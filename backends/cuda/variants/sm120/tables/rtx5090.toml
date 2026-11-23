@@ -1,0 +1,380 @@
+# Copyright 2026 The flyx Authors. SPDX-License-Identifier: Apache-2.0
+# Tuning table for NVIDIA GeForce RTX 5090, written by `cuda_bench tune` (GB/s of weights streamed in brackets).
+# 2026-11-12..15, RTX 5090 32 GB, CUDA 13 (verified end-to-end on Qwen3.8-27B).
+sku = "rtx5090"
+devices = ["NVIDIA GeForce RTX 5090"]
+# Programmatic dependent launch verified on Qwen3.8-27B UD-Q4_K_XL (+0.9% plain, +2.3% MTP, +0.3% DFlash2).
+pdl = true
+# The table of every sm_120 GPU without one of its own: on an RTX PRO 6000 Blackwell (QUASAR's NVFP4
+# 27B) plain decoding 66.5 -> 77.7 tok/s and DFlash2 229 -> 258 against the defaults (docs/perf/2026-11-20-modal-tables.md).
+architectures = ["12.0"]
+
+[[gemm]]  # attention q|k|v
+format = "nvfp4"
+n = 10240
+k = 2560
+rules = [
+  { rows = [1, 1], span = 128, chunks = 4, nt = 1, warps = 2, unroll = 4 },  # r1 1286
+  { rows = [2, 8], span = 128, chunks = 4, nt = 1, warps = 4, unroll = 4 },  # r4 1266 r8 1234
+  { rows = [9, 16], span = 128, chunks = 4, nt = 2, warps = 4, unroll = 4 },  # r16 1190
+]
+
+[[gemm]]  # gdn in (qkv|z|b|a)
+format = "nvfp4"
+n = 12352
+k = 2560
+rules = [
+  { rows = [1, 1], span = 128, chunks = 4, nt = 1, warps = 2, unroll = 4 },  # r1 1347
+  { rows = [2, 8], span = 128, chunks = 4, nt = 2, warps = 4, unroll = 4 },  # r4 1296 r8 1277
+  { rows = [9, 16], span = 128, chunks = 4, nt = 4, warps = 4, unroll = 2 },  # r16 1152
+]
+
+[[gemm]]  # mlp gate|up
+format = "nvfp4"
+n = 18432
+k = 2560
+rules = [
+  { rows = [1, 4], span = 128, chunks = 4, nt = 1, warps = 4, unroll = 4 },  # r1 1473 r4 1473
+  { rows = [5, 8], span = 128, chunks = 4, nt = 1, warps = 4, unroll = 8 },  # r8 1456
+  { rows = [9, 16], span = 128, chunks = 4, nt = 1, warps = 4, unroll = 4 },  # r16 1309
+]
+
+[[gemm]]  # mlp down
+format = "nvfp4"
+n = 2560
+k = 9216
+rules = [
+  { rows = [1, 4], span = 128, chunks = 16, nt = 1, warps = 16, unroll = 2 },  # r1 1296 r4 1271
+  { rows = [5, 16], span = 128, chunks = 16, nt = 2, warps = 16, unroll = 2 },  # r8 1117 r16 853
+]
+
+[[gemm]]  # attention / gdn out
+format = "nvfp4"
+n = 2560
+k = 4096
+rules = [
+  { rows = [1, 16], span = 128, chunks = 8, nt = 1, warps = 8, unroll = 4 },  # r1 993 r4 961 r8 900 r16 720
+]
+
+[[gemm]]  # lm head
+format = "bf16"
+n = 248320
+k = 2560
+rules = [
+  { rows = [1, 1], nt = 1, warps = 16, unroll = 16 },  # r1 1702
+  { rows = [2, 4], nt = 1, warps = 16, unroll = 8 },  # r4 1702
+  { rows = [5, 8], nt = 4, warps = 16, unroll = 4 },  # r8 1670
+  { rows = [9, 16], nt = 2, warps = 16, unroll = 4 },  # r16 1648
+]
+
+[[gemm]]  # mtp q|k|v, dflash2 context k|v
+format = "bf16"
+n = 10240
+k = 2560
+rules = [
+  { rows = [1, 1], nt = 1, warps = 16, unroll = 4 },  # r1 1530
+  { rows = [2, 4], nt = 1, warps = 16, unroll = 16 },  # r4 1533
+  { rows = [5, 16], nt = 2, warps = 16, unroll = 8 },  # r8 1471 r16 1399
+]
+
+[[gemm]]  # mtp / dflash2 mlp gate|up
+format = "bf16"
+n = 18432
+k = 2560
+rules = [
+  { rows = [1, 4], nt = 1, warps = 16, unroll = 8 },  # r1 1594 r4 1600
+  { rows = [5, 16], nt = 2, warps = 16, unroll = 8 },  # r8 1531 r16 1482
+]
+
+[[gemm]]  # mtp / dflash2 mlp down
+format = "bf16"
+n = 2560
+k = 9216
+rules = [
+  { rows = [1, 8], nt = 1, warps = 16, unroll = 8 },  # r1 1250 r4 1245 r8 1232
+  { rows = [9, 16], nt = 2, warps = 16, unroll = 8 },  # r16 1200
+]
+
+[[gemm]]  # mtp / dflash2 attention out
+format = "bf16"
+n = 2560
+k = 4096
+rules = [
+  { rows = [1, 1], nt = 1, warps = 16, unroll = 16 },  # r1 1400
+  { rows = [2, 4], nt = 1, warps = 16, unroll = 4 },  # r4 1384
+  { rows = [5, 8], nt = 1, warps = 16, unroll = 16 },  # r8 1347
+  { rows = [9, 16], nt = 2, warps = 16, unroll = 8 },  # r16 1264
+]
+
+[[gemm]]  # mtp fc
+format = "bf16"
+n = 2560
+k = 5120
+rules = [
+  { rows = [1, 1], nt = 1, warps = 16, unroll = 8 },  # r1 1362
+  { rows = [2, 8], nt = 1, warps = 16, unroll = 4 },  # r4 1340 r8 1306
+  { rows = [9, 16], nt = 4, warps = 16, unroll = 4 },  # r16 1202
+]
+
+[[gemm]]  # dflash2 q|k|v
+format = "bf16"
+n = 6144
+k = 2560
+rules = [
+  { rows = [1, 4], nt = 1, warps = 16, unroll = 8 },  # r1 1456 r4 1422
+  { rows = [5, 8], nt = 1, warps = 16, unroll = 4 },  # r8 1347
+  { rows = [9, 16], nt = 2, warps = 16, unroll = 8 },  # r16 1159
+]
+
+[[gemm]]  # dflash2 conv proj
+format = "bf16"
+n = 640
+k = 2560
+rules = [
+  { rows = [1, 1], nt = 1, warps = 16, unroll = 16 },  # r1 615
+  { rows = [2, 4], nt = 1, warps = 16, unroll = 8 },  # r4 615
+  { rows = [5, 8], nt = 1, warps = 16, unroll = 16 },  # r8 593
+  { rows = [9, 16], nt = 1, warps = 16, unroll = 4 },  # r16 485
+]
+
+[[gemm]]  # dflash2 fc
+format = "bf16"
+n = 2560
+k = 12800
+rules = [
+  { rows = [1, 1], nt = 2, warps = 16, unroll = 4 },  # r1 1192
+  { rows = [2, 8], nt = 1, warps = 16, unroll = 8 },  # r4 1177 r8 1172
+  { rows = [9, 16], nt = 2, warps = 16, unroll = 4 },  # r16 1151
+]
+
+[[gemm]]  # dflash2 selector
+format = "bf16"
+n = 256
+k = 2560
+rules = [
+  { rows = [1, 8], nt = 1, warps = 16, unroll = 8 },  # r1 267 r4 305 r8 256
+  { rows = [9, 16], nt = 1, warps = 16, unroll = 4 },  # r16 213
+]
+
+[[gemm]]  # lm head in W12 (the same bits as bf16)
+format = "w12"
+n = 248320
+k = 2560
+rules = [
+  { rows = [1, 4], nt = 1, warps = 16, unroll = 8 },  # r1 1660 r4 1577
+  { rows = [5, 8], nt = 4, warps = 16, unroll = 4 },  # r8 1507
+  { rows = [9, 16], nt = 4, warps = 8, unroll = 4 },  # r16 1373
+]
+
+# Qwen3.8-27B in NVFP4 (GGML's, repacked), the stacks as the engine forms them: `cuda_bench tune gemm`
+# with the 27B's shapes, 2026-11-12; before them the
+# generic nvfp4_k128 rule below took them.
+[[gemm]]  # 27B attention q|k|v
+format = "nvfp4"
+n = 14336
+k = 5120
+rules = [
+  { rows = [1, 4], span = 128, chunks = 8, nt = 1, warps = 8, unroll = 4 },  # r1 1632 r4 1606
+  { rows = [5, 16], span = 128, chunks = 8, nt = 2, warps = 8, unroll = 4 },  # r8 1527 r16 1123
+]
+
+[[gemm]]  # 27B gdn in (qkv|z|b|a)
+format = "nvfp4"
+n = 16480
+k = 5120
+rules = [
+  { rows = [1, 4], span = 128, chunks = 8, nt = 1, warps = 8, unroll = 4 },  # r1 1628 r4 1609
+  { rows = [5, 16], span = 128, chunks = 8, nt = 2, warps = 8, unroll = 4 },  # r8 1535 r16 1120
+]
+
+[[gemm]]  # 27B mlp gate|up
+format = "nvfp4"
+n = 34816
+k = 5120
+rules = [
+  { rows = [1, 4], span = 128, chunks = 8, nt = 1, warps = 8, unroll = 4 },  # r1 1790 r4 1774
+  { rows = [5, 16], span = 128, chunks = 8, nt = 2, warps = 8, unroll = 4 },  # r8 1643 r16 1200
+]
+
+[[gemm]]  # 27B mlp down
+format = "nvfp4"
+n = 5120
+k = 17408
+rules = [
+  { rows = [1, 1], span = 128, chunks = 16, nt = 1, warps = 16, unroll = 2 },  # r1 1607
+  { rows = [2, 16], span = 128, chunks = 16, nt = 2, warps = 16, unroll = 2 },  # r4 1544 r8 1415 r16 885
+]
+
+[[gemm]]  # 27B attention / gdn out
+format = "nvfp4"
+n = 5120
+k = 6144
+rules = [
+  { rows = [1, 4], span = 128, chunks = 8, nt = 1, warps = 8, unroll = 4 },  # r1 1405 r4 1371
+  { rows = [5, 16], span = 128, chunks = 8, nt = 2, warps = 8, unroll = 4 },  # r8 1319 r16 1094
+]
+
+# This GPU's rules: for shapes no [[gemm]] lists, and the GGML block kernels' on Qwen3.8-27B's and Qwen3.5-4B's layers, every block type.
+[rules]
+bf16 = [
+  { rows = [1, 1], nt = 1, warps = 16, unroll = 16 },
+  { rows = [2, 4], nt = 1, warps = 16, unroll = 8 },
+  { rows = [5, 8], nt = 1, warps = 16, unroll = 4 },
+  { rows = [9, 16], nt = 2, warps = 16, unroll = 4 },
+]
+nvfp4_k128 = { span = 128, chunks = 8, nt = 1, warps = 8, unroll = 4 }
+nvfp4_k64 = { span = 64, chunks = 16, nt = 1, warps = 16, unroll = 4 }
+blocks = [
+  { n_max = 2048, rows = [1, 16], nt = 1, nw = 2, kw = 4 },
+  { n_max = 6144, rows = [1, 2], nt = 1, nw = 2, kw = 4 },
+  { n_max = 6144, rows = [3, 16], nt = 1, nw = 4, kw = 4 },
+  { n_max = 12288, rows = [1, 16], nt = 1, nw = 4, kw = 2 },
+  { n_max = 65536, rows = [1, 4], nt = 1, nw = 8, kw = 1 },
+  { n_max = 65536, rows = [5, 16], nt = 2, nw = 8, kw = 1 },
+  { rows = [1, 1], nt = 1, nw = 4, kw = 2 },
+  { rows = [2, 4], nt = 1, nw = 8, kw = 1 },
+  { rows = [5, 16], nt = 2, nw = 4, kw = 1 },
+]
+# blocks, 1 rows: 309592 us with these rules, 309656 with the defaults (-0.0%), 303656 with the best for each
+# blocks, 2 rows: 325458 us with these rules, 325550 with the defaults (-0.0%), 317263 with the best for each
+# blocks, 4 rows: 358229 us with these rules, 379779 with the defaults (-5.7%), 349991 with the best for each
+# blocks, 8 rows: 429683 us with these rules, 458695 with the defaults (-6.3%), 419196 with the best for each
+# blocks, 16 rows: 432966 us with these rules, 461491 with the defaults (-6.2%), 422259 with the best for each
+blocks_q8_runs = [
+  { n_max = 2560, runs = 4 },
+  { n_max = 5120, k_max = 6144, runs = 2 },
+  { n_max = 5120, runs = 4 },
+  { n_max = 6144, runs = 2 },
+  { runs = 1 },
+]
+# blocks_q8_runs, passes of 32, 64, 128 and 512 rows: 5891369 us with these runs, 5955068 with the defaults' (-1.1%)
+blocks_q8 = [
+  { types = ["Q4_1"], rows = [17, 128], n_max = 12288, bn = 64, qk = 128, bm = 64 },
+  { types = ["Q4_1"], rows = [17, 128], bn = 128, qk = 256, bm = 64 },
+  { types = ["Q4_1"], rows = [129, 2147483647], n_max = 2048, bn = 64, qk = 128, bm = 64 },
+  { types = ["Q4_1"], bn = 128, qk = 64, bm = 128 },
+  { types = ["Q5_1"], rows = [17, 128], n_max = 12288, bn = 64, qk = 128, bm = 64 },
+  { types = ["Q5_1"], rows = [17, 128], bn = 128, qk = 256, bm = 64 },
+  { types = ["Q5_1"], rows = [129, 2147483647], n_max = 64, bn = 64, qk = 128, bm = 64 },
+  { types = ["Q5_1"], bn = 128, qk = 64, bm = 128 },
+  { types = ["Q8_0"], rows = [17, 128], n_max = 2048, bn = 64, qk = 128, bm = 64 },
+  { types = ["Q8_0"], rows = [17, 128], bn = 128, qk = 256, bm = 64 },
+  { types = ["Q8_0"], rows = [129, 2147483647], n_max = 64, bn = 64, qk = 128, bm = 64 },
+  { types = ["Q8_0"], rows = [129, 2147483647], n_max = 2048, bn = 128, qk = 256, bm = 64 },
+  { types = ["Q8_0"], bn = 128, qk = 64, bm = 128 },
+  { types = ["IQ2_XXS", "IQ3_XXS", "IQ3_S", "IQ1_S"], rows = [17, 128], n_max = 2048, bn = 64, qk = 128, bm = 64 },
+  { types = ["IQ2_XXS", "IQ3_XXS", "IQ3_S", "IQ1_S"], rows = [17, 128], n_max = 6144, bn = 128, qk = 256, bm = 64 },
+  { types = ["IQ2_XXS", "IQ3_XXS", "IQ3_S", "IQ1_S"], rows = [17, 128], n_max = 12288, bn = 64, qk = 128, bm = 64 },
+  { types = ["IQ2_XXS", "IQ3_XXS", "IQ3_S", "IQ1_S"], rows = [17, 128], bn = 128, qk = 256, bm = 64 },
+  { types = ["IQ2_XXS", "IQ3_XXS", "IQ3_S", "IQ1_S"], rows = [129, 2147483647], n_max = 64, bn = 64, qk = 128, bm = 64 },
+  { types = ["IQ2_XXS", "IQ3_XXS", "IQ3_S", "IQ1_S"], rows = [129, 2147483647], n_max = 2048, bn = 128, qk = 256, bm = 64 },
+  { types = ["IQ2_XXS", "IQ3_XXS", "IQ3_S", "IQ1_S"], rows = [129, 2147483647], n_max = 65536, bn = 128, qk = 256, bm = 128 },
+  { types = ["IQ2_XXS", "IQ3_XXS", "IQ3_S", "IQ1_S"], bn = 128, qk = 64, bm = 128 },
+  { types = ["IQ2_S", "IQ1_M"], rows = [17, 128], n_max = 12288, bn = 64, qk = 128, bm = 64 },
+  { types = ["IQ2_S", "IQ1_M"], rows = [17, 128], bn = 128, qk = 256, bm = 64 },
+  { types = ["IQ2_S", "IQ1_M"], rows = [129, 2147483647], n_max = 2048, bn = 64, qk = 128, bm = 64 },
+  { types = ["IQ2_S", "IQ1_M"], rows = [129, 2147483647], n_max = 65536, bn = 128, qk = 256, bm = 128 },
+  { types = ["IQ2_S", "IQ1_M"], bn = 128, qk = 64, bm = 128 },
+  { rows = [17, 128], n_max = 2048, bn = 64, qk = 128, bm = 64 },
+  { rows = [17, 128], n_max = 6144, bn = 128, qk = 256, bm = 64 },
+  { rows = [17, 128], n_max = 12288, bn = 64, qk = 128, bm = 64 },
+  { rows = [17, 128], bn = 128, qk = 256, bm = 64 },
+  { rows = [129, 2147483647], n_max = 2048, bn = 64, qk = 128, bm = 64 },
+  { bn = 128, qk = 64, bm = 128 },
+]
+# blocks_q8, passes of 32, 64 and 128 rows: 2454819 us with these rules, 2587240 with the defaults (-5.1%), 2425565 with the best for each
+# blocks_q8, passes of 512 rows: 3583360 us with these rules, 3682041 with the defaults (-2.7%), 3572870 with the best for each
+blocks_round = [
+  # IQ4_XS and Q6_K on round kernel 5 (the streams split among a block's warps): `cuda_bench round
+  # T NxK R` against `... R 5` on the 27B's layers from 1024 to 34816 columns. IQ4_XS from 3 to 8 rows on every layer (8 rows: 12288 x 5120 29.7 -> 23.5 us, 17408 x 5120 36.4 ->
+  # 32.6, 1024 x 5120 11.8 -> 6.8), from 9 rows on layers of up to 6144 columns (16 rows: 5120 x 17408 40.1 -> 38.8;
+  # wider ones lost: 17408 x 5120 38.7 -> 42.1); Q6_K from 3 rows (8 rows: 6144 x 5120 20.4 -> 17.7; 12 and 16 rows
+  # 3% less over the layers). Q4_K and Q5_K lost at every row count.
+  { types = ["IQ4_XS", "Q6_K"], rows = [3, 4], tensor_cores = "warps" },
+  { types = ["IQ4_XS", "Q6_K"], rows = [5, 8], tensor_cores = "warps" },
+  { types = ["IQ4_XS"], rows = [9, 16], n_max = 6144, tensor_cores = "warps" },
+  { types = ["Q6_K"], rows = [9, 16], tensor_cores = "warps" },
+  # IQ3 types on the 27B's 5120-column layers (MLP down, attention and GDN out): the split kernel decodes them through
+  # one table of signed rows (5a5049e, 51ef120) and beats dp4a there from 5 rows on: UD-IQ3_XXS rounds of 8 rows
+  # 13.20 -> 12.77 ms, 6 rows 12.04 -> 11.79 (tree_bench; at 2 rows it lost 0.4 ms, at 3-4 nothing).
+  { types = ["IQ3_XXS", "IQ3_S"], rows = [5, 8], n_min = 2048, n_max = 5120, tensor_cores = "split" },
+  # Rounds of 7-8 rows on the same layers: the split kernel against the rules before it (`cuda_bench round T NxK 8`
+  # and `... 8 3`, us, 5120x5120 / 5120x6144 / 5120x17408 / 4096x5120):
+  # Q5_K 18.1 / 20.0 / 47.2 / 15.8 -> 15.9 / 18.1 / 46.8 / 13.4, IQ4_XS 15.7 / 18.3 / 42.5 / 14.5 -> 14.1 / 16.9 /
+  # 38.7 / 12.3, IQ2_XXS 11.5 / 13.4 / 28.4 / 11.0 -> 10.2 / 12.0 / 26.6 / 9.7, Q8_0 21.9 / 25.7 / 76.2 / 17.8 -> 20.9 /
+  # 24.6 / 64.3 / 17.1. (Q4_K, Q6_K, Q2_K, Q3_K and Q5_0 lose on the MLP's down projection there: dp4a as before.)
+  { types = ["Q5_K", "IQ4_XS", "IQ2_XXS", "Q8_0"], rows = [7, 8], n_min = 2048, n_max = 5120, tensor_cores = "split" },
+  # IQ3_XXS and IQ2_XXS rounds of 7-8 rows on the MLP's gate and up (wider than 16384 columns): the split kernel
+  # with the columns in the MMA's first operand (`cuda_bench round TYPE NxK 8`, us: IQ3_XXS 34816 x 5120 58.1 ->
+  # 54.5, 17408 x 5120 32.2 -> 30.4; IQ2_XXS 47.1 -> 45.0, 26.0 -> 25.1; elsewhere it lost). Not the GDN's
+  # 16384-column input stack: its narrow b|a run then takes a launch of its own, and DFlash2's
+  # rounds lost 0.9% with it.
+  { types = ["IQ3_XXS", "IQ2_XXS"], rows = [7, 8], n_min = 16384, tensor_cores = "split_columns" },
+  # Rounds of 1 row of the IQ types (`cuda_bench tune blocks_round` of 2026-11-14). The rules below gave their
+  # 5120-column layers 2 columns a
+  # warp: IQ3_S MLP down 32.8 -> 26.2 us, GDN out 12.7 -> 10.8, IQ4_XS down 35.7 -> 31.5 (`cuda_bench round`);
+  # UD-IQ3_XXS plain decoding 113.5 -> 115.2 tok/s. Its rules for the K types lost on UD-Q4_K_XL (81.0 -> 80.2).
+  { types = ["IQ2_XXS", "IQ2_XS"], rows = [1, 1], n_max = 64, kernel = 2, columns = 1, ahead = 0 },
+  { types = ["IQ2_S"], rows = [1, 1], n_max = 64, columns = 2, ahead = 0 },
+  { types = ["IQ2_XXS", "IQ3_S"], rows = [1, 1], n_min = 2048, n_max = 5120, kernel = 2, columns = 1, ahead = 0 },
+  { types = ["IQ1_M"], rows = [1, 1], n_min = 2048, n_max = 5120, columns = 2, ahead = 0 },
+  { types = ["IQ3_S", "IQ4_XS"], rows = [1, 1], n_min = 5120, n_max = 6144, kernel = 2, columns = 2, ahead = 0 },
+  { types = ["IQ1_S"], rows = [1, 1], n_min = 6144, n_max = 65536, columns = 2, ahead = 0 },
+  { types = ["IQ2_XXS"], rows = [1, 1], n_min = 12288, n_max = 65536, columns = 2, ahead = 0 },
+  { types = ["IQ1_S", "IQ1_M", "IQ2_XXS", "IQ2_XS", "IQ2_S", "IQ3_XXS", "IQ3_S", "IQ4_NL", "IQ4_XS"], rows = [1, 1], n_max = 6144, columns = 1, ahead = 2 },
+  { types = ["Q5_K"], rows = [1, 1], n_min = 2048, n_max = 65536, columns = 2, ahead = 0 },
+  { types = ["Q2_K"], rows = [1, 1], n_min = 12288, n_max = 65536, kernel = 2, columns = 4, ahead = 0, warps = 16, staged = 1 },
+  { types = ["Q4_K"], rows = [1, 1], n_min = 12288, n_max = 65536, columns = 2, ahead = 0 },
+  { types = ["Q4_1"], rows = [2, 2], n_max = 64, columns = 4, ahead = 0, warps = 16, staged = 1 },
+  { types = ["Q5_0"], rows = [2, 2], n_max = 6144, columns = 1, ahead = 0 },
+  { types = ["Q5_K"], rows = [2, 2], n_max = 65536, columns = 1, ahead = 0 },
+  { types = ["Q6_K"], rows = [2, 2], n_min = 2048, n_max = 6144, columns = 2, ahead = 0 },
+  { types = ["IQ1_S"], rows = [2, 2], n_min = 2048, n_max = 6144, columns = 4, ahead = 0, warps = 16, staged = 1 },
+  { types = ["Q2_K", "Q4_K"], rows = [2, 2], n_min = 12288, n_max = 65536, columns = 4, ahead = 0, warps = 16, staged = 1 },
+  { types = ["Q5_K"], rows = [3, 4], n_max = 2048, columns = 1, ahead = 0 },
+  { types = ["IQ3_XXS", "IQ3_S", "IQ4_XS"], rows = [3, 4], n_max = 64, columns = 1, ahead = 0 },
+  { types = ["Q4_0", "IQ4_NL"], rows = [3, 4], n_min = 2048, n_max = 5120, columns = 4, ahead = 0 },
+  { types = ["Q4_1", "IQ4_XS"], rows = [3, 4], n_min = 2048, n_max = 5120, columns = 2, ahead = 0 },
+  { types = ["Q5_0", "Q8_0"], rows = [3, 4], n_min = 2048, n_max = 5120, columns = 1, ahead = 0 },
+  { types = ["Q5_1"], rows = [3, 4], n_min = 2048, n_max = 6144, columns = 2, ahead = 0 },
+  { types = ["IQ2_XXS"], rows = [3, 4], n_min = 6144, n_max = 12288, columns = 4, ahead = 0 },
+  { types = ["Q4_0"], rows = [3, 4], n_min = 12288, n_max = 65536, columns = 4, ahead = 0 },
+  { types = ["Q4_1"], rows = [3, 4], n_min = 12288, n_max = 65536, columns = 2, ahead = 0 },
+  { types = ["Q4_1", "Q5_1"], rows = [5, 6], n_max = 12288, columns = 0, ahead = 0, warps = 16, staged = 1, parts = 2 },
+  { types = ["Q8_0"], rows = [5, 6], n_max = 6144, columns = 0, ahead = 0, warps = 16, staged = 1, parts = 2 },
+  { types = ["IQ2_XXS", "IQ4_XS"], rows = [5, 6], n_max = 64, tensor_cores = "rows" },
+  { types = ["IQ3_XXS", "IQ4_NL"], rows = [5, 6], n_max = 64, columns = 0, ahead = 0, warps = 16, staged = 1 },
+  { types = ["IQ3_S"], rows = [5, 6], n_max = 64, columns = 2, ahead = 2 },
+  { types = ["IQ3_S"], rows = [5, 6], n_min = 64, n_max = 2048, columns = 2, ahead = 0 },
+  { types = ["Q5_1", "Q5_K"], rows = [5, 6], n_min = 2048, n_max = 5120, columns = 0, ahead = 0, warps = 16, staged = 1 },
+  { types = ["Q2_K", "Q3_K", "Q4_K", "Q6_K"], rows = [5, 6], n_min = 2048, n_max = 5120, columns = 0, ahead = 0, warps = 16, staged = 2 },
+  { types = ["IQ3_S", "IQ4_XS"], rows = [5, 6], n_min = 2048, n_max = 5120, columns = 2, ahead = 2 },
+  { types = ["Q4_1", "Q5_1", "Q8_0"], rows = [7, 8], n_max = 12288, columns = 0, ahead = 0, warps = 16, staged = 1, parts = 2 },
+  { types = ["IQ2_XXS", "IQ3_XXS", "IQ3_S", "IQ1_S", "IQ4_XS"], rows = [7, 8], n_max = 64, tensor_cores = "rows" },
+  { types = ["Q2_K", "Q3_K", "Q4_K", "Q5_K", "Q6_K"], rows = [7, 8], n_min = 2048, n_max = 5120, columns = 0, ahead = 0, warps = 16, staged = 2 },
+  { types = ["IQ3_S"], rows = [7, 8], n_min = 2048, n_max = 5120, columns = 2, ahead = 2 },
+  { types = ["Q6_K"], rows = [7, 8], n_min = 5120, columns = 0, ahead = 0, warps = 16, staged = 1 },
+  { types = ["Q3_K"], rows = [7, 8], n_min = 12288, n_max = 65536, tensor_cores = "columns" },
+  { types = ["Q5_1"], rows = [9, 16], n_min = 6144, n_max = 65536, columns = 0, ahead = 0 },
+  { rows = [1, 1], n_max = 2048, columns = 1, ahead = 2 },
+  { rows = [1, 1], n_min = 2048, n_max = 6144, columns = 2, ahead = 0 },
+  { rows = [1, 1], n_min = 6144, kernel = 2, columns = 4, ahead = 0 },
+  { rows = [2, 2], n_max = 2048, columns = 1, ahead = 0 },
+  { rows = [2, 2], n_min = 2048, columns = 4, ahead = 0 },
+  { rows = [3, 4], columns = 4, ahead = 0, staged = 1 },
+  { rows = [5, 6], n_max = 5120, columns = 0, ahead = 0, warps = 16, staged = 1, parts = 2 },
+  { rows = [5, 6], n_min = 5120, columns = 0, ahead = 0, warps = 16, staged = 1 },
+  { rows = [7, 8], n_max = 5120, columns = 0, ahead = 0, warps = 16, staged = 1, parts = 2 },
+  { rows = [7, 8], n_min = 5120, n_max = 65536, columns = 0, ahead = 0, warps = 16, staged = 1 },
+  { rows = [7, 8], n_min = 65536, tensor_cores = "columns" },
+  # From 9 rows the split kernel for every type: a rule that kept Q4_0, Q4_1, Q5_0, Q5_1, Q2_K and Q4_K on dp4a for
+  # layers of 2048-5120 columns lost 30-45% at 12-16 rows once the split kernel had caught up (16 rows, us: Q4_K
+  # 5120x17408 69.0 -> 46.0, Q4_0 74.0 -> 44.1).
+  { rows = [9, 16], tensor_cores = "split" },
+]
+# blocks_round, rounds of 1 rows: 187604 us with these rules, 190095 with the defaults (-1.3%), 186291 with the best for each
+# blocks_round, rounds of 2 rows: 199962 us with these rules, 203399 with the defaults (-1.7%), 198761 with the best for each
+# blocks_round, rounds of 4 rows: 226105 us with these rules, 240746 with the defaults (-6.1%), 224058 with the best for each
+# blocks_round, rounds of 6 rows: 264133 us with these rules, 300249 with the defaults (-12.0%), 262268 with the best for each
+# blocks_round, rounds of 8 rows: 288393 us with these rules, 330452 with the defaults (-12.7%), 286626 with the best for each
+# blocks_round, rounds of 16 rows: 536350 us with these rules, 538542 with the defaults (-0.4%), 530505 with the best for each

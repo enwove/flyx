@@ -1,0 +1,45 @@
+flyx
+Copyright 2026 The flyx Authors
+
+This product includes software developed by third parties:
+
+  nlohmann/json (https://github.com/nlohmann/json), MIT License,
+  Copyright (c) 2013-2023 Niels Lohmann. See third_party/nlohmann/LICENSE.MIT.
+
+  utf8proc (https://github.com/JuliaStrings/utf8proc), MIT License and the
+  Unicode data license. See third_party/utf8proc/LICENSE.md.
+
+  cpp-httplib (https://github.com/yhirose/cpp-httplib), MIT License,
+  Copyright (c) 2017 yhirose. See third_party/httplib/LICENSE and
+  third_party/httplib/README.flyx.md.
+
+  The Jinja engine of llama.cpp (https://github.com/ggml-org/llama.cpp),
+  MIT License, Copyright (c) 2023-2026 The ggml authors.
+  See third_party/jinja/LICENSE and third_party/jinja/README.flyx.md.
+
+  The quantization header of ggml (ggml-common.h, from
+  https://github.com/ggml-org/llama.cpp), MIT License, Copyright (c)
+  2023-2026 The ggml authors. See third_party/ggml/LICENSE and
+  third_party/ggml/README.flyx.md.
+
+  XGrammar (https://github.com/mlc-ai/xgrammar), C++ core, Apache License
+  2.0, Copyright (c) 2024 by XGrammar Contributors. See
+  third_party/xgrammar/LICENSE, third_party/xgrammar/NOTICE and
+  third_party/xgrammar/README.flyx.md. It includes:
+    picojson, BSD 2-Clause License, Copyright 2009-2010 Cybozu Labs, Inc.,
+    Copyright 2011-2014 Kazuho Oku (the license is in picojson.h);
+    dlpack.h (https://github.com/dmlc/dlpack), Apache License 2.0. See
+    third_party/xgrammar/3rdparty/dlpack/LICENSE.
+
+  Preact (https://github.com/preactjs/preact), version 10.26.4, MIT License,
+  Copyright (c) 2015-present Jason Miller. See third_party/preact/LICENSE and
+  third_party/preact/README.flyx.md. Built into the dashboard page.
+
+  htm (https://github.com/developit/htm), version 3.1.1, Apache License 2.0,
+  Copyright 2018 Google Inc. See third_party/htm/LICENSE and
+  third_party/htm/README.flyx.md. Built into the dashboard page.
+
+The dashboard's Integration page names five coding agents by their marks:
+Claude Code (Anthropic), Codex (OpenAI), DeepSeek, OpenCode and Pi. The marks
+are trademarks of their owners, shown only to name those clients; flyx is not
+affiliated with them. Where each drawing is from: docs/prior-art.md.

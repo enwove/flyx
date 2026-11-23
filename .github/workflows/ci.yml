@@ -1,0 +1,56 @@
+# Copyright 2026 The flyx Authors. SPDX-License-Identifier: Apache-2.0
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  cpu:
+    name: CPU build & tests (Ubuntu)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install build tools
+        run: sudo apt-get update && sudo apt-get install -y ninja-build
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Cache pip downloads
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/pip
+          key: pip-${{ runner.os }}-py312-${{ hashFiles('.github/workflows/ci.yml') }}
+          restore-keys: |
+            pip-${{ runner.os }}-py312-
+
+      - name: Install Python test dependencies
+        run: |
+          python -m pip install -U pip
+          python -m pip install --index-url https://download.pytorch.org/whl/cpu torch
+          python -m pip install transformers tokenizers safetensors gguf
+
+      - name: Check layering, numerics tables, and docs
+        run: |
+          python tools/check_layering.py
+          python tools/check_numerics.py
+          python tools/check_docs.py
+
+      - name: Build and test (cpu preset)
+        run: bash tools/ci/cpu.sh
+
+      - name: Upload CI log on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ci-cpu-log
+          path: logs/ci/cpu.log

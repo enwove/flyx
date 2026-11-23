@@ -1,0 +1,134 @@
+Summarize this document in a few paragraphs.
+
+# Tree rounds of more than 16 rows at one-row bits: what a verify pass costs on MiniCPM5-1B (2026-11-17)
+
+RTX 5060 Ti 8 GB (8151 MiB; the desktop's display GPU, 1.7 GB held by other programs during the first runs, 2.5 to
+3.0 GB during the last), Windows 11 Home 26300, driver 610.88, MSVC 19.44, CUDA 13.5; a release build
+(`release-windows` with `FLYX_TESTS=ON`, `FLYX_CUDA_ARCHS=120-real`) of flyx-windows 4ae5ae7 with this change (ABI 32:
+tree rounds of up to 64 rows, every GEMM 16 rows at a time,
+[tree-verification.md](../design/tree-verification.md#rounds-of-more-than-16-rows-phase-2)).
+Raw output: [2026-11-17-rtx5060ti-tree-rows.txt](2026-11-17-rtx5060ti-tree-rows.txt).  The timings and the profile
+(its sections 1 and 2) ran before the change's review fixes, which changed no round's work (an engine lowers no round
+of more than 16 rows of its own, a session leases what it takes, tests); the memory, rule 4 and "unchanged" sections
+ran on the final code (section 6), with one timing run beside them.
+
+Model: `minicpm5-1b.flyx`, MiniCPM5-1B in BF16 (decision 0074), binary16 K/V (`--kv 16`). Rounds of given drafts
+(`bench/tree/tree_bench.cpp`): a prompt of random tokens, then rounds of random drafts (nearly none accepted, so
+every round moves one position and its rows' work is all of its cost), two in flight, graphs, as the engine runs
+them; a round of w drafts verifies w + 1 rows.
+
+```
+tree_bench minicpm5-1b.flyx --kv 16 --ctx-at 1024 --widths 15,31,47,63 --rounds 100     # three times
+tree_bench minicpm5-1b.flyx --kv 16 --ctx-at 4096 --widths 15,31,47,63 --rounds 100
+tree_bench minicpm5-1b.flyx --kv 16 --ctx-at 1024 --widths 3,7,15,31 --rounds 100       # a session of 32 rows
+tree_bench minicpm5-1b.flyx --kv 16 --ctx-at 1024 --widths 15,31,63 --rounds 30 --backend-options profile=1
+tree_bench minicpm5-1b.flyx --kv 16 --ctx-at 1024|9000 --widths 3,7,15,31 --check 400
+tree_bench minicpm5-1b.flyx --kv 16 --ctx-at 1024 --widths 31 --check 400
+tree_bench minicpm5-1b.flyx --kv 16 --ctx-at 1024 --widths 47,63 --check 400
+tree_bench minicpm5-1b.flyx --kv 16 --ctx-at 1024 --widths 31,63 --check 400 \
+    --backend-options rows_attention_from=0      # and fusion=0
+```
+
+## A round by its rows
+
+ms a round (the tree a chain; a random tree of the same rows 1 to 2% more), mean of the three runs at 1024 tokens of
+context (they agree within 0.4%), and one run at 4096:
+
+| rows | 1 (plain) | 16 | 32 | 48 | 64 |
+|---|---:|---:|---:|---:|---:|
+| ms, context 1024 | 4.331 | 6.362 | 13.101 | 20.139 | 27.583 |
+| t(rows) / t(1) | 1 | 1.469 | **3.025** | 4.650 | 6.368 |
+| ms, context 4096 | 4.633 | 8.281 | 16.774 | 25.076 | 33.962 |
+| t(rows) / t(1) | 1 | 1.787 | 3.621 | 5.412 | 7.330 |
+
+The run on the final code (section 6; another program held 2.9 GB of the GPU then) gave 4.502 ms a plain round and
+2.97, 4.54 and 6.46 plain rounds at 32, 48 and 64 rows (a chain; the other shapes up to 9% more), and 3.19 at 32 rows in
+the run after it: the same costs within that GPU's noise.
+
+t(32) / t(1) is 3.0, not the 1.9 to 2.1 the plan estimated: the estimate took a 16-row tile for about the cost of a
+plain round (the weights read once), and the 16-row round itself costs 1.47 of one here. Past 16 rows the cost is
+the 16-row round's again for every 16 rows (t(32) = 2.06 t(16), t(64) = 4.34 t(16)): every tile reads the weights
+again and does its own work.
+
+Where a round's time goes (option `profile=1`: no graphs, every node timed, per pass summed over the 24 layers;
+plain rounds 4.98 ms without graphs against 4.33 with them):
+
+| node (ms a pass) | 1 row | 16 rows | 32 rows | 64 rows |
+|---|---:|---:|---:|---:|
+| attention mixer (q\|k\|v and o GEMMs, attention) | 1.562 | 2.596 | 5.096 | 10.010 |
+| mlp (gate\|up and down GEMMs) | 2.813 | 3.181 | 6.529 | 12.943 |
+| head and choice (W12, or the certified head: greedy) | 0.526 | 1.042 | 2.091 | 4.187 |
+| the rest (embedding, given drafts, accept and compaction) | 0.075 | 0.070 | 0.081 | 0.098 |
+| a pass | 4.976 | 6.890 | 13.796 | 27.237 |
+
+A 16-row tile adds about 1.9 ms to what one row costs (attention 1.0, MLP 0.4, head 0.5): the three bf16 parts' MMAs
+of 16 rows, the attention one row a block (a tree's rows each read their own keys). A multi-tile GEMM that reads the
+weights once for every tile (the plan's next step) keeps that work for every tile, so at 32 rows about
+4.3 + 2 x 1.9 = 8 ms (1.9 plain rounds) is what it can reach, by this profile: the plan's 1.1 to 1.3 needs less work
+a tile as well (fewer MMAs, the attention's rows together), not only fewer weight reads.
+
+## Memory
+
+A session's round buffers hold the widest round plan its backend lowered: rows, logits and sampling scratch (`cz`,
+`ci`: the vocabulary of 130,560 floats and ints a row), attention partials, and 16 K/V slots more past the context
+for every 16 rows. `seq_bytes` of a session of 49,536 tokens (section 6): 1254.99 MB with the plans of the load (16
+rows), 1290.48 MB once trees of 31 drafts are lowered (32 rows), 1361.17 MB with trees of 63 (64 rows): 35.5 and 35.3
+MB for every 16 rows. An engine lowers no round of more than 16 rows of its own (its given trees are of 3, 7 and 15
+drafts; DV's trees of 31 will be its drafter's own), so its sessions are what they were before this change; on the
+8 GB card those 35 MB would be about 1,400 positions of a fitted context (24.6 KB a position). `tree_bench` and
+golden_test lower their wider trees after the load, and the sessions they make after it lease the larger size
+(`Engine::session_bytes()` asks the backend at every session), so the ledger refuses one that does not fit rather
+than the GPU running short.
+
+## Rule 4 on the real model
+
+`tree_bench --check 400`: tree rounds that hide plain decoding's continuation on a random path of a random tree (the
+other drafts never the token chosen at their depth) give plain decoding's tokens and accept exactly that path (on the
+final code, section 6; the runs before the review fixes, section 3, gave the same):
+
+| trees (drafts) | context | options | rounds | tokens equal | hidden path accepted |
+|---|---:|---|---:|---:|---:|
+| 3, 7, 15, 31 | 1024 | | 105 | 405 of 405 | 105 of 105 |
+| 3, 7, 15, 31 | 9000 (rows past 8192 keys on `attention_rows_mma`) | | 105 | 405 of 405 | 105 of 105 |
+| 31 | 1024 | | 70 | 404 of 404 | 70 of 70 |
+| 47, 63 | 1024 | | 53 | 400 of 400 | 53 of 53 |
+| 31, 63 | 1024 | `rows_attention_from=0` | 57 | 401 of 401 | 57 of 57 |
+| 31, 63 | 1024 | `fusion=0` | 57 | 401 of 401 | 57 of 57 |
+
+The first run of trees of 47 and 63 drafts (before the fix in this change) gave plain decoding's tokens but
+accepted the hidden path in 22 of 64 rounds: `given_drafts` copied the launch's drafts with one thread a draft, 32
+of them, so drafts past the 32nd kept the round before's. It now loops over the drafts (and golden_test's trees of
+47 and 63 drafts fail without that).
+
+## Rounds of up to 16 rows: unchanged
+
+GSM8K's first 50 questions as the [plain record](2026-11-17-rtx5060ti-minicpm5-gsm8k-plain.md) runs them, on the
+final code (section 6), each record compared with `bench/ab/same_runs.py` (the same answers and, round by round, the
+same rounds over the prompts both records hold):
+
+```
+SUFFIX='\nPlease reason step by step, and put your final answer within \boxed{}.'
+flyx bench minicpm5-1b.flyx --prompts gsm8k_test.jsonl --suffix "$SUFFIX" --kv 16 --ctx 2048 --no-lookup \
+    --limit 50 --json plain50.json
+flyx bench minicpm5-1b-dv.flyx --prompts gsm8k_test.jsonl --suffix "$SUFFIX" --kv 16 --ctx 2048 --drafter dv \
+    --limit 50 --json dv50.json
+python -I bench/ab/same_runs.py plain50.json plain.json    # the plain record's run (sha256 a7eb7f26...)
+python -I bench/ab/same_runs.py dv50.json dv_pool15.json   # the DV record's run of minicpm5-1b-dv.flyx (81b96763...)
+```
+
+Plain decoding gives the plain record's answers and rounds (50 of 50, 14,584 rounds), and DV's rounds of 15 drafts
+are the [DV record](2026-11-17-rtx5060ti-minicpm5-gsm8k-dv15.md)'s round for round (50 of 50, 2,990 rounds, every
+one's tokens and accepted drafts; 4.864 tokens a round). The records' sha256 are in the DV record's raw output.
+
+Plain decoding's speed against the commit this change starts from, 4ae5ae7 (`git archive 4ae5ae7`, built the same
+way: `release-windows` with `FLYX_CUDA_ARCHS=120-real`), the plain command above with `--json ab_{old,new}_K.json`,
+the two builds taking turns (pairs 1 and 3 the old build first, 2 and 4 the new), decode tok/s:
+
+| pair | 1 | 2 | 3 | 4 | median |
+|---|---:|---:|---:|---:|---:|
+| 4ae5ae7 | 225.1 | 228.5 | 228.7 | 227.0 | 227.8 |
+| this change | 222.1 | 227.5 | 228.6 | 228.6 | 228.1 |
+
+The per-pair difference's median is -0.6 tok/s (-0.2%), the first pair (the GPU's first minutes) the widest; each
+pair's two records have the same answers and rounds (same_runs.py, section 6). The plain record's 232 tok/s and the
+DV record's 238 were measured earlier the same day with less of the GPU held by other programs.

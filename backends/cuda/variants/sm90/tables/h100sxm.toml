@@ -1,0 +1,512 @@
+# Copyright 2026 The flyx Authors. SPDX-License-Identifier: Apache-2.0
+# Tuning table for NVIDIA H100 80GB HBM3, written by `cuda_bench tune Qwen3.8-27B-UD-IQ3_XXS.gguf`.
+# GB/s of weights streamed in brackets.
+# 2026-11-20, NVIDIA H100 SXM 80 GB, driver 610.57.04, power limit 700 W, max SM clock 1980 MHz.
+sku = "h100sxm"
+devices = ["NVIDIA H100 80GB HBM3"]
+
+# FP8 GQA, one full middle window; six orders, five timed launches per sample (ms).
+# HB2 4.5770 4.4654 4.4428 4.4428 4.4425 4.4424 median 4.4428
+# HB3 4.7457 4.5848 4.5907 4.5810 4.5909 4.5933 median 4.5908
+# HB6 3.4257 3.4260 3.4030 3.4029 3.4022 3.4035 median 3.4033
+[[flash_gqa]]
+fp8 = true
+nh = 24
+nkv = 4
+hd = 256
+rows = 256
+keys = 32832
+hb = 6
+
+# FP8 GQA, one full middle window; six orders, five timed launches per sample (ms).
+# HB2 9.4877 9.4976 9.4960 9.4976 9.4980 9.4956 median 9.4968
+# HB3 9.1974 9.2093 9.2136 9.2100 9.2056 9.2093 median 9.2093
+# HB6 6.8136 6.8179 6.8117 6.8178 6.8138 6.8154 median 6.8146
+[[flash_gqa]]
+fp8 = true
+nh = 24
+nkv = 4
+hd = 256
+rows = 1024
+keys = 32832
+hb = 6
+
+[[gemm]]  # attention q|k|v
+format = "nvfp4"
+n = 10240
+k = 2560
+rules = [
+  { rows = [1, 8], span = 128, chunks = 4, nt = 2, warps = 4, unroll = 4 },  # r1 935 r4 928 r8 930
+  { rows = [9, 16], span = 128, chunks = 4, nt = 2, warps = 2, unroll = 4 },  # r16 770
+]
+
+[[gemm]]  # gdn in (qkv|z|b|a)
+format = "nvfp4"
+n = 12352
+k = 2560
+rules = [
+  { rows = [1, 8], span = 128, chunks = 4, nt = 2, warps = 4, unroll = 4 },  # r1 1005 r4 1006 r8 1007
+  { rows = [9, 16], span = 128, chunks = 4, nt = 2, warps = 2, unroll = 4 },  # r16 893
+]
+
+[[gemm]]  # mlp gate|up
+format = "nvfp4"
+n = 18432
+k = 2560
+rules = [
+  { rows = [1, 16], span = 128, chunks = 4, nt = 2, warps = 4, unroll = 4 },  # r1 1172 r4 1159 r8 1152 r16 959
+]
+
+[[gemm]]  # mlp down
+format = "nvfp4"
+n = 2560
+k = 9216
+rules = [
+  { rows = [1, 8], span = 128, chunks = 8, nt = 1, warps = 8, unroll = 4 },  # r1 787 r4 786 r8 769
+  { rows = [9, 16], span = 128, chunks = 8, nt = 2, warps = 8, unroll = 4 },  # r16 585
+]
+
+[[gemm]]  # attention / gdn out
+format = "nvfp4"
+n = 2560
+k = 4096
+rules = [
+  { rows = [1, 8], span = 128, chunks = 8, nt = 1, warps = 8, unroll = 4 },  # r1 560 r4 555 r8 542
+  { rows = [9, 16], span = 128, chunks = 8, nt = 2, warps = 8, unroll = 4 },  # r16 452
+]
+
+[[gemm]]  # lm head
+format = "bf16"
+n = 248320
+k = 2560
+rules = [
+  { rows = [1, 8], nt = 2, warps = 16, unroll = 8 },  # r1 2917 r4 2918 r8 2835
+  { rows = [9, 16], nt = 4, warps = 16, unroll = 4 },  # r16 2287
+]
+
+[[gemm]]  # mtp q|k|v, dflash2 context k|v
+format = "bf16"
+n = 10240
+k = 2560
+rules = [
+  { rows = [1, 8], nt = 2, warps = 16, unroll = 8 },  # r1 2027 r4 1982 r8 1941
+  { rows = [9, 16], nt = 2, warps = 8, unroll = 8 },  # r16 1716
+]
+
+[[gemm]]  # mtp / dflash2 mlp gate|up
+format = "bf16"
+n = 18432
+k = 2560
+rules = [
+  { rows = [1, 16], nt = 2, warps = 8, unroll = 8 },  # r1 2333 r4 2292 r8 2255 r16 2111
+]
+
+[[gemm]]  # mtp / dflash2 mlp down
+format = "bf16"
+n = 2560
+k = 9216
+rules = [
+  { rows = [1, 8], nt = 2, warps = 16, unroll = 4 },  # r1 1769 r4 1742 r8 1700
+  { rows = [9, 16], nt = 4, warps = 16, unroll = 4 },  # r16 1578
+]
+
+[[gemm]]  # mtp / dflash2 attention out
+format = "bf16"
+n = 2560
+k = 4096
+rules = [
+  { rows = [1, 8], nt = 2, warps = 16, unroll = 4 },  # r1 1448 r4 1396 r8 1341
+  { rows = [9, 16], nt = 4, warps = 16, unroll = 4 },  # r16 1327
+]
+
+[[gemm]]  # mtp fc
+format = "bf16"
+n = 2560
+k = 5120
+rules = [
+  { rows = [1, 8], nt = 2, warps = 16, unroll = 4 },  # r1 1541 r4 1521 r8 1481
+  { rows = [9, 16], nt = 4, warps = 16, unroll = 4 },  # r16 1395
+]
+
+[[gemm]]  # dflash2 q|k|v
+format = "bf16"
+n = 6144
+k = 2560
+rules = [
+  { rows = [1, 16], nt = 2, warps = 8, unroll = 8 },  # r1 1832 r4 1813 r8 1789 r16 1657
+]
+
+[[gemm]]  # dflash2 conv proj
+format = "bf16"
+n = 640
+k = 2560
+rules = [
+  { rows = [1, 16], nt = 1, warps = 16, unroll = 16 },  # r1 407 r4 403 r8 398 r16 372
+]
+
+[[gemm]]  # dflash2 fc
+format = "bf16"
+n = 2560
+k = 12800
+rules = [
+  { rows = [1, 8], nt = 2, warps = 16, unroll = 4 },  # r1 1792 r4 1768 r8 1729
+  { rows = [9, 16], nt = 4, warps = 16, unroll = 4 },  # r16 1642
+]
+
+[[gemm]]  # dflash2 selector
+format = "bf16"
+n = 256
+k = 2560
+rules = [
+  { rows = [1, 4], nt = 1, warps = 16, unroll = 16 },  # r1 167 r4 165
+  { rows = [5, 8], nt = 1, warps = 16, unroll = 8 },  # r8 163
+  { rows = [9, 16], nt = 1, warps = 16, unroll = 16 },  # r16 153
+]
+
+[[gemm]]  # lm head in W12 (the same bits as bf16)
+format = "w12"
+n = 248320
+k = 2560
+rules = [
+  { rows = [1, 16], nt = 4, warps = 8, unroll = 4 },  # r1 1748 r4 1698 r8 1658 r16 1428
+]
+
+[[gemm]]  # 27B attention q|k|v
+format = "nvfp4"
+n = 14336
+k = 5120
+rules = [
+  { rows = [1, 16], span = 128, chunks = 8, nt = 2, warps = 8, unroll = 4 },  # r1 1340 r4 1332 r8 1326 r16 1008
+]
+
+[[gemm]]  # 27B gdn in (qkv|z|b|a)
+format = "nvfp4"
+n = 16480
+k = 5120
+rules = [
+  { rows = [1, 16], span = 128, chunks = 8, nt = 2, warps = 8, unroll = 4 },  # r1 1393 r4 1379 r8 1368 r16 1129
+]
+
+[[gemm]]  # 27B mlp gate|up
+format = "nvfp4"
+n = 34816
+k = 5120
+rules = [
+  { rows = [1, 16], span = 128, chunks = 8, nt = 2, warps = 8, unroll = 4 },  # r1 1589 r4 1578 r8 1568 r16 1269
+]
+
+[[gemm]]  # 27B mlp down
+format = "nvfp4"
+n = 5120
+k = 17408
+rules = [
+  { rows = [1, 4], span = 128, chunks = 8, nt = 1, warps = 4, unroll = 4 },  # r1 1287 r4 1282
+  { rows = [5, 16], span = 128, chunks = 8, nt = 2, warps = 8, unroll = 4 },  # r8 1260 r16 1007
+]
+
+[[gemm]]  # 27B attention / gdn out
+format = "nvfp4"
+n = 5120
+k = 6144
+rules = [
+  { rows = [1, 8], span = 128, chunks = 4, nt = 1, warps = 4, unroll = 8 },  # r1 946 r4 946 r8 901
+  { rows = [9, 16], span = 128, chunks = 4, nt = 2, warps = 4, unroll = 4 },  # r16 840
+]
+
+# This GPU's rules: for shapes no [[gemm]] lists, and the GGML block kernels' on the files' block matrices.
+[rules]
+bf16 = [
+  { rows = [1, 8], nt = 2, warps = 16, unroll = 8 },
+  { rows = [9, 16], nt = 4, warps = 16, unroll = 4 },
+]
+nvfp4_k128 = { span = 128, chunks = 8, nt = 2, warps = 8, unroll = 4 }
+nvfp4_k64 = { span = 64, chunks = 4, nt = 1, warps = 4, unroll = 4 }
+blocks = [
+  { n_max = 2048, rows = [1, 16], nt = 1, nw = 2, kw = 4 },
+  { n_max = 6144, rows = [1, 4], nt = 1, nw = 2, kw = 4 },
+  { n_max = 6144, rows = [5, 16], nt = 2, nw = 2, kw = 4 },
+  { n_max = 12288, rows = [1, 1], nt = 1, nw = 2, kw = 4 },
+  { n_max = 12288, rows = [2, 2], nt = 2, nw = 2, kw = 4 },
+  { n_max = 12288, rows = [3, 16], nt = 1, nw = 4, kw = 2 },
+  { n_max = 65536, rows = [1, 4], nt = 2, nw = 2, kw = 4 },
+  { n_max = 65536, rows = [5, 16], nt = 2, nw = 4, kw = 1 },
+  { rows = [1, 4], nt = 2, nw = 4, kw = 1 },
+  { rows = [5, 16], nt = 2, nw = 8, kw = 1 },
+]
+# blocks, 1 rows: 19181 us with these rules, 21574 with the defaults (-11.1%), 18960 with the best for each
+# blocks, 2 rows: 20270 us with these rules, 22172 with the defaults (-8.6%), 20001 with the best for each
+# blocks, 4 rows: 23153 us with these rules, 27019 with the defaults (-14.3%), 22751 with the best for each
+# blocks, 8 rows: 29539 us with these rules, 32417 with the defaults (-8.9%), 28795 with the best for each
+# blocks, 16 rows: 29652 us with these rules, 32540 with the defaults (-8.9%), 28920 with the best for each
+blocks_q8_runs = [
+  { n_max = 5120, runs = 4 },
+  { n_max = 6144, runs = 2 },
+  { n_max = 12288, runs = 1 },
+  { n_max = 17408, runs = 2 },
+  { runs = 1 },
+]
+# blocks_q8_runs, passes of 32, 64, 128 and 512 rows: 368308 us with these runs, 379081 with the defaults' (-2.8%)
+blocks_q8 = [
+  { types = ["Q2_K"], rows = [17, 128], bn = 64, qk = 128, bm = 64 },
+  { types = ["Q2_K"], rows = [129, 2147483647], n_max = 64, bn = 64, qk = 128, bm = 64 },
+  { types = ["Q2_K"], rows = [129, 2147483647], n_max = 2048, bn = 64, qk = 64, bm = 128 },
+  { types = ["Q2_K"], rows = [129, 2147483647], n_max = 5120, bn = 128, qk = 64, bm = 128 },
+  { types = ["Q2_K"], rows = [129, 2147483647], n_max = 6144, bn = 64, qk = 128, bm = 64 },
+  { types = ["Q2_K"], bn = 64, qk = 64, bm = 128 },
+  { types = ["IQ2_XS"], rows = [17, 128], n_max = 5120, bn = 64, qk = 128, bm = 64 },
+  { types = ["IQ2_XS"], rows = [17, 128], n_max = 6144, bn = 128, qk = 256, bm = 64 },
+  { types = ["IQ2_XS"], rows = [17, 128], bn = 64, qk = 128, bm = 64 },
+  { types = ["IQ2_XS"], rows = [129, 2147483647], n_max = 64, bn = 64, qk = 128, bm = 64 },
+  { types = ["IQ2_XS"], rows = [129, 2147483647], n_max = 2048, bn = 64, qk = 64, bm = 128 },
+  { types = ["IQ2_XS"], rows = [129, 2147483647], n_max = 5120, bn = 128, qk = 64, bm = 128 },
+  { types = ["IQ2_XS"], rows = [129, 2147483647], n_max = 6144, bn = 128, qk = 256, bm = 64 },
+  { types = ["IQ2_XS"], rows = [129, 2147483647], n_max = 12288, bn = 64, qk = 64, bm = 128 },
+  { types = ["IQ2_XS"], rows = [129, 2147483647], n_max = 65536, bn = 128, qk = 256, bm = 64 },
+  { types = ["IQ2_XS"], bn = 64, qk = 64, bm = 128 },
+  { rows = [17, 128], n_max = 5120, bn = 64, qk = 128, bm = 64 },
+  { rows = [17, 128], n_max = 6144, bn = 128, qk = 256, bm = 64 },
+  { rows = [17, 128], bn = 64, qk = 128, bm = 64 },
+  { rows = [129, 2147483647], n_max = 64, bn = 64, qk = 128, bm = 64 },
+  { rows = [129, 2147483647], n_max = 5120, bn = 64, qk = 64, bm = 128 },
+  { rows = [129, 2147483647], n_max = 6144, bn = 128, qk = 256, bm = 64 },
+  { bn = 64, qk = 64, bm = 128 },
+]
+# blocks_q8, passes of 32, 64 and 128 rows: 161017 us with these rules, 186748 with the defaults (-13.8%), 160924 with the best for each
+# blocks_q8, passes of 512 rows: 209173 us with these rules, 229995 with the defaults (-9.1%), 208635 with the best for each
+blocks_round = [
+  { types = ["IQ3_XXS"], rows = [1, 1], n_min = 2048, n_max = 5120, columns = 2, ahead = 0 },
+  { types = ["IQ2_S"], rows = [2, 2], n_min = 2048, n_max = 5120, columns = 4, ahead = 0, warps = 16, staged = 1 },
+  { types = ["Q2_K"], rows = [3, 4], n_max = 12288, columns = 4, ahead = 0, staged = 1 },
+  { types = ["IQ4_XS"], rows = [3, 4], n_min = 2048, n_max = 5120, columns = 2, ahead = 0 },
+  { types = ["IQ3_S"], rows = [3, 4], n_min = 5120, n_max = 6144, columns = 2, ahead = 0 },
+  { types = ["IQ3_S", "IQ4_XS"], rows = [3, 4], n_min = 6144, n_max = 65536, columns = 2, ahead = 0 },
+  { types = ["Q2_K"], rows = [5, 6], n_min = 2048, n_max = 12288, columns = 0, ahead = 0, warps = 16, staged = 1 },
+  { types = ["IQ3_S"], rows = [5, 6], n_min = 5120, n_max = 6144, columns = 2, ahead = 0 },
+  { types = ["IQ3_S", "IQ4_XS"], rows = [5, 6], n_min = 6144, n_max = 65536, columns = 2, ahead = 0 },
+  { types = ["Q2_K"], rows = [7, 8], n_min = 2048, n_max = 12288, columns = 0, ahead = 0, warps = 16, staged = 1 },
+  { types = ["Q4_K"], rows = [7, 8], n_min = 2048, n_max = 5120, tensor_cores = "split_columns" },
+  { types = ["IQ3_S"], rows = [7, 8], n_min = 5120, n_max = 6144, columns = 2, ahead = 0 },
+  { types = ["IQ3_S", "IQ4_XS"], rows = [7, 8], n_min = 12288, n_max = 65536, columns = 2, ahead = 0 },
+  { rows = [1, 1], n_max = 64, kernel = 2, columns = 1, ahead = 0 },
+  { rows = [1, 1], n_min = 64, n_max = 5120, columns = 1, ahead = 2 },
+  { rows = [1, 1], n_min = 5120, n_max = 65536, columns = 2, ahead = 0 },
+  { rows = [1, 1], n_min = 65536, columns = 1, ahead = 2 },
+  { rows = [2, 2], n_max = 2048, columns = 1, ahead = 0 },
+  { rows = [2, 2], n_min = 2048, columns = 2, ahead = 0 },
+  { rows = [3, 4], n_max = 6144, columns = 4, ahead = 0, staged = 1 },
+  { rows = [3, 4], n_min = 6144, n_max = 12288, columns = 2, ahead = 0 },
+  { rows = [3, 4], n_min = 12288, columns = 4, ahead = 0, staged = 1 },
+  { rows = [5, 6], n_max = 2048, columns = 0, ahead = 0, warps = 16, staged = 1, parts = 2 },
+  { rows = [5, 6], n_min = 2048, n_max = 6144, columns = 0, ahead = 0, warps = 16, staged = 1 },
+  { rows = [5, 6], n_min = 6144, n_max = 12288, columns = 2, ahead = 0 },
+  { rows = [5, 6], n_min = 12288, n_max = 65536, columns = 0, ahead = 0, warps = 16, staged = 1 },
+  { rows = [5, 6], n_min = 65536, tensor_cores = "split_columns" },
+  { rows = [7, 8], n_max = 2048, columns = 0, ahead = 0, warps = 16, staged = 1, parts = 2 },
+  { rows = [7, 8], n_min = 2048, n_max = 6144, columns = 0, ahead = 0, warps = 16, staged = 1 },
+  { rows = [7, 8], n_min = 6144, n_max = 12288, tensor_cores = "split" },
+  { rows = [7, 8], n_min = 12288, n_max = 65536, columns = 0, ahead = 0, warps = 16, staged = 1 },
+  { rows = [7, 8], n_min = 65536, tensor_cores = "split_columns" },
+  { rows = [9, 16], tensor_cores = "split" },
+]
+# blocks_round, rounds of 1 rows: 8738 us with these rules, 10162 with the defaults (-14.0%), 8678 with the best for each
+# blocks_round, rounds of 2 rows: 10370 us with these rules, 11216 with the defaults (-7.5%), 10211 with the best for each
+# blocks_round, rounds of 4 rows: 12561 us with these rules, 14832 with the defaults (-15.3%), 12411 with the best for each
+# blocks_round, rounds of 6 rows: 14525 us with these rules, 16802 with the defaults (-13.6%), 14222 with the best for each
+# blocks_round, rounds of 8 rows: 15927 us with these rules, 19514 with the defaults (-18.4%), 15394 with the best for each
+# blocks_round, rounds of 16 rows: 20692 us with these rules, 29467 with the defaults (-29.8%), 20663 with the best for each
+# round shape Q8_0 N=48 rows=1 active=0 430.51 us best=2 413.43 us; K:count 5120:96
+#   { types = ["Q8_0"], rows = [1, 1], n_min = 47, n_max = 48, kernel = 2, columns = 1, ahead = 0 },
+# round shape Q8_0 N=48 rows=4 active=5 928.73 us best=12 610.65 us; K:count 5120:96
+#   { types = ["Q8_0"], rows = [4, 4], n_min = 47, n_max = 48, columns = 4, ahead = 0, staged = 1 },
+# round shape Q8_0 N=1024 rows=1 active=0 11.55 us best=2 11.26 us; K:count 5120:2
+#   { types = ["Q8_0"], rows = [1, 1], n_min = 1023, n_max = 1024, kernel = 2, columns = 1, ahead = 0 },
+# round shape Q8_0 N=1024 rows=4 active=5 22.24 us best=12 14.93 us; K:count 5120:2
+#   { types = ["Q8_0"], rows = [4, 4], n_min = 1023, n_max = 1024, columns = 4, ahead = 0, staged = 1 },
+# round shape Q2_K N=5120 rows=1 active=1 17.35 us best=1 17.35 us; K:count 17408:1
+#   { types = ["Q2_K"], rows = [1, 1], n_min = 5119, n_max = 5120, columns = 2, ahead = 0 },
+# round shape Q2_K N=5120 rows=4 active=6 66.85 us best=12 30.92 us; K:count 17408:1
+#   { types = ["Q2_K"], rows = [4, 4], n_min = 5119, n_max = 5120, columns = 4, ahead = 0, staged = 1 },
+# round shape Q2_K N=6144 rows=1 active=1 15.68 us best=1 15.68 us; K:count 5120:2
+#   { types = ["Q2_K"], rows = [1, 1], n_min = 6143, n_max = 6144, columns = 2, ahead = 0 },
+# round shape Q2_K N=6144 rows=4 active=6 36.07 us best=12 25.88 us; K:count 5120:2
+#   { types = ["Q2_K"], rows = [4, 4], n_min = 6143, n_max = 6144, columns = 4, ahead = 0, staged = 1 },
+# round shape Q2_K N=10240 rows=1 active=4 30.02 us best=1 23.72 us; K:count 5120:2
+#   { types = ["Q2_K"], rows = [1, 1], n_min = 10239, n_max = 10240, columns = 2, ahead = 0 },
+# round shape Q2_K N=10240 rows=4 active=7 45.32 us best=12 35.80 us; K:count 5120:2
+#   { types = ["Q2_K"], rows = [4, 4], n_min = 10239, n_max = 10240, columns = 4, ahead = 0, staged = 1 },
+# round shape Q2_K N=12288 rows=1 active=4 61.94 us best=1 49.69 us; K:count 5120:4
+#   { types = ["Q2_K"], rows = [1, 1], n_min = 12287, n_max = 12288, columns = 2, ahead = 0 },
+# round shape Q2_K N=12288 rows=4 active=7 91.61 us best=12 72.84 us; K:count 5120:4
+#   { types = ["Q2_K"], rows = [4, 4], n_min = 12287, n_max = 12288, columns = 4, ahead = 0, staged = 1 },
+# round shape Q3_K N=5120 rows=1 active=1 78.84 us best=0 65.39 us; K:count 6144:3 17408:1
+#   { types = ["Q3_K"], rows = [1, 1], n_min = 5119, n_max = 5120, columns = 1, ahead = 2 },
+# round shape Q3_K N=5120 rows=4 active=6 113.21 us best=12 98.37 us; K:count 6144:3 17408:1
+#   { types = ["Q3_K"], rows = [4, 4], n_min = 5119, n_max = 5120, columns = 4, ahead = 0, staged = 1 },
+# round shape Q3_K N=17408 rows=1 active=4 56.64 us best=3 55.15 us; K:count 5120:2
+#   { types = ["Q3_K"], rows = [1, 1], n_min = 17407, n_max = 17408, kernel = 2, columns = 2, ahead = 0 },
+# round shape Q3_K N=17408 rows=4 active=6 82.87 us best=12 73.36 us; K:count 5120:2
+#   { types = ["Q3_K"], rows = [4, 4], n_min = 17407, n_max = 17408, columns = 4, ahead = 0, staged = 1 },
+# round shape Q4_K N=1024 rows=1 active=0 109.05 us best=0 109.05 us; K:count 5120:19
+#   { types = ["Q4_K"], rows = [1, 1], n_min = 1023, n_max = 1024, columns = 1, ahead = 2 },
+# round shape Q4_K N=1024 rows=4 active=5 213.25 us best=12 187.03 us; K:count 5120:19
+#   { types = ["Q4_K"], rows = [4, 4], n_min = 1023, n_max = 1024, columns = 4, ahead = 0, staged = 1 },
+# round shape Q4_K N=5120 rows=1 active=1 88.54 us best=0 77.88 us; K:count 6144:4 17408:1
+#   { types = ["Q4_K"], rows = [1, 1], n_min = 5119, n_max = 5120, columns = 1, ahead = 2 },
+# round shape Q4_K N=5120 rows=4 active=6 161.10 us best=-4 116.49 us; K:count 6144:4 17408:1
+#   { types = ["Q4_K"], rows = [4, 4], n_min = 5119, n_max = 5120, tensor_cores = "split_columns" },
+# round shape Q4_K N=17408 rows=1 active=4 30.71 us best=1 25.90 us; K:count 5120:1
+#   { types = ["Q4_K"], rows = [1, 1], n_min = 17407, n_max = 17408, columns = 2, ahead = 0 },
+# round shape Q4_K N=17408 rows=4 active=-2 51.94 us best=12 37.51 us; K:count 5120:1
+#   { types = ["Q4_K"], rows = [4, 4], n_min = 17407, n_max = 17408, columns = 4, ahead = 0, staged = 1 },
+# round shape Q4_K N=248320 rows=1 active=4 321.21 us best=0 266.99 us; K:count 5120:1
+#   { types = ["Q4_K"], rows = [1, 1], n_min = 248319, n_max = 248320, columns = 1, ahead = 2 },
+# round shape Q4_K N=248320 rows=4 active=6 417.29 us best=12 387.76 us; K:count 5120:1
+#   { types = ["Q4_K"], rows = [4, 4], n_min = 248319, n_max = 248320, columns = 4, ahead = 0, staged = 1 },
+# round shape Q5_K N=1024 rows=1 active=0 48.47 us best=2 41.79 us; K:count 5120:7
+#   { types = ["Q5_K"], rows = [1, 1], n_min = 1023, n_max = 1024, kernel = 2, columns = 1, ahead = 0 },
+# round shape Q5_K N=1024 rows=4 active=5 68.65 us best=5 68.65 us; K:count 5120:7
+#   { types = ["Q5_K"], rows = [4, 4], n_min = 1023, n_max = 1024, columns = 1, ahead = 0 },
+# round shape Q6_K N=5120 rows=1 active=1 71.03 us best=2 66.76 us; K:count 6144:1 10240:1 17408:1
+#   { types = ["Q6_K"], rows = [1, 1], n_min = 5119, n_max = 5120, kernel = 2, columns = 1, ahead = 0 },
+# round shape Q6_K N=5120 rows=4 active=-5 101.10 us best=12 89.34 us; K:count 6144:1 10240:1 17408:1
+#   { types = ["Q6_K"], rows = [4, 4], n_min = 5119, n_max = 5120, columns = 4, ahead = 0, staged = 1 },
+# round shape Q6_K N=12288 rows=1 active=4 23.31 us best=3 21.69 us; K:count 5120:1
+#   { types = ["Q6_K"], rows = [1, 1], n_min = 12287, n_max = 12288, kernel = 2, columns = 2, ahead = 0 },
+# round shape Q6_K N=12288 rows=4 active=-5 32.59 us best=12 26.36 us; K:count 5120:1
+#   { types = ["Q6_K"], rows = [4, 4], n_min = 12287, n_max = 12288, columns = 4, ahead = 0, staged = 1 },
+# round shape Q6_K N=17408 rows=1 active=4 65.49 us best=3 61.12 us; K:count 5120:2
+#   { types = ["Q6_K"], rows = [1, 1], n_min = 17407, n_max = 17408, kernel = 2, columns = 2, ahead = 0 },
+# round shape Q6_K N=17408 rows=4 active=-5 91.88 us best=12 76.38 us; K:count 5120:2
+#   { types = ["Q6_K"], rows = [4, 4], n_min = 17407, n_max = 17408, columns = 4, ahead = 0, staged = 1 },
+# round shape IQ2_XXS N=5120 rows=1 active=1 81.54 us best=1 81.54 us; K:count 6144:1 17408:4
+#   { types = ["IQ2_XXS"], rows = [1, 1], n_min = 5119, n_max = 5120, columns = 2, ahead = 0 },
+# round shape IQ2_XXS N=5120 rows=4 active=6 167.37 us best=12 131.64 us; K:count 6144:1 17408:4
+#   { types = ["IQ2_XXS"], rows = [4, 4], n_min = 5119, n_max = 5120, columns = 4, ahead = 0, staged = 1 },
+# round shape IQ2_XXS N=6144 rows=1 active=1 8.59 us best=1 8.59 us; K:count 5120:1
+#   { types = ["IQ2_XXS"], rows = [1, 1], n_min = 6143, n_max = 6144, columns = 2, ahead = 0 },
+# round shape IQ2_XXS N=6144 rows=4 active=6 14.04 us best=12 12.54 us; K:count 5120:1
+#   { types = ["IQ2_XXS"], rows = [4, 4], n_min = 6143, n_max = 6144, columns = 4, ahead = 0, staged = 1 },
+# round shape IQ2_XXS N=10240 rows=1 active=4 66.33 us best=1 52.19 us; K:count 5120:4
+#   { types = ["IQ2_XXS"], rows = [1, 1], n_min = 10239, n_max = 10240, columns = 2, ahead = 0 },
+# round shape IQ2_XXS N=10240 rows=4 active=7 89.77 us best=12 81.33 us; K:count 5120:4
+#   { types = ["IQ2_XXS"], rows = [4, 4], n_min = 10239, n_max = 10240, columns = 4, ahead = 0, staged = 1 },
+# round shape IQ2_XXS N=12288 rows=1 active=4 16.76 us best=3 13.38 us; K:count 5120:1
+#   { types = ["IQ2_XXS"], rows = [1, 1], n_min = 12287, n_max = 12288, kernel = 2, columns = 2, ahead = 0 },
+# round shape IQ2_XXS N=12288 rows=4 active=7 22.48 us best=12 20.54 us; K:count 5120:1
+#   { types = ["IQ2_XXS"], rows = [4, 4], n_min = 12287, n_max = 12288, columns = 4, ahead = 0, staged = 1 },
+# round shape IQ2_XXS N=17408 rows=1 active=4 295.11 us best=1 229.82 us; K:count 5120:13
+#   { types = ["IQ2_XXS"], rows = [1, 1], n_min = 17407, n_max = 17408, columns = 2, ahead = 0 },
+# round shape IQ2_XXS N=17408 rows=4 active=7 400.08 us best=6 370.41 us; K:count 5120:13
+#   { types = ["IQ2_XXS"], rows = [4, 4], n_min = 17407, n_max = 17408, columns = 2, ahead = 0 },
+# round shape IQ2_XS N=5120 rows=1 active=1 84.11 us best=0 82.31 us; K:count 17408:4
+#   { types = ["IQ2_XS"], rows = [1, 1], n_min = 5119, n_max = 5120, columns = 1, ahead = 2 },
+# round shape IQ2_XS N=5120 rows=4 active=6 241.65 us best=12 130.34 us; K:count 17408:4
+#   { types = ["IQ2_XS"], rows = [4, 4], n_min = 5119, n_max = 5120, columns = 4, ahead = 0, staged = 1 },
+# round shape IQ2_XS N=6144 rows=1 active=1 9.65 us best=3 9.65 us; K:count 5120:1
+#   { types = ["IQ2_XS"], rows = [1, 1], n_min = 6143, n_max = 6144, kernel = 2, columns = 2, ahead = 0 },
+# round shape IQ2_XS N=6144 rows=4 active=6 19.08 us best=12 13.64 us; K:count 5120:1
+#   { types = ["IQ2_XS"], rows = [4, 4], n_min = 6143, n_max = 6144, columns = 4, ahead = 0, staged = 1 },
+# round shape IQ2_XS N=17408 rows=1 active=4 168.24 us best=1 143.89 us; K:count 5120:7
+#   { types = ["IQ2_XS"], rows = [1, 1], n_min = 17407, n_max = 17408, columns = 2, ahead = 0 },
+# round shape IQ2_XS N=17408 rows=4 active=7 235.10 us best=12 219.32 us; K:count 5120:7
+#   { types = ["IQ2_XS"], rows = [4, 4], n_min = 17407, n_max = 17408, columns = 4, ahead = 0, staged = 1 },
+# round shape IQ2_S N=5120 rows=1 active=1 174.05 us best=0 172.28 us; K:count 6144:1 17408:7
+#   { types = ["IQ2_S"], rows = [1, 1], n_min = 5119, n_max = 5120, columns = 1, ahead = 2 },
+# round shape IQ2_S N=5120 rows=4 active=6 404.30 us best=12 266.06 us; K:count 6144:1 17408:7
+#   { types = ["IQ2_S"], rows = [4, 4], n_min = 5119, n_max = 5120, columns = 4, ahead = 0, staged = 1 },
+# round shape IQ2_S N=6144 rows=1 active=1 62.83 us best=1 62.83 us; K:count 5120:6
+#   { types = ["IQ2_S"], rows = [1, 1], n_min = 6143, n_max = 6144, columns = 2, ahead = 0 },
+# round shape IQ2_S N=6144 rows=4 active=6 108.53 us best=12 89.08 us; K:count 5120:6
+#   { types = ["IQ2_S"], rows = [4, 4], n_min = 6143, n_max = 6144, columns = 4, ahead = 0, staged = 1 },
+# round shape IQ2_S N=10240 rows=1 active=4 56.29 us best=1 48.50 us; K:count 5120:3
+#   { types = ["IQ2_S"], rows = [1, 1], n_min = 10239, n_max = 10240, columns = 2, ahead = 0 },
+# round shape IQ2_S N=10240 rows=4 active=7 76.64 us best=6 72.09 us; K:count 5120:3
+#   { types = ["IQ2_S"], rows = [4, 4], n_min = 10239, n_max = 10240, columns = 2, ahead = 0 },
+# round shape IQ2_S N=17408 rows=1 active=4 471.03 us best=1 407.01 us; K:count 5120:18
+#   { types = ["IQ2_S"], rows = [1, 1], n_min = 17407, n_max = 17408, columns = 2, ahead = 0 },
+# round shape IQ2_S N=17408 rows=4 active=7 638.37 us best=12 612.96 us; K:count 5120:18
+#   { types = ["IQ2_S"], rows = [4, 4], n_min = 17407, n_max = 17408, columns = 4, ahead = 0, staged = 1 },
+# round shape IQ3_XXS N=5120 rows=1 active=1 559.49 us best=1 559.49 us; K:count 6144:10 17408:15
+#   { types = ["IQ3_XXS"], rows = [1, 1], n_min = 5119, n_max = 5120, columns = 2, ahead = 0 },
+# round shape IQ3_XXS N=5120 rows=4 active=6 1111.42 us best=12 819.67 us; K:count 6144:10 17408:15
+#   { types = ["IQ3_XXS"], rows = [4, 4], n_min = 5119, n_max = 5120, columns = 4, ahead = 0, staged = 1 },
+# round shape IQ3_XXS N=6144 rows=1 active=1 285.04 us best=1 285.04 us; K:count 5120:24
+#   { types = ["IQ3_XXS"], rows = [1, 1], n_min = 6143, n_max = 6144, columns = 2, ahead = 0 },
+# round shape IQ3_XXS N=6144 rows=4 active=6 461.12 us best=12 394.05 us; K:count 5120:24
+#   { types = ["IQ3_XXS"], rows = [4, 4], n_min = 6143, n_max = 6144, columns = 4, ahead = 0, staged = 1 },
+# round shape IQ3_XXS N=10240 rows=1 active=4 506.42 us best=1 399.93 us; K:count 5120:21
+#   { types = ["IQ3_XXS"], rows = [1, 1], n_min = 10239, n_max = 10240, columns = 2, ahead = 0 },
+# round shape IQ3_XXS N=10240 rows=4 active=7 627.72 us best=6 546.43 us; K:count 5120:21
+#   { types = ["IQ3_XXS"], rows = [4, 4], n_min = 10239, n_max = 10240, columns = 2, ahead = 0 },
+# round shape IQ3_XXS N=12288 rows=1 active=4 145.27 us best=1 116.17 us; K:count 5120:6
+#   { types = ["IQ3_XXS"], rows = [1, 1], n_min = 12287, n_max = 12288, columns = 2, ahead = 0 },
+# round shape IQ3_XXS N=12288 rows=4 active=7 178.53 us best=6 158.07 us; K:count 5120:6
+#   { types = ["IQ3_XXS"], rows = [4, 4], n_min = 12287, n_max = 12288, columns = 2, ahead = 0 },
+# round shape IQ3_XXS N=17408 rows=1 active=4 1522.30 us best=1 1174.02 us; K:count 5120:44
+#   { types = ["IQ3_XXS"], rows = [1, 1], n_min = 17407, n_max = 17408, columns = 2, ahead = 0 },
+# round shape IQ3_XXS N=17408 rows=4 active=7 1881.31 us best=12 1767.55 us; K:count 5120:44
+#   { types = ["IQ3_XXS"], rows = [4, 4], n_min = 17407, n_max = 17408, columns = 4, ahead = 0, staged = 1 },
+# round shape IQ3_S N=1024 rows=1 active=0 34.97 us best=2 34.52 us; K:count 5120:5
+#   { types = ["IQ3_S"], rows = [1, 1], n_min = 1023, n_max = 1024, kernel = 2, columns = 1, ahead = 0 },
+# round shape IQ3_S N=1024 rows=4 active=5 56.01 us best=5 56.01 us; K:count 5120:5
+#   { types = ["IQ3_S"], rows = [4, 4], n_min = 1023, n_max = 1024, columns = 1, ahead = 0 },
+# round shape IQ3_S N=5120 rows=1 active=1 1068.96 us best=0 964.25 us; K:count 6144:26 17408:20
+#   { types = ["IQ3_S"], rows = [1, 1], n_min = 5119, n_max = 5120, columns = 1, ahead = 2 },
+# round shape IQ3_S N=5120 rows=4 active=5 1818.60 us best=6 1487.55 us; K:count 6144:26 17408:20
+#   { types = ["IQ3_S"], rows = [4, 4], n_min = 5119, n_max = 5120, columns = 2, ahead = 0 },
+# round shape IQ3_S N=6144 rows=1 active=1 171.88 us best=1 171.88 us; K:count 5120:13
+#   { types = ["IQ3_S"], rows = [1, 1], n_min = 6143, n_max = 6144, columns = 2, ahead = 0 },
+# round shape IQ3_S N=6144 rows=4 active=5 261.96 us best=6 204.16 us; K:count 5120:13
+#   { types = ["IQ3_S"], rows = [4, 4], n_min = 6143, n_max = 6144, columns = 2, ahead = 0 },
+# round shape IQ3_S N=10240 rows=1 active=4 451.90 us best=0 348.53 us; K:count 5120:17
+#   { types = ["IQ3_S"], rows = [1, 1], n_min = 10239, n_max = 10240, columns = 1, ahead = 2 },
+# round shape IQ3_S N=10240 rows=4 active=7 545.63 us best=6 457.73 us; K:count 5120:17
+#   { types = ["IQ3_S"], rows = [4, 4], n_min = 10239, n_max = 10240, columns = 2, ahead = 0 },
+# round shape IQ3_S N=12288 rows=1 active=4 107.38 us best=1 89.77 us; K:count 5120:4
+#   { types = ["IQ3_S"], rows = [1, 1], n_min = 12287, n_max = 12288, columns = 2, ahead = 0 },
+# round shape IQ3_S N=12288 rows=4 active=7 128.95 us best=6 108.80 us; K:count 5120:4
+#   { types = ["IQ3_S"], rows = [4, 4], n_min = 12287, n_max = 12288, columns = 2, ahead = 0 },
+# round shape IQ3_S N=17408 rows=1 active=4 805.80 us best=1 668.75 us; K:count 5120:21
+#   { types = ["IQ3_S"], rows = [1, 1], n_min = 17407, n_max = 17408, columns = 2, ahead = 0 },
+# round shape IQ3_S N=17408 rows=4 active=7 975.93 us best=6 839.15 us; K:count 5120:21
+#   { types = ["IQ3_S"], rows = [4, 4], n_min = 17407, n_max = 17408, columns = 2, ahead = 0 },
+# round shape IQ1_S N=5120 rows=1 active=1 18.38 us best=3 18.18 us; K:count 17408:1
+#   { types = ["IQ1_S"], rows = [1, 1], n_min = 5119, n_max = 5120, kernel = 2, columns = 2, ahead = 0 },
+# round shape IQ1_S N=5120 rows=4 active=6 44.43 us best=12 28.25 us; K:count 17408:1
+#   { types = ["IQ1_S"], rows = [4, 4], n_min = 5119, n_max = 5120, columns = 4, ahead = 0, staged = 1 },
+# round shape IQ1_S N=17408 rows=1 active=4 153.64 us best=1 127.63 us; K:count 5120:7
+#   { types = ["IQ1_S"], rows = [1, 1], n_min = 17407, n_max = 17408, columns = 2, ahead = 0 },
+# round shape IQ1_S N=17408 rows=4 active=7 210.44 us best=12 193.66 us; K:count 5120:7
+#   { types = ["IQ1_S"], rows = [4, 4], n_min = 17407, n_max = 17408, columns = 4, ahead = 0, staged = 1 },
+# round shape IQ1_M N=5120 rows=1 active=1 44.81 us best=1 44.81 us; K:count 17408:2
+#   { types = ["IQ1_M"], rows = [1, 1], n_min = 5119, n_max = 5120, columns = 2, ahead = 0 },
+# round shape IQ1_M N=5120 rows=4 active=6 135.51 us best=12 68.60 us; K:count 17408:2
+#   { types = ["IQ1_M"], rows = [4, 4], n_min = 5119, n_max = 5120, columns = 4, ahead = 0, staged = 1 },
+# round shape IQ1_M N=17408 rows=1 active=4 25.46 us best=1 21.64 us; K:count 5120:1
+#   { types = ["IQ1_M"], rows = [1, 1], n_min = 17407, n_max = 17408, columns = 2, ahead = 0 },
+# round shape IQ1_M N=17408 rows=4 active=7 34.84 us best=12 32.95 us; K:count 5120:1
+#   { types = ["IQ1_M"], rows = [4, 4], n_min = 17407, n_max = 17408, columns = 4, ahead = 0, staged = 1 },
+# round shape IQ4_XS N=1024 rows=1 active=0 6.62 us best=0 6.62 us; K:count 5120:1
+#   { types = ["IQ4_XS"], rows = [1, 1], n_min = 1023, n_max = 1024, columns = 1, ahead = 2 },
+# round shape IQ4_XS N=1024 rows=4 active=-5 9.96 us best=-5 9.96 us; K:count 5120:1
+#   { types = ["IQ4_XS"], rows = [4, 4], n_min = 1023, n_max = 1024, tensor_cores = "warps" },
+# round shape IQ4_XS N=5120 rows=1 active=4 681.96 us best=0 515.00 us; K:count 6144:19 17408:8
+#   { types = ["IQ4_XS"], rows = [1, 1], n_min = 5119, n_max = 5120, columns = 1, ahead = 2 },
+# round shape IQ4_XS N=5120 rows=4 active=-5 735.69 us best=-5 735.69 us; K:count 6144:19 17408:8
+#   { types = ["IQ4_XS"], rows = [4, 4], n_min = 5119, n_max = 5120, tensor_cores = "warps" },
+# round shape IQ4_XS N=6144 rows=1 active=4 15.90 us best=1 13.10 us; K:count 5120:1
+#   { types = ["IQ4_XS"], rows = [1, 1], n_min = 6143, n_max = 6144, columns = 2, ahead = 0 },
+# round shape IQ4_XS N=6144 rows=4 active=-5 16.68 us best=6 15.69 us; K:count 5120:1
+#   { types = ["IQ4_XS"], rows = [4, 4], n_min = 6143, n_max = 6144, columns = 2, ahead = 0 },
+# round shape IQ4_XS N=10240 rows=1 active=4 27.00 us best=0 20.70 us; K:count 5120:1
+#   { types = ["IQ4_XS"], rows = [1, 1], n_min = 10239, n_max = 10240, columns = 1, ahead = 2 },
+# round shape IQ4_XS N=10240 rows=4 active=-5 29.27 us best=6 26.78 us; K:count 5120:1
+#   { types = ["IQ4_XS"], rows = [4, 4], n_min = 10239, n_max = 10240, columns = 2, ahead = 0 },
+# round shape IQ4_XS N=12288 rows=1 active=4 27.49 us best=1 22.44 us; K:count 5120:1
+#   { types = ["IQ4_XS"], rows = [1, 1], n_min = 12287, n_max = 12288, columns = 2, ahead = 0 },
+# round shape IQ4_XS N=12288 rows=4 active=-5 29.68 us best=6 27.19 us; K:count 5120:1
+#   { types = ["IQ4_XS"], rows = [4, 4], n_min = 12287, n_max = 12288, columns = 2, ahead = 0 },
+# round shape IQ4_XS N=17408 rows=1 active=4 546.58 us best=1 441.90 us; K:count 5120:14
+#   { types = ["IQ4_XS"], rows = [1, 1], n_min = 17407, n_max = 17408, columns = 2, ahead = 0 },
+# round shape IQ4_XS N=17408 rows=4 active=-5 596.55 us best=6 552.97 us; K:count 5120:14
+#   { types = ["IQ4_XS"], rows = [4, 4], n_min = 17407, n_max = 17408, columns = 2, ahead = 0 },

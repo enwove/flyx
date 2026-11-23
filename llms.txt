@@ -1,0 +1,38 @@
+# flyx
+
+> Low-latency local LLM inference engine for single-user NVIDIA GPUs (CUDA 13, C++/CUDA, Apache-2.0) with bitwise-exact speculative decoding (MTP, DFlash2, DV, prompt lookup), native GGUF and `.flyx` support, tiered GPU/RAM/disk long-context KV caches with 2-bit StrataFlux attention, and OpenAI / Anthropic HTTP APIs.
+
+Start here when deploying, integrating, or modifying `flyx`. Each document below is the single source of truth for its domain.
+
+## Quick Reference
+
+- Binary: `flyx` (`flyx-server` symlink aliases `flyx serve`)
+- Subcommands: `serve`, `run`, `chat`, `bench`, `tokenize`, `template`, `monitor`
+- OpenAI API base URL: `http://127.0.0.1:8080/v1` (`/v1/chat/completions`, `/v1/responses`, `/v1/completions`, `/v1/models`)
+- Anthropic API base URL: `http://127.0.0.1:8080` (`/v1/messages`, `/v1/messages/count_tokens`)
+- Management & telemetry: `/health`, `/v1/telemetry`, `/v1/load`, `/v1/unload`, `/v1/hub/search`, `/v1/hub/files`, `/v1/hub/cached`, `/v1/hub/dir`, `/v1/requests`, `/v1/logs`
+- C API header: `include/flyx/flyx.h` (`FLYX_API_VERSION = 2`)
+- Python binding: `python/flyx/__init__.py` (zero-dependency `ctypes`)
+
+## Deploy and Integrate
+
+- [README.md](README.md): Project overview, 30-second quick start, supported hardware/model summary, headline decode throughput.
+- [README_zh.md](README_zh.md): Chinese README mirroring README.md.
+- [docs/server.md](docs/server.md): Complete CLI flags and defaults, environment variables, `--backend-opt` keys, OpenAI/Anthropic/management HTTP endpoints and schemas, error codes, coding-agent integration, and C/Python API usage. Read this before running `flyx serve`, calling HTTP endpoints, or passing engine/backend options.
+- [docs/models.md](docs/models.md): Supported architectures (Qwen3.5/3.8, Qwen3, Llama such as MiniCPM5-1B), GGUF and `.flyx` formats (format 2 for V-LoRA adapters), Hugging Face Hub resolution, MTP, DFlash2 and DV drafters, and long-context KV tiering + 2-bit StrataFlux sizing recipes for 16/24/32 GB GPUs. Read this when selecting a model, drafter, or long-context configuration.
+- [docs/monitor.md](docs/monitor.md): `GET /v1/telemetry` schema (version 1), `flyx monitor` CLI, and built-in web dashboard (`/dashboard`, `--dashboard-dir`).
+- [docs/benchmarks.md](docs/benchmarks.md): Reproducible consumer-GPU long-context coding (`1K–256K`), `flyx bench` plain/MTP/DFlash2 throughput tables, and Needle-in-a-Haystack attention-fidelity verification with exact commands.
+
+## Build, Test, and Contribute
+
+- [AGENTS.md](AGENTS.md): Mandatory engineering rules for coding agents—directory layering boundaries, 5 correctness gates, build/test verification commands, and code standards. Read this before modifying any source file.
+- [docs/building.md](docs/building.md): Toolchain requirements, CMake presets (`dev`, `debug`, `cpu`, `dev-windows`, `cpu-windows`, `release-linux`, `release-windows`), CMake options, and Linux/Windows release packaging.
+- [docs/testing.md](docs/testing.md): Test dependencies, `ctest` suite map, CUPTI tracing, and coding-agent integration checks.
+- [docs/design/architecture.md](docs/design/architecture.md): Repository directory map, request lifecycle, scheduler/prefix-cache orchestration, KV tiering & StrataFlux 2-bit mechanics, speculative decoding invariants, and Model -> Program -> Region -> Op execution model.
+- [docs/design/numerics.md](docs/design/numerics.md): Machine-verified (`tools/check_numerics.py`) per-kernel precision contract, bitwise equivalence classes, and comparison against `llama.cpp`.
+- [docs/design/gguf.md](docs/design/gguf.md): GGUF container reader, metadata keys, model layout flags, and packed GGML block execution.
+- [docs/design/tree-verification.md](docs/design/tree-verification.md): Bitwise-exact speculative tree verification on hybrid attention + GDN models, DFlash2 dynamic trees, and tree rounds of up to 64 rows on attention-only models.
+- [docs/design/dv.md](docs/design/dv.md): The DV canvas drafter (bifill-dv): the canvas pass and selector trees, when its rounds run, its CUDA rounds, the V-LoRA (the target's own adapters) and `.flyx` format 2, and what DV is held to.
+- [docs/prior-art.md](docs/prior-art.md): Algorithmic references and shipped third-party libraries (`third_party/`, `NOTICE`).
+- [CONTRIBUTING.md](CONTRIBUTING.md): Contribution workflow and commit checklist.
+- [SECURITY.md](SECURITY.md): Security boundary assumptions and private vulnerability reporting.

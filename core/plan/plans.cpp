@@ -1,0 +1,218 @@
+// Copyright 2026 The flyx Authors. SPDX-License-Identifier: Apache-2.0
+#include "core/plan/plans.h"
+
+#include <algorithm>
+
+namespace flyx::plan {
+
+int Plans::widest() const { return widths.empty() ? 0 : *std::max_element(widths.begin(), widths.end()); }
+
+void Plans::free(const flyx_backend_api* api) {
+  for (auto* p : rounds) api->plan_free(p);
+  for (auto* p : given) api->plan_free(p);
+  for (auto* p : trees) api->plan_free(p);
+  for (auto* p : adaptive)
+    if (p) api->plan_free(p);
+  if (prefill) api->plan_free(prefill);
+  rounds.clear();
+  widths.clear();
+  drafters.clear();
+  drafter_trees.clear();
+  given.clear();
+  given_widths.clear();
+  trees.clear();
+  tree_widths.clear();
+  adaptive.clear();
+  adaptive_checkpoints.clear();
+  refused.clear();
+  refused_drafter = -1;
+  prefill = nullptr;
+}
+
+bool build(const flyx_backend_api* api, flyx_bmodel* bm, const interfaces::Model& model, int prefill_chunk,
+           int fixed_width, bool given, bool draft_trees, Plans* out, std::string* err, bool adaptive) {
+  auto pre = model.prefill_program();
+  flyx_program pp{FLYX_PHASE_PREFILL, 0, prefill_chunk, static_cast<int32_t>(pre.size()), pre.data()};
+  if (api->lower(bm, &pp, &out->prefill) != 0) {
+    *err = std::string("lower prefill: ") + api->last_error();
+    return false;
+  }
+  // Rounds to choose from: plain decoding and each drafter's draft counts (a fixed width: that many, every drafter).
+  auto add = [&](int width, int drafter) {
+    out->widths.push_back(width);
+    out->drafters.push_back(drafter);
+    out->drafter_trees.push_back(false);
+  };
+  auto lower_round = [&](int k, int drafter, bool given_drafts, std::vector<flyx_plan*>* to, bool tree = false) {
+    auto rnd = model.round_program(k, drafter, given_drafts);
+    for (auto& n : rnd) {  // the tree is the round's (DV's say so themselves): the node of its drafts says so
+      if (tree && n.kind == FLYX_NODE_GIVEN) n.arg1 = FLYX_GIVEN_TREE;
+      if (tree && n.kind == FLYX_NODE_DRAFT) n.arg1 = FLYX_DRAFT_TREE;
+    }
+    flyx_program rp{FLYX_PHASE_ROUND, k, k + 1, static_cast<int32_t>(rnd.size()), rnd.data()};
+    flyx_plan* plan = nullptr;
+    if (api->lower(bm, &rp, &plan) != 0) {
+      *err = std::string("lower round: ") + api->last_error();
+      return false;
+    }
+    to->push_back(plan);
+    return true;
+  };
+  auto lower_given_trees = [&]() {
+    for (int k : tree_widths()) {
+      std::string e;
+      std::swap(e, *err);
+      const bool ok = lower_round(k, -1, true, &out->trees, true);
+      std::swap(e, *err);
+      if (!ok) break;  // the backend has no tree rounds
+      out->tree_widths.push_back(k);
+    }
+  };
+  // A drafter that drafts nothing but trees (DV): its widths where the backend lowers them, each refused said
+  // (cpu_ref has no tree rounds); none lowered, the rounds are the ones without it.  Pinned (a width asked for), its
+  // widest at most that many drafts the backend lowers, alone: no plain decoding or lookup round beside it.
+  // Unpinned, one whose state follows its own rounds only (Model::restarts: DV's canvas) also has its warm-up,
+  // round_program(0, d): plain decoding that brings the state along (the controller runs it before the drafter's
+  // first round after any other).
+  int pinned = -1;  // pinned to such a drafter: its rounds alone
+  auto lower_trees = [&](int d) {
+    const std::vector<int> drafts = model.draft_widths(d);
+    std::vector<int> tries = drafts;
+    if (fixed_width > 0) {  // widest first, capped at the width asked for, until one lowers
+      tries.clear();
+      for (auto w = drafts.rbegin(); w != drafts.rend(); ++w)
+        if (std::find(tries.begin(), tries.end(), std::min(fixed_width, *w)) == tries.end())
+          tries.push_back(std::min(fixed_width, *w));
+    }
+    std::vector<flyx_plan*> lowered;
+    std::vector<int> widths;
+    auto free_lowered = [&] {
+      for (auto* p : lowered) api->plan_free(p);
+      lowered.clear();
+    };
+    auto refuse = [&](int k, const std::string& e) {
+      out->refused += (out->refused.empty() ? "" : "; ") + std::string(model.drafter_name(d)) + " " +
+                      (k > 0 ? std::to_string(k) : std::string("warm-up")) + ": " + e;
+    };
+    for (int k : tries) {
+      std::string e;
+      std::swap(e, *err);
+      const bool ok = lower_round(k, d, false, &lowered, true);
+      std::swap(e, *err);
+      if (!ok) {
+        // Memory the load can give back (engine.cpp: trim) is not a reason to draft without it: the load lowers
+        // the plans again once it has (the ones lowered here freed first).
+        if (e.find("out of GPU memory") != std::string::npos) return free_lowered(), *err = e, false;
+        refuse(k, e);
+        continue;
+      }
+      widths.push_back(k);
+      if (fixed_width > 0) break;
+    }
+    if (!widths.empty() && fixed_width < 0 && model.restarts(d)) {
+      std::string e;
+      std::swap(e, *err);
+      const bool ok = lower_round(0, d, false, &lowered);
+      std::swap(e, *err);
+      if (!ok) {
+        if (e.find("out of GPU memory") != std::string::npos) return free_lowered(), *err = e, false;
+        refuse(0, e);  // without its warm-up the drafter is not run: its rounds after others' would draft nothing
+        widths.clear();
+      } else {
+        widths.push_back(0);
+      }
+    }
+    if (widths.empty()) {
+      free_lowered();
+      out->refused_drafter = d;
+      return true;
+    }
+    for (size_t j = 0; j < widths.size(); ++j) {
+      add(widths[j], d);
+      out->drafter_trees.back() = widths[j] > 0;
+      out->rounds.push_back(lowered[j]);
+    }
+    if (fixed_width > 0) pinned = d;
+    return true;
+  };
+  auto add_round = [&](int k, int d) {  // a round of a drafter of chains (or plain decoding), lowered
+    add(k, d);
+    return lower_round(k, d, false, &out->rounds);
+  };
+  if (fixed_width < 0 && !add_round(0, -1)) return false;
+  if (fixed_width != 0)
+    for (int d = 0; d < model.drafters() && pinned < 0; ++d) {
+      const std::vector<int> drafts = model.draft_widths(d);
+      if (drafts.empty()) continue;
+      if (model.drafts_trees(d)) {
+        if (!lower_trees(d)) return false;
+        if (pinned >= 0) {  // its rounds alone
+          out->widths.assign(1, out->widths.back());
+          out->drafters.assign(1, d);
+          out->drafter_trees.assign(1, true);
+          flyx_plan* keep = out->rounds.back();
+          out->rounds.pop_back();
+          for (auto* p : out->rounds) api->plan_free(p);
+          out->rounds.assign(1, keep);
+        }
+        continue;
+      }
+      if (fixed_width > 0) {
+        if (!add_round(std::min(fixed_width, drafts.back()), d)) return false;
+      } else {
+        for (int k : drafts)
+          if (!add_round(k, d)) return false;
+      }
+    }
+  if (out->widths.empty() && !add_round(0, -1)) return false;  // pinned, with no drafter to draft: plain decoding
+  if (draft_trees && fixed_width < 0)
+    for (int d = 0; d < model.drafters(); ++d)
+      for (int k : draft_tree_widths()) {
+        if (model.drafts_trees(d)) break;  // its rounds are trees already
+        std::string e;
+        std::swap(e, *err);
+        const bool ok = lower_round(k, d, false, &out->rounds, true);
+        std::swap(e, *err);
+        if (!ok) break;  // a drafter (or backend) that drafts no trees
+        add(k, d);
+        out->drafter_trees.back() = true;
+      }
+  if (pinned >= 0) {  // a drafter's rounds alone, pinned: no lookup rounds beside them
+    lower_given_trees();
+    return true;
+  }
+  if (given) {
+    for (int k : given_widths()) {
+      if (!lower_round(k, -1, true, &out->given)) return false;
+      out->given_widths.push_back(k);
+    }
+    for (int k : wide_given_widths()) {
+      std::string e;
+      std::swap(e, *err);
+      const bool ok = lower_round(k, -1, true, &out->given);
+      std::swap(e, *err);
+      if (!ok) break;  // the backend has no wide rounds
+      out->given_widths.push_back(k);
+    }
+  }
+  lower_given_trees();
+  if (adaptive && fixed_width < 0 && model.drafters() > 0) {
+    out->adaptive.assign(size_t(model.drafters()), nullptr);
+    out->adaptive_checkpoints.resize(size_t(model.drafters()));
+    for (int d = 0; d < model.drafters(); ++d) {
+      const std::vector<int> cps = model.adaptive_checkpoints(d);
+      if (cps.size() < 2 || cps.size() > FLYX_MAX_STOP_BUCKETS) continue;
+      auto rnd = model.round_program(cps.back(), d, false);
+      flyx_program rp{FLYX_PHASE_ROUND, cps.back(), cps.back() + 1, static_cast<int32_t>(rnd.size()), rnd.data(),
+                      static_cast<int32_t>(cps.size()), cps.data()};
+      flyx_plan* plan = nullptr;
+      if (api->lower(bm, &rp, &plan) == 0 && plan) {
+        out->adaptive[size_t(d)] = plan;
+        out->adaptive_checkpoints[size_t(d)] = cps;
+      }
+    }
+  }
+  return true;
+}
+
+}  // namespace flyx::plan

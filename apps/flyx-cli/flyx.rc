@@ -1,0 +1,47 @@
+// Copyright 2026 The flyx Authors. SPDX-License-Identifier: Apache-2.0
+// Windows executable icon and version metadata for flyx.exe and flyx-standalone.exe.
+#include <winver.h>
+
+#ifndef FLYX_VERSION_MAJOR
+#define FLYX_VERSION_MAJOR 0
+#endif
+#ifndef FLYX_VERSION_MINOR
+#define FLYX_VERSION_MINOR 0
+#endif
+#ifndef FLYX_VERSION_PATCH
+#define FLYX_VERSION_PATCH 0
+#endif
+#ifndef FLYX_VERSION
+#define FLYX_VERSION "0.0.0"
+#endif
+
+1 ICON "flyx.ico"
+
+VS_VERSION_INFO VERSIONINFO
+ FILEVERSION FLYX_VERSION_MAJOR,FLYX_VERSION_MINOR,FLYX_VERSION_PATCH,0
+ PRODUCTVERSION FLYX_VERSION_MAJOR,FLYX_VERSION_MINOR,FLYX_VERSION_PATCH,0
+ FILEFLAGSMASK VS_FFI_FILEFLAGSMASK
+ FILEFLAGS 0x0L
+ FILEOS VOS_NT_WINDOWS32
+ FILETYPE VFT_APP
+ FILESUBTYPE VFT2_UNKNOWN
+BEGIN
+  BLOCK "StringFileInfo"
+  BEGIN
+    BLOCK "040904B0"
+    BEGIN
+      VALUE "CompanyName", "Enwove\0"
+      VALUE "FileDescription", "FLYX Local LLM Inference Engine\0"
+      VALUE "FileVersion", FLYX_VERSION "\0"
+      VALUE "InternalName", "flyx\0"
+      VALUE "LegalCopyright", "Copyright 2026 The flyx Authors (Apache-2.0)\0"
+      VALUE "OriginalFilename", "flyx.exe\0"
+      VALUE "ProductName", "FLYX\0"
+      VALUE "ProductVersion", FLYX_VERSION "\0"
+    END
+  END
+  BLOCK "VarFileInfo"
+  BEGIN
+    VALUE "Translation", 0x0409, 1200
+  END
+END

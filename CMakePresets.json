@@ -1,0 +1,114 @@
+{
+  "version": 5,
+  "configurePresets": [
+    {
+      "name": "base-ninja",
+      "hidden": true,
+      "generator": "Ninja",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Release"
+      }
+    },
+    {
+      "name": "base-windows",
+      "hidden": true,
+      "inherits": "base-ninja",
+      "condition": { "type": "equals", "lhs": "${hostSystemName}", "rhs": "Windows" },
+      "cacheVariables": {
+        "CMAKE_C_COMPILER": "cl",
+        "CMAKE_CXX_COMPILER": "cl",
+        "FLYX_COMPILER_CACHE": "OFF"
+      }
+    },
+    {
+      "name": "base-release-pkg",
+      "hidden": true,
+      "inherits": "base-ninja",
+      "cacheVariables": {
+        "FLYX_STATIC_RUNTIME": "ON",
+        "FLYX_CUDA_ARCHS": "80-real;89-real;90-real;100-real;120-real;120-virtual",
+        "FLYX_CUDA_LINEINFO": "OFF",
+        "FLYX_CUDA_COMPRESS": "size",
+        "FLYX_TUNE_CANDIDATES": "OFF"
+      }
+    },
+    {
+      "name": "dev",
+      "inherits": "base-ninja",
+      "displayName": "Development (Release, tests, this machine's GPU architectures)",
+      "binaryDir": "$env{HOME}/flyx-build",
+      "cacheVariables": { "FLYX_TESTS": "ON" }
+    },
+    {
+      "name": "debug",
+      "inherits": "dev",
+      "displayName": "Debug (RelWithDebInfo: line info)",
+      "binaryDir": "$env{HOME}/flyx-build-debug",
+      "cacheVariables": { "CMAKE_BUILD_TYPE": "RelWithDebInfo" }
+    },
+    {
+      "name": "cpu",
+      "inherits": "dev",
+      "displayName": "CPU only (float64 reference backend)",
+      "binaryDir": "$env{HOME}/flyx-build-cpu",
+      "cacheVariables": { "FLYX_CUDA": "OFF" }
+    },
+    {
+      "name": "dev-windows",
+      "inherits": "base-windows",
+      "displayName": "Development on Windows (Release, tests, MSVC, this machine's GPU)",
+      "binaryDir": "$env{USERPROFILE}/flyx-build",
+      "cacheVariables": { "FLYX_TESTS": "ON" }
+    },
+    {
+      "name": "cpu-windows",
+      "inherits": "dev-windows",
+      "displayName": "CPU only on Windows (float64 reference backend)",
+      "binaryDir": "$env{USERPROFILE}/flyx-build-cpu",
+      "cacheVariables": { "FLYX_CUDA": "OFF" }
+    },
+    {
+      "name": "release-linux",
+      "inherits": "base-release-pkg",
+      "displayName": "Release package: Linux / WSL2 x86_64, CUDA 13, driver only at run time",
+      "binaryDir": "$env{HOME}/flyx-build-release",
+      "cacheVariables": {
+        "FLYX_TESTS": "ON",
+        "CMAKE_INSTALL_PREFIX": "$env{HOME}/flyx-build-release/stage"
+      }
+    },
+    {
+      "name": "release-windows",
+      "inherits": ["base-windows", "base-release-pkg"],
+      "displayName": "Release package: Windows x86_64, MSVC 2022, CUDA 13, driver only at run time",
+      "binaryDir": "$env{USERPROFILE}/flyx-build-release",
+      "cacheVariables": {
+        "FLYX_CUDA_ARCHS": "80-real;89-real;120-real;120-virtual",
+        "FLYX_TESTS": "OFF",
+        "CMAKE_INSTALL_PREFIX": "$env{USERPROFILE}/flyx-build-release/stage"
+      }
+    }
+  ],
+  "buildPresets": [
+    { "name": "dev", "configurePreset": "dev" },
+    { "name": "debug", "configurePreset": "debug" },
+    { "name": "cpu", "configurePreset": "cpu" },
+    { "name": "dev-windows", "configurePreset": "dev-windows" },
+    { "name": "cpu-windows", "configurePreset": "cpu-windows" },
+    { "name": "release-linux", "configurePreset": "release-linux" },
+    { "name": "release-windows", "configurePreset": "release-windows" }
+  ],
+  "testPresets": [
+    {
+      "name": "test-base",
+      "hidden": true,
+      "output": { "outputOnFailure": true },
+      "execution": { "jobs": 8 }
+    },
+    { "name": "dev", "inherits": "test-base", "configurePreset": "dev" },
+    { "name": "cpu", "inherits": "test-base", "configurePreset": "cpu" },
+    { "name": "dev-windows", "inherits": "test-base", "configurePreset": "dev-windows" },
+    { "name": "cpu-windows", "inherits": "test-base", "configurePreset": "cpu-windows" },
+    { "name": "release-linux", "inherits": "test-base", "configurePreset": "release-linux" }
+  ]
+}

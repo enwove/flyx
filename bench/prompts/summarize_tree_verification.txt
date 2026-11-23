@@ -1,0 +1,250 @@
+Summarize this document in a few paragraphs.
+
+# Verifying a tree of drafts in one round
+
+Status: phase 1 built (2026-11-13); phase 2's rounds of up to 64 rows at one-row bits built for attention-only
+models (2026-11-17, ABI 32, [below](#rounds-of-more-than-16-rows-phase-2)); gated delta nets past 16 rows and phase
+3 are designs. The user's own drafting method (DV: a block of mask slots filled
+in one pass, a selector growing a dynamic tree of 31 to 127 nodes from their candidates) plugs in as a drafter that
+drafts trees ([dv.md](dv.md)); this note is the engine's side: what a round needs to verify a tree, how others do
+it, and why flyx does it differently.
+
+## What a tree round is
+
+A round's drafts are `token[i]` with `parent[i]` (-1: the round's anchor, row 0), parents before children. Row i
+sits at position `base + depth[i]`; it attends to every committed key and to its ancestors (and itself), not to its
+siblings or cousins. The target's choice at each row is computed as for any row; acceptance walks from the anchor to
+the child whose token is the parent's choice, as deep as that goes, and emits the choices along that path. The
+accepted path becomes the sequence: its K/V in consecutive slots, its recurrent state the committed state. A chain is
+the tree with `parent[i] = i - 1`.
+
+## How others do it (2023-2026)
+
+* Trees on attention-only models: SpecInfer (token trees, ancestor attention mask, multi-step speculative
+  sampling), Medusa (fixed trees, typical acceptance), EAGLE-2 (dynamic trees from the drafter's confidence),
+  Sequoia (tree size and shape chosen from measured verification cost by tree size: the hardware-aware budget),
+  DDTree / DARTree (trees from a block-diffusion drafter's per-slot distributions, best-first under a node budget).
+* Hybrid models (recurrent layers keep one state, which a tree's branches cannot share):
+  * vLLM and SGLang by default keep a full state snapshot per draft position and serve Qwen3-Next / Qwen3.5 with
+    chains only (topk 1); ReplaySSM (SGLang opt-in, a vLLM RFC) keeps a checkpoint and the window's inputs and
+    replays at commit, chains only. flyx's commit already works this way (the round's replay buffer, folded).
+  * STree (arXiv 2505.14969): trees for Mamba-2, whose scalar decay accumulates along paths.
+  * TreeWY (arXiv 2608.20961): a tree-structured WY form of the gated delta rule, one triangular solve over the
+    nodes with an ancestor mask, per-node pseudo-values instead of states, the accepted state rebuilt at commit;
+    equal to the recurrence to bf16 rounding, not bitwise; trees raised acceptance (3.23 -> 3.58 at 39 nodes, depth
+    3) but were not a throughput gain.
+  * Bole (arXiv 2608.01651): the tree's closed form solved by a finite Neumann series to the tree's depth, compact
+    factors per node, 82-99% less transient state; "algebraically exact", no floating-point identity; sizes trees by
+    the largest node count whose forward stays within (1 + eps) of a plain decode step.
+  * LumoTree (arXiv 2609.23900): keeps the sequential updates, runs paths in parallel from states cut at branch
+    points, replays the accepted path at commit, gathers conv histories along ancestry; puts the main path's K/V
+    contiguously; still five greedy disagreements at exact logit ties in 126 cycles: not bitwise.
+  * SpecLA (arXiv 2607.16673): topology-aware kernels and compact factors for linear-attention models.
+
+None of them gives a tree-verified token the bits plain decoding gives it. flyx's rule 4 (AGENTS.md: speculation
+never changes the output) needs exactly that, so:
+
+## flyx's design: every node's arithmetic is plain decoding's
+
+1. **The launch's tree** (`flyx_gen_params`: `drafts`, `n_drafts`, and new `parents`): the way an outside drafter
+   (the user's method, lookup) hands a round its drafts. Rounds with `FLYX_NODE_GIVEN` take a tree; the built-in
+   drafters' rounds stay chains with their plans and kernels unchanged. The launch derives each row's depth and its
+   path (the row of its ancestor at every depth) once, on the host, into the round's device tables.
+2. **Positions by depth**: rotary embedding of row i at `base + depth[i]`; its K/V written to slot `base + i`.
+3. **Attention in the order decoding would see the keys**: row i's logical keys are the committed ones, then its
+   path by depth; key `j >= base` is read from slot `base + path[i][j - base]`. Tiles and key splits follow logical
+   positions, as in decoding, so the sums are the same sums in the same order. In tree plans the grouped kernels
+   take one row a block (a row's bits do not depend on the rows beside it), since rows of different branches cannot
+   share a tile of their own part; the tensor-core kernel (from 8192 keys) keeps its rows together: they share the
+   tiles before the round's keys and take the tiles holding them one row at a time.
+4. **GDN layers walk the tree**: the short convolution of row i takes the inputs of its last three ancestors (the
+   committed window above the anchor); the recurrence goes through the rows in order, and where a row's parent is
+   not the row before it, it reloads the round's starting state and replays the parent's path (the same per-row
+   operations), then goes on. Rows of up to 16: a replay is a few steps. (Larger trees: keep branch states in shared
+   memory or L2 instead of replaying; phase 2.) The fused one-kernel round stays for chains; tree plans take the four
+   kernels, which give the same bits.
+5. **Choices**: a row's sampled choice draws from its position's random stream (`base + depth[i]`), as decoding at
+   that position does; penalties count the row's ancestors' drafts. So a tree round's choices, sampling included, are
+   the ones plain decoding makes along each path, and acceptance stays exact matching.
+6. **Accept** walks the tree from the anchor and writes the accepted path's rows.
+7. **Compact, then commit**: the accepted path's rows are moved to rows 0..n everywhere a later step reads them (K/V
+   in every attention layer, the GDN replay rows, the drafters' input rows); then the commit and the drafters'
+   context run as after a chain round.
+8. **Relaxed acceptance (opt-in, lossy)**: min-p (accept a child if the target gives its token at least tau times
+   its top probability; the DV method's "DVC" rule, tau 0.2) and typical acceptance (Medusa: probability above min(eps,
+   sqrt(eps) exp(-entropy)), eps 0.09); at a node the qualifying child with the highest target probability; the
+   round ends with the target's own choice. Off by default.
+
+## What phase 1 is, in the code
+
+* ABI 23: `flyx_gen_params.parents` (and `accept_min_p`, `accept_typical`), `FLYX_GIVEN_TREE` as the GIVEN
+  node's arg1.  The core lowers tree rounds of 3, 7 and 15 drafts where the backend has them
+  (`Engine::tree_widths()`, `tree_plan()`); cpu_ref has none (it refuses the plan), the CUDA backend all.  Wider
+  given trees (ABI 32, below) are lowered by what runs them (golden_test, tree_bench), not by the engine.
+* The launch turns the parents into `TreeRows` (every row's depth and its path) on the host and copies it through a
+  ring of pinned slots, as the drafts; a round's graph reads the table, so one captured graph serves every tree of
+  its width.
+* Kernels: `attn_prep` (position by depth, slot by row), the three attention kernels (`tree_slot`; the float32 ones
+  one row a block, the tensor-core one sharing the keys before the round among its rows),
+  the combine (splits by the row's own key count), `gdn_conv` (ancestors' inputs), `gdn_recur_tree` (the lanes
+  kernel's TREE instance: replays where a row's parent is not the row before), `penalize_rows` (ancestors' drafts),
+  `choose_rows` (depth's random stream), `accept_tree` (ops::accept_tree), and the compactions (`compact_kv`,
+  `gdn_compact`, `compact_rows`: K/V slots and e4m3 scales, replay rows, tokens, final hidden rows, taps).  The
+  fused one-kernel GDN round is not used in tree plans.
+* Relaxed acceptance runs in any round with drafts (chains too) when the request asks: `row_stats` after the head,
+  `accept_tree` with the rules; its rounds get graphs of their own.
+
+Tests (golden_test, CUDA, every golden configuration: BF16, NVFP4, unfused, GDN 128, tensor-core attention from
+key 0, the tiny Qwen3 in BF16 and GGUF): random trees of 3, 7 and 15 drafts hide plain decoding's continuation on a
+random path (half of them the deepest), the other drafts never the token chosen at their depth; every round must
+emit plain decoding's tokens and accept exactly the hidden path, 20 rounds a run: greedy, sampling, penalties, FP8
+caches, min-p 1 (only the top token qualifies: plain decoding again).  The MTP drafter's rounds after tree rounds
+whose paths were moved give the ring entries (drafts too) of the same rounds whose paths were already in place.
+Breaking the compaction or the GDN replay fails them at the first moved path.  Chains: the existing golden tests,
+unchanged.
+
+What phase 1 costs a round: the float32 attention one row a block where a chain shares a block among rows (the 27B's
+takes one row a block anyway), GDN replays (at most the depth of a row, a few steps), the four GDN kernels instead of the fused
+one, and the compactions (a few KB a layer).
+
+## A drafter's own trees (DFlash2)
+
+Given trees test the verification; a drafter that drafts trees uses it.  DFlash2 already scores 16 candidates at
+each of its 7 positions (the target's head on the drafter's rows) and a low-rank selector rates each candidate after
+the token before it; its walk keeps the best chain.  `FLYX_DRAFT_TREE` (ABI 24, the DRAFT node's arg1) asks for a
+tree instead (ops/draft/ref.h): the walk's chain first (the trunk), then branches grown best first, EAGLE-2's dynamic
+tree on these scores (a node's value the sum of the log-probabilities along its path, each the selector's softmax
+over a parent's 16 candidates; every further draft the highest-valued child of a node already in the tree).  The
+kernel (`selector_tree`, one block) writes the drafts and the round's `TreeRows`, so the launch uploads no tree and
+one graph serves every tree of a width; the round is then a tree round as above, and its result names the tree
+(`parents`, ABI 24).  The MTP layer drafts one token a step and has no trees (the backend refuses them).
+
+Why the trunk: a tree grown best first from the anchor alone accepted fewer drafts on the 27B than the chain of 7
+(the selector's softmax is far less sure than the drafter is: the chain's later drafts are accepted often), so the
+tree is the chain and what its budget adds; it never accepts less than its chain.
+
+Which round runs is the speculation controller's choice, sized to the GPU by measured costs: with `--draft-trees`
+(FLYX_DRAFT_TREES=1) the plans add DFlash2 trees of 9, 11 and 15 drafts, each timed at load like every round.  A
+tree's expected tokens are its trunk's (the drafter's acceptance by position, which every tree round teaches as well,
+its trunk being the chain) plus what its branches add (learned per tree size from the tokens its rounds gave beyond
+their trunk's, 0.4 until seen; each tree tried once in 64 of its drafter's rounds); a tree runs where that over its
+cost beats every chain.  Measured on the RTX 5090 (docs/perf/2026-11-13-rtx5090-drafted-trees.md,
+decision 0048): the branches add 0.15-0.23 tokens each for the first two, a row past 8 costs more than that, so the
+chains win and the option is off by default.
+
+Tests: `selector_tree` against best_first_tree in test_select (its trunk the walk's chain; a tree that must branch,
+one of a full round, one shallower than its positions); golden: DFlash2's trees taking turns with its chains give the
+reference's tokens, with oracle drafts the long accepted runs, chosen every round too, sampled plain decoding's
+tokens for one seed, and a session continued from inside its last rounds; round_chooser: the tree where its
+branches add tokens, the chain where they add nothing.
+
+## Phases
+
+1. Trees of up to 16 rows, end to end (above).
+2. Rounds of more than 16 rows at one-row bits (the round GEMMs, attention and GDN for 31-255 rows), and branch
+   states instead of replays.  Built for attention-only models up to 64 rows (below); GDN to do.
+3. (Later, if the user's method needs it) rows in the same pass that are not verified: their own mask, starting
+   state and weights. DV's canvas runs as a pass of its own after the check first (option A); fusing its rows into
+   the verify pass is this phase (option B, [dv.md](dv.md)).
+
+## Rounds of more than 16 rows (phase 2)
+
+Built (ABI 32), for models of attention layers (a Llama, Qwen3; GDN models keep trees of 16 rows, refused at
+lowering, so their plans lower as before):
+
+* **Limits.** Option (b) below: `FLYX_MAX_TREE_ROWS` (64) rows for tree rounds and `FLYX_MAX_EMIT` (64) tokens,
+  drafts and parents in a ring entry; chains, rounds of several sequences and `flyx_room` keep `FLYX_MAX_ROWS` (16).
+  The core's emission buffer and the speculation controller's positions follow `FLYX_MAX_EMIT`; tree plans lower up
+  to 64 rows.  `TreeRows` holds 64 rows (4.6 KB), the attention kernel's path in shared memory 64 bytes, the
+  penalties' and the accept's arrays 64.
+* **Buffers** follow the widest round plan the backend lowered (`flyx_bmodel::round_rows`, 16 until a wider one):
+  a session's round rows, logits, sampling scratch (`cz`, `ci`), attention partials, drafts and accept statistics;
+  the GEMM scratch stays the 16-row one plus bf16 rows for `gemm_fp4_rows`.  On MiniCPM5-1B (vocabulary 130,560)
+  that is 35 MB a session for every 16 rows past 16 (`seq_bytes`), so an engine lowers no round of more than 16
+  rows of its own (`plan::tree_widths()` stays 3, 7 and 15; a drafter whose rounds are wider, DV's trees of 31,
+  will lower its own): its sessions are as before.  A wider plan lowered after the load through the ABI (golden_test,
+  tree_bench) makes the sessions made after it larger, and each leases what the backend says it takes then
+  (`Engine::session_bytes()` asks `seq_size` at every session, so the ledger refuses one that does not fit rather
+  than the GPU running out); a session made before a wider plan refuses its rounds.
+* **The end of the context, one rule.** `flyx_room` is unchanged: a round starts only where one of 16 rows fits.
+  A round emits at most `flyx_emit_most(position, max_ctx) = max_ctx - position` tokens (`ops::accept_tree` cuts
+  its walk there; a round of 16 rows or fewer never reaches it), so no token is ever past `max_ctx`, and the
+  sequence stops there.  Its rows past `max_ctx` are verified in K/V slots kept beyond it: `cap = max_ctx + 16 + R`
+  for R round rows (`max_ctx + 32` before, the same for R = 16), enough for the round in flight after it too.
+* **GEMMs.** A round's pass carries `Launch::round`; with it a GEMM of more than 16 rows runs the 1..16-row
+  choice 16 rows at a time (bf16: `gemm_skinny` per tile, `gemm_rows` with option `gemm=rows`; GGML blocks: a
+  round's staging and kernels per tile), NVFP4 through `gemm_fp4_rows` (each weight span decoded once for up to
+  four tiles, each tile's arithmetic the 1..16-row kernel's).  A prefill pass never has the flag.
+* **Fused regions.** A fused producer stages its pass's rows whole for the next GEMM (tensor cores past 16 rows),
+  so round plans of more than 16 rows resolve to the generic regions; fused and generic give the same bits (class
+  F), so a row verified in such a round has the bits plain decoding's fused rounds give it.
+* **The head** runs in parts of 16 rows, each part on the 1..16-row paths (W12, the FP8 copy, the certified head
+  with its scratch in turn); penalties, choices and the relaxed rules' statistics over all rows.
+* **Attention** keeps the split kernels for a tree (never `attention_flash`, which has no tree): the float32
+  kernels one row a block, `attention_rows_mma` for a row of `rows_attention_from` keys or more, by the row's own
+  key count, as decoding it does.
+* **Not with it:** strata attention (its scratch holds 16 rows; such a launch is refused), rounds of several
+  sequences (trees run alone), DFlash2's trees (its selector's kernel drafts 15 at most).
+
+Checked: `cuda_ops` (`test_gemm_round`: bf16 skinny tiles, `gemm=rows` and NVFP4 at 17, 31, 32, 33, 48 and 64
+rows, every row the bits it has alone, and the same rows as a prefill pass not; `test_head_parts`: W12, the FP8
+copy and the certified head in parts; `test_attention_tree`: trees of 17, 32 (a chain of depth 31, a random one)
+and 64 rows (a trunk of 40), every row the bits of decoding its path alone, with every kernel choice, about 8192
+keys too), golden tree rounds of 31 drafts and of 47 and 63 (plans the test lowers) on every attention-only tiny
+file (the Llama, its NVFP4 copy, held to its own plain decoding, the Qwen3 in BF16 and as a float32 GGUF, read as
+bf16, two Qwen3 of GGML block weights, Q8_0 and Q4_K, held to their own plain decoding: `golden_cuda_quant_*`, the
+DV files' targets; unfused, tensor-core attention from key 0, FP8 K/V, the K/V all in host memory; greedy, sampled,
+with penalties and min-p 1; read a round at a time and two in flight, each round launched behind the one before
+with its drafts where that round's path ends), tree rounds of 32 and 64 rows 16 positions before the context's end
+(the round in flight after each writing its rows past it, the prompt's K/V, every layer's, the bytes they were), a
+tree round of 64 rows in flight before strata attention's switch (the one launched behind it, which it may move
+past the switch, refused; where the model's shape has strata kernels: the Qwen3s), and `tree_bench --check` with
+trees of 31, 47 and 63 on MiniCPM5-1B ([record](../perf/2026-11-17-rtx5060ti-tree-rows.md)).  The prefill GEMM in
+such a round instead fails the kernel tests and the tiny Llama's tree rounds; a tree on `attention_flash` fails both
+everywhere; the GGML block GEMMs or the packed head on all of a round's rows at once fail `golden_cuda_quant_*`; a
+K/V cap of `max_ctx + 32` fails the context's end at 64 rows; a ring of one pinned slot for drafts and trees fails
+the rounds two in flight with the K/V in host memory; counting a round in flight as 16 rows fails the strata
+switch.
+
+What it costs (MiniCPM5-1B, BF16, `--kv 16`, RTX 5060 Ti, 1024 tokens of context;
+[record](../perf/2026-11-17-rtx5060ti-tree-rows.md)): a round of 16 rows 1.47 plain rounds, 32 rows 3.03, 48 rows
+4.65, 64 rows 6.37 (at 4096 tokens: 1.79, 3.62, 5.41, 7.33).  Every 16 rows cost the 16-row round again: each tile
+reads the weights and adds its own work (about 1.9 ms a tile over a plain round's 4.3: the three bf16 parts' MMAs,
+the attention a row a block, the head).  A multi-tile bf16 GEMM that reads the weights once for every tile saves the
+reads, not that work: about 1.9 plain rounds at 32 rows by the profile.
+
+## Phase 2: what it needs, and the open choice
+
+Built: the NVFP4 GEMM of 17..64 rows with the 1..16-row kernel's bits (`gemm_fp4_rows`), and rounds of up to 64
+rows above (the row limit by option (b), every GEMM 16 rows at a time, the head in parts, attention).  Still to
+do:
+
+* **The row limit.** FLYX_MAX_ROWS (16) sizes the ABI's ring entries (tokens, drafts), the per-session row
+  buffers and logits, TreeRows, and the room every pass leaves at the end of the context (flyx_room). Two ways:
+  (a) raise it for every round (64 or 128): one constant, but every session's buffers grow (a 64-row round's logits
+  alone are 64 MB at the 27B's vocabulary) and every sequence keeps that many positions free at its end; (b) keep 16
+  for rounds as they are and give tree plans a limit of their own (FLYX_MAX_TREE_ROWS), their buffers allocated
+  when a session first runs one, their ring entry a separate result. (b) leaves everything that runs today as it is.
+  Taken: (b), with one ring entry of FLYX_MAX_EMIT for every round (ABI 32) and the buffers sized when a session is
+  made, by the widest round plan lowered (allocated on first use, `seq_bytes` would not count them).
+* **GEMMs.** Done 16 rows at a time (bf16, GGML blocks; NVFP4 four tiles a weight decode).  To do: the bf16
+  multi-tile form of k_gemm_skinny (the weights read once for every tile).
+* **Attention.** The split kernels take any number of rows; a tree's round keys beyond one 16-key tile are already
+  read through tree_slot. The tensor-core kernel takes the tiles of round keys one row at a time: with 64 rows, the
+  last 4 tiles 64 times; a deeper tree wants its rows grouped by branch.
+* **GDN.** The recurrence stages 16 rows at a time; a row's replay must read ancestors staged earlier (from the
+  replay buffer in global memory instead of shared memory), and replays grow with depth: past 16 rows, branch states
+  kept for the tree's branch points (a few states a head in L2) instead of replays from the round's start.
+* **Head and choices.** Done: the head 16 rows at a time into the round's logits, penalties, choices and the
+  relaxed rules' statistics over all rows; the accept walk reads the choices of all rows.
+* **Verification in 4-bit inputs (an option to decide).** Rounds that keep plain decoding's bits are bound by the
+  bf16 tensor cores (float32 accumulation runs at half rate on GeForce): 2.9 plain rounds at 32 rows, 5.1 at 64 on
+  the 27B (perf record). The W4A4 kernels (NVFP4 inputs, the prefill GEMM) cost 2.2 at 32 and about 2.4 at 64, at
+  llama.cpp's precision for passes of that many rows, but not plain decoding's bits: lossy like the relaxed rules,
+  so it could only be an option off by default.
+
+## Is it worth verifying more rows?
+
+A round verifying R rows costs t(R); plain decoding emits one token per t(1). The round is faster only if it emits
+more than t(R) / t(1) tokens on average: the break-even line, measured on the 27B in
+docs/perf/2026-11-13-rtx5090-tree-break-even.md.

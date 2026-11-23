@@ -1,0 +1,14 @@
+build/
+*.flyx
+__pycache__/
+*.pyc
+/assets/
+.sync.tar.gz
+logs/
+models/**/*.safetensors
+models/**/*.gguf
+models/**/*.bin
+models/**/.cache/
+.venv/
+build-*/
+dist/

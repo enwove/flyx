@@ -1,0 +1,162 @@
+// Copyright 2026 The flyx Authors. SPDX-License-Identifier: Apache-2.0
+// What a model file says about chat: its Jinja
+// template, and the chat format that template belongs to: how replies are
+// read back (thinking, tool calls) and, for templates a renderer was written
+// for, that renderer.  Core renders any template with the Jinja engine
+// (core/render/chat.h); the formats are the model families' (models/formats/).
+// Core reaches them only through this interface (interfaces::open_chat, defined in
+// models/formats/formats.cpp).
+#pragma once
+
+#include <memory>
+#include <optional>
+#include <span>
+#include <string>
+#include <string_view>
+#include <vector>
+
+#include "core/interfaces/json_depth.h"
+#include "nlohmann/json.hpp"
+
+namespace flyx {
+class ModelFile;
+}
+
+namespace flyx::interfaces {
+
+using ojson = nlohmann::ordered_json;
+
+// JSON text from outside the engine (a request's body, tool-call arguments written as text, what a model wrote) is
+// parsed with parse_json.  Deeper than kMaxJsonDepth it comes back discarded, as text that is not JSON does.
+inline ojson parse_json(std::string_view s) {
+  return json_depth_within(s) ? ojson::parse(s, nullptr, false) : ojson(ojson::value_t::discarded);
+}
+
+// Bytes [begin, end) of a text.
+struct TextSpan {
+  size_t begin = 0, end = 0;
+};
+
+struct ToolCall {
+  std::string id;
+  std::string name;
+  ojson arguments = ojson::object();  // keys in the order the client sent them
+};
+
+struct ChatMessage {
+  std::string role;                      // system | user | assistant | tool
+  std::string content;                   // text (content parts already joined)
+  std::optional<std::string> reasoning;  // assistant thinking given separately (reasoning_content)
+  std::vector<ToolCall> tool_calls;      // assistant
+  std::string tool_call_id;              // tool
+};
+
+struct ChatOptions {
+  bool add_generation_prompt = true;
+  bool enable_thinking = true;
+  // More template variables (OpenAI chat_template_kwargs), e.g. reasoning_effort.
+  ojson kwargs = ojson::object();
+};
+
+struct RenderedChat {
+  std::string text;
+  // Bytes the template wrote itself (sorted): special tokens are read only
+  // here.  The client's strings, as they pass through the template, are not.
+  std::vector<TextSpan> literal;
+  // Byte offsets where a later request is likely to branch, so the engine
+  // keeps checkpoints there: where this conversation ends (before the
+  // generation prompt) and where earlier requests that it continues ended; on
+  // a first request, the nearest earlier end of a user message or of tool
+  // results whose prefix renders the same.  At most three, ascending.
+  std::vector<size_t> boundaries;
+  // Explicit client cache breakpoints, as byte offsets in the actual rendering.
+  std::vector<size_t> cache_prefixes;
+  size_t system_end = 0;
+  bool in_reasoning = false;  // the generation prompt leaves a thinking block open
+  // Byte offset where the conversation ends and the generation prompt begins
+  // (0: not known).  A later prompt that has all the text up to here is the
+  // same conversation, sent again or continued.
+  size_t conversation_end = 0;
+  // Byte offset where the first user message ends (0: none, or not known):
+  // a request that shares the text up to here is the same conversation as
+  // another, not just one with the same system prompt.
+  size_t first_user_end = 0;
+};
+
+// What a reply may be, beyond what the model writes on its own:
+// the API's tool_choice and parallel_tool_calls, or a JSON answer.
+struct ReplyRules {
+  enum Tools { kAuto, kRequired, kForced, kNone } tools = kAuto;
+  std::string forced;     // kForced: the one tool to call
+  bool parallel = true;   // more than one call in a reply
+  bool json = false;      // the answer is JSON matching `schema` (OpenAI response_format)
+  ojson schema = true;    // json: true = any JSON value
+};
+
+// A piece of a reply, as the client sees it.
+// A tool call streams as kToolCallStart (call.name), zero or more kToolCallDelta
+// (text: incremental JSON argument fragments), and finally kToolCall (complete call).
+struct OutputEvent {
+  enum Kind { kReasoning, kContent, kToolCallStart, kToolCallDelta, kToolCall } kind;
+  std::string text;  // reasoning / content delta, or kToolCallDelta JSON arguments fragment
+  ToolCall call;     // kToolCallStart: name; kToolCall: name and arguments (typed by the tool's JSON schema)
+};
+
+// Splits one reply into thinking, answer text and tool calls as it streams.
+class OutputParser {
+ public:
+  virtual ~OutputParser() = default;
+  virtual std::vector<OutputEvent> feed(std::string_view text) = 0;
+  // End of generation: emits what is still held back.
+  virtual std::vector<OutputEvent> finish() = 0;
+  virtual int tool_calls() const = 0;
+};
+
+class Chat {
+ public:
+  virtual ~Chat() = default;
+  // The Jinja source to render prompts with.
+  virtual const std::string& template_source() const = 0;
+  // Special tokens the template may name as variables (bos_token, eos_token).
+  virtual const ojson& template_tokens() const = 0;
+  // The chat format: "qwen35" (a renderer written for Qwen3.5's template),
+  // "qwen3_coder" / "hermes" (replies read back, the template rendered by
+  // the engine), or "plain" (text only).
+  virtual const char* format() const = 0;
+  // Whether replies can carry tool calls this build reads.
+  virtual bool reads_tool_calls() const = 0;
+  // Whether a generation prompt (what the template appends to open the
+  // assistant's turn) leaves a thinking block open.
+  virtual bool opens_reasoning(std::string_view generation_prompt) const = 0;
+  // A parser for one reply.  in_reasoning: the prompt left a thinking block
+  // open.  tools: the request's definitions (to type parameter values); null
+  // or empty disables tool-call parsing.
+  virtual std::unique_ptr<OutputParser> parser(bool in_reasoning, const std::vector<ojson>* tools) const = 0;
+  // The grammar a reply must match, as an XGrammar structural tag (JSON
+  // text): an optional thinking block, then text and tool calls in this
+  // format's syntax, each call's arguments fitting its tool's schema, as
+  // `rules` allow.  "" when nothing constrains the reply (no tools and no
+  // JSON answer, tool_choice none, or a format without tool calls).
+  virtual std::string reply_grammar(const std::vector<ojson>& tools, const ReplyRules& rules,
+                                    bool in_reasoning) const {
+    return "";
+  }
+
+  // A renderer written for exactly this template (selected by its full
+  // text): the bytes and literal spans the Jinja engine gives, hundreds of
+  // times faster.  Tests hold every such renderer to the engine.
+  virtual bool native() const { return false; }
+  // Only when native(): renders the messages (text and literal spans; the
+  // generation prompt if asked); false with *err where the template raises.
+  virtual bool render(std::span<const ChatMessage> msgs, const std::vector<ojson>& tools, const ChatOptions& opt,
+                      bool generation_prompt, RenderedChat* out, std::string* err) const {
+    return *err = "no native renderer", false;
+  }
+};
+
+// The chat side of a model file: its template (or `template_override`, a
+// Jinja source given at load) and the chat format that template belongs to.
+// Null with *err set when there is no template.
+std::unique_ptr<Chat> open_chat(const ModelFile& file, const std::string& template_override, std::string* err);
+
+}  // namespace flyx::interfaces

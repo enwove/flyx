@@ -1,0 +1,123 @@
+Summarize this document in a few paragraphs.
+
+# 0074 Llama's attention without q/k norms: MiniCPM5-1B, plain decoding
+
+Date: 2026-11-17. Status: built; MiniCPM5-1B checked against transformers and run on an RTX 5060 Ti 8 GB (Windows 11,
+driver 610.88, CUDA 13.5).
+
+## Why
+
+The owner's drafting method, DV (a block of mask slots filled in one pass, a selector growing a tree of 31 to 127
+nodes; [tree verification](../design/tree-verification.md)), is developed and evaluated on MiniCPM5-1B: its trees
+reach 9.5 tokens a forward there, and its relaxed rule's cost was measured on MiniCPM5-1B's GSM8K answers
+([record](../perf/2026-11-13-rtx5090-tree-break-even.md)). Before DV can plug into flyx's rounds, flyx has to run
+MiniCPM5-1B itself, and give transformers' tokens.
+
+MiniCPM5-1B is published as `LlamaForCausalLM`: 24 layers of attention (16 query heads on 2 KV heads of 128, the
+whole head rotated, theta 5e6) and a SwiGLU MLP of 4608, plain RMSNorm weights, an untied head of 130560 rows, no
+biases and none of the earlier MiniCPMs' scaling. That is Qwen3's layer without the per-head RMSNorm of q and k
+before the rotary. Its tokenizer cuts numbers into groups of up to three before a Qwen2-like split.
+
+## Decision
+
+1. **The model describes the absence; no new block kind.** Decision 0008 lists "q/k norms yes/no" among the
+   attention block's flags, and backend_abi.h already said that an index of -1 means none. A Llama's attention
+   blocks name no q/k norm (`flyx_norm` weight -1); everything else is the block Qwen3 uses. `models/qwen3`
+   became `models/llama`, one description for the family: arch `llama` (no q/k norms) and arch `qwen3` (q/k
+   norms), the norms decided by the architecture, not by which tensors a file happens to hold (a Llama file with
+   q/k norm tensors is refused). A second copy of qwen3.cpp for a one-field difference, or a `qk_norm` key in the
+   file's config, would each be a second way to say what the architecture already says.
+2. **The backends take "none" as the identity before the rotary.** The float64 reference is `ops::prep_head` (a
+   head's norm where there is one, then the rotary), which cpu_ref and the kernel tests use. CUDA's attention prep
+   (`k_attn_prep`) takes null norm pointers: no sum, and in its place the barrier the sum's barriers were
+   (a block can hold several heads; the next head's write of the shared row must wait for the last one's reads).
+   Blocks with norms compute as before: Qwen3's and Qwen3.5's logits keep their bits (below). The CUDA prep
+   takes one offset and eps for both norms, so it takes q and k norms both or neither (`supported()` refuses one
+   without the other).
+3. **The ABI keeps its number (30).** The structures did not change, and a backend built before fails on a block
+   without q/k norms ("weight -1 missing": CUDA's at open, cpu_ref's in the first pass) rather than computing
+   anything else. A new number would make every engine refuse every older backend, for models those backends run
+   correctly.
+4. **MiniCPM5's pre-tokenizer.** The converter names the pipeline `minicpm5` (tokenizer.json: no normalizer, a
+   Split on `\p{N}{1,3}`, then Qwen2's split with `\p{N}+`, then the byte-level step) and core/tokenizer implements
+   it: runs of numbers cut into threes from the left, then the word split on each piece by itself (a piece's end is
+   the end of the text for `\s+(?!\S)`: "  12" splits as "  ", "12", not " ", " ", "12").
+   Its post-processor (TemplateProcessing) puts `<s>` (id 0) before every text, whatever `add_bos_token` in
+   tokenizer_config.json says: transformers' `tok("hi")` is `[0, 7466]`. The converter records the tokens a
+   post-processor puts before the text (header `tokenizer.prefix_ids`, each a special token) and refuses every
+   other shape (a token after the text, BERT's and RoBERTa's processors); a ByteLevel post-processor (Qwen's) only
+   moves offsets. The engine puts them before every raw prompt (`/v1/completions`, `flyx run` without `--chat`,
+   the C API and the binding's text, `flyx tokenize`, `kld`): `render_request` writes them as text, each token in
+   a span of its own, as a template writes its `<s>`, so a session's history (its decoded text) is still continued
+   by the client's text. A chat prompt has its `<s>` from the template.
+5. **The converter** maps `model_type` `llama` (and `minicpm5`) to arch `llama` and refuses what this Llama does not
+   compute: biases, another activation, scaled rotary (whichever key names its kind: `rope_type`, or the older
+   `type` that many Llama-family configs still write and transformers reads as the same; any `factor` other than
+   1), sliding windows, and the scale factors other Llama-family checkpoints carry (MiniCPM 1 to 4's `scale_emb`,
+   `scale_depth`, `dim_model_base`; Granite's multipliers). The end tokens are the model's `</s>` and
+   `<|im_end|>` (1, 130073).
+6. **Chat through the model's own template.** The Jinja engine renders MiniCPM5's template as transformers does (a
+   test fixture now, `tests/core/render/templates/minicpm5.jinja`). Its tool calls are `<function name=...>` with
+   `<param>` children and no `<tool_call>` around them, which no reply format here reads: the template is
+   recognised as `plain` (thinking blocks read, tools refused), not mistaken for Qwen's `hermes` or `qwen3_coder`.
+7. **Binary16 K/V by default on a Llama.** Rule 5 takes a default rounding coarser than llama.cpp's only where a
+   real model showed no visible drop, and on MiniCPM5-1B FP8 K/V moves the next tokens visibly (below), where
+   decision 0061 measured none on Qwen. The cache's default is the model's now (`interfaces::Model::
+   kv_fp8_by_default`): FP8 for Qwen3.5 and Qwen3 as before, binary16 for arch `llama`. `--kv`, the C API's
+   `FLYX_KV_FP8` / `FLYX_KV_16`, the binding's `kv=` and `POST /v1/load`'s `"kv"` still choose either; without
+   them (`FLYX_KV_DEFAULT`, `kv=None`, the dashboard's first choice) the model's holds, and the engine's options
+   carry the one taken after the load.
+
+## Measured
+
+MiniCPM5-1B in BF16 (`flyx_convert --model MiniCPM5-1B -o minicpm5-1b.flyx`: 2.16 GB, 3 s), RTX 5060 Ti 8 GB:
+
+* **Against transformers** (`tests/e2e/check_real_model.py --hf MiniCPM5-1B --model minicpm5-1b.flyx --drafters
+  --hf-dtype float32`: four chat prompts without thinking, 128 tokens, binary16 K/V, no drafter; transformers on
+  the CPU): greedy tokens identical to transformers in float32 on all four (22, 126, 128 and 128 tokens, up to the
+  end of the turn). Against transformers in bfloat16 (the same command without `--hf-dtype float32`, the script's
+  default), two identical; the other two first differ at tokens 17 and 63, where bfloat16's top two logits are
+  0.000 and 0.125 apart (a tie, and one bfloat16 step).
+* **Tokenizer**: the script's 10 texts, alone and as raw prompts (`<s>` first, as transformers' `tok(text)`), and
+  3690 more (the model's READMEs, flyx's decisions, C++ and Python, and 3000 runs of numbers in five scripts beside
+  spaces, letters and punctuation; 187,760 tokens), every one tokenized as HuggingFace tokenizers does.
+* **Template**: every conversation of `chat_cases.py` without tools renders to transformers' text, branch points
+  and thinking block; with tools, refused.
+* **Speed** (`flyx bench minicpm5-1b.flyx -n 128`: its three short prompts, greedy, FP8 K/V): 231.1 tok/s plain
+  (`--no-lookup`; 232.1 with `--kv 16`), 268.5 tok/s by default (lookup rounds: 1.17 tokens a round); prefill of 33
+  to 84 tokens 7.6 to 8.9 ms; load 1.3 s, 2.28 GB of weights on the GPU. `flyx run --chat --no-think` answers two
+  GSM8K-style questions right ($639 and 37 pencils) at 232.6 and 229.9 tok/s.
+* **FP8 K/V** (0061's default, `--kv fp8` here) is coarser here than where 0061 measured it: against binary16 (`kld
+  minicpm5-1b.flyx --text ... --tokens 400 --start 32 --kv 16 --save ref.bin`, then `--kv fp8 --ref ref.bin`: 400
+  positions after 32 tokens of each of the model's two READMEs and tree-verification.md, each text after the `<s>`
+  its tokenizer puts first) it gives KL 0.0064 (p99 0.063), the same top-1 97.2%, perplexity 14.78 against 14.58
+  (+1.4%), where the 27B gave 0.0009 to 0.0016, 98.6% and 0.1%. (Measured first without the `<s>`, on token
+  streams the model does not see in use: KL 0.0082, 95.6%, +1.1%.) Keys that no norm has evened out keep their
+  large channels, and one e4m3 scale per position and head leaves the others few bits. `check_real_model.py --kv-fp8
+  --drafters --hf-dtype float32`: two prompts still transformers' float32 tokens (22 and 128); the planets' list
+  has them for 35 tokens and then ends its turn where float32 goes on (the script compares up to the engine's end
+  of turn, so it reports "identical over 35 tokens"); the Chinese one first differs at token 9 (top-2 gap 0.405).
+  Binary16 costs this model nothing at these lengths (232.1 against 231.1 tok/s) and about 12 KB a token more: 24 KB
+  a token against FP8's 12.4 KB (a byte a value and a float32 scale per position and head, for K and for V, in 24
+  layers of 2 heads of 128).
+* **Bits kept**: the log-probabilities of Qwen3-0.6B and Qwen3.5-4B NVFP4 (`kld --save`, 200 positions of a text)
+  are byte for byte those of the build before this change.
+* **Tests**: 65 of 65, six of them new (`tokenizer_minicpm5`, `golden_cpu_ref_llama`, `golden_cuda_llama` with
+  its unfused and tensor-core variants: a tiny Llama of MiniCPM5's head shape, golden tokens from transformers in
+  float64; `converter`: scaled rotary refused under either key, the post-processor's prefix written and other
+  post-processors refused). The tiny Llama's tokenizer has MiniCPM5's post-processor: `tokenizer_minicpm5` holds a
+  raw prompt's tokens to transformers' `tok(text)`, and `request` holds a raw prompt on it to them, the session's
+  history still kept. `gguf_models` refuses an unknown architecture and a Llama GGUF, each by its own message.
+  `golden_*_llama` and `golden_*_qwen3` check the cache each takes when not told (binary16, FP8).
+  The kernel tests' cases without q/k norms, MiniCPM5's shape (decode, 16 rows, a 100-row prefill chunk whose
+  blocks hold three heads each, the FP8 cache): q within 2.1e-7 of float64, every "same bits" check exact.
+
+## Not done
+
+* **A drafter for MiniCPM5-1B** (DV, or another): plain decoding only; lookup rounds (0024) still draft from the
+  session's own text.
+* **MiniCPM5's tool calls** read back (and their grammar for `tool_choice`): a request with tools is refused.
+* **A Llama GGUF**: llama.cpp's converter permutes a Llama's q and k rows for its interleaved rotary pairs; reading
+  that would take a row order in the description (as Qwen3.5's gate rows have), not done.
+* **A GGUF's `add_bos_token`** is still refused by the GGUF reader rather than taken as a prefix: no GGUF this build
+  reads needs one.

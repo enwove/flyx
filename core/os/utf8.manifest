@@ -1,0 +1,13 @@
+<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<!-- Copyright 2026 The flyx Authors. SPDX-License-Identifier: Apache-2.0 -->
+<!-- Embedded in every program on Windows (flyx_program in CMakeLists.txt): the process's ANSI code page is UTF-8
+     (Windows 10 1903 and later), so the C and C++ runtimes' file names, getenv and the other narrow strings are UTF-8
+     as they are everywhere else.  Without it they are the system's code page (936, GBK, on a Chinese Windows), and a
+     path the engine holds in UTF-8 names another file. -->
+<assembly xmlns="urn:schemas-microsoft-com:asm.v1" manifestVersion="1.0">
+  <application xmlns="urn:schemas-microsoft-com:asm.v3">
+    <windowsSettings>
+      <activeCodePage xmlns="http://schemas.microsoft.com/SMI/2019/WindowsSettings">UTF-8</activeCodePage>
+    </windowsSettings>
+  </application>
+</assembly>

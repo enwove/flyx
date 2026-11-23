@@ -1,0 +1,339 @@
+# Architecture (as built)
+
+The full design, with its reasoning and sources, is the design document
+"flyx · 本地推理引擎架构设计". This page maps it to the code as it stands
+and lists the rules the implementation keeps.
+
+## Layers
+
+The directories follow the design's 仓库结构 ([0009](../decisions/0009-repository-layout.md));
+a directory boundary is an architecture boundary, and `tools/check_layering.py`
+(a test) enforces the include rules. Dependencies point inward: `core`
+depends on nothing outside itself and `include/`; `ops` only on `core/api`;
+`models` on `core/api` and the file reader (`core/artifact`); backends on
+`core/api` and `ops`; `apps` tie everything together.
+
+```
+include/flyx/     flyx.h (C API), backend_abi.h (engine <-> backend function table, the model as data)
+core/                plain C++, no CUDA
+  api/               model.h: what a model gives the engine (description, drafter, programs); open_model
+  artifact/          .flyx reader (header, mmap tensors)
+  plan/              programs -> plans (the backend lowers them and picks kernels); device memory budget
+  session/           Session (state, prepare: continue / roll back / restore a checkpoint), SessionPool
+  exec/              Engine (load), the generation loop, Executor (GPU thread, queue), C API
+  resources/         ResourceLedger and leases
+  spec/              SpecController (width per round), the round cost table measured at load
+  protocol/          tokenizer, Qwen3.5 chat template (tools), output parser, OpenAI / Anthropic messages
+  platform/          the only platform-specific code (dynamic libraries, time, environment)
+ops/<op>/ref.h       float64 definition of every op, one directory per op; ops/ops.h includes them all;
+                     ops/sampling/sampling.h is the token-choice definition host and device share
+models/              the model file as blocks (weights, state, typed blocks) and its programs; qwen35/, qwen3/
+backends/cpu_ref/    float64 backend (the reference the GPU is tested against)
+backends/cuda/       backend.h, blocks.h (internal types), backend.cpp (the ABI table, probe, open)
+  ops/               the kernels, one translation unit per op family; kernels.cuh declares their launchers
+  regions/           what each node runs on its block (generic and fused), plans: lower() and running them
+  runtime/           sequence state and buffers, prefill passes, rounds as CUDA graphs, token ring, rollback
+  loader/            the description bound to blocks (weights stacked for the kernels), weights onto the device
+  variants/          compiled kernel configurations; sm120/tables: per-GPU tuning tables
+apps/                flyx-cli, flyx-server (OpenAI / Anthropic HTTP)
+python/              flyx (ctypes binding), convert (HuggingFace / ModelOpt -> .flyx), reference (PyTorch)
+tests/               laid out like the sources: core/protocol, backends/cuda, apps/flyx-server; e2e (golden, real model)
+bench/               microbench (cuda_bench), ab (A/B runs), external (llama.cpp), replay (agent sessions), trace (kernel timelines)
+tools/               codegen (tuning tables -> dispatch rules), ci, layering and numerics checks, quickstart
+packaging/           release tarball, wheel, smoke test
+```
+
+Where the code differs from the design's tree:
+
+* `models` include `core/artifact` to read the file (tensors by name, the
+  config); the design's "only `core/api`" needs the reader behind an
+  interface there.
+* Directories that hold nothing yet, with what fills them
+  ([0006](../decisions/0006-design-scope.md)): `core/diag` (timing is in
+  each request's `flyx_usage`, the reason a prompt was or was not reused
+  comes from `Session::prepare` and `SessionPool`, per-node GPU time from
+  `FLYX_PROFILE=1` in the backend); the three-stage completion tickets of
+  `core/resources` (dropped: one GPU thread frees after its stream is idle);
+  pinned double-buffer upload in `backends/cuda/loader` (with 27B); kernels
+  specific to sm_120a and the separate `flyx-cuda-sm120` package in
+  `variants/sm120` (with FP8/FP4 activations, after their quality gate);
+  the relayout cache of `core/artifact` (dropped: kernels read the file's
+  layout, the binder stacks at upload).
+
+## Request path
+
+1. **Protocol.** A chat request (`core/protocol/chat_json`) becomes
+   `ChatMessage`s; `render_qwen35` produces the prompt text and the byte
+   offsets of message boundaries. Text the session has already shown keeps
+   its tokens (`Session::tokenize`); only the new tail is encoded.
+2. **Session choice.** `SessionPool` picks the resident session whose shown
+   history the prompt continues for at least half; else a free slot; else the
+   least recently used. The executor thread owns the GPU; a retry of the
+   running conversation or a closed connection cancels it.
+3. **Prepare.** The longest usable prefix: the live state; a rollback inside
+   the last rounds (fold of saved inputs); or a checkpoint at a message
+   boundary; else from the start. The reason is logged.
+4. **Prefill** in chunks cut at the last two message boundaries (checkpoints
+   taken there and at the prompt end); the last chunk samples the first token.
+5. **Rounds.** Two in flight. Each round is one CUDA graph: draft (MTP steps
+   or a DFlash2 block), verify `width + 1` rows, choose a token per row,
+   accept, commit (fold the recurrent state to the accepted rows, MTP / DFlash2
+   context). The width is chosen per round by `SpecController` from the cost
+   of each width (measured at load) and the acceptance seen so far.
+6. **Output.** Stop tokens on the GPU; stop strings on the host (text that may
+   start one is held back); the output parser splits thinking, text and tool
+   calls; what was shown becomes the session's history.
+
+## Invariants
+
+`docs/design/numerics.md` is the full contract: per kernel, its reference and
+tolerance, which paths must give the same bits, and the coding rules that
+keep them.
+
+* **Token choice is a pure function** of the logits, the parameters, the seed
+  and the position (`ops/sampling/sampling.h`): greedy, or Gumbel-max with noise keyed
+  on (seed, position, token). A draft is accepted iff it equals that choice,
+  which keeps the output distribution exact under speculation and makes
+  speculative output identical to plain output.
+* **A row's result does not depend on the other rows.** The 1..16-row GEMMs
+  split K into a fixed partition (bf16: 16 chunks; NVFP4: one partition per
+  shape) summed in order; all compiled configurations of a partition give the
+  same bits; plain decoding and verification run the same kernels.
+* **Kernels that round, the reference rounds too** (NVFP4 linears take bf16
+  activations; `flyx_ref` and `cpu_ref` round before computing in float64).
+* **Memory is leased before it is taken**: weights and workspace at load,
+  one lease per session; the backend reports exact sizes (`seq_bytes` runs
+  its allocation code in counting mode).
+
+## Program, regions, ops
+
+The design has three layers; two are separate today and the third lives
+inside the backend ([0006](../decisions/0006-design-scope.md)):
+
+* **Blocks**: `models/<arch>` turns the model file into the description a
+  backend runs (`flyx_model_desc`, ABI 6,
+  [0008](../decisions/0008-programs-from-blocks.md)): a table of weights
+  (tensors of the file), a table of per-sequence state (K/V caches, GDN
+  states, the MTP hidden ring) and typed blocks (embedding, attention, gated
+  delta net, MLP, head, the MTP and DFlash2 drafters, DFlash2 layers) with
+  their dimensions, flags (output gate, norm offsets, rotary dims) and the
+  indices of their weights, state and sub-blocks. A backend implements block
+  kinds and allocates what the state table declares; it does not know the
+  model's name, and refuses at open a block its kernels cannot run. The
+  engine reads model facts (vocabulary, the drafter, its block size) from the
+  model, not from the file.
+* **Program**: `models/<arch>` also emits a backend-neutral list of nodes
+  for prefill and for a round of each width: run a block, tap the residual
+  stream for a drafter, draft, take context, accept, commit. No `Builder` or
+  value graph in core: the node list is the graph, and `core/plan` has the
+  backend lower it once per phase and width. Core reaches the model only
+  through `core/api/model.h` (`api::open_model`, defined in `models/`).
+* **Region**: `lower()` in a backend resolves every node to its block and an
+  implementation: the generic one or the most specific registered override
+  that fits the plan's rows and the block's shapes (today: fused producers
+  that write the next GEMM's input already rounded, split for 1..16 rows and
+  bf16 for prefill, and the GDN mixer between its projections as one kernel
+  for up to 4 rows,
+  [0007](../decisions/0007-gdn-round-kernel.md); the backend option `fusion=0`
+  keeps the generic ones and a golden test runs it).
+  The resolved list is the execution plan; a round's plan is captured once
+  per session as a CUDA graph and replayed.
+* **Op**: the kernels a region's generic implementation calls in order
+  (`backends/cuda/ops/kernels.cuh`), each with a float64 contract in
+  `ops/<op>/ref.h` (token choice: `ops/sampling/sampling.h`) tested by
+  `cuda_op_test` (`tests/backends/cuda/op_test.cu`). A region's
+  generic implementation is written in the backend, not in core: a core-side
+  expansion of regions into ops pays off when a second backend (Metal, HIP)
+  has to run the model from ops alone, and is deferred until then. `cpu_ref`
+  implements the model directly, which keeps it an independent reference.
+
+## GPU specialization
+
+`cuda_bench tune` measures every compiled configuration on the model's GEMM
+shapes and writes `variants/<arch>/tables/<sku>.toml`; the build turns all
+tables into dispatch rules (`tools/codegen/gen_gemm_tables.py`, which also
+checks them). At load the backend picks the table by device name (a table may
+inherit another GPU's), falling back to defaults.
+
+## CUDA backend sources
+
+The kernels compile per family, each file holding its kernels and their
+launchers (the public API is `ops/kernels.cuh`): `ops/gemm_decode.cu` (1..16
+rows: CUDA-core rows, bf16 and NVFP4 on tensor cores), `ops/gemm_prefill.cu`
+(many rows, the pipelined tensor-core GEMM and its configurations),
+`ops/gemm.cu` (dispatch by rows and shape, tuning tables, NVFP4
+quantization), `ops/attention.cu`, `ops/attention_flash.cu`, `ops/gdn.cu`,
+`ops/rows.cu`, `ops/sampling.cu` (token choice, round bookkeeping) and
+`ops/draft.cu` (MTP and DFlash2 kernels). What they share is in
+`ops/common/`: `device.cuh` (device helpers, header-only, so no relocatable
+device code) and `launch.h` (a launch's options and scratch, where fused
+producers leave a GEMM's input). A launch that stages GEMM inputs or consults options takes a
+`Launch` (stream, scratch, options); the others take a stream.
+The host side shares `backend.h` (the backend's types: options, row
+buffers, the model, plans, sequences) and `blocks.h` (the blocks and the
+state table) across `backend.cpp` (the ABI table, probe, open),
+`loader/bind.cpp` (the description's tables to its blocks and state table,
+weights laid out for the kernels: q|k|v and gate|up stacked),
+`loader/weights.cpp` (weights onto the device, the NVFP4 copies drafting
+reads), `runtime/state.cpp` (sequence state and row buffers sized from the
+blocks, the shared prefill buffers), `runtime/rounds.cpp` (prefill passes,
+rounds and their graphs, the token ring, waiting, rollback, checkpoints),
+`regions/layers.cpp` (what each node runs on its block: generic
+implementations and the fused variants), `regions/linear.cpp` (a GEMM on a
+weight of either format) and `regions/plan.cpp` (which blocks the kernels
+take, the block and implementation of each node, `lower()`, running a plan).
+
+## Memory and buffers
+
+The K/V cache of a session is one contiguous allocation sized for its
+context (no pages: the graph's addresses stay fixed without them), bf16 or,
+with `--kv fp8`, e4m3 with a scale per position and head. Buffers sized by
+a pass's rows exist twice: per session for rounds (16 rows), and once in the
+model for prefill chunks (1024 rows by default), borrowed by whichever
+session prefills. Freeing happens on the GPU thread after its stream is
+idle, so no completion tickets are needed. Waits for the device poll
+(`cudaEventQuery` and sleep): on WSL every CUDA wait spins otherwise.
+
+## Not built (decided in 0006, with what would bring each back)
+
+* FP8 output head for the target: waits for a quality gate (FP8 keeps the
+  BF16 head's top-1 choice on 97-98% of real-text positions).
+* Fusing the remaining small kernels between decode GEMMs (the norms at the
+  start of each region: about 0.24 ms of a 5.7 ms token; SwiGLU: 0.04 ms)
+  into the GEMMs. The GDN mixer's are one kernel (0007).
+* Prefill with FP8/FP4 activations on sm_120a MMA (and the sm_120a package):
+  after the quality gate.
+* A core-side Op layer and region expansion: with a second backend.
+* Jinja templates: with a second model family. Pinned double-buffer loading:
+  with 27B. Older GPUs (sm_80/86/89) in the package: when one can be tested.
+* Chunked GDN prefill scan: built (decision 0011).
+* Tree speculation; Apple / AMD backends; host-memory state cache; `.ninfer`.
+* Dropped: paged KV, graphs per context range, fused head + argmax,
+  completion tickets and arena, weight relayout cache, GPU diagnostic ring.
+# flyx
+
+A local LLM inference engine built for one thing: the lowest latency for a
+single user on a single consumer GPU. First target: **Qwen3.5-4B** with the
+**DFlash2** block drafter on an RTX 5070 Ti (sm_120), Linux / WSL, CUDA 13.
+
+Status: **v0.4, the correct path, the API and the speed work of the design
+that measurement kept** (NVFP4 weights, tuned and fused decode kernels,
+tensor-core prefill, KV-head attention, an optional FP8 K/V cache, an NVFP4
+draft head). Everything below works end to end and is checked against a
+float64 reference and against transformers. What the design proposed and was
+measured not worth building is in
+[0006](docs/decisions/0006-design-scope.md).
+
+| | |
+|---|---|
+| Model | Qwen3.5 text decoder (gated delta net + gated attention); Qwen3 dense (tested on a tiny model; published checkpoints need its tokenizer's split) |
+| Weights | BF16, or NVFP4 from NVIDIA ModelOpt checkpoints (e.g. `AxionML/Qwen3.5-4B-NVFP4`): e2m1 x e4m3 decoded in registers to exact bf16, activations rounded to bf16 (the float64 reference rounds the same way) |
+| Drafters | the model's own MTP layer (default; one step per draft) or DFlash2 (block of 16: anchor + 15 drafts, candidate selector walk) |
+| Speculation | the width (drafts per round) is chosen every round: round cost per width is measured at load, per-position acceptance is tracked per session, and the width with the most expected tokens per ms wins (plain decoding included) |
+| Decoding | greedy, or sampling (temperature, top-p, top-k, seed) on the GPU; for one seed the output is the same with and without the drafter |
+| Rounds | draft → verify → accept → commit as one CUDA graph; 2 rounds in flight; waits poll instead of spinning (~3.5% of one core while decoding) |
+| Memory | every byte leased from a ledger before it is taken; prefill buffers shared by the sessions; `--kv fp8` halves the K/V cache |
+| Sessions | prefix reuse; rollback inside the last rounds by folding saved state; checkpoints at message boundaries and prompt ends; stop strings roll back to what was shown |
+| API | OpenAI (`/v1/chat/completions`, `/v1/completions`) and Anthropic (`/v1/messages`) compatible server: streaming, thinking, tool calls; C API and Python binding |
+| Backends | `cuda` (sm_120 generic kernels), `cpu_ref` (float64, for tests); a model reaches them as weights, per-sequence state and typed blocks ([0008](docs/decisions/0008-programs-from-blocks.md)), so a model made of blocks they run needs no backend change |
+
+## Build
+
+Needs CUDA 13 (`nvcc` on `PATH`), CMake ≥ 3.24, Ninja, g++ ≥ 11, Python 3.11+ (build-time code generation).
+
+```sh
+cmake --preset dev && cmake --build --preset dev   # ~/flyx-build; presets: dev, debug, cpu, release-linux
+ctest --preset dev
+```
+
+Outputs in `build/bin`: `flyx` (CLI), `flyx-server` (HTTP API), `libflyx.so` (C API),
+`libflyx-cuda.so`, `libflyx-cpu_ref.so` (backends, loaded at start-up),
+tests. The CUDA backend links the CUDA runtime statically: at run time only the
+NVIDIA driver is needed.
+
+## Tests
+
+```sh
+pip install torch transformers tokenizers safetensors   # for the reference and test assets
+cd build && ctest --output-on-failure
+```
+
+- `make_assets` builds a tiny random Qwen3.5 + DFlash2 pair and golden outputs from the Python reference,
+  and a tiny Qwen3 with golden outputs from transformers itself
+- `reference_vs_transformers` checks the reference against HuggingFace transformers
+- `layering` and `numerics` check the directory rules and the numerics contract
+- `tokenizer`, `golden_cpu_ref`, `golden_cuda` check the engine token by token: plain decoding,
+  DFlash2, forced long accepted runs, rollback, checkpoint restore, edited prompts; `golden_cuda_unfused`
+  the same with the generic region implementations; `golden_*_qwen3` the second architecture
+- `layering` and `numerics` check the directory rules and that every kernel has its row in
+  [the numerics contract](docs/design/numerics.md)
+- `cuda_ops` checks every CUDA kernel against the float64 ops in `ops/<op>/ref.h`, and the sampler's
+  choices and distribution against `ops::sample_token`
+- the golden tests also check that sampled output for one seed does not depend on the drafter,
+  that stop strings end the output exactly before them, and that the MTP drafter's drafts equal
+  the reference's (also after rollback and checkpoint restore)
+
+`tools/ci/cpu.sh` (no GPU) and `tools/ci/gpu.sh` (build, every suite, the real-model and HTTP
+checks, the benchmark) are what CI will run; they run by hand today ([tools/ci](tools/ci/README.md)).
+
+## Run Qwen3.5-4B + DFlash2
+
+On WSL keep models and the build tree on the Linux file system (`~/models`,
+`~/flyx-build`): WSL reads `/mnt/<drive>` through a slow network file
+system, and a model there takes minutes to load instead of seconds.
+
+```sh
+hf download Qwen/Qwen3.5-4B --local-dir ~/models/Qwen3.5-4B
+hf download vllm-project/Qwen3.5-4B-DFlash2 --local-dir ~/models/Qwen3.5-4B-DFlash2
+PYTHONPATH=python/convert python -m flyx_convert \
+    --model ~/models/Qwen3.5-4B --draft ~/models/Qwen3.5-4B-DFlash2 -o ~/models/qwen35-4b.flyx
+
+B=~/flyx-build/bin M=~/models/qwen35-4b.flyx
+$B/flyx run $M --chat --no-think -p "Explain speculative decoding in 3 sentences." -v
+$B/flyx chat $M
+$B/flyx bench $M                      # tok/s and tokens per round (MTP drafter, width chosen per round)
+$B/flyx bench $M --drafter dflash2    # the DFlash2 drafter instead
+$B/flyx bench $M --no-spec            # plain decoding for comparison
+$B/flyx bench $M --width 3            # a fixed number of drafts per round
+
+python tests/e2e/check_real_model.py --hf ~/models/Qwen3.5-4B --model $M --lib $B/libflyx.so
+```
+
+`tools/quickstart.sh` does all of the above in one go.
+
+## Release packages
+
+```sh
+bash packaging/package.sh      # dist/flyx-<v>-linux-x86_64-cuda13.tar.gz and a Python wheel
+```
+
+The tarball (`bin/`, `lib/`, `lib/flyx/` backends, `include/`, `python/`)
+needs only libc and an NVIDIA driver >= 580: the CUDA runtime and the C++
+runtime are linked statically, kernels are built for sm_80 / 86 / 89 / 120
+plus PTX. The wheel carries the same libraries for the ctypes binding (no
+torch). `packaging/smoke.sh` unpacks a tarball into an empty directory and
+checks the dependencies, the CLI on both backends and the server.
+
+Idle tiers (server): `--idle-unload S` frees the sessions after S idle seconds
+(the weights stay), `--keep-alive S` unloads the model as well and loads it
+again on the next request (~1.5 s for the NVFP4 4B); both log what they freed.
+
+Device memory is budgeted before it is taken: `-v` prints the bill (weights,
+one session at the chosen context); the server caps `--sessions` at what fits;
+a context that does not fit fails at load with options that would.
+
+## Speed
+
+Qwen3.5-4B on an RTX 5070 Ti (WSL2), `flyx bench`, 256 new tokens, mean of three prompts
+(flyx f0e8001, [record](docs/perf/2026-11-07-rtx5070ti-vs-llama-cpp-f0e8001.md)):
+
+| weights | plain | MTP drafter | DFlash2 drafter | prefill, 6000 tokens |
+|---|---|---|---|---|
+| BF16 | 88.5 tok/s | 216 tok/s | 179 tok/s | 0.675 s (8.9K tok/s) |
+| NVFP4 | 195 tok/s | 358 tok/s | 309 tok/s | 0.76 s (7.9K tok/s) |
+
+Run-to-run spread on this machine is up to 9% (GPU clocks; on WSL the
+Windows desktop shares the GPU): `bench/ab/ab_decode.sh` alternates two settings
+to compare them (`bench/ab/ab_builds.sh` and `bench/ab/ab_prefill.sh`: two
+builds). Long contexts: NVFP4 plain decode at 24K tokens 134 tok/s,
+149 wi

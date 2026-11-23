@@ -1,0 +1,74 @@
+# Copyright 2026 The flyx Authors. SPDX-License-Identifier: Apache-2.0
+# Tuning table for NVIDIA GeForce RTX 5080, written by `cuda_bench tune` (GB/s of weights streamed in brackets).
+# 2026-11-14, RTX 5080 16 GB, driver 580.126.09, power limit 330 W.
+sku = "rtx5080"
+devices = ["NVIDIA GeForce RTX 5080"]
+
+# Round rules only; prefill keeps architecture defaults (verified on Qwen3.8-27B).
+[rules]
+blocks_round = [
+  { types = ["IQ2_XS"], rows = [1, 1], n_max = 64, kernel = 2, columns = 1, ahead = 0 },
+  { types = ["Q5_1", "Q5_K"], rows = [1, 1], n_min = 64, n_max = 2048, kernel = 2, columns = 1, ahead = 0 },
+  { types = ["IQ2_S", "IQ3_XXS"], rows = [1, 1], n_min = 2048, n_max = 5120, kernel = 2, columns = 4, ahead = 0 },
+  { types = ["Q3_K"], rows = [1, 1], n_min = 6144, n_max = 12288, kernel = 2, columns = 2, ahead = 0 },
+  { types = ["Q4_K"], rows = [1, 1], n_min = 12288, n_max = 65536, columns = 1, ahead = 2 },
+  { types = ["IQ1_S"], rows = [1, 1], n_min = 12288, n_max = 65536, kernel = 2, columns = 4, ahead = 0, warps = 16, staged = 1 },
+  { types = ["Q5_K"], rows = [2, 2], n_max = 5120, columns = 1, ahead = 0 },
+  { types = ["Q4_0", "Q4_1"], rows = [2, 2], n_min = 64, n_max = 2048, columns = 4, ahead = 0 },
+  { types = ["Q4_K"], rows = [2, 2], n_min = 64, n_max = 2048, columns = 2, ahead = 0 },
+  { types = ["Q2_K", "Q3_K"], rows = [2, 2], n_min = 2048, n_max = 5120, columns = 2, ahead = 0 },
+  { types = ["IQ2_S", "IQ4_XS"], rows = [2, 2], n_min = 2048, n_max = 6144, columns = 4, ahead = 0 },
+  { types = ["IQ1_S"], rows = [2, 2], n_min = 2048, n_max = 6144, columns = 4, ahead = 0, warps = 16, staged = 1 },
+  { types = ["Q5_1", "Q8_0"], rows = [2, 2], n_min = 5120, n_max = 6144, columns = 1, ahead = 0 },
+  { types = ["Q2_K", "Q3_K"], rows = [2, 2], n_min = 5120, n_max = 65536, columns = 2, ahead = 0 },
+  { types = ["Q4_K", "Q5_K"], rows = [2, 2], n_min = 5120, n_max = 12288, columns = 2, ahead = 0 },
+  { types = ["Q5_K"], rows = [2, 2], n_min = 12288, n_max = 65536, columns = 1, ahead = 0 },
+  { types = ["IQ1_S"], rows = [2, 2], n_min = 12288, n_max = 65536, columns = 4, ahead = 0, warps = 16, staged = 1 },
+  { types = ["Q5_0", "Q3_K"], rows = [3, 4], n_max = 64, columns = 1, ahead = 0 },
+  { types = ["IQ3_S"], rows = [3, 4], n_min = 64, n_max = 2048, columns = 1, ahead = 0 },
+  { types = ["Q4_0", "IQ4_NL"], rows = [3, 4], n_min = 5120, n_max = 6144, columns = 4, ahead = 0 },
+  { types = ["IQ3_XXS", "IQ3_S", "IQ4_XS"], rows = [3, 4], n_min = 5120, n_max = 6144, columns = 2, ahead = 0 },
+  { types = ["Q4_1", "Q5_0", "Q5_1", "Q8_0", "Q2_K", "Q3_K", "Q4_K", "Q6_K"], rows = [5, 6], n_max = 64, columns = 0, ahead = 0, warps = 16, staged = 1, parts = 2 },
+  { types = ["IQ3_XXS"], rows = [5, 6], n_max = 5120, tensor_cores = "split" },
+  { types = ["Q5_0", "Q5_1", "IQ4_NL", "IQ4_XS"], rows = [5, 6], n_min = 64, n_max = 5120, columns = 0, ahead = 0, warps = 16, staged = 1, parts = 2 },
+  { types = ["Q8_0", "IQ2_S", "IQ3_S", "IQ1_M"], rows = [5, 6], n_min = 2048, n_max = 5120, columns = 0, ahead = 0, warps = 16, staged = 1 },
+  { types = ["IQ3_S"], rows = [5, 6], n_min = 5120, n_max = 6144, tensor_cores = "split" },
+  { types = ["Q4_0", "Q4_1"], rows = [5, 6], n_min = 6144, n_max = 12288, columns = 0, ahead = 0, warps = 16, staged = 1, parts = 2 },
+  { types = ["Q4_1", "Q5_0", "Q5_1", "Q2_K", "Q4_K", "Q6_K"], rows = [7, 8], n_max = 64, columns = 0, ahead = 0, warps = 16, staged = 1, parts = 2 },
+  { types = ["IQ3_XXS", "IQ3_S"], rows = [7, 8], n_max = 6144, tensor_cores = "split" },
+  { types = ["Q5_1"], rows = [7, 8], n_min = 64, n_max = 6144, columns = 0, ahead = 0, warps = 16, staged = 1, parts = 2 },
+  { types = ["Q8_0"], rows = [7, 8], n_min = 64, n_max = 12288, columns = 0, ahead = 0, warps = 16, staged = 1, parts = 2 },
+  { types = ["IQ4_NL"], rows = [7, 8], n_min = 64, n_max = 5120, columns = 0, ahead = 0, warps = 16, staged = 1, parts = 2 },
+  { types = ["IQ2_S"], rows = [7, 8], n_min = 2048, n_max = 5120, columns = 0, ahead = 0, warps = 16, staged = 1 },
+  { types = ["IQ4_XS"], rows = [7, 8], n_min = 2048, n_max = 5120, tensor_cores = "split" },
+  { types = ["Q4_0", "IQ1_M"], rows = [7, 8], n_min = 5120, n_max = 6144, columns = 0, ahead = 0, warps = 16, staged = 1, parts = 2 },
+  { types = ["Q4_1"], rows = [7, 8], n_min = 5120, n_max = 12288, columns = 0, ahead = 0, warps = 16, staged = 1, parts = 2 },
+  { types = ["IQ1_S"], rows = [7, 8], n_min = 5120, n_max = 6144, tensor_cores = "split" },
+  { types = ["IQ1_S"], rows = [7, 8], n_min = 6144, n_max = 65536, tensor_cores = "split_columns" },
+  { types = ["IQ3_XXS"], rows = [7, 8], n_min = 12288, n_max = 65536, tensor_cores = "split" },
+  { rows = [1, 1], n_max = 2048, columns = 1, ahead = 2 },
+  { rows = [1, 1], n_min = 2048, n_max = 5120, columns = 2, ahead = 0 },
+  { rows = [1, 1], n_min = 5120, n_max = 6144, columns = 1, ahead = 2 },
+  { rows = [1, 1], n_min = 6144, n_max = 65536, kernel = 2, columns = 4, ahead = 0 },
+  { rows = [1, 1], n_min = 65536, columns = 1, ahead = 2 },
+  { rows = [2, 2], n_max = 2048, columns = 1, ahead = 0 },
+  { rows = [2, 2], n_min = 2048, n_max = 5120, columns = 4, ahead = 0 },
+  { rows = [2, 2], n_min = 5120, n_max = 6144, columns = 2, ahead = 0 },
+  { rows = [2, 2], n_min = 6144, columns = 4, ahead = 0 },
+  { rows = [3, 4], columns = 4, ahead = 0, staged = 1 },
+  { rows = [5, 6], n_max = 64, tensor_cores = "split" },
+  { rows = [5, 6], n_min = 64, n_max = 2048, columns = 0, ahead = 0, warps = 16, staged = 1, parts = 2 },
+  { rows = [5, 6], n_min = 2048, n_max = 5120, columns = 0, ahead = 0, warps = 16, staged = 2 },
+  { rows = [5, 6], n_min = 5120, columns = 0, ahead = 0, warps = 16, staged = 1 },
+  { rows = [7, 8], n_max = 64, tensor_cores = "split" },
+  { rows = [7, 8], n_min = 64, n_max = 2048, columns = 0, ahead = 0, warps = 16, staged = 1, parts = 2 },
+  { rows = [7, 8], n_min = 2048, n_max = 5120, columns = 0, ahead = 0, warps = 16, staged = 2 },
+  { rows = [7, 8], n_min = 5120, columns = 0, ahead = 0, warps = 16, staged = 1 },
+  { rows = [9, 16], tensor_cores = "split" },
+]
+# blocks_round, rounds of 1 rows: 350838 us with these rules, 351928 with the defaults (-0.3%), 349073 with the best for each
+# blocks_round, rounds of 2 rows: 359915 us with these rules, 363797 with the defaults (-1.1%), 358470 with the best for each
+# blocks_round, rounds of 4 rows: 377109 us with these rules, 408418 with the defaults (-7.7%), 376090 with the best for each
+# blocks_round, rounds of 6 rows: 401614 us with these rules, 467567 with the defaults (-14.1%), 399004 with the best for each
+# blocks_round, rounds of 8 rows: 424040 us with these rules, 509338 with the defaults (-16.7%), 418949 with the best for each
+# blocks_round, rounds of 16 rows: 526436 us with these rules, 713335 with the defaults (-26.2%), 526436 with the best for each

@@ -1,0 +1,24 @@
+{"question": "Write a Python function that parses an ISO 8601 date string without using the datetime module, with a few tests."}
+{"question": "Explain how a CPU cache works to a new engineer, with a concrete example of a cache miss."}
+{"question": "Write a short poem about the sea at night."}
+{"question": "What are the main causes of the French Revolution? Answer in a few paragraphs."}
+{"question": "Translate into French: The meeting has been moved to Thursday afternoon because the director is travelling on Wednesday."}
+{"question": "Write a polite email to a landlord asking for the heating in the flat to be repaired."}
+{"question": "Give me a recipe for a simple vegetable soup, with a list of ingredients and the steps."}
+{"question": "What is the difference between TCP and UDP? When would you use each?"}
+{"question": "Write a C++ function that reverses a singly linked list, and explain how it works."}
+{"question": "Tell me a short story about a robot who learns to paint."}
+{"question": "Summarize the plot of Romeo and Juliet in five sentences."}
+{"question": "Explain photosynthesis to a ten-year-old."}
+{"question": "List ten practical tips for improving sleep."}
+{"question": "Write a SQL query that returns the five customers with the highest total order value, and explain each clause."}
+{"question": "What are the pros and cons of remote work for a small software company?"}
+{"question": "Describe the water cycle step by step."}
+{"question": "Write a JavaScript function that debounces another function, with an example of its use."}
+{"question": "Why is the sky blue? Give a clear physical explanation."}
+{"question": "Draft a short product description for a reusable stainless steel water bottle."}
+{"question": "Explain what a hash table is, how collisions are handled, and what its time complexity is."}
+{"question": "Write a haiku about autumn leaves, then explain the imagery you chose."}
+{"question": "Compare the economies of ancient Rome and ancient China in a few paragraphs."}
+{"question": "How do vaccines train the immune system? Keep it short."}
+{"question": "Write a bash script that counts the lines in every .txt file in a directory and prints the total."}

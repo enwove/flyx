@@ -1,0 +1,493 @@
+# Copyright 2026 The flyx Authors. SPDX-License-Identifier: Apache-2.0
+#
+# Kernel configurations compiled into the CUDA backend, and [defaults]: the
+# rules every GPU without a table of its own takes.  The tuner (`cuda_bench
+# tune`) measures every one of them on the model's shapes; the per-GPU tables
+# in variants/<arch>/tables/ pick among them per shape and row count, and may
+# carry their own rules of any family [defaults] has ([rules]: a family whole);
+# tools/codegen/gen_gemm_tables.py turns all of it into C++ at build time.
+#
+# Every bf16 configuration gives bit-identical results.  NVFP4 results depend
+# on the K partition (span, chunks): a table must use one partition for all
+# row counts of a shape.
+
+[[bf16_skinny]]            # tile (8-column groups per warp), warps per block, loop unroll
+nt = 1
+warps = 8
+unroll = 8
+[[bf16_skinny]]
+nt = 1
+warps = 16
+unroll = 8
+[[bf16_skinny]]
+nt = 1
+warps = 16
+unroll = 4
+[[bf16_skinny]]
+nt = 2
+warps = 8
+unroll = 8
+[[bf16_skinny]]
+nt = 2
+warps = 16
+unroll = 8
+[[bf16_skinny]]
+nt = 2
+warps = 16
+unroll = 4
+[[bf16_skinny]]
+nt = 4
+warps = 16
+unroll = 4
+[[bf16_skinny]]
+nt = 4
+warps = 8
+unroll = 4
+[[bf16_skinny]]
+nt = 1
+warps = 16
+unroll = 16
+
+# 17..64 rows: tile, chunks (a warp each), loop unroll, input parts (3: the 1..16-row bits, in 16 chunks; 1: a
+# drafting pass's, in the chunks K gives it, 8 or 16: gen_gemm_tables.py draft_chunks)
+[[bf16_mt]]
+nt = 1
+chunks = 16
+unroll = 4
+parts = 3
+[[bf16_mt]]
+nt = 1
+chunks = 16
+unroll = 8
+parts = 3
+[[bf16_mt]]
+nt = 2
+chunks = 16
+unroll = 4
+parts = 3
+[[bf16_mt]]
+nt = 2
+chunks = 16
+unroll = 8
+parts = 3
+[[bf16_mt]]
+nt = 4
+chunks = 16
+unroll = 2
+parts = 3
+[[bf16_mt]]
+nt = 4
+chunks = 16
+unroll = 4
+parts = 3
+[[bf16_mt]]
+nt = 1
+chunks = 16
+unroll = 4
+parts = 1
+[[bf16_mt]]
+nt = 2
+chunks = 16
+unroll = 4
+parts = 1
+[[bf16_mt]]
+nt = 4
+chunks = 16
+unroll = 4
+parts = 1
+[[bf16_mt]]
+nt = 1
+chunks = 8
+unroll = 4
+parts = 1
+[[bf16_mt]]
+nt = 2
+chunks = 8
+unroll = 4
+parts = 1
+[[bf16_mt]]
+nt = 4
+chunks = 8
+unroll = 4
+parts = 1
+[[bf16_mt]]
+nt = 2
+chunks = 8
+unroll = 8
+parts = 1
+[[bf16_mt]]
+nt = 4
+chunks = 8
+unroll = 2
+parts = 1
+
+[[nvfp4_skinny]]           # span (K values per lane group), chunks (K partition), tile, warps, unroll
+span = 128
+chunks = 4
+nt = 1
+warps = 4
+unroll = 4
+[[nvfp4_skinny]]
+span = 128
+chunks = 4
+nt = 2
+warps = 4
+unroll = 4
+[[nvfp4_skinny]]
+span = 128
+chunks = 4
+nt = 1
+warps = 4
+unroll = 8
+[[nvfp4_skinny]]
+span = 128
+chunks = 4
+nt = 1
+warps = 2
+unroll = 4
+[[nvfp4_skinny]]
+span = 128
+chunks = 4
+nt = 2
+warps = 2
+unroll = 4
+[[nvfp4_skinny]]
+span = 128
+chunks = 4
+nt = 4
+warps = 4
+unroll = 2
+[[nvfp4_skinny]]
+span = 128
+chunks = 8
+nt = 1
+warps = 8
+unroll = 4
+[[nvfp4_skinny]]
+span = 128
+chunks = 8
+nt = 2
+warps = 8
+unroll = 4
+[[nvfp4_skinny]]
+span = 128
+chunks = 8
+nt = 1
+warps = 4
+unroll = 4
+[[nvfp4_skinny]]
+span = 128
+chunks = 16
+nt = 1
+warps = 16
+unroll = 2
+[[nvfp4_skinny]]
+span = 128
+chunks = 16
+nt = 2
+warps = 16
+unroll = 2
+[[nvfp4_skinny]]
+span = 128
+chunks = 16
+nt = 1
+warps = 8
+unroll = 4
+[[nvfp4_skinny]]
+span = 64
+chunks = 4
+nt = 1
+warps = 4
+unroll = 4
+[[nvfp4_skinny]]
+span = 64
+chunks = 16
+nt = 1
+warps = 16
+unroll = 4
+
+# GGML block weights (GGUF files), 1..16 rows: nt tiles of 8 columns a warp; nw warps on neighbouring columns
+# share a window of activations; kw such groups of warps each take a run of K on the same columns.  Every one
+# gives the same bits.
+[[blocks_skinny]]
+nt = 2
+nw = 8
+kw = 1
+[[blocks_skinny]]
+nt = 2
+nw = 4
+kw = 1
+[[blocks_skinny]]
+nt = 1
+nw = 8
+kw = 1
+[[blocks_skinny]]
+nt = 1
+nw = 4
+kw = 2
+[[blocks_skinny]]
+nt = 1
+nw = 2
+kw = 4
+[[blocks_skinny]]
+nt = 1
+nw = 4
+kw = 4
+[[blocks_skinny]]
+nt = 2
+nw = 2
+kw = 4
+
+# GGML block weights, passes of more than 16 rows with inputs in 8 bits (FLYX_ACT_Q8): columns a block of
+# threads (bn), values of K a tile of rows (qk; a barrier a tile).  Every one gives the same bits.
+[[blocks_q8]]
+bn = 64
+qk = 128
+[[blocks_q8]]
+bn = 128
+qk = 256
+[[blocks_q8]]
+bn = 64
+qk = 64
+[[blocks_q8]]
+bn = 128
+qk = 64
+# Tiles of 64 rows (bm; 128 above) for short passes: a pass of up to 64 rows computes no padding rows a second
+# tile of 64 would, and the warps each take one step of 16 rows.
+[[blocks_q8]]
+bn = 64
+qk = 128
+bm = 64
+[[blocks_q8]]
+bn = 128
+qk = 256
+bm = 64
+
+# GGML block weights, rounds with inputs in 8 bits on dp4a (k_round_blocks_q8): the rows the kernel holds (1, 2, 4,
+# 8 or 16; a round runs one that takes its rows), the columns a warp takes at once (a row's values are loaded once
+# for all of them) and the groups of 32 weights a lane loads ahead per column (on their way while it multiplies);
+# 0 takes them by the type's unit: 4 columns (2 for units over 32 bytes), as many groups ahead as registers hold 4
+# units of 16 bytes or 2 of more; `warps` a block of threads (8 unless said); `staged`: the block first copies the
+# round's rows (their 8-bit values, scales and sums) to shared memory and reads them there (where they do not fit,
+# K too long, the same configuration reads them from global memory).  Every one gives the same bits.  The ones the
+# defaults use (`cuda_bench rounds` measures every one compiled); the staged ones, 2..8 rows on wide layers:
+#
+[[blocks_round]]
+rows = 1
+columns = 1
+ahead = 2
+[[blocks_round]]
+rows = 1
+columns = 2
+ahead = 0
+[[blocks_round]]
+rows = 2
+columns = 1
+ahead = 0
+[[blocks_round]]
+rows = 2
+columns = 2
+ahead = 0
+[[blocks_round]]
+rows = 2
+columns = 4
+ahead = 0
+[[blocks_round]]
+rows = 4
+columns = 1
+ahead = 0
+[[blocks_round]]
+rows = 4
+columns = 2
+ahead = 0
+[[blocks_round]]
+rows = 4
+columns = 4
+ahead = 0
+[[blocks_round]]
+rows = 8
+columns = 0
+ahead = 0
+[[blocks_round]]
+rows = 8
+columns = 2
+ahead = 0
+[[blocks_round]]
+rows = 8
+columns = 2
+ahead = 2
+[[blocks_round]]
+rows = 2
+columns = 4
+ahead = 0
+warps = 16
+staged = 1
+[[blocks_round]]
+rows = 4
+columns = 4
+ahead = 0
+staged = 1
+[[blocks_round]]
+rows = 8
+columns = 0
+ahead = 0
+warps = 16
+staged = 1
+[[blocks_round]]
+rows = 16
+columns = 0
+ahead = 0
+# 8 rows on layers of few columns (the projections back to the hidden size):
+# two warps a column set, rows 0-3 and 4-7 (more warps in flight; the IQ types' best), and the rows through shared
+# memory a window of K at a time where all of them do not fit (the K types' best).  Every one gives the same bits.
+[[blocks_round]]
+rows = 8
+columns = 0
+ahead = 0
+warps = 16
+staged = 1
+parts = 2
+[[blocks_round]]
+rows = 8
+columns = 0
+ahead = 0
+warps = 16
+staged = 2
+
+# The rules for shapes no table lists, on every GPU whose table (or one it inherits) has no rules of that family.
+[defaults]
+# bf16: three input planes; 5..8 rows read them for every 8 columns of an nt = 1 tile (RTX 5090:
+# 17% slower than nt = 2)
+bf16 = [{ rows = [1, 4], nt = 1, warps = 16, unroll = 8 }, { rows = [5, 8], nt = 2, warps = 16, unroll = 8 },
+        { rows = [9, 16], nt = 4, warps = 16, unroll = 4 }]
+nvfp4_k128 = { span = 128, chunks = 4, nt = 1, warps = 4, unroll = 4 }   # K % 128 == 0
+nvfp4_k64 = { span = 64, chunks = 4, nt = 1, warps = 4, unroll = 4 }     # otherwise (K % 64 == 0)
+# bf16, 17..64 rows on k_gemm_skinny_mt (bf16_mt): a round's in three parts (bf16_rows: each row the 1..16-row
+# kernel's bits) and a drafting pass's in one (bf16_draft: bf16 inputs, the tile and the unroll; the chunks K's).
+bf16_rows = [{ rows = [17, 64], nt = 2, chunks = 16, unroll = 4, parts = 3 }]
+bf16_draft = [{ rows = [17, 64], nt = 2, unroll = 4 }]
+# GGML block weights, by the layer's columns (n_max; the last rules for the rest) and the rows.  A narrow layer
+# runs several stretches of K at once; a wide one shares a window among many columns.  Measured on an RTX 5070 Ti;
+# a GPU's table may have its own.
+# Inputs in 8 bits, by block type, the pass's rows and the layer's columns (`cuda_bench q8runs T table` on the 27B's
+# and the 4B's layers at 32, 64, 128 and 512 rows, every type).
+# Passes of up to 128 rows take tiles of 64 rows: 1.5 times the speed at 32 and 64 rows, 5% at 128 (Q5_0 and
+# IQ4_NL only up to 64).  Longer passes, most types: up to the 4B's 9216 columns, blocks of 64 columns (two an SM:
+# tiles of rows 128 values long fit); wider, 128 (one an SM with a whole window of rows a tile, half the reads of
+# the rows).  The legacy types with blocks of 32 and a plain scale hold more of a window in registers and keep tiles
+# of K 64 long, 128 columns on wide layers (5 to 6% faster than tiles of 128); Q5_0, Q8_0 and IQ4_NL do best with
+# 64 x 128 (128 x 256 cost them 10 to 20% on wide layers).  Layers of at most 64 columns (the gated delta nets' b and
+# a: 32 or 48) take tiles of 64 rows whatever the pass: one block of columns, so the tiles of rows are all the
+# parallelism there is; 1.6 to 1.9 times the speed at 512 rows, every type measured.
+blocks_q8 = [
+  { types = ["Q4_0", "Q4_1", "Q5_1"], n_max = 64, bn = 64, qk = 128, bm = 64 },
+  { types = ["Q4_0", "Q4_1", "Q5_1"], rows = [17, 128], bn = 64, qk = 128, bm = 64 },
+  { types = ["Q4_0", "Q4_1", "Q5_1"], n_max = 4096, bn = 64, qk = 64 },
+  { types = ["Q4_0", "Q4_1", "Q5_1"], bn = 128, qk = 64 },
+  { types = ["Q8_0"], n_max = 64, bn = 64, qk = 128, bm = 64 },
+  { types = ["Q8_0"], rows = [17, 128], bn = 64, qk = 128, bm = 64 },
+  { types = ["Q8_0"], bn = 64, qk = 128 },
+  { types = ["Q5_0", "IQ4_NL"], n_max = 64, bn = 64, qk = 128, bm = 64 },
+  { types = ["Q5_0", "IQ4_NL"], rows = [17, 64], bn = 64, qk = 128, bm = 64 },
+  { types = ["Q5_0", "IQ4_NL"], bn = 64, qk = 128 },
+  { n_max = 64, bn = 64, qk = 128, bm = 64 },
+  { rows = [17, 128], n_max = 9216, bn = 64, qk = 128, bm = 64 },
+  { rows = [17, 128], bn = 128, qk = 256, bm = 64 },
+  { n_max = 9216, bn = 64, qk = 128 },
+  { bn = 128, qk = 256 },
+]
+# ... and the runs of K they add a layer up in, by its columns and K (k_max; at most one run a window of 256): a K
+# partition, so it decides a row's bits, whatever the pass.  A launch with fewer tiles than three an SM spreads the
+# runs over the GPU (a block a run, where the scratch holds their sums); otherwise a block takes them in turn,
+# folding each onto y: the same bits.  Runs pay where a pass of 64-128 rows leaves the GPU idle (the GDN's b and a,
+# attention k and v, the 4B's 2560-column and the 27B's 5120-column layers: 1.2 to 2.1 times faster), and cost
+# their folds in long passes, which fill it anyway: the rules keep that within 1% at 512 rows.
+blocks_q8_runs = [
+  { n_max = 1024, runs = 4 },                # GDN b and a, attention k and v
+  { n_max = 2560, k_max = 4096, runs = 2 },  # the 4B's out
+  { n_max = 2560, runs = 4 },                # the 4B's down
+  { n_max = 5120, k_max = 8192, runs = 1 },  # the 27B's out: a fold costs 4% at 512 rows
+  { n_max = 5120, runs = 2 },                # the 27B's down
+  { runs = 1 },
+]
+# Rounds with inputs in 8 bits: the first rule that matches the block type, the round's rows (within one dp4a
+# kernel's: 1, 2, 3-4, 5-8, 9-16; `kernel`: one of more rows, the same bits) and the layer's columns (more than n_min,
+# at most n_max): a configuration of the dp4a kernel, or one of the integer tensor-core kernels (`tensor_cores`:
+# "rows", the rows in the MMA's first operand; "columns", the columns there; "split", "split_columns" and "warps", the
+# sums' streams split among blocks or a block's warps).  Rules naming types are exceptions; the
+# rules for every type cover the rest. `cuda_bench tune` on an RTX 5090 (its table there,
+# variants/sm120/tables/rtx5090.toml, has the same rules): every block type on Qwen3.8-27B's and Qwen3.5-4B's layers,
+# weighed by their layers, a type's own rule where it saves 25 us a round and 3%.  At one row a lane loads 2 groups
+# ahead or none, not 4: fewer groups in flight let more warps run; from 5 rows the K-quants' wide layers take the
+# tensor cores with the columns in the MMA (16 columns of a group an MMA, decoded once), the other types stay on dp4a,
+# whose decoding of a whole group a lane costs least.  The rules before these came from the 27B's two files alone and
+# gave every other type the tensor cores at 7 and 8 rows on layers wider than 6144: over every type, 36% more GEMM
+# time in 8-row rounds. IQ4_XS and Q6_K from 3 rows: the streams
+# split among a block's warps (RTX 5070 Ti, the 27B's layers from 1024 to 17408 columns, at 8
+# rows 0.55-0.74 of these rules' time for IQ4_XS, 0.72-0.94 for Q6_K, at 16 0.53-0.66 and 0.69-0.91; 1 and 2 rows
+# even). Q4_K and Q5_K on it were slower than these rules.
+blocks_round = [
+  { types = ["IQ4_XS", "Q6_K"], rows = [3, 4], tensor_cores = "warps" },
+  { types = ["IQ4_XS", "Q6_K"], rows = [5, 8], tensor_cores = "warps" },
+  { types = ["IQ4_XS", "Q6_K"], rows = [9, 16], tensor_cores = "warps" },
+  { types = ["IQ2_XXS"], rows = [1, 1], n_max = 64, kernel = 2, columns = 1, ahead = 0 },
+  { types = ["Q8_0"], rows = [1, 1], n_min = 2048, n_max = 6144, kernel = 2, columns = 1, ahead = 0 },
+  { types = ["Q5_K"], rows = [1, 1], n_min = 2048, n_max = 65536, columns = 2, ahead = 0 },
+  { types = ["IQ4_XS"], rows = [1, 1], n_min = 2048, n_max = 6144, kernel = 2, columns = 4, ahead = 0 },
+  { types = ["Q5_K"], rows = [2, 2], n_max = 65536, columns = 1, ahead = 0 },
+  { types = ["Q4_1"], rows = [2, 2], n_min = 64, n_max = 6144, columns = 4, ahead = 0 },
+  { types = ["Q2_K", "IQ2_XXS"], rows = [3, 4], n_max = 2048, columns = 2, ahead = 0 },
+  { types = ["Q4_K"], rows = [3, 4], n_max = 64, columns = 2, ahead = 0 },
+  { types = ["IQ3_S"], rows = [3, 4], n_max = 6144, columns = 1, ahead = 0 },
+  { types = ["Q4_0", "Q4_1", "Q5_1", "IQ4_NL"], rows = [3, 4], n_min = 2048, n_max = 6144, columns = 4, ahead = 0 },
+  { types = ["Q3_K"], rows = [3, 4], n_min = 2048, n_max = 65536, columns = 2, ahead = 0 },
+  { types = ["Q5_K"], rows = [3, 4], n_min = 2048, n_max = 12288, columns = 2, ahead = 0 },
+  { types = ["Q4_K", "Q5_K"], rows = [3, 4], n_min = 12288, n_max = 65536, tensor_cores = "columns" },
+  { types = ["Q4_0"], rows = [5, 6], n_max = 64, columns = 2, ahead = 0 },
+  { types = ["Q4_1", "Q5_0", "Q8_0", "Q2_K"], rows = [5, 6], n_max = 64, columns = 2, ahead = 2 },
+  { types = ["Q5_1"], rows = [5, 6], n_max = 2048, columns = 0, ahead = 0 },
+  { types = ["IQ2_XS", "IQ4_NL"], rows = [5, 6], n_max = 2048, tensor_cores = "rows" },
+  { types = ["Q8_0"], rows = [5, 6], n_min = 2048, n_max = 6144, tensor_cores = "rows" },
+  { types = ["IQ2_XS", "IQ4_NL"], rows = [5, 6], n_min = 2048, n_max = 6144, columns = 0, ahead = 0 },
+  { types = ["Q4_K", "Q5_K"], rows = [5, 6], n_min = 6144, n_max = 65536, tensor_cores = "columns" },
+  { types = ["Q8_0"], rows = [5, 6], n_min = 12288, n_max = 65536, columns = 2, ahead = 0 },
+  { types = ["Q3_K"], rows = [5, 6], n_min = 12288, n_max = 65536, tensor_cores = "columns" },
+  { types = ["Q5_0"], rows = [7, 8], n_max = 64, columns = 2, ahead = 2 },
+  { types = ["Q5_1"], rows = [7, 8], n_max = 6144, columns = 0, ahead = 0 },
+  { types = ["Q8_0"], rows = [7, 8], n_max = 6144, tensor_cores = "rows" },
+  { types = ["Q5_0"], rows = [7, 8], n_min = 64, n_max = 2048, columns = 2, ahead = 0 },
+  { types = ["Q4_K", "Q5_K"], rows = [7, 8], n_min = 2048, n_max = 65536, tensor_cores = "columns" },
+  { types = ["IQ4_NL"], rows = [7, 8], n_min = 2048, n_max = 6144, columns = 0, ahead = 0 },
+  { types = ["Q2_K", "Q3_K"], rows = [7, 8], n_min = 6144, n_max = 65536, tensor_cores = "columns" },
+  { types = ["Q8_0"], rows = [7, 8], n_min = 12288, n_max = 65536, columns = 2, ahead = 0 },
+  { types = ["Q4_1", "Q5_0"], rows = [9, 16], n_min = 2048, n_max = 6144, columns = 0, ahead = 0 },
+  { types = ["Q5_1"], rows = [9, 16], n_min = 2048, n_max = 65536, columns = 0, ahead = 0 },
+  { rows = [1, 1], n_max = 2048, columns = 1, ahead = 2 },
+  { rows = [1, 1], n_min = 2048, n_max = 6144, columns = 2, ahead = 0 },
+  { rows = [1, 1], n_min = 6144, kernel = 2, columns = 4, ahead = 0 },
+  { rows = [2, 2], n_max = 2048, columns = 1, ahead = 0 },
+  { rows = [2, 2], n_min = 2048, n_max = 6144, columns = 2, ahead = 0 },
+  { rows = [2, 2], n_min = 6144, columns = 4, ahead = 0 },
+  { rows = [3, 4], n_max = 2048, columns = 1, ahead = 0 },
+  { rows = [3, 4], n_min = 2048, n_max = 6144, columns = 2, ahead = 0 },
+  { rows = [3, 4], n_min = 6144, n_max = 65536, columns = 4, ahead = 0 },
+  { rows = [3, 4], n_min = 65536, columns = 2, ahead = 0 },
+  { rows = [5, 6], n_max = 64, tensor_cores = "rows" },
+  { rows = [5, 6], n_min = 64, n_max = 2048, columns = 2, ahead = 2 },
+  { rows = [5, 6], n_min = 2048, n_max = 6144, columns = 2, ahead = 0 },
+  { rows = [5, 6], n_min = 6144, n_max = 65536, columns = 0, ahead = 0 },
+  { rows = [5, 6], n_min = 65536, tensor_cores = "columns" },
+  { rows = [7, 8], n_max = 2048, tensor_cores = "rows" },
+  { rows = [7, 8], n_min = 2048, n_max = 6144, columns = 2, ahead = 0 },
+  { rows = [7, 8], n_min = 6144, n_max = 65536, columns = 0, ahead = 0 },
+  { rows = [7, 8], n_min = 65536, tensor_cores = "columns" },
+  { rows = [9, 16], tensor_cores = "rows" },
+]
+blocks = [
+  { n_max = 2048, rows = [1, 16], nt = 1, nw = 2, kw = 4 },
+  { n_max = 6144, rows = [1, 2], nt = 1, nw = 2, kw = 4 },
+  { n_max = 6144, rows = [3, 16], nt = 1, nw = 4, kw = 2 },
+  { n_max = 12288, rows = [1, 16], nt = 1, nw = 4, kw = 2 },
+  { n_max = 65536, rows = [1, 16], nt = 1, nw = 8, kw = 1 },
+  { rows = [1, 16], nt = 2, nw = 8, kw = 1 },               # the output head
+]
