@@ -39,7 +39,7 @@ svg.i { width: 16px; height: 16px; flex: none; fill: none; stroke: currentColor;
        transition: grid-template-columns 0.18s ease; }
 @media (prefers-reduced-motion: reduce) { .app { transition: none; } }
 .topbar { grid-column: 1 / -1; display: flex; align-items: center; gap: 4px; padding: 0 12px 0 16px; min-width: 0; }
-/* The logo, single-colour racing green on paper.
+/* The full-colour FLYX lockup on paper.
    24px high, the lockup's least; its clear space (a quarter of the mark's height) is within the bar's 48px. */
 .word { display: flex; align-items: center; flex: none; margin-right: 10px; text-decoration: none; }
 .word img { display: block; width: auto; height: 24px; }

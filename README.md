@@ -13,7 +13,18 @@
 </p>
 
 <p align="center">
-  <b>English</b> · <a href="README_zh.md">中文</a> &nbsp;|&nbsp;
+  <b>English</b> ·
+  <a href="docs/i18n/README_zh.md">中文</a> ·
+  <a href="docs/i18n/README_ja.md">日本語</a> ·
+  <a href="docs/i18n/README_ko.md">한국어</a> ·
+  <a href="docs/i18n/README_es.md">Español</a> ·
+  <a href="docs/i18n/README_fr.md">Français</a> ·
+  <a href="docs/i18n/README_de.md">Deutsch</a>
+</p>
+
+---
+
+<p align="center">
   <a href="#quick-start">Quick Start</a> ·
   <a href="#performance">Performance</a> ·
   <a href="docs/models.md">Models</a> ·
