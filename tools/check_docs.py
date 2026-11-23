@@ -64,7 +64,7 @@ def _strip_code(text: str) -> str:
 
 
 def _public_doc_files(root: str) -> list[str]:
-    files = ["llms.txt", "README.md", "README_zh.md", "AGENTS.md", "CONTRIBUTING.md", "SECURITY.md",
+    files = ["llms.txt", "README.md", "AGENTS.md", "CONTRIBUTING.md", "SECURITY.md",
              "tools/ci/README.md", "bench/prompts/README.md"]
     for sub in ("docs", ".github"):
         base = os.path.join(root, sub)
@@ -127,9 +127,10 @@ def main(root: str) -> int:
     for rel in public_files:
         full = os.path.join(root, rel)
         text = _read(full)
-        cjk_text = re.sub(r'<a href="README_[a-z]+\.md">[^<]+</a>', "", text) if rel == "README.md" else text
+        is_readme = rel == "README.md" or bool(re.fullmatch(r"docs/i18n/README_[a-z]+\.md", rel))
+        cjk_text = re.sub(r'<a href="(?:docs/i18n/)?README_[a-z]+\.md">[^<]+</a>', "", text) if is_readme else text
         for label, pat in leak_patterns:
-            if label == "CJK text" and rel == "README_zh.md":
+            if label == "CJK text" and rel in ("docs/i18n/README_zh.md", "docs/i18n/README_ja.md"):
                 continue
             target_text = cjk_text if label == "CJK text" else text
             m = pat.search(target_text)
@@ -156,7 +157,7 @@ def main(root: str) -> int:
             for link in _extract_links(_read(llms_path))
             if not link.startswith(("http://", "https://", "mailto:"))
         }
-        expected = {"README.md", "README_zh.md", "AGENTS.md", "CONTRIBUTING.md", "SECURITY.md"}
+        expected = {"README.md", "AGENTS.md", "CONTRIBUTING.md", "SECURITY.md"}
         expected.update(f for f in public_files if f.startswith("docs/") and f.endswith(".md"))
         for req in sorted(expected - llms_links):
             bad.append(f"llms.txt: missing index link for {req}")
