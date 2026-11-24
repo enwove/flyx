@@ -1157,6 +1157,54 @@ struct LinuxScan {
   std::unordered_set<int> ancestors;
 };
 
+struct LinuxAppUsage {
+  std::string key, proc_name;
+  uint64_t bytes = 0;
+  int procs = 0;
+  bool runs_flyx = false;
+  bool any_same_uid = false;
+  std::vector<int> pids;
+};
+
+// A scan's groups as the listing shows them: those of at least minimum_bytes, the largest first, each with whether
+// it can be closed.
+void finish_linux_scan(LinuxScan& out, std::unordered_map<std::string, LinuxAppUsage>& groups,
+                       uint64_t minimum_bytes) {
+  out.snap.others_bytes =
+      out.snap.mem_used > out.snap.own_bytes ? out.snap.mem_used - out.snap.own_bytes : 0;
+
+  std::vector<LinuxGroup> list;
+  for (auto& [k, g] : groups) {
+    if (g.bytes < minimum_bytes) continue;
+    LinuxGroup lg;
+    lg.app.id = gpu_app_group_id(g.key);
+    lg.app.process_name = g.proc_name;
+    lg.app.name = clean_gpu_app_name(g.proc_name, "", "");
+    lg.app.bytes = g.bytes;
+    lg.app.local_bytes = g.bytes;
+    lg.app.processes = g.procs;
+    if (g.runs_flyx) {
+      lg.app.closable = false;
+      lg.app.reason = "runs_flyx";
+    } else if (!g.any_same_uid) {
+      lg.app.closable = false;
+      lg.app.reason = "other_user";
+    } else {
+      lg.app.closable = true;
+    }
+    lg.pids = std::move(g.pids);
+    list.push_back(std::move(lg));
+  }
+  std::sort(list.begin(), list.end(), [](const LinuxGroup& a, const LinuxGroup& b) {
+    if (a.app.bytes != b.app.bytes) return a.app.bytes > b.app.bytes;
+    return a.app.name < b.app.name;
+  });
+  for (auto& lg : list) {
+    out.snap.apps.push_back(lg.app);
+    out.groups_by_id[lg.app.id] = std::move(lg);
+  }
+}
+
 LinuxScan scan_linux_gpu_apps(const std::string& device_hint) {
   LinuxScan out;
   const auto& nv = nvml_linux_api();
@@ -1205,15 +1253,7 @@ LinuxScan scan_linux_gpu_apps(const std::string& device_hint) {
     if (!e.empty()) ancestor_exes.insert(e);
   }
 
-  struct Acc {
-    std::string key, proc_name;
-    uint64_t bytes = 0;
-    int procs = 0;
-    bool runs_flyx = false;
-    bool any_same_uid = false;
-    std::vector<int> pids;
-  };
-  std::unordered_map<std::string, Acc> groups;
+  std::unordered_map<std::string, LinuxAppUsage> groups;
 
   for (const auto& [pid, used] : by_pid) {
     if (pid == self_pid) {
@@ -1239,39 +1279,7 @@ LinuxScan scan_linux_gpu_apps(const std::string& device_hint) {
     if (proc_same_uid(pid)) g.any_same_uid = true;
   }
 
-  out.snap.others_bytes =
-      out.snap.mem_used > out.snap.own_bytes ? out.snap.mem_used - out.snap.own_bytes : 0;
-
-  std::vector<LinuxGroup> list;
-  for (auto& [k, g] : groups) {
-    if (g.bytes < kMinAppVramBytes) continue;
-    LinuxGroup lg;
-    lg.app.id = gpu_app_group_id(g.key);
-    lg.app.process_name = g.proc_name;
-    lg.app.name = clean_gpu_app_name(g.proc_name, "", "");
-    lg.app.bytes = g.bytes;
-    lg.app.local_bytes = g.bytes;
-    lg.app.processes = g.procs;
-    if (g.runs_flyx) {
-      lg.app.closable = false;
-      lg.app.reason = "runs_flyx";
-    } else if (!g.any_same_uid) {
-      lg.app.closable = false;
-      lg.app.reason = "other_user";
-    } else {
-      lg.app.closable = true;
-    }
-    lg.pids = std::move(g.pids);
-    list.push_back(std::move(lg));
-  }
-  std::sort(list.begin(), list.end(), [](const LinuxGroup& a, const LinuxGroup& b) {
-    if (a.app.bytes != b.app.bytes) return a.app.bytes > b.app.bytes;
-    return a.app.name < b.app.name;
-  });
-  for (auto& lg : list) {
-    out.snap.apps.push_back(lg.app);
-    out.groups_by_id[lg.app.id] = std::move(lg);
-  }
+  finish_linux_scan(out, groups, kMinAppVramBytes);
   return out;
 }
 
@@ -1304,15 +1312,7 @@ LinuxScan scan_linux_ram_apps() {
     if (!e.empty()) ancestor_exes.insert(e);
   }
 
-  struct Acc {
-    std::string key, proc_name;
-    uint64_t bytes = 0;
-    int procs = 0;
-    bool runs_flyx = false;
-    bool any_same_uid = false;
-    std::vector<int> pids;
-  };
-  std::unordered_map<std::string, Acc> groups;
+  std::unordered_map<std::string, LinuxAppUsage> groups;
 
   std::error_code ec;
   for (const auto& entry : std::filesystem::directory_iterator("/proc", ec)) {
@@ -1346,38 +1346,7 @@ LinuxScan scan_linux_ram_apps() {
     if (proc_same_uid(pid)) g.any_same_uid = true;
   }
 
-  out.snap.others_bytes = out.snap.mem_used > out.snap.own_bytes ? out.snap.mem_used - out.snap.own_bytes : 0;
-
-  std::vector<LinuxGroup> list;
-  for (auto& [k, g] : groups) {
-    if (g.bytes < kMinAppRamBytes) continue;
-    LinuxGroup lg;
-    lg.app.id = gpu_app_group_id(g.key);
-    lg.app.process_name = g.proc_name;
-    lg.app.name = clean_gpu_app_name(g.proc_name, "", "");
-    lg.app.bytes = g.bytes;
-    lg.app.local_bytes = g.bytes;
-    lg.app.processes = g.procs;
-    if (g.runs_flyx) {
-      lg.app.closable = false;
-      lg.app.reason = "runs_flyx";
-    } else if (!g.any_same_uid) {
-      lg.app.closable = false;
-      lg.app.reason = "other_user";
-    } else {
-      lg.app.closable = true;
-    }
-    lg.pids = std::move(g.pids);
-    list.push_back(std::move(lg));
-  }
-  std::sort(list.begin(), list.end(), [](const LinuxGroup& a, const LinuxGroup& b) {
-    if (a.app.bytes != b.app.bytes) return a.app.bytes > b.app.bytes;
-    return a.app.name < b.app.name;
-  });
-  for (auto& lg : list) {
-    out.snap.apps.push_back(lg.app);
-    out.groups_by_id[lg.app.id] = std::move(lg);
-  }
+  finish_linux_scan(out, groups, kMinAppRamBytes);
   return out;
 }
 
