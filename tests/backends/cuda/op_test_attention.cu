@@ -972,10 +972,10 @@ void test_strata_layout(int hd, int nh, int nkv, int rows, int ctx, int bits, bo
       CK(cudaHostGetDevicePointer(&pd, ph, 0));
       auto *hb = static_cast<uint8_t*>(ph), *db = static_cast<uint8_t*>(pd);
       PageGatherCtx pctx{};
-      pctx.k_page = k_page.data();
-      pctx.v_page = v_page.data();
-      pctx.ks_page = fp8 ? ks_page.data() : nullptr;
-      pctx.vs_page = fp8 ? vs_page.data() : nullptr;
+      pctx.k_page = k_page.data() + size_t(sink) * row_bytes;
+      pctx.v_page = v_page.data() + size_t(sink) * row_bytes;
+      pctx.ks_page = fp8 ? ks_page.data() + size_t(sink) * nkv : nullptr;
+      pctx.vs_page = fp8 ? vs_page.data() + size_t(sink) * nkv : nullptr;
       pctx.req_host = reinterpret_cast<PageGatherReq*>(hb + req_off);
       pctx.req_dev = reinterpret_cast<PageGatherReq*>(db + req_off);
       pctx.miss_count_host = reinterpret_cast<int32_t*>(hb + cnt_off);
@@ -990,6 +990,7 @@ void test_strata_layout(int hd, int nh, int nkv, int rows, int ctx, int bits, bo
       pctx.elem = elem;
       pctx.max_misses = int(max_misses);
       pctx.cap = cap;
+      pctx.device_positions = sink;
 
       std::vector<uint32_t> ref_bits(exact.size()), got_bits(exact.size());
       CK(cudaMemcpy(ref_bits.data(), dout, ref_bits.size() * sizeof(float), cudaMemcpyDeviceToHost));

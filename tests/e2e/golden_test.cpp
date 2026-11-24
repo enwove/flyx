@@ -1682,7 +1682,7 @@ void strata_rounds(const std::string& model, const std::string& backend, const s
     }
     // Hybrid WDDM+pageable split (pinned_host_mb choosing a partial mix of pinned and pageable layers).
     {
-      const int hctx = 16384;
+      const int hctx = 32768;
       const std::string hbase = narrow + ",head_cert=0";
       auto h_pin = make(model, backend, false, "", false, hbase + ",pageable_kv=off", false, hctx, kReferenceWidth,
                         false, 0, "strata", 0);
@@ -1693,9 +1693,9 @@ void strata_rounds(const std::string& model, const std::string& backend, const s
       check(h_pin->api()->seq_size(h_pin->bmodel(), &lpin, &sz_pin) == 0 &&
                 h_pg->api()->seq_size(h_pg->bmodel(), &lpg, &sz_pg) == 0,
             "hybrid pageable_kv: query pinned and pageable sizes");
-      // prio1 reserves 32 MiB + bounce + copies; pick a budget halfway between all-pageable and all-pinned.
+      // Full-pinned needs ~(32 MiB + sz_pin.host); backing off by kv_delta/4 lands cleanly between 1 and 2 pinned layers.
       const uint64_t kv_delta = sz_pin.host_mapped > sz_pg.host_mapped ? sz_pin.host_mapped - sz_pg.host_mapped : 0;
-      const int mid_mb = int((32ull << 20) / (1ull << 20) + (sz_pg.host_mapped + kv_delta / 2) / (1ull << 20));
+      const int mid_mb = int(((32ull << 20) + sz_pin.host - kv_delta / 4) / (1ull << 20));
       auto h_mix = make(model, backend, true, "mtp", false,
                         hbase + ",pageable_kv=auto,pinned_host_mb=" + std::to_string(mid_mb), false, hctx,
                         kReferenceWidth, false, 0, "strata", 0);
@@ -1710,6 +1710,49 @@ void strata_rounds(const std::string& model, const std::string& backend, const s
       const auto tp = turns(h_pin.get(), &lp_out, 400, 8), tm = turns(h_mix.get(), &lm_out, 400, 8);
       check(tp.size() == size_t(N / 2) * 2 && tm == tp && !lp_out.empty() && lm_out == lp_out,
             "hybrid pageable_kv=auto (pinned + pageable mix, MTP): identical tokens and logits to pinned host KV");
+    }
+    // Adaptive stopping + pageable_kv=on: adaptive plans cannot put cudaLaunchHostFunc inside conditional IF graph
+    // bodies, so they must fall back cleanly to flat CUDA graphs (from_graph > 0, without_graph == 0) with exact bits.
+    {
+      auto ad_pin = make(model, backend, true, "mtp", true, narrow + ",pageable_kv=off", false, 512, -1, false, 0,
+                         "strata:2", 0, 64, 1);
+      auto ad_pg = make(model, backend, true, "mtp", true, narrow + ",pageable_kv=on", false, 512, -1, false, 0,
+                        "strata:2", 0, 64, 1);
+      Session sp(ad_pin.get()), sg(ad_pg.get());
+      check(sp.init(&err) && sg.init(&err), "pageable_kv=on adaptive: init sessions");
+      const auto tp = gen(sp, prompt, N).tokens, tg = gen(sg, prompt, N).tokens;
+      flyx_graph_stats gs{};
+      const bool has_gs = ad_pg->api()->graph_stats && ad_pg->api()->graph_stats(sg.seq(), &gs) == 0;
+      check(tp.size() == size_t(N) && tg == tp && has_gs && gs.from_graph > 0 && gs.without_graph == 0,
+            "pageable_kv=on adaptive MTP: identical tokens to pinned and runs from flat CUDA graphs (" +
+                std::to_string(gs.from_graph) + " from graph, " + std::to_string(gs.without_graph) + " without)");
+    }
+    // Non-zero unaligned device_positions (17000 -> rounds down to 16384 VMM granule) with auto switch past it:
+    // exact rounds in [16384, 16400) must skip graph capture without disabling s->graphs for subsequent strata rounds.
+    {
+      const int uctx = 20480;
+      const std::string uopts = narrow + ",strata_from=16400";
+      auto u_pin = make(model, backend, false, "", false, uopts + ",pageable_kv=off", false, uctx, kReferenceWidth,
+                        false, 17000, "auto", 0, 512);
+      auto u_pg = make(model, backend, false, "", false, uopts + ",pageable_kv=on", false, uctx, kReferenceWidth,
+                       false, 17000, "auto", 0, 512);
+      flyx_seq_size sz_up{}, sz_ug{};
+      const flyx_seq_layout lup = u_pin->kv_layout(), lug = u_pg->kv_layout();
+      const bool ok_u = u_pin->api()->seq_size(u_pin->bmodel(), &lup, &sz_up) == 0 &&
+                        u_pg->api()->seq_size(u_pg->bmodel(), &lug, &sz_ug) == 0;
+      check(ok_u && sz_ug.device_positions == 16384 && sz_ug.host_mapped == 0 && sz_ug.host <= sz_up.host + (1ull << 20),
+            "pageable_kv=on unaligned kv_gpu=17000: rounded to 16384 and host size excludes device prefix (" +
+                std::to_string(sz_ug.host) + " vs pinned " + std::to_string(sz_up.host) + ")");
+      std::vector<int32_t> p16k(16390);
+      for (size_t i = 0; i < p16k.size(); ++i) p16k[i] = int32_t((13 * i + 5) % size_t(vocab));
+      Session sp(u_pin.get()), sg(u_pg.get());
+      check(sp.init(&err) && sg.init(&err), "pageable_kv=on unaligned kv_gpu=17000: init sessions");
+      const auto tp = gen(sp, p16k, 24).tokens, tg = gen(sg, p16k, 24).tokens;
+      flyx_graph_stats gs{};
+      const bool has_gs = u_pg->api()->graph_stats && u_pg->api()->graph_stats(sg.seq(), &gs) == 0;
+      check(tp.size() == 24 && tg == tp && has_gs && gs.from_graph >= 10,
+            "pageable_kv=on unaligned kv_gpu=17000 across auto switch: identical tokens and graphs stay active (" +
+                std::to_string(gs.from_graph) + " from graph, " + std::to_string(gs.without_graph) + " without)");
     }
   }
 }

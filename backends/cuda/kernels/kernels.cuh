@@ -626,6 +626,7 @@ struct PageGatherCtx {
   int nkv = 0, hd = 0, elem = 1;     // elem: 1 (FP8 e4m3) or 2 (binary16)
   int max_misses = 0;
   int cap = 0;
+  int device_positions = 0;          // k_page/v_page/ks_page/vs_page start at position device_positions
 };
 
 // Descriptor for draining a pageable layer's newly committed rows from its GPU tail ring into a per-round-slot mapped

@@ -190,9 +190,10 @@ size_t graph_keep(const flyx_seq& s, bool count) {
     kernels += kStrataNodes * size_t(std::max(0, s.copies));
     copies += kStrataCopyNodes * size_t(std::clamp(s.copy_host, 0, std::max(0, s.copies)));
   }
-  if (!s.page_layers.empty()) {
-    kernels += 1 + s.page_layers.size();  // kv_drain_pageable + extra claim/list/install kernel per pageable layer
-    others += s.page_layers.size();       // cudaLaunchHostFunc node per pageable layer
+  const size_t page_n = s.dry ? size_t(s.page_graph_layers) : s.page_layers.size();
+  if (page_n > 0) {
+    kernels += 1 + page_n;  // kv_drain_pageable + extra claim/list/install kernel per pageable layer
+    others += page_n;       // cudaLaunchHostFunc node per pageable layer
   }
   std::lock_guard<std::mutex> lock(m->graph_mu);
   if (count) count_round_graphs(m);
@@ -200,7 +201,9 @@ size_t graph_keep(const flyx_seq& s, bool count) {
   for (const auto& [plan, g] : m->round_graphs) {
     if (!g.bytes) continue;  // not counted yet, or no graph of it can be made
     const size_t steps = window ? size_t(g.mtp_steps) : 0;
-    const size_t branches = plan->adaptive() ? std::max<size_t>(1, plan->checkpoints.size()) : 1;
+    const size_t branches = (plan->adaptive() && s.page_layers.empty())
+                                ? std::max<size_t>(1, plan->checkpoints.size())
+                                : 1;
     const size_t round = g.bytes + (branches * kernels + kMtpWindowNodes * steps) * kGraphKernelBytes +
                          branches * copies * kGraphCopyBytes + branches * others * kGraphOtherBytes;
     room += round;

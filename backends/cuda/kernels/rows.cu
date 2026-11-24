@@ -366,9 +366,11 @@ __global__ void k_kv_drain_pageable(const PageDrainLayer* layers, int n_layers, 
     dk[i] = sk[i];
     dv[i] = sv[i];
   }
-  if (L.ks && threadIdx.x < L.nkv) {
-    L.drain_ks[dst_row * size_t(L.nkv) + threadIdx.x] = L.ks[size_t(cell) * size_t(L.nkv) + threadIdx.x];
-    L.drain_vs[dst_row * size_t(L.nkv) + threadIdx.x] = L.vs[size_t(cell) * size_t(L.nkv) + threadIdx.x];
+  if (L.ks) {
+    for (int h = int(threadIdx.x); h < L.nkv; h += int(blockDim.x)) {
+      L.drain_ks[dst_row * size_t(L.nkv) + size_t(h)] = L.ks[size_t(cell) * size_t(L.nkv) + size_t(h)];
+      L.drain_vs[dst_row * size_t(L.nkv) + size_t(h)] = L.vs[size_t(cell) * size_t(L.nkv) + size_t(h)];
+    }
   }
 }
 

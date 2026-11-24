@@ -167,6 +167,8 @@ bool gpu_memory(size_t* free, size_t* total);
 size_t gpu_process_memory();
 // Remaining WDDM non-local (page-locked host) GPU memory budget on Windows, less a safety reserve; UINT64_MAX elsewhere.
 uint64_t host_pinned_budget();
+// CUDA VMM allocation granularity (typically 2 MiB; fallback 2 MiB if VMM is unavailable).
+size_t vmm_granularity();
 // Windows: device memory device_malloc keeps free.  Past what its video memory manager keeps free (250 MiB for 32 MiB
 // allocations, up to 560 MiB for 256 MiB to 1 GiB ones: device_stats.cpp), allocations land in host memory.
 constexpr size_t kPagedFloor = 768ull << 20;
@@ -827,6 +829,8 @@ struct flyx_seq {
                       int ring_tail = 0);
   // Hybrid WDDM pinned + pageable host K/V overflow (runtime/tiers.cpp, runtime/state.cpp).
   uint64_t pinned_budget = UINT64_MAX;  // sampled once per seq_size / seq_new_in so dry-run & real build agree
+  size_t page_spill_vram = 0;           // extra VRAM headroom reserved in seq_size() for multi-session WDDM spill
+  int page_graph_layers = 0;            // worst-case pageable layers budgeted for CUDA graph room in seq_size()
   std::vector<std::pair<void*, size_t>> pageable_allocs;
   std::deque<flyx::cuda::PageGatherCtx> page_ctxs;  // stable pointers captured by cudaLaunchHostFunc graph nodes
   std::vector<int> page_layers;                     // kv[] indices backed by pageable host RAM
@@ -838,6 +842,15 @@ struct flyx_seq {
   void flush_page_prefill(int start, int n);
   void drain_page_host(unsigned long long seq, int pos, int n_tokens);
   void reload_page_ring(int pos);
+  // True when an exact (non-strata-only) round reaches past any pageable layer's rounded device_positions:
+  // stage_before() uses pageable cudaMemcpyAsync, which CUDA forbids inside stream graph capture.
+  bool has_page_exact(int strata, int rows) const {
+    if (page_layers.empty() || strata == flyx::cuda::kStrataAll) return false;
+    const long long reach = (long long)position + in_flight_rows() + rows;
+    for (int idx : page_layers)
+      if (reach > kv[size_t(idx)].device_positions) return true;
+    return false;
+  }
   // The copies to the staging beside the pass (runtime/tiers.cpp). stage_begin, given what the pass's
   // attentions read through stagings in their order (a cache's views, or its copy in host memory),
   // forks the stage stream and starts the first one's copy of each staging there: the positions written before the

@@ -95,6 +95,11 @@ size_t round_up(size_t n, size_t g) { return (n + g - 1) / g * g; }
 
 namespace flyx::cuda {
 
+size_t vmm_granularity() {
+  const Vmm& v = vmm();
+  return v.missing.empty() && v.gran > 0 ? v.gran : (2ull << 20);
+}
+
 VmmSlab::~VmmSlab() {
   if (handles.empty()) return;
   const Vmm& v = vmm();
@@ -229,8 +234,10 @@ flyx_seq::Tiered flyx_seq::tiered_alloc(size_t positions, size_t row, int role, 
 
   if (pageable) {
     t.page_ring = t.device_rows + ring_tail;
-    t.page = static_cast<uint8_t*>(pageable_alloc_raw(want));
+    const size_t host_want = (positions - size_t(t.device_rows)) * row;
+    t.page = static_cast<uint8_t*>(pageable_alloc_raw(host_want));
     const size_t ring_bytes = size_t(ring_tail) * row;
+    device_positions = std::min(device_positions, t.device_rows);
     if (dry) {
       if (dev == 0) {
         t.at = alloc<uint8_t>(ring_bytes);
@@ -238,7 +245,6 @@ flyx_seq::Tiered flyx_seq::tiered_alloc(size_t positions, size_t row, int role, 
         dry_bytes += dev + round_up(ring_bytes, v.gran);
         t.at = reinterpret_cast<void*>(uintptr_t(256));
       }
-      device_positions = std::min(device_positions, t.device_rows);
       t.view = reinterpret_cast<void*>(uintptr_t(256));
       return t;
     }
@@ -284,11 +290,11 @@ flyx_seq::Tiered flyx_seq::tiered_alloc(size_t positions, size_t row, int role, 
     return t;
   }
 
+  device_positions = std::min(device_positions, t.device_rows);  // what every cache keeps on the device, at most
   if (dry) {
     dry_bytes += dev;
     dry_host_bytes += host;
     dry_mapped_bytes += host;
-    device_positions = std::min(device_positions, t.device_rows);  // what every cache keeps on the device, at most
     t.at = t.view = reinterpret_cast<void*>(uintptr_t(256));
     return t;
   }
@@ -579,14 +585,14 @@ void flyx_seq::stage_ahead(const StageItem& x) {
       const int h1 = std::min(b.staged_cap(), position);
       if (h1 > h0) {
         const size_t n = size_t(h1 - h0);
-        CK(cudaMemcpyAsync(static_cast<uint8_t*>(b.vk) + size_t(h0) * b.row, b.k_page + size_t(h0) * b.row, n * b.row,
+        CK(cudaMemcpyAsync(static_cast<uint8_t*>(b.vk) + size_t(h0) * b.row, b.k_page, n * b.row,
                            cudaMemcpyHostToDevice, stage_side.st));
-        CK(cudaMemcpyAsync(static_cast<uint8_t*>(b.vv) + size_t(h0) * b.row, b.v_page + size_t(h0) * b.row, n * b.row,
+        CK(cudaMemcpyAsync(static_cast<uint8_t*>(b.vv) + size_t(h0) * b.row, b.v_page, n * b.row,
                            cudaMemcpyHostToDevice, stage_side.st));
         if (b.ks_page) {
           const size_t sb = n * size_t(b.nkv) * sizeof(float);
-          CK(cudaMemcpyAsync(b.vks, b.ks_page + size_t(h0) * b.nkv, sb, cudaMemcpyHostToDevice, stage_side.st));
-          CK(cudaMemcpyAsync(b.vvs, b.vs_page + size_t(h0) * b.nkv, sb, cudaMemcpyHostToDevice, stage_side.st));
+          CK(cudaMemcpyAsync(b.vks, b.ks_page, sb, cudaMemcpyHostToDevice, stage_side.st));
+          CK(cudaMemcpyAsync(b.vvs, b.vs_page, sb, cudaMemcpyHostToDevice, stage_side.st));
         }
       }
     } else {
@@ -632,15 +638,16 @@ void flyx_seq::window_stage(const KvBuf& b, int w0, int w1, int parity, int rows
       if (h1 > h0) {
         const size_t n = size_t(h1 - h0);
         const size_t off_dst = size_t(h0 - w0);
-        CK(cudaMemcpyAsync(b.wk[parity] + off_dst * b.row, b.k_page + size_t(h0) * b.row, n * b.row,
+        const size_t off_src = size_t(h0 - b.device_positions);
+        CK(cudaMemcpyAsync(b.wk[parity] + off_dst * b.row, b.k_page + off_src * b.row, n * b.row,
                            cudaMemcpyHostToDevice, s));
-        CK(cudaMemcpyAsync(b.wv[parity] + off_dst * b.row, b.v_page + size_t(h0) * b.row, n * b.row,
+        CK(cudaMemcpyAsync(b.wv[parity] + off_dst * b.row, b.v_page + off_src * b.row, n * b.row,
                            cudaMemcpyHostToDevice, s));
         if (b.ks_page) {
           const size_t sb = n * size_t(b.nkv) * sizeof(float);
-          CK(cudaMemcpyAsync(b.wks[parity] + off_dst * b.nkv, b.ks_page + size_t(h0) * b.nkv, sb,
+          CK(cudaMemcpyAsync(b.wks[parity] + off_dst * b.nkv, b.ks_page + off_src * b.nkv, sb,
                              cudaMemcpyHostToDevice, s));
-          CK(cudaMemcpyAsync(b.wvs[parity] + off_dst * b.nkv, b.vs_page + size_t(h0) * b.nkv, sb,
+          CK(cudaMemcpyAsync(b.wvs[parity] + off_dst * b.nkv, b.vs_page + off_src * b.nkv, sb,
                              cudaMemcpyHostToDevice, s));
         }
       }
@@ -704,14 +711,14 @@ void flyx_seq::stage_before(const KvBuf& kb, int pos_add, int span, cudaStream_t
       const int h1 = std::min(kb.staged_cap(), position);
       if (h1 > h0) {
         const size_t n = size_t(h1 - h0);
-        CK(cudaMemcpyAsync(static_cast<uint8_t*>(kb.vk) + size_t(h0) * kb.row, kb.k_page + size_t(h0) * kb.row,
-                           n * kb.row, cudaMemcpyHostToDevice, s));
-        CK(cudaMemcpyAsync(static_cast<uint8_t*>(kb.vv) + size_t(h0) * kb.row, kb.v_page + size_t(h0) * kb.row,
-                           n * kb.row, cudaMemcpyHostToDevice, s));
+        CK(cudaMemcpyAsync(static_cast<uint8_t*>(kb.vk) + size_t(h0) * kb.row, kb.k_page, n * kb.row,
+                           cudaMemcpyHostToDevice, s));
+        CK(cudaMemcpyAsync(static_cast<uint8_t*>(kb.vv) + size_t(h0) * kb.row, kb.v_page, n * kb.row,
+                           cudaMemcpyHostToDevice, s));
         if (kb.ks_page) {
           const size_t sb = n * size_t(kb.nkv) * sizeof(float);
-          CK(cudaMemcpyAsync(kb.vks, kb.ks_page + size_t(h0) * kb.nkv, sb, cudaMemcpyHostToDevice, s));
-          CK(cudaMemcpyAsync(kb.vvs, kb.vs_page + size_t(h0) * kb.nkv, sb, cudaMemcpyHostToDevice, s));
+          CK(cudaMemcpyAsync(kb.vks, kb.ks_page, sb, cudaMemcpyHostToDevice, s));
+          CK(cudaMemcpyAsync(kb.vvs, kb.vs_page, sb, cudaMemcpyHostToDevice, s));
         }
       }
     } else {
@@ -787,14 +794,14 @@ void flyx_seq::stage_text(const KvBuf& kb, cudaStream_t s) {
     const int h1 = std::min(kb.staged_cap(), position);
     if (h1 > h0) {
       const size_t n = size_t(h1 - h0);
-      CK(cudaMemcpyAsync(static_cast<uint8_t*>(kb.vk) + size_t(h0) * kb.row, kb.k_page + size_t(h0) * kb.row,
-                         n * kb.row, cudaMemcpyHostToDevice, s));
-      CK(cudaMemcpyAsync(static_cast<uint8_t*>(kb.vv) + size_t(h0) * kb.row, kb.v_page + size_t(h0) * kb.row,
-                         n * kb.row, cudaMemcpyHostToDevice, s));
+      CK(cudaMemcpyAsync(static_cast<uint8_t*>(kb.vk) + size_t(h0) * kb.row, kb.k_page, n * kb.row,
+                         cudaMemcpyHostToDevice, s));
+      CK(cudaMemcpyAsync(static_cast<uint8_t*>(kb.vv) + size_t(h0) * kb.row, kb.v_page, n * kb.row,
+                         cudaMemcpyHostToDevice, s));
       if (kb.ks_page) {
         const size_t sb = n * size_t(kb.nkv) * sizeof(float);
-        CK(cudaMemcpyAsync(kb.vks, kb.ks_page + size_t(h0) * kb.nkv, sb, cudaMemcpyHostToDevice, s));
-        CK(cudaMemcpyAsync(kb.vvs, kb.vs_page + size_t(h0) * kb.nkv, sb, cudaMemcpyHostToDevice, s));
+        CK(cudaMemcpyAsync(kb.vks, kb.ks_page, sb, cudaMemcpyHostToDevice, s));
+        CK(cudaMemcpyAsync(kb.vvs, kb.vs_page, sb, cudaMemcpyHostToDevice, s));
       }
     }
     KvStageScales sc;
@@ -833,14 +840,15 @@ void flyx_seq::flush_page_prefill(int start, int n) {
     for (int p = lo; p < hi;) {
       const int slot = b.device_positions + (p - b.device_positions) % tail;
       const int chunk = std::min(hi - p, b.page_ring - slot);
-      CK(cudaMemcpyAsync(b.k_page + size_t(p) * b.row, static_cast<const uint8_t*>(b.k) + size_t(slot) * b.row,
+      const size_t dst = size_t(p - b.device_positions);
+      CK(cudaMemcpyAsync(b.k_page + dst * b.row, static_cast<const uint8_t*>(b.k) + size_t(slot) * b.row,
                          size_t(chunk) * b.row, cudaMemcpyDeviceToHost, st));
-      CK(cudaMemcpyAsync(b.v_page + size_t(p) * b.row, static_cast<const uint8_t*>(b.v) + size_t(slot) * b.row,
+      CK(cudaMemcpyAsync(b.v_page + dst * b.row, static_cast<const uint8_t*>(b.v) + size_t(slot) * b.row,
                          size_t(chunk) * b.row, cudaMemcpyDeviceToHost, st));
       if (b.ks_page) {
         const size_t sb = size_t(chunk) * size_t(b.nkv) * sizeof(float);
-        CK(cudaMemcpyAsync(b.ks_page + size_t(p) * b.nkv, b.ks + size_t(slot) * b.nkv, sb, cudaMemcpyDeviceToHost, st));
-        CK(cudaMemcpyAsync(b.vs_page + size_t(p) * b.nkv, b.vs + size_t(slot) * b.nkv, sb, cudaMemcpyDeviceToHost, st));
+        CK(cudaMemcpyAsync(b.ks_page + dst * b.nkv, b.ks + size_t(slot) * b.nkv, sb, cudaMemcpyDeviceToHost, st));
+        CK(cudaMemcpyAsync(b.vs_page + dst * b.nkv, b.vs + size_t(slot) * b.nkv, sb, cudaMemcpyDeviceToHost, st));
       }
       p += chunk;
     }
@@ -857,13 +865,14 @@ void flyx_seq::drain_page_host(unsigned long long seq, int pos, int n_tokens) {
     for (int r = 0; r < n_tokens; ++r) {
       const int p = pos - n_tokens + r;
       if (p < b.device_positions) continue;
+      const size_t dst = size_t(p - b.device_positions);
       const size_t src_row = size_t(rslot) * size_t(max_rows) + size_t(r);
-      std::memcpy(b.k_page + size_t(p) * b.row, dl.drain_k_host + src_row * b.row, b.row);
-      std::memcpy(b.v_page + size_t(p) * b.row, dl.drain_v_host + src_row * b.row, b.row);
+      std::memcpy(b.k_page + dst * b.row, dl.drain_k_host + src_row * b.row, b.row);
+      std::memcpy(b.v_page + dst * b.row, dl.drain_v_host + src_row * b.row, b.row);
       if (b.ks_page) {
         const size_t sb = size_t(b.nkv) * sizeof(float);
-        std::memcpy(b.ks_page + size_t(p) * b.nkv, dl.drain_ks_host + src_row * b.nkv, sb);
-        std::memcpy(b.vs_page + size_t(p) * b.nkv, dl.drain_vs_host + src_row * b.nkv, sb);
+        std::memcpy(b.ks_page + dst * b.nkv, dl.drain_ks_host + src_row * b.nkv, sb);
+        std::memcpy(b.vs_page + dst * b.nkv, dl.drain_vs_host + src_row * b.nkv, sb);
       }
     }
   }
@@ -880,14 +889,15 @@ void flyx_seq::reload_page_ring(int pos) {
     for (int p = lo; p < hi;) {
       const int slot = b.device_positions + (p - b.device_positions) % tail;
       const int chunk = std::min(hi - p, b.page_ring - slot);
-      CK(cudaMemcpyAsync(static_cast<uint8_t*>(b.k) + size_t(slot) * b.row, b.k_page + size_t(p) * b.row,
+      const size_t src = size_t(p - b.device_positions);
+      CK(cudaMemcpyAsync(static_cast<uint8_t*>(b.k) + size_t(slot) * b.row, b.k_page + src * b.row,
                          size_t(chunk) * b.row, cudaMemcpyHostToDevice, st));
-      CK(cudaMemcpyAsync(static_cast<uint8_t*>(b.v) + size_t(slot) * b.row, b.v_page + size_t(p) * b.row,
+      CK(cudaMemcpyAsync(static_cast<uint8_t*>(b.v) + size_t(slot) * b.row, b.v_page + src * b.row,
                          size_t(chunk) * b.row, cudaMemcpyHostToDevice, st));
       if (b.ks_page) {
         const size_t sb = size_t(chunk) * size_t(b.nkv) * sizeof(float);
-        CK(cudaMemcpyAsync(b.ks + size_t(slot) * b.nkv, b.ks_page + size_t(p) * b.nkv, sb, cudaMemcpyHostToDevice, st));
-        CK(cudaMemcpyAsync(b.vs + size_t(slot) * b.nkv, b.vs_page + size_t(p) * b.nkv, sb, cudaMemcpyHostToDevice, st));
+        CK(cudaMemcpyAsync(b.ks + size_t(slot) * b.nkv, b.ks_page + src * b.nkv, sb, cudaMemcpyHostToDevice, st));
+        CK(cudaMemcpyAsync(b.vs + size_t(slot) * b.nkv, b.vs_page + src * b.nkv, sb, cudaMemcpyHostToDevice, st));
       }
       p += chunk;
     }

@@ -1841,20 +1841,22 @@ void CUDART_CB strata_page_gather_host(void* ud) {
     const PageGatherReq req = c->req_host[m];
     const int p0 = 2 * req.q;
     const int p1 = p0 + 1;
+    const size_t i0 = size_t(p0 - c->device_positions);
+    const size_t i1 = size_t(p1 - c->device_positions);
     uint8_t* dst = c->bounce_kv_host + size_t(m) * 4 * head_bytes;
     const size_t h_off = size_t(req.kvh) * head_bytes;
-    std::memcpy(dst, c->k_page + size_t(p0) * pos_stride + h_off, head_bytes);
-    if (p1 < c->cap) std::memcpy(dst + head_bytes, c->k_page + size_t(p1) * pos_stride + h_off, head_bytes);
+    std::memcpy(dst, c->k_page + i0 * pos_stride + h_off, head_bytes);
+    if (p1 < c->cap) std::memcpy(dst + head_bytes, c->k_page + i1 * pos_stride + h_off, head_bytes);
     else std::memset(dst + head_bytes, 0, head_bytes);
-    std::memcpy(dst + 2 * head_bytes, c->v_page + size_t(p0) * pos_stride + h_off, head_bytes);
-    if (p1 < c->cap) std::memcpy(dst + 3 * head_bytes, c->v_page + size_t(p1) * pos_stride + h_off, head_bytes);
+    std::memcpy(dst + 2 * head_bytes, c->v_page + i0 * pos_stride + h_off, head_bytes);
+    if (p1 < c->cap) std::memcpy(dst + 3 * head_bytes, c->v_page + i1 * pos_stride + h_off, head_bytes);
     else std::memset(dst + 3 * head_bytes, 0, head_bytes);
     if (c->ks_page) {
       float* sd = c->bounce_scale_host + size_t(m) * 4;
-      sd[0] = c->ks_page[size_t(p0) * c->nkv + req.kvh];
-      sd[1] = p1 < c->cap ? c->ks_page[size_t(p1) * c->nkv + req.kvh] : 0.f;
-      sd[2] = c->vs_page[size_t(p0) * c->nkv + req.kvh];
-      sd[3] = p1 < c->cap ? c->vs_page[size_t(p1) * c->nkv + req.kvh] : 0.f;
+      sd[0] = c->ks_page[i0 * c->nkv + req.kvh];
+      sd[1] = p1 < c->cap ? c->ks_page[i1 * c->nkv + req.kvh] : 0.f;
+      sd[2] = c->vs_page[i0 * c->nkv + req.kvh];
+      sd[3] = p1 < c->cap ? c->vs_page[i1 * c->nkv + req.kvh] : 0.f;
     }
   }
 }

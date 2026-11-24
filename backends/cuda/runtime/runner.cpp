@@ -1516,8 +1516,7 @@ int launch(flyx_plan* p, flyx_seq* s, const flyx_gen_params* g) {
     const int prefix = r.prefix;
     // Exact reads over pageable K/V stage from pageable host memory via cudaMemcpyAsync (not capturable).
     // Steady-state strata rounds past device_positions always have ps.strata == kStrataAll and capture into graphs.
-    const bool page_exact = !s->page_layers.empty() && ps.strata != kStrataAll &&
-                            (long long)s->position + s->in_flight_rows() + ps.rows > s->device_positions;
+    const bool page_exact = s->has_page_exact(ps.strata, ps.rows);
     auto it = page_exact ? s->graph.end() : s->graph.find(key);
     // A rewind may shorten the safe prefix. As it grows, recapture at most once per 4096 positions per
     // graph so a long generation also benefits.  The old graph goes once its launches are done:
@@ -1545,8 +1544,11 @@ int launch(flyx_plan* p, flyx_seq* s, const flyx_gen_params* g) {
         Captured c;
         GraphSize size{};
         bool captured = false;
+        // CUDA forbids host nodes (cudaLaunchHostFunc, used by pageable K/V gathers) inside conditional IF graph
+        // bodies, so adaptive plans on pageable sessions capture the flat full-width round into a regular CUDA graph.
+        const bool use_cond = p->adaptive() && s->page_layers.empty();
 #if CUDART_VERSION >= 12040
-        if (p->adaptive()) {
+        if (use_cond) {
           captured = capture_adaptive_graph(p, s, r, &c.graph, &size);
         } else
 #endif
@@ -1569,7 +1571,7 @@ int launch(flyx_plan* p, flyx_seq* s, const flyx_gen_params* g) {
             it = s->graph.emplace(key, flyx_seq::RoundGraph{exec, prefix, size.bytes}).first;
             s->graph_held += size.bytes;
             note_graph(s, size);
-            say_graph(s->m, p->adaptive() ? "adaptive round" : "round", ps.rows, key.second, size);
+            say_graph(s->m, use_cond ? "adaptive round" : "round", ps.rows, key.second, size);
           } else {
             failed = true;
           }
@@ -1580,7 +1582,7 @@ int launch(flyx_plan* p, flyx_seq* s, const flyx_gen_params* g) {
           if (s->m->verbose)
             std::fprintf(stderr, "flyx-cuda: a round graph with a conditional canvas pass failed: the pass inline\n");
         } else if (failed) {
-          if (!p->adaptive()) s->graphs = false;
+          if (!use_cond) s->graphs = false;
           if (s->m->verbose) std::fprintf(stderr, "flyx-cuda: graph capture failed, running rounds eagerly\n");
         }
       }
@@ -1698,9 +1700,7 @@ int launch_batch(flyx_plan* const* plans, flyx_seq* const* seqs, const flyx_gen_
       flyx_seq* s = seqs[idx];
       const int seq_rows = plans[idx]->width + 1;
       const int strata = s->strata_phase(seq_rows);
-      if (!s->page_layers.empty() && strata != kStrataAll &&
-          (long long)s->position + s->in_flight_rows() + seq_rows > s->device_positions)
-        any_page_exact = true;
+      if (s->has_page_exact(strata, seq_rows)) any_page_exact = true;
       s->snap_pos = -1;  // rounds write the round slots
       set_gen(s, gens[idx]);
       set_drafts(s, gens[idx]);
@@ -2068,14 +2068,15 @@ void snapshot_parts(flyx_seq* s, int c, int begin, int pos, HostCursor& host, bo
           if (first < split)
             copy(static_cast<uint8_t*>(dev) + size_t(first) * width * elem, size_t(split - first) * width * elem);
           if (split < end)
-            copy_page(page + size_t(split) * width * elem, size_t(end - split) * width * elem);
+            copy_page(page + size_t(split - b.device_positions) * width * elem, size_t(end - split) * width * elem);
         };
         split_kv(b.k, b.k_page);
         split_kv(b.v, b.v_page);
         if (k.fp8) {
           auto split_sc = [&](float* dev, float* page) {
             if (first < split) copy(dev + size_t(first) * k.nkv, size_t(split - first) * k.nkv * sizeof(float));
-            if (split < end) copy_page(page + size_t(split) * k.nkv, size_t(end - split) * k.nkv * sizeof(float));
+            if (split < end)
+              copy_page(page + size_t(split - b.device_positions) * k.nkv, size_t(end - split) * k.nkv * sizeof(float));
           };
           split_sc(b.ks, b.ks_page);
           split_sc(b.vs, b.vs_page);
