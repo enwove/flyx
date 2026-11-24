@@ -86,6 +86,11 @@ def up_to_date(out: str) -> bool:
     return made_from == inputs_digest() and all(os.path.exists(os.path.join(out, o)) for o in OUTPUTS)
 
 
+# --digest: what the assets are made from, for a cache of OUT_DIR to be kept under (.github/workflows/ci.yml).
+if __name__ == "__main__" and sys.argv[1:] == ["--digest"]:
+    print(inputs_digest())
+    sys.exit(0)
+
 # Before the imports below (torch alone takes seconds): most test runs find the assets up to date.
 if __name__ == "__main__" and up_to_date(sys.argv[1] if len(sys.argv) > 1 else "tiny_assets"):
     print("assets up to date: nothing they are made from changed")
@@ -749,34 +754,61 @@ def write_dv_rounds(out: str, cases: dict) -> int:
     start at each point (fresh, dv_fresh); and the same fresh starts with FP8 caches (fp8: the e4m3 reference's own
     greedy tokens, which FP8 caches may change, and its trees along them).  cases: a file's golden cases (its
     transformers tokens: tiny_llama_dv_lora.flyx's and tiny_llama_dv31_lora.flyx's with their V-LoRA), the others'
-    under ""."""
+    under "".
+
+    A file's cases are independent of each other and of the other files', and nearly all of this script's time (a
+    fresh start at every point of every case, twice over; the script took the hosted CPU runner 41 minutes with them
+    one after another), so each case is a process's own job (dv_case_rounds), as many at once as there are processors,
+    and their rows are put together in the files' and the cases' order: the bytes one process writes."""
     rows = {"chains": list(DV_CHAINS), "every": DV_CHAIN_EVERY, "first": DV_CHAIN_FIRST,
             "file_chains": {k: list(v) for k, v in DV_CHAINS_BY_FILE.items()}, "files": {}, "fresh": {}, "fp8": {}}
+    jobs = [(out, name, c) for name in DV_ROUND_FILES for c in cases.get(name, cases[""])]
+    workers = min(len(jobs), os.cpu_count() or 1)
+    if workers > 1:
+        import multiprocessing
+        # spawn everywhere: a fork of a process whose torch has started its threads may wait on them forever
+        with multiprocessing.get_context("spawn").Pool(workers, initializer=torch.set_num_threads,
+                                                      initargs=(1,)) as pool:
+            done = pool.map(dv_case_rounds, jobs, chunksize=1)
+    else:
+        done = [dv_case_rounds(job) for job in jobs]
+    for name in DV_ROUND_FILES:
+        rows["files"][name], rows["fresh"][name], rows["fp8"][name] = [], [], []
     n = 0
-    for name in ("tiny_llama_dv.flyx", "tiny_llama_dv_pool.flyx", "tiny_llama_dv32.flyx", "tiny_llama_dv31.flyx",
-                 "tiny_llama_dv31_pool.flyx", "tiny_llama_dv31_wide.flyx", "tiny_llama_dv31_wide_pool.flyx",
-                 "tiny_llama_dv_lora.flyx", "tiny_llama_dv31_lora.flyx"):
-        cfg, W, dvc = dv.from_flyx(os.path.join(out, name))
-        canvas_round = torch.bfloat16 if dvc.slots > 16 else None
-        model = dv.Dv(cfg, W, dvc, torch.float64, kv_round=torch.float16, canvas_round=canvas_round)
-        fp8 = dv.Dv(cfg, W, dvc, torch.float64, kv_round="e4m3", canvas_round=canvas_round)
-        runs, fresh, fp8_runs = [], [], []
-        for c in cases.get(name, cases[""]):
-            r = model.generate(c["prompt"], len(c["tokens"]),
-                               oracle=dv_chains(len(c["prompt"]), c["tokens"], dvc.width, cfg.vocab,
-                                                DV_CHAINS_BY_FILE.get(name, DV_CHAINS)))
-            if r["ids"] != c["tokens"]:
-                raise RuntimeError(f"{name}: DV's float64 reference does not emit the golden tokens")
-            runs.append([{k: rd[k] for k in ("pos", "drafts", "parents", "accepted")} for rd in r["rounds"]])
-            n += len(r["rounds"])
-            fresh.append(dv_fresh(model, c["prompt"], c["tokens"]))
-            tokens8 = fp8.plain(c["prompt"], len(c["tokens"]))
-            fp8_runs.append({"tokens": tokens8, "fresh": dv_fresh(fp8, c["prompt"], tokens8)})
-            n += 2 * len(fresh[-1]) + 2 * len(fp8_runs[-1]["fresh"])
-        rows["files"][name], rows["fresh"][name], rows["fp8"][name] = runs, fresh, fp8_runs
+    for (_, name, _), (runs, fresh, fp8_run, count) in zip(jobs, done):
+        rows["files"][name].append(runs)
+        rows["fresh"][name].append(fresh)
+        rows["fp8"][name].append(fp8_run)
+        n += count
     with open(os.path.join(out, "golden_llama_dv.json"), "w", encoding="utf-8") as f:
         json.dump(rows, f, indent=0)
     return n
+
+
+DV_ROUND_FILES = ("tiny_llama_dv.flyx", "tiny_llama_dv_pool.flyx", "tiny_llama_dv32.flyx", "tiny_llama_dv31.flyx",
+                  "tiny_llama_dv31_pool.flyx", "tiny_llama_dv31_wide.flyx", "tiny_llama_dv31_wide_pool.flyx",
+                  "tiny_llama_dv_lora.flyx", "tiny_llama_dv31_lora.flyx")
+
+
+def dv_case_rounds(job: tuple) -> tuple:
+    """One case of one DV file for golden_llama_dv.json (write_dv_rounds): its rounds, its fresh starts, the same with
+    FP8 caches, and how many rounds that is.  A function of the file and the case alone (the reference from the file
+    anew, no random numbers), so it gives the same rows in a process of its own, whatever ran there before."""
+    out, name, c = job
+    cfg, W, dvc = dv.from_flyx(os.path.join(out, name))
+    canvas_round = torch.bfloat16 if dvc.slots > 16 else None
+    model = dv.Dv(cfg, W, dvc, torch.float64, kv_round=torch.float16, canvas_round=canvas_round)
+    fp8 = dv.Dv(cfg, W, dvc, torch.float64, kv_round="e4m3", canvas_round=canvas_round)
+    r = model.generate(c["prompt"], len(c["tokens"]),
+                       oracle=dv_chains(len(c["prompt"]), c["tokens"], dvc.width, cfg.vocab,
+                                        DV_CHAINS_BY_FILE.get(name, DV_CHAINS)))
+    if r["ids"] != c["tokens"]:
+        raise RuntimeError(f"{name}: DV's float64 reference does not emit the golden tokens")
+    runs = [{k: rd[k] for k in ("pos", "drafts", "parents", "accepted")} for rd in r["rounds"]]
+    fresh = dv_fresh(model, c["prompt"], c["tokens"])
+    tokens8 = fp8.plain(c["prompt"], len(c["tokens"]))
+    fp8_run = {"tokens": tokens8, "fresh": dv_fresh(fp8, c["prompt"], tokens8)}
+    return runs, fresh, fp8_run, len(r["rounds"]) + 2 * len(fresh) + 2 * len(fp8_run["fresh"])
 
 
 def write_chat_cases(tok_dir: str, out_json: str) -> int:
