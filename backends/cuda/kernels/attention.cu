@@ -268,7 +268,7 @@ template <int HD, int RT, bool CANVAS = false>
 __global__ void __launch_bounds__(128) k_attention(const float* q, const kv16* Kc, const kv16* Vc, int nh, int nkv,
                                                    int rows, int causal, int extra, float scale, const DevParams* P,
                                                    float* part, int pos_add, int window, int slots,
-                                                   const TreeRows* tree, int canvas_s0) {
+                                                   const TreeRows* tree, int canvas_s0, SplitWindow sw = {}) {
   pdl_trigger();
   constexpr int DPL = HD / 32;
   __shared__ float s_m[4][RT], s_l[4][RT];
@@ -292,6 +292,24 @@ __global__ void __launch_bounds__(128) k_attention(const float* q, const kv16* K
       hi = max(hi, ke[i]);
     }
   }
+  const int orig_ks = ks[0], orig_ke = ke[0];
+  if constexpr (RT == 1 && !CANVAS) {
+    if (sw.state) {
+      if (nrows <= 0) return;
+      if (orig_ks >= orig_ke) {
+        if (sw.first) {
+          float* pr = part + ((size_t(r0) * nh + h) * slots + split) * (HD + 2);
+          for (int idx = threadIdx.x; idx < HD + 2; idx += blockDim.x) pr[idx] = idx == 0 ? -INFINITY : 0.f;
+        }
+        return;
+      }
+      ks[0] = max(orig_ks, sw.k_lo);
+      ke[0] = min(orig_ke, sw.k_hi);
+      lo = ks[0];
+      hi = ke[0];
+      if (lo >= hi) return;
+    }
+  }
 
   float qv[RT][DPL], acc[RT][DPL], m[RT], l[RT];
 #pragma unroll
@@ -302,6 +320,15 @@ __global__ void __launch_bounds__(128) k_attention(const float* q, const kv16* K
     for (int e = 0; e < DPL; ++e) {
       acc[i][e] = 0.f;
       qv[i][e] = i < nrows ? q[(size_t(r0 + i) * nh + h) * HD + lane * DPL + e] : 0.f;
+    }
+  }
+  if constexpr (RT == 1 && !CANVAS) {
+    if (sw.state && orig_ks < sw.k_lo) {
+      const float* wp = sw.carry + (size_t(r0) * nh + h) * kSplitStateFloats(HD) + warp * (HD + 40);
+      m[0] = wp[0];
+      l[0] = wp[1];
+#pragma unroll
+      for (int e = 0; e < DPL; ++e) acc[0][e] = wp[2 + lane * DPL + e];
     }
   }
   for (int j = lo < hi ? lo + ((warp - lo) & 3) : hi; j < hi; j += 4) {
@@ -328,6 +355,18 @@ __global__ void __launch_bounds__(128) k_attention(const float* q, const kv16* K
 #pragma unroll
       for (int e = 0; e < DPL; ++e) acc[i][e] = acc[i][e] * corr + p * vf[e];
       m[i] = mn;
+    }
+  }
+  if constexpr (RT == 1 && !CANVAS) {
+    if (sw.state && orig_ke > sw.k_hi) {
+      float* wp = sw.state + (size_t(r0) * nh + h) * kSplitStateFloats(HD) + warp * (HD + 40);
+      if (lane == 0) {
+        wp[0] = m[0];
+        wp[1] = l[0];
+      }
+#pragma unroll
+      for (int e = 0; e < DPL; ++e) wp[2 + lane * DPL + e] = acc[0][e];
+      return;
     }
   }
 #pragma unroll
@@ -380,7 +419,8 @@ template <int HD, int G, int RT, bool FP8, bool CANVAS = false>
 __global__ void __launch_bounds__(128) k_attention_gqa(const float* __restrict__ q, KvRef kv, int nh, int nkv, int rows,
                                                        int causal, int extra, float scale, const DevParams* P,
                                                        float* __restrict__ part, int pos_add, int below,
-                                                       int slots, const TreeRows* __restrict__ tree, int canvas_s0) {
+                                                       int slots, const TreeRows* __restrict__ tree, int canvas_s0,
+                                                       SplitWindow sw = {}) {
   pdl_trigger();
   constexpr int QN = G * RT, DPL = HD / 32, CH = HD / 8;
   __shared__ __align__(16) float Qs[QN][HD];
@@ -412,6 +452,26 @@ __global__ void __launch_bounds__(128) k_attention_gqa(const float* __restrict__
     if (own[i] && ks[i] < ke[i]) {
       lo = min(lo, ks[i]);
       hi = max(hi, ke[i]);
+    }
+  }
+  const int orig_ks = ks[0], orig_ke = ke[0];
+  if constexpr (RT == 1 && !CANVAS) {
+    if (sw.state) {
+      if (!own[0]) return;
+      if (orig_ks >= orig_ke) {
+        if (sw.first) {
+          for (int idx = threadIdx.x; idx < QN * (HD + 2); idx += blockDim.x) {
+            const int qi = idx / (HD + 2), e = idx - qi * (HD + 2);
+            part[((size_t(r0) * nh + kvh * G + qi) * slots + split) * (HD + 2) + e] = e == 0 ? -INFINITY : 0.f;
+          }
+        }
+        return;
+      }
+      ks[0] = max(orig_ks, sw.k_lo);
+      ke[0] = min(orig_ke, sw.k_hi);
+      lo = ks[0];
+      hi = ke[0];
+      if (lo >= hi) return;
     }
   }
   if (lo >= hi) {  // no keys for any of the block's rows in this split: empty partials
@@ -450,6 +510,18 @@ __global__ void __launch_bounds__(128) k_attention_gqa(const float* __restrict__
     lp[qi] = 0.f;
 #pragma unroll
     for (int e = 0; e < DPL; ++e) acc[qi][e] = 0.f;
+  }
+  if constexpr (RT == 1 && !CANVAS) {
+    if (sw.state && orig_ks < sw.k_lo) {
+#pragma unroll
+      for (int qi = 0; qi < QN; ++qi) {
+        const float* wp = sw.carry + (size_t(r0) * nh + kvh * G + qi) * kSplitStateFloats(HD) + warp * (HD + 40);
+        m[qi] = wp[0];
+        lp[qi] = wp[1 + lane];
+#pragma unroll
+        for (int e = 0; e < DPL; ++e) acc[qi][e] = wp[33 + lane * DPL + e];
+      }
+    }
   }
   if (lo < hi) {
     const int t0 = lo >> 5, t1 = (hi - 1) >> 5;
@@ -602,6 +674,19 @@ __global__ void __launch_bounds__(128) k_attention_gqa(const float* __restrict__
           }
         }
       }
+    }
+  }
+  if constexpr (RT == 1 && !CANVAS) {
+    if (sw.state && orig_ke > sw.k_hi) {
+#pragma unroll
+      for (int qi = 0; qi < QN; ++qi) {
+        float* wp = sw.state + (size_t(r0) * nh + kvh * G + qi) * kSplitStateFloats(HD) + warp * (HD + 40);
+        if (lane == 0) wp[0] = m[qi];
+        wp[1 + lane] = lp[qi];
+#pragma unroll
+        for (int e = 0; e < DPL; ++e) wp[33 + lane * DPL + e] = acc[qi][e];
+      }
+      return;
     }
   }
   // per-lane partial sums of p -> the warp's (fixed tree), then the four warps in order
@@ -908,17 +993,17 @@ void attention(const float* q, KvRef kv, int nh, int nkv, int hd, int rows, bool
 template <int HD, int G, bool FP8>
 void launch_gqa(const float* q, KvRef kv, int nh, int nkv, int rows, bool causal, int extra, float scale,
                 const DevParams* P, float* partial, int splits, cudaStream_t st, int pos_add, int below,
-                const TreeRows* tree, CanvasKeys canvas) {
+                const TreeRows* tree, CanvasKeys canvas, const SplitWindow& sw) {
   // Two rows a block where their queries fit the 48 KB of static shared memory (Qs and the four warps' s_acc: five
   // floats a query and dim); else one (the 27B's 6 query heads of 256 dims a KV head), and one for a tree (rows of
-  // other branches read other keys of the round) or a canvas.  A row's result does not depend on RT.
+  // other branches read other keys of the round), a canvas, or a split window.  A row's result does not depend on RT.
   constexpr bool kTwoRows = size_t(5) * 2 * G * HD * sizeof(float) <= 48 * 1024;
   if (canvas.s0 >= 0) {
     k_attention_gqa<HD, G, 1, FP8, true><<<dim3(rows, nkv, std::min(splits, kAttnCoresSplits)), 128, 0, st>>>(
         q, kv, nh, nkv, rows, causal, extra, scale, P, partial, pos_add, below, splits, nullptr, canvas.s0);
-  } else if (tree || rows == 1 || !kTwoRows) {
+  } else if (tree || sw.state || rows == 1 || !kTwoRows) {
     k_attention_gqa<HD, G, 1, FP8><<<dim3(rows, nkv, std::min(splits, kAttnCoresSplits)), 128, 0, st>>>(
-        q, kv, nh, nkv, rows, causal, extra, scale, P, partial, pos_add, below, splits, tree, -1);
+        q, kv, nh, nkv, rows, causal, extra, scale, P, partial, pos_add, below, splits, tree, -1, sw);
   } else if constexpr (kTwoRows) {
     k_attention_gqa<HD, G, 2, FP8><<<dim3(ceil_div(rows, 2), nkv, std::min(splits, kAttnCoresSplits)), 128, 0, st>>>(
         q, kv, nh, nkv, rows, causal, extra, scale, P, partial, pos_add, below, splits, nullptr, -1);
@@ -943,17 +1028,18 @@ namespace {
 // The KV-head-grouped kernel for the G = nh / nkv and head dims gqa_compiled names.
 bool attention_gqa(const float* q, KvRef kv, int nh, int nkv, int hd, int rows, bool causal, int extra, float scale,
                    const DevParams* P, float* partial, int splits, cudaStream_t st, int pos_add,
-                   const KernelOptions& opt, int below, const TreeRows* tree, CanvasKeys canvas) {
+                   const KernelOptions& opt, int below, const TreeRows* tree, CanvasKeys canvas,
+                   const SplitWindow& sw) {
   if (!kv_fp8_supported(opt, nh, nkv, hd)) return false;  // the shapes this kernel takes, FP8 or not
   const int g = nh / nkv;
-#define FLYX_GQA(HD_, G_)                                                                                  \
+#define FLYX_GQA(HD_, G_)                                                                                     \
   if (hd == HD_ && g == G_) {                                                                                 \
     if (kv.fp8())                                                                                             \
       launch_gqa<HD_, G_, true>(q, kv, nh, nkv, rows, causal, extra, scale, P, partial, splits, st, pos_add,  \
-                                below, tree, canvas);                                                         \
+                                below, tree, canvas, sw);                                                     \
     else                                                                                                      \
       launch_gqa<HD_, G_, false>(q, kv, nh, nkv, rows, causal, extra, scale, P, partial, splits, st, pos_add, \
-                                 below, tree, canvas);                                                        \
+                                 below, tree, canvas, sw);                                                    \
     return true;                                                                                              \
   }
   FLYX_GQA(32, 1) FLYX_GQA(32, 2) FLYX_GQA(32, 4)
@@ -974,14 +1060,15 @@ void attention_split(const float* q, const kv16* Kc, const kv16* Vc, int nh, int
 
 void attention_split(const float* q, KvRef kv, int nh, int nkv, int hd, int rows, bool causal, int extra, float scale,
                      const DevParams* P, const float* gate, int ld_gate, float* out, int ld_out, float* partial,
-                     int splits, const Launch& L, int pos_add, int window, const TreeRows* tree, CanvasKeys canvas) {
+                     int splits, const Launch& L, int pos_add, int window, const TreeRows* tree, CanvasKeys canvas,
+                     const SplitWindow& sw) {
   const cudaStream_t st = L.st;
   const bool on_canvas = canvas.s0 >= 0;
   if (on_canvas && (tree || window > 0)) {
     std::fprintf(stderr, "flyx-cuda: attention of a canvas pass with a tree or a window\n");
     std::abort();
   }
-  const int rt = tree ? 1 : 4;  // the per-head kernel's rows a block
+  const int rt = (tree || sw.state) ? 1 : 4;  // the per-head kernel's rows a block
   dim3 grid(nh, std::min(splits, kAttnCoresSplits), ceil_div(rows, rt));
   const kv16* Kc = static_cast<const kv16*>(kv.k);
   const kv16* Vc = static_cast<const kv16*>(kv.v);
@@ -994,20 +1081,20 @@ void attention_split(const float* q, KvRef kv, int nh, int nkv, int hd, int rows
   if (window == 0 && !on_canvas && opts(L).rows_mma && opts(L).attention != kAttnPerHead) {
     const int want = nkv > 0 && nh % nkv == 0 && gqa_compiled(hd, nh / nkv) ? opts(L).rows_mma_from : 0;
     if (attention_rows_mma(q, kv, nh, nkv, hd, rows, causal, extra, scale, P, partial, splits, L, pos_add, want,
-                           tree))
+                           tree, sw))
       from = want;
   }
   if (from > 0 && (window > 0 || !attention_gqa(q, kv, nh, nkv, hd, rows, causal, extra, scale, P, partial, splits,
-                                                st, pos_add, opts(L), from, tree, canvas))) {
+                                                st, pos_add, opts(L), from, tree, canvas, sw))) {
     if (kv.fp8())  // the backend refuses FP8 caches of other shapes at load
       throw std::runtime_error("flyx-cuda: FP8 KV cache with an unsupported attention shape");
     auto per_head = [&](auto kernel1, auto kernel4, auto kernel_canvas) {
       if (on_canvas) kernel_canvas<<<grid, 128, 0, st>>>(q, Kc, Vc, nh, nkv, rows, causal, extra, scale, P, partial,
-                                                         pos_add, window, splits, nullptr, canvas.s0);
-      else if (tree) kernel1<<<grid, 128, 0, st>>>(q, Kc, Vc, nh, nkv, rows, causal, extra, scale, P, partial, pos_add,
-                                                    window, splits, tree, -1);
+                                                         pos_add, window, splits, nullptr, canvas.s0, SplitWindow{});
+      else if (tree || sw.state) kernel1<<<grid, 128, 0, st>>>(q, Kc, Vc, nh, nkv, rows, causal, extra, scale, P,
+                                                               partial, pos_add, window, splits, tree, -1, sw);
       else kernel4<<<grid, 128, 0, st>>>(q, Kc, Vc, nh, nkv, rows, causal, extra, scale, P, partial, pos_add, window,
-                                          splits, nullptr, -1);
+                                          splits, nullptr, -1, SplitWindow{});
     };
     switch (hd) {
     case 32: per_head(k_attention<32, 1>, k_attention<32, 4>, k_attention<32, 4, true>); break;
@@ -1018,6 +1105,7 @@ void attention_split(const float* q, KvRef kv, int nh, int nkv, int hd, int rows
       throw std::runtime_error("flyx-cuda: attention with head dim " + std::to_string(hd));
     }
   }
+  if (sw.state && !sw.last) return;
   const Out o = out ? Out{out, nullptr, nullptr} : split_out(L, rows, nh * hd);
   const int used_from = from == INT_MAX ? -1 : from;
   if (tree)

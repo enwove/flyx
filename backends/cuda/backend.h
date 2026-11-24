@@ -119,6 +119,7 @@ inline void destroy_side(SideStream& s) {
 //                         fusion=0 and round_glu=0, whose producers round their own outputs per 32)
 //   act_fp4=1|2           measurement: inputs first rounded as NVFP4 (1) or MXFP8 (2) activations would be
 enum class WaitMode { poll, spin, automatic };  // option wait=poll|spin|auto
+enum class PageableKvMode { off, on, automatic };  // option pageable_kv=off|on|auto
 struct BackendOptions {
   KernelOptions kernels;  // the ones launches consult
   bool profile = false, graphs = true, fusion = true, exact_drafts = false;
@@ -144,6 +145,13 @@ struct BackendOptions {
   int wide = 0;                  // wide=auto (0: wide lookup rounds where the GPU has room, open_model), 0 (1), 1 (2)
   int strata_copy_slots = 2;
   bool strata_compact = false;  // pack the two shared words into the 24 private words of a hosted 256d 3-bit copy
+  // Hybrid WDDM pinned + pageable host K/V overflow for Strata sessions (tiers.cpp / state.cpp):
+  //   auto: keep low-bit copies and as many K/V layers as fit in WDDM pinned budget, spill remaining K/V layers to
+  //         ordinary pageable RAM (0 bytes WDDM non-local); no-op on Linux unless pinned_host_mb is set.
+  //   on:   place all tiered Strata K/V layers in pageable RAM (testing).
+  //   off:  always pin all host K/V via cuMemCreate/cudaHostAlloc.
+  PageableKvMode pageable_kv = PageableKvMode::automatic;
+  int pinned_host_mb = -1;  // override pinned host budget in MiB (-1: query DXGI NON_LOCAL on Windows, unlimited else)
 };
 bool parse_options(const char* text, BackendOptions* o, std::string* err);
 
@@ -157,6 +165,10 @@ bool gpu_memory(size_t* free, size_t* total);
 // What this process holds of that device as the system counts it (flyx_memory_info.process): the models, their
 // sequences, and the CUDA context with its kernels' modules.  0 where the system does not tell a process's share.
 size_t gpu_process_memory();
+// Remaining WDDM non-local (page-locked host) GPU memory budget on Windows, less a safety reserve; UINT64_MAX elsewhere.
+uint64_t host_pinned_budget();
+// CUDA VMM allocation granularity (typically 2 MiB; fallback 2 MiB if VMM is unavailable).
+size_t vmm_granularity();
 // Windows: device memory device_malloc keeps free.  Past what its video memory manager keeps free (250 MiB for 32 MiB
 // allocations, up to 560 MiB for 256 MiB to 1 GiB ones: device_stats.cpp), allocations land in host memory.
 constexpr size_t kPagedFloor = 768ull << 20;
@@ -183,8 +195,8 @@ void gemm_on_glu(const Lin& W, int N, int K, float* y, int ldy, int rows, bool a
 struct RowBufs {
   int *tokens = nullptr, *choice = nullptr;
   float *x = nullptr, *h = nullptr, *proj = nullptr, *act = nullptr, *gdn_o = nullptr, *qbuf = nullptr,
-        *part = nullptr, *attn_state = nullptr, *feats = nullptr, *cx = nullptr, *ckv = nullptr, *mcat = nullptr,
-        *mx = nullptr, *mhn = nullptr;
+        *part = nullptr, *attn_state = nullptr, *split_state = nullptr, *feats = nullptr, *cx = nullptr,
+        *ckv = nullptr, *mcat = nullptr, *mx = nullptr, *mhn = nullptr;
   float* lora = nullptr;  // the target's adapters' first products (RowNeeds::lora a row; none without adapters)
   GdnBufs pre{};  // GDN prefill scratch (prefill set only)
   Scratch scratch{};  // the GEMM inputs the kernels stage
@@ -194,6 +206,7 @@ struct RowBufs {
 struct RowNeeds {
   int proj = 0, act = 0, gdn_o = 0, q = 0;  // projections, activations, GDN output, attention queries
   int attn_state = 0;                       // prefill windowed flash attention softmax state (floats per row)
+  int split_state = 0;                      // prefill windowed split attention warp state (floats per row, <= 16 rows)
   int lora = 0;                             // the target's adapters' first products: q|k|v's (3 rank), gate|up's
   int feats = 0, cx = 0, ckv = 0;           // DFlash2 context: tapped features, fc output, K/V projections
   bool mtp = false;                         // MTP context rows (2 x hidden, hidden, hidden)
@@ -711,6 +724,7 @@ struct flyx_seq {
     if (ready_ev) cudaEventDestroy(ready_ev);
     for (void* p : allocs) cudaFree(p);
     for (void* p : host_allocs) cudaFreeHost(p);
+    if (page_pinned_host) cudaFreeHost(page_pinned_host);
     release_mapped();
     for (auto e : stage_ready) cudaEventDestroy(e);
     for (auto e : stage_free) cudaEventDestroy(e);
@@ -753,9 +767,9 @@ struct flyx_seq {
   size_t strata_lse_bytes = 0;  // device bytes of strata.lse (reused for head logits / sampling sort after layers)
   struct Mapped {
     unsigned long long va = 0, view = 0;
-    size_t dev = 0, bytes = 0, stage = 0;    // stage: the view's bytes past dev, its staging's
-    unsigned long long handles[2] = {0, 0};  // device part, host part
-    int slot = -1;                           // the staging the view maps past its device part
+    size_t dev = 0, bytes = 0, va_bytes = 0, stage = 0;  // stage: the view's bytes past dev, its staging's
+    unsigned long long handles[2] = {0, 0};              // device part, host/ring part
+    int slot = -1;                                       // the staging the view maps past its device part
   };
   // A staging's size. 0: as large as a cache's host part. Else, with strata attention (FLYX_KV_STRATA
   // or AUTO), stage_window positions, and at least what a round reading the caches reaches past the device part
@@ -807,10 +821,39 @@ struct flyx_seq {
   // view is the range's view, mapping staging[slot] past its device rows.
   struct Tiered {
     void *at = nullptr, *view = nullptr;
+    uint8_t* page = nullptr;  // pageable host backing when pageable == true (0 bytes WDDM pinned)
     int device_rows = INT32_MAX, slot = -1, stage_rows = INT32_MAX;  // stage_rows: positions its staging holds
+    int page_ring_base = 0;   // first tail-ring slot (>= device_rows; +1 gap when dev % row != 0)
+    int page_ring = 0;        // total GPU slots (page_ring_base + ring_tail) when pageable == true
     float* scales = nullptr;  // its staging's scales (scale_floats a position: FP8's KV heads; 0: none)
   };
-  Tiered tiered_alloc(size_t positions, size_t row, int role, int parity, int scale_floats);
+  Tiered tiered_alloc(size_t positions, size_t row, int role, int parity, int scale_floats, bool pageable = false,
+                      int ring_tail = 0, bool even_dev = false);
+  // Hybrid WDDM pinned + pageable host K/V overflow (runtime/tiers.cpp, runtime/state.cpp).
+  uint64_t pinned_budget = UINT64_MAX;  // sampled once per seq_size / seq_new_in so dry-run & real build agree
+  size_t page_spill_vram = 0;           // extra VRAM headroom reserved in seq_size() for WDDM spill
+  size_t page_spill_host = 0;           // extra host memory headroom reserved in seq_size() for WDDM spill
+  bool page_spill_auto = false;         // seq_size() dry run under finite WDDM auto budget (graphs.cpp conservative)
+  std::vector<std::pair<void*, size_t>> pageable_allocs;
+  std::deque<flyx::cuda::PageGatherCtx> page_ctxs;  // stable pointers captured by cudaLaunchHostFunc graph nodes
+  std::vector<int> page_layers;                     // kv[] indices backed by pageable host RAM
+  void* page_pinned_host = nullptr;                 // single mapped pinned allocation for gather bounce + round drain
+  void* page_pinned_dev = nullptr;
+  flyx::cuda::PageDrainLayer* page_drain_dev = nullptr;
+  std::vector<flyx::cuda::PageDrainLayer> page_drain_host;
+  void* pageable_alloc_raw(size_t bytes);
+  void flush_page_prefill(int start, int n);
+  void drain_page_host(unsigned long long seq, int pos, int n_tokens);
+  void reload_page_ring(int pos);
+  // True when an exact (non-strata-only) round reaches past any pageable layer's rounded device_positions:
+  // stage_before() uses pageable cudaMemcpyAsync, which CUDA forbids inside stream graph capture.
+  bool has_page_exact(int strata, int rows) const {
+    if (page_layers.empty() || strata == flyx::cuda::kStrataAll) return false;
+    const long long reach = (long long)position + in_flight_rows() + rows;
+    for (int idx : page_layers)
+      if (reach > kv[size_t(idx)].device_positions) return true;
+    return false;
+  }
   // The copies to the staging beside the pass (runtime/tiers.cpp). stage_begin, given what the pass's
   // attentions read through stagings in their order (a cache's views, or its copy in host memory),
   // forks the stage stream and starts the first one's copy of each staging there: the positions written before the
@@ -851,7 +894,7 @@ struct flyx_seq {
   // A small pass (a prefill's last rows, a short message) whose keys go past the stagings reads host memory where it
   // is: its round kernel reads each key once, at the bus's speed.
   bool reads_direct(const flyx::cuda::KvBuf& kb, int rows, bool round) const {
-    return kb.vk && !round && rows <= FLYX_MAX_ROWS && (long long)position + rows > kb.staged_cap();
+    return kb.vk && !kb.pageable && !round && rows <= FLYX_MAX_ROWS && (long long)position + rows > kb.staged_cap();
   }
   void stage_begin(std::vector<StageItem> order, cudaStream_t st);
   void stage_ahead(const StageItem& x);
