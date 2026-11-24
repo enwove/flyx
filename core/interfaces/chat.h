@@ -172,15 +172,19 @@ class Chat {
   // text): an optional thinking block, then text and tool calls in this
   // format's syntax, each call's arguments fitting its tool's schema, as
   // `rules` allow.  "" when nothing constrains the reply (no tools and no
-  // JSON answer, tool_choice none, or a format without tool calls).
+  // JSON answer, tool_choice none, or a format without tool calls); a format
+  // that can only keep thinking out of a reply with a grammar gives one for
+  // rules.thinking false whatever else is asked (Inkling-2's).
   virtual std::string reply_grammar(const std::vector<ojson>& tools, const ReplyRules& rules,
                                     bool in_reasoning) const {
     return "";
   }
   // The special tokens a reply in this format is written with, by their text: a format whose section and call
   // markers are control tokens (Inkling-2's <|message_model|>, <|content_text|>, <|end_message|>).  A reply grammar
-  // matches these by that text, as it matches ordinary tokens; any other special token it never takes.  None where
-  // the markers are ordinary tokens (<think>, <tool_call>).
+  // matches these by that text, as it matches ordinary tokens, and so wherever it takes that text: a grammar tells
+  // a marker's token from the same characters in ordinary tokens nowhere (free text that must not hold a marker
+  // excludes its text).  Any other special token it never takes; the model's stop tokens end a reply and are not
+  // named here.  None where the markers are ordinary tokens (<think>, <tool_call>).
   virtual std::vector<std::string> reply_tokens() const { return {}; }
   // Template variables that say what the engine's own options say, for a template that has other names for them:
   // one with a thinking effort and no enable_thinking is given the effort of thinking switched off.  The request's

@@ -807,14 +807,17 @@ void test_chat_and_format(const std::string& model_path) {
           "the format names its reply markers, each a control token of the model");
     check(admits(grm, thought + call, markers), "the grammar takes a reply written with its control tokens");
     check(!admits(grm, thought + call, {}), "a grammar that knows no marker takes none of them");
-    // A marker inside a section's text is not text: the section ends at its own <|end_message|>.
+    // A section's text ends at its own <|end_message|>, as the parser ends it: a marker that opens a section is
+    // text there (a reply may quote one), and after the section only what the grammar puts next is taken.
     const std::string auto_grm = e->chat().reply_grammar(tools, ReplyRules{}, rc);
+    const std::string quoting = "<|message_model|><|content_text|>a<|content_text|>b<|end_message|>";
     bool ends = false;
-    const std::string nested = "<|message_model|><|content_text|>a<|content_text|>b<|end_message|>";
-    const size_t n = taken(auto_grm, nested, markers, &ends);
-    check(n == 3 && !ends, "a section's text holds no marker (" + std::to_string(n) + " tokens taken)");
-    // Thinking switched off: the reply has no thinking section, with tools and without; left on, a reply with no
-    // tools is not held to anything.
+    const size_t n = taken(auto_grm, hello + thought, markers, &ends);
+    check(admits(auto_grm, quoting, markers) && n == tok.encode(hello).size() + 1 && !ends,
+          "a section's text may quote an opening marker; no thinking section after the text (" + std::to_string(n) +
+              " tokens taken)");
+    // Thinking switched off: the reply has no thinking section, with tools and without, and is otherwise the
+    // model's (as many text sections as it writes); left on, a reply with no tools is not held to anything.
     ReplyRules quiet;
     quiet.thinking = false;
     const std::string quiet_text = e->chat().reply_grammar({}, quiet, rc);
@@ -824,6 +827,9 @@ void test_chat_and_format(const std::string& model_path) {
               admits(quiet_tools, call, markers) && !admits(quiet_tools, thought + call, markers) &&
               admits(auto_grm, thought + hello, markers) && admits(auto_grm, thought + call, markers),
           "thinking off: text or calls, no thinking section; on: an optional one first");
+    check(admits(quiet_text, hello + hello, markers) && !admits(quiet_text, hello + thought, markers) &&
+              !admits(quiet_text, hello + call, markers),
+          "thinking off, no tools: text sections and nothing else");
   }
 
   // Round-trip tokenizer encode/decode on control tokens and text.

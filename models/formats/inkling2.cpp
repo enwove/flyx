@@ -252,13 +252,11 @@ ojson arguments_schema(const ojson& fn) {
   return {{"type", "object"}};
 }
 
-// A section's text: no marker in it, as its token or spelled out, so a section ends at its own <|end_message|> and
-// the next begins only where the grammar puts one.
+// A section's text: anything but the two markers that end a section for the parser, as their tokens or spelled out.
+// The markers that open one are text here, as they are to the parser (a reply may quote them): a section begins only
+// after the one before it has ended, where the grammar puts it.
 ojson any_section_body() {
-  ojson excludes = ojson::array();
-  for (std::string& marker : inkling2_reply_tokens()) excludes.push_back(std::move(marker));
-  excludes.push_back(std::string(kEndSampling));
-  return {{"type", "any_text"}, {"excludes", std::move(excludes)}};
+  return {{"type", "any_text"}, {"excludes", ojson::array({std::string(kEndMessage), std::string(kEndSampling)})}};
 }
 
 ojson thinking_section() {
@@ -355,7 +353,12 @@ std::string inkling2_reply_grammar(const std::vector<ojson>& tools, const ReplyR
   } else if (rules.json) {
     answer = json_text_section(rules.schema);
   } else if (!rules.thinking) {
-    answer = text_section();  // nothing else to hold the reply to: only its thinking is left out
+    // Nothing else to hold the reply to: only its thinking is left out, so as many text sections as the model writes.
+    answer = {{"type", "tags_with_separator"},
+              {"tags", ojson::array({text_section()})},
+              {"separator", ""},
+              {"at_least_one", true},
+              {"stop_after_first", false}};
   } else {
     return "";
   }
