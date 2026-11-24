@@ -304,9 +304,18 @@ bool Generation::prefill() {
 }
 
 int Generation::rejected(const flyx_round_result& r) {
-  if (!req_.grammar || finish_) return -1;
-  for (int i = 0; i < r.n_tokens; ++i)
+  if (!req_.grammar || finish_ || grammar_over_) return -1;
+  for (int i = 0; i < r.n_tokens; ++i) {
     if (!req_.grammar->accept(r.tokens[i])) return i;
+    // A stop token the request goes on past (ignore_eos: a measurement's fixed number of tokens) is where the reply
+    // the grammar holds ends.  What follows is no reply's, so nothing holds it; the matcher, which has ended, is not
+    // asked again (it takes no token after a stop token, and has no mask to give).
+    const std::vector<int32_t>& eos = e_->eos();
+    if (req_.ignore_eos && std::find(eos.begin(), eos.end(), r.tokens[i]) != eos.end()) {
+      grammar_over_ = true;
+      return -1;
+    }
+  }
   return -1;
 }
 

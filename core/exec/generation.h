@@ -227,6 +227,7 @@ class Generation {
   int finish_ = 0;                 // flyx_finish_reason once the reply has ended
   // rounds
   bool every_ = false;             // GenerateRequest::grammar_reference
+  bool grammar_over_ = false;      // the grammar took a stop token the request goes on past (ignore_eos)
   bool launching_ = false;
   int64_t next_disk_stage_ = 0;    // next accepted position at which to stage generated KV (0: no disk tier)
   bool stage_due_ = false;         // drain outstanding rounds before reading their state
