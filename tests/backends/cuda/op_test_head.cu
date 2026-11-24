@@ -373,7 +373,7 @@ void test_draft_pick(int V, int K, bool plant, bool pick) {
       return v;
     };
     auto softcap_ref = [](double z, double cap) { return cap > 0.0 ? cap * std::tanh(z / cap) : z; };
-    auto test_score = [&](int Rk_c, bool with_bias, float cap_c, const char* tag) {
+    auto test_score = [&](int Rk_c, bool accum, bool with_bias, float cap_c, const char* tag) {
       constexpr int Vc = 1024, C = 173;
       std::vector<int> c_ids(C);
       for (int c = 0; c < C; ++c) c_ids[c] = (c * 5 + 3) % Vc;
@@ -392,14 +392,14 @@ void test_draft_pick(int V, int K, bool plant, bool pick) {
       float* d_mk = up(mk_c);
       bf16* d_w2 = up_bf16(w2_c);
       float* d_w2b = with_bias ? up(w2b_c) : nullptr;
-      draft_score_bf16(d_mk, Rk_c, d_w2, d_w2b, Rk_c, 1, d_row, kDraftPickFloats, true, cap_c, 0);
+      draft_score_bf16(d_mk, Rk_c, d_w2, d_w2b, Rk_c, 1, d_row, kDraftPickFloats, accum, cap_c, 0);
       auto got_row = down_raw(d_row, kDraftPickFloats);
       Vec got_v(C), want_v(C);
       for (int c = 0; c < C; ++c) {
         const int vid = c_ids[c];
         double dot = 0.0;
         for (int q = 0; q < Rk_c; ++q) dot += w2_q[size_t(vid) * Rk_c + q] * double(float(mk_c[q]));
-        const double z = double(float(c_base[c])) + dot + (with_bias ? double(float(w2b_c[vid])) : 0.0);
+        const double z = (accum ? double(float(c_base[c])) : 0.0) + dot + (with_bias ? double(float(w2b_c[vid])) : 0.0);
         got_v[c] = got_row[kDraftCandCap + c];
         want_v[c] = softcap_ref(z, cap_c);
       }
@@ -409,8 +409,58 @@ void test_draft_pick(int V, int K, bool plant, bool pick) {
       CK(cudaFree(d_w2));
       if (d_w2b) CK(cudaFree(d_w2b));
     };
-    test_score(256, true, 30.f, "draft_score_bf16 (K=256 accum + bias + cap)");
-    test_score(36, false, 0.f, "draft_score_bf16 (K=36 scalar accum)");
+    test_score(256, true, true, 30.f, "draft_score_bf16 (K=256 accum + bias + cap)");
+    test_score(36, true, false, 0.f, "draft_score_bf16 (K=36 scalar accum)");
+    test_score(36, false, false, 0.f, "draft_score_bf16 (K=36 scalar overwrite)");
+
+    {  // Multi-row draft_combine_cands (rows=3, with add+bias+cap and add=nullptr softcap-only).
+      constexpr int Vc = 512, C = 64, R_c = 3;
+      std::vector<float> h_rows(size_t(R_c) * kDraftPickFloats, 0.f);
+      Vec c_base = randv(size_t(R_c) * C, 1.5), c_add = randv(size_t(R_c) * C, 1.0), w2b_c = randv(Vc, 0.25);
+      for (int r = 0; r < R_c; ++r) {
+        float* hr = h_rows.data() + size_t(r) * kDraftPickFloats;
+        int* h_ci = reinterpret_cast<int*>(hr);
+        for (int c = 0; c < C; ++c) {
+          h_ci[c] = (r * 37 + c * 5 + 3) % Vc;
+          hr[kDraftCandCap + c] = float(c_base[size_t(r) * C + c]);
+        }
+        h_ci[2 * kDraftCandCap] = C;
+      }
+      float* d_rows = up_raw(h_rows);
+      float* d_add = up(c_add);
+      float* d_w2b = up(w2b_c);
+      draft_combine_cands(d_add, C, d_w2b, 20.f, R_c, d_rows, kDraftPickFloats, 0);
+      auto got_m = down_raw(d_rows, h_rows.size());
+      Vec got_v(size_t(R_c) * C), want_v(size_t(R_c) * C);
+      for (int r = 0; r < R_c; ++r) {
+        const float* gr = got_m.data() + size_t(r) * kDraftPickFloats;
+        const int* g_ci = reinterpret_cast<const int*>(gr);
+        for (int c = 0; c < C; ++c) {
+          got_v[size_t(r) * C + c] = gr[kDraftCandCap + c];
+          want_v[size_t(r) * C + c] = softcap_ref(
+              double(float(c_base[size_t(r) * C + c])) + double(float(c_add[size_t(r) * C + c])) +
+                  double(float(w2b_c[g_ci[c]])),
+              20.0);
+        }
+      }
+      expect("draft_combine_cands (rows=3 + bias + cap)", got_v, want_v, 2e-6);
+
+      // Softcap-only mode (add == nullptr, bias == nullptr).
+      CK(cudaMemcpy(d_rows, h_rows.data(), h_rows.size() * sizeof(float), cudaMemcpyHostToDevice));
+      draft_combine_cands(nullptr, 0, nullptr, 15.f, R_c, d_rows, kDraftPickFloats, 0);
+      auto got_sc = down_raw(d_rows, h_rows.size());
+      for (int r = 0; r < R_c; ++r) {
+        const float* gr = got_sc.data() + size_t(r) * kDraftPickFloats;
+        for (int c = 0; c < C; ++c) {
+          got_v[size_t(r) * C + c] = gr[kDraftCandCap + c];
+          want_v[size_t(r) * C + c] = softcap_ref(double(float(c_base[size_t(r) * C + c])), 15.0);
+        }
+      }
+      expect("draft_combine_cands (rows=3 softcap-only)", got_v, want_v, 2e-6);
+      CK(cudaFree(d_rows));
+      CK(cudaFree(d_add));
+      CK(cudaFree(d_w2b));
+    }
 
     {  // draft_combine_cands + draft_pick_topk (argmax, tie-break, prob, margin).
       constexpr int Vc = 512, C = 97;

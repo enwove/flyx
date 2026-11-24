@@ -343,8 +343,9 @@ void make_head_w12(flyx_bmodel* m) {
 // they were made from computes the same bits), then the certified head's e4m3
 // copy (the whole head chooses: the same tokens), then an NVFP4 copy drafts read
 // (option draft_head=full; drafts from the bf16 head: other drafts, the same
-// output, a draft being kept only when it is the target's choice).  Nothing that
-// changes a result goes: head_fp8's copy, the user's choice, stays.
+// output, a draft being kept only when it is the target's choice), and finally
+// the 1-bit SignHead draft copy (h.coarse; drafts fall back to the full head).
+// Nothing that changes a result goes: head_fp8's copy, the user's choice, stays.
 uint64_t trim(flyx_bmodel* m, uint64_t bytes) {
   try {
     CK(cudaDeviceSynchronize());

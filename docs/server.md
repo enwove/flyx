@@ -113,7 +113,7 @@ Defined in `core/os/env.h` (plus CUDA / Python standard variables). Explicit CLI
 | `FLYX_ACTIVATIONS` | `exact` \| `nvfp4` | Default activation mode when `--activations` is unset. |
 | `FLYX_LOOKUP` | `0` \| `1` | Enable/disable prompt lookup (`0` = `--no-lookup`). |
 | `FLYX_DRAFT_TREES` | `0` \| `1` | Enable/disable DFlash2 draft trees (`1` = `--draft-trees`). |
-| `FLYX_ADAPTIVE` | `0` \| `1` | Enable/disable intra-round confidence optimal stopping on adaptive drafter plans (`1`, default). Sequential drafters (MTP) only: block drafters (DFlash2) verify the chooser's fixed widths. |
+| `FLYX_ADAPTIVE` | `0` \| `1` | Enable/disable intra-round confidence optimal stopping on adaptive drafter plans (`1`, default). Enabled for sequential drafters (MTP) and for block drafters on targets whose verify cost scales steeply with width; dense targets paired with block drafters (DFlash2) verify the chooser's fixed widths. |
 | `FLYX_CHAT_NATIVE` | `0` \| `1` | Force Jinja engine (`0`) instead of native chat renderer (`1`, default). |
 | `FLYX_API_KEY` / `FLYX_KEY` | string | Default server API key when `--api-key` is unset. |
 | `FLYX_MODELS_DIR` | paths (`:` Linux / `;` Win) | Additional local model directories appended to `--models-dir`. |

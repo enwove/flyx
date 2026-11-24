@@ -111,13 +111,10 @@ class Model : public interfaces::Model {
   std::vector<int> draft_widths(int d) const override;
   std::vector<int> adaptive_checkpoints(int d) const override;
   int block_drafts(int d) const override;
-  // True for target architectures whose verify cost climbs steeply with concurrent verify rows (e.g. sparse MoE
-  // active-expert fan-out), so parallel block drafters benefit from finer width ladders and per-round stopping.
-  virtual bool verify_scales_with_width() const { return false; }
   int trained_ctx() const override { return trained_ctx_; }
-  bool drafts_trees(int d) const override { return drafters_.at(size_t(d)).kind == Drafter::kDv; }
+  bool drafts_trees(int d) const override;
   bool file_drafts_trees() const override { return file_drafts_trees_; }
-  bool restarts(int d) const override { return drafters_.at(size_t(d)).kind == Drafter::kDv; }
+  bool restarts(int d) const override;
   bool kv_fp8_by_default() const override { return kv_fp8_by_default_; }
 
  protected:
@@ -135,8 +132,9 @@ class Model : public interfaces::Model {
   };
   Tables tables_;
   std::vector<DrafterBlock> drafters_;
-  bool kv_fp8_by_default_ = true;  // FP8 where a real model of the family showed no visible drop
-  bool file_drafts_trees_ = false;  // the file holds DV, asked for or not
+  bool kv_fp8_by_default_ = true;         // FP8 where a real model of the family showed no visible drop
+  bool file_drafts_trees_ = false;        // the file holds DV, asked for or not
+  bool verify_scales_with_width_ = false; // sparse-MoE targets whose verify cost climbs steeply with verify width
 
  private:
   flyx_model_desc desc_{};

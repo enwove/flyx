@@ -13,6 +13,7 @@
 #include <algorithm>
 #include <climits>
 #include <cstdint>
+#include <stdexcept>
 
 #include "backends/cuda/kernels/common/device.cuh"
 #include "backends/cuda/kernels/common/launch.h"
@@ -751,6 +752,8 @@ void gemm_sign_rough(const float* x, int ldx, const SignHead& h, int N, int K, f
 
 void gemm_sign_rough_add(const float* x, int ldx, const SignHead& h, const float* bias, int N, int K, float* y,
                          int ldy, const Launch& L) {
+  if (N <= 0 || K <= 0) return;
+  if (K % 128 != 0) throw std::invalid_argument("gemm_sign_rough_add: K must be a multiple of 128");
   const int grid = ceil_div(N, kSignTiles1 * kSign1Rows);
   if (K <= 256)
     k_sign_rough_lut<1, kSignTiles1, 2, true><<<grid, kSign1Rows, 0, L.st>>>(x, ldx, h.bits, h.scales, bias, N, K, y,
@@ -762,13 +765,17 @@ void gemm_sign_rough_add(const float* x, int ldx, const SignHead& h, const float
 
 void draft_select_cands(float* rough, int ld, int V, int rows, const Launch& L) {
   static_assert(2 * kCandCap + 1 <= kDraftPickFloats, "a row's candidates fit where its rough scores were");
+  if (rows <= 0 || V <= 0) return;
   launch_draft_select(rough, ld, V, rows, L);
 }
 
 void draft_score_bf16(const float* x, int ldx, const bf16* W, const float* bias, int K, int rows, float* rough, int ld,
                       bool accumulate, float softcap, cudaStream_t st) {
+  if (rows <= 0) return;
   const dim3 grid(rows, kCandCap / 8);
-  if (!accumulate && !bias && softcap <= 0.f && K <= 4096 && (K & 7) == 0) {
+  const bool fast_aligned = (K & 7) == 0 && (ldx & 3) == 0 && (reinterpret_cast<uintptr_t>(W) & 15u) == 0 &&
+                            (reinterpret_cast<uintptr_t>(x) & 15u) == 0;
+  if (!accumulate && !bias && softcap <= 0.f && K <= 4096 && fast_aligned) {
     k_draft_score<<<grid, 256, 0, st>>>(rough, ld, W, K, x, ldx);
   } else {
     k_draft_score_gen<<<grid, 256, 0, st>>>(rough, ld, W, bias, K, x, ldx, accumulate, softcap);
@@ -777,11 +784,13 @@ void draft_score_bf16(const float* x, int ldx, const bf16* W, const float* bias,
 
 void draft_combine_cands(const float* add, int ld_add, const float* bias, float softcap, int rows, float* rough, int ld,
                          cudaStream_t st) {
+  if (rows <= 0) return;
   k_draft_combine_cands<<<rows, kCandCap, 0, st>>>(add, ld_add, bias, softcap, rough, ld);
 }
 
 void draft_pick_topk(float* rough, int ld, int rows, int k, int* idx, float* val, cudaStream_t st, float* prob,
                      float* margin) {
+  if (rows <= 0 || k <= 0) return;
   k_draft_topk<<<rows, 32, 0, st>>>(rough, ld, k, idx, val, prob, margin);
 }
 

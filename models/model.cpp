@@ -53,9 +53,9 @@ std::vector<int> Model::draft_widths(int d) const {
     return {widest};
   }
   const int widest = tr.stretch_block ? b.max_drafts : std::min(FLYX_MAX_ROWS - 1, b.max_drafts);
-  const std::vector<int> ladder = tr.sequential                ? std::vector<int>{1, 3, 5, 7}
-                                  : verify_scales_with_width() ? std::vector<int>{3, 5, 7}
-                                                               : std::vector<int>{3, 7};
+  const std::vector<int> ladder = tr.sequential              ? std::vector<int>{1, 3, 5, 7}
+                                  : verify_scales_with_width_ ? std::vector<int>{3, 5, 7}
+                                                              : std::vector<int>{3, 7};
   std::vector<int> widths;
   for (int k : ladder)
     if (k < widest) widths.push_back(k);
@@ -75,7 +75,7 @@ std::vector<int> Model::adaptive_checkpoints(int d) const {
   // - targets with steep verify-cost scaling (e.g. sparse MoE active-expert fan-out) benefit on any block drafter.
   // Dense targets paired with block drafters have nearly flat verify cost across widths (RTX PRO 6000, QUASAR NVFP4
   // 27B + DFlash2: adaptive 425-439 vs fixed 443-494 tok/s on code) and avoid extra verify subgraphs in VRAM.
-  if (tr.sequential || verify_scales_with_width()) return ws.size() > 1 ? ws : std::vector<int>{};
+  if (tr.sequential || verify_scales_with_width_) return ws.size() > 1 ? ws : std::vector<int>{};
   return {};
 }
 
@@ -83,6 +83,10 @@ int Model::block_drafts(int d) const {
   const DrafterBlock& b = drafters_.at(size_t(d));
   return drafter_traits(b.kind).sequential ? std::min(7, b.max_drafts) : b.max_drafts;
 }
+
+bool Model::drafts_trees(int d) const { return drafter_traits(drafters_.at(size_t(d)).kind).tree_only; }
+
+bool Model::restarts(int d) const { return drafter_traits(drafters_.at(size_t(d)).kind).tree_only; }
 
 void Model::add_drafter(Drafter kind, int block, int max_drafts) {
   drafters_.push_back({kind, block, max_drafts});
