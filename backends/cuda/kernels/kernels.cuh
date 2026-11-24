@@ -570,6 +570,19 @@ size_t sign_head_bytes(int N, int K);  // bits and scales
 void make_sign_head(const bf16* W, int N, int K, SignHead* h, cudaStream_t st);
 void gemm_sign_rough(const float* x, int ldx, const SignHead& h, int N, int K, float* y, int ldy, int rows,
                      const Launch& L, bool exact_1row = false);
+// y[n] += rough(x, h)[n] + (bias ? bias[n] : 0) for 1 row, L2-caching h for small tables reused across steps.
+void gemm_sign_rough_add(const float* x, int ldx, const SignHead& h, const float* bias, int N, int K, float* y,
+                         int ldy, const Launch& L);
+// Shared two-stage candidate-set primitives over rough [rows][ld] (ld >= max(V, kDraftPickFloats)):
+// select ~kDraftCands survivors per row, score survivors against any bf16 matrix (overwrite or accumulate + bias +
+// softcap), combine a packed dots_blocks candidate vector + bias + softcap, and pick top-k with prob/margin.
+void draft_select_cands(float* rough, int ld, int V, int rows, const Launch& L);
+void draft_score_bf16(const float* x, int ldx, const bf16* W, const float* bias, int K, int rows, float* rough, int ld,
+                      bool accumulate, float softcap, cudaStream_t st);
+void draft_combine_cands(const float* add, int ld_add, const float* bias, float softcap, int rows, float* rough, int ld,
+                         cudaStream_t st);
+void draft_pick_topk(float* rough, int ld, int rows, int k, int* idx, float* val, cudaStream_t st,
+                     float* prob = nullptr, float* margin = nullptr);
 void draft_pick(const float* x, int ldx, const SignHead& h, const bf16* W, int V, int K, int rows, int k, int* idx,
                 float* val, float* rough, const Launch& L, bool exact_1row = false, float* prob = nullptr,
                 float* margin = nullptr);

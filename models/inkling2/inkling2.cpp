@@ -398,6 +398,10 @@ bool Inkling2::build(const ModelFile& file, const ModelOptions& o, std::string* 
   Config c = read_gguf_config(file);
   take_companions(file, &c);
   trained_ctx_ = c.trained_ctx;
+  // Every row of a sparse MoE reads its own experts' weights, so verifying more drafts costs nearly in proportion:
+  // a block drafter's rounds take the finer width ladder and stop on the device where its confidence falls
+  // (Model::draft_widths, adaptive_checkpoints).
+  verify_scales_with_width_ = true;
   // Default FP8 KV cache on non-roomy GPUs (matches Qwen3.8-27B default path; verified in docs/design/numerics.md).
   DrafterSources sources{};
   sources.dspark = c.dspark;

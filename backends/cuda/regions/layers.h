@@ -31,6 +31,12 @@ void head_logits(const HeadBlock& h, const RowView& v, int r0, int n, bool cert,
                  const KernelOptions& ko, bool x16 = false);
 void draft_head_pick(const HeadBlock& head, const float* x, int nr, int k, int* idx, float* val, flyx_seq* s,
                      const Launch& L, float* prob = nullptr, float* margin = nullptr);
+// Shared two-stage rough+exact pick for additive draft heads: softcap(head(x_base) + extra(x_extra) + bias).
+bool draft_head_additive_ready(const HeadBlock& head, const Lin& extra, const SignHead& extra_coarse, int K_extra);
+void draft_head_pick_additive_step(const HeadBlock& head, const float* x_base, const Lin& extra,
+                                   const SignHead& extra_coarse, const float* extra_bias, const float* x_extra,
+                                   int K_extra, float softcap, float* cand_row, int ld, float* scratch_add, int k,
+                                   int* idx_out, float* val_out, float* prob_out, float* margin_out, const Launch& L);
 
 // Drafting works on the sequence's own buffers and scratch, on the stream of L (the sequence's, or a batch round's).
 // DFlash2: one block of drafts; tree: `width` of its candidates as a tree (FLYX_DRAFT_TREE), the TreeRows with them

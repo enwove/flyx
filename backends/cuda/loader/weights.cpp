@@ -250,6 +250,14 @@ void release_w12(flyx_bmodel* m, W12* w, size_t N, size_t K, size_t E) {
   *w = W12{};
 }
 
+// Gives back a 1-bit SignHead copy (bits and scales; null fields were not allocated).
+void release_sign_head(flyx_bmodel* m, SignHead* sh, int N, int K) {
+  const size_t tiled = size_t(N + 255) / 256 * 256;
+  if (sh->bits) m->release(sh->bits, tiled * size_t(K) / 32 * sizeof(uint32_t));
+  if (sh->scales) m->release(sh->scales, tiled * size_t(K) / 64 * sizeof(bf16));
+  *sh = SignHead{};
+}
+
 }  // namespace
 
 // Option head_fp8: the target's logits from an e4m3 copy of the head (half
@@ -335,8 +343,9 @@ void make_head_w12(flyx_bmodel* m) {
 // they were made from computes the same bits), then the certified head's e4m3
 // copy (the whole head chooses: the same tokens), then an NVFP4 copy drafts read
 // (option draft_head=full; drafts from the bf16 head: other drafts, the same
-// output, a draft being kept only when it is the target's choice).  Nothing that
-// changes a result goes: head_fp8's copy, the user's choice, stays.
+// output, a draft being kept only when it is the target's choice), and finally
+// the 1-bit SignHead draft copy (h.coarse; drafts fall back to the full head).
+// Nothing that changes a result goes: head_fp8's copy, the user's choice, stays.
 uint64_t trim(flyx_bmodel* m, uint64_t bytes) {
   try {
     CK(cudaDeviceSynchronize());
@@ -372,122 +381,154 @@ uint64_t trim(flyx_bmodel* m, uint64_t bytes) {
       h.draft = Lin{};
       if (m->verbose) std::fprintf(stderr, "flyx-cuda: the NVFP4 draft head given back: drafts read the bf16 head\n");
     });
+    if (before - m->bytes >= bytes) return before - m->bytes;
+    const size_t pre_coarse = m->bytes;
+    heads([&](HeadBlock& h) {
+      if (h.coarse.bits || h.coarse.scales) release_sign_head(m, &h.coarse, h.vocab, h.hidden);
+    });
+    if (m->verbose && pre_coarse != m->bytes)
+      std::fprintf(stderr, "flyx-cuda: 1-bit draft head given back (%.2f GB): drafts read the full head\n",
+                   double(pre_coarse - m->bytes) / 1e9);
     return before - m->bytes;
   } catch (const std::exception&) {
     return 0;
   }
 }
 
-// A packed head's 1-bit copy for draft_pick: its rows decoded a run at a time, the copy made from them.
-void make_packed_draft_head(flyx_bmodel* m, HeadBlock& h) {
-  const size_t tiled = size_t(h.vocab + 255) / 256 * 256;  // whole tiles of 256 rows
-  h.coarse.bits = m->alloc<uint32_t>(tiled * h.hidden / 32);
-  h.coarse.scales = m->alloc<bf16>(tiled * h.hidden / 64);
-  constexpr int kRun = 1024;
-  std::vector<int> ids(kRun);
-  struct DeviceGuard {
-    void* p = nullptr;
-    ~DeviceGuard() {
-      if (p) cudaFree(p);
-    }
-  } dids_g, rows_g;
-  CK(cudaMalloc(&dids_g.p, sizeof(int) * kRun));
-  CK(cudaMalloc(&rows_g.p, sizeof(float) * size_t(kRun) * h.hidden));
-  int* dids = static_cast<int*>(dids_g.p);
-  float* rows = static_cast<float*>(rows_g.p);
-  for (int n0 = 0; n0 < h.vocab; n0 += kRun) {  // the default stream throughout: each run after the last
-    const int n = std::min(kRun, h.vocab - n0);
-    for (int i = 0; i < n; ++i) ids[size_t(i)] = n0 + i;
-    CK(cudaMemcpy(dids, ids.data(), sizeof(int) * size_t(n), cudaMemcpyHostToDevice));
-    embed_blocks(dids, h.wb, h.hidden, rows, n, 0);
-    make_sign_head_rows(rows, n0, n, h.hidden, &h.coarse, 0);
-  }
-  CK(cudaDeviceSynchronize());
-  if (m->verbose)
-    std::fprintf(stderr, "flyx-cuda: drafts pick from a 1-bit copy of the packed head (%.2f GB)\n",
-                 sign_head_bytes(h.vocab, h.hidden) / 1e9);
-}
+namespace {
 
-// The DFlash2 drafter's projections: an NVFP4 copy with an NVFP4 target (drafted against a BF16 target they lost
-// 9% of their acceptance, more than the shorter rounds win back: -2.6%; NVFP4 target +9.6%), a Q8_0 copy with a
-// target of GGML block weights (the 27B's drafter reads 3.3 GB of bf16 a round, 3.5 to 3.9 ms of a 24 ms round on
-// an RTX 5090), else bf16.  The target's MLPs say what it is (the MTP layer's, quantized here too, does not count).
-void make_dflash_weights(flyx_bmodel* m) {
-  bool target_fp4 = false, target_packed = false;
+enum class TargetQuant { kFloat, kNvfp4, kPacked };
+
+// Target precision from its own MLP layers (excluding MTP's own MLP, which is quantized separately).
+TargetQuant target_quant_kind(const flyx_bmodel* m) {
+  bool fp4 = false, packed = false;
   const int mtp_mlp = m->mtp_block >= 0 ? block<MtpBlock>(m, m->mtp_block).mlp : -1;
   for (size_t i = 0; i < m->blocks.size(); ++i)
     if (const auto* f = std::get_if<MlpBlock>(&m->blocks[i]); f && int(i) != mtp_mlp) {
-      target_fp4 = target_fp4 || f->w_gu.q;
-      target_packed = target_packed || f->w_gu.packed();
+      fp4 = fp4 || f->w_gu.q;
+      packed = packed || f->w_gu.packed();
     }
-  if (!target_fp4 && !target_packed) return;
-  auto copy = [&](Lin& l, int N, int K) { target_fp4 ? quantize_in_place(m, l, N, K) : q8_in_place(m, l, N, K); };
-  auto& d = block<DFlashBlock>(m, m->dflash_block);
-  const int H = d.hidden, TG = d.conv_taps * (H / d.conv_group), nqkv = (d.nh + 2 * d.nkv) * d.hd;
-  for (int j = 0; j < d.layers(); ++j) {
-    auto& l = block<DFlashLayer>(m, d.first_layer + j);
-    copy(l.attn_proj, 2 * TG, H);
-    copy(l.w_qkv, nqkv, H);
-    copy(l.w_o, H, d.nh * d.hd);
-    copy(l.mlp_proj, 2 * TG, H);
-    copy(l.w_gu, 2 * d.inter, H);
-    copy(l.w_down, H, d.inter);
-  }
-  copy(d.fc, H, d.n_taps * d.target_hidden);
-  copy(d.ctx, d.ctx_width(), H);
-  copy(d.sel_hid, d.sel_rank, H);
+  return fp4 ? TargetQuant::kNvfp4 : packed ? TargetQuant::kPacked : TargetQuant::kFloat;
 }
 
-void make_draft_weights(flyx_bmodel* m) {
-  if (m->mtp_block < 0 && m->dflash_block < 0) return;
-  auto& h = block<HeadBlock>(m, m->head_block);
-  if (m->dflash_block >= 0 && !m->opt.exact_drafts) make_dflash_weights(m);
-  if (h.wb.data) {  // a packed head: draft_pick_blocks, or read as it is
-    if (!m->opt.exact_drafts && !m->opt.full_draft_head && h.hidden % 128 == 0 && h.vocab >= kDraftPickFloats)
-      make_packed_draft_head(m, h);
-    if (!m->opt.exact_drafts && m->mtp_block >= 0) {
-      auto& b = block<MtpBlock>(m, m->mtp_block);
-      auto& a = block<AttnBlock>(m, b.attn);
-      auto& f = block<MlpBlock>(m, b.mlp);
-      const size_t before = m->bytes;
-      auto q_mtp = [&](Lin& l, int N, int K) {
-        if (l.packed()) quantize_packed_in_place(m, l, N, K);
-        else quantize_in_place(m, l, N, K);
-      };
-      q_mtp(b.fc, a.hidden, 2 * a.hidden);
-      q_mtp(a.w_in, a.n_in(), a.hidden);
-      q_mtp(a.w_out, a.hidden, a.nh * a.hd);
-      q_mtp(f.w_gu, 2 * f.inter, f.hidden);
-      q_mtp(f.w_down, f.hidden, f.inter);
-      if (m->verbose && m->bytes != before)
-        std::fprintf(stderr, "flyx-cuda: MTP layer -> NVFP4 (VRAM delta %+.2f GB)\n",
-                     double(int64_t(m->bytes) - int64_t(before)) / 1e9);
-    }
-    return;
+// Unified 1-bit SignHead builder for either a bf16 matrix (w) or a packed GGML BlockMat (wb).
+// Returns false without throwing if the GPU lacks room (caller falls back cleanly to the full matrix).
+bool make_sign_head_for(flyx_bmodel* m, const bf16* w, const BlockMat* wb, int N, int K, SignHead* out,
+                        const char* what) {
+  if ((!w && !(wb && wb->data)) || N < kDraftPickFloats || K % 128 != 0) return false;
+  const size_t tiled = size_t(N + 255) / 256 * 256;  // whole tiles of 256 rows
+  try {
+    out->bits = m->alloc<uint32_t>(tiled * size_t(K) / 32);
+    out->scales = m->alloc<bf16>(tiled * size_t(K) / 64);
+  } catch (const OutOfDeviceMemory& e) {
+    release_sign_head(m, out, N, K);
+    if (m->verbose)
+      std::fprintf(stderr, "flyx-cuda: no room for 1-bit %s (%.0f MiB: %s); reading full matrix\n", what,
+                   sign_head_bytes(N, K) / 1048576.0, e.what());
+    return false;
   }
-  if (m->opt.exact_drafts || !h.w || h.hidden % 32 != 0) return;
-  if (!m->opt.full_draft_head && h.hidden % 128 == 0 && h.hidden <= 4096 && h.vocab >= kDraftPickFloats) {
-    // Drafts from draft_pick: a 1-bit copy picks candidates,
-    // the bf16 rows score them; no NVFP4 copy of the head.
-    const size_t rows = size_t(h.vocab + 255) / 256 * 256;  // whole tiles of 256 rows
-    h.coarse.bits = m->alloc<uint32_t>(rows * h.hidden / 32);
-    h.coarse.scales = m->alloc<bf16>(rows * h.hidden / 64);
-    make_sign_head(h.w, h.vocab, h.hidden, &h.coarse, 0);
+  if (w) {
+    make_sign_head(w, N, K, out, 0);
   } else {
+    constexpr int kRun = 1024;
+    std::vector<int> ids(kRun);
+    struct DeviceGuard {
+      void* p = nullptr;
+      ~DeviceGuard() {
+        if (p) cudaFree(p);
+      }
+    } dids_g, rows_g;
+    if (cudaMalloc(&dids_g.p, sizeof(int) * kRun) != cudaSuccess ||
+        cudaMalloc(&rows_g.p, sizeof(float) * size_t(kRun) * size_t(K)) != cudaSuccess) {
+      cudaGetLastError();
+      release_sign_head(m, out, N, K);
+      return false;
+    }
+    int* dids = static_cast<int*>(dids_g.p);
+    float* rows = static_cast<float*>(rows_g.p);
+    for (int n0 = 0; n0 < N; n0 += kRun) {  // the default stream throughout: each run after the last
+      const int n = std::min(kRun, N - n0);
+      for (int i = 0; i < n; ++i) ids[size_t(i)] = n0 + i;
+      CK(cudaMemcpy(dids, ids.data(), sizeof(int) * size_t(n), cudaMemcpyHostToDevice));
+      embed_blocks(dids, *wb, K, rows, n, 0);
+      make_sign_head_rows(rows, n0, n, K, out, 0);
+    }
+  }
+  CK(cudaDeviceSynchronize());
+  if (m->verbose)
+    std::fprintf(stderr, "flyx-cuda: 1-bit %s (%.1f MB) for two-stage draft screening\n", what,
+                 sign_head_bytes(N, K) / 1e6);
+  return true;
+}
+
+// Quantize MTP's single sequential layer to NVFP4 (both BF16 and Q8_0/packed checkpoints).
+void quantize_mtp_weights(flyx_bmodel* m) {
+  if (m->mtp_block < 0) return;
+  auto& b = block<MtpBlock>(m, m->mtp_block);
+  auto& a = block<AttnBlock>(m, b.attn);
+  auto& f = block<MlpBlock>(m, b.mlp);
+  const size_t before = m->bytes;
+  auto q_mtp = [&](Lin& l, int N, int K) {
+    if (l.packed()) quantize_packed_in_place(m, l, N, K);
+    else quantize_in_place(m, l, N, K);
+  };
+  q_mtp(b.fc, a.hidden, 2 * a.hidden);
+  q_mtp(a.w_in, a.n_in(), a.hidden);
+  q_mtp(a.w_out, a.hidden, a.nh * a.hd);
+  q_mtp(f.w_gu, 2 * f.inter, f.hidden);
+  q_mtp(f.w_down, f.hidden, f.inter);
+  if (m->verbose && m->bytes != before)
+    std::fprintf(stderr, "flyx-cuda: MTP layer -> NVFP4 (VRAM delta %+.2f GB)\n",
+                 double(int64_t(m->bytes) - int64_t(before)) / 1e9);
+}
+
+// Shared block-drafter weight policy (DFlash2 and future parallel block drafters): quantize BF16 projections to
+// NVFP4 beside an NVFP4 target (drafted against a BF16 target NVFP4 lost 9% acceptance, -2.6% overall; NVFP4 target
+// +9.6%) or Q8_0 beside GGML block weights (the 27B's drafter reads 3.3 GB of bf16 a round), leaving already-quantized
+// block drafters intact.
+void quantize_block_drafter_weights(flyx_bmodel* m, TargetQuant tq) {
+  if (tq == TargetQuant::kFloat) return;
+  auto copy = [&](Lin& l, int N, int K) {
+    if (tq == TargetQuant::kNvfp4) quantize_in_place(m, l, N, K);
+    else q8_in_place(m, l, N, K);
+  };
+  if (m->dflash_block >= 0) {
+    auto& d = block<DFlashBlock>(m, m->dflash_block);
+    const int H = d.hidden, TG = d.conv_taps * (H / d.conv_group), nqkv = (d.nh + 2 * d.nkv) * d.hd;
+    for (int j = 0; j < d.layers(); ++j) {
+      auto& l = block<DFlashLayer>(m, d.first_layer + j);
+      copy(l.attn_proj, 2 * TG, H);
+      copy(l.w_qkv, nqkv, H);
+      copy(l.w_o, H, d.nh * d.hd);
+      copy(l.mlp_proj, 2 * TG, H);
+      copy(l.w_gu, 2 * d.inter, H);
+      copy(l.w_down, H, d.inter);
+    }
+    copy(d.fc, H, d.n_taps * d.target_hidden);
+    copy(d.ctx, d.ctx_width(), H);
+    copy(d.sel_hid, d.sel_rank, H);
+  }
+}
+
+}  // namespace
+
+void make_draft_weights(flyx_bmodel* m) {
+  if (m->opt.exact_drafts || (m->mtp_block < 0 && m->dflash_block < 0)) return;
+  // Quantize drafter layers first so freed VRAM is available for optional 1-bit SignHead copies.
+  quantize_mtp_weights(m);
+  quantize_block_drafter_weights(m, target_quant_kind(m));
+
+  auto& h = block<HeadBlock>(m, m->head_block);
+  const bool want_sign =
+      !m->opt.full_draft_head && h.hidden % 128 == 0 && h.vocab >= kDraftPickFloats && (h.wb.data || h.hidden <= 4096);
+  if (want_sign && (h.wb.data || h.w)) {
+    make_sign_head_for(m, h.wb.data ? nullptr : h.w, h.wb.data ? &h.wb : nullptr, h.vocab, h.hidden, &h.coarse,
+                       "draft head");
+  } else if (!h.wb.data && h.w && h.hidden % 32 == 0) {
     h.draft.q = m->alloc<uint8_t>(size_t(h.vocab) * h.hidden / 2);
     h.draft.s = m->alloc<uint8_t>(size_t(h.vocab) * h.hidden / 16);
     h.draft.rs = m->alloc<float>(h.vocab);
     quantize_nvfp4(h.w, h.vocab, h.hidden, h.draft.q, h.draft.s, h.draft.rs, 0);
-  }
-  if (m->mtp_block >= 0) {
-    auto& b = block<MtpBlock>(m, m->mtp_block);
-    auto& a = block<AttnBlock>(m, b.attn);
-    auto& f = block<MlpBlock>(m, b.mlp);
-    quantize_in_place(m, b.fc, a.hidden, 2 * a.hidden);
-    quantize_in_place(m, a.w_in, a.n_in(), a.hidden);
-    quantize_in_place(m, a.w_out, a.hidden, a.nh * a.hd);
-    quantize_in_place(m, f.w_gu, 2 * f.inter, f.hidden);
-    quantize_in_place(m, f.w_down, f.hidden, f.inter);
   }
 }
 
