@@ -323,6 +323,43 @@ void test_mrope() {
     expect(std::string("mrope 3D K ") + (interleaved ? "interleaved" : "contiguous"),
            down_f16(Kc + size_t(ctx) * nkv * hd, want_k.size()), want_k, 2e-3);
 
+    // FP8 KV (Compact=true) 3D MRoPE path
+    {
+      uint8_t *K8 = dev<uint8_t>(size_t(ctx + rows) * nkv * hd), *V8 = dev<uint8_t>(size_t(ctx + rows) * nkv * hd);
+      float *Ks = dev<float>(size_t(ctx + rows) * nkv), *Vs = dev<float>(size_t(ctx + rows) * nkv);
+      float* dq8 = dev<float>(want_q.size());
+      attn_prep(dqkv, ld, 0, nh * hd, (nh + nkv) * hd, dqn, dkn, 1.f, float(eps), theta, rot, nh, nkv, hd, rows, dP,
+                kPosPosition, false, dq8, KvRef{K8, V8, Ks, Vs}, 0, 0, nullptr, 0, CanvasKeys{}, mr);
+      expect(std::string("mrope 3D fp8 Q ") + (interleaved ? "interleaved" : "contiguous"),
+             down(dq8, want_q.size()), want_q, 1e-5);
+      std::vector<uint8_t> hK8(size_t(rows) * nkv * hd);
+      std::vector<float> hKs(size_t(rows) * nkv);
+      CK(cudaMemcpy(hK8.data(), K8 + size_t(ctx) * nkv * hd, hK8.size(), cudaMemcpyDeviceToHost));
+      CK(cudaMemcpy(hKs.data(), Ks + size_t(ctx) * nkv, hKs.size() * 4, cudaMemcpyDeviceToHost));
+      double worst = 0.0;
+      for (int r = 0; r < rows; ++r) {
+        for (int j = 0; j < nkv; ++j) {
+          const double* krow = &want_k[(size_t(r) * nkv + j) * hd];
+          double ka = 0.0;
+          for (int d = 0; d < hd; ++d) ka = std::max(ka, std::fabs(krow[d]));
+          const double sc = double(hKs[size_t(r) * nkv + j]);
+          for (int d = 0; d < hd; ++d) {
+            const double got = ops::e4m3_to_double(hK8[(size_t(r) * nkv + j) * hd + d]) * sc;
+            worst = std::max(worst, std::fabs(got - krow[d]) / (std::fabs(krow[d]) / 16.0 + ka / 448.0 / 8.0 + 1e-30));
+          }
+        }
+      }
+      const bool ok_fp8 = worst <= 1.0;
+      std::printf("  %-4s mrope 3D fp8 K %-11s (error / half step %.3f, limit 1)\n", ok_fp8 ? "ok" : "FAIL",
+                  interleaved ? "interleaved" : "contiguous", worst);
+      if (!ok_fp8) ++g_fail;
+      cudaFree(K8);
+      cudaFree(V8);
+      cudaFree(Ks);
+      cudaFree(Vs);
+      cudaFree(dq8);
+    }
+
     // Scalar rope_delta path (decode after multimodal prefill: pos_3d == nullptr, P->rope_delta = -7)
     DevParams phost{};
     phost.position = ctx;

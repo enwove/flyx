@@ -29,7 +29,7 @@ extern "C" {
  * the structs (python/flyx/__init__.py) carries the number it was written
  * for and refuses a library that answers another, rather than reading a
  * struct laid out differently from the one it writes. */
-#define FLYX_API_VERSION 3u  /* 3: added mmproj_file and no_vision to flyx_load_options */
+#define FLYX_API_VERSION 3u  /* 3: added mmproj_file, no_vision, vision_device, vision_quant, vision_max_tokens to flyx_load_options */
 FLYX_API uint32_t flyx_api_version(void);
 
 typedef struct flyx_engine flyx_engine;

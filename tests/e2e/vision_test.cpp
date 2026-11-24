@@ -23,6 +23,7 @@
 #include "core/render/chat_json.h"
 #include "core/session/store.h"
 #include "core/vision/image.h"
+#include "core/vision/media_span.h"
 #include "flyx/backend_abi.h"
 #include "models/vision/preprocess.h"
 #include "ops/dtype/ref.h"
@@ -98,12 +99,32 @@ uint16_t f32_to_bf16(float x) {
   return uint16_t(u >> 16);
 }
 
+// Build an uncompressed 32-bit BGRA TGA image in memory (top-left origin).
+std::vector<uint8_t> make_rgba_tga(int w, int h, uint8_t r, uint8_t g, uint8_t b, uint8_t a) {
+  std::vector<uint8_t> out(18 + size_t(w) * size_t(h) * 4, 0);
+  out[2] = 2;  // uncompressed true-color
+  out[12] = uint8_t(w & 0xff);
+  out[13] = uint8_t((w >> 8) & 0xff);
+  out[14] = uint8_t(h & 0xff);
+  out[15] = uint8_t((h >> 8) & 0xff);
+  out[16] = 32;  // 32 bpp BGRA
+  out[17] = 0x28;  // top-left origin, 8-bit alpha
+  for (int i = 0; i < w * h; ++i) {
+    out[18 + size_t(i) * 4 + 0] = b;
+    out[18 + size_t(i) * 4 + 1] = g;
+    out[18 + size_t(i) * 4 + 2] = r;
+    out[18 + size_t(i) * 4 + 3] = a;
+  }
+  return out;
+}
+
 void test_image_and_cache() {
   const auto red_bmp = make_bmp(8, 8, 220, 30, 10);
   const auto blue_bmp = make_bmp(8, 8, 10, 40, 230);
   ImageInput img_r, img_b;
   std::string err;
-  CHECK(vision::make_image_from_bytes(red_bmp, "image/bmp", "", &img_r, &err), err);
+  CHECK(vision::make_image_from_bytes(red_bmp, "image/bmp", "HIGH", &img_r, &err), err);
+  CHECK(img_r.detail == "high", "make_image_from_bytes must canonicalize detail case-insensitively");
   CHECK(vision::make_image_from_bytes(blue_bmp, "image/bmp", "", &img_b, &err), err);
   CHECK(img_r.sha256 != img_b.sha256, "distinct images must produce distinct SHA-256 hashes");
 
@@ -112,11 +133,45 @@ void test_image_and_cache() {
   CHECK(rgb.width == 8 && rgb.height == 8 && rgb.rgb.size() == 8 * 8 * 3, "decoded BMP size mismatch");
   CHECK(rgb.rgb[0] == 220 && rgb.rgb[1] == 30 && rgb.rgb[2] == 10, "decoded RGB values mismatch");
 
-  // Data URI parsing & remote URL rejection.
+  // Alpha compositing onto white background (prevents transparent PNG/TGA black-halo regression).
+  {
+    const auto clear_tga = make_rgba_tga(4, 4, 200, 10, 20, 0);
+    interfaces::RgbImage alpha0;
+    CHECK(vision::decode_image_bytes(clear_tga.data(), clear_tga.size(), &alpha0, &err), err);
+    CHECK(alpha0.rgb[0] == 255 && alpha0.rgb[1] == 255 && alpha0.rgb[2] == 255,
+          "fully transparent pixel must composite to white");
+    const auto half_tga = make_rgba_tga(4, 4, 200, 0, 0, 128);
+    interfaces::RgbImage alpha50;
+    CHECK(vision::decode_image_bytes(half_tga.data(), half_tga.size(), &alpha50, &err), err);
+    // (200 * 128 + 255 * 127 + 127) / 255 = 227; (0 * 128 + 255 * 127 + 127) / 255 = 127
+    CHECK(std::abs(int(alpha50.rgb[0]) - 227) <= 1 && std::abs(int(alpha50.rgb[1]) - 127) <= 1 &&
+              std::abs(int(alpha50.rgb[2]) - 127) <= 1,
+          "semi-transparent pixel must alpha-composite onto white");
+  }
+
+  // Strict base64 validation (stray char, bad padding, non-zero trailing bits).
+  {
+    std::vector<uint8_t> raw;
+    CHECK(vision::decode_base64("AA==", &raw, &err) && raw.size() == 1 && raw[0] == 0, "valid AA== base64");
+    CHECK(!vision::decode_base64("A", &raw, &err), "stray single base64 char must fail");
+    CHECK(!vision::decode_base64("===", &raw, &err), "excess padding must fail");
+    CHECK(!vision::decode_base64("AA=A", &raw, &err), "data after '=' padding must fail");
+    CHECK(!vision::decode_base64("AB==", &raw, &err), "non-zero trailing 4 bits in == must fail");
+    CHECK(!vision::decode_base64("ABD=", &raw, &err), "non-zero trailing 2 bits in = must fail");
+  }
+
+  // Data URI parsing (RFC 2397 parameters) & malformed/remote URI rejection.
   ImageInput parsed;
   const std::string uri = "data:image/bmp;base64," + encode_b64(red_bmp);
   CHECK(vision::parse_image_data_uri(uri, &parsed, &err), err);
   CHECK(parsed.sha256 == img_r.sha256, "data URI round-trip SHA-256 mismatch");
+  CHECK(vision::parse_image_data_uri("data:image/bmp;charset=utf-8;BASE64," + encode_b64(red_bmp), &parsed, &err),
+        "RFC 2397 parameter before ;base64 must succeed");
+  CHECK(parsed.mime == "image/bmp" && parsed.sha256 == img_r.sha256, "RFC 2397 MIME extraction mismatch");
+  CHECK(!vision::parse_image_data_uri("data:image/bmp;base64foo," + encode_b64(red_bmp), &parsed, &err),
+        "substring ;base64foo must be rejected");
+  CHECK(!vision::parse_image_data_uri("data:image/bmp;base64;extra=1," + encode_b64(red_bmp), &parsed, &err),
+        ";base64 not as final parameter must be rejected");
   CHECK(!vision::parse_image_data_uri("https://example.com/a.png", &parsed, &err), "remote URL must be rejected");
   CHECK(!vision::parse_image_data_uri("data:text/plain;base64,aGk=", &parsed, &err), "non-image MIME must be rejected");
 
@@ -145,65 +200,103 @@ void test_chat_json_and_media_prefix() {
   const std::string b64_b = encode_b64(blue_bmp);
   std::string err;
 
-  // OpenAI image_url
+  // OpenAI image_url (valid detail canonicalization, invalid detail, disallowed roles)
   {
     ojson msgs = ojson::array({{{"role", "user"},
                                 {"content", ojson::array({
                                                 {{"type", "image_url"},
                                                  {"image_url", {{"url", "data:image/bmp;base64," + b64_r},
-                                                                {"detail", "low"}}}},
+                                                                {"detail", "LOW"}}}},
                                                 {{"type", "text"}, {"text", "describe"}},
                                             })}}});
     std::vector<ChatMessage> out;
     CHECK(messages_from_openai(msgs, &out, &err), err);
     CHECK(out.size() == 1 && out[0].parts.size() == 2, "OpenAI multimodal parts count");
     CHECK(out[0].parts[0].kind == ContentPart::kImage && out[0].parts[0].image->detail == "low", "OpenAI image detail");
+
+    ojson bad_detail = ojson::array({{{"role", "user"},
+                                      {"content", ojson::array({{{"type", "image_url"},
+                                                                 {"image_url", {{"url", "data:image/bmp;base64," + b64_r},
+                                                                                {"detail", "ultra"}}}}})}}});
+    CHECK(!messages_from_openai(bad_detail, &out, &err), "OpenAI invalid detail must be rejected");
+
+    for (const char* role : {"system", "assistant"}) {
+      ojson bad_role = ojson::array({{{"role", role},
+                                      {"content", ojson::array({{{"type", "image_url"},
+                                                                 {"image_url", {{"url", "data:image/bmp;base64," + b64_r}}}}})}}});
+      CHECK(!messages_from_openai(bad_role, &out, &err), std::string("OpenAI image in ") + role + " must be rejected");
+    }
   }
-  // OpenAI Responses input_image
+  // OpenAI Responses input_image & role/detail validation
   {
     ojson items = ojson::array({{{"type", "message"},
                                  {"role", "user"},
                                  {"content", ojson::array({
-                                                 {{"type", "input_image"}, {"image_url", "data:image/bmp;base64," + b64_b}},
+                                                 {{"type", "input_image"},
+                                                  {"image_url", "data:image/bmp;base64," + b64_b},
+                                                  {"detail", "High"}},
                                                  {{"type", "input_text"}, {"text", "hi"}},
                                              })}}});
     std::vector<ChatMessage> out;
     CHECK(messages_from_responses("", items, &out, &err), err);
-    CHECK(out.size() == 1 && out[0].parts.size() == 2 && out[0].parts[0].kind == ContentPart::kImage,
+    CHECK(out.size() == 1 && out[0].parts.size() == 2 && out[0].parts[0].kind == ContentPart::kImage &&
+              out[0].parts[0].image->detail == "high",
           "Responses input_image parse");
+    ojson bad_role = ojson::array({{{"type", "message"},
+                                    {"role", "assistant"},
+                                    {"content", ojson::array({{{"type", "input_image"},
+                                                               {"image_url", "data:image/bmp;base64," + b64_b}}})}}});
+    CHECK(!messages_from_responses("", bad_role, &out, &err), "Responses image in assistant must be rejected");
+    ojson bad_detail = ojson::array({{{"type", "message"},
+                                      {"role", "user"},
+                                      {"content", ojson::array({{{"type", "input_image"},
+                                                                 {"image_url", "data:image/bmp;base64," + b64_b},
+                                                                 {"detail", "huge"}}})}}});
+    CHECK(!messages_from_responses("", bad_detail, &out, &err), "Responses invalid detail must be rejected");
   }
-  // Anthropic image & empty source rejection
+  // Anthropic image, cache_control on image block, non-image media_type & empty source rejection
   {
     ojson req = {{"messages", ojson::array({{{"role", "user"},
                                              {"content", ojson::array({
                                                              {{"type", "image"},
                                                               {"source", {{"type", "base64"},
                                                                           {"media_type", "image/bmp"},
-                                                                          {"data", b64_r}}}},
+                                                                          {"data", b64_r}}},
+                                                              {"cache_control", {{"type", "ephemeral"}}}},
                                                              {{"type", "text"}, {"text", "what?"}},
                                                          })}}})}};
     std::vector<ChatMessage> out;
     std::vector<ojson> tools;
-    CHECK(chat_from_anthropic(req, &out, &tools, &err), err);
+    std::vector<ChatCachePoint> cps;
+    CHECK(chat_from_anthropic(req, &out, &tools, &err, false, nullptr, &cps), err);
     CHECK(out.size() == 1 && out[0].parts.size() == 2 && out[0].parts[0].kind == ContentPart::kImage,
           "Anthropic image parse");
+    CHECK(cps.size() == 1 && cps[0].messages == 1 && cps[0].parts == 1,
+          "Anthropic cache_control on image block must record part prefix");
 
     ojson bad = {{"messages", ojson::array({{{"role", "user"},
                                              {"content", ojson::array({{{"type", "image"}, {"source", ojson::object()}}})}}})}};
     CHECK(!chat_from_anthropic(bad, &out, &tools, &err), "Anthropic empty image source must be rejected");
+
+    ojson bad_mime = {{"messages", ojson::array({{{"role", "user"},
+                                                  {"content", ojson::array({{{"type", "image"},
+                                                                             {"source", {{"type", "base64"},
+                                                                                         {"media_type", "application/pdf"},
+                                                                                         {"data", b64_r}}}}})}}})}};
+    CHECK(!chat_from_anthropic(bad_mime, &out, &tools, &err), "Anthropic non-image media_type must be rejected");
   }
   // MediaSpan prefix collision safety
   {
     const std::vector<int32_t> toks = {1, 2, 100, 100, 100, 100, 3, 4};
     interfaces::MediaSpan m1{2, 4, vision::sha256_bytes(red_bmp.data(), red_bmp.size()), {1, 4, 4}, 4, {}};
     interfaces::MediaSpan m2{2, 4, vision::sha256_bytes(blue_bmp.data(), blue_bmp.size()), {1, 4, 4}, 4, {}};
-    CHECK(interfaces::media_prefix_match(toks, {m1}, toks, {m1}) == 8, "identical media spans must match full length");
-    CHECK(interfaces::media_prefix_match(toks, {m1}, toks, {m2}) == 2,
+    CHECK(vision::media_prefix_match(toks, {m1}, toks, {m1}) == 8, "identical media spans must match full length");
+    CHECK(vision::media_prefix_match(toks, {m1}, toks, {m2}) == 2,
           "different images with identical placeholder tokens must clamp before span");
-    CHECK(!interfaces::media_prefix_equal(toks, {m1}, toks, {m2}), "different images must not compare equal");
+    CHECK(!vision::media_prefix_equal(toks, {m1}, toks, {m2}), "different images must not compare equal");
     // Truncating mid-span must clamp before span start.
     const std::vector<int32_t> half = {1, 2, 100, 100};
-    CHECK(interfaces::media_prefix_match(toks, {m1}, half, {}) == 2, "must never split inside MediaSpan");
+    CHECK(vision::media_prefix_match(toks, {m1}, half, {}) == 2, "must never split inside MediaSpan");
   }
   // Qwen35VisionAdapter preprocessing & 3D MRoPE positions
   {
@@ -241,6 +334,34 @@ void test_chat_json_and_media_prefix() {
     CHECK(pp.pos_3d[12] == 1 && pp.pos_3d[13] == 2 && pp.pos_3d[14] == 2, "pos_3d last patch");
     CHECK(pp.pos_3d[15] == 3 && pp.pos_3d[16] == 3 && pp.pos_3d[17] == 3, "pos_3d post-image");
     CHECK(pp.rope_delta == -2, "rope_delta expected -2");
+    CHECK(pp.pos_rope_deltas.size() == prompt.size() + 1 && pp.pos_rope_deltas[0] == 0 && pp.pos_rope_deltas[1] == 0 &&
+              pp.pos_rope_deltas[5] == -2 && pp.pos_rope_deltas[7] == -2,
+          "pos_rope_deltas prefix map mismatch");
+
+    // Two-image prompt: intermediate pos_rope_deltas after 1st image must be -2 while final is -4.
+    std::vector<int32_t> prompt2 = {10, 99, 99, 99, 99, 11, 99, 99, 99, 99, 12};
+    std::vector<interfaces::MediaSpan> sps = {{1, 4, {}, {1, 4, 4}, 4, {}}, {6, 4, {}, {1, 4, 4}, 4, {}}};
+    auto pp2 = adapter.build_positions(prompt2, sps);
+    CHECK(pp2.rope_delta == -4 && pp2.pos_rope_deltas.size() == prompt2.size() + 1 && pp2.pos_rope_deltas[5] == -2 &&
+              pp2.pos_rope_deltas[6] == -2 && pp2.pos_rope_deltas[10] == -4 && pp2.pos_rope_deltas[11] == -4,
+          "two-image pos_rope_deltas mismatch");
+
+    // smart_resize_dims strict budget enforcement under extreme aspect ratio and small max_tokens (< 64).
+    {
+      interfaces::RgbImage wide;
+      wide.width = 2000;
+      wide.height = 20;
+      wide.rgb.assign(size_t(wide.width) * size_t(wide.height) * 3, 64);
+      interfaces::PreparedMedia pm_wide;
+      CHECK(adapter.preprocess(wide, 16, &pm_wide, &err), err);
+      CHECK(pm_wide.n_embeds <= 16, "extreme aspect ratio + small max_tokens must not exceed budget");
+
+      interfaces::RgbImage too_wide;
+      too_wide.width = 2010;
+      too_wide.height = 10;
+      too_wide.rgb.assign(size_t(too_wide.width) * size_t(too_wide.height) * 3, 64);
+      CHECK(!adapter.preprocess(too_wide, 256, &pm_wide, &err), "aspect ratio > 200:1 must be rejected");
+    }
   }
   std::printf("  ok   multimodal JSON parsing, MediaSpan prefix safety, Qwen35VisionAdapter\n");
 }
@@ -340,7 +461,10 @@ struct TinyVlm {
     views.reserve(64);
   }
 
-  explicit TinyVlm(bool prequant_q8_vision = false, bool include_vision = true) {
+  bool has_gdn = false;
+
+  explicit TinyVlm(bool prequant_q8_vision = false, bool include_vision = true, bool include_gdn = false)
+      : has_gdn(include_gdn) {
     finalize_views();
     // LLM weights
     const int w_emb = add_bf16(kV, kH, 0.25f);
@@ -357,6 +481,17 @@ struct TinyVlm {
     const int w_down = add_bf16(kH, kInter, 0.08f);
     const int w_fnorm = add_f32(kH, 0, 0.05f, 0.f);
     const int w_head = add_bf16(kV, kH, 0.15f);
+    // Optional GDN block weights (nk=1, nv=1, dk=128, dv=128, conv=4 -> triggers prefill_align=64 on CUDA)
+    const int w_gnorm = include_gdn ? add_f32(kH, 0, 0.05f, 0.f) : -1;
+    const int w_gqkv = include_gdn ? add_bf16(3 * 128, kH, 0.06f) : -1;
+    const int w_gz = include_gdn ? add_bf16(128, kH, 0.06f) : -1;
+    const int w_gb = include_gdn ? add_bf16(1, kH, 0.06f) : -1;
+    const int w_ga = include_gdn ? add_bf16(1, kH, 0.06f) : -1;
+    const int w_gout = include_gdn ? add_bf16(kH, 128, 0.06f) : -1;
+    const int w_gconv = include_gdn ? add_f32(3 * 128, 4, 0.05f, 0.f) : -1;
+    const int w_galog = include_gdn ? add_f32(1, 0, 0.05f, -1.f) : -1;
+    const int w_gdt = include_gdn ? add_f32(1, 0, 0.05f, 0.f) : -1;
+    const int w_gonorm = include_gdn ? add_f32(128, 0, 0.05f, 1.f) : -1;
     // MTP weights
     const int w_mtp_en = add_f32(kH, 0, 0.05f, 0.f);
     const int w_mtp_hn = add_f32(kH, 0, 0.05f, 0.f);
@@ -417,6 +552,17 @@ struct TinyVlm {
     s_ring.kind = FLYX_STATE_RING;
     s_ring.width = kH;
     states = {s_kv, s_mkv, s_ring};
+    if (include_gdn) {
+      flyx_state s_gdn{};
+      s_gdn.kind = FLYX_STATE_GDN;
+      s_gdn.nk = 1;
+      s_gdn.nv = 1;
+      s_gdn.dk = 128;
+      s_gdn.dv = 128;
+      s_gdn.conv = 4;
+      s_gdn.head_order = FLYX_GDN_HEADS_GROUPED;
+      states.push_back(s_gdn);
+    }
 
     auto make_norm = [](int32_t w, double offset = 1.0, double eps = 1e-6) {
       flyx_norm n{};
@@ -601,6 +747,30 @@ struct TinyVlm {
       b.vision_merge.fc2_b = w_vm_fc2_b;
       blocks.push_back(b);
     }
+    if (include_gdn) {
+      b = {};
+      b.kind = FLYX_BLOCK_GDN;
+      b.gdn.hidden = kH;
+      b.gdn.nk = 1;
+      b.gdn.nv = 1;
+      b.gdn.dk = 128;
+      b.gdn.dv = 128;
+      b.gdn.conv = 4;
+      b.gdn.norm = make_norm(w_gnorm);
+      b.gdn.out_norm = make_norm(w_gonorm, 0.0, 1e-6);
+      b.gdn.qkv = w_gqkv;
+      b.gdn.z = w_gz;
+      b.gdn.b = w_gb;
+      b.gdn.a = w_ga;
+      b.gdn.out = w_gout;
+      b.gdn.conv_w = w_gconv;
+      b.gdn.A_log = w_galog;
+      b.gdn.dt_bias = w_gdt;
+      b.gdn.state = 3;
+      b.gdn.head_order = FLYX_GDN_HEADS_GROUPED;
+      b.gdn.decay = FLYX_GDN_DECAY_LOG;
+      blocks.push_back(b);
+    }
 
     desc = {kH, kV, int32_t(weights.size()), int32_t(states.size()), int32_t(blocks.size()),
             weights.data(), states.data(), blocks.data()};
@@ -670,9 +840,13 @@ BackendRun run_backend_vlm(const char* name, const TinyVlm& vlm, const std::vect
   flyx_plan* vplan = nullptr;
   CHECK(api->lower(bm, &vp, &vplan) == 0, std::string(name) + " lower vision: " + api->last_error());
 
-  std::vector<flyx_node> pre_nodes = {{FLYX_NODE_RUN, 0, 0, 0}, {FLYX_NODE_RUN, 1, 0, 0}, {FLYX_NODE_RUN, 2, 0, 0},
-                                      {FLYX_NODE_CONTEXT, 6, 0, 0}, {FLYX_NODE_RUN, 3, 1, 0}};
-  flyx_program pp{FLYX_PHASE_PREFILL, 0, 64, int32_t(pre_nodes.size()), pre_nodes.data()};
+  std::vector<flyx_node> pre_nodes = {{FLYX_NODE_RUN, 0, 0, 0}};
+  if (vlm.has_gdn) pre_nodes.push_back({FLYX_NODE_RUN, 11, 0, 0});
+  pre_nodes.push_back({FLYX_NODE_RUN, 1, 0, 0});
+  pre_nodes.push_back({FLYX_NODE_RUN, 2, 0, 0});
+  pre_nodes.push_back({FLYX_NODE_CONTEXT, 6, 0, 0});
+  pre_nodes.push_back({FLYX_NODE_RUN, 3, 1, 0});
+  flyx_program pp{FLYX_PHASE_PREFILL, 0, 128, int32_t(pre_nodes.size()), pre_nodes.data()};
   flyx_plan* pplan = nullptr;
   CHECK(api->lower(bm, &pp, &pplan) == 0, std::string(name) + " lower prefill: " + api->last_error());
 
@@ -680,6 +854,7 @@ BackendRun run_backend_vlm(const char* name, const TinyVlm& vlm, const std::vect
     std::vector<flyx_node> rn;
     if (width > 0) rn.push_back({FLYX_NODE_DRAFT, 6, width, 0});
     rn.push_back({FLYX_NODE_RUN, 0, 0, 0});
+    if (vlm.has_gdn) rn.push_back({FLYX_NODE_RUN, 11, 0, 0});
     rn.push_back({FLYX_NODE_RUN, 1, 0, 0});
     rn.push_back({FLYX_NODE_RUN, 2, 0, 0});
     rn.push_back({FLYX_NODE_RUN, 3, 0, 0});
@@ -788,9 +963,11 @@ BackendRun run_backend_vlm(const char* name, const TinyVlm& vlm, const std::vect
 
   res.plain_tokens = decode_with(rplan0, false);
   res.mtp_tokens = decode_with(rplan3, false);
-  res.split_tokens = decode_with(rplan3, true);
   CHECK(res.mtp_tokens == res.plain_tokens, std::string(name) + ": Gate 4 failed (MTP != plain)");
-  CHECK(res.split_tokens == res.plain_tokens, std::string(name) + ": split multimodal prefill != whole prefill");
+  if (!vlm.has_gdn) {
+    res.split_tokens = decode_with(rplan3, true);
+    CHECK(res.split_tokens == res.plain_tokens, std::string(name) + ": split multimodal prefill != whole prefill");
+  }
 
   // 2. Checkpoint restore + SnapshotStore rope_delta persistence + collision check
   const std::vector<int32_t> followup = {21, 22, 23, 24};
@@ -857,6 +1034,102 @@ BackendRun run_backend_vlm(const char* name, const TinyVlm& vlm, const std::vect
       CHECK(res.snap_followup == res.direct_followup, std::string(name) + ": snapshot load lost rope_delta");
       api->seq_free(seq2);
     }
+    api->seq_free(seq);
+  }
+
+  // 3. Short-window rewind after multimodal turn preserves rope_delta & matches plain tokens.
+  {
+    flyx_seq* seq = nullptr;
+    CHECK(api->seq_new(bm, 128, &seq) == 0, "seq_new rewind");
+    flyx_gen_params g{};
+    g.limit = 128;
+    flyx_prefill_input in{};
+    in.tokens = prompt.data();
+    in.n = int32_t(prompt.size());
+    in.embeds = res.vision_embeds.data();
+    in.embed_rows = embed_rows;
+    in.n_embeds = 4;
+    in.pos_3d = pos_3d.data();
+    in.rope_delta = rope_delta;
+    in.set_rope_delta = 1;
+    CHECK(api->prefill_ex(pplan, seq, &in, &g) == 0, "rewind prefill_ex");
+    flyx_round_result rr{};
+    CHECK(api->read(seq, &rr) == 0, "rewind read prefill");
+    const int32_t first_tok = rr.tokens[0];
+    CHECK(first_tok == res.plain_tokens[0], "rewind first_tok mismatch");
+    CHECK(api->launch(rplan3, seq, &g) == 0, "rewind launch 1");
+    CHECK(api->read(seq, &rr) == 0, "rewind read 1");
+    CHECK(api->launch(rplan3, seq, &g) == 0, "rewind launch 2");
+    CHECK(api->read(seq, &rr) == 0, "rewind read 2");
+    // Rewind back into the first round's window (position 64 + 1 = 65, anchor = res.plain_tokens[1] after 1 emitted token).
+    CHECK(api->rewind(seq, int32_t(prompt.size()) + 1, res.plain_tokens[1]) == 1,
+          std::string(name) + ": short-window rewind after multimodal turn failed");
+    std::vector<int32_t> after_rewind = {res.plain_tokens[0], res.plain_tokens[1]};
+    while (after_rewind.size() < res.plain_tokens.size()) {
+      CHECK(api->launch(rplan3, seq, &g) == 0, "rewind re-launch");
+      CHECK(api->read(seq, &rr) == 0, "rewind re-read");
+      for (int i = 0; i < rr.n_tokens && after_rewind.size() < res.plain_tokens.size(); ++i)
+        after_rewind.push_back(rr.tokens[i]);
+    }
+    CHECK(after_rewind == res.plain_tokens, std::string(name) + ": rewind after multimodal turn changed tokens");
+    api->seq_free(seq);
+  }
+
+  // 4. Intra-pass snapshot with snap_rope_delta != pass-end rope_delta, plus FLYX_PREFILL_SNAP_NONE.
+  //    Active when the backend uses chunked prefill alignment (align > 1, e.g. hybrid GDN+Attn on CUDA).
+  if (vlm.has_gdn && std::string(name) == "cuda")
+    CHECK(api->prefill_align && api->prefill_align(bm) > 1 && (64 % api->prefill_align(bm)) == 0,
+          "hybrid GDN model on CUDA must have chunked prefill_align dividing 64");
+  if (api->prefill_snapshot && api->prefill_align && api->prefill_align(bm) > 1) {
+    // Extend prompt (64 tokens, rope_delta=-2) with a 2nd image at rows 66..69 (total 72 tokens, pass-end rope_delta=-4).
+    std::vector<int32_t> prompt2 = prompt;
+    prompt2.insert(prompt2.end(), {13, 14, 63, 63, 63, 63, 15, 16});
+    std::vector<float> embeds2 = res.vision_embeds;
+    embeds2.insert(embeds2.end(), res.vision_embeds.begin(), res.vision_embeds.end());
+    const int32_t embed_rows2[8] = {2, 3, 4, 5, 66, 67, 68, 69};
+    std::vector<int32_t> pos3d2 = pos_3d;
+    // rows 64,65: text at 62, 63; rows 66..69: image t=64, h=64..65, w=64..65; rows 70,71: text at 66, 67 -> cur=68, delta=68-72=-4
+    const int32_t tail_pos[] = {62, 62, 62, 63, 63, 63, 64, 64, 64, 64, 64, 65,
+                                64, 65, 64, 64, 65, 65, 66, 66, 66, 67, 67, 67};
+    pos3d2.insert(pos3d2.end(), std::begin(tail_pos), std::end(tail_pos));
+
+    flyx_seq* seq = nullptr;
+    CHECK(api->seq_new(bm, 128, &seq) == 0, "seq_new snap_delta");
+    CHECK(api->prefill_snapshot(seq, 64) == 0, "prefill_snapshot 64");
+    flyx_prefill_input in{};
+    in.tokens = prompt2.data();
+    in.n = int32_t(prompt2.size());
+    in.embeds = embeds2.data();
+    in.embed_rows = embed_rows2;
+    in.n_embeds = 8;
+    in.pos_3d = pos3d2.data();
+    in.rope_delta = -4;
+    in.set_rope_delta = 1;
+    in.has_snap_rope_delta = 1;
+    in.snap_rope_delta = -2;
+    CHECK(api->prefill_ex(pplan, seq, &in, nullptr) == 0, "snap_delta prefill_ex");
+    CHECK(api->checkpoint(seq, 0) == 64, std::string(name) + ": expected intra-pass checkpoint at 64");
+    CHECK(api->restore(seq, 0, followup[0]) == 64, "restore intra-pass checkpoint at 64");
+    const auto restored_followup = decode_followup(seq);
+    CHECK(restored_followup == res.direct_followup,
+          std::string(name) + ": intra-pass snap_rope_delta was overwritten by pass-end rope_delta");
+    api->seq_free(seq);
+
+    // FLYX_PREFILL_SNAP_NONE suppresses implicit intra-pass snapshot (checkpoint() captures pass-end pos 72, not 64).
+    CHECK(api->seq_new(bm, 128, &seq) == 0, "seq_new snap_none");
+    CHECK(api->prefill_snapshot(seq, FLYX_PREFILL_SNAP_NONE) == 0, "prefill_snapshot NONE");
+    flyx_prefill_input in_none{};
+    in_none.tokens = prompt2.data();
+    in_none.n = int32_t(prompt2.size());
+    in_none.embeds = embeds2.data();
+    in_none.embed_rows = embed_rows2;
+    in_none.n_embeds = 8;
+    in_none.pos_3d = pos3d2.data();
+    in_none.rope_delta = -4;
+    in_none.set_rope_delta = 1;
+    CHECK(api->prefill_ex(pplan, seq, &in_none, nullptr) == 0, "snap_none prefill_ex");
+    CHECK(api->checkpoint(seq, 0) == int(prompt2.size()),
+          std::string(name) + ": FLYX_PREFILL_SNAP_NONE must not capture an intra-pass snapshot at 64");
     api->seq_free(seq);
   }
 
@@ -971,9 +1244,16 @@ void test_tiny_vlm_backends() {
   CHECK(disk_preq8.vision_embeds == gpu_preq8.vision_embeds, "pre-quantized Q8_0 disk != gpu");
   CHECK(gpu_preq8.plain_tokens == ref_preq8.plain_tokens, "pre-quantized Q8_0 greedy tokens differ");
 
+  // Hybrid GDN + MRoPE Attn + Vision (exercises prefill_align=64, intra-pass snap_rope_delta, FLYX_PREFILL_SNAP_NONE)
+  TinyVlm hybrid(false, true, /*include_gdn=*/true);
+  const BackendRun ref_hyb = run_backend_vlm("cpu_ref", hybrid, patches, "", FLYX_VISION_DEV_GPU, FLYX_VISION_QUANT_EXACT);
+  const BackendRun gpu_hyb = run_backend_vlm("cuda", hybrid, patches, "", FLYX_VISION_DEV_DISK, FLYX_VISION_QUANT_EXACT);
+  CHECK(gpu_hyb.plain_tokens == ref_hyb.plain_tokens, "cuda vs cpu_ref hybrid GDN+MRoPE greedy tokens differ");
+  CHECK(gpu_hyb.direct_followup == ref_hyb.direct_followup, "cuda vs cpu_ref hybrid GDN+MRoPE followup differs");
+
   std::printf(
       "  ok   cuda tiny VLM vs cpu_ref (exact %.2e, q8 %.2e, nvfp4 %.2e, pre-Q8_0 %.2e; disk==host==gpu bit-exact, 0 "
-      "vision VRAM)\n",
+      "vision VRAM, hybrid GDN+MRoPE snap_rope_delta)\n",
       rel_exact, rel_q8, rel_fp4, rel_preq8);
 }
 

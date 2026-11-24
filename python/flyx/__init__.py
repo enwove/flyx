@@ -164,7 +164,12 @@ class Engine:
         kv: None (the model's: FP8, binary16 on Llama models), "fp8" or "16" (binary16, llama.cpp's).
         chat_template: a Jinja template's source (not a path), used instead of the model file's.
         drafter_file: drafters in files of their own, one path or a list: the MTP layer from a GGUF (unsloth's
-        MTP/mtp-*.gguf), for a GGUF without it, or a DFlash2 drafter file (flyx_convert --draft alone)."""
+        MTP/mtp-*.gguf), for a GGUF without it, or a DFlash2 drafter file (flyx_convert --draft alone).
+        mmproj_file: optional companion mmproj-*.gguf vision projector path.
+        vision: False skips loading any vision encoder even if present.
+        vision_device: "disk" (default, 0 VRAM / 0 locked RAM), "host", "gpu", or "auto".
+        vision_quant: "q8" (default), "exact", or "nvfp4" for float vision linears.
+        vision_max_tokens: per-image merged visual token cap (0 = auto)."""
         if isinstance(drafter_file, (list, tuple)):
             drafter_file = "\n".join(os.path.expanduser(os.fspath(p)) for p in drafter_file)
         elif drafter_file is not None:

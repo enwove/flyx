@@ -9,7 +9,7 @@ Single reference for the `flyx` CLI, `flyx serve` HTTP endpoints, environment va
 | Command | Synopsis | Description |
 |---|---|---|
 | `serve` | `flyx serve [MODEL] [serve-opts] [engine-opts]` | Start OpenAI + Anthropic HTTP API server and dashboard. Without `MODEL`, restores the last served model (`~/.config/flyx/serve.json` or `%APPDATA%\flyx\serve.json`), or starts unloaded (HTTP 503 until loaded via `/v1/load` or dashboard). |
-| `run` | `flyx run MODEL (-p TEXT \| -f FILE) [--chat] [--no-think] [-n N] [opts]` | Single-shot generation. Use `-f FILE` for prompts > 128 KB. |
+| `run` | `flyx run MODEL (-p TEXT \| -f FILE) [--image FILE]... [--chat] [--no-think] [-n N] [opts]` | Single-shot generation. Use `-f FILE` for prompts > 128 KB; `--image` attaches local images (implies `--chat`). |
 | `chat` | `flyx chat MODEL [opts]` | Interactive multi-turn terminal chat. |
 | `bench` | `flyx bench MODEL [-n N] [--prompts FILE.jsonl] [--json [FILE]] [opts]` | Benchmark decode `tok/s`, tokens/round, and GPU telemetry across 3 fixed prompts, or across a prompt set (`--prompts`). `--json` emits one JSON record on stdout, or into `FILE`. |
 | `tokenize` | `flyx tokenize MODEL "TEXT"` | Print token IDs for `TEXT`. |
@@ -103,7 +103,7 @@ All commands that load a model share the parser in `apps/common/engine_flags.cpp
 | `--no-system-log` | flag | off | Disable in-memory ring buffer of last 2000 stderr lines (`GET /v1/logs`). |
 | `--dashboard-dir` | `DIR` | embedded | Serve dashboard static files from `DIR` (e.g., `apps/flyx-server/dashboard`) before embedded assets. |
 
-> **Remembered model settings:** Starting `flyx serve` with no `MODEL` reloads the last model and its saved model-level settings (`--ctx`, drafters, KV placement) from `serve.json`. To change saved model settings at startup, pass `MODEL` explicitly. Process flags (`--sessions`, `--kv-disk`, `--kv-method`, `--backend-opt`) must be passed on each launch.
+> **Remembered model settings:** Starting `flyx serve` with no `MODEL` reloads the last model and its saved model-level settings (`--ctx`, drafters, KV placement, and vision options `--mmproj`, `--no-vision`, `--vision-device`, `--vision-quant`, `--vision-max-tokens`) from `serve.json`. To change saved model settings at startup, pass `MODEL` explicitly. Process flags (`--sessions`, `--kv-disk`, `--kv-method`, `--backend-opt`) must be passed on each launch.
 
 ---
 
@@ -290,7 +290,7 @@ export OPENAI_API_KEY=local-key
 
 ### Python (`python/flyx/__init__.py`)
 
-Zero external dependencies (`ctypes` over `libflyx.so` / `flyx.dll`, `FLYX_API_VERSION = 2`). Automatically locates the native library inside wheels or unpacked release archives; override via `lib=` or `FLYX_LIB`.
+Zero external dependencies (`ctypes` over `libflyx.so` / `flyx.dll`, `FLYX_API_VERSION = 3`). Automatically locates the native library inside wheels or unpacked release archives; override via `lib=` or `FLYX_LIB`.
 
 ```python
 import flyx
@@ -328,7 +328,7 @@ Concurrency & lifecycle:
 
 ### C API (`include/flyx/flyx.h`)
 
-Check `flyx_api_version() == FLYX_API_VERSION` (`2u`) before using struct layouts. Core entrypoints:
+Check `flyx_api_version() == FLYX_API_VERSION` (`3u`) before using struct layouts. Core entrypoints:
 - Engine lifecycle: `flyx_load(path, &opts, &err)`, `flyx_unload(engine)`, `flyx_backend_name(engine)`, `flyx_tokenize(engine, text, out, cap)`.
 - Session lifecycle: `flyx_session_new(engine)`, `flyx_generate(session, &req, on_event, user, &usage, &err)`, `flyx_cancel(session)` (thread-safe), `flyx_session_free(session)`.
 - Events (`flyx_event_kind`): `FLYX_EVENT_TEXT` (1), `FLYX_EVENT_DONE` (2), `FLYX_EVENT_REASONING` (3), `FLYX_EVENT_TOOL_CALL` (4). Return non-zero from `on_event` to cancel.
