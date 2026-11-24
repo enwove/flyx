@@ -5,6 +5,7 @@
 #include <stdexcept>
 
 #include "core/interfaces/options.h"
+#include "models/inkling2/inkling2.h"
 #include "models/llama/llama.h"
 #include "models/qwen35/qwen35.h"
 
@@ -15,6 +16,7 @@ const char* drafter_name(Drafter d) {
     case Drafter::kMtp: return "mtp";
     case Drafter::kDFlash2: return "dflash2";
     case Drafter::kDv: return "dv";
+    case Drafter::kDSpark: return "dspark";
     default: return "none";
   }
 }
@@ -41,6 +43,14 @@ std::vector<int> Model::draft_widths(int d) const {
     const int widest = std::min(FLYX_MAX_WIDE_ROWS - 1, b.max_drafts);
     if (widest > FLYX_MAX_ROWS - 1) return {FLYX_MAX_ROWS - 1, widest};
     return {widest};
+  }
+  if (b.kind == Drafter::kDSpark) {
+    const int widest = std::min(FLYX_MAX_ROWS - 1, b.max_drafts);
+    std::vector<int> widths;
+    for (int k : {3, 5})
+      if (k < widest) widths.push_back(k);
+    widths.push_back(widest);
+    return widths;
   }
   const bool seq = is_sequential(b.kind);
   const int widest = seq ? std::min(FLYX_MAX_ROWS - 1, b.max_drafts) : b.max_drafts;
@@ -81,9 +91,9 @@ bool choose_drafters(const ModelOptions& o, const DrafterSources& has, std::vect
   out->clear();
   interfaces::DrafterMode mode = interfaces::DrafterMode::kAuto;
   if (!interfaces::parse_drafter_mode(o.drafter, &mode))
-    return *err = "unknown drafter '" + o.drafter + "' (mtp, dflash2, dv, all or none)", false;
+    return *err = "unknown drafter '" + o.drafter + "' (mtp, dflash2, dv, dspark, all or none)", false;
   if (!o.speculative || mode == interfaces::DrafterMode::kNone) return true;
-  bool mtp = false, dflash2 = false, dv = false;
+  bool mtp = false, dflash2 = false, dv = false, dspark = false;
   switch (mode) {
     case interfaces::DrafterMode::kMtp:
       if (!has.mtp) return *err = "the model file has no MTP layer", false;
@@ -97,27 +107,35 @@ bool choose_drafters(const ModelOptions& o, const DrafterSources& has, std::vect
       if (!has.dv) return *err = "the model file has no DV drafter", false;
       dv = true;
       break;
+    case interfaces::DrafterMode::kDSpark:
+      if (!has.dspark) return *err = "the model file has no DSpark drafter", false;
+      dspark = true;
+      break;
     case interfaces::DrafterMode::kAll:
       mtp = has.mtp;
       dflash2 = has.dflash2;
       dv = has.dv;
+      dspark = has.dspark;
       break;
     case interfaces::DrafterMode::kAuto: {
       // Every drafter given in a file of its own; of the model file's own, the MTP layer if it has one, else DFlash2
       // (MTP was measured faster on the 4B, 462 against 341 tok/s: a file with both keeps it until choosing between
       // them every round is measured there).  DV only when named (dv, all).
       const bool own_mtp = has.mtp && !has.mtp_beside, own_dflash2 = has.dflash2 && !has.dflash2_beside;
+      const bool own_dspark = has.dspark && !has.dspark_beside;
       mtp = has.mtp_beside || own_mtp;
       dflash2 = has.dflash2_beside || (own_dflash2 && !own_mtp);
+      dspark = has.dspark_beside || own_dspark;
       break;
     }
     case interfaces::DrafterMode::kNone: break;
   }
   // DV's canvas follows its own rounds only, and the controller weighs its warm-up against plain decoding's and
   // lookup's rounds alone: no drafter beside it.
-  if (dv && (mtp || dflash2)) return *err = "DV drafts alone: not beside another drafter", false;
+  if (dv && (mtp || dflash2 || dspark)) return *err = "DV drafts alone: not beside another drafter", false;
   if (mtp) out->push_back(Drafter::kMtp);
   if (dflash2) out->push_back(Drafter::kDFlash2);
+  if (dspark) out->push_back(Drafter::kDSpark);
   if (dv) out->push_back(Drafter::kDv);
   return true;
 }
@@ -129,7 +147,7 @@ std::string declared_activations(const ModelFile& file) {
   return q.contains("activations") && q.at("activations").is_string() ? q.at("activations").get<std::string>() : "";
 }
 
-int Tables::weight(const std::string& name, std::vector<int64_t> shape) {
+int Tables::weight(const std::string& name, std::vector<int64_t> shape, const std::string& ggml_scale_name) {
   auto it = index_.find(name);
   if (it != index_.end()) return it->second;
   const flyx_tensor_view* t = file_->tensor(name);
@@ -149,7 +167,8 @@ int Tables::weight(const std::string& name, std::vector<int64_t> shape) {
   // ones), bf16 in rounds (finer than its 8 bits).
   const bool fp4 = t->dtype == FLYX_DT_NVFP4 || t->dtype == FLYX_DT_GGML_NVFP4;
   if (flyx_block_values(t->dtype) && !fp4 && !exact_) w.activations = FLYX_ACT_Q8;
-  if (fp4 && !exact_ && nvfp4_inputs_) w.activations = FLYX_ACT_NVFP4;
+  // 3D NVFP4 expert tensors keep bf16 activations (finer than FP4 and row-independent across sparse MoE dispatches).
+  if (fp4 && t->ndim == 2 && !exact_ && nvfp4_inputs_) w.activations = FLYX_ACT_NVFP4;
   if (t->dtype == FLYX_DT_NVFP4) {
     w.scale = file_->tensor(name + ".scale");
     w.scale2 = file_->tensor(name + ".scale2");
@@ -160,6 +179,13 @@ int Tables::weight(const std::string& name, std::vector<int64_t> shape) {
     const bool ok_scale2 = w.scale2 && w.scale2->dtype == FLYX_DT_F32 && w.scale2->nbytes >= sizeof(float);
     if (!ok_scale || !ok_scale2)
       throw std::runtime_error(name + ": NVFP4 without valid scales");
+  } else if (!ggml_scale_name.empty()) {
+    if (const flyx_tensor_view* s2 = file_->tensor(ggml_scale_name)) {
+      const bool ok_s2 = s2->dtype == FLYX_DT_F32 && s2->ndim == 1 &&
+                         (s2->shape[0] == 1 || (t->ndim == 3 && s2->shape[0] == t->shape[0]));
+      if (!ok_s2) throw std::runtime_error(ggml_scale_name + ": invalid GGML scale tensor");
+      w.scale2 = s2;
+    }
   }
   weights.push_back(w);
   return index_[name] = int(weights.size()) - 1;
@@ -191,7 +217,8 @@ bool Tables::set_activations(const std::string& how, const std::string& declared
   bool other_k = false;
   for (const auto& name : file_->tensor_names()) {
     const flyx_tensor_view* t = file_->tensor(name);
-    other_k = other_k || (t && t->dtype == FLYX_DT_GGML_NVFP4 && t->ndim == 2 && t->shape[1] % 128);
+    other_k = other_k || (t && t->dtype == FLYX_DT_GGML_NVFP4 && (t->ndim == 2 || t->ndim == 3) &&
+                          t->shape[t->ndim - 1] % 128);
   }
   // Asked for by name, NVFP4 weights take NVFP4 inputs whatever the file says: a file converted with bf16 inputs
   // takes them without a second conversion, and neither the device nor the GGUF rules above
@@ -324,6 +351,7 @@ constexpr ArchEntry kArchitectures[] = {
     {"qwen35", qwen35::open, true, nullptr},
     {"qwen3", llama::open, true, "lora"},  // Llama's layer with q/k norms; their own adapters (a V-LoRA)
     {"llama", llama::open, false, "lora"},
+    {"inkling2_loop", inkling2::open, true, nullptr},
 };
 
 }  // namespace

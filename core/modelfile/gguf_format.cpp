@@ -209,7 +209,9 @@ int dtype_of(uint32_t ggml_type) {
     case 28: return FLYX_DT_F64;
     case 29: return FLYX_DT_GGML_IQ1_M;
     case 30: return FLYX_DT_BF16;
+    case 39: return FLYX_DT_GGML_MXFP4;
     case 40: return FLYX_DT_GGML_NVFP4;
+    case 42: return FLYX_DT_GGML_Q2_0;
     default: return -1;
   }
 }
@@ -394,9 +396,12 @@ void tokenizer(const json& meta, const RawTokenizer& raw, ModelFile::Contents* o
   }
   out->blobs["tokenizer.merges"] =
       std::string_view(reinterpret_cast<const char*>(merges_buf.data()), merges_buf.size());
-  out->header["tokenizer"] = {{"pretokenizer", meta.value("tokenizer.ggml.pre", "")},
-                              {"normalizer", meta.value("tokenizer.ggml.normalizer.nfc", true) ? "nfc" : "none"},
-                              {"ignore_merges", false},
+  const std::string pre = meta.value("tokenizer.ggml.pre", "");
+  const bool is_inkling2 = pre == "inkling2";
+  const bool is_gpt4o = pre == "gpt-4o";
+  out->header["tokenizer"] = {{"pretokenizer", pre},
+                              {"normalizer", meta.value("tokenizer.ggml.normalizer.nfc", !(is_inkling2 || is_gpt4o)) ? "nfc" : "none"},
+                              {"ignore_merges", meta.value("tokenizer.ggml.ignore_merges", is_inkling2)},
                               {"n_tokens", n},
                               {"n_merges", n_merges}};
   add_blob(out, "tokenizer.added", added.dump());

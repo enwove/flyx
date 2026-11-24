@@ -183,6 +183,16 @@ struct RowBufs {
         *part = nullptr, *attn_state = nullptr, *feats = nullptr, *cx = nullptr, *ckv = nullptr, *mcat = nullptr,
         *mx = nullptr, *mhn = nullptr;
   float* lora = nullptr;  // the target's adapters' first products (RowNeeds::lora a row; none without adapters)
+  // Inkling-2 pass-local scratch (null for models without RelAttnBlock / MoeBlock).
+  float *res_bank = nullptr, *prelude_cur = nullptr, *prelude_blocks = nullptr;
+  float *loop_bank = nullptr, *loop_bank_out = nullptr, *loop_msg = nullptr;
+  float *inp_saved = nullptr, *attn_in = nullptr;
+  float *ctrl_cat = nullptr, *ctrl_gate = nullptr, *ctrl_gf = nullptr;
+  float *rel_q = nullptr, *sink = nullptr, *kv_conv = nullptr, *kv_dyn = nullptr;
+  float *post_raw = nullptr, *post_out = nullptr;
+  int* moe_idx = nullptr;
+  float *moe_w = nullptr, *moe_gu = nullptr, *moe_act = nullptr;
+  MoeScratch moe_sc{};  // grouped MoE scratch (prefill set only)
   GdnBufs pre{};  // GDN prefill scratch (prefill set only)
   Scratch scratch{};  // the GEMM inputs the kernels stage
 };
@@ -192,11 +202,15 @@ struct RowNeeds {
   int proj = 0, act = 0, gdn_o = 0, q = 0;  // projections, activations, GDN output, attention queries
   int attn_state = 0;                       // prefill windowed flash attention softmax state (floats per row)
   int lora = 0;                             // the target's adapters' first products: q|k|v's (3 rank), gate|up's
-  int feats = 0, cx = 0, ckv = 0;           // DFlash2 context: tapped features, fc output, K/V projections
+  int feats = 0, cx = 0, ckv = 0;           // DFlash2/DSpark context: tapped features, fc output, K/V projections
   bool mtp = false;                         // MTP context rows (2 x hidden, hidden, hidden)
   bool glu = false;                         // non-packed MLP weights (prefill gemm_glu_staged)
   int k_max = 0;                            // largest GEMM K: the scratch staging GEMM inputs is sized by it
   bool q8 = false;  // weights with inputs in 8 bits: a prefill scratch holds their GEMMs' runs of K side by side
+  int max_bank = 0, max_loop_rank = 0;      // Inkling-2 AttnRes bank depth & loop gate rank
+  int rel_q = 0, sink = 0, kv_dim = 0, kv_dyn = 0;
+  int moe_experts = 0, moe_topk = 0, moe_inter = 0;
+  bool dspark = false;
 };
 
 // option head_cert: head_certify's scratch (row norms, bound keys, surviving columns and their count), shared in shape
@@ -367,8 +381,9 @@ struct flyx_bmodel {
   flyx::cuda::StateTable states;
   int hidden = 0, vocab = 0;  // the residual stream's width, the vocabulary
   int mtp_block = -1, dflash_block = -1;  // the drafters (at most one of each), -1: none
-  int dv_block = -1;                      // DV (docs/design/dv.md), -1: none
+  int dv_block = -1, dspark_block = -1;   // DV and DSpark drafters, -1: none
   int head_block = -1;                    // the head they read
+  std::unordered_map<int, float*> vec_weights;  // 1D device vectors referenced by FLYX_NODE_RES_MIX (weight index -> GPU)
   flyx::cuda::RowNeeds need;
 
   int prefill_rows = 0;  // rows of the widest prefill plan lowered: the shared prefill buffers hold them
@@ -526,10 +541,14 @@ struct flyx_seq {
   // state, as the model's state table declares it
   std::vector<flyx::cuda::KvBuf> kv;
   std::vector<flyx::cuda::GdnBuf> gdn;
+  std::vector<flyx::cuda::ShortConvBuf> sconv;
   // Every gated delta net's state, window and replay buffers on the device, for a round's commit in two launches
   // (gdn_fold_layers); null where the layers are not alike or their states not 16-byte aligned.
   flyx::cuda::GdnLayer* gdn_layers = nullptr;
-  float* ring = nullptr;               // the hidden ring (MTP input), kHring x ring_width
+  // Every ShortConv layer's window and replay buffers on the device, for a round's commit in one launch.
+  flyx::cuda::ShortConvLayer* sconv_layers = nullptr;
+  bool sconv_alike = false;
+  float* ring = nullptr;               // the hidden ring (MTP/DSpark input), kHring x ring_width
   float* ring_snap = nullptr;          // 1-row hidden snapshot at pass_snap - 1 (preserved past kHring overwrites)
   float* ring_ckp[FLYX_CHECKPOINTS]{};  // host memory, as the GDN checkpoints (host_alloc)
   flyx::cuda::RowBufs own;              // this session's row buffers (rounds)
@@ -602,7 +621,13 @@ struct flyx_seq {
   flyx::cuda::CertScratch cert{};  // option head_cert: head_certify's scratch
   float *dx = nullptr, *dh = nullptr, *dhc = nullptr, *dtmp = nullptr, *dproj = nullptr, *dact = nullptr,
         *ddelta = nullptr, *dq = nullptr;
+  // DSpark drafter scratch (null when m->dspark_block < 0).
+  float *ds_x = nullptr, *ds_h = nullptr, *ds_proj = nullptr, *ds_act = nullptr, *ds_q = nullptr;
+  float *ds_hn = nullptr, *ds_state = nullptr, *ds_joint = nullptr, *ds_jout = nullptr, *ds_markov = nullptr,
+        *ds_bias = nullptr;
+  int* ds_prev = nullptr;
   int ld_proj = 0, ld_act = 0, ld_feats = 0, ld_dproj = 0, ld_dact = 0, ld_ckv = 0;
+  int ld_ds_proj = 0, ld_ds_act = 0;
 
   // host mirror (valid whenever nothing is in flight)
   int position = 0, round = 0;
@@ -918,6 +943,12 @@ struct RowView {
 // The sequence's row buffers (its own when bufs is null, or the prefill buffers it borrows), on its stream.
 RowView rows_of(flyx_seq* s, RowBufs* bufs = nullptr);
 
+// Pass-local host counters for Inkling-2 Block Attention Residuals / loop passes (compile-time constants per node,
+// safe during CUDA graph capture).
+struct ResState {
+  int res_n = 0, prelude_n = 0, loop_n = 0;
+};
+
 struct Pass {
   flyx_plan* p;
   flyx_seq* s;
@@ -932,6 +963,7 @@ struct Pass {
                          // kStrataAll, kStrataBoth
   int accept_width = -1; // override p->width for FLYX_NODE_ACCEPT inside adaptive verify branches (-1: p->width)
   RowView v{};           // the rows it works on (rows_of(s) for a sequence's own pass)
+  ResState* res = nullptr;  // pass-local AttnRes / loop bank counters (stack-owned by forward_nodes)
   int width() const { return accept_width >= 0 ? accept_width : p->width; }
   bool reads_copy(const KvBuf& kb) const { return round && kb.kq && strata != kStrataNone; }
   bool reads_cache(const KvBuf& kb) const { return !reads_copy(kb) || strata == kStrataBoth; }

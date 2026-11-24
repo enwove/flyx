@@ -696,7 +696,35 @@ bool WeightLoader::packable(int w) const {
   return m_->opt.packed_blocks && v->ndim == 2 && blocks_supported(v->dtype, int(v->shape[1]));
 }
 
+bool WeightLoader::can_stack(const std::vector<int>& ws) const {
+  if (ws.empty()) return false;
+  const int w0 = ws[0];
+  const bool p0 = packable(w0);
+  const auto is_fp4 = [&](int w) { return t(w)->dtype == FLYX_DT_NVFP4 || t(w)->dtype == FLYX_DT_GGML_NVFP4; };
+  const bool f0 = is_fp4(w0);
+  const int64_t K0 = t(w0)->shape[1];
+  for (int w : ws) {
+    if (t(w)->ndim != 2 || t(w)->shape[1] != K0) return false;
+    if (packable(w) != p0 || is_fp4(w) != f0) return false;
+    if (p0 && weights_[w].activations != weights_[w0].activations) return false;
+  }
+  return true;
+}
+
 Lin WeightLoader::lin_stack(const std::vector<int>& ws, int* rows_out, const std::vector<RowOrder>& orders) {
+  bool any_order = false;
+  for (const auto& o : orders)
+    if (o) any_order = true;
+  if (!any_order) {
+    if (auto it = lins_.find(ws); it != lins_.end()) {
+      if (rows_out) {
+        int r = 0;
+        for (int w : ws) r += int(t(w)->shape[0]);
+        *rows_out = r;
+      }
+      return it->second;
+    }
+  }
   Lin L;
   bool all_packable = true;
   for (int w : ws) all_packable = all_packable && packable(w) && t(w)->shape[1] == t(ws[0])->shape[1];
@@ -716,6 +744,7 @@ Lin WeightLoader::lin_stack(const std::vector<int>& ws, int* rows_out, const std
       i = end;
     }
     if (rows_out) *rows_out = rows;
+    if (!any_order) lins_[ws] = L;
     return L;
   }
   // NVFP4, ModelOpt's or GGML's (repacked: ggml_nvfp4_planes).
@@ -724,7 +753,9 @@ Lin WeightLoader::lin_stack(const std::vector<int>& ws, int* rows_out, const std
   for (int w : ws)
     if (is_fp4(w) != fp4) throw std::runtime_error(std::string(t(w)->name) + ": mixed weight formats in one stack");
   if (!fp4) {
-    L.w = stack(ws, rows_out, orders);
+    L.w = (!any_order && ws.size() == 1) ? mat(ws[0]) : stack(ws, rows_out, orders);
+    if (rows_out && !any_order && ws.size() == 1) *rows_out = int(t(ws[0])->shape[0]);
+    if (!any_order) lins_[ws] = L;
     return L;
   }
   size_t rows = 0;
@@ -749,7 +780,9 @@ Lin WeightLoader::lin_stack(const std::vector<int>& ws, int* rows_out, const std
                              [&](size_t n, const auto& fn) { parallel_rows(n, fn); });
       upload_staged(L.q + r0 * K / 2, q.data(), q.size());
       upload_staged(L.s + r0 * K / 16, sc.data(), sc.size());
-      std::vector<float> one(nr, 1.f);
+      float g_scale = 1.f;
+      if (weights_[w].scale2) g_scale = static_cast<float>(flyx::ops::load(weights_[w].scale2, 0));
+      std::vector<float> one(nr, g_scale);
       CK(cudaMemcpy(L.rs + r0, one.data(), nr * 4, cudaMemcpyHostToDevice));
       r0 += nr;
       continue;
@@ -766,7 +799,166 @@ Lin WeightLoader::lin_stack(const std::vector<int>& ws, int* rows_out, const std
     r0 += nr;
   }
   if (rows_out) *rows_out = int(rows);
+  if (!any_order) lins_[ws] = L;
   return L;
+}
+
+ExpertMat WeightLoader::expert_mat(int w) {
+  if (auto it = experts_.find(w); it != experts_.end()) return it->second;
+  const auto* v = t(w);
+  if (v->ndim != 3) throw std::runtime_error(std::string(v->name) + ": expert_mat requires a 3D tensor [E, N, K]");
+  const size_t E = size_t(v->shape[0]), N = size_t(v->shape[1]), K = size_t(v->shape[2]);
+  const size_t total_rows = E * N;
+  ExpertMat em{};
+  em.n_experts = int(E);
+  em.N = int(N);
+
+  // Optional per-expert F32 scale tensor (present on GGML NVFP4 and on requantized MoE experts in Unsloth GGUFs).
+  auto upload_expert_scales = [&](bool required_default) -> float* {
+    const auto* s2 = weights_[w].scale2;
+    if (!s2 && !required_default) return nullptr;
+    float* rs_dev = m_->alloc<float>(E);
+    std::vector<float> rs_host(E, 1.f);
+    if (s2) {
+      const size_t sn = numel(s2);
+      if (sn == E)
+        for (size_t i = 0; i < E; ++i) rs_host[i] = static_cast<float>(flyx::ops::load(s2, i));
+      else if (sn == 1)
+        std::fill(rs_host.begin(), rs_host.end(), static_cast<float>(flyx::ops::load(s2, 0)));
+      else
+        throw std::runtime_error(std::string(v->name) + ": unexpected per-expert scale length");
+    }
+    CK(cudaMemcpy(rs_dev, rs_host.data(), E * sizeof(float), cudaMemcpyHostToDevice));
+    return rs_dev;
+  };
+
+  if (v->dtype == FLYX_DT_GGML_NVFP4) {
+    if (K % 64 != 0) throw std::runtime_error(std::string(v->name) + ": GGML NVFP4 K must be a multiple of 64");
+    const size_t per_row = K / 64;
+    const size_t q_row = K / 2, s_row = K / 16, file_row = per_row * 36;
+    uint8_t* q_dev = m_->alloc<uint8_t>(total_rows * q_row);
+    uint8_t* s_dev = m_->alloc<uint8_t>(total_rows * s_row);
+    const auto* file = static_cast<const uint8_t*>(v->data);
+    times_.file_bytes += total_rows * file_row;
+    if (!staging_) staging_ = std::make_unique<LoadStaging>();
+    LoadStaging& S = *staging_;
+    const size_t chunk = std::max<size_t>(1, (LoadStaging::kBytes - 16) / (q_row + s_row));
+    for (size_t r0 = 0; r0 < total_rows; r0 += chunk) {
+      const size_t nr = std::min(chunk, total_rows - r0);
+      const int b = S.next;
+      S.next ^= 1;
+      const double t0 = load_clock();
+      CK(cudaEventSynchronize(S.done[b]));
+      const double t1 = load_clock();
+      uint8_t* hq = S.buf[b];
+      uint8_t* hs = hq + (nr * q_row + 15) / 16 * 16;
+      parallel_rows(nr, [&](size_t a, size_t e) {
+        for (size_t r = a; r < e; ++r) {
+          const uint8_t* in = file + (r0 + r) * file_row;
+          uint8_t* qo = hq + r * q_row;
+          uint8_t* so = hs + r * s_row;
+          for (size_t k = 0; k < per_row; ++k, in += 36) {
+            const uint8_t* d = in;
+            const uint8_t* qs = in + 4;
+            for (int g = 0; g < 4; ++g) {
+              if (d[g] == 0xFF)
+                throw std::runtime_error(std::string(v->name) + ": an NVFP4 scale of 0xFF (no e4m3 holds it)");
+              so[4 * k + size_t(g)] = d[g] == 0x7F ? 0 : uint8_t(d[g] & 0x7F);
+              auto code = [&](int l) { return l < 8 ? qs[8 * g + l] & 15 : qs[8 * g + l - 8] >> 4; };
+              for (int i = 0; i < 8; ++i)
+                qo[32 * k + 8 * size_t(g) + size_t(i)] = uint8_t(code(2 * i) | code(2 * i + 1) << 4);
+            }
+          }
+        }
+      });
+      CK(cudaMemcpyAsync(q_dev + r0 * q_row, hq, nr * q_row, cudaMemcpyHostToDevice, S.st));
+      CK(cudaMemcpyAsync(s_dev + r0 * s_row, hs, nr * s_row, cudaMemcpyHostToDevice, S.st));
+      CK(cudaEventRecord(S.done[b], S.st));
+      times_.copy_s += t1 - t0;
+      times_.pack_s += load_clock() - t1;
+    }
+    em.q = q_dev;
+    em.s = s_dev;
+    em.rs = upload_expert_scales(/*required_default=*/true);
+    return experts_[w] = em;
+  }
+
+  if (m_->opt.packed_blocks && blocks_supported(v->dtype, int(K))) {
+    blocks_init();
+    const BlockLayout l = blocks_layout(v->dtype);
+    const size_t per_row = K / size_t(l.values);
+    const size_t row_bytes = per_row * size_t(l.stride), row_scales = per_row * size_t(l.scales);
+    const size_t file_row = per_row * size_t(l.bytes);
+    uint8_t* data = m_->alloc<uint8_t>(total_rows * row_bytes);
+    uint16_t* scales = m_->alloc<uint16_t>(total_rows * row_scales);
+    const auto* file = static_cast<const uint8_t*>(v->data);
+    times_.file_bytes += total_rows * file_row;
+    if (!staging_) staging_ = std::make_unique<LoadStaging>();
+    LoadStaging& S = *staging_;
+    const size_t scale_bytes = row_scales * sizeof(uint16_t);
+    const size_t chunk = std::max<size_t>(1, (LoadStaging::kBytes - 16) / (row_bytes + scale_bytes));
+    const int dtype = v->dtype;
+    for (size_t r0 = 0; r0 < total_rows; r0 += chunk) {
+      const size_t nr = std::min(chunk, total_rows - r0);
+      const int b = S.next;
+      S.next ^= 1;
+      const double t0 = load_clock();
+      CK(cudaEventSynchronize(S.done[b]));
+      const double t1 = load_clock();
+      uint8_t* hp = S.buf[b];
+      auto* hs = reinterpret_cast<uint16_t*>(hp + (nr * row_bytes + 15) / 16 * 16);
+      parallel_rows(nr, [&](size_t a, size_t e) {
+        blocks_pack(dtype, file + (r0 + a) * file_row, (e - a) * per_row, hp + a * row_bytes, hs + a * row_scales);
+      });
+      CK(cudaMemcpyAsync(data + r0 * row_bytes, hp, nr * row_bytes, cudaMemcpyHostToDevice, S.st));
+      CK(cudaMemcpyAsync(scales + r0 * row_scales, hs, nr * scale_bytes, cudaMemcpyHostToDevice, S.st));
+      CK(cudaEventRecord(S.done[b], S.st));
+      times_.copy_s += t1 - t0;
+      times_.pack_s += load_clock() - t1;
+    }
+    em.blk = BlockMat{data, scales, v->dtype, int(total_rows), weights_[w].activations == FLYX_ACT_Q8};
+    em.rs = upload_expert_scales(/*required_default=*/false);
+    return experts_[w] = em;
+  }
+
+  // Fallback: BF16 on device (handles BF16, F16, F32, or blocks=bf16).
+  if (!numbers(v)) throw std::runtime_error(std::string(v->name) + ": unsupported expert dtype");
+  bf16* dst = m_->alloc<bf16>(total_rows * K);
+  const size_t bytes = total_rows * K * sizeof(uint16_t);
+  if (v->dtype == FLYX_DT_BF16) {
+    upload_staged(dst, v->data, bytes);
+  } else {
+    const size_t row_bytes = K * sizeof(uint16_t);
+    auto conv_rows = [&](size_t r0, size_t count, uint16_t* out) {
+      for (size_t i = 0; i < count; ++i) {
+        const size_t from = (r0 + i) * K;
+        for (size_t k = 0; k < K; ++k)
+          out[i * K + k] = float_to_bf16(static_cast<float>(flyx::ops::load(v, from + k)));
+      }
+    };
+    if (bytes < (size_t(1) << 20)) {
+      std::vector<uint16_t> h(total_rows * K);
+      parallel_rows(total_rows, [&](size_t a, size_t e) { conv_rows(a, e - a, h.data() + a * K); });
+      CK(cudaMemcpy(dst, h.data(), bytes, cudaMemcpyHostToDevice));
+    } else {
+      if (!staging_) staging_ = std::make_unique<LoadStaging>();
+      LoadStaging& S = *staging_;
+      const size_t chunk = std::max<size_t>(1, LoadStaging::kBytes / row_bytes);
+      for (size_t r0 = 0; r0 < total_rows; r0 += chunk) {
+        const size_t nr = std::min(chunk, total_rows - r0);
+        const int b = S.next;
+        S.next ^= 1;
+        CK(cudaEventSynchronize(S.done[b]));
+        auto* hp = reinterpret_cast<uint16_t*>(S.buf[b]);
+        parallel_rows(nr, [&](size_t a, size_t e) { conv_rows(r0 + a, e - a, hp + a * K); });
+        CK(cudaMemcpyAsync(dst + r0 * K, hp, nr * row_bytes, cudaMemcpyHostToDevice, S.st));
+        CK(cudaEventRecord(S.done[b], S.st));
+      }
+    }
+  }
+  em.w = dst;
+  em.rs = upload_expert_scales(/*required_default=*/false);
+  return experts_[w] = em;
 }
 
 std::vector<float> WeightLoader::host_f32(int w) const {
@@ -775,6 +967,11 @@ std::vector<float> WeightLoader::host_f32(int w) const {
   std::vector<float> out(numel(v));
   for (size_t i = 0; i < out.size(); ++i) out[i] = static_cast<float>(flyx::ops::load(v, i));
   return out;
+}
+
+float* WeightLoader::vec(int w) {
+  if (auto it = vecs_.find(w); it != vecs_.end()) return it->second;
+  return vecs_[w] = put(host_f32(w));
 }
 
 float* WeightLoader::vecs(const std::vector<int>& ws) {

@@ -180,9 +180,13 @@ bool parse_name(const std::string& s, Name* out) {
 bool model_gguf_name(const std::string& path) {
   const std::string p = detail::lower(path), base = detail::base_name(p);
   if (!base.ends_with(".gguf") || base.find("mmproj") != std::string::npos ||
-      base.find("imatrix") != std::string::npos || base.starts_with("mtp-"))
+      base.find("imatrix") != std::string::npos || base.starts_with("mtp-") || base.starts_with("dspark-"))
     return false;
-  return !p.starts_with("mtp/") && p.find("/mtp/") == std::string::npos;
+  if (p.starts_with("mtp/") || p.find("/mtp/") != std::string::npos || p.starts_with("dspark/") ||
+      p.find("/dspark/") != std::string::npos || p.starts_with("old_support/") ||
+      p.find("/old_support/") != std::string::npos)
+    return false;
+  return true;
 }
 
 bool parse_split_gguf_name(const std::string& path, SplitGguf* out) { return parse_split(path, out); }

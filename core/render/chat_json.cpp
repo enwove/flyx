@@ -109,6 +109,7 @@ bool messages_from_openai(const ojson& messages, std::vector<ChatMessage>* out, 
       }
     }
     cm.tool_call_id = str_or(m, "tool_call_id");
+    cm.name = str_or(m, "name");
     out->push_back(std::move(cm));
   }
   return true;

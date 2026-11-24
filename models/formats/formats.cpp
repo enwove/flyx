@@ -13,6 +13,7 @@
 #include "core/interfaces/chat.h"
 #include "core/modelfile/modelfile.h"
 #include "models/formats/family.h"
+#include "models/formats/inkling2.h"
 #include "models/formats/qwen35.h"
 #include "models/formats/tags.h"
 
@@ -46,6 +47,12 @@ class Chat : public interfaces::Chat {
       syntax_ = family_->replies;
       return;
     }
+    if (is_inkling2_template(source_)) {
+      format_ = "inkling2";
+      inkling2_ = true;
+      inkling2_tools_ = has(source_, "<|content_invoke_tool_json|>");
+      return;
+    }
     // Tool calls written as XML: Qwen3.5, Qwen3-Coder (llama.cpp's test, chat.cpp "Qwen3-Coder").
     if (has(source_, "<tool_call>") && has(source_, "<function=") && has(source_, "<parameter=")) {
       format_ = "qwen3_coder";
@@ -62,15 +69,16 @@ class Chat : public interfaces::Chat {
   const std::string& template_source() const override { return source_; }
   const ojson& template_tokens() const override { return tokens_; }
   const char* format() const override { return format_; }
-  bool reads_tool_calls() const override { return syntax_.calls != nullptr; }
+  bool reads_tool_calls() const override { return inkling2_ ? inkling2_tools_ : (syntax_.calls != nullptr); }
 
   bool opens_reasoning(std::string_view gen) const override {
-    if (!syntax_.thinking) return false;
+    if (inkling2_ || !syntax_.thinking) return false;
     size_t open = gen.rfind("<think>");
     return open != std::string_view::npos && gen.find("</think>", open) == std::string_view::npos;
   }
 
   std::unique_ptr<interfaces::OutputParser> parser(bool in_reasoning, const std::vector<ojson>* tools) const override {
+    if (inkling2_) return make_inkling2_parser(inkling2_tools_ ? tools : nullptr);
     TagSyntax s = syntax_;
     if (!tools || tools->empty()) s.calls = nullptr;
     if (!s.thinking && !s.calls) return std::make_unique<PlainParser>();
@@ -79,6 +87,7 @@ class Chat : public interfaces::Chat {
 
   std::string reply_grammar(const std::vector<ojson>& tools, const interfaces::ReplyRules& rules,
                             bool in_reasoning) const override {
+    if (inkling2_) return inkling2_reply_grammar(inkling2_tools_ ? tools : std::vector<ojson>{}, rules);
     return formats::reply_grammar(syntax_, tools, rules, in_reasoning);
   }
 
@@ -94,6 +103,8 @@ class Chat : public interfaces::Chat {
   ojson tokens_;
   const Family* family_ = nullptr;
   const char* format_ = "plain";
+  bool inkling2_ = false;
+  bool inkling2_tools_ = false;
   TagSyntax syntax_;
 };
 

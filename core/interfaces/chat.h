@@ -49,6 +49,7 @@ struct ChatMessage {
   std::optional<std::string> reasoning;  // assistant thinking given separately (reasoning_content)
   std::vector<ToolCall> tool_calls;      // assistant
   std::string tool_call_id;              // tool
+  std::string name;                      // optional tool / assistant name
 };
 
 struct ChatOptions {

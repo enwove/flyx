@@ -1335,4 +1335,108 @@ void stop_decide_step(const float* prob, const float* margin, const flyx_stop_po
 void stop_decide_block(const float* prob, const float* margin, const flyx_stop_policy* pol, DevStopState* state,
                        StopCondHandles h_ver, cudaStream_t st);
 
+// ---- Inkling-2 target ops (inkling2.cu, moe.cu) ---------------------------------------------
+// In-place logit softcapping: z = cap * tanh(z / cap) for finite z (leaves -inf untouched for head_cert).
+void softcap_rows(float* logits, int ld, int V, int rows, float cap, cudaStream_t st);
+
+// Block Attention Residuals depth-wise mixing (ops/attnres/ref.h):
+//   bank [n_blocks, rows, H] (may be null when n_blocks == 0), cur [rows, H], queries [n_queries, H]
+//   -> out [n_queries, rows, H] (query-major so each query's output is contiguous [rows, H]).
+void attn_res_mix(const float* bank, int n_blocks, const float* cur, const float* queries, int n_queries, int rows,
+                  int H, float* out, cudaStream_t st);
+
+// Cross-pass loop gate controller prep and apply (ops/attnres/ref.h):
+//   prep:  cat_out [rows, 2*H] = [rmsnorm(cur, 1e-6) | rmsnorm(msg, 1e-6)]
+//   apply: out [rows, H] = cur - tanh(forget) * cur + tanh(gain) * msg  (out may alias cur)
+void loop_ctrl_prep(const float* cur, const float* msg, int rows, int H, float* cat_out, cudaStream_t st);
+void loop_ctrl_apply(const float* cur, const float* msg, const float* gain, int ld_gain, const float* forget,
+                     int ld_forget, int rows, int H, float* out, cudaStream_t st);
+
+// Causal depthwise short convolution with residual scaling and optional per-head dynamic taps (ops/shortconv/ref.h).
+// win: [FLYX_ROUND_SLOTS][conv - 1][ch_total]; replay (rounds): [kGdnReplaySlots][replay_rows][ch_total].
+struct ShortConvLayer {
+  float* win;
+  float* replay;
+};
+void shortconv_pass(const float* x, int ldx, const float* w, const float* dyn, float* win, size_t win_stride,
+                    int in_sel, int next_sel, int skip, float* replay, size_t replay_stride, int replay_sel,
+                    int ch_off, int ch_total, int C, int conv, int n_heads, const DevParams* P, int rows, float* out,
+                    int ldo, cudaStream_t st, bool accumulate = false);
+void shortconv_fold(const ShortConvLayer* layers, int n, size_t win_stride, size_t replay_stride, int in_sel,
+                    int out_sel, int replay_sel, int channels, int conv, const DevParams* P, int rows,
+                    const int* rows_dev, bool skip_if_noop, cudaStream_t st);
+
+// Relative-position-bias attention prep & attention (ops/attention/ref.h: l2_clip, log_pos_scale, attend_rel).
+// prep: clips Q (with q_clip_w) and R (with r_clip_w), applies global log_pos_scale tau to Q & R, clips K,
+// no-gamma RMSNorms V, and writes K/V to kv.slot_of(pos) (supports ring KV and binary16/FP8).
+void rel_attn_prep(const float* q_in, int ldq, const float* k_in, int ldk, const float* v_in, int ldv,
+                   const float* r_in, int ldr, const float* q_clip_w, const float* r_clip_w, float qk_clip,
+                   float rel_clip, float v_eps, int log_floor, float log_alpha, int nh, int nkv, int hd, int d_rel,
+                   int rows, const DevParams* P, int pos_sel, bool is_swa, float* q_out, float* r_out, KvRef kv,
+                   cudaStream_t st, int pos_add = 0);
+// Causal relative-position-bias attention with per-query sink, virtual 0 sink, optional sliding window & ring KV,
+// and optional sigmoid(gate) multiply. out == nullptr writes fused split_out(L, rows, nh * hd, false).
+void rel_attention(const float* q, const float* r, KvRef kv, const float* rel_bias, const float* sink, int ld_sink,
+                   const float* gate, int ld_gate, int nh, int nkv, int hd, int d_rel, int rel_extent, int window,
+                   int rows, const DevParams* P, float* out, int ld_out, float* partial, int splits, const Launch& L,
+                   int pos_add = 0);
+
+// Sparse MoE routing, SiTU activation, and row-independent expert GEMMs (ops/moe/ref.h, ops/activation/ref.h).
+struct ExpertMat {
+  int n_experts = 0;
+  int N = 0;
+  const bf16* w = nullptr;
+  const uint8_t* q = nullptr;
+  const uint8_t* s = nullptr;
+  const float* rs = nullptr;  // [n_experts] per-expert F32 scale
+  BlockMat blk{};             // packed GGML blocks, rows = n_experts * N
+  bool packed() const { return blk.data != nullptr; }
+};
+struct MoeScratch {
+  int* counts = nullptr;      // [max_experts]
+  int* offsets = nullptr;     // [max_experts + 1]
+  int* pairs = nullptr;       // [chunk_rows * max_top_k]
+  float* down_buf = nullptr;  // [chunk_rows * max_top_k * H]
+  int chunk_rows = 0;
+  int max_experts = 0;
+  int max_top_k = 0;
+};
+void moe_route(const float* logits, const float* bias, int rows, int n_experts, int top_k, bool gating_sigmoid,
+               bool norm_weights, float norm_eps, float route_scale, int* idx_out, float* w_out, cudaStream_t st);
+void situ_rows(const float* gu, int ld_gu, int I, float beta, float linear_beta, float* out, int ld_out, int rows,
+               cudaStream_t st);
+// gate_up over selected experts eidx [rows, top_k]: fuse_act=false writes [rows*top_k, 2*I];
+// fuse_act=true applies SiTU/SwiGLU in registers and writes [rows*top_k, I] (bit-identical to unfused + situ_rows).
+void moe_gate_up(const float* x, int ldx, const ExpertMat& W, const int* eidx, int rows, int top_k, int I, int K,
+                 float situ_beta, float situ_linear_beta, bool fuse_act, float* out, int ld_out, const MoeScratch* sc,
+                 const Launch& L);
+// Weighted down-projection: out[r, n] (=|+=) sum_{k=0..top_k-1} ew[r, k] * down_{eidx[r, k]}(act[r * top_k + k])[n].
+void moe_down(const float* act, int ld_act, const ExpertMat& W, const int* eidx, const float* ew, int rows, int top_k,
+              int H, int K, float* out, int ld_out, bool accumulate, const MoeScratch* sc, const Launch& L);
+
+// ---- DSpark drafter kernels (dspark.cu) -----------------------------------------------------
+// Weighted sum of n_taps tapped features [rows, ld_feats] -> RMSNorm -> out [rows, H].
+void dspark_ctx_mix_norm(const float* feats, int ld_feats, const float* mix, const float* norm_w, float eps, int n_taps,
+                         int rows, int H, float* out, cudaStream_t st);
+// Initialize DSpark draft block: row 0 = rmsnorm(anchor_emb, tok_norm), rows 1..B-1 = mask_embd[0..B-2],
+// *prev_out = P->anchor, state_out[0..markov_rank) = 0.
+void dspark_prep_block(const DevParams* P, const float* anchor_emb, const float* tok_norm_w, float eps,
+                       const float* mask_embd, int B, int H, float* dx, int* prev_out, float* state_out,
+                       int markov_rank, cudaStream_t st);
+// Non-causal block-uniform attention over context [max(0, P->position - window + 1), P->position) plus B block rows.
+void dspark_block_attention(const float* q, const kv16* Kc, const kv16* Vc, int nh, int nkv, int hd, int B, int window,
+                            float scale, const DevParams* P, float* out, int ld_out, float* partial, int splits,
+                            const Launch& L);
+// Pack Markov RNN input [state (Rk) | w1_row (Rk, untouched if null) | hidden_i (H) | f_rnn (H)] into joint_out.
+void dspark_markov_pack(const DevParams* P, const float* state, const float* w1_row, const float* hidden_i,
+                        const float* hring, int Rk, int H, float* joint_out, cudaStream_t st);
+// Markov RNN gate update: joint = joint_out + joint_bias -> update state [Rk] in place and write markov_out [Rk].
+void dspark_markov_gate(const float* joint_out, const float* joint_bias, int Rk, float* state, float* markov_out,
+                        cudaStream_t st);
+// Combine base + bias + w2_b (nullable), apply optional softcap, write to out (may alias base).
+void dspark_combine_logits(const float* base, const float* bias, const float* w2_b, int V, float softcap, float* out,
+                           cudaStream_t st);
+// Commit step's picked token (or oracle when P->oracle_len > 0) to drafts[step] and prev_tok.
+void dspark_pick_step(const DevParams* P, const int* oracle, int step, int* prev_tok, int* drafts, cudaStream_t st);
+
 }  // namespace flyx::cuda

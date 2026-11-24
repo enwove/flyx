@@ -248,4 +248,15 @@ void pool_tree(int width, int ranks, int depths, int k, const int32_t* cand, con
   }
 }
 
+// DSpark Markov RNN head step (Inkling-2): updates `state` [rank] in place and writes `markov` [rank]
+// from joint_out = joint_proj([state | w1_prev | hidden_i | f_rnn]) + joint_proj_b ([3 * rank]).
+inline void dspark_markov_gate(const double* joint_out, int rank, double* state, double* markov) {
+  for (int j = 0; j < rank; ++j) {
+    const double g = 1.0 / (1.0 + std::exp(-joint_out[j]));
+    const double c = std::tanh(joint_out[rank + j]);
+    state[j] = c + g * (state[j] - c);
+    markov[j] = std::tanh(joint_out[2 * rank + j]);
+  }
+}
+
 }  // namespace flyx::ops

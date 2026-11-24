@@ -390,7 +390,7 @@ bool nvfp4_inputs(const flyx_model_desc& desc, bool* on, std::string* err) {
     const flyx_weight& w = desc.weights[i];
     if (!w.t || (w.t->dtype != FLYX_DT_NVFP4 && w.t->dtype != FLYX_DT_GGML_NVFP4)) continue;
     if (w.activations != FLYX_ACT_NVFP4) {
-      ++without;
+      if (w.t->ndim == 2) ++without;  // 3D MoE experts always use bf16 activations (FLYX_ACT_FORMAT)
       continue;
     }
     ++with;
@@ -555,6 +555,7 @@ int open_model(const flyx_model_desc* desc, const flyx_open_options* opts, flyx_
         if (const auto* g = std::get_if<GdnBlock>(&b)) nvfp4 = nvfp4 && g->w_in.q && g->w_out.q;
         else if (const auto* a = std::get_if<AttnBlock>(&b)) nvfp4 = nvfp4 && a->w_in.q && a->w_out.q;
         else if (const auto* f = std::get_if<MlpBlock>(&b)) nvfp4 = nvfp4 && f->w_gu.q && f->w_down.q;
+        else if (std::holds_alternative<RelAttnBlock>(b) || std::holds_alternative<MoeBlock>(b)) nvfp4 = false;
       }
       size_t free_b = 0, total_b = 0;
       const bool roomy = gpu_memory(&free_b, &total_b) && free_b >= size_t(24) * 1000000000;
@@ -584,7 +585,8 @@ int open_model(const flyx_model_desc* desc, const flyx_open_options* opts, flyx_
     // From the description: a drafter's layers may come before its block, and run out of memory before it is bound.
     bool drafter = false;
     for (int i = 0; i < desc->n_blocks; ++i)
-      for (int k : {FLYX_BLOCK_MTP, FLYX_BLOCK_DFLASH2, FLYX_BLOCK_DFLASH2_LAYER, FLYX_BLOCK_DV, FLYX_BLOCK_DV_LAYER})
+      for (int k : {FLYX_BLOCK_MTP, FLYX_BLOCK_DFLASH2, FLYX_BLOCK_DFLASH2_LAYER, FLYX_BLOCK_DV, FLYX_BLOCK_DV_LAYER,
+                    FLYX_BLOCK_DSPARK, FLYX_BLOCK_DSPARK_LAYER})
         drafter = drafter || desc->blocks[i].kind == k;
     char head[160] = "Not enough VRAM while loading weights.";
     if (has_others)

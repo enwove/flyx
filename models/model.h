@@ -30,7 +30,7 @@ using interfaces::ModelOptions;
 // name: the engine sees drafters by number and the round widths each offers
 // (draft_widths).  DV (models/dv.h) drafts trees, and its canvas follows its
 // own rounds only (Model::restarts).
-enum class Drafter { kNone, kMtp, kDFlash2, kDv };
+enum class Drafter { kNone, kMtp, kDFlash2, kDv, kDSpark };
 const char* drafter_name(Drafter d);
 
 // What a .flyx file says of its NVFP4 weights' inputs ("quant": {"activations": ...}; "" if nothing).
@@ -41,6 +41,7 @@ struct DrafterSources {
   bool mtp = false, dflash2 = false;                // the model has one
   bool mtp_beside = false, dflash2_beside = false;  // ... from a drafter file
   bool dv = false;                                  // the model file has a DV drafter
+  bool dspark = false, dspark_beside = false;       // DSpark drafter (Inkling-2 companion GGUF)
 };
 
 // The drafters a model holds, the MTP layer first: the one
@@ -70,8 +71,9 @@ class Tables {
   bool has(const std::string& name) const { return file_->tensor(name) != nullptr; }
   // A weight of this shape (NVFP4: the logical [N, K], with its scales).
   // Asking for the same tensor twice gives the same index.  Throws when the
-  // tensor is missing or has another shape.
-  int weight(const std::string& name, std::vector<int64_t> shape);
+  // tensor is missing or has another shape.  Optional `ggml_scale_name` binds
+  // a per-tensor or per-expert F32 scale to GGML weights (NVFP4 or requantized MoE experts, ABI 44).
+  int weight(const std::string& name, std::vector<int64_t> shape, const std::string& ggml_scale_name = "");
   flyx_norm norm(const std::string& name, int64_t n, double offset, double eps) {
     return {weight(name, {n}), 0, offset, eps};
   }

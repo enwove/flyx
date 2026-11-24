@@ -138,6 +138,7 @@ jinja::value message_to_jinja(const ChatMessage& m) {
     insert_input_lit(obj, "tool_calls", std::move(calls));
   }
   if (!m.tool_call_id.empty()) insert_input_lit(obj, "tool_call_id", make_jinja_string(m.tool_call_id, true));
+  if (!m.name.empty()) insert_input_lit(obj, "name", make_jinja_string(m.name, true));
   return obj;
 }
 
@@ -231,11 +232,12 @@ void hash_chat_message(uint64_t& h, const ChatMessage& m) {
     hash_ojson(h, c.arguments);
   }
   hash_str(h, m.tool_call_id);
+  hash_str(h, m.name);
 }
 
 bool same_chat_message(const ChatMessage& a, const ChatMessage& b) {
   if (a.role != b.role || a.content != b.content || a.reasoning != b.reasoning || a.tool_call_id != b.tool_call_id ||
-      a.tool_calls.size() != b.tool_calls.size())
+      a.name != b.name || a.tool_calls.size() != b.tool_calls.size())
     return false;
   for (size_t i = 0; i < a.tool_calls.size(); ++i)
     if (a.tool_calls[i].id != b.tool_calls[i].id || a.tool_calls[i].name != b.tool_calls[i].name ||

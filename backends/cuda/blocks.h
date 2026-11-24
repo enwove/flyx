@@ -57,6 +57,12 @@ struct KvSpec {
   int layers = 1, nkv = 0, hd = 0;
   bool fp8 = false;    // e4m3 with a scale per position and KV head (one cache only)
   bool draft = false;  // only drafting reads it (the MTP layer's): on the device, never in tiers
+  int window = 0;      // >0: sliding-window ring cache kept on device (never tiered)
+};
+// Recurrent state of a depthwise ShortConv layer (Inkling-2): (conv - 1) x channels window
+// in FLYX_ROUND_SLOTS slots, round replay inputs, and checkpoint copies.
+struct ShortConvSpec {
+  int conv = 0, channels = 0;
 };
 // Recurrent state of a gated delta net (GdnDims): state and conv window in
 // FLYX_ROUND_SLOTS slots, the round's per-row inputs kept for the commit
@@ -66,6 +72,7 @@ struct KvSpec {
 struct StateTable {
   std::vector<KvSpec> kv;
   std::vector<GdnDims> gdn;
+  std::vector<ShortConvSpec> sconv;
   int ring_width = 0;  // 0: none
 };
 
@@ -75,6 +82,8 @@ struct EmbedBlock {
   int hidden = 0, vocab = 0;
   bf16* table = nullptr;  // [vocab, hidden]; null when packed
   BlockMat blk;           // the table as packed GGML blocks (data null: bf16)
+  bool has_norm = false;
+  Norm norm{};            // optional post-embedding RMSNorm (Inkling-2)
 };
 
 // norm -> q (| output gate) | k | v -> q/k norms, rotary on the first `rot`
@@ -115,7 +124,8 @@ struct MlpBlock {
 
 // Final norm -> logits -> the token choice per row.
 struct HeadBlock {
-  int hidden = 0, vocab = 0;
+  int hidden = 0, vocab = 0;   // vocab is vocab_out (unpadded) when vocab_out > 0
+  float softcap = 0.f;         // >0: z = softcap * tanh(z / softcap)
   Norm norm;
   bf16* w = nullptr;           // [vocab, hidden]; the embedding table when tied; null when packed
   BlockMat wb;                 // the head as packed GGML blocks (data null: bf16); no copies below then
@@ -196,8 +206,74 @@ struct DvBlock {
   float *sel_ta = nullptr, *sel_tb = nullptr;  // [vocab][sel_rank]: A E[t] and B E[t] for every token t
 };
 
+// Inkling-2 relative-position-bias attention (SWA or Global) with AttnRes, optional cross-pass loop control,
+// Q/K/R L2 clipping, no-gamma V RMSNorm, per-query sink, and depthwise ShortConv on K/V/output.
+struct RelAttnBlock {
+  int hidden = 0, nh = 0, nkv = 0, hd = 0;
+  int d_rel = 0, rel_extent = 0, window = 0, conv = 0, log_scale_floor = 0;
+  float qk_clip = 0.f, rel_clip = 0.f, log_scale_alpha = 0.f, eps = 0.f;
+  Norm q_norm_in, k_norm_in, v_norm_in;
+  Lin w_qgr, w_q, w_gate, w_rel;  // stacked {q, gate, rel} when compatible, else separate
+  bool stacked_qgr = false;
+  Lin w_k, w_v, w_o, w_sink, w_k_conv_proj, w_v_conv_proj;
+  float *rel_bias = nullptr, *q_clip_w = nullptr, *rel_clip_w = nullptr;
+  float *k_conv = nullptr, *v_conv = nullptr, *post_conv = nullptr;
+  float *res_query = nullptr, *loop_msg_query = nullptr;
+  int res_push = 0, loop_rank = 0;
+  Lin loop_ctrl_down[3], loop_ctrl_gf[3], loop_ctrl_gain[3], loop_ctrl_forget[3];
+  bool loop_ctrl_stacked[3] = {};
+  int kv = -1, sconv = -1;
+};
+
+// Inkling-2 sparse MoE block with AttnRes, optional cross-pass loop control, SiTU activation, and post ShortConv.
+struct MoeBlock {
+  int hidden = 0, inter = 0, n_experts = 0, top_k = 0, conv = 0;
+  bool gating_sigmoid = true, norm_weights = true;
+  float route_scale = 1.f, norm_eps = 1e-20f, situ_beta = 0.f, situ_linear_beta = 0.f;
+  Norm norm;
+  Lin router;
+  float* router_bias = nullptr;
+  ExpertMat gate_up, down;
+  float *post_conv = nullptr, *res_query = nullptr;
+  int loop_rank = 0;
+  Lin loop_ctrl_down, loop_ctrl_gf, loop_ctrl_gain, loop_ctrl_forget;
+  bool loop_ctrl_stacked = false;
+  int sconv = -1, sconv_offset = 0;
+};
+
+// DSpark companion drafter (Inkling-2): 3-layer DFlash with block-uniform SWA/Full + Markov RNN head.
+struct DSparkLayer {
+  int window = 0;
+  Norm norm, post_norm, q_norm, k_norm, k_ctx_norm, ctx_norm;
+  Lin w_qkv, w_q, w_k, w_v, w_o;
+  bool stacked_qkv = false;
+  Lin w_ctx_kv, w_k_ctx, w_v_ctx;
+  bool stacked_ctx_kv = false;
+  Lin w_gu, w_gate, w_up, w_down;
+  bool stacked_gu = false;
+  float* ctx_mix = nullptr;  // [n_taps]
+};
+struct DSparkBlock {
+  int hidden = 0, nh = 0, nkv = 0, hd = 0, inter = 0;
+  int block = 0, n_taps = 0, markov_rank = 0, vocab_out = 0;
+  double theta = 0;
+  float softcap = 0.f;
+  int embed = -1, head = -1, first_layer = -1, n_layers = 0;
+  Norm tok_norm, norm, markov_ctx_norm;
+  float* mask_embd = nullptr;       // [block - 1, hidden]
+  float* markov_ctx_mix = nullptr;  // [n_taps]
+  bf16* markov_w1 = nullptr;        // [vocab_out, markov_rank] (null when packed)
+  BlockMat markov_w1_blk{};         // packed GGML blocks for markov_w1 (data null: bf16)
+  Lin markov_w2;                    // [vocab_out, markov_rank]
+  float* markov_w2_b = nullptr;     // [vocab_out] (nullable)
+  Lin joint_proj;                   // [3 * markov_rank, 2 * hidden + 2 * markov_rank]
+  float* joint_proj_b = nullptr;    // [3 * markov_rank]
+  int kv = -1;                      // StateTable::kv
+  int layers() const { return n_layers; }
+};
+
 using Block = std::variant<EmbedBlock, AttnBlock, GdnBlock, MlpBlock, HeadBlock, MtpBlock, DFlashBlock, DFlashLayer,
-                           DvBlock, DvLayer>;
+                           DvBlock, DvLayer, RelAttnBlock, MoeBlock, DSparkBlock, DSparkLayer>;
 
 // ---- a sequence's state, as the table declares it -------------------------------------------
 struct KvBuf {
@@ -252,7 +328,13 @@ struct KvBuf {
   size_t hot_tags = 0;  // slots, all heads
   // The MTP layer's: its draft steps attend to its first `sink` positions and its last `window` (0:
   // all), which a ring of `ring` slots holds (0: a slot a position).
+  // SWA target layers (KvSpec::window > 0): fixed GPU ring buffer (`swa_ring = true`), checkpointed on host.
   int ring = 0, sink = 0, window = 0;
+  bool swa_ring = false;
+  void* ckp_k[FLYX_CHECKPOINTS]{};
+  void* ckp_v[FLYX_CHECKPOINTS]{};
+  float* ckp_ks[FLYX_CHECKPOINTS]{};
+  float* ckp_vs[FLYX_CHECKPOINTS]{};
   KvRef ref() const {  // where a pass writes
     KvRef r{k, v, ks, vs, kq, vq, kqs, vqs, bits, words, grid, hot_tag, hot_claim, hot, hot_bits,
             vk ? device_positions : INT32_MAX, ring, sink};
@@ -303,6 +385,12 @@ struct GdnBuf {
   GdnBufs replay{};                    // the round's rows, a slot each
   float* ckp_S[FLYX_CHECKPOINTS]{};  // the checkpoints' state and window, in host memory
   float* ckp_win[FLYX_CHECKPOINTS]{};
+};
+struct ShortConvBuf {
+  int conv = 0, channels = 0;
+  float *win = nullptr, *replay = nullptr;  // FLYX_ROUND_SLOTS and kGdnReplaySlots slots each
+  size_t w_stride = 0, r_stride = 0;        // floats per slot
+  float* ckp_win[FLYX_CHECKPOINTS]{};       // host checkpoints
 };
 
 }  // namespace flyx::cuda

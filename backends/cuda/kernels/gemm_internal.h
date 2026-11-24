@@ -40,7 +40,9 @@ struct BlockTables {
   const uint32_t* pair_u4;   // [256]  a byte's two nibbles (the low one first)
   const uint32_t* pair_s4;   // [256]  the same less 8
   const uint32_t* pair_iq4;  // [256]  the same through IQ4's 16 values
+  const uint32_t* pair_mxfp4;  // [256] the same through MXFP4's 16 values (2 * e2m1)
   const uint2* quad_u2;      // [256]  a byte's four 2-bit codes
+  const uint2* quad_s2;      // [256]  the same less 1 (Q2_0: -1, 0, 1, 2)
   const uint2* quad_hi6;     // [256]  16 c - 32 of them: the high bits of Q6_K's codes, with its bias
   const uint2* quad_mask;    // [16]   4 b - 4 of four bits: Q3_K's mask
   const uint16_t* int8;      // [256]  a signed byte
@@ -54,6 +56,7 @@ struct BlockTables {
   uint32_t iq3_s8[2][2];         // IQ3_XXS, IQ3_S: magnitudes 0..3, 4..7
   uint32_t iq1_s8[2];            // 8 w + 1, then 8 w - 1, for w = -1, 0, 1
   const uint16_t* pair_iq4_s8;   // [256]  a byte's two nibbles through IQ4's 16 values, as int8 (the low one first)
+  const uint16_t* pair_mxfp4_s8; // [256]  the same through MXFP4's 16 values, as int8
   // IQ4's 16 values as int8 (byte i: value i), in registers: k_round_blocks_warps looks a nibble up with byte_perm.
   uint32_t iq4_s8[4];
 };

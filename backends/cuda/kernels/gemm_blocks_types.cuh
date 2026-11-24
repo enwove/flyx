@@ -103,6 +103,19 @@ constexpr uint32_t kHalf16 = 0x4C00u, kHalfMinus16 = 0xCC00u, kOnes = 0x3C003C00
 
 __device__ __forceinline__ float half_of(uint32_t bits) { return __half2float(__ushort_as_half(uint16_t(bits))); }
 __device__ __forceinline__ float scale_at(const uint16_t* plane, size_t i) { return half_of(plane[i]); }
+// Types whose scales plane stores the high 16 bits of float32 (bfloat16, exact for MXFP4 E8M0 powers of two)
+// instead of binary16.
+template <class F, class = void>
+constexpr bool kScaleBf16 = false;
+template <class F>
+constexpr bool kScaleBf16<F, std::void_t<decltype(F::kScaleBf16)>> = F::kScaleBf16;
+template <class F>
+__device__ __forceinline__ float scale_bits(uint32_t bits) {
+  if constexpr (kScaleBf16<F>) return __uint_as_float((bits & 0xFFFFu) << 16);
+  else return half_of(bits);
+}
+template <class F>
+__device__ __forceinline__ float scale_of(const uint16_t* plane, size_t i) { return scale_bits<F>(plane[i]); }
 
 // D (+)= A B on mma.m16n8k16: binary16 inputs, float32 accumulators.
 __device__ __forceinline__ void mma_f16(float* c, const uint32_t* a, const uint32_t* b) {
@@ -431,6 +444,104 @@ struct FIQ4_NL {  // q = the 16-value table's entry of the code
   }
 };
 static_assert(sizeof(block_iq4_nl) == 18 && offsetof(block_iq4_nl, qs) == 2, "block_iq4_nl");
+
+// MXFP4 (32 weights): E8M0 scale stored as exact bfloat16 in the scales plane (blocks_pack),
+// 16 bytes of E2M1 nibble pairs (kvalues_mxfp4 = 2 * e2m1, scale = 0.5 * 2^(e - 127)).
+struct FMXFP4 {
+  static constexpr int kDtype = FLYX_DT_GGML_MXFP4, kValues = 32, kBytes = 17, kSkip = 1, kStride = 16;
+  static constexpr int kScales = 1, kS0 = -1, kS1 = -1, kPlanes = 1;
+  static constexpr int kFlatRun = 0;
+  static constexpr bool kScaleBf16 = true;
+  using Local = Iq4Table;
+  static __device__ __forceinline__ void tables(const Tables& T, Local& L) {
+    fetch(L.pairs, T.pair_mxfp4, 256);
+    fetch(L.pairs8, T.pair_mxfp4_s8, 256);
+  }
+  FLYX_NIBBLES32
+  static __device__ __forceinline__ void words(const Local& L, const Lane& n, int, uint32_t* w0, uint32_t*) {
+    words_of_nibbles(L.pairs, n, w0);
+  }
+  static __device__ __forceinline__ float coef(int, float d0, float) { return d0; }
+  static constexpr int kSub = 32;
+  static __device__ __forceinline__ void codes(const Tables&, const Local& L, const Lane& n, int, uint32_t* w) {
+    w[0] = nibbles_through(L.pairs8, n.q[0] >> n.shift);
+    w[1] = nibbles_through(L.pairs8, n.q[1] >> n.shift);
+  }
+  static __device__ __forceinline__ void factors(const Lane&, int, float d0, float, float* f, float* m) {
+    *f = d0, *m = 0.f;
+  }
+  struct Unit {
+    uint4 q;
+  };
+  static __device__ __forceinline__ Unit unit(const uint8_t* p, int) { return {ld128(p)}; }
+  static __device__ __forceinline__ void unit_codes(const Tables&, const Local& L, const Unit& u, int, uint32_t* w) {
+#pragma unroll
+    for (int i = 0; i < 4; ++i) {
+      w[i] = nibbles_through(L.pairs8, word(u.q, i));
+      w[4 + i] = nibbles_through(L.pairs8, word(u.q, i) >> 4);
+    }
+  }
+  static __device__ __forceinline__ void unit_factors(const Unit&, int, float d0, float, float* f, float* m) {
+    f[0] = d0, m[0] = 0.f;
+  }
+};
+static_assert(sizeof(block_mxfp4) == 17 && offsetof(block_mxfp4, qs) == 1, "block_mxfp4");
+
+// Unpack one byte of four 2-bit Q2_0 codes (c0 | c1<<2 | c2<<4 | c3<<6) to four int8s (c - 1).
+__device__ __forceinline__ uint32_t q2_0_byte_s8(uint32_t b) {
+  const uint32_t q = (b & 3u) | ((b & 0x0Cu) << 6) | ((b & 0x30u) << 12) | ((b & 0xC0u) << 18);
+  return __vsub4(q, 0x01010101u);
+}
+
+// Q2_0 (64 weights = 2 groups of 32): binary16 scale d, 16 bytes of 4 packed 2-bit codes (q - 1) per byte.
+struct FQ2_0 {
+  static constexpr int kDtype = FLYX_DT_GGML_Q2_0, kValues = 64, kBytes = 18, kSkip = 2, kStride = 16;
+  static constexpr int kScales = 1, kS0 = 0, kS1 = -1, kPlanes = 1;
+  static constexpr int kFlatRun = 0;
+  struct Local {
+    uint2 quad[256];
+  };
+  static __device__ __forceinline__ void tables(const Tables& T, Local& L) { fetch(L.quad, T.quad_s2, 256); }
+  struct Lane {
+    uint32_t g0, g1;  // 2 bytes (8 weights) for group 0 and group 1
+  };
+  using Raw = Lane;
+  static __device__ __forceinline__ Raw load(const uint8_t* p, int t) {
+    return {ld16(p + 2 * t), ld16(p + 8 + 2 * t)};
+  }
+  static __device__ __forceinline__ Lane build(const Raw& r, int) { return r; }
+  FLYX_LANES_LOAD
+  static __device__ __forceinline__ void words(const Local& L, const Lane& n, int G, uint32_t* w0, uint32_t*) {
+    const uint32_t b2 = G == 0 ? n.g0 : n.g1;
+    put(w0, L.quad[b2 & 0xFFu]);
+    put(w0 + 2, L.quad[(b2 >> 8) & 0xFFu]);
+  }
+  static __device__ __forceinline__ float coef(int, float d0, float) { return d0; }
+  static constexpr int kSub = 32;
+  static __device__ __forceinline__ void codes(const Tables&, const Local&, const Lane& n, int G, uint32_t* w) {
+    const uint32_t b2 = G == 0 ? n.g0 : n.g1;
+    w[0] = q2_0_byte_s8(b2 & 0xFFu);
+    w[1] = q2_0_byte_s8((b2 >> 8) & 0xFFu);
+  }
+  static __device__ __forceinline__ void factors(const Lane&, int, float d0, float, float* f, float* m) {
+    *f = d0, *m = 0.f;
+  }
+  struct Unit {
+    uint2 q;  // 8 bytes = 32 weights of group G
+  };
+  static __device__ __forceinline__ Unit unit(const uint8_t* p, int G) { return {ld64(p + 8 * G)}; }
+  static __device__ __forceinline__ void unit_codes(const Tables&, const Local&, const Unit& u, int, uint32_t* w) {
+#pragma unroll
+    for (int i = 0; i < 4; ++i) {
+      w[i] = q2_0_byte_s8((u.q.x >> (8 * i)) & 0xFFu);
+      w[4 + i] = q2_0_byte_s8((u.q.y >> (8 * i)) & 0xFFu);
+    }
+  }
+  static __device__ __forceinline__ void unit_factors(const Unit&, int, float d0, float, float* f, float* m) {
+    f[0] = d0, m[0] = 0.f;
+  }
+};
+static_assert(sizeof(block_q2_0) == 18 && offsetof(block_q2_0, qs) == 2, "block_q2_0");
 
 // 5-bit codes: the fifth bits in a word (bit j: weight j), then the nibbles as above.
 struct Fifths32 {
@@ -1743,8 +1854,9 @@ static_assert(sizeof(block_iq4_xs) == 136 && offsetof(block_iq4_xs, scales_h) ==
               "block_iq4_xs");
 
 #define FLYX_BLOCK_TYPES(X)                                                                  \
-  X(FQ4_0) X(FQ4_1) X(FQ5_0) X(FQ5_1) X(FQ8_0) X(FQ2_K) X(FQ3_K) X(FQ4_K) X(FQ5_K) X(FQ6_K) \
-  X(FIQ2_XXS) X(FIQ2_XS) X(FIQ2_S) X(FIQ3_XXS) X(FIQ3_S) X(FIQ1_S) X(FIQ1_M) X(FIQ4_NL) X(FIQ4_XS)
+  X(FQ4_0) X(FQ4_1) X(FQ5_0) X(FQ5_1) X(FQ8_0) X(FMXFP4) X(FQ2_0) X(FQ2_K) X(FQ3_K) X(FQ4_K) \
+  X(FQ5_K) X(FQ6_K) X(FIQ2_XXS) X(FIQ2_XS) X(FIQ2_S) X(FIQ3_XXS) X(FIQ3_S) X(FIQ1_S) X(FIQ1_M) \
+  X(FIQ4_NL) X(FIQ4_XS)
 
 }  // namespace
 }  // namespace flyx::cuda

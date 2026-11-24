@@ -96,15 +96,31 @@ void ensure_checkpoint_slot(flyx_seq* s, int c) {
   auto* base = static_cast<unsigned char*>(p);
   s->ckp_arena[c] = base;
   size_t off = 0;
-  auto take = [&](size_t bytes) -> float* {
+  auto take_raw = [&](size_t bytes) -> void* {
     const size_t aligned = (bytes + 255) / 256 * 256;
-    auto* ptr = reinterpret_cast<float*>(base + off);
+    void* ptr = base + off;
     off += aligned;
     return ptr;
   };
+  auto take = [&](size_t bytes) -> float* { return static_cast<float*>(take_raw(bytes)); };
   for (auto& g : s->gdn) {
     g.ckp_S[c] = take(g.s_stride * sizeof(float));
     g.ckp_win[c] = take(g.w_stride * sizeof(float));
+  }
+  for (auto& sc : s->sconv) sc.ckp_win[c] = take(sc.w_stride * sizeof(float));
+  for (size_t i = 0; i < s->kv.size(); ++i) {
+    auto& kb = s->kv[i];
+    if (!kb.swa_ring) continue;
+    const KvSpec& ks = s->m->states.kv[i];
+    const size_t elem = ks.fp8 ? 1 : sizeof(kv16);
+    const size_t bytes = size_t(kb.ring) * size_t(ks.nkv) * size_t(ks.hd) * elem;
+    kb.ckp_k[c] = take_raw(bytes);
+    kb.ckp_v[c] = take_raw(bytes);
+    if (ks.fp8) {
+      const size_t sbytes = size_t(kb.ring) * size_t(ks.nkv) * sizeof(float);
+      kb.ckp_ks[c] = take(sbytes);
+      kb.ckp_vs[c] = take(sbytes);
+    }
   }
   if (const int w = s->m->states.ring_width) {
     s->ring_ckp[c] = take(size_t(w) * sizeof(float));
@@ -114,11 +130,29 @@ void ensure_checkpoint_slot(flyx_seq* s, int c) {
 
 void copy_checkpoint_state(flyx_seq* s, int c, int sl, int pos, bool save, bool snap = false) {
   auto move = [&](void* host, void* dev, size_t bytes) {
+    if (bytes == 0) return;
     CK(cudaMemcpyAsync(save ? host : dev, save ? dev : host, bytes, cudaMemcpyDefault, s->st));
   };
   for (auto& g : s->gdn) {
     move(g.ckp_S[c], g.S + sl * g.s_stride, g.s_stride * sizeof(float));
     move(g.ckp_win[c], g.win + sl * g.w_stride, g.w_stride * sizeof(float));
+  }
+  for (auto& sc : s->sconv) move(sc.ckp_win[c], sc.win + sl * sc.w_stride, sc.w_stride * sizeof(float));
+  for (size_t i = 0; i < s->kv.size(); ++i) {
+    auto& kb = s->kv[i];
+    if (!kb.swa_ring) continue;
+    const int n_slots = std::min(pos, kb.ring);
+    if (n_slots <= 0) continue;
+    const KvSpec& ks = s->m->states.kv[i];
+    const size_t elem = ks.fp8 ? 1 : sizeof(kv16);
+    const size_t bytes = size_t(n_slots) * size_t(ks.nkv) * size_t(ks.hd) * elem;
+    move(kb.ckp_k[c], kb.k, bytes);
+    move(kb.ckp_v[c], kb.v, bytes);
+    if (ks.fp8) {
+      const size_t sbytes = size_t(n_slots) * size_t(ks.nkv) * sizeof(float);
+      move(kb.ckp_ks[c], kb.ks, sbytes);
+      move(kb.ckp_vs[c], kb.vs, sbytes);
+    }
   }
   const size_t w = size_t(s->m->states.ring_width);
   if (s->ring && pos > 0) {  // snap: saved before hring_put overwrote kHring slots; else the ring holds pos - 1
@@ -215,6 +249,8 @@ void reset_state(flyx_seq* s, int anchor) {
     CK(cudaMemsetAsync(g.S, 0, FLYX_ROUND_SLOTS * g.s_stride * sizeof(float), s->st));
     CK(cudaMemsetAsync(g.win, 0, FLYX_ROUND_SLOTS * g.w_stride * sizeof(float), s->st));
   }
+  for (auto& sc : s->sconv)
+    CK(cudaMemsetAsync(sc.win, 0, FLYX_ROUND_SLOTS * sc.w_stride * sizeof(float), s->st));
   for (auto& mt : s->meta) mt = {};
   set_params(s, 0, anchor, 0);
 }
@@ -856,6 +892,11 @@ int launch_batch(flyx_plan* const* plans, flyx_seq* const* seqs, const flyx_gen_
     if (!seqs[i]) return no_sequence("launch_batch");
   if (n == 1) return launch(plans[0], seqs[0], gens[0]);
   flyx_bmodel* m = seqs[0]->m;
+  if (m->need.max_bank > 0 || m->dspark_block >= 0) {
+    for (int i = 0; i < n; ++i)
+      if (const int r = launch(plans[i], seqs[i], gens[i]); r != 0) return r;
+    return 0;
+  }
   int rows = 0;
   for (int i = 0; i < n; ++i) {
     if (plans[i]->phase != FLYX_PHASE_ROUND || plans[i]->m != m || seqs[i]->m != m)
@@ -1114,6 +1155,20 @@ int rewind(flyx_seq* s, int32_t pos, int32_t anchor) {
         gdn_conv_fold(g.win, g.w_stride, kSlotExplicit + sl, kSlotExplicit + to, g.replay, kSlotExplicit + rsl, s->P,
                       rows, nullptr, false, s->st);
       }
+      if (!s->sconv.empty()) {
+        if (s->sconv_alike) {
+          const ShortConvBuf& f = s->sconv[0];
+          shortconv_fold(s->sconv_layers, int(s->sconv.size()), f.w_stride, f.r_stride, kSlotExplicit + sl,
+                         kSlotExplicit + to, kSlotExplicit + rsl, f.channels, f.conv, s->P, rows, nullptr, false,
+                         s->st);
+        } else {
+          for (size_t i = 0; i < s->sconv.size(); ++i) {
+            const ShortConvBuf& sc = s->sconv[i];
+            shortconv_fold(s->sconv_layers + i, 1, sc.w_stride, sc.r_stride, kSlotExplicit + sl, kSlotExplicit + to,
+                           kSlotExplicit + rsl, sc.channels, sc.conv, s->P, rows, nullptr, false, s->st);
+          }
+        }
+      }
       s->meta[sl].rows = rows;  // tokens past pos are discarded; later rewinds must not replay stale rows
       for (int k = 1; k <= back; ++k) s->meta[flyx_round_slot(r + k)].valid = false;
       set_params(s, pos, anchor, r + 1);
@@ -1185,6 +1240,7 @@ uint64_t layout_hash(const flyx_seq* s) {
     mix(uint64_t(k.hd));
     mix(k.fp8);
     const KvBuf& b = s->kv[i];
+    if (k.window) mix(uint64_t(k.window) << 32 | 79);
     if (b.ring) mix(uint64_t(b.ring) << 32 | 75);  // a ring of slots: saved as its slots are
     if (b.kq) {  // the strata copy, saved with the cache: its format too
       mix(uint64_t(b.bits));
@@ -1200,6 +1256,13 @@ uint64_t layout_hash(const flyx_seq* s) {
     mix(uint64_t(g.dk));
     mix(uint64_t(g.ck));
     mix(uint64_t(g.C()));
+  }
+  if (!m->states.sconv.empty()) {
+    mix(0x53434f4e56ull);
+    for (const ShortConvSpec& sc : m->states.sconv) {
+      mix(uint64_t(sc.conv));
+      mix(uint64_t(sc.channels));
+    }
   }
   mix(uint64_t(m->states.ring_width));
   return h;
@@ -1218,6 +1281,7 @@ uint64_t snapshot_size(const flyx_seq* s, int begin, int pos) {
     }
   }
   for (const GdnBuf& g : s->gdn) n += (g.s_stride + g.w_stride) * sizeof(float);
+  for (const ShortConvBuf& sc : s->sconv) n += sc.w_stride * sizeof(float);
   return n + uint64_t(s->m->states.ring_width) * sizeof(float);
 }
 
@@ -1240,23 +1304,34 @@ void snapshot_parts(flyx_seq* s, int c, int begin, int pos, HostCursor& host, bo
     const int first = b.ring ? 0 : begin, end = b.ring ? std::min(pos, b.ring) : pos;
     const int slots = b.ring ? b.ring : s->cap;
     const size_t elem = k.fp8 ? 1 : sizeof(kv16), width = size_t(k.nkv) * k.hd;
-    for (int l = 0; l < k.layers; ++l) {
-      const size_t offset = (size_t(l) * b.layer_stride + size_t(first) * width) * elem;
+    if (b.swa_ring && save) {
       const size_t bytes = size_t(end - first) * width * elem;
-      copy(static_cast<uint8_t*>(b.k) + offset, bytes);
-      copy(static_cast<uint8_t*>(b.v) + offset, bytes);
-      if (k.fp8 && b.ks_host) {  // the device part's scales, then the others' from host memory
-        const int split = std::clamp(b.device_positions, first, end);
-        auto scales = [&](float* device, float* far) {
-          if (first < split) copy(device + size_t(first) * k.nkv, size_t(split - first) * k.nkv * sizeof(float));
-          if (split < end) copy(far + size_t(split) * k.nkv, size_t(end - split) * k.nkv * sizeof(float));
-        };
-        scales(b.ks, b.ks_host);
-        scales(b.vs, b.vs_host);
-      } else if (k.fp8) {
-        const size_t offset_scales = (size_t(l) * slots + first) * k.nkv;
-        copy(b.ks + offset_scales, size_t(end - first) * k.nkv * sizeof(float));
-        copy(b.vs + offset_scales, size_t(end - first) * k.nkv * sizeof(float));
+      copy(b.ckp_k[c], bytes);
+      copy(b.ckp_v[c], bytes);
+      if (k.fp8) {
+        const size_t sbytes = size_t(end - first) * k.nkv * sizeof(float);
+        copy(b.ckp_ks[c], sbytes);
+        copy(b.ckp_vs[c], sbytes);
+      }
+    } else {
+      for (int l = 0; l < k.layers; ++l) {
+        const size_t offset = (size_t(l) * b.layer_stride + size_t(first) * width) * elem;
+        const size_t bytes = size_t(end - first) * width * elem;
+        copy(static_cast<uint8_t*>(b.k) + offset, bytes);
+        copy(static_cast<uint8_t*>(b.v) + offset, bytes);
+        if (k.fp8 && b.ks_host) {  // the device part's scales, then the others' from host memory
+          const int split = std::clamp(b.device_positions, first, end);
+          auto scales = [&](float* device, float* far) {
+            if (first < split) copy(device + size_t(first) * k.nkv, size_t(split - first) * k.nkv * sizeof(float));
+            if (split < end) copy(far + size_t(split) * k.nkv, size_t(end - split) * k.nkv * sizeof(float));
+          };
+          scales(b.ks, b.ks_host);
+          scales(b.vs, b.vs_host);
+        } else if (k.fp8) {
+          const size_t offset_scales = (size_t(l) * slots + first) * k.nkv;
+          copy(b.ks + offset_scales, size_t(end - first) * k.nkv * sizeof(float));
+          copy(b.vs + offset_scales, size_t(end - first) * k.nkv * sizeof(float));
+        }
       }
     }
     if (b.kq) {  // one layer's (strata attention): its codes 16 positions at a time, its scales
@@ -1290,6 +1365,8 @@ void snapshot_parts(flyx_seq* s, int c, int begin, int pos, HostCursor& host, bo
     copy(save ? g.ckp_S[c] : g.S + sl * g.s_stride, g.s_stride * sizeof(float));
     copy(save ? g.ckp_win[c] : g.win + sl * g.w_stride, g.w_stride * sizeof(float));
   }
+  for (ShortConvBuf& sc : s->sconv)
+    copy(save ? sc.ckp_win[c] : sc.win + sl * sc.w_stride, sc.w_stride * sizeof(float));
   const size_t w = size_t(s->m->states.ring_width) * sizeof(float);
   if (w && pos > 0) copy(save ? s->ring_ckp[c] : s->ring + size_t((pos - 1) % kHring) * (w / sizeof(float)), w);
   else if (w && save)  // no row before position 0

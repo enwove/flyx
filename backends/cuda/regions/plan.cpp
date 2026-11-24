@@ -12,18 +12,26 @@ std::string node_name(const flyx_node& n, const Block* b) {
       if (std::holds_alternative<EmbedBlock>(*b)) return "embed";
       if (std::holds_alternative<GdnBlock>(*b)) return "gdn mixer";
       if (std::holds_alternative<AttnBlock>(*b)) return "attention mixer";
+      if (std::holds_alternative<RelAttnBlock>(*b)) return "rel attention mixer";
       if (std::holds_alternative<MlpBlock>(*b)) return "mlp";
+      if (std::holds_alternative<MoeBlock>(*b)) return "moe";
       return "head + choose";
     case FLYX_NODE_TAP: return "tap";
     case FLYX_NODE_DRAFT:
       if (std::holds_alternative<DvBlock>(*b)) return "dv tree";
+      if (std::holds_alternative<DSparkBlock>(*b)) return "dspark block";
       return std::holds_alternative<MtpBlock>(*b) ? "mtp draft" : "dflash2 block";
     case FLYX_NODE_CONTEXT:
       if (std::holds_alternative<DvBlock>(*b)) return "dv canvas";
+      if (std::holds_alternative<DSparkBlock>(*b)) return "dspark context";
       return std::holds_alternative<MtpBlock>(*b) ? "mtp context" : "dflash2 context";
     case FLYX_NODE_ACCEPT: return "accept";
     case FLYX_NODE_COMMIT: return "commit (fold)";
     case FLYX_NODE_GIVEN: return "given drafts";
+    case FLYX_NODE_RES_RESET: return "res reset";
+    case FLYX_NODE_LOOP_PRELUDE: return "loop prelude";
+    case FLYX_NODE_LOOP_NEXT: return "loop next";
+    case FLYX_NODE_RES_MIX: return "res mix";
     default: return "?";
   }
 }
@@ -39,6 +47,12 @@ bool supported(const flyx_bmodel* m, const Block& blk, std::string* why) {
       return no("the attention prep takes one offset and eps for the q and k norms");
     if (m->states.kv[size_t(a->kv)].fp8 && !kv_fp8_supported(m->opt.kernels, a->nh, a->nkv, a->hd))
       return no("an FP8 KV cache needs 1, 2 or 4 query heads per KV head");
+  } else if (const auto* r = std::get_if<RelAttnBlock>(&blk)) {
+    if (!attention_head_dim(r->hd) || r->nkv < 1 || r->nh % r->nkv || r->d_rel < 1 || r->conv < 2 || r->conv > 64)
+      return no("rel_attn dimensions outside what the CUDA kernels take (head dim 32, 64, 128 or 256, conv 2..64)");
+  } else if (const auto* e = std::get_if<MoeBlock>(&blk)) {
+    if (e->n_experts < 1 || e->top_k < 1 || e->top_k > e->n_experts || (e->post_conv && (e->conv < 2 || e->conv > 64)))
+      return no("MoE dimensions outside what the CUDA kernels support");
   } else if (const auto* g = std::get_if<GdnBlock>(&blk)) {
     if (g->gd.dk > 128 || g->gd.ck > 8 || g->gd.nk < 1 || g->gd.nv % g->gd.nk)
       return no("gated delta net dimensions outside what the CUDA kernels support (key head dim up to 128, conv up to 8)");
@@ -52,6 +66,11 @@ bool supported(const flyx_bmodel* m, const Block& blk, std::string* why) {
         d->conv_group < 1 || d->hidden % d->conv_group || d->nkv < 1 || d->nh % d->nkv)
       return no("drafter dimensions outside what the CUDA kernels support");
     if (d->hidden != m->hidden || d->target_hidden != m->hidden) return no("drafter hidden size differs from the target's");
+  } else if (const auto* ds = std::get_if<DSparkBlock>(&blk)) {
+    if (!attention_head_dim(ds->hd) || ds->block < 2 || ds->block > FLYX_MAX_ROWS || ds->nkv < 1 || ds->nh % ds->nkv ||
+        ds->hidden != m->hidden || ds->markov_rank < 1)
+      return no("DSpark drafter dimensions outside what the CUDA kernels support");
+    if (m->states.ring_width != ds->hidden) return no("DSpark ring width differs from hidden size");
   } else if (const auto* v = std::get_if<DvBlock>(&blk)) {
     if (v->hidden != m->hidden || v->topk != 16 || v->res_k != 16)  // a slot's 16 candidates (DV's kernels: kDvTop)
       return no("DV dimensions outside what the CUDA backend takes (its hidden size, 16 candidates a slot)");
@@ -61,24 +80,32 @@ bool supported(const flyx_bmodel* m, const Block& blk, std::string* why) {
 
 // The block a node runs, if it is one the node can run.
 const Block* block_of(const flyx_bmodel* m, const flyx_node& n, std::string* err) {
-  if (n.kind == FLYX_NODE_ACCEPT || n.kind == FLYX_NODE_COMMIT || n.kind == FLYX_NODE_GIVEN) return nullptr;
+  if (n.kind == FLYX_NODE_ACCEPT || n.kind == FLYX_NODE_COMMIT || n.kind == FLYX_NODE_GIVEN ||
+      n.kind == FLYX_NODE_RES_RESET || n.kind == FLYX_NODE_LOOP_PRELUDE || n.kind == FLYX_NODE_LOOP_NEXT)
+    return nullptr;
+  if (n.kind == FLYX_NODE_RES_MIX) {
+    if (m->vec_weights.find(n.arg0) == m->vec_weights.end())
+      *err = "RES_MIX references missing 1D weight " + std::to_string(n.arg0);
+    return nullptr;
+  }
   if (n.block < 0 || n.block >= int(m->blocks.size())) {
     *err = "node names block " + std::to_string(n.block);
     return nullptr;
   }
   const Block* b = &m->blocks[size_t(n.block)];
   const bool drafter = std::holds_alternative<MtpBlock>(*b) || std::holds_alternative<DFlashBlock>(*b) ||
-                       std::holds_alternative<DvBlock>(*b);
+                       std::holds_alternative<DvBlock>(*b) || std::holds_alternative<DSparkBlock>(*b);
   bool fits = false;
   switch (n.kind) {
     case FLYX_NODE_RUN:
       fits = std::holds_alternative<EmbedBlock>(*b) || std::holds_alternative<AttnBlock>(*b) ||
              std::holds_alternative<GdnBlock>(*b) || std::holds_alternative<MlpBlock>(*b) ||
-             std::holds_alternative<HeadBlock>(*b);
+             std::holds_alternative<HeadBlock>(*b) || std::holds_alternative<RelAttnBlock>(*b) ||
+             std::holds_alternative<MoeBlock>(*b);
       break;
     case FLYX_NODE_TAP: {
-      const auto* d = std::get_if<DFlashBlock>(b);
-      fits = d && n.arg0 >= 0 && n.arg0 < d->n_taps;
+      if (const auto* d = std::get_if<DFlashBlock>(b)) fits = n.arg0 >= 0 && n.arg0 < d->n_taps;
+      else if (const auto* ds = std::get_if<DSparkBlock>(b)) fits = n.arg0 >= 0 && n.arg0 < ds->n_taps;
       break;
     }
     case FLYX_NODE_DRAFT:
@@ -125,6 +152,15 @@ bool fused_dflash_context(const flyx_bmodel*, const Block& blk) {
   const auto* d = std::get_if<DFlashBlock>(&blk);
   return d && d->hidden % 64 == 0;
 }
+bool fused_rel_attn(const flyx_bmodel*, const Block& blk) {
+  const auto* r = std::get_if<RelAttnBlock>(&blk);
+  return r && (r->nh * r->hd) % 64 == 0;
+}
+bool fused_moe(const flyx_bmodel*, const Block& blk) { return std::holds_alternative<MoeBlock>(blk); }
+bool fused_dspark_draft(const flyx_bmodel*, const Block& blk) {
+  const auto* d = std::get_if<DSparkBlock>(&blk);
+  return d && d->hidden % 64 == 0 && d->inter % 64 == 0;
+}
 
 void run_node(const Pass& ps, const flyx_node& n, const Block* b);
 
@@ -135,8 +171,12 @@ const RegionImpl kOverrides[] = {
      [](const Pass& ps, const flyx_node&, const Block* b) { gdn_layer(ps, std::get<GdnBlock>(*b), true); }},
     {FLYX_NODE_RUN, "fused producers", 1 << 30, fused_attn,
      [](const Pass& ps, const flyx_node&, const Block* b) { attn_layer(ps, std::get<AttnBlock>(*b), true); }},
+    {FLYX_NODE_RUN, "fused producers", 1 << 30, fused_rel_attn,
+     [](const Pass& ps, const flyx_node&, const Block* b) { rel_attn_layer(ps, std::get<RelAttnBlock>(*b), true); }},
     {FLYX_NODE_RUN, "fused producers", 1 << 30, fused_mlp,
      [](const Pass& ps, const flyx_node&, const Block* b) { mlp_layer(ps, std::get<MlpBlock>(*b), true); }},
+    {FLYX_NODE_RUN, "fused SiTU", 1 << 30, fused_moe,
+     [](const Pass& ps, const flyx_node&, const Block* b) { moe_layer(ps, std::get<MoeBlock>(*b), true); }},
     {FLYX_NODE_DRAFT, "fused producers", 1 << 30, fused_mtp_draft,
      [](const Pass& ps, const flyx_node& n, const Block* b) {
        mtp_draft(ps.s, std::get<MtpBlock>(*b), n.arg0, ps.v.L, true);
@@ -144,6 +184,10 @@ const RegionImpl kOverrides[] = {
     {FLYX_NODE_DRAFT, "fused producers", 1 << 30, fused_dflash_draft,
      [](const Pass& ps, const flyx_node& n, const Block* b) {
        draft_block(ps.s, std::get<DFlashBlock>(*b), n.arg0, ps.v.L, n.arg1 == FLYX_DRAFT_TREE, true);
+     }},
+    {FLYX_NODE_DRAFT, "fused producers", 1 << 30, fused_dspark_draft,
+     [](const Pass& ps, const flyx_node& n, const Block* b) {
+       dspark_draft(ps.s, std::get<DSparkBlock>(*b), n.arg0, ps.v.L, true);
      }},
     {FLYX_NODE_CONTEXT, "fused producers", 1 << 30, fused_mtp_context,
      [](const Pass& ps, const flyx_node&, const Block* b) { mtp_context(ps, std::get<MtpBlock>(*b), true); }},
@@ -182,9 +226,9 @@ void forward_nodes(const Pass& ps, size_t begin, size_t end, int copy_prefix) {
   // A prefill's windows of keys past the stagings take the two parities in turn, a small pass past them none (0074).
   std::vector<flyx_seq::StageItem> staged;
   int parity = 0;
-  for (size_t i = begin; i < end; ++i)
-    if (const auto* a = ps.p->block[i] ? std::get_if<AttnBlock>(ps.p->block[i]) : nullptr;
-        a && ps.p->nodes[i].kind == FLYX_NODE_RUN) {
+  for (size_t i = begin; i < end; ++i) {
+    if (ps.p->nodes[i].kind != FLYX_NODE_RUN || !ps.p->block[i]) continue;
+    if (const auto* a = std::get_if<AttnBlock>(ps.p->block[i])) {
       const KvBuf& kb = s->kv[size_t(a->kv)];
       if (kb.vk && ps.reads_cache(kb)) {
         if (const int windows = ps.round ? 0 : s->windows(kb, ps.rows)) {
@@ -200,10 +244,17 @@ void forward_nodes(const Pass& ps, size_t begin, size_t end, int copy_prefix) {
       }
       if (kb.kq_stage && ps.reads_copy_only(kb))
         staged.push_back({a->kv, true, copy_prefix, s->copy_scan_end < copy_prefix ? s->copy_scan_end : 0});
+    } else if (const auto* r = std::get_if<RelAttnBlock>(ps.p->block[i])) {
+      const KvBuf& kb = s->kv[size_t(r->kv)];
+      if (kb.vk && !s->reads_direct(kb, ps.rows, ps.round)) staged.push_back({r->kv, false});
     }
+  }
   s->stage_begin(std::move(staged), ps.v.L.st);
+  ResState res_state{};
+  Pass cur = ps;
+  cur.res = &res_state;
   for (size_t i = begin; i < end; ++i) {
-    ps.p->impl[i]->fn(ps, ps.p->nodes[i], ps.p->block[i]);
+    ps.p->impl[i]->fn(cur, ps.p->nodes[i], ps.p->block[i]);
     if (prof) CK(cudaEventRecord(s->prof_ev[i - begin + 1], s->st));
   }
   s->stage_end(ps.v.L.st);
@@ -242,6 +293,8 @@ void draft_step_range(const Pass& ps, int start, int end) {
       mtp_draft(ps.s, *t, end, ps.v.L, fused, start);
     } else if (const auto* d = std::get_if<DFlashBlock>(ps.p->block[i])) {
       draft_block(ps.s, *d, end, ps.v.L, ps.p->nodes[i].arg1 == FLYX_DRAFT_TREE, fused);
+    } else if (const auto* ds = std::get_if<DSparkBlock>(ps.p->block[i])) {
+      dspark_draft(ps.s, *ds, end, ps.v.L, fused);
     }
     return;
   }
@@ -255,14 +308,24 @@ void run_node(const Pass& ps, const flyx_node& n, const Block* b) {
     case FLYX_NODE_RUN:
       if (const auto* e = std::get_if<EmbedBlock>(b)) {
         if (ps.round) build_rows(s->P, s->drafts, -1, rv.b.tokens, ps.rows, st);
-        if (residual16(ps)) embed(rv.b.tokens, e->table, e->hidden, x16_of(rv), ps.rows, st);
-        else embed_tokens(*e, rv.b.tokens, rv.b.x, ps.rows, st);
+        if (residual16(ps)) {
+          embed(rv.b.tokens, e->table, e->hidden, x16_of(rv), ps.rows, st);
+        } else if (e->has_norm) {
+          embed_tokens(*e, rv.b.tokens, rv.b.h, ps.rows, st);
+          rmsnorm(rv.b.h, e->hidden, e->norm.w, e->norm.offset, e->norm.eps, rv.b.x, e->hidden, ps.rows, e->hidden, st);
+        } else {
+          embed_tokens(*e, rv.b.tokens, rv.b.x, ps.rows, st);
+        }
       } else if (const auto* g = std::get_if<GdnBlock>(b)) {
         gdn_layer(ps, *g);
       } else if (const auto* a = std::get_if<AttnBlock>(b)) {
         attn_layer(ps, *a);
+      } else if (const auto* r = std::get_if<RelAttnBlock>(b)) {
+        rel_attn_layer(ps, *r);
       } else if (const auto* f = std::get_if<MlpBlock>(b)) {
         mlp_layer(ps, *f);
+      } else if (const auto* me = std::get_if<MoeBlock>(b)) {
+        moe_layer(ps, *me);
       } else if (!n.arg0) {
         head(ps, std::get<HeadBlock>(*b), false);
       } else if (ps.sample_last) {
@@ -270,18 +333,29 @@ void run_node(const Pass& ps, const flyx_node& n, const Block* b) {
       }
       break;
     case FLYX_NODE_TAP:
-      if (residual16(ps)) tap_copy(x16_of(rv), s->m->hidden, rv.b.feats, rv.ld_feats, n.arg0, ps.rows, st);
-      else tap_copy(rv.b.x, s->m->hidden, rv.b.feats, rv.ld_feats, n.arg0, ps.rows, st);
+      if (n.arg1 == 1) {
+        const auto& ds = std::get<DSparkBlock>(*b);
+        const auto& hb = block<HeadBlock>(s->m, ds.head);
+        rmsnorm(rv.b.x, s->m->hidden, hb.norm.w, hb.norm.offset, hb.norm.eps, rv.b.h, s->m->hidden, ps.rows,
+                s->m->hidden, st);
+        tap_copy(rv.b.h, s->m->hidden, rv.b.feats, rv.ld_feats, n.arg0, ps.rows, st);
+      } else if (residual16(ps)) {
+        tap_copy(x16_of(rv), s->m->hidden, rv.b.feats, rv.ld_feats, n.arg0, ps.rows, st);
+      } else {
+        tap_copy(rv.b.x, s->m->hidden, rv.b.feats, rv.ld_feats, n.arg0, ps.rows, st);
+      }
       break;
     case FLYX_NODE_DRAFT:
       if (const auto* t = std::get_if<MtpBlock>(b)) mtp_draft(s, *t, n.arg0, rv.L);
       else if (const auto* v = std::get_if<DvBlock>(b)) dv_draft(s, *v, n.arg0, rv.L);
+      else if (const auto* ds = std::get_if<DSparkBlock>(b)) dspark_draft(s, *ds, n.arg0, rv.L);
       else draft_block(s, std::get<DFlashBlock>(*b), n.arg0, rv.L, n.arg1 == FLYX_DRAFT_TREE);
       break;
     case FLYX_NODE_CONTEXT:
       if (const auto* t = std::get_if<MtpBlock>(b)) mtp_context(ps, *t);
       else if (const auto* v = std::get_if<DvBlock>(b); v && ps.round) dv_context_unless_noop(ps, *v);
       else if (v) forget_canvas(s, st);  // a prefill's: the canvas starts over
+      else if (const auto* ds = std::get_if<DSparkBlock>(b)) dspark_context(ps, *ds);
       else draft_context(ps, std::get<DFlashBlock>(*b));
       break;
     case FLYX_NODE_ACCEPT: {
@@ -303,6 +377,42 @@ void run_node(const Pass& ps, const flyx_node& n, const Block* b) {
     }
     case FLYX_NODE_COMMIT: commit(ps); break;
     case FLYX_NODE_GIVEN: given_drafts(s->P, s->oracle, n.arg0, s->drafts, st); break;
+    case FLYX_NODE_RES_RESET:
+      ps.res->res_n = 0;
+      ps.res->prelude_n = 0;
+      ps.res->loop_n = 0;
+      break;
+    case FLYX_NODE_LOOP_PRELUDE: {
+      const size_t row_bytes = size_t(ps.rows) * size_t(s->m->hidden) * sizeof(float);
+      CK(cudaMemcpyAsync(rv.b.prelude_cur, rv.b.x, row_bytes, cudaMemcpyDeviceToDevice, st));
+      if (ps.res->res_n > 0)
+        CK(cudaMemcpyAsync(rv.b.prelude_blocks, rv.b.res_bank, size_t(ps.res->res_n) * row_bytes,
+                           cudaMemcpyDeviceToDevice, st));
+      ps.res->prelude_n = ps.res->res_n;
+      break;
+    }
+    case FLYX_NODE_LOOP_NEXT: {
+      const size_t row_bytes = size_t(ps.rows) * size_t(s->m->hidden) * sizeof(float);
+      const int skip = ps.res->prelude_n + 1;
+      const int ln = std::max(0, ps.res->res_n - skip);
+      CK(cudaMemcpyAsync(rv.b.loop_bank_out, rv.b.x, row_bytes, cudaMemcpyDeviceToDevice, st));
+      if (ln > 0)
+        CK(cudaMemcpyAsync(rv.b.loop_bank, rv.b.res_bank + size_t(skip) * size_t(ps.rows) * size_t(s->m->hidden),
+                           size_t(ln) * row_bytes, cudaMemcpyDeviceToDevice, st));
+      ps.res->loop_n = ln;
+      CK(cudaMemcpyAsync(rv.b.x, rv.b.prelude_cur, row_bytes, cudaMemcpyDeviceToDevice, st));
+      if (ps.res->prelude_n > 0)
+        CK(cudaMemcpyAsync(rv.b.res_bank, rv.b.prelude_blocks, size_t(ps.res->prelude_n) * row_bytes,
+                           cudaMemcpyDeviceToDevice, st));
+      ps.res->res_n = ps.res->prelude_n;
+      break;
+    }
+    case FLYX_NODE_RES_MIX: {
+      const int H = s->m->hidden;
+      attn_res_mix(rv.b.res_bank, ps.res->res_n, rv.b.x, s->m->vec_weights.at(n.arg0), 1, ps.rows, H, rv.b.h, st);
+      CK(cudaMemcpyAsync(rv.b.x, rv.b.h, size_t(ps.rows) * size_t(H) * sizeof(float), cudaMemcpyDeviceToDevice, st));
+      break;
+    }
     default: throw std::runtime_error("cuda: unknown node kind " + std::to_string(n.kind));
   }
 }
@@ -353,14 +463,20 @@ int lower(flyx_bmodel* m, const flyx_program* prog, flyx_plan** out) {
         }
       }
     }
+    if (n.kind == FLYX_NODE_RES_RESET && n.arg0 > m->need.max_bank)
+      return fail("lower: RES_RESET bank depth exceeds model max_bank");
     if (n.kind == FLYX_NODE_GIVEN) most = m->wide_rows - 1;
     // A wide round's drafts are given (a chain or a tree), or DV's tree (its kernels draft up to 63).
     if (wide && n.kind == FLYX_NODE_DRAFT && !(b && std::holds_alternative<DvBlock>(*b)))
       return fail("lower: a wide round verifies given drafts or DV's tree");
     if (n.kind == FLYX_NODE_GIVEN && n.arg1 == FLYX_GIVEN_TREE) p->tree = true;
-    if (n.kind == FLYX_NODE_RUN && b)
-      if (const auto* a = std::get_if<AttnBlock>(b))
+    if (n.kind == FLYX_NODE_RUN && b) {
+      if (const auto* a = std::get_if<AttnBlock>(b)) {
         if (std::find(p->tree_kv.begin(), p->tree_kv.end(), a->kv) == p->tree_kv.end()) p->tree_kv.push_back(a->kv);
+      } else if (const auto* r = std::get_if<RelAttnBlock>(b)) {
+        if (std::find(p->tree_kv.begin(), p->tree_kv.end(), r->kv) == p->tree_kv.end()) p->tree_kv.push_back(r->kv);
+      }
+    }
     if (n.kind == FLYX_NODE_DRAFT && n.arg1 == FLYX_DRAFT_TREE) {
       // The DFlash2 selector's candidates make a tree (ops/draft/ref.h), DV's selector its own (its tree's T at
       // most); MTP drafts one token a step.

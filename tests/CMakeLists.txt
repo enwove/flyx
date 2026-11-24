@@ -97,6 +97,9 @@ flyx_add_unit_test(gguf_models_test models/gguf_test.cpp)
 flyx_add_unit_test(dv_models_test models/dv_test.cpp)
 flyx_add_unit_test(llama_models_test models/llama/llama_test.cpp)
 flyx_add_unit_test(gguf_e2e_test e2e/gguf_test.cpp)
+flyx_add_unit_test(inkling2_test e2e/inkling2_test.cpp)
+add_dependencies(inkling2_test flyx-cpu_ref)
+add_test(NAME inkling2_cpu_ref COMMAND inkling2_test ${CMAKE_BINARY_DIR}/inkling2_assets cpu_ref)
 
 add_executable(numbers_test apps/common/numbers_test.cpp ${CMAKE_SOURCE_DIR}/apps/common/numbers.cpp)
 target_include_directories(numbers_test PRIVATE ${CMAKE_SOURCE_DIR})
@@ -397,11 +400,13 @@ if(TARGET flyx-cuda)
   add_executable(cuda_op_test backends/cuda/op_test.cu backends/cuda/op_test_gemm.cu backends/cuda/op_test_blocks.cu
                  backends/cuda/op_test_attention.cu backends/cuda/op_test_gdn.cu backends/cuda/op_test_nvfp4.cu
                  backends/cuda/op_test_head.cu backends/cuda/op_test_sampling.cu backends/cuda/op_test_layers.cu
-                 backends/cuda/op_test_dv.cu)
+                 backends/cuda/op_test_dv.cu backends/cuda/op_test_inkling2.cu)
   target_link_libraries(cuda_op_test PRIVATE flyx_cuda_kernels)
   add_dependencies(cuda_op_test flyx_gemm_tables)  # op_test_gemm.cu reads the generated tables
   set_target_properties(cuda_op_test PROPERTIES CUDA_ARCHITECTURES "${FLYX_CUDA_ARCHS}")
   add_test(NAME cuda_ops COMMAND cuda_op_test)
+  add_dependencies(inkling2_test flyx-cuda)
+  add_test(NAME inkling2_cuda COMMAND inkling2_test ${CMAKE_BINARY_DIR}/inkling2_assets cuda)
 
   add_test(NAME scheduler_cuda COMMAND scheduler_test ${ASSETS}/tiny.flyx cuda)
   set_tests_properties(scheduler_cuda PROPERTIES FIXTURES_REQUIRED assets)

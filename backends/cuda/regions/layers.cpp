@@ -47,13 +47,15 @@ bool residual16_model(flyx_bmodel* m) {
     for (size_t i = 0; i < m->blocks.size() && ok; ++i) {
       if (drafter_parts[i]) continue;
       const Block& b = m->blocks[i];
-      if (const auto* e = std::get_if<EmbedBlock>(&b)) ok = e->table != nullptr;
+      if (const auto* e = std::get_if<EmbedBlock>(&b)) ok = e->table != nullptr && !e->has_norm;
       else if (const auto* g = std::get_if<GdnBlock>(&b))
         ok = g->w_in.q && g->w_out.q && g->hidden % 128 == 0 && g->v_width() % 128 == 0;
       else if (const auto* a = std::get_if<AttnBlock>(&b))  // adapters (ABI 43) add float32 products: float32 rows
         ok = a->w_in.q && a->w_out.q && a->hidden % 128 == 0 && a->nh * a->hd % 128 == 0 && !a->lora;
       else if (const auto* f = std::get_if<MlpBlock>(&b))
         ok = f->w_gu.q && f->w_down.q && f->hidden % 128 == 0 && f->inter % 128 == 0 && !f->lora;
+      else if (std::holds_alternative<RelAttnBlock>(b) || std::holds_alternative<MoeBlock>(b))
+        ok = false;
     }
     m->res16 = ok ? 1 : 0;
   }
@@ -567,6 +569,277 @@ void mlp_layer(const Pass& ps, const MlpBlock& f, bool fused) {
   lora_out(rv, f.lora, 2, rv.b.act, rv.ld_act, I, H, R, ldu, L);  // the SwiGLU rows, rv.ld_act apart
 }
 
+namespace {
+
+void apply_loop_ctrl(const float* cur, const float* msg, int rows, int H, int rank, const Lin& down, bool stacked_gf,
+                     const Lin& gf, const Lin& gain, const Lin& forget, float* ctrl_cat, float* ctrl_gate,
+                     float* ctrl_gf, float* out, const Launch& L) {
+  cudaStream_t st = L.st;
+  loop_ctrl_prep(cur, msg, rows, H, ctrl_cat, st);
+  gemm(ctrl_cat, 2 * H, down, rank, 2 * H, ctrl_gate, rank, rows, false, L);
+  if (stacked_gf) {
+    gemm(ctrl_gate, rank, gf, 2 * H, rank, ctrl_gf, 2 * H, rows, false, L);
+  } else {
+    gemm(ctrl_gate, rank, gain, H, rank, ctrl_gf, 2 * H, rows, false, L);
+    gemm(ctrl_gate, rank, forget, H, rank, ctrl_gf + H, 2 * H, rows, false, L);
+  }
+  loop_ctrl_apply(cur, msg, ctrl_gf, 2 * H, ctrl_gf + H, 2 * H, rows, H, out, st);
+}
+
+}  // namespace
+
+void rel_attn_layer(const Pass& ps, const RelAttnBlock& a, bool fused) {
+  const RowView& rv = ps.v;
+  auto* s = ps.s;
+  const int H = a.hidden, R = ps.rows, nh = a.nh, nkv = a.nkv, hd = a.hd;
+  const int q_dim = nh * hd, kv_dim = nkv * hd, dr = a.d_rel;
+  const bool is_swa = a.window > 0;
+  cudaStream_t st = rv.L.st;
+  const Launch& L = rv.L;
+  ShortConvBuf& sc = s->sconv[size_t(a.sconv)];
+  const bool direct = ps.round && ps.p->width == 0;
+  const int next_sel = ps.round ? (direct ? kSlotNext : -1) : kSlotCur;
+  const int skip = ps.round && direct ? kSkipIfStopped : kSkipNever;
+  float* rep = ps.round ? sc.replay : nullptr;
+  const size_t rep_stride = ps.round ? sc.r_stride : 0;
+
+  if (a.loop_msg_query)
+    attn_res_mix(rv.b.loop_bank, ps.res->loop_n, rv.b.loop_bank_out, a.loop_msg_query, 4, R, H, rv.b.loop_msg, st);
+
+  const float* in_raw[3] = {rv.b.x, rv.b.x, rv.b.x};
+  if (a.res_query) {
+    const int nq = is_swa ? 1 : 3;
+    attn_res_mix(rv.b.res_bank, ps.res->res_n, rv.b.x, a.res_query, nq, R, H, rv.b.attn_in, st);
+    in_raw[0] = rv.b.attn_in;
+    in_raw[1] = is_swa ? rv.b.attn_in : rv.b.attn_in + size_t(R) * H;
+    in_raw[2] = is_swa ? rv.b.attn_in : rv.b.attn_in + size_t(2) * R * H;
+  }
+  if (a.loop_rank > 0) {
+    // Reverse order so when is_swa shares in_raw[0..2] == attn_in, j=2,1 read attn_in before j=0 overwrites it.
+    for (int j = 2; j >= 0; --j) {
+      float* dst = rv.b.attn_in + size_t(j) * R * H;
+      const float* msg = rv.b.loop_msg + size_t(j) * R * H;
+      apply_loop_ctrl(in_raw[j], msg, R, H, a.loop_rank, a.loop_ctrl_down[j], a.loop_ctrl_stacked[j],
+                      a.loop_ctrl_gf[j], a.loop_ctrl_gain[j], a.loop_ctrl_forget[j], rv.b.ctrl_cat, rv.b.ctrl_gate,
+                      rv.b.ctrl_gf, dst, L);
+      in_raw[j] = dst;
+    }
+  }
+
+  // Q / gate / rel / sink share q_norm_in(in_raw[0]) -> rv.b.h (non-aliasing).
+  rmsnorm(in_raw[0], H, a.q_norm_in.w, a.q_norm_in.offset, a.q_norm_in.eps, rv.b.h, H, R, H, st);
+  if (a.stacked_qgr) {
+    gemm(rv.b.h, H, a.w_qgr, 2 * q_dim + nh * dr, H, rv.b.proj, rv.ld_proj, R, false, L);
+  } else {
+    gemm(rv.b.h, H, a.w_q, q_dim, H, rv.b.proj, rv.ld_proj, R, false, L);
+    gemm(rv.b.h, H, a.w_gate, q_dim, H, rv.b.proj + q_dim, rv.ld_proj, R, false, L);
+    gemm(rv.b.h, H, a.w_rel, nh * dr, H, rv.b.proj + 2 * q_dim, rv.ld_proj, R, false, L);
+  }
+  gemm(rv.b.h, H, a.w_sink, nh, H, rv.b.sink, nh, R, false, L);
+
+  // K input norm -> K projection -> ShortConv -> kv_conv[0..R*kv_dim).
+  rmsnorm(in_raw[1], H, a.k_norm_in.w, a.k_norm_in.offset, a.k_norm_in.eps, rv.b.h, H, R, H, st);
+  gemm(rv.b.h, H, a.w_k, kv_dim, H, rv.b.act, kv_dim, R, false, L);
+  float* k_dyn = nullptr;
+  if (!is_swa) {
+    gemm(rv.b.h, H, a.w_k_conv_proj, nkv * a.conv, H, rv.b.kv_dyn, nkv * a.conv, R, false, L);
+    k_dyn = rv.b.kv_dyn;
+  }
+  shortconv_pass(rv.b.act, kv_dim, a.k_conv, k_dyn, sc.win, sc.w_stride, kSlotCur, next_sel, skip, rep, rep_stride,
+                 kSlotCur, 0, sc.channels, kv_dim, a.conv, nkv, s->P, R, rv.b.kv_conv, kv_dim, st, false);
+
+  // V input norm -> V projection -> ShortConv -> kv_conv[R*kv_dim..2*R*kv_dim).
+  rmsnorm(in_raw[2], H, a.v_norm_in.w, a.v_norm_in.offset, a.v_norm_in.eps, rv.b.h, H, R, H, st);
+  gemm(rv.b.h, H, a.w_v, kv_dim, H, rv.b.act, kv_dim, R, false, L);
+  float* v_dyn = nullptr;
+  if (!is_swa) {
+    gemm(rv.b.h, H, a.w_v_conv_proj, nkv * a.conv, H, rv.b.kv_dyn, nkv * a.conv, R, false, L);
+    v_dyn = rv.b.kv_dyn;
+  }
+  shortconv_pass(rv.b.act, kv_dim, a.v_conv, v_dyn, sc.win, sc.w_stride, kSlotCur, next_sel, skip, rep, rep_stride,
+                 kSlotCur, kv_dim, sc.channels, kv_dim, a.conv, nkv, s->P, R, rv.b.kv_conv + size_t(R) * kv_dim,
+                 kv_dim, st, false);
+
+  const KvBuf& kb = s->kv[size_t(a.kv)];
+  rel_attn_prep(rv.b.proj, rv.ld_proj, rv.b.kv_conv, kv_dim, rv.b.kv_conv + size_t(R) * kv_dim, kv_dim,
+                rv.b.proj + 2 * q_dim, rv.ld_proj, a.q_clip_w, a.rel_clip_w, a.qk_clip, a.rel_clip, a.eps,
+                a.log_scale_floor, a.log_scale_alpha, nh, nkv, hd, dr, R, s->P, kPosPosition, is_swa, rv.b.qbuf,
+                rv.b.rel_q, kb.ref(), st, 0);
+
+  const bool direct_kv = s->reads_direct(kb, R, ps.round);
+  if (kb.vk && !direct_kv) s->stage_before(kb, 0, R, st);
+  const bool split = fused && !a.w_o.q8_inputs() && q_dim % 64 == 0;
+  rel_attention(rv.b.qbuf, rv.b.rel_q, (kb.vk && !direct_kv) ? kb.staged() : kb.ref(), a.rel_bias, rv.b.sink, nh,
+                rv.b.proj + q_dim, rv.ld_proj, nh, nkv, hd, dr, a.rel_extent, a.window, R, s->P,
+                split ? nullptr : rv.b.act, q_dim, rv.b.part, ps.round ? kRoundSplits : kPrefillSplits, L, 0);
+  if (kb.vk && !direct_kv) s->stage_after(kb, st);
+
+  if (split) gemm_presplit(a.w_o, H, q_dim, rv.b.post_raw, H, R, false, L);
+  else gemm(rv.b.act, q_dim, a.w_o, H, q_dim, rv.b.post_raw, H, R, false, L);
+
+  if (a.res_push) {
+    const size_t row_bytes = size_t(R) * size_t(H) * sizeof(float);
+    CK(cudaMemcpyAsync(rv.b.res_bank + size_t(ps.res->res_n) * R * H, rv.b.x, row_bytes, cudaMemcpyDeviceToDevice, st));
+    ++ps.res->res_n;
+    shortconv_pass(rv.b.post_raw, H, a.post_conv, nullptr, sc.win, sc.w_stride, kSlotCur, next_sel, skip, rep,
+                   rep_stride, kSlotCur, 2 * kv_dim, sc.channels, H, a.conv, 0, s->P, R, rv.b.x, H, st, false);
+  } else {
+    shortconv_pass(rv.b.post_raw, H, a.post_conv, nullptr, sc.win, sc.w_stride, kSlotCur, next_sel, skip, rep,
+                   rep_stride, kSlotCur, 2 * kv_dim, sc.channels, H, a.conv, 0, s->P, R, rv.b.x, H, st, true);
+  }
+}
+
+void moe_layer(const Pass& ps, const MoeBlock& f, bool fused) {
+  const RowView& rv = ps.v;
+  auto* s = ps.s;
+  const int H = f.hidden, I = f.inter, E = f.n_experts, K = f.top_k, R = ps.rows;
+  cudaStream_t st = rv.L.st;
+  const Launch& L = rv.L;
+
+  const float* cur = rv.b.x;
+  if (f.res_query) {
+    attn_res_mix(rv.b.res_bank, ps.res->res_n, rv.b.x, f.res_query, 1, R, H, rv.b.attn_in, st);
+    cur = rv.b.attn_in;
+  }
+  if (f.loop_rank > 0) {
+    const float* msg = rv.b.loop_msg + size_t(3) * R * H;
+    apply_loop_ctrl(cur, msg, R, H, f.loop_rank, f.loop_ctrl_down, f.loop_ctrl_stacked, f.loop_ctrl_gf,
+                    f.loop_ctrl_gain, f.loop_ctrl_forget, rv.b.ctrl_cat, rv.b.ctrl_gate, rv.b.ctrl_gf, rv.b.attn_in, L);
+    cur = rv.b.attn_in;
+  }
+
+  rmsnorm(cur, H, f.norm.w, f.norm.offset, f.norm.eps, rv.b.h, H, R, H, st);
+  gemm(rv.b.h, H, f.router, E, H, rv.b.proj, E, R, false, L);
+  moe_route(rv.b.proj, f.router_bias, R, E, K, f.gating_sigmoid, f.norm_weights, f.norm_eps, f.route_scale,
+            rv.b.moe_idx, rv.b.moe_w, st);
+
+  const MoeScratch* msc = (!ps.round && R > 16 && rv.b.moe_sc.pairs) ? &rv.b.moe_sc : nullptr;
+  if (fused) {
+    moe_gate_up(rv.b.h, H, f.gate_up, rv.b.moe_idx, R, K, I, H, f.situ_beta, f.situ_linear_beta, true, rv.b.moe_act, I,
+                msc, L);
+  } else {
+    moe_gate_up(rv.b.h, H, f.gate_up, rv.b.moe_idx, R, K, I, H, f.situ_beta, f.situ_linear_beta, false, rv.b.moe_gu,
+                2 * I, msc, L);
+    situ_rows(rv.b.moe_gu, 2 * I, I, f.situ_beta, f.situ_linear_beta, rv.b.moe_act, I, R * K, st);
+  }
+  if (f.post_conv) {
+    moe_down(rv.b.moe_act, I, f.down, rv.b.moe_idx, rv.b.moe_w, R, K, H, I, rv.b.post_raw, H, false, msc, L);
+    ShortConvBuf& sc = s->sconv[size_t(f.sconv)];
+    const bool direct = ps.round && ps.p->width == 0;
+    const int next_sel = ps.round ? (direct ? kSlotNext : -1) : kSlotCur;
+    const int skip = ps.round && direct ? kSkipIfStopped : kSkipNever;
+    float* rep = ps.round ? sc.replay : nullptr;
+    const size_t rep_stride = ps.round ? sc.r_stride : 0;
+    shortconv_pass(rv.b.post_raw, H, f.post_conv, nullptr, sc.win, sc.w_stride, kSlotCur, next_sel, skip, rep,
+                   rep_stride, kSlotCur, f.sconv_offset, sc.channels, H, f.conv, 0, s->P, R, rv.b.x, H, st, true);
+  } else {
+    moe_down(rv.b.moe_act, I, f.down, rv.b.moe_idx, rv.b.moe_w, R, K, H, I, rv.b.x, H, true, msc, L);
+  }
+}
+
+void dspark_context(const Pass& ps, const DSparkBlock& b, bool /*fused*/) {
+  const RowView& rv = ps.v;
+  auto* s = ps.s;
+  const auto* m = s->m;
+  const KvBuf& kv = s->kv[size_t(b.kv)];
+  const int H = b.hidden, R = ps.rows, nkv = b.nkv, hd = b.hd;
+  const int sel = ps.round ? kPosStart : kPosPosition;
+  cudaStream_t st = rv.L.st;
+  const Launch& L = rv.L;
+
+  dspark_ctx_mix_norm(rv.b.feats, rv.ld_feats, b.markov_ctx_mix, b.markov_ctx_norm.w, b.markov_ctx_norm.eps, b.n_taps,
+                      R, H, rv.b.cx, st);
+  if (!ps.round && s->pass_snap > 0 && s->ring_snap) {
+    const int snap_row = s->pass_snap - s->position;
+    const float* src = snap_row == 0 ? s->ring + size_t((s->pass_snap - 1) % kHring) * size_t(H)
+                                     : rv.b.cx + size_t(snap_row - 1) * size_t(H);
+    CK(cudaMemcpyAsync(s->ring_snap, src, size_t(H) * sizeof(float), cudaMemcpyDeviceToDevice, st));
+  }
+  hring_put(s->P, sel, ps.round, rv.b.cx, H, R, s->ring, H, st);
+
+  for (int j = 0; j < b.layers(); ++j) {
+    const auto& l = block<DSparkLayer>(m, b.first_layer + j);
+    dspark_ctx_mix_norm(rv.b.feats, rv.ld_feats, l.ctx_mix, l.ctx_norm.w, l.ctx_norm.eps, b.n_taps, R, H, rv.b.cx, st);
+    if (l.stacked_ctx_kv) {
+      gemm(rv.b.cx, H, l.w_ctx_kv, 2 * nkv * hd, H, rv.b.ckv, rv.ld_ckv, R, false, L);
+    } else {
+      gemm(rv.b.cx, H, l.w_k_ctx, nkv * hd, H, rv.b.ckv, rv.ld_ckv, R, false, L);
+      gemm(rv.b.cx, H, l.w_v_ctx, nkv * hd, H, rv.b.ckv + nkv * hd, rv.ld_ckv, R, false, L);
+    }
+    draft_ctx_kv(rv.b.ckv, rv.ld_ckv, l.k_ctx_norm.w, l.k_ctx_norm.eps, b.theta, 1, nkv, hd, R, s->P, sel, ps.round,
+                 kv.k16(j), kv.v16(j), kv.layer_stride, st);
+  }
+}
+
+void dspark_draft(flyx_seq* s, const DSparkBlock& b, int width, const Launch& L, bool fused) {
+  const auto* m = s->m;
+  const auto& E = block<EmbedBlock>(m, b.embed);
+  const auto& head = block<HeadBlock>(m, b.head);
+  const KvBuf& kv = s->kv[size_t(b.kv)];
+  const int B = std::min(b.block, width + 1);
+  const int H = b.hidden, nh = b.nh, nkv = b.nkv, hd = b.hd, I = b.inter;
+  const int V = head.vocab, Rk = b.markov_rank, nqkv = (nh + 2 * nkv) * hd;
+  cudaStream_t st = L.st;
+
+  // Row 0: raw anchor embedding -> DSpark tok_norm; rows 1..B-1: mask_embd[0..B-2]; init prev & Markov state.
+  build_rows(s->P, nullptr, 0, s->dtok, 1, st);
+  embed_tokens(E, s->dtok, s->ds_h, 1, st);
+  dspark_prep_block(s->P, s->ds_h, b.tok_norm.w, b.tok_norm.eps, b.mask_embd, B, H, s->ds_x, s->ds_prev, s->ds_state,
+                    Rk, st);
+
+  const float scale = 1.f / std::sqrt(float(hd));
+  for (int j = 0; j < b.layers(); ++j) {
+    const auto& l = block<DSparkLayer>(m, b.first_layer + j);
+    kv16* Kj = kv.k16(j);
+    kv16* Vj = kv.v16(j);
+    if (l.stacked_qkv) {
+      norm_project(s->ds_x, s->ds_h, s->ds_proj, s->ld_ds_proj, B, l.norm, l.w_qkv, nqkv, H, L, fused);
+    } else {
+      rmsnorm(s->ds_x, H, l.norm.w, l.norm.offset, l.norm.eps, s->ds_h, H, B, H, st);
+      gemm(s->ds_h, H, l.w_q, nh * hd, H, s->ds_proj, s->ld_ds_proj, B, false, L);
+      gemm(s->ds_h, H, l.w_k, nkv * hd, H, s->ds_proj + nh * hd, s->ld_ds_proj, B, false, L);
+      gemm(s->ds_h, H, l.w_v, nkv * hd, H, s->ds_proj + (nh + nkv) * hd, s->ld_ds_proj, B, false, L);
+    }
+    attn_prep(s->ds_proj, s->ld_ds_proj, 0, nh * hd, (nh + nkv) * hd, l.q_norm.w, l.k_norm.w, l.q_norm.offset,
+              l.q_norm.eps, b.theta, hd, nh, nkv, hd, B, s->P, kPosPosition, false, s->ds_q, Kj, Vj, st);
+    dspark_block_attention(s->ds_q, Kj, Vj, nh, nkv, hd, B, l.window, scale, s->P, s->ds_act, nh * hd, s->own.part,
+                           kRoundSplits, L);
+    gemm(s->ds_act, nh * hd, l.w_o, H, nh * hd, s->ds_x, H, B, true, L);
+    if (l.stacked_gu) {
+      norm_project(s->ds_x, s->ds_h, s->ds_proj, s->ld_ds_proj, B, l.post_norm, l.w_gu, 2 * I, H, L, fused);
+    } else {
+      rmsnorm(s->ds_x, H, l.post_norm.w, l.post_norm.offset, l.post_norm.eps, s->ds_h, H, B, H, st);
+      gemm(s->ds_h, H, l.w_gate, I, H, s->ds_proj, s->ld_ds_proj, B, false, L);
+      gemm(s->ds_h, H, l.w_up, I, H, s->ds_proj + I, s->ld_ds_proj, B, false, L);
+    }
+    if (fused) {
+      swiglu_split(s->ds_proj, s->ld_ds_proj, I, B, L, l.w_down.q8_inputs());
+      gemm_presplit(l.w_down, H, I, s->ds_x, H, B, true, L);
+    } else {
+      swiglu(s->ds_proj, s->ld_ds_proj, I, s->ds_act, s->ld_ds_act, B, st);
+      gemm(s->ds_act, s->ld_ds_act, l.w_down, H, I, s->ds_x, H, B, true, L);
+    }
+  }
+
+  // Batched base logits for rows 1..nr (reads the target head weight once).
+  const int nr = std::min(width, B - 1);
+  rmsnorm(s->ds_x + H, H, b.norm.w, b.norm.offset, b.norm.eps, s->ds_hn, H, nr, H, st);
+  draft_logits(head, s->ds_hn, H, s->logits, nr, L);
+  for (int step = 0; step < nr; ++step) {
+    if (b.markov_w1_blk.data) embed_blocks(s->ds_prev, b.markov_w1_blk, Rk, s->ds_joint + Rk, 1, st);
+    else embed(s->ds_prev, b.markov_w1, Rk, s->ds_joint + Rk, 1, st);
+    dspark_markov_pack(s->P, s->ds_state, nullptr, s->ds_hn + size_t(step) * H, s->ring, Rk, H, s->ds_joint, st);
+    gemm(s->ds_joint, 2 * Rk + 2 * H, b.joint_proj, 3 * Rk, 2 * Rk + 2 * H, s->ds_jout, 3 * Rk, 1, false, L);
+    dspark_markov_gate(s->ds_jout, b.joint_proj_b, Rk, s->ds_state, s->ds_markov, st);
+    gemm(s->ds_markov, Rk, b.markov_w2, V, Rk, s->ds_bias, V, 1, false, L);
+    float* row_logits = s->logits + size_t(step) * V;
+    dspark_combine_logits(row_logits, s->ds_bias, b.markov_w2_b, V, b.softcap, row_logits, st);
+    topk_rows(row_logits, V, V, 1, s->ds_prev, nullptr, 1, st, s->topv, s->topi, s->top_rows, s->draft_prob + step,
+              s->draft_margin + step);
+    dspark_pick_step(s->P, s->oracle, step, s->ds_prev, s->drafts, st);
+  }
+}
+
 void head(const Pass& ps, const HeadBlock& h, bool last_only) {
   const RowView& rv = ps.v;
   auto* s = ps.s;
@@ -582,6 +855,7 @@ void head(const Pass& ps, const HeadBlock& h, bool last_only) {
     for (int a = 0; a < n; a += FLYX_MAX_ROWS) {
       const int k = std::min(FLYX_MAX_ROWS, n - a);
       head_logits(h, rv, a, k, ps.cert, s->cert, s->m->opt.kernels);
+      if (h.softcap > 0.f) softcap_rows(rv.logits, V, V, k, h.softcap, st);
       if (ps.pen) penalize_rows(rv.logits, V, V, k, s->G, s->reply, s->drafts, st, tree, a);
       choose_rows(rv.logits, V, V, k, s->P, a + 1, s->G, a == 0 ? s->mask : nullptr, s->cz, s->ci, s->argv, s->argi,
                   rv.b.choice + a, st, tree, a);  // the mask is the round's first row's
@@ -593,6 +867,7 @@ void head(const Pass& ps, const HeadBlock& h, bool last_only) {
     return;
   }
   head_logits(h, rv, r0, n, ps.cert, s->cert, s->m->opt.kernels, residual16(ps));
+  if (h.softcap > 0.f) softcap_rows(rv.logits, V, V, n, h.softcap, st);
   // Penalties first (a request that has one): in a round, row r was given the
   // drafts before it, which count as the reply for it.
   // A tree's row: its ancestors' drafts, its depth's position.
@@ -812,6 +1087,20 @@ void commit(const Pass& ps) {
   const RowView& rv = ps.v;
   auto* s = ps.s;
   if (ps.p->width == 0) return;  // plain rounds wrote the next window and state in the pass
+  if (!s->sconv.empty()) {
+    if (s->sconv_alike) {
+      const ShortConvBuf& f = s->sconv[0];
+      shortconv_fold(s->sconv_layers, int(s->sconv.size()), f.w_stride, f.r_stride, kSlotLast, kSlotAfterLast,
+                     kSlotLast, f.channels, f.conv, s->P, 0, &s->P->last_n, true, rv.L.st);
+    } else {
+      for (size_t i = 0; i < s->sconv.size(); ++i) {
+        const ShortConvBuf& sc = s->sconv[i];
+        shortconv_fold(s->sconv_layers + i, 1, sc.w_stride, sc.r_stride, kSlotLast, kSlotAfterLast, kSlotLast,
+                       sc.channels, sc.conv, s->P, 0, &s->P->last_n, true, rv.L.st);
+      }
+    }
+  }
+  if (s->gdn.empty()) return;
   // Every layer in two launches when they are alike (the same arithmetic as a layer at a time).
   if (s->gdn_layers) {
     const GdnBuf& g = s->gdn[0];

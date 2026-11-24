@@ -444,6 +444,12 @@ void blocks_pack(int dtype, const uint8_t* file, size_t n, uint8_t* payload, uin
       s[0] = uint16_t((w[0] >> 12) | ((w[1] >> 8) & 0x00f0) | ((w[2] >> 4) & 0x0f00) | (w[3] & 0xf000));
       continue;
     }
+    if (dtype == FLYX_DT_GGML_MXFP4) {  // E8M0 scale stored as exact bfloat16 (high 16 bits of GGML_E8M0_TO_FP32_HALF)
+      const uint8_t e = b[0];
+      const uint32_t fbits = e < 2 ? (0x00200000u << e) : (uint32_t(e - 1) << 23);
+      s[0] = uint16_t(fbits >> 16);
+      continue;
+    }
     std::memcpy(s, b + s0, 2);
     if (s1 >= 0) std::memcpy(s + 1, b + s1, 2);
   }

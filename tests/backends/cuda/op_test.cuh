@@ -167,7 +167,7 @@ struct BlockType {
   const char* name;
   std::vector<int> scales_at;
 };
-extern const BlockType kBlockTypes[19];
+extern const BlockType kBlockTypes[21];
 const BlockType& block_type(int dtype);
 std::vector<uint8_t> random_blocks(const BlockType& bt, size_t n);
 BlockMat up_blocks(int dtype, const std::vector<uint8_t>& file, int rows, bool host = false);
@@ -257,5 +257,12 @@ void test_dv_slide(int slots, int hidden, int rank);
 void test_dv_selector_table(int depths, int rank, int vocab);
 void test_dv_trees();
 void test_canvas_attention(int hd, int nh, int nkv, int start, int N, bool causal, bool fp8, double theta);
+void test_inkling2_softcap();
+void test_inkling2_attn_res();
+void test_inkling2_loop_ctrl();
+void test_inkling2_shortconv();
+void test_inkling2_rel_attn();
+void test_inkling2_moe();
+void test_dspark();
 
 }  // namespace flyx::optest
