@@ -259,16 +259,18 @@ def openai_checks(cl: Client, model: str):
           f"{plain and plain.lower().count('echo')} then {pushed and pushed.lower().count('echo')}")
     # Give the model a choice of words: even a penalized token can win every time if the prompt requires it.  A seed
     # whose list the penalty leaves as it is says nothing either way (Inkling-2-Mini's with seed 7), so the next is
-    # tried; one whose default is not the list with 1.5 spelled out ends the search, and fails.
+    # tried; one whose default is not the list with 1.5 spelled out ends the search, and fails, as does a request
+    # that fails (no reply is not a reply that differs).
     names = "List twenty possible names for a pet cat, one per line."
     for seed in (7, 8, 9, 10):
         by_default = with_penalty(names, seed=seed)
         spelled = with_penalty(names, seed=seed, presence_penalty=1.5)
         without = with_penalty(names, seed=seed, presence_penalty=0)
-        if by_default != spelled or by_default != without:
+        if None in (by_default, spelled, without) or by_default != spelled or by_default != without:
             break
-    check(by_default is not None and by_default == spelled and by_default != without,
-          "without thinking the default presence penalty is 1.5", f"{by_default!r} / {spelled!r} / {without!r}")
+    check(None not in (by_default, spelled, without) and by_default == spelled and by_default != without,
+          "without thinking the default presence penalty is 1.5",
+          f"seed {seed}: {by_default!r} / {spelled!r} / {without!r}")
     st, r = cl.post("/v1/chat/completions", {"model": model, "max_tokens": 4, "presence_penalty": 3,
                                              "messages": [{"role": "user", "content": "hi"}]})
     check(st == 400 and "error" in r, "presence_penalty out of range -> 400", json.dumps(r)[:200])
