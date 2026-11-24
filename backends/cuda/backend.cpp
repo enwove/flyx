@@ -575,20 +575,29 @@ int open_model(const flyx_model_desc* desc, const flyx_open_options* opts, flyx_
     make_head_w12(m.get());
     CK(cudaDeviceSynchronize());
     t[5] = load_clock();
-  } catch (const OutOfDeviceMemory& e) {
+  } catch (const OutOfDeviceMemory&) {
     // Not the free memory at the start: on Windows that leaves out what other programs hold until the GPU runs short.
     size_t free = 0, total = 0;
-    char held[200] = "";
-    if (gpu_memory(&free, &total) && total > free + m->bytes)
-      std::snprintf(held, sizeof(held), "; the model had %.2f GB of the GPU's %.2f GB, other programs and the driver "
-                    "hold %.2f GB", m->bytes / 1e9, total / 1e9, (total - free - m->bytes) / 1e9);
+    const bool mem_ok = gpu_memory(&free, &total) && total > 0;
+    const size_t others = mem_ok && total > free + m->bytes ? total - free - m->bytes : 0;
+    const bool has_others = others >= (256ull << 20);
     // From the description: a drafter's layers may come before its block, and run out of memory before it is bound.
     bool drafter = false;
     for (int i = 0; i < desc->n_blocks; ++i)
       for (int k : {FLYX_BLOCK_MTP, FLYX_BLOCK_DFLASH2, FLYX_BLOCK_DFLASH2_LAYER, FLYX_BLOCK_DV, FLYX_BLOCK_DV_LAYER})
         drafter = drafter || desc->blocks[i].kind == k;
-    return fail(std::string("uploading weights: ") + e.what() + held + ". Options: close some of the other programs;" +
-                (drafter ? " no drafter (smaller weights);" : "") + " a smaller quantization of the model.");
+    char head[160] = "Not enough VRAM while loading weights.";
+    if (has_others)
+      std::snprintf(head, sizeof(head), "Not enough VRAM while loading weights: %.2f / %.2f GB used by other apps.",
+                    others / 1e9, total / 1e9);
+    else if (mem_ok)
+      std::snprintf(head, sizeof(head), "Not enough VRAM while loading weights (%.2f GB GPU).", total / 1e9);
+    const std::string fix =
+        has_others ? std::string(" Close other apps") + (drafter ? ", disable speculative decoding" : "") +
+                         ", or use a smaller quantization."
+                   : (drafter ? " Disable speculative decoding or use a smaller quantization."
+                              : " Use a smaller quantization.");
+    return fail(std::string(head) + fix);
   } catch (const std::exception& e) {
     return fail(std::string("uploading weights: ") + e.what());
   }

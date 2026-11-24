@@ -15,6 +15,8 @@ import { Chat } from "./pages/chat.js";
 import { Logs } from "./pages/logs.js";
 import { Integration } from "./pages/integration.js";
 import { Hint, markVisited } from "./components/hints.js";
+import { VramModal, isVramError, parseVramNeeded } from "./components/vram_apps.js";
+import { reloadServed, loadWant } from "./lib/actions.js";
 
 const TABS = PAGES.map((p) => p[0]);
 const TITLES = Object.fromEntries(PAGES.map((p) => [p[0], p[1]]));
@@ -55,6 +57,7 @@ function App() {
   const [openRequest, setOpenRequest] = useState(requestFromAddress);
   const [libraryAsked, setLibraryAsked] = useState(0);  // counts the times a page asked for the Model page's library
   const [currentAsked, setCurrentAsked] = useState(0);  // and for its card of the model (a load's state, its error)
+  const [memKind, setMemKind] = useState("");           // "" | "vram" | "ram": modal showing apps using memory
   const [collapsed, setCollapsedState] = useState(document.documentElement.dataset.side === "collapsed");
 
   useEffect(() => {
@@ -136,15 +139,22 @@ function App() {
     : t("No model loaded") + " · FLYX";
 
   const page = (id, body) => html`<section id=${"tab-" + id} hidden=${tab !== id}>${body}</section>`;
+  const modalNeed = memKind === "vram" && L && !busyLoad(L) && isVramError(L.error) ? parseVramNeeded(L.error) : 0;
+  const modalRetry = tm && tm.model && tm.model.id && L && L.loaded
+    ? () => { setMemKind(""); reloadServed(); }
+    : L && L.state === "failed" && L.target
+      ? () => { setMemKind(""); loadWant(L.remembered && L.remembered.model === L.target ? L.remembered : { model: L.target }); }
+      : null;
+  const modalRetryLabel = tm && tm.model && tm.model.id ? "Reload model" : "Retry loading";
   return html`
     <div class="app">
       <${TopBar} title=${TITLES[tab]} go=${go}/>
-      <${Sidebar} tab=${tab} go=${go} collapsed=${collapsed} setCollapsed=${setCollapsed}/>
+      <${Sidebar} tab=${tab} go=${go} collapsed=${collapsed} setCollapsed=${setCollapsed} onOpenMem=${setMemKind}/>
       <main id="main">
         <div class="page">
           <${Notice} keyChanged=${keyChanged}/>
-          <${Hint} tab=${tab} go=${go} explore=${exploreLibrary} showModel=${showModel}/>
-          ${page("overview", html`<${Overview} active=${tab === "overview"} go=${go} explore=${exploreLibrary} showModel=${showModel}/>`)}
+          <${Hint} tab=${tab} go=${go} explore=${exploreLibrary} showModel=${showModel} onOpenMem=${setMemKind}/>
+          ${page("overview", html`<${Overview} active=${tab === "overview"} go=${go} explore=${exploreLibrary} showModel=${showModel} onOpenMem=${setMemKind}/>`)}
           ${page("model", html`<${ModelPage} active=${tab === "model"} libraryAsked=${libraryAsked} currentAsked=${currentAsked}/>`)}
           ${page("requests", html`<${Requests} key=${apiKey()} active=${tab === "requests"} openId=${openRequest} select=${selectRequest}/>`)}
           ${page("chat", html`<${Chat} active=${tab === "chat"}/>`)}
@@ -152,6 +162,8 @@ function App() {
           ${page("integration", html`<${Integration} active=${tab === "integration"}/>`)}
         </div>
       </main>
+      <${VramModal} open=${!!memKind} kind=${memKind || "vram"} onClose=${() => setMemKind("")} needBytes=${modalNeed}
+                    onRetry=${modalRetry} retryLabel=${modalRetryLabel}/>
     </div>`;
 }
 

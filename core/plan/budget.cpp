@@ -2,6 +2,7 @@
 #include "core/plan/budget.h"
 
 #include <algorithm>
+#include <cstdio>
 
 #include "core/os/os.h"
 
@@ -139,36 +140,81 @@ GpuHeld held_of(const flyx_memory_info& mi) {
   return h;
 }
 
+// "3.88" for 3.88e9 bytes (matching gb()'s decimal GB without the unit, for "3.88 / 17.09 GB").
+std::string gb_num(uint64_t bytes) {
+  char buf[32];
+  std::snprintf(buf, sizeof(buf), "%.2f", bytes / 1e9);
+  return buf;
+}
+
+// One short sentence of actionable options when VRAM is short.
+std::string vram_fix(const GpuHeld& held, uint64_t missing, bool has_drafter, bool mostly_bf16) {
+  std::string alt;
+  if (has_drafter) alt += ", disable speculative decoding";
+  alt += mostly_bf16 ? ", or use NVFP4 weights" : ", or use a smaller quantization";
+  if (closable(held)) {
+    if (missing) return "Close other apps to free at least " + gb(missing) + " VRAM" + alt + ".";
+    return "Close other apps" + alt + ".";
+  }
+  if (has_drafter)
+    return std::string("Disable speculative decoding or use ") +
+           (mostly_bf16 ? "NVFP4 weights." : "a smaller quantization.");
+  return mostly_bf16 ? "Use NVFP4 weights." : "Use a smaller quantization.";
+}
+
+// Short, itemized VRAM refusal message: other-app usage (or GPU size), minimum needed breakdown, and fix.
+std::string vram_short_error(const GpuHeld& held, uint64_t weights, uint64_t session, uint64_t overhead,
+                             uint64_t missing, bool has_drafter, bool mostly_bf16) {
+  const uint64_t need = weights + session + overhead;
+  std::string msg;
+  if (closable(held) && held.total > 0)
+    msg = "Not enough VRAM: " + gb_num(held.others) + " / " + gb(held.total) + " used by other apps. ";
+  else if (held.total > 0)
+    msg = "Not enough VRAM: " + gb(held.total) + " GPU, " + gb(missing) + " short. ";
+  else
+    msg = "Not enough VRAM: " + gb(missing) + " short. ";
+  if (session > 0)
+    msg += "Loading needs at least " + gb(need) + " (" + gb(weights) + " weights + " + gb(session) + " session + " +
+           gb(overhead) + " runtime/reserve). ";
+  else
+    msg += "Loading needs at least " + gb(need) + " (" + gb(weights) + " weights + " + gb(overhead) +
+           " runtime/reserve). ";
+  return msg + vram_fix(held, missing, has_drafter, mostly_bf16);
+}
+
 bool init_device_budget(const flyx_backend_api* api, flyx_bmodel* bm, const KvTiers& tiers, bool has_drafter,
                         bool mostly_bf16, ResourceLedger* ledger, Budget* out, flyx_memory_info* mi,
-                        std::string* err) {
+                        uint64_t* reserve_out, std::string* err) {
   *mi = {};
+  *reserve_out = 0;
   const bool reported = api->memory(bm, mi) == 0 && mi->total > 0;
   out->held = held_of(*mi);
-  // What would make room, for the refusals below.
-  const std::string others = held_note(out->held);
-  const std::string room = (others.empty() ? std::string(". Options:") : "; " + others + ". Options:") +
-                           (closable(out->held) ? " close other programs;" : "") +
-                           (has_drafter ? " no drafter (smaller weights);" : "") +
-                           (mostly_bf16 ? " NVFP4 weights instead of BF16." : " a smaller quantization of the model.");
+  uint64_t reserve = 0;
+  auto fail_vram = [&] {
+    const uint64_t overhead = mi->workspace + out->held.runtime + reserve;
+    const uint64_t missing = reserve > mi->free ? reserve - mi->free : 0;
+    *err = vram_short_error(out->held, mi->weights, 0, overhead, missing, has_drafter, mostly_bf16);
+    return false;
+  };
   if (reported) {
     // Windows pages a process's GPU memory out rather than refuse it, and does so before the GPU is full: a 27B
     // session filling the budget on a 16 GB card under WSL2 (15.8 of 16.3 GB in use) prefilled 12 times slower, one
-    // with 0.15 GB less ran as fast as ever. Half a gigabyte more is left there.
-    const uint64_t paged = tiers.gpu_paged ? 512ull << 20 : 0;
-    const uint64_t reserve = std::max<uint64_t>(384ull << 20, mi->total / 40) + paged;
+    // with 0.15 GB less ran as fast as ever; large allocations start paging around 560-690 MiB free (kPagedFloor is
+    // 768 MiB). Hold at least 768 MiB + 64 MiB desktop cushion where Windows pages, without stacking on top of base.
+    const uint64_t base = std::max<uint64_t>(384ull << 20, mi->total / 40);
+    constexpr uint64_t kPagedReserve = (768ull + 64ull) << 20;
+    reserve = tiers.gpu_paged ? std::max(base, kPagedReserve) : base;
+    *reserve_out = reserve;
     const uint64_t have = mi->free + mi->weights + mi->workspace;
     // Zero is the ledger's sentinel for a backend that does not report a budget.
-    if (have <= reserve)
-      return *err = "not enough GPU memory for the device reserve (" + gb(reserve) + "); " + gb(mi->free) +
-                    " free after loading the model" + room, false;
+    if (have <= reserve) return fail_vram();
     ledger->set_budget(have - reserve);
   }
   std::string why;
   out->weights = ledger->reserve("weights", "model", mi->weights, &why);
-  if (!out->weights) return *err = "not enough GPU memory for " + why + room, false;
+  if (!out->weights) return fail_vram();
   out->workspace = ledger->reserve("workspace", "kernels", mi->workspace, &why);
-  if (!out->workspace) return *err = "not enough GPU memory for " + why + room, false;
+  if (!out->workspace) return fail_vram();
   out->sessions_room = ledger->budget() ? ledger->available() : 0;
   return true;
 }
@@ -274,56 +320,44 @@ constexpr int kLeastCtx = 1024;
 uint64_t least_session(const TierPlacer& placer, bool in_host) {
   uint64_t bytes = 0;
   if (!in_host) return device_bytes(placer.api, placer.bm, kLeastCtx, placer.tiers, &bytes) ? bytes : 0;
-  const flyx_seq_layout l{kLeastCtx, 0, placer.tiers.method, placer.tiers.method_arg, INT32_MAX};
+  // FLYX_KV_AUTO falls back to exact when Strata copies do not fit, so the true floor is exact.
+  const KvTiers t = placer.tiers.method == FLYX_KV_AUTO ? exact_of(placer.tiers) : placer.tiers;
+  const flyx_seq_layout l{kLeastCtx, 0, t.method, t.method_arg, INT32_MAX};
   flyx_seq_size s{};
   return placer.api->seq_size(placer.bm, &l, &s) == 0 ? s.device : 0;
 }
 
-std::string format_oom_error(const TierPlacer& placer, const flyx_memory_info& mi, int max_ctx, bool has_drafter,
-                             bool mostly_bf16, bool tiers_on) {
+std::string format_oom_error(const TierPlacer& placer, const flyx_memory_info& mi, uint64_t reserve, int max_ctx,
+                             bool has_drafter, bool mostly_bf16, bool tiers_on) {
   const GpuHeld& held = placer.out->held;
-  const std::string others = held_note(held);
   const uint64_t left = placer.ledger->available();
-  const std::string after = gb(left) + " are left after the weights (" + gb(mi.weights) +
-                            (others.empty() ? "" : "; " + others) + ")";
-  std::string fits;  // the contexts that would fit
-  if (tiers_on) {    // the longest the GPU and host memory hold together
+  int fit_ctx = 0;
+  if (tiers_on) {  // the longest the GPU and host memory hold together
     flyx_seq_layout l{};
     flyx_seq_size placed{};
-    if (const int ctx = placer.longest_placed(max_ctx, &l, &placed); ctx > 0)
-      fits += " a context of " + std::to_string(ctx) + " tokens, the K/V past the GPU's part in host memory (" +
-              gb(placed.host) + " of it; --ctx max takes the longest);";
+    fit_ctx = placer.longest_placed(max_ctx, &l, &placed);
   }
-  for (int ctx = max_ctx / 2; ctx >= 1024; ctx /= 2) {
-    uint64_t b = 0;
-    if (device_bytes(placer.api, placer.bm, ctx, placer.tiers, &b) && b <= left) {
-      fits += " a context of " + std::to_string(ctx) + " tokens (" + gb(b) + " per session);";
-      break;
+  if (!fit_ctx) {
+    for (int ctx = max_ctx / 2; ctx >= 1024; ctx /= 2) {
+      uint64_t b = 0;
+      if (device_bytes(placer.api, placer.bm, ctx, placer.tiers, &b) && b <= left) {
+        fit_ctx = ctx;
+        break;
+      }
     }
   }
   // No context fits: the context asked for is not what is in the way.  What the shortest session keeps on the GPU
   // is, and how much of it is missing says how far off the load is.
-  const uint64_t least = fits.empty() ? least_session(placer, tiers_on) : 0;
+  const uint64_t least = !fit_ctx ? least_session(placer, tiers_on) : 0;
   const uint64_t missing = least > left ? least - left : 0;
-  std::string msg;
   if (missing) {
-    msg = "not enough GPU memory for a session: " +
-          (tiers_on ? "with its K/V in host memory one of " + std::to_string(kLeastCtx) + " tokens still keeps " +
-                          gb(least) + " on the GPU"
-                    : "one of " + std::to_string(kLeastCtx) + " tokens takes " + gb(least)) +
-          ", " + after + ". Options:";
-  } else {
-    msg = "not enough GPU memory for one session with a " + std::to_string(max_ctx) + "-token context: it needs " +
-          gb(placer.out->session_bytes) + ", " + after + ". Options:" + fits;
+    const uint64_t overhead = mi.workspace + held.runtime + reserve;
+    return vram_short_error(held, mi.weights, least, overhead, missing, has_drafter, mostly_bf16);
   }
-  if (closable(held))
-    msg += missing ? " close other programs (" + gb(missing) + " more are needed);" : " close other programs;";
-  if (has_drafter) msg += " no drafter (smaller weights);";
-  msg += mostly_bf16 ? " NVFP4 weights instead of BF16." : " a smaller quantization of the model.";
-  // Why the K/V are not in host memory, unless the line above said what stays on the GPU with them there.
-  if (!(missing && tiers_on) && !placer.out->tier_note.empty() && placer.tiers.ram != 0)
-    msg += " (K/V past the GPU's part in host memory: " + placer.out->tier_note + ".)";
-  return msg;
+  std::string msg = "Not enough VRAM for " + std::to_string(max_ctx) + "-token context (needs " +
+                    gb(placer.out->session_bytes) + ", " + gb(left) + " free after weights). ";
+  if (fit_ctx > 0) msg += "Max supported context: " + std::to_string(fit_ctx) + " tokens. ";
+  return msg + vram_fix(held, 0, has_drafter, mostly_bf16);
 }
 
 }  // namespace
@@ -356,7 +390,8 @@ bool account(const flyx_backend_api* api, flyx_bmodel* bm, bool has_drafter, boo
   out->layout = {max_ctx, INT32_MAX, tiers.method, tiers.method_arg, 0};
   out->host_budget = host_budget(tiers);
   flyx_memory_info mi{};
-  if (!init_device_budget(api, bm, tiers, has_drafter, mostly_bf16, ledger, out, &mi, err)) return false;
+  uint64_t reserve = 0;
+  if (!init_device_budget(api, bm, tiers, has_drafter, mostly_bf16, ledger, out, &mi, &reserve, err)) return false;
   uint64_t sb = 0;
   if (!device_bytes(api, bm, max_ctx, tiers, &sb, err)) return false;
   out->session_bytes = sb;
@@ -404,7 +439,7 @@ bool account(const flyx_backend_api* api, flyx_bmodel* bm, bool has_drafter, boo
       out->ctx_limit = CtxLimit::kGpu;
       return true;
     }
-    *err = format_oom_error(placer, mi, max_ctx, has_drafter, mostly_bf16, tiers_on);
+    *err = format_oom_error(placer, mi, reserve, max_ctx, has_drafter, mostly_bf16, tiers_on);
     return false;
   }
   return true;

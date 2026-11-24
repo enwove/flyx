@@ -40,6 +40,7 @@
 #include <tuple>
 
 #include "apps/flyx-server/agent_launch.h"
+#include "apps/flyx-server/gpu_apps.h"
 #include "apps/flyx-server/server.h"
 #include "core/interfaces/model.h"
 #include "core/os/env.h"
@@ -460,6 +461,93 @@ void add_manage_routes(httplib::Server& http, Server* s) {
     if (target.keyed) env.emplace_back("FLYX_KEY", s->cfg.api_key);
     if (!os::open_shell_window(dir, command, env, &err)) return error(r, 501, err, "not_supported");
     send_json(r, 200, {{"launched", true}, {"dir", dir}});
+  });
+  auto device_hint = [s]() -> std::string {
+    const ModelHost::Served served = s->host->served();
+    if (served.sched) {
+      TelemetrySnapshot t;
+      flyx_device_stats d{};
+      bool ok = false;
+      served.sched->telemetry(&t, &d, &ok);
+      if (!t.model.device.empty()) return t.model.device;
+    }
+    if (s->device_probe.is_object() && s->device_probe.contains("name") && s->device_probe["name"].is_string())
+      return s->device_probe["name"].get<std::string>();
+    return "";
+  };
+  auto gpu_snapshot_json = [](const GpuAppSnapshot& snap, const char* kind, bool can_close) {
+    ojson apps = ojson::array();
+    for (const auto& a : snap.apps) {
+      apps.push_back({{"id", a.id},
+                      {"name", a.name},
+                      {"process", a.process_name},
+                      {"bytes", a.bytes},
+                      {"local_bytes", a.local_bytes},
+                      {"processes", a.processes},
+                      {"closable", a.closable},
+                      {"reason", a.reason.empty() ? ojson(nullptr) : ojson(a.reason)}});
+    }
+    return ojson{{"kind", kind},
+                 {"supported", snap.supported},
+                 {"can_close", can_close},
+                 {"device", snap.device_name.empty() ? ojson(nullptr) : ojson(snap.device_name)},
+                 {"mem_total", snap.mem_total},
+                 {"mem_used", snap.mem_used},
+                 {"mem_free", snap.mem_free},
+                 {"own_bytes", snap.own_bytes},
+                 {"others_bytes", snap.others_bytes},
+                 {"system_bytes", snap.system_bytes},
+                 {"idle_igpu", snap.idle_igpu.empty() ? ojson(nullptr) : ojson(snap.idle_igpu)},
+                 {"apps", std::move(apps)}};
+  };
+  http.Get("/v1/device/processes", [s, device_hint, gpu_snapshot_json](const httplib::Request& q, httplib::Response& r) {
+    if (!require_manage(*s, q, r, "inspecting memory usage")) return;
+    const std::string kind = q.has_param("kind") ? q.get_param_value("kind") : "vram";
+    if (kind != "vram" && kind != "ram") return error(r, 400, "kind must be vram or ram", "invalid_request_error");
+    r.set_header("Cache-Control", "no-store");
+    const bool ram = kind == "ram";
+    const GpuAppSnapshot snap = ram ? list_ram_apps() : list_gpu_apps(device_hint());
+    if (!ram && snap.mem_total > 0) s->probe_mem_used.store(snap.mem_used, std::memory_order_relaxed);
+    send_json(r, 200, gpu_snapshot_json(snap, ram ? "ram" : "vram", from_this_machine(q)));
+  });
+  http.Post("/v1/device/close", [s, device_hint, gpu_snapshot_json](const httplib::Request& q, httplib::Response& r) {
+    if (!require_manage(*s, q, r, "closing applications")) return;
+    if (!from_this_machine(q))
+      return error(r, 403, "closing applications is only allowed from this machine", "permission_error");
+    const ojson body = interfaces::parse_json(q.body);
+    if (!body.is_object()) return error(r, 400, "request body is not a JSON object", "invalid_request_error");
+    if (!body.contains("id") || !body["id"].is_string() || body["id"].get<std::string>().empty())
+      return error(r, 400, "id: an application id from GET /v1/device/processes", "invalid_request_error");
+    bool force = false;
+    if (body.contains("force") && !body["force"].is_null()) {
+      if (!body["force"].is_boolean()) return error(r, 400, "force: true or false", "invalid_request_error");
+      force = body["force"].get<bool>();
+    }
+    std::string kind = "vram";
+    if (body.contains("kind") && !body["kind"].is_null()) {
+      if (!body["kind"].is_string()) return error(r, 400, "kind must be vram or ram", "invalid_request_error");
+      kind = body["kind"].get<std::string>();
+      if (kind != "vram" && kind != "ram") return error(r, 400, "kind must be vram or ram", "invalid_request_error");
+    }
+    const bool ram = kind == "ram";
+    const GpuCloseResult res =
+        ram ? close_ram_app(body["id"].get<std::string>(), force) : close_gpu_app(device_hint(), body["id"].get<std::string>(), force);
+    if (!ram && res.snapshot.mem_total > 0) s->probe_mem_used.store(res.snapshot.mem_used, std::memory_order_relaxed);
+    if (res.status == CloseStatus::kUnsupported)
+      return error(r, 501, "closing applications is not supported on this system", "not_supported");
+    if (res.status == CloseStatus::kNotFound)
+      return error(r, 404, "that application is no longer listed", "not_found");
+    if (res.status == CloseStatus::kForbidden)
+      return error(r, 403, "that application is protected and cannot be closed from FLYX", "permission_error");
+    if (res.status == CloseStatus::kAccessDenied)
+      return error(r, 403, "permission denied: close that application manually", "permission_error");
+    const char* status = res.status == CloseStatus::kClosed   ? "closed"
+                       : res.status == CloseStatus::kNoWindow ? "no_window"
+                                                              : "still_running";
+    send_json(r, 200, {{"status", status},
+                       {"windows_signaled", res.windows_signaled},
+                       {"name", res.app_name},
+                       {"snapshot", gpu_snapshot_json(res.snapshot, ram ? "ram" : "vram", true)}});
   });
 }
 

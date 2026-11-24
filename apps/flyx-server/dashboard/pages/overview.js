@@ -2,9 +2,9 @@
 // The Overview page: what runs now, throughput (decode and prefill) and speculative decoding over two minutes, the
 // recent requests, the sessions on the GPU, and the engine, device and host.
 import { html } from "../lib/html.js";
-import { t } from "../lib/i18n.js";
+import { t, tErr } from "../lib/i18n.js";
 import { fmt, gib, gb, ktok, secs, clock, level, shortDevice } from "../lib/format.js";
-import { Meter, MemBar, StatusBadge } from "../lib/ui.js";
+import { Meter, MemBar, StatusBadge, Icon } from "../lib/ui.js";
 import { Chart } from "../lib/charts.js";
 import { pendingConnect } from "../components/hints.js";
 import { openRequest } from "../lib/actions.js";
@@ -36,7 +36,7 @@ function now(tm, phase) {
     if (p.total) side.push(gb(p.done) + " of " + gb(p.total) + " GB");
     if (p.bytes_per_s) side.push(fmt(p.bytes_per_s / 1e6) + " MB/s");
   } else if (phase === "none") {
-    if (L.state === "failed") { say("Load failed: "); say(L.error || "", true); }
+    if (L.state === "failed") { say("Load failed: "); say(tErr(L.error || ""), true); }
     else say("No model loaded. Choose one under Model.");
   } else if (phase === "loading") {
     say("Loading "); say(L.target || "the model", true);
@@ -93,7 +93,7 @@ const Gauge = ({ id, label, value, frac }) => html`
 
 const Kv = ({ pairs }) => html`<dl class="kv">${pairs.map(([k, v]) => html`<dt>${t(k)}</dt><dd>${t(v)}</dd>`)}</dl>`;
 
-export function Overview({ active, go, explore, showModel }) {
+export function Overview({ active, go, explore, showModel, onOpenMem }) {
   const tm = live.last;
   if (!tm) return html`<div class="now"><span class="badge">${t("Connecting")}</span><div class="what">-</div></div>`;
   const phase = phaseOf(tm), model = tm.model || {}, d = tm.device, recent = tm.recent || [], L = tm.load || {};
@@ -205,10 +205,19 @@ export function Overview({ active, go, explore, showModel }) {
           ["PCIe", d.pcie_gen ? "gen " + d.pcie_gen + " x" + d.pcie_width : "-"],
         ] : [["GPU", model.loaded ? "no figures from this device" : "model not loaded"]]}/></div>
       <div class="pane" id="ov-host"><div class="pane-h"><h2>${t("Host")}</h2></div>
-        ${[["VRAM", memory.vram], ["RAM", memory.ram]].map(([k, m]) => html`
-          <div class="memrow" id=${"ov-" + k.toLowerCase()}>
-            <div class="mk"><span>${t(k)}</span><span class="v">${m ? gib(m.used) + " / " + gib(m.total) + " GiB" : "-"}</span></div>
-            <${MemBar} m=${m}/></div>`)}
+        ${[["VRAM", "vram", memory.vram], ["RAM", "ram", memory.ram]].map(([k, kind, m]) => {
+          const act = !!(m && onOpenMem);
+          const onKey = (e) => { if (e.key === "Enter" || e.key === " ") { e.preventDefault(); onOpenMem(kind); } };
+          return html`
+          <div class=${"memrow" + (act ? " memrow-act" : "")} id=${"ov-" + kind}
+               role=${act ? "button" : undefined} tabIndex=${act ? 0 : undefined}
+               title=${act ? t(kind === "ram" ? "Inspect and close apps using RAM" : "Inspect and close apps using VRAM") : undefined}
+               onClick=${act ? () => onOpenMem(kind) : undefined}
+               onKeyDown=${act ? onKey : undefined}>
+            <div class="mk"><span class="lk-lbl">${t(k)}${act ? html`<${Icon} name="chev" cls="lk-chev"/>` : ""}</span>
+              <span class="v">${m ? gib(m.used) + " / " + gib(m.total) + " GiB" : "-"}</span></div>
+            <${MemBar} m=${m}/></div>`;
+        })}
         <${Kv} pairs=${[
           ["CPU, FLYX", tm._cpu === undefined ? "-" : tm._cpu > 100 ? fmt(tm._cpu / 100, 1) + " cores" : fmt(tm._cpu, 1) + "% of a core"],
           ["Cores", fmt(sys.cpus)],

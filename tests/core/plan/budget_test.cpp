@@ -215,7 +215,7 @@ int main() {
       check(!ok && !err.empty(), "refuse a load that cannot cover the reserve, weights or workspace");
     }
   }
-  {  // where Windows pages GPU memory, half a gigabyte more stays free: 8,192 positions fewer at 64 KiB each
+  {  // where Windows pages GPU memory, reserve is max(base, 832 MiB) rather than base + 512 MiB
     ResourceLedger ledger;
     plan::Budget b;
     std::string err;
@@ -223,9 +223,27 @@ int main() {
     plan::KvTiers paged = kGpuOnly;
     paged.gpu_paged = true;
     const bool ok = plan::account(&api, nullptr, false, false, &ctx, 4096, paged, &ledger, &b, &err);
-    const int want = int((left - kGiB - kGiB / 2) / (64 * 1024)) / 1024 * 1024;
-    check(ok && ctx == want, "GPU memory Windows pages: 512 MB more left free (" + std::to_string(ctx) + ", want " +
+    const uint64_t paged_left = 16 * kGiB - 832 * kMiB - 10 * kGiB - kGiB / 2;
+    const int want = int((paged_left - kGiB) / (64 * 1024)) / 1024 * 1024;
+    check(ok && ctx == want, "GPU memory Windows pages: 832 MiB reserve floor (" + std::to_string(ctx) + ", want " +
                                  std::to_string(want) + ")");
+  }
+  {  // on a large GPU where base reserve (total / 40) already exceeds 832 MiB, gpu_paged adds nothing extra
+    auto large = fake();
+    large.memory = [](flyx_bmodel*, flyx_memory_info* out) {
+      *out = {10 * kGiB, kGiB / 2, 37 * kGiB + kGiB / 2, 48 * kGiB, 0};
+      return 0;
+    };
+    ResourceLedger l0, l1;
+    plan::Budget b0, b1;
+    std::string e0, e1;
+    int c0 = 8192, c1 = 8192;
+    plan::KvTiers paged = kGpuOnly;
+    paged.gpu_paged = true;
+    check(plan::account(&large, nullptr, false, false, &c0, 0, kGpuOnly, &l0, &b0, &e0) &&
+              plan::account(&large, nullptr, false, false, &c1, 0, paged, &l1, &b1, &e1) &&
+              b0.sessions_room == b1.sessions_room,
+          "large GPU (>33 GiB) does not stack paged reserve on top of total/40");
   }
   {
     ResourceLedger ledger;
@@ -233,7 +251,7 @@ int main() {
     std::string err;
     int ctx = 262144;
     check(!plan::account(&api, nullptr, false, false, &ctx, 0, kGpuOnly, &ledger, &b, &err) && ctx == 262144 &&
-              err.find("a context of") != std::string::npos,
+              err.find("Max supported context:") != std::string::npos,
           "a context asked for is refused, naming one that fits: " + err);
   }
   {
@@ -242,7 +260,7 @@ int main() {
     std::string err;
     int ctx = 262144;
     check(!plan::account(&api, nullptr, true, false, &ctx, 131072, kGpuOnly, &ledger, &b, &err) && ctx == 262144 &&
-              err.find("no drafter") != std::string::npos,
+              err.find("Disable speculative decoding") != std::string::npos,
           "nothing at or above the floor fits: refused: " + err);
   }
   {
@@ -296,12 +314,8 @@ int main() {
     int ctx = 262144;
     const plan::KvTiers tiers{-1, int64_t(4 * kGiB)};
     const bool ok = plan::account(&api, nullptr, false, false, &ctx, 0, tiers, &ledger, &b, &err);
-    const size_t at = err.find("tokens, the K/V past the GPU's part in host memory");
-    int named = 0;
-    if (at != std::string::npos) {
-      const size_t from = err.rfind("a context of ", at);
-      named = from == std::string::npos ? 0 : std::atoi(err.c_str() + from + 13);
-    }
+    const size_t at = err.find("Max supported context: ");
+    int named = at == std::string::npos ? 0 : std::atoi(err.c_str() + at + 23);
     check(!ok && named > 120000 && named < 140000,
           "a context host memory cannot take is refused, naming one the GPU and host memory hold (" +
               std::to_string(named) + "): " + err);
@@ -390,7 +404,8 @@ int main() {
     int ctx = 4096;
     g_others = 16 * kGiB - 10 * kGiB - kGiB / 2 - 64 * kMiB;  // 64 MiB free
     const bool ok = plan::account(&api, nullptr, false, false, &ctx, 0, kGpuOnly, &ledger, &b, &err);
-    check(!ok && err.find("other programs, the driver and flyx's own runtime hold 5.84 GB") != std::string::npos,
+    check(!ok && err.find("Not enough VRAM: 5.84 / 17.18 GB used by other apps.") != std::string::npos &&
+              err.find("Close other apps to free at least 0.36 GB VRAM") != std::string::npos,
           "no room for the weights' own lease: refused, not granted with the weights uncounted: " + err);
     g_others = 0;
   }
@@ -402,8 +417,8 @@ int main() {
     g_weights = 128 * kMiB, g_workspace = 64 * kMiB;
     g_others = 16 * kGiB - g_weights - g_workspace - 64 * kMiB;  // 64 MiB free: 256 MiB in all, the reserve 410
     const bool ok = plan::account(&api, nullptr, false, false, &ctx, 0, kGpuOnly, &ledger, &b, &err);
-    check(!ok && err.find("0.07 GB free after loading the model") != std::string::npos &&
-              err.find("other programs, the driver and flyx's own runtime hold 16.91 GB") != std::string::npos,
+    check(!ok && err.find("Not enough VRAM: 16.91 / 17.18 GB used by other apps.") != std::string::npos &&
+              err.find("Close other apps to free at least 0.36 GB VRAM") != std::string::npos,
           "under the reserve altogether: refused, saying what other programs hold: " + err);
     g_weights = 10 * kGiB, g_workspace = kGiB / 2, g_others = 0;
   }
@@ -417,10 +432,7 @@ int main() {
       std::string err;
       int ctx = 262144;
       const bool ok = plan::account(&api, nullptr, false, false, &ctx, 0, kGpuOnly, &ledger, &b, &err);
-      const std::string want =
-          split ? "other programs and the driver hold 3.22 GB of its 17.18 GB, flyx's own runtime 0.54 GB"
-                : "other programs, the driver and flyx's own runtime hold 3.76 GB of its 17.18 GB";
-      check(!ok && err.find(want) != std::string::npos && err.find(" close other programs;") != std::string::npos &&
+      check(!ok && err.find("Close other apps, or use a smaller quantization.") != std::string::npos &&
                 b.held.runtime_known == split && b.held.others == 3 * kGiB + (split ? 0 : kGiB / 2) &&
                 b.held.runtime == (split ? kGiB / 2 : 0),
             std::string(split ? "the process's share counted" : "no share counted") + ": " + err);
@@ -440,19 +452,38 @@ int main() {
       const bool ok =
           plan::account(&api, nullptr, true, false, &ctx, longest ? 1024 : 0, host, &ledger, &b, &err, longest);
       check(!ok &&
-                err.find("with its K/V in host memory one of 1024 tokens still keeps 1.07 GB on the GPU, 0.97 GB are "
-                         "left after the weights") != std::string::npos &&
-                err.find(" close other programs (0.10 GB more are needed); no drafter") != std::string::npos &&
-                err.find("-token context") == std::string::npos && err.find("(K/V past") == std::string::npos,
+                err.find("used by other apps. Loading needs at least ") != std::string::npos &&
+                err.find("1.07 GB session") != std::string::npos &&
+                err.find("Close other apps to free at least 0.10 GB VRAM, disable speculative decoding") != std::string::npos &&
+                err.find("-token context") == std::string::npos,
             std::string(longest ? "--ctx max" : "a context asked for") + ", no session fits: " + err);
+    }
+    // FLYX_KV_AUTO with Strata overhead at 1024 must still report the exact fallback floor in the OOM error.
+    auto strata_auto = fake();
+    strata_auto.seq_size = [](flyx_bmodel* bm, const flyx_seq_layout* l, flyx_seq_size* out) {
+      seq_size(bm, l, out);
+      if (l->method == FLYX_KV_AUTO) out->device += 256 * kMiB;  // Strata overhead when kStrataHostExact == 0
+      return 0;
+    };
+    {
+      ResourceLedger ledger;
+      plan::Budget b;
+      std::string err;
+      int ctx = 262144;
+      plan::KvTiers host_auto = host;
+      host_auto.method = FLYX_KV_AUTO;
+      const bool ok = plan::account(&strata_auto, nullptr, true, false, &ctx, 1024, host_auto, &ledger, &b, &err, true);
+      check(!ok && err.find("1.07 GB session") != std::string::npos &&
+                err.find("free at least 0.10 GB VRAM") != std::string::npos,
+            "FLYX_KV_AUTO OOM floor uses exact fallback size, not Strata overhead: " + err);
     }
     ResourceLedger ledger;
     plan::Budget b;
     std::string err;
     int ctx = 262144;
     const bool ok = plan::account(&api, nullptr, false, false, &ctx, 4096, kGpuOnly, &ledger, &b, &err);
-    check(!ok && err.find("one of 1024 tokens takes 1.14 GB, 0.97 GB are left") != std::string::npos &&
-              err.find(" close other programs (0.17 GB more are needed);") != std::string::npos,
+    check(!ok && err.find("1.14 GB session") != std::string::npos &&
+              err.find("Close other apps to free at least 0.17 GB VRAM") != std::string::npos,
           "no session fits the GPU alone: " + err);
     g_others = 0, g_split = false;
   }

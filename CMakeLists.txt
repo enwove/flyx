@@ -244,6 +244,7 @@ set(FLYX_CLI_SOURCES
     apps/flyx-server/openai_responses.cpp apps/flyx-server/anthropic_messages.cpp
     apps/flyx-server/telemetry.cpp apps/flyx-server/model_host.cpp apps/flyx-server/manage.cpp
     apps/flyx-server/request_log.cpp apps/flyx-server/system_log.cpp apps/flyx-server/agent_launch.cpp
+    apps/flyx-server/gpu_apps.cpp
     ${FLYX_DASHBOARD_CPP}
     apps/common/engine_flags.cpp apps/common/numbers.cpp apps/common/model_source.cpp)
 if(WIN32)

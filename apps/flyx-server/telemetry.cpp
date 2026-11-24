@@ -119,6 +119,10 @@ ojson snapshot_json(const Server& s, int recent) {
   ojson sessions = ojson::array();
   for (const auto& sl : t.sessions) sessions.push_back({{"id", sl.id}, {"tokens", sl.tokens}});
   ojson device = served.sched ? ojson(nullptr) : s.device_probe;  // no model: what the start-up probe found
+  if (!served.sched && device.is_object()) {
+    const uint64_t fresh = s.probe_mem_used.load(std::memory_order_relaxed);
+    if (fresh > 0) device["mem_used"] = fresh;
+  }
   if (device_ok) {
     device = {{"name", m.device},
               {"util", known(d.util)},

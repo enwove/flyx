@@ -112,8 +112,8 @@ inline void destroy_side(SideStream& s) {
 //                         a 2-bit copy, 64 with more; 0: none, the copy alone), at least strata_least=N pairs (32),
 //                         plus the last strata_recent=N positions, and at most strata_most=N pairs (256; 0: no
 //                         bound); strata_scan=cores, strata_grid=normal: measurement
-//   strata_from=N         --kv-method auto: rounds read the copy from position N on (default: 32,768 past the GPU's
-//                         part of the K/V)
+//   strata_from=N         --kv-method auto: rounds read the copy from position N on (default: the GPU's part of
+//                         the K/V, i.e. 0 tokens of exact host overhang)
 //   act_group=64|128|256  measurement: 8-bit inputs with one scale this many values (bench/quality/kld.cpp; with
 //                         fusion=0 and round_glu=0, whose producers round their own outputs per 32)
 //   act_fp4=1|2           measurement: inputs first rounded as NVFP4 (1) or MXFP8 (2) activations would be
@@ -491,11 +491,11 @@ constexpr int kRoundSplits = 64;
 // What a round's attention reads of a cache with a low-bit copy: the cache (every position), the
 // copy (strata attention), or both, the copy's output replacing the rows at the switch or past it.
 enum StrataPhase { kStrataNone, kStrataAll, kStrataBoth };
-// FLYX_KV_AUTO's switch (KernelOptions::strata_from): this many positions past the device's part of the
-// K/V.  With exact rounds on tensor cores, exact attention over positions on the GPU outran strata's at every length
-// measured (RTX 5090, 27B Q4_K_XL, MTP: 109.1 against 101.3 tok/s at 122K, 81.1 against 68.9 at 260K); on the RTX
-// 5070 Ti (27B IQ3_XXS) exact rounds stayed ahead with up to 28K positions in host memory, plain and with MTP.
-constexpr int kStrataHostExact = 32768;
+// FLYX_KV_AUTO's switch (KernelOptions::strata_from): this many positions past the device's part of the K/V.
+// Exact attention stays on for every position that fits on the GPU (where it outran strata on RTX 5090 at every
+// length); once a session spills into host memory, switching immediately (0 host overhang) avoids sizing the device
+// staging window for a 32K exact host suffix and keeps long-context budgeting compact on tight 16 GB cards.
+constexpr int kStrataHostExact = 0;
 constexpr int kMaxPrefillRows = 4096;
 constexpr int kPrefillSplits = 8;
 

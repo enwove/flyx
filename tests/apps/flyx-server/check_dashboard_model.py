@@ -109,8 +109,10 @@ def telemetry(want, remembered=None):
 class Server:
     """The stubbed server of one page: what it was asked to load, to delete and to show a folder dialog for."""
 
-    def __init__(self, page, tm, dialog=(200, LISTING)):
+    def __init__(self, page, tm, dialog=(200, LISTING), gpu_apps=None):
         self.tm, self.dialog, self.posted, self.deleted, self.dialogs = tm, dialog, [], [], []
+        self.gpu_apps = copy.deepcopy(gpu_apps) if gpu_apps is not None else None
+        self.closed = []
         page.route("**/dashboard/**", lambda r: serve(r, ROOT / "apps/flyx-server/dashboard"))
         page.route("**/v1/**", self.answer)
 
@@ -120,6 +122,32 @@ class Server:
         if method == "POST" and url.endswith("/v1/load"):
             self.posted.append(route.request.post_data_json)
             return route.fulfill(json={})
+        if method == "GET" and "/v1/device/processes" in url:
+            kind = query.get("kind", ["vram"])[0]
+            if self.gpu_apps is None:
+                return route.fulfill(json={"kind": kind, "supported": True, "can_close": True, "mem_total": 16 * GB,
+                                           "mem_used": 2 * GB, "mem_free": 14 * GB, "own_bytes": 0,
+                                           "others_bytes": 2 * GB, "system_bytes": 0, "idle_igpu": None, "apps": []})
+            data = self.gpu_apps.get(kind, self.gpu_apps) if "vram" in self.gpu_apps or "ram" in self.gpu_apps else self.gpu_apps
+            return route.fulfill(json=data)
+        if method == "POST" and "/v1/device/close" in url:
+            body = route.request.post_data_json
+            self.closed.append(body)
+            app_id, force = body["id"], bool(body.get("force"))
+            kind = body.get("kind", "vram")
+            bucket = self.gpu_apps.get(kind, self.gpu_apps) if "vram" in self.gpu_apps or "ram" in self.gpu_apps else self.gpu_apps
+            apps = bucket["apps"]
+            target = next((a for a in apps if a["id"] == app_id), None)
+            if not target:
+                return route.fulfill(status=404, json={"error": {"message": "not found"}})
+            if target.get("tray") and not force:
+                return route.fulfill(json={"status": "still_running", "windows_signaled": 1, "name": target["name"],
+                                           "snapshot": bucket})
+            bucket["apps"] = [a for a in apps if a["id"] != app_id]
+            bucket["mem_free"] += target["bytes"]
+            bucket["others_bytes"] = max(0, bucket["others_bytes"] - target["bytes"])
+            return route.fulfill(json={"status": "closed", "windows_signaled": 1, "name": target["name"],
+                                       "snapshot": bucket})
         if method == "POST" and "/v1/hub/dir" in url:
             self.dialogs.append(route.request.post_data_json)
             return route.fulfill(status=self.dialog[0], json=self.dialog[1])
@@ -191,16 +219,17 @@ def check_context_limit(open_page, want):
     gpu = {"by": "gpu", "wanted": 262144, "short": True, "left": 820_000_000, "gpu_tokens": 8192,
            "others": 3_600_000_000, "closable": True, "runtime": 540_000_000}
     cases = [
-        (gpu, "warn", "Context 8,192 / 262,144 (all KV in VRAM). 0.82 GB VRAM left after weights "
+        (gpu, "warn", "Limited context window 8,192 / 262,144. Not enough VRAM left "
                       "(3.60 GB used by other apps). Close other apps and reload for a longer context."),
         (dict(gpu, others=100_000_000, closable=False), "warn",
-         "Disable speculative decoding or use a smaller quantization for more VRAM."),
+         "Limited context window 8,192 / 262,144. Not enough VRAM left. "
+         "Disable speculative decoding or use a smaller quantization for a longer context."),
         ({"by": "host", "wanted": 262144, "short": False, "left": 7_300_000_000, "gpu_tokens": 4096,
           "others": None, "closable": False, "runtime": None}, "hint",
-         "Context 8,192 / 262,144 (KV: 4,096 tokens in VRAM, 4,096 in RAM). RAM KV budget is 7.30 GB."),
+         "Limited context window 8,192 / 262,144. Not enough free RAM (7.30 GB available for KV)."),
         ({"by": "host", "wanted": 262144, "short": False, "left": 7_300_000_000, "gpu_tokens": 0,
           "others": None, "closable": False, "runtime": None}, "hint",
-         "Context 8,192 / 262,144 (all KV in RAM). RAM KV budget is 7.30 GB."),
+         "Limited context window 8,192 / 262,144. Not enough free RAM (7.30 GB available for KV)."),
     ]
     for limit, tone, text in cases:
         tm = telemetry(want)
@@ -406,6 +435,120 @@ def check_nothing_served(page, server, remembered):
     expect(page.locator("#mv-library")).to_be_visible()
 
 
+def check_vram_apps(open_page, want):
+    """VRAM manager panel: auto-opens on OOM, safe two-step close (graceful -> force quit), protected & remote read-only."""
+    snap = {
+        "supported": True, "can_close": True, "device": "NVIDIA GeForce RTX 5070 Ti",
+        "mem_total": int(17.09 * GB), "mem_used": int(4.12 * GB), "mem_free": int(12.97 * GB),
+        "own_bytes": int(0.24 * GB), "others_bytes": int(3.88 * GB), "system_bytes": int(0.95 * GB),
+        "idle_igpu": "AMD Radeon(TM) Graphics",
+        "apps": [
+            {"id": "antigrav", "name": "Antigravity", "process": "Antigravity", "bytes": int(0.45 * GB),
+             "local_bytes": int(0.43 * GB), "processes": 2, "closable": False, "reason": "runs_flyx"},
+            {"id": "discord", "name": "Discord", "process": "Discord", "bytes": int(0.26 * GB),
+             "local_bytes": int(0.26 * GB), "processes": 1, "closable": True, "reason": None, "tray": True},
+            {"id": "slack", "name": "Slack", "process": "Slack", "bytes": int(0.24 * GB),
+             "local_bytes": int(0.20 * GB), "processes": 2, "closable": True, "reason": None},
+        ],
+    }
+    tm = telemetry(None, remembered=want)
+    tm["load"]["state"] = "failed"
+    tm["load"]["target"] = want["model"]
+    tm["load"]["error"] = (
+        "Not enough VRAM: 3.88 / 17.09 GB used by other apps. "
+        "Loading needs at least 13.24 GB (10.72 GB weights + 0.74 GB session + 1.78 GB runtime/reserve). "
+        "Close other apps to free at least 0.20 GB VRAM, disable speculative decoding, or use a smaller quantization.")
+    page, server = open_page(tm, gpu_apps=snap)
+    panel = page.locator("#ld-vram-apps")
+    expect(panel).to_be_visible()
+    expect(panel).to_contain_text("Apps using VRAM")
+    expect(panel).to_contain_text("Antigravity")
+    expect(panel).to_contain_text("Runs FLYX")
+    expect(panel).to_contain_text("Protected")
+    expect(panel).to_contain_text("AMD Radeon(TM) Graphics")
+    expect(panel.locator('.vapps-row[data-app="Antigravity"] button')).to_have_count(0)
+    # Normal app closes on first click and highlights Retry loading once enough VRAM is freed.
+    panel.locator('.vapps-row[data-app="Slack"] button').click()
+    expect(panel.locator('.vapps-row[data-app="Slack"]')).to_have_count(0)
+    expect(panel).to_contain_text("+240 MB freed")
+    expect(panel.locator("#ld-vram-apps-retry")).to_have_class(re.compile(r"\bprimary\b"))
+    assert server.closed[-1] == {"id": "slack", "force": False}
+    # Tray-resident app transitions to Force quit and requires confirmation modal.
+    panel.locator('.vapps-row[data-app="Discord"] button').click()
+    expect(panel.locator('.vapps-row[data-app="Discord"]')).to_contain_text("Still running")
+    expect(panel.locator('.vapps-row[data-app="Discord"] button')).to_have_text("Force quit")
+    panel.locator('.vapps-row[data-app="Discord"] button').click()
+    page.locator(".modal").get_by_role("button", name="Force quit").click()
+    expect(panel.locator('.vapps-row[data-app="Discord"]')).to_have_count(0)
+    assert server.closed[-1] == {"id": "discord", "force": True}
+    # Retry loading posts the failed target model.
+    with page.expect_request(lambda r: r.method == "POST" and r.url.endswith("/v1/load")):
+        panel.locator("#ld-vram-apps-retry").click()
+    assert server.posted[-1]["model"] == want["model"]
+    page.close()
+
+    # Remote viewer (can_close=False) sees apps read-only without close buttons.
+    remote_snap = copy.deepcopy(snap)
+    remote_snap["can_close"] = False
+    page, _ = open_page(tm, gpu_apps=remote_snap)
+    expect(page.locator("#ld-vram-apps .vapps-row button")).to_have_count(0)
+    page.close()
+
+    # Short-context GPU banner has a Manage VRAM toggle; sidebar VRAM & RAM rows open their matching modals.
+    ram_snap = {
+        "kind": "ram", "supported": True, "can_close": True, "device": "System RAM",
+        "mem_total": int(34 * GB), "mem_used": int(24 * GB), "mem_free": int(10 * GB),
+        "own_bytes": int(1 * GB), "others_bytes": int(23 * GB), "system_bytes": int(2 * GB),
+        "idle_igpu": None,
+        "apps": [{"id": "browser", "name": "Firefox", "process": "firefox", "bytes": int(3.2 * GB),
+                  "local_bytes": int(3.2 * GB), "processes": 8, "closable": True, "reason": None}],
+    }
+    tm_ctx = telemetry(want)
+    tm_ctx["system"] = {"ram_total": int(34 * GB), "ram_available": int(10 * GB), "cpus": 16}
+    tm_ctx["model"]["context_limit"] = {"by": "gpu", "wanted": 262144, "short": True, "left": 830_000_000,
+                                        "gpu_tokens": 0, "others": 3_600_000_000, "closable": True, "runtime": 500_000_000}
+    page, server = open_page(tm_ctx, gpu_apps={"vram": snap, "ram": ram_snap})
+    expect(page.locator("#ld-vram-apps")).to_have_count(0)
+    page.locator("#ld-vram-toggle").click()
+    expect(page.locator("#ld-vram-apps")).to_be_visible()
+    # Persistent sidebar VRAM & RAM rows open their matching modals; Escape closes cleanly.
+    page.locator("#r-vram-row").click()
+    expect(page.locator("#vram-modal-apps")).to_have_attribute("data-kind", "vram")
+    expect(page.locator("#vram-modal-apps")).to_contain_text("Discord")
+    page.keyboard.press("Escape")
+    expect(page.locator("#vram-modal")).to_have_count(0)
+    page.locator("#r-ram-row").click()
+    expect(page.locator("#vram-modal-apps")).to_have_attribute("data-kind", "ram")
+    expect(page.locator("#vram-modal-apps")).to_contain_text("Apps using RAM")
+    expect(page.locator("#vram-modal-apps")).to_contain_text("Firefox")
+    page.locator('#vram-modal-apps .vapps-row[data-app="firefox"] button').click()
+    assert server.closed[-1] == {"id": "browser", "force": False, "kind": "ram"}
+    page.keyboard.press("Escape")
+    # Global short-context warning banner on Overview offers Manage VRAM directly.
+    page.locator('.side nav .navi[data-tab="overview"]').click()
+    hint = page.locator('#hint[data-hint="short"]')
+    expect(hint).to_be_visible()
+    hint.get_by_role("button", name="Manage VRAM").click()
+    expect(page.locator("#vram-modal-apps")).to_have_attribute("data-kind", "vram")
+    page.close()
+
+    # Host-RAM-limited context banner offers Manage RAM on both Model card and global Hint banner.
+    tm_ram = telemetry(want)
+    tm_ram["system"] = {"ram_total": int(34 * GB), "ram_available": int(10 * GB), "cpus": 16}
+    tm_ram["model"]["context_limit"] = {"by": "host", "wanted": 262144, "short": True, "left": 4_200_000_000,
+                                        "gpu_tokens": 0, "others": None, "closable": False, "runtime": None}
+    page, _ = open_page(tm_ram, gpu_apps={"vram": snap, "ram": ram_snap})
+    expect(page.locator("#ld-vram-toggle")).to_have_text("Manage RAM")
+    page.locator("#ld-vram-toggle").click()
+    expect(page.locator("#ld-vram-apps")).to_have_attribute("data-kind", "ram")
+    expect(page.locator("#ld-vram-apps")).to_contain_text("Firefox")
+    page.locator('.side nav .navi[data-tab="overview"]').click()
+    hint = page.locator('#hint[data-hint="short"]')
+    hint.get_by_role("button", name="Manage RAM").click()
+    expect(page.locator("#vram-modal-apps")).to_have_attribute("data-kind", "ram")
+    page.close()
+
+
 def check(browser):
     want = {"model": "./models/Local [27B] & O'Brien.gguf", "ctx": 8192, "kv": "fp8", "kv_gpu": 0, "kv_ram": 4}
     errors = []
@@ -424,6 +567,7 @@ def check(browser):
     check_drafters(page, server, want)
     page.close()
     check_context_limit(open_page, want)
+    check_vram_apps(open_page, want)
     plain = dict(want, model="models/local.gguf")
     page, server = open_page(telemetry(plain))
     check_hub(page, server, plain)

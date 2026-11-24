@@ -110,6 +110,9 @@ target_include_directories(request_log_test PRIVATE ${CMAKE_SOURCE_DIR} ${CMAKE_
 target_link_libraries(request_log_test PRIVATE flyx_core Threads::Threads)
 add_executable(agent_launch_test apps/flyx-server/agent_launch_test.cpp ${CMAKE_SOURCE_DIR}/apps/flyx-server/agent_launch.cpp)
 target_include_directories(agent_launch_test PRIVATE ${CMAKE_SOURCE_DIR} ${CMAKE_SOURCE_DIR}/third_party)
+add_executable(gpu_apps_test apps/flyx-server/gpu_apps_test.cpp ${CMAKE_SOURCE_DIR}/apps/flyx-server/gpu_apps.cpp)
+target_include_directories(gpu_apps_test PRIVATE ${CMAKE_SOURCE_DIR} ${CMAKE_SOURCE_DIR}/include ${CMAKE_SOURCE_DIR}/third_party)
+target_link_libraries(gpu_apps_test PRIVATE flyx_core)
 
 add_library(flyx-test-host-kv SHARED core/session/backend_adapter.cpp)
 target_include_directories(flyx-test-host-kv PRIVATE ${CMAKE_SOURCE_DIR}/include)
@@ -216,6 +219,7 @@ set_tests_properties(parked_edit PROPERTIES FIXTURES_REQUIRED assets)
 add_test(NAME response_store COMMAND response_store_test)
 add_test(NAME request_log COMMAND request_log_test)
 add_test(NAME agent_launch COMMAND agent_launch_test)
+add_test(NAME gpu_apps COMMAND gpu_apps_test)
 # Which round next: the drafter's widths by acceptance, lookup rounds, the rest after a poor one (no model).
 add_test(NAME round_chooser COMMAND chooser_test)
 # Round costs timed at load at two contexts: what a device takes, not what another program's work made them (no model).

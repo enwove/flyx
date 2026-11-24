@@ -2,6 +2,8 @@
 // flyx-server: OpenAI- (chat completions, Responses) and Anthropic-compatible HTTP API over one engine.
 #pragma once
 
+#include <atomic>
+#include <cstdint>
 #include <functional>
 #include <memory>
 #include <string>
@@ -42,6 +44,7 @@ struct Server {
   EngineOptions base;  // the command line's engine options: what a model named in the dashboard starts from
   double started_at = 0;  // unix seconds
   ojson device_probe;     // the GPU found at start when no model was named (telemetry's device until one loads)
+  std::atomic<uint64_t> probe_mem_used{0};  // refreshed by /v1/device/* so idle VRAM bars update after closing apps
   RequestLog* requests = nullptr;  // the last finished requests, for GET /v1/requests
   SystemLog* logs = nullptr;       // the last lines on standard error, for GET /v1/logs
   std::vector<std::string> models_dirs{};  // --models-dir, then FLYX_MODELS_DIR: model files beside the cache (0079)

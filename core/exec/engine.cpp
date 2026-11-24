@@ -344,9 +344,9 @@ bool Engine::lower_and_time(std::string* err) {
     lower_ms_ += os::now_ms() - t0;
     if (err->find("out of GPU memory") == std::string::npos) return false;
     if (!give_back()) {  // out of GPU memory with nothing left to give back: what would make room (as the budget's)
-      *err += std::string(". Options: close some of the other programs;") +
-              (model_->drafters() > 0 ? " no drafter (smaller weights);" : "") +
-              " a smaller quantization of the model.";
+      *err += std::string(". Close other apps") +
+              (model_->drafters() > 0 ? ", disable speculative decoding" : "") +
+              ", or use a smaller quantization.";
       return false;
     }
   }
@@ -443,10 +443,14 @@ bool Engine::plan_memory(plan::KvTiers* tiers, int session_limit, int* asked_ctx
 void Engine::log_memory_plan(int asked_ctx) const {
   if (flyx_seq_size size{};
       budget_.layout.method != FLYX_KV_READ_ALL && api_->seq_size(bm_, &budget_.layout, &size) == 0) {
-    if (budget_.layout.method == FLYX_KV_AUTO && size.strata_from < opt_.max_ctx)
-      log::info("flyx: K/V read exactly up to %d tokens, then through a %d-bit copy, the positions each "
-                "token attends to most read exactly",
-                size.strata_from, budget_.layout.method_arg ? budget_.layout.method_arg : 3);
+    if (budget_.layout.method == FLYX_KV_AUTO && size.strata_from < opt_.max_ctx) {
+      const int bits = budget_.layout.method_arg ? budget_.layout.method_arg : 2;
+      if (size.strata_from > 0)
+        log::info("flyx: K/V read exactly up to %d tokens, then through a %d-bit copy, the positions each "
+                  "token attends to most read exactly", size.strata_from, bits);
+      else
+        log::info("flyx: K/V read through a %d-bit copy, the positions each token attends to most read exactly", bits);
+    }
     if (budget_.layout.copy_host > 0 && size.copies > 0)
       log::info("flyx: the copy of %d of the %d layers in host memory",
                 std::min(budget_.layout.copy_host, size.copies), size.copies);

@@ -23,21 +23,12 @@ export function contextLimit(model) {
   const l = model && model.context_limit;
   if (!l || !model.context) return null;
   const gb2 = (b) => (b / 1e9).toFixed(2);
-  let head;
-  if (Number.isFinite(l.gpu_tokens)) {
-    const gpuTok = Math.max(0, Math.min(model.context, l.gpu_tokens));
-    const ramTok = model.context - gpuTok;
-    head = ramTok === 0 ? "Context " + fmt(model.context) + " / " + fmt(l.wanted) + " (all KV in VRAM)."
-         : gpuTok === 0 ? "Context " + fmt(model.context) + " / " + fmt(l.wanted) + " (all KV in RAM)."
-         : "Context " + fmt(model.context) + " / " + fmt(l.wanted) + " (KV: " + fmt(gpuTok) + " tokens in VRAM, " + fmt(ramTok) + " in RAM).";
-  } else {
-    head = "Context " + fmt(model.context) + " / " + fmt(l.wanted) + ".";
-  }
+  const head = "Limited context window " + fmt(model.context) + " / " + fmt(l.wanted) + ".";
   const cause = l.by === "host"
-    ? "RAM KV budget is " + gb2(l.left) + " GB. Free RAM or raise \"KV in host RAM\" for a longer context."
+    ? "Not enough free RAM (" + gb2(l.left) + " GB available for KV). Free RAM or raise \"KV in host RAM\" for a longer context."
     : l.closable
-      ? gb2(l.left) + " GB VRAM left after weights (" + gb2(l.others) + " GB used by other apps). Close other apps and reload for a longer context."
-      : gb2(l.left) + " GB VRAM left after weights. Disable speculative decoding or use a smaller quantization for more VRAM.";
+      ? "Not enough VRAM left (" + gb2(l.others) + " GB used by other apps). Close other apps and reload for a longer context."
+      : "Not enough VRAM left. Disable speculative decoding or use a smaller quantization for a longer context.";
   return { parts: [head, cause], text: head + " " + cause, short: !!l.short };
 }
 // A meter's colour: near full, then full.

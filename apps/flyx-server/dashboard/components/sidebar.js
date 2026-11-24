@@ -38,10 +38,12 @@ function figures(tm) {
            ops: (tm.rates && tm.rates.output_per_second) || [] };
 }
 
-function LiveCard({ f, tm }) {
+function LiveCard({ f, tm, onOpenMem }) {
   const { model, state, d, recent, decoding, lastReq, decode, tpr, ttft, used, vram, ram, cpu } = f;
   const fresh = (lastReq.prompt_tokens || 0) - (lastReq.reused_tokens || 0);
   const pct = (v) => fmt(v, v < 10 ? 1 : 0) + "%";
+  const vramAct = !!(vram && onOpenMem), ramAct = !!(ram && onOpenMem);
+  const keyFor = (kind) => (e) => { if (e.key === "Enter" || e.key === " ") { e.preventDefault(); onOpenMem(kind); } };
   return html`
     <div class="live" id="live" aria-live="off">
       <div class="live-head"><span class="caps">${t("Live")}</span></div>
@@ -57,11 +59,23 @@ function LiveCard({ f, tm }) {
           <div><div class="lk">${t("TTFT")}</div><div class="lbig">${secs(ttft)}</div>
             <div class="lsub">${recent.length ? t(fmt(fresh) + " new tokens") : ""}</div></div>
         </div>
-        <div class="lrow" id="r-vram-row"><div class="lk">${t("VRAM")}<span class="v" id="r-vram">
-            ${vram ? html`<${Val} v=${gib(vram.used) + " / " + gib(vram.total)} unit="GiB"/>` : "-"}</span></div>
+        <div class=${"lrow" + (vramAct ? " lrow-act" : "")} id="r-vram-row"
+             role=${vramAct ? "button" : undefined} tabIndex=${vramAct ? 0 : undefined}
+             title=${vramAct ? t("Inspect and close apps using VRAM") : undefined}
+             aria-label=${vramAct ? t("Manage VRAM") : undefined}
+             onClick=${vramAct ? () => onOpenMem("vram") : undefined}
+             onKeyDown=${vramAct ? keyFor("vram") : undefined}>
+          <div class="lk"><span class="lk-lbl">${t("VRAM")}${vramAct ? html`<${Icon} name="chev" cls="lk-chev"/>` : ""}</span>
+            <span class="v" id="r-vram">${vram ? html`<${Val} v=${gib(vram.used) + " / " + gib(vram.total)} unit="GiB"/>` : "-"}</span></div>
           <${MemBar} m=${vram} bare/></div>
-        <div class="lrow" id="r-ram-row"><div class="lk">${t("RAM")}<span class="v" id="r-ram">
-            ${ram ? html`<${Val} v=${gib(ram.used) + " / " + gib(ram.total)} unit="GiB"/>` : "-"}</span></div>
+        <div class=${"lrow" + (ramAct ? " lrow-act" : "")} id="r-ram-row"
+             role=${ramAct ? "button" : undefined} tabIndex=${ramAct ? 0 : undefined}
+             title=${ramAct ? t("Inspect and close apps using RAM") : undefined}
+             aria-label=${ramAct ? t("Manage RAM") : undefined}
+             onClick=${ramAct ? () => onOpenMem("ram") : undefined}
+             onKeyDown=${ramAct ? keyFor("ram") : undefined}>
+          <div class="lk"><span class="lk-lbl">${t("RAM")}${ramAct ? html`<${Icon} name="chev" cls="lk-chev"/>` : ""}</span>
+            <span class="v" id="r-ram">${ram ? html`<${Val} v=${gib(ram.used) + " / " + gib(ram.total)} unit="GiB"/>` : "-"}</span></div>
           <${MemBar} m=${ram} bare/></div>
         <div class="lrow"><div class="lk">${t("Context")}<span class="v">
             ${model.context && used !== null ? ktok(used) + " / " + ktok(model.context) : model.context ? "0 / " + ktok(model.context) : "-"}</span></div>
@@ -81,7 +95,7 @@ const RailMem = ({ m }) => html`<span class="rb mb">
   ${m && m.own > 0 ? html`<i class="own" style=${{ width: m.own / m.total * 100 + "%" }}></i>` : ""}
   ${m && m.others > 0 ? html`<i class="oth" style=${{ width: m.others / m.total * 100 + "%" }}></i>` : ""}</span>`;
 
-function Rail({ f, open }) {
+function Rail({ f, open, onOpenMem }) {
   const { model, d, phase, busy, decode, tpr, ttft, used, vram, ram, cpu } = f;
   const ctx = model.context && used !== null ? used / model.context : null;
   const load = cpu.all === null ? cpu.own : cpu.all;
@@ -91,6 +105,7 @@ function Rail({ f, open }) {
                  model.context ? t("context") + " " + ktok(used || 0) + " / " + ktok(model.context) : ""].filter(Boolean).join("\n") +
                 "\n" + t("Click to open the sidebar.");
   const key = (e) => { if (e.key === "Enter" || e.key === " ") { e.preventDefault(); open(); } };
+  const railMem = (kind, has) => (e) => { if (!has || !onOpenMem) return; e.stopPropagation(); onOpenMem(kind); };
   return html`
     <div class="rail" id="rail" title=${title} role="button" tabindex="0" onClick=${open} onKeyDown=${key}>
       <span class=${"rs " + state} id="rl-state" title=${t(phaseNames[phase] || phase)}></span>
@@ -99,9 +114,13 @@ function Rail({ f, open }) {
       <div class="rm"><span class="rv">${fmt(tpr, 2)}</span><span class="rl">${t("tok/rnd")}</span></div>
       <div class="rm"><span class="rv">${ttft === null ? "-" : ttft < 1 ? Math.round(ttft * 1000) + "ms" : ttft.toFixed(1) + "s"}</span>
         <span class="rl">${t("TTFT")}</span></div>
-      <div class="rm"><span class="rv">${vram ? (vram.used / 1073741824).toFixed(1) : "-"}</span><span class="rl">${t("VRAM")}</span>
+      <div class=${"rm" + (vram && onOpenMem ? " rm-act" : "")} id="rl-vram"
+           title=${vram && onOpenMem ? t("Inspect and close apps using VRAM") : undefined}
+           onClick=${railMem("vram", vram)}><span class="rv">${vram ? (vram.used / 1073741824).toFixed(1) : "-"}</span><span class="rl">${t("VRAM")}</span>
         <${RailMem} m=${vram}/></div>
-      <div class="rm"><span class="rv">${ram ? (ram.used / 1073741824).toFixed(1) : "-"}</span><span class="rl">${t("RAM")}</span>
+      <div class=${"rm" + (ram && onOpenMem ? " rm-act" : "")} id="rl-ram"
+           title=${ram && onOpenMem ? t("Inspect and close apps using RAM") : undefined}
+           onClick=${railMem("ram", ram)}><span class="rv">${ram ? (ram.used / 1073741824).toFixed(1) : "-"}</span><span class="rl">${t("RAM")}</span>
         <${RailMem} m=${ram}/></div>
       <div class="rm"><span class="rv">${ctx === null ? "-" : fmt(100 * ctx) + "%"}</span><span class="rl">${t("context")}</span>
         <span class="rb"><i class=${ctx === null ? "" : level(ctx)} style=${{ width: (ctx || 0) * 100 + "%" }}></i></span></div>
@@ -110,7 +129,7 @@ function Rail({ f, open }) {
     </div>`;
 }
 
-export function Sidebar({ tab, go, collapsed, setCollapsed }) {
+export function Sidebar({ tab, go, collapsed, setCollapsed, onOpenMem }) {
   const tm = live.last || {};
   const f = figures(tm);
   return html`
@@ -121,8 +140,8 @@ export function Sidebar({ tab, go, collapsed, setCollapsed }) {
                   aria-selected=${String(tab === id)} onClick=${() => go(id)}>
             <${Icon} name=${icon}/><span class="t">${t(name)}</span></button>`)}
       </nav>
-      <div class="grow" id="live-dock">${live.last ? html`<${LiveCard} f=${f} tm=${tm}/>` : ""}</div>
-      ${live.last ? html`<${Rail} f=${f} open=${() => setCollapsed(false)}/>` : ""}
+      <div class="grow" id="live-dock">${live.last ? html`<${LiveCard} f=${f} tm=${tm} onOpenMem=${onOpenMem}/>` : ""}</div>
+      ${live.last ? html`<${Rail} f=${f} open=${() => setCollapsed(false)} onOpenMem=${onOpenMem}/>` : ""}
       <div class="foot">
         <button class="navi" id="collapse" data-tip=${t("Expand")} aria-expanded=${String(!collapsed)}
                 onClick=${() => setCollapsed(!collapsed)}><${Icon} name="panel"/><span class="t">${t("Collapse")}</span></button>
