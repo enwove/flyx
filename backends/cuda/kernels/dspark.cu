@@ -123,10 +123,33 @@ __global__ void __launch_bounds__(128) k_dspark_attn_split(const float* __restri
     const int cell = ring > 0 ? (j % ring) : j;
     const size_t at = (size_t(cell) * nkv + kvh) * HD + lane * DPL;
     float kf[DPL], vf[DPL];
+    if constexpr (DPL == 4) {
+      const uint2 kr = *reinterpret_cast<const uint2*>(Kc + at);
+      const uint2 vr = *reinterpret_cast<const uint2*>(Vc + at);
+      const float2 k0 = __half22float2(*reinterpret_cast<const __half2*>(&kr.x));
+      const float2 k1 = __half22float2(*reinterpret_cast<const __half2*>(&kr.y));
+      const float2 v0 = __half22float2(*reinterpret_cast<const __half2*>(&vr.x));
+      const float2 v1 = __half22float2(*reinterpret_cast<const __half2*>(&vr.y));
+      kf[0] = k0.x; kf[1] = k0.y; kf[2] = k1.x; kf[3] = k1.y;
+      vf[0] = v0.x; vf[1] = v0.y; vf[2] = v1.x; vf[3] = v1.y;
+    } else if constexpr (DPL == 8) {
+      const uint4 kr = *reinterpret_cast<const uint4*>(Kc + at);
+      const uint4 vr = *reinterpret_cast<const uint4*>(Vc + at);
+      const uint32_t kwords[4] = {kr.x, kr.y, kr.z, kr.w};
+      const uint32_t vwords[4] = {vr.x, vr.y, vr.z, vr.w};
 #pragma unroll
-    for (int e = 0; e < DPL; ++e) {
-      kf[e] = __half2float(Kc[at + e]);
-      vf[e] = __half2float(Vc[at + e]);
+      for (int q = 0; q < 4; ++q) {
+        const float2 kf2 = __half22float2(*reinterpret_cast<const __half2*>(&kwords[q]));
+        const float2 vf2 = __half22float2(*reinterpret_cast<const __half2*>(&vwords[q]));
+        kf[2 * q] = kf2.x; kf[2 * q + 1] = kf2.y;
+        vf[2 * q] = vf2.x; vf[2 * q + 1] = vf2.y;
+      }
+    } else {
+#pragma unroll
+      for (int e = 0; e < DPL; ++e) {
+        kf[e] = __half2float(Kc[at + e]);
+        vf[e] = __half2float(Vc[at + e]);
+      }
     }
 #pragma unroll
     for (int i = 0; i < RT; ++i) {
@@ -216,7 +239,7 @@ template <int HD>
 void dispatch_dspark_attn(const float* q, const kv16* Kc, const kv16* Vc, int nh, int nkv, int B, int window, int ring,
                           float scale, const DevParams* P, float* out, int ld_out, float* partial, int splits,
                           const Launch& L) {
-  const int eff = std::max(1, splits);
+  const int eff = std::min(std::max(1, splits), kAttnCoresSplits);
   k_dspark_attn_split<HD, 4><<<dim3(nh, eff, ceil_div(B, 4)), 128, 0, L.st>>>(q, Kc, Vc, nh, nkv, B, window, ring,
                                                                                scale, P, partial, eff);
   k_dspark_attn_combine<<<dim3(nh, B), HD, 0, L.st>>>(partial, nh, HD, B, window, eff, P, out, ld_out);

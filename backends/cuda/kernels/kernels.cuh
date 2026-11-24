@@ -1408,11 +1408,24 @@ struct ExpertMat {
   BlockMat blk{};             // packed GGML blocks, rows = n_experts * N
   bool packed() const { return blk.data != nullptr; }
 };
+struct MoeTask {
+  int expert;  // expert index in [0, n_experts)
+  int p0;      // starting index in pairs[]
+  int nb;      // count of pairs in this tile (1..BM)
+};
 struct MoeScratch {
-  int* counts = nullptr;      // [max_experts]
-  int* offsets = nullptr;     // [max_experts + 1]
-  int* pairs = nullptr;       // [chunk_rows * max_top_k]
-  float* down_buf = nullptr;  // [chunk_rows * max_top_k * H]
+  int* counts = nullptr;       // [max_experts]
+  int* offsets = nullptr;      // [max_experts + 1]
+  int* pairs = nullptr;        // [chunk_rows * max_top_k]
+  MoeTask* tasks = nullptr;    // [chunk_rows * max_top_k] (compacted per-expert BM-row tiles)
+  int* n_tasks = nullptr;      // [1]
+  float* down_buf = nullptr;   // [chunk_rows * max_top_k * H]
+  // Pre-staged activations (q8_* and bf16_a alias one buffer sized for stage_elems).
+  int8_t* q8_a = nullptr;      // [stage_elems]
+  float* q8_d = nullptr;       // [stage_elems / 32]
+  float* q8_s = nullptr;       // [stage_elems / 16]
+  bf16* bf16_a = nullptr;      // [stage_elems]
+  size_t stage_elems = 0;
   int chunk_rows = 0;
   int max_experts = 0;
   int max_top_k = 0;

@@ -141,18 +141,32 @@ void alloc_rows(const flyx_bmodel* m, int R, bool prefill, RowBufs* b, Alloc&& a
   if (n.moe_experts > 0) {
     b->moe_idx = static_cast<int*>(alloc(size_t(R) * n.moe_topk * sizeof(int)));
     b->moe_w = f(size_t(R) * n.moe_topk);
-    b->moe_gu = f(size_t(R) * n.moe_topk * 2 * n.moe_inter);
-    b->moe_act = f(size_t(R) * n.moe_topk * n.moe_inter);
-    if (prefill && R > 16) {
-      const int chunk = std::min(R, 256);
-      b->moe_sc.counts = static_cast<int*>(alloc(size_t(n.moe_experts) * sizeof(int)));
-      b->moe_sc.offsets = static_cast<int*>(alloc(size_t(n.moe_experts + 1) * sizeof(int)));
-      b->moe_sc.pairs = static_cast<int*>(alloc(size_t(chunk) * n.moe_topk * sizeof(int)));
-      b->moe_sc.down_buf = f(size_t(chunk) * n.moe_topk * H);
-      b->moe_sc.chunk_rows = chunk;
-      b->moe_sc.max_experts = n.moe_experts;
-      b->moe_sc.max_top_k = n.moe_topk;
-    }
+    // moe_gu is dead during moe_down (and unused when fused), so down_buf safely aliases it.
+    const size_t gu_or_down = std::max(size_t(2) * size_t(n.moe_inter), size_t(H));
+    b->moe_gu = f(size_t(R) * size_t(n.moe_topk) * gu_or_down);
+    b->moe_act = f(size_t(R) * size_t(n.moe_topk) * size_t(n.moe_inter));
+    const int chunk = std::min(R, 256);
+    b->moe_sc.counts = static_cast<int*>(alloc(size_t(n.moe_experts) * sizeof(int)));
+    b->moe_sc.offsets = static_cast<int*>(alloc(size_t(n.moe_experts + 1) * sizeof(int)));
+    b->moe_sc.pairs = static_cast<int*>(alloc(size_t(chunk) * size_t(n.moe_topk) * sizeof(int)));
+    b->moe_sc.tasks = static_cast<MoeTask*>(alloc(size_t(chunk) * size_t(n.moe_topk) * sizeof(MoeTask)));
+    b->moe_sc.n_tasks = static_cast<int*>(alloc(sizeof(int)));
+    b->moe_sc.down_buf = b->moe_gu;
+    const size_t stage_elems =
+        std::max(size_t(chunk) * size_t(H), size_t(chunk) * size_t(n.moe_topk) * size_t(n.moe_inter));
+    const size_t q8_a_bytes = (stage_elems + 255) / 256 * 256;
+    const size_t q8_d_bytes = (((stage_elems + 31) / 32) * sizeof(float) + 255) / 256 * 256;
+    const size_t q8_s_bytes = (((stage_elems + 15) / 16) * sizeof(float) + 255) / 256 * 256;
+    const size_t stage_bytes = std::max(stage_elems * sizeof(bf16), q8_a_bytes + q8_d_bytes + q8_s_bytes);
+    auto* stage_base = static_cast<uint8_t*>(alloc(stage_bytes));
+    b->moe_sc.q8_a = reinterpret_cast<int8_t*>(stage_base);
+    b->moe_sc.q8_d = reinterpret_cast<float*>(stage_base + q8_a_bytes);
+    b->moe_sc.q8_s = reinterpret_cast<float*>(stage_base + q8_a_bytes + q8_d_bytes);
+    b->moe_sc.bf16_a = reinterpret_cast<bf16*>(stage_base);
+    b->moe_sc.stage_elems = stage_elems;
+    b->moe_sc.chunk_rows = chunk;
+    b->moe_sc.max_experts = n.moe_experts;
+    b->moe_sc.max_top_k = n.moe_topk;
   }
 
   if (prefill) {

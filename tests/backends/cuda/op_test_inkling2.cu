@@ -288,7 +288,9 @@ void test_inkling2_rel_attn() {
   };
   const Case cases[] = {
       {"swa ring f16 hd128 R=9", 8, 2, 128, 16, 16, 16, 64, 90, 9, false},
+      {"swa ring f16 hd128 R=37", 12, 4, 128, 16, 32, 32, 96, 110, 37, false},
       {"global f16 hd128 R=37", 8, 2, 128, 16, 128, 0, 0, 50, 37, false},
+      {"global fp8 hd128 R=37", 12, 4, 128, 16, 128, 0, 0, 50, 37, true},
       {"swa fp8 hd64 R=5", 8, 4, 64, 8, 16, 16, 64, 70, 5, true},
       {"global f16 hd32 R=8", 4, 2, 32, 8, 16, 0, 0, 40, 8, false},
       {"global fp8 hd32 R=1", 4, 2, 32, 8, 32, 0, 0, 40, 1, true},
@@ -436,10 +438,35 @@ void test_inkling2_rel_attn() {
     rel_attention(d_qout, d_rout, kv, d_rb, d_sink, c.nh, d_gate, q_dim, c.nh, c.nkv, c.hd, c.d_rel, c.rel_extent,
                   c.window, c.rows, P, d_out, q_dim, d_part, splits, TL);
     Vec got_o = down(d_out, size_t(c.rows) * q_dim);
-    expect(std::string("rel_attn ") + c.name, got_o, want_o, c.fp8 ? 5e-4 : 3e-5);
+    const bool is_flash = c.rows > FLYX_MAX_ROWS;
+    expect(std::string("rel_attn ") + c.name, got_o, want_o, is_flash ? (c.fp8 ? 3e-3 : 2e-3) : (c.fp8 ? 5e-4 : 3e-5));
 
-    // Row-count independence: check BOTH row 0 (inside a full RT=4 tile) and last row (run alone vs multi).
-    if (c.rows > 1) {
+    // When rows > FLYX_MAX_ROWS, also verify exact float32 kAttnSplit path (GQA + per-head) and R=1 bit-identity.
+    if (is_flash) {
+      KernelOptions kopt{};
+      kopt.attention = kAttnSplit;
+      Launch Ls = TL;
+      Ls.opt = &kopt;
+      float* d_os = dev<float>(size_t(c.rows) * q_dim);
+      rel_attention(d_qout, d_rout, kv, d_rb, d_sink, c.nh, d_gate, q_dim, c.nh, c.nkv, c.hd, c.d_rel, c.rel_extent,
+                    c.window, c.rows, P, d_os, q_dim, d_part, splits, Ls);
+      Vec got_os = down(d_os, size_t(c.rows) * q_dim);
+      expect(std::string("rel_attn split ") + c.name, got_os, want_o, c.fp8 ? 5e-4 : 3e-5);
+      for (int rr : {0, c.rows - 1}) {
+        DevParams* P1 = params(c.ctx + rr, 0);
+        float* d_o1 = dev<float>(size_t(q_dim));
+        rel_attention(d_qout + size_t(rr) * q_dim, d_rout + size_t(rr) * c.nh * c.d_rel, kv, d_rb,
+                      d_sink + size_t(rr) * c.nh, c.nh, d_gate + size_t(rr) * q_dim, q_dim, c.nh, c.nkv, c.hd, c.d_rel,
+                      c.rel_extent, c.window, 1, P1, d_o1, q_dim, d_part, splits, Ls);
+        Vec got_1 = down(d_o1, size_t(q_dim));
+        Vec got_rr(got_os.begin() + ptrdiff_t(rr) * q_dim, got_os.begin() + ptrdiff_t(rr + 1) * q_dim);
+        expect_bits(std::string("rel_attn split R=1 vs multi r=") + std::to_string(rr) + " " + c.name, got_1, got_rr);
+        cudaFree(P1);
+        cudaFree(d_o1);
+      }
+      cudaFree(d_os);
+    } else if (c.rows > 1) {
+      // Round-sized rows: verify Gate 4 row-count bit-identity (GQA R=1 vs multi) and per-head fallback parity.
       for (int rr : {0, c.rows - 1}) {
         DevParams* P1 = params(c.ctx + rr, 0);
         float* d_o1 = dev<float>(size_t(q_dim));
@@ -466,8 +493,9 @@ void test_inkling2_rel_attn() {
                       c.window, c.rows, P, d_wout, q_dim, d_part, splits, TL, 0, rw);
       }
       Vec got_w = down(d_wout, size_t(c.rows) * q_dim);
-      expect(std::string("rel_attn windowed(3) vs ref ") + c.name, got_w, want_o, c.fp8 ? 5e-4 : 3e-5);
-      expect(std::string("rel_attn windowed(3) vs single ") + c.name, got_w, got_o, 2e-5);
+      expect(std::string("rel_attn windowed(3) vs ref ") + c.name, got_w, want_o,
+             is_flash ? (c.fp8 ? 3e-3 : 2e-3) : (c.fp8 ? 5e-4 : 3e-5));
+      expect(std::string("rel_attn windowed(3) vs single ") + c.name, got_w, got_o, is_flash ? 5e-4 : 2e-5);
       cudaFree(d_wstate);
       cudaFree(d_wout);
     }
@@ -851,7 +879,19 @@ void test_inkling2_moe() {
   msc.counts = dev<int>(E);
   msc.offsets = dev<int>(E + 1);
   msc.pairs = dev<int>(size_t(R) * top_k);
+  msc.tasks = dev<MoeTask>(size_t(R) * top_k);
+  msc.n_tasks = dev<int>(1);
   msc.down_buf = dev<float>(size_t(R) * top_k * H);
+  msc.stage_elems = std::max(size_t(R) * H, size_t(R) * top_k * I);
+  const size_t q8_a_b = (msc.stage_elems + 255) / 256 * 256;
+  const size_t q8_d_b = (((msc.stage_elems + 31) / 32) * sizeof(float) + 255) / 256 * 256;
+  const size_t q8_s_b = (((msc.stage_elems + 15) / 16) * sizeof(float) + 255) / 256 * 256;
+  const size_t stg_b = std::max(msc.stage_elems * sizeof(bf16), q8_a_b + q8_d_b + q8_s_b);
+  uint8_t* msc_stage = dev<uint8_t>(stg_b);
+  msc.q8_a = reinterpret_cast<int8_t*>(msc_stage);
+  msc.q8_d = reinterpret_cast<float*>(msc_stage + q8_a_b);
+  msc.q8_s = reinterpret_cast<float*>(msc_stage + q8_a_b + q8_d_b);
+  msc.bf16_a = reinterpret_cast<bf16*>(msc_stage);
   msc.chunk_rows = R;
   msc.max_experts = E;
   msc.max_top_k = top_k;
@@ -859,6 +899,7 @@ void test_inkling2_moe() {
   auto run_and_check = [&](const std::string& label, const ExpertMat& w_gu, const ExpertMat& w_dn, const Vec& gu_f64,
                            const Vec& dn_f64, bool round_a16, bool round_q8, bool round_a16h, double tol) {
     // Reference in float64 with the exact input rounding contract of this weight format.
+    Vec want_gu(size_t(R) * top_k * 2 * I, 0.0);
     Vec want_act(size_t(R) * top_k * I, 0.0);
     Vec want_out(size_t(R) * H, 0.0);
     for (int r = 0; r < R; ++r) {
@@ -870,6 +911,7 @@ void test_inkling2_moe() {
         const int e = eidx[size_t(r) * top_k + k];
         Vec gu(static_cast<size_t>(2 * I), 0.0);
         ops::linear_expert_f64(xr.data(), H, gu_f64.data(), e, 2 * I, gu.data());
+        std::copy(gu.begin(), gu.end(), want_gu.begin() + ptrdiff_t(r * top_k + k) * 2 * I);
         Vec a(static_cast<size_t>(I));
         for (int i = 0; i < I; ++i) a[i] = ops::situ(gu[i], gu[I + i], beta, lb);
         std::copy(a.begin(), a.end(), want_act.begin() + ptrdiff_t(r * top_k + k) * I);
@@ -893,9 +935,12 @@ void test_inkling2_moe() {
     moe_gate_up(d_x, H, w_gu, d_eidx, R, top_k, I, H, beta, lb, true, d_act_fused, I, &msc, TL);
     moe_gate_up(d_x, H, w_gu, d_eidx, R, top_k, I, H, beta, lb, false, d_gu_raw, 2 * I, &msc, TL);
     situ_rows(d_gu_raw, 2 * I, I, beta, lb, d_act_unfused, I, R * top_k, 0);
+    Vec got_gu = down(d_gu_raw, size_t(R) * top_k * 2 * I);
     Vec got_act_f = down(d_act_fused, size_t(R) * top_k * I);
     Vec got_act_u = down(d_act_unfused, size_t(R) * top_k * I);
-    expect("moe_gate_up " + label, got_act_f, want_act, tol);
+    expect("moe_gate_up raw " + label, got_gu, want_gu, tol);
+    // situ clamps output to [-beta*lb, +beta*lb] even when random_blocks (e.g. Q6_K) raw dots reach ~1000.
+    expect("moe_gate_up " + label, got_act_f, want_act, std::max(tol, 1.5e-4));
     expect_bits("moe_gate_up fused==unfused " + label, got_act_f, got_act_u);
 
     float* d_want_act = up(want_act);
@@ -904,7 +949,7 @@ void test_inkling2_moe() {
     expect("moe_down " + label, got_y_grp_clean, want_out, tol);
     cudaFree(d_want_act);
 
-    // Gate 4: direct single-row decode (R=1, sc=nullptr) vs grouped prefill (R=37, sc=&msc) MUST BE BIT-IDENTICAL!
+    // Gate 4: R=1 (sc=nullptr), R=1 (sc=&msc), R=8 grouped (sc=&msc), and R=37 grouped (sc=&msc) MUST BE BIT-IDENTICAL!
     moe_down(d_act_fused, I, w_dn, d_eidx, d_ew, R, top_k, H, I, d_y_grouped, H, false, &msc, TL);
     Vec got_y_grp = down(d_y_grouped, size_t(R) * H);
     const int rr = 19;
@@ -917,6 +962,25 @@ void test_inkling2_moe() {
     Vec got_y1 = down(d_y_1, size_t(H));
     Vec got_ygrp_rr(got_y_grp.begin() + ptrdiff_t(rr) * H, got_y_grp.begin() + ptrdiff_t(rr + 1) * H);
     expect_bits("moe R=1 direct == R=37 grouped " + label, got_y1, got_ygrp_rr);
+
+    moe_gate_up(d_x + size_t(rr) * H, H, w_gu, d_eidx + size_t(rr) * top_k, 1, top_k, I, H, beta, lb, true, d_act_1, I,
+                &msc, TL);
+    moe_down(d_act_1, I, w_dn, d_eidx + size_t(rr) * top_k, d_ew + size_t(rr) * top_k, 1, top_k, H, I, d_y_1, H, false,
+             &msc, TL);
+    expect_bits("moe R=1 staged == R=37 grouped " + label, down(d_y_1, size_t(H)), got_ygrp_rr);
+
+    const int r8_0 = 16;  // covers rr = 19 at offset 3
+    float* d_act_8 = dev<float>(size_t(8) * top_k * I);
+    float* d_y_8 = dev<float>(size_t(8) * H);
+    moe_gate_up(d_x + size_t(r8_0) * H, H, w_gu, d_eidx + size_t(r8_0) * top_k, 8, top_k, I, H, beta, lb, true, d_act_8,
+                I, &msc, TL);
+    moe_down(d_act_8, I, w_dn, d_eidx + size_t(r8_0) * top_k, d_ew + size_t(r8_0) * top_k, 8, top_k, H, I, d_y_8, H,
+             false, &msc, TL);
+    Vec got_y8 = down(d_y_8, size_t(8) * H);
+    Vec got_y8_rr(got_y8.begin() + ptrdiff_t(rr - r8_0) * H, got_y8.begin() + ptrdiff_t(rr - r8_0 + 1) * H);
+    expect_bits("moe R=8 grouped == R=37 grouped " + label, got_y8_rr, got_ygrp_rr);
+    cudaFree(d_act_8);
+    cudaFree(d_y_8);
 
     // Also verify accumulate=true on moe_down.
     Vec bias_y = randv(size_t(H), 0.5);
@@ -1029,8 +1093,10 @@ void test_inkling2_moe() {
     cudaFree(const_cast<float*>(w_dn.rs));
   }
 
-  // (c) Packed GGML block experts: MXFP4, Q2_0, Q4_K, Q8_0 (both Q8 and exact a16h).
-  const int ggml_types[] = {FLYX_DT_GGML_MXFP4, FLYX_DT_GGML_Q2_0, FLYX_DT_GGML_Q4_K, FLYX_DT_GGML_Q8_0};
+  // (c) Packed GGML block experts: MXFP4, Q2_0, Q4_K, Q6_K, Q8_0, IQ2_XXS, IQ2_S, IQ3_XXS, IQ4_NL (Q8 and a16h).
+  const int ggml_types[] = {FLYX_DT_GGML_MXFP4,  FLYX_DT_GGML_Q2_0,   FLYX_DT_GGML_Q4_K,
+                            FLYX_DT_GGML_Q6_K,   FLYX_DT_GGML_Q8_0,   FLYX_DT_GGML_IQ2_XXS,
+                            FLYX_DT_GGML_IQ2_S,  FLYX_DT_GGML_IQ3_XXS, FLYX_DT_GGML_IQ4_NL};
   for (int dt : ggml_types) {
     const BlockType& bt = block_type(dt);
     const int k_blk = flyx_block_values(dt);
@@ -1057,13 +1123,107 @@ void test_inkling2_moe() {
     }
   }
 
+  // (d) Multi-span non-power-of-2 K (Inkling-2 dimensions: H = 2304 -> 3 spans tail 8; I = 1152 -> 2 spans tail 4).
+  {
+    const int RM = 19, EM = 4, KM = 2, HM = 2304, IM = 1152;
+    seed("inkling2_moe_multispan", RM, EM, KM, HM, IM);
+    Vec xm = randv(size_t(RM) * HM, 0.5);
+    Vec rlm = randv(size_t(RM) * EM, 1.0);
+    std::vector<int> eim(size_t(RM) * KM);
+    Vec ewm(size_t(RM) * KM);
+    for (int r = 0; r < RM; ++r)
+      ops::moe_route(&rlm[size_t(r) * EM], nullptr, EM, KM, true, true, 1e-20, 1.0, &eim[size_t(r) * KM],
+                     &ewm[size_t(r) * KM]);
+    float* dxm = up(xm);
+    int* deim = dev<int>(eim.size());
+    CK(cudaMemcpy(deim, eim.data(), eim.size() * 4, cudaMemcpyHostToDevice));
+    float* dewm = up(ewm);
+    MoeScratch sm{};
+    sm.counts = dev<int>(EM);
+    sm.offsets = dev<int>(EM + 1);
+    sm.pairs = dev<int>(size_t(RM) * KM);
+    sm.tasks = dev<MoeTask>(size_t(RM) * KM);
+    sm.n_tasks = dev<int>(1);
+    sm.down_buf = dev<float>(size_t(RM) * KM * HM);
+    sm.stage_elems = std::max(size_t(RM) * HM, size_t(RM) * KM * IM);
+    const size_t qa = (sm.stage_elems + 255) / 256 * 256;
+    const size_t qd = (((sm.stage_elems + 31) / 32) * sizeof(float) + 255) / 256 * 256;
+    const size_t qs = (((sm.stage_elems + 15) / 16) * sizeof(float) + 255) / 256 * 256;
+    uint8_t* sbuf = dev<uint8_t>(std::max(sm.stage_elems * sizeof(bf16), qa + qd + qs));
+    sm.q8_a = reinterpret_cast<int8_t*>(sbuf);
+    sm.q8_d = reinterpret_cast<float*>(sbuf + qa);
+    sm.q8_s = reinterpret_cast<float*>(sbuf + qa + qd);
+    sm.bf16_a = reinterpret_cast<bf16*>(sbuf);
+    sm.chunk_rows = RM;
+    sm.max_experts = EM;
+    sm.max_top_k = KM;
+    float* d_act_m = dev<float>(size_t(RM) * KM * IM);
+    float* d_y_m = dev<float>(size_t(RM) * HM);
+    float* d_act_1 = dev<float>(size_t(KM) * IM);
+    float* d_y_1 = dev<float>(size_t(HM));
+    float* d_act_8 = dev<float>(size_t(8) * KM * IM);
+    float* d_y_8 = dev<float>(size_t(8) * HM);
+    for (int gu_dt : {FLYX_DT_GGML_IQ3_XXS, FLYX_DT_GGML_Q4_K}) {
+      const BlockType& gbt = block_type(gu_dt);
+      const BlockType& dbt = block_type(FLYX_DT_GGML_IQ4_NL);
+      std::vector<uint8_t> graw = random_blocks(gbt, size_t(EM) * 2 * IM * (HM / flyx_block_values(gu_dt)));
+      std::vector<uint8_t> draw = random_blocks(dbt, size_t(EM) * HM * (IM / flyx_block_values(FLYX_DT_GGML_IQ4_NL)));
+      ExpertMat wgu{}, wdn{};
+      wgu.n_experts = EM;
+      wgu.N = 2 * IM;
+      wgu.blk = up_blocks(gu_dt, graw, EM * 2 * IM);
+      wgu.blk.q8 = true;
+      wdn.n_experts = EM;
+      wdn.N = HM;
+      wdn.blk = up_blocks(FLYX_DT_GGML_IQ4_NL, draw, EM * HM);
+      wdn.blk.q8 = true;
+      moe_gate_up(dxm, HM, wgu, deim, RM, KM, IM, HM, beta, lb, true, d_act_m, IM, &sm, TL);
+      moe_down(d_act_m, IM, wdn, deim, dewm, RM, KM, HM, IM, d_y_m, HM, false, &sm, TL);
+      Vec ym = down(d_y_m, size_t(RM) * HM);
+      const int rr = 11;
+      Vec yref(ym.begin() + ptrdiff_t(rr) * HM, ym.begin() + ptrdiff_t(rr + 1) * HM);
+      moe_gate_up(dxm + size_t(rr) * HM, HM, wgu, deim + size_t(rr) * KM, 1, KM, IM, HM, beta, lb, true, d_act_1, IM,
+                  &sm, TL);
+      moe_down(d_act_1, IM, wdn, deim + size_t(rr) * KM, dewm + size_t(rr) * KM, 1, KM, HM, IM, d_y_1, HM, false, &sm,
+               TL);
+      expect_bits(std::string("moe multispan 2304x1152 R=1==R=19 ") + gbt.name, down(d_y_1, size_t(HM)), yref);
+      moe_gate_up(dxm + size_t(8) * HM, HM, wgu, deim + size_t(8) * KM, 8, KM, IM, HM, beta, lb, true, d_act_8, IM, &sm,
+                  TL);
+      moe_down(d_act_8, IM, wdn, deim + size_t(8) * KM, dewm + size_t(8) * KM, 8, KM, HM, IM, d_y_8, HM, false, &sm, TL);
+      Vec y8 = down(d_y_8, size_t(8) * HM);
+      expect_bits(std::string("moe multispan 2304x1152 R=8==R=19 ") + gbt.name,
+                  Vec(y8.begin() + ptrdiff_t(rr - 8) * HM, y8.begin() + ptrdiff_t(rr - 7) * HM), yref);
+      cudaFree(const_cast<uint8_t*>(wgu.blk.data));
+      cudaFree(const_cast<uint8_t*>(wdn.blk.data));
+    }
+    cudaFree(dxm);
+    cudaFree(deim);
+    cudaFree(dewm);
+    cudaFree(sm.counts);
+    cudaFree(sm.offsets);
+    cudaFree(sm.pairs);
+    cudaFree(sm.tasks);
+    cudaFree(sm.n_tasks);
+    cudaFree(sm.down_buf);
+    cudaFree(sbuf);
+    cudaFree(d_act_m);
+    cudaFree(d_y_m);
+    cudaFree(d_act_1);
+    cudaFree(d_y_1);
+    cudaFree(d_act_8);
+    cudaFree(d_y_8);
+  }
+
   cudaFree(d_x);
   cudaFree(d_eidx);
   cudaFree(d_ew);
   cudaFree(msc.counts);
   cudaFree(msc.offsets);
   cudaFree(msc.pairs);
+  cudaFree(msc.tasks);
+  cudaFree(msc.n_tasks);
   cudaFree(msc.down_buf);
+  cudaFree(msc_stage);
 }
 
 void test_dspark() {

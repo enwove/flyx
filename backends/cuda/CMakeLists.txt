@@ -34,7 +34,10 @@ set(FLYX_CUDA_COMPAT_BLOCK_SOURCES
     kernels/gemm_blocks_iq_low.cu kernels/gemm_blocks_iq_high.cu
     kernels/gemm_blocks_round_legacy.cu kernels/gemm_blocks_round_k.cu
     kernels/gemm_blocks_round_iq_low.cu kernels/gemm_blocks_round_iq_high.cu kernels/gemm_blocks_round_glu.cu)
-set(FLYX_CUDA_COMPAT_SOURCES ${FLYX_CUDA_COMPAT_BLOCK_SOURCES} kernels/attention_strata.cu kernels/gdn.cu)
+set(FLYX_CUDA_COMPAT_SOURCES ${FLYX_CUDA_COMPAT_BLOCK_SOURCES}
+    kernels/moe_blocks_legacy.cu kernels/moe_blocks_k.cu
+    kernels/moe_blocks_iq_low.cu kernels/moe_blocks_iq_high.cu
+    kernels/attention_strata.cu kernels/gdn.cu)
 set(FLYX_CUDA_TABLE_SOURCES
     kernels/gemm.cu kernels/gemm_decode.cu kernels/attention_flash.cu
     kernels/gemm_blocks.cu kernels/gemm_blocks_round.cu ${FLYX_CUDA_COMPAT_BLOCK_SOURCES})

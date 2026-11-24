@@ -445,9 +445,471 @@ __global__ void __launch_bounds__(128) k_rel_bias_table(const float* __restrict_
   out[(size_t(r) * nh + h) * rel_extent + dist] = acc;
 }
 
-// ---- rel_attention (row-count independent split-K + virtual 0 sink combine) ----------------
+// ---- rel_attention: FlashAttention prefill (tensor cores) + GQA/split float32 decode ------
 __device__ __forceinline__ int rel_splits_used(int span, int max_splits) {
   return min(max_splits, max(1, (span + 63) / 64));
+}
+
+__device__ __forceinline__ void rel_ldmatrix_x2_trans(uint32_t* r, const void* smem) {
+  const uint32_t s = static_cast<uint32_t>(__cvta_generic_to_shared(smem));
+  asm volatile("ldmatrix.sync.aligned.m8n8.x2.trans.shared.b16 {%0,%1}, [%2];\n" : "=r"(r[0]), "=r"(r[1]) : "r"(s));
+}
+
+template <int HD>
+__host__ __device__ constexpr int rel_flash_kt() {
+  return HD >= 128 ? 32 : 64;
+}
+
+template <int HD>
+constexpr size_t rel_flash_smem(int d_rel) {
+  const int rs_ld = d_rel > 0 ? ((d_rel + 3) / 4) * 4 : 0;
+  return size_t(64 + 2 * rel_flash_kt<HD>()) * (HD + 8) * sizeof(kv16) + size_t(64) * rs_ld * sizeof(float);
+}
+
+template <int NT>
+__device__ __forceinline__ void rel_flash_state(bool store, float* state, int nh, int h, int wrow0, int rows, int g,
+                                                int t, float (&o)[NT][4], float (&m)[2], float (&l)[2]) {
+#pragma unroll
+  for (int half = 0; half < 2; ++half) {
+    const int row = wrow0 + g + 8 * half;
+    if (row >= rows) continue;
+    float* p = state + (size_t(row) * nh + h) * kFlashStateFloats(NT * 8);
+    if (store) {
+      if (t == 0) p[0] = m[half];
+      p[1 + t] = l[half];
+    } else {
+      m[half] = p[0];
+      l[half] = p[1 + t];
+    }
+#pragma unroll
+    for (int n = 0; n < NT; ++n)
+#pragma unroll
+      for (int e = 0; e < 2; ++e) {
+        float& x = p[8 + n * 8 + 2 * t + e];
+        if (store) x = o[n][2 * half + e];
+        else o[n][2 * half + e] = x;
+      }
+  }
+}
+
+// Prefill relative-position-bias attention on tensor cores (mma.m16n8k16 binary16 in, fp32 accumulate).
+// Supports linear and SWA ring caches (kv.slot_of), binary16 and FP8 caches, windowed prefill (RelWindow),
+// exact fp32 relative-bias dot products, virtual 0 sink (m=0, l=(t==0?1:0)), and output sigmoid gate.
+template <int HD, bool FP8>
+__global__ void __launch_bounds__(128)
+    k_rel_flash_prefill(const float* __restrict__ q, const float* __restrict__ r_q, KvRef kv,
+                        const float* __restrict__ rel_bias, const float* __restrict__ sink, int ld_sink,
+                        const float* __restrict__ gate, int ld_gate, int nh, int nkv, int d_rel, int rel_extent,
+                        int window, int rows, float scale, const DevParams* P, int pos_add, int k_lo, int k_hi,
+                        int first_win, int last_win, float* __restrict__ state, Out out, int ld_out) {
+  pdl_trigger();
+  constexpr int KT = rel_flash_kt<HD>(), LD = HD + 8, NT = HD / 8, ST = KT / 8;
+  constexpr float kLog2e = 1.4426950408889634f;
+  const int rs_ld = d_rel > 0 ? ((d_rel + 3) / 4) * 4 : 0;
+
+  extern __shared__ __align__(16) unsigned char sm_raw[];
+  kv16(*Qs)[LD] = reinterpret_cast<kv16(*)[LD]>(sm_raw);
+  kv16(*Ks)[LD] = reinterpret_cast<kv16(*)[LD]>(sm_raw + size_t(64) * LD * sizeof(kv16));
+  kv16(*Vs)[LD] = reinterpret_cast<kv16(*)[LD]>(sm_raw + size_t(64 + KT) * LD * sizeof(kv16));
+  float* Rs = reinterpret_cast<float*>(sm_raw + size_t(64 + 2 * KT) * LD * sizeof(kv16));
+
+  const int h = blockIdx.x, r0 = blockIdx.y * 64, tid = threadIdx.x, warp = tid >> 5, lane = tid & 31;
+  const int g = lane >> 2, t = lane & 3;
+  const int kvh = h / (nh / nkv);
+  const int base = P->position + pos_add;
+
+  for (int i = tid; i < 64 * HD / 2; i += 128) {
+    const int r = i / (HD / 2), c = 2 * (i % (HD / 2));
+    float2 v = make_float2(0.f, 0.f);
+    if (r0 + r < rows) v = *reinterpret_cast<const float2*>(q + (size_t(r0 + r) * nh + h) * HD + c);
+    *reinterpret_cast<__half2*>(&Qs[r][c]) = __floats2half2_rn(v.x, v.y);
+  }
+  const bool use_rel = d_rel > 0 && rel_extent > 0 && rel_bias != nullptr;
+  if (use_rel) {
+    for (int i = tid; i < 64 * d_rel; i += 128) {
+      const int r = i / d_rel, dm = i - r * d_rel;
+      Rs[r * rs_ld + dm] = (r0 + r < rows) ? r_q[(size_t(r0 + r) * nh + h) * d_rel + dm] : 0.f;
+    }
+  }
+
+  const int wrow0 = r0 + warp * 16;
+  const int last_row = min(rows, r0 + 64) - 1;
+  const int w_first = window > 0 ? max(0, base + r0 - window + 1) : 0;
+  const int kstart = max(k_lo, w_first);
+  const int kwin = min(base + last_row + 1, k_hi);
+
+  float o[NT][4];
+#pragma unroll
+  for (int n = 0; n < NT; ++n) o[n][0] = o[n][1] = o[n][2] = o[n][3] = 0.f;
+  // Virtual 0 sink: logit 0 (0 in log2 units) with value 0 -> exp2(0 - 0) = 1 summed across the 4 lanes (t==0 holds 1).
+  float m[2] = {0.f, 0.f};
+  float l[2] = {t == 0 ? 1.f : 0.f, t == 0 ? 1.f : 0.f};
+  if (state && !first_win) rel_flash_state<NT>(false, state, nh, h, wrow0, rows, g, t, o, m, l);
+
+  float sv_half[2];
+#pragma unroll
+  for (int half = 0; half < 2; ++half) {
+    const int row = wrow0 + g + 8 * half;
+    sv_half[half] = row < rows ? sink[size_t(row) * ld_sink + h] : 0.f;
+  }
+  const bool rb_aligned16 = use_rel && d_rel == 16 && (reinterpret_cast<uintptr_t>(rel_bias) & 15u) == 0;
+
+  for (int k0 = kstart; k0 < kwin; k0 += KT) {
+    __syncthreads();
+    if constexpr (FP8) {
+      for (int i = tid; i < KT * HD / 8; i += 128) {
+        const int r = i / (HD / 8), c = 8 * (i % (HD / 8)), pos = k0 + r;
+        uint4 kb = make_uint4(0, 0, 0, 0), vb = kb;
+        if (pos < kwin) {
+          const int cell = kv.slot_of(pos);
+          const size_t at = (size_t(cell) * nkv + kvh) * HD + c;
+          const uint2 kq = *reinterpret_cast<const uint2*>(static_cast<const uint8_t*>(kv.k) + at);
+          const uint2 vq = *reinterpret_cast<const uint2*>(static_cast<const uint8_t*>(kv.v) + at);
+          const float ksc = kv.kscales(cell)[size_t(cell) * nkv + kvh];
+          const float vsc = kv.vscales(cell)[size_t(cell) * nkv + kvh];
+          float kf[8], vf[8];
+          e4m3x4_to_float(kq.x, kf);
+          e4m3x4_to_float(kq.y, kf + 4);
+          e4m3x4_to_float(vq.x, vf);
+          e4m3x4_to_float(vq.y, vf + 4);
+          kb = make_uint4(pack_f16(kf[0] * ksc, kf[1] * ksc), pack_f16(kf[2] * ksc, kf[3] * ksc),
+                          pack_f16(kf[4] * ksc, kf[5] * ksc), pack_f16(kf[6] * ksc, kf[7] * ksc));
+          vb = make_uint4(pack_f16(vf[0] * vsc, vf[1] * vsc), pack_f16(vf[2] * vsc, vf[3] * vsc),
+                          pack_f16(vf[4] * vsc, vf[5] * vsc), pack_f16(vf[6] * vsc, vf[7] * vsc));
+        }
+        *reinterpret_cast<uint4*>(&Ks[r][c]) = kb;
+        *reinterpret_cast<uint4*>(&Vs[r][c]) = vb;
+      }
+    } else {
+      const kv16* Kc = static_cast<const kv16*>(kv.k);
+      const kv16* Vc = static_cast<const kv16*>(kv.v);
+      for (int i = tid; i < KT * HD / 8; i += 128) {
+        const int r = i / (HD / 8), c = 8 * (i % (HD / 8)), pos = k0 + r;
+        const bool ok = pos < kwin;
+        const int cell = ok ? kv.slot_of(pos) : 0;
+        const size_t at = (size_t(cell) * nkv + kvh) * HD + c;
+        cp_async16(&Ks[r][c], Kc + at, ok);
+        cp_async16(&Vs[r][c], Vc + at, ok);
+      }
+      cp_async_commit();
+      cp_async_wait<0>();
+    }
+    __syncthreads();
+    if (wrow0 >= rows || base + wrow0 + 15 < k0 || (window > 0 && k0 + KT - 1 < base + wrow0 - window + 1)) continue;
+
+    float s[ST][4];
+#pragma unroll
+    for (int j = 0; j < ST; ++j) s[j][0] = s[j][1] = s[j][2] = s[j][3] = 0.f;
+#pragma unroll
+    for (int kk = 0; kk < HD; kk += 16) {
+      uint32_t a[4];
+      ldmatrix_x4(a, &Qs[warp * 16 + (lane & 15)][kk + (lane >> 4) * 8]);
+#pragma unroll
+      for (int j = 0; j < ST; ++j) {
+        uint32_t b[2];
+        ldmatrix_x2(b, &Ks[j * 8 + (lane & 7)][kk + ((lane >> 3) & 1) * 8]);
+        mma_f16(s[j], a, b);
+      }
+    }
+
+#pragma unroll
+    for (int half = 0; half < 2; ++half) {
+      const int row = wrow0 + g + 8 * half, qpos = base + row;
+      const int row_first = window > 0 ? max(0, qpos - window + 1) : 0;
+      const float sv = sv_half[half];
+      float4 rq0, rq1, rq2, rq3;
+      const float* rq_ptr = use_rel ? &Rs[(warp * 16 + g + 8 * half) * rs_ld] : nullptr;
+      if (rb_aligned16 && row < rows) {
+        rq0 = *reinterpret_cast<const float4*>(rq_ptr);
+        rq1 = *reinterpret_cast<const float4*>(rq_ptr + 4);
+        rq2 = *reinterpret_cast<const float4*>(rq_ptr + 8);
+        rq3 = *reinterpret_cast<const float4*>(rq_ptr + 12);
+      }
+      float mx = -INFINITY;
+#pragma unroll
+      for (int j = 0; j < ST; ++j)
+#pragma unroll
+        for (int e = 0; e < 2; ++e) {
+          const int key = k0 + j * 8 + 2 * t + e;
+          float& v = s[j][2 * half + e];
+          if (row < rows && key >= row_first && key <= qpos && key < kwin) {
+            float rb = 0.f;
+            if (use_rel) {
+              const int dist = qpos - key;
+              if (dist >= 0 && dist < rel_extent) {
+                const float* br = rel_bias + size_t(dist) * d_rel;
+                if (rb_aligned16) {
+                  const float4 b0 = __ldg(reinterpret_cast<const float4*>(br));
+                  const float4 b1 = __ldg(reinterpret_cast<const float4*>(br + 4));
+                  const float4 b2 = __ldg(reinterpret_cast<const float4*>(br + 8));
+                  const float4 b3 = __ldg(reinterpret_cast<const float4*>(br + 12));
+                  rb = __fmaf_rn(rq0.x, b0.x, __fmaf_rn(rq0.y, b0.y, __fmaf_rn(rq0.z, b0.z, __fmul_rn(rq0.w, b0.w))));
+                  rb = __fmaf_rn(rq1.x, b1.x, __fmaf_rn(rq1.y, b1.y, __fmaf_rn(rq1.z, b1.z, __fmaf_rn(rq1.w, b1.w, rb))));
+                  rb = __fmaf_rn(rq2.x, b2.x, __fmaf_rn(rq2.y, b2.y, __fmaf_rn(rq2.z, b2.z, __fmaf_rn(rq2.w, b2.w, rb))));
+                  rb = __fmaf_rn(rq3.x, b3.x, __fmaf_rn(rq3.y, b3.y, __fmaf_rn(rq3.z, b3.z, __fmaf_rn(rq3.w, b3.w, rb))));
+                } else {
+                  for (int dm = 0; dm < d_rel; ++dm) rb = __fmaf_rn(rq_ptr[dm], __ldg(br + dm), rb);
+                }
+              }
+            }
+            v = __fsub_rn(__fmaf_rn(v, scale, rb), sv) * kLog2e;
+          } else {
+            v = -INFINITY;
+          }
+          mx = fmaxf(mx, v);
+        }
+      mx = fmaxf(mx, __shfl_xor_sync(0xffffffffu, mx, 1));
+      mx = fmaxf(mx, __shfl_xor_sync(0xffffffffu, mx, 2));
+      const float mnew = fmaxf(m[half], mx);
+      if (mnew > m[half]) {
+        const float alpha = exp2f(m[half] - mnew);
+        m[half] = mnew;
+        l[half] *= alpha;
+#pragma unroll
+        for (int n = 0; n < NT; ++n) {
+          o[n][2 * half] *= alpha;
+          o[n][2 * half + 1] *= alpha;
+        }
+      }
+#pragma unroll
+      for (int j = 0; j < ST; ++j)
+#pragma unroll
+        for (int e = 0; e < 2; ++e) {
+          float& v = s[j][2 * half + e];
+          v = v == -INFINITY ? 0.f : exp2f(v - mnew);
+          l[half] += v;
+        }
+    }
+
+#pragma unroll
+    for (int kk = 0; kk < KT; kk += 16) {
+      const int j = kk / 8;
+      const uint32_t a[4] = {pack_f16(s[j][0], s[j][1]), pack_f16(s[j][2], s[j][3]),
+                             pack_f16(s[j + 1][0], s[j + 1][1]), pack_f16(s[j + 1][2], s[j + 1][3])};
+#pragma unroll
+      for (int n = 0; n < NT; ++n) {
+        uint32_t b[2];
+        rel_ldmatrix_x2_trans(b, &Vs[kk + (lane & 15)][n * 8]);
+        mma_f16(o[n], a, b);
+      }
+    }
+  }
+
+  if (state && !last_win) {
+    rel_flash_state<NT>(true, state, nh, h, wrow0, rows, g, t, o, m, l);
+    return;
+  }
+#pragma unroll
+  for (int half = 0; half < 2; ++half) {
+    float sum = l[half];
+    sum += __shfl_xor_sync(0xffffffffu, sum, 1);
+    sum += __shfl_xor_sync(0xffffffffu, sum, 2);
+    const int row = wrow0 + g + 8 * half;
+    if (row >= rows) continue;
+    const float inv = sum > 0.f ? 1.f / sum : 0.f;
+#pragma unroll
+    for (int n = 0; n < NT; ++n)
+#pragma unroll
+      for (int e = 0; e < 2; ++e) {
+        const int d = n * 8 + 2 * t + e;
+        float v = o[n][2 * half + e] * inv;
+        if (gate) v *= sigm(gate[size_t(row) * ld_gate + h * HD + d]);
+        put(out, size_t(row) * ld_out + h * HD + d, size_t(row) * nh * HD + h * HD + d, v);
+      }
+  }
+}
+
+template <int DPL, bool FP8>
+__device__ __forceinline__ void rel_load_kv(const KvRef& kv, int cell, int kvh, int nkv, int HD, int lane,
+                                            float (&kf)[DPL], float (&vf)[DPL]) {
+  const size_t at = (size_t(cell) * nkv + kvh) * HD + lane * DPL;
+  if constexpr (FP8) {
+    const float ksc = kv.kscales(cell)[size_t(cell) * nkv + kvh];
+    const float vsc = kv.vscales(cell)[size_t(cell) * nkv + kvh];
+    const uint8_t* kp = static_cast<const uint8_t*>(kv.k) + at;
+    const uint8_t* vp = static_cast<const uint8_t*>(kv.v) + at;
+    if constexpr (DPL == 4) {
+      e4m3x4_to_float(*reinterpret_cast<const uint32_t*>(kp), kf);
+      e4m3x4_to_float(*reinterpret_cast<const uint32_t*>(vp), vf);
+#pragma unroll
+      for (int e = 0; e < 4; ++e) {
+        kf[e] *= ksc;
+        vf[e] *= vsc;
+      }
+    } else if constexpr (DPL == 8) {
+      const uint2 kq = *reinterpret_cast<const uint2*>(kp);
+      const uint2 vq = *reinterpret_cast<const uint2*>(vp);
+      e4m3x4_to_float(kq.x, kf);
+      e4m3x4_to_float(kq.y, kf + 4);
+      e4m3x4_to_float(vq.x, vf);
+      e4m3x4_to_float(vq.y, vf + 4);
+#pragma unroll
+      for (int e = 0; e < 8; ++e) {
+        kf[e] *= ksc;
+        vf[e] *= vsc;
+      }
+    } else {
+#pragma unroll
+      for (int e = 0; e < DPL; ++e) {
+        kf[e] = e4m3_to_float(kp[e]) * ksc;
+        vf[e] = e4m3_to_float(vp[e]) * vsc;
+      }
+    }
+  } else {
+    const kv16* kp = static_cast<const kv16*>(kv.k) + at;
+    const kv16* vp = static_cast<const kv16*>(kv.v) + at;
+    if constexpr (DPL == 4) {
+      const uint2 kr = *reinterpret_cast<const uint2*>(kp);
+      const uint2 vr = *reinterpret_cast<const uint2*>(vp);
+      const float2 k0 = __half22float2(*reinterpret_cast<const __half2*>(&kr.x));
+      const float2 k1 = __half22float2(*reinterpret_cast<const __half2*>(&kr.y));
+      const float2 v0 = __half22float2(*reinterpret_cast<const __half2*>(&vr.x));
+      const float2 v1 = __half22float2(*reinterpret_cast<const __half2*>(&vr.y));
+      kf[0] = k0.x; kf[1] = k0.y; kf[2] = k1.x; kf[3] = k1.y;
+      vf[0] = v0.x; vf[1] = v0.y; vf[2] = v1.x; vf[3] = v1.y;
+    } else if constexpr (DPL == 8) {
+      const uint4 kr = *reinterpret_cast<const uint4*>(kp);
+      const uint4 vr = *reinterpret_cast<const uint4*>(vp);
+      const uint32_t kwords[4] = {kr.x, kr.y, kr.z, kr.w};
+      const uint32_t vwords[4] = {vr.x, vr.y, vr.z, vr.w};
+#pragma unroll
+      for (int q = 0; q < 4; ++q) {
+        const float2 kf2 = __half22float2(*reinterpret_cast<const __half2*>(&kwords[q]));
+        const float2 vf2 = __half22float2(*reinterpret_cast<const __half2*>(&vwords[q]));
+        kf[2 * q] = kf2.x; kf[2 * q + 1] = kf2.y;
+        vf[2 * q] = vf2.x; vf[2 * q + 1] = vf2.y;
+      }
+    } else if constexpr (DPL == 2) {
+      const float2 k0 = __half22float2(*reinterpret_cast<const __half2*>(kp));
+      const float2 v0 = __half22float2(*reinterpret_cast<const __half2*>(vp));
+      kf[0] = k0.x; kf[1] = k0.y;
+      vf[0] = v0.x; vf[1] = v0.y;
+    } else {
+#pragma unroll
+      for (int e = 0; e < DPL; ++e) {
+        kf[e] = __half2float(kp[e]);
+        vf[e] = __half2float(vp[e]);
+      }
+    }
+  }
+}
+
+// GQA-grouped exact float32 decode/verify kernel: 1 row x G query heads per block (100% row-count independent).
+// Reads K, V, and rel_bias once per KV head and shares them across all G query heads.
+template <int HD, int G, bool FP8>
+__global__ void __launch_bounds__(128)
+    k_rel_attention_gqa(const float* __restrict__ q, const float* __restrict__ r_q, KvRef kv,
+                        const float* __restrict__ rel_bias, const float* __restrict__ sink, int ld_sink, int nh,
+                        int nkv, int d_rel, int rel_extent, int window, float scale, const DevParams* P,
+                        float* __restrict__ part, int pos_add, int splits, int k_lo, int k_hi) {
+  pdl_trigger();
+  constexpr int DPL = HD / 32;
+  const int r = blockIdx.x, kvh = blockIdx.y, sp = blockIdx.z;
+  const int p = P->position + pos_add + r;
+  const int w_first = window > 0 ? max(0, p - window + 1) : 0;
+  const int first = max(w_first, k_lo);
+  const int total = min(p + 1, k_hi);
+  const int span = max(0, total - first);
+  const int used = span > 0 ? rel_splits_used(span, splits) : 0;
+  if (sp >= used) return;
+
+  const int chunk = (span + used - 1) / used;
+  const int ks = min(total, first + sp * chunk);
+  const int ke = min(total, ks + chunk);
+
+  __shared__ float s_m[4][G], s_l[4][G];
+  __shared__ float s_acc[4][G][HD];
+  const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
+  const int h0 = kvh * G;
+
+  float qv[G][DPL], acc[G][DPL], m[G], l[G], sink_v[G], rv_lane[G];
+#pragma unroll
+  for (int hi = 0; hi < G; ++hi) {
+    const int h = h0 + hi;
+    m[hi] = -INFINITY;
+    l[hi] = 0.f;
+    sink_v[hi] = sink[size_t(r) * ld_sink + h];
+    rv_lane[hi] = lane < d_rel ? r_q[(size_t(r) * nh + h) * d_rel + lane] : 0.f;
+#pragma unroll
+    for (int e = 0; e < DPL; ++e) {
+      acc[hi][e] = 0.f;
+      qv[hi][e] = q[(size_t(r) * nh + h) * HD + lane * DPL + e];
+    }
+  }
+
+  for (int j = ks < ke ? ks + ((warp - ks) & 3) : ke; j < ke; j += 4) {
+    const int cell = kv.slot_of(j);
+    float kf[DPL], vf[DPL];
+    rel_load_kv<DPL, FP8>(kv, cell, kvh, nkv, HD, lane, kf, vf);
+    const int dist = p - j;
+    const bool has_rb = dist >= 0 && dist < rel_extent;
+    const float* br = has_rb ? (rel_bias + size_t(dist) * d_rel) : nullptr;
+    const float br_lane = (has_rb && d_rel <= 32 && lane < d_rel) ? __ldg(br + lane) : 0.f;
+#pragma unroll
+    for (int hi = 0; hi < G; ++hi) {
+      float d = 0.f;
+#pragma unroll
+      for (int e = 0; e < DPL; ++e) d = __fmaf_rn(qv[hi][e], kf[e], d);
+      float rb = 0.f;
+      if (has_rb) {
+        if (d_rel <= 32) {
+          if (lane < d_rel) rb = __fmul_rn(br_lane, rv_lane[hi]);
+        } else {
+          const float* rr = r_q + (size_t(r) * nh + h0 + hi) * d_rel;
+          for (int di = lane; di < d_rel; di += 32) rb = __fmaf_rn(__ldg(br + di), rr[di], rb);
+        }
+      }
+      const float s = __fsub_rn(__fmaf_rn(warp_sum(d), scale, warp_sum(rb)), sink_v[hi]);
+      const float nm = fmaxf(m[hi], s);
+      const float ew = m[hi] == -INFINITY ? 0.f : __expf(__fsub_rn(m[hi], nm));
+      const float w = __expf(__fsub_rn(s, nm));
+      l[hi] = __fmaf_rn(l[hi], ew, w);
+#pragma unroll
+      for (int e = 0; e < DPL; ++e) acc[hi][e] = __fmaf_rn(w, vf[e], __fmul_rn(acc[hi][e], ew));
+      m[hi] = nm;
+    }
+  }
+
+#pragma unroll
+  for (int hi = 0; hi < G; ++hi) {
+    if (lane == 0) {
+      s_m[warp][hi] = m[hi];
+      s_l[warp][hi] = l[hi];
+    }
+#pragma unroll
+    for (int e = 0; e < DPL; ++e) s_acc[warp][hi][lane * DPL + e] = acc[hi][e];
+  }
+  __syncthreads();
+
+  if (warp == 0) {
+#pragma unroll
+    for (int hi = 0; hi < G; ++hi) {
+      float M = -INFINITY;
+#pragma unroll
+      for (int w = 0; w < 4; ++w) M = fmaxf(M, s_m[w][hi]);
+      float L = 0.f;
+      float out_v[DPL];
+#pragma unroll
+      for (int e = 0; e < DPL; ++e) out_v[e] = 0.f;
+      if (M != -INFINITY) {
+#pragma unroll
+        for (int w = 0; w < 4; ++w) {
+          if (s_m[w][hi] == -INFINITY) continue;
+          const float f = __expf(__fsub_rn(s_m[w][hi], M));
+          L = __fmaf_rn(s_l[w][hi], f, L);
+#pragma unroll
+          for (int e = 0; e < DPL; ++e) out_v[e] = __fmaf_rn(s_acc[w][hi][lane * DPL + e], f, out_v[e]);
+        }
+      }
+      float* dst = part + ((size_t(r) * nh + h0 + hi) * splits + sp) * (HD + 2);
+      if (lane == 0) {
+        dst[0] = M;
+        dst[1] = L;
+      }
+#pragma unroll
+      for (int e = 0; e < DPL; ++e) dst[2 + lane * DPL + e] = out_v[e];
+    }
+  }
 }
 
 template <int HD, int RT>
@@ -469,6 +931,7 @@ __global__ void __launch_bounds__(128) k_rel_attention_split(const float* __rest
 
   int p[RT], ks[RT], ke[RT], lo = INT_MAX, hi = 0;
   float sink_v[RT];
+  bool any_used = false;
 #pragma unroll
   for (int i = 0; i < RT; ++i) {
     p[i] = base + r0 + i;
@@ -478,6 +941,7 @@ __global__ void __launch_bounds__(128) k_rel_attention_split(const float* __rest
     const int span = max(0, total - first);
     const int used = span > 0 ? rel_splits_used(span, splits) : 0;
     if (i < nrows && sp < used) {
+      any_used = true;
       const int chunk = (span + used - 1) / used;
       ks[i] = min(total, first + sp * chunk);
       ke[i] = min(total, ks[i] + chunk);
@@ -491,6 +955,7 @@ __global__ void __launch_bounds__(128) k_rel_attention_split(const float* __rest
       sink_v[i] = 0.f;
     }
   }
+  if (!any_used) return;
 
   float qv[RT][DPL], acc[RT][DPL], m[RT], l[RT];
   float rv_lane[RT];  // holds r_q[row, h, lane] when d_rel <= 32
@@ -509,27 +974,9 @@ __global__ void __launch_bounds__(128) k_rel_attention_split(const float* __rest
   const bool is_fp8 = kv.fp8();
   for (int j = lo < hi ? lo + ((warp - lo) & 3) : hi; j < hi; j += 4) {
     const int cell = kv.slot_of(j);
-    const size_t at = (size_t(cell) * nkv + kvh) * HD + lane * DPL;
     float kf[DPL], vf[DPL];
-    if (is_fp8) {
-      const float ksc = kv.kscales(cell)[size_t(cell) * nkv + kvh];
-      const float vsc = kv.vscales(cell)[size_t(cell) * nkv + kvh];
-      const uint8_t* kp = static_cast<const uint8_t*>(kv.k) + at;
-      const uint8_t* vp = static_cast<const uint8_t*>(kv.v) + at;
-#pragma unroll
-      for (int e = 0; e < DPL; ++e) {
-        kf[e] = e4m3_to_float(kp[e]) * ksc;
-        vf[e] = e4m3_to_float(vp[e]) * vsc;
-      }
-    } else {
-      const kv16* kp = static_cast<const kv16*>(kv.k) + at;
-      const kv16* vp = static_cast<const kv16*>(kv.v) + at;
-#pragma unroll
-      for (int e = 0; e < DPL; ++e) {
-        kf[e] = __half2float(kp[e]);
-        vf[e] = __half2float(vp[e]);
-      }
-    }
+    if (is_fp8) rel_load_kv<DPL, true>(kv, cell, kvh, nkv, HD, lane, kf, vf);
+    else rel_load_kv<DPL, false>(kv, cell, kvh, nkv, HD, lane, kf, vf);
 
 #pragma unroll
     for (int i = 0; i < RT; ++i) {
@@ -686,22 +1133,84 @@ __global__ void k_rel_attention_combine_win(const float* __restrict__ part, cons
   put(out, size_t(r) * ld_out + h * hd + d, size_t(r) * nh * hd + h * hd + d, o);
 }
 
+template <int HD, bool FP8>
+bool launch_rel_flash(const float* q, const float* r, KvRef kv, const float* rel_bias, const float* sink, int ld_sink,
+                      const float* gate, int ld_gate, int nh, int nkv, int d_rel, int rel_extent, int window, int rows,
+                      float scale, const DevParams* P, float* out, int ld_out, const Launch& L, int pos_add,
+                      const RelWindow& win) {
+  if (d_rel > 64) return false;
+  const size_t smem = rel_flash_smem<HD>(d_rel);
+  static const bool ready = set_dynamic_smem(k_rel_flash_prefill<HD, FP8>, rel_flash_smem<HD>(64));
+  (void)ready;
+  const int k_lo = win.state ? win.k_lo : 0;
+  const int k_hi = win.state ? win.k_hi : INT_MAX;
+  const int first_win = win.state ? int(win.first) : 1;
+  const int last_win = win.state ? int(win.last) : 1;
+  const Out dst = (!win.state || win.last) ? (out ? Out{out, nullptr, nullptr} : split_out(L, rows, nh * HD, false))
+                                           : Out{nullptr, nullptr, nullptr};
+  k_rel_flash_prefill<HD, FP8><<<dim3(nh, ceil_div(rows, 64)), 128, smem, L.st>>>(
+      q, r, kv, rel_bias, sink, ld_sink, gate, ld_gate, nh, nkv, d_rel, rel_extent, window, rows, scale, P, pos_add,
+      k_lo, k_hi, first_win, last_win, win.state, dst, ld_out);
+  return true;
+}
+
+template <int HD>
+bool launch_rel_gqa(const float* q, const float* r, KvRef kv, const float* rel_bias, const float* sink, int ld_sink,
+                    int nh, int nkv, int d_rel, int rel_extent, int window, int rows, float scale, const DevParams* P,
+                    float* partial, int eff_splits, cudaStream_t st, int pos_add, int k_lo, int k_hi) {
+  if (nkv <= 0 || nh % nkv != 0) return false;
+  const int G = nh / nkv;
+  const dim3 grid(rows, nkv, eff_splits);
+#define FLYX_REL_GQA(G_)                                                                                               \
+  if (G == (G_)) {                                                                                                     \
+    if (kv.fp8())                                                                                                      \
+      k_rel_attention_gqa<HD, G_, true><<<grid, 128, 0, st>>>(q, r, kv, rel_bias, sink, ld_sink, nh, nkv, d_rel,       \
+                                                              rel_extent, window, scale, P, partial, pos_add,          \
+                                                              eff_splits, k_lo, k_hi);                                 \
+    else                                                                                                               \
+      k_rel_attention_gqa<HD, G_, false><<<grid, 128, 0, st>>>(q, r, kv, rel_bias, sink, ld_sink, nh, nkv, d_rel,      \
+                                                               rel_extent, window, scale, P, partial, pos_add,         \
+                                                               eff_splits, k_lo, k_hi);                                \
+    return true;                                                                                                       \
+  }
+  FLYX_REL_GQA(1) FLYX_REL_GQA(2) FLYX_REL_GQA(3) FLYX_REL_GQA(4)
+  if constexpr (HD <= 128) {
+    FLYX_REL_GQA(6) FLYX_REL_GQA(8)
+  }
+#undef FLYX_REL_GQA
+  return false;
+}
+
 template <int HD>
 void dispatch_rel_attention(const float* q, const float* r, KvRef kv, const float* rel_bias, const float* sink,
                             int ld_sink, const float* gate, int ld_gate, int nh, int nkv, int d_rel, int rel_extent,
                             int window, int rows, float scale, const DevParams* P, float* out, int ld_out,
                             float* partial, int splits, const Launch& L, int pos_add, const RelWindow& win) {
-  const int eff_splits = std::max(1, splits);
+  // Prefill (more causal rows than a round): tensor-core FlashAttention unless kAttnSplit is forced.
+  if (rows > FLYX_MAX_ROWS && !L.round_rows && opts(L).attention != kAttnSplit) {
+    const bool ok = kv.fp8()
+                        ? launch_rel_flash<HD, true>(q, r, kv, rel_bias, sink, ld_sink, gate, ld_gate, nh, nkv, d_rel,
+                                                     rel_extent, window, rows, scale, P, out, ld_out, L, pos_add, win)
+                        : launch_rel_flash<HD, false>(q, r, kv, rel_bias, sink, ld_sink, gate, ld_gate, nh, nkv, d_rel,
+                                                      rel_extent, window, rows, scale, P, out, ld_out, L, pos_add, win);
+    if (ok) return;
+  }
+  const int eff_splits = std::min(std::max(1, splits), kAttnCoresSplits);
   const int k_lo = win.state ? win.k_lo : 0;
   const int k_hi = win.state ? win.k_hi : INT_MAX;
-  if (rows == 1) {
-    k_rel_attention_split<HD, 1><<<dim3(nh, eff_splits, 1), 128, 0, L.st>>>(
-        q, r, kv, rel_bias, sink, ld_sink, nh, nkv, d_rel, rel_extent, window, rows, scale, P, partial, pos_add,
-        eff_splits, k_lo, k_hi);
-  } else {
-    k_rel_attention_split<HD, 4><<<dim3(nh, eff_splits, ceil_div(rows, 4)), 128, 0, L.st>>>(
-        q, r, kv, rel_bias, sink, ld_sink, nh, nkv, d_rel, rel_extent, window, rows, scale, P, partial, pos_add,
-        eff_splits, k_lo, k_hi);
+  const bool gqa_ok = opts(L).attention != kAttnPerHead &&
+                      launch_rel_gqa<HD>(q, r, kv, rel_bias, sink, ld_sink, nh, nkv, d_rel, rel_extent, window, rows,
+                                         scale, P, partial, eff_splits, L.st, pos_add, k_lo, k_hi);
+  if (!gqa_ok) {
+    if (rows == 1) {
+      k_rel_attention_split<HD, 1><<<dim3(nh, eff_splits, 1), 128, 0, L.st>>>(
+          q, r, kv, rel_bias, sink, ld_sink, nh, nkv, d_rel, rel_extent, window, rows, scale, P, partial, pos_add,
+          eff_splits, k_lo, k_hi);
+    } else {
+      k_rel_attention_split<HD, 4><<<dim3(nh, eff_splits, ceil_div(rows, 4)), 128, 0, L.st>>>(
+          q, r, kv, rel_bias, sink, ld_sink, nh, nkv, d_rel, rel_extent, window, rows, scale, P, partial, pos_add,
+          eff_splits, k_lo, k_hi);
+    }
   }
   const Out dst = (!win.state || win.last) ? (out ? Out{out, nullptr, nullptr} : split_out(L, rows, nh * HD, false))
                                            : Out{nullptr, nullptr, nullptr};

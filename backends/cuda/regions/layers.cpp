@@ -663,10 +663,12 @@ void rel_attn_layer(const Pass& ps, const RelAttnBlock& a, bool fused) {
   gemm(rv.b.h, H, a.w_sink, nh, H, rv.b.sink, nh, R, false, L);
 
   // K input norm -> K projection -> ShortConv -> kv_conv[0..R*kv_dim).
-  rmsnorm(in_raw[1], H, a.k_norm_in.w, a.k_norm_in.offset, a.k_norm_in.eps, rv.b.h, H, R, H, st);
-  gemm(rv.b.h, H, a.w_k, kv_dim, H, rv.b.act, kv_dim, R, false, L);
   float* k_dyn = nullptr;
-  if (!is_swa) {
+  if (is_swa) {
+    norm_project(in_raw[1], rv.b.h, rv.b.act, kv_dim, R, a.k_norm_in, a.w_k, kv_dim, H, L, fused && H % 64 == 0);
+  } else {
+    rmsnorm(in_raw[1], H, a.k_norm_in.w, a.k_norm_in.offset, a.k_norm_in.eps, rv.b.h, H, R, H, st);
+    gemm(rv.b.h, H, a.w_k, kv_dim, H, rv.b.act, kv_dim, R, false, L);
     gemm(rv.b.h, H, a.w_k_conv_proj, nkv * a.conv, H, rv.b.kv_dyn, nkv * a.conv, R, false, L);
     k_dyn = rv.b.kv_dyn;
   }
@@ -674,10 +676,12 @@ void rel_attn_layer(const Pass& ps, const RelAttnBlock& a, bool fused) {
                  kSlotCur, 0, sc.channels, kv_dim, a.conv, nkv, s->P, R, rv.b.kv_conv, kv_dim, st, false);
 
   // V input norm -> V projection -> ShortConv -> kv_conv[R*kv_dim..2*R*kv_dim).
-  rmsnorm(in_raw[2], H, a.v_norm_in.w, a.v_norm_in.offset, a.v_norm_in.eps, rv.b.h, H, R, H, st);
-  gemm(rv.b.h, H, a.w_v, kv_dim, H, rv.b.act, kv_dim, R, false, L);
   float* v_dyn = nullptr;
-  if (!is_swa) {
+  if (is_swa) {
+    norm_project(in_raw[2], rv.b.h, rv.b.act, kv_dim, R, a.v_norm_in, a.w_v, kv_dim, H, L, fused && H % 64 == 0);
+  } else {
+    rmsnorm(in_raw[2], H, a.v_norm_in.w, a.v_norm_in.offset, a.v_norm_in.eps, rv.b.h, H, R, H, st);
+    gemm(rv.b.h, H, a.w_v, kv_dim, H, rv.b.act, kv_dim, R, false, L);
     gemm(rv.b.h, H, a.w_v_conv_proj, nkv * a.conv, H, rv.b.kv_dyn, nkv * a.conv, R, false, L);
     v_dyn = rv.b.kv_dyn;
   }
@@ -808,7 +812,7 @@ void moe_layer(const Pass& ps, const MoeBlock& f, bool fused) {
   moe_route(rv.b.proj, f.router_bias, R, E, K, f.gating_sigmoid, f.norm_weights, f.norm_eps, f.route_scale,
             rv.b.moe_idx, rv.b.moe_w, st);
 
-  const MoeScratch* msc = (!ps.round && R > 16 && rv.b.moe_sc.pairs) ? &rv.b.moe_sc : nullptr;
+  const MoeScratch* msc = rv.b.moe_sc.pairs ? &rv.b.moe_sc : nullptr;
   if (fused) {
     moe_gate_up(rv.b.h, H, f.gate_up, rv.b.moe_idx, R, K, I, H, f.situ_beta, f.situ_linear_beta, true, rv.b.moe_act, I,
                 msc, L);
