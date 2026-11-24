@@ -197,15 +197,7 @@ void mtp_draft_rows(const BatchPass& bp, const MtpBlock& b, const std::vector<si
     if (A >= 2) {
       // Read the 1-bit or full draft head once across all A active sequences while keeping rough scores bit-identical
       // to 1-row solo mtp_draft() (exact_1row = true).
-      if (head.coarse.bits && head.wb.data) {
-        draft_pick_blocks(v.b.h, H, head.coarse, head.wb, head.vocab, H, A, 1, v.b.choice, nullptr, v.logits, L, true);
-      } else if (head.coarse.bits) {
-        draft_pick(v.b.h, H, head.coarse, head.w, head.vocab, H, A, 1, v.b.choice, nullptr, v.logits, L, true);
-      } else {
-        draft_logits(head, v.b.h, H, v.logits, A, L);
-        flyx_seq* scratch_seq = bp.seq[active[0]].s;
-        argmax_rows(v.logits, head.vocab, head.vocab, v.b.choice, A, scratch_seq->argv, scratch_seq->argi, st);
-      }
+      draft_head_pick(head, v.b.h, A, 1, v.b.choice, nullptr, pick_scratch(bp.seq[active[0]].s, v.logits), L, true);
       for (int j = 0; j < A; ++j) {
         const Pass& ps = bp.seq[active[size_t(j)]];
         flyx_seq* s = ps.s;
@@ -328,17 +320,8 @@ void draft_block_rows(const BatchPass& bp, const DFlashBlock& b, const std::vect
         rmsnorm(df.dx + (g * B + 1) * H, H, b.norm.w, b.norm.offset, b.norm.eps, df.dh + size_t(batch_off[bi]) * H, H,
                 nr, H, st);
       }
-      if (head.coarse.bits && head.wb.data) {
-        draft_pick_blocks(df.dh, H, head.coarse, head.wb, head.vocab, H, total_nr, b.sel_topk, df.cand, df.unary,
-                          v.logits, L);
-      } else if (head.coarse.bits) {
-        draft_pick(df.dh, H, head.coarse, head.w, head.vocab, H, total_nr, b.sel_topk, df.cand, df.unary, v.logits, L);
-      } else {
-        draft_logits(head, df.dh, H, v.logits, total_nr, L);
-        flyx_seq* lead = bp.seq[members[off]].s;
-        topk_rows(v.logits, head.vocab, head.vocab, b.sel_topk, df.cand, df.unary, total_nr, st, lead->topv,
-                  lead->topi, lead->top_rows);
-      }
+      draft_head_pick(head, df.dh, total_nr, b.sel_topk, df.cand, df.unary,
+                      pick_scratch(bp.seq[members[off]].s, v.logits), L);
       gemm(df.dh, H, b.sel_hid, b.sel_rank, H, df.hid, b.sel_rank, total_nr, false, L);
       for (size_t bi = 0; bi < n_batched; ++bi) {
         const size_t g = batched[bi];

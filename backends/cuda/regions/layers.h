@@ -29,8 +29,29 @@ void mlp_body(float* x, const MlpBlock& f, int R, float* h, float* proj, int ld_
 void gdn_out_project(const RowView& v, const GdnBlock& g, int R, bool fused);
 void head_logits(const HeadBlock& h, const RowView& v, int r0, int n, bool cert, const CertScratch& cs,
                  const KernelOptions& ko, bool x16 = false);
-void draft_head_pick(const HeadBlock& head, const float* x, int nr, int k, int* idx, float* val, flyx_seq* s,
-                     const Launch& L, float* prob = nullptr, float* margin = nullptr);
+// Where a draft head's pick keeps its scores and its choice's scratch: a sequence's own, or (logits given) a batch's
+// scores with one of its sequences' choice scratch, the batch's rows sharing a launch.
+struct DraftPickScratch {
+  float* logits;         // rows x max(vocab, kDraftPickFloats)
+  float* argv;           // argmax_rows'
+  int* argi;
+  float* topv;           // topk_rows'
+  int* topi;
+  int top_rows;
+};
+inline DraftPickScratch pick_scratch(const flyx_seq* s, float* logits = nullptr) {
+  return {logits ? logits : s->logits, s->argv, s->argi, s->topv, s->topi, s->top_rows};
+}
+// The drafts' top k of nr rows from the head (k 1 without values: their argmax): its 1-bit copy's candidates scored
+// exactly on a packed or a bf16 head, else its draft logits whole.  exact_1row: each of several rows gets the rough
+// scores it has alone (a batch's rows, one a sequence: the drafts a sequence has by itself).
+void draft_head_pick(const HeadBlock& head, const float* x, int nr, int k, int* idx, float* val,
+                     const DraftPickScratch& sc, const Launch& L, bool exact_1row = false, float* prob = nullptr,
+                     float* margin = nullptr);
+inline void draft_head_pick(const HeadBlock& head, const float* x, int nr, int k, int* idx, float* val, flyx_seq* s,
+                            const Launch& L, float* prob = nullptr, float* margin = nullptr) {
+  draft_head_pick(head, x, nr, k, idx, val, pick_scratch(s), L, false, prob, margin);
+}
 // Shared two-stage rough+exact pick for additive draft heads: softcap(head(x_base) + extra(x_extra) + bias).
 bool draft_head_additive_ready(const HeadBlock& head, const Lin& extra, const SignHead& extra_coarse, int K_extra);
 void draft_head_pick_additive_step(const HeadBlock& head, const float* x_base, const Lin& extra,
