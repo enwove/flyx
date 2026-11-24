@@ -104,7 +104,8 @@ if(TARGET flyx-cuda)
 endif()
 flyx_add_unit_test(inkling2_test e2e/inkling2_test.cpp)
 add_dependencies(inkling2_test flyx-cpu_ref)
-add_test(NAME inkling2_cpu_ref COMMAND inkling2_test ${CMAKE_BINARY_DIR}/inkling2_assets cpu_ref)
+# Each run writes the models it reads: a directory of its own, so the two can run at once (ctest -j).
+add_test(NAME inkling2_cpu_ref COMMAND inkling2_test ${CMAKE_BINARY_DIR}/inkling2_assets/cpu_ref cpu_ref)
 
 add_executable(numbers_test apps/common/numbers_test.cpp ${CMAKE_SOURCE_DIR}/apps/common/numbers.cpp)
 target_include_directories(numbers_test PRIVATE ${CMAKE_SOURCE_DIR})
@@ -414,7 +415,7 @@ if(TARGET flyx-cuda)
   set_target_properties(cuda_op_test PROPERTIES CUDA_ARCHITECTURES "${FLYX_CUDA_ARCHS}")
   add_test(NAME cuda_ops COMMAND cuda_op_test)
   add_dependencies(inkling2_test flyx-cuda)
-  add_test(NAME inkling2_cuda COMMAND inkling2_test ${CMAKE_BINARY_DIR}/inkling2_assets cuda)
+  add_test(NAME inkling2_cuda COMMAND inkling2_test ${CMAKE_BINARY_DIR}/inkling2_assets/cuda cuda)
 
   add_test(NAME scheduler_cuda COMMAND scheduler_test ${ASSETS}/tiny.flyx cuda)
   set_tests_properties(scheduler_cuda PROPERTIES FIXTURES_REQUIRED assets)
