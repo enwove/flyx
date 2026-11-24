@@ -40,7 +40,11 @@ __global__ void __launch_bounds__(256) k_attn_res_mix(const float* __restrict__ 
   __shared__ float s_inv[kMaxResStates];
   __shared__ float s_dot[4][kMaxResStates];
   __shared__ float s_alpha[4][kMaxResStates];
+  __shared__ float s_part[kMaxResStates][5][8];  // a state's five sums, a warp each
 
+  // Every state's sums as block_sum_n makes them (a warp's tree, then the eight warps'), with one barrier for all
+  // the states where each had three: a warp leaves its sums, and thread m finishes state m.  The same bits, and a
+  // round runs this two to three times a layer visit.
   const float inv_sqrt_h = rsqrtf(float(H));
   for (int m = 0; m < M; ++m) {
     const float* src = (m < n_blocks) ? (bank + (size_t(m) * rows + r) * H) : (cur + size_t(r) * H);
@@ -53,15 +57,29 @@ __global__ void __launch_bounds__(256) k_attn_res_mix(const float* __restrict__ 
       if (nq_chunk >= 3) acc[3] = __fmaf_rn(v, queries[size_t(q0 + 2) * H + i], acc[3]);
       if (nq_chunk >= 4) acc[4] = __fmaf_rn(v, queries[size_t(q0 + 3) * H + i], acc[4]);
     }
-    block_sum_n(acc);
-    if (tid == 0) {
-      const float inv = rsqrtf(acc[0] / float(H) + 1e-6f);
-      s_inv[m] = inv;
-      const float sc = inv * inv_sqrt_h;
-      for (int q = 0; q < nq_chunk; ++q) s_dot[q][m] = acc[q + 1] * sc;
+#pragma unroll
+    for (int a = 0; a < 5; ++a) {
+      const float w = warp_sum(acc[a]);
+      if ((tid & 31) == 0) s_part[m][a][tid >> 5] = w;
     }
-    __syncthreads();
   }
+  __syncthreads();
+  if (tid < M) {
+    float t[5];
+#pragma unroll
+    for (int a = 0; a < 5; ++a) {
+      // block_sum_n's second tree over lanes 0..7 of a warp whose other lanes hold +0
+      float p[8];
+#pragma unroll
+      for (int w = 0; w < 8; ++w) p[w] = s_part[tid][a][w] + 0.f;
+      t[a] = ((p[0] + p[4]) + (p[2] + p[6])) + ((p[1] + p[5]) + (p[3] + p[7]));
+    }
+    const float inv = rsqrtf(t[0] / float(H) + 1e-6f);
+    s_inv[tid] = inv;
+    const float sc = inv * inv_sqrt_h;
+    for (int q = 0; q < nq_chunk; ++q) s_dot[q][tid] = t[q + 1] * sc;
+  }
+  __syncthreads();
   if (tid == 0) {
     for (int q = 0; q < nq_chunk; ++q) {
       float mx = -INFINITY;

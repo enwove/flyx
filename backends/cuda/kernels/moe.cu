@@ -24,7 +24,7 @@ namespace {
 
 constexpr int kMoeWarps = 4;
 constexpr int kMoeKT = 1024;
-constexpr int kRouteThreads = 128;
+constexpr int kRouteThreads = 128, kRouteTop = 64;  // threads a row; the most experts a row takes
 
 __device__ __forceinline__ float situ_val(float g, float u, float beta, float linear_beta) {
   if (beta > 0.f) {
@@ -60,13 +60,13 @@ __global__ void __launch_bounds__(kRouteThreads) k_moe_route(const float* __rest
                                                              float route_scale, int* __restrict__ idx_out,
                                                              float* __restrict__ w_out) {
   pdl_trigger();
-  const int r = blockIdx.x, tid = threadIdx.x, lane = tid & 31, warp = tid >> 5;
+  const int r = blockIdx.x, tid = threadIdx.x;
   const float* lr = logits + size_t(r) * E;
   extern __shared__ float sh[];  // probs[E], sel[E]
   float* probs = sh;
   float* sel = sh + E;
-  __shared__ float s_val[kRouteThreads / 32];
-  __shared__ int s_idx[kRouteThreads / 32];
+  __shared__ int s_top_i[kRouteTop];
+  __shared__ float s_top_w[kRouteTop];
   __shared__ float s_norm;
 
   if (gating_sigmoid) {
@@ -95,44 +95,32 @@ __global__ void __launch_bounds__(kRouteThreads) k_moe_route(const float* __rest
   }
   __syncthreads();
 
+  // The top_k best in order: a thread counts, for each of its experts, those better than it (score_better is a total
+  // order, ties to the lower index), and an expert with fewer than top_k before it is the choice of that rank: what
+  // choosing one best at a time gave, each behind two barriers, with two barriers for all of them (a round runs this
+  // once a layer visit, and a launch lasts as long as its barriers).
+  for (int e = tid; e < E; e += kRouteThreads) {
+    const float v = sel[e];
+    int before = 0;
+    for (int j = 0; j < E; ++j) before += (j != e && score_better(sel[j], j, v, e)) ? 1 : 0;
+    if (before < top_k) {
+      s_top_i[before] = e;
+      s_top_w[before] = probs[e];
+    }
+  }
+  __syncthreads();
+  if (tid == 0) {
+    float sum_w = 0.f;
+    for (int k = 0; k < top_k; ++k) sum_w += s_top_w[k];
+    s_norm = norm_weights ? (route_scale / (sum_w + norm_eps)) : route_scale;
+  }
+  __syncthreads();
   int* out_i = idx_out + size_t(r) * top_k;
   float* out_w = w_out + size_t(r) * top_k;
-  float sum_w = 0.f;
-  for (int k = 0; k < top_k; ++k) {
-    float bv = -INFINITY;
-    int bi = -1;
-    for (int e = tid; e < E; e += kRouteThreads) {
-      const float v = sel[e];
-      if (bi < 0 || score_better(v, e, bv, bi)) bv = v, bi = e;
-    }
-#pragma unroll
-    for (int o = 16; o > 0; o >>= 1) {
-      const float ov = __shfl_xor_sync(0xffffffffu, bv, o);
-      const int oi = __shfl_xor_sync(0xffffffffu, bi, o);
-      if (oi >= 0 && (bi < 0 || score_better(ov, oi, bv, bi))) bv = ov, bi = oi;
-    }
-    if (lane == 0) {
-      s_val[warp] = bv;
-      s_idx[warp] = bi;
-    }
-    __syncthreads();
-    if (tid == 0) {
-      float best_v = -INFINITY;
-      int best_i = 0;
-      for (int w = 0; w < kRouteThreads / 32; ++w)
-        if (s_idx[w] >= 0 && (w == 0 || score_better(s_val[w], s_idx[w], best_v, best_i)))
-          best_v = s_val[w], best_i = s_idx[w];
-      out_i[k] = best_i;
-      const float pw = probs[best_i];
-      out_w[k] = pw;
-      sum_w += pw;
-      sel[best_i] = -INFINITY;
-    }
-    __syncthreads();
+  for (int k = tid; k < top_k; k += kRouteThreads) {
+    out_i[k] = s_top_i[k];
+    out_w[k] = s_top_w[k] * s_norm;
   }
-  if (tid == 0) s_norm = norm_weights ? (route_scale / (sum_w + norm_eps)) : route_scale;
-  __syncthreads();
-  for (int k = tid; k < top_k; k += kRouteThreads) out_w[k] *= s_norm;
 }
 
 __global__ void k_situ_rows(const float* __restrict__ gu, int ld_gu, int I, float beta, float linear_beta,
@@ -780,7 +768,7 @@ constexpr bool moe_use_mma(int rc, int M, int n_experts) { return rc > FLYX_MAX_
 
 void moe_route(const float* logits, const float* bias, int rows, int n_experts, int top_k, bool gating_sigmoid,
                bool norm_weights, float norm_eps, float route_scale, int* idx_out, float* w_out, cudaStream_t st) {
-  if (rows <= 0 || n_experts <= 0 || top_k <= 0 || top_k > n_experts)
+  if (rows <= 0 || n_experts <= 0 || top_k <= 0 || top_k > n_experts || top_k > kRouteTop)
     throw std::runtime_error("moe_route: invalid dimensions");
   const size_t smem = size_t(2) * size_t(n_experts) * sizeof(float);
   k_moe_route<<<rows, kRouteThreads, smem, st>>>(logits, bias, n_experts, top_k, int(gating_sigmoid), int(norm_weights),
