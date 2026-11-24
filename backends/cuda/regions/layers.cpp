@@ -958,21 +958,34 @@ void dspark_draft(flyx_seq* s, const DSparkBlock& b, int width, const Launch& L,
     }
   }
 
-  // Batched base logits for rows 1..nr (reads the target head weight once).
+  // The drafts' logits are softcap(head(hn) + markov_w2(markov) + bias), a step's Markov vector made from the draft
+  // before it.  With 1-bit copies of both heads (loader/weights.cpp) the rows' rough head scores are made at once and
+  // each step adds its rough Markov scores, picks its candidates from the sum and scores only those exactly on both
+  // heads (draft_head_pick_additive_step); picked from the head's rough scores alone, the drafts the Markov head
+  // moves up were lost.  Otherwise both heads are read whole: the head once for every row, the Markov head a step.
   const int nr = std::min(width, B - 1);
   rmsnorm(s->ds_x + H, H, b.norm.w, b.norm.offset, b.norm.eps, s->ds_hn, H, nr, H, st);
-  draft_logits(head, s->ds_hn, H, s->logits, nr, L);
+  const bool two_stage = draft_head_additive_ready(head, b.markov_w2, b.markov_coarse, Rk);
+  const int ld = two_stage ? std::max(V, kDraftPickFloats) : V;
+  if (two_stage) gemm_sign_rough(s->ds_hn, H, head.coarse, V, H, s->logits, ld, nr, L);
+  else draft_logits(head, s->ds_hn, H, s->logits, nr, L);
   for (int step = 0; step < nr; ++step) {
     if (b.markov_w1_blk.data) embed_blocks(s->ds_prev, b.markov_w1_blk, Rk, s->ds_joint + Rk, 1, st);
     else embed(s->ds_prev, b.markov_w1, Rk, s->ds_joint + Rk, 1, st);
     dspark_markov_pack(s->P, s->ds_state, nullptr, s->ds_hn + size_t(step) * H, s->ring, Rk, H, s->ds_joint, st);
     gemm(s->ds_joint, 2 * Rk + 2 * H, b.joint_proj, 3 * Rk, 2 * Rk + 2 * H, s->ds_jout, 3 * Rk, 1, false, L);
     dspark_markov_gate(s->ds_jout, b.joint_proj_b, Rk, s->ds_state, s->ds_markov, st);
-    gemm(s->ds_markov, Rk, b.markov_w2, V, Rk, s->ds_bias, V, 1, false, L);
-    float* row_logits = s->logits + size_t(step) * V;
-    dspark_combine_logits(row_logits, s->ds_bias, b.markov_w2_b, V, b.softcap, row_logits, st);
-    topk_rows(row_logits, V, V, 1, s->ds_prev, nullptr, 1, st, s->topv, s->topi, s->top_rows, s->draft_prob + step,
-              s->draft_margin + step);
+    float* row_logits = s->logits + size_t(step) * ld;
+    if (two_stage) {
+      draft_head_pick_additive_step(head, s->ds_hn + size_t(step) * H, b.markov_w2, b.markov_coarse, b.markov_w2_b,
+                                    s->ds_markov, Rk, b.softcap, row_logits, ld, s->ds_bias, 1, s->ds_prev, nullptr,
+                                    s->draft_prob + step, s->draft_margin + step, L);
+    } else {
+      gemm(s->ds_markov, Rk, b.markov_w2, V, Rk, s->ds_bias, V, 1, false, L);
+      dspark_combine_logits(row_logits, s->ds_bias, b.markov_w2_b, V, b.softcap, row_logits, st);
+      topk_rows(row_logits, V, V, 1, s->ds_prev, nullptr, 1, st, s->topv, s->topi, s->top_rows, s->draft_prob + step,
+                s->draft_margin + step);
+    }
     dspark_pick_step(s->P, s->oracle, step, s->ds_prev, s->drafts, st);
   }
 }

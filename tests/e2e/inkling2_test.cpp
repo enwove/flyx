@@ -6,7 +6,8 @@
 //     sparse MoE (SiTU, 3D NVFP4 with per-expert .scale, MXFP4, Q2_0, Q8_0, BF16, mixed-dtype F32 sink_proj).
 //   * Gate 2: fusion=0 == fusion=1 bit-identical.
 //   * Gate 3: CUDA == float64 cpu_ref (greedy, seeded sampling with penalties, prefill chunking, rewind, edit).
-//   * Gate 4: Plain == DSpark speculative decoding (greedy & seeded sampling with penalties), CUDA graphs on/off.
+//   * Gate 4: Plain == DSpark speculative decoding (greedy & seeded sampling with penalties), CUDA graphs on/off,
+//     its drafts from both heads read whole and from their 1-bit copies (the two-stage draft head).
 //   * SWA ring wraparound: checkpoint/restore and snapshot_save/snapshot_load past ring capacity.
 //   * Multi-sequence concurrent batch (`launch_batch` fallback) and Inkling-2 chat template / format / grammar.
 #include <algorithm>
@@ -393,6 +394,10 @@ void write_tiny_inkling2(const std::filesystem::path& path, const TinySpec& c, b
     toks.push_back(s);
     ttypes.push_back(3);
   }
+  for (int t = int(toks.size()); t < c.vocab_unpadded; ++t) {  // a larger vocabulary's other tokens: never text
+    toks.push_back("<|unused_" + std::to_string(t) + "|>");
+    ttypes.push_back(3);
+  }
   w.add_str("tokenizer.ggml.model", "gpt2");
   // Exercise both "inkling2" (unsloth GGUFs) and "gpt-4o" (o200k alias) pre-tokenizers.
   w.add_str("tokenizer.ggml.pre", mixed_quant ? "gpt-4o" : "inkling2");
@@ -508,11 +513,12 @@ void write_tiny_inkling2(const std::filesystem::path& path, const TinySpec& c, b
   w.write(path);
 }
 
-void write_tiny_dspark(const std::filesystem::path& path, const TinySpec& c, bool packed_w1, uint32_t seed_val) {
+void write_tiny_dspark(const std::filesystem::path& path, const TinySpec& c, bool packed_w1, uint32_t seed_val,
+                       int rank = 32) {
   std::mt19937 rng(seed_val);
   GgufWriter w;
   const std::string arch = "dflash";
-  const int layers = 3, block = 8, rank = 32;
+  const int layers = 3, block = 8;
   const int n_visits = c.core_start + c.n_passes * (c.core_end - c.core_start) + (c.n_phys - c.core_end);  // 10
   const std::vector<uint32_t> taps = {0, 3, 7, uint32_t(n_visits)};  // includes post output_norm tap!
   const std::vector<bool> swa_pat = {true, true, false};
@@ -645,6 +651,13 @@ std::vector<int32_t> fresh_gen(Engine& e, const std::vector<int32_t>& prompt, in
   std::string err;
   if (!s.init(&err)) throw std::runtime_error("session init: " + err);
   return run_gen(s, prompt, n, sampled);
+}
+
+// Device bytes the backend's model holds (weights and the copies made of them).
+uint64_t weight_bytes(const Engine& e) {
+  flyx_memory_info mi{};
+  if (!e.api()->memory || e.api()->memory(e.bmodel(), &mi) != 0) throw std::runtime_error("memory() failed");
+  return mi.weights;
 }
 
 int teacher_forced_matches(Engine& e, const std::vector<int32_t>& prompt, const std::vector<int32_t>& want) {
@@ -1100,6 +1113,59 @@ int main(int argc, char** argv) {
         const auto want_long = fresh_gen(*gpu_strata, long_prompt, 24, false);
         check(same_tokens(fresh_gen(*win_dspark, long_prompt, 24, false), want_long),
               "RelAttn windowed prefill (stage_window=64) + DSpark Full ring (mtp_window=16) == GPU strata");
+      }
+
+      // ---- 6. DSpark's two-stage draft head: 1-bit copies of the head and of the Markov head pick the candidates ----
+      // The tiny models above are too small for the copies (a hidden width and a Markov rank of 128s, 1,025 tokens
+      // or more), so their drafts read both heads whole; these take the two-stage path, from bf16 and from packed
+      // weights, and draft_head=full reads the heads whole again.
+      std::printf("Inkling-2 DSpark two-stage draft head (1-bit copies of the head and the Markov head)\n");
+      {
+        TinySpec wide;
+        wide.H = 128;
+        wide.vocab_padded = 1344;
+        wide.vocab_unpadded = 1280;
+        const int rank = 128;
+        for (const bool packed : {false, true}) {
+          const std::string tag = packed ? "Q8_0 heads" : "bf16 heads";
+          const auto target = dir / (packed ? "wide_inkling2_mixed.gguf" : "wide_inkling2_bf16.gguf");
+          const auto drafter = dir / (packed ? "dspark-wide-q8.gguf" : "dspark-wide-bf16.gguf");
+          write_tiny_inkling2(target, wide, packed, packed ? 6006 : 5005);
+          write_tiny_dspark(drafter, wide, packed, packed ? 8008 : 7007, rank);
+          auto dspark = [&](const std::string& opts) {
+            return load_engine(target.string(), "cuda",
+                               {.speculative = true,
+                                .prefill_chunk = 32,
+                                .drafter = "dspark",
+                                .drafter_files = {drafter.string()},
+                                .backend_opts = opts});
+          };
+          auto plain = load_engine(target.string(), "cuda", {.prefill_chunk = 32});
+          auto pick = dspark(""), pick_unfused = dspark("fusion=0"), pick_nographs = dspark("graphs=0");
+          auto full = dspark("draft_head=full");
+          const auto greedy = fresh_gen(*plain, prompt, 40, false);
+          const auto sampled = fresh_gen(*plain, prompt, 40, true);
+          check(same_tokens(fresh_gen(*pick, prompt, 40, false), greedy), tag + ": two-stage DSpark greedy == plain");
+          check(same_tokens(fresh_gen(*pick, prompt, 40, true), sampled),
+                tag + ": two-stage DSpark sampled+penalties == plain");
+          check(same_tokens(fresh_gen(*pick_unfused, prompt, 40, false), greedy),
+                tag + ": two-stage DSpark fusion=0 == plain");
+          check(same_tokens(fresh_gen(*pick_nographs, prompt, 40, true), sampled),
+                tag + ": two-stage DSpark graphs=0 sampled+penalties == plain");
+          check(same_tokens(fresh_gen(*full, prompt, 40, false), greedy),
+                tag + ": draft_head=full DSpark greedy == plain");
+          check(same_tokens(fresh_gen(*full, prompt, 40, true), sampled),
+                tag + ": draft_head=full DSpark sampled+penalties == plain");
+          // What the default holds for it: the two 1-bit copies, where draft_head=full holds an NVFP4 copy of a bf16
+          // head (larger than both) and no copy of a packed one.
+          const int64_t held = int64_t(weight_bytes(*pick)) - int64_t(weight_bytes(*full));
+          const int64_t rows = (wide.vocab_unpadded + 255) / 256 * 256;
+          const int64_t copies = rows * (wide.H + rank) / 8 + rows * (wide.H + rank) / 64 * 2;  // signs, group scales
+          const int64_t nvfp4_head = int64_t(wide.vocab_unpadded) * (wide.H / 2 + wide.H / 16 + 4);
+          check(held == copies - (packed ? 0 : nvfp4_head),
+                tag + ": the default holds the head's and the Markov head's 1-bit copies (" + std::to_string(held) +
+                    " bytes against draft_head=full)");
+        }
       }
     }
   } catch (const std::exception& e) {

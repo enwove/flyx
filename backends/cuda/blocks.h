@@ -379,6 +379,7 @@ struct DSparkBlock {
   bf16* markov_w1 = nullptr;        // [vocab_out, markov_rank] (null when packed)
   BlockMat markov_w1_blk{};         // packed GGML blocks for markov_w1 (data null: bf16)
   Lin markov_w2;                    // [vocab_out, markov_rank]
+  SignHead markov_coarse;           // its 1-bit copy, read beside the head's (HeadBlock::coarse); bits null: none
   float* markov_w2_b = nullptr;     // [vocab_out] (nullable)
   Lin joint_proj;                   // [3 * markov_rank, 2 * hidden + 2 * markov_rank]
   float* joint_proj_b = nullptr;    // [3 * markov_rank]

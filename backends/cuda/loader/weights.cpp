@@ -386,6 +386,11 @@ uint64_t trim(flyx_bmodel* m, uint64_t bytes) {
     heads([&](HeadBlock& h) {
       if (h.coarse.bits || h.coarse.scales) release_sign_head(m, &h.coarse, h.vocab, h.hidden);
     });
+    if (m->dspark_block >= 0) {  // read only beside the head's, and made only of a Markov head of the head's rows
+      auto& d = block<DSparkBlock>(m, m->dspark_block);
+      if (d.markov_coarse.bits || d.markov_coarse.scales)
+        release_sign_head(m, &d.markov_coarse, block<HeadBlock>(m, d.head).vocab, d.markov_rank);
+    }
     if (m->verbose && pre_coarse != m->bytes)
       std::fprintf(stderr, "flyx-cuda: 1-bit draft head given back (%.2f GB): drafts read the full head\n",
                    double(pre_coarse - m->bytes) / 1e9);
@@ -407,6 +412,9 @@ TargetQuant target_quant_kind(const flyx_bmodel* m) {
     if (const auto* f = std::get_if<MlpBlock>(&m->blocks[i]); f && int(i) != mtp_mlp) {
       fp4 = fp4 || f->w_gu.q;
       packed = packed || f->w_gu.packed();
+    } else if (const auto* e = std::get_if<MoeBlock>(&m->blocks[i])) {  // a sparse MoE's experts, likewise
+      fp4 = fp4 || e->gate_up.q;
+      packed = packed || e->gate_up.packed();
     }
   return fp4 ? TargetQuant::kNvfp4 : packed ? TargetQuant::kPacked : TargetQuant::kFloat;
 }
@@ -508,12 +516,40 @@ void quantize_block_drafter_weights(flyx_bmodel* m, TargetQuant tq) {
     copy(d.ctx, d.ctx_width(), H);
     copy(d.sel_hid, d.sel_rank, H);
   }
+  if (m->dspark_block >= 0) {  // its layers' linears; a drafter file already in GGML blocks keeps them as they are
+    auto& d = block<DSparkBlock>(m, m->dspark_block);
+    const int H = d.hidden, nh = d.nh, nkv = d.nkv, hd = d.hd, I = d.inter;
+    for (int j = 0; j < d.layers(); ++j) {
+      auto& l = block<DSparkLayer>(m, d.first_layer + j);
+      if (l.stacked_qkv) {
+        copy(l.w_qkv, (nh + 2 * nkv) * hd, H);
+      } else {
+        copy(l.w_q, nh * hd, H);
+        copy(l.w_k, nkv * hd, H);
+        copy(l.w_v, nkv * hd, H);
+      }
+      copy(l.w_o, H, nh * hd);
+      if (l.stacked_ctx_kv) {
+        copy(l.w_ctx_kv, 2 * nkv * hd, H);
+      } else {
+        copy(l.w_k_ctx, nkv * hd, H);
+        copy(l.w_v_ctx, nkv * hd, H);
+      }
+      if (l.stacked_gu) {
+        copy(l.w_gu, 2 * I, H);
+      } else {
+        copy(l.w_gate, I, H);
+        copy(l.w_up, I, H);
+      }
+      copy(l.w_down, H, I);
+    }
+  }
 }
 
 }  // namespace
 
 void make_draft_weights(flyx_bmodel* m) {
-  if (m->opt.exact_drafts || (m->mtp_block < 0 && m->dflash_block < 0)) return;
+  if (m->opt.exact_drafts || (m->mtp_block < 0 && m->dflash_block < 0 && m->dspark_block < 0)) return;
   // Quantize drafter layers first so freed VRAM is available for optional 1-bit SignHead copies.
   quantize_mtp_weights(m);
   quantize_block_drafter_weights(m, target_quant_kind(m));
@@ -529,6 +565,18 @@ void make_draft_weights(flyx_bmodel* m) {
     h.draft.s = m->alloc<uint8_t>(size_t(h.vocab) * h.hidden / 16);
     h.draft.rs = m->alloc<float>(h.vocab);
     quantize_nvfp4(h.w, h.vocab, h.hidden, h.draft.q, h.draft.s, h.draft.rs, 0);
+  }
+  // DSpark's drafts add its Markov head's logits to the target head's: the candidates are picked from both heads'
+  // 1-bit copies together (draft_head_pick_additive_step), so the Markov head gets a copy when the target head has
+  // one.  Without it DSpark reads both heads whole, and a copy of the target head no other drafter reads goes back.
+  if (m->dspark_block >= 0) {
+    auto& d = block<DSparkBlock>(m, m->dspark_block);
+    const BlockMat* packed = d.markov_w2.packed() && d.markov_w2.blk.size() == 1 ? &d.markov_w2.blk[0] : nullptr;
+    const bool same_rows = (d.vocab_out > 0 ? d.vocab_out : h.vocab) == h.vocab && d.head == m->head_block;
+    const bool made = h.coarse.bits && same_rows &&
+                      make_sign_head_for(m, d.markov_w2.w, packed, h.vocab, d.markov_rank, &d.markov_coarse,
+                                         "DSpark Markov head");
+    if (!made && m->mtp_block < 0 && m->dflash_block < 0) release_sign_head(m, &h.coarse, h.vocab, h.hidden);
   }
 }
 
