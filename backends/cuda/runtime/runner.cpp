@@ -392,20 +392,7 @@ int prefill_ex(flyx_plan* p, flyx_seq* s, const flyx_prefill_input* in, const fl
       for (int i = 0; i < in->n_embeds; ++i)
         if (in->embed_rows[i] < 0 || in->embed_rows[i] >= n) return fail("prefill_ex: embed_row out of range");
       const size_t need_e = size_t(in->n_embeds) * size_t(m->hidden);
-      if (need_e > m->prefill_embeds_cap) {
-        if (m->prefill_embeds) CK(cudaFree(m->prefill_embeds));
-        m->prefill_embeds = nullptr;
-        m->prefill_embeds_cap = 0;
-        m->prefill_embeds = static_cast<float*>(device_malloc(need_e * sizeof(float)));
-        m->prefill_embeds_cap = need_e;
-      }
-      if (size_t(in->n_embeds) > m->prefill_embed_rows_cap) {
-        if (m->prefill_embed_rows) CK(cudaFree(m->prefill_embed_rows));
-        m->prefill_embed_rows = nullptr;
-        m->prefill_embed_rows_cap = 0;
-        m->prefill_embed_rows = static_cast<int32_t*>(device_malloc(size_t(in->n_embeds) * sizeof(int32_t)));
-        m->prefill_embed_rows_cap = size_t(in->n_embeds);
-      }
+      reserve_prefill_inputs(m, in->n_embeds, 0);
       CK(cudaMemcpyAsync(m->prefill_embeds, in->embeds, need_e * sizeof(float), cudaMemcpyHostToDevice, s->st));
       CK(cudaMemcpyAsync(m->prefill_embed_rows, in->embed_rows, size_t(in->n_embeds) * sizeof(int32_t),
                          cudaMemcpyHostToDevice, s->st));
@@ -416,13 +403,7 @@ int prefill_ex(flyx_plan* p, flyx_seq* s, const flyx_prefill_input* in, const fl
     std::vector<int32_t> pos3d_host;  // kept alive until sync_stream(s) below
     if (in->pos_3d) {
       const size_t need_p = size_t(n) * 6;  // [pos_3d (3*n) | mtp_pos_3d (3*n)]
-      if (need_p > m->prefill_pos3d_cap) {
-        if (m->prefill_pos3d) CK(cudaFree(m->prefill_pos3d));
-        m->prefill_pos3d = nullptr;
-        m->prefill_pos3d_cap = 0;
-        m->prefill_pos3d = static_cast<int32_t*>(device_malloc(need_p * sizeof(int32_t)));
-        m->prefill_pos3d_cap = need_p;
-      }
+      reserve_prefill_inputs(m, 0, n);
       pos3d_host.resize(need_p);
       std::memcpy(pos3d_host.data(), in->pos_3d, size_t(n) * 3 * sizeof(int32_t));
       int32_t* mtp_p = pos3d_host.data() + size_t(n) * 3;
