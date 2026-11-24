@@ -7,6 +7,7 @@
 
 #include "core/grammar/grammar.h"
 #include "core/os/os.h"
+#include "core/vision/media_span.h"
 
 namespace flyx {
 
@@ -146,13 +147,13 @@ bool Generation::start() {
   const int align = e_->prefill_align();
   for (int32_t at : req_.checkpoints) {
     at = at / align * align;
-    if (at > reused && at < n_ && !interfaces::inside_media_span(req_.media_spans, at)) cuts_.push_back(at);
+    if (at > reused && at < n_ && !vision::inside_media_span(req_.media_spans, at)) cuts_.push_back(at);
   }
   std::sort(cuts_.begin(), cuts_.end());
   cuts_.erase(std::unique(cuts_.begin(), cuts_.end()), cuts_.end());
   if (cuts_.size() > 2) cuts_.erase(cuts_.begin(), cuts_.end() - 2);
   keep_ = req_.keep_checkpoint >= 0 ? req_.keep_checkpoint / align * align : -1;
-  if (keep_ >= 0 && interfaces::inside_media_span(req_.media_spans, keep_)) keep_ = -1;
+  if (keep_ >= 0 && vision::inside_media_span(req_.media_spans, keep_)) keep_ = -1;
   pos_ = reused;
   phase_ = Phase::kPrefill;
   return true;
@@ -161,10 +162,14 @@ bool Generation::start() {
 bool Generation::prefill() {
   const auto& prompt = req_.prompt;
   const auto* media = req_.media_spans.empty() ? nullptr : &req_.media_spans;
-  if (cancelled()) {  // between passes: the state holds a valid prefix
-    s_->advanced(prompt, pos_, media);
-    if (checkpoint_due_ && !interfaces::inside_media_span(req_.media_spans, pos_))
-      s_->take_checkpoint(prompt, pos_, due_keep_, Session::Anchor::None, false, media);
+  if (cancelled()) {  // between passes: only expose live state if it does not split a MediaSpan
+    if (vision::inside_media_span(req_.media_spans, pos_)) {
+      s_->reset_after_error();
+    } else {
+      s_->advanced(prompt, pos_, media);
+      if (checkpoint_due_)
+        s_->take_checkpoint(prompt, pos_, due_keep_, Session::Anchor::None, false, media);
+    }
     result_.usage.prefill_ms = os::now_ms() - started_ms_;
     result_.usage.finish_reason = FLYX_FINISH_CANCEL;
     phase_ = Phase::kDone;
@@ -202,15 +207,30 @@ bool Generation::prefill() {
   const bool last = end == n_;
   const bool before_last = req_.prefill_only && last && n_ % align == 0 && pos_ > result_.usage.reused_tokens;
   if (checkpoint_due_ || anchor != Session::Anchor::None || before_last) {
-    s_->advanced(prompt, pos_, media);
-    if (!interfaces::inside_media_span(req_.media_spans, pos_)) {
+    if (!vision::inside_media_span(req_.media_spans, pos_)) {
+      s_->advanced(prompt, pos_, media);
       const bool share = pos_ <= req_.share_system_prefix && req_.share_system_prefix < end;
       s_->take_checkpoint(prompt, pos_, checkpoint_due_ && due_keep_, anchor, share, media);
+    } else if (checkpoint_due_ && crossed_cut_ >= 0) {
+      // Pass ended inside a MediaSpan, but its intra-pass snapshot sits at crossed_cut_ (outside any span).
+      s_->take_checkpoint(prompt, pos_, due_keep_, anchor, false, media);
     }
     checkpoint_due_ = false;
+    crossed_cut_ = -1;
   }
   const bool sample = last && !req_.prefill_only;
-  if (align > 1 && api_->prefill_snapshot && api_->prefill_snapshot(s_->seq(), crossed) != 0)
+  // Never let the backend's implicit intra-pass snapshot land inside a MediaSpan: walk backward to an aligned
+  // position outside all spans, or suppress intra-pass snapshotting so checkpoint_prompt_end() captures `end`.
+  int snap_pos = crossed;
+  if (align > 1 && api_->prefill_snapshot && snap_pos < 0 && !req_.media_spans.empty()) {
+    const int nat = end / align * align;
+    if (nat >= pos_ && nat < end && vision::inside_media_span(req_.media_spans, nat)) {
+      int b = nat - align;
+      while (b >= pos_ && vision::inside_media_span(req_.media_spans, b)) b -= align;
+      snap_pos = (b > 0 && b >= pos_) ? b : FLYX_PREFILL_SNAP_NONE;
+    }
+  }
+  if (align > 1 && api_->prefill_snapshot && api_->prefill_snapshot(s_->seq(), snap_pos) != 0)
     return fail(std::string("prefill_snapshot: ") + api_->last_error(), true);
   const bool multimodal = !req_.media_spans.empty() || !req_.prompt_embed_rows.empty() || req_.has_mrope;
   if (!multimodal) {
@@ -236,12 +256,33 @@ bool Generation::prefill() {
     }
     if (!req_.pos_3d.empty()) in.pos_3d = req_.pos_3d.data() + size_t(pos_) * 3;
     if (req_.has_mrope) {
-      if (last) {
+      auto delta_at = [&](int at, int32_t* out_delta) -> bool {
+        if (at >= 0 && size_t(at) < req_.pos_rope_deltas.size()) {
+          *out_delta = req_.pos_rope_deltas[size_t(at)];
+          return true;
+        }
+        if (at == n_) {
+          *out_delta = req_.rope_delta;
+          return true;
+        }
+        return false;
+      };
+      int32_t end_delta = 0;
+      if (!vision::inside_media_span(req_.media_spans, end) && delta_at(end, &end_delta)) {
         in.set_rope_delta = 1;
-        in.rope_delta = req_.rope_delta;
-      } else if (!interfaces::inside_media_span(req_.media_spans, end) && size_t(end) * 3 < req_.pos_3d.size()) {
-        in.set_rope_delta = 1;
-        in.rope_delta = req_.pos_3d[size_t(end) * 3] - end;
+        in.rope_delta = end_delta;
+      }
+      const int eff_snap =
+          (align <= 1 || snap_pos == FLYX_PREFILL_SNAP_NONE)
+              ? -1
+              : (snap_pos >= pos_ && snap_pos < end && snap_pos % align == 0)
+                    ? snap_pos
+                    : ((end / align * align >= pos_ && end / align * align < end) ? end / align * align : -1);
+      int32_t snap_delta = 0;
+      if (eff_snap >= 0 && !vision::inside_media_span(req_.media_spans, eff_snap) &&
+          delta_at(eff_snap, &snap_delta)) {
+        in.has_snap_rope_delta = 1;
+        in.snap_rope_delta = snap_delta;
       }
     }
     if (api_->prefill_ex(e_->prefill_plan(), s_->seq(), &in, sample ? &g_ : nullptr) != 0)
@@ -251,6 +292,7 @@ bool Generation::prefill() {
   if (req_.on_prefill) req_.on_prefill(pos_, n_);
   if (!last) {
     checkpoint_due_ = crossed >= 0 || (cut_ < cuts_.size() && cuts_[cut_] == pos_);
+    crossed_cut_ = crossed;
     due_keep_ = (crossed >= 0 ? crossed : pos_) == keep_;
     return true;
   }

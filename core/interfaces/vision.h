@@ -44,57 +44,6 @@ inline bool operator==(const MediaSpan& a, const MediaSpan& b) {
 }
 inline bool operator!=(const MediaSpan& a, const MediaSpan& b) { return !(a == b); }
 
-// Longest common token prefix between (a_tok, a_med) and (b_tok, b_med) where every
-// overlapping MediaSpan is identical and the returned length never splits inside a MediaSpan.
-inline size_t media_prefix_match(const std::vector<int32_t>& a_tok, const std::vector<MediaSpan>& a_med,
-                                 const std::vector<int32_t>& b_tok, const std::vector<MediaSpan>& b_med) {
-  size_t L = 0;
-  const size_t n = a_tok.size() < b_tok.size() ? a_tok.size() : b_tok.size();
-  while (L < n && a_tok[L] == b_tok[L]) ++L;
-  if (a_med.empty() && b_med.empty()) return L;
-  size_t i = 0;
-  while (i < a_med.size() && i < b_med.size()) {
-    const auto& ma = a_med[i];
-    const auto& mb = b_med[i];
-    const size_t a_start = size_t(ma.token_pos);
-    const size_t b_start = size_t(mb.token_pos);
-    if (a_start >= L && b_start >= L) break;
-    const size_t a_end = a_start + size_t(ma.n_tokens);
-    const size_t b_end = b_start + size_t(mb.n_tokens);
-    if (a_end > L || b_end > L || ma != mb) {
-      const size_t cut = a_start < b_start ? a_start : b_start;
-      if (cut < L) L = cut;
-      return L;
-    }
-    ++i;
-  }
-  if (i < a_med.size() && size_t(a_med[i].token_pos) < L) L = size_t(a_med[i].token_pos);
-  if (i < b_med.size() && size_t(b_med[i].token_pos) < L) L = size_t(b_med[i].token_pos);
-  return L;
-}
-
-// True iff (prefix_tok, prefix_med) is an exact token+media prefix of (prompt_tok, prompt_med).
-inline bool media_prefix_equal(const std::vector<int32_t>& prefix_tok, const std::vector<MediaSpan>& prefix_med,
-                               const std::vector<int32_t>& prompt_tok, const std::vector<MediaSpan>& prompt_med) {
-  return prefix_tok.size() <= prompt_tok.size() &&
-         media_prefix_match(prefix_tok, prefix_med, prompt_tok, prompt_med) == prefix_tok.size();
-}
-
-// Return all MediaSpans completely contained in [0, pos).
-inline std::vector<MediaSpan> slice_media_prefix(const std::vector<MediaSpan>& media, size_t pos) {
-  std::vector<MediaSpan> out;
-  for (const auto& m : media)
-    if (size_t(m.token_pos) + size_t(m.n_tokens) <= pos) out.push_back(m);
-  return out;
-}
-
-// True if token position `pos` falls strictly inside any MediaSpan (unsafe split/checkpoint point).
-inline bool inside_media_span(const std::vector<MediaSpan>& media, int32_t pos) {
-  for (const auto& m : media)
-    if (pos > m.token_pos && pos < m.token_pos + m.n_tokens) return true;
-  return false;
-}
-
 // Preprocessed patches and token expansion for one image (or video / tiled image).
 struct PreparedMedia {
   std::vector<float> patches;          // [n_patches * patch_dim], row-major
@@ -113,7 +62,9 @@ struct PreparedMedia {
 struct PromptPositions {
   bool is_3d = false;                  // false: standard 1D sequential positions
   std::vector<int32_t> pos_3d;         // when is_3d: [prompt_len * 3] = (t, h, w) per token
-  int32_t rope_delta = 0;              // scalar offset added to 1D decode positions after prompt
+  // When is_3d: [prompt_len + 1] decode rope_delta after prefix [0, p), for any non-media boundary p.
+  std::vector<int32_t> pos_rope_deltas;
+  int32_t rope_delta = 0;              // scalar offset added to 1D decode positions after prompt (= pos_rope_deltas[L])
 };
 
 // Architecture-specific vision preprocessing, placeholder expansion, and position rules.

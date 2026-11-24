@@ -6,6 +6,7 @@
 #include <cstring>
 
 #include "core/hub/sha256.h"
+#include "core/interfaces/options.h"
 #include "core/os/os.h"
 
 #define STB_IMAGE_IMPLEMENTATION
@@ -48,6 +49,10 @@ bool iequals_prefix(std::string_view s, std::string_view pfx) {
   return true;
 }
 
+bool iequals(std::string_view a, std::string_view b) {
+  return a.size() == b.size() && iequals_prefix(a, b);
+}
+
 std::string mime_from_path(const std::string& path) {
   const size_t dot = path.rfind('.');
   if (dot == std::string::npos) return "image/octet-stream";
@@ -81,17 +86,22 @@ std::array<uint8_t, 32> sha256_bytes(const void* data, size_t n) {
 
 bool decode_base64(std::string_view in, std::vector<uint8_t>* out, std::string* err) {
   out->clear();
-  out->reserve((in.size() / 4) * 3 + 3);
+  out->reserve(std::min<size_t>((in.size() / 4) * 3 + 3, kMaxRawImageBytes + 1));
   uint32_t buf = 0;
   int bits = 0;
-  bool ended = false;
+  int pad = 0;
+  size_t data_chars = 0;
   for (unsigned char c : in) {
     if (c == ' ' || c == '\t' || c == '\r' || c == '\n') continue;
     if (c == '=') {
-      ended = true;
+      ++pad;
+      if (pad > 2) {
+        if (err) *err = "invalid base64 padding";
+        return false;
+      }
       continue;
     }
-    if (ended) {
+    if (pad > 0) {
       if (err) *err = "invalid base64 data: characters after padding";
       return false;
     }
@@ -100,6 +110,7 @@ bool decode_base64(std::string_view in, std::vector<uint8_t>* out, std::string* 
       if (err) *err = "invalid base64 character";
       return false;
     }
+    ++data_chars;
     buf = (buf << 6) | uint32_t(v);
     bits += 6;
     if (bits >= 8) {
@@ -110,6 +121,14 @@ bool decode_base64(std::string_view in, std::vector<uint8_t>* out, std::string* 
         return false;
       }
     }
+  }
+  if (bits == 6 || (pad > 0 && ((data_chars + size_t(pad)) % 4 != 0))) {
+    if (err) *err = "invalid base64 length or padding";
+    return false;
+  }
+  if (bits > 0 && (buf & ((1u << bits) - 1u)) != 0) {
+    if (err) *err = "invalid base64 trailing bits";
+    return false;
   }
   if (out->empty()) {
     if (err) *err = "empty base64 image data";
@@ -137,6 +156,29 @@ bool decode_image_bytes(const uint8_t* data, size_t n, interfaces::RgbImage* out
     if (err) *err = "image dimensions too large (" + std::to_string(w) + "x" + std::to_string(h) + ")";
     return false;
   }
+  // Alpha-bearing formats (GA=2, RGBA=4) are composited onto white like PIL/transformers
+  // so dark text on transparent PNGs/GIFs does not collapse into black.
+  if (comp == 2 || comp == 4) {
+    int dw = 0, dh = 0, dcomp = 0;
+    unsigned char* rgba = stbi_load_from_memory(data, int(n), &dw, &dh, &dcomp, 4);
+    if (!rgba) {
+      if (err) *err = std::string("failed to decode image: ") + (stbi_failure_reason() ? stbi_failure_reason() : "corrupt image");
+      return false;
+    }
+    const size_t npx = size_t(dw) * size_t(dh);
+    out->width = dw;
+    out->height = dh;
+    out->rgb.resize(npx * 3);
+    for (size_t i = 0; i < npx; ++i) {
+      const uint32_t a = rgba[i * 4 + 3];
+      const uint32_t inv_a = 255u - a;
+      out->rgb[i * 3 + 0] = uint8_t((uint32_t(rgba[i * 4 + 0]) * a + 255u * inv_a + 127u) / 255u);
+      out->rgb[i * 3 + 1] = uint8_t((uint32_t(rgba[i * 4 + 1]) * a + 255u * inv_a + 127u) / 255u);
+      out->rgb[i * 3 + 2] = uint8_t((uint32_t(rgba[i * 4 + 2]) * a + 255u * inv_a + 127u) / 255u);
+    }
+    stbi_image_free(rgba);
+    return true;
+  }
   unsigned char* rgb = stbi_load_from_memory(data, int(n), &w, &h, &comp, 3);
   if (!rgb) {
     if (err) *err = std::string("failed to decode image: ") + (stbi_failure_reason() ? stbi_failure_reason() : "corrupt image");
@@ -159,10 +201,12 @@ bool make_image_from_bytes(std::vector<uint8_t> bytes, std::string mime, std::st
     if (err) *err = "image exceeds maximum allowed size (32 MiB)";
     return false;
   }
+  std::string norm_detail;
+  if (!interfaces::normalize_image_detail(detail, &norm_detail, err)) return false;
   out->sha256 = sha256_bytes(bytes.data(), bytes.size());
   out->bytes = std::move(bytes);
   out->mime = std::move(mime);
-  out->detail = std::move(detail);
+  out->detail = std::move(norm_detail);
   return true;
 }
 
@@ -182,12 +226,13 @@ bool parse_image_data_uri(std::string_view uri, interfaces::ImageInput* out, std
   }
   const std::string_view meta = uri.substr(5, comma - 5);
   const std::string_view payload = uri.substr(comma + 1);
-  const size_t semi = meta.find(';');
-  if (semi == std::string_view::npos || !iequals_prefix(meta.substr(semi + 1), "base64")) {
+  const size_t last_semi = meta.rfind(';');
+  if (last_semi == std::string_view::npos || !iequals(meta.substr(last_semi + 1), "base64")) {
     if (err) *err = "data URI must be base64-encoded (data:image/...;base64,...)";
     return false;
   }
-  std::string mime(meta.substr(0, semi));
+  const size_t first_semi = meta.find(';');
+  std::string mime(meta.substr(0, first_semi));
   if (!iequals_prefix(mime, "image/")) {
     if (err) *err = "data URI media type must be image/* (got '" + mime + "')";
     return false;

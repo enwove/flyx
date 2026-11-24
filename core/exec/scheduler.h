@@ -149,6 +149,8 @@ class Scheduler {
     std::shared_lock<std::shared_mutex> lock(engine_mu_);
     return engine_ != nullptr;
   }
+  // Thread-safe check of whether this model has an active vision encoder (survives idle unload).
+  bool has_vision() const { return has_vision_.load(); }
   // The context of a session: as asked for, or the longest that fit in GPU memory when it was not.
   int max_ctx() const { return ctx_ > 0 ? ctx_.load() : eo_.max_ctx; }
   // What the scheduler is doing and has done, and the device's live figures
@@ -196,6 +198,8 @@ class Scheduler {
   // Set and reset by the scheduler thread (or the constructor) under unique engine_mu_; other threads hold a shared
   // lock while asking the engine for device figures or compiling a request's grammar so readers never block each other.
   std::unique_ptr<Engine> engine_;
+  std::shared_ptr<const interfaces::VisionAdapter> vision_adapter_;  // kept across idle unload for count_tokens()
+  std::atomic<bool> has_vision_{false};
   BatchCostModel batch_cost_;
   mutable std::shared_mutex engine_mu_;
   Telemetry telemetry_;

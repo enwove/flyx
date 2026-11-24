@@ -207,11 +207,14 @@ class Engine {
   bool has_vision() const {
     return model_ && model_->vision() != nullptr && plans_.vision != nullptr && api_ && api_->encode_vision != nullptr;
   }
-  // Compute per-image merged visual token budget from detail level, context size, image count, and vision_max_tokens.
+  // Compute per-image merged visual token budget from detail level, context size, and vision_max_tokens.
+  static int image_token_budget_for(int max_ctx, int vision_max_tokens, const std::string& detail);
   int image_token_budget(const std::string& detail, size_t n_images) const;
   // Decode, preprocess, and encode one image into projected embeddings (cached by SHA-256 + detail + max_tokens).
+  // When client_error is non-null, sets *client_error = true for malformed input / missing vision encoder and
+  // false for internal backend failures.
   bool encode_image(const interfaces::ImageInput& img, int max_tokens, std::shared_ptr<const vision::CachedVision>* out,
-                    std::string* err) const;
+                    std::string* err, bool* client_error = nullptr) const;
   // Prefill passes reproduce a longer pass bit for bit when they start at a multiple of this.
   int prefill_align() const { return prefill_align_; }
   // Rows per prefill pass: the option, as a multiple of prefill_align().

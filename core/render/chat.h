@@ -39,6 +39,7 @@ using interfaces::ToolCall;
 // With no messages, tool_count definitions belong to the prefix.
 struct ChatCachePoint {
   size_t messages = 0, content_bytes = 0, reasoning_bytes = 0, calls = 0, tool_count = 0;
+  size_t parts = 0;  // when > 0, number of leading ContentParts in the last message
 };
 
 class ChatTemplate {

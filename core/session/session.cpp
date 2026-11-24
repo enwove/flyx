@@ -3,6 +3,8 @@
 
 #include <algorithm>
 
+#include "core/vision/media_span.h"
+
 namespace flyx {
 
 Session::~Session() {
@@ -38,7 +40,7 @@ bool Session::init(std::string* err) {
 size_t Session::common_prefix(const std::vector<int32_t>& prompt,
                               const std::vector<interfaces::MediaSpan>* media) const {
   static const std::vector<interfaces::MediaSpan> kEmptyMedia;
-  return interfaces::media_prefix_match(tokens_, media_, prompt, media ? *media : kEmptyMedia);
+  return vision::media_prefix_match(tokens_, media_, prompt, media ? *media : kEmptyMedia);
 }
 
 std::vector<int32_t> Session::tokenize(const std::string& text, const std::vector<TextSpan>* literal,
@@ -96,7 +98,7 @@ void Session::cut_checkpoints(int pos) {
 void Session::advanced(const std::vector<int32_t>& prompt, int pos,
                        const std::vector<interfaces::MediaSpan>* media) {
   tokens_.assign(prompt.begin(), prompt.begin() + pos);
-  if (media) media_ = interfaces::slice_media_prefix(*media, size_t(pos));
+  if (media) media_ = vision::slice_media_prefix(*media, size_t(pos));
   else media_.clear();
   state_pos_ = pos;
 }
@@ -110,7 +112,7 @@ void Session::record(const flyx_round_result& r, int round) {
 
 void Session::rolled_back(int pos) {
   tokens_.resize(size_t(pos) + 1);
-  media_ = interfaces::slice_media_prefix(media_, size_t(pos));
+  media_ = vision::slice_media_prefix(media_, size_t(pos));
   rounds_.cut(tokens_.size());
   state_pos_ = pos;
   cut_checkpoints(pos);
@@ -158,7 +160,7 @@ bool Session::take_checkpoint(const std::vector<int32_t>& prompt, int pos, bool 
   if (slot < 0) return false;
   // The backend may keep an earlier position (a chunk boundary a fresh prefill reproduces exactly).
   const int at = e_->api()->checkpoint(seq_, slot);
-  if (at < 0 || at > pos || interfaces::inside_media_span(pm, at)) {
+  if (at < 0 || at > pos || vision::inside_media_span(pm, at)) {
     ck_[slot] = {};
     return false;
   }
@@ -166,7 +168,7 @@ bool Session::take_checkpoint(const std::vector<int32_t>& prompt, int pos, bool 
     for (auto& c : ck_) c.keep = false;
   if (anchor == Anchor::System)
     for (auto& c : ck_) c.system = false;
-  ck_[slot] = {true, {prompt.begin(), prompt.begin() + at}, interfaces::slice_media_prefix(pm, size_t(at)),
+  ck_[slot] = {true, {prompt.begin(), prompt.begin() + at}, vision::slice_media_prefix(pm, size_t(at)),
                ++ck_clock_, keep, anchor == Anchor::System};
   if (anchor != Anchor::None && disk_cache() && at > 0) {
     std::string why;
@@ -212,7 +214,7 @@ int Session::save_to(SnapshotStore& store, std::string* why, const SnapshotStore
   auto current = [&](int c) {
     const Ckpt& k = ck_[c];
     return k.valid && k.prefix.size() >= kSnapshotWorth &&
-           interfaces::media_prefix_equal(k.prefix, k.media, tokens_, media_);
+           vision::media_prefix_equal(k.prefix, k.media, tokens_, media_);
   };
   int kept = -1, newest = -1;
   for (int c = 0; c < FLYX_CHECKPOINTS; ++c) {
@@ -307,7 +309,7 @@ std::pair<int, int> Session::checkpoint_for(const std::vector<int32_t>& prompt, 
     const auto& ck = ck_[c];
     const int pos = static_cast<int>(ck.prefix.size());
     if (!ck.valid || pos > limit || pos <= best_pos) continue;
-    if (interfaces::media_prefix_equal(ck.prefix, ck.media, prompt, media)) {
+    if (vision::media_prefix_equal(ck.prefix, ck.media, prompt, media)) {
       best = c;
       best_pos = pos;
     }
@@ -350,7 +352,7 @@ int Session::prepare(const std::vector<int32_t>& prompt, std::string* how, std::
     if (auto got = load_snapshot(prompt, n - 1, state_pos_, pm, how, err)) return *got;
     *how = state_pos_ == 0 ? (tokens_.empty() ? "cold start" : "nothing reusable") : "continued the live state";
     tokens_.resize(state_pos_);
-    media_ = interfaces::slice_media_prefix(pm, size_t(state_pos_));
+    media_ = vision::slice_media_prefix(pm, size_t(state_pos_));
     rounds_.cut(tokens_.size());
     return state_pos_;
   }
@@ -370,7 +372,7 @@ int Session::prepare(const std::vector<int32_t>& prompt, std::string* how, std::
     state_pos_ = L;
     cut_checkpoints(L);
     tokens_.resize(L);
-    media_ = interfaces::slice_media_prefix(pm, size_t(L));
+    media_ = vision::slice_media_prefix(pm, size_t(L));
     rounds_.cut(tokens_.size());
     // A stored snapshot may hold more of the prompt than the session shares with it (another conversation's).
     if (auto got = load_snapshot(prompt, n - 1, L, pm, how, err)) {
@@ -396,7 +398,7 @@ int Session::prepare(const std::vector<int32_t>& prompt, std::string* how, std::
     *how = "recomputed from the start" + at + ", no checkpoint at or before it";
   }
   tokens_.assign(prompt.begin(), prompt.begin() + state_pos_);
-  media_ = interfaces::slice_media_prefix(pm, size_t(state_pos_));
+  media_ = vision::slice_media_prefix(pm, size_t(state_pos_));
   cut_checkpoints(state_pos_);
   rounds_.cut(tokens_.size());
   return state_pos_;

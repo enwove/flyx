@@ -1,9 +1,11 @@
 // Copyright 2026 The flyx Authors. SPDX-License-Identifier: Apache-2.0
 #include "core/render/chat_json.h"
 
+#include <cctype>
 #include <memory>
 #include <set>
 
+#include "core/interfaces/options.h"
 #include "core/vision/image.h"
 
 namespace flyx {
@@ -30,6 +32,14 @@ bool parse_arguments(const ojson& a, ojson* out, std::string* err) {
   return true;
 }
 
+bool iequals_prefix(std::string_view s, std::string_view pfx) {
+  if (s.size() < pfx.size()) return false;
+  for (size_t i = 0; i < pfx.size(); ++i)
+    if (std::tolower(static_cast<unsigned char>(s[i])) != std::tolower(static_cast<unsigned char>(pfx[i])))
+      return false;
+  return true;
+}
+
 bool parse_image_part(const ojson& part, const std::string& type, std::shared_ptr<const ImageInput>* out,
                       std::string* err) {
   ImageInput img;
@@ -41,23 +51,33 @@ bool parse_image_part(const ojson& part, const std::string& type, std::shared_pt
       url = it->get<std::string>();
     } else if (it->is_object()) {
       url = str_or(*it, "url");
-      detail = str_or(*it, "detail");
+      if (it->contains("detail") && !(*it)["detail"].is_null()) {
+        if (!(*it)["detail"].is_string()) return *err = "image_url.detail must be a string", false;
+        detail = (*it)["detail"].get<std::string>();
+      }
     } else {
       return *err = "image_url must be a string or an object with 'url'", false;
     }
     if (!vision::parse_image_data_uri(url, &img, err)) return false;
-    img.detail = std::move(detail);
+    if (!interfaces::normalize_image_detail(detail, &img.detail, err)) return false;
   } else if (type == "input_image") {
     std::string url = str_or(part, "image_url");
     if (url.empty()) return *err = "input_image part missing 'image_url' data URI", false;
     if (!vision::parse_image_data_uri(url, &img, err)) return false;
-    img.detail = str_or(part, "detail");
+    std::string detail;
+    if (part.contains("detail") && !part["detail"].is_null()) {
+      if (!part["detail"].is_string()) return *err = "input_image.detail must be a string", false;
+      detail = part["detail"].get<std::string>();
+    }
+    if (!interfaces::normalize_image_detail(detail, &img.detail, err)) return false;
   } else if (type == "image") {
     const auto src = part.find("source");
     if (src != part.end() && src->is_object()) {
       const std::string stype = str_or(*src, "type");
       if (stype == "base64") {
         const std::string media = str_or(*src, "media_type");
+        if (!media.empty() && !iequals_prefix(media, "image/"))
+          return *err = "image source.media_type must be image/* (got '" + media + "')", false;
         const std::string data = str_or(*src, "data");
         if (data.empty()) return *err = "image source missing base64 'data'", false;
         std::vector<uint8_t> bytes;
@@ -154,7 +174,9 @@ bool messages_from_openai(const ojson& messages, std::vector<ChatMessage>* out, 
     cm.role = str_or(m, "role");
     if (cm.role == "developer") cm.role = "system";
     if (cm.role == "function") cm.role = "tool";
-    if (m.contains("content") && !parse_content_parts(m["content"], &cm.content, &cm.parts, true, err)) return false;
+    const bool allow_images = (cm.role == "user" || cm.role == "tool");
+    if (m.contains("content") && !parse_content_parts(m["content"], &cm.content, &cm.parts, allow_images, err))
+      return false;
     for (const char* key : {"reasoning_content", "reasoning"})
       if (m.contains(key) && m[key].is_string()) {
         cm.reasoning = m[key].get<std::string>();
@@ -306,7 +328,7 @@ bool messages_from_responses(const std::string& instructions, const ojson& items
       std::string role = str_or(it, "role"), text;
       std::vector<ContentPart> parts;
       const auto content = it.find("content");
-      if (content != it.end() && !parse_content_parts(*content, &text, &parts, role != "assistant", err)) return false;
+      if (content != it.end() && !parse_content_parts(*content, &text, &parts, role == "user", err)) return false;
       if (role == "assistant") {
         ChatMessage& m = assistant(open && !out->back().tool_calls.empty());  // text after calls starts a turn
         m.content += text;
@@ -482,7 +504,8 @@ struct AnthropicCache {
   }
   void mark_end(const ojson& block, size_t count, const ChatMessage& m) const {
     if (marked(block))
-      points->push_back({count, m.content.size(), m.reasoning ? m.reasoning->size() : 0, m.tool_calls.size()});
+      points->push_back(
+          {count, m.content.size(), m.reasoning ? m.reasoning->size() : 0, m.tool_calls.size(), 0, m.parts.size()});
   }
 };
 
@@ -552,7 +575,10 @@ bool parse_anthropic_user(const ojson& m, const ojson& content, const AnthropicC
   std::string text;
   std::vector<ContentPart> user_parts;
   bool has_user_image = false;
-  std::vector<std::pair<size_t, size_t>> marked_text;
+  struct UserMark {
+    size_t prior = 0, text_bytes = 0, part_count = 0;
+  };
+  std::vector<UserMark> marked_blocks;
   for (const auto& b : content) {
     const std::string type = str_or(b, "type");
     if (type == "tool_result") {
@@ -571,13 +597,15 @@ bool parse_anthropic_user(const ojson& m, const ojson& content, const AnthropicC
       const std::string s = str_or(b, "text");
       text += s;
       user_parts.push_back(ContentPart::make_text(s));
-      if (cache.marked(b) && marked_text.size() < AnthropicCache::kLimit)
-        marked_text.emplace_back(out->size(), text.size());
+      if (cache.marked(b) && marked_blocks.size() < AnthropicCache::kLimit)
+        marked_blocks.push_back({out->size(), text.size(), user_parts.size()});
     } else if (type == "image") {
       std::shared_ptr<const ImageInput> img;
       if (!parse_image_part(b, type, &img, err)) return false;
       has_user_image = true;
       user_parts.push_back(ContentPart::make_image(std::move(img)));
+      if (cache.marked(b) && marked_blocks.size() < AnthropicCache::kLimit)
+        marked_blocks.push_back({out->size(), text.size(), user_parts.size()});
     } else {
       return *err = "user content block of type '" + type + "' is not supported (text, image and tool results only)",
              false;
@@ -587,16 +615,16 @@ bool parse_anthropic_user(const ojson& m, const ojson& content, const AnthropicC
     ChatMessage um{"user", std::move(text), std::nullopt, {}, ""};
     if (has_user_image) um.parts = std::move(user_parts);
     out->push_back(std::move(um));
-    for (const auto& [prior, bytes] : marked_text) {
+    for (const auto& mk : marked_blocks) {
       if (cache.points->size() == AnthropicCache::kLimit) break;
-      if (prior + 1 == out->size()) {
-        cache.points->push_back({out->size(), bytes});
-      } else if (prior > 0) {
+      if (mk.prior + 1 == out->size()) {
+        cache.points->push_back({out->size(), mk.text_bytes, 0, 0, 0, has_user_image ? mk.part_count : 0});
+      } else if (mk.prior > 0) {
         // A later tool result renders before this text. Only the messages ahead of that tool belong
         // to the stable prefix; the full rendered input remains exactly as for an unmarked request.
-        const auto& last = (*out)[prior - 1];
-        cache.points->push_back({prior, last.content.size(), last.reasoning ? last.reasoning->size() : 0,
-                                 last.tool_calls.size()});
+        const auto& last = (*out)[mk.prior - 1];
+        cache.points->push_back({mk.prior, last.content.size(), last.reasoning ? last.reasoning->size() : 0,
+                                 last.tool_calls.size(), 0, last.parts.size()});
       }
     }
   }

@@ -177,9 +177,29 @@ bool parse_name(const std::string& s, Name* out) {
   return true;
 }
 
+bool mmproj_gguf_name(const std::string& path) {
+  const std::string p = detail::lower(path), base = detail::base_name(p);
+  if (!base.ends_with(".gguf") || base.find("imatrix") != std::string::npos || base.starts_with("mtp-") ||
+      p.starts_with("mtp/") || p.find("/mtp/") != std::string::npos)
+    return false;
+  if (p.starts_with("mmproj/") || p.find("/mmproj/") != std::string::npos) return true;
+  for (size_t pos = 0; (pos = base.find("mmproj", pos)) != std::string::npos; pos += 6) {
+    const bool left_ok = (pos == 0 || kSep.find(base[pos - 1]) != std::string_view::npos);
+    const size_t after = pos + 6;
+    const bool right_ok = (after == base.size() || kSep.find(base[after]) != std::string_view::npos);
+    if (!left_ok || !right_ok) continue;
+    const std::string_view prefix(base.data(), pos);
+    if (prefix.ends_with("no-") || prefix.ends_with("no_") || prefix.ends_with("without-") ||
+        prefix.ends_with("without_"))
+      continue;
+    return true;
+  }
+  return false;
+}
+
 bool model_gguf_name(const std::string& path) {
   const std::string p = detail::lower(path), base = detail::base_name(p);
-  if (!base.ends_with(".gguf") || base.find("mmproj") != std::string::npos ||
+  if (!base.ends_with(".gguf") || mmproj_gguf_name(path) ||
       base.find("imatrix") != std::string::npos || base.starts_with("mtp-"))
     return false;
   return !p.starts_with("mtp/") && p.find("/mtp/") == std::string::npos;
@@ -259,11 +279,12 @@ const RepoFile* mtp_file(const Repo& r) {
 
 const RepoFile* mmproj_file(const Repo& r) {
   auto rank = [](const std::string& path) -> int {
+    if (!mmproj_gguf_name(path)) return -1;
     const std::string base = detail::lower(detail::base_name(path));
-    if (!base.ends_with(".gguf") || base.find("mmproj") == std::string::npos) return -1;
-    if (base.find("bf16") != std::string::npos) return 4;
-    if (base.find("f16") != std::string::npos || base.find("fp16") != std::string::npos) return 3;
-    if (base.find("f32") != std::string::npos) return 2;
+    if (base.find("bf16") != std::string::npos) return 5;
+    if (base.find("f16") != std::string::npos || base.find("fp16") != std::string::npos) return 4;
+    if (base.find("f32") != std::string::npos || base.find("fp32") != std::string::npos) return 3;
+    if (base.find("q8_0") != std::string::npos || base.find("q8") != std::string::npos) return 2;
     return 1;
   };
   const RepoFile* best = nullptr;

@@ -594,14 +594,16 @@ struct ChatTemplate::Impl {
                                       {tools.begin(), tools.begin() + h.tool_count}, opt);
       } else if (h.messages && h.messages <= n) {
         const auto& m = msgs[h.messages - 1];
+        const bool parts_whole = m.parts.empty() || h.parts >= m.parts.size();
         const bool whole = h.content_bytes == m.content.size() && h.calls == m.tool_calls.size() &&
-                           h.reasoning_bytes == (m.reasoning ? m.reasoning->size() : 0);
+                           h.reasoning_bytes == (m.reasoning ? m.reasoning->size() : 0) && parts_whole;
         if (whole && h.messages == n && end) {
           at = *end;
         } else {
           std::vector<ChatMessage> part(msgs.begin(), msgs.begin() + h.messages);
           auto& last = part.back();
           last.content.resize(std::min(last.content.size(), h.content_bytes));
+          if (!last.parts.empty()) last.parts.resize(std::min(last.parts.size(), h.parts));
           // Some templates render tools after the system text. For a mark on that text, discover where
           // it ends before any following tool definitions, independently of the combined system/tool root.
           if (last.role == "system") last.content += '\x01';

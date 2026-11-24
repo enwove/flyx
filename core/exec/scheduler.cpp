@@ -190,6 +190,9 @@ bool Scheduler::load(std::string* err) {
   {
     std::unique_lock<std::shared_mutex> lock(engine_mu_);
     max_sessions_ = std::max(1, std::min(wanted, e->sessions_that_fit()));
+    const bool has_v = e->has_vision();
+    has_vision_.store(has_v);
+    vision_adapter_ = has_v ? e->model().vision_shared() : nullptr;
     engine_ = std::move(e);
   }
   batch_cost_.build(engine_->widths(), engine_->round_drafters(), engine_->round_ms(), engine_->lookup_widths(),
@@ -324,20 +327,47 @@ void Scheduler::cancel(Job* job) {
 int Scheduler::count_tokens(const Request& in, std::string* err) {
   RenderedChat rc;
   if (!render_request(chat_, tok_, in, &rc, err, false)) return -1;
-  int total = static_cast<int>(tok_.encode(rc.text, &rc.literal).size());
+  const std::vector<int32_t> base = tok_.encode(rc.text, &rc.literal);
+  int total = static_cast<int>(base.size());
   if (!rc.images.empty()) {
-    std::shared_lock<std::shared_mutex> lock(engine_mu_);
-    if (!engine_ || !engine_->has_vision()) {
+    std::shared_ptr<const interfaces::VisionAdapter> va;
+    int budget_ctx = max_ctx();
+    int vmax = eo_.vision_max_tokens;
+    {
+      std::shared_lock<std::shared_mutex> lock(engine_mu_);
+      va = vision_adapter_;
+      if (engine_) {
+        budget_ctx = engine_->options().max_ctx;
+        vmax = engine_->options().vision_max_tokens;
+      }
+    }
+    if (!va) {
       *err = "this model has no vision encoder loaded (pass --mmproj <mmproj.gguf>)";
       return -1;
+    }
+    bool exact_offsets = true;
+    for (const auto& ri : rc.images)
+      if (ri.byte_offset == std::string::npos || ri.byte_end == std::string::npos || ri.byte_end < ri.byte_offset ||
+          ri.byte_end > rc.text.size())
+        exact_offsets = false;
+    if (!exact_offsets) {
+      const int32_t ph = va->placeholder_token();
+      size_t found = 0;
+      for (int32_t id : base)
+        if (id == ph) ++found;
+      if (found != rc.images.size()) {
+        *err = "chat template emitted " + std::to_string(found) + " image placeholders for " +
+               std::to_string(rc.images.size()) + " images";
+        return -1;
+      }
     }
     for (const auto& ri : rc.images) {
       if (!ri.image) return *err = "missing image data in multimodal message", -1;
       interfaces::RgbImage rgb;
       if (!vision::decode_image_bytes(ri.image->bytes.data(), ri.image->bytes.size(), &rgb, err)) return -1;
-      const int budget = engine_->image_token_budget(ri.image->detail, rc.images.size());
+      const int budget = Engine::image_token_budget_for(budget_ctx, vmax, ri.image->detail);
       interfaces::PreparedMedia pm;
-      if (!engine_->model().vision()->preprocess(rgb, budget, &pm, err)) return -1;
+      if (!va->preprocess(rgb, budget, &pm, err)) return -1;
       total += static_cast<int>(pm.tokens.size()) - 1;  // replaces the single placeholder token
     }
   }

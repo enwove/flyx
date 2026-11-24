@@ -134,7 +134,8 @@ Config read_gguf_config(const ModelFile& file) {
   }
   if (m.has("rope.dimension_sections")) {
     const auto& sec = m.at("rope.dimension_sections");
-    if (sec.is_array() && sec.size() >= 3) {
+    if (sec.is_array() && sec.size() >= 3 && sec[0].is_number_integer() && sec[1].is_number_integer() &&
+        sec[2].is_number_integer()) {
       const int s0 = sec[0].get<int>(), s1 = sec[1].get<int>(), s2 = sec[2].get<int>();
       if (s0 > 0 && s1 > 0 && s2 > 0 && s0 + s1 + s2 == f.rot_dim / 2) {
         f.mrope_section[0] = s0;
@@ -186,16 +187,32 @@ void read_gguf_mmproj(const json& h, int companion_idx, const Config& f, VisionC
                              ") does not match model hidden size (" + std::to_string(f.hidden) + ")");
   if (v.hidden % v.n_heads != 0) throw std::runtime_error(what + "mmproj hidden not divisible by head_count");
   v.head_dim = v.hidden / v.n_heads;
-  if (v.head_dim % 4 != 0 || v.hidden > kMaxWidth || v.inter > kMaxWidth || v.depth > kMaxLayers)
+  if (v.head_dim % 4 != 0 || v.hidden > kMaxWidth || v.inter > kMaxWidth || v.depth > kMaxLayers ||
+      v.patch_size > 64 || v.merge_size > 16)
     throw std::runtime_error(what + "invalid mmproj vision dimensions");
   if (g.contains("clip.vision.attention.layer_norm_epsilon") && g["clip.vision.attention.layer_norm_epsilon"].is_number())
     v.eps = g["clip.vision.attention.layer_norm_epsilon"].get<double>();
+  if (!(v.eps > 0.0) || !std::isfinite(v.eps))
+    throw std::runtime_error(what + "invalid mmproj layer_norm_epsilon");
   if (g.contains("clip.vision.image_mean") && g["clip.vision.image_mean"].is_array() &&
-      g["clip.vision.image_mean"].size() == 3)
-    for (int c = 0; c < 3; ++c) v.mean[c] = g["clip.vision.image_mean"][size_t(c)].get<float>();
+      g["clip.vision.image_mean"].size() == 3) {
+    for (int c = 0; c < 3; ++c) {
+      if (!g["clip.vision.image_mean"][size_t(c)].is_number())
+        throw std::runtime_error(what + "invalid mmproj image_mean");
+      v.mean[c] = g["clip.vision.image_mean"][size_t(c)].get<float>();
+      if (!std::isfinite(v.mean[c])) throw std::runtime_error(what + "non-finite mmproj image_mean");
+    }
+  }
   if (g.contains("clip.vision.image_std") && g["clip.vision.image_std"].is_array() &&
-      g["clip.vision.image_std"].size() == 3)
-    for (int c = 0; c < 3; ++c) v.std[c] = g["clip.vision.image_std"][size_t(c)].get<float>();
+      g["clip.vision.image_std"].size() == 3) {
+    for (int c = 0; c < 3; ++c) {
+      if (!g["clip.vision.image_std"][size_t(c)].is_number())
+        throw std::runtime_error(what + "invalid mmproj image_std");
+      v.std[c] = g["clip.vision.image_std"][size_t(c)].get<float>();
+      if (!(v.std[c] > 0.0f) || !std::isfinite(v.std[c]))
+        throw std::runtime_error(what + "invalid mmproj image_std");
+    }
+  }
   if (g.contains("clip.vision.is_deepstack_layers") && g["clip.vision.is_deepstack_layers"].is_array()) {
     for (const auto& flag : g["clip.vision.is_deepstack_layers"]) {
       const bool on = (flag.is_boolean() && flag.get<bool>()) ||
@@ -276,6 +293,19 @@ Config read_config(const json& h) {
   for (const auto& t : lt) {
     if (t != "attn" && t != "gdn") throw std::runtime_error("unknown layer_types entry: " + t);
     f.is_attn.push_back(t == "attn");
+  }
+  if (c.contains("mrope_section") && c["mrope_section"].is_array() && c["mrope_section"].size() >= 3 &&
+      c["mrope_section"][0].is_number_integer() && c["mrope_section"][1].is_number_integer() &&
+      c["mrope_section"][2].is_number_integer()) {
+    const int s0 = c["mrope_section"][0].get<int>();
+    const int s1 = c["mrope_section"][1].get<int>();
+    const int s2 = c["mrope_section"][2].get<int>();
+    if (s0 > 0 && s1 > 0 && s2 > 0 && s0 + s1 + s2 == f.rot_dim / 2) {
+      f.mrope_section[0] = s0;
+      f.mrope_section[1] = s1;
+      f.mrope_section[2] = s2;
+      f.mrope_interleaved = true;
+    }
   }
   validate_config(f);
   return f;
@@ -494,12 +524,12 @@ void Qwen35::build_vision(const ModelFile& file, const Config& c) {
   const int in_dim = temporal * slice_dim;
 
   const flyx_tensor_view* pos_t = file.tensor(vn("v.position_embd.weight"));
-  if (!pos_t || pos_t->ndim != 2 || pos_t->shape[1] != H)
+  if (!pos_t || pos_t->ndim != 2 || pos_t->shape[0] <= 0 || pos_t->shape[0] > INT_MAX || pos_t->shape[1] != H)
     throw std::runtime_error("mmproj: missing or invalid v.position_embd.weight");
   const int num_pos = int(pos_t->shape[0]);
   const int pos_side = int(std::llround(std::sqrt(double(num_pos))));
-  if (pos_side * pos_side != num_pos)
-    throw std::runtime_error("mmproj: v.position_embd.weight row count is not a square");
+  if (pos_side <= 0 || int64_t(pos_side) * pos_side != num_pos)
+    throw std::runtime_error("mmproj: v.position_embd.weight row count is not a positive square");
 
   std::vector<flyx_node> vnodes;
   // 1. Stem: Conv3d patch embedding (split into t=0 and t=1 in mmproj GGUF) + bias + 2D bilinear pos_embed
@@ -607,6 +637,17 @@ bool Qwen35::build(const ModelFile& file, const ModelOptions& o, std::string* er
   const json& h = file.header();
   Config c = GgufMeta::is(file) ? read_gguf_config(file) : read_config(h);
   take_companions(file, &c, o.vision);
+  if (c.vision.enabled && !c.mrope_interleaved) {
+    // Qwen3.5 / Qwen3.8 checkpoints converted to .flyx before mrope_section was serialized use rot_dim=64 [11, 11, 10].
+    if (!c.gguf && c.rot_dim == 64) {
+      c.mrope_section[0] = 11;
+      c.mrope_section[1] = 11;
+      c.mrope_section[2] = 10;
+      c.mrope_interleaved = true;
+    } else {
+      return *err = "vision encoder requires 3D MRoPE sections (rope.dimension_sections / mrope_section)", false;
+    }
+  }
   trained_ctx_ = c.trained_ctx;
   gguf_ = c.gguf;
   mtp_companion_ = c.mtp_companion;

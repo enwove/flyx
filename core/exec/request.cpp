@@ -91,8 +91,9 @@ bool prepare_multimodal_prompt(Engine& e, const Session& s, const RenderedChat& 
       return false;
     }
     const int budget = e.image_token_budget(rc.images[i].image->detail, n_imgs);
-    if (!e.encode_image(*rc.images[i].image, budget, &encoded[i], err)) {
-      out->invalid = true;
+    bool client_err = true;
+    if (!e.encode_image(*rc.images[i].image, budget, &encoded[i], err, &client_err)) {
+      out->invalid = client_err;
       return false;
     }
   }
@@ -116,7 +117,8 @@ bool prepare_multimodal_prompt(Engine& e, const Session& s, const RenderedChat& 
     const auto& hmed = s.history_media();
     bool reuse_history = !htext.empty() && rc.text.size() >= htext.size() &&
                          rc.text.compare(0, htext.size(), htext) == 0 && himgs.size() <= n_imgs &&
-                         hmed.size() == himgs.size();
+                         hmed.size() == himgs.size() &&
+                         (himgs.size() == n_imgs || rc.images[himgs.size()].byte_offset >= htext.size());
     for (size_t k = 0; reuse_history && k < himgs.size(); ++k) {
       const auto &ha = himgs[k], &rb = rc.images[k];
       if (!ha.image || !rb.image || ha.byte_offset != rb.byte_offset || ha.byte_end != rb.byte_end ||
@@ -224,6 +226,7 @@ bool prepare_multimodal_prompt(Engine& e, const Session& s, const RenderedChat& 
   auto pp = e.model().vision()->build_positions(gen.prompt, gen.media_spans);
   gen.has_mrope = pp.is_3d;
   gen.pos_3d = std::move(pp.pos_3d);
+  gen.pos_rope_deltas = std::move(pp.pos_rope_deltas);
   gen.rope_delta = pp.rope_delta;
   gen.rendered_text = rc.text;
   gen.rendered_images = rc.images;
@@ -243,8 +246,21 @@ bool render_request(const ChatTemplate& chat, const Tokenizer& tok, const Reques
     std::vector<ChatMessage> messages{rq.messages.front()};
     auto next = rq.messages.begin() + 1;
     for (; next != rq.messages.end() && next->role == "system"; ++next) {
-      messages.front().content += "\n\n";
-      messages.front().content += next->content;
+      if (!messages.front().parts.empty() || !next->parts.empty()) {
+        if (messages.front().parts.empty() && !messages.front().content.empty()) {
+          messages.front().parts.push_back(interfaces::ContentPart::make_text(messages.front().content));
+          messages.front().content.clear();
+        }
+        messages.front().parts.push_back(interfaces::ContentPart::make_text("\n\n"));
+        if (!next->parts.empty()) {
+          messages.front().parts.insert(messages.front().parts.end(), next->parts.begin(), next->parts.end());
+        } else if (!next->content.empty()) {
+          messages.front().parts.push_back(interfaces::ContentPart::make_text(next->content));
+        }
+      } else {
+        messages.front().content += "\n\n";
+        messages.front().content += next->content;
+      }
     }
     messages.insert(messages.end(), next, rq.messages.end());
     std::string retry_error;

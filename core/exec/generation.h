@@ -93,6 +93,7 @@ struct GenerateRequest {
   std::vector<float> prompt_embeds;          // [prompt_embed_rows.size() * hidden], row-major
   std::vector<int32_t> prompt_embed_rows;    // sorted ascending absolute token indices in `prompt`
   std::vector<int32_t> pos_3d;               // optional [prompt.size() * 3] = (t, h, w) per token
+  std::vector<int32_t> pos_rope_deltas;      // optional [prompt.size() + 1] decode rope_delta per boundary
   int32_t rope_delta = 0;                    // scalar decode offset after prompt when has_mrope
   bool has_mrope = false;
   std::string rendered_text;                 // unexpanded template text (for multimodal history_text_)
@@ -218,6 +219,7 @@ class Generation {
   int pos_ = 0;                    // prompt tokens given to the device
   int keep_ = -1;                  // the cut whose checkpoint is kept
   bool checkpoint_due_ = false;    // the pass in flight ends at a cut, or crosses one: its checkpoint, once it has run
+  int crossed_cut_ = -1;           // when >= 0, the intra-pass cut that checkpoint_due_ will capture
   bool due_keep_ = false;          // that checkpoint is the kept one (keep_)
   bool end_keep_ = false;          // the last pass crossed keep_: the checkpoint after the first token is the kept one
   // reply

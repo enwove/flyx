@@ -83,6 +83,8 @@ class Model {
 
   // Optional multimodal vision encoder (null / empty for text-only models or when ModelOptions::vision == false).
   virtual const VisionAdapter* vision() const { return nullptr; }
+  // Shared handle to the lightweight VisionAdapter metadata (survives idle engine unload in Scheduler::count_tokens).
+  virtual std::shared_ptr<const VisionAdapter> vision_shared() const { return nullptr; }
   // Vision encoder execution graph (FLYX_PHASE_VISION): stem -> ViT layers -> projector/merger.
   virtual std::vector<flyx_node> vision_program() const { return {}; }
 };

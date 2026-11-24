@@ -12,6 +12,7 @@
 #include "core/os/os.h"
 #include "core/os/path.h"
 #include "core/resources/ledger.h"
+#include "core/vision/media_span.h"
 
 namespace flyx {
 
@@ -350,7 +351,7 @@ bool SnapshotStore::put(const flyx_backend_api* api, flyx_seq* seq, int slot, co
   if (staging_only && (!disk_enabled() || !disk_tip))
     return *why = "staging decoded rows requires a disk lineage", false;
   Entry* parent = disk_tip ? by_id(ancestor(*disk_tip, prefix.size())) : nullptr;
-  while (parent && (!interfaces::media_prefix_equal(parent->prefix, parent->media, prefix, media) ||
+  while (parent && (!vision::media_prefix_equal(parent->prefix, parent->media, prefix, media) ||
                     !available(*parent))) {
     if (!disk_enabled()) return *why = kDiskFailed, false;
     parent = by_id(parent->parent);
@@ -597,7 +598,7 @@ const SnapshotStore::Entry* SnapshotStore::find(const std::vector<int32_t>& prom
   for (const auto& e : entries_) {
     const size_t n = e->prefix.size();
     if (e->staging_only || n <= floor || n > limit || n > prompt.size() || (best && n < best->prefix.size())) continue;
-    if (interfaces::media_prefix_equal(e->prefix, e->media, prompt, pm) && available(*e)) best = e.get();
+    if (vision::media_prefix_equal(e->prefix, e->media, prompt, pm) && available(*e)) best = e.get();
   }
   discard_failed_ranges();
   return best;

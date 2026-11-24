@@ -61,10 +61,10 @@ std::vector<float> resize_bicubic_rgb(const uint8_t* src, int sw, int sh, int dw
   }
   // Horizontal pass: [sh, sw, 3] -> [sh, dw, 3]
   const auto x_taps = build_bicubic_taps(sw, dw);
-  std::vector<double> tmp(size_t(sh) * size_t(dw) * 3, 0.0);
+  std::vector<float> tmp(size_t(sh) * size_t(dw) * 3, 0.0f);
   for (int y = 0; y < sh; ++y) {
     const uint8_t* srow = src + size_t(y) * size_t(sw) * 3;
-    double* drow = tmp.data() + size_t(y) * size_t(dw) * 3;
+    float* drow = tmp.data() + size_t(y) * size_t(dw) * 3;
     for (int x = 0; x < dw; ++x) {
       const Tap& t = x_taps[size_t(x)];
       double c0 = 0.0, c1 = 0.0, c2 = 0.0;
@@ -75,9 +75,9 @@ std::vector<float> resize_bicubic_rgb(const uint8_t* src, int sw, int sh, int dw
         c1 += w * double(p[1]);
         c2 += w * double(p[2]);
       }
-      drow[size_t(x) * 3 + 0] = c0;
-      drow[size_t(x) * 3 + 1] = c1;
-      drow[size_t(x) * 3 + 2] = c2;
+      drow[size_t(x) * 3 + 0] = float(c0);
+      drow[size_t(x) * 3 + 1] = float(c1);
+      drow[size_t(x) * 3 + 2] = float(c2);
     }
   }
   // Vertical pass: [sh, dw, 3] -> [dh, dw, 3]
@@ -90,10 +90,10 @@ std::vector<float> resize_bicubic_rgb(const uint8_t* src, int sw, int sh, int dw
       double c0 = 0.0, c1 = 0.0, c2 = 0.0;
       for (int i = 0; i < t.count; ++i) {
         const double w = t.w[size_t(i)];
-        const double* p = tmp.data() + (size_t(t.start + i) * size_t(dw) + size_t(x)) * 3;
-        c0 += w * p[0];
-        c1 += w * p[1];
-        c2 += w * p[2];
+        const float* p = tmp.data() + (size_t(t.start + i) * size_t(dw) + size_t(x)) * 3;
+        c0 += w * double(p[0]);
+        c1 += w * double(p[1]);
+        c2 += w * double(p[2]);
       }
       drow[size_t(x) * 3 + 0] = float(std::clamp(c0, 0.0, 255.0));
       drow[size_t(x) * 3 + 1] = float(std::clamp(c1, 0.0, 255.0));
@@ -109,11 +109,12 @@ bool smart_resize_dims(int h, int w, int factor, int64_t min_pixels, int64_t max
     if (err) *err = "invalid image dimensions";
     return false;
   }
-  if (std::max(h, w) / std::min(h, w) > 200) {
+  if (double(std::max(h, w)) / double(std::min(h, w)) > 200.0) {
     if (err) *err = "image aspect ratio exceeds 200:1";
     return false;
   }
-  if (max_pixels < int64_t(factor) * factor) max_pixels = int64_t(factor) * factor;
+  const int64_t min_tile = int64_t(factor) * factor;
+  if (max_pixels < min_tile) max_pixels = min_tile;
   if (min_pixels > max_pixels) min_pixels = max_pixels;
   int64_t h_bar = std::max<int64_t>(factor, int64_t(std::llround(double(h) / factor)) * factor);
   int64_t w_bar = std::max<int64_t>(factor, int64_t(std::llround(double(w) / factor)) * factor);
@@ -123,8 +124,18 @@ bool smart_resize_dims(int h, int w, int factor, int64_t min_pixels, int64_t max
     w_bar = std::max<int64_t>(factor, int64_t(std::floor(double(w) / beta / factor)) * factor);
   } else if (h_bar * w_bar < min_pixels) {
     const double beta = std::sqrt(double(min_pixels) / (double(h) * double(w)));
-    h_bar = int64_t(std::ceil(double(h) * beta / factor)) * factor;
-    w_bar = int64_t(std::ceil(double(w) * beta / factor)) * factor;
+    h_bar = std::max<int64_t>(factor, int64_t(std::ceil(double(h) * beta / factor)) * factor);
+    w_bar = std::max<int64_t>(factor, int64_t(std::ceil(double(w) * beta / factor)) * factor);
+  }
+  // Enforce max_pixels strictly (extreme aspect ratio floor-clamp or upscale ceil overshoot).
+  if (h_bar * w_bar > max_pixels) {
+    if (h_bar >= w_bar) {
+      h_bar = std::max<int64_t>(factor, (max_pixels / w_bar / factor) * factor);
+      if (h_bar * w_bar > max_pixels) w_bar = std::max<int64_t>(factor, (max_pixels / h_bar / factor) * factor);
+    } else {
+      w_bar = std::max<int64_t>(factor, (max_pixels / h_bar / factor) * factor);
+      if (h_bar * w_bar > max_pixels) h_bar = std::max<int64_t>(factor, (max_pixels / w_bar / factor) * factor);
+    }
   }
   if (h_bar > INT32_MAX || w_bar > INT32_MAX) {
     if (err) *err = "resized image dimensions overflow";
@@ -219,10 +230,12 @@ interfaces::PromptPositions Qwen35VisionAdapter::build_positions(
   }
   res.is_3d = true;
   res.pos_3d.resize(size_t(L) * 3, 0);
+  res.pos_rope_deltas.resize(size_t(L) + 1, 0);
   const int M = std::max(1, p_.merge_size);
   int32_t cur = 0;
   int32_t tok_i = 0;
   size_t sp_i = 0;
+  res.pos_rope_deltas[0] = 0;
   while (tok_i < L) {
     if (sp_i < spans.size() && spans[sp_i].token_pos == tok_i) {
       const auto& sp = spans[sp_i++];
@@ -237,9 +250,11 @@ interfaces::PromptPositions Qwen35VisionAdapter::build_positions(
             res.pos_3d[idx + 0] = cur + t;
             res.pos_3d[idx + 1] = cur + h;
             res.pos_3d[idx + 2] = cur + w;
+            res.pos_rope_deltas[size_t(tok_i + k) + 1] = cur - (tok_i + k + 1);
           }
       tok_i += sp.n_tokens;
       cur += std::max({llm_t, llm_h, llm_w});
+      if (tok_i <= L) res.pos_rope_deltas[size_t(tok_i)] = cur - tok_i;
     } else {
       const size_t idx = size_t(tok_i) * 3;
       res.pos_3d[idx + 0] = cur;
@@ -247,6 +262,7 @@ interfaces::PromptPositions Qwen35VisionAdapter::build_positions(
       res.pos_3d[idx + 2] = cur;
       ++cur;
       ++tok_i;
+      res.pos_rope_deltas[size_t(tok_i)] = cur - tok_i;
     }
   }
   res.rope_delta = cur - L;

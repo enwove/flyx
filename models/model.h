@@ -125,6 +125,7 @@ class Model : public interfaces::Model {
   bool restarts(int d) const override { return drafters_.at(size_t(d)).kind == Drafter::kDv; }
   bool kv_fp8_by_default() const override { return kv_fp8_by_default_; }
   const interfaces::VisionAdapter* vision() const override { return vision_adapter_.get(); }
+  std::shared_ptr<const interfaces::VisionAdapter> vision_shared() const override { return vision_adapter_; }
   std::vector<flyx_node> vision_program() const override { return vision_nodes_; }
 
  protected:
@@ -146,7 +147,7 @@ class Model : public interfaces::Model {
   };
   Tables tables_;
   std::vector<DrafterBlock> drafters_;
-  std::unique_ptr<interfaces::VisionAdapter> vision_adapter_;
+  std::shared_ptr<const interfaces::VisionAdapter> vision_adapter_;
   std::vector<flyx_node> vision_nodes_;
   bool kv_fp8_by_default_ = true;  // FP8 where a real model of the family showed no visible drop
   bool file_drafts_trees_ = false;  // the file holds DV, asked for or not
