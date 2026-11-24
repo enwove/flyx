@@ -208,9 +208,9 @@ flyx_seq::Tiered flyx_seq::tiered_alloc(size_t positions, size_t row, int role, 
   // Strata pageable layers require an even device_rows split so no Strata pair straddles device and pageable RAM;
   // enforcing the same even rounding for all page-eligible layers keeps device_positions and staging slots identical
   // across pinned and pageable layers in hybrid auto mode.
-  size_t dev = size_t(device_positions) * row / v.gran * v.gran;
-  if (pageable || even_dev)
-    while (dev >= v.gran && ((dev / row) & 1)) dev -= v.gran;
+  // alloc_state asks every cache for positions that are whole rows here (tiered_device_positions), so K and V of a
+  // layer, and every layer, get the same device_rows.
+  const size_t dev = tiered_device_bytes(device_positions, row, v.gran, pageable || even_dev);
   const size_t host = total - dev;
   t.device_rows = int(dev / row);
   // The staging the view's rest maps: one for the caches of a role, size and parity, which attentions read in turn,

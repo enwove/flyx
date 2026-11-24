@@ -516,6 +516,17 @@ void alloc_state(const flyx_bmodel* m, flyx_seq* s) {
   const bool page_eligible = strata && nh_most > 0 && s->copies > 0 && s->device_positions >= 0 &&
                              s->device_positions < s->cap && m->opt.pageable_kv != PageableKvMode::off &&
                              page_bounce_est <= (64ull << 20);
+  // Every cache in tiers keeps the same positions on the device, whole rows up to a boundary of the mapping's
+  // granularity (tiered_device_positions): a layer's scales, its pageable buffers and its tail ring are split there
+  // for K and V both, and the sizes below count on it.
+  if (s->device_positions >= 0 && s->device_positions < s->cap) {
+    std::vector<size_t> tier_rows;
+    for (const KvSpec& k : m->states.kv)
+      if (tiered(k)) tier_rows.push_back(row_of(k));
+    if (!tier_rows.empty())
+      s->device_positions = tiered_device_positions(s->device_positions, tier_rows.data(), int(tier_rows.size()),
+                                                    vmm_granularity(), page_eligible);
+  }
   auto is_pageable_k = [&](int i, int k) {
     if (k <= 0) return false;
     if (k >= s->copies) return true;
@@ -558,8 +569,7 @@ void alloc_state(const flyx_bmodel* m, flyx_seq* s) {
         }
         const size_t row = row_of(k);
         const size_t tot_v = round_up_g(size_t(s->cap) * row);
-        size_t dev_v = size_t(s->device_positions) * row / gran * gran;
-        while (dev_v >= gran && ((dev_v / row) & 1)) dev_v -= gran;
+        const size_t dev_v = tiered_device_bytes(s->device_positions, row, gran, true);
         const uint64_t host_kv = tot_v > dev_v ? uint64_t(tot_v - dev_v) : 0;
         const uint64_t scales_b = k.fp8 ? 2 * uint64_t(s->cap) * k.nkv * sizeof(float) : 0;
         const uint64_t kv_p = 2 * host_kv + scales_b;

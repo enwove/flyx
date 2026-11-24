@@ -596,6 +596,32 @@ void embed(const int* tokens, const bf16* E, int H, bf16* x, int rows, cudaStrea
 // tokens = [P.anchor, fill...] when fill >= 0, else [P.anchor, drafts[0..rows-1)]
 void build_rows(const DevParams* P, const int* drafts, int fill, int* tokens, int rows, cudaStream_t st);
 
+// A cache in tiers keeps its first positions on the device and maps the rest from host memory, in pieces of the
+// mapping's granularity `gran`: the device's part of a cache asked for `positions` rows of `row` bytes is the bytes
+// below the last boundary at or below them (`even`: at an even count of whole rows, strata's pairs of positions
+// staying on one side).  Where `row` does not divide `gran` that part can end inside a row.
+inline size_t tiered_device_bytes(int positions, size_t row, size_t gran, bool even) {
+  size_t dev = size_t(positions) * row / gran * gran;
+  if (even)
+    while (dev >= gran && ((dev / row) & 1)) dev -= gran;
+  return dev;
+}
+// The most positions, `positions` at most, at which the device's part of every cache of these row sizes ends on a
+// whole row (tiered_device_bytes == positions * row for each).  Asked for these, a layer's K and V and every layer
+// split at the same position; asked for more, each cache would round down by itself, a granule apart from the one
+// allocated before it (rows of 768 bytes, 13,000 positions: 10,922 for the first cache, 8,192 for the next), though
+// a layer's scales, pageable buffers and tail ring are split at one position for both.
+inline int tiered_device_positions(int positions, const size_t* rows, int n, size_t gran, bool even) {
+  for (bool moved = true; moved && positions > 0;) {
+    moved = false;
+    for (int i = 0; i < n; ++i) {
+      const int held = int(tiered_device_bytes(positions, rows[i], gran, even) / rows[i]);
+      if (held < positions) positions = held, moved = true;
+    }
+  }
+  return positions;
+}
+
 // A layer's K/V cache, [cap][nkv][hd]: binary16 (kv16), or e4m3 with one float scale per
 // (position, kv head) in ks / vs (amax / 448 of that head's row).  FP8 when ks is set.
 // Per-pair gather request written by k_strata_page_list and serviced by the host callback from pageable RAM into a

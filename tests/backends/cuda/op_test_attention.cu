@@ -1089,6 +1089,33 @@ void test_strata(int hd, int nh, int nkv, int rows, int ctx, int bits, bool fp8)
 
 void test_pageable_kv_ops() {
   seed("pageable_kv_ops", 0);
+  // The device's part of the caches in tiers (tiered_device_bytes, tiered_device_positions): rows that divide the
+  // mapping's 2 MiB end it on a row at once; rows of 768 bytes (3 KV heads of 128, binary16) asked for 13,000
+  // positions end the first cache inside row 10,922 and the next, given those, at 8,192, where every cache then
+  // agrees; rows of 2,560 and 1,024 bytes together agree on a position both end a row at.
+  {
+    const size_t gran = size_t(2) << 20;
+    struct TierCase {
+      int asked;
+      std::vector<size_t> rows;
+      int want;
+    };
+    bool ok_tiers = tiered_device_bytes(13000, 768, gran, false) == 4 * gran &&
+                    tiered_device_bytes(10922, 768, gran, false) == 3 * gran &&
+                    tiered_device_bytes(8192, 768, gran, false) == size_t(8192) * 768 &&
+                    tiered_device_bytes(17000, 128, gran, true) == size_t(16384) * 128;
+    for (const TierCase& tc : {TierCase{13000, {768}, 8192}, TierCase{15000, {768}, 8192}, TierCase{17000, {128}, 16384},
+                               TierCase{17000, {2560}, 16384}, TierCase{20000, {2560, 1024}, 16384},
+                               TierCase{5000, {2560, 768}, 0}, TierCase{100, {1024}, 0}, TierCase{0, {768}, 0}})
+      for (bool even : {false, true}) {
+        const int got = tiered_device_positions(tc.asked, tc.rows.data(), int(tc.rows.size()), gran, even);
+        bool whole = got == tc.want && (!even || got % 2 == 0);
+        for (size_t row : tc.rows) whole = whole && tiered_device_bytes(got, row, gran, even) == size_t(got) * row;
+        ok_tiers = ok_tiers && whole;
+      }
+    std::printf("  %-4s tiered caches' device part: one position, a whole row of every cache\n", ok_tiers ? "ok" : "FAIL");
+    g_fail += !ok_tiers;
+  }
   // Test both aligned ring_pad=0 (nkv=4, row=1024) and unaligned ring_pad=1 (nkv=10, hd=128, binary16 -> row=2560,
   // non-divisor of 2 MiB VMM granule where slot `sink` straddles the VMM boundary and must stay untouched).
   struct RingCase {
