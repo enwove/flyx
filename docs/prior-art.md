@@ -28,7 +28,8 @@ The dashboard names coding agents and Hugging Face by their own marks (`apps/fly
 
 | Mark | Drawing taken from |
 |---|---|
-| Claude Code, DeepSeek, Hugging Face, Pi | [Simple Icons](https://github.com/simple-icons/simple-icons) `16.38.0` (`claudecode`, `deepseek`, `huggingface`, `pi`; icon data CC0-1.0), which cites `code.claude.com`, `www.deepseek.com`, `huggingface.co` and `pi.dev/favicon.svg` |
+| Claude Code, DeepSeek, Pi | [Simple Icons](https://github.com/simple-icons/simple-icons) `16.38.0` (`claudecode`, `deepseek`, `pi`; icon data CC0-1.0), which cites `code.claude.com`, `www.deepseek.com` and `pi.dev/favicon.svg` |
+| Hugging Face | [Hugging Face Brand Assets](https://huggingface.co/brand) (`huggingface/brand-assets`, `hf-logo-pirate.svg`, transparent hollow interior for light-theme tabs) |
 | Codex | [Lobe Icons](https://github.com/lobehub/lobe-icons) static SVG `1.104.0` (`codex`; MIT) |
 | OpenCode | its repository's `packages/identity/mark.svg` (commit `1251a87`), brought to a 24-unit box |
 
