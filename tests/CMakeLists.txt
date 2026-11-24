@@ -106,6 +106,7 @@ flyx_add_unit_test(inkling2_test e2e/inkling2_test.cpp)
 add_dependencies(inkling2_test flyx-cpu_ref)
 # Each run writes the models it reads: a directory of its own, so the two can run at once (ctest -j).
 add_test(NAME inkling2_cpu_ref COMMAND inkling2_test ${CMAKE_BINARY_DIR}/inkling2_assets/cpu_ref cpu_ref)
+set_tests_properties(inkling2_cpu_ref PROPERTIES FIXTURES_SETUP inkling2_models)
 
 add_executable(numbers_test apps/common/numbers_test.cpp ${CMAKE_SOURCE_DIR}/apps/common/numbers.cpp)
 target_include_directories(numbers_test PRIVATE ${CMAKE_SOURCE_DIR})
@@ -316,6 +317,11 @@ flyx_add_py_test(dv_counts ${CMAKE_SOURCE_DIR}/tests/e2e/check_dv_test.py)
 flyx_add_py_test(bench_prompts ${CMAKE_SOURCE_DIR}/tests/apps/flyx-cli/bench_prompts_test.py
                  ARGS $<TARGET_FILE:flyx-cli> ${ASSETS} ${CMAKE_SOURCE_DIR}/tests/core/render/templates/qwen3.5.jinja
                  FIXTURES assets)
+# The same where a chat without thinking carries a reply grammar (the tiny Inkling-2 model inkling2_cpu_ref writes):
+# every prompt of the set keeps its grammar until it runs, and its reply is held to it.
+flyx_add_py_test(bench_prompts_grammar ${CMAKE_SOURCE_DIR}/tests/apps/flyx-cli/bench_prompts_grammar_test.py
+                 ARGS $<TARGET_FILE:flyx-cli> ${CMAKE_BINARY_DIR}/inkling2_assets/cpu_ref/tiny_inkling2_bf16.gguf
+                 FIXTURES inkling2_models)
 # Two builds' flyx bench --prompts records of one command: the same answers and rounds over the prompts both hold, and
 # what fails (bench/ab/same_runs.py; records made up, no model).
 flyx_add_py_test(same_runs ${CMAKE_SOURCE_DIR}/tests/bench/ab/same_runs_test.py)
