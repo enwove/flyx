@@ -7,11 +7,12 @@
 // chosen (POST /v1/load).  Fields an older server may not send are read defensively.
 import { html, useState, useEffect, useRef } from "../lib/html.js";
 import { saved, getJson, call } from "../lib/api.js";
-import { t } from "../lib/i18n.js";
+import { t, tErr } from "../lib/i18n.js";
 import { fmt, gib, gb, secs, shortDevice, baseName, psQuote, shQuote, compact, ago, contextLimit } from "../lib/format.js";
 import { Icon, CodeSnippet, CopyButton, confirmBox, defaultShell, ShellPicker } from "../lib/ui.js";
 import { live, poll, busyLoad } from "../lib/telemetry.js";
-import { unloadServed, stopFetch } from "../lib/actions.js";
+import { unloadServed, reloadServed, stopFetch } from "../lib/actions.js";
+import { VramApps, isVramError, parseVramNeeded } from "../components/vram_apps.js";
 
 // "org/name[:quant][@rev]", not a path: a relative path of two parts reads the same, but for its file's extension.
 const hubName = (v) => /^(https?:\/\/(hf\.co|huggingface\.co)\/)?[A-Za-z0-9._-]+\/[A-Za-z0-9._-]+(:[A-Za-z0-9._-]+)?(@[A-Za-z0-9._-]+)?$/.test(v.trim()) &&
@@ -37,8 +38,7 @@ function draftersOf(L) {
 let gpuTotal = Number(saved.get("gpu_total")) || 0;
 function deviceReserve(total) {
   const base = Math.max(384 * 1048576, total / 40);
-  const paged = /Windows/i.test(navigator.userAgent) ? 512 * 1048576 : 0;
-  return base + paged;
+  return /Windows/i.test(navigator.userAgent) ? Math.max(base, 832 * 1048576) : base;
 }
 function freeForModel() {
   const d = live.last && live.last.device, m = live.last && live.last.memory;
@@ -62,10 +62,11 @@ function FitTag({ size }) {
 
 // What is served and its state, its facts, a fetch's or a load's progress, its drafters, an error.  With nothing
 // served it is the view's whole content: `again` loads the model the server remembers, `browse` shows the library.
-function Serving({ tm, again, browse }) {
+function Serving({ tm, again, retry, browse }) {
   const L = tm.load || { state: "none" }, model = tm.model || {}, p = L.progress || {};
   const loadedWant = model.id && L.loaded ? L.loaded : null, busy = busyLoad(L);
   const [msg, setMsg] = useState("");
+  const [vramOpen, setVramOpen] = useState(false);
   const facts = [];
   if (model.loaded && !busy) {
     if (model.device) facts.push(["GPU", shortDevice(model.device)]);
@@ -88,6 +89,13 @@ function Serving({ tm, again, browse }) {
   if (model.loaded && !busy && model.drafter && /mtp/.test(model.drafter) && !drafters.some((d) => d.kind === "mtp"))
     drafters.unshift({ kind: "mtp", from: "model file" });
   const limit = model.loaded && !busy ? contextLimit(model) : null;  // memory cut the context: why, and what gives more
+  const ctxLimit = model.context_limit;
+  const ctxMemKind = !limit || !ctxLimit ? ""
+    : ctxLimit.by === "host" ? "ram"
+    : ctxLimit.by === "gpu" && ctxLimit.closable ? "vram" : "";
+  const vramErr = !busy && isVramError(L.error);
+  const showMemPanel = vramErr || (!!ctxMemKind && vramOpen);
+  const panelKind = vramErr ? "vram" : (ctxMemKind || "vram");
   const stateName = { none: "Nothing loaded", fetching: "Fetching", loading: "Loading", ready: "Serving", failed: "Failed" }[L.state] || L.state;
   const tone = L.state === "ready" ? "ok" : L.state === "failed" ? "bad" : busy ? "warn" : "";
   const idle = !model.id && !busy;
@@ -111,7 +119,10 @@ function Serving({ tm, again, browse }) {
           <${Icon} name="play"/>${t("Load the last model again")}</button>` : ""}
         <button class=${"btn" + (again ? "" : " primary")} id="ld-browse" onClick=${browse}>${t("Explore the model library")}</button></div>` : ""}
       <dl class="stats" id="ld-facts" hidden=${!facts.length}>${facts.map(([k, v]) => html`<div><dt>${t(k)}</dt><dd>${t(v)}</dd></div>`)}</dl>
-      <div class=${"banner " + (limit && limit.short ? "warn" : "hint")} id="ld-ctx" hidden=${!limit}>${limit ? limit.parts.map((s) => t(s)).join(" ").replace(/([。！？]) /g, "$1") : ""}</div>
+      <div class=${"banner " + (limit && limit.short ? "warn" : "hint")} id="ld-ctx" hidden=${!limit}>
+        <div class="grow2">${limit ? limit.parts.map((s) => t(s)).join(" ").replace(/([。！？]) /g, "$1") : ""}</div>
+        ${ctxMemKind ? html`<button class="btn sm" id="ld-vram-toggle" onClick=${() => setVramOpen((v) => !v)}>
+          ${t(vramOpen ? "Hide apps" : ctxMemKind === "ram" ? "Manage RAM" : "Manage VRAM")}</button>` : ""}</div>
       <div class=${"bar" + (L.state === "loading" ? " busy" : "")} id="ld-prog" hidden=${!busy}>
         <i style=${{ width: L.state === "loading" ? "" : (p.total ? 100 * p.done / p.total : 0) + "%" }}></i></div>
       <div class="prog" id="ld-sub">${sub}</div>
@@ -119,7 +130,12 @@ function Serving({ tm, again, browse }) {
         <div class="dr"><span class="k">${d.kind === "mtp" ? "MTP" : d.kind === "dflash2" ? "DFlash2" : d.kind}</span>
           <span class="f">${(d.from === "model file" ? t("the model file's own layer") : d.from) + (d.size ? " · " + gb(d.size) + " GB" : "")}</span></div>`)}</div>
       <div class=${"banner " + (L.fallback ? "warn" : "bad")} id="ld-err" hidden=${!L.error && !msg}>
-        ${L.error ? (L.fallback ? t("The new model did not load: " + L.error + ". " + L.fallback + " was loaded again.") : L.error) : t(msg)}</div>
+        ${L.error ? (L.fallback ? [t("The new model did not load."), tErr(L.error), t(L.fallback + " was loaded again.")].join(" ").replace(/([。！？]) /g, "$1") : tErr(L.error)) : t(msg)}</div>
+      <${VramApps} open=${showMemPanel} kind=${panelKind} id="ld-vram-apps"
+                   needBytes=${vramErr ? parseVramNeeded(L.error) : 0}
+                   onRetry=${vramErr ? retry : (model.id && loadedWant ? reloadServed : null)}
+                   retryLabel=${vramErr ? "Retry loading" : "Reload model"}
+                   onClose=${!vramErr ? () => setVramOpen(false) : null}/>
     </div>`;
 }
 
@@ -264,6 +280,7 @@ export function ModelPage({ active, libraryAsked, currentAsked }) {
   const [msg, setMsg] = useState("");
   const filled = useRef(false), sawState = useRef(""), sawLoaded = useRef("");
   const searchSeq = useRef(0), repoSeq = useRef(0), dirSeq = useRef(0), placed = useRef(false);
+  const lastAttempt = useRef(null);
   const set = (k) => (e) => setF(Object.assign({}, f, { [k]: e.target.type === "checkbox" ? e.target.checked : e.target.value }));
   const setTab = (k) => { setTabState(k); saved.set("models_tab", k); setMsg(""); };
   // `next`: the list, or what makes it of the list as it is by then (an answer that took long to come).
@@ -461,7 +478,9 @@ export function ModelPage({ active, libraryAsked, currentAsked }) {
                             lines, same ? "Reload" : "Switch")) return;
     }
     setMsg("");
-    const r = await call("POST", "/v1/load", want || body(name));
+    const reqBody = want || body(name);
+    lastAttempt.current = reqBody;
+    const r = await call("POST", "/v1/load", reqBody);
     if (!r.ok) { setMsg(r.error); return; }
     setView("current");  // where the fetch's and the load's progress show
     document.getElementById("main").scrollTo({ top: 0 });
@@ -889,6 +908,12 @@ export function ModelPage({ active, libraryAsked, currentAsked }) {
                   : atCache ? local.filter((m) => m.source === "hub" && m.kind !== "drafter").map((m) => m.name) : dir ? dir.models.map((m) => m.name) : [];
   const cmdModel = shownRows.includes(target) ? target : loadedWant ? loadedWant.model : L.remembered ? L.remembered.model : "";
   const again = L.remembered ? { model: L.remembered.model, load: () => loadModel(L.remembered.model, L.remembered) } : null;
+  const retryWant = L.target
+    ? (lastAttempt.current && lastAttempt.current.model === L.target ? lastAttempt.current
+       : L.remembered && L.remembered.model === L.target ? L.remembered
+       : { model: L.target })
+    : L.remembered || null;
+  const retry = retryWant ? () => loadModel(retryWant.model, retryWant) : null;
   const current = view === "current";
   const stateTone = L.state === "ready" ? "ok" : L.state === "failed" ? "bad" : busy ? "warn" : "";
   const stateWord = L.state === "fetching" ? t("Fetching") + (L.progress && L.progress.total ? " " + fmt(100 * L.progress.done / L.progress.total) + "%" : "") :
@@ -900,7 +925,7 @@ export function ModelPage({ active, libraryAsked, currentAsked }) {
       <button role="tab" data-view="library" aria-selected=${String(!current)} onClick=${() => setView("library")}>${t("Model library")}</button>
     </div>
     <div class="mview" id="mv-current" hidden=${!current}>
-      <div class="sec"><div class="pane statbar"><${Serving} tm=${tm} again=${again} browse=${() => setView("library")}/></div></div>
+      <div class="sec"><div class="pane statbar"><${Serving} tm=${tm} again=${again} retry=${retry} browse=${() => setView("library")}/></div></div>
       ${model.id ? html`<div class="sec">${settingsView(cmdModel)}</div>` : ""}
     </div>
     <div class="sec hubsec" id="mv-library" hidden=${current}>

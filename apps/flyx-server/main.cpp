@@ -491,6 +491,7 @@ int run(int argc, char** argv) {
       srv.device_probe = {{"name", info.name}, {"mem_total", info.mem_total ? ojson(info.mem_total) : ojson(nullptr)},
                           {"mem_used", info.mem_total ? ojson(info.mem_total - info.mem_free) : ojson(nullptr)},
                           {"backend", backend}};
+      if (info.mem_total) srv.probe_mem_used.store(info.mem_total - info.mem_free, std::memory_order_relaxed);
       std::fprintf(stderr, "flyx-server: %s (%s), %.1f GB free\n", info.name, backend.c_str(), info.mem_free / 1e9);
     }
   }

@@ -13,6 +13,7 @@ import { Icon } from "../lib/ui.js";
 import { live, busyLoad, poll } from "../lib/telemetry.js";
 import { loadWant } from "../lib/actions.js";
 import { fmt } from "../lib/format.js";
+import { isVramError } from "./vram_apps.js";
 
 // The pages this browser has opened, and the hints closed in it.
 function savedSet(name) {
@@ -34,10 +35,15 @@ const RULES = [
   ["failed", (c) => {
     if (!c.L.error || c.busy) return null;
     const fell = c.L.fallback, name = c.L.target || "the model";
+    const acts = isVramError(c.L.error)
+      ? [{ label: "Manage VRAM", primary: true, run: (n) => n.openMem && n.openMem("vram") },
+         { label: "View details", run: (n) => n.showModel() },
+         { label: "View logs", run: (n) => n.go("logs") }]
+      : [{ label: "View details", primary: true, run: (n) => n.showModel() },
+         { label: "View logs", run: (n) => n.go("logs") }];
     return { key: "failed:" + c.L.error, tone: fell ? "warn" : "bad", hideOn: fell ? ["model"] : ["model", "overview"],
       title: fell ? "Failed to load " + name + "; reverted to " + fell : "Failed to load " + name,
-      text: c.L.error, actions: [{ label: "View details", primary: true, run: (n) => n.showModel() },
-                                 { label: "View logs", run: (n) => n.go("logs") }] };
+      text: c.L.error.split(/(?<=\.)\s+/), actions: acts };
   }],
   // Nothing served: the model library, or the model loaded last.
   ["no-model", (c) => {
@@ -60,10 +66,17 @@ const RULES = [
     const fix = l.by === "host" ? "Free system memory or raise the host KV cache limit, then reload the model."
       : l.closable ? "Other processes are using " + gb(l.others) + " of GPU memory. Close them and reload the model."
       : "Disable speculative decoding or use a smaller quantization to free GPU memory.";
+    const acts = l.by === "host"
+      ? [{ label: "Manage RAM", primary: true, run: (n) => n.openMem && n.openMem("ram") },
+         { label: "View details", run: (n) => n.showModel() }]
+      : l.closable
+        ? [{ label: "Manage VRAM", primary: true, run: (n) => n.openMem && n.openMem("vram") },
+           { label: "View details", run: (n) => n.showModel() }]
+        : [{ label: "View details", primary: true, run: (n) => n.showModel() }];
     return { key: "short:" + c.model.id + ":" + c.model.context, tone: "warn", hideOn: ["model"],
       title: "Context limited to " + fmt(c.model.context) + " tokens (model supports " + fmt(l.wanted) + ")",
       text: ["Coding agents may run out of context in long sessions.", fix],
-      actions: [{ label: "View details", primary: true, run: (n) => n.showModel() }] };
+      actions: acts };
   }],
   // A model served, and Integration never opened: connect a client.
   ["connect", (c) => {
@@ -86,7 +99,7 @@ function context(tm, tab) {
            visited };
 }
 
-export function Hint({ tab, go, explore, showModel }) {
+export function Hint({ tab, go, explore, showModel, onOpenMem }) {
   const [, again] = useState(0);
   const tm = live.last;
   if (!tm || live.notice) return "";
@@ -100,7 +113,7 @@ export function Hint({ tab, go, explore, showModel }) {
   }
   if (hint && hint.hideOn && hint.hideOn.includes(tab)) hint = null;
   if (!hint) return "";
-  const nav = { go, explore, showModel };
+  const nav = { go, explore, showModel, openMem: onOpenMem };
   const close = () => { addTo("hints_closed", hint.key); again((x) => x + 1); poll(); };
   return html`
     <div class=${"hint " + hint.tone} role="status" id="hint" data-hint=${hint.key.split(":")[0]}>

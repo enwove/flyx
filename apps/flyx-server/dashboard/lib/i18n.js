@@ -51,6 +51,16 @@ export function t(str) {
   return v === undefined ? str : str.match(/^\s*/)[0] + v + str.match(/\s*$/)[0];
 }
 
+// A backend error string (possibly several sentences): translate whole first, else sentence by sentence, collapsing
+// spaces after CJK punctuation.
+export function tErr(str) {
+  if (typeof str !== "string" || !str) return "";
+  const whole = t(str);
+  if (whole !== str) return whole;
+  const parts = str.split(/(?<=\.)\s+/);
+  return parts.length > 1 ? parts.map((s) => t(s)).join(" ").replace(/([。！？]) /g, "$1") : whole;
+}
+
 // A paragraph translated whole (its code kept in place), as HTML, or null for English.
 export const para = (key) => (LANGS[lang] && LANGS[lang].paras[key]) || null;
 
