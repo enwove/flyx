@@ -850,11 +850,14 @@ void bind(flyx_bmodel* m, const flyx_model_desc& d, LoadTimes* times) {
       default: throw std::runtime_error("block kind " + std::to_string(b.kind) + ": not implemented by this backend");
     }
   }
-  // Bind 1D [hidden] weight vectors so FLYX_NODE_RES_MIX (e.g. output_res_query) can read them from GPU.
-  // WeightLoader::vec deduplicates with norms/queries already uploaded above.
+  // FLYX_NODE_RES_MIX names a [hidden] vector by its weight index (Inkling-2's output_res_query), and no block
+  // owns it: the vectors of that shape that no block's binding read go on the device for it.  A block's own vectors
+  // stay where the block put them (a vision block's in host memory or on disk when the options say so, a drafter's
+  // in the layout its kernels read), so a model without such a node holds nothing more for it.
   for (int w = 0; w < d.n_weights; ++w) {
     const flyx_tensor_view* v = d.weights[w].t;
-    if (v && v->ndim == 1 && v->shape[0] == d.hidden && WeightLoader::numbers(v)) m->vec_weights[w] = L.vec(w);
+    if (v && v->ndim == 1 && v->shape[0] == d.hidden && WeightLoader::numbers(v) && !L.asked(w))
+      m->vec_weights[w] = L.vec(w);
   }
   m->vision_disk.flush_clean();
   L.finish();

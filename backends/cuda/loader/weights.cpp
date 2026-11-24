@@ -620,7 +620,10 @@ void ggml_nvfp4_planes(const flyx_tensor_view* v, const std::function<size_t(siz
 
 // ---- WeightLoader --------------------------------------------------------------------------
 WeightLoader::WeightLoader(flyx_bmodel* model, const flyx_model_desc& desc)
-    : m_(model), weights_(desc.weights), n_weights_(desc.n_weights) {}
+    : m_(model),
+      weights_(desc.weights),
+      n_weights_(desc.n_weights),
+      asked_(size_t(std::max(desc.n_weights, 0))) {}
 
 WeightLoader::~WeightLoader() = default;
 
@@ -644,6 +647,7 @@ void WeightLoader::finish() {
 
 const flyx_tensor_view* WeightLoader::t(int w) const {
   if (w < 0 || w >= n_weights_ || !weights_[w].t) throw std::runtime_error("weight " + std::to_string(w) + " missing");
+  asked_[size_t(w)] = true;
   return weights_[w].t;
 }
 

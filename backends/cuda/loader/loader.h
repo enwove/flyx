@@ -44,6 +44,9 @@ class WeightLoader {
   void finish();
 
   const flyx_tensor_view* t(int w) const;
+  // Whether a block's binding read weight w (anything the loader was asked for).  One that none read is a program
+  // node's (FLYX_NODE_RES_MIX names its vector by weight index).
+  bool asked(int w) const { return w >= 0 && size_t(w) < asked_.size() && asked_[size_t(w)]; }
   static size_t numel(const flyx_tensor_view* v);
   static bool numbers(const flyx_tensor_view* v);
 
@@ -101,6 +104,7 @@ class WeightLoader {
   flyx_bmodel* m_ = nullptr;
   const flyx_weight* weights_ = nullptr;
   int n_weights_ = 0;
+  mutable std::vector<bool> asked_;          // t(w) was called
   std::unordered_map<int, bf16*> mats_;      // matrices uploaded once (a tied head is the embedding)
   std::unordered_map<int, BlockMat> packs_;  // block weights packed once
   std::unordered_map<int, float*> vecs_;     // 1D/small float vectors uploaded once (shared across loop passes)
