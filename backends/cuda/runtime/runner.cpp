@@ -17,11 +17,13 @@ namespace flyx::cuda {
 
 namespace {
 
-void copy_ring(flyx_seq* s, cudaStream_t st) {
+void copy_ring(flyx_seq* s, cudaStream_t st, bool drain = true) {
+  if (drain && !s->page_layers.empty())
+    kv_drain_pageable(s->page_drain_dev, int(s->page_layers.size()), s->P, s->ring_dev, s->m->wide_rows, st);
   CK(cudaMemcpyAsync(s->ring_host, s->ring_dev, sizeof(flyx_round_result) * kRing, cudaMemcpyDeviceToHost, st));
 }
 
-void copy_ring(flyx_seq* s) { copy_ring(s, s->st); }
+void copy_ring(flyx_seq* s, bool drain = true) { copy_ring(s, s->st, drain); }
 
 template <class Fn>
 int guarded(Fn&& fn) {
@@ -474,6 +476,7 @@ int prefill_ex(flyx_plan* p, flyx_seq* s, const flyx_prefill_input* in, const fl
     s->copy_written(s->position);
     s->staged(s->position + n);
     forward(ps);
+    s->flush_page_prefill(s->position, n);
     s->snap_pos = s->pass_snap;
     s->pass_snap = -1;
     if (in->pos_3d) {
@@ -493,7 +496,7 @@ int prefill_ex(flyx_plan* p, flyx_seq* s, const flyx_prefill_input* in, const fl
     CK(cudaEventRecord(m->prefill_ev, s->st));
     s->position += n;
     if (sample_last) {
-      copy_ring(s);
+      copy_ring(s, false);
       ++s->seq_no;
       CK(cudaEventRecord(s->ev[s->seq_no % kRing], s->st));
       s->pending.push_back({'P', 0});
@@ -1547,7 +1550,10 @@ int launch(flyx_plan* p, flyx_seq* s, const flyx_gen_params* g) {
     const Pass& ps = r.ps;
     const auto& key = r.key;
     const int prefix = r.prefix;
-    auto it = s->graph.find(key);
+    // Exact reads over pageable K/V stage from pageable host memory via cudaMemcpyAsync (not capturable).
+    // Steady-state strata rounds past device_positions always have ps.strata == kStrataAll and capture into graphs.
+    const bool page_exact = s->has_page_exact(ps.strata, ps.rows);
+    auto it = page_exact ? s->graph.end() : s->graph.find(key);
     // A rewind may shorten the safe prefix. As it grows, recapture at most once per 4096 positions per
     // graph so a long generation also benefits.  The old graph goes once its launches are done:
     // destroyed in flight, what it holds would stay the driver's beside the new one's until they end.
@@ -1564,7 +1570,7 @@ int launch(flyx_plan* p, flyx_seq* s, const flyx_gen_params* g) {
     };
     // A capture that found no room waits kGraphRecent rounds before the next: the graphs it would take
     // the place of are by then ones the session ran lately, or not.
-    if (it == s->graph.end() && s->graphs && s->seq_no >= s->graph_retry) {
+    if (it == s->graph.end() && !page_exact && s->graphs && s->seq_no >= s->graph_retry) {
       cudaGraphExec_t exec = nullptr;
       // A driver that refuses DV's conditional canvas pass (dv_context_unless_noop), in the capture or the
       // instantiation, or does not give its body to count (graph_size), gets the round with the pass inline.
@@ -1574,8 +1580,11 @@ int launch(flyx_plan* p, flyx_seq* s, const flyx_gen_params* g) {
         Captured c;
         GraphSize size{};
         bool captured = false;
+        // CUDA forbids host nodes (cudaLaunchHostFunc, used by pageable K/V gathers) inside conditional IF graph
+        // bodies, so adaptive plans on pageable sessions capture the flat full-width round into a regular CUDA graph.
+        const bool use_cond = p->adaptive() && s->page_layers.empty();
 #if CUDART_VERSION >= 12040
-        if (p->adaptive()) {
+        if (use_cond) {
           captured = capture_adaptive_graph(p, s, r, &c.graph, &size);
         } else
 #endif
@@ -1598,7 +1607,7 @@ int launch(flyx_plan* p, flyx_seq* s, const flyx_gen_params* g) {
             it = s->graph.emplace(key, flyx_seq::RoundGraph{exec, prefix, size.bytes}).first;
             s->graph_held += size.bytes;
             note_graph(s, size);
-            say_graph(s->m, p->adaptive() ? "adaptive round" : "round", ps.rows, key.second, size);
+            say_graph(s->m, use_cond ? "adaptive round" : "round", ps.rows, key.second, size);
           } else {
             failed = true;
           }
@@ -1609,7 +1618,7 @@ int launch(flyx_plan* p, flyx_seq* s, const flyx_gen_params* g) {
           if (s->m->verbose)
             std::fprintf(stderr, "flyx-cuda: a round graph with a conditional canvas pass failed: the pass inline\n");
         } else if (failed) {
-          if (!p->adaptive()) s->graphs = false;
+          if (!use_cond) s->graphs = false;
           if (s->m->verbose) std::fprintf(stderr, "flyx-cuda: graph capture failed, running rounds eagerly\n");
         }
       }
@@ -1726,11 +1735,13 @@ int launch_batch(flyx_plan* const* plans, flyx_seq* const* seqs, const flyx_gen_
     BatchKey key;
     key.n = n;
     bool prefill_claimed = false;
+    bool any_page_exact = false;
     for (int i = 0, at = 0; i < n; ++i) {
       const int idx = ord[i];
       flyx_seq* s = seqs[idx];
       const int seq_rows = plans[idx]->width + 1;
       const int strata = s->strata_phase(seq_rows);
+      if (s->has_page_exact(strata, seq_rows)) any_page_exact = true;
       s->snap_pos = -1;  // rounds write the round slots
       set_gen(s, gens[idx]);
       set_drafts(s, gens[idx]);
@@ -1758,8 +1769,8 @@ int launch_batch(flyx_plan* const* plans, flyx_seq* const* seqs, const flyx_gen_
       run_batch(bp);
       for (int i = 0; i < n; ++i) copy_ring(seqs[ord[i]], B.st);
     };
-    auto it = B.graphs.find(key);
-    if (it == B.graphs.end() && B.graphs_ok && m->opt.graphs) {
+    auto it = any_page_exact ? B.graphs.end() : B.graphs.find(key);
+    if (it == B.graphs.end() && !any_page_exact && B.graphs_ok && m->opt.graphs) {
       // Only capture once a batch key repeats enough to amortize graph instantiation cost.
       if (B.hits.size() >= BatchRounds::kMaxHitEntries && B.hits.find(key) == B.hits.end()) B.hits.clear();
       const uint32_t seen = ++B.hits[key];
@@ -1852,6 +1863,7 @@ int read_result(flyx_seq* s, flyx_round_result* out) {
     char kind = s->pending.front().kind;
     s->pending.pop_front();
     if (kind == 'R' && out->n_tokens > 0) {
+      s->drain_page_host(seq, out->position, out->n_tokens);
       s->meta[flyx_round_slot(s->round)] = {true, out->position - out->n_tokens, out->n_tokens, s->rope_delta};
       s->round += 1;
       s->meta[flyx_round_slot(s->round)].valid = false;
@@ -1965,6 +1977,7 @@ int rewind(flyx_seq* s, int32_t pos, int32_t anchor) {
       s->rope_delta = mt.rope_delta;
       s->prev_pos3d_at = -1;
       set_params(s, pos, anchor, r + 1);
+      s->reload_page_ring(pos);
       CK(cudaGetLastError());
       return 1;
     }
@@ -2008,6 +2021,7 @@ int restore(flyx_seq* s, int32_t c, int32_t anchor) {
     s->rope_delta = s->ckp[c].rope_delta;
     s->prev_pos3d_at = -1;
     set_params(s, s->ckp[c].pos, anchor, s->round);
+    s->reload_page_ring(s->position);
     return s->position;
   });
 }
@@ -2100,6 +2114,17 @@ void snapshot_parts(flyx_seq* s, int c, int begin, int pos, HostCursor& host, bo
     const int first = b.ring ? 0 : begin, end = b.ring ? std::min(pos, b.ring) : pos;
     const int slots = b.ring ? b.ring : s->cap;
     const size_t elem = k.fp8 ? 1 : sizeof(kv16), width = size_t(k.nkv) * k.hd;
+    auto copy_page = [&](void* ptr, size_t bytes) {
+      if (save && !host_synced) {
+        sync_stream(s);  // ensure prior stream writes (flush_page_prefill) completed before CPU reads pageable RAM
+        host_synced = true;
+      }
+      host.take(bytes, [&](uint8_t* h, uint64_t o, uint64_t len) {
+        uint8_t* p = static_cast<uint8_t*>(ptr) + o;
+        std::memcpy(save ? static_cast<void*>(h) : static_cast<void*>(p),
+                    save ? static_cast<const void*>(p) : static_cast<const void*>(h), len);
+      });
+    };
     if (b.swa_ring && save) {
       const size_t bytes = size_t(end - first) * width * elem;
       copy(b.ckp_k[c], bytes);
@@ -2111,6 +2136,28 @@ void snapshot_parts(flyx_seq* s, int c, int begin, int pos, HostCursor& host, bo
       }
     } else {
       for (int l = 0; l < k.layers; ++l) {
+        if (b.pageable) {
+          const int split = std::clamp(b.device_positions, first, end);
+          auto split_kv = [&](void* dev, uint8_t* page) {
+            if (first < split)
+              copy(static_cast<uint8_t*>(dev) + size_t(first) * width * elem, size_t(split - first) * width * elem);
+            if (split < end)
+              copy_page(page + size_t(split - b.device_positions) * width * elem, size_t(end - split) * width * elem);
+          };
+          split_kv(b.k, b.k_page);
+          split_kv(b.v, b.v_page);
+          if (k.fp8) {
+            auto split_sc = [&](float* dev, float* page) {
+              if (first < split) copy(dev + size_t(first) * k.nkv, size_t(split - first) * k.nkv * sizeof(float));
+              if (split < end)
+                copy_page(page + size_t(split - b.device_positions) * k.nkv,
+                          size_t(end - split) * k.nkv * sizeof(float));
+            };
+            split_sc(b.ks, b.ks_page);
+            split_sc(b.vs, b.vs_page);
+          }
+          continue;
+        }
         const size_t offset = (size_t(l) * b.layer_stride + size_t(first) * width) * elem;
         const size_t bytes = size_t(end - first) * width * elem;
         copy(static_cast<uint8_t*>(b.k) + offset, bytes);
@@ -2211,6 +2258,7 @@ int snapshot_load(flyx_seq* s, const flyx_host_pieces* src, uint64_t bytes, int3
     HostCursor host{src, sizeof h};
     s->copy_home(false);  // the copy loaded to its host home, every position changed
     snapshot_parts(s, -1, h.begin, h.pos, host, false);
+    s->reload_page_ring(h.pos);
     s->copy_written(h.begin);
     for (auto& mt : s->meta) mt = {};
     s->rope_delta = h.rope_delta;

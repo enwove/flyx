@@ -24,6 +24,8 @@
 #include <dlfcn.h>
 #endif
 
+#include <algorithm>
+#include <cstdint>
 #include <cstdio>
 #include <cstring>
 #include <mutex>
@@ -202,6 +204,26 @@ size_t gpu_process_memory() {
 #else
   return 0;
 #endif
+}
+
+// Remaining page-locked (WDDM non-local) host memory budget for this device, less a safety reserve so DWM, driver
+// pools and lazy checkpoints stay inside WDDM's 50% shared-memory cap.  UINT64_MAX where no WDDM cap applies.
+uint64_t host_pinned_budget() {
+#if defined(_WIN32)
+  std::lock_guard<std::mutex> lock(g_nvml_mu);
+  if (!g_adapter_tried && g_has_luid) {
+    g_adapter_tried = true;
+    g_adapter = find_adapter();
+  }
+  DXGI_QUERY_VIDEO_MEMORY_INFO info{};
+  if (g_adapter && SUCCEEDED(g_adapter->QueryVideoMemoryInfo(0, DXGI_MEMORY_SEGMENT_GROUP_NON_LOCAL, &info)) &&
+      info.Budget > 0) {
+    const uint64_t reserve = std::max<uint64_t>(512ull << 20, info.Budget / 16);
+    const uint64_t used = uint64_t(info.CurrentUsage) + reserve;
+    return uint64_t(info.Budget) > used ? uint64_t(info.Budget) - used : 0;
+  }
+#endif
+  return UINT64_MAX;
 }
 
 

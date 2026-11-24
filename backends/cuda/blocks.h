@@ -464,18 +464,27 @@ struct KvBuf {
   void* ckp_v[FLYX_CHECKPOINTS]{};
   float* ckp_ks[FLYX_CHECKPOINTS]{};
   float* ckp_vs[FLYX_CHECKPOINTS]{};
+  // Pageable host K/V backing (Windows WDDM overflow): full [0, cap) cold K/V in pageable RAM while GPU k/v holds
+  // [0, device_positions) plus a rolling tail ring (`page_ring` total slots, `page_safe` guaranteed valid in ring).
+  // `ring` stays 0 so snapshots/layout hashes match pinned host-KV sessions bit-for-bit.
+  bool pageable = false;
+  uint8_t *k_page = nullptr, *v_page = nullptr;
+  float *ks_page = nullptr, *vs_page = nullptr;
+  int page_ring_base = 0, page_ring = 0, page_safe = 0;
+  PageGatherCtx* page_ctx = nullptr;
   KvRef ref() const {  // where a pass writes
     KvRef r{k, v, ks, vs, kq, vq, kqs, vqs, bits, words, grid, hot_tag, hot_claim, hot, hot_bits,
-            vk ? device_positions : INT32_MAX, ring, sink};
+            vk ? device_positions : INT32_MAX, pageable ? page_ring : ring, pageable ? device_positions : sink};
     if (ks_host) r.ks_far = ks_host, r.vs_far = vs_host, r.scale_split = device_positions;
     r.hot_scale = hot_scale;
+    if (pageable) r.page_ctx = page_ctx, r.ring_safe = page_safe, r.ring_pad = page_ring_base - device_positions;
     return r;
   }
   // What an attention reads: the caches, or after stage() their views.
   KvRef staged() const {
     if (!vk) return ref();
     KvRef r{vk, vv, ks, vs};
-    if (ks_host) {
+    if (ks_host || ks_page) {
       r.ks_far = scales_from(vks, device_positions), r.vs_far = scales_from(vvs, device_positions);
       r.scale_split = device_positions;
     }
