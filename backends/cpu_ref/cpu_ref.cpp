@@ -133,6 +133,7 @@ void vnorm(const RefModel* M, const flyx_vnorm& n, const double* x, int len, dou
   if (n.kind == FLYX_NORM_LAYER) {
     flyx::ops::layernorm(x, w, b, len, n.eps, y);
   } else {
+    if (!w) throw std::runtime_error("vnorm: RMSNorm with bias requires weight");
     flyx::ops::rmsnorm(x, w, len, n.eps, n.offset, y);
     if (b)
       for (int i = 0; i < len; ++i) y[i] += b[i];
@@ -167,6 +168,7 @@ struct Slot {
   std::vector<Vec> S, conv;                  // GDN
   bool replay_valid = false;                 // replay below describes the round that started here
   int start_pos = 0, rows = 0;               // committed rows of that round
+  int rope_delta = 0;                        // decode rope_delta when this round ran
   std::vector<Vec> k, v, beta, g, mixed;     // GDN, [max_rows * ...]
 };
 
@@ -741,6 +743,7 @@ void commit(RefSeq* s) {
   s->slot[from].replay_valid = true;
   s->slot[from].start_pos = s->start;
   s->slot[from].rows = s->last_n + 1;
+  s->slot[from].rope_delta = s->rope_delta;
   s->slot[to].replay_valid = false;
 }
 
@@ -969,12 +972,14 @@ int open_model(const flyx_model_desc* desc, const flyx_open_options* opts, flyx_
       m->owned_views.push_back(std::move(v));
     }
     for (int i = 0; i < desc->n_blocks; ++i) {
-      const int k = desc->blocks[i].kind;
+      const flyx_block& b = desc->blocks[i];
+      const int k = b.kind;
       // DV's blocks (ABI 42) are taken and never run: such a model decodes here as without DV (lower).
       if (k < FLYX_BLOCK_EMBED || k > FLYX_BLOCK_VISION_MERGE)
         throw std::runtime_error("block kind " + std::to_string(k) + ": not implemented by cpu_ref");
+      if (k == FLYX_BLOCK_VISION_STEM && b.vision_stem.cls_token >= 0)
+        throw std::runtime_error("vision_stem: cls_token is not yet implemented by cpu_ref");
       if (k == FLYX_BLOCK_DFLASH2) m->dflash = i;
-      const flyx_block& b = desc->blocks[i];
       if (k == FLYX_BLOCK_ATTN || k == FLYX_BLOCK_MLP) {  // a target's own adapters (ABI 43)
         const flyx_lora* l = k == FLYX_BLOCK_ATTN ? b.attn.lora : b.mlp.lora;
         const int n = k == FLYX_BLOCK_ATTN ? 4 : 3;
@@ -1038,6 +1043,7 @@ int lower(flyx_bmodel* bm, const flyx_program* prog, flyx_plan** out) {
   if (prog->n_checkpoints > 0) return fail("adaptive rounds: not in this backend");
   RefModel* m = as_m(bm);
   if (prog->phase == FLYX_PHASE_VISION) {
+    if (prog->max_rows < 1 || prog->n_nodes < 1 || !prog->nodes) return fail("vision program: empty");
     for (int i = 0; i < prog->n_nodes; ++i) {
       const flyx_node& n = prog->nodes[i];
       if (n.kind != FLYX_NODE_RUN || n.block < 0 || n.block >= int(m->blocks.size()))
@@ -1046,6 +1052,8 @@ int lower(flyx_bmodel* bm, const flyx_program* prog, flyx_plan** out) {
       if (k < FLYX_BLOCK_VISION_STEM || k > FLYX_BLOCK_VISION_MERGE)
         return fail("vision program: non-vision block kind " + std::to_string(k));
     }
+    if (m->block(prog->nodes[0].block).kind != FLYX_BLOCK_VISION_STEM)
+      return fail("vision program: must begin with a vision_stem block");
     auto p = std::make_unique<RefPlan>();
     p->m = m;
     p->phase = FLYX_PHASE_VISION;
@@ -1222,12 +1230,17 @@ void run_vision_stem(const RefModel* M, const flyx_vision_stem_block& B, const f
   if (B.patch_b >= 0) add_bias(vs->x.data(), H, M->vec(B.patch_b).data(), N, H);
   if (B.pos_mode == FLYX_VPOS_ADD_FIXED && B.pos_w >= 0) {
     const Vec& pos = M->vec(B.pos_w);
+    const int pos_rows = int(pos.size()) / H;
+    if (pos_rows <= 0) throw std::runtime_error("vision_stem: pos_w has fewer than H elements");
     for (int r = 0; r < N; ++r) {
-      const size_t idx = size_t(r % (int(pos.size()) / H)) * H;
+      const size_t idx = size_t(r % pos_rows) * H;
       for (int c = 0; c < H; ++c) vs->x[size_t(r) * H + c] += pos[idx + c];
     }
   } else if (B.pos_mode == FLYX_VPOS_BILINEAR_2D && B.pos_w >= 0) {
     const Vec& pos = M->vec(B.pos_w);
+    if (B.pos_grid_h <= 0 || B.pos_grid_w <= 0 ||
+        size_t(B.pos_grid_h) * size_t(B.pos_grid_w) * size_t(H) > pos.size())
+      throw std::runtime_error("vision_stem: pos_grid_h * pos_grid_w exceeds pos_w rows");
     vision_pos_embed_bilinear_add(vs->x.data(), pos.data(), B.pos_grid_h, B.pos_grid_w, H,
                                   vs->grid_thw, vs->n_grids, B.merge_size);
   }
@@ -1293,7 +1306,12 @@ void run_vit_attn(const RefModel* M, const flyx_vit_attn_block& B, VisionState* 
   const double scale = 1.0 / std::sqrt(double(hd));
   const int n_segs = vs->n_segs > 0 ? vs->n_segs : 1;
   const int32_t fallback[2] = {0, N};
+  if (vs->n_segs > 0 && !vs->cu_seqlens) throw std::runtime_error("vit_attn: n_segs > 0 with null cu_seqlens");
   const int32_t* cu = vs->n_segs > 0 ? vs->cu_seqlens : fallback;
+  for (int i = 0; i <= n_segs; ++i) {
+    if (cu[i] < 0 || cu[i] > N || (i > 0 && cu[i] < cu[i - 1]))
+      throw std::runtime_error("vit_attn: cu_seqlens out of range or non-monotonic");
+  }
   for (int seg = 0; seg < n_segs; ++seg) {
     const int s0 = cu[seg], s1 = cu[seg + 1];
     for (int r = s0; r < s1; ++r)
@@ -1369,19 +1387,27 @@ void run_vision_merge(const RefModel* M, const flyx_vision_merge_block& B, Visio
       std::copy(tmp.begin(), tmp.end(), &cur[size_t(r) * merged_dim]);
     }
   }
+  const bool has_fc1 = B.fc1 >= 0, has_fc2 = B.fc2 >= 0;
   Vec proj;
-  if (B.fc1_out > 0 && B.fc1 >= 0) {
+  if (has_fc1 && has_fc2) {
     Vec mid(size_t(out_rows) * B.fc1_out);
     lin(M, B.fc1, cur.data(), out_rows, merged_dim, B.fc1_out, mid.data(), out_rows);
     if (B.fc1_b >= 0) add_bias(mid.data(), B.fc1_out, M->vec(B.fc1_b).data(), out_rows, B.fc1_out);
     for (double& v : mid) v = vact(v, B.act);
     proj.resize(size_t(out_rows) * B.out_hidden);
     lin(M, B.fc2, mid.data(), out_rows, B.fc1_out, B.out_hidden, proj.data(), out_rows);
-  } else {
+    if (B.fc2_b >= 0) add_bias(proj.data(), B.out_hidden, M->vec(B.fc2_b).data(), out_rows, B.out_hidden);
+  } else if (has_fc2) {
     proj.resize(size_t(out_rows) * B.out_hidden);
     lin(M, B.fc2, cur.data(), out_rows, merged_dim, B.out_hidden, proj.data(), out_rows);
+    if (B.fc2_b >= 0) add_bias(proj.data(), B.out_hidden, M->vec(B.fc2_b).data(), out_rows, B.out_hidden);
+  } else if (has_fc1) {
+    proj.resize(size_t(out_rows) * B.out_hidden);
+    lin(M, B.fc1, cur.data(), out_rows, merged_dim, B.out_hidden, proj.data(), out_rows);
+    if (B.fc1_b >= 0) add_bias(proj.data(), B.out_hidden, M->vec(B.fc1_b).data(), out_rows, B.out_hidden);
+  } else {
+    proj = std::move(cur);
   }
-  if (B.fc2_b >= 0) add_bias(proj.data(), B.out_hidden, M->vec(B.fc2_b).data(), out_rows, B.out_hidden);
   vs->rows = out_rows;
   vs->width = B.out_hidden;
   vs->x = std::move(proj);
@@ -1392,8 +1418,26 @@ int encode_vision(flyx_plan* bp, const flyx_vision_input* in, float* out_embeds,
   RefPlan* p = as_p(bp);
   if (!p || p->phase != FLYX_PHASE_VISION) return fail("encode_vision: not a vision plan");
   if (!in || !in->patches || in->n_patches <= 0 || in->patch_dim <= 0) return fail("encode_vision: invalid input");
+  if (!in->grid_thw || in->n_grids <= 0) return fail("encode_vision: invalid grid_thw");
   if (!out_embeds || out_cap_rows <= 0) return fail("encode_vision: invalid output buffer");
   try {
+    int merge_size = 1;
+    for (const flyx_node& n : p->nodes) {
+      const flyx_block& b = p->m->block(n.block);
+      if (b.kind == FLYX_BLOCK_VISION_STEM) merge_size = std::max(merge_size, std::max(1, b.vision_stem.merge_size));
+      else if (b.kind == FLYX_BLOCK_VIT_ATTN) merge_size = std::max(merge_size, std::max(1, b.vit_attn.merge_size));
+    }
+    size_t total_patches = 0;
+    for (int g = 0; g < in->n_grids; ++g) {
+      const int T = in->grid_thw[g * 3 + 0];
+      const int H = in->grid_thw[g * 3 + 1];
+      const int W = in->grid_thw[g * 3 + 2];
+      if (T <= 0 || H <= 0 || W <= 0 || (H % merge_size) != 0 || (W % merge_size) != 0)
+        throw std::runtime_error("encode_vision: grid_thw dimensions invalid or not divisible by merge_size");
+      total_patches += size_t(T) * size_t(H) * size_t(W);
+    }
+    if (total_patches != size_t(in->n_patches))
+      throw std::runtime_error("encode_vision: grid_thw total patches != n_patches");
     VisionState vs{};
     vs.grid_thw = in->grid_thw;
     vs.n_grids = in->n_grids;
@@ -1457,6 +1501,7 @@ int rewind(flyx_seq* bs, int32_t pos, int32_t anchor) {
     return 1;
   }
   if (pos == s->position) {
+    s->prev_pos3d_at = -1;
     s->anchor = anchor;
     s->stopped = false;
     return 1;
@@ -1468,6 +1513,8 @@ int rewind(flyx_seq* bs, int32_t pos, int32_t anchor) {
     fold_into(s, sl, to, pos - a.start_pos);
     a.rows = pos - a.start_pos;  // tokens past pos are discarded; later rewinds must not replay stale rows
     for (int k = 1; k <= back; ++k) s->slot[flyx_round_slot(r + k)].replay_valid = false;
+    s->rope_delta = a.rope_delta;
+    s->prev_pos3d_at = -1;
     s->round = r + 1;
     s->position = pos;
     s->anchor = anchor;

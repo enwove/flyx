@@ -847,6 +847,9 @@ typedef struct {
   const int32_t* cu_seqlens;   /* [n_segs + 1]: cumulative patch offsets (0 .. n_patches) */
 } flyx_vision_input;
 
+/* Special prefill_snapshot() argument (ABI 44): suppress intra-pass snapshot capture for the next pass. */
+#define FLYX_PREFILL_SNAP_NONE (-2)
+
 /* Extended prefill pass input (ABI 44): supports external embedding injection (vision/audio)
  * and explicit 3D MRoPE coordinates with a decode-time scalar rope_delta. */
 typedef struct {
@@ -858,6 +861,8 @@ typedef struct {
   const int32_t* pos_3d;       /* [n * 3] (t, h, w) coordinates for 3D MRoPE (NULL = standard 1D) */
   int32_t set_rope_delta;      /* 1: set sequence's decode rope_delta to `rope_delta` after this pass */
   int32_t rope_delta;          /* offset added to 1D decode positions: pos_1d = seq_pos + rope_delta */
+  int32_t has_snap_rope_delta; /* 1: use snap_rope_delta for an intra-pass checkpoint captured in this pass */
+  int32_t snap_rope_delta;     /* model-provided decode rope_delta at the intra-pass checkpoint position */
 } flyx_prefill_input;
 
 /* All functions return 0 on success unless stated otherwise; on failure

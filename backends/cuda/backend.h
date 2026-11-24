@@ -665,6 +665,7 @@ struct flyx_seq {
   struct Meta {  // per round slot: the committed rows of the round that started from it
     bool valid = false;
     int start = 0, rows = 0;
+    int rope_delta = 0;
   } meta[FLYX_ROUND_SLOTS];
 
   bool graphs = true;

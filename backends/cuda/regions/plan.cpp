@@ -369,6 +369,8 @@ int lower(flyx_bmodel* m, const flyx_program* prog, flyx_plan** out) {
       p->block.push_back(b);
       p->impl.push_back(&kGeneric);
     }
+    if (!std::holds_alternative<VisionStemBlock>(*p->block.front()))
+      return fail("lower: vision plan must begin with a vision_stem block");
     *out = p.release();
     return 0;
   }

@@ -229,6 +229,7 @@ struct VisionLin {
   int N = 0, K = 0, K_pad = 0;
   bool on_host = false;
   bool on_disk = false;
+  bool a4 = false;  // pre-quantized NVFP4 weight calibrated for W4A4 prefill activations (FLYX_ACT_NVFP4)
   DiskKind disk_kind = kDiskNone;
   uint64_t disk_off = 0;
   size_t disk_bytes = 0;

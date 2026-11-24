@@ -912,6 +912,10 @@ VisionLin WeightLoader::vision_lin_stack(const std::vector<int>& ws, int* rows_o
   for (int w : ws)
     if (is_fp4(w) != fp4) throw std::runtime_error(std::string(t(w)->name) + ": mixed weight formats in vision stack");
   if (fp4) {
+    for (int w : ws)
+      if (weights_[w].activations != weights_[ws[0]].activations)
+        throw std::runtime_error(std::string(t(w)->name) + ": mixed activation rounding in vision stack");
+    vl.a4 = weights_[ws[0]].activations == FLYX_ACT_NVFP4;
     if (!host && !disk) {
       vl.w = lin_stack(ws);
       record_bytes(total_rows * K / 2 + total_rows * K / 16 + total_rows * sizeof(float));

@@ -42,6 +42,7 @@ std::string win_err(DWORD code) {
 VisionDiskStore::~VisionDiskStore() { close(); }
 
 void VisionDiskStore::close() {
+  std::lock_guard<std::mutex> lk(map_mu_);
   if (map_base_) {
 #ifdef _WIN32
     UnmapViewOfFile(map_base_);
@@ -51,7 +52,7 @@ void VisionDiskStore::close() {
     map_base_ = nullptr;
     map_len_ = 0;
   }
-  map_tried_ = false;
+  map_tried_.store(false, std::memory_order_release);
   if (handle_ == -1) return;
 #ifdef _WIN32
   CloseHandle(reinterpret_cast<HANDLE>(handle_));
@@ -158,33 +159,36 @@ void VisionDiskStore::flush_clean() {
 }
 
 void VisionDiskStore::ensure_mapped() const {
-  if (map_tried_ || handle_ == -1 || size_ == 0) return;
+  if (map_tried_.load(std::memory_order_acquire) || handle_ == -1 || size_ == 0) return;
   std::lock_guard<std::mutex> lk(map_mu_);
-  if (map_tried_) return;
-  map_tried_ = true;
+  if (map_tried_.load(std::memory_order_relaxed)) return;
 #ifdef _WIN32
   HANDLE fm = CreateFileMappingW(reinterpret_cast<HANDLE>(handle_), nullptr, PAGE_READONLY, 0, 0, nullptr);
-  if (!fm) return;
-  void* p = MapViewOfFile(fm, FILE_MAP_READ, 0, 0, 0);
-  CloseHandle(fm);  // the mapped view retains the section object
-  if (!p) return;
-  map_base_ = static_cast<const uint8_t*>(p);
-  map_len_ = static_cast<size_t>(size_);
+  if (fm) {
+    void* p = MapViewOfFile(fm, FILE_MAP_READ, 0, 0, 0);
+    CloseHandle(fm);  // the mapped view retains the section object
+    if (p) {
+      map_base_ = static_cast<const uint8_t*>(p);
+      map_len_ = static_cast<size_t>(size_);
+    }
+  }
 #else
   void* p = ::mmap(nullptr, static_cast<size_t>(size_), PROT_READ, MAP_SHARED, static_cast<int>(handle_), 0);
-  if (p == MAP_FAILED) return;
-  map_base_ = static_cast<const uint8_t*>(p);
-  map_len_ = static_cast<size_t>(size_);
-  ::madvise(const_cast<uint8_t*>(map_base_), map_len_, MADV_SEQUENTIAL);
+  if (p != MAP_FAILED) {
+    map_base_ = static_cast<const uint8_t*>(p);
+    map_len_ = static_cast<size_t>(size_);
+    ::madvise(const_cast<uint8_t*>(map_base_), map_len_, MADV_SEQUENTIAL);
+  }
 #endif
+  map_tried_.store(true, std::memory_order_release);
 }
 
 void VisionDiskStore::read_at(uint64_t offset, void* dst, size_t nbytes) const {
   if (nbytes == 0) return;
-  if (handle_ == -1 || offset + nbytes > size_)
+  if (handle_ == -1 || offset > size_ || nbytes > size_ - offset)
     throw std::runtime_error("vision disk store: read out of range");
   ensure_mapped();
-  if (map_base_ && offset + nbytes <= map_len_) {
+  if (map_base_ && offset <= map_len_ && nbytes <= map_len_ - offset) {
     std::memcpy(dst, map_base_ + offset, nbytes);
     return;
   }

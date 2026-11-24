@@ -5,6 +5,7 @@
 // available memory for host KV budgeting while still serving warm reads from OS cache.
 #pragma once
 
+#include <atomic>
 #include <cstddef>
 #include <cstdint>
 #include <mutex>
@@ -42,7 +43,7 @@ class VisionDiskStore {
   mutable std::mutex map_mu_;
   mutable const uint8_t* map_base_ = nullptr;
   mutable size_t map_len_ = 0;
-  mutable bool map_tried_ = false;
+  mutable std::atomic<bool> map_tried_{false};
 };
 
 }  // namespace flyx::cuda

@@ -68,21 +68,22 @@ __global__ void __launch_bounds__(kLnThreads) k_layernorm(const float* x, int ld
   }
 }
 
-__global__ void k_add_bias(float* y, int ldy, const float* b, int cols) {
+__global__ void k_add_bias(float* y, int ldy, const float* b, int rows, int cols) {
   pdl_trigger();
-  const int r = blockIdx.y;
   const int c = blockIdx.x * blockDim.x + threadIdx.x;
-  if (c < cols) y[size_t(r) * ldy + c] += b[c];
+  if (c >= cols) return;
+  const float bv = b[c];
+  for (int r = blockIdx.y; r < rows; r += gridDim.y) y[size_t(r) * ldy + c] += bv;
 }
 
-__global__ void k_vision_residual_add(float* x, const float* y, const float* scale, int cols) {
+__global__ void k_vision_residual_add(float* x, const float* y, const float* scale, int rows, int cols) {
   pdl_trigger();
-  const int r = blockIdx.y;
   const int c = blockIdx.x * blockDim.x + threadIdx.x;
-  if (c < cols) {
+  if (c >= cols) return;
+  const float sv = scale ? scale[c] : 1.f;
+  for (int r = blockIdx.y; r < rows; r += gridDim.y) {
     const size_t idx = size_t(r) * cols + c;
-    const float v = y[idx];
-    x[idx] += scale ? v * scale[c] : v;
+    x[idx] += scale ? y[idx] * sv : y[idx];
   }
 }
 
@@ -117,11 +118,11 @@ __global__ void k_vact_gated(const float* gate, const float* up, float* out, siz
   if (i < n) out[i] = eval_vact(gate[i], act) * up[i];
 }
 
-__global__ void k_vision_zero_tail(float* x, int valid_cols, int ld) {
+__global__ void k_vision_zero_tail(float* x, int rows, int valid_cols, int ld) {
   pdl_trigger();
-  const int r = blockIdx.y;
   const int c = valid_cols + blockIdx.x * blockDim.x + threadIdx.x;
-  if (c < ld) x[size_t(r) * ld + c] = 0.f;
+  if (c >= ld) return;
+  for (int r = blockIdx.y; r < rows; r += gridDim.y) x[size_t(r) * ld + c] = 0.f;
 }
 
 // Tiled float32 GEMM: y[m, n] (=|+=) sum_k x[m, k] * W[n, k], arbitrary M, N, K.
@@ -182,40 +183,41 @@ __global__ void __launch_bounds__(256) k_gemm_f32(const float* __restrict__ x, i
   }
 }
 
-__global__ void k_vision_pos_embed_add(float* x, const float* pos, int pos_rows, int H) {
+__global__ void k_vision_pos_embed_add(float* x, const float* pos, int pos_rows, int H, int rows) {
   pdl_trigger();
-  const int r = blockIdx.y;
   const int c = blockIdx.x * blockDim.x + threadIdx.x;
-  if (c < H) x[size_t(r) * H + c] += pos[size_t(r % pos_rows) * H + c];
+  if (c >= H) return;
+  for (int r = blockIdx.y; r < rows; r += gridDim.y) x[size_t(r) * H + c] += pos[size_t(r % pos_rows) * H + c];
 }
 
 __global__ void k_vision_pos_embed_bilinear_add(float* x, const float* pos, int pos_h, int pos_w, int H,
                                                 const int32_t* coords_h, const int32_t* coords_w,
-                                                const int32_t* row_gh, const int32_t* row_gw) {
+                                                const int32_t* row_gh, const int32_t* row_gw, int rows) {
   pdl_trigger();
-  const int r = blockIdx.y;
   const int c = blockIdx.x * blockDim.x + threadIdx.x;
   if (c >= H) return;
-  const int h = coords_h[r], w = coords_w[r], gh = row_gh[r], gw = row_gw[r];
-  const double sy = gh > 1 ? double(pos_h - 1) / double(gh - 1) : 0.0;
-  const double sx = gw > 1 ? double(pos_w - 1) / double(gw - 1) : 0.0;
-  const double yf = h * sy;
-  const double xf = w * sx;
-  const int y0 = min(pos_h - 1, max(0, int(floor(yf))));
-  const int x0 = min(pos_w - 1, max(0, int(floor(xf))));
-  const int y1 = min(pos_h - 1, y0 + 1);
-  const int x1 = min(pos_w - 1, x0 + 1);
-  const float dy = float(yf - y0);
-  const float dx = float(xf - x0);
-  const float w00 = (1.f - dy) * (1.f - dx);
-  const float w01 = (1.f - dy) * dx;
-  const float w10 = dy * (1.f - dx);
-  const float w11 = dy * dx;
-  const float p00 = pos[(size_t(y0) * pos_w + x0) * H + c];
-  const float p01 = pos[(size_t(y0) * pos_w + x1) * H + c];
-  const float p10 = pos[(size_t(y1) * pos_w + x0) * H + c];
-  const float p11 = pos[(size_t(y1) * pos_w + x1) * H + c];
-  x[size_t(r) * H + c] += w00 * p00 + w01 * p01 + w10 * p10 + w11 * p11;
+  for (int r = blockIdx.y; r < rows; r += gridDim.y) {
+    const int h = coords_h[r], w = coords_w[r], gh = row_gh[r], gw = row_gw[r];
+    const double sy = gh > 1 ? double(pos_h - 1) / double(gh - 1) : 0.0;
+    const double sx = gw > 1 ? double(pos_w - 1) / double(gw - 1) : 0.0;
+    const double yf = h * sy;
+    const double xf = w * sx;
+    const int y0 = min(pos_h - 1, max(0, int(floor(yf))));
+    const int x0 = min(pos_w - 1, max(0, int(floor(xf))));
+    const int y1 = min(pos_h - 1, y0 + 1);
+    const int x1 = min(pos_w - 1, x0 + 1);
+    const float dy = float(yf - y0);
+    const float dx = float(xf - x0);
+    const float w00 = (1.f - dy) * (1.f - dx);
+    const float w01 = (1.f - dy) * dx;
+    const float w10 = dy * (1.f - dx);
+    const float w11 = dy * dx;
+    const float p00 = pos[(size_t(y0) * pos_w + x0) * H + c];
+    const float p01 = pos[(size_t(y0) * pos_w + x1) * H + c];
+    const float p10 = pos[(size_t(y1) * pos_w + x0) * H + c];
+    const float p11 = pos[(size_t(y1) * pos_w + x1) * H + c];
+    x[size_t(r) * H + c] += w00 * p00 + w01 * p01 + w10 * p10 + w11 * p11;
+  }
 }
 
 // 2D axial Vision RoPE (ops/rope/ref.h rope_2d_axial): grid (rows), block 256.
@@ -331,6 +333,7 @@ __global__ void __launch_bounds__(256) k_vision_attention(const float* __restric
           if (d < hd) dot = __fmaf_rn(qv[e], Ks[j * hd_pad + d], dot);
         }
         const float sc = warp_sum(dot) * scale;
+        if (sc <= -INFINITY) continue;
         const float mn = fmaxf(m, sc);
         const float corr = mn == m ? 1.f : expf(m - mn);
         const float p = expf(sc - mn);
@@ -357,14 +360,15 @@ __global__ void __launch_bounds__(256) k_vision_attention(const float* __restric
   }
 }
 
-__global__ void k_vision_avg_pool_blocks(const float* x, int group, int hidden, float* out) {
+__global__ void k_vision_avg_pool_blocks(const float* x, int n_blocks, int group, int hidden, float* out) {
   pdl_trigger();
-  const int b = blockIdx.y;
   const int c = blockIdx.x * blockDim.x + threadIdx.x;
   if (c >= hidden) return;
-  float sum = 0.f;
-  for (int g = 0; g < group; ++g) sum += x[(size_t(b) * group + g) * hidden + c];
-  out[size_t(b) * hidden + c] = sum / float(group);
+  for (int b = blockIdx.y; b < n_blocks; b += gridDim.y) {
+    float sum = 0.f;
+    for (int g = 0; g < group; ++g) sum += x[(size_t(b) * group + g) * hidden + c];
+    out[size_t(b) * hidden + c] = sum / float(group);
+  }
 }
 
 __global__ void k_embed_scatter(float* x, bf16* x16, int H, const float* embeds, const int32_t* embed_rows) {
@@ -391,12 +395,12 @@ void layernorm(const float* x, int ldx, const float* w, const float* b, float ep
 
 void add_bias(float* y, int ldy, const float* b, int rows, int cols, cudaStream_t st) {
   if (rows <= 0 || cols <= 0) return;
-  k_add_bias<<<dim3(ceil_div(cols, 256), rows), 256, 0, st>>>(y, ldy, b, cols);
+  k_add_bias<<<dim3(ceil_div(cols, 256), std::min(rows, 65535)), 256, 0, st>>>(y, ldy, b, rows, cols);
 }
 
 void vision_residual_add(float* x, const float* y, const float* scale, int rows, int cols, cudaStream_t st) {
   if (rows <= 0 || cols <= 0) return;
-  k_vision_residual_add<<<dim3(ceil_div(cols, 256), rows), 256, 0, st>>>(x, y, scale, cols);
+  k_vision_residual_add<<<dim3(ceil_div(cols, 256), std::min(rows, 65535)), 256, 0, st>>>(x, y, scale, rows, cols);
 }
 
 void vact_apply(float* x, size_t n, int act, cudaStream_t st) {
@@ -418,15 +422,15 @@ void gemm_f32(const float* x, int ldx, const float* W, int N, int K, float* y, i
 
 void vision_pos_embed_add(float* x, const float* pos, int pos_rows, int H, int rows, cudaStream_t st) {
   if (rows <= 0 || H <= 0 || pos_rows <= 0) return;
-  k_vision_pos_embed_add<<<dim3(ceil_div(H, 256), rows), 256, 0, st>>>(x, pos, pos_rows, H);
+  k_vision_pos_embed_add<<<dim3(ceil_div(H, 256), std::min(rows, 65535)), 256, 0, st>>>(x, pos, pos_rows, H, rows);
 }
 
 void vision_pos_embed_bilinear_add(float* x, const float* pos, int pos_h, int pos_w, int H, const int32_t* coords_h,
                                    const int32_t* coords_w, const int32_t* row_gh, const int32_t* row_gw, int rows,
                                    cudaStream_t st) {
   if (rows <= 0 || H <= 0) return;
-  k_vision_pos_embed_bilinear_add<<<dim3(ceil_div(H, 256), rows), 256, 0, st>>>(x, pos, pos_h, pos_w, H, coords_h,
-                                                                                coords_w, row_gh, row_gw);
+  k_vision_pos_embed_bilinear_add<<<dim3(ceil_div(H, 256), std::min(rows, 65535)), 256, 0, st>>>(
+      x, pos, pos_h, pos_w, H, coords_h, coords_w, row_gh, row_gw, rows);
 }
 
 void vision_rope_2d(float* qkv, int ld, int q_off, int k_off, int nh, int hd, double theta, const int32_t* coords_h,
@@ -457,7 +461,8 @@ void vision_attention(const float* qkv, int ld, int q_off, int k_off, int v_off,
 
 void vision_avg_pool_blocks(const float* x, int n_blocks, int group, int hidden, float* out, cudaStream_t st) {
   if (n_blocks <= 0 || hidden <= 0) return;
-  k_vision_avg_pool_blocks<<<dim3(ceil_div(hidden, 256), n_blocks), 256, 0, st>>>(x, group, hidden, out);
+  k_vision_avg_pool_blocks<<<dim3(ceil_div(hidden, 256), std::min(n_blocks, 65535)), 256, 0, st>>>(x, n_blocks, group,
+                                                                                                    hidden, out);
 }
 
 void embed_scatter(float* x, bf16* x16, int H, const float* embeds, const int32_t* embed_rows, int n_embeds,
@@ -469,7 +474,7 @@ void embed_scatter(float* x, bf16* x16, int H, const float* embeds, const int32_
 void vision_zero_tail(float* x, int rows, int valid_cols, int ld, cudaStream_t st) {
   const int tail = ld - valid_cols;
   if (rows <= 0 || tail <= 0) return;
-  k_vision_zero_tail<<<dim3(ceil_div(tail, 256), rows), 256, 0, st>>>(x, valid_cols, ld);
+  k_vision_zero_tail<<<dim3(ceil_div(tail, 256), std::min(rows, 65535)), 256, 0, st>>>(x, rows, valid_cols, ld);
 }
 
 }  // namespace flyx::cuda

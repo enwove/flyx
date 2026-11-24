@@ -369,16 +369,16 @@ int prefill_ex(flyx_plan* p, flyx_seq* s, const flyx_prefill_input* in, const fl
     // its GDN state and window go to the round slot after the current one, for checkpoint() (the bits a pass ending
     // there gives: numerics.md, K).  That slot held the oldest round's start; it is no longer a rollback source.
     const int align = m->prefill_align;
+    const bool suppress = s->want_snap == FLYX_PREFILL_SNAP_NONE;
     const bool wanted = s->want_snap >= s->position && s->want_snap < s->position + n && s->want_snap % align == 0;
-    const int boundary = wanted ? s->want_snap : (s->position + n) / align * align;
+    const int boundary = suppress ? -1 : wanted ? s->want_snap : (s->position + n) / align * align;
     s->want_snap = -1;
     s->snap_pos = -1;
     s->pass_snap = align > 1 && boundary >= s->position && boundary < s->position + n ? boundary : -1;
     if (s->pass_snap >= 0) {
       s->snap_slot = flyx_round_slot(s->round + 1);
       s->meta[s->snap_slot].valid = false;
-      s->snap_rope_delta = in->pos_3d ? (in->pos_3d[size_t(s->pass_snap - s->position) * 3] - s->pass_snap)
-                                      : s->rope_delta;
+      s->snap_rope_delta = in->has_snap_rope_delta ? in->snap_rope_delta : s->rope_delta;
     }
     Pass ps{p, s, n, false, sample_last != 0, sample && certified(s, sample), sample && penalized(sample)};
     ps.v = rows_of(s, &m->prefill_bufs);  // the prefill buffers it borrows
@@ -490,6 +490,7 @@ int encode_vision(flyx_plan* p, const flyx_vision_input* in, float* out_embeds, 
     size_t x_floats = 0, h_floats = 0, b1_floats = 0, b2_floats = 0;
     int max_k = 64;
     bool need_q8 = false;
+    bool need_a4 = false;
     auto align256 = [](size_t b) { return (b + 255) / 256 * 256; };
 
     // Collect offloaded (host or disk) vision vectors and linears in exact execution order for pipelined streaming.
@@ -510,6 +511,7 @@ int encode_vision(flyx_plan* p, const flyx_vision_input* in, float* out_embeds, 
     auto note_lin = [&](const VisionLin& vl) {
       if (!vl.present()) return;
       need_q8 = need_q8 || vl.q8_inputs();
+      need_a4 = need_a4 || vl.a4;
       max_k = std::max(max_k, vl.eff_k());
       if (vl.offloaded()) {
         host_lins.push_back(&vl);
@@ -605,28 +607,44 @@ int encode_vision(flyx_plan* p, const flyx_vision_input* in, float* out_embeds, 
                                ") != n_patches (" + std::to_string(N) + ")");
     std::vector<int32_t> cu_host;
     int n_segs = 1;
-    if (in->n_segs > 0 && in->cu_seqlens) {
+    if (in->n_segs > 0) {
+      if (!in->cu_seqlens) throw std::runtime_error("encode_vision: n_segs > 0 with null cu_seqlens");
       n_segs = in->n_segs;
       cu_host.assign(in->cu_seqlens, in->cu_seqlens + n_segs + 1);
+      for (int i = 0; i <= n_segs; ++i) {
+        if (cu_host[size_t(i)] < 0 || cu_host[size_t(i)] > N ||
+            (i > 0 && cu_host[size_t(i)] < cu_host[size_t(i - 1)]))
+          throw std::runtime_error("encode_vision: cu_seqlens out of range or non-monotonic");
+      }
     } else {
       cu_host = {0, N};
     }
 
-    const size_t sc_bytes = scratch_bytes(N, max_k, need_q8, false, false, false);
+    const size_t sc_bytes = scratch_bytes(N, max_k, need_q8, need_a4, false, need_a4);
     const size_t base_bytes =
         align256(x_floats * sizeof(float)) + align256(h_floats * sizeof(float)) +
         align256(b1_floats * sizeof(float)) + align256(b2_floats * sizeof(float)) +
         align256(size_t(4 * N + n_segs + 1) * sizeof(int32_t)) + align256(sc_bytes) + host_vec_bytes;
     const size_t slot_stride = align256(max_stage_bytes);
 
-    // Declare memory guards BEFORE event/stream/thread guards so reverse destruction runs:
-    //   1. join disk IO prefetch thread -> 2. synchronize & destroy CUDA streams ->
-    //   3. destroy CUDA events -> 4. free transient disk vec / device / fallback buffers.
+    // Acquire prefill_mu FIRST and declare all host/device buffers BEFORE event/stream/thread guards so reverse
+    // destruction runs strictly in order on both normal return and exceptions:
+    //   1. join disk IO thread -> 2. sync & destroy CUDA streams -> 3. destroy CUDA events ->
+    //   4. free disk_chunks / meta_host / disk_vec_buf / fallback / device guards -> 5. release prefill_mu.
+    std::lock_guard<std::mutex> lock(m->prefill_mu);
+
     constexpr size_t kDiskChunkBytes = size_t(8) << 20;  // 8 MiB per host ring slot -> <= 16 MiB total pinned ring
     unsigned char* host_ring = nullptr;
     size_t host_ring_stride = 0;
     std::vector<unsigned char> host_ring_fallback;
     std::vector<unsigned char> disk_vec_buf;
+    std::vector<int32_t> meta_host;
+    struct DiskChunk {
+      uint64_t disk_off = 0;
+      size_t gpu_off = 0;
+      size_t bytes = 0;
+    };
+    std::vector<DiskChunk> disk_chunks;
 
     struct AllocGuard {
       void* ptr = nullptr;
@@ -680,7 +698,6 @@ int encode_vision(flyx_plan* p, const flyx_vision_input* in, float* out_embeds, 
       }
     }
 
-    std::lock_guard<std::mutex> lock(m->prefill_mu);
     unsigned char* arena = nullptr;
     unsigned char* stage_base = nullptr;
     int n_slots = 0;
@@ -739,6 +756,7 @@ int encode_vision(flyx_plan* p, const flyx_vision_input* in, float* out_embeds, 
       const size_t need_host = 2 * host_ring_stride;
       if (m->vision_disk_stage_bytes < need_host) {
         if (m->vision_disk_stage) {
+          m->host_bytes -= std::min(m->host_bytes, m->vision_disk_stage_bytes);
           cudaFreeHost(m->vision_disk_stage);
           m->vision_disk_stage = nullptr;
           m->vision_disk_stage_bytes = 0;
@@ -747,6 +765,7 @@ int encode_vision(flyx_plan* p, const flyx_vision_input* in, float* out_embeds, 
         if (cudaHostAlloc(&hp, need_host, cudaHostAllocDefault) == cudaSuccess) {
           m->vision_disk_stage = hp;
           m->vision_disk_stage_bytes = need_host;
+          m->host_bytes += need_host;
         } else {
           cudaGetLastError();
         }
@@ -776,7 +795,7 @@ int encode_vision(flyx_plan* p, const flyx_vision_input* in, float* out_embeds, 
     int32_t* d_gw = d_gh + N;
     int32_t* d_cu = d_gw + N;
     void* sc_mem = take(sc_bytes);
-    Scratch sc = scratch_carve(sc_mem, sc_bytes, N, max_k, need_q8, false, false, false);
+    Scratch sc = scratch_carve(sc_mem, sc_bytes, N, max_k, need_q8, need_a4, false, need_a4);
     if (need_q8) {
       if (sc.q8_count) CK(cudaMemsetAsync(sc.q8_count, 0, kQ8Tiles * sizeof(int), sg.st));
       if (sc.round_count) CK(cudaMemsetAsync(sc.round_count, 0, sc.round_count_cap * sizeof(int), sg.st));
@@ -813,7 +832,7 @@ int encode_vision(flyx_plan* p, const flyx_vision_input* in, float* out_embeds, 
     // Upload patches and metadata to device.
     CK(cudaMemcpyAsync(b1, in->patches, size_t(N) * size_t(in->patch_dim) * sizeof(float), cudaMemcpyHostToDevice,
                        sg.st));
-    std::vector<int32_t> meta_host(size_t(4 * N + n_segs + 1));
+    meta_host.resize(size_t(4 * N + n_segs + 1));
     std::memcpy(meta_host.data(), coords_h.data(), size_t(N) * sizeof(int32_t));
     std::memcpy(meta_host.data() + N, coords_w.data(), size_t(N) * sizeof(int32_t));
     std::memcpy(meta_host.data() + 2 * N, row_gh.data(), size_t(N) * sizeof(int32_t));
@@ -895,12 +914,6 @@ int encode_vision(flyx_plan* p, const flyx_vision_input* in, float* out_embeds, 
     };
 
     // Flatten disk linears into <= 8 MiB chunks so the pinned host ring stays <= 16 MiB regardless of linear size.
-    struct DiskChunk {
-      uint64_t disk_off = 0;
-      size_t gpu_off = 0;
-      size_t bytes = 0;
-    };
-    std::vector<DiskChunk> disk_chunks;
     std::vector<std::pair<size_t, size_t>> lin_chunk_range;  // [begin, end) in disk_chunks per host_lins entry
     if (any_disk_lins) {
       lin_chunk_range.resize(host_lins.size());
@@ -986,27 +999,41 @@ int encode_vision(flyx_plan* p, const flyx_vision_input* in, float* out_embeds, 
     size_t h_idx = 0;
     if (!host_lins.empty()) kick_dma(0);
 
+    KernelOptions vopt_no_a4 = m->opt.kernels;
+    vopt_no_a4.prefill_fp4 = false;
+    KernelOptions vopt_a4 = m->opt.kernels;
+    vopt_a4.prefill_fp4 = true;
     auto run_vlin = [&](const VisionLin& vl, const float* inp, int ldi, float* outp, int ldo, int rows,
                         bool accumulate) {
       const int ke = vl.eff_k();
+      Launch Lv = L;
+      Lv.opt = vl.a4 ? &vopt_a4 : &vopt_no_a4;
       if (!vl.offloaded()) {
-        gemm(inp, ldi, vl.w, vl.N, ke, outp, ldo, rows, accumulate, L);
+        gemm(inp, ldi, vl.w, vl.N, ke, outp, ldo, rows, accumulate, Lv);
         return;
       }
       const int slot = n_slots == 2 ? int(h_idx & 1) : 0;
       if (n_slots == 1 && h_idx > 0) kick_dma(h_idx);
       CK(cudaStreamWaitEvent(sg.st, copy_done[slot].ev, 0));
       if (n_slots == 2 && h_idx + 1 < host_lins.size()) kick_dma(h_idx + 1);
-      gemm(inp, ldi, staged[slot], vl.N, ke, outp, ldo, rows, accumulate, L);
+      gemm(inp, ldi, staged[slot], vl.N, ke, outp, ldo, rows, accumulate, Lv);
       CK(cudaEventRecord(comp_done[slot].ev, sg.st));
       ++h_idx;
     };
 
     auto run_vnorm = [&](const VNorm& vn, const float* src, int lds, float* dst, int ldd, int rows, int dim) {
-      if (vn.kind == FLYX_NORM_RMS)
+      if (!vn.present()) {
+        if (dst != src || ldd != lds)
+          CK(cudaMemcpy2DAsync(dst, size_t(ldd) * sizeof(float), src, size_t(lds) * sizeof(float),
+                               size_t(dim) * sizeof(float), size_t(rows), cudaMemcpyDeviceToDevice, sg.st));
+        return;
+      }
+      if (vn.kind == FLYX_NORM_RMS) {
         rmsnorm(src, lds, dev_vec(vn.w), vn.offset, vn.eps, dst, ldd, rows, dim, sg.st);
-      else
+        if (vn.b.present()) add_bias(dst, ldd, dev_vec(vn.b), rows, dim, sg.st);
+      } else {
         layernorm(src, lds, dev_vec(vn.w), dev_vec(vn.b), vn.eps, dst, ldd, rows, dim, sg.st);
+      }
     };
 
     int cur_rows = N, cur_width = 0;
@@ -1148,6 +1175,8 @@ int encode_vision(flyx_plan* p, const flyx_vision_input* in, float* out_embeds, 
     if (borrowed && m->prefill_ev) CK(cudaEventRecord(m->prefill_ev, sg.st));
     CK(cudaStreamSynchronize(sg.st));
     if (dma_sg.st) CK(cudaStreamSynchronize(dma_sg.st));
+    if (disk_io.th.joinable()) disk_io.th.join();
+    if (disk_io.err) std::rethrow_exception(disk_io.err);
     if (out_rows) *out_rows = cur_rows;
     return 0;
   });
@@ -1782,7 +1811,7 @@ int read_result(flyx_seq* s, flyx_round_result* out) {
     char kind = s->pending.front().kind;
     s->pending.pop_front();
     if (kind == 'R' && out->n_tokens > 0) {
-      s->meta[flyx_round_slot(s->round)] = {true, out->position - out->n_tokens, out->n_tokens};
+      s->meta[flyx_round_slot(s->round)] = {true, out->position - out->n_tokens, out->n_tokens, s->rope_delta};
       s->round += 1;
       s->meta[flyx_round_slot(s->round)].valid = false;
     }
@@ -1878,6 +1907,7 @@ int rewind(flyx_seq* s, int32_t pos, int32_t anchor) {
       }
       s->meta[sl].rows = rows;  // tokens past pos are discarded; later rewinds must not replay stale rows
       for (int k = 1; k <= back; ++k) s->meta[flyx_round_slot(r + k)].valid = false;
+      s->rope_delta = mt.rope_delta;
       s->prev_pos3d_at = -1;
       set_params(s, pos, anchor, r + 1);
       CK(cudaGetLastError());

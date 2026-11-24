@@ -377,6 +377,7 @@ DvBlock dv(WeightLoader& L, const flyx_model_desc& d, const flyx_dv_block& b, co
 }
 
 VNorm bind_vnorm(WeightLoader& L, const flyx_vnorm& n) {
+  expect(!(n.kind == FLYX_NORM_RMS && n.w < 0 && n.b >= 0), "vnorm: RMSNorm with bias requires weight");
   return VNorm{n.kind, n.w >= 0 ? L.vision_vec(n.w) : VisionVec{}, n.b >= 0 ? L.vision_vec(n.b) : VisionVec{},
                float(n.offset), float(n.eps)};
 }
@@ -412,9 +413,14 @@ VisionStemBlock vision_stem(WeightLoader& L, const flyx_vision_stem_block& b) {
     const size_t n = WeightLoader::numel(L.t(b.pos_w));
     expect(n % size_t(s.hidden) == 0, "vision_stem: pos_w size not divisible by hidden");
     s.pos_rows = int(n / size_t(s.hidden));
+    if (s.pos_mode == FLYX_VPOS_BILINEAR_2D) {
+      expect(s.pos_grid_h > 0 && s.pos_grid_w > 0 &&
+                 size_t(s.pos_grid_h) * size_t(s.pos_grid_w) <= size_t(s.pos_rows),
+             "vision_stem: pos_grid_h * pos_grid_w exceeds pos_w rows");
+    }
     s.pos_w = L.vision_vec(b.pos_w);
   }
-  if (b.cls_token >= 0) s.cls_token = L.vision_vec(b.cls_token);
+  expect(b.cls_token < 0, "vision_stem: cls_token is not yet implemented by this backend");
   s.pre_norm = bind_vnorm(L, b.pre_norm);
   return s;
 }

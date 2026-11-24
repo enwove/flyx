@@ -509,8 +509,8 @@ int open_model(const flyx_model_desc* desc, const flyx_open_options* opts, flyx_
     }
     if (m->opt.vision == FLYX_VISION_DEV_AUTO) {
       // vision=auto: keep vision encoder weights on the GPU when >= 8 GB of free VRAM remain after LLM + vision
-      // weights (for KV cache, drafters, and round graphs); otherwise keep them in pinned host RAM (0 VRAM) and
-      // double-buffer stream each linear to the GPU during encode_vision().
+      // weights (for KV cache, drafters, and round graphs); otherwise keep them in an auto-deleted temp file on disk
+      // (0 VRAM, 0 locked host RAM) and 3-stage stream each linear to the GPU during encode_vision().
       std::vector<char> is_vis(size_t(desc->n_weights), 0), is_vis_lin(size_t(desc->n_weights), 0);
       auto mv = [&](int w) {
         if (w >= 0 && w < desc->n_weights) is_vis[size_t(w)] = 1;
