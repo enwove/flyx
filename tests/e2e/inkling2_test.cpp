@@ -869,6 +869,42 @@ int main(int argc, char** argv) {
     check(same_tokens(fresh_gen(*ref_dspark, prompt, 24, true), ref_sampled),
           "cpu_ref DSpark sampled+penalties == cpu_ref plain");
 
+    // A prompt asked again, its conversation ending where the prompt does (the real template opens a reply with
+    // nothing of its own): the session kept the state before the prompt's last token, and reuses all the rest.  Eight
+    // rounds later no rollback reaches it (FLYX_ROUND_SLOTS), and the prompt is longer than a prefill pass.
+    {
+      std::vector<int32_t> longer;
+      for (int i = 0; i < 48; ++i) longer.push_back(10 + (i * 11) % 240);
+      auto e = load_engine(bf16_gguf.string(), backend);
+      Session s(e.get());
+      std::string serr;
+      if (!s.init(&serr)) throw std::runtime_error("session init: " + serr);
+      auto ask = [&](int* reused) {
+        GenerateRequest req;
+        req.prompt = longer;
+        req.max_new_tokens = 8;
+        req.ignore_eos = true;
+        req.checkpoints = {int32_t(longer.size())};
+        GenerateResult res;
+        std::vector<int32_t> out;
+        if (generate(s, req,
+                     [&](std::string_view, const int32_t* ids, int cnt) {
+                       out.insert(out.end(), ids, ids + cnt);
+                       return true;
+                     },
+                     &res, &serr) != 0)
+          throw std::runtime_error("generate: " + serr);
+        *reused = res.usage.reused_tokens;
+        return out;
+      };
+      int cold = -1, warm = -1;
+      const auto first = ask(&cold), again = ask(&warm);
+      check(cold == 0 && warm == int(longer.size()) - 1 && same_tokens(again, first) &&
+                same_tokens(first, fresh_gen(*e, longer, 8)),
+            "a prompt asked again reuses all but its last token (" + std::to_string(warm) + " of " +
+                std::to_string(longer.size()) + "), the same tokens (" + backend + ")");
+    }
+
     if (backend == "cuda") {
       // ---- 2. CUDA vs cpu_ref, Gate 2 (fusion=0 == fusion=1), Gate 4 (plain == DSpark), CUDA graphs ----
       auto cu_plain = load_engine(bf16_gguf.string(), "cuda", {.prefill_chunk = 32});

@@ -145,14 +145,23 @@ bool Generation::start() {
   // fresh prefill would reproduce it bit for bit (numerics.md: K); a
   // checkpoint at a message boundary keeps the boundary before it.
   const int align = e_->prefill_align();
+  // A boundary at the prompt's very end: a template that opens the reply with nothing of its own (Inkling-2's), so
+  // that the conversation ends where the prompt does.  The same prompt asked again (a retry, another sample) runs its
+  // last token again to choose a first token of its own (Session::prepare), so the state to keep is the one before
+  // that token; with none kept there such a request computed its whole prompt again (6,303 tokens: 2.9 s, against
+  // 23 ms from the kept state).  A backend with no alignment keeps no state inside a pass, so this one costs a pass
+  // of its own for the last token (50 ms on Inkling-2-Mini): only where the prompt takes more than one pass anyway.
+  // A shorter one asked again costs less than that pass would cost every request.
+  const bool passes = n_ - reused > e_->prefill_chunk();
+  auto cut_at = [&](int32_t at) { return (passes ? std::min<int32_t>(at, n_ - 1) : at) / align * align; };
   for (int32_t at : req_.checkpoints) {
-    at = at / align * align;
+    at = cut_at(at);
     if (at > reused && at < n_ && !vision::inside_media_span(req_.media_spans, at)) cuts_.push_back(at);
   }
   std::sort(cuts_.begin(), cuts_.end());
   cuts_.erase(std::unique(cuts_.begin(), cuts_.end()), cuts_.end());
   if (cuts_.size() > 2) cuts_.erase(cuts_.begin(), cuts_.end() - 2);
-  keep_ = req_.keep_checkpoint >= 0 ? req_.keep_checkpoint / align * align : -1;
+  keep_ = req_.keep_checkpoint >= 0 ? cut_at(req_.keep_checkpoint) : -1;
   if (keep_ >= 0 && vision::inside_media_span(req_.media_spans, keep_)) keep_ = -1;
   pos_ = reused;
   phase_ = Phase::kPrefill;
