@@ -463,6 +463,7 @@ int run(int argc, char** argv) {
   ModelHost models(args.so);
   EngineOptions start_from = eo;
   start_from.drafter_files.clear();  // the command line's model's own: a model named on the page names its drafters
+  start_from.mmproj_file.clear();    // likewise: a model named on the page names its own vision projector
   Server srv{&models, cfg, start_from, os::unix_seconds(), {}};
   RequestLog requests(args.request_log);
   srv.requests = &requests;
@@ -473,7 +474,9 @@ int run(int argc, char** argv) {
   ModelHost::Want later;
   const bool remembered = model.empty() && ModelHost::remembered(&later, start_from);
   if (!model.empty()) {
-    if (!models.run(ModelHost::Want{model, eo.drafter_files, start_from, args.name}, &err)) {
+    EngineOptions init_eo = start_from;
+    init_eo.mmproj_file = eo.vision ? eo.mmproj_file : "";
+    if (!models.run(ModelHost::Want{model, eo.drafter_files, init_eo, args.name}, &err)) {
       end_dashboard(true);
       os::write_original_stderr("error: " + err + "\n");
       pause_owned_console();
@@ -484,7 +487,7 @@ int run(int argc, char** argv) {
   } else {
     std::fprintf(stderr, "flyx-server: no model named: choose one in the dashboard's model panel\n");
   }
-  if (model.empty() && !remembered) {  // the GPU now, so that the page can tell which files fit it
+  if (model.empty()) {  // probe GPU up front so fit tags work while loading or if a remembered load fails
     std::string backend;
     flyx_device_info info{};
     if (probe_device(start_from, &backend, &info, &err)) {
@@ -492,7 +495,8 @@ int run(int argc, char** argv) {
                           {"mem_used", info.mem_total ? ojson(info.mem_total - info.mem_free) : ojson(nullptr)},
                           {"backend", backend}};
       if (info.mem_total) srv.probe_mem_used.store(info.mem_total - info.mem_free, std::memory_order_relaxed);
-      std::fprintf(stderr, "flyx-server: %s (%s), %.1f GB free\n", info.name, backend.c_str(), info.mem_free / 1e9);
+      if (!remembered)
+        std::fprintf(stderr, "flyx-server: %s (%s), %.1f GB free\n", info.name, backend.c_str(), info.mem_free / 1e9);
     }
   }
   // Connections past the workers wait for one, as many again at most: more are closed at once, not left to hang.

@@ -26,12 +26,12 @@ namespace {
 // next head's writes.
 // CANVAS: a DV canvas pass's rows (CanvasKeys): row r at P->start + 1 + pos_add + r, its K/V at slot
 // canvas_s0 + pos_add + r.
-template <bool Compact, bool CANVAS>
+template <bool Compact, bool CANVAS, bool MROPE = false>
 __global__ void k_attn_prep(const float* qkv, int ld, int q_off, int k_off, int v_off, const float* q_norm,
                             const float* k_norm, float norm_offset, float eps, double theta, int rot_dim, int nh,
                             int nkv, int hd, const DevParams* P, int pos_sel, int skip_if_noop, float* q_out, KvRef kv,
                             int pos_add, int hpb, const TreeRows* tree, const double* rope, int strata_base,
-                            int canvas_s0) {
+                            int canvas_s0, MRoPE mrope = {}) {
   pdl_trigger();
   extern __shared__ float sh[];
   if (skip_if_noop && P->noop) return;
@@ -42,8 +42,29 @@ __global__ void k_attn_prep(const float* qkv, int ld, int q_off, int k_off, int 
   const int half = rot_dim / 2;
   float* cs = sh + hd;
   if (d < half) {  // the pair's factor from rope_table, or its pow (a pair never registered)
-    if (rope) rope_cs_inv(pos, rope[d], &cs[d], &cs[half + d]);
-    else rope_cs(pos, d, rot_dim, theta, &cs[d], &cs[half + d]);
+    int rpos = pos;
+    if constexpr (MROPE) {
+      int pt, ph, pw;
+      if (!CANVAS && mrope.pos_3d) {
+        pt = mrope.pos_3d[3 * r + 0];
+        ph = mrope.pos_3d[3 * r + 1];
+        pw = mrope.pos_3d[3 * r + 2];
+      } else {
+        pt = ph = pw = pos + P->rope_delta;
+      }
+      int ax = 0;
+      if (mrope.interleaved) {
+        if (d % 3 == 1 && d < 3 * mrope.sec[1]) ax = 1;
+        else if (d % 3 == 2 && d < 3 * mrope.sec[2]) ax = 2;
+      } else {
+        if (d < mrope.sec[0]) ax = 0;
+        else if (d < mrope.sec[0] + mrope.sec[1]) ax = 1;
+        else ax = 2;
+      }
+      rpos = ax == 0 ? pt : (ax == 1 ? ph : pw);
+    }
+    if (rope) rope_cs_inv(rpos, rope[d], &cs[d], &cs[half + d]);
+    else rope_cs(rpos, d, rot_dim, theta, &cs[d], &cs[half + d]);
   }
   const int h_end = min(nh + nkv, (blockIdx.x + 1) * hpb);
   for (int hidx = blockIdx.x * hpb; hidx < h_end; ++hidx) {
@@ -713,31 +734,41 @@ __global__ void k_attention_combine(const float* part, int nh, int hd, int split
 void attn_prep(const float* qkv, int ld, int q_off, int k_off, int v_off, const float* q_norm, const float* k_norm,
                float norm_offset, float eps, double theta, int rot_dim, int nh, int nkv, int hd, int rows,
                const DevParams* P, int pos_sel, bool skip_if_noop, float* q_out, KvRef kv, cudaStream_t st,
-               int pos_add, const TreeRows* tree, int strata_base, CanvasKeys canvas) {
+               int pos_add, const TreeRows* tree, int strata_base, CanvasKeys canvas, MRoPE mrope) {
   // Heads per block: enough blocks to fill the GPU (about 512), else fewer rotations.  Every
   // grouping gives the same bits.  A 5760-token prefill: one head per block 11.5 ms of
   // attn_prep, all 20 of a row 2.9 ms (bench/trace).
   const int H = nh + nkv, hpb = std::clamp(H * rows / 512, 1, H);
   dim3 grid((H + hpb - 1) / hpb, rows);
   const size_t shared = (hd + rot_dim + (kv.kq ? 2 * hd : 0)) * sizeof(float);
+  const bool use_mrope = mrope.active();
   if (canvas.s0 >= 0) {
     if (tree || kv.kq) {  // DV's trees read every position exactly: no tree rows here, no low-bit copy to write
       std::fprintf(stderr, "flyx-cuda: attn_prep of a canvas pass with a tree or a low-bit copy\n");
       std::abort();
     }
-    k_attn_prep<false, true><<<grid, hd, shared, st>>>(qkv, ld, q_off, k_off, v_off, q_norm, k_norm, norm_offset, eps,
-                                                       theta, rot_dim, nh, nkv, hd, P, pos_sel, skip_if_noop, q_out,
-                                                       kv, pos_add, hpb, nullptr, rope_table(theta, rot_dim), 0,
-                                                       canvas.s0);
+    if (use_mrope)
+      k_attn_prep<false, true, true><<<grid, hd, shared, st>>>(qkv, ld, q_off, k_off, v_off, q_norm, k_norm, norm_offset,
+                                                               eps, theta, rot_dim, nh, nkv, hd, P, pos_sel, skip_if_noop,
+                                                               q_out, kv, pos_add, hpb, nullptr, rope_table(theta, rot_dim),
+                                                               0, canvas.s0, mrope);
+    else
+      k_attn_prep<false, true, false><<<grid, hd, shared, st>>>(qkv, ld, q_off, k_off, v_off, q_norm, k_norm, norm_offset,
+                                                                eps, theta, rot_dim, nh, nkv, hd, P, pos_sel, skip_if_noop,
+                                                                q_out, kv, pos_add, hpb, nullptr, rope_table(theta, rot_dim),
+                                                                0, canvas.s0);
     return;
   }
-  auto run = [&](auto tag) {
-    k_attn_prep<decltype(tag)::value, false><<<grid, hd, shared, st>>>(qkv, ld, q_off, k_off, v_off, q_norm, k_norm,
-        norm_offset, eps, theta, rot_dim, nh, nkv, hd, P, pos_sel, skip_if_noop, q_out, kv, pos_add, hpb, tree,
-        rope_table(theta, rot_dim), strata_base, -1);
+  auto run = [&](auto compact_tag, auto mrope_tag) {
+    k_attn_prep<decltype(compact_tag)::value, false, decltype(mrope_tag)::value><<<grid, hd, shared, st>>>(
+        qkv, ld, q_off, k_off, v_off, q_norm, k_norm, norm_offset, eps, theta, rot_dim, nh, nkv, hd, P, pos_sel,
+        skip_if_noop, q_out, kv, pos_add, hpb, tree, rope_table(theta, rot_dim), strata_base, -1, mrope);
   };
-  if (hd == 256 && kv.bits == 3 && kv.words == 24) run(std::true_type{});
-  else run(std::false_type{});
+  const bool compact = hd == 256 && kv.bits == 3 && kv.words == 24;
+  if (compact && use_mrope) run(std::true_type{}, std::true_type{});
+  else if (compact) run(std::true_type{}, std::false_type{});
+  else if (use_mrope) run(std::false_type{}, std::true_type{});
+  else run(std::false_type{}, std::false_type{});
 }
 
 namespace {

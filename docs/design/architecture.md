@@ -9,9 +9,9 @@ System architecture, repository layout, execution pipeline, memory hierarchy, an
 Directory boundaries are architecture boundaries enforced by `tools/check_layering.py` (ctest `layering`). Dependencies point strictly inward: `core/` depends only on itself and `include/`; `ops/` only on `core/interfaces/` and `include/`; `models/` on `core/interfaces/` and `core/modelfile/`; `backends/` on `core/interfaces/`, `ops/`, and `include/`; `apps/` wire layers together.
 
 ```text
-include/flyx/         Public C API (flyx.h, version 2) and engine <-> backend ABI (backend_abi.h, version 39)
+include/flyx/         Public C API (flyx.h, version 3) and engine <-> backend ABI (backend_abi.h, version 44)
 core/                 Plain C++20 engine, zero CUDA headers
-  interfaces/         Shared headers: model.h (open_model), chat.h (open_chat), options.h
+  interfaces/         Shared headers: model.h (open_model), chat.h (open_chat), options.h, vision.h
   modelfile/          Format-agnostic mmap container: .flyx (flyx_format.cpp) & GGUF container (gguf_format.cpp)
   hub/                Hugging Face Hub client (parallel range download, SHA-256, lock/resume, cache scanner)
   plan/               Program -> backend plan lowering, VRAM/RAM/StrataFlux tier planner (budget.cpp)
@@ -21,22 +21,24 @@ core/                 Plain C++20 engine, zero CUDA headers
   resources/          ResourceLedger and VRAM/host memory leases
   speculation/        RoundChooser, SpecController (cost-weighted drafter/width selection), LookupDrafter
   render/             ChatTemplate (native renderer or Jinja fallback), OpenAI/Anthropic/Responses converters
+  vision/             Base64/data-URI & in-memory image decoding (image.cpp), media-span prefix matching (media_span.h)
   tokenizer/          Byte-level BPE (template-only special tokens) and streaming UTF-8 decoder
   grammar/            XGrammar compiler, cache, and per-request token matcher
   os/                 OS abstraction (mmap, dynamic libraries, time, process/system stats, env.h, utf8.manifest)
 ops/<op>/ref.h        Float64 reference per op; ops/sampling/sampling.h (host/device token choice);
                       ops/dtype/ggml.h (GGML block float64 semantics)
-models/               Architecture descriptions (blocks, weights, state) and Programs: qwen35/, qwen3/, gguf.h
+models/               Architecture descriptions (blocks, weights, state) and Programs: qwen35/, qwen3/, llama/,
+                      vision/ (VisionAdapter preprocessing, smart-resize, 3D MRoPE positions), gguf.h
   formats/            Bidirectional chat formats: detection, reply parsing (tags/calls), XGrammar structural tags,
                       and byte-identical native renderers (qwen35.cpp)
 backends/cpu_ref/     Independent float64 reference backend (shared library)
 backends/cuda/        CUDA 13 backend (shared library): backend.h, blocks.h, backend.cpp
-  kernels/            CUDA kernels by op family (gemm*, attention*, gdn*, rows, sampling, draft, tree);
+  kernels/            CUDA kernels by op family (gemm*, attention*, gdn*, rows, sampling, draft, tree, vision);
                       kernels.cuh declares all public launchers; common/ holds device.cuh and launch.h
   regions/            Generic and fused region implementations (layers.cpp, linear.cpp, plan.cpp)
   runtime/            Sequence buffers & VMM KV mapping (state.cpp), CUDA-graph rounds & rollback (runner.cpp),
-                      round-graph memory and each session's room for it (graphs.cpp), adaptive host wait
-                      (sleep.cpp), NVML telemetry (device_stats.cpp)
+                      round-graph memory and each session's room for it (graphs.cpp), disk-offloaded vision
+                      weight streaming (vision_disk.cpp), adaptive host wait (sleep.cpp), NVML telemetry (device_stats.cpp)
   loader/             Block binding & stacked weight layout (bind.cpp), multithreaded pinned upload (weights.cpp)
   variants/           Compiled kernel configs (candidates.toml) and per-GPU tuning tables (<arch>/tables/<sku>.toml)
 apps/                 flyx-cli (unified `flyx` binary + terminal monitor), flyx-server (`serve`: openai_chat.cpp,
@@ -44,7 +46,7 @@ apps/                 flyx-cli (unified `flyx` binary + terminal monitor), flyx-
                       common/ (shared engine/sampling flag parser, defaults.h, model_source.cpp)
 python/               flyx/ (ctypes binding), convert/ (HF/ModelOpt -> .flyx), reference/ (PyTorch float64 ref)
 tests/                Mirrors source tree + tests/e2e/ (golden, GGUF, real-model checks)
-third_party/          Vendored libs (nlohmann/json, utf8proc, cpp-httplib, jinja, xgrammar, ggml, preact, htm)
+third_party/          Vendored libs (nlohmann/json, utf8proc, cpp-httplib, jinja, xgrammar, ggml, preact, htm, stb)
 bench/                cuda_bench, tree_bench, ab/, external/, prompts/, quality/, replay/, trace/
 tools/                codegen/ (gen_gemm_tables.py), windows/ (vsenv.ps1), ci/, check_layering.py, check_numerics.py,
                       check_docs.py
@@ -83,7 +85,7 @@ One dedicated thread (`Scheduler`) owns the GPU and drives a set of `Generation`
 
 Model execution is cleanly separated into four abstractions:
 
-1. **Blocks (`flyx_model_desc`, backend ABI 43):** `models/<arch>/` describes the model purely as data—weight table, per-sequence state table (KV caches, GDN states, MTP hidden ring), and typed blocks (`embedding`, `attention`, `gdn`, `mlp`, `head`, `mtp`, `dflash2`, `dv`, `dv_layer`) carrying dimensions, layout flags, and indices. Backends implement block kinds without knowing model names and refuse unsupported blocks at load time. Since ABI 34 the backend also exposes `trim()` so the engine can reclaim speed-only auxiliary copies (e.g., W12 / FP8-certified / 1-bit `SignHead` draft copies) under tight VRAM budgets before failing load.
+1. **Blocks (`flyx_model_desc`, backend ABI 44):** `models/<arch>/` describes the model purely as data—weight table, per-sequence state table (KV caches, GDN states, MTP hidden ring), and typed blocks (`embedding`, `attention`, `gdn`, `mlp`, `head`, `mtp`, `dflash2`, `dv`, `dv_layer`, plus `vision_stem`, `vision_pos`, `vision_block`, `vision_merge` for `FLYX_PHASE_VISION` multimodal encoders) carrying dimensions, layout flags, and indices. Backends implement block kinds without knowing model names and refuse unsupported blocks at load time. Vision models also expose a model-owned `VisionAdapter` (`core/interfaces/vision.h`, implemented in `models/vision/`) for image preprocessing and 3D MRoPE position generation, while `backends/cuda/` encodes images via `encode_vision` and splices embeddings into prefill via `prefill_ex`. Since ABI 34 the backend also exposes `trim()` so the engine can reclaim speed-only auxiliary copies (e.g., W12 / FP8-certified / 1-bit `SignHead` draft copies) under tight VRAM budgets before failing load.
 2. **Program:** `models/<arch>/` emits a flat, backend-neutral node list for prefill and for each drafter/width round (`run block`, `tap residual`, `draft`, `take context`, `accept`, `commit`). `core/plan` lowers programs once at load time.
 3. **Regions (`backends/cuda/regions/`):** `lower()` maps every node to either a generic op sequence or a registered fused override matching the block shape and row count (e.g., fused producer-to-GEMM staging, 1-kernel GDN rounds for ≤ 4 rows, SwiGLU epilogues). `--backend-opt fusion=0` forces generic implementations; golden tests verify fused == generic. Lowered decode plans are captured once per session as CUDA graphs.
 4. **Ops (`ops/<op>/ref.h` & `backends/cuda/kernels/`):** Every CUDA kernel launcher declared in `kernels/kernels.cuh` has a float64 reference in `ops/<op>/ref.h`, unit tests in `tests/backends/cuda/op_test_*.cu`, and a machine-checked contract row in [docs/design/numerics.md](numerics.md).
@@ -110,7 +112,7 @@ All device and host memory is accounted for by `ResourceLedger` before allocatio
   - The device reserve (`max(384 MiB, total / 40)`, raised to at least `832 MiB` = `768 MiB` paging floor + `64 MiB` desktop cushion where Windows pages GPU memory) absorbs driver overhead and desktop fluctuations without double-stacking on larger cards.
 - **What the budget says when memory is short:** The budget is what the device has free at the load plus what the model took, less the reserve; what is not in it is held by other programs, the driver, and the process's own CUDA runtime (context and kernel modules: 0.54 GB beside the 27B on an RTX 5070 Ti under Windows). `flyx_memory_info.process` (ABI 37) is the process's share of the device as the system counts it, which tells that runtime from other programs: Windows counts video memory by process (DXGI, the adapter with the CUDA device's LUID: 11,164 MiB against the "GPU Process Memory" counter's 11,168); NVML does not there nor under WSL2, and elsewhere the figure is 0 and the two are reported as one. Host memory is told the same way since ABI 39: `flyx_seq_size.host_mapped` is the part of a session's host memory mapped for the device alone (its K/V past the GPU's part), which no process memory figure counts, and `flyx_device_stats.process_host` the process's page-locked host memory as Windows counts it; telemetry's `process.ram` adds them to the resident memory.
   - Other programs' share of a desktop GPU is not a fixed figure: Windows moves idle programs' video memory out under pressure and back when the GPU empties. On that 5070 Ti they held 1.7 GiB beside a loaded 27B, 2.2 GiB a minute after it was unloaded and 3.5 GiB at a load made while the desktop was in use; a reload measures them after they have come back (0.2-0.35 GiB more than a few seconds later, on three loads). The budget takes what it measures; it does not wait for, or count on, what Windows may move out.
-  - Even with every K/V position in host memory a session keeps its fixed state, its positions' scales and its stagings on the GPU (the 27B's 2-bit file with its MTP layer: 0.74 GB at 1,024 tokens, 0.91 GB at 32,768, 1.78 GB at 131,072), and weights never go to host memory. So a load can fail, or `--ctx max` settle for a few thousand tokens, with host memory to spare. The refusal then names that shortest session and how much is missing rather than the context asked for; a context cut short is logged with the memory that cut it (`plan::ctx_limit_note`), as a warning under `kShortCtx` (32,768 tokens), and reported in the server's telemetry (`model.context_limit`).
+  - Even with every K/V position in host memory a session keeps its fixed state, its positions' scales and its stagings on the GPU (the 27B's 2-bit file with its MTP layer: 0.74 GB at 1,024 tokens, 0.91 GB at 32,768, 1.78 GB at 131,072), and language-model weights never go to host memory (vision encoder weights default to `--vision-device disk`, taking 0 VRAM and 0 locked host RAM). So a load can fail, or `--ctx max` settle for a few thousand tokens, with host memory to spare. The refusal then names that shortest session and how much is missing rather than the context asked for; a context cut short is logged with the memory that cut it (`plan::ctx_limit_note`), as a warning under `kShortCtx` (32,768 tokens), and reported in the server's telemetry (`model.context_limit`).
 - **Compact GDN state & shared prefill buffers:** Each session holds `FLYX_ROUND_SLOTS = 3` recurrent state slots on GPU (supporting 2 in-flight rounds plus rollback via input replay), while message-boundary checkpoints live in pinned host RAM. Prefill row buffers (`--prefill-chunk`) are allocated once per model and borrowed across sessions.
 
 ---

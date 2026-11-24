@@ -85,6 +85,8 @@ std::vector<GgufChoice> gguf_choices(const Repo& r);
 // Whether a GGUF at `path` ('/' between directories) can hold a model by its name: not a projector, an importance
 // matrix or an MTP layer of its own (mtp-*.gguf, anything under an MTP directory).  Split parts count.
 bool model_gguf_name(const std::string& path);
+// Whether a GGUF at `path` ('/' between directories) is a vision projector (mmproj) file by name/directory.
+bool mmproj_gguf_name(const std::string& path);
 // Parsed shard suffix of a split GGUF ("<prefix>-00001-of-00003.gguf").
 struct SplitGguf {
   std::string prefix;  // path before "-00001-of-00003.gguf"
@@ -107,6 +109,8 @@ bool is_drafter(const Repo& r);
 bool select(const Repo& r, const Name& name, std::vector<RepoFile>* files, std::string* err);
 // The MTP layer in a GGUF of its own beside the models (unsloth: MTP/mtp-*.gguf), or nullptr.
 const RepoFile* mtp_file(const Repo& r);
+// The multimodal vision projector in a GGUF beside the models (e.g. mmproj-BF16.gguf), or nullptr.
+const RepoFile* mmproj_file(const Repo& r);
 
 struct Progress {
   std::string file;                  // the one being fetched

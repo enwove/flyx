@@ -45,18 +45,147 @@ function ReplyMeta({ m }) {
   return html`<div class="cv-meta"><${CopyButton} get=${() => m.content}/>${vals.filter(Boolean).map((v) => html`<span>${t(v)}</span>`)}</div>`;
 }
 
-export function Chat({ active }) {
-  // Messages as the page shows them: {role: "user", content} or {role: "assistant", content, thinking, done, ...}.
+const MAX_IMG_BYTES = 32 * 1024 * 1024;
+const IMG_MIMES = new Set(["image/png", "image/jpeg", "image/bmp", "image/gif", "image/x-tga", "image/tga"]);
+const IMG_EXT = /\.(png|jpe?g|bmp|gif|tga|psd|ppm|pgm)$/i;
+const IMG_EXTRA_EXT = /\.(webp|avif|svg|ico|jfif)$/i;
+const EXT_MIME = {
+  png: "image/png", jpg: "image/jpeg", jpeg: "image/jpeg", bmp: "image/bmp", gif: "image/gif",
+  tga: "image/x-tga", psd: "image/vnd.adobe.photoshop", ppm: "image/x-portable-pixmap", pgm: "image/x-portable-graymap",
+};
+const NO_VISION_ERR = "Load a vision projector (mmproj) in Model settings to attach images.";
+const BAD_IMG_ERR = "Unsupported image format (use PNG, JPEG, BMP, GIF, or WebP).";
+const BIG_IMG_ERR = "Image exceeds the 32 MiB size limit.";
+
+const isImageFile = (f) => !!(f && ((f.type && f.type.toLowerCase().startsWith("image/")) ||
+  IMG_EXT.test(f.name || "") || IMG_EXTRA_EXT.test(f.name || "")));
+const imgNative = (f) => !!(f && ((f.type && IMG_MIMES.has(f.type.toLowerCase())) || IMG_EXT.test(f.name || "")));
+const normVDev = (v) => (v === "host" || v === "cpu") ? "host" : v === "gpu" ? "gpu" : v === "auto" ? "auto" : "disk";
+const normVQuant = (v) => (v === "exact" || v === "bf16") ? "exact" : (v === "nvfp4" || v === "fp4") ? "nvfp4" : "q8";
+const dragHasFiles = (e) => !!(e.dataTransfer && (Array.from(e.dataTransfer.types || []).includes("Files") ||
+  (e.dataTransfer.files && e.dataTransfer.files.length)));
+
+function extractTransferFiles(dt, imagesOnly) {
+  if (!dt) return [];
+  const out = [];
+  if (dt.files && dt.files.length) {
+    for (const f of Array.from(dt.files)) {
+      if (!imagesOnly || isImageFile(f)) out.push(f);
+    }
+  }
+  if (!out.length && dt.items && dt.items.length) {
+    for (const item of Array.from(dt.items)) {
+      if (item.kind !== "file") continue;
+      const f = item.getAsFile && item.getAsFile();
+      if (!f) continue;
+      const itemImg = !!(item.type && item.type.toLowerCase().startsWith("image/"));
+      if (imagesOnly && !isImageFile(f) && !itemImg) continue;
+      out.push(!isImageFile(f) && itemImg ? new File([f], f.name || "image", { type: item.type }) : f);
+    }
+  }
+  return out;
+}
+
+function readBlobAsDataUrl(blob) {
+  return new Promise((resolve) => {
+    const reader = new FileReader();
+    reader.onload = () => resolve(typeof reader.result === "string" ? reader.result : null);
+    reader.onerror = () => resolve(null);
+    reader.readAsDataURL(blob);
+  });
+}
+
+function ensureImageDataUrl(url, file) {
+  if (typeof url !== "string") return null;
+  const comma = url.indexOf(",");
+  if (comma < 0 || comma === url.length - 1) return null;
+  if (/^data:image\/[^;,]+;base64,/i.test(url)) return url;
+  const ext = ((file.name || "").split(".").pop() || "").toLowerCase();
+  const mime = (file.type && /^image\//i.test(file.type)) ? file.type.toLowerCase() : (EXT_MIME[ext] || "image/png");
+  return "data:" + mime + ";base64," + url.slice(comma + 1);
+}
+
+// Detect WebP / ISO BMFF (AVIF, HEIF) by magic bytes so files saved under a .png or .jpg name still transcode.
+async function sniffBrowserOnly(file) {
+  try {
+    const b = new Uint8Array(await file.slice(0, 12).arrayBuffer());
+    if (b.length >= 12 && b[0] === 0x52 && b[1] === 0x49 && b[2] === 0x46 && b[3] === 0x46 &&
+        b[8] === 0x57 && b[9] === 0x45 && b[10] === 0x42 && b[11] === 0x50) return "image/webp";
+    if (b.length >= 12 && b[4] === 0x66 && b[5] === 0x74 && b[6] === 0x79 && b[7] === 0x70) {
+      const brand = String.fromCharCode(b[8], b[9], b[10], b[11]);
+      return brand === "avif" || brand === "avis" ? "image/avif" : "application/octet-stream";
+    }
+  } catch { /* fall back to MIME / extension */ }
+  return "";
+}
+
+function canvasToBlob(canvas, type, quality) {
+  return new Promise((resolve) => canvas.toBlob((blob) => resolve(blob), type, quality));
+}
+
+async function transcodeImage(file, sniffedType) {
+  const srcBlob = sniffedType ? new Blob([file], sniffedType.startsWith("image/") ? { type: sniffedType } : {}) : file;
+  const objUrl = URL.createObjectURL(srcBlob);
+  try {
+    const img = await new Promise((resolve, reject) => {
+      const el = new Image();
+      el.onload = () => resolve(el);
+      el.onerror = () => reject(new Error("decode"));
+      el.src = objUrl;
+    });
+    const w = img.naturalWidth || img.width, h = img.naturalHeight || img.height;
+    if (!w || !h) return { err: BAD_IMG_ERR };
+    const canvas = document.createElement("canvas");
+    canvas.width = w;
+    canvas.height = h;
+    const ctx = canvas.getContext("2d");
+    if (!ctx) return { err: BAD_IMG_ERR };
+    ctx.drawImage(img, 0, 0, w, h);
+    let blob = await canvasToBlob(canvas, "image/png");
+    if (blob && blob.size > MAX_IMG_BYTES) {
+      // High-resolution WebP/AVIF can expand past 32 MiB as lossless PNG; fall back to white-matted JPEG.
+      ctx.globalCompositeOperation = "destination-over";
+      ctx.fillStyle = "#ffffff";
+      ctx.fillRect(0, 0, w, h);
+      blob = await canvasToBlob(canvas, "image/jpeg", 0.92);
+    }
+    if (!blob) return { err: BAD_IMG_ERR };
+    if (blob.size > MAX_IMG_BYTES) return { err: BIG_IMG_ERR };
+    const url = await readBlobAsDataUrl(blob);
+    return url ? { item: { name: file.name || "image.png", url } } : { err: BAD_IMG_ERR };
+  } catch {
+    return { err: BAD_IMG_ERR };
+  } finally {
+    URL.revokeObjectURL(objUrl);
+  }
+}
+
+async function loadImageFile(file) {
+  if (!isImageFile(file) || !file.size) return { err: BAD_IMG_ERR };
+  if (file.size > MAX_IMG_BYTES) return { err: BIG_IMG_ERR };
+  const sniffed = await sniffBrowserOnly(file);
+  if (sniffed || !imgNative(file)) return transcodeImage(file, sniffed);
+  const url = ensureImageDataUrl(await readBlobAsDataUrl(file), file);
+  return url ? { item: { name: file.name || "image", url } } : { err: BAD_IMG_ERR };
+}
+
+export function Chat({ active, showModel }) {
+  // Messages as the page shows them: {role: "user", content, images?, imageCount?} or {role: "assistant", content, thinking, done, ...}.
   const [msgs, setMsgs] = useState([]);
   const [prompt, setPrompt] = useState("");
+  const [images, setImages] = useState([]);  // [{name, url}] pending attachments
+  const [imgErr, setImgErr] = useState("");
+  const [drag, setDrag] = useState(false);
   const [think, setThink] = useState(true);
   // The history: the conversations kept in this browser, the one shown among them ("" until its first message),
   // whether their list is open.
   const [chats, setChats] = useState(loadChats);
   const [chatId, setChatId] = useState("");
   const [histOpen, setHistOpen] = useState(false);
-  const controller = useRef(null), box = useRef(null), input = useRef(null);
+  const controller = useRef(null), box = useRef(null), input = useRef(null), fileInput = useRef(null), readSeq = useRef(0);
   const streaming = !!controller.current;
+  const tm = live.last || {}, model = tm.model || {}, sl = (tm.memory && tm.memory.sessions) || [];
+  const hasVision = !!model.vision;
   // The conversation `id` in the history as `ms` has it now, at the top; untouched when nothing in it changed (one
   // only opened and read stays where it was).
   const keep = (id, ms) => setChats((old) => {
@@ -64,7 +193,8 @@ export function Chat({ active }) {
     if (!id || !first) return old;
     const was = old.find((c) => c.id === id);
     if (was && JSON.stringify(was.msgs) === JSON.stringify(turns)) return old;
-    const title = first.content.replace(/\s+/g, " ").trim().slice(0, 80);
+    const rawTitle = (first.content || "").replace(/\s+/g, " ").trim();
+    const title = (rawTitle || (first.imageCount ? "[Image]" : "")).slice(0, 80);
     return storeChats([{ id, at: Date.now(), title, msgs: turns }, ...old.filter((c) => c.id !== id)]);
   });
   // Kept whenever it changes and no reply is being written: after each reply, and after one is stopped or fails.
@@ -78,6 +208,10 @@ export function Chat({ active }) {
     return () => { document.removeEventListener("click", click); document.removeEventListener("keydown", esc); };
   }, [histOpen]);
   useEffect(() => { if (active && input.current) input.current.focus(); }, [active]);
+  useEffect(() => {
+    if (!hasVision) { readSeq.current++; setImages([]); setImgErr(""); setDrag(false); }
+    else setImgErr((e) => e === NO_VISION_ERR ? "" : e);
+  }, [hasVision]);
   useLayoutEffect(() => { if (box.current) box.current.scrollTop = box.current.scrollHeight; }, [msgs]);
 
   const update = (changes) => setMsgs((ms) => {
@@ -88,23 +222,63 @@ export function Chat({ active }) {
     return next;
   });
 
+  const addFiles = (fileList) => {
+    const list = fileList ? Array.from(fileList) : [];
+    if (!list.length) return;
+    if (!hasVision) { setImgErr(NO_VISION_ERR); return; }
+    setImgErr("");
+    const seq = readSeq.current;
+    Promise.all(list.map(loadImageFile)).then((results) => {
+      if (seq !== readSeq.current) return;
+      const ok = [];
+      let err = "";
+      for (const r of results) {
+        if (r.item) ok.push(r.item);
+        else if (r.err) err = r.err;
+      }
+      setImgErr(err);
+      if (ok.length) setImages((old) => old.concat(ok));
+    });
+  };
+  const onPaste = (e) => {
+    const files = extractTransferFiles(e.clipboardData, true);
+    if (!files.length) return;
+    e.preventDefault();
+    if (!hasVision) { setImgErr(NO_VISION_ERR); return; }
+    addFiles(files);
+  };
+  const userWire = (m) => {
+    if (m.images && m.images.length) {
+      const parts = m.images.map((im) => ({ type: "image_url", image_url: { url: im.url } }));
+      if (m.content) parts.push({ type: "text", text: m.content });
+      return { role: "user", content: parts };
+    }
+    if (!m.content && m.imageCount) return { role: "user", content: "[Image]" };
+    return { role: "user", content: m.content };
+  };
+
   async function send() {
     const content = prompt.trim();
-    if (!content || controller.current) return;
+    const attached = hasVision ? images.slice() : [];
+    if ((!content && !attached.length) || controller.current) return;
+    readSeq.current++;
     setPrompt("");
+    setImages([]);
+    setImgErr("");
     // What the model is sent: a turn that failed is left out with its question; a stopped reply goes as far as it got.
     const history = [];
     for (const m of msgs) {
-      if (m.role === "user") history.push({ role: "user", content: m.content });
+      if (m.role === "user") history.push(userWire(m));
       else if (m.error) history.pop();
       else if (m.done || (m.stopped && m.content)) history.push({ role: "assistant", content: m.content });
     }
-    const turns = history.concat([{ role: "user", content }]);
+    const userMsg = attached.length ? { role: "user", content, images: attached } : { role: "user", content };
+    const turns = history.concat([userWire(userMsg)]);
     // The question is kept at once: a page closed before the reply came still has it.
     const chat = chatId || newChatId();
     if (!chatId) setChatId(chat);
-    keep(chat, msgs.concat([{ role: "user", content }]));
-    setMsgs((ms) => ms.concat([{ role: "user", content }, { role: "assistant", content: "", thinking: "", model: (live.last && live.last.model && live.last.model.id) || "Model" }]));
+    keep(chat, msgs.concat([userMsg]));
+    setMsgs((ms) => ms.concat([userMsg, { role: "assistant", content: "", thinking: "", model: (live.last && live.last.model && live.last.model.id) || "Model" }]));
     controller.current = new AbortController();
     const t0 = performance.now();
     let first = 0, reply = "", thinking = "", usage = null, id = "";
@@ -165,12 +339,18 @@ export function Chat({ active }) {
   }
   const clear = () => {
     if (controller.current) controller.current.abort();
+    readSeq.current++;
     setMsgs([]);
+    setImages([]);
+    setImgErr("");
     setChatId("");
   };
   const openChat = (c) => {
     if (controller.current) controller.current.abort();
+    readSeq.current++;
     setMsgs(c.msgs.map((m) => Object.assign({}, m)));
+    setImages([]);
+    setImgErr("");
     setChatId(c.id);
     setHistOpen(false);
     if (input.current) input.current.focus();
@@ -188,12 +368,12 @@ export function Chat({ active }) {
   };
   const key = (e) => { if (e.key === "Enter" && !e.shiftKey && !e.isComposing) { e.preventDefault(); send(); } };
 
-  const tm = live.last || {}, model = tm.model || {}, sl = (tm.memory && tm.memory.sessions) || [];
   const lr = (tm.recent || []).find((r) => r.label === "chat");
   const stat = [];
   if (model.context) stat.push(["context", ktok(sl.length ? sl[0].tokens : 0) + " / " + ktok(model.context)]);
   if (lr) stat.push(["last reply", fmt(lr.decode_tok_s, 1) + " tok/s"]);
   if (model.drafter) stat.push(["drafter", model.drafter]);
+  if (hasVision) stat.push(["vision", t(normVDev(model.vision_device)) + " · " + normVQuant(model.vision_quant)]);
   return html`
     <div class="chat">
       <div class="histwrap">
@@ -206,7 +386,7 @@ export function Chat({ active }) {
             ${chats.map((c) => html`
               <div class=${"hist-row" + (c.id === chatId ? " sel" : "")} role="menuitem" tabindex="0" data-chat=${c.id} onClick=${() => openChat(c)}
                    onKeyDown=${(e) => { if (e.key === "Enter" && e.target === e.currentTarget) openChat(c); }}>
-                <span class="ht">${c.title}</span>
+                <span class="ht">${c.title === "[Image]" ? t("[Image]") : c.title}</span>
                 <span class="hm">${t(ago(c.at / 1000))} · ${t(c.msgs.length + (c.msgs.length === 1 ? " message" : " messages"))}</span>
                 <button class="iconbtn del" title=${t("Delete")} aria-label=${t("Delete")}
                         onClick=${(e) => { e.stopPropagation(); forget(c.id); }}><${Icon} name="trash"/></button>
@@ -218,7 +398,10 @@ export function Chat({ active }) {
       <div class="msgs" aria-live="polite" ref=${box}><div class="cv" id="msgs">
         ${!msgs.length ? html`<div class="empty" id="chat-empty" style="text-align: center; padding-top: 18vh">
           ${t("Talk to the model on this server. Replies stream from POST /v1/chat/completions.")}</div>` : ""}
-        ${msgs.map((m, i) => m.role === "user" ? html`<div class="cv-user">${m.content}</div>` : html`
+        ${msgs.map((m, i) => m.role === "user" ? html`<div class="cv-user">
+          ${m.images && m.images.length ? html`<div class="cv-imgs">${m.images.map((im) => html`<img src=${im.url} alt=${im.name || "image"}/>`)}</div>`
+            : m.imageCount ? html`<div class="cv-imgnote">${t(m.imageCount === 1 ? "[1 image attached]" : "[" + m.imageCount + " images attached]")}</div>` : ""}
+          ${m.content}</div>` : html`
           <${AsstTurn} parts=${[]} name=${m.model} current>
             ${m.thinking ? html`<${Think} text=${m.thinking} label=${m.done || m.stopped || m.error ? t("Thought · " + fmt(m.thinking.length) + " characters") : t("Thinking")}/>` : ""}
             <div class="md" dangerouslySetInnerHTML=${{ __html: md(m.content || "") }}></div>
@@ -227,13 +410,36 @@ export function Chat({ active }) {
           <//>`)}
       </div></div>
       <div class="composer">
-        <div class="compose">
-          <textarea id="prompt" rows="1" ref=${input} placeholder=${t("Message FLYX. Enter sends, Shift+Enter for a new line.")}
-                    value=${prompt} onInput=${(e) => setPrompt(e.target.value)} onKeyDown=${key}></textarea>
+        <div class=${"compose" + (drag ? " drag" : "")}
+             onDragOver=${(e) => { if (dragHasFiles(e)) { e.preventDefault(); if (hasVision) setDrag(true); } }}
+             onDragLeave=${(e) => { if (!e.currentTarget.contains(e.relatedTarget)) setDrag(false); }}
+             onDrop=${(e) => {
+               setDrag(false);
+               if (!dragHasFiles(e)) return;
+               e.preventDefault();
+               if (!hasVision) { setImgErr(NO_VISION_ERR); return; }
+               addFiles(extractTransferFiles(e.dataTransfer, false));
+             }}>
+          ${images.length ? html`<div class="compose-imgs" id="chat-imgs">${images.map((im, idx) => html`
+            <div class="compose-thumb"><img src=${im.url} alt=${im.name || "image"}/>
+              <button type="button" title=${t("Remove")} aria-label=${t("Remove")}
+                      onClick=${() => setImages((old) => old.filter((_, j) => j !== idx))}><${Icon} name="close"/></button></div>`)}</div>` : ""}
+          ${imgErr ? html`<div class=${"compose-err" + (imgErr === NO_VISION_ERR ? " note" : "")} id="chat-imgerr">
+            <span>${t(imgErr)}</span>
+            ${imgErr === NO_VISION_ERR && showModel ? html`<button type="button" class="linkbtn" id="chat-img-model" onClick=${showModel}>${t("Model settings")}</button>` : ""}
+          </div>` : ""}
+          <textarea id="prompt" rows="1" ref=${input} placeholder=${t(hasVision ? "Message FLYX, or paste / drop an image. Enter sends, Shift+Enter for a new line." : "Message FLYX. Enter sends, Shift+Enter for a new line.")}
+                    value=${prompt} onInput=${(e) => setPrompt(e.target.value)} onKeyDown=${key} onPaste=${onPaste}></textarea>
           <div class="btns">
+            <input type="file" ref=${fileInput} accept="image/*,.tga,.psd,.ppm,.pgm,.webp,.avif" multiple hidden
+                   onChange=${(e) => { addFiles(e.target.files); e.target.value = ""; }}/>
+            <button type="button" class=${"imgbtn" + (hasVision ? "" : " off")} id="chat-img" disabled=${streaming}
+                    data-vision=${hasVision ? "1" : "0"}
+                    title=${t(hasVision ? "Attach image" : NO_VISION_ERR)} aria-label=${t("Attach image")}
+                    onClick=${() => { if (!hasVision) setImgErr(NO_VISION_ERR); else if (fileInput.current) fileInput.current.click(); }}><${Icon} name="image"/></button>
             <button class="sendbtn stop" id="stop" disabled=${!streaming} title=${t("Stop")} aria-label=${t("Stop the reply")}
                     onClick=${() => controller.current && controller.current.abort()}><${Icon} name="stopsq"/></button>
-            <button class=${"sendbtn" + (prompt.trim() ? "" : " dim")} id="send" disabled=${streaming} title=${t("Send (Enter)")} aria-label=${t("Send")}
+            <button class=${"sendbtn" + (prompt.trim() || images.length ? "" : " dim")} id="send" disabled=${streaming} title=${t("Send (Enter)")} aria-label=${t("Send")}
                     onClick=${send}><${Icon} name="arrowup"/></button>
           </div>
         </div>

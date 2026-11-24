@@ -83,6 +83,8 @@ struct EmbedBlock {
 struct AttnBlock {
   int hidden = 0, nh = 0, nkv = 0, hd = 0, rot = 0;
   double theta = 0;
+  int mrope_section[3] = {0, 0, 0};
+  int mrope_interleaved = 0;
   bool gate = false;           // the q projection is [q (nh*hd) | gate (nh*hd)]
   Norm norm, q_norm, k_norm;   // q_norm and k_norm share offset and eps; w null: none (Llama's heads as projected)
   Lin w_in, w_out;             // w_in: the projections stacked as above
@@ -90,6 +92,9 @@ struct AttnBlock {
   int kv = -1;                 // its cache (StateTable::kv)
   int q_width() const { return (gate ? 2 : 1) * nh * hd; }
   int n_in() const { return q_width() + 2 * nkv * hd; }
+  MRoPE mrope(const int32_t* pos_3d = nullptr) const {
+    return MRoPE{{mrope_section[0], mrope_section[1], mrope_section[2]}, mrope_interleaved, pos_3d};
+  }
 };
 
 // norm -> [mixed (q|k|v) | z | b | a] -> causal conv, gated delta rule over
@@ -196,8 +201,116 @@ struct DvBlock {
   float *sel_ta = nullptr, *sel_tb = nullptr;  // [vocab][sel_rank]: A E[t] and B E[t] for every token t
 };
 
+// Float32 vision vector/table (patch_w, pos_w, norms, biases, layer_scale), on GPU, pinned host RAM, or disk.
+struct VisionVec {
+  float* ptr = nullptr;
+  size_t count = 0;
+  bool on_host = false;
+  bool on_disk = false;
+  uint64_t disk_off = 0;
+  bool present() const { return count > 0 && (ptr != nullptr || on_disk); }
+  bool offloaded() const { return on_host || on_disk; }
+  size_t bytes() const { return count * sizeof(float); }
+};
+
+// Generalized vision norm (LayerNorm with optional w/b, or RMSNorm).
+struct VNorm {
+  int kind = FLYX_NORM_LAYER;
+  VisionVec w, b;
+  float offset = 0.f, eps = 1e-6f;
+  bool present() const { return w.present() || b.present(); }
+};
+
+// Vision linear weight [N, K] (zero-padded to K_pad when quantized with K % align != 0),
+// resident on GPU, in pinned host RAM (on_host: 0 VRAM), or in an auto-deleted disk file (on_disk: 0 VRAM & 0 locked RAM).
+struct VisionLin {
+  enum DiskKind { kDiskNone = 0, kDiskBf16 = 1, kDiskNvfp4 = 2, kDiskPacked = 3 };
+  Lin w;  // device ptrs on GPU; pinned host ptrs when on_host; BlockMat metadata (null ptrs) when on_disk + kDiskPacked
+  int N = 0, K = 0, K_pad = 0;
+  bool on_host = false;
+  bool on_disk = false;
+  bool a4 = false;  // pre-quantized NVFP4 weight calibrated for W4A4 prefill activations (FLYX_ACT_NVFP4)
+  DiskKind disk_kind = kDiskNone;
+  uint64_t disk_off = 0;
+  size_t disk_bytes = 0;
+  bool present() const {
+    return N > 0 && (w.w != nullptr || w.q != nullptr || w.packed() || (on_disk && disk_kind != kDiskNone));
+  }
+  bool offloaded() const { return on_host || on_disk; }
+  bool q8_inputs() const { return w.q8_inputs(); }
+  int eff_k() const { return K_pad > 0 ? K_pad : K; }
+  size_t staging_bytes() const {
+    if (!present()) return 0;
+    if (on_disk) return disk_bytes;
+    const size_t ke = size_t(eff_k());
+    auto align256 = [](size_t b) { return (b + 255) / 256 * 256; };
+    if (w.packed()) {
+      size_t total = 0;
+      for (const BlockMat& bm : w.blk) {
+        const BlockLayout lo = blocks_layout(bm.dtype);
+        const size_t per_row = ke / size_t(lo.values);
+        total += align256(size_t(bm.rows) * per_row * size_t(lo.stride));
+        total += align256(size_t(bm.rows) * per_row * size_t(lo.scales) * sizeof(uint16_t));
+      }
+      return total;
+    }
+    if (w.q) {
+      return align256(size_t(N) * ke / 2) + align256(size_t(N) * ke / 16) + align256(size_t(N) * sizeof(float));
+    }
+    return align256(size_t(N) * ke * sizeof(bf16));
+  }
+};
+
+// Vision encoder stem: patch projection (float32, arbitrary in_dim) + optional bias, pos_embed, pre_norm.
+struct VisionStemBlock {
+  int in_dim = 0, hidden = 0;
+  VisionVec patch_w;             // [hidden, in_dim] float32 (concatenated [W0 | W1] if patch_w2 >= 0)
+  VisionVec patch_b;             // [hidden] float32 (optional)
+  int pos_mode = FLYX_VPOS_NONE;
+  VisionVec pos_w;               // [pos_rows, hidden] float32 (optional)
+  int pos_rows = 0, pos_grid_h = 0, pos_grid_w = 0, merge_size = 1;
+  VisionVec cls_token;           // [hidden] float32 (optional)
+  VNorm pre_norm;
+};
+
+// Bidirectional ViT self-attention (arbitrary head_dim <= 256, optional Q/K norm, 2D axial RoPE, LayerScale).
+struct VitAttnBlock {
+  int hidden = 0, nh = 0, hd = 0;
+  int rope_mode = FLYX_VROPE_NONE;
+  double theta = 0;
+  int merge_size = 1;
+  VNorm norm, q_norm, k_norm;
+  VisionLin w_qkv, w_o;          // w_qkv: [3 * nh * hd, hidden]
+  VisionVec qkv_b;               // [3 * nh * hd] (optional)
+  VisionVec o_b;                 // [hidden] (optional)
+  VisionVec layer_scale;         // [hidden] (optional)
+};
+
+// ViT MLP (plain or gated, optional biases and LayerScale).
+struct VitMlpBlock {
+  int hidden = 0, inter = 0;
+  int act = FLYX_VACT_GELU_TANH;
+  bool gated = false;
+  VNorm norm;
+  VisionLin w_fc1, w_gate, w_fc2;
+  VisionVec fc1_b, gate_b, fc2_b;
+  VisionVec layer_scale;
+};
+
+// Spatial token merger + multimodal projector (spatial concat / avg pool / none + 1 or 2 linear layers).
+struct VisionMergeBlock {
+  int in_hidden = 0, merge_hidden = 0, out_hidden = 0;
+  int merge_mode = FLYX_VMERGE_NONE;
+  int merge_size = 1;
+  int act = FLYX_VACT_GELU;
+  bool post_norm = false;
+  VNorm norm;
+  VisionLin w_fc1, w_fc2;
+  VisionVec fc1_b, fc2_b;
+};
+
 using Block = std::variant<EmbedBlock, AttnBlock, GdnBlock, MlpBlock, HeadBlock, MtpBlock, DFlashBlock, DFlashLayer,
-                           DvBlock, DvLayer>;
+                           DvBlock, DvLayer, VisionStemBlock, VitAttnBlock, VitMlpBlock, VisionMergeBlock>;
 
 // ---- a sequence's state, as the table declares it -------------------------------------------
 struct KvBuf {

@@ -52,10 +52,11 @@ def native_args(command, shell, tmp):
     return json.loads(result.read_text(encoding="utf8"))
 
 
-def hub_model(repo, quant, size, mtp=None, current=True):
+def hub_model(repo, quant, size, mtp=None, current=True, mmproj=None):
     file = repo.split("/")[1].replace("-GGUF", "") + "-" + quant + ".gguf"
     return {"name": repo + ":" + quant, "kind": "gguf", "source": "hub", "repo": repo, "quant": quant, "file": file,
-            "path": CACHE + "\\" + file, "size": size, "modified": 1.7e9, "revision": "abc123", "current": current, "mtp": mtp}
+            "path": CACHE + "\\" + file, "size": size, "modified": 1.7e9, "revision": "abc123", "current": current,
+            "mtp": mtp, "mmproj": mmproj}
 
 
 def dir_model(folder, file, size, kind="gguf", quant=None):
@@ -64,9 +65,12 @@ def dir_model(folder, file, size, kind="gguf", quant=None):
 
 
 CATALOG = {"cache": CACHE, "cache_from": "default", "dirs": [FOLDER], "models": [
-    hub_model(REPO, "Q4_K_M", int(17.6 * GB), "in-file"), hub_model(REPO, "IQ3_XXS", int(11.8 * GB), "in-repo"),
+    hub_model(REPO, "Q4_K_M", int(17.6 * GB), "in-file", mmproj="in-repo"),
+    hub_model(REPO, "IQ3_XXS", int(11.8 * GB), "in-repo", mmproj="in-repo"),
     hub_model("acme/Tiny-4B-GGUF", "Q8_0", int(4.5 * GB), None, False),
-    dir_model(FOLDER, "tiny-bf16.flyx", int(0.4 * GB), "flyx"), dir_model(FOLDER, "Other-12B-Q5_K_M.gguf", int(8.9 * GB), quant="Q5_K_M"),
+    dir_model(FOLDER, "tiny-bf16.flyx", int(0.4 * GB), "flyx"),
+    dir_model(FOLDER, "Other-12B-Q5_K_M.gguf", int(8.9 * GB), quant="Q5_K_M"),
+    dir_model(FOLDER, "mmproj-BF16.gguf", int(0.9 * GB), kind="mmproj"),
     {"name": "acme/Tiny-27B-DFlash2", "kind": "drafter", "source": "hub", "repo": "acme/Tiny-27B-DFlash2", "size": int(1.9 * GB)}]}
 FOUND = {"query": "Qwen3", "family": True, "endpoint": "https://huggingface.co", "models": [
     {"id": REPO, "downloads": 7383193, "likes": 6300, "updated": "2026-11-12T02:15:52.000Z", "created": None, "pipeline": None,
@@ -82,6 +86,7 @@ def repository(repo):
     return {"repo": repo, "from_cache": False, "drafter": None, "base_models": ["acme/Tiny-27B"], "runs": runs,
             "known_drafters": ["acme/Tiny-27B-DFlash2"] if runs else [], "build_architectures": ["qwen35", "qwen3"],
             "mtp": {"path": "MTP/mtp.gguf", "size": int(0.6 * GB), "cached": True} if runs else None,
+            "mmproj": {"path": "mmproj-BF16.gguf", "size": int(0.9 * GB), "cached": True} if runs else None,
             "info": {"downloads": 7383193, "likes": 6300, "updated": "2026-11-12T02:15:52.000Z", "license": "apache-2.0", "pipeline": None,
                      "gated": False, "architecture": "qwen35" if runs else "gemma4", "context": 262144, "parameters": 27320697856},
             "ggufs": [{"name": repo + ":" + q, "quant": q, "size": int(s * GB), "split": False, "parts": 1, "complete": True, "cached": c and runs}
@@ -282,17 +287,54 @@ def check_drafters(page, server, want):
     for spec, mode, paths in [(True, "none", []), (True, "dflash2", []), (False, "all", files), (True, "all", files)]:
         want.update(speculative=spec, drafter=mode, drafters=paths)
         page.reload()
+        page.locator('#lset-tabs [data-stab="spec"]').click()
         expect(page.locator("#sd-saved input")).to_be_checked()
         expect(page.locator("#mf-reload")).to_have_count(0)
+        page.locator('#lset-tabs [data-stab="general"]').click()
         page.locator("#mf-ctx").fill("4096")
         check_choice(spec, mode, paths)
     page.locator("#mf-reset").click()
+    page.locator('#lset-tabs [data-stab="spec"]').click()
     page.locator("#sd-default").click()
     check_choice(True, "", [])
     page.locator("#sd-file").fill("./another.gguf")
     check_choice(True, "mtp", ["./another.gguf"])
     page.locator("#mf-reset").click()
     expect(page.locator("#sd-saved input")).to_be_checked()
+
+
+def check_vision(page, server, open_page, want):
+    """Vision encoder settings tab: custom mmproj, storage/precision/max-tokens, disable toggle."""
+    page.locator('#lset-tabs [data-stab="vision"]').click()
+    expect(page.locator("#vs-on")).to_be_checked()
+    expect(page.locator("#vs-device")).to_have_value("disk")
+    expect(page.locator("#vs-quant")).to_have_value("q8")
+    page.locator("#vs-file").fill("./mmproj-test.gguf")
+    page.locator("#vs-device").select_option("host")
+    page.locator("#vs-quant").select_option("nvfp4")
+    page.locator("#vs-maxtok").fill("1024")
+    assert page.locator("#vs-maxtok").evaluate("el => el.checkValidity()")
+    args = command(page)
+    assert args[args.index("--mmproj") + 1] == "./mmproj-test.gguf", args
+    assert args[args.index("--vision-device") + 1] == "host", args
+    assert args[args.index("--vision-quant") + 1] == "nvfp4", args
+    assert args[args.index("--vision-max-tokens") + 1] == "1024", args
+    confirm(page, "#mf-reload", "Reload")
+    body = server.posted[-1]
+    assert (body["vision"], body["mmproj"], body["vision_device"], body["vision_quant"], body["vision_max_tokens"]) == (
+        True, "./mmproj-test.gguf", "host", "nvfp4", 1024), body
+    page.locator("#vs-on").uncheck(force=True)
+    args = command(page)
+    assert "--no-vision" in args and "--mmproj" not in args and "--vision-device" not in args, args
+    confirm(page, "#mf-reload", "Reload")
+    body = server.posted[-1]
+    assert body["vision"] is False and body["mmproj"] is None, body
+    page.locator("#mf-reset").click()
+    expect(page.locator("#vs-on")).to_be_checked()
+    # A model loaded with vision disabled (even if a stale mmproj remained in saved settings) shows no ghost changes.
+    off_page, _ = open_page(telemetry(dict(want, vision=False, mmproj="./stale.gguf")))
+    expect(off_page.locator("#mf-reload")).to_have_count(0)
+    off_page.close()
 
 
 def check_hub(page, server, want):
@@ -302,6 +344,7 @@ def check_hub(page, server, want):
     expect(page.locator("#hf-family")).to_contain_text("Qwen3")
     expect(page.locator("#hf-name")).to_have_text("Tiny-27B-GGUF")  # the first repository found is shown
     expect(page.locator("#mf-files .mrow")).to_have_count(5)
+    expect(page.locator("#hf-mmproj")).to_contain_text("mmproj-BF16.gguf")
     expect(page.locator("#mf-load")).to_be_disabled()
     page.locator('#mf-files .mrow[data-name$=":Q5_K_M"]').click()
     expect(page.locator("#mf-load")).to_have_text("Switch to this model")
@@ -335,15 +378,17 @@ def check_local(page, server):
     expect(folders).to_have_count(3)  # where Hugging Face downloads to, the model directory, the served model's folder
     expect(folders.nth(0).locator(".ps")).to_have_text(CACHE)
     expect(folders.nth(1).locator(".ps")).to_have_text(FOLDER)
-    expect(models).to_have_count(6)
+    expect(models).to_have_count(7)
     one = page.locator('#lc-list .prow.model[data-model="' + REPO + ':IQ3_XXS"]')
     expect(one.locator(".pn")).to_have_text("Tiny-27B-GGUF · IQ3_XXS")
     expect(one.locator(".pm")).to_have_text("11.8 GB")
     expect(one.locator(".pt")).to_have_text("GGUF")
     expect(page.locator('#lc-list .prow.model[data-model$="tiny-bf16.flyx"] .pt')).to_have_text(".flyx")
+    expect(page.locator('#lc-list .prow.model[data-model$="mmproj-BF16.gguf"] .pt')).to_have_text("mmproj")
     expect(page.locator('#lc-list .prow.model[data-model="acme/Tiny-27B-DFlash2"] .pt')).to_have_text("drafter")
     one.click()
     expect(page.locator("#lc-name")).to_have_text("Tiny-27B-GGUF · IQ3_XXS")
+    expect(page.locator("#lc-detail .dchips")).to_contain_text("+ Vision")
     expect(page.locator("#lc-path")).to_contain_text("Tiny-27B-IQ3_XXS.gguf")
     confirm(page, "#mf-load", "Switch")
     assert server.posted[-1]["model"] == REPO + ":IQ3_XXS", server.posted[-1]
@@ -355,9 +400,18 @@ def check_local(page, server):
     page.locator("#mf-q").fill("12b")
     expect(models).to_have_count(1)
     page.locator("#mf-q").fill("")
-    # A drafter is not loaded; a folder's own row shows the folder: where Hugging Face downloads to, by repository.
+    # A drafter or vision projector is not loaded on its own; a projector can be attached under Vision settings.
     page.locator('#lc-list .prow.model[data-model="acme/Tiny-27B-DFlash2"]').click()
     expect(page.locator("#mf-load")).to_be_disabled()
+    page.locator('#lc-list .prow.model[data-model$="mmproj-BF16.gguf"]').click()
+    expect(page.locator("#mf-load")).to_be_disabled()
+    expect(page.locator("#lc-detail")).to_contain_text("vision projector")
+    page.locator("#lc-use-mmproj").click()
+    expect(page.locator("#mv-current")).to_be_visible()
+    expect(page.locator("#vs-file")).to_have_value(FOLDER + "\\mmproj-BF16.gguf")
+    page.locator("#mf-reset").click()
+    view(page, "library")
+    page.locator('#src-seg [data-src="local"]').click()
     folders.nth(0).click()
     expect(page.locator("#mf-path")).to_have_value(CACHE)
     expect(page.locator("#mf-cached .rgroup")).to_have_count(3)
@@ -565,6 +619,7 @@ def check(browser):
     check_settings(page, server, want)
     check_commands(page, want)
     check_drafters(page, server, want)
+    check_vision(page, server, open_page, want)
     page.close()
     check_context_limit(open_page, want)
     check_vram_apps(open_page, want)

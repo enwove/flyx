@@ -149,6 +149,16 @@ int main() {
   test_penalize();
   test_wide_rows_choice();
   test_fp4();
+  test_layernorm();
+  test_add_bias();
+  test_vact();
+  test_gemm_f32();
+  test_vision_pos_embed();
+  test_vision_rope_2d();
+  test_vision_attention();
+  test_vision_avg_pool();
+  test_embed_scatter();
+  test_mrope();
   std::printf("%s (%d failures)\n", g_fail ? "FAILED" : "PASSED", g_fail);
   return g_fail ? 1 : 0;
 }

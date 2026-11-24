@@ -9,6 +9,7 @@
 #include <string_view>
 #include <thread>
 
+#include "core/exec/generation.h"
 #include "core/interfaces/options.h"
 #include "core/os/env.h"
 #include "core/os/log.h"
@@ -18,6 +19,25 @@
 namespace flyx {
 
 namespace {
+
+int32_t to_abi_vision_device(interfaces::VisionDeviceMode m) {
+  switch (m) {
+    case interfaces::VisionDeviceMode::kDisk: return FLYX_VISION_DEV_DISK;
+    case interfaces::VisionDeviceMode::kHost: return FLYX_VISION_DEV_HOST;
+    case interfaces::VisionDeviceMode::kGpu: return FLYX_VISION_DEV_GPU;
+    case interfaces::VisionDeviceMode::kAuto: return FLYX_VISION_DEV_AUTO;
+  }
+  return FLYX_VISION_DEV_DISK;
+}
+
+int32_t to_abi_vision_quant(interfaces::VisionQuantMode m) {
+  switch (m) {
+    case interfaces::VisionQuantMode::kQ8: return FLYX_VISION_QUANT_Q8;
+    case interfaces::VisionQuantMode::kExact: return FLYX_VISION_QUANT_EXACT;
+    case interfaces::VisionQuantMode::kNvfp4: return FLYX_VISION_QUANT_NVFP4;
+  }
+  return FLYX_VISION_QUANT_Q8;
+}
 
 bool set_kv_method(const EngineOptions& opt, plan::KvTiers* tiers, std::string* err) {
   interfaces::KvMethodSpec spec;
@@ -493,6 +513,13 @@ void Engine::log_memory_plan(int asked_ctx) const {
 bool Engine::load(const std::string& path, const EngineOptions& opt, std::string* err, int session_limit) {
   opt_ = opt;
   apply_environment(&opt_);
+  interfaces::VisionDeviceMode vdev = interfaces::VisionDeviceMode::kDisk;
+  interfaces::VisionQuantMode vquant = interfaces::VisionQuantMode::kQ8;
+  if (!interfaces::parse_vision_device(opt_.vision_device, &vdev, &opt_.vision_device, err)) return false;
+  if (!interfaces::parse_vision_quant(opt_.vision_quant, &vquant, &opt_.vision_quant, err)) return false;
+  if (opt_.vision_max_tokens < 0)
+    return *err = "invalid --vision-max-tokens (must be >= 0)", false;
+  if (!opt_.vision) opt_.mmproj_file.clear();
   plan::KvTiers tiers;
   if (!set_kv_method(opt_, &tiers, err)) return false;
   // The load's steps, for its report (verbose): file, tokenizer and chat, backend, model, open, plans, rounds, memory.
@@ -500,6 +527,8 @@ bool Engine::load(const std::string& path, const EngineOptions& opt, std::string
   if (!file_.open(path, err)) return false;
   for (const std::string& f : opt_.drafter_files)
     if (!file_.add(f, err)) return false;
+  if (opt_.vision && !opt_.mmproj_file.empty())
+    if (!file_.add(opt_.mmproj_file, err)) return false;
   ReadAhead ahead(file_);  // until the load returns
   t[1] = os::now_ms();
   if (!tok_.load(file_, err)) return false;
@@ -515,10 +544,16 @@ bool Engine::load(const std::string& path, const EngineOptions& opt, std::string
   if (!load_backend(err)) return false;
   t[3] = os::now_ms();
   // The model as blocks, with its drafters: the one asked for, else every one it has.
-  interfaces::ModelOptions mo{opt_.drafter, opt_.speculative, opt_.activations};
+  interfaces::ModelOptions mo;
+  mo.drafter = opt_.drafter;
+  mo.speculative = opt_.speculative;
+  mo.vision = opt_.vision;
+  mo.activations = opt_.activations;
   mo.fp4_inputs = device_.fp4_inputs != 0;
   model_ = interfaces::open_model(file_, mo, err);
   if (!model_) return false;
+  if (opt_.vision && !opt_.mmproj_file.empty() && !model_->vision())
+    return *err = "--mmproj " + opt_.mmproj_file + ": file is not a supported vision projector (mmproj)", false;
   if (opt_.verbose && !mo.fp4_inputs && opt_.activations.empty()) {
     int nvfp4 = 0;
     for (int i = 0; i < model_->desc().n_weights; ++i) {
@@ -536,6 +571,8 @@ bool Engine::load(const std::string& path, const EngineOptions& opt, std::string
   if (opt_.kv == FLYX_KV_DEFAULT) opt_.kv = roomy() || !model_->kv_fp8_by_default() ? FLYX_KV_16 : FLYX_KV_FP8;
   oo.kv_fp8 = opt_.kv == FLYX_KV_FP8 ? 1 : 0;
   oo.options = opt_.backend_options.c_str();
+  oo.vision_device = to_abi_vision_device(vdev);
+  oo.vision_quant = to_abi_vision_quant(vquant);
   if (api_->open(&model_->desc(), &oo, &bm_) != 0) {
     *err = std::string("backend open: ") + api_->last_error();
     return false;
@@ -546,6 +583,7 @@ bool Engine::load(const std::string& path, const EngineOptions& opt, std::string
   lower_ms_ = timed_ms_ = 0;
   given_back_ = 0;
   if (!lower_and_time(err)) return false;
+  if (opt_.verbose && has_vision()) log::info("flyx: vision encoder loaded");
   int asked_ctx = 0;
   if (!plan_memory(&tiers, session_limit, &asked_ctx, err)) return false;
   wanted_ctx_ = asked_ctx;
@@ -594,6 +632,101 @@ std::string Engine::memory_report() const {
     r += " on the GPU (K/V of " + std::to_string(budget_.layout.device_positions) + " tokens) and " +
          gb(budget_.session_host_bytes) + " in host memory";
   return r;
+}
+
+int Engine::image_token_budget_for(int max_ctx, int vision_max_tokens, const std::string& detail) {
+  const int avail = std::max(256, prompt_limit(max_ctx) - 256);
+  std::string norm;
+  if (!interfaces::normalize_image_detail(detail, &norm, nullptr)) norm = "auto";
+  int budget = 0;
+  if (norm == "low") {
+    budget = std::min(256, avail);
+  } else if (norm == "high") {
+    budget = std::min(4096, avail);
+  } else {
+    // Keep per-image auto budget independent of conversation image count so adding an image on a later
+    // turn never changes earlier turns' VisionCache keys or invalidates their KV/GDN prefix cache.
+    budget = std::min(2048, std::max(256, avail / 2));
+  }
+  if (vision_max_tokens > 0) budget = std::min(budget, vision_max_tokens);
+  return std::max(16, budget);
+}
+
+int Engine::image_token_budget(const std::string& detail, size_t /*n_images*/) const {
+  return image_token_budget_for(opt_.max_ctx, opt_.vision_max_tokens, detail);
+}
+
+bool Engine::encode_image(const interfaces::ImageInput& img, int max_tokens,
+                          std::shared_ptr<const vision::CachedVision>* out, std::string* err,
+                          bool* client_error) const {
+  auto fail_client = [&](const std::string& msg) {
+    if (client_error) *client_error = true;
+    *err = msg;
+    return false;
+  };
+  auto fail_internal = [&](const std::string& msg) {
+    if (client_error) *client_error = false;
+    *err = msg;
+    return false;
+  };
+  if (!has_vision()) return fail_client("this model has no vision encoder loaded (pass --mmproj <mmproj.gguf>)");
+  std::string norm_detail;
+  if (!interfaces::normalize_image_detail(img.detail, &norm_detail, err)) {
+    if (client_error) *client_error = true;
+    return false;
+  }
+  const vision::VisionCacheKey key{img.sha256, norm_detail, max_tokens};
+  if (vision_cache_.get(key, out)) return true;
+
+  const double t_enc0 = os::now_ms();
+  interfaces::RgbImage rgb;
+  if (!vision::decode_image_bytes(img.bytes.data(), img.bytes.size(), &rgb, err)) {
+    if (client_error) *client_error = true;
+    return false;
+  }
+  rgb.sha256 = img.sha256;
+
+  interfaces::PreparedMedia pm;
+  if (!model_->vision()->preprocess(rgb, max_tokens, &pm, err)) {
+    if (client_error) *client_error = true;
+    return false;
+  }
+  if (pm.n_patches <= 0 || pm.patch_dim <= 0 || pm.tokens.empty() || pm.n_embeds <= 0)
+    return fail_client("vision preprocess produced empty output");
+  const double t_pre = os::now_ms();
+
+  flyx_vision_input vi{};
+  vi.patches = pm.patches.data();
+  vi.n_patches = pm.n_patches;
+  vi.patch_dim = pm.patch_dim;
+  vi.grid_thw = pm.grid_thw.empty() ? nullptr : pm.grid_thw.data();
+  vi.n_grids = static_cast<int32_t>(pm.grid_thw.size() / 3);
+  vi.cu_seqlens = pm.cu_seqlens.size() >= 2 ? pm.cu_seqlens.data() : nullptr;
+  vi.n_segs = pm.cu_seqlens.size() >= 2 ? static_cast<int32_t>(pm.cu_seqlens.size() - 1) : 0;
+
+  const int expected_rows = pm.n_embeds;
+  const int out_h = model_->vision()->out_hidden() > 0 ? model_->vision()->out_hidden() : model_->desc().hidden;
+  auto cv = std::make_shared<vision::CachedVision>();
+  cv->embeds.resize(size_t(expected_rows) * size_t(out_h));
+  int32_t got_rows = 0;
+  if (api_->encode_vision(plans_.vision, &vi, cv->embeds.data(), expected_rows, &got_rows) != 0)
+    return fail_internal(std::string("encode_vision: ") + api_->last_error());
+  if (got_rows != expected_rows)
+    return fail_internal("encode_vision: produced " + std::to_string(got_rows) + " rows, expected " +
+                         std::to_string(expected_rows));
+  if (opt_.verbose) {
+    const double t_end = os::now_ms();
+    log::info("flyx: vision encode %dx%d -> %d patches -> %d tokens: %.1f ms (preprocess %.1f ms, ViT %.1f ms)",
+              rgb.width, rgb.height, pm.n_patches, got_rows, t_end - t_enc0, t_pre - t_enc0, t_end - t_pre);
+  }
+  cv->tokens = std::move(pm.tokens);
+  cv->embed_offsets = std::move(pm.embed_offsets);
+  cv->n_embeds = pm.n_embeds;
+  cv->grid_thw = std::move(pm.grid_thw);
+  cv->out_hidden = out_h;
+  vision_cache_.put(key, cv);
+  *out = std::move(cv);
+  return true;
 }
 
 }  // namespace flyx

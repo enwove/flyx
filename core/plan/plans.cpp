@@ -14,6 +14,7 @@ void Plans::free(const flyx_backend_api* api) {
   for (auto* p : adaptive)
     if (p) api->plan_free(p);
   if (prefill) api->plan_free(prefill);
+  if (vision) api->plan_free(vision);
   rounds.clear();
   widths.clear();
   drafters.clear();
@@ -27,6 +28,7 @@ void Plans::free(const flyx_backend_api* api) {
   refused.clear();
   refused_drafter = -1;
   prefill = nullptr;
+  vision = nullptr;
 }
 
 bool build(const flyx_backend_api* api, flyx_bmodel* bm, const interfaces::Model& model, int prefill_chunk,
@@ -36,6 +38,14 @@ bool build(const flyx_backend_api* api, flyx_bmodel* bm, const interfaces::Model
   if (api->lower(bm, &pp, &out->prefill) != 0) {
     *err = std::string("lower prefill: ") + api->last_error();
     return false;
+  }
+  if (auto vp = model.vision_program(); !vp.empty()) {
+    constexpr int32_t kMaxVisionPatches = 16384;
+    flyx_program vprog{FLYX_PHASE_VISION, 0, kMaxVisionPatches, static_cast<int32_t>(vp.size()), vp.data()};
+    if (api->lower(bm, &vprog, &out->vision) != 0) {
+      *err = std::string("lower vision: ") + api->last_error();
+      return false;
+    }
   }
   // Rounds to choose from: plain decoding and each drafter's draft counts (a fixed width: that many, every drafter).
   auto add = [&](int width, int drafter) {

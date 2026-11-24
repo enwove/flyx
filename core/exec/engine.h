@@ -20,6 +20,7 @@
 #include "core/speculation/controller.h"
 #include "core/tokenizer/tokenizer.h"
 #include "core/resources/ledger.h"
+#include "core/vision/image.h"
 #include "flyx/backend_abi.h"
 #include "flyx/flyx.h"
 
@@ -54,6 +55,19 @@ struct EngineOptions {
   // layer (unsloth ships Qwen3.8-27B's so: MTP/mtp-*.gguf), a DFlash2 drafter file (python/convert --draft
   // alone).  Empty: none.
   std::vector<std::string> drafter_files;
+  // Optional multimodal vision projector companion GGUF (mmproj-*.gguf). Empty: none.
+  std::string mmproj_file;
+  // Disable loading any vision encoder even if mmproj weights are present (--no-vision).
+  bool vision = true;
+  // Where vision encoder weights live: "disk" (default: auto-deleted temp file on disk, 0 bytes VRAM & 0 bytes
+  // locked host RAM, 3-stage streamed via OS page cache), "host" (pinned host RAM, 0 VRAM), "gpu" (GPU resident),
+  // or "auto" (GPU if >= 8 GB free after weights, else disk).
+  std::string vision_device = "disk";
+  // On-the-fly quantization of floating-point vision linear weights: "q8" (default: Q8_0, ~46% smaller),
+  // "exact" (keep file BF16/F16/F32), or "nvfp4" (NVFP4, ~70% smaller). Pre-quantized mmproj stays packed.
+  std::string vision_quant = "q8";
+  // Optional cap on merged visual tokens per image (0 = auto by context size and detail level).
+  int vision_max_tokens = 0;
   int verbose = 0;
   // Prompt rows per prefill pass.  Larger chunks keep the GEMMs busier; the
   // buffers for one chunk are shared by all sessions.
@@ -189,6 +203,18 @@ class Engine {
   const std::vector<std::vector<int>>& adaptive_checkpoints() const { return plans_.adaptive_checkpoints; }
   flyx_bmodel* bmodel() const { return bm_; }
   flyx_plan* prefill_plan() const { return plans_.prefill; }
+  flyx_plan* vision_plan() const { return plans_.vision; }
+  bool has_vision() const {
+    return model_ && model_->vision() != nullptr && plans_.vision != nullptr && api_ && api_->encode_vision != nullptr;
+  }
+  // Compute per-image merged visual token budget from detail level, context size, and vision_max_tokens.
+  static int image_token_budget_for(int max_ctx, int vision_max_tokens, const std::string& detail);
+  int image_token_budget(const std::string& detail, size_t n_images) const;
+  // Decode, preprocess, and encode one image into projected embeddings (cached by SHA-256 + detail + max_tokens).
+  // When client_error is non-null, sets *client_error = true for malformed input / missing vision encoder and
+  // false for internal backend failures.
+  bool encode_image(const interfaces::ImageInput& img, int max_tokens, std::shared_ptr<const vision::CachedVision>* out,
+                    std::string* err, bool* client_error = nullptr) const;
   // Prefill passes reproduce a longer pass bit for bit when they start at a multiple of this.
   int prefill_align() const { return prefill_align_; }
   // Rows per prefill pass: the option, as a multiple of prefill_align().
@@ -261,6 +287,7 @@ class Engine {
   std::vector<int32_t> eos_;
   Grammar grammar_;
   std::mutex grammar_mu_;
+  mutable vision::VisionCache vision_cache_;
   ResourceLedger ledger_;
   plan::Budget budget_;                     // leases from ledger_
   int wanted_ctx_ = 0;                      // the context before the budget fitted it

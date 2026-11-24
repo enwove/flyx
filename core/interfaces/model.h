@@ -11,6 +11,7 @@
 #include <string>
 #include <vector>
 
+#include "core/interfaces/vision.h"
 #include "flyx/backend_abi.h"
 
 namespace flyx {
@@ -29,6 +30,7 @@ struct ModelOptions {
   // the file says (finer), other weights as the file has it; with "nvfp4" NVFP4 ones, which the
   // backend refuses.
   bool fp4_inputs = true;
+  bool vision = true;       // false: skip loading any vision encoder / mmproj companion (--no-vision)
 };
 
 class Model {
@@ -78,6 +80,13 @@ class Model {
   // draft with any of them, but one whose state follows its own rounds only
   // (restarts): its round of width 0 is its warm-up.
   virtual std::vector<flyx_node> round_program(int width, int d, bool given) const = 0;
+
+  // Optional multimodal vision encoder (null / empty for text-only models or when ModelOptions::vision == false).
+  virtual const VisionAdapter* vision() const { return nullptr; }
+  // Shared handle to the lightweight VisionAdapter metadata (survives idle engine unload in Scheduler::count_tokens).
+  virtual std::shared_ptr<const VisionAdapter> vision_shared() const { return nullptr; }
+  // Vision encoder execution graph (FLYX_PHASE_VISION): stem -> ViT layers -> projector/merger.
+  virtual std::vector<flyx_node> vision_program() const { return {}; }
 };
 
 // The model in a file, by its architecture, with the drafters asked for.

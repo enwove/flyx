@@ -44,11 +44,15 @@ class Session {
   // literal: where special tokens are read (RenderedChat::literal); null: everywhere.
   std::vector<int32_t> tokenize(const std::string& text, const std::vector<TextSpan>* literal = nullptr,
                                 std::string* how = nullptr) const;
-  // Common prefix of `prompt` and the tokens this session has seen.
-  size_t common_prefix(const std::vector<int32_t>& prompt) const;
+  // Common prefix of `prompt` (with optional multimodal spans) and the tokens this session has seen.
+  size_t common_prefix(const std::vector<int32_t>& prompt,
+                       const std::vector<interfaces::MediaSpan>* media = nullptr) const;
   // The last request's prompt and what the client saw of its reply.
   const std::vector<int32_t>& history() const { return history_; }
   const std::string& history_text() const { return history_text_; }
+  const std::vector<interfaces::MediaSpan>& history_media() const { return history_media_; }
+  const std::vector<interfaces::RenderedImage>& history_images() const { return history_images_; }
+  const std::vector<interfaces::MediaSpan>& media() const { return media_; }
   size_t resident_tokens() const { return tokens_.size(); }
 
   // ---- the state, as a generation moves it ------------------------------------------------
@@ -57,9 +61,11 @@ class Session {
   // or before the common prefix, a snapshot in the store (set_store) that
   // holds more of it than those, else nothing.  Returns the number of prompt
   // tokens in the state, or -1 with *err; *how says which it was.
-  int prepare(const std::vector<int32_t>& prompt, std::string* how, std::string* err);
+  int prepare(const std::vector<int32_t>& prompt, std::string* how, std::string* err,
+              const std::vector<interfaces::MediaSpan>* media = nullptr);
   // Save a displaced conversation while preserving the incoming prompt's best stored checkpoint.
-  void park_for(const std::vector<int32_t>& prompt, std::string* why);
+  void park_for(const std::vector<int32_t>& prompt, std::string* why,
+                const std::vector<interfaces::MediaSpan>* media = nullptr);
   // Snapshots in host memory this session loads from (null: none).
   void set_store(SnapshotStore* store) {
     if (store_ != store) disk_tip_ = 0;
@@ -75,7 +81,8 @@ class Session {
   // to the other slot through the configured cache, leaving this conversation resident.
   void share_system_checkpoint();
   // Prefill brought the state to prompt[0, pos).
-  void advanced(const std::vector<int32_t>& prompt, int pos);
+  void advanced(const std::vector<int32_t>& prompt, int pos,
+                const std::vector<interfaces::MediaSpan>* media = nullptr);
   // A ring entry: its tokens follow the sequence, the state holds r.position tokens.  round: the round it was
   // (Engine::round_name's index; -1 a lookup round, -2 a prefill's first token, -3 not known), for trace_rounds.
   void record(const flyx_round_result& r, int round = -3);
@@ -89,14 +96,16 @@ class Session {
   // A marked system prefix can also be shared through spare RAM while this request is active.
   // Returns true when the backend captured the checkpoint.
   bool take_checkpoint(const std::vector<int32_t>& prompt, int pos, bool keep, Anchor anchor = Anchor::None,
-                       bool share = false);
+                       bool share = false, const std::vector<interfaces::MediaSpan>* media = nullptr);
   // The state is unknown after a device error: start over next time.
   void reset_after_error();
   // The reply ended.  What the client saw of it (the first `published` of
   // `reply`, and the stop token when all of it was shown) becomes, after the
   // prompt, the history the next request is compared with.
   void publish(const std::vector<int32_t>& prompt, const std::vector<int32_t>& reply, size_t published,
-               int32_t stop_token);
+               int32_t stop_token, const std::vector<interfaces::MediaSpan>* media = nullptr,
+               const std::string* rendered_text = nullptr,
+               const std::vector<interfaces::RenderedImage>* rendered_images = nullptr);
   // Every token the state has seen or emitted; the last one is its next input.
   const std::vector<int32_t>& tokens() const { return tokens_; }
   int state_pos() const { return state_pos_; }
@@ -119,8 +128,10 @@ class Session {
  private:
   void share_checkpoint(int slot, bool spare_only);
   // Slot and position of the longest local checkpoint the prompt can resume; {-1, 0} when none matches.
-  std::pair<int, int> checkpoint_for(const std::vector<int32_t>& prompt, int limit) const;
-  std::optional<int> load_snapshot(const std::vector<int32_t>& prompt, int limit, int floor, std::string* how,
+  std::pair<int, int> checkpoint_for(const std::vector<int32_t>& prompt, int limit,
+                                     const std::vector<interfaces::MediaSpan>& media) const;
+  std::optional<int> load_snapshot(const std::vector<int32_t>& prompt, int limit, int floor,
+                                   const std::vector<interfaces::MediaSpan>& media, std::string* how,
                                    std::string* err);
   void cut_checkpoints(int pos);
 
@@ -128,9 +139,12 @@ class Session {
   flyx_seq* seq_ = nullptr;
   std::string init_error_;        // why init failed
   std::vector<int32_t> tokens_;   // every token this session's state has seen or emitted
+  std::vector<interfaces::MediaSpan> media_;  // media spans within tokens_
   int state_pos_ = 0;             // tokens processed into the device state
   std::vector<int32_t> history_;  // prompt + published output of the last generation
-  std::string history_text_;      // its text
+  std::string history_text_;      // its text (unexpanded template text + reply for multimodal)
+  std::vector<interfaces::MediaSpan> history_media_;
+  std::vector<interfaces::RenderedImage> history_images_;
   std::atomic<bool> cancel_{false};
   bool in_use_ = false;
   bool needs_reset_ = false;  // device rewind(0) failed after an error; retry before next prepare
@@ -141,6 +155,7 @@ class Session {
   struct Ckpt {
     bool valid = false;
     std::vector<int32_t> prefix;  // tokens [0, pos)
+    std::vector<interfaces::MediaSpan> media;  // media spans within [0, pos)
     uint64_t stamp = 0;
     bool keep = false;            // not replaced until another is kept (GenerateRequest::keep_checkpoint)
     bool system = false;          // restore point shared by different branches near the start

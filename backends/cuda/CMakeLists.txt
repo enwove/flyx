@@ -44,7 +44,7 @@ set(FLYX_CUDA_KERNEL_SOURCES
     kernels/gemm_blocks.cu kernels/gemm_blocks_round.cu kernels/gemm_blocks_tables.cu
     kernels/attention.cu kernels/attention_flash.cu kernels/attention_rows.cu kernels/tree.cu
     kernels/gdn_chunk.cu kernels/rows.cu kernels/sampling.cu kernels/draft.cu kernels/draft_head.cu
-    kernels/dv.cu kernels/head_cert.cu kernels/stop_decide.cu)
+    kernels/dv.cu kernels/head_cert.cu kernels/stop_decide.cu kernels/vision.cu)
 
 # The device code's flags: line tables unless left out, the fatbinary's compression (top-level CMakeLists.txt).
 set(FLYX_CUDA_DEVICE_FLAGS "")
@@ -115,6 +115,7 @@ set(FLYX_CUDA_HOST_SOURCES
   backend.cpp
   loader/bind.cpp loader/weights.cpp
   runtime/state.cpp runtime/runner.cpp runtime/graphs.cpp runtime/sleep.cpp runtime/device_stats.cpp runtime/tiers.cpp
+  runtime/vision_disk.cpp
   regions/batch.cpp regions/layers.cpp regions/linear.cpp regions/plan.cpp)
 add_library(flyx-cuda MODULE ${FLYX_CUDA_HOST_SOURCES})
 target_link_libraries(flyx-cuda PRIVATE flyx_cuda_kernels CUDA::cudart_static ${CMAKE_DL_LIBS})

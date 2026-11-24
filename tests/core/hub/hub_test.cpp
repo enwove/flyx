@@ -163,6 +163,30 @@ void choices() {
   n.quant = "";
   check(!flyx::hub::select(r, n, &files, &err) && err.find("several") != std::string::npos, "no quantization named: which?");
   check(flyx::hub::mtp_file(r) && flyx::hub::mtp_file(r)->path == "MTP/mtp-Qwen3.8-27B-Q4_0.gguf", "the MTP file");
+  check(flyx::hub::mmproj_file(r) && flyx::hub::mmproj_file(r)->path == "mmproj-F16.gguf", "the mmproj file");
+  // mmproj_gguf_name edge cases (subfolders, imatrix, MTP, negative qualifiers) and precision ranking.
+  check(flyx::hub::mmproj_gguf_name("mmproj-BF16.gguf") && flyx::hub::mmproj_gguf_name("mmproj/vision.gguf") &&
+            flyx::hub::mmproj_gguf_name("qwen-mmproj-f16.gguf") &&
+            !flyx::hub::mmproj_gguf_name("imatrix_mmproj.gguf") && !flyx::hub::mmproj_gguf_name("MTP/mmproj.gguf") &&
+            !flyx::hub::mmproj_gguf_name("Qwen3-no-mmproj-Q4_K_M.gguf") &&
+            !flyx::hub::mmproj_gguf_name("Qwen3-without-mmproj-Q8_0.gguf"),
+        "mmproj_gguf_name handles subfolders and excludes imatrix/MTP/no-mmproj");
+  check(flyx::hub::model_gguf_name("Qwen3-no-mmproj-Q4_K_M.gguf") && !flyx::hub::model_gguf_name("mmproj/vision.gguf"),
+        "model_gguf_name keeps no-mmproj models and excludes mmproj/ subfolders");
+  {
+    flyx::hub::Repo vr;
+    vr.id = "org/vlm-GGUF";
+    vr.files = {file("mmproj-Q8_0.gguf", 1), file("mmproj-F32.gguf", 4), file("mmproj/mmproj-F16.gguf", 2),
+                file("mmproj-BF16.gguf", 2)};
+    check(flyx::hub::mmproj_file(vr) && flyx::hub::mmproj_file(vr)->path == "mmproj-BF16.gguf",
+          "mmproj_file prefers BF16 over F16/F32/Q8_0");
+    vr.files = {file("mmproj-Q8_0.gguf", 1), file("mmproj-F32.gguf", 4), file("mmproj/mmproj-F16.gguf", 2)};
+    check(flyx::hub::mmproj_file(vr) && flyx::hub::mmproj_file(vr)->path == "mmproj/mmproj-F16.gguf",
+          "mmproj_file prefers F16 over F32/Q8_0 (including mmproj/ subfolder)");
+    vr.files = {file("mmproj-Q8_0.gguf", 1), file("mmproj-F32.gguf", 4)};
+    check(flyx::hub::mmproj_file(vr) && flyx::hub::mmproj_file(vr)->path == "mmproj-F32.gguf",
+          "mmproj_file prefers F32 over Q8_0");
+  }
   flyx::hub::Repo one;
   one.id = "x/y";
   one.files = {file("llama-2-7b.Q4_K_M.gguf", 4)};

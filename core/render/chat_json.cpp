@@ -1,7 +1,12 @@
 // Copyright 2026 The flyx Authors. SPDX-License-Identifier: Apache-2.0
 #include "core/render/chat_json.h"
 
+#include <cctype>
+#include <memory>
 #include <set>
+
+#include "core/interfaces/options.h"
+#include "core/vision/image.h"
 
 namespace flyx {
 namespace {
@@ -27,41 +32,131 @@ bool parse_arguments(const ojson& a, ojson* out, std::string* err) {
   return true;
 }
 
-}  // namespace
+bool iequals_prefix(std::string_view s, std::string_view pfx) {
+  if (s.size() < pfx.size()) return false;
+  for (size_t i = 0; i < pfx.size(); ++i)
+    if (std::tolower(static_cast<unsigned char>(s[i])) != std::tolower(static_cast<unsigned char>(pfx[i])))
+      return false;
+  return true;
+}
 
-bool content_text(const ojson& content, std::string* out, std::string* err) {
-  out->clear();
+bool parse_image_part(const ojson& part, const std::string& type, std::shared_ptr<const ImageInput>* out,
+                      std::string* err) {
+  ImageInput img;
+  if (type == "image_url") {
+    const auto it = part.find("image_url");
+    if (it == part.end()) return *err = "image_url part missing 'image_url' field", false;
+    std::string url, detail;
+    if (it->is_string()) {
+      url = it->get<std::string>();
+    } else if (it->is_object()) {
+      url = str_or(*it, "url");
+      if (it->contains("detail") && !(*it)["detail"].is_null()) {
+        if (!(*it)["detail"].is_string()) return *err = "image_url.detail must be a string", false;
+        detail = (*it)["detail"].get<std::string>();
+      }
+    } else {
+      return *err = "image_url must be a string or an object with 'url'", false;
+    }
+    if (!vision::parse_image_data_uri(url, &img, err)) return false;
+    if (!interfaces::normalize_image_detail(detail, &img.detail, err)) return false;
+  } else if (type == "input_image") {
+    std::string url = str_or(part, "image_url");
+    if (url.empty()) return *err = "input_image part missing 'image_url' data URI", false;
+    if (!vision::parse_image_data_uri(url, &img, err)) return false;
+    std::string detail;
+    if (part.contains("detail") && !part["detail"].is_null()) {
+      if (!part["detail"].is_string()) return *err = "input_image.detail must be a string", false;
+      detail = part["detail"].get<std::string>();
+    }
+    if (!interfaces::normalize_image_detail(detail, &img.detail, err)) return false;
+  } else if (type == "image") {
+    const auto src = part.find("source");
+    if (src != part.end() && src->is_object()) {
+      const std::string stype = str_or(*src, "type");
+      if (stype == "base64") {
+        const std::string media = str_or(*src, "media_type");
+        if (!media.empty() && !iequals_prefix(media, "image/"))
+          return *err = "image source.media_type must be image/* (got '" + media + "')", false;
+        const std::string data = str_or(*src, "data");
+        if (data.empty()) return *err = "image source missing base64 'data'", false;
+        std::vector<uint8_t> bytes;
+        if (!vision::decode_base64(data, &bytes, err)) return false;
+        if (!vision::make_image_from_bytes(std::move(bytes), media.empty() ? "image/png" : media, "", &img, err))
+          return false;
+      } else if (stype == "url") {
+        return *err = "remote image URLs are not fetched; send base64 image data", false;
+      } else {
+        return *err = "image source.type must be 'base64'", false;
+      }
+    } else if (part.contains("url") && part["url"].is_string()) {
+      if (!vision::parse_image_data_uri(part["url"].get_ref<const std::string&>(), &img, err)) return false;
+    } else {
+      return *err = "image part missing 'source' object or 'url' data URI", false;
+    }
+  } else {
+    return *err = "unsupported image part type '" + type + "'", false;
+  }
+  *out = std::make_shared<ImageInput>(std::move(img));
+  return true;
+}
+
+bool parse_content_parts(const ojson& content, std::string* text_out, std::vector<ContentPart>* parts_out,
+                         bool allow_images, std::string* err) {
+  text_out->clear();
+  if (parts_out) parts_out->clear();
   if (content.is_null()) return true;
   if (content.is_string()) {
-    *out = content.get<std::string>();
+    *text_out = content.get<std::string>();
     return true;
   }
   if (!content.is_array()) {
     *err = "message content must be a string or a list of parts";
     return false;
   }
+  bool has_image = false;
+  std::vector<ContentPart> parts;
   for (const auto& part : content) {
     if (part.is_string()) {
-      *out += part.get<std::string>();
+      const std::string s = part.get<std::string>();
+      *text_out += s;
+      parts.push_back(ContentPart::make_text(s));
       continue;
     }
     if (!part.is_object()) {
       *err = "every content part must be a string or an object";
       return false;
     }
-    std::string type = str_or(part, "type", "text");
+    const std::string type = str_or(part, "type", "text");
     if (type == "text" || type == "input_text" || type == "output_text") {
-      *out += str_or(part, "text");
-    } else if (type == "image" || type == "image_url" || type == "input_image" || type == "video" ||
-               type == "input_audio" || type == "file" || type == "document") {
-      *err = "content of type '" + type + "' is not supported (text only)";
+      const std::string s = str_or(part, "text");
+      *text_out += s;
+      parts.push_back(ContentPart::make_text(s));
+    } else if (type == "image" || type == "image_url" || type == "input_image") {
+      if (!allow_images) {
+        *err = "content of type '" + type + "' is not supported here";
+        return false;
+      }
+      std::shared_ptr<const ImageInput> img;
+      if (!parse_image_part(part, type, &img, err)) return false;
+      has_image = true;
+      parts.push_back(ContentPart::make_image(std::move(img)));
+    } else if (type == "video" || type == "input_audio" || type == "file" || type == "document") {
+      *err = "content of type '" + type + "' is not supported";
       return false;
     } else {
       *err = "unknown content part type '" + type + "'";
       return false;
     }
   }
+  if (has_image && parts_out) *parts_out = std::move(parts);
   return true;
+}
+
+}  // namespace
+
+bool content_text(const ojson& content, std::string* out, std::string* err) {
+  return parse_content_parts(content, out, nullptr, false, err);
 }
 
 bool messages_from_openai(const ojson& messages, std::vector<ChatMessage>* out, std::string* err) {
@@ -79,7 +174,9 @@ bool messages_from_openai(const ojson& messages, std::vector<ChatMessage>* out, 
     cm.role = str_or(m, "role");
     if (cm.role == "developer") cm.role = "system";
     if (cm.role == "function") cm.role = "tool";
-    if (m.contains("content") && !content_text(m["content"], &cm.content, err)) return false;
+    const bool allow_images = (cm.role == "user" || cm.role == "tool");
+    if (m.contains("content") && !parse_content_parts(m["content"], &cm.content, &cm.parts, allow_images, err))
+      return false;
     for (const char* key : {"reasoning_content", "reasoning"})
       if (m.contains(key) && m[key].is_string()) {
         cm.reasoning = m[key].get<std::string>();
@@ -229,8 +326,9 @@ bool messages_from_responses(const std::string& instructions, const ojson& items
     const std::string type = str_or(it, "type", it.contains("role") ? "message" : "");
     if (type == "message") {
       std::string role = str_or(it, "role"), text;
+      std::vector<ContentPart> parts;
       const auto content = it.find("content");
-      if (content != it.end() && !content_text(*content, &text, err)) return false;
+      if (content != it.end() && !parse_content_parts(*content, &text, &parts, role == "user", err)) return false;
       if (role == "assistant") {
         ChatMessage& m = assistant(open && !out->back().tool_calls.empty());  // text after calls starts a turn
         m.content += text;
@@ -239,7 +337,9 @@ bool messages_from_responses(const std::string& instructions, const ojson& items
       if (role == "developer") role = "system";
       if (role != "user" && role != "system")
         return *err = "message role must be user, assistant, system or developer (got '" + role + "')", false;
-      out->push_back({role, std::move(text), std::nullopt, {}, ""});
+      ChatMessage cm{role, std::move(text), std::nullopt, {}, ""};
+      cm.parts = std::move(parts);
+      out->push_back(std::move(cm));
       open = false;
     } else if (type == "reasoning") {
       const ChatMessage* last = open ? &out->back() : nullptr;
@@ -256,9 +356,12 @@ bool messages_from_responses(const std::string& instructions, const ojson& items
       assistant(false).tool_calls.push_back(std::move(call));
     } else if (type == "function_call_output") {
       std::string text;
+      std::vector<ContentPart> parts;
       const auto output = it.find("output");
-      if (output != it.end() && !content_text(*output, &text, err)) return false;
-      out->push_back({"tool", std::move(text), std::nullopt, {}, str_or(it, "call_id")});
+      if (output != it.end() && !parse_content_parts(*output, &text, &parts, true, err)) return false;
+      ChatMessage tm{"tool", std::move(text), std::nullopt, {}, str_or(it, "call_id")};
+      tm.parts = std::move(parts);
+      out->push_back(std::move(tm));
       open = false;
     } else if (type == "item_reference") {
       return *err = "item_reference is not supported: send the item, or previous_response_id", false;
@@ -401,7 +504,8 @@ struct AnthropicCache {
   }
   void mark_end(const ojson& block, size_t count, const ChatMessage& m) const {
     if (marked(block))
-      points->push_back({count, m.content.size(), m.reasoning ? m.reasoning->size() : 0, m.tool_calls.size()});
+      points->push_back(
+          {count, m.content.size(), m.reasoning ? m.reasoning->size() : 0, m.tool_calls.size(), 0, m.parts.size()});
   }
 };
 
@@ -466,40 +570,61 @@ bool parse_anthropic_assistant(const ojson& m, const ojson& content, const Anthr
 
 bool parse_anthropic_user(const ojson& m, const ojson& content, const AnthropicCache& cache,
                           std::vector<ChatMessage>* out, std::string* err) {
-  // user: tool results become tool messages, text after them a user message
+  // user: tool results become tool messages, text and images after them a user message
   const size_t before = out->size();
   std::string text;
-  std::vector<std::pair<size_t, size_t>> marked_text;
+  std::vector<ContentPart> user_parts;
+  bool has_user_image = false;
+  struct UserMark {
+    size_t prior = 0, text_bytes = 0, part_count = 0;
+  };
+  std::vector<UserMark> marked_blocks;
   for (const auto& b : content) {
     const std::string type = str_or(b, "type");
     if (type == "tool_result") {
       std::string result;
-      if (b.contains("content") && !content_text(b["content"], &result, err)) return false;
-      if (b.contains("is_error") && b["is_error"].is_boolean() && b["is_error"].get<bool>())
+      std::vector<ContentPart> tparts;
+      if (b.contains("content") && !parse_content_parts(b["content"], &result, &tparts, true, err)) return false;
+      if (b.contains("is_error") && b["is_error"].is_boolean() && b["is_error"].get<bool>()) {
         result = "Error: " + result;
+        if (!tparts.empty()) tparts.insert(tparts.begin(), ContentPart::make_text("Error: "));
+      }
       ChatMessage tm{"tool", std::move(result), std::nullopt, {}, str_or(b, "tool_use_id")};
+      tm.parts = std::move(tparts);
       out->push_back(std::move(tm));
       cache.mark_end(b, out->size(), out->back());
     } else if (type == "text") {
-      text += str_or(b, "text");
-      if (cache.marked(b) && marked_text.size() < AnthropicCache::kLimit)
-        marked_text.emplace_back(out->size(), text.size());
+      const std::string s = str_or(b, "text");
+      text += s;
+      user_parts.push_back(ContentPart::make_text(s));
+      if (cache.marked(b) && marked_blocks.size() < AnthropicCache::kLimit)
+        marked_blocks.push_back({out->size(), text.size(), user_parts.size()});
+    } else if (type == "image") {
+      std::shared_ptr<const ImageInput> img;
+      if (!parse_image_part(b, type, &img, err)) return false;
+      has_user_image = true;
+      user_parts.push_back(ContentPart::make_image(std::move(img)));
+      if (cache.marked(b) && marked_blocks.size() < AnthropicCache::kLimit)
+        marked_blocks.push_back({out->size(), text.size(), user_parts.size()});
     } else {
-      return *err = "user content block of type '" + type + "' is not supported (text and tool results only)", false;
+      return *err = "user content block of type '" + type + "' is not supported (text, image and tool results only)",
+             false;
     }
   }
-  if (!text.empty() || out->size() == before) {
-    out->push_back({"user", std::move(text), std::nullopt, {}, ""});
-    for (const auto& [prior, bytes] : marked_text) {
+  if (!text.empty() || has_user_image || out->size() == before) {
+    ChatMessage um{"user", std::move(text), std::nullopt, {}, ""};
+    if (has_user_image) um.parts = std::move(user_parts);
+    out->push_back(std::move(um));
+    for (const auto& mk : marked_blocks) {
       if (cache.points->size() == AnthropicCache::kLimit) break;
-      if (prior + 1 == out->size()) {
-        cache.points->push_back({out->size(), bytes});
-      } else if (prior > 0) {
+      if (mk.prior + 1 == out->size()) {
+        cache.points->push_back({out->size(), mk.text_bytes, 0, 0, 0, has_user_image ? mk.part_count : 0});
+      } else if (mk.prior > 0) {
         // A later tool result renders before this text. Only the messages ahead of that tool belong
         // to the stable prefix; the full rendered input remains exactly as for an unmarked request.
-        const auto& last = (*out)[prior - 1];
-        cache.points->push_back({prior, last.content.size(), last.reasoning ? last.reasoning->size() : 0,
-                                 last.tool_calls.size()});
+        const auto& last = (*out)[mk.prior - 1];
+        cache.points->push_back({mk.prior, last.content.size(), last.reasoning ? last.reasoning->size() : 0,
+                                 last.tool_calls.size(), 0, last.parts.size()});
       }
     }
   }

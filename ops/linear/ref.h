@@ -48,13 +48,22 @@ inline void linear_a4(const double* x, int rows, int K, const flyx_tensor_view* 
 }
 
 // linear() of inputs rounded to 8-bit integers with a scale per 32 values (round_q8): GGML block weights in every
-// pass when the weight says so (FLYX_ACT_Q8; since ABI 18 rounds too).
+// pass when the weight says so (FLYX_ACT_Q8; since ABI 18 rounds too).  Rows whose K is not a multiple of 32
+// (e.g. quantized vision MLPs with padded weights) are zero-padded to a multiple of 32 before rounding.
 inline void linear_a8(const double* x, int rows, int K, const flyx_tensor_view* W, int N, double* y) {
+  const int K_pad = (K + 31) / 32 * 32;
   std::vector<double> xr(size_t(rows) * K);
-  std::vector<int8_t> p(static_cast<size_t>(K));
-  std::vector<float> d(static_cast<size_t>(K / 32));
+  std::vector<double> padded;
+  if (K_pad != K) padded.assign(static_cast<size_t>(K_pad), 0.0);
+  std::vector<int8_t> p(static_cast<size_t>(K_pad));
+  std::vector<float> d(static_cast<size_t>(K_pad / 32));
   for (int r = 0; r < rows; ++r) {
-    round_q8(x + size_t(r) * K, K, p.data(), d.data());
+    const double* row = x + size_t(r) * K;
+    if (K_pad != K) {
+      std::copy(row, row + K, padded.data());
+      row = padded.data();
+    }
+    round_q8(row, K_pad, p.data(), d.data());
     for (int k = 0; k < K; ++k) xr[size_t(r) * K + k] = double(d[size_t(k / 32)]) * p[size_t(k)];
   }
   linear(xr.data(), rows, K, W, N, y);

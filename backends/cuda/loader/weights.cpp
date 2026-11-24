@@ -833,6 +833,333 @@ float* WeightLoader::put(const std::vector<float>& values) {
   return p;
 }
 
+VisionVec WeightLoader::vision_put(const std::vector<float>& values) {
+  if (values.empty()) return {};
+  const size_t bytes = values.size() * sizeof(float);
+  if (m_->opt.vision == FLYX_VISION_DEV_DISK) {
+    const uint64_t off = m_->vision_disk.append(values.data(), bytes);
+    m_->vision_disk_bytes += bytes;
+    return VisionVec{nullptr, values.size(), false, true, off};
+  }
+  if (m_->opt.vision == FLYX_VISION_DEV_HOST) {
+    float* p = m_->host_pinned<float>(values.size());
+    std::memcpy(p, values.data(), bytes);
+    m_->vision_host_bytes += bytes;
+    return VisionVec{p, values.size(), true, false, 0};
+  }
+  float* p = put(values);
+  m_->vision_dev_bytes += bytes;
+  return VisionVec{p, values.size(), false, false, 0};
+}
+
+VisionLin WeightLoader::vision_lin_stack(const std::vector<int>& ws, int* rows_out) {
+  if (ws.empty()) return {};
+  const bool disk = m_->opt.vision == FLYX_VISION_DEV_DISK;
+  const bool host = m_->opt.vision == FLYX_VISION_DEV_HOST;
+  const int vq = m_->opt.vision_quant;
+  const size_t K = size_t(t(ws[0])->shape[1]);
+  size_t total_rows = 0;
+  for (int w : ws) {
+    if (t(w)->ndim != 2 || size_t(t(w)->shape[1]) != K)
+      throw std::runtime_error(std::string(t(w)->name) + ": vision linear shape mismatch");
+    total_rows += size_t(t(w)->shape[0]);
+  }
+  if (rows_out) *rows_out = int(total_rows);
+
+  VisionLin vl;
+  vl.N = int(total_rows);
+  vl.K = int(K);
+  vl.K_pad = int(K);
+  vl.on_host = host;
+  vl.on_disk = disk;
+
+  auto align256 = [](size_t b) { return (b + 255) / 256 * 256; };
+  auto write_disk_blob = [&](const std::vector<std::pair<const void*, size_t>>& parts, VisionLin::DiskKind kind) {
+    size_t total = 0;
+    for (const auto& [ptr, nb] : parts) total += align256(nb);
+    std::vector<uint8_t> blob(total, 0);
+    size_t off = 0;
+    for (const auto& [ptr, nb] : parts) {
+      if (nb) std::memcpy(blob.data() + off, ptr, nb);
+      off += align256(nb);
+    }
+    vl.disk_kind = kind;
+    vl.disk_off = m_->vision_disk.append(blob.data(), blob.size());
+    vl.disk_bytes = blob.size();
+    m_->vision_disk_bytes += blob.size();
+  };
+  auto record_bytes = [&](size_t b) {
+    if (host) m_->vision_host_bytes += b;
+    else if (!disk) m_->vision_dev_bytes += b;
+  };
+
+  // 1. Pre-quantized GGML block weights (e.g. mmproj-Q8_0.gguf / Q4_K / Q6_K): keep packed as-is.
+  bool all_packable = true;
+  for (int w : ws) all_packable = all_packable && packable(w);
+  if (all_packable) {
+    for (int w : ws)
+      if (weights_[w].activations != weights_[ws[0]].activations)
+        throw std::runtime_error(std::string(t(w)->name) + ": mixed activation rounding in vision stack");
+    std::vector<std::vector<uint8_t>> disk_datas;
+    std::vector<std::vector<uint16_t>> disk_scales;
+    std::vector<std::pair<const void*, size_t>> disk_parts;
+    for (size_t i = 0; i < ws.size();) {
+      size_t end = i + 1;
+      while (end < ws.size() && t(ws[end])->dtype == t(ws[i])->dtype) ++end;
+      std::vector<int> run(ws.begin() + i, ws.begin() + end);
+      const BlockLayout lo = blocks_layout(t(run[0])->dtype);
+      const size_t per_row = K / size_t(lo.values);
+      const size_t row_bytes = per_row * size_t(lo.stride), row_scales = per_row * size_t(lo.scales);
+      size_t run_rows = 0;
+      for (int w : run) run_rows += size_t(t(w)->shape[0]);
+      if (disk) {
+        blocks_init();
+        disk_datas.emplace_back(run_rows * row_bytes);
+        disk_scales.emplace_back(run_rows * row_scales);
+        size_t r0 = 0;
+        for (int w : run) {
+          pack_rows(w, {}, disk_datas.back().data() + r0 * row_bytes, disk_scales.back().data() + r0 * row_scales,
+                    /*host=*/true);
+          r0 += size_t(t(w)->shape[0]);
+        }
+        vl.w.blk.push_back(BlockMat{nullptr, nullptr, t(run[0])->dtype, int(run_rows),
+                                    weights_[run[0]].activations == FLYX_ACT_Q8});
+        disk_parts.emplace_back(disk_datas.back().data(), disk_datas.back().size());
+        disk_parts.emplace_back(disk_scales.back().data(), disk_scales.back().size() * sizeof(uint16_t));
+      } else if (host) {
+        blocks_init();
+        uint8_t* data = m_->host_pinned<uint8_t>(run_rows * row_bytes);
+        uint16_t* scales = m_->host_pinned<uint16_t>(run_rows * row_scales);
+        size_t r0 = 0;
+        for (int w : run) {
+          pack_rows(w, {}, data + r0 * row_bytes, scales + r0 * row_scales, /*host=*/true);
+          r0 += size_t(t(w)->shape[0]);
+        }
+        vl.w.blk.push_back(BlockMat{data, scales, t(run[0])->dtype, int(run_rows),
+                                    weights_[run[0]].activations == FLYX_ACT_Q8});
+      } else {
+        vl.w.blk.push_back(run.size() == 1 ? pack(run[0]) : pack_run(run, {}));
+      }
+      record_bytes(run_rows * (row_bytes + row_scales * sizeof(uint16_t)));
+      i = end;
+    }
+    if (disk) write_disk_blob(disk_parts, VisionLin::kDiskPacked);
+    return vl;
+  }
+
+  // 2. Pre-quantized NVFP4 weights: keep NVFP4 planes as-is.
+  auto is_fp4 = [&](int w) { return t(w)->dtype == FLYX_DT_NVFP4 || t(w)->dtype == FLYX_DT_GGML_NVFP4; };
+  const bool fp4 = is_fp4(ws[0]);
+  for (int w : ws)
+    if (is_fp4(w) != fp4) throw std::runtime_error(std::string(t(w)->name) + ": mixed weight formats in vision stack");
+  if (fp4) {
+    for (int w : ws)
+      if (weights_[w].activations != weights_[ws[0]].activations)
+        throw std::runtime_error(std::string(t(w)->name) + ": mixed activation rounding in vision stack");
+    vl.a4 = weights_[ws[0]].activations == FLYX_ACT_NVFP4;
+    if (!host && !disk) {
+      vl.w = lin_stack(ws);
+      record_bytes(total_rows * K / 2 + total_rows * K / 16 + total_rows * sizeof(float));
+      return vl;
+    }
+    if (K % 32) throw std::runtime_error(std::string(t(ws[0])->name) + ": NVFP4 K must be a multiple of 32");
+    std::vector<uint8_t> q_tmp, s_tmp;
+    std::vector<float> rs_tmp;
+    uint8_t *q_dst = nullptr, *s_dst = nullptr;
+    float* rs_dst = nullptr;
+    if (disk) {
+      q_tmp.resize(total_rows * K / 2);
+      s_tmp.resize(total_rows * K / 16);
+      rs_tmp.resize(total_rows);
+      q_dst = q_tmp.data();
+      s_dst = s_tmp.data();
+      rs_dst = rs_tmp.data();
+    } else {
+      q_dst = vl.w.q = m_->host_pinned<uint8_t>(total_rows * K / 2);
+      s_dst = vl.w.s = m_->host_pinned<uint8_t>(total_rows * K / 16);
+      rs_dst = vl.w.rs = m_->host_pinned<float>(total_rows);
+    }
+    size_t r0 = 0;
+    for (int w : ws) {
+      const size_t nr = size_t(t(w)->shape[0]);
+      if (t(w)->dtype == FLYX_DT_GGML_NVFP4) {
+        if (K % 64) throw std::runtime_error(std::string(t(w)->name) + ": GGML NVFP4 K must be a multiple of 64");
+        ggml_nvfp4_planes_with(t(w), {}, q_dst + r0 * K / 2, s_dst + r0 * K / 16,
+                               [&](size_t n, const auto& fn) { parallel_rows(n, fn); });
+        std::fill_n(rs_dst + r0, nr, 1.f);
+      } else {
+        const auto* sc = weights_[w].scale;
+        const auto* s2 = weights_[w].scale2;
+        if (!sc || !s2 || sc->dtype != FLYX_DT_F8E4M3 || s2->dtype != FLYX_DT_F32)
+          throw std::runtime_error(std::string(t(w)->name) + ": bad NVFP4 scales");
+        std::memcpy(q_dst + r0 * K / 2, t(w)->data, nr * K / 2);
+        std::memcpy(s_dst + r0 * K / 16, sc->data, nr * K / 16);
+        std::fill_n(rs_dst + r0, nr, static_cast<const float*>(s2->data)[0]);
+      }
+      r0 += nr;
+    }
+    if (disk) {
+      write_disk_blob({{q_tmp.data(), q_tmp.size()}, {s_tmp.data(), s_tmp.size()},
+                       {rs_tmp.data(), rs_tmp.size() * sizeof(float)}},
+                      VisionLin::kDiskNvfp4);
+    } else {
+      record_bytes(total_rows * K / 2 + total_rows * K / 16 + total_rows * sizeof(float));
+    }
+    return vl;
+  }
+
+  // Helper to read row `r` of a floating-point tensor into float32 (fast path for BF16).
+  auto read_row_f32 = [](const flyx_tensor_view* v, size_t r, size_t cols, float* dst) {
+    if (v->dtype == FLYX_DT_BF16) {
+      const auto* in = static_cast<const uint16_t*>(v->data) + r * cols;
+      for (size_t k = 0; k < cols; ++k) {
+        const uint32_t u = uint32_t(in[k]) << 16;
+        std::memcpy(dst + k, &u, 4);
+      }
+    } else if (v->dtype == FLYX_DT_F32) {
+      const auto* in = static_cast<const float*>(v->data) + r * cols;
+      std::memcpy(dst, in, cols * sizeof(float));
+    } else {
+      for (size_t k = 0; k < cols; ++k) dst[k] = static_cast<float>(flyx::ops::load(v, r * cols + k));
+    }
+  };
+
+  // 3. On-the-fly Q8_0 quantization (8.5 bpw, ~46% smaller, zero-padded to K % 32 == 0).
+  if (vq == FLYX_VISION_QUANT_Q8) {
+    blocks_init();
+    const size_t K_pad = (K + 31) / 32 * 32;
+    const size_t blocks_per_row = K_pad / 32;
+    vl.K_pad = int(K_pad);
+    const size_t pay_bytes = total_rows * K_pad;
+    const size_t sc_elems = total_rows * blocks_per_row;
+    uint8_t* pay_host = nullptr;
+    uint16_t* sc_host = nullptr;
+    std::vector<uint8_t> pay_tmp;
+    std::vector<uint16_t> sc_tmp;
+    if (host) {
+      pay_host = m_->host_pinned<uint8_t>(pay_bytes);
+      sc_host = m_->host_pinned<uint16_t>(sc_elems);
+    } else {
+      pay_tmp.resize(pay_bytes);
+      sc_tmp.resize(sc_elems);
+      pay_host = pay_tmp.data();
+      sc_host = sc_tmp.data();
+    }
+    size_t r0 = 0;
+    for (int w : ws) {
+      const auto* v = t(w);
+      if (!numbers(v)) throw std::runtime_error(std::string(v->name) + ": unsupported vision weight dtype");
+      const size_t nr = size_t(v->shape[0]);
+      parallel_rows(nr, [&](size_t a, size_t e) {
+        std::vector<float> row(K);
+        for (size_t r = a; r < e; ++r) {
+          read_row_f32(v, r, K, row.data());
+          flyx::ops::quantize_row_q8_0(row.data(), int(K), int(K_pad), pay_host + (r0 + r) * K_pad,
+                                       sc_host + (r0 + r) * blocks_per_row);
+        }
+      });
+      r0 += nr;
+    }
+    if (disk) {
+      vl.w.blk = {BlockMat{nullptr, nullptr, FLYX_DT_GGML_Q8_0, int(total_rows), true}};
+      write_disk_blob({{pay_tmp.data(), pay_bytes}, {sc_tmp.data(), sc_elems * sizeof(uint16_t)}},
+                      VisionLin::kDiskPacked);
+    } else if (host) {
+      vl.w.blk = {BlockMat{pay_host, sc_host, FLYX_DT_GGML_Q8_0, int(total_rows), true}};
+      record_bytes(pay_bytes + sc_elems * sizeof(uint16_t));
+    } else {
+      uint8_t* d_pay = m_->alloc<uint8_t>(pay_bytes);
+      uint16_t* d_sc = m_->alloc<uint16_t>(sc_elems);
+      upload_staged(d_pay, pay_host, pay_bytes);
+      upload_staged(d_sc, sc_host, sc_elems * sizeof(uint16_t));
+      vl.w.blk = {BlockMat{d_pay, d_sc, FLYX_DT_GGML_Q8_0, int(total_rows), true}};
+      record_bytes(pay_bytes + sc_elems * sizeof(uint16_t));
+    }
+    return vl;
+  }
+
+  // 4. On-the-fly NVFP4 quantization (4.5 bpw, ~70% smaller, zero-padded to K % 64 == 0).
+  if (vq == FLYX_VISION_QUANT_NVFP4) {
+    const size_t K_pad = (K + 63) / 64 * 64;
+    vl.K_pad = int(K_pad);
+    const size_t q_bytes = total_rows * K_pad / 2;
+    const size_t s_bytes = total_rows * K_pad / 16;
+    uint8_t *q_host = nullptr, *s_host = nullptr;
+    float* rs_host = nullptr;
+    std::vector<uint8_t> q_tmp, s_tmp;
+    std::vector<float> rs_tmp;
+    if (host) {
+      q_host = m_->host_pinned<uint8_t>(q_bytes);
+      s_host = m_->host_pinned<uint8_t>(s_bytes);
+      rs_host = m_->host_pinned<float>(total_rows);
+    } else {
+      q_tmp.resize(q_bytes);
+      s_tmp.resize(s_bytes);
+      rs_tmp.resize(total_rows);
+      q_host = q_tmp.data();
+      s_host = s_tmp.data();
+      rs_host = rs_tmp.data();
+    }
+    size_t r0 = 0;
+    for (int w : ws) {
+      const auto* v = t(w);
+      if (!numbers(v)) throw std::runtime_error(std::string(v->name) + ": unsupported vision weight dtype");
+      const size_t nr = size_t(v->shape[0]);
+      parallel_rows(nr, [&](size_t a, size_t e) {
+        std::vector<float> row(K);
+        for (size_t r = a; r < e; ++r) {
+          read_row_f32(v, r, K, row.data());
+          flyx::ops::quantize_row_nvfp4(row.data(), int(K), int(K_pad), q_host + (r0 + r) * (K_pad / 2),
+                                        s_host + (r0 + r) * (K_pad / 16), rs_host + (r0 + r));
+        }
+      });
+      r0 += nr;
+    }
+    if (disk) {
+      write_disk_blob({{q_tmp.data(), q_bytes}, {s_tmp.data(), s_bytes}, {rs_tmp.data(), total_rows * sizeof(float)}},
+                      VisionLin::kDiskNvfp4);
+    } else if (host) {
+      vl.w.q = q_host;
+      vl.w.s = s_host;
+      vl.w.rs = rs_host;
+      record_bytes(q_bytes + s_bytes + total_rows * sizeof(float));
+    } else {
+      vl.w.q = m_->alloc<uint8_t>(q_bytes);
+      vl.w.s = m_->alloc<uint8_t>(s_bytes);
+      vl.w.rs = m_->alloc<float>(total_rows);
+      upload_staged(vl.w.q, q_host, q_bytes);
+      upload_staged(vl.w.s, s_host, s_bytes);
+      CK(cudaMemcpy(vl.w.rs, rs_host, total_rows * sizeof(float), cudaMemcpyHostToDevice));
+      record_bytes(q_bytes + s_bytes + total_rows * sizeof(float));
+    }
+    return vl;
+  }
+
+  // 5. Exact BF16 (disk, host pinned, or GPU resident).
+  if (disk) {
+    std::vector<bf16> tmp(total_rows * K);
+    size_t off = 0;
+    for (int w : ws) {
+      put_bf16(tmp.data() + off, w, {}, /*host=*/true);
+      off += numel(t(w));
+    }
+    write_disk_blob({{tmp.data(), tmp.size() * sizeof(bf16)}}, VisionLin::kDiskBf16);
+  } else if (host) {
+    bf16* p = m_->host_pinned<bf16>(total_rows * K);
+    size_t off = 0;
+    for (int w : ws) {
+      put_bf16(p + off, w, {}, /*host=*/true);
+      off += numel(t(w));
+    }
+    vl.w.w = p;
+    record_bytes(total_rows * K * sizeof(bf16));
+  } else {
+    vl.w.w = stack(ws);
+    record_bytes(total_rows * K * sizeof(bf16));
+  }
+  return vl;
+}
+
 // ---- GGML block weights, packed ------------------------------------------------------------
 // The file's blocks become payloads and scales (blocks_pack) through host
 // buffers of a few megabytes, in the row order the kernels want; the device
