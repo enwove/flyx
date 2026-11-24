@@ -135,7 +135,7 @@ void mtp_draft_rows(const BatchPass& bp, const MtpBlock& b, const std::vector<si
   const auto& head = block<HeadBlock>(m, b.head);
   const auto& a = block<AttnBlock>(m, b.attn);
   const auto& f = block<MlpBlock>(m, b.mlp);
-  const int H = a.hidden, nh = a.nh, nkv = a.nkv, hd = a.hd, q_w = nh * hd;
+  const int H = a.hidden, q_w = a.nh * a.hd;
   cudaStream_t st = v.L.st;
   const Launch& L = v.L;
 
@@ -167,29 +167,9 @@ void mtp_draft_rows(const BatchPass& bp, const MtpBlock& b, const std::vector<si
       flyx_seq* s = bp.seq[active[size_t(j)]].s;
       const KvBuf& kv = s->kv[size_t(a.kv)];
       const float* proj_j = v.b.proj + size_t(j) * v.ld_proj;
-      const float* gate_j = a.gate ? proj_j + q_w : nullptr;
       float* q_j = v.b.qbuf + size_t(j) * q_w;
       float* act_j = v.b.act + size_t(j) * q_w;
-      attn_prep(proj_j, v.ld_proj, 0, a.q_width(), a.q_width() + nkv * hd, a.q_norm.w, a.k_norm.w, a.q_norm.offset,
-                a.q_norm.eps, a.theta, a.rot, nh, nkv, hd, 1, s->P, kPosPosition, false, q_j, kv.ref(), st, i - 1,
-                nullptr, 0, CanvasKeys{}, a.mrope());
-      s->stage_before(kv, i - 1, 1, st);
-      if (kv.kq) {
-        params_at(s->P, s->P_window, i - 1, st);
-        attention_strata(q_j, kv.ref(), s->mtp_strata, nh, nkv, hd, 1, 1.f / std::sqrt(float(hd)), s->P_window, gate_j,
-                         v.ld_proj, act_j, q_w, v.b.part, kRoundSplits, L, 0, nullptr, s->P);
-      } else if (kv.window > 0) {
-        kv_window(kv.ref(), s->mtp_window, nkv, hd, kv.window, s->P, s->P_window, i - 1, st);
-        KernelOptions in_order = *L.opt;
-        in_order.pdl = false;
-        Launch after = L;
-        after.opt = &in_order;
-        attention(q_j, s->mtp_window, nh, nkv, hd, 1, true, 0, 1.f / std::sqrt(float(hd)), s->P_window, gate_j,
-                  v.ld_proj, act_j, q_w, v.b.part, kRoundSplits, after, i - 1);
-      } else {
-        attention(q_j, kv.staged(), nh, nkv, hd, 1, true, 0, 1.f / std::sqrt(float(hd)), s->P, gate_j, v.ld_proj,
-                  act_j, q_w, v.b.part, kRoundSplits, L, i - 1);
-      }
+      mtp_draft_attention(s, a, kv, i - 1, proj_j, v.ld_proj, q_j, act_j, v.b.part, L);
     }
     gemm(v.b.act, q_w, a.w_out, H, q_w, v.b.mx, H, A, true, L);
     mlp_body(v.b.mx, f, A, v.b.h, v.b.proj, v.ld_proj, v.b.act, v.ld_act, L, fused);

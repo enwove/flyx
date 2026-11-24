@@ -24,6 +24,8 @@ inline bf16* x16_of(const RowView& v) { return reinterpret_cast<bf16*>(v.b.x); }
 void norm_project(const float* x, float* h, float* out, int ld_out, int R, const Norm& n, const Lin& w, int N, int H,
                   const Launch& L, bool fused);
 void norm_and_project(const RowView& v, int R, const Norm& n, const Lin& w, int N, int H, bool fused);
+void mtp_draft_attention(flyx_seq* s, const AttnBlock& a, const KvBuf& kv, int pos_offset, const float* proj,
+                         int ld_proj, float* q, float* out, float* part, const Launch& L);
 void mlp_body(float* x, const MlpBlock& f, int R, float* h, float* proj, int ld_proj, float* act, int ld_act,
               const Launch& L, bool fused);
 void gdn_out_project(const RowView& v, const GdnBlock& g, int R, bool fused);
