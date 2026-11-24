@@ -129,6 +129,8 @@ void alloc_rows(const flyx_bmodel* m, int R, bool prefill, RowBufs* b, Alloc&& a
       b->ctrl_cat = f(size_t(R) * 2 * H);
       b->ctrl_gate = f(size_t(R) * n.max_loop_rank);
       b->ctrl_gf = f(size_t(R) * 2 * H);
+      b->ctrl_scratch = f(size_t(kLoopGates) * (prefill ? std::min(R, FLYX_MAX_ROWS) : R) *
+                          loop_row_floats(n.max_loop_rank));
     }
   }
   if (n.rel_q > 0) {

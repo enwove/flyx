@@ -186,6 +186,178 @@ void test_inkling2_loop_ctrl() {
   cudaFree(d_out);
 }
 
+namespace {
+
+// A float32 matrix [N][K] as a model file holds one (the reference reads these very values).
+flyx_tensor_view view_f32(const std::vector<float>& w, int N, int K) {
+  flyx_tensor_view t{};
+  t.dtype = FLYX_DT_F32;
+  t.ndim = 2;
+  t.shape[0] = N;
+  t.shape[1] = K;
+  t.data = w.data();
+  t.nbytes = w.size() * sizeof(float);
+  return t;
+}
+
+std::vector<float> randf(size_t n, double scale) {
+  const Vec v = randv(n, scale);
+  return std::vector<float>(v.begin(), v.end());
+}
+
+float* up_f(const std::vector<float>& v) {
+  float* p = dev<float>(v.size());
+  CK(cudaMemcpy(p, v.data(), v.size() * 4, cudaMemcpyHostToDevice));
+  return p;
+}
+
+}  // namespace
+
+// loop_control against ops::loop_control on float32 weights the reference reads as they are: one controller and
+// three in one launch, the real model's shape and sizes that fill no warp or block, a row alone and among others,
+// out beside cur and on it.
+void test_inkling2_loop_control() {
+  std::printf("inkling2 loop_control\n");
+  struct Shape {
+    int R, H, rank;
+  };
+  for (const Shape sh : {Shape{9, 256, 64}, Shape{3, 2304, 64}, Shape{20, 200, 12}, Shape{1, 2304, 64}}) {
+    const int R = sh.R, H = sh.H, rank = sh.rank, n = kLoopGates;
+    seed("inkling2_loop_control", R, H, rank);
+    const std::string at = " R=" + std::to_string(R) + " H=" + std::to_string(H) + " rank=" + std::to_string(rank);
+    const size_t RH = size_t(R) * H;
+    std::vector<Vec> cur(n), msg(n), want(n);
+    std::vector<float*> d_cur(n), d_msg(n), d_down(n), d_gain(n), d_forget(n);
+    float* d_out = dev<float>(size_t(n) * RH);
+    float* d_gate = dev<float>(size_t(n) * R * loop_row_floats(rank));
+    LoopGate gates[kLoopGates];
+    for (int c = 0; c < n; ++c) {
+      cur[size_t(c)] = randv(RH, 1.0 + c);
+      msg[size_t(c)] = randv(RH, 0.5 + c);
+      const std::vector<float> w_down = randf(size_t(rank) * 2 * H, 0.05);
+      const std::vector<float> w_gain = randf(size_t(H) * rank, 0.1), w_forget = randf(size_t(H) * rank, 0.1);
+      const flyx_tensor_view vd = view_f32(w_down, rank, 2 * H), vg = view_f32(w_gain, H, rank);
+      const flyx_tensor_view vf = view_f32(w_forget, H, rank);
+      // the kernel's inputs are float32: the reference from the same values
+      Vec cur32(RH), msg32(RH);
+      for (size_t i = 0; i < RH; ++i) {
+        cur32[i] = double(float(cur[size_t(c)][i]));
+        msg32[i] = double(float(msg[size_t(c)][i]));
+      }
+      want[size_t(c)].assign(RH, 0.0);
+      ops::loop_control(cur32.data(), msg32.data(), R, H, rank, &vd, &vg, &vf, want[size_t(c)].data());
+      d_cur[size_t(c)] = up(cur[size_t(c)]);
+      d_msg[size_t(c)] = up(msg[size_t(c)]);
+      d_down[size_t(c)] = up_f(w_down);
+      d_gain[size_t(c)] = up_f(w_gain);
+      d_forget[size_t(c)] = up_f(w_forget);
+      gates[c] = {d_cur[size_t(c)], d_msg[size_t(c)], d_down[size_t(c)], d_gain[size_t(c)], d_forget[size_t(c)],
+                  d_out + size_t(c) * RH};
+    }
+
+    loop_control(gates, n, R, H, rank, d_gate, 0);
+    std::vector<Vec> got(n);
+    for (int c = 0; c < n; ++c) {
+      got[size_t(c)] = down(d_out + size_t(c) * RH, RH);
+      expect("loop_control, three at once: controller " + std::to_string(c) + at, got[size_t(c)], want[size_t(c)],
+             2e-5);
+    }
+
+    // One controller a launch: the bits it has among three.
+    float* d_one = dev<float>(RH);
+    for (int c = 0; c < n; ++c) {
+      LoopGate one = gates[c];
+      one.out = d_one;
+      loop_control(&one, 1, R, H, rank, d_gate, 0);
+      expect_bits("loop_control alone = among three: controller " + std::to_string(c) + at, down(d_one, RH),
+                  got[size_t(c)]);
+    }
+
+    // A row alone: the bits it has among the others (rule 4: every row count).
+    const int rr = R / 2;
+    {
+      LoopGate one = gates[1];
+      one.cur += size_t(rr) * H;
+      one.msg += size_t(rr) * H;
+      one.out = d_one;
+      loop_control(&one, 1, 1, H, rank, d_gate, 0);
+      const Vec& all = got[1];
+      expect_bits("loop_control a row alone = among " + std::to_string(R) + at, down(d_one, size_t(H)),
+                  Vec(all.begin() + ptrdiff_t(rr) * H, all.begin() + ptrdiff_t(rr + 1) * H));
+    }
+
+    // out on its own cur (the three at once, each in place).
+    for (int c = 0; c < n; ++c) gates[c].out = d_cur[size_t(c)];
+    loop_control(gates, n, R, H, rank, d_gate, 0);
+    for (int c = 0; c < n; ++c)
+      expect_bits("loop_control in place: controller " + std::to_string(c) + at, down(d_cur[size_t(c)], RH),
+                  got[size_t(c)]);
+
+    for (int c = 0; c < n; ++c) {
+      cudaFree(d_cur[size_t(c)]);
+      cudaFree(d_msg[size_t(c)]);
+      cudaFree(d_down[size_t(c)]);
+      cudaFree(d_gain[size_t(c)]);
+      cudaFree(d_forget[size_t(c)]);
+    }
+    cudaFree(d_out);
+    cudaFree(d_gate);
+    cudaFree(d_one);
+  }
+}
+
+// linear_f32 against ops::linear on a float32 matrix: a router's and a sink's shapes of the real model, sizes that
+// fill no warp, accumulation, and a row alone against the same row among others.
+void test_inkling2_linear_f32() {
+  std::printf("inkling2 linear_f32\n");
+  struct Shape {
+    int R, N, K;
+  };
+  for (const Shape sh : {Shape{1, 128, 2304}, Shape{8, 128, 2304}, Shape{20, 24, 2304}, Shape{5, 37, 100},
+                         Shape{33, 4, 64}}) {
+    const int R = sh.R, N = sh.N, K = sh.K;
+    seed("inkling2_linear_f32", R, N, K);
+    const std::string at = " " + std::to_string(R) + "x" + std::to_string(N) + "x" + std::to_string(K);
+    const Vec x = randv(size_t(R) * K, 1.0);
+    const std::vector<float> w = randf(size_t(N) * K, 0.2);
+    const flyx_tensor_view vw = view_f32(w, N, K);
+    Vec x32(x.size());
+    for (size_t i = 0; i < x.size(); ++i) x32[i] = double(float(x[i]));
+    Vec want(size_t(R) * N, 0.0);
+    ops::linear(x32.data(), R, K, &vw, N, want.data());
+
+    float* dx = up(x);
+    float* dw = up_f(w);
+    const int ldy = N + 3;  // rows apart by more than their length
+    float* dy = dev<float>(size_t(R) * ldy);
+    linear_f32(dx, K, dw, N, K, dy, ldy, R, false, 0);
+    const Vec all = down(dy, size_t(R) * ldy);
+    Vec got(size_t(R) * N);
+    for (int r = 0; r < R; ++r) std::copy_n(all.begin() + ptrdiff_t(r) * ldy, N, got.begin() + ptrdiff_t(r) * N);
+    expect("linear_f32" + at, got, want, 2e-5);
+
+    linear_f32(dx, K, dw, N, K, dy, ldy, R, true, 0);  // y = y + y
+    const Vec twice = down(dy, size_t(R) * ldy);
+    Vec got2(size_t(R) * N), want2(size_t(R) * N);
+    for (int r = 0; r < R; ++r)
+      for (int c = 0; c < N; ++c) {
+        got2[size_t(r) * N + c] = twice[size_t(r) * ldy + c];
+        want2[size_t(r) * N + c] = double(float(got[size_t(r) * N + c]) + float(got[size_t(r) * N + c]));
+      }
+    expect_bits("linear_f32 accumulate" + at, got2, want2);
+
+    const int rr = R / 2;
+    float* d1 = dev<float>(size_t(N));
+    linear_f32(dx + size_t(rr) * K, K, dw, N, K, d1, N, 1, false, 0);
+    expect_bits("linear_f32 a row alone = among " + std::to_string(R) + at, down(d1, size_t(N)),
+                Vec(got.begin() + ptrdiff_t(rr) * N, got.begin() + ptrdiff_t(rr + 1) * N));
+    cudaFree(dx);
+    cudaFree(dw);
+    cudaFree(dy);
+    cudaFree(d1);
+  }
+}
+
 void test_inkling2_shortconv() {
   std::printf("inkling2 shortconv_pass + fold\n");
   for (int with_dyn : {0, 1}) {

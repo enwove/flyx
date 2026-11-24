@@ -162,6 +162,8 @@ int main() {
   test_inkling2_softcap();
   test_inkling2_attn_res();
   test_inkling2_loop_ctrl();
+  test_inkling2_loop_control();
+  test_inkling2_linear_f32();
   test_inkling2_shortconv();
   test_inkling2_rel_attn();
   test_inkling2_rel_strata();

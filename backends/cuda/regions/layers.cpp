@@ -610,6 +610,18 @@ void mlp_layer(const Pass& ps, const MlpBlock& f, bool fused) {
 
 namespace {
 
+// A block's loop gate controllers run in two ways (ops/attnres/ref.h loop_control).  Rounds, and the passes of
+// FLYX_MAX_ROWS rows or fewer that compute as rounds, read the float32 weights the file holds, all of a block's
+// controllers in two launches (loop_control).  A prefill pass of more rows runs each as linears on tensor cores from
+// bf16 inputs (apply_loop_ctrl), as its other bf16 linears run there: the two agree within tolerance
+// (docs/design/numerics.md, "Not promised"), and in float32 such a pass took 15% longer (Inkling-2-Mini, 6,280
+// tokens in passes of 1,024, RTX 5070 Ti).
+bool loop_as_round(const Pass& ps) { return ps.round || ps.rows <= FLYX_MAX_ROWS; }
+
+LoopGate loop_gate(const LoopWeights& w, const float* cur, const float* msg, float* out) {
+  return {cur, msg, w.down, w.gain, w.forget, out};
+}
+
 void apply_loop_ctrl(const float* cur, const float* msg, int rows, int H, int rank, const Lin& down, bool stacked_gf,
                      const Lin& gf, const Lin& gain, const Lin& forget, float* ctrl_cat, float* ctrl_gate,
                      float* ctrl_gf, float* out, const Launch& L) {
@@ -678,7 +690,18 @@ void rel_attn_layer(const Pass& ps, const RelAttnBlock& a, bool fused) {
     in_raw[1] = is_swa ? rv.b.attn_in : rv.b.attn_in + size_t(R) * H;
     in_raw[2] = is_swa ? rv.b.attn_in : rv.b.attn_in + size_t(2) * R * H;
   }
-  if (a.loop_rank > 0) {
+  if (a.loop_rank > 0 && loop_as_round(ps)) {
+    // The q, k and v controllers at once, each writing where its input was mixed (attn_in + j R H).  An SWA block
+    // mixes one input for all three there, which the first would write over while the others read it: that one
+    // writes to ctrl_cat.
+    LoopGate gates[3];
+    for (int j = 0; j < 3; ++j) {
+      float* dst = j == 0 && in_raw[1] == rv.b.attn_in ? rv.b.ctrl_cat : rv.b.attn_in + size_t(j) * R * H;
+      gates[j] = loop_gate(a.loop_f32[j], in_raw[j], rv.b.loop_msg + size_t(j) * R * H, dst);
+    }
+    loop_control(gates, 3, R, H, a.loop_rank, rv.b.ctrl_scratch, st);
+    for (int j = 0; j < 3; ++j) in_raw[j] = gates[j].out;
+  } else if (a.loop_rank > 0) {
     // Reverse order so when is_swa shares in_raw[0..2] == attn_in, j=2,1 read attn_in before j=0 overwrites it.
     for (int j = 2; j >= 0; --j) {
       float* dst = rv.b.attn_in + size_t(j) * R * H;
@@ -841,8 +864,14 @@ void moe_layer(const Pass& ps, const MoeBlock& f, bool fused) {
   }
   if (f.loop_rank > 0) {
     const float* msg = rv.b.loop_msg + size_t(3) * R * H;
-    apply_loop_ctrl(cur, msg, R, H, f.loop_rank, f.loop_ctrl_down, f.loop_ctrl_stacked, f.loop_ctrl_gf,
-                    f.loop_ctrl_gain, f.loop_ctrl_forget, rv.b.ctrl_cat, rv.b.ctrl_gate, rv.b.ctrl_gf, rv.b.attn_in, L);
+    if (loop_as_round(ps)) {
+      const LoopGate gate = loop_gate(f.loop_f32, cur, msg, rv.b.attn_in);
+      loop_control(&gate, 1, R, H, f.loop_rank, rv.b.ctrl_scratch, st);
+    } else {
+      apply_loop_ctrl(cur, msg, R, H, f.loop_rank, f.loop_ctrl_down, f.loop_ctrl_stacked, f.loop_ctrl_gf,
+                      f.loop_ctrl_gain, f.loop_ctrl_forget, rv.b.ctrl_cat, rv.b.ctrl_gate, rv.b.ctrl_gf, rv.b.attn_in,
+                      L);
+    }
     cur = rv.b.attn_in;
   }
 

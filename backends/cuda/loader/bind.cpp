@@ -383,6 +383,17 @@ DvBlock dv(WeightLoader& L, const flyx_model_desc& d, const flyx_dv_block& b, co
   return v;
 }
 
+// A cross-pass loop gate controller's weights as rounds read them: float32 whatever the file holds them in.
+LoopWeights loop_weights(WeightLoader& L, int down, int gain, int forget, int hidden, int rank) {
+  auto shaped = [&](int w, int N, int K) {
+    const flyx_tensor_view* v = L.t(w);
+    return v->ndim == 2 && v->shape[0] == N && v->shape[1] == K;
+  };
+  expect(shaped(down, rank, 2 * hidden) && shaped(gain, hidden, rank) && shaped(forget, hidden, rank),
+         "a loop gate controller of other shapes than [rank, 2 hidden], [hidden, rank], [hidden, rank]");
+  return {L.f32(down), L.f32(gain), L.f32(forget)};
+}
+
 RelAttnBlock rel_attn(WeightLoader& L, const flyx_rel_attn_block& b, const StateMap& sm) {
   RelAttnBlock a;
   a.hidden = b.hidden;
@@ -412,9 +423,9 @@ RelAttnBlock rel_attn(WeightLoader& L, const flyx_rel_attn_block& b, const State
   a.w_k = L.lin(b.k);
   a.w_v = L.lin(b.v);
   a.w_o = L.lin(b.o);
-  a.w_sink = L.lin(b.sink_proj);
-  if (b.k_conv_proj >= 0) a.w_k_conv_proj = L.lin(b.k_conv_proj);
-  if (b.v_conv_proj >= 0) a.w_v_conv_proj = L.lin(b.v_conv_proj);
+  a.w_sink = L.lin_f32(b.sink_proj);
+  if (b.k_conv_proj >= 0) a.w_k_conv_proj = L.lin_f32(b.k_conv_proj);
+  if (b.v_conv_proj >= 0) a.w_v_conv_proj = L.lin_f32(b.v_conv_proj);
   a.rel_bias = L.vec(b.rel_bias);
   a.q_clip_w = L.vec(b.q_clip_w);
   a.rel_clip_w = L.vec(b.rel_clip_w);
@@ -427,6 +438,8 @@ RelAttnBlock rel_attn(WeightLoader& L, const flyx_rel_attn_block& b, const State
   a.loop_rank = b.loop_rank;
   if (b.loop_rank > 0) {
     for (int j = 0; j < 3; ++j) {
+      a.loop_f32[j] = loop_weights(L, b.loop_ctrl_down[j], b.loop_ctrl_gain[j], b.loop_ctrl_forget[j], b.hidden,
+                                   b.loop_rank);
       a.loop_ctrl_down[j] = L.lin(b.loop_ctrl_down[j]);
       if (L.can_stack({b.loop_ctrl_gain[j], b.loop_ctrl_forget[j]})) {
         a.loop_ctrl_gf[j] = L.lin_stack({b.loop_ctrl_gain[j], b.loop_ctrl_forget[j]});
@@ -456,7 +469,7 @@ MoeBlock moe(WeightLoader& L, const flyx_moe_block& b, const StateMap& sm) {
   f.situ_beta = b.situ_beta;
   f.situ_linear_beta = b.situ_linear_beta;
   f.norm = norm(L, b.norm);
-  f.router = L.lin(b.router);
+  f.router = L.lin_f32(b.router);
   if (b.router_bias >= 0) f.router_bias = L.vec(b.router_bias);
   f.gate_up = L.expert_mat(b.gate_up);
   f.down = L.expert_mat(b.down);
@@ -464,6 +477,7 @@ MoeBlock moe(WeightLoader& L, const flyx_moe_block& b, const StateMap& sm) {
   if (b.res_query >= 0) f.res_query = L.vec(b.res_query);
   f.loop_rank = b.loop_rank;
   if (b.loop_rank > 0) {
+    f.loop_f32 = loop_weights(L, b.loop_ctrl_down, b.loop_ctrl_gain, b.loop_ctrl_forget, b.hidden, b.loop_rank);
     f.loop_ctrl_down = L.lin(b.loop_ctrl_down);
     if (L.can_stack({b.loop_ctrl_gain, b.loop_ctrl_forget})) {
       f.loop_ctrl_gf = L.lin_stack({b.loop_ctrl_gain, b.loop_ctrl_forget});

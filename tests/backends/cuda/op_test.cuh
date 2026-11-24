@@ -270,6 +270,8 @@ void test_mrope();
 void test_inkling2_softcap();
 void test_inkling2_attn_res();
 void test_inkling2_loop_ctrl();
+void test_inkling2_loop_control();
+void test_inkling2_linear_f32();
 void test_inkling2_shortconv();
 void test_inkling2_rel_attn();
 void test_inkling2_rel_strata();

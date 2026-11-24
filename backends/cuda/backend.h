@@ -191,6 +191,7 @@ struct RowBufs {
   float *loop_bank = nullptr, *loop_bank_out = nullptr, *loop_msg = nullptr;
   float *inp_saved = nullptr, *attn_in = nullptr;
   float *ctrl_cat = nullptr, *ctrl_gate = nullptr, *ctrl_gf = nullptr;
+  float* ctrl_scratch = nullptr;  // loop_control's (rounds, and passes of FLYX_MAX_ROWS rows or fewer)
   float *rel_q = nullptr, *rel_btab = nullptr, *sink = nullptr, *kv_conv = nullptr, *kv_dyn = nullptr;
   float *post_raw = nullptr, *post_out = nullptr;
   int* moe_idx = nullptr;

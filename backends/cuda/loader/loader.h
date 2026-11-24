@@ -79,6 +79,12 @@ class WeightLoader {
   ExpertMat expert_mat(int w);
 
   std::vector<float> host_f32(int w) const;
+  // A matrix in float32 on the device, the values its file holds (any number type).  Uploaded once: the passes of
+  // a looped core share their weights.
+  float* f32(int w);
+  // A small control linear (a sparse MoE's router, an attention sink, a dynamic-tap projection): lin(), and beside
+  // it the float32 values of a float32 or binary16 matrix (Lin::f), which rounds read.
+  Lin lin_f32(int w);
   float* vec(int w);
   float* vecs(const std::vector<int>& ws);
   float* put(const std::vector<float>& values);
@@ -98,6 +104,7 @@ class WeightLoader {
   std::unordered_map<int, bf16*> mats_;      // matrices uploaded once (a tied head is the embedding)
   std::unordered_map<int, BlockMat> packs_;  // block weights packed once
   std::unordered_map<int, float*> vecs_;     // 1D/small float vectors uploaded once (shared across loop passes)
+  std::unordered_map<int, float*> f32s_;     // float32 matrices uploaded once
   std::map<std::vector<int>, Lin> lins_;     // stacked/single linears uploaded once (shared across loop passes)
   std::unordered_map<int, ExpertMat> experts_;  // 3D expert tensors uploaded once (shared across loop passes)
   std::unique_ptr<LoadStaging> staging_;

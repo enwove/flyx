@@ -26,6 +26,10 @@ struct Lin {
   bf16* w = nullptr;
   uint8_t *q = nullptr, *s = nullptr;
   float* rs = nullptr;
+  // Beside w: the float32 values a float32 or binary16 file holds (WeightLoader::lin_f32: a small control projection,
+  // where bf16's 8 bits pick another expert or move a gate).  gemm() reads it in rounds (linear_f32) and w in
+  // prefill passes of more than FLYX_MAX_ROWS rows, on tensor cores; no fused producer's linear has one.
+  float* f = nullptr;
   std::vector<BlockMat> blk{};
   bool packed() const { return !blk.empty(); }
   // Block weights whose inputs are 8 bits in every pass (FLYX_ACT_Q8): a fused producer writes them so.
@@ -319,6 +323,12 @@ struct VisionMergeBlock {
   VisionVec fc1_b, fc2_b;
 };
 
+// A cross-pass loop gate controller's weights in float32, the values its file holds, as rounds read them
+// (kernels.cuh loop_control): down [rank][2 hidden], gain and forget [hidden][rank].
+struct LoopWeights {
+  float *down = nullptr, *gain = nullptr, *forget = nullptr;
+};
+
 // Inkling-2 relative-position-bias attention (SWA or Global) with AttnRes, optional cross-pass loop control,
 // Q/K/R L2 clipping, no-gamma V RMSNorm, per-query sink, and depthwise ShortConv on K/V/output.
 struct RelAttnBlock {
@@ -333,8 +343,11 @@ struct RelAttnBlock {
   float *k_conv = nullptr, *v_conv = nullptr, *post_conv = nullptr;
   float *res_query = nullptr, *loop_msg_query = nullptr;
   int res_push = 0, loop_rank = 0;
+  // The q, k and v inputs' controllers: linears for prefill passes of more than FLYX_MAX_ROWS rows (bf16 or as
+  // the file packs them), float32 for rounds.
   Lin loop_ctrl_down[3], loop_ctrl_gf[3], loop_ctrl_gain[3], loop_ctrl_forget[3];
   bool loop_ctrl_stacked[3] = {};
+  LoopWeights loop_f32[3];
   int kv = -1, sconv = -1;
 };
 
@@ -349,8 +362,9 @@ struct MoeBlock {
   ExpertMat gate_up, down;
   float *post_conv = nullptr, *res_query = nullptr;
   int loop_rank = 0;
-  Lin loop_ctrl_down, loop_ctrl_gf, loop_ctrl_gain, loop_ctrl_forget;
+  Lin loop_ctrl_down, loop_ctrl_gf, loop_ctrl_gain, loop_ctrl_forget;  // as RelAttnBlock's
   bool loop_ctrl_stacked = false;
+  LoopWeights loop_f32;
   int sconv = -1, sconv_offset = 0;
 };
 

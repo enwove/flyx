@@ -1054,8 +1054,25 @@ std::vector<float> WeightLoader::host_f32(int w) const {
   const auto* v = t(w);
   if (!numbers(v)) throw std::runtime_error(std::string(v->name) + ": unsupported dtype");
   std::vector<float> out(numel(v));
+  if (v->dtype == FLYX_DT_F32) {  // as they are
+    std::memcpy(out.data(), v->data, out.size() * sizeof(float));
+    return out;
+  }
   for (size_t i = 0; i < out.size(); ++i) out[i] = static_cast<float>(flyx::ops::load(v, i));
   return out;
+}
+
+float* WeightLoader::f32(int w) {
+  if (auto it = f32s_.find(w); it != f32s_.end()) return it->second;
+  if (t(w)->ndim != 2) throw std::runtime_error(std::string(t(w)->name) + ": not a matrix");
+  return f32s_[w] = put(host_f32(w));
+}
+
+Lin WeightLoader::lin_f32(int w) {
+  Lin l = lin(w);
+  const auto* v = t(w);
+  if (v->ndim == 2 && (v->dtype == FLYX_DT_F32 || v->dtype == FLYX_DT_F16 || v->dtype == FLYX_DT_F64)) l.f = f32(w);
+  return l;
 }
 
 float* WeightLoader::vec(int w) {

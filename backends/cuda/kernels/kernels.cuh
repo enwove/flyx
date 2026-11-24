@@ -1419,6 +1419,31 @@ void attn_res_mix(const float* bank, int n_blocks, const float* cur, const float
 void loop_ctrl_prep(const float* cur, const float* msg, int rows, int H, float* cat_out, cudaStream_t st);
 void loop_ctrl_apply(const float* cur, const float* msg, const float* gain, int ld_gain, const float* forget,
                      int ld_forget, int rows, int H, float* out, cudaStream_t st);
+// The same controllers as rounds run them (ops/attnres/ref.h loop_control): up to kLoopGates of them over the same
+// rows in two launches (an attention block's q, k and v at once), reading float32 weights, the values the file holds
+// (bf16, binary16 and float32 files alike: none is rounded), and summing in float32:
+//   gate = down . [rmsnorm(cur, 1e-6) | rmsnorm(msg, 1e-6)]            [rank]
+//   out  = cur - tanh(forget . gate) * cur + tanh(gain . gate) * msg   [H]
+// A gate output is a block of 256 threads, each its inputs 256 apart in order, then the block's tree (cur's half and
+// msg's half apart, each times its norm's scale); an output a warp, its lanes 32 of the rank apart, then their tree.
+// A row has the same bits whatever rows and controllers run with it.  out may be its own controller's cur; no
+// controller's out may be another's cur or msg.
+constexpr int kLoopGates = 3;
+struct LoopGate {
+  const float *cur = nullptr, *msg = nullptr;                      // [rows][H]
+  const float *down = nullptr, *gain = nullptr, *forget = nullptr;  // [rank][2 H], [H][rank], [H][rank]
+  float* out = nullptr;                                            // [rows][H]
+};
+// Floats of scratch a row of one controller takes: the down projection's two half sums an output, the two norms'
+// sums of squares.
+__host__ __device__ constexpr size_t loop_row_floats(int rank) { return 2 * size_t(rank) + 2; }
+// scratch: n * rows * loop_row_floats(rank) floats.
+void loop_control(const LoopGate* g, int n, int rows, int H, int rank, float* scratch, cudaStream_t st);
+// y[r][n] (+)= sum_k W[n][k] x[r][k] of a float32 W [N][K] as its file holds it (Lin::f: a sparse MoE's router, an
+// attention sink, a dynamic-tap projection, as rounds run them): an output a warp, its lanes 32 values of K apart in
+// order, then their tree.  A row has the same bits whatever rows run with it.
+void linear_f32(const float* x, int ldx, const float* W, int N, int K, float* y, int ldy, int rows, bool accumulate,
+                cudaStream_t st);
 
 // Causal depthwise short convolution with residual scaling and optional per-head dynamic taps (ops/shortconv/ref.h).
 // win: [FLYX_ROUND_SLOTS][conv - 1][ch_total]; replay (rounds): [kGdnReplaySlots][replay_rows][ch_total].
