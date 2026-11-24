@@ -20,54 +20,68 @@ const char* drafter_name(Drafter d) {
 }
 
 namespace {
-// Sequential drafters (MTP, future EAGLE-4, etc.) propose one token per step and can stop mid-chain;
-// parallel block drafters (DFlash2, future DSpark, etc.) propose a whole block in one forward pass.
-bool is_sequential(Drafter d) { return d == Drafter::kMtp; }
+// Structural properties of a drafter kind; policy functions (draft_widths, adaptive_checkpoints, block_drafts)
+// decide from these traits plus target properties (verify_scales_with_width) rather than per-drafter branches.
+struct DrafterTraits {
+  bool sequential;     // drafts one token per step; stopping early saves both draft and verify work
+  bool tree_only;      // drafts trees over a persistent canvas (DV)
+  bool stretch_block;  // shared mask token lets a parallel block draft past max_drafts up to FLYX_MAX_ROWS - 1
+};
+
+DrafterTraits drafter_traits(Drafter d) {
+  switch (d) {
+    case Drafter::kMtp: return {/*sequential=*/true, false, false};
+    case Drafter::kDFlash2: return {false, false, /*stretch_block=*/true};
+    case Drafter::kDv: return {false, /*tree_only=*/true, false};
+  }
+  return {false, false, false};
+}
 }  // namespace
 
-// Sequential drafters use tensor-core MMA-aligned checkpoints 1, 3, 5, 7, 15 (rows 2, 4, 6, 8, 16)
-// clipped to max_drafts: adaptive stopping exits early on low confidence and jumps to full 15 drafts
-// on high-confidence chains or models/GPUs where wide rounds pay, with only 5 verify subgraphs (fast startup).
-// Parallel block drafters (DFlash2) draft a whole block at once: 3, 7 and the block, plus FLYX_MAX_ROWS - 1
-// when the block is narrower.
-// DV drafts trees of its file's width, at most the drafts a tree round verifies
-// (FLYX_MAX_WIDE_ROWS - 1, on the wide rows): what its references drafted; and
-// of a round of 16 rows, 15, where the file's is wider (the controller rates
-// each by the tokens its own rounds gave).
+// Width ladder and intra-round adaptive stopping, driven by drafter traits + target structure:
+// - Sequential drafters (MTP, future EAGLE-4): tensor-core aligned 1, 3, 5, 7, ..., max_drafts (<= 15).
+// - Parallel block drafters: {3, 5, 7} when target verify cost scales steeply with width (e.g. sparse MoE),
+//   {3, 7} on dense targets, plus FLYX_MAX_ROWS - 1 when stretch_block allows drafting past max_drafts.
+// - Tree-only drafters (DV): up to FLYX_MAX_WIDE_ROWS - 1 (plus 15 when wider).
 std::vector<int> Model::draft_widths(int d) const {
   const DrafterBlock& b = drafters_.at(size_t(d));
   if (b.max_drafts <= 0) return {};
-  if (b.kind == Drafter::kDv) {
+  const DrafterTraits tr = drafter_traits(b.kind);
+  if (tr.tree_only) {
     const int widest = std::min(FLYX_MAX_WIDE_ROWS - 1, b.max_drafts);
     if (widest > FLYX_MAX_ROWS - 1) return {FLYX_MAX_ROWS - 1, widest};
     return {widest};
   }
-  const bool seq = is_sequential(b.kind);
-  const int widest = seq ? std::min(FLYX_MAX_ROWS - 1, b.max_drafts) : b.max_drafts;
+  const int widest = tr.stretch_block ? b.max_drafts : std::min(FLYX_MAX_ROWS - 1, b.max_drafts);
+  const std::vector<int> ladder = tr.sequential                ? std::vector<int>{1, 3, 5, 7}
+                                  : verify_scales_with_width() ? std::vector<int>{3, 5, 7}
+                                                               : std::vector<int>{3, 7};
   std::vector<int> widths;
-  for (int k : seq ? std::vector<int>{1, 3, 5, 7} : std::vector<int>{3, 7})
+  for (int k : ladder)
     if (k < widest) widths.push_back(k);
   widths.push_back(widest);
-  if (!seq && widest < FLYX_MAX_ROWS - 1) widths.push_back(FLYX_MAX_ROWS - 1);
+  if (tr.stretch_block && widest < FLYX_MAX_ROWS - 1) widths.push_back(FLYX_MAX_ROWS - 1);
   return widths;
 }
 
 std::vector<int> Model::adaptive_checkpoints(int d) const {
   const DrafterBlock& b = drafters_.at(size_t(d));
-  if (b.max_drafts <= 0 || b.kind == Drafter::kDv) return {};  // DV drafts trees: no round stops inside them
+  const DrafterTraits tr = drafter_traits(b.kind);
+  if (b.max_drafts <= 0 || tr.tree_only) return {};  // tree-only drafters (DV): no intra-round chain stop
   const std::vector<int> ws = draft_widths(d);
-  if (is_sequential(b.kind)) return ws.size() > 1 ? ws : std::vector<int>{};
-  // Block drafters (DFlash2 and similar) draft their whole block in one pass whatever the round stops at, so
-  // stopping saves only verify rows, and the fixed widths' chooser (with its wide block after a run) does better:
-  // RTX PRO 6000, QUASAR NVFP4 27B + DFlash2, adaptive against fixed widths: code 425-439 against 443-494 tok/s,
-  // a code edit 604 against 656, explanations 255 against 260, prose and lists the same.  Their adaptive round
-  // also held a graph of every checkpoint's verify pass beside the fixed widths' graphs.
+  // Intra-round GPU confidence stopping (stop_decide_step / stop_decide_block) pays whenever cutting verify width
+  // saves substantial work:
+  // - sequential drafters save both remaining draft steps and verify rows;
+  // - targets with steep verify-cost scaling (e.g. sparse MoE active-expert fan-out) benefit on any block drafter.
+  // Dense targets paired with block drafters have nearly flat verify cost across widths (RTX PRO 6000, QUASAR NVFP4
+  // 27B + DFlash2: adaptive 425-439 vs fixed 443-494 tok/s on code) and avoid extra verify subgraphs in VRAM.
+  if (tr.sequential || verify_scales_with_width()) return ws.size() > 1 ? ws : std::vector<int>{};
   return {};
 }
 
 int Model::block_drafts(int d) const {
   const DrafterBlock& b = drafters_.at(size_t(d));
-  return b.kind == Drafter::kMtp ? std::min(7, b.max_drafts) : b.max_drafts;
+  return drafter_traits(b.kind).sequential ? std::min(7, b.max_drafts) : b.max_drafts;
 }
 
 void Model::add_drafter(Drafter kind, int block, int max_drafts) {

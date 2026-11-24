@@ -249,10 +249,11 @@ constexpr int kSign1Rows = 256;
 constexpr int kSignTiles1 = 2;
 constexpr int kSignTilesR = 4;
 
-template <int R, int T, int TILE_G2>
+template <int R, int T, int TILE_G2, bool ACCUM_BIAS = false>
 __global__ void __launch_bounds__(kSign1Rows)
 k_sign_rough_lut(const float* __restrict__ x, int ldx, const uint32_t* __restrict__ bits,
-                 const bf16* __restrict__ scales, int N, int K, float* __restrict__ y, int ldy) {
+                 const bf16* __restrict__ scales, const float* __restrict__ bias, int N, int K, float* __restrict__ y,
+                 int ldy) {
   constexpr int kTileQ = TILE_G2 * 32;
   __shared__ float tab[R][kTileQ][16];
 
@@ -302,7 +303,11 @@ k_sign_rough_lut(const float* __restrict__ x, int ldx, const uint32_t* __restric
       uint32_t s2[T];
 #pragma unroll
       for (int t = 0; t < T; ++t) {
-        w[t] = valid[t] ? ldg_stream(wb[t] + 256 * size_t(g2)) : make_uint4(0, 0, 0, 0);
+        if constexpr (ACCUM_BIAS) {
+          w[t] = valid[t] ? __ldg(wb[t] + 256 * size_t(g2)) : make_uint4(0, 0, 0, 0);
+        } else {
+          w[t] = valid[t] ? ldg_stream(wb[t] + 256 * size_t(g2)) : make_uint4(0, 0, 0, 0);
+        }
         s2[t] = valid[t] ? __ldg(sc2[t] + 256 * size_t(g2)) : 0u;
       }
 #pragma unroll
@@ -334,8 +339,14 @@ k_sign_rough_lut(const float* __restrict__ x, int ldx, const uint32_t* __restric
   for (int t = 0; t < T; ++t) {
     if (!valid[t]) continue;
     const int n = n0 + t * kSign1Rows;
+    if constexpr (ACCUM_BIAS) {
+      const float bval = bias ? __ldg(bias + n) : 0.f;
 #pragma unroll
-    for (int r = 0; r < R; ++r) y[size_t(r) * ldy + n] = score[t][r];
+      for (int r = 0; r < R; ++r) y[size_t(r) * ldy + n] = y[size_t(r) * ldy + n] + score[t][r] + bval;
+    } else {
+#pragma unroll
+      for (int r = 0; r < R; ++r) y[size_t(r) * ldy + n] = score[t][r];
+    }
   }
 }
 
@@ -564,6 +575,64 @@ __global__ void __launch_bounds__(256) k_draft_score(float* __restrict__ rough, 
   if (lane == 0) row[kCandCap + c] = s;
 }
 
+// General bf16 candidate-scoring kernel for arbitrary K, optional accumulate into existing candidate scores,
+// optional per-token bias, and optional logit softcap (shared by additive / softcapped draft heads).
+__global__ void __launch_bounds__(256)
+k_draft_score_gen(float* __restrict__ rough, int ld_rough, const bf16* __restrict__ W, const float* __restrict__ bias,
+                  int K, const float* __restrict__ x, int ldx, bool accumulate, float softcap) {
+  const int r = blockIdx.x, lane = threadIdx.x & 31, c = blockIdx.y * 8 + (threadIdx.x >> 5);
+  float* row = rough + size_t(r) * ld_rough;
+  const int* cand_i = reinterpret_cast<const int*>(row);
+  if (c >= cand_i[2 * kCandCap]) return;
+  const int vid = cand_i[c];
+  const float* xr = x + size_t(r) * ldx;
+  float s = 0.f;
+  const bool vec8 =
+      (K & 7) == 0 && (reinterpret_cast<uintptr_t>(W) & 15u) == 0 && (reinterpret_cast<uintptr_t>(xr) & 15u) == 0;
+  if (vec8) {
+    const uint4* wr = reinterpret_cast<const uint4*>(W + size_t(vid) * K);
+    const int n8 = K >> 3;
+    for (int q = lane; q < n8; q += 32) {
+      const uint4 a = __ldg(wr + q);
+      const float4 x0 = *reinterpret_cast<const float4*>(xr + 8 * q);
+      const float4 x1 = *reinterpret_cast<const float4*>(xr + 8 * q + 4);
+      const uint32_t wa[4] = {a.x, a.y, a.z, a.w};
+      const float xv[8] = {x0.x, x0.y, x0.z, x0.w, x1.x, x1.y, x1.z, x1.w};
+#pragma unroll
+      for (int e = 0; e < 4; ++e) {
+        const float2 f = __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162*>(&wa[e]));
+        s = __fmaf_rn(f.x, xv[2 * e], s);
+        s = __fmaf_rn(f.y, xv[2 * e + 1], s);
+      }
+    }
+  } else {
+    const bf16* wr = W + size_t(vid) * K;
+    for (int k = lane; k < K; k += 32) s = __fmaf_rn(__bfloat162float(__ldg(wr + k)), xr[k], s);
+  }
+#pragma unroll
+  for (int o = 16; o > 0; o >>= 1) s += __shfl_xor_sync(0xffffffffu, s, o);
+  if (lane == 0) {
+    float z = (accumulate ? row[kCandCap + c] : 0.f) + s + (bias ? bias[vid] : 0.f);
+    if (softcap > 0.f) z = softcap * tanhf(z / softcap);
+    row[kCandCap + c] = z;
+  }
+}
+
+// grid rows; block kCandCap: combines an optional packed candidate-score vector + optional vocab bias + optional
+// softcap into rough[r * ld_rough + kCandCap + c].
+__global__ void __launch_bounds__(kCandCap)
+k_draft_combine_cands(const float* __restrict__ add, int ld_add, const float* __restrict__ bias, float softcap,
+                      float* __restrict__ rough, int ld_rough) {
+  const int r = blockIdx.x, c = threadIdx.x;
+  float* row = rough + size_t(r) * ld_rough;
+  const int* cand_i = reinterpret_cast<const int*>(row);
+  if (c >= cand_i[2 * kCandCap]) return;
+  const int vid = cand_i[c];
+  float z = row[kCandCap + c] + (add ? add[size_t(r) * ld_add + c] : 0.f) + (bias ? bias[vid] : 0.f);
+  if (softcap > 0.f) z = softcap * tanhf(z / softcap);
+  row[kCandCap + c] = z;
+}
+
 // One warp per row: the top k of the candidates by exact logit, high to low, the lowest index on ties.
 // When prob_out or margin_out is non-null, also records the top candidate's truncated softmax probability over all
 // scored candidates and its logit margin above the runner-up (drafter-agnostic confidence signal).
@@ -644,7 +713,8 @@ void gemm_sign_rough(const float* x, int ldx, const SignHead& h, int N, int K, f
   const bool fits_1row = K % 128 == 0;
   if (rows == 1 && fits_1row) {
     const int grid = ceil_div(N, kSignTiles1 * kSign1Rows);
-    k_sign_rough_lut<1, kSignTiles1, 10><<<grid, kSign1Rows, 0, L.st>>>(x, ldx, h.bits, h.scales, N, K, y, ldy);
+    k_sign_rough_lut<1, kSignTiles1, 10><<<grid, kSign1Rows, 0, L.st>>>(x, ldx, h.bits, h.scales, nullptr, N, K, y,
+                                                                        ldy);
     return;
   }
   if (exact_1row && rows >= 2 && fits_1row) {
@@ -654,9 +724,15 @@ void gemm_sign_rough(const float* x, int ldx, const SignHead& h, int N, int K, f
       const float* xr = x + size_t(r0) * ldx;
       float* yr = y + size_t(r0) * ldy;
       if (chunk == 1) gemm_sign_rough(xr, ldx, h, N, K, yr, ldy, 1, L, true);
-      else if (chunk == 2) k_sign_rough_lut<2, kSignTilesR, 4><<<grid, kSign1Rows, 0, L.st>>>(xr, ldx, h.bits, h.scales, N, K, yr, ldy);
-      else if (chunk == 3) k_sign_rough_lut<3, kSignTilesR, 4><<<grid, kSign1Rows, 0, L.st>>>(xr, ldx, h.bits, h.scales, N, K, yr, ldy);
-      else k_sign_rough_lut<4, kSignTilesR, 4><<<grid, kSign1Rows, 0, L.st>>>(xr, ldx, h.bits, h.scales, N, K, yr, ldy);
+      else if (chunk == 2)
+        k_sign_rough_lut<2, kSignTilesR, 4><<<grid, kSign1Rows, 0, L.st>>>(xr, ldx, h.bits, h.scales, nullptr, N, K, yr,
+                                                                           ldy);
+      else if (chunk == 3)
+        k_sign_rough_lut<3, kSignTilesR, 4><<<grid, kSign1Rows, 0, L.st>>>(xr, ldx, h.bits, h.scales, nullptr, N, K, yr,
+                                                                           ldy);
+      else
+        k_sign_rough_lut<4, kSignTilesR, 4><<<grid, kSign1Rows, 0, L.st>>>(xr, ldx, h.bits, h.scales, nullptr, N, K, yr,
+                                                                           ldy);
       r0 += chunk;
     }
     return;
@@ -673,14 +749,49 @@ void gemm_sign_rough(const float* x, int ldx, const SignHead& h, int N, int K, f
     k_gemm_sign<8, 4><<<grid, 128, 0, L.st>>>(sc.split, K, h.bits, h.scales, N, K, y, ldy, rows);
 }
 
+void gemm_sign_rough_add(const float* x, int ldx, const SignHead& h, const float* bias, int N, int K, float* y,
+                         int ldy, const Launch& L) {
+  const int grid = ceil_div(N, kSignTiles1 * kSign1Rows);
+  if (K <= 256)
+    k_sign_rough_lut<1, kSignTiles1, 2, true><<<grid, kSign1Rows, 0, L.st>>>(x, ldx, h.bits, h.scales, bias, N, K, y,
+                                                                             ldy);
+  else
+    k_sign_rough_lut<1, kSignTiles1, 10, true><<<grid, kSign1Rows, 0, L.st>>>(x, ldx, h.bits, h.scales, bias, N, K, y,
+                                                                              ldy);
+}
+
+void draft_select_cands(float* rough, int ld, int V, int rows, const Launch& L) {
+  static_assert(2 * kCandCap + 1 <= kDraftPickFloats, "a row's candidates fit where its rough scores were");
+  launch_draft_select(rough, ld, V, rows, L);
+}
+
+void draft_score_bf16(const float* x, int ldx, const bf16* W, const float* bias, int K, int rows, float* rough, int ld,
+                      bool accumulate, float softcap, cudaStream_t st) {
+  const dim3 grid(rows, kCandCap / 8);
+  if (!accumulate && !bias && softcap <= 0.f && K <= 4096 && (K & 7) == 0) {
+    k_draft_score<<<grid, 256, 0, st>>>(rough, ld, W, K, x, ldx);
+  } else {
+    k_draft_score_gen<<<grid, 256, 0, st>>>(rough, ld, W, bias, K, x, ldx, accumulate, softcap);
+  }
+}
+
+void draft_combine_cands(const float* add, int ld_add, const float* bias, float softcap, int rows, float* rough, int ld,
+                         cudaStream_t st) {
+  k_draft_combine_cands<<<rows, kCandCap, 0, st>>>(add, ld_add, bias, softcap, rough, ld);
+}
+
+void draft_pick_topk(float* rough, int ld, int rows, int k, int* idx, float* val, cudaStream_t st, float* prob,
+                     float* margin) {
+  k_draft_topk<<<rows, 32, 0, st>>>(rough, ld, k, idx, val, prob, margin);
+}
+
 void draft_pick(const float* x, int ldx, const SignHead& h, const bf16* W, int V, int K, int rows, int k, int* idx,
                 float* val, float* rough, const Launch& L, bool exact_1row, float* prob, float* margin) {
-  static_assert(2 * kCandCap + 1 <= kDraftPickFloats, "a row's candidates fit where its rough scores were");
   const int ld = std::max(V, kDraftPickFloats);
   gemm_sign_rough(x, ldx, h, V, K, rough, ld, rows, L, exact_1row);
-  launch_draft_select(rough, ld, V, rows, L);
-  k_draft_score<<<dim3(rows, kCandCap / 8), 256, 0, L.st>>>(rough, ld, W, K, x, ldx);
-  k_draft_topk<<<rows, 32, 0, L.st>>>(rough, ld, k, idx, val, prob, margin);
+  draft_select_cands(rough, ld, V, rows, L);
+  draft_score_bf16(x, ldx, W, nullptr, K, rows, rough, ld, false, 0.f, L.st);
+  draft_pick_topk(rough, ld, rows, k, idx, val, L.st, prob, margin);
 }
 
 void draft_pick_blocks(const float* x, int ldx, const SignHead& h, const BlockMat& W, int V, int K, int rows, int k,
@@ -688,12 +799,12 @@ void draft_pick_blocks(const float* x, int ldx, const SignHead& h, const BlockMa
                        float* margin) {
   const int ld = std::max(V, kDraftPickFloats);
   gemm_sign_rough(x, ldx, h, V, K, rough, ld, rows, L, exact_1row);
-  launch_draft_select(rough, ld, V, rows, L);
+  draft_select_cands(rough, ld, V, rows, L);
   // Every row's candidates from the packed rows at once (a row's candidates decoded to float32 first, a row at a
   // time, were 7 launch pairs and 141 us a DFlash2 round on the 27B; the same values, in the same order).
   int* cand = reinterpret_cast<int*>(rough);
   dots_blocks(W, K, cand, cand + 2 * kCandCap, rough + kCandCap, size_t(ld), kCandCap, x, ldx, rows, L.st);
-  k_draft_topk<<<rows, 32, 0, L.st>>>(rough, ld, k, idx, val, prob, margin);
+  draft_pick_topk(rough, ld, rows, k, idx, val, L.st, prob, margin);
 }
 
 }  // namespace flyx::cuda

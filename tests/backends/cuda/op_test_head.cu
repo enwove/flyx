@@ -357,6 +357,160 @@ void test_draft_pick(int V, int K, bool plant, bool pick) {
     std::printf("  %-4s %-48s\n", prob_ok ? "ok" : "FAIL", "truncated softmax p_max bounds");
     g_fail += !prob_ok;
   }
+
+  // Shared additive/softcap two-stage candidate-head primitives: gemm_sign_rough_add, draft_score_bf16 (accum),
+  // draft_combine_cands, and draft_pick_topk (run once on the small test case).
+  if (V <= kDraftCandCap) {
+    auto up_raw = [](const std::vector<float>& v) {
+      float* p = dev<float>(v.size());
+      CK(cudaMemcpy(p, v.data(), v.size() * sizeof(float), cudaMemcpyHostToDevice));
+      return p;
+    };
+    auto down_raw = [](const float* p, size_t n) {
+      CK(cudaDeviceSynchronize());
+      std::vector<float> v(n);
+      CK(cudaMemcpy(v.data(), p, n * sizeof(float), cudaMemcpyDeviceToHost));
+      return v;
+    };
+    auto softcap_ref = [](double z, double cap) { return cap > 0.0 ? cap * std::tanh(z / cap) : z; };
+    auto test_score = [&](int Rk_c, bool with_bias, float cap_c, const char* tag) {
+      constexpr int Vc = 1024, C = 173;
+      std::vector<int> c_ids(C);
+      for (int c = 0; c < C; ++c) c_ids[c] = (c * 5 + 3) % Vc;
+      Vec c_base = randv(C, 2.0), mk_c = randv(Rk_c, 0.8);
+      Vec w2_c = randv(size_t(Vc) * Rk_c, 0.2), w2b_c = randv(Vc, 0.3);
+      Vec w2_q(size_t(Vc) * Rk_c);
+      for (size_t i = 0; i < w2_c.size(); ++i) w2_q[i] = from_bf16(to_bf16(w2_c[i]));
+      std::vector<float> h_row(kDraftPickFloats, 0.f);
+      int* h_ci = reinterpret_cast<int*>(h_row.data());
+      for (int c = 0; c < C; ++c) {
+        h_ci[c] = c_ids[c];
+        h_row[kDraftCandCap + c] = float(c_base[c]);
+      }
+      h_ci[2 * kDraftCandCap] = C;
+      float* d_row = up_raw(h_row);
+      float* d_mk = up(mk_c);
+      bf16* d_w2 = up_bf16(w2_c);
+      float* d_w2b = with_bias ? up(w2b_c) : nullptr;
+      draft_score_bf16(d_mk, Rk_c, d_w2, d_w2b, Rk_c, 1, d_row, kDraftPickFloats, true, cap_c, 0);
+      auto got_row = down_raw(d_row, kDraftPickFloats);
+      Vec got_v(C), want_v(C);
+      for (int c = 0; c < C; ++c) {
+        const int vid = c_ids[c];
+        double dot = 0.0;
+        for (int q = 0; q < Rk_c; ++q) dot += w2_q[size_t(vid) * Rk_c + q] * double(float(mk_c[q]));
+        const double z = double(float(c_base[c])) + dot + (with_bias ? double(float(w2b_c[vid])) : 0.0);
+        got_v[c] = got_row[kDraftCandCap + c];
+        want_v[c] = softcap_ref(z, cap_c);
+      }
+      expect(tag, got_v, want_v, 3e-5);
+      CK(cudaFree(d_row));
+      CK(cudaFree(d_mk));
+      CK(cudaFree(d_w2));
+      if (d_w2b) CK(cudaFree(d_w2b));
+    };
+    test_score(256, true, 30.f, "draft_score_bf16 (K=256 accum + bias + cap)");
+    test_score(36, false, 0.f, "draft_score_bf16 (K=36 scalar accum)");
+
+    {  // draft_combine_cands + draft_pick_topk (argmax, tie-break, prob, margin).
+      constexpr int Vc = 512, C = 97;
+      std::vector<int> c_ids(C);
+      for (int c = 0; c < C; ++c) c_ids[c] = (c * 3 + 7) % Vc;
+      Vec c_base = randv(C, 1.5), c_add = randv(C, 1.0), w2b_c = randv(Vc, 0.25);
+      std::vector<float> h_row(kDraftPickFloats, 0.f);
+      int* h_ci = reinterpret_cast<int*>(h_row.data());
+      for (int c = 0; c < C; ++c) {
+        h_ci[c] = c_ids[c];
+        h_row[kDraftCandCap + c] = float(c_base[c]);
+      }
+      h_ci[2 * kDraftCandCap] = C;
+      float* d_row = up_raw(h_row);
+      float* d_add = up(c_add);
+      float* d_w2b = up(w2b_c);
+      draft_combine_cands(d_add, 0, d_w2b, 25.f, 1, d_row, kDraftPickFloats, 0);
+      auto got_row = down_raw(d_row, kDraftPickFloats);
+      Vec got_v(C), want_v(C);
+      for (int c = 0; c < C; ++c) {
+        const int vid = c_ids[c];
+        got_v[c] = got_row[kDraftCandCap + c];
+        want_v[c] = softcap_ref(double(float(c_base[c])) + double(float(c_add[c])) + double(float(w2b_c[vid])), 25.0);
+      }
+      expect("draft_combine_cands (bias + softcap)", got_v, want_v, 2e-6);
+
+      int best_c = -1, best_id = INT_MAX;
+      double m1 = -1e30, m2 = -1e30;
+      for (int c = 0; c < C; ++c) {
+        if (got_v[c] > m1 || (got_v[c] == m1 && c_ids[c] < best_id)) m1 = got_v[c], best_id = c_ids[c], best_c = c;
+      }
+      double zsum = 0.0;
+      for (int c = 0; c < C; ++c) {
+        zsum += std::exp(got_v[c] - m1);
+        if (c != best_c && got_v[c] > m2) m2 = got_v[c];
+      }
+      int* d_idx = dev<int>(1);
+      float* d_p = dev<float>(1);
+      float* d_m = dev<float>(1);
+      draft_pick_topk(d_row, kDraftPickFloats, 1, 1, d_idx, nullptr, 0, d_p, d_m);
+      int got_id = -1;
+      CK(cudaDeviceSynchronize());
+      CK(cudaMemcpy(&got_id, d_idx, 4, cudaMemcpyDeviceToHost));
+      const Vec gp1 = down(d_p, 1), gm1 = down(d_m, 1);
+
+      // Tie-break: lower vocab id wins and margin == 0.
+      std::vector<float> t_row = got_row;
+      int* t_ci = reinterpret_cast<int*>(t_row.data());
+      t_ci[5] = 400;
+      t_ci[12] = 120;
+      t_row[kDraftCandCap + 5] = 50.f;
+      t_row[kDraftCandCap + 12] = 50.f;
+      CK(cudaMemcpy(d_row, t_row.data(), t_row.size() * sizeof(float), cudaMemcpyHostToDevice));
+      draft_pick_topk(d_row, kDraftPickFloats, 1, 1, d_idx, nullptr, 0, d_p, d_m);
+      int tb_id = -1;
+      CK(cudaDeviceSynchronize());
+      CK(cudaMemcpy(&tb_id, d_idx, 4, cudaMemcpyDeviceToHost));
+      const Vec tb_m = down(d_m, 1);
+      const bool ok_pk = got_id == best_id && std::abs(gp1[0] - 1.0 / zsum) < 1e-5 &&
+                         std::abs(gm1[0] - (m1 - m2)) < 1e-5 && tb_id == 120 && tb_m[0] == 0.0;
+      std::printf("  %-4s %-48s\n", ok_pk ? "ok" : "FAIL", "draft_pick_topk (argmax/prob/margin/tie)");
+      g_fail += !ok_pk;
+      CK(cudaFree(d_row));
+      CK(cudaFree(d_add));
+      CK(cudaFree(d_w2b));
+      CK(cudaFree(d_idx));
+      CK(cudaFree(d_p));
+      CK(cudaFree(d_m));
+    }
+
+    auto test_sign_add = [&](int K_s, bool with_bias, const char* tag) {
+      constexpr int Ns = 777;
+      Vec W_s = randv(size_t(Ns) * K_s, 0.4), x_s = randv(K_s, 0.9);
+      Vec init_y = randv(Ns, 2.0), b_s = randv(Ns, 0.5);
+      bf16* d_W = up_bf16(W_s);
+      float* d_x = up(x_s);
+      float* d_y = up(init_y);
+      float* d_b = with_bias ? up(b_s) : nullptr;
+      const size_t tiled = size_t(Ns + 255) / 256 * 256;
+      SignHead sh{dev<uint32_t>(tiled * size_t(K_s) / 32), dev<bf16>(tiled * size_t(K_s) / 64)};
+      make_sign_head(d_W, Ns, K_s, &sh, 0);
+      gemm_sign_rough_add(d_x, K_s, sh, d_b, Ns, K_s, d_y, Ns, TL);
+      Vec got = down(d_y, Ns);
+      float* d_ref = dev<float>(Ns);
+      gemm_sign_rough(d_x, K_s, sh, Ns, K_s, d_ref, Ns, 1, TL);
+      Vec ref_rough = down(d_ref, Ns), want(Ns);
+      for (int n = 0; n < Ns; ++n)
+        want[n] = double(float(init_y[n])) + ref_rough[n] + (with_bias ? double(float(b_s[n])) : 0.0);
+      expect(tag, got, want, 2e-6);
+      CK(cudaFree(d_W));
+      CK(cudaFree(d_x));
+      CK(cudaFree(d_y));
+      if (d_b) CK(cudaFree(d_b));
+      CK(cudaFree(d_ref));
+      CK(cudaFree(sh.bits));
+      CK(cudaFree(sh.scales));
+    };
+    test_sign_add(256, true, "gemm_sign_rough_add (K=256 + bias)");
+    test_sign_add(512, false, "gemm_sign_rough_add (K=512 no bias)");
+  }
 }
 
 }  // namespace flyx::optest

@@ -111,6 +111,9 @@ class Model : public interfaces::Model {
   std::vector<int> draft_widths(int d) const override;
   std::vector<int> adaptive_checkpoints(int d) const override;
   int block_drafts(int d) const override;
+  // True for target architectures whose verify cost climbs steeply with concurrent verify rows (e.g. sparse MoE
+  // active-expert fan-out), so parallel block drafters benefit from finer width ladders and per-round stopping.
+  virtual bool verify_scales_with_width() const { return false; }
   int trained_ctx() const override { return trained_ctx_; }
   bool drafts_trees(int d) const override { return drafters_.at(size_t(d)).kind == Drafter::kDv; }
   bool file_drafts_trees() const override { return file_drafts_trees_; }
