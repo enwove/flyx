@@ -918,6 +918,160 @@ void test_strata_layout(int hd, int nh, int nkv, int rows, int ctx, int bits, bo
       Kr = down_f16(static_cast<kv16*>(dK), nv);
       Vr = down_f16(static_cast<kv16*>(dV), nv);
     }
+    if (rows > 1 && ctx >= 64) {
+      // Pageable host K/V gather (cold miss with forced hot collisions, warm hit, CUDA graph host node, and hot=null):
+      // cold positions [sink, ring_lo) live ONLY in pageable RAM (absent from the GPU tail ring).
+      const int elem = fp8 ? 1 : int(sizeof(kv16));
+      const size_t row_bytes = size_t(nkv) * hd * elem;
+      std::vector<uint8_t> k_page(size_t(cap) * row_bytes), v_page(size_t(cap) * row_bytes);
+      CK(cudaMemcpy(k_page.data(), dK, k_page.size(), cudaMemcpyDeviceToHost));
+      CK(cudaMemcpy(v_page.data(), dV, v_page.size(), cudaMemcpyDeviceToHost));
+      std::vector<float> ks_page, vs_page;
+      if (fp8) {
+        ks_page.resize(size_t(cap) * nkv);
+        vs_page.resize(size_t(cap) * nkv);
+        CK(cudaMemcpy(ks_page.data(), dKs, ks_page.size() * sizeof(float), cudaMemcpyDeviceToHost));
+        CK(cudaMemcpy(vs_page.data(), dVs, vs_page.size() * sizeof(float), cudaMemcpyDeviceToHost));
+      }
+      const int sink = 8, ring_safe = 16, ring_tail = 32, ring_slots = sink + ring_tail;
+      std::vector<uint8_t> k_ring_h(size_t(ring_slots) * row_bytes, 0x5au), v_ring_h(size_t(ring_slots) * row_bytes, 0x5au);
+      std::vector<float> ks_ring_h(fp8 ? size_t(ring_slots) * nkv : 0, -999.f);
+      std::vector<float> vs_ring_h(fp8 ? size_t(ring_slots) * nkv : 0, -999.f);
+      auto put_ring = [&](int pos) {
+        const int sl = pos < sink ? pos : sink + (pos - sink) % ring_tail;
+        std::memcpy(k_ring_h.data() + size_t(sl) * row_bytes, k_page.data() + size_t(pos) * row_bytes, row_bytes);
+        std::memcpy(v_ring_h.data() + size_t(sl) * row_bytes, v_page.data() + size_t(pos) * row_bytes, row_bytes);
+        if (fp8) {
+          std::memcpy(ks_ring_h.data() + size_t(sl) * nkv, ks_page.data() + size_t(pos) * nkv, nkv * sizeof(float));
+          std::memcpy(vs_ring_h.data() + size_t(sl) * nkv, vs_page.data() + size_t(pos) * nkv, nkv * sizeof(float));
+        }
+      };
+      for (int p = 0; p < sink; ++p) put_ring(p);
+      for (int p = std::max(sink, total - ring_tail); p < total; ++p) put_ring(p);
+      uint8_t* dK_ring = dev<uint8_t>(k_ring_h.size());
+      uint8_t* dV_ring = dev<uint8_t>(v_ring_h.size());
+      CK(cudaMemcpy(dK_ring, k_ring_h.data(), k_ring_h.size(), cudaMemcpyHostToDevice));
+      CK(cudaMemcpy(dV_ring, v_ring_h.data(), v_ring_h.size(), cudaMemcpyHostToDevice));
+      float *dKs_ring = nullptr, *dVs_ring = nullptr;
+      if (fp8) {
+        dKs_ring = dev<float>(ks_ring_h.size());
+        dVs_ring = dev<float>(vs_ring_h.size());
+        CK(cudaMemcpy(dKs_ring, ks_ring_h.data(), ks_ring_h.size() * sizeof(float), cudaMemcpyHostToDevice));
+        CK(cudaMemcpy(dVs_ring, vs_ring_h.data(), vs_ring_h.size() * sizeof(float), cudaMemcpyHostToDevice));
+      }
+      const size_t max_misses = size_t(rows) * size_t(nkv) * size_t(every.sel_stride);
+      int32_t* miss_map = dev<int32_t>(max_misses);
+      auto align256 = [](size_t n) { return (n + 255) / 256 * 256; };
+      const size_t req_off = 0;
+      const size_t cnt_off = align256(max_misses * sizeof(PageGatherReq));
+      const size_t bkv_off = cnt_off + 256;
+      const size_t bsc_off = bkv_off + align256(max_misses * 4 * size_t(hd) * size_t(elem));
+      const size_t pinned_bytes = bsc_off + align256(max_misses * 4 * sizeof(float));
+      void *ph = nullptr, *pd = nullptr;
+      CK(cudaHostAlloc(&ph, pinned_bytes, cudaHostAllocMapped));
+      CK(cudaHostGetDevicePointer(&pd, ph, 0));
+      auto *hb = static_cast<uint8_t*>(ph), *db = static_cast<uint8_t*>(pd);
+      PageGatherCtx pctx{};
+      pctx.k_page = k_page.data();
+      pctx.v_page = v_page.data();
+      pctx.ks_page = fp8 ? ks_page.data() : nullptr;
+      pctx.vs_page = fp8 ? vs_page.data() : nullptr;
+      pctx.req_host = reinterpret_cast<PageGatherReq*>(hb + req_off);
+      pctx.req_dev = reinterpret_cast<PageGatherReq*>(db + req_off);
+      pctx.miss_count_host = reinterpret_cast<int32_t*>(hb + cnt_off);
+      pctx.miss_count_dev = reinterpret_cast<int32_t*>(db + cnt_off);
+      pctx.miss_map = miss_map;
+      pctx.bounce_kv_host = hb + bkv_off;
+      pctx.bounce_kv_dev = db + bkv_off;
+      pctx.bounce_scale_host = reinterpret_cast<float*>(hb + bsc_off);
+      pctx.bounce_scale_dev = reinterpret_cast<float*>(db + bsc_off);
+      pctx.nkv = nkv;
+      pctx.hd = hd;
+      pctx.elem = elem;
+      pctx.max_misses = int(max_misses);
+      pctx.cap = cap;
+
+      std::vector<uint32_t> ref_bits(exact.size()), got_bits(exact.size());
+      CK(cudaMemcpy(ref_bits.data(), dout, ref_bits.size() * sizeof(float), cudaMemcpyDeviceToHost));
+
+      KvRef pkv = kv;
+      pkv.k = dK_ring;
+      pkv.v = dV_ring;
+      pkv.ks = dKs_ring;
+      pkv.vs = dVs_ring;
+      pkv.ks_far = pkv.vs_far = nullptr;
+      pkv.scale_split = INT32_MAX;
+      pkv.ring = ring_slots;
+      pkv.sink = sink;
+      pkv.host_from = sink;
+      pkv.ring_safe = ring_safe;
+      pkv.page_ctx = &pctx;
+      pkv.hot_bits = 2;  // 4 hot slots per KV head -> forced collisions + duplicate claims across rows
+      const int cols = 1 << pkv.hot_bits, slots_total = nkv * cols;
+      pkv.hot_tag = dev<int32_t>(slots_total);
+      pkv.hot_claim = dev<int32_t>(slots_total);
+      pkv.hot = dev<uint8_t>(size_t(slots_total) * 4 * size_t(hd) * size_t(elem));
+      pkv.hot_scale = fp8 ? dev<float>(slots_total * 4) : nullptr;
+      CK(cudaMemset(pkv.hot_tag, 0xff, slots_total * sizeof(int32_t)));
+      CK(cudaMemset(pkv.hot_claim, 0x7f, slots_total * sizeof(int32_t)));
+
+      cudaStream_t pst = nullptr;
+      CK(cudaStreamCreateWithFlags(&pst, cudaStreamNonBlocking));
+      Launch PL = TL;
+      PL.st = pst;
+
+      // 1) Cold cache miss + collisions -> bit-identical to pinned; verify hot_tag winners & cleared claims.
+      attention_strata(dqr, pkv, every, nh, nkv, hd, rows, float(scale), P, nullptr, 0, dout, nh * hd, part, slots, PL);
+      CK(cudaStreamSynchronize(pst));
+      CK(cudaMemcpy(got_bits.data(), dout, got_bits.size() * sizeof(float), cudaMemcpyDeviceToHost));
+      bool ok_page = (ref_bits == got_bits);
+      std::vector<int32_t> tags(slots_total), claims(slots_total), winners(cols, INT_MAX);
+      CK(cudaMemcpy(tags.data(), pkv.hot_tag, tags.size() * sizeof(int32_t), cudaMemcpyDeviceToHost));
+      CK(cudaMemcpy(claims.data(), pkv.hot_claim, claims.size() * sizeof(int32_t), cudaMemcpyDeviceToHost));
+      const int ring_lo = std::max(sink, (ctx > ring_safe ? (ctx - ring_safe) : 0) & ~1);
+      for (int q = sink / 2; 2 * q + 1 < ring_lo; ++q) {
+        const int sl = pkv.hot_slot(q);
+        winners[sl] = std::min(winners[sl], q);
+      }
+      for (int sl = 0; sl < slots_total; ++sl) {
+        const int q = winners[sl % cols];
+        ok_page &= (tags[sl] == (q == INT_MAX ? -1 : q)) && (claims[sl] == kHotFree);
+      }
+      // 2) Warm cache hit + CUDA graph capture/launch (with cudaLaunchHostFunc node).
+      cudaGraph_t g = nullptr;
+      cudaGraphExec_t ge = nullptr;
+      CK(cudaStreamBeginCapture(pst, cudaStreamCaptureModeThreadLocal));
+      attention_strata(dqr, pkv, every, nh, nkv, hd, rows, float(scale), P, nullptr, 0, dout, nh * hd, part, slots, PL);
+      CK(cudaStreamEndCapture(pst, &g));
+      CK(cudaGraphInstantiate(&ge, g, 0));
+      CK(cudaGraphDestroy(g));
+      CK(cudaMemsetAsync(dout, 0, got_bits.size() * sizeof(float), pst));
+      CK(cudaGraphLaunch(ge, pst));
+      CK(cudaStreamSynchronize(pst));
+      CK(cudaMemcpy(got_bits.data(), dout, got_bits.size() * sizeof(float), cudaMemcpyDeviceToHost));
+      ok_page &= (ref_bits == got_bits);
+      CK(cudaGraphExecDestroy(ge));
+      // 3) No hot cache (hot == nullptr): every cold pair read via miss_map + bounce.
+      KvRef pkv_nohot = pkv;
+      pkv_nohot.hot = nullptr;
+      pkv_nohot.hot_tag = pkv_nohot.hot_claim = nullptr;
+      pkv_nohot.hot_scale = nullptr;
+      CK(cudaMemsetAsync(dout, 0, got_bits.size() * sizeof(float), pst));
+      attention_strata(dqr, pkv_nohot, every, nh, nkv, hd, rows, float(scale), P, nullptr, 0, dout, nh * hd, part, slots,
+                       PL);
+      CK(cudaStreamSynchronize(pst));
+      CK(cudaMemcpy(got_bits.data(), dout, got_bits.size() * sizeof(float), cudaMemcpyDeviceToHost));
+      ok_page &= (ref_bits == got_bits);
+      verdict(ok_page, "strata pageable host gather (cold, graph+warm, no-hot) " + tag, ok_page ? 0.0 : 2.0);
+      // Restore dout for the float64 reference comparison below.
+      CK(cudaMemcpy(dout, ref_bits.data(), ref_bits.size() * sizeof(float), cudaMemcpyHostToDevice));
+
+      CK(cudaStreamDestroy(pst));
+      CK(cudaFreeHost(ph));
+      for (void* p : std::initializer_list<void*>{dK_ring, dV_ring, dKs_ring, dVs_ring, miss_map, pkv.hot_tag,
+                                                  pkv.hot_claim, pkv.hot, pkv.hot_scale})
+        if (p) CK(cudaFree(p));
+    }
     for (int r = 0; r < rows; ++r)
       for (int h = 0; h < nh; ++h)
         ops::attend(&qall[(size_t(ctx + r) * nh + h) * hd], Kr.data(), Vr.data(), ctx + r + 1, nkv, hd, h / G, scale,
@@ -929,6 +1083,137 @@ void test_strata_layout(int hd, int nh, int nkv, int rows, int ctx, int bits, bo
 void test_strata(int hd, int nh, int nkv, int rows, int ctx, int bits, bool fp8) {
   test_strata_layout(hd, nh, nkv, rows, ctx, bits, fp8, false);
   if (hd == 256 && bits == 3) test_strata_layout(hd, nh, nkv, rows, ctx, bits, fp8, true);
+}
+
+void test_pageable_kv_ops() {
+  seed("pageable_kv_ops", 0);
+  for (bool fp8 : {false, true}) {
+    const int nkv = 4, hd = 128, elem = fp8 ? 1 : int(sizeof(kv16));
+    const size_t row_bytes = size_t(nkv) * hd * elem;
+    const int sink = 8, tail = 32, ring = sink + tail, cap = 96;
+    const int pos0 = 68, span = 12;  // wraps around tail boundary (68-8)%32 = 28 -> 28..31, 0..7
+    std::vector<uint8_t> k_ring(size_t(ring) * row_bytes), v_ring(size_t(ring) * row_bytes);
+    for (size_t i = 0; i < k_ring.size(); ++i) {
+      k_ring[i] = uint8_t((i * 131 + 17 + (fp8 ? 3 : 0)) & 0xffu);
+      v_ring[i] = uint8_t((i * 73 + 53 + (fp8 ? 9 : 0)) & 0xffu);
+    }
+    std::vector<float> ks_ring(size_t(ring) * nkv), vs_ring(size_t(ring) * nkv);
+    for (size_t i = 0; i < ks_ring.size(); ++i) {
+      ks_ring[i] = 0.05f * float(i + 1);
+      vs_ring[i] = 0.07f * float(i + 1);
+    }
+    uint8_t* dk = dev<uint8_t>(k_ring.size());
+    uint8_t* dv = dev<uint8_t>(v_ring.size());
+    uint8_t* dvk = dev<uint8_t>(size_t(cap) * row_bytes);
+    uint8_t* dvv = dev<uint8_t>(size_t(cap) * row_bytes);
+    CK(cudaMemcpy(dk, k_ring.data(), k_ring.size(), cudaMemcpyHostToDevice));
+    CK(cudaMemcpy(dv, v_ring.data(), v_ring.size(), cudaMemcpyHostToDevice));
+    CK(cudaMemset(dvk, 0, size_t(cap) * row_bytes));
+    CK(cudaMemset(dvv, 0, size_t(cap) * row_bytes));
+    float *dks = nullptr, *dvs = nullptr, *dvks = nullptr, *dvvs = nullptr;
+    KvStageScales sc{};
+    if (fp8) {
+      dks = dev<float>(ks_ring.size());
+      dvs = dev<float>(vs_ring.size());
+      dvks = dev<float>(size_t(cap) * nkv);
+      dvvs = dev<float>(size_t(cap) * nkv);
+      CK(cudaMemcpy(dks, ks_ring.data(), ks_ring.size() * sizeof(float), cudaMemcpyHostToDevice));
+      CK(cudaMemcpy(dvs, vs_ring.data(), vs_ring.size() * sizeof(float), cudaMemcpyHostToDevice));
+      CK(cudaMemset(dvks, 0, size_t(cap) * nkv * sizeof(float)));
+      CK(cudaMemset(dvvs, 0, size_t(cap) * nkv * sizeof(float)));
+      sc = {dks, dvs, dvks, dvvs, nkv};
+    }
+    DevParams* P = params(pos0);
+    kv_stage_ring(dk, dvk, dv, dvv, row_bytes, sink, ring, pos0 - 6, cap, P, 0, span, kStageAll, 4, nullptr, sc);
+    CK(cudaDeviceSynchronize());
+    std::vector<uint8_t> gk(size_t(cap) * row_bytes), gv(size_t(cap) * row_bytes);
+    CK(cudaMemcpy(gk.data(), dvk, gk.size(), cudaMemcpyDeviceToHost));
+    CK(cudaMemcpy(gv.data(), dvv, gv.size(), cudaMemcpyDeviceToHost));
+    std::vector<float> gks(fp8 ? size_t(cap) * nkv : 0), gvs(fp8 ? size_t(cap) * nkv : 0);
+    if (fp8) {
+      CK(cudaMemcpy(gks.data(), dvks, gks.size() * sizeof(float), cudaMemcpyDeviceToHost));
+      CK(cudaMemcpy(gvs.data(), dvvs, gvs.size() * sizeof(float), cudaMemcpyDeviceToHost));
+    }
+    bool ok_stage = true;
+    for (int p = pos0 - 6; p < pos0 + span; ++p) {
+      const int sl = p < sink ? p : sink + (p - sink) % tail;
+      ok_stage &= std::equal(gk.data() + size_t(p) * row_bytes, gk.data() + size_t(p + 1) * row_bytes,
+                             k_ring.data() + size_t(sl) * row_bytes);
+      ok_stage &= std::equal(gv.data() + size_t(p) * row_bytes, gv.data() + size_t(p + 1) * row_bytes,
+                             v_ring.data() + size_t(sl) * row_bytes);
+      if (fp8) {
+        ok_stage &= std::equal(gks.data() + size_t(p) * nkv, gks.data() + size_t(p + 1) * nkv,
+                               ks_ring.data() + size_t(sl) * nkv);
+        ok_stage &= std::equal(gvs.data() + size_t(p) * nkv, gvs.data() + size_t(p + 1) * nkv,
+                               vs_ring.data() + size_t(sl) * nkv);
+      }
+    }
+    std::printf("  %-4s kv_stage_ring wrap-around copy %s\n", ok_stage ? "ok" : "FAIL", fp8 ? "fp8" : "binary16");
+    g_fail += !ok_stage;
+
+    // kv_drain_pageable: drain committed round rows (pos0 .. pos0+span-1) to mapped pinned drain ring slot.
+    const int max_rows = 16;
+    const unsigned long long seq_no = 11;
+    const int rslot = int(seq_no % kRing);
+    DevParams hp{};
+    hp.position = pos0 + span;
+    hp.seq_no = seq_no;
+    CK(cudaMemcpy(P, &hp, sizeof(hp), cudaMemcpyHostToDevice));
+    flyx_round_result hring[kRing]{};
+    hring[rslot].position = pos0 + span;
+    hring[rslot].n_tokens = span;
+    hring[rslot].seq_no = seq_no;
+    flyx_round_result* dring = dev<flyx_round_result>(kRing);
+    CK(cudaMemcpy(dring, hring, sizeof(hring), cudaMemcpyHostToDevice));
+    const size_t kv_sz = size_t(kRing) * max_rows * row_bytes;
+    const size_t sc_sz = fp8 ? size_t(kRing) * max_rows * nkv * sizeof(float) : 0;
+    void *dh = nullptr, *dd = nullptr;
+    CK(cudaHostAlloc(&dh, 2 * kv_sz + 2 * sc_sz, cudaHostAllocMapped));
+    CK(cudaHostGetDevicePointer(&dd, dh, 0));
+    std::memset(dh, 0, 2 * kv_sz + 2 * sc_sz);
+    auto *hb = static_cast<uint8_t*>(dh), *db = static_cast<uint8_t*>(dd);
+    PageDrainLayer dl{};
+    dl.k = dk;
+    dl.v = dv;
+    dl.ks = dks;
+    dl.vs = dvs;
+    dl.drain_k = db;
+    dl.drain_v = db + kv_sz;
+    dl.drain_ks = fp8 ? reinterpret_cast<float*>(db + 2 * kv_sz) : nullptr;
+    dl.drain_vs = fp8 ? reinterpret_cast<float*>(db + 2 * kv_sz + sc_sz) : nullptr;
+    dl.row_bytes = row_bytes;
+    dl.device_positions = sink;
+    dl.ring = ring;
+    dl.nkv = nkv;
+    PageDrainLayer* ddl = dev<PageDrainLayer>(1);
+    CK(cudaMemcpy(ddl, &dl, sizeof(dl), cudaMemcpyHostToDevice));
+    kv_drain_pageable(ddl, 1, P, dring, max_rows, nullptr);
+    CK(cudaDeviceSynchronize());
+    bool ok_drain = true;
+    const uint8_t* hk = hb;
+    const uint8_t* hv = hb + kv_sz;
+    const float* hks = fp8 ? reinterpret_cast<const float*>(hb + 2 * kv_sz) : nullptr;
+    const float* hvs = fp8 ? reinterpret_cast<const float*>(hb + 2 * kv_sz + sc_sz) : nullptr;
+    for (int r = 0; r < span; ++r) {
+      const int p = pos0 + r;
+      const int sl = sink + (p - sink) % tail;
+      const size_t dst_row = size_t(rslot) * max_rows + size_t(r);
+      ok_drain &= std::equal(hk + dst_row * row_bytes, hk + (dst_row + 1) * row_bytes,
+                             k_ring.data() + size_t(sl) * row_bytes);
+      ok_drain &= std::equal(hv + dst_row * row_bytes, hv + (dst_row + 1) * row_bytes,
+                             v_ring.data() + size_t(sl) * row_bytes);
+      if (fp8) {
+        ok_drain &= std::equal(hks + dst_row * nkv, hks + (dst_row + 1) * nkv, ks_ring.data() + size_t(sl) * nkv);
+        ok_drain &= std::equal(hvs + dst_row * nkv, hvs + (dst_row + 1) * nkv, vs_ring.data() + size_t(sl) * nkv);
+      }
+    }
+    std::printf("  %-4s kv_drain_pageable round drain %s\n", ok_drain ? "ok" : "FAIL", fp8 ? "fp8" : "binary16");
+    g_fail += !ok_drain;
+
+    CK(cudaFreeHost(dh));
+    for (void* p : std::initializer_list<void*>{dk, dv, dvk, dvv, dks, dvs, dvks, dvvs, P, dring, ddl})
+      if (p) CK(cudaFree(p));
+  }
 }
 
 // A tree round of more than 16 rows (up to FLYX_MAX_WIDE_ROWS; docs/design/tree-verification.md): row r, its K/V in

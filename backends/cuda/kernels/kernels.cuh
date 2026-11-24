@@ -598,6 +598,53 @@ void build_rows(const DevParams* P, const int* drafts, int fill, int* tokens, in
 
 // A layer's K/V cache, [cap][nkv][hd]: binary16 (kv16), or e4m3 with one float scale per
 // (position, kv head) in ks / vs (amax / 448 of that head's row).  FP8 when ks is set.
+// Per-pair gather request written by k_strata_page_list and serviced by the host callback from pageable RAM into a
+// compact mapped pinned bounce buffer (zero WDDM non-local footprint for cold K/V).
+struct PageGatherReq {
+  int32_t kvh;
+  int32_t q;         // pair index (positions 2*q, 2*q + 1)
+  int32_t hot_slot;  // >= 0: install into kv.hot[kvh, hot_slot]; < 0: hash-collision bounce-only slot
+  int32_t pad;
+};
+
+struct PageGatherCtx {
+  // Cold host K/V in ordinary pageable memory (VirtualAlloc / mmap; not page-locked).
+  const uint8_t* k_page = nullptr;
+  const uint8_t* v_page = nullptr;
+  const float* ks_page = nullptr;
+  const float* vs_page = nullptr;
+  // Shared per-session mapped pinned staging (host and device views of the same allocation).
+  PageGatherReq* req_host = nullptr;
+  PageGatherReq* req_dev = nullptr;
+  int32_t* miss_count_host = nullptr;
+  int32_t* miss_count_dev = nullptr;
+  int32_t* miss_map = nullptr;       // device buffer [FLYX_MAX_ROWS][nkv][sel_stride]: bounce index or -1
+  uint8_t* bounce_kv_host = nullptr;
+  uint8_t* bounce_kv_dev = nullptr;
+  float* bounce_scale_host = nullptr;
+  float* bounce_scale_dev = nullptr;
+  int nkv = 0, hd = 0, elem = 1;     // elem: 1 (FP8 e4m3) or 2 (binary16)
+  int max_misses = 0;
+  int cap = 0;
+};
+
+// Descriptor for draining a pageable layer's newly committed rows from its GPU tail ring into a per-round-slot mapped
+// pinned drain buffer at the end of a round (read_result copies them into pageable RAM on the host).
+struct PageDrainLayer {
+  const uint8_t *k = nullptr, *v = nullptr;
+  const float *ks = nullptr, *vs = nullptr;
+  uint8_t *drain_k = nullptr, *drain_v = nullptr;  // device pointer to [kRing][max_rows][row_bytes]
+  float *drain_ks = nullptr, *drain_vs = nullptr;  // device pointer to [kRing][max_rows][nkv] (FP8 only)
+  uint8_t *drain_k_host = nullptr, *drain_v_host = nullptr;
+  float *drain_ks_host = nullptr, *drain_vs_host = nullptr;
+  size_t row_bytes = 0;
+  int nkv = 0, device_positions = 0, ring = 0;
+  __host__ __device__ int slot_of(int pos) const {
+    return ring <= 0 || pos < device_positions ? pos
+                                               : device_positions + (pos - device_positions) % (ring - device_positions);
+  }
+};
+
 struct KvRef {
   void* k = nullptr;
   void* v = nullptr;
@@ -634,6 +681,11 @@ struct KvRef {
   float* vs_far = nullptr;
   int scale_split = INT32_MAX;
   float* hot_scale = nullptr;
+  // Pageable host K/V layer (null for GPU / pinned host layers): cold positions [host_from, ring_lo) live in pageable
+  // RAM and are gathered via a CUDA graph host node; positions >= ring_lo = max(host_from, (P_hot->pos - ring_safe) & ~1)
+  // are live in the GPU tail ring (slot_of).
+  PageGatherCtx* page_ctx = nullptr;
+  int ring_safe = 0;
   __host__ __device__ bool fp8() const { return ks != nullptr; }
   __host__ __device__ float* kscales(int pos) const { return pos < scale_split ? ks : ks_far; }
   __host__ __device__ float* vscales(int pos) const { return pos < scale_split ? vs : vs_far; }
@@ -1258,6 +1310,15 @@ struct KvStageScales {
 void kv_stage(const void* k, void* vk, const void* v, void* vv, size_t row, int from, int cap, const DevParams* P,
               int pos_add, int span, KvStagePart part, int blocks, cudaStream_t st, int per_row = 1,
               const KvStageScales& scales = KvStageScales{});
+// Copy positions written by the current pass from a pageable layer's GPU tail ring (slot_of) into a linear staging
+// window (vk/vv, scales).
+void kv_stage_ring(const void* k, void* vk, const void* v, void* vv, size_t row, int sink, int ring, int from, int cap,
+                   const DevParams* P, int pos_add, int span, KvStagePart part, int blocks, cudaStream_t st,
+                   const KvStageScales& scales = KvStageScales{});
+// At round end (before copy_ring): copy each pageable layer's newly committed rows [pos - n_tokens, pos) from its GPU
+// tail ring into its mapped pinned drain slot (P->seq_no % kRing).
+void kv_drain_pageable(const PageDrainLayer* layers, int n_layers, const DevParams* P, const flyx_round_result* ring_dev,
+                       int max_rows, cudaStream_t st);
 
 // After a prefill chunk: advance the position; optionally set the anchor from
 // choice[0] and emit it (counted in `reply` when G has a penalty).

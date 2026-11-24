@@ -382,6 +382,25 @@ const std::vector<OptionSpec>& option_specs() {
       kernel_whole_opt("mtp_copy", &KernelOptions::mtp_copy),
       kernel_whole_opt("mtp_sink", &KernelOptions::mtp_sink),
       kernel_flag_opt("mtp_ring", &KernelOptions::mtp_ring),
+      {"pageable_kv",
+       [](const std::string& key, const std::string& val, BackendOptions* o, std::string* err) {
+         if (!check_choice(key, val, {"auto", "on", "off"}, err)) return false;
+         o->pageable_kv = val == "on" ? PageableKvMode::on : val == "off" ? PageableKvMode::off : PageableKvMode::automatic;
+         return true;
+       },
+       [](const BackendOptions& o, const BackendOptions& def) -> std::string {
+         if (o.pageable_kv == def.pageable_kv) return "";
+         return o.pageable_kv == PageableKvMode::on ? "pageable_kv=on"
+                : o.pageable_kv == PageableKvMode::off ? "pageable_kv=off"
+                                                       : "pageable_kv=auto";
+       }},
+      {"pinned_host_mb",
+       [](const std::string& key, const std::string& val, BackendOptions* o, std::string* err) {
+         return parse_whole_val(key, val, &o->pinned_host_mb, err);
+       },
+       [](const BackendOptions& o, const BackendOptions&) -> std::string {
+         return o.pinned_host_mb >= 0 ? "pinned_host_mb=" + std::to_string(o.pinned_host_mb) : "";
+       }},
   };
   return specs;
 }

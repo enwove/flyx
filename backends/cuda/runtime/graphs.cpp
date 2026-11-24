@@ -180,7 +180,7 @@ size_t graph_keep(const flyx_seq& s, bool count) {
   auto* m = const_cast<flyx_bmodel*>(s.m);
   if (!m->opt.graphs) return 0;
   // What a round takes past its plan's count: other heads, the K/V in tiers, rounds that read low-bit copies.
-  size_t kernels = kGraphHeadNodes, copies = 0;
+  size_t kernels = kGraphHeadNodes, copies = 0, others = 0;
   bool window = false;
   for (const KvBuf& b : s.kv) {
     kernels += b.vk ? kTierNodes : 0;
@@ -190,6 +190,10 @@ size_t graph_keep(const flyx_seq& s, bool count) {
     kernels += kStrataNodes * size_t(std::max(0, s.copies));
     copies += kStrataCopyNodes * size_t(std::clamp(s.copy_host, 0, std::max(0, s.copies)));
   }
+  if (!s.page_layers.empty()) {
+    kernels += 1 + s.page_layers.size();  // kv_drain_pageable + extra claim/list/install kernel per pageable layer
+    others += s.page_layers.size();       // cudaLaunchHostFunc node per pageable layer
+  }
   std::lock_guard<std::mutex> lock(m->graph_mu);
   if (count) count_round_graphs(m);
   size_t room = 0, most = 0;
@@ -198,7 +202,7 @@ size_t graph_keep(const flyx_seq& s, bool count) {
     const size_t steps = window ? size_t(g.mtp_steps) : 0;
     const size_t branches = plan->adaptive() ? std::max<size_t>(1, plan->checkpoints.size()) : 1;
     const size_t round = g.bytes + (branches * kernels + kMtpWindowNodes * steps) * kGraphKernelBytes +
-                         branches * copies * kGraphCopyBytes;
+                         branches * copies * kGraphCopyBytes + branches * others * kGraphOtherBytes;
     room += round;
     most = std::max(most, round);
   }

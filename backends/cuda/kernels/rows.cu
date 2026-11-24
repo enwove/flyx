@@ -308,4 +308,84 @@ void kv_stage(const void* k, void* vk, const void* v, void* vv, size_t row, int 
                                      pos_add, span, part, per_row, scales);
 }
 
+namespace {
+
+__global__ void k_kv_stage_ring(const uint4* k, uint4* vk, const uint4* v, uint4* vv, size_t row16, int sink, int ring,
+                                int from, int cap, const DevParams* P, int pos_add, int span, KvStagePart part,
+                                KvStageScales sc) {
+  const int at = P->position + pos_add;
+  const int first = part == kStagePass ? max(from, at) : from;
+  const int end = min(cap, part == kStageBefore ? at : at + span);
+  if (end <= first) return;
+  const int tail = ring - sink;
+  auto slot_of = [&](int pos) { return ring <= 0 || pos < sink ? pos : sink + (pos - sink) % tail; };
+  if (sc.ks) {
+    const int npos = end - first;
+    const size_t total = size_t(npos) * sc.nkv;
+    for (size_t i = size_t(blockIdx.x) * blockDim.x + threadIdx.x; i < total; i += size_t(gridDim.x) * blockDim.x) {
+      const int pos = first + int(i / size_t(sc.nkv));
+      const int h = int(i % size_t(sc.nkv));
+      const int src = slot_of(pos);
+      sc.vks[size_t(pos) * sc.nkv + h] = sc.ks[size_t(src) * sc.nkv + h];
+      sc.vvs[size_t(pos) * sc.nkv + h] = sc.vs[size_t(src) * sc.nkv + h];
+    }
+  }
+  const int npos = end - first;
+  const size_t total = size_t(npos) * row16;
+  for (size_t i = size_t(blockIdx.x) * blockDim.x + threadIdx.x; i < total; i += size_t(gridDim.x) * blockDim.x) {
+    const int pos = first + int(i / row16);
+    const size_t col = i % row16;
+    const int src = slot_of(pos);
+    vk[size_t(pos) * row16 + col] = k[size_t(src) * row16 + col];
+    vv[size_t(pos) * row16 + col] = v[size_t(src) * row16 + col];
+  }
+}
+
+__global__ void k_kv_drain_pageable(const PageDrainLayer* layers, int n_layers, const DevParams* P,
+                                    const flyx_round_result* ring_dev, int max_rows) {
+  pdl_trigger();
+  const int li = int(blockIdx.y);
+  if (li >= n_layers) return;
+  const unsigned long long seq = P->seq_no;
+  const int rslot = int(seq % kRing);
+  const flyx_round_result& e = ring_dev[rslot];
+  const int n = e.n_tokens;
+  const int r = int(blockIdx.x);
+  if (n <= 0 || r >= n) return;
+  const PageDrainLayer& L = layers[li];
+  const int pos = e.position - n + r;
+  if (pos < L.device_positions) return;
+  const int cell = L.slot_of(pos);
+  const size_t row16 = L.row_bytes / 16;
+  const size_t dst_row = size_t(rslot) * size_t(max_rows) + size_t(r);
+  const uint4* sk = reinterpret_cast<const uint4*>(L.k) + size_t(cell) * row16;
+  const uint4* sv = reinterpret_cast<const uint4*>(L.v) + size_t(cell) * row16;
+  uint4* dk = reinterpret_cast<uint4*>(L.drain_k) + dst_row * row16;
+  uint4* dv = reinterpret_cast<uint4*>(L.drain_v) + dst_row * row16;
+  for (size_t i = threadIdx.x; i < row16; i += blockDim.x) {
+    dk[i] = sk[i];
+    dv[i] = sv[i];
+  }
+  if (L.ks && threadIdx.x < L.nkv) {
+    L.drain_ks[dst_row * size_t(L.nkv) + threadIdx.x] = L.ks[size_t(cell) * size_t(L.nkv) + threadIdx.x];
+    L.drain_vs[dst_row * size_t(L.nkv) + threadIdx.x] = L.vs[size_t(cell) * size_t(L.nkv) + threadIdx.x];
+  }
+}
+
+}  // namespace
+
+void kv_stage_ring(const void* k, void* vk, const void* v, void* vv, size_t row, int sink, int ring, int from, int cap,
+                   const DevParams* P, int pos_add, int span, KvStagePart part, int blocks, cudaStream_t st,
+                   const KvStageScales& scales) {
+  k_kv_stage_ring<<<blocks, 256, 0, st>>>(static_cast<const uint4*>(k), static_cast<uint4*>(vk),
+                                          static_cast<const uint4*>(v), static_cast<uint4*>(vv), row / 16, sink, ring,
+                                          from, cap, P, pos_add, span, part, scales);
+}
+
+void kv_drain_pageable(const PageDrainLayer* layers, int n_layers, const DevParams* P, const flyx_round_result* ring_dev,
+                       int max_rows, cudaStream_t st) {
+  if (n_layers <= 0 || max_rows <= 0) return;
+  k_kv_drain_pageable<<<dim3(max_rows, n_layers), 128, 0, st>>>(layers, n_layers, P, ring_dev, max_rows);
+}
+
 }  // namespace flyx::cuda

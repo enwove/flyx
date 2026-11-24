@@ -11,6 +11,7 @@
 #include <climits>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <stdexcept>
 
 #include "backends/cuda/kernels/common/device.cuh"
@@ -1747,6 +1748,150 @@ __global__ void __launch_bounds__(256) k_strata_fill(KvRef kv, int nkv, const in
   }
 }
 
+// Pageable host K/V gather pipeline for Strata attention (Windows WDDM overflow):
+// Cold pairs [host_from, ring_lo) live in pageable RAM; positions < host_from and >= ring_lo live on GPU (slot_of).
+// 1) k_strata_page_claim claims hot-cache slots across rows (deduplicating pairs shared across rows).
+// 2) k_strata_page_list emits unique cold misses into mapped pinned PageGatherReq[] (and bounce indices for collisions).
+// 3) strata_page_gather_host (captured as a CUDA graph host node via cudaLaunchHostFunc) copies cold pairs from
+//    pageable RAM into mapped pinned bounce_kv/bounce_scale.
+// 4) k_strata_page_install installs winning misses into VRAM kv.hot/kv.hot_scale and clears hot_claim.
+struct PageBounce {
+  const uint8_t* bounce_kv = nullptr;
+  const float* bounce_scale = nullptr;
+  const int32_t* miss_map = nullptr;
+};
+
+__device__ __forceinline__ int page_ring_lo(const KvRef& kv, int pos) {
+  const int lo = pos > kv.ring_safe ? ((pos - kv.ring_safe) & ~1) : 0;
+  return max(kv.host_from, lo);
+}
+
+__global__ void __launch_bounds__(256)
+    k_strata_page_claim(KvRef kv, int nkv, const int* __restrict__ sel, int sel_stride, const int* __restrict__ sel_n,
+                        const DevParams* P, int32_t* miss_count) {
+  pdl_trigger();
+  if (blockIdx.x == 0 && blockIdx.y == 0 && threadIdx.x == 0) *miss_count = 0;
+  if (!kv.hot) return;
+  const int r = blockIdx.x, kvh = blockIdx.y, n = sel_n[size_t(r) * nkv + kvh];
+  const int ring_lo = page_ring_lo(kv, P->position);
+  const int* list = sel + (size_t(r) * nkv + kvh) * sel_stride;
+  const int32_t* tag = kv.hot_tag + (size_t(kvh) << kv.hot_bits);
+  int32_t* claim = kv.hot_claim + (size_t(kvh) << kv.hot_bits);
+  for (int i = threadIdx.x; i < n; i += blockDim.x) {
+    const int q = list[i];
+    if (2 * q < kv.host_from || 2 * q + 1 >= ring_lo) continue;
+    const int sl = kv.hot_slot(q);
+    // Pin already-resident pairs (-1 < every non-negative claim key) so a colliding miss in the same
+    // round cannot evict a hit whose miss_map entry is -1.
+    atomicMin(&claim[sl], tag[sl] == q ? -1 : hot_claim_key(q));
+  }
+}
+
+__global__ void __launch_bounds__(256)
+    k_strata_page_list(KvRef kv, int nkv, const int* __restrict__ sel, int sel_stride, const int* __restrict__ sel_n,
+                       const DevParams* P, PageGatherReq* req_dev, int32_t* miss_count, int32_t* miss_map) {
+  pdl_trigger();
+  const int r = blockIdx.x, kvh = blockIdx.y, rows = gridDim.x;
+  const int n = sel_n[size_t(r) * nkv + kvh];
+  const int ring_lo = page_ring_lo(kv, P->position);
+  const int* list = sel + (size_t(r) * nkv + kvh) * sel_stride;
+  int32_t* map_row = miss_map + (size_t(r) * nkv + kvh) * sel_stride;
+  const int32_t* tag = kv.hot ? kv.hot_tag + (size_t(kvh) << kv.hot_bits) : nullptr;
+  const int32_t* claim = kv.hot ? kv.hot_claim + (size_t(kvh) << kv.hot_bits) : nullptr;
+  for (int i = threadIdx.x; i < n; i += blockDim.x) {
+    const int q = list[i];
+    if (2 * q < kv.host_from || 2 * q + 1 >= ring_lo) {
+      map_row[i] = -1;
+      continue;
+    }
+    if (kv.hot) {
+      const int sl = kv.hot_slot(q);
+      if (tag[sl] == q) {
+        map_row[i] = -1;
+        continue;
+      }
+      const int win = claim[sl];
+      if (win >= 0) {
+        if (win == q * rows + r) {
+          const int m = atomicAdd(miss_count, 1);
+          req_dev[m] = PageGatherReq{kvh, q, sl, 0};
+          map_row[i] = -1;
+          continue;
+        }
+        if (win / rows == q) {
+          map_row[i] = -1;
+          continue;
+        }
+      }
+    }
+    const int m = atomicAdd(miss_count, 1);
+    req_dev[m] = PageGatherReq{kvh, q, -1, 0};
+    map_row[i] = m;
+  }
+}
+
+void CUDART_CB strata_page_gather_host(void* ud) {
+  const auto* c = static_cast<const PageGatherCtx*>(ud);
+  const int n = *c->miss_count_host;
+  if (n <= 0) return;
+  const int lim = n < c->max_misses ? n : c->max_misses;
+  const size_t head_bytes = size_t(c->hd) * size_t(c->elem);
+  const size_t pos_stride = size_t(c->nkv) * head_bytes;
+  for (int m = 0; m < lim; ++m) {
+    const PageGatherReq req = c->req_host[m];
+    const int p0 = 2 * req.q;
+    const int p1 = p0 + 1;
+    uint8_t* dst = c->bounce_kv_host + size_t(m) * 4 * head_bytes;
+    const size_t h_off = size_t(req.kvh) * head_bytes;
+    std::memcpy(dst, c->k_page + size_t(p0) * pos_stride + h_off, head_bytes);
+    if (p1 < c->cap) std::memcpy(dst + head_bytes, c->k_page + size_t(p1) * pos_stride + h_off, head_bytes);
+    else std::memset(dst + head_bytes, 0, head_bytes);
+    std::memcpy(dst + 2 * head_bytes, c->v_page + size_t(p0) * pos_stride + h_off, head_bytes);
+    if (p1 < c->cap) std::memcpy(dst + 3 * head_bytes, c->v_page + size_t(p1) * pos_stride + h_off, head_bytes);
+    else std::memset(dst + 3 * head_bytes, 0, head_bytes);
+    if (c->ks_page) {
+      float* sd = c->bounce_scale_host + size_t(m) * 4;
+      sd[0] = c->ks_page[size_t(p0) * c->nkv + req.kvh];
+      sd[1] = p1 < c->cap ? c->ks_page[size_t(p1) * c->nkv + req.kvh] : 0.f;
+      sd[2] = c->vs_page[size_t(p0) * c->nkv + req.kvh];
+      sd[3] = p1 < c->cap ? c->vs_page[size_t(p1) * c->nkv + req.kvh] : 0.f;
+    }
+  }
+}
+
+template <int HD, int Elem>
+__global__ void __launch_bounds__(256)
+    k_strata_page_install(KvRef kv, int nkv, const PageGatherReq* __restrict__ req_dev,
+                          const int32_t* __restrict__ miss_count, const uint8_t* __restrict__ bounce_kv,
+                          const float* __restrict__ bounce_scale) {
+  pdl_trigger();
+  if (!kv.hot) return;
+  const size_t hot_total = size_t(nkv) << kv.hot_bits;
+  const size_t tid = size_t(blockIdx.x) * size_t(blockDim.x) + size_t(threadIdx.x);
+  const size_t stride = size_t(gridDim.x) * size_t(blockDim.x);
+  for (size_t i = tid; i < hot_total; i += stride) kv.hot_claim[i] = kHotFree;
+  const int n = *miss_count;
+  if (n <= 0) return;
+  const int warp = int(tid >> 5);
+  const int total_warps = int(stride >> 5);
+  const int lane = int(threadIdx.x) & 31;
+  constexpr size_t pair_bytes = 4 * size_t(HD) * size_t(Elem);
+  constexpr size_t pair_u32 = pair_bytes / 4;
+  for (int m = warp; m < n; m += total_warps) {
+    const PageGatherReq req = req_dev[m];
+    if (req.hot_slot < 0) continue;
+    const size_t hidx = (size_t(req.kvh) << kv.hot_bits) + size_t(req.hot_slot);
+    uint32_t* dst = reinterpret_cast<uint32_t*>(kv.hot + hidx * pair_bytes);
+    const uint32_t* src = reinterpret_cast<const uint32_t*>(bounce_kv + size_t(m) * pair_bytes);
+    for (size_t x = lane; x < pair_u32; x += 32) dst[x] = src[x];
+    if constexpr (Elem == 1) {
+      if (kv.hot_scale && lane < 4) kv.hot_scale[(hidx << 2) + lane] = bounce_scale[size_t(m) * 4 + lane];
+    }
+    __syncwarp();
+    if (lane == 0) kv.hot_tag[hidx] = req.q;
+  }
+}
+
 // The correction (StrataFlux's equation 8), in two steps.  strata_delta: a slice of a row's selected positions, their
 // copy's contributions (rotated basis) and the cache's own (unrotated), and the change to the softmax's sum, per query
 // head; grid (rows, nkv, kStrataSlices), block 32 * kDeltaWarps (warps in order).  strata_finish: the copy's attention
@@ -1758,7 +1903,7 @@ __global__ void __launch_bounds__(32 * kDeltaWarps, 12 / kDeltaWarps)
     k_strata_delta(const float* __restrict__ q, const float* __restrict__ qr, KvRef kv, int nh, int nkv, float scale,
                    const DevParams* P, const DevParams* P_hot,
                    const float* __restrict__ part, int slots, int used_cap, const int* __restrict__ sel,
-                   int sel_stride, const int* __restrict__ sel_n, float* __restrict__ delta) {
+                   int sel_stride, const int* __restrict__ sel_n, float* __restrict__ delta, PageBounce pb = {}) {
   pdl_trigger();
   constexpr int DPL = HD / 32, NW = kDeltaWarps;
   constexpr StrataLayout SL(HD, BITS);
@@ -1820,9 +1965,37 @@ __global__ void __launch_bounds__(32 * kDeltaWarps, 12 / kDeltaWarps)
     uint2 kx8 = {0, 0}, vx8 = {0, 0};
     uint4 kx16 = {0, 0, 0, 0}, vx16 = {0, 0, 0, 0};
     float kf_small[DPL], vf_small[DPL];
-    if constexpr (FP8 && DPL == 8) {
-      const uint8_t *ksrc = static_cast<const uint8_t*>(kv.k) + at, *vsrc = static_cast<const uint8_t*>(kv.v) + at;
-      const float *kscale_at = nullptr, *vscale_at = nullptr;
+    constexpr int kElem = FP8 ? 1 : 2;
+    const uint8_t* ksrc = static_cast<const uint8_t*>(kv.k) + at * kElem;
+    const uint8_t* vsrc = static_cast<const uint8_t*>(kv.v) + at * kElem;
+    const float *kscale_at = nullptr, *vscale_at = nullptr;
+    if (pb.bounce_kv) {
+      const int q_pair = j >> 1;
+      const int ring_lo = page_ring_lo(kv, P_hot->position);
+      if (2 * q_pair >= kv.host_from && 2 * q_pair + 1 < ring_lo) {
+        const int sl = kv.hot ? kv.hot_slot(q_pair) : -1;
+        if (kv.hot && kv.hot_tag[(size_t(kvh) << kv.hot_bits) + sl] == q_pair) {
+          const uint8_t* held = kv.hot + ((size_t(kvh) << kv.hot_bits) + sl) * 4 * HD * kElem + lane * DPL * kElem;
+          ksrc = held + (j & 1) * HD * kElem;
+          vsrc = held + (2 + (j & 1)) * HD * kElem;
+          if constexpr (FP8) {
+            if (kv.hot_scale) {
+              kscale_at = kv.hot_scale + ((((size_t(kvh) << kv.hot_bits) + sl) << 2) + (j & 1));
+              vscale_at = kscale_at + 2;
+            }
+          }
+        } else {
+          const int m = pb.miss_map[(size_t(r) * nkv + kvh) * sel_stride + (p >> 1)];
+          const uint8_t* held = pb.bounce_kv + size_t(m) * 4 * HD * kElem + lane * DPL * kElem;
+          ksrc = held + (j & 1) * HD * kElem;
+          vsrc = held + (2 + (j & 1)) * HD * kElem;
+          if constexpr (FP8) {
+            kscale_at = pb.bounce_scale + size_t(m) * 4 + (j & 1);
+            vscale_at = kscale_at + 2;
+          }
+        }
+      }
+    } else if constexpr (FP8 && DPL == 8) {
       if (kv.hot) {
         const int q_pair = j >> 1, sl = kv.hot_slot(q_pair);
         if (hot_pair(kv, q_pair, P_hot->position) && kv.hot_tag[(size_t(kvh) << kv.hot_bits) + sl] == q_pair) {
@@ -1835,6 +2008,8 @@ __global__ void __launch_bounds__(32 * kDeltaWarps, 12 / kDeltaWarps)
           }
         }
       }
+    }
+    if constexpr (FP8 && DPL == 8) {
       kx8 = *reinterpret_cast<const uint2*>(ksrc);
       vx8 = *reinterpret_cast<const uint2*>(vsrc);
       kscale = kscale_at ? *kscale_at : kv.kscales(cj)[size_t(cj) * nkv + kvh];
@@ -1842,19 +2017,21 @@ __global__ void __launch_bounds__(32 * kDeltaWarps, 12 / kDeltaWarps)
     } else if constexpr (FP8) {
 #pragma unroll
       for (int e = 0; e < DPL; ++e) {
-        kf_small[e] = e4m3_to_float(static_cast<const uint8_t*>(kv.k)[at + e]);
-        vf_small[e] = e4m3_to_float(static_cast<const uint8_t*>(kv.v)[at + e]);
+        kf_small[e] = e4m3_to_float(ksrc[e]);
+        vf_small[e] = e4m3_to_float(vsrc[e]);
       }
-      kscale = kv.kscales(cj)[size_t(cj) * nkv + kvh];
-      vscale = kv.vscales(cj)[size_t(cj) * nkv + kvh];
+      kscale = kscale_at ? *kscale_at : kv.kscales(cj)[size_t(cj) * nkv + kvh];
+      vscale = vscale_at ? *vscale_at : kv.vscales(cj)[size_t(cj) * nkv + kvh];
     } else if constexpr (DPL == 8) {
-      kx16 = *reinterpret_cast<const uint4*>(static_cast<const kv16*>(kv.k) + at);
-      vx16 = *reinterpret_cast<const uint4*>(static_cast<const kv16*>(kv.v) + at);
+      kx16 = *reinterpret_cast<const uint4*>(ksrc);
+      vx16 = *reinterpret_cast<const uint4*>(vsrc);
     } else {
+      const kv16* k16 = reinterpret_cast<const kv16*>(ksrc);
+      const kv16* v16 = reinterpret_cast<const kv16*>(vsrc);
 #pragma unroll
       for (int e = 0; e < DPL; ++e) {
-        kf_small[e] = __half2float(static_cast<const kv16*>(kv.k)[at + e]);
-        vf_small[e] = __half2float(static_cast<const kv16*>(kv.v)[at + e]);
+        kf_small[e] = __half2float(k16[e]);
+        vf_small[e] = __half2float(v16[e]);
       }
     }
 
@@ -2150,7 +2327,25 @@ void launch_strata(const float* q, KvRef kv, const StrataScratch& sc, int nh, in
   } else {
     k_strata_select_recent<<<dim3(rows, nkv), 128, 0, st>>>(P, sc.how.most, sc.sel, sc.sel_stride, sc.sel_n);
   }
-  if (kv.hot && kv.fp8()) {
+  PageBounce pb{};
+  if (kv.page_ctx) {
+    PageGatherCtx* pc = kv.page_ctx;
+    k_strata_page_claim<<<dim3(rows, nkv), 256, 0, st>>>(kv, nkv, sc.sel, sc.sel_stride, sc.sel_n, P_hot,
+                                                         pc->miss_count_dev);
+    k_strata_page_list<<<dim3(rows, nkv), 256, 0, st>>>(kv, nkv, sc.sel, sc.sel_stride, sc.sel_n, P_hot, pc->req_dev,
+                                                        pc->miss_count_dev, pc->miss_map);
+    const cudaError_t host_err = cudaLaunchHostFunc(st, strata_page_gather_host, pc);
+    if (host_err != cudaSuccess) throw std::runtime_error(cudaGetErrorString(host_err));
+    if (kv.hot) {
+      if (kv.fp8())
+        k_strata_page_install<HD, 1><<<kStrataSlices, 256, 0, st>>>(kv, nkv, pc->req_dev, pc->miss_count_dev,
+                                                                    pc->bounce_kv_dev, pc->bounce_scale_dev);
+      else
+        k_strata_page_install<HD, 2><<<kStrataSlices, 256, 0, st>>>(kv, nkv, pc->req_dev, pc->miss_count_dev,
+                                                                    pc->bounce_kv_dev, pc->bounce_scale_dev);
+    }
+    pb = {pc->bounce_kv_dev, pc->bounce_scale_dev, pc->miss_map};
+  } else if (kv.hot && kv.fp8()) {
     k_strata_claim<<<dim3(rows, nkv), 256, 0, st>>>(kv, nkv, sc.sel, sc.sel_stride, sc.sel_n, P_hot);
     k_strata_fill<HD><<<dim3(rows, nkv, kStrataSlices), 256, 0, st>>>(kv, nkv, sc.sel, sc.sel_stride, sc.sel_n, P_hot);
   }
@@ -2163,7 +2358,7 @@ void launch_strata(const float* q, KvRef kv, const StrataScratch& sc, int nh, in
     }();
     (void)delta_fp8_carveout;
     k_strata_delta<HD, G, BITS, true, Compact><<<dg, 32 * kDeltaWarps, 0, st>>>(
-        q, sc.qr, kv, nh, nkv, scale, P, P_hot, partial, slots, splits, sc.sel, sc.sel_stride, sc.sel_n, sc.delta);
+        q, sc.qr, kv, nh, nkv, scale, P, P_hot, partial, slots, splits, sc.sel, sc.sel_stride, sc.sel_n, sc.delta, pb);
   } else {
     static const bool delta_f16_carveout = [] {
       cudaFuncSetAttribute(k_strata_delta<HD, G, BITS, false, Compact>,
@@ -2172,7 +2367,7 @@ void launch_strata(const float* q, KvRef kv, const StrataScratch& sc, int nh, in
     }();
     (void)delta_f16_carveout;
     k_strata_delta<HD, G, BITS, false, Compact><<<dg, 32 * kDeltaWarps, 0, st>>>(
-        q, sc.qr, kv, nh, nkv, scale, P, P_hot, partial, slots, splits, sc.sel, sc.sel_stride, sc.sel_n, sc.delta);
+        q, sc.qr, kv, nh, nkv, scale, P, P_hot, partial, slots, splits, sc.sel, sc.sel_stride, sc.sel_n, sc.delta, pb);
   }
   k_strata_finish<HD><<<dim3(rows, nh), HD, 0, st>>>(nh, nkv, P, partial, slots, splits, sc.delta, kStrataSlices,
                                                       gate, ld_gate, o, ld_out, from);

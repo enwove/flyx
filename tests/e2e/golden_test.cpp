@@ -1553,6 +1553,165 @@ void strata_rounds(const std::string& model, const std::string& backend, const s
                                                               prompts.begin() + std::ptrdiff_t(std::min<size_t>(3, pick.size()))),
                std::vector<size_t>(pick.begin(), pick.begin() + std::ptrdiff_t(std::min<size_t>(3, pick.size()))),
                "strata: rounds of several sequences, plain and each drafter");
+
+  // Pageable and hybrid WDDM+pageable host K/V overflow: must match pinned host K/V bit-for-bit across
+  // prefill windows, exact->strata switch, plain/MTP/DFlash2, rollback, checkpoints, cross-mode snapshots, and batches.
+  {
+    const int vocab = make(model, backend, false)->model().desc().vocab;
+    std::vector<int32_t> longp;
+    while (longp.size() < 400) {
+      longp.insert(longp.end(), prompt.begin(), prompt.end());
+      longp.insert(longp.end(), want.begin(), want.end());
+    }
+    longp.resize(400);
+    auto turns = [&](Engine* e, std::vector<float>* logits, int p1_len, int p2_add) {
+      Session s(e);
+      if (!s.init(&err)) return std::vector<int32_t>{-1};
+      std::vector<int32_t> p1(longp.begin(), longp.begin() + p1_len);
+      auto out = gen(s, p1, N / 2).tokens;
+      auto p2 = p1;
+      p2.insert(p2.end(), out.begin(), out.end());
+      p2.insert(p2.end(), longp.begin(), longp.begin() + p2_add);
+      const auto more = gen(s, p2, N / 2).tokens;
+      out.insert(out.end(), more.begin(), more.end());
+      logits->assign(size_t(vocab), 0.f);
+      if (e->api()->logits(s.seq(), 0, logits->data()) != 0) logits->clear();
+      return out;
+    };
+    for (const char* method : {"strata", "auto"})
+      for (bool fp8 : {false, true}) {
+        const std::string base =
+            narrow + ",head_cert=0,stage_window=64" + (std::string(method) == "auto" ? ",strata_from=200" : "");
+        auto pinned =
+            make(model, backend, false, "", fp8, base + ",pageable_kv=off", false, 512, kReferenceWidth, false, 0,
+                 method, 0, 48);
+        auto paged =
+            make(model, backend, false, "", fp8, base + ",pageable_kv=on", false, 512, kReferenceWidth, false, 0,
+                 method, 0, 48);
+        auto paged_mtp =
+            make(model, backend, true, "mtp", fp8, base + ",pageable_kv=on", false, 512, kReferenceWidth, false, 0,
+                 method, 0, 48);
+        auto paged_df =
+            make(model, backend, true, "dflash2", fp8, base + ",pageable_kv=on", false, 512, kReferenceWidth, false, 0,
+                 method, 0, 48);
+        flyx_seq_size sz_pin{}, sz_pg{};
+        const flyx_seq_layout lp = pinned->kv_layout(), lq = paged->kv_layout();
+        const bool ok_sz = pinned->api()->seq_size(pinned->bmodel(), &lp, &sz_pin) == 0 &&
+                           paged->api()->seq_size(paged->bmodel(), &lq, &sz_pg) == 0;
+        check(ok_sz && sz_pg.host_mapped < sz_pin.host_mapped,
+              std::string("pageable_kv=on, ") + method + (fp8 ? ", fp8" : ", binary16") +
+                  ": reduces host_mapped (" + std::to_string(sz_pg.host_mapped) + " < " +
+                  std::to_string(sz_pin.host_mapped) + ")");
+        // Multi-window prefill (>16 rows per chunk): exact bit-for-bit match against pinned host KV.
+        // Note: logits(seq, 0) is row 0 of the last round, so compare logits plain-vs-plain (and tokens across all).
+        std::vector<float> lpin, lpg, lmtp, ldf;
+        const auto tpin = turns(pinned.get(), &lpin, 384, 24), tpg = turns(paged.get(), &lpg, 384, 24),
+                   tmtp = turns(paged_mtp.get(), &lmtp, 384, 24), tdf = turns(paged_df.get(), &ldf, 384, 24);
+        check(tpin.size() == size_t(N / 2) * 2 && tpg == tpin && tmtp == tpin && tdf == tpin && !lpin.empty() &&
+                  lpg == lpin,
+              std::string("pageable_kv=on, ") + method + (fp8 ? ", fp8" : ", binary16") +
+                  ": windowed prefill plain matches pinned logits bit-for-bit; MTP and DFlash2 match tokens");
+        // Short tail prefill past stage_window (<=16 rows): uses windowed attention_flash (bf16 MMA) rather than
+        // direct PCIe attention_split (fp32); speculation matches plain tokens and logits stay within bf16 rounding.
+        std::vector<float> spin, spg, smtp, sdf;
+        const auto stpin = turns(pinned.get(), &spin, 400, 8), stpg = turns(paged.get(), &spg, 400, 8),
+                   stmtp = turns(paged_mtp.get(), &smtp, 400, 8), stdf = turns(paged_df.get(), &sdf, 400, 8);
+        float max_diff = 0.f;
+        for (size_t i = 0; i < std::min(spin.size(), spg.size()); ++i)
+          max_diff = std::max(max_diff, std::fabs(spin[i] - spg[i]));
+        check(stpg.size() == size_t(N / 2) * 2 && stpg == stpin && stmtp == stpg && stdf == stpg && !spg.empty() &&
+                  max_diff < 5e-3f,
+              std::string("pageable_kv=on, ") + method + (fp8 ? ", fp8" : ", binary16") +
+                  ": short-tail windowed prefill matches pinned tokens (max logit diff " + std::to_string(max_diff) +
+                  ") and MTP/DFlash2 match plain");
+      }
+    // Rollback (edited prompt), checkpoint restore, and cross-mode snapshots (pinned <-> pageable).
+    {
+      const std::string opts = narrow + ",head_cert=0";
+      auto pinned = make(model, backend, true, "mtp", true, opts + ",pageable_kv=off", false, 512, kReferenceWidth,
+                         false, 0, "strata:2", 0, 64);
+      auto paged = make(model, backend, true, "mtp", true, opts + ",pageable_kv=on", false, 512, kReferenceWidth,
+                        false, 0, "strata:2", 0, 64);
+      SnapshotStore store_pin(uint64_t(1) << 28), store_pg(uint64_t(1) << 28);
+      Session s_pin(pinned.get()), s_pg(paged.get());
+      check(s_pin.init(&err) && s_pg.init(&err), "pageable_kv rollback/snapshot: init sessions");
+      std::vector<int32_t> history(333);
+      for (size_t i = 0; i < history.size(); ++i) history[i] = int32_t((17 * i + i / 13) % size_t(vocab));
+      const auto a1 = gen(s_pin, history, 20).tokens, b1 = gen(s_pg, history, 20).tokens;
+      check(a1.size() == 20 && a1 == b1, "pageable_kv=on: long prompt + MTP matches pinned");
+      const int k_pin = s_pin.save_to(store_pin, &err), k_pg = s_pg.save_to(store_pg, &err);
+      check(k_pin >= 256 && k_pin == k_pg, "pageable_kv=on: checkpoint saved at identical position");
+      // Edit prompt shorter -> rollback / reset, then restore from the OPPOSITE mode's snapshot store!
+      std::vector<int32_t> edit(history.begin(), history.begin() + 45);
+      edit.front() = (edit.front() + 1) % vocab;
+      const auto a2 = gen(s_pin, edit, 16).tokens, b2 = gen(s_pg, edit, 16).tokens;
+      check(a2.size() == 16 && a2 == b2, "pageable_kv=on: edited shorter prompt matches pinned");
+      s_pin.set_store(&store_pg);   // pinned loads snapshot written by pageable session
+      s_pg.set_store(&store_pin);   // pageable loads snapshot written by pinned session
+      history.push_back(edit.front());
+      const Out a3 = gen(s_pin, history, 20), b3 = gen(s_pg, history, 20);
+      std::vector<float> la(size_t(vocab), 0.f), lb(size_t(vocab), 0.f);
+      check(a3.usage.reused_tokens == k_pg && b3.usage.reused_tokens == k_pin && a3.tokens == b3.tokens &&
+                pinned->api()->logits(s_pin.seq(), 0, la.data()) == 0 &&
+                paged->api()->logits(s_pg.seq(), 0, lb.data()) == 0 && la == lb,
+            "pageable_kv=on: cross-mode snapshot load (pinned <-> pageable) gives identical tokens and logits");
+    }
+    // Batched rounds with pageable_kv=on.
+    {
+      auto pg_batch = make(model, backend, true, "all", true, narrow + ",pageable_kv=on", false, 512, -1, false, 0,
+                           "strata", 0);
+      std::vector<size_t> pb;
+      for (size_t i = 0; i < pg_batch->widths().size(); ++i)
+        if (pg_batch->widths()[i] == 0) {
+          pb.push_back(i);
+          break;
+        }
+      for (int d = 0; d < 4; ++d) {
+        size_t best = pg_batch->widths().size();
+        for (size_t i = 0; i < pg_batch->widths().size(); ++i)
+          if (pg_batch->round_drafters()[i] == d &&
+              (best == pg_batch->widths().size() || pg_batch->widths()[i] < pg_batch->widths()[best]))
+            best = i;
+        if (best < pg_batch->widths().size()) pb.push_back(best);
+      }
+      batch_rounds(pg_batch.get(),
+                   std::vector<std::vector<int32_t>>(prompts.begin(),
+                                                     prompts.begin() + std::ptrdiff_t(std::min<size_t>(3, pb.size()))),
+                   std::vector<size_t>(pb.begin(), pb.begin() + std::ptrdiff_t(std::min<size_t>(3, pb.size()))),
+                   "pageable_kv=on: batched rounds, plain and each drafter");
+    }
+    // Hybrid WDDM+pageable split (pinned_host_mb choosing a partial mix of pinned and pageable layers).
+    {
+      const int hctx = 16384;
+      const std::string hbase = narrow + ",head_cert=0";
+      auto h_pin = make(model, backend, false, "", false, hbase + ",pageable_kv=off", false, hctx, kReferenceWidth,
+                        false, 0, "strata", 0);
+      auto h_pg = make(model, backend, false, "", false, hbase + ",pageable_kv=on", false, hctx, kReferenceWidth,
+                       false, 0, "strata", 0);
+      flyx_seq_size sz_pin{}, sz_pg{};
+      const flyx_seq_layout lpin = h_pin->kv_layout(), lpg = h_pg->kv_layout();
+      check(h_pin->api()->seq_size(h_pin->bmodel(), &lpin, &sz_pin) == 0 &&
+                h_pg->api()->seq_size(h_pg->bmodel(), &lpg, &sz_pg) == 0,
+            "hybrid pageable_kv: query pinned and pageable sizes");
+      // prio1 reserves 32 MiB + bounce + copies; pick a budget halfway between all-pageable and all-pinned.
+      const uint64_t kv_delta = sz_pin.host_mapped > sz_pg.host_mapped ? sz_pin.host_mapped - sz_pg.host_mapped : 0;
+      const int mid_mb = int((32ull << 20) / (1ull << 20) + (sz_pg.host_mapped + kv_delta / 2) / (1ull << 20));
+      auto h_mix = make(model, backend, true, "mtp", false,
+                        hbase + ",pageable_kv=auto,pinned_host_mb=" + std::to_string(mid_mb), false, hctx,
+                        kReferenceWidth, false, 0, "strata", 0);
+      flyx_seq_size sz_mix{};
+      const flyx_seq_layout lmix = h_mix->kv_layout();
+      const bool ok_mix = h_mix->api()->seq_size(h_mix->bmodel(), &lmix, &sz_mix) == 0;
+      check(ok_mix && sz_mix.host_mapped > sz_pg.host_mapped && sz_mix.host_mapped < sz_pin.host_mapped,
+            "hybrid pageable_kv=auto,pinned_host_mb=" + std::to_string(mid_mb) + ": partial split (" +
+                std::to_string(sz_pg.host_mapped) + " < " + std::to_string(sz_mix.host_mapped) + " < " +
+                std::to_string(sz_pin.host_mapped) + ")");
+      std::vector<float> lp_out, lm_out;
+      const auto tp = turns(h_pin.get(), &lp_out, 400, 8), tm = turns(h_mix.get(), &lm_out, 400, 8);
+      check(tp.size() == size_t(N / 2) * 2 && tm == tp && !lp_out.empty() && lm_out == lp_out,
+            "hybrid pageable_kv=auto (pinned + pageable mix, MTP): identical tokens and logits to pinned host KV");
+    }
+  }
 }
 
 // The tensor-core round attention for every row (rows_attention_from=0: by default it takes rows of 8,192 keys or

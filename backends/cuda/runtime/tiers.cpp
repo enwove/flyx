@@ -6,7 +6,20 @@
 // the backend links no driver library.
 #include <cuda.h>
 
+#if defined(_WIN32)
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
+#else
+#include <sys/mman.h>
+#endif
+
 #include <algorithm>
+#include <cstring>
 #include <mutex>
 #include <stdexcept>
 #include <string>
@@ -155,7 +168,28 @@ void* prefill_vmm_alloc(flyx_bmodel* m, size_t bytes, size_t* actual_bytes) {
 
 }  // namespace flyx::cuda
 
-flyx_seq::Tiered flyx_seq::tiered_alloc(size_t positions, size_t row, int role, int parity, int scale_floats) {
+void* flyx_seq::pageable_alloc_raw(size_t bytes) {
+  if (dry) {
+    dry_host_bytes += bytes;
+    return reinterpret_cast<void*>(uintptr_t(256));
+  }
+  if (bytes == 0) return nullptr;
+  void* p = nullptr;
+#if defined(_WIN32)
+  p = VirtualAlloc(nullptr, bytes, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
+  if (!p)
+    throw std::runtime_error("K/V in pageable host memory: VirtualAlloc failed (" + std::to_string(GetLastError()) +
+                             ")");
+#else
+  p = mmap(nullptr, bytes, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+  if (p == MAP_FAILED) throw std::runtime_error("K/V in pageable host memory: mmap failed");
+#endif
+  pageable_allocs.push_back({p, bytes});
+  return p;
+}
+
+flyx_seq::Tiered flyx_seq::tiered_alloc(size_t positions, size_t row, int role, int parity, int scale_floats,
+                                        bool pageable, int ring_tail) {
   Tiered t;
   const size_t want = positions * row;
   if (device_positions < 0 || size_t(device_positions) >= positions) {
@@ -166,15 +200,18 @@ flyx_seq::Tiered flyx_seq::tiered_alloc(size_t positions, size_t row, int role, 
   if (!v.missing.empty()) throw std::runtime_error("K/V in host memory: " + v.missing);
   const size_t total = round_up(want, v.gran);
   // The device part rounds down to the granularity: the rows past it go to the host with the rest.
-  const size_t dev = size_t(device_positions) * row / v.gran * v.gran, host = total - dev;
+  size_t dev = size_t(device_positions) * row / v.gran * v.gran;
+  if (pageable)
+    while (dev >= v.gran && ((dev / row) & 1)) dev -= v.gran;
+  const size_t host = total - dev;
   t.device_rows = int(dev / row);
   // The staging the view's rest maps: one for the caches of a role, size and parity, which attentions read in turn,
   // in the pool (pool_finish).  As large as the host part; with strata attention, stage_window positions and what a
   // round reading the caches reaches.
   size_t stage = host, held = host / row;  // the staging's bytes, and the positions past the device part it holds
   if (stage_window > 0) {
-    const long long want = std::max<long long>(stage_window, (long long)stage_reach - t.device_rows);
-    const size_t whole = size_t((want + kFlashWindowAlign - 1) / kFlashWindowAlign * kFlashWindowAlign);
+    const long long want_w = std::max<long long>(stage_window, (long long)stage_reach - t.device_rows);
+    const size_t whole = size_t((want_w + kFlashWindowAlign - 1) / kFlashWindowAlign * kFlashWindowAlign);
     if (whole * row < host) stage = round_up(whole * row, v.gran), held = whole;  // the rest of the piece unused
   }
   t.stage_rows = int(std::min<size_t>(held, INT32_MAX));
@@ -189,6 +226,64 @@ flyx_seq::Tiered flyx_seq::tiered_alloc(size_t positions, size_t row, int role, 
   }
   t.slot = slot;
   t.scales = staging[size_t(slot)].scales;
+
+  if (pageable) {
+    t.page_ring = t.device_rows + ring_tail;
+    t.page = static_cast<uint8_t*>(pageable_alloc_raw(want));
+    const size_t ring_bytes = size_t(ring_tail) * row;
+    if (dry) {
+      if (dev == 0) {
+        t.at = alloc<uint8_t>(ring_bytes);
+      } else {
+        dry_bytes += dev + round_up(ring_bytes, v.gran);
+        t.at = reinterpret_cast<void*>(uintptr_t(256));
+      }
+      device_positions = std::min(device_positions, t.device_rows);
+      t.view = reinterpret_cast<void*>(uintptr_t(256));
+      return t;
+    }
+    CUmemAllocationProp dp{};
+    dp.type = CU_MEM_ALLOCATION_TYPE_PINNED;
+    dp.location = {CU_MEM_LOCATION_TYPE_DEVICE, v.device};
+    CUmemAccessDesc access{};
+    access.location = {CU_MEM_LOCATION_TYPE_DEVICE, v.device};
+    access.flags = CU_MEM_ACCESS_FLAGS_PROT_READWRITE;
+    mapped.push_back(Mapped{});
+    Mapped& m = mapped.back();
+    m.dev = dev;
+    m.bytes = total;
+    m.stage = stage;
+    m.slot = slot;
+    CUdeviceptr vw = 0;
+    check(v.reserve(&vw, total, v.gran, 0, 0), "reserving addresses for a view");
+    m.view = vw;
+    if (dev == 0) {
+      m.va = 0;
+      m.va_bytes = 0;
+      t.at = alloc<uint8_t>(ring_bytes);
+    } else {
+      const size_t ring_vmm = round_up(ring_bytes, v.gran);
+      const size_t va_sz = dev + ring_vmm;
+      CUdeviceptr va = 0;
+      check(v.reserve(&va, va_sz, v.gran, 0, 0), "reserving addresses for a pageable ring");
+      m.va = va;
+      m.va_bytes = va_sz;
+      CUmemGenericAllocationHandle hd = 0, hr = 0;
+      check(v.create(&hd, dev, &dp, 0), "allocating device memory");
+      m.handles[0] = hd;
+      check(v.map(va, dev, 0, hd, 0), "mapping device memory");
+      check(v.map(vw, dev, 0, hd, 0), "mapping a view's device memory");
+      check(v.create(&hr, ring_vmm, &dp, 0), "allocating device tail ring");
+      m.handles[1] = hr;
+      check(v.map(va + dev, ring_vmm, 0, hr, 0), "mapping device tail ring");
+      check(v.set_access(va, va_sz, &access, 1), "granting the device access");
+      CK(cudaMemsetAsync(reinterpret_cast<void*>(va), 0, dev + ring_bytes, st));
+      t.at = reinterpret_cast<void*>(va);
+    }
+    t.view = reinterpret_cast<void*>(vw);
+    return t;
+  }
+
   if (dry) {
     dry_bytes += dev;
     dry_host_bytes += host;
@@ -208,6 +303,7 @@ flyx_seq::Tiered flyx_seq::tiered_alloc(size_t positions, size_t row, int role, 
   Mapped& m = mapped.back();
   m.dev = dev;
   m.bytes = total;
+  m.va_bytes = total;
   m.stage = stage;
   m.slot = slot;
   CUdeviceptr va = 0, vw = 0;
@@ -460,9 +556,10 @@ void flyx_seq::stage_ahead(const StageItem& x) {
       b.copy_stage(P, 0, kStageBefore, blocks, stage_side.st);
     }
   } else if (x.parity >= 0) {
-    // Prefill starts with an idle sequence: this whole historical window is already written. K/V reside in
-    // host-backed CUDA virtual addresses. The runtime resolves the transfer kind from those addresses.
-    if (m->opt.stage_dma && x.from >= b.device_positions && x.to <= position) {
+    // Prefill starts with an idle sequence: this whole historical window is already written.
+    if (b.pageable) {
+      window_stage(b, x.from, x.to, x.parity, 0, kStageBefore, blocks, stage_side.st);
+    } else if (m->opt.stage_dma && x.from >= b.device_positions && x.to <= position) {
       const size_t n = size_t(x.to - x.from), offset = size_t(x.from) * b.row;
       CK(cudaMemcpyAsync(b.wk[x.parity], static_cast<const uint8_t*>(b.k) + offset, n * b.row,
                          cudaMemcpyDefault, stage_side.st));
@@ -477,7 +574,24 @@ void flyx_seq::stage_ahead(const StageItem& x) {
       window_stage(b, x.from, x.to, x.parity, 0, kStageBefore, blocks, stage_side.st);
     }
   } else {
-    b.stage(P, 0, 0, kStageBefore, blocks, stage_side.st);
+    if (b.pageable) {
+      const int h0 = b.device_positions;
+      const int h1 = std::min(b.staged_cap(), position);
+      if (h1 > h0) {
+        const size_t n = size_t(h1 - h0);
+        CK(cudaMemcpyAsync(static_cast<uint8_t*>(b.vk) + size_t(h0) * b.row, b.k_page + size_t(h0) * b.row, n * b.row,
+                           cudaMemcpyHostToDevice, stage_side.st));
+        CK(cudaMemcpyAsync(static_cast<uint8_t*>(b.vv) + size_t(h0) * b.row, b.v_page + size_t(h0) * b.row, n * b.row,
+                           cudaMemcpyHostToDevice, stage_side.st));
+        if (b.ks_page) {
+          const size_t sb = n * size_t(b.nkv) * sizeof(float);
+          CK(cudaMemcpyAsync(b.vks, b.ks_page + size_t(h0) * b.nkv, sb, cudaMemcpyHostToDevice, stage_side.st));
+          CK(cudaMemcpyAsync(b.vvs, b.vs_page + size_t(h0) * b.nkv, sb, cudaMemcpyHostToDevice, stage_side.st));
+        }
+      }
+    } else {
+      b.stage(P, 0, 0, kStageBefore, blocks, stage_side.st);
+    }
   }
 }
 
@@ -494,6 +608,51 @@ void* shifted(uint8_t* staging, int w0, size_t row) {
 // (kStageBefore), the pass's own (kStagePass), or all of them (kStageAll).
 void flyx_seq::window_stage(const KvBuf& b, int w0, int w1, int parity, int rows, KvStagePart part, int blocks,
                             cudaStream_t s) const {
+  if (b.pageable) {
+    if (part != kStagePass) {
+      // Any sub-window prefix below device_positions (when device_positions isn't window-aligned) lives on GPU.
+      if (w0 < b.device_positions) {
+        const int d1 = std::min(w1, b.device_positions);
+        if (d1 > w0) {
+          const size_t n = size_t(d1 - w0);
+          CK(cudaMemcpyAsync(b.wk[parity], static_cast<const uint8_t*>(b.k) + size_t(w0) * b.row, n * b.row,
+                             cudaMemcpyDeviceToDevice, s));
+          CK(cudaMemcpyAsync(b.wv[parity], static_cast<const uint8_t*>(b.v) + size_t(w0) * b.row, n * b.row,
+                             cudaMemcpyDeviceToDevice, s));
+          if (b.ks_page) {
+            const size_t sb = n * size_t(b.nkv) * sizeof(float);
+            CK(cudaMemcpyAsync(b.wks[parity], b.ks + size_t(w0) * b.nkv, sb, cudaMemcpyDeviceToDevice, s));
+            CK(cudaMemcpyAsync(b.wvs[parity], b.vs + size_t(w0) * b.nkv, sb, cudaMemcpyDeviceToDevice, s));
+          }
+        }
+      }
+      // Historical host positions [max(w0, device_positions), min(w1, position)) live in pageable RAM.
+      const int h0 = std::max(w0, b.device_positions);
+      const int h1 = std::min(w1, position);
+      if (h1 > h0) {
+        const size_t n = size_t(h1 - h0);
+        const size_t off_dst = size_t(h0 - w0);
+        CK(cudaMemcpyAsync(b.wk[parity] + off_dst * b.row, b.k_page + size_t(h0) * b.row, n * b.row,
+                           cudaMemcpyHostToDevice, s));
+        CK(cudaMemcpyAsync(b.wv[parity] + off_dst * b.row, b.v_page + size_t(h0) * b.row, n * b.row,
+                           cudaMemcpyHostToDevice, s));
+        if (b.ks_page) {
+          const size_t sb = n * size_t(b.nkv) * sizeof(float);
+          CK(cudaMemcpyAsync(b.wks[parity] + off_dst * b.nkv, b.ks_page + size_t(h0) * b.nkv, sb,
+                             cudaMemcpyHostToDevice, s));
+          CK(cudaMemcpyAsync(b.wvs[parity] + off_dst * b.nkv, b.vs_page + size_t(h0) * b.nkv, sb,
+                             cudaMemcpyHostToDevice, s));
+        }
+      }
+    }
+    if (part != kStageBefore) {
+      KvStageScales sc;
+      if (b.ks_page) sc = {b.ks, b.vs, b.scales_from(b.wks[parity], w0), b.scales_from(b.wvs[parity], w0), b.nkv};
+      kv_stage_ring(b.k, shifted(b.wk[parity], w0, b.row), b.v, shifted(b.wv[parity], w0, b.row), b.row,
+                    b.device_positions, b.page_ring, w0, w1, P, 0, rows, kStagePass, blocks, s, sc);
+    }
+    return;
+  }
   KvStageScales sc;  // and their scales
   if (b.ks_host) sc = {b.ks_host, b.vs_host, b.scales_from(b.wks[parity], w0), b.scales_from(b.wvs[parity], w0), b.nkv};
   kv_stage(b.k, shifted(b.wk[parity], w0, b.row), b.v, shifted(b.wv[parity], w0, b.row), b.row, w0, w1, P, 0, rows,
@@ -501,7 +660,7 @@ void flyx_seq::window_stage(const KvBuf& b, int w0, int w1, int parity, int rows
 }
 
 int flyx_seq::windows(const KvBuf& kb, int rows) const {
-  if (!kb.vk || stage_window <= 0 || rows <= FLYX_MAX_ROWS) return 0;
+  if (!kb.vk || stage_window <= 0 || (!kb.pageable && rows <= FLYX_MAX_ROWS)) return 0;
   const long long end = (long long)position + rows;  // the pass's keys: [0, end)
   if (end <= kb.staged_cap()) return 0;               // the view holds them
   const int from = window_from(kb), len = window_len(kb);
@@ -521,7 +680,7 @@ flyx::cuda::KvRef flyx_seq::window_before(const KvBuf& kb, int w0, int w1, int r
     if (w1 > position) window_stage(kb, w0, w1, parity, rows, kStagePass, kStageBlocksAll, s);
   }
   KvRef r{shifted(kb.wk[parity], w0, kb.row), shifted(kb.wv[parity], w0, kb.row), kb.ks, kb.vs};
-  if (kb.ks_host) {  // the window's scales past the device part, staged with it
+  if (kb.ks_host || kb.ks_page) {  // the window's scales past the device part, staged with it
     r.ks_far = kb.scales_from(kb.wks[parity], w0), r.vs_far = kb.scales_from(kb.wvs[parity], w0);
     r.scale_split = kb.device_positions;
   }
@@ -539,6 +698,36 @@ void flyx_seq::stage_wait(const KvBuf& kb, bool copy, cudaStream_t s, bool first
 
 void flyx_seq::stage_before(const KvBuf& kb, int pos_add, int span, cudaStream_t s) {
   if (!kb.vk) return;
+  if (kb.pageable) {
+    if (!stage_on) {
+      const int h0 = kb.device_positions;
+      const int h1 = std::min(kb.staged_cap(), position);
+      if (h1 > h0) {
+        const size_t n = size_t(h1 - h0);
+        CK(cudaMemcpyAsync(static_cast<uint8_t*>(kb.vk) + size_t(h0) * kb.row, kb.k_page + size_t(h0) * kb.row,
+                           n * kb.row, cudaMemcpyHostToDevice, s));
+        CK(cudaMemcpyAsync(static_cast<uint8_t*>(kb.vv) + size_t(h0) * kb.row, kb.v_page + size_t(h0) * kb.row,
+                           n * kb.row, cudaMemcpyHostToDevice, s));
+        if (kb.ks_page) {
+          const size_t sb = n * size_t(kb.nkv) * sizeof(float);
+          CK(cudaMemcpyAsync(kb.vks, kb.ks_page + size_t(h0) * kb.nkv, sb, cudaMemcpyHostToDevice, s));
+          CK(cudaMemcpyAsync(kb.vvs, kb.vs_page + size_t(h0) * kb.nkv, sb, cudaMemcpyHostToDevice, s));
+        }
+      }
+    } else {
+      if (pos_add != 0) throw std::logic_error("cuda: a staged attention's rows past the pass's");
+      stage_wait(kb, false, s);
+    }
+    KvStageScales sc;
+    if (kb.ks_page)
+      sc = {kb.ks, kb.vs, kb.scales_from(kb.vks, kb.device_positions), kb.scales_from(kb.vvs, kb.device_positions),
+            kb.nkv};
+    // Copy both any in-flight committed rows [position, P->position) and the pass's own rows from the GPU tail ring.
+    kv_stage_ring(kb.k, kb.vk, kb.v, kb.vv, kb.row, kb.device_positions, kb.page_ring,
+                  std::max(kb.device_positions, position), kb.staged_cap(), P, pos_add, span, kStageAll,
+                  kStageBlocksAll, s, sc);
+    return;
+  }
   if (!stage_on) {
     kb.stage(P, pos_add, span, kStageAll, kStageBlocksAll, s);
     return;
@@ -593,6 +782,29 @@ void flyx_seq::stage_text(const KvBuf& kb, cudaStream_t s) {
   // Strata attention's stagings of a fixed size hold fewer, but DV's trees never read through them
   // (the engine reads every position for trees).
   if (stage_window > 0) throw std::logic_error("cuda: DV's canvas pass over stagings of a fixed size (strata's)");
+  if (kb.pageable) {
+    const int h0 = kb.device_positions;
+    const int h1 = std::min(kb.staged_cap(), position);
+    if (h1 > h0) {
+      const size_t n = size_t(h1 - h0);
+      CK(cudaMemcpyAsync(static_cast<uint8_t*>(kb.vk) + size_t(h0) * kb.row, kb.k_page + size_t(h0) * kb.row,
+                         n * kb.row, cudaMemcpyHostToDevice, s));
+      CK(cudaMemcpyAsync(static_cast<uint8_t*>(kb.vv) + size_t(h0) * kb.row, kb.v_page + size_t(h0) * kb.row,
+                         n * kb.row, cudaMemcpyHostToDevice, s));
+      if (kb.ks_page) {
+        const size_t sb = n * size_t(kb.nkv) * sizeof(float);
+        CK(cudaMemcpyAsync(kb.vks, kb.ks_page + size_t(h0) * kb.nkv, sb, cudaMemcpyHostToDevice, s));
+        CK(cudaMemcpyAsync(kb.vvs, kb.vs_page + size_t(h0) * kb.nkv, sb, cudaMemcpyHostToDevice, s));
+      }
+    }
+    KvStageScales sc;
+    if (kb.ks_page)
+      sc = {kb.ks, kb.vs, kb.scales_from(kb.vks, kb.device_positions), kb.scales_from(kb.vvs, kb.device_positions),
+            kb.nkv};
+    kv_stage_ring(kb.k, kb.vk, kb.v, kb.vv, kb.row, kb.device_positions, kb.page_ring,
+                  std::max(kb.device_positions, position), kb.staged_cap(), P, 0, 0, kStageAll, kStageBlocksAll, s, sc);
+    return;
+  }
   kb.stage(P, 0, 0, kStageAll, kStageBlocksAll, s);
 }
 
@@ -610,31 +822,115 @@ void flyx_seq::release_prefill_pool() {
   if (bm->prefill_owner == this) bm->prefill_owner = nullptr;
 }
 
-void flyx_seq::release_mapped() {
-  if (mapped.empty() && staging.empty()) return;
-  const Vmm& v = vmm();
-  if (st) cudaStreamSynchronize(st);
-  for (const Mapped& m : mapped)
-    for (unsigned long long va : {m.va, m.view}) {
-      if (!va) continue;
-      if (m.dev) v.unmap(CUdeviceptr(va), m.dev);
-      if (va == m.view)  // its staging, piece by piece
-        for (size_t o = m.dev; o < m.dev + m.stage; o += v.gran) v.unmap(CUdeviceptr(va) + o, v.gran);
-      else
-        v.unmap(CUdeviceptr(va) + m.dev, m.bytes - m.dev);
-      v.address_free(CUdeviceptr(va), m.bytes);
+void flyx_seq::flush_page_prefill(int start, int n) {
+  if (page_layers.empty() || n <= 0) return;
+  for (int idx : page_layers) {
+    const KvBuf& b = kv[size_t(idx)];
+    const int lo = std::max(b.device_positions, start);
+    const int hi = start + n;
+    if (lo >= hi) continue;
+    const int tail = b.page_ring - b.device_positions;
+    for (int p = lo; p < hi;) {
+      const int slot = b.device_positions + (p - b.device_positions) % tail;
+      const int chunk = std::min(hi - p, b.page_ring - slot);
+      CK(cudaMemcpyAsync(b.k_page + size_t(p) * b.row, static_cast<const uint8_t*>(b.k) + size_t(slot) * b.row,
+                         size_t(chunk) * b.row, cudaMemcpyDeviceToHost, st));
+      CK(cudaMemcpyAsync(b.v_page + size_t(p) * b.row, static_cast<const uint8_t*>(b.v) + size_t(slot) * b.row,
+                         size_t(chunk) * b.row, cudaMemcpyDeviceToHost, st));
+      if (b.ks_page) {
+        const size_t sb = size_t(chunk) * size_t(b.nkv) * sizeof(float);
+        CK(cudaMemcpyAsync(b.ks_page + size_t(p) * b.nkv, b.ks + size_t(slot) * b.nkv, sb, cudaMemcpyDeviceToHost, st));
+        CK(cudaMemcpyAsync(b.vs_page + size_t(p) * b.nkv, b.vs + size_t(slot) * b.nkv, sb, cudaMemcpyDeviceToHost, st));
+      }
+      p += chunk;
     }
-  for (const Mapped& m : mapped)
-    for (auto h : m.handles)
-      if (h) v.release(CUmemGenericAllocationHandle(h));
-  if (pool_va) {
-    for (size_t o = 0; o < pool_bytes; o += v.gran) v.unmap(CUdeviceptr(pool_va) + o, v.gran);
-    v.address_free(CUdeviceptr(pool_va), pool_bytes);
   }
-  for (unsigned long long h : pool_pieces) v.release(CUmemGenericAllocationHandle(h));
-  pool_pieces.clear();
-  shared_prefill.reset();
-  pool_va = 0;
-  mapped.clear();
-  staging.clear();
+}
+
+void flyx_seq::drain_page_host(unsigned long long seq, int pos, int n_tokens) {
+  if (page_layers.empty() || n_tokens <= 0) return;
+  const int rslot = int(seq % kRing);
+  const int max_rows = m->wide_rows;
+  for (size_t li = 0; li < page_layers.size(); ++li) {
+    const KvBuf& b = kv[size_t(page_layers[li])];
+    const PageDrainLayer& dl = page_drain_host[li];
+    for (int r = 0; r < n_tokens; ++r) {
+      const int p = pos - n_tokens + r;
+      if (p < b.device_positions) continue;
+      const size_t src_row = size_t(rslot) * size_t(max_rows) + size_t(r);
+      std::memcpy(b.k_page + size_t(p) * b.row, dl.drain_k_host + src_row * b.row, b.row);
+      std::memcpy(b.v_page + size_t(p) * b.row, dl.drain_v_host + src_row * b.row, b.row);
+      if (b.ks_page) {
+        const size_t sb = size_t(b.nkv) * sizeof(float);
+        std::memcpy(b.ks_page + size_t(p) * b.nkv, dl.drain_ks_host + src_row * b.nkv, sb);
+        std::memcpy(b.vs_page + size_t(p) * b.nkv, dl.drain_vs_host + src_row * b.nkv, sb);
+      }
+    }
+  }
+}
+
+void flyx_seq::reload_page_ring(int pos) {
+  if (page_layers.empty() || pos <= 0) return;
+  for (int idx : page_layers) {
+    const KvBuf& b = kv[size_t(idx)];
+    const int tail = b.page_ring - b.device_positions;
+    const int lo = std::max(b.device_positions, pos - tail);
+    const int hi = pos;
+    if (lo >= hi) continue;
+    for (int p = lo; p < hi;) {
+      const int slot = b.device_positions + (p - b.device_positions) % tail;
+      const int chunk = std::min(hi - p, b.page_ring - slot);
+      CK(cudaMemcpyAsync(static_cast<uint8_t*>(b.k) + size_t(slot) * b.row, b.k_page + size_t(p) * b.row,
+                         size_t(chunk) * b.row, cudaMemcpyHostToDevice, st));
+      CK(cudaMemcpyAsync(static_cast<uint8_t*>(b.v) + size_t(slot) * b.row, b.v_page + size_t(p) * b.row,
+                         size_t(chunk) * b.row, cudaMemcpyHostToDevice, st));
+      if (b.ks_page) {
+        const size_t sb = size_t(chunk) * size_t(b.nkv) * sizeof(float);
+        CK(cudaMemcpyAsync(b.ks + size_t(slot) * b.nkv, b.ks_page + size_t(p) * b.nkv, sb, cudaMemcpyHostToDevice, st));
+        CK(cudaMemcpyAsync(b.vs + size_t(slot) * b.nkv, b.vs_page + size_t(p) * b.nkv, sb, cudaMemcpyHostToDevice, st));
+      }
+      p += chunk;
+    }
+  }
+}
+
+void flyx_seq::release_mapped() {
+  if (st) cudaStreamSynchronize(st);
+  if (!mapped.empty() || !staging.empty()) {
+    const Vmm& v = vmm();
+    for (const Mapped& m : mapped) {
+      if (m.va) {
+        if (m.dev) v.unmap(CUdeviceptr(m.va), m.dev);
+        if (m.va_bytes > m.dev) v.unmap(CUdeviceptr(m.va) + m.dev, m.va_bytes - m.dev);
+        v.address_free(CUdeviceptr(m.va), m.va_bytes);
+      }
+      if (m.view) {
+        if (m.dev) v.unmap(CUdeviceptr(m.view), m.dev);
+        for (size_t o = m.dev; o < m.dev + m.stage; o += v.gran) v.unmap(CUdeviceptr(m.view) + o, v.gran);
+        v.address_free(CUdeviceptr(m.view), m.bytes);
+      }
+    }
+    for (const Mapped& m : mapped)
+      for (auto h : m.handles)
+        if (h) v.release(CUmemGenericAllocationHandle(h));
+    if (pool_va) {
+      for (size_t o = 0; o < pool_bytes; o += v.gran) v.unmap(CUdeviceptr(pool_va) + o, v.gran);
+      v.address_free(CUdeviceptr(pool_va), pool_bytes);
+    }
+    for (unsigned long long h : pool_pieces) v.release(CUmemGenericAllocationHandle(h));
+    pool_pieces.clear();
+    shared_prefill.reset();
+    pool_va = 0;
+    mapped.clear();
+    staging.clear();
+  }
+  for (const auto& [p, bytes] : pageable_allocs) {
+#if defined(_WIN32)
+    (void)bytes;
+    VirtualFree(p, 0, MEM_RELEASE);
+#else
+    munmap(p, bytes);
+#endif
+  }
+  pageable_allocs.clear();
 }

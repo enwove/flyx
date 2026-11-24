@@ -101,6 +101,7 @@ int main() {
   test_strata(128, 16, 4, 5, 500, 3, false);   // head dim 128
   test_strata(64, 8, 2, 3, 300, 3, true);      // head dim 64 (the layout's shared words)
   test_strata(32, 4, 2, 5, 100, 3, false);     // the tiny model's
+  test_pageable_kv_ops();
   // Every head dim the kernels take (the backend loads no other): decode, a prefill chunk on the tensor cores, and
   // the same with an FP8 cache.
   for (int hd = 32; hd <= 256; hd += 32)
