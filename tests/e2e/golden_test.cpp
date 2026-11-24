@@ -4018,10 +4018,11 @@ int main(int argc, char** argv) {
 
     // A request that goes on past the end of its reply (ignore_eos: a measurement's fixed number of tokens) under a
     // grammar.  The grammar holds the reply to its end, the stop token it ends with included, and nothing after
-    // it: the matcher has ended there and is not asked about the tokens that follow.  With and without drafts.
+    // it: the matcher has ended there and is not asked about the tokens that follow, nor for a mask where every
+    // round's first token is masked (the reference).  With and without drafts.
     {
       const std::string tag = R"({"type": "structural_tag", "format": {"type": "const_string", "value": "a"}})";
-      auto run = [&](Engine* e) {
+      auto run = [&](Engine* e, bool reference = false) {
         std::string gerr;
         auto m = e->grammar().matcher(tag, &gerr);
         std::vector<int32_t> toks;
@@ -4034,6 +4035,7 @@ int main(int argc, char** argv) {
         rq.max_new_tokens = 24;
         rq.ignore_eos = true;
         rq.grammar = m.get();
+        rq.grammar_reference = reference;
         Session s(e);
         init_checked(s);
         GenerateResult res;
@@ -4044,12 +4046,12 @@ int main(int argc, char** argv) {
           check(false, "generate past a grammar's end: " + err);
         return toks;
       };
-      const auto a = run(plain.get()), b = run(spec.get()), m = run(mtp.get());
+      const auto a = run(plain.get()), b = run(spec.get()), m = run(mtp.get()), ref = run(plain.get(), true);
       const auto& eos = plain->eos();
       check(a.size() == 24 && plain->tokenizer().token_bytes(a[0]) == "a" &&
-                std::find(eos.begin(), eos.end(), a[1]) != eos.end() && b == a && m == a,
+                std::find(eos.begin(), eos.end(), a[1]) != eos.end() && b == a && m == a && ref == a,
             "grammar, past the reply's end (ignore_eos): the reply, its stop token, then tokens nothing holds; "
-            "plain, DFlash2 and MTP: " + str(a, 6));
+            "plain, DFlash2, MTP and every round masked: " + str(a, 6));
     }
 
     // Drafts looked up in the sequence itself: text that

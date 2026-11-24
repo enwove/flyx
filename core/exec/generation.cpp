@@ -419,6 +419,8 @@ bool Generation::finish_prefill() {
 
 void Generation::prepare_round(const RoundChoice& round, bool masked, flyx_gen_params* params, flyx_plan** plan) {
   *params = g_;
+  // No mask once the reply the grammar holds has ended (rejected()): its matcher has none to give.
+  masked = masked && !grammar_over_;
   if (masked) {
     req_.grammar->allowed(mask_.data());
     params->mask = mask_.data();
