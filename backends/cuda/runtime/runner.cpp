@@ -132,6 +132,17 @@ void copy_checkpoint_state(flyx_seq* s, int c, int sl, int pos, bool save, bool 
   }
 }
 
+// Before the shared prefill slab goes to another borrower: its owner's copy goes home, and prefill_ev marks the
+// end of that copy on the owner's stream for the borrower to wait on.  Under prefill_mu.
+void save_prefill_owner(flyx_bmodel* m) {
+  flyx_seq* prev = m->prefill_owner;
+  if (prev && prev->uses_shared_prefill()) {
+    prev->copy_home(false);
+    prev->prefill_clobbered = true;
+    CK(cudaEventRecord(m->prefill_ev, prev->st));
+  }
+}
+
 }  // namespace
 
 
@@ -350,15 +361,8 @@ int prefill_ex(flyx_plan* p, flyx_seq* s, const flyx_prefill_input* in, const fl
     // Borrow the model's prefill buffers for this pass: after any previous prefill or strata session using the slab.
     auto* m = const_cast<flyx_bmodel*>(s->m);
     std::lock_guard<std::mutex> lock(m->prefill_mu);
-    if (m->prefill_owner) {
-      flyx_seq* prev = m->prefill_owner;
-      if (prev->uses_shared_prefill()) {
-        prev->copy_home(false);
-        prev->prefill_clobbered = true;
-        CK(cudaEventRecord(m->prefill_ev, prev->st));
-      }
-      m->prefill_owner = nullptr;
-    }
+    save_prefill_owner(m);
+    m->prefill_owner = nullptr;
     CK(cudaStreamWaitEvent(s->st, m->prefill_ev, 0));
     if (m->prefill_dirty && m->prefill_zero_ptr && m->prefill_zero_bytes > 0) {
       CK(cudaMemsetAsync(m->prefill_zero_ptr, 0, m->prefill_zero_bytes, s->st));
@@ -708,15 +712,8 @@ int encode_vision(flyx_plan* p, const flyx_vision_input* in, float* out_embeds, 
     void* prefill_base = m->prefill_va ? reinterpret_cast<void*>(m->prefill_va)
                                        : (!m->prefill_allocs.empty() ? m->prefill_allocs[0] : nullptr);
     auto claim_prefill = [&]() {
-      if (m->prefill_owner) {
-        flyx_seq* prev = m->prefill_owner;
-        if (prev->uses_shared_prefill()) {
-          prev->copy_home(false);
-          prev->prefill_clobbered = true;
-          CK(cudaEventRecord(m->prefill_ev, prev->st));
-        }
-        m->prefill_owner = nullptr;
-      }
+      save_prefill_owner(m);
+      m->prefill_owner = nullptr;
       if (m->prefill_ev) CK(cudaStreamWaitEvent(sg.st, m->prefill_ev, 0));
       if (dma_sg.st && m->prefill_ev) CK(cudaStreamWaitEvent(dma_sg.st, m->prefill_ev, 0));
       m->prefill_dirty = true;
@@ -1229,14 +1226,7 @@ void copy_for(flyx_seq* s, int strata, int rows, bool allow_prefill_pool = true,
     if (!prefill_locked) lock.lock();
     if (want_dev) {
       if (m->prefill_owner != s) {
-        if (m->prefill_owner) {
-          flyx_seq* prev = m->prefill_owner;
-          if (prev->uses_shared_prefill()) {
-            prev->copy_home(false);
-            prev->prefill_clobbered = true;
-            CK(cudaEventRecord(m->prefill_ev, prev->st));
-          }
-        }
+        save_prefill_owner(m);
         CK(cudaStreamWaitEvent(s->st, m->prefill_ev, 0));
         m->prefill_owner = s;
       }
