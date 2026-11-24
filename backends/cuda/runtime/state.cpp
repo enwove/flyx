@@ -117,7 +117,8 @@ void alloc_rows(const flyx_bmodel* m, int R, bool prefill, RowBufs* b, Alloc&& a
 
     const size_t q_off = align_f(size_t(R) * n.q);
     const size_t part_span = align_f(part);
-    const size_t split_st = size_t(std::min(R, FLYX_MAX_ROWS)) * n.split_state;
+    // Windowed split attention's state of a round's rows, twice: read from one, written to the other (SplitWindow).
+    const size_t split_st = 2 * size_t(std::min(R, FLYX_MAX_ROWS)) * n.split_state;
     const size_t attn_aux = std::max(size_t(R) * n.attn_state, part_span + split_st);
     const size_t slot_b = std::max({size_t(R) * H, size_t(R) * n.gdn_o, q_off + attn_aux});
     float* base_b = f(slot_b);

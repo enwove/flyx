@@ -1325,9 +1325,15 @@ void test_pageable_kv_ops() {
 
   // Windowed attention_split (SplitWindow): must reproduce single-pass attention_split bit-for-bit across
   // k_attention_gqa, k_attention_rows_mma (and mixed rows across rows_mma_from), and per-head k_attention.
-  {
-    const int hd = 128, nh = 8, nkv = 2, rows = 9, ctx = 400, cap = ctx + rows + 16, splits = 8;
-    const int from = 64, win_len = 64, end = ctx + rows;
+  // A row's splits are 128 keys at ctx 400 (each window inside one split), 96 at 280 and 160 at 1100, where a split
+  // ends inside a window: the split before it reads the state the launch before left while the one after it leaves
+  // its own, two blocks of one launch; and windows of 384 keys at 1100, which hold a whole split between those two.
+  struct WindowCase {
+    int ctx, win_len;
+  };
+  for (const WindowCase wc : {WindowCase{400, 64}, WindowCase{280, 64}, WindowCase{1100, 64}, WindowCase{1100, 384}}) {
+    const int hd = 128, nh = 8, nkv = 2, rows = 9, ctx = wc.ctx, cap = ctx + rows + 16, splits = 8;
+    const int from = 64, win_len = wc.win_len, end = ctx + rows;
     const float scale = float(1.0 / std::sqrt(hd));
     const Vec q = randv(size_t(rows) * nh * hd), gate = randv(size_t(rows) * nh * hd);
     Vec Kc = randv(size_t(cap) * nkv * hd), Vc = randv(size_t(cap) * nkv * hd);
@@ -1336,7 +1342,8 @@ void test_pageable_kv_ops() {
     float* dq = up(q);
     float* dgate = up(gate);
     float* part = dev<float>(attention_partial_floats(rows, nh, hd, splits));
-    float* split_st = dev<float>(size_t(rows) * nh * kSplitStateFloats(hd));
+    const size_t plane = size_t(rows) * nh * kSplitStateFloats(hd);  // read from one, written to the other
+    float* split_st = dev<float>(2 * plane);
     float* dref = dev<float>(size_t(rows) * nh * hd);
     float* dgot = dev<float>(size_t(rows) * nh * hd);
     DevParams* P = params(ctx);
@@ -1405,15 +1412,21 @@ void test_pageable_kv_ops() {
         CK(cudaMemcpy(ref_bits.data(), dref, ref_bits.size() * sizeof(float), cudaMemcpyDeviceToHost));
 
         CK(cudaMemset(part, 0xaa, attention_partial_floats(rows, nh, hd, splits) * sizeof(float)));
-        CK(cudaMemset(split_st, 0x55, size_t(rows) * nh * kSplitStateFloats(hd) * sizeof(float)));
+        CK(cudaMemset(split_st, 0x55, 2 * plane * sizeof(float)));
         CK(cudaMemset(dgot, 0, size_t(rows) * nh * hd * sizeof(float)));
         SplitWindow sw;
-        sw.state = split_st;
+        int launches = 0;
+        auto swap_state = [&] {  // as regions/layers.cpp attn_windows does before every launch
+          sw.state = split_st + size_t(launches & 1) * plane;
+          sw.carry = split_st + size_t((launches + 1) & 1) * plane;
+          ++launches;
+        };
         // First window: device prefix [0, from).
         sw.k_lo = 0;
         sw.k_hi = from;
         sw.first = true;
         sw.last = false;
+        swap_state();
         attention_split(dq, full, nh, nkv, hd, rows, true, 0, scale, P, dgate, nh * hd, dgot, nh * hd, part, splits, L,
                         0, 0, nullptr, {}, sw);
         sw.first = false;
@@ -1436,13 +1449,14 @@ void test_pageable_kv_ops() {
           sw.k_lo = w0;
           sw.k_hi = w1;
           sw.last = (wi + 1 == nwin);
+          swap_state();
           attention_split(dq, wkv, nh, nkv, hd, rows, true, 0, scale, P, dgate, nh * hd, dgot, nh * hd, part, splits, L,
                           0, 0, nullptr, {}, sw);
         }
         CK(cudaMemcpy(got_bits.data(), dgot, got_bits.size() * sizeof(float), cudaMemcpyDeviceToHost));
         const bool ok_sw = (got_bits == ref_bits);
-        std::printf("  %-4s SplitWindow bit-identical (%s, %s)\n", ok_sw ? "ok" : "FAIL", md.name,
-                    fp8 ? "fp8" : "binary16");
+        std::printf("  %-4s SplitWindow bit-identical (%s, %s, %d keys, windows of %d)\n", ok_sw ? "ok" : "FAIL",
+                    md.name, fp8 ? "fp8" : "binary16", ctx, win_len);
         g_fail += !ok_sw;
       }
       for (void* p : std::initializer_list<void*>{dK, dV, dKw, dVw, dKs, dVs, dKsw, dVsw})

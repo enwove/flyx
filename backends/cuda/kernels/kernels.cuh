@@ -930,12 +930,17 @@ const double* rope_table(double theta, int rot_dim);
 // probabilities rounded to binary16 like the caches, fp32 accumulation).
 // attention_flash returns false when the head dim is not supported.
 // Windowed split-K attention across staging windows [k_lo, k_hi) (k_lo a multiple of kFlashWindowAlign): carries the
-// in-flight split's warp state across window boundaries in `state` (at most one split per (row, head) straddles any
-// boundary) so pageable short prefills (rows <= FLYX_MAX_ROWS) reproduce single-pass attention_split bit-for-bit.
+// in-flight split's warp state across window boundaries (at most one split per (row, head) straddles any boundary) so
+// pageable short prefills (rows <= FLYX_MAX_ROWS) reproduce single-pass attention_split bit-for-bit.  A launch has two
+// boundaries: the split that began before k_lo reads what the launch before left, and the split that goes on past
+// k_hi leaves its own.  Where a split ends inside the window these are two blocks of one launch, running in no
+// order, so what is read (`carry`) and what is written (`state`) are two buffers, which the caller swaps from one
+// launch to the next.
 __host__ __device__ constexpr int kSplitStateFloats(int hd) { return 4 * (hd + 40); }
 struct SplitWindow {
   int k_lo = 0, k_hi = INT_MAX;
-  float* state = nullptr;  // [rows][nh][kSplitStateFloats(hd)]
+  float* state = nullptr;        // [rows][nh][kSplitStateFloats(hd)]: written by the split that goes on past k_hi
+  const float* carry = nullptr;  // the same of the launch before, read by the split that began before k_lo (k_lo > 0)
   bool first = true, last = true;
 };
 void attention_split(const float* q, const kv16* Kc, const kv16* Vc, int nh, int nkv, int hd, int rows, bool causal,

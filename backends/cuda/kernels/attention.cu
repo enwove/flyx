@@ -324,7 +324,7 @@ __global__ void __launch_bounds__(128) k_attention(const float* q, const kv16* K
   }
   if constexpr (RT == 1 && !CANVAS) {
     if (sw.state && orig_ks < sw.k_lo) {
-      const float* wp = sw.state + (size_t(r0) * nh + h) * kSplitStateFloats(HD) + warp * (HD + 40);
+      const float* wp = sw.carry + (size_t(r0) * nh + h) * kSplitStateFloats(HD) + warp * (HD + 40);
       m[0] = wp[0];
       l[0] = wp[1];
 #pragma unroll
@@ -515,7 +515,7 @@ __global__ void __launch_bounds__(128) k_attention_gqa(const float* __restrict__
     if (sw.state && orig_ks < sw.k_lo) {
 #pragma unroll
       for (int qi = 0; qi < QN; ++qi) {
-        const float* wp = sw.state + (size_t(r0) * nh + kvh * G + qi) * kSplitStateFloats(HD) + warp * (HD + 40);
+        const float* wp = sw.carry + (size_t(r0) * nh + kvh * G + qi) * kSplitStateFloats(HD) + warp * (HD + 40);
         m[qi] = wp[0];
         lp[qi] = wp[1 + lane];
 #pragma unroll

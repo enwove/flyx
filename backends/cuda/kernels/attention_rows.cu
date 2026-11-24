@@ -230,7 +230,7 @@ __global__ void __launch_bounds__(32 * kMaxWarps) k_attention_rows_mma(
 #pragma unroll
     for (int j = 0; j < 2; ++j) {
       if (!cok[j]) continue;
-      const float* hp = sw.state + (size_t(r0) * nh + kvh * G + whead + 2 * t + j) * kSplitStateFloats(HD);
+      const float* hp = sw.carry + (size_t(r0) * nh + kvh * G + whead + 2 * t + j) * kSplitStateFloats(HD);
       m[j] = hp[0];
       l[j] = hp[2 + g];
 #pragma unroll
@@ -241,7 +241,7 @@ __global__ void __launch_bounds__(32 * kMaxWarps) k_attention_rows_mma(
     if constexpr (FP8) {
       int v_load = INT_MIN;
       if (cok[0]) {
-        const float* hp = sw.state + (size_t(r0) * nh + kvh * G + whead + 2 * t) * kSplitStateFloats(HD);
+        const float* hp = sw.carry + (size_t(r0) * nh + kvh * G + whead + 2 * t) * kSplitStateFloats(HD);
         v_load = reinterpret_cast<const int*>(hp)[1];
       }
       ve = __shfl_sync(0xffffffffu, v_load, 0);

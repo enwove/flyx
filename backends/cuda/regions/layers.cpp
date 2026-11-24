@@ -382,17 +382,25 @@ void attn_windows(const Pass& ps, const AttnBlock& a, const KvBuf& kb, int windo
   const float scale = 1.f / std::sqrt(float(hd));
   const float* gate = a.gate ? rv.b.proj + nh * hd : nullptr;
   const int from = s->window_from(kb), len = s->window_len(kb), end = s->position + R;
-  if (R <= FLYX_MAX_ROWS || s->m->opt.kernels.attention == kAttnSplit) {
+  // A pass of a round's rows or fewer (pageable caches only: windows() gives the others none) takes a round's
+  // kernels, as it does without windows; attention=split has no windows at all (alloc_state).
+  if (R <= FLYX_MAX_ROWS) {
     if (!rv.b.split_state) throw std::logic_error("cuda: prefill split window state buffer missing");
+    // Two buffers of the rows' state, read and written in turn: a launch reads what the one before left
+    // (SplitWindow::carry) while another of its blocks writes what the next will read.
+    float* const planes[2] = {rv.b.split_state, rv.b.split_state + size_t(R) * s->m->need.split_state};
     SplitWindow sw;
-    sw.state = rv.b.split_state;
+    int launches = 0;
     auto run = [&](const KvRef& kv, int k_lo, int k_hi, bool last) {
       sw.k_lo = k_lo;
       sw.k_hi = k_hi;
       sw.last = last;
+      sw.state = planes[launches & 1];
+      sw.carry = planes[(launches + 1) & 1];
       attention_split(rv.b.qbuf, kv, nh, nkv, hd, R, true, 0, scale, s->P, gate, rv.ld_proj, out, ld_out, rv.b.part,
                       kPrefillSplits, rv.L, 0, 0, nullptr, {}, sw);
       sw.first = false;
+      ++launches;
     };
     if (from > 0) run(kb.ref(), 0, from, false);
     for (int i = 0; i < windows; ++i) {

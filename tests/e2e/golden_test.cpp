@@ -1620,6 +1620,16 @@ void strata_rounds(const std::string& model, const std::string& backend, const s
                   spg == spin,
               std::string("pageable_kv=on, ") + method + (fp8 ? ", fp8" : ", binary16") +
                   ": short-tail windowed prefill matches pinned tokens and logits bit-for-bit; MTP/DFlash2 match");
+        // The same with tails of 273 to 280 keys, whose splits are 96 keys: one ends inside a window of 64, and that
+        // launch holds both the split that reads the state the launch before left and the one that leaves its own.
+        std::vector<float> xpin, xpg, xmtp, xdf;
+        const int inner = 272 - N / 2;
+        const auto xtpin = turns(pinned.get(), &xpin, inner, 8), xtpg = turns(paged.get(), &xpg, inner, 8),
+                   xtmtp = turns(paged_mtp.get(), &xmtp, inner, 8), xtdf = turns(paged_df.get(), &xdf, inner, 8);
+        check(xtpg.size() == size_t(N / 2) * 2 && xtpg == xtpin && xtmtp == xtpg && xtdf == xtpg && !xpg.empty() &&
+                  xpg == xpin,
+              std::string("pageable_kv=on, ") + method + (fp8 ? ", fp8" : ", binary16") +
+                  ": short-tail windowed prefill with a split ending inside a window matches pinned bit-for-bit");
         // Budget contract (AGENTS.md): under finite WDDM auto budget even when a single session uses <25% of it
         // (picking 0 pageable layers at seq_size()), seq_size() must still bound full-spill VRAM and host memory.
         auto auto_big = make(model, backend, false, "", fp8, base + ",pageable_kv=auto,pinned_host_mb=8192", false,
