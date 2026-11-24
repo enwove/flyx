@@ -145,23 +145,17 @@ bool Generation::start() {
   // fresh prefill would reproduce it bit for bit (numerics.md: K); a
   // checkpoint at a message boundary keeps the boundary before it.
   const int align = e_->prefill_align();
-  // A boundary at the prompt's very end: a template that opens the reply with nothing of its own (Inkling-2's), so
-  // that the conversation ends where the prompt does.  The same prompt asked again (a retry, another sample) runs its
-  // last token again to choose a first token of its own (Session::prepare), so the state to keep is the one before
-  // that token; with none kept there such a request computed its whole prompt again (6,303 tokens: 2.9 s, against
-  // 23 ms from the kept state).  A backend with no alignment keeps no state inside a pass, so this one costs a pass
-  // of its own for the last token (50 ms on Inkling-2-Mini): only where the prompt takes more than one pass anyway.
-  // A shorter one asked again costs less than that pass would cost every request.
-  const bool passes = n_ - reused > e_->prefill_chunk();
-  auto cut_at = [&](int32_t at) { return (passes ? std::min<int32_t>(at, n_ - 1) : at) / align * align; };
   for (int32_t at : req_.checkpoints) {
-    at = cut_at(at);
+    // A boundary at the prompt's very end: a template that opens the reply with nothing of its own (Inkling-2's), so
+    // that the conversation ends where the prompt does.  No pass is cut there; prefill() keeps the last pass's start.
+    if (at == n_) ends_at_boundary_ = true;
+    at = at / align * align;
     if (at > reused && at < n_ && !vision::inside_media_span(req_.media_spans, at)) cuts_.push_back(at);
   }
   std::sort(cuts_.begin(), cuts_.end());
   cuts_.erase(std::unique(cuts_.begin(), cuts_.end()), cuts_.end());
   if (cuts_.size() > 2) cuts_.erase(cuts_.begin(), cuts_.end() - 2);
-  keep_ = req_.keep_checkpoint >= 0 ? cut_at(req_.keep_checkpoint) : -1;
+  keep_ = req_.keep_checkpoint >= 0 ? req_.keep_checkpoint / align * align : -1;
   if (keep_ >= 0 && vision::inside_media_span(req_.media_spans, keep_)) keep_ = -1;
   pos_ = reused;
   phase_ = Phase::kPrefill;
@@ -211,15 +205,23 @@ bool Generation::prefill() {
       anchor = Session::Anchor::Prefix;
   }
   // An identical follow-up must run its last token to choose its own first output. If the end checkpoint
-  // would include that token, keep the preceding prefill pass boundary. Before the first pass, the reused
+  // would include that token, keep the preceding prefill pass boundary: for a prompt only prefilled, and for one whose
+  // conversation ends where it does (ends_at_boundary_), which has no boundary before its end for the same prompt
+  // asked again (a retry, another sample) to start from; that request computed its whole prompt once the reply had
+  // left the rollback window (6,303 tokens on Inkling-2-Mini: 2.9 s). It now runs this last pass again, the rows that
+  // ran here, so its first token is computed as this one's was. Before the first pass, the reused
   // state can come directly from decode and must not become a restorable prefill checkpoint.
   const bool last = end == n_;
-  const bool before_last = req_.prefill_only && last && n_ % align == 0 && pos_ > result_.usage.reused_tokens;
+  const bool before_last = (req_.prefill_only || ends_at_boundary_) && last && n_ % align == 0 &&
+                           pos_ > result_.usage.reused_tokens;
   if (checkpoint_due_ || anchor != Session::Anchor::None || before_last) {
     if (!vision::inside_media_span(req_.media_spans, pos_)) {
       s_->advanced(prompt, pos_, media);
       const bool share = pos_ <= req_.share_system_prefix && req_.share_system_prefix < end;
-      s_->take_checkpoint(prompt, pos_, checkpoint_due_ && due_keep_, anchor, share, media);
+      // The question's checkpoint, kept through the tool calls that follow it: the cut at its end, or this pass's
+      // start for a question that ends where the prompt does.
+      const bool keep = (checkpoint_due_ && due_keep_) || (before_last && keep_ == n_);
+      s_->take_checkpoint(prompt, pos_, keep, anchor, share, media);
     } else if (checkpoint_due_ && crossed_cut_ >= 0) {
       // Pass ended inside a MediaSpan, but its intra-pass snapshot sits at crossed_cut_ (outside any span).
       s_->take_checkpoint(prompt, pos_, due_keep_, anchor, false, media);

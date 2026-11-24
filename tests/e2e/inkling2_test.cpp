@@ -870,39 +870,50 @@ int main(int argc, char** argv) {
           "cpu_ref DSpark sampled+penalties == cpu_ref plain");
 
     // A prompt asked again, its conversation ending where the prompt does (the real template opens a reply with
-    // nothing of its own): the session kept the state before the prompt's last token, and reuses all the rest.  Eight
-    // rounds later no rollback reaches it (FLYX_ROUND_SLOTS), and the prompt is longer than a prefill pass.
+    // nothing of its own): the session kept the state its last prefill pass started from, and runs that pass again.
+    // Eight rounds later no rollback reaches the prompt (FLYX_ROUND_SLOTS).  The boundary gives the first request no
+    // pass of its own and moves none: its passes are those of a request that names no boundary (32 rows, then 24),
+    // so its first token is computed as theirs is, and the one asked again computes it from the same 24 rows.
     {
       std::vector<int32_t> longer;
-      for (int i = 0; i < 48; ++i) longer.push_back(10 + (i * 11) % 240);
+      for (int i = 0; i < 56; ++i) longer.push_back(10 + (i * 11) % 240);
       auto e = load_engine(bf16_gguf.string(), backend);
-      Session s(e.get());
-      std::string serr;
-      if (!s.init(&serr)) throw std::runtime_error("session init: " + serr);
-      auto ask = [&](int* reused) {
+      struct Asked {
+        std::vector<int32_t> tokens;
+        std::vector<int> passes;  // the prompt tokens in the state as the request starts, then after each pass
+        int reused = -1;
+      };
+      auto ask = [&](Session& s, bool boundary) {
+        Asked a;
         GenerateRequest req;
         req.prompt = longer;
         req.max_new_tokens = 8;
         req.ignore_eos = true;
-        req.checkpoints = {int32_t(longer.size())};
+        if (boundary) req.checkpoints = {int32_t(longer.size())};
+        if (boundary) req.keep_checkpoint = int32_t(longer.size());
+        req.on_prefill = [&](int done, int) { a.passes.push_back(done); };
         GenerateResult res;
-        std::vector<int32_t> out;
+        std::string gerr;
         if (generate(s, req,
                      [&](std::string_view, const int32_t* ids, int cnt) {
-                       out.insert(out.end(), ids, ids + cnt);
+                       a.tokens.insert(a.tokens.end(), ids, ids + cnt);
                        return true;
                      },
-                     &res, &serr) != 0)
-          throw std::runtime_error("generate: " + serr);
-        *reused = res.usage.reused_tokens;
-        return out;
+                     &res, &gerr) != 0)
+          throw std::runtime_error("generate: " + gerr);
+        a.reused = res.usage.reused_tokens;
+        return a;
       };
-      int cold = -1, warm = -1;
-      const auto first = ask(&cold), again = ask(&warm);
-      check(cold == 0 && warm == int(longer.size()) - 1 && same_tokens(again, first) &&
-                same_tokens(first, fresh_gen(*e, longer, 8)),
-            "a prompt asked again reuses all but its last token (" + std::to_string(warm) + " of " +
-                std::to_string(longer.size()) + "), the same tokens (" + backend + ")");
+      Session s(e.get()), bare(e.get());
+      std::string serr;
+      if (!s.init(&serr) || !bare.init(&serr)) throw std::runtime_error("session init: " + serr);
+      const Asked first = ask(s, true), again = ask(s, true), unmarked = ask(bare, false);
+      check(first.reused == 0 && first.passes == std::vector<int>{0, 32, 56} && unmarked.passes == first.passes &&
+                same_tokens(first.tokens, unmarked.tokens),
+            "a boundary at the prompt's end adds no prefill pass and moves none (" + backend + ")");
+      check(again.reused == 32 && again.passes == std::vector<int>{32, 56} && same_tokens(again.tokens, first.tokens),
+            "a prompt asked again runs its last pass again (" + std::to_string(again.reused) + " of " +
+                std::to_string(longer.size()) + " reused), the same tokens (" + backend + ")");
     }
 
     if (backend == "cuda") {

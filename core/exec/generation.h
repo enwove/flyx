@@ -218,6 +218,7 @@ class Generation {
   size_t cut_ = 0;
   int pos_ = 0;                    // prompt tokens given to the device
   int keep_ = -1;                  // the cut whose checkpoint is kept
+  bool ends_at_boundary_ = false;  // a requested checkpoint is the prompt's end: the last pass's start is kept for it
   bool checkpoint_due_ = false;    // the pass in flight ends at a cut, or crosses one: its checkpoint, once it has run
   int crossed_cut_ = -1;           // when >= 0, the intra-pass cut that checkpoint_due_ will capture
   bool due_keep_ = false;          // that checkpoint is the kept one (keep_)
