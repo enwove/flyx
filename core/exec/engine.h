@@ -59,9 +59,10 @@ struct EngineOptions {
   std::string mmproj_file;
   // Disable loading any vision encoder even if mmproj weights are present (--no-vision).
   bool vision = true;
-  // Where vision encoder weights live: "host" (default: pinned host RAM, 0 bytes resident VRAM,
-  // double-buffered DMA streamed to GPU), "gpu" (resident in GPU VRAM), or "auto" (GPU if >= 8 GB free).
-  std::string vision_device = "host";
+  // Where vision encoder weights live: "disk" (default: auto-deleted temp file on disk, 0 bytes VRAM & 0 bytes
+  // locked host RAM, 3-stage streamed via OS page cache), "host" (pinned host RAM, 0 VRAM), "gpu" (GPU resident),
+  // or "auto" (GPU if >= 8 GB free after weights, else disk).
+  std::string vision_device = "disk";
   // On-the-fly quantization of floating-point vision linear weights: "q8" (default: Q8_0, ~46% smaller),
   // "exact" (keep file BF16/F16/F32), or "nvfp4" (NVFP4, ~70% smaller). Pre-quantized mmproj stays packed.
   std::string vision_quant = "q8";

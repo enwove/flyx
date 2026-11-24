@@ -619,6 +619,7 @@ void bind(flyx_bmodel* m, const flyx_model_desc& d, LoadTimes* times) {
       default: throw std::runtime_error("block kind " + std::to_string(b.kind) + ": not implemented by this backend");
     }
   }
+  m->vision_disk.flush_clean();
   L.finish();
   if (times) *times = L.times();
 }

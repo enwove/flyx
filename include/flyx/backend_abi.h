@@ -744,9 +744,10 @@ typedef struct {
 
 /* Where vision encoder weights live and how they run (ABI 44). */
 typedef enum {
-  FLYX_VISION_DEV_HOST = 0,     /* default: pinned host RAM (0 VRAM), double-buffered DMA streamed to GPU */
-  FLYX_VISION_DEV_GPU  = 1,     /* vision weights resident in GPU VRAM */
-  FLYX_VISION_DEV_AUTO = 2      /* GPU resident when >= 8 GB VRAM remain free after weights, else host */
+  FLYX_VISION_DEV_DISK = 0,     /* default: auto-deleted temp file on disk (0 VRAM, 0 locked host RAM), 3-stage streamed */
+  FLYX_VISION_DEV_HOST = 1,     /* pinned host RAM (0 VRAM), double-buffered DMA streamed to GPU */
+  FLYX_VISION_DEV_GPU  = 2,     /* vision weights resident in GPU VRAM */
+  FLYX_VISION_DEV_AUTO = 3      /* GPU resident when >= 8 GB VRAM remain free after weights, else disk */
 } flyx_vision_device;
 
 /* On-the-fly quantization of floating-point vision linear weights at load time (ABI 44).
@@ -766,7 +767,7 @@ typedef struct {
    * documents its keys and fails open() on one it does not know; a key given
    * twice takes the later value.  The engine passes them through unread. */
   const char* options;
-  int32_t vision_device;        /* flyx_vision_device (ABI 44; 0 = host) */
+  int32_t vision_device;        /* flyx_vision_device (ABI 44; 0 = disk) */
   int32_t vision_quant;         /* flyx_vision_quant (ABI 44; 0 = q8) */
 } flyx_open_options;
 

@@ -115,6 +115,7 @@ set(FLYX_CUDA_HOST_SOURCES
   backend.cpp
   loader/bind.cpp loader/weights.cpp
   runtime/state.cpp runtime/runner.cpp runtime/graphs.cpp runtime/sleep.cpp runtime/device_stats.cpp runtime/tiers.cpp
+  runtime/vision_disk.cpp
   regions/batch.cpp regions/layers.cpp regions/linear.cpp regions/plan.cpp)
 add_library(flyx-cuda MODULE ${FLYX_CUDA_HOST_SOURCES})
 target_link_libraries(flyx-cuda PRIVATE flyx_cuda_kernels CUDA::cudart_static ${CMAKE_DL_LIBS})

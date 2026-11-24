@@ -201,12 +201,15 @@ struct DvBlock {
   float *sel_ta = nullptr, *sel_tb = nullptr;  // [vocab][sel_rank]: A E[t] and B E[t] for every token t
 };
 
-// Float32 vision vector/table (patch_w, pos_w, norms, biases, layer_scale), on GPU or in pinned host RAM.
+// Float32 vision vector/table (patch_w, pos_w, norms, biases, layer_scale), on GPU, pinned host RAM, or disk.
 struct VisionVec {
   float* ptr = nullptr;
   size_t count = 0;
   bool on_host = false;
-  bool present() const { return ptr != nullptr && count > 0; }
+  bool on_disk = false;
+  uint64_t disk_off = 0;
+  bool present() const { return count > 0 && (ptr != nullptr || on_disk); }
+  bool offloaded() const { return on_host || on_disk; }
   size_t bytes() const { return count * sizeof(float); }
 };
 
@@ -219,16 +222,25 @@ struct VNorm {
 };
 
 // Vision linear weight [N, K] (zero-padded to K_pad when quantized with K % align != 0),
-// either resident on GPU (!on_host) or in pinned host RAM (on_host: 0 bytes VRAM, DMA-streamed in encode_vision).
+// resident on GPU, in pinned host RAM (on_host: 0 VRAM), or in an auto-deleted disk file (on_disk: 0 VRAM & 0 locked RAM).
 struct VisionLin {
-  Lin w;  // device pointers when !on_host; pinned host pointers when on_host
+  enum DiskKind { kDiskNone = 0, kDiskBf16 = 1, kDiskNvfp4 = 2, kDiskPacked = 3 };
+  Lin w;  // device ptrs on GPU; pinned host ptrs when on_host; BlockMat metadata (null ptrs) when on_disk + kDiskPacked
   int N = 0, K = 0, K_pad = 0;
   bool on_host = false;
-  bool present() const { return N > 0 && (w.w != nullptr || w.q != nullptr || w.packed()); }
+  bool on_disk = false;
+  DiskKind disk_kind = kDiskNone;
+  uint64_t disk_off = 0;
+  size_t disk_bytes = 0;
+  bool present() const {
+    return N > 0 && (w.w != nullptr || w.q != nullptr || w.packed() || (on_disk && disk_kind != kDiskNone));
+  }
+  bool offloaded() const { return on_host || on_disk; }
   bool q8_inputs() const { return w.q8_inputs(); }
   int eff_k() const { return K_pad > 0 ? K_pad : K; }
   size_t staging_bytes() const {
     if (!present()) return 0;
+    if (on_disk) return disk_bytes;
     const size_t ke = size_t(eff_k());
     auto align256 = [](size_t b) { return (b + 255) / 256 * 256; };
     if (w.packed()) {

@@ -12,7 +12,7 @@
 //       [--image FILE ...]      pair each --text (assistant reply) 1:1 with an image prompt
 //       [--prompt TEXT]         user prompt sent with each --image (default: "Describe this image in detail.")
 //       [--no-think]            disable thinking in multimodal chat template
-//       [--vision-device D]     host | gpu | auto (default: host)
+//       [--vision-device D]     disk | host | gpu | auto (default: disk)
 //       [--vision-quant Q]      q8 | exact | nvfp4 (default: q8)
 //       --save REF.bin          the distributions, for comparisons against them
 //       --ref REF.bin           compare with a file --save wrote (the same model's vocabulary, texts and tokens)

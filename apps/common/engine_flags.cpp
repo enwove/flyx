@@ -100,11 +100,11 @@ bool engine_flag(const std::string& a, const std::function<std::string()>& value
   } else if (a == "--no-vision") {
     eo->vision = false;
   } else if (a == "--vision-offload") {
-    eo->vision_device = "host";
+    eo->vision_device = "disk";
   } else if (a == "--vision-device") {
     const std::string v = value();
-    if (v != "auto" && v != "gpu" && v != "host" && v != "cpu")
-      std::fprintf(stderr, "error: --vision-device host, gpu, or auto\n"), std::exit(2);
+    if (v != "disk" && v != "file" && v != "auto" && v != "gpu" && v != "host" && v != "cpu")
+      std::fprintf(stderr, "error: --vision-device disk, host, gpu, or auto\n"), std::exit(2);
     eo->vision_device = v;
   } else if (a == "--vision-quant") {
     const std::string v = value();
@@ -170,9 +170,9 @@ std::string engine_flags_help(int ctx) {
          "                       --draft alone), for a model of either format\n"
          "  --mmproj F           multimodal vision projector GGUF (mmproj-*.gguf) beside the model file\n"
          "  --no-vision          do not load a vision encoder even if a projector is available\n"
-         "  --vision-offload     keep vision weights in pinned host RAM (0 VRAM) and stream layers to GPU on demand\n"
-         "  --vision-device D    host | gpu | auto (default host: 0 VRAM, streamed from pinned host RAM; auto uses\n"
-         "                       GPU when >= 8 GB free after weights)\n"
+         "  --vision-offload     offload vision weights to an auto-deleted temp file on disk (0 VRAM, 0 locked RAM)\n"
+         "  --vision-device D    disk | host | gpu | auto (default disk: 0 VRAM & 0 locked RAM, streamed via OS page\n"
+         "                       cache; host keeps pinned RAM; auto uses GPU when >= 8 GB free after weights)\n"
          "  --vision-quant Q     q8 | exact | nvfp4 (default q8: Q8_0 linear weights, ~46% smaller; exact keeps\n"
          "                       file precision; nvfp4 ~70% smaller)\n"
          "  --vision-max-tokens N cap merged visual tokens per image (default: auto by context and detail)\n"

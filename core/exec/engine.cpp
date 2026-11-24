@@ -21,10 +21,11 @@ namespace flyx {
 namespace {
 
 bool parse_vision_device(const std::string& s, int32_t* out, std::string* err) {
-  if (s.empty() || s == "host" || s == "cpu") return *out = FLYX_VISION_DEV_HOST, true;
+  if (s.empty() || s == "disk" || s == "file") return *out = FLYX_VISION_DEV_DISK, true;
+  if (s == "host" || s == "cpu") return *out = FLYX_VISION_DEV_HOST, true;
   if (s == "gpu") return *out = FLYX_VISION_DEV_GPU, true;
   if (s == "auto") return *out = FLYX_VISION_DEV_AUTO, true;
-  return *err = "unknown --vision-device '" + s + "' (host, gpu, or auto)", false;
+  return *err = "unknown --vision-device '" + s + "' (disk, host, gpu, or auto)", false;
 }
 
 bool parse_vision_quant(const std::string& s, int32_t* out, std::string* err) {

@@ -913,40 +913,49 @@ void test_tiny_vlm_backends() {
 
   const BackendRun gpu = run_backend_vlm("cuda", vlm, patches, "", FLYX_VISION_DEV_GPU, FLYX_VISION_QUANT_EXACT);
   const BackendRun host = run_backend_vlm("cuda", vlm, patches, "", FLYX_VISION_DEV_HOST, FLYX_VISION_QUANT_EXACT);
+  const BackendRun disk = run_backend_vlm("cuda", vlm, patches, "", FLYX_VISION_DEV_DISK, FLYX_VISION_QUANT_EXACT);
   const BackendRun gpu_unfused =
       run_backend_vlm("cuda", vlm, patches, "fusion=0", FLYX_VISION_DEV_GPU, FLYX_VISION_QUANT_EXACT);
   const double rel_exact = rel_err(gpu.vision_embeds, ref.vision_embeds);
   CHECK(rel_exact < 2e-5, "cuda vs cpu_ref exact encode_vision rel err: " + std::to_string(rel_exact));
   CHECK(host.vision_embeds == gpu.vision_embeds, "vision=host exact must be bit-identical to vision=gpu");
+  CHECK(disk.vision_embeds == gpu.vision_embeds, "vision=disk exact must be bit-identical to vision=gpu");
   CHECK(host.weights_bytes == text_vram,
         "vision=host must use 0 resident vision VRAM (" + std::to_string(host.weights_bytes) + " vs " +
             std::to_string(text_vram) + ")");
+  CHECK(disk.weights_bytes == text_vram, "vision=disk must use 0 resident vision VRAM");
   CHECK(gpu.weights_bytes > text_vram, "vision=gpu should allocate vision VRAM");
   CHECK(gpu.plain_tokens == ref.plain_tokens, "cuda vs cpu_ref exact multimodal greedy tokens differ");
   CHECK(gpu.direct_followup == ref.direct_followup, "cuda vs cpu_ref follow-up rope_delta tokens differ");
   CHECK(gpu_unfused.plain_tokens == gpu.plain_tokens, "Gate 2 failed: cuda fusion=0 != fused");
   CHECK(gpu_unfused.direct_followup == gpu.direct_followup, "Gate 2 failed: cuda fusion=0 followup != fused");
 
-  // On-the-fly Q8_0 quantization (GPU + Host offload, with padded kVInter=144 -> 160)
+  // On-the-fly Q8_0 quantization (GPU + Host + Disk offload, with padded kVInter=144 -> 160)
   const BackendRun gpu_q8 = run_backend_vlm("cuda", vlm, patches, "", FLYX_VISION_DEV_GPU, FLYX_VISION_QUANT_Q8);
   const BackendRun host_q8 = run_backend_vlm("cuda", vlm, patches, "", FLYX_VISION_DEV_HOST, FLYX_VISION_QUANT_Q8);
+  const BackendRun disk_q8 = run_backend_vlm("cuda", vlm, patches, "", FLYX_VISION_DEV_DISK, FLYX_VISION_QUANT_Q8);
   const BackendRun def_run = run_backend_vlm("cuda", vlm, patches, "", 0, 0);
   const double rel_q8 = rel_err(gpu_q8.vision_embeds, ref_q8.vision_embeds);
   CHECK(rel_q8 < 2e-5, "cuda vs cpu_ref q8 encode_vision rel err: " + std::to_string(rel_q8));
   CHECK(host_q8.vision_embeds == gpu_q8.vision_embeds, "vision=host q8 must be bit-identical to vision=gpu q8");
+  CHECK(disk_q8.vision_embeds == gpu_q8.vision_embeds, "vision=disk q8 must be bit-identical to vision=gpu q8");
   CHECK(host_q8.weights_bytes == text_vram, "vision=host q8 must use 0 resident vision VRAM");
-  CHECK(def_run.weights_bytes == text_vram, "default flyx_open_options must use 0 resident vision VRAM (host)");
-  CHECK(def_run.vision_embeds == host_q8.vision_embeds, "default flyx_open_options must match host + q8 bit-for-bit");
+  CHECK(disk_q8.weights_bytes == text_vram, "vision=disk q8 must use 0 resident vision VRAM");
+  CHECK(def_run.weights_bytes == text_vram, "default flyx_open_options must use 0 resident vision VRAM (disk)");
+  CHECK(def_run.vision_embeds == disk_q8.vision_embeds, "default flyx_open_options must match disk + q8 bit-for-bit");
   CHECK(gpu_q8.weights_bytes < gpu.weights_bytes, "vision_quant=q8 must use less VRAM than exact BF16");
   CHECK(gpu_q8.plain_tokens == ref_q8.plain_tokens, "cuda vs cpu_ref q8 greedy tokens differ");
 
-  // On-the-fly NVFP4 quantization (GPU + Host offload, with padded kVInter=144 -> 192)
+  // On-the-fly NVFP4 quantization (GPU + Host + Disk offload, with padded kVInter=144 -> 192)
   const BackendRun gpu_fp4 = run_backend_vlm("cuda", vlm, patches, "", FLYX_VISION_DEV_GPU, FLYX_VISION_QUANT_NVFP4);
   const BackendRun host_fp4 = run_backend_vlm("cuda", vlm, patches, "", FLYX_VISION_DEV_HOST, FLYX_VISION_QUANT_NVFP4);
+  const BackendRun disk_fp4 = run_backend_vlm("cuda", vlm, patches, "", FLYX_VISION_DEV_DISK, FLYX_VISION_QUANT_NVFP4);
   const double rel_fp4 = rel_err(gpu_fp4.vision_embeds, ref_fp4.vision_embeds);
   CHECK(rel_fp4 < 2e-5, "cuda vs cpu_ref nvfp4 encode_vision rel err: " + std::to_string(rel_fp4));
   CHECK(host_fp4.vision_embeds == gpu_fp4.vision_embeds, "vision=host nvfp4 must be bit-identical to vision=gpu nvfp4");
+  CHECK(disk_fp4.vision_embeds == gpu_fp4.vision_embeds, "vision=disk nvfp4 must be bit-identical to vision=gpu nvfp4");
   CHECK(host_fp4.weights_bytes == text_vram, "vision=host nvfp4 must use 0 resident vision VRAM");
+  CHECK(disk_fp4.weights_bytes == text_vram, "vision=disk nvfp4 must use 0 resident vision VRAM");
   CHECK(gpu_fp4.weights_bytes < gpu_q8.weights_bytes, "vision_quant=nvfp4 must use less VRAM than q8");
   CHECK(gpu_fp4.plain_tokens == ref_fp4.plain_tokens, "cuda vs cpu_ref nvfp4 greedy tokens differ");
 
@@ -954,14 +963,17 @@ void test_tiny_vlm_backends() {
   const BackendRun gpu_preq8 = run_backend_vlm("cuda", vlm_q8, patches, "", FLYX_VISION_DEV_GPU, FLYX_VISION_QUANT_EXACT);
   const BackendRun host_preq8 =
       run_backend_vlm("cuda", vlm_q8, patches, "", FLYX_VISION_DEV_HOST, FLYX_VISION_QUANT_EXACT);
+  const BackendRun disk_preq8 =
+      run_backend_vlm("cuda", vlm_q8, patches, "", FLYX_VISION_DEV_DISK, FLYX_VISION_QUANT_EXACT);
   const double rel_preq8 = rel_err(gpu_preq8.vision_embeds, ref_preq8.vision_embeds);
   CHECK(rel_preq8 < 2e-5, "cuda vs cpu_ref pre-quantized Q8_0 rel err: " + std::to_string(rel_preq8));
   CHECK(host_preq8.vision_embeds == gpu_preq8.vision_embeds, "pre-quantized Q8_0 host != gpu");
+  CHECK(disk_preq8.vision_embeds == gpu_preq8.vision_embeds, "pre-quantized Q8_0 disk != gpu");
   CHECK(gpu_preq8.plain_tokens == ref_preq8.plain_tokens, "pre-quantized Q8_0 greedy tokens differ");
 
   std::printf(
-      "  ok   cuda tiny VLM vs cpu_ref (exact %.2e, q8 %.2e, nvfp4 %.2e, pre-Q8_0 %.2e; host==gpu bit-exact, 0 vision "
-      "VRAM)\n",
+      "  ok   cuda tiny VLM vs cpu_ref (exact %.2e, q8 %.2e, nvfp4 %.2e, pre-Q8_0 %.2e; disk==host==gpu bit-exact, 0 "
+      "vision VRAM)\n",
       rel_exact, rel_q8, rel_fp4, rel_preq8);
 }
 

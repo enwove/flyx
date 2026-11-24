@@ -2,9 +2,12 @@
 // Prefill passes and rounds (graphs, the token ring), waiting for the device, rollback, checkpoints and their
 // snapshots in host memory.
 #include <algorithm>
+#include <condition_variable>
 #include <cstddef>
 #include <cstring>
+#include <exception>
 #include <string>
+#include <thread>
 
 #include "backends/common/snapshot_format.h"
 #include "backends/cuda/backend.h"
@@ -489,26 +492,29 @@ int encode_vision(flyx_plan* p, const flyx_vision_input* in, float* out_embeds, 
     bool need_q8 = false;
     auto align256 = [](size_t b) { return (b + 255) / 256 * 256; };
 
-    // Collect on-host vision vectors and linears in exact execution order for single-slab / double-buffered DMA.
+    // Collect offloaded (host or disk) vision vectors and linears in exact execution order for pipelined streaming.
     std::vector<const VisionVec*> host_vecs;
-    size_t host_vec_bytes = 0;
+    size_t host_vec_bytes = 0, disk_vec_bytes = 0;
     auto note_vec = [&](const VisionVec& v) {
-      if (v.present() && v.on_host) {
+      if (v.present() && v.offloaded()) {
         host_vecs.push_back(&v);
         host_vec_bytes += align256(v.bytes());
+        if (v.on_disk) disk_vec_bytes += align256(v.bytes());
       }
     };
     auto note_vnorm = [&](const VNorm& vn) { note_vec(vn.w), note_vec(vn.b); };
 
     std::vector<const VisionLin*> host_lins;
     size_t max_stage_bytes = 0;
+    bool any_disk_lins = false;
     auto note_lin = [&](const VisionLin& vl) {
       if (!vl.present()) return;
       need_q8 = need_q8 || vl.q8_inputs();
       max_k = std::max(max_k, vl.eff_k());
-      if (vl.on_host) {
+      if (vl.offloaded()) {
         host_lins.push_back(&vl);
         max_stage_bytes = std::max(max_stage_bytes, vl.staging_bytes());
+        any_disk_lins = any_disk_lins || vl.on_disk;
       }
     };
 
@@ -613,7 +619,15 @@ int encode_vision(flyx_plan* p, const flyx_vision_input* in, float* out_embeds, 
         align256(size_t(4 * N + n_segs + 1) * sizeof(int32_t)) + align256(sc_bytes) + host_vec_bytes;
     const size_t slot_stride = align256(max_stage_bytes);
 
-    // Declare memory guards BEFORE event/stream guards so streams synchronize & destroy before device frees.
+    // Declare memory guards BEFORE event/stream/thread guards so reverse destruction runs:
+    //   1. join disk IO prefetch thread -> 2. synchronize & destroy CUDA streams ->
+    //   3. destroy CUDA events -> 4. free transient disk vec / device / fallback buffers.
+    constexpr size_t kDiskChunkBytes = size_t(8) << 20;  // 8 MiB per host ring slot -> <= 16 MiB total pinned ring
+    unsigned char* host_ring = nullptr;
+    size_t host_ring_stride = 0;
+    std::vector<unsigned char> host_ring_fallback;
+    std::vector<unsigned char> disk_vec_buf;
+
     struct AllocGuard {
       void* ptr = nullptr;
       ~AllocGuard() {
@@ -626,7 +640,7 @@ int encode_vision(flyx_plan* p, const flyx_vision_input* in, float* out_embeds, 
       ~EventGuard() {
         if (ev) cudaEventDestroy(ev);
       }
-    } copy_done[2], comp_done[2];
+    } copy_done[2], comp_done[2], chunk_dma_done[2];
 
     struct StreamGuard {
       cudaStream_t st = nullptr;
@@ -637,12 +651,32 @@ int encode_vision(flyx_plan* p, const flyx_vision_input* in, float* out_embeds, 
         }
       }
     } sg, dma_sg;
+
+    struct DiskIoState {
+      std::mutex mu;
+      std::condition_variable cv;
+      int64_t io_done[2] = {-1, -1};
+      int64_t dma_recorded[2] = {-1, -1};
+      bool stop = false;
+      std::exception_ptr err;
+      std::thread th;
+      ~DiskIoState() {
+        {
+          std::lock_guard<std::mutex> lk(mu);
+          stop = true;
+        }
+        cv.notify_all();
+        if (th.joinable()) th.join();
+      }
+    } disk_io;
+
     CK(cudaStreamCreateWithFlags(&sg.st, cudaStreamNonBlocking));
     if (!host_lins.empty()) {
       CK(cudaStreamCreateWithFlags(&dma_sg.st, cudaStreamNonBlocking));
       for (int i = 0; i < 2; ++i) {
         CK(cudaEventCreateWithFlags(&copy_done[i].ev, cudaEventDisableTiming));
         CK(cudaEventCreateWithFlags(&comp_done[i].ev, cudaEventDisableTiming));
+        if (any_disk_lins) CK(cudaEventCreateWithFlags(&chunk_dma_done[i].ev, cudaEventDisableTiming));
       }
     }
 
@@ -698,6 +732,33 @@ int encode_vision(flyx_plan* p, const flyx_vision_input* in, float* out_embeds, 
       }
     }
 
+    // Lazily allocate a compact 2-slot pinned host ring (<= 16 MiB total) on first disk encode_vision().
+    // 0 bytes locked at load / plan_memory / pure-text time; avoids per-image WDDM pin/unpin overhead.
+    if (any_disk_lins && n_slots > 0 && slot_stride > 0) {
+      host_ring_stride = std::min(slot_stride, kDiskChunkBytes);
+      const size_t need_host = 2 * host_ring_stride;
+      if (m->vision_disk_stage_bytes < need_host) {
+        if (m->vision_disk_stage) {
+          cudaFreeHost(m->vision_disk_stage);
+          m->vision_disk_stage = nullptr;
+          m->vision_disk_stage_bytes = 0;
+        }
+        void* hp = nullptr;
+        if (cudaHostAlloc(&hp, need_host, cudaHostAllocDefault) == cudaSuccess) {
+          m->vision_disk_stage = hp;
+          m->vision_disk_stage_bytes = need_host;
+        } else {
+          cudaGetLastError();
+        }
+      }
+      if (m->vision_disk_stage && m->vision_disk_stage_bytes >= need_host) {
+        host_ring = static_cast<unsigned char*>(m->vision_disk_stage);
+      } else {
+        host_ring_fallback.resize(need_host);
+        host_ring = host_ring_fallback.data();
+      }
+    }
+
     size_t off = 0;
     auto take = [&](size_t bytes) -> void* {
       void* ptr = arena + off;
@@ -722,19 +783,28 @@ int encode_vision(flyx_plan* p, const flyx_vision_input* in, float* out_embeds, 
       if (sc.side_count) CK(cudaMemsetAsync(sc.side_count, 0, sc.side_count_cap * sizeof(int), sg.st));
     }
 
-    // Upload all on-host float32 vision vectors (patch_w, pos_w, norms, biases) once at pass start.
+    // Upload all offloaded float32 vision vectors (patch_w, pos_w, norms, biases) once at pass start.
     std::unordered_map<const VisionVec*, float*> vec_dev;
     if (!host_vecs.empty()) {
+      if (disk_vec_bytes > 0) disk_vec_buf.resize(disk_vec_bytes);
+      size_t disk_off_cur = 0;
       vec_dev.reserve(host_vecs.size());
       for (const VisionVec* v : host_vecs) {
         auto* dst = static_cast<float*>(take(v->bytes()));
-        CK(cudaMemcpyAsync(dst, v->ptr, v->bytes(), cudaMemcpyHostToDevice, sg.st));
+        if (v->on_disk) {
+          unsigned char* src = disk_vec_buf.data() + disk_off_cur;
+          disk_off_cur += align256(v->bytes());
+          m->vision_disk.read_at(v->disk_off, src, v->bytes());
+          CK(cudaMemcpyAsync(dst, src, v->bytes(), cudaMemcpyHostToDevice, sg.st));
+        } else {
+          CK(cudaMemcpyAsync(dst, v->ptr, v->bytes(), cudaMemcpyHostToDevice, sg.st));
+        }
         vec_dev.emplace(v, dst);
       }
     }
     auto dev_vec = [&](const VisionVec& v) -> const float* {
       if (!v.present()) return nullptr;
-      if (!v.on_host) return v.ptr;
+      if (!v.offloaded()) return v.ptr;
       return vec_dev.at(&v);
     };
 
@@ -751,8 +821,39 @@ int encode_vision(flyx_plan* p, const flyx_vision_input* in, float* out_embeds, 
     std::memcpy(meta_host.data() + 4 * N, cu_host.data(), size_t(n_segs + 1) * sizeof(int32_t));
     CK(cudaMemcpyAsync(meta, meta_host.data(), meta_host.size() * sizeof(int32_t), cudaMemcpyHostToDevice, sg.st));
 
-    // Double-buffered async H2D staging for offloaded vision linears (0 bytes permanent VRAM).
-    auto stage_into = [&](const VisionLin& vl, int slot) -> Lin {
+    // Reconstruct device Lin pointers inside a GPU staging slot holding a single contiguous disk blob.
+    auto bind_disk_lin = [&](const VisionLin& vl, unsigned char* dst) -> Lin {
+      size_t off_s = 0;
+      auto carve = [&](size_t bytes) -> void* {
+        void* q = dst + off_s;
+        off_s += align256(bytes);
+        return q;
+      };
+      const size_t ke = size_t(vl.eff_k());
+      Lin out{};
+      if (vl.disk_kind == VisionLin::kDiskPacked) {
+        out.blk.reserve(vl.w.blk.size());
+        for (const BlockMat& bm : vl.w.blk) {
+          const BlockLayout lo = blocks_layout(bm.dtype);
+          const size_t per_row = ke / size_t(lo.values);
+          const size_t db = size_t(bm.rows) * per_row * size_t(lo.stride);
+          const size_t sb = size_t(bm.rows) * per_row * size_t(lo.scales) * sizeof(uint16_t);
+          auto* d_data = static_cast<uint8_t*>(carve(db));
+          auto* d_scales = static_cast<uint16_t*>(carve(sb));
+          out.blk.push_back(BlockMat{d_data, d_scales, bm.dtype, bm.rows, bm.q8});
+        }
+      } else if (vl.disk_kind == VisionLin::kDiskNvfp4) {
+        out.q = static_cast<uint8_t*>(carve(size_t(vl.N) * ke / 2));
+        out.s = static_cast<uint8_t*>(carve(size_t(vl.N) * ke / 16));
+        out.rs = static_cast<float*>(carve(size_t(vl.N) * sizeof(float)));
+      } else if (vl.disk_kind == VisionLin::kDiskBf16) {
+        out.w = static_cast<bf16*>(carve(size_t(vl.N) * ke * sizeof(bf16)));
+      }
+      return out;
+    };
+
+    // Double-buffered async H2D staging for pinned-host vision linears (0 bytes permanent VRAM).
+    auto stage_host_into = [&](const VisionLin& vl, int slot) -> Lin {
       unsigned char* dst = stage_base + size_t(slot) * slot_stride;
       size_t off_s = 0;
       auto carve = [&](size_t bytes) -> void* {
@@ -793,33 +894,109 @@ int encode_vision(flyx_plan* p, const flyx_vision_input* in, float* out_embeds, 
       return out;
     };
 
-    Lin staged[2];
-    size_t h_idx = 0;
-    if (!host_lins.empty()) {
-      staged[0] = stage_into(*host_lins[0], 0);
-      CK(cudaEventRecord(copy_done[0].ev, dma_sg.st));
+    // Flatten disk linears into <= 8 MiB chunks so the pinned host ring stays <= 16 MiB regardless of linear size.
+    struct DiskChunk {
+      uint64_t disk_off = 0;
+      size_t gpu_off = 0;
+      size_t bytes = 0;
+    };
+    std::vector<DiskChunk> disk_chunks;
+    std::vector<std::pair<size_t, size_t>> lin_chunk_range;  // [begin, end) in disk_chunks per host_lins entry
+    if (any_disk_lins) {
+      lin_chunk_range.resize(host_lins.size());
+      for (size_t i = 0; i < host_lins.size(); ++i) {
+        const size_t b = disk_chunks.size();
+        const VisionLin& vl = *host_lins[i];
+        if (vl.on_disk) {
+          for (size_t pos = 0; pos < vl.disk_bytes; pos += host_ring_stride) {
+            const size_t nb = std::min(host_ring_stride, vl.disk_bytes - pos);
+            disk_chunks.push_back(DiskChunk{vl.disk_off + pos, pos, nb});
+          }
+        }
+        lin_chunk_range[i] = {b, disk_chunks.size()};
+      }
+      int cur_dev = 0;
+      CK(cudaGetDevice(&cur_dev));
+      disk_io.th = std::thread([&, cur_dev]() {
+        try {
+          CK(cudaSetDevice(cur_dev));
+          for (size_t c = 0; c < disk_chunks.size(); ++c) {
+            const int hs = int(c & 1);
+            if (c >= 2) {
+              const int64_t prev = int64_t(c) - 2;
+              {
+                std::unique_lock<std::mutex> lk(disk_io.mu);
+                disk_io.cv.wait(lk, [&]() { return disk_io.stop || disk_io.dma_recorded[hs] >= prev; });
+                if (disk_io.stop) return;
+              }
+              CK(cudaEventSynchronize(chunk_dma_done[hs].ev));
+            }
+            const DiskChunk& ch = disk_chunks[c];
+            m->vision_disk.read_at(ch.disk_off, host_ring + size_t(hs) * host_ring_stride, ch.bytes);
+            {
+              std::lock_guard<std::mutex> lk(disk_io.mu);
+              disk_io.io_done[hs] = int64_t(c);
+            }
+            disk_io.cv.notify_all();
+          }
+        } catch (...) {
+          {
+            std::lock_guard<std::mutex> lk(disk_io.mu);
+            disk_io.err = std::current_exception();
+          }
+          disk_io.cv.notify_all();
+        }
+      });
     }
+
+    Lin staged[2];
+    auto kick_dma = [&](size_t idx) {
+      const int s = n_slots == 2 ? int(idx & 1) : 0;
+      const VisionLin& vl = *host_lins[idx];
+      if (vl.on_disk) {
+        if (int64_t(idx) >= n_slots) CK(cudaStreamWaitEvent(dma_sg.st, comp_done[s].ev, 0));
+        unsigned char* gpu_dst = stage_base + size_t(s) * slot_stride;
+        const auto [cb, ce] = lin_chunk_range[idx];
+        for (size_t c = cb; c < ce; ++c) {
+          const int hs = int(c & 1);
+          {
+            std::unique_lock<std::mutex> lk(disk_io.mu);
+            disk_io.cv.wait(lk, [&]() { return disk_io.err != nullptr || disk_io.io_done[hs] == int64_t(c); });
+            if (disk_io.err) std::rethrow_exception(disk_io.err);
+          }
+          const DiskChunk& ch = disk_chunks[c];
+          unsigned char* host_src = host_ring + size_t(hs) * host_ring_stride;
+          CK(cudaMemcpyAsync(gpu_dst + ch.gpu_off, host_src, ch.bytes, cudaMemcpyHostToDevice, dma_sg.st));
+          CK(cudaEventRecord(chunk_dma_done[hs].ev, dma_sg.st));
+          {
+            std::lock_guard<std::mutex> lk(disk_io.mu);
+            disk_io.dma_recorded[hs] = int64_t(c);
+          }
+          disk_io.cv.notify_all();
+        }
+        staged[s] = bind_disk_lin(vl, gpu_dst);
+        CK(cudaEventRecord(copy_done[s].ev, dma_sg.st));
+      } else {
+        if (int64_t(idx) >= n_slots) CK(cudaStreamWaitEvent(dma_sg.st, comp_done[s].ev, 0));
+        staged[s] = stage_host_into(vl, s);
+        CK(cudaEventRecord(copy_done[s].ev, dma_sg.st));
+      }
+    };
+
+    size_t h_idx = 0;
+    if (!host_lins.empty()) kick_dma(0);
 
     auto run_vlin = [&](const VisionLin& vl, const float* inp, int ldi, float* outp, int ldo, int rows,
                         bool accumulate) {
       const int ke = vl.eff_k();
-      if (!vl.on_host) {
+      if (!vl.offloaded()) {
         gemm(inp, ldi, vl.w, vl.N, ke, outp, ldo, rows, accumulate, L);
         return;
       }
       const int slot = n_slots == 2 ? int(h_idx & 1) : 0;
-      if (n_slots == 1 && h_idx > 0) {
-        CK(cudaStreamWaitEvent(dma_sg.st, comp_done[0].ev, 0));
-        staged[0] = stage_into(*host_lins[h_idx], 0);
-        CK(cudaEventRecord(copy_done[0].ev, dma_sg.st));
-      }
+      if (n_slots == 1 && h_idx > 0) kick_dma(h_idx);
       CK(cudaStreamWaitEvent(sg.st, copy_done[slot].ev, 0));
-      if (n_slots == 2 && h_idx + 1 < host_lins.size()) {
-        const int nxt = slot ^ 1;
-        if (h_idx >= 1) CK(cudaStreamWaitEvent(dma_sg.st, comp_done[nxt].ev, 0));
-        staged[nxt] = stage_into(*host_lins[h_idx + 1], nxt);
-        CK(cudaEventRecord(copy_done[nxt].ev, dma_sg.st));
-      }
+      if (n_slots == 2 && h_idx + 1 < host_lins.size()) kick_dma(h_idx + 1);
       gemm(inp, ldi, staged[slot], vl.N, ke, outp, ldo, rows, accumulate, L);
       CK(cudaEventRecord(comp_done[slot].ev, sg.st));
       ++h_idx;

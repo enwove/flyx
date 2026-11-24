@@ -263,16 +263,20 @@ const std::vector<OptionSpec>& option_specs() {
        }},
       {"vision",
        [](const std::string& key, const std::string& val, BackendOptions* o, std::string* err) {
-         if (!check_choice(key, val, {"auto", "host", "cpu", "gpu"}, err)) return false;
-         o->vision = (val == "host" || val == "cpu") ? FLYX_VISION_DEV_HOST
-                     : val == "gpu"                  ? FLYX_VISION_DEV_GPU
-                                                     : FLYX_VISION_DEV_AUTO;
+         if (!check_choice(key, val, {"disk", "file", "host", "cpu", "gpu", "auto"}, err)) return false;
+         o->vision = (val == "disk" || val == "file")   ? FLYX_VISION_DEV_DISK
+                     : (val == "host" || val == "cpu")  ? FLYX_VISION_DEV_HOST
+                     : val == "gpu"                     ? FLYX_VISION_DEV_GPU
+                                                        : FLYX_VISION_DEV_AUTO;
          return true;
        },
        [](const BackendOptions& o, const BackendOptions& def) -> std::string {
          if (o.vision == def.vision) return "";
          return std::string("vision=") +
-                (o.vision == FLYX_VISION_DEV_HOST ? "host" : o.vision == FLYX_VISION_DEV_GPU ? "gpu" : "auto");
+                (o.vision == FLYX_VISION_DEV_DISK   ? "disk"
+                 : o.vision == FLYX_VISION_DEV_HOST ? "host"
+                 : o.vision == FLYX_VISION_DEV_GPU  ? "gpu"
+                                                    : "auto");
        }},
       {"vision_quant",
        [](const std::string& key, const std::string& val, BackendOptions* o, std::string* err) {
@@ -561,7 +565,7 @@ int open_model(const flyx_model_desc* desc, const flyx_open_options* opts, flyx_
         }
         const bool roomy = ok_mem && free_b > llm_bytes + vis_bytes &&
                            free_b - (llm_bytes + vis_bytes) >= size_t(8) * 1000000000;
-        m->opt.vision = roomy ? FLYX_VISION_DEV_GPU : FLYX_VISION_DEV_HOST;
+        m->opt.vision = roomy ? FLYX_VISION_DEV_GPU : FLYX_VISION_DEV_DISK;
       }
     }
     // FP8 tensor cores whose e4m3 sums are float32's: sm_90 and later.  Ada's (sm_89: L4, L40S) sum in fewer bits:
@@ -706,6 +710,7 @@ int open_model(const flyx_model_desc* desc, const flyx_open_options* opts, flyx_
       else
         std::fprintf(stderr, " (the embedding)");
     }
+    if (m->vision_disk_bytes) std::fprintf(stderr, ", %.2f GB on disk (vision)", m->vision_disk_bytes / 1e9);
     std::fprintf(stderr, "\n");
     const auto& L = load_times;
     std::fprintf(stderr,
