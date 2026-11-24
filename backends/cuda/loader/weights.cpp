@@ -235,7 +235,7 @@ namespace {
 void release_cert(flyx_bmodel* m, HeadBlock* h) {
   if (h->w8) m->release(h->w8, size_t(h->vocab) * h->hidden);
   if (h->rs8) m->release(h->rs8, size_t(h->vocab) * sizeof(float));
-  if (h->cert) m->release(h->cert, size_t(h->vocab) * sizeof(float));
+  if (h->cert) m->release(h->cert, size_t(h->vocab) * 2 * sizeof(float));
   h->w8 = nullptr, h->rs8 = nullptr, h->cert = nullptr;
 }
 
@@ -272,7 +272,7 @@ void make_head_fp8(flyx_bmodel* m) {
       try {
         h->w8 = m->alloc<uint8_t>(size_t(h->vocab) * h->hidden);
         h->rs8 = m->alloc<float>(h->vocab);
-        if (ko.head_cert && !ko.head_fp8) h->cert = m->alloc<float>(h->vocab);
+        if (ko.head_cert && !ko.head_fp8) h->cert = m->alloc<float>(size_t(h->vocab) * 2);
       } catch (const OutOfDeviceMemory& e) {
         if (ko.head_fp8) throw;
         release_cert(m, h);

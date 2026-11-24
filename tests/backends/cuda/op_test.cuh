@@ -236,6 +236,7 @@ void test_gdn_chunk(const GdnDims d, const int rows, const int pos0, const doubl
 void test_gemm_glu(int M, int I, int K);
 void test_gemm_w4a4(int M, int N, int K);
 void test_head_cert(int V, int K);
+void test_head_cert_input_rounding();
 void test_gemm_fp8(int N, int K);
 void test_gemm_w12(int N, int K);
 void test_draft_pick(int V, int K, bool plant, bool pick = true);

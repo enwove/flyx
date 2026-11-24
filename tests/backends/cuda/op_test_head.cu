@@ -11,8 +11,8 @@ namespace flyx::optest {
 // every finite entry holds gemm_skinny's bits and each row's largest entry
 // (lowest index on ties) is gemm_skinny's over the whole vocabulary.  The
 // weights hold exact duplicate rows (ties) and rows one bf16 step apart
-// (near ties), and some activation rows point at them; the bound held at
-// every entry (|exact - copy| <= ||x|| coef).
+// (near ties), and some activation rows point at them. On these inputs the
+// score differences fit within ||x|| coef even before the input rounding term.
 void test_head_cert(int V, int K) {
   std::printf("certified head (%d x %d)\n", V, K);
   seed("certified head", V, K);
@@ -28,14 +28,14 @@ void test_head_cert(int V, int K) {
   bf16* dw = dev<bf16>(wb.size());
   CK(cudaMemcpy(dw, wb.data(), wb.size() * 2, cudaMemcpyHostToDevice));
   uint8_t* dq = dev<uint8_t>(size_t(V) * K);
-  float *drs = dev<float>(V), *coef = dev<float>(V);
+  float *drs = dev<float>(V), *coef = dev<float>(2 * V);
   quantize_fp8_rows(dw, V, K, dq, drs, 0);
   head_cert_coef(dw, dq, drs, V, K, coef, 0);
   const std::vector<float> cf = [&] {
     Vec c = down(coef, V);
     return std::vector<float>(c.begin(), c.end());
   }();
-  float* hn = dev<float>(16);
+  float* norms = dev<float>(2 * 16);
   int *key = dev<int>(16), *cols = dev<int>(V), *count = dev<int>(1);
   for (int rows : {1, 5, 16}) {
     Vec x = randv(size_t(rows) * K);
@@ -45,7 +45,7 @@ void test_head_cert(int V, int K) {
     gemm_skinny(dx, K, dw, V, K, full, V, rows, false, TL);
     gemm_fp8_skinny(dx, K, dq, drs, V, K, got, V, rows, false, TL);
     const Vec approx = down(got, size_t(rows) * V);
-    head_certify(dx, K, dw, coef, V, K, got, V, rows, hn, key, cols, count, TL);
+    head_certify(dx, K, dw, coef, V, K, got, V, rows, norms, key, cols, count, TL);
     const Vec f = down(full, size_t(rows) * V), c = down(got, size_t(rows) * V);
     const int survivors = down_i(count, 1)[0];
     bool bound = true, bits = true, choice = true;
@@ -69,6 +69,63 @@ void test_head_cert(int V, int K) {
     std::printf("  %-4s %-48s\n", choice ? "ok" : "FAIL", "every row's choice is gemm_skinny's");
     g_fail += !bound + !bits + !choice;
   }
+}
+
+void test_head_cert_input_rounding() {
+  std::printf("certified head with aligned bf16 rounding errors\n");
+  constexpr int V = 2, K = 256;
+  Vec w(V * K);
+  std::fill_n(w.begin(), 128, 1.);
+  std::fill_n(w.begin() + 128, 128, -1.);
+  bf16* dw = up_bf16(w);
+  uint8_t* dq = dev<uint8_t>(V * K);
+  float *drs = dev<float>(V), *coef = dev<float>(2 * V);
+  quantize_fp8_rows(dw, V, K, dq, drs, 0);
+  head_cert_coef(dw, dq, drs, V, K, coef, 0);
+
+  // A's three runs round to 1, 129/128 and 1. Its screening score for token 0 is -0.625.
+  // B equals token 0's weight row, so it keeps token 0 for both rows in a two-row launch.
+  Vec x(4 * K);  // [A, B, A, -A] supplies both orders and the opposite rounding error.
+  std::fill_n(x.begin(), 128, 1028. / 1024.);
+  std::fill_n(x.begin() + 128, 80, 1029. / 1024.);
+  std::fill_n(x.begin() + 208, 48, 1022. / 1024.);
+  std::copy_n(w.begin(), K, x.begin() + K);
+  std::copy_n(x.begin(), K, x.begin() + 2 * K);
+  for (int k = 0; k < K; ++k) x[3 * K + k] = -x[k];
+  float *dx = up(x), *full = dev<float>(V), *logits = dev<float>(2 * V), *norms = dev<float>(2 * 2);
+  int *key = dev<int>(2), *cols = dev<int>(V), *count = dev<int>(1);
+  auto certified_scores = [&](const float* rows_begin, int rows, int row) {
+    gemm_fp8_skinny(rows_begin, K, dq, drs, V, K, logits, V, rows, false, TL);
+    head_certify(rows_begin, K, dw, coef, V, K, logits, V, rows, norms, key, cols, count, TL);
+    return down(logits + row * V, V);
+  };
+  auto check_alone = [&](const float* row, const char* name, double token0_score) {
+    gemm_skinny(row, K, dw, V, K, full, V, 1, false, TL);
+    const Vec f = down(full, V), c = certified_scores(row, 1, 0);
+    expect(std::string(name) + " full-head scores", f, {token0_score, 0.}, 0);
+    const int full_choice = ops::argmax(f.data(), V), choice = ops::argmax(c.data(), V);
+    const bool exact = choice == full_choice && c[choice] == f[full_choice];
+    std::printf("  %-4s %s alone matches the full head's choice and score (certified %d, full %d)\n",
+                exact ? "ok" : "FAIL", name, choice, full_choice);
+    g_fail += !exact;
+    return c;
+  };
+  const Vec alone = check_alone(dx, "A", 0.203125);
+  const int alone_choice = ops::argmax(alone.data(), V);
+  for (int a_row : {0, 1}) {
+    const Vec batched = certified_scores(dx + a_row * K, 2, a_row);
+    const int choice = ops::argmax(batched.data(), V);
+    const bool same = choice == alone_choice && batched[choice] == alone[alone_choice];
+    std::printf("  %-4s %-48s (batched %d, alone %d)\n", same ? "ok" : "FAIL",
+                a_row == 0 ? "A in [A, B] matches A alone" : "A in [B, A] matches A alone", choice, alone_choice);
+    g_fail += !same;
+  }
+  // For -A, token 0's screening score is too high. Its lower bound must leave token 1 eligible.
+  check_alone(dx + 3 * K, "-A", -0.203125);
+  for (float* p : {dx, full, logits, norms, drs, coef}) CK(cudaFree(p));
+  for (int* p : {key, cols, count}) CK(cudaFree(p));
+  CK(cudaFree(dw));
+  CK(cudaFree(dq));
 }
 
 void test_gemm_fp8(int N, int K) {
