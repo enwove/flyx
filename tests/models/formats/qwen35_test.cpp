@@ -294,6 +294,92 @@ int main(int argc, char** argv) {
     }
   }
 
+  // 3. Multimodal rendering parity (native vs Jinja engine): parts, images, add_vision_id truthiness,
+  //    <tool_response> wrapping an image, system/assistant/tool with parts.
+  {
+    auto img_part = [](uint8_t tag) {
+      ContentPart p;
+      p.kind = ContentPart::kImage;
+      auto im = std::make_shared<ImageInput>();
+      im->sha256.fill(tag);
+      im->mime = "image/png";
+      p.image = std::move(im);
+      return p;
+    };
+    auto txt_part = [](std::string s) {
+      ContentPart p;
+      p.kind = ContentPart::kText;
+      p.text = std::move(s);
+      return p;
+    };
+    auto parts_msg = [](std::string role, std::vector<ContentPart> parts) {
+      ChatMessage m;
+      m.role = std::move(role);
+      m.parts = std::move(parts);
+      return m;
+    };
+    std::vector<std::pair<std::string, std::vector<ChatMessage>>> cases;
+    cases.push_back({"single image + text", {parts_msg("user", {txt_part("  Look: "), img_part(1), txt_part(" what is this?  ")})}});
+    cases.push_back({"multi-image multi-turn",
+                     {parts_msg("system", {txt_part("  Be concise.  ")}),
+                      parts_msg("user", {img_part(1), txt_part("first")}),
+                      msg("assistant", "First image."),
+                      parts_msg("user", {txt_part("Compare "), img_part(2), txt_part(" and "), img_part(3)})}});
+    cases.push_back({"user tool_response wrapping image",
+                     {msg("user", "question"),
+                      msg("assistant", "calling"),
+                      parts_msg("user", {txt_part("<tool_response>"), img_part(4), txt_part("</tool_response>")})}});
+    {
+      ChatMessage asst = parts_msg("assistant", {txt_part("<think>\nplan\n</think>\n\nanswer")});
+      asst.tool_calls.push_back({"call_1", "search", ojson{{"query", "cat"}}});
+      cases.push_back({"assistant parts with think + tool_calls + tool image",
+                       {msg("user", "find cat"), asst,
+                        parts_msg("tool", {txt_part("found: "), img_part(5)}),
+                        msg("user", "thanks")}});
+    }
+    cases.push_back({"system with image", {parts_msg("system", {txt_part("sys "), img_part(6)}), msg("user", "hi")}});
+
+    const std::vector<ojson> vision_kwargs = {
+        ojson::object(),
+        ojson{{"add_vision_id", false}},
+        ojson{{"add_vision_id", true}},
+        ojson{{"add_vision_id", 1}},
+        ojson{{"add_vision_id", 0}},
+        ojson{{"add_vision_id", "yes"}},
+        ojson{{"add_vision_id", ""}},
+    };
+    int mm_checked = 0;
+    for (const auto& [name, msgs] : cases) {
+      for (const auto& kw : vision_kwargs) {
+        ChatOptions opt;
+        opt.enable_thinking = true;
+        opt.add_generation_prompt = true;
+        opt.kwargs = kw;
+        RenderedChat a, b;
+        std::string ea, eb;
+        const bool oka = engine.render(msgs, tools, opt, &a, &ea);
+        const bool okb = native.render(msgs, tools, opt, &b, &eb);
+        const std::string tag = "multimodal [" + name + " kw=" + kw.dump() + "]: ";
+        check(oka == okb && ea == eb, tag + "engine " + (oka ? "ok" : ea) + " vs native " + (okb ? "ok" : eb));
+        if (!oka || !okb) continue;
+        ++mm_checked;
+        if (a.text != b.text) check(false, tag + "text differs " + first_difference(a.text, b.text));
+        bool same_lit = a.literal.size() == b.literal.size();
+        for (size_t k = 0; same_lit && k < a.literal.size(); ++k)
+          same_lit = a.literal[k].begin == b.literal[k].begin && a.literal[k].end == b.literal[k].end;
+        check(same_lit, tag + "literal spans differ");
+        check(a.boundaries == b.boundaries, tag + "boundaries differ");
+        check(a.in_reasoning == b.in_reasoning, tag + "in_reasoning differs");
+        check(a.images.size() == b.images.size(), tag + "image count differs");
+        for (const auto& im : b.images)
+          check(im.byte_offset <= im.byte_end && im.byte_end <= b.text.size() &&
+                    b.text.substr(im.byte_offset, im.byte_end - im.byte_offset) == "<|image_pad|>",
+                tag + "native image placeholder offset mismatch");
+      }
+    }
+    check(mm_checked >= 28, "multimodal cases covered (" + std::to_string(mm_checked) + ")");
+  }
+
   std::printf("qwen35 format: %d conversations rendered (%d rejected) alike by the engine and the renderer, %d round "
               "trips: %s\n",
               rendered, rejected, trips, failures ? "FAILED" : "ok");

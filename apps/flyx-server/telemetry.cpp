@@ -82,6 +82,12 @@ ojson snapshot_json(const Server& s, int recent) {
     model["drafter"] = m.drafter;
     model["max_width"] = m.width;
     model["chat_format"] = m.chat_format;
+    model["vision"] = m.vision;
+    if (m.vision) {
+      model["vision_device"] = m.vision_device;
+      model["vision_quant"] = m.vision_quant;
+      if (m.vision_max_tokens > 0) model["vision_max_tokens"] = m.vision_max_tokens;
+    }
     model["max_sessions"] = m.max_sessions;
     model["memory"] = m.memory;
     model["load_s"] = m.load_s;

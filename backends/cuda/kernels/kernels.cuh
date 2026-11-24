@@ -37,6 +37,7 @@ struct DevParams {
   int start;         // position at the start of the last round
   int noop;          // the last launched round did nothing (already stopped)
   unsigned long long seq_no;
+  int rope_delta;    // scalar MRoPE offset for decode / text turns after multimodal prefill
   int oracle_len;
   int last_round;    // round index that started at last_slot (for replay slot indexing)
 };
@@ -804,6 +805,16 @@ struct CanvasKeys {
   int s0 = -1;
 };
 
+// 3D Multimodal RoPE (Qwen3.5/3.8 interleaved or contiguous sections): active when any sec[i] > 0.
+// During multimodal prefill, pos_3d holds [rows, 3] device ints (t, h, w); during decode or pure-text
+// passes, pos_3d is null and every axis uses scalar pos + P->rope_delta.
+struct MRoPE {
+  int sec[3] = {0, 0, 0};
+  int interleaved = 0;
+  const int32_t* pos_3d = nullptr;
+  __host__ __device__ bool active() const { return sec[0] > 0 || sec[1] > 0 || sec[2] > 0; }
+};
+
 // Attention input prep for one projection output row block:
 //   qkv rows: [q heads (nh*hd) | other (skip) | k (nkv*hd) | v (nkv*hd)] at the given column offsets.
 //   q -> rmsnorm(q_norm) -> rope -> q_out [rows, nh, hd]
@@ -822,7 +833,8 @@ void attn_prep(const float* qkv, int ld, int q_off, int k_off, int v_off, const 
 void attn_prep(const float* qkv, int ld, int q_off, int k_off, int v_off, const float* q_norm, const float* k_norm,
                float norm_offset, float eps, double theta, int rot_dim, int nh, int nkv, int hd, int rows,
                const DevParams* P, int pos_sel, bool skip_if_noop, float* q_out, KvRef kv, cudaStream_t st,
-               int pos_add = 0, const TreeRows* tree = nullptr, int strata_base = 0, CanvasKeys canvas = {});
+               int pos_add = 0, const TreeRows* tree = nullptr, int strata_base = 0, CanvasKeys canvas = {},
+               MRoPE mrope = {});
 // The MTP layer's positions a draft step reads: its first src.sink positions and its last `window`,
 // [max(0, q - window + 1), q] (q = P->position + pos_add), of src (where src.slot_of says), K, V and their scales,
 // copied in order to dst's first rows; *P_out = *P but for the position at which an attention at pos_add reads
@@ -1334,5 +1346,41 @@ void stop_decide_step(const float* prob, const float* margin, const flyx_stop_po
                       cudaStream_t st);
 void stop_decide_block(const float* prob, const float* margin, const flyx_stop_policy* pol, DevStopState* state,
                        StopCondHandles h_ver, cudaStream_t st);
+
+// ---- Vision encoder & multimodal prefill kernels (vision.cu) ----
+// Standard LayerNorm: y = (x - mean) * rsqrt(var + eps) * (w ? w : 1) + (b ? b : 0) per row.
+void layernorm(const float* x, int ldx, const float* w, const float* b, float eps, float* y, int ldy, int rows, int n,
+               cudaStream_t st);
+// y[r, c] += b[c] for r < rows, c < cols.
+void add_bias(float* y, int ldy, const float* b, int rows, int cols, cudaStream_t st);
+// x[r, c] += scale ? y[r, c] * scale[c] : y[r, c] (plain residual or LayerScale).
+void vision_residual_add(float* x, const float* y, const float* scale, int rows, int cols, cudaStream_t st);
+// In-place activation (flyx_vact_kind: GELU_TANH, GELU, SILU, QUICK_GELU) on n elements.
+void vact_apply(float* x, size_t n, int act, cudaStream_t st);
+// Gated activation: out[i] = vact(gate[i], act) * up[i] on n elements.
+void vact_gated(const float* gate, const float* up, float* out, size_t n, int act, cudaStream_t st);
+// Zero columns [valid_cols, ld) in every row of x [rows, ld] (for padded quantized K dimensions).
+void vision_zero_tail(float* x, int rows, int valid_cols, int ld, cudaStream_t st);
+// Float32 GEMM: y[r, n] (=|+=) sum_k x[r, k] * W[n, k], arbitrary K (patch Conv2d/3d stem with F32 weights).
+void gemm_f32(const float* x, int ldx, const float* W, int N, int K, float* y, int ldy, int rows, bool accumulate,
+              cudaStream_t st);
+// Add fixed position embedding table pos [pos_rows, H] modulo pos_rows to x [rows, H].
+void vision_pos_embed_add(float* x, const float* pos, int pos_rows, int H, int rows, cudaStream_t st);
+// Add bilinearly interpolated 2D position embedding from [pos_h, pos_w, H] using per-row coords and grid dims.
+void vision_pos_embed_bilinear_add(float* x, const float* pos, int pos_h, int pos_w, int H, const int32_t* coords_h,
+                                   const int32_t* coords_w, const int32_t* row_gh, const int32_t* row_gw, int rows,
+                                   cudaStream_t st);
+// 2D axial Vision RoPE in-place on Q and K heads inside qkv [rows, ld] at offsets q_off, k_off.
+void vision_rope_2d(float* qkv, int ld, int q_off, int k_off, int nh, int hd, double theta, const int32_t* coords_h,
+                    const int32_t* coords_w, int rows, cudaStream_t st);
+// Bidirectional block-diagonal vision attention (arbitrary hd <= 256, float32 online softmax) over cu_seqlens segments.
+void vision_attention(const float* qkv, int ld, int q_off, int k_off, int v_off, int nh, int hd,
+                      const int32_t* cu_seqlens, int n_segs, int rows, float scale, float* out, int ld_out,
+                      cudaStream_t st);
+// Average-pool contiguous groups of `group` rows: out[b, c] = mean_{g < group} x[b * group + g, c].
+void vision_avg_pool_blocks(const float* x, int n_blocks, int group, int hidden, float* out, cudaStream_t st);
+// Overwrite selected rows embed_rows[i] of x (float32) or x16 (bf16) with embeds[i * H .. (i + 1) * H).
+void embed_scatter(float* x, bf16* x16, int H, const float* embeds, const int32_t* embed_rows, int n_embeds,
+                   cudaStream_t st);
 
 }  // namespace flyx::cuda

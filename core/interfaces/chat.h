@@ -8,6 +8,7 @@
 // models/formats/formats.cpp).
 #pragma once
 
+#include <array>
 #include <memory>
 #include <optional>
 #include <span>
@@ -43,12 +44,33 @@ struct ToolCall {
   ojson arguments = ojson::object();  // keys in the order the client sent them
 };
 
+// One image attached to a chat message (raw encoded bytes such as PNG/JPEG, or a decoded
+// payload; sha256 identifies its content for prefix caching and embedding reuse).
+struct ImageInput {
+  std::vector<uint8_t> bytes;          // raw encoded image bytes (PNG/JPEG/BMP/GIF/TGA)
+  std::array<uint8_t, 32> sha256{};    // SHA-256 of `bytes`
+  std::string mime;                    // optional MIME type, e.g. "image/png"
+  std::string detail;                  // optional detail hint: "", "auto", "low", "high"
+};
+
+struct ContentPart {
+  enum Kind { kText = 0, kImage = 1 } kind = kText;
+  std::string text;                             // kText
+  std::shared_ptr<const ImageInput> image;      // kImage
+
+  static ContentPart make_text(std::string s) { return {kText, std::move(s), nullptr}; }
+  static ContentPart make_image(std::shared_ptr<const ImageInput> img) { return {kImage, {}, std::move(img)}; }
+};
+
 struct ChatMessage {
   std::string role;                      // system | user | assistant | tool
-  std::string content;                   // text (content parts already joined)
+  std::string content;                   // text (when `parts` is empty)
   std::optional<std::string> reasoning;  // assistant thinking given separately (reasoning_content)
   std::vector<ToolCall> tool_calls;      // assistant
   std::string tool_call_id;              // tool
+  // Multimodal content parts (non-empty when a message carries images alongside text).
+  // Kept last so existing aggregate initializers for text-only messages remain valid.
+  std::vector<ContentPart> parts;
 };
 
 struct ChatOptions {
@@ -58,11 +80,20 @@ struct ChatOptions {
   ojson kwargs = ojson::object();
 };
 
+// An image rendered into RenderedChat::text, anchored at the byte span of its template placeholder.
+struct RenderedImage {
+  size_t byte_offset = std::string::npos;  // start byte in RenderedChat::text (npos = resolve by placeholder token)
+  size_t byte_end = std::string::npos;     // end byte in RenderedChat::text (exclusive)
+  std::shared_ptr<const ImageInput> image; // source image bytes + SHA-256 + detail
+};
+
 struct RenderedChat {
   std::string text;
   // Bytes the template wrote itself (sorted): special tokens are read only
   // here.  The client's strings, as they pass through the template, are not.
   std::vector<TextSpan> literal;
+  // Multimodal images emitted into `text`, in order of appearance (empty for text-only requests).
+  std::vector<RenderedImage> images;
   // Byte offsets where a later request is likely to branch, so the engine
   // keeps checkpoints there: where this conversation ends (before the
   // generation prompt) and where earlier requests that it continues ended; on

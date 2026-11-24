@@ -35,7 +35,12 @@ export function storeChats(list) {
 
 // A message as it is kept: what was said and the reply's own figures, not what only a reply being written has.
 export function keptMessage(m) {
-  if (m.role === "user") return { role: "user", content: m.content };
+  if (m.role === "user") {
+    const out = { role: "user", content: m.content || "" };
+    const nImg = m.images ? m.images.length : (m.imageCount || 0);
+    if (nImg > 0) out.imageCount = nImg;  // omit base64 data URLs from localStorage so quota is not exhausted
+    return out;
+  }
   const out = { role: "assistant", content: m.content || "", thinking: m.thinking || "", model: m.model };
   for (const k of ["id", "usage", "elapsed", "clientTtft", "error"]) if (m[k] !== undefined && m[k] !== null) out[k] = m[k];
   if (m.done) out.done = true; else if (!m.error) out.stopped = true;  // one cut short (by Stop, or by the page closing) reads as stopped

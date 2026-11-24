@@ -17,11 +17,12 @@ struct SnapshotHeader {
   uint64_t layout;
   int32_t pos, begin;
   uint64_t bytes;
+  int32_t rope_delta, pad0;
 };
 
 constexpr uint32_t kSnapshotMagic = 0x504E5346u;  // "FSNP"
-constexpr uint32_t kSnapshotVersion = 1;
-constexpr uint32_t kDeltaVersion = 2;
+constexpr uint32_t kSnapshotVersion = 3;
+constexpr uint32_t kDeltaVersion = 4;
 
 constexpr uint64_t kFnv1aOffset = 1469598103934665603ull;
 constexpr uint64_t kFnv1aPrime = 1099511628211ull;

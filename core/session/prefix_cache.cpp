@@ -12,6 +12,42 @@ size_t common_text(const std::string& a, const std::string& b) {
   return i;
 }
 
+bool same_image(const interfaces::RenderedImage& a, const interfaces::RenderedImage& b) {
+  return a.image && b.image && a.image->sha256 == b.image->sha256 && a.image->detail == b.image->detail;
+}
+
+// Common text prefix clamped before the first differing rendered image (so identical text with different images
+// never routes to the same resident session or claims a false shared history).
+size_t common_rendered(const interfaces::RenderedChat& prompt, const std::string& history_text,
+                       const std::vector<interfaces::RenderedImage>& history_images) {
+  size_t c = common_text(prompt.text, history_text);
+  if (prompt.images.empty() && history_images.empty()) return c;
+  // Non-native Jinja path uses npos sentinel offsets: require ordered image prefix equality or clamp to 0.
+  for (const auto& img : prompt.images)
+    if (img.byte_offset == std::string::npos) {
+      if (history_images.size() > prompt.images.size()) return 0;
+      for (size_t i = 0; i < history_images.size(); ++i)
+        if (!same_image(prompt.images[i], history_images[i])) return 0;
+      return c;
+    }
+  for (const auto& img : history_images)
+    if (img.byte_offset == std::string::npos) return 0;
+
+  size_t i = 0;
+  while (i < prompt.images.size() && i < history_images.size()) {
+    const auto& pa = prompt.images[i];
+    const auto& hb = history_images[i];
+    if (pa.byte_offset >= c && hb.byte_offset >= c) break;
+    if (pa.byte_end > c || hb.byte_end > c || pa.byte_offset != hb.byte_offset || pa.byte_end != hb.byte_end ||
+        !same_image(pa, hb))
+      return std::min(c, std::min(pa.byte_offset, hb.byte_offset));
+    ++i;
+  }
+  if (i < prompt.images.size() && prompt.images[i].byte_offset < c) return prompt.images[i].byte_offset;
+  if (i < history_images.size() && history_images[i].byte_offset < c) return history_images[i].byte_offset;
+  return c;
+}
+
 // Shared text shorter than this is the template's opening or a few words in
 // common, not a prefix that ties a request to a session: about 64 tokens,
 // one prefill alignment of the CUDA backend, below which no checkpoint can
@@ -53,7 +89,7 @@ Session* PrefixCache::acquire(const interfaces::RenderedChat& prompt, Choice* ch
     if (slots_[i].used == resume_assignment)
       return hand_out(static_cast<int>(i), "session " + std::to_string(slots_[i].id) + " (continues its prewarm)");
     const auto& history = slots_[i].s->history_text();
-    const size_t c = common_text(prompt.text, history);
+    const size_t c = common_rendered(prompt, history, slots_[i].s->history_images());
     if (best < 0 || c > best_len) {
       best = static_cast<int>(i);
       sibling_slot = best;

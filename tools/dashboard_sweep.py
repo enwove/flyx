@@ -110,12 +110,16 @@ def walk(pg, lang: str, shots: str | None) -> dict[str, str]:
     go("model")
     pg.click('#mv-tabs [data-view="current"]'); pg.wait_for_timeout(400); look("model"); shot("model")
     if pg.locator("#mf-settings").count():  # the load settings: only while a model is served
+        pg.click('#lset-tabs [data-stab="spec"]'); pg.wait_for_timeout(300)
         if pg.locator("#sd-adv").get_attribute("open") is None:
             pg.click("#sd-adv summary"); pg.wait_for_timeout(300)
         look("model, advanced")
         if pg.locator("#sd-file").is_enabled():  # not with speculative decoding off
             pg.fill("#sd-file", "org/drafter"); pg.wait_for_timeout(300); look("model, a custom drafter typed")
             pg.fill("#sd-file", ""); pg.wait_for_timeout(200)
+        pg.click('#lset-tabs [data-stab="vision"]'); pg.wait_for_timeout(300)
+        look("model, vision")
+        pg.click('#lset-tabs [data-stab="general"]'); pg.wait_for_timeout(200)
     pg.click('#mv-tabs [data-view="library"]'); pg.wait_for_timeout(2500); look("model, its library"); shot("model-library")
     for t in reversed(pg.locator('button[role="tab"][data-src]').all()):  # this machine, then back to Hugging Face
         t.click()

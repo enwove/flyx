@@ -205,4 +205,81 @@ inline void round_q8(const double* x, int K, int8_t* p, float* d) {
   }
 }
 
+// IEEE-754 binary16 bit encoding of a float32 (round to nearest even, matching CUDA __float2half_rn).
+inline uint16_t float_to_f16_bits(float v) {
+  uint32_t u = 0;
+  std::memcpy(&u, &v, 4);
+  const uint32_t sign = (u >> 16) & 0x8000u;
+  int exp = int((u >> 23) & 0xFFu) - 127;
+  uint32_t mant = u & 0x7FFFFFu;
+  if (exp == 128) return uint16_t(sign | 0x7C00u | (mant ? 0x0200u : 0u));
+  if (exp > 15) return uint16_t(sign | 0x7C00u);
+  if (exp >= -14) {
+    uint32_t m = mant + (0x0FFFu + ((mant >> 13) & 1u));
+    if (m & 0x800000u) {
+      m = 0;
+      ++exp;
+      if (exp > 15) return uint16_t(sign | 0x7C00u);
+    }
+    return uint16_t(sign | (uint32_t(exp + 15) << 10) | (m >> 13));
+  }
+  if (exp >= -25) {
+    mant |= 0x800000u;
+    const int shift = -14 - exp + 13;
+    const uint32_t half_bit = 1u << (shift - 1);
+    const uint32_t low = mant & ((1u << shift) - 1u);
+    uint32_t q = mant >> shift;
+    if (low > half_bit || (low == half_bit && (q & 1u))) ++q;
+    return uint16_t(sign | q);
+  }
+  return uint16_t(sign);
+}
+
+// Quantize one weight row of length K (zero-padded to K_pad, multiple of 32) into GGML Q8_0 payload + f16 scales.
+// Exact bit-for-bit formula shared by cpu_ref and the CUDA backend's on-the-fly vision quantizer.
+inline void quantize_row_q8_0(const float* src, int K, int K_pad, uint8_t* payload, uint16_t* scales) {
+  const int blocks = K_pad / 32;
+  for (int b = 0; b < blocks; ++b) {
+    float v[32], amax = 0.f;
+    for (int e = 0; e < 32; ++e) {
+      const int idx = 32 * b + e;
+      v[e] = idx < K ? src[idx] : 0.f;
+      amax = std::max(amax, std::fabs(v[e]));
+    }
+    const uint16_t dh_bits = float_to_f16_bits(amax / 127.f);
+    const float d = static_cast<float>(ggml::half(dh_bits));
+    const float inv = d > 0.f ? 1.f / d : 0.f;
+    scales[b] = dh_bits;
+    for (int e = 0; e < 32; ++e) {
+      const int q = std::clamp(static_cast<int>(std::nearbyint(v[e] * inv)), -127, 127);
+      payload[32 * b + e] = static_cast<uint8_t>(static_cast<int8_t>(q));
+    }
+  }
+}
+
+// Quantize one weight row of length K (zero-padded to K_pad, multiple of 64) into NVFP4 planes (Q, S, RS).
+// Matches k_quantize_nvfp4: rs = max|w| / (6 * 448), block e4m3 scale per 16, e2m1 codes two per byte.
+inline void quantize_row_nvfp4(const float* src, int K, int K_pad, uint8_t* Q, uint8_t* S, float* RS) {
+  float amax = 0.f;
+  for (int k = 0; k < K; ++k) amax = std::max(amax, std::fabs(src[k]));
+  const float rs = amax > 0.f ? amax / (6.f * 448.f) : 1.f;
+  *RS = rs;
+  const int blocks = K_pad / 16;
+  for (int b = 0; b < blocks; ++b) {
+    float v[16], bmax = 0.f;
+    for (int e = 0; e < 16; ++e) {
+      const int idx = 16 * b + e;
+      v[e] = idx < K ? src[idx] : 0.f;
+      bmax = std::max(bmax, std::fabs(v[e]));
+    }
+    const uint8_t sc = e4m3_nearest(bmax / 6.f / rs);
+    const float scale = static_cast<float>(e4m3_to_double(sc)) * rs;
+    const float inv = scale > 0.f ? 1.f / scale : 0.f;
+    S[b] = sc;
+    for (int e = 0; e < 16; e += 2) {
+      Q[b * 8 + e / 2] = static_cast<uint8_t>(e2m1_nearest(v[e] * inv) | (e2m1_nearest(v[e + 1] * inv) << 4));
+    }
+  }
+}
+
 }  // namespace flyx::ops

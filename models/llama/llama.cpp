@@ -137,8 +137,15 @@ bool Llama::build(const ModelFile& file, const ModelOptions& o, std::string* err
   sources.dv = has_dv;
   std::vector<Drafter> drafters;
   if (!choose_drafters(o, sources, &drafters, err)) return false;
-  if (file.companions() > 0)
+  if (file.companions() > 0) {
+    if (file.header().contains("companions") && file.header().at("companions").is_array()) {
+      for (const auto& ch : file.header().at("companions")) {
+        if (ch.is_object() && ch.value("arch", "") == "clip")
+          return *err = std::string("a ") + family + " model does not support a vision projector (--mmproj)", false;
+      }
+    }
     return *err = std::string("a ") + family + " model has no drafter to read from a file", false;
+  }
   if (!tables_.set_activations(o.activations, declared_activations(file), o.fp4_inputs, err)) return false;
   // MiniCPM5-1B's next tokens move visibly with an FP8 cache (KL 0.0064, top-1 97.2%): binary16 unless
   // the caller asks for FP8.

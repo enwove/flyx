@@ -97,6 +97,11 @@ flyx_add_unit_test(gguf_models_test models/gguf_test.cpp)
 flyx_add_unit_test(dv_models_test models/dv_test.cpp)
 flyx_add_unit_test(llama_models_test models/llama/llama_test.cpp)
 flyx_add_unit_test(gguf_e2e_test e2e/gguf_test.cpp)
+flyx_add_unit_test(vision_test e2e/vision_test.cpp)
+add_dependencies(vision_test flyx-cpu_ref)
+if(TARGET flyx-cuda)
+  add_dependencies(vision_test flyx-cuda)
+endif()
 
 add_executable(numbers_test apps/common/numbers_test.cpp ${CMAKE_SOURCE_DIR}/apps/common/numbers.cpp)
 target_include_directories(numbers_test PRIVATE ${CMAKE_SOURCE_DIR})
@@ -237,6 +242,8 @@ add_test(NAME request COMMAND request_test ${ASSETS}/tiny.flyx
                                  ${CMAKE_SOURCE_DIR}/tests/core/render/templates/qwen3.5.jinja
                                  ${ASSETS}/tiny_llama.flyx)
 add_test(NAME ref_sums COMMAND sums_test)
+add_test(NAME vision COMMAND vision_test)
+set_tests_properties(vision PROPERTIES WORKING_DIRECTORY "$<TARGET_FILE_DIR:vision_test>")
 # DV's float64 references against the Python reference's cases (make_tiny.py's dv_cases.json): trees on 1000 random
 # tables of each kind and edge cases, cov's term, selector tables, the canvas's input, statistics and slide.
 add_test(NAME dv_trees COMMAND dv_tree_test ${ASSETS})
@@ -397,7 +404,7 @@ if(TARGET flyx-cuda)
   add_executable(cuda_op_test backends/cuda/op_test.cu backends/cuda/op_test_gemm.cu backends/cuda/op_test_blocks.cu
                  backends/cuda/op_test_attention.cu backends/cuda/op_test_gdn.cu backends/cuda/op_test_nvfp4.cu
                  backends/cuda/op_test_head.cu backends/cuda/op_test_sampling.cu backends/cuda/op_test_layers.cu
-                 backends/cuda/op_test_dv.cu)
+                 backends/cuda/op_test_dv.cu backends/cuda/op_test_vision.cu)
   target_link_libraries(cuda_op_test PRIVATE flyx_cuda_kernels)
   add_dependencies(cuda_op_test flyx_gemm_tables)  # op_test_gemm.cu reads the generated tables
   set_target_properties(cuda_op_test PROPERTIES CUDA_ARCHITECTURES "${FLYX_CUDA_ARCHS}")

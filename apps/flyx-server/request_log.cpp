@@ -5,8 +5,10 @@
 
 #include <algorithm>
 #include <array>
+#include <cctype>
 #include <charconv>
 #include <cstdint>
+#include <optional>
 #include <string_view>
 
 #include "apps/flyx-server/server.h"
@@ -155,12 +157,49 @@ size_t scalar_json_bytes(const ojson& v) {
   return dump_json(v).size();
 }
 
+bool iequals_prefix(std::string_view s, std::string_view pfx) {
+  if (s.size() < pfx.size()) return false;
+  for (size_t i = 0; i < pfx.size(); ++i)
+    if (std::tolower(static_cast<unsigned char>(s[i])) != std::tolower(static_cast<unsigned char>(pfx[i])))
+      return false;
+  return true;
+}
+
+// Replace large inline base64 image payloads (data:image/...;base64,... and Anthropic source.data)
+// with a compact placeholder so request logs do not waste 64 KiB on base64 noise or crush text clipping.
+std::optional<std::string> redact_image_string(const std::string& s, const ojson* parent_obj, std::string_view key) {
+  if (s.size() > 64 && iequals_prefix(s, "data:image/")) {
+    const size_t comma = s.find(',');
+    if (comma != std::string::npos && comma <= 128) {
+      const std::string_view meta(s.data() + 5, comma - 5);
+      const size_t last_semi = meta.rfind(';');
+      if (last_semi != std::string_view::npos && meta.size() - (last_semi + 1) == 6 &&
+          iequals_prefix(meta.substr(last_semi + 1), "base64")) {
+        const size_t first_semi = meta.find(';');
+        const std::string_view mime = meta.substr(0, first_semi);
+        return "<base64 " + std::string(mime) + ", " + std::to_string(s.size() - comma - 1) + " chars>";
+      }
+    }
+  }
+  if (s.size() > 64 && parent_obj && key == "data" && parent_obj->contains("type") &&
+      (*parent_obj)["type"].is_string() && (*parent_obj)["type"].get_ref<const std::string&>() == "base64") {
+    std::string media = "image";
+    if (parent_obj->contains("media_type") && (*parent_obj)["media_type"].is_string()) {
+      const auto& mt = (*parent_obj)["media_type"].get_ref<const std::string&>();
+      if (!mt.empty() && mt.size() <= 64) media = mt;
+    }
+    return "<base64 " + media + ", " + std::to_string(s.size()) + " chars>";
+  }
+  return std::nullopt;
+}
+
 // Single read-only iterative walk: computes exact compact serialized JSON byte length at every clip cap
 // (64 KiB, 16 KiB, 4 KiB, 1 KiB), the longest string length, and whether nesting exceeds kMaxClipDepth.
 struct BodyMeasure {
   std::array<size_t, 4> bytes{};
   size_t longest = 0;
   bool deep = false;
+  bool redacted = false;
 };
 
 BodyMeasure measure_body(const ojson& root) {
@@ -170,13 +209,15 @@ BodyMeasure measure_body(const ojson& root) {
   };
   struct Item {
     const ojson* node;
+    const ojson* parent_obj;
+    std::string_view key;
     size_t depth;
   };
   std::vector<Item> stack;
   stack.reserve(64);
-  stack.push_back({&root, 0});
+  stack.push_back({&root, nullptr, {}, 0});
   while (!stack.empty()) {
-    const auto [value, depth] = stack.back();
+    const auto [value, parent_obj, key, depth] = stack.back();
     stack.pop_back();
     if (depth > kMaxClipDepth) {
       m.deep = true;
@@ -184,16 +225,20 @@ BodyMeasure measure_body(const ojson& root) {
       continue;
     }
     if (value->is_string()) {
-      const auto& s = value->get_ref<const std::string&>();
+      const auto& raw = value->get_ref<const std::string&>();
+      const auto red = redact_image_string(raw, parent_obj, key);
+      if (red) m.redacted = true;
+      const std::string& s = red ? *red : raw;
       m.longest = std::max(m.longest, s.size());
       std::array<size_t, 4> sb{};
       escaped_clipped_bytes(s, sb);
       for (size_t k = 0; k < 4; ++k) m.bytes[k] += sb[k];
     } else if (value->is_structured()) {
       add_all(2 + (value->empty() ? 0 : value->size() - 1));  // brackets and commas
+      const ojson* p = value->is_object() ? value : nullptr;
       for (auto it = value->begin(); it != value->end(); ++it) {
-        if (value->is_object()) add_all(escaped_key_bytes(it.key()) + 1);  // quoted key and colon
-        stack.push_back({&(*it), depth + 1});
+        if (p) add_all(escaped_key_bytes(it.key()) + 1);  // quoted key and colon
+        stack.push_back({&(*it), p, p ? std::string_view(it.key()) : std::string_view{}, depth + 1});
       }
     } else {
       add_all(scalar_json_bytes(*value));
@@ -206,33 +251,38 @@ BodyMeasure measure_body(const ojson& root) {
 ojson clip_strings(const ojson& original, size_t max) {
   struct Frame {
     const ojson* src;
+    const ojson* parent_obj;
+    std::string_view key;
     ojson* dst;
     size_t depth;
   };
   ojson root;
   std::vector<Frame> stack;
-  stack.push_back({&original, &root, 0});
+  stack.push_back({&original, nullptr, {}, &root, 0});
   while (!stack.empty()) {
-    const auto [src, dst, depth] = stack.back();
+    const auto [src, parent_obj, key, dst, depth] = stack.back();
     stack.pop_back();
     if (depth > kMaxClipDepth) {
       *dst = std::string(kDepthMarker);
       continue;
     }
     if (src->is_string()) {
-      *dst = RequestLog::clip(src->get_ref<const std::string&>(), max);
+      const auto& raw = src->get_ref<const std::string&>();
+      const auto red = redact_image_string(raw, parent_obj, key);
+      *dst = RequestLog::clip(red ? *red : raw, max);
     } else if (src->is_object()) {
       *dst = ojson::object();
       auto& kept = dst->get_ref<ojson::object_t&>();
       kept.reserve(src->size());
       for (auto it = src->begin(); it != src->end(); ++it) kept.emplace_back(it.key(), ojson());
       auto dit = kept.begin();
-      for (auto it = src->begin(); it != src->end(); ++it, ++dit) stack.push_back({&(*it), &dit->second, depth + 1});
+      for (auto it = src->begin(); it != src->end(); ++it, ++dit)
+        stack.push_back({&(*it), src, it.key(), &dit->second, depth + 1});
     } else if (src->is_array()) {
       *dst = ojson::array();
       auto& kept = dst->get_ref<ojson::array_t&>();
       kept.resize(src->size());
-      for (size_t i = 0; i < src->size(); ++i) stack.push_back({&((*src)[i]), &kept[i], depth + 1});
+      for (size_t i = 0; i < src->size(); ++i) stack.push_back({&((*src)[i]), nullptr, {}, &kept[i], depth + 1});
     } else {
       *dst = *src;
     }
@@ -248,12 +298,12 @@ ojson kept_request(const ojson& body) {
   if (!m.deep) {
     for (size_t k = 0; k < 3; ++k) {
       if (m.bytes[k] <= RequestLog::kRequestBytes) {
-        return m.longest <= kClipCaps[k] ? body : clip_strings(body, kClipCaps[k]);
+        return (!m.redacted && m.longest <= kClipCaps[k]) ? body : clip_strings(body, kClipCaps[k]);
       }
     }
   }
   if (m.bytes[3] <= kHardRequestBytes) {
-    return (!m.deep && m.longest <= kSmallestClip) ? body : clip_strings(body, kSmallestClip);
+    return (!m.deep && !m.redacted && m.longest <= kSmallestClip) ? body : clip_strings(body, kSmallestClip);
   }
   ojson summary = {{"_truncated", true}, {"bytes", m.bytes[3]}};
   if (body.is_object()) {

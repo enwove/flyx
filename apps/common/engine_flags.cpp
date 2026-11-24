@@ -95,6 +95,24 @@ bool engine_flag(const std::string& a, const std::function<std::string()>& value
     eo->drafter = v;
   } else if (a == "--drafter-file") {
     eo->drafter_files.push_back(value());
+  } else if (a == "--mmproj") {
+    eo->mmproj_file = value();
+  } else if (a == "--no-vision") {
+    eo->vision = false;
+  } else if (a == "--vision-offload") {
+    eo->vision_device = "disk";
+  } else if (a == "--vision-device") {
+    const std::string v = value();
+    std::string err;
+    if (!interfaces::parse_vision_device(v, nullptr, &eo->vision_device, &err))
+      std::fprintf(stderr, "error: %s\n", err.c_str()), std::exit(2);
+  } else if (a == "--vision-quant") {
+    const std::string v = value();
+    std::string err;
+    if (!interfaces::parse_vision_quant(v, nullptr, &eo->vision_quant, &err))
+      std::fprintf(stderr, "error: %s\n", err.c_str()), std::exit(2);
+  } else if (a == "--vision-max-tokens") {
+    eo->vision_max_tokens = whole_flag("--vision-max-tokens", value(), 16, kMaxCtx);
   } else if (a == "--activations") {
     eo->activations = value();
   } else if (a == "--chat-template") {
@@ -150,6 +168,14 @@ std::string engine_flags_help(int ctx) {
          "  --drafter-file F     a drafter in a file of its own (repeatable): the MTP layer from a GGUF, for a GGUF\n"
          "                       without it (unsloth's MTP/mtp-*.gguf), or a DFlash2 drafter file (python/convert\n"
          "                       --draft alone), for a model of either format\n"
+         "  --mmproj F           multimodal vision projector GGUF (mmproj-*.gguf) beside the model file\n"
+         "  --no-vision          do not load a vision encoder even if a projector is available\n"
+         "  --vision-offload     offload vision weights to an auto-deleted temp file on disk (0 VRAM, 0 locked RAM)\n"
+         "  --vision-device D    disk | host | gpu | auto (default disk: 0 VRAM & 0 locked RAM, streamed via OS page\n"
+         "                       cache; host keeps pinned RAM; auto uses GPU when >= 8 GB free after weights)\n"
+         "  --vision-quant Q     q8 | exact | nvfp4 (default q8: Q8_0 linear weights, ~46% smaller; exact keeps\n"
+         "                       file precision; nvfp4 ~70% smaller)\n"
+         "  --vision-max-tokens N cap merged visual tokens per image (default: auto by context and detail)\n"
          "  --width N            fix the model drafter's width at N, up to its maximum (default: chosen per round)\n"
          "                       prompt lookup can still verify 15 drafts from earlier text (disable with --no-lookup)\n"
          "                       but not beside a DV drafter, whose rounds then run alone: its widest of at most N\n"

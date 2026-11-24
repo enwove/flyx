@@ -86,7 +86,8 @@ void attn_rows(const BatchPass& bp, const AttnBlock& a, bool fused) {
     const float* proj = v.b.proj + size_t(bp.first[i]) * v.ld_proj;
     float* q = v.b.qbuf + size_t(bp.first[i]) * w;
     attn_prep(proj, v.ld_proj, 0, a.q_width(), a.q_width() + nkv * hd, a.q_norm.w, a.k_norm.w, a.q_norm.offset,
-              a.q_norm.eps, a.theta, a.rot, nh, nkv, hd, ps.rows, s->P, kPosPosition, false, q, kb.ref(), st);
+              a.q_norm.eps, a.theta, a.rot, nh, nkv, hd, ps.rows, s->P, kPosPosition, false, q, kb.ref(), st, 0,
+              nullptr, 0, CanvasKeys{}, a.mrope());
     if (ps.reads_cache(kb)) {
       s->stage_before(kb, 0, ps.rows, st);  // all its positions in host memory
       attention(q, kb.staged(), nh, nkv, hd, ps.rows, true, 0, 1.f / std::sqrt(float(hd)), s->P,
@@ -170,7 +171,8 @@ void mtp_draft_rows(const BatchPass& bp, const MtpBlock& b, const std::vector<si
       float* q_j = v.b.qbuf + size_t(j) * q_w;
       float* act_j = v.b.act + size_t(j) * q_w;
       attn_prep(proj_j, v.ld_proj, 0, a.q_width(), a.q_width() + nkv * hd, a.q_norm.w, a.k_norm.w, a.q_norm.offset,
-                a.q_norm.eps, a.theta, a.rot, nh, nkv, hd, 1, s->P, kPosPosition, false, q_j, kv.ref(), st, i - 1);
+                a.q_norm.eps, a.theta, a.rot, nh, nkv, hd, 1, s->P, kPosPosition, false, q_j, kv.ref(), st, i - 1,
+                nullptr, 0, CanvasKeys{}, a.mrope());
       s->stage_before(kv, i - 1, 1, st);
       if (kv.kq) {
         params_at(s->P, s->P_window, i - 1, st);
@@ -397,7 +399,7 @@ void mtp_context_rows(const BatchPass& bp, const MtpBlock& b, bool fused) {
     const KvBuf& kv = ps.s->kv[size_t(a.kv)];
     attn_prep(rv.b.proj, rv.ld_proj, 0, a.q_width(), a.q_width() + nkv * hd, a.q_norm.w, a.k_norm.w, a.q_norm.offset,
               a.q_norm.eps, a.theta, a.rot, nh, nkv, hd, ps.rows, ps.s->P, kPosStart, true, rv.b.qbuf, kv.ref(), st,
-              -1);
+              -1, nullptr, 0, CanvasKeys{}, a.mrope());
   }
 }
 

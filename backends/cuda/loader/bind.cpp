@@ -147,6 +147,10 @@ AttnBlock attention(WeightLoader& L, const flyx_attn_block& b, const StateMap& s
   a.hd = b.head_dim;
   a.rot = b.rot_dim;
   a.theta = b.theta;
+  a.mrope_section[0] = b.mrope_section[0];
+  a.mrope_section[1] = b.mrope_section[1];
+  a.mrope_section[2] = b.mrope_section[2];
+  a.mrope_interleaved = b.mrope_interleaved;
   rope_register(a.theta, a.rot);  // attn_prep's rotary factors, once
   a.gate = b.gate != FLYX_GATE_NONE;
   a.norm = norm(L, b.norm);
@@ -372,6 +376,131 @@ DvBlock dv(WeightLoader& L, const flyx_model_desc& d, const flyx_dv_block& b, co
   return v;
 }
 
+VNorm bind_vnorm(WeightLoader& L, const flyx_vnorm& n) {
+  expect(!(n.kind == FLYX_NORM_RMS && n.w < 0 && n.b >= 0), "vnorm: RMSNorm with bias requires weight");
+  return VNorm{n.kind, n.w >= 0 ? L.vision_vec(n.w) : VisionVec{}, n.b >= 0 ? L.vision_vec(n.b) : VisionVec{},
+               float(n.offset), float(n.eps)};
+}
+
+VisionStemBlock vision_stem(WeightLoader& L, const flyx_vision_stem_block& b) {
+  VisionStemBlock s;
+  s.in_dim = b.in_dim;
+  s.hidden = b.hidden;
+  expect(s.in_dim > 0 && s.hidden > 0, "vision_stem: non-positive dimensions");
+  if (b.patch_w2 >= 0) {
+    expect(s.in_dim % 2 == 0, "vision_stem: split patch_w2 requires even in_dim");
+    const size_t H = size_t(s.hidden), half = size_t(s.in_dim / 2);
+    const std::vector<float> w0 = L.host_f32(b.patch_w);
+    const std::vector<float> w1 = L.host_f32(b.patch_w2);
+    expect(w0.size() == H * half && w1.size() == H * half, "vision_stem: patch_w / patch_w2 size mismatch");
+    std::vector<float> cat(H * size_t(s.in_dim));
+    for (size_t r = 0; r < H; ++r) {
+      std::memcpy(cat.data() + r * size_t(s.in_dim), w0.data() + r * half, half * sizeof(float));
+      std::memcpy(cat.data() + r * size_t(s.in_dim) + half, w1.data() + r * half, half * sizeof(float));
+    }
+    s.patch_w = L.vision_put(cat);
+  } else {
+    const std::vector<float> w = L.host_f32(b.patch_w);
+    expect(w.size() == size_t(s.hidden) * size_t(s.in_dim), "vision_stem: patch_w size mismatch");
+    s.patch_w = L.vision_put(w);
+  }
+  if (b.patch_b >= 0) s.patch_b = L.vision_vec(b.patch_b);
+  s.pos_mode = b.pos_mode;
+  s.pos_grid_h = b.pos_grid_h;
+  s.pos_grid_w = b.pos_grid_w;
+  s.merge_size = std::max(1, int(b.merge_size));
+  if (b.pos_w >= 0) {
+    const size_t n = WeightLoader::numel(L.t(b.pos_w));
+    expect(n % size_t(s.hidden) == 0, "vision_stem: pos_w size not divisible by hidden");
+    s.pos_rows = int(n / size_t(s.hidden));
+    if (s.pos_mode == FLYX_VPOS_BILINEAR_2D) {
+      expect(s.pos_grid_h > 0 && s.pos_grid_w > 0 &&
+                 size_t(s.pos_grid_h) * size_t(s.pos_grid_w) <= size_t(s.pos_rows),
+             "vision_stem: pos_grid_h * pos_grid_w exceeds pos_w rows");
+    }
+    s.pos_w = L.vision_vec(b.pos_w);
+  }
+  expect(b.cls_token < 0, "vision_stem: cls_token is not yet implemented by this backend");
+  s.pre_norm = bind_vnorm(L, b.pre_norm);
+  return s;
+}
+
+VitAttnBlock vit_attn(WeightLoader& L, const flyx_vit_attn_block& b) {
+  VitAttnBlock a;
+  a.hidden = b.hidden;
+  a.nh = b.n_heads;
+  a.hd = b.head_dim;
+  a.rope_mode = b.rope_mode;
+  a.theta = b.theta;
+  a.merge_size = std::max(1, int(b.merge_size));
+  a.norm = bind_vnorm(L, b.norm);
+  a.q_norm = bind_vnorm(L, b.q_norm);
+  a.k_norm = bind_vnorm(L, b.k_norm);
+  const int pw = a.nh * a.hd;
+  int rows = 0;
+  if (b.qkv >= 0) {
+    a.w_qkv = L.vision_lin(b.qkv);
+    rows = a.w_qkv.N;
+    if (b.qkv_b >= 0) a.qkv_b = L.vision_vec(b.qkv_b);
+  } else {
+    a.w_qkv = L.vision_lin_stack({b.q, b.k, b.v}, &rows);
+    if (b.q_b >= 0 || b.k_b >= 0 || b.v_b >= 0) {
+      std::vector<float> qb(size_t(3 * pw), 0.f);
+      auto copy_b = [&](int w, int off) {
+        if (w < 0) return;
+        const std::vector<float> v = L.host_f32(w);
+        expect(int(v.size()) == pw, "vit_attn: q/k/v bias size mismatch");
+        std::memcpy(qb.data() + off, v.data(), size_t(pw) * sizeof(float));
+      };
+      copy_b(b.q_b, 0);
+      copy_b(b.k_b, pw);
+      copy_b(b.v_b, 2 * pw);
+      a.qkv_b = L.vision_put(qb);
+    }
+  }
+  expect(rows == 3 * pw, "vit_attn: qkv projection rows do not match 3 * nh * hd");
+  a.w_o = L.vision_lin(b.o);
+  if (b.o_b >= 0) a.o_b = L.vision_vec(b.o_b);
+  if (b.layer_scale >= 0) a.layer_scale = L.vision_vec(b.layer_scale);
+  return a;
+}
+
+VitMlpBlock vit_mlp(WeightLoader& L, const flyx_vit_mlp_block& b) {
+  VitMlpBlock f;
+  f.hidden = b.hidden;
+  f.inter = b.inter;
+  f.act = b.act;
+  f.gated = b.gated != 0;
+  f.norm = bind_vnorm(L, b.norm);
+  f.w_fc1 = L.vision_lin(b.fc1);
+  if (b.fc1_b >= 0) f.fc1_b = L.vision_vec(b.fc1_b);
+  if (f.gated) {
+    f.w_gate = L.vision_lin(b.gate);
+    if (b.gate_b >= 0) f.gate_b = L.vision_vec(b.gate_b);
+  }
+  f.w_fc2 = L.vision_lin(b.fc2);
+  if (b.fc2_b >= 0) f.fc2_b = L.vision_vec(b.fc2_b);
+  if (b.layer_scale >= 0) f.layer_scale = L.vision_vec(b.layer_scale);
+  return f;
+}
+
+VisionMergeBlock vision_merge(WeightLoader& L, const flyx_vision_merge_block& b) {
+  VisionMergeBlock mg;
+  mg.in_hidden = b.in_hidden;
+  mg.merge_hidden = b.fc1_out;
+  mg.out_hidden = b.out_hidden;
+  mg.merge_mode = b.merge_mode;
+  mg.merge_size = std::max(1, int(b.merge_size));
+  mg.act = b.act;
+  mg.post_norm = b.post_norm != 0;
+  mg.norm = bind_vnorm(L, b.norm);
+  if (b.fc1 >= 0) mg.w_fc1 = L.vision_lin(b.fc1);
+  if (b.fc1_b >= 0) mg.fc1_b = L.vision_vec(b.fc1_b);
+  if (b.fc2 >= 0) mg.w_fc2 = L.vision_lin(b.fc2);
+  if (b.fc2_b >= 0) mg.fc2_b = L.vision_vec(b.fc2_b);
+  return mg;
+}
+
 template <class B>
 void add(flyx_bmodel* m, B b) {
   m->blocks.emplace_back(std::in_place_type<B>, std::move(b));
@@ -489,9 +618,14 @@ void bind(flyx_bmodel* m, const flyx_model_desc& d, LoadTimes* times) {
         break;
       }
       case FLYX_BLOCK_DV_LAYER: add(m, dv_layer(L, d, b.dv_layer, carve)); break;
+      case FLYX_BLOCK_VISION_STEM: add(m, vision_stem(L, b.vision_stem)); break;
+      case FLYX_BLOCK_VIT_ATTN: add(m, vit_attn(L, b.vit_attn)); break;
+      case FLYX_BLOCK_VIT_MLP: add(m, vit_mlp(L, b.vit_mlp)); break;
+      case FLYX_BLOCK_VISION_MERGE: add(m, vision_merge(L, b.vision_merge)); break;
       default: throw std::runtime_error("block kind " + std::to_string(b.kind) + ": not implemented by this backend");
     }
   }
+  m->vision_disk.flush_clean();
   L.finish();
   if (times) *times = L.times();
 }

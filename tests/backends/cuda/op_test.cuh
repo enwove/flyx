@@ -257,5 +257,15 @@ void test_dv_slide(int slots, int hidden, int rank);
 void test_dv_selector_table(int depths, int rank, int vocab);
 void test_dv_trees();
 void test_canvas_attention(int hd, int nh, int nkv, int start, int N, bool causal, bool fp8, double theta);
+void test_layernorm();
+void test_add_bias();
+void test_vact();
+void test_gemm_f32();
+void test_vision_pos_embed();
+void test_vision_rope_2d();
+void test_vision_attention();
+void test_vision_avg_pool();
+void test_embed_scatter();
+void test_mrope();
 
 }  // namespace flyx::optest

@@ -46,6 +46,7 @@ class Writer {
   explicit Writer(RenderedChat* out) : out_(out) {
     out_->text.clear();
     out_->literal.clear();
+    out_->images.clear();
   }
   void lit(std::string_view s) {
     if (s.empty()) return;
@@ -56,6 +57,12 @@ class Writer {
   }
   void in(std::string_view s) { out_->text += s; }
   void text(std::string_view s, bool client) { client ? in(s) : lit(s); }
+  // Emits a template image placeholder as a literal span and anchors `img` at its byte span.
+  void image(std::shared_ptr<const interfaces::ImageInput> img, std::string_view placeholder) {
+    const size_t b = out_->text.size();
+    lit(placeholder);
+    out_->images.push_back({b, out_->text.size(), std::move(img)});
+  }
 
  private:
   RenderedChat* out_;
