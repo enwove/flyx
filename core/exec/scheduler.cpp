@@ -231,6 +231,12 @@ void Scheduler::publish_model() {
   m.chat_format = chat_.format();
   m.chat_ok = chat_.ok();
   m.chat_native = chat_.native();
+  m.vision = engine_->has_vision();
+  if (m.vision) {
+    m.vision_device = engine_->options().vision_device;
+    m.vision_quant = engine_->options().vision_quant;
+    m.vision_max_tokens = engine_->options().vision_max_tokens;
+  }
   m.memory = engine_->memory_report();
   m.width = engine_->width();
   m.max_ctx = max_ctx();

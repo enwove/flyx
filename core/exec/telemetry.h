@@ -35,6 +35,9 @@ struct RequestRecord {
 struct ModelInfo {
   std::string device, backend, drafter, chat_format, memory;  // memory: Engine::memory_report()
   bool chat_ok = false, chat_native = false;
+  bool vision = false;
+  std::string vision_device, vision_quant;
+  int vision_max_tokens = 0;
   int width = 0;                  // widest round
   int max_ctx = 0, max_sessions = 0;
   uint64_t ledger_budget = 0;     // device bytes the engine may use (0 = unknown)

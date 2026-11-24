@@ -463,6 +463,7 @@ int run(int argc, char** argv) {
   ModelHost models(args.so);
   EngineOptions start_from = eo;
   start_from.drafter_files.clear();  // the command line's model's own: a model named on the page names its drafters
+  start_from.mmproj_file.clear();    // likewise: a model named on the page names its own vision projector
   Server srv{&models, cfg, start_from, os::unix_seconds(), {}};
   RequestLog requests(args.request_log);
   srv.requests = &requests;
@@ -473,7 +474,9 @@ int run(int argc, char** argv) {
   ModelHost::Want later;
   const bool remembered = model.empty() && ModelHost::remembered(&later, start_from);
   if (!model.empty()) {
-    if (!models.run(ModelHost::Want{model, eo.drafter_files, start_from, args.name}, &err)) {
+    EngineOptions init_eo = start_from;
+    init_eo.mmproj_file = eo.mmproj_file;
+    if (!models.run(ModelHost::Want{model, eo.drafter_files, init_eo, args.name}, &err)) {
       end_dashboard(true);
       os::write_original_stderr("error: " + err + "\n");
       pause_owned_console();

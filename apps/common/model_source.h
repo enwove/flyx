@@ -28,6 +28,8 @@ struct Fetched {
   std::vector<std::string> drafters;  // paths: the ones named, and the MTP file of the model's repository when the
                                       // model's GGUF lacks the layer
   std::string mmproj;                 // path to multimodal vision projector GGUF (empty: none)
+  std::string mmproj_source;          // display label: repo/path (Hub) or local path
+  std::optional<uint64_t> mmproj_size;  // bytes on disk
   std::string name;                   // the model's name for the API: its file's, without the extension
   std::vector<std::string> notes;     // for the log: a drafter published for this model, the MTP file taken
   std::vector<DrafterSource> drafter_sources;  // what the model drafts with: its own MTP layer, the files above
@@ -67,7 +69,7 @@ int gguf_mtp_layers(const std::string& path);
 struct LocalModel {
   std::string path;   // absolute
   std::string file;   // its name
-  std::string kind;   // "gguf" or "flyx"
+  std::string kind;   // "gguf", "flyx", or "mmproj"
   std::string quant;  // from the name, "" when it names none
   uint64_t size = 0;
   int parts = 0;  // > 1 for a complete split GGUF (path points to shard 1, size is the sum)

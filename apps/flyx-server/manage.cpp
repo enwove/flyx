@@ -121,11 +121,13 @@ Listed dir_entry(const apps::LocalModel& m) {
 // copy, else the newest snapshot's); then the model directories' files.
 std::vector<Listed> listing(const Server& s) {
   const std::vector<hub::Cached> snapshots = hub::cached();
-  std::set<std::string> repos_with_mtp;  // the repository's MTP layer is in the cache, in any snapshot
+  std::set<std::string> repos_with_mtp;     // the repository's MTP layer is in the cache, in any snapshot
+  std::set<std::string> repos_with_mmproj;  // the repository's vision projector is in the cache, in any snapshot
   for (const hub::Cached& c : snapshots) {
     hub::Repo r;
     r.files = c.files;
     if (hub::mtp_file(r)) repos_with_mtp.insert(c.repo);
+    if (hub::mmproj_file(r)) repos_with_mmproj.insert(c.repo);
   }
   std::vector<Listed> out;
   std::set<std::pair<std::string, std::string>> seen;  // (repository, path)
@@ -148,7 +150,8 @@ std::vector<Listed> listing(const Server& s) {
       }
       l.json = {{"name", name + suffix}, {"kind", kind}, {"source", "hub"}, {"repo", c.repo}, {"quant", or_null(quant)},
                 {"file", file}, {"path", disk}, {"size", size}, {"modified", apps::modified_unix(modified)},
-                {"revision", c.commit}, {"current", c.current}, {"mtp", mtp}};
+                {"revision", c.commit}, {"current", c.current}, {"mtp", mtp},
+                {"mmproj", std::string(kind) == "gguf" && repos_with_mmproj.count(c.repo) ? ojson("in-repo") : ojson(nullptr)}};
       return l;
     };
     const std::vector<hub::GgufChoice> ggufs = hub::gguf_choices(r);
@@ -268,6 +271,9 @@ ojson repo_json(const hub::Repo& r) {
   ojson mtp = nullptr;
   if (const hub::RepoFile* f = hub::mtp_file(r))
     mtp = {{"path", f->path}, {"size", f->size}, {"cached", on_disk(snap + f->path)}};
+  ojson mmproj = nullptr;
+  if (const hub::RepoFile* f = hub::mmproj_file(r))
+    mmproj = {{"path", f->path}, {"size", f->size}, {"cached", on_disk(snap + f->path)}};
   // A DFlash2 drafter's directory: config.json naming the architecture, and safetensors; no GGUF.
   uint64_t weights = 0;
   bool config = false;
@@ -294,6 +300,7 @@ ojson repo_json(const hub::Repo& r) {
           {"base_models", r.base_models},
           {"ggufs", ggufs},
           {"mtp", mtp},
+          {"mmproj", mmproj},
           {"drafter", ggufs.empty() && config && weights > 0 && hub::is_drafter(r) ? ojson({{"size", weights}}) : ojson(nullptr)},
           {"architectures", r.architectures},
           {"known_drafters", apps::known_drafters(r.base_models)},

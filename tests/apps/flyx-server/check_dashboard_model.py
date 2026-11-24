@@ -282,17 +282,46 @@ def check_drafters(page, server, want):
     for spec, mode, paths in [(True, "none", []), (True, "dflash2", []), (False, "all", files), (True, "all", files)]:
         want.update(speculative=spec, drafter=mode, drafters=paths)
         page.reload()
+        page.locator('#lset-tabs [data-stab="spec"]').click()
         expect(page.locator("#sd-saved input")).to_be_checked()
         expect(page.locator("#mf-reload")).to_have_count(0)
+        page.locator('#lset-tabs [data-stab="general"]').click()
         page.locator("#mf-ctx").fill("4096")
         check_choice(spec, mode, paths)
     page.locator("#mf-reset").click()
+    page.locator('#lset-tabs [data-stab="spec"]').click()
     page.locator("#sd-default").click()
     check_choice(True, "", [])
     page.locator("#sd-file").fill("./another.gguf")
     check_choice(True, "mtp", ["./another.gguf"])
     page.locator("#mf-reset").click()
     expect(page.locator("#sd-saved input")).to_be_checked()
+
+
+def check_vision(page, server):
+    """Vision encoder settings tab: custom mmproj, storage/precision/max-tokens, disable toggle."""
+    page.locator('#lset-tabs [data-stab="vision"]').click()
+    expect(page.locator("#vs-on")).to_be_checked()
+    expect(page.locator("#vs-device")).to_have_value("disk")
+    expect(page.locator("#vs-quant")).to_have_value("q8")
+    page.locator("#vs-file").fill("./mmproj-test.gguf")
+    page.locator("#vs-device").select_option("host")
+    page.locator("#vs-quant").select_option("nvfp4")
+    page.locator("#vs-maxtok").fill("1024")
+    args = command(page)
+    assert args[args.index("--mmproj") + 1] == "./mmproj-test.gguf", args
+    assert args[args.index("--vision-device") + 1] == "host", args
+    assert args[args.index("--vision-quant") + 1] == "nvfp4", args
+    assert args[args.index("--vision-max-tokens") + 1] == "1024", args
+    confirm(page, "#mf-reload", "Reload")
+    body = server.posted[-1]
+    assert (body["vision"], body["mmproj"], body["vision_device"], body["vision_quant"], body["vision_max_tokens"]) == (
+        True, "./mmproj-test.gguf", "host", "nvfp4", 1024), body
+    page.locator("#vs-on").uncheck(force=True)
+    args = command(page)
+    assert "--no-vision" in args and "--mmproj" not in args and "--vision-device" not in args, args
+    page.locator("#mf-reset").click()
+    expect(page.locator("#vs-on")).to_be_checked()
 
 
 def check_hub(page, server, want):
@@ -565,6 +594,7 @@ def check(browser):
     check_settings(page, server, want)
     check_commands(page, want)
     check_drafters(page, server, want)
+    check_vision(page, server)
     page.close()
     check_context_limit(open_page, want)
     check_vram_apps(open_page, want)

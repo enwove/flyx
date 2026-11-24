@@ -74,6 +74,7 @@ function Serving({ tm, again, retry, browse }) {
     if (loadedWant) facts.push(["KV cache", loadedWant.kv === "16" ? "16-bit" : loadedWant.kv === "fp8" ? "fp8" : "auto"]);
     facts.push(["Sessions", fmt(model.max_sessions)]);
     facts.push(["Drafting", model.drafter ? model.drafter + ", up to " + model.max_width : "off"]);
+    facts.push(["Vision", model.vision ? (model.vision_device || "disk") + " · " + (model.vision_quant || "q8") : "off"]);
     if (model.load_s) facts.push(["Load time", secs(model.load_s)]);
     if (tm.memory && tm.memory.ledger_used) facts.push(["Memory", gib(tm.memory.ledger_used) + " GiB"]);
   }
@@ -128,7 +129,11 @@ function Serving({ tm, again, retry, browse }) {
       <div class="prog" id="ld-sub">${sub}</div>
       <div class="srv-dr" id="ld-drafters">${drafters.map((d) => html`
         <div class="dr"><span class="k">${d.kind === "mtp" ? "MTP" : d.kind === "dflash2" ? "DFlash2" : d.kind}</span>
-          <span class="f">${(d.from === "model file" ? t("the model file's own layer") : d.from) + (d.size ? " · " + gb(d.size) + " GB" : "")}</span></div>`)}</div>
+          <span class="f">${(d.from === "model file" ? t("the model file's own layer") : d.from) + (d.size ? " · " + gb(d.size) + " GB" : "")}</span></div>`)}
+        ${model.loaded && !busy && (L.vision_projector || model.vision) ? html`
+        <div class="dr"><span class="k">${t("Vision")}</span>
+          <span class="f">${(L.vision_projector && L.vision_projector.from ? L.vision_projector.from : t("model file")) +
+            (L.vision_projector && L.vision_projector.size ? " · " + gb(L.vision_projector.size) + " GB" : "")}</span></div>` : ""}</div>
       <div class=${"banner " + (L.fallback ? "warn" : "bad")} id="ld-err" hidden=${!L.error && !msg}>
         ${L.error ? (L.fallback ? [t("The new model did not load."), tErr(L.error), t(L.fallback + " was loaded again.")].join(" ").replace(/([。！？]) /g, "$1") : tErr(L.error)) : t(msg)}</div>
       <${VramApps} open=${showMemPanel} kind=${panelKind} id="ld-vram-apps"
@@ -141,6 +146,8 @@ function Serving({ tm, again, retry, browse }) {
 
 // A drafter given as a GGUF is an MTP layer; anything else a DFlash2 drafter.
 const kindOf = (d) => /\.gguf$/i.test(d) ? "mtp" : "dflash2";
+const normVisionDev = (v) => (v === "host" || v === "cpu") ? "host" : v === "gpu" ? "gpu" : v === "auto" ? "auto" : "disk";
+const normVisionQuant = (v) => (v === "exact" || v === "bf16") ? "exact" : (v === "nvfp4" || v === "fp4") ? "nvfp4" : "q8";
 
 // The settings of a want as the form shows them, for comparing with what is loaded.
 function shown(w) {
@@ -150,7 +157,10 @@ function shown(w) {
            spec: w.speculative === false ? "off" : "on", drafter: [w.drafter || "default", ...(w.drafters || [])],
            width: w.width === null || w.width === undefined ? "auto" : String(w.width),
            head: w.draft_head === "full" ? "full head" : "1-bit pick", weights: w.draft_weights === "exact" ? "exact" : "compact copy",
-           lookup: w.lookup !== false ? "on" : "off", trees: w.draft_trees ? "on" : "off" };
+           lookup: w.lookup !== false ? "on" : "off", trees: w.draft_trees ? "on" : "off",
+           vision: w.vision === false ? "off" : "on", mmproj: w.mmproj || "auto",
+           vision_device: normVisionDev(w.vision_device), vision_quant: normVisionQuant(w.vision_quant),
+           vision_max_tokens: w.vision_max_tokens > 0 ? String(w.vision_max_tokens) : "auto" };
 }
 
 function draftingOf(w) {
@@ -167,7 +177,10 @@ function formOf(w) {
            kvgpu: typeof w.kv_gpu === "number" ? String(w.kv_gpu) : "", name: w.name || "",
            spec: w.speculative !== false, ...draftingOf(w),
            width: w.width === null || w.width === undefined ? "" : String(w.width), trees: !!w.draft_trees, lookup: w.lookup !== false,
-           head: w.draft_head === "full" ? "full" : "", weights: w.draft_weights === "exact" ? "exact" : "" };
+           head: w.draft_head === "full" ? "full" : "", weights: w.draft_weights === "exact" ? "exact" : "",
+           vision: w.vision !== false, visionSource: w.mmproj ? "custom" : "default", mmproj: w.mmproj || "",
+           vision_device: normVisionDev(w.vision_device), vision_quant: normVisionQuant(w.vision_quant),
+           vision_max_tokens: w.vision_max_tokens > 0 ? String(w.vision_max_tokens) : "" };
 }
 const EMPTY_FORM = formOf({});
 
@@ -180,9 +193,13 @@ function loadBody(chosen, f) {
   const adv = { width: f.width ? parseInt(f.width, 10) : null, draft_trees: f.trees, lookup: f.lookup,
                 draft_head: f.head || null, draft_weights: f.weights || null };
   const draft = f.draftSource === "saved" ? f.savedDraft : { drafter: own ? kindOf(own) : "", drafters: own ? [own] : [] };
+  const mmproj = f.vision && f.visionSource === "custom" && f.mmproj.trim() ? f.mmproj.trim() : null;
+  const vmax = parseInt(f.vision_max_tokens, 10);
+  const vis = { vision: f.vision, mmproj, vision_device: normVisionDev(f.vision_device),
+                vision_quant: normVisionQuant(f.vision_quant), vision_max_tokens: vmax >= 16 ? vmax : null };
   // kv "auto": the engine's default, not the server's --kv (null would keep that)
   return Object.assign({ model: chosen, ctx, kv: f.kv || "auto", kv_ram: kvRam >= 0 ? kvRam : "auto",
-                         kv_gpu: kvGpu >= 0 ? kvGpu : null, name: name || null, speculative: f.spec }, draft, adv);
+                         kv_gpu: kvGpu >= 0 ? kvGpu : null, name: name || null, speculative: f.spec }, draft, adv, vis);
 }
 
 // The command line that loads the same: what a user can put in a script.
@@ -190,7 +207,7 @@ function commandOf(b, shell) {
   const ps = shell === "powershell";
   // Windows PowerShell 5.1 drops literal double quotes and can consume a trailing backslash
   // when joining native arguments that contain spaces. Pass the native command line in these cases.
-  const strings = [b.model, b.name, ...b.drafters];
+  const strings = [b.model, b.name, b.mmproj, ...b.drafters];
   const native = ps && strings.some((s) => s && (s.includes('"') || (/\s/.test(s) && s.endsWith("\\"))));
   const nativeQuote = (s) => '"' + s.replace(/(\\*)"/g, '$1$1\\"').replace(/\\+$/, '$&$&') + '"';
   const q = native ? nativeQuote : ps ? psQuote : shQuote;
@@ -207,6 +224,11 @@ function commandOf(b, shell) {
   if (!b.lookup) parts.push("--no-lookup");
   if (b.draft_head) parts.push("--backend-opt draft_head=" + b.draft_head);
   if (b.draft_weights) parts.push("--backend-opt draft_weights=" + b.draft_weights);
+  if (b.vision === false) parts.push("--no-vision");
+  if (b.mmproj) parts.push("--mmproj " + q(b.mmproj));
+  if (b.vision !== false && b.vision_device && b.vision_device !== "disk") parts.push("--vision-device " + b.vision_device);
+  if (b.vision !== false && b.vision_quant && b.vision_quant !== "q8") parts.push("--vision-quant " + b.vision_quant);
+  if (b.vision !== false && b.vision_max_tokens) parts.push("--vision-max-tokens " + b.vision_max_tokens);
   if (b.name) parts.push("--name " + q(b.name));
   const port = location.port || (location.protocol === "https:" ? "443" : "80");
   if (port !== "8080") parts.push("--port " + port);
@@ -276,6 +298,7 @@ export function ModelPage({ active, libraryAsked, currentAsked }) {
   useEffect(() => { if (libraryAsked) setView("library"); }, [libraryAsked]);  // another page's way here
   useEffect(() => { if (currentAsked) setView("current"); }, [currentAsked]);  // and to the model's card
   const [advOpen, setAdvOpen] = useState(false);
+  const [stab, setStab] = useState("general");
   const [shell, setShell] = useState(defaultShell);
   const [msg, setMsg] = useState("");
   const filled = useRef(false), sawState = useRef(""), sawLoaded = useRef("");
@@ -357,7 +380,7 @@ export function ModelPage({ active, libraryAsked, currentAsked }) {
     setDirMsg("");
     setLoc(a.j.path);
     setPathText(a.j.path);
-    if (a.j.kind === "file" && a.j.models.length === 1) setTarget(a.j.models[0].name);
+    if (a.j.kind === "file" && a.j.models.length === 1 && a.j.models[0].kind !== "mmproj") setTarget(a.j.models[0].name);
   }
   const kept = folders.some((x) => samePath(x, loc));
   const keep = () => setFolders(kept ? folders.filter((x) => !samePath(x, loc)) : [...folders, loc]);
@@ -393,7 +416,7 @@ export function ModelPage({ active, libraryAsked, currentAsked }) {
     placed.current = true;
     const served = loadedWant && !hubName(loadedWant.model) && /[\\/]/.test(loadedWant.model) ? folderOf({ name: loadedWant.model }) : "";
     openPath(served || catalog.cache);
-    const first = loadedWant ? loadedWant.model : (catalog.models.find((m) => m.source === "hub" && m.kind !== "drafter") || {}).name;
+    const first = loadedWant ? loadedWant.model : (catalog.models.find((m) => m.source === "hub" && m.kind !== "drafter" && m.kind !== "mmproj") || {}).name;
     if (first) { setPicked(first); setTarget(first); }
   }, [catalog, tab, view]);
 
@@ -507,13 +530,38 @@ export function ModelPage({ active, libraryAsked, currentAsked }) {
   const draftWith = (name) => {
     setF((current) => Object.assign({}, current, { spec: true, draftSource: "custom", drafter: name }));
     setView("current");
+    setStab("spec");
     setTimeout(() => { const row = document.getElementById("sd-custom"); if (row) row.scrollIntoView({ behavior: "smooth", block: "center" }); }, 60);
   };
+  const projectWith = (path) => {
+    setF((current) => Object.assign({}, current, { vision: true, visionSource: "custom", mmproj: path }));
+    setView("current");
+    setStab("vision");
+    setTimeout(() => { const row = document.getElementById("vs-custom"); if (row) row.scrollIntoView({ behavior: "smooth", block: "center" }); }, 60);
+  };
+  const visOff = !f.vision, visCustom = f.visionSource === "custom", mmOwn = f.mmproj.trim();
+  const pickVision = (source) => { if (!visOff) setF(Object.assign({}, f, { visionSource: source })); };
+  const visDefault = () => {
+    if (loadedWant && loadedWant.vision !== false && !loadedWant.mmproj) {
+      if (L.vision_projector && L.vision_projector.from)
+        return { tag: "in use", tone: "ok", line: t("from " + L.vision_projector.from + (L.vision_projector.size ? " (" + gb(L.vision_projector.size) + " GB)" : "")) };
+      if (model.vision) return { tag: "in use", tone: "ok", line: t("Loaded from the model file.") };
+      return { tag: "none", tone: "", line: t("No vision projector loaded: text-only.") };
+    }
+    return { tag: "", tone: "", line: t("Auto-loads mmproj from Hugging Face if available.") };
+  };
+  const vdflt = visDefault();
   const drafting = !use.spec ? "off" : use.draftSource === "custom" && use.drafter.trim() ? baseName(use.drafter.trim()) :
                    use.draftSource === "saved" ? "last loaded" : "default";
-  const brief = [["context", String(now.ctx)], ["KV", now.kv], ["drafting", drafting]];
+  const visionBrief = !use.vision ? "off" : normVisionDev(use.vision_device) + " · " + normVisionQuant(use.vision_quant);
+  const brief = [["context", String(now.ctx)], ["KV", now.kv], ["drafting", drafting], ["vision", visionBrief]];
+  const genChg = ["ctx", "kv", "kv_ram", "kv_gpu", "name"].filter((k) => changed.includes(k)).length;
+  const specChg = ["spec", "drafter", "width", "head", "weights", "lookup", "trees"].filter((k) => changed.includes(k)).length;
+  const visChg = ["vision", "mmproj", "vision_device", "vision_quant", "vision_max_tokens"].filter((k) => changed.includes(k)).length;
 
   function settingsView(cmdModel) {
+    const specSum = !f.spec ? t("off") : f.draftSource === "custom" && own ? baseName(own) : f.draftSource === "saved" ? t("last loaded") : t("default");
+    const visSum = !f.vision ? t("off") : normVisionDev(f.vision_device) + " · " + normVisionQuant(f.vision_quant);
     return html`
       <div class="pane lset" id="mf-settings">
         <div class="lset-h">
@@ -525,81 +573,145 @@ export function ModelPage({ active, libraryAsked, currentAsked }) {
             <button class="btn primary" id="mf-reload" disabled=${busy} onClick=${() => loadModel(loadedWant.model)}>
               ${t("Reload with these settings")}</button>` : ""}
         </div>
-        <div class="lset-b">
-          <div class="lset-col">
-            <div class="pane-h"><h2>${t("Configuration")}</h2></div>
-            <div class="opts">
-              <${Field} k="ctx" label="Context length" was=${was("ctx")} hint="Tokens, or empty (auto) for the model's full context, or the longest the GPU and host memory hold.">
-                <input type="text" id="mf-ctx" inputmode="numeric" autocomplete="off" spellcheck="false" placeholder=${t("auto")}
-                       value=${f.ctx} onInput=${set("ctx")}/><//>
-              <${Field} k="kv" label="KV cache" was=${was("kv")} hint="fp8 holds twice the context.">
-                <select id="mf-kv" value=${f.kv} onChange=${set("kv")}><option value="">${t("auto")}</option><option value="fp8">fp8</option><option value="16">${t("16-bit")}</option></select><//>
-              <${Field} k="kv_ram" label="KV in host RAM" was=${was("kv_ram")} hint="GB, for context past the GPU.">
-                <input type="number" id="mf-kvram" min="0" step="1" placeholder=${t("auto")} value=${f.kvram} onInput=${set("kvram")}/><//>
-              <${Field} k="kv_gpu" label="KV on the GPU" was=${was("kv_gpu")} hint="Tokens, at most.">
-                <input type="number" id="mf-kvgpu" min="0" step="1024" placeholder=${t("as many as fit")} value=${f.kvgpu} onInput=${set("kvgpu")}/><//>
-              <${Field} k="name" label="API model id" was=${was("name")}>
-                <input type="text" id="mf-name" placeholder=${t("the file's name")} spellcheck="false" autocomplete="off" value=${f.name} onInput=${set("name")}/><//>
+        <div class="lset-nav">
+          <div class="seg lset-seg" role="tablist" id="lset-tabs">
+            <button role="tab" data-stab="general" aria-selected=${String(stab === "general")} onClick=${() => setStab("general")}>
+              <span>${t("Configuration")}</span>
+              ${genChg ? html`<span class="chg">+${genChg}</span>` : ""}
+            </button>
+            <button role="tab" data-stab="spec" aria-selected=${String(stab === "spec")} onClick=${() => setStab("spec")}>
+              <span class=${"dot" + (f.spec ? " on" : "")}></span>
+              <span>${t("Speculative decoding")}</span>
+              <span class="sum">${specSum}</span>
+              ${specChg ? html`<span class="chg">+${specChg}</span>` : ""}
+            </button>
+            <button role="tab" data-stab="vision" aria-selected=${String(stab === "vision")} onClick=${() => setStab("vision")}>
+              <span class=${"dot" + (f.vision ? " on" : "")}></span>
+              <span>${t("Vision encoder")}</span>
+              <span class="sum">${visSum}</span>
+              ${visChg ? html`<span class="chg">+${visChg}</span>` : ""}
+            </button>
+          </div>
+        </div>
+        <div class="lset-panel" id="lset-general" role="tabpanel" hidden=${stab !== "general"}>
+          <div class="pane-h"><h2>${t("Configuration")}</h2></div>
+          <div class="opts c3">
+            <${Field} k="ctx" label="Context length" was=${was("ctx")} hint="Tokens, or empty (auto) for the model's full context, or the longest the GPU and host memory hold.">
+              <input type="text" id="mf-ctx" inputmode="numeric" autocomplete="off" spellcheck="false" placeholder=${t("auto")}
+                     value=${f.ctx} onInput=${set("ctx")}/><//>
+            <${Field} k="kv" label="KV cache" was=${was("kv")} hint="fp8 holds twice the context.">
+              <select id="mf-kv" value=${f.kv} onChange=${set("kv")}><option value="">${t("auto")}</option><option value="fp8">fp8</option><option value="16">${t("16-bit")}</option></select><//>
+            <${Field} k="kv_ram" label="KV in host RAM" was=${was("kv_ram")} hint="GB, for context past the GPU.">
+              <input type="number" id="mf-kvram" min="0" step="1" placeholder=${t("auto")} value=${f.kvram} onInput=${set("kvram")}/><//>
+            <${Field} k="kv_gpu" label="KV on the GPU" was=${was("kv_gpu")} hint="Tokens, at most.">
+              <input type="number" id="mf-kvgpu" min="0" step="1024" placeholder=${t("as many as fit")} value=${f.kvgpu} onInput=${set("kvgpu")}/><//>
+            <${Field} k="name" label="API model id" was=${was("name")}>
+              <input type="text" id="mf-name" placeholder=${t("the file's name")} spellcheck="false" autocomplete="off" value=${f.name} onInput=${set("name")}/><//>
+          </div>
+        </div>
+        <div class="lset-panel" id="lset-spec" role="tabpanel" hidden=${stab !== "spec"}>
+          <div class="pane-h"><h2>${t("Speculative decoding")}</h2>
+            <span class=${"sd-was" + (was("spec") !== null ? " on" : "")}>${was("spec") !== null ? t("was " + t(was("spec"))) : ""}</span>
+            <label class="switch sd-switch" title=${t("Speculative decoding")}>
+              <input type="checkbox" id="sd-on" aria-label=${t("Speculative decoding")} checked=${f.spec} onChange=${set("spec")}/><i></i></label></div>
+          <div class=${"sdopts" + (f.spec ? "" : " off")} data-k="drafter">
+            ${savedDraft ? html`<div class=${"sdrow pick" + (f.draftSource === "saved" ? " sel" : "")} id="sd-saved" onClick=${() => pickDraft("saved")}>
+              <input type="radio" name="sd-src" aria-label=${t("last loaded")} checked=${f.draftSource === "saved"} disabled=${specOff}/>
+              <div class="grow"><div class="dhead"><b>${t("last loaded")}</b><span class="tag2">${savedDraft.drafter || t("default")}</span></div>
+                ${savedDraft.drafters.map((file) => html`<span class="ddesc">${file}</span>`)}</div></div>` : ""}
+            <div class=${"sdrow pick" + (f.draftSource === "default" ? " sel" : "")} id="sd-default" onClick=${() => pickDraft("default")}>
+              <input type="radio" name="sd-src" aria-label=${t("Default")} checked=${f.draftSource === "default"} disabled=${specOff}/>
+              <div class="grow">
+                <div class="dhead"><b>${t("Default")}</b>${dflt.tag ? html`<span class=${"tag2 " + dflt.tone}>${t(dflt.tag)}</span>` : ""}</div>
+                ${dflt.lines.map((l) => html`<em class="sd-what">${l}</em>`)}
+              </div>
+            </div>
+            <div class=${"sdrow pick" + (custom ? " sel" : "")} id="sd-custom" onClick=${() => pickDraft("custom")}>
+              <input type="radio" name="sd-src" aria-label=${t("Custom drafter")} checked=${custom} disabled=${specOff}/>
+              <div class="grow">
+                <div class="dhead"><b>${t("Custom drafter")}</b>
+                  ${custom && own ? html`<span class=${"tag2 " + (ownCached ? "ok" : "")}>${t(ownCached ? "downloaded" : hubName(own) ? "Hugging Face" : "file")}</span>` : ""}
+                  <span class="was on">${was("drafter") !== null ? t("was " + t(was("drafter"))) : ""}</span></div>
+                <p class="ddesc">${t("A drafter of your own, in place of the default: a Hugging Face name or a path on the server's machine.")}</p>
+                <input type="text" id="sd-file" placeholder=${t("org/name, or a path")} spellcheck="false" autocomplete="off" disabled=${specOff}
+                       value=${f.drafter} onFocus=${() => !custom && pickDraft("custom")}
+                       onInput=${(e) => setF(Object.assign({}, f, { draftSource: "custom", drafter: e.target.value }))}/>
+                ${custom ? html`<em>${t(!own ? "Give a Hugging Face name or a path; empty, the default is used." : ownCached ? "On this machine." :
+                                         hubName(own) ? "Fetched from Hugging Face when the model loads." : "A file on the server's machine.")}</em>` : ""}
+              </div>
             </div>
           </div>
-          <div class="lset-col">
-            <div class="pane-h"><h2>${t("Speculative decoding")}</h2>
-              <span class=${"sd-was" + (was("spec") !== null ? " on" : "")}>${was("spec") !== null ? t("was " + t(was("spec"))) : ""}</span>
-              <label class="switch sd-switch" title=${t("Speculative decoding")}>
-                <input type="checkbox" id="sd-on" aria-label=${t("Speculative decoding")} checked=${f.spec} onChange=${set("spec")}/><i></i></label></div>
-            <div class=${"sdopts" + (f.spec ? "" : " off")} data-k="drafter">
-              ${savedDraft ? html`<div class=${"sdrow pick" + (f.draftSource === "saved" ? " sel" : "")} id="sd-saved" onClick=${() => pickDraft("saved")}>
-                <input type="radio" name="sd-src" aria-label=${t("last loaded")} checked=${f.draftSource === "saved"} disabled=${specOff}/>
-                <div class="grow"><div class="dhead"><b>${t("last loaded")}</b><span class="tag2">${savedDraft.drafter || t("default")}</span></div>
-                  ${savedDraft.drafters.map((file) => html`<span class="ddesc">${file}</span>`)}</div></div>` : ""}
-              <div class=${"sdrow pick" + (f.draftSource === "default" ? " sel" : "")} id="sd-default" onClick=${() => pickDraft("default")}>
-                <input type="radio" name="sd-src" aria-label=${t("Default")} checked=${f.draftSource === "default"} disabled=${specOff}/>
-                <div class="grow">
-                  <div class="dhead"><b>${t("Default")}</b>${dflt.tag ? html`<span class=${"tag2 " + dflt.tone}>${t(dflt.tag)}</span>` : ""}</div>
-                  ${dflt.lines.map((l) => html`<em class="sd-what">${l}</em>`)}
-                </div>
-              </div>
-              <div class=${"sdrow pick" + (custom ? " sel" : "")} id="sd-custom" onClick=${() => pickDraft("custom")}>
-                <input type="radio" name="sd-src" aria-label=${t("Custom drafter")} checked=${custom} disabled=${specOff}/>
-                <div class="grow">
-                  <div class="dhead"><b>${t("Custom drafter")}</b>
-                    ${custom && own ? html`<span class=${"tag2 " + (ownCached ? "ok" : "")}>${t(ownCached ? "downloaded" : hubName(own) ? "Hugging Face" : "file")}</span>` : ""}
-                    <span class="was on">${was("drafter") !== null ? t("was " + t(was("drafter"))) : ""}</span></div>
-                  <p class="ddesc">${t("A drafter of your own, in place of the default: a Hugging Face name or a path on the server's machine.")}</p>
-                  <input type="text" id="sd-file" placeholder=${t("org/name, or a path")} spellcheck="false" autocomplete="off" disabled=${specOff}
-                         value=${f.drafter} onFocus=${() => !custom && pickDraft("custom")}
-                         onInput=${(e) => setF(Object.assign({}, f, { draftSource: "custom", drafter: e.target.value }))}/>
-                  ${custom ? html`<em>${t(!own ? "Give a Hugging Face name or a path; empty, the default is used." : ownCached ? "On this machine." :
-                                           hubName(own) ? "Fetched from Hugging Face when the model loads." : "A file on the server's machine.")}</em>` : ""}
-                </div>
+          ${specOff ? html`<em class="sd-note">${t("Plain decoding: one token a step.")}</em>` : ""}
+          <details class="adv" id="sd-adv" open=${advOpen} onToggle=${(e) => { e.stopPropagation(); setAdvOpen(e.target.open); }}>
+            <summary><${Icon} name="chev"/>${t("Advanced")}<span class="was" id="sd-adv-was">${advChanged.length ? t(advChanged.length + " changed") : ""}</span></summary>
+            <div class="opts c3" style="margin-top: 12px">
+              <${Field} k="width" label="Drafts a round" was=${was("width")} hint="How many drafts the model checks a step.">
+                <select id="sd-width" value=${f.width} onChange=${set("width")} disabled=${specOff}>
+                  <option value="">${t("Auto (chosen each round)")}</option>
+                  ${["1", "2", "3", "4", "5", "6", "7", "8", "12", "16"].map((n) => html`<option value=${n}>${n}</option>`)}
+                </select><//>
+              <${Field} k="head" label="Draft head" was=${was("head")} hint="How drafts choose their tokens.">
+                <select id="sd-head" value=${f.head} onChange=${set("head")} disabled=${specOff}>
+                  <option value="">${t("1-bit pick (default)")}</option><option value="full">${t("Full head")}</option></select><//>
+              <${Field} k="weights" label="Drafter weights" was=${was("weights")} hint="Only the drafts can change, never the output.">
+                <select id="sd-weights" value=${f.weights} onChange=${set("weights")} disabled=${specOff}>
+                  <option value="">${t("Compact copy (default)")}</option><option value="exact">${t("Exact")}</option></select><//>
+              <${Field} k="lookup" label="Drafts from repeated text" was=${was("lookup")} hint="Where the reply repeats earlier text, that text is proposed too.">
+                <label class="switch"><input type="checkbox" id="sd-lookup" checked=${f.lookup} onChange=${set("lookup")} disabled=${specOff}/><i></i>${t(f.lookup ? "on" : "off")}</label><//>
+              <${Field} k="trees" label="Draft trees" was=${was("trees")} hint="The drafter proposes several branches at once, not one line.">
+                <label class="switch"><input type="checkbox" id="sd-trees" checked=${f.trees} onChange=${set("trees")} disabled=${specOff}/><i></i>${t(f.trees ? "on" : "off")}</label><//>
+            </div>
+          </details>
+        </div>
+        <div class="lset-panel" id="lset-vision" role="tabpanel" hidden=${stab !== "vision"}>
+          <div class="pane-h"><h2>${t("Vision encoder")}</h2>
+            <span class=${"sd-was" + (was("vision") !== null ? " on" : "")}>${was("vision") !== null ? t("was " + t(was("vision"))) : ""}</span>
+            <label class="switch sd-switch" title=${t("Vision encoder")}>
+              <input type="checkbox" id="vs-on" aria-label=${t("Vision encoder")} checked=${f.vision} onChange=${set("vision")}/><i></i></label></div>
+          <div class=${"sdopts" + (f.vision ? "" : " off")} data-k="mmproj">
+            <div class=${"sdrow pick" + (!visCustom ? " sel" : "")} id="vs-default" onClick=${() => pickVision("default")}>
+              <input type="radio" name="vs-src" aria-label=${t("Default")} checked=${!visCustom} disabled=${visOff}/>
+              <div class="grow">
+                <div class="dhead"><b>${t("Default")}</b>${vdflt.tag ? html`<span class=${"tag2 " + vdflt.tone}>${t(vdflt.tag)}</span>` : ""}</div>
+                <em class="sd-what">${vdflt.line}</em>
               </div>
             </div>
-            ${specOff ? html`<em class="sd-note">${t("Plain decoding: one token a step.")}</em>` : ""}
-            <details class="adv" id="sd-adv" open=${advOpen} onToggle=${(e) => { e.stopPropagation(); setAdvOpen(e.target.open); }}>
-              <summary><${Icon} name="chev"/>${t("Advanced")}<span class="was" id="sd-adv-was">${advChanged.length ? t(advChanged.length + " changed") : ""}</span></summary>
-              <div class="opts" style="margin-top: 12px">
-                <${Field} k="width" label="Drafts a round" was=${was("width")} hint="How many drafts the model checks a step.">
-                  <select id="sd-width" value=${f.width} onChange=${set("width")} disabled=${specOff}>
-                    <option value="">${t("Auto (chosen each round)")}</option>
-                    ${["1", "2", "3", "4", "5", "6", "7", "8", "12", "16"].map((n) => html`<option value=${n}>${n}</option>`)}
-                  </select><//>
-                <${Field} k="head" label="Draft head" was=${was("head")} hint="How drafts choose their tokens.">
-                  <select id="sd-head" value=${f.head} onChange=${set("head")} disabled=${specOff}>
-                    <option value="">${t("1-bit pick (default)")}</option><option value="full">${t("Full head")}</option></select><//>
-                <${Field} k="weights" label="Drafter weights" was=${was("weights")} hint="Only the drafts can change, never the output.">
-                  <select id="sd-weights" value=${f.weights} onChange=${set("weights")} disabled=${specOff}>
-                    <option value="">${t("Compact copy (default)")}</option><option value="exact">${t("Exact")}</option></select><//>
-                <${Field} k="lookup" label="Drafts from repeated text" was=${was("lookup")} hint="Where the reply repeats earlier text, that text is proposed too.">
-                  <label class="switch"><input type="checkbox" id="sd-lookup" checked=${f.lookup} onChange=${set("lookup")} disabled=${specOff}/><i></i>${t(f.lookup ? "on" : "off")}</label><//>
-                <${Field} k="trees" label="Draft trees" was=${was("trees")} hint="The drafter proposes several branches at once, not one line.">
-                  <label class="switch"><input type="checkbox" id="sd-trees" checked=${f.trees} onChange=${set("trees")} disabled=${specOff}/><i></i>${t(f.trees ? "on" : "off")}</label><//>
+            <div class=${"sdrow pick" + (visCustom ? " sel" : "")} id="vs-custom" onClick=${() => pickVision("custom")}>
+              <input type="radio" name="vs-src" aria-label=${t("Custom projector")} checked=${visCustom} disabled=${visOff}/>
+              <div class="grow">
+                <div class="dhead"><b>${t("Custom projector")}</b>
+                  ${visCustom && mmOwn ? html`<span class="tag2">${t("file")}</span>` : ""}
+                  <span class="was on">${was("mmproj") !== null ? t("was " + t(was("mmproj"))) : ""}</span></div>
+                <p class="ddesc">${t("Path to a companion mmproj-*.gguf file on the server's machine.")}</p>
+                <input type="text" id="vs-file" placeholder=${t("path to mmproj-*.gguf")} spellcheck="false" autocomplete="off" disabled=${visOff}
+                       value=${f.mmproj} onFocus=${() => !visCustom && pickVision("custom")}
+                       onInput=${(e) => setF(Object.assign({}, f, { visionSource: "custom", mmproj: e.target.value }))}/>
               </div>
-            </details>
+            </div>
           </div>
-          <div class="lset-cmd">
-            <div class="pane-h"><h2>${t("Command line")}</h2><span class="aside"><${ShellPicker} shell=${shell} onChange=${setShell}/></span></div>
-            <${CodeSnippet} id="mf-cmd" text=${commandOf(body(cmdModel), shell)}/>
+          ${visOff ? html`<em class="sd-note">${t("Vision disabled: text-only decoding.")}</em>` : ""}
+          <div class=${"opts c3" + (visOff ? " off" : "")} style="margin-top: 14px">
+            <${Field} k="vision_device" label="Vision storage" was=${was("vision_device")} hint="Disk keeps 0 VRAM and 0 locked RAM so KV capacity is untouched.">
+              <select id="vs-device" value=${f.vision_device} onChange=${set("vision_device")} disabled=${visOff}>
+                <option value="disk">${t("Disk (default · 0 VRAM, 0 RAM)")}</option>
+                <option value="host">${t("Host RAM (0 VRAM)")}</option>
+                <option value="gpu">${t("GPU (VRAM)")}</option>
+                <option value="auto">${t("Auto (GPU if >= 8 GB free)")}</option>
+              </select><//>
+            <${Field} k="vision_quant" label="Vision precision" was=${was("vision_quant")} hint="Q8_0 matches BF16 quality (~46% smaller); pre-quantized files stay packed.">
+              <select id="vs-quant" value=${f.vision_quant} onChange=${set("vision_quant")} disabled=${visOff}>
+                <option value="q8">${t("Q8_0 (default)")}</option>
+                <option value="exact">${t("Exact (file precision)")}</option>
+                <option value="nvfp4">${t("NVFP4 (compact)")}</option>
+              </select><//>
+            <${Field} k="vision_max_tokens" label="Max tokens / image" was=${was("vision_max_tokens")} hint="Cap merged visual tokens per image (empty: auto).">
+              <input type="number" id="vs-maxtok" min="16" step="64" placeholder=${t("auto")} disabled=${visOff}
+                     value=${f.vision_max_tokens} onInput=${set("vision_max_tokens")}/><//>
           </div>
+        </div>
+        <div class="lset-cmd">
+          <div class="pane-h"><h2>${t("Command line")}</h2><span class="aside"><${ShellPicker} shell=${shell} onChange=${setShell}/></span></div>
+          <${CodeSnippet} id="mf-cmd" text=${commandOf(body(cmdModel), shell)}/>
         </div>
       </div>`;
   }
@@ -627,7 +739,9 @@ export function ModelPage({ active, libraryAsked, currentAsked }) {
   const localRow = (m) => {
     const d = describe(m), tags = [];
     if (m.kind === "flyx") tags.push([".flyx"]);
+    if (m.kind === "mmproj") tags.push(["mmproj", "info"]);
     if (m.mtp === "in-file") tags.push(["MTP inside", "ok"]); else if (m.mtp === "in-repo") tags.push(["+ MTP file", "ok"]);
+    if (m.mmproj === "in-repo") tags.push(["+ Vision", "ok"]);
     if (m.current === false) tags.push(["older revision", "info"]);
     if (m.parts > 1) tags.push([m.parts + " parts"]);
     return { name: m.name, title: d.quant || d.file || m.name, sub: d.quant ? (d.file || m.name) : "", tags, size: m.size,
@@ -642,8 +756,9 @@ export function ModelPage({ active, libraryAsked, currentAsked }) {
     else if (same) { label = changed.length ? "Reload with these settings" : "Loaded"; disabled = disabled || !changed.length; }
     else if (loadedWant && name) label = "Switch to this model";
     const what = !name ? "" : same ? "This is the model being served." : m || !hubName(name) ? sized(row.size) + " on disk" : sized(row.size) + " to download first";
-    // A drafter chosen for the model served may not draft for another.
+    // A drafter or vision projector chosen for the model served may not match another.
     const strange = !!name && !same && use.spec && use.draftSource !== "default" && (use.draftSource === "saved" || !!use.drafter.trim());
+    const strangeVis = !!name && !same && use.vision && use.visionSource === "custom" && !!use.mmproj.trim();
     return html`
       <div class="loadbox" id="mf-loadbox">
         <div class="what">
@@ -653,6 +768,8 @@ export function ModelPage({ active, libraryAsked, currentAsked }) {
                  : html`<div class="ts" id="mf-chosen-s">${t(note || "Choose one of these to load.")}</div>`}
           ${strange ? html`<div class="ts warn" id="mf-strange">${t("Drafts with the drafter set for the model served.")}
             <button class="linkbtn" onClick=${() => setF(Object.assign({}, f, { draftSource: "default" }))}>${t("Use this model's default")}</button></div>` : ""}
+          ${strangeVis ? html`<div class="ts warn" id="mf-strange-vis">${t("Uses the vision projector set for the model served.")}
+            <button class="linkbtn" onClick=${() => setF(Object.assign({}, f, { visionSource: "default" }))}>${t("Use default projector")}</button></div>` : ""}
           ${msg ? html`<div class="ts bad" id="mf-msg">${t(msg)}</div>` : ""}
         </div>
         <button class="btn primary" id="mf-load" disabled=${disabled} onClick=${() => loadModel(name)}>${t(label)}</button>
@@ -719,6 +836,7 @@ export function ModelPage({ active, libraryAsked, currentAsked }) {
           <div class="dsec">${t("Files")}<span>${t(rows.length + " quantizations")}</span></div>
           <div class="mrows" id="mf-files" role="listbox">${rowsView(rows)}</div>` : ""}
         ${j && j.mtp ? html`<p class="lead dnote">${t("This repository keeps an MTP layer in " + j.mtp.path + " (" + gb(j.mtp.size) + " GB): it comes along for a file without its own.")}</p>` : ""}
+        ${j && j.mmproj ? html`<p class="lead dnote" id="hf-mmproj">${t("This repository includes a vision projector in " + j.mmproj.path + " (" + gb(j.mmproj.size) + " GB): it loads automatically unless vision is turned off.")}</p>` : ""}
         ${j && j.drafter ? html`<div class="banner hint"><div class="grow2">${t(repoSel + " is a drafter (" + gb(j.drafter.size) + " GB), not a model: it drafts for one, and is not loaded on its own.")}</div>
           ${model.id ? html`<button class="btn sm" onClick=${() => draftWith(repoSel)}>${t("Draft with it")}</button>` : ""}</div>` : ""}
         ${j && !j.drafter && !rows.length ? html`<p class="lead">${t("No GGUF files in " + repoSel + ".")}</p>` : ""}
@@ -758,13 +876,13 @@ export function ModelPage({ active, libraryAsked, currentAsked }) {
         setListings((old) => Object.assign({}, old, { [folder]: a.error ? { models: [], error: a.error } : { models: a.j.models } })));
     }
   }, [active, view, tab, catalog, places.join("\n")]);
-  const kindOfModel = (m) => m.kind === "drafter" ? "drafter" : m.kind === "flyx" ? ".flyx" : "GGUF";
+  const kindOfModel = (m) => m.kind === "drafter" ? "drafter" : m.kind === "mmproj" ? "mmproj" : m.kind === "flyx" ? ".flyx" : "GGUF";
   // A model as the list names it: a repository's by its name and quantization, a file by its own name.
   const titleOf = (m) => {
     const d = describe(m);
     return m.source === "hub" && d.repo ? d.repo.split("/")[1] + (d.quant ? " \u00b7 " + d.quant : "") : d.file || baseName(m.name);
   };
-  const pickModel = (m) => { setPicked(m.name); setTarget(m.kind === "drafter" ? "" : m.name); setMsg(""); };
+  const pickModel = (m) => { setPicked(m.name); setTarget(m.kind === "drafter" || m.kind === "mmproj" ? "" : m.name); setMsg(""); };
   function localList() {
     if (catalogErr) return html`<div class="empty pad">${catalogErr}</div>`;
     if (!catalog) return html`<div class="empty pad">${t("Looking...")}</div>`;
@@ -809,22 +927,23 @@ export function ModelPage({ active, libraryAsked, currentAsked }) {
   }
   // One model of the list: what it is, where its file is, and the box that loads it.
   function modelDetail(m) {
-    const d = describe(m), hubModel = m.source === "hub", drafter = m.kind === "drafter";
+    const d = describe(m), hubModel = m.source === "hub", drafter = m.kind === "drafter", mmproj = m.kind === "mmproj";
     const chips = [[t(kindOfModel(m)), ""]];
     if (d.quant) chips.push([d.quant, ""]);
     if (m.mtp === "in-file") chips.push([t("MTP inside"), "ok"]); else if (m.mtp === "in-repo") chips.push([t("+ MTP file"), "ok"]);
+    if (m.mmproj === "in-repo") chips.push([t("+ Vision"), "ok"]);
     if (m.parts > 1) chips.push([t(m.parts + " parts"), ""]);
     if (m.current === false) chips.push([t("older revision"), "info"]);
     if (loadedWant && m.name === loadedWant.model) chips.push([t("serving"), "live"]);
     return html`
       <div class="hub-scroll" id="lc-detail">
         <div class="dh">
-          <div class="dh-icon"><${Icon} name="model"/></div>
+          <div class="dh-icon"><${Icon} name=${mmproj ? "image" : "model"}/></div>
           <div class="dh-t"><h3 id="lc-name">${titleOf(m)}</h3><span>${hubModel ? (d.repo || "").split("/")[0] : folderOf(m)}</span></div>
-          ${hubModel && !drafter ? html`<button class="btn ghost sm" id="lc-quants" onClick=${() => { setTab("hub"); showRepo(d.repo, ""); }}>${t("All its quantizations")}</button>` : ""}
+          ${hubModel && !drafter && !mmproj ? html`<button class="btn ghost sm" id="lc-quants" onClick=${() => { setTab("hub"); showRepo(d.repo, ""); }}>${t("All its quantizations")}</button>` : ""}
           ${hubModel ? html`<button class="btn ghost sm" id="lc-delete" onClick=${() => removeCached(m)}><${Icon} name="trash"/>${t("Delete")}</button>` : ""}
         </div>
-        <div class="dchips">${chips.map(([text, tone]) => html`<span class=${"tag2 " + tone}>${text}</span>`)}${drafter ? "" : html`<${FitTag} size=${m.size}/>`}</div>
+        <div class="dchips">${chips.map(([text, tone]) => html`<span class=${"tag2 " + tone}>${text}</span>`)}${drafter || mmproj ? "" : html`<${FitTag} size=${m.size}/>`}</div>
         <dl class="stats small">
           <div><dt>${t("Size")}</dt><dd>${m.size ? sized(m.size) : "-"}</dd></div>
           ${m.modified ? html`<div><dt>${t("Modified")}</dt><dd>${t(ago(m.modified))}</dd></div>` : ""}
@@ -835,8 +954,10 @@ export function ModelPage({ active, libraryAsked, currentAsked }) {
         <${CodeSnippet} id="lc-path" text=${m.path || m.name}/>
         ${drafter ? html`<div class="banner hint"><div class="grow2">${t(m.name + " is a drafter (" + gb(m.size) + " GB), not a model: it drafts for one, and is not loaded on its own.")}</div>
           ${model.id ? html`<button class="btn sm" onClick=${() => draftWith(m.name)}>${t("Draft with it")}</button>` : ""}</div>` : ""}
+        ${mmproj ? html`<div class="banner hint"><div class="grow2">${t(m.file + " is a vision projector (" + gb(m.size) + " GB), not a standalone model: attach it to a compatible VLM.")}</div>
+          ${model.id ? html`<button class="btn sm" id="lc-use-mmproj" onClick=${() => projectWith(m.path || m.name)}>${t("Use as projector")}</button>` : ""}</div>` : ""}
       </div>
-      ${loadBox(drafter ? [] : [localRow(m)], drafter ? "A drafter is not loaded on its own." : "")}`;
+      ${loadBox(drafter || mmproj ? [] : [localRow(m)], drafter ? "A drafter is not loaded on its own." : mmproj ? "A vision projector is not loaded on its own." : "")}`;
   }
   function localDetail() {
     const j = atCache ? null : dir, start = !!j && j.kind === "start";
@@ -859,7 +980,7 @@ export function ModelPage({ active, libraryAsked, currentAsked }) {
       const rows = [];
       const body = groups.map(([name, all]) => {
         const list = all.slice().sort((x, y) => (x.size || 0) - (y.size || 0));
-        const mine = list.filter((m) => m.kind !== "drafter").map(localRow), drafter = list.find((m) => m.kind === "drafter");
+        const mine = list.filter((m) => m.kind !== "drafter" && m.kind !== "mmproj").map(localRow), drafter = list.find((m) => m.kind === "drafter");
         rows.push(...mine);
         return html`
           <div class="rgroup" data-repo=${name}>
@@ -881,10 +1002,11 @@ export function ModelPage({ active, libraryAsked, currentAsked }) {
         ${loadBox(rows, rows.length ? "" : "Nothing here to load.")}`;
     }
     // Any other folder: the folders in it, the model files in it and under it.
-    const rows = j ? j.models.map((m) => {
+    const rows = j ? j.models.filter((m) => m.kind !== "mmproj").map((m) => {
       const r = localRow(m), rel = j.kind === "dir" && m.path.length > j.path.length ? m.path.slice(j.path.length).replace(/^[\\/]+/, "") : m.file;
       return Object.assign(r, { sub: r.title === rel ? "" : rel });
     }).filter((r) => hit(r.title + " " + r.sub)) : [];
+    const folderMmproj = j ? j.models.filter((m) => m.kind === "mmproj") : [];
     return html`
       <div class="hub-scroll" id="lc-detail">
         ${bar}
@@ -896,7 +1018,9 @@ export function ModelPage({ active, libraryAsked, currentAsked }) {
         ${j && !start ? html`
           <div class="dsec">${t("Model files")}<span>${t(j.kind === "dir" ? "here and two folders down" : "")}</span></div>
           ${rows.length ? html`<div class="mrows" id="mf-cached" role="listbox">${rowsView(rows)}</div>`
-                        : html`<div class="empty">${t(j.models.length ? "Nothing matches." : "No .gguf or .flyx model files here.")}</div>`}` : ""}
+                        : html`<div class="empty">${t(j.models.length ? "Nothing matches." : "No .gguf or .flyx model files here.")}</div>`}
+          ${folderMmproj.map((mm) => html`<div class="banner hint" style="margin-top: 10px"><div class="grow2">${t(mm.file + " is a vision projector (" + gb(mm.size) + " GB), not a standalone model: attach it to a compatible VLM.")}</div>
+            ${model.id ? html`<button class="btn sm" onClick=${() => projectWith(mm.path || mm.name)}>${t("Use as projector")}</button>` : ""}</div>`)}` : ""}
       </div>
       ${loadBox(rows, start ? "Open a folder to see its model files." : "")}`;
   }
@@ -905,7 +1029,8 @@ export function ModelPage({ active, libraryAsked, currentAsked }) {
   const pickedModel = picked ? places.flatMap(modelsOf).find((m) => m.name === picked) : null;
   const shownRows = hubTab ? (hub && hub.repo === repoSel ? (hub.j.ggufs || []).filter(whole).map((g) => g.name) : [])
                   : pickedModel ? [pickedModel.name]
-                  : atCache ? local.filter((m) => m.source === "hub" && m.kind !== "drafter").map((m) => m.name) : dir ? dir.models.map((m) => m.name) : [];
+                  : atCache ? local.filter((m) => m.source === "hub" && m.kind !== "drafter" && m.kind !== "mmproj").map((m) => m.name)
+                  : dir ? dir.models.filter((m) => m.kind !== "mmproj").map((m) => m.name) : [];
   const cmdModel = shownRows.includes(target) ? target : loadedWant ? loadedWant.model : L.remembered ? L.remembered.model : "";
   const again = L.remembered ? { model: L.remembered.model, load: () => loadModel(L.remembered.model, L.remembered) } : null;
   const retryWant = L.target
@@ -934,7 +1059,7 @@ export function ModelPage({ active, libraryAsked, currentAsked }) {
           <div class="seg" role="tablist" id="src-seg">
             <button role="tab" data-src="hub" aria-selected=${String(hubTab)} onClick=${() => setTab("hub")}><${Icon} name="hf"/>Hugging Face</button>
             <button role="tab" data-src="local" aria-selected=${String(!hubTab)} onClick=${() => setTab("local")}>
-              <${Icon} name="machine"/>${t("On this machine")}${local.length ? html`<span class="n" id="mf-count">${local.filter((m) => m.kind !== "drafter").length}</span>` : ""}</button>
+              <${Icon} name="machine"/>${t("On this machine")}${local.length ? html`<span class="n" id="mf-count">${local.filter((m) => m.kind !== "drafter" && m.kind !== "mmproj").length}</span>` : ""}</button>
           </div>
           <label class="search"><${Icon} name="search"/>
             ${hubTab ? html`<input type="text" id="hf-q" placeholder=${t("Search Hugging Face, or give a repository: org/name")} spellcheck="false" autocomplete="off"

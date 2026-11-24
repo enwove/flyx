@@ -36,6 +36,9 @@ ojson want_json(const ModelHost::Want& w) {
           {"draft_weights", w.draft_weights.empty() ? ojson(nullptr) : ojson(w.draft_weights)},
           {"mmproj", w.eo.mmproj_file.empty() ? ojson(nullptr) : ojson(w.eo.mmproj_file)},
           {"vision", w.eo.vision},
+          {"vision_device", w.eo.vision_device.empty() ? ojson("disk") : ojson(w.eo.vision_device)},
+          {"vision_quant", w.eo.vision_quant.empty() ? ojson("q8") : ojson(w.eo.vision_quant)},
+          {"vision_max_tokens", w.eo.vision_max_tokens > 0 ? ojson(w.eo.vision_max_tokens) : ojson(nullptr)},
           {"name", w.name}};
 }
 
@@ -171,13 +174,43 @@ bool want_from_json(const ojson& j, const EngineOptions& base, ModelHost::Want* 
     if (!j["name"].is_string()) return *err = "\"name\": model id string", false;
     out.name = j["name"].get<std::string>();
   }
-  if (j.contains("mmproj") && !j["mmproj"].is_null()) {
-    if (!j["mmproj"].is_string()) return *err = "\"mmproj\": path to vision projector GGUF", false;
-    out.eo.mmproj_file = j["mmproj"].get<std::string>();
+  if (j.contains("mmproj")) {
+    if (j["mmproj"].is_null()) {
+      out.eo.mmproj_file.clear();
+    } else {
+      if (!j["mmproj"].is_string()) return *err = "\"mmproj\": path to vision projector GGUF", false;
+      out.eo.mmproj_file = j["mmproj"].get<std::string>();
+    }
   }
   if (j.contains("vision") && !j["vision"].is_null()) {
     if (!j["vision"].is_boolean()) return *err = "\"vision\": true or false", false;
     out.eo.vision = j["vision"].get<bool>();
+  }
+  if (j.contains("vision_device") && !j["vision_device"].is_null()) {
+    if (!j["vision_device"].is_string()) return *err = "\"vision_device\": disk, host, gpu or auto", false;
+    const std::string vd = j["vision_device"].get<std::string>();
+    if (!vd.empty() && vd != "disk" && vd != "file" && vd != "host" && vd != "cpu" && vd != "gpu" && vd != "auto")
+      return *err = "\"vision_device\": disk, host, gpu or auto", false;
+    out.eo.vision_device = vd.empty() ? "disk" : vd;
+  }
+  if (j.contains("vision_quant") && !j["vision_quant"].is_null()) {
+    if (!j["vision_quant"].is_string()) return *err = "\"vision_quant\": q8, exact or nvfp4", false;
+    const std::string vq = j["vision_quant"].get<std::string>();
+    if (!vq.empty() && vq != "q8" && vq != "q8_0" && vq != "exact" && vq != "bf16" && vq != "nvfp4" && vq != "fp4")
+      return *err = "\"vision_quant\": q8, exact or nvfp4", false;
+    out.eo.vision_quant = vq.empty() ? "q8" : vq;
+  }
+  if (j.contains("vision_max_tokens")) {
+    if (j["vision_max_tokens"].is_null()) {
+      out.eo.vision_max_tokens = 0;
+    } else if (!j["vision_max_tokens"].is_number_integer()) {
+      return *err = "\"vision_max_tokens\": whole number >= 16, or null for auto", false;
+    } else {
+      const int64_t n = j["vision_max_tokens"].get<int64_t>();
+      if (n != 0 && (n < 16 || n > apps::kMaxCtx))
+        return *err = "\"vision_max_tokens\": 16 to " + std::to_string(apps::kMaxCtx) + ", or null for auto", false;
+      out.eo.vision_max_tokens = int(n);
+    }
   }
   // Drafting, as --width, --draft-trees and --no-lookup set it; absent or null: the server's own setting.
   if (j.contains("width") && !j["width"].is_null()) {
@@ -289,7 +322,7 @@ std::shared_ptr<Scheduler> ModelHost::open(const apps::Fetched& f, const EngineO
                                            std::string* err) const {
   EngineOptions eo = options;
   eo.drafter_files = f.drafters;
-  if (!f.mmproj.empty()) eo.mmproj_file = f.mmproj;
+  eo.mmproj_file = f.mmproj;
   std::fprintf(stderr, "flyx-server: loading %s\n", f.model.c_str());
   const double t0 = os::now_ms();
   std::shared_ptr<Scheduler> sched;
@@ -412,7 +445,12 @@ ojson ModelHost::status() const {
              {"notes", notes_},
              {"fallback", fallback_.empty() ? ojson(nullptr) : ojson(fallback_)},
              {"drafters", drafters_json(served_.sched ? fetched_.drafter_sources : std::vector<apps::DrafterSource>{}, "from")},
-             {"suggested", drafters_json(served_.sched ? fetched_.suggested : std::vector<apps::DrafterSource>{}, "name")}};
+             {"suggested", drafters_json(served_.sched ? fetched_.suggested : std::vector<apps::DrafterSource>{}, "name")},
+             {"vision_projector",
+              served_.sched && !fetched_.mmproj_source.empty()
+                  ? ojson({{"from", fetched_.mmproj_source},
+                           {"size", fetched_.mmproj_size ? ojson(*fetched_.mmproj_size) : ojson(nullptr)}})
+                  : ojson(nullptr)}};
   if (busy_) j["elapsed_s"] = (os::now_ms() - since_ms_) / 1000;
   if (state_ == "fetching")
     j["progress"] = {{"file", progress_.file}, {"done", progress_.done}, {"total", progress_.total},
@@ -432,6 +470,10 @@ void log_loaded(const Scheduler& sched, const std::string& name, double load_s) 
                name.c_str(), m.device.c_str(), m.backend.c_str(), m.max_ctx, m.drafter.c_str(), m.width, load_s);
   std::fprintf(stderr, "flyx-server: memory: %s; up to %d session%s\n", m.memory.c_str(),
                m.max_sessions, m.max_sessions == 1 ? "" : "s");
+  if (m.vision) {
+    std::fprintf(stderr, "flyx-server: vision: %s (%s)%s\n", m.vision_device.c_str(), m.vision_quant.c_str(),
+                 m.vision_max_tokens > 0 ? (" max " + std::to_string(m.vision_max_tokens) + " tok/img").c_str() : "");
+  }
   std::fprintf(stderr, "flyx-server: chat template: %s\n",
                !m.chat_ok ? "none (chat endpoints answer 400)"
                : m.chat_native

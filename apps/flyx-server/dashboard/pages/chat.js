@@ -46,16 +46,18 @@ function ReplyMeta({ m }) {
 }
 
 export function Chat({ active }) {
-  // Messages as the page shows them: {role: "user", content} or {role: "assistant", content, thinking, done, ...}.
+  // Messages as the page shows them: {role: "user", content, images?, imageCount?} or {role: "assistant", content, thinking, done, ...}.
   const [msgs, setMsgs] = useState([]);
   const [prompt, setPrompt] = useState("");
+  const [images, setImages] = useState([]);  // [{name, url}] pending attachments
+  const [drag, setDrag] = useState(false);
   const [think, setThink] = useState(true);
   // The history: the conversations kept in this browser, the one shown among them ("" until its first message),
   // whether their list is open.
   const [chats, setChats] = useState(loadChats);
   const [chatId, setChatId] = useState("");
   const [histOpen, setHistOpen] = useState(false);
-  const controller = useRef(null), box = useRef(null), input = useRef(null);
+  const controller = useRef(null), box = useRef(null), input = useRef(null), fileInput = useRef(null);
   const streaming = !!controller.current;
   // The conversation `id` in the history as `ms` has it now, at the top; untouched when nothing in it changed (one
   // only opened and read stays where it was).
@@ -64,7 +66,8 @@ export function Chat({ active }) {
     if (!id || !first) return old;
     const was = old.find((c) => c.id === id);
     if (was && JSON.stringify(was.msgs) === JSON.stringify(turns)) return old;
-    const title = first.content.replace(/\s+/g, " ").trim().slice(0, 80);
+    const rawTitle = (first.content || "").replace(/\s+/g, " ").trim();
+    const title = (rawTitle || (first.imageCount ? "[Image]" : "")).slice(0, 80);
     return storeChats([{ id, at: Date.now(), title, msgs: turns }, ...old.filter((c) => c.id !== id)]);
   });
   // Kept whenever it changes and no reply is being written: after each reply, and after one is stopped or fails.
@@ -88,23 +91,56 @@ export function Chat({ active }) {
     return next;
   });
 
+  const addFiles = (fileList) => {
+    if (!fileList) return;
+    for (const file of Array.from(fileList)) {
+      if (!file.type || !file.type.startsWith("image/")) continue;
+      const reader = new FileReader();
+      reader.onload = () => {
+        if (typeof reader.result === "string")
+          setImages((old) => old.concat([{ name: file.name || "image", url: reader.result }]));
+      };
+      reader.readAsDataURL(file);
+    }
+  };
+  const onPaste = (e) => {
+    const tm0 = live.last || {};
+    if (!(tm0.model && tm0.model.vision)) return;
+    const files = e.clipboardData && e.clipboardData.files;
+    if (files && files.length && Array.from(files).some((f) => f.type && f.type.startsWith("image/"))) {
+      e.preventDefault();
+      addFiles(files);
+    }
+  };
+  const userWire = (m) => {
+    if (m.images && m.images.length) {
+      const parts = m.images.map((im) => ({ type: "image_url", image_url: { url: im.url } }));
+      if (m.content) parts.push({ type: "text", text: m.content });
+      return { role: "user", content: parts };
+    }
+    return { role: "user", content: m.content };
+  };
+
   async function send() {
     const content = prompt.trim();
-    if (!content || controller.current) return;
+    const attached = images.slice();
+    if ((!content && !attached.length) || controller.current) return;
     setPrompt("");
+    setImages([]);
     // What the model is sent: a turn that failed is left out with its question; a stopped reply goes as far as it got.
     const history = [];
     for (const m of msgs) {
-      if (m.role === "user") history.push({ role: "user", content: m.content });
+      if (m.role === "user") history.push(userWire(m));
       else if (m.error) history.pop();
       else if (m.done || (m.stopped && m.content)) history.push({ role: "assistant", content: m.content });
     }
-    const turns = history.concat([{ role: "user", content }]);
+    const userMsg = attached.length ? { role: "user", content, images: attached } : { role: "user", content };
+    const turns = history.concat([userWire(userMsg)]);
     // The question is kept at once: a page closed before the reply came still has it.
     const chat = chatId || newChatId();
     if (!chatId) setChatId(chat);
-    keep(chat, msgs.concat([{ role: "user", content }]));
-    setMsgs((ms) => ms.concat([{ role: "user", content }, { role: "assistant", content: "", thinking: "", model: (live.last && live.last.model && live.last.model.id) || "Model" }]));
+    keep(chat, msgs.concat([userMsg]));
+    setMsgs((ms) => ms.concat([userMsg, { role: "assistant", content: "", thinking: "", model: (live.last && live.last.model && live.last.model.id) || "Model" }]));
     controller.current = new AbortController();
     const t0 = performance.now();
     let first = 0, reply = "", thinking = "", usage = null, id = "";
@@ -166,6 +202,7 @@ export function Chat({ active }) {
   const clear = () => {
     if (controller.current) controller.current.abort();
     setMsgs([]);
+    setImages([]);
     setChatId("");
   };
   const openChat = (c) => {
@@ -189,11 +226,13 @@ export function Chat({ active }) {
   const key = (e) => { if (e.key === "Enter" && !e.shiftKey && !e.isComposing) { e.preventDefault(); send(); } };
 
   const tm = live.last || {}, model = tm.model || {}, sl = (tm.memory && tm.memory.sessions) || [];
+  const hasVision = !!model.vision;
   const lr = (tm.recent || []).find((r) => r.label === "chat");
   const stat = [];
   if (model.context) stat.push(["context", ktok(sl.length ? sl[0].tokens : 0) + " / " + ktok(model.context)]);
   if (lr) stat.push(["last reply", fmt(lr.decode_tok_s, 1) + " tok/s"]);
   if (model.drafter) stat.push(["drafter", model.drafter]);
+  if (hasVision) stat.push(["vision", (model.vision_device || "disk") + " · " + (model.vision_quant || "q8")]);
   return html`
     <div class="chat">
       <div class="histwrap">
@@ -218,7 +257,10 @@ export function Chat({ active }) {
       <div class="msgs" aria-live="polite" ref=${box}><div class="cv" id="msgs">
         ${!msgs.length ? html`<div class="empty" id="chat-empty" style="text-align: center; padding-top: 18vh">
           ${t("Talk to the model on this server. Replies stream from POST /v1/chat/completions.")}</div>` : ""}
-        ${msgs.map((m, i) => m.role === "user" ? html`<div class="cv-user">${m.content}</div>` : html`
+        ${msgs.map((m, i) => m.role === "user" ? html`<div class="cv-user">
+          ${m.images && m.images.length ? html`<div class="cv-imgs">${m.images.map((im) => html`<img src=${im.url} alt=${im.name || "image"}/>`)}</div>`
+            : m.imageCount ? html`<div class="cv-imgnote">${t(m.imageCount === 1 ? "[1 image attached]" : "[" + m.imageCount + " images attached]")}</div>` : ""}
+          ${m.content}</div>` : html`
           <${AsstTurn} parts=${[]} name=${m.model} current>
             ${m.thinking ? html`<${Think} text=${m.thinking} label=${m.done || m.stopped || m.error ? t("Thought · " + fmt(m.thinking.length) + " characters") : t("Thinking")}/>` : ""}
             <div class="md" dangerouslySetInnerHTML=${{ __html: md(m.content || "") }}></div>
@@ -227,13 +269,24 @@ export function Chat({ active }) {
           <//>`)}
       </div></div>
       <div class="composer">
-        <div class="compose">
-          <textarea id="prompt" rows="1" ref=${input} placeholder=${t("Message FLYX. Enter sends, Shift+Enter for a new line.")}
-                    value=${prompt} onInput=${(e) => setPrompt(e.target.value)} onKeyDown=${key}></textarea>
+        <div class=${"compose" + (drag ? " drag" : "")}
+             onDragOver=${(e) => { if (hasVision) { e.preventDefault(); setDrag(true); } }}
+             onDragLeave=${() => setDrag(false)}
+             onDrop=${(e) => { if (hasVision) { e.preventDefault(); setDrag(false); addFiles(e.dataTransfer && e.dataTransfer.files); } }}>
+          ${images.length ? html`<div class="compose-imgs" id="chat-imgs">${images.map((im, idx) => html`
+            <div class="compose-thumb"><img src=${im.url} alt=${im.name || "image"}/>
+              <button type="button" title=${t("Remove")} aria-label=${t("Remove")}
+                      onClick=${() => setImages((old) => old.filter((_, j) => j !== idx))}><${Icon} name="close"/></button></div>`)}</div>` : ""}
+          <textarea id="prompt" rows="1" ref=${input} placeholder=${t(hasVision ? "Message FLYX, or paste / drop an image. Enter sends, Shift+Enter for a new line." : "Message FLYX. Enter sends, Shift+Enter for a new line.")}
+                    value=${prompt} onInput=${(e) => setPrompt(e.target.value)} onKeyDown=${key} onPaste=${onPaste}></textarea>
           <div class="btns">
+            ${hasVision ? html`<input type="file" ref=${fileInput} accept="image/*" multiple hidden
+                                      onChange=${(e) => { addFiles(e.target.files); e.target.value = ""; }}/>
+              <button type="button" class="imgbtn" id="chat-img" disabled=${streaming} title=${t("Attach image")} aria-label=${t("Attach image")}
+                      onClick=${() => fileInput.current && fileInput.current.click()}><${Icon} name="image"/></button>` : ""}
             <button class="sendbtn stop" id="stop" disabled=${!streaming} title=${t("Stop")} aria-label=${t("Stop the reply")}
                     onClick=${() => controller.current && controller.current.abort()}><${Icon} name="stopsq"/></button>
-            <button class=${"sendbtn" + (prompt.trim() ? "" : " dim")} id="send" disabled=${streaming} title=${t("Send (Enter)")} aria-label=${t("Send")}
+            <button class=${"sendbtn" + (prompt.trim() || images.length ? "" : " dim")} id="send" disabled=${streaming} title=${t("Send (Enter)")} aria-label=${t("Send")}
                     onClick=${send}><${Icon} name="arrowup"/></button>
           </div>
         </div>
