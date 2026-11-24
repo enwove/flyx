@@ -584,6 +584,11 @@ struct LoadOpts {
   int max_ctx = 512;
   int prefill_chunk = 32;
   int width = 0;
+  int kv = FLYX_KV_16;
+  int kv_gpu = -1;
+  int kv_copy_gpu = -1;
+  int64_t kv_ram = 0;
+  std::string kv_method = "exact";
   std::string drafter = "none";
   std::vector<std::string> drafter_files{};
   std::string backend_opts{};
@@ -602,7 +607,11 @@ std::unique_ptr<Engine> load_engine(const std::string& path, const std::string& 
   eo.width = o.speculative ? (o.width > 0 ? o.width : 7) : 0;
   eo.drafter_files = o.drafter_files;
   eo.activations = o.activations;
-  eo.kv = FLYX_KV_16;
+  eo.kv = o.kv;
+  eo.kv_gpu = o.kv_gpu;
+  eo.kv_copy_gpu = o.kv_copy_gpu;
+  eo.kv_ram = o.kv_ram;
+  eo.kv_method = o.kv_method;
   auto e = std::make_unique<Engine>();
   std::string err;
   if (!e->load(path, eo, &err)) throw std::runtime_error("load(" + backend + "): " + err);
@@ -968,6 +977,130 @@ int main(int argc, char** argv) {
       const auto cu_exact_sampled = fresh_gen(*cu_exact, prompt, 24, true);
       check(same_tokens(fresh_gen(*cu_exact_dspark, prompt, 24, true), cu_exact_sampled),
             "mixed-quant --activations exact Gate 4: DSpark sampled+penalties == cuda plain");
+
+      // ---- 5. FP8 KV, 2/3-bit StrataFlux, auto switch, host-RAM windowed prefill, and DSpark KV rings ----
+      std::printf("Inkling-2 FP8 KV, StrataFlux (2/3-bit & auto), windowed prefill, and DSpark KV rings\n");
+      {
+        const int64_t ram = 256ll << 20;
+        const std::string narrow = "strata_denom=8,strata_least=1";
+        // 5a. FP8 KV exact: plain == DSpark (greedy & sampled+penalties).
+        auto fp8_plain = load_engine(bf16_gguf.string(), "cuda", {.prefill_chunk = 32, .kv = FLYX_KV_FP8});
+        auto fp8_dspark = load_engine(bf16_gguf.string(), "cuda",
+                                      {.speculative = true,
+                                       .prefill_chunk = 32,
+                                       .kv = FLYX_KV_FP8,
+                                       .drafter = "dspark",
+                                       .drafter_files = {dspark_bf16.string()}});
+        const auto fp8_greedy = fresh_gen(*fp8_plain, prompt, 24, false);
+        const auto fp8_sampled = fresh_gen(*fp8_plain, prompt, 24, true);
+        check(same_tokens(fresh_gen(*fp8_dspark, prompt, 24, false), fp8_greedy),
+              "FP8 KV Gate 4: DSpark greedy == plain");
+        check(same_tokens(fresh_gen(*fp8_dspark, prompt, 24, true), fp8_sampled),
+              "FP8 KV Gate 4: DSpark sampled+penalties == plain");
+
+        // 5b. StrataFlux with every pair refined reproduces exact binary16 tokens identically.
+        auto strata_all = load_engine(bf16_gguf.string(), "cuda",
+                                      {.prefill_chunk = 32,
+                                       .kv = FLYX_KV_16,
+                                       .kv_method = "strata",
+                                       .backend_opts = "strata_least=100000"});
+        check(same_tokens(fresh_gen(*strata_all, prompt, 24, false), cu_greedy),
+              "RelAttn strata:2 all pairs refined == exact binary16");
+
+        // 5c. 2-bit & 3-bit StrataFlux (binary16 and FP8): plain == DSpark, host KV (+ hot cache), host copy streaming.
+        for (const char* method : {"strata", "strata:3"}) {
+          for (int kv_fmt : {FLYX_KV_16, FLYX_KV_FP8}) {
+            const std::string tag = std::string(method) + (kv_fmt == FLYX_KV_FP8 ? " fp8" : " f16");
+            auto st_plain = load_engine(bf16_gguf.string(), "cuda",
+                                        {.prefill_chunk = 32, .kv = kv_fmt, .kv_method = method, .backend_opts = narrow});
+            auto st_dspark = load_engine(bf16_gguf.string(), "cuda",
+                                         {.speculative = true,
+                                          .prefill_chunk = 32,
+                                          .kv = kv_fmt,
+                                          .kv_method = method,
+                                          .drafter = "dspark",
+                                          .drafter_files = {dspark_bf16.string()},
+                                          .backend_opts = narrow});
+            auto st_host_kv = load_engine(bf16_gguf.string(), "cuda",
+                                          {.speculative = true,
+                                           .prefill_chunk = 32,
+                                           .kv = kv_fmt,
+                                           .kv_gpu = 0,
+                                           .kv_ram = ram,
+                                           .kv_method = method,
+                                           .drafter = "dspark",
+                                           .drafter_files = {dspark_bf16.string()},
+                                           .backend_opts = narrow});
+            auto st_host_copy = load_engine(bf16_gguf.string(), "cuda",
+                                            {.speculative = true,
+                                             .prefill_chunk = 32,
+                                             .kv = kv_fmt,
+                                             .kv_gpu = 0,
+                                             .kv_copy_gpu = 0,
+                                             .kv_ram = ram,
+                                             .kv_method = method,
+                                             .drafter = "dspark",
+                                             .drafter_files = {dspark_bf16.string()},
+                                             .backend_opts = narrow});
+            const auto t_plain = fresh_gen(*st_plain, prompt, 24, false);
+            check(same_tokens(fresh_gen(*st_dspark, prompt, 24, false), t_plain),
+                  tag + " Gate 4: DSpark == plain");
+            check(same_tokens(fresh_gen(*st_host_kv, prompt, 24, false), t_plain),
+                  tag + " host KV (+ hot cache) + DSpark == GPU plain");
+            check(same_tokens(fresh_gen(*st_host_copy, prompt, 24, false), t_plain),
+                  tag + " host KV + host copy streaming + DSpark == GPU plain");
+          }
+        }
+
+        // 5d. auto:2 across strata_from switch (default Qwen3.8/Inkling-2 path): exact before switch, DSpark == plain across.
+        const int sw = int(prompt.size()) + 10;
+        const std::string auto_opts = narrow + ",strata_from=" + std::to_string(sw);
+        for (int kv_fmt : {FLYX_KV_16, FLYX_KV_FP8}) {
+          const std::string tag = kv_fmt == FLYX_KV_FP8 ? "auto:2 fp8" : "auto:2 f16";
+          auto au_plain = load_engine(bf16_gguf.string(), "cuda",
+                                      {.prefill_chunk = 32, .kv = kv_fmt, .kv_method = "auto", .backend_opts = auto_opts});
+          auto au_dspark = load_engine(bf16_gguf.string(), "cuda",
+                                       {.speculative = true,
+                                        .prefill_chunk = 32,
+                                        .kv = kv_fmt,
+                                        .kv_gpu = 0,
+                                        .kv_ram = ram,
+                                        .kv_method = "auto",
+                                        .drafter = "dspark",
+                                        .drafter_files = {dspark_bf16.string()},
+                                        .backend_opts = auto_opts});
+          const auto t_au = fresh_gen(*au_plain, prompt, 24, false);
+          const auto& t_exact = kv_fmt == FLYX_KV_FP8 ? fp8_greedy : cu_greedy;
+          check(same_tokens(std::vector<int32_t>(t_au.begin(), t_au.begin() + 10),
+                            std::vector<int32_t>(t_exact.begin(), t_exact.begin() + 10)),
+                tag + " before strata_from switch == exact");
+          check(same_tokens(fresh_gen(*au_dspark, prompt, 24, false), t_au),
+                tag + " across strata_from switch (host KV + DSpark) == plain");
+        }
+
+        // 5e. Windowed prefill staging (RelWindow) + DSpark Full-layer bounded ring (mtp_window=16, max_ctx=512 > 8*16).
+        std::vector<int32_t> long_prompt(180);
+        for (int i = 0; i < 180; ++i) long_prompt[size_t(i)] = 12 + (i * 17) % 230;
+        auto gpu_strata = load_engine(bf16_gguf.string(), "cuda",
+                                      {.prefill_chunk = 32,
+                                       .kv = FLYX_KV_FP8,
+                                       .kv_method = "strata",
+                                       .backend_opts = narrow});
+        auto win_dspark = load_engine(bf16_gguf.string(), "cuda",
+                                      {.speculative = true,
+                                       .max_ctx = 512,
+                                       .prefill_chunk = 32,
+                                       .kv = FLYX_KV_FP8,
+                                       .kv_gpu = 0,
+                                       .kv_ram = ram,
+                                       .kv_method = "strata",
+                                       .drafter = "dspark",
+                                       .drafter_files = {dspark_bf16.string()},
+                                       .backend_opts = narrow + ",stage_window=64,mtp_window=16"});
+        const auto want_long = fresh_gen(*gpu_strata, long_prompt, 24, false);
+        check(same_tokens(fresh_gen(*win_dspark, long_prompt, 24, false), want_long),
+              "RelAttn windowed prefill (stage_window=64) + DSpark Full ring (mtp_window=16) == GPU strata");
+      }
     }
   } catch (const std::exception& e) {
     std::fprintf(stderr, "FAIL exception: %s\n", e.what());

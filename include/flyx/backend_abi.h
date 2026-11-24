@@ -499,7 +499,7 @@ typedef struct {
  * non-causal block attention over context K/V (optional sliding window) and block rows, SwiGLU MLP. */
 typedef struct {
   int32_t window;                      /* 0 = full context; > 0 = sliding window (e.g. 1025) */
-  int32_t pad0;
+  int32_t kv;                          /* state: FLYX_STATE_KV (draft = 1, layers = 1, window = window) */
   flyx_norm norm, post_norm, q_norm, k_norm, k_ctx_norm, ctx_norm;
   int32_t q, k, v, o, k_ctx, v_ctx, ctx_mix;
   int32_t gate, up, down;
@@ -519,7 +519,6 @@ typedef struct {
   int32_t markov_w1;                   /* [vocab_out, markov_rank] */
   int32_t markov_w2, markov_w2_b;      /* [vocab_out, markov_rank], [vocab_out] or -1 */
   int32_t joint_proj, joint_proj_b;    /* [3*markov_rank, 2*hidden + 2*markov_rank], [3*markov_rank] */
-  int32_t kv;                          /* state: FLYX_STATE_KV (layers = layers) */
   int32_t ring;                        /* state: FLYX_STATE_RING (width = hidden, f_rnn per pos) */
 } flyx_dspark_block;
 

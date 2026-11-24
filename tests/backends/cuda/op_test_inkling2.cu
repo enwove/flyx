@@ -454,6 +454,24 @@ void test_inkling2_rel_attn() {
       }
     }
 
+    // Windowed prefill rel_attention (RelWindow) across 3 windows must match float64 ref and single-pass output.
+    if (c.window == 0 && total >= 24) {
+      float* d_wstate = dev<float>(size_t(c.rows) * c.nh * kFlashStateFloats(c.hd));
+      float* d_wout = dev<float>(size_t(c.rows) * q_dim);
+      const int w1 = total / 3, w2 = (2 * total) / 3;
+      const int bounds[4] = {0, w1, w2, total};
+      for (int wi = 0; wi < 3; ++wi) {
+        RelWindow rw{bounds[wi], bounds[wi + 1], d_wstate, wi == 0, wi == 2};
+        rel_attention(d_qout, d_rout, kv, d_rb, d_sink, c.nh, d_gate, q_dim, c.nh, c.nkv, c.hd, c.d_rel, c.rel_extent,
+                      c.window, c.rows, P, d_wout, q_dim, d_part, splits, TL, 0, rw);
+      }
+      Vec got_w = down(d_wout, size_t(c.rows) * q_dim);
+      expect(std::string("rel_attn windowed(3) vs ref ") + c.name, got_w, want_o, c.fp8 ? 5e-4 : 3e-5);
+      expect(std::string("rel_attn windowed(3) vs single ") + c.name, got_w, got_o, 2e-5);
+      cudaFree(d_wstate);
+      cudaFree(d_wout);
+    }
+
     // Fused split_out -> gemm_presplit == unfused -> gemm (Gate 2) for round-sized rows.
     if (c.rows <= 16 && q_dim % 64 == 0) {
       const int H_out = 128;
@@ -491,6 +509,271 @@ void test_inkling2_rel_attn() {
     cudaFree(d_gate);
     cudaFree(d_out);
     cudaFree(d_part);
+  }
+}
+
+void test_inkling2_rel_strata() {
+  std::printf("inkling2 rel_bias_table + attention_strata (RelStrata)\n");
+  struct Case {
+    int hd, nh, nkv, d_rel, rel_extent, ctx, rows, bits;
+    bool fp8;
+  };
+  const Case cases[] = {
+      {128, 12, 4, 16, 64, 260, 8, 2, true},   // Inkling-2 shape (hd=128, G=3), 2-bit FP8 + hot cache
+      {128, 12, 4, 16, 64, 260, 8, 2, false},  // Inkling-2 shape (hd=128, G=3), 2-bit binary16
+      {128, 12, 4, 16, 64, 260, 6, 3, true},   // Inkling-2 shape (hd=128, G=3), 3-bit packed CTA FP8
+      {128, 12, 4, 16, 64, 190, 5, 4, false},  // Inkling-2 shape (hd=128, G=3), 4-bit binary16
+      {64, 6, 2, 8, 32, 140, 5, 2, true},      // hd=64, G=3, 2-bit FP8
+  };
+  for (const Case& c : cases) {
+    const std::string tag = "hd" + std::to_string(c.hd) + " G=" + std::to_string(c.nh / c.nkv) + " b" +
+                            std::to_string(c.bits) + (c.fp8 ? " fp8" : " f16");
+    seed("inkling2_rel_strata", c.hd, c.nh, c.bits, int(c.fp8));
+    const int total = c.ctx + c.rows, cap = total + 16, slots = 64;
+    const int q_dim = c.nh * c.hd, kv_dim = c.nkv * c.hd;
+    const int words = strata_words(c.hd, c.bits);
+    const float qk_clip = 6.f, rel_clip = 4.f, v_eps = 1e-6f, log_alpha = 0.25f;
+    const int log_floor = 32;
+    const double scale = 1.0 / std::sqrt(double(c.hd));
+
+    Vec q_all = randv(size_t(total) * q_dim, 0.8);
+    Vec k_all = randv(size_t(total) * kv_dim, 0.8);
+    Vec v_all = randv(size_t(total) * kv_dim, 0.8);
+    Vec r_all = randv(size_t(total) * c.nh * c.d_rel, 0.8);
+    Vec q_cw = randv(size_t(q_dim), 0.5);
+    Vec r_cw = randv(size_t(c.nh) * c.d_rel, 0.5);
+    Vec rel_bias = randv(size_t(c.rel_extent) * c.d_rel, 0.3);
+    Vec sink = randv(size_t(c.rows) * c.nh, 0.8);
+    Vec gate = randv(size_t(c.rows) * q_dim, 1.0);
+
+    const size_t nv = size_t(cap) * kv_dim;
+    void* dK = c.fp8 ? static_cast<void*>(dev<uint8_t>(nv)) : static_cast<void*>(dev<kv16>(nv));
+    void* dV = c.fp8 ? static_cast<void*>(dev<uint8_t>(nv)) : static_cast<void*>(dev<kv16>(nv));
+    float* dKs = c.fp8 ? dev<float>(size_t(cap) * c.nkv) : nullptr;
+    float* dVs = c.fp8 ? dev<float>(size_t(cap) * c.nkv) : nullptr;
+    const size_t ncode = size_t(strata_positions(cap)) * c.nkv * words;
+    uint32_t *dkq = dev<uint32_t>(ncode), *dvq = dev<uint32_t>(ncode);
+    __half2 *dkqs = dev<__half2>(size_t(cap) * c.nkv), *dvqs = dev<__half2>(size_t(cap) * c.nkv);
+    KvRef kv{dK, dV, dKs, dVs, dkq, dvq, dkqs, dvqs, c.bits, words, 0};
+
+    float *dq_in = up(q_all), *dk_in = up(k_all), *dv_in = up(v_all), *dr_in = up(r_all);
+    float *d_qcw = up(q_cw), *d_rcw = up(r_cw), *d_rb = up(rel_bias), *d_sink = up(sink), *d_gate = up(gate);
+    float* dq_out = dev<float>(size_t(total) * q_dim);
+    float* dr_out = dev<float>(size_t(total) * c.nh * c.d_rel);
+    DevParams* P0 = params(0, 0);
+    rel_attn_prep(dq_in, q_dim, dk_in, kv_dim, dv_in, kv_dim, dr_in, c.nh * c.d_rel, d_qcw, d_rcw, qk_clip, rel_clip,
+                  v_eps, log_floor, log_alpha, c.nh, c.nkv, c.hd, c.d_rel, total, P0, kPosPosition, false, dq_out,
+                  dr_out, kv, 0);
+    CK(cudaDeviceSynchronize());
+
+    // 1. Staged prefill Strata write (strata_base = 16) must match direct writes byte-for-byte.
+    {
+      const int base = 16, nr = 16;
+      const size_t sw = size_t(nr) * c.nkv * words, sg = size_t(nr) * c.nkv;
+      KvRef staged = kv;
+      staged.kq = dev<uint32_t>(sw);
+      staged.vq = dev<uint32_t>(sw);
+      staged.kqs = dev<__half2>(sg);
+      staged.vqs = dev<__half2>(sg);
+      CK(cudaMemset(staged.kq, 0xcd, sw * sizeof(uint32_t)));
+      CK(cudaMemset(staged.vq, 0xcd, sw * sizeof(uint32_t)));
+      CK(cudaMemset(staged.kqs, 0xcd, sg * sizeof(__half2)));
+      CK(cudaMemset(staged.vqs, 0xcd, sg * sizeof(__half2)));
+      DevParams* Pb = params(base, 0);
+      rel_attn_prep(dq_in + size_t(base) * q_dim, q_dim, dk_in + size_t(base) * kv_dim, kv_dim,
+                    dv_in + size_t(base) * kv_dim, kv_dim, dr_in + size_t(base) * c.nh * c.d_rel, c.nh * c.d_rel,
+                    d_qcw, d_rcw, qk_clip, rel_clip, v_eps, log_floor, log_alpha, c.nh, c.nkv, c.hd, c.d_rel, nr, Pb,
+                    kPosPosition, false, dq_out + size_t(base) * q_dim, dr_out + size_t(base) * c.nh * c.d_rel,
+                    staged, 0, 0, base);
+      std::vector<uint32_t> kq_all(ncode), vq_all(ncode), skq(sw), svq(sw);
+      std::vector<__half2> kqs_all(size_t(cap) * c.nkv), vqs_all(size_t(cap) * c.nkv), skqs(sg), svqs(sg);
+      CK(cudaMemcpy(kq_all.data(), dkq, ncode * 4, cudaMemcpyDeviceToHost));
+      CK(cudaMemcpy(vq_all.data(), dvq, ncode * 4, cudaMemcpyDeviceToHost));
+      CK(cudaMemcpy(kqs_all.data(), dkqs, kqs_all.size() * 4, cudaMemcpyDeviceToHost));
+      CK(cudaMemcpy(vqs_all.data(), dvqs, vqs_all.size() * 4, cudaMemcpyDeviceToHost));
+      CK(cudaMemcpy(skq.data(), staged.kq, sw * 4, cudaMemcpyDeviceToHost));
+      CK(cudaMemcpy(svq.data(), staged.vq, sw * 4, cudaMemcpyDeviceToHost));
+      CK(cudaMemcpy(skqs.data(), staged.kqs, sg * 4, cudaMemcpyDeviceToHost));
+      CK(cudaMemcpy(svqs.data(), staged.vqs, sg * 4, cudaMemcpyDeviceToHost));
+      const size_t woff = strata_words_at(base, 0, c.nkv, words), goff = size_t(base) * c.nkv;
+      const bool eq = std::equal(skq.begin(), skq.end(), kq_all.begin() + ptrdiff_t(woff)) &&
+                      std::equal(svq.begin(), svq.end(), vq_all.begin() + ptrdiff_t(woff)) &&
+                      std::memcmp(skqs.data(), kqs_all.data() + goff, sg * sizeof(__half2)) == 0 &&
+                      std::memcmp(svqs.data(), vqs_all.data() + goff, sg * sizeof(__half2)) == 0;
+      std::printf("  %-4s rel_attn_prep strata_base=16 staged==direct (%s)\n", eq ? "ok" : "FAIL", tag.c_str());
+      if (!eq) ++g_fail;
+      cudaFree(Pb);
+      cudaFree(staged.kq);
+      cudaFree(staged.vq);
+      cudaFree(staged.kqs);
+      cudaFree(staged.vqs);
+    }
+
+    // 2. rel_bias_table vs float64 dot product.
+    float* d_btab = dev<float>(size_t(c.rows) * c.nh * c.rel_extent);
+    rel_bias_table(dr_out + size_t(c.ctx) * c.nh * c.d_rel, d_rb, c.nh, c.d_rel, c.rel_extent, c.rows, d_btab, 0);
+    Vec got_bt = down(d_btab, size_t(c.rows) * c.nh * c.rel_extent);
+    Vec rq_h = down(dr_out + size_t(c.ctx) * c.nh * c.d_rel, size_t(c.rows) * c.nh * c.d_rel);
+    Vec want_bt(got_bt.size(), 0.0);
+    for (int r = 0; r < c.rows; ++r)
+      for (int h = 0; h < c.nh; ++h)
+        for (int dist = 0; dist < c.rel_extent; ++dist) {
+          double acc = 0.0;
+          for (int m = 0; m < c.d_rel; ++m)
+            acc += rel_bias[size_t(dist) * c.d_rel + m] * rq_h[(size_t(r) * c.nh + h) * c.d_rel + m];
+          want_bt[(size_t(r) * c.nh + h) * c.rel_extent + dist] = acc;
+        }
+    expect("rel_bias_table " + tag, got_bt, want_bt, 1e-5);
+
+    // Prepare exact float64 reference attend_rel over the stored cache (binary16 or FP8).
+    Vec Kr(nv), Vr(nv);
+    if (c.fp8) {
+      std::vector<uint8_t> hk(nv), hv(nv);
+      Vec hks = down(dKs, size_t(cap) * c.nkv), hvs = down(dVs, size_t(cap) * c.nkv);
+      CK(cudaMemcpy(hk.data(), dK, nv, cudaMemcpyDeviceToHost));
+      CK(cudaMemcpy(hv.data(), dV, nv, cudaMemcpyDeviceToHost));
+      for (int p = 0; p < total; ++p)
+        for (int kh = 0; kh < c.nkv; ++kh) {
+          const double ks = hks[size_t(p) * c.nkv + kh], vs = hvs[size_t(p) * c.nkv + kh];
+          for (int d = 0; d < c.hd; ++d) {
+            const size_t idx = (size_t(p) * c.nkv + kh) * c.hd + d;
+            Kr[idx] = double(ops::e4m3_to_double(hk[idx])) * ks;
+            Vr[idx] = double(ops::e4m3_to_double(hv[idx])) * vs;
+          }
+        }
+    } else {
+      Kr = down_f16(static_cast<kv16*>(dK), nv);
+      Vr = down_f16(static_cast<kv16*>(dV), nv);
+    }
+    Vec q_h = down(dq_out + size_t(c.ctx) * q_dim, size_t(c.rows) * q_dim);
+    Vec want_exact(size_t(c.rows) * q_dim, 0.0);
+    for (int r = 0; r < c.rows; ++r)
+      for (int h = 0; h < c.nh; ++h)
+        ops::attend_rel(&q_h[(size_t(r) * c.nh + h) * c.hd], &rq_h[(size_t(r) * c.nh + h) * c.d_rel], Kr.data(),
+                        Vr.data(), rel_bias.data(), sink[size_t(r) * c.nh + h], c.ctx + r, 0, c.nkv, c.hd, c.d_rel,
+                        c.rel_extent, h / (c.nh / c.nkv), scale, &want_exact[(size_t(r) * c.nh + h) * c.hd]);
+    for (size_t i = 0; i < want_exact.size(); ++i) want_exact[i] *= ops::sigmoid(gate[i]);
+
+    // Allocate StrataScratch.
+    StrataScratch sc{};
+    sc.lse_stride = ((cap + 1) / 2 + 7) / 8 * 8;
+    sc.sel_stride = (cap + 1) / 2;
+    sc.chunks = 2;
+    sc.lse = dev<__half>(size_t(c.rows) * c.nh * sc.lse_stride);
+    sc.cand = dev<int>(size_t(c.rows) * c.nkv * sc.chunks * sc.sel_stride);
+    sc.cand_key = dev<uint32_t>(size_t(c.rows) * c.nkv * sc.chunks * sc.sel_stride);
+    sc.cand_n = dev<int>(size_t(c.rows) * c.nkv * sc.chunks);
+    sc.gathered = dev<int>(size_t(c.rows) * c.nkv * sc.chunks * sc.sel_stride);
+    sc.gathered_key = dev<uint32_t>(size_t(c.rows) * c.nkv * sc.chunks * sc.sel_stride);
+    sc.sel = dev<int>(size_t(c.rows) * c.nkv * sc.sel_stride);
+    sc.sel_n = dev<int>(size_t(c.rows) * c.nkv);
+    sc.qr = dev<float>(size_t(c.rows) * c.nh * c.hd);
+    sc.delta = dev<float>(size_t(c.rows) * c.nkv * kStrataSlices * (2 * size_t(c.nh / c.nkv * c.hd) + 8));
+
+    float* d_part = dev<float>(attention_partial_floats(c.rows, c.nh, c.hd, slots));
+    float* d_out = dev<float>(size_t(c.rows) * q_dim);
+    DevParams* P = params(c.ctx, 0);
+    const RelStrata rel{d_btab, c.rel_extent, d_sink, c.nh};
+
+    // 3. Every pair refined (how.least = 100000) == exact attend_rel float64 ref (both MMA and cores scan).
+    sc.how = {16, 100000, 16, 0};
+    for (bool mma : {true, false}) {
+      KernelOptions kopt{};
+      kopt.strata_mma = mma;
+      Launch L = TL;
+      L.opt = &kopt;
+      attention_strata(dq_out + size_t(c.ctx) * q_dim, kv, sc, c.nh, c.nkv, c.hd, c.rows, float(scale), P, d_gate,
+                       q_dim, d_out, q_dim, d_part, slots, L, 0, nullptr, nullptr, rel);
+      expect(std::string("rel_strata all-refined ") + (mma ? "mma " : "cores ") + tag,
+             down(d_out, size_t(c.rows) * q_dim), want_exact, 6e-3);
+    }
+
+    // 4. Partial refinement: Gate 4 bit-identity (R=1 vs R=rows) + FP8 hot-cache bit-identity.
+    sc.how = {8, 4, 16, 64};
+    for (bool mma : {true, false}) {
+      KernelOptions kopt{};
+      kopt.strata_mma = mma;
+      Launch L = TL;
+      L.opt = &kopt;
+      attention_strata(dq_out + size_t(c.ctx) * q_dim, kv, sc, c.nh, c.nkv, c.hd, c.rows, float(scale), P, d_gate,
+                       q_dim, d_out, q_dim, d_part, slots, L, 0, nullptr, nullptr, rel);
+      Vec multi = down(d_out, size_t(c.rows) * q_dim);
+      for (int rr : {0, c.rows - 1}) {
+        DevParams* P1 = params(c.ctx + rr, 0);
+        float* d_o1 = dev<float>(size_t(q_dim));
+        const RelStrata rel1{d_btab + size_t(rr) * c.nh * c.rel_extent, c.rel_extent, d_sink + size_t(rr) * c.nh, c.nh};
+        attention_strata(dq_out + size_t(c.ctx + rr) * q_dim, kv, sc, c.nh, c.nkv, c.hd, 1, float(scale), P1,
+                         d_gate + size_t(rr) * q_dim, q_dim, d_o1, q_dim, d_part, slots, L, 0, nullptr, nullptr, rel1);
+        Vec got1 = down(d_o1, size_t(q_dim));
+        Vec slice(multi.begin() + ptrdiff_t(rr) * q_dim, multi.begin() + ptrdiff_t(rr + 1) * q_dim);
+        expect_bits(std::string("rel_strata R=1 vs multi r=") + std::to_string(rr) + (mma ? " mma " : " cores ") + tag,
+                    got1, slice);
+        cudaFree(P1);
+        cudaFree(d_o1);
+      }
+
+      if (c.fp8 && mma) {
+        KvRef hkv = kv;
+        hkv.hot_bits = 7;  // 128 slots per KV head
+        hkv.host_from = 0;
+        const size_t htags = size_t(c.nkv) << hkv.hot_bits;
+        hkv.hot_tag = dev<int32_t>(htags);
+        hkv.hot_claim = dev<int32_t>(htags);
+        hkv.hot = dev<uint8_t>(htags * 4 * size_t(c.hd));
+        hkv.hot_scale = dev<float>(htags * 4);
+        std::vector<int32_t> neg1(htags, -1), freev(htags, kHotFree);
+        CK(cudaMemcpy(hkv.hot_tag, neg1.data(), htags * 4, cudaMemcpyHostToDevice));
+        CK(cudaMemcpy(hkv.hot_claim, freev.data(), htags * 4, cudaMemcpyHostToDevice));
+        // Cold pass (claims & fills hot cache), then warm pass (reads from hot cache).
+        attention_strata(dq_out + size_t(c.ctx) * q_dim, hkv, sc, c.nh, c.nkv, c.hd, c.rows, float(scale), P, d_gate,
+                         q_dim, d_out, q_dim, d_part, slots, L, 0, nullptr, nullptr, rel);
+        Vec cold = down(d_out, size_t(c.rows) * q_dim);
+        attention_strata(dq_out + size_t(c.ctx) * q_dim, hkv, sc, c.nh, c.nkv, c.hd, c.rows, float(scale), P, d_gate,
+                         q_dim, d_out, q_dim, d_part, slots, L, 0, nullptr, nullptr, rel);
+        Vec warm = down(d_out, size_t(c.rows) * q_dim);
+        expect_bits("rel_strata fp8 hot-cache cold==uncached " + tag, cold, multi);
+        expect_bits("rel_strata fp8 hot-cache warm==uncached " + tag, warm, multi);
+        cudaFree(hkv.hot_tag);
+        cudaFree(hkv.hot_claim);
+        cudaFree(hkv.hot);
+        cudaFree(hkv.hot_scale);
+      }
+    }
+
+    cudaFree(P0);
+    cudaFree(P);
+    cudaFree(dK);
+    cudaFree(dV);
+    if (dKs) cudaFree(dKs);
+    if (dVs) cudaFree(dVs);
+    cudaFree(dkq);
+    cudaFree(dvq);
+    cudaFree(dkqs);
+    cudaFree(dvqs);
+    cudaFree(dq_in);
+    cudaFree(dk_in);
+    cudaFree(dv_in);
+    cudaFree(dr_in);
+    cudaFree(d_qcw);
+    cudaFree(d_rcw);
+    cudaFree(d_rb);
+    cudaFree(d_sink);
+    cudaFree(d_gate);
+    cudaFree(dq_out);
+    cudaFree(dr_out);
+    cudaFree(d_btab);
+    cudaFree(sc.lse);
+    cudaFree(sc.cand);
+    cudaFree(sc.cand_key);
+    cudaFree(sc.cand_n);
+    cudaFree(sc.gathered);
+    cudaFree(sc.gathered_key);
+    cudaFree(sc.sel);
+    cudaFree(sc.sel_n);
+    cudaFree(sc.qr);
+    cudaFree(sc.delta);
+    cudaFree(d_part);
+    cudaFree(d_out);
   }
 }
 
@@ -881,6 +1164,24 @@ void test_dspark() {
         ops::attend(&q[(size_t(r) * nh + hh) * hd], &K[size_t(lo) * nkv * hd], &V[size_t(lo) * nkv * hd], nk, nkv, hd,
                     hh / (nh / nkv), double(scale), &want[(size_t(r) * nh + hh) * hd]);
     expect(window > 0 ? "dspark_block_attention SWA" : "dspark_block_attention Full", got, want, 3e-5);
+    if (window > 0) {
+      // Ring wraparound: ctx = 45 > ring = 32, verify bit-identical to linear KV.
+      const int ring = 32;
+      Vec Kr(size_t(ring) * nkv * hd, 0.0), Vr(size_t(ring) * nkv * hd, 0.0);
+      for (int p = 0; p < ctx + B; ++p) {
+        const int cell = p % ring;
+        std::copy_n(&K[size_t(p) * nkv * hd], nkv * hd, &Kr[size_t(cell) * nkv * hd]);
+        std::copy_n(&V[size_t(p) * nkv * hd], nkv * hd, &Vr[size_t(cell) * nkv * hd]);
+      }
+      kv16* dKr = up_f16(Kr);
+      kv16* dVr = up_f16(Vr);
+      float* doutr = dev<float>(size_t(B) * nh * hd);
+      dspark_block_attention(dq, dKr, dVr, nh, nkv, hd, B, window, scale, P, doutr, nh * hd, dpart, splits, TL, ring);
+      expect_bits("dspark_block_attention SWA ring==linear", down(doutr, size_t(B) * nh * hd), got);
+      cudaFree(dKr);
+      cudaFree(dVr);
+      cudaFree(doutr);
+    }
     cudaFree(P);
     cudaFree(dq);
     cudaFree(dK);

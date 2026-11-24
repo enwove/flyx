@@ -262,6 +262,7 @@ void test_inkling2_attn_res();
 void test_inkling2_loop_ctrl();
 void test_inkling2_shortconv();
 void test_inkling2_rel_attn();
+void test_inkling2_rel_strata();
 void test_inkling2_moe();
 void test_dspark();
 

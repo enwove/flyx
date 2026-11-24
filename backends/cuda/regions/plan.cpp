@@ -226,28 +226,27 @@ void forward_nodes(const Pass& ps, size_t begin, size_t end, int copy_prefix) {
   // A prefill's windows of keys past the stagings take the two parities in turn, a small pass past them none (0074).
   std::vector<flyx_seq::StageItem> staged;
   int parity = 0;
+  auto stage_kv = [&](int kv_idx) {
+    const KvBuf& kb = s->kv[size_t(kv_idx)];
+    if (kb.vk && ps.reads_cache(kb)) {
+      if (const int windows = ps.round ? 0 : s->windows(kb, ps.rows)) {
+        const int from = s->window_from(kb), len = s->window_len(kb), end_pos = s->position + ps.rows;
+        for (int w = 0; w < windows; ++w) {
+          const int w0 = from + w * len;
+          staged.push_back({kv_idx, false, w0, std::min(end_pos, w0 + len), parity});
+          parity = kb.wslot[1] >= 0 ? parity ^ 1 : 0;
+        }
+      } else if (!s->reads_direct(kb, ps.rows, ps.round)) {
+        staged.push_back({kv_idx, false});
+      }
+    }
+    if (kb.kq_stage && ps.reads_copy_only(kb))
+      staged.push_back({kv_idx, true, copy_prefix, s->copy_scan_end < copy_prefix ? s->copy_scan_end : 0});
+  };
   for (size_t i = begin; i < end; ++i) {
     if (ps.p->nodes[i].kind != FLYX_NODE_RUN || !ps.p->block[i]) continue;
-    if (const auto* a = std::get_if<AttnBlock>(ps.p->block[i])) {
-      const KvBuf& kb = s->kv[size_t(a->kv)];
-      if (kb.vk && ps.reads_cache(kb)) {
-        if (const int windows = ps.round ? 0 : s->windows(kb, ps.rows)) {
-          const int from = s->window_from(kb), len = s->window_len(kb), end_pos = s->position + ps.rows;
-          for (int w = 0; w < windows; ++w) {
-            const int w0 = from + w * len;
-            staged.push_back({a->kv, false, w0, std::min(end_pos, w0 + len), parity});
-            parity = kb.wslot[1] >= 0 ? parity ^ 1 : 0;
-          }
-        } else if (!s->reads_direct(kb, ps.rows, ps.round)) {
-          staged.push_back({a->kv, false});
-        }
-      }
-      if (kb.kq_stage && ps.reads_copy_only(kb))
-        staged.push_back({a->kv, true, copy_prefix, s->copy_scan_end < copy_prefix ? s->copy_scan_end : 0});
-    } else if (const auto* r = std::get_if<RelAttnBlock>(ps.p->block[i])) {
-      const KvBuf& kb = s->kv[size_t(r->kv)];
-      if (kb.vk && !s->reads_direct(kb, ps.rows, ps.round)) staged.push_back({r->kv, false});
-    }
+    if (const auto* a = std::get_if<AttnBlock>(ps.p->block[i])) stage_kv(a->kv);
+    else if (const auto* r = std::get_if<RelAttnBlock>(ps.p->block[i])) stage_kv(r->kv);
   }
   s->stage_begin(std::move(staged), ps.v.L.st);
   ResState res_state{};

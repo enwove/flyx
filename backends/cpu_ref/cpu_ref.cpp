@@ -804,9 +804,9 @@ void dspark_context(RefSeq* s, const flyx_dspark_block& d, int n_rows) {
       for (int kh = 0; kh < nkv; ++kh) {
         norm(M, l.k_ctx_norm, &k[size_t(kh) * size_t(hd)], hd, tmp.data());
         rope(tmp.data(), pos, d.theta, hd);
-        std::copy(tmp.begin(), tmp.end(), &s->K[size_t(d.kv)][size_t(j)][(size_t(pos) * size_t(nkv) + size_t(kh)) * size_t(hd)]);
+        std::copy(tmp.begin(), tmp.end(), &s->K[size_t(l.kv)][0][(size_t(pos) * size_t(nkv) + size_t(kh)) * size_t(hd)]);
         std::copy_n(&v[size_t(kh) * size_t(hd)], hd,
-                    &s->V[size_t(d.kv)][size_t(j)][(size_t(pos) * size_t(nkv) + size_t(kh)) * size_t(hd)]);
+                    &s->V[size_t(l.kv)][0][(size_t(pos) * size_t(nkv) + size_t(kh)) * size_t(hd)]);
       }
     }
   }
@@ -833,8 +833,8 @@ void dspark_draft(RefSeq* s, const flyx_dspark_block& d, int width) {
   const double scale = 1.0 / std::sqrt(double(hd));
   for (int j = 0; j < d.layers; ++j) {
     const auto& l = dspark_layer(M, d, j);
-    const Vec& dK = s->K[size_t(d.kv)][size_t(j)];
-    const Vec& dV = s->V[size_t(d.kv)][size_t(j)];
+    const Vec& dK = s->K[size_t(l.kv)][0];
+    const Vec& dV = s->V[size_t(l.kv)][0];
     for (int r = 0; r < B; ++r) norm(M, l.norm, &x[size_t(r) * size_t(H)], H, &h[size_t(r) * size_t(H)]);
     lin(M, l.q, h.data(), B, H, nh * hd, q.data(), B);
     lin(M, l.k, h.data(), B, H, nkv * hd, k.data(), B);

@@ -86,7 +86,7 @@ __device__ __forceinline__ int dspark_splits_used(int span, int max_splits) {
 template <int HD, int RT>
 __global__ void __launch_bounds__(128) k_dspark_attn_split(const float* __restrict__ q, const kv16* __restrict__ Kc,
                                                            const kv16* __restrict__ Vc, int nh, int nkv, int B,
-                                                           int window, float scale, const DevParams* P,
+                                                           int window, int ring, float scale, const DevParams* P,
                                                            float* __restrict__ part, int splits) {
   pdl_trigger();
   constexpr int DPL = HD / 32;
@@ -120,7 +120,8 @@ __global__ void __launch_bounds__(128) k_dspark_attn_split(const float* __restri
   }
 
   for (int j = ks < ke ? ks + ((warp - ks) & 3) : ke; j < ke; j += 4) {
-    const size_t at = (size_t(j) * nkv + kvh) * HD + lane * DPL;
+    const int cell = ring > 0 ? (j % ring) : j;
+    const size_t at = (size_t(cell) * nkv + kvh) * HD + lane * DPL;
     float kf[DPL], vf[DPL];
 #pragma unroll
     for (int e = 0; e < DPL; ++e) {
@@ -212,12 +213,12 @@ __global__ void k_dspark_attn_combine(const float* __restrict__ part, int nh, in
 }
 
 template <int HD>
-void dispatch_dspark_attn(const float* q, const kv16* Kc, const kv16* Vc, int nh, int nkv, int B, int window,
+void dispatch_dspark_attn(const float* q, const kv16* Kc, const kv16* Vc, int nh, int nkv, int B, int window, int ring,
                           float scale, const DevParams* P, float* out, int ld_out, float* partial, int splits,
                           const Launch& L) {
   const int eff = std::max(1, splits);
-  k_dspark_attn_split<HD, 4><<<dim3(nh, eff, ceil_div(B, 4)), 128, 0, L.st>>>(q, Kc, Vc, nh, nkv, B, window, scale, P,
-                                                                               partial, eff);
+  k_dspark_attn_split<HD, 4><<<dim3(nh, eff, ceil_div(B, 4)), 128, 0, L.st>>>(q, Kc, Vc, nh, nkv, B, window, ring,
+                                                                               scale, P, partial, eff);
   k_dspark_attn_combine<<<dim3(nh, B), HD, 0, L.st>>>(partial, nh, HD, B, window, eff, P, out, ld_out);
 }
 
@@ -297,12 +298,20 @@ void dspark_prep_block(const DevParams* P, const float* anchor_emb, const float*
 
 void dspark_block_attention(const float* q, const kv16* Kc, const kv16* Vc, int nh, int nkv, int hd, int B, int window,
                             float scale, const DevParams* P, float* out, int ld_out, float* partial, int splits,
-                            const Launch& L) {
+                            const Launch& L, int ring) {
   switch (hd) {
-    case 32: dispatch_dspark_attn<32>(q, Kc, Vc, nh, nkv, B, window, scale, P, out, ld_out, partial, splits, L); return;
-    case 64: dispatch_dspark_attn<64>(q, Kc, Vc, nh, nkv, B, window, scale, P, out, ld_out, partial, splits, L); return;
-    case 128: dispatch_dspark_attn<128>(q, Kc, Vc, nh, nkv, B, window, scale, P, out, ld_out, partial, splits, L); return;
-    case 256: dispatch_dspark_attn<256>(q, Kc, Vc, nh, nkv, B, window, scale, P, out, ld_out, partial, splits, L); return;
+    case 32:
+      dispatch_dspark_attn<32>(q, Kc, Vc, nh, nkv, B, window, ring, scale, P, out, ld_out, partial, splits, L);
+      return;
+    case 64:
+      dispatch_dspark_attn<64>(q, Kc, Vc, nh, nkv, B, window, ring, scale, P, out, ld_out, partial, splits, L);
+      return;
+    case 128:
+      dispatch_dspark_attn<128>(q, Kc, Vc, nh, nkv, B, window, ring, scale, P, out, ld_out, partial, splits, L);
+      return;
+    case 256:
+      dispatch_dspark_attn<256>(q, Kc, Vc, nh, nkv, B, window, ring, scale, P, out, ld_out, partial, splits, L);
+      return;
     default: throw std::runtime_error("dspark_block_attention: unsupported head dim " + std::to_string(hd));
   }
 }

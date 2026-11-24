@@ -154,6 +154,7 @@ int main() {
   test_inkling2_loop_ctrl();
   test_inkling2_shortconv();
   test_inkling2_rel_attn();
+  test_inkling2_rel_strata();
   test_inkling2_moe();
   test_dspark();
   std::printf("%s (%d failures)\n", g_fail ? "FAILED" : "PASSED", g_fail);

@@ -244,6 +244,7 @@ struct MoeBlock {
 // DSpark companion drafter (Inkling-2): 3-layer DFlash with block-uniform SWA/Full + Markov RNN head.
 struct DSparkLayer {
   int window = 0;
+  int kv = -1;  // per-layer StateTable::kv (layers == 1)
   Norm norm, post_norm, q_norm, k_norm, k_ctx_norm, ctx_norm;
   Lin w_qkv, w_q, w_k, w_v, w_o;
   bool stacked_qkv = false;
@@ -268,7 +269,6 @@ struct DSparkBlock {
   float* markov_w2_b = nullptr;     // [vocab_out] (nullable)
   Lin joint_proj;                   // [3 * markov_rank, 2 * hidden + 2 * markov_rank]
   float* joint_proj_b = nullptr;    // [3 * markov_rank]
-  int kv = -1;                      // StateTable::kv
   int layers() const { return n_layers; }
 };
 

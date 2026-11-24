@@ -900,10 +900,17 @@ bool attention_flash_gqa_cfg(int hb, const float* q, KvRef kv, int nh, int nkv, 
 // every position, each row's StrataScratch::how pairs most attended to replaced by the cache's own values (kv.k / kv.v,
 // FP8 or binary16, in device or host memory).  The shapes strata_supported names; `partial` as attention_split's.
 // Only the rows at position `from` or past it are written (the others are exact attention's).
+// Optional relative-position bias table and per-query virtual sink for Strata attention (Inkling-2 Global layers).
+struct RelStrata {
+  const float* btab = nullptr;  // [rows, nh, extent] precomputed rel_bias @ r_q
+  int extent = 0;               // bias table extent (dist >= extent adds 0)
+  const float* sink = nullptr;  // [rows, ld_sink] per-query virtual sink logit
+  int ld_sink = 0;
+};
 void attention_strata(const float* q, KvRef kv, const StrataScratch& scratch, int nh, int nkv, int hd, int rows,
                       float scale, const DevParams* P, const float* gate, int ld_gate, float* out, int ld_out,
                       float* partial, int slots, const Launch& L, int from = 0, cudaEvent_t second_ready = nullptr,
-                      const DevParams* P_hot = nullptr);
+                      const DevParams* P_hot = nullptr, RelStrata rel = {});
 bool strata_supported(int nh, int nkv, int hd, int bits);
 int strata_words(int hd, int bits);  // 32-bit words of codes a position and head (StrataLayout)
 
@@ -1093,7 +1100,7 @@ void tap_copy(const bf16* x, int H, float* feats, int ld_feats, int slot, int ro
 // Draft context K/V: kv rows [rows, layers * 2 * nkv * hd] = per layer [k | v]; k -> rmsnorm -> rope -> dK[layer][pos].
 void draft_ctx_kv(const float* kv, int ld, const float* k_norms, float eps, double theta, int layers, int nkv, int hd,
                   int rows, const DevParams* P, int pos_sel, bool skip_if_noop, kv16* dK, kv16* dV,
-                  size_t layer_stride, cudaStream_t st);
+                  size_t layer_stride, cudaStream_t st, int ring = 0);
 // Compare drafts with choices, advance P, write the ring entry.  With a
 // penalty in G the tokens emitted are counted in `reply`.
 void accept(DevParams* P, const DevGen* G, const int* drafts, const int* choice, int width,
@@ -1368,18 +1375,27 @@ void shortconv_fold(const ShortConvLayer* layers, int n, size_t win_stride, size
 
 // Relative-position-bias attention prep & attention (ops/attention/ref.h: l2_clip, log_pos_scale, attend_rel).
 // prep: clips Q (with q_clip_w) and R (with r_clip_w), applies global log_pos_scale tau to Q & R, clips K,
-// no-gamma RMSNorms V, and writes K/V to kv.slot_of(pos) (supports ring KV and binary16/FP8).
+// no-gamma RMSNorms V, and writes K/V to kv.slot_of(pos) (supports ring KV, binary16/FP8, and Strata low-bit copy).
 void rel_attn_prep(const float* q_in, int ldq, const float* k_in, int ldk, const float* v_in, int ldv,
                    const float* r_in, int ldr, const float* q_clip_w, const float* r_clip_w, float qk_clip,
                    float rel_clip, float v_eps, int log_floor, float log_alpha, int nh, int nkv, int hd, int d_rel,
                    int rows, const DevParams* P, int pos_sel, bool is_swa, float* q_out, float* r_out, KvRef kv,
-                   cudaStream_t st, int pos_add = 0);
+                   cudaStream_t st, int pos_add = 0, int strata_base = 0);
+// Precompute relative-position bias table out[r, h, dist] = dot(rel_bias[dist], r_q[r, h]) for Strata attention.
+void rel_bias_table(const float* r_q, const float* rel_bias, int nh, int d_rel, int rel_extent, int rows, float* out,
+                    cudaStream_t st);
+// Prefill window state for windowed host-RAM staged rel_attention (mirrors FlashWindow).
+struct RelWindow {
+  int k_lo = 0, k_hi = INT_MAX;
+  float* state = nullptr;  // [rows][nh][kFlashStateFloats(hd)]: M, L, A[hd] carried across windows
+  bool first = true, last = true;
+};
 // Causal relative-position-bias attention with per-query sink, virtual 0 sink, optional sliding window & ring KV,
-// and optional sigmoid(gate) multiply. out == nullptr writes fused split_out(L, rows, nh * hd, false).
+// optional prefill key windowing, and optional sigmoid(gate) multiply. out == nullptr writes fused split_out.
 void rel_attention(const float* q, const float* r, KvRef kv, const float* rel_bias, const float* sink, int ld_sink,
                    const float* gate, int ld_gate, int nh, int nkv, int hd, int d_rel, int rel_extent, int window,
                    int rows, const DevParams* P, float* out, int ld_out, float* partial, int splits, const Launch& L,
-                   int pos_add = 0);
+                   int pos_add = 0, const RelWindow& win = {});
 
 // Sparse MoE routing, SiTU activation, and row-independent expert GEMMs (ops/moe/ref.h, ops/activation/ref.h).
 struct ExpertMat {
@@ -1426,7 +1442,7 @@ void dspark_prep_block(const DevParams* P, const float* anchor_emb, const float*
 // Non-causal block-uniform attention over context [max(0, P->position - window + 1), P->position) plus B block rows.
 void dspark_block_attention(const float* q, const kv16* Kc, const kv16* Vc, int nh, int nkv, int hd, int B, int window,
                             float scale, const DevParams* P, float* out, int ld_out, float* partial, int splits,
-                            const Launch& L);
+                            const Launch& L, int ring = 0);
 // Pack Markov RNN input [state (Rk) | w1_row (Rk, untouched if null) | hidden_i (H) | f_rnn (H)] into joint_out.
 void dspark_markov_pack(const DevParams* P, const float* state, const float* w1_row, const float* hidden_i,
                         const float* hring, int Rk, int H, float* joint_out, cudaStream_t st);

@@ -476,9 +476,13 @@ MoeBlock moe(WeightLoader& L, const flyx_moe_block& b, const StateMap& sm) {
   return f;
 }
 
-DSparkLayer dspark_layer(WeightLoader& L, const flyx_dspark_layer_block& b) {
+DSparkLayer dspark_layer(WeightLoader& L, const flyx_dspark_layer_block& b, const StateMap& sm) {
   DSparkLayer l;
   l.window = b.window;
+  l.kv = state_of(sm.kv, b.kv, "K/V");
+  KvSpec& k = L.model()->states.kv[size_t(l.kv)];
+  expect(k.layers == 1, "DSpark layer cache must have 1 layer");
+  k.fp8 = false;  // DSpark draft kernels (draft_ctx_kv / dspark_block_attention) read binary16 KV
   l.norm = norm(L, b.norm);
   l.post_norm = norm(L, b.post_norm);
   l.q_norm = norm(L, b.q_norm);
@@ -546,9 +550,11 @@ DSparkBlock dspark(WeightLoader& L, const flyx_model_desc& d, const flyx_dspark_
   if (b.markov_w2_b >= 0) f.markov_w2_b = L.vec(b.markov_w2_b);
   f.joint_proj = L.lin(b.joint_proj);
   f.joint_proj_b = L.vec(b.joint_proj_b);
-  f.kv = state_of(sm.kv, b.kv, "K/V");
-  const KvSpec& k = L.model()->states.kv[size_t(f.kv)];
-  expect(k.layers == f.layers() && k.nkv == f.nkv && k.hd == f.hd, "DSpark context cache differs from its layers");
+  for (int j = 0; j < b.layers; ++j) {
+    const int lkv = state_of(sm.kv, d.blocks[b.first_layer + j].dspark_layer.kv, "K/V");
+    const KvSpec& k = L.model()->states.kv[size_t(lkv)];
+    expect(k.layers == 1 && k.nkv == f.nkv && k.hd == f.hd, "DSpark layer context cache differs from its dims");
+  }
   expect(b.ring >= 0 && b.ring < d.n_states && sm.ring[size_t(b.ring)], "DSpark names no hidden ring state");
   return f;
 }
@@ -680,7 +686,7 @@ void bind(flyx_bmodel* m, const flyx_model_desc& d, LoadTimes* times) {
         add(m, dspark(L, d, b.dspark, sm));
         break;
       }
-      case FLYX_BLOCK_DSPARK_LAYER: add(m, dspark_layer(L, b.dspark_layer)); break;
+      case FLYX_BLOCK_DSPARK_LAYER: add(m, dspark_layer(L, b.dspark_layer, sm)); break;
       case FLYX_BLOCK_DV: {
         const int e = ref(b.dv.embed, FLYX_BLOCK_EMBED, "embedding");
         const int head = ref(b.dv.head, FLYX_BLOCK_HEAD, "head");

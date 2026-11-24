@@ -38,7 +38,10 @@ RowNeeds row_needs(const flyx_bmodel* m) {
       n.proj = std::max({n.proj, 2 * q_dim + r->nh * r->d_rel, kv_dim, r->nh});
       n.act = std::max({n.act, q_dim, kv_dim});
       n.q = std::max(n.q, q_dim);
+      n.attn_state = std::max(n.attn_state, r->nh * kFlashStateFloats(r->hd));
       n.rel_q = std::max(n.rel_q, r->nh * r->d_rel);
+      n.max_rel_nh = std::max(n.max_rel_nh, r->nh);
+      n.max_rel_extent = std::max(n.max_rel_extent, r->rel_extent);
       n.sink = std::max(n.sink, r->nh);
       n.kv_dim = std::max(n.kv_dim, kv_dim);
       if (r->window == 0) n.kv_dyn = std::max(n.kv_dyn, r->nkv * r->conv);
@@ -186,14 +189,18 @@ void alloc_rows(const flyx_bmodel* m, int R, bool prefill, RowBufs* b, Alloc&& a
     if (n.feats) b->cx = base_a;
 
     const size_t q_off = align_f(size_t(R) * n.q);
-    const size_t attn_aux = std::max(size_t(R) * n.attn_state, part);
+    // AttnBlock's flash prefill never uses part, so attn_state aliases part; RelAttnBlock's windowed prefill
+    // uses split-K part and attn_state simultaneously, so keep them disjoint when RelAttnBlock is present.
+    const bool separate_state = n.max_rel_extent > 0 && n.attn_state > 0;
+    const size_t attn_aux =
+        separate_state ? align_f(part) + size_t(R) * n.attn_state : std::max(size_t(R) * n.attn_state, part);
     const size_t slot_b = std::max({size_t(R) * H, size_t(R) * n.gdn_o, q_off + attn_aux});
     float* base_b = f(slot_b);
     b->h = base_b;
     b->gdn_o = base_b;
     b->qbuf = base_b;
-    if (n.attn_state > 0) b->attn_state = base_b + q_off;
     b->part = base_b + q_off;
+    if (n.attn_state > 0) b->attn_state = separate_state ? b->part + align_f(part) : base_b + q_off;
   } else {
     // Round buffers: mtp_draft keeps mx live across the MTP layer, so mx stays separate from act/proj/h.
     // gdn_o and qbuf belong to distinct layer types and safely alias.
@@ -204,6 +211,8 @@ void alloc_rows(const flyx_bmodel* m, int R, bool prefill, RowBufs* b, Alloc&& a
     b->gdn_o = oq;
     b->qbuf = oq;
     b->part = f(part);
+    if (n.max_rel_nh > 0 && n.max_rel_extent > 0)
+      b->rel_btab = f(size_t(std::min(R, FLYX_MAX_ROWS)) * n.max_rel_nh * n.max_rel_extent);
     if (n.feats) {
       b->cx = f(size_t(R) * n.cx);
       b->ckv = f(size_t(R) * n.ckv);
@@ -463,19 +472,22 @@ void alloc_state(const flyx_bmodel* m, flyx_seq* s) {
   // blocks have, for the shapes its kernels take and the scratch.
   const bool strata = s->kv_method == FLYX_KV_STRATA;
   int nh_most = 0, nkv_most = 0, hd_most = 0, g_hd_most = 0;  // the most of each, and of query heads times head dim
-  for (const Block& blk : m->blocks)
-    if (const auto* a = std::get_if<AttnBlock>(&blk)) {
-      const KvSpec& k = m->states.kv[size_t(a->kv)];
-      if (!strata || !tiered(k)) continue;
-      if (!strata_supported(a->nh, a->nkv, a->hd, s->kv_bits))
-        throw std::runtime_error("strata attention: not compiled for " + std::to_string(a->nh) + " query heads of " +
-                                 std::to_string(a->hd) + " over " + std::to_string(a->nkv) + " KV heads at " +
-                                 std::to_string(s->kv_bits) + " bits");
-      nh_most = std::max(nh_most, a->nh);
-      nkv_most = std::max(nkv_most, a->nkv);
-      g_hd_most = std::max(g_hd_most, a->nh / a->nkv * a->hd);
-      hd_most = std::max(hd_most, a->hd);
-    }
+  auto check_strata = [&](int kv_idx, int nh, int nkv, int hd) {
+    const KvSpec& k = m->states.kv[size_t(kv_idx)];
+    if (!strata || !tiered(k)) return;
+    if (!strata_supported(nh, nkv, hd, s->kv_bits))
+      throw std::runtime_error("strata attention: not compiled for " + std::to_string(nh) + " query heads of " +
+                               std::to_string(hd) + " over " + std::to_string(nkv) + " KV heads at " +
+                               std::to_string(s->kv_bits) + " bits");
+    nh_most = std::max(nh_most, nh);
+    nkv_most = std::max(nkv_most, nkv);
+    g_hd_most = std::max(g_hd_most, nh / nkv * hd);
+    hd_most = std::max(hd_most, hd);
+  };
+  for (const Block& blk : m->blocks) {
+    if (const auto* a = std::get_if<AttnBlock>(&blk)) check_strata(a->kv, a->nh, a->nkv, a->hd);
+    else if (const auto* r = std::get_if<RelAttnBlock>(&blk)) check_strata(r->kv, r->nh, r->nkv, r->hd);
+  }
   // The stagings' size: with strata attention a prefill reads keys past them a window at a time, on
   // the tensor-core kernel (the option attention=split keeps them as large as the host parts).
   if (strata && nh_most > 0 && m->opt.kernels.attention != kAttnSplit) {
@@ -536,11 +548,22 @@ void alloc_state(const flyx_bmodel* m, flyx_seq* s) {
       b.sink = mtp_copy ? 0 : m->opt.kernels.mtp_sink;  // with a copy, the copy has the first positions
       const int ring = (b.sink + std::max(b.window + 2 * FLYX_MAX_ROWS, s->rows_cap) + 63) / 64 * 64;
       if (m->opt.kernels.mtp_ring && ring < s->cap) b.ring = positions = ring;
-    } else if (k.window > 0 && !k.draft) {
-      // SWA fixed GPU ring: holds the sliding window plus one full prefill chunk or rollback window.
+    } else if (k.window > 0) {
+      // SWA fixed GPU ring (target SWA and DSpark SWA layers): holds the window plus one prefill chunk or rollback span.
       const int ring =
           (k.window + std::max(FLYX_ROUND_SLOTS * FLYX_MAX_ROWS + m->wide_rows, s->rows_cap) + 63) / 64 * 64;
       if (ring < s->cap) {
+        b.swa_ring = true;
+        b.ring = positions = ring;
+      }
+    } else if (m->dspark_block >= 0 && k.draft && k.layers == 1 && m->opt.kernels.mtp_window > 0 &&
+               s->cap > 8 * m->opt.kernels.mtp_window) {
+      // DSpark Full-attention layer at long contexts (> 8 * mtp_window): bound on-device draft KV to a sliding ring,
+      // matching MTP's mtp_window behavior (exact full context for shorter contexts, bounded VRAM at long contexts).
+      b.window = m->opt.kernels.mtp_window;
+      const int ring =
+          (b.window + std::max(FLYX_ROUND_SLOTS * FLYX_MAX_ROWS + m->wide_rows, s->rows_cap) + 63) / 64 * 64;
+      if (m->opt.kernels.mtp_ring && ring < s->cap) {
         b.swa_ring = true;
         b.ring = positions = ring;
       }

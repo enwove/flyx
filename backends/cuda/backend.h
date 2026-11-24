@@ -188,7 +188,7 @@ struct RowBufs {
   float *loop_bank = nullptr, *loop_bank_out = nullptr, *loop_msg = nullptr;
   float *inp_saved = nullptr, *attn_in = nullptr;
   float *ctrl_cat = nullptr, *ctrl_gate = nullptr, *ctrl_gf = nullptr;
-  float *rel_q = nullptr, *sink = nullptr, *kv_conv = nullptr, *kv_dyn = nullptr;
+  float *rel_q = nullptr, *rel_btab = nullptr, *sink = nullptr, *kv_conv = nullptr, *kv_dyn = nullptr;
   float *post_raw = nullptr, *post_out = nullptr;
   int* moe_idx = nullptr;
   float *moe_w = nullptr, *moe_gu = nullptr, *moe_act = nullptr;
@@ -208,7 +208,7 @@ struct RowNeeds {
   int k_max = 0;                            // largest GEMM K: the scratch staging GEMM inputs is sized by it
   bool q8 = false;  // weights with inputs in 8 bits: a prefill scratch holds their GEMMs' runs of K side by side
   int max_bank = 0, max_loop_rank = 0;      // Inkling-2 AttnRes bank depth & loop gate rank
-  int rel_q = 0, sink = 0, kv_dim = 0, kv_dyn = 0;
+  int rel_q = 0, max_rel_nh = 0, max_rel_extent = 0, sink = 0, kv_dim = 0, kv_dyn = 0;
   int moe_experts = 0, moe_topk = 0, moe_inter = 0;
   bool dspark = false;
 };

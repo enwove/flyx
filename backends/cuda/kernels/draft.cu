@@ -177,7 +177,7 @@ __global__ void k_tap_copy(const TIn* x, int H, float* feats, int ld, int slot) 
 // grid (layers * nkv, rows); block hd.
 __global__ void k_draft_ctx_kv(const float* kv, int ld, const float* k_norms, float eps, double theta, int nkv, int hd,
                                const DevParams* P, int pos_sel, int skip_if_noop, kv16* dK, kv16* dV,
-                               size_t layer_stride, const double* rope) {
+                               size_t layer_stride, const double* rope, int ring) {
   pdl_trigger();
   extern __shared__ float sh[];
   if (skip_if_noop && P->noop) return;
@@ -194,7 +194,8 @@ __global__ void k_draft_ctx_kv(const float* kv, int ld, const float* k_norms, fl
   if (rope) rope_cs_inv(pos, rope[i], &c, &s);  // rope_table's factor, or its pow
   else rope_cs(pos, i, hd, theta, &c, &s);
   const float out = d < half ? nv * c - sh[d + half] * s : nv * c + sh[d - half] * s;
-  const size_t at = size_t(layer) * layer_stride + (size_t(pos) * nkv + kh) * hd + d;
+  const int slot = ring > 0 ? (pos % ring) : pos;
+  const size_t at = size_t(layer) * layer_stride + (size_t(slot) * nkv + kh) * hd + d;
   dK[at] = __float2half_rn(out);
   dV[at] = __float2half_rn(row[nkv * hd + kh * hd + d]);
 }
@@ -372,10 +373,10 @@ void tap_copy(const bf16* x, int H, float* feats, int ld_feats, int slot, int ro
 
 void draft_ctx_kv(const float* kv, int ld, const float* k_norms, float eps, double theta, int layers, int nkv, int hd,
                   int rows, const DevParams* P, int pos_sel, bool skip_if_noop, kv16* dK, kv16* dV,
-                  size_t layer_stride, cudaStream_t st) {
+                  size_t layer_stride, cudaStream_t st, int ring) {
   k_draft_ctx_kv<<<dim3(layers * nkv, rows), hd, hd * sizeof(float), st>>>(kv, ld, k_norms, eps, theta, nkv, hd, P,
                                                                             pos_sel, skip_if_noop, dK, dV,
-                                                                            layer_stride, rope_table(theta, hd));
+                                                                            layer_stride, rope_table(theta, hd), ring);
 }
 
 }  // namespace flyx::cuda

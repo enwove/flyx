@@ -586,6 +586,31 @@ void apply_loop_ctrl(const float* cur, const float* msg, int rows, int H, int ra
   loop_ctrl_apply(cur, msg, ctrl_gf, 2 * H, ctrl_gf + H, 2 * H, rows, H, out, st);
 }
 
+void rel_attn_windows(const Pass& ps, const RelAttnBlock& a, const KvBuf& kb, int windows, float* out, int ld_out) {
+  const RowView& rv = ps.v;
+  auto* s = ps.s;
+  const int R = ps.rows, nh = a.nh, nkv = a.nkv, hd = a.hd, dr = a.d_rel;
+  cudaStream_t st = rv.L.st;
+  if (!rv.b.attn_state) throw std::logic_error("cuda: prefill window state buffer missing");
+  const int from = s->window_from(kb), len = s->window_len(kb), end = s->position + R;
+  RelWindow w;
+  w.state = rv.b.attn_state;
+  auto run = [&](const KvRef& kv, int k_lo, int k_hi, bool last) {
+    w.k_lo = k_lo;
+    w.k_hi = k_hi;
+    w.last = last;
+    rel_attention(rv.b.qbuf, rv.b.rel_q, kv, a.rel_bias, rv.b.sink, nh, rv.b.proj + nh * hd, rv.ld_proj, nh, nkv, hd,
+                  dr, a.rel_extent, a.window, R, s->P, out, ld_out, rv.b.part, kPrefillSplits, rv.L, 0, w);
+    w.first = false;
+  };
+  if (from > 0) run(kb.ref(), 0, from, false);
+  for (int i = 0; i < windows; ++i) {
+    const int w0 = from + i * len, w1 = std::min(end, w0 + len);
+    run(s->window_before(kb, w0, w1, R, st), w0, w1, i + 1 == windows);
+    s->stage_after(kb, st);
+  }
+}
+
 }  // namespace
 
 void rel_attn_layer(const Pass& ps, const RelAttnBlock& a, bool fused) {
@@ -661,18 +686,88 @@ void rel_attn_layer(const Pass& ps, const RelAttnBlock& a, bool fused) {
                  kv_dim, st, false);
 
   const KvBuf& kb = s->kv[size_t(a.kv)];
+  KvRef kv = kb.ref();
+  // Stage aligned 16-row prefill Strata writes in dead device memory (rv.b.act) and flush contiguously
+  // via cudaMemcpyAsync instead of scattering 4-byte writes across PCIe into host-pinned Strata buffers.
+  const bool stage_strata =
+      !ps.round && rv.b.act && kb.kq && kb.kq_host && kb.kq == kb.kq_host && kb.ring == 0 && R >= 16 && (R & 15) == 0 &&
+      (s->position & 15) == 0;
+  const bool stage_grids = kb.copy_slot >= 0;
+  const size_t q_words = size_t(R) * size_t(nkv) * size_t(kb.words);
+  const size_t grid_cnt = size_t(R) * size_t(nkv);
+  const size_t need_bytes =
+      2 * q_words * sizeof(uint32_t) + (stage_grids ? 2 * grid_cnt * sizeof(__half2) : 0);
+  const bool use_stage = stage_strata && need_bytes <= size_t(R) * size_t(rv.ld_act) * sizeof(float);
+  uint32_t *stg_kq = nullptr, *stg_vq = nullptr;
+  __half2 *stg_kqs = nullptr, *stg_vqs = nullptr;
+  const size_t goff = size_t(s->position) * size_t(nkv);
+  if (use_stage) {
+    stg_kq = reinterpret_cast<uint32_t*>(rv.b.act);
+    stg_vq = stg_kq + q_words;
+    kv.kq = stg_kq;
+    kv.vq = stg_vq;
+    if (stage_grids) {
+      stg_kqs = reinterpret_cast<__half2*>(stg_vq + q_words);
+      stg_vqs = stg_kqs + grid_cnt;
+      kv.kqs = stg_kqs;
+      kv.vqs = stg_vqs;
+    } else {
+      kv.kqs = kb.kqs + goff;
+      kv.vqs = kb.vqs + goff;
+    }
+  }
   rel_attn_prep(rv.b.proj, rv.ld_proj, rv.b.kv_conv, kv_dim, rv.b.kv_conv + size_t(R) * kv_dim, kv_dim,
                 rv.b.proj + 2 * q_dim, rv.ld_proj, a.q_clip_w, a.rel_clip_w, a.qk_clip, a.rel_clip, a.eps,
                 a.log_scale_floor, a.log_scale_alpha, nh, nkv, hd, dr, R, s->P, kPosPosition, is_swa, rv.b.qbuf,
-                rv.b.rel_q, kb.ref(), st, 0);
+                rv.b.rel_q, kv, st, 0, use_stage ? s->position : 0);
+  if (use_stage) {
+    const size_t woff = strata_words_at(s->position, 0, nkv, kb.words);
+    CK(cudaMemcpyAsync(kb.kq + woff, stg_kq, q_words * sizeof(uint32_t), cudaMemcpyDefault, st));
+    CK(cudaMemcpyAsync(kb.vq + woff, stg_vq, q_words * sizeof(uint32_t), cudaMemcpyDefault, st));
+    if (stage_grids) {
+      CK(cudaMemcpyAsync(kb.kqs + goff, stg_kqs, grid_cnt * sizeof(__half2), cudaMemcpyDefault, st));
+      CK(cudaMemcpyAsync(kb.vqs + goff, stg_vqs, grid_cnt * sizeof(__half2), cudaMemcpyDefault, st));
+    }
+  }
 
-  const bool direct_kv = s->reads_direct(kb, R, ps.round);
-  if (kb.vk && !direct_kv) s->stage_before(kb, 0, R, st);
   const bool split = fused && !a.w_o.q8_inputs() && q_dim % 64 == 0;
-  rel_attention(rv.b.qbuf, rv.b.rel_q, (kb.vk && !direct_kv) ? kb.staged() : kb.ref(), a.rel_bias, rv.b.sink, nh,
-                rv.b.proj + q_dim, rv.ld_proj, nh, nkv, hd, dr, a.rel_extent, a.window, R, s->P,
-                split ? nullptr : rv.b.act, q_dim, rv.b.part, ps.round ? kRoundSplits : kPrefillSplits, L, 0);
-  if (kb.vk && !direct_kv) s->stage_after(kb, st);
+  if (ps.reads_cache(kb)) {
+    if (const int windows = ps.round ? 0 : s->windows(kb, R)) {
+      rel_attn_windows(ps, a, kb, windows, split ? nullptr : rv.b.act, q_dim);
+    } else {
+      const bool direct_kv = s->reads_direct(kb, R, ps.round);
+      if (kb.vk && !direct_kv) s->stage_before(kb, 0, R, st);
+      rel_attention(rv.b.qbuf, rv.b.rel_q, (kb.vk && !direct_kv) ? kb.staged() : kb.ref(), a.rel_bias, rv.b.sink, nh,
+                    rv.b.proj + q_dim, rv.ld_proj, nh, nkv, hd, dr, a.rel_extent, a.window, R, s->P,
+                    split ? nullptr : rv.b.act, q_dim, rv.b.part, ps.round ? kRoundSplits : kPrefillSplits, L, 0);
+      if (kb.vk && !direct_kv) s->stage_after(kb, st);
+    }
+  }
+  if (ps.reads_copy(kb)) {
+    const bool only = ps.reads_copy_only(kb);
+    const cudaEvent_t full = only ? s->copy_before(kb, R, st, true) : nullptr;
+    const float scale = 1.f / std::sqrt(float(hd));
+    const int from = ps.strata == kStrataBoth ? s->strata_from : 0;
+    if (R <= FLYX_MAX_ROWS) {
+      rel_bias_table(rv.b.rel_q, a.rel_bias, nh, dr, a.rel_extent, R, rv.b.rel_btab, st);
+      const RelStrata rel{rv.b.rel_btab, a.rel_extent, rv.b.sink, nh};
+      attention_strata(rv.b.qbuf, kb.copy_read(only), s->strata, nh, nkv, hd, R, scale, s->P, rv.b.proj + q_dim,
+                       rv.ld_proj, split ? nullptr : rv.b.act, q_dim, rv.b.part, kRoundSplits, L, from, full, nullptr,
+                       rel);
+    } else {
+      const size_t q_row = size_t(q_dim), rq_row = size_t(nh) * dr;
+      for (int a0 = 0; a0 < R; a0 += FLYX_MAX_ROWS) {
+        const int k = std::min(FLYX_MAX_ROWS, R - a0);
+        shift_params(s->P, s->P_shift, a0, st);
+        rel_bias_table(rv.b.rel_q + a0 * rq_row, a.rel_bias, nh, dr, a.rel_extent, k, rv.b.rel_btab, st);
+        const RelStrata rel{rv.b.rel_btab, a.rel_extent, rv.b.sink + size_t(a0) * nh, nh};
+        attention_strata(rv.b.qbuf + a0 * q_row, kb.copy_read(only), s->strata, nh, nkv, hd, k, scale, s->P_shift,
+                         rv.b.proj + size_t(a0) * rv.ld_proj + q_dim, rv.ld_proj, rv.b.act + a0 * q_row, q_dim,
+                         rv.b.part, kRoundSplits, L, from, a0 == 0 ? full : nullptr, s->P, rel);
+      }
+    }
+    if (only) s->stage_after(kb, st);
+  }
 
   if (split) gemm_presplit(a.w_o, H, q_dim, rv.b.post_raw, H, R, false, L);
   else gemm(rv.b.act, q_dim, a.w_o, H, q_dim, rv.b.post_raw, H, R, false, L);
@@ -741,7 +836,6 @@ void dspark_context(const Pass& ps, const DSparkBlock& b, bool /*fused*/) {
   const RowView& rv = ps.v;
   auto* s = ps.s;
   const auto* m = s->m;
-  const KvBuf& kv = s->kv[size_t(b.kv)];
   const int H = b.hidden, R = ps.rows, nkv = b.nkv, hd = b.hd;
   const int sel = ps.round ? kPosStart : kPosPosition;
   cudaStream_t st = rv.L.st;
@@ -759,6 +853,7 @@ void dspark_context(const Pass& ps, const DSparkBlock& b, bool /*fused*/) {
 
   for (int j = 0; j < b.layers(); ++j) {
     const auto& l = block<DSparkLayer>(m, b.first_layer + j);
+    const KvBuf& kv = s->kv[size_t(l.kv)];
     dspark_ctx_mix_norm(rv.b.feats, rv.ld_feats, l.ctx_mix, l.ctx_norm.w, l.ctx_norm.eps, b.n_taps, R, H, rv.b.cx, st);
     if (l.stacked_ctx_kv) {
       gemm(rv.b.cx, H, l.w_ctx_kv, 2 * nkv * hd, H, rv.b.ckv, rv.ld_ckv, R, false, L);
@@ -767,7 +862,7 @@ void dspark_context(const Pass& ps, const DSparkBlock& b, bool /*fused*/) {
       gemm(rv.b.cx, H, l.w_v_ctx, nkv * hd, H, rv.b.ckv + nkv * hd, rv.ld_ckv, R, false, L);
     }
     draft_ctx_kv(rv.b.ckv, rv.ld_ckv, l.k_ctx_norm.w, l.k_ctx_norm.eps, b.theta, 1, nkv, hd, R, s->P, sel, ps.round,
-                 kv.k16(j), kv.v16(j), kv.layer_stride, st);
+                 kv.k16(0), kv.v16(0), kv.layer_stride, st, kv.ring);
   }
 }
 
@@ -775,7 +870,6 @@ void dspark_draft(flyx_seq* s, const DSparkBlock& b, int width, const Launch& L,
   const auto* m = s->m;
   const auto& E = block<EmbedBlock>(m, b.embed);
   const auto& head = block<HeadBlock>(m, b.head);
-  const KvBuf& kv = s->kv[size_t(b.kv)];
   const int B = std::min(b.block, width + 1);
   const int H = b.hidden, nh = b.nh, nkv = b.nkv, hd = b.hd, I = b.inter;
   const int V = head.vocab, Rk = b.markov_rank, nqkv = (nh + 2 * nkv) * hd;
@@ -790,8 +884,8 @@ void dspark_draft(flyx_seq* s, const DSparkBlock& b, int width, const Launch& L,
   const float scale = 1.f / std::sqrt(float(hd));
   for (int j = 0; j < b.layers(); ++j) {
     const auto& l = block<DSparkLayer>(m, b.first_layer + j);
-    kv16* Kj = kv.k16(j);
-    kv16* Vj = kv.v16(j);
+    const KvBuf& kv = s->kv[size_t(l.kv)];
+    const int eff_win = l.window > 0 ? l.window : kv.window;
     if (l.stacked_qkv) {
       norm_project(s->ds_x, s->ds_h, s->ds_proj, s->ld_ds_proj, B, l.norm, l.w_qkv, nqkv, H, L, fused);
     } else {
@@ -801,9 +895,9 @@ void dspark_draft(flyx_seq* s, const DSparkBlock& b, int width, const Launch& L,
       gemm(s->ds_h, H, l.w_v, nkv * hd, H, s->ds_proj + (nh + nkv) * hd, s->ld_ds_proj, B, false, L);
     }
     attn_prep(s->ds_proj, s->ld_ds_proj, 0, nh * hd, (nh + nkv) * hd, l.q_norm.w, l.k_norm.w, l.q_norm.offset,
-              l.q_norm.eps, b.theta, hd, nh, nkv, hd, B, s->P, kPosPosition, false, s->ds_q, Kj, Vj, st);
-    dspark_block_attention(s->ds_q, Kj, Vj, nh, nkv, hd, B, l.window, scale, s->P, s->ds_act, nh * hd, s->own.part,
-                           kRoundSplits, L);
+              l.q_norm.eps, b.theta, hd, nh, nkv, hd, B, s->P, kPosPosition, false, s->ds_q, kv.ref(), st);
+    dspark_block_attention(s->ds_q, kv.k16(0), kv.v16(0), nh, nkv, hd, B, eff_win, scale, s->P, s->ds_act, nh * hd,
+                           s->own.part, kRoundSplits, L, kv.ring);
     gemm(s->ds_act, nh * hd, l.w_o, H, nh * hd, s->ds_x, H, B, true, L);
     if (l.stacked_gu) {
       norm_project(s->ds_x, s->ds_h, s->ds_proj, s->ld_ds_proj, B, l.post_norm, l.w_gu, 2 * I, H, L, fused);

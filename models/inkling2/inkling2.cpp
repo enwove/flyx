@@ -344,7 +344,15 @@ int Inkling2::build_dspark(const ModelFile& file, const Config& c) {
     flyx_block lb{};
     lb.kind = FLYX_BLOCK_DSPARK_LAYER;
     auto& y = lb.dspark_layer;
-    y.window = swa_pat[size_t(l)] ? swa_win : 0;
+    flyx_state lkv{};
+    lkv.kind = FLYX_STATE_KV;
+    lkv.draft = 1;
+    lkv.layers = 1;
+    lkv.n_kv = nkv;
+    lkv.head_dim = hd;
+    lkv.window = swa_pat[size_t(l)] ? swa_win : 0;
+    y.window = lkv.window;
+    y.kv = T.state(lkv);
     y.norm = T.norm(p + "attn_norm.weight", H, 0.0, eps);
     y.post_norm = T.norm(p + "ffn_norm.weight", H, 0.0, eps);
     y.q_norm = T.norm(p + "attn_q_norm.weight", hd, 0.0, eps);
@@ -374,14 +382,6 @@ int Inkling2::build_dspark(const ModelFile& file, const Config& c) {
   d.joint_proj = T.weight(cn("joint_proj.weight"), {3 * rank, 2 * H + 2 * rank});
   d.joint_proj_b = T.weight(cn("joint_proj.bias"), {3 * rank});
 
-  flyx_state kv{};
-  kv.kind = FLYX_STATE_KV;
-  kv.draft = 1;
-  kv.layers = layers;
-  kv.n_kv = nkv;
-  kv.head_dim = hd;
-  d.kv = T.state(kv);
-
   flyx_state ring{};
   ring.kind = FLYX_STATE_RING;
   ring.draft = 1;
@@ -398,7 +398,7 @@ bool Inkling2::build(const ModelFile& file, const ModelOptions& o, std::string* 
   Config c = read_gguf_config(file);
   take_companions(file, &c);
   trained_ctx_ = c.trained_ctx;
-  kv_fp8_by_default_ = false;  // keep binary16 KV by default to match llama.cpp quality (Gate 5)
+  // Default FP8 KV cache on non-roomy GPUs (matches Qwen3.8-27B default path; verified in docs/design/numerics.md).
   DrafterSources sources{};
   sources.dspark = c.dspark;
   sources.dspark_beside = c.dspark_companion >= 0;

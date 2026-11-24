@@ -212,13 +212,15 @@ __global__ void k_shortconv_fold(const ShortConvLayer* __restrict__ layers, size
 
 // ---- rel_attn_prep ------------------------------------------------------------------------
 // grid (nh + nkv, rows); block size = round_up_32(max(hd, d_rel)).
+template <bool Compact = false>
 __global__ void k_rel_attn_prep(const float* __restrict__ q_in, int ldq, const float* __restrict__ k_in, int ldk,
                                 const float* __restrict__ v_in, int ldv, const float* __restrict__ r_in, int ldr,
                                 const float* __restrict__ q_clip_w, const float* __restrict__ r_clip_w, float qk_clip,
                                 float rel_clip, float v_eps, int log_floor, float log_alpha, int nh, int nkv, int hd,
                                 int d_rel, const DevParams* P, int pos_sel, int is_swa, float* __restrict__ q_out,
-                                float* __restrict__ r_out, KvRef kv, int pos_add) {
+                                float* __restrict__ r_out, KvRef kv, int pos_add, int strata_base) {
   pdl_trigger();
+  extern __shared__ float sh[];
   const int hidx = blockIdx.x, r = blockIdx.y, d = threadIdx.x;
   const int base = (pos_sel == kPosStart ? P->start : P->position) + pos_add;
   const int pos = base + r;
@@ -273,6 +275,174 @@ __global__ void k_rel_attn_prep(const float* __restrict__ q_in, int ldq, const f
     static_cast<kv16*>(kv.k)[at] = __float2half_rn(ko);
     static_cast<kv16*>(kv.v)[at] = __float2half_rn(vo);
   }
+
+  // Low-bit Strata copy (FWHT + uniform quantization + StrataLayout packing, matching attn_prep bit-for-bit).
+  if (kv.kq) {
+    float* xk = sh;
+    float* xv = xk + hd;
+    float fk = d < hd ? ko : 0.f, fv = d < hd ? vo : 0.f;
+#pragma unroll
+    for (int len = 1; len < 32; len <<= 1) {
+      const float ok = __shfl_xor_sync(0xffffffffu, fk, len);
+      const float ov = __shfl_xor_sync(0xffffffffu, fv, len);
+      fk = (d & len) ? (ok - fk) : (fk + ok);
+      fv = (d & len) ? (ov - fv) : (fv + ov);
+    }
+    if (hd > 32) {
+      if (d < hd) {
+        xk[d] = fk;
+        xv[d] = fv;
+      }
+      __syncthreads();
+      const int half_hd = hd >> 1;
+      for (int len = 32; len < half_hd; len <<= 1) {
+        if (d < half_hd) {
+          const int lo = ((d & ~(len - 1)) << 1) | (d & (len - 1));
+          const float ak = xk[lo], bk = xk[lo + len];
+          xk[lo] = ak + bk;
+          xk[lo + len] = ak - bk;
+          const float av = xv[lo], bv = xv[lo + len];
+          xv[lo] = av + bv;
+          xv[lo + len] = av - bv;
+        }
+        __syncthreads();
+      }
+      if (d < hd) {
+        const float sk = xk[d], pk = xk[d ^ half_hd];
+        fk = (d & half_hd) ? (pk - sk) : (sk + pk);
+        const float sv = xv[d], pv = xv[d ^ half_hd];
+        fv = (d & half_hd) ? (pv - sv) : (sv + pv);
+      }
+    }
+    const float inv_s = rsqrtf(float(hd));
+    const float xrk = d < hd ? fk * inv_s : 0.f, xrv = d < hd ? fv * inv_s : 0.f;
+    const int top = (1 << kv.bits) - 1;
+    float lok, stepk, lov, stepv;
+    if (kv.grid) {
+      float ms[2] = {xrk, xrv};
+      block_sum_n(ms);
+      const float mk = ms[0] / float(hd), mv = ms[1] / float(hd);
+      float vs[2] = {d < hd ? (xrk - mk) * (xrk - mk) : 0.f, d < hd ? (xrv - mv) * (xrv - mv) : 0.f};
+      block_sum_n(vs);
+      const float c = kv.bits == 2 ? 0.9957f : kv.bits == 3 ? 0.5860f : 0.3352f;
+      stepk = c * sqrtf(vs[0] / float(hd));
+      stepv = c * sqrtf(vs[1] / float(hd));
+      lok = mk - float((top + 1) / 2) * stepk;
+      lov = mv - float((top + 1) / 2) * stepv;
+    } else {
+      float mm[4] = {d < hd ? xrk : -INFINITY, d < hd ? -xrk : -INFINITY, d < hd ? xrv : -INFINITY,
+                     d < hd ? -xrv : -INFINITY};
+      block_max_n(mm);
+      lok = -mm[1];
+      stepk = (mm[0] - lok) / float(top + 1);
+      lov = -mm[3];
+      stepv = (mm[2] - lov) / float(top + 1);
+    }
+    const __half2 gridk = __floats2half2_rn(lok, stepk);
+    const __half2 gridv = __floats2half2_rn(lov, stepv);
+    lok = __low2float(gridk);
+    stepk = __high2float(gridk);
+    lov = __low2float(gridv);
+    stepv = __high2float(gridv);
+    uint8_t* codes_k = reinterpret_cast<uint8_t*>(xk);
+    uint8_t* codes_v = codes_k + hd;
+    if (d < hd) {
+      codes_k[d] = uint8_t(stepk > 0.f ? min(top, max(0, int(floorf((xrk - lok) / stepk)))) : 0);
+      codes_v[d] = uint8_t(stepv > 0.f ? min(top, max(0, int(floorf((xrv - lov) / stepv)))) : 0);
+    }
+    __syncthreads();
+    if (d >= hd) return;
+    const StrataLayout L(hd, kv.bits);
+    const int sslot = pos - strata_base;
+    const size_t woff = strata_words_at(sslot, kh, nkv, kv.words);
+    const int p16 = sslot & 15;
+    const int kw = Compact ? 24 : L.kwords();
+    const int vw = Compact ? 24 : L.vwords();
+    const int vbase = hd >= 64 ? ((kv.words + 31) & ~31) : kv.words;
+    if (d < kw) {
+      uint32_t w = 0;
+      if (d < 4 * L.kown) {
+        const int t = d / L.kown, j0 = (d % L.kown) * L.cph;
+        for (int s = 0; s < L.cph; ++s) {
+          const int first = 8 * (j0 + s) + 2 * t;
+          w |= uint32_t(codes_k[first]) << (s * kv.bits);
+          w |= uint32_t(codes_k[first + 1]) << (16 + s * kv.bits);
+        }
+      } else {
+        const int t0 = (d - 4 * L.kown) * L.kgpw, t_end = min(4, t0 + L.kgpw);
+        for (int t = t0; t < t_end; ++t) {
+          for (int rr = 0; rr < L.kleft; ++rr) {
+            const int s = (t - t0) * L.kleft + rr;
+            const int first = 8 * (L.kown * L.cph + rr) + 2 * t;
+            w |= uint32_t(codes_k[first]) << (s * kv.bits);
+            w |= uint32_t(codes_k[first + 1]) << (16 + s * kv.bits);
+          }
+        }
+      }
+      if constexpr (Compact) {
+        const int i = d % 6, bit = i % 3;
+        const int first = 2 * (4 * (30 + i / 3) + d / 6);
+        w |= uint32_t((codes_k[first] >> bit) & 1) << 15;
+        w |= uint32_t((codes_k[first + 1] >> bit) & 1) << 31;
+      }
+      kv.kq[woff + L.k_index(p16, d)] = w;
+    } else if (d < kv.words) {
+      kv.kq[woff + d * 16 + p16] = 0u;
+    } else if (d >= vbase && d < vbase + vw) {
+      const int vd = d - vbase;
+      uint32_t w = 0;
+      if (vd < 8 * L.vown) {
+        const int g = vd / L.vown, m0 = (vd % L.vown) * L.cph;
+        for (int s = 0; s < L.cph; ++s) {
+          const int first = 16 * (m0 + s) + g;
+          w |= uint32_t(codes_v[first]) << (s * kv.bits);
+          w |= uint32_t(codes_v[first + 8]) << (16 + s * kv.bits);
+        }
+      } else {
+        const int g0 = (vd - 8 * L.vown) * L.vgpw, g_end = min(8, g0 + L.vgpw);
+        for (int g = g0; g < g_end; ++g) {
+          for (int rr = 0; rr < L.vleft; ++rr) {
+            const int s = (g - g0) * L.vleft + rr;
+            const int first = 16 * (L.vown * L.cph + rr) + g;
+            w |= uint32_t(codes_v[first]) << (s * kv.bits);
+            w |= uint32_t(codes_v[first + 8]) << (16 + s * kv.bits);
+          }
+        }
+      }
+      if constexpr (Compact) {
+        const int i = vd % 3, bit = i;
+        const int first = 240 + vd / 3;
+        w |= uint32_t((codes_v[first] >> bit) & 1) << 15;
+        w |= uint32_t((codes_v[first + 8] >> bit) & 1) << 31;
+      }
+      kv.vq[woff + L.v_index(p16, vd)] = w;
+    } else if (d >= vbase + vw && d < vbase + kv.words) {
+      kv.vq[woff + (d - vbase) * 16 + p16] = 0u;
+    }
+    if (d == 0) {
+      kv.kqs[size_t(sslot) * nkv + kh] = gridk;
+      kv.vqs[size_t(sslot) * nkv + kh] = gridv;
+    }
+  }
+}
+
+// ---- rel_bias_table -----------------------------------------------------------------------
+// Precomputes out[(r * nh + h) * extent + dist] = dot(rel_bias[dist], r_q[r, h]).
+__global__ void __launch_bounds__(128) k_rel_bias_table(const float* __restrict__ r_q,
+                                                        const float* __restrict__ rel_bias, int nh, int d_rel,
+                                                        int rel_extent, float* __restrict__ out) {
+  pdl_trigger();
+  const int dist = blockIdx.x * blockDim.x + threadIdx.x;
+  const int h = blockIdx.y, r = blockIdx.z;
+  extern __shared__ float sr[];
+  const float* rq = r_q + (size_t(r) * nh + h) * d_rel;
+  for (int m = threadIdx.x; m < d_rel; m += blockDim.x) sr[m] = rq[m];
+  __syncthreads();
+  if (dist >= rel_extent) return;
+  const float* br = rel_bias + size_t(dist) * d_rel;
+  float acc = 0.f;
+  for (int m = 0; m < d_rel; ++m) acc = __fmaf_rn(__ldg(br + m), sr[m], acc);
+  out[(size_t(r) * nh + h) * rel_extent + dist] = acc;
 }
 
 // ---- rel_attention (row-count independent split-K + virtual 0 sink combine) ----------------
@@ -286,7 +456,7 @@ __global__ void __launch_bounds__(128) k_rel_attention_split(const float* __rest
                                                              const float* __restrict__ sink, int ld_sink, int nh,
                                                              int nkv, int d_rel, int rel_extent, int window, int rows,
                                                              float scale, const DevParams* P, float* __restrict__ part,
-                                                             int pos_add, int splits) {
+                                                             int pos_add, int splits, int k_lo, int k_hi) {
   pdl_trigger();
   constexpr int DPL = HD / 32;
   __shared__ float s_m[4][RT], s_l[4][RT];
@@ -302,10 +472,11 @@ __global__ void __launch_bounds__(128) k_rel_attention_split(const float* __rest
 #pragma unroll
   for (int i = 0; i < RT; ++i) {
     p[i] = base + r0 + i;
-    const int first = window > 0 ? max(0, p[i] - window + 1) : 0;
-    const int total = p[i] + 1;
+    const int w_first = window > 0 ? max(0, p[i] - window + 1) : 0;
+    const int first = max(w_first, k_lo);
+    const int total = min(p[i] + 1, k_hi);
     const int span = max(0, total - first);
-    const int used = rel_splits_used(span, splits);
+    const int used = span > 0 ? rel_splits_used(span, splits) : 0;
     if (i < nrows && sp < used) {
       const int chunk = (span + used - 1) / used;
       ks[i] = min(total, first + sp * chunk);
@@ -406,9 +577,11 @@ __global__ void __launch_bounds__(128) k_rel_attention_split(const float* __rest
 #pragma unroll
     for (int i = 0; i < RT; ++i) {
       if (i >= nrows) break;
-      const int total = p[i] + 1;
-      const int first = window > 0 ? max(0, p[i] - window + 1) : 0;
-      const int used = rel_splits_used(max(0, total - first), splits);
+      const int w_first = window > 0 ? max(0, p[i] - window + 1) : 0;
+      const int first = max(w_first, k_lo);
+      const int total = min(p[i] + 1, k_hi);
+      const int span = max(0, total - first);
+      const int used = span > 0 ? rel_splits_used(span, splits) : 0;
       if (sp >= used) continue;
       float M = -INFINITY;
 #pragma unroll
@@ -466,24 +639,80 @@ __global__ void k_rel_attention_combine(const float* __restrict__ part, const fl
   put(out, size_t(r) * ld_out + h * hd + d, size_t(r) * nh * hd + h * hd + d, o);
 }
 
+__global__ void k_rel_attention_combine_win(const float* __restrict__ part, const float* __restrict__ gate, int ld_gate,
+                                            int nh, int hd, int window, int splits, const DevParams* P, int pos_add,
+                                            int k_lo, int k_hi, int first_win, int last_win, float* __restrict__ state,
+                                            Out out, int ld_out) {
+  pdl_trigger();
+  const int h = blockIdx.x, r = blockIdx.y, d = threadIdx.x;
+  const int p = P->position + pos_add + r;
+  const int w_first = window > 0 ? max(0, p - window + 1) : 0;
+  const int first = max(w_first, k_lo);
+  const int total = min(p + 1, k_hi);
+  const int span = max(0, total - first);
+  const int used = span > 0 ? rel_splits_used(span, splits) : 0;
+  const float* pr = part + (size_t(r) * nh + h) * splits * (hd + 2);
+  float* st = state + (size_t(r) * nh + h) * kFlashStateFloats(hd);
+
+  float M = first_win ? -INFINITY : st[0];
+  for (int s = 0; s < used; ++s) M = fmaxf(M, pr[s * (hd + 2)]);
+  if (last_win) M = fmaxf(M, 0.f);  // virtual sink at logit 0
+
+  float L = last_win ? __expf(__fsub_rn(0.f, M)) : 0.f;
+  float A = 0.f;
+  if (!first_win && st[0] != -INFINITY) {
+    const float fp = __expf(__fsub_rn(st[0], M));
+    L = __fmaf_rn(st[1], fp, L);
+    A = __fmaf_rn(st[2 + d], fp, A);
+  }
+  for (int s = 0; s < used; ++s) {
+    const float ms = pr[s * (hd + 2)];
+    if (ms == -INFINITY) continue;
+    const float f = __expf(__fsub_rn(ms, M));
+    L = __fmaf_rn(pr[s * (hd + 2) + 1], f, L);
+    A = __fmaf_rn(pr[s * (hd + 2) + 2 + d], f, A);
+  }
+
+  if (!last_win) {
+    if (d == 0) {
+      st[0] = M;
+      st[1] = L;
+    }
+    st[2 + d] = A;
+    return;
+  }
+  float o = L > 0.f ? A / L : 0.f;
+  if (gate) o *= sigm(gate[size_t(r) * ld_gate + h * hd + d]);
+  put(out, size_t(r) * ld_out + h * hd + d, size_t(r) * nh * hd + h * hd + d, o);
+}
+
 template <int HD>
 void dispatch_rel_attention(const float* q, const float* r, KvRef kv, const float* rel_bias, const float* sink,
                             int ld_sink, const float* gate, int ld_gate, int nh, int nkv, int d_rel, int rel_extent,
                             int window, int rows, float scale, const DevParams* P, float* out, int ld_out,
-                            float* partial, int splits, const Launch& L, int pos_add) {
+                            float* partial, int splits, const Launch& L, int pos_add, const RelWindow& win) {
   const int eff_splits = std::max(1, splits);
+  const int k_lo = win.state ? win.k_lo : 0;
+  const int k_hi = win.state ? win.k_hi : INT_MAX;
   if (rows == 1) {
     k_rel_attention_split<HD, 1><<<dim3(nh, eff_splits, 1), 128, 0, L.st>>>(
         q, r, kv, rel_bias, sink, ld_sink, nh, nkv, d_rel, rel_extent, window, rows, scale, P, partial, pos_add,
-        eff_splits);
+        eff_splits, k_lo, k_hi);
   } else {
     k_rel_attention_split<HD, 4><<<dim3(nh, eff_splits, ceil_div(rows, 4)), 128, 0, L.st>>>(
         q, r, kv, rel_bias, sink, ld_sink, nh, nkv, d_rel, rel_extent, window, rows, scale, P, partial, pos_add,
-        eff_splits);
+        eff_splits, k_lo, k_hi);
   }
-  const Out dst = out ? Out{out, nullptr, nullptr} : split_out(L, rows, nh * HD, false);
-  k_rel_attention_combine<<<dim3(nh, rows), HD, 0, L.st>>>(partial, gate, ld_gate, nh, HD, window, eff_splits, P,
-                                                           pos_add, dst, ld_out);
+  const Out dst = (!win.state || win.last) ? (out ? Out{out, nullptr, nullptr} : split_out(L, rows, nh * HD, false))
+                                           : Out{nullptr, nullptr, nullptr};
+  if (win.state) {
+    k_rel_attention_combine_win<<<dim3(nh, rows), HD, 0, L.st>>>(partial, gate, ld_gate, nh, HD, window, eff_splits, P,
+                                                                 pos_add, k_lo, k_hi, int(win.first), int(win.last),
+                                                                 win.state, dst, ld_out);
+  } else {
+    k_rel_attention_combine<<<dim3(nh, rows), HD, 0, L.st>>>(partial, gate, ld_gate, nh, HD, window, eff_splits, P,
+                                                             pos_add, dst, ld_out);
+  }
 }
 
 }  // namespace
@@ -537,35 +766,48 @@ void rel_attn_prep(const float* q_in, int ldq, const float* k_in, int ldk, const
                    const float* r_in, int ldr, const float* q_clip_w, const float* r_clip_w, float qk_clip,
                    float rel_clip, float v_eps, int log_floor, float log_alpha, int nh, int nkv, int hd, int d_rel,
                    int rows, const DevParams* P, int pos_sel, bool is_swa, float* q_out, float* r_out, KvRef kv,
-                   cudaStream_t st, int pos_add) {
+                   cudaStream_t st, int pos_add, int strata_base) {
   const int threads = std::max(32, ((std::max(hd, d_rel) + 31) / 32) * 32);
-  k_rel_attn_prep<<<dim3(nh + nkv, rows), threads, 0, st>>>(q_in, ldq, k_in, ldk, v_in, ldv, r_in, ldr, q_clip_w,
-                                                            r_clip_w, qk_clip, rel_clip, v_eps, log_floor, log_alpha,
-                                                            nh, nkv, hd, d_rel, P, pos_sel, int(is_swa), q_out, r_out,
-                                                            kv, pos_add);
+  const size_t smem = kv.kq ? size_t(2) * size_t(hd) * sizeof(float) : 0;
+  if (kv.kq && hd == 256 && kv.bits == 3 && kv.words == 24) {
+    k_rel_attn_prep<true><<<dim3(nh + nkv, rows), threads, smem, st>>>(
+        q_in, ldq, k_in, ldk, v_in, ldv, r_in, ldr, q_clip_w, r_clip_w, qk_clip, rel_clip, v_eps, log_floor, log_alpha,
+        nh, nkv, hd, d_rel, P, pos_sel, int(is_swa), q_out, r_out, kv, pos_add, strata_base);
+  } else {
+    k_rel_attn_prep<false><<<dim3(nh + nkv, rows), threads, smem, st>>>(
+        q_in, ldq, k_in, ldk, v_in, ldv, r_in, ldr, q_clip_w, r_clip_w, qk_clip, rel_clip, v_eps, log_floor, log_alpha,
+        nh, nkv, hd, d_rel, P, pos_sel, int(is_swa), q_out, r_out, kv, pos_add, strata_base);
+  }
+}
+
+void rel_bias_table(const float* r_q, const float* rel_bias, int nh, int d_rel, int rel_extent, int rows, float* out,
+                    cudaStream_t st) {
+  if (rows <= 0 || nh <= 0 || rel_extent <= 0) return;
+  k_rel_bias_table<<<dim3(ceil_div(rel_extent, 128), nh, rows), 128, size_t(d_rel) * sizeof(float), st>>>(
+      r_q, rel_bias, nh, d_rel, rel_extent, out);
 }
 
 void rel_attention(const float* q, const float* r, KvRef kv, const float* rel_bias, const float* sink, int ld_sink,
                    const float* gate, int ld_gate, int nh, int nkv, int hd, int d_rel, int rel_extent, int window,
                    int rows, const DevParams* P, float* out, int ld_out, float* partial, int splits, const Launch& L,
-                   int pos_add) {
+                   int pos_add, const RelWindow& win) {
   const float scale = 1.f / std::sqrt(float(hd));
   switch (hd) {
     case 32:
       dispatch_rel_attention<32>(q, r, kv, rel_bias, sink, ld_sink, gate, ld_gate, nh, nkv, d_rel, rel_extent, window,
-                                 rows, scale, P, out, ld_out, partial, splits, L, pos_add);
+                                 rows, scale, P, out, ld_out, partial, splits, L, pos_add, win);
       return;
     case 64:
       dispatch_rel_attention<64>(q, r, kv, rel_bias, sink, ld_sink, gate, ld_gate, nh, nkv, d_rel, rel_extent, window,
-                                 rows, scale, P, out, ld_out, partial, splits, L, pos_add);
+                                 rows, scale, P, out, ld_out, partial, splits, L, pos_add, win);
       return;
     case 128:
       dispatch_rel_attention<128>(q, r, kv, rel_bias, sink, ld_sink, gate, ld_gate, nh, nkv, d_rel, rel_extent, window,
-                                  rows, scale, P, out, ld_out, partial, splits, L, pos_add);
+                                  rows, scale, P, out, ld_out, partial, splits, L, pos_add, win);
       return;
     case 256:
       dispatch_rel_attention<256>(q, r, kv, rel_bias, sink, ld_sink, gate, ld_gate, nh, nkv, d_rel, rel_extent, window,
-                                  rows, scale, P, out, ld_out, partial, splits, L, pos_add);
+                                  rows, scale, P, out, ld_out, partial, splits, L, pos_add, win);
       return;
     default: throw std::runtime_error("rel_attention: unsupported head dim " + std::to_string(hd));
   }
