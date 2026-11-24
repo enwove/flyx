@@ -2,6 +2,7 @@
 #include "core/plan/plans.h"
 
 #include <algorithm>
+#include <optional>
 
 namespace flyx::plan {
 
@@ -68,13 +69,20 @@ bool build(const flyx_backend_api* api, flyx_bmodel* bm, const interfaces::Model
     to->push_back(plan);
     return true;
   };
+  // A round the engine can do without: lowered where the backend takes it, else the backend's refusal.  *err is
+  // left as it was.
+  auto probe_round = [&](int k, int drafter, bool given_drafts, std::vector<flyx_plan*>* to,
+                         bool tree) -> std::optional<std::string> {
+    std::string e;
+    std::swap(e, *err);
+    const bool ok = lower_round(k, drafter, given_drafts, to, tree);
+    std::swap(e, *err);
+    if (ok) return std::nullopt;
+    return e;
+  };
   auto lower_given_trees = [&]() {
     for (int k : tree_widths()) {
-      std::string e;
-      std::swap(e, *err);
-      const bool ok = lower_round(k, -1, true, &out->trees, true);
-      std::swap(e, *err);
-      if (!ok) break;  // the backend has no tree rounds
+      if (probe_round(k, -1, true, &out->trees, true)) break;  // the backend has no tree rounds
       out->tree_widths.push_back(k);
     }
   };
@@ -105,28 +113,20 @@ bool build(const flyx_backend_api* api, flyx_bmodel* bm, const interfaces::Model
                       (k > 0 ? std::to_string(k) : std::string("warm-up")) + ": " + e;
     };
     for (int k : tries) {
-      std::string e;
-      std::swap(e, *err);
-      const bool ok = lower_round(k, d, false, &lowered, true);
-      std::swap(e, *err);
-      if (!ok) {
+      if (auto why = probe_round(k, d, false, &lowered, true)) {
         // Memory the load can give back (engine.cpp: trim) is not a reason to draft without it: the load lowers
         // the plans again once it has (the ones lowered here freed first).
-        if (e.find("out of GPU memory") != std::string::npos) return free_lowered(), *err = e, false;
-        refuse(k, e);
+        if (why->find("out of GPU memory") != std::string::npos) return free_lowered(), *err = *why, false;
+        refuse(k, *why);
         continue;
       }
       widths.push_back(k);
       if (fixed_width > 0) break;
     }
     if (!widths.empty() && fixed_width < 0 && model.restarts(d)) {
-      std::string e;
-      std::swap(e, *err);
-      const bool ok = lower_round(0, d, false, &lowered);
-      std::swap(e, *err);
-      if (!ok) {
-        if (e.find("out of GPU memory") != std::string::npos) return free_lowered(), *err = e, false;
-        refuse(0, e);  // without its warm-up the drafter is not run: its rounds after others' would draft nothing
+      if (auto why = probe_round(0, d, false, &lowered, false)) {
+        if (why->find("out of GPU memory") != std::string::npos) return free_lowered(), *err = *why, false;
+        refuse(0, *why);  // without its warm-up the drafter is not run: its rounds after others' would draft nothing
         widths.clear();
       } else {
         widths.push_back(0);
@@ -179,11 +179,7 @@ bool build(const flyx_backend_api* api, flyx_bmodel* bm, const interfaces::Model
     for (int d = 0; d < model.drafters(); ++d)
       for (int k : draft_tree_widths()) {
         if (model.drafts_trees(d)) break;  // its rounds are trees already
-        std::string e;
-        std::swap(e, *err);
-        const bool ok = lower_round(k, d, false, &out->rounds, true);
-        std::swap(e, *err);
-        if (!ok) break;  // a drafter (or backend) that drafts no trees
+        if (probe_round(k, d, false, &out->rounds, true)) break;  // a drafter (or backend) that drafts no trees
         add(k, d);
         out->drafter_trees.back() = true;
       }
@@ -197,11 +193,7 @@ bool build(const flyx_backend_api* api, flyx_bmodel* bm, const interfaces::Model
       out->given_widths.push_back(k);
     }
     for (int k : wide_given_widths()) {
-      std::string e;
-      std::swap(e, *err);
-      const bool ok = lower_round(k, -1, true, &out->given);
-      std::swap(e, *err);
-      if (!ok) break;  // the backend has no wide rounds
+      if (probe_round(k, -1, true, &out->given, false)) break;  // the backend has no wide rounds
       out->given_widths.push_back(k);
     }
   }
