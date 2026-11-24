@@ -99,6 +99,20 @@ bool engine_flag(const std::string& a, const std::function<std::string()>& value
     eo->mmproj_file = value();
   } else if (a == "--no-vision") {
     eo->vision = false;
+  } else if (a == "--vision-offload") {
+    eo->vision_device = "host";
+  } else if (a == "--vision-device") {
+    const std::string v = value();
+    if (v != "auto" && v != "gpu" && v != "host" && v != "cpu")
+      std::fprintf(stderr, "error: --vision-device auto, gpu, or host\n"), std::exit(2);
+    eo->vision_device = v;
+  } else if (a == "--vision-quant") {
+    const std::string v = value();
+    if (v != "exact" && v != "bf16" && v != "q8" && v != "q8_0" && v != "nvfp4" && v != "fp4")
+      std::fprintf(stderr, "error: --vision-quant exact, q8, or nvfp4\n"), std::exit(2);
+    eo->vision_quant = v;
+  } else if (a == "--vision-max-tokens") {
+    eo->vision_max_tokens = whole_flag("--vision-max-tokens", value(), 16, kMaxCtx);
   } else if (a == "--activations") {
     eo->activations = value();
   } else if (a == "--chat-template") {
@@ -156,6 +170,10 @@ std::string engine_flags_help(int ctx) {
          "                       --draft alone), for a model of either format\n"
          "  --mmproj F           multimodal vision projector GGUF (mmproj-*.gguf) beside the model file\n"
          "  --no-vision          do not load a vision encoder even if a projector is available\n"
+         "  --vision-offload     keep vision weights in pinned host RAM (0 VRAM) and stream layers to GPU on demand\n"
+         "  --vision-device D    auto | gpu | host (default auto: GPU when >= 8 GB free after weights, else host)\n"
+         "  --vision-quant Q     exact | q8 | nvfp4 (default exact: keep file precision; q8 ~47%% smaller, nvfp4 ~71%%)\n"
+         "  --vision-max-tokens N cap merged visual tokens per image (default: auto by context and detail)\n"
          "  --width N            fix the model drafter's width at N, up to its maximum (default: chosen per round)\n"
          "                       prompt lookup can still verify 15 drafts from earlier text (disable with --no-lookup)\n"
          "                       but not beside a DV drafter, whose rounds then run alone: its widest of at most N\n"

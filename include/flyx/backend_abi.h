@@ -742,6 +742,21 @@ typedef struct {
   uint64_t process_host;
 } flyx_device_stats;
 
+/* Where vision encoder weights live and how they run (ABI 44). */
+typedef enum {
+  FLYX_VISION_DEV_AUTO = 0,     /* backend picks GPU resident vs pinned host streaming by free VRAM headroom */
+  FLYX_VISION_DEV_HOST = 1,     /* vision weights in pinned host RAM, streamed to GPU during encode_vision (0 VRAM) */
+  FLYX_VISION_DEV_GPU  = 2      /* vision weights resident in GPU VRAM */
+} flyx_vision_device;
+
+/* On-the-fly quantization of floating-point vision linear weights at load time (ABI 44).
+ * Pre-quantized GGML block weights in mmproj files are always kept packed as-is. */
+typedef enum {
+  FLYX_VISION_QUANT_EXACT = 0,  /* keep file format (BF16/F16/F32 or pre-quantized GGML blocks) */
+  FLYX_VISION_QUANT_Q8    = 1,  /* quantize float vision linears to Q8_0 (8.5 bpw, ~47% smaller) */
+  FLYX_VISION_QUANT_NVFP4 = 2   /* quantize float vision linears to NVFP4 (4.5 bpw, ~71% smaller) */
+} flyx_vision_quant;
+
 typedef struct {
   int32_t max_ctx;              /* tokens per sequence */
   int32_t verbose;
@@ -751,6 +766,8 @@ typedef struct {
    * documents its keys and fails open() on one it does not know; a key given
    * twice takes the later value.  The engine passes them through unread. */
   const char* options;
+  int32_t vision_device;        /* flyx_vision_device (ABI 44; 0 = auto) */
+  int32_t vision_quant;         /* flyx_vision_quant (ABI 44; 0 = exact) */
 } flyx_open_options;
 
 /* Device memory as the backend sees it (0 = unknown, e.g. a CPU backend). */

@@ -71,7 +71,7 @@ bool supported(const flyx_bmodel* m, const Block& blk, std::string* why) {
     const int merged = vm->merge_mode == FLYX_VMERGE_SPATIAL_CONCAT
                            ? vm->in_hidden * vm->merge_size * vm->merge_size
                            : vm->in_hidden;
-    if (merged % 8 || (vm->w_fc2.w && vm->merge_hidden % 8))
+    if (merged % 8 || (vm->w_fc1.present() && vm->w_fc2.present() && vm->merge_hidden % 8))
       return no("vision_merge dimensions must be multiples of 8");
   }
   return true;

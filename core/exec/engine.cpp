@@ -9,6 +9,7 @@
 #include <string_view>
 #include <thread>
 
+#include "core/exec/generation.h"
 #include "core/interfaces/options.h"
 #include "core/os/env.h"
 #include "core/os/log.h"
@@ -18,6 +19,20 @@
 namespace flyx {
 
 namespace {
+
+bool parse_vision_device(const std::string& s, int32_t* out, std::string* err) {
+  if (s.empty() || s == "auto") return *out = FLYX_VISION_DEV_AUTO, true;
+  if (s == "host" || s == "cpu") return *out = FLYX_VISION_DEV_HOST, true;
+  if (s == "gpu") return *out = FLYX_VISION_DEV_GPU, true;
+  return *err = "unknown --vision-device '" + s + "' (auto, gpu, or host)", false;
+}
+
+bool parse_vision_quant(const std::string& s, int32_t* out, std::string* err) {
+  if (s.empty() || s == "exact" || s == "bf16") return *out = FLYX_VISION_QUANT_EXACT, true;
+  if (s == "q8" || s == "q8_0") return *out = FLYX_VISION_QUANT_Q8, true;
+  if (s == "nvfp4" || s == "fp4") return *out = FLYX_VISION_QUANT_NVFP4, true;
+  return *err = "unknown --vision-quant '" + s + "' (exact, q8, or nvfp4)", false;
+}
 
 bool set_kv_method(const EngineOptions& opt, plan::KvTiers* tiers, std::string* err) {
   interfaces::KvMethodSpec spec;
@@ -542,6 +557,8 @@ bool Engine::load(const std::string& path, const EngineOptions& opt, std::string
   if (opt_.kv == FLYX_KV_DEFAULT) opt_.kv = roomy() || !model_->kv_fp8_by_default() ? FLYX_KV_16 : FLYX_KV_FP8;
   oo.kv_fp8 = opt_.kv == FLYX_KV_FP8 ? 1 : 0;
   oo.options = opt_.backend_options.c_str();
+  if (!parse_vision_device(opt_.vision_device, &oo.vision_device, err)) return false;
+  if (!parse_vision_quant(opt_.vision_quant, &oo.vision_quant, err)) return false;
   if (api_->open(&model_->desc(), &oo, &bm_) != 0) {
     *err = std::string("backend open: ") + api_->last_error();
     return false;
@@ -603,6 +620,21 @@ std::string Engine::memory_report() const {
   return r;
 }
 
+int Engine::image_token_budget(const std::string& detail, size_t n_images) const {
+  const int avail = std::max(256, prompt_limit(opt_.max_ctx) - 256);
+  int budget = 0;
+  if (detail == "low") {
+    budget = std::min(256, avail);
+  } else if (detail == "high") {
+    budget = std::min(4096, avail);
+  } else {
+    const int per_img = std::max(256, (avail / 2) / std::max(1, static_cast<int>(n_images)));
+    budget = std::min({2048, per_img, avail});
+  }
+  if (opt_.vision_max_tokens > 0) budget = std::min(budget, opt_.vision_max_tokens);
+  return std::max(16, budget);
+}
+
 bool Engine::encode_image(const interfaces::ImageInput& img, int max_tokens,
                           std::shared_ptr<const vision::CachedVision>* out, std::string* err) const {
   if (!has_vision()) {
@@ -612,6 +644,7 @@ bool Engine::encode_image(const interfaces::ImageInput& img, int max_tokens,
   const vision::VisionCacheKey key{img.sha256, img.detail, max_tokens};
   if (vision_cache_.get(key, out)) return true;
 
+  const double t_enc0 = os::now_ms();
   interfaces::RgbImage rgb;
   if (!vision::decode_image_bytes(img.bytes.data(), img.bytes.size(), &rgb, err)) return false;
   rgb.sha256 = img.sha256;
@@ -622,6 +655,7 @@ bool Engine::encode_image(const interfaces::ImageInput& img, int max_tokens,
     *err = "vision preprocess produced empty output";
     return false;
   }
+  const double t_pre = os::now_ms();
 
   flyx_vision_input vi{};
   vi.patches = pm.patches.data();
@@ -644,6 +678,11 @@ bool Engine::encode_image(const interfaces::ImageInput& img, int max_tokens,
   if (got_rows != expected_rows) {
     *err = "encode_vision: produced " + std::to_string(got_rows) + " rows, expected " + std::to_string(expected_rows);
     return false;
+  }
+  if (opt_.verbose) {
+    const double t_end = os::now_ms();
+    log::info("flyx: vision encode %dx%d -> %d patches -> %d tokens: %.1f ms (preprocess %.1f ms, ViT %.1f ms)",
+              rgb.width, rgb.height, pm.n_patches, got_rows, t_end - t_enc0, t_pre - t_enc0, t_end - t_pre);
   }
   cv->tokens = std::move(pm.tokens);
   cv->embed_offsets = std::move(pm.embed_offsets);

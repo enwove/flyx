@@ -881,6 +881,30 @@ int open_model(const flyx_model_desc* desc, const flyx_open_options* opts, flyx_
   m->blocks.assign(desc->blocks, desc->blocks + desc->n_blocks);
   m->states.assign(desc->states, desc->states + desc->n_states);
   try {
+    // Identify vision linear weight indices when on-the-fly vision quantization is requested.
+    const int32_t vq = opts ? opts->vision_quant : FLYX_VISION_QUANT_EXACT;
+    std::unordered_set<int> vision_lin_w;
+    if (vq == FLYX_VISION_QUANT_Q8 || vq == FLYX_VISION_QUANT_NVFP4) {
+      auto mark = [&](int idx) {
+        if (idx >= 0) vision_lin_w.insert(idx);
+      };
+      for (const flyx_block& b : m->blocks) {
+        if (b.kind == FLYX_BLOCK_VIT_ATTN) {
+          mark(b.vit_attn.qkv);
+          mark(b.vit_attn.q);
+          mark(b.vit_attn.k);
+          mark(b.vit_attn.v);
+          mark(b.vit_attn.o);
+        } else if (b.kind == FLYX_BLOCK_VIT_MLP) {
+          mark(b.vit_mlp.fc1);
+          mark(b.vit_mlp.gate);
+          mark(b.vit_mlp.fc2);
+        } else if (b.kind == FLYX_BLOCK_VISION_MERGE) {
+          mark(b.vision_merge.fc1);
+          mark(b.vision_merge.fc2);
+        }
+      }
+    }
     for (int i = 0; i < desc->n_weights; ++i) {
       const flyx_weight& w = desc->weights[i];
       if (!w.t) throw std::runtime_error("weight " + std::to_string(i) + " has no tensor");
@@ -898,14 +922,48 @@ int open_model(const flyx_model_desc* desc, const flyx_open_options* opts, flyx_
       auto data = std::make_unique<std::vector<double>>(nvfp4 && !ggml_fp4
                                                             ? flyx::ops::dequant_nvfp4(w.t, w.scale, w.scale2)
                                                             : flyx::ops::to_vec(w.t));
+      bool q_q8 = false, q_fp4 = false;
+      if (floats && w.t->ndim == 2 && vision_lin_w.count(i)) {
+        const int N = int(w.t->shape[0]), K = int(w.t->shape[1]);
+        std::vector<float> row_f(static_cast<size_t>(K));
+        if (vq == FLYX_VISION_QUANT_Q8) {
+          const int K_pad = (K + 31) / 32 * 32;
+          std::vector<uint8_t> payload(static_cast<size_t>(K_pad));
+          std::vector<uint16_t> scales(static_cast<size_t>(K_pad / 32));
+          for (int r = 0; r < N; ++r) {
+            for (int k = 0; k < K; ++k) row_f[size_t(k)] = static_cast<float>((*data)[size_t(r) * K + k]);
+            flyx::ops::quantize_row_q8_0(row_f.data(), K, K_pad, payload.data(), scales.data());
+            for (int k = 0; k < K; ++k)
+              (*data)[size_t(r) * K + k] =
+                  flyx::ops::ggml::half(scales[size_t(k / 32)]) * double(static_cast<int8_t>(payload[size_t(k)]));
+          }
+          q_q8 = true;
+        } else if (vq == FLYX_VISION_QUANT_NVFP4) {
+          const int K_pad = (K + 63) / 64 * 64;
+          std::vector<uint8_t> q(static_cast<size_t>(K_pad / 2));
+          std::vector<uint8_t> s(static_cast<size_t>(K_pad / 16));
+          for (int r = 0; r < N; ++r) {
+            for (int k = 0; k < K; ++k) row_f[size_t(k)] = static_cast<float>((*data)[size_t(r) * K + k]);
+            float rs = 1.f;
+            flyx::ops::quantize_row_nvfp4(row_f.data(), K, K_pad, q.data(), s.data(), &rs);
+            for (int k = 0; k < K; ++k) {
+              const uint8_t byte = q[size_t(k / 2)];
+              const uint8_t code = (k & 1) ? (byte >> 4) : (byte & 0xF);
+              (*data)[size_t(r) * K + k] =
+                  flyx::ops::e2m1_to_double(code) * flyx::ops::e4m3_to_double(s[size_t(k / 16)]) * double(rs);
+            }
+          }
+          q_fp4 = true;
+        }
+      }
       auto v = std::make_unique<flyx_tensor_view>(*w.t);
       v->dtype = FLYX_DT_F64;
       v->data = data->data();
       v->nbytes = data->size() * sizeof(double);
       m->W.push_back(v.get());
       if (blocks) m->a16h.insert(v.get());
-      if (nvfp4) m->a16.insert(v.get());
-      if (blocks && w.activations == FLYX_ACT_Q8) m->q8.insert(v.get());
+      if (nvfp4 || q_fp4) m->a16.insert(v.get());
+      if ((blocks && w.activations == FLYX_ACT_Q8) || q_q8) m->q8.insert(v.get());
       if (nvfp4 && w.activations == FLYX_ACT_NVFP4) m->a4.insert(v.get());
       m->owned.push_back(std::move(data));
       m->owned_views.push_back(std::move(v));

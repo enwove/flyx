@@ -85,6 +85,7 @@ one, keeps binary16 by default). Where the two stand, from llama.cpp's sources
 | NVFP4 inputs (W4A4): the rounding | from the float32 value, one rounding: fused producers leave a pass's rows in float32; the gate and up GEMM leaves its SwiGLU in bf16 with each row's largest magnitude, as vLLM and SGLang keep theirs, rounded from there; a scale per row besides the e4m3 one per 16 | from the float32 value (`quantize_mmq_nvfp4`) | equal or finer; the down projection's inputs coarser (bf16 first) |
 | exp, division, square roots, values below 2^-126 | correctly rounded where the kernels do not ask for the fast intrinsic; subnormals kept | `-use_fast_math`: approximate, subnormals flushed to zero | equal or finer |
 | Norms, SwiGLU, the GDN convolution, gated norm and row-by-row recurrence, sampling | float32 | float32 | equal |
+| Vision encoder weights (`mmproj`) | file precision by default (BF16/F16/F32 or pre-quantized GGML blocks kept packed; host offload `vision=host` streams identical bytes to GPU for bit-identical outputs); opt-in `--vision-quant q8` (Q8_0 + 8-bit inputs) or `nvfp4` (NVFP4 + bf16 inputs) | file precision (`mmproj-BF16` / `mmproj-Q8_0`, `--no-mmproj-offload` runs on CPU) | equal by default; opt-in quantization |
 
 ## Launchers
 
@@ -267,6 +268,7 @@ against the reference) rather than by a kernel test.
 | layernorm | ops::layernorm (ops/norm/ref.h): float32 mean, variance, rsqrt and optional affine scale/bias per row | 1e-5 | R | test_layernorm |
 | add_bias, vision_residual_add | ops::add_bias (ops/vision/ref.h) and optional LayerScale residual add in float32 | 1e-6 | R | test_add_bias |
 | vact_apply, vact_gated | ops::vact (ops/activation/ref.h): GELU (tanh and erf), SiLU, QuickGELU, plain and gated | 1e-5 | R | test_vact |
+| vision_zero_tail | exact zero fill of padded columns `[valid_cols, ld)` per row for quantized vision linears with `K` not divisible by 32/64 | exact | R | test_vact |
 | gemm_f32 | ops::linear (ops/linear/ref.h) on float32 inputs and float32 weights for arbitrary K (vision patch stems, including patch_size=14) | 2e-5 | R | test_gemm_f32 |
 | vision_pos_embed_add, vision_pos_embed_bilinear_add | fixed modulo and ops::vision_pos_embed_bilinear_add (ops/vision/ref.h): align_corners=true bilinear interpolation in float64 coordinates, float32 accumulation | 1e-5 | R | test_vision_pos_embed |
 | vision_rope_2d | ops::rope_2d_axial (ops/rope/ref.h): 2D axial rotary embedding in double angles, float32 sin/cos | 1e-5 | R | test_vision_rope_2d |

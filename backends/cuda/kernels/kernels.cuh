@@ -1359,6 +1359,8 @@ void vision_residual_add(float* x, const float* y, const float* scale, int rows,
 void vact_apply(float* x, size_t n, int act, cudaStream_t st);
 // Gated activation: out[i] = vact(gate[i], act) * up[i] on n elements.
 void vact_gated(const float* gate, const float* up, float* out, size_t n, int act, cudaStream_t st);
+// Zero columns [valid_cols, ld) in every row of x [rows, ld] (for padded quantized K dimensions).
+void vision_zero_tail(float* x, int rows, int valid_cols, int ld, cudaStream_t st);
 // Float32 GEMM: y[r, n] (=|+=) sum_k x[r, k] * W[n, k], arbitrary K (patch Conv2d/3d stem with F32 weights).
 void gemm_f32(const float* x, int ldx, const float* W, int N, int K, float* y, int ldy, int rows, bool accumulate,
               cudaStream_t st);

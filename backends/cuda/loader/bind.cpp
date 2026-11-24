@@ -377,8 +377,8 @@ DvBlock dv(WeightLoader& L, const flyx_model_desc& d, const flyx_dv_block& b, co
 }
 
 VNorm bind_vnorm(WeightLoader& L, const flyx_vnorm& n) {
-  return VNorm{n.kind, n.w >= 0 ? L.vec(n.w) : nullptr, n.b >= 0 ? L.vec(n.b) : nullptr, float(n.offset),
-               float(n.eps)};
+  return VNorm{n.kind, n.w >= 0 ? L.vision_vec(n.w) : VisionVec{}, n.b >= 0 ? L.vision_vec(n.b) : VisionVec{},
+               float(n.offset), float(n.eps)};
 }
 
 VisionStemBlock vision_stem(WeightLoader& L, const flyx_vision_stem_block& b) {
@@ -397,13 +397,13 @@ VisionStemBlock vision_stem(WeightLoader& L, const flyx_vision_stem_block& b) {
       std::memcpy(cat.data() + r * size_t(s.in_dim), w0.data() + r * half, half * sizeof(float));
       std::memcpy(cat.data() + r * size_t(s.in_dim) + half, w1.data() + r * half, half * sizeof(float));
     }
-    s.patch_w = L.put(cat);
+    s.patch_w = L.vision_put(cat);
   } else {
     const std::vector<float> w = L.host_f32(b.patch_w);
     expect(w.size() == size_t(s.hidden) * size_t(s.in_dim), "vision_stem: patch_w size mismatch");
-    s.patch_w = L.put(w);
+    s.patch_w = L.vision_put(w);
   }
-  if (b.patch_b >= 0) s.patch_b = L.vec(b.patch_b);
+  if (b.patch_b >= 0) s.patch_b = L.vision_vec(b.patch_b);
   s.pos_mode = b.pos_mode;
   s.pos_grid_h = b.pos_grid_h;
   s.pos_grid_w = b.pos_grid_w;
@@ -412,9 +412,9 @@ VisionStemBlock vision_stem(WeightLoader& L, const flyx_vision_stem_block& b) {
     const size_t n = WeightLoader::numel(L.t(b.pos_w));
     expect(n % size_t(s.hidden) == 0, "vision_stem: pos_w size not divisible by hidden");
     s.pos_rows = int(n / size_t(s.hidden));
-    s.pos_w = L.vec(b.pos_w);
+    s.pos_w = L.vision_vec(b.pos_w);
   }
-  if (b.cls_token >= 0) s.cls_token = L.vec(b.cls_token);
+  if (b.cls_token >= 0) s.cls_token = L.vision_vec(b.cls_token);
   s.pre_norm = bind_vnorm(L, b.pre_norm);
   return s;
 }
@@ -433,11 +433,11 @@ VitAttnBlock vit_attn(WeightLoader& L, const flyx_vit_attn_block& b) {
   const int pw = a.nh * a.hd;
   int rows = 0;
   if (b.qkv >= 0) {
-    a.w_qkv = L.lin(b.qkv);
-    rows = int(L.t(b.qkv)->shape[0]);
-    if (b.qkv_b >= 0) a.qkv_b = L.vec(b.qkv_b);
+    a.w_qkv = L.vision_lin(b.qkv);
+    rows = a.w_qkv.N;
+    if (b.qkv_b >= 0) a.qkv_b = L.vision_vec(b.qkv_b);
   } else {
-    a.w_qkv = L.lin_stack({b.q, b.k, b.v}, &rows);
+    a.w_qkv = L.vision_lin_stack({b.q, b.k, b.v}, &rows);
     if (b.q_b >= 0 || b.k_b >= 0 || b.v_b >= 0) {
       std::vector<float> qb(size_t(3 * pw), 0.f);
       auto copy_b = [&](int w, int off) {
@@ -449,13 +449,13 @@ VitAttnBlock vit_attn(WeightLoader& L, const flyx_vit_attn_block& b) {
       copy_b(b.q_b, 0);
       copy_b(b.k_b, pw);
       copy_b(b.v_b, 2 * pw);
-      a.qkv_b = L.put(qb);
+      a.qkv_b = L.vision_put(qb);
     }
   }
   expect(rows == 3 * pw, "vit_attn: qkv projection rows do not match 3 * nh * hd");
-  a.w_o = L.lin(b.o);
-  if (b.o_b >= 0) a.o_b = L.vec(b.o_b);
-  if (b.layer_scale >= 0) a.layer_scale = L.vec(b.layer_scale);
+  a.w_o = L.vision_lin(b.o);
+  if (b.o_b >= 0) a.o_b = L.vision_vec(b.o_b);
+  if (b.layer_scale >= 0) a.layer_scale = L.vision_vec(b.layer_scale);
   return a;
 }
 
@@ -466,15 +466,15 @@ VitMlpBlock vit_mlp(WeightLoader& L, const flyx_vit_mlp_block& b) {
   f.act = b.act;
   f.gated = b.gated != 0;
   f.norm = bind_vnorm(L, b.norm);
-  f.w_fc1 = L.lin(b.fc1);
-  if (b.fc1_b >= 0) f.fc1_b = L.vec(b.fc1_b);
+  f.w_fc1 = L.vision_lin(b.fc1);
+  if (b.fc1_b >= 0) f.fc1_b = L.vision_vec(b.fc1_b);
   if (f.gated) {
-    f.w_gate = L.lin(b.gate);
-    if (b.gate_b >= 0) f.gate_b = L.vec(b.gate_b);
+    f.w_gate = L.vision_lin(b.gate);
+    if (b.gate_b >= 0) f.gate_b = L.vision_vec(b.gate_b);
   }
-  f.w_fc2 = L.lin(b.fc2);
-  if (b.fc2_b >= 0) f.fc2_b = L.vec(b.fc2_b);
-  if (b.layer_scale >= 0) f.layer_scale = L.vec(b.layer_scale);
+  f.w_fc2 = L.vision_lin(b.fc2);
+  if (b.fc2_b >= 0) f.fc2_b = L.vision_vec(b.fc2_b);
+  if (b.layer_scale >= 0) f.layer_scale = L.vision_vec(b.layer_scale);
   return f;
 }
 
@@ -488,10 +488,10 @@ VisionMergeBlock vision_merge(WeightLoader& L, const flyx_vision_merge_block& b)
   mg.act = b.act;
   mg.post_norm = b.post_norm != 0;
   mg.norm = bind_vnorm(L, b.norm);
-  if (b.fc1 >= 0) mg.w_fc1 = L.lin(b.fc1);
-  if (b.fc1_b >= 0) mg.fc1_b = L.vec(b.fc1_b);
-  if (b.fc2 >= 0) mg.w_fc2 = L.lin(b.fc2);
-  if (b.fc2_b >= 0) mg.fc2_b = L.vec(b.fc2_b);
+  if (b.fc1 >= 0) mg.w_fc1 = L.vision_lin(b.fc1);
+  if (b.fc1_b >= 0) mg.fc1_b = L.vision_vec(b.fc1_b);
+  if (b.fc2 >= 0) mg.w_fc2 = L.vision_lin(b.fc2);
+  if (b.fc2_b >= 0) mg.fc2_b = L.vision_vec(b.fc2_b);
   return mg;
 }
 

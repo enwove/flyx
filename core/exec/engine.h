@@ -59,6 +59,14 @@ struct EngineOptions {
   std::string mmproj_file;
   // Disable loading any vision encoder even if mmproj weights are present (--no-vision).
   bool vision = true;
+  // Where vision encoder weights live: "auto" (GPU if roomy, else pinned host RAM streamed to GPU),
+  // "gpu" (resident in GPU VRAM), or "host" (pinned host RAM, 0 bytes resident VRAM).
+  std::string vision_device = "auto";
+  // On-the-fly quantization of floating-point vision linear weights: "exact" (keep file dtype),
+  // "q8" (Q8_0, ~47% smaller), or "nvfp4" (NVFP4, ~71% smaller). Pre-quantized mmproj stays packed.
+  std::string vision_quant = "exact";
+  // Optional cap on merged visual tokens per image (0 = auto by context size and detail level).
+  int vision_max_tokens = 0;
   int verbose = 0;
   // Prompt rows per prefill pass.  Larger chunks keep the GEMMs busier; the
   // buffers for one chunk are shared by all sessions.
@@ -198,6 +206,8 @@ class Engine {
   bool has_vision() const {
     return model_ && model_->vision() != nullptr && plans_.vision != nullptr && api_ && api_->encode_vision != nullptr;
   }
+  // Compute per-image merged visual token budget from detail level, context size, image count, and vision_max_tokens.
+  int image_token_budget(const std::string& detail, size_t n_images) const;
   // Decode, preprocess, and encode one image into projected embeddings (cached by SHA-256 + detail + max_tokens).
   bool encode_image(const interfaces::ImageInput& img, int max_tokens, std::shared_ptr<const vision::CachedVision>* out,
                     std::string* err) const;

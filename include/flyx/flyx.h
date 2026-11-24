@@ -73,6 +73,9 @@ typedef struct {
                                (python/convert --draft alone); several separated by newlines; NULL = none */
   const char* mmproj_file;  /* multimodal projector / vision encoder companion GGUF (e.g. mmproj-BF16.gguf); NULL = none */
   int32_t no_vision;        /* 1 = skip loading any vision encoder even if present in the model or companion */
+  const char* vision_device; /* "auto" | "gpu" | "host" (NULL = auto: GPU if roomy, else pinned host streaming) */
+  const char* vision_quant;  /* "exact" | "q8" | "nvfp4" (NULL = exact: keep file precision) */
+  int32_t vision_max_tokens; /* per-image merged visual token cap (0 = auto by context size) */
 } flyx_load_options;
 
 typedef struct {

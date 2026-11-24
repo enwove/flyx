@@ -38,6 +38,10 @@ All commands that load a model share the parser in `apps/common/engine_flags.cpp
 | `--drafter-file` | `PATH` \| `HF_REPO` (repeatable) | none | Sidecar MTP GGUF (`MTP/mtp-*.gguf`) or DFlash2 drafter (`.flyx` or HF repo directory). |
 | `--mmproj` | `PATH` | auto (HF Hub) / none (local) | Multimodal vision projector GGUF (`mmproj-*.gguf`, e.g., `mmproj-BF16.gguf`) paired with the model file. Auto-fetched from Hugging Face Hub repos when available unless `--no-vision` is set. |
 | `--no-vision` | flag | off | Disable loading any vision encoder / `mmproj` projector even if available. |
+| `--vision-offload` | flag | off | Shorthand for `--vision-device host`: keep vision weights in pinned host RAM (0 VRAM) and double-buffer stream layers to GPU during image encoding. |
+| `--vision-device` | `auto` \| `gpu` \| `host` | `auto` | Where vision encoder weights live (`auto`: GPU when >= 8 GB VRAM remain free after weights, else pinned host RAM streamed to GPU with bit-identical outputs). |
+| `--vision-quant` | `exact` \| `q8` \| `nvfp4` | `exact` | On-the-fly quantization of floating-point vision linear weights (`q8`: Q8_0 ~47% smaller; `nvfp4`: NVFP4 ~71% smaller; pre-quantized GGML `mmproj` files stay packed). |
+| `--vision-max-tokens` | `N` (`16..max_ctx`) | auto | Cap merged visual tokens per image across CLI, OpenAI, Responses, and Anthropic endpoints. |
 | `--width` | `N` (`0..64`) | adaptive | Pin model drafter width (up to drafter max). Prompt lookup still runs unless `--no-lookup`, but not beside a DV drafter: its widest tree of at most `N` drafts then runs every round. |
 | `--cycle` | `I,J,...` | off | Measurements and tests: launch these rounds in turn (indices into the rounds `-v` lists), no lookup round, instead of the controller's choice. An index past the rounds fails the load. |
 | `--no-spec` | flag | off | Disable all speculative decoding (drafters + lookup). |
@@ -159,6 +163,8 @@ Passed verbatim to the backend (`backends/cuda/backend.cpp`). Unknown keys or in
 | `gemm` | `auto` \| `rows` | `auto` | Force CUDA-core row GEMMs (`rows`, debugging). |
 | `blocks` | `packed` \| `bf16` | `packed` | `bf16` dequantizes GGUF block weights to bf16 at load (higher VRAM, outside packed contract). |
 | `embed` | `auto` \| `host` \| `gpu` | `auto` | Untied embedding table in host RAM (`host`, read over PCIe) or on the GPU (`gpu`); `auto`: `gpu` where 32 GB of GPU memory remain after the weights, else `host`. |
+| `vision` | `auto` \| `host` \| `gpu` | `auto` | Vision encoder weight placement (`host`: pinned host RAM, 0 bytes VRAM, double-buffered DMA streamed to GPU during `encode_vision`; `auto`: `gpu` when >= 8 GB free after weights, else `host`). |
+| `vision_quant` | `exact` \| `q8` \| `nvfp4` | `exact` | On-the-fly quantization of floating-point vision linears (`q8`: Q8_0, `nvfp4`: NVFP4; pre-quantized GGML blocks stay packed). |
 | `head_w12` | `0` \| `1` | `1` | Lossless 12-bit packed bf16 output head for 1..16 rows (`0` saves ~0.95 GB on 4B, ~5% slower plain). |
 | `head_cert` | `0` \| `1` | `1` | Certified FP8-filtered exact greedy head (bit-identical greedy tokens; `0` saves ~0.64 GB on 4B). |
 | `head_fp8` | `0` \| `1` | `0` | Lossy FP8 output head (trades accuracy for decode speed). |

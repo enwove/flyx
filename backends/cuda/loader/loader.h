@@ -79,6 +79,12 @@ class WeightLoader {
   float* vecs(const std::vector<int>& ws);
   float* put(const std::vector<float>& values);
 
+  // Vision encoder loaders: honor BackendOptions::vision (GPU vs pinned host RAM) and vision_quant (exact/q8/nvfp4).
+  VisionVec vision_vec(int w) { return vision_put(host_f32(w)); }
+  VisionVec vision_put(const std::vector<float>& values);
+  VisionLin vision_lin(int w) { return vision_lin_stack({w}); }
+  VisionLin vision_lin_stack(const std::vector<int>& ws, int* rows_out = nullptr);
+
  private:
   void parallel_rows(size_t n, const std::function<void(size_t, size_t)>& fn);
 

@@ -60,7 +60,8 @@ class _LoadOpts(C.Structure):
                 ("speculative", C.c_int32), ("verbose", C.c_int32), ("drafter", C.c_char_p), ("width", C.c_int32),
                 ("prefill_chunk", C.c_int32), ("kv", C.c_int32),
                 ("backend_options", C.c_char_p), ("activations", C.c_char_p), ("chat_template", C.c_char_p),
-                ("drafter_file", C.c_char_p), ("mmproj_file", C.c_char_p), ("no_vision", C.c_int32)]
+                ("drafter_file", C.c_char_p), ("mmproj_file", C.c_char_p), ("no_vision", C.c_int32),
+                ("vision_device", C.c_char_p), ("vision_quant", C.c_char_p), ("vision_max_tokens", C.c_int32)]
 
 
 class _Msg(C.Structure):
@@ -153,7 +154,9 @@ class Engine:
                  drafter: str | None = None, width: int = 0, prefill_chunk: int = 0, kv: str | None = None,
                  backend_options: str | None = None, activations: str | None = None,
                  chat_template: str | None = None, drafter_file: str | list[str] | None = None,
-                 mmproj_file: str | None = None, vision: bool = True):
+                 mmproj_file: str | None = None, vision: bool = True,
+                 vision_device: str | None = None, vision_quant: str | None = None,
+                 vision_max_tokens: int = 0):
         """max_ctx: tokens, or "max": the model's own context, or the longest the GPU and host memory hold.
         width: drafts per round (0: chosen each round by the speculation controller).
         activations: None (as the file has it), "exact" (every format's own rounding everywhere) or "nvfp4"
@@ -184,7 +187,10 @@ class Engine:
                          chat_template.encode() if chat_template else None,
                          drafter_file.encode() if drafter_file else None,
                          os.path.expanduser(os.fspath(mmproj_file)).encode() if mmproj_file else None,
-                         0 if vision else 1)
+                         0 if vision else 1,
+                         vision_device.encode() if vision_device else None,
+                         vision_quant.encode() if vision_quant else None,
+                         int(vision_max_tokens))
         err = _Err()
         self._h = self._lib.flyx_load(os.path.expanduser(model).encode(), C.byref(opts), C.byref(err))
         if not self._h:

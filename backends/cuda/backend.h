@@ -138,6 +138,8 @@ struct BackendOptions {
   bool draft_kv16 = false;       // draft_kv=16: the MTP layer's cache in binary16 beside the target's FP8
   bool packed_blocks = true;     // blocks=bf16 clears it
   int embed = 0;                 // embed=auto (0: host memory unless the GPU has room, open_model), host (1), gpu (2)
+  int vision = FLYX_VISION_DEV_AUTO;        // vision=auto (0), host (1: pinned RAM streamed to GPU), gpu (2)
+  int vision_quant = FLYX_VISION_QUANT_EXACT;  // vision_quant=exact (0), q8 (1), nvfp4 (2)
   int wide = 0;                  // wide=auto (0: wide lookup rounds where the GPU has room, open_model), 0 (1), 1 (2)
   int strata_copy_slots = 2;
   bool strata_compact = false;  // pack the two shared words into the 24 private words of a hosted 256d 3-bit copy
@@ -357,8 +359,9 @@ void prefill_vmm_free(flyx_bmodel* m);
 struct flyx_bmodel {
   std::vector<void*> allocs;
   size_t bytes = 0;
-  std::vector<void*> host_allocs;  // pinned host memory the kernels read over the bus (host_alloc)
+  std::vector<void*> host_allocs;  // pinned host memory (host_alloc / host_pinned)
   size_t host_bytes = 0;
+  size_t vision_dev_bytes = 0, vision_host_bytes = 0;  // subset of bytes / host_bytes held by vision blocks
   int verbose = 0;
 
   // The model as blocks (blocks.h), built by bind() at open: blocks[i] is the
@@ -440,6 +443,17 @@ struct flyx_bmodel {
     void* d = nullptr;
     CK(cudaHostGetDevicePointer(&d, p, 0));
     return static_cast<T*>(d);
+  }
+  // Page-locked host memory for async H2D DMA streaming (e.g. offloaded vision weights): raw host pointer,
+  // 0 bytes of GPU VRAM, freed with host_allocs on model close.
+  template <class T>
+  T* host_pinned(size_t n) {
+    if (n == 0) return nullptr;
+    void* p = nullptr;
+    CK(cudaHostAlloc(&p, n * sizeof(T), cudaHostAllocDefault));
+    host_allocs.push_back(p);
+    host_bytes += n * sizeof(T);
+    return static_cast<T*>(p);
   }
   // Gives back an allocation of n bytes made by alloc().
   void release(void* p, size_t n) {

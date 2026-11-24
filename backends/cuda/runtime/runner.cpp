@@ -486,6 +486,32 @@ int encode_vision(flyx_plan* p, const flyx_vision_input* in, float* out_embeds, 
     int merge_size = 1;
     size_t x_floats = 0, h_floats = 0, b1_floats = 0, b2_floats = 0;
     int max_k = 64;
+    bool need_q8 = false;
+    auto align256 = [](size_t b) { return (b + 255) / 256 * 256; };
+
+    // Collect on-host vision vectors and linears in exact execution order for single-slab / double-buffered DMA.
+    std::vector<const VisionVec*> host_vecs;
+    size_t host_vec_bytes = 0;
+    auto note_vec = [&](const VisionVec& v) {
+      if (v.present() && v.on_host) {
+        host_vecs.push_back(&v);
+        host_vec_bytes += align256(v.bytes());
+      }
+    };
+    auto note_vnorm = [&](const VNorm& vn) { note_vec(vn.w), note_vec(vn.b); };
+
+    std::vector<const VisionLin*> host_lins;
+    size_t max_stage_bytes = 0;
+    auto note_lin = [&](const VisionLin& vl) {
+      if (!vl.present()) return;
+      need_q8 = need_q8 || vl.q8_inputs();
+      max_k = std::max(max_k, vl.eff_k());
+      if (vl.on_host) {
+        host_lins.push_back(&vl);
+        max_stage_bytes = std::max(max_stage_bytes, vl.staging_bytes());
+      }
+    };
+
     for (const Block* blk : p->block) {
       if (const auto* st = std::get_if<VisionStemBlock>(blk)) {
         if (in->patch_dim != st->in_dim)
@@ -495,29 +521,51 @@ int encode_vision(flyx_plan* p, const flyx_vision_input* in, float* out_embeds, 
         h_floats = std::max(h_floats, size_t(N) * size_t(st->hidden));
         b1_floats = std::max(b1_floats, size_t(N) * size_t(st->in_dim));
         merge_size = std::max(merge_size, st->merge_size);
+        note_vec(st->patch_w), note_vec(st->patch_b), note_vec(st->pos_w), note_vec(st->cls_token);
+        note_vnorm(st->pre_norm);
       } else if (const auto* va = std::get_if<VitAttnBlock>(blk)) {
         const int pw = va->nh * va->hd;
+        const int ld_h = std::max(va->hidden, va->w_qkv.eff_k());
+        const int ld_o = std::max(pw, va->w_o.eff_k());
         x_floats = std::max(x_floats, size_t(N) * size_t(va->hidden));
-        h_floats = std::max(h_floats, size_t(N) * size_t(va->hidden));
+        h_floats = std::max(h_floats, size_t(N) * size_t(ld_h));
         b1_floats = std::max(b1_floats, size_t(N) * size_t(3 * pw));
-        b2_floats = std::max(b2_floats, size_t(N) * size_t(std::max(pw, va->hidden)));
-        max_k = std::max({max_k, va->hidden, pw});
+        b2_floats = std::max(b2_floats, size_t(N) * size_t(std::max(ld_o, va->hidden)));
+        max_k = std::max({max_k, ld_h, ld_o});
         merge_size = std::max(merge_size, va->merge_size);
+        note_vnorm(va->norm), note_vnorm(va->q_norm), note_vnorm(va->k_norm);
+        note_vec(va->qkv_b), note_vec(va->o_b), note_vec(va->layer_scale);
+        note_lin(va->w_qkv), note_lin(va->w_o);
       } else if (const auto* vf = std::get_if<VitMlpBlock>(blk)) {
+        const int ld_h = std::max({vf->hidden, vf->w_fc1.eff_k(), vf->gated ? vf->w_gate.eff_k() : 0});
+        const int ld_i = std::max(vf->inter, vf->w_fc2.eff_k());
         x_floats = std::max(x_floats, size_t(N) * size_t(vf->hidden));
-        h_floats = std::max(h_floats, size_t(N) * size_t(vf->hidden));
-        b1_floats = std::max(b1_floats, size_t(N) * size_t(vf->inter));
-        b2_floats = std::max(b2_floats, size_t(N) * size_t(std::max(vf->inter, vf->hidden)));
-        max_k = std::max({max_k, vf->hidden, vf->inter});
+        h_floats = std::max(h_floats, size_t(N) * size_t(ld_h));
+        b1_floats = std::max(b1_floats, size_t(N) * size_t(ld_i));
+        b2_floats = std::max(b2_floats, size_t(N) * size_t(std::max(ld_i, vf->hidden)));
+        max_k = std::max({max_k, ld_h, ld_i});
+        note_vnorm(vf->norm);
+        note_vec(vf->fc1_b), note_vec(vf->gate_b), note_vec(vf->fc2_b), note_vec(vf->layer_scale);
+        note_lin(vf->w_fc1);
+        if (vf->gated) note_lin(vf->w_gate);
+        note_lin(vf->w_fc2);
       } else if (const auto* vm = std::get_if<VisionMergeBlock>(blk)) {
         const int ms = std::max(1, vm->merge_size), grp = ms * ms;
         const int out_r = vm->merge_mode != FLYX_VMERGE_NONE ? (N / grp) : N;
         const int merged = vm->merge_mode == FLYX_VMERGE_SPATIAL_CONCAT ? vm->in_hidden * grp : vm->in_hidden;
+        const bool has_fc1 = vm->w_fc1.present(), has_fc2 = vm->w_fc2.present();
+        const int ld_m1 = std::max(merged, has_fc1 ? vm->w_fc1.eff_k() : (has_fc2 ? vm->w_fc2.eff_k() : 0));
+        const int ld_m2 = has_fc1 && has_fc2 ? std::max(vm->merge_hidden, vm->w_fc2.eff_k()) : vm->merge_hidden;
         x_floats = std::max({x_floats, size_t(N) * size_t(vm->in_hidden), size_t(out_r) * size_t(vm->out_hidden)});
-        h_floats = std::max({h_floats, size_t(N) * size_t(vm->in_hidden), size_t(out_r) * size_t(merged)});
-        b1_floats = std::max(b1_floats, size_t(out_r) * size_t(std::max(vm->merge_hidden, vm->out_hidden)));
-        b2_floats = std::max(b2_floats, size_t(out_r) * size_t(std::max(merged, vm->out_hidden)));
-        max_k = std::max({max_k, merged, vm->merge_hidden});
+        h_floats = std::max({h_floats, size_t(N) * size_t(vm->in_hidden), size_t(out_r) * size_t(ld_m1)});
+        b1_floats = std::max(b1_floats, size_t(out_r) * size_t(std::max(ld_m2, vm->out_hidden)));
+        b2_floats = std::max(b2_floats, size_t(out_r) * size_t(std::max(ld_m1, vm->out_hidden)));
+        max_k = std::max({max_k, ld_m1, ld_m2});
+        note_vnorm(vm->norm);
+        note_vec(vm->fc1_b), note_vec(vm->fc2_b);
+        if (has_fc1 && has_fc2) note_lin(vm->w_fc1), note_lin(vm->w_fc2);
+        else if (has_fc2) note_lin(vm->w_fc2);
+        else if (has_fc1) note_lin(vm->w_fc1);
       }
     }
     max_k = (max_k + 63) / 64 * 64;
@@ -558,34 +606,54 @@ int encode_vision(flyx_plan* p, const flyx_vision_input* in, float* out_embeds, 
       cu_host = {0, N};
     }
 
-    auto align256 = [](size_t b) { return (b + 255) / 256 * 256; };
-    const size_t sc_bytes = scratch_bytes(N, max_k, false, false, false, false);
-    const size_t total_bytes =
+    const size_t sc_bytes = scratch_bytes(N, max_k, need_q8, false, false, false);
+    const size_t base_bytes =
         align256(x_floats * sizeof(float)) + align256(h_floats * sizeof(float)) +
         align256(b1_floats * sizeof(float)) + align256(b2_floats * sizeof(float)) +
-        align256(size_t(4 * N + n_segs + 1) * sizeof(int32_t)) + align256(sc_bytes);
+        align256(size_t(4 * N + n_segs + 1) * sizeof(int32_t)) + align256(sc_bytes) + host_vec_bytes;
+    const size_t slot_stride = align256(max_stage_bytes);
 
-    struct StreamGuard {
-      cudaStream_t st = nullptr;
-      ~StreamGuard() {
-        if (st) cudaStreamDestroy(st);
-      }
-    } sg;
-    CK(cudaStreamCreateWithFlags(&sg.st, cudaStreamNonBlocking));
-
+    // Declare memory guards BEFORE event/stream guards so streams synchronize & destroy before device frees.
     struct AllocGuard {
       void* ptr = nullptr;
       ~AllocGuard() {
         if (ptr) cudaFree(ptr);
       }
-    } own_mem;
+    } own_mem, stage_mem;
+
+    struct EventGuard {
+      cudaEvent_t ev = nullptr;
+      ~EventGuard() {
+        if (ev) cudaEventDestroy(ev);
+      }
+    } copy_done[2], comp_done[2];
+
+    struct StreamGuard {
+      cudaStream_t st = nullptr;
+      ~StreamGuard() {
+        if (st) {
+          cudaStreamSynchronize(st);
+          cudaStreamDestroy(st);
+        }
+      }
+    } sg, dma_sg;
+    CK(cudaStreamCreateWithFlags(&sg.st, cudaStreamNonBlocking));
+    if (!host_lins.empty()) {
+      CK(cudaStreamCreateWithFlags(&dma_sg.st, cudaStreamNonBlocking));
+      for (int i = 0; i < 2; ++i) {
+        CK(cudaEventCreateWithFlags(&copy_done[i].ev, cudaEventDisableTiming));
+        CK(cudaEventCreateWithFlags(&comp_done[i].ev, cudaEventDisableTiming));
+      }
+    }
 
     std::lock_guard<std::mutex> lock(m->prefill_mu);
     unsigned char* arena = nullptr;
+    unsigned char* stage_base = nullptr;
+    int n_slots = 0;
     bool borrowed = false;
     void* prefill_base = m->prefill_va ? reinterpret_cast<void*>(m->prefill_va)
                                        : (!m->prefill_allocs.empty() ? m->prefill_allocs[0] : nullptr);
-    if (prefill_base && m->prefill_bytes >= total_bytes) {
+    auto claim_prefill = [&]() {
       if (m->prefill_owner) {
         flyx_seq* prev = m->prefill_owner;
         if (prev->uses_shared_prefill()) {
@@ -596,12 +664,38 @@ int encode_vision(flyx_plan* p, const flyx_vision_input* in, float* out_embeds, 
         m->prefill_owner = nullptr;
       }
       if (m->prefill_ev) CK(cudaStreamWaitEvent(sg.st, m->prefill_ev, 0));
+      if (dma_sg.st && m->prefill_ev) CK(cudaStreamWaitEvent(dma_sg.st, m->prefill_ev, 0));
       m->prefill_dirty = true;
       arena = static_cast<unsigned char*>(prefill_base);
       borrowed = true;
+    };
+
+    if (prefill_base && m->prefill_bytes >= base_bytes) {
+      claim_prefill();
+      if (!host_lins.empty()) {
+        if (m->prefill_bytes >= base_bytes + 2 * slot_stride) {
+          stage_base = arena + base_bytes;
+          n_slots = 2;
+        } else if (m->prefill_bytes >= base_bytes + slot_stride) {
+          stage_base = arena + base_bytes;
+          n_slots = 1;
+        }
+      }
     } else {
-      own_mem.ptr = device_malloc(total_bytes);
+      own_mem.ptr = device_malloc(base_bytes);
       arena = static_cast<unsigned char*>(own_mem.ptr);
+    }
+
+    if (!host_lins.empty() && n_slots == 0) {
+      try {
+        stage_mem.ptr = device_malloc(2 * slot_stride);
+        stage_base = static_cast<unsigned char*>(stage_mem.ptr);
+        n_slots = 2;
+      } catch (const OutOfDeviceMemory&) {
+        stage_mem.ptr = device_malloc(slot_stride);
+        stage_base = static_cast<unsigned char*>(stage_mem.ptr);
+        n_slots = 1;
+      }
     }
 
     size_t off = 0;
@@ -621,7 +715,29 @@ int encode_vision(flyx_plan* p, const flyx_vision_input* in, float* out_embeds, 
     int32_t* d_gw = d_gh + N;
     int32_t* d_cu = d_gw + N;
     void* sc_mem = take(sc_bytes);
-    Scratch sc = scratch_carve(sc_mem, sc_bytes, N, max_k, false, false, false, false);
+    Scratch sc = scratch_carve(sc_mem, sc_bytes, N, max_k, need_q8, false, false, false);
+    if (need_q8) {
+      if (sc.q8_count) CK(cudaMemsetAsync(sc.q8_count, 0, kQ8Tiles * sizeof(int), sg.st));
+      if (sc.round_count) CK(cudaMemsetAsync(sc.round_count, 0, sc.round_count_cap * sizeof(int), sg.st));
+      if (sc.side_count) CK(cudaMemsetAsync(sc.side_count, 0, sc.side_count_cap * sizeof(int), sg.st));
+    }
+
+    // Upload all on-host float32 vision vectors (patch_w, pos_w, norms, biases) once at pass start.
+    std::unordered_map<const VisionVec*, float*> vec_dev;
+    if (!host_vecs.empty()) {
+      vec_dev.reserve(host_vecs.size());
+      for (const VisionVec* v : host_vecs) {
+        auto* dst = static_cast<float*>(take(v->bytes()));
+        CK(cudaMemcpyAsync(dst, v->ptr, v->bytes(), cudaMemcpyHostToDevice, sg.st));
+        vec_dev.emplace(v, dst);
+      }
+    }
+    auto dev_vec = [&](const VisionVec& v) -> const float* {
+      if (!v.present()) return nullptr;
+      if (!v.on_host) return v.ptr;
+      return vec_dev.at(&v);
+    };
+
     Launch L{sg.st, &sc, &m->opt.kernels, nullptr, nullptr};
 
     // Upload patches and metadata to device.
@@ -635,23 +751,97 @@ int encode_vision(flyx_plan* p, const flyx_vision_input* in, float* out_embeds, 
     std::memcpy(meta_host.data() + 4 * N, cu_host.data(), size_t(n_segs + 1) * sizeof(int32_t));
     CK(cudaMemcpyAsync(meta, meta_host.data(), meta_host.size() * sizeof(int32_t), cudaMemcpyHostToDevice, sg.st));
 
+    // Double-buffered async H2D staging for offloaded vision linears (0 bytes permanent VRAM).
+    auto stage_into = [&](const VisionLin& vl, int slot) -> Lin {
+      unsigned char* dst = stage_base + size_t(slot) * slot_stride;
+      size_t off_s = 0;
+      auto carve = [&](size_t bytes) -> void* {
+        void* q = dst + off_s;
+        off_s += align256(bytes);
+        return q;
+      };
+      const size_t ke = size_t(vl.eff_k());
+      Lin out{};
+      if (vl.w.packed()) {
+        out.blk.reserve(vl.w.blk.size());
+        for (const BlockMat& bm : vl.w.blk) {
+          const BlockLayout lo = blocks_layout(bm.dtype);
+          const size_t per_row = ke / size_t(lo.values);
+          const size_t db = size_t(bm.rows) * per_row * size_t(lo.stride);
+          const size_t sb = size_t(bm.rows) * per_row * size_t(lo.scales) * sizeof(uint16_t);
+          auto* d_data = static_cast<uint8_t*>(carve(db));
+          auto* d_scales = static_cast<uint16_t*>(carve(sb));
+          CK(cudaMemcpyAsync(d_data, bm.data, db, cudaMemcpyHostToDevice, dma_sg.st));
+          CK(cudaMemcpyAsync(d_scales, bm.scales, sb, cudaMemcpyHostToDevice, dma_sg.st));
+          out.blk.push_back(BlockMat{d_data, d_scales, bm.dtype, bm.rows, bm.q8});
+        }
+      } else if (vl.w.q) {
+        const size_t qb = size_t(vl.N) * ke / 2;
+        const size_t sb = size_t(vl.N) * ke / 16;
+        const size_t rsb = size_t(vl.N) * sizeof(float);
+        out.q = static_cast<uint8_t*>(carve(qb));
+        out.s = static_cast<uint8_t*>(carve(sb));
+        out.rs = static_cast<float*>(carve(rsb));
+        CK(cudaMemcpyAsync(out.q, vl.w.q, qb, cudaMemcpyHostToDevice, dma_sg.st));
+        CK(cudaMemcpyAsync(out.s, vl.w.s, sb, cudaMemcpyHostToDevice, dma_sg.st));
+        CK(cudaMemcpyAsync(out.rs, vl.w.rs, rsb, cudaMemcpyHostToDevice, dma_sg.st));
+      } else if (vl.w.w) {
+        const size_t wb = size_t(vl.N) * ke * sizeof(bf16);
+        out.w = static_cast<bf16*>(carve(wb));
+        CK(cudaMemcpyAsync(out.w, vl.w.w, wb, cudaMemcpyHostToDevice, dma_sg.st));
+      }
+      return out;
+    };
+
+    Lin staged[2];
+    size_t h_idx = 0;
+    if (!host_lins.empty()) {
+      staged[0] = stage_into(*host_lins[0], 0);
+      CK(cudaEventRecord(copy_done[0].ev, dma_sg.st));
+    }
+
+    auto run_vlin = [&](const VisionLin& vl, const float* inp, int ldi, float* outp, int ldo, int rows,
+                        bool accumulate) {
+      const int ke = vl.eff_k();
+      if (!vl.on_host) {
+        gemm(inp, ldi, vl.w, vl.N, ke, outp, ldo, rows, accumulate, L);
+        return;
+      }
+      const int slot = n_slots == 2 ? int(h_idx & 1) : 0;
+      if (n_slots == 1 && h_idx > 0) {
+        CK(cudaStreamWaitEvent(dma_sg.st, comp_done[0].ev, 0));
+        staged[0] = stage_into(*host_lins[h_idx], 0);
+        CK(cudaEventRecord(copy_done[0].ev, dma_sg.st));
+      }
+      CK(cudaStreamWaitEvent(sg.st, copy_done[slot].ev, 0));
+      if (n_slots == 2 && h_idx + 1 < host_lins.size()) {
+        const int nxt = slot ^ 1;
+        if (h_idx >= 1) CK(cudaStreamWaitEvent(dma_sg.st, comp_done[nxt].ev, 0));
+        staged[nxt] = stage_into(*host_lins[h_idx + 1], nxt);
+        CK(cudaEventRecord(copy_done[nxt].ev, dma_sg.st));
+      }
+      gemm(inp, ldi, staged[slot], vl.N, ke, outp, ldo, rows, accumulate, L);
+      CK(cudaEventRecord(comp_done[slot].ev, sg.st));
+      ++h_idx;
+    };
+
     auto run_vnorm = [&](const VNorm& vn, const float* src, int lds, float* dst, int ldd, int rows, int dim) {
       if (vn.kind == FLYX_NORM_RMS)
-        rmsnorm(src, lds, vn.w, vn.offset, vn.eps, dst, ldd, rows, dim, sg.st);
+        rmsnorm(src, lds, dev_vec(vn.w), vn.offset, vn.eps, dst, ldd, rows, dim, sg.st);
       else
-        layernorm(src, lds, vn.w, vn.b, vn.eps, dst, ldd, rows, dim, sg.st);
+        layernorm(src, lds, dev_vec(vn.w), dev_vec(vn.b), vn.eps, dst, ldd, rows, dim, sg.st);
     };
 
     int cur_rows = N, cur_width = 0;
     for (const Block* blk : p->block) {
       if (const auto* st = std::get_if<VisionStemBlock>(blk)) {
-        gemm_f32(b1, st->in_dim, st->patch_w, st->hidden, st->in_dim, x, st->hidden, N, false, sg.st);
-        if (st->patch_b) add_bias(x, st->hidden, st->patch_b, N, st->hidden, sg.st);
-        if (st->pos_mode == FLYX_VPOS_ADD_FIXED && st->pos_w)
-          vision_pos_embed_add(x, st->pos_w, st->pos_rows, st->hidden, N, sg.st);
-        else if (st->pos_mode == FLYX_VPOS_BILINEAR_2D && st->pos_w)
-          vision_pos_embed_bilinear_add(x, st->pos_w, st->pos_grid_h, st->pos_grid_w, st->hidden, d_ch, d_cw, d_gh,
-                                        d_gw, N, sg.st);
+        gemm_f32(b1, st->in_dim, dev_vec(st->patch_w), st->hidden, st->in_dim, x, st->hidden, N, false, sg.st);
+        if (st->patch_b.present()) add_bias(x, st->hidden, dev_vec(st->patch_b), N, st->hidden, sg.st);
+        if (st->pos_mode == FLYX_VPOS_ADD_FIXED && st->pos_w.present())
+          vision_pos_embed_add(x, dev_vec(st->pos_w), st->pos_rows, st->hidden, N, sg.st);
+        else if (st->pos_mode == FLYX_VPOS_BILINEAR_2D && st->pos_w.present())
+          vision_pos_embed_bilinear_add(x, dev_vec(st->pos_w), st->pos_grid_h, st->pos_grid_w, st->hidden, d_ch, d_cw,
+                                        d_gh, d_gw, N, sg.st);
         if (st->pre_norm.present()) {
           run_vnorm(st->pre_norm, x, st->hidden, h, st->hidden, N, st->hidden);
           CK(cudaMemcpyAsync(x, h, size_t(N) * size_t(st->hidden) * sizeof(float), cudaMemcpyDeviceToDevice, sg.st));
@@ -660,9 +850,12 @@ int encode_vision(flyx_plan* p, const flyx_vision_input* in, float* out_embeds, 
         cur_width = st->hidden;
       } else if (const auto* va = std::get_if<VitAttnBlock>(blk)) {
         const int pw = va->nh * va->hd;
-        run_vnorm(va->norm, x, va->hidden, h, va->hidden, cur_rows, va->hidden);
-        gemm(h, va->hidden, va->w_qkv, 3 * pw, va->hidden, b1, 3 * pw, cur_rows, false, L);
-        if (va->qkv_b) add_bias(b1, 3 * pw, va->qkv_b, cur_rows, 3 * pw, sg.st);
+        const int ld_h = std::max(va->hidden, va->w_qkv.eff_k());
+        const int ld_o = std::max(pw, va->w_o.eff_k());
+        run_vnorm(va->norm, x, va->hidden, h, ld_h, cur_rows, va->hidden);
+        if (ld_h > va->hidden) vision_zero_tail(h, cur_rows, va->hidden, ld_h, sg.st);
+        run_vlin(va->w_qkv, h, ld_h, b1, 3 * pw, cur_rows, false);
+        if (va->qkv_b.present()) add_bias(b1, 3 * pw, dev_vec(va->qkv_b), cur_rows, 3 * pw, sg.st);
         auto head_norm = [&](const VNorm& qkn, int off_cols) {
           if (!qkn.present()) return;
           CK(cudaMemcpy2DAsync(b2, size_t(pw) * sizeof(float), b1 + off_cols, size_t(3 * pw) * sizeof(float),
@@ -676,33 +869,39 @@ int encode_vision(flyx_plan* p, const flyx_vision_input* in, float* out_embeds, 
         if (va->rope_mode == FLYX_VROPE_AXIAL_2D)
           vision_rope_2d(b1, 3 * pw, 0, pw, va->nh, va->hd, va->theta, d_ch, d_cw, cur_rows, sg.st);
         vision_attention(b1, 3 * pw, 0, pw, 2 * pw, va->nh, va->hd, d_cu, n_segs, cur_rows,
-                         1.f / std::sqrt(float(va->hd)), b2, pw, sg.st);
-        if (va->layer_scale) {
-          gemm(b2, pw, va->w_o, va->hidden, pw, h, va->hidden, cur_rows, false, L);
-          if (va->o_b) add_bias(h, va->hidden, va->o_b, cur_rows, va->hidden, sg.st);
-          vision_residual_add(x, h, va->layer_scale, cur_rows, va->hidden, sg.st);
+                         1.f / std::sqrt(float(va->hd)), b2, ld_o, sg.st);
+        if (ld_o > pw) vision_zero_tail(b2, cur_rows, pw, ld_o, sg.st);
+        if (va->layer_scale.present()) {
+          run_vlin(va->w_o, b2, ld_o, h, va->hidden, cur_rows, false);
+          if (va->o_b.present()) add_bias(h, va->hidden, dev_vec(va->o_b), cur_rows, va->hidden, sg.st);
+          vision_residual_add(x, h, dev_vec(va->layer_scale), cur_rows, va->hidden, sg.st);
         } else {
-          gemm(b2, pw, va->w_o, va->hidden, pw, x, va->hidden, cur_rows, true, L);
-          if (va->o_b) add_bias(x, va->hidden, va->o_b, cur_rows, va->hidden, sg.st);
+          run_vlin(va->w_o, b2, ld_o, x, va->hidden, cur_rows, true);
+          if (va->o_b.present()) add_bias(x, va->hidden, dev_vec(va->o_b), cur_rows, va->hidden, sg.st);
         }
       } else if (const auto* vf = std::get_if<VitMlpBlock>(blk)) {
-        run_vnorm(vf->norm, x, vf->hidden, h, vf->hidden, cur_rows, vf->hidden);
-        gemm(h, vf->hidden, vf->w_fc1, vf->inter, vf->hidden, b1, vf->inter, cur_rows, false, L);
-        if (vf->fc1_b) add_bias(b1, vf->inter, vf->fc1_b, cur_rows, vf->inter, sg.st);
+        const int ld_h = std::max({vf->hidden, vf->w_fc1.eff_k(), vf->gated ? vf->w_gate.eff_k() : 0});
+        const int ld_i = std::max(vf->inter, vf->w_fc2.eff_k());
+        run_vnorm(vf->norm, x, vf->hidden, h, ld_h, cur_rows, vf->hidden);
+        if (ld_h > vf->hidden) vision_zero_tail(h, cur_rows, vf->hidden, ld_h, sg.st);
+        run_vlin(vf->w_fc1, h, ld_h, b1, ld_i, cur_rows, false);
+        if (vf->fc1_b.present()) add_bias(b1, ld_i, dev_vec(vf->fc1_b), cur_rows, vf->inter, sg.st);
+        if (ld_i > vf->inter) vision_zero_tail(b1, cur_rows, vf->inter, ld_i, sg.st);
         if (vf->gated) {
-          gemm(h, vf->hidden, vf->w_gate, vf->inter, vf->hidden, b2, vf->inter, cur_rows, false, L);
-          if (vf->gate_b) add_bias(b2, vf->inter, vf->gate_b, cur_rows, vf->inter, sg.st);
-          vact_gated(b2, b1, b1, size_t(cur_rows) * size_t(vf->inter), vf->act, sg.st);
+          run_vlin(vf->w_gate, h, ld_h, b2, ld_i, cur_rows, false);
+          if (vf->gate_b.present()) add_bias(b2, ld_i, dev_vec(vf->gate_b), cur_rows, vf->inter, sg.st);
+          if (ld_i > vf->inter) vision_zero_tail(b2, cur_rows, vf->inter, ld_i, sg.st);
+          vact_gated(b2, b1, b1, size_t(cur_rows) * size_t(ld_i), vf->act, sg.st);
         } else {
-          vact_apply(b1, size_t(cur_rows) * size_t(vf->inter), vf->act, sg.st);
+          vact_apply(b1, size_t(cur_rows) * size_t(ld_i), vf->act, sg.st);
         }
-        if (vf->layer_scale) {
-          gemm(b1, vf->inter, vf->w_fc2, vf->hidden, vf->inter, h, vf->hidden, cur_rows, false, L);
-          if (vf->fc2_b) add_bias(h, vf->hidden, vf->fc2_b, cur_rows, vf->hidden, sg.st);
-          vision_residual_add(x, h, vf->layer_scale, cur_rows, vf->hidden, sg.st);
+        if (vf->layer_scale.present()) {
+          run_vlin(vf->w_fc2, b1, ld_i, h, vf->hidden, cur_rows, false);
+          if (vf->fc2_b.present()) add_bias(h, vf->hidden, dev_vec(vf->fc2_b), cur_rows, vf->hidden, sg.st);
+          vision_residual_add(x, h, dev_vec(vf->layer_scale), cur_rows, vf->hidden, sg.st);
         } else {
-          gemm(b1, vf->inter, vf->w_fc2, vf->hidden, vf->inter, x, vf->hidden, cur_rows, true, L);
-          if (vf->fc2_b) add_bias(x, vf->hidden, vf->fc2_b, cur_rows, vf->hidden, sg.st);
+          run_vlin(vf->w_fc2, b1, ld_i, x, vf->hidden, cur_rows, true);
+          if (vf->fc2_b.present()) add_bias(x, vf->hidden, dev_vec(vf->fc2_b), cur_rows, vf->hidden, sg.st);
         }
       } else if (const auto* vm = std::get_if<VisionMergeBlock>(blk)) {
         const int ms = std::max(1, vm->merge_size), grp = ms * ms;
@@ -725,26 +924,34 @@ int encode_vision(flyx_plan* p, const flyx_vision_input* in, float* out_embeds, 
           vision_avg_pool_blocks(x, out_r, grp, vm->in_hidden, b2, sg.st);
           merged_ptr = b2;
         }
+        const bool has_fc1 = vm->w_fc1.present(), has_fc2 = vm->w_fc2.present();
+        const int ld_m1 = std::max(merged_dim, has_fc1 ? vm->w_fc1.eff_k() : (has_fc2 ? vm->w_fc2.eff_k() : 0));
         if (vm->post_norm && vm->norm.present()) {
-          run_vnorm(vm->norm, merged_ptr, merged_dim, h, merged_dim, out_r, merged_dim);
+          run_vnorm(vm->norm, merged_ptr, merged_dim, h, ld_m1, out_r, merged_dim);
+          if (ld_m1 > merged_dim) vision_zero_tail(h, out_r, merged_dim, ld_m1, sg.st);
+          merged_ptr = h;
+        } else if (ld_m1 > merged_dim) {
+          CK(cudaMemcpy2DAsync(h, size_t(ld_m1) * sizeof(float), merged_ptr, size_t(merged_dim) * sizeof(float),
+                               size_t(merged_dim) * sizeof(float), size_t(out_r), cudaMemcpyDeviceToDevice, sg.st));
+          vision_zero_tail(h, out_r, merged_dim, ld_m1, sg.st);
           merged_ptr = h;
         }
-        const bool has_fc1 = vm->w_fc1.w || vm->w_fc1.q || vm->w_fc1.packed();
-        const bool has_fc2 = vm->w_fc2.w || vm->w_fc2.q || vm->w_fc2.packed();
         if (has_fc1 && has_fc2) {
-          gemm(merged_ptr, merged_dim, vm->w_fc1, vm->merge_hidden, merged_dim, b1, vm->merge_hidden, out_r, false, L);
-          if (vm->fc1_b) add_bias(b1, vm->merge_hidden, vm->fc1_b, out_r, vm->merge_hidden, sg.st);
-          vact_apply(b1, size_t(out_r) * size_t(vm->merge_hidden), vm->act, sg.st);
-          gemm(b1, vm->merge_hidden, vm->w_fc2, vm->out_hidden, vm->merge_hidden, x, vm->out_hidden, out_r, false, L);
-          if (vm->fc2_b) add_bias(x, vm->out_hidden, vm->fc2_b, out_r, vm->out_hidden, sg.st);
+          const int ld_m2 = std::max(vm->merge_hidden, vm->w_fc2.eff_k());
+          run_vlin(vm->w_fc1, merged_ptr, ld_m1, b1, ld_m2, out_r, false);
+          if (vm->fc1_b.present()) add_bias(b1, ld_m2, dev_vec(vm->fc1_b), out_r, vm->merge_hidden, sg.st);
+          if (ld_m2 > vm->merge_hidden) vision_zero_tail(b1, out_r, vm->merge_hidden, ld_m2, sg.st);
+          vact_apply(b1, size_t(out_r) * size_t(ld_m2), vm->act, sg.st);
+          run_vlin(vm->w_fc2, b1, ld_m2, x, vm->out_hidden, out_r, false);
+          if (vm->fc2_b.present()) add_bias(x, vm->out_hidden, dev_vec(vm->fc2_b), out_r, vm->out_hidden, sg.st);
         } else if (has_fc2) {
-          gemm(merged_ptr, merged_dim, vm->w_fc2, vm->out_hidden, merged_dim, b1, vm->out_hidden, out_r, false, L);
-          if (vm->fc2_b) add_bias(b1, vm->out_hidden, vm->fc2_b, out_r, vm->out_hidden, sg.st);
+          run_vlin(vm->w_fc2, merged_ptr, ld_m1, b1, vm->out_hidden, out_r, false);
+          if (vm->fc2_b.present()) add_bias(b1, vm->out_hidden, dev_vec(vm->fc2_b), out_r, vm->out_hidden, sg.st);
           CK(cudaMemcpyAsync(x, b1, size_t(out_r) * size_t(vm->out_hidden) * sizeof(float), cudaMemcpyDeviceToDevice,
                              sg.st));
         } else if (has_fc1) {
-          gemm(merged_ptr, merged_dim, vm->w_fc1, vm->out_hidden, merged_dim, b1, vm->out_hidden, out_r, false, L);
-          if (vm->fc1_b) add_bias(b1, vm->out_hidden, vm->fc1_b, out_r, vm->out_hidden, sg.st);
+          run_vlin(vm->w_fc1, merged_ptr, ld_m1, b1, vm->out_hidden, out_r, false);
+          if (vm->fc1_b.present()) add_bias(b1, vm->out_hidden, dev_vec(vm->fc1_b), out_r, vm->out_hidden, sg.st);
           CK(cudaMemcpyAsync(x, b1, size_t(out_r) * size_t(vm->out_hidden) * sizeof(float), cudaMemcpyDeviceToDevice,
                              sg.st));
         } else if (merged_ptr != x) {
@@ -763,6 +970,7 @@ int encode_vision(flyx_plan* p, const flyx_vision_input* in, float* out_embeds, 
                        sg.st));
     if (borrowed && m->prefill_ev) CK(cudaEventRecord(m->prefill_ev, sg.st));
     CK(cudaStreamSynchronize(sg.st));
+    if (dma_sg.st) CK(cudaStreamSynchronize(dma_sg.st));
     if (out_rows) *out_rows = cur_rows;
     return 0;
   });

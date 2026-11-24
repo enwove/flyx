@@ -325,16 +325,11 @@ int Scheduler::count_tokens(const Request& in, std::string* err) {
       *err = "this model has no vision encoder loaded (pass --mmproj <mmproj.gguf>)";
       return -1;
     }
-    const int avail = std::max(256, prompt_limit(engine_->options().max_ctx) - 256);
     for (const auto& ri : rc.images) {
       if (!ri.image) return *err = "missing image data in multimodal message", -1;
       interfaces::RgbImage rgb;
       if (!vision::decode_image_bytes(ri.image->bytes.data(), ri.image->bytes.size(), &rgb, err)) return -1;
-      const int budget = ri.image->detail == "low"
-                             ? std::min(256, avail)
-                             : ri.image->detail == "high"
-                                   ? std::min(4096, avail)
-                                   : std::min(2048, std::min(std::max(256, (avail / 2) / static_cast<int>(rc.images.size())), avail));
+      const int budget = engine_->image_token_budget(ri.image->detail, rc.images.size());
       interfaces::PreparedMedia pm;
       if (!engine_->model().vision()->preprocess(rgb, budget, &pm, err)) return -1;
       total += static_cast<int>(pm.tokens.size()) - 1;  // replaces the single placeholder token

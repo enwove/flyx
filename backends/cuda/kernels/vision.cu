@@ -117,6 +117,13 @@ __global__ void k_vact_gated(const float* gate, const float* up, float* out, siz
   if (i < n) out[i] = eval_vact(gate[i], act) * up[i];
 }
 
+__global__ void k_vision_zero_tail(float* x, int valid_cols, int ld) {
+  pdl_trigger();
+  const int r = blockIdx.y;
+  const int c = valid_cols + blockIdx.x * blockDim.x + threadIdx.x;
+  if (c < ld) x[size_t(r) * ld + c] = 0.f;
+}
+
 // Tiled float32 GEMM: y[m, n] (=|+=) sum_k x[m, k] * W[n, k], arbitrary M, N, K.
 // Block tile 64x64x16, 16x16 threads (each thread accumulates a 4x4 sub-tile) in fixed K order.
 __global__ void __launch_bounds__(256) k_gemm_f32(const float* __restrict__ x, int ldx, const float* __restrict__ W,
@@ -457,6 +464,12 @@ void embed_scatter(float* x, bf16* x16, int H, const float* embeds, const int32_
                    cudaStream_t st) {
   if (n_embeds <= 0 || H <= 0) return;
   k_embed_scatter<<<n_embeds, 256, 0, st>>>(x, x16, H, embeds, embed_rows);
+}
+
+void vision_zero_tail(float* x, int rows, int valid_cols, int ld, cudaStream_t st) {
+  const int tail = ld - valid_cols;
+  if (rows <= 0 || tail <= 0) return;
+  k_vision_zero_tail<<<dim3(ceil_div(tail, 256), rows), 256, 0, st>>>(x, valid_cols, ld);
 }
 
 }  // namespace flyx::cuda

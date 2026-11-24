@@ -81,6 +81,19 @@ void test_vact() {
     cudaFree(du);
     cudaFree(dout);
   }
+  // vision_zero_tail: zero trailing columns [valid_cols, ld) per row, preserving [0, valid_cols).
+  {
+    const int rows = 13, valid = 144, ld = 192;
+    Vec mat(size_t(rows) * ld);
+    for (size_t i = 0; i < mat.size(); ++i) mat[i] = double(float(double(i % 97) * 0.25 - 12.0));
+    Vec want = mat;
+    for (int r = 0; r < rows; ++r)
+      for (int c = valid; c < ld; ++c) want[size_t(r) * ld + c] = 0.0;
+    float* dm = up(mat);
+    vision_zero_tail(dm, rows, valid, ld, 0);
+    expect("vision_zero_tail 13x144->192", down(dm, mat.size()), want, 0.0);
+    cudaFree(dm);
+  }
 }
 
 void test_gemm_f32() {

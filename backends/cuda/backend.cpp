@@ -261,6 +261,34 @@ const std::vector<OptionSpec>& option_specs() {
          return o.embed != def.embed ? std::string("embed=") + (o.embed == 1 ? "host" : o.embed == 2 ? "gpu" : "auto")
                                      : "";
        }},
+      {"vision",
+       [](const std::string& key, const std::string& val, BackendOptions* o, std::string* err) {
+         if (!check_choice(key, val, {"auto", "host", "cpu", "gpu"}, err)) return false;
+         o->vision = (val == "host" || val == "cpu") ? FLYX_VISION_DEV_HOST
+                     : val == "gpu"                  ? FLYX_VISION_DEV_GPU
+                                                     : FLYX_VISION_DEV_AUTO;
+         return true;
+       },
+       [](const BackendOptions& o, const BackendOptions& def) -> std::string {
+         if (o.vision == def.vision) return "";
+         return std::string("vision=") +
+                (o.vision == FLYX_VISION_DEV_HOST ? "host" : o.vision == FLYX_VISION_DEV_GPU ? "gpu" : "auto");
+       }},
+      {"vision_quant",
+       [](const std::string& key, const std::string& val, BackendOptions* o, std::string* err) {
+         if (!check_choice(key, val, {"exact", "bf16", "q8", "q8_0", "nvfp4", "fp4"}, err)) return false;
+         o->vision_quant = (val == "q8" || val == "q8_0")       ? FLYX_VISION_QUANT_Q8
+                           : (val == "nvfp4" || val == "fp4")   ? FLYX_VISION_QUANT_NVFP4
+                                                                : FLYX_VISION_QUANT_EXACT;
+         return true;
+       },
+       [](const BackendOptions& o, const BackendOptions& def) -> std::string {
+         if (o.vision_quant == def.vision_quant) return "";
+         return std::string("vision_quant=") +
+                (o.vision_quant == FLYX_VISION_QUANT_Q8     ? "q8"
+                 : o.vision_quant == FLYX_VISION_QUANT_NVFP4 ? "nvfp4"
+                                                             : "exact");
+       }},
       {"wide",
        [](const std::string& key, const std::string& val, BackendOptions* o, std::string* err) {
          if (!check_choice(key, val, {"auto", "0", "1"}, err)) return false;
@@ -456,6 +484,10 @@ int open_model(const flyx_model_desc* desc, const flyx_open_options* opts, flyx_
     cudaDeviceProp prop{};
     cudaGetDeviceProperties(&prop, 0);
     std::string err;
+    if (opts) {
+      m->opt.vision = opts->vision_device;
+      m->opt.vision_quant = opts->vision_quant;
+    }
     if (!parse_options(opts ? opts->options : nullptr, &m->opt, &err)) return fail("options: " + err);
     if (!nvfp4_inputs(*desc, &m->opt.kernels.prefill_fp4, &err)) return fail(err);
     if (m->opt.embed == 0) {
@@ -470,6 +502,67 @@ int open_model(const flyx_model_desc* desc, const flyx_open_options* opts, flyx_
                          free_b - weights >= size_t(32) * 1000000000;
       cudaGetLastError();
       m->opt.embed = roomy ? 2 : 1;
+    }
+    if (m->opt.vision == FLYX_VISION_DEV_AUTO) {
+      // vision=auto: keep vision encoder weights on the GPU when >= 8 GB of free VRAM remain after LLM + vision
+      // weights (for KV cache, drafters, and round graphs); otherwise keep them in pinned host RAM (0 VRAM) and
+      // double-buffer stream each linear to the GPU during encode_vision().
+      std::vector<char> is_vis(size_t(desc->n_weights), 0), is_vis_lin(size_t(desc->n_weights), 0);
+      auto mv = [&](int w) {
+        if (w >= 0 && w < desc->n_weights) is_vis[size_t(w)] = 1;
+      };
+      auto ml = [&](int w) {
+        if (w >= 0 && w < desc->n_weights) is_vis[size_t(w)] = 1, is_vis_lin[size_t(w)] = 1;
+      };
+      auto mn = [&](const flyx_vnorm& n) { mv(n.w), mv(n.b); };
+      for (int i = 0; i < desc->n_blocks; ++i) {
+        const flyx_block& b = desc->blocks[i];
+        if (b.kind == FLYX_BLOCK_VISION_STEM) {
+          mv(b.vision_stem.patch_w), mv(b.vision_stem.patch_w2), mv(b.vision_stem.patch_b), mv(b.vision_stem.pos_w),
+              mv(b.vision_stem.cls_token);
+          mn(b.vision_stem.pre_norm);
+        } else if (b.kind == FLYX_BLOCK_VIT_ATTN) {
+          mn(b.vit_attn.norm), mn(b.vit_attn.q_norm), mn(b.vit_attn.k_norm);
+          ml(b.vit_attn.qkv), ml(b.vit_attn.q), ml(b.vit_attn.k), ml(b.vit_attn.v), ml(b.vit_attn.o);
+          mv(b.vit_attn.qkv_b), mv(b.vit_attn.q_b), mv(b.vit_attn.k_b), mv(b.vit_attn.v_b), mv(b.vit_attn.o_b),
+              mv(b.vit_attn.layer_scale);
+        } else if (b.kind == FLYX_BLOCK_VIT_MLP) {
+          mn(b.vit_mlp.norm);
+          ml(b.vit_mlp.fc1), ml(b.vit_mlp.gate), ml(b.vit_mlp.fc2);
+          mv(b.vit_mlp.fc1_b), mv(b.vit_mlp.gate_b), mv(b.vit_mlp.fc2_b), mv(b.vit_mlp.layer_scale);
+        } else if (b.kind == FLYX_BLOCK_VISION_MERGE) {
+          mn(b.vision_merge.norm);
+          ml(b.vision_merge.fc1), ml(b.vision_merge.fc2);
+          mv(b.vision_merge.fc1_b), mv(b.vision_merge.fc2_b);
+        }
+      }
+      uint64_t llm_bytes = 0, vis_bytes = 0;
+      for (int i = 0; i < desc->n_weights; ++i) {
+        const flyx_tensor_view* t = desc->weights[i].t;
+        if (!t) continue;
+        if (!is_vis[size_t(i)]) {
+          llm_bytes += t->nbytes;
+          continue;
+        }
+        uint64_t nb = t->nbytes;
+        const bool flt = t->dtype == FLYX_DT_BF16 || t->dtype == FLYX_DT_F16 || t->dtype == FLYX_DT_F32;
+        if (is_vis_lin[size_t(i)] && flt) {
+          if (m->opt.vision_quant == FLYX_VISION_QUANT_Q8) nb = (nb * 55) / 100;
+          else if (m->opt.vision_quant == FLYX_VISION_QUANT_NVFP4) nb = (nb * 30) / 100;
+        }
+        vis_bytes += nb;
+      }
+      if (vis_bytes > 0) {
+        size_t free_b = 0, total_b = 0;
+        bool ok_mem = gpu_memory(&free_b, &total_b);
+        if (!ok_mem) {
+          ok_mem = cudaMemGetInfo(&free_b, &total_b) == cudaSuccess;
+          cudaGetLastError();
+        }
+        const bool roomy = ok_mem && free_b > llm_bytes + vis_bytes &&
+                           free_b - (llm_bytes + vis_bytes) >= size_t(8) * 1000000000;
+        m->opt.vision = roomy ? FLYX_VISION_DEV_GPU : FLYX_VISION_DEV_HOST;
+      }
     }
     // FP8 tensor cores whose e4m3 sums are float32's: sm_90 and later.  Ada's (sm_89: L4, L40S) sum in fewer bits:
     // attention with q in e4m3 came out about 50 times past the op test's tolerance (relative error up to 1.5e-3
@@ -603,7 +696,16 @@ int open_model(const flyx_model_desc* desc, const flyx_open_options* opts, flyx_
   }
   if (m->verbose) {
     std::fprintf(stderr, "flyx-cuda: weights %.2f GB on the GPU", m->bytes / 1e9);
-    if (m->host_bytes) std::fprintf(stderr, ", %.2f GB in host memory (the embedding)", m->host_bytes / 1e9);
+    if (m->vision_dev_bytes) std::fprintf(stderr, " (vision %.2f GB)", m->vision_dev_bytes / 1e9);
+    if (m->host_bytes) {
+      std::fprintf(stderr, ", %.2f GB in host memory", m->host_bytes / 1e9);
+      if (m->vision_host_bytes && m->host_bytes > m->vision_host_bytes)
+        std::fprintf(stderr, " (embedding + vision %.2f GB)", m->vision_host_bytes / 1e9);
+      else if (m->vision_host_bytes)
+        std::fprintf(stderr, " (vision)");
+      else
+        std::fprintf(stderr, " (the embedding)");
+    }
     std::fprintf(stderr, "\n");
     const auto& L = load_times;
     std::fprintf(stderr,

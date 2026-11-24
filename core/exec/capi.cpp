@@ -64,6 +64,9 @@ flyx_engine* flyx_load(const char* path, const flyx_load_options* opts, flyx_err
       }
       if (opts->mmproj_file) o.mmproj_file = opts->mmproj_file;
       if (opts->no_vision) o.vision = false;
+      if (opts->vision_device) o.vision_device = opts->vision_device;
+      if (opts->vision_quant) o.vision_quant = opts->vision_quant;
+      if (opts->vision_max_tokens > 0) o.vision_max_tokens = opts->vision_max_tokens;
     }
     std::string msg;
     if (!e->e->load(path, o, &msg)) {

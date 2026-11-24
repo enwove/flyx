@@ -9,14 +9,6 @@
 namespace flyx {
 namespace {
 
-int image_token_budget(const std::string& detail, int max_ctx, size_t n_images) {
-  const int avail = std::max(256, prompt_limit(max_ctx) - 256);
-  if (detail == "low") return std::min(256, avail);
-  if (detail == "high") return std::min(4096, avail);
-  const int per = std::max(256, (avail / 2) / static_cast<int>(std::max<size_t>(1, n_images)));
-  return std::min(2048, std::min(per, avail));
-}
-
 struct ByteTokSeg {
   size_t byte_begin = 0, byte_end = 0;
   int32_t tok_begin = 0, tok_end = 0;
@@ -98,7 +90,7 @@ bool prepare_multimodal_prompt(Engine& e, const Session& s, const RenderedChat& 
       *err = "missing image data in multimodal message";
       return false;
     }
-    const int budget = image_token_budget(rc.images[i].image->detail, e.options().max_ctx, n_imgs);
+    const int budget = e.image_token_budget(rc.images[i].image->detail, n_imgs);
     if (!e.encode_image(*rc.images[i].image, budget, &encoded[i], err)) {
       out->invalid = true;
       return false;

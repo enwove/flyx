@@ -25,6 +25,7 @@
 #include "core/vision/image.h"
 #include "flyx/backend_abi.h"
 #include "models/vision/preprocess.h"
+#include "ops/dtype/ref.h"
 
 namespace {
 
@@ -253,17 +254,18 @@ struct TinyVlm {
   static constexpr int kHd = 64;
   static constexpr int kRot = 32;
   static constexpr int kInter = 256;
-  // Vision dims (divisible by 64 for all BF16 GEMMs; patch_dim arbitrary -> gemm_f32)
+  // Vision dims: kVInter = 144 (divisible by 16, NOT 32 or 64 — exercises padded ffn_down like Qwen3.8-27B's 4304!).
   static constexpr int kVH = 64;
   static constexpr int kVNh = 2;
   static constexpr int kVHd = 32;
-  static constexpr int kVInter = 128;
+  static constexpr int kVInter = 144;
   static constexpr int kPatchDim = 48;  // 2 * 3 * 2 * 2 * 2 = 48 (arbitrary non-64!)
   static constexpr int kMerge = 2;
   static constexpr int kMergeH = 256;   // kVH * kMerge * kMerge = 64 * 4
 
   std::vector<std::vector<uint16_t>> bf16_bufs;
   std::vector<std::vector<float>> f32_bufs;
+  std::vector<std::vector<uint8_t>> q8_bufs;
   std::vector<flyx_tensor_view> views;
   std::vector<flyx_weight> weights;
   std::vector<flyx_state> states;
@@ -271,6 +273,35 @@ struct TinyVlm {
   flyx_model_desc desc{};
 
   std::mt19937 rng{42};
+
+  // Add a pre-quantized GGML Q8_0 2D tensor [r, c] (c % 32 == 0, 34 bytes per 32-element block: f16 d + 32 int8s).
+  int add_q8_0(int64_t r, int64_t c, float scale = 0.08f) {
+    std::normal_distribution<float> dist(0.f, scale);
+    const size_t bpr = size_t(c / 32);
+    q8_bufs.emplace_back(size_t(r) * bpr * 34);
+    std::vector<float> row(static_cast<size_t>(c));
+    std::vector<uint8_t> pay(static_cast<size_t>(c));
+    std::vector<uint16_t> sc(bpr);
+    for (int64_t i = 0; i < r; ++i) {
+      for (int64_t k = 0; k < c; ++k) row[size_t(k)] = dist(rng);
+      ops::quantize_row_q8_0(row.data(), int(c), int(c), pay.data(), sc.data());
+      uint8_t* dst = q8_bufs.back().data() + size_t(i) * bpr * 34;
+      for (size_t b = 0; b < bpr; ++b) {
+        std::memcpy(dst + b * 34, &sc[b], 2);
+        std::memcpy(dst + b * 34 + 2, pay.data() + b * 32, 32);
+      }
+    }
+    flyx_tensor_view tv{};
+    tv.name = "v.q8_0";
+    tv.data = q8_bufs.back().data();
+    tv.nbytes = q8_bufs.back().size();
+    tv.dtype = FLYX_DT_GGML_Q8_0;
+    tv.ndim = 2;
+    tv.shape[0] = r;
+    tv.shape[1] = c;
+    views.push_back(tv);
+    return int(views.size() - 1);
+  }
 
   int add_bf16(int64_t r, int64_t c, float scale = 0.08f) {
     std::normal_distribution<float> dist(0.f, scale);
@@ -305,10 +336,11 @@ struct TinyVlm {
   void finalize_views() {
     bf16_bufs.reserve(64);
     f32_bufs.reserve(64);
+    q8_bufs.reserve(16);
     views.reserve(64);
   }
 
-  TinyVlm() {
+  explicit TinyVlm(bool prequant_q8_vision = false, bool include_vision = true) {
     finalize_views();
     // LLM weights
     const int w_emb = add_bf16(kV, kH, 0.25f);
@@ -341,32 +373,36 @@ struct TinyVlm {
     const int w_mtp_u = add_bf16(kInter, kH, 0.08f);
     const int w_mtp_d = add_bf16(kH, kInter, 0.08f);
     const int w_mtp_fn = add_f32(kH, 0, 0.05f, 0.f);
-    // Vision encoder weights
-    const int w_vpatch = add_f32(kVH, kPatchDim, 0.1f);
-    const int w_vpatch_b = add_f32(kVH, 0, 0.05f);
-    const int w_vpos = add_f32(16, kVH, 0.05f);  // 4x4 learned pos grid
-    const int w_va_nw = add_f32(kVH, 0, 0.05f, 1.f);
-    const int w_va_nb = add_f32(kVH, 0, 0.02f);
-    const int w_va_qkv = add_bf16(3 * kVNh * kVHd, kVH, 0.08f);
-    const int w_va_qkv_b = add_f32(3 * kVNh * kVHd, 0, 0.02f);
-    const int w_va_o = add_bf16(kVH, kVNh * kVHd, 0.08f);
-    const int w_va_o_b = add_f32(kVH, 0, 0.02f);
-    const int w_vf_nw = add_f32(kVH, 0, 0.05f, 1.f);
-    const int w_vf_nb = add_f32(kVH, 0, 0.02f);
-    const int w_vf_fc1 = add_bf16(kVInter, kVH, 0.08f);
-    const int w_vf_fc1_b = add_f32(kVInter, 0, 0.02f);
-    const int w_vf_fc2 = add_bf16(kVH, kVInter, 0.08f);
-    const int w_vf_fc2_b = add_f32(kVH, 0, 0.02f);
-    const int w_vm_nw = add_f32(kVH, 0, 0.05f, 1.f);
-    const int w_vm_nb = add_f32(kVH, 0, 0.02f);
-    const int w_vm_fc1 = add_bf16(kMergeH, kMergeH, 0.08f);
-    const int w_vm_fc1_b = add_f32(kMergeH, 0, 0.02f);
-    const int w_vm_fc2 = add_bf16(kH, kMergeH, 0.08f);
-    const int w_vm_fc2_b = add_f32(kH, 0, 0.02f);
+    // Vision encoder weights (optional pre-quantized GGML Q8_0 for K % 32 == 0 matrices, mimicking mmproj-Q8_0.gguf)
+    auto add_vmat = [&](int64_t r, int64_t c, float scale) {
+      return (prequant_q8_vision && (c % 32 == 0)) ? add_q8_0(r, c, scale) : add_bf16(r, c, scale);
+    };
+    const int w_vpatch = include_vision ? add_f32(kVH, kPatchDim, 0.1f) : -1;
+    const int w_vpatch_b = include_vision ? add_f32(kVH, 0, 0.05f) : -1;
+    const int w_vpos = include_vision ? add_f32(16, kVH, 0.05f) : -1;
+    const int w_va_nw = include_vision ? add_f32(kVH, 0, 0.05f, 1.f) : -1;
+    const int w_va_nb = include_vision ? add_f32(kVH, 0, 0.02f) : -1;
+    const int w_va_qkv = include_vision ? add_vmat(3 * kVNh * kVHd, kVH, 0.08f) : -1;
+    const int w_va_qkv_b = include_vision ? add_f32(3 * kVNh * kVHd, 0, 0.02f) : -1;
+    const int w_va_o = include_vision ? add_vmat(kVH, kVNh * kVHd, 0.08f) : -1;
+    const int w_va_o_b = include_vision ? add_f32(kVH, 0, 0.02f) : -1;
+    const int w_vf_nw = include_vision ? add_f32(kVH, 0, 0.05f, 1.f) : -1;
+    const int w_vf_nb = include_vision ? add_f32(kVH, 0, 0.02f) : -1;
+    const int w_vf_fc1 = include_vision ? add_vmat(kVInter, kVH, 0.08f) : -1;
+    const int w_vf_fc1_b = include_vision ? add_f32(kVInter, 0, 0.02f) : -1;
+    const int w_vf_fc2 = include_vision ? add_vmat(kVH, kVInter, 0.08f) : -1;
+    const int w_vf_fc2_b = include_vision ? add_f32(kVH, 0, 0.02f) : -1;
+    const int w_vm_nw = include_vision ? add_f32(kVH, 0, 0.05f, 1.f) : -1;
+    const int w_vm_nb = include_vision ? add_f32(kVH, 0, 0.02f) : -1;
+    const int w_vm_fc1 = include_vision ? add_vmat(kMergeH, kMergeH, 0.08f) : -1;
+    const int w_vm_fc1_b = include_vision ? add_f32(kMergeH, 0, 0.02f) : -1;
+    const int w_vm_fc2 = include_vision ? add_vmat(kH, kMergeH, 0.08f) : -1;
+    const int w_vm_fc2_b = include_vision ? add_f32(kH, 0, 0.02f) : -1;
 
     weights.resize(views.size());
     for (size_t i = 0; i < views.size(); ++i) {
-      weights[i] = flyx_weight{&views[i], nullptr, nullptr, FLYX_ACT_FORMAT, 0};
+      const int act = views[i].dtype == FLYX_DT_GGML_Q8_0 ? FLYX_ACT_Q8 : FLYX_ACT_FORMAT;
+      weights[i] = flyx_weight{&views[i], nullptr, nullptr, act, 0};
     }
 
     // States: 0 = target KV, 1 = MTP KV, 2 = hidden ring
@@ -497,72 +533,74 @@ struct TinyVlm {
     b.mtp.ring = 2;
     blocks.push_back(b);
 
-    b = {};
-    b.kind = FLYX_BLOCK_VISION_STEM;
-    b.vision_stem.in_dim = kPatchDim;
-    b.vision_stem.hidden = kVH;
-    b.vision_stem.patch_w = w_vpatch;
-    b.vision_stem.patch_w2 = -1;
-    b.vision_stem.patch_b = w_vpatch_b;
-    b.vision_stem.pos_mode = FLYX_VPOS_BILINEAR_2D;
-    b.vision_stem.pos_w = w_vpos;
-    b.vision_stem.pos_grid_h = 4;
-    b.vision_stem.pos_grid_w = 4;
-    b.vision_stem.merge_size = kMerge;
-    b.vision_stem.cls_token = -1;
-    b.vision_stem.pre_norm = make_vnorm(-1, -1);
-    blocks.push_back(b);
+    if (include_vision) {
+      b = {};
+      b.kind = FLYX_BLOCK_VISION_STEM;
+      b.vision_stem.in_dim = kPatchDim;
+      b.vision_stem.hidden = kVH;
+      b.vision_stem.patch_w = w_vpatch;
+      b.vision_stem.patch_w2 = -1;
+      b.vision_stem.patch_b = w_vpatch_b;
+      b.vision_stem.pos_mode = FLYX_VPOS_BILINEAR_2D;
+      b.vision_stem.pos_w = w_vpos;
+      b.vision_stem.pos_grid_h = 4;
+      b.vision_stem.pos_grid_w = 4;
+      b.vision_stem.merge_size = kMerge;
+      b.vision_stem.cls_token = -1;
+      b.vision_stem.pre_norm = make_vnorm(-1, -1);
+      blocks.push_back(b);
 
-    b = {};
-    b.kind = FLYX_BLOCK_VIT_ATTN;
-    b.vit_attn.hidden = kVH;
-    b.vit_attn.n_heads = kVNh;
-    b.vit_attn.head_dim = kVHd;
-    b.vit_attn.rope_mode = FLYX_VROPE_AXIAL_2D;
-    b.vit_attn.merge_size = kMerge;
-    b.vit_attn.theta = 10000.0;
-    b.vit_attn.norm = make_vnorm(w_va_nw, w_va_nb);
-    b.vit_attn.q_norm = make_vnorm(-1, -1);
-    b.vit_attn.k_norm = make_vnorm(-1, -1);
-    b.vit_attn.qkv = w_va_qkv;
-    b.vit_attn.qkv_b = w_va_qkv_b;
-    b.vit_attn.q = b.vit_attn.k = b.vit_attn.v = -1;
-    b.vit_attn.q_b = b.vit_attn.k_b = b.vit_attn.v_b = -1;
-    b.vit_attn.o = w_va_o;
-    b.vit_attn.o_b = w_va_o_b;
-    b.vit_attn.layer_scale = -1;
-    blocks.push_back(b);
+      b = {};
+      b.kind = FLYX_BLOCK_VIT_ATTN;
+      b.vit_attn.hidden = kVH;
+      b.vit_attn.n_heads = kVNh;
+      b.vit_attn.head_dim = kVHd;
+      b.vit_attn.rope_mode = FLYX_VROPE_AXIAL_2D;
+      b.vit_attn.merge_size = kMerge;
+      b.vit_attn.theta = 10000.0;
+      b.vit_attn.norm = make_vnorm(w_va_nw, w_va_nb);
+      b.vit_attn.q_norm = make_vnorm(-1, -1);
+      b.vit_attn.k_norm = make_vnorm(-1, -1);
+      b.vit_attn.qkv = w_va_qkv;
+      b.vit_attn.qkv_b = w_va_qkv_b;
+      b.vit_attn.q = b.vit_attn.k = b.vit_attn.v = -1;
+      b.vit_attn.q_b = b.vit_attn.k_b = b.vit_attn.v_b = -1;
+      b.vit_attn.o = w_va_o;
+      b.vit_attn.o_b = w_va_o_b;
+      b.vit_attn.layer_scale = -1;
+      blocks.push_back(b);
 
-    b = {};
-    b.kind = FLYX_BLOCK_VIT_MLP;
-    b.vit_mlp.hidden = kVH;
-    b.vit_mlp.inter = kVInter;
-    b.vit_mlp.gated = 0;
-    b.vit_mlp.act = FLYX_VACT_GELU_TANH;
-    b.vit_mlp.norm = make_vnorm(w_vf_nw, w_vf_nb);
-    b.vit_mlp.fc1 = w_vf_fc1;
-    b.vit_mlp.fc1_b = w_vf_fc1_b;
-    b.vit_mlp.gate = b.vit_mlp.gate_b = -1;
-    b.vit_mlp.fc2 = w_vf_fc2;
-    b.vit_mlp.fc2_b = w_vf_fc2_b;
-    b.vit_mlp.layer_scale = -1;
-    blocks.push_back(b);
+      b = {};
+      b.kind = FLYX_BLOCK_VIT_MLP;
+      b.vit_mlp.hidden = kVH;
+      b.vit_mlp.inter = kVInter;
+      b.vit_mlp.gated = 0;
+      b.vit_mlp.act = FLYX_VACT_GELU_TANH;
+      b.vit_mlp.norm = make_vnorm(w_vf_nw, w_vf_nb);
+      b.vit_mlp.fc1 = w_vf_fc1;
+      b.vit_mlp.fc1_b = w_vf_fc1_b;
+      b.vit_mlp.gate = b.vit_mlp.gate_b = -1;
+      b.vit_mlp.fc2 = w_vf_fc2;
+      b.vit_mlp.fc2_b = w_vf_fc2_b;
+      b.vit_mlp.layer_scale = -1;
+      blocks.push_back(b);
 
-    b = {};
-    b.kind = FLYX_BLOCK_VISION_MERGE;
-    b.vision_merge.in_hidden = kVH;
-    b.vision_merge.merge_size = kMerge;
-    b.vision_merge.merge_mode = FLYX_VMERGE_SPATIAL_CONCAT;
-    b.vision_merge.post_norm = 0;
-    b.vision_merge.fc1_out = kMergeH;
-    b.vision_merge.out_hidden = kH;
-    b.vision_merge.act = FLYX_VACT_GELU;
-    b.vision_merge.norm = make_vnorm(w_vm_nw, w_vm_nb);
-    b.vision_merge.fc1 = w_vm_fc1;
-    b.vision_merge.fc1_b = w_vm_fc1_b;
-    b.vision_merge.fc2 = w_vm_fc2;
-    b.vision_merge.fc2_b = w_vm_fc2_b;
-    blocks.push_back(b);
+      b = {};
+      b.kind = FLYX_BLOCK_VISION_MERGE;
+      b.vision_merge.in_hidden = kVH;
+      b.vision_merge.merge_size = kMerge;
+      b.vision_merge.merge_mode = FLYX_VMERGE_SPATIAL_CONCAT;
+      b.vision_merge.post_norm = 0;
+      b.vision_merge.fc1_out = kMergeH;
+      b.vision_merge.out_hidden = kH;
+      b.vision_merge.act = FLYX_VACT_GELU;
+      b.vision_merge.norm = make_vnorm(w_vm_nw, w_vm_nb);
+      b.vision_merge.fc1 = w_vm_fc1;
+      b.vision_merge.fc1_b = w_vm_fc1_b;
+      b.vision_merge.fc2 = w_vm_fc2;
+      b.vision_merge.fc2_b = w_vm_fc2_b;
+      blocks.push_back(b);
+    }
 
     desc = {kH, kV, int32_t(weights.size()), int32_t(states.size()), int32_t(blocks.size()),
             weights.data(), states.data(), blocks.data()};
@@ -570,6 +608,7 @@ struct TinyVlm {
 };
 
 struct BackendRun {
+  uint64_t weights_bytes = 0;
   std::vector<float> vision_embeds;
   std::vector<int32_t> plain_tokens;
   std::vector<int32_t> mtp_tokens;
@@ -579,8 +618,31 @@ struct BackendRun {
   std::vector<int32_t> direct_followup;
 };
 
+uint64_t measure_weights_bytes(const char* name, const TinyVlm& vlm, int32_t vision_dev = FLYX_VISION_DEV_GPU,
+                               int32_t vision_quant = FLYX_VISION_QUANT_EXACT) {
+  EngineOptions eo;
+  eo.backend = name;
+  std::unique_ptr<os::DynLib> lib;
+  const flyx_backend_api* api = nullptr;
+  flyx_device_info info{};
+  std::string err;
+  CHECK(open_backend(eo, &lib, &api, &info, &err), std::string(name) + ": " + err);
+  flyx_open_options oo{};
+  oo.max_ctx = 256;
+  oo.kv_fp8 = 0;
+  oo.vision_device = vision_dev;
+  oo.vision_quant = vision_quant;
+  flyx_bmodel* bm = nullptr;
+  CHECK(api->open(&vlm.desc, &oo, &bm) == 0, std::string(name) + " open: " + api->last_error());
+  flyx_memory_info mem{};
+  if (api->memory) api->memory(bm, &mem);
+  api->close(bm);
+  return mem.weights;
+}
+
 BackendRun run_backend_vlm(const char* name, const TinyVlm& vlm, const std::vector<float>& patches,
-                           const char* backend_opts = "") {
+                           const char* backend_opts = "", int32_t vision_dev = FLYX_VISION_DEV_GPU,
+                           int32_t vision_quant = FLYX_VISION_QUANT_EXACT) {
   EngineOptions eo;
   eo.backend = name;
   eo.backend_options = backend_opts ? backend_opts : "";
@@ -594,8 +656,12 @@ BackendRun run_backend_vlm(const char* name, const TinyVlm& vlm, const std::vect
   oo.max_ctx = 256;
   oo.kv_fp8 = 0;
   oo.options = backend_opts && *backend_opts ? backend_opts : nullptr;
+  oo.vision_device = vision_dev;
+  oo.vision_quant = vision_quant;
   flyx_bmodel* bm = nullptr;
   CHECK(api->open(&vlm.desc, &oo, &bm) == 0, std::string(name) + " open: " + api->last_error());
+  flyx_memory_info mem{};
+  if (api->memory) api->memory(bm, &mem);
 
   // Programs
   std::vector<flyx_node> v_nodes = {{FLYX_NODE_RUN, 7, 0, 0}, {FLYX_NODE_RUN, 8, 0, 0},
@@ -629,6 +695,7 @@ BackendRun run_backend_vlm(const char* name, const TinyVlm& vlm, const std::vect
   flyx_plan* rplan3 = make_round(3);
 
   BackendRun res;
+  res.weights_bytes = mem.weights;
   // 1. Vision encoding: 4x4 patch grid -> 2x2 = 4 output embeddings of dim kH.
   const int32_t grid_thw[3] = {1, 4, 4};
   const int32_t cu[2] = {0, 16};
@@ -808,8 +875,26 @@ void test_tiny_vlm_backends() {
   std::vector<float> patches(16 * TinyVlm::kPatchDim);
   for (float& v : patches) v = dist(rng);
 
-  const BackendRun ref = run_backend_vlm("cpu_ref", vlm, patches);
-  std::printf("  ok   cpu_ref tiny VLM (encode_vision, MRoPE prefill_ex, MTP == plain, split prefill, ckpt+snapshot rope_delta)\n");
+  auto rel_err = [](const std::vector<float>& a, const std::vector<float>& b) {
+    CHECK(a.size() == b.size(), "embed size mismatch");
+    double num = 0.0, den = 0.0;
+    for (size_t i = 0; i < a.size(); ++i) {
+      const double d = double(a[i]) - double(b[i]);
+      num += d * d;
+      den += double(b[i]) * double(b[i]);
+    }
+    return std::sqrt(num / std::max(den, 1e-12));
+  };
+
+  const BackendRun ref = run_backend_vlm("cpu_ref", vlm, patches, "", FLYX_VISION_DEV_GPU, FLYX_VISION_QUANT_EXACT);
+  const BackendRun ref_q8 = run_backend_vlm("cpu_ref", vlm, patches, "", FLYX_VISION_DEV_GPU, FLYX_VISION_QUANT_Q8);
+  const BackendRun ref_fp4 = run_backend_vlm("cpu_ref", vlm, patches, "", FLYX_VISION_DEV_GPU, FLYX_VISION_QUANT_NVFP4);
+  // Pre-quantized GGML Q8_0 vision weights (like mmproj-Q8_0.gguf)
+  TinyVlm vlm_q8(true, true);
+  const BackendRun ref_preq8 = run_backend_vlm("cpu_ref", vlm_q8, patches);
+  std::printf(
+      "  ok   cpu_ref tiny VLM (exact/q8/nvfp4 + pre-quantized Q8_0, padded kVInter=%d, MTP == plain, ckpt+snapshot)\n",
+      TinyVlm::kVInter);
 
   // Run CUDA if a CUDA backend and device are available in this build.
   EngineOptions probe_opt;
@@ -820,23 +905,60 @@ void test_tiny_vlm_backends() {
     std::printf("  skip cuda tiny VLM (%s)\n", perr.c_str());
     return;
   }
-  const BackendRun gpu = run_backend_vlm("cuda", vlm, patches);
-  const BackendRun gpu_unfused = run_backend_vlm("cuda", vlm, patches, "fusion=0");
-  double num = 0.0, den = 0.0;
-  for (size_t i = 0; i < ref.vision_embeds.size(); ++i) {
-    const double d = double(gpu.vision_embeds[i]) - double(ref.vision_embeds[i]);
-    num += d * d;
-    den += double(ref.vision_embeds[i]) * double(ref.vision_embeds[i]);
-  }
-  const double rel = std::sqrt(num / std::max(den, 1e-12));
-  CHECK(rel < 2e-3, "cuda vs cpu_ref encode_vision rel err too large: " + std::to_string(rel));
-  CHECK(gpu.plain_tokens == ref.plain_tokens, "cuda vs cpu_ref multimodal greedy tokens differ");
+
+  // Verify 0 bytes of resident vision VRAM when vision=host vs text-only model!
+  TinyVlm text_only(false, false);
+  const uint64_t text_vram = measure_weights_bytes("cuda", text_only);
+
+  const BackendRun gpu = run_backend_vlm("cuda", vlm, patches, "", FLYX_VISION_DEV_GPU, FLYX_VISION_QUANT_EXACT);
+  const BackendRun host = run_backend_vlm("cuda", vlm, patches, "", FLYX_VISION_DEV_HOST, FLYX_VISION_QUANT_EXACT);
+  const BackendRun gpu_unfused =
+      run_backend_vlm("cuda", vlm, patches, "fusion=0", FLYX_VISION_DEV_GPU, FLYX_VISION_QUANT_EXACT);
+  const double rel_exact = rel_err(gpu.vision_embeds, ref.vision_embeds);
+  CHECK(rel_exact < 2e-5, "cuda vs cpu_ref exact encode_vision rel err: " + std::to_string(rel_exact));
+  CHECK(host.vision_embeds == gpu.vision_embeds, "vision=host exact must be bit-identical to vision=gpu");
+  CHECK(host.weights_bytes == text_vram,
+        "vision=host must use 0 resident vision VRAM (" + std::to_string(host.weights_bytes) + " vs " +
+            std::to_string(text_vram) + ")");
+  CHECK(gpu.weights_bytes > text_vram, "vision=gpu should allocate vision VRAM");
+  CHECK(gpu.plain_tokens == ref.plain_tokens, "cuda vs cpu_ref exact multimodal greedy tokens differ");
   CHECK(gpu.direct_followup == ref.direct_followup, "cuda vs cpu_ref follow-up rope_delta tokens differ");
   CHECK(gpu_unfused.plain_tokens == gpu.plain_tokens, "Gate 2 failed: cuda fusion=0 != fused");
   CHECK(gpu_unfused.direct_followup == gpu.direct_followup, "Gate 2 failed: cuda fusion=0 followup != fused");
+
+  // On-the-fly Q8_0 quantization (GPU + Host offload, with padded kVInter=144 -> 160)
+  const BackendRun gpu_q8 = run_backend_vlm("cuda", vlm, patches, "", FLYX_VISION_DEV_GPU, FLYX_VISION_QUANT_Q8);
+  const BackendRun host_q8 = run_backend_vlm("cuda", vlm, patches, "", FLYX_VISION_DEV_HOST, FLYX_VISION_QUANT_Q8);
+  const double rel_q8 = rel_err(gpu_q8.vision_embeds, ref_q8.vision_embeds);
+  CHECK(rel_q8 < 2e-5, "cuda vs cpu_ref q8 encode_vision rel err: " + std::to_string(rel_q8));
+  CHECK(host_q8.vision_embeds == gpu_q8.vision_embeds, "vision=host q8 must be bit-identical to vision=gpu q8");
+  CHECK(host_q8.weights_bytes == text_vram, "vision=host q8 must use 0 resident vision VRAM");
+  CHECK(gpu_q8.weights_bytes < gpu.weights_bytes, "vision_quant=q8 must use less VRAM than exact BF16");
+  CHECK(gpu_q8.plain_tokens == ref_q8.plain_tokens, "cuda vs cpu_ref q8 greedy tokens differ");
+
+  // On-the-fly NVFP4 quantization (GPU + Host offload, with padded kVInter=144 -> 192)
+  const BackendRun gpu_fp4 = run_backend_vlm("cuda", vlm, patches, "", FLYX_VISION_DEV_GPU, FLYX_VISION_QUANT_NVFP4);
+  const BackendRun host_fp4 = run_backend_vlm("cuda", vlm, patches, "", FLYX_VISION_DEV_HOST, FLYX_VISION_QUANT_NVFP4);
+  const double rel_fp4 = rel_err(gpu_fp4.vision_embeds, ref_fp4.vision_embeds);
+  CHECK(rel_fp4 < 2e-5, "cuda vs cpu_ref nvfp4 encode_vision rel err: " + std::to_string(rel_fp4));
+  CHECK(host_fp4.vision_embeds == gpu_fp4.vision_embeds, "vision=host nvfp4 must be bit-identical to vision=gpu nvfp4");
+  CHECK(host_fp4.weights_bytes == text_vram, "vision=host nvfp4 must use 0 resident vision VRAM");
+  CHECK(gpu_fp4.weights_bytes < gpu_q8.weights_bytes, "vision_quant=nvfp4 must use less VRAM than q8");
+  CHECK(gpu_fp4.plain_tokens == ref_fp4.plain_tokens, "cuda vs cpu_ref nvfp4 greedy tokens differ");
+
+  // Pre-quantized GGML Q8_0 vision weights (mmproj-Q8_0.gguf path)
+  const BackendRun gpu_preq8 = run_backend_vlm("cuda", vlm_q8, patches, "", FLYX_VISION_DEV_GPU, FLYX_VISION_QUANT_EXACT);
+  const BackendRun host_preq8 =
+      run_backend_vlm("cuda", vlm_q8, patches, "", FLYX_VISION_DEV_HOST, FLYX_VISION_QUANT_EXACT);
+  const double rel_preq8 = rel_err(gpu_preq8.vision_embeds, ref_preq8.vision_embeds);
+  CHECK(rel_preq8 < 2e-5, "cuda vs cpu_ref pre-quantized Q8_0 rel err: " + std::to_string(rel_preq8));
+  CHECK(host_preq8.vision_embeds == gpu_preq8.vision_embeds, "pre-quantized Q8_0 host != gpu");
+  CHECK(gpu_preq8.plain_tokens == ref_preq8.plain_tokens, "pre-quantized Q8_0 greedy tokens differ");
+
   std::printf(
-      "  ok   cuda tiny VLM vs cpu_ref (encode_vision rel err %.2e, 16+10 tokens exact match, MTP == plain, fusion=0 == fused, ckpt+snapshot rope_delta)\n",
-      rel);
+      "  ok   cuda tiny VLM vs cpu_ref (exact %.2e, q8 %.2e, nvfp4 %.2e, pre-Q8_0 %.2e; host==gpu bit-exact, 0 vision "
+      "VRAM)\n",
+      rel_exact, rel_q8, rel_fp4, rel_preq8);
 }
 
 }  // namespace
