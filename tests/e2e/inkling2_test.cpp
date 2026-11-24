@@ -889,14 +889,15 @@ int main(int argc, char** argv) {
         std::vector<int> passes;  // the prompt tokens in the state as the request starts, then after each pass
         int reused = -1;
       };
-      auto ask = [&](Session& s, bool boundary) {
+      // boundary: the conversation ends where the prompt does; question: and that end is a question's.
+      auto ask = [&](Session& s, const std::vector<int32_t>& prompt, bool boundary, bool question) {
         Asked a;
         GenerateRequest req;
-        req.prompt = longer;
+        req.prompt = prompt;
         req.max_new_tokens = 8;
         req.ignore_eos = true;
-        if (boundary) req.checkpoints = {int32_t(longer.size())};
-        if (boundary) req.keep_checkpoint = int32_t(longer.size());
+        if (boundary) req.checkpoints = {int32_t(prompt.size())};
+        if (question) req.keep_checkpoint = int32_t(prompt.size());
         req.on_prefill = [&](int done, int) { a.passes.push_back(done); };
         GenerateResult res;
         std::string gerr;
@@ -910,16 +911,36 @@ int main(int argc, char** argv) {
         a.reused = res.usage.reused_tokens;
         return a;
       };
-      Session s(e.get()), bare(e.get());
+      Session s(e.get()), bare(e.get()), chat(e.get());
       std::string serr;
-      if (!s.init(&serr) || !bare.init(&serr)) throw std::runtime_error("session init: " + serr);
-      const Asked first = ask(s, true), again = ask(s, true), unmarked = ask(bare, false);
+      if (!s.init(&serr) || !bare.init(&serr) || !chat.init(&serr)) throw std::runtime_error("session init: " + serr);
+      const Asked first = ask(s, longer, true, true), again = ask(s, longer, true, true),
+                  unmarked = ask(bare, longer, false, false);
       check(first.reused == 0 && first.passes == std::vector<int>{0, 32, 56} && unmarked.passes == first.passes &&
                 same_tokens(first.tokens, unmarked.tokens),
             "a boundary at the prompt's end adds no prefill pass and moves none (" + backend + ")");
       check(again.reused == 32 && again.passes == std::vector<int>{32, 56} && same_tokens(again.tokens, first.tokens),
             "a prompt asked again runs its last pass again (" + std::to_string(again.reused) + " of " +
                 std::to_string(longer.size()) + " reused), the same tokens (" + backend + ")");
+
+      // A question that ends where its prompt does (one pass here: no pass start to keep): the checkpoint at its end
+      // is the question's, kept through the turns that follow, six of them with a checkpoint each at its own end
+      // where a sequence has four slots.  The next question's prompt leaves the conversation right after the first
+      // (a template drops the thinking of the turns since), and starts from that checkpoint.
+      const std::vector<int32_t> question(longer.begin(), longer.begin() + 24);
+      ask(chat, question, true, true);
+      std::vector<int32_t> turns = question;
+      for (int t = 0; t < 6; ++t) {
+        for (int i = 0; i < 9; ++i) turns.push_back(40 + int(turns.size() * 7 % 200));
+        ask(chat, turns, true, false);
+      }
+      std::vector<int32_t> next = question;
+      for (int i = 0; i < 12; ++i) next.push_back(3 + i * 5);
+      const Asked asked_next = ask(chat, next, true, true);
+      check(asked_next.reused == int(question.size()),
+            "a question's checkpoint at its prompt's end is kept through six turns (" +
+                std::to_string(asked_next.reused) + " of " + std::to_string(question.size()) + " reused, " + backend +
+                ")");
     }
 
     if (backend == "cuda") {

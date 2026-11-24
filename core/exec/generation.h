@@ -222,7 +222,8 @@ class Generation {
   bool checkpoint_due_ = false;    // the pass in flight ends at a cut, or crosses one: its checkpoint, once it has run
   int crossed_cut_ = -1;           // when >= 0, the intra-pass cut that checkpoint_due_ will capture
   bool due_keep_ = false;          // that checkpoint is the kept one (keep_)
-  bool end_keep_ = false;          // the last pass crossed keep_: the checkpoint after the first token is the kept one
+  bool end_keep_ = false;          // the last pass crossed keep_, or keep_ is the prompt's end: the checkpoint after
+                                   // the first token is the kept one
   // reply
   int emitted_ = 0;                // tokens counted against max_new
   int finish_ = 0;                 // flyx_finish_reason once the reply has ended

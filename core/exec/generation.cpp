@@ -218,10 +218,7 @@ bool Generation::prefill() {
     if (!vision::inside_media_span(req_.media_spans, pos_)) {
       s_->advanced(prompt, pos_, media);
       const bool share = pos_ <= req_.share_system_prefix && req_.share_system_prefix < end;
-      // The question's checkpoint, kept through the tool calls that follow it: the cut at its end, or this pass's
-      // start for a question that ends where the prompt does.
-      const bool keep = (checkpoint_due_ && due_keep_) || (before_last && keep_ == n_);
-      s_->take_checkpoint(prompt, pos_, keep, anchor, share, media);
+      s_->take_checkpoint(prompt, pos_, checkpoint_due_ && due_keep_, anchor, share, media);
     } else if (checkpoint_due_ && crossed_cut_ >= 0) {
       // Pass ended inside a MediaSpan, but its intra-pass snapshot sits at crossed_cut_ (outside any span).
       s_->take_checkpoint(prompt, pos_, due_keep_, anchor, false, media);
@@ -307,7 +304,10 @@ bool Generation::prefill() {
     due_keep_ = (crossed >= 0 ? crossed : pos_) == keep_;
     return true;
   }
-  end_keep_ = crossed >= 0 && crossed == keep_;
+  // The question's checkpoint, kept through the tool calls that follow it, is the one taken at the prompt's end where
+  // the last pass crossed the question's end, or where the question ends with the prompt (no generation prompt after
+  // it: the next question's prompt differs from this conversation right there).
+  end_keep_ = (crossed >= 0 && crossed == keep_) || keep_ == n_;
   s_->advanced(prompt, n_, media);
   g_.mask = nullptr;  // rounds run unmasked unless a token has to be chosen again
   phase_ = Phase::kFinishPrefill;
