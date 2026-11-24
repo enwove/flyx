@@ -1,6 +1,7 @@
 // Copyright 2026 The flyx Authors. SPDX-License-Identifier: Apache-2.0
 // CUDA kernel tests for Inkling-2 target ops (softcap, AttnRes, loop control, ShortConv,
 // relative-position-bias attention, sparse MoE) and DSpark drafter kernels against float64 refs.
+#include "backends/cuda/loader/exact_bf16.h"
 #include "tests/backends/cuda/op_test.cuh"
 
 namespace flyx::optest {
@@ -211,6 +212,164 @@ float* up_f(const std::vector<float>& v) {
   return p;
 }
 
+void expect_device_bits(const std::string& what, const float* got, const float* want, size_t count) {
+  std::vector<uint32_t> a(count), b(count);
+  CK(cudaMemcpy(a.data(), got, count * sizeof(uint32_t), cudaMemcpyDeviceToHost));
+  CK(cudaMemcpy(b.data(), want, count * sizeof(uint32_t), cudaMemcpyDeviceToHost));
+  const auto mismatch = std::mismatch(a.begin(), a.end(), b.begin());
+  if (mismatch.first == a.end()) {
+    std::printf("  ok   %-48s bit-identical\n", what.c_str());
+  } else {
+    std::printf("  FAIL %-48s word %zu: %08x != %08x\n", what.c_str(), size_t(mismatch.first - a.begin()),
+                unsigned(*mismatch.first), unsigned(*mismatch.second));
+    ++g_fail;
+  }
+}
+
+// The reference and both device matrices use exactly the same weight values.
+struct ExactTestMatrix {
+  std::vector<float> values;
+  flyx_tensor_view view;
+  float* full;
+  bf16* compact;
+
+  ExactTestMatrix(int N, int K, double scale) {
+    Vec w = randv(size_t(N) * K, scale);
+    round_bf16(w);
+    values.assign(w.begin(), w.end());
+    view = view_f32(values, N, K);
+    full = up(w);
+    compact = up_bf16(w);
+  }
+  ~ExactTestMatrix() {
+    cudaFree(full);
+    cudaFree(compact);
+  }
+  ExactTestMatrix(const ExactTestMatrix&) = delete;
+  ExactTestMatrix& operator=(const ExactTestMatrix&) = delete;
+};
+
+void test_compact_loop_control() {
+  const int rows = 16, H = 259, rank = 35;
+  seed("inkling2_compact_loop_control", rows, H, rank);
+  const auto cur = randf(size_t(rows) * H, 1.0), msg = randf(cur.size(), 0.5);
+  ExactTestMatrix wd(rank, 2 * H, 0.05), wg(H, rank, 0.1), wf(H, rank, 0.1);
+  const Vec cur32(cur.begin(), cur.end()), msg32(msg.begin(), msg.end());
+  Vec want(cur.size());
+  ops::loop_control(cur32.data(), msg32.data(), rows, H, rank, &wd.view, &wg.view, &wf.view, want.data());
+
+  float* d_cur = up_f(cur);
+  float* d_msg = up_f(msg);
+  float* out_full = dev<float>(cur.size());
+  float* out_compact = dev<float>(kLoopGates * cur.size());
+  const size_t gate_size = rows * loop_row_floats(rank);
+  float* gate_full = dev<float>(gate_size);
+  float* gate_compact = dev<float>(kLoopGates * gate_size);
+  LoopGate full{d_cur, d_msg, {wd.full}, {wg.full}, {wf.full}, out_full};
+  LoopGate compact{d_cur, d_msg, {nullptr, wd.compact}, {nullptr, wg.compact}, {nullptr, wf.compact}, out_compact};
+  LoopGate batch = compact;
+  batch.out += cur.size();
+  loop_control(&batch, 1, rows, H, rank, gate_compact + gate_size, 0);
+  for (int R : {1, 2, 3, 4, 5, 8, 16}) {
+    const std::string at = " R=" + std::to_string(R);
+    loop_control(&full, 1, R, H, rank, gate_full, 0);
+    CK(cudaMemset(gate_compact, 0xff, R * loop_row_floats(rank) * sizeof(float)));
+    CK(cudaMemset(out_compact, 0xff, size_t(R) * H * sizeof(float)));
+    loop_control(&compact, 1, R, H, rank, gate_compact, 0);
+    expect_device_bits("compact loop gate = f32" + at, gate_compact, gate_full, R * loop_row_floats(rank));
+    expect_device_bits("compact loop apply = f32" + at, out_compact, out_full, size_t(R) * H);
+    expect_device_bits("compact loop_control = 16-row prefix" + at, out_compact, batch.out, size_t(R) * H);
+    expect("compact loop_control" + at, down(out_compact, size_t(R) * H), Vec(want.begin(), want.begin() + R * H),
+           2e-5);
+  }
+
+  // Each controller keeps a different one of its three matrices in float32 in the same launch.
+  LoopGate mixed[kLoopGates] = {compact, compact, compact};
+  mixed[0].down = full.down;
+  mixed[1].gain = full.gain;
+  mixed[2].forget = full.forget;
+  for (int c = 0; c < kLoopGates; ++c) mixed[c].out = out_compact + c * cur.size();
+  CK(cudaMemset(gate_compact, 0xff, kLoopGates * gate_size * sizeof(float)));
+  CK(cudaMemset(out_compact, 0xff, kLoopGates * cur.size() * sizeof(float)));
+  loop_control(mixed, kLoopGates, rows, H, rank, gate_compact, 0);
+  for (int c = 0; c < kLoopGates; ++c) {
+    const std::string at = " controller " + std::to_string(c);
+    expect_device_bits("mixed loop gate = f32" + at, gate_compact + c * gate_size, gate_full, gate_size);
+    expect_device_bits("mixed loop apply = f32" + at, mixed[c].out, out_full, cur.size());
+  }
+  cudaFree(d_cur);
+  cudaFree(d_msg);
+  cudaFree(out_full);
+  cudaFree(out_compact);
+  cudaFree(gate_full);
+  cudaFree(gate_compact);
+}
+
+void test_compact_linear_f32() {
+  const int rows = 16, N = 37, K = 101;
+  seed("inkling2_compact_linear_f32", rows, N, K);
+  const auto x = randf(size_t(rows) * K, 1.0);
+  const Vec x32(x.begin(), x.end());
+  ExactTestMatrix w(N, K, 0.2);
+  Vec want(size_t(rows) * N);
+  ops::linear(x32.data(), rows, K, &w.view, N, want.data());
+  float* dx = up_f(x);
+  float* full = dev<float>(want.size());
+  float* compact = dev<float>(want.size());
+  float* batch = dev<float>(want.size());
+  linear_f32(dx, K, {nullptr, w.compact}, N, K, batch, N, rows, false, 0);
+  for (int R : {1, 2, 3, 4, 5, 8, 16}) {
+    const std::string at = " R=" + std::to_string(R);
+    const size_t count = size_t(R) * N;
+    linear_f32(dx, K, {w.full}, N, K, full, N, R, false, 0);
+    linear_f32(dx, K, {nullptr, w.compact}, N, K, compact, N, R, false, 0);
+    expect_device_bits("compact linear_f32 = f32" + at, compact, full, count);
+    expect_device_bits("compact linear_f32 = 16-row prefix" + at, compact, batch, count);
+    expect("compact linear_f32" + at, down(compact, count), Vec(want.begin(), want.begin() + R * N), 2e-5);
+    linear_f32(dx, K, {w.full}, N, K, full, N, R, true, 0);
+    linear_f32(dx, K, {nullptr, w.compact}, N, K, compact, N, R, true, 0);
+    expect_device_bits("compact linear_f32 accumulate = f32" + at, compact, full, count);
+  }
+  cudaFree(dx);
+  cudaFree(full);
+  cudaFree(compact);
+  cudaFree(batch);
+}
+
+void test_one_inexact_weight() {
+  // Signed zero, a subnormal, infinities and NaN payloads are exact when their low halves are zero.
+  const uint32_t words[] = {0x80000000u, 0x00010000u, 0x7f800000u, 0xff800000u, 0x7f810000u, 0xffc30000u};
+  bool has_nan = false;
+  const bool exact_words = all_exact_bf16(words, sizeof(words) / sizeof(words[0]), &has_nan) && has_nan;
+  std::printf("  %-4s %-48s\n", exact_words ? "ok" : "FAIL", "all_exact_bf16 accepts exact special values");
+  if (!exact_words) ++g_fail;
+
+  const int K = 65;
+  std::vector<float> w(K, 0.f);
+  w.front() = -0.f;
+  w.back() = 1.f;
+  const bool exact = all_exact_bf16(w.data(), w.size(), &has_nan) && !has_nan;
+  w.back() = std::nextafter(1.f, 2.f);  // only bit zero differs from the exact tensor
+  const bool compact = all_exact_bf16(w.data(), w.size());
+  const bool ok = exact && !compact;
+  std::printf("  %-4s %-48s\n", ok ? "ok" : "FAIL", "all_exact_bf16 detects one low bit in last weight");
+  if (!ok) ++g_fail;
+
+  Vec x(K, 0.);
+  x.back() = 1.;
+  float* dx = up(x);
+  float* dw = up_f(w);
+  bf16* db = up_bf16(Vec(w.begin(), w.end()));
+  float* out = dev<float>(1);
+  const RoundWeight selected = compact ? RoundWeight{nullptr, db} : RoundWeight{dw};
+  linear_f32(dx, K, selected, 1, K, out, 1, 1, false, 0);
+  expect_device_bits("linear_f32 keeps the single non-bf16 weight", out, dw + K - 1, 1);
+  cudaFree(dx);
+  cudaFree(dw);
+  cudaFree(db);
+  cudaFree(out);
+}
+
 }  // namespace
 
 // loop_control against ops::loop_control on float32 weights the reference reads as they are: one controller and
@@ -251,7 +410,7 @@ void test_inkling2_loop_control() {
       d_down[size_t(c)] = up_f(w_down);
       d_gain[size_t(c)] = up_f(w_gain);
       d_forget[size_t(c)] = up_f(w_forget);
-      gates[c] = {d_cur[size_t(c)], d_msg[size_t(c)], d_down[size_t(c)], d_gain[size_t(c)], d_forget[size_t(c)],
+      gates[c] = {d_cur[size_t(c)], d_msg[size_t(c)], {d_down[size_t(c)]}, {d_gain[size_t(c)]}, {d_forget[size_t(c)]},
                   d_out + size_t(c) * RH};
     }
 
@@ -304,6 +463,7 @@ void test_inkling2_loop_control() {
     cudaFree(d_gate);
     cudaFree(d_one);
   }
+  test_compact_loop_control();
 }
 
 // linear_f32 against ops::linear on a float32 matrix: a router's and a sink's shapes of the real model, sizes that
@@ -330,13 +490,13 @@ void test_inkling2_linear_f32() {
     float* dw = up_f(w);
     const int ldy = N + 3;  // rows apart by more than their length
     float* dy = dev<float>(size_t(R) * ldy);
-    linear_f32(dx, K, dw, N, K, dy, ldy, R, false, 0);
+    linear_f32(dx, K, {dw}, N, K, dy, ldy, R, false, 0);
     const Vec all = down(dy, size_t(R) * ldy);
     Vec got(size_t(R) * N);
     for (int r = 0; r < R; ++r) std::copy_n(all.begin() + ptrdiff_t(r) * ldy, N, got.begin() + ptrdiff_t(r) * N);
     expect("linear_f32" + at, got, want, 2e-5);
 
-    linear_f32(dx, K, dw, N, K, dy, ldy, R, true, 0);  // y = y + y
+    linear_f32(dx, K, {dw}, N, K, dy, ldy, R, true, 0);  // y = y + y
     const Vec twice = down(dy, size_t(R) * ldy);
     Vec got2(size_t(R) * N), want2(size_t(R) * N);
     for (int r = 0; r < R; ++r)
@@ -348,7 +508,7 @@ void test_inkling2_linear_f32() {
 
     const int rr = R / 2;
     float* d1 = dev<float>(size_t(N));
-    linear_f32(dx + size_t(rr) * K, K, dw, N, K, d1, N, 1, false, 0);
+    linear_f32(dx + size_t(rr) * K, K, {dw}, N, K, d1, N, 1, false, 0);
     expect_bits("linear_f32 a row alone = among " + std::to_string(R) + at, down(d1, size_t(N)),
                 Vec(got.begin() + ptrdiff_t(rr) * N, got.begin() + ptrdiff_t(rr + 1) * N));
     cudaFree(dx);
@@ -356,6 +516,8 @@ void test_inkling2_linear_f32() {
     cudaFree(dy);
     cudaFree(d1);
   }
+  test_compact_linear_f32();
+  test_one_inexact_weight();
 }
 
 void test_inkling2_shortconv() {

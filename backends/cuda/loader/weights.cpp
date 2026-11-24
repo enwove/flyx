@@ -5,6 +5,8 @@
 #include <condition_variable>
 #include <exception>
 
+#include "backends/cuda/loader/exact_bf16.h"
+
 namespace flyx::cuda {
 
 // Persistent worker pool scoped to a single model load so WeightLoader::parallel_rows avoids spawning and joining
@@ -1066,16 +1068,41 @@ std::vector<float> WeightLoader::host_f32(int w) const {
   return out;
 }
 
-float* WeightLoader::f32(int w) {
-  if (auto it = f32s_.find(w); it != f32s_.end()) return it->second;
-  if (t(w)->ndim != 2) throw std::runtime_error(std::string(t(w)->name) + ": not a matrix");
-  return f32s_[w] = put(host_f32(w));
+RoundWeight WeightLoader::round_weight(int w, const bf16* prefill) {
+  if (auto it = round_weights_.find(w); it != round_weights_.end()) return it->second;
+  const auto* v = t(w);
+  if (v->ndim != 2) throw std::runtime_error(std::string(v->name) + ": not a matrix");
+  const size_t n = numel(v);
+  std::vector<float> decoded;
+  const void* values = v->data;
+  if (v->dtype != FLYX_DT_F32) {
+    decoded = host_f32(w);
+    values = decoded.data();
+  }
+  RoundWeight weight;
+  bool has_nan = false;
+  if (!all_exact_bf16(values, n, &has_nan)) {
+    float* p = m_->alloc<float>(n);
+    CK(cudaMemcpy(p, values, n * sizeof(float), cudaMemcpyHostToDevice));
+    weight.f32 = p;
+  } else if (prefill && !has_nan) {
+    weight.b16 = prefill;
+  } else {
+    // Packed prefill has no bf16 slice. For NaNs, its normal conversion can change the payload or quiet bit.
+    std::vector<uint16_t> high(n);
+    for (size_t i = 0; i < n; ++i) high[i] = uint16_t(f32_word(values, i) >> 16);
+    bf16* p = m_->alloc<bf16>(n);
+    upload_staged(p, high.data(), n * sizeof(bf16));
+    weight.b16 = p;
+  }
+  return round_weights_[w] = weight;
 }
 
 Lin WeightLoader::lin_f32(int w) {
   Lin l = lin(w);
   const auto* v = t(w);
-  if (v->ndim == 2 && (v->dtype == FLYX_DT_F32 || v->dtype == FLYX_DT_F16 || v->dtype == FLYX_DT_F64)) l.f = f32(w);
+  if (v->ndim == 2 && (v->dtype == FLYX_DT_F32 || v->dtype == FLYX_DT_F16 || v->dtype == FLYX_DT_F64))
+    l.round = round_weight(w, l.w);
   return l;
 }
 

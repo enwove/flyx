@@ -142,16 +142,22 @@ __global__ void k_loop_ctrl_apply(const float* __restrict__ cur, const float* __
 }
 
 // ---- loop_control & linear_f32: the controllers and the control projections as rounds run them -------------
-// Float32 weights the file holds, read cold from device memory each time (a token passes gigabytes of weights
-// between two uses), so a launch lasts as long as its bytes take to arrive: many small blocks that each read their
-// share at once.  A block takes NR rows (1, 2, 4 or 8: a template, since rows counted at run time in the inner loops
-// made a one-row launch five times as long), so a round's rows read the weights once; rows past the last repeat it
-// and are not written.
+// The weights are read cold from device memory each time (a token passes gigabytes of weights between two uses).
+// A matrix with exact bf16 values needs only its high words. Many small blocks each read their share at once.
+// A block takes NR rows (1, 2, 4 or 8: a template, since rows counted at run time in the inner loops made a one-row
+// launch five times as long) and reads the weights once for those rows. Rows past the last repeat it and are not written.
 struct LoopGates {
   LoopGate g[kLoopGates];
 };
 constexpr int kLoopBlock = 256, kLoopRows = 8;
 inline int loop_rows(int rows) { return rows == 1 ? 1 : rows == 2 ? 2 : rows <= 4 ? 4 : kLoopRows; }
+
+// A controller owns a grid plane, so the choice of width is uniform across a block and made outside the dot product.
+template <typename Dot>
+__device__ __forceinline__ void with_weight_row(RoundWeight w, size_t offset, Dot dot) {
+  if (w.b16) dot(w.b16 + offset);
+  else dot(w.f32 + offset);
+}
 
 // A block: one output of one controller's down projection for NR rows, a thread its inputs 256 apart in order and
 // then the block's tree; cur's half and msg's half summed apart (raw[2 o], raw[2 o + 1]): each half's norm scale
@@ -161,7 +167,6 @@ template <int NR>
 __global__ void __launch_bounds__(kLoopBlock) k_loop_gate(LoopGates G, int H, int rank, int rows, float* raw) {
   pdl_trigger();
   const int o = blockIdx.x, r0 = blockIdx.y * NR, c = blockIdx.z, tid = threadIdx.x;
-  const float* w = G.g[c].down + size_t(o) * size_t(2 * H);
   const float *cur[NR], *msg[NR];
   float acc[2 * NR];
 #pragma unroll
@@ -171,14 +176,16 @@ __global__ void __launch_bounds__(kLoopBlock) k_loop_gate(LoopGates G, int H, in
     msg[j] = G.g[c].msg + size_t(r) * H;
     acc[2 * j] = acc[2 * j + 1] = 0.f;
   }
-  for (int i = tid; i < H; i += kLoopBlock) {
-    const float wc = w[i], wm = w[H + i];
+  with_weight_row(G.g[c].down, size_t(o) * size_t(2 * H), [&](const auto* w) {
+    for (int i = tid; i < H; i += kLoopBlock) {
+      const float wc = in_value(w + i), wm = in_value(w + H + i);
 #pragma unroll
-    for (int j = 0; j < NR; ++j) {
-      acc[2 * j] = __fmaf_rn(wc, cur[j][i], acc[2 * j]);
-      acc[2 * j + 1] = __fmaf_rn(wm, msg[j][i], acc[2 * j + 1]);
+      for (int j = 0; j < NR; ++j) {
+        acc[2 * j] = __fmaf_rn(wc, cur[j][i], acc[2 * j]);
+        acc[2 * j + 1] = __fmaf_rn(wm, msg[j][i], acc[2 * j + 1]);
+      }
     }
-  }
+  });
   block_sum_n(acc);
   float* row0 = raw + (size_t(c) * rows + r0) * loop_row_floats(rank);
 #pragma unroll
@@ -209,8 +216,6 @@ __global__ void __launch_bounds__(kLoopBlock) k_loop_apply(LoopGates G, int H, i
   const int lane = threadIdx.x & 31, h = blockIdx.x * (kLoopBlock / 32) + (threadIdx.x >> 5);
   const int r0 = blockIdx.y * NR, c = blockIdx.z;
   if (h >= H) return;
-  const float* gain = G.g[c].gain + size_t(h) * rank;
-  const float* forget = G.g[c].forget + size_t(h) * rank;
   const float* row[NR];
   float inv_cur[NR], inv_msg[NR], gn[NR], fg[NR];
 #pragma unroll
@@ -220,15 +225,20 @@ __global__ void __launch_bounds__(kLoopBlock) k_loop_apply(LoopGates G, int H, i
     inv_msg[j] = rsqrtf(row[j][2 * rank + 1] / float(H) + 1e-6f);
     gn[j] = fg[j] = 0.f;
   }
-  for (int i = lane; i < rank; i += 32) {
-    const float wg = gain[i], wf = forget[i];
+  const size_t offset = size_t(h) * rank;
+  with_weight_row(G.g[c].gain, offset, [&](const auto* gain) {
+    with_weight_row(G.g[c].forget, offset, [&](const auto* forget) {
+      for (int i = lane; i < rank; i += 32) {
+        const float wg = in_value(gain + i), wf = in_value(forget + i);
 #pragma unroll
-    for (int j = 0; j < NR; ++j) {
-      const float gi = __fmaf_rn(row[j][2 * i], inv_cur[j], __fmul_rn(row[j][2 * i + 1], inv_msg[j]));
-      gn[j] = __fmaf_rn(wg, gi, gn[j]);
-      fg[j] = __fmaf_rn(wf, gi, fg[j]);
-    }
-  }
+        for (int j = 0; j < NR; ++j) {
+          const float gi = __fmaf_rn(row[j][2 * i], inv_cur[j], __fmul_rn(row[j][2 * i + 1], inv_msg[j]));
+          gn[j] = __fmaf_rn(wg, gi, gn[j]);
+          fg[j] = __fmaf_rn(wf, gi, fg[j]);
+        }
+      }
+    });
+  });
 #pragma unroll
   for (int j = 0; j < NR; ++j) {
     const float g = warp_sum(gn[j]), f = warp_sum(fg[j]);
@@ -241,14 +251,14 @@ __global__ void __launch_bounds__(kLoopBlock) k_loop_apply(LoopGates G, int H, i
 }
 
 // A warp: one output for NR rows, its lanes 32 values of K apart in order, then their tree.
-template <int NR>
-__global__ void __launch_bounds__(kLoopBlock) k_linear_f32(const float* x, int ldx, const float* __restrict__ W, int N,
+template <int NR, typename Weight>
+__global__ void __launch_bounds__(kLoopBlock) k_linear_f32(const float* x, int ldx, const Weight* __restrict__ W, int N,
                                                            int K, float* y, int ldy, int rows, int accumulate) {
   pdl_trigger();
   const int lane = threadIdx.x & 31, n = blockIdx.x * (kLoopBlock / 32) + (threadIdx.x >> 5);
   const int r0 = blockIdx.y * NR;
   if (n >= N) return;
-  const float* w = W + size_t(n) * K;
+  const Weight* w = W + size_t(n) * K;
   const float* xr[NR];
   float acc[NR];
 #pragma unroll
@@ -257,7 +267,7 @@ __global__ void __launch_bounds__(kLoopBlock) k_linear_f32(const float* x, int l
     acc[j] = 0.f;
   }
   for (int k = lane; k < K; k += 32) {
-    const float wk = w[k];
+    const float wk = in_value(w + k);
 #pragma unroll
     for (int j = 0; j < NR; ++j) acc[j] = __fmaf_rn(wk, xr[j][k], acc[j]);
   }
@@ -1415,17 +1425,21 @@ void loop_control(const LoopGate* g, int n, int rows, int H, int rank, float* sc
 #undef FLYX_LOOP_LAUNCH
 }
 
-void linear_f32(const float* x, int ldx, const float* W, int N, int K, float* y, int ldy, int rows, bool accumulate,
+void linear_f32(const float* x, int ldx, RoundWeight W, int N, int K, float* y, int ldy, int rows, bool accumulate,
                 cudaStream_t st) {
   if (rows <= 0 || N <= 0) return;
   const int nr = loop_rows(rows), acc = accumulate ? 1 : 0;
   const dim3 grid(ceil_div(N, kLoopBlock / 32), ceil_div(rows, nr));
-  switch (nr) {
-    case 1: k_linear_f32<1><<<grid, kLoopBlock, 0, st>>>(x, ldx, W, N, K, y, ldy, rows, acc); break;
-    case 2: k_linear_f32<2><<<grid, kLoopBlock, 0, st>>>(x, ldx, W, N, K, y, ldy, rows, acc); break;
-    case 4: k_linear_f32<4><<<grid, kLoopBlock, 0, st>>>(x, ldx, W, N, K, y, ldy, rows, acc); break;
-    default: k_linear_f32<8><<<grid, kLoopBlock, 0, st>>>(x, ldx, W, N, K, y, ldy, rows, acc); break;
-  }
+  auto launch = [&](const auto* w) {
+    switch (nr) {
+      case 1: k_linear_f32<1><<<grid, kLoopBlock, 0, st>>>(x, ldx, w, N, K, y, ldy, rows, acc); break;
+      case 2: k_linear_f32<2><<<grid, kLoopBlock, 0, st>>>(x, ldx, w, N, K, y, ldy, rows, acc); break;
+      case 4: k_linear_f32<4><<<grid, kLoopBlock, 0, st>>>(x, ldx, w, N, K, y, ldy, rows, acc); break;
+      default: k_linear_f32<8><<<grid, kLoopBlock, 0, st>>>(x, ldx, w, N, K, y, ldy, rows, acc); break;
+    }
+  };
+  if (W.b16) launch(W.b16);
+  else launch(W.f32);
 }
 
 void shortconv_pass(const float* x, int ldx, const float* w, const float* dyn, float* win, size_t win_stride,

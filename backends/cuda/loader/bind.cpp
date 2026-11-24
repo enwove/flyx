@@ -383,7 +383,6 @@ DvBlock dv(WeightLoader& L, const flyx_model_desc& d, const flyx_dv_block& b, co
   return v;
 }
 
-// A cross-pass loop gate controller's weights as rounds read them: float32 whatever the file holds them in.
 LoopWeights loop_weights(WeightLoader& L, int down, int gain, int forget, int hidden, int rank) {
   auto shaped = [&](int w, int N, int K) {
     const flyx_tensor_view* v = L.t(w);
@@ -391,7 +390,21 @@ LoopWeights loop_weights(WeightLoader& L, int down, int gain, int forget, int hi
   };
   expect(shaped(down, rank, 2 * hidden) && shaped(gain, hidden, rank) && shaped(forget, hidden, rank),
          "a loop gate controller of other shapes than [rank, 2 hidden], [hidden, rank], [hidden, rank]");
-  return {L.f32(down), L.f32(gain), L.f32(forget)};
+  LoopWeights weights;
+  weights.down = L.lin(down);
+  weights.stacked = L.can_stack({gain, forget});
+  if (weights.stacked) {
+    weights.gain_forget = L.lin_stack({gain, forget});
+  } else {
+    weights.gain = L.lin(gain);
+    weights.forget = L.lin(forget);
+  }
+  // The dense stack keeps both [hidden, rank] matrices in row order, gain first.
+  const bf16* gf = weights.gain_forget.w;
+  weights.down.round = L.round_weight(down, weights.down.w);
+  weights.gain.round = L.round_weight(gain, gf ? gf : weights.gain.w);
+  weights.forget.round = L.round_weight(forget, gf ? gf + size_t(hidden) * rank : weights.forget.w);
+  return weights;
 }
 
 RelAttnBlock rel_attn(WeightLoader& L, const flyx_rel_attn_block& b, const StateMap& sm) {
@@ -437,18 +450,9 @@ RelAttnBlock rel_attn(WeightLoader& L, const flyx_rel_attn_block& b, const State
   a.res_push = b.res_push;
   a.loop_rank = b.loop_rank;
   if (b.loop_rank > 0) {
-    for (int j = 0; j < 3; ++j) {
-      a.loop_f32[j] = loop_weights(L, b.loop_ctrl_down[j], b.loop_ctrl_gain[j], b.loop_ctrl_forget[j], b.hidden,
+    for (int j = 0; j < 3; ++j)
+      a.loop_ctrl[j] = loop_weights(L, b.loop_ctrl_down[j], b.loop_ctrl_gain[j], b.loop_ctrl_forget[j], b.hidden,
                                    b.loop_rank);
-      a.loop_ctrl_down[j] = L.lin(b.loop_ctrl_down[j]);
-      if (L.can_stack({b.loop_ctrl_gain[j], b.loop_ctrl_forget[j]})) {
-        a.loop_ctrl_gf[j] = L.lin_stack({b.loop_ctrl_gain[j], b.loop_ctrl_forget[j]});
-        a.loop_ctrl_stacked[j] = true;
-      } else {
-        a.loop_ctrl_gain[j] = L.lin(b.loop_ctrl_gain[j]);
-        a.loop_ctrl_forget[j] = L.lin(b.loop_ctrl_forget[j]);
-      }
-    }
   }
   a.kv = state_of(sm.kv, b.kv, "K/V");
   a.sconv = state_of(sm.sconv, b.sconv, "ShortConv");
@@ -476,17 +480,8 @@ MoeBlock moe(WeightLoader& L, const flyx_moe_block& b, const StateMap& sm) {
   if (b.post_conv >= 0) f.post_conv = L.vec(b.post_conv);
   if (b.res_query >= 0) f.res_query = L.vec(b.res_query);
   f.loop_rank = b.loop_rank;
-  if (b.loop_rank > 0) {
-    f.loop_f32 = loop_weights(L, b.loop_ctrl_down, b.loop_ctrl_gain, b.loop_ctrl_forget, b.hidden, b.loop_rank);
-    f.loop_ctrl_down = L.lin(b.loop_ctrl_down);
-    if (L.can_stack({b.loop_ctrl_gain, b.loop_ctrl_forget})) {
-      f.loop_ctrl_gf = L.lin_stack({b.loop_ctrl_gain, b.loop_ctrl_forget});
-      f.loop_ctrl_stacked = true;
-    } else {
-      f.loop_ctrl_gain = L.lin(b.loop_ctrl_gain);
-      f.loop_ctrl_forget = L.lin(b.loop_ctrl_forget);
-    }
-  }
+  if (b.loop_rank > 0)
+    f.loop_ctrl = loop_weights(L, b.loop_ctrl_down, b.loop_ctrl_gain, b.loop_ctrl_forget, b.hidden, b.loop_rank);
   if (b.sconv >= 0) {
     f.sconv = state_of(sm.sconv, b.sconv, "ShortConv");
     f.sconv_offset = b.sconv_offset;

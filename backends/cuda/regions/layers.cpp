@@ -639,7 +639,7 @@ void mlp_layer(const Pass& ps, const MlpBlock& f, bool fused) {
 namespace {
 
 // A block's loop gate controllers run in two ways (ops/attnres/ref.h loop_control).  Rounds, and the passes of
-// FLYX_MAX_ROWS rows or fewer that compute as rounds, read the float32 weights the file holds, all of a block's
+// FLYX_MAX_ROWS rows or fewer that compute as rounds, read the exact weights, all of a block's
 // controllers in two launches (loop_control).  A prefill pass of more rows runs each as linears on tensor cores from
 // bf16 inputs (apply_loop_ctrl), as its other bf16 linears run there: the two agree within tolerance
 // (docs/design/numerics.md, "Not promised"), and in float32 such a pass took 15% longer (Inkling-2-Mini, 6,280
@@ -647,20 +647,19 @@ namespace {
 bool loop_as_round(const Pass& ps) { return ps.round || ps.rows <= FLYX_MAX_ROWS; }
 
 LoopGate loop_gate(const LoopWeights& w, const float* cur, const float* msg, float* out) {
-  return {cur, msg, w.down, w.gain, w.forget, out};
+  return {cur, msg, w.down.round, w.gain.round, w.forget.round, out};
 }
 
-void apply_loop_ctrl(const float* cur, const float* msg, int rows, int H, int rank, const Lin& down, bool stacked_gf,
-                     const Lin& gf, const Lin& gain, const Lin& forget, float* ctrl_cat, float* ctrl_gate,
-                     float* ctrl_gf, float* out, const Launch& L) {
+void apply_loop_ctrl(const float* cur, const float* msg, int rows, int H, int rank, const LoopWeights& w,
+                     float* ctrl_cat, float* ctrl_gate, float* ctrl_gf, float* out, const Launch& L) {
   cudaStream_t st = L.st;
   loop_ctrl_prep(cur, msg, rows, H, ctrl_cat, st);
-  gemm(ctrl_cat, 2 * H, down, rank, 2 * H, ctrl_gate, rank, rows, false, L);
-  if (stacked_gf) {
-    gemm(ctrl_gate, rank, gf, 2 * H, rank, ctrl_gf, 2 * H, rows, false, L);
+  gemm(ctrl_cat, 2 * H, w.down, rank, 2 * H, ctrl_gate, rank, rows, false, L);
+  if (w.stacked) {
+    gemm(ctrl_gate, rank, w.gain_forget, 2 * H, rank, ctrl_gf, 2 * H, rows, false, L);
   } else {
-    gemm(ctrl_gate, rank, gain, H, rank, ctrl_gf, 2 * H, rows, false, L);
-    gemm(ctrl_gate, rank, forget, H, rank, ctrl_gf + H, 2 * H, rows, false, L);
+    gemm(ctrl_gate, rank, w.gain, H, rank, ctrl_gf, 2 * H, rows, false, L);
+    gemm(ctrl_gate, rank, w.forget, H, rank, ctrl_gf + H, 2 * H, rows, false, L);
   }
   loop_ctrl_apply(cur, msg, ctrl_gf, 2 * H, ctrl_gf + H, 2 * H, rows, H, out, st);
 }
@@ -725,7 +724,7 @@ void rel_attn_layer(const Pass& ps, const RelAttnBlock& a, bool fused) {
     LoopGate gates[3];
     for (int j = 0; j < 3; ++j) {
       float* dst = j == 0 && in_raw[1] == rv.b.attn_in ? rv.b.ctrl_cat : rv.b.attn_in + size_t(j) * R * H;
-      gates[j] = loop_gate(a.loop_f32[j], in_raw[j], rv.b.loop_msg + size_t(j) * R * H, dst);
+      gates[j] = loop_gate(a.loop_ctrl[j], in_raw[j], rv.b.loop_msg + size_t(j) * R * H, dst);
     }
     loop_control(gates, 3, R, H, a.loop_rank, rv.b.ctrl_scratch, st);
     for (int j = 0; j < 3; ++j) in_raw[j] = gates[j].out;
@@ -734,9 +733,8 @@ void rel_attn_layer(const Pass& ps, const RelAttnBlock& a, bool fused) {
     for (int j = 2; j >= 0; --j) {
       float* dst = rv.b.attn_in + size_t(j) * R * H;
       const float* msg = rv.b.loop_msg + size_t(j) * R * H;
-      apply_loop_ctrl(in_raw[j], msg, R, H, a.loop_rank, a.loop_ctrl_down[j], a.loop_ctrl_stacked[j],
-                      a.loop_ctrl_gf[j], a.loop_ctrl_gain[j], a.loop_ctrl_forget[j], rv.b.ctrl_cat, rv.b.ctrl_gate,
-                      rv.b.ctrl_gf, dst, L);
+      apply_loop_ctrl(in_raw[j], msg, R, H, a.loop_rank, a.loop_ctrl[j], rv.b.ctrl_cat, rv.b.ctrl_gate, rv.b.ctrl_gf,
+                      dst, L);
       in_raw[j] = dst;
     }
   }
@@ -893,12 +891,11 @@ void moe_layer(const Pass& ps, const MoeBlock& f, bool fused) {
   if (f.loop_rank > 0) {
     const float* msg = rv.b.loop_msg + size_t(3) * R * H;
     if (loop_as_round(ps)) {
-      const LoopGate gate = loop_gate(f.loop_f32, cur, msg, rv.b.attn_in);
+      const LoopGate gate = loop_gate(f.loop_ctrl, cur, msg, rv.b.attn_in);
       loop_control(&gate, 1, R, H, f.loop_rank, rv.b.ctrl_scratch, st);
     } else {
-      apply_loop_ctrl(cur, msg, R, H, f.loop_rank, f.loop_ctrl_down, f.loop_ctrl_stacked, f.loop_ctrl_gf,
-                      f.loop_ctrl_gain, f.loop_ctrl_forget, rv.b.ctrl_cat, rv.b.ctrl_gate, rv.b.ctrl_gf, rv.b.attn_in,
-                      L);
+      apply_loop_ctrl(cur, msg, R, H, f.loop_rank, f.loop_ctrl, rv.b.ctrl_cat, rv.b.ctrl_gate, rv.b.ctrl_gf,
+                      rv.b.attn_in, L);
     }
     cur = rv.b.attn_in;
   }

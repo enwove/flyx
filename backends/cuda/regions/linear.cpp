@@ -1,6 +1,5 @@
 // Copyright 2026 The flyx Authors. SPDX-License-Identifier: Apache-2.0
-// A GEMM on a weight of any format (bf16, NVFP4, packed GGML blocks; a control projection's float32 copy in
-// rounds), and the draft logits.
+// A GEMM on a weight of any format (bf16, NVFP4, packed GGML blocks, exact control projections), and the draft logits.
 #include <mutex>
 
 #include "backends/cuda/backend.h"
@@ -43,12 +42,11 @@ void log_shape(const KernelOptions* opt, const char* fmt, int N, int K, int rows
 
 void gemm(const float* x, int ldx, const Lin& W, int N, int K, float* y, int ldy, int rows, bool accumulate,
           const Launch& L) {
-  // A control projection's float32 copy: rounds, wide ones too, and the passes of 16 rows or fewer that compute as
-  // rounds (every row the bits it has alone).  A prefill pass of more rows reads the bf16 copy below, on tensor
-  // cores from bf16 inputs as its other linears do.
-  if (W.f && (rows <= 16 || L.round_rows)) {
+  // Control projections read exact weights and float32 inputs in rounds of any width and in short prefill passes.
+  // Larger prefill passes use the usual bf16 GEMM below.
+  if ((W.round.f32 || W.round.b16) && (rows <= 16 || L.round_rows)) {
     log_shape(L.opt, "f32", N, K, rows);
-    return linear_f32(x, ldx, W.f, N, K, y, ldy, rows, accumulate, L.st);
+    return linear_f32(x, ldx, W.round, N, K, y, ldy, rows, accumulate, L.st);
   }
   log_shape(L.opt, W.packed() ? "blocks" : W.q ? "nvfp4" : "bf16", N, K, rows);
   if (L.round_rows && rows > 16) {  // a wide round: the 1..16-row bits for every row

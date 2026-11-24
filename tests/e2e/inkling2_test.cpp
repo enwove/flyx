@@ -337,7 +337,10 @@ const char* kInkling2Template = R"jinja(
 {%- endif -%}
 )jinja";
 
-void write_tiny_inkling2(const std::filesystem::path& path, const TinySpec& c, bool mixed_quant, uint32_t seed_val) {
+enum class RoundMatrixCase { Generated, ExactBf16, OneLowBit };
+
+void write_tiny_inkling2(const std::filesystem::path& path, const TinySpec& c, bool mixed_quant, uint32_t seed_val,
+                         RoundMatrixCase round_case = RoundMatrixCase::Generated) {
   std::mt19937 rng(seed_val);
   GgufWriter w;
   const std::string arch = "inkling2_loop";
@@ -411,8 +414,17 @@ void write_tiny_inkling2(const std::filesystem::path& path, const TinySpec& c, b
   w.add_u32("tokenizer.ggml.eos_token_id", 269);  // <|end_message|>
   w.add_str("tokenizer.chat_template", kInkling2Template);
 
+  const std::string core = "blk." + std::to_string(c.core_start) + ".";
   auto add_mat = [&](const std::string& name, int N, int K, uint32_t dt, float sd = 0.08f) {
     const size_t n = size_t(N) * K;
+    if (round_case != RoundMatrixCase::Generated &&
+        (name == core + "ffn_gate_inp.weight" || name == core + "loop_q_ctrl_forget.weight")) {
+      auto data = gen_f32(rng, n, 0.f, sd);
+      for (size_t i = 0; i < data.size(); i += 4) data[i] = data[i + 1] = 0;  // little-endian GGUF
+      if (round_case == RoundMatrixCase::OneLowBit) data[data.size() - 4] = 1;
+      w.add_tensor(name, {uint64_t(N), uint64_t(K)}, kGgmlF32, std::move(data));
+      return;
+    }
     if (dt == kGgmlF32) w.add_tensor(name, {uint64_t(N), uint64_t(K)}, kGgmlF32, gen_f32(rng, n, 0.f, sd));
     else if (dt == kGgmlBF16) w.add_tensor(name, {uint64_t(N), uint64_t(K)}, kGgmlBF16, gen_bf16(rng, n, sd));
     else if (dt == kGgmlQ8_0) w.add_tensor(name, {uint64_t(N), uint64_t(K)}, kGgmlQ8_0, gen_q8_0(rng, n, sd));
@@ -944,6 +956,18 @@ int main(int argc, char** argv) {
     }
 
     if (backend == "cuda") {
+      {
+        auto held = [&](RoundMatrixCase round_case, const char* filename) {
+          const auto path = dir / filename;
+          write_tiny_inkling2(path, spec, false, 1001, round_case);
+          return weight_bytes(*load_engine(path.string(), "cuda"));
+        };
+        const uint64_t exact = held(RoundMatrixCase::ExactBf16, "tiny_inkling2_exact_round.gguf");
+        const uint64_t inexact = held(RoundMatrixCase::OneLowBit, "tiny_inkling2_inexact_round.gguf");
+        const size_t router = size_t(spec.n_experts) * spec.H, forget = size_t(spec.H) * spec.gate_rank;
+        check(inexact == exact + (router + forget) * sizeof(float),
+              "one low bit in each repeated core matrix retains exactly one F32 router and one F32 forget matrix");
+      }
       // ---- 2. CUDA vs cpu_ref, Gate 2 (fusion=0 == fusion=1), Gate 4 (plain == DSpark), CUDA graphs ----
       auto cu_plain = load_engine(bf16_gguf.string(), "cuda", {.prefill_chunk = 32});
       auto cu_unfused = load_engine(bf16_gguf.string(), "cuda", {.prefill_chunk = 32, .backend_opts = "fusion=0"});
