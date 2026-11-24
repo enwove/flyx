@@ -197,7 +197,7 @@ Passed verbatim to the backend (`backends/cuda/backend.cpp`). Unknown keys or in
 | `strata_compact` | `0` \| `1` | `0` | Pack 256-dim hosted 3-bit StrataFlux copies (24 words/pos instead of 26). |
 | `strata_scan` | `mma` \| `cores` | `mma` | Tensor-core (`mma`) vs FP32 (`cores`, measurement) StrataFlux scan. |
 | `pageable_kv` | `auto` \| `on` \| `off` | `auto` | Spill tiered StrataFlux K/V overflow layers past the pinned host budget (WDDM non-local cap on Windows) into OS pageable RAM (`VirtualAlloc`/`mmap`) while keeping low-bit Strata copies and within-budget K/V layers pinned. |
-| `pinned_host_mb` | `-1` or `N` (≥ 0) | `-1` (auto) | Override the pinned host K/V budget in MiB for `pageable_kv=auto` (`-1` queries DXGI non-local budget on Windows, unlimited on Linux). |
+| `pinned_host_mb` | `N` (≥ 0) | unset (auto) | Override the pinned host K/V budget in MiB for `pageable_kv=auto` (unset: the DXGI non-local budget on Windows, unlimited on Linux). |
 | `strata_grid` | `range` \| `normal` | `range` | StrataFlux low-bit quantization grid mode. |
 | `strata_chunk` | `N` (≥ 1) | `16384` | Selection chunk size in pairs (test/debug knob). |
 | `mtp_window` | `N` (≥ 0) | `4096` | Above `8 * N` context, MTP reads last `N` positions exact (`0` = full exact device cache). |

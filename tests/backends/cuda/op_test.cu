@@ -97,6 +97,7 @@ int main() {
   test_strata(256, 24, 4, 1, 257, 3, false);   // single-row 3-bit scan with binary16 K/V and a partial tile
   test_strata(256, 24, 4, 4, 1022, 2, true);   // 1023..1026 keys: full 32-key tiles and an unpaired final key
   test_strata(256, 24, 4, 1, 1000, 2, false);  // plain decode, 2 bits, binary16 cache
+  test_strata(256, 24, 4, 3, 900, 2, false);   // a round's rows on a binary16 cache: its pairs from pageable memory too
   test_strata(256, 16, 4, 9, 700, 4, true);    // G = 4, 4 bits, rows past 8
   test_strata(128, 16, 4, 5, 500, 3, false);   // head dim 128
   test_strata(64, 8, 2, 3, 300, 3, true);      // head dim 64 (the layout's shared words)

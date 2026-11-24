@@ -1673,6 +1673,37 @@ void strata_rounds(const std::string& model, const std::string& backend, const s
                 pinned->api()->logits(s_pin.seq(), 0, la.data()) == 0 &&
                 paged->api()->logits(s_pg.seq(), 0, lb.data()) == 0 && la == lb,
             "pageable_kv=on: cross-mode snapshot load (pinned <-> pageable) gives identical tokens and logits");
+      // The two ways back that leave the session's caches where they are, both past the device's part, where the
+      // tail ring no longer holds what the rounds after the edit overwrote and is read again from pageable memory
+      // (reload_page_ring): a rewind inside the last rounds (the edit two tokens before the end of the reply), then
+      // the prompt's checkpoint restored (the edit at the reply's first token, behind every round kept).
+      Session r_pin(pinned.get()), r_pg(paged.get());
+      check(r_pin.init(&err) && r_pg.init(&err), "pageable_kv rewind/restore: init sessions");
+      std::vector<int32_t> turn(history.begin(), history.begin() + 333);
+      const auto c1 = gen(r_pin, turn, 20).tokens, d1 = gen(r_pg, turn, 20).tokens;
+      check(c1.size() == 20 && c1 == d1, "pageable_kv=on: the turn to go back into matches pinned");
+      std::vector<int32_t> near = turn;
+      near.insert(near.end(), c1.begin(), c1.begin() + 18);
+      near.push_back((c1[18] + 1) % vocab);
+      const Out c2 = gen(r_pin, near, 12), d2 = gen(r_pg, near, 12);
+      std::vector<float> lc(size_t(vocab), 0.f), ld(size_t(vocab), 0.f);
+      check(c2.usage.reused_tokens > int(turn.size()) && d2.usage.reused_tokens == c2.usage.reused_tokens &&
+                c2.tokens.size() == 12 && d2.tokens == c2.tokens &&
+                pinned->api()->logits(r_pin.seq(), 0, lc.data()) == 0 &&
+                paged->api()->logits(r_pg.seq(), 0, ld.data()) == 0 && lc == ld,
+            "pageable_kv=on: a rewind inside the last rounds (" + std::to_string(d2.usage.reused_tokens) + " of " +
+                std::to_string(near.size()) + " reused) gives pinned's tokens and logits");
+      std::vector<int32_t> far = turn;
+      far.push_back((c1[0] + 1) % vocab);
+      const Out c3 = gen(r_pin, far, 12), d3 = gen(r_pg, far, 12);
+      // (at the prompt's end, or the multiple of the backend's prefill alignment before it: 320 with chunked GDN)
+      check(c3.usage.reused_tokens >= 256 && c3.usage.reused_tokens <= int(turn.size()) &&
+                d3.usage.reused_tokens == c3.usage.reused_tokens &&
+                c3.tokens.size() == 12 && d3.tokens == c3.tokens &&
+                pinned->api()->logits(r_pin.seq(), 0, lc.data()) == 0 &&
+                paged->api()->logits(r_pg.seq(), 0, ld.data()) == 0 && lc == ld,
+            "pageable_kv=on: the prompt's checkpoint restored (" + std::to_string(d3.usage.reused_tokens) + " of " +
+                std::to_string(far.size()) + " reused) gives pinned's tokens and logits");
     }
     // Batched rounds with pageable_kv=on.
     {
