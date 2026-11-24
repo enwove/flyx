@@ -174,31 +174,39 @@ bool want_from_json(const ojson& j, const EngineOptions& base, ModelHost::Want* 
     if (!j["name"].is_string()) return *err = "\"name\": model id string", false;
     out.name = j["name"].get<std::string>();
   }
+  bool mmproj_given = false;
   if (j.contains("mmproj")) {
     if (j["mmproj"].is_null()) {
       out.eo.mmproj_file.clear();
     } else {
       if (!j["mmproj"].is_string()) return *err = "\"mmproj\": path to vision projector GGUF", false;
       out.eo.mmproj_file = j["mmproj"].get<std::string>();
+      mmproj_given = !out.eo.mmproj_file.empty();
     }
   }
-  if (j.contains("vision") && !j["vision"].is_null()) {
+  const bool vision_given = j.contains("vision") && !j["vision"].is_null();
+  if (vision_given) {
     if (!j["vision"].is_boolean()) return *err = "\"vision\": true or false", false;
     out.eo.vision = j["vision"].get<bool>();
+  } else if (mmproj_given) {
+    out.eo.vision = true;
   }
+  if (!out.eo.vision) out.eo.mmproj_file.clear();
   if (j.contains("vision_device") && !j["vision_device"].is_null()) {
     if (!j["vision_device"].is_string()) return *err = "\"vision_device\": disk, host, gpu or auto", false;
     const std::string vd = j["vision_device"].get<std::string>();
-    if (!vd.empty() && vd != "disk" && vd != "file" && vd != "host" && vd != "cpu" && vd != "gpu" && vd != "auto")
-      return *err = "\"vision_device\": disk, host, gpu or auto", false;
-    out.eo.vision_device = vd.empty() ? "disk" : vd;
+    if (!interfaces::parse_vision_device(vd, nullptr, &out.eo.vision_device, err)) {
+      *err = "\"vision_device\": disk, host, gpu or auto";
+      return false;
+    }
   }
   if (j.contains("vision_quant") && !j["vision_quant"].is_null()) {
     if (!j["vision_quant"].is_string()) return *err = "\"vision_quant\": q8, exact or nvfp4", false;
     const std::string vq = j["vision_quant"].get<std::string>();
-    if (!vq.empty() && vq != "q8" && vq != "q8_0" && vq != "exact" && vq != "bf16" && vq != "nvfp4" && vq != "fp4")
-      return *err = "\"vision_quant\": q8, exact or nvfp4", false;
-    out.eo.vision_quant = vq.empty() ? "q8" : vq;
+    if (!interfaces::parse_vision_quant(vq, nullptr, &out.eo.vision_quant, err)) {
+      *err = "\"vision_quant\": q8, exact or nvfp4";
+      return false;
+    }
   }
   if (j.contains("vision_max_tokens")) {
     if (j["vision_max_tokens"].is_null()) {
@@ -447,7 +455,7 @@ ojson ModelHost::status() const {
              {"drafters", drafters_json(served_.sched ? fetched_.drafter_sources : std::vector<apps::DrafterSource>{}, "from")},
              {"suggested", drafters_json(served_.sched ? fetched_.suggested : std::vector<apps::DrafterSource>{}, "name")},
              {"vision_projector",
-              served_.sched && !fetched_.mmproj_source.empty()
+              served_.sched && served_.sched->has_vision() && !fetched_.mmproj_source.empty()
                   ? ojson({{"from", fetched_.mmproj_source},
                            {"size", fetched_.mmproj_size ? ojson(*fetched_.mmproj_size) : ojson(nullptr)}})
                   : ojson(nullptr)}};

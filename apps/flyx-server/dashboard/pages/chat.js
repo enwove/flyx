@@ -45,11 +45,20 @@ function ReplyMeta({ m }) {
   return html`<div class="cv-meta"><${CopyButton} get=${() => m.content}/>${vals.filter(Boolean).map((v) => html`<span>${t(v)}</span>`)}</div>`;
 }
 
+const MAX_IMG_BYTES = 32 * 1024 * 1024;
+const IMG_MIMES = new Set(["image/png", "image/jpeg", "image/bmp", "image/gif", "image/x-tga", "image/tga"]);
+const IMG_EXT = /\.(png|jpe?g|bmp|gif|tga|psd|ppm|pgm)$/i;
+const imgSupported = (f) => (f.type && IMG_MIMES.has(f.type.toLowerCase())) || IMG_EXT.test(f.name || "");
+const normVDev = (v) => (v === "host" || v === "cpu") ? "host" : v === "gpu" ? "gpu" : v === "auto" ? "auto" : "disk";
+const normVQuant = (v) => (v === "exact" || v === "bf16") ? "exact" : (v === "nvfp4" || v === "fp4") ? "nvfp4" : "q8";
+const dragHasFiles = (e) => !!(e.dataTransfer && Array.from(e.dataTransfer.types || []).includes("Files"));
+
 export function Chat({ active }) {
   // Messages as the page shows them: {role: "user", content, images?, imageCount?} or {role: "assistant", content, thinking, done, ...}.
   const [msgs, setMsgs] = useState([]);
   const [prompt, setPrompt] = useState("");
   const [images, setImages] = useState([]);  // [{name, url}] pending attachments
+  const [imgErr, setImgErr] = useState("");
   const [drag, setDrag] = useState(false);
   const [think, setThink] = useState(true);
   // The history: the conversations kept in this browser, the one shown among them ("" until its first message),
@@ -57,8 +66,10 @@ export function Chat({ active }) {
   const [chats, setChats] = useState(loadChats);
   const [chatId, setChatId] = useState("");
   const [histOpen, setHistOpen] = useState(false);
-  const controller = useRef(null), box = useRef(null), input = useRef(null), fileInput = useRef(null);
+  const controller = useRef(null), box = useRef(null), input = useRef(null), fileInput = useRef(null), readSeq = useRef(0);
   const streaming = !!controller.current;
+  const tm = live.last || {}, model = tm.model || {}, sl = (tm.memory && tm.memory.sessions) || [];
+  const hasVision = !!model.vision;
   // The conversation `id` in the history as `ms` has it now, at the top; untouched when nothing in it changed (one
   // only opened and read stays where it was).
   const keep = (id, ms) => setChats((old) => {
@@ -81,6 +92,9 @@ export function Chat({ active }) {
     return () => { document.removeEventListener("click", click); document.removeEventListener("keydown", esc); };
   }, [histOpen]);
   useEffect(() => { if (active && input.current) input.current.focus(); }, [active]);
+  useEffect(() => {
+    if (!hasVision) { readSeq.current++; setImages([]); setImgErr(""); setDrag(false); }
+  }, [hasVision]);
   useLayoutEffect(() => { if (box.current) box.current.scrollTop = box.current.scrollHeight; }, [msgs]);
 
   const update = (changes) => setMsgs((ms) => {
@@ -92,22 +106,33 @@ export function Chat({ active }) {
   });
 
   const addFiles = (fileList) => {
-    if (!fileList) return;
+    if (!fileList || !hasVision) return;
+    const valid = [];
+    let err = "";
     for (const file of Array.from(fileList)) {
-      if (!file.type || !file.type.startsWith("image/")) continue;
-      const reader = new FileReader();
-      reader.onload = () => {
-        if (typeof reader.result === "string")
-          setImages((old) => old.concat([{ name: file.name || "image", url: reader.result }]));
-      };
-      reader.readAsDataURL(file);
+      if (!file.type?.startsWith("image/") && !IMG_EXT.test(file.name || "")) continue;
+      if (!imgSupported(file)) { err = "Unsupported image format (use PNG, JPEG, BMP, or GIF)."; continue; }
+      if (file.size > MAX_IMG_BYTES) { err = "Image exceeds the 32 MiB size limit."; continue; }
+      valid.push(file);
     }
+    setImgErr(err);
+    if (!valid.length) return;
+    const seq = ++readSeq.current;
+    Promise.all(valid.map((file) => new Promise((resolve) => {
+      const reader = new FileReader();
+      reader.onload = () => resolve(typeof reader.result === "string" ? { name: file.name || "image", url: reader.result } : null);
+      reader.onerror = () => resolve(null);
+      reader.readAsDataURL(file);
+    }))).then((items) => {
+      if (seq !== readSeq.current) return;
+      const ok = items.filter(Boolean);
+      if (ok.length) setImages((old) => old.concat(ok));
+    });
   };
   const onPaste = (e) => {
-    const tm0 = live.last || {};
-    if (!(tm0.model && tm0.model.vision)) return;
+    if (!hasVision) return;
     const files = e.clipboardData && e.clipboardData.files;
-    if (files && files.length && Array.from(files).some((f) => f.type && f.type.startsWith("image/"))) {
+    if (files && files.length && Array.from(files).some((f) => (f.type && f.type.startsWith("image/")) || IMG_EXT.test(f.name || ""))) {
       e.preventDefault();
       addFiles(files);
     }
@@ -118,15 +143,18 @@ export function Chat({ active }) {
       if (m.content) parts.push({ type: "text", text: m.content });
       return { role: "user", content: parts };
     }
+    if (!m.content && m.imageCount) return { role: "user", content: "[Image]" };
     return { role: "user", content: m.content };
   };
 
   async function send() {
     const content = prompt.trim();
-    const attached = images.slice();
+    const attached = hasVision ? images.slice() : [];
     if ((!content && !attached.length) || controller.current) return;
+    readSeq.current++;
     setPrompt("");
     setImages([]);
+    setImgErr("");
     // What the model is sent: a turn that failed is left out with its question; a stopped reply goes as far as it got.
     const history = [];
     for (const m of msgs) {
@@ -201,13 +229,18 @@ export function Chat({ active }) {
   }
   const clear = () => {
     if (controller.current) controller.current.abort();
+    readSeq.current++;
     setMsgs([]);
     setImages([]);
+    setImgErr("");
     setChatId("");
   };
   const openChat = (c) => {
     if (controller.current) controller.current.abort();
+    readSeq.current++;
     setMsgs(c.msgs.map((m) => Object.assign({}, m)));
+    setImages([]);
+    setImgErr("");
     setChatId(c.id);
     setHistOpen(false);
     if (input.current) input.current.focus();
@@ -225,14 +258,12 @@ export function Chat({ active }) {
   };
   const key = (e) => { if (e.key === "Enter" && !e.shiftKey && !e.isComposing) { e.preventDefault(); send(); } };
 
-  const tm = live.last || {}, model = tm.model || {}, sl = (tm.memory && tm.memory.sessions) || [];
-  const hasVision = !!model.vision;
   const lr = (tm.recent || []).find((r) => r.label === "chat");
   const stat = [];
   if (model.context) stat.push(["context", ktok(sl.length ? sl[0].tokens : 0) + " / " + ktok(model.context)]);
   if (lr) stat.push(["last reply", fmt(lr.decode_tok_s, 1) + " tok/s"]);
   if (model.drafter) stat.push(["drafter", model.drafter]);
-  if (hasVision) stat.push(["vision", (model.vision_device || "disk") + " · " + (model.vision_quant || "q8")]);
+  if (hasVision) stat.push(["vision", t(normVDev(model.vision_device)) + " · " + normVQuant(model.vision_quant)]);
   return html`
     <div class="chat">
       <div class="histwrap">
@@ -245,7 +276,7 @@ export function Chat({ active }) {
             ${chats.map((c) => html`
               <div class=${"hist-row" + (c.id === chatId ? " sel" : "")} role="menuitem" tabindex="0" data-chat=${c.id} onClick=${() => openChat(c)}
                    onKeyDown=${(e) => { if (e.key === "Enter" && e.target === e.currentTarget) openChat(c); }}>
-                <span class="ht">${c.title}</span>
+                <span class="ht">${c.title === "[Image]" ? t("[Image]") : c.title}</span>
                 <span class="hm">${t(ago(c.at / 1000))} · ${t(c.msgs.length + (c.msgs.length === 1 ? " message" : " messages"))}</span>
                 <button class="iconbtn del" title=${t("Delete")} aria-label=${t("Delete")}
                         onClick=${(e) => { e.stopPropagation(); forget(c.id); }}><${Icon} name="trash"/></button>
@@ -270,17 +301,18 @@ export function Chat({ active }) {
       </div></div>
       <div class="composer">
         <div class=${"compose" + (drag ? " drag" : "")}
-             onDragOver=${(e) => { if (hasVision) { e.preventDefault(); setDrag(true); } }}
-             onDragLeave=${() => setDrag(false)}
-             onDrop=${(e) => { if (hasVision) { e.preventDefault(); setDrag(false); addFiles(e.dataTransfer && e.dataTransfer.files); } }}>
+             onDragOver=${(e) => { if (hasVision && dragHasFiles(e)) { e.preventDefault(); setDrag(true); } }}
+             onDragLeave=${(e) => { if (!e.currentTarget.contains(e.relatedTarget)) setDrag(false); }}
+             onDrop=${(e) => { setDrag(false); if (hasVision && dragHasFiles(e)) { e.preventDefault(); addFiles(e.dataTransfer.files); } }}>
           ${images.length ? html`<div class="compose-imgs" id="chat-imgs">${images.map((im, idx) => html`
             <div class="compose-thumb"><img src=${im.url} alt=${im.name || "image"}/>
               <button type="button" title=${t("Remove")} aria-label=${t("Remove")}
                       onClick=${() => setImages((old) => old.filter((_, j) => j !== idx))}><${Icon} name="close"/></button></div>`)}</div>` : ""}
+          ${imgErr ? html`<div class="compose-err" id="chat-imgerr">${t(imgErr)}</div>` : ""}
           <textarea id="prompt" rows="1" ref=${input} placeholder=${t(hasVision ? "Message FLYX, or paste / drop an image. Enter sends, Shift+Enter for a new line." : "Message FLYX. Enter sends, Shift+Enter for a new line.")}
                     value=${prompt} onInput=${(e) => setPrompt(e.target.value)} onKeyDown=${key} onPaste=${onPaste}></textarea>
           <div class="btns">
-            ${hasVision ? html`<input type="file" ref=${fileInput} accept="image/*" multiple hidden
+            ${hasVision ? html`<input type="file" ref=${fileInput} accept=".png,.jpg,.jpeg,.bmp,.gif,.tga,.psd,.ppm,.pgm,image/png,image/jpeg,image/bmp,image/gif" multiple hidden
                                       onChange=${(e) => { addFiles(e.target.files); e.target.value = ""; }}/>
               <button type="button" class="imgbtn" id="chat-img" disabled=${streaming} title=${t("Attach image")} aria-label=${t("Attach image")}
                       onClick=${() => fileInput.current && fileInput.current.click()}><${Icon} name="image"/></button>` : ""}

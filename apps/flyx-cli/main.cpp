@@ -170,6 +170,7 @@ Args parse(int argc, char** argv) {
     else bad_usage(!s.empty() && s[0] == '-' ? "unknown option " + s : "unexpected argument '" + s + "'");
   }
   sampling_overrides.apply(&a.sampling);
+  if (!a.images.empty() && a.cmd != "run") bad_usage("--image is only supported with 'flyx run'");
   return a;
 }
 
@@ -323,21 +324,24 @@ PreparedRequest prepare(Engine& e, const Session& s, const Request& rq, bool bra
 }
 
 int cmd_run(const Args& a) {
+  std::string err;
+  std::vector<std::shared_ptr<const interfaces::ImageInput>> loaded_images;
+  loaded_images.reserve(a.images.size());
+  for (const std::string& img_path : a.images) {
+    interfaces::ImageInput img;
+    if (!vision::load_image_file(img_path, &img, &err))
+      return std::fprintf(stderr, "error: %s\n", err.c_str()), 1;
+    loaded_images.push_back(std::make_shared<interfaces::ImageInput>(std::move(img)));
+  }
   auto e = load(a);
   Session s(e.get());
-  std::string err;
   if (!s.init(&err)) return std::fprintf(stderr, "error: %s\n", err.c_str()), 1;
   Request rq;
-  rq.chat = a.chat || !a.images.empty();
+  rq.chat = a.chat || !loaded_images.empty();
   rq.split_output = false;  // the reply as the model wrote it, thinking included
-  if (!a.images.empty()) {
+  if (!loaded_images.empty()) {
     ChatMessage um = msg("user", a.prompt);
-    for (const std::string& img_path : a.images) {
-      interfaces::ImageInput img;
-      if (!vision::load_image_file(img_path, &img, &err))
-        return std::fprintf(stderr, "error: %s\n", err.c_str()), 1;
-      um.parts.push_back(interfaces::ContentPart::make_image(std::make_shared<interfaces::ImageInput>(std::move(img))));
-    }
+    for (const auto& img : loaded_images) um.parts.push_back(interfaces::ContentPart::make_image(img));
     if (!a.prompt.empty()) um.parts.push_back(interfaces::ContentPart::make_text(a.prompt));
     rq.messages = {std::move(um)};
   } else if (a.chat) {
@@ -897,6 +901,7 @@ int run_command(int argc, char** argv) {
     const bool engine = a.cmd == "run" || a.cmd == "chat" || a.cmd == "bench";
     EngineOptions files_only;
     files_only.speculative = false;
+    files_only.vision = false;
     if (!apps::fetch_named(&a.model, engine ? &a.engine : &files_only, &err)) {
       std::fprintf(stderr, "error: %s\n", err.c_str());
       return 1;

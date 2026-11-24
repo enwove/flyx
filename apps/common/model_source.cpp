@@ -118,7 +118,7 @@ std::vector<LocalModel> scan_model_dirs(const std::vector<std::string>& dirs, in
       if (!gguf && !flyx) continue;
       std::string rel = from_path(it->path().lexically_relative(root));
       std::replace(rel.begin(), rel.end(), '\\', '/');
-      const bool is_mmproj = gguf && low.find("mmproj") != std::string::npos;
+      const bool is_mmproj = gguf && hub::mmproj_gguf_name(rel);
       if (gguf && !is_mmproj && !hub::model_gguf_name(rel)) continue;
       const fs::path canon = fs::weakly_canonical(it->path(), e2);
       if (e2 || !it->is_regular_file(e2) || e2 || !seen.insert(canon).second) continue;

@@ -121,13 +121,13 @@ Listed dir_entry(const apps::LocalModel& m) {
 // copy, else the newest snapshot's); then the model directories' files.
 std::vector<Listed> listing(const Server& s) {
   const std::vector<hub::Cached> snapshots = hub::cached();
-  std::set<std::string> repos_with_mtp;     // the repository's MTP layer is in the cache, in any snapshot
-  std::set<std::string> repos_with_mmproj;  // the repository's vision projector is in the cache, in any snapshot
+  std::set<std::string> repos_with_mtp;  // the repository's MTP layer is in the cache, in any snapshot
+  std::set<std::pair<std::string, std::string>> snaps_with_mmproj;  // (repo, commit) holding a vision projector
   for (const hub::Cached& c : snapshots) {
     hub::Repo r;
     r.files = c.files;
     if (hub::mtp_file(r)) repos_with_mtp.insert(c.repo);
-    if (hub::mmproj_file(r)) repos_with_mmproj.insert(c.repo);
+    if (hub::mmproj_file(r)) snaps_with_mmproj.insert({c.repo, c.commit});
   }
   std::vector<Listed> out;
   std::set<std::pair<std::string, std::string>> seen;  // (repository, path)
@@ -151,7 +151,9 @@ std::vector<Listed> listing(const Server& s) {
       l.json = {{"name", name + suffix}, {"kind", kind}, {"source", "hub"}, {"repo", c.repo}, {"quant", or_null(quant)},
                 {"file", file}, {"path", disk}, {"size", size}, {"modified", apps::modified_unix(modified)},
                 {"revision", c.commit}, {"current", c.current}, {"mtp", mtp},
-                {"mmproj", std::string(kind) == "gguf" && repos_with_mmproj.count(c.repo) ? ojson("in-repo") : ojson(nullptr)}};
+                {"mmproj", std::string(kind) == "gguf" && snaps_with_mmproj.count({c.repo, c.commit})
+                               ? ojson("in-repo")
+                               : ojson(nullptr)}};
       return l;
     };
     const std::vector<hub::GgufChoice> ggufs = hub::gguf_choices(r);
@@ -403,13 +405,35 @@ void add_manage_routes(httplib::Server& http, Server* s) {
     if (it->json["source"] == "dir")
       return error(r, 400, name + " is a file of a model directory of yours: flyx deletes only from the Hugging Face cache",
                    "invalid_request_error");
+    // When deleting the last model in a snapshot, also reclaim any unreferenced mmproj files in that snapshot
+    // (unless currently mounted by the served model).
+    int models_in_snap = 0;
+    for (const Listed& l : all)
+      if (l.json["source"] == "hub" && l.repo == it->repo && l.commit == it->commit) ++models_in_snap;
+    std::vector<std::pair<std::string, std::string>> orphan_mmproj;  // (repo-relative path, disk path)
+    if (models_in_snap == 1) {
+      for (const hub::Cached& c : hub::cached()) {
+        if (c.repo != it->repo || c.commit != it->commit) continue;
+        for (const hub::RepoFile& f : c.files) {
+          if (hub::mmproj_gguf_name(f.path)) {
+            const std::string disk = from_path((to_path(c.dir) / to_path(f.path)).make_preferred());
+            orphan_mmproj.emplace_back(f.path, disk);
+          }
+        }
+      }
+    }
     bool served = false, ok = false;
     uint64_t freed = 0;
     std::string err;
     const bool idle = s->host->with_files_in_use(
         [&](const std::vector<std::string>& used) {
           for (const std::string& f : it->on_disk) served = served || in_use(f, used);
-          if (!served) ok = hub::remove_cached(it->repo, it->commit, it->files, &freed, &err);
+          if (!served) {
+            std::vector<std::string> to_remove = it->files;
+            for (const auto& [rel, disk] : orphan_mmproj)
+              if (!in_use(disk, used)) to_remove.push_back(rel);
+            ok = hub::remove_cached(it->repo, it->commit, to_remove, &freed, &err);
+          }
         },
         &err);
     if (!idle) return error(r, 409, err, "conflict");

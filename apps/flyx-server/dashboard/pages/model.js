@@ -74,7 +74,7 @@ function Serving({ tm, again, retry, browse }) {
     if (loadedWant) facts.push(["KV cache", loadedWant.kv === "16" ? "16-bit" : loadedWant.kv === "fp8" ? "fp8" : "auto"]);
     facts.push(["Sessions", fmt(model.max_sessions)]);
     facts.push(["Drafting", model.drafter ? model.drafter + ", up to " + model.max_width : "off"]);
-    facts.push(["Vision", model.vision ? (model.vision_device || "disk") + " · " + (model.vision_quant || "q8") : "off"]);
+    facts.push(["Vision", model.vision ? t(normVisionDev(model.vision_device)) + " · " + normVisionQuant(model.vision_quant) : "off"]);
     if (model.load_s) facts.push(["Load time", secs(model.load_s)]);
     if (tm.memory && tm.memory.ledger_used) facts.push(["Memory", gib(tm.memory.ledger_used) + " GiB"]);
   }
@@ -130,7 +130,7 @@ function Serving({ tm, again, retry, browse }) {
       <div class="srv-dr" id="ld-drafters">${drafters.map((d) => html`
         <div class="dr"><span class="k">${d.kind === "mtp" ? "MTP" : d.kind === "dflash2" ? "DFlash2" : d.kind}</span>
           <span class="f">${(d.from === "model file" ? t("the model file's own layer") : d.from) + (d.size ? " · " + gb(d.size) + " GB" : "")}</span></div>`)}
-        ${model.loaded && !busy && (L.vision_projector || model.vision) ? html`
+        ${model.loaded && !busy && model.vision ? html`
         <div class="dr"><span class="k">${t("Vision")}</span>
           <span class="f">${(L.vision_projector && L.vision_projector.from ? L.vision_projector.from : t("model file")) +
             (L.vision_projector && L.vision_projector.size ? " · " + gb(L.vision_projector.size) + " GB" : "")}</span></div>` : ""}</div>
@@ -151,6 +151,7 @@ const normVisionQuant = (v) => (v === "exact" || v === "bf16") ? "exact" : (v ==
 
 // The settings of a want as the form shows them, for comparing with what is loaded.
 function shown(w) {
+  const vOn = w.vision !== false;
   return { ctx: w.ctx || "auto", kv: w.kv === "16" ? "16-bit" : w.kv === "fp8" ? "fp8" : "auto",
            kv_ram: typeof w.kv_ram === "number" ? w.kv_ram + " GB" : "auto", kv_gpu: typeof w.kv_gpu === "number" ? fmt(w.kv_gpu) : "as many as fit",
            name: w.name || "the file's name",
@@ -158,7 +159,7 @@ function shown(w) {
            width: w.width === null || w.width === undefined ? "auto" : String(w.width),
            head: w.draft_head === "full" ? "full head" : "1-bit pick", weights: w.draft_weights === "exact" ? "exact" : "compact copy",
            lookup: w.lookup !== false ? "on" : "off", trees: w.draft_trees ? "on" : "off",
-           vision: w.vision === false ? "off" : "on", mmproj: w.mmproj || "auto",
+           vision: vOn ? "on" : "off", mmproj: vOn ? (w.mmproj || "auto") : "auto",
            vision_device: normVisionDev(w.vision_device), vision_quant: normVisionQuant(w.vision_quant),
            vision_max_tokens: w.vision_max_tokens > 0 ? String(w.vision_max_tokens) : "auto" };
 }
@@ -194,9 +195,11 @@ function loadBody(chosen, f) {
                 draft_head: f.head || null, draft_weights: f.weights || null };
   const draft = f.draftSource === "saved" ? f.savedDraft : { drafter: own ? kindOf(own) : "", drafters: own ? [own] : [] };
   const mmproj = f.vision && f.visionSource === "custom" && f.mmproj.trim() ? f.mmproj.trim() : null;
-  const vmax = parseInt(f.vision_max_tokens, 10);
+  const vmaxRaw = String(f.vision_max_tokens).trim();
+  const vmax = vmaxRaw ? parseInt(vmaxRaw, 10) : NaN;
   const vis = { vision: f.vision, mmproj, vision_device: normVisionDev(f.vision_device),
-                vision_quant: normVisionQuant(f.vision_quant), vision_max_tokens: vmax >= 16 ? vmax : null };
+                vision_quant: normVisionQuant(f.vision_quant),
+                vision_max_tokens: Number.isFinite(vmax) && vmax > 0 ? vmax : null };
   // kv "auto": the engine's default, not the server's --kv (null would keep that)
   return Object.assign({ model: chosen, ctx, kv: f.kv || "auto", kv_ram: kvRam >= 0 ? kvRam : "auto",
                          kv_gpu: kvGpu >= 0 ? kvGpu : null, name: name || null, speculative: f.spec }, draft, adv, vis);
@@ -543,7 +546,7 @@ export function ModelPage({ active, libraryAsked, currentAsked }) {
   const pickVision = (source) => { if (!visOff) setF(Object.assign({}, f, { visionSource: source })); };
   const visDefault = () => {
     if (loadedWant && loadedWant.vision !== false && !loadedWant.mmproj) {
-      if (L.vision_projector && L.vision_projector.from)
+      if (model.vision && L.vision_projector && L.vision_projector.from)
         return { tag: "in use", tone: "ok", line: t("from " + L.vision_projector.from + (L.vision_projector.size ? " (" + gb(L.vision_projector.size) + " GB)" : "")) };
       if (model.vision) return { tag: "in use", tone: "ok", line: t("Loaded from the model file.") };
       return { tag: "none", tone: "", line: t("No vision projector loaded: text-only.") };
@@ -553,7 +556,7 @@ export function ModelPage({ active, libraryAsked, currentAsked }) {
   const vdflt = visDefault();
   const drafting = !use.spec ? "off" : use.draftSource === "custom" && use.drafter.trim() ? baseName(use.drafter.trim()) :
                    use.draftSource === "saved" ? "last loaded" : "default";
-  const visionBrief = !use.vision ? "off" : normVisionDev(use.vision_device) + " · " + normVisionQuant(use.vision_quant);
+  const visionBrief = !use.vision ? "off" : t(normVisionDev(use.vision_device)) + " · " + normVisionQuant(use.vision_quant);
   const brief = [["context", String(now.ctx)], ["KV", now.kv], ["drafting", drafting], ["vision", visionBrief]];
   const genChg = ["ctx", "kv", "kv_ram", "kv_gpu", "name"].filter((k) => changed.includes(k)).length;
   const specChg = ["spec", "drafter", "width", "head", "weights", "lookup", "trees"].filter((k) => changed.includes(k)).length;
@@ -561,7 +564,7 @@ export function ModelPage({ active, libraryAsked, currentAsked }) {
 
   function settingsView(cmdModel) {
     const specSum = !f.spec ? t("off") : f.draftSource === "custom" && own ? baseName(own) : f.draftSource === "saved" ? t("last loaded") : t("default");
-    const visSum = !f.vision ? t("off") : normVisionDev(f.vision_device) + " · " + normVisionQuant(f.vision_quant);
+    const visSum = !f.vision ? t("off") : t(normVisionDev(f.vision_device)) + " · " + normVisionQuant(f.vision_quant);
     return html`
       <div class="pane lset" id="mf-settings">
         <div class="lset-h">
@@ -569,10 +572,11 @@ export function ModelPage({ active, libraryAsked, currentAsked }) {
             <p class="lead">${t(loadedWant ? "What the next model loads with. The model being served takes a change when it is reloaded."
                                            : "What the next model loads with.")}</p></div>
           ${changed.length ? html`<span class="was">${t(changed.length + " changed")}</span>
-            <button class="linkbtn" id="mf-reset" onClick=${() => setF(formOf(loadedWant))}>${t("Reset to what is loaded")}</button>
+            <button class="linkbtn" id="mf-reset" onClick=${() => { setF(formOf(loadedWant)); setMsg(""); }}>${t("Reset to what is loaded")}</button>
             <button class="btn primary" id="mf-reload" disabled=${busy} onClick=${() => loadModel(loadedWant.model)}>
               ${t("Reload with these settings")}</button>` : ""}
         </div>
+        ${msg ? html`<div class="banner bad" id="mf-setmsg" style="margin-bottom: 12px">${t(msg)}</div>` : ""}
         <div class="lset-nav">
           <div class="seg lset-seg" role="tablist" id="lset-tabs">
             <button role="tab" data-stab="general" aria-selected=${String(stab === "general")} onClick=${() => setStab("general")}>
@@ -705,7 +709,7 @@ export function ModelPage({ active, libraryAsked, currentAsked }) {
                 <option value="nvfp4">${t("NVFP4 (compact)")}</option>
               </select><//>
             <${Field} k="vision_max_tokens" label="Max tokens / image" was=${was("vision_max_tokens")} hint="Cap merged visual tokens per image (empty: auto).">
-              <input type="number" id="vs-maxtok" min="16" step="64" placeholder=${t("auto")} disabled=${visOff}
+              <input type="number" id="vs-maxtok" min="16" step="1" placeholder=${t("auto")} disabled=${visOff}
                      value=${f.vision_max_tokens} onInput=${set("vision_max_tokens")}/><//>
           </div>
         </div>
@@ -1002,11 +1006,14 @@ export function ModelPage({ active, libraryAsked, currentAsked }) {
         ${loadBox(rows, rows.length ? "" : "Nothing here to load.")}`;
     }
     // Any other folder: the folders in it, the model files in it and under it.
-    const rows = j ? j.models.filter((m) => m.kind !== "mmproj").map((m) => {
+    const allModels = j ? j.models.filter((m) => m.kind !== "mmproj") : [];
+    const rows = allModels.map((m) => {
       const r = localRow(m), rel = j.kind === "dir" && m.path.length > j.path.length ? m.path.slice(j.path.length).replace(/^[\\/]+/, "") : m.file;
       return Object.assign(r, { sub: r.title === rel ? "" : rel });
-    }).filter((r) => hit(r.title + " " + r.sub)) : [];
-    const folderMmproj = j ? j.models.filter((m) => m.kind === "mmproj") : [];
+    }).filter((r) => hit(r.title + " " + r.sub));
+    const folderMmproj = j ? j.models.filter((m) => m.kind === "mmproj" && hit(m.file + " " + (m.path || ""))) : [];
+    const loadNote = start ? "Open a folder to see its model files."
+      : j && j.kind === "file" && folderMmproj.length ? "A vision projector is not loaded on its own." : "";
     return html`
       <div class="hub-scroll" id="lc-detail">
         ${bar}
@@ -1018,11 +1025,12 @@ export function ModelPage({ active, libraryAsked, currentAsked }) {
         ${j && !start ? html`
           <div class="dsec">${t("Model files")}<span>${t(j.kind === "dir" ? "here and two folders down" : "")}</span></div>
           ${rows.length ? html`<div class="mrows" id="mf-cached" role="listbox">${rowsView(rows)}</div>`
-                        : html`<div class="empty">${t(j.models.length ? "Nothing matches." : "No .gguf or .flyx model files here.")}</div>`}
+            : folderMmproj.length && j.kind === "file" ? ""
+            : html`<div class="empty">${t(allModels.length ? "Nothing matches." : "No .gguf or .flyx model files here.")}</div>`}
           ${folderMmproj.map((mm) => html`<div class="banner hint" style="margin-top: 10px"><div class="grow2">${t(mm.file + " is a vision projector (" + gb(mm.size) + " GB), not a standalone model: attach it to a compatible VLM.")}</div>
             ${model.id ? html`<button class="btn sm" onClick=${() => projectWith(mm.path || mm.name)}>${t("Use as projector")}</button>` : ""}</div>`)}` : ""}
       </div>
-      ${loadBox(rows, start ? "Open a folder to see its model files." : "")}`;
+      ${loadBox(rows, loadNote)}`;
   }
 
   const hubTab = tab === "hub";

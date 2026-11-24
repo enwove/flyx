@@ -103,14 +103,14 @@ bool engine_flag(const std::string& a, const std::function<std::string()>& value
     eo->vision_device = "disk";
   } else if (a == "--vision-device") {
     const std::string v = value();
-    if (v != "disk" && v != "file" && v != "auto" && v != "gpu" && v != "host" && v != "cpu")
-      std::fprintf(stderr, "error: --vision-device disk, host, gpu, or auto\n"), std::exit(2);
-    eo->vision_device = v;
+    std::string err;
+    if (!interfaces::parse_vision_device(v, nullptr, &eo->vision_device, &err))
+      std::fprintf(stderr, "error: %s\n", err.c_str()), std::exit(2);
   } else if (a == "--vision-quant") {
     const std::string v = value();
-    if (v != "exact" && v != "bf16" && v != "q8" && v != "q8_0" && v != "nvfp4" && v != "fp4")
-      std::fprintf(stderr, "error: --vision-quant q8, exact, or nvfp4\n"), std::exit(2);
-    eo->vision_quant = v;
+    std::string err;
+    if (!interfaces::parse_vision_quant(v, nullptr, &eo->vision_quant, &err))
+      std::fprintf(stderr, "error: %s\n", err.c_str()), std::exit(2);
   } else if (a == "--vision-max-tokens") {
     eo->vision_max_tokens = whole_flag("--vision-max-tokens", value(), 16, kMaxCtx);
   } else if (a == "--activations") {
