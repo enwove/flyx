@@ -132,7 +132,7 @@ std::string engine_flags_help(int ctx) {
          "                       others' in host memory, each copied to the GPU while the layers before it run\n"
          "                       (default: as many as fit)\n"
          "  --kv-method M       how rounds read the K/V: auto[:BITS] (the default: every position while the K/V\n"
-         "                       is on the GPU and up to 32,768 tokens past it, then strata; BITS default 2),\n"
+         "                       is on the GPU, then strata once it spills to host memory; BITS default 2),\n"
          "                       exact (every position, every step) or strata[:BITS] (a BITS-bit\n"
          "                       copy of every position on the GPU, the positions a row attends to most read again\n"
          "                       from the cache; BITS 2 to 4, default 2)\n"

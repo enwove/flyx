@@ -126,7 +126,7 @@ A target's own adapters (a **V-LoRA**: LoRA beside the target's linears, e.g. bi
 
 | Mode | Behavior | Quality vs Speed Trade-off |
 |---|---|---|
-| `auto` *(default, 2-bit)* | Exact attention while context ≤ `kv_gpu + 32,768`; switches automatically to 2-bit StrataFlux attention past that threshold (`strata_from`). Falls back to `exact` if StrataFlux copies don't fit alongside KV. | Exact at short/medium contexts; fast at 100K–500K+ tokens without scanning full host KV every step. |
+| `auto` *(default, 2-bit)* | Exact attention while context ≤ `kv_gpu`; switches automatically to 2-bit StrataFlux attention once KV spills to host RAM (`strata_from`). Falls back to `exact` if StrataFlux copies don't fit alongside KV. | Exact while KV fits on GPU; fast at long contexts without scanning full host KV every step. |
 | `exact` | Reads every KV position exactly at every step (including host-resident KV over PCIe). | Zero approximation; decode latency scales linearly with host-resident KV length (~0.67 ms/step per 1K host tokens on 27B over PCIe 5 x16). |
 | `strata[:2\|3\|4]` | Always scans a 2-, 3-, or 4-bit Walsh-Hadamard summary copy and refines the top attended key pairs (`strata_denom`, `strata_least=32`, `strata_most=256`) from exact FP8/FP16 KV (cached on GPU via `strata_hot=2048`). | 2-bit is default (smallest footprint, fastest 1-warp scan); `:3` or `:4` uses more memory for tighter approximation. |
 

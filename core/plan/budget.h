@@ -52,7 +52,7 @@ struct KvTiers {
   int copy_gpu = -1;
   uint64_t reserved = 0;
   int method = FLYX_KV_READ_ALL, method_arg = 0;  // how rounds read the K/V (flyx_seq_layout)
-  bool gpu_paged = false;  // the GPU's memory is Windows' to page (os::gpu_memory_paged): 512 MB more stays free
+  bool gpu_paged = false;  // the GPU's memory is Windows' to page (os::gpu_memory_paged): reserve at least 832 MiB
 };
 
 // The host memory kv_ram's auto leaves to the system and other programs, of a machine with `total_ram` bytes: a
