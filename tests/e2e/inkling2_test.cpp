@@ -310,8 +310,11 @@ struct TinySpec {
   std::vector<bool> is_swa = {true, false, true, false, true, false};
 };
 
-// Minimal Inkling-2 chat template exercising tojson(sort_keys=true), thinking, text, and tool invocation tags.
+// Minimal Inkling-2 chat template exercising tojson(sort_keys=true), thinking, text, and tool invocation tags, and
+// the thinking effort the real template writes (reasoning_effort, 0.9 unless given, "none" for no thinking).
 const char* kInkling2Template = R"jinja(
+{%- set eff = reasoning_effort if reasoning_effort is defined and reasoning_effort is not none else 0.9 -%}
+<|message_system|><|content_text|>Thinking effort level: {{ 0 if eff == 'none' else eff }}<|end_message|>
 {%- for m in messages -%}
 {%- if m.role == 'user' -%}
 <|message_user|><|content_text|>{{ m.content or '' }}<|end_message|>
@@ -717,6 +720,28 @@ void test_chat_and_format(const std::string& model_path) {
             rc.text.find(R"({"a": 2, "m": 3, "z": 1})") != std::string::npos,
         "tojson(sort_keys=true) sorted keys a, m, z in rendered prompt");
 
+  // Thinking switched off reaches the template as the effort it reads (it has no enable_thinking), unless the request
+  // names an effort itself.
+  {
+    auto effort = [&](bool thinking, const char* asked) {
+      ChatOptions o;
+      o.enable_thinking = thinking;
+      if (asked) o.kwargs["reasoning_effort"] = asked;
+      RenderedChat r;
+      std::string why;
+      if (!e->chat().render(msgs, tools, o, &r, &why, false)) return "error: " + why;
+      const std::string key = "Thinking effort level: ";
+      const size_t at = r.text.find(key);
+      if (at == std::string::npos) return std::string("not written");
+      return r.text.substr(at + key.size(), r.text.find("<|end_message|>", at) - at - key.size());
+    };
+    const std::string on = effort(true, nullptr), off = effort(false, nullptr), low = effort(false, "low"),
+                      none = effort(true, "none");
+    check(on == "0.9" && off == "0" && low == "low" && none == "0",
+          "thinking off is the template's effort none; a request's own effort stays (" + on + ", " + off + ", " + low +
+              ", " + none + ")");
+  }
+
   // Parse Inkling-2 reply with thinking, visible text, and tool call.
   auto parser = e->chat().parser(rc, &tools);
   std::string reasoning, content;
@@ -770,6 +795,7 @@ void test_chat_and_format(const std::string& model_path) {
       return ends;
     };
     const std::string thought = "<|message_model|><|content_thinking|>plan<|end_message|>";
+    const std::string hello = "<|message_model|><|content_text|>hello<|end_message|>";
     const std::string call = "<|message_model|>lookup<|content_invoke_tool_json|>"
                              "{\"name\":\"lookup\",\"args\":{\"a\":2}}<|end_message|>";
     const std::vector<int32_t> written = tok.encode(thought + call);
@@ -787,6 +813,17 @@ void test_chat_and_format(const std::string& model_path) {
     const std::string nested = "<|message_model|><|content_text|>a<|content_text|>b<|end_message|>";
     const size_t n = taken(auto_grm, nested, markers, &ends);
     check(n == 3 && !ends, "a section's text holds no marker (" + std::to_string(n) + " tokens taken)");
+    // Thinking switched off: the reply has no thinking section, with tools and without; left on, a reply with no
+    // tools is not held to anything.
+    ReplyRules quiet;
+    quiet.thinking = false;
+    const std::string quiet_text = e->chat().reply_grammar({}, quiet, rc);
+    const std::string quiet_tools = e->chat().reply_grammar(tools, quiet, rc);
+    check(e->chat().reply_grammar({}, ReplyRules{}, rc).empty() && admits(quiet_text, hello, markers) &&
+              !admits(quiet_text, thought + hello, markers) && admits(quiet_tools, hello, markers) &&
+              admits(quiet_tools, call, markers) && !admits(quiet_tools, thought + call, markers) &&
+              admits(auto_grm, thought + hello, markers) && admits(auto_grm, thought + call, markers),
+          "thinking off: text or calls, no thinking section; on: an optional one first");
   }
 
   // Round-trip tokenizer encode/decode on control tokens and text.

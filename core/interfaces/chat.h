@@ -123,6 +123,10 @@ struct ReplyRules {
   bool parallel = true;   // more than one call in a reply
   bool json = false;      // the answer is JSON matching `schema` (OpenAI response_format)
   ojson schema = true;    // json: true = any JSON value
+  // Whether the request left thinking on (ChatOptions::enable_thinking; the engine sets it for every chat request).
+  // Off, a format whose template cannot keep its model from thinking leaves the thinking out of the reply here
+  // (Inkling-2: its template writes an effort, and the model opens a thinking section at effort none too).
+  bool thinking = true;
 };
 
 // A piece of a reply, as the client sees it.
@@ -178,6 +182,10 @@ class Chat {
   // matches these by that text, as it matches ordinary tokens; any other special token it never takes.  None where
   // the markers are ordinary tokens (<think>, <tool_call>).
   virtual std::vector<std::string> reply_tokens() const { return {}; }
+  // Template variables that say what the engine's own options say, for a template that has other names for them:
+  // one with a thinking effort and no enable_thinking is given the effort of thinking switched off.  The request's
+  // own variables (ChatOptions::kwargs) come before these.
+  virtual ojson option_variables(const ChatOptions& opt) const { return ojson::object(); }
 
   // A renderer written for exactly this template (selected by its full
   // text): the bytes and literal spans the Jinja engine gives, hundreds of

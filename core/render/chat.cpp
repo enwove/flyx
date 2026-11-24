@@ -369,6 +369,11 @@ struct ChatTemplate::Impl {
     ctx.set_val("add_generation_prompt", jinja::mk_val<jinja::value_bool>(gen));
     if (!opt.kwargs.is_object() || !opt.kwargs.contains("enable_thinking"))
       ctx.set_val("enable_thinking", jinja::mk_val<jinja::value_bool>(opt.enable_thinking));
+    // The same options under the names this template reads them by, unless the request set those itself.
+    const ojson named = chat->option_variables(opt);
+    for (auto it = named.begin(); it != named.end(); ++it)
+      if (!opt.kwargs.is_object() || !opt.kwargs.contains(it.key()))
+        ctx.set_val(it.key(), to_jinja_value(it.value(), false, 0));
 
     jinja::runtime runtime(ctx);
     const jinja::value result = runtime.execute(program);

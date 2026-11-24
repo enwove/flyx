@@ -95,6 +95,13 @@ class Chat : public interfaces::Chat {
     return inkling2_ ? inkling2_reply_tokens() : std::vector<std::string>();
   }
 
+  // Inkling-2's template has no enable_thinking: it writes a thinking effort, 0.9 unless told (reasoning_effort),
+  // and "none" is its word for no thinking.
+  ojson option_variables(const interfaces::ChatOptions& opt) const override {
+    if (inkling2_ && !opt.enable_thinking) return {{"reasoning_effort", "none"}};
+    return ojson::object();
+  }
+
   bool native() const override { return family_ != nullptr; }
   bool render(std::span<const ChatMessage> msgs, const std::vector<ojson>& tools, const ChatOptions& opt,
               bool generation_prompt, RenderedChat* out, std::string* err) const override {

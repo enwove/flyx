@@ -66,7 +66,7 @@ All commands that load a model share the parser in `apps/common/engine_flags.cpp
 | `-p TEXT` / `-f FILE` | `run` | string / path | — | Prompt text or file path. |
 | `--image FILE` | `run` | path (repeatable) | none | Attach one or more local image files (PNG, JPEG, BMP, GIF, TGA) to the prompt (implies `--chat`; requires a loaded vision encoder via `--mmproj` or Hub auto-fetch). |
 | `--chat` | `run` | flag | off | Wrap prompt as a single user message through the chat template. |
-| `--no-think` | `run`, `chat`, `template`, `serve` | flag | off | Disable thinking block by default (`enable_thinking=false`); `bench` always runs without it. |
+| `--no-think` | `run`, `chat`, `template`, `serve` | flag | off | Disable thinking block by default (`enable_thinking=false`; a template that reads a thinking effort instead, Inkling-2's, is given its `reasoning_effort` `none`, and the reply is held to no thinking section); `bench` always runs without it. |
 | `-n N` | `run`, `chat`, `bench` | `≥ 0` | `256` | Maximum new tokens to generate. |
 | `--ignore-eos` | `run` | flag | off | Continue past EOS tokens until `-n` or context limit (`bench` always does). |
 | `--json [FILE]` | `bench` | flag, or path | off | Emit structured JSON benchmark output on stdout, or into `FILE` when the next argument is not an option. |

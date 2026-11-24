@@ -354,10 +354,16 @@ std::string inkling2_reply_grammar(const std::vector<ojson>& tools, const ReplyR
     }
   } else if (rules.json) {
     answer = json_text_section(rules.schema);
+  } else if (!rules.thinking) {
+    answer = text_section();  // nothing else to hold the reply to: only its thinking is left out
   } else {
     return "";
   }
-  ojson format = {{"type", "sequence"}, {"elements", ojson::array({thinking_section(), std::move(answer)})}};
+  // Thinking switched off: the template has no way to say so (it writes an effort, and the model opens a thinking
+  // section at effort none as well), so the reply has no thinking section to begin with.
+  ojson format = rules.thinking
+                     ? ojson{{"type", "sequence"}, {"elements", ojson::array({thinking_section(), std::move(answer)})}}
+                     : std::move(answer);
   return dump_safe({{"type", "structural_tag"}, {"format", std::move(format)}});
 }
 
