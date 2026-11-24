@@ -22,17 +22,17 @@ Produces the same internal representation exposed for `.flyx` files:
 - `header["tokenizer"]` + blobs (`tokenizer.vocab`, `tokenizer.merges`, `tokenizer.added`): `gpt2` byte-level BPE tables (`qwen35` and `qwen2` pre-tokenizers, NFC or no normalization).
 - `header["generation"]["eos_ids"]`: file EOS tokens plus `<|im_end|>` and `<|endoftext|>` when present in the vocabulary.
 - `chat_template.jinja`: embedded chat template.
-- **Tensors:** exposed under GGUF names with row-major shapes (reversing GGUF's fastest-dimension-first order) and types mapped to `backend_abi.h`: `F32`, `F16`, `BF16`, `F64`, `Q4_0`, `Q4_1`, `Q5_0`, `Q5_1`, `Q8_0`, `Q2_K`–`Q6_K`, `IQ1_S`, `IQ1_M`, `IQ2_XXS`, `IQ2_XS`, `IQ2_S`, `IQ3_XXS`, `IQ3_S`, `IQ4_NL`, `IQ4_XS`, and GGML `NVFP4` (type 40). Every block tensor row must be a whole number of blocks.
+- **Tensors:** exposed under GGUF names with row-major shapes (reversing GGUF's fastest-dimension-first order) and types mapped to `backend_abi.h`: `F32`, `F16`, `BF16`, `F64`, `Q2_0`, `Q4_0`, `Q4_1`, `Q5_0`, `Q5_1`, `Q8_0`, `Q2_K`–`Q6_K`, `IQ1_S`, `IQ1_M`, `IQ2_XXS`, `IQ2_XS`, `IQ2_S`, `IQ3_XXS`, `IQ3_S`, `IQ4_NL`, `IQ4_XS`, `MXFP4` (type 39), and GGML `NVFP4` (type 40). Every block tensor row must be a whole number of blocks.
 
-Refused cleanly at open time: unsupported GGUF version/endianness, a split file with a part missing or its split metadata inconsistent, incomplete models, unsupported tensor types (e.g., `MXFP4`), quantization version ≠ 2, or any length/offset overflow, truncation, overlap, or duplicate name.
+Refused cleanly at open time: unsupported GGUF version/endianness, a split file with a part missing or its split metadata inconsistent, incomplete models, unsupported tensor types, quantization version ≠ 2, or any length/offset overflow, truncation, overlap, or duplicate name.
 
 ---
 
-## Architecture Mapping (`models/qwen35/`, `models/qwen3/`)
+## Architecture Mapping (`models/qwen35/`, `models/qwen3/`, `models/inkling2/`)
 
-Both architectures read standard `llama.cpp` keys (`<arch>.block_count`, `embedding_length`, `feed_forward_length`, `attention.head_count`, `attention.head_count_kv`, `attention.key_length`, `rope.dimension_count`, `rope.freq_base`, `attention.layer_norm_rms_epsilon`; for Qwen3.5 also `ssm.group_count`, `ssm.time_step_rank`, `ssm.state_size`, `ssm.inner_size`, `ssm.conv_kernel`, `full_attention_interval` or `attention.recurrent_layers`, and `nextn_predict_layers`). A missing `output.weight` ties the output head to `token_embd.weight`. Scaled RoPE, sliding-window target attention, MoE experts, and scaled embeddings are refused.
+All architectures read standard `llama.cpp` keys (`<arch>.block_count`, `embedding_length`, `feed_forward_length`, `attention.head_count`, `attention.head_count_kv`, `attention.key_length`, `rope.dimension_count`, `rope.freq_base`, `attention.layer_norm_rms_epsilon`; for Qwen3.5 also `ssm.group_count`, `ssm.time_step_rank`, `ssm.state_size`, `ssm.inner_size`, `ssm.conv_kernel`, `full_attention_interval` or `attention.recurrent_layers`, and `nextn_predict_layers`; for Inkling-2 `inkling2_loop` also loop prelude/core/epilogue counts, AttnRes / loop-control metadata, ShortConv, relative-position-bias attention, sliding-window SWA layers, and sparse MoE expert routing / SiTU parameters). A missing `output.weight` ties the output head to `token_embd.weight`. Scaled RoPE and vision towers are refused.
 
-Sidecar drafters attach via `--drafter-file`: standalone MTP GGUFs (`MTP/mtp-*.gguf`) or DFlash2 checkpoints (HF directory or `.flyx`), sharing the target GGUF's packed embedding and output head.
+Sidecar drafters attach via `--drafter-file`: standalone MTP GGUFs (`MTP/mtp-*.gguf`), DFlash2 checkpoints (HF directory or `.flyx`), or DSpark GGUFs (`dspark-*.gguf`), sharing the target GGUF's packed embedding and output head.
 
 ### Qwen3.5 Layout Flags (Zero Weight Rewriting in `models/`)
 

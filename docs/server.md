@@ -34,8 +34,8 @@ All commands that load a model share the parser in `apps/common/engine_flags.cpp
 | `--kv-method` | `auto[:BITS]` \| `exact` \| `strata[:BITS]` | `auto` (`BITS=2`) | Decode KV read mode. `BITS` in `2..4` (default `2`). `auto`: exact attention up to `kv_gpu`, then StrataFlux once KV spills to host RAM; `exact`: exact attention everywhere; `strata`: StrataFlux everywhere. A file with a DV drafter reads exactly under `auto`, with `--drafter dv` or without (its trees read every position, and naming it changes no token); `strata` with DV drafting is refused. |
 | `--backend` | `cuda` \| `cpu_ref` | first available (`cuda`) | Backend shared library to load. Select GPU with `CUDA_VISIBLE_DEVICES`. |
 | `--backend-opt` | `K=V` (repeatable) | none | Backend-specific option (also `FLYX_BACKEND_OPTIONS=K=V,...`). Unknown keys fail load. |
-| `--drafter` | `mtp` \| `dflash2` \| `dv` \| `all` \| `none` | auto | Active drafters. Default enables all `--drafter-file` drafters plus the model's embedded MTP (or embedded DFlash2). Multiple active drafters are selected dynamically per round. A DV drafter (in a DV `.flyx` file, [DV](design/dv.md)) drafts only when named (`dv` or `all`): its warm-up, its trees of 15 and of the file's width, plain decoding and lookup rounds are then chosen every round. |
-| `--drafter-file` | `PATH` \| `HF_REPO` (repeatable) | none | Sidecar MTP GGUF (`MTP/mtp-*.gguf`) or DFlash2 drafter (`.flyx` or HF repo directory). |
+| `--drafter` | `mtp` \| `dflash2` \| `dv` \| `dspark` \| `all` \| `none` | auto | Active drafters. Default enables all `--drafter-file` drafters plus the model's embedded MTP (or embedded DFlash2). Multiple active drafters are selected dynamically per round. A DV drafter (in a DV `.flyx` file, [DV](design/dv.md)) drafts only when named (`dv` or `all`): its warm-up, its trees of 15 and of the file's width, plain decoding and lookup rounds are then chosen every round. |
+| `--drafter-file` | `PATH` \| `HF_REPO` (repeatable) | none | Sidecar MTP GGUF (`MTP/mtp-*.gguf`), DFlash2 drafter (`.flyx` or HF repo directory), or DSpark GGUF (`dspark-*.gguf`). |
 | `--width` | `N` (`0..64`) | adaptive | Pin model drafter width (up to drafter max). Prompt lookup still runs unless `--no-lookup`, but not beside a DV drafter: its widest tree of at most `N` drafts then runs every round. |
 | `--cycle` | `I,J,...` | off | Measurements and tests: launch these rounds in turn (indices into the rounds `-v` lists), no lookup round, instead of the controller's choice. An index past the rounds fails the load. |
 | `--no-spec` | flag | off | Disable all speculative decoding (drafters + lookup). |
@@ -109,7 +109,7 @@ Defined in `core/os/env.h` (plus CUDA / Python standard variables). Explicit CLI
 | `FLYX_BACKEND` | `cuda` \| `cpu_ref` | Default backend when `--backend` is unset. |
 | `FLYX_BACKEND_DIR` | path | Directory searched for `libflyx-*.so` / `libflyx-*.dll`. |
 | `FLYX_BACKEND_OPTIONS` | `K=V,K2=V2` | Prepended before `--backend-opt` flags. |
-| `FLYX_DRAFTER` | `mtp` \| `dflash2` \| `dv` \| `all` \| `none` | Default drafter mode when `--drafter` is unset. |
+| `FLYX_DRAFTER` | `mtp` \| `dflash2` \| `dv` \| `dspark` \| `all` \| `none` | Default drafter mode when `--drafter` is unset. |
 | `FLYX_ACTIVATIONS` | `exact` \| `nvfp4` | Default activation mode when `--activations` is unset. |
 | `FLYX_LOOKUP` | `0` \| `1` | Enable/disable prompt lookup (`0` = `--no-lookup`). |
 | `FLYX_DRAFT_TREES` | `0` \| `1` | Enable/disable DFlash2 draft trees (`1` = `--draft-trees`). |

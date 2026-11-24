@@ -1,6 +1,6 @@
 # Models, Drafters, and Long-Context Sizing
 
-Reference for supported model architectures (Qwen3.5 / Qwen3.8, Qwen3, Llama), file formats, Hugging Face Hub loading, speculative drafters, and GPU/RAM/disk KV sizing.
+Reference for supported model architectures (Qwen3.5 / Qwen3.8, Qwen3, Inkling-2, Llama), file formats, Hugging Face Hub loading, speculative drafters, and GPU/RAM/disk KV sizing.
 
 ---
 
@@ -8,7 +8,7 @@ Reference for supported model architectures (Qwen3.5 / Qwen3.8, Qwen3, Llama), f
 
 | Format | Supported Architectures | Supported Weight Types | Refused / Unsupported |
 |---|---|---|---|
-| **GGUF** (native, zero conversion) | `qwen35` (Qwen3.5 / Qwen3.8 hybrid GDN + gated attention), `qwen3` (dense) | `F32`, `F16`, `BF16`, `Q4_0`, `Q4_1`, `Q5_0`, `Q5_1`, `Q8_0`, `Q2_K`–`Q6_K`, `IQ1_S`, `IQ1_M`, `IQ2_XXS`, `IQ2_XS`, `IQ2_S`, `IQ3_XXS`, `IQ3_S`, `IQ4_NL`, `IQ4_XS`, mixed quants, GGML `NVFP4`; a split file (`-00001-of-0000N.gguf`) with all its parts in one folder | `MXFP4`, MoE experts, vision towers, sliding-window target attention, scaled RoPE |
+| **GGUF** (native, zero conversion) | `qwen35` (Qwen3.5 / Qwen3.8 hybrid GDN + gated attention), `qwen3` (dense), `inkling2_loop` (Inkling-2 looped ShortConv + RelAttn + sparse MoE) | `F32`, `F16`, `BF16`, `Q2_0`, `Q4_0`, `Q4_1`, `Q5_0`, `Q5_1`, `Q8_0`, `Q2_K`–`Q6_K`, `IQ1_S`, `IQ1_M`, `IQ2_XXS`, `IQ2_XS`, `IQ2_S`, `IQ3_XXS`, `IQ3_S`, `IQ4_NL`, `IQ4_XS`, mixed quants, `MXFP4`, GGML `NVFP4`; a split file (`-00001-of-0000N.gguf`) with all its parts in one folder | Vision towers (`mmproj`), scaled RoPE, Llama GGUFs |
 | **`.flyx`** (via `python/convert`) | Qwen3.5 / Qwen3.8, Qwen3, Llama (e.g. MiniCPM5-1B) | `BF16`, NVIDIA ModelOpt `NVFP4` | Vision / MoE; a Llama GGUF |
 
 Key execution properties:
@@ -41,17 +41,18 @@ flyx serve unsloth/Qwen3.8-27B-GGUF:UD-IQ2_S --drafter-file z-lab/Qwen3.8-27B-DF
 
 ## 3. Speculative Drafters
 
-`flyx` supports four drafter sources and can run multiple simultaneously; a per-round controller (`RoundChooser`) chooses the drafter and width dynamically from load-time measured costs and live acceptance rates.
+`flyx` supports five drafter sources and can run multiple simultaneously; a per-round controller (`RoundChooser`) chooses the drafter and width dynamically from load-time measured costs and live acceptance rates.
 
 | Drafter | Source | Notes |
 |---|---|---|
 | **MTP** (Multi-Token Prediction) | Embedded in GGUF/HF checkpoint, or sidecar `--drafter-file MTP/mtp-*.gguf` | Default when present. Shares target embedding/head. At long contexts (> 32K), uses 4096-token exact ring + 2-bit StrataFlux copy (`mtp_window`, `mtp_copy`). |
 | **DFlash2** (block diffusion) | HF repo (`--drafter-file z-lab/Qwen3.8-27B-DFlash2`) or converted `.flyx` | Beside GGUF weights, projections are quantized to Q8_0 (drafts only). Strongest on code/structured text; `--drafter dflash2` selects it exclusively. |
+| **DSpark** (block diffusion + Markov RNN head) | Sidecar GGUF (`--drafter-file dspark-Inkling-2-Mini-*.gguf`) | Companion 3-layer block-uniform SWA/Full drafter with autoregressive Markov refinement for `inkling2_loop`. Uses bounded per-layer binary16 KV rings (`window = 1025` on SWA layers, `mtp_window` ring on the Full layer above 32K) to cap drafter KV at ~28 MiB at any context length. |
 | **DV** (bifill-dv's canvas drafter) | A DV `.flyx` file: a Llama with bifill-dv's canvas and selector written in (`flyx_convert --dv`) | Only when named (`--drafter dv` or `all`). A canvas pass of the target's weights with its own adapter over 32 slots after the anchor, then a selector that grows a tree of the file's width (31) or of 15, verified exactly (rounds of up to 64 rows). Its warm-up, its trees of 15 and of 31, plain decoding and lookup rounds are chosen every round by tokens per ms at the context; `--width N` pins it. CUDA backend only; see [DV](design/dv.md). |
 | **Prompt Lookup** | Built-in (enabled by default) | Verifies 15 drafts copied from matching 6-token n-grams in the current sequence with zero drafter forward pass. Big speedup on agent code edits/repeats; backs off for 32 tokens after poor rounds (`--no-lookup` disables). |
 
 Control flags:
-- `--drafter mtp|dflash2|dv|all|none`
+- `--drafter mtp|dflash2|dv|dspark|all|none`
 - `--drafter-file PATH_OR_HF` (repeatable)
 - `--width N` (pin model drafter width; lookup remains active unless `--no-lookup`)
 - `--draft-trees` (opt-in DFlash2 dynamic trees; off by default)
