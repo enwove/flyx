@@ -114,7 +114,23 @@ jinja::value message_to_jinja(const ChatMessage& m) {
   obj->val_obj.reserve(5);
   obj->unordered.reserve(5);
   insert_input_lit(obj, "role", make_jinja_string(m.role, true));
-  insert_input_lit(obj, "content", make_jinja_string(m.content, true));
+  if (!m.parts.empty()) {
+    auto parts = jinja::mk_val<jinja::value_array>();
+    parts->val_arr.reserve(m.parts.size());
+    for (const auto& p : m.parts) {
+      auto item = jinja::mk_val<jinja::value_object>();
+      if (p.kind == ContentPart::kImage) {
+        insert_input_lit(item, "type", make_jinja_string("image", true));
+      } else {
+        insert_input_lit(item, "type", make_jinja_string("text", true));
+        insert_input_lit(item, "text", make_jinja_string(p.text, true));
+      }
+      parts->push_back(std::move(item));
+    }
+    insert_input_lit(obj, "content", std::move(parts));
+  } else {
+    insert_input_lit(obj, "content", make_jinja_string(m.content, true));
+  }
   if (m.reasoning) insert_input_lit(obj, "reasoning_content", make_jinja_string(*m.reasoning, true));
   if (!m.tool_calls.empty()) {
     auto calls = jinja::mk_val<jinja::value_array>();
@@ -231,16 +247,36 @@ void hash_chat_message(uint64_t& h, const ChatMessage& m) {
     hash_ojson(h, c.arguments);
   }
   hash_str(h, m.tool_call_id);
+  hash_u64(h, m.parts.size());
+  for (const auto& p : m.parts) {
+    hash_u64(h, static_cast<uint64_t>(p.kind));
+    if (p.kind == ContentPart::kImage && p.image) {
+      hash_bytes(h, p.image->sha256.data(), p.image->sha256.size());
+      hash_str(h, p.image->detail);
+    } else {
+      hash_str(h, p.text);
+    }
+  }
 }
 
 bool same_chat_message(const ChatMessage& a, const ChatMessage& b) {
   if (a.role != b.role || a.content != b.content || a.reasoning != b.reasoning || a.tool_call_id != b.tool_call_id ||
-      a.tool_calls.size() != b.tool_calls.size())
+      a.tool_calls.size() != b.tool_calls.size() || a.parts.size() != b.parts.size())
     return false;
   for (size_t i = 0; i < a.tool_calls.size(); ++i)
     if (a.tool_calls[i].id != b.tool_calls[i].id || a.tool_calls[i].name != b.tool_calls[i].name ||
         !same_ojson(a.tool_calls[i].arguments, b.tool_calls[i].arguments))
       return false;
+  for (size_t i = 0; i < a.parts.size(); ++i) {
+    const auto &pa = a.parts[i], &pb = b.parts[i];
+    if (pa.kind != pb.kind) return false;
+    if (pa.kind == ContentPart::kImage) {
+      if (!pa.image != !pb.image) return false;
+      if (pa.image && (pa.image->sha256 != pb.image->sha256 || pa.image->detail != pb.image->detail)) return false;
+    } else if (pa.text != pb.text) {
+      return false;
+    }
+  }
   return true;
 }
 
@@ -337,6 +373,7 @@ struct ChatTemplate::Impl {
     auto parts = jinja::runtime::gather_string_parts(result);
     out->text.clear();
     out->literal.clear();
+    out->images.clear();
     size_t total = 0;
     for (const auto& part : parts->val_str.parts) total += part.val.size();
     out->text.reserve(total);
@@ -347,6 +384,12 @@ struct ChatTemplate::Impl {
       if (!out->literal.empty() && out->literal.back().end == b) out->literal.back().end = out->text.size();
       else out->literal.push_back({b, out->text.size()});
     }
+    // Non-native Jinja path: preserve ordered images with sentinel offsets; request preparation
+    // resolves them against the vision adapter's literal placeholder token IDs.
+    for (size_t i = 0; i < count; ++i)
+      for (const auto& p : msgs[i].parts)
+        if (p.kind == ContentPart::kImage && p.image)
+          out->images.push_back({std::string::npos, std::string::npos, p.image});
   }
 
   // Where recent conversations ended (their text up to the generation

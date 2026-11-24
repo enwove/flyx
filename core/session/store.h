@@ -31,6 +31,8 @@
 #include <utility>
 #include <vector>
 
+#include "core/interfaces/chat.h"
+#include "core/interfaces/vision.h"
 #include "flyx/backend_abi.h"
 
 namespace flyx {
@@ -101,10 +103,13 @@ class SnapshotStore {
   struct History {
     std::vector<int32_t> tokens;
     std::string text;
+    std::vector<interfaces::MediaSpan> media{};
+    std::vector<interfaces::RenderedImage> images{};
   };
   struct Spill;
   struct Entry {
     std::vector<int32_t> prefix;  // the tokens before the snapshot's position (a prefix of history.tokens)
+    std::vector<interfaces::MediaSpan> media;  // multimodal spans within [0, prefix.size())
     std::shared_ptr<const History> history;  // shared by the checkpoints of one parked conversation
     std::vector<HostBuffer> pieces;  // `piece` bytes each, `bytes` in all; none while on disk
     std::vector<void*> at;           // their addresses, for view()
@@ -128,6 +133,7 @@ class SnapshotStore {
     uint64_t* disk_tip = nullptr;
     bool staging_only = false;
     const Entry* restore = nullptr;
+    const std::vector<interfaces::MediaSpan>* media = nullptr;
   };
   // Keeps checkpoint `slot` of `seq`, which holds `prefix`, of the
   // conversation `opts.history`.  A snapshot of the same tokens is replaced; the
@@ -144,7 +150,8 @@ class SnapshotStore {
   }
   // The snapshot holding the most tokens of `prompt`: more than `floor` and at
   // most `limit` of them.  Null: none.
-  const Entry* find(const std::vector<int32_t>& prompt, size_t limit, size_t floor);
+  const Entry* find(const std::vector<int32_t>& prompt, size_t limit, size_t floor,
+                    const std::vector<interfaces::MediaSpan>* media = nullptr);
   // The stored conversation whose history `text` continues furthest (the whole
   // history's text a prefix of it).  Null: none.
   const History* continued_by(const std::string& text);

@@ -88,6 +88,15 @@ struct GenerateRequest {
   std::function<void(int done, int total)> on_prefill;
   // Monitoring: called as each round is read, with the drafts it verified (its width) and the ones accepted.
   std::function<void(int drafted, int accepted)> on_round;
+  // Optional multimodal prefill payload (empty for text-only requests).
+  std::vector<interfaces::MediaSpan> media_spans;
+  std::vector<float> prompt_embeds;          // [prompt_embed_rows.size() * hidden], row-major
+  std::vector<int32_t> prompt_embed_rows;    // sorted ascending absolute token indices in `prompt`
+  std::vector<int32_t> pos_3d;               // optional [prompt.size() * 3] = (t, h, w) per token
+  int32_t rope_delta = 0;                    // scalar decode offset after prompt when has_mrope
+  bool has_mrope = false;
+  std::string rendered_text;                 // unexpanded template text (for multimodal history_text_)
+  std::vector<interfaces::RenderedImage> rendered_images;  // for multimodal PrefixCache routing
 };
 
 struct GenerateResult {

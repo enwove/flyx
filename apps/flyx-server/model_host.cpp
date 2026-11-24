@@ -34,6 +34,8 @@ ojson want_json(const ModelHost::Want& w) {
           {"lookup", w.eo.lookup},
           {"draft_head", w.draft_head.empty() ? ojson(nullptr) : ojson(w.draft_head)},
           {"draft_weights", w.draft_weights.empty() ? ojson(nullptr) : ojson(w.draft_weights)},
+          {"mmproj", w.eo.mmproj_file.empty() ? ojson(nullptr) : ojson(w.eo.mmproj_file)},
+          {"vision", w.eo.vision},
           {"name", w.name}};
 }
 
@@ -81,6 +83,7 @@ void save_settings(const ModelHost::Want& w) {
   ojson last = want_json(w);
   last["model"] = remember_path(w.model);
   for (size_t i = 0; i < w.drafters.size(); ++i) last["drafters"][i] = remember_path(w.drafters[i]);
+  if (!w.eo.mmproj_file.empty()) last["mmproj"] = remember_path(w.eo.mmproj_file);
   std::error_code ec;
   fs::create_directories(p.parent_path(), ec);
   fs::path tmp = p;
@@ -167,6 +170,14 @@ bool want_from_json(const ojson& j, const EngineOptions& base, ModelHost::Want* 
   if (j.contains("name") && !j["name"].is_null()) {
     if (!j["name"].is_string()) return *err = "\"name\": model id string", false;
     out.name = j["name"].get<std::string>();
+  }
+  if (j.contains("mmproj") && !j["mmproj"].is_null()) {
+    if (!j["mmproj"].is_string()) return *err = "\"mmproj\": path to vision projector GGUF", false;
+    out.eo.mmproj_file = j["mmproj"].get<std::string>();
+  }
+  if (j.contains("vision") && !j["vision"].is_null()) {
+    if (!j["vision"].is_boolean()) return *err = "\"vision\": true or false", false;
+    out.eo.vision = j["vision"].get<bool>();
   }
   // Drafting, as --width, --draft-trees and --no-lookup set it; absent or null: the server's own setting.
   if (j.contains("width") && !j["width"].is_null()) {
@@ -266,6 +277,7 @@ bool ModelHost::with_files_in_use(const std::function<void(const std::vector<std
     if (served_.sched) {
       in_use.push_back(fetched_.model);
       in_use.insert(in_use.end(), fetched_.drafters.begin(), fetched_.drafters.end());
+      if (!fetched_.mmproj.empty()) in_use.push_back(fetched_.mmproj);
     }
   }
   BusyGuard guard(this);
@@ -277,6 +289,7 @@ std::shared_ptr<Scheduler> ModelHost::open(const apps::Fetched& f, const EngineO
                                            std::string* err) const {
   EngineOptions eo = options;
   eo.drafter_files = f.drafters;
+  if (!f.mmproj.empty()) eo.mmproj_file = f.mmproj;
   std::fprintf(stderr, "flyx-server: loading %s\n", f.model.c_str());
   const double t0 = os::now_ms();
   std::shared_ptr<Scheduler> sched;
@@ -333,7 +346,8 @@ bool ModelHost::work(const Want& w, std::string* err) {
     std::lock_guard<std::mutex> lock(mu_);
     progress_ = p;
   });
-  if (!apps::fetch_model(w.model, w.drafters, apps::wants_mtp(w.eo), logged, &stop_, &f, err)) {
+  if (!apps::fetch_model(w.model, w.drafters, apps::wants_mtp(w.eo), logged, &stop_, &f, err, w.eo.mmproj_file,
+                         w.eo.vision)) {
     std::fprintf(stderr, "flyx-server: %s: %s\n", w.model.c_str(), err->c_str());
     std::lock_guard<std::mutex> lock(mu_);
     error_ = *err, state_ = served_.sched ? "ready" : "failed";

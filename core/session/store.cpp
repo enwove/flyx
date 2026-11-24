@@ -341,6 +341,8 @@ bool SnapshotStore::put(const flyx_backend_api* api, flyx_seq* seq, int slot, co
   uint64_t* disk_tip = opts.disk_tip;
   const bool staging_only = opts.staging_only;
   const Entry* restore = opts.restore;
+  static const std::vector<interfaces::MediaSpan> kEmptyMedia;
+  const auto& media = opts.media ? *opts.media : kEmptyMedia;
   reap();
   discard_failed_ranges();
   if (on_disk) *on_disk = false;
@@ -348,12 +350,13 @@ bool SnapshotStore::put(const flyx_backend_api* api, flyx_seq* seq, int slot, co
   if (staging_only && (!disk_enabled() || !disk_tip))
     return *why = "staging decoded rows requires a disk lineage", false;
   Entry* parent = disk_tip ? by_id(ancestor(*disk_tip, prefix.size())) : nullptr;
-  while (parent && (!std::equal(parent->prefix.begin(), parent->prefix.end(), prefix.begin()) ||
+  while (parent && (!interfaces::media_prefix_equal(parent->prefix, parent->media, prefix, media) ||
                     !available(*parent))) {
     if (!disk_enabled()) return *why = kDiskFailed, false;
     parent = by_id(parent->parent);
   }
-  if (parent && parent->prefix.size() == prefix.size() && (staging_only || !parent->staging_only)) {
+  if (parent && parent->prefix.size() == prefix.size() && parent->media == media &&
+      (staging_only || !parent->staging_only)) {
     if (history) parent->history = std::move(history);
     parent->used = ++clock_;
     *disk_tip = parent->disk_id;
@@ -372,9 +375,10 @@ bool SnapshotStore::put(const flyx_backend_api* api, flyx_seq* seq, int slot, co
     return *why = "keeping the incoming conversation's checkpoint", false;
   if (direct && !disk_enabled())
     return *why = "a snapshot of " + gb(bytes) + " does not fit the host cache of " + gb(budget_), false;
-  // A snapshot of the same tokens goes first: this one replaces it.
+  // A snapshot of the same tokens and media goes first: this one replaces it.
   for (size_t i = 0; i < entries_.size(); ++i)
-    if (!staging_only && entries_[i].get() != restore && !entries_[i]->disk_id && entries_[i]->prefix == prefix) {
+    if (!staging_only && entries_[i].get() != restore && !entries_[i]->disk_id &&
+        entries_[i]->prefix == prefix && entries_[i]->media == media) {
       drop(i);
       break;
     }
@@ -412,6 +416,7 @@ bool SnapshotStore::put(const flyx_backend_api* api, flyx_seq* seq, int slot, co
     bytes_ += bytes;
   }
   e->prefix = prefix;
+  e->media = media;
   e->history = std::move(history);
   e->bytes = bytes;
   e->used = ++clock_;
@@ -584,12 +589,15 @@ void SnapshotStore::own_memory() {
                  entries_.end());
 }
 
-const SnapshotStore::Entry* SnapshotStore::find(const std::vector<int32_t>& prompt, size_t limit, size_t floor) {
+const SnapshotStore::Entry* SnapshotStore::find(const std::vector<int32_t>& prompt, size_t limit, size_t floor,
+                                                const std::vector<interfaces::MediaSpan>* media) {
+  static const std::vector<interfaces::MediaSpan> kEmptyMedia;
+  const auto& pm = media ? *media : kEmptyMedia;
   const Entry* best = nullptr;
   for (const auto& e : entries_) {
     const size_t n = e->prefix.size();
     if (e->staging_only || n <= floor || n > limit || n > prompt.size() || (best && n < best->prefix.size())) continue;
-    if (std::equal(e->prefix.begin(), e->prefix.end(), prompt.begin()) && available(*e)) best = e.get();
+    if (interfaces::media_prefix_equal(e->prefix, e->media, prompt, pm) && available(*e)) best = e.get();
   }
   discard_failed_ranges();
   return best;
@@ -598,7 +606,7 @@ const SnapshotStore::Entry* SnapshotStore::find(const std::vector<int32_t>& prom
 const SnapshotStore::History* SnapshotStore::continued_by(const std::string& text) {
   const History* best = nullptr;
   for (const auto& e : entries_) {
-    if (e->staging_only || !e->history) continue;
+    if (e->staging_only || !e->history || !e->history->media.empty()) continue;
     const std::string& h = e->history->text;
     if (h.empty() || h.size() > text.size() || (best && h.size() < best->text.size())) continue;
     if (text.compare(0, h.size(), h) == 0 && available(*e)) best = e->history.get();

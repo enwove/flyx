@@ -66,6 +66,7 @@ struct Args {
   std::string json_file;    // --json FILE: the record goes there, not to stdout
   std::string prompts, suffix;  // bench --prompts FILE.jsonl, --suffix S
   int limit = 0;                // bench --limit N: the first N prompts of the set (0: all)
+  std::vector<std::string> images;   // run --image FILE (repeatable)
   std::vector<std::string> command;  // the command line, for a prompt set's record
   EngineOptions engine;     // the engine's options (apps/common/engine_flags.h)
   SamplingParams sampling;  // greedy unless --temperature
@@ -86,6 +87,7 @@ constexpr int kPromptSetMaxNew = 512;
                "       flyx monitor [URL] [--key KEY] [--interval S] [--once]   (a running server)\n"
                "  -p TEXT              prompt (run)\n"
                "  -f FILE              the prompt from a file (run; a long one: a command line holds 128 KB at most)\n"
+               "  --image FILE         attach an image file to the prompt (run, repeatable; implies --chat)\n"
                "  --chat               wrap the prompt as a user message (run)\n"
                "  --no-think           disable the thinking block in chat mode\n"
                "  -n N                 max new tokens (default 256)\n"
@@ -150,6 +152,7 @@ Args parse(int argc, char** argv) {
       if (!apps::read_text_file(path, &a.prompt))
         std::fprintf(stderr, "error: cannot read %s\n", path.c_str()), std::exit(2);
     } else if (s == "--chat") a.chat = true;
+    else if (s == "--image") a.images.push_back(next());
     else if (s == "--no-think") a.think = false;
     else if (s == "-n") a.n = apps::whole_flag("-n", next(), 0, INT_MAX), a.n_given = true;
     else if (s == "--ignore-eos") a.ignore_eos = true;
@@ -325,10 +328,23 @@ int cmd_run(const Args& a) {
   std::string err;
   if (!s.init(&err)) return std::fprintf(stderr, "error: %s\n", err.c_str()), 1;
   Request rq;
-  rq.chat = a.chat;
+  rq.chat = a.chat || !a.images.empty();
   rq.split_output = false;  // the reply as the model wrote it, thinking included
-  if (a.chat) rq.messages = {msg("user", a.prompt)};
-  else rq.text = a.prompt;
+  if (!a.images.empty()) {
+    ChatMessage um = msg("user", a.prompt);
+    for (const std::string& img_path : a.images) {
+      interfaces::ImageInput img;
+      if (!vision::load_image_file(img_path, &img, &err))
+        return std::fprintf(stderr, "error: %s\n", err.c_str()), 1;
+      um.parts.push_back(interfaces::ContentPart::make_image(std::make_shared<interfaces::ImageInput>(std::move(img))));
+    }
+    if (!a.prompt.empty()) um.parts.push_back(interfaces::ContentPart::make_text(a.prompt));
+    rq.messages = {std::move(um)};
+  } else if (a.chat) {
+    rq.messages = {msg("user", a.prompt)};
+  } else {
+    rq.text = a.prompt;
+  }
   rq.chat_options.enable_thinking = a.think;
   rq.gen.max_new_tokens = a.n;
   rq.gen.ignore_eos = a.ignore_eos;

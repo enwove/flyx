@@ -387,6 +387,13 @@ struct flyx_bmodel {
   flyx_seq* prefill_owner = nullptr;    // session whose strata pool currently occupies prefill_slab (under prefill_mu)
   bool prefill_dirty = false;           // true when prefill_slab was written by a strata session since last prefill
   size_t prefill_bytes = 0;
+  // Reusable device staging for multimodal prefill_ex (guarded by prefill_mu; allocated lazily on first VLM prefill).
+  float* prefill_embeds = nullptr;
+  size_t prefill_embeds_cap = 0;
+  int32_t* prefill_embed_rows = nullptr;
+  size_t prefill_embed_rows_cap = 0;
+  int32_t* prefill_pos3d = nullptr;
+  size_t prefill_pos3d_cap = 0;
   cudaEvent_t prefill_ev = nullptr;  // the last prefill pass that used prefill_bufs
   // Held from a pass's wait for prefill_ev to its record, and while the buffers are replaced: sessions on two
   // threads take them one pass after the other.
@@ -406,6 +413,9 @@ struct flyx_bmodel {
                    double(batch->rows) / batch->launched, batch->captured);
     batch.reset();  // its graphs and stream before the memory they use
     if (prefill_ev) cudaEventDestroy(prefill_ev);
+    if (prefill_embeds) cudaFree(prefill_embeds);
+    if (prefill_embed_rows) cudaFree(prefill_embed_rows);
+    if (prefill_pos3d) cudaFree(prefill_pos3d);
     flyx::cuda::prefill_vmm_free(this);
     for (void* p : prefill_allocs) cudaFree(p);
     for (void* p : allocs) cudaFree(p);
@@ -536,6 +546,7 @@ struct flyx_seq {
   struct Ckpt {
     bool valid = false;
     int pos = 0;
+    int rope_delta = 0;
   } ckp[FLYX_CHECKPOINTS];
 
   // drafter scratch
@@ -606,10 +617,13 @@ struct flyx_seq {
 
   // host mirror (valid whenever nothing is in flight)
   int position = 0, round = 0;
+  int rope_delta = 0;                 // scalar MRoPE offset for decode / follow-up text turns
+  int32_t prev_pos3d[3] = {0, 0, 0};  // last row's 3D position from previous multimodal prefill chunk (for MTP)
+  int prev_pos3d_at = -1;             // sequence position that prev_pos3d corresponds to (-1: none)
   // The GDN state and conv window at the last multiple of prefill_align the
   // last prefill pass crossed (pass_snap: where the pass in progress puts it),
   // in round slot snap_slot; -1: none.  Valid until the next pass or round.
-  int pass_snap = -1, snap_pos = -1, snap_slot = 0;
+  int pass_snap = -1, snap_pos = -1, snap_slot = 0, snap_rope_delta = 0;
   int want_snap = -1;  // prefill_snapshot's position for the next pass (-1: the last multiple it crosses)
   unsigned long long seq_no = 0, read_no = 0;
   struct PendingOp {
@@ -931,6 +945,12 @@ struct Pass {
   int strata = 0;        // a round's attention over the caches with a copy (flyx_seq::strata_phase): kStrataNone,
                          // kStrataAll, kStrataBoth
   int accept_width = -1; // override p->width for FLYX_NODE_ACCEPT inside adaptive verify branches (-1: p->width)
+  // Multimodal prefill_ex overrides (device pointers; null/0 on pure-text passes and all rounds).
+  const float* embeds = nullptr;
+  const int32_t* embed_rows = nullptr;
+  int n_embeds = 0;
+  const int32_t* pos_3d = nullptr;
+  const int32_t* mtp_pos_3d = nullptr;
   RowView v{};           // the rows it works on (rows_of(s) for a sequence's own pass)
   int width() const { return accept_width >= 0 ? accept_width : p->width; }
   bool reads_copy(const KvBuf& kb) const { return round && kb.kq && strata != kStrataNone; }
@@ -1026,6 +1046,9 @@ void reset_state(flyx_seq* s, int anchor);
 // starts from MASK (a prefill's CONTEXT, a rewind, a restore, a snapshot load); queued on st.
 void forget_canvas(flyx_seq* s, cudaStream_t st);
 int prefill(flyx_plan* p, flyx_seq* s, const int32_t* tokens, int32_t n, const flyx_gen_params* sample);
+int prefill_ex(flyx_plan* p, flyx_seq* s, const flyx_prefill_input* in, const flyx_gen_params* sample);
+int encode_vision(flyx_plan* p, const flyx_vision_input* in, float* out_embeds, int32_t out_cap_rows,
+                  int32_t* out_rows);
 int launch(flyx_plan* p, flyx_seq* s, const flyx_gen_params* g);
 // A greedy round of plan p on s, captured as launch() would and not kept: its graph's size (graph_room).
 GraphSize round_graph_size(flyx_plan* p, flyx_seq* s);

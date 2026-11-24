@@ -236,7 +236,8 @@ bool wants_mtp(const EngineOptions& eo) {
 }
 
 bool fetch_model(const std::string& model, const std::vector<std::string>& drafters, bool want_mtp,
-                 const hub::ProgressFn& progress, const std::atomic<bool>* stop, Fetched* out, std::string* err) {
+                 const hub::ProgressFn& progress, const std::atomic<bool>* stop, Fetched* out, std::string* err,
+                 const std::string& mmproj, bool want_vision) {
   *out = {};
   hub::Repo repo;
   if (!one(model, progress, stop, &out->model, &repo, err)) return false;
@@ -252,7 +253,19 @@ bool fetch_model(const std::string& model, const std::vector<std::string>& draft
         {drepo.id.empty() || !hub::is_drafter(drepo) ? drafter_kind(path) : "dflash2", drepo.id.empty() ? path : d,
          bytes_on_disk(path)});
   }
+  if (want_vision && !mmproj.empty()) {
+    if (!exists_on_disk(mmproj)) return *err = mmproj + ": no such vision projector file", false;
+    out->mmproj = mmproj;
+  }
   if (repo.id.empty()) return true;  // a path: nothing more to know
+  if (want_vision && out->mmproj.empty()) {
+    if (const hub::RepoFile* mm = hub::mmproj_file(repo)) {
+      std::vector<std::string> paths;
+      if (!hub::fetch(repo, {*mm}, &paths, progress, stop, err)) return false;
+      out->mmproj = paths[0];
+      out->notes.push_back("the vision projector from " + repo.id + "/" + mm->path);
+    }
+  }
   // unsloth keeps the MTP layer of GGUFs made without it in MTP/.
   const hub::RepoFile* mtp = hub::mtp_file(repo);
   if (want_mtp && mtp && own_mtp == 0) {
@@ -296,7 +309,8 @@ hub::ProgressFn make_progress_logger(const char* prefix, double interval_ms, hub
 bool fetch_named(std::string* model, EngineOptions* eo, std::string* err) {
   auto progress = make_progress_logger("flyx", 2000);
   Fetched f;
-  if (!fetch_model(*model, eo->drafter_files, wants_mtp(*eo), progress, nullptr, &f, err)) return false;
+  if (!fetch_model(*model, eo->drafter_files, wants_mtp(*eo), progress, nullptr, &f, err, eo->mmproj_file, eo->vision))
+    return false;
   if (f.model != *model) std::fprintf(stderr, "flyx: %s is %s\n", model->c_str(), f.model.c_str());
   for (size_t i = 0; i < eo->drafter_files.size() && i < f.drafters.size(); ++i)
     if (f.drafters[i] != eo->drafter_files[i])
@@ -304,6 +318,7 @@ bool fetch_named(std::string* model, EngineOptions* eo, std::string* err) {
   for (const std::string& n : f.notes) std::fprintf(stderr, "flyx: %s\n", n.c_str());
   *model = f.model;
   eo->drafter_files = f.drafters;
+  eo->mmproj_file = f.mmproj;
   return true;
 }
 

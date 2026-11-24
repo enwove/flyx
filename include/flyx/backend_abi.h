@@ -30,7 +30,7 @@
 extern "C" {
 #endif
 
-#define FLYX_BACKEND_ABI_VERSION 43u
+#define FLYX_BACKEND_ABI_VERSION 44u
 #define FLYX_BACKEND_ENTRY "flyx_backend_get_api"
 /* How a backend library exports its entry. */
 #if defined(_WIN32)
@@ -196,6 +196,20 @@ typedef struct {
   double offset, eps;
 } flyx_norm;
 
+/* Generalized norm for vision blocks (ABI 44): RMSNorm or LayerNorm with optional weight and bias. */
+typedef enum {
+  FLYX_NORM_RMS = 0,
+  FLYX_NORM_LAYER = 1
+} flyx_norm_kind;
+
+typedef struct {
+  int32_t kind;                        /* flyx_norm_kind */
+  int32_t w;                           /* weight [n], -1 = none */
+  int32_t b;                           /* bias [n], -1 = none */
+  int32_t pad0;
+  double offset, eps;
+} flyx_vnorm;
+
 /* A low-rank adapter on a linear y = W x (ABI 42): y = W x + scale b (a x), a [rank, in], b [out, rank], both bf16
  * (ABI 43: the scale; DV's canvas adapters have none, scale 1).  rank 0: none, as a block built zeroed has. */
 typedef struct {
@@ -269,7 +283,11 @@ typedef enum {
   FLYX_BLOCK_DFLASH2 = 7,
   FLYX_BLOCK_DFLASH2_LAYER = 8,
   FLYX_BLOCK_DV = 9,           /* ABI 42 */
-  FLYX_BLOCK_DV_LAYER = 10     /* ABI 42 */
+  FLYX_BLOCK_DV_LAYER = 10,    /* ABI 42 */
+  FLYX_BLOCK_VISION_STEM = 11, /* ABI 44: patch embed + optional bias + optional pos embed / cls */
+  FLYX_BLOCK_VIT_ATTN = 12,    /* ABI 44: bidirectional ViT self-attention */
+  FLYX_BLOCK_VIT_MLP = 13,     /* ABI 44: ViT FFN (2-layer standard or 3-layer gated) */
+  FLYX_BLOCK_VISION_MERGE = 14 /* ABI 44: spatial merge/pool + optional norm + 1/2-layer projector */
 } flyx_block_kind;
 
 /* Token rows -> residual rows: x = table[token]. */
@@ -297,6 +315,10 @@ typedef struct {
   /* ABI 43: the block's own adapters on q, k, v and o (flyx_linear order), in every pass that runs it (a V-LoRA,
    * python/convert --lora), all four or none, one rank; none with an output gate. */
   flyx_lora lora[4];
+  /* ABI 44: 3D Multimodal RoPE (Qwen3.5/3.8). mrope_section[0..2] = (T, H, W) frequency pair counts summing to
+   * rot_dim / 2 (all 0 = standard 1D RoPE). mrope_interleaved: 1 = interleaved T,H,W; 0 = contiguous chunks. */
+  int32_t mrope_section[3];
+  int32_t mrope_interleaved;
 } flyx_attn_block;
 
 /* Gated delta net, as ops/ops.h: from h = norm(x), mixed = qkv(h) through
@@ -435,6 +457,102 @@ typedef struct {
   int32_t canvas;                      /* state: FLYX_STATE_CANVAS */
 } flyx_dv_block;
 
+/* ---- Composable Vision Encoder Blocks (ABI 44) ----------------------------------
+ * Parameterized building blocks shared across vision-language architectures
+ * (Qwen3.5/3.8, SigLIP/Gemma3, Pixtral, InternVL, Llama4): adding a new VLM
+ * describes its vision encoder using these blocks and a FLYX_PHASE_VISION
+ * program under models/<arch>/ without changing any backend. */
+
+typedef enum {
+  FLYX_VACT_NONE = 0,
+  FLYX_VACT_GELU_TANH = 1,   /* 0.5 * x * (1 + tanh(sqrt(2/pi) * (x + 0.044715 * x^3))) */
+  FLYX_VACT_GELU = 2,        /* 0.5 * x * (1 + erf(x / sqrt(2))) */
+  FLYX_VACT_SILU = 3,
+  FLYX_VACT_QUICK_GELU = 4   /* x * sigmoid(1.702 * x) */
+} flyx_vact_kind;
+
+typedef enum {
+  FLYX_VPOS_NONE = 0,
+  FLYX_VPOS_ADD_FIXED = 1,   /* pos_w [N, hidden] added directly row-by-row */
+  FLYX_VPOS_BILINEAR_2D = 2  /* pos_w [pos_grid_h * pos_grid_w, hidden] bilinearly interpolated (align_corners=1)
+                              * and ordered into spatial-merge blocks of merge_size x merge_size */
+} flyx_vpos_kind;
+
+typedef enum {
+  FLYX_VROPE_NONE = 0,
+  FLYX_VROPE_AXIAL_2D = 1    /* 2D axial RoPE over patch (h, w) in spatial-merge order (first half H, second half W) */
+} flyx_vrope_kind;
+
+typedef enum {
+  FLYX_VMERGE_NONE = 0,
+  FLYX_VMERGE_SPATIAL_CONCAT = 1, /* merge_size^2 consecutive rows concatenated -> [N / m^2, hidden * m^2] */
+  FLYX_VMERGE_AVG_POOL_2D = 2     /* 2D average pool merge_size x merge_size per grid -> [N / m^2, hidden] */
+} flyx_vmerge_kind;
+
+/* Patch embedding linear (single weight or split temporal pair W0|W1 as in GGUF mmproj),
+ * optional bias, optional positional embedding addition, optional pre-norm. */
+typedef struct {
+  int32_t in_dim;            /* patch vector width (e.g. 1536 = 2 * 3 * 16 * 16) */
+  int32_t hidden;            /* ViT hidden width (e.g. 1152 on Qwen3.8-27B) */
+  int32_t patch_w;           /* [hidden, in_dim] (or first half [hidden, in_dim/2] when patch_w2 >= 0) */
+  int32_t patch_w2;          /* -1 = single weight; >= 0 = second temporal slice [hidden, in_dim/2] */
+  int32_t patch_b;           /* [hidden], -1 = none */
+  int32_t pos_mode;          /* flyx_vpos_kind */
+  int32_t pos_w;             /* [pos_grid_h * pos_grid_w, hidden], -1 = none */
+  int32_t pos_grid_h;        /* base grid height (e.g. 48) */
+  int32_t pos_grid_w;        /* base grid width (e.g. 48) */
+  int32_t merge_size;        /* spatial merge factor (e.g. 2) for BILINEAR_2D ordering */
+  int32_t cls_token;         /* optional [hidden] prepended per image (-1 = none) */
+  int32_t pad0;
+  flyx_vnorm pre_norm;       /* optional norm after pos_embed (w = -1: none) */
+} flyx_vision_stem_block;
+
+/* Bidirectional block-diagonal ViT self-attention: x += [layer_scale *] o(attn(rope(q), rope(k), v)) + o_b.
+ * Supports fused qkv or split q/k/v, optional biases, optional QK-norm, and arbitrary head_dim % 8 == 0. */
+typedef struct {
+  int32_t hidden, n_heads, head_dim;
+  int32_t rope_mode;         /* flyx_vrope_kind */
+  int32_t merge_size;        /* spatial merge factor for AXIAL_2D coordinates */
+  int32_t pad0;
+  double theta;              /* 2D RoPE base (e.g. 10000.0) */
+  flyx_vnorm norm;           /* pre-attention norm */
+  flyx_vnorm q_norm, k_norm; /* optional per-head Q/K norm (w = -1: none) */
+  int32_t qkv, qkv_b;        /* fused [3*nh*hd, hidden] & [3*nh*hd] (-1 if split q/k/v) */
+  int32_t q, k, v;           /* split [nh*hd, hidden] (-1 if fused qkv) */
+  int32_t q_b, k_b, v_b;     /* split biases (-1 = none) */
+  int32_t o, o_b;            /* [hidden, nh*hd] & [hidden] (-1 = none) */
+  int32_t layer_scale;       /* optional [hidden] residual scale (-1 = none) */
+  int32_t pad1;
+} flyx_vit_attn_block;
+
+/* ViT FFN: x += [layer_scale *] fc2(act(fc1(h)) [* up]) where h = norm(x). */
+typedef struct {
+  int32_t hidden, inter;
+  int32_t gated;             /* 0: fc2(act(fc1(h))); 1: fc2(act(gate(h)) * fc1(h)) */
+  int32_t act;               /* flyx_vact_kind */
+  flyx_vnorm norm;           /* pre-MLP norm */
+  int32_t fc1, fc1_b;        /* [inter, hidden] & [inter] (-1 = none) */
+  int32_t gate, gate_b;      /* gated=1: [inter, hidden] & [inter] (-1 if !gated) */
+  int32_t fc2, fc2_b;        /* [hidden, inter] & [hidden] (-1 = none) */
+  int32_t layer_scale;       /* optional [hidden] residual scale (-1 = none) */
+  int32_t pad0;
+} flyx_vit_mlp_block;
+
+/* Spatial merge / pooling + optional norm (before or after merge) + 1- or 2-layer projector to out_hidden. */
+typedef struct {
+  int32_t in_hidden;         /* ViT hidden width (e.g. 1152) */
+  int32_t merge_size;        /* spatial merge factor (e.g. 2) */
+  int32_t merge_mode;        /* flyx_vmerge_kind */
+  int32_t post_norm;         /* 0: norm before merge (width in_hidden); 1: norm after merge (width merged_dim) */
+  int32_t fc1_out;           /* intermediate dim of 2-layer projector (e.g. 4608), or 0 for 1-layer (fc2 only) */
+  int32_t out_hidden;        /* LLM hidden width (e.g. 5120) */
+  int32_t act;               /* flyx_vact_kind between fc1 and fc2 */
+  int32_t pad0;
+  flyx_vnorm norm;           /* post_ln (w = -1: none) */
+  int32_t fc1, fc1_b;        /* [fc1_out, merged_dim] & [fc1_out] (-1 if fc1_out == 0) */
+  int32_t fc2, fc2_b;        /* [out_hidden, fc1_out or merged_dim] & [out_hidden] (-1 = none) */
+} flyx_vision_merge_block;
+
 typedef struct {
   int32_t kind;                        /* flyx_block_kind */
   int32_t pad0;
@@ -449,6 +567,10 @@ typedef struct {
     flyx_dflash2_layer_block dflash2_layer;
     flyx_dv_block dv;                  /* ABI 42 */
     flyx_dv_layer_block dv_layer;      /* ABI 42 */
+    flyx_vision_stem_block vision_stem;   /* ABI 44 */
+    flyx_vit_attn_block vit_attn;         /* ABI 44 */
+    flyx_vit_mlp_block vit_mlp;           /* ABI 44 */
+    flyx_vision_merge_block vision_merge; /* ABI 44 */
   };
 } flyx_block;
 
@@ -486,7 +608,7 @@ typedef struct { int32_t kind, block, arg0, arg1; } flyx_node;
 
 /* ---- Program: what a backend is asked to run ---------------------------- */
 
-typedef enum { FLYX_PHASE_PREFILL = 0, FLYX_PHASE_ROUND = 1 } flyx_phase;
+typedef enum { FLYX_PHASE_PREFILL = 0, FLYX_PHASE_ROUND = 1, FLYX_PHASE_VISION = 2 } flyx_phase;
 
 typedef struct {
   int32_t phase;                /* flyx_phase */
@@ -696,6 +818,30 @@ typedef struct {
   uint64_t params_most, params_unknown;
 } flyx_graph_stats;
 
+/* Vision encoder input (ABI 44): flat patch rows and spatial-temporal grid metadata. */
+typedef struct {
+  const float* patches;        /* [n_patches, patch_dim] row-major float32 */
+  int32_t n_patches;
+  int32_t patch_dim;
+  const int32_t* grid_thw;     /* [n_grids * 3]: (T, H_patches, W_patches) per image/tile */
+  int32_t n_grids;
+  int32_t n_segs;              /* number of bidirectional attention segments */
+  const int32_t* cu_seqlens;   /* [n_segs + 1]: cumulative patch offsets (0 .. n_patches) */
+} flyx_vision_input;
+
+/* Extended prefill pass input (ABI 44): supports external embedding injection (vision/audio)
+ * and explicit 3D MRoPE coordinates with a decode-time scalar rope_delta. */
+typedef struct {
+  const int32_t* tokens;       /* [n] token IDs */
+  int32_t n;
+  int32_t n_embeds;            /* number of rows overridden by external embeddings (0 = text-only) */
+  const float* embeds;         /* [n_embeds, hidden] float32 embeddings (NULL if n_embeds == 0) */
+  const int32_t* embed_rows;   /* [n_embeds] sorted row indices in [0, n) receiving embeds[i] */
+  const int32_t* pos_3d;       /* [n * 3] (t, h, w) coordinates for 3D MRoPE (NULL = standard 1D) */
+  int32_t set_rope_delta;      /* 1: set sequence's decode rope_delta to `rope_delta` after this pass */
+  int32_t rope_delta;          /* offset added to 1D decode positions: pos_1d = seq_pos + rope_delta */
+} flyx_prefill_input;
+
 /* All functions return 0 on success unless stated otherwise; on failure
  * last_error() describes what happened. */
 typedef struct flyx_backend_api {
@@ -821,6 +967,15 @@ typedef struct flyx_backend_api {
    * the pass crosses, in place of the last one it crosses (a message boundary inside a pass then needs no pass of
    * its own); -1: the last one.  For the next prefill call only.  NULL: always the last one. */
   int (*prefill_snapshot)(flyx_seq* s, int32_t pos);
+  /* Stateless vision encoder execution (ABI 44): runs a FLYX_PHASE_VISION plan on `in` and writes
+   * [n_out_rows, out_hidden] float32 embeddings into `out_embeds` (capacity `out_cap_rows` rows).
+   * Writes actual output row count into `*out_rows` if non-NULL.  Waits for the device.
+   * NULL when the backend does not implement vision blocks. */
+  int (*encode_vision)(flyx_plan* vision_plan, const flyx_vision_input* in, float* out_embeds,
+                       int32_t out_cap_rows, int32_t* out_rows);
+  /* Extended prefill pass (ABI 44) supporting external embeddings (vision/audio) and 3D MRoPE positions.
+   * NULL: text-only backend (engine falls back to prefill() when inputs are text-only). */
+  int (*prefill_ex)(flyx_plan* p, flyx_seq* s, const flyx_prefill_input* in, const flyx_gen_params* sample);
 } flyx_backend_api;
 
 typedef const flyx_backend_api* (*flyx_backend_entry_fn)(void);

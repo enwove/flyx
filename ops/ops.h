@@ -15,3 +15,4 @@
 #include "ops/sampling/ref.h"
 #include "ops/draft/ref.h"
 #include "ops/canvas/ref.h"
+#include "ops/vision/ref.h"

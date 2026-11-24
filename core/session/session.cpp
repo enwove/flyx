@@ -35,20 +35,21 @@ bool Session::init(std::string* err) {
   return true;
 }
 
-size_t Session::common_prefix(const std::vector<int32_t>& prompt) const {
-  size_t L = 0;
-  while (L < prompt.size() && L < tokens_.size() && tokens_[L] == prompt[L]) ++L;
-  return L;
+size_t Session::common_prefix(const std::vector<int32_t>& prompt,
+                              const std::vector<interfaces::MediaSpan>* media) const {
+  static const std::vector<interfaces::MediaSpan> kEmptyMedia;
+  return interfaces::media_prefix_match(tokens_, media_, prompt, media ? *media : kEmptyMedia);
 }
 
 std::vector<int32_t> Session::tokenize(const std::string& text, const std::vector<TextSpan>* literal,
                                        std::string* how) const {
   const auto& tok = e_->tokenizer();
   // A history whose text this one continues keeps its tokens: this session's, else that of a conversation whose
-  // checkpoints are in the store (so they still match).
+  // checkpoints are in the store (so they still match). Text-only histories only; multimodal requests use
+  // prepare_request()'s media-aware path.
   const std::vector<int32_t>* kept = nullptr;
   size_t h = 0;
-  if (!history_text_.empty() && text.size() >= history_text_.size() &&
+  if (history_media_.empty() && !history_text_.empty() && text.size() >= history_text_.size() &&
       text.compare(0, history_text_.size(), history_text_) == 0) {
     kept = &history_;
     h = history_text_.size();
@@ -77,9 +78,12 @@ void Session::reset_after_error() {
   needs_reset_ = e_->api()->rewind(seq_, 0, 0) != 1;
   state_pos_ = 0;
   tokens_.clear();
+  media_.clear();
   rounds_.forget();
   history_.clear();
   history_text_.clear();
+  history_media_.clear();
+  history_images_.clear();
   cut_checkpoints(0);
 }
 
@@ -89,8 +93,11 @@ void Session::cut_checkpoints(int pos) {
   if (disk_tip_) disk_tip_ = store_->ancestor(disk_tip_, static_cast<size_t>(pos));
 }
 
-void Session::advanced(const std::vector<int32_t>& prompt, int pos) {
+void Session::advanced(const std::vector<int32_t>& prompt, int pos,
+                       const std::vector<interfaces::MediaSpan>* media) {
   tokens_.assign(prompt.begin(), prompt.begin() + pos);
+  if (media) media_ = interfaces::slice_media_prefix(*media, size_t(pos));
+  else media_.clear();
   state_pos_ = pos;
 }
 
@@ -103,20 +110,41 @@ void Session::record(const flyx_round_result& r, int round) {
 
 void Session::rolled_back(int pos) {
   tokens_.resize(size_t(pos) + 1);
+  media_ = interfaces::slice_media_prefix(media_, size_t(pos));
   rounds_.cut(tokens_.size());
   state_pos_ = pos;
   cut_checkpoints(pos);
 }
 
 void Session::publish(const std::vector<int32_t>& prompt, const std::vector<int32_t>& reply, size_t published,
-                      int32_t stop_token) {
+                      int32_t stop_token, const std::vector<interfaces::MediaSpan>* media,
+                      const std::string* rendered_text,
+                      const std::vector<interfaces::RenderedImage>* rendered_images) {
   history_ = prompt;
   history_.insert(history_.end(), reply.begin(), reply.begin() + static_cast<std::ptrdiff_t>(published));
   if (stop_token >= 0 && published == reply.size()) history_.push_back(stop_token);
-  history_text_ = e_->tokenizer().decode(history_);
+  if (media && !media->empty()) {
+    history_media_ = *media;
+    if (rendered_text && !rendered_text->empty()) {
+      std::vector<int32_t> tail(reply.begin(), reply.begin() + static_cast<std::ptrdiff_t>(published));
+      if (stop_token >= 0 && published == reply.size()) tail.push_back(stop_token);
+      history_text_ = *rendered_text + e_->tokenizer().decode(tail);
+    } else {
+      history_text_ = e_->tokenizer().decode(history_);
+    }
+    if (rendered_images) history_images_ = *rendered_images;
+    else history_images_.clear();
+  } else {
+    history_media_.clear();
+    history_images_.clear();
+    history_text_ = e_->tokenizer().decode(history_);
+  }
 }
 
-bool Session::take_checkpoint(const std::vector<int32_t>& prompt, int pos, bool keep, Anchor anchor, bool share) {
+bool Session::take_checkpoint(const std::vector<int32_t>& prompt, int pos, bool keep, Anchor anchor, bool share,
+                              const std::vector<interfaces::MediaSpan>* media) {
+  static const std::vector<interfaces::MediaSpan> kEmptyMedia;
+  const auto& pm = media ? *media : media_;
   // An empty slot, else the least recently used one; a kept checkpoint stays.
   int slot = -1;
   for (int c = 0; c < FLYX_CHECKPOINTS; ++c) {
@@ -130,7 +158,7 @@ bool Session::take_checkpoint(const std::vector<int32_t>& prompt, int pos, bool 
   if (slot < 0) return false;
   // The backend may keep an earlier position (a chunk boundary a fresh prefill reproduces exactly).
   const int at = e_->api()->checkpoint(seq_, slot);
-  if (at < 0 || at > pos) {
+  if (at < 0 || at > pos || interfaces::inside_media_span(pm, at)) {
     ck_[slot] = {};
     return false;
   }
@@ -138,11 +166,12 @@ bool Session::take_checkpoint(const std::vector<int32_t>& prompt, int pos, bool 
     for (auto& c : ck_) c.keep = false;
   if (anchor == Anchor::System)
     for (auto& c : ck_) c.system = false;
-  ck_[slot] = {true, {prompt.begin(), prompt.begin() + at}, ++ck_clock_, keep, anchor == Anchor::System};
+  ck_[slot] = {true, {prompt.begin(), prompt.begin() + at}, interfaces::slice_media_prefix(pm, size_t(at)),
+               ++ck_clock_, keep, anchor == Anchor::System};
   if (anchor != Anchor::None && disk_cache() && at > 0) {
     std::string why;
     store_->put(e_->api(), seq_, slot, ck_[slot].prefix, &why,
-                {.disk_tip = &disk_tip_, .staging_only = anchor == Anchor::Staging});
+                {.disk_tip = &disk_tip_, .staging_only = anchor == Anchor::Staging, .media = &ck_[slot].media});
   } else if (share) {
     share_checkpoint(slot, true);
   }
@@ -168,21 +197,22 @@ void Session::share_system_checkpoint() {
 void Session::share_checkpoint(int slot, bool spare_only) {
   if (!store_ || !store_->budget() || disk_cache()) return;  // disk anchors were saved during prefill
   const auto& prefix = ck_[slot].prefix;
+  const auto& media = ck_[slot].media;
   const size_t n = prefix.size();
-  if (n < kSnapshotWorth || store_->find(prefix, n, n - 1)) return;
+  if (n < kSnapshotWorth || store_->find(prefix, n, n - 1, &media)) return;
   uint64_t bytes = 0;
   if (spare_only && (e_->api()->snapshot_bytes(seq_, slot, 0, &bytes) != 0 ||
                      !store_->fits_without_eviction(bytes))) return;
   std::string why;
-  store_->put(e_->api(), seq_, slot, prefix, &why);
+  store_->put(e_->api(), seq_, slot, prefix, &why, {.media = &media});
 }
 
 int Session::save_to(SnapshotStore& store, std::string* why, const SnapshotStore::Entry* restore) {
   // The checkpoints of the tokens this session holds now: the one kept through tool turns, and the newest.
   auto current = [&](int c) {
     const Ckpt& k = ck_[c];
-    return k.valid && k.prefix.size() >= kSnapshotWorth && k.prefix.size() <= tokens_.size() &&
-           std::equal(k.prefix.begin(), k.prefix.end(), tokens_.begin());
+    return k.valid && k.prefix.size() >= kSnapshotWorth &&
+           interfaces::media_prefix_equal(k.prefix, k.media, tokens_, media_);
   };
   int kept = -1, newest = -1;
   for (int c = 0; c < FLYX_CHECKPOINTS; ++c) {
@@ -195,7 +225,10 @@ int Session::save_to(SnapshotStore& store, std::string* why, const SnapshotStore
   why->clear();
   if (newest < 0) return 0;
   // Both checkpoints describe the same conversation when this session gives up its slot.
-  auto history = history_text_.empty() ? nullptr : std::make_shared<const SnapshotStore::History>(history_, history_text_);
+  auto history = history_text_.empty()
+                     ? nullptr
+                     : std::make_shared<const SnapshotStore::History>(
+                           SnapshotStore::History{history_, history_text_, history_media_, history_images_});
   // Disk ranges build from the earlier checkpoint. In RAM the last insertion survives eviction,
   // so give the protected question priority when the budget can hold only one of the two.
   const bool disk = store.disk_enabled();
@@ -205,7 +238,8 @@ int Session::save_to(SnapshotStore& store, std::string* why, const SnapshotStore
     bool on_disk = false;
     uint64_t tip = current_tip ? store.ancestor(current_tip, ck_[c].prefix.size()) : 0;
     const bool ok = store.put(e_->api(), seq_, c, ck_[c].prefix, &w,
-                              {.history = history, .on_disk = &on_disk, .disk_tip = &tip, .restore = restore});
+                              {.history = history, .on_disk = &on_disk, .disk_tip = &tip, .restore = restore,
+                               .media = &ck_[c].media});
     if (ok && (c == newest || !current_tip)) current_tip = tip;
     if (ok) longest = std::max(longest, static_cast<int>(ck_[c].prefix.size()));
     *why += (why->empty() ? "" : "; ") + (ok ? "kept " + std::to_string(ck_[c].prefix.size()) + " tokens " +
@@ -218,10 +252,11 @@ int Session::save_to(SnapshotStore& store, std::string* why, const SnapshotStore
 
 // A matching snapshot's restored position, or no value if none was tried. An incomplete read can already have
 // changed the sequence, so rewind it to zero before trying a shorter snapshot or starting a fresh prefill.
-std::optional<int> Session::load_snapshot(const std::vector<int32_t>& prompt, int limit, int floor, std::string* how,
+std::optional<int> Session::load_snapshot(const std::vector<int32_t>& prompt, int limit, int floor,
+                                         const std::vector<interfaces::MediaSpan>& media, std::string* how,
                                          std::string* err) {
   if (!store_ || limit <= floor) return std::nullopt;
-  const SnapshotStore::Entry* e = store_->find(prompt, size_t(limit), size_t(floor));
+  const SnapshotStore::Entry* e = store_->find(prompt, size_t(limit), size_t(floor), &media);
   if (!e) return std::nullopt;
   std::string first_failure;
   int pos = 0;
@@ -236,6 +271,7 @@ std::optional<int> Session::load_snapshot(const std::vector<int32_t>& prompt, in
     if (first_failure.empty()) first_failure = why;
     state_pos_ = 0;
     tokens_.clear();
+    media_.clear();
     rounds_.forget();
     cut_checkpoints(0);
     if (e_->api()->rewind(seq_, 0, prompt.front()) != 1) {
@@ -244,7 +280,7 @@ std::optional<int> Session::load_snapshot(const std::vector<int32_t>& prompt, in
       return -1;
     }
     needs_reset_ = false;
-    e = failed_end ? store_->find(prompt, failed_end - 1, 0) : nullptr;
+    e = failed_end ? store_->find(prompt, failed_end - 1, 0, &media) : nullptr;
   }
   if (!e) {
     *how = "recomputed from the start after an incomplete snapshot: " + first_failure;
@@ -256,6 +292,7 @@ std::optional<int> Session::load_snapshot(const std::vector<int32_t>& prompt, in
   disk_tip_ = e->disk_id;
   state_pos_ = pos;
   tokens_.assign(prompt.begin(), prompt.begin() + pos);
+  media_ = e->media;
   rounds_.forget();
   *how = "loaded a snapshot from " + std::string(from_disk ? "disk" : "host memory") + " at token " +
          std::to_string(pos);
@@ -263,13 +300,14 @@ std::optional<int> Session::load_snapshot(const std::vector<int32_t>& prompt, in
   return pos;
 }
 
-std::pair<int, int> Session::checkpoint_for(const std::vector<int32_t>& prompt, int limit) const {
+std::pair<int, int> Session::checkpoint_for(const std::vector<int32_t>& prompt, int limit,
+                                            const std::vector<interfaces::MediaSpan>& media) const {
   int best = -1, best_pos = 0;
   for (int c = 0; c < FLYX_CHECKPOINTS; ++c) {
     const auto& ck = ck_[c];
     const int pos = static_cast<int>(ck.prefix.size());
     if (!ck.valid || pos > limit || pos <= best_pos) continue;
-    if (std::equal(ck.prefix.begin(), ck.prefix.end(), prompt.begin())) {
+    if (interfaces::media_prefix_equal(ck.prefix, ck.media, prompt, media)) {
       best = c;
       best_pos = pos;
     }
@@ -277,19 +315,25 @@ std::pair<int, int> Session::checkpoint_for(const std::vector<int32_t>& prompt, 
   return {best, best_pos};
 }
 
-void Session::park_for(const std::vector<int32_t>& prompt, std::string* why) {
+void Session::park_for(const std::vector<int32_t>& prompt, std::string* why,
+                       const std::vector<interfaces::MediaSpan>* media) {
   if (!store_ || prompt.empty()) return;
-  const int shared = static_cast<int>(std::min(prompt.size() - 1, common_prefix(prompt)));
+  static const std::vector<interfaces::MediaSpan> kEmptyMedia;
+  const auto& pm = media ? *media : kEmptyMedia;
+  const int shared = static_cast<int>(std::min(prompt.size() - 1, common_prefix(prompt, &pm)));
   // A deep edit may be outside the backend's rewind window. Until prepare tries it, only the matching
   // local checkpoint is guaranteed to survive; parking must leave a better stored one available.
-  const int floor = state_pos_ <= shared ? state_pos_ : checkpoint_for(prompt, shared).second;
-  const auto* restore = store_->find(prompt, prompt.size() - 1, floor);
+  const int floor = state_pos_ <= shared ? state_pos_ : checkpoint_for(prompt, shared, pm).second;
+  const auto* restore = store_->find(prompt, prompt.size() - 1, floor, &pm);
   save_to(*store_, why, restore);
 }
 
 // Bring the device state to the longest usable prefix of `prompt`.  Returns
 // the number of prompt tokens already in the state, or -1.
-int Session::prepare(const std::vector<int32_t>& prompt, std::string* how, std::string* err) {
+int Session::prepare(const std::vector<int32_t>& prompt, std::string* how, std::string* err,
+                     const std::vector<interfaces::MediaSpan>* media) {
+  static const std::vector<interfaces::MediaSpan> kEmptyMedia;
+  const auto& pm = media ? *media : kEmptyMedia;
   const auto* api = e_->api();
   if (needs_reset_) {
     if (api->rewind(seq_, 0, prompt.front()) != 1) {
@@ -299,13 +343,14 @@ int Session::prepare(const std::vector<int32_t>& prompt, std::string* how, std::
     needs_reset_ = false;
   }
   const int n = static_cast<int>(prompt.size());
-  const int common = static_cast<int>(common_prefix(prompt));
+  const int common = static_cast<int>(common_prefix(prompt, &pm));
   const int L = std::min(common, n - 1);  // the last prompt token must run to produce the first output
   if (state_pos_ <= L) {
     // A stored snapshot may hold more of the prompt than the live state (any of it but the last token).
-    if (auto got = load_snapshot(prompt, n - 1, state_pos_, how, err)) return *got;
+    if (auto got = load_snapshot(prompt, n - 1, state_pos_, pm, how, err)) return *got;
     *how = state_pos_ == 0 ? (tokens_.empty() ? "cold start" : "nothing reusable") : "continued the live state";
     tokens_.resize(state_pos_);
+    media_ = interfaces::slice_media_prefix(pm, size_t(state_pos_));
     rounds_.cut(tokens_.size());
     return state_pos_;
   }
@@ -315,6 +360,7 @@ int Session::prepare(const std::vector<int32_t>& prompt, std::string* how, std::
     needs_reset_ = true;
     state_pos_ = 0;
     tokens_.clear();
+    media_.clear();
     rounds_.forget();
     cut_checkpoints(0);
     *err = std::string("rewind: ") + (api->last_error() ? api->last_error() : "rewind failed");
@@ -324,9 +370,10 @@ int Session::prepare(const std::vector<int32_t>& prompt, std::string* how, std::
     state_pos_ = L;
     cut_checkpoints(L);
     tokens_.resize(L);
+    media_ = interfaces::slice_media_prefix(pm, size_t(L));
     rounds_.cut(tokens_.size());
     // A stored snapshot may hold more of the prompt than the session shares with it (another conversation's).
-    if (auto got = load_snapshot(prompt, n - 1, L, how, err)) {
+    if (auto got = load_snapshot(prompt, n - 1, L, pm, how, err)) {
       if (*got > 0) *how += at;
       return *got;
     }
@@ -334,10 +381,10 @@ int Session::prepare(const std::vector<int32_t>& prompt, std::string* how, std::
     return L;
   }
   // Outside the rollback window: newest usable checkpoint, else from scratch.
-  const auto [best, best_pos] = checkpoint_for(prompt, L);
+  const auto [best, best_pos] = checkpoint_for(prompt, L, pm);
   state_pos_ = 0;
   // A stored snapshot may hold more of the prompt than any checkpoint here.
-  if (auto got = load_snapshot(prompt, n - 1, best_pos, how, err)) {
+  if (auto got = load_snapshot(prompt, n - 1, best_pos, pm, how, err)) {
     if (*got > 0) *how += at;
     return *got;
   }
@@ -349,6 +396,7 @@ int Session::prepare(const std::vector<int32_t>& prompt, std::string* how, std::
     *how = "recomputed from the start" + at + ", no checkpoint at or before it";
   }
   tokens_.assign(prompt.begin(), prompt.begin() + state_pos_);
+  media_ = interfaces::slice_media_prefix(pm, size_t(state_pos_));
   cut_checkpoints(state_pos_);
   rounds_.cut(tokens_.size());
   return state_pos_;

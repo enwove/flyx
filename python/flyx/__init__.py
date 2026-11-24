@@ -28,7 +28,7 @@ __all__ = [
 
 # The version of the C API the structures below mirror (FLYX_API_VERSION in include/flyx/flyx.h): they
 # change together.  A library of another version lays its structs out differently, so it is refused when loaded.
-_API_VERSION = 2
+_API_VERSION = 3
 
 FLYX_EVENT_TEXT = 1
 FLYX_EVENT_DONE = 2
@@ -60,7 +60,7 @@ class _LoadOpts(C.Structure):
                 ("speculative", C.c_int32), ("verbose", C.c_int32), ("drafter", C.c_char_p), ("width", C.c_int32),
                 ("prefill_chunk", C.c_int32), ("kv", C.c_int32),
                 ("backend_options", C.c_char_p), ("activations", C.c_char_p), ("chat_template", C.c_char_p),
-                ("drafter_file", C.c_char_p)]
+                ("drafter_file", C.c_char_p), ("mmproj_file", C.c_char_p), ("no_vision", C.c_int32)]
 
 
 class _Msg(C.Structure):
@@ -152,7 +152,8 @@ class Engine:
                  speculative: bool = True, verbose: bool = False, backend_dir: str | None = None,
                  drafter: str | None = None, width: int = 0, prefill_chunk: int = 0, kv: str | None = None,
                  backend_options: str | None = None, activations: str | None = None,
-                 chat_template: str | None = None, drafter_file: str | list[str] | None = None):
+                 chat_template: str | None = None, drafter_file: str | list[str] | None = None,
+                 mmproj_file: str | None = None, vision: bool = True):
         """max_ctx: tokens, or "max": the model's own context, or the longest the GPU and host memory hold.
         width: drafts per round (0: chosen each round by the speculation controller).
         activations: None (as the file has it), "exact" (every format's own rounding everywhere) or "nvfp4"
@@ -181,7 +182,9 @@ class Engine:
                          backend_options.encode() if backend_options else None,
                          activations.encode() if activations else None,
                          chat_template.encode() if chat_template else None,
-                         drafter_file.encode() if drafter_file else None)
+                         drafter_file.encode() if drafter_file else None,
+                         os.path.expanduser(os.fspath(mmproj_file)).encode() if mmproj_file else None,
+                         0 if vision else 1)
         err = _Err()
         self._h = self._lib.flyx_load(os.path.expanduser(model).encode(), C.byref(opts), C.byref(err))
         if not self._h:

@@ -13,12 +13,41 @@ namespace flyx {
 namespace {
 
 bool same_message(const ChatMessage& a, const ChatMessage& b) {
-  return a.role == b.role && a.content == b.content && a.reasoning == b.reasoning &&
-         a.tool_call_id == b.tool_call_id &&
-         std::equal(a.tool_calls.begin(), a.tool_calls.end(), b.tool_calls.begin(), b.tool_calls.end(),
-                    [](const ToolCall& x, const ToolCall& y) {
-                      return x.id == y.id && x.name == y.name && x.arguments == y.arguments;
-                    });
+  if (a.role != b.role || a.content != b.content || a.reasoning != b.reasoning ||
+      a.tool_call_id != b.tool_call_id || a.parts.size() != b.parts.size() ||
+      !std::equal(a.tool_calls.begin(), a.tool_calls.end(), b.tool_calls.begin(), b.tool_calls.end(),
+                  [](const ToolCall& x, const ToolCall& y) {
+                    return x.id == y.id && x.name == y.name && x.arguments == y.arguments;
+                  }))
+    return false;
+  for (size_t i = 0; i < a.parts.size(); ++i) {
+    const auto &pa = a.parts[i], &pb = b.parts[i];
+    if (pa.kind != pb.kind) return false;
+    if (pa.kind == ContentPart::kImage) {
+      if (!pa.image != !pb.image) return false;
+      if (pa.image && (pa.image->sha256 != pb.image->sha256 || pa.image->detail != pb.image->detail)) return false;
+    } else if (pa.text != pb.text) {
+      return false;
+    }
+  }
+  return true;
+}
+
+bool same_rendered_images_prefix(const RenderedChat& a, const RenderedChat& b, size_t end) {
+  if (a.images.empty() && b.images.empty()) return true;
+  if (a.images.size() > b.images.size()) return false;
+  for (size_t i = 0; i < a.images.size(); ++i) {
+    const auto &ia = a.images[i], &ib = b.images[i];
+    if (ia.byte_offset != std::string::npos && ia.byte_offset >= end) break;
+    if (!ia.image || !ib.image || ia.byte_offset != ib.byte_offset || ia.byte_end != ib.byte_end ||
+        ia.image->sha256 != ib.image->sha256 || ia.image->detail != ib.image->detail)
+      return false;
+  }
+  // Ensure b does not inject an extra image before `end`.
+  if (a.images.size() < b.images.size() && b.images[a.images.size()].byte_offset != std::string::npos &&
+      b.images[a.images.size()].byte_offset < end)
+    return false;
+  return true;
 }
 
 const char* finish_name(int f) {
@@ -289,7 +318,29 @@ void Scheduler::cancel(Job* job) {
 int Scheduler::count_tokens(const Request& in, std::string* err) {
   RenderedChat rc;
   if (!render_request(chat_, tok_, in, &rc, err, false)) return -1;
-  return static_cast<int>(tok_.encode(rc.text, &rc.literal).size());
+  int total = static_cast<int>(tok_.encode(rc.text, &rc.literal).size());
+  if (!rc.images.empty()) {
+    std::shared_lock<std::shared_mutex> lock(engine_mu_);
+    if (!engine_ || !engine_->has_vision()) {
+      *err = "this model has no vision encoder loaded (pass --mmproj <mmproj.gguf>)";
+      return -1;
+    }
+    const int avail = std::max(256, prompt_limit(engine_->options().max_ctx) - 256);
+    for (const auto& ri : rc.images) {
+      if (!ri.image) return *err = "missing image data in multimodal message", -1;
+      interfaces::RgbImage rgb;
+      if (!vision::decode_image_bytes(ri.image->bytes.data(), ri.image->bytes.size(), &rgb, err)) return -1;
+      const int budget = ri.image->detail == "low"
+                             ? std::min(256, avail)
+                             : ri.image->detail == "high"
+                                   ? std::min(4096, avail)
+                                   : std::min(2048, std::min(std::max(256, (avail / 2) / static_cast<int>(rc.images.size())), avail));
+      interfaces::PreparedMedia pm;
+      if (!engine_->model().vision()->preprocess(rgb, budget, &pm, err)) return -1;
+      total += static_cast<int>(pm.tokens.size()) - 1;  // replaces the single placeholder token
+    }
+  }
+  return total;
 }
 
 std::shared_ptr<Job> Scheduler::submit(Request in, std::string* err, int* status, double arrived_at) {
@@ -333,7 +384,8 @@ std::shared_ptr<Job> Scheduler::submit(Request in, std::string* err, int* status
         return false;
       if (b.gen.prefill_only && !a.gen.prefill_only) return false;
       if (const size_t end = other->prompt_.conversation_end)
-        return job->prompt_.text.compare(0, end, other->prompt_.text, 0, end) == 0;
+        return job->prompt_.text.compare(0, end, other->prompt_.text, 0, end) == 0 &&
+               same_rendered_images_prefix(other->prompt_, job->prompt_, end);
       return a.chat && b.chat && a.messages.size() <= b.messages.size() && a.tools == b.tools &&
              a.chat_options.enable_thinking == b.chat_options.enable_thinking &&
              a.chat_options.add_generation_prompt == b.chat_options.add_generation_prompt &&

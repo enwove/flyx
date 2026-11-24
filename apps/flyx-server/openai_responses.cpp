@@ -208,6 +208,9 @@ void stored_text_parts(ojson& parts, bool output) {
   if (parts.is_string()) parts = ojson::array({parts});
   for (auto& part : parts) {
     if (!part.is_object()) part = {{"text", part.is_string() ? part : ojson("")}};
+    if (part.contains("type") && part["type"].is_string() &&
+        (part["type"] == "input_image" || part["type"] == "image_url" || part["type"] == "image"))
+      continue;
     if (!part.contains("text") || !part["text"].is_string()) part["text"] = "";
     part["type"] = output ? "output_text" : "input_text";
     if (output && !part.contains("annotations")) part["annotations"] = ojson::array();

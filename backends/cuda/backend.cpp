@@ -645,6 +645,7 @@ const flyx_backend_api kApi = {
     prefill, launch, read_result, rewind, checkpoint, restore, set_oracle, last_error, memory, seq_bytes,
     prefill_align, device_stats, ready, set_reply, snapshot_bytes, snapshot_save, snapshot_load, launch_batch,
     pinned_alloc, pinned_free, read_logits, seq_new_in, seq_size, trim, graph_stats, prefill_snapshot,
+    encode_vision, prefill_ex,
 };
 
 }  // namespace flyx::cuda

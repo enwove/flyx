@@ -8,7 +8,7 @@ Reference for supported model architectures (Qwen3.5 / Qwen3.8, Qwen3, Llama), f
 
 | Format | Supported Architectures | Supported Weight Types | Refused / Unsupported |
 |---|---|---|---|
-| **GGUF** (native, zero conversion) | `qwen35` (Qwen3.5 / Qwen3.8 hybrid GDN + gated attention), `qwen3` (dense) | `F32`, `F16`, `BF16`, `Q4_0`, `Q4_1`, `Q5_0`, `Q5_1`, `Q8_0`, `Q2_K`–`Q6_K`, `IQ1_S`, `IQ1_M`, `IQ2_XXS`, `IQ2_XS`, `IQ2_S`, `IQ3_XXS`, `IQ3_S`, `IQ4_NL`, `IQ4_XS`, mixed quants, GGML `NVFP4`; a split file (`-00001-of-0000N.gguf`) with all its parts in one folder | `MXFP4`, MoE experts, vision towers, sliding-window target attention, scaled RoPE |
+| **GGUF** (native, zero conversion) | `qwen35` (Qwen3.5 / Qwen3.8 hybrid GDN + gated attention, plus multimodal vision via `--mmproj` `qwen3vl_merger` `mmproj-*.gguf`), `qwen3` (dense) | `F32`, `F16`, `BF16`, `Q4_0`, `Q4_1`, `Q5_0`, `Q5_1`, `Q8_0`, `Q2_K`–`Q6_K`, `IQ1_S`, `IQ1_M`, `IQ2_XXS`, `IQ2_XS`, `IQ2_S`, `IQ3_XXS`, `IQ3_S`, `IQ4_NL`, `IQ4_XS`, mixed quants, GGML `NVFP4`; a split file (`-00001-of-0000N.gguf`) with all its parts in one folder | `MXFP4`, MoE experts, sliding-window target attention, scaled RoPE |
 | **`.flyx`** (via `python/convert`) | Qwen3.5 / Qwen3.8, Qwen3, Llama (e.g. MiniCPM5-1B) | `BF16`, NVIDIA ModelOpt `NVFP4` | Vision / MoE; a Llama GGUF |
 
 Key execution properties:
@@ -34,6 +34,7 @@ flyx serve unsloth/Qwen3.8-27B-GGUF:UD-IQ2_S --drafter-file z-lab/Qwen3.8-27B-DF
 | `org/repo:QUANT` | Selects the GGUF carrying `QUANT` (falls back to `UD-<QUANT>` when unique). Passing `org/repo` without `:QUANT` lists available GGUFs and sizes. |
 | `org/repo:QUANT@REV` | Pins a branch or commit hash (also used to address older cached snapshots). |
 | Auto MTP sidecar | If a GGUF lacks an embedded MTP layer and the repo contains `MTP/*.gguf` (e.g., `unsloth/Qwen3.8-27B-GGUF`), `flyx` fetches and attaches it automatically. |
+| Auto `mmproj` vision projector | If a Hub GGUF repo contains a vision projector (`mmproj-BF16.gguf` preferred over F16/F32), `flyx` fetches and attaches it automatically unless `--no-vision` or an explicit `--mmproj` path is given. |
 | Direct DFlash2 loading | `z-lab/*-DFlash2` and `vllm-project/*-DFlash2` repos load directly from `config.json` + `.safetensors` with no conversion step. |
 | Downloader & cache | 16 parallel range connections, SHA-256 verified against Hub metadata, resumable across restarts, multi-process coordinated via `.flyx-lock` files in standard HF cache (`HF_HOME`, `HF_HUB_CACHE`, `HF_TOKEN`, `HF_ENDPOINT`, `HF_HUB_OFFLINE=1`). Requires `libcurl` on Linux; native WinHTTP on Windows. |
 

@@ -257,6 +257,28 @@ const RepoFile* mtp_file(const Repo& r) {
   return nullptr;
 }
 
+const RepoFile* mmproj_file(const Repo& r) {
+  auto rank = [](const std::string& path) -> int {
+    const std::string base = detail::lower(detail::base_name(path));
+    if (!base.ends_with(".gguf") || base.find("mmproj") == std::string::npos) return -1;
+    if (base.find("bf16") != std::string::npos) return 4;
+    if (base.find("f16") != std::string::npos || base.find("fp16") != std::string::npos) return 3;
+    if (base.find("f32") != std::string::npos) return 2;
+    return 1;
+  };
+  const RepoFile* best = nullptr;
+  int best_rank = -1;
+  for (const RepoFile& f : r.files) {
+    const int k = rank(f.path);
+    if (k < 0) continue;
+    if (k > best_rank || (k == best_rank && best && f.path.size() < best->path.size())) {
+      best = &f;
+      best_rank = k;
+    }
+  }
+  return best;
+}
+
 bool select(const Repo& r, const Name& name, std::vector<RepoFile>* files, std::string* err) {
   files->clear();
   const std::vector<GgufChoice> choices = gguf_choices(r);

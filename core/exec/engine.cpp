@@ -500,6 +500,8 @@ bool Engine::load(const std::string& path, const EngineOptions& opt, std::string
   if (!file_.open(path, err)) return false;
   for (const std::string& f : opt_.drafter_files)
     if (!file_.add(f, err)) return false;
+  if (opt_.vision && !opt_.mmproj_file.empty())
+    if (!file_.add(opt_.mmproj_file, err)) return false;
   ReadAhead ahead(file_);  // until the load returns
   t[1] = os::now_ms();
   if (!tok_.load(file_, err)) return false;
@@ -515,7 +517,11 @@ bool Engine::load(const std::string& path, const EngineOptions& opt, std::string
   if (!load_backend(err)) return false;
   t[3] = os::now_ms();
   // The model as blocks, with its drafters: the one asked for, else every one it has.
-  interfaces::ModelOptions mo{opt_.drafter, opt_.speculative, opt_.activations};
+  interfaces::ModelOptions mo;
+  mo.drafter = opt_.drafter;
+  mo.speculative = opt_.speculative;
+  mo.vision = opt_.vision;
+  mo.activations = opt_.activations;
   mo.fp4_inputs = device_.fp4_inputs != 0;
   model_ = interfaces::open_model(file_, mo, err);
   if (!model_) return false;
@@ -546,6 +552,7 @@ bool Engine::load(const std::string& path, const EngineOptions& opt, std::string
   lower_ms_ = timed_ms_ = 0;
   given_back_ = 0;
   if (!lower_and_time(err)) return false;
+  if (opt_.verbose && has_vision()) log::info("flyx: vision encoder loaded");
   int asked_ctx = 0;
   if (!plan_memory(&tiers, session_limit, &asked_ctx, err)) return false;
   wanted_ctx_ = asked_ctx;
@@ -594,6 +601,58 @@ std::string Engine::memory_report() const {
     r += " on the GPU (K/V of " + std::to_string(budget_.layout.device_positions) + " tokens) and " +
          gb(budget_.session_host_bytes) + " in host memory";
   return r;
+}
+
+bool Engine::encode_image(const interfaces::ImageInput& img, int max_tokens,
+                          std::shared_ptr<const vision::CachedVision>* out, std::string* err) const {
+  if (!has_vision()) {
+    *err = "this model has no vision encoder loaded (pass --mmproj <mmproj.gguf>)";
+    return false;
+  }
+  const vision::VisionCacheKey key{img.sha256, img.detail, max_tokens};
+  if (vision_cache_.get(key, out)) return true;
+
+  interfaces::RgbImage rgb;
+  if (!vision::decode_image_bytes(img.bytes.data(), img.bytes.size(), &rgb, err)) return false;
+  rgb.sha256 = img.sha256;
+
+  interfaces::PreparedMedia pm;
+  if (!model_->vision()->preprocess(rgb, max_tokens, &pm, err)) return false;
+  if (pm.n_patches <= 0 || pm.patch_dim <= 0 || pm.tokens.empty() || pm.n_embeds <= 0) {
+    *err = "vision preprocess produced empty output";
+    return false;
+  }
+
+  flyx_vision_input vi{};
+  vi.patches = pm.patches.data();
+  vi.n_patches = pm.n_patches;
+  vi.patch_dim = pm.patch_dim;
+  vi.grid_thw = pm.grid_thw.empty() ? nullptr : pm.grid_thw.data();
+  vi.n_grids = static_cast<int32_t>(pm.grid_thw.size() / 3);
+  vi.cu_seqlens = pm.cu_seqlens.size() >= 2 ? pm.cu_seqlens.data() : nullptr;
+  vi.n_segs = pm.cu_seqlens.size() >= 2 ? static_cast<int32_t>(pm.cu_seqlens.size() - 1) : 0;
+
+  const int expected_rows = pm.n_embeds;
+  const int out_h = model_->vision()->out_hidden() > 0 ? model_->vision()->out_hidden() : model_->desc().hidden;
+  auto cv = std::make_shared<vision::CachedVision>();
+  cv->embeds.resize(size_t(expected_rows) * size_t(out_h));
+  int32_t got_rows = 0;
+  if (api_->encode_vision(plans_.vision, &vi, cv->embeds.data(), expected_rows, &got_rows) != 0) {
+    *err = std::string("encode_vision: ") + api_->last_error();
+    return false;
+  }
+  if (got_rows != expected_rows) {
+    *err = "encode_vision: produced " + std::to_string(got_rows) + " rows, expected " + std::to_string(expected_rows);
+    return false;
+  }
+  cv->tokens = std::move(pm.tokens);
+  cv->embed_offsets = std::move(pm.embed_offsets);
+  cv->n_embeds = pm.n_embeds;
+  cv->grid_thw = std::move(pm.grid_thw);
+  cv->out_hidden = out_h;
+  vision_cache_.put(key, cv);
+  *out = std::move(cv);
+  return true;
 }
 
 }  // namespace flyx

@@ -48,11 +48,81 @@ bool fail(std::string* err, const char* message) {
   return false;
 }
 
+bool has_images(const ChatMessage& m) {
+  for (const auto& p : m.parts)
+    if (p.kind == interfaces::ContentPart::kImage) return true;
+  return false;
+}
+
+bool emit_content(Writer& w, const ChatMessage& m, bool is_system, bool add_vision_id, int* image_count,
+                  std::string* err) {
+  if (m.parts.empty()) {
+    w.in(py_strip(m.content));
+    return true;
+  }
+  if (is_system && has_images(m)) return fail(err, "System message cannot contain images.");
+  // Mirror Jinja render_content(content)|trim: find the first and last non-empty piece so leading/trailing
+  // whitespace around text parts is stripped identically to applying |trim to the joined message content.
+  struct Piece {
+    bool is_image = false;
+    std::string_view text;
+    std::shared_ptr<const interfaces::ImageInput> img;
+  };
+  std::vector<Piece> pieces;
+  pieces.reserve(m.parts.size());
+  for (const auto& p : m.parts) {
+    if (p.kind == interfaces::ContentPart::kImage) pieces.push_back({true, {}, p.image});
+    else if (!p.text.empty()) pieces.push_back({false, p.text, nullptr});
+  }
+  // Strip leading whitespace on leading text pieces (stopping at first image or non-empty trimmed text).
+  size_t lo = 0;
+  while (lo < pieces.size() && !pieces[lo].is_image) {
+    const std::string_view sv = pieces[lo].text;
+    const std::string_view st = py_strip(sv);
+    if (st.empty()) {
+      ++lo;
+      continue;
+    }
+    // Trim leading only (preserve trailing if more pieces follow).
+    const size_t lead = size_t(st.data() - sv.data());
+    pieces[lo].text = sv.substr(lead);
+    break;
+  }
+  // Strip trailing whitespace on trailing text pieces.
+  size_t hi = pieces.size();
+  while (hi > lo && !pieces[hi - 1].is_image) {
+    const std::string_view sv = pieces[hi - 1].text;
+    const std::string_view st = py_strip(sv);
+    if (st.empty()) {
+      --hi;
+      continue;
+    }
+    const size_t end = size_t(st.data() - sv.data()) + st.size();
+    pieces[hi - 1].text = sv.substr(0, end);
+    break;
+  }
+  for (size_t k = lo; k < hi; ++k) {
+    if (pieces[k].is_image) {
+      ++(*image_count);
+      if (add_vision_id) w.lit("Picture " + std::to_string(*image_count) + ": ");
+      w.lit("<|vision_start|>");
+      w.image(pieces[k].img, "<|image_pad|>");
+      w.lit("<|vision_end|>");
+    } else {
+      w.in(pieces[k].text);
+    }
+  }
+  return true;
+}
+
 bool render_qwen35(std::span<const ChatMessage> msgs, const std::vector<ojson>& tools, const ChatOptions& opt,
                    bool generation_prompt, RenderedChat* out, std::string* err) {
   Writer w(out);
   const size_t n = msgs.size();
   if (n == 0) return fail(err, "No messages provided.");
+  const bool add_vision_id = opt.kwargs.is_object() && opt.kwargs.contains("add_vision_id") &&
+                             opt.kwargs["add_vision_id"].is_boolean() && opt.kwargs["add_vision_id"].get<bool>();
+  int image_count = 0;
 
   // The system block: the tools and their instructions, then the system message.
   if (!tools.empty()) {
@@ -64,6 +134,7 @@ bool render_qwen35(std::span<const ChatMessage> msgs, const std::vector<ojson>& 
     }
     w.lit(kToolsFooter);
     if (msgs[0].role == "system") {
+      if (has_images(msgs[0])) return fail(err, "System message cannot contain images.");
       const std::string_view content = py_strip(msgs[0].content);
       if (!content.empty()) {
         w.lit("\n\n");
@@ -72,6 +143,7 @@ bool render_qwen35(std::span<const ChatMessage> msgs, const std::vector<ojson>& 
     }
     w.lit("<|im_end|>\n");
   } else if (msgs[0].role == "system") {
+    if (has_images(msgs[0])) return fail(err, "System message cannot contain images.");
     w.lit("<|im_start|>system\n");
     w.in(py_strip(msgs[0].content));
     w.lit("<|im_end|>\n");
@@ -82,8 +154,9 @@ bool render_qwen35(std::span<const ChatMessage> msgs, const std::vector<ojson>& 
   size_t last_query = n - 1;
   for (size_t i = n; i-- > 0;) {
     if (!multi_step_tool || msgs[i].role != "user") continue;
+    const bool img = has_images(msgs[i]);
     const std::string_view content = py_strip(msgs[i].content);
-    if (!(starts_with(content, "<tool_response>") && ends_with(content, "</tool_response>"))) {
+    if (img || !(starts_with(content, "<tool_response>") && ends_with(content, "</tool_response>"))) {
       multi_step_tool = false;
       last_query = i;
     }
@@ -99,7 +172,7 @@ bool render_qwen35(std::span<const ChatMessage> msgs, const std::vector<ojson>& 
       w.lit("<|im_start|>");
       w.in(m.role);
       w.lit("\n");
-      w.in(content);
+      if (!emit_content(w, m, false, add_vision_id, &image_count, err)) return false;
       w.lit("<|im_end|>\n");
     } else if (m.role == "assistant") {
       std::string_view reasoning;
@@ -121,11 +194,12 @@ bool render_qwen35(std::span<const ChatMessage> msgs, const std::vector<ojson>& 
       } else {
         w.lit("\n");
       }
-      w.in(content);
+      if (m.parts.empty()) w.in(content);
+      else if (!emit_content(w, m, false, add_vision_id, &image_count, err)) return false;
       for (size_t c = 0; c < m.tool_calls.size(); ++c) {
         const auto& call = m.tool_calls[c];
         if (c > 0) w.lit("\n<tool_call>\n<function=");
-        else w.lit(py_strip(content).empty() ? "<tool_call>\n<function=" : "\n\n<tool_call>\n<function=");
+        else w.lit(py_strip(content).empty() && m.parts.empty() ? "<tool_call>\n<function=" : "\n\n<tool_call>\n<function=");
         w.in(call.name);
         w.lit(">\n");
         if (call.arguments.is_object())
@@ -145,7 +219,7 @@ bool render_qwen35(std::span<const ChatMessage> msgs, const std::vector<ojson>& 
     } else if (m.role == "tool") {
       if (i > 0 && msgs[i - 1].role != "tool") w.lit("<|im_start|>user");
       w.lit("\n<tool_response>\n");
-      w.in(content);
+      if (!emit_content(w, m, false, add_vision_id, &image_count, err)) return false;
       w.lit("\n</tool_response>");
       if (i + 1 == n || msgs[i + 1].role != "tool") w.lit("<|im_end|>\n");
     } else {

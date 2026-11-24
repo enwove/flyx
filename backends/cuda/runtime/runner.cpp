@@ -195,6 +195,7 @@ void set_params(flyx_seq* s, int position, int anchor, int round) {
   p.anchor = anchor;
   p.round = round;
   p.seq_no = s->seq_no;
+  p.rope_delta = s->rope_delta;
   CK(cudaMemcpyAsync(s->P, &p, offsetof(DevParams, oracle_len), cudaMemcpyHostToDevice, s->st));
   // A rewind, restore or snapshot load: the canvas no longer follows the text (a prompt edited back to the position
   // a slide left would draft from a canvas of text no longer there).
@@ -216,6 +217,8 @@ void reset_state(flyx_seq* s, int anchor) {
     CK(cudaMemsetAsync(g.win, 0, FLYX_ROUND_SLOTS * g.w_stride * sizeof(float), s->st));
   }
   for (auto& mt : s->meta) mt = {};
+  s->rope_delta = 0;
+  s->prev_pos3d_at = -1;
   set_params(s, 0, anchor, 0);
 }
 
@@ -326,11 +329,15 @@ void check_idle(flyx_seq* s) {
   sync_stream(s);
 }
 
-int prefill(flyx_plan* p, flyx_seq* s, const int32_t* tokens, int32_t n, const flyx_gen_params* sample) {
-  if (!s) return no_sequence("prefill");
+int prefill_ex(flyx_plan* p, flyx_seq* s, const flyx_prefill_input* in, const flyx_gen_params* sample) {
+  if (!s) return no_sequence("prefill_ex");
+  if (!in || !in->tokens) return fail("prefill_ex: missing tokens");
+  const int32_t n = in->n;
   const int sample_last = sample != nullptr;
   if (p->phase != FLYX_PHASE_PREFILL) return fail("not a prefill plan");
   if (n <= 0 || n > p->max_rows || n > s->rows_cap) return fail("prefill chunk size out of range");
+  if (in->n_embeds < 0 || in->n_embeds > n) return fail("prefill_ex: n_embeds out of range");
+  if (in->n_embeds > 0 && (!in->embeds || !in->embed_rows)) return fail("prefill_ex: missing embeds or embed_rows");
   return guarded([&] {
     check_idle(s);  // also guarantees the staging buffer is free
     if (!flyx_room(s->position + n, s->max_ctx)) return fail("context is full");
@@ -352,8 +359,8 @@ int prefill(flyx_plan* p, flyx_seq* s, const int32_t* tokens, int32_t n, const f
       CK(cudaMemsetAsync(m->prefill_zero_ptr, 0, m->prefill_zero_bytes, s->st));
       m->prefill_dirty = false;
     }
-    std::memcpy(s->tok_host, tokens, sizeof(int) * n);
-    CK(cudaMemcpyAsync(m->prefill_bufs.tokens, s->tok_host, sizeof(int) * n, cudaMemcpyHostToDevice, s->st));
+    std::memcpy(s->tok_host, in->tokens, sizeof(int) * size_t(n));
+    CK(cudaMemcpyAsync(m->prefill_bufs.tokens, s->tok_host, sizeof(int) * size_t(n), cudaMemcpyHostToDevice, s->st));
     s->meta[flyx_round_slot(s->round)].valid = false;
     // A multiple of prefill_align inside the pass (the pass then ends past it): the last one, or prefill_snapshot's;
     // its GDN state and window go to the round slot after the current one, for checkpoint() (the bits a pass ending
@@ -367,9 +374,62 @@ int prefill(flyx_plan* p, flyx_seq* s, const int32_t* tokens, int32_t n, const f
     if (s->pass_snap >= 0) {
       s->snap_slot = flyx_round_slot(s->round + 1);
       s->meta[s->snap_slot].valid = false;
+      s->snap_rope_delta = in->pos_3d ? (in->pos_3d[size_t(s->pass_snap - s->position) * 3] - s->pass_snap)
+                                      : s->rope_delta;
     }
     Pass ps{p, s, n, false, sample_last != 0, sample && certified(s, sample), sample && penalized(sample)};
     ps.v = rows_of(s, &m->prefill_bufs);  // the prefill buffers it borrows
+    if (in->n_embeds > 0) {
+      for (int i = 0; i < in->n_embeds; ++i)
+        if (in->embed_rows[i] < 0 || in->embed_rows[i] >= n) return fail("prefill_ex: embed_row out of range");
+      const size_t need_e = size_t(in->n_embeds) * size_t(m->hidden);
+      if (need_e > m->prefill_embeds_cap) {
+        if (m->prefill_embeds) CK(cudaFree(m->prefill_embeds));
+        m->prefill_embeds = nullptr;
+        m->prefill_embeds_cap = 0;
+        m->prefill_embeds = static_cast<float*>(device_malloc(need_e * sizeof(float)));
+        m->prefill_embeds_cap = need_e;
+      }
+      if (size_t(in->n_embeds) > m->prefill_embed_rows_cap) {
+        if (m->prefill_embed_rows) CK(cudaFree(m->prefill_embed_rows));
+        m->prefill_embed_rows = nullptr;
+        m->prefill_embed_rows_cap = 0;
+        m->prefill_embed_rows = static_cast<int32_t*>(device_malloc(size_t(in->n_embeds) * sizeof(int32_t)));
+        m->prefill_embed_rows_cap = size_t(in->n_embeds);
+      }
+      CK(cudaMemcpyAsync(m->prefill_embeds, in->embeds, need_e * sizeof(float), cudaMemcpyHostToDevice, s->st));
+      CK(cudaMemcpyAsync(m->prefill_embed_rows, in->embed_rows, size_t(in->n_embeds) * sizeof(int32_t),
+                         cudaMemcpyHostToDevice, s->st));
+      ps.embeds = m->prefill_embeds;
+      ps.embed_rows = m->prefill_embed_rows;
+      ps.n_embeds = in->n_embeds;
+    }
+    std::vector<int32_t> pos3d_host;  // kept alive until sync_stream(s) below
+    if (in->pos_3d) {
+      const size_t need_p = size_t(n) * 6;  // [pos_3d (3*n) | mtp_pos_3d (3*n)]
+      if (need_p > m->prefill_pos3d_cap) {
+        if (m->prefill_pos3d) CK(cudaFree(m->prefill_pos3d));
+        m->prefill_pos3d = nullptr;
+        m->prefill_pos3d_cap = 0;
+        m->prefill_pos3d = static_cast<int32_t*>(device_malloc(need_p * sizeof(int32_t)));
+        m->prefill_pos3d_cap = need_p;
+      }
+      pos3d_host.resize(need_p);
+      std::memcpy(pos3d_host.data(), in->pos_3d, size_t(n) * 3 * sizeof(int32_t));
+      int32_t* mtp_p = pos3d_host.data() + size_t(n) * 3;
+      if (s->prev_pos3d_at == s->position - 1) {
+        mtp_p[0] = s->prev_pos3d[0];
+        mtp_p[1] = s->prev_pos3d[1];
+        mtp_p[2] = s->prev_pos3d[2];
+      } else {
+        const int prev = s->position - 1 + s->rope_delta;
+        mtp_p[0] = mtp_p[1] = mtp_p[2] = prev;
+      }
+      if (n > 1) std::memcpy(mtp_p + 3, in->pos_3d, size_t(n - 1) * 3 * sizeof(int32_t));
+      CK(cudaMemcpyAsync(m->prefill_pos3d, pos3d_host.data(), need_p * sizeof(int32_t), cudaMemcpyHostToDevice, s->st));
+      ps.pos_3d = m->prefill_pos3d;
+      ps.mtp_pos_3d = m->prefill_pos3d + size_t(n) * 3;
+    }
     // A prefill reads the caches through the stagings: the copy at home in host memory.
     s->copy_home(false);
     s->copy_written(s->position);
@@ -377,6 +437,19 @@ int prefill(flyx_plan* p, flyx_seq* s, const int32_t* tokens, int32_t n, const f
     forward(ps);
     s->snap_pos = s->pass_snap;
     s->pass_snap = -1;
+    if (in->pos_3d) {
+      s->prev_pos3d[0] = in->pos_3d[size_t(n - 1) * 3 + 0];
+      s->prev_pos3d[1] = in->pos_3d[size_t(n - 1) * 3 + 1];
+      s->prev_pos3d[2] = in->pos_3d[size_t(n - 1) * 3 + 2];
+      s->prev_pos3d_at = s->position + n - 1;
+    } else {
+      s->prev_pos3d_at = -1;
+    }
+    if (in->set_rope_delta) {
+      s->rope_delta = in->rope_delta;
+      s->params_host->rope_delta = s->rope_delta;
+      CK(cudaMemcpyAsync(&s->P->rope_delta, &s->params_host->rope_delta, sizeof(int), cudaMemcpyHostToDevice, s->st));
+    }
     prefill_done(s->P, n, m->prefill_bufs.choice, sample_last, s->ring_dev, s->G, s->reply, s->st);
     CK(cudaEventRecord(m->prefill_ev, s->st));
     s->position += n;
@@ -387,7 +460,310 @@ int prefill(flyx_plan* p, flyx_seq* s, const int32_t* tokens, int32_t n, const f
       s->pending.push_back({'P', 0});
     }
     s->update_write_hi();
+    if (in->n_embeds > 0 || in->pos_3d || in->set_rope_delta) sync_stream(s);
     CK(cudaGetLastError());
+    return 0;
+  });
+}
+
+int prefill(flyx_plan* p, flyx_seq* s, const int32_t* tokens, int32_t n, const flyx_gen_params* sample) {
+  flyx_prefill_input in{};
+  in.tokens = tokens;
+  in.n = n;
+  return prefill_ex(p, s, &in, sample);
+}
+
+int encode_vision(flyx_plan* p, const flyx_vision_input* in, float* out_embeds, int32_t out_cap_rows,
+                  int32_t* out_rows) {
+  if (!p || p->phase != FLYX_PHASE_VISION) return fail("encode_vision: not a vision plan");
+  if (!in || !in->patches || !in->grid_thw || !out_embeds || out_cap_rows <= 0)
+    return fail("encode_vision: null input or invalid output buffer");
+  if (in->n_patches <= 0 || in->n_patches > p->max_rows || in->n_grids <= 0)
+    return fail("encode_vision: invalid patch or grid count");
+  return guarded([&] {
+    flyx_bmodel* m = p->m;
+    const int N = in->n_patches;
+    int merge_size = 1;
+    size_t x_floats = 0, h_floats = 0, b1_floats = 0, b2_floats = 0;
+    int max_k = 64;
+    for (const Block* blk : p->block) {
+      if (const auto* st = std::get_if<VisionStemBlock>(blk)) {
+        if (in->patch_dim != st->in_dim)
+          throw std::runtime_error("encode_vision: patch_dim mismatch (" + std::to_string(in->patch_dim) + " vs " +
+                                   std::to_string(st->in_dim) + ")");
+        x_floats = std::max(x_floats, size_t(N) * size_t(st->hidden));
+        h_floats = std::max(h_floats, size_t(N) * size_t(st->hidden));
+        b1_floats = std::max(b1_floats, size_t(N) * size_t(st->in_dim));
+        merge_size = std::max(merge_size, st->merge_size);
+      } else if (const auto* va = std::get_if<VitAttnBlock>(blk)) {
+        const int pw = va->nh * va->hd;
+        x_floats = std::max(x_floats, size_t(N) * size_t(va->hidden));
+        h_floats = std::max(h_floats, size_t(N) * size_t(va->hidden));
+        b1_floats = std::max(b1_floats, size_t(N) * size_t(3 * pw));
+        b2_floats = std::max(b2_floats, size_t(N) * size_t(std::max(pw, va->hidden)));
+        max_k = std::max({max_k, va->hidden, pw});
+        merge_size = std::max(merge_size, va->merge_size);
+      } else if (const auto* vf = std::get_if<VitMlpBlock>(blk)) {
+        x_floats = std::max(x_floats, size_t(N) * size_t(vf->hidden));
+        h_floats = std::max(h_floats, size_t(N) * size_t(vf->hidden));
+        b1_floats = std::max(b1_floats, size_t(N) * size_t(vf->inter));
+        b2_floats = std::max(b2_floats, size_t(N) * size_t(std::max(vf->inter, vf->hidden)));
+        max_k = std::max({max_k, vf->hidden, vf->inter});
+      } else if (const auto* vm = std::get_if<VisionMergeBlock>(blk)) {
+        const int ms = std::max(1, vm->merge_size), grp = ms * ms;
+        const int out_r = vm->merge_mode != FLYX_VMERGE_NONE ? (N / grp) : N;
+        const int merged = vm->merge_mode == FLYX_VMERGE_SPATIAL_CONCAT ? vm->in_hidden * grp : vm->in_hidden;
+        x_floats = std::max({x_floats, size_t(N) * size_t(vm->in_hidden), size_t(out_r) * size_t(vm->out_hidden)});
+        h_floats = std::max({h_floats, size_t(N) * size_t(vm->in_hidden), size_t(out_r) * size_t(merged)});
+        b1_floats = std::max(b1_floats, size_t(out_r) * size_t(std::max(vm->merge_hidden, vm->out_hidden)));
+        b2_floats = std::max(b2_floats, size_t(out_r) * size_t(std::max(merged, vm->out_hidden)));
+        max_k = std::max({max_k, merged, vm->merge_hidden});
+      }
+    }
+    max_k = (max_k + 63) / 64 * 64;
+
+    // Precompute spatial coordinates and per-row grid dims on host (spatial-merge block order).
+    std::vector<int32_t> coords_h, coords_w, row_gh, row_gw;
+    coords_h.reserve(size_t(N));
+    coords_w.reserve(size_t(N));
+    row_gh.reserve(size_t(N));
+    row_gw.reserve(size_t(N));
+    for (int g = 0; g < in->n_grids; ++g) {
+      const int T = in->grid_thw[g * 3 + 0];
+      const int H = in->grid_thw[g * 3 + 1];
+      const int W = in->grid_thw[g * 3 + 2];
+      if (T <= 0 || H <= 0 || W <= 0 || (H % merge_size) != 0 || (W % merge_size) != 0)
+        throw std::runtime_error("encode_vision: grid_thw dimensions invalid or not divisible by merge_size");
+      const int bh_n = H / merge_size, bw_n = W / merge_size;
+      for (int t = 0; t < T; ++t)
+        for (int bh = 0; bh < bh_n; ++bh)
+          for (int bw = 0; bw < bw_n; ++bw)
+            for (int mh = 0; mh < merge_size; ++mh)
+              for (int mw = 0; mw < merge_size; ++mw) {
+                coords_h.push_back(bh * merge_size + mh);
+                coords_w.push_back(bw * merge_size + mw);
+                row_gh.push_back(H);
+                row_gw.push_back(W);
+              }
+    }
+    if (int(coords_h.size()) != N)
+      throw std::runtime_error("encode_vision: grid_thw total patches (" + std::to_string(coords_h.size()) +
+                               ") != n_patches (" + std::to_string(N) + ")");
+    std::vector<int32_t> cu_host;
+    int n_segs = 1;
+    if (in->n_segs > 0 && in->cu_seqlens) {
+      n_segs = in->n_segs;
+      cu_host.assign(in->cu_seqlens, in->cu_seqlens + n_segs + 1);
+    } else {
+      cu_host = {0, N};
+    }
+
+    auto align256 = [](size_t b) { return (b + 255) / 256 * 256; };
+    const size_t sc_bytes = scratch_bytes(N, max_k, false, false, false, false);
+    const size_t total_bytes =
+        align256(x_floats * sizeof(float)) + align256(h_floats * sizeof(float)) +
+        align256(b1_floats * sizeof(float)) + align256(b2_floats * sizeof(float)) +
+        align256(size_t(4 * N + n_segs + 1) * sizeof(int32_t)) + align256(sc_bytes);
+
+    struct StreamGuard {
+      cudaStream_t st = nullptr;
+      ~StreamGuard() {
+        if (st) cudaStreamDestroy(st);
+      }
+    } sg;
+    CK(cudaStreamCreateWithFlags(&sg.st, cudaStreamNonBlocking));
+
+    struct AllocGuard {
+      void* ptr = nullptr;
+      ~AllocGuard() {
+        if (ptr) cudaFree(ptr);
+      }
+    } own_mem;
+
+    std::lock_guard<std::mutex> lock(m->prefill_mu);
+    unsigned char* arena = nullptr;
+    bool borrowed = false;
+    void* prefill_base = m->prefill_va ? reinterpret_cast<void*>(m->prefill_va)
+                                       : (!m->prefill_allocs.empty() ? m->prefill_allocs[0] : nullptr);
+    if (prefill_base && m->prefill_bytes >= total_bytes) {
+      if (m->prefill_owner) {
+        flyx_seq* prev = m->prefill_owner;
+        if (prev->uses_shared_prefill()) {
+          prev->copy_home(false);
+          prev->prefill_clobbered = true;
+          CK(cudaEventRecord(m->prefill_ev, prev->st));
+        }
+        m->prefill_owner = nullptr;
+      }
+      if (m->prefill_ev) CK(cudaStreamWaitEvent(sg.st, m->prefill_ev, 0));
+      m->prefill_dirty = true;
+      arena = static_cast<unsigned char*>(prefill_base);
+      borrowed = true;
+    } else {
+      own_mem.ptr = device_malloc(total_bytes);
+      arena = static_cast<unsigned char*>(own_mem.ptr);
+    }
+
+    size_t off = 0;
+    auto take = [&](size_t bytes) -> void* {
+      void* ptr = arena + off;
+      off += align256(bytes);
+      return ptr;
+    };
+    float* x = static_cast<float*>(take(x_floats * sizeof(float)));
+    float* h = static_cast<float*>(take(h_floats * sizeof(float)));
+    float* b1 = static_cast<float*>(take(b1_floats * sizeof(float)));
+    float* b2 = static_cast<float*>(take(b2_floats * sizeof(float)));
+    int32_t* meta = static_cast<int32_t*>(take(size_t(4 * N + n_segs + 1) * sizeof(int32_t)));
+    int32_t* d_ch = meta;
+    int32_t* d_cw = d_ch + N;
+    int32_t* d_gh = d_cw + N;
+    int32_t* d_gw = d_gh + N;
+    int32_t* d_cu = d_gw + N;
+    void* sc_mem = take(sc_bytes);
+    Scratch sc = scratch_carve(sc_mem, sc_bytes, N, max_k, false, false, false, false);
+    Launch L{sg.st, &sc, &m->opt.kernels, nullptr, nullptr};
+
+    // Upload patches and metadata to device.
+    CK(cudaMemcpyAsync(b1, in->patches, size_t(N) * size_t(in->patch_dim) * sizeof(float), cudaMemcpyHostToDevice,
+                       sg.st));
+    std::vector<int32_t> meta_host(size_t(4 * N + n_segs + 1));
+    std::memcpy(meta_host.data(), coords_h.data(), size_t(N) * sizeof(int32_t));
+    std::memcpy(meta_host.data() + N, coords_w.data(), size_t(N) * sizeof(int32_t));
+    std::memcpy(meta_host.data() + 2 * N, row_gh.data(), size_t(N) * sizeof(int32_t));
+    std::memcpy(meta_host.data() + 3 * N, row_gw.data(), size_t(N) * sizeof(int32_t));
+    std::memcpy(meta_host.data() + 4 * N, cu_host.data(), size_t(n_segs + 1) * sizeof(int32_t));
+    CK(cudaMemcpyAsync(meta, meta_host.data(), meta_host.size() * sizeof(int32_t), cudaMemcpyHostToDevice, sg.st));
+
+    auto run_vnorm = [&](const VNorm& vn, const float* src, int lds, float* dst, int ldd, int rows, int dim) {
+      if (vn.kind == FLYX_NORM_RMS)
+        rmsnorm(src, lds, vn.w, vn.offset, vn.eps, dst, ldd, rows, dim, sg.st);
+      else
+        layernorm(src, lds, vn.w, vn.b, vn.eps, dst, ldd, rows, dim, sg.st);
+    };
+
+    int cur_rows = N, cur_width = 0;
+    for (const Block* blk : p->block) {
+      if (const auto* st = std::get_if<VisionStemBlock>(blk)) {
+        gemm_f32(b1, st->in_dim, st->patch_w, st->hidden, st->in_dim, x, st->hidden, N, false, sg.st);
+        if (st->patch_b) add_bias(x, st->hidden, st->patch_b, N, st->hidden, sg.st);
+        if (st->pos_mode == FLYX_VPOS_ADD_FIXED && st->pos_w)
+          vision_pos_embed_add(x, st->pos_w, st->pos_rows, st->hidden, N, sg.st);
+        else if (st->pos_mode == FLYX_VPOS_BILINEAR_2D && st->pos_w)
+          vision_pos_embed_bilinear_add(x, st->pos_w, st->pos_grid_h, st->pos_grid_w, st->hidden, d_ch, d_cw, d_gh,
+                                        d_gw, N, sg.st);
+        if (st->pre_norm.present()) {
+          run_vnorm(st->pre_norm, x, st->hidden, h, st->hidden, N, st->hidden);
+          CK(cudaMemcpyAsync(x, h, size_t(N) * size_t(st->hidden) * sizeof(float), cudaMemcpyDeviceToDevice, sg.st));
+        }
+        cur_rows = N;
+        cur_width = st->hidden;
+      } else if (const auto* va = std::get_if<VitAttnBlock>(blk)) {
+        const int pw = va->nh * va->hd;
+        run_vnorm(va->norm, x, va->hidden, h, va->hidden, cur_rows, va->hidden);
+        gemm(h, va->hidden, va->w_qkv, 3 * pw, va->hidden, b1, 3 * pw, cur_rows, false, L);
+        if (va->qkv_b) add_bias(b1, 3 * pw, va->qkv_b, cur_rows, 3 * pw, sg.st);
+        auto head_norm = [&](const VNorm& qkn, int off_cols) {
+          if (!qkn.present()) return;
+          CK(cudaMemcpy2DAsync(b2, size_t(pw) * sizeof(float), b1 + off_cols, size_t(3 * pw) * sizeof(float),
+                               size_t(pw) * sizeof(float), size_t(cur_rows), cudaMemcpyDeviceToDevice, sg.st));
+          run_vnorm(qkn, b2, va->hd, b2, va->hd, cur_rows * va->nh, va->hd);
+          CK(cudaMemcpy2DAsync(b1 + off_cols, size_t(3 * pw) * sizeof(float), b2, size_t(pw) * sizeof(float),
+                               size_t(pw) * sizeof(float), size_t(cur_rows), cudaMemcpyDeviceToDevice, sg.st));
+        };
+        head_norm(va->q_norm, 0);
+        head_norm(va->k_norm, pw);
+        if (va->rope_mode == FLYX_VROPE_AXIAL_2D)
+          vision_rope_2d(b1, 3 * pw, 0, pw, va->nh, va->hd, va->theta, d_ch, d_cw, cur_rows, sg.st);
+        vision_attention(b1, 3 * pw, 0, pw, 2 * pw, va->nh, va->hd, d_cu, n_segs, cur_rows,
+                         1.f / std::sqrt(float(va->hd)), b2, pw, sg.st);
+        if (va->layer_scale) {
+          gemm(b2, pw, va->w_o, va->hidden, pw, h, va->hidden, cur_rows, false, L);
+          if (va->o_b) add_bias(h, va->hidden, va->o_b, cur_rows, va->hidden, sg.st);
+          vision_residual_add(x, h, va->layer_scale, cur_rows, va->hidden, sg.st);
+        } else {
+          gemm(b2, pw, va->w_o, va->hidden, pw, x, va->hidden, cur_rows, true, L);
+          if (va->o_b) add_bias(x, va->hidden, va->o_b, cur_rows, va->hidden, sg.st);
+        }
+      } else if (const auto* vf = std::get_if<VitMlpBlock>(blk)) {
+        run_vnorm(vf->norm, x, vf->hidden, h, vf->hidden, cur_rows, vf->hidden);
+        gemm(h, vf->hidden, vf->w_fc1, vf->inter, vf->hidden, b1, vf->inter, cur_rows, false, L);
+        if (vf->fc1_b) add_bias(b1, vf->inter, vf->fc1_b, cur_rows, vf->inter, sg.st);
+        if (vf->gated) {
+          gemm(h, vf->hidden, vf->w_gate, vf->inter, vf->hidden, b2, vf->inter, cur_rows, false, L);
+          if (vf->gate_b) add_bias(b2, vf->inter, vf->gate_b, cur_rows, vf->inter, sg.st);
+          vact_gated(b2, b1, b1, size_t(cur_rows) * size_t(vf->inter), vf->act, sg.st);
+        } else {
+          vact_apply(b1, size_t(cur_rows) * size_t(vf->inter), vf->act, sg.st);
+        }
+        if (vf->layer_scale) {
+          gemm(b1, vf->inter, vf->w_fc2, vf->hidden, vf->inter, h, vf->hidden, cur_rows, false, L);
+          if (vf->fc2_b) add_bias(h, vf->hidden, vf->fc2_b, cur_rows, vf->hidden, sg.st);
+          vision_residual_add(x, h, vf->layer_scale, cur_rows, vf->hidden, sg.st);
+        } else {
+          gemm(b1, vf->inter, vf->w_fc2, vf->hidden, vf->inter, x, vf->hidden, cur_rows, true, L);
+          if (vf->fc2_b) add_bias(x, vf->hidden, vf->fc2_b, cur_rows, vf->hidden, sg.st);
+        }
+      } else if (const auto* vm = std::get_if<VisionMergeBlock>(blk)) {
+        const int ms = std::max(1, vm->merge_size), grp = ms * ms;
+        if (!vm->post_norm && vm->norm.present()) {
+          run_vnorm(vm->norm, x, vm->in_hidden, h, vm->in_hidden, cur_rows, vm->in_hidden);
+          CK(cudaMemcpyAsync(x, h, size_t(cur_rows) * size_t(vm->in_hidden) * sizeof(float), cudaMemcpyDeviceToDevice,
+                             sg.st));
+        }
+        int out_r = cur_rows, merged_dim = vm->in_hidden;
+        float* merged_ptr = x;
+        if (vm->merge_mode == FLYX_VMERGE_SPATIAL_CONCAT) {
+          if (cur_rows % grp != 0) throw std::runtime_error("encode_vision: patch count not divisible by merge_size^2");
+          out_r = cur_rows / grp;
+          merged_dim = vm->in_hidden * grp;
+          merged_ptr = x;
+        } else if (vm->merge_mode == FLYX_VMERGE_AVG_POOL_2D) {
+          if (cur_rows % grp != 0) throw std::runtime_error("encode_vision: patch count not divisible by merge_size^2");
+          out_r = cur_rows / grp;
+          merged_dim = vm->in_hidden;
+          vision_avg_pool_blocks(x, out_r, grp, vm->in_hidden, b2, sg.st);
+          merged_ptr = b2;
+        }
+        if (vm->post_norm && vm->norm.present()) {
+          run_vnorm(vm->norm, merged_ptr, merged_dim, h, merged_dim, out_r, merged_dim);
+          merged_ptr = h;
+        }
+        const bool has_fc1 = vm->w_fc1.w || vm->w_fc1.q || vm->w_fc1.packed();
+        const bool has_fc2 = vm->w_fc2.w || vm->w_fc2.q || vm->w_fc2.packed();
+        if (has_fc1 && has_fc2) {
+          gemm(merged_ptr, merged_dim, vm->w_fc1, vm->merge_hidden, merged_dim, b1, vm->merge_hidden, out_r, false, L);
+          if (vm->fc1_b) add_bias(b1, vm->merge_hidden, vm->fc1_b, out_r, vm->merge_hidden, sg.st);
+          vact_apply(b1, size_t(out_r) * size_t(vm->merge_hidden), vm->act, sg.st);
+          gemm(b1, vm->merge_hidden, vm->w_fc2, vm->out_hidden, vm->merge_hidden, x, vm->out_hidden, out_r, false, L);
+          if (vm->fc2_b) add_bias(x, vm->out_hidden, vm->fc2_b, out_r, vm->out_hidden, sg.st);
+        } else if (has_fc2) {
+          gemm(merged_ptr, merged_dim, vm->w_fc2, vm->out_hidden, merged_dim, b1, vm->out_hidden, out_r, false, L);
+          if (vm->fc2_b) add_bias(b1, vm->out_hidden, vm->fc2_b, out_r, vm->out_hidden, sg.st);
+          CK(cudaMemcpyAsync(x, b1, size_t(out_r) * size_t(vm->out_hidden) * sizeof(float), cudaMemcpyDeviceToDevice,
+                             sg.st));
+        } else if (has_fc1) {
+          gemm(merged_ptr, merged_dim, vm->w_fc1, vm->out_hidden, merged_dim, b1, vm->out_hidden, out_r, false, L);
+          if (vm->fc1_b) add_bias(b1, vm->out_hidden, vm->fc1_b, out_r, vm->out_hidden, sg.st);
+          CK(cudaMemcpyAsync(x, b1, size_t(out_r) * size_t(vm->out_hidden) * sizeof(float), cudaMemcpyDeviceToDevice,
+                             sg.st));
+        } else if (merged_ptr != x) {
+          CK(cudaMemcpyAsync(x, merged_ptr, size_t(out_r) * size_t(merged_dim) * sizeof(float), cudaMemcpyDeviceToDevice,
+                             sg.st));
+        }
+        cur_rows = out_r;
+        cur_width = vm->out_hidden;
+      }
+    }
+
+    if (cur_rows > out_cap_rows)
+      throw std::runtime_error("encode_vision: output buffer too small (" + std::to_string(cur_rows) + " > " +
+                               std::to_string(out_cap_rows) + ")");
+    CK(cudaMemcpyAsync(out_embeds, x, size_t(cur_rows) * size_t(cur_width) * sizeof(float), cudaMemcpyDeviceToHost,
+                       sg.st));
+    if (borrowed && m->prefill_ev) CK(cudaEventRecord(m->prefill_ev, sg.st));
+    CK(cudaStreamSynchronize(sg.st));
+    if (out_rows) *out_rows = cur_rows;
     return 0;
   });
 }
@@ -1099,6 +1475,7 @@ int rewind(flyx_seq* s, int32_t pos, int32_t anchor) {
       return 1;
     }
     if (pos == s->position) {
+      s->prev_pos3d_at = -1;
       set_params(s, pos, anchor, s->round);
       return 1;
     }
@@ -1116,6 +1493,7 @@ int rewind(flyx_seq* s, int32_t pos, int32_t anchor) {
       }
       s->meta[sl].rows = rows;  // tokens past pos are discarded; later rewinds must not replay stale rows
       for (int k = 1; k <= back; ++k) s->meta[flyx_round_slot(r + k)].valid = false;
+      s->prev_pos3d_at = -1;
       set_params(s, pos, anchor, r + 1);
       CK(cudaGetLastError());
       return 1;
@@ -1139,6 +1517,7 @@ int checkpoint(flyx_seq* s, int32_t c) {
     copy_checkpoint_state(s, c, sl, pos, true, snap);
     s->ckp[c].valid = true;
     s->ckp[c].pos = pos;
+    s->ckp[c].rope_delta = snap ? s->snap_rope_delta : s->rope_delta;
     return pos;
   });
 }
@@ -1156,6 +1535,8 @@ int restore(flyx_seq* s, int32_t c, int32_t anchor) {
     check_idle(s);
     copy_checkpoint_state(s, c, flyx_round_slot(s->round), s->ckp[c].pos, false);
     for (auto& mt : s->meta) mt = {};
+    s->rope_delta = s->ckp[c].rope_delta;
+    s->prev_pos3d_at = -1;
     set_params(s, s->ckp[c].pos, anchor, s->round);
     return s->position;
   });
@@ -1314,7 +1695,8 @@ int snapshot_save(flyx_seq* s, int32_t c, int32_t begin, const flyx_host_pieces*
     return fail("a snapshot of this checkpoint takes " + std::to_string(need) + " bytes");
   return guarded([&] {
     check_idle(s);
-    const SnapshotHeader h{kSnapshotMagic, begin ? kDeltaVersion : kSnapshotVersion, layout_hash(s), pos, begin, need};
+    const SnapshotHeader h{kSnapshotMagic, begin ? kDeltaVersion : kSnapshotVersion, layout_hash(s), pos, begin, need,
+                           s->ckp[c].rope_delta, 0};
     HostCursor host{dst};
     host.put(&h, sizeof h);
     s->copy_home(false);  // the copy saved from its host home
@@ -1339,6 +1721,8 @@ int snapshot_load(flyx_seq* s, const flyx_host_pieces* src, uint64_t bytes, int3
     snapshot_parts(s, -1, h.begin, h.pos, host, false);
     s->copy_written(h.begin);
     for (auto& mt : s->meta) mt = {};
+    s->rope_delta = h.rope_delta;
+    s->prev_pos3d_at = -1;
     set_params(s, h.pos, anchor, s->round);
     sync_stream(s);  // the bytes are the caller's
     return s->position;

@@ -124,10 +124,11 @@ bool Generation::start() {
   }
 
   // Park and restore in one scheduler step. Time the incoming prefill from its own preparation.
-  if (req_.park_previous) s_->park_for(prompt, &result_.parked);
+  const auto* media = req_.media_spans.empty() ? nullptr : &req_.media_spans;
+  if (req_.park_previous) s_->park_for(prompt, &result_.parked, media);
   started_ms_ = os::now_ms();
   std::string err;
-  const int reused = s_->prepare(prompt, &result_.reuse, &err);
+  const int reused = s_->prepare(prompt, &result_.reuse, &err, media);
   if (reused < 0) return fail(err, true);
   // Penalties count the reply's tokens, and a reply starts here with none.
   if (!req_.prefill_only && penalized() && api_->set_reply(s_->seq(), nullptr, 0) != 0)
@@ -145,12 +146,13 @@ bool Generation::start() {
   const int align = e_->prefill_align();
   for (int32_t at : req_.checkpoints) {
     at = at / align * align;
-    if (at > reused && at < n_) cuts_.push_back(at);
+    if (at > reused && at < n_ && !interfaces::inside_media_span(req_.media_spans, at)) cuts_.push_back(at);
   }
   std::sort(cuts_.begin(), cuts_.end());
   cuts_.erase(std::unique(cuts_.begin(), cuts_.end()), cuts_.end());
   if (cuts_.size() > 2) cuts_.erase(cuts_.begin(), cuts_.end() - 2);
   keep_ = req_.keep_checkpoint >= 0 ? req_.keep_checkpoint / align * align : -1;
+  if (keep_ >= 0 && interfaces::inside_media_span(req_.media_spans, keep_)) keep_ = -1;
   pos_ = reused;
   phase_ = Phase::kPrefill;
   return true;
@@ -158,9 +160,11 @@ bool Generation::start() {
 
 bool Generation::prefill() {
   const auto& prompt = req_.prompt;
+  const auto* media = req_.media_spans.empty() ? nullptr : &req_.media_spans;
   if (cancelled()) {  // between passes: the state holds a valid prefix
-    s_->advanced(prompt, pos_);
-    if (checkpoint_due_) s_->take_checkpoint(prompt, pos_, due_keep_);
+    s_->advanced(prompt, pos_, media);
+    if (checkpoint_due_ && !interfaces::inside_media_span(req_.media_spans, pos_))
+      s_->take_checkpoint(prompt, pos_, due_keep_, Session::Anchor::None, false, media);
     result_.usage.prefill_ms = os::now_ms() - started_ms_;
     result_.usage.finish_reason = FLYX_FINISH_CANCEL;
     phase_ = Phase::kDone;
@@ -198,16 +202,51 @@ bool Generation::prefill() {
   const bool last = end == n_;
   const bool before_last = req_.prefill_only && last && n_ % align == 0 && pos_ > result_.usage.reused_tokens;
   if (checkpoint_due_ || anchor != Session::Anchor::None || before_last) {
-    s_->advanced(prompt, pos_);
-    const bool share = pos_ <= req_.share_system_prefix && req_.share_system_prefix < end;
-    s_->take_checkpoint(prompt, pos_, checkpoint_due_ && due_keep_, anchor, share);
+    s_->advanced(prompt, pos_, media);
+    if (!interfaces::inside_media_span(req_.media_spans, pos_)) {
+      const bool share = pos_ <= req_.share_system_prefix && req_.share_system_prefix < end;
+      s_->take_checkpoint(prompt, pos_, checkpoint_due_ && due_keep_, anchor, share, media);
+    }
     checkpoint_due_ = false;
   }
   const bool sample = last && !req_.prefill_only;
   if (align > 1 && api_->prefill_snapshot && api_->prefill_snapshot(s_->seq(), crossed) != 0)
     return fail(std::string("prefill_snapshot: ") + api_->last_error(), true);
-  if (api_->prefill(e_->prefill_plan(), s_->seq(), prompt.data() + pos_, end - pos_, sample ? &g_ : nullptr) != 0)
-    return fail(std::string("prefill: ") + api_->last_error(), true);
+  const bool multimodal = !req_.media_spans.empty() || !req_.prompt_embed_rows.empty() || req_.has_mrope;
+  if (!multimodal) {
+    if (api_->prefill(e_->prefill_plan(), s_->seq(), prompt.data() + pos_, end - pos_, sample ? &g_ : nullptr) != 0)
+      return fail(std::string("prefill: ") + api_->last_error(), true);
+  } else {
+    if (!api_->prefill_ex) return fail("backend does not support multimodal prefill", true);
+    flyx_prefill_input in{};
+    in.tokens = prompt.data() + pos_;
+    in.n = end - pos_;
+    std::vector<int32_t> local_rows;
+    if (!req_.prompt_embed_rows.empty()) {
+      const auto lo = std::lower_bound(req_.prompt_embed_rows.begin(), req_.prompt_embed_rows.end(), pos_);
+      const auto hi = std::lower_bound(lo, req_.prompt_embed_rows.end(), end);
+      if (lo != hi) {
+        const size_t first_idx = size_t(lo - req_.prompt_embed_rows.begin());
+        local_rows.reserve(size_t(hi - lo));
+        for (auto it = lo; it != hi; ++it) local_rows.push_back(*it - pos_);
+        in.embeds = req_.prompt_embeds.data() + first_idx * size_t(e_->model().desc().hidden);
+        in.embed_rows = local_rows.data();
+        in.n_embeds = static_cast<int32_t>(local_rows.size());
+      }
+    }
+    if (!req_.pos_3d.empty()) in.pos_3d = req_.pos_3d.data() + size_t(pos_) * 3;
+    if (req_.has_mrope) {
+      if (last) {
+        in.set_rope_delta = 1;
+        in.rope_delta = req_.rope_delta;
+      } else if (!interfaces::inside_media_span(req_.media_spans, end) && size_t(end) * 3 < req_.pos_3d.size()) {
+        in.set_rope_delta = 1;
+        in.rope_delta = req_.pos_3d[size_t(end) * 3] - end;
+      }
+    }
+    if (api_->prefill_ex(e_->prefill_plan(), s_->seq(), &in, sample ? &g_ : nullptr) != 0)
+      return fail(std::string("prefill_ex: ") + api_->last_error(), true);
+  }
   pos_ = end;
   if (req_.on_prefill) req_.on_prefill(pos_, n_);
   if (!last) {
@@ -216,7 +255,7 @@ bool Generation::prefill() {
     return true;
   }
   end_keep_ = crossed >= 0 && crossed == keep_;
-  s_->advanced(prompt, n_);
+  s_->advanced(prompt, n_, media);
   g_.mask = nullptr;  // rounds run unmasked unless a token has to be chosen again
   phase_ = Phase::kFinishPrefill;
   return true;
@@ -264,9 +303,11 @@ bool Generation::checkpoint_prompt_end() {
   // its alignment the prompt reaches; when the last pass crossed the kept cut, that is it.
   // A follow-up can reuse a long decoded tail. Its end-of-prefill checkpoint can now own those staged
   // KV pages and a restorable recurrent state. Short continuations keep their usual cheap checkpoint.
+  const auto* media = req_.media_spans.empty() ? nullptr : &req_.media_spans;
   const bool crossed_interval = n_ / kAnchorTokens > result_.usage.reused_tokens / kAnchorTokens;
-  return s_->take_checkpoint(req_.prompt, n_, end_keep_, s_->disk_cache() && crossed_interval ? Session::Anchor::Prefix
-                                                                                              : Session::Anchor::None);
+  return s_->take_checkpoint(req_.prompt, n_, end_keep_,
+                             s_->disk_cache() && crossed_interval ? Session::Anchor::Prefix : Session::Anchor::None,
+                             false, media);
 }
 
 bool Generation::finish_prefill() {
@@ -275,7 +316,9 @@ bool Generation::finish_prefill() {
     if (!checkpoint_prompt_end()) return fail("could not checkpoint the prefilled prompt", true);
     result_.usage.prefill_ms = os::now_ms() - started_ms_;
     result_.usage.finish_reason = cancelled() ? FLYX_FINISH_CANCEL : FLYX_FINISH_LENGTH;
-    s_->publish(req_.prompt, {}, 0, -1);
+    s_->publish(req_.prompt, {}, 0, -1, req_.media_spans.empty() ? nullptr : &req_.media_spans,
+                req_.rendered_text.empty() ? nullptr : &req_.rendered_text,
+                req_.rendered_images.empty() ? nullptr : &req_.rendered_images);
     phase_ = Phase::kDone;
     return false;
   }
@@ -386,7 +429,8 @@ bool Generation::round(bool wait, bool* busy) {
     // enter the staged prefix, excluding output held for a stop string and rounds after the reply ended.
     const int pos = s_->state_pos();
     if (launching_ && !cancelled() && pos >= next_disk_stage_ && size_t(pos) <= size_t(n_) + reply_.published())
-      s_->take_checkpoint(s_->tokens(), pos, false, Session::Anchor::Staging);
+      s_->take_checkpoint(s_->tokens(), pos, false, Session::Anchor::Staging, false,
+                          req_.media_spans.empty() ? nullptr : &req_.media_spans);
     next_disk_stage_ = s_->disk_cache() ? (int64_t(pos) / kAnchorTokens + 1) * kAnchorTokens : 0;
     stage_due_ = false;
   }
@@ -500,7 +544,10 @@ bool Generation::finish_up() {
   u.decode_ms = os::now_ms() - decoding_ms_;
   u.new_tokens = emitted_;
   u.finish_reason = finish_;
-  s_->publish(req_.prompt, reply_.tokens(), reply_.published(), result_.stop_token);
+  s_->publish(req_.prompt, reply_.tokens(), reply_.published(), result_.stop_token,
+              req_.media_spans.empty() ? nullptr : &req_.media_spans,
+              req_.rendered_text.empty() ? nullptr : &req_.rendered_text,
+              req_.rendered_images.empty() ? nullptr : &req_.rendered_images);
   phase_ = Phase::kDone;
   return false;
 }

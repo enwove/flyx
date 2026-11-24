@@ -123,12 +123,37 @@ void norm(const RefModel* M, const flyx_norm& n, const double* x, int len, doubl
   flyx::ops::rmsnorm(x, M->vec(n.w).data(), len, n.eps, n.offset, y);
 }
 
+void vnorm(const RefModel* M, const flyx_vnorm& n, const double* x, int len, double* y) {
+  if (n.w < 0 && n.b < 0) {
+    if (y != x) std::copy(x, x + len, y);
+    return;
+  }
+  const double* w = n.w >= 0 ? M->vec(n.w).data() : nullptr;
+  const double* b = n.b >= 0 ? M->vec(n.b).data() : nullptr;
+  if (n.kind == FLYX_NORM_LAYER) {
+    flyx::ops::layernorm(x, w, b, len, n.eps, y);
+  } else {
+    flyx::ops::rmsnorm(x, w, len, n.eps, n.offset, y);
+    if (b)
+      for (int i = 0; i < len; ++i) y[i] += b[i];
+  }
+}
+
+bool has_mrope(const flyx_attn_block& B) {
+  return B.mrope_section[0] > 0 || B.mrope_section[1] > 0 || B.mrope_section[2] > 0;
+}
+
 // One head of an attention block's q or k as attention takes it (ops::prep_head): its norm, none where the block
-// names none (weight -1), then the rotary at pos.
+// names none (weight -1), then the rotary at pos (or 3D MRoPE coordinates when pos_3d is given).
 void prep_head(const RefModel* M, const flyx_attn_block& B, const flyx_norm& n, const double* x, int pos,
-               double* y) {
+               double* y, const int32_t* pos_3d = nullptr) {
   const double* w = n.w < 0 ? nullptr : M->vec(n.w).data();
-  flyx::ops::prep_head(x, w, B.head_dim, n.eps, n.offset, pos, B.theta, B.rot_dim, y);
+  if (pos_3d && has_mrope(B)) {
+    flyx::ops::prep_head_3d(x, w, B.head_dim, n.eps, n.offset, pos_3d[0], pos_3d[1], pos_3d[2], B.theta, B.rot_dim,
+                            B.mrope_section, B.mrope_interleaved != 0, y);
+  } else {
+    flyx::ops::prep_head(x, w, B.head_dim, n.eps, n.offset, pos, B.theta, B.rot_dim, y);
+  }
 }
 
 struct RefPlan {
@@ -148,6 +173,7 @@ struct Slot {
 struct Ckpt {
   bool valid = false;
   int pos = 0;
+  int rope_delta = 0;
   std::vector<Vec> S, conv;
   Vec ring_h;  // the ring's vector at pos - 1 (the MTP drafter's next input)
 };
@@ -160,6 +186,9 @@ struct RefSeq {
   Slot slot[FLYX_ROUND_SLOTS];
   Ckpt ck[FLYX_CHECKPOINTS];
   int position = 0, anchor = 0, round = 0;
+  int rope_delta = 0;                  // ABI 44: scalar MRoPE decode offset (0 for text-only)
+  int32_t prev_pos3d[3] = {0, 0, 0};   // last prefill token's 3D pos (for cross-chunk MTP row 0)
+  int prev_pos3d_at = -1;              // sequence position that prev_pos3d corresponds to (-1: none)
   Vec head_logits;  // the head's rows of the last pass, vocab each (logits())
   bool stopped = false;
   std::deque<flyx_round_result> ring;
@@ -171,6 +200,9 @@ struct RefSeq {
   int rows = 0, start = 0;
   bool noop = false, sample_last = false;
   std::vector<int32_t> tok, drafts, choice;
+  // ABI 44: optional external embeddings & 3D positions for the current prefill pass only
+  std::unordered_map<int, const float*> embed_override;
+  const int32_t* pos_3d = nullptr;
   Vec x, feats;
   int last_n = 0, last_slot = 0;
 };
@@ -196,6 +228,8 @@ void reset_state(RefSeq* s) {
   }
   s->position = 0;
   s->round = 0;
+  s->rope_delta = 0;
+  s->prev_pos3d_at = -1;
   s->stopped = false;
 }
 
@@ -203,8 +237,14 @@ void embed_rows(RefSeq* s, const flyx_embed_block& e, const int32_t* ids, int n,
   const auto* E = s->m->w(e.table);
   const int H = e.hidden;
   x->assign(size_t(n) * H, 0.0);
-  for (int r = 0; r < n; ++r)
-    for (int c = 0; c < H; ++c) (*x)[size_t(r) * H + c] = load(E, size_t(ids[r]) * H + c);
+  for (int r = 0; r < n; ++r) {
+    auto ov = s->embed_override.find(r);
+    if (ov != s->embed_override.end()) {
+      for (int c = 0; c < H; ++c) (*x)[size_t(r) * H + c] = double(ov->second[c]);
+    } else {
+      for (int c = 0; c < H; ++c) (*x)[size_t(r) * H + c] = load(E, size_t(ids[r]) * H + c);
+    }
+  }
 }
 
 // ---- target layers ----------------------------------------------------------
@@ -297,8 +337,10 @@ void attn_mixer(RefSeq* s, const flyx_attn_block& B) {
   Vec tmp(hd);
   for (int r = 0; r < R; ++r) {
     int pos = s->start + r;
+    const int32_t* p3 = s->pos_3d ? s->pos_3d + size_t(r) * 3 : nullptr;
+    const int rope_pos = pos + (has_mrope(B) ? s->rope_delta : 0);
     for (int j = 0; j < nkv; ++j) {
-      prep_head(M, B, B.k_norm, &k[(size_t(r) * nkv + j) * hd], pos, tmp.data());
+      prep_head(M, B, B.k_norm, &k[(size_t(r) * nkv + j) * hd], rope_pos, tmp.data(), p3);
       std::copy(tmp.begin(), tmp.end(), &KC[(size_t(pos) * nkv + j) * hd]);
       std::copy(&v[(size_t(r) * nkv + j) * hd], &v[(size_t(r) * nkv + j) * hd] + hd, &VC[(size_t(pos) * nkv + j) * hd]);
     }
@@ -306,8 +348,10 @@ void attn_mixer(RefSeq* s, const flyx_attn_block& B) {
   Vec o(size_t(nh) * hd), y(H), q(hd);
   for (int r = 0; r < R; ++r) {
     int pos = s->start + r;
+    const int32_t* p3 = s->pos_3d ? s->pos_3d + size_t(r) * 3 : nullptr;
+    const int rope_pos = pos + (has_mrope(B) ? s->rope_delta : 0);
     for (int hh = 0; hh < nh; ++hh) {
-      prep_head(M, B, B.q_norm, &qg[size_t(r) * qw + q_at(B, hh)], pos, q.data());
+      prep_head(M, B, B.q_norm, &qg[size_t(r) * qw + q_at(B, hh)], rope_pos, q.data(), p3);
       attend(q.data(), KC.data(), VC.data(), pos + 1, nkv, hd, hh / (nh / nkv), 1.0 / std::sqrt(double(hd)),
              &o[size_t(hh) * hd]);
     }
@@ -523,13 +567,18 @@ void draft_block(RefSeq* s, const flyx_dflash2_block& d, int width) {
 // ---- MTP drafter (python/reference/flyx_ref/mtp.py) ----------------------------
 
 // x = fc([norm_emb(embed(tok)), norm_hidden(h)]); the engine's GEMM takes gemm_rows rows at once.
-void mtp_input(RefSeq* s, const flyx_mtp_block& B, const double* h, int tok, double* x, int gemm_rows) {
+void mtp_input(RefSeq* s, const flyx_mtp_block& B, const double* h, int tok, double* x, int gemm_rows,
+               const float* emb_override = nullptr) {
   const auto* M = s->m;
   const auto& e = M->block(B.embed).embed;
   const int H = e.hidden;
   Vec cat(2 * size_t(H)), emb(H);
-  const auto* E = M->w(e.table);
-  for (int c = 0; c < H; ++c) emb[c] = load(E, size_t(tok) * H + c);
+  if (emb_override) {
+    for (int c = 0; c < H; ++c) emb[c] = double(emb_override[c]);
+  } else {
+    const auto* E = M->w(e.table);
+    for (int c = 0; c < H; ++c) emb[c] = load(E, size_t(tok) * H + c);
+  }
   norm(M, B.norm_emb, emb.data(), H, cat.data());
   norm(M, B.norm_hidden, h, H, cat.data() + H);
   lin(M, B.fc, cat.data(), 1, 2 * H, H, x, gemm_rows);
@@ -538,10 +587,11 @@ void mtp_input(RefSeq* s, const flyx_mtp_block& B, const double* h, int tok, dou
 // Writes the K/V entry at pos from layer input x; q (nh*hd, normed and rotated) and gate if given.  The engine's
 // GEMMs take gemm_rows rows at once.
 void mtp_qkv(RefSeq* s, const flyx_attn_block& A, const double* x, int pos, double* q, double* gate,
-             int gemm_rows) {
+             int gemm_rows, const int32_t* pos_3d = nullptr) {
   const auto* M = s->m;
   const int H = A.hidden, nh = A.n_heads, nkv = A.n_kv, hd = A.head_dim;
   const int qw = (A.gate ? 2 : 1) * nh * hd;
+  const int rope_pos = pos + (has_mrope(A) ? s->rope_delta : 0);
   Vec h(H), qg(qw), k(size_t(nkv) * hd), v(size_t(nkv) * hd), tmp(hd);
   Vec& mK = s->K[size_t(A.kv)][0];
   Vec& mV = s->V[size_t(A.kv)][0];
@@ -549,14 +599,14 @@ void mtp_qkv(RefSeq* s, const flyx_attn_block& A, const double* x, int pos, doub
   lin(M, A.k, h.data(), 1, H, nkv * hd, k.data(), gemm_rows);
   lin(M, A.v, h.data(), 1, H, nkv * hd, v.data(), gemm_rows);
   for (int j = 0; j < nkv; ++j) {
-    prep_head(M, A, A.k_norm, &k[size_t(j) * hd], pos, tmp.data());
+    prep_head(M, A, A.k_norm, &k[size_t(j) * hd], rope_pos, tmp.data(), pos_3d);
     std::copy(tmp.begin(), tmp.end(), &mK[(size_t(pos) * nkv + j) * hd]);
     std::copy(&v[size_t(j) * hd], &v[size_t(j) * hd] + hd, &mV[(size_t(pos) * nkv + j) * hd]);
   }
   if (!q) return;
   lin(M, A.q, h.data(), 1, H, qw, qg.data(), gemm_rows);
   for (int hh = 0; hh < nh; ++hh) {
-    prep_head(M, A, A.q_norm, &qg[size_t(q_at(A, hh))], pos, &q[size_t(hh) * hd]);
+    prep_head(M, A, A.q_norm, &qg[size_t(q_at(A, hh))], rope_pos, &q[size_t(hh) * hd], pos_3d);
     if (A.gate) std::copy_n(&qg[size_t(gate_at(A, hh))], hd, gate + size_t(hh) * hd);
   }
 }
@@ -614,8 +664,15 @@ void mtp_context(RefSeq* s, const flyx_mtp_block& B, int rows) {
     const int pos = base - 1 + r;
     if (pos < 0) continue;
     const double* h = r == 0 ? &s->hidden_at[size_t(pos) * H] : &hn[size_t(r - 1) * H];
-    mtp_input(s, B, h, s->tok[r], x.data(), rows);  // the pass's rows, as the engine runs the context
-    mtp_qkv(s, M->block(B.attn).attn, x.data(), pos, nullptr, nullptr, rows);
+    auto ov = s->embed_override.find(r);
+    const float* emb = ov != s->embed_override.end() ? ov->second : nullptr;
+    const int32_t* p3 = nullptr;
+    if (s->pos_3d) {
+      if (r > 0) p3 = s->pos_3d + size_t(r - 1) * 3;
+      else if (s->prev_pos3d_at == pos) p3 = s->prev_pos3d;
+    }
+    mtp_input(s, B, h, s->tok[r], x.data(), rows, emb);  // the pass's rows, as the engine runs the context
+    mtp_qkv(s, M->block(B.attn).attn, x.data(), pos, nullptr, nullptr, rows, p3);
   }
   for (int r = 0; r < rows; ++r) std::copy(&hn[size_t(r) * H], &hn[size_t(r) * H] + H, &s->hidden_at[size_t(base + r) * H]);
 }
@@ -856,7 +913,7 @@ int open_model(const flyx_model_desc* desc, const flyx_open_options* opts, flyx_
     for (int i = 0; i < desc->n_blocks; ++i) {
       const int k = desc->blocks[i].kind;
       // DV's blocks (ABI 42) are taken and never run: such a model decodes here as without DV (lower).
-      if (k < FLYX_BLOCK_EMBED || k > FLYX_BLOCK_DV_LAYER)
+      if (k < FLYX_BLOCK_EMBED || k > FLYX_BLOCK_VISION_MERGE)
         throw std::runtime_error("block kind " + std::to_string(k) + ": not implemented by cpu_ref");
       if (k == FLYX_BLOCK_DFLASH2) m->dflash = i;
       const flyx_block& b = desc->blocks[i];
@@ -922,6 +979,24 @@ void close_model(flyx_bmodel* m) { delete as_m(m); }
 int lower(flyx_bmodel* bm, const flyx_program* prog, flyx_plan** out) {
   if (prog->n_checkpoints > 0) return fail("adaptive rounds: not in this backend");
   RefModel* m = as_m(bm);
+  if (prog->phase == FLYX_PHASE_VISION) {
+    for (int i = 0; i < prog->n_nodes; ++i) {
+      const flyx_node& n = prog->nodes[i];
+      if (n.kind != FLYX_NODE_RUN || n.block < 0 || n.block >= int(m->blocks.size()))
+        return fail("vision program: invalid node");
+      const int k = m->block(n.block).kind;
+      if (k < FLYX_BLOCK_VISION_STEM || k > FLYX_BLOCK_VISION_MERGE)
+        return fail("vision program: non-vision block kind " + std::to_string(k));
+    }
+    auto p = std::make_unique<RefPlan>();
+    p->m = m;
+    p->phase = FLYX_PHASE_VISION;
+    p->width = 0;
+    p->max_rows = prog->max_rows;
+    p->nodes.assign(prog->nodes, prog->nodes + prog->n_nodes);
+    *out = reinterpret_cast<flyx_plan*>(p.release());
+    return 0;
+  }
   int most = 0;  // drafts the round may verify: up to a full round of given ones, else what its drafter proposes
   for (int i = 0; i < prog->n_nodes; ++i) {
     const flyx_node& n = prog->nodes[i];
@@ -984,14 +1059,25 @@ int seq_new(flyx_bmodel* bm, int32_t max_ctx, flyx_seq** out) {
 
 void seq_free(flyx_seq* s) { delete as_s(s); }
 
-int prefill(flyx_plan* bp, flyx_seq* bs, const int32_t* tokens, int32_t n, const flyx_gen_params* sample) {
+int prefill_ex(flyx_plan* bp, flyx_seq* bs, const flyx_prefill_input* in, const flyx_gen_params* sample) {
   RefPlan* p = as_p(bp);
   RefSeq* s = as_s(bs);
   if (p->phase != FLYX_PHASE_PREFILL) return fail("not a prefill plan");
+  if (!in || !in->tokens) return fail("prefill_ex: null input");
+  const int32_t n = in->n;
   if (n <= 0 || n > p->max_rows) return fail("prefill chunk size out of range");
   if (!flyx_room(s->position + n, s->max_ctx)) return fail("context is full");
+  if (in->n_embeds < 0 || (in->n_embeds > 0 && (!in->embeds || !in->embed_rows)))
+    return fail("prefill_ex: invalid external embeddings");
   try {
-    s->tok.assign(tokens, tokens + n);
+    s->tok.assign(in->tokens, in->tokens + n);
+    s->embed_override.clear();
+    for (int32_t i = 0; i < in->n_embeds; ++i) {
+      const int32_t r = in->embed_rows[i];
+      if (r < 0 || r >= n) return fail("prefill_ex: embed_rows index out of range");
+      s->embed_override[r] = in->embeds + size_t(i) * size_t(s->m->hidden);
+    }
+    s->pos_3d = in->pos_3d;
     s->rows = n;
     s->start = s->position;
     s->sample_last = sample != nullptr;
@@ -1001,6 +1087,17 @@ int prefill(flyx_plan* bp, flyx_seq* bs, const int32_t* tokens, int32_t n, const
     // but the current slot no longer starts a recorded round.
     s->slot[cur_slot(s)].replay_valid = false;
     run_nodes(p, s);
+    if (in->pos_3d) {
+      s->prev_pos3d[0] = in->pos_3d[size_t(n - 1) * 3 + 0];
+      s->prev_pos3d[1] = in->pos_3d[size_t(n - 1) * 3 + 1];
+      s->prev_pos3d[2] = in->pos_3d[size_t(n - 1) * 3 + 2];
+      s->prev_pos3d_at = s->position + n - 1;
+    } else {
+      s->prev_pos3d_at = -1;
+    }
+    s->embed_override.clear();
+    s->pos_3d = nullptr;
+    if (in->set_rope_delta) s->rope_delta = in->rope_delta;
     s->position += n;
     s->stopped = false;
     if (sample) {
@@ -1014,9 +1111,253 @@ int prefill(flyx_plan* bp, flyx_seq* bs, const int32_t* tokens, int32_t n, const
       s->ring.push_back(r);
     }
   } catch (const std::exception& e) {
+    s->embed_override.clear();
+    s->pos_3d = nullptr;
     return fail(e.what());
   }
   return 0;
+}
+
+int prefill(flyx_plan* bp, flyx_seq* bs, const int32_t* tokens, int32_t n, const flyx_gen_params* sample) {
+  flyx_prefill_input in{};
+  in.tokens = tokens;
+  in.n = n;
+  return prefill_ex(bp, bs, &in, sample);
+}
+
+// ---- Stateless Vision Encoder (ABI 44) --------------------------------------------------
+
+struct VisionState {
+  int rows = 0;
+  int width = 0;
+  Vec x;
+  const int32_t* grid_thw = nullptr;
+  int n_grids = 0;
+  const int32_t* cu_seqlens = nullptr;
+  int n_segs = 0;
+};
+
+void run_vision_stem(const RefModel* M, const flyx_vision_stem_block& B, const flyx_vision_input* in,
+                     VisionState* vs) {
+  if (in->patch_dim != B.in_dim)
+    throw std::runtime_error("vision_stem: patch_dim mismatch (" + std::to_string(in->patch_dim) + " vs " +
+                             std::to_string(B.in_dim) + ")");
+  const int N = in->n_patches, H = B.hidden;
+  Vec inp(size_t(N) * size_t(B.in_dim));
+  for (size_t i = 0; i < inp.size(); ++i) inp[i] = double(in->patches[i]);
+  vs->rows = N;
+  vs->width = H;
+  vs->x.assign(size_t(N) * size_t(H), 0.0);
+  if (B.patch_w2 >= 0) {
+    const int half = B.in_dim / 2;
+    Vec p0(size_t(N) * size_t(half)), p1(size_t(N) * size_t(half)), y1(size_t(N) * size_t(H));
+    for (int r = 0; r < N; ++r) {
+      std::copy_n(&inp[size_t(r) * B.in_dim], half, &p0[size_t(r) * half]);
+      std::copy_n(&inp[size_t(r) * B.in_dim + half], half, &p1[size_t(r) * half]);
+    }
+    lin(M, B.patch_w, p0.data(), N, half, H, vs->x.data(), N);
+    lin(M, B.patch_w2, p1.data(), N, half, H, y1.data(), N);
+    for (size_t i = 0; i < vs->x.size(); ++i) vs->x[i] += y1[i];
+  } else {
+    lin(M, B.patch_w, inp.data(), N, B.in_dim, H, vs->x.data(), N);
+  }
+  if (B.patch_b >= 0) add_bias(vs->x.data(), H, M->vec(B.patch_b).data(), N, H);
+  if (B.pos_mode == FLYX_VPOS_ADD_FIXED && B.pos_w >= 0) {
+    const Vec& pos = M->vec(B.pos_w);
+    for (int r = 0; r < N; ++r) {
+      const size_t idx = size_t(r % (int(pos.size()) / H)) * H;
+      for (int c = 0; c < H; ++c) vs->x[size_t(r) * H + c] += pos[idx + c];
+    }
+  } else if (B.pos_mode == FLYX_VPOS_BILINEAR_2D && B.pos_w >= 0) {
+    const Vec& pos = M->vec(B.pos_w);
+    vision_pos_embed_bilinear_add(vs->x.data(), pos.data(), B.pos_grid_h, B.pos_grid_w, H,
+                                  vs->grid_thw, vs->n_grids, B.merge_size);
+  }
+  if (B.pre_norm.w >= 0 || B.pre_norm.b >= 0) {
+    Vec tmp(static_cast<size_t>(H));
+    for (int r = 0; r < N; ++r) {
+      vnorm(M, B.pre_norm, &vs->x[size_t(r) * H], H, tmp.data());
+      std::copy(tmp.begin(), tmp.end(), &vs->x[size_t(r) * H]);
+    }
+  }
+}
+
+void run_vit_attn(const RefModel* M, const flyx_vit_attn_block& B, VisionState* vs) {
+  const int N = vs->rows, H = B.hidden, nh = B.n_heads, hd = B.head_dim;
+  const int proj_w = nh * hd;
+  Vec h(size_t(N) * H);
+  for (int r = 0; r < N; ++r) vnorm(M, B.norm, &vs->x[size_t(r) * H], H, &h[size_t(r) * H]);
+  Vec Q(size_t(N) * proj_w), K(size_t(N) * proj_w), V(size_t(N) * proj_w);
+  if (B.qkv >= 0) {
+    Vec qkv(size_t(N) * 3 * proj_w);
+    lin(M, B.qkv, h.data(), N, H, 3 * proj_w, qkv.data(), N);
+    if (B.qkv_b >= 0) add_bias(qkv.data(), 3 * proj_w, M->vec(B.qkv_b).data(), N, 3 * proj_w);
+    for (int r = 0; r < N; ++r) {
+      const double* row = &qkv[size_t(r) * 3 * proj_w];
+      std::copy_n(row, proj_w, &Q[size_t(r) * proj_w]);
+      std::copy_n(row + proj_w, proj_w, &K[size_t(r) * proj_w]);
+      std::copy_n(row + 2 * proj_w, proj_w, &V[size_t(r) * proj_w]);
+    }
+  } else {
+    lin(M, B.q, h.data(), N, H, proj_w, Q.data(), N);
+    lin(M, B.k, h.data(), N, H, proj_w, K.data(), N);
+    lin(M, B.v, h.data(), N, H, proj_w, V.data(), N);
+    if (B.q_b >= 0) add_bias(Q.data(), proj_w, M->vec(B.q_b).data(), N, proj_w);
+    if (B.k_b >= 0) add_bias(K.data(), proj_w, M->vec(B.k_b).data(), N, proj_w);
+    if (B.v_b >= 0) add_bias(V.data(), proj_w, M->vec(B.v_b).data(), N, proj_w);
+  }
+  if (B.q_norm.w >= 0 || B.k_norm.w >= 0) {
+    Vec tmp(static_cast<size_t>(hd));
+    for (int r = 0; r < N; ++r) {
+      for (int hh = 0; hh < nh; ++hh) {
+        if (B.q_norm.w >= 0) {
+          vnorm(M, B.q_norm, &Q[(size_t(r) * nh + hh) * hd], hd, tmp.data());
+          std::copy(tmp.begin(), tmp.end(), &Q[(size_t(r) * nh + hh) * hd]);
+        }
+        if (B.k_norm.w >= 0) {
+          vnorm(M, B.k_norm, &K[(size_t(r) * nh + hh) * hd], hd, tmp.data());
+          std::copy(tmp.begin(), tmp.end(), &K[(size_t(r) * nh + hh) * hd]);
+        }
+      }
+    }
+  }
+  if (B.rope_mode == FLYX_VROPE_AXIAL_2D) {
+    std::vector<int32_t> ch, cw;
+    vision_spatial_coords(vs->grid_thw, vs->n_grids, B.merge_size, &ch, &cw);
+    if (int(ch.size()) != N) throw std::runtime_error("vit_attn: grid_thw patch count mismatch");
+    for (int r = 0; r < N; ++r)
+      for (int hh = 0; hh < nh; ++hh) {
+        rope_2d_axial(&Q[(size_t(r) * nh + hh) * hd], ch[size_t(r)], cw[size_t(r)], B.theta, hd);
+        rope_2d_axial(&K[(size_t(r) * nh + hh) * hd], ch[size_t(r)], cw[size_t(r)], B.theta, hd);
+      }
+  }
+  Vec out(size_t(N) * proj_w, 0.0);
+  const double scale = 1.0 / std::sqrt(double(hd));
+  const int n_segs = vs->n_segs > 0 ? vs->n_segs : 1;
+  const int32_t fallback[2] = {0, N};
+  const int32_t* cu = vs->n_segs > 0 ? vs->cu_seqlens : fallback;
+  for (int seg = 0; seg < n_segs; ++seg) {
+    const int s0 = cu[seg], s1 = cu[seg + 1];
+    for (int r = s0; r < s1; ++r)
+      for (int hh = 0; hh < nh; ++hh)
+        attend_range(&Q[(size_t(r) * nh + hh) * hd], K.data(), V.data(), s0, s1, nh, hd, hh, scale,
+                     &out[(size_t(r) * nh + hh) * hd]);
+  }
+  Vec y(size_t(N) * H);
+  lin(M, B.o, out.data(), N, proj_w, H, y.data(), N);
+  if (B.o_b >= 0) add_bias(y.data(), H, M->vec(B.o_b).data(), N, H);
+  const double* ls = B.layer_scale >= 0 ? M->vec(B.layer_scale).data() : nullptr;
+  for (int r = 0; r < N; ++r)
+    for (int c = 0; c < H; ++c)
+      vs->x[size_t(r) * H + c] += ls ? y[size_t(r) * H + c] * ls[c] : y[size_t(r) * H + c];
+}
+
+void run_vit_mlp(const RefModel* M, const flyx_vit_mlp_block& B, VisionState* vs) {
+  const int N = vs->rows, H = B.hidden, I = B.inter;
+  Vec h(size_t(N) * H);
+  for (int r = 0; r < N; ++r) vnorm(M, B.norm, &vs->x[size_t(r) * H], H, &h[size_t(r) * H]);
+  Vec mid(size_t(N) * I);
+  lin(M, B.fc1, h.data(), N, H, I, mid.data(), N);
+  if (B.fc1_b >= 0) add_bias(mid.data(), I, M->vec(B.fc1_b).data(), N, I);
+  if (B.gated) {
+    Vec g(size_t(N) * I);
+    lin(M, B.gate, h.data(), N, H, I, g.data(), N);
+    if (B.gate_b >= 0) add_bias(g.data(), I, M->vec(B.gate_b).data(), N, I);
+    for (size_t i = 0; i < mid.size(); ++i) mid[i] = vact(g[i], B.act) * mid[i];
+  } else {
+    for (double& v : mid) v = vact(v, B.act);
+  }
+  Vec y(size_t(N) * H);
+  lin(M, B.fc2, mid.data(), N, I, H, y.data(), N);
+  if (B.fc2_b >= 0) add_bias(y.data(), H, M->vec(B.fc2_b).data(), N, H);
+  const double* ls = B.layer_scale >= 0 ? M->vec(B.layer_scale).data() : nullptr;
+  for (int r = 0; r < N; ++r)
+    for (int c = 0; c < H; ++c)
+      vs->x[size_t(r) * H + c] += ls ? y[size_t(r) * H + c] * ls[c] : y[size_t(r) * H + c];
+}
+
+void run_vision_merge(const RefModel* M, const flyx_vision_merge_block& B, VisionState* vs) {
+  const int N = vs->rows, H = B.in_hidden;
+  const int m = std::max(1, B.merge_size);
+  const int group = m * m;
+  if (!B.post_norm && (B.norm.w >= 0 || B.norm.b >= 0)) {
+    Vec tmp(static_cast<size_t>(H));
+    for (int r = 0; r < N; ++r) {
+      vnorm(M, B.norm, &vs->x[size_t(r) * H], H, tmp.data());
+      std::copy(tmp.begin(), tmp.end(), &vs->x[size_t(r) * H]);
+    }
+  }
+  int out_rows = N;
+  int merged_dim = H;
+  Vec cur;
+  if (B.merge_mode == FLYX_VMERGE_SPATIAL_CONCAT) {
+    if (N % group != 0) throw std::runtime_error("vision_merge: patch count not divisible by merge_size^2");
+    out_rows = N / group;
+    merged_dim = H * group;
+    cur = std::move(vs->x);  // already contiguous in spatial-merge order!
+  } else if (B.merge_mode == FLYX_VMERGE_AVG_POOL_2D) {
+    if (N % group != 0) throw std::runtime_error("vision_merge: patch count not divisible by merge_size^2");
+    out_rows = N / group;
+    merged_dim = H;
+    cur.resize(size_t(out_rows) * merged_dim);
+    vision_avg_pool_blocks(vs->x.data(), out_rows, group, H, cur.data());
+  } else {
+    cur = std::move(vs->x);
+  }
+  if (B.post_norm && (B.norm.w >= 0 || B.norm.b >= 0)) {
+    Vec tmp(static_cast<size_t>(merged_dim));
+    for (int r = 0; r < out_rows; ++r) {
+      vnorm(M, B.norm, &cur[size_t(r) * merged_dim], merged_dim, tmp.data());
+      std::copy(tmp.begin(), tmp.end(), &cur[size_t(r) * merged_dim]);
+    }
+  }
+  Vec proj;
+  if (B.fc1_out > 0 && B.fc1 >= 0) {
+    Vec mid(size_t(out_rows) * B.fc1_out);
+    lin(M, B.fc1, cur.data(), out_rows, merged_dim, B.fc1_out, mid.data(), out_rows);
+    if (B.fc1_b >= 0) add_bias(mid.data(), B.fc1_out, M->vec(B.fc1_b).data(), out_rows, B.fc1_out);
+    for (double& v : mid) v = vact(v, B.act);
+    proj.resize(size_t(out_rows) * B.out_hidden);
+    lin(M, B.fc2, mid.data(), out_rows, B.fc1_out, B.out_hidden, proj.data(), out_rows);
+  } else {
+    proj.resize(size_t(out_rows) * B.out_hidden);
+    lin(M, B.fc2, cur.data(), out_rows, merged_dim, B.out_hidden, proj.data(), out_rows);
+  }
+  if (B.fc2_b >= 0) add_bias(proj.data(), B.out_hidden, M->vec(B.fc2_b).data(), out_rows, B.out_hidden);
+  vs->rows = out_rows;
+  vs->width = B.out_hidden;
+  vs->x = std::move(proj);
+}
+
+int encode_vision(flyx_plan* bp, const flyx_vision_input* in, float* out_embeds, int32_t out_cap_rows,
+                  int32_t* out_rows) {
+  RefPlan* p = as_p(bp);
+  if (!p || p->phase != FLYX_PHASE_VISION) return fail("encode_vision: not a vision plan");
+  if (!in || !in->patches || in->n_patches <= 0 || in->patch_dim <= 0) return fail("encode_vision: invalid input");
+  if (!out_embeds || out_cap_rows <= 0) return fail("encode_vision: invalid output buffer");
+  try {
+    VisionState vs{};
+    vs.grid_thw = in->grid_thw;
+    vs.n_grids = in->n_grids;
+    vs.cu_seqlens = in->cu_seqlens;
+    vs.n_segs = in->n_segs;
+    for (const flyx_node& n : p->nodes) {
+      const flyx_block& b = p->m->block(n.block);
+      switch (b.kind) {
+        case FLYX_BLOCK_VISION_STEM: run_vision_stem(p->m, b.vision_stem, in, &vs); break;
+        case FLYX_BLOCK_VIT_ATTN: run_vit_attn(p->m, b.vit_attn, &vs); break;
+        case FLYX_BLOCK_VIT_MLP: run_vit_mlp(p->m, b.vit_mlp, &vs); break;
+        case FLYX_BLOCK_VISION_MERGE: run_vision_merge(p->m, b.vision_merge, &vs); break;
+        default: throw std::runtime_error("encode_vision: unsupported block kind " + std::to_string(b.kind));
+      }
+    }
+    if (vs.rows > out_cap_rows) return fail("encode_vision: output buffer too small");
+    for (size_t i = 0; i < vs.x.size(); ++i) out_embeds[i] = float(vs.x[i]);
+    if (out_rows) *out_rows = vs.rows;
+    return 0;
+  } catch (const std::exception& e) {
+    return fail(e.what());
+  }
 }
 
 int launch(flyx_plan* bp, flyx_seq* bs, const flyx_gen_params* g) {
@@ -1084,7 +1425,7 @@ int checkpoint(flyx_seq* bs, int32_t c) {
   RefSeq* s = as_s(bs);
   if (c < 0 || c >= FLYX_CHECKPOINTS) return fail("bad checkpoint slot");
   const Slot& sl = s->slot[cur_slot(s)];
-  s->ck[c] = {true, s->position, sl.S, sl.conv, {}};
+  s->ck[c] = {true, s->position, s->rope_delta, sl.S, sl.conv, {}};
   if (!s->hidden_at.empty() && s->position > 0) {
     const size_t W = size_t(s->m->ring_width);
     s->ck[c].ring_h.assign(s->hidden_at.begin() + (s->position - 1) * W, s->hidden_at.begin() + s->position * W);
@@ -1100,6 +1441,8 @@ int restore(flyx_seq* bs, int32_t c, int32_t anchor) {
   sl.S = s->ck[c].S;
   sl.conv = s->ck[c].conv;
   s->position = s->ck[c].pos;
+  s->rope_delta = s->ck[c].rope_delta;
+  s->prev_pos3d_at = -1;
   if (!s->ck[c].ring_h.empty())
     std::copy(s->ck[c].ring_h.begin(), s->ck[c].ring_h.end(),
               s->hidden_at.begin() + size_t(s->position - 1) * s->m->ring_width);
@@ -1213,7 +1556,7 @@ int snapshot_save(flyx_seq* bs, int32_t c, int32_t begin, const flyx_host_pieces
   if (bytes < need || !pieces_hold(dst, need))
     return fail("a snapshot of this checkpoint takes " + std::to_string(need) + " bytes");
   const SnapshotHeader h{kSnapshotMagic, begin ? kDeltaVersion : kSnapshotVersion, layout_hash(s->m),
-                         ck.pos, begin, need};
+                         ck.pos, begin, need, ck.rope_delta, 0};
   HostCursor out{dst};
   out.put(&h, sizeof h);
   auto put = [&](const double* v, size_t n) { out.put(v, n * sizeof(double)); };
@@ -1266,6 +1609,8 @@ int snapshot_load(flyx_seq* bs, const flyx_host_pieces* src, uint64_t bytes, int
   if (s->m->ring_width > 0 && h.pos > 0)
     get(s->hidden_at.data() + size_t(h.pos - 1) * s->m->ring_width, size_t(s->m->ring_width));
   s->position = h.pos;
+  s->rope_delta = h.rope_delta;
+  s->prev_pos3d_at = -1;
   s->anchor = anchor;
   s->stopped = false;
   s->ring.clear();
@@ -1299,6 +1644,8 @@ const flyx_backend_api kApi = {
     host_alloc, host_free, logits, seq_new_in, seq_size, nullptr,  // trim: nothing kept for speed
     nullptr,                                                       // graph_stats: no graphs
     nullptr,  // prefill_snapshot: prefill_align 1, a pass crosses no boundary it keeps
+    encode_vision,
+    prefill_ex,
 };
 
 }  // namespace

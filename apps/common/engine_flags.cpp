@@ -95,6 +95,10 @@ bool engine_flag(const std::string& a, const std::function<std::string()>& value
     eo->drafter = v;
   } else if (a == "--drafter-file") {
     eo->drafter_files.push_back(value());
+  } else if (a == "--mmproj") {
+    eo->mmproj_file = value();
+  } else if (a == "--no-vision") {
+    eo->vision = false;
   } else if (a == "--activations") {
     eo->activations = value();
   } else if (a == "--chat-template") {
@@ -150,6 +154,8 @@ std::string engine_flags_help(int ctx) {
          "  --drafter-file F     a drafter in a file of its own (repeatable): the MTP layer from a GGUF, for a GGUF\n"
          "                       without it (unsloth's MTP/mtp-*.gguf), or a DFlash2 drafter file (python/convert\n"
          "                       --draft alone), for a model of either format\n"
+         "  --mmproj F           multimodal vision projector GGUF (mmproj-*.gguf) beside the model file\n"
+         "  --no-vision          do not load a vision encoder even if a projector is available\n"
          "  --width N            fix the model drafter's width at N, up to its maximum (default: chosen per round)\n"
          "                       prompt lookup can still verify 15 drafts from earlier text (disable with --no-lookup)\n"
          "                       but not beside a DV drafter, whose rounds then run alone: its widest of at most N\n"

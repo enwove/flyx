@@ -330,7 +330,9 @@ int seq_bytes(flyx_bmodel* m, int32_t max_ctx, uint64_t* out) {
 int memory(flyx_bmodel* m, flyx_memory_info* out) {
   *out = {};
   out->weights = m->bytes;
-  out->workspace = m->prefill_bytes;
+  out->workspace = m->prefill_bytes + m->prefill_embeds_cap * sizeof(float) +
+                   m->prefill_embed_rows_cap * sizeof(int32_t) +
+                   m->prefill_pos3d_cap * sizeof(int32_t);
   size_t fr = 0, tot = 0;
   if (!gpu_memory(&fr, &tot)) return fail("cudaMemGetInfo failed");
   out->free = fr;

@@ -27,6 +27,7 @@ struct Fetched {
   std::string model;                  // a path
   std::vector<std::string> drafters;  // paths: the ones named, and the MTP file of the model's repository when the
                                       // model's GGUF lacks the layer
+  std::string mmproj;                 // path to multimodal vision projector GGUF (empty: none)
   std::string name;                   // the model's name for the API: its file's, without the extension
   std::vector<std::string> notes;     // for the log: a drafter published for this model, the MTP file taken
   std::vector<DrafterSource> drafter_sources;  // what the model drafts with: its own MTP layer, the files above
@@ -34,8 +35,10 @@ struct Fetched {
 };
 
 // Fetches what is missing. want_mtp: take the repository's MTP file for a GGUF without the layer.
+// want_vision: take the repository's mmproj GGUF when no explicit mmproj path was given.
 bool fetch_model(const std::string& model, const std::vector<std::string>& drafters, bool want_mtp,
-                 const hub::ProgressFn& progress, const std::atomic<bool>* stop, Fetched* out, std::string* err);
+                 const hub::ProgressFn& progress, const std::atomic<bool>* stop, Fetched* out, std::string* err,
+                 const std::string& mmproj = "", bool want_vision = true);
 
 // Whether `eo` drafts with the MTP layer when the model has one (not --no-spec, not --drafter dflash2 or none).
 bool wants_mtp(const EngineOptions& eo);

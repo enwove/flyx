@@ -107,6 +107,8 @@ bool is_drafter(const Repo& r);
 bool select(const Repo& r, const Name& name, std::vector<RepoFile>* files, std::string* err);
 // The MTP layer in a GGUF of its own beside the models (unsloth: MTP/mtp-*.gguf), or nullptr.
 const RepoFile* mtp_file(const Repo& r);
+// The multimodal vision projector in a GGUF beside the models (e.g. mmproj-BF16.gguf), or nullptr.
+const RepoFile* mmproj_file(const Repo& r);
 
 struct Progress {
   std::string file;                  // the one being fetched

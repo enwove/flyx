@@ -657,7 +657,10 @@ bool read_gguf(const uint8_t* data, size_t size, const std::string& path, ModelF
                std::string* err, bool need_tokenizer) {
   try {
     ShardHeader h = parse_shard_header(data, size, false, need_tokenizer);
-    if (h.meta.value("general.type", "model") != "model") invalid("GGUF is not a complete model");
+    const std::string gtype = h.meta.value("general.type", "model");
+    if (gtype != "model" && (need_tokenizer || gtype != "mmproj"))
+      invalid(gtype == "mmproj" ? "GGUF is a multimodal projector (pass beside a model with --mmproj)"
+                                : "GGUF is not a complete model");
     if (h.meta.contains("split.count") && integer(h.meta.at("split.count"), "split.count", 0, INT_MAX) > 1)
       invalid("split GGUF requires opening its files from disk");
     ModelFile::Contents result;
@@ -682,7 +685,10 @@ bool read_gguf(std::vector<std::unique_ptr<os::MappedFile>>* maps, const std::st
         initial.meta.contains("split.count") ? int(integer(initial.meta.at("split.count"), "split.count", 0, 99999)) : 1;
     if (split_count <= 1) {
       if (initial.n_tensors == 0) invalid("invalid GGUF tensor/metadata counts");
-      if (initial.meta.value("general.type", "model") != "model") invalid("GGUF is not a complete model");
+      const std::string gtype = initial.meta.value("general.type", "model");
+      if (gtype != "model" && (need_tokenizer || gtype != "mmproj"))
+        invalid(gtype == "mmproj" ? "GGUF is a multimodal projector (pass beside a model with --mmproj)"
+                                  : "GGUF is not a complete model");
       ModelFile::Contents result;
       bool quantized = false;
       append_shard_tensors((*maps)[0]->data(), (*maps)[0]->size(), initial, &result, &quantized);

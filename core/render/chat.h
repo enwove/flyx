@@ -25,10 +25,13 @@ namespace flyx {
 using ojson = nlohmann::ordered_json;
 using interfaces::ChatMessage;
 using interfaces::ChatOptions;
+using interfaces::ContentPart;
+using interfaces::ImageInput;
 using interfaces::ReplyRules;
 using interfaces::OutputEvent;
 using interfaces::OutputParser;
 using interfaces::RenderedChat;
+using interfaces::RenderedImage;
 using interfaces::ToolCall;
 
 // A stable prefix requested by the client, expressed in the normalized conversation.
