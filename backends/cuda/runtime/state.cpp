@@ -563,8 +563,10 @@ void alloc_state(const flyx_bmodel* m, flyx_seq* s) {
         const uint64_t q_bytes = uint64_t(strata_positions(s->cap)) * k.nkv * words * sizeof(uint32_t);
         if (hosted(idx)) {
           prio1_base += 2 * q_bytes + 2 * uint64_t(s->cap) * k.nkv * sizeof(__half2);
-        } else if (s->copy_host > 0) {
-          // Resident copies sharing the staging pool may still hold a host parking copy.
+        } else {
+          // A resident copy that reaches into the stagings' or the shared prefill slab's part of the pool keeps a
+          // pinned home in host memory too (pool_finish), whether or not other copies live there.  Every one is
+          // counted: the split then never pins more than the budget, at worst a layer more than needed is pageable.
           prio1_base += 2 * q_bytes;
         }
         const size_t row = row_of(k);
