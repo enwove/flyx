@@ -290,6 +290,8 @@ int Tables::attn_block(const std::string& prefix, const AttnBlockSpec& s, const 
     a.q_norm = a.k_norm = flyx_norm{-1, 0, 0.0, 0.0};  // the heads go to the rotary as projected (backend_abi.h)
   }
   a.kv = state(st);
+  for (int i = 0; i < 3; ++i) a.mrope_section[i] = s.mrope_section[i];
+  a.mrope_interleaved = s.mrope_interleaved ? 1 : 0;
   return block(b);
 }
 
@@ -355,6 +357,21 @@ constexpr ArchEntry kArchitectures[] = {
 };
 
 }  // namespace
+
+int32_t find_added_token(const ModelFile& file, std::string_view content) {
+  const std::string_view raw = file.blob("tokenizer.added");
+  if (raw.empty()) return -1;
+  const nlohmann::json j = nlohmann::json::parse(raw.begin(), raw.end(), nullptr, false);
+  if (!j.is_array()) return -1;
+  for (const auto& item : j) {
+    if (!item.is_object()) continue;
+    if (item.contains("content") && item["content"].is_string() && item["content"].get<std::string>() == content &&
+        item.contains("id") && item["id"].is_number_integer()) {
+      return item["id"].get<int32_t>();
+    }
+  }
+  return -1;
+}
 
 std::unique_ptr<Model> open(const ModelFile& file, const ModelOptions& o, std::string* err) {
   for (const ArchEntry& entry : kArchitectures) {

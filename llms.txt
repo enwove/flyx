@@ -1,6 +1,6 @@
 # flyx
 
-> Low-latency local LLM inference engine for single-user NVIDIA GPUs (CUDA 13, C++/CUDA, Apache-2.0) with bitwise-exact speculative decoding (MTP, DFlash2, DV, prompt lookup), native GGUF and `.flyx` support, tiered GPU/RAM/disk long-context KV caches with 2-bit StrataFlux attention, and OpenAI / Anthropic HTTP APIs.
+> Low-latency local LLM and multimodal VLM inference engine for single-user NVIDIA GPUs (CUDA 13, C++/CUDA, Apache-2.0) with bitwise-exact speculative decoding (MTP, DFlash2, DV, prompt lookup), native GGUF and `.flyx` support, companion `mmproj` vision encoding with disk/host/GPU weight placement, tiered GPU/RAM/disk long-context KV caches with 2-bit StrataFlux attention, and OpenAI / Anthropic HTTP APIs.
 
 Start here when deploying, integrating, or modifying `flyx`. Each document below is the single source of truth for its domain.
 
@@ -11,7 +11,7 @@ Start here when deploying, integrating, or modifying `flyx`. Each document below
 - OpenAI API base URL: `http://127.0.0.1:8080/v1` (`/v1/chat/completions`, `/v1/responses`, `/v1/completions`, `/v1/models`)
 - Anthropic API base URL: `http://127.0.0.1:8080` (`/v1/messages`, `/v1/messages/count_tokens`)
 - Management & telemetry: `/health`, `/v1/telemetry`, `/v1/load`, `/v1/unload`, `/v1/hub/search`, `/v1/hub/files`, `/v1/hub/cached`, `/v1/hub/dir`, `/v1/requests`, `/v1/logs`
-- C API header: `include/flyx/flyx.h` (`FLYX_API_VERSION = 2`)
+- C API header: `include/flyx/flyx.h` (`FLYX_API_VERSION = 3`)
 - Python binding: `python/flyx/__init__.py` (zero-dependency `ctypes`)
 
 ## Deploy and Integrate

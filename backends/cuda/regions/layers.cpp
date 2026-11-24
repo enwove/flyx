@@ -217,7 +217,8 @@ void mtp_draft(flyx_seq* s, const MtpBlock& b, int width, const Launch& L, bool 
     gemm(own.mcat, 2 * H, b.fc, H, 2 * H, own.mx, H, 1, false, L);
     norm_project(own.mx, own.h, own.proj, s->ld_proj, 1, a.norm, a.w_in, a.n_in(), H, L, fused);
     attn_prep(own.proj, s->ld_proj, 0, a.q_width(), a.q_width() + nkv * hd, a.q_norm.w, a.k_norm.w, a.q_norm.offset,
-              a.q_norm.eps, a.theta, a.rot, nh, nkv, hd, 1, s->P, kPosPosition, false, own.qbuf, kv.ref(), st, i - 1);
+              a.q_norm.eps, a.theta, a.rot, nh, nkv, hd, 1, s->P, kPosPosition, false, own.qbuf, kv.ref(), st, i - 1,
+              nullptr, 0, CanvasKeys{}, a.mrope());
     s->stage_before(kv, i - 1, 1, st);
     if (kv.kq) {  // its copy of every position, the last ones exact
       params_at(s->P, s->P_window, i - 1, st);
@@ -266,8 +267,15 @@ void mtp_context(const Pass& ps, const MtpBlock& b, bool fused) {
   const Launch& L = rv.L;
   if (residual16(ps)) rmsnorm(x16_of(rv), H, head.norm.w, head.norm.offset, head.norm.eps, rv.b.mhn, H, R, H, st);
   else rmsnorm(rv.b.x, H, head.norm.w, head.norm.offset, head.norm.eps, rv.b.mhn, H, R, H, st);
-  if (E.blk.data) embed_blocks(rv.b.tokens, E.blk, H, rv.b.h, R, st);  // rv.b.h is free until the layer's norm
-  mtp_gather(s->P, sel, ps.round, nullptr, s->ring, rv.b.mhn, H, rv.b.tokens, E.table, rv.b.h, b.norm_emb.w,
+  if (E.blk.data) {
+    embed_blocks(rv.b.tokens, E.blk, H, rv.b.h, R, st);  // rv.b.h is free until the layer's norm
+    if (ps.n_embeds > 0) embed_scatter(rv.b.h, nullptr, H, ps.embeds, ps.embed_rows, ps.n_embeds, st);
+  } else if (ps.n_embeds > 0) {
+    embed(rv.b.tokens, E.table, H, rv.b.h, R, st);
+    embed_scatter(rv.b.h, nullptr, H, ps.embeds, ps.embed_rows, ps.n_embeds, st);
+  }
+  const bf16* mtp_table = (E.blk.data || ps.n_embeds > 0) ? nullptr : E.table;
+  mtp_gather(s->P, sel, ps.round, nullptr, s->ring, rv.b.mhn, H, rv.b.tokens, mtp_table, rv.b.h, b.norm_emb.w,
              b.norm_hidden.w, b.norm_emb.offset, b.norm_emb.eps, H, R, rv.b.mcat, st);
   if (!ps.round && s->pass_snap > 0 && s->ring_snap) {
     // Capture hidden[pass_snap - 1] before hring_put overwrites the kHring-slot ring when end - pass_snap >= kHring.
@@ -280,7 +288,8 @@ void mtp_context(const Pass& ps, const MtpBlock& b, bool fused) {
   gemm(rv.b.mcat, 2 * H, b.fc, H, 2 * H, rv.b.mx, H, R, false, L);
   norm_project(rv.b.mx, rv.b.h, rv.b.proj, rv.ld_proj, R, a.norm, a.w_in, a.n_in(), H, L, fused);
   attn_prep(rv.b.proj, rv.ld_proj, 0, a.q_width(), a.q_width() + nkv * hd, a.q_norm.w, a.k_norm.w, a.q_norm.offset,
-            a.q_norm.eps, a.theta, a.rot, nh, nkv, hd, R, s->P, sel, ps.round, rv.b.qbuf, kv.ref(), st, -1);
+            a.q_norm.eps, a.theta, a.rot, nh, nkv, hd, R, s->P, sel, ps.round, rv.b.qbuf, kv.ref(), st, -1, nullptr, 0,
+            CanvasKeys{}, a.mrope(ps.mtp_pos_3d));
 }
 
 // fused: the producers write the next GEMM's input already rounded (split for 1..16 rows,
@@ -469,7 +478,7 @@ void attn_layer(const Pass& ps, const AttnBlock& a, bool fused) {
   }
   attn_prep(rv.b.proj, rv.ld_proj, 0, a.q_width(), a.q_width() + nkv * hd, a.q_norm.w, a.k_norm.w, a.q_norm.offset,
             a.q_norm.eps, a.theta, a.rot, nh, nkv, hd, R, s->P, kPosPosition, false, rv.b.qbuf, kv, st, 0, tree,
-            use_stage ? s->position : 0);
+            use_stage ? s->position : 0, CanvasKeys{}, a.mrope(ps.pos_3d));
   if (use_stage) {
     const size_t woff = strata_words_at(s->position, 0, nkv, kb.words);
     CK(cudaMemcpyAsync(kb.kq + woff, stg_kq, q_words * sizeof(uint32_t), cudaMemcpyDefault, st));
@@ -1084,7 +1093,7 @@ void dv_context(const Pass& ps, const DvBlock& v) {
       gemm(d.lora + 2 * r, ldl, l.b_v, kvw, r, d.proj + qw + kvw, ldp, N, true, L);
     }
     attn_prep(d.proj, ldp, 0, qw, qw + kvw, a.q_norm.w, a.k_norm.w, a.q_norm.offset, a.q_norm.eps, a.theta, a.rot, nh,
-              nkv, hd, N, s->P, kPosStart, false, d.q, kv, st, 0, nullptr, 0, keys);
+              nkv, hd, N, s->P, kPosStart, false, d.q, kv, st, 0, nullptr, 0, keys, a.mrope());
     s->stage_text(kb, st);
     attention(d.q, kv, nh, nkv, hd, N, v.causal, N, 1.f / std::sqrt(float(hd)), s->P, nullptr, 0, d.act, qw, d.part,
               d.splits, L, 0, 0, nullptr, keys);

@@ -60,6 +60,8 @@ struct AttnBlockSpec {
   double theta, norm_offset, eps;
   bool draft = false;
   bool qk_norm = true;  // false: no RMSNorm of each head's q and k (the block names none, weight -1)
+  int mrope_section[3] = {0, 0, 0};  // 3D MRoPE sections (T, H, W); all 0 = standard 1D RoPE
+  bool mrope_interleaved = false;
 };
 
 // The tables of a description, built from a file's tensors by name.
@@ -72,10 +74,16 @@ class Tables {
   // A weight of this shape (NVFP4: the logical [N, K], with its scales).
   // Asking for the same tensor twice gives the same index.  Throws when the
   // tensor is missing or has another shape.  Optional `ggml_scale_name` binds
-  // a per-tensor or per-expert F32 scale to GGML weights (NVFP4 or requantized MoE experts, ABI 44).
+  // a per-tensor or per-expert F32 scale to GGML weights (NVFP4 or requantized MoE experts, ABI 45).
   int weight(const std::string& name, std::vector<int64_t> shape, const std::string& ggml_scale_name = "");
   flyx_norm norm(const std::string& name, int64_t n, double offset, double eps) {
     return {weight(name, {n}), 0, offset, eps};
+  }
+  flyx_vnorm vnorm(int kind, const std::string& w_name, const std::string& b_name, int64_t n, double offset,
+                   double eps) {
+    const int wi = w_name.empty() ? -1 : weight(w_name, {n});
+    const int bi = b_name.empty() ? -1 : weight(b_name, {n});
+    return {kind, wi, bi, 0, offset, eps};
   }
   int state(const flyx_state& s);
   int block(const flyx_block& b);
@@ -118,12 +126,19 @@ class Model : public interfaces::Model {
   bool file_drafts_trees() const override { return file_drafts_trees_; }
   bool restarts(int d) const override { return drafters_.at(size_t(d)).kind == Drafter::kDv; }
   bool kv_fp8_by_default() const override { return kv_fp8_by_default_; }
+  const interfaces::VisionAdapter* vision() const override { return vision_adapter_.get(); }
+  std::shared_ptr<const interfaces::VisionAdapter> vision_shared() const override { return vision_adapter_; }
+  std::vector<flyx_node> vision_program() const override { return vision_nodes_; }
 
  protected:
   explicit Model(const ModelFile& file) : tables_(file) {}
   int trained_ctx_ = 0;  // set by the architecture from its file
   // A drafter the model holds: its block, the most drafts it proposes in a round.
   void add_drafter(Drafter kind, int block, int max_drafts);
+  void set_vision(std::unique_ptr<interfaces::VisionAdapter> adapter, std::vector<flyx_node> nodes) {
+    vision_adapter_ = std::move(adapter);
+    vision_nodes_ = std::move(nodes);
+  }
   // desc() points into the tables from here on; call once they are complete.
   void finish(int hidden, int vocab);
 
@@ -134,6 +149,8 @@ class Model : public interfaces::Model {
   };
   Tables tables_;
   std::vector<DrafterBlock> drafters_;
+  std::shared_ptr<const interfaces::VisionAdapter> vision_adapter_;
+  std::vector<flyx_node> vision_nodes_;
   bool kv_fp8_by_default_ = true;  // FP8 where a real model of the family showed no visible drop
   bool file_drafts_trees_ = false;  // the file holds DV, asked for or not
 
@@ -141,6 +158,9 @@ class Model : public interfaces::Model {
   flyx_model_desc desc_{};
   std::string drafter_names_ = "none";
 };
+
+// Look up an added/special token's ID by its exact text in the model file's tokenizer.added blob (-1 if absent).
+int32_t find_added_token(const ModelFile& file, std::string_view content);
 
 // The model in a file, by its architecture; null with *err set if the file
 // cannot be read as one.

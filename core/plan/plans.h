@@ -13,6 +13,7 @@ namespace flyx::plan {
 
 struct Plans {
   flyx_plan* prefill = nullptr;   // prompt rows, prefill_chunk at a time
+  flyx_plan* vision = nullptr;    // optional vision encoder (FLYX_PHASE_VISION)
   // The rounds to choose from: plain decoding, then each drafter's widths, ascending (a drafter that drafts nothing
   // but trees: those the backend lowers, then its warm-up, a round of 0 drafts of it, Model::restarts), then the
   // trees its drafter drafts (draft_tree_widths(), where the backend has them).

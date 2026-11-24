@@ -320,6 +320,38 @@ int ensure_prefill_rows(flyx_bmodel* m, int rows) {
         m->prefill_zero_bytes = size_t(hi - lo);
       }
     }
+    // Pre-allocate multimodal prefill staging when the model has vision blocks so memory() reports it before planning.
+    bool has_vision = false;
+    for (const Block& b : m->blocks)
+      if (std::holds_alternative<VisionStemBlock>(b)) {
+        has_vision = true;
+        break;
+      }
+    if (has_vision) {
+      const size_t need_e = size_t(rows) * size_t(m->hidden);
+      if (need_e > m->prefill_embeds_cap) {
+        if (m->prefill_embeds) CK(cudaFree(m->prefill_embeds));
+        m->prefill_embeds = nullptr;
+        m->prefill_embeds_cap = 0;
+        m->prefill_embeds = static_cast<float*>(device_malloc(need_e * sizeof(float)));
+        m->prefill_embeds_cap = need_e;
+      }
+      if (size_t(rows) > m->prefill_embed_rows_cap) {
+        if (m->prefill_embed_rows) CK(cudaFree(m->prefill_embed_rows));
+        m->prefill_embed_rows = nullptr;
+        m->prefill_embed_rows_cap = 0;
+        m->prefill_embed_rows = static_cast<int32_t*>(device_malloc(size_t(rows) * sizeof(int32_t)));
+        m->prefill_embed_rows_cap = size_t(rows);
+      }
+      const size_t need_p = size_t(rows) * 6;
+      if (need_p > m->prefill_pos3d_cap) {
+        if (m->prefill_pos3d) CK(cudaFree(m->prefill_pos3d));
+        m->prefill_pos3d = nullptr;
+        m->prefill_pos3d_cap = 0;
+        m->prefill_pos3d = static_cast<int32_t*>(device_malloc(need_p * sizeof(int32_t)));
+        m->prefill_pos3d_cap = need_p;
+      }
+    }
     CK(cudaDeviceSynchronize());  // zero before any session's stream uses them: those do not wait for this one
   } catch (const std::exception& e) {
     prefill_vmm_free(m);
@@ -424,7 +456,9 @@ int seq_bytes(flyx_bmodel* m, int32_t max_ctx, uint64_t* out) {
 int memory(flyx_bmodel* m, flyx_memory_info* out) {
   *out = {};
   out->weights = m->bytes;
-  out->workspace = m->prefill_bytes;
+  out->workspace = m->prefill_bytes + m->prefill_embeds_cap * sizeof(float) +
+                   m->prefill_embed_rows_cap * sizeof(int32_t) +
+                   m->prefill_pos3d_cap * sizeof(int32_t);
   size_t fr = 0, tot = 0;
   if (!gpu_memory(&fr, &tot)) return fail("cudaMemGetInfo failed");
   out->free = fr;

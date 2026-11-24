@@ -149,6 +149,16 @@ int main() {
   test_penalize();
   test_wide_rows_choice();
   test_fp4();
+  test_layernorm();
+  test_add_bias();
+  test_vact();
+  test_gemm_f32();
+  test_vision_pos_embed();
+  test_vision_rope_2d();
+  test_vision_attention();
+  test_vision_avg_pool();
+  test_embed_scatter();
+  test_mrope();
   test_inkling2_softcap();
   test_inkling2_attn_res();
   test_inkling2_loop_ctrl();

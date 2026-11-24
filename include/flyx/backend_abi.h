@@ -30,7 +30,7 @@
 extern "C" {
 #endif
 
-#define FLYX_BACKEND_ABI_VERSION 44u
+#define FLYX_BACKEND_ABI_VERSION 45u
 #define FLYX_BACKEND_ENTRY "flyx_backend_get_api"
 /* How a backend library exports its entry. */
 #if defined(_WIN32)
@@ -96,12 +96,12 @@ typedef enum {
   FLYX_DT_GGML_IQ4_NL = 27, FLYX_DT_GGML_IQ4_XS = 28,
   /* GGML's NVFP4 (ABI 22): blocks of 64 e2m1 values with an unsigned e4m3
    * scale per 16 and no scale per tensor; not ModelOpt's FLYX_DT_NVFP4
-   * above, whose values a backend may take it as.  Since ABI 44 an optional
+   * above, whose values a backend may take it as.  Since ABI 45 an optional
    * per-tensor or per-expert float32 scale may accompany it in scale2. */
   FLYX_DT_GGML_NVFP4 = 29,
-  /* GGML's MXFP4 (ABI 44, GGML type 39): 32 e2m1 values with one E8M0 scale. */
+  /* GGML's MXFP4 (ABI 45, GGML type 39): 32 e2m1 values with one E8M0 scale. */
   FLYX_DT_GGML_MXFP4 = 30,
-  /* GGML's Q2_0 (ABI 44, GGML type 42): 64 2-bit values (q - 1) with one binary16 scale. */
+  /* GGML's Q2_0 (ABI 45, GGML type 42): 64 2-bit values (q - 1) with one binary16 scale. */
   FLYX_DT_GGML_Q2_0 = 31
 } flyx_dtype;
 
@@ -203,6 +203,20 @@ typedef struct {
   double offset, eps;
 } flyx_norm;
 
+/* Generalized norm for vision blocks (ABI 44): RMSNorm or LayerNorm with optional weight and bias. */
+typedef enum {
+  FLYX_NORM_RMS = 0,
+  FLYX_NORM_LAYER = 1
+} flyx_norm_kind;
+
+typedef struct {
+  int32_t kind;                        /* flyx_norm_kind */
+  int32_t w;                           /* weight [n], -1 = none */
+  int32_t b;                           /* bias [n], -1 = none */
+  int32_t pad0;
+  double offset, eps;
+} flyx_vnorm;
+
 /* A low-rank adapter on a linear y = W x (ABI 42): y = W x + scale b (a x), a [rank, in], b [out, rank], both bf16
  * (ABI 43: the scale; DV's canvas adapters have none, scale 1).  rank 0: none, as a block built zeroed has. */
 typedef struct {
@@ -226,7 +240,7 @@ typedef enum {
    * the position the canvas follows.  Not positional and not kept in checkpoints: a prefill, rewind or restore leaves
    * it unknown, and the drafter starts it over (only drafting reads it). */
   FLYX_STATE_CANVAS = 4,
-  /* Causal short-convolution recurrent history (ABI 44): `conv - 1` rows of `channels` float32 values per logical
+  /* Causal short-convolution recurrent history (ABI 45): `conv - 1` rows of `channels` float32 values per logical
    * layer; folded to accepted rows at commit, rewound inside FLYX_ROUND_SLOTS, and saved in checkpoints/snapshots. */
   FLYX_STATE_SHORTCONV = 5
 } flyx_state_kind;
@@ -242,8 +256,8 @@ typedef struct {
   int32_t width;                       /* RING; CANVAS: the hidden size */
   int32_t head_order;                  /* GDN: flyx_gdn_head_order */
   int32_t slots, topk, rank;           /* CANVAS (ABI 42): slots, candidates a slot keeps, the selector's rank */
-  int32_t window;                      /* KV (ABI 44): sliding window size (> 0: fixed ring); 0 = full context */
-  int32_t channels;                    /* SHORTCONV (ABI 44): channel count per logical layer */
+  int32_t window;                      /* KV (ABI 45): sliding window size (> 0: fixed ring); 0 = full context */
+  int32_t channels;                    /* SHORTCONV (ABI 45): channel count per logical layer */
   int32_t pad0;
 } flyx_state;
 
@@ -282,17 +296,21 @@ typedef enum {
   FLYX_BLOCK_DFLASH2_LAYER = 8,
   FLYX_BLOCK_DV = 9,           /* ABI 42 */
   FLYX_BLOCK_DV_LAYER = 10,    /* ABI 42 */
-  FLYX_BLOCK_REL_ATTN = 11,    /* ABI 44: relative-bias + sink + shortconv + optional SWA attention */
-  FLYX_BLOCK_MOE = 12,         /* ABI 44: sparse MoE with SiTU/SwiGLU + optional shortconv & attn-res/loop */
-  FLYX_BLOCK_DSPARK = 13,      /* ABI 44: DSpark parallel block drafter with Markov RNN head */
-  FLYX_BLOCK_DSPARK_LAYER = 14 /* ABI 44: one layer of DSpark */
+  FLYX_BLOCK_VISION_STEM = 11, /* ABI 44: patch embed + optional bias + optional pos embed / cls */
+  FLYX_BLOCK_VIT_ATTN = 12,    /* ABI 44: bidirectional ViT self-attention */
+  FLYX_BLOCK_VIT_MLP = 13,     /* ABI 44: ViT FFN (2-layer standard or 3-layer gated) */
+  FLYX_BLOCK_VISION_MERGE = 14, /* ABI 44: spatial merge/pool + optional norm + 1/2-layer projector */
+  FLYX_BLOCK_REL_ATTN = 15,    /* ABI 45: relative-bias + sink + shortconv + optional SWA attention */
+  FLYX_BLOCK_MOE = 16,         /* ABI 45: sparse MoE with SiTU/SwiGLU + optional shortconv & attn-res/loop */
+  FLYX_BLOCK_DSPARK = 17,      /* ABI 45: DSpark parallel block drafter with Markov RNN head */
+  FLYX_BLOCK_DSPARK_LAYER = 18 /* ABI 45: one layer of DSpark */
 } flyx_block_kind;
 
-/* Token rows -> residual rows: x = table[token], optionally followed by RMSNorm (has_norm != 0, ABI 44). */
+/* Token rows -> residual rows: x = table[token], optionally followed by RMSNorm (has_norm != 0, ABI 45). */
 typedef struct {
   int32_t hidden, vocab;
   int32_t table;                       /* [vocab, hidden] */
-  int32_t has_norm;                    /* ABI 44: 1 = apply norm after lookup; 0 = none */
+  int32_t has_norm;                    /* ABI 45: 1 = apply norm after lookup; 0 = none */
   flyx_norm norm;
 } flyx_embed_block;
 
@@ -315,6 +333,10 @@ typedef struct {
   /* ABI 43: the block's own adapters on q, k, v and o (flyx_linear order), in every pass that runs it (a V-LoRA,
    * python/convert --lora), all four or none, one rank; none with an output gate. */
   flyx_lora lora[4];
+  /* ABI 44: 3D Multimodal RoPE (Qwen3.5/3.8). mrope_section[0..2] = (T, H, W) frequency pair counts summing to
+   * rot_dim / 2 (all 0 = standard 1D RoPE). mrope_interleaved: 1 = interleaved T,H,W; 0 = contiguous chunks. */
+  int32_t mrope_section[3];
+  int32_t mrope_interleaved;
 } flyx_attn_block;
 
 /* Gated delta net, as ops/ops.h: from h = norm(x), mixed = qkv(h) through
@@ -341,14 +363,14 @@ typedef struct {
   flyx_lora lora[3];                   /* ABI 43: on gate, up and down, as an attention block's (all or none) */
 } flyx_mlp_block;
 
-/* logits = w(norm(x)), optional softcapping (cap * tanh(logit / cap) when softcap > 0, ABI 44),
- * optional truncation to vocab_out unpadded tokens (0 = vocab, ABI 44), then token choice per row. */
+/* logits = w(norm(x)), optional softcapping (cap * tanh(logit / cap) when softcap > 0, ABI 45),
+ * optional truncation to vocab_out unpadded tokens (0 = vocab, ABI 45), then token choice per row. */
 typedef struct {
   int32_t hidden, vocab;
   flyx_norm norm;
   int32_t w;                           /* [vocab, hidden]; the embedding's table when tied */
-  int32_t vocab_out;                   /* ABI 44: unpadded vocab exposed to sampling (0 = vocab) */
-  float softcap;                       /* ABI 44: final logit softcap (0 = none) */
+  int32_t vocab_out;                   /* ABI 45: unpadded vocab exposed to sampling (0 = vocab) */
+  float softcap;                       /* ABI 45: final logit softcap (0 = none) */
   int32_t pad0;
 } flyx_head_block;
 
@@ -457,9 +479,105 @@ typedef struct {
   int32_t canvas;                      /* state: FLYX_STATE_CANVAS */
 } flyx_dv_block;
 
+/* ---- Composable Vision Encoder Blocks (ABI 44) ----------------------------------
+ * Parameterized building blocks shared across vision-language architectures
+ * (Qwen3.5/3.8, SigLIP/Gemma3, Pixtral, InternVL, Llama4): adding a new VLM
+ * describes its vision encoder using these blocks and a FLYX_PHASE_VISION
+ * program under models/<arch>/ without changing any backend. */
+
+typedef enum {
+  FLYX_VACT_NONE = 0,
+  FLYX_VACT_GELU_TANH = 1,   /* 0.5 * x * (1 + tanh(sqrt(2/pi) * (x + 0.044715 * x^3))) */
+  FLYX_VACT_GELU = 2,        /* 0.5 * x * (1 + erf(x / sqrt(2))) */
+  FLYX_VACT_SILU = 3,
+  FLYX_VACT_QUICK_GELU = 4   /* x * sigmoid(1.702 * x) */
+} flyx_vact_kind;
+
+typedef enum {
+  FLYX_VPOS_NONE = 0,
+  FLYX_VPOS_ADD_FIXED = 1,   /* pos_w [N, hidden] added directly row-by-row */
+  FLYX_VPOS_BILINEAR_2D = 2  /* pos_w [pos_grid_h * pos_grid_w, hidden] bilinearly interpolated (align_corners=1)
+                              * and ordered into spatial-merge blocks of merge_size x merge_size */
+} flyx_vpos_kind;
+
+typedef enum {
+  FLYX_VROPE_NONE = 0,
+  FLYX_VROPE_AXIAL_2D = 1    /* 2D axial RoPE over patch (h, w) in spatial-merge order (first half H, second half W) */
+} flyx_vrope_kind;
+
+typedef enum {
+  FLYX_VMERGE_NONE = 0,
+  FLYX_VMERGE_SPATIAL_CONCAT = 1, /* merge_size^2 consecutive rows concatenated -> [N / m^2, hidden * m^2] */
+  FLYX_VMERGE_AVG_POOL_2D = 2     /* 2D average pool merge_size x merge_size per grid -> [N / m^2, hidden] */
+} flyx_vmerge_kind;
+
+/* Patch embedding linear (single weight or split temporal pair W0|W1 as in GGUF mmproj),
+ * optional bias, optional positional embedding addition, optional pre-norm. */
+typedef struct {
+  int32_t in_dim;            /* patch vector width (e.g. 1536 = 2 * 3 * 16 * 16) */
+  int32_t hidden;            /* ViT hidden width (e.g. 1152 on Qwen3.8-27B) */
+  int32_t patch_w;           /* [hidden, in_dim] (or first half [hidden, in_dim/2] when patch_w2 >= 0) */
+  int32_t patch_w2;          /* -1 = single weight; >= 0 = second temporal slice [hidden, in_dim/2] */
+  int32_t patch_b;           /* [hidden], -1 = none */
+  int32_t pos_mode;          /* flyx_vpos_kind */
+  int32_t pos_w;             /* [pos_grid_h * pos_grid_w, hidden], -1 = none */
+  int32_t pos_grid_h;        /* base grid height (e.g. 48) */
+  int32_t pos_grid_w;        /* base grid width (e.g. 48) */
+  int32_t merge_size;        /* spatial merge factor (e.g. 2) for BILINEAR_2D ordering */
+  int32_t cls_token;         /* optional [hidden] prepended per image (-1 = none) */
+  int32_t pad0;
+  flyx_vnorm pre_norm;       /* optional norm after pos_embed (w = -1: none) */
+} flyx_vision_stem_block;
+
+/* Bidirectional block-diagonal ViT self-attention: x += [layer_scale *] o(attn(rope(q), rope(k), v)) + o_b.
+ * Supports fused qkv or split q/k/v, optional biases, optional QK-norm, and arbitrary head_dim % 8 == 0. */
+typedef struct {
+  int32_t hidden, n_heads, head_dim;
+  int32_t rope_mode;         /* flyx_vrope_kind */
+  int32_t merge_size;        /* spatial merge factor for AXIAL_2D coordinates */
+  int32_t pad0;
+  double theta;              /* 2D RoPE base (e.g. 10000.0) */
+  flyx_vnorm norm;           /* pre-attention norm */
+  flyx_vnorm q_norm, k_norm; /* optional per-head Q/K norm (w = -1: none) */
+  int32_t qkv, qkv_b;        /* fused [3*nh*hd, hidden] & [3*nh*hd] (-1 if split q/k/v) */
+  int32_t q, k, v;           /* split [nh*hd, hidden] (-1 if fused qkv) */
+  int32_t q_b, k_b, v_b;     /* split biases (-1 = none) */
+  int32_t o, o_b;            /* [hidden, nh*hd] & [hidden] (-1 = none) */
+  int32_t layer_scale;       /* optional [hidden] residual scale (-1 = none) */
+  int32_t pad1;
+} flyx_vit_attn_block;
+
+/* ViT FFN: x += [layer_scale *] fc2(act(fc1(h)) [* up]) where h = norm(x). */
+typedef struct {
+  int32_t hidden, inter;
+  int32_t gated;             /* 0: fc2(act(fc1(h))); 1: fc2(act(gate(h)) * fc1(h)) */
+  int32_t act;               /* flyx_vact_kind */
+  flyx_vnorm norm;           /* pre-MLP norm */
+  int32_t fc1, fc1_b;        /* [inter, hidden] & [inter] (-1 = none) */
+  int32_t gate, gate_b;      /* gated=1: [inter, hidden] & [inter] (-1 if !gated) */
+  int32_t fc2, fc2_b;        /* [hidden, inter] & [hidden] (-1 = none) */
+  int32_t layer_scale;       /* optional [hidden] residual scale (-1 = none) */
+  int32_t pad0;
+} flyx_vit_mlp_block;
+
+/* Spatial merge / pooling + optional norm (before or after merge) + 1- or 2-layer projector to out_hidden. */
+typedef struct {
+  int32_t in_hidden;         /* ViT hidden width (e.g. 1152) */
+  int32_t merge_size;        /* spatial merge factor (e.g. 2) */
+  int32_t merge_mode;        /* flyx_vmerge_kind */
+  int32_t post_norm;         /* 0: norm before merge (width in_hidden); 1: norm after merge (width merged_dim) */
+  int32_t fc1_out;           /* intermediate dim of 2-layer projector (e.g. 4608), or 0 for 1-layer (fc2 only) */
+  int32_t out_hidden;        /* LLM hidden width (e.g. 5120) */
+  int32_t act;               /* flyx_vact_kind between fc1 and fc2 */
+  int32_t pad0;
+  flyx_vnorm norm;           /* post_ln (w = -1: none) */
+  int32_t fc1, fc1_b;        /* [fc1_out, merged_dim] & [fc1_out] (-1 if fc1_out == 0) */
+  int32_t fc2, fc2_b;        /* [out_hidden, fc1_out or merged_dim] & [out_hidden] (-1 = none) */
+} flyx_vision_merge_block;
+
 /* Relative-position-bias attention with per-query sink, Q/K/R L2 clipping, no-gamma V RMSNorm,
  * K/V/output causal short convolutions (optional per-head dynamic taps on global layers),
- * optional block attention-residual mixing, and optional cross-pass loop control (ABI 44). */
+ * optional block attention-residual mixing, and optional cross-pass loop control (ABI 45). */
 typedef struct {
   int32_t hidden, n_heads, n_kv, head_dim;
   int32_t d_rel, rel_extent, window, conv, log_scale_floor;
@@ -477,7 +595,7 @@ typedef struct {
   int32_t kv, sconv;                   /* state indices: FLYX_STATE_KV and FLYX_STATE_SHORTCONV */
 } flyx_rel_attn_block;
 
-/* Sparse Mixture-of-Experts block (ABI 44): optional depth-residual mix and cross-pass FFN controller,
+/* Sparse Mixture-of-Experts block (ABI 45): optional depth-residual mix and cross-pass FFN controller,
  * RMSNorm, F32 router (softmax or sigmoid + optional bias), top-k routing with optional normalization & scale,
  * 3D fused gate_up [E, 2*I, H] + SiTU (situ_beta > 0) or SwiGLU + 3D down [E, H, I], optional post-FFN shortconv. */
 typedef struct {
@@ -495,7 +613,7 @@ typedef struct {
   int32_t sconv, sconv_offset;         /* FLYX_STATE_SHORTCONV index and channel offset */
 } flyx_moe_block;
 
-/* One layer of a DSpark parallel block drafter (ABI 44): per-layer context tap mix + K/V projection,
+/* One layer of a DSpark parallel block drafter (ABI 45): per-layer context tap mix + K/V projection,
  * non-causal block attention over context K/V (optional sliding window) and block rows, SwiGLU MLP. */
 typedef struct {
   int32_t window;                      /* 0 = full context; > 0 = sliding window (e.g. 1025) */
@@ -505,7 +623,7 @@ typedef struct {
   int32_t gate, up, down;
 } flyx_dspark_layer_block;
 
-/* DSpark parallel block drafter with Markov RNN head (ABI 44). */
+/* DSpark parallel block drafter with Markov RNN head (ABI 45). */
 typedef struct {
   int32_t hidden, n_heads, n_kv, head_dim, inter;
   int32_t block, n_taps, markov_rank, vocab_out;
@@ -536,10 +654,14 @@ typedef struct {
     flyx_dflash2_layer_block dflash2_layer;
     flyx_dv_block dv;                  /* ABI 42 */
     flyx_dv_layer_block dv_layer;      /* ABI 42 */
-    flyx_rel_attn_block rel_attn;      /* ABI 44 */
-    flyx_moe_block moe;                /* ABI 44 */
-    flyx_dspark_block dspark;          /* ABI 44 */
-    flyx_dspark_layer_block dspark_layer; /* ABI 44 */
+    flyx_vision_stem_block vision_stem;   /* ABI 44 */
+    flyx_vit_attn_block vit_attn;         /* ABI 44 */
+    flyx_vit_mlp_block vit_mlp;           /* ABI 44 */
+    flyx_vision_merge_block vision_merge; /* ABI 44 */
+    flyx_rel_attn_block rel_attn;      /* ABI 45 */
+    flyx_moe_block moe;                /* ABI 45 */
+    flyx_dspark_block dspark;          /* ABI 45 */
+    flyx_dspark_layer_block dspark_layer; /* ABI 45 */
   };
 } flyx_block;
 
@@ -564,7 +686,7 @@ typedef enum {
   FLYX_NODE_COMMIT,      /* fold recurrent state to the accepted rows */
   FLYX_NODE_GIVEN,       /* the launch's drafts (gen.drafts) are the round's arg0 drafts; no drafter runs (block -1);
                              * arg1 = FLYX_GIVEN_TREE: they form a tree (gen.parents) */
-  /* Depth-residual bank and looped-pass control nodes (ABI 44, pass-local scratch):
+  /* Depth-residual bank and looped-pass control nodes (ABI 45, pass-local scratch):
    *   RES_RESET    clear res_bank (arg0 = capacity in blocks)
    *   LOOP_PRELUDE snapshot prelude = cur and prelude_blocks = res_bank
    *   LOOP_NEXT    loop_bank = res_bank[prelude_size + 1 .. end], loop_bank_out = cur,
@@ -587,7 +709,7 @@ typedef struct { int32_t kind, block, arg0, arg1; } flyx_node;
 
 /* ---- Program: what a backend is asked to run ---------------------------- */
 
-typedef enum { FLYX_PHASE_PREFILL = 0, FLYX_PHASE_ROUND = 1 } flyx_phase;
+typedef enum { FLYX_PHASE_PREFILL = 0, FLYX_PHASE_ROUND = 1, FLYX_PHASE_VISION = 2 } flyx_phase;
 
 typedef struct {
   int32_t phase;                /* flyx_phase */
@@ -721,6 +843,22 @@ typedef struct {
   uint64_t process_host;
 } flyx_device_stats;
 
+/* Where vision encoder weights live and how they run (ABI 44). */
+typedef enum {
+  FLYX_VISION_DEV_DISK = 0,     /* default: auto-deleted temp file on disk (0 VRAM, 0 locked host RAM), 3-stage streamed */
+  FLYX_VISION_DEV_HOST = 1,     /* pinned host RAM (0 VRAM), double-buffered DMA streamed to GPU */
+  FLYX_VISION_DEV_GPU  = 2,     /* vision weights resident in GPU VRAM */
+  FLYX_VISION_DEV_AUTO = 3      /* GPU resident when >= 8 GB VRAM remain free after weights, else disk */
+} flyx_vision_device;
+
+/* On-the-fly quantization of floating-point vision linear weights at load time (ABI 44).
+ * Pre-quantized GGML block weights in mmproj files are always kept packed as-is. */
+typedef enum {
+  FLYX_VISION_QUANT_Q8    = 0,  /* default: quantize float vision linears to Q8_0 (8.5 bpw, ~46% smaller) */
+  FLYX_VISION_QUANT_EXACT = 1,  /* keep file format (BF16/F16/F32 or pre-quantized GGML blocks) */
+  FLYX_VISION_QUANT_NVFP4 = 2   /* quantize float vision linears to NVFP4 (4.5 bpw, ~70% smaller) */
+} flyx_vision_quant;
+
 typedef struct {
   int32_t max_ctx;              /* tokens per sequence */
   int32_t verbose;
@@ -730,6 +868,8 @@ typedef struct {
    * documents its keys and fails open() on one it does not know; a key given
    * twice takes the later value.  The engine passes them through unread. */
   const char* options;
+  int32_t vision_device;        /* flyx_vision_device (ABI 44; 0 = disk) */
+  int32_t vision_quant;         /* flyx_vision_quant (ABI 44; 0 = q8) */
 } flyx_open_options;
 
 /* Device memory as the backend sees it (0 = unknown, e.g. a CPU backend). */
@@ -796,6 +936,35 @@ typedef struct {
   uint64_t from_graph, without_graph, captured;
   uint64_t params_most, params_unknown;
 } flyx_graph_stats;
+
+/* Vision encoder input (ABI 44): flat patch rows and spatial-temporal grid metadata. */
+typedef struct {
+  const float* patches;        /* [n_patches, patch_dim] row-major float32 */
+  int32_t n_patches;
+  int32_t patch_dim;
+  const int32_t* grid_thw;     /* [n_grids * 3]: (T, H_patches, W_patches) per image/tile */
+  int32_t n_grids;
+  int32_t n_segs;              /* number of bidirectional attention segments */
+  const int32_t* cu_seqlens;   /* [n_segs + 1]: cumulative patch offsets (0 .. n_patches) */
+} flyx_vision_input;
+
+/* Special prefill_snapshot() argument (ABI 44): suppress intra-pass snapshot capture for the next pass. */
+#define FLYX_PREFILL_SNAP_NONE (-2)
+
+/* Extended prefill pass input (ABI 44): supports external embedding injection (vision/audio)
+ * and explicit 3D MRoPE coordinates with a decode-time scalar rope_delta. */
+typedef struct {
+  const int32_t* tokens;       /* [n] token IDs */
+  int32_t n;
+  int32_t n_embeds;            /* number of rows overridden by external embeddings (0 = text-only) */
+  const float* embeds;         /* [n_embeds, hidden] float32 embeddings (NULL if n_embeds == 0) */
+  const int32_t* embed_rows;   /* [n_embeds] sorted row indices in [0, n) receiving embeds[i] */
+  const int32_t* pos_3d;       /* [n * 3] (t, h, w) coordinates for 3D MRoPE (NULL = standard 1D) */
+  int32_t set_rope_delta;      /* 1: set sequence's decode rope_delta to `rope_delta` after this pass */
+  int32_t rope_delta;          /* offset added to 1D decode positions: pos_1d = seq_pos + rope_delta */
+  int32_t has_snap_rope_delta; /* 1: use snap_rope_delta for an intra-pass checkpoint captured in this pass */
+  int32_t snap_rope_delta;     /* model-provided decode rope_delta at the intra-pass checkpoint position */
+} flyx_prefill_input;
 
 /* All functions return 0 on success unless stated otherwise; on failure
  * last_error() describes what happened. */
@@ -922,6 +1091,15 @@ typedef struct flyx_backend_api {
    * the pass crosses, in place of the last one it crosses (a message boundary inside a pass then needs no pass of
    * its own); -1: the last one.  For the next prefill call only.  NULL: always the last one. */
   int (*prefill_snapshot)(flyx_seq* s, int32_t pos);
+  /* Stateless vision encoder execution (ABI 44): runs a FLYX_PHASE_VISION plan on `in` and writes
+   * [n_out_rows, out_hidden] float32 embeddings into `out_embeds` (capacity `out_cap_rows` rows).
+   * Writes actual output row count into `*out_rows` if non-NULL.  Waits for the device.
+   * NULL when the backend does not implement vision blocks. */
+  int (*encode_vision)(flyx_plan* vision_plan, const flyx_vision_input* in, float* out_embeds,
+                       int32_t out_cap_rows, int32_t* out_rows);
+  /* Extended prefill pass (ABI 44) supporting external embeddings (vision/audio) and 3D MRoPE positions.
+   * NULL: text-only backend (engine falls back to prefill() when inputs are text-only). */
+  int (*prefill_ex)(flyx_plan* p, flyx_seq* s, const flyx_prefill_input* in, const flyx_gen_params* sample);
 } flyx_backend_api;
 
 typedef const flyx_backend_api* (*flyx_backend_entry_fn)(void);

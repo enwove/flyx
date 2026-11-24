@@ -14,6 +14,10 @@ std::string node_name(const flyx_node& n, const Block* b) {
       if (std::holds_alternative<AttnBlock>(*b)) return "attention mixer";
       if (std::holds_alternative<RelAttnBlock>(*b)) return "rel attention mixer";
       if (std::holds_alternative<MlpBlock>(*b)) return "mlp";
+      if (std::holds_alternative<VisionStemBlock>(*b)) return "vision stem";
+      if (std::holds_alternative<VitAttnBlock>(*b)) return "vit attention";
+      if (std::holds_alternative<VitMlpBlock>(*b)) return "vit mlp";
+      if (std::holds_alternative<VisionMergeBlock>(*b)) return "vision merge";
       if (std::holds_alternative<MoeBlock>(*b)) return "moe";
       return "head + choose";
     case FLYX_NODE_TAP: return "tap";
@@ -74,6 +78,20 @@ bool supported(const flyx_bmodel* m, const Block& blk, std::string* why) {
   } else if (const auto* v = std::get_if<DvBlock>(&blk)) {
     if (v->hidden != m->hidden || v->topk != 16 || v->res_k != 16)  // a slot's 16 candidates (DV's kernels: kDvTop)
       return no("DV dimensions outside what the CUDA backend takes (its hidden size, 16 candidates a slot)");
+  } else if (const auto* va = std::get_if<VitAttnBlock>(&blk)) {
+    if (va->nh < 1 || va->hd < 1 || va->hd > 256 || va->hidden % 8 || (va->nh * va->hd) % 8)
+      return no("vit_attn dimensions outside what the CUDA kernels support (head_dim <= 256, widths multiple of 8)");
+    if (va->rope_mode == FLYX_VROPE_AXIAL_2D && va->hd % 4 != 0)
+      return no("vit_attn 2D axial RoPE requires head_dim divisible by 4");
+  } else if (const auto* vf = std::get_if<VitMlpBlock>(&blk)) {
+    if (vf->hidden % 8 || vf->inter % 8)
+      return no("vit_mlp dimensions must be multiples of 8");
+  } else if (const auto* vm = std::get_if<VisionMergeBlock>(&blk)) {
+    const int merged = vm->merge_mode == FLYX_VMERGE_SPATIAL_CONCAT
+                           ? vm->in_hidden * vm->merge_size * vm->merge_size
+                           : vm->in_hidden;
+    if (merged % 8 || (vm->w_fc1.present() && vm->w_fc2.present() && vm->merge_hidden % 8))
+      return no("vision_merge dimensions must be multiples of 8");
   }
   return true;
 }
@@ -100,7 +118,9 @@ const Block* block_of(const flyx_bmodel* m, const flyx_node& n, std::string* err
     case FLYX_NODE_RUN:
       fits = std::holds_alternative<EmbedBlock>(*b) || std::holds_alternative<AttnBlock>(*b) ||
              std::holds_alternative<GdnBlock>(*b) || std::holds_alternative<MlpBlock>(*b) ||
-             std::holds_alternative<HeadBlock>(*b) || std::holds_alternative<RelAttnBlock>(*b) ||
+             std::holds_alternative<HeadBlock>(*b) || std::holds_alternative<VisionStemBlock>(*b) ||
+             std::holds_alternative<VitAttnBlock>(*b) || std::holds_alternative<VitMlpBlock>(*b) ||
+             std::holds_alternative<VisionMergeBlock>(*b) || std::holds_alternative<RelAttnBlock>(*b) ||
              std::holds_alternative<MoeBlock>(*b);
       break;
     case FLYX_NODE_TAP: {
@@ -309,11 +329,15 @@ void run_node(const Pass& ps, const flyx_node& n, const Block* b) {
         if (ps.round) build_rows(s->P, s->drafts, -1, rv.b.tokens, ps.rows, st);
         if (residual16(ps)) {
           embed(rv.b.tokens, e->table, e->hidden, x16_of(rv), ps.rows, st);
+          if (ps.n_embeds > 0)
+            embed_scatter(nullptr, x16_of(rv), e->hidden, ps.embeds, ps.embed_rows, ps.n_embeds, st);
         } else if (e->has_norm) {
           embed_tokens(*e, rv.b.tokens, rv.b.h, ps.rows, st);
           rmsnorm(rv.b.h, e->hidden, e->norm.w, e->norm.offset, e->norm.eps, rv.b.x, e->hidden, ps.rows, e->hidden, st);
+          if (ps.n_embeds > 0) embed_scatter(rv.b.x, nullptr, e->hidden, ps.embeds, ps.embed_rows, ps.n_embeds, st);
         } else {
           embed_tokens(*e, rv.b.tokens, rv.b.x, ps.rows, st);
+          if (ps.n_embeds > 0) embed_scatter(rv.b.x, nullptr, e->hidden, ps.embeds, ps.embed_rows, ps.n_embeds, st);
         }
       } else if (const auto* g = std::get_if<GdnBlock>(b)) {
         gdn_layer(ps, *g);
@@ -433,6 +457,30 @@ bool dv_runs(const flyx_bmodel* m, const DvBlock& v, const flyx_node& n, std::st
 }
 
 int lower(flyx_bmodel* m, const flyx_program* prog, flyx_plan** out) {
+  if (prog->phase == FLYX_PHASE_VISION) {
+    if (prog->max_rows < 1 || prog->n_nodes < 1) return fail("lower: bad vision program");
+    auto p = std::make_unique<flyx_plan>();
+    p->m = m;
+    p->phase = prog->phase;
+    p->width = 0;
+    p->max_rows = prog->max_rows;
+    p->nodes.assign(prog->nodes, prog->nodes + prog->n_nodes);
+    for (const auto& n : p->nodes) {
+      std::string err;
+      const Block* b = block_of(m, n, &err);
+      if (!err.empty()) return fail("lower: " + err);
+      const bool ok = n.kind == FLYX_NODE_RUN && b &&
+                      (std::holds_alternative<VisionStemBlock>(*b) || std::holds_alternative<VitAttnBlock>(*b) ||
+                       std::holds_alternative<VitMlpBlock>(*b) || std::holds_alternative<VisionMergeBlock>(*b));
+      if (!ok) return fail("lower: vision plan contains non-vision node");
+      p->block.push_back(b);
+      p->impl.push_back(&kGeneric);
+    }
+    if (!std::holds_alternative<VisionStemBlock>(*p->block.front()))
+      return fail("lower: vision plan must begin with a vision_stem block");
+    *out = p.release();
+    return 0;
+  }
   if (prog->max_rows < 1 || (prog->phase == FLYX_PHASE_ROUND && prog->max_rows > m->wide_rows) ||
       prog->max_rows > kMaxPrefillRows)
     return fail("bad row count");

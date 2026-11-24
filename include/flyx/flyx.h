@@ -29,7 +29,7 @@ extern "C" {
  * the structs (python/flyx/__init__.py) carries the number it was written
  * for and refuses a library that answers another, rather than reading a
  * struct laid out differently from the one it writes. */
-#define FLYX_API_VERSION 2u  /* 2: kv_fp8 became kv, 0 meaning the default (FP8) */
+#define FLYX_API_VERSION 3u  /* 3: added mmproj_file, no_vision, vision_device, vision_quant, vision_max_tokens to flyx_load_options */
 FLYX_API uint32_t flyx_api_version(void);
 
 typedef struct flyx_engine flyx_engine;
@@ -71,6 +71,11 @@ typedef struct {
   const char* chat_template; /* a Jinja chat template's source, used instead of the model file's; NULL = the file's */
   const char* drafter_file; /* drafters in files of their own: a GGUF holding the MTP layer, or a DFlash2 drafter file
                                (python/convert --draft alone); several separated by newlines; NULL = none */
+  const char* mmproj_file;  /* multimodal projector / vision encoder companion GGUF (e.g. mmproj-BF16.gguf); NULL = none */
+  int32_t no_vision;        /* 1 = skip loading any vision encoder even if present in the model or companion */
+  const char* vision_device; /* "disk" | "host" | "gpu" | "auto" (NULL = disk: 0 VRAM, 0 locked host RAM) */
+  const char* vision_quant;  /* "q8" | "exact" | "nvfp4" (NULL = q8: Q8_0 on float vision linears) */
+  int32_t vision_max_tokens; /* per-image merged visual token cap (0 = auto by context size) */
 } flyx_load_options;
 
 typedef struct {

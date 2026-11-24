@@ -250,7 +250,7 @@ export function Integration({ active }) {
           <tr><td><code>accept_min_p</code>, <code>accept_typical</code></td><td>chat</td>${Td(String.raw`FLYX's own, 0 to 1: relaxed acceptance of drafts. Lossy, off by default.`)}</tr>
           <tr><td><code>seed</code></td><td>${t("all")}</td>${Td(String.raw`one seed, the same tokens, with a drafter or without`)}</tr>
         </tbody></table>
-        ${Lead(String.raw`Not supported: <code>repetition_penalty</code>; images and other non-text content get a 400.`)}
+        ${Lead(String.raw`Not supported: <code>repetition_penalty</code>; audio, video, and remote image URLs get a 400 (send images as base64 data URIs or Anthropic base64 blocks with a vision model).`)}
       </section>
 
       <section id="d-sampling">
