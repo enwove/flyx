@@ -173,6 +173,11 @@ class Chat {
                                     bool in_reasoning) const {
     return "";
   }
+  // The special tokens a reply in this format is written with, by their text: a format whose section and call
+  // markers are control tokens (Inkling-2's <|message_model|>, <|content_text|>, <|end_message|>).  A reply grammar
+  // matches these by that text, as it matches ordinary tokens; any other special token it never takes.  None where
+  // the markers are ordinary tokens (<think>, <tool_call>).
+  virtual std::vector<std::string> reply_tokens() const { return {}; }
 
   // A renderer written for exactly this template (selected by its full
   // text): the bytes and literal spans the Jinja engine gives, hundreds of

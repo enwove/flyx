@@ -45,9 +45,11 @@ class Grammar {
  public:
   Grammar();
   ~Grammar();
-  // Token text from the tokenizer; special tokens never match text; stop_ids
-  // end a reply; ids past the tokenizer (padding up to `vocab`) never match.
-  void init(const Tokenizer& tok, int vocab, std::vector<int32_t> stop_ids);
+  // Token text from the tokenizer; special tokens never match text, but for
+  // `markers` (the ones the chat format writes replies with: interfaces::
+  // Chat::reply_tokens), which match theirs; stop_ids end a reply; ids past
+  // the tokenizer (padding up to `vocab`) never match.
+  void init(const Tokenizer& tok, int vocab, std::vector<int32_t> stop_ids, const std::vector<int32_t>& markers = {});
   bool ready() const;
   int words() const;  // bitmask words of the vocabulary
   // A matcher for one reply under an XGrammar structural tag (JSON text).

@@ -23,4 +23,8 @@ std::unique_ptr<interfaces::OutputParser> make_inkling2_parser(const std::vector
 
 std::string inkling2_reply_grammar(const std::vector<ojson>& tools, const ReplyRules& rules);
 
+// The control tokens a reply is written with, by their text (interfaces::Chat::reply_tokens): the ones the grammar
+// above names.  <|content_model_end_sampling|> is not among them: it ends the reply, as the model's stop token.
+std::vector<std::string> inkling2_reply_tokens();
+
 }  // namespace flyx::models::formats

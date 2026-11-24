@@ -71,14 +71,20 @@ struct Grammar::Impl {
 Grammar::Grammar() : impl_(std::make_unique<Impl>()) {}
 Grammar::~Grammar() = default;
 
-void Grammar::init(const Tokenizer& tok, int vocab, std::vector<int32_t> stop_ids) {
+void Grammar::init(const Tokenizer& tok, int vocab, std::vector<int32_t> stop_ids,
+                   const std::vector<int32_t>& markers) {
   std::vector<std::string> text(static_cast<size_t>(vocab));
   impl_->never.assign(size_t(vocab), true);
+  auto matches_text = [&](int32_t id) {
+    text[size_t(id)] = tok.token_bytes(id);  // "" = never matches text
+    impl_->never[size_t(id)] = false;
+  };
   for (int32_t id = 0; id < vocab && id < tok.n_tokens(); ++id)
-    if (!tok.special(id)) {
-      text[size_t(id)] = tok.token_bytes(id);  // "" = never matches text
-      impl_->never[size_t(id)] = false;
-    }
+    if (!tok.special(id)) matches_text(id);
+  // A reply's own markers: without them a format that writes its sections with control tokens could only spell
+  // them, a character at a time, in ordinary tokens the model never saw there.
+  for (int32_t id : markers)
+    if (id >= 0 && id < vocab && id < tok.n_tokens()) matches_text(id);
   for (int32_t id : stop_ids)
     if (id >= 0 && id < vocab) impl_->never[size_t(id)] = false;
   impl_->info = std::make_unique<xgrammar::TokenizerInfo>(text, xgrammar::VocabType::RAW, vocab, std::move(stop_ids));

@@ -236,7 +236,12 @@ bool Engine::load_backend(std::string* err) {
 
 Grammar& Engine::grammar() {
   std::lock_guard<std::mutex> lock(grammar_mu_);
-  if (!grammar_.ready()) grammar_.init(tok_, model_->desc().vocab, eos_);
+  if (!grammar_.ready()) {
+    std::vector<int32_t> markers;  // the special tokens the chat format writes replies with
+    for (const std::string& text : chat_.reply_tokens())
+      if (const int32_t id = tok_.added_id(text); tok_.special(id)) markers.push_back(id);
+    grammar_.init(tok_, model_->desc().vocab, eos_, markers);
+  }
   return grammar_;
 }
 

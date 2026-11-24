@@ -91,6 +91,10 @@ class Chat : public interfaces::Chat {
     return formats::reply_grammar(syntax_, tools, rules, in_reasoning);
   }
 
+  std::vector<std::string> reply_tokens() const override {
+    return inkling2_ ? inkling2_reply_tokens() : std::vector<std::string>();
+  }
+
   bool native() const override { return family_ != nullptr; }
   bool render(std::span<const ChatMessage> msgs, const std::vector<ojson>& tools, const ChatOptions& opt,
               bool generation_prompt, RenderedChat* out, std::string* err) const override {

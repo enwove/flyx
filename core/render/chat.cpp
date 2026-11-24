@@ -738,6 +738,10 @@ std::string ChatTemplate::reply_grammar(const std::vector<ojson>& tools, const R
   return impl_ ? impl_->chat->reply_grammar(tools, rules, r.in_reasoning) : std::string();
 }
 
+std::vector<std::string> ChatTemplate::reply_tokens() const {
+  return impl_ ? impl_->chat->reply_tokens() : std::vector<std::string>();
+}
+
 std::unique_ptr<OutputParser> ChatTemplate::parser(const RenderedChat& r, const std::vector<ojson>* tools) const {
   if (!impl_) return nullptr;
   return impl_->chat->parser(r.in_reasoning, tools);

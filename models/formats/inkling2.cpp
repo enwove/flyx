@@ -252,8 +252,13 @@ ojson arguments_schema(const ojson& fn) {
   return {{"type", "object"}};
 }
 
+// A section's text: no marker in it, as its token or spelled out, so a section ends at its own <|end_message|> and
+// the next begins only where the grammar puts one.
 ojson any_section_body() {
-  return {{"type", "any_text"}, {"excludes", ojson::array({"<|end_message|>", "<|content_model_end_sampling|>"})}};
+  ojson excludes = ojson::array();
+  for (std::string& marker : inkling2_reply_tokens()) excludes.push_back(std::move(marker));
+  excludes.push_back(std::string(kEndSampling));
+  return {{"type", "any_text"}, {"excludes", std::move(excludes)}};
 }
 
 ojson thinking_section() {
@@ -294,6 +299,11 @@ bool is_inkling2_template(std::string_view source) {
   return source.find(kMsgModel) != std::string_view::npos &&
          source.find(kContentThinking) != std::string_view::npos &&
          source.find(kEndMessage) != std::string_view::npos;
+}
+
+std::vector<std::string> inkling2_reply_tokens() {
+  return {std::string(kMsgModel), std::string(kContentThinking), std::string(kContentText),
+          std::string(kContentInvokeJson), std::string(kEndMessage)};
 }
 
 std::unique_ptr<interfaces::OutputParser> make_inkling2_parser(const std::vector<ojson>* tools) {

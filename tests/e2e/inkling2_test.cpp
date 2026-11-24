@@ -23,6 +23,7 @@
 #include <vector>
 
 #include "core/exec/generation.h"
+#include "core/grammar/grammar.h"
 #include "core/render/chat.h"
 #include "core/session/store.h"
 #include "nlohmann/json.hpp"
@@ -743,6 +744,50 @@ void test_chat_and_format(const std::string& model_path) {
   const std::string grm = e->chat().reply_grammar(tools, rules, rc);
   check(!grm.empty() && grm.find("<|content_invoke_tool_json|>") != std::string::npos,
         "Inkling-2 XGrammar structural tag generated");
+
+  // A reply as the model writes it, every marker its control token: the grammar takes it and lets it end there.  A
+  // grammar that knows no marker takes none of them (they are special tokens), which would leave a model to spell
+  // its sections out in ordinary tokens.  The stop token as in the real model's file, <|content_model_end_sampling|>.
+  {
+    std::vector<int32_t> markers;
+    for (const std::string& text : e->chat().reply_tokens()) markers.push_back(tok.added_id(text));
+    // How many of the reply's tokens the grammar takes, and whether it may end after the last.
+    auto taken = [&](const std::string& tag, const std::string& reply, const std::vector<int32_t>& known,
+                     bool* ends) {
+      Grammar g;
+      g.init(tok, tok.n_tokens(), {tok.added_id("<|content_model_end_sampling|>")}, known);
+      std::string why;
+      auto m = g.matcher(tag, &why);
+      const std::vector<int32_t> ids = tok.encode(reply);
+      size_t n = 0;
+      while (m && n < ids.size() && m->accept(ids[n])) ++n;
+      *ends = m && n == ids.size() && m->can_end();
+      return n;
+    };
+    auto admits = [&](const std::string& tag, const std::string& reply, const std::vector<int32_t>& known) {
+      bool ends = false;
+      taken(tag, reply, known, &ends);
+      return ends;
+    };
+    const std::string thought = "<|message_model|><|content_thinking|>plan<|end_message|>";
+    const std::string call = "<|message_model|>lookup<|content_invoke_tool_json|>"
+                             "{\"name\":\"lookup\",\"args\":{\"a\":2}}<|end_message|>";
+    const std::vector<int32_t> written = tok.encode(thought + call);
+    const int64_t as_tokens = std::count_if(written.begin(), written.end(), [&](int32_t id) {
+      return std::find(markers.begin(), markers.end(), id) != markers.end();
+    });
+    check(markers.size() == 5 && std::none_of(markers.begin(), markers.end(), [](int32_t id) { return id < 0; }) &&
+              as_tokens == 6,
+          "the format names its reply markers, each a control token of the model");
+    check(admits(grm, thought + call, markers), "the grammar takes a reply written with its control tokens");
+    check(!admits(grm, thought + call, {}), "a grammar that knows no marker takes none of them");
+    // A marker inside a section's text is not text: the section ends at its own <|end_message|>.
+    const std::string auto_grm = e->chat().reply_grammar(tools, ReplyRules{}, rc);
+    bool ends = false;
+    const std::string nested = "<|message_model|><|content_text|>a<|content_text|>b<|end_message|>";
+    const size_t n = taken(auto_grm, nested, markers, &ends);
+    check(n == 3 && !ends, "a section's text holds no marker (" + std::to_string(n) + " tokens taken)");
+  }
 
   // Round-trip tokenizer encode/decode on control tokens and text.
   auto ids = tok.encode("<|message_user|><|content_text|>hello<|end_message|>");
