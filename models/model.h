@@ -120,9 +120,9 @@ class Model : public interfaces::Model {
   std::vector<int> adaptive_checkpoints(int d) const override;
   int block_drafts(int d) const override;
   int trained_ctx() const override { return trained_ctx_; }
-  bool drafts_trees(int d) const override { return drafters_.at(size_t(d)).kind == Drafter::kDv; }
+  bool drafts_trees(int d) const override;
   bool file_drafts_trees() const override { return file_drafts_trees_; }
-  bool restarts(int d) const override { return drafters_.at(size_t(d)).kind == Drafter::kDv; }
+  bool restarts(int d) const override;
   bool kv_fp8_by_default() const override { return kv_fp8_by_default_; }
   const interfaces::VisionAdapter* vision() const override { return vision_adapter_.get(); }
   std::shared_ptr<const interfaces::VisionAdapter> vision_shared() const override { return vision_adapter_; }
@@ -149,8 +149,9 @@ class Model : public interfaces::Model {
   std::vector<DrafterBlock> drafters_;
   std::shared_ptr<const interfaces::VisionAdapter> vision_adapter_;
   std::vector<flyx_node> vision_nodes_;
-  bool kv_fp8_by_default_ = true;  // FP8 where a real model of the family showed no visible drop
-  bool file_drafts_trees_ = false;  // the file holds DV, asked for or not
+  bool kv_fp8_by_default_ = true;         // FP8 where a real model of the family showed no visible drop
+  bool file_drafts_trees_ = false;        // the file holds DV, asked for or not
+  bool verify_scales_with_width_ = false; // sparse-MoE targets whose verify cost climbs steeply with verify width
 
  private:
   flyx_model_desc desc_{};
