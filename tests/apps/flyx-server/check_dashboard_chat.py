@@ -159,6 +159,145 @@ def check_history(page):
     assert page.evaluate("localStorage.getItem('flyx.chats')") is None
 
 
+def check_vision_upload(page):
+    """Chat image attachment: visible hint without mmproj, WebP/misnamed-WebP canvas transcoding,
+    clipboardData.items paste fallback, drag-and-drop, unsupported format error, and multipart payload."""
+    errors = []
+    page.on("pageerror", lambda e: errors.append(str(e)))
+    model = {"id": "vlm", "loaded": True, "context": 8192, "vision": False}
+    tm = {"schema_version": 1, "model": model, "load": {"state": "ready"}, "state": {"phase": "idle"},
+          "memory": {"sessions": []}, "rates": {}, "recent": [], "totals": {}}
+    sent = []
+
+    def api(route):
+        url = route.request.url
+        if route.request.method == "POST" and "/chat/completions" in url:
+            sent.append(route.request.post_data_json["messages"])
+            events = [{"id": "chatcmpl-v", "choices": [{"delta": {"content": "looks good"}}]},
+                      {"id": "chatcmpl-v", "choices": [], "usage": {"completion_tokens": 2}}]
+            route.fulfill(content_type="text/event-stream",
+                          body="".join("data: " + json.dumps(e) + "\n\n" for e in events) + "data: [DONE]\n\n")
+        elif "/telemetry" in url:
+            route.fulfill(json=tm)
+        elif "/hub/cached" in url:
+            route.fulfill(json={"cache": "", "dirs": [], "models": []})
+        elif "/hub/search" in url:
+            route.fulfill(json={"query": "", "models": []})
+        else:
+            route.fulfill(json={})
+
+    page.route("**/dashboard/**", lambda route: serve(route, ROOT / "apps/flyx-server/dashboard"))
+    page.route("**/v1/**", api)
+    page.goto("http://[::1]:18479/dashboard/#chat")
+
+    # Without a vision projector, the attach button stays visible in a muted state and explains what to load.
+    btn = page.locator("#chat-img")
+    expect(btn).to_be_visible()
+    expect(btn).to_have_attribute("data-vision", "0")
+    btn.click()
+    err = page.locator("#chat-imgerr")
+    expect(err).to_contain_text("Load a vision projector (mmproj) in Model settings to attach images.")
+    page.locator("#chat-img-model").click()
+    expect(page.locator("#tab-model")).to_be_visible()
+
+    # Back to Chat: pasting via clipboardData.items (empty .files) and dropping files show the hint without attaching.
+    page.locator('.side nav .navi[data-tab="chat"]').click()
+    expect(page.locator("#tab-chat")).to_be_visible()
+    page.locator("#clear").click()
+    expect(err).to_have_count(0)
+    page.evaluate("""() => {
+        const file = new File([new Uint8Array([137, 80, 78, 71])], 'clip.png', {type: 'image/png'});
+        const ev = new Event('paste', {bubbles: true, cancelable: true});
+        Object.defineProperty(ev, 'clipboardData', {
+            value: {files: [], items: [{kind: 'file', type: 'image/png', getAsFile: () => file}]}
+        });
+        document.getElementById('prompt').dispatchEvent(ev);
+    }""")
+    expect(err).to_contain_text("Load a vision projector (mmproj)")
+    expect(page.locator("#chat-imgs")).to_have_count(0)
+    page.locator("#clear").click()
+    page.evaluate("""() => {
+        const file = new File([new Uint8Array([137, 80, 78, 71])], 'drop.png', {type: 'image/png'});
+        const ev = new Event('drop', {bubbles: true, cancelable: true});
+        Object.defineProperty(ev, 'dataTransfer', {value: {types: ['Files'], files: [file]}});
+        document.querySelector('#tab-chat .compose').dispatchEvent(ev);
+    }""")
+    expect(err).to_contain_text("Load a vision projector (mmproj)")
+    expect(page.locator("#chat-imgs")).to_have_count(0)
+
+    # Enable vision in telemetry: button activates, no-vision note clears, and vision status appears.
+    model.update(vision=True, vision_device="disk", vision_quant="q8")
+    page.evaluate("import('/dashboard/lib/telemetry.js').then(m => m.poll())")
+    expect(btn).to_have_attribute("data-vision", "1")
+    expect(err).to_have_count(0)
+    expect(page.locator("#chatstat")).to_contain_text("disk")
+
+    # Build genuine 2x2 PNG and WebP payloads inside the browser via canvas.
+    png_b64, webp_b64 = page.evaluate("""async () => {
+        const c = document.createElement('canvas');
+        c.width = 2; c.height = 2;
+        const ctx = c.getContext('2d');
+        ctx.fillStyle = '#26704f';
+        ctx.fillRect(0, 0, 2, 2);
+        const toB64 = (mime) => new Promise((res) => c.toBlob((b) => {
+            const r = new FileReader();
+            r.onload = () => res(r.result.split(',')[1]);
+            r.readAsDataURL(b);
+        }, mime));
+        return [await toB64('image/png'), await toB64('image/webp')];
+    }""")
+    import base64
+    png_bytes = base64.b64decode(png_b64)
+    webp_bytes = base64.b64decode(webp_b64)
+    assert png_bytes[:8] == b"\x89PNG\r\n\x1a\n"
+    assert webp_bytes[:4] == b"RIFF" and webp_bytes[8:12] == b"WEBP"
+
+    # Attach native PNG, WebP, and a WebP disguised as .png (like Wikia downloads): all produce valid PNG data URIs.
+    file_input = page.locator('#tab-chat input[type="file"]')
+    file_input.set_input_files([
+        {"name": "native.png", "mimeType": "image/png", "buffer": png_bytes},
+        {"name": "photo.webp", "mimeType": "image/webp", "buffer": webp_bytes},
+        {"name": "disguised.png", "mimeType": "image/png", "buffer": webp_bytes},
+    ])
+    expect(page.locator("#chat-imgs .compose-thumb")).to_have_count(3)
+    expect(err).to_have_count(0)
+
+    # Paste via clipboardData.items fallback (empty .files) adds a 4th thumbnail with no duplicate.
+    page.evaluate("""(b64) => {
+        const raw = Uint8Array.from(atob(b64), c => c.charCodeAt(0));
+        const file = new File([raw], 'pasted.webp', {type: 'image/webp'});
+        const ev = new Event('paste', {bubbles: true, cancelable: true});
+        Object.defineProperty(ev, 'clipboardData', {
+            value: {files: [], items: [{kind: 'file', type: 'image/webp', getAsFile: () => file}]}
+        });
+        document.getElementById('prompt').dispatchEvent(ev);
+    }""", webp_b64)
+    expect(page.locator("#chat-imgs .compose-thumb")).to_have_count(4)
+
+    # Remove the last thumbnail; verify non-image file shows an error without losing valid attachments.
+    page.locator("#chat-imgs .compose-thumb button").last.click()
+    expect(page.locator("#chat-imgs .compose-thumb")).to_have_count(3)
+    file_input.set_input_files([{"name": "notes.txt", "mimeType": "text/plain", "buffer": b"hello"}])
+    expect(err).to_contain_text("Unsupported image format")
+    expect(page.locator("#chat-imgs .compose-thumb")).to_have_count(3)
+
+    # Send message and verify all 3 attached images were encoded as genuine PNG data URIs.
+    page.locator("#prompt").fill("Describe these")
+    page.locator("#send").click()
+    expect(page.locator("#msgs .md").last).to_have_text("looks good")
+    parts = sent[-1][-1]["content"]
+    assert isinstance(parts, list) and len(parts) == 4, parts
+    for i in range(3):
+        assert parts[i]["type"] == "image_url", parts[i]
+        url = parts[i]["image_url"]["url"]
+        assert url.startswith("data:image/png;base64,"), url[:40]
+        raw = base64.b64decode(url.split(",", 1)[1])
+        assert raw[:8] == b"\x89PNG\r\n\x1a\n", f"part {i} was not valid PNG bytes: {raw[:16]!r}"
+    assert parts[3] == {"type": "text", "text": "Describe these"}, parts[3]
+    expect(page.locator("#msgs .cv-imgs img")).to_have_count(3)
+    assert not errors, errors
+
+
 if __name__ == "__main__":
     cli = argparse.ArgumentParser(description=__doc__)
     cli.add_argument("--browser", choices=("chromium", "msedge"), default="chromium")
@@ -166,8 +305,9 @@ if __name__ == "__main__":
     with sync_playwright() as p:
         browser = p.chromium.launch(channel=args.browser)
         try:
-            check(browser.new_page())
-            check_history(browser.new_page())
+            check(browser.new_page(locale="en-US"))
+            check_history(browser.new_page(locale="en-US"))
+            check_vision_upload(browser.new_page(locale="en-US"))
         finally:
             browser.close()
-    print("Chat matched completion IDs, handled partial, failed and complete reply streams, and kept its history.")
+    print("Chat matched completion IDs, handled partial, failed and complete reply streams, kept its history, and attached images.")

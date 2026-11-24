@@ -48,12 +48,128 @@ function ReplyMeta({ m }) {
 const MAX_IMG_BYTES = 32 * 1024 * 1024;
 const IMG_MIMES = new Set(["image/png", "image/jpeg", "image/bmp", "image/gif", "image/x-tga", "image/tga"]);
 const IMG_EXT = /\.(png|jpe?g|bmp|gif|tga|psd|ppm|pgm)$/i;
-const imgSupported = (f) => (f.type && IMG_MIMES.has(f.type.toLowerCase())) || IMG_EXT.test(f.name || "");
+const IMG_EXTRA_EXT = /\.(webp|avif|svg|ico|jfif)$/i;
+const EXT_MIME = {
+  png: "image/png", jpg: "image/jpeg", jpeg: "image/jpeg", bmp: "image/bmp", gif: "image/gif",
+  tga: "image/x-tga", psd: "image/vnd.adobe.photoshop", ppm: "image/x-portable-pixmap", pgm: "image/x-portable-graymap",
+};
+const NO_VISION_ERR = "Load a vision projector (mmproj) in Model settings to attach images.";
+const BAD_IMG_ERR = "Unsupported image format (use PNG, JPEG, BMP, GIF, or WebP).";
+const BIG_IMG_ERR = "Image exceeds the 32 MiB size limit.";
+
+const isImageFile = (f) => !!(f && ((f.type && f.type.toLowerCase().startsWith("image/")) ||
+  IMG_EXT.test(f.name || "") || IMG_EXTRA_EXT.test(f.name || "")));
+const imgNative = (f) => !!(f && ((f.type && IMG_MIMES.has(f.type.toLowerCase())) || IMG_EXT.test(f.name || "")));
 const normVDev = (v) => (v === "host" || v === "cpu") ? "host" : v === "gpu" ? "gpu" : v === "auto" ? "auto" : "disk";
 const normVQuant = (v) => (v === "exact" || v === "bf16") ? "exact" : (v === "nvfp4" || v === "fp4") ? "nvfp4" : "q8";
-const dragHasFiles = (e) => !!(e.dataTransfer && Array.from(e.dataTransfer.types || []).includes("Files"));
+const dragHasFiles = (e) => !!(e.dataTransfer && (Array.from(e.dataTransfer.types || []).includes("Files") ||
+  (e.dataTransfer.files && e.dataTransfer.files.length)));
 
-export function Chat({ active }) {
+function extractTransferFiles(dt, imagesOnly) {
+  if (!dt) return [];
+  const out = [];
+  if (dt.files && dt.files.length) {
+    for (const f of Array.from(dt.files)) {
+      if (!imagesOnly || isImageFile(f)) out.push(f);
+    }
+  }
+  if (!out.length && dt.items && dt.items.length) {
+    for (const item of Array.from(dt.items)) {
+      if (item.kind !== "file") continue;
+      const f = item.getAsFile && item.getAsFile();
+      if (!f) continue;
+      const itemImg = !!(item.type && item.type.toLowerCase().startsWith("image/"));
+      if (imagesOnly && !isImageFile(f) && !itemImg) continue;
+      out.push(!isImageFile(f) && itemImg ? new File([f], f.name || "image", { type: item.type }) : f);
+    }
+  }
+  return out;
+}
+
+function readBlobAsDataUrl(blob) {
+  return new Promise((resolve) => {
+    const reader = new FileReader();
+    reader.onload = () => resolve(typeof reader.result === "string" ? reader.result : null);
+    reader.onerror = () => resolve(null);
+    reader.readAsDataURL(blob);
+  });
+}
+
+function ensureImageDataUrl(url, file) {
+  if (typeof url !== "string") return null;
+  const comma = url.indexOf(",");
+  if (comma < 0 || comma === url.length - 1) return null;
+  if (/^data:image\/[^;,]+;base64,/i.test(url)) return url;
+  const ext = ((file.name || "").split(".").pop() || "").toLowerCase();
+  const mime = (file.type && /^image\//i.test(file.type)) ? file.type.toLowerCase() : (EXT_MIME[ext] || "image/png");
+  return "data:" + mime + ";base64," + url.slice(comma + 1);
+}
+
+// Detect WebP / ISO BMFF (AVIF, HEIF) by magic bytes so files saved under a .png or .jpg name still transcode.
+async function sniffBrowserOnly(file) {
+  try {
+    const b = new Uint8Array(await file.slice(0, 12).arrayBuffer());
+    if (b.length >= 12 && b[0] === 0x52 && b[1] === 0x49 && b[2] === 0x46 && b[3] === 0x46 &&
+        b[8] === 0x57 && b[9] === 0x45 && b[10] === 0x42 && b[11] === 0x50) return "image/webp";
+    if (b.length >= 12 && b[4] === 0x66 && b[5] === 0x74 && b[6] === 0x79 && b[7] === 0x70) {
+      const brand = String.fromCharCode(b[8], b[9], b[10], b[11]);
+      return brand === "avif" || brand === "avis" ? "image/avif" : "application/octet-stream";
+    }
+  } catch { /* fall back to MIME / extension */ }
+  return "";
+}
+
+function canvasToBlob(canvas, type, quality) {
+  return new Promise((resolve) => canvas.toBlob((blob) => resolve(blob), type, quality));
+}
+
+async function transcodeImage(file, sniffedType) {
+  const srcBlob = sniffedType ? new Blob([file], sniffedType.startsWith("image/") ? { type: sniffedType } : {}) : file;
+  const objUrl = URL.createObjectURL(srcBlob);
+  try {
+    const img = await new Promise((resolve, reject) => {
+      const el = new Image();
+      el.onload = () => resolve(el);
+      el.onerror = () => reject(new Error("decode"));
+      el.src = objUrl;
+    });
+    const w = img.naturalWidth || img.width, h = img.naturalHeight || img.height;
+    if (!w || !h) return { err: BAD_IMG_ERR };
+    const canvas = document.createElement("canvas");
+    canvas.width = w;
+    canvas.height = h;
+    const ctx = canvas.getContext("2d");
+    if (!ctx) return { err: BAD_IMG_ERR };
+    ctx.drawImage(img, 0, 0, w, h);
+    let blob = await canvasToBlob(canvas, "image/png");
+    if (blob && blob.size > MAX_IMG_BYTES) {
+      // High-resolution WebP/AVIF can expand past 32 MiB as lossless PNG; fall back to white-matted JPEG.
+      ctx.globalCompositeOperation = "destination-over";
+      ctx.fillStyle = "#ffffff";
+      ctx.fillRect(0, 0, w, h);
+      blob = await canvasToBlob(canvas, "image/jpeg", 0.92);
+    }
+    if (!blob) return { err: BAD_IMG_ERR };
+    if (blob.size > MAX_IMG_BYTES) return { err: BIG_IMG_ERR };
+    const url = await readBlobAsDataUrl(blob);
+    return url ? { item: { name: file.name || "image.png", url } } : { err: BAD_IMG_ERR };
+  } catch {
+    return { err: BAD_IMG_ERR };
+  } finally {
+    URL.revokeObjectURL(objUrl);
+  }
+}
+
+async function loadImageFile(file) {
+  if (!isImageFile(file) || !file.size) return { err: BAD_IMG_ERR };
+  if (file.size > MAX_IMG_BYTES) return { err: BIG_IMG_ERR };
+  const sniffed = await sniffBrowserOnly(file);
+  if (sniffed || !imgNative(file)) return transcodeImage(file, sniffed);
+  const url = ensureImageDataUrl(await readBlobAsDataUrl(file), file);
+  return url ? { item: { name: file.name || "image", url } } : { err: BAD_IMG_ERR };
+}
+
+export function Chat({ active, showModel }) {
   // Messages as the page shows them: {role: "user", content, images?, imageCount?} or {role: "assistant", content, thinking, done, ...}.
   const [msgs, setMsgs] = useState([]);
   const [prompt, setPrompt] = useState("");
@@ -94,6 +210,7 @@ export function Chat({ active }) {
   useEffect(() => { if (active && input.current) input.current.focus(); }, [active]);
   useEffect(() => {
     if (!hasVision) { readSeq.current++; setImages([]); setImgErr(""); setDrag(false); }
+    else setImgErr((e) => e === NO_VISION_ERR ? "" : e);
   }, [hasVision]);
   useLayoutEffect(() => { if (box.current) box.current.scrollTop = box.current.scrollHeight; }, [msgs]);
 
@@ -106,36 +223,29 @@ export function Chat({ active }) {
   });
 
   const addFiles = (fileList) => {
-    if (!fileList || !hasVision) return;
-    const valid = [];
-    let err = "";
-    for (const file of Array.from(fileList)) {
-      if (!file.type?.startsWith("image/") && !IMG_EXT.test(file.name || "")) continue;
-      if (!imgSupported(file)) { err = "Unsupported image format (use PNG, JPEG, BMP, or GIF)."; continue; }
-      if (file.size > MAX_IMG_BYTES) { err = "Image exceeds the 32 MiB size limit."; continue; }
-      valid.push(file);
-    }
-    setImgErr(err);
-    if (!valid.length) return;
-    const seq = ++readSeq.current;
-    Promise.all(valid.map((file) => new Promise((resolve) => {
-      const reader = new FileReader();
-      reader.onload = () => resolve(typeof reader.result === "string" ? { name: file.name || "image", url: reader.result } : null);
-      reader.onerror = () => resolve(null);
-      reader.readAsDataURL(file);
-    }))).then((items) => {
+    const list = fileList ? Array.from(fileList) : [];
+    if (!list.length) return;
+    if (!hasVision) { setImgErr(NO_VISION_ERR); return; }
+    setImgErr("");
+    const seq = readSeq.current;
+    Promise.all(list.map(loadImageFile)).then((results) => {
       if (seq !== readSeq.current) return;
-      const ok = items.filter(Boolean);
+      const ok = [];
+      let err = "";
+      for (const r of results) {
+        if (r.item) ok.push(r.item);
+        else if (r.err) err = r.err;
+      }
+      setImgErr(err);
       if (ok.length) setImages((old) => old.concat(ok));
     });
   };
   const onPaste = (e) => {
-    if (!hasVision) return;
-    const files = e.clipboardData && e.clipboardData.files;
-    if (files && files.length && Array.from(files).some((f) => (f.type && f.type.startsWith("image/")) || IMG_EXT.test(f.name || ""))) {
-      e.preventDefault();
-      addFiles(files);
-    }
+    const files = extractTransferFiles(e.clipboardData, true);
+    if (!files.length) return;
+    e.preventDefault();
+    if (!hasVision) { setImgErr(NO_VISION_ERR); return; }
+    addFiles(files);
   };
   const userWire = (m) => {
     if (m.images && m.images.length) {
@@ -301,21 +411,32 @@ export function Chat({ active }) {
       </div></div>
       <div class="composer">
         <div class=${"compose" + (drag ? " drag" : "")}
-             onDragOver=${(e) => { if (hasVision && dragHasFiles(e)) { e.preventDefault(); setDrag(true); } }}
+             onDragOver=${(e) => { if (dragHasFiles(e)) { e.preventDefault(); if (hasVision) setDrag(true); } }}
              onDragLeave=${(e) => { if (!e.currentTarget.contains(e.relatedTarget)) setDrag(false); }}
-             onDrop=${(e) => { setDrag(false); if (hasVision && dragHasFiles(e)) { e.preventDefault(); addFiles(e.dataTransfer.files); } }}>
+             onDrop=${(e) => {
+               setDrag(false);
+               if (!dragHasFiles(e)) return;
+               e.preventDefault();
+               if (!hasVision) { setImgErr(NO_VISION_ERR); return; }
+               addFiles(extractTransferFiles(e.dataTransfer, false));
+             }}>
           ${images.length ? html`<div class="compose-imgs" id="chat-imgs">${images.map((im, idx) => html`
             <div class="compose-thumb"><img src=${im.url} alt=${im.name || "image"}/>
               <button type="button" title=${t("Remove")} aria-label=${t("Remove")}
                       onClick=${() => setImages((old) => old.filter((_, j) => j !== idx))}><${Icon} name="close"/></button></div>`)}</div>` : ""}
-          ${imgErr ? html`<div class="compose-err" id="chat-imgerr">${t(imgErr)}</div>` : ""}
+          ${imgErr ? html`<div class=${"compose-err" + (imgErr === NO_VISION_ERR ? " note" : "")} id="chat-imgerr">
+            <span>${t(imgErr)}</span>
+            ${imgErr === NO_VISION_ERR && showModel ? html`<button type="button" class="linkbtn" id="chat-img-model" onClick=${showModel}>${t("Model settings")}</button>` : ""}
+          </div>` : ""}
           <textarea id="prompt" rows="1" ref=${input} placeholder=${t(hasVision ? "Message FLYX, or paste / drop an image. Enter sends, Shift+Enter for a new line." : "Message FLYX. Enter sends, Shift+Enter for a new line.")}
                     value=${prompt} onInput=${(e) => setPrompt(e.target.value)} onKeyDown=${key} onPaste=${onPaste}></textarea>
           <div class="btns">
-            ${hasVision ? html`<input type="file" ref=${fileInput} accept=".png,.jpg,.jpeg,.bmp,.gif,.tga,.psd,.ppm,.pgm,image/png,image/jpeg,image/bmp,image/gif" multiple hidden
-                                      onChange=${(e) => { addFiles(e.target.files); e.target.value = ""; }}/>
-              <button type="button" class="imgbtn" id="chat-img" disabled=${streaming} title=${t("Attach image")} aria-label=${t("Attach image")}
-                      onClick=${() => fileInput.current && fileInput.current.click()}><${Icon} name="image"/></button>` : ""}
+            <input type="file" ref=${fileInput} accept="image/*,.tga,.psd,.ppm,.pgm,.webp,.avif" multiple hidden
+                   onChange=${(e) => { addFiles(e.target.files); e.target.value = ""; }}/>
+            <button type="button" class=${"imgbtn" + (hasVision ? "" : " off")} id="chat-img" disabled=${streaming}
+                    data-vision=${hasVision ? "1" : "0"}
+                    title=${t(hasVision ? "Attach image" : NO_VISION_ERR)} aria-label=${t("Attach image")}
+                    onClick=${() => { if (!hasVision) setImgErr(NO_VISION_ERR); else if (fileInput.current) fileInput.current.click(); }}><${Icon} name="image"/></button>
             <button class="sendbtn stop" id="stop" disabled=${!streaming} title=${t("Stop")} aria-label=${t("Stop the reply")}
                     onClick=${() => controller.current && controller.current.abort()}><${Icon} name="stopsq"/></button>
             <button class=${"sendbtn" + (prompt.trim() || images.length ? "" : " dim")} id="send" disabled=${streaming} title=${t("Send (Enter)")} aria-label=${t("Send")}

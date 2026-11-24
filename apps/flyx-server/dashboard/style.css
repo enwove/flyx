@@ -598,7 +598,8 @@ hr.div { border: 0; border-top: 1px solid var(--border); margin: 20px 0 16px; }
            box-shadow: 0 2px 12px rgba(18, 53, 42, 0.06); }
 .compose.drag { border-color: var(--accent); background: var(--primary-soft); }
 .compose-imgs { grid-column: 1 / -1; display: flex; flex-wrap: wrap; gap: 8px; padding: 4px 4px 2px 0; }
-.compose-err { grid-column: 1 / -1; font-size: 12px; color: var(--bad); padding: 2px 4px 0 0; }
+.compose-err { grid-column: 1 / -1; display: flex; align-items: baseline; flex-wrap: wrap; gap: 4px 10px; font-size: 12px; color: var(--danger); padding: 2px 4px 0 0; }
+.compose-err.note { color: var(--muted); }
 .compose-thumb { position: relative; width: 64px; height: 64px; border-radius: var(--r-md); overflow: hidden; border: 1px solid var(--border); background: var(--frame); }
 .compose-thumb img { width: 100%; height: 100%; object-fit: cover; display: block; }
 .compose-thumb button { position: absolute; top: 2px; right: 2px; width: 20px; height: 20px; border-radius: 50%; border: 0; padding: 0;
@@ -613,6 +614,10 @@ hr.div { border: 0; border-top: 1px solid var(--border); margin: 20px 0 16px; }
 .imgbtn { width: 34px; height: 34px; border-radius: 50%; border: 0; background: transparent; color: var(--muted);
           display: grid; place-items: center; padding: 0; cursor: pointer; }
 .imgbtn:hover { background: var(--frame); color: var(--text); }
+.imgbtn.off { opacity: 0.45; }
+.imgbtn.off:hover { background: var(--frame); color: var(--muted); }
+.imgbtn:disabled { opacity: 0.35; cursor: default; }
+.imgbtn:disabled:hover { background: transparent; color: var(--muted); }
 .imgbtn svg.i { width: 17px; height: 17px; }
 /* One round button, as chat apps have it: an arrow to send, a square to stop while a reply streams. */
 .sendbtn { width: 34px; height: 34px; border-radius: 50%; border: 0; display: grid; place-items: center; padding: 0;

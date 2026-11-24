@@ -157,7 +157,7 @@ function App() {
           ${page("overview", html`<${Overview} active=${tab === "overview"} go=${go} explore=${exploreLibrary} showModel=${showModel} onOpenMem=${setMemKind}/>`)}
           ${page("model", html`<${ModelPage} active=${tab === "model"} libraryAsked=${libraryAsked} currentAsked=${currentAsked}/>`)}
           ${page("requests", html`<${Requests} key=${apiKey()} active=${tab === "requests"} openId=${openRequest} select=${selectRequest}/>`)}
-          ${page("chat", html`<${Chat} active=${tab === "chat"}/>`)}
+          ${page("chat", html`<${Chat} active=${tab === "chat"} showModel=${showModel}/>`)}
           ${page("logs", html`<${Logs} active=${tab === "logs"}/>`)}
           ${page("integration", html`<${Integration} active=${tab === "integration"}/>`)}
         </div>
