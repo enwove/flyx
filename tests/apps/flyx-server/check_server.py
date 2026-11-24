@@ -240,7 +240,7 @@ def openai_checks(cl: Client, model: str):
         return r["choices"][0]["message"]["content"] if st == 200 else None
     a, b, c = sample(7), sample(7), sample(8)
     check(a is not None and a == b, "same seed gives the same sample")
-    check(a != c, "another seed gives another sample")
+    check(c is not None and a != c, "another seed gives another sample")
 
     # Penalties. A reply that would repeat itself changes under a frequency
     # penalty; requests without thinking get Qwen3.5's presence penalty of 1.5 unless they say
@@ -260,15 +260,15 @@ def openai_checks(cl: Client, model: str):
     # Give the model a choice of words: even a penalized token can win every time if the prompt requires it.  A seed
     # whose list the penalty leaves as it is says nothing either way (Inkling-2-Mini's with seed 7), so the next is
     # tried; one whose default is not the list with 1.5 spelled out ends the search, and fails, as does a request
-    # that fails (no reply is not a reply that differs).
+    # that fails or answers nothing (no reply is not a reply that differs).
     names = "List twenty possible names for a pet cat, one per line."
     for seed in (7, 8, 9, 10):
         by_default = with_penalty(names, seed=seed)
         spelled = with_penalty(names, seed=seed, presence_penalty=1.5)
         without = with_penalty(names, seed=seed, presence_penalty=0)
-        if None in (by_default, spelled, without) or by_default != spelled or by_default != without:
+        if not all((by_default, spelled, without)) or by_default != spelled or by_default != without:
             break
-    check(None not in (by_default, spelled, without) and by_default == spelled and by_default != without,
+    check(all((by_default, spelled, without)) and by_default == spelled and by_default != without,
           "without thinking the default presence penalty is 1.5",
           f"seed {seed}: {by_default!r} / {spelled!r} / {without!r}")
     st, r = cl.post("/v1/chat/completions", {"model": model, "max_tokens": 4, "presence_penalty": 3,
