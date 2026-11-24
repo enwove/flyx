@@ -257,11 +257,16 @@ def openai_checks(cl: Client, model: str):
           pushed.lower().count("echo") < plain.lower().count("echo"),
           "frequency_penalty: fewer repeats of a repeated word",
           f"{plain and plain.lower().count('echo')} then {pushed and pushed.lower().count('echo')}")
-    # Give the model a choice of words: even a penalized token can win every time if the prompt requires it.
+    # Give the model a choice of words: even a penalized token can win every time if the prompt requires it.  A seed
+    # whose list the penalty leaves as it is says nothing either way (Inkling-2-Mini's with seed 7), so the next is
+    # tried; one whose default is not the list with 1.5 spelled out ends the search, and fails.
     names = "List twenty possible names for a pet cat, one per line."
-    by_default = with_penalty(names, seed=7)
-    spelled = with_penalty(names, seed=7, presence_penalty=1.5)
-    without = with_penalty(names, seed=7, presence_penalty=0)
+    for seed in (7, 8, 9, 10):
+        by_default = with_penalty(names, seed=seed)
+        spelled = with_penalty(names, seed=seed, presence_penalty=1.5)
+        without = with_penalty(names, seed=seed, presence_penalty=0)
+        if by_default != spelled or by_default != without:
+            break
     check(by_default is not None and by_default == spelled and by_default != without,
           "without thinking the default presence penalty is 1.5", f"{by_default!r} / {spelled!r} / {without!r}")
     st, r = cl.post("/v1/chat/completions", {"model": model, "max_tokens": 4, "presence_penalty": 3,
