@@ -20,6 +20,36 @@ void draft_head_pick(const HeadBlock& head, const float* x, int nr, int k, int* 
   }
 }
 
+bool draft_head_additive_ready(const HeadBlock& head, const Lin& extra, const SignHead& extra_coarse, int K_extra) {
+  return head.coarse.bits && extra_coarse.bits && (head.wb.data || head.w) &&
+         (extra.w || (extra.packed() && extra.blk.size() == 1 && K_extra % 128 == 0));
+}
+
+void draft_head_pick_additive_step(const HeadBlock& head, const float* x_base, const Lin& extra,
+                                   const SignHead& extra_coarse, const float* extra_bias, const float* x_extra,
+                                   int K_extra, float softcap, float* cand_row, int ld, float* scratch_add, int k,
+                                   int* idx_out, float* val_out, float* prob_out, float* margin_out, const Launch& L) {
+  const int H = head.hidden, V = head.vocab;
+  cudaStream_t st = L.st;
+  gemm_sign_rough_add(x_extra, K_extra, extra_coarse, extra_bias, V, K_extra, cand_row, ld, L);
+  draft_select_cands(cand_row, ld, V, 1, L);
+  int* cand_i = reinterpret_cast<int*>(cand_row);
+  if (head.wb.data) {
+    dots_blocks(head.wb, H, cand_i, cand_i + 2 * kDraftCandCap, cand_row + kDraftCandCap, size_t(ld), kDraftCandCap,
+                x_base, H, 1, st);
+  } else {
+    draft_score_bf16(x_base, H, head.w, nullptr, H, 1, cand_row, ld, false, 0.f, st);
+  }
+  if (extra.w) {
+    draft_score_bf16(x_extra, K_extra, extra.w, extra_bias, K_extra, 1, cand_row, ld, true, softcap, st);
+  } else {
+    dots_blocks(extra.blk[0], K_extra, cand_i, cand_i + 2 * kDraftCandCap, scratch_add, 0, kDraftCandCap, x_extra,
+                K_extra, 1, st);
+    draft_combine_cands(scratch_add, 0, extra_bias, softcap, 1, cand_row, ld, st);
+  }
+  draft_pick_topk(cand_row, ld, 1, k, idx_out, val_out, st, prob_out, margin_out);
+}
+
 void norm_project(const float* x, float* h, float* out, int ld_out, int R, const Norm& n, const Lin& w, int N, int H,
                   const Launch& L, bool fused) {
   if (fused) {
