@@ -891,7 +891,8 @@ void test_tiny_vlm_backends() {
   const BackendRun ref_fp4 = run_backend_vlm("cpu_ref", vlm, patches, "", FLYX_VISION_DEV_GPU, FLYX_VISION_QUANT_NVFP4);
   // Pre-quantized GGML Q8_0 vision weights (like mmproj-Q8_0.gguf)
   TinyVlm vlm_q8(true, true);
-  const BackendRun ref_preq8 = run_backend_vlm("cpu_ref", vlm_q8, patches);
+  const BackendRun ref_preq8 =
+      run_backend_vlm("cpu_ref", vlm_q8, patches, "", FLYX_VISION_DEV_GPU, FLYX_VISION_QUANT_EXACT);
   std::printf(
       "  ok   cpu_ref tiny VLM (exact/q8/nvfp4 + pre-quantized Q8_0, padded kVInter=%d, MTP == plain, ckpt+snapshot)\n",
       TinyVlm::kVInter);
@@ -929,10 +930,13 @@ void test_tiny_vlm_backends() {
   // On-the-fly Q8_0 quantization (GPU + Host offload, with padded kVInter=144 -> 160)
   const BackendRun gpu_q8 = run_backend_vlm("cuda", vlm, patches, "", FLYX_VISION_DEV_GPU, FLYX_VISION_QUANT_Q8);
   const BackendRun host_q8 = run_backend_vlm("cuda", vlm, patches, "", FLYX_VISION_DEV_HOST, FLYX_VISION_QUANT_Q8);
+  const BackendRun def_run = run_backend_vlm("cuda", vlm, patches, "", 0, 0);
   const double rel_q8 = rel_err(gpu_q8.vision_embeds, ref_q8.vision_embeds);
   CHECK(rel_q8 < 2e-5, "cuda vs cpu_ref q8 encode_vision rel err: " + std::to_string(rel_q8));
   CHECK(host_q8.vision_embeds == gpu_q8.vision_embeds, "vision=host q8 must be bit-identical to vision=gpu q8");
   CHECK(host_q8.weights_bytes == text_vram, "vision=host q8 must use 0 resident vision VRAM");
+  CHECK(def_run.weights_bytes == text_vram, "default flyx_open_options must use 0 resident vision VRAM (host)");
+  CHECK(def_run.vision_embeds == host_q8.vision_embeds, "default flyx_open_options must match host + q8 bit-for-bit");
   CHECK(gpu_q8.weights_bytes < gpu.weights_bytes, "vision_quant=q8 must use less VRAM than exact BF16");
   CHECK(gpu_q8.plain_tokens == ref_q8.plain_tokens, "cuda vs cpu_ref q8 greedy tokens differ");
 

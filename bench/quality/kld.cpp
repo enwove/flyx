@@ -6,6 +6,14 @@
 //       [--kv fp8|16]           the K/V cache's format (the model's default otherwise)
 //       [--kv-method M]         how rounds read it (exact, strata[:BITS])
 //       [--kv-ram GB]           host memory for K/V the GPU does not hold (the engine's default otherwise)
+//       [--ctx N]               context length (default: auto)
+//       [--prefill-chunk N]     prefill chunk size (default: auto)
+//       [--mmproj FILE]         multimodal vision projector GGUF
+//       [--image FILE ...]      pair each --text (assistant reply) 1:1 with an image prompt
+//       [--prompt TEXT]         user prompt sent with each --image (default: "Describe this image in detail.")
+//       [--no-think]            disable thinking in multimodal chat template
+//       [--vision-device D]     host | gpu | auto (default: host)
+//       [--vision-quant Q]      q8 | exact | nvfp4 (default: q8)
 //       --save REF.bin          the distributions, for comparisons against them
 //       --ref REF.bin           compare with a file --save wrote (the same model's vocabulary, texts and tokens)
 //
@@ -30,6 +38,7 @@
 #include "core/exec/generation.h"
 #include "core/exec/request.h"
 #include "core/session/session.h"
+#include "core/vision/image.h"
 
 using namespace flyx;
 
@@ -77,15 +86,33 @@ int main(int argc, char** argv) {
     return 2;
   }
   const std::string model = argv[1];
-  std::vector<std::string> texts;
+  std::vector<std::string> texts, images;
   std::string save, ref, activations, backend_options, kv, kv_method;
+  std::string mmproj, vision_device, vision_quant, prompt_text = "Describe this image in detail.";
   double kv_ram = -1;
-  int tokens = 1024, start = 32;
-  for (int i = 2; i + 1 < argc; i += 2) {
-    const std::string k = argv[i], v = argv[i + 1];
+  int tokens = 1024, start = 32, ctx = 0, prefill_chunk = 0;
+  bool enable_thinking = true;
+  for (int i = 2; i < argc; ++i) {
+    const std::string k = argv[i];
+    if (k == "--no-think") {
+      enable_thinking = false;
+      continue;
+    }
+    if (i + 1 >= argc) {
+      std::fprintf(stderr, "kld: missing value for %s\n", k.c_str());
+      return 2;
+    }
+    const std::string v = argv[++i];
     if (k == "--text") texts.push_back(v);
+    else if (k == "--image") images.push_back(v);
+    else if (k == "--prompt") prompt_text = v;
+    else if (k == "--mmproj") mmproj = v;
+    else if (k == "--vision-device") vision_device = v;
+    else if (k == "--vision-quant") vision_quant = v;
     else if (k == "--tokens") tokens = std::atoi(v.c_str());
     else if (k == "--start") start = std::atoi(v.c_str());
+    else if (k == "--ctx") ctx = std::atoi(v.c_str());
+    else if (k == "--prefill-chunk") prefill_chunk = std::atoi(v.c_str());
     else if (k == "--save") save = v;
     else if (k == "--ref") ref = v;
     else if (k == "--activations") activations = v;
@@ -93,25 +120,42 @@ int main(int argc, char** argv) {
     else if (k == "--kv") kv = v;
     else if (k == "--kv-method") kv_method = v;
     else if (k == "--kv-ram") kv_ram = std::atof(v.c_str());
+    else {
+      std::fprintf(stderr, "kld: unknown flag %s\n", k.c_str());
+      return 2;
+    }
   }
   if (texts.empty() || save.empty() == ref.empty()) {
     std::fprintf(stderr, "kld: one --text at least, and --save or --ref\n");
     return 2;
   }
+  if (!images.empty() && images.size() != texts.size()) {
+    std::fprintf(stderr, "kld: --image count (%zu) must match --text count (%zu)\n", images.size(), texts.size());
+    return 2;
+  }
   EngineOptions o;
   o.speculative = false;
   o.lookup = false;
-  o.max_ctx = start + tokens + 64;
+  o.max_ctx = ctx > 0 ? ctx : (!images.empty() ? std::max(2048, tokens + 1024) : start + tokens + 64);
   o.ctx_given = true;
+  if (prefill_chunk > 0) o.prefill_chunk = prefill_chunk;
   o.activations = activations;
   if (!kv.empty()) o.kv = kv == "fp8" ? FLYX_KV_FP8 : FLYX_KV_16;
   if (!kv_method.empty()) o.kv_method = kv_method;
   if (kv_ram >= 0) o.kv_ram = int64_t(kv_ram * 1e9);
+  if (!mmproj.empty()) o.mmproj_file = mmproj;
+  if (!vision_device.empty()) o.vision_device = vision_device;
+  if (!vision_quant.empty()) o.vision_quant = vision_quant;
+  if (images.empty() && mmproj.empty()) o.vision = false;
   o.backend_options = backend_options.empty() ? "head_cert=0" : backend_options + ",head_cert=0";
   Engine e;
   std::string err;
   if (!e.load(model, o, &err)) {
     std::fprintf(stderr, "load: %s\n", err.c_str());
+    return 1;
+  }
+  if (!images.empty() && (!e.has_vision() || !e.chat().ok())) {
+    std::fprintf(stderr, "kld: --image requires a model with a chat template and a loaded vision encoder\n");
     return 1;
   }
   const auto* api = e.api();
@@ -128,17 +172,19 @@ int main(int argc, char** argv) {
     return 1;
   }
 
-  // the texts' tokens: start + tokens + 1 of each
+  // Tokenize texts: text-only mode needs start + tokens + 1; multimodal mode teacher-forces tokens + 1 reply tokens.
+  const bool multimodal = !images.empty();
+  const int need = multimodal ? (tokens + 1) : (start + tokens + 1);
   std::vector<std::vector<int32_t>> toks;
   for (const auto& path : texts) {
     std::ifstream f(path, std::ios::binary);
     const std::string s((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
-    auto t = e.tokenizer().encode_prompt(s);  // as the model sees a text: after its tokenizer's prefix (<s>)
-    if (t.size() < size_t(start + tokens + 1)) {
-      std::fprintf(stderr, "kld: %s has %zu tokens, fewer than %d\n", path.c_str(), t.size(), start + tokens + 1);
+    auto t = multimodal ? e.tokenizer().encode(s) : e.tokenizer().encode_prompt(s);
+    if (t.size() < size_t(need)) {
+      std::fprintf(stderr, "kld: %s has %zu tokens, fewer than %d\n", path.c_str(), t.size(), need);
       return 1;
     }
-    t.resize(size_t(start + tokens + 1));
+    t.resize(size_t(need));
     toks.push_back(std::move(t));
   }
 
@@ -178,28 +224,67 @@ int main(int argc, char** argv) {
       std::fprintf(stderr, "session: %s\n", err.c_str());
       return 1;
     }
-    GenerateRequest rq;
-    rq.prompt.assign(t.begin(), t.begin() + start);
-    rq.max_new_tokens = 1;
-    rq.ignore_eos = true;
-    GenerateResult res;
-    if (generate(s, rq, TextSink{}, &res, &err) != 0) {
-      std::fprintf(stderr, "prefill: %s\n", err.c_str());
-      return 1;
+    int base_pos = start;
+    int t_start = start;
+    if (multimodal) {
+      auto img = std::make_shared<interfaces::ImageInput>();
+      if (!vision::load_image_file(images[ti], img.get(), &err)) {
+        std::fprintf(stderr, "image %s: %s\n", images[ti].c_str(), err.c_str());
+        return 1;
+      }
+      Request req;
+      req.chat = true;
+      req.chat_options.enable_thinking = enable_thinking;
+      ChatMessage msg;
+      msg.role = "user";
+      msg.parts.push_back(interfaces::ContentPart::make_image(img));
+      msg.parts.push_back(interfaces::ContentPart::make_text(prompt_text));
+      req.messages.push_back(std::move(msg));
+      RenderedChat rc;
+      if (!render_request(e.chat(), e.tokenizer(), req, &rc, &err, false)) {
+        std::fprintf(stderr, "render: %s\n", err.c_str());
+        return 1;
+      }
+      PreparedRequest pr;
+      if (!prepare_request(e, s, req, rc, &pr, &err)) {
+        std::fprintf(stderr, "prepare: %s\n", err.c_str());
+        return 1;
+      }
+      base_pos = int(pr.gen.prompt.size());
+      t_start = 0;
+      pr.gen.max_new_tokens = 1;
+      pr.gen.ignore_eos = true;
+      GenerateResult res;
+      if (generate(s, pr.gen, TextSink{}, &res, &err) != 0) {
+        std::fprintf(stderr, "prefill: %s\n", err.c_str());
+        return 1;
+      }
+    } else {
+      GenerateRequest rq;
+      rq.prompt.assign(t.begin(), t.begin() + start);
+      rq.max_new_tokens = 1;
+      rq.ignore_eos = true;
+      GenerateResult res;
+      if (generate(s, rq, TextSink{}, &res, &err) != 0) {
+        std::fprintf(stderr, "prefill: %s\n", err.c_str());
+        return 1;
+      }
     }
     Totals one;
     flyx_gen_params g{};
     g.top_p = 1.f;
     flyx_round_result r{};
-    for (int p = start; p < start + tokens; ++p) {
-      // the text's token is the input at position p, whatever the model chose there
-      if (api->rewind(s.seq(), p, t[size_t(p)]) != 1 || api->launch(plain, s.seq(), &g) != 0 ||
+    for (int step = 0; step < tokens; ++step) {
+      const int seq_pos = base_pos + step;
+      const size_t ti_pos = size_t(t_start + step);
+      // the text's token is the input at position seq_pos, whatever the model chose there
+      if (api->rewind(s.seq(), seq_pos, t[ti_pos]) != 1 || api->launch(plain, s.seq(), &g) != 0 ||
           api->read(s.seq(), &r) != 0 || api->logits(s.seq(), 0, z.data()) != 0) {
-        std::fprintf(stderr, "kld: position %d: %s\n", p, api->last_error());
+        std::fprintf(stderr, "kld: position %d: %s\n", seq_pos, api->last_error());
         return 1;
       }
       log_softmax(z, &lp);
-      const int32_t next = t[size_t(p) + 1];
+      const int32_t next = t[ti_pos + 1];
       if (out) {
         std::fwrite(lp.data(), sizeof(float), lp.size(), out);
         one.nll -= lp[size_t(next)];

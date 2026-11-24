@@ -21,17 +21,17 @@ namespace flyx {
 namespace {
 
 bool parse_vision_device(const std::string& s, int32_t* out, std::string* err) {
-  if (s.empty() || s == "auto") return *out = FLYX_VISION_DEV_AUTO, true;
-  if (s == "host" || s == "cpu") return *out = FLYX_VISION_DEV_HOST, true;
+  if (s.empty() || s == "host" || s == "cpu") return *out = FLYX_VISION_DEV_HOST, true;
   if (s == "gpu") return *out = FLYX_VISION_DEV_GPU, true;
-  return *err = "unknown --vision-device '" + s + "' (auto, gpu, or host)", false;
+  if (s == "auto") return *out = FLYX_VISION_DEV_AUTO, true;
+  return *err = "unknown --vision-device '" + s + "' (host, gpu, or auto)", false;
 }
 
 bool parse_vision_quant(const std::string& s, int32_t* out, std::string* err) {
-  if (s.empty() || s == "exact" || s == "bf16") return *out = FLYX_VISION_QUANT_EXACT, true;
-  if (s == "q8" || s == "q8_0") return *out = FLYX_VISION_QUANT_Q8, true;
+  if (s.empty() || s == "q8" || s == "q8_0") return *out = FLYX_VISION_QUANT_Q8, true;
+  if (s == "exact" || s == "bf16") return *out = FLYX_VISION_QUANT_EXACT, true;
   if (s == "nvfp4" || s == "fp4") return *out = FLYX_VISION_QUANT_NVFP4, true;
-  return *err = "unknown --vision-quant '" + s + "' (exact, q8, or nvfp4)", false;
+  return *err = "unknown --vision-quant '" + s + "' (q8, exact, or nvfp4)", false;
 }
 
 bool set_kv_method(const EngineOptions& opt, plan::KvTiers* tiers, std::string* err) {

@@ -138,8 +138,8 @@ struct BackendOptions {
   bool draft_kv16 = false;       // draft_kv=16: the MTP layer's cache in binary16 beside the target's FP8
   bool packed_blocks = true;     // blocks=bf16 clears it
   int embed = 0;                 // embed=auto (0: host memory unless the GPU has room, open_model), host (1), gpu (2)
-  int vision = FLYX_VISION_DEV_AUTO;        // vision=auto (0), host (1: pinned RAM streamed to GPU), gpu (2)
-  int vision_quant = FLYX_VISION_QUANT_EXACT;  // vision_quant=exact (0), q8 (1), nvfp4 (2)
+  int vision = FLYX_VISION_DEV_HOST;         // vision=host (0: pinned RAM streamed to GPU), gpu (1), auto (2)
+  int vision_quant = FLYX_VISION_QUANT_Q8;   // vision_quant=q8 (0), exact (1), nvfp4 (2)
   int wide = 0;                  // wide=auto (0: wide lookup rounds where the GPU has room, open_model), 0 (1), 1 (2)
   int strata_copy_slots = 2;
   bool strata_compact = false;  // pack the two shared words into the 24 private words of a hosted 256d 3-bit copy

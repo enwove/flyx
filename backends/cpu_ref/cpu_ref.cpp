@@ -882,7 +882,7 @@ int open_model(const flyx_model_desc* desc, const flyx_open_options* opts, flyx_
   m->states.assign(desc->states, desc->states + desc->n_states);
   try {
     // Identify vision linear weight indices when on-the-fly vision quantization is requested.
-    const int32_t vq = opts ? opts->vision_quant : FLYX_VISION_QUANT_EXACT;
+    const int32_t vq = opts ? opts->vision_quant : FLYX_VISION_QUANT_Q8;
     std::unordered_set<int> vision_lin_w;
     if (vq == FLYX_VISION_QUANT_Q8 || vq == FLYX_VISION_QUANT_NVFP4) {
       auto mark = [&](int idx) {
