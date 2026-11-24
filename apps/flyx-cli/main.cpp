@@ -650,7 +650,8 @@ int cmd_bench_prompts(const Args& a) {
     return write_record(text, a, out) && error.empty() ? 0 : 1;
   };
   for (size_t i = 0; i < prepared.size(); ++i) {
-    const GenerateRequest& gen = prepared[i].gen;
+    const PreparedRequest ran = std::move(prepared[i]);  // its grammar's state goes with it once the prompt has run
+    const GenerateRequest& gen = ran.gen;
     std::string err;
     Session s(e.get());
     // The reply's tokens as they are shown (no stop strings here: all of them), then the end token that ended it.
