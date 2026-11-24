@@ -310,15 +310,15 @@ void kv_stage(const void* k, void* vk, const void* v, void* vv, size_t row, int 
 
 namespace {
 
-__global__ void k_kv_stage_ring(const uint4* k, uint4* vk, const uint4* v, uint4* vv, size_t row16, int sink, int ring,
-                                int from, int cap, const DevParams* P, int pos_add, int span, KvStagePart part,
-                                KvStageScales sc) {
+__global__ void k_kv_stage_ring(const uint4* k, uint4* vk, const uint4* v, uint4* vv, size_t row16, int sink,
+                                int ring_base, int ring, int from, int cap, const DevParams* P, int pos_add, int span,
+                                KvStagePart part, KvStageScales sc) {
   const int at = P->position + pos_add;
   const int first = part == kStagePass ? max(from, at) : from;
   const int end = min(cap, part == kStageBefore ? at : at + span);
   if (end <= first) return;
-  const int tail = ring - sink;
-  auto slot_of = [&](int pos) { return ring <= 0 || pos < sink ? pos : sink + (pos - sink) % tail; };
+  const int tail = ring - ring_base;
+  auto slot_of = [&](int pos) { return ring <= 0 || pos < sink ? pos : ring_base + (pos - sink) % tail; };
   if (sc.ks) {
     const int npos = end - first;
     const size_t total = size_t(npos) * sc.nkv;
@@ -376,12 +376,12 @@ __global__ void k_kv_drain_pageable(const PageDrainLayer* layers, int n_layers, 
 
 }  // namespace
 
-void kv_stage_ring(const void* k, void* vk, const void* v, void* vv, size_t row, int sink, int ring, int from, int cap,
-                   const DevParams* P, int pos_add, int span, KvStagePart part, int blocks, cudaStream_t st,
-                   const KvStageScales& scales) {
+void kv_stage_ring(const void* k, void* vk, const void* v, void* vv, size_t row, int sink, int ring_base, int ring,
+                   int from, int cap, const DevParams* P, int pos_add, int span, KvStagePart part, int blocks,
+                   cudaStream_t st, const KvStageScales& scales) {
   k_kv_stage_ring<<<blocks, 256, 0, st>>>(static_cast<const uint4*>(k), static_cast<uint4*>(vk),
-                                          static_cast<const uint4*>(v), static_cast<uint4*>(vv), row / 16, sink, ring,
-                                          from, cap, P, pos_add, span, part, scales);
+                                          static_cast<const uint4*>(v), static_cast<uint4*>(vv), row / 16, sink,
+                                          ring_base, ring, from, cap, P, pos_add, span, part, scales);
 }
 
 void kv_drain_pageable(const PageDrainLayer* layers, int n_layers, const DevParams* P, const flyx_round_result* ring_dev,

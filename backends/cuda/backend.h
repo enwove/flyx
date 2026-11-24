@@ -195,8 +195,8 @@ void gemm_on_glu(const Lin& W, int N, int K, float* y, int ldy, int rows, bool a
 struct RowBufs {
   int *tokens = nullptr, *choice = nullptr;
   float *x = nullptr, *h = nullptr, *proj = nullptr, *act = nullptr, *gdn_o = nullptr, *qbuf = nullptr,
-        *part = nullptr, *attn_state = nullptr, *feats = nullptr, *cx = nullptr, *ckv = nullptr, *mcat = nullptr,
-        *mx = nullptr, *mhn = nullptr;
+        *part = nullptr, *attn_state = nullptr, *split_state = nullptr, *feats = nullptr, *cx = nullptr,
+        *ckv = nullptr, *mcat = nullptr, *mx = nullptr, *mhn = nullptr;
   float* lora = nullptr;  // the target's adapters' first products (RowNeeds::lora a row; none without adapters)
   GdnBufs pre{};  // GDN prefill scratch (prefill set only)
   Scratch scratch{};  // the GEMM inputs the kernels stage
@@ -206,6 +206,7 @@ struct RowBufs {
 struct RowNeeds {
   int proj = 0, act = 0, gdn_o = 0, q = 0;  // projections, activations, GDN output, attention queries
   int attn_state = 0;                       // prefill windowed flash attention softmax state (floats per row)
+  int split_state = 0;                      // prefill windowed split attention warp state (floats per row, <= 16 rows)
   int lora = 0;                             // the target's adapters' first products: q|k|v's (3 rank), gate|up's
   int feats = 0, cx = 0, ckv = 0;           // DFlash2 context: tapped features, fc output, K/V projections
   bool mtp = false;                         // MTP context rows (2 x hidden, hidden, hidden)
@@ -822,15 +823,17 @@ struct flyx_seq {
     void *at = nullptr, *view = nullptr;
     uint8_t* page = nullptr;  // pageable host backing when pageable == true (0 bytes WDDM pinned)
     int device_rows = INT32_MAX, slot = -1, stage_rows = INT32_MAX;  // stage_rows: positions its staging holds
-    int page_ring = 0;        // total GPU slots (device_rows + ring_tail) when pageable == true
+    int page_ring_base = 0;   // first tail-ring slot (>= device_rows; +1 gap when dev % row != 0)
+    int page_ring = 0;        // total GPU slots (page_ring_base + ring_tail) when pageable == true
     float* scales = nullptr;  // its staging's scales (scale_floats a position: FP8's KV heads; 0: none)
   };
   Tiered tiered_alloc(size_t positions, size_t row, int role, int parity, int scale_floats, bool pageable = false,
-                      int ring_tail = 0);
+                      int ring_tail = 0, bool even_dev = false);
   // Hybrid WDDM pinned + pageable host K/V overflow (runtime/tiers.cpp, runtime/state.cpp).
   uint64_t pinned_budget = UINT64_MAX;  // sampled once per seq_size / seq_new_in so dry-run & real build agree
-  size_t page_spill_vram = 0;           // extra VRAM headroom reserved in seq_size() for multi-session WDDM spill
-  int page_graph_layers = 0;            // worst-case pageable layers budgeted for CUDA graph room in seq_size()
+  size_t page_spill_vram = 0;           // extra VRAM headroom reserved in seq_size() for WDDM spill
+  size_t page_spill_host = 0;           // extra host memory headroom reserved in seq_size() for WDDM spill
+  bool page_spill_auto = false;         // seq_size() dry run under finite WDDM auto budget (graphs.cpp conservative)
   std::vector<std::pair<void*, size_t>> pageable_allocs;
   std::deque<flyx::cuda::PageGatherCtx> page_ctxs;  // stable pointers captured by cudaLaunchHostFunc graph nodes
   std::vector<int> page_layers;                     // kv[] indices backed by pageable host RAM

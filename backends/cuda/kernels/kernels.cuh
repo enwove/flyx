@@ -639,10 +639,10 @@ struct PageDrainLayer {
   uint8_t *drain_k_host = nullptr, *drain_v_host = nullptr;
   float *drain_ks_host = nullptr, *drain_vs_host = nullptr;
   size_t row_bytes = 0;
-  int nkv = 0, device_positions = 0, ring = 0;
+  int nkv = 0, device_positions = 0, ring_base = 0, ring = 0;
   __host__ __device__ int slot_of(int pos) const {
     return ring <= 0 || pos < device_positions ? pos
-                                               : device_positions + (pos - device_positions) % (ring - device_positions);
+                                               : ring_base + (pos - device_positions) % (ring - ring_base);
   }
 };
 
@@ -687,11 +687,16 @@ struct KvRef {
   // are live in the GPU tail ring (slot_of).
   PageGatherCtx* page_ctx = nullptr;
   int ring_safe = 0;
+  // Optional gap slots skipped between `sink` and the tail ring start (1 when VMM `dev` is not a multiple of row
+  // bytes so the first tail-ring slot never aliases the device VMM handle shared with the staged view).
+  int ring_pad = 0;
   __host__ __device__ bool fp8() const { return ks != nullptr; }
   __host__ __device__ float* kscales(int pos) const { return pos < scale_split ? ks : ks_far; }
   __host__ __device__ float* vscales(int pos) const { return pos < scale_split ? vs : vs_far; }
   __host__ __device__ int slot_of(int pos) const {
-    return ring <= 0 || pos < sink ? pos : sink + (pos - sink) % (ring - sink);
+    if (ring <= 0 || pos < sink) return pos;
+    const int base = sink + ring_pad;
+    return base + (pos - sink) % (ring - base);
   }
   // Fibonacci hashing: pairs near one another spread over the slots.
   __host__ __device__ int hot_slot(int q) const { return int((uint32_t(q) * 2654435761u) >> (32 - hot_bits)); }
@@ -924,13 +929,22 @@ const double* rope_table(double theta, int rot_dim);
 // causal prefill of more than 16 rows (head dims 32/64/128/256; q and the
 // probabilities rounded to binary16 like the caches, fp32 accumulation).
 // attention_flash returns false when the head dim is not supported.
+// Windowed split-K attention across staging windows [k_lo, k_hi) (k_lo a multiple of kFlashWindowAlign): carries the
+// in-flight split's warp state across window boundaries in `state` (at most one split per (row, head) straddles any
+// boundary) so pageable short prefills (rows <= FLYX_MAX_ROWS) reproduce single-pass attention_split bit-for-bit.
+__host__ __device__ constexpr int kSplitStateFloats(int hd) { return 4 * (hd + 40); }
+struct SplitWindow {
+  int k_lo = 0, k_hi = INT_MAX;
+  float* state = nullptr;  // [rows][nh][kSplitStateFloats(hd)]
+  bool first = true, last = true;
+};
 void attention_split(const float* q, const kv16* Kc, const kv16* Vc, int nh, int nkv, int hd, int rows, bool causal,
                      int extra, float scale, const DevParams* P, const float* gate, int ld_gate, float* out,
                      int ld_out, float* partial, int splits, const Launch& L, int pos_add = 0, int window = 0);
 void attention_split(const float* q, KvRef kv, int nh, int nkv, int hd, int rows, bool causal, int extra, float scale,
                      const DevParams* P, const float* gate, int ld_gate, float* out, int ld_out, float* partial,
                      int splits, const Launch& L, int pos_add = 0, int window = 0, const TreeRows* tree = nullptr,
-                     CanvasKeys canvas = {});
+                     CanvasKeys canvas = {}, const SplitWindow& sw = SplitWindow{});
 bool attention_flash(const float* q, const kv16* Kc, const kv16* Vc, int nh, int nkv, int hd, int rows, float scale,
                      const DevParams* P, const float* gate, int ld_gate, float* out, int ld_out, const Launch& L,
                      int pos_add = 0);
@@ -939,7 +953,7 @@ bool attention_flash(const float* q, const kv16* Kc, const kv16* Vc, int nh, int
 // a shape it does not take.
 bool attention_rows_mma(const float* q, KvRef kv, int nh, int nkv, int hd, int rows, bool causal, int extra,
                         float scale, const DevParams* P, float* partial, int splits, const Launch& L, int pos_add,
-                        int from, const TreeRows* tree = nullptr);
+                        int from, const TreeRows* tree = nullptr, const SplitWindow& sw = SplitWindow{});
 // A prefill's attention a window of keys at a time: the keys [k_lo, k_hi) of each row's (k_lo a multiple
 // of kFlashWindowAlign; kv need hold only those), carrying each (row, head)'s softmax state (its maximum, its four
 // lanes' sums, its deferred FP8 value-scale exponent bit-cast in slot 5 for grouped FP8 kernels, and its output,
@@ -1313,9 +1327,9 @@ void kv_stage(const void* k, void* vk, const void* v, void* vv, size_t row, int 
               const KvStageScales& scales = KvStageScales{});
 // Copy positions written by the current pass from a pageable layer's GPU tail ring (slot_of) into a linear staging
 // window (vk/vv, scales).
-void kv_stage_ring(const void* k, void* vk, const void* v, void* vv, size_t row, int sink, int ring, int from, int cap,
-                   const DevParams* P, int pos_add, int span, KvStagePart part, int blocks, cudaStream_t st,
-                   const KvStageScales& scales = KvStageScales{});
+void kv_stage_ring(const void* k, void* vk, const void* v, void* vv, size_t row, int sink, int ring_base, int ring,
+                   int from, int cap, const DevParams* P, int pos_add, int span, KvStagePart part, int blocks,
+                   cudaStream_t st, const KvStageScales& scales = KvStageScales{});
 // At round end (before copy_ring): copy each pageable layer's newly committed rows [pos - n_tokens, pos) from its GPU
 // tail ring into its mapped pinned drain slot (P->seq_no % kRing).
 void kv_drain_pageable(const PageDrainLayer* layers, int n_layers, const DevParams* P, const flyx_round_result* ring_dev,

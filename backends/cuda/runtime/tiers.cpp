@@ -194,7 +194,7 @@ void* flyx_seq::pageable_alloc_raw(size_t bytes) {
 }
 
 flyx_seq::Tiered flyx_seq::tiered_alloc(size_t positions, size_t row, int role, int parity, int scale_floats,
-                                        bool pageable, int ring_tail) {
+                                        bool pageable, int ring_tail, bool even_dev) {
   Tiered t;
   const size_t want = positions * row;
   if (device_positions < 0 || size_t(device_positions) >= positions) {
@@ -205,8 +205,11 @@ flyx_seq::Tiered flyx_seq::tiered_alloc(size_t positions, size_t row, int role, 
   if (!v.missing.empty()) throw std::runtime_error("K/V in host memory: " + v.missing);
   const size_t total = round_up(want, v.gran);
   // The device part rounds down to the granularity: the rows past it go to the host with the rest.
+  // Strata pageable layers require an even device_rows split so no Strata pair straddles device and pageable RAM;
+  // enforcing the same even rounding for all page-eligible layers keeps device_positions and staging slots identical
+  // across pinned and pageable layers in hybrid auto mode.
   size_t dev = size_t(device_positions) * row / v.gran * v.gran;
-  if (pageable)
+  if (pageable || even_dev)
     while (dev >= v.gran && ((dev / row) & 1)) dev -= v.gran;
   const size_t host = total - dev;
   t.device_rows = int(dev / row);
@@ -233,16 +236,23 @@ flyx_seq::Tiered flyx_seq::tiered_alloc(size_t positions, size_t row, int role, 
   t.scales = staging[size_t(slot)].scales;
 
   if (pageable) {
-    t.page_ring = t.device_rows + ring_tail;
+    // When dev is not a multiple of row, slot t.device_rows straddles the VMM boundary dev and its prefix bytes live
+    // in the device handle `hd` that `view` also maps for staged reads. Skip that straddling slot (ring_pad = 1) so
+    // every tail-ring slot lies strictly inside the private ring handle `hr` (va + dev) and staging into `view` at
+    // device_positions can never clobber or race with a wrapped tail-ring token.
+    const int ring_pad = (dev > 0 && (dev % row) != 0) ? 1 : 0;
+    t.page_ring_base = t.device_rows + ring_pad;
+    t.page_ring = t.page_ring_base + ring_tail;
     const size_t host_want = (positions - size_t(t.device_rows)) * row;
     t.page = static_cast<uint8_t*>(pageable_alloc_raw(host_want));
     const size_t ring_bytes = size_t(ring_tail) * row;
+    const size_t ring_vmm_bytes = size_t(ring_tail + ring_pad) * row;
     device_positions = std::min(device_positions, t.device_rows);
     if (dry) {
       if (dev == 0) {
         t.at = alloc<uint8_t>(ring_bytes);
       } else {
-        dry_bytes += dev + round_up(ring_bytes, v.gran);
+        dry_bytes += dev + round_up(ring_vmm_bytes, v.gran);
         t.at = reinterpret_cast<void*>(uintptr_t(256));
       }
       t.view = reinterpret_cast<void*>(uintptr_t(256));
@@ -268,7 +278,7 @@ flyx_seq::Tiered flyx_seq::tiered_alloc(size_t positions, size_t row, int role, 
       m.va_bytes = 0;
       t.at = alloc<uint8_t>(ring_bytes);
     } else {
-      const size_t ring_vmm = round_up(ring_bytes, v.gran);
+      const size_t ring_vmm = round_up(ring_vmm_bytes, v.gran);
       const size_t va_sz = dev + ring_vmm;
       CUdeviceptr va = 0;
       check(v.reserve(&va, va_sz, v.gran, 0, 0), "reserving addresses for a pageable ring");
@@ -283,7 +293,7 @@ flyx_seq::Tiered flyx_seq::tiered_alloc(size_t positions, size_t row, int role, 
       m.handles[1] = hr;
       check(v.map(va + dev, ring_vmm, 0, hr, 0), "mapping device tail ring");
       check(v.set_access(va, va_sz, &access, 1), "granting the device access");
-      CK(cudaMemsetAsync(reinterpret_cast<void*>(va), 0, dev + ring_bytes, st));
+      CK(cudaMemsetAsync(reinterpret_cast<void*>(va), 0, dev + ring_vmm_bytes, st));
       t.at = reinterpret_cast<void*>(va);
     }
     t.view = reinterpret_cast<void*>(vw);
@@ -656,7 +666,7 @@ void flyx_seq::window_stage(const KvBuf& b, int w0, int w1, int parity, int rows
       KvStageScales sc;
       if (b.ks_page) sc = {b.ks, b.vs, b.scales_from(b.wks[parity], w0), b.scales_from(b.wvs[parity], w0), b.nkv};
       kv_stage_ring(b.k, shifted(b.wk[parity], w0, b.row), b.v, shifted(b.wv[parity], w0, b.row), b.row,
-                    b.device_positions, b.page_ring, w0, w1, P, 0, rows, kStagePass, blocks, s, sc);
+                    b.device_positions, b.page_ring_base, b.page_ring, w0, w1, P, 0, rows, kStagePass, blocks, s, sc);
     }
     return;
   }
@@ -730,7 +740,7 @@ void flyx_seq::stage_before(const KvBuf& kb, int pos_add, int span, cudaStream_t
       sc = {kb.ks, kb.vs, kb.scales_from(kb.vks, kb.device_positions), kb.scales_from(kb.vvs, kb.device_positions),
             kb.nkv};
     // Copy both any in-flight committed rows [position, P->position) and the pass's own rows from the GPU tail ring.
-    kv_stage_ring(kb.k, kb.vk, kb.v, kb.vv, kb.row, kb.device_positions, kb.page_ring,
+    kv_stage_ring(kb.k, kb.vk, kb.v, kb.vv, kb.row, kb.device_positions, kb.page_ring_base, kb.page_ring,
                   std::max(kb.device_positions, position), kb.staged_cap(), P, pos_add, span, kStageAll,
                   kStageBlocksAll, s, sc);
     return;
@@ -808,7 +818,7 @@ void flyx_seq::stage_text(const KvBuf& kb, cudaStream_t s) {
     if (kb.ks_page)
       sc = {kb.ks, kb.vs, kb.scales_from(kb.vks, kb.device_positions), kb.scales_from(kb.vvs, kb.device_positions),
             kb.nkv};
-    kv_stage_ring(kb.k, kb.vk, kb.v, kb.vv, kb.row, kb.device_positions, kb.page_ring,
+    kv_stage_ring(kb.k, kb.vk, kb.v, kb.vv, kb.row, kb.device_positions, kb.page_ring_base, kb.page_ring,
                   std::max(kb.device_positions, position), kb.staged_cap(), P, 0, 0, kStageAll, kStageBlocksAll, s, sc);
     return;
   }
@@ -836,9 +846,10 @@ void flyx_seq::flush_page_prefill(int start, int n) {
     const int lo = std::max(b.device_positions, start);
     const int hi = start + n;
     if (lo >= hi) continue;
-    const int tail = b.page_ring - b.device_positions;
+    const int base = b.page_ring_base;
+    const int tail = b.page_ring - base;
     for (int p = lo; p < hi;) {
-      const int slot = b.device_positions + (p - b.device_positions) % tail;
+      const int slot = base + (p - b.device_positions) % tail;
       const int chunk = std::min(hi - p, b.page_ring - slot);
       const size_t dst = size_t(p - b.device_positions);
       CK(cudaMemcpyAsync(b.k_page + dst * b.row, static_cast<const uint8_t*>(b.k) + size_t(slot) * b.row,
@@ -882,12 +893,13 @@ void flyx_seq::reload_page_ring(int pos) {
   if (page_layers.empty() || pos <= 0) return;
   for (int idx : page_layers) {
     const KvBuf& b = kv[size_t(idx)];
-    const int tail = b.page_ring - b.device_positions;
+    const int base = b.page_ring_base;
+    const int tail = b.page_ring - base;
     const int lo = std::max(b.device_positions, pos - tail);
     const int hi = pos;
     if (lo >= hi) continue;
     for (int p = lo; p < hi;) {
-      const int slot = b.device_positions + (p - b.device_positions) % tail;
+      const int slot = base + (p - b.device_positions) % tail;
       const int chunk = std::min(hi - p, b.page_ring - slot);
       const size_t src = size_t(p - b.device_positions);
       CK(cudaMemcpyAsync(static_cast<uint8_t*>(b.k) + size_t(slot) * b.row, b.k_page + src * b.row,

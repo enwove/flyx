@@ -190,7 +190,7 @@ size_t graph_keep(const flyx_seq& s, bool count) {
     kernels += kStrataNodes * size_t(std::max(0, s.copies));
     copies += kStrataCopyNodes * size_t(std::clamp(s.copy_host, 0, std::max(0, s.copies)));
   }
-  const size_t page_n = s.dry ? size_t(s.page_graph_layers) : s.page_layers.size();
+  const size_t page_n = s.page_spill_auto ? 0 : s.page_layers.size();
   if (page_n > 0) {
     kernels += 1 + page_n;  // kv_drain_pageable + extra claim/list/install kernel per pageable layer
     others += page_n;       // cudaLaunchHostFunc node per pageable layer
@@ -201,11 +201,24 @@ size_t graph_keep(const flyx_seq& s, bool count) {
   for (const auto& [plan, g] : m->round_graphs) {
     if (!g.bytes) continue;  // not counted yet, or no graph of it can be made
     const size_t steps = window ? size_t(g.mtp_steps) : 0;
-    const size_t branches = (plan->adaptive() && s.page_layers.empty())
-                                ? std::max<size_t>(1, plan->checkpoints.size())
-                                : 1;
-    const size_t round = g.bytes + (branches * kernels + kMtpWindowNodes * steps) * kGraphKernelBytes +
-                         branches * copies * kGraphCopyBytes + branches * others * kGraphOtherBytes;
+    size_t round = 0;
+    if (s.page_spill_auto) {
+      // Auto mode may instantiate either all-pinned adaptive graphs or flat pageable graphs (up to s.copies layers).
+      const size_t ad_branches = plan->adaptive() ? std::max<size_t>(1, plan->checkpoints.size()) : 1;
+      const size_t round_pinned = g.bytes + (ad_branches * kernels + kMtpWindowNodes * steps) * kGraphKernelBytes +
+                                  ad_branches * copies * kGraphCopyBytes + ad_branches * others * kGraphOtherBytes;
+      const size_t page_k = s.copies > 0 ? 1 + size_t(s.copies) : 0;
+      const size_t page_o = s.copies > 0 ? size_t(s.copies) : 0;
+      const size_t round_paged = g.bytes + (kernels + page_k + kMtpWindowNodes * steps) * kGraphKernelBytes +
+                                 copies * kGraphCopyBytes + (others + page_o) * kGraphOtherBytes;
+      round = std::max(round_pinned, round_paged);
+    } else {
+      const size_t branches = (plan->adaptive() && s.page_layers.empty())
+                                  ? std::max<size_t>(1, plan->checkpoints.size())
+                                  : 1;
+      round = g.bytes + (branches * kernels + kMtpWindowNodes * steps) * kGraphKernelBytes +
+              branches * copies * kGraphCopyBytes + branches * others * kGraphOtherBytes;
+    }
     room += round;
     most = std::max(most, round);
   }

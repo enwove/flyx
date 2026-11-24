@@ -79,7 +79,7 @@ template <int HD, int NP, bool FP8, bool Q8>  // NP: binary16 parts of q and p (
 __global__ void __launch_bounds__(32 * kMaxWarps) k_attention_rows_mma(
     const float* q, KvRef kv, int nh, int nkv, int rows, int rows_per_block, int causal, int extra, float scale,
     const DevParams* P, float* __restrict__ part, int pos_add, int from, const TreeRows* __restrict__ tree,
-    int q_e4m3) {
+    int q_e4m3, SplitWindow sw = {}) {
   static_assert(FP8 || !Q8, "q in e4m3 needs an FP8 cache");
   pdl_trigger();
   constexpr int KS = HD / 16, LD = HD + 8;  // 16-dim steps of the scores, and 16-dim tiles of the output
@@ -113,16 +113,32 @@ __global__ void __launch_bounds__(32 * kMaxWarps) k_attention_rows_mma(
   auto range = [&](int i, int* ks, int* ke) { attn_split_range(total_of(i), split, splits, ks, ke); };
   auto out_of = [&](int i, int h) { return ((size_t(r0 + i) * nh + kvh * G + h) * splits + split) * (HD + 2); };
   int lo = INT_MAX, hi = 0;  // the keys of this split any of the block's rows has
+  int orig_ks = 0, orig_ke = 0;
   bool any = false;
   for (int i = 0; i < nr; ++i) {
     int a, b;
     range(i, &a, &b);
     any = any || mine(i);
+    if (i == 0) orig_ks = a, orig_ke = b;
     if (mine(i) && a < b) lo = min(lo, a), hi = max(hi, b);
   }
   if (!any) return;  // the float32 kernels' rows only: gone while the kernel before still runs
   pdl_wait();        // q and the round's keys come from the kernels before
-  if (lo >= hi) {  // empty partials
+  if (sw.state) {
+    // Windowed launch always passes rows_per_block = 1 (nr = 1, single row r0).
+    if (orig_ks >= orig_ke) {
+      if (sw.first) {
+        for (int idx = threadIdx.x; idx < G * (HD + 2); idx += blockDim.x) {
+          const int c = idx / (HD + 2), e = idx - c * (HD + 2);
+          part[out_of(0, c) + e] = e == 0 ? -INFINITY : 0.f;
+        }
+      }
+      return;
+    }
+    lo = max(orig_ks, sw.k_lo);
+    hi = min(orig_ke, sw.k_hi);
+    if (lo >= hi) return;
+  } else if (lo >= hi) {  // empty partials
     for (int idx = threadIdx.x; idx < nr * G * (HD + 2); idx += blockDim.x) {
       const int c = idx / (HD + 2), e = idx - c * (HD + 2);
       if (mine(c / G)) part[out_of(c / G, c % G) + e] = e == 0 ? -INFINITY : 0.f;
@@ -135,7 +151,10 @@ __global__ void __launch_bounds__(32 * kMaxWarps) k_attention_rows_mma(
 #pragma unroll
   for (int j = 0; j < 2; ++j) {
     cok[j] = mine(wrow) && whead + 2 * t + j < G;
-    if (cok[j]) range(wrow, &cks[j], &cke[j]);
+    if (cok[j]) {
+      if (sw.state) cks[j] = lo, cke[j] = hi;
+      else range(wrow, &cks[j], &cke[j]);
+    }
   }
   // The B fragments of head whead + g of row wrow, scaled by 2^sh: dims 16 ks + 2 t (+1) and + 8 (+9) in binary16
   // parts; Q8: bq[0][kb] dims 32 kb + 4 t (+1, +2, +3) and + 16 (...) in e4m3.
@@ -203,7 +222,31 @@ __global__ void __launch_bounds__(32 * kMaxWarps) k_attention_rows_mma(
   float m[2] = {-INFINITY, -INFINITY}, l[2] = {0.f, 0.f};  // l: this lane's keys' share
   int ve = INT_MIN;      // FP8: E of the output's scale 2^(14 - E) (INT_MIN: no value scale of the row's keys yet)
   int rks = 0, rke = 0;  // the warp's row's keys of this split
-  if (mine(wrow)) range(wrow, &rks, &rke);
+  if (mine(wrow)) {
+    if (sw.state) rks = lo, rke = hi;
+    else range(wrow, &rks, &rke);
+  }
+  if (sw.state && orig_ks < sw.k_lo && wrow < nr) {
+#pragma unroll
+    for (int j = 0; j < 2; ++j) {
+      if (!cok[j]) continue;
+      const float* hp = sw.state + (size_t(r0) * nh + kvh * G + whead + 2 * t + j) * kSplitStateFloats(HD);
+      m[j] = hp[0];
+      l[j] = hp[2 + g];
+#pragma unroll
+      for (int mt = 0; mt < KS; ++mt)
+#pragma unroll
+        for (int h = 0; h < 2; ++h) o[mt][2 * h + j] = hp[10 + 16 * mt + g + 8 * h];
+    }
+    if constexpr (FP8) {
+      int v_load = INT_MIN;
+      if (cok[0]) {
+        const float* hp = sw.state + (size_t(r0) * nh + kvh * G + whead + 2 * t) * kSplitStateFloats(HD);
+        v_load = reinterpret_cast<const int*>(hp)[1];
+      }
+      ve = __shfl_sync(0xffffffffu, v_load, 0);
+    }
+  }
   // row >= 0: a tree's row r0 + row, its round keys from its ancestors' slots; -1: keys as they are (a chain's rows,
   // or the keys before the round, which every row of a tree shares).
   auto load = [&](int tile, int buf, int row) {
@@ -375,6 +418,25 @@ __global__ void __launch_bounds__(32 * kMaxWarps) k_attention_rows_mma(
       if (wrow == i) step(tile, 0, 0);
       __syncthreads();
     }
+  if (sw.state && orig_ke > sw.k_hi) {
+    if (wrow < nr) {
+#pragma unroll
+      for (int j = 0; j < 2; ++j) {
+        if (!cok[j]) continue;
+        float* hp = sw.state + (size_t(r0) * nh + kvh * G + whead + 2 * t + j) * kSplitStateFloats(HD);
+        if (g == 0) {
+          hp[0] = m[j];
+          if constexpr (FP8) reinterpret_cast<int*>(hp)[1] = ve;
+        }
+        hp[2 + g] = l[j];
+#pragma unroll
+        for (int mt = 0; mt < KS; ++mt)
+#pragma unroll
+          for (int h = 0; h < 2; ++h) hp[10 + 16 * mt + g + 8 * h] = o[mt][2 * h + j];
+      }
+    }
+    return;
+  }
   // the columns' p sums over the 8 lanes that hold their keys (a fixed tree), then the partials
 #pragma unroll
   for (int j = 0; j < 2; ++j)
@@ -400,8 +462,8 @@ __global__ void __launch_bounds__(32 * kMaxWarps) k_attention_rows_mma(
 template <int HD, bool FP8>
 void launch_rows_mma(const float* q, KvRef kv, int nh, int nkv, int rows, bool causal, int extra, float scale,
                      const DevParams* P, float* partial, int splits, const Launch& L, int pos_add, int from,
-                     const TreeRows* tree) {
-  const int G = nh / nkv, WR = (G + 7) / 8, rows_per_block = kMaxWarps / WR;
+                     const TreeRows* tree, const SplitWindow& sw) {
+  const int G = nh / nkv, WR = (G + 7) / 8, rows_per_block = sw.state ? 1 : kMaxWarps / WR;
   // FP8: at least kFp8Warps a block, the ones past its rows' loading and converting with the others (a row alone in a
   // warp of its own left the SMs idle: one row at 63K tokens on the 5070 Ti ran 4% slower than the float32 kernel).
   const int blocks = ceil_div(rows, rows_per_block);
@@ -420,7 +482,7 @@ void launch_rows_mma(const float* q, KvRef kv, int nh, int nkv, int rows, bool c
                                : k_attention_rows_mma<HD, 3, FP8, Q8>;
     launch_dependent_smem(kernel, dim3(blocks, nkv, splits), dim3(32 * warps), rows_mma_smem<HD, FP8, Q8>(), L, q, kv,
                           nh, nkv, rows, rows_per_block, int(causal), extra, scale, P, partial, pos_add, from, tree,
-                          int(asked_q8 && !Q8));
+                          int(asked_q8 && !Q8), sw);
   };
   if constexpr (FP8) {
     if (q8) return pick(std::true_type{});
@@ -431,27 +493,29 @@ void launch_rows_mma(const float* q, KvRef kv, int nh, int nkv, int rows, bool c
 template <int HD>
 void launch_rows_mma(const float* q, KvRef kv, int nh, int nkv, int rows, bool causal, int extra, float scale,
                      const DevParams* P, float* partial, int splits, const Launch& L, int pos_add, int from,
-                     const TreeRows* tree) {
+                     const TreeRows* tree, const SplitWindow& sw) {
   if (kv.fp8())
-    launch_rows_mma<HD, true>(q, kv, nh, nkv, rows, causal, extra, scale, P, partial, splits, L, pos_add, from, tree);
+    launch_rows_mma<HD, true>(q, kv, nh, nkv, rows, causal, extra, scale, P, partial, splits, L, pos_add, from, tree,
+                              sw);
   else
-    launch_rows_mma<HD, false>(q, kv, nh, nkv, rows, causal, extra, scale, P, partial, splits, L, pos_add, from, tree);
+    launch_rows_mma<HD, false>(q, kv, nh, nkv, rows, causal, extra, scale, P, partial, splits, L, pos_add, from, tree,
+                               sw);
 }
 
 }  // namespace
 
 bool attention_rows_mma(const float* q, KvRef kv, int nh, int nkv, int hd, int rows, bool causal, int extra,
                         float scale, const DevParams* P, float* partial, int splits, const Launch& L, int pos_add,
-                        int from, const TreeRows* tree) {
+                        int from, const TreeRows* tree, const SplitWindow& sw) {
   if (nkv <= 0 || nh % nkv != 0 || nh / nkv > 8 * kMaxWarps) return false;
   switch (hd) {
-  case 32: launch_rows_mma<32>(q, kv, nh, nkv, rows, causal, extra, scale, P, partial, splits, L, pos_add, from, tree);
+  case 32: launch_rows_mma<32>(q, kv, nh, nkv, rows, causal, extra, scale, P, partial, splits, L, pos_add, from, tree, sw);
     break;
-  case 64: launch_rows_mma<64>(q, kv, nh, nkv, rows, causal, extra, scale, P, partial, splits, L, pos_add, from, tree);
+  case 64: launch_rows_mma<64>(q, kv, nh, nkv, rows, causal, extra, scale, P, partial, splits, L, pos_add, from, tree, sw);
     break;
-  case 128: launch_rows_mma<128>(q, kv, nh, nkv, rows, causal, extra, scale, P, partial, splits, L, pos_add, from, tree);
+  case 128: launch_rows_mma<128>(q, kv, nh, nkv, rows, causal, extra, scale, P, partial, splits, L, pos_add, from, tree, sw);
     break;
-  case 256: launch_rows_mma<256>(q, kv, nh, nkv, rows, causal, extra, scale, P, partial, splits, L, pos_add, from, tree);
+  case 256: launch_rows_mma<256>(q, kv, nh, nkv, rows, causal, extra, scale, P, partial, splits, L, pos_add, from, tree, sw);
     break;
   default: return false;
   }

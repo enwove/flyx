@@ -17,6 +17,7 @@ RowNeeds row_needs(const flyx_bmodel* m) {
       n.act = std::max(n.act, a->nh * a->hd);
       n.q = std::max(n.q, a->nh * a->hd);
       n.attn_state = std::max(n.attn_state, a->nh * kFlashStateFloats(a->hd));
+      n.split_state = std::max(n.split_state, a->nh * kSplitStateFloats(a->hd));
       n.lora = std::max(n.lora, 3 * a->lora.rank);
       ks({a->hidden, a->nh * a->hd, a->lora.rank});
     } else if (const auto* g = std::get_if<GdnBlock>(&blk)) {
@@ -115,7 +116,9 @@ void alloc_rows(const flyx_bmodel* m, int R, bool prefill, RowBufs* b, Alloc&& a
     if (n.feats) b->cx = base_a;
 
     const size_t q_off = align_f(size_t(R) * n.q);
-    const size_t attn_aux = std::max(size_t(R) * n.attn_state, part);
+    const size_t part_span = align_f(part);
+    const size_t split_st = size_t(std::min(R, FLYX_MAX_ROWS)) * n.split_state;
+    const size_t attn_aux = std::max(size_t(R) * n.attn_state, part_span + split_st);
     const size_t slot_b = std::max({size_t(R) * H, size_t(R) * n.gdn_o, q_off + attn_aux});
     float* base_b = f(slot_b);
     b->h = base_b;
@@ -123,6 +126,7 @@ void alloc_rows(const flyx_bmodel* m, int R, bool prefill, RowBufs* b, Alloc&& a
     b->qbuf = base_b;
     if (n.attn_state > 0) b->attn_state = base_b + q_off;
     b->part = base_b + q_off;
+    if (n.split_state > 0) b->split_state = b->part + part_span;
   } else {
     // Round buffers: mtp_draft keeps mx live across the MTP layer, so mx stays separate from act/proj/h.
     // gdn_o and qbuf belong to distinct layer types and safely alias.
@@ -355,7 +359,7 @@ int seq_size(flyx_bmodel* m, const flyx_seq_layout* layout, flyx_seq_size* out) 
   }
   *out = {};
   out->device = s.dry_bytes + s.page_spill_vram + room;
-  out->host = s.dry_host_bytes;
+  out->host = s.dry_host_bytes + s.page_spill_host;
   out->host_mapped = s.dry_mapped_bytes;
   out->device_positions = std::min(s.device_positions, layout->max_ctx);
   out->strata_from = s.kv_method == FLYX_KV_STRATA ? s.strata_from : layout->max_ctx;
@@ -553,7 +557,8 @@ void alloc_state(const flyx_bmodel* m, flyx_seq* s) {
         }
         const size_t row = row_of(k);
         const size_t tot_v = round_up_g(size_t(s->cap) * row);
-        const size_t dev_v = size_t(s->device_positions) * row / gran * gran;
+        size_t dev_v = size_t(s->device_positions) * row / gran * gran;
+        while (dev_v >= gran && ((dev_v / row) & 1)) dev_v -= gran;
         const uint64_t host_kv = tot_v > dev_v ? uint64_t(tot_v - dev_v) : 0;
         const uint64_t scales_b = k.fp8 ? 2 * uint64_t(s->cap) * k.nkv * sizeof(float) : 0;
         const uint64_t kv_p = 2 * host_kv + scales_b;
@@ -622,8 +627,10 @@ void alloc_state(const flyx_bmodel* m, flyx_seq* s) {
       const int scale_floats = k.fp8 ? k.nkv : 0;  // the scales go where the positions go
       const int layer_i = copy_i;
       const bool use_pageable = strata && nh_most > 0 && is_pageable(layer_i);
-      const flyx_seq::Tiered tk = s->tiered_alloc(s->cap, b.row, 0, parity, scale_floats, use_pageable, page_ring_tail);
-      const flyx_seq::Tiered tv = s->tiered_alloc(s->cap, b.row, 1, parity, scale_floats, use_pageable, page_ring_tail);
+      const flyx_seq::Tiered tk =
+          s->tiered_alloc(s->cap, b.row, 0, parity, scale_floats, use_pageable, page_ring_tail, page_eligible);
+      const flyx_seq::Tiered tv =
+          s->tiered_alloc(s->cap, b.row, 1, parity, scale_floats, use_pageable, page_ring_tail, page_eligible);
       b.k = tk.at;
       b.vk = tk.view;
       b.v = tv.at;
@@ -638,6 +645,7 @@ void alloc_state(const flyx_bmodel* m, flyx_seq* s) {
         b.pageable = true;
         b.k_page = tk.page;
         b.v_page = tv.page;
+        b.page_ring_base = tk.page_ring_base;
         b.page_ring = tk.page_ring;
         b.page_safe = page_ring_safe;
         s->page_layers.push_back(int(s->kv.size()));
@@ -834,6 +842,7 @@ void alloc_state(const flyx_bmodel* m, flyx_seq* s) {
         dl.row_bytes = b.row;
         dl.nkv = ks.nkv;
         dl.device_positions = b.device_positions;
+        dl.ring_base = b.page_ring_base;
         dl.ring = b.page_ring;
         s->page_drain_host[li] = dl;
       }
@@ -845,38 +854,62 @@ void alloc_state(const flyx_bmodel* m, flyx_seq* s) {
                      s->copies - int(s->page_layers.size()), s->copies, int(s->page_layers.size()));
     }
   }
-  s->page_graph_layers = int(s->page_layers.size());
-  // Windows automatic mode: if one session consumes >25% of remaining WDDM non-local budget, a later concurrent
-  // session (or WDDM drift before seq_new_in) may spill more layers to pageable RAM than seq_size() picked now.
-  // Reserve the worst-case VRAM delta (GPU tail rings, miss_map, non-FP8 hot cache, graph nodes) in seq_size() so
-  // real allocations never exceed the VRAM reported to core/plan/budget.cpp (AGENTS.md layering rule).
-  if (s->dry && page_eligible && m->opt.pageable_kv == PageableKvMode::automatic && s->pinned_budget != UINT64_MAX &&
-      n_pageable < s->copies && total_session_pinned * 4 > s->pinned_budget) {
+  // Windows automatic mode: seq_new_in() re-queries the live WDDM non-local budget, so concurrent sessions or other
+  // processes using shared GPU memory may spill more (or fewer) layers than seq_size() saw at planning time.
+  // Unconditionally reserve the worst-case VRAM, host memory, and graph room across all possible spill counts
+  // 0..s->copies so real allocations never exceed what seq_size() reported to core/plan/budget.cpp (AGENTS.md).
+  // Set page_spill_auto on both dry and live sessions so graph_room(live) matches the room leased by seq_size().
+  s->page_spill_auto = page_eligible && m->opt.pageable_kv == PageableKvMode::automatic && s->pinned_budget != UINT64_MAX;
+  if (s->dry && s->page_spill_auto) {
     const size_t gran = vmm_granularity();
     auto round_up_g = [&](size_t n) { return (n + gran - 1) / gran * gran; };
-    size_t extra = 0;
+    size_t extra_vram = 0;
+    size_t cur_layer_host = 0, sum_pinned_host = 0, sum_max_host = 0, cur_drain_host = 0;
     const int hot = m->opt.kernels.strata_hot;
+    const size_t max_misses = size_t(FLYX_MAX_ROWS) * size_t(nkv_most) * size_t(s->strata.sel_stride);
+    const size_t bounce_host = align256(max_misses * sizeof(PageGatherReq)) + 256 +
+                               align256(max_misses * 4 * size_t(hd_most) * size_t(elem_most)) +
+                               align256(max_misses * 4 * sizeof(float));
     for (size_t i = 0; i < s->kv.size(); ++i) {
       const KvBuf& b = s->kv[i];
       const KvSpec& k = m->states.kv[i];
-      if (!b.vk || !tiered(k) || b.pageable) continue;
+      if (!b.vk || !tiered(k)) continue;
+      const size_t tot_v = round_up_g(size_t(s->cap) * b.row);
+      const size_t dev_v = round_up_g(size_t(b.device_positions) * b.row);
+      const int ring_pad = (dev_v > 0 && (dev_v % b.row) != 0) ? 1 : 0;
+      const size_t pinned_h = 2 * (tot_v - dev_v) +
+                              (k.fp8 ? 2 * align256(size_t(s->cap) * size_t(k.nkv) * sizeof(float)) : 0);
+      const size_t paged_h = 2 * size_t(s->cap - b.device_positions) * b.row +
+                             (k.fp8 ? 2 * size_t(s->cap - b.device_positions) * size_t(k.nkv) * sizeof(float) : 0);
+      const size_t drain_h = 2 * align256(size_t(kRing) * size_t(m->wide_rows) * b.row) +
+                             (k.fp8 ? 2 * align256(size_t(kRing) * size_t(m->wide_rows) * size_t(k.nkv) * sizeof(float))
+                                    : 0);
+      cur_layer_host += b.pageable ? paged_h : pinned_h;
+      if (b.pageable) cur_drain_host += drain_h;
+      sum_pinned_host += pinned_h;
+      sum_max_host += std::max(pinned_h, paged_h + drain_h);
+      if (b.pageable) continue;
       const size_t ring_bytes = size_t(page_ring_tail) * b.row;
-      extra += 2 * (b.device_positions == 0 ? align256(ring_bytes) : round_up_g(ring_bytes));
-      if (k.fp8) extra += 2 * align256(size_t(page_ring_tail) * size_t(k.nkv) * sizeof(float));
-      else if (hot > 0) {
+      const size_t ring_vmm_bytes = size_t(page_ring_tail + ring_pad) * b.row;
+      extra_vram += 2 * (dev_v == 0 ? align256(ring_bytes) : round_up_g(ring_vmm_bytes));
+      if (k.fp8) {
+        extra_vram += 2 * align256(size_t(page_ring_tail + ring_pad) * size_t(k.nkv) * sizeof(float));
+      } else if (hot > 0) {
         int hb = 0;
         while ((1 << hb) < hot) ++hb;
         const size_t tags = size_t(k.nkv) << hb;
-        extra += 2 * align256(tags * sizeof(int32_t)) + align256(tags * 4 * size_t(k.hd) * sizeof(kv16));
+        extra_vram += 2 * align256(tags * sizeof(int32_t)) + align256(tags * 4 * size_t(k.hd) * sizeof(kv16));
       }
     }
-    if (s->page_layers.empty()) {
-      const size_t max_misses = size_t(FLYX_MAX_ROWS) * size_t(nkv_most) * size_t(s->strata.sel_stride);
-      extra += align256(max_misses * sizeof(int32_t));
-    }
-    extra += align256(size_t(s->copies - n_pageable) * sizeof(PageDrainLayer));
-    s->page_spill_vram = extra;
-    s->page_graph_layers = s->copies;
+    if (s->page_layers.empty()) extra_vram += align256(max_misses * sizeof(int32_t));
+    const size_t cur_drain_dev =
+        s->page_layers.empty() ? 0 : align256(s->page_layers.size() * sizeof(PageDrainLayer));
+    const size_t all_drain_dev = align256(size_t(s->copies) * sizeof(PageDrainLayer));
+    if (all_drain_dev > cur_drain_dev) extra_vram += all_drain_dev - cur_drain_dev;
+    const size_t cur_host = cur_layer_host + (s->page_layers.empty() ? 0 : bounce_host + cur_drain_host);
+    const size_t worst_host = std::max(sum_pinned_host, bounce_host + sum_max_host);
+    s->page_spill_vram = extra_vram;
+    s->page_spill_host = worst_host > cur_host ? worst_host - cur_host : 0;
   }
   for (const GdnDims& gd : m->states.gdn) {
     GdnBuf b;

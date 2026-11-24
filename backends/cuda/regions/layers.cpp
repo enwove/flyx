@@ -379,10 +379,30 @@ void attn_windows(const Pass& ps, const AttnBlock& a, const KvBuf& kb, int windo
   auto* s = ps.s;
   const int R = ps.rows, nh = a.nh, nkv = a.nkv, hd = a.hd;
   cudaStream_t st = rv.L.st;
-  if (!rv.b.attn_state) throw std::logic_error("cuda: prefill window state buffer missing");
   const float scale = 1.f / std::sqrt(float(hd));
   const float* gate = a.gate ? rv.b.proj + nh * hd : nullptr;
   const int from = s->window_from(kb), len = s->window_len(kb), end = s->position + R;
+  if (R <= FLYX_MAX_ROWS || s->m->opt.kernels.attention == kAttnSplit) {
+    if (!rv.b.split_state) throw std::logic_error("cuda: prefill split window state buffer missing");
+    SplitWindow sw;
+    sw.state = rv.b.split_state;
+    auto run = [&](const KvRef& kv, int k_lo, int k_hi, bool last) {
+      sw.k_lo = k_lo;
+      sw.k_hi = k_hi;
+      sw.last = last;
+      attention_split(rv.b.qbuf, kv, nh, nkv, hd, R, true, 0, scale, s->P, gate, rv.ld_proj, out, ld_out, rv.b.part,
+                      kPrefillSplits, rv.L, 0, 0, nullptr, {}, sw);
+      sw.first = false;
+    };
+    if (from > 0) run(kb.ref(), 0, from, false);
+    for (int i = 0; i < windows; ++i) {
+      const int w0 = from + i * len, w1 = std::min(end, w0 + len);
+      run(s->window_before(kb, w0, w1, R, st), w0, w1, i + 1 == windows);
+      s->stage_after(kb, st);
+    }
+    return;
+  }
+  if (!rv.b.attn_state) throw std::logic_error("cuda: prefill window state buffer missing");
   FlashWindow w;
   w.state = rv.b.attn_state;
   auto run = [&](const KvRef& kv, int k_lo, int k_hi, bool last) {

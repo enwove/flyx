@@ -1,5 +1,6 @@
 // Copyright 2026 The flyx Authors. SPDX-License-Identifier: Apache-2.0
 // Kernel tests: attention: attn_prep, the split kernel, the tensor-core kernel, the FP8 cache, strata attention.
+#include <cuda.h>
 #include "tests/backends/cuda/op_test.cuh"
 #include "backends/cuda/runtime/strata_snapshot.h"
 
@@ -1088,20 +1089,37 @@ void test_strata(int hd, int nh, int nkv, int rows, int ctx, int bits, bool fp8)
 
 void test_pageable_kv_ops() {
   seed("pageable_kv_ops", 0);
-  for (bool fp8 : {false, true}) {
-    const int nkv = 4, hd = 128, elem = fp8 ? 1 : int(sizeof(kv16));
+  // Test both aligned ring_pad=0 (nkv=4, row=1024) and unaligned ring_pad=1 (nkv=10, hd=128, binary16 -> row=2560,
+  // non-divisor of 2 MiB VMM granule where slot `sink` straddles the VMM boundary and must stay untouched).
+  struct RingCase {
+    int nkv, hd, ring_pad;
+    bool fp8;
+    const char* name;
+  };
+  for (const RingCase rc : {RingCase{4, 128, 0, false, "binary16"}, RingCase{4, 128, 0, true, "fp8"},
+                            RingCase{10, 128, 1, false, "binary16 nkv=10 ring_pad=1"},
+                            RingCase{10, 128, 1, true, "fp8 nkv=10 ring_pad=1"}}) {
+    const int nkv = rc.nkv, hd = rc.hd, elem = rc.fp8 ? 1 : int(sizeof(kv16));
+    const bool fp8 = rc.fp8;
     const size_t row_bytes = size_t(nkv) * hd * elem;
-    const int sink = 8, tail = 32, ring = sink + tail, cap = 96;
+    const int sink = 8, ring_base = sink + rc.ring_pad, tail = 32, ring = ring_base + tail, cap = 96;
     const int pos0 = 68, span = 12;  // wraps around tail boundary (68-8)%32 = 28 -> 28..31, 0..7
     std::vector<uint8_t> k_ring(size_t(ring) * row_bytes), v_ring(size_t(ring) * row_bytes);
     for (size_t i = 0; i < k_ring.size(); ++i) {
       k_ring[i] = uint8_t((i * 131 + 17 + (fp8 ? 3 : 0)) & 0xffu);
       v_ring[i] = uint8_t((i * 73 + 53 + (fp8 ? 9 : 0)) & 0xffu);
     }
+    if (rc.ring_pad) {
+      std::memset(k_ring.data() + size_t(sink) * row_bytes, 0xee, row_bytes);
+      std::memset(v_ring.data() + size_t(sink) * row_bytes, 0xee, row_bytes);
+    }
     std::vector<float> ks_ring(size_t(ring) * nkv), vs_ring(size_t(ring) * nkv);
     for (size_t i = 0; i < ks_ring.size(); ++i) {
       ks_ring[i] = 0.05f * float(i + 1);
       vs_ring[i] = 0.07f * float(i + 1);
+    }
+    if (rc.ring_pad) {
+      for (int h = 0; h < nkv; ++h) ks_ring[size_t(sink) * nkv + h] = vs_ring[size_t(sink) * nkv + h] = -777.f;
     }
     uint8_t* dk = dev<uint8_t>(k_ring.size());
     uint8_t* dv = dev<uint8_t>(v_ring.size());
@@ -1125,7 +1143,8 @@ void test_pageable_kv_ops() {
       sc = {dks, dvs, dvks, dvvs, nkv};
     }
     DevParams* P = params(pos0);
-    kv_stage_ring(dk, dvk, dv, dvv, row_bytes, sink, ring, pos0 - 6, cap, P, 0, span, kStageAll, 4, nullptr, sc);
+    kv_stage_ring(dk, dvk, dv, dvv, row_bytes, sink, ring_base, ring, pos0 - 6, cap, P, 0, span, kStageAll, 4, nullptr,
+                  sc);
     CK(cudaDeviceSynchronize());
     std::vector<uint8_t> gk(size_t(cap) * row_bytes), gv(size_t(cap) * row_bytes);
     CK(cudaMemcpy(gk.data(), dvk, gk.size(), cudaMemcpyDeviceToHost));
@@ -1137,7 +1156,7 @@ void test_pageable_kv_ops() {
     }
     bool ok_stage = true;
     for (int p = pos0 - 6; p < pos0 + span; ++p) {
-      const int sl = p < sink ? p : sink + (p - sink) % tail;
+      const int sl = p < sink ? p : ring_base + (p - sink) % tail;
       ok_stage &= std::equal(gk.data() + size_t(p) * row_bytes, gk.data() + size_t(p + 1) * row_bytes,
                              k_ring.data() + size_t(sl) * row_bytes);
       ok_stage &= std::equal(gv.data() + size_t(p) * row_bytes, gv.data() + size_t(p + 1) * row_bytes,
@@ -1149,7 +1168,7 @@ void test_pageable_kv_ops() {
                                vs_ring.data() + size_t(sl) * nkv);
       }
     }
-    std::printf("  %-4s kv_stage_ring wrap-around copy %s\n", ok_stage ? "ok" : "FAIL", fp8 ? "fp8" : "binary16");
+    std::printf("  %-4s kv_stage_ring wrap-around copy %s\n", ok_stage ? "ok" : "FAIL", rc.name);
     g_fail += !ok_stage;
 
     // kv_drain_pageable: drain committed round rows (pos0 .. pos0+span-1) to mapped pinned drain ring slot.
@@ -1184,6 +1203,7 @@ void test_pageable_kv_ops() {
     dl.drain_vs = fp8 ? reinterpret_cast<float*>(db + 2 * kv_sz + sc_sz) : nullptr;
     dl.row_bytes = row_bytes;
     dl.device_positions = sink;
+    dl.ring_base = ring_base;
     dl.ring = ring;
     dl.nkv = nkv;
     PageDrainLayer* ddl = dev<PageDrainLayer>(1);
@@ -1197,7 +1217,7 @@ void test_pageable_kv_ops() {
     const float* hvs = fp8 ? reinterpret_cast<const float*>(hb + 2 * kv_sz + sc_sz) : nullptr;
     for (int r = 0; r < span; ++r) {
       const int p = pos0 + r;
-      const int sl = sink + (p - sink) % tail;
+      const int sl = ring_base + (p - sink) % tail;
       const size_t dst_row = size_t(rslot) * max_rows + size_t(r);
       ok_drain &= std::equal(hk + dst_row * row_bytes, hk + (dst_row + 1) * row_bytes,
                              k_ring.data() + size_t(sl) * row_bytes);
@@ -1208,12 +1228,227 @@ void test_pageable_kv_ops() {
         ok_drain &= std::equal(hvs + dst_row * nkv, hvs + (dst_row + 1) * nkv, vs_ring.data() + size_t(sl) * nkv);
       }
     }
-    std::printf("  %-4s kv_drain_pageable round drain %s\n", ok_drain ? "ok" : "FAIL", fp8 ? "fp8" : "binary16");
+    std::printf("  %-4s kv_drain_pageable round drain %s\n", ok_drain ? "ok" : "FAIL", rc.name);
     g_fail += !ok_drain;
 
     CK(cudaFreeHost(dh));
     for (void* p : std::initializer_list<void*>{dk, dv, dvk, dvv, dks, dvs, dvks, dvvs, P, dring, ddl})
       if (p) CK(cudaFree(p));
+  }
+
+  // Real VMM non-divisor regression (nkv=10, hd=128, binary16 -> row=2560, dev=4 MiB -> device_rows=1638,
+  // 1638*2560 = 4,193,280 < 4,194,304): verify writing staged row `device_rows` into `vw` (which shares `hd` with
+  // `va`) does NOT overwrite the wrapped ring token at slot `ring_base = 1639` in `va`.
+  {
+    auto get_fn = [](const char* name, auto* fn) {
+      void* p = nullptr;
+      cudaDriverEntryPointQueryResult q{};
+      if (cudaGetDriverEntryPointByVersion(name, &p, 12000, cudaEnableDefault, &q) != cudaSuccess ||
+          q != cudaDriverEntryPointSuccess || !p)
+        return false;
+      *fn = reinterpret_cast<std::remove_pointer_t<decltype(fn)>>(p);
+      return true;
+    };
+    decltype(&cuMemGetAllocationGranularity) fn_gran = nullptr;
+    decltype(&cuMemAddressReserve) fn_res = nullptr;
+    decltype(&cuMemAddressFree) fn_free = nullptr;
+    decltype(&cuMemCreate) fn_create = nullptr;
+    decltype(&cuMemRelease) fn_rel = nullptr;
+    decltype(&cuMemMap) fn_map = nullptr;
+    decltype(&cuMemUnmap) fn_unmap = nullptr;
+    decltype(&cuMemSetAccess) fn_acc = nullptr;
+    if (get_fn("cuMemGetAllocationGranularity", &fn_gran) && get_fn("cuMemAddressReserve", &fn_res) &&
+        get_fn("cuMemAddressFree", &fn_free) && get_fn("cuMemCreate", &fn_create) &&
+        get_fn("cuMemRelease", &fn_rel) && get_fn("cuMemMap", &fn_map) && get_fn("cuMemUnmap", &fn_unmap) &&
+        get_fn("cuMemSetAccess", &fn_acc)) {
+      int dev_id = 0;
+      CK(cudaGetDevice(&dev_id));
+      CUmemAllocationProp dp{};
+      dp.type = CU_MEM_ALLOCATION_TYPE_PINNED;
+      dp.location = {CU_MEM_LOCATION_TYPE_DEVICE, dev_id};
+      size_t gran = 0;
+      if (fn_gran(&gran, &dp, CU_MEM_ALLOC_GRANULARITY_MINIMUM) == CUDA_SUCCESS && gran > 0) {
+        const size_t row = 10 * 128 * sizeof(kv16);  // 2560 bytes: does not divide 2 MiB
+        size_t dev_b = 2 * gran;
+        while (dev_b >= gran && ((dev_b / row) & 1)) dev_b -= gran;
+        const int device_rows = int(dev_b / row);
+        const int ring_pad = (dev_b > 0 && (dev_b % row) != 0) ? 1 : 0;
+        const int ring_base = device_rows + ring_pad;
+        const int tail = 64;
+        const size_t ring_vmm = ((size_t(tail + ring_pad) * row + gran - 1) / gran) * gran;
+        CUdeviceptr va = 0, vw = 0;
+        CUmemGenericAllocationHandle hd = 0, hr = 0, hs = 0;
+        CUmemAccessDesc acc{};
+        acc.location = {CU_MEM_LOCATION_TYPE_DEVICE, dev_id};
+        acc.flags = CU_MEM_ACCESS_FLAGS_PROT_READWRITE;
+        if (fn_res(&va, dev_b + ring_vmm, gran, 0, 0) == CUDA_SUCCESS &&
+            fn_res(&vw, dev_b + gran, gran, 0, 0) == CUDA_SUCCESS &&
+            fn_create(&hd, dev_b, &dp, 0) == CUDA_SUCCESS && fn_create(&hr, ring_vmm, &dp, 0) == CUDA_SUCCESS &&
+            fn_create(&hs, gran, &dp, 0) == CUDA_SUCCESS) {
+          fn_map(va, dev_b, 0, hd, 0);
+          fn_map(va + dev_b, ring_vmm, 0, hr, 0);
+          fn_map(vw, dev_b, 0, hd, 0);
+          fn_map(vw + dev_b, gran, 0, hs, 0);
+          fn_acc(va, dev_b + ring_vmm, &acc, 1);
+          fn_acc(vw, dev_b + gran, &acc, 1);
+          std::vector<uint8_t> recent_tok(row, 0xa5u), old_tok(row, 0x3cu), got_recent(row, 0u);
+          // Wrapped token at pos = device_rows + tail lands in slot `ring_base` of `va`.
+          KvRef kr{};
+          kr.ring = ring_base + tail;
+          kr.sink = device_rows;
+          kr.ring_pad = ring_pad;
+          const int wrapped_slot = kr.slot_of(device_rows + tail);
+          CK(cudaMemcpy(reinterpret_cast<uint8_t*>(va) + size_t(wrapped_slot) * row, recent_tok.data(), row,
+                        cudaMemcpyHostToDevice));
+          // Staging old token `device_rows` into `vw + device_rows * row` writes into shared `hd` tail bytes.
+          CK(cudaMemcpy(reinterpret_cast<uint8_t*>(vw) + size_t(device_rows) * row, old_tok.data(), row,
+                        cudaMemcpyHostToDevice));
+          CK(cudaMemcpy(got_recent.data(), reinterpret_cast<uint8_t*>(va) + size_t(wrapped_slot) * row, row,
+                        cudaMemcpyDeviceToHost));
+          const bool ok_vmm = (ring_pad == 1) && (wrapped_slot == device_rows + 1) && (got_recent == recent_tok);
+          std::printf("  %-4s VMM unaligned row=2560 view staging preserves wrapped tail ring\n",
+                      ok_vmm ? "ok" : "FAIL");
+          g_fail += !ok_vmm;
+          fn_unmap(vw + dev_b, gran);
+          fn_unmap(vw, dev_b);
+          fn_unmap(va + dev_b, ring_vmm);
+          fn_unmap(va, dev_b);
+        }
+        if (hs) fn_rel(hs);
+        if (hr) fn_rel(hr);
+        if (hd) fn_rel(hd);
+        if (vw) fn_free(vw, dev_b + gran);
+        if (va) fn_free(va, dev_b + ring_vmm);
+      }
+    }
+  }
+
+  // Windowed attention_split (SplitWindow): must reproduce single-pass attention_split bit-for-bit across
+  // k_attention_gqa, k_attention_rows_mma (and mixed rows across rows_mma_from), and per-head k_attention.
+  {
+    const int hd = 128, nh = 8, nkv = 2, rows = 9, ctx = 400, cap = ctx + rows + 16, splits = 8;
+    const int from = 64, win_len = 64, end = ctx + rows;
+    const float scale = float(1.0 / std::sqrt(hd));
+    const Vec q = randv(size_t(rows) * nh * hd), gate = randv(size_t(rows) * nh * hd);
+    Vec Kc = randv(size_t(cap) * nkv * hd), Vc = randv(size_t(cap) * nkv * hd);
+    round_f16(Kc);
+    round_f16(Vc);
+    float* dq = up(q);
+    float* dgate = up(gate);
+    float* part = dev<float>(attention_partial_floats(rows, nh, hd, splits));
+    float* split_st = dev<float>(size_t(rows) * nh * kSplitStateFloats(hd));
+    float* dref = dev<float>(size_t(rows) * nh * hd);
+    float* dgot = dev<float>(size_t(rows) * nh * hd);
+    DevParams* P = params(ctx);
+    for (bool fp8 : {false, true}) {
+      const size_t elem = fp8 ? 1 : sizeof(kv16);
+      const size_t row_bytes = size_t(nkv) * hd * elem;
+      void *dK = nullptr, *dV = nullptr, *dKw = nullptr, *dVw = nullptr;
+      float *dKs = nullptr, *dVs = nullptr, *dKsw = nullptr, *dVsw = nullptr;
+      if (fp8) {
+        std::vector<uint8_t> kq(size_t(cap) * nkv * hd), vq(size_t(cap) * nkv * hd);
+        std::vector<float> ks(size_t(cap) * nkv), vs(size_t(cap) * nkv);
+        for (int p = 0; p < cap; ++p)
+          for (int h = 0; h < nkv; ++h) {
+            const size_t base = (size_t(p) * nkv + h) * hd;
+            double km = 0, vm = 0;
+            for (int d = 0; d < hd; ++d) km = std::max(km, std::fabs(Kc[base + d])), vm = std::max(vm, std::fabs(Vc[base + d]));
+            ks[size_t(p) * nkv + h] = float(km > 0 ? km / 448.0 : 1.0);
+            vs[size_t(p) * nkv + h] = float(vm > 0 ? vm / 448.0 : 1.0);
+            for (int d = 0; d < hd; ++d) {
+              kq[base + d] = uint8_t(__nv_cvt_float_to_fp8(float(Kc[base + d] / ks[size_t(p) * nkv + h]),
+                                                           __NV_SATFINITE, __NV_E4M3));
+              vq[base + d] = uint8_t(__nv_cvt_float_to_fp8(float(Vc[base + d] / vs[size_t(p) * nkv + h]),
+                                                           __NV_SATFINITE, __NV_E4M3));
+            }
+          }
+        dK = dev<uint8_t>(kq.size());
+        dV = dev<uint8_t>(vq.size());
+        CK(cudaMemcpy(dK, kq.data(), kq.size(), cudaMemcpyHostToDevice));
+        CK(cudaMemcpy(dV, vq.data(), vq.size(), cudaMemcpyHostToDevice));
+        dKs = dev<float>(ks.size());
+        dVs = dev<float>(vs.size());
+        CK(cudaMemcpy(dKs, ks.data(), ks.size() * sizeof(float), cudaMemcpyHostToDevice));
+        CK(cudaMemcpy(dVs, vs.data(), vs.size() * sizeof(float), cudaMemcpyHostToDevice));
+        dKw = dev<uint8_t>(size_t(win_len) * row_bytes);
+        dVw = dev<uint8_t>(size_t(win_len) * row_bytes);
+        dKsw = dev<float>(size_t(win_len) * nkv);
+        dVsw = dev<float>(size_t(win_len) * nkv);
+      } else {
+        dK = up_f16(Kc);
+        dV = up_f16(Vc);
+        dKw = dev<kv16>(size_t(win_len) * nkv * hd);
+        dVw = dev<kv16>(size_t(win_len) * nkv * hd);
+      }
+      struct Mode {
+        const char* name;
+        bool mma;
+        int mma_from, attn;
+      };
+      std::vector<Mode> modes = {
+          {"gqa fp32", false, 0, kAttnAuto},
+          {"rows_mma all", true, 0, kAttnAuto},
+          {"rows_mma+gqa mixed", true, ctx + 4, kAttnAuto},
+      };
+      if (!fp8) modes.push_back({"per-head", false, 0, kAttnPerHead});
+      for (const Mode& md : modes) {
+        KernelOptions o{};
+        o.rows_mma = md.mma;
+        o.rows_mma_from = md.mma_from;
+        o.attention = md.attn;
+        Launch L = TL;
+        L.opt = &o;
+        KvRef full{dK, dV, dKs, dVs};
+        CK(cudaMemset(dref, 0, size_t(rows) * nh * hd * sizeof(float)));
+        attention_split(dq, full, nh, nkv, hd, rows, true, 0, scale, P, dgate, nh * hd, dref, nh * hd, part, splits, L);
+        std::vector<uint32_t> ref_bits(size_t(rows) * nh * hd), got_bits(size_t(rows) * nh * hd);
+        CK(cudaMemcpy(ref_bits.data(), dref, ref_bits.size() * sizeof(float), cudaMemcpyDeviceToHost));
+
+        CK(cudaMemset(part, 0xaa, attention_partial_floats(rows, nh, hd, splits) * sizeof(float)));
+        CK(cudaMemset(split_st, 0x55, size_t(rows) * nh * kSplitStateFloats(hd) * sizeof(float)));
+        CK(cudaMemset(dgot, 0, size_t(rows) * nh * hd * sizeof(float)));
+        SplitWindow sw;
+        sw.state = split_st;
+        // First window: device prefix [0, from).
+        sw.k_lo = 0;
+        sw.k_hi = from;
+        sw.first = true;
+        sw.last = false;
+        attention_split(dq, full, nh, nkv, hd, rows, true, 0, scale, P, dgate, nh * hd, dgot, nh * hd, part, splits, L,
+                        0, 0, nullptr, {}, sw);
+        sw.first = false;
+        const int nwin = (end - from + win_len - 1) / win_len;
+        for (int wi = 0; wi < nwin; ++wi) {
+          const int w0 = from + wi * win_len, w1 = std::min(end, w0 + win_len), wn = w1 - w0;
+          CK(cudaMemcpy(dKw, static_cast<const uint8_t*>(dK) + size_t(w0) * row_bytes, size_t(wn) * row_bytes,
+                        cudaMemcpyDeviceToDevice));
+          CK(cudaMemcpy(dVw, static_cast<const uint8_t*>(dV) + size_t(w0) * row_bytes, size_t(wn) * row_bytes,
+                        cudaMemcpyDeviceToDevice));
+          KvRef wkv{reinterpret_cast<void*>(reinterpret_cast<uintptr_t>(dKw) - size_t(w0) * row_bytes),
+                    reinterpret_cast<void*>(reinterpret_cast<uintptr_t>(dVw) - size_t(w0) * row_bytes), dKs, dVs};
+          if (fp8) {
+            CK(cudaMemcpy(dKsw, dKs + size_t(w0) * nkv, size_t(wn) * nkv * sizeof(float), cudaMemcpyDeviceToDevice));
+            CK(cudaMemcpy(dVsw, dVs + size_t(w0) * nkv, size_t(wn) * nkv * sizeof(float), cudaMemcpyDeviceToDevice));
+            wkv.ks_far = reinterpret_cast<float*>(reinterpret_cast<uintptr_t>(dKsw) - size_t(w0) * nkv * sizeof(float));
+            wkv.vs_far = reinterpret_cast<float*>(reinterpret_cast<uintptr_t>(dVsw) - size_t(w0) * nkv * sizeof(float));
+            wkv.scale_split = from;
+          }
+          sw.k_lo = w0;
+          sw.k_hi = w1;
+          sw.last = (wi + 1 == nwin);
+          attention_split(dq, wkv, nh, nkv, hd, rows, true, 0, scale, P, dgate, nh * hd, dgot, nh * hd, part, splits, L,
+                          0, 0, nullptr, {}, sw);
+        }
+        CK(cudaMemcpy(got_bits.data(), dgot, got_bits.size() * sizeof(float), cudaMemcpyDeviceToHost));
+        const bool ok_sw = (got_bits == ref_bits);
+        std::printf("  %-4s SplitWindow bit-identical (%s, %s)\n", ok_sw ? "ok" : "FAIL", md.name,
+                    fp8 ? "fp8" : "binary16");
+        g_fail += !ok_sw;
+      }
+      for (void* p : std::initializer_list<void*>{dK, dV, dKw, dVw, dKs, dVs, dKsw, dVsw})
+        if (p) CK(cudaFree(p));
+    }
+    for (void* p : std::initializer_list<void*>{dq, dgate, part, split_st, dref, dgot, P}) CK(cudaFree(p));
   }
 }
 

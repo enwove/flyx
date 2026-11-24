@@ -1611,19 +1611,27 @@ void strata_rounds(const std::string& model, const std::string& backend, const s
                   lpg == lpin,
               std::string("pageable_kv=on, ") + method + (fp8 ? ", fp8" : ", binary16") +
                   ": windowed prefill plain matches pinned logits bit-for-bit; MTP and DFlash2 match tokens");
-        // Short tail prefill past stage_window (<=16 rows): uses windowed attention_flash (bf16 MMA) rather than
-        // direct PCIe attention_split (fp32); speculation matches plain tokens and logits stay within bf16 rounding.
+        // Short tail prefill past stage_window (<=16 rows): uses windowed attention_split (SplitWindow) and must
+        // match pinned host KV bit-for-bit across plain, MTP, and DFlash2.
         std::vector<float> spin, spg, smtp, sdf;
         const auto stpin = turns(pinned.get(), &spin, 400, 8), stpg = turns(paged.get(), &spg, 400, 8),
                    stmtp = turns(paged_mtp.get(), &smtp, 400, 8), stdf = turns(paged_df.get(), &sdf, 400, 8);
-        float max_diff = 0.f;
-        for (size_t i = 0; i < std::min(spin.size(), spg.size()); ++i)
-          max_diff = std::max(max_diff, std::fabs(spin[i] - spg[i]));
         check(stpg.size() == size_t(N / 2) * 2 && stpg == stpin && stmtp == stpg && stdf == stpg && !spg.empty() &&
-                  max_diff < 5e-3f,
+                  spg == spin,
               std::string("pageable_kv=on, ") + method + (fp8 ? ", fp8" : ", binary16") +
-                  ": short-tail windowed prefill matches pinned tokens (max logit diff " + std::to_string(max_diff) +
-                  ") and MTP/DFlash2 match plain");
+                  ": short-tail windowed prefill matches pinned tokens and logits bit-for-bit; MTP/DFlash2 match");
+        // Budget contract (AGENTS.md): under finite WDDM auto budget even when a single session uses <25% of it
+        // (picking 0 pageable layers at seq_size()), seq_size() must still bound full-spill VRAM and host memory.
+        auto auto_big = make(model, backend, false, "", fp8, base + ",pageable_kv=auto,pinned_host_mb=8192", false,
+                             512, kReferenceWidth, false, 0, method, 0, 48);
+        flyx_seq_size sz_auto{};
+        const flyx_seq_layout la = auto_big->kv_layout();
+        const bool ok_auto = auto_big->api()->seq_size(auto_big->bmodel(), &la, &sz_auto) == 0;
+        check(ok_auto && sz_auto.device >= sz_pg.device && sz_auto.host >= sz_pg.host,
+              std::string("pageable_kv=auto (<25% budget), ") + method + (fp8 ? ", fp8" : ", binary16") +
+                  ": seq_size bounds full-spill VRAM (" + std::to_string(sz_auto.device) + " >= " +
+                  std::to_string(sz_pg.device) + ") and host (" + std::to_string(sz_auto.host) + " >= " +
+                  std::to_string(sz_pg.host) + ")");
       }
     // Rollback (edited prompt), checkpoint restore, and cross-mode snapshots (pinned <-> pageable).
     {
@@ -1680,10 +1688,11 @@ void strata_rounds(const std::string& model, const std::string& backend, const s
                    std::vector<size_t>(pb.begin(), pb.begin() + std::ptrdiff_t(std::min<size_t>(3, pb.size()))),
                    "pageable_kv=on: batched rounds, plain and each drafter");
     }
-    // Hybrid WDDM+pageable split (pinned_host_mb choosing a partial mix of pinned and pageable layers).
+    // Hybrid WDDM+pageable split (pinned_host_mb choosing a partial mix of pinned and pageable layers),
+    // including stage_window=64 so short-tail prefills mix direct pinned layers and SplitWindow pageable layers.
     {
       const int hctx = 32768;
-      const std::string hbase = narrow + ",head_cert=0";
+      const std::string hbase = narrow + ",head_cert=0,stage_window=64";
       auto h_pin = make(model, backend, false, "", false, hbase + ",pageable_kv=off", false, hctx, kReferenceWidth,
                         false, 0, "strata", 0);
       auto h_pg = make(model, backend, false, "", false, hbase + ",pageable_kv=on", false, hctx, kReferenceWidth,
@@ -1696,6 +1705,9 @@ void strata_rounds(const std::string& model, const std::string& backend, const s
       // Full-pinned needs ~(32 MiB + sz_pin.host); backing off by kv_delta/4 lands cleanly between 1 and 2 pinned layers.
       const uint64_t kv_delta = sz_pin.host_mapped > sz_pg.host_mapped ? sz_pin.host_mapped - sz_pg.host_mapped : 0;
       const int mid_mb = int(((32ull << 20) + sz_pin.host - kv_delta / 4) / (1ull << 20));
+      auto h_mix_plain = make(model, backend, false, "", false,
+                              hbase + ",pageable_kv=auto,pinned_host_mb=" + std::to_string(mid_mb), false, hctx,
+                              kReferenceWidth, false, 0, "strata", 0);
       auto h_mix = make(model, backend, true, "mtp", false,
                         hbase + ",pageable_kv=auto,pinned_host_mb=" + std::to_string(mid_mb), false, hctx,
                         kReferenceWidth, false, 0, "strata", 0);
@@ -1706,18 +1718,32 @@ void strata_rounds(const std::string& model, const std::string& backend, const s
             "hybrid pageable_kv=auto,pinned_host_mb=" + std::to_string(mid_mb) + ": partial split (" +
                 std::to_string(sz_pg.host_mapped) + " < " + std::to_string(sz_mix.host_mapped) + " < " +
                 std::to_string(sz_pin.host_mapped) + ")");
-      std::vector<float> lp_out, lm_out;
-      const auto tp = turns(h_pin.get(), &lp_out, 400, 8), tm = turns(h_mix.get(), &lm_out, 400, 8);
-      check(tp.size() == size_t(N / 2) * 2 && tm == tp && !lp_out.empty() && lm_out == lp_out,
-            "hybrid pageable_kv=auto (pinned + pageable mix, MTP): identical tokens and logits to pinned host KV");
+      std::vector<float> lp_out, lmp_out, lm_out;
+      const auto tp = turns(h_pin.get(), &lp_out, 400, 8), tmp = turns(h_mix_plain.get(), &lmp_out, 400, 8),
+                 tm = turns(h_mix.get(), &lm_out, 400, 8);
+      check(tp.size() == size_t(N / 2) * 2 && tmp == tp && tm == tp && !lp_out.empty() && lmp_out == lp_out,
+            "hybrid pageable_kv=auto (pinned + pageable mix, plain+MTP, stage_window=64): identical tokens and logits");
     }
     // Adaptive stopping + pageable_kv=on: adaptive plans cannot put cudaLaunchHostFunc inside conditional IF graph
     // bodies, so they must fall back cleanly to flat CUDA graphs (from_graph > 0, without_graph == 0) with exact bits.
+    // Also verify auto mode bounds both all-pinned adaptive graphs and all-pageable flat graphs in seq_size().
     {
       auto ad_pin = make(model, backend, true, "mtp", true, narrow + ",pageable_kv=off", false, 512, -1, false, 0,
                          "strata:2", 0, 64, 1);
       auto ad_pg = make(model, backend, true, "mtp", true, narrow + ",pageable_kv=on", false, 512, -1, false, 0,
                         "strata:2", 0, 64, 1);
+      auto ad_auto0 = make(model, backend, true, "mtp", true, narrow + ",pageable_kv=auto,pinned_host_mb=0", false, 512,
+                           -1, false, 0, "strata:2", 0, 64, 1);
+      flyx_seq_size sz_ad_pin{}, sz_ad_pg{}, sz_ad_auto0{};
+      const flyx_seq_layout l_ad_pin = ad_pin->kv_layout(), l_ad_pg = ad_pg->kv_layout(),
+                            l_ad_auto0 = ad_auto0->kv_layout();
+      const bool ok_ad_sz = ad_pin->api()->seq_size(ad_pin->bmodel(), &l_ad_pin, &sz_ad_pin) == 0 &&
+                            ad_pg->api()->seq_size(ad_pg->bmodel(), &l_ad_pg, &sz_ad_pg) == 0 &&
+                            ad_auto0->api()->seq_size(ad_auto0->bmodel(), &l_ad_auto0, &sz_ad_auto0) == 0;
+      check(ok_ad_sz && sz_ad_auto0.device >= sz_ad_pin.device && sz_ad_auto0.device >= sz_ad_pg.device,
+            "pageable_kv=auto adaptive MTP: seq_size bounds both pinned adaptive (" +
+                std::to_string(sz_ad_pin.device) + ") and paged flat (" + std::to_string(sz_ad_pg.device) +
+                ") <= " + std::to_string(sz_ad_auto0.device));
       Session sp(ad_pin.get()), sg(ad_pg.get());
       check(sp.init(&err) && sg.init(&err), "pageable_kv=on adaptive: init sessions");
       const auto tp = gen(sp, prompt, N).tokens, tg = gen(sg, prompt, N).tokens;
