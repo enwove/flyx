@@ -287,7 +287,7 @@ void snapshot_through_host(Engine* e, Engine* other, const std::vector<int32_t>&
 // (launch_batch) with the plans given, whose drafters and widths may differ; each gets, round after round, the ring
 // entries (tokens, drafts, how many accepted, position) the same rounds give it alone.
 void batch_rounds(Engine* e, const std::vector<std::vector<int32_t>>& prompts, const std::vector<size_t>& plan_of,
-                  const std::string& what) {
+                  const std::string& what, int expected_drafts = -1) {
   const auto* api = e->api();
   const size_t n = prompts.size();
   std::string err;
@@ -322,6 +322,7 @@ void batch_rounds(Engine* e, const std::vector<std::vector<int32_t>>& prompts, c
       const flyx_round_result &x = a[i], &y = b[i];
       same += x.n_tokens == y.n_tokens && x.n_accepted == y.n_accepted && x.position == y.position &&
               x.stopped == y.stopped && x.n_drafts == y.n_drafts &&
+              (expected_drafts < 0 || x.n_drafts == expected_drafts) &&
               std::equal(x.tokens, x.tokens + x.n_tokens, y.tokens) &&
               std::equal(x.drafts, x.drafts + x.n_drafts, y.drafts);
     }
@@ -4319,6 +4320,12 @@ int main(int argc, char** argv) {
     std::vector<std::vector<int32_t>> prompts;
     for (const auto& c : g["cases"]) prompts.push_back(c["prompt"].get<std::vector<int32_t>>());
     wide_block(dir + "/tiny_block8.flyx", backend, prompts);
+    if (backend == "cuda") {
+      constexpr int kWidth = 7;
+      auto block7 = make(dir + "/tiny_block7.flyx", backend, true, "dflash2", false, "", false, 512, kWidth);
+      batch_rounds(block7.get(), {prompts[0], prompts[1]}, {0, 0}, "batched DFlash2 chains of 7 on a block of 7",
+                   kWidth);
+    }
   }
   std::printf("%s (%d failures)\n", g_fail ? "FAILED" : "PASSED", g_fail);
   return g_fail ? 1 : 0;
