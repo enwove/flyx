@@ -133,6 +133,10 @@ class Server:
         self.tm, self.dialog, self.posted, self.deleted, self.dialogs = tm, dialog, [], [], []
         self.gpu_apps = copy.deepcopy(gpu_apps) if gpu_apps is not None else None
         self.closed = []
+        self.hub_endpoint = "https://huggingface.co"
+        self.hub_source = "default"
+        self.hub_fail = False
+        self.hub_configs = []
         page.route("**/dashboard/**", lambda r: serve(r, ROOT / "apps/flyx-server/dashboard"))
         page.route("**/v1/**", self.answer)
 
@@ -178,13 +182,32 @@ class Server:
             return route.fulfill(json=self.tm)
         if "/v1/hub/cached" in url:
             return route.fulfill(json=CATALOG)
+        if "/v1/hub/config" in url:
+            if method == "POST":
+                body = route.request.post_data_json or {}
+                raw = (body.get("endpoint") or "").strip()
+                self.hub_configs.append(raw)
+                if raw.startswith("ftp://"):
+                    return route.fulfill(status=400, json={"error": {"message": "endpoint: URL must use http:// or https://"}})
+                if not raw or raw.rstrip("/") == "https://huggingface.co":
+                    self.hub_endpoint, self.hub_source = "https://huggingface.co", "default"
+                else:
+                    norm = raw if raw.startswith(("http://", "https://")) else "https://" + raw
+                    self.hub_endpoint, self.hub_source = norm.rstrip("/"), "setting"
+            return route.fulfill(json={"endpoint": self.hub_endpoint, "default_endpoint": "https://huggingface.co",
+                                       "source": self.hub_source, "offline": False})
         if "/v1/hub/search" in url:
+            if self.hub_fail:
+                return route.fulfill(status=502, json={"error": {"message": "cannot reach the Hub (timed out)"}})
             cursor = query.get("cursor", [""])[0]
             arch = query.get("arch", [""])[0]
             q_text = query.get("q", [""])[0]
             if cursor == "page2-tok":
-                return route.fulfill(json=FOUND_PAGE2)
+                res = copy.deepcopy(FOUND_PAGE2)
+                res["endpoint"] = self.hub_endpoint
+                return route.fulfill(json=res)
             res = copy.deepcopy(FOUND)
+            res["endpoint"] = self.hub_endpoint
             if q_text:
                 res["query"], res["family"], res["next_cursor"] = q_text, False, None
             elif arch:
@@ -192,7 +215,9 @@ class Server:
                 res["models"] = [m for m in res["models"] if m.get("architecture") == arch]
             return route.fulfill(json=res)
         if "/v1/hub/files" in url:
-            return route.fulfill(json=repository(query["repo"][0]))
+            res = repository(query["repo"][0])
+            res["endpoint"] = self.hub_endpoint
+            return route.fulfill(json=res)
         if "/v1/hub/dir" in url:
             path = query.get("path", [""])[0]
             return route.fulfill(json=FOLDERS[path]) if path in FOLDERS else route.fulfill(
@@ -422,8 +447,8 @@ def check_hub(page, server, want):
     expect(page.locator("#hf-detail .dchips")).to_contain_text("+ MTP")
     expect(page.locator("#mf-files .mrow")).to_have_count(5)
     expect(page.locator("#hf-companions .mrow")).to_have_count(3)
-    expect(page.locator('#hf-companions .mrow[data-kind="mtp"] svg use')).to_have_attribute("href", "#i-bolt")
-    expect(page.locator('#hf-companions .mrow[data-kind="mmproj"]').first.locator("svg use")).to_have_attribute("href", "#i-image")
+    expect(page.locator('#hf-companions .mrow[data-kind="mtp"] .cmain svg use')).to_have_attribute("href", "#i-bolt")
+    expect(page.locator('#hf-companions .mrow[data-kind="mmproj"]').first.locator(".cmain svg use")).to_have_attribute("href", "#i-image")
     expect(page.locator("#mf-load")).to_be_disabled()
     # Selecting a companion in Hugging Face detail turns the bottom-right CTA into Use as projector / Draft with it.
     page.locator('#hf-companions .mrow[data-comp$=":mmproj-F16.gguf"]').click()
@@ -440,12 +465,78 @@ def check_hub(page, server, want):
     expect(page.locator("#sd-file")).to_have_value(REPO + ":mtp.gguf")
     page.locator("#mf-reset").click()
     view(page, "library")
+    # Selecting one drafter + one vision projector simultaneously applies both in one click.
+    page.locator('#hf-companions .mrow[data-comp$=":mtp.gguf"]').click()
+    page.locator('#hf-companions .mrow[data-comp$=":mmproj-F16.gguf"]').click()
+    expect(page.locator('#hf-companions .mrow[data-comp$=":mtp.gguf"]')).to_have_attribute("aria-selected", "true")
+    expect(page.locator('#hf-companions .mrow[data-comp$=":mmproj-F16.gguf"]')).to_have_attribute("aria-selected", "true")
+    # Picking another mmproj swaps only the projector while keeping the drafter selected.
+    page.locator('#hf-companions .mrow[data-comp$=":mmproj-BF16.gguf"]').click()
+    expect(page.locator('#hf-companions .mrow[data-comp$=":mtp.gguf"]')).to_have_attribute("aria-selected", "true")
+    expect(page.locator('#hf-companions .mrow[data-comp$=":mmproj-F16.gguf"]')).to_have_attribute("aria-selected", "false")
+    expect(page.locator('#hf-companions .mrow[data-comp$=":mmproj-BF16.gguf"]')).to_have_attribute("aria-selected", "true")
+    expect(page.locator("#mf-load")).to_have_text("Use selected companions")
+    page.locator("#mf-load").click()
+    expect(page.locator("#mv-current")).to_be_visible()
+    expect(page.locator("#sd-file")).to_have_value(REPO + ":mtp.gguf")
+    page.locator('#lset-tabs [data-stab="vision"]').click()
+    expect(page.locator("#vs-file")).to_have_value(REPO + ":mmproj-BF16.gguf")
+    page.locator("#mf-reset").click()
+    view(page, "library")
+    # Picking a quantization together with 1 drafter + 1 mmproj loads all three in one POST /v1/load.
+    page.locator('#mf-files .mrow[data-name$=":Q5_K_M"]').click()
+    page.locator('#hf-companions .mrow[data-comp$=":mtp.gguf"]').click()
+    page.locator('#hf-companions .mrow[data-comp$=":mmproj-F16.gguf"]').click()
+    expect(page.locator("#mf-load")).to_have_text("Switch to this model")
+    expect(page.locator("#mf-chosen-s")).to_contain_text("20.3 GB to download first")
+    expect(page.locator("#mf-chosen-s")).to_contain_text("mtp.gguf")
+    expect(page.locator("#mf-chosen-s")).to_contain_text("mmproj-F16.gguf")
+    confirm(page, "#mf-load", "Switch")
+    body = server.posted[-1]
+    assert (body["model"], body["drafter"], body["drafters"], body["mmproj"]) == (
+        REPO + ":Q5_K_M", "mtp", [REPO + ":mtp.gguf"], REPO + ":mmproj-F16.gguf"), body
+    # Selecting a quantization alone posts with default companions and exact quantization size.
+    view(page, "library")
+    page.locator('#mf-files .mrow[data-name$=":Q5_K_M"]').click()  # deselect previous Q5_K_M
     page.locator('#mf-files .mrow[data-name$=":Q5_K_M"]').click()
     expect(page.locator("#mf-load")).to_have_text("Switch to this model")
     expect(page.locator("#mf-chosen-s")).to_contain_text("19.4 GB to download first")
     confirm(page, "#mf-load", "Switch")
     body = server.posted[-1]  # another model, with the settings of the one served
-    assert (body["model"], body["ctx"], body["kv"], body["kv_gpu"]) == (REPO + ":Q5_K_M", want["ctx"], want["kv"], want["kv_gpu"]), body
+    assert (body["model"], body["ctx"], body["kv"], body["kv_gpu"], body["drafters"], body["mmproj"]) == (
+        REPO + ":Q5_K_M", want["ctx"], want["kv"], want["kv_gpu"], [], None), body
+    # Hub mirror endpoint selector: validate bad URL, apply mirror, update links, and reset back to default.
+    view(page, "library")
+    expect(page.locator("#hf-ep-toggle")).to_contain_text("huggingface.co")
+    page.locator("#hf-ep-toggle").click()
+    expect(page.locator("#hf-epbar")).to_be_visible()
+    page.locator("#hf-ep-input").fill("ftp://bad.example")
+    page.locator("#hf-ep-save").click()
+    expect(page.locator("#hf-ep-msg")).to_contain_text("http:// or https://")
+    page.locator("#hf-ep-input").fill("hf-mirror.com")
+    page.locator("#hf-ep-save").click()
+    expect(page.locator("#hf-ep-toggle")).to_contain_text("hf-mirror.com")
+    expect(page.locator("#hf-ep-toggle")).to_have_class(re.compile(r"\bon\b"))
+    expect(page.locator('#hf-detail a[href^="https://hf-mirror.com/"]')).to_have_count(1)
+    page.locator("#hf-ep-reset").click()
+    expect(page.locator("#hf-ep-toggle")).to_contain_text("huggingface.co")
+    expect(page.locator("#hf-ep-toggle")).not_to_have_class(re.compile(r"\bon\b"))
+    expect(page.locator("#hf-list .prow")).to_have_count(3)
+    page.locator("#hf-ep-toggle").click()
+    expect(page.locator("#hf-epbar")).to_have_count(0)
+    # When the Hub cannot be reached, the list shows a Use a mirror shortcut that opens the mirror bar.
+    server.hub_fail = True
+    page.locator("#hf-sort").select_option("downloads")
+    expect(page.locator("#hf-msg")).to_contain_text("cannot reach the Hub")
+    expect(page.locator("#hf-ep-help")).to_be_visible()
+    page.locator("#hf-ep-help").click()
+    expect(page.locator("#hf-epbar")).to_be_visible()
+    server.hub_fail = False
+    page.locator('#hf-epbar .chip[data-ep="https://hf-mirror.com"]').click()
+    expect(page.locator("#hf-list .prow")).to_have_count(3)
+    page.locator("#hf-ep-reset").click()
+    page.locator("#hf-ep-toggle").click()
+    page.locator("#hf-sort").select_option("trending")
     # A repository of an architecture this build does not run is not loaded.
     view(page, "library")
     page.locator('#hf-list .prow[data-repo="acme/Other-9B-GGUF"]').click()
@@ -512,6 +603,15 @@ def check_local(page, server):
     expect(page.locator("#mv-current")).to_be_visible()
     expect(page.locator("#vs-file")).to_have_value(FOLDER + "\\mmproj-BF16.gguf")
     page.locator("#mf-reset").click()
+    view(page, "library")
+    page.locator('#src-seg [data-src="local"]').click()
+    folders.nth(1).click()
+    expect(page.locator("#lc-companions .mrow")).to_have_count(1)
+    page.locator('#mf-cached .mrow[data-name$="Other-12B-Q5_K_M.gguf"]').click()
+    page.locator('#lc-companions .mrow[data-comp$="mmproj-BF16.gguf"]').click()
+    confirm(page, "#mf-load", "Switch")
+    assert (server.posted[-1]["model"], server.posted[-1]["mmproj"]) == (
+        FOLDER + "\\Other-12B-Q5_K_M.gguf", FOLDER + "\\mmproj-BF16.gguf"), server.posted[-1]
     view(page, "library")
     page.locator('#src-seg [data-src="local"]').click()
     folders.nth(0).click()

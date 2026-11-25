@@ -275,8 +275,11 @@ bool fetch_model(const std::string& model, const std::vector<std::string>& draft
     }
   }
   // unsloth keeps the MTP layer of GGUFs made without it in MTP/.
+  bool has_mtp_drafter = false;
+  for (const auto& ds : out->drafter_sources)
+    if (ds.kind == "mtp") has_mtp_drafter = true;
   const hub::RepoFile* mtp = hub::mtp_file(repo);
-  if (want_mtp && mtp && own_mtp == 0) {
+  if (want_mtp && mtp && own_mtp == 0 && !has_mtp_drafter) {
     std::vector<std::string> paths;
     if (!hub::fetch(repo, {*mtp}, &paths, progress, stop, err)) return false;
     out->drafters.push_back(paths[0]);

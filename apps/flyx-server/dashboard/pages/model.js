@@ -14,13 +14,27 @@ import { live, poll, busyLoad } from "../lib/telemetry.js";
 import { unloadServed, reloadServed, stopFetch } from "../lib/actions.js";
 import { VramApps, isVramError, parseVramNeeded } from "../components/vram_apps.js";
 
-// "org/name[:quant|file][@rev]", not a path: a relative path of two parts reads the same unless it has ':' or lacks a model extension.
-const hubName = (v) => {
+const hostOf = (u) => String(u || "").replace(/^https?:\/\//i, "").replace(/\/.*$/, "") || "huggingface.co";
+const safeOrigin = (u) => /^https?:\/\//i.test(String(u || "")) ? String(u).replace(/\/+$/, "") : "https://huggingface.co";
+function stripHubPrefix(v, extraOrigin) {
   const s = v.trim();
-  if (!/^(https?:\/\/(hf\.co|huggingface\.co)\/)?[A-Za-z0-9._-]+\/[A-Za-z0-9._-]+(:[A-Za-z0-9._-]+)?(@[A-Za-z0-9._-]+)?$/.test(s)) return false;
+  const prefixes = ["https://huggingface.co/", "http://huggingface.co/", "huggingface.co/",
+                    "https://hf.co/", "hf.co/", "https://hf-mirror.com/", "hf-mirror.com/"];
+  if (extraOrigin) {
+    const clean = safeOrigin(extraOrigin);
+    prefixes.unshift(clean + "/", hostOf(clean) + "/");
+  }
+  const low = s.toLowerCase();
+  for (const p of prefixes) if (low.startsWith(p.toLowerCase())) return s.slice(p.length);
+  return s;
+}
+// "org/name[:quant|file][@rev]", not a path: a relative path of two parts reads the same unless it has ':' or lacks a model extension.
+const hubName = (v, extraOrigin) => {
+  const s = stripHubPrefix(v, extraOrigin);
+  if (!/^[A-Za-z0-9._-]+\/[A-Za-z0-9._-]+(:[A-Za-z0-9._-]+)?(@[A-Za-z0-9._-]+)?$/.test(s)) return false;
   return s.includes(":") || !/\.(gguf|flyx)$/i.test(s);
 };
-const repoOf = (v) => v.trim().replace(/^https?:\/\/(hf\.co|huggingface\.co)\//, "").split("@")[0].split(":")[0];
+const repoOf = (v, extraOrigin) => stripHubPrefix(v, extraOrigin).split("@")[0].split(":")[0];
 const quantOf = (v) => { const m = /:([^@]+)/.exec(v); return m ? m[1] : null; };
 
 function describe(m) {
@@ -288,6 +302,13 @@ export function ModelPage({ active, libraryAsked, currentAsked }) {
   const [repoSel, setRepoSel] = useState("");
   const [hub, setHub] = useState(null);  // {repo, j}: GET /v1/hub/files of the repository shown
   const [hubMsg, setHubMsg] = useState("");
+  const [hubCfg, setHubCfg] = useState(null);  // GET /v1/hub/config: {endpoint, default_endpoint, source, offline}
+  const [epOpen, setEpOpen] = useState(false);
+  const [epText, setEpText] = useState("");
+  const [epMsg, setEpMsg] = useState("");
+  const [epSaving, setEpSaving] = useState(false);
+  const [hubDraft, setHubDraft] = useState("");
+  const [hubMmproj, setHubMmproj] = useState("");
   // this machine: the models the server lists, the folders kept here, the folder shown (`loc`; "" for where to start)
   const [catalog, setCatalog] = useState(null);
   const [catalogErr, setCatalogErr] = useState("");
@@ -298,6 +319,8 @@ export function ModelPage({ active, libraryAsked, currentAsked }) {
   const [pathText, setPathText] = useState("");
   const [localQ, setLocalQ] = useState("");
   const [picked, setPicked] = useState("");  // the model of the list shown at the right; "": the folder at `loc`
+  const [localDraft, setLocalDraft] = useState("");
+  const [localMmproj, setLocalMmproj] = useState("");
   const [listings, setListings] = useState({});  // a folder the server does not list by itself -> {models} of GET /v1/hub/dir
   // the model to load, and how
   const [target, setTarget] = useState("");
@@ -326,6 +349,31 @@ export function ModelPage({ active, libraryAsked, currentAsked }) {
   });
   const [picking, setPicking] = useState(false);  // the desktop's folder dialog is open, on the server's machine
 
+  const hubEndpoint = (hubCfg && hubCfg.endpoint) || (found && found.endpoint) || "https://huggingface.co";
+  const hubDefaultEndpoint = (hubCfg && hubCfg.default_endpoint) || "https://huggingface.co";
+  const isCustomEndpoint = hubEndpoint.replace(/\/+$/, "").toLowerCase() !== hubDefaultEndpoint.replace(/\/+$/, "").toLowerCase();
+
+  async function refreshHubConfig() {
+    const r = await call("GET", "/v1/hub/config");
+    if (r.ok && r.json) setHubCfg(r.json);
+  }
+  async function applyEndpoint(raw) {
+    if (epSaving) return;
+    setEpSaving(true);
+    setEpMsg("");
+    const r = await call("POST", "/v1/hub/config", { endpoint: raw });
+    setEpSaving(false);
+    if (!r.ok) {
+      setEpMsg(r.status === 404 && !r.json ? "This server cannot change the Hub endpoint yet: update FLYX." : r.error);
+      return;
+    }
+    if (r.json) {
+      setHubCfg(r.json);
+      setEpText(r.json.endpoint || "");
+    }
+    search(q, sort, arch, 0, "");
+    if (repoSel) showRepo(repoSel, "");
+  }
   async function refreshCached() {
     try { setCatalog(await getJson("/v1/hub/cached")); setCatalogErr(""); } catch (e) { setCatalogErr(e.message); }
   }
@@ -333,7 +381,7 @@ export function ModelPage({ active, libraryAsked, currentAsked }) {
   async function search(text, by, archFilter = "", pageIdx = 0, cursorStr = "") {
     const n = ++searchSeq.current;
     setFoundMsg("Asking Hugging Face ...");
-    const word = hubName(text) ? repoOf(text) : text.trim();  // a name with its quantization or revision: its repository
+    const word = hubName(text, hubEndpoint) ? repoOf(text, hubEndpoint) : text.trim();  // a name with its quantization or revision: its repository
     let path = "/v1/hub/search?limit=20&sort=" + by + "&q=" + encodeURIComponent(word);
     if (!word && archFilter) path += "&arch=" + encodeURIComponent(archFilter);
     if (cursorStr) path += "&cursor=" + encodeURIComponent(cursorStr);
@@ -360,6 +408,7 @@ export function ModelPage({ active, libraryAsked, currentAsked }) {
   // A repository's files and what the Hub says of it.  `quant`: the file to choose once they are known.
   async function showRepo(id, quant) {
     const n = ++repoSeq.current;
+    if (id !== repoSel) { setHubDraft(""); setHubMmproj(""); }
     setRepoSel(id);
     setHubMsg("Asking Hugging Face about " + id + " ...");
     setMsg("");
@@ -375,12 +424,13 @@ export function ModelPage({ active, libraryAsked, currentAsked }) {
   // The search box also takes a repository's whole name (org/name, org/name:QUANT, its address): shown at once.
   function named(text) {
     const v = text.trim();
-    if (!hubName(v)) return false;
-    showRepo(repoOf(v), quantOf(v.replace(/^https?:\/\/(hf\.co|huggingface\.co)\//, "").split("@")[0]) || "");
+    if (!hubName(v, hubEndpoint)) return false;
+    showRepo(repoOf(v, hubEndpoint), quantOf(stripHubPrefix(v, hubEndpoint).split("@")[0]) || "");
     return true;
   }
   useEffect(() => {
     if (!active || view !== "library" || tab !== "hub") return;
+    refreshHubConfig();
     const h = setTimeout(() => search(q, sort, arch, 0, ""), found || foundMsg ? 350 : 0);
     return () => clearTimeout(h);
   }, [active, view, tab, q, sort, arch]);
@@ -397,6 +447,8 @@ export function ModelPage({ active, libraryAsked, currentAsked }) {
     const n = ++dirSeq.current;
     setLoc(p);
     setPathText(p);
+    setLocalDraft("");
+    setLocalMmproj("");
     setMsg("");
     // The folder Hugging Face downloads to is shown by its repositories, as the server lists them, not by its files as
     // they lie in it.
@@ -505,9 +557,10 @@ export function ModelPage({ active, libraryAsked, currentAsked }) {
   // ---- the settings a load takes: those shown with the model served (a change is compared with what it has); with
   // none served there are none to show, and a load takes the defaults ----
   const use = model.id ? f : EMPTY_FORM;
+  const diffShown = (a, b) => Object.keys(b).filter((k) => k === "drafter"
+    ? a[k].length !== b[k].length || a[k].some((value, i) => value !== b[k][i]) : a[k] !== b[k]);
   const before = loadedWant ? shown(loadedWant) : null, now = shown(loadBody(loadedWant ? loadedWant.model : "", use));
-  const changed = before ? Object.keys(now).filter((k) => k === "drafter"
-    ? before[k].length !== now[k].length || before[k].some((value, i) => value !== now[k][i]) : before[k] !== now[k]) : [];
+  const changed = before ? diffShown(before, now) : [];
   const was = (k) => changed.includes(k) ? (k === "drafter" ? before[k].join(" · ") : before[k]) : null;
   const advChanged = ["width", "head", "weights", "lookup", "trees"].filter((k) => was(k) !== null);
   useEffect(() => { if (advChanged.length) setAdvOpen(true); }, [advChanged.length]);
@@ -516,18 +569,32 @@ export function ModelPage({ active, libraryAsked, currentAsked }) {
   const keepDraft = changed.includes("drafter") || !!use.draftPicked;
   const keepMmproj = changed.includes("mmproj") || !!use.mmprojPicked;
   const keepName = changed.includes("name");
-  function settingsFor(name) {
-    if (!loadedWant || !name || name === loadedWant.model) return use;
+  function settingsFor(name, overrides) {
     const next = Object.assign({}, use);
-    if (!keepDraft) { next.draftSource = "default"; next.savedDraft = null; next.drafter = ""; }
-    if (!keepMmproj) { next.visionSource = "default"; next.mmproj = ""; }
-    if (!keepName) next.name = "";
+    if (loadedWant && name && name !== loadedWant.model) {
+      if (!keepDraft) { next.draftSource = "default"; next.savedDraft = null; next.drafter = ""; }
+      if (!keepMmproj) { next.visionSource = "default"; next.mmproj = ""; }
+      if (!keepName) next.name = "";
+    }
+    if (overrides && overrides.drafter) {
+      next.spec = true;
+      next.draftSource = "custom";
+      next.savedDraft = null;
+      next.drafter = overrides.drafter;
+      next.draftPicked = true;
+    }
+    if (overrides && overrides.mmproj) {
+      next.vision = true;
+      next.visionSource = "custom";
+      next.mmproj = overrides.mmproj;
+      next.mmprojPicked = true;
+    }
     return next;
   }
-  const body = (name) => loadBody(name, settingsFor(name));
+  const body = (name, overrides) => loadBody(name, settingsFor(name, overrides));
 
   // Loads `name` with the settings; or `want`, a load the server remembers, as it was.
-  async function loadModel(name, want) {
+  async function loadModel(name, want, overrides) {
     if (!name) { setMsg("Choose a model first."); return; }
     const same = !!loadedWant && name === loadedWant.model;
     const st = tm.state || {}, served = model.id;
@@ -543,10 +610,14 @@ export function ModelPage({ active, libraryAsked, currentAsked }) {
                             lines, same ? "Reload" : "Switch")) return;
     }
     setMsg("");
-    const reqBody = want || body(name);
+    const reqBody = want || body(name, overrides);
     lastAttempt.current = reqBody;
     const r = await call("POST", "/v1/load", reqBody);
     if (!r.ok) { setMsg(r.error); return; }
+    setHubDraft("");
+    setHubMmproj("");
+    setLocalDraft("");
+    setLocalMmproj("");
     setView("current");  // where the fetch's and the load's progress show
     document.getElementById("main").scrollTo({ top: 0 });
     poll();
@@ -570,7 +641,7 @@ export function ModelPage({ active, libraryAsked, currentAsked }) {
   const pickDraft = (source) => { if (!specOff) setF(Object.assign({}, f, { draftSource: source, savedDraft, draftPicked: false })); };
   // A drafter named by the page (one of the cache, one published for a repository's model) goes to the settings.
   const draftWith = (name) => {
-    setF((current) => Object.assign({}, current, { spec: true, draftSource: "custom", drafter: name, draftPicked: true }));
+    setF((current) => Object.assign({}, current, { spec: true, draftSource: "custom", savedDraft: null, drafter: name, draftPicked: true }));
     setView("current");
     setStab("spec");
     setTimeout(() => { const row = document.getElementById("sd-custom"); if (row) row.scrollIntoView({ behavior: "smooth", block: "center" }); }, 60);
@@ -580,6 +651,13 @@ export function ModelPage({ active, libraryAsked, currentAsked }) {
     setView("current");
     setStab("vision");
     setTimeout(() => { const row = document.getElementById("vs-custom"); if (row) row.scrollIntoView({ behavior: "smooth", block: "center" }); }, 60);
+  };
+  const applyCompanions = (draftSpec, mmprojSpec) => {
+    setF((current) => Object.assign({}, current,
+      draftSpec ? { spec: true, draftSource: "custom", savedDraft: null, drafter: draftSpec, draftPicked: true } : {},
+      mmprojSpec ? { vision: true, visionSource: "custom", mmproj: mmprojSpec, mmprojPicked: true } : {}));
+    setView("current");
+    setStab(draftSpec ? "spec" : "vision");
   };
   const visOff = !f.vision, visCustom = f.visionSource === "custom", mmOwn = f.mmproj.trim();
   const pickVision = (source) => { if (!visOff) setF(Object.assign({}, f, { visionSource: source, mmprojPicked: false })); };
@@ -764,7 +842,7 @@ export function ModelPage({ active, libraryAsked, currentAsked }) {
     const serving = loadedWant ? loadedWant.model : null, remembered = L.remembered ? L.remembered.model : null;
     return rows.map((r) => html`
       <div class=${"mrow" + (r.name === target ? " sel" : "") + (r.off ? " off" : "")} data-name=${r.name} role="option" aria-selected=${String(r.name === target)}
-           onClick=${r.off ? undefined : () => { setTarget(r.name); setMsg(""); }}>
+           onClick=${r.off ? undefined : () => { setTarget(r.name === target ? "" : r.name); setMsg(""); }}>
         <span class="radio"></span>
         <div><div class="q">${r.title}</div>${r.sub ? html`<div class="fn">${r.sub}</div>` : ""}</div>
         <div class="tags">
@@ -777,6 +855,80 @@ export function ModelPage({ active, libraryAsked, currentAsked }) {
         ${r.del ? html`<button class="iconbtn del" title=${t("Delete from the Hugging Face cache")} aria-label=${t("Delete")}
                                onClick=${(e) => { e.stopPropagation(); removeCached(r.del); }}><${Icon} name="trash"/></button>` : html`<span></span>`}
       </div>`);
+  }
+  // Companion files (at most one drafter + at most one vision projector) that can be combined with a model or applied together.
+  function companionsView(id, comps, pickedDraft, setPickedDraft, pickedMm, setPickedMm) {
+    const drafts = comps.filter((c) => c.kind !== "mmproj"), mmprojs = comps.filter((c) => c.kind === "mmproj");
+    const renderRow = (c, sel, onToggle) => {
+      const isMm = c.kind === "mmproj";
+      const kindTag = isMm ? ["mmproj", "info"] : c.kind === "dspark" ? ["DSpark", "ok"] : c.kind === "mtp" ? ["MTP", "ok"] : ["drafter", "ok"];
+      const sub = c.path && c.path !== c.file ? c.path : "";
+      return html`
+        <div class=${"mrow comp" + (sel ? " sel" : "")} data-comp=${c.key} data-kind=${c.kind} role="option" aria-selected=${String(sel)}
+             onClick=${() => { onToggle(); setMsg(""); }}>
+          <span class="check"><${Icon} name="check"/></span>
+          <div class="cmain">
+            <${Icon} name=${isMm ? "image" : "bolt"} cls=${isMm ? "k-mmproj" : "k-drafter"}/>
+            <div><div class="q">${c.file}</div>${sub ? html`<div class="fn">${sub}</div>` : ""}</div>
+          </div>
+          <div class="tags">
+            <span class=${"tag2 " + kindTag[1]}>${t(kindTag[0])}</span>
+            ${c.default ? html`<span class="tag2 ok">${t("auto")}</span>` : ""}
+            ${c.cached ? html`<span class="tag2 info">${t("downloaded")}</span>` : ""}
+          </div>
+          <div class="sz">${c.size ? sized(c.size) : "-"}</div>
+          <div class="fit"></div>
+          <span></span>
+        </div>`;
+    };
+    return html`
+      <div class="mrows comp-list" id=${id} role="listbox" aria-multiselectable="true">
+        ${drafts.length ? html`
+          <div class="mgroup-h">${t("Drafter")}<span>${t("pick up to one")}</span></div>
+          ${drafts.map((c) => renderRow(c, pickedDraft === c.key, () => setPickedDraft(pickedDraft === c.key ? "" : c.key)))}` : ""}
+        ${mmprojs.length ? html`
+          <div class="mgroup-h">${t("Vision projector")}<span>${t("pick up to one")}</span></div>
+          ${mmprojs.map((c) => renderRow(c, pickedMm === c.key, () => setPickedMm(pickedMm === c.key ? "" : c.key)))}` : ""}
+      </div>`;
+  }
+  function companionBarState(rows, selDraft, selMm, clearPicked) {
+    const hasMain = rows.some((r) => r.name === target && !r.off);
+    if (hasMain) {
+      const overrides = (selDraft || selMm) ? {
+        drafter: selDraft ? selDraft.spec : null,
+        mmproj: selMm ? selMm.spec : null,
+        drafterSize: selDraft ? (selDraft.size || 0) : 0,
+        drafterCached: selDraft ? !!selDraft.cached : true,
+        mmprojSize: selMm ? (selMm.size || 0) : 0,
+        mmprojCached: selMm ? !!selMm.cached : true,
+      } : null;
+      return { action: null, overrides };
+    }
+    if (!selDraft && !selMm) return { action: null, overrides: null };
+    const items = [selDraft, selMm].filter(Boolean);
+    const allCached = items.every((c) => c.cached);
+    const totalSz = items.reduce((n, c) => n + (c.size || 0), 0);
+    const fetchSz = items.reduce((n, c) => n + (c.cached ? 0 : (c.size || 0)), 0);
+    const sub = allCached ? sized(totalSz) + " on disk" : sized(fetchSz) + " to download first";
+    if (selDraft && selMm) {
+      return {
+        action: { title: selDraft.file + " + " + selMm.file, sub, label: "Use selected companions",
+                  disabled: !model.id || busy, onClick: () => { applyCompanions(selDraft.spec, selMm.spec); clearPicked(); } },
+        overrides: null,
+      };
+    }
+    if (selMm) {
+      return {
+        action: { title: selMm.file, sub, label: "Use as projector", disabled: !model.id || busy,
+                  onClick: () => { projectWith(selMm.spec); clearPicked(); } },
+        overrides: null,
+      };
+    }
+    return {
+      action: { title: selDraft.file, sub, label: "Draft with it", disabled: !model.id || busy,
+                onClick: () => { draftWith(selDraft.spec); clearPicked(); } },
+      overrides: null,
+    };
   }
   const localRow = (m) => {
     const d = describe(m), tags = [];
@@ -791,7 +943,8 @@ export function ModelPage({ active, libraryAsked, currentAsked }) {
   };
   // `rows`: the ones shown, so a choice made elsewhere is not loaded from here.  `note`: what stands in the way.
   // `action` (optional): replaces loading with a companion action (e.g., attaching an mmproj or drafter).
-  function loadBox(rows, note, action) {
+  // `overrides` (optional): companion files picked alongside a main model row to load together in one shot.
+  function loadBox(rows, note, action, overrides) {
     if (action) {
       return html`
         <div class="loadbox" id="mf-loadbox">
@@ -805,12 +958,21 @@ export function ModelPage({ active, libraryAsked, currentAsked }) {
     }
     const row = rows.find((r) => r.name === target && !r.off), name = row ? row.name : "";
     const same = !!loadedWant && name === loadedWant.model, m = entryOf(name);
+    const eff = settingsFor(name, overrides), effNow = shown(loadBody(name, eff));
+    const effChanged = before ? diffShown(before, effNow) : [];
     let label = "Load model", disabled = !name || busy || !!note;
     if (busy) label = L.state === "fetching" ? "Fetching…" : "Loading…";
-    else if (same) { label = changed.length ? "Reload with these settings" : "Loaded"; disabled = disabled || !changed.length; }
+    else if (same) { label = effChanged.length ? "Reload with these settings" : "Loaded"; disabled = disabled || !effChanged.length; }
     else if (loadedWant && name) label = "Switch to this model";
-    const what = !name ? "" : same ? "This is the model being served." : m || !hubName(name) ? sized(row.size) + " on disk" : sized(row.size) + " to download first";
-    const eff = settingsFor(name), effNow = shown(loadBody(name, eff));
+    const mainOnDisk = !name ? true : (!!m || !hubName(name));
+    const extraFetch = (overrides && overrides.drafter && !overrides.drafterCached ? overrides.drafterSize : 0) +
+                       (overrides && overrides.mmproj && !overrides.mmprojCached ? overrides.mmprojSize : 0);
+    const extraTotal = (overrides && overrides.drafter ? overrides.drafterSize : 0) +
+                       (overrides && overrides.mmproj ? overrides.mmprojSize : 0);
+    const fetchBytes = (mainOnDisk ? 0 : row.size) + extraFetch;
+    const what = !name ? "" : same && !extraFetch ? "This is the model being served."
+      : fetchBytes > 0 ? sized(fetchBytes) + " to download first"
+      : sized(row.size + extraTotal) + " on disk";
     const drafting = !eff.spec ? "off" : eff.draftSource === "custom" && eff.drafter.trim() ? baseName(eff.drafter.trim()) :
                      eff.draftSource === "saved" ? "last loaded" : "default";
     const visionBrief = !eff.vision ? "off" : (eff.visionSource === "custom" && eff.mmproj.trim() ? baseName(eff.mmproj.trim()) + " · " : "") +
@@ -825,7 +987,7 @@ export function ModelPage({ active, libraryAsked, currentAsked }) {
                  : html`<div class="ts" id="mf-chosen-s">${t(note || "Choose one of these to load.")}</div>`}
           ${msg ? html`<div class="ts bad" id="mf-msg">${t(msg)}</div>` : ""}
         </div>
-        <button class="btn primary" id="mf-load" disabled=${disabled} onClick=${() => loadModel(name)}>${t(label)}</button>
+        <button class="btn primary" id="mf-load" disabled=${disabled} onClick=${() => loadModel(name, null, overrides)}>${t(label)}</button>
       </div>`;
   }
 
@@ -838,28 +1000,35 @@ export function ModelPage({ active, libraryAsked, currentAsked }) {
       : found && found.query ? t("Showing " + found.query + " models, the family this build runs. Search for any other.") : "";
     const showPager = !!found && !foundMsg && (page > 0 || !!found.next_cursor);
     return html`
-      ${found && found.family && familyText ? html`<div class="hub-note" id="hf-family">${familyText}</div>` : ""}
+      ${found && found.family && familyText ? html`<div class="hub-note" id="hf-family">${familyText}</div>` : null}
       ${found && found.family && archs.length > 1 ? html`
         <div class="hub-archs pills" id="hf-archs" role="group">
           <button type="button" data-arch="" aria-pressed=${String(arch === "")} onClick=${() => setArch("")}>${t("All")}</button>
           ${archs.map((a) => html`
-            <button type="button" data-arch=${a} aria-pressed=${String(arch === a)} onClick=${() => setArch(a)}>${a}</button>`)}
-        </div>` : ""}
-      ${foundMsg ? html`<div class="empty pad" id="hf-msg">${t(foundMsg)}</div>` : ""}
-      ${found && !list.length && !foundMsg ? html`<div class="empty pad">${t("Nothing matches.")}</div>` : ""}
-      ${list.map((m) => html`
-        <button class=${"prow" + (m.id === repoSel ? " sel" : "")} data-repo=${m.id} onClick=${() => showRepo(m.id, "")}>
+            <button type="button" key=${a} data-arch=${a} aria-pressed=${String(arch === a)} onClick=${() => setArch(a)}>${a}</button>`)}
+        </div>` : null}
+      ${foundMsg ? html`
+        <div class="hub-status">
+          <div class="empty pad" id="hf-msg">${t(foundMsg)}</div>
+          ${!foundMsg.startsWith("Asking ") ? html`
+            <div class="hub-ephint"><button type="button" class="btn sm" id="hf-ep-help"
+              onClick=${() => { setEpOpen(true); setEpText(hubEndpoint); setEpMsg(""); }}>
+              <${Icon} name="globe"/>${t("Use a mirror")}</button></div>` : null}
+        </div>` : null}
+      ${found && !list.length && !foundMsg ? html`<div class="empty pad">${t("Nothing matches.")}</div>` : null}
+      ${list.length ? html`<div class="hub-items">${list.map((m) => html`
+        <button key=${m.id} class=${"prow" + (m.id === repoSel ? " sel" : "")} data-repo=${m.id} onClick=${() => showRepo(m.id, "")}>
           <span class="pn">${m.id.split("/")[1]}</span>
           <span class="pm"><${Icon} name="heart"/>${compact(m.likes)}<${Icon} name="dl"/>${compact(m.downloads)}</span>
-          <span class="ps">${m.id.split("/")[0]}${m.architecture ? html` <span class=${"tag2" + (m.runs === false ? " bad" : "")}>${m.architecture}</span>` : ""}${m.cached ? html` <span class="tag2 info">${t("downloaded")}</span>` : ""}${m.gated ? html` <span class="tag2">${t("gated")}</span>` : ""}</span>
+          <span class="ps">${m.id.split("/")[0]}${m.architecture ? html` <span class=${"tag2" + (m.runs === false ? " bad" : "")}>${m.architecture}</span>` : null}${m.cached ? html` <span class="tag2 info">${t("downloaded")}</span>` : null}${m.gated ? html` <span class="tag2">${t("gated")}</span>` : null}</span>
           <span class="pt">${t(ago(m.updated || m.created))}</span>
-        </button>`)}
+        </button>`)}</div>` : null}
       ${showPager ? html`
         <div class="hub-pager" id="hf-pager">
           <button class="btn sm" id="hf-prev" disabled=${page === 0} onClick=${() => goHubPage(page - 1)}>${t("Prev page")}</button>
           <span class="hub-page" id="hf-page">${t("Page " + (page + 1))}</span>
           <button class="btn sm" id="hf-next" disabled=${!found.next_cursor} onClick=${() => goHubPage(page + 1)}>${t("Next page")}</button>
-        </div>` : ""}`;
+        </div>` : null}`;
   }
   function hubDetail() {
     if (!repoSel) return html`<div class="hub-scroll"><div class="empty">${t("Pick a repository on the left to see its files.")}</div></div>${loadBox([], "")}`;
@@ -872,18 +1041,16 @@ export function ModelPage({ active, libraryAsked, currentAsked }) {
       const m = entryOf(g.name);
       return { name: g.name, title: g.quant, sub: "", tags, size: g.size, off: !whole(g), del: m && m.source === "hub" ? m : null };
     }) : [];
-    const comps = j && Array.isArray(j.companions) ? j.companions : [
+    const rawComps = j && Array.isArray(j.companions) ? j.companions : [
       ...(j && j.mtp ? [{ name: repoSel + ":" + baseName(j.mtp.path), path: j.mtp.path, file: baseName(j.mtp.path),
                           kind: "mtp", size: j.mtp.size, cached: !!j.mtp.cached, disk: null, default: true }] : []),
       ...(j && j.mmproj ? [{ name: repoSel + ":" + baseName(j.mmproj.path), path: j.mmproj.path, file: baseName(j.mmproj.path),
                              kind: "mmproj", size: j.mmproj.size, cached: !!j.mmproj.cached, disk: null, default: true }] : []),
     ];
-    const selComp = comps.find((c) => c.name === target);
-    const compAction = selComp ? (selComp.kind === "mmproj"
-      ? { title: selComp.file, sub: selComp.cached ? sized(selComp.size) + " on disk" : sized(selComp.size) + " to download first",
-          label: "Use as projector", disabled: !model.id || busy, onClick: () => projectWith(selComp.disk || selComp.name) }
-      : { title: selComp.file, sub: selComp.cached ? sized(selComp.size) + " on disk" : sized(selComp.size) + " to download first",
-          label: "Draft with it", disabled: !model.id || busy, onClick: () => draftWith(selComp.disk || selComp.name) }) : null;
+    const comps = rawComps.map((c) => Object.assign({}, c, { key: c.name, spec: c.disk || c.name }));
+    const selDraft = comps.find((c) => c.kind !== "mmproj" && c.key === hubDraft) || null;
+    const selMm = comps.find((c) => c.kind === "mmproj" && c.key === hubMmproj) || null;
+    const { action: compAction, overrides: compOverrides } = companionBarState(rows, selDraft, selMm, () => { setHubDraft(""); setHubMmproj(""); });
     const unsupported = j && j.runs === false;
     const note = unsupported ? "This build does not run this architecture." : j && !rows.length ? "Nothing here to load." : "";
     const chips = [];
@@ -903,7 +1070,7 @@ export function ModelPage({ active, libraryAsked, currentAsked }) {
           <div class="dh-icon"><${Icon} name="model"/></div>
           <div class="dh-t"><h3 id="hf-name">${short}</h3><span>${org}</span></div>
           <${CopyButton} get=${() => repoSel} label="Copy name"/>
-          <a class="btn ghost sm" href=${((found && found.endpoint) || "https://huggingface.co") + "/" + repoSel} target="_blank" rel="noopener noreferrer">
+          <a class="btn ghost sm" href=${safeOrigin((j && j.endpoint) || hubEndpoint) + "/" + repoSel} target="_blank" rel="noopener noreferrer">
             <${Icon} name="ext"/>${t("Open on Hugging Face")}</a>
         </div>
         ${chips.length ? html`<div class="dchips">${chips.map(([text, tone]) => html`<span class=${"tag2 " + tone}>${text}</span>`)}</div>` : ""}
@@ -921,29 +1088,8 @@ export function ModelPage({ active, libraryAsked, currentAsked }) {
           <div class="dsec">${t("Files")}<span>${t(rows.length + " quantizations")}</span></div>
           <div class="mrows" id="mf-files" role="listbox">${rowsView(rows)}</div>` : ""}
         ${comps.length ? html`
-          <div class="dsec">${t("Companion files")}<span>${t("attached automatically or picked individually")}</span></div>
-          <div class="mrows" id="hf-companions" role="listbox">${comps.map((c) => {
-            const isMm = c.kind === "mmproj", sel = target === c.name;
-            const kindTag = isMm ? ["mmproj", "info"] : c.kind === "dspark" ? ["DSpark", "ok"] : ["MTP", "ok"];
-            const sub = c.path && c.path !== c.file ? c.path : "";
-            return html`
-              <div class=${"mrow comp" + (sel ? " sel" : "")} data-comp=${c.name} data-kind=${c.kind} role="option" aria-selected=${String(sel)}
-                   onClick=${() => { setTarget(c.name); setMsg(""); }}>
-                <span class="radio"></span>
-                <div class="cmain">
-                  <${Icon} name=${isMm ? "image" : "bolt"} cls=${isMm ? "k-mmproj" : "k-drafter"}/>
-                  <div><div class="q">${c.file}</div>${sub ? html`<div class="fn">${sub}</div>` : ""}</div>
-                </div>
-                <div class="tags">
-                  <span class=${"tag2 " + kindTag[1]}>${t(kindTag[0])}</span>
-                  ${c.default ? html`<span class="tag2 ok">${t("auto")}</span>` : ""}
-                  ${c.cached ? html`<span class="tag2 info">${t("downloaded")}</span>` : ""}
-                </div>
-                <div class="sz">${c.size ? sized(c.size) : "-"}</div>
-                <div class="fit"></div>
-                <span></span>
-              </div>`;
-          })}</div>` : ""}
+          <div class="dsec">${t("Companion files")}<span>${t("pick up to one drafter and one vision projector")}</span></div>
+          ${companionsView("hf-companions", comps, hubDraft, setHubDraft, hubMmproj, setHubMmproj)}` : ""}
         ${j && j.drafter ? html`<div class="banner hint"><div class="grow2">${t(repoSel + " is a drafter (" + gb(j.drafter.size) + " GB), not a model: it drafts for one, and is not loaded on its own.")}</div>
           ${model.id ? html`<button class="btn sm" onClick=${() => draftWith(repoSel)}>${t("Draft with it")}</button>` : ""}</div>` : ""}
         ${j && !j.drafter && !rows.length ? html`<p class="lead">${t("No GGUF files in " + repoSel + ".")}</p>` : ""}
@@ -952,7 +1098,7 @@ export function ModelPage({ active, libraryAsked, currentAsked }) {
             ${" "}<code>${j.known_drafters[0]}</code></div>
             ${model.id ? html`<button class="btn sm" onClick=${() => draftWith(j.known_drafters[0])}>${t("Add to settings")}</button>` : ""}</div>` : ""}
       </div>
-      ${loadBox(rows, note, compAction)}`;
+      ${loadBox(rows, note, compAction, compOverrides)}`;
   }
 
   // ---- this machine: folders in a list, the models of the one shown ----
@@ -1125,13 +1271,28 @@ export function ModelPage({ active, libraryAsked, currentAsked }) {
     const folderDrafters = j ? j.models.filter((m) => m.kind === "drafter" && hit(m.file + " " + (m.path || ""))) : [];
     const singleMmproj = j && j.kind === "file" && folderMmproj.length === 1 ? folderMmproj[0] : null;
     const singleDrafter = j && j.kind === "file" && folderDrafters.length === 1 ? folderDrafters[0] : null;
-    const compAction = singleMmproj
-      ? { title: singleMmproj.path || singleMmproj.name, sub: "A vision projector is not loaded on its own.",
-          label: "Use as projector", disabled: !model.id || busy, onClick: () => projectWith(singleMmproj.path || singleMmproj.name) }
+    const relOf = (m) => j && j.kind === "dir" && m.path.length > j.path.length ? m.path.slice(j.path.length).replace(/^[\\/]+/, "") : m.file;
+    const localComps = [
+      ...folderDrafters.map((m) => ({
+        key: m.path || m.name, spec: m.path || m.name, file: m.file, path: relOf(m),
+        kind: kindOf(m.file || m.name), size: m.size, cached: true, default: false,
+      })),
+      ...folderMmproj.map((m) => ({
+        key: m.path || m.name, spec: m.path || m.name, file: m.file, path: relOf(m),
+        kind: "mmproj", size: m.size, cached: true, default: false,
+      })),
+    ];
+    const selLocalDraft = localComps.find((c) => c.kind !== "mmproj" && c.key === localDraft) || null;
+    const selLocalMm = localComps.find((c) => c.kind === "mmproj" && c.key === localMmproj) || null;
+    const localBar = singleMmproj
+      ? { action: { title: singleMmproj.path || singleMmproj.name, sub: "A vision projector is not loaded on its own.",
+                    label: "Use as projector", disabled: !model.id || busy, onClick: () => projectWith(singleMmproj.path || singleMmproj.name) },
+          overrides: null }
       : singleDrafter
-      ? { title: singleDrafter.path || singleDrafter.name, sub: "A drafter is not loaded on its own.",
-          label: "Draft with it", disabled: !model.id || busy, onClick: () => draftWith(singleDrafter.path || singleDrafter.name) }
-      : null;
+      ? { action: { title: singleDrafter.path || singleDrafter.name, sub: "A drafter is not loaded on its own.",
+                    label: "Draft with it", disabled: !model.id || busy, onClick: () => draftWith(singleDrafter.path || singleDrafter.name) },
+          overrides: null }
+      : companionBarState(rows, selLocalDraft, selLocalMm, () => { setLocalDraft(""); setLocalMmproj(""); });
     const loadNote = start ? "Open a folder to see its model files." : "";
     return html`
       <div class="hub-scroll" id="lc-detail">
@@ -1146,12 +1307,13 @@ export function ModelPage({ active, libraryAsked, currentAsked }) {
           ${rows.length ? html`<div class="mrows" id="mf-cached" role="listbox">${rowsView(rows)}</div>`
             : singleMmproj || singleDrafter ? ""
             : html`<div class="empty">${t(allModels.length ? "Nothing matches." : "No .gguf or .flyx model files here.")}</div>`}
-          ${folderDrafters.map((dr) => html`<div class="banner hint" style="margin-top: 10px"><div class="grow2">${t(dr.file + " is a drafter (" + gb(dr.size) + " GB), not a model: it drafts for one, and is not loaded on its own.")}</div>
-            ${!singleDrafter && model.id ? html`<button class="btn sm" onClick=${() => draftWith(dr.path || dr.name)}>${t("Draft with it")}</button>` : ""}</div>`)}
-          ${folderMmproj.map((mm) => html`<div class="banner hint" style="margin-top: 10px"><div class="grow2">${t(mm.file + " is a vision projector (" + gb(mm.size) + " GB), not a standalone model: attach it to a compatible VLM.")}</div>
-            ${!singleMmproj && model.id ? html`<button class="btn sm" onClick=${() => projectWith(mm.path || mm.name)}>${t("Use as projector")}</button>` : ""}</div>`)}` : ""}
+          ${singleDrafter ? html`<div class="banner hint" style="margin-top: 10px"><div class="grow2">${t(singleDrafter.file + " is a drafter (" + gb(singleDrafter.size) + " GB), not a model: it drafts for one, and is not loaded on its own.")}</div></div>` : ""}
+          ${singleMmproj ? html`<div class="banner hint" style="margin-top: 10px"><div class="grow2">${t(singleMmproj.file + " is a vision projector (" + gb(singleMmproj.size) + " GB), not a standalone model: attach it to a compatible VLM.")}</div></div>` : ""}
+          ${!singleDrafter && !singleMmproj && localComps.length ? html`
+            <div class="dsec">${t("Companion files")}<span>${t("pick up to one drafter and one vision projector")}</span></div>
+            ${companionsView("lc-companions", localComps, localDraft, setLocalDraft, localMmproj, setLocalMmproj)}` : ""}` : ""}
       </div>
-      ${loadBox(rows, loadNote, compAction)}`;
+      ${loadBox(rows, loadNote, localBar.action, localBar.overrides)}`;
   }
 
   const hubTab = tab === "hub";
@@ -1197,8 +1359,32 @@ export function ModelPage({ active, libraryAsked, currentAsked }) {
                      : html`<input type="text" id="mf-q" placeholder=${t("Filter by name or quantization")} spellcheck="false" autocomplete="off"
                                    value=${localQ} onInput=${(e) => setLocalQ(e.target.value)}/>`}</label>
           ${hubTab ? html`<select id="hf-sort" aria-label=${t("Order")} value=${sort} onChange=${(e) => setSort(e.target.value)}>
-            ${SORTS.map(([k, name]) => html`<option value=${k}>${t(name)}</option>`)}</select>` : ""}
+            ${SORTS.map(([k, name]) => html`<option value=${k}>${t(name)}</option>`)}</select>` : null}
+          ${hubTab ? html`<button type="button" class=${"btn epbtn" + (isCustomEndpoint ? " on" : "")} id="hf-ep-toggle"
+                    aria-expanded=${String(epOpen)} title=${t("Hugging Face mirror or endpoint") + ": " + hubEndpoint}
+                    onClick=${() => { setEpOpen((v) => !v); setEpText(hubEndpoint); setEpMsg(""); }}>
+              <${Icon} name="globe"/><span>${hostOf(hubEndpoint)}</span></button>` : null}
         </div>
+        ${hubTab && epOpen ? html`
+          <div class="hub-epbar" id="hf-epbar">
+            <span class="eplabel">${t("Hub mirror")}</span>
+            <input type="text" id="hf-ep-input" spellcheck="false" autocomplete="off"
+                   placeholder="https://huggingface.co"
+                   aria-label=${t("Hugging Face mirror or endpoint")}
+                   value=${epText} onInput=${(e) => { setEpText(e.target.value); setEpMsg(""); }}
+                   onKeyDown=${(e) => { if (e.key === "Enter") { e.preventDefault(); applyEndpoint(epText); } }}/>
+            <button type="button" class="btn sm primary" id="hf-ep-save" disabled=${epSaving}
+                    onClick=${() => applyEndpoint(epText)}>${t("Apply")}</button>
+            ${isCustomEndpoint || (hubCfg && hubCfg.source === "setting") ? html`
+              <button type="button" class="btn sm" id="hf-ep-reset" disabled=${epSaving}
+                      onClick=${() => applyEndpoint("")}>${t("Reset")}</button>` : null}
+            <span class="ep-presets">
+              <button type="button" class="chip" data-ep="https://huggingface.co" onClick=${() => applyEndpoint("https://huggingface.co")}>huggingface.co</button>
+              <button type="button" class="chip" data-ep="https://hf-mirror.com" onClick=${() => applyEndpoint("https://hf-mirror.com")}>hf-mirror.com</button>
+            </span>
+            ${epMsg ? html`<span class="ep-msg bad" id="hf-ep-msg">${t(epMsg)}</span>`
+                    : hubCfg && hubCfg.source === "HF_ENDPOINT" ? html`<span class="ep-msg" id="hf-ep-msg">${t("from HF_ENDPOINT")}</span>` : null}
+          </div>` : null}
         <div class="hub-b">
           <div class="hub-list" id=${hubTab ? "hf-list" : "lc-list"}>${hubTab ? hubList() : localList()}</div>
           <div class="hub-detail">${hubTab ? hubDetail() : pickedModel ? modelDetail(pickedModel) : localDetail()}</div>

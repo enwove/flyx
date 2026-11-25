@@ -6,6 +6,9 @@
 //                         "drafter": "mtp|dflash2|dv|all|none", "speculative": BOOL, "kv": "fp8|16", "name": ID}
 //                         -> 202 and the state; 409 while one loads
 //   DELETE /v1/load       stops a fetch under way (what came stays for the next try)
+//   GET /v1/hub/config    current Hugging Face Hub endpoint, default endpoint, source ("setting", "HF_ENDPOINT",
+//                         "default"), and offline flag
+//   POST /v1/hub/config   {"endpoint": URL or ""} sets or resets the Hub endpoint (persisted to serve.json)
 //   GET /v1/hub/search?q=TEXT&sort=trending|downloads|likes|updated|created&limit=N&cursor=C&arch=A   the Hub's
 //                         repositories with GGUF files; without q, filtered to the architectures this build runs
 //                         (optionally narrowed to arch=A), paginated via next_cursor
@@ -324,7 +327,8 @@ ojson repo_json(const hub::Repo& r) {
           {"known_drafters", apps::known_drafters(r.base_models)},
           {"info", r.from_cache ? ojson(nullptr) : info},
           {"runs", runs},
-          {"build_architectures", known}};
+          {"build_architectures", known},
+          {"endpoint", hub::endpoint()}};
 }
 
 }  // namespace
@@ -348,6 +352,38 @@ void add_manage_routes(httplib::Server& http, Server* s) {
     if (!require_manage(*s, q, r, "loading models")) return;
     s->host->cancel();
     send_json(r, 200, s->host->status());
+  });
+  auto hub_config_json = []() -> ojson {
+    return {{"endpoint", hub::endpoint()},
+            {"default_endpoint", "https://huggingface.co"},
+            {"source", hub::endpoint_source()},
+            {"offline", hub::offline()}};
+  };
+  http.Get("/v1/hub/config", [s, hub_config_json](const httplib::Request& q, httplib::Response& r) {
+    if (!require_manage(*s, q, r, "configuring Hugging Face")) return;
+    send_json(r, 200, hub_config_json());
+  });
+  http.Post("/v1/hub/config", [s, hub_config_json](const httplib::Request& q, httplib::Response& r) {
+    if (!require_manage(*s, q, r, "configuring Hugging Face")) return;
+    const ojson body = interfaces::parse_json(q.body);
+    if (!body.is_object()) return error(r, 400, "request body is not a JSON object", "invalid_request_error");
+    std::string raw;
+    if (body.contains("endpoint") && !body["endpoint"].is_null()) {
+      if (!body["endpoint"].is_string())
+        return error(r, 400, "\"endpoint\": a URL such as https://hf-mirror.com, or empty to reset", "invalid_request_error");
+      raw = body["endpoint"].get<std::string>();
+    }
+    std::string normalized, err;
+    if (!hub::normalize_endpoint(raw, &normalized, &err)) return error(r, 400, err, "invalid_request_error");
+    // Clear the saved override when emptied, or when explicitly set back to huggingface.co with no HF_ENDPOINT env.
+    const std::string saved =
+        normalized.empty() || (normalized == "https://huggingface.co" && os::getenv_str(env::kHfEndpoint).empty())
+            ? std::string()
+            : normalized;
+    if (!hub::set_endpoint(saved, &err)) return error(r, 400, err, "invalid_request_error");
+    if (!ModelHost::save_hub_endpoint(saved, &err)) return error(r, 500, err, "server_error");
+    std::fprintf(stderr, "flyx-server: Hugging Face endpoint set to %s\n", hub::endpoint().c_str());
+    send_json(r, 200, hub_config_json());
   });
   http.Get("/v1/hub/files", [s](const httplib::Request& q, httplib::Response& r) {
     if (!require_manage(*s, q, r, "loading models")) return;

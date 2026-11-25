@@ -158,7 +158,13 @@ bool remove_cached(const std::string& repo, const std::string& commit, const std
 
 std::string cache_dir();
 std::string cache_source();  // "HF_HUB_CACHE" | "HF_HOME" | "XDG_CACHE_HOME" | "default"
+// Normalizes and validates a Hub endpoint URL (e.g. "hf-mirror.com" -> "https://hf-mirror.com", trimming trailing
+// slashes). Empty input clears any override (falling back to HF_ENDPOINT or https://huggingface.co).
+bool normalize_endpoint(const std::string& raw, std::string* normalized, std::string* err);
+// Sets or clears a process-wide Hub endpoint override; empty restores HF_ENDPOINT / https://huggingface.co.
+bool set_endpoint(const std::string& url, std::string* err = nullptr);
 std::string endpoint();
+std::string endpoint_source();  // "setting" | "HF_ENDPOINT" | "default"
 bool offline();
 
 }  // namespace flyx::hub

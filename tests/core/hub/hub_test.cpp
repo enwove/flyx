@@ -112,6 +112,30 @@ void names() {
   for (const char* path : {"/home/me/model.gguf", "C:\\models\\x.gguf", "D:/models/x.gguf", "model.gguf", "a/b/c",
                            "../x", "org/..", "./x", "", "org/name:", "org/na me"})
     check(!flyx::hub::parse_name(path, &n), std::string("not a Hub name: \"") + path + "\"");
+  // Endpoint normalization, override, source reporting, and mirror URL parsing.
+  std::string norm, ep_err;
+  check(flyx::hub::normalize_endpoint("hf-mirror.com/", &norm, &ep_err) && norm == "https://hf-mirror.com",
+        "normalize_endpoint adds https:// and strips trailing slash");
+  check(flyx::hub::normalize_endpoint("http://127.0.0.1:8080/hf/", &norm, &ep_err) &&
+            norm == "http://127.0.0.1:8080/hf",
+        "normalize_endpoint keeps explicit http:// and path prefix");
+  check(flyx::hub::normalize_endpoint("   ", &norm, &ep_err) && norm.empty(),
+        "normalize_endpoint treats blank as reset");
+  for (const char* bad : {"ftp://hf-mirror.com", "javascript:alert(1)", "https://hf-mirror.com?a=1",
+                          "https://hf-mirror.com#x", "https://user@hf-mirror.com", "https://", "https://bad host"})
+    check(!flyx::hub::normalize_endpoint(bad, &norm, &ep_err),
+          std::string("normalize_endpoint rejects invalid URL: ") + bad);
+  check(flyx::hub::set_endpoint("hf-mirror.com", &ep_err) && flyx::hub::endpoint() == "https://hf-mirror.com" &&
+            flyx::hub::endpoint_source() == "setting",
+        "set_endpoint overrides endpoint() and reports source=setting");
+  check(flyx::hub::parse_name("https://hf-mirror.com/org/model-GGUF:Q4_K_M", &n) && n.repo == "org/model-GGUF" &&
+            n.quant == "Q4_K_M",
+        "parse_name strips configured custom mirror URL");
+  check(flyx::hub::parse_name("hf-mirror.com/org/model-GGUF:Q8_0", &n) && n.repo == "org/model-GGUF" &&
+            n.quant == "Q8_0",
+        "parse_name strips configured custom mirror host without scheme");
+  check(flyx::hub::set_endpoint("", &ep_err) && flyx::hub::endpoint_source() != "setting",
+        "set_endpoint(\"\") clears custom override");
 }
 
 flyx::hub::RepoFile file(const std::string& path, uint64_t size, const std::string& sha256 = "ab") {

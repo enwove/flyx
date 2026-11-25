@@ -184,11 +184,28 @@ std::string quant_label(const std::string& stem, const std::string& shared) {
 
 bool parse_name(const std::string& s, Name* out) {
   std::string t = s;
+  bool stripped = false;
   for (const std::string_view p : {"https://huggingface.co/", "http://huggingface.co/", "huggingface.co/",
                                    "https://hf.co/", "hf.co/", "hf://"}) {
     if (t.starts_with(p)) {
       t = t.substr(p.size());
+      stripped = true;
       break;
+    }
+  }
+  if (!stripped) {
+    const std::string ep = endpoint();
+    if (!ep.empty()) {
+      const std::string ep_slash = ep + "/";
+      if (t.starts_with(ep_slash)) {
+        t = t.substr(ep_slash.size());
+      } else {
+        const size_t sep = ep.find("://");
+        if (sep != std::string::npos) {
+          const std::string host_slash = ep.substr(sep + 3) + "/";
+          if (t.starts_with(host_slash)) t = t.substr(host_slash.size());
+        }
+      }
     }
   }
   Name n;
