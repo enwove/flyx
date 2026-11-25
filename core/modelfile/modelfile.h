@@ -24,13 +24,14 @@ namespace flyx {
 class ModelFile {
  public:
   // Maps the file and reads it with the reader its first bytes name.  A file
-  // that holds a drafter alone ("kind": "drafter") is no model:
-  // it goes beside one (add).
+  // that holds a drafter alone ("kind": "drafter", or a GGUF file whose
+  // general.architecture is "dflash") is no model: it goes beside one (add).
   bool open(const std::string& path, std::string* err);
   // Another file of the same model holding a part this one lacks (a
   // companion: unsloth ships the Qwen3.8-27B GGUF's MTP layer as a GGUF of its
-  // own, a DFlash2 drafter file, 0038, or its authors'
-  // directory of config.json and safetensors, 0060).  The i-th one added has
+  // own, a DFlash2 drafter file, 0038, its authors'
+  // directory of config.json and safetensors, 0060, or its GGUF file as
+  // llama.cpp reads it, general.architecture "dflash").  The i-th one added has
   // its header at header()["companions"][i] and its tensors named
   // companion_name(i, their name); its blobs are not read.  models/<arch>
   // decides what it takes from each, by name: nothing of one stands in for
@@ -80,9 +81,8 @@ class ModelFile {
 // Lightweight header metadata peeked from a GGUF file without mapping the whole file.
 struct GgufPeek {
   bool valid = false;
-  std::string arch;
-  int mtp_layers = 0;
-  bool has_markov_context = false;
+  std::string arch;    // general.architecture ("dflash": a drafter alone)
+  int mtp_layers = 0;  // <arch>.nextn_predict_layers, 0 if absent
 };
 GgufPeek gguf_peek(const std::string& path);
 

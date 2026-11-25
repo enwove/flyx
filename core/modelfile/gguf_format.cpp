@@ -845,7 +845,6 @@ GgufPeek gguf_peek(const std::string& path) {
   if (!count(&tensors) || !count(&entries) || entries > (uint64_t(1) << 24)) return out;
   std::string arch;
   std::map<std::string, int64_t> layers;  // keyed by architecture: the key may come before general.architecture
-  bool has_markov = false;
   for (uint64_t i = 0; i < entries; ++i) {
     std::string key;
     uint32_t type = 0;
@@ -877,14 +876,11 @@ GgufPeek gguf_peek(const std::string& path) {
     static const std::string kKey = ".nextn_predict_layers";
     if (type != 6 && type != 12 && key.size() > kKey.size() && key.ends_with(kKey))
       layers[key.substr(0, key.size() - kKey.size())] = v;
-    else if (type == 7 && key == "dflash.has_markov_context")
-      has_markov = v != 0;
   }
   out.valid = true;
   out.arch = arch;
   const auto it = layers.find(arch);
   out.mtp_layers = it == layers.end() || it->second < 0 ? 0 : int(std::min<int64_t>(it->second, 1 << 20));
-  out.has_markov_context = arch == "dflash" && has_markov;
   return out;
 }
 

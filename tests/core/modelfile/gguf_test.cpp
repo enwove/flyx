@@ -342,11 +342,9 @@ void array_stride_bounds() {
 void dflash_gguf_peek_and_open(const std::string& dir) {
   const std::string model = dir + "/tiny_gguf.gguf", drafter = dir + "/tiny_draft.gguf";
   const GgufPeek pm = gguf_peek(model);
-  check(pm.valid && pm.arch == "qwen35" && pm.mtp_layers == 1 && !pm.has_markov_context,
-        "gguf_peek reports arch and mtp_layers on target GGUF");
+  check(pm.valid && pm.arch == "qwen35" && pm.mtp_layers == 1, "gguf_peek reports arch and mtp_layers on target GGUF");
   const GgufPeek pd = gguf_peek(drafter);
-  check(pd.valid && pd.arch == "dflash" && pd.mtp_layers == 0 && !pd.has_markov_context,
-        "gguf_peek identifies arch='dflash' drafter GGUF");
+  check(pd.valid && pd.arch == "dflash" && pd.mtp_layers == 0, "gguf_peek identifies arch='dflash' drafter GGUF");
   ModelFile f;
   std::string err;
   const bool opened = f.open(drafter, &err);
