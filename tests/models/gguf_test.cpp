@@ -441,6 +441,141 @@ void dflash2_validation(const std::string& dir) {
   }
 }
 
+// DFlash2 GGUF (arch="dflash") matches canonical DFlash2 .flyx block-for-block and attaches to non-Qwen3.5
+// architectures (Qwen3 dense) through the shared models/drafters/ registry.
+void dflash2_gguf_and_universal(const std::string& dir) {
+  auto open_with = [&](ModelFile* f, const std::string& model, const std::string& comp, std::string* err) {
+    if (!f->open(model, err) || !f->add(comp, err)) return std::unique_ptr<interfaces::Model>{};
+    interfaces::ModelOptions o;
+    o.drafter = "dflash2";
+    return interfaces::open_model(*f, o, err);
+  };
+  std::string err;
+  // 1. Qwen3.5 + tiny_draft.flyx vs Qwen3.5 + tiny_draft.gguf: identical blocks, weights, states, and programs.
+  ModelFile fa, fb;
+  const auto ma = open_with(&fa, dir + "/tiny_gguf.gguf", dir + "/tiny_draft.flyx", &err);
+  const auto mb = open_with(&fb, dir + "/tiny_gguf.gguf", dir + "/tiny_draft.gguf", &err);
+  check(ma && mb, "DFlash2 GGUF opens beside Qwen3.5 GGUF: " + err);
+  if (ma && mb) {
+    const auto& da = ma->desc();
+    const auto& db = mb->desc();
+    bool ok = da.n_blocks == db.n_blocks && da.n_states == db.n_states &&
+              std::string(ma->drafter()) == std::string(mb->drafter());
+    for (int i = 0; ok && i < da.n_blocks; ++i) {
+      const auto& x = da.blocks[i];
+      const auto& y = db.blocks[i];
+      if (x.kind != y.kind) {
+        ok = false;
+        break;
+      }
+      Compare c{{&da}, {&db}, 1e-6, "dflash block " + std::to_string(i)};
+      if (x.kind == FLYX_BLOCK_DFLASH2_LAYER) {
+        const auto &a = x.dflash2_layer, &b = y.dflash2_layer;
+        c.norm(a.norm, b.norm, size_t(da.hidden), "norm");
+        c.norm(a.post_norm, b.post_norm, size_t(da.hidden), "post_norm");
+        c.norm(a.q_norm, b.q_norm, size_t(da.weights[a.q_norm.w].t->shape[0]), "q_norm");
+        c.norm(a.k_norm, b.k_norm, size_t(da.weights[a.k_norm.w].t->shape[0]), "k_norm");
+        c.whole(a.q, b.q, "q");
+        c.whole(a.k, b.k, "k");
+        c.whole(a.v, b.v, "v");
+        c.whole(a.o, b.o, "o");
+        c.whole(a.gate, b.gate, "gate");
+        c.whole(a.up, b.up, "up");
+        c.whole(a.down, b.down, "down");
+        c.whole(a.attn_conv_proj, b.attn_conv_proj, "attn_conv_proj");
+        c.whole(a.mlp_conv_proj, b.mlp_conv_proj, "mlp_conv_proj");
+        auto numel = [&](int w) {
+          size_t n = 1;
+          const auto* t = da.weights[w].t;
+          for (int d = 0; d < t->ndim; ++d) n *= size_t(t->shape[d]);
+          return n;
+        };
+        c.rows(a.attn_conv_base, 0, b.attn_conv_base, 0, numel(a.attn_conv_base), "attn_conv_base");
+        c.rows(a.mlp_conv_base, 0, b.mlp_conv_base, 0, numel(a.mlp_conv_base), "mlp_conv_base");
+      } else if (x.kind == FLYX_BLOCK_DFLASH2) {
+        const auto &a = x.dflash2, &b = y.dflash2;
+        c.same(a.hidden, b.hidden, "hidden");
+        c.same(a.n_heads, b.n_heads, "n_heads");
+        c.same(a.n_kv, b.n_kv, "n_kv");
+        c.same(a.head_dim, b.head_dim, "head_dim");
+        c.same(a.inter, b.inter, "inter");
+        c.same(a.block, b.block, "block");
+        c.same(a.mask_token, b.mask_token, "mask_token");
+        c.same(a.window, b.window, "window");
+        c.same(a.n_taps, b.n_taps, "n_taps");
+        c.same(a.conv_taps, b.conv_taps, "conv_taps");
+        c.same(a.conv_group, b.conv_group, "conv_group");
+        c.same(a.sel_rank, b.sel_rank, "sel_rank");
+        c.same(a.sel_topk, b.sel_topk, "sel_topk");
+        c.same(a.theta, b.theta, "theta");
+        c.whole(a.fc, b.fc, "fc");
+        c.norm(a.hidden_norm, b.hidden_norm, size_t(a.hidden), "hidden_norm");
+        c.norm(a.norm, b.norm, size_t(a.hidden), "norm");
+        c.whole(a.sel_pred, b.sel_pred, "sel_pred");
+        c.whole(a.sel_succ, b.sel_succ, "sel_succ");
+        c.whole(a.sel_hid, b.sel_hid, "sel_hid");
+      }
+      ok = ok && c.ok;
+    }
+    auto prog_eq = [](const std::vector<flyx_node>& p, const std::vector<flyx_node>& q) {
+      if (p.size() != q.size()) return false;
+      for (size_t i = 0; i < p.size(); ++i)
+        if (p[i].kind != q[i].kind || p[i].block != q[i].block || p[i].arg0 != q[i].arg0 || p[i].arg1 != q[i].arg1)
+          return false;
+      return true;
+    };
+    check(ok && prog_eq(ma->prefill_program(), mb->prefill_program()) &&
+              prog_eq(ma->round_program(7, 0, false), mb->round_program(7, 0, false)),
+          "DFlash2 GGUF matches DFlash2 .flyx block-for-block, weight-for-weight, and program-for-program");
+  }
+
+  // 2. Qwen3 (both GGUF and .flyx) attaches tiny_qwen3_draft.gguf through the shared drafter registry.
+  for (const std::string& q3 : {dir + "/tiny_qwen3_gguf.gguf", dir + "/tiny_qwen3.flyx"}) {
+    err.clear();
+    ModelFile fq;
+    const auto mq = open_with(&fq, q3, dir + "/tiny_qwen3_draft.gguf", &err);
+    int taps = 0, ctx = 0;
+    if (mq) {
+      for (const flyx_node& n : mq->prefill_program()) {
+        taps += n.kind == FLYX_NODE_TAP;
+        ctx += n.kind == FLYX_NODE_CONTEXT;
+      }
+    }
+    check(mq && mq->drafters() == 1 && std::string(mq->drafter()) == "dflash2" && taps == 2 && ctx == 1,
+          "Qwen3 attaches DFlash2 GGUF (" + q3 + "): " + err);
+  }
+
+  // 3. Refusal checks on DFlash2 GGUF: mismatched hidden, causal=true.
+  err.clear();
+  {
+    ModelFile fm;
+    const auto mismatch = open_with(&fm, dir + "/tiny_w4a4.flyx", dir + "/tiny_draft.gguf", &err);
+    check(!mismatch && err.find("another model") != std::string::npos,
+          "DFlash2 GGUF for another hidden size is refused (" + err + ")");
+  }
+  {
+    // Flip dflash.attention.causal from false to true in a temp copy.
+    std::ifstream in(dir + "/tiny_draft.gguf", std::ios::binary);
+    std::vector<char> data{std::istreambuf_iterator<char>(in), {}};
+    const std::string key = "dflash.attention.causal";
+    const auto at = std::search(data.begin(), data.end(), key.begin(), key.end());
+    if (at != data.end()) {
+      at[std::ptrdiff_t(key.size()) + 4] = 1;  // skip uint32 value type (7 = bool), set bool = true
+      const std::string bad = dir + "/bad_causal_dflash.gguf";
+      std::ofstream(bad, std::ios::binary).write(data.data(), std::streamsize(data.size()));
+      err.clear();
+      bool refused_causal = false;
+      {
+        ModelFile fc;
+        const auto mc = open_with(&fc, dir + "/tiny_gguf.gguf", bad, &err);
+        refused_causal = !mc && err.find("causal") != std::string::npos;
+      }
+      std::remove(bad.c_str());
+      check(refused_causal, "DFlash2 GGUF with causal=true is refused (" + err + ")");
+    }
+  }
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -449,6 +584,7 @@ int main(int argc, char** argv) {
   fp4_inputs_by_device(dir + "/tiny_w4a4.flyx");
   activations_asked(dir);
   dflash2_validation(dir);
+  dflash2_gguf_and_universal(dir);
   same_model(dir + "/tiny.flyx", dir + "/tiny_gguf.gguf");
   same_model(dir + "/tiny.flyx", dir + "/tiny_bf16.gguf");
   same_model(dir + "/tiny_explicit_hd.flyx", dir + "/tiny_explicit_hd.gguf");

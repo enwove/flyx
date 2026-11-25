@@ -685,6 +685,8 @@ bool read_gguf(std::vector<std::unique_ptr<os::MappedFile>>* maps, const std::st
         initial.meta.contains("split.count") ? int(integer(initial.meta.at("split.count"), "split.count", 0, 99999)) : 1;
     if (split_count <= 1) {
       if (initial.n_tensors == 0) invalid("invalid GGUF tensor/metadata counts");
+      if (need_tokenizer && initial.meta.value("general.architecture", "") == "dflash")
+        invalid("GGUF holds a drafter alone, not a model: give it beside the model (--drafter-file)");
       const std::string gtype = initial.meta.value("general.type", "model");
       if (gtype != "model" && (need_tokenizer || gtype != "mmproj"))
         invalid(gtype == "mmproj" ? "GGUF is a multimodal projector (pass beside a model with --mmproj)"
@@ -813,7 +815,8 @@ class HeaderReader {
 
 namespace flyx {
 
-int gguf_peek_mtp_layers(const std::string& path) {
+GgufPeek gguf_peek(const std::string& path) {
+  GgufPeek out;
   std::string target = path;
   modelfile::SplitPath sp;
   if (modelfile::parse_split_suffix(path, &sp) && sp.part != 1) target = modelfile::shard_path(sp, 0);
@@ -821,7 +824,7 @@ int gguf_peek_mtp_layers(const std::string& path) {
   char magic[4];
   uint32_t version = 0;
   if (!r.read(magic, 4) || std::memcmp(magic, "GGUF", 4) != 0 || !r.get(&version) || version < 1 || version > 3)
-    return -1;
+    return out;
   auto count = [&](uint64_t* n) {
     if (version > 1) return r.get(n);
     uint32_t v = 0;
@@ -839,43 +842,55 @@ int gguf_peek_mtp_layers(const std::string& path) {
   };
   static constexpr int kSize[] = {1, 1, 2, 2, 4, 4, 4, 1, 0, 0, 8, 8, 8};  // GGUF value types; 0: not fixed
   uint64_t tensors = 0, entries = 0;
-  if (!count(&tensors) || !count(&entries) || entries > (uint64_t(1) << 24)) return -1;
+  if (!count(&tensors) || !count(&entries) || entries > (uint64_t(1) << 24)) return out;
   std::string arch;
   std::map<std::string, int64_t> layers;  // keyed by architecture: the key may come before general.architecture
+  bool has_markov = false;
   for (uint64_t i = 0; i < entries; ++i) {
     std::string key;
     uint32_t type = 0;
-    if (!text(&key) || !r.get(&type) || type > 12) return -1;
+    if (!text(&key) || !r.get(&type) || type > 12) return out;
     if (type == 9) {  // array: element type, count, elements
       uint32_t of = 0;
       uint64_t n = 0;
-      if (!r.get(&of) || of > 12 || of == 9 || !count(&n)) return -1;
+      if (!r.get(&of) || of > 12 || of == 9 || !count(&n)) return out;
       if (of == 8) {
         for (uint64_t k = 0; k < n; ++k)
-          if (!text(nullptr)) return -1;
+          if (!text(nullptr)) return out;
       } else {
         const uint64_t es = uint64_t(kSize[of]);
-        if (!es || n > std::numeric_limits<uint64_t>::max() / es || !r.skip(n * es)) return -1;
+        if (!es || n > std::numeric_limits<uint64_t>::max() / es || !r.skip(n * es)) return out;
       }
       continue;
     }
     if (type == 8) {
-      if (!text(key == "general.architecture" ? &arch : nullptr)) return -1;
+      if (!text(key == "general.architecture" ? &arch : nullptr)) return out;
       continue;
     }
     int64_t v = 0;
     const int size = kSize[type];
     unsigned char raw[8] = {};
-    if (!r.read(raw, size_t(size))) return -1;
+    if (!r.read(raw, size_t(size))) return out;
     const bool is_signed = type == 1 || type == 3 || type == 5 || type == 11;
     for (int b = size - 1; b >= 0; --b) v = (v << 8) | raw[b];  // GGUF is little-endian
     if (is_signed && size < 8 && (raw[size - 1] & 0x80)) v -= int64_t(1) << (8 * size);
     static const std::string kKey = ".nextn_predict_layers";
     if (type != 6 && type != 12 && key.size() > kKey.size() && key.ends_with(kKey))
       layers[key.substr(0, key.size() - kKey.size())] = v;
+    else if (type == 7 && key == "dflash.has_markov_context")
+      has_markov = v != 0;
   }
+  out.valid = true;
+  out.arch = arch;
   const auto it = layers.find(arch);
-  return it == layers.end() || it->second < 0 ? 0 : int(std::min<int64_t>(it->second, 1 << 20));
+  out.mtp_layers = it == layers.end() || it->second < 0 ? 0 : int(std::min<int64_t>(it->second, 1 << 20));
+  out.has_markov_context = arch == "dflash" && has_markov;
+  return out;
+}
+
+int gguf_peek_mtp_layers(const std::string& path) {
+  const GgufPeek p = gguf_peek(path);
+  return p.valid ? p.mtp_layers : -1;
 }
 
 }  // namespace flyx

@@ -32,7 +32,8 @@ bool ModelFile::open(const std::string& path, std::string* err) {
   if (!read(&maps_, path, &c_, err, /*need_tokenizer=*/true)) return false;
   // The header is the file's word: a key of another type than expected is read as absent, never thrown on.
   const auto kind = c_.header.find("kind");
-  if (kind != c_.header.end() && kind->is_string() && kind->get_ref<const std::string&>() == "drafter")
+  if ((kind != c_.header.end() && kind->is_string() && kind->get_ref<const std::string&>() == "drafter") ||
+      c_.arch == "dflash")
     return *err = path + " holds a drafter alone, not a model: give it beside the model (--drafter-file)", false;
   if (c_.header.is_object()) c_.header.erase("companions");  // add() lists them; what a file put there is not one
   return true;

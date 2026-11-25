@@ -103,6 +103,27 @@ int main(int argc, char** argv) {
       check(f2.open(model, &err) && !f2.add(tmp.string(), &err) && err.find("nest") != std::string::npos,
             "deeply nested drafter config.json is rejected cleanly: " + err);
     }
+    // z-lab layout with a post-final-norm tap (target_layer_ids containing num_target_layers) keeps it at
+    // num_target_layers instead of turning it into num_target_layers + 1.
+    fs::remove_all(tmp, ec);
+    fs::copy(fs::path(dir) / "hf_draft_zlab", tmp, fs::copy_options::recursive, ec);
+    {
+      std::ifstream in(tmp / "config.json");
+      auto cfg = nlohmann::json::parse(in);
+      const int n_target = cfg.at("num_target_layers").get<int>();
+      cfg["dflash_config"]["target_layer_ids"] = {0, 2, n_target};
+      std::ofstream out(tmp / "config.json", std::ios::binary | std::ios::trunc);
+      out << cfg.dump();
+    }
+    {
+      flyx::ModelFile f3;
+      std::string err;
+      const bool ok = f3.open(model, &err) && f3.add(tmp.string(), &err);
+      const auto taps = ok ? f3.header()["companions"][0]["draft"]["taps"].get<std::vector<int>>() : std::vector<int>{};
+      const int n_target = ok ? f3.header()["companions"][0]["draft"]["target"]["layers"].get<int>() : -1;
+      check(ok && taps == std::vector<int>({1, 3, n_target}),
+            "target_layer_ids == num_target_layers stays unclamped at num_target_layers: " + err);
+    }
     fs::remove_all(tmp, ec);
   }
   std::printf("%s\n", failures ? "FAILED" : "all passed");
