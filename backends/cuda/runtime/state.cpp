@@ -1221,7 +1221,7 @@ void build_seq(flyx_bmodel* m, int32_t max_ctx, flyx_seq* s) {
     }
     if (s->arena_host_bytes > 0) {
       void* p = nullptr;
-      CK(cudaHostAlloc(&p, s->arena_host_bytes, cudaHostAllocDefault));
+      CK(cudaHostAlloc(&p, s->arena_host_bytes, cudaHostAllocMapped));
       std::memset(p, 0, s->arena_host_bytes);
       s->host_allocs.push_back(p);
       s->host_arena = static_cast<unsigned char*>(p);
@@ -1235,6 +1235,7 @@ void build_seq(flyx_bmodel* m, int32_t max_ctx, flyx_seq* s) {
   s->tree_host = s->pinned_alloc<TreeRows>(size_t(flyx_seq::kDraftSlots));
   s->stop_host = s->pinned_alloc<flyx_stop_policy>(size_t(flyx_seq::kDraftSlots));
   s->ring_host = s->pinned_alloc<flyx_round_result>(size_t(kRing));
+  if (!s->dry) CK(cudaHostGetDevicePointer(reinterpret_cast<void**>(&s->ring_host_dev), s->ring_host, 0));
   s->tok_host = s->pinned_alloc<int>(size_t(prefill_rows));
   s->P = s->alloc<DevParams>(1);
   s->G = s->alloc<DevGen>(1);

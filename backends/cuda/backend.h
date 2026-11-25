@@ -582,7 +582,8 @@ struct flyx_seq {
   int mask_words = 0;
   flyx::cuda::Reply reply{};                       // the reply's tokens as the penalties count them (set_reply, accept)
   flyx_round_result* ring_dev = nullptr;
-  flyx_round_result* ring_host = nullptr;  // pinned mirror
+  flyx_round_result* ring_host = nullptr;      // pinned mirror
+  flyx_round_result* ring_host_dev = nullptr;  // the mirror as kernels address it (mapped: ring_publish writes it)
   int* tok_host = nullptr;             // pinned staging for prefill tokens
   cudaEvent_t ev[flyx::cuda::kRing]{};
 
@@ -936,7 +937,8 @@ struct flyx_seq {
   void stage_text(const flyx::cuda::KvBuf& kb, cudaStream_t st);
   void create_stage_stream();
   std::vector<void*> host_allocs;
-  // Small pinned host staging (not counted in dry_host_bytes; freed with host_allocs).
+  // Small pinned host staging, mapped into the device's address space (a kernel writes the result ring there:
+  // ring_publish); not counted in dry_host_bytes; freed with host_allocs.
   template <class T>
   T* pinned_alloc(size_t n) {
     const size_t bytes = n * sizeof(T);
@@ -952,7 +954,7 @@ struct flyx_seq {
       return reinterpret_cast<T*>(p);  // zeroed once with the arena
     }
     void* p = nullptr;
-    CK(cudaMallocHost(&p, bytes));
+    CK(cudaHostAlloc(&p, bytes, cudaHostAllocMapped));
     host_allocs.push_back(p);
     return static_cast<T*>(p);
   }

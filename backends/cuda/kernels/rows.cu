@@ -431,4 +431,18 @@ void kv_drain_pageable(const PageDrainLayer* layers, int n_layers, const DevPara
   k_kv_drain_pageable<<<dim3(max_rows, n_layers), 128, 0, st>>>(layers, n_layers, P, ring_dev, max_rows);
 }
 
+namespace {
+__global__ void k_ring_publish(const uint32_t* __restrict__ src, uint32_t* dst, int words) {
+  for (int i = threadIdx.x; i < words; i += blockDim.x) dst[i] = src[i];
+  __threadfence_system();  // the host reads the mirror once the round's event has fired
+}
+}  // namespace
+
+void ring_publish(const flyx_round_result* ring, flyx_round_result* host, cudaStream_t st) {
+  static_assert(sizeof(flyx_round_result) % sizeof(uint32_t) == 0, "the ring is copied in 32-bit words");
+  constexpr int kWords = int(sizeof(flyx_round_result) * kRing / sizeof(uint32_t));
+  k_ring_publish<<<1, 256, 0, st>>>(reinterpret_cast<const uint32_t*>(ring), reinterpret_cast<uint32_t*>(host),
+                                    kWords);
+}
+
 }  // namespace flyx::cuda
