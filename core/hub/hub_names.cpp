@@ -230,12 +230,18 @@ bool mmproj_gguf_name(const std::string& path) {
   return false;
 }
 
+bool mtp_gguf_name(const std::string& path) {
+  const std::string p = detail::lower(path), base = detail::base_name(p);
+  if (!base.ends_with(".gguf") || base.find("imatrix") != std::string::npos) return false;
+  return base.starts_with("mtp-") || p.starts_with("mtp/") || p.find("/mtp/") != std::string::npos;
+}
+
 bool model_gguf_name(const std::string& path) {
   const std::string p = detail::lower(path), base = detail::base_name(p);
-  if (!base.ends_with(".gguf") || mmproj_gguf_name(path) ||
-      base.find("imatrix") != std::string::npos || base.starts_with("mtp-"))
+  if (!base.ends_with(".gguf") || mmproj_gguf_name(path) || mtp_gguf_name(path) ||
+      base.find("imatrix") != std::string::npos)
     return false;
-  return !p.starts_with("mtp/") && p.find("/mtp/") == std::string::npos;
+  return true;
 }
 
 bool parse_split_gguf_name(const std::string& path, SplitGguf* out) { return parse_split(path, out); }
@@ -307,6 +313,8 @@ std::vector<GgufChoice> gguf_choices(const Repo& r) {
 const RepoFile* mtp_file(const Repo& r) {
   for (const RepoFile& f : r.files)
     if (f.path.starts_with("MTP/") && detail::lower(f.path).ends_with(".gguf")) return &f;
+  for (const RepoFile& f : r.files)
+    if (mtp_gguf_name(f.path)) return &f;
   return nullptr;
 }
 
@@ -331,6 +339,25 @@ const RepoFile* mmproj_file(const Repo& r) {
     }
   }
   return best;
+}
+
+std::vector<CompanionFile> companion_files(const Repo& r) {
+  const RepoFile* def_mtp = mtp_file(r);
+  const RepoFile* def_mm = mmproj_file(r);
+  std::vector<CompanionFile> out;
+  for (const RepoFile& f : r.files) {
+    if (mtp_gguf_name(f.path))
+      out.push_back({f, "mtp", def_mtp && def_mtp->path == f.path});
+    else if (mmproj_gguf_name(f.path))
+      out.push_back({f, "mmproj", def_mm && def_mm->path == f.path});
+  }
+  auto order = [](const std::string& k) { return k == "mmproj" ? 1 : 0; };
+  std::sort(out.begin(), out.end(), [&](const CompanionFile& a, const CompanionFile& b) {
+    if (order(a.kind) != order(b.kind)) return order(a.kind) < order(b.kind);
+    if (a.is_default != b.is_default) return a.is_default > b.is_default;
+    return a.file.path < b.file.path;
+  });
+  return out;
 }
 
 bool select(const Repo& r, const Name& name, std::vector<RepoFile>* files, std::string* err) {
@@ -358,7 +385,24 @@ bool select(const Repo& r, const Name& name, std::vector<RepoFile>* files, std::
             (!pick || c.quant.size() < pick->quant.size()))
           pick = &c;
       }
-    if (!pick) return *err = r.id + " has no GGUF file for \"" + name.quant + "\"; it has:" + listing(), false;
+    if (!pick) {
+      // Also allow naming a companion file in the repository directly (e.g. org/repo:mmproj-BF16.gguf).
+      const std::vector<CompanionFile> comps = companion_files(r);
+      const CompanionFile* comp = nullptr;
+      for (const CompanionFile& c : comps)
+        if (detail::lower(c.file.path) == want) comp = &c;
+      if (!comp)
+        for (const CompanionFile& c : comps)
+          if (detail::lower(detail::base_name(c.file.path)) == want) {
+            comp = &c;
+            break;
+          }
+      if (comp) {
+        *files = {comp->file};
+        return true;
+      }
+      return *err = r.id + " has no GGUF file for \"" + name.quant + "\"; it has:" + listing(), false;
+    }
     if (pick->split && !pick->complete)
       return *err = r.id + ":" + pick->quant + " is an incomplete split GGUF (" + std::to_string(pick->parts.size()) +
                     " parts found)", false;

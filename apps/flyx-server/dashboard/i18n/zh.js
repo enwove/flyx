@@ -362,6 +362,8 @@ export default {
     "Max tokens / image": "单图最大 token 数",
     "Cap merged visual tokens per image (empty: auto).": "限制每张图合并后的视觉 token 上限（留空为自动）。",
     "mmproj": "视觉投影器", "+ Vision": "+ 视觉",
+    "Companion files": "配套文件",
+    "attached automatically or picked individually": "加载时自动附带，也可单独选用",
     "Use as projector": "用作视觉投影器",
     "A vision projector is not loaded on its own.": "视觉投影器不能单独加载。",
     "Attach image": "添加图片", "Remove": "移除", "[1 image attached]": "[已附 1 张图片]", "[Image]": "[图片]",

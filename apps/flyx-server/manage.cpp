@@ -277,6 +277,20 @@ ojson repo_json(const hub::Repo& r) {
   ojson mmproj = nullptr;
   if (const hub::RepoFile* f = hub::mmproj_file(r))
     mmproj = {{"path", f->path}, {"size", f->size}, {"cached", on_disk(snap + f->path)}};
+  ojson companions = ojson::array();
+  for (const hub::CompanionFile& c : hub::companion_files(r)) {
+    const std::string base = c.file.path.substr(c.file.path.rfind('/') + 1);
+    const bool cached = on_disk(snap + c.file.path);
+    const std::string disk = from_path((to_path(hub::snapshot_dir(r)) / to_path(c.file.path)).make_preferred());
+    companions.push_back({{"name", r.id + ":" + base},
+                          {"path", c.file.path},
+                          {"file", base},
+                          {"kind", c.kind},
+                          {"size", c.file.size},
+                          {"cached", cached},
+                          {"disk", cached ? ojson(disk) : ojson(nullptr)},
+                          {"default", c.is_default}});
+  }
   // A DFlash2 drafter's directory: config.json naming the architecture, and safetensors; no GGUF.
   uint64_t weights = 0;
   bool config = false;
@@ -304,6 +318,7 @@ ojson repo_json(const hub::Repo& r) {
           {"ggufs", ggufs},
           {"mtp", mtp},
           {"mmproj", mmproj},
+          {"companions", companions},
           {"drafter", ggufs.empty() && config && weights > 0 && hub::is_drafter(r) ? ojson({{"size", weights}}) : ojson(nullptr)},
           {"architectures", r.architectures},
           {"known_drafters", apps::known_drafters(r.base_models)},

@@ -608,6 +608,8 @@ export default {
     "Max tokens / image": "画像あたり最大 token 数",
     "Cap merged visual tokens per image (empty: auto).": "画像 1 枚あたりの統合後ビジョン token 数の上限（空欄で自動）。",
     "mmproj": "mmproj", "+ Vision": "+ ビジョン",
+    "Companion files": "付属ファイル",
+    "attached automatically or picked individually": "自動読み込み、または個別に選択可能",
     "Use as projector": "プロジェクタとして使用",
     "A vision projector is not loaded on its own.": "ビジョンプロジェクタ単独では読み込めません。",
     "Attach image": "画像を添付", "Remove": "削除", "[1 image attached]": "[画像 1 枚を添付]", "[Image]": "[画像]",

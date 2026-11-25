@@ -14,9 +14,12 @@ import { live, poll, busyLoad } from "../lib/telemetry.js";
 import { unloadServed, reloadServed, stopFetch } from "../lib/actions.js";
 import { VramApps, isVramError, parseVramNeeded } from "../components/vram_apps.js";
 
-// "org/name[:quant][@rev]", not a path: a relative path of two parts reads the same, but for its file's extension.
-const hubName = (v) => /^(https?:\/\/(hf\.co|huggingface\.co)\/)?[A-Za-z0-9._-]+\/[A-Za-z0-9._-]+(:[A-Za-z0-9._-]+)?(@[A-Za-z0-9._-]+)?$/.test(v.trim()) &&
-                      !/\.(gguf|flyx)$/i.test(v.trim());
+// "org/name[:quant|file][@rev]", not a path: a relative path of two parts reads the same unless it has ':' or lacks a model extension.
+const hubName = (v) => {
+  const s = v.trim();
+  if (!/^(https?:\/\/(hf\.co|huggingface\.co)\/)?[A-Za-z0-9._-]+\/[A-Za-z0-9._-]+(:[A-Za-z0-9._-]+)?(@[A-Za-z0-9._-]+)?$/.test(s)) return false;
+  return s.includes(":") || !/\.(gguf|flyx)$/i.test(s);
+};
 const repoOf = (v) => v.trim().replace(/^https?:\/\/(hf\.co|huggingface\.co)\//, "").split("@")[0].split(":")[0];
 const quantOf = (v) => { const m = /:([^@]+)/.exec(v); return m ? m[1] : null; };
 
@@ -406,7 +409,7 @@ export function ModelPage({ active, libraryAsked, currentAsked }) {
     setDirMsg("");
     setLoc(a.j.path);
     setPathText(a.j.path);
-    if (a.j.kind === "file" && a.j.models.length === 1 && a.j.models[0].kind !== "mmproj") setTarget(a.j.models[0].name);
+    if (a.j.kind === "file" && a.j.models.length === 1 && a.j.models[0].kind !== "mmproj" && a.j.models[0].kind !== "drafter") setTarget(a.j.models[0].name);
   }
   const kept = folders.some((x) => samePath(x, loc));
   const keep = () => setFolders(kept ? folders.filter((x) => !samePath(x, loc)) : [...folders, loc]);
@@ -719,7 +722,7 @@ export function ModelPage({ active, libraryAsked, currentAsked }) {
               <input type="radio" name="vs-src" aria-label=${t("Custom projector")} checked=${visCustom} disabled=${visOff}/>
               <div class="grow">
                 <div class="dhead"><b>${t("Custom projector")}</b>
-                  ${visCustom && mmOwn ? html`<span class="tag2">${t("file")}</span>` : ""}
+                  ${visCustom && mmOwn ? html`<span class="tag2">${t(hubName(mmOwn) ? "Hugging Face" : "file")}</span>` : ""}
                   <span class="was on">${was("mmproj") !== null ? t("was " + t(was("mmproj"))) : ""}</span></div>
                 <p class="ddesc">${t("Path to a companion mmproj-*.gguf file on the server's machine.")}</p>
                 <input type="text" id="vs-file" placeholder=${t("path to mmproj-*.gguf")} spellcheck="false" autocomplete="off" disabled=${visOff}
@@ -869,6 +872,18 @@ export function ModelPage({ active, libraryAsked, currentAsked }) {
       const m = entryOf(g.name);
       return { name: g.name, title: g.quant, sub: "", tags, size: g.size, off: !whole(g), del: m && m.source === "hub" ? m : null };
     }) : [];
+    const comps = j && Array.isArray(j.companions) ? j.companions : [
+      ...(j && j.mtp ? [{ name: repoSel + ":" + baseName(j.mtp.path), path: j.mtp.path, file: baseName(j.mtp.path),
+                          kind: "mtp", size: j.mtp.size, cached: !!j.mtp.cached, disk: null, default: true }] : []),
+      ...(j && j.mmproj ? [{ name: repoSel + ":" + baseName(j.mmproj.path), path: j.mmproj.path, file: baseName(j.mmproj.path),
+                             kind: "mmproj", size: j.mmproj.size, cached: !!j.mmproj.cached, disk: null, default: true }] : []),
+    ];
+    const selComp = comps.find((c) => c.name === target);
+    const compAction = selComp ? (selComp.kind === "mmproj"
+      ? { title: selComp.file, sub: selComp.cached ? sized(selComp.size) + " on disk" : sized(selComp.size) + " to download first",
+          label: "Use as projector", disabled: !model.id || busy, onClick: () => projectWith(selComp.disk || selComp.name) }
+      : { title: selComp.file, sub: selComp.cached ? sized(selComp.size) + " on disk" : sized(selComp.size) + " to download first",
+          label: "Draft with it", disabled: !model.id || busy, onClick: () => draftWith(selComp.disk || selComp.name) }) : null;
     const unsupported = j && j.runs === false;
     const note = unsupported ? "This build does not run this architecture." : j && !rows.length ? "Nothing here to load." : "";
     const chips = [];
@@ -878,6 +893,9 @@ export function ModelPage({ active, libraryAsked, currentAsked }) {
     if (info.context) chips.push([t("context") + " " + fmt(info.context), ""]);
     if (info.license) chips.push([info.license, ""]);
     if (info.gated) chips.push([t("gated"), "warn"]);
+    if (comps.some((c) => c.kind === "mmproj")) chips.push([t("+ Vision"), "ok"]);
+    if (comps.some((c) => c.kind === "dspark")) chips.push(["+ DSpark", "ok"]);
+    if (comps.some((c) => c.kind === "mtp")) chips.push(["+ MTP", "ok"]);
     const [org, short] = repoSel.split("/");
     return html`
       <div class="hub-scroll" id="hf-detail">
@@ -902,8 +920,30 @@ export function ModelPage({ active, libraryAsked, currentAsked }) {
         ${rows.length ? html`
           <div class="dsec">${t("Files")}<span>${t(rows.length + " quantizations")}</span></div>
           <div class="mrows" id="mf-files" role="listbox">${rowsView(rows)}</div>` : ""}
-        ${j && j.mtp ? html`<p class="lead dnote">${t("This repository keeps an MTP layer in " + j.mtp.path + " (" + gb(j.mtp.size) + " GB): it comes along for a file without its own.")}</p>` : ""}
-        ${j && j.mmproj ? html`<p class="lead dnote" id="hf-mmproj">${t("This repository includes a vision projector in " + j.mmproj.path + " (" + gb(j.mmproj.size) + " GB): it loads automatically unless vision is turned off.")}</p>` : ""}
+        ${comps.length ? html`
+          <div class="dsec">${t("Companion files")}<span>${t("attached automatically or picked individually")}</span></div>
+          <div class="mrows" id="hf-companions" role="listbox">${comps.map((c) => {
+            const isMm = c.kind === "mmproj", sel = target === c.name;
+            const kindTag = isMm ? ["mmproj", "info"] : c.kind === "dspark" ? ["DSpark", "ok"] : ["MTP", "ok"];
+            const sub = c.path && c.path !== c.file ? c.path : "";
+            return html`
+              <div class=${"mrow comp" + (sel ? " sel" : "")} data-comp=${c.name} data-kind=${c.kind} role="option" aria-selected=${String(sel)}
+                   onClick=${() => { setTarget(c.name); setMsg(""); }}>
+                <span class="radio"></span>
+                <div class="cmain">
+                  <${Icon} name=${isMm ? "image" : "bolt"} cls=${isMm ? "k-mmproj" : "k-drafter"}/>
+                  <div><div class="q">${c.file}</div>${sub ? html`<div class="fn">${sub}</div>` : ""}</div>
+                </div>
+                <div class="tags">
+                  <span class=${"tag2 " + kindTag[1]}>${t(kindTag[0])}</span>
+                  ${c.default ? html`<span class="tag2 ok">${t("auto")}</span>` : ""}
+                  ${c.cached ? html`<span class="tag2 info">${t("downloaded")}</span>` : ""}
+                </div>
+                <div class="sz">${c.size ? sized(c.size) : "-"}</div>
+                <div class="fit"></div>
+                <span></span>
+              </div>`;
+          })}</div>` : ""}
         ${j && j.drafter ? html`<div class="banner hint"><div class="grow2">${t(repoSel + " is a drafter (" + gb(j.drafter.size) + " GB), not a model: it drafts for one, and is not loaded on its own.")}</div>
           ${model.id ? html`<button class="btn sm" onClick=${() => draftWith(repoSel)}>${t("Draft with it")}</button>` : ""}</div>` : ""}
         ${j && !j.drafter && !rows.length ? html`<p class="lead">${t("No GGUF files in " + repoSel + ".")}</p>` : ""}
@@ -912,7 +952,7 @@ export function ModelPage({ active, libraryAsked, currentAsked }) {
             ${" "}<code>${j.known_drafters[0]}</code></div>
             ${model.id ? html`<button class="btn sm" onClick=${() => draftWith(j.known_drafters[0])}>${t("Add to settings")}</button>` : ""}</div>` : ""}
       </div>
-      ${loadBox(rows, note)}`;
+      ${loadBox(rows, note, compAction)}`;
   }
 
   // ---- this machine: folders in a list, the models of the one shown ----
@@ -1076,16 +1116,21 @@ export function ModelPage({ active, libraryAsked, currentAsked }) {
         ${loadBox(rows, rows.length ? "" : "Nothing here to load.")}`;
     }
     // Any other folder: the folders in it, the model files in it and under it.
-    const allModels = j ? j.models.filter((m) => m.kind !== "mmproj") : [];
+    const allModels = j ? j.models.filter((m) => m.kind !== "mmproj" && m.kind !== "drafter") : [];
     const rows = allModels.map((m) => {
       const r = localRow(m), rel = j.kind === "dir" && m.path.length > j.path.length ? m.path.slice(j.path.length).replace(/^[\\/]+/, "") : m.file;
       return Object.assign(r, { sub: r.title === rel ? "" : rel });
     }).filter((r) => hit(r.title + " " + r.sub));
     const folderMmproj = j ? j.models.filter((m) => m.kind === "mmproj" && hit(m.file + " " + (m.path || ""))) : [];
+    const folderDrafters = j ? j.models.filter((m) => m.kind === "drafter" && hit(m.file + " " + (m.path || ""))) : [];
     const singleMmproj = j && j.kind === "file" && folderMmproj.length === 1 ? folderMmproj[0] : null;
-    const mmAction = singleMmproj
+    const singleDrafter = j && j.kind === "file" && folderDrafters.length === 1 ? folderDrafters[0] : null;
+    const compAction = singleMmproj
       ? { title: singleMmproj.path || singleMmproj.name, sub: "A vision projector is not loaded on its own.",
           label: "Use as projector", disabled: !model.id || busy, onClick: () => projectWith(singleMmproj.path || singleMmproj.name) }
+      : singleDrafter
+      ? { title: singleDrafter.path || singleDrafter.name, sub: "A drafter is not loaded on its own.",
+          label: "Draft with it", disabled: !model.id || busy, onClick: () => draftWith(singleDrafter.path || singleDrafter.name) }
       : null;
     const loadNote = start ? "Open a folder to see its model files." : "";
     return html`
@@ -1099,12 +1144,14 @@ export function ModelPage({ active, libraryAsked, currentAsked }) {
         ${j && !start ? html`
           <div class="dsec">${t("Model files")}<span>${t(j.kind === "dir" ? "here and two folders down" : "")}</span></div>
           ${rows.length ? html`<div class="mrows" id="mf-cached" role="listbox">${rowsView(rows)}</div>`
-            : singleMmproj ? ""
+            : singleMmproj || singleDrafter ? ""
             : html`<div class="empty">${t(allModels.length ? "Nothing matches." : "No .gguf or .flyx model files here.")}</div>`}
+          ${folderDrafters.map((dr) => html`<div class="banner hint" style="margin-top: 10px"><div class="grow2">${t(dr.file + " is a drafter (" + gb(dr.size) + " GB), not a model: it drafts for one, and is not loaded on its own.")}</div>
+            ${!singleDrafter && model.id ? html`<button class="btn sm" onClick=${() => draftWith(dr.path || dr.name)}>${t("Draft with it")}</button>` : ""}</div>`)}
           ${folderMmproj.map((mm) => html`<div class="banner hint" style="margin-top: 10px"><div class="grow2">${t(mm.file + " is a vision projector (" + gb(mm.size) + " GB), not a standalone model: attach it to a compatible VLM.")}</div>
             ${!singleMmproj && model.id ? html`<button class="btn sm" onClick=${() => projectWith(mm.path || mm.name)}>${t("Use as projector")}</button>` : ""}</div>`)}` : ""}
       </div>
-      ${loadBox(rows, loadNote, mmAction)}`;
+      ${loadBox(rows, loadNote, compAction)}`;
   }
 
   const hubTab = tab === "hub";
@@ -1112,7 +1159,7 @@ export function ModelPage({ active, libraryAsked, currentAsked }) {
   const shownRows = hubTab ? (hub && hub.repo === repoSel ? (hub.j.ggufs || []).filter(whole).map((g) => g.name) : [])
                   : pickedModel ? [pickedModel.name]
                   : atCache ? local.filter((m) => m.source === "hub" && m.kind !== "drafter" && m.kind !== "mmproj").map((m) => m.name)
-                  : dir ? dir.models.filter((m) => m.kind !== "mmproj").map((m) => m.name) : [];
+                  : dir ? dir.models.filter((m) => m.kind !== "mmproj" && m.kind !== "drafter").map((m) => m.name) : [];
   const cmdModel = shownRows.includes(target) ? target : loadedWant ? loadedWant.model : L.remembered ? L.remembered.model : "";
   const again = L.remembered ? { model: L.remembered.model, load: () => loadModel(L.remembered.model, L.remembered) } : null;
   const retryWant = L.target

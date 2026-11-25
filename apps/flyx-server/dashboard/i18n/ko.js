@@ -608,6 +608,8 @@ export default {
     "Max tokens / image": "이미지당 최대 token",
     "Cap merged visual tokens per image (empty: auto).": "이미지당 병합된 비전 token 상한 (비워 두면 자동).",
     "mmproj": "mmproj", "+ Vision": "+ 비전",
+    "Companion files": "동반 파일",
+    "attached automatically or picked individually": "자동으로 첨부되거나 개별 선택 가능",
     "Use as projector": "프로젝터로 사용",
     "A vision projector is not loaded on its own.": "비전 프로젝터는 단독으로 로드할 수 없습니다.",
     "Attach image": "이미지 첨부", "Remove": "제거", "[1 image attached]": "[이미지 1개 첨부됨]", "[Image]": "[이미지]",

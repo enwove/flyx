@@ -608,6 +608,8 @@ export default {
     "Max tokens / image": "Max. Tokens / Bild",
     "Cap merged visual tokens per image (empty: auto).": "Obergrenze für zusammengefasste Bild-Tokens pro Bild (leer: Auto).",
     "mmproj": "mmproj", "+ Vision": "+ Vision",
+    "Companion files": "Begleitdateien",
+    "attached automatically or picked individually": "automatisch angehängt oder einzeln auswählbar",
     "Use as projector": "Als Projektor verwenden",
     "A vision projector is not loaded on its own.": "Ein Vision-Projektor wird nicht allein geladen.",
     "Attach image": "Bild anhängen", "Remove": "Entfernen", "[1 image attached]": "[1 Bild angehängt]", "[Image]": "[Bild]",

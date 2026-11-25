@@ -94,6 +94,14 @@ def repository(repo):
             "known_drafters": ["acme/Tiny-27B-DFlash2"] if runs else [], "build_architectures": ["qwen35", "qwen3"],
             "mtp": {"path": "MTP/mtp.gguf", "size": int(0.6 * GB), "cached": True} if runs else None,
             "mmproj": {"path": "mmproj-BF16.gguf", "size": int(0.9 * GB), "cached": True} if runs else None,
+            "companions": [
+                {"name": repo + ":mtp.gguf", "path": "MTP/mtp.gguf", "file": "mtp.gguf", "kind": "mtp",
+                 "size": int(0.6 * GB), "cached": True, "disk": None, "default": True},
+                {"name": repo + ":mmproj-BF16.gguf", "path": "mmproj-BF16.gguf", "file": "mmproj-BF16.gguf", "kind": "mmproj",
+                 "size": int(0.9 * GB), "cached": True, "disk": None, "default": True},
+                {"name": repo + ":mmproj-F16.gguf", "path": "mmproj-F16.gguf", "file": "mmproj-F16.gguf", "kind": "mmproj",
+                 "size": int(0.9 * GB), "cached": False, "disk": None, "default": False},
+            ] if runs else [],
             "info": {"downloads": 7383193, "likes": 6300, "updated": "2026-11-12T02:15:52.000Z", "license": "apache-2.0", "pipeline": None,
                      "gated": False, "architecture": "qwen35" if runs else "gemma4", "context": 262144, "parameters": 27320697856},
             "ggufs": [{"name": repo + ":" + q, "quant": q, "size": int(s * GB), "split": False, "parts": 1, "complete": True, "cached": c and runs}
@@ -410,9 +418,28 @@ def check_hub(page, server, want):
     page.locator('#hf-archs button[data-arch=""]').click()
     expect(page.locator("#hf-list .prow")).to_have_count(3)
     expect(page.locator("#hf-name")).to_have_text("Tiny-27B-GGUF")  # the first repository found is shown
+    expect(page.locator("#hf-detail .dchips")).to_contain_text("+ Vision")
+    expect(page.locator("#hf-detail .dchips")).to_contain_text("+ MTP")
     expect(page.locator("#mf-files .mrow")).to_have_count(5)
-    expect(page.locator("#hf-mmproj")).to_contain_text("mmproj-BF16.gguf")
+    expect(page.locator("#hf-companions .mrow")).to_have_count(3)
+    expect(page.locator('#hf-companions .mrow[data-kind="mtp"] svg use')).to_have_attribute("href", "#i-bolt")
+    expect(page.locator('#hf-companions .mrow[data-kind="mmproj"]').first.locator("svg use")).to_have_attribute("href", "#i-image")
     expect(page.locator("#mf-load")).to_be_disabled()
+    # Selecting a companion in Hugging Face detail turns the bottom-right CTA into Use as projector / Draft with it.
+    page.locator('#hf-companions .mrow[data-comp$=":mmproj-F16.gguf"]').click()
+    expect(page.locator("#mf-load")).to_have_text("Use as projector")
+    page.locator("#mf-load").click()
+    expect(page.locator("#mv-current")).to_be_visible()
+    expect(page.locator("#vs-file")).to_have_value(REPO + ":mmproj-F16.gguf")
+    expect(page.locator("#vs-custom .tag2")).to_have_text("Hugging Face")
+    page.locator("#mf-reset").click()
+    view(page, "library")
+    page.locator('#hf-companions .mrow[data-comp$=":mtp.gguf"]').click()
+    expect(page.locator("#mf-load")).to_have_text("Draft with it")
+    page.locator("#mf-load").click()
+    expect(page.locator("#sd-file")).to_have_value(REPO + ":mtp.gguf")
+    page.locator("#mf-reset").click()
+    view(page, "library")
     page.locator('#mf-files .mrow[data-name$=":Q5_K_M"]').click()
     expect(page.locator("#mf-load")).to_have_text("Switch to this model")
     expect(page.locator("#mf-chosen-s")).to_contain_text("19.4 GB to download first")

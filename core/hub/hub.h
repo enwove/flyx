@@ -90,6 +90,15 @@ std::vector<GgufChoice> gguf_choices(const Repo& r);
 bool model_gguf_name(const std::string& path);
 // Whether a GGUF at `path` ('/' between directories) is a vision projector (mmproj) file by name/directory.
 bool mmproj_gguf_name(const std::string& path);
+// Whether a GGUF at `path` ('/' between directories) is an MTP drafter file by name/directory.
+bool mtp_gguf_name(const std::string& path);
+// A companion GGUF in a repository (vision projector or drafter) listed alongside its main models.
+struct CompanionFile {
+  RepoFile file;
+  std::string kind;      // "mmproj" or "mtp"
+  bool is_default = false;
+};
+std::vector<CompanionFile> companion_files(const Repo& r);
 // Parsed shard suffix of a split GGUF ("<prefix>-00001-of-00003.gguf").
 struct SplitGguf {
   std::string prefix;  // path before "-00001-of-00003.gguf"

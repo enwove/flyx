@@ -164,6 +164,19 @@ void choices() {
   check(!flyx::hub::select(r, n, &files, &err) && err.find("several") != std::string::npos, "no quantization named: which?");
   check(flyx::hub::mtp_file(r) && flyx::hub::mtp_file(r)->path == "MTP/mtp-Qwen3.8-27B-Q4_0.gguf", "the MTP file");
   check(flyx::hub::mmproj_file(r) && flyx::hub::mmproj_file(r)->path == "mmproj-F16.gguf", "the mmproj file");
+  {
+    const auto comps = flyx::hub::companion_files(r);
+    check(comps.size() == 2 && comps[0].kind == "mtp" && comps[0].is_default &&
+              comps[0].file.path == "MTP/mtp-Qwen3.8-27B-Q4_0.gguf" && comps[1].kind == "mmproj" &&
+              comps[1].is_default && comps[1].file.path == "mmproj-F16.gguf",
+          "companion_files lists MTP and mmproj with default flags");
+    check(flyx::hub::select(r, {r.id, "mmproj-F16.gguf"}, &files, &err) && files.size() == 1 &&
+              files[0].path == "mmproj-F16.gguf",
+          "select resolves repo:mmproj-F16.gguf companion directly");
+    check(flyx::hub::select(r, {r.id, "mtp-Qwen3.8-27B-Q4_0.gguf"}, &files, &err) && files.size() == 1 &&
+              files[0].path == "MTP/mtp-Qwen3.8-27B-Q4_0.gguf",
+          "select resolves repo:mtp-*.gguf companion by basename");
+  }
   // mmproj_gguf_name edge cases (subfolders, imatrix, MTP, negative qualifiers) and precision ranking.
   check(flyx::hub::mmproj_gguf_name("mmproj-BF16.gguf") && flyx::hub::mmproj_gguf_name("mmproj/vision.gguf") &&
             flyx::hub::mmproj_gguf_name("qwen-mmproj-f16.gguf") &&
