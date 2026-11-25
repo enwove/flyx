@@ -289,8 +289,12 @@ bool Engine::build_and_calibrate_plans(double* t_plans, double* t_rounds, std::s
                              : std::min(plans_.widths[i], chain > 0 ? chain : plans_.widths[i]);
     }
   *t_plans = os::now_ms();
+  // The rounds are timed where this prompt ends, on the drafts that follow it.  Prose, not a count: after "1, 2, 3, 4,
+  // 5, 6," the drafts are digits and commas, and a sparse-MoE target routes a round of those few tokens to few experts,
+  // so its wide rounds timed cheap (Inkling-2-Mini: 2 -> 3 drafts +0.7 ms timed, +1.5 ms on chat prompts).
   std::vector<int32_t> prompt = tok_.encode("The quick brown fox jumps over the lazy dog. In the beginning was the word, and "
-                                            "the word was with the engine, and the engine was fast. 1, 2, 3, 4, 5, 6,");
+                                            "the word was with the engine, and the engine was fast. When the evening "
+                                            "came, the travellers");
   if (prompt.size() > 64) prompt.resize(64);
   std::vector<std::string> labels, given_labels;
   for (size_t i = 0; i < plans_.widths.size(); ++i) labels.push_back(round_name(i));
