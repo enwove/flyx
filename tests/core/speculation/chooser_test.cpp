@@ -676,16 +676,20 @@ int main() {
     rc.candidates({}, 0, &cands);
     const bool adaptive_first = !cands.empty() && cands.front().preferred && cands.front().choice.adaptive;
     const bool prefers_7 = cands.size() > 1 && !cands[1].choice.adaptive && cands[1].choice.width == 7;
-    check(adaptive_first && prefers_7 && cands.front().choice.width == 3 &&
-              std::fabs(cands.front().solo_ms - 10.1) < 1e-9,
+    const RoundCandidate* three = nullptr;  // the fixed candidate of 3, scored as its own plan
+    for (const RoundCandidate& c : cands)
+      if (!c.choice.adaptive && c.choice.width == 3) three = &c;
+    check(adaptive_first && prefers_7 && three && cands.front().choice.width == 3 &&
+              cands.front().expected_tokens == three->expected_tokens && cands.front().solo_ms == three->solo_ms,
           "a preferred 7 past adaptive checkpoints up to 3: the adaptive round, scored as the plan of 3");
-    ConfidenceStopper own, last;
-    own.configure({1, 3}, {10.0, 12.0}, 7.5);
-    last.configure({1, 3}, {10.0, 12.0}, 7.5);
-    own.observe(7, 7, nullptr, nullptr, 17.0);
-    last.observe(7, 7, nullptr, nullptr);
-    check(own.policy().lambda < last.policy().lambda,
-          "a fixed round of 7 past checkpoints up to 3 is credited at its own cost (17 ms), not the widest's (12 ms)");
+    // A fixed round of 7 accepted whole, through the chooser: lambda moves toward 8 tokens over 7's own cost.
+    const float lam0 = rc.stop_policy(0)->lambda;
+    const RoundChoice seven{false, 3, 7, 0, false};
+    rc.commit(seven, 0);
+    rc.result(seven, true, 7, std::vector<int32_t>(8, 1), 0, true);
+    const double want = 0.9 * double(lam0) + 0.1 * 8.0 / 10.2;
+    check(std::fabs(double(rc.stop_policy(0)->lambda) - want) < 1e-6,
+          "a fixed round of 7 past checkpoints up to 3 trains the stopper at its own cost (10.2 ms), not 3's (10.1)");
   }
 
     // ConfidenceStopper online calibration + RoundChooser adaptive candidate selection (solo adaptive, batched fixed).

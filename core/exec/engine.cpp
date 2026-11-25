@@ -321,7 +321,7 @@ bool Engine::build_and_calibrate_plans(double* t_plans, double* t_rounds, std::s
     // rows and 32 canvas rows a round of 31).  Its cost per token of context past the first.
     const int longer = restarting ? long_calibration(opt_.max_ctx, prefill_align_) : 0;
     if (longer > round_ms_at_) {
-      std::vector<int32_t> context;  // the prompt repeated, its last copy whole: the same drafts follow both timings
+      std::vector<int32_t> context;  // the prompt repeated, its last copy whole: both timings draft after its end
       while (static_cast<int>(context.size()) < longer) context.insert(context.begin(), prompt.begin(), prompt.end());
       context.erase(context.begin(), context.end() - longer);
       const std::string what = "round at " + std::to_string(longer) + " tokens";

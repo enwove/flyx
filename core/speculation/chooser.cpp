@@ -139,7 +139,7 @@ void RoundChooser::candidates(const std::vector<int32_t>& tokens, int in_flight,
   // An intra-round stopping plan (adaptive) for a model drafter's chains; never DV's, whose rounds are trees and its
   // warm-up, and whose canvas follows its own rounds (keeps_state).  A run widened past what the drafter's adaptive
   // round reaches keeps its fixed width.  (A width the controller prefers outright past it does not: on
-  // Inkling-2-Mini those fixed rounds cost DSpark 1 to 2% and DFlash2 up to 2.6% against the adaptive round.)
+  // Inkling-2-Mini, RTX 5070 Ti, those fixed rounds made DSpark's and DFlash2's rounds 0.5 to 2.6% slower; PR #22.)
   const bool past_adaptive = widened && pref_drafter >= 0 && size_t(pref_drafter) < stoppers_.size() &&
                              (*widths_)[pref] > stoppers_[size_t(pref_drafter)].max_width();
   const bool use_adaptive = adaptive_on_ && pref_drafter >= 0 && !spec_.is_tree(pref) && !spec_.keeps_state(pref) &&
@@ -253,12 +253,14 @@ void RoundChooser::result(const RoundChoice& round, bool emitted, int accepted, 
           }
       }
       spec_.observe(obs_index, accepted, trunk_accepted);  // the drafter's acceptance only
-      // A fixed round's tokens are credited at its own plan's cost: its width may lie past the stopper's checkpoints.
+      // A fixed round's tokens are credited at its own plan's cost, at the context it ran at (tokens holds its own
+      // already): its width may lie past the stopper's checkpoints.
       if (!spec_.is_tree(round.index) && round.drafter >= 0 && size_t(round.drafter) < stoppers_.size() &&
-          stoppers_[size_t(round.drafter)].ready())
+          stoppers_[size_t(round.drafter)].ready()) {
+        const int ran_at = std::max(0, static_cast<int>(tokens.size()) - (accepted + 1));
         stoppers_[size_t(round.drafter)].observe(eff_w, accepted, draft_prob, draft_margin,
-                                                 round.adaptive ? 0.0
-                                                                : spec_.cost(round.index, static_cast<int>(tokens.size())));
+                                                 round.adaptive ? 0.0 : spec_.cost(round.index, ran_at));
+      }
     }
     // The runs are a model drafter's chains (DFlash2's block): no tree's, and none of DV, whose canvas follows its
     // own rounds.
