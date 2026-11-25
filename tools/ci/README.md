@@ -9,4 +9,6 @@ The CPU tier runs in GitHub Actions via [`.github/workflows/ci.yml`](../../.gith
 
 Both scripts fail fast and store logs in `logs/ci/` (gitignored). The GPU tier writes benchmark output to `logs/ci/bench.txt`.
 
+The tests' fixtures (`make_assets`: `tests/e2e/make_tiny.py`) are most of the CPU tier's time when they have to be made. They are made again only when what they are made from changed (the Python reference, the converter, the chat templates, the versions of the packages that build them: the digest in `<build>/assets/.inputs`), and the hosted workflow keeps that directory in a cache named by the same digest (`python tests/e2e/make_tiny.py --digest`), so a change that touches none of those restores them instead.
+
 Requirements: CMake ≥ 3.24, Ninja, Python 3.11+ with `torch`, `transformers`, `tokenizers`, `safetensors`, `gguf`; for `gpu`, CUDA 13 (`nvcc`) and converted models under `$MODELS` (provisioned by `tools/quickstart.sh`).
