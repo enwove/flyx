@@ -10,6 +10,7 @@
 #include <memory>
 #include <set>
 
+#include "core/interfaces/model.h"
 #include "core/interfaces/options.h"
 #include "core/modelfile/modelfile.h"
 #include "core/os/env.h"
@@ -226,6 +227,12 @@ std::string drafter_kind(const std::string& path) {
   return "dflash2";
 }
 
+bool supports_vision_arch(const std::string& arch) {
+  if (arch.empty()) return true;
+  const std::vector<std::string> vis = interfaces::vision_architectures();
+  return std::find(vis.begin(), vis.end(), arch) != vis.end();
+}
+
 }  // namespace
 
 std::string model_name_of(const std::string& path, bool local) {
@@ -288,12 +295,16 @@ bool fetch_model(const std::string& model, const std::vector<std::string>& draft
   if (repo.id.empty()) return true;  // a path: nothing more to know
   if (want_vision && out->mmproj.empty()) {
     if (const hub::RepoFile* mm = hub::mmproj_file(repo)) {
-      std::vector<std::string> paths;
-      if (!hub::fetch(repo, {*mm}, &paths, progress, stop, err)) return false;
-      out->mmproj = paths[0];
-      out->mmproj_source = repo.id + "/" + mm->path;
-      out->mmproj_size = mm->size;
-      out->notes.push_back("the vision projector from " + repo.id + "/" + mm->path);
+      const flyx::GgufPeek pk = flyx::gguf_peek(out->model);
+      const std::string arch = pk.valid && !pk.arch.empty() ? pk.arch : repo.info.gguf_architecture;
+      if (supports_vision_arch(arch)) {
+        std::vector<std::string> paths;
+        if (!hub::fetch(repo, {*mm}, &paths, progress, stop, err)) return false;
+        out->mmproj = paths[0];
+        out->mmproj_source = repo.id + "/" + mm->path;
+        out->mmproj_size = mm->size;
+        out->notes.push_back("the vision projector from " + repo.id + "/" + mm->path);
+      }
     }
   }
   // unsloth keeps the MTP layer of GGUFs made without it in MTP/.

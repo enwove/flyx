@@ -1204,6 +1204,22 @@ int main(int argc, char** argv) {
           "cpu_ref DFlash2 HF dir greedy == cpu_ref plain");
     check(same_tokens(fresh_gen(*ref_both, prompt, 24, false), ref_greedy),
           "cpu_ref DSpark + DFlash2 (--drafter all) greedy == cpu_ref plain");
+    {
+      const auto clip_gguf = dir / "mmproj-BF16.gguf";
+      GgufWriter cw;
+      cw.add_str("general.architecture", "clip");
+      cw.add_tensor("v.dummy", {4}, kGgmlF32, std::vector<uint8_t>(16, 0));
+      cw.write(clip_gguf);
+      EngineOptions clip_opts{};
+      clip_opts.backend = "cpu_ref";
+      clip_opts.mmproj_file = clip_gguf.string();
+      Engine clip_eng;
+      std::string clip_err;
+      const bool ok = clip_eng.load(bf16_gguf.string(), clip_opts, &clip_err);
+      check(!ok && clip_err.find("vision projector") != std::string::npos &&
+                clip_err.find("drafter file") == std::string::npos,
+            "inkling2_loop refuses --mmproj clip companion with a vision projector message (" + clip_err + ")");
+    }
 
     // A prompt asked again, its conversation ending where the prompt does (the real template opens a reply with
     // nothing of its own): the session kept the state its last prefill pass started from, and runs that pass again.

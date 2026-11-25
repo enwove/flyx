@@ -272,9 +272,15 @@ bool Inkling2::build(const ModelFile& file, const ModelOptions& o, std::string* 
 
   std::vector<int> unclaimed;
   drafters_reg_.scan(file, target, nullptr, /*has_dv=*/false, &unclaimed);
-  if (!unclaimed.empty())
-    throw std::runtime_error("drafter file " + std::to_string(unclaimed[0] + 1) +
-                             ": inkling2_loop takes only DSpark or DFlash2 companion drafters");
+  if (!unclaimed.empty()) {
+    const int i = unclaimed.front();
+    const json& ch = file.header().at("companions").at(size_t(i));
+    if (ch.is_object() && ch.value("arch", "") == "clip")
+      return *err = "an inkling2_loop model does not support a vision projector (--mmproj)", false;
+    return *err = "companion file " + std::to_string(i + 1) +
+                  ": inkling2_loop takes only DSpark or DFlash2 companion drafters",
+           false;
+  }
 
   trained_ctx_ = c.trained_ctx;
   // Every row of a sparse MoE reads its own experts' weights, so verifying more drafts costs nearly in proportion:

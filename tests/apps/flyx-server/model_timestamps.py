@@ -101,6 +101,31 @@ def check_listing(url, file):
     assert ds_row["kind"] == "drafter" and ds_row["drafter_kind"] == "dspark", ds_row
     assert loc_row["kind"] == "drafter" and loc_row["drafter_kind"] == "dflash2", loc_row
 
+    # Cached Hub repos with an mmproj file: vision-capable arch (qwen35) advertises mmproj; non-vision arch
+    # (inkling2_loop) suppresses mmproj in both /v1/hub/cached and /v1/hub/files.
+    for repo_dir, fname, arch in (
+        ("models--acme--Mini-Qwen35-GGUF", "Mini-Qwen35-Q4_K_M.gguf", "qwen35"),
+        ("models--acme--Mini-Inkling2-GGUF", "Mini-Inkling2-Q4_K_M.gguf", "inkling2_loop"),
+    ):
+        rdir = root / "hub" / repo_dir
+        (rdir / "refs").mkdir(parents=True, exist_ok=True)
+        (rdir / "refs" / "main").write_text(commit, encoding="ascii")
+        sdir = rdir / "snapshots" / commit
+        sdir.mkdir(parents=True, exist_ok=True)
+        (sdir / fname).write_bytes(gguf(0, arch=arch))
+        (sdir / "mmproj-BF16.gguf").write_bytes(gguf(0, arch="clip"))
+    with urlopen(url + "/v1/hub/cached", timeout=5) as response:
+        by_key4 = {(m["source"], m["file"]): m for m in json.load(response)["models"]}
+    assert by_key4[("hub", "Mini-Qwen35-Q4_K_M.gguf")]["mmproj"] == "in-repo", by_key4[("hub", "Mini-Qwen35-Q4_K_M.gguf")]
+    assert by_key4[("hub", "Mini-Inkling2-Q4_K_M.gguf")]["mmproj"] is None, by_key4[("hub", "Mini-Inkling2-Q4_K_M.gguf")]
+    with urlopen(url + "/v1/hub/files?repo=acme/Mini-Qwen35-GGUF", timeout=5) as response:
+        q_repo = json.load(response)
+    assert q_repo["mmproj"] is not None and any(c["kind"] == "mmproj" for c in q_repo["companions"]), q_repo
+    with urlopen(url + "/v1/hub/files?repo=acme/Mini-Inkling2-GGUF", timeout=5) as response:
+        i_repo = json.load(response)
+    assert i_repo["mmproj"] is None and not any(c["kind"] == "mmproj" for c in i_repo["companions"]), i_repo
+
+
 
 if __name__ == "__main__":
     exe, asset = (Path(arg).resolve() for arg in sys.argv[1:])

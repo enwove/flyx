@@ -361,15 +361,16 @@ bool reads_required(const ModelFile& file, const std::vector<std::string>& reads
 struct ArchEntry {
   const char* name;
   std::unique_ptr<Model> (*open)(const ModelFile&, const ModelOptions&, std::string*);
-  bool gguf;  // its GGUF files read too (a Llama's are not: llama.cpp's converter permutes its q and k rows)
+  bool gguf;    // its GGUF files read too (a Llama's are not: llama.cpp's converter permutes its q and k rows)
+  bool vision;  // its build opens a vision projector (--mmproj)
   const char* reads;  // a part a file may require (format 2's "requires") that the model reads, or null
 };
 
 constexpr ArchEntry kArchitectures[] = {
-    {"qwen35", qwen35::open, true, nullptr},
-    {"qwen3", llama::open, true, "lora"},  // Llama's layer with q/k norms; their own adapters (a V-LoRA)
-    {"llama", llama::open, false, "lora"},
-    {"inkling2_loop", inkling2::open, true, nullptr},
+    {"qwen35", qwen35::open, true, true, nullptr},
+    {"qwen3", llama::open, true, false, "lora"},  // Llama's layer with q/k norms; their own adapters (a V-LoRA)
+    {"llama", llama::open, false, false, "lora"},
+    {"inkling2_loop", inkling2::open, true, false, nullptr},
 };
 
 }  // namespace
@@ -415,6 +416,13 @@ std::vector<std::string> architectures() {
   return names;
 }
 
+std::vector<std::string> vision_architectures() {
+  std::vector<std::string> names;
+  for (const ArchEntry& entry : kArchitectures)
+    if (entry.vision) names.emplace_back(entry.name);
+  return names;
+}
+
 }  // namespace flyx::models
 
 namespace flyx::interfaces {
@@ -424,5 +432,6 @@ std::unique_ptr<Model> open_model(const ModelFile& file, const ModelOptions& o, 
 }
 
 std::vector<std::string> model_architectures() { return models::architectures(); }
+std::vector<std::string> vision_architectures() { return models::vision_architectures(); }
 
 }  // namespace flyx::interfaces
