@@ -176,6 +176,49 @@ void test_inkling2_loop_ctrl() {
   Vec got_ip = down(d_cur, size_t(R) * H);
   expect_bits("loop_ctrl_apply in-place", got_ip, got);
 
+  // loop_ctrl_apply_norm: bit-identical to loop_ctrl_apply + rmsnorm (including H > 5120 tail loop) & matches f64.
+  for (int Hn : {256, 2560, 5200}) {
+    const int Rn = Hn == 256 ? 17 : 5;
+    seed("inkling2_loop_apply_norm", Rn, Hn);
+    Vec c = randv(size_t(Rn) * Hn, 1.0);
+    Vec m = randv(size_t(Rn) * Hn, 1.0);
+    Vec gf = randv(size_t(Rn) * 2 * Hn, 0.8);
+    Vec nw = randv(Hn, 0.5);
+    const float off = 1.f, eps = 1e-6f;
+    float* dc = up(c);
+    float* dm = up(m);
+    float* dgf = up(gf);
+    float* dnw = up(nw);
+    float* dtmp = dev<float>(size_t(Rn) * Hn);
+    float* dref = dev<float>(size_t(Rn) * Hn);
+    float* dfused = dev<float>(size_t(Rn) * Hn);
+    loop_ctrl_apply(dc, dm, dgf, 2 * Hn, dgf + Hn, 2 * Hn, Rn, Hn, dtmp, 0);
+    rmsnorm(dtmp, Hn, dnw, off, eps, dref, Hn, Rn, Hn, 0);
+    loop_ctrl_apply_norm(dc, dm, dgf, 2 * Hn, dgf + Hn, 2 * Hn, dnw, off, eps, Rn, Hn, dfused, Hn, 0);
+    Vec g_fused = down(dfused, size_t(Rn) * Hn);
+    Vec g_ref = down(dref, size_t(Rn) * Hn);
+    expect_bits("loop_ctrl_apply_norm == apply+rmsnorm H=" + std::to_string(Hn), g_fused, g_ref);
+    Vec w_f64(size_t(Rn) * Hn);
+    for (int r = 0; r < Rn; ++r) {
+      Vec row(Hn);
+      for (int i = 0; i < Hn; ++i) {
+        const double cv = c[size_t(r) * Hn + i], mv = m[size_t(r) * Hn + i];
+        const double gn = std::tanh(gf[size_t(r) * 2 * Hn + i]);
+        const double fg = std::tanh(gf[size_t(r) * 2 * Hn + Hn + i]);
+        row[i] = cv - fg * cv + gn * mv;
+      }
+      ops::rmsnorm(row.data(), nw.data(), Hn, double(eps), double(off), &w_f64[size_t(r) * Hn]);
+    }
+    expect("loop_ctrl_apply_norm f64 H=" + std::to_string(Hn), g_fused, w_f64, 2e-5);
+    cudaFree(dc);
+    cudaFree(dm);
+    cudaFree(dgf);
+    cudaFree(dnw);
+    cudaFree(dtmp);
+    cudaFree(dref);
+    cudaFree(dfused);
+  }
+
   cudaFree(d_cur);
   cudaFree(d_msg);
   cudaFree(d_wd);

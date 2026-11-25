@@ -680,6 +680,21 @@ void apply_loop_ctrl(const float* cur, const float* msg, int rows, int H, int ra
   loop_ctrl_apply(cur, msg, ctrl_gf, 2 * H, ctrl_gf + H, 2 * H, rows, H, out, st);
 }
 
+void apply_loop_ctrl_norm(const float* cur, const float* msg, int rows, int H, int rank, const LoopWeights& w,
+                          const Norm& n, float* ctrl_cat, float* ctrl_gate, float* ctrl_gf, float* y, int ldy,
+                          const Launch& L) {
+  cudaStream_t st = L.st;
+  loop_ctrl_prep(cur, msg, rows, H, ctrl_cat, st);
+  gemm(ctrl_cat, 2 * H, w.down, rank, 2 * H, ctrl_gate, rank, rows, false, L);
+  if (w.stacked) {
+    gemm(ctrl_gate, rank, w.gain_forget, 2 * H, rank, ctrl_gf, 2 * H, rows, false, L);
+  } else {
+    gemm(ctrl_gate, rank, w.gain, H, rank, ctrl_gf, 2 * H, rows, false, L);
+    gemm(ctrl_gate, rank, w.forget, H, rank, ctrl_gf + H, 2 * H, rows, false, L);
+  }
+  loop_ctrl_apply_norm(cur, msg, ctrl_gf, 2 * H, ctrl_gf + H, 2 * H, n.w, n.offset, n.eps, rows, H, y, ldy, st);
+}
+
 void rel_attn_windows(const Pass& ps, const RelAttnBlock& a, const KvBuf& kb, int windows, float* out, int ld_out) {
   const RowView& rv = ps.v;
   auto* s = ps.s;
@@ -725,6 +740,7 @@ void rel_attn_layer(const Pass& ps, const RelAttnBlock& a, bool fused) {
   if (a.loop_msg_query)
     attn_res_mix(rv.b.loop_bank, ps.res->loop_n, rv.b.loop_bank_out, a.loop_msg_query, 4, R, H, rv.b.loop_msg, st);
 
+  bool q_normed = false;
   const float* in_raw[3] = {rv.b.x, rv.b.x, rv.b.x};
   if (a.res_query) {
     const int nq = is_swa ? 1 : 3;
@@ -747,11 +763,17 @@ void rel_attn_layer(const Pass& ps, const RelAttnBlock& a, bool fused) {
   } else if (a.loop_rank > 0) {
     // Reverse order so when is_swa shares in_raw[0..2] == attn_in, j=2,1 read attn_in before j=0 overwrites it.
     for (int j = 2; j >= 0; --j) {
-      float* dst = rv.b.attn_in + size_t(j) * R * H;
       const float* msg = rv.b.loop_msg + size_t(j) * R * H;
-      apply_loop_ctrl(in_raw[j], msg, R, H, a.loop_rank, a.loop_ctrl[j], rv.b.ctrl_cat, rv.b.ctrl_gate, rv.b.ctrl_gf,
-                      dst, L);
-      in_raw[j] = dst;
+      if (j == 0 && fused) {
+        apply_loop_ctrl_norm(in_raw[0], msg, R, H, a.loop_rank, a.loop_ctrl[0], a.q_norm_in, rv.b.ctrl_cat,
+                             rv.b.ctrl_gate, rv.b.ctrl_gf, rv.b.h, H, L);
+        q_normed = true;
+      } else {
+        float* dst = rv.b.attn_in + size_t(j) * R * H;
+        apply_loop_ctrl(in_raw[j], msg, R, H, a.loop_rank, a.loop_ctrl[j], rv.b.ctrl_cat, rv.b.ctrl_gate, rv.b.ctrl_gf,
+                        dst, L);
+        in_raw[j] = dst;
+      }
     }
   }
 
@@ -776,7 +798,17 @@ void rel_attn_layer(const Pass& ps, const RelAttnBlock& a, bool fused) {
   };
 
   bool q_staged = false;
-  if (a.stacked_qgr) {
+  if (q_normed) {
+    if (a.stacked_qgr) {
+      gemm(rv.b.h, H, a.w_qgr, 2 * q_dim + nh * dr, H, rv.b.proj, rv.ld_proj, R, false, L);
+      gemm(rv.b.h, H, a.w_sink, nh, H, rv.b.sink, nh, R, false, L);
+    } else {
+      gemm(rv.b.h, H, a.w_q, q_dim, H, rv.b.proj, rv.ld_proj, R, false, L);
+      gemm(rv.b.h, H, a.w_gate, q_dim, H, rv.b.proj + q_dim, rv.ld_proj, R, false, L);
+      gemm(rv.b.h, H, a.w_rel, nh * dr, H, rv.b.proj + 2 * q_dim, rv.ld_proj, R, false, L);
+      gemm(rv.b.h, H, a.w_sink, nh, H, rv.b.sink, nh, R, false, L);
+    }
+  } else if (a.stacked_qgr) {
     q_staged = project_pair(in_raw[0], a.q_norm_in, a.w_qgr, 2 * q_dim + nh * dr, rv.b.proj, rv.ld_proj,
                             a.w_sink, nh, rv.b.sink);
   } else {
@@ -919,6 +951,7 @@ void moe_layer(const Pass& ps, const MoeBlock& f, bool fused) {
   cudaStream_t st = rv.L.st;
   const Launch& L = rv.L;
 
+  bool norm_done = false;
   const float* cur = rv.b.x;
   if (f.res_query) {
     attn_res_mix(rv.b.res_bank, ps.res->res_n, rv.b.x, f.res_query, 1, R, H, rv.b.attn_in, st);
@@ -929,11 +962,16 @@ void moe_layer(const Pass& ps, const MoeBlock& f, bool fused) {
     if (loop_as_round(ps)) {
       const LoopGate gate = loop_gate(f.loop_ctrl, cur, msg, rv.b.attn_in);
       loop_control(&gate, 1, R, H, f.loop_rank, rv.b.ctrl_scratch, st);
+      cur = rv.b.attn_in;
+    } else if (fused) {
+      apply_loop_ctrl_norm(cur, msg, R, H, f.loop_rank, f.loop_ctrl, f.norm, rv.b.ctrl_cat, rv.b.ctrl_gate,
+                           rv.b.ctrl_gf, rv.b.h, H, L);
+      norm_done = true;
     } else {
       apply_loop_ctrl(cur, msg, R, H, f.loop_rank, f.loop_ctrl, rv.b.ctrl_cat, rv.b.ctrl_gate, rv.b.ctrl_gf,
                       rv.b.attn_in, L);
+      cur = rv.b.attn_in;
     }
-    cur = rv.b.attn_in;
   }
 
   // A fused round's kernels write what the next one reads, where the generic layer stages it from float32 rows in
@@ -941,10 +979,12 @@ void moe_layer(const Pass& ps, const MoeBlock& f, bool fused) {
   // the down GEMM's bf16 rows (in moe_act: the scratch's own bf16 rows lie over the 8-bit ones it is reading).
   const MoeScratch* msc = rv.b.moe_sc.pairs ? &rv.b.moe_sc : nullptr;
   const bool round_q8 = fused && ps.round && moe_round_q8(f.gate_up, R, K, H, msc);
-  if (round_q8)
-    rmsnorm_moe_q8(cur, H, f.norm.w, f.norm.offset, f.norm.eps, rv.b.h, H, R, H, *msc, moe_q8_mins(f.gate_up), st);
-  else
-    rmsnorm(cur, H, f.norm.w, f.norm.offset, f.norm.eps, rv.b.h, H, R, H, st);
+  if (!norm_done) {
+    if (round_q8)
+      rmsnorm_moe_q8(cur, H, f.norm.w, f.norm.offset, f.norm.eps, rv.b.h, H, R, H, *msc, moe_q8_mins(f.gate_up), st);
+    else
+      rmsnorm(cur, H, f.norm.w, f.norm.offset, f.norm.eps, rv.b.h, H, R, H, st);
+  }
   gemm(rv.b.h, H, f.router, E, H, rv.b.proj, E, R, false, L);
   moe_route(rv.b.proj, f.router_bias, R, E, K, f.gating_sigmoid, f.norm_weights, f.norm_eps, f.route_scale,
             rv.b.moe_idx, rv.b.moe_w, st);

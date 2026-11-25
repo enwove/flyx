@@ -1530,9 +1530,13 @@ void attn_res_mix(const float* bank, int n_blocks, const float* cur, const float
 // Cross-pass loop gate controller prep and apply (ops/attnres/ref.h):
 //   prep:  cat_out [rows, 2*H] = [rmsnorm(cur, 1e-6) | rmsnorm(msg, 1e-6)]
 //   apply: out [rows, H] = cur - tanh(forget) * cur + tanh(gain) * msg  (out may alias cur)
+//   apply_norm: fused prefill apply + downstream rmsnorm -> y (exact k_rmsnorm 512-thread sum order)
 void loop_ctrl_prep(const float* cur, const float* msg, int rows, int H, float* cat_out, cudaStream_t st);
 void loop_ctrl_apply(const float* cur, const float* msg, const float* gain, int ld_gain, const float* forget,
                      int ld_forget, int rows, int H, float* out, cudaStream_t st);
+void loop_ctrl_apply_norm(const float* cur, const float* msg, const float* gain, int ld_gain, const float* forget,
+                          int ld_forget, const float* norm_w, float norm_offset, float norm_eps, int rows, int H,
+                          float* y, int ldy, cudaStream_t st);
 // A row-major matrix for a float32 dot product. Exactly one pointer is set on a bound weight.
 // b16 holds the high words when every float32 value in the matrix has a zero low word.
 struct RoundWeight {

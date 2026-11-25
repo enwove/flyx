@@ -110,7 +110,18 @@ __global__ void __launch_bounds__(256) k_attn_res_mix(const float* __restrict__ 
   }
 }
 
-// ---- loop_ctrl_prep & loop_ctrl_apply -----------------------------------------------------
+// Exact block_sum order for 512-thread (16-warp) blocks in a single barrier (matches rows.cu::block512_sum).
+__device__ __forceinline__ float block512_sum(float v) {
+  __shared__ float sh[16];
+  const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
+  v = warp_sum(v);
+  if (lane == 0) sh[warp] = v;
+  __syncthreads();
+  const float t = lane < 16 ? sh[lane] : 0.f;
+  return warp_sum(t);
+}
+
+// ---- loop_ctrl_prep, loop_ctrl_apply & loop_ctrl_apply_norm --------------------------------
 __global__ void __launch_bounds__(512) k_loop_ctrl_prep(const float* __restrict__ cur, const float* __restrict__ msg,
                                                         int H, float* __restrict__ cat_out) {
   pdl_trigger();
@@ -122,7 +133,7 @@ __global__ void __launch_bounds__(512) k_loop_ctrl_prep(const float* __restrict_
     const float v = src[i];
     ss = __fmaf_rn(v, v, ss);
   }
-  const float inv = rsqrtf(block_sum(ss) / float(H) + 1e-6f);
+  const float inv = rsqrtf(block512_sum(ss) / float(H) + 1e-6f);
   for (int i = tid; i < H; i += 512) dst[i] = src[i] * inv;
 }
 
@@ -138,19 +149,78 @@ __global__ void k_loop_ctrl_apply(const float* __restrict__ cur, const float* __
   const float m = msg[at];
   const float gn = tanhf(gain[size_t(r) * ld_gain + i]);
   const float fg = tanhf(forget[size_t(r) * ld_forget + i]);
-  out[at] = c - fg * c + gn * m;
+  out[at] = __fmaf_rn(gn, m, __fmaf_rn(-fg, c, c));
+}
+
+constexpr int kLoopNormCache = 10;
+
+__global__ void __launch_bounds__(512, 2)
+    k_loop_ctrl_apply_norm(const float* __restrict__ cur, const float* __restrict__ msg, const float* __restrict__ gain,
+                           int ld_gain, const float* __restrict__ forget, int ld_forget,
+                           const float* __restrict__ norm_w, float norm_offset, float norm_eps, int H,
+                           float* __restrict__ y, int ldy) {
+  pdl_trigger();
+  const int r = blockIdx.x, tid = threadIdx.x;
+  const float* cr = cur + size_t(r) * H;
+  const float* mr = msg + size_t(r) * H;
+  const float* gr = gain + size_t(r) * ld_gain;
+  const float* fr = forget + size_t(r) * ld_forget;
+  float* yr = y + size_t(r) * ldy;
+  float xv[kLoopNormCache], wv[kLoopNormCache];
+  float ss = 0.f;
+#pragma unroll
+  for (int u = 0; u < kLoopNormCache; ++u) {
+    const int i = tid + u * 512;
+    if (i < H) {
+      const float c = cr[i], m = mr[i];
+      const float gn = tanhf(gr[i]), fg = tanhf(fr[i]);
+      const float v = __fmaf_rn(gn, m, __fmaf_rn(-fg, c, c));
+      xv[u] = v;
+      wv[u] = norm_w[i];
+      ss = __fmaf_rn(v, v, ss);
+    }
+  }
+  for (int i = tid + kLoopNormCache * 512; i < H; i += 512) {
+    const float c = cr[i], m = mr[i];
+    const float gn = tanhf(gr[i]), fg = tanhf(fr[i]);
+    const float v = __fmaf_rn(gn, m, __fmaf_rn(-fg, c, c));
+    ss = __fmaf_rn(v, v, ss);
+  }
+  const float inv = rsqrtf(block512_sum(ss) / float(H) + norm_eps);
+#pragma unroll
+  for (int u = 0; u < kLoopNormCache; ++u) {
+    const int i = tid + u * 512;
+    if (i < H) yr[i] = (xv[u] * inv) * (norm_offset + wv[u]);
+  }
+  for (int i = tid + kLoopNormCache * 512; i < H; i += 512) {
+    const float c = cr[i], m = mr[i];
+    const float gn = tanhf(gr[i]), fg = tanhf(fr[i]);
+    const float v = __fmaf_rn(gn, m, __fmaf_rn(-fg, c, c));
+    yr[i] = (v * inv) * (norm_offset + norm_w[i]);
+  }
 }
 
 // ---- loop_control & linear_f32: the controllers and the control projections as rounds run them -------------
 // The weights are read cold from device memory each time (a token passes gigabytes of weights between two uses).
 // A matrix with exact bf16 values needs only its high words. Many small blocks each read their share at once.
-// A block takes NR rows (1, 2, 4 or 8: a template, since rows counted at run time in the inner loops made a one-row
-// launch five times as long) and reads the weights once for those rows. Rows past the last repeat it and are not written.
+// A block takes NR rows (1, 2 or 4: a template, avoiding NR=8 register spills on multi-row rounds while reading
+// weights once per tile of rows). Rows past the last repeat it and are not written.
 struct LoopGates {
   LoopGate g[kLoopGates];
 };
-constexpr int kLoopBlock = 256, kLoopRows = 8;
-inline int loop_rows(int rows) { return rows == 1 ? 1 : rows == 2 ? 2 : rows <= 4 ? 4 : kLoopRows; }
+constexpr int kLoopGateThreads = 128, kLoopApplyBlock = 256, kLoopLinearBlock = 256;
+inline int loop_rows(int rows) { return rows == 1 ? 1 : rows == 2 ? 2 : 4; }
+
+// Load 8 contiguous values from a bf16 or float32 weight row at element offset (aligned 16B for bf16, 16B for f32).
+__device__ __forceinline__ void load_w8(const bf16* w, int idx8, float (&out)[8]) {
+  unpack8(__ldg(reinterpret_cast<const uint4*>(w) + idx8), out);
+}
+__device__ __forceinline__ void load_w8(const float* w, int idx8, float (&out)[8]) {
+  const float4 a = __ldg(reinterpret_cast<const float4*>(w) + 2 * idx8);
+  const float4 b = __ldg(reinterpret_cast<const float4*>(w) + 2 * idx8 + 1);
+  out[0] = a.x; out[1] = a.y; out[2] = a.z; out[3] = a.w;
+  out[4] = b.x; out[5] = b.y; out[6] = b.z; out[7] = b.w;
+}
 
 // A controller owns a grid plane, so the choice of width is uniform across a block and made outside the dot product.
 template <typename Dot>
@@ -159,70 +229,253 @@ __device__ __forceinline__ void with_weight_row(RoundWeight w, size_t offset, Do
   else dot(w.f32 + offset);
 }
 
-// A block: one output of one controller's down projection for NR rows, a thread its inputs 256 apart in order and
-// then the block's tree; cur's half and msg's half summed apart (raw[2 o], raw[2 o + 1]): each half's norm scale
-// multiplies its sum, in k_loop_apply.  The blocks of output 0 also sum the rows' squares for those scales
-// (raw[2 rank], raw[2 rank + 1]): once for all that read them, and before any output is written (out may be cur).
-template <int NR>
-__global__ void __launch_bounds__(kLoopBlock) k_loop_gate(LoopGates G, int H, int rank, int rows, float* raw) {
+// A block: NO outputs (1 or 2) of one controller's down projection for NR rows, 128 threads (4 warps).
+// When H % 8 == 0 (and pointers are aligned), each thread loads 8 weights and 8 activations at once (uint4 / 2x float4)
+// in identical order for bf16 and f32 weights, then reduces across 4 warps in one barrier.
+// Blocks of output 0 also sum the rows' squares for cur and msg norms (raw[2 rank], raw[2 rank + 1]).
+template <int NR, int NO>
+__global__ void __launch_bounds__(kLoopGateThreads) k_loop_gate(LoopGates G, int H, int rank, int rows, float* raw) {
   pdl_trigger();
-  const int o = blockIdx.x, r0 = blockIdx.y * NR, c = blockIdx.z, tid = threadIdx.x;
+  constexpr int kWarps = kLoopGateThreads / 32;
+  const int o0 = blockIdx.x * NO, r0 = blockIdx.y * NR, c = blockIdx.z, tid = threadIdx.x;
+  const int lane = tid & 31, warp = tid >> 5;
   const float *cur[NR], *msg[NR];
-  float acc[2 * NR];
+  float acc[NO][2 * NR];
 #pragma unroll
   for (int j = 0; j < NR; ++j) {
     const int r = min(r0 + j, rows - 1);
     cur[j] = G.g[c].cur + size_t(r) * H;
     msg[j] = G.g[c].msg + size_t(r) * H;
-    acc[2 * j] = acc[2 * j + 1] = 0.f;
   }
-  with_weight_row(G.g[c].down, size_t(o) * size_t(2 * H), [&](const auto* w) {
-    for (int i = tid; i < H; i += kLoopBlock) {
-      const float wc = in_value(w + i), wm = in_value(w + H + i);
 #pragma unroll
-      for (int j = 0; j < NR; ++j) {
-        acc[2 * j] = __fmaf_rn(wc, cur[j][i], acc[2 * j]);
-        acc[2 * j + 1] = __fmaf_rn(wm, msg[j][i], acc[2 * j + 1]);
+  for (int p = 0; p < NO; ++p)
+#pragma unroll
+    for (int j = 0; j < 2 * NR; ++j) acc[p][j] = 0.f;
+
+  const bool vec8 =
+      (H & 7) == 0 &&
+      ((G.g[c].down.b16 ? (reinterpret_cast<uintptr_t>(G.g[c].down.b16) & 15u)
+                        : (reinterpret_cast<uintptr_t>(G.g[c].down.f32) & 15u)) == 0) &&
+      (reinterpret_cast<uintptr_t>(G.g[c].cur) & 15u) == 0 && (reinterpret_cast<uintptr_t>(G.g[c].msg) & 15u) == 0;
+
+  with_weight_row(G.g[c].down, 0, [&](const auto* wbase) {
+    if (vec8) {
+      const int H8 = H >> 3;
+      for (int i = tid; i < H8; i += kLoopGateThreads) {
+        float xc[NR][8], xm[NR][8];
+#pragma unroll
+        for (int j = 0; j < NR; ++j) {
+          const float4 c0 = reinterpret_cast<const float4*>(cur[j])[2 * i];
+          const float4 c1 = reinterpret_cast<const float4*>(cur[j])[2 * i + 1];
+          const float4 m0 = reinterpret_cast<const float4*>(msg[j])[2 * i];
+          const float4 m1 = reinterpret_cast<const float4*>(msg[j])[2 * i + 1];
+          xc[j][0] = c0.x; xc[j][1] = c0.y; xc[j][2] = c0.z; xc[j][3] = c0.w;
+          xc[j][4] = c1.x; xc[j][5] = c1.y; xc[j][6] = c1.z; xc[j][7] = c1.w;
+          xm[j][0] = m0.x; xm[j][1] = m0.y; xm[j][2] = m0.z; xm[j][3] = m0.w;
+          xm[j][4] = m1.x; xm[j][5] = m1.y; xm[j][6] = m1.z; xm[j][7] = m1.w;
+        }
+#pragma unroll
+        for (int p = 0; p < NO; ++p) {
+          const int o = o0 + p;
+          if (o >= rank) continue;
+          const auto* wr = wbase + size_t(o) * size_t(2 * H);
+          float wc[8], wm[8];
+          load_w8(wr, i, wc);
+          load_w8(wr + H, i, wm);
+#pragma unroll
+          for (int j = 0; j < NR; ++j) {
+            float a0 = acc[p][2 * j], a1 = acc[p][2 * j + 1];
+#pragma unroll
+            for (int e = 0; e < 8; ++e) {
+              a0 = __fmaf_rn(wc[e], xc[j][e], a0);
+              a1 = __fmaf_rn(wm[e], xm[j][e], a1);
+            }
+            acc[p][2 * j] = a0;
+            acc[p][2 * j + 1] = a1;
+          }
+        }
+      }
+    } else {
+      for (int i = tid; i < H; i += kLoopGateThreads) {
+        float xc[NR], xm[NR];
+#pragma unroll
+        for (int j = 0; j < NR; ++j) xc[j] = cur[j][i], xm[j] = msg[j][i];
+#pragma unroll
+        for (int p = 0; p < NO; ++p) {
+          const int o = o0 + p;
+          if (o >= rank) continue;
+          const auto* wr = wbase + size_t(o) * size_t(2 * H);
+          const float wc = in_value(wr + i), wm = in_value(wr + H + i);
+#pragma unroll
+          for (int j = 0; j < NR; ++j) {
+            acc[p][2 * j] = __fmaf_rn(wc, xc[j], acc[p][2 * j]);
+            acc[p][2 * j + 1] = __fmaf_rn(wm, xm[j], acc[p][2 * j + 1]);
+          }
+        }
       }
     }
   });
-  block_sum_n(acc);
-  float* row0 = raw + (size_t(c) * rows + r0) * loop_row_floats(rank);
+
+  __shared__ float sh[NO * 2 * NR][kWarps];
 #pragma unroll
-  for (int j = 0; j < 2 * NR; ++j)
-    if (tid == j && r0 + (j >> 1) < rows) row0[size_t(j >> 1) * loop_row_floats(rank) + 2 * o + (j & 1)] = acc[j];
-  if (o != 0) return;
+  for (int p = 0; p < NO; ++p) {
 #pragma unroll
-  for (int j = 0; j < 2 * NR; ++j) acc[j] = 0.f;
-  for (int i = tid; i < H; i += kLoopBlock) {
-#pragma unroll
-    for (int j = 0; j < NR; ++j) {
-      const float a = cur[j][i], b = msg[j][i];
-      acc[2 * j] = __fmaf_rn(a, a, acc[2 * j]);
-      acc[2 * j + 1] = __fmaf_rn(b, b, acc[2 * j + 1]);
+    for (int j = 0; j < 2 * NR; ++j) {
+      const float v = warp_sum(acc[p][j]);
+      if (lane == 0) sh[p * 2 * NR + j][warp] = v;
     }
   }
-  block_sum_n(acc);
+  __syncthreads();
+  float* row0 = raw + (size_t(c) * rows + r0) * loop_row_floats(rank);
+  if (tid < NO * 2 * NR) {
+    const int p = tid / (2 * NR), j = tid - p * (2 * NR), o = o0 + p;
+    const float s = (sh[tid][0] + sh[tid][2]) + (sh[tid][1] + sh[tid][3]);
+    if (o < rank && r0 + (j >> 1) < rows)
+      row0[size_t(j >> 1) * loop_row_floats(rank) + 2 * o + (j & 1)] = s;
+  }
+  if (o0 != 0) return;
+
+  float ss[2 * NR];
 #pragma unroll
-  for (int j = 0; j < 2 * NR; ++j)
-    if (tid == j && r0 + (j >> 1) < rows) row0[size_t(j >> 1) * loop_row_floats(rank) + 2 * rank + (j & 1)] = acc[j];
+  for (int j = 0; j < 2 * NR; ++j) ss[j] = 0.f;
+  if (vec8) {
+    const int H8 = H >> 3;
+    for (int i = tid; i < H8; i += kLoopGateThreads) {
+#pragma unroll
+      for (int j = 0; j < NR; ++j) {
+        const float4 c0 = reinterpret_cast<const float4*>(cur[j])[2 * i];
+        const float4 c1 = reinterpret_cast<const float4*>(cur[j])[2 * i + 1];
+        const float4 m0 = reinterpret_cast<const float4*>(msg[j])[2 * i];
+        const float4 m1 = reinterpret_cast<const float4*>(msg[j])[2 * i + 1];
+        float a0 = ss[2 * j], a1 = ss[2 * j + 1];
+        a0 = __fmaf_rn(c0.x, c0.x, a0); a0 = __fmaf_rn(c0.y, c0.y, a0);
+        a0 = __fmaf_rn(c0.z, c0.z, a0); a0 = __fmaf_rn(c0.w, c0.w, a0);
+        a0 = __fmaf_rn(c1.x, c1.x, a0); a0 = __fmaf_rn(c1.y, c1.y, a0);
+        a0 = __fmaf_rn(c1.z, c1.z, a0); a0 = __fmaf_rn(c1.w, c1.w, a0);
+        a1 = __fmaf_rn(m0.x, m0.x, a1); a1 = __fmaf_rn(m0.y, m0.y, a1);
+        a1 = __fmaf_rn(m0.z, m0.z, a1); a1 = __fmaf_rn(m0.w, m0.w, a1);
+        a1 = __fmaf_rn(m1.x, m1.x, a1); a1 = __fmaf_rn(m1.y, m1.y, a1);
+        a1 = __fmaf_rn(m1.z, m1.z, a1); a1 = __fmaf_rn(m1.w, m1.w, a1);
+        ss[2 * j] = a0;
+        ss[2 * j + 1] = a1;
+      }
+    }
+  } else {
+    for (int i = tid; i < H; i += kLoopGateThreads) {
+#pragma unroll
+      for (int j = 0; j < NR; ++j) {
+        const float a = cur[j][i], b = msg[j][i];
+        ss[2 * j] = __fmaf_rn(a, a, ss[2 * j]);
+        ss[2 * j + 1] = __fmaf_rn(b, b, ss[2 * j + 1]);
+      }
+    }
+  }
+  __syncthreads();  // finish reading sh above before reusing it for norms
+#pragma unroll
+  for (int j = 0; j < 2 * NR; ++j) {
+    const float v = warp_sum(ss[j]);
+    if (lane == 0) sh[j][warp] = v;
+  }
+  __syncthreads();
+  if (tid < 2 * NR) {
+    const float s = (sh[tid][0] + sh[tid][2]) + (sh[tid][1] + sh[tid][3]);
+    if (r0 + (tid >> 1) < rows) row0[size_t(tid >> 1) * loop_row_floats(rank) + 2 * rank + (tid & 1)] = s;
+  }
 }
 
-// A warp: one output of one controller for NR rows, its lanes 32 of the rank apart and then their tree.  A lane
-// makes the gates it reads from the raw sums and the norms' scales (every lane the same scales).
+// Fast path for rank % 8 == 0 && rank <= 128 (Inkling-2 rank = 64): precompute normalized gates s_gi[NR][rank] once
+// per block in shared memory (only 2*NR rsqrtf calls per block), then 8 lanes per output channel h (32 channels per
+// 256-thread block) read 8 weights per lane (uint4 for bf16 / 2x float4 for f32) in identical order.
 template <int NR>
-__global__ void __launch_bounds__(kLoopBlock) k_loop_apply(LoopGates G, int H, int rank, int rows, const float* raw) {
+__global__ void __launch_bounds__(kLoopApplyBlock)
+    k_loop_apply_vec8(LoopGates G, int H, int rank, int rows, const float* raw) {
   pdl_trigger();
-  const int lane = threadIdx.x & 31, h = blockIdx.x * (kLoopBlock / 32) + (threadIdx.x >> 5);
+  const int tid = threadIdx.x;
   const int r0 = blockIdx.y * NR, c = blockIdx.z;
+  const size_t stride = loop_row_floats(rank);
+  __shared__ float s_inv[2 * NR];
+  __shared__ float s_gi[NR][128];
+  if (tid < 2 * NR) {
+    const int j = tid >> 1, half = tid & 1;
+    const float* rptr = raw + (size_t(c) * rows + min(r0 + j, rows - 1)) * stride;
+    s_inv[tid] = rsqrtf(rptr[2 * rank + half] / float(H) + 1e-6f);
+  }
+  __syncthreads();
+  for (int idx = tid; idx < NR * rank; idx += kLoopApplyBlock) {
+    const int j = idx / rank, i = idx - j * rank;
+    const float* rptr = raw + (size_t(c) * rows + min(r0 + j, rows - 1)) * stride;
+    s_gi[j][i] = __fmaf_rn(rptr[2 * i], s_inv[2 * j], __fmul_rn(rptr[2 * i + 1], s_inv[2 * j + 1]));
+  }
+  __syncthreads();
+
+  const int sub = tid & 7;
+  const int h = blockIdx.x * (kLoopApplyBlock / 8) + (tid >> 3);
   if (h >= H) return;
-  const float* row[NR];
-  float inv_cur[NR], inv_msg[NR], gn[NR], fg[NR];
+  const int chunks = rank >> 3;
+  const size_t offset = size_t(h) * rank;
+  float gn[NR], fg[NR];
+#pragma unroll
+  for (int j = 0; j < NR; ++j) gn[j] = fg[j] = 0.f;
+  with_weight_row(G.g[c].gain, offset, [&](const auto* gain) {
+    with_weight_row(G.g[c].forget, offset, [&](const auto* forget) {
+      for (int ch = sub; ch < chunks; ch += 8) {
+        float wg[8], wf[8];
+        load_w8(gain, ch, wg);
+        load_w8(forget, ch, wf);
+        const int k0 = ch * 8;
+#pragma unroll
+        for (int j = 0; j < NR; ++j) {
+          const float* gp = s_gi[j] + k0;
+          float g = gn[j], f = fg[j];
+#pragma unroll
+          for (int e = 0; e < 8; ++e) {
+            g = __fmaf_rn(wg[e], gp[e], g);
+            f = __fmaf_rn(wf[e], gp[e], f);
+          }
+          gn[j] = g;
+          fg[j] = f;
+        }
+      }
+    });
+  });
 #pragma unroll
   for (int j = 0; j < NR; ++j) {
-    row[j] = raw + (size_t(c) * rows + min(r0 + j, rows - 1)) * loop_row_floats(rank);
-    inv_cur[j] = rsqrtf(row[j][2 * rank] / float(H) + 1e-6f);
-    inv_msg[j] = rsqrtf(row[j][2 * rank + 1] / float(H) + 1e-6f);
+    float g = gn[j], f = fg[j];
+    g += __shfl_xor_sync(0xffffffffu, g, 4);
+    g += __shfl_xor_sync(0xffffffffu, g, 2);
+    g += __shfl_xor_sync(0xffffffffu, g, 1);
+    f += __shfl_xor_sync(0xffffffffu, f, 4);
+    f += __shfl_xor_sync(0xffffffffu, f, 2);
+    f += __shfl_xor_sync(0xffffffffu, f, 1);
+    if (sub == 0 && r0 + j < rows) {
+      const size_t at = (size_t(r0) + j) * H + h;
+      const float cv = G.g[c].cur[at], mv = G.g[c].msg[at];
+      G.g[c].out[at] = __fmaf_rn(tanhf(g), mv, __fmaf_rn(-tanhf(f), cv, cv));
+    }
+  }
+}
+
+// General fallback for arbitrary rank (not a multiple of 8 or > 128): one warp per output h, still caching inv scales.
+template <int NR>
+__global__ void __launch_bounds__(kLoopApplyBlock)
+    k_loop_apply(LoopGates G, int H, int rank, int rows, const float* raw) {
+  pdl_trigger();
+  const int tid = threadIdx.x, lane = tid & 31, h = blockIdx.x * (kLoopApplyBlock / 32) + (tid >> 5);
+  const int r0 = blockIdx.y * NR, c = blockIdx.z;
+  const size_t stride = loop_row_floats(rank);
+  __shared__ float s_inv[2 * NR];
+  if (tid < 2 * NR) {
+    const int j = tid >> 1, half = tid & 1;
+    const float* rptr = raw + (size_t(c) * rows + min(r0 + j, rows - 1)) * stride;
+    s_inv[tid] = rsqrtf(rptr[2 * rank + half] / float(H) + 1e-6f);
+  }
+  __syncthreads();
+  if (h >= H) return;
+  const float* row[NR];
+  float gn[NR], fg[NR];
+#pragma unroll
+  for (int j = 0; j < NR; ++j) {
+    row[j] = raw + (size_t(c) * rows + min(r0 + j, rows - 1)) * stride;
     gn[j] = fg[j] = 0.f;
   }
   const size_t offset = size_t(h) * rank;
@@ -232,7 +485,7 @@ __global__ void __launch_bounds__(kLoopBlock) k_loop_apply(LoopGates G, int H, i
         const float wg = in_value(gain + i), wf = in_value(forget + i);
 #pragma unroll
         for (int j = 0; j < NR; ++j) {
-          const float gi = __fmaf_rn(row[j][2 * i], inv_cur[j], __fmul_rn(row[j][2 * i + 1], inv_msg[j]));
+          const float gi = __fmaf_rn(row[j][2 * i], s_inv[2 * j], __fmul_rn(row[j][2 * i + 1], s_inv[2 * j + 1]));
           gn[j] = __fmaf_rn(wg, gi, gn[j]);
           fg[j] = __fmaf_rn(wf, gi, fg[j]);
         }
@@ -250,12 +503,13 @@ __global__ void __launch_bounds__(kLoopBlock) k_loop_apply(LoopGates G, int H, i
   }
 }
 
-// A warp: one output for NR rows, its lanes 32 values of K apart in order, then their tree.
+// A warp: one output for NR rows; vectorized 8-element chunks when K % 8 == 0 and aligned (identical order for bf16/f32).
 template <int NR, typename Weight>
-__global__ void __launch_bounds__(kLoopBlock) k_linear_f32(const float* x, int ldx, const Weight* __restrict__ W, int N,
-                                                           int K, float* y, int ldy, int rows, int accumulate) {
+__global__ void __launch_bounds__(kLoopLinearBlock)
+    k_linear_f32(const float* x, int ldx, const Weight* __restrict__ W, int N, int K, float* y, int ldy, int rows,
+                 int accumulate) {
   pdl_trigger();
-  const int lane = threadIdx.x & 31, n = blockIdx.x * (kLoopBlock / 32) + (threadIdx.x >> 5);
+  const int lane = threadIdx.x & 31, n = blockIdx.x * (kLoopLinearBlock / 32) + (threadIdx.x >> 5);
   const int r0 = blockIdx.y * NR;
   if (n >= N) return;
   const Weight* w = W + size_t(n) * K;
@@ -266,10 +520,32 @@ __global__ void __launch_bounds__(kLoopBlock) k_linear_f32(const float* x, int l
     xr[j] = x + size_t(min(r0 + j, rows - 1)) * ldx;
     acc[j] = 0.f;
   }
-  for (int k = lane; k < K; k += 32) {
-    const float wk = in_value(w + k);
+  const bool vec8 =
+      (K & 7) == 0 && (ldx & 3) == 0 && (reinterpret_cast<uintptr_t>(W) & 15u) == 0 &&
+      (reinterpret_cast<uintptr_t>(x) & 15u) == 0;
+  if (vec8) {
+    const int K8 = K >> 3;
+    for (int k = lane; k < K8; k += 32) {
+      float wv[8];
+      load_w8(w, k, wv);
 #pragma unroll
-    for (int j = 0; j < NR; ++j) acc[j] = __fmaf_rn(wk, xr[j][k], acc[j]);
+      for (int j = 0; j < NR; ++j) {
+        const float4 x0 = reinterpret_cast<const float4*>(xr[j])[2 * k];
+        const float4 x1 = reinterpret_cast<const float4*>(xr[j])[2 * k + 1];
+        float a = acc[j];
+        a = __fmaf_rn(wv[0], x0.x, a); a = __fmaf_rn(wv[1], x0.y, a);
+        a = __fmaf_rn(wv[2], x0.z, a); a = __fmaf_rn(wv[3], x0.w, a);
+        a = __fmaf_rn(wv[4], x1.x, a); a = __fmaf_rn(wv[5], x1.y, a);
+        a = __fmaf_rn(wv[6], x1.z, a); a = __fmaf_rn(wv[7], x1.w, a);
+        acc[j] = a;
+      }
+    }
+  } else {
+    for (int k = lane; k < K; k += 32) {
+      const float wk = in_value(w + k);
+#pragma unroll
+      for (int j = 0; j < NR; ++j) acc[j] = __fmaf_rn(wk, xr[j][k], acc[j]);
+    }
   }
 #pragma unroll
   for (int j = 0; j < NR; ++j) {
@@ -1416,19 +1692,48 @@ void loop_ctrl_apply(const float* cur, const float* msg, const float* gain, int 
   k_loop_ctrl_apply<<<dim3(ceil_div(H, 256), rows), 256, 0, st>>>(cur, msg, gain, ld_gain, forget, ld_forget, H, out);
 }
 
+void loop_ctrl_apply_norm(const float* cur, const float* msg, const float* gain, int ld_gain, const float* forget,
+                          int ld_forget, const float* norm_w, float norm_offset, float norm_eps, int rows, int H,
+                          float* y, int ldy, cudaStream_t st) {
+  if (rows <= 0 || H <= 0) return;
+  k_loop_ctrl_apply_norm<<<rows, 512, 0, st>>>(cur, msg, gain, ld_gain, forget, ld_forget, norm_w, norm_offset,
+                                               norm_eps, H, y, ldy);
+}
+
 void loop_control(const LoopGate* g, int n, int rows, int H, int rank, float* scratch, cudaStream_t st) {
   if (n < 1 || n > kLoopGates) throw std::invalid_argument("loop_control: 1 to kLoopGates controllers");
   if (rows <= 0 || H <= 0 || rank <= 0) return;
   LoopGates G{};
-  for (int c = 0; c < n; ++c) G.g[c] = g[c];
+  bool apply_vec8 = (rank & 7) == 0 && rank <= 128;
+  for (int c = 0; c < n; ++c) {
+    G.g[c] = g[c];
+    const uintptr_t pg = g[c].gain.b16 ? reinterpret_cast<uintptr_t>(g[c].gain.b16)
+                                       : reinterpret_cast<uintptr_t>(g[c].gain.f32);
+    const uintptr_t pf = g[c].forget.b16 ? reinterpret_cast<uintptr_t>(g[c].forget.b16)
+                                         : reinterpret_cast<uintptr_t>(g[c].forget.f32);
+    if ((pg & 15u) != 0 || (pf & 15u) != 0) apply_vec8 = false;
+  }
   const int nr = loop_rows(rows);
-  const dim3 gate_grid(rank, ceil_div(rows, nr), n), apply_grid(ceil_div(H, kLoopBlock / 32), ceil_div(rows, nr), n);
-#define FLYX_LOOP_LAUNCH(NR)                                                                case NR:                                                                                    k_loop_gate<NR><<<gate_grid, kLoopBlock, 0, st>>>(G, H, rank, rows, scratch);             k_loop_apply<NR><<<apply_grid, kLoopBlock, 0, st>>>(G, H, rank, rows, scratch);           break;
+  const int no = (rows >= 4 && n > 1 && rank >= 4) ? 2 : 1;
+  const dim3 gate_grid(ceil_div(rank, no), ceil_div(rows, nr), n);
+  const dim3 apply_grid(ceil_div(H, apply_vec8 ? (kLoopApplyBlock / 8) : (kLoopApplyBlock / 32)),
+                        ceil_div(rows, nr), n);
+#define FLYX_LOOP_LAUNCH(NR)                                                                                     \
+  case NR:                                                                                                       \
+    if (no == 2) k_loop_gate<NR, 2><<<gate_grid, kLoopGateThreads, 0, st>>>(G, H, rank, rows, scratch);          \
+    else k_loop_gate<NR, 1><<<gate_grid, kLoopGateThreads, 0, st>>>(G, H, rank, rows, scratch);                  \
+    if (apply_vec8) k_loop_apply_vec8<NR><<<apply_grid, kLoopApplyBlock, 0, st>>>(G, H, rank, rows, scratch);    \
+    else k_loop_apply<NR><<<apply_grid, kLoopApplyBlock, 0, st>>>(G, H, rank, rows, scratch);                    \
+    break;
   switch (nr) {
     FLYX_LOOP_LAUNCH(1)
     FLYX_LOOP_LAUNCH(2)
-    FLYX_LOOP_LAUNCH(4)
-    FLYX_LOOP_LAUNCH(8)
+    default:
+      if (no == 2) k_loop_gate<4, 2><<<gate_grid, kLoopGateThreads, 0, st>>>(G, H, rank, rows, scratch);
+      else k_loop_gate<4, 1><<<gate_grid, kLoopGateThreads, 0, st>>>(G, H, rank, rows, scratch);
+      if (apply_vec8) k_loop_apply_vec8<4><<<apply_grid, kLoopApplyBlock, 0, st>>>(G, H, rank, rows, scratch);
+      else k_loop_apply<4><<<apply_grid, kLoopApplyBlock, 0, st>>>(G, H, rank, rows, scratch);
+      break;
   }
 #undef FLYX_LOOP_LAUNCH
 }
@@ -1437,13 +1742,12 @@ void linear_f32(const float* x, int ldx, RoundWeight W, int N, int K, float* y, 
                 cudaStream_t st) {
   if (rows <= 0 || N <= 0) return;
   const int nr = loop_rows(rows), acc = accumulate ? 1 : 0;
-  const dim3 grid(ceil_div(N, kLoopBlock / 32), ceil_div(rows, nr));
+  const dim3 grid(ceil_div(N, kLoopLinearBlock / 32), ceil_div(rows, nr));
   auto launch = [&](const auto* w) {
     switch (nr) {
-      case 1: k_linear_f32<1><<<grid, kLoopBlock, 0, st>>>(x, ldx, w, N, K, y, ldy, rows, acc); break;
-      case 2: k_linear_f32<2><<<grid, kLoopBlock, 0, st>>>(x, ldx, w, N, K, y, ldy, rows, acc); break;
-      case 4: k_linear_f32<4><<<grid, kLoopBlock, 0, st>>>(x, ldx, w, N, K, y, ldy, rows, acc); break;
-      default: k_linear_f32<8><<<grid, kLoopBlock, 0, st>>>(x, ldx, w, N, K, y, ldy, rows, acc); break;
+      case 1: k_linear_f32<1><<<grid, kLoopLinearBlock, 0, st>>>(x, ldx, w, N, K, y, ldy, rows, acc); break;
+      case 2: k_linear_f32<2><<<grid, kLoopLinearBlock, 0, st>>>(x, ldx, w, N, K, y, ldy, rows, acc); break;
+      default: k_linear_f32<4><<<grid, kLoopLinearBlock, 0, st>>>(x, ldx, w, N, K, y, ldy, rows, acc); break;
     }
   };
   if (W.b16) launch(W.b16);
