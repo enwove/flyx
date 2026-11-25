@@ -37,9 +37,10 @@ bool is_dflash_companion(const nlohmann::json& header);
 // (parse_dflash2_*, parse_dspark_gguf).
 void check_made_for(const nlohmann::json& header, const TargetSpec& target);
 
-// Parse and validate a DFlash2 spec from canonical JSON ("draft" section in .flyx or drafter_dir).
-DFlash2Spec parse_dflash2_json(const nlohmann::json& j, const TargetSpec& target, int companion,
-                               const ModelFile* file = nullptr);
+// Parse and validate a DFlash2 spec from canonical JSON ("draft" section in .flyx or drafter_dir); `file` holds its
+// tensors (the selector's codebooks say whether they have the target's padding rows).
+DFlash2Spec parse_dflash2_json(const ModelFile& file, const nlohmann::json& j, const TargetSpec& target,
+                               int companion);
 
 // Parse and validate a DFlash2 spec from a GGUF companion header with general.architecture == "dflash".
 DFlash2Spec parse_dflash2_gguf(const ModelFile& file, const nlohmann::json& header, const TargetSpec& target,

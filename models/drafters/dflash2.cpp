@@ -55,15 +55,14 @@ int parse_softcap_mode(const std::string& mode) {
   throw std::runtime_error("unsupported DFlash2 selector_softcap_mode: " + mode);
 }
 
-int resolve_sel_vocab(const ModelFile* file, const std::string& pred_name, const TargetSpec& target) {
-  if (file) {
-    if (const flyx_tensor_view* t = file->tensor(pred_name)) {
-      if (t->ndim == 2 && (t->shape[0] == target.vocab || t->shape[0] == target.padded_vocab()))
-        return int(t->shape[0]);
-      if (t->ndim == 2) throw std::runtime_error(mismatch_msg(target));
-    }
-  }
-  return target.vocab;
+// The rows of the selector's codebooks: a row a token, or a row a row of the target's padded embedding.  A file
+// without the tensor is refused by name when the block is built.
+int resolve_sel_vocab(const ModelFile& file, const std::string& pred_name, const TargetSpec& target) {
+  const flyx_tensor_view* t = file.tensor(pred_name);
+  if (!t || t->ndim != 2) return target.vocab;
+  if (t->shape[0] != target.vocab && t->shape[0] != target.padded_vocab())
+    throw std::runtime_error(mismatch_msg(target));
+  return int(t->shape[0]);
 }
 
 // A drafter tensor's name in an arch "dflash" GGUF file, from the name python/convert gives it ("draft.fc",
@@ -132,7 +131,7 @@ void check_made_for(const json& header, const TargetSpec& target) {
   else check_json_target(header.at("draft"), target);
 }
 
-DFlash2Spec parse_dflash2_json(const json& j, const TargetSpec& target, int companion, const ModelFile* file) {
+DFlash2Spec parse_dflash2_json(const ModelFile& file, const json& j, const TargetSpec& target, int companion) {
   check_json_target(j, target);
   DFlash2Spec spec{};
   spec.gguf = false;
@@ -272,7 +271,7 @@ DFlash2Spec parse_dflash2_gguf(const ModelFile& file, const json& header, const 
   d.mask_token = mask_token;
 
   const std::string pred_name = ModelFile::companion_name(companion, "selector_predecessor.weight");
-  spec.sel_vocab = resolve_sel_vocab(&file, pred_name, target);
+  spec.sel_vocab = resolve_sel_vocab(file, pred_name, target);
   validate_dflash2_spec(&spec, target);
   return spec;
 }

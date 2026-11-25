@@ -71,11 +71,11 @@ void DrafterRegistry::scan(const ModelFile& file, const TargetSpec& target, cons
 const DFlash2Spec& DrafterRegistry::ensure_dflash2_spec(const ModelFile& file, const TargetSpec& target) {
   if (dflash2_spec_) return *dflash2_spec_;
   const int i = dflash2_companion_;
-  if (i < 0) return dflash2_spec_.emplace(parse_dflash2_json(file.header().at("draft"), target, -1, &file));
+  if (i < 0) return dflash2_spec_.emplace(parse_dflash2_json(file, file.header().at("draft"), target, -1));
   const json& h = file.header().at("companions").at(size_t(i));
   try {
     dflash2_spec_ = GgufMeta::is_header(h) ? parse_dflash2_gguf(file, h, target, i)
-                                           : parse_dflash2_json(h.at("draft"), target, i, &file);
+                                           : parse_dflash2_json(file, h.at("draft"), target, i);
   } catch (const std::exception& e) {
     throw std::runtime_error(companion_label(i) + e.what());
   }
