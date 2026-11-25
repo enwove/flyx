@@ -78,11 +78,12 @@ function(flyx_configure_cuda_lib target archs)
   cmake_parse_arguments(ARG "USES_TABLES" "" "" ${ARGN})
   set_target_properties(${target} PROPERTIES CUDA_ARCHITECTURES "${archs}")
   target_compile_options(${target} PRIVATE "$<$<COMPILE_LANGUAGE:CUDA>:${FLYX_CUDA_DEVICE_FLAGS}>")
+  # Every library alike: kernels.cuh's inline functions (moe_dp4a_compiled) read it, whatever else a library includes.
+  target_compile_definitions(${target} PUBLIC FLYX_TUNE_CANDIDATES=$<IF:$<BOOL:${FLYX_TUNE_CANDIDATES}>,1,0>)
   if(ARG_USES_TABLES)
     add_dependencies(${target} flyx_gemm_tables)
     target_include_directories(${target} PUBLIC ${CMAKE_SOURCE_DIR} ${CMAKE_SOURCE_DIR}/include
                                ${CMAKE_SOURCE_DIR}/third_party ${FLYX_GEN_DIR})
-    target_compile_definitions(${target} PUBLIC FLYX_TUNE_CANDIDATES=$<IF:$<BOOL:${FLYX_TUNE_CANDIDATES}>,1,0>)
   else()
     target_include_directories(${target} PUBLIC ${CMAKE_SOURCE_DIR} ${CMAKE_SOURCE_DIR}/include)
   endif()
