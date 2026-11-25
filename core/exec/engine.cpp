@@ -291,11 +291,12 @@ bool Engine::build_and_calibrate_plans(double* t_plans, double* t_rounds, std::s
   *t_plans = os::now_ms();
   // The rounds are timed where this prompt ends, on the drafts that follow it.  Prose, not a count: after "1, 2, 3, 4,
   // 5, 6," the drafts are digits and commas, and a sparse-MoE target routes a round of those few tokens to few experts,
-  // so its wide rounds timed cheap (Inkling-2-Mini: 2 -> 3 drafts +0.7 ms timed, +1.5 ms on chat prompts).
+  // so its wide rounds timed cheap (Inkling-2-Mini: 2 -> 3 drafts +0.7 ms timed, +1.5 ms on chat prompts).  A tokenizer
+  // that makes more than 64 tokens of it keeps its end, and the longer context below ends with it too.
   std::vector<int32_t> prompt = tok_.encode("The quick brown fox jumps over the lazy dog. In the beginning was the word, and "
                                             "the word was with the engine, and the engine was fast. When the evening "
                                             "came, the travellers");
-  if (prompt.size() > 64) prompt.resize(64);
+  if (prompt.size() > 64) prompt.erase(prompt.begin(), prompt.end() - 64);
   std::vector<std::string> labels, given_labels;
   for (size_t i = 0; i < plans_.widths.size(); ++i) labels.push_back(round_name(i));
   for (int k : plans_.given_widths) given_labels.push_back(std::to_string(k));
@@ -320,9 +321,9 @@ bool Engine::build_and_calibrate_plans(double* t_plans, double* t_rounds, std::s
     // rows and 32 canvas rows a round of 31).  Its cost per token of context past the first.
     const int longer = restarting ? long_calibration(opt_.max_ctx, prefill_align_) : 0;
     if (longer > round_ms_at_) {
-      std::vector<int32_t> context;
-      while (static_cast<int>(context.size()) < longer) context.insert(context.end(), prompt.begin(), prompt.end());
-      context.resize(size_t(longer));
+      std::vector<int32_t> context;  // the prompt repeated, its last copy whole: the same drafts follow both timings
+      while (static_cast<int>(context.size()) < longer) context.insert(context.begin(), prompt.begin(), prompt.end());
+      context.erase(context.begin(), context.end() - longer);
       const std::string what = "round at " + std::to_string(longer) + " tokens";
       auto time_at = [&](const std::vector<int32_t>& tokens, const std::string& label) {
         std::vector<double> ms;
