@@ -200,6 +200,13 @@ void choices() {
     check(flyx::hub::select(r, {r.id, "mtp-Qwen3.8-27B-Q4_0.gguf"}, &files, &err) && files.size() == 1 &&
               files[0].path == "MTP/mtp-Qwen3.8-27B-Q4_0.gguf",
           "select resolves repo:mtp-*.gguf companion by basename");
+    flyx::hub::Repo df;
+    df.id = "org/model-DFlash2-GGUF";
+    df.info.gguf_architecture = "dflash";
+    df.files = {file("Model-DFlash2-Draft-BF16.gguf", 5)};
+    check(flyx::hub::select(df, {df.id, "Model-DFlash2-Draft-BF16.gguf"}, &files, &err) && files.size() == 1 &&
+              files[0].path == "Model-DFlash2-Draft-BF16.gguf",
+          "select resolves repo:file.gguf directly for dflash GGUF drafter repos");
   }
   // mmproj_gguf_name edge cases (subfolders, imatrix, MTP, negative qualifiers) and precision ranking.
   check(flyx::hub::mmproj_gguf_name("mmproj-BF16.gguf") && flyx::hub::mmproj_gguf_name("mmproj/vision.gguf") &&

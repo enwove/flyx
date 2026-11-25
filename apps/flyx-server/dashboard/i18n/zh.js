@@ -369,6 +369,7 @@ export default {
     "Vision projector": "视觉投影器",
     "pick up to one": "最多选 1 个",
     "Use selected companions": "使用所选配套文件",
+    "This repository holds a drafter, not a standalone model: choose a file below to draft with it.": "该仓库提供的是草稿模型（drafter），不能单独加载：请在下方选择文件用于投机解码。",
     "Hub mirror": "镜像地址",
     "Hugging Face mirror or endpoint": "Hugging Face 镜像或端点地址",
     "Apply": "应用",

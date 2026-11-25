@@ -615,6 +615,7 @@ export default {
     "Vision projector": "ビジョンプロジェクタ",
     "pick up to one": "最大 1 つ選択",
     "Use selected companions": "選択した付属ファイルを使用",
+    "This repository holds a drafter, not a standalone model: choose a file below to draft with it.": "このリポジトリは単独モデルではなく drafter です。下からファイルを選んで投機的デコードに使用してください。",
     "Hub mirror": "Hub ミラー",
     "Hugging Face mirror or endpoint": "Hugging Face ミラーまたはエンドポイント",
     "Apply": "適用",

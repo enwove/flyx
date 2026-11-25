@@ -77,21 +77,31 @@ function FitTag({ size }) {
   return html`<span class=${"tag2 " + (fits ? "ok" : "bad")} title=${t(title)}>${t(fits ? "fits" : "too big")}</span>`;
 }
 
-// What is served and its state, its facts, a fetch's or a load's progress, its drafters, an error.  With nothing
+const drafterLabel = (k) => k === "mtp" ? "MTP" : k === "dflash2" ? "DFlash2" : k === "dspark" ? "DSpark" : k;
+
+// What is served and its state, its facts, a fetch's or a load's progress, an error.  With nothing
 // served it is the view's whole content: `again` loads the model the server remembers, `browse` shows the library.
 function Serving({ tm, again, retry, browse }) {
   const L = tm.load || { state: "none" }, model = tm.model || {}, p = L.progress || {};
   const loadedWant = model.id && L.loaded ? L.loaded : null, busy = busyLoad(L);
   const [msg, setMsg] = useState("");
   const [vramOpen, setVramOpen] = useState(false);
+  const drafters = model.loaded && !busy ? draftersOf(L).slice() : [];
+  if (model.loaded && !busy && model.drafter && /mtp/.test(model.drafter) && !drafters.some((d) => d.kind === "mtp"))
+    drafters.unshift({ kind: "mtp", from: "model file" });
+  const draftTip = drafters.map((d) => drafterLabel(d.kind) + ": " + d.from + (d.size ? " · " + gb(d.size) + " GB" : "")).join("\n");
+  const visionTip = model.loaded && !busy && model.vision
+    ? (L.vision_projector && L.vision_projector.from ? L.vision_projector.from : t("model file")) +
+      (L.vision_projector && L.vision_projector.size ? " · " + gb(L.vision_projector.size) + " GB" : "")
+    : "";
   const facts = [];
   if (model.loaded && !busy) {
     if (model.device) facts.push(["GPU", shortDevice(model.device)]);
     facts.push(["Context", fmt(model.context)]);
     if (loadedWant) facts.push(["KV cache", loadedWant.kv === "16" ? "16-bit" : loadedWant.kv === "fp8" ? "fp8" : "auto"]);
     facts.push(["Sessions", fmt(model.max_sessions)]);
-    facts.push(["Drafting", model.drafter ? model.drafter + ", up to " + model.max_width : "off"]);
-    facts.push(["Vision", model.vision ? t(normVisionDev(model.vision_device)) + " · " + normVisionQuant(model.vision_quant) : "off"]);
+    facts.push(["Drafting", model.drafter ? model.drafter + ", up to " + model.max_width : "off", draftTip]);
+    facts.push(["Vision", model.vision ? t(normVisionDev(model.vision_device)) + " · " + normVisionQuant(model.vision_quant) : "off", visionTip]);
     if (model.load_s) facts.push(["Load time", secs(model.load_s)]);
     if (tm.memory && tm.memory.ledger_used) facts.push(["Memory", gib(tm.memory.ledger_used) + " GiB"]);
   }
@@ -103,9 +113,6 @@ function Serving({ tm, again, retry, browse }) {
       (p.bytes_per_s ? " · " + fmt(p.bytes_per_s / 1e6) + " MB/s" : "") + (left !== null && !p.checking ? " · " + secs(left) + " left" : "") +
       (p.checking ? " · checking its sha256" : "") + (model.id ? " · " + model.id + " keeps serving meanwhile" : "");
   } else if (L.state === "loading") sub = t("loading onto the GPU · " + secs(L.elapsed_s));
-  const drafters = model.loaded && !busy ? draftersOf(L).slice() : [];
-  if (model.loaded && !busy && model.drafter && /mtp/.test(model.drafter) && !drafters.some((d) => d.kind === "mtp"))
-    drafters.unshift({ kind: "mtp", from: "model file" });
   const limit = model.loaded && !busy ? contextLimit(model) : null;  // memory cut the context: why, and what gives more
   const ctxLimit = model.context_limit;
   const ctxMemKind = !limit || !ctxLimit ? ""
@@ -138,7 +145,7 @@ function Serving({ tm, again, retry, browse }) {
         ${again ? html`<button class="btn primary" id="ld-again" title=${again.model} onClick=${again.load}>
           <${Icon} name="play"/>${t("Load the last model again")}</button>` : ""}
         <button class=${"btn" + (again ? "" : " primary")} id="ld-browse" onClick=${browse}>${t("Explore the model library")}</button></div>` : ""}
-      <dl class="stats" id="ld-facts" hidden=${!facts.length}>${facts.map(([k, v]) => html`<div><dt>${t(k)}</dt><dd>${t(v)}</dd></div>`)}</dl>
+      <dl class="stats" id="ld-facts" hidden=${!facts.length}>${facts.map(([k, v, tip]) => html`<div title=${tip || undefined}><dt>${t(k)}</dt><dd>${t(v)}</dd></div>`)}</dl>
       <div class=${"banner " + (limit && limit.short ? "warn" : "hint")} id="ld-ctx" hidden=${!limit}>
         <div class="grow2">${limit ? limit.parts.map((s) => t(s)).join(" ").replace(/([。！？]) /g, "$1") : ""}</div>
         ${ctxMemKind ? html`<button class="btn sm" id="ld-vram-toggle" onClick=${() => setVramOpen((v) => !v)}>
@@ -146,13 +153,6 @@ function Serving({ tm, again, retry, browse }) {
       <div class=${"bar" + (L.state === "loading" ? " busy" : "")} id="ld-prog" hidden=${!busy}>
         <i style=${{ width: L.state === "loading" ? "" : (p.total ? 100 * p.done / p.total : 0) + "%" }}></i></div>
       <div class="prog" id="ld-sub">${sub}</div>
-      <div class="srv-dr" id="ld-drafters">${drafters.map((d) => html`
-        <div class="dr"><span class="k">${d.kind === "mtp" ? "MTP" : d.kind === "dflash2" ? "DFlash2" : d.kind}</span>
-          <span class="f">${(d.from === "model file" ? t("the model file's own layer") : d.from) + (d.size ? " · " + gb(d.size) + " GB" : "")}</span></div>`)}
-        ${model.loaded && !busy && model.vision ? html`
-        <div class="dr"><span class="k">${t("Vision")}</span>
-          <span class="f">${(L.vision_projector && L.vision_projector.from ? L.vision_projector.from : t("model file")) +
-            (L.vision_projector && L.vision_projector.size ? " · " + gb(L.vision_projector.size) + " GB" : "")}</span></div>` : ""}</div>
       <div class=${"banner " + (L.fallback ? "warn" : "bad")} id="ld-err" hidden=${!L.error && !msg}>
         ${L.error ? (L.fallback ? [t("The new model did not load."), tErr(L.error), t(L.fallback + " was loaded again.")].join(" ").replace(/([。！？]) /g, "$1") : tErr(L.error)) : t(msg)}</div>
       <${VramApps} open=${showMemPanel} kind=${panelKind} id="ld-vram-apps"
@@ -163,8 +163,11 @@ function Serving({ tm, again, retry, browse }) {
     </div>`;
 }
 
-// A drafter given as a GGUF is an MTP layer; anything else a DFlash2 drafter.
-const kindOf = (d) => /\.gguf$/i.test(d) ? "mtp" : "dflash2";
+// A drafter given as a GGUF is a DSpark, DFlash2, or MTP file; anything else a DFlash2 drafter.
+const kindOf = (d) => /\.gguf$/i.test(d)
+  ? (/(?:^|[\\/:-])dspark(?:[\\/._-]|$)/i.test(d) ? "dspark"
+     : /(?:^|[\\/:-])dflash2?(?:[\\/._-]|$)/i.test(d) ? "dflash2" : "mtp")
+  : "dflash2";
 const normVisionDev = (v) => (v === "host" || v === "cpu") ? "host" : v === "gpu" ? "gpu" : v === "auto" ? "auto" : "disk";
 const normVisionQuant = (v) => (v === "exact" || v === "bf16") ? "exact" : (v === "nvfp4" || v === "fp4") ? "nvfp4" : "q8";
 
@@ -431,7 +434,10 @@ export function ModelPage({ active, libraryAsked, currentAsked }) {
   useEffect(() => {
     if (!active || view !== "library" || tab !== "hub") return;
     refreshHubConfig();
-    const h = setTimeout(() => search(q, sort, arch, 0, ""), found || foundMsg ? 350 : 0);
+    const h = setTimeout(() => {
+      search(q, sort, arch, 0, "");
+      if (hubName(q, hubEndpoint)) named(q);
+    }, found || foundMsg ? 350 : 0);
     return () => clearTimeout(h);
   }, [active, view, tab, q, sort, arch]);
   // The first repository shown: the served model's, else the first found.
@@ -677,6 +683,9 @@ export function ModelPage({ active, libraryAsked, currentAsked }) {
 
   function settingsView(cmdModel) {
     const specLoaded = !!model.drafter, visLoaded = !!model.vision;
+    const activeDrafters = model.loaded && !busy ? draftersOf(L).slice() : [];
+    if (model.loaded && !busy && model.drafter && /mtp/.test(model.drafter) && !activeDrafters.some((d) => d.kind === "mtp"))
+      activeDrafters.unshift({ kind: "mtp", from: "model file" });
     const specSum = !f.spec ? t("off") : f.draftSource === "custom" && own ? baseName(own) : f.draftSource === "saved" ? t("last loaded") :
                     specLoaded ? t("default") : t("none");
     const visSum = !f.vision ? t("off") : visLoaded ? t(normVisionDev(f.vision_device)) + " · " + normVisionQuant(f.vision_quant) :
@@ -734,6 +743,9 @@ export function ModelPage({ active, libraryAsked, currentAsked }) {
             <span class=${"sd-was" + (was("spec") !== null ? " on" : "")}>${was("spec") !== null ? t("was " + t(was("spec"))) : ""}</span>
             <label class="switch sd-switch" title=${t("Speculative decoding")}>
               <input type="checkbox" id="sd-on" aria-label=${t("Speculative decoding")} checked=${f.spec} onChange=${set("spec")}/><i></i></label></div>
+          ${activeDrafters.length ? html`<div class="srv-dr in-panel" id="ld-drafters">${activeDrafters.map((d) => html`
+            <div class="dr"><span class="tag2 ok">${t("in use")}</span><span class="k">${drafterLabel(d.kind)}</span>
+              <span class="f">${(d.from === "model file" ? t("the model file's own layer") : d.from) + (d.size ? " · " + gb(d.size) + " GB" : "")}</span></div>`)}</div>` : null}
           <div class=${"sdopts" + (f.spec ? "" : " off")} data-k="drafter">
             ${savedDraft ? html`<div class=${"sdrow pick" + (f.draftSource === "saved" ? " sel" : "")} id="sd-saved" onClick=${() => pickDraft("saved")}>
               <input type="radio" name="sd-src" aria-label=${t("last loaded")} checked=${f.draftSource === "saved"} disabled=${specOff}/>
@@ -788,6 +800,10 @@ export function ModelPage({ active, libraryAsked, currentAsked }) {
             <span class=${"sd-was" + (was("vision") !== null ? " on" : "")}>${was("vision") !== null ? t("was " + t(was("vision"))) : ""}</span>
             <label class="switch sd-switch" title=${t("Vision encoder")}>
               <input type="checkbox" id="vs-on" aria-label=${t("Vision encoder")} checked=${f.vision} onChange=${set("vision")}/><i></i></label></div>
+          ${model.loaded && !busy && model.vision ? html`<div class="srv-dr in-panel" id="ld-vision-src">
+            <div class="dr"><span class="tag2 ok">${t("in use")}</span><span class="k">${t("Vision")}</span>
+              <span class="f">${(L.vision_projector && L.vision_projector.from ? L.vision_projector.from : t("model file")) +
+                (L.vision_projector && L.vision_projector.size ? " · " + gb(L.vision_projector.size) + " GB" : "")}</span></div></div>` : null}
           <div class=${"sdopts" + (f.vision ? "" : " off")} data-k="mmproj">
             <div class=${"sdrow pick" + (!visCustom ? " sel" : "")} id="vs-default" onClick=${() => pickVision("default")}>
               <input type="radio" name="vs-src" aria-label=${t("Default")} checked=${!visCustom} disabled=${visOff}/>
@@ -861,7 +877,8 @@ export function ModelPage({ active, libraryAsked, currentAsked }) {
     const drafts = comps.filter((c) => c.kind !== "mmproj"), mmprojs = comps.filter((c) => c.kind === "mmproj");
     const renderRow = (c, sel, onToggle) => {
       const isMm = c.kind === "mmproj";
-      const kindTag = isMm ? ["mmproj", "info"] : c.kind === "dspark" ? ["DSpark", "ok"] : c.kind === "mtp" ? ["MTP", "ok"] : ["drafter", "ok"];
+      const kindTag = isMm ? ["mmproj", "info"] : c.kind === "dspark" ? ["DSpark", "ok"]
+                    : c.kind === "dflash2" ? ["DFlash2", "ok"] : c.kind === "mtp" ? ["MTP", "ok"] : ["drafter", "ok"];
       const sub = c.path && c.path !== c.file ? c.path : "";
       return html`
         <div class=${"mrow comp" + (sel ? " sel" : "")} data-comp=${c.key} data-kind=${c.kind} role="option" aria-selected=${String(sel)}
@@ -995,12 +1012,8 @@ export function ModelPage({ active, libraryAsked, currentAsked }) {
   function hubList() {
     const list = found ? found.models : [];
     const archs = found && Array.isArray(found.architectures) ? found.architectures : [];
-    const familyText = archs.length
-      ? t("Showing supported models (" + archs.join(", ") + "). Search for any other.")
-      : found && found.query ? t("Showing " + found.query + " models, the family this build runs. Search for any other.") : "";
     const showPager = !!found && !foundMsg && (page > 0 || !!found.next_cursor);
     return html`
-      ${found && found.family && familyText ? html`<div class="hub-note" id="hf-family">${familyText}</div>` : null}
       ${found && found.family && archs.length > 1 ? html`
         <div class="hub-archs pills" id="hf-archs" role="group">
           <button type="button" data-arch="" aria-pressed=${String(arch === "")} onClick=${() => setArch("")}>${t("All")}</button>
@@ -1020,7 +1033,7 @@ export function ModelPage({ active, libraryAsked, currentAsked }) {
         <button key=${m.id} class=${"prow" + (m.id === repoSel ? " sel" : "")} data-repo=${m.id} onClick=${() => showRepo(m.id, "")}>
           <span class="pn">${m.id.split("/")[1]}</span>
           <span class="pm"><${Icon} name="heart"/>${compact(m.likes)}<${Icon} name="dl"/>${compact(m.downloads)}</span>
-          <span class="ps">${m.id.split("/")[0]}${m.architecture ? html` <span class=${"tag2" + (m.runs === false ? " bad" : "")}>${m.architecture}</span>` : null}${m.cached ? html` <span class="tag2 info">${t("downloaded")}</span>` : null}${m.gated ? html` <span class="tag2">${t("gated")}</span>` : null}</span>
+          <span class="ps">${m.id.split("/")[0]}${m.architecture ? html` <span class=${"tag2" + (m.runs === false ? " bad" : m.drafter ? " ok" : "")}>${m.architecture}</span>` : m.drafter ? html` <span class="tag2 ok">${t("drafter")}</span>` : null}${m.cached ? html` <span class="tag2 info">${t("downloaded")}</span>` : null}${m.gated ? html` <span class="tag2">${t("gated")}</span>` : null}</span>
           <span class="pt">${t(ago(m.updated || m.created))}</span>
         </button>`)}</div>` : null}
       ${showPager ? html`
@@ -1050,9 +1063,14 @@ export function ModelPage({ active, libraryAsked, currentAsked }) {
     const comps = rawComps.map((c) => Object.assign({}, c, { key: c.name, spec: c.disk || c.name }));
     const selDraft = comps.find((c) => c.kind !== "mmproj" && c.key === hubDraft) || null;
     const selMm = comps.find((c) => c.kind === "mmproj" && c.key === hubMmproj) || null;
-    const { action: compAction, overrides: compOverrides } = companionBarState(rows, selDraft, selMm, () => { setHubDraft(""); setHubMmproj(""); });
+    const barState = companionBarState(rows, selDraft, selMm, () => { setHubDraft(""); setHubMmproj(""); });
+    const compAction = barState.action || (j && j.drafter && !rows.length && !comps.length
+      ? { title: repoSel, sub: (entryOf(repoSel) ? sized(j.drafter.size) + " on disk" : sized(j.drafter.size) + " to download first"),
+          label: "Draft with it", disabled: !model.id || busy, onClick: () => draftWith(repoSel) }
+      : null);
+    const compOverrides = barState.overrides;
     const unsupported = j && j.runs === false;
-    const note = unsupported ? "This build does not run this architecture." : j && !rows.length ? "Nothing here to load." : "";
+    const note = unsupported ? "This build does not run this architecture." : j && !rows.length && !j.drafter_repo && !j.drafter ? "Nothing here to load." : "";
     const chips = [];
     if (info.pipeline) chips.push([info.pipeline, ""]);
     if (info.architecture) chips.push([info.architecture, unsupported ? "bad" : j.runs ? "ok" : ""]);
@@ -1087,12 +1105,12 @@ export function ModelPage({ active, libraryAsked, currentAsked }) {
         ${rows.length ? html`
           <div class="dsec">${t("Files")}<span>${t(rows.length + " quantizations")}</span></div>
           <div class="mrows" id="mf-files" role="listbox">${rowsView(rows)}</div>` : ""}
+        ${j && j.drafter_repo ? html`<div class="banner hint" id="hf-drafter-repo"><div class="grow2">${t("This repository holds a drafter, not a standalone model: choose a file below to draft with it.")}</div></div>` : null}
         ${comps.length ? html`
           <div class="dsec">${t("Companion files")}<span>${t("pick up to one drafter and one vision projector")}</span></div>
           ${companionsView("hf-companions", comps, hubDraft, setHubDraft, hubMmproj, setHubMmproj)}` : ""}
-        ${j && j.drafter ? html`<div class="banner hint"><div class="grow2">${t(repoSel + " is a drafter (" + gb(j.drafter.size) + " GB), not a model: it drafts for one, and is not loaded on its own.")}</div>
-          ${model.id ? html`<button class="btn sm" onClick=${() => draftWith(repoSel)}>${t("Draft with it")}</button>` : ""}</div>` : ""}
-        ${j && !j.drafter && !rows.length ? html`<p class="lead">${t("No GGUF files in " + repoSel + ".")}</p>` : ""}
+        ${j && j.drafter ? html`<div class="banner hint" id="hf-drafter-only"><div class="grow2">${t(repoSel + " is a drafter (" + gb(j.drafter.size) + " GB), not a model: it drafts for one, and is not loaded on its own.")}</div></div>` : ""}
+        ${j && !j.drafter && !j.drafter_repo && !rows.length ? html`<p class="lead">${t("No GGUF files in " + repoSel + ".")}</p>` : ""}
         ${j && (j.known_drafters || []).length ? html`
           <div class="banner hint" id="hf-drafters"><div class="grow2">${t("A DFlash2 drafter is published for this model.")} ${t("It often adds speed on top of MTP:")}
             ${" "}<code>${j.known_drafters[0]}</code></div>

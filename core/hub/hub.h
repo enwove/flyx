@@ -65,13 +65,14 @@ struct Found {
   std::string pipeline;
   std::string architecture;      // GGUF general.architecture from expand[]=gguf, empty when absent
   bool gated = false;
+  bool is_drafter = false;       // DFlash2 safetensors drafter or GGUF dflash drafter
 };
-// The Hub's repositories holding GGUF files whose names match `query` (every one when it is empty), at most `limit`,
-// ordered by `sort`: "trending", "downloads", "likes", "updated" or "created", the most first.  `cursor` resumes from
-// a previous call's *next_cursor (from the Hub's Link rel="next" header).  Only the Hub knows: false, with *err
-// saying why, offline or when it cannot be reached.
+// The Hub's repositories holding GGUF files (when `gguf_only` is true) whose names match `query` (every one when it is
+// empty), at most `limit`, ordered by `sort`: "trending", "downloads", "likes", "updated" or "created", the most first.
+// `cursor` resumes from a previous call's *next_cursor (from the Hub's Link rel="next" header).  Only the Hub knows:
+// false, with *err saying why, offline or when it cannot be reached.
 bool search(const std::string& query, const std::string& sort, int limit, std::vector<Found>* out, std::string* err,
-            const std::string& cursor = "", std::string* next_cursor = nullptr);
+            const std::string& cursor = "", std::string* next_cursor = nullptr, bool gguf_only = true);
 
 // The GGUF files of a repository a model can be read from, each with the quantization its name carries ("UD-IQ3_XXS"
 // for Qwen3.8-27B-UD-IQ3_XXS.gguf).  Left out: projectors, importance matrices, files under MTP/; split models are

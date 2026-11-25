@@ -267,12 +267,35 @@ bool in_use(const std::string& file, const std::vector<std::string>& used) {
 
 ojson repo_json(const hub::Repo& r) {
   const std::string snap = hub::snapshot_dir(r) + "/";
+  const bool dflash_gguf_repo = r.info.gguf_architecture == "dflash";
   ojson ggufs = ojson::array();
-  for (const hub::GgufChoice& c : hub::gguf_choices(r)) {
-    bool cached = c.complete;
-    for (const hub::RepoFile& p : c.parts) cached = cached && on_disk(snap + p.path);
-    ggufs.push_back({{"name", r.id + ":" + c.quant}, {"quant", c.quant}, {"size", c.total_size}, {"split", c.split},
-                     {"parts", int(c.parts.size())}, {"complete", c.complete}, {"cached", cached}});
+  ojson companions = ojson::array();
+  std::set<std::string> comp_paths;
+  auto push_comp = [&](const hub::RepoFile& f, const std::string& kind, bool is_default) {
+    if (!comp_paths.insert(f.path).second) return;
+    const std::string base = f.path.substr(f.path.rfind('/') + 1);
+    const bool cached = on_disk(snap + f.path);
+    const std::string disk = from_path((to_path(hub::snapshot_dir(r)) / to_path(f.path)).make_preferred());
+    companions.push_back({{"name", r.id + ":" + base},
+                          {"path", f.path},
+                          {"file", base},
+                          {"kind", kind},
+                          {"size", f.size},
+                          {"cached", cached},
+                          {"disk", cached ? ojson(disk) : ojson(nullptr)},
+                          {"default", is_default}});
+  };
+  const std::vector<hub::GgufChoice> choices = hub::gguf_choices(r);
+  if (dflash_gguf_repo) {
+    for (size_t idx = 0; idx < choices.size(); ++idx)
+      if (!choices[idx].split) push_comp(choices[idx].file, "dflash2", idx == 0);
+  } else {
+    for (const hub::GgufChoice& c : choices) {
+      bool cached = c.complete;
+      for (const hub::RepoFile& p : c.parts) cached = cached && on_disk(snap + p.path);
+      ggufs.push_back({{"name", r.id + ":" + c.quant}, {"quant", c.quant}, {"size", c.total_size}, {"split", c.split},
+                       {"parts", int(c.parts.size())}, {"complete", c.complete}, {"cached", cached}});
+    }
   }
   ojson mtp = nullptr;
   if (const hub::RepoFile* f = hub::mtp_file(r))
@@ -280,20 +303,7 @@ ojson repo_json(const hub::Repo& r) {
   ojson mmproj = nullptr;
   if (const hub::RepoFile* f = hub::mmproj_file(r))
     mmproj = {{"path", f->path}, {"size", f->size}, {"cached", on_disk(snap + f->path)}};
-  ojson companions = ojson::array();
-  for (const hub::CompanionFile& c : hub::companion_files(r)) {
-    const std::string base = c.file.path.substr(c.file.path.rfind('/') + 1);
-    const bool cached = on_disk(snap + c.file.path);
-    const std::string disk = from_path((to_path(hub::snapshot_dir(r)) / to_path(c.file.path)).make_preferred());
-    companions.push_back({{"name", r.id + ":" + base},
-                          {"path", c.file.path},
-                          {"file", base},
-                          {"kind", c.kind},
-                          {"size", c.file.size},
-                          {"cached", cached},
-                          {"disk", cached ? ojson(disk) : ojson(nullptr)},
-                          {"default", c.is_default}});
-  }
+  for (const hub::CompanionFile& c : hub::companion_files(r)) push_comp(c.file, c.kind, c.is_default);
   // A DFlash2 drafter's directory: config.json naming the architecture, and safetensors; no GGUF.
   uint64_t weights = 0;
   bool config = false;
@@ -306,9 +316,11 @@ ojson repo_json(const hub::Repo& r) {
   // What the Hub says of it; and, where it named the GGUFs' architecture, whether this build opens that one.
   const hub::RepoInfo& i = r.info;
   const std::vector<std::string> known = interfaces::model_architectures();
-  const ojson runs = i.gguf_architecture.empty()
-                         ? ojson(nullptr)
-                         : ojson(std::find(known.begin(), known.end(), i.gguf_architecture) != known.end());
+  const ojson runs = dflash_gguf_repo
+                         ? ojson(true)
+                         : i.gguf_architecture.empty()
+                               ? ojson(nullptr)
+                               : ojson(std::find(known.begin(), known.end(), i.gguf_architecture) != known.end());
   const ojson info = {{"downloads", i.downloads}, {"likes", i.likes}, {"updated", or_null(i.updated)},
                       {"license", or_null(i.license)}, {"pipeline", or_null(i.pipeline)}, {"gated", i.gated},
                       {"architecture", or_null(i.gguf_architecture)},
@@ -323,6 +335,7 @@ ojson repo_json(const hub::Repo& r) {
           {"mmproj", mmproj},
           {"companions", companions},
           {"drafter", ggufs.empty() && config && weights > 0 && hub::is_drafter(r) ? ojson({{"size", weights}}) : ojson(nullptr)},
+          {"drafter_repo", dflash_gguf_repo},
           {"architectures", r.architectures},
           {"known_drafters", apps::known_drafters(r.base_models)},
           {"info", r.from_cache ? ojson(nullptr) : info},
@@ -406,8 +419,47 @@ void add_manage_routes(httplib::Server& http, Server* s) {
     std::vector<hub::Found> found;
     std::string next_cursor, err;
     if (!asked.empty()) {
-      if (!hub::search(asked, sort, limit, &found, &err, cursor, &next_cursor))
+      if (!hub::search(asked, sort, limit, &found, &err, cursor, &next_cursor, /*gguf_only=*/true))
         return error(r, 502, err, "hub_error");
+      if (cursor.empty()) {
+        std::set<std::string> seen_ids;
+        for (const auto& f : found) seen_ids.insert(f.id);
+        std::string low = asked;
+        for (char& c : low) c = char(std::tolower(static_cast<unsigned char>(c)));
+        const bool drafter_query = low.find("dflash") != std::string::npos || low.find("dspark") != std::string::npos ||
+                                   low.find("drafter") != std::string::npos || low.find("mtp") != std::string::npos;
+        // Include safetensors DFlash2 drafter repos (which filter=gguf omits) when searching drafters or when no GGUF matches.
+        if (found.empty() || drafter_query) {
+          std::vector<hub::Found> extra;
+          std::string e2;
+          if (hub::search(asked, sort, limit, &extra, &e2, "", found.empty() ? &next_cursor : nullptr,
+                          /*gguf_only=*/false)) {
+            const bool take_all = found.empty();
+            for (auto& x : extra) {
+              if ((take_all || x.is_drafter) && seen_ids.insert(x.id).second) found.push_back(std::move(x));
+            }
+          }
+        }
+        // If the query names an exact repository (org/name), look it up directly so safetensors drafters or newly
+        // published repos are always found even when Hub search omits them.
+        hub::Name exact;
+        if (hub::parse_name(asked, &exact) && seen_ids.insert(exact.repo).second) {
+          hub::Repo repo;
+          std::string e2;
+          if (hub::describe(exact.repo, exact.revision, &repo, &e2)) {
+            hub::Found f;
+            f.id = repo.id;
+            f.downloads = repo.info.downloads;
+            f.likes = repo.info.likes;
+            f.updated = repo.info.updated;
+            f.pipeline = repo.info.pipeline;
+            f.architecture = repo.info.gguf_architecture;
+            f.gated = repo.info.gated;
+            f.is_drafter = hub::is_drafter(repo) || repo.info.gguf_architecture == "dflash";
+            found.insert(found.begin(), std::move(f));
+          }
+        }
+      }
     } else {
       // Without a query, browse GGUF repositories of every architecture this build runs (or one chosen via `arch`),
       // resuming cleanly across HF batches with a "<skip>:<hf_cursor>" cursor so nothing is skipped or duplicated.
@@ -461,10 +513,13 @@ void add_manage_routes(httplib::Server& http, Server* s) {
     const std::set<std::string> known_set(known.begin(), known.end());
     ojson models = ojson::array();
     for (const hub::Found& f : found) {
-      const ojson runs = f.architecture.empty() ? ojson(nullptr) : ojson(known_set.count(f.architecture) > 0);
+      const bool drafter = f.is_drafter || f.architecture == "dflash";
+      const ojson runs = drafter ? ojson(true)
+                                 : f.architecture.empty() ? ojson(nullptr) : ojson(known_set.count(f.architecture) > 0);
       models.push_back({{"id", f.id}, {"downloads", f.downloads}, {"likes", f.likes}, {"updated", or_null(f.updated)},
                         {"created", or_null(f.created)}, {"pipeline", or_null(f.pipeline)}, {"gated", f.gated},
-                        {"cached", here.count(f.id) > 0}, {"architecture", or_null(f.architecture)}, {"runs", runs}});
+                        {"cached", here.count(f.id) > 0}, {"architecture", or_null(f.architecture)}, {"runs", runs},
+                        {"drafter", drafter}});
     }
     send_json(r, 200,
               {{"query", asked},

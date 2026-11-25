@@ -615,6 +615,7 @@ export default {
     "Vision projector": "Vision-Projektor",
     "pick up to one": "höchstens eins wählen",
     "Use selected companions": "Ausgewählte Begleitdateien verwenden",
+    "This repository holds a drafter, not a standalone model: choose a file below to draft with it.": "Dieses Repository enthält einen Drafter, kein eigenständiges Modell: Wähle unten eine Datei zum Entwerfen aus.",
     "Hub mirror": "Hub-Mirror",
     "Hugging Face mirror or endpoint": "Hugging Face-Mirror oder Endpunkt",
     "Apply": "Anwenden",

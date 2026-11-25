@@ -87,7 +87,23 @@ FOUND_PAGE2 = {"query": "", "family": True, "architectures": ["qwen35", "qwen3",
 
 
 def repository(repo):
-    """GET /v1/hub/files: REPO as this build runs it, any other of an architecture it does not."""
+    """GET /v1/hub/files: REPO as this build runs it, a dflash GGUF drafter repo, a safetensors drafter repo, or unsupported."""
+    if repo == "acme/Model-DFlash2-GGUF":
+        return {"repo": repo, "from_cache": False, "drafter": None, "drafter_repo": True, "base_models": ["acme/Tiny-27B"],
+                "runs": True, "known_drafters": [], "build_architectures": ["qwen35", "qwen3"],
+                "mtp": None, "mmproj": None, "ggufs": [],
+                "companions": [{"name": repo + ":Model-DFlash2-Draft-BF16.gguf", "path": "Model-DFlash2-Draft-BF16.gguf",
+                                "file": "Model-DFlash2-Draft-BF16.gguf", "kind": "dflash2",
+                                "size": int(0.5 * GB), "cached": False, "disk": None, "default": True}],
+                "info": {"downloads": 12, "likes": 1, "updated": "2026-11-24T02:15:52.000Z", "license": "apache-2.0",
+                         "pipeline": "text-generation", "gated": False, "architecture": "dflash",
+                         "context": 1048576, "parameters": 495000000}}
+    if repo == "acme/Model-DFlash2":
+        return {"repo": repo, "from_cache": False, "drafter": {"size": int(0.9 * GB)}, "drafter_repo": False,
+                "base_models": ["acme/Tiny-27B"], "runs": None, "known_drafters": [],
+                "build_architectures": ["qwen35", "qwen3"], "mtp": None, "mmproj": None, "ggufs": [], "companions": [],
+                "info": {"downloads": 500, "likes": 25, "updated": "2026-11-24T02:15:52.000Z", "license": "apache-2.0",
+                         "pipeline": None, "gated": False, "architecture": None, "context": None, "parameters": None}}
     runs = repo == REPO
     quants = [("IQ3_XXS", 11.8, True), ("Q4_K_M", 17.6, True), ("Q5_K_M", 19.4, False), ("Q6_K", 22.3, False), ("BF16", 54.7, False)]
     return {"repo": repo, "from_cache": False, "drafter": None, "base_models": ["acme/Tiny-27B"], "runs": runs,
@@ -403,14 +419,23 @@ def check_vision(page, server, open_page, want):
     tm_on["model"]["drafter"] = "mtp"
     tm_on["model"]["max_width"] = 4
     tm_on["model"]["vision"] = True
+    tm_on["load"]["vision_projector"] = {"from": "acme/Tiny-27B-GGUF/mmproj-BF16.gguf", "size": int(0.9 * GB)}
     on_page, _ = open_page(tm_on)
+    # Active drafter and vision sources live in their settings tabs rather than inflating the Serving card.
+    expect(on_page.locator(".srv #ld-drafters")).to_have_count(0)
+    expect(on_page.locator(".srv #ld-vision-src")).to_have_count(0)
     spec_dot = on_page.locator('#lset-tabs [data-stab="spec"] .dot')
     vis_dot = on_page.locator('#lset-tabs [data-stab="vision"] .dot')
     expect(spec_dot).to_have_class(re.compile(r"\bon\b"))
     expect(vis_dot).to_have_class(re.compile(r"\bon\b"))
     expect(on_page.locator('#lset-tabs [data-stab="spec"] .sum')).to_have_text("default")
     expect(on_page.locator('#lset-tabs [data-stab="vision"] .sum')).to_have_text("disk · q8")
+    on_page.locator('#lset-tabs [data-stab="spec"]').click()
+    expect(on_page.locator("#lset-spec #ld-drafters")).to_be_visible()
+    expect(on_page.locator("#lset-spec #ld-drafters")).to_contain_text("MTP")
     on_page.locator('#lset-tabs [data-stab="vision"]').click()
+    expect(on_page.locator("#lset-vision #ld-vision-src")).to_be_visible()
+    expect(on_page.locator("#lset-vision #ld-vision-src")).to_contain_text("mmproj-BF16.gguf")
     on_page.locator("#vs-on").uncheck(force=True)
     expect(vis_dot).not_to_have_class(re.compile(r"\bon\b"))
     on_page.close()
@@ -420,8 +445,10 @@ def check_hub(page, server, want):
     """The library's Hugging Face side: supported architectures, filter pills, pagination, files, a file loaded."""
     view(page, "library")
     expect(page.locator("#hf-list .prow")).to_have_count(3)
-    expect(page.locator("#hf-family")).to_contain_text("qwen35, qwen3, inkling2_loop")
+    expect(page.locator("#hf-family")).to_have_count(0)
     expect(page.locator("#hf-archs button")).to_have_count(4)
+    expect(page.locator("#hf-archs")).to_contain_text("qwen35")
+    expect(page.locator("#hf-archs")).to_contain_text("inkling2_loop")
     expect(page.locator("#hf-pager")).to_be_visible()
     expect(page.locator("#hf-prev")).to_be_disabled()
     expect(page.locator("#hf-page")).to_have_text("Page 1")
@@ -543,6 +570,25 @@ def check_hub(page, server, want):
     expect(page.locator("#hf-unsupported")).to_contain_text("gemma4")
     page.locator('#mf-files .mrow[data-name$=":Q5_K_M"]').click()
     expect(page.locator("#mf-load")).to_be_disabled()
+    # A dflash GGUF drafter repo is never marked unsupported and lets the user draft with its GGUF directly.
+    page.locator("#hf-q").fill("acme/Model-DFlash2-GGUF")
+    expect(page.locator("#hf-name")).to_have_text("Model-DFlash2-GGUF")
+    expect(page.locator("#hf-unsupported")).to_have_count(0)
+    expect(page.locator("#hf-drafter-repo")).to_be_visible()
+    page.locator('#hf-companions .mrow[data-kind="dflash2"]').click()
+    expect(page.locator("#mf-load")).to_have_text("Draft with it")
+    page.locator("#mf-load").click()
+    expect(page.locator("#mv-current")).to_be_visible()
+    expect(page.locator("#sd-file")).to_have_value("acme/Model-DFlash2-GGUF:Model-DFlash2-Draft-BF16.gguf")
+    expect(page.locator("#mf-cmd")).to_contain_text("--drafter dflash2")
+    page.locator("#mf-reset").click()
+    # Typing a safetensors DFlash2 repo org/name auto-opens it without Enter and offers Draft with it.
+    view(page, "library")
+    page.locator("#hf-q").fill("acme/Model-DFlash2")
+    expect(page.locator("#hf-name")).to_have_text("Model-DFlash2")
+    expect(page.locator("#hf-drafter-only")).to_be_visible()
+    expect(page.locator("#mf-load")).to_have_text("Draft with it")
+    page.locator("#hf-q").fill("")
     # A name with its quantization, in the search box: that file of that repository.
     page.locator("#hf-q").fill(REPO + ":q6_k")
     page.keyboard.press("Enter")

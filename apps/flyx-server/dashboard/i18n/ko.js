@@ -615,6 +615,7 @@ export default {
     "Vision projector": "비전 프로젝터",
     "pick up to one": "최대 1개 선택",
     "Use selected companions": "선택한 동반 파일 사용",
+    "This repository holds a drafter, not a standalone model: choose a file below to draft with it.": "이 저장소는 단독 모델이 아니라 drafter입니다. 아래에서 파일을 선택해 추측 디코딩에 사용하세요.",
     "Hub mirror": "Hub 미러",
     "Hugging Face mirror or endpoint": "Hugging Face 미러 또는 엔드포인트",
     "Apply": "적용",

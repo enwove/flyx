@@ -423,7 +423,7 @@ std::string extract_next_cursor(const std::string& link) {
 }
 
 bool search(const std::string& query, const std::string& sort, int limit, std::vector<Found>* out, std::string* err,
-            const std::string& cursor, std::string* next_cursor) {
+            const std::string& cursor, std::string* next_cursor, bool gguf_only) {
   out->clear();
   if (next_cursor) next_cursor->clear();
   if (offline()) return *err = "HF_HUB_OFFLINE is set: the Hub is not asked", false;
@@ -431,10 +431,11 @@ bool search(const std::string& query, const std::string& sort, int limit, std::v
                  : sort == "created" ? "createdAt" : "trendingScore";
   os::HttpGet g;
   // expand[]: returns GGUF architecture, timestamps, counts and gated status without full sibling file lists.
-  g.url = endpoint() + "/api/models?filter=gguf&direction=-1&sort=" + by + "&limit=" +
+  g.url = endpoint() + "/api/models?" + (gguf_only ? "filter=gguf&" : "") + "direction=-1&sort=" + by + "&limit=" +
           std::to_string(std::clamp(limit, 1, 100)) +
           "&expand[]=gguf&expand[]=downloads&expand[]=likes&expand[]=lastModified&expand[]=createdAt"
           "&expand[]=pipeline_tag&expand[]=gated" +
+          (gguf_only ? "" : "&expand[]=config") +
           (query.empty() ? "" : "&search=" + detail::url_query(query)) +
           (cursor.empty() ? "" : "&cursor=" + detail::url_query(cursor));
   g.headers = detail::auth_headers();
@@ -455,6 +456,13 @@ bool search(const std::string& query, const std::string& sort, int limit, std::v
     f.updated = str_field(m, "lastModified"), f.created = str_field(m, "createdAt");
     f.pipeline = str_field(m, "pipeline_tag"), f.gated = gated_field(m);
     if (const auto gg = m.find("gguf"); gg != m.end() && gg->is_object()) f.architecture = str_field(*gg, "architecture");
+    if (f.architecture == "dflash") f.is_drafter = true;
+    if (const auto cfg = m.find("config"); cfg != m.end() && cfg->is_object()) {
+      if (const auto archs = cfg->find("architectures"); archs != cfg->end() && archs->is_array()) {
+        for (const auto& a : *archs)
+          if (a.is_string() && a.get<std::string>() == "DFlash2DraftModel") f.is_drafter = true;
+      }
+    }
     out->push_back(std::move(f));
   }
   if (next_cursor) *next_cursor = extract_next_cursor(link);

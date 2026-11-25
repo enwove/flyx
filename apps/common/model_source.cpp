@@ -201,9 +201,13 @@ bool one(const std::string& spec, const hub::ProgressFn& progress, const std::at
   return true;
 }
 
-// What kind of drafter a file or directory given beside a model holds: a GGUF, an MTP layer; a.flyx
-// file or a directory of config and safetensors, a DFlash2 drafter.
-std::string drafter_kind(const std::string& path) { return lower(path).ends_with(".gguf") ? "mtp" : "dflash2"; }
+// What kind of drafter a file or directory given beside a model holds: a GGUF holds a DFlash2 drafter or MTP layer;
+// a .flyx file or a directory of config and safetensors holds a DFlash2 drafter.
+std::string drafter_kind(const std::string& path) {
+  const std::string lp = lower(path);
+  if (lp.ends_with(".gguf")) return lp.find("dflash") != std::string::npos ? "dflash2" : "mtp";
+  return "dflash2";
+}
 
 }  // namespace
 

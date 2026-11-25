@@ -418,6 +418,21 @@ bool select(const Repo& r, const Name& name, std::vector<RepoFile>* files, std::
         *files = {comp->file};
         return true;
       }
+      if (want.ends_with(".gguf")) {
+        const RepoFile* direct = nullptr;
+        for (const RepoFile& f : r.files)
+          if (detail::lower(f.path) == want) direct = &f;
+        if (!direct)
+          for (const RepoFile& f : r.files)
+            if (detail::lower(detail::base_name(f.path)) == want) {
+              direct = &f;
+              break;
+            }
+        if (direct) {
+          *files = {*direct};
+          return true;
+        }
+      }
       return *err = r.id + " has no GGUF file for \"" + name.quant + "\"; it has:" + listing(), false;
     }
     if (pick->split && !pick->complete)
