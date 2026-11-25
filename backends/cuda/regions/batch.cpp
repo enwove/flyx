@@ -400,8 +400,10 @@ void run_batch(const BatchPass& bp) {
         mtp_members.push_back(idx);
         continue;
       }
+      // A grouped chain must use the same block size it uses alone. Noncausal attention can see later rows.
       if (const auto* d = std::get_if<DFlashBlock>(ps.p->block[0]);
-          d && df.dx && d->block > 0 && d->block * 2 <= FLYX_MAX_ROWS && (!dflash_blk || dflash_blk == d)) {
+          d && df.dx && ps.p->nodes[0].arg0 < d->block && d->block * 2 <= FLYX_MAX_ROWS &&
+          (!dflash_blk || dflash_blk == d)) {
         dflash_blk = d;
         dflash_members.push_back(idx);
         continue;

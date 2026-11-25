@@ -26,7 +26,8 @@ pre-tokenizer, and the <s> its post-processor puts before a text),
 tiny_gdn128.flyx, golden_gdn128.json, tiny_w4a4.flyx
 (NVFP4 inputs in long passes; checked against the float64 backend); the
 drafter alone as z-lab publishes DFlash2 drafters (hf_draft_zlab/) converted
-to a drafter file (tiny_draft.flyx), and with a sliding window of 8
+to a drafter file (tiny_draft.flyx), with blocks of 8 and 7 (tiny_block8.flyx and tiny_block7.flyx),
+and with a sliding window of 8
 (hf_draft_window/: tiny_window.flyx with the target, golden_window.json,
 and alone, tiny_draft_window.flyx).  dv_cases.json: DV's trees, selector tables and
 canvas steps from the Python reference, for the float64 references in ops/
@@ -50,8 +51,9 @@ ROOT = os.path.join(HERE, "..", "..")
 STAMP = ".inputs"
 OUTPUTS = ("tiny.flyx", "tiny_nvfp4.flyx", "tiny_qwen3.flyx", "tiny_gdn128.flyx", "tiny_w4a4.flyx",
            "golden.json", "golden_nvfp4.json", "golden_qwen3.json", "golden_gdn128.json", "tokenizer_cases.json",
-           "chat_cases.json", "tiny_draft.flyx", "tiny_window.flyx", "golden_window.json",
-           "tiny_draft_window.flyx", "tiny_w4a4_a16.flyx", "tiny_llama.flyx", "golden_llama.json",
+           "chat_cases.json", "tiny_draft.flyx", "tiny_block8.flyx", "tiny_block7.flyx",
+           "tiny_window.flyx", "golden_window.json", "tiny_draft_window.flyx", "tiny_w4a4_a16.flyx",
+           "tiny_llama.flyx", "golden_llama.json",
            "tokenizer_cases_minicpm5.json", "dv_cases.json", "tiny_llama_dv.flyx", "tiny_llama_dv_pool.flyx",
            "tiny_llama_dv32.flyx", "tiny_llama_dv31.flyx", "tiny_llama_dv31_pool.flyx", "tiny_llama_dv31_wide.flyx",
            "tiny_llama_dv31_wide_pool.flyx", "golden_llama_dv.json", "tiny_llama_nvfp4.flyx", "golden_llama_nvfp4.json",
@@ -460,10 +462,11 @@ def main(out):
     convert(tdir, wpath, wdir, log=lambda *_: None)
     write_golden(wpath, os.path.join(out, "golden_window.json"), prompts, vocab)
     convert_draft(wdir, os.path.join(out, "tiny_draft_window.flyx"), log=lambda *_: None)
-    # A drafter whose block (8) is less than a round's rows: its chains of 15 draft from a wider block.
-    bdir = os.path.join(out, "hf_draft_block8")
-    zlab_drafter(ddir, bdir, layers, block=8)
-    convert(tdir, os.path.join(out, "tiny_block8.flyx"), bdir, log=lambda *_: None)
+    # Chains of 15 widen the 8-row block. With 7 native rows, two widened chains of 7 fit in one batch.
+    for block in (8, 7):
+        bdir = os.path.join(out, f"hf_draft_block{block}")
+        zlab_drafter(ddir, bdir, layers, block=block)
+        convert(tdir, os.path.join(out, f"tiny_block{block}.flyx"), bdir, log=lambda *_: None)
     # The same model with NVFP4 linears (as NVIDIA ModelOpt stores them).
     qdir = os.path.join(out, "hf_target_nvfp4")
     make_nvfp4_dir(tdir, qdir)
@@ -546,7 +549,8 @@ def main(out):
           f"tokenizer_cases.json ({len(cases)}), chat_cases.json ({n_chat}), tiny_qwen3.flyx, "
           f"golden_qwen3.json ({n3} prompts), tiny_llama.flyx, golden_llama.json ({nl} prompts), "
           f"tokenizer_cases_minicpm5.json ({len(lcases)}), "
-          f"tiny_gdn128.flyx, golden_gdn128.json, tiny_draft.flyx, tiny_window.flyx, golden_window.json, "
+          f"tiny_gdn128.flyx, golden_gdn128.json, tiny_draft.flyx, tiny_block8.flyx, tiny_block7.flyx, "
+          f"tiny_window.flyx, golden_window.json, "
           f"tiny_draft_window.flyx, tiny_w4a4.flyx, tiny_w4a4_a16.flyx, dv_cases.json, tiny_llama_dv.flyx, "
           f"tiny_llama_dv_pool.flyx, tiny_llama_dv32.flyx, tiny_llama_dv31.flyx, tiny_llama_dv31_pool.flyx, "
           f"tiny_llama_dv31_wide.flyx, tiny_llama_dv31_wide_pool.flyx, golden_llama_dv.json ({nd} rounds), "
