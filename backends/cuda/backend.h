@@ -1026,10 +1026,20 @@ struct RowView {
 // The sequence's row buffers (its own when bufs is null, or the prefill buffers it borrows), on its stream.
 RowView rows_of(flyx_seq* s, RowBufs* bufs = nullptr);
 
+// Deferred post-sublayer ShortConv + residual update fused into the next sublayer's AttnRes + RMSNorm in rounds.
+struct PendingPostConv {
+  const float* post_raw = nullptr;
+  const float* conv_w = nullptr;
+  int sconv = -1, ch_off = 0, conv = 0;
+  bool res_push = false;
+};
+
 // Pass-local host counters for Inkling-2 Block Attention Residuals / loop passes (compile-time constants per node,
 // safe during CUDA graph capture).
 struct ResState {
   int res_n = 0, prelude_n = 0, loop_n = 0;
+  float* x_cur = nullptr;       // active residual buffer (rv.b.x or rv.b.post_out)
+  PendingPostConv pending{};    // deferred post_conv to fuse into next sublayer
 };
 
 struct Pass {

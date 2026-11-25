@@ -174,6 +174,8 @@ int main() {
   test_inkling2_loop_control();
   test_inkling2_linear_f32();
   test_inkling2_shortconv();
+  test_inkling2_sublayer_fusion();
+  test_inkling2_rel_prep_kv_sc();
   test_inkling2_rel_attn();
   test_inkling2_rel_strata();
   test_inkling2_moe();

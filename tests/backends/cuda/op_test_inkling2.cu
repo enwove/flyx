@@ -2045,4 +2045,361 @@ void test_dspark() {
   }
 }
 
+void test_inkling2_sublayer_fusion() {
+  std::printf("inkling2 shortconv_res_mix_norm + res_src flush\n");
+  // 1. shortconv_pass with separate res_src matches memcpy + in-place accumulate bit-for-bit.
+  {
+    const int R = 6, H = 2560, conv = 4, hist = conv - 1, ch_off = 512, ch_total = H + ch_off;
+    seed("inkling2_shortconv_res_src", R, H);
+    Vec raw = randv(size_t(R) * H, 1.0);
+    Vec cw = randv(size_t(H) * conv, 0.3);
+    Vec st0 = randv(size_t(hist) * ch_total, 0.4);
+    Vec xsrc = randv(size_t(R) * H, 0.8);
+    DevParams* P = params(0, 0);
+    const size_t w_stride = size_t(hist) * ch_total;
+    float* d_win = dev<float>(FLYX_ROUND_SLOTS * w_stride);
+    std::vector<float> h_st0(st0.begin(), st0.end());
+    CK(cudaMemcpy(d_win, h_st0.data(), w_stride * sizeof(float), cudaMemcpyHostToDevice));
+    float* d_raw = up(raw);
+    float* d_cw = up(cw);
+    float* d_xsrc = up(xsrc);
+    float* d_ref = up(xsrc);
+    float* d_got = dev<float>(size_t(R) * H);
+    shortconv_pass(d_raw, H, d_cw, nullptr, d_win, w_stride, kSlotCur, -1, kSkipNever, nullptr, 0, kSlotCur, ch_off,
+                   ch_total, H, conv, 0, P, R, d_ref, H, 0, true);
+    shortconv_pass(d_raw, H, d_cw, nullptr, d_win, w_stride, kSlotCur, -1, kSkipNever, nullptr, 0, kSlotCur, ch_off,
+                   ch_total, H, conv, 0, P, R, d_got, H, 0, true, d_xsrc);
+    expect_device_bits("shortconv_pass res_src == in-place accumulate", d_got, d_ref, size_t(R) * H);
+    cudaFree(P);
+    cudaFree(d_win);
+    cudaFree(d_raw);
+    cudaFree(d_cw);
+    cudaFree(d_xsrc);
+    cudaFree(d_ref);
+    cudaFree(d_got);
+  }
+
+  // 2. shortconv_res_mix_norm bit-identical across U=5 (H=2560) & U=10 (H=3072), R=1 & R=8,
+  //    res_push=false/true, nb=0/5, and all 4 SublayerNorm modes (None, F32, MoeQ8, AttnQ8Split).
+  struct Case {
+    int R, H, nb, nq;
+    bool res_push, direct, moe_mins;
+    SublayerNorm norm;
+    const char* name;
+  };
+  const Case cases[] = {
+      {1, 2560, 0, 1, false, true, false, SublayerNorm::None, "R=1 H=2560 nb=0 None direct"},
+      {8, 2560, 5, 3, true, false, false, SublayerNorm::None, "R=8 H=2560 nb=5 nq=3 push None"},
+      {8, 2560, 5, 1, true, false, false, SublayerNorm::F32, "R=8 H=2560 nb=5 push F32"},
+      {8, 2560, 5, 1, false, false, false, SublayerNorm::MoeQ8, "R=8 H=2560 nb=5 MoeQ8"},
+      {1, 2560, 5, 1, true, true, true, SublayerNorm::MoeQ8, "R=1 H=2560 nb=5 push MoeQ8+mins direct"},
+      {8, 2560, 5, 1, false, false, false, SublayerNorm::AttnQ8Split, "R=8 H=2560 nb=5 nq=1 AttnQ8Split"},
+      {8, 2560, 5, 3, true, false, false, SublayerNorm::AttnQ8Split, "R=8 H=2560 nb=5 nq=3 push AttnQ8Split"},
+      {4, 3072, 3, 3, true, false, false, SublayerNorm::AttnQ8Split, "R=4 H=3072 (U=10) nb=3 nq=3 AttnQ8Split"},
+  };
+  for (const Case& tc : cases) {
+    const int R = tc.R, H = tc.H, nb = tc.nb, nq = tc.nq, conv = 4, hist = conv - 1;
+    const int ch_off = 256, ch_total = ch_off + H;
+    seed("inkling2_sublayer_fusion", R, H, nb, nq, int(tc.res_push), int(tc.norm), int(tc.moe_mins));
+    Vec raw = randv(size_t(R) * H, 1.0);
+    Vec cw = randv(size_t(H) * conv, 0.3);
+    Vec st0 = randv(size_t(hist) * ch_total, 0.5);
+    Vec xsrc = randv(size_t(R) * H, 0.9);
+    Vec bank0 = randv(size_t(nb + 1) * R * H, 0.8);
+    Vec queries = randv(size_t(nq) * H, 0.5);
+    Vec nw = randv(H, 0.5);
+    const float noff = 0.f, neps = 1e-6f;
+
+    DevParams* P = params(0, 0);
+    const size_t w_stride = size_t(hist) * ch_total;
+    const size_t r_stride = size_t(R) * ch_total;
+    std::vector<float> h_st0(st0.begin(), st0.end());
+    float* d_raw = up(raw);
+    float* d_cw = up(cw);
+    float* d_xsrc = up(xsrc);
+    float* d_q = up(queries);
+    float* d_nw = up(nw);
+
+    float* d_win_ref = dev<float>(FLYX_ROUND_SLOTS * w_stride);
+    float* d_win_got = dev<float>(FLYX_ROUND_SLOTS * w_stride);
+    CK(cudaMemcpy(d_win_ref, h_st0.data(), w_stride * sizeof(float), cudaMemcpyHostToDevice));
+    CK(cudaMemcpy(d_win_got, h_st0.data(), w_stride * sizeof(float), cudaMemcpyHostToDevice));
+    float* d_rep_ref = dev<float>(kGdnReplaySlots * r_stride);
+    float* d_rep_got = dev<float>(kGdnReplaySlots * r_stride);
+    float* d_bank_ref = up(bank0);
+    float* d_bank_got = up(bank0);
+    float* d_x_ref = up(xsrc);
+    float* d_x_got = dev<float>(size_t(R) * H);
+    float* d_mix_ref = dev<float>(size_t(nq) * R * H);
+    float* d_mix_got = dev<float>(size_t(nq) * R * H);
+    float* d_ny_ref = dev<float>(size_t(R) * H);
+    float* d_ny_got = dev<float>(size_t(R) * H);
+
+    // Reference: separate shortconv_pass + res_push + attn_res_mix + norm.
+    const int next_sel = tc.direct ? kSlotNext : -1;
+    int eff_nb = nb;
+    if (tc.res_push) {
+      CK(cudaMemcpy(d_bank_ref + size_t(nb) * R * H, d_x_ref, size_t(R) * H * sizeof(float), cudaMemcpyDeviceToDevice));
+      ++eff_nb;
+    }
+    shortconv_pass(d_raw, H, d_cw, nullptr, d_win_ref, w_stride, kSlotCur, next_sel, kSkipNever, d_rep_ref, r_stride,
+                   kSlotCur, ch_off, ch_total, H, conv, 0, P, R, d_x_ref, H, 0, !tc.res_push);
+    attn_res_mix(d_bank_ref, eff_nb, d_x_ref, d_q, nq, R, H, d_mix_ref, 0);
+
+    MoeScratch msc_ref{}, msc_got{};
+    const size_t q8_n = size_t(R) * H;
+    if (tc.norm == SublayerNorm::MoeQ8) {
+      msc_ref.q8_a = dev<int8_t>(q8_n);
+      msc_ref.q8_d = dev<float>(q8_n / 32);
+      msc_ref.q8_s = dev<float>(q8_n / 16);
+      msc_got.q8_a = dev<int8_t>(q8_n);
+      msc_got.q8_d = dev<float>(q8_n / 32);
+      msc_got.q8_s = dev<float>(q8_n / 16);
+      rmsnorm_moe_q8(d_mix_ref, H, d_nw, noff, neps, d_ny_ref, H, R, H, msc_ref, tc.moe_mins, 0);
+    } else if (tc.norm == SublayerNorm::F32) {
+      rmsnorm(d_mix_ref, H, d_nw, noff, neps, d_ny_ref, H, R, H, 0);
+    }
+
+    // Separate Scratch buffers for AttnQ8Split comparison.
+    std::vector<uint8_t> ref_q8, got_q8;
+    std::vector<float> ref_d, got_d, ref_s, got_s;
+    std::vector<uint16_t> ref_hi, got_hi, ref_mid, got_mid, ref_lo, got_lo;
+    if (tc.norm == SublayerNorm::AttnQ8Split) {
+      rmsnorm_q8_split(d_mix_ref, H, d_nw, noff, neps, R, H, TL);
+      CK(cudaDeviceSynchronize());
+      ref_q8.resize(q8_n);
+      ref_d.resize(q8_n / 32);
+      ref_s.resize(q8_n / 16);
+      ref_hi.resize(q8_n);
+      ref_mid.resize(q8_n);
+      ref_lo.resize(q8_n);
+      const size_t scap = TL.scratch->split_cap;
+      CK(cudaMemcpy(ref_q8.data(), TL.scratch->q8, q8_n, cudaMemcpyDeviceToHost));
+      CK(cudaMemcpy(ref_d.data(), TL.scratch->q8_scale, ref_d.size() * 4, cudaMemcpyDeviceToHost));
+      CK(cudaMemcpy(ref_s.data(), TL.scratch->q8_sums, ref_s.size() * 4, cudaMemcpyDeviceToHost));
+      CK(cudaMemcpy(ref_hi.data(), TL.scratch->split, q8_n * 2, cudaMemcpyDeviceToHost));
+      CK(cudaMemcpy(ref_mid.data(), TL.scratch->split + scap, q8_n * 2, cudaMemcpyDeviceToHost));
+      CK(cudaMemcpy(ref_lo.data(), TL.scratch->split + 2 * scap, q8_n * 2, cudaMemcpyDeviceToHost));
+      CK(cudaMemset(TL.scratch->q8, 0x55, q8_n));
+      CK(cudaMemset(TL.scratch->split, 0x55, q8_n * 2));
+      CK(cudaMemset(TL.scratch->split + scap, 0x55, q8_n * 2));
+      CK(cudaMemset(TL.scratch->split + 2 * scap, 0x55, q8_n * 2));
+    }
+
+    // Fused: shortconv_res_mix_norm.
+    SublayerPostConv spc{d_raw,    d_cw,  d_win_got, w_stride, kSlotCur, next_sel, kSkipNever,
+                         d_rep_got, r_stride, kSlotCur,  ch_off,   ch_total, conv,     tc.res_push};
+    shortconv_res_mix_norm(spc, d_xsrc, d_x_got, d_bank_got, nb, d_q, nq,
+                           (tc.norm == SublayerNorm::None || nq > 1) ? d_mix_got : nullptr, tc.norm, d_nw, noff, neps,
+                           d_ny_got, H, tc.norm == SublayerNorm::MoeQ8 ? &msc_got : nullptr, tc.moe_mins, P, R, H, TL);
+
+    const std::string tag = std::string("sublayer ") + tc.name;
+    expect_device_bits(tag + " x_dst", d_x_got, d_x_ref, size_t(R) * H);
+    expect_device_bits(tag + " replay", d_rep_got, d_rep_ref, r_stride);
+    if (tc.res_push) expect_device_bits(tag + " bank push", d_bank_got + size_t(nb) * R * H, d_bank_ref + size_t(nb) * R * H, size_t(R) * H);
+    if (tc.direct) expect_device_bits(tag + " win_out", d_win_got + w_stride, d_win_ref + w_stride, w_stride);
+    if (tc.norm == SublayerNorm::None) {
+      expect_device_bits(tag + " mix_out", d_mix_got, d_mix_ref, size_t(nq) * R * H);
+    } else if (tc.norm == SublayerNorm::F32) {
+      expect_device_bits(tag + " norm_y", d_ny_got, d_ny_ref, size_t(R) * H);
+    } else if (tc.norm == SublayerNorm::MoeQ8) {
+      expect_device_bits(tag + " moe norm_y", d_ny_got, d_ny_ref, size_t(R) * H);
+      expect_device_bits(tag + " moe q8_d", msc_got.q8_d, msc_ref.q8_d, q8_n / 32);
+      if (tc.moe_mins) expect_device_bits(tag + " moe q8_s", msc_got.q8_s, msc_ref.q8_s, q8_n / 16);
+      std::vector<int8_t> qa(q8_n), qb(q8_n);
+      CK(cudaMemcpy(qa.data(), msc_got.q8_a, q8_n, cudaMemcpyDeviceToHost));
+      CK(cudaMemcpy(qb.data(), msc_ref.q8_a, q8_n, cudaMemcpyDeviceToHost));
+      const bool q_ok = qa == qb;
+      std::printf("  %-4s %-48s %s\n", q_ok ? "ok" : "FAIL", (tag + " moe q8_a").c_str(),
+                  q_ok ? "bit-identical" : "BIT MISMATCH");
+      g_fail += !q_ok;
+    } else if (tc.norm == SublayerNorm::AttnQ8Split) {
+      CK(cudaDeviceSynchronize());
+      got_q8.resize(q8_n);
+      got_d.resize(q8_n / 32);
+      got_s.resize(q8_n / 16);
+      got_hi.resize(q8_n);
+      got_mid.resize(q8_n);
+      got_lo.resize(q8_n);
+      const size_t scap = TL.scratch->split_cap;
+      CK(cudaMemcpy(got_q8.data(), TL.scratch->q8, q8_n, cudaMemcpyDeviceToHost));
+      CK(cudaMemcpy(got_d.data(), TL.scratch->q8_scale, got_d.size() * 4, cudaMemcpyDeviceToHost));
+      CK(cudaMemcpy(got_s.data(), TL.scratch->q8_sums, got_s.size() * 4, cudaMemcpyDeviceToHost));
+      CK(cudaMemcpy(got_hi.data(), TL.scratch->split, q8_n * 2, cudaMemcpyDeviceToHost));
+      CK(cudaMemcpy(got_mid.data(), TL.scratch->split + scap, q8_n * 2, cudaMemcpyDeviceToHost));
+      CK(cudaMemcpy(got_lo.data(), TL.scratch->split + 2 * scap, q8_n * 2, cudaMemcpyDeviceToHost));
+      const bool ok_all = got_q8 == ref_q8 && got_d == ref_d && got_s == ref_s && got_hi == ref_hi &&
+                          got_mid == ref_mid && got_lo == ref_lo;
+      std::printf("  %-4s %-48s %s\n", ok_all ? "ok" : "FAIL", (tag + " q8+split").c_str(),
+                  ok_all ? "bit-identical" : "BIT MISMATCH");
+      g_fail += !ok_all;
+      if (nq > 1)
+        expect_device_bits(tag + " mix_out[1..nq-1]", d_mix_got + size_t(R) * H, d_mix_ref + size_t(R) * H,
+                           size_t(nq - 1) * R * H);
+    }
+
+    if (tc.norm == SublayerNorm::MoeQ8) {
+      cudaFree(msc_ref.q8_a);
+      cudaFree(msc_ref.q8_d);
+      cudaFree(msc_ref.q8_s);
+      cudaFree(msc_got.q8_a);
+      cudaFree(msc_got.q8_d);
+      cudaFree(msc_got.q8_s);
+    }
+    cudaFree(P);
+    cudaFree(d_raw);
+    cudaFree(d_cw);
+    cudaFree(d_xsrc);
+    cudaFree(d_q);
+    cudaFree(d_nw);
+    cudaFree(d_win_ref);
+    cudaFree(d_win_got);
+    cudaFree(d_rep_ref);
+    cudaFree(d_rep_got);
+    cudaFree(d_bank_ref);
+    cudaFree(d_bank_got);
+    cudaFree(d_x_ref);
+    cudaFree(d_x_got);
+    cudaFree(d_mix_ref);
+    cudaFree(d_mix_got);
+    cudaFree(d_ny_ref);
+    cudaFree(d_ny_got);
+  }
+}
+
+void test_inkling2_rel_prep_kv_sc() {
+  std::printf("inkling2 rel_attn_prep fused KvShortConv\n");
+  for (bool is_swa : {true, false}) {
+    for (bool fp8 : {false, true}) {
+      for (int R : {1, 8}) {
+        const int nh = 16, nkv = 4, hd = 128, dr = 16, conv = 4, hist = conv - 1;
+        const int q_dim = nh * hd, kv_dim = nkv * hd, ch_total = 2 * kv_dim + 64, pos0 = 25, cap = 64;
+        seed("inkling2_rel_prep_kv_sc", int(is_swa), int(fp8), R);
+        Vec q_in = randv(size_t(R) * q_dim, 1.0);
+        Vec k_raw = randv(size_t(R) * kv_dim, 1.0);
+        Vec v_raw = randv(size_t(R) * kv_dim, 1.0);
+        Vec r_in = randv(size_t(R) * nh * dr, 1.0);
+        Vec qcw = randv(q_dim, 0.5), rcw = randv(nh * dr, 0.5);
+        Vec kw = randv(size_t(kv_dim) * conv, 0.3), vw = randv(size_t(kv_dim) * conv, 0.3);
+        Vec kdyn = is_swa ? Vec{} : randv(size_t(R) * nkv * conv, 0.2);
+        Vec vdyn = is_swa ? Vec{} : randv(size_t(R) * nkv * conv, 0.2);
+        Vec st0 = randv(size_t(hist) * ch_total, 0.5);
+        std::vector<float> h_st0(st0.begin(), st0.end());
+
+        DevParams* P = params(pos0, 0);
+        const size_t w_stride = size_t(hist) * ch_total, r_stride = size_t(R) * ch_total;
+        float* d_qin = up(q_in);
+        float* d_kraw = up(k_raw);
+        float* d_vraw = up(v_raw);
+        float* d_rin = up(r_in);
+        float* d_qcw = up(qcw);
+        float* d_rcw = up(rcw);
+        float* d_kw = up(kw);
+        float* d_vw = up(vw);
+        float* d_kdyn = is_swa ? nullptr : up(kdyn);
+        float* d_vdyn = is_swa ? nullptr : up(vdyn);
+
+        float* d_win_ref = dev<float>(FLYX_ROUND_SLOTS * w_stride);
+        float* d_win_got = dev<float>(FLYX_ROUND_SLOTS * w_stride);
+        CK(cudaMemcpy(d_win_ref, h_st0.data(), w_stride * sizeof(float), cudaMemcpyHostToDevice));
+        CK(cudaMemcpy(d_win_got, h_st0.data(), w_stride * sizeof(float), cudaMemcpyHostToDevice));
+        float* d_rep_ref = dev<float>(kGdnReplaySlots * r_stride);
+        float* d_rep_got = dev<float>(kGdnReplaySlots * r_stride);
+        float* d_kconv = dev<float>(size_t(R) * kv_dim);
+        float* d_vconv = dev<float>(size_t(R) * kv_dim);
+        float* d_qo_ref = dev<float>(size_t(R) * q_dim);
+        float* d_qo_got = dev<float>(size_t(R) * q_dim);
+        float* d_ro_ref = dev<float>(size_t(R) * nh * dr);
+        float* d_ro_got = dev<float>(size_t(R) * nh * dr);
+
+        const size_t kv_elems = size_t(cap) * kv_dim;
+        const size_t sc_elems = size_t(cap) * nkv;
+        KvRef kv_ref{}, kv_got{};
+        if (fp8) {
+          kv_ref.k = dev<uint8_t>(kv_elems);
+          kv_ref.v = dev<uint8_t>(kv_elems);
+          kv_ref.ks = dev<float>(sc_elems);
+          kv_ref.vs = dev<float>(sc_elems);
+          kv_got.k = dev<uint8_t>(kv_elems);
+          kv_got.v = dev<uint8_t>(kv_elems);
+          kv_got.ks = dev<float>(sc_elems);
+          kv_got.vs = dev<float>(sc_elems);
+        } else {
+          kv_ref.k = dev<kv16>(kv_elems);
+          kv_ref.v = dev<kv16>(kv_elems);
+          kv_got.k = dev<kv16>(kv_elems);
+          kv_got.v = dev<kv16>(kv_elems);
+        }
+        const int next_sel = (R == 1) ? kSlotNext : -1;
+
+        // Reference: shortconv_pass(K) + shortconv_pass(V) + rel_attn_prep.
+        shortconv_pass(d_kraw, kv_dim, d_kw, d_kdyn, d_win_ref, w_stride, kSlotCur, next_sel, kSkipNever, d_rep_ref,
+                       r_stride, kSlotCur, 0, ch_total, kv_dim, conv, nkv, P, R, d_kconv, kv_dim, 0, false);
+        shortconv_pass(d_vraw, kv_dim, d_vw, d_vdyn, d_win_ref, w_stride, kSlotCur, next_sel, kSkipNever, d_rep_ref,
+                       r_stride, kSlotCur, kv_dim, ch_total, kv_dim, conv, nkv, P, R, d_vconv, kv_dim, 0, false);
+        rel_attn_prep(d_qin, q_dim, d_kconv, kv_dim, d_vconv, kv_dim, d_rin, nh * dr, d_qcw, d_rcw, 4.f, 2.f, 1e-6f,
+                      128, 0.2f, nh, nkv, hd, dr, R, P, kPosPosition, is_swa, d_qo_ref, d_ro_ref, kv_ref, 0);
+
+        // Fused: single rel_attn_prep with KvShortConv.
+        const KvShortConv kv_sc{d_kw,     d_vw,     d_kdyn,   d_vdyn,   d_win_got, w_stride, kSlotCur,
+                                next_sel, kSkipNever, d_rep_got, r_stride, kSlotCur,  ch_total, conv};
+        rel_attn_prep(d_qin, q_dim, d_kraw, kv_dim, d_vraw, kv_dim, d_rin, nh * dr, d_qcw, d_rcw, 4.f, 2.f, 1e-6f,
+                      128, 0.2f, nh, nkv, hd, dr, R, P, kPosPosition, is_swa, d_qo_got, d_ro_got, kv_got, 0, 0, 0,
+                      &kv_sc);
+
+        const std::string tag = std::string(is_swa ? "swa" : "global") + (fp8 ? " fp8" : " f16") + " R=" +
+                                std::to_string(R);
+        expect_device_bits("rel_prep+kv_sc " + tag + " q", d_qo_got, d_qo_ref, size_t(R) * q_dim);
+        expect_device_bits("rel_prep+kv_sc " + tag + " r", d_ro_got, d_ro_ref, size_t(R) * nh * dr);
+        expect_device_bits("rel_prep+kv_sc " + tag + " replay", d_rep_got, d_rep_ref, r_stride);
+        if (next_sel >= 0) expect_device_bits("rel_prep+kv_sc " + tag + " win_out", d_win_got + w_stride, d_win_ref + w_stride, w_stride);
+        const size_t kv_bytes = kv_elems * (fp8 ? 1 : 2);
+        std::vector<uint8_t> ka(kv_bytes), kb(kv_bytes), va(kv_bytes), vb(kv_bytes);
+        CK(cudaDeviceSynchronize());
+        CK(cudaMemcpy(ka.data(), kv_got.k, kv_bytes, cudaMemcpyDeviceToHost));
+        CK(cudaMemcpy(kb.data(), kv_ref.k, kv_bytes, cudaMemcpyDeviceToHost));
+        CK(cudaMemcpy(va.data(), kv_got.v, kv_bytes, cudaMemcpyDeviceToHost));
+        CK(cudaMemcpy(vb.data(), kv_ref.v, kv_bytes, cudaMemcpyDeviceToHost));
+        const bool kv_ok = ka == kb && va == vb;
+        std::printf("  %-4s %-48s %s\n", kv_ok ? "ok" : "FAIL", ("rel_prep+kv_sc " + tag + " KV bytes").c_str(),
+                    kv_ok ? "bit-identical" : "BIT MISMATCH");
+        g_fail += !kv_ok;
+        if (fp8) {
+          expect_device_bits("rel_prep+kv_sc " + tag + " ks", kv_got.ks, kv_ref.ks, sc_elems);
+          expect_device_bits("rel_prep+kv_sc " + tag + " vs", kv_got.vs, kv_ref.vs, sc_elems);
+          cudaFree(kv_ref.ks);
+          cudaFree(kv_ref.vs);
+          cudaFree(kv_got.ks);
+          cudaFree(kv_got.vs);
+        }
+        cudaFree(kv_ref.k);
+        cudaFree(kv_ref.v);
+        cudaFree(kv_got.k);
+        cudaFree(kv_got.v);
+        cudaFree(P);
+        cudaFree(d_qin);
+        cudaFree(d_kraw);
+        cudaFree(d_vraw);
+        cudaFree(d_rin);
+        cudaFree(d_qcw);
+        cudaFree(d_rcw);
+        cudaFree(d_kw);
+        cudaFree(d_vw);
+        if (d_kdyn) cudaFree(d_kdyn);
+        if (d_vdyn) cudaFree(d_vdyn);
+        cudaFree(d_win_ref);
+        cudaFree(d_win_got);
+        cudaFree(d_rep_ref);
+        cudaFree(d_rep_got);
+        cudaFree(d_kconv);
+        cudaFree(d_vconv);
+        cudaFree(d_qo_ref);
+        cudaFree(d_qo_got);
+        cudaFree(d_ro_ref);
+        cudaFree(d_ro_got);
+      }
+    }
+  }
+}
+
 }  // namespace flyx::optest

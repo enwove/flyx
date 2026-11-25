@@ -70,6 +70,7 @@ void gdn_layer(const Pass& ps, const GdnBlock& g, bool fused = false);
 void attn_layer(const Pass& ps, const AttnBlock& a, bool fused = false);
 void rel_attn_layer(const Pass& ps, const RelAttnBlock& a, bool fused = false);
 void moe_layer(const Pass& ps, const MoeBlock& f, bool fused = false);
+void flush_pending_post_conv(const Pass& ps, bool require_in_x = true);
 void dspark_draft(flyx_seq* s, const DSparkBlock& b, int width, const Launch& L, bool fused = false);
 void dspark_context(const Pass& ps, const DSparkBlock& b, bool fused = false);
 // A block's own adapters (ABI 43) on the linears that read one input (x null: a fused producer's staged rows; else

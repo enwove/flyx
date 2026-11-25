@@ -270,12 +270,20 @@ void forward_nodes(const Pass& ps, size_t begin, size_t end, int copy_prefix) {
   }
   s->stage_begin(std::move(staged), ps.v.L.st);
   ResState res_state{};
+  res_state.x_cur = ps.v.b.x;
   Pass cur = ps;
   cur.res = &res_state;
   for (size_t i = begin; i < end; ++i) {
-    ps.p->impl[i]->fn(cur, ps.p->nodes[i], ps.p->block[i]);
+    const flyx_node& nd = ps.p->nodes[i];
+    const Block* blk = ps.p->block[i];
+    const bool takes_pending =
+        nd.kind == FLYX_NODE_RUN && blk &&
+        (std::holds_alternative<RelAttnBlock>(*blk) || std::holds_alternative<MoeBlock>(*blk));
+    if (!takes_pending) flush_pending_post_conv(cur, true);
+    ps.p->impl[i]->fn(cur, nd, blk);
     if (prof) CK(cudaEventRecord(s->prof_ev[i - begin + 1], s->st));
   }
+  flush_pending_post_conv(cur, true);
   s->stage_end(ps.v.L.st);
   if (!prof) return;
   CK(cudaEventSynchronize(s->prof_ev[nn]));

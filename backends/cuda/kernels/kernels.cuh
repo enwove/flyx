@@ -1570,6 +1570,7 @@ void linear_f32(const float* x, int ldx, RoundWeight W, int N, int K, float* y, 
 
 // Causal depthwise short convolution with residual scaling and optional per-head dynamic taps (ops/shortconv/ref.h).
 // win: [FLYX_ROUND_SLOTS][conv - 1][ch_total]; replay (rounds): [kGdnReplaySlots][replay_rows][ch_total].
+// res_src (optional, when accumulate=true): read the residual to add from res_src instead of out (for ping-pong flush).
 struct ShortConvLayer {
   float* win;
   float* replay;
@@ -1577,10 +1578,47 @@ struct ShortConvLayer {
 void shortconv_pass(const float* x, int ldx, const float* w, const float* dyn, float* win, size_t win_stride,
                     int in_sel, int next_sel, int skip, float* replay, size_t replay_stride, int replay_sel,
                     int ch_off, int ch_total, int C, int conv, int n_heads, const DevParams* P, int rows, float* out,
-                    int ldo, cudaStream_t st, bool accumulate = false);
+                    int ldo, cudaStream_t st, bool accumulate = false, const float* res_src = nullptr);
 void shortconv_fold(const ShortConvLayer* layers, int n, size_t win_stride, size_t replay_stride, int in_sel,
                     int out_sel, int replay_sel, int channels, int conv, const DevParams* P, int rows,
                     const int* rows_dev, bool skip_if_noop, cudaStream_t st);
+
+// Optional fused K/V ShortConv parameters for rel_attn_prep in rounds (replaces 2 separate shortconv_pass launches).
+struct KvShortConv {
+  const float *k_w = nullptr, *v_w = nullptr;      // [kv_dim][conv]
+  const float *k_dyn = nullptr, *v_dyn = nullptr;  // [rows][nkv][conv] (null for SWA)
+  float* win = nullptr;
+  size_t win_stride = 0;
+  int in_sel = 0, next_sel = -1, skip = 0;
+  float* replay = nullptr;
+  size_t replay_stride = 0;
+  int replay_sel = 0;
+  int ch_total = 0, conv = 0;
+};
+
+// Fused Inkling-2 sublayer boundary for rounds (1..16 rows, H <= 5120):
+// shortconv_pass(post_raw) + residual update (+ optional res_push to bank) + attn_res_mix (+ optional rmsnorm).
+// Runs 1 block (512 threads) per row (zero redundant ShortConv/bank reads), bit-identical to
+// separate shortconv_pass + res_push + attn_res_mix + rmsnorm(_q8_split / _moe_q8).
+struct SublayerPostConv {
+  const float* post_raw = nullptr;
+  const float* conv_w = nullptr;
+  float* win = nullptr;
+  size_t win_stride = 0;
+  int in_sel = 0, next_sel = -1, skip = 0;
+  float* replay = nullptr;
+  size_t replay_stride = 0;
+  int replay_sel = 0;
+  int ch_off = 0, ch_total = 0, conv = 0;
+  bool res_push = false;
+};
+enum class SublayerNorm { None, F32, MoeQ8, AttnQ8Split };
+struct MoeScratch;
+void shortconv_res_mix_norm(const SublayerPostConv& sc, const float* x_src, float* x_dst, float* bank, int n_blocks,
+                            const float* queries, int n_queries, float* mix_out, SublayerNorm norm_mode,
+                            const float* norm_w, float norm_offset, float norm_eps, float* norm_y, int ldy,
+                            const MoeScratch* msc, bool moe_mins, const DevParams* P, int rows, int H,
+                            const Launch& L);
 
 // Relative-position-bias attention prep & attention (ops/attention/ref.h: l2_clip, log_pos_scale, attend_rel).
 // prep: clips Q (with q_clip_w) and R (with r_clip_w), applies global log_pos_scale tau to Q & R, clips K,
@@ -1589,7 +1627,7 @@ void rel_attn_prep(const float* q_in, int ldq, const float* k_in, int ldk, const
                    const float* r_in, int ldr, const float* q_clip_w, const float* r_clip_w, float qk_clip,
                    float rel_clip, float v_eps, int log_floor, float log_alpha, int nh, int nkv, int hd, int d_rel,
                    int rows, const DevParams* P, int pos_sel, bool is_swa, float* q_out, float* r_out, KvRef kv,
-                   cudaStream_t st, int pos_add = 0, int strata_base = 0);
+                   cudaStream_t st, int pos_add = 0, int strata_base = 0, const KvShortConv* kv_sc = nullptr);
 // Precompute relative-position bias table out[r, h, dist] = dot(rel_bias[dist], r_q[r, h]) for Strata attention.
 void rel_bias_table(const float* r_q, const float* rel_bias, int nh, int d_rel, int rel_extent, int rows, float* out,
                     cudaStream_t st);

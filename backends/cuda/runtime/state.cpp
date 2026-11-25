@@ -138,9 +138,12 @@ void alloc_rows(const flyx_bmodel* m, int R, bool prefill, RowBufs* b, Alloc&& a
     b->rel_q = f(size_t(R) * n.rel_q);
     b->sink = f(size_t(R) * n.sink);
     b->kv_conv = f(size_t(R) * 2 * n.kv_dim);
-    if (n.kv_dyn > 0) b->kv_dyn = f(size_t(R) * n.kv_dyn);
+    if (n.kv_dyn > 0) b->kv_dyn = f(size_t(R) * 2 * n.kv_dyn);
   }
-  if (n.rel_q > 0 || n.moe_experts > 0) b->post_raw = f(size_t(R) * H);
+  if (n.rel_q > 0 || n.moe_experts > 0) {
+    b->post_raw = f(size_t(R) * H);
+    if (!prefill) b->post_out = f(size_t(R) * H);
+  }
   if (n.moe_experts > 0) {
     b->moe_idx = static_cast<int*>(alloc(size_t(R) * n.moe_topk * sizeof(int)));
     b->moe_w = f(size_t(R) * n.moe_topk);

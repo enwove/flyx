@@ -695,6 +695,18 @@ void apply_loop_ctrl_norm(const float* cur, const float* msg, int rows, int H, i
   loop_ctrl_apply_norm(cur, msg, ctrl_gf, 2 * H, ctrl_gf + H, 2 * H, n.w, n.offset, n.eps, rows, H, y, ldy, st);
 }
 
+SublayerPostConv make_sublayer_post_conv(const Pass& ps, const PendingPostConv& pend) {
+  auto* s = ps.s;
+  ShortConvBuf& sc = s->sconv[size_t(pend.sconv)];
+  const bool direct = ps.round && ps.p->width == 0;
+  const int next_sel = ps.round ? (direct ? kSlotNext : -1) : kSlotCur;
+  const int skip = ps.round && direct ? kSkipIfStopped : kSkipNever;
+  float* rep = ps.round ? sc.replay : nullptr;
+  const size_t rep_stride = ps.round ? sc.r_stride : 0;
+  return SublayerPostConv{pend.post_raw, pend.conv_w, sc.win, sc.w_stride, kSlotCur, next_sel, skip, rep, rep_stride,
+                          kSlotCur, pend.ch_off, sc.channels, pend.conv, pend.res_push};
+}
+
 void rel_attn_windows(const Pass& ps, const RelAttnBlock& a, const KvBuf& kb, int windows, float* out, int ld_out) {
   const RowView& rv = ps.v;
   auto* s = ps.s;
@@ -722,6 +734,40 @@ void rel_attn_windows(const Pass& ps, const RelAttnBlock& a, const KvBuf& kb, in
 
 }  // namespace
 
+void flush_pending_post_conv(const Pass& ps, bool require_in_x) {
+  if (!ps.res) return;
+  const RowView& rv = ps.v;
+  auto* s = ps.s;
+  const int H = s->m->hidden, R = ps.rows;
+  cudaStream_t st = rv.L.st;
+  float* x_cur = ps.res->x_cur ? ps.res->x_cur : rv.b.x;
+  const size_t row_bytes = size_t(R) * size_t(H) * sizeof(float);
+  if (ps.res->pending.post_raw) {
+    const PendingPostConv pend = ps.res->pending;
+    const SublayerPostConv spc = make_sublayer_post_conv(ps, pend);
+    float* dst = require_in_x ? rv.b.x : x_cur;
+    if (pend.res_push) {
+      CK(cudaMemcpyAsync(rv.b.res_bank + size_t(ps.res->res_n) * R * H, x_cur, row_bytes, cudaMemcpyDeviceToDevice,
+                         st));
+      ++ps.res->res_n;
+      shortconv_pass(spc.post_raw, H, spc.conv_w, nullptr, spc.win, spc.win_stride, spc.in_sel, spc.next_sel, spc.skip,
+                     spc.replay, spc.replay_stride, spc.replay_sel, spc.ch_off, spc.ch_total, H, spc.conv, 0, s->P, R,
+                     dst, H, st, false);
+    } else {
+      shortconv_pass(spc.post_raw, H, spc.conv_w, nullptr, spc.win, spc.win_stride, spc.in_sel, spc.next_sel, spc.skip,
+                     spc.replay, spc.replay_stride, spc.replay_sel, spc.ch_off, spc.ch_total, H, spc.conv, 0, s->P, R,
+                     dst, H, st, true, dst == x_cur ? nullptr : x_cur);
+    }
+    ps.res->pending = {};
+    ps.res->x_cur = dst;
+    return;
+  }
+  if (require_in_x && x_cur != rv.b.x) {
+    CK(cudaMemcpyAsync(rv.b.x, x_cur, row_bytes, cudaMemcpyDeviceToDevice, st));
+    ps.res->x_cur = rv.b.x;
+  }
+}
+
 void rel_attn_layer(const Pass& ps, const RelAttnBlock& a, bool fused) {
   const RowView& rv = ps.v;
   auto* s = ps.s;
@@ -740,14 +786,50 @@ void rel_attn_layer(const Pass& ps, const RelAttnBlock& a, bool fused) {
   if (a.loop_msg_query)
     attn_res_mix(rv.b.loop_bank, ps.res->loop_n, rv.b.loop_bank_out, a.loop_msg_query, 4, R, H, rv.b.loop_msg, st);
 
+  // A fused round's producers write a projection's input as its GEMM reads it, in the launch that computes it; the
+  // generic layer stages it from float32 rows in a launch of its own for each reader.
+  const bool round_q8 = fused && ps.round && R <= FLYX_MAX_ROWS;
+  bool q_staged = false;
   bool q_normed = false;
   const float* in_raw[3] = {rv.b.x, rv.b.x, rv.b.x};
-  if (a.res_query) {
+
+  const bool has_pending = ps.res && ps.res->pending.post_raw != nullptr;
+  const bool can_fuse_sub = has_pending && round_q8 && a.res_query && rv.b.post_out && H <= 5120 &&
+                            (ps.res->res_n + int(ps.res->pending.res_push) + 1) <= 64;
+  if (can_fuse_sub) {
+    const PendingPostConv pend = ps.res->pending;
+    const SublayerPostConv spc = make_sublayer_post_conv(ps, pend);
+    float* x_src = ps.res->x_cur ? ps.res->x_cur : rv.b.x;
+    float* x_dst = (x_src == rv.b.x) ? rv.b.post_out : rv.b.x;
     const int nq = is_swa ? 1 : 3;
-    attn_res_mix(rv.b.res_bank, ps.res->res_n, rv.b.x, a.res_query, nq, R, H, rv.b.attn_in, st);
+    const bool q_dual = a.loop_rank == 0 && a.stacked_qgr && a.w_qgr.q8_inputs() && (H % 32 == 0) &&
+                        gemm_reads_split(rv.b.h, H, a.w_sink, H, L);
+    const bool swa_reuse = is_swa && same_norm(a.q_norm_in, a.k_norm_in) && same_norm(a.q_norm_in, a.v_norm_in) &&
+                           a.w_k.q8_inputs() && a.w_v.q8_inputs();
+    const bool fuse_q_norm = q_dual && (!is_swa || swa_reuse);
+    shortconv_res_mix_norm(spc, x_src, x_dst, rv.b.res_bank, ps.res->res_n, a.res_query, nq,
+                           (fuse_q_norm && is_swa) ? nullptr : rv.b.attn_in,
+                           fuse_q_norm ? SublayerNorm::AttnQ8Split : SublayerNorm::None,
+                           fuse_q_norm ? a.q_norm_in.w : nullptr, a.q_norm_in.offset, a.q_norm_in.eps, nullptr, H,
+                           nullptr, false, s->P, R, H, L);
+    if (pend.res_push) ++ps.res->res_n;
+    ps.res->pending = {};
+    ps.res->x_cur = x_dst;
     in_raw[0] = rv.b.attn_in;
     in_raw[1] = is_swa ? rv.b.attn_in : rv.b.attn_in + size_t(R) * H;
     in_raw[2] = is_swa ? rv.b.attn_in : rv.b.attn_in + size_t(2) * R * H;
+    q_staged = fuse_q_norm;
+  } else {
+    if (has_pending) flush_pending_post_conv(ps, false);
+    const float* cur_x = (ps.res && ps.res->x_cur) ? ps.res->x_cur : rv.b.x;
+    in_raw[0] = in_raw[1] = in_raw[2] = cur_x;
+    if (a.res_query) {
+      const int nq = is_swa ? 1 : 3;
+      attn_res_mix(rv.b.res_bank, ps.res->res_n, cur_x, a.res_query, nq, R, H, rv.b.attn_in, st);
+      in_raw[0] = rv.b.attn_in;
+      in_raw[1] = is_swa ? rv.b.attn_in : rv.b.attn_in + size_t(R) * H;
+      in_raw[2] = is_swa ? rv.b.attn_in : rv.b.attn_in + size_t(2) * R * H;
+    }
   }
   if (a.loop_rank > 0 && loop_as_round(ps)) {
     // The q, k and v controllers at once, each writing where its input was mixed (attn_in + j R H).  An SWA block
@@ -777,9 +859,6 @@ void rel_attn_layer(const Pass& ps, const RelAttnBlock& a, bool fused) {
     }
   }
 
-  // A fused round's producers write a projection's input as its GEMM reads it, in the launch that computes it; the
-  // generic layer stages it from float32 rows in a launch of its own for each reader.
-  const bool round_q8 = fused && ps.round && R <= FLYX_MAX_ROWS;
   // The norm of x for two projections that read it in different forms, w in 8 bits and its companion (a sink or
   // dynamic-tap projection) as three bf16 parts: one launch writes both, which lie apart in the scratch.
   auto project_pair = [&](const float* x, const Norm& n, const Lin& w, int cols, float* out, int ld_out,
@@ -797,8 +876,10 @@ void rel_attn_layer(const Pass& ps, const RelAttnBlock& a, bool fused) {
     return dual;
   };
 
-  bool q_staged = false;
-  if (q_normed) {
+  if (q_staged) {
+    gemm_presplit(a.w_qgr, 2 * q_dim + nh * dr, H, rv.b.proj, rv.ld_proj, R, false, L);
+    gemm_presplit(a.w_sink, nh, H, rv.b.sink, nh, R, false, L);
+  } else if (q_normed) {
     if (a.stacked_qgr) {
       gemm(rv.b.h, H, a.w_qgr, 2 * q_dim + nh * dr, H, rv.b.proj, rv.ld_proj, R, false, L);
       gemm(rv.b.h, H, a.w_sink, nh, H, rv.b.sink, nh, R, false, L);
@@ -824,22 +905,31 @@ void rel_attn_layer(const Pass& ps, const RelAttnBlock& a, bool fused) {
   const bool reuse_q = q_staged && is_swa && in_raw[0] == in_raw[1] && in_raw[0] == in_raw[2] &&
                        same_norm(a.q_norm_in, a.k_norm_in) && same_norm(a.q_norm_in, a.v_norm_in) &&
                        a.w_k.q8_inputs() && a.w_v.q8_inputs();
-  auto project_kv = [&](const float* x, const Norm& n, const Lin& w, const Lin& taps, const float* conv, int offset) {
+  // In fused rounds (next_sel != kSlotCur), write raw K/V directly into rv.b.kv_conv and run both K & V ShortConvs
+  // inside rel_attn_prep (eliminating 2 shortconv_pass launches + DRAM round-trips per layer).
+  const bool fuse_kv_sc = round_q8 && a.conv <= 64;
+  auto project_kv = [&](const float* x, const Norm& n, const Lin& w, const Lin& taps, const float* conv, int offset,
+                        float* dyn_dst) {
+    float* raw_dst = fuse_kv_sc ? (rv.b.kv_conv + size_t(R) * offset) : rv.b.act;
     float* dyn = nullptr;
     if (reuse_q) {
-      gemm_presplit(w, kv_dim, H, rv.b.act, kv_dim, R, false, L);
+      gemm_presplit(w, kv_dim, H, raw_dst, kv_dim, R, false, L);
     } else if (is_swa) {
-      norm_project(x, rv.b.h, rv.b.act, kv_dim, R, n, w, kv_dim, H, L, fused && H % 64 == 0);
+      norm_project(x, rv.b.h, raw_dst, kv_dim, R, n, w, kv_dim, H, L, fused && H % 64 == 0);
     } else {
-      dyn = rv.b.kv_dyn;
-      project_pair(x, n, w, kv_dim, rv.b.act, kv_dim, taps, nkv * a.conv, dyn);
+      dyn = dyn_dst;
+      project_pair(x, n, w, kv_dim, raw_dst, kv_dim, taps, nkv * a.conv, dyn);
     }
-    shortconv_pass(rv.b.act, kv_dim, conv, dyn, sc.win, sc.w_stride, kSlotCur, next_sel, skip, rep, rep_stride,
-                   kSlotCur, offset, sc.channels, kv_dim, a.conv, nkv, s->P, R, rv.b.kv_conv + size_t(R) * offset,
-                   kv_dim, st, false);
+    if (!fuse_kv_sc) {
+      shortconv_pass(rv.b.act, kv_dim, conv, dyn, sc.win, sc.w_stride, kSlotCur, next_sel, skip, rep, rep_stride,
+                     kSlotCur, offset, sc.channels, kv_dim, a.conv, nkv, s->P, R, rv.b.kv_conv + size_t(R) * offset,
+                     kv_dim, st, false);
+    }
   };
-  project_kv(in_raw[1], a.k_norm_in, a.w_k, a.w_k_conv_proj, a.k_conv, 0);
-  project_kv(in_raw[2], a.v_norm_in, a.w_v, a.w_v_conv_proj, a.v_conv, kv_dim);
+  float* k_dyn = is_swa ? nullptr : rv.b.kv_dyn;
+  float* v_dyn = is_swa ? nullptr : (fuse_kv_sc ? rv.b.kv_dyn + size_t(R) * nkv * a.conv : rv.b.kv_dyn);
+  project_kv(in_raw[1], a.k_norm_in, a.w_k, a.w_k_conv_proj, a.k_conv, 0, k_dyn);
+  project_kv(in_raw[2], a.v_norm_in, a.w_v, a.w_v_conv_proj, a.v_conv, kv_dim, v_dyn);
 
   const KvBuf& kb = s->kv[size_t(a.kv)];
   KvRef kv = kb.ref();
@@ -872,10 +962,12 @@ void rel_attn_layer(const Pass& ps, const RelAttnBlock& a, bool fused) {
       kv.vqs = kb.vqs + goff;
     }
   }
+  const KvShortConv kv_sc{a.k_conv, a.v_conv, k_dyn, v_dyn, sc.win, sc.w_stride, kSlotCur, next_sel, skip, rep,
+                          rep_stride, kSlotCur, sc.channels, a.conv};
   rel_attn_prep(rv.b.proj, rv.ld_proj, rv.b.kv_conv, kv_dim, rv.b.kv_conv + size_t(R) * kv_dim, kv_dim,
                 rv.b.proj + 2 * q_dim, rv.ld_proj, a.q_clip_w, a.rel_clip_w, a.qk_clip, a.rel_clip, a.eps,
                 a.log_scale_floor, a.log_scale_alpha, nh, nkv, hd, dr, R, s->P, kPosPosition, is_swa, rv.b.qbuf,
-                rv.b.rel_q, kv, st, 0, use_stage ? s->position : 0);
+                rv.b.rel_q, kv, st, 0, use_stage ? s->position : 0, fuse_kv_sc ? &kv_sc : nullptr);
   if (use_stage) {
     const size_t woff = strata_words_at(s->position, 0, nkv, kb.words);
     CK(cudaMemcpyAsync(kb.kq + woff, stg_kq, q_words * sizeof(uint32_t), cudaMemcpyDefault, st));
@@ -932,15 +1024,20 @@ void rel_attn_layer(const Pass& ps, const RelAttnBlock& a, bool fused) {
   if (split || q8_out) gemm_presplit(a.w_o, H, q_dim, rv.b.post_raw, H, R, false, L);
   else gemm(rv.b.act, q_dim, a.w_o, H, q_dim, rv.b.post_raw, H, R, false, L);
 
+  if (round_q8 && ps.res && a.post_conv && rv.b.post_out && H <= 5120) {
+    ps.res->pending = PendingPostConv{rv.b.post_raw, a.post_conv, a.sconv, 2 * kv_dim, a.conv, a.res_push != 0};
+    return;
+  }
+  float* x_cur = (ps.res && ps.res->x_cur) ? ps.res->x_cur : rv.b.x;
   if (a.res_push) {
     const size_t row_bytes = size_t(R) * size_t(H) * sizeof(float);
-    CK(cudaMemcpyAsync(rv.b.res_bank + size_t(ps.res->res_n) * R * H, rv.b.x, row_bytes, cudaMemcpyDeviceToDevice, st));
+    CK(cudaMemcpyAsync(rv.b.res_bank + size_t(ps.res->res_n) * R * H, x_cur, row_bytes, cudaMemcpyDeviceToDevice, st));
     ++ps.res->res_n;
     shortconv_pass(rv.b.post_raw, H, a.post_conv, nullptr, sc.win, sc.w_stride, kSlotCur, next_sel, skip, rep,
-                   rep_stride, kSlotCur, 2 * kv_dim, sc.channels, H, a.conv, 0, s->P, R, rv.b.x, H, st, false);
+                   rep_stride, kSlotCur, 2 * kv_dim, sc.channels, H, a.conv, 0, s->P, R, x_cur, H, st, false);
   } else {
     shortconv_pass(rv.b.post_raw, H, a.post_conv, nullptr, sc.win, sc.w_stride, kSlotCur, next_sel, skip, rep,
-                   rep_stride, kSlotCur, 2 * kv_dim, sc.channels, H, a.conv, 0, s->P, R, rv.b.x, H, st, true);
+                   rep_stride, kSlotCur, 2 * kv_dim, sc.channels, H, a.conv, 0, s->P, R, x_cur, H, st, true);
   }
 }
 
@@ -951,11 +1048,40 @@ void moe_layer(const Pass& ps, const MoeBlock& f, bool fused) {
   cudaStream_t st = rv.L.st;
   const Launch& L = rv.L;
 
+  // A fused round's kernels write what the next one reads, where the generic layer stages it from float32 rows in
+  // a launch between them: the norm the gate|up GEMM's 8-bit rows beside the router's float32 ones, and that GEMM
+  // the down GEMM's bf16 rows (in moe_act: the scratch's own bf16 rows lie over the 8-bit ones it is reading).
+  const MoeScratch* msc = rv.b.moe_sc.pairs ? &rv.b.moe_sc : nullptr;
+  const bool round_q8 = fused && ps.round && moe_round_q8(f.gate_up, R, K, H, msc);
   bool norm_done = false;
   const float* cur = rv.b.x;
-  if (f.res_query) {
-    attn_res_mix(rv.b.res_bank, ps.res->res_n, rv.b.x, f.res_query, 1, R, H, rv.b.attn_in, st);
+
+  const bool has_pending = ps.res && ps.res->pending.post_raw != nullptr;
+  const bool can_fuse_sub = has_pending && fused && ps.round && R <= FLYX_MAX_ROWS && f.res_query && rv.b.post_out &&
+                            H <= 5120 && (ps.res->res_n + int(ps.res->pending.res_push) + 1) <= 64;
+  if (can_fuse_sub) {
+    const PendingPostConv pend = ps.res->pending;
+    const SublayerPostConv spc = make_sublayer_post_conv(ps, pend);
+    float* x_src = ps.res->x_cur ? ps.res->x_cur : rv.b.x;
+    float* x_dst = (x_src == rv.b.x) ? rv.b.post_out : rv.b.x;
+    SublayerNorm nmode = SublayerNorm::None;
+    if (f.loop_rank == 0) nmode = (round_q8 && H % 32 == 0) ? SublayerNorm::MoeQ8 : SublayerNorm::F32;
+    shortconv_res_mix_norm(spc, x_src, x_dst, rv.b.res_bank, ps.res->res_n, f.res_query, 1,
+                           nmode == SublayerNorm::None ? rv.b.attn_in : nullptr, nmode, f.norm.w, f.norm.offset,
+                           f.norm.eps, rv.b.h, H, msc, moe_q8_mins(f.gate_up), s->P, R, H, L);
+    if (pend.res_push) ++ps.res->res_n;
+    ps.res->pending = {};
+    ps.res->x_cur = x_dst;
+    norm_done = (nmode != SublayerNorm::None);
     cur = rv.b.attn_in;
+  } else {
+    if (has_pending) flush_pending_post_conv(ps, false);
+    const float* cur_x = (ps.res && ps.res->x_cur) ? ps.res->x_cur : rv.b.x;
+    cur = cur_x;
+    if (f.res_query) {
+      attn_res_mix(rv.b.res_bank, ps.res->res_n, cur_x, f.res_query, 1, R, H, rv.b.attn_in, st);
+      cur = rv.b.attn_in;
+    }
   }
   if (f.loop_rank > 0) {
     const float* msg = rv.b.loop_msg + size_t(3) * R * H;
@@ -974,11 +1100,6 @@ void moe_layer(const Pass& ps, const MoeBlock& f, bool fused) {
     }
   }
 
-  // A fused round's kernels write what the next one reads, where the generic layer stages it from float32 rows in
-  // a launch between them: the norm the gate|up GEMM's 8-bit rows beside the router's float32 ones, and that GEMM
-  // the down GEMM's bf16 rows (in moe_act: the scratch's own bf16 rows lie over the 8-bit ones it is reading).
-  const MoeScratch* msc = rv.b.moe_sc.pairs ? &rv.b.moe_sc : nullptr;
-  const bool round_q8 = fused && ps.round && moe_round_q8(f.gate_up, R, K, H, msc);
   if (!norm_done) {
     if (round_q8)
       rmsnorm_moe_q8(cur, H, f.norm.w, f.norm.offset, f.norm.eps, rv.b.h, H, R, H, *msc, moe_q8_mins(f.gate_up), st);
@@ -1001,16 +1122,22 @@ void moe_layer(const Pass& ps, const MoeBlock& f, bool fused) {
   }
   if (f.post_conv) {
     moe_down(rv.b.moe_act, I, f.down, rv.b.moe_idx, rv.b.moe_w, R, K, H, I, rv.b.post_raw, H, false, msc, L, act_bf16);
+    if (fused && ps.round && R <= FLYX_MAX_ROWS && ps.res && rv.b.post_out && H <= 5120) {
+      ps.res->pending = PendingPostConv{rv.b.post_raw, f.post_conv, f.sconv, f.sconv_offset, f.conv, false};
+      return;
+    }
     ShortConvBuf& sc = s->sconv[size_t(f.sconv)];
     const bool direct = ps.round && ps.p->width == 0;
     const int next_sel = ps.round ? (direct ? kSlotNext : -1) : kSlotCur;
     const int skip = ps.round && direct ? kSkipIfStopped : kSkipNever;
     float* rep = ps.round ? sc.replay : nullptr;
     const size_t rep_stride = ps.round ? sc.r_stride : 0;
+    float* x_cur = (ps.res && ps.res->x_cur) ? ps.res->x_cur : rv.b.x;
     shortconv_pass(rv.b.post_raw, H, f.post_conv, nullptr, sc.win, sc.w_stride, kSlotCur, next_sel, skip, rep,
-                   rep_stride, kSlotCur, f.sconv_offset, sc.channels, H, f.conv, 0, s->P, R, rv.b.x, H, st, true);
+                   rep_stride, kSlotCur, f.sconv_offset, sc.channels, H, f.conv, 0, s->P, R, x_cur, H, st, true);
   } else {
-    moe_down(rv.b.moe_act, I, f.down, rv.b.moe_idx, rv.b.moe_w, R, K, H, I, rv.b.x, H, true, msc, L, act_bf16);
+    float* x_cur = (ps.res && ps.res->x_cur) ? ps.res->x_cur : rv.b.x;
+    moe_down(rv.b.moe_act, I, f.down, rv.b.moe_idx, rv.b.moe_w, R, K, H, I, x_cur, H, true, msc, L, act_bf16);
   }
 }
 
