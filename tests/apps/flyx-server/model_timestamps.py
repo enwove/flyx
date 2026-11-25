@@ -7,7 +7,8 @@ import shutil
 import struct
 import sys
 import tempfile
-from urllib.request import urlopen
+from urllib.request import Request, urlopen
+import time
 
 from remembered_model import serve
 
@@ -125,6 +126,27 @@ def check_listing(url, file):
         i_repo = json.load(response)
     assert i_repo["mmproj"] is None and not any(c["kind"] == "mmproj" for c in i_repo["companions"]), i_repo
 
+    # A failed POST /v1/load switch must leave the server in state="failed" with no model served (never auto-reload
+    # the previous model), while keeping `remembered` intact for an explicit reload.
+    with urlopen(url + "/v1/load", timeout=5) as response:
+        before = json.load(response)
+    assert before["state"] == "ready" and before["model"] is not None and before["remembered"] is not None, before
+    bogus = root / "not-a-model.gguf"
+    bogus.write_bytes(b"not a valid gguf \x00\x01\x02")
+    req = Request(url + "/v1/load", data=json.dumps({"model": str(bogus)}).encode("utf-8"),
+                  headers={"Content-Type": "application/json"}, method="POST")
+    with urlopen(req, timeout=5) as response:
+        assert response.status == 202
+    deadline = time.monotonic() + 30
+    after = {}
+    while time.monotonic() < deadline:
+        with urlopen(url + "/v1/load", timeout=5) as response:
+            after = json.load(response)
+        if after.get("state") not in ("fetching", "loading"):
+            break
+        time.sleep(0.05)
+    assert after["state"] == "failed" and after["model"] is None and after["fallback"] is None, after
+    assert after["error"] and after["remembered"] == before["remembered"], after
 
 
 if __name__ == "__main__":

@@ -611,8 +611,7 @@ export function ModelPage({ active, libraryAsked, currentAsked }) {
       if (n) lines.push(n + (n === 1 ? " request is" : " requests are") + " running or waiting: " + (n === 1 ? "it is" : "they are") + " stopped.");
       lines.push(served + " is unloaded first; its GPU memory comes back before the new one loads.");
       if (isHub(name) && !entryOf(name)) lines.push("The files are fetched first, while " + served + " keeps answering.");
-      lines.push("fallback" in L ? "If the new one fails to load, " + served + " is loaded again." :
-                 "If the new one fails to load, no model is served until another is loaded.");
+      lines.push("If the new one fails to load, no model is served until another is loaded.");
       if (!await confirmBox(same ? "Reload " + served + " with these settings?" : "Switch to " + (describe(entryOf(name) || { name }).quant || name) + "?",
                             lines, same ? "Reload" : "Switch")) return;
     }
