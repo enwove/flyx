@@ -30,7 +30,8 @@ ops/<op>/ref.h        Float64 reference per op; ops/sampling/sampling.h (host/de
 models/               Architecture descriptions (blocks, weights, state) and Programs: qwen35/, llama/ (Qwen3 and
                       Llama), vision/ (VisionAdapter preprocessing, smart-resize, 3D MRoPE positions), gguf.h
   drafters/           Drafters the architectures share: DFlash2 from a .flyx file, its authors' directory or a
-                      dflash GGUF (dflash2.cpp), claimed, attached and given their program nodes by registry.cpp
+                      dflash GGUF (dflash2.cpp), and DSpark from a Markov-context dflash GGUF (dspark.cpp),
+                      claimed, attached and given their program nodes by registry.cpp
   formats/            Bidirectional chat formats: detection, reply parsing (tags/calls), XGrammar structural tags,
                       and byte-identical native renderers (qwen35.cpp)
 backends/cpu_ref/     Independent float64 reference backend (shared library)

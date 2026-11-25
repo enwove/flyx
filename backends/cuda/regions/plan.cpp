@@ -363,19 +363,32 @@ void run_node(const Pass& ps, const flyx_node& n, const Block* b) {
         head(ps, std::get<HeadBlock>(*b), true);
       }
       break;
-    case FLYX_NODE_TAP:
-      if (n.arg1 == 1) {
-        const auto& ds = std::get<DSparkBlock>(*b);
-        const auto& hb = block<HeadBlock>(s->m, ds.head);
-        rmsnorm(rv.b.x, s->m->hidden, hb.norm.w, hb.norm.offset, hb.norm.eps, rv.b.h, s->m->hidden, ps.rows,
-                s->m->hidden, st);
-        tap_copy(rv.b.h, s->m->hidden, rv.b.feats, rv.ld_feats, n.arg0, ps.rows, st);
-      } else if (residual16(ps)) {
-        tap_copy(x16_of(rv), s->m->hidden, rv.b.feats, rv.ld_feats, n.arg0, ps.rows, st);
+    case FLYX_NODE_TAP: {
+      int head_idx = -1, feats_off = 0;
+      if (const auto* df = std::get_if<DFlashBlock>(b)) {
+        head_idx = df->head;
+        feats_off = df->feats_offset;
       } else {
-        tap_copy(rv.b.x, s->m->hidden, rv.b.feats, rv.ld_feats, n.arg0, ps.rows, st);
+        const auto& ds = std::get<DSparkBlock>(*b);
+        head_idx = ds.head;
+        feats_off = ds.feats_offset;
+      }
+      if (n.arg1 == 1) {
+        const auto& hb = block<HeadBlock>(s->m, head_idx);
+        if (residual16(ps))
+          rmsnorm(x16_of(rv), s->m->hidden, hb.norm.w, hb.norm.offset, hb.norm.eps, rv.b.h, s->m->hidden, ps.rows,
+                  s->m->hidden, st);
+        else
+          rmsnorm(rv.b.x, s->m->hidden, hb.norm.w, hb.norm.offset, hb.norm.eps, rv.b.h, s->m->hidden, ps.rows,
+                  s->m->hidden, st);
+        tap_copy(rv.b.h, s->m->hidden, rv.b.feats + feats_off, rv.ld_feats, n.arg0, ps.rows, st);
+      } else if (residual16(ps)) {
+        tap_copy(x16_of(rv), s->m->hidden, rv.b.feats + feats_off, rv.ld_feats, n.arg0, ps.rows, st);
+      } else {
+        tap_copy(rv.b.x, s->m->hidden, rv.b.feats + feats_off, rv.ld_feats, n.arg0, ps.rows, st);
       }
       break;
+    }
     case FLYX_NODE_DRAFT:
       if (const auto* t = std::get_if<MtpBlock>(b)) mtp_draft(s, *t, n.arg0, rv.L);
       else if (const auto* v = std::get_if<DvBlock>(b)) dv_draft(s, *v, n.arg0, rv.L);

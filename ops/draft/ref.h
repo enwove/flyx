@@ -32,6 +32,15 @@
 
 namespace flyx::ops {
 
+// DFlash2 selector candidate score: unary + edge, with optional tanh softcapping applied either to
+// the unary logit before adding the bilinear correction (`softcap_mode == 0`) or to their sum
+// (`softcap_mode == 1`, Inkling-2 DFlash2).
+inline double dflash2_selector_score(double unary, double edge, double softcap = 0.0, int softcap_mode = 0) {
+  if (softcap <= 0.0) return unary + edge;
+  if (softcap_mode == 1) return softcap * std::tanh((unary + edge) / softcap);
+  return softcap * std::tanh(unary / softcap) + edge;
+}
+
 template <class Score>
 void best_first_tree(int width, int depths, int k, int32_t anchor, const int32_t* cand, Score score, int32_t* drafts,
                      int32_t* parents) {

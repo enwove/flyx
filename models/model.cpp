@@ -71,15 +71,20 @@ std::vector<int> Model::adaptive_checkpoints(int d) const {
   const DrafterBlock& b = drafters_.at(size_t(d));
   const DrafterTraits tr = drafter_traits(b.kind);
   if (b.max_drafts <= 0 || tr.tree_only) return {};  // tree-only drafters (DV): no intra-round chain stop
-  const std::vector<int> ws = draft_widths(d);
   // Intra-round GPU confidence stopping (stop_decide_step / stop_decide_block) pays whenever cutting verify width
   // saves substantial work:
   // - sequential drafters save both remaining draft steps and verify rows;
   // - targets with steep verify-cost scaling (e.g. sparse MoE active-expert fan-out) benefit on any block drafter.
   // Dense targets paired with block drafters have nearly flat verify cost across widths (RTX PRO 6000, QUASAR NVFP4
   // 27B + DFlash2: adaptive 425-439 vs fixed 443-494 tok/s on code) and avoid extra verify subgraphs in VRAM.
-  if (tr.sequential || verify_scales_with_width_) return ws.size() > 1 ? ws : std::vector<int>{};
-  return {};
+  if (!tr.sequential && !verify_scales_with_width_) return {};
+  // Keep a parallel block drafter's adaptive graph within its trained block (b.max_drafts); stretching every adaptive
+  // round past the trained block degrades bidirectional draft quality and adds draft/verify work (stretched widths
+  // stay in draft_widths for explicit --width or widened high-acceptance runs).
+  std::vector<int> cps;
+  for (int w : draft_widths(d))
+    if (w <= b.max_drafts) cps.push_back(w);
+  return cps.size() > 1 ? cps : std::vector<int>{};
 }
 
 int Model::block_drafts(int d) const {

@@ -33,17 +33,37 @@ void check_json_target(const json& j, const TargetSpec& target) {
   if (j.value("kind", "") != "dflash2") throw std::runtime_error(mismatch_msg(target));
   if (!j.contains("target") || !j["target"].is_object()) return;
   const json& t = j["target"];
+  const int tv = t.value("vocab", target.vocab);
+  const bool vocab_ok = tv == target.vocab || tv == target.padded_vocab();
   const bool layers_ok = !t.contains("layers") || t["layers"].is_null() || t["layers"].get<int>() == target.layers;
-  if (t.value("hidden", target.hidden) != target.hidden || t.value("vocab", target.vocab) != target.vocab ||
-      !layers_ok)
+  if (t.value("hidden", target.hidden) != target.hidden || !vocab_ok || !layers_ok)
     throw std::runtime_error(mismatch_msg(target));
 }
 
 // An arch "dflash" GGUF header: the drafter reads the target's embedding and head, so its width is the target's.
 void check_gguf_target(const GgufMeta& cm, const TargetSpec& target) {
-  if (cm.count("embedding_length") != target.hidden ||
-      (cm.has("vocab_size") && cm.count("vocab_size") != target.vocab))
-    throw std::runtime_error(mismatch_msg(target));
+  if (cm.count("embedding_length") != target.hidden) throw std::runtime_error(mismatch_msg(target));
+  if (cm.has("vocab_size")) {
+    const int dv = cm.count("vocab_size");
+    if (dv != target.vocab && dv != target.padded_vocab()) throw std::runtime_error(mismatch_msg(target));
+  }
+}
+
+int parse_softcap_mode(const std::string& mode) {
+  if (mode == "before_correction") return FLYX_DFLASH2_SOFTCAP_BEFORE;
+  if (mode == "after_correction") return FLYX_DFLASH2_SOFTCAP_AFTER;
+  throw std::runtime_error("unsupported DFlash2 selector_softcap_mode: " + mode);
+}
+
+int resolve_sel_vocab(const ModelFile* file, const std::string& pred_name, const TargetSpec& target) {
+  if (file) {
+    if (const flyx_tensor_view* t = file->tensor(pred_name)) {
+      if (t->ndim == 2 && (t->shape[0] == target.vocab || t->shape[0] == target.padded_vocab()))
+        return int(t->shape[0]);
+      if (t->ndim == 2) throw std::runtime_error(mismatch_msg(target));
+    }
+  }
+  return target.vocab;
 }
 
 // A drafter tensor's name in an arch "dflash" GGUF file, from the name python/convert gives it ("draft.fc",
@@ -73,14 +93,18 @@ void validate_dflash2_spec(DFlash2Spec* spec, const TargetSpec& target) {
   if (d.block < 2 || d.block > FLYX_MAX_ROWS)
     throw std::runtime_error("DFlash2 block size outside 2.." + std::to_string(FLYX_MAX_ROWS));
   if (d.hidden != target.hidden) throw std::runtime_error("DFlash2 hidden size does not match target");
+  const int max_vocab = target.padded_vocab();
   if (d.hidden <= 0 || spec->layers <= 0 || d.n_heads <= 0 || d.n_kv <= 0 || d.head_dim <= 0 || d.head_dim % 2 != 0 ||
       d.inter <= 0 || d.n_heads % d.n_kv != 0 || d.conv_taps <= 0 || d.sel_rank <= 0 || d.sel_rank > kMaxWidth ||
-      d.sel_topk <= 0 || d.sel_topk > target.vocab || d.mask_token < 0 || d.mask_token >= target.vocab ||
+      d.sel_topk <= 0 || d.sel_topk > target.vocab || d.mask_token < 0 || d.mask_token >= max_vocab ||
       !(spec->eps > 0) || !std::isfinite(spec->eps) || !(d.theta > 0) || !std::isfinite(d.theta) ||
+      !std::isfinite(d.softcap) || d.softcap < 0.0f ||
       d.hidden > kMaxWidth || d.inter > kMaxWidth || spec->layers > kMaxLayers || d.n_heads > kMaxHeads ||
       d.head_dim > kMaxHeadDim || d.conv_taps > kMaxHeadDim || spec->taps.empty() ||
       spec->taps.size() > size_t(INT_MAX) || d.window < 0)
     throw std::runtime_error("invalid DFlash2 drafter config");
+  if (spec->sel_vocab != target.vocab && spec->sel_vocab != max_vocab)
+    throw std::runtime_error(mismatch_msg(target));
   d.n_taps = int32_t(spec->taps.size());
   if (d.conv_group < 1 || d.hidden % d.conv_group)
     throw std::runtime_error("DFlash2 conv group does not divide hidden");
@@ -97,7 +121,10 @@ void validate_dflash2_spec(DFlash2Spec* spec, const TargetSpec& target) {
 bool is_dflash_companion(const json& header) {
   if (!header.is_object()) return false;
   if (header.value("kind", "") == "drafter" && header.contains("draft") && header["draft"].is_object()) return true;
-  return GgufMeta::is_header(header) && header.value("arch", "") == "dflash";
+  if (!GgufMeta::is_header(header) || header.value("arch", "") != "dflash") return false;
+  const GgufMeta cm(header);
+  return !(cm.has("has_markov_context") && cm.at("has_markov_context").is_boolean() &&
+           cm.at("has_markov_context").get<bool>());
 }
 
 void check_made_for(const json& header, const TargetSpec& target) {
@@ -105,7 +132,7 @@ void check_made_for(const json& header, const TargetSpec& target) {
   else check_json_target(header.at("draft"), target);
 }
 
-DFlash2Spec parse_dflash2_json(const json& j, const TargetSpec& target, int companion) {
+DFlash2Spec parse_dflash2_json(const json& j, const TargetSpec& target, int companion, const ModelFile* file) {
   check_json_target(j, target);
   DFlash2Spec spec{};
   spec.gguf = false;
@@ -133,7 +160,16 @@ DFlash2Spec parse_dflash2_json(const json& j, const TargetSpec& target, int comp
   const int64_t win = j.value("window", int64_t(0));
   if (win < 0 || win > INT_MAX) throw std::runtime_error("DFlash2 window out of range");
   d.window = int32_t(win);
+  const double sc = j.contains("softcap") && j["softcap"].is_number() ? j["softcap"].get<double>() : 0.0;
+  if (!std::isfinite(sc) || sc < 0.0) throw std::runtime_error("DFlash2 softcap out of range");
+  d.softcap = float(sc);
+  d.softcap_mode = j.contains("softcap_mode") && j["softcap_mode"].is_string()
+                       ? parse_softcap_mode(j["softcap_mode"].get<std::string>())
+                       : FLYX_DFLASH2_SOFTCAP_BEFORE;
   spec.eps = j.at("eps").get<double>();
+  const std::string pred_name =
+      companion >= 0 ? ModelFile::companion_name(companion, "draft.sel.pred") : std::string("draft.sel.pred");
+  spec.sel_vocab = resolve_sel_vocab(file, pred_name, target);
   validate_dflash2_spec(&spec, target);
   return spec;
 }
@@ -145,15 +181,12 @@ DFlash2Spec parse_dflash2_gguf(const ModelFile& file, const json& header, const 
   // What the layout can say that the block here does not run: refused, never drafted as the plain block.
   auto set = [&](const char* key) { return cm.has(key) && cm.at(key).is_boolean() && cm.at(key).get<bool>(); };
   if (set("has_markov_context"))
-    throw std::runtime_error("DSpark drafters (dflash.has_markov_context = true) are not supported by this build");
+    throw std::runtime_error("DSpark drafters (dflash.has_markov_context = true) use the DSpark drafter path");
   if (set("attention.causal"))
     throw std::runtime_error("causal DFlash2 layers are not supported (the block attends both ways)");
   if (set("sample_from_anchor")) throw std::runtime_error("sample_from_anchor=True is not supported");
   if (set("has_confidence_head"))
     throw std::runtime_error("a DFlash2 confidence head (dflash.has_confidence_head) is not supported");
-  if (cm.has("final_logit_softcapping") &&
-      !(cm.at("final_logit_softcapping").is_number() && cm.at("final_logit_softcapping").get<double>() == 0))
-    throw std::runtime_error("DFlash2 logit soft-capping (dflash.final_logit_softcapping) is not supported");
 
   DFlash2Spec spec{};
   spec.gguf = true;
@@ -176,6 +209,19 @@ DFlash2Spec parse_dflash2_gguf(const ModelFile& file, const json& header, const 
   d.conv_group = cm.count_or("conv_group_size", 16);
   d.sel_rank = cm.count_or("selector_rank", 256);
   d.sel_topk = cm.count_or("selector_top_k", 16);
+  if (cm.has("final_logit_softcapping")) {
+    if (!cm.at("final_logit_softcapping").is_number())
+      throw std::runtime_error("DFlash2 GGUF final_logit_softcapping must be a number");
+    const double sc = cm.at("final_logit_softcapping").get<double>();
+    if (!std::isfinite(sc) || sc < 0.0) throw std::runtime_error("DFlash2 GGUF final_logit_softcapping out of range");
+    d.softcap = float(sc);
+  }
+  if (d.softcap > 0.0f) {
+    if (cm.has("selector_softcap_mode") && cm.at("selector_softcap_mode").is_string())
+      d.softcap_mode = parse_softcap_mode(cm.at("selector_softcap_mode").get<std::string>());
+    else
+      d.softcap_mode = FLYX_DFLASH2_SOFTCAP_BEFORE;  // llama.cpp GGUF default when softcap > 0
+  }
 
   int win = cm.count_or("attention.sliding_window", 0, 0);
   if (cm.has("attention.sliding_window_pattern")) {
@@ -206,12 +252,7 @@ DFlash2Spec parse_dflash2_gguf(const ModelFile& file, const json& header, const 
     if (!item.is_number_integer()) throw std::runtime_error("DFlash2 GGUF target_layers must be integers");
     const int64_t t = item.get<int64_t>();
     if (t < 1 || t > target.layers) throw std::runtime_error("DFlash2 tap after layer " + std::to_string(t));
-    // The layout's indices are transformers' hidden states (the published 27B drafter's are its config's
-    // target_layer_ids + 1), and the last of those is the final norm's output.  A tap reads the residual stream
-    // before that norm: a drafter made on the last one is refused, never given the other.
-    if (t == target.layers)
-      throw std::runtime_error("DFlash2 GGUF taps the target's final hidden state (dflash.target_layers " +
-                               std::to_string(t) + "), read after the output norm: not supported yet");
+    // t in [1, target.layers) taps the residual stream after layer t; t == target.layers taps post-output_norm.
     spec.taps.push_back(int(t));
   }
 
@@ -230,6 +271,8 @@ DFlash2Spec parse_dflash2_gguf(const ModelFile& file, const json& header, const 
         "DFlash2 GGUF missing mask_token_id (expected dflash.mask_token_id or tokenizer.ggml.mask_token_id)");
   d.mask_token = mask_token;
 
+  const std::string pred_name = ModelFile::companion_name(companion, "selector_predecessor.weight");
+  spec.sel_vocab = resolve_sel_vocab(&file, pred_name, target);
   validate_dflash2_spec(&spec, target);
   return spec;
 }
@@ -275,8 +318,8 @@ int build_dflash2(Tables& T, const DFlash2Spec& spec, const TargetSpec& target) 
   d.fc = T.weight(dn("draft.fc"), {H, int64_t(d.n_taps) * target.hidden});
   d.hidden_norm = T.norm(dn("draft.hidden_norm"), H, 0.0, eps);
   d.norm = T.norm(dn("draft.norm"), H, 0.0, eps);
-  d.sel_pred = T.weight(dn("draft.sel.pred"), {target.vocab, d.sel_rank});
-  d.sel_succ = T.weight(dn("draft.sel.succ"), {target.vocab, d.sel_rank});
+  d.sel_pred = T.weight(dn("draft.sel.pred"), {spec.sel_vocab, d.sel_rank});
+  d.sel_succ = T.weight(dn("draft.sel.succ"), {spec.sel_vocab, d.sel_rank});
   d.sel_hid = T.weight(dn("draft.sel.hid"), {d.sel_rank, H});
 
   flyx_state st{};

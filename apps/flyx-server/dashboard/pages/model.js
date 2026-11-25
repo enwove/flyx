@@ -77,7 +77,7 @@ function FitTag({ size }) {
   return html`<span class=${"tag2 " + (fits ? "ok" : "bad")} title=${t(title)}>${t(fits ? "fits" : "too big")}</span>`;
 }
 
-const drafterLabel = (k) => k === "mtp" ? "MTP" : k === "dflash2" ? "DFlash2" : k;
+const drafterLabel = (k) => k === "mtp" ? "MTP" : k === "dflash2" ? "DFlash2" : k === "dspark" ? "DSpark" : k;
 
 // What is served and its state, its facts, a fetch's or a load's progress, an error.  With nothing
 // served it is the view's whole content: `again` loads the model the server remembers, `browse` shows the library.
@@ -163,9 +163,10 @@ function Serving({ tm, again, retry, browse }) {
     </div>`;
 }
 
-// A drafter given as a GGUF is a DFlash2 or MTP file; anything else a DFlash2 drafter.
+// A drafter given as a GGUF is a DSpark, DFlash2, or MTP file; anything else a DFlash2 drafter.
 const kindOf = (d) => /\.gguf$/i.test(d)
-  ? (/(?:^|[\\/:-])dflash2?(?:[\\/._-]|$)/i.test(d) ? "dflash2" : "mtp")
+  ? (/(?:^|[\\/:-])dspark(?:[\\/._-]|$)/i.test(d) ? "dspark"
+     : /(?:^|[\\/:-])dflash2?(?:[\\/._-]|$)/i.test(d) ? "dflash2" : "mtp")
   : "dflash2";
 const normVisionDev = (v) => (v === "host" || v === "cpu") ? "host" : v === "gpu" ? "gpu" : v === "auto" ? "auto" : "disk";
 const normVisionQuant = (v) => (v === "exact" || v === "bf16") ? "exact" : (v === "nvfp4" || v === "fp4") ? "nvfp4" : "q8";
@@ -634,7 +635,7 @@ export function ModelPage({ active, libraryAsked, currentAsked }) {
   // its default; else what a model brings along.
   function defaultDrafter() {
     if (loadedWant && loadedWant.speculative !== false && !loadedWant.drafter && !loadedWant.drafters?.length) {
-      const list = draftersOf(L).map((d) => (d.kind === "mtp" ? "MTP" : d.kind === "dflash2" ? "DFlash2" : d.kind) + " · " +
+      const list = draftersOf(L).map((d) => drafterLabel(d.kind) + " · " +
         (d.from === "model file" ? t("the model file's own layer") : t("from " + d.from + (d.size ? " (" + gb(d.size) + " GB)" : ""))));
       if (!list.length && model.drafter) list.push(model.drafter.toUpperCase() + " · " + t("the model file's own layer"));
       return list.length ? { tag: "in use", tone: "ok", lines: list } : { tag: "none", tone: "", lines: [t("This model loaded no drafter: plain decoding.")] };
@@ -879,7 +880,7 @@ export function ModelPage({ active, libraryAsked, currentAsked }) {
     const renderRow = (c, sel, onToggle) => {
       const isMm = c.kind === "mmproj";
       const kindTag = isMm ? ["mmproj", "info"]
-                    : c.kind === "dflash2" ? ["DFlash2", "ok"] : c.kind === "mtp" ? ["MTP", "ok"] : ["drafter", "ok"];
+                    : c.kind === "dflash2" ? ["DFlash2", "ok"] : c.kind === "dspark" ? ["DSpark", "ok"] : c.kind === "mtp" ? ["MTP", "ok"] : ["drafter", "ok"];
       const sub = c.path && c.path !== c.file ? c.path : "";
       return html`
         <div class=${"mrow comp" + (sel ? " sel" : "")} data-comp=${c.key} data-kind=${c.kind} role="option" aria-selected=${String(sel)}

@@ -123,7 +123,9 @@ std::vector<LocalModel> scan_model_dirs(const std::vector<std::string>& dirs, in
       // a header means reading through the file's tokenizer tables: only the files whose names suggest a drafter
       // are opened here.  One named otherwise is listed as a model, and refused as one when it is opened.
       const bool maybe_dflash =
-          gguf && !is_mmproj && (low.find("dflash") != std::string::npos || low.find("draft") != std::string::npos);
+          gguf && !is_mmproj &&
+          (low.find("dflash") != std::string::npos || low.find("dspark") != std::string::npos ||
+           low.find("draft") != std::string::npos);
       const bool is_drafter =
           gguf && !is_mmproj &&
           (hub::mtp_gguf_name(rel) || (maybe_dflash && flyx::gguf_peek(from_path(it->path())).arch == "dflash"));
@@ -215,7 +217,7 @@ std::string drafter_kind(const std::string& path) {
   if (lp.ends_with(".gguf")) {
     const flyx::GgufPeek p = flyx::gguf_peek(path);
     if (p.valid) {
-      if (p.arch == "dflash") return lp.find("dspark") != std::string::npos ? "dspark" : "dflash2";
+      if (p.arch == "dflash") return p.has_markov_context ? "dspark" : "dflash2";
       if (p.mtp_layers > 0) return "mtp";
     }
     if (lp.find("dspark") != std::string::npos) return "dspark";
@@ -240,6 +242,7 @@ std::vector<std::string> known_drafters(const std::vector<std::string>& base_mod
   static const std::pair<const char*, const char*> kKnown[] = {
       {"Qwen/Qwen3.8-27B", "z-lab/Qwen3.8-27B-DFlash2"},
       {"Qwen/Qwen3.5-4B", "vllm-project/Qwen3.5-4B-DFlash2"},
+      {"thinkingmachines/Inkling-2-Mini", "incoai/Inkling-2-Mini-DFlash2"},
   };
   std::vector<std::string> out;
   for (const std::string& b : base_models)

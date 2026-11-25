@@ -247,18 +247,52 @@ void refusals(const std::string& dir) {
     const char* what;
   };
   for (const Case& c : {Case{"tiny_draft_refused_causal.gguf", "causal", "causal layers"},
-                        Case{"tiny_draft_refused_dspark.gguf", "DSpark", "a Markov context (DSpark)"},
                         Case{"tiny_draft_refused_anchor.gguf", "sample_from_anchor", "sampling from the anchor"},
                         Case{"tiny_draft_refused_confidence.gguf", "confidence head", "a confidence head"},
-                        Case{"tiny_draft_refused_softcap.gguf", "soft-capping", "soft-capped logits"},
-                        Case{"tiny_draft_refused_last_layer.gguf", "final hidden state",
-                             "a tap on the target's final hidden state"},
                         Case{"tiny_draft_refused_pattern.gguf", "must be uniform", "layers that do not all slide"}}) {
     ModelFile f;
     std::string err;
     const auto m = open_beside(&f, model, dir + "/" + c.file, "dflash2", &err);
     check(!m && err.find(c.says) != std::string::npos && err.find("companion file 1: ") != std::string::npos,
           std::string("a DFlash2 GGUF with ") + c.what + ": refused, the file named (" + err + ")");
+  }
+  {  // A GGUF with has_markov_context=true is classified as DSpark (not DFlash2); selecting dspark validates its tensors.
+    ModelFile f;
+    std::string err;
+    const auto m_df = open_beside(&f, model, dir + "/tiny_draft_refused_dspark.gguf", "dflash2", &err);
+    check(!m_df && err.find("no DFlash2 drafter") != std::string::npos,
+          "a Markov-context GGUF is classified as DSpark, not DFlash2 (" + err + ")");
+    ModelFile f2;
+    std::string err2;
+    const auto m_ds = open_beside(&f2, model, dir + "/tiny_draft_refused_dspark.gguf", "dspark", &err2);
+    check(!m_ds && err2.find("companion file 1: ") != std::string::npos && err2.find("DSpark") != std::string::npos,
+          "a Markov-context GGUF missing DSpark tensors is refused under dspark, the file named (" + err2 + ")");
+  }
+  {  // Soft-capped DFlash2 GGUF is supported: sets softcap and default before_correction mode.
+    ModelFile f;
+    std::string err;
+    const auto m = open_beside(&f, model, dir + "/tiny_draft_refused_softcap.gguf", "dflash2", &err);
+    bool ok = false;
+    if (m) {
+      const flyx_model_desc d = m->desc();
+      for (int i = 0; i < d.n_blocks; ++i)
+        if (d.blocks[i].kind == FLYX_BLOCK_DFLASH2)
+          ok = d.blocks[i].dflash2.softcap == 30.0f && d.blocks[i].dflash2.softcap_mode == FLYX_DFLASH2_SOFTCAP_BEFORE;
+    }
+    check(ok, "a DFlash2 GGUF with final_logit_softcapping opens with softcap=30 and before_correction mode (" + err +
+                  ")");
+  }
+  {  // A tap equal to target.layers taps post-output_norm (FLYX_NODE_TAP with arg1 == 1).
+    ModelFile f;
+    std::string err;
+    const auto m = open_beside(&f, model, dir + "/tiny_draft_refused_last_layer.gguf", "dflash2", &err);
+    bool has_post_norm = false;
+    if (m) {
+      for (const flyx_node& n : m->prefill_program())
+        if (n.kind == FLYX_NODE_TAP && n.arg1 == 1) has_post_norm = true;
+    }
+    check(m && has_post_norm,
+          "a DFlash2 GGUF tapping target.layers emits a post-output_norm FLYX_NODE_TAP (arg1=1) (" + err + ")");
   }
   {  // What a drafter's config says is read when it drafts: not chosen, the model opens without it.
     ModelFile f;

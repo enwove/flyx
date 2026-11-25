@@ -604,12 +604,178 @@ void write_tiny_dspark(const std::filesystem::path& path, const TinySpec& c, boo
   w.write(path);
 }
 
+void write_tiny_dflash2_gguf(const std::filesystem::path& path, const TinySpec& c, bool q8_weights,
+                             bool padded_codebook, uint32_t seed_val, int rank = 32, int d_nh = 0) {
+  std::mt19937 rng(seed_val);
+  GgufWriter w;
+  const std::string arch = "dflash";
+  const int nh = d_nh > 0 ? d_nh : c.nh;
+  const int layers = 2, block = 8, conv_taps = 2, conv_group = 16, topk = 16;
+  const int n_visits = c.core_start + c.n_passes * (c.core_end - c.core_start) + (c.n_phys - c.core_end);  // 10
+  const std::vector<uint32_t> taps = {2, 6, uint32_t(n_visits)};  // 1-based, ending at post-output_norm tap!
+  const std::vector<bool> swa_pat(size_t(layers), true);
+  const int sel_vocab = padded_codebook ? c.vocab_padded : c.vocab_unpadded;
+
+  w.add_str("general.architecture", arch);
+  w.add_u32("general.quantization_version", 2);
+  w.add_u32(arch + ".block_count", uint32_t(layers));
+  w.add_u32(arch + ".embedding_length", uint32_t(c.H));
+  w.add_u32(arch + ".feed_forward_length", uint32_t(c.inter));
+  w.add_u32(arch + ".attention.head_count", uint32_t(nh));
+  w.add_u32(arch + ".attention.head_count_kv", uint32_t(c.nkv));
+  w.add_u32(arch + ".attention.key_length", uint32_t(c.hd));
+  w.add_u32(arch + ".attention.value_length", uint32_t(c.hd));
+  w.add_bool(arch + ".attention.causal", false);
+  w.add_f32(arch + ".rope.freq_base", 10000.f);
+  w.add_f32(arch + ".attention.layer_norm_rms_epsilon", c.eps);
+  w.add_u32(arch + ".block_size", uint32_t(block));
+  w.add_u32(arch + ".conv_kernel_size", uint32_t(conv_taps));
+  w.add_u32(arch + ".conv_group_size", uint32_t(conv_group));
+  w.add_u32(arch + ".selector_rank", uint32_t(rank));
+  w.add_u32(arch + ".selector_top_k", uint32_t(topk));
+  w.add_f32(arch + ".final_logit_softcapping", c.softcap);
+  w.add_u32(arch + ".attention.sliding_window", uint32_t(c.window));
+  w.add_bool_arr(arch + ".attention.sliding_window_pattern", swa_pat);
+  w.add_u32_arr(arch + ".target_layers", taps);
+  w.add_u32("tokenizer.ggml.mask_token_id", 266);
+
+  const uint32_t lin_dt = q8_weights ? kGgmlQ8_0 : kGgmlBF16;
+  auto add_mat = [&](const std::string& name, int N, int K, uint32_t dt, float sd = 0.08f) {
+    const size_t n = size_t(N) * K;
+    if (dt == kGgmlBF16) w.add_tensor(name, {uint64_t(N), uint64_t(K)}, kGgmlBF16, gen_bf16(rng, n, sd));
+    else if (dt == kGgmlQ8_0) w.add_tensor(name, {uint64_t(N), uint64_t(K)}, kGgmlQ8_0, gen_q8_0(rng, n, sd));
+    else w.add_tensor(name, {uint64_t(N), uint64_t(K)}, kGgmlF32, gen_f32(rng, n, 0.f, sd));
+  };
+  auto add_vec = [&](const std::string& name, const std::vector<uint64_t>& shape, float mean, float sd) {
+    size_t n = 1;
+    for (uint64_t d : shape) n *= size_t(d);
+    w.add_tensor(name, shape, kGgmlF32, gen_f32(rng, n, mean, sd));
+  };
+
+  const int q_dim = nh * c.hd, kv_dim = c.nkv * c.hd;
+  const int tg2 = 2 * conv_taps * (c.H / conv_group);
+  for (int l = 0; l < layers; ++l) {
+    const std::string p = "blk." + std::to_string(l) + ".";
+    add_vec(p + "attn_norm.weight", {uint64_t(c.H)}, 1.f, 0.1f);
+    add_vec(p + "ffn_norm.weight", {uint64_t(c.H)}, 1.f, 0.1f);
+    add_vec(p + "attn_q_norm.weight", {uint64_t(c.hd)}, 1.f, 0.1f);
+    add_vec(p + "attn_k_norm.weight", {uint64_t(c.hd)}, 1.f, 0.1f);
+    add_mat(p + "attn_q.weight", q_dim, c.H, lin_dt);
+    add_mat(p + "attn_k.weight", kv_dim, c.H, lin_dt);
+    add_mat(p + "attn_v.weight", kv_dim, c.H, lin_dt);
+    add_mat(p + "attn_output.weight", c.H, q_dim, lin_dt);
+    add_mat(p + "ffn_gate.weight", c.inter, c.H, lin_dt);
+    add_mat(p + "ffn_up.weight", c.inter, c.H, lin_dt);
+    add_mat(p + "ffn_down.weight", c.H, c.inter, lin_dt);
+    add_mat(p + "attn_conv_proj.weight", tg2, c.H, lin_dt, 0.05f);
+    add_vec(p + "attn_conv_base", {2, uint64_t(conv_taps), uint64_t(c.H)}, 0.5f, 0.1f);
+    add_mat(p + "ffn_conv_proj.weight", tg2, c.H, lin_dt, 0.05f);
+    add_vec(p + "ffn_conv_base", {2, uint64_t(conv_taps), uint64_t(c.H)}, 0.5f, 0.1f);
+  }
+  add_mat("fc.weight", c.H, int(taps.size()) * c.H, lin_dt);
+  add_vec("enc.output_norm.weight", {uint64_t(c.H)}, 1.f, 0.1f);
+  add_vec("output_norm.weight", {uint64_t(c.H)}, 1.f, 0.1f);
+  add_mat("selector_predecessor.weight", sel_vocab, rank, kGgmlBF16, 0.1f);
+  add_mat("selector_successor.weight", sel_vocab, rank, kGgmlBF16, 0.1f);
+  add_mat("selector_hidden.weight", rank, c.H, lin_dt, 0.1f);
+  w.write(path);
+}
+
+void write_tiny_dflash2_dir(const std::filesystem::path& dir, const TinySpec& c, uint32_t seed_val, int rank = 32) {
+  std::filesystem::create_directories(dir);
+  std::mt19937 rng(seed_val);
+  const int layers = 2, block = 8, conv_taps = 2, conv_group = 16, topk = 16;
+  const int n_visits = c.core_start + c.n_passes * (c.core_end - c.core_start) + (c.n_phys - c.core_end);  // 10
+  const json cfg = {
+      {"architectures", {"DFlash2DraftModel"}},
+      {"hidden_size", c.H},
+      {"intermediate_size", c.inter},
+      {"num_hidden_layers", layers},
+      {"num_attention_heads", c.nh},
+      {"num_key_value_heads", c.nkv},
+      {"head_dim", c.hd},
+      {"rms_norm_eps", c.eps},
+      {"rope_parameters", {{"rope_theta", 10000.0}}},
+      {"is_causal", false},
+      {"layer_types", std::vector<std::string>(size_t(layers), "sliding_attention")},
+      {"sliding_window", c.window},
+      {"num_target_layers", n_visits},
+      {"vocab_size", c.vocab_padded},
+      {"dflash_config",
+       {{"block_size", block},
+        {"conv_group_size", conv_group},
+        {"conv_kernel_size", conv_taps},
+        {"final_logit_softcapping", c.softcap},
+        {"mask_token_id", 266},
+        {"selector_rank", rank},
+        {"selector_softcap_mode", "after_correction"},
+        {"selector_top_k", topk},
+        {"target_layer_ids", {1, 5, n_visits}}}},
+  };
+  {
+    std::ofstream out(dir / "config.json", std::ios::binary | std::ios::trunc);
+    out << cfg.dump(2);
+  }
+  json hdr = json::object();
+  std::vector<uint8_t> blob;
+  auto add_t = [&](const std::string& name, const std::vector<int64_t>& shape, const std::string& dt,
+                   const std::vector<uint8_t>& bytes) {
+    const uint64_t start = blob.size();
+    blob.insert(blob.end(), bytes.begin(), bytes.end());
+    hdr[name] = {{"dtype", dt}, {"shape", shape}, {"data_offsets", {start, uint64_t(blob.size())}}};
+  };
+  auto add_bf16 = [&](const std::string& name, const std::vector<int64_t>& shape, float sd = 0.08f) {
+    size_t n = 1;
+    for (int64_t d : shape) n *= size_t(d);
+    add_t(name, shape, "BF16", gen_bf16(rng, n, sd));
+  };
+  auto add_f32 = [&](const std::string& name, const std::vector<int64_t>& shape, float mean, float sd) {
+    size_t n = 1;
+    for (int64_t d : shape) n *= size_t(d);
+    add_t(name, shape, "F32", gen_f32(rng, n, mean, sd));
+  };
+
+  const int q_dim = c.nh * c.hd, kv_dim = c.nkv * c.hd;
+  const int tg2 = 2 * conv_taps * (c.H / conv_group);
+  for (int l = 0; l < layers; ++l) {
+    const std::string p = "model.layers." + std::to_string(l) + ".";
+    add_f32(p + "input_layernorm.weight", {c.H}, 1.f, 0.1f);
+    add_f32(p + "post_attention_layernorm.weight", {c.H}, 1.f, 0.1f);
+    add_f32(p + "self_attn.q_norm.weight", {c.hd}, 1.f, 0.1f);
+    add_f32(p + "self_attn.k_norm.weight", {c.hd}, 1.f, 0.1f);
+    add_bf16(p + "self_attn.q_proj.weight", {q_dim, c.H});
+    add_bf16(p + "self_attn.k_proj.weight", {kv_dim, c.H});
+    add_bf16(p + "self_attn.v_proj.weight", {kv_dim, c.H});
+    add_bf16(p + "self_attn.o_proj.weight", {c.H, q_dim});
+    add_bf16(p + "mlp.gate_proj.weight", {c.inter, c.H});
+    add_bf16(p + "mlp.up_proj.weight", {c.inter, c.H});
+    add_bf16(p + "mlp.down_proj.weight", {c.H, c.inter});
+    add_bf16(p + "attention_conv.kernel_projection.weight", {tg2, c.H}, 0.05f);
+    add_f32(p + "attention_conv.base_kernel", {2, conv_taps, c.H}, 0.5f, 0.1f);
+    add_bf16(p + "mlp_conv.kernel_projection.weight", {tg2, c.H}, 0.05f);
+    add_f32(p + "mlp_conv.base_kernel", {2, conv_taps, c.H}, 0.5f, 0.1f);
+  }
+  add_bf16("model.fc.weight", {c.H, 3 * c.H});
+  add_f32("model.hidden_norm.weight", {c.H}, 1.f, 0.1f);
+  add_f32("model.norm.weight", {c.H}, 1.f, 0.1f);
+  add_bf16("model.candidate_selector.predecessor_codebook", {c.vocab_padded, rank}, 0.1f);
+  add_bf16("model.candidate_selector.successor_codebook", {c.vocab_padded, rank}, 0.1f);
+  add_bf16("model.candidate_selector.hidden_projection.weight", {rank, c.H}, 0.1f);
+
+  const std::string hdr_s = hdr.dump();
+  const uint64_t hlen = hdr_s.size();
+  std::ofstream out(dir / "model.safetensors", std::ios::binary | std::ios::trunc);
+  out.write(reinterpret_cast<const char*>(&hlen), 8);
+  out.write(hdr_s.data(), std::streamsize(hdr_s.size()));
+  out.write(reinterpret_cast<const char*>(blob.data()), std::streamsize(blob.size()));
+}
+
 struct LoadOpts {
   bool speculative = false;
   bool lookup = false;
   int max_ctx = 512;
   int prefill_chunk = 32;
-  int width = 0;
+  int width = -1;  // -1: default pinned 7 when speculative; 0: adaptive / auto
   int kv = FLYX_KV_16;
   int kv_gpu = -1;
   int kv_copy_gpu = -1;
@@ -631,7 +797,7 @@ std::unique_ptr<Engine> load_engine(const std::string& path, const std::string& 
   eo.lookup_given = o.lookup;
   eo.speculative = o.speculative;
   eo.drafter = o.speculative ? o.drafter : "none";
-  eo.width = o.speculative ? (o.width > 0 ? o.width : 7) : 0;
+  eo.width = o.speculative ? (o.width >= 0 ? o.width : 7) : 0;
   eo.drafter_files = o.drafter_files;
   eo.activations = o.activations;
   eo.kv = o.kv;
@@ -989,28 +1155,55 @@ int main(int argc, char** argv) {
     const auto mixed_gguf = dir / "tiny_inkling2_mixed.gguf";
     const auto dspark_bf16 = dir / "dspark-tiny-bf16.gguf";
     const auto dspark_q8 = dir / "dspark-tiny-q8.gguf";
+    const auto dflash2_bf16 = dir / "dflash2-tiny-bf16.gguf";
+    const auto dflash2_q8 = dir / "dflash2-tiny-q8.gguf";
+    const auto dflash2_dir = dir / "dflash2-tiny-hf";
     write_tiny_inkling2(bf16_gguf, spec, false, 1001);
     write_tiny_inkling2(mixed_gguf, spec, true, 2002);
     write_tiny_dspark(dspark_bf16, spec, false, 3003);
     write_tiny_dspark(dspark_q8, spec, true, 4004);
+    write_tiny_dflash2_gguf(dflash2_bf16, spec, false, /*padded_codebook=*/true, 5005);
+    // Use more query heads than the target (8 > 4) so wide-block DFlash2 rounds (B=16) guard attention partial sizing.
+    write_tiny_dflash2_gguf(dflash2_q8, spec, true, /*padded_codebook=*/false, 6006, 32, spec.nh * 2);
+    write_tiny_dflash2_dir(dflash2_dir, spec, 7007);
 
     test_chat_and_format(bf16_gguf.string());
 
     std::vector<int32_t> prompt;
     for (int i = 0; i < 20; ++i) prompt.push_back(10 + (i * 7) % 240);
 
-    // ---- 1. Float64 cpu_ref baseline + cpu_ref DSpark ---------------------------------------
+    // ---- 1. Float64 cpu_ref baseline + cpu_ref DSpark + cpu_ref DFlash2 (GGUF & HF dir) + all ----
     std::printf("Inkling-2 bf16+nvfp4 target (%s vs cpu_ref)\n", backend.c_str());
     auto ref_plain = load_engine(bf16_gguf.string(), "cpu_ref");
     auto ref_dspark = load_engine(bf16_gguf.string(), "cpu_ref",
                                   {.speculative = true, .drafter = "dspark", .drafter_files = {dspark_bf16.string()}});
+    auto ref_dflash2 = load_engine(bf16_gguf.string(), "cpu_ref",
+                                   {.speculative = true, .drafter = "dflash2", .drafter_files = {dflash2_bf16.string()}});
+    auto ref_dflash2_dir =
+        load_engine(bf16_gguf.string(), "cpu_ref",
+                    {.speculative = true, .drafter = "dflash2", .drafter_files = {dflash2_dir.string()}});
+    auto ref_both = load_engine(bf16_gguf.string(), "cpu_ref",
+                                {.speculative = true,
+                                 .drafter = "all",
+                                 .drafter_files = {dspark_bf16.string(), dflash2_bf16.string()}});
     check(std::string(ref_dspark->drafter()) == "dspark", "cpu_ref loaded DSpark companion drafter");
+    check(std::string(ref_dflash2->drafter()) == "dflash2", "cpu_ref loaded DFlash2 GGUF companion drafter");
+    check(std::string(ref_dflash2_dir->drafter()) == "dflash2", "cpu_ref loaded DFlash2 HF dir companion drafter");
+    check(ref_both->model().drafters() == 2, "cpu_ref loaded DSpark + DFlash2 simultaneously (--drafter all)");
     const auto ref_greedy = fresh_gen(*ref_plain, prompt, 24, false);
     const auto ref_sampled = fresh_gen(*ref_plain, prompt, 24, true);
     check(same_tokens(fresh_gen(*ref_dspark, prompt, 24, false), ref_greedy),
           "cpu_ref DSpark greedy == cpu_ref plain");
     check(same_tokens(fresh_gen(*ref_dspark, prompt, 24, true), ref_sampled),
           "cpu_ref DSpark sampled+penalties == cpu_ref plain");
+    check(same_tokens(fresh_gen(*ref_dflash2, prompt, 24, false), ref_greedy),
+          "cpu_ref DFlash2 GGUF greedy == cpu_ref plain");
+    check(same_tokens(fresh_gen(*ref_dflash2, prompt, 24, true), ref_sampled),
+          "cpu_ref DFlash2 GGUF sampled+penalties == cpu_ref plain");
+    check(same_tokens(fresh_gen(*ref_dflash2_dir, prompt, 24, false), ref_greedy),
+          "cpu_ref DFlash2 HF dir greedy == cpu_ref plain");
+    check(same_tokens(fresh_gen(*ref_both, prompt, 24, false), ref_greedy),
+          "cpu_ref DSpark + DFlash2 (--drafter all) greedy == cpu_ref plain");
 
     // A prompt asked again, its conversation ending where the prompt does (the real template opens a reply with
     // nothing of its own): the session kept the state its last prefill pass started from, and runs that pass again.
@@ -1135,6 +1328,200 @@ int main(int argc, char** argv) {
             "Gate 4: cuda DSpark sampled+penalties == cuda plain");
       check(same_tokens(fresh_gen(*cu_dspark_unfused, prompt, 24, false), cu_greedy),
             "Gate 2+4: cuda DSpark fusion=0 == cuda plain");
+
+      // ---- 2b. Inkling-2 + DFlash2 (GGUF BF16/Q8_0, HF safetensors dir) & DSpark + DFlash2 together ----
+      std::printf("Inkling-2 DFlash2 (GGUF BF16/Q8_0, HF safetensors) and DSpark+DFlash2 simultaneously\n");
+      {
+        auto cu_df_bf16 = load_engine(bf16_gguf.string(), "cuda",
+                                      {.speculative = true,
+                                       .prefill_chunk = 32,
+                                       .drafter = "dflash2",
+                                       .drafter_files = {dflash2_bf16.string()}});
+        auto cu_df_unfused = load_engine(bf16_gguf.string(), "cuda",
+                                         {.speculative = true,
+                                          .prefill_chunk = 32,
+                                          .drafter = "dflash2",
+                                          .drafter_files = {dflash2_bf16.string()},
+                                          .backend_opts = "fusion=0"});
+        auto cu_df_nographs = load_engine(bf16_gguf.string(), "cuda",
+                                          {.speculative = true,
+                                           .prefill_chunk = 32,
+                                           .drafter = "dflash2",
+                                           .drafter_files = {dflash2_bf16.string()},
+                                           .backend_opts = "graphs=0"});
+        auto cu_df_dir = load_engine(bf16_gguf.string(), "cuda",
+                                     {.speculative = true,
+                                      .prefill_chunk = 32,
+                                      .drafter = "dflash2",
+                                      .drafter_files = {dflash2_dir.string()}});
+        auto cu_df_q8 = load_engine(mixed_gguf.string(), "cuda",
+                                    {.speculative = true,
+                                     .prefill_chunk = 32,
+                                     .drafter = "dflash2",
+                                     .drafter_files = {dflash2_q8.string()}});
+        auto cu_mix_plain_df = load_engine(mixed_gguf.string(), "cuda", {.prefill_chunk = 32});
+        auto cu_both = load_engine(bf16_gguf.string(), "cuda",
+                                   {.speculative = true,
+                                    .prefill_chunk = 32,
+                                    .drafter = "all",
+                                    .drafter_files = {dspark_bf16.string(), dflash2_bf16.string()}});
+        check(std::string(cu_df_bf16->drafter()) == "dflash2", "cuda loaded DFlash2 GGUF on Inkling-2");
+        check(std::string(cu_df_dir->drafter()) == "dflash2", "cuda loaded DFlash2 HF safetensors on Inkling-2");
+        check(cu_both->model().drafters() == 2, "cuda loaded DSpark + DFlash2 simultaneously (--drafter all)");
+        check(same_tokens(fresh_gen(*cu_df_bf16, prompt, 24, false), cu_greedy),
+              "Gate 4: cuda DFlash2 GGUF greedy == cuda plain");
+        check(same_tokens(fresh_gen(*cu_df_bf16, prompt, 24, true), cu_sampled),
+              "Gate 4: cuda DFlash2 GGUF sampled+penalties == cuda plain");
+        check(same_tokens(fresh_gen(*cu_df_unfused, prompt, 24, false), cu_greedy),
+              "Gate 2+4: cuda DFlash2 GGUF fusion=0 == cuda plain");
+        check(same_tokens(fresh_gen(*cu_df_nographs, prompt, 24, true), cu_sampled),
+              "Gate 4: cuda DFlash2 GGUF graphs=0 sampled == cuda plain");
+        check(same_tokens(fresh_gen(*cu_df_dir, prompt, 24, false), cu_greedy),
+              "Gate 4: cuda DFlash2 HF safetensors greedy == cuda plain");
+        check(same_tokens(fresh_gen(*cu_df_dir, prompt, 24, true), cu_sampled),
+              "Gate 4: cuda DFlash2 HF safetensors sampled+penalties == cuda plain");
+        const auto mix_g = fresh_gen(*cu_mix_plain_df, prompt, 24, false);
+        const auto mix_s = fresh_gen(*cu_mix_plain_df, prompt, 24, true);
+        check(same_tokens(fresh_gen(*cu_df_q8, prompt, 24, false), mix_g),
+              "Gate 4: cuda mixed-quant Inkling-2 + Q8_0 DFlash2 GGUF greedy == plain");
+        check(same_tokens(fresh_gen(*cu_df_q8, prompt, 24, true), mix_s),
+              "Gate 4: cuda mixed-quant Inkling-2 + Q8_0 DFlash2 GGUF sampled+penalties == plain");
+        check(same_tokens(fresh_gen(*cu_both, prompt, 24, false), cu_greedy),
+              "Gate 4: cuda DSpark + DFlash2 (--drafter all) greedy == cuda plain");
+        check(same_tokens(fresh_gen(*cu_both, prompt, 24, true), cu_sampled),
+              "Gate 4: cuda DSpark + DFlash2 (--drafter all) sampled+penalties == cuda plain");
+
+        // 16-row (width=15) row-count invariance + adaptive conditional graph (width=0) + oracle + lookup.
+        for (const bool mixed : {false, true}) {
+          const std::string tag = mixed ? "mixed-quant" : "bf16";
+          const auto& tgt = mixed ? mixed_gguf : bf16_gguf;
+          const auto& df = mixed ? dflash2_q8 : dflash2_bf16;
+          auto e_plain = load_engine(tgt.string(), "cuda", {.prefill_chunk = 32, .backend_opts = "head_cert=0"});
+          const auto want48 = fresh_gen(*e_plain, prompt, 48, false);
+          const auto want48_s = fresh_gen(*e_plain, prompt, 48, true);
+
+          // 16-row lookup round (width=15, 14 accepted + 1 rejected) logits vs 1-row plain and fusion=0 vs fusion=1.
+          for (const std::string fusion : {"fusion=0", "fusion=1"}) {
+            auto e16 = load_engine(tgt.string(), "cuda",
+                                   {.speculative = true,
+                                    .lookup = true,
+                                    .prefill_chunk = 32,
+                                    .width = 0,
+                                    .backend_opts = "head_cert=0,blocks=packed," + fusion});
+            size_t idx15 = SIZE_MAX;
+            for (size_t i = 0; i < e16->lookup_widths().size(); ++i)
+              if (e16->lookup_widths()[i] == 15) idx15 = i;
+            check(idx15 != SIZE_MAX, tag + " (" + fusion + "): has lookup width=15 plan");
+            if (idx15 != SIZE_MAX) {
+              const int vocab = e16->model().desc().vocab;
+              // Collect 1-row reference logits for steps 0..16.
+              std::vector<float> ref_logits(17 * size_t(vocab));
+              {
+                Session sr(e16.get());
+                std::string serr;
+                if (!sr.init(&serr)) throw std::runtime_error(serr);
+                flyx_gen_params gp{};
+                gp.top_p = 1.f;
+                flyx_round_result rr{};
+                const auto* api = e16->api();
+                if (api->prefill(e16->prefill_plan(), sr.seq(), prompt.data(), int32_t(prompt.size()), &gp) ||
+                    api->read(sr.seq(), &rr))
+                  throw std::runtime_error(api->last_error());
+                for (int step = 0; step < 17; ++step) {
+                  if (api->launch(e16->round_plan(0), sr.seq(), &gp) || api->read(sr.seq(), &rr))
+                    throw std::runtime_error(api->last_error());
+                  if (api->logits(sr.seq(), 0, ref_logits.data() + size_t(step) * vocab))
+                    throw std::runtime_error(api->last_error());
+                }
+              }
+              // Run 16-row lookup round with 14 accepted drafts + 1 wrong, then a 1-row follow-up round.
+              Session s16(e16.get());
+              std::string serr;
+              if (!s16.init(&serr)) throw std::runtime_error(serr);
+              flyx_gen_params gp{};
+              gp.top_p = 1.f;
+              flyx_round_result rr{};
+              const auto* api = e16->api();
+              if (api->prefill(e16->prefill_plan(), s16.seq(), prompt.data(), int32_t(prompt.size()), &gp) ||
+                  api->read(s16.seq(), &rr))
+                throw std::runtime_error(api->last_error());
+              int32_t drafts15[15];
+              for (int i = 0; i < 14; ++i) drafts15[i] = want48[size_t(1 + i)];
+              drafts15[14] = (want48[15] + 1) % vocab;
+              flyx_gen_params gv = gp;
+              gv.drafts = drafts15;
+              gv.n_drafts = 15;
+              gv.drafts_at = int32_t(prompt.size()) + 1;
+              if (api->launch(e16->lookup_plan(idx15), s16.seq(), &gv) || api->read(s16.seq(), &rr))
+                throw std::runtime_error(api->last_error());
+              bool ok16 = rr.n_accepted == 14 && rr.n_tokens == 15 &&
+                          std::equal(rr.tokens, rr.tokens + 15, want48.begin() + 1);
+              int bad_row = -1;
+              float max_diff = 0.f;
+              std::vector<float> got(static_cast<size_t>(vocab));
+              for (int row = 0; row < 15; ++row) {
+                if (api->logits(s16.seq(), row, got.data())) throw std::runtime_error(api->last_error());
+                for (int v = 0; v < vocab; ++v) {
+                  const float d = std::fabs(got[size_t(v)] - ref_logits[size_t(row) * vocab + size_t(v)]);
+                  if (d > max_diff) {
+                    max_diff = d;
+                    if (bad_row < 0 && d > 0.f) bad_row = row;
+                  }
+                }
+              }
+              if (api->launch(e16->round_plan(0), s16.seq(), &gp) || api->read(s16.seq(), &rr))
+                throw std::runtime_error(api->last_error());
+              const bool next_ok = rr.n_tokens == 1 && rr.tokens[0] == want48[16];
+              check(ok16 && next_ok && max_diff == 0.f,
+                    tag + " (" + fusion + "): 16-row lookup round (14 accepted) bit-identical to 1-row plain" +
+                        (max_diff > 0.f ? " [bad_row=" + std::to_string(bad_row) + " max_diff=" + std::to_string(max_diff) + "]" : ""));
+            }
+          }
+
+          // Adaptive DFlash2 (width=0, lookup=true) both free and with oracle forcing long accepted runs.
+          auto e_adapt = load_engine(tgt.string(), "cuda",
+                                     {.speculative = true,
+                                      .lookup = true,
+                                      .prefill_chunk = 32,
+                                      .width = 0,
+                                      .drafter = "dflash2",
+                                      .drafter_files = {df.string()}});
+          check(same_tokens(fresh_gen(*e_adapt, prompt, 48, false), want48),
+                tag + " Gate 4: adaptive DFlash2 + lookup greedy == plain");
+          check(same_tokens(fresh_gen(*e_adapt, prompt, 48, true), want48_s),
+                tag + " Gate 4: adaptive DFlash2 + lookup sampled+penalties == plain");
+          {
+            Session so(e_adapt.get());
+            std::string serr;
+            if (!so.init(&serr)) throw std::runtime_error(serr);
+            std::vector<int32_t> oracle = prompt;
+            oracle.insert(oracle.end(), want48.begin(), want48.end());
+            if (e_adapt->api()->set_oracle(so.seq(), oracle.data(), int32_t(oracle.size())) != 0)
+              throw std::runtime_error(e_adapt->api()->last_error());
+            check(same_tokens(run_gen(so, prompt, 48, false), want48),
+                  tag + " Gate 4: adaptive DFlash2 + oracle (forced accepted runs) greedy == plain");
+          }
+          // Fixed width=15 DFlash2 + oracle.
+          auto e_w15 = load_engine(tgt.string(), "cuda",
+                                   {.speculative = true,
+                                    .lookup = true,
+                                    .prefill_chunk = 32,
+                                    .width = 15,
+                                    .drafter = "dflash2",
+                                    .drafter_files = {df.string()}});
+          {
+            Session so(e_w15.get());
+            std::string serr;
+            if (!so.init(&serr)) throw std::runtime_error(serr);
+            std::vector<int32_t> oracle = prompt;
+            oracle.insert(oracle.end(), want48.begin(), want48.end());
+            if (e_w15->api()->set_oracle(so.seq(), oracle.data(), int32_t(oracle.size())) != 0)
+              throw std::runtime_error(e_w15->api()->last_error());
+            check(same_tokens(run_gen(so, prompt, 48, false), want48),
+                  tag + " Gate 4: width=15 DFlash2 + oracle (15 accepted/round) greedy == plain");
+          }
+        }
+      }
 
       // ---- 3. Rewind, edited prompt, and SWA ring wraparound checkpoint/restore & snapshot ----
       std::printf("Inkling-2 rewind, edit, and SWA ring wraparound checkpoint/snapshot\n");

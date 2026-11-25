@@ -30,7 +30,7 @@
 extern "C" {
 #endif
 
-#define FLYX_BACKEND_ABI_VERSION 45u
+#define FLYX_BACKEND_ABI_VERSION 46u
 #define FLYX_BACKEND_ENTRY "flyx_backend_get_api"
 /* How a backend library exports its entry. */
 #if defined(_WIN32)
@@ -386,6 +386,12 @@ typedef struct {
   int32_t ring;                        /* state (width hidden) */
 } flyx_mtp_block;
 
+/* Where a DFlash2 selector applies logit softcapping when softcap > 0 (ABI 46). */
+typedef enum {
+  FLYX_DFLASH2_SOFTCAP_BEFORE = 0,  /* cap * tanh(unary / cap) + edge */
+  FLYX_DFLASH2_SOFTCAP_AFTER = 1    /* cap * tanh((unary + edge) / cap) */
+} flyx_dflash2_softcap_mode;
+
 /* DFlash2 block drafter (python/reference/flyx_ref/draft.py): `block`
  * rows (the anchor, then mask_token) through its layers, attending to the
  * context K/V and to each other (not causal; with a window, only to the
@@ -404,6 +410,10 @@ typedef struct {
   int32_t fc, sel_pred, sel_succ, sel_hid;
   int32_t kv;                          /* state: one cache per layer */
   int32_t window;                      /* sliding window of every layer; 0: none */
+  float softcap;                       /* ABI 46: selector logit softcap (0 = none) */
+  int32_t softcap_mode;                /* ABI 46: flyx_dflash2_softcap_mode */
+  int32_t vocab_out;                   /* ABI 46: unpadded vocab exposed to candidate top-k (0 = head.vocab) */
+  int32_t pad0;
 } flyx_dflash2_block;
 
 /* A DFlash2 layer: attention (q, k, v, o; q/k norms; rotary on all dims) and
