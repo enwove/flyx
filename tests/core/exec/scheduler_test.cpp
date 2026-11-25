@@ -123,6 +123,22 @@ std::vector<std::string> finished(const Scheduler& sched, size_t n) {
   return out;
 }
 
+// What the scheduler recorded of the newest finished request with this label, and how many requests finished after
+// it (-1: none with the label).
+struct Finished {
+  RequestRecord record;
+  int after = -1;
+};
+Finished finished_as(const Scheduler& sched, const std::string& label) {
+  TelemetrySnapshot t;
+  flyx_device_stats d{};
+  bool device_ok = false;
+  sched.telemetry(&t, &d, &device_ok);
+  for (size_t i = 0; i < t.recent.size(); ++i)
+    if (t.recent[i].label == label) return {t.recent[i], int(i)};
+  return {};
+}
+
 void check_queue(Scheduler& sched) {
   auto busy = send(sched, raw(sched, "busy", "Keep generating.", 1500));
   busy->wait_started();
@@ -591,9 +607,14 @@ int main(int argc, char** argv) {
     auto dogs = send(sched, raw(sched, "dogs", "Tell me a story about " + words("the dog", 8), 8));
     cats->wait();
     dogs->wait();
-    const auto order = finished(sched, 2);
-    check(cats->done && dogs->done && order == std::vector<std::string>{"dogs", "cats"},
-          "two unrelated requests with the same opening words run at once (" + order[0] + " ended first)");
+    // Where each ran is the scheduler's doing and what it recorded; which ended first is the machine's as well (the
+    // long one outlasts the short one by tens of milliseconds on cpu_ref, less than a busy machine's hiccup).
+    const Finished c = finished_as(sched, "cats"), g = finished_as(sched, "dogs");
+    check(cats->done && dogs->done && c.record.session > 0 && g.record.session > 0 &&
+              c.record.session != g.record.session,
+          "two unrelated requests with the same opening words run at once, a session each (" +
+              std::to_string(c.record.session) + ", " + std::to_string(g.record.session) + "; " +
+              (g.after > c.after ? "dogs" : "cats") + " ended first)");
   }
   // A sibling: the same long preamble, another question.  With every slot
   // taken it takes its sibling's place, and waits while the sibling runs
@@ -615,10 +636,19 @@ int main(int argc, char** argv) {
     long_one->wait();
     sibling->wait();
     follow->wait();
+    // The sibling ran where the long one ran and ended after it; the follow-up ran in the other session and found
+    // its conversation still there (it reuses the story and the reply to it).  Whether the follow-up or the long one
+    // ended first is not the scheduler's doing, and under load it was the long one.
     const auto order = finished(sched, 3);
-    check(long_one->done && sibling->done && follow->done &&
-              order == std::vector<std::string>{"follow", "long", "sibling"},
-          "a sibling waits for its busy sibling's session (" + order[0] + ", " + order[1] + ", " + order[2] + ")");
+    const Finished l = finished_as(sched, "long"), sib = finished_as(sched, "sibling");
+    const Finished f = finished_as(sched, "follow");
+    const int kept = sched.count_text_tokens(story + dogs->text);
+    check(long_one->done && sibling->done && follow->done && l.record.session > 0 &&
+              sib.record.session == l.record.session && sib.after >= 0 && sib.after < l.after &&
+              f.record.session > 0 && f.record.session != l.record.session && f.record.reused_tokens >= kept,
+          "a sibling waits for its busy sibling's session, the other session's conversation stays (" + order[0] + ", " +
+              order[1] + ", " + order[2] + "; the follow-up reused " + std::to_string(f.record.reused_tokens) + " of " +
+              std::to_string(kept) + ")");
     TelemetrySnapshot now;
     flyx_device_stats dd{};
     bool ok = false;
