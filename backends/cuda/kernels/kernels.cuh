@@ -96,6 +96,16 @@ inline const char* moe_dp4a_name(MoeDp4a variant) {
   static_assert(sizeof(names) / sizeof(names[0]) == kMoeDp4aCount);
   return names[variant];
 }
+// The configurations a build compiles: all with the tuning candidates (FLYX_TUNE_CANDIDATES, as cuda_bench measures
+// them); a release build only those the default takes (1x1, 2x1) and the original tiles.
+constexpr bool moe_dp4a_compiled(MoeDp4a variant) {
+#if !defined(FLYX_TUNE_CANDIDATES) || FLYX_TUNE_CANDIDATES
+  return variant >= kMoeDp4aDefault && variant < kMoeDp4aCount;
+#else
+  return variant == kMoeDp4aDefault || variant == kMoeDp4aC1U1 || variant == kMoeDp4aC2U1 ||
+         variant == kMoeDp4aOriginal;
+#endif
+}
 // The formats for which extra configurations are compiled, also exercised by cuda_bench and cuda_op_test.
 inline constexpr int kMoeDp4aTypes[] = {FLYX_DT_GGML_IQ3_XXS, FLYX_DT_GGML_IQ2_S, FLYX_DT_GGML_IQ2_XXS,
                                         FLYX_DT_GGML_IQ2_XS, FLYX_DT_GGML_IQ4_NL, FLYX_DT_GGML_Q4_K};

@@ -211,10 +211,13 @@ const std::vector<OptionSpec>& option_specs() {
        [](const std::string& key, const std::string& val, BackendOptions* o, std::string* err) {
          for (int i = 0; i < kMoeDp4aCount; ++i) {
            const auto variant = static_cast<MoeDp4a>(i);
-           if (val == moe_dp4a_name(variant)) {
-             o->kernels.moe_dp4a = variant;
-             return true;
+           if (val != moe_dp4a_name(variant)) continue;
+           if (!moe_dp4a_compiled(variant)) {
+             *err = key + "=" + val + " is not compiled in this build (configure with -DFLYX_TUNE_CANDIDATES=ON)";
+             return false;
            }
+           o->kernels.moe_dp4a = variant;
+           return true;
          }
          *err = "bad value \"" + val + "\" for " + key;
          return false;

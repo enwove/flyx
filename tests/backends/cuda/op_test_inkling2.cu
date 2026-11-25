@@ -1642,6 +1642,7 @@ void test_moe_dp4a_variants() {
       launch.opt = &options;
       for (int v = 0; v < kMoeDp4aCount; ++v) {
         options.moe_dp4a = static_cast<MoeDp4a>(v);
+        if (!moe_dp4a_compiled(options.moe_dp4a)) continue;  // a release build compiles the default's and original
         for (int rows : {1, 2, 4, 8, R}) {
           const size_t words = size_t(rows) * words_per_row;
           CK(cudaMemset(got, 0xff, words * sizeof(float)));

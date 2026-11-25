@@ -865,13 +865,22 @@ void launch_dp4a_q8(MoeDp4a mode, const Tables& T, const ExpertMat& W, int I_or_
   };
   if constexpr (has_moe_dp4a_variants(F::kDtype)) {
     if (FUSE_ACT && mode == kMoeDp4aDefault && rows > 1) mode = grouped_gate_up_dp4a<F>(rows);
+    // A configuration the build does not compile (moe_dp4a_compiled; the option refuses it) takes the original tiles.
     switch (mode) {
       case kMoeDp4aC1U1: return launch(MoeDp4aConfig<1, 1>{});
-      case kMoeDp4aC1U2: return launch(MoeDp4aConfig<1, 2>{});
+      case kMoeDp4aC1U2:
+        if constexpr (moe_dp4a_compiled(kMoeDp4aC1U2)) return launch(MoeDp4aConfig<1, 2>{});
+        break;
       case kMoeDp4aC2U1: return launch(MoeDp4aConfig<2, 1>{});
-      case kMoeDp4aC2U2: return launch(MoeDp4aConfig<2, 2>{});
-      case kMoeDp4aC4U1: return launch(MoeDp4aConfig<4, 1>{});
-      case kMoeDp4aC4U2: return launch(MoeDp4aConfig<4, 2>{});
+      case kMoeDp4aC2U2:
+        if constexpr (moe_dp4a_compiled(kMoeDp4aC2U2)) return launch(MoeDp4aConfig<2, 2>{});
+        break;
+      case kMoeDp4aC4U1:
+        if constexpr (moe_dp4a_compiled(kMoeDp4aC4U1)) return launch(MoeDp4aConfig<4, 1>{});
+        break;
+      case kMoeDp4aC4U2:
+        if constexpr (moe_dp4a_compiled(kMoeDp4aC4U2)) return launch(MoeDp4aConfig<4, 2>{});
+        break;
       default: break;
     }
   }

@@ -272,6 +272,7 @@ void bench_moe_projection(int dtype, bool down) {
     const int variants = nvfp4 ? 1 : kMoeDp4aCount;
     for (int v = 0; v < variants; ++v) {
       options.moe_dp4a = static_cast<MoeDp4a>(v);
+      if (!moe_dp4a_compiled(options.moe_dp4a)) continue;  // a release build's
       cudaGraph_t graph;
       cudaGraphExec_t exec;
       CK(cudaStreamBeginCapture(st, cudaStreamCaptureModeGlobal));
