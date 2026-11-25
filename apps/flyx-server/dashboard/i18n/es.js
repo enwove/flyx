@@ -5,6 +5,13 @@ export default {
   name: "Español",
   tag: "es",
   dict: {
+    "Permission mode": "Modo de permisos",
+    "Accept project edits and ask about other commands": "Aceptar cambios en el proyecto y preguntar por otros comandos",
+    "Ask for permission": "Pedir permiso",
+    "Review commands with a model": "Revisar los comandos con un modelo",
+    "Skip permission prompts": "Omitir las solicitudes de permiso",
+    "Use Claude Code settings": "Usar la configuración de Claude Code",
+    "Model review can cause a single-slot server to process the conversation again after a command.": "Tras la revisión de un comando por un modelo, un servidor con capacidad para una sola sesión puede tener que volver a procesar la conversación.",
     "A folder's model files": "Archivos de modelo de una carpeta",
     "Choose a folder with the system's dialog": "Elegir una carpeta con el diálogo del sistema",
     "Repositories on Hugging Face": "Repositorios en Hugging Face",

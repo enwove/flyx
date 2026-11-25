@@ -29,7 +29,8 @@
 //   POST /v1/unload       the model served goes; the settings file still names it
 //   POST /v1/agents/launch  {"agent": "claude|codex", "dir": PATH} opens a window of PowerShell on the server's
 //                         machine, in folder dir (without it, one the person picks in the desktop's folder dialog),
-//                         running that coding agent against the model served (agent_launch.h): {"launched": true,
+//                         running that coding agent against the model served (agent_launch.h), with an optional
+//                         permission_mode for Claude Code: {"launched": true,
 //                         "dir"}, or {"launched": false} when the dialog is cancelled.  For a browser on that machine
 //                         only: 403 from another, 409 with no model served or a dialog open, 501 where no window can
 //                         be opened (not Windows, SSH, a service)
@@ -630,6 +631,11 @@ void add_manage_routes(httplib::Server& http, Server* s) {
     const auto& agents = launch_agents();
     if (std::find(agents.begin(), agents.end(), agent) == agents.end())
       return error(r, 400, "agent must be one of: claude, codex", "invalid_request_error");
+    const std::string mode = text("permission_mode");
+    if (body.contains("permission_mode") &&
+        (agent != "claude" || (mode != "default" && mode != "acceptEdits" && mode != "auto" && mode != "bypassPermissions")))
+      return error(r, 400, "permission_mode is for Claude Code and must be default, acceptEdits, auto or bypassPermissions",
+                   "invalid_request_error");
     if (!os::shell_window_supported())
       return error(r, 501, "opening a terminal window is supported on Windows only", "not_supported");
     const ModelHost::Served served = s->host->served();
@@ -638,7 +644,7 @@ void add_manage_routes(httplib::Server& http, Server* s) {
     std::string host = q.local_addr.empty() ? "127.0.0.1" : q.local_addr;
     if (host.find(':') != std::string::npos) host = "[" + host + "]";
     const AgentTarget target{"http://" + host + ":" + std::to_string(q.local_port), served.name,
-                             served.sched->max_ctx(), !s->cfg.api_key.empty()};
+                             served.sched->max_ctx(), !s->cfg.api_key.empty(), mode};
     const std::string command = agent_powershell(agent, target);
     if (command.empty())
       return error(r, 409, "the model id has one of \" & | < > ^ % in it, which cannot be passed to Codex from "

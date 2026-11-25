@@ -21,7 +21,16 @@ const AGENTS = [
 // apps/flyx-server/agent_launch.cpp sets the same for a launch from here.
 const claudeOutput = (context) => Math.max(1, Math.min(128000, Math.floor(context / 2)));
 
-function claudeCommand(shell, origin, model, context, keyed) {
+const claudePermissions = [
+  ["acceptEdits", "Accept project edits and ask about other commands"],
+  ["default", "Ask for permission"],
+  ["auto", "Review commands with a model"],
+  ["bypassPermissions", "Skip permission prompts"],
+  ["", "Use Claude Code settings"],
+];
+
+function claudeCommand(shell, origin, model, context, keyed, permissionMode) {
+  const permission = permissionMode ? " --permission-mode " + permissionMode : "";
   if (shell === "powershell") {
     // PowerShell 5.1 can strip literal quotes from native arguments. Both model and credentials travel in the file.
     return [
@@ -41,7 +50,7 @@ function claudeCommand(shell, origin, model, context, keyed) {
       "  $file = [IO.Path]::GetTempFileName()",
       "  try {",
       "    [IO.File]::WriteAllText($file, ($settings | ConvertTo-Json))",
-      "    claude --settings $file",
+      "    claude --settings $file" + permission,
       "  } finally { [IO.File]::Delete($file) }",
       "}",
     ].join("\n");
@@ -56,7 +65,7 @@ function claudeCommand(shell, origin, model, context, keyed) {
     CLAUDE_CODE_GATEWAY_HINT_HEADERS: "1",
   };
   const settings = JSON.stringify({ model, env }, null, 2);
-  if (!keyed) return "claude --settings " + shQuote(settings);
+  if (!keyed) return "claude --settings " + shQuote(settings) + permission;
 
   // Keep the configured key out of both the clipboard and the launched client's command line.
   return [
@@ -69,16 +78,16 @@ function claudeCommand(shell, origin, model, context, keyed) {
     "  jq '.env.ANTHROPIC_AUTH_TOKEN = env.FLYX_KEY' > \"$file\" <<'FLYX_JSON'",
     settings,
     "FLYX_JSON",
-    "  claude --settings \"$file\"",
+    "  claude --settings \"$file\"" + permission,
     ")",
   ].join("\n");
 }
 
-function ClaudeSetup({ origin, model, context, keyed, shell }) {
+function ClaudeSetup({ origin, model, context, keyed, shell, permissionMode }) {
   return html`
     <p>${t("Run this in your project directory. It uses the model and context shown by FLYX for this Claude Code session.")}</p>
     ${keyed && html`<p>${t(shell === "powershell" ? "Set $env:FLYX_KEY to the server API key first." : "Export FLYX_KEY with the server API key first. This command uses jq.")}</p>`}
-    <${CodeSnippet} text=${claudeCommand(shell, origin, model, context, keyed)}/>
+    <${CodeSnippet} text=${claudeCommand(shell, origin, model, context, keyed, permissionMode)}/>
     <p class="lead">${t("Seeing 401 Invalid bearer token? Type /exit in Claude Code, then run the command above. For this launch, --settings overrides the Anthropic URL and token saved in Claude Code.")}</p>
     <details><summary>${t("Claude Code output limit")}</summary>
       <p><code>CLAUDE_CODE_MAX_OUTPUT_TOKENS</code> ${t("caps each reply: half the context, at most 128,000. Lower it if long replies tie up the server.")}</p>
@@ -200,7 +209,7 @@ const folderName = (d) => d.replace(/[\\/]+$/, "").split(/[\\/]/).pop() || d;
 
 // Where the agent starts, asked over the page: one folder, the one started in last (this browser's) until another
 // is chosen in the desktop's own dialog (POST /v1/hub/dir); then the window opens there.
-function ProjectDialog({ agent, close, started }) {
+function ProjectDialog({ agent, permissionMode, close, started }) {
   const [dir, setDir] = useState(() => saved.get("project_dir") || "");
   const [state, setState] = useState(null);  // {picking}, {busy}, {err}
   const go = useRef(null);
@@ -218,7 +227,7 @@ function ProjectDialog({ agent, close, started }) {
   }
   async function start() {
     setState({ busy: true });
-    const r = await call("POST", "/v1/agents/launch", { agent, dir });
+    const r = await call("POST", "/v1/agents/launch", { agent, dir, permission_mode: permissionMode || undefined });
     if (!r.ok) return setState({ err: r.error });
     saved.set("project_dir", dir);
     started();
@@ -248,7 +257,7 @@ function ProjectDialog({ agent, close, started }) {
 }
 
 // The button that starts the agent; the folder is asked for in the dialog it opens.
-function Launch({ agent }) {
+function Launch({ agent, permissionMode }) {
   const [open, setOpen] = useState(false);
   const [ok, setOk] = useState(false);
   return html`
@@ -256,7 +265,7 @@ function Launch({ agent }) {
       ${ok && html`<span class="launch-note ok">${t("Started in a new PowerShell window.")}</span>`}
       <button class="btn primary sm" id="agent-launch-go" onClick=${() => { setOk(false); setOpen(true); }}>
         <${Icon} name="play"/>${t("Open in PowerShell")}</button>
-      ${open && html`<${ProjectDialog} agent=${agent} close=${() => setOpen(false)}
+      ${open && html`<${ProjectDialog} agent=${agent} permissionMode=${permissionMode} close=${() => setOpen(false)}
         started=${() => { setOpen(false); setOk(true); }}/>`}
     </span>`;
 }
@@ -264,6 +273,8 @@ function Launch({ agent }) {
 export function AgentSetup({ origin, model, context, keyed }) {
   const [agent, setAgent] = useState("claude");
   const [shell, setShell] = useState(defaultShell);
+  const [claudeMode, setClaudeMode] = useState("acceptEdits");
+  const permissionMode = agent === "claude" ? claudeMode : undefined;
   const [, name, url, setup] = AGENTS.find(([id]) => id === agent);
   const needsShell = agent === "claude" || (agent === "deepseek" && !keyed);
   // The clients reserve room for a reply. A small server context still needs room for the input.
@@ -280,16 +291,23 @@ export function AgentSetup({ origin, model, context, keyed }) {
           <svg class=${"agent-logo agent-" + id} aria-hidden="true"><use href=${"#i-agent-" + id}/></svg>${id === "other" ? t(label) : label}</button>`)}
       </div>
       <div class="agent-guide" id="agent-guide" role="region" aria-labelledby=${"guide-" + agent}>
+        ${agent === "claude" && context > 0 && html`<label class="field">
+          <span>${t("Permission mode")}</span>
+          <select id="claude-permission" value=${permissionMode} onChange=${(e) => setClaudeMode(e.currentTarget.value)}>
+            ${claudePermissions.map(([value, label]) => html`<option key=${value} value=${value}>${t(label)}</option>`)}
+          </select>
+          <em>${t("Model review can cause a single-slot server to process the conversation again after a command.")}</em>
+        </label>`}
         <div class="agent-controls">
           ${url ? html`<a href=${url} target="_blank" rel="noreferrer">
             <svg class=${"agent-logo agent-" + agent} aria-hidden="true"><use href=${"#i-agent-" + agent}/></svg>${name} · ${t("Client documentation")}</a>` : html`<span></span>`}
-          ${context && launch ? html`<${Launch} key=${agent} agent=${agent}/>` : needsShell && context && picker}
+          ${context && launch ? html`<${Launch} key=${agent} agent=${agent} permissionMode=${permissionMode}/>` : needsShell && context && picker}
         </div>
         ${context ? html`
           ${launch && html`
             <div class="manual-h"><span class="caps">${t("Or set it up yourself")}</span>${needsShell && picker}</div>`}
           ${keyed && agent !== "claude" && agent !== "other" && html`<p>${t("Set the FLYX_KEY environment variable to the server API key before launching.")}</p>`}
-          <${setup} origin=${origin} model=${model} context=${context} outputLimit=${outputLimit} keyed=${keyed} shell=${shell}/>
+          <${setup} origin=${origin} model=${model} context=${context} outputLimit=${outputLimit} keyed=${keyed} shell=${shell} permissionMode=${permissionMode}/>
           ${["opencode", "pi", "deepseek"].includes(agent) && html`<p class="lead">${t("Adjust the output limit in the example to allow longer replies.")}</p>`}
         ` : html`<p>${t("Load a model and connect the dashboard to see its launch command.")}</p>`}
       </div>

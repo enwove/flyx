@@ -5,6 +5,13 @@ export default {
   name: "한국어",
   tag: "ko",
   dict: {
+    "Permission mode": "권한 모드",
+    "Accept project edits and ask about other commands": "프로젝트 편집을 허용하고 다른 명령은 필요할 때 확인",
+    "Ask for permission": "권한 요청",
+    "Review commands with a model": "모델로 명령 검토",
+    "Skip permission prompts": "권한 확인 건너뛰기",
+    "Use Claude Code settings": "Claude Code 설정 사용",
+    "Model review can cause a single-slot server to process the conversation again after a command.": "한 번에 세션 하나만 처리하는 서버는 모델이 명령을 검토한 뒤 대화를 다시 처리해야 할 수 있습니다.",
     "A folder's model files": "폴더의 모델 파일",
     "Choose a folder with the system's dialog": "시스템 대화 상자로 폴더 선택",
     "Repositories on Hugging Face": "Hugging Face의 저장소",

@@ -5,6 +5,13 @@ export default {
   name: "日本語",
   tag: "ja",
   dict: {
+    "Permission mode": "権限モード",
+    "Accept project edits and ask about other commands": "プロジェクト内の編集を許可し、その他のコマンドは必要に応じて確認する",
+    "Ask for permission": "実行前に確認する",
+    "Review commands with a model": "モデルでコマンドを審査する",
+    "Skip permission prompts": "権限の確認をスキップする",
+    "Use Claude Code settings": "Claude Code の設定を使用する",
+    "Model review can cause a single-slot server to process the conversation again after a command.": "同時に 1 セッションしか扱えないサーバーでは、モデルがコマンドを審査した後、会話を再処理する場合があります。",
     "A folder's model files": "フォルダー内のモデルファイル",
     "Choose a folder with the system's dialog": "システムのダイアログでフォルダーを選択",
     "Repositories on Hugging Face": "Hugging Face のリポジトリ",

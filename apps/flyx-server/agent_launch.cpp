@@ -68,7 +68,7 @@ std::string claude(const AgentTarget& t) {
       "  $file = [IO.Path]::GetTempFileName()",
       "  try {",
       "    [IO.File]::WriteAllText($file, ($settings | ConvertTo-Json))",
-      "    claude --settings $file",
+      "    claude --settings $file" + (t.permission_mode.empty() ? "" : " --permission-mode " + ps_quote(t.permission_mode)),
       std::string("  } finally { [IO.File]::Delete($file)") + (t.keyed ? "; Remove-Item Env:FLYX_KEY -ErrorAction SilentlyContinue" : "") + " }",
       "}",
   });
