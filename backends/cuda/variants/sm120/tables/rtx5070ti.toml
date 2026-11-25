@@ -427,6 +427,21 @@ blocks_q8 = [
 # blocks_q8, passes of 32, 64 and 128 rows: 4234609 us with these rules, 4581724 with the defaults (-7.6%), 4207811 with the best for each
 # blocks_q8, passes of 512 rows: 6198861 us with these rules, 6372700 with the defaults (-2.7%), 6167043 with the best for each
 blocks_round = [
+  # Inkling-2-Mini's dense widths in rounds of 3 and 4 rows (`cuda_bench tune blocks_round Inkling-2-Mini-UD-IQ3_XXS.gguf`,
+  # 2026-11-25, driver 610.88): each shape's best at four rows where it beat the rules below by 3% or more, and the
+  # 201,024-token head's (read every round) at 2%.  None of these widths is the 27B's or 4B's; width 1024, which their
+  # K/V layers share, keeps the rules below.  us a call, rules below -> these: Q8_0 384 99.7 -> 85.9, 2304 288.6 -> 251.3,
+  # 3072 434.8 -> 399.1; Q4_K 3072 32.1 -> 30.8; Q5_K 384 17.0 -> 14.1, 3072 116.5 -> 98.6, 201024 428.0 -> 419.3; Q6_K
+  # 384 63.9 -> 61.0, 3072 89.1 -> 75.1.  Its one-row choices measured no better in whole rounds.
+  { types = ["Q8_0"], rows = [3, 4], n_min = 383, n_max = 384, columns = 4, ahead = 0 },
+  { types = ["Q8_0"], rows = [3, 4], n_min = 2303, n_max = 2304, columns = 2, ahead = 0 },
+  { types = ["Q8_0"], rows = [3, 4], n_min = 3071, n_max = 3072, columns = 4, ahead = 0, staged = 1 },
+  { types = ["Q4_K"], rows = [3, 4], n_min = 3071, n_max = 3072, tensor_cores = "warps" },
+  { types = ["Q5_K"], rows = [3, 4], n_min = 383, n_max = 384, columns = 1, ahead = 0 },
+  { types = ["Q5_K"], rows = [3, 4], n_min = 3071, n_max = 3072, tensor_cores = "warps" },
+  { types = ["Q5_K"], rows = [3, 4], n_min = 201023, n_max = 201024, tensor_cores = "columns" },
+  { types = ["Q6_K"], rows = [3, 4], n_min = 383, n_max = 384, columns = 2, ahead = 0 },
+  { types = ["Q6_K"], rows = [3, 4], n_min = 3071, n_max = 3072, tensor_cores = "warps" },
   { types = ["Q4_0", "Q4_K", "IQ2_S", "IQ1_S"], rows = [1, 1], n_max = 5120, columns = 1, ahead = 2 },
   { types = ["Q3_K"], rows = [1, 1], n_max = 64, kernel = 2, columns = 1, ahead = 0 },
   { types = ["Q4_0", "IQ1_M"], rows = [1, 1], n_min = 64, n_max = 2048, kernel = 2, columns = 4, ahead = 0 },
