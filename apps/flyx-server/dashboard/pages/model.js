@@ -153,8 +153,7 @@ function Serving({ tm, again, retry, browse }) {
       <div class=${"bar" + (L.state === "loading" ? " busy" : "")} id="ld-prog" hidden=${!busy}>
         <i style=${{ width: L.state === "loading" ? "" : (p.total ? 100 * p.done / p.total : 0) + "%" }}></i></div>
       <div class="prog" id="ld-sub">${sub}</div>
-      <div class=${"banner " + (L.fallback ? "warn" : "bad")} id="ld-err" hidden=${!L.error && !msg}>
-        ${L.error ? (L.fallback ? [t("The new model did not load."), tErr(L.error), t(L.fallback + " was loaded again.")].join(" ").replace(/([。！？]) /g, "$1") : tErr(L.error)) : t(msg)}</div>
+      <div class="banner bad" id="ld-err" hidden=${!L.error && !msg}>${L.error ? tErr(L.error) : t(msg)}</div>
       <${VramApps} open=${showMemPanel} kind=${panelKind} id="ld-vram-apps"
                    needBytes=${vramErr ? parseVramNeeded(L.error) : 0}
                    onRetry=${vramErr ? retry : (model.id && loadedWant ? reloadServed : null)}

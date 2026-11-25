@@ -861,7 +861,7 @@ def chat_status(cl: Client, model: str) -> int:
     return st
 
 
-def fallback_checks(cl: Client, model: str):
+def failed_switch_checks(cl: Client, model: str):
     """a model that fails to load stays unloaded in state 'failed' (no auto-reload of the previous model)."""
     print("a failed switch stays unloaded")
     st_b, before = cl.get("/v1/load")
@@ -1065,7 +1065,7 @@ def request_log_checks(cl: Client, model: str):
 
 
 def system_log_checks(cl: Client):
-    """The system log: GET /v1/logs has the server's own lines (fallback_checks, run before, made it
+    """The system log: GET /v1/logs has the server's own lines (failed_switch_checks, run before, made it
     write that a model did not load), numbered in order, and gives only what came after a number."""
     print("system log")
     st, j = cl.get("/v1/logs?limit=2000")
@@ -1078,7 +1078,7 @@ def system_log_checks(cl: Client):
     check(bool(lines) and seqs == sorted(seqs) and len(set(seqs)) == len(seqs) and j.get("next") == seqs[-1],
           "lines numbered in order, next is the last", json.dumps(j)[:300])
     check(all(isinstance(l.get("t"), (int, float)) and isinstance(l.get("text"), str) for l in lines), "each has t and text")
-    check(any("did not load" in l.get("text", "") for l in lines), "the failed load (fallback check) is in the log",
+    check(any("did not load" in l.get("text", "") for l in lines), "the failed load (the failed switch check) is in the log",
           json.dumps([l.get("text") for l in lines[-8:]])[:400])
     st, k = cl.get(f"/v1/logs?after={j['next']}")
     check(st == 200 and all(l["seq"] > j["next"] for l in k.get("lines", [])), "?after=N: only the lines past N")
@@ -1328,7 +1328,7 @@ def main():
     dashboard_checks(cl)
     model_panel_checks(cl, model)
     request_log_checks(cl, model)
-    fallback_checks(cl, model)
+    failed_switch_checks(cl, model)
     system_log_checks(cl)
     security_checks(cl, model)
     unload_checks(cl, model)  # last: the model goes and comes back
