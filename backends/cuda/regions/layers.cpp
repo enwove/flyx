@@ -154,7 +154,7 @@ void head_logits(const HeadBlock& h, const RowView& v, int r0, int n, bool cert,
     gemm_fp8_skinny(v.b.h, H, h.w8, h.rs8, V, H, v.logits, V, n, false, v.L);
   } else if (h.cert && n <= 16 && cert && !ko.row_gemms) {  // option head_cert
     gemm_fp8_skinny(v.b.h, H, h.w8, h.rs8, V, H, v.logits, V, n, false, v.L);
-    head_certify(v.b.h, H, h.w, h.cert, V, H, v.logits, V, n, cs.hn, cs.key, cs.cols, cs.count, v.L);
+    head_certify(v.b.h, H, h.w, h.cert, V, H, v.logits, V, n, cs.norms, cs.key, cs.cols, cs.count, v.L);
   } else if (h.w12.hi && n <= 16 && !ko.row_gemms) {
     gemm_w12_skinny(v.b.h, H, h.w12, V, H, v.logits, V, n, false, v.L);
   } else if (h.wb.data) {

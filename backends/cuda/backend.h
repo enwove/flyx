@@ -218,7 +218,7 @@ struct RowNeeds {
 // option head_cert: head_certify's scratch (row norms, bound keys, surviving columns and their count), shared in shape
 // by each sequence and by batch rounds.
 struct CertScratch {
-  float* hn = nullptr;
+  float* norms = nullptr;  // activation norms followed by input rounding residual norms, each [rows]
   int *key = nullptr, *cols = nullptr, *count = nullptr;
 };
 

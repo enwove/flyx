@@ -160,7 +160,7 @@ void alloc_rows(const flyx_bmodel* m, int R, bool prefill, RowBufs* b, Alloc&& a
 template <class Alloc>
 void alloc_cert_scratch(const flyx_bmodel* m, CertScratch* c, Alloc&& alloc) {
   if (!m->opt.kernels.head_cert || m->opt.kernels.head_fp8) return;
-  c->hn = static_cast<float*>(alloc(FLYX_MAX_ROWS * sizeof(float)));
+  c->norms = static_cast<float*>(alloc(2 * FLYX_MAX_ROWS * sizeof(float)));
   c->key = static_cast<int*>(alloc(FLYX_MAX_ROWS * sizeof(int)));
   c->cols = static_cast<int*>(alloc(size_t(m->vocab) * sizeof(int)));
   c->count = static_cast<int*>(alloc(sizeof(int)));

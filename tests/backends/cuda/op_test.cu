@@ -142,6 +142,7 @@ int main() {
   test_gemm_fp8(1000, 2560);   // a partial column tile
   test_head_cert(5003, 256);   // a partial column group
   test_head_cert(20000, 2560);
+  test_head_cert_input_rounding();
   test_gemm_w12(1000, 2560);
   test_gemm_w12(64, 256);
   test_draft_pick(20000, 512, true);

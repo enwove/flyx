@@ -202,8 +202,8 @@ against the reference) rather than by a kernel test.
 | quantize_fp8_rows | e4m3 of w / (the row's largest magnitude / 448), nearest | exact (codes and scales as the host's) | - | test_gemm_fp8 |
 | gemm_fp8_skinny | linear of the e4m3 weights (opt-in: head_fp8); where K % 256 == 0 of the rows rounded once to bf16 (k_gemm_fp8_sliced, basalt's sliced product: 16 weight rows a block over the whole K, 4 warps on fixed 64-value slices of every 256, their sums added in warp order), else of the rows as three bf16 parts | 2e-5 | R (a row's sums depend on K alone), C | test_gemm_fp8 |
 | gemm_skinny_cols | the listed columns of gemm_skinny | gemm_skinny's bits | R; gemm_skinny's | test_head_cert |
-| head_cert_coef | the e4m3 copy's error norm per row, plus the GEMMs' rounding | a bound that held at every entry | - | test_head_cert |
-| head_certify | greedy choice of gemm_skinny over the vocabulary (opt-in: head_cert) | the same token, survivors with gemm_skinny's bits | R | test_head_cert, golden |
+| head_cert_coef | per vocabulary entry, `coef = norm(w - q) + 1e-3 * (norm(w) + norm(q))` and `qn = norm(q)` for the scaled e4m3 copy q | both rounded up | - | test_head_cert, test_head_cert_input_rounding |
+| head_certify | greedy choice over the vocabulary. Both screening bounds use the radius `norm(x) * coef + dn * qn`, with `dn = norm(x - bf16(x))` on the sliced path and zero on the three-part path | gemm_skinny's greedy token alone and in either batch order, survivors with gemm_skinny's bits | R | test_head_cert, test_head_cert_input_rounding, golden |
 | w12_encode, w12_finish | the head's bf16 weights in W12 (12 bits, lossless), every one decoded and compared | exact (the bf16 bits back) | - | test_gemm_w12 |
 | gemm_w12_skinny, gemm_w12_skinny_cfg | as gemm_skinny on the decoded weights (the head, 1..16 rows, by default) | the bits of gemm_skinny | R, C | test_gemm_w12 |
 | make_sign_head | the drafts' 1-bit head: sign of each weight, mean abs of each 64 (bf16) | exact (as the host makes it) | - | test_draft_pick |

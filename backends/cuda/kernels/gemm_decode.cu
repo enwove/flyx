@@ -1449,7 +1449,7 @@ void quantize_fp8_rows(const bf16* W, int N, int K, uint8_t* Q, float* RS, cudaS
 void gemm_fp8_skinny(const float* x, int ldx, const uint8_t* W, const float* RS, int N, int K, float* y, int ldy,
                      int rows, bool accumulate, const Launch& L) {
   const Parts p = split_rows(L, x, ldx, rows, K);
-  if (K % 256 == 0) {  // the sliced kernel (bf16 rows); RTX PRO 6000, the 27B's head: 1.47 -> see the perf record
+  if (gemm_fp8_skinny_rounds_input(K)) {  // the sliced kernel (bf16 rows); RTX PRO 6000, the 27B's head: 1.47 -> see the perf record
     if (rows <= 8)
       launch_dependent(k_gemm_fp8_sliced<1>, dim3(ceil_div(N, 16)), dim3(128), L, p.hi, K, W, RS, N, K, y, ldy, rows,
                        int(accumulate));
