@@ -110,6 +110,7 @@ bool want_from_json(const ojson& j, const EngineOptions& base, ModelHost::Want* 
   out.model = j["model"].get<std::string>();
   out.eo = base;
   out.eo.drafter_files.clear();
+  out.eo.mmproj_file.clear();
   if (j.contains("drafters") && !j["drafters"].is_null()) {
     if (!j["drafters"].is_array()) return *err = "\"drafters\": a list of paths or Hub names", false;
     for (const auto& d : j["drafters"]) {

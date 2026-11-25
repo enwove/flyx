@@ -174,12 +174,13 @@ function draftingOf(w) {
 
 // The form's fields from a want ({model, ctx, kv, drafters, ...}).
 function formOf(w) {
+  const vOn = w.vision !== false;
   return { ctx: w.ctx || "", kv: w.kv === "16" || w.kv === "fp8" ? w.kv : "", kvram: typeof w.kv_ram === "number" ? String(w.kv_ram) : "",
            kvgpu: typeof w.kv_gpu === "number" ? String(w.kv_gpu) : "", name: w.name || "",
-           spec: w.speculative !== false, ...draftingOf(w),
+           spec: w.speculative !== false, ...draftingOf(w), draftPicked: false,
            width: w.width === null || w.width === undefined ? "" : String(w.width), trees: !!w.draft_trees, lookup: w.lookup !== false,
            head: w.draft_head === "full" ? "full" : "", weights: w.draft_weights === "exact" ? "exact" : "",
-           vision: w.vision !== false, visionSource: w.mmproj ? "custom" : "default", mmproj: w.mmproj || "",
+           vision: vOn, visionSource: vOn && w.mmproj ? "custom" : "default", mmproj: vOn ? (w.mmproj || "") : "", mmprojPicked: false,
            vision_device: normVisionDev(w.vision_device), vision_quant: normVisionQuant(w.vision_quant),
            vision_max_tokens: w.vision_max_tokens > 0 ? String(w.vision_max_tokens) : "" };
 }
@@ -479,13 +480,26 @@ export function ModelPage({ active, libraryAsked, currentAsked }) {
   // ---- the settings a load takes: those shown with the model served (a change is compared with what it has); with
   // none served there are none to show, and a load takes the defaults ----
   const use = model.id ? f : EMPTY_FORM;
-  const body = (name) => loadBody(name, use);
-  const before = loadedWant ? shown(loadedWant) : null, now = shown(body(loadedWant ? loadedWant.model : ""));
+  const before = loadedWant ? shown(loadedWant) : null, now = shown(loadBody(loadedWant ? loadedWant.model : "", use));
   const changed = before ? Object.keys(now).filter((k) => k === "drafter"
     ? before[k].length !== now[k].length || before[k].some((value, i) => value !== now[k][i]) : before[k] !== now[k]) : [];
   const was = (k) => changed.includes(k) ? (k === "drafter" ? before[k].join(" · ") : before[k]) : null;
   const advChanged = ["width", "head", "weights", "lookup", "trees"].filter((k) => was(k) !== null);
   useEffect(() => { if (advChanged.length) setAdvOpen(true); }, [advChanged.length]);
+  // Companions (custom drafter, vision projector) and a custom API id belong to the model served: do not carry them
+  // onto a different model unless the user edited or picked them for the next load.
+  const keepDraft = changed.includes("drafter") || !!use.draftPicked;
+  const keepMmproj = changed.includes("mmproj") || !!use.mmprojPicked;
+  const keepName = changed.includes("name");
+  function settingsFor(name) {
+    if (!loadedWant || !name || name === loadedWant.model) return use;
+    const next = Object.assign({}, use);
+    if (!keepDraft) { next.draftSource = "default"; next.savedDraft = null; next.drafter = ""; }
+    if (!keepMmproj) { next.visionSource = "default"; next.mmproj = ""; }
+    if (!keepName) next.name = "";
+    return next;
+  }
+  const body = (name) => loadBody(name, settingsFor(name));
 
   // Loads `name` with the settings; or `want`, a load the server remembers, as it was.
   async function loadModel(name, want) {
@@ -528,22 +542,22 @@ export function ModelPage({ active, libraryAsked, currentAsked }) {
   const ownCached = !!own && !!catalog && catalog.models.some((x) => x.kind === "drafter" && x.name === own);
   const specOff = !f.spec, custom = f.draftSource === "custom";
   const savedDraft = f.draftSource === "saved" ? f.savedDraft : draftingOf(loadedWant || L.remembered || {}).savedDraft;
-  const pickDraft = (source) => { if (!specOff) setF(Object.assign({}, f, { draftSource: source, savedDraft })); };
+  const pickDraft = (source) => { if (!specOff) setF(Object.assign({}, f, { draftSource: source, savedDraft, draftPicked: false })); };
   // A drafter named by the page (one of the cache, one published for a repository's model) goes to the settings.
   const draftWith = (name) => {
-    setF((current) => Object.assign({}, current, { spec: true, draftSource: "custom", drafter: name }));
+    setF((current) => Object.assign({}, current, { spec: true, draftSource: "custom", drafter: name, draftPicked: true }));
     setView("current");
     setStab("spec");
     setTimeout(() => { const row = document.getElementById("sd-custom"); if (row) row.scrollIntoView({ behavior: "smooth", block: "center" }); }, 60);
   };
   const projectWith = (path) => {
-    setF((current) => Object.assign({}, current, { vision: true, visionSource: "custom", mmproj: path }));
+    setF((current) => Object.assign({}, current, { vision: true, visionSource: "custom", mmproj: path, mmprojPicked: true }));
     setView("current");
     setStab("vision");
     setTimeout(() => { const row = document.getElementById("vs-custom"); if (row) row.scrollIntoView({ behavior: "smooth", block: "center" }); }, 60);
   };
   const visOff = !f.vision, visCustom = f.visionSource === "custom", mmOwn = f.mmproj.trim();
-  const pickVision = (source) => { if (!visOff) setF(Object.assign({}, f, { visionSource: source })); };
+  const pickVision = (source) => { if (!visOff) setF(Object.assign({}, f, { visionSource: source, mmprojPicked: false })); };
   const visDefault = () => {
     if (loadedWant && loadedWant.vision !== false && !loadedWant.mmproj) {
       if (model.vision && L.vision_projector && L.vision_projector.from)
@@ -554,10 +568,6 @@ export function ModelPage({ active, libraryAsked, currentAsked }) {
     return { tag: "", tone: "", line: t("Auto-loads mmproj from Hugging Face if available.") };
   };
   const vdflt = visDefault();
-  const drafting = !use.spec ? "off" : use.draftSource === "custom" && use.drafter.trim() ? baseName(use.drafter.trim()) :
-                   use.draftSource === "saved" ? "last loaded" : "default";
-  const visionBrief = !use.vision ? "off" : t(normVisionDev(use.vision_device)) + " · " + normVisionQuant(use.vision_quant);
-  const brief = [["context", String(now.ctx)], ["KV", now.kv], ["drafting", drafting], ["vision", visionBrief]];
   const genChg = ["ctx", "kv", "kv_ram", "kv_gpu", "name"].filter((k) => changed.includes(k)).length;
   const specChg = ["spec", "drafter", "width", "head", "weights", "lookup", "trees"].filter((k) => changed.includes(k)).length;
   const visChg = ["vision", "mmproj", "vision_device", "vision_quant", "vision_max_tokens"].filter((k) => changed.includes(k)).length;
@@ -639,7 +649,7 @@ export function ModelPage({ active, libraryAsked, currentAsked }) {
                 <p class="ddesc">${t("A drafter of your own, in place of the default: a Hugging Face name or a path on the server's machine.")}</p>
                 <input type="text" id="sd-file" placeholder=${t("org/name, or a path")} spellcheck="false" autocomplete="off" disabled=${specOff}
                        value=${f.drafter} onFocus=${() => !custom && pickDraft("custom")}
-                       onInput=${(e) => setF(Object.assign({}, f, { draftSource: "custom", drafter: e.target.value }))}/>
+                       onInput=${(e) => setF(Object.assign({}, f, { draftSource: "custom", drafter: e.target.value, draftPicked: false }))}/>
                 ${custom ? html`<em>${t(!own ? "Give a Hugging Face name or a path; empty, the default is used." : ownCached ? "On this machine." :
                                          hubName(own) ? "Fetched from Hugging Face when the model loads." : "A file on the server's machine.")}</em>` : ""}
               </div>
@@ -689,7 +699,7 @@ export function ModelPage({ active, libraryAsked, currentAsked }) {
                 <p class="ddesc">${t("Path to a companion mmproj-*.gguf file on the server's machine.")}</p>
                 <input type="text" id="vs-file" placeholder=${t("path to mmproj-*.gguf")} spellcheck="false" autocomplete="off" disabled=${visOff}
                        value=${f.mmproj} onFocus=${() => !visCustom && pickVision("custom")}
-                       onInput=${(e) => setF(Object.assign({}, f, { visionSource: "custom", mmproj: e.target.value }))}/>
+                       onInput=${(e) => setF(Object.assign({}, f, { visionSource: "custom", mmproj: e.target.value, mmprojPicked: false }))}/>
               </div>
             </div>
           </div>
@@ -760,9 +770,12 @@ export function ModelPage({ active, libraryAsked, currentAsked }) {
     else if (same) { label = changed.length ? "Reload with these settings" : "Loaded"; disabled = disabled || !changed.length; }
     else if (loadedWant && name) label = "Switch to this model";
     const what = !name ? "" : same ? "This is the model being served." : m || !hubName(name) ? sized(row.size) + " on disk" : sized(row.size) + " to download first";
-    // A drafter or vision projector chosen for the model served may not match another.
-    const strange = !!name && !same && use.spec && use.draftSource !== "default" && (use.draftSource === "saved" || !!use.drafter.trim());
-    const strangeVis = !!name && !same && use.vision && use.visionSource === "custom" && !!use.mmproj.trim();
+    const eff = settingsFor(name), effNow = shown(loadBody(name, eff));
+    const drafting = !eff.spec ? "off" : eff.draftSource === "custom" && eff.drafter.trim() ? baseName(eff.drafter.trim()) :
+                     eff.draftSource === "saved" ? "last loaded" : "default";
+    const visionBrief = !eff.vision ? "off" : (eff.visionSource === "custom" && eff.mmproj.trim() ? baseName(eff.mmproj.trim()) + " · " : "") +
+                        t(normVisionDev(eff.vision_device)) + " · " + normVisionQuant(eff.vision_quant);
+    const brief = [["context", String(effNow.ctx)], ["KV", effNow.kv], ["drafting", drafting], ["vision", visionBrief]];
     return html`
       <div class="loadbox" id="mf-loadbox">
         <div class="what">
@@ -770,10 +783,6 @@ export function ModelPage({ active, libraryAsked, currentAsked }) {
                         <div class="ts" id="mf-chosen-s">${t(what)}<span class="with"> · ${brief.map(([k, v]) => t(k) + " " + t(v)).join(" · ")}${model.id ? " · " : ""}</span>
                           ${model.id ? html`<button class="linkbtn" id="mf-tosettings" onClick=${() => setView("current")}>${t("Change the settings")}</button>` : ""}</div>`
                  : html`<div class="ts" id="mf-chosen-s">${t(note || "Choose one of these to load.")}</div>`}
-          ${strange ? html`<div class="ts warn" id="mf-strange">${t("Drafts with the drafter set for the model served.")}
-            <button class="linkbtn" onClick=${() => setF(Object.assign({}, f, { draftSource: "default" }))}>${t("Use this model's default")}</button></div>` : ""}
-          ${strangeVis ? html`<div class="ts warn" id="mf-strange-vis">${t("Uses the vision projector set for the model served.")}
-            <button class="linkbtn" onClick=${() => setF(Object.assign({}, f, { visionSource: "default" }))}>${t("Use default projector")}</button></div>` : ""}
           ${msg ? html`<div class="ts bad" id="mf-msg">${t(msg)}</div>` : ""}
         </div>
         <button class="btn primary" id="mf-load" disabled=${disabled} onClick=${() => loadModel(name)}>${t(label)}</button>

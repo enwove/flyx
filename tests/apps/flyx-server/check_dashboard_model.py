@@ -457,6 +457,104 @@ def check_local(page, server):
     expect(page.locator('#lc-list .prow.folder[data-place="dir:D:\\\\"]')).to_have_count(0)
 
 
+def check_switch_companions(open_page, want):
+    """Switching to another model drops the served model's companions and API id unless picked or edited for the switch."""
+    served = dict(want, model=FOLDER + "\\Qwen3.8-27B.gguf", name="served-alias",
+                  drafter="dflash2", drafters=["acme/Tiny-27B-DFlash2"],
+                  mmproj=FOLDER + "\\mmproj-Qwen3.8.gguf",
+                  vision_device="host", vision_quant="nvfp4", vision_max_tokens=1024)
+    page, server = open_page(telemetry(served))
+    # Switching to a different local model clears stale mmproj, drafter, and API id while keeping general settings.
+    view(page, "library")
+    page.locator('#src-seg [data-src="local"]').click()
+    page.locator('#lc-list .prow.model[data-model$="Other-12B-Q5_K_M.gguf"]').click()
+    expect(page.locator("#mf-chosen-s")).to_contain_text("drafting default")
+    expect(page.locator("#mf-chosen-s")).not_to_contain_text("mmproj-Qwen3.8.gguf")
+    expect(page.locator("#mf-chosen-s")).not_to_contain_text("Tiny-27B-DFlash2")
+    expect(page.locator("#mf-strange")).to_have_count(0)
+    expect(page.locator("#mf-strange-vis")).to_have_count(0)
+    confirm(page, "#mf-load", "Switch")
+    body = server.posted[-1]
+    assert body["model"] == FOLDER + "\\Other-12B-Q5_K_M.gguf", body
+    assert (body["mmproj"], body["drafter"], body["drafters"], body["name"]) == (None, "", [], None), body
+    assert (body["ctx"], body["kv"], body["kv_gpu"], body["kv_ram"], body["speculative"]) == (
+        want["ctx"], want["kv"], want["kv_gpu"], want["kv_ram"], True), body
+    assert (body["vision"], body["vision_device"], body["vision_quant"], body["vision_max_tokens"]) == (
+        True, "host", "nvfp4", 1024), body
+    # The command line for the chosen other model agrees: no stale companion or alias flags.
+    args = command(page)
+    assert args[2] == FOLDER + "\\Other-12B-Q5_K_M.gguf", args
+    assert not ({"--mmproj", "--drafter", "--drafter-file", "--name"} & set(args)), args
+    # Switching to a Hugging Face model likewise drops stale companions.
+    view(page, "library")
+    page.locator('#src-seg [data-src="hub"]').click()
+    page.locator('#mf-files .mrow[data-name$=":Q5_K_M"]').click()
+    confirm(page, "#mf-load", "Switch")
+    body = server.posted[-1]
+    assert body["model"] == REPO + ":Q5_K_M", body
+    assert (body["mmproj"], body["drafter"], body["drafters"], body["name"]) == (None, "", [], None), body
+    # Explicitly picking a new projector for the switch keeps that projector while still dropping stale drafter/name.
+    view(page, "library")
+    page.locator('#src-seg [data-src="local"]').click()
+    page.locator('#lc-list .prow.model[data-model$="mmproj-BF16.gguf"]').click()
+    page.locator("#lc-use-mmproj").click()
+    view(page, "library")
+    page.locator('#lc-list .prow.model[data-model$="Other-12B-Q5_K_M.gguf"]').click()
+    expect(page.locator("#mf-chosen-s")).to_contain_text("mmproj-BF16.gguf")
+    expect(page.locator("#mf-chosen-s")).to_contain_text("drafting default")
+    confirm(page, "#mf-load", "Switch")
+    body = server.posted[-1]
+    assert (body["mmproj"], body["drafter"], body["drafters"], body["name"]) == (
+        FOLDER + "\\mmproj-BF16.gguf", "", [], None), body
+    # Editing the drafter and API id keeps those edits while still dropping the untouched served mmproj.
+    page.locator("#mf-reset").click()
+    page.locator('#lset-tabs [data-stab="general"]').click()
+    page.locator("#mf-name").fill("custom-alias")
+    page.locator('#lset-tabs [data-stab="spec"]').click()
+    page.locator("#sd-file").fill("./new-mtp.gguf")
+    view(page, "library")
+    page.locator('#lc-list .prow.model[data-model$="Other-12B-Q5_K_M.gguf"]').click()
+    confirm(page, "#mf-load", "Switch")
+    body = server.posted[-1]
+    assert (body["mmproj"], body["drafter"], body["drafters"], body["name"]) == (
+        None, "mtp", ["./new-mtp.gguf"], "custom-alias"), body
+    # Reloading the same model still preserves all of its own companions and API id.
+    page.locator("#mf-reset").click()
+    page.locator('#lset-tabs [data-stab="general"]').click()
+    page.locator("#mf-ctx").fill("4096")
+    confirm(page, "#mf-reload", "Reload")
+    body = server.posted[-1]
+    assert body["model"] == served["model"] and body["ctx"] == 4096, body
+    assert (body["mmproj"], body["drafter"], body["drafters"], body["name"]) == (
+        served["mmproj"], "dflash2", ["acme/Tiny-27B-DFlash2"], "served-alias"), body
+    page.close()
+
+    # Explicitly re-picking the same mmproj via "Use as projector" carries it onto a compatible switch target.
+    same_mm = dict(served, mmproj=FOLDER + "\\mmproj-BF16.gguf")
+    page, server = open_page(telemetry(same_mm))
+    view(page, "library")
+    page.locator('#src-seg [data-src="local"]').click()
+    page.locator('#lc-list .prow.model[data-model$="mmproj-BF16.gguf"]').click()
+    page.locator("#lc-use-mmproj").click()
+    view(page, "library")
+    page.locator('#lc-list .prow.model[data-model$="Other-12B-Q5_K_M.gguf"]').click()
+    confirm(page, "#mf-load", "Switch")
+    body = server.posted[-1]
+    assert (body["mmproj"], body["drafter"], body["drafters"]) == (FOLDER + "\\mmproj-BF16.gguf", "", []), body
+    page.close()
+
+    # A served model with a multi-file saved drafter config drops it on switch while keeping speculative=False.
+    saved_draft = dict(want, model="models/local.gguf", speculative=False,
+                       drafter="all", drafters=["./drafts/DFlash model.flyx", "./drafts/MTP layer.gguf"])
+    page, server = open_page(telemetry(saved_draft))
+    view(page, "library")
+    page.locator('#mf-files .mrow[data-name$=":Q5_K_M"]').click()
+    confirm(page, "#mf-load", "Switch")
+    body = server.posted[-1]
+    assert (body["speculative"], body["drafter"], body["drafters"]) == (False, "", []), body
+    page.close()
+
+
 def check_nothing_served(page, server, remembered):
     """No model: the library first; no settings to show, so a load takes the defaults; the last load as it was."""
     expect(page.locator("#mv-library")).to_be_visible()
@@ -623,6 +721,7 @@ def check(browser):
     page.close()
     check_context_limit(open_page, want)
     check_vram_apps(open_page, want)
+    check_switch_companions(open_page, want)
     plain = dict(want, model="models/local.gguf")
     page, server = open_page(telemetry(plain))
     check_hub(page, server, plain)
