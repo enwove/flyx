@@ -39,13 +39,20 @@ DrafterTraits drafter_traits(Drafter d) {
   }
   return {false, false, false};
 }
+
+// The drafts a parallel block drafter's adaptive round drafts at most on a target whose verify cost climbs steeply
+// with width; it verifies 1, 2 or 3 of them.  Inkling-2-Mini (RTX 5070 Ti): DSpark's fourth to seventh drafts added
+// 0.07 to 0.2 tokens a round while every round drafted them, and its stop rule verified 3 or more of 7 in half the
+// rounds; capped, adaptive DSpark 151.5 -> 156.3 tok/s on chat prompts and 169.5 -> 172.3 on thinking ones, DFlash2
+// 166.1 -> 169.7 on chat.  Runs of fully accepted rounds still widen to the fixed rounds past it.
+constexpr int kSteepBlockAdaptiveDrafts = 3;
 }  // namespace
 
 // Width ladder and intra-round adaptive stopping, driven by drafter traits + target structure:
 // - Sequential drafters (MTP, future EAGLE-4): tensor-core aligned 1, 3, 5, 7, ..., max_drafts (<= 15).
-// - Parallel block drafters: {1, 3, 5, 7} when target verify cost scales steeply with width (e.g. sparse MoE, where
-//   each draft row reads its own experts: one draft often pays where three do not), {3, 7} on dense targets, plus
-//   FLYX_MAX_ROWS - 1 when stretch_block allows drafting past max_drafts.
+// - Parallel block drafters: {1, 2, 3, 5, 7} when target verify cost scales steeply with width (e.g. sparse MoE, where
+//   each draft row reads its own experts: one or two drafts often pay where three do not), {3, 7} on dense targets,
+//   plus FLYX_MAX_ROWS - 1 when stretch_block allows drafting past max_drafts.
 // - Tree-only drafters (DV): up to FLYX_MAX_WIDE_ROWS - 1 (plus 15 when wider).
 std::vector<int> Model::draft_widths(int d) const {
   const DrafterBlock& b = drafters_.at(size_t(d));
@@ -57,8 +64,9 @@ std::vector<int> Model::draft_widths(int d) const {
     return {widest};
   }
   const int widest = tr.stretch_block ? b.max_drafts : std::min(FLYX_MAX_ROWS - 1, b.max_drafts);
-  const std::vector<int> ladder =
-      tr.sequential || verify_scales_with_width_ ? std::vector<int>{1, 3, 5, 7} : std::vector<int>{3, 7};
+  const std::vector<int> ladder = tr.sequential                ? std::vector<int>{1, 3, 5, 7}
+                                  : verify_scales_with_width_ ? std::vector<int>{1, 2, 3, 5, 7}
+                                                              : std::vector<int>{3, 7};
   std::vector<int> widths;
   for (int k : ladder)
     if (k < widest) widths.push_back(k);
@@ -80,10 +88,12 @@ std::vector<int> Model::adaptive_checkpoints(int d) const {
   if (!tr.sequential && !verify_scales_with_width_) return {};
   // Keep a parallel block drafter's adaptive graph within its trained block (b.max_drafts); stretching every adaptive
   // round past the trained block degrades bidirectional draft quality and adds draft/verify work (stretched widths
-  // stay in draft_widths for explicit --width or widened high-acceptance runs).
+  // stay in draft_widths for explicit --width or widened high-acceptance runs).  On a steep-verify target its adaptive
+  // round drafts at most kSteepBlockAdaptiveDrafts.
+  const int most = tr.sequential ? b.max_drafts : std::min(b.max_drafts, kSteepBlockAdaptiveDrafts);
   std::vector<int> cps;
   for (int w : draft_widths(d))
-    if (w <= b.max_drafts) cps.push_back(w);
+    if (w <= most) cps.push_back(w);
   return cps.size() > 1 ? cps : std::vector<int>{};
 }
 
