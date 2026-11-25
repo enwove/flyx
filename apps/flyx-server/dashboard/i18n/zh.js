@@ -5,6 +5,13 @@ export default {
   name: "中文",
   tag: "zh-CN",
   dict: {
+    "Permission mode": "权限模式",
+    "Accept project edits and ask about other commands": "自动接受项目内的编辑，其他命令按需询问",
+    "Ask for permission": "手动批准",
+    "Review commands with a model": "用模型审核命令",
+    "Skip permission prompts": "跳过权限询问",
+    "Use Claude Code settings": "使用 Claude Code 的设置",
+    "Model review can cause a single-slot server to process the conversation again after a command.": "模型审核命令后，只有一个会话槽位的服务器可能需要重新处理整段对话。",
     "A folder's model files": "文件夹中的模型文件",
     "Choose a folder with the system's dialog": "用系统对话框选择文件夹",
     "Repositories on Hugging Face": "Hugging Face 上的仓库",

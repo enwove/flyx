@@ -37,7 +37,8 @@ std::string run(const std::string& script, const std::string& key) {
   const size_t n = GetEnvironmentVariableA("TEMP", dir, sizeof dir);
   const std::string file = std::string(dir, n) + "\\flyx_agent_launch_test.ps1";
   std::ofstream(file, std::ios::binary) << "\xEF\xBB\xBF[Console]::OutputEncoding = [Text.Encoding]::UTF8\n"
-                                        << "function claude { [Console]::Out.Write('<<<' + [IO.File]::ReadAllText($args[1]) + '>>>') }\n"
+                                        << "function claude { [Console]::Out.Write('<<<' + [IO.File]::ReadAllText($args[1]) + '>>>')"
+                                           "; [Console]::Out.Write('<<<' + (($args | Select-Object -Skip 2) -join ' ') + '>>>') }\n"
                                         << "function codex { [Console]::Out.Write('<<<' + ($args -join \"`n\") + '>>>') }\n"
                                         << (key.empty() ? "Remove-Item Env:FLYX_KEY -ErrorAction SilentlyContinue\n"
                                                         : "$env:FLYX_KEY = " + ps_quote(key) + "\n")
@@ -107,7 +108,8 @@ int main() {
         check(env["CLAUDE_CODE_MAX_CONTEXT_TOKENS"] == "18000", "claude context" + tag);
         check(env["CLAUDE_CODE_MAX_OUTPUT_TOKENS"] == "9000", "claude output limit: half the context" + tag);
       }
-      check(part(out, 1).empty(), "FLYX_KEY is gone after claude" + tag);
+      check(part(out, 1).empty(), "an omitted mode uses Claude Code's settings" + tag);
+      check(part(out, 2).empty(), "FLYX_KEY is gone after claude" + tag);
     }
     {
       const std::string out = run(codex, k);
@@ -130,6 +132,14 @@ int main() {
           "a plain model id is a TOML literal string");
     check(agent_powershell("claude", t).find("CLAUDE_CODE_MAX_OUTPUT_TOKENS = '128000'") != std::string::npos,
           "claude output limit: at most 128,000");
+    for (const char* mode : {"acceptEdits", "default", "auto", "bypassPermissions"}) {
+      t.permission_mode = mode;
+      const std::string command = agent_powershell("claude", t);
+      check(command.find("--permission-mode " + ps_quote(mode)) != std::string::npos, "Claude permission mode " + t.permission_mode);
+#ifdef _WIN32
+      check(part(run(command, ""), 1) == "--permission-mode " + t.permission_mode, "Claude receives " + t.permission_mode);
+#endif
+    }
   }
   if (failures) return 1;
   std::printf("PASS: agent launch commands\n");
