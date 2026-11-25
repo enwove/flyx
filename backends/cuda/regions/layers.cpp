@@ -6,17 +6,17 @@
 namespace flyx::cuda {
 
 // Draft head top-k / argmax dispatch (1-bit rough pick on packed or bf16 head, else full draft logits).
-void draft_head_pick(const HeadBlock& head, const float* x, int nr, int k, int* idx, float* val, flyx_seq* s,
-                     const Launch& L, float* prob, float* margin) {
+void draft_head_pick(const HeadBlock& head, const float* x, int nr, int k, int* idx, float* val,
+                     const DraftPickScratch& sc, const Launch& L, bool exact_1row, float* prob, float* margin) {
   const int H = head.hidden, V = head.vocab;
   if (head.coarse.bits && head.wb.data) {
-    draft_pick_blocks(x, H, head.coarse, head.wb, V, H, nr, k, idx, val, s->logits, L, false, prob, margin);
+    draft_pick_blocks(x, H, head.coarse, head.wb, V, H, nr, k, idx, val, sc.logits, L, exact_1row, prob, margin);
   } else if (head.coarse.bits) {
-    draft_pick(x, H, head.coarse, head.w, V, H, nr, k, idx, val, s->logits, L, false, prob, margin);
+    draft_pick(x, H, head.coarse, head.w, V, H, nr, k, idx, val, sc.logits, L, exact_1row, prob, margin);
   } else {
-    draft_logits(head, x, H, s->logits, nr, L);
-    if (k == 1 && !val && !prob && !margin) argmax_rows(s->logits, V, V, idx, nr, s->argv, s->argi, L.st);
-    else topk_rows(s->logits, V, V, k, idx, val, nr, L.st, s->topv, s->topi, s->top_rows, prob, margin);
+    draft_logits(head, x, H, sc.logits, nr, L);
+    if (k == 1 && !val && !prob && !margin) argmax_rows(sc.logits, V, V, idx, nr, sc.argv, sc.argi, L.st);
+    else topk_rows(sc.logits, V, V, k, idx, val, nr, L.st, sc.topv, sc.topi, sc.top_rows, prob, margin);
   }
 }
 
