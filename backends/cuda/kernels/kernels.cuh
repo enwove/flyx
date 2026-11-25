@@ -585,7 +585,8 @@ void draft_score_bf16(const float* x, int ldx, const bf16* W, const float* bias,
 void draft_combine_cands(const float* add, int ld_add, const float* bias, float softcap, int rows, float* rough, int ld,
                          cudaStream_t st);
 void draft_pick_topk(float* rough, int ld, int rows, int k, int* idx, float* val, cudaStream_t st,
-                     float* prob = nullptr, float* margin = nullptr);
+                     float* prob = nullptr, float* margin = nullptr, const DevParams* P = nullptr, int pos_add = 0,
+                     const DevGen* G = nullptr);
 void draft_pick(const float* x, int ldx, const SignHead& h, const bf16* W, int V, int K, int rows, int k, int* idx,
                 float* val, float* rough, const Launch& L, bool exact_1row = false, float* prob = nullptr,
                 float* margin = nullptr);
@@ -1189,6 +1190,10 @@ void argmax_rows(const float* logits, int ld, int V, int* out, int rows, float* 
 // in mask (ceil(V / 32) words).  cz/ci: scratch of rows * V floats / ints.
 void choose_rows(const float* logits, int ld, int V, int rows, const DevParams* P, int base_add, const DevGen* G,
                  const uint32_t* mask, float* cz, int* ci, float* scratch, int* iscratch, int* out, cudaStream_t st,
+                 const TreeRows* tree = nullptr, int tree_from = 0);
+// Sampling-only half of choose_rows (no-op when G->temperature <= 0; used by DSpark's full-vocab fallback path).
+void sample_rows(const float* logits, int ld, int V, int rows, const DevParams* P, int base_add, const DevGen* G,
+                 const uint32_t* mask, float* cz, int* ci, int* out, cudaStream_t st,
                  const TreeRows* tree = nullptr, int tree_from = 0);
 // tree: row r samples position P->position + base_add + depth - tree_from, its depth the tree's row tree_from + r's
 // (a wide round's 16 rows at a time from row tree_from, base_add = tree_from + 1).

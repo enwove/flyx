@@ -59,7 +59,8 @@ bool draft_head_additive_ready(const HeadBlock& head, const Lin& extra, const Si
 void draft_head_pick_additive_step(const HeadBlock& head, const float* x_base, const Lin& extra,
                                    const SignHead& extra_coarse, const float* extra_bias, const float* x_extra,
                                    int K_extra, float softcap, float* cand_row, int ld, float* scratch_add, int k,
-                                   int* idx_out, float* val_out, float* prob_out, float* margin_out, const Launch& L);
+                                   int* idx_out, float* val_out, float* prob_out, float* margin_out, const Launch& L,
+                                   const DevParams* P = nullptr, int pos_add = 0, const DevGen* G = nullptr);
 
 // Drafting works on the sequence's own buffers and scratch, on the stream of L (the sequence's, or a batch round's).
 // DFlash2: one block of drafts; tree: `width` of its candidates as a tree (FLYX_DRAFT_TREE), the TreeRows with them

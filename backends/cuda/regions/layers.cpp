@@ -30,7 +30,8 @@ bool draft_head_additive_ready(const HeadBlock& head, const Lin& extra, const Si
 void draft_head_pick_additive_step(const HeadBlock& head, const float* x_base, const Lin& extra,
                                    const SignHead& extra_coarse, const float* extra_bias, const float* x_extra,
                                    int K_extra, float softcap, float* cand_row, int ld, float* scratch_add, int k,
-                                   int* idx_out, float* val_out, float* prob_out, float* margin_out, const Launch& L) {
+                                   int* idx_out, float* val_out, float* prob_out, float* margin_out, const Launch& L,
+                                   const DevParams* P, int pos_add, const DevGen* G) {
   const int H = head.hidden, V = head.vocab;
   cudaStream_t st = L.st;
   gemm_sign_rough_add(x_extra, K_extra, extra_coarse, extra_bias, V, K_extra, cand_row, ld, L);
@@ -49,7 +50,7 @@ void draft_head_pick_additive_step(const HeadBlock& head, const float* x_base, c
                 K_extra, 1, st);
     draft_combine_cands(scratch_add, 0, extra_bias, softcap, 1, cand_row, ld, st);
   }
-  draft_pick_topk(cand_row, ld, 1, k, idx_out, val_out, st, prob_out, margin_out);
+  draft_pick_topk(cand_row, ld, 1, k, idx_out, val_out, st, prob_out, margin_out, P, pos_add, G);
 }
 
 void norm_project(const float* x, float* h, float* out, int ld_out, int R, const Norm& n, const Lin& w, int N, int H,
@@ -1245,12 +1246,13 @@ void dspark_draft(flyx_seq* s, const DSparkBlock& b, int width, const Launch& L,
     if (two_stage) {
       draft_head_pick_additive_step(head, s->ds_hn + size_t(step) * H, b.markov_w2, b.markov_coarse, b.markov_w2_b,
                                     s->ds_markov, Rk, b.softcap, row_logits, ld, s->ds_bias, 1, s->ds_prev, nullptr,
-                                    s->draft_prob + step, s->draft_margin + step, L);
+                                    s->draft_prob + step, s->draft_margin + step, L, s->P, 1 + step, s->G);
     } else {
       gemm(s->ds_markov, Rk, b.markov_w2, V, Rk, s->ds_bias, V, 1, false, L);
       dspark_combine_logits(row_logits, s->ds_bias, b.markov_w2_b, V, b.softcap, row_logits, st);
       topk_rows(row_logits, V, V, 1, s->ds_prev, nullptr, 1, st, s->topv, s->topi, s->top_rows, s->draft_prob + step,
                 s->draft_margin + step);
+      sample_rows(row_logits, V, V, 1, s->P, 1 + step, s->G, nullptr, s->cz, s->ci, s->ds_prev, st);
     }
     dspark_pick_step(s->P, s->oracle, step, s->ds_prev, s->drafts, st);
   }
