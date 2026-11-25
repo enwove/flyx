@@ -1388,6 +1388,15 @@ int main(int argc, char** argv) {
                   tag + " host KV (+ hot cache) + DSpark == GPU plain");
             check(same_tokens(fresh_gen(*st_host_copy, prompt, 24, false), t_plain),
                   tag + " host KV + host copy streaming + DSpark == GPU plain");
+            // Rounds whose rows pass 128 and 256 keys, where a row's first split is shorter than the row's before it
+            // (attn_split_range), so that the round's last row is not the one whose split ends last: DSpark's rounds
+            // still read every key of every row.  A prompt of 100 tokens, 180 decoded after it.
+            std::vector<int32_t> longer;
+            for (int i = 0; i < 100; ++i) longer.push_back(10 + (i * 11) % 240);
+            const auto t_across = fresh_gen(*st_plain, longer, 180, false);
+            check(same_tokens(fresh_gen(*st_dspark, longer, 180, false), t_across) &&
+                      same_tokens(fresh_gen(*st_host_kv, longer, 180, false), t_across),
+                  tag + " rounds across 128 and 256 keys: DSpark == plain, host KV too");
           }
         }
 
