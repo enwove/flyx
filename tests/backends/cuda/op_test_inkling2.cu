@@ -1427,7 +1427,6 @@ void test_inkling2_moe() {
   CK(cudaMemcpy(d_eidx, eidx.data(), eidx.size() * 4, cudaMemcpyHostToDevice));
   float* d_ew = up(ew);
   MoeScratch msc{};
-  msc.counts = dev<int>(E);
   msc.offsets = dev<int>(E + 1);
   msc.pairs = dev<int>(size_t(R) * top_k);
   msc.tasks = dev<MoeTask>(size_t(R) * top_k);
@@ -1573,8 +1572,8 @@ void test_inkling2_moe() {
     expect_bits("moe R=1 staged == R=37 grouped " + label, down(d_y_1, size_t(H)), got_ygrp_rr);
 
     const int r8_0 = 16;  // covers rr = 19 at offset 3
-    float* d_act_8 = dev<float>(size_t(8) * top_k * I);
-    float* d_y_8 = dev<float>(size_t(8) * H);
+    float* d_act_8 = dev<float>(size_t(16) * top_k * I);  // 16 rows: the grouping checks below
+    float* d_y_8 = dev<float>(size_t(16) * H);
     moe_gate_up(d_x + size_t(r8_0) * H, H, w_gu, d_eidx + size_t(r8_0) * top_k, 8, top_k, I, H, beta, lb, true, d_act_8,
                 I, &msc, TL);
     moe_down(d_act_8, I, w_dn, d_eidx + size_t(r8_0) * top_k, d_ew + size_t(r8_0) * top_k, 8, top_k, H, I, d_y_8, H,
@@ -1582,6 +1581,18 @@ void test_inkling2_moe() {
     Vec got_y8 = down(d_y_8, size_t(8) * H);
     Vec got_y8_rr(got_y8.begin() + ptrdiff_t(rr - r8_0) * H, got_y8.begin() + ptrdiff_t(rr - r8_0 + 1) * H);
     expect_bits("moe R=8 grouped == R=37 grouped " + label, got_y8_rr, got_ygrp_rr);
+
+    // The down GEMM takes over the grouping by expert that the gate|up GEMM leaves (moe_gate_up's return) where its
+    // tiles are the ones it would make, else groups again: the same bits either way, at row counts where the two
+    // GEMMs' tiles are alike and where they are not.
+    for (int rows : {2, 4, 8, 16}) {
+      const std::string tag = label + " R=" + std::to_string(rows);
+      const int grouped = moe_gate_up(d_x, H, w_gu, d_eidx, rows, top_k, I, H, beta, lb, true, d_act_8, I, &msc, TL);
+      moe_down(d_act_8, I, w_dn, d_eidx, d_ew, rows, top_k, H, I, d_y_8, H, false, &msc, TL, nullptr, grouped);
+      const Vec taken = down(d_y_8, size_t(rows) * H);
+      moe_down(d_act_8, I, w_dn, d_eidx, d_ew, rows, top_k, H, I, d_y_8, H, false, &msc, TL);
+      expect_bits("moe down on gate|up's grouping == its own " + tag, taken, down(d_y_8, size_t(rows) * H));
+    }
     cudaFree(d_act_8);
     cudaFree(d_y_8);
 
@@ -1743,7 +1754,6 @@ void test_inkling2_moe() {
     CK(cudaMemcpy(deim, eim.data(), eim.size() * 4, cudaMemcpyHostToDevice));
     float* dewm = up(ewm);
     MoeScratch sm{};
-    sm.counts = dev<int>(EM);
     sm.offsets = dev<int>(EM + 1);
     sm.pairs = dev<int>(size_t(RM) * KM);
     sm.tasks = dev<MoeTask>(size_t(RM) * KM);
@@ -1803,7 +1813,6 @@ void test_inkling2_moe() {
     cudaFree(dxm);
     cudaFree(deim);
     cudaFree(dewm);
-    cudaFree(sm.counts);
     cudaFree(sm.offsets);
     cudaFree(sm.pairs);
     cudaFree(sm.tasks);
@@ -1818,10 +1827,106 @@ void test_inkling2_moe() {
     cudaFree(d_y_8);
   }
 
+  // (e) The grouping by expert with more experts and more (row, expert) pairs than k_moe_group_tasks has threads
+  // (each thread scans a run of experts; pairs go round in several passes), and experts with more pairs than a tile
+  // holds: every row of a 70-row launch equals the row alone, through gate|up and down.
+  {
+    const int RG = 70, EG = 300, KG = 4, HG = 128, IG = 64;
+    seed("inkling2_moe_grouping", RG, EG, KG, HG, IG);
+    Vec xg = randv(size_t(RG) * HG, 0.5);
+    Vec rlg = randv(size_t(RG) * EG, 1.0);
+    for (int r = 0; r < RG; ++r)  // a few hot experts, so some hold more pairs than a tile of 4 or 8
+      for (int e = 0; e < 3; ++e) rlg[size_t(r) * EG + e] += 3.0;
+    std::vector<int> eig(size_t(RG) * KG);
+    Vec ewg(size_t(RG) * KG);
+    for (int r = 0; r < RG; ++r)
+      ops::moe_route(&rlg[size_t(r) * EG], nullptr, EG, KG, true, true, 1e-20, 1.0, &eig[size_t(r) * KG],
+                     &ewg[size_t(r) * KG]);
+    float* dxg = up(xg);
+    int* deig = dev<int>(eig.size());
+    CK(cudaMemcpy(deig, eig.data(), eig.size() * 4, cudaMemcpyHostToDevice));
+    float* dewg = up(ewg);
+    MoeScratch sg{};
+    sg.offsets = dev<int>(EG + 1);
+    sg.pairs = dev<int>(size_t(RG) * KG);
+    sg.tasks = dev<MoeTask>(size_t(RG) * KG);
+    sg.n_tasks = dev<int>(1);
+    sg.down_buf = dev<float>(size_t(RG) * KG * HG);
+    sg.stage_elems = std::max(size_t(RG) * HG, size_t(RG) * KG * IG);
+    const size_t qa = (sg.stage_elems + 255) / 256 * 256;
+    const size_t qd = (((sg.stage_elems + 31) / 32) * sizeof(float) + 255) / 256 * 256;
+    const size_t qs = (((sg.stage_elems + 15) / 16) * sizeof(float) + 255) / 256 * 256;
+    uint8_t* sbuf = dev<uint8_t>(std::max(sg.stage_elems * sizeof(bf16), qa + qd + qs));
+    sg.q8_a = reinterpret_cast<int8_t*>(sbuf);
+    sg.q8_d = reinterpret_cast<float*>(sbuf + qa);
+    sg.q8_s = reinterpret_cast<float*>(sbuf + qa + qd);
+    sg.bf16_a = reinterpret_cast<bf16*>(sbuf);
+    sg.chunk_rows = RG;
+    sg.max_experts = EG;
+    sg.max_top_k = KG;
+    float* d_act_g = dev<float>(size_t(RG) * KG * IG);
+    float* d_y_g = dev<float>(size_t(RG) * HG);
+    float* d_act_1 = dev<float>(size_t(KG) * IG);
+    float* d_y_1 = dev<float>(size_t(HG));
+    const BlockType& qbt = block_type(FLYX_DT_GGML_Q8_0);
+    for (int packed : {1, 0}) {
+      ExpertMat wgu{}, wdn{};
+      wgu.n_experts = wdn.n_experts = EG;
+      wgu.N = 2 * IG;
+      wdn.N = HG;
+      if (packed) {
+        wgu.blk = up_blocks(FLYX_DT_GGML_Q8_0, random_blocks(qbt, size_t(EG) * 2 * IG * (HG / 32)), EG * 2 * IG);
+        wdn.blk = up_blocks(FLYX_DT_GGML_Q8_0, random_blocks(qbt, size_t(EG) * HG * (IG / 32)), EG * HG);
+        wgu.blk.q8 = wdn.blk.q8 = true;
+      } else {
+        Vec gu = randv(size_t(EG) * 2 * IG * HG, 0.1), dn = randv(size_t(EG) * HG * IG, 0.1);
+        round_bf16(gu);
+        round_bf16(dn);
+        wgu.w = up_bf16(gu);
+        wdn.w = up_bf16(dn);
+      }
+      const char* name = packed ? "Q8_0" : "bf16";
+      const int grouped = moe_gate_up(dxg, HG, wgu, deig, RG, KG, IG, HG, beta, lb, true, d_act_g, IG, &sg, TL);
+      moe_down(d_act_g, IG, wdn, deig, dewg, RG, KG, HG, IG, d_y_g, HG, false, &sg, TL, nullptr, grouped);
+      const Vec yg = down(d_y_g, size_t(RG) * HG);
+      bool same = true;
+      for (int rr : {0, 1, 33, 68, 69}) {
+        moe_gate_up(dxg + size_t(rr) * HG, HG, wgu, deig + size_t(rr) * KG, 1, KG, IG, HG, beta, lb, true, d_act_1, IG,
+                    &sg, TL);
+        moe_down(d_act_1, IG, wdn, deig + size_t(rr) * KG, dewg + size_t(rr) * KG, 1, KG, HG, IG, d_y_1, HG, false,
+                 &sg, TL);
+        const Vec y1 = down(d_y_1, size_t(HG));
+        same &= std::memcmp(y1.data(), yg.data() + size_t(rr) * HG, size_t(HG) * sizeof(double)) == 0;
+      }
+      std::printf("  %-4s moe grouping of %d experts, %d pairs: rows alone == R=%d (%s)\n", same ? "ok" : "FAIL", EG,
+                  RG * KG, RG, name);
+      if (!same) ++g_fail;
+      if (packed) {
+        cudaFree(const_cast<uint8_t*>(wgu.blk.data));
+        cudaFree(const_cast<uint8_t*>(wdn.blk.data));
+      } else {
+        cudaFree(const_cast<bf16*>(wgu.w));
+        cudaFree(const_cast<bf16*>(wdn.w));
+      }
+    }
+    cudaFree(dxg);
+    cudaFree(deig);
+    cudaFree(dewg);
+    cudaFree(sg.offsets);
+    cudaFree(sg.pairs);
+    cudaFree(sg.tasks);
+    cudaFree(sg.n_tasks);
+    cudaFree(sg.down_buf);
+    cudaFree(sbuf);
+    cudaFree(d_act_g);
+    cudaFree(d_y_g);
+    cudaFree(d_act_1);
+    cudaFree(d_y_1);
+  }
+
   cudaFree(d_x);
   cudaFree(d_eidx);
   cudaFree(d_ew);
-  cudaFree(msc.counts);
   cudaFree(msc.offsets);
   cudaFree(msc.pairs);
   cudaFree(msc.tasks);

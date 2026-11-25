@@ -1118,16 +1118,19 @@ void moe_layer(const Pass& ps, const MoeBlock& f, bool fused) {
 
   bf16* act_bf16 =
       round_q8 && moe_round_bf16_down(f.down, R, K, I, msc) ? reinterpret_cast<bf16*>(rv.b.moe_act) : nullptr;
+  // The grouping of the rows by expert that the gate|up GEMM leaves in the scratch, which the down GEMM takes over.
+  int grouped = 0;
   if (fused) {
-    moe_gate_up(rv.b.h, H, f.gate_up, rv.b.moe_idx, R, K, I, H, f.situ_beta, f.situ_linear_beta, true, rv.b.moe_act, I,
-                msc, L, round_q8, act_bf16);
+    grouped = moe_gate_up(rv.b.h, H, f.gate_up, rv.b.moe_idx, R, K, I, H, f.situ_beta, f.situ_linear_beta, true,
+                          rv.b.moe_act, I, msc, L, round_q8, act_bf16);
   } else {
-    moe_gate_up(rv.b.h, H, f.gate_up, rv.b.moe_idx, R, K, I, H, f.situ_beta, f.situ_linear_beta, false, rv.b.moe_gu,
-                2 * I, msc, L);
+    grouped = moe_gate_up(rv.b.h, H, f.gate_up, rv.b.moe_idx, R, K, I, H, f.situ_beta, f.situ_linear_beta, false,
+                          rv.b.moe_gu, 2 * I, msc, L);
     situ_rows(rv.b.moe_gu, 2 * I, I, f.situ_beta, f.situ_linear_beta, rv.b.moe_act, I, R * K, st);
   }
   if (f.post_conv) {
-    moe_down(rv.b.moe_act, I, f.down, rv.b.moe_idx, rv.b.moe_w, R, K, H, I, rv.b.post_raw, H, false, msc, L, act_bf16);
+    moe_down(rv.b.moe_act, I, f.down, rv.b.moe_idx, rv.b.moe_w, R, K, H, I, rv.b.post_raw, H, false, msc, L, act_bf16,
+             grouped);
     if (fused && ps.round && R <= FLYX_MAX_ROWS && ps.res && rv.b.post_out && H <= 5120) {
       ps.res->pending = PendingPostConv{rv.b.post_raw, f.post_conv, f.sconv, f.sconv_offset, f.conv, false};
       return;
@@ -1143,7 +1146,8 @@ void moe_layer(const Pass& ps, const MoeBlock& f, bool fused) {
                    rep_stride, kSlotCur, f.sconv_offset, sc.channels, H, f.conv, 0, s->P, R, x_cur, H, st, true);
   } else {
     float* x_cur = (ps.res && ps.res->x_cur) ? ps.res->x_cur : rv.b.x;
-    moe_down(rv.b.moe_act, I, f.down, rv.b.moe_idx, rv.b.moe_w, R, K, H, I, x_cur, H, true, msc, L, act_bf16);
+    moe_down(rv.b.moe_act, I, f.down, rv.b.moe_idx, rv.b.moe_w, R, K, H, I, x_cur, H, true, msc, L, act_bf16,
+             grouped);
   }
 }
 

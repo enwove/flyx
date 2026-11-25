@@ -154,7 +154,6 @@ void alloc_rows(const flyx_bmodel* m, int R, bool prefill, RowBufs* b, Alloc&& a
     b->moe_gu = f(size_t(R) * size_t(n.moe_topk) * gu_or_down);
     b->moe_act = f(size_t(R) * size_t(n.moe_topk) * size_t(n.moe_inter));
     const int chunk = std::min(R, 256);
-    b->moe_sc.counts = static_cast<int*>(alloc(size_t(n.moe_experts) * sizeof(int)));
     b->moe_sc.offsets = static_cast<int*>(alloc(size_t(n.moe_experts + 1) * sizeof(int)));
     b->moe_sc.pairs = static_cast<int*>(alloc(size_t(chunk) * size_t(n.moe_topk) * sizeof(int)));
     b->moe_sc.tasks = static_cast<MoeTask*>(alloc(size_t(chunk) * size_t(n.moe_topk) * sizeof(MoeTask)));

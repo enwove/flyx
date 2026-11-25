@@ -1669,7 +1669,6 @@ struct MoeTask {
   int nb;      // count of pairs in this tile (1..BM)
 };
 struct MoeScratch {
-  int* counts = nullptr;       // [max_experts]
   int* offsets = nullptr;      // [max_experts + 1]
   int* pairs = nullptr;        // [chunk_rows * max_top_k]
   MoeTask* tasks = nullptr;    // [chunk_rows * max_top_k] (compacted per-expert BM-row tiles)
@@ -1708,14 +1707,18 @@ bool moe_round_bf16_down(const ExpertMat& W, int rows, int top_k, int K, const M
 // fuse_act=true applies SiTU/SwiGLU in registers and writes [rows*top_k, I] (bit-identical to unfused + situ_rows).
 // act_bf16 (with fuse_act and moe_round_q8): the activations there in bf16, each rounded to nearest as staging
 // rounds it, not in out; storage of its own, as sc->bf16_a lies over the 8-bit rows this GEMM is reading.
-void moe_gate_up(const float* x, int ldx, const ExpertMat& W, const int* eidx, int rows, int top_k, int I, int K,
-                 float situ_beta, float situ_linear_beta, bool fuse_act, float* out, int ld_out, const MoeScratch* sc,
-                 const Launch& L, bool q8_ready = false, bf16* act_bf16 = nullptr);
+// Returns the rows a work tile holds of the grouping by expert it leaves in sc for all `rows` at once (0: none),
+// what moe_down takes as `grouped` for the same eidx and rows.
+int moe_gate_up(const float* x, int ldx, const ExpertMat& W, const int* eidx, int rows, int top_k, int I, int K,
+                float situ_beta, float situ_linear_beta, bool fuse_act, float* out, int ld_out, const MoeScratch* sc,
+                const Launch& L, bool q8_ready = false, bf16* act_bf16 = nullptr);
 // Weighted down-projection: out[r, n] (=|+=) sum_{k=0..top_k-1} ew[r, k] * down_{eidx[r, k]}(act[r * top_k + k])[n].
 // act_bf16 (with moe_round_bf16_down): its input [rows*top_k, K] in bf16 already, read in place of act.
+// grouped: moe_gate_up's return for these eidx and rows, sc untouched since; its work tiles are taken where they are
+// the ones this GEMM would group (0: group them here).
 void moe_down(const float* act, int ld_act, const ExpertMat& W, const int* eidx, const float* ew, int rows, int top_k,
               int H, int K, float* out, int ld_out, bool accumulate, const MoeScratch* sc, const Launch& L,
-              const bf16* act_bf16 = nullptr);
+              const bf16* act_bf16 = nullptr, int grouped = 0);
 
 // ---- DSpark drafter kernels (dspark.cu) -----------------------------------------------------
 // Weighted sum of n_taps tapped features [rows, ld_feats] -> RMSNorm -> out [rows, H].
