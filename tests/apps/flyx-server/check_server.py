@@ -869,31 +869,21 @@ def chat_status(cl: Client, model: str) -> int:
 
 
 def fallback_checks(cl: Client, model: str):
-    """a model that fails to load stays unloaded in state 'failed' (no auto-reload of the previous model)."""
-    print("a failed switch stays unloaded")
-    st_b, before = cl.get("/v1/load")
-    remembered = before.get("remembered") if st_b == 200 else None
+    """a model that fails to load gives way to the one served before it, loaded again."""
+    print("a failed switch falls back")
     bogus = os.path.join(tempfile.mkdtemp(prefix="flyx_check_"), "bogus.gguf")
     with open(bogus, "wb") as f:
         f.write(b"not a model at all \x00\x01\x02\xff")
     st, s = cl.post("/v1/load", {"model": bogus})
     if st == 403:
-        print("  note POST /v1/load: 403 (not this machine and no --key): failed switch is not checked")
+        print("  note POST /v1/load: 403 (not this machine and no --key): the fallback is not checked")
         return
     check(st == 202, "POST /v1/load of a bogus file: started", f"{st} {json.dumps(s)[:200]}")
     s = wait_load(cl, 180)
-    check(s.get("state") == "failed" and s.get("fallback") is None and s.get("model") is None and
-          bool(s.get("error")), "it fails without auto-reloading the old model", json.dumps(s)[:300])
-    check(chat_status(cl, model) == 503, "a chat request after a failed switch: 503")
+    check(s.get("state") == "ready" and s.get("fallback") == model and s.get("model") == model and
+          bool(s.get("error")), "it fails, and the old model is served again", json.dumps(s)[:300])
+    check(chat_status(cl, model) == 200, "a chat request after the fallback")
     os.remove(bogus)
-    check(bool(remembered), "the settings file still remembers the previous model", json.dumps(before)[:200])
-    if not remembered:
-        return
-    st, s = cl.post("/v1/load", remembered)
-    check(st == 202, "POST /v1/load of the remembered model after failed switch", f"{st} {json.dumps(s)[:200]}")
-    s = wait_load(cl, 300)
-    check(s.get("state") == "ready" and s.get("model") == model, "served again after explicit reload", json.dumps(s)[:200])
-    check(chat_status(cl, model) == 200, "a chat request after explicit reload")
 
 
 def unload_checks(cl: Client, model: str):
