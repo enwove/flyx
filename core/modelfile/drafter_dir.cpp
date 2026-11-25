@@ -43,15 +43,7 @@ json draft_config(const json& sc) {
     if (std::find(archs.begin(), archs.end(), "DFlash2DraftModel") == archs.end())
       throw std::runtime_error("drafter architectures " + archs.dump() + ": DFlash2DraftModel is supported");
     dc = sc.at("dflash_config"), tl = sc;
-    const int64_t n_target_layers = sc.contains("num_target_layers") && sc["num_target_layers"].is_number_integer()
-                                        ? sc["num_target_layers"].get<int64_t>()
-                                        : -1;
-    for (const auto& i : dc.at("target_layer_ids")) {
-      const int64_t v = i.get<int64_t>();
-      // 0-based layer output i in [0, num_target_layers) becomes 1-based i + 1; an index equal to
-      // num_target_layers represents a post-final-norm capture and stays at num_target_layers.
-      taps.push_back(n_target_layers > 0 && v == n_target_layers ? v : v + 1);
-    }
+    for (const auto& i : dc.at("target_layer_ids")) taps.push_back(i.get<int64_t>() + 1);
     vocab = tl.at("vocab_size").get<int64_t>(), target_hidden = tl.at("hidden_size").get<int64_t>();
     causal = sc.value("is_causal", json());
   } else {
