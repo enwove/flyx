@@ -273,7 +273,7 @@ Base URLs: OpenAI clients use `http://127.0.0.1:8080/v1`; Anthropic clients use 
 
 The dashboard's **Integration** page (`http://127.0.0.1:8080/`) generates exact shell commands pre-filled with your host, port, API key, loaded model ID, and context size for **Claude Code**, **Codex CLI**, **DeepSeek Harness**, **OpenCode**, and **Pi**. On Windows, with the browser on the server's machine, **Open in PowerShell** starts Claude Code or Codex CLI in a project folder you pick (`POST /v1/agents/launch`). For any other agent, its **Others** entry gives a text to paste to the agent (base URLs, model ID, context, how the key is passed) by which it sets itself up.
 
-The Claude Code guide starts in `acceptEdits` mode. Project edits run automatically and Claude Code asks about commands that need approval. The permission picker applies to both the copied command and **Open in PowerShell**. Choosing `auto` lets a model review commands. On a single-slot server, those reviews can displace the active conversation and cause another prefill.
+The Claude Code guide defaults to `bypassPermissions`, so tool calls generally run without asking for approval. Choose `acceptEdits` to allow project edits and prompt for other commands as needed. The permission picker applies to both the copied command and **Open in PowerShell**. Choosing `auto` lets a model review commands. On a single-slot server, those reviews can displace the active conversation and cause another prefill.
 
 Quick environment templates:
 

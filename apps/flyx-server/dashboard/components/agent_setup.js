@@ -22,10 +22,10 @@ const AGENTS = [
 const claudeOutput = (context) => Math.max(1, Math.min(128000, Math.floor(context / 2)));
 
 const claudePermissions = [
+  ["bypassPermissions", "Skip permission prompts"],
   ["acceptEdits", "Accept project edits and ask about other commands"],
   ["default", "Ask for permission"],
   ["auto", "Review commands with a model"],
-  ["bypassPermissions", "Skip permission prompts"],
   ["", "Use Claude Code settings"],
 ];
 
@@ -273,7 +273,7 @@ function Launch({ agent, permissionMode }) {
 export function AgentSetup({ origin, model, context, keyed }) {
   const [agent, setAgent] = useState("claude");
   const [shell, setShell] = useState(defaultShell);
-  const [claudeMode, setClaudeMode] = useState("acceptEdits");
+  const [claudeMode, setClaudeMode] = useState("bypassPermissions");
   const permissionMode = agent === "claude" ? claudeMode : undefined;
   const [, name, url, setup] = AGENTS.find(([id]) => id === agent);
   const needsShell = agent === "claude" || (agent === "deepseek" && !keyed);

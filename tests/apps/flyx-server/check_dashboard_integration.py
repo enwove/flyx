@@ -172,7 +172,8 @@ def guides(panel, keyed):
         assert snippets and all(KEY not in value for value in snippets)
         if agent == "claude":
             modes = panel.locator("#claude-permission")
-            assert modes.input_value() == "acceptEdits"
+            assert modes.input_value() == "bypassPermissions"
+            assert "--permission-mode bypassPermissions" in snippets[0]
             for shell in ("powershell", "sh"):
                 panel.locator(f"button[data-shell={shell}]").click()
                 prose.update(guide_prose(panel))
@@ -273,12 +274,12 @@ def check_launch(browser, telemetry, errors):
     page.goto(ORIGIN + "/dashboard/#integration")
     panel = page.locator("#tab-integration")
     dialog = page.locator("#project-dialog")
-    for agent, mode in (("claude", "acceptEdits"), ("claude", "bypassPermissions"), ("claude", ""), ("codex", "")):
+    for agent, mode in (("claude", "bypassPermissions"), ("claude", "acceptEdits"), ("claude", ""), ("codex", "")):
         panel.locator(f"button[data-agent={agent}]").click()
-        if agent == "claude":
-            panel.locator("#claude-permission").select_option(mode)
-        else:
+        if agent == "codex":
             assert panel.locator("#claude-permission").count() == 0
+        elif sent:  # The first launch uses the selection already on the page.
+            panel.locator("#claude-permission").select_option(mode)
         panel.locator("#agent-launch-go").click()
         dialog.wait_for()
         if not sent:
