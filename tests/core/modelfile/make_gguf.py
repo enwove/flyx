@@ -336,35 +336,52 @@ def explicit_head_dim(out):
     export(path, out / "hf_target", out / "tiny_explicit_hd.gguf")
 
 
-def export_dflash2_gguf(source: Path, target: Path, *, encode=None, sliding_pattern: bool = False):
-    """Export a canonical DFlash2 drafter .flyx file as a llama.cpp arch='dflash' GGUF."""
+def _bf16(writer, name, a):
+    """A float32 matrix as GGUF's BF16, rounded to nearest even."""
+    a = np.ascontiguousarray(a, np.float32)
+    bits = a.view(np.uint32)
+    bits = ((bits + 0x7fff + ((bits >> 16) & 1)) >> 16).astype(np.uint16)
+    writer.add_tensor(name, bits.view(np.uint8).reshape(a.shape[0], -1), raw_dtype=gguf.GGMLQuantizationType.BF16)
+
+
+def _dflash2_keys(w, d, *, causal=False, taps=None, pattern=None, extra=()):
+    """The metadata of a llama.cpp arch='dflash' GGUF, from a canonical "draft" config."""
+    w.add_uint32("dflash.block_count", d["layers"])
+    w.add_uint32("dflash.embedding_length", d["hidden"])
+    w.add_uint32("dflash.feed_forward_length", d["inter"])
+    w.add_uint32("dflash.attention.head_count", d["n_heads"])
+    w.add_uint32("dflash.attention.head_count_kv", d["n_kv"])
+    w.add_uint32("dflash.attention.key_length", d["head_dim"])
+    w.add_uint32("dflash.attention.value_length", d["head_dim"])
+    w.add_bool("dflash.attention.causal", causal)
+    w.add_float32("dflash.rope.freq_base", d["rope_theta"])
+    w.add_float32("dflash.attention.layer_norm_rms_epsilon", d["eps"])
+    w.add_uint32("dflash.block_size", d["block"])
+    w.add_uint32("dflash.conv_kernel_size", d["conv_taps"])
+    w.add_uint32("dflash.conv_group_size", d["conv_group"])
+    w.add_uint32("dflash.selector_rank", d["sel_rank"])
+    w.add_uint32("dflash.selector_top_k", d["sel_topk"])
+    w.add_array("dflash.target_layers", [int(t) for t in (taps or d["taps"])])
+    win = int(d.get("window", 0) or 0)
+    if win > 0:
+        w.add_uint32("dflash.attention.sliding_window", win)
+        if pattern:
+            w.add_array("dflash.attention.sliding_window_pattern", [bool(p) for p in pattern])
+    for key, value in extra:
+        (w.add_bool if isinstance(value, bool) else w.add_float32)(key, value)
+    w.add_uint32("tokenizer.ggml.mask_token_id", d["mask_token"])
+
+
+def export_dflash2_gguf(source: Path, target: Path, *, encode=None, **keys):
+    """Export a canonical DFlash2 drafter .flyx file as a llama.cpp arch='dflash' GGUF.  encode: a GGML block type
+    for a matrix whose rows are whole blocks of it (others stay BF16).  keys: what the metadata says other than the
+    drafter's own config (_dflash2_keys: for the files the engine refuses)."""
     with Reader(str(source)) as r:
         d = r.header["draft"]
         w = gguf.GGUFWriter(str(target), "dflash")
         if encode:
             w.add_uint32("general.quantization_version", 2)
-        w.add_uint32("dflash.block_count", d["layers"])
-        w.add_uint32("dflash.embedding_length", d["hidden"])
-        w.add_uint32("dflash.feed_forward_length", d["inter"])
-        w.add_uint32("dflash.attention.head_count", d["n_heads"])
-        w.add_uint32("dflash.attention.head_count_kv", d["n_kv"])
-        w.add_uint32("dflash.attention.key_length", d["head_dim"])
-        w.add_uint32("dflash.attention.value_length", d["head_dim"])
-        w.add_bool("dflash.attention.causal", False)
-        w.add_float32("dflash.rope.freq_base", d["rope_theta"])
-        w.add_float32("dflash.attention.layer_norm_rms_epsilon", d["eps"])
-        w.add_uint32("dflash.block_size", d["block"])
-        w.add_uint32("dflash.conv_kernel_size", d["conv_taps"])
-        w.add_uint32("dflash.conv_group_size", d["conv_group"])
-        w.add_uint32("dflash.selector_rank", d["sel_rank"])
-        w.add_uint32("dflash.selector_top_k", d["sel_topk"])
-        w.add_array("dflash.target_layers", [int(t) for t in d["taps"]])
-        win = int(d.get("window", 0) or 0)
-        if win > 0:
-            w.add_uint32("dflash.attention.sliding_window", win)
-            if sliding_pattern:
-                w.add_array("dflash.attention.sliding_window_pattern", [True] * d["layers"])
-        w.add_uint32("tokenizer.ggml.mask_token_id", d["mask_token"])
+        _dflash2_keys(w, d, **keys)
 
         top_map = {
             "draft.fc": "fc.weight",
@@ -409,9 +426,7 @@ def export_dflash2_gguf(source: Path, target: Path, *, encode=None, sliding_patt
                 blocks = gguf.quants.quantize(a, typ)
                 w.add_tensor(dest, blocks, raw_dtype=typ)
             elif a.ndim == 2:
-                bits = a.view(np.uint32)
-                bits = ((bits + 0x7fff + ((bits >> 16) & 1)) >> 16).astype(np.uint16)
-                w.add_tensor(dest, bits.view(np.uint8).reshape(a.shape[0], -1), raw_dtype=gguf.GGMLQuantizationType.BF16)
+                _bf16(w, dest, a)
             else:
                 w.add_tensor(dest, a)
         w.write_header_to_file()
@@ -420,76 +435,88 @@ def export_dflash2_gguf(source: Path, target: Path, *, encode=None, sliding_patt
         w.close()
 
 
-def dflash2_ggufs(out: Path):
-    """DFlash2 GGUF fixtures: BF16, sliding-window, Q8_0 quantized (for Qwen3.5), and one sized for tiny_qwen3."""
-    export_dflash2_gguf(out / "tiny_draft.flyx", out / "tiny_draft.gguf")
-    export_dflash2_gguf(out / "tiny_draft_window.flyx", out / "tiny_draft_window.gguf", sliding_pattern=True)
-    export_dflash2_gguf(out / "tiny_draft.flyx", out / "tiny_draft_q8.gguf",
-                        encode=lambda _: gguf.GGMLQuantizationType.Q8_0)
-
-    # A tiny DFlash2 GGUF matched to tiny_qwen3 (dense attention target, non-Qwen3.5 architecture).
-    with Reader(str(out / "tiny_qwen3.flyx")) as q3:
-        c = q3.header["config"]
+def random_dflash2_gguf(model: Path, target: Path, seed: int):
+    """A DFlash2 GGUF drafter of random weights for a dense model (.flyx: its width, vocabulary and layer count),
+    reading its first layer's output and the one before its last's."""
+    with Reader(str(model)) as r:
+        c = r.header["config"]
     H, V, target_layers = int(c["hidden"]), int(c["vocab"]), int(c["layers"])
-    layers, nh, nkv, hd, I = 2, 4, 2, 32, max(128, H * 2)
-    block, ktaps, group, rank, topk = 8, 2, 16, 16, 16
-    taps = [1, target_layers] if target_layers >= 2 else [1]
+    assert target_layers >= 3, "the drafter taps two layers before the model's last"
+    layers, nh, nkv, hd, inter = 2, 4, 2, 32, max(128, H * 2)
+    ktaps, group, rank = 2, 16, 16
+    taps = [1, target_layers - 1]
     G = H // group
-    rng = np.random.default_rng(20261124)
+    rng = np.random.default_rng(seed)
 
-    def add_bf16(writer, name, arr):
-        a = np.ascontiguousarray(arr, np.float32)
-        bits = a.view(np.uint32)
-        bits = ((bits + 0x7fff + ((bits >> 16) & 1)) >> 16).astype(np.uint16)
-        writer.add_tensor(name, bits.view(np.uint8).reshape(a.shape[0], -1), raw_dtype=gguf.GGMLQuantizationType.BF16)
+    def norm(n):
+        return np.ascontiguousarray(1.0 + 0.1 * rng.normal(0, 1, (n,)), np.float32)
 
-    w = gguf.GGUFWriter(str(out / "tiny_qwen3_draft.gguf"), "dflash")
-    w.add_uint32("dflash.block_count", layers)
-    w.add_uint32("dflash.embedding_length", H)
-    w.add_uint32("dflash.feed_forward_length", I)
-    w.add_uint32("dflash.attention.head_count", nh)
-    w.add_uint32("dflash.attention.head_count_kv", nkv)
-    w.add_uint32("dflash.attention.key_length", hd)
-    w.add_uint32("dflash.attention.value_length", hd)
-    w.add_bool("dflash.attention.causal", False)
-    w.add_float32("dflash.rope.freq_base", 10000.0)
-    w.add_float32("dflash.attention.layer_norm_rms_epsilon", 1e-6)
-    w.add_uint32("dflash.block_size", block)
-    w.add_uint32("dflash.conv_kernel_size", ktaps)
-    w.add_uint32("dflash.conv_group_size", group)
-    w.add_uint32("dflash.selector_rank", rank)
-    w.add_uint32("dflash.selector_top_k", topk)
-    w.add_array("dflash.target_layers", taps)
-    w.add_uint32("tokenizer.ggml.mask_token_id", 3)
-
-    add_bf16(w, "fc.weight", rng.normal(0, (len(taps) * H) ** -0.5, (H, len(taps) * H)))
-    w.add_tensor("enc.output_norm.weight", np.ascontiguousarray(1.0 + 0.1 * rng.normal(0, 1, (H,)), np.float32))
-    w.add_tensor("output_norm.weight", np.ascontiguousarray(1.0 + 0.1 * rng.normal(0, 1, (H,)), np.float32))
-    add_bf16(w, "selector_predecessor.weight", rng.normal(0, 0.5, (V, rank)))
-    add_bf16(w, "selector_successor.weight", rng.normal(0, 0.5, (V, rank)))
-    add_bf16(w, "selector_hidden.weight", rng.normal(0, H ** -0.5, (rank, H)))
-    for l in range(layers):
-        p = f"blk.{l}."
-        w.add_tensor(p + "attn_norm.weight", np.ascontiguousarray(1.0 + 0.1 * rng.normal(0, 1, (H,)), np.float32))
-        w.add_tensor(p + "ffn_norm.weight", np.ascontiguousarray(1.0 + 0.1 * rng.normal(0, 1, (H,)), np.float32))
-        w.add_tensor(p + "attn_q_norm.weight", np.ascontiguousarray(1.0 + 0.1 * rng.normal(0, 1, (hd,)), np.float32))
-        w.add_tensor(p + "attn_k_norm.weight", np.ascontiguousarray(1.0 + 0.1 * rng.normal(0, 1, (hd,)), np.float32))
-        add_bf16(w, p + "attn_q.weight", rng.normal(0, H ** -0.5, (nh * hd, H)))
-        add_bf16(w, p + "attn_k.weight", rng.normal(0, H ** -0.5, (nkv * hd, H)))
-        add_bf16(w, p + "attn_v.weight", rng.normal(0, H ** -0.5, (nkv * hd, H)))
-        add_bf16(w, p + "attn_output.weight", rng.normal(0, (nh * hd) ** -0.5, (H, nh * hd)))
-        add_bf16(w, p + "ffn_gate.weight", rng.normal(0, H ** -0.5, (I, H)))
-        add_bf16(w, p + "ffn_up.weight", rng.normal(0, H ** -0.5, (I, H)))
-        add_bf16(w, p + "ffn_down.weight", rng.normal(0, I ** -0.5, (H, I)))
+    w = gguf.GGUFWriter(str(target), "dflash")
+    _dflash2_keys(w, {"layers": layers, "hidden": H, "inter": inter, "n_heads": nh, "n_kv": nkv, "head_dim": hd,
+                      "rope_theta": 10000.0, "eps": 1e-6, "block": 8, "conv_taps": ktaps, "conv_group": group,
+                      "sel_rank": rank, "sel_topk": 16, "taps": taps, "mask_token": 3})
+    _bf16(w, "fc.weight", rng.normal(0, (len(taps) * H) ** -0.5, (H, len(taps) * H)))
+    w.add_tensor("enc.output_norm.weight", norm(H))
+    w.add_tensor("output_norm.weight", norm(H))
+    _bf16(w, "selector_predecessor.weight", rng.normal(0, 0.5, (V, rank)))
+    _bf16(w, "selector_successor.weight", rng.normal(0, 0.5, (V, rank)))
+    _bf16(w, "selector_hidden.weight", rng.normal(0, H ** -0.5, (rank, H)))
+    for layer in range(layers):
+        p = f"blk.{layer}."
+        w.add_tensor(p + "attn_norm.weight", norm(H))
+        w.add_tensor(p + "ffn_norm.weight", norm(H))
+        w.add_tensor(p + "attn_q_norm.weight", norm(hd))
+        w.add_tensor(p + "attn_k_norm.weight", norm(hd))
+        _bf16(w, p + "attn_q.weight", rng.normal(0, H ** -0.5, (nh * hd, H)))
+        _bf16(w, p + "attn_k.weight", rng.normal(0, H ** -0.5, (nkv * hd, H)))
+        _bf16(w, p + "attn_v.weight", rng.normal(0, H ** -0.5, (nkv * hd, H)))
+        _bf16(w, p + "attn_output.weight", rng.normal(0, (nh * hd) ** -0.5, (H, nh * hd)))
+        _bf16(w, p + "ffn_gate.weight", rng.normal(0, H ** -0.5, (inter, H)))
+        _bf16(w, p + "ffn_up.weight", rng.normal(0, H ** -0.5, (inter, H)))
+        _bf16(w, p + "ffn_down.weight", rng.normal(0, inter ** -0.5, (H, inter)))
         for kind in ("attn", "ffn"):
             base = (0.2 * rng.normal(0, 1, (2, ktaps, H))).astype(np.float32)
             base[:, 0] += 1.0
             w.add_tensor(p + f"{kind}_conv_base", np.ascontiguousarray(base))
-            add_bf16(w, p + f"{kind}_conv_proj.weight", rng.normal(0, 0.3 * H ** -0.5, (2 * ktaps * G, H)))
+            _bf16(w, p + f"{kind}_conv_proj.weight", rng.normal(0, 0.3 * H ** -0.5, (2 * ktaps * G, H)))
     w.write_header_to_file()
     w.write_kv_data_to_file()
     w.write_tensors_to_file()
     w.close()
+
+
+def dflash2_ggufs(out: Path):
+    """DFlash2 drafters as llama.cpp's GGUF files (arch "dflash"), beside the tiny models:
+    tiny_draft*.gguf: tiny.flyx's drafter in BF16, with a sliding window, in Q8_0, and with the types mixed as a
+      Q4_K_M file mixes them (the stacked q|k|v and context k|v of more than one type);
+    tiny_qwen3_draft.gguf, tiny_llama_draft.gguf: random drafters for the tiny Qwen3 and the tiny Llama;
+    tiny_draft_refused_*.gguf: tiny.flyx's drafter saying what the engine does not run."""
+    types = gguf.GGMLQuantizationType
+    export_dflash2_gguf(out / "tiny_draft.flyx", out / "tiny_draft.gguf")
+    with Reader(str(out / "tiny_draft_window.flyx")) as r:
+        sliding = r.header["draft"]["layers"]
+    assert sliding >= 2, "a pattern that is not uniform needs two layers"
+    export_dflash2_gguf(out / "tiny_draft_window.flyx", out / "tiny_draft_window.gguf", pattern=[True] * sliding)
+    export_dflash2_gguf(out / "tiny_draft.flyx", out / "tiny_draft_q8.gguf", encode=lambda _: types.Q8_0)
+    export_dflash2_gguf(out / "tiny_draft.flyx", out / "tiny_draft_mixed.gguf",
+                        encode=lambda name: types.Q8_0 if name.endswith(("attn.v", "mlp.down")) else types.Q4_0)
+    random_dflash2_gguf(out / "tiny_qwen3.flyx", out / "tiny_qwen3_draft.gguf", 20261124)
+    random_dflash2_gguf(out / "tiny_llama.flyx", out / "tiny_llama_draft.gguf", 20261125)
+
+    with Reader(str(out / "tiny_draft.flyx")) as r:
+        d = r.header["draft"]
+    refused = {
+        "causal": {"causal": True},
+        "dspark": {"extra": [("dflash.has_markov_context", True)]},
+        "anchor": {"extra": [("dflash.sample_from_anchor", True)]},
+        "confidence": {"extra": [("dflash.has_confidence_head", True)]},
+        "softcap": {"extra": [("dflash.final_logit_softcapping", 30.0)]},
+        "last_layer": {"taps": d["taps"][:-1] + [d["target"]["layers"]]},
+    }
+    for name, keys in refused.items():
+        export_dflash2_gguf(out / "tiny_draft.flyx", out / f"tiny_draft_refused_{name}.gguf", **keys)
+    export_dflash2_gguf(out / "tiny_draft_window.flyx", out / "tiny_draft_refused_pattern.gguf",
+                        pattern=[i % 2 == 0 for i in range(sliding)])
 
 
 def main(out):

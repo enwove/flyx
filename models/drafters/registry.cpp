@@ -10,54 +10,31 @@ namespace flyx::models::drafters {
 
 using nlohmann::json;
 
+namespace {
+
+std::string companion_label(int i) { return "companion file " + std::to_string(i + 1) + ": "; }
+
+}  // namespace
+
 void DrafterRegistry::scan(const ModelFile& file, const TargetSpec& target, const MtpHooks* mtp, bool has_dv,
                            std::vector<int>* unclaimed) {
-  sources_ = {};
-  mtp_companion_ = -1;
-  dflash2_gguf_ = false;
-  dflash2_companion_ = -1;
-  dflash2_json_ = json();
-  dflash2_spec_.reset();
-  dflash2_block_ = -1;
-  dflash2_taps_.clear();
-  context_blocks_.clear();
+  *this = DrafterRegistry();
   if (unclaimed) unclaimed->clear();
 
   const json& hdr = file.header();
   sources_.dv = has_dv;
   if (mtp && mtp->embedded) sources_.mtp = true;
-  if (hdr.is_object() && hdr.contains("draft") && hdr["draft"].is_object()) {
-    sources_.dflash2 = true;
-    dflash2_gguf_ = false;
-    dflash2_companion_ = -1;
-    dflash2_json_ = hdr["draft"];
-  }
+  if (hdr.is_object() && hdr.contains("draft") && hdr["draft"].is_object()) sources_.dflash2 = true;
 
   for (int i = 0; i < file.companions(); ++i) {
     const json& h = hdr.at("companions").at(size_t(i));
-    const std::string what = "companion file " + std::to_string(i + 1) + ": ";
+    const std::string what = companion_label(i);
     if (is_dflash_companion(h)) {
       if (sources_.dflash2) throw std::runtime_error(what + "the model has a DFlash2 drafter already");
-      if (GgufMeta::is_header(h)) {
-        try {
-          dflash2_spec_ = parse_dflash2_gguf(file, h, target, i);
-        } catch (const std::exception& e) {
-          throw std::runtime_error(what + e.what());
-        }
-        dflash2_gguf_ = true;
-      } else {
-        const json& d = h.at("draft");
-        const json t = d.value("target", json::object());
-        const int th = t.value("hidden", target.hidden);
-        const int tv = t.value("vocab", target.vocab);
-        const bool vocab_ok = tv == target.vocab || tv == target.padded_vocab();
-        const bool layers_ok = !t.contains("layers") || t["layers"].is_null() || t["layers"].get<int>() == target.layers;
-        if (d.value("kind", "") != "dflash2" || th != target.hidden || !vocab_ok || !layers_ok)
-          throw std::runtime_error(what + "a drafter made for another model (this one: width " +
-                                   std::to_string(target.hidden) + ", vocabulary " + std::to_string(target.vocab) +
-                                   ", " + std::to_string(target.layers) + " layers)");
-        dflash2_gguf_ = false;
-        dflash2_json_ = d;
+      try {
+        check_made_for(h, target);
+      } catch (const std::exception& e) {
+        throw std::runtime_error(what + e.what());
       }
       sources_.dflash2 = true;
       sources_.dflash2_beside = true;
@@ -80,12 +57,15 @@ void DrafterRegistry::scan(const ModelFile& file, const TargetSpec& target, cons
 }
 
 const DFlash2Spec& DrafterRegistry::ensure_dflash2_spec(const ModelFile& file, const TargetSpec& target) {
-  if (!dflash2_spec_) {
-    if (dflash2_gguf_)
-      dflash2_spec_ = parse_dflash2_gguf(file, file.header().at("companions").at(size_t(dflash2_companion_)), target,
-                                         dflash2_companion_);
-    else
-      dflash2_spec_ = parse_dflash2_json(dflash2_json_, target, dflash2_companion_, &file);
+  if (dflash2_spec_) return *dflash2_spec_;
+  const int i = dflash2_companion_;
+  if (i < 0) return dflash2_spec_.emplace(parse_dflash2_json(file.header().at("draft"), target, -1));
+  const json& h = file.header().at("companions").at(size_t(i));
+  try {
+    dflash2_spec_ = GgufMeta::is_header(h) ? parse_dflash2_gguf(file, h, target, i)
+                                           : parse_dflash2_json(h.at("draft"), target, i);
+  } catch (const std::exception& e) {
+    throw std::runtime_error(companion_label(i) + e.what());
   }
   return *dflash2_spec_;
 }

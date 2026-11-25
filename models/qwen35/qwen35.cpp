@@ -501,8 +501,8 @@ bool Qwen35::build(const ModelFile& file, const ModelOptions& o, std::string* er
   mtp_hooks.tensor_name = [this](const std::string& canonical, int comp) {
     return gguf_ ? gguf_name(canonical, layers_, comp) : canonical;
   };
-  mtp_hooks.build_layer = [this, &c](int comp) -> std::pair<int, int> {
-    mtp_companion_ = comp;
+  // The layer's tensors are named through n(), which reads mtp_companion_ (set below, before any block is built).
+  mtp_hooks.build_layer = [this, &c](int) -> std::pair<int, int> {
     return {attention("mtp.L0.", c, true), mlp("mtp.L0.", c)};
   };
 

@@ -17,7 +17,8 @@ namespace flyx::models::drafters {
 
 class DrafterRegistry {
  public:
-  // Inspect embedded drafters in `file` and claim any drafter companions.
+  // Inspect embedded drafters in `file` and claim any drafter companions: a companion made for another model is
+  // refused here, chosen or not; what a claimed drafter's own config says is read when it is chosen (below).
   // Non-drafter companion indices (such as clip/mmproj vision projectors) are appended to `unclaimed`.
   void scan(const ModelFile& file, const TargetSpec& target, const MtpHooks* mtp, bool has_dv,
             std::vector<int>* unclaimed);
@@ -38,16 +39,12 @@ class DrafterRegistry {
   // Emit FLYX_NODE_CONTEXT nodes for all attached drafters managed by this registry (MTP, DFlash2).
   void emit_contexts(std::vector<flyx_node>* p) const;
 
-  bool has_active_context() const { return !context_blocks_.empty(); }
-
  private:
   const DFlash2Spec& ensure_dflash2_spec(const ModelFile& file, const TargetSpec& target);
 
   DrafterSources sources_{};
   int mtp_companion_ = -1;
-  bool dflash2_gguf_ = false;
-  int dflash2_companion_ = -1;
-  nlohmann::json dflash2_json_;  // canonical JSON when !dflash2_gguf_
+  int dflash2_companion_ = -1;  // the companion holding the DFlash2 drafter, -1: the model file ("draft")
   std::optional<DFlash2Spec> dflash2_spec_;
 
   int dflash2_block_ = -1;

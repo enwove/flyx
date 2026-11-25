@@ -11,6 +11,8 @@
 // canvas runs this model's own attention and MLP blocks, and a .flyx file of
 // either may hold the target's own adapters (a V-LoRA, python/convert --lora:
 // the header's "lora" section), on every linear of every layer, in every pass.
+// A model of either takes a DFlash2 drafter made for it (models/drafters/):
+// its taps and context nodes go into the programs here; DV still drafts alone.
 #include "models/llama/llama.h"
 
 #include <cmath>
@@ -159,7 +161,8 @@ bool Llama::build(const ModelFile& file, const ModelOptions& o, std::string* err
 
   std::vector<int> unclaimed;
   drafters_reg_.scan(file, target, /*mtp=*/nullptr, has_dv, &unclaimed);
-  for (int i : unclaimed) {
+  if (!unclaimed.empty()) {  // a file beside the model that is no drafter of its: the family reads nothing else
+    const int i = unclaimed.front();
     const json& ch = file.header().at("companions").at(size_t(i));
     if (ch.is_object() && ch.value("arch", "") == "clip")
       return *err = std::string("a ") + family + " model does not support a vision projector (--mmproj)", false;

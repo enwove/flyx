@@ -13,14 +13,11 @@ namespace flyx::models::drafters {
 struct TargetSpec {
   std::string arch;        // target architecture name as the file reports it ("qwen35", "qwen3", "llama", ...)
   int hidden = 0;          // residual stream width
-  int vocab = 0;           // effective (unpadded) vocabulary size
-  int vocab_padded = 0;    // storage vocabulary size (0 means same as vocab)
+  int vocab = 0;           // vocabulary size (the rows of the embedding the drafters share)
   int layers = 0;          // logical layer / visit count (1..layers are valid tap indices)
   int embed = -1;          // target FLYX_BLOCK_EMBED index (populated before attach)
   int head = -1;           // target FLYX_BLOCK_HEAD index (populated before attach)
   bool gguf = false;       // true when the target model was opened from GGUF
-
-  int padded_vocab() const { return vocab_padded > 0 ? vocab_padded : vocab; }
 };
 
 // Optional architecture callbacks for targets that can host an embedded or sidecar-GGUF MTP layer.
