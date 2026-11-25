@@ -339,6 +339,19 @@ void array_stride_bounds() {
         "reject tokenizer.ggml.token_type array exceeding remaining/4 before reserve: " + err);
 }
 
+void dflash_gguf_peek_and_open(const std::string& dir) {
+  const std::string model = dir + "/tiny_gguf.gguf", drafter = dir + "/tiny_draft.gguf";
+  const GgufPeek pm = gguf_peek(model);
+  check(pm.valid && pm.arch == "qwen35" && pm.mtp_layers == 1, "gguf_peek reports arch and mtp_layers on target GGUF");
+  const GgufPeek pd = gguf_peek(drafter);
+  check(pd.valid && pd.arch == "dflash" && pd.mtp_layers == 0, "gguf_peek identifies arch='dflash' drafter GGUF");
+  ModelFile f;
+  std::string err;
+  const bool opened = f.open(drafter, &err);
+  check(!opened && err.find("a drafter alone, not a model") != std::string::npos,
+        "standalone arch='dflash' GGUF refused by ModelFile::open (" + err + ")");
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -352,6 +365,7 @@ int main(int argc, char** argv) {
   split_gguf(dir);
   companion_skips_tokenizer(dir + "/tiny_gguf.gguf");
   array_stride_bounds();
+  dflash_gguf_peek_and_open(dir);
   std::printf("%d failures\n", failures);
   return failures ? 1 : 0;
 }

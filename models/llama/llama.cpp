@@ -11,11 +11,14 @@
 // canvas runs this model's own attention and MLP blocks, and a .flyx file of
 // either may hold the target's own adapters (a V-LoRA, python/convert --lora:
 // the header's "lora" section), on every linear of every layer, in every pass.
+// A model of either takes a DFlash2 drafter made for it (models/drafters/):
+// its taps and context nodes go into the programs here; DV still drafts alone.
 #include "models/llama/llama.h"
 
 #include <cmath>
 #include <stdexcept>
 
+#include "models/drafters/registry.h"
 #include "models/dv.h"
 #include "models/gguf.h"
 
@@ -121,32 +124,21 @@ class Llama final : public Model {
   std::vector<flyx_node> round_program(int width, int d, bool given) const override;
 
  private:
+  void add_layers(std::vector<flyx_node>* p) const;
+
   int embed_ = -1, head_ = -1;
   std::vector<int> layers_;  // per layer: attention block, MLP block
   int dv_block_ = -1;        // DV, when it drafts
+  drafters::DrafterRegistry drafters_reg_;
 };
 
 bool Llama::build(const ModelFile& file, const ModelOptions& o, std::string* err) {
   const bool qwen3 = file.arch() == "qwen3", qk_norm = qwen3;  // Qwen3 normalises each head's q and k
   const char* family = qwen3 ? "Qwen3" : "Llama";
-  // DV, the one drafter of the family: in a Llama .flyx file of its own (python/convert --dv).
+  // DV: in a Llama .flyx file of its own (python/convert --dv).
   const bool has_dv = dv::in_file(file);
   if (has_dv && (qwen3 || GgufMeta::is(file))) return *err = "a DV drafter in a file that is not a Llama .flyx", false;
   file_drafts_trees_ = has_dv;
-  DrafterSources sources;
-  sources.dv = has_dv;
-  std::vector<Drafter> drafters;
-  if (!choose_drafters(o, sources, &drafters, err)) return false;
-  if (file.companions() > 0) {
-    if (file.header().contains("companions") && file.header().at("companions").is_array()) {
-      for (const auto& ch : file.header().at("companions")) {
-        if (ch.is_object() && ch.value("arch", "") == "clip")
-          return *err = std::string("a ") + family + " model does not support a vision projector (--mmproj)", false;
-      }
-    }
-    return *err = std::string("a ") + family + " model has no drafter to read from a file", false;
-  }
-  if (!tables_.set_activations(o.activations, declared_activations(file), o.fp4_inputs, err)) return false;
   // MiniCPM5-1B's next tokens move visibly with an FP8 cache (KL 0.0064, top-1 97.2%): binary16 unless
   // the caller asks for FP8.
   kv_fp8_by_default_ = qwen3;
@@ -159,6 +151,29 @@ bool Llama::build(const ModelFile& file, const ModelOptions& o, std::string* err
   const Config c = GgufMeta::is(file) ? read_gguf_config(file) : read_config(file.header().at("config"));
   const Lora lora = GgufMeta::is(file) ? Lora{} : read_lora(file);
   trained_ctx_ = c.trained_ctx;
+
+  drafters::TargetSpec target{};
+  target.arch = file.arch();
+  target.hidden = c.hidden;
+  target.vocab = c.vocab;
+  target.layers = c.layers;
+  target.gguf = c.gguf;
+
+  std::vector<int> unclaimed;
+  drafters_reg_.scan(file, target, /*mtp=*/nullptr, has_dv, &unclaimed);
+  if (!unclaimed.empty()) {  // a file beside the model that is no drafter of its: the family reads nothing else
+    const int i = unclaimed.front();
+    const json& ch = file.header().at("companions").at(size_t(i));
+    if (ch.is_object() && ch.value("arch", "") == "clip")
+      return *err = std::string("a ") + family + " model does not support a vision projector (--mmproj)", false;
+    return *err = "companion file " + std::to_string(i + 1) + ": holds no drafter a " + family + " model takes", false;
+  }
+
+  std::vector<Drafter> drafters;
+  if (!choose_drafters(o, drafters_reg_.sources(), &drafters, err)) return false;
+  drafters_reg_.validate_selected(file, drafters, target);
+  if (!tables_.set_activations(o.activations, declared_activations(file), o.fp4_inputs, err)) return false;
+
   const int H = c.hidden, layers = c.layers, V = c.vocab, I = c.inter;
   const int nh = c.n_heads, nkv = c.n_kv, hd = c.head_dim;
   const double eps = c.eps;
@@ -175,6 +190,8 @@ bool Llama::build(const ModelFile& file, const ModelOptions& o, std::string* err
   };
   embed_ = T.embed_block(H, V, n);
   head_ = T.head_block(H, V, embed_, 0.0, c.eps, n);
+  target.embed = embed_;
+  target.head = head_;
   AttnBlockSpec attn_spec{H, c.n_heads, c.n_kv, c.head_dim, c.head_dim, FLYX_GATE_NONE, c.theta, 0.0, c.eps};
   attn_spec.qk_norm = qk_norm;
   for (int i = 0; i < layers; ++i) {
@@ -202,50 +219,72 @@ bool Llama::build(const ModelFile& file, const ModelOptions& o, std::string* err
       f.lora[2] = adapter(p + "mlp.down", H, I);
     }
   }
-  if (!drafters.empty()) {  // DV
-    dv::Target t;
-    t.hidden = H;
-    t.vocab = V;
-    t.n_heads = nh;
-    t.n_kv = nkv;
-    t.head_dim = hd;
-    t.inter = I;
-    t.eps = eps;
-    t.embed = embed_;
-    t.head = head_;
-    for (size_t i = 0; i < layers_.size(); i += 2) {
-      t.attn.push_back(layers_[i]);
-      t.mlp.push_back(layers_[i + 1]);
+  for (Drafter kind : drafters) {
+    if (kind == Drafter::kDv) {
+      dv::Target t;
+      t.hidden = H;
+      t.vocab = V;
+      t.n_heads = nh;
+      t.n_kv = nkv;
+      t.head_dim = hd;
+      t.inter = I;
+      t.eps = eps;
+      t.embed = embed_;
+      t.head = head_;
+      for (size_t i = 0; i < layers_.size(); i += 2) {
+        t.attn.push_back(layers_[i]);
+        t.mlp.push_back(layers_[i + 1]);
+      }
+      dv_block_ = dv::describe(T, file, t);
+      add_drafter(Drafter::kDv, dv_block_, T.at(dv_block_).dv.tree_width);
+    } else {
+      int max_drafts = 0;
+      const int blk = drafters_reg_.attach(kind, file, T, target, /*mtp=*/nullptr, &max_drafts);
+      add_drafter(kind, blk, max_drafts);
     }
-    dv_block_ = dv::describe(T, file, t);
-    add_drafter(Drafter::kDv, dv_block_, T.at(dv_block_).dv.tree_width);
   }
   finish(H, V);
   return true;
 }
 
+void Llama::add_layers(std::vector<flyx_node>* p) const {
+  for (size_t i = 0; i < layers_.size(); i += 2) {
+    p->push_back({FLYX_NODE_RUN, layers_[i], 0, 0});
+    p->push_back({FLYX_NODE_RUN, layers_[i + 1], 0, 0});
+    drafters_reg_.emit_taps(p, int(i / 2) + 1);
+  }
+}
+
 std::vector<flyx_node> Llama::prefill_program() const {
   std::vector<flyx_node> p;
   p.push_back({FLYX_NODE_RUN, embed_, 0, 0});
-  for (int b : layers_) p.push_back({FLYX_NODE_RUN, b, 0, 0});
+  add_layers(&p);
+  drafters_reg_.emit_contexts(&p);
   p.push_back({FLYX_NODE_RUN, head_, 1, 0});
   if (dv_block_ >= 0) p.push_back({FLYX_NODE_CONTEXT, dv_block_, 0, 0});  // DV's canvas starts over
   return p;
 }
 
-// Plain decoding, a round of given drafts, or DV's round or warm-up (width 0; models/dv.h).  Only DV's rounds run its
-// canvas: a round of another kind leaves it behind, and DV's next round starts it over.
+// Plain decoding, a round of given drafts, a DFlash2 round, or DV's round or warm-up (width 0; models/dv.h).
+// Only DV's rounds run its canvas: a round of another kind leaves it behind, and DV's next round starts it over.
 std::vector<flyx_node> Llama::round_program(int width, int d, bool given) const {
-  std::vector<flyx_node> verify;
-  verify.push_back({FLYX_NODE_RUN, embed_, 0, 0});
-  for (int b : layers_) verify.push_back({FLYX_NODE_RUN, b, 0, 0});
-  verify.push_back({FLYX_NODE_RUN, head_, 0, 0});
-  if (!given && d >= 0) return dv::round_program(drafters_.at(size_t(d)).block, width, verify);
+  if (!given && d >= 0 && drafters_.at(size_t(d)).kind == Drafter::kDv) {
+    std::vector<flyx_node> verify;
+    verify.push_back({FLYX_NODE_RUN, embed_, 0, 0});
+    for (int b : layers_) verify.push_back({FLYX_NODE_RUN, b, 0, 0});
+    verify.push_back({FLYX_NODE_RUN, head_, 0, 0});
+    return dv::round_program(drafters_.at(size_t(d)).block, width, verify);
+  }
   std::vector<flyx_node> p;
-  if (given && width > 0) p.push_back({FLYX_NODE_GIVEN, -1, width, 0});
-  p.insert(p.end(), verify.begin(), verify.end());
+  if (width > 0)
+    p.push_back(given ? flyx_node{FLYX_NODE_GIVEN, -1, width, 0}
+                      : flyx_node{FLYX_NODE_DRAFT, drafters_.at(size_t(d)).block, width, 0});
+  p.push_back({FLYX_NODE_RUN, embed_, 0, 0});
+  add_layers(&p);
+  p.push_back({FLYX_NODE_RUN, head_, 0, 0});
   p.push_back({FLYX_NODE_ACCEPT, -1, width, 0});
   p.push_back({FLYX_NODE_COMMIT, -1, 0, 0});
+  drafters_reg_.emit_contexts(&p);
   return p;
 }
 

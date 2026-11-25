@@ -119,7 +119,14 @@ std::vector<LocalModel> scan_model_dirs(const std::vector<std::string>& dirs, in
       std::string rel = from_path(it->path().lexically_relative(root));
       std::replace(rel.begin(), rel.end(), '\\', '/');
       const bool is_mmproj = gguf && hub::mmproj_gguf_name(rel);
-      const bool is_drafter = gguf && !is_mmproj && hub::mtp_gguf_name(rel);
+      // A DFlash2 drafter's GGUF says what it is in its header alone (general.architecture "dflash"), and reading
+      // a header means reading through the file's tokenizer tables: only the files whose names suggest a drafter
+      // are opened here.  One named otherwise is listed as a model, and refused as one when it is opened.
+      const bool maybe_dflash =
+          gguf && !is_mmproj && (low.find("dflash") != std::string::npos || low.find("draft") != std::string::npos);
+      const bool is_drafter =
+          gguf && !is_mmproj &&
+          (hub::mtp_gguf_name(rel) || (maybe_dflash && flyx::gguf_peek(from_path(it->path())).arch == "dflash"));
       if (gguf && !is_mmproj && !is_drafter && !hub::model_gguf_name(rel)) continue;
       const fs::path canon = fs::weakly_canonical(it->path(), e2);
       if (e2 || !it->is_regular_file(e2) || e2 || !seen.insert(canon).second) continue;
@@ -201,11 +208,18 @@ bool one(const std::string& spec, const hub::ProgressFn& progress, const std::at
   return true;
 }
 
-// What kind of drafter a file or directory given beside a model holds: a GGUF holds a DFlash2 drafter or MTP layer;
-// a .flyx file or a directory of config and safetensors holds a DFlash2 drafter.
+// What kind of drafter a file or directory given beside a model holds: read from the GGUF header when possible
+// (arch "dflash" vs MTP), falling back to filename/format for directories and .flyx drafter files.
 std::string drafter_kind(const std::string& path) {
   const std::string lp = lower(path);
-  if (lp.ends_with(".gguf")) return lp.find("dflash") != std::string::npos ? "dflash2" : "mtp";
+  if (lp.ends_with(".gguf")) {
+    const flyx::GgufPeek p = flyx::gguf_peek(path);
+    if (p.valid) {
+      if (p.arch == "dflash") return "dflash2";
+      if (p.mtp_layers > 0) return "mtp";
+    }
+    return lp.find("dflash") != std::string::npos ? "dflash2" : "mtp";
+  }
   return "dflash2";
 }
 

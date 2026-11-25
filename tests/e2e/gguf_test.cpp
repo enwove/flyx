@@ -18,6 +18,7 @@
 //   float64 backend's tokens, teacher forced, with the same prefill passes
 //   (the rounding depends on a pass's rows); asked for by name
 //   (--activations nvfp4) in a file that says bf16 inputs, the same tokens.
+#include <algorithm>
 #include <cstdio>
 #include <fstream>
 #include <stdexcept>
@@ -296,10 +297,14 @@ void split_mtp(const std::string& dir, const std::string& backend) {
 // * A drafter file is no model; a drafter made for another model is refused; a model takes one DFlash2 drafter.
 void dflash_file(const std::string& dir, const std::string& backend) {
   const std::string drafter = dir + "/tiny_draft.flyx", window = dir + "/tiny_draft_window.flyx";
+  const std::string drafter_gguf = dir + "/tiny_draft.gguf", window_gguf = dir + "/tiny_draft_window.gguf";
+  // The GGUF drafter in Q8_0, and with the block types mixed as a Q4_K_M file mixes them: its stacked q|k|v and its
+  // context k|v are then runs of more than one type.
+  const std::string drafter_q8 = dir + "/tiny_draft_q8.gguf", drafter_mixed = dir + "/tiny_draft_mixed.gguf";
   std::ifstream f(dir + "/golden.json");
   const json golden = json::parse(f);
-  // The drafter file, and the directory z-lab publishes it as, read in place.
-  for (const std::string& source : {drafter, dir + "/hf_draft_zlab"}) {
+  // The drafter file (.flyx), the directory z-lab publishes it as, and the arch="dflash" GGUF.
+  for (const std::string& source : {drafter, dir + "/hf_draft_zlab", drafter_gguf}) {
     std::printf("  the drafter from %s\n", source.substr(dir.size() + 1).c_str());
     auto dflash = engine(dir + "/tiny_gguf.gguf", backend,
                          {.speculative = true, .drafter = "dflash2", .drafter_files = {source}});
@@ -322,10 +327,16 @@ void dflash_file(const std::string& dir, const std::string& backend) {
   }
   const std::string q8 = dir + "/tiny_q8_target.gguf";
   auto plain = engine(q8, backend);
-  for (const std::string& file : {drafter, window, dir + "/hf_draft_zlab", dir + "/hf_draft_window"}) {
+  for (const std::string& file : {drafter, window, dir + "/hf_draft_zlab", dir + "/hf_draft_window", drafter_gguf,
+                                  window_gguf, drafter_q8, drafter_mixed}) {
     const std::string which = std::string(file.find("window") != std::string::npos ? "a DFlash2 drafter with a sliding window"
-                                                                                  : "a DFlash2 drafter") +
-                              (file.find("/hf_") != std::string::npos ? " (its directory)" : "");
+                                          : file.find("_q8") != std::string::npos  ? "a Q8_0 DFlash2 GGUF drafter"
+                                          : file.find("_mixed") != std::string::npos
+                                              ? "a DFlash2 GGUF drafter of mixed block types"
+                                              : "a DFlash2 drafter") +
+                              (file.find("/hf_") != std::string::npos ? " (its directory)"
+                               : file.ends_with(".gguf")              ? " (GGUF)"
+                                                                      : "");
     const Load drafted = {.speculative = true, .drafter = "dflash2", .drafter_files = {file}};
     Load in16 = drafted, exact = drafted;
     in16.activations = exact.activations = "exact";
@@ -353,6 +364,62 @@ void dflash_file(const std::string& dir, const std::string& backend) {
                 std::to_string(same) + " / " + std::to_string(total));
     }
   }
+  // This test runs four times at once (ctest -j: fused, generic, PDL on and off) beside the golden tests, all on one
+  // device: from here on an engine is given back before the next ones load, so that no more are alive at a time
+  // than in the loop above.
+  plain.reset();
+  // The packed drafters beside a BF16 target (packed GGML weights inside DFlash2 when the target itself is
+  // non-quantized), plus fusion=0 parity on CUDA.
+  {
+    const auto p = golden.at("cases").at(0).at("prompt").get<std::vector<int32_t>>();
+    const auto want = tokens_of(*engine(dir + "/tiny_gguf.gguf", backend), p, 32);
+    for (const std::string& packed : {drafter_q8, drafter_mixed}) {
+      const std::string which = packed.substr(dir.size() + 1);
+      const Load drafted = {.speculative = true, .drafter = "dflash2", .drafter_files = {packed}};
+      auto fused = engine(dir + "/tiny_gguf.gguf", backend, drafted);
+      check(same_tokens(tokens_of(*fused, p, 32), want), which + " beside BF16 target: plain decoding's tokens");
+      if (backend == "cpu_ref") continue;
+      Load generic_load = drafted;
+      generic_load.options = "fusion=0";
+      auto generic = engine(dir + "/tiny_gguf.gguf", backend, generic_load);
+      std::vector<int32_t> ta, tb;
+      const auto a = traced(*fused, p, 32, &ta), b = traced(*generic, p, 32, &tb);
+      bool same_drafts = ta == tb && a.size() == b.size();
+      for (size_t i = 1; same_drafts && i < a.size(); ++i)
+        same_drafts = a[i].n_drafts == b[i].n_drafts &&
+                      std::equal(a[i].drafts, a[i].drafts + a[i].n_drafts, b[i].drafts);
+      check(same_drafts, which + ": fused == generic (fusion=0) tokens and drafts");
+    }
+  }
+  // The dense targets with a DFlash2 GGUF drafter made for them: Qwen3 (GGUF and .flyx) and Llama (plain and with
+  // its own adapters, a V-LoRA).
+  {
+    struct Dense {
+      const char* model;
+      const char* drafter;
+    };
+    const std::vector<int32_t> prompt = {12, 37, 81, 104};
+    for (const Dense& t : {Dense{"tiny_qwen3_gguf.gguf", "tiny_qwen3_draft.gguf"},
+                           Dense{"tiny_qwen3.flyx", "tiny_qwen3_draft.gguf"},
+                           Dense{"tiny_llama.flyx", "tiny_llama_draft.gguf"},
+                           Dense{"tiny_llama_lora.flyx", "tiny_llama_draft.gguf"}}) {
+      const std::string model = dir + "/" + t.model;
+      auto plain_dense = engine(model, backend);
+      const auto want_g = tokens_of(*plain_dense, prompt, 32, false);
+      const auto want_s = tokens_of(*plain_dense, prompt, 24, true);
+      plain_dense.reset();
+      auto spec_dense = engine(model, backend,
+                               {.speculative = true, .drafter = "dflash2", .drafter_files = {dir + "/" + t.drafter}});
+      std::vector<int32_t> got_g;
+      int total_drafts = 0;
+      for (const auto& r : traced(*spec_dense, prompt, 32, &got_g)) total_drafts += r.n_drafts;
+      check(same_tokens(got_g, want_g) && total_drafts > 0,
+            std::string(t.model) + " + DFlash2 GGUF: greedy matches plain (" + std::to_string(total_drafts) +
+                " drafts)");
+      check(tokens_of(*spec_dense, prompt, 24, true) == want_s,
+            std::string(t.model) + " + DFlash2 GGUF: seeded sampling matches plain");
+    }
+  }
   {  // The drafters a model holds unless one is named (models/model.h: choose_drafters).
     auto own = engine(dir + "/tiny.flyx", backend, {.speculative = true, .drafter = ""});
     auto all = engine(dir + "/tiny.flyx", backend, {.speculative = true, .drafter = "all"});
@@ -364,6 +431,9 @@ void dflash_file(const std::string& dir, const std::string& backend) {
   }
   std::string why = refusal(drafter, backend, {});
   check(why.find("a drafter alone, not a model") != std::string::npos, "a drafter file alone is no model (" + why + ")");
+  why = refusal(drafter_gguf, backend, {});
+  check(why.find("a drafter alone, not a model") != std::string::npos,
+        "a DFlash2 GGUF alone is no model (" + why + ")");
   why = refusal(dir + "/tiny_w4a4.flyx", backend, {.speculative = true, .drafter = "dflash2", .drafter_files = {drafter}});
   check(why.find("another model") != std::string::npos,
         "a drafter made for another model (twice as wide) is refused (" + why + ")");

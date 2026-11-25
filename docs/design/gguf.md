@@ -8,6 +8,7 @@
 |---|---|---|
 | `core/modelfile/gguf_format.cpp` | GGUF container: header, metadata, tokenizer tables, tensor offsets and validation | Model architecture semantics; tensor rewriting |
 | `models/gguf.h`, `models/<arch>/` | `llama.cpp` metadata keys, tensor names, and architecture layout flags | Data movement or dequantization |
+| `models/drafters/` | A drafter GGUF's keys and tensor names (`general.architecture=dflash`), mapped from the names `python/convert` gives the same drafter | A target architecture's keys or layout |
 | `ops/dtype/ggml.h` | Exact float64 definition of element `i` in every supported GGML block type | GPU kernel layout |
 | `third_party/ggml/ggml-common.h` | Upstream GGML block structs and codebooks (unchanged) | Local modifications |
 | `backends/<name>/` | Device upload, packing, and kernel execution according to layout flags | GGUF container parsing |
@@ -28,11 +29,26 @@ Refused cleanly at open time: unsupported GGUF version/endianness, a split file 
 
 ---
 
-## Architecture Mapping (`models/qwen35/`, `models/qwen3/`)
+## Architecture Mapping (`models/qwen35/`, `models/llama/`)
 
 Both architectures read standard `llama.cpp` keys (`<arch>.block_count`, `embedding_length`, `feed_forward_length`, `attention.head_count`, `attention.head_count_kv`, `attention.key_length`, `rope.dimension_count`, `rope.freq_base`, `attention.layer_norm_rms_epsilon`; for Qwen3.5 also `ssm.group_count`, `ssm.time_step_rank`, `ssm.state_size`, `ssm.inner_size`, `ssm.conv_kernel`, `full_attention_interval` or `attention.recurrent_layers`, and `nextn_predict_layers`). A missing `output.weight` ties the output head to `token_embd.weight`. Scaled RoPE, sliding-window target attention, MoE experts, and scaled embeddings are refused.
 
-Sidecar drafters attach via `--drafter-file`: standalone MTP GGUFs (`MTP/mtp-*.gguf`) or DFlash2 checkpoints (HF directory or `.flyx`), sharing the target GGUF's packed embedding and output head.
+Sidecar drafters attach via `--drafter-file`: standalone MTP GGUFs (`MTP/mtp-*.gguf`) or DFlash2 checkpoints (HF directory, `.flyx`, or a drafter GGUF, below), sharing the target GGUF's packed embedding and output head.
+
+### DFlash2 Drafter GGUF (`models/drafters/`, `general.architecture=dflash`)
+
+A file `llama.cpp` reads as a DFlash2 drafter (e.g. `z-lab/Qwen3.8-27B-DFlash2-GGUF`) is a drafter alone: opened as a model it is refused, beside a model of any supported architecture it is the model's DFlash2 drafter. The blocks are the ones a `.flyx` drafter file gives; only the names differ.
+
+| Read | Keys / Tensors |
+|---|---|
+| Dimensions | `dflash.block_count`, `embedding_length` (the target's width), `feed_forward_length`, `attention.head_count`, `attention.head_count_kv`, `attention.key_length`, `rope.freq_base`, `attention.layer_norm_rms_epsilon` |
+| Drafting | `dflash.block_size`, `conv_kernel_size`, `conv_group_size`, `selector_rank`, `selector_top_k`, `target_layers` (the target's hidden states the drafter reads: after that many layers), `attention.sliding_window` with `attention.sliding_window_pattern`, and `tokenizer.ggml.mask_token_id` (or `dflash.mask_token_id`) |
+| Top-level tensors | `fc.weight`, `enc.output_norm.weight`, `output_norm.weight`, `selector_hidden.weight`, `selector_predecessor.weight`, `selector_successor.weight` |
+| Per layer (`blk.<i>.`) | The dense layer's names (`attn_norm`, `attn_q`/`k`/`v`/`output`, `attn_q_norm`, `attn_k_norm`, `ffn_norm`, `ffn_gate`/`up`/`down`) plus `attn_conv_base`, `attn_conv_proj.weight`, `ffn_conv_base`, `ffn_conv_proj.weight` |
+
+Its matrices stay as stored: GGML block types packed (mixed types in one stacked projection run as one GEMM per run of a type), BF16 as BF16 (quantized at load beside a quantized target, as a `.flyx` drafter's are). The file's own tokenizer is not read.
+
+Refused, with the file named: a width or vocabulary other than the target's (whether or not the drafter is chosen); and, when it is chosen to draft, causal layers, a sliding-window pattern that is not uniform, `dflash.sample_from_anchor`, `dflash.has_confidence_head`, `dflash.final_logit_softcapping`, `dflash.has_markov_context` (DSpark), and a `target_layers` entry equal to the target's layer count (its final hidden state, taken after the output norm, which a tap of the residual stream is not).
 
 ### Qwen3.5 Layout Flags (Zero Weight Rewriting in `models/`)
 
@@ -62,8 +78,9 @@ Sidecar drafters attach via `--drafter-file`: standalone MTP GGUFs (`MTP/mtp-*.g
 |---|---|
 | `ggml_blocks` | Every decoded value of random blocks for every block type vs Python `gguf` decoder |
 | `gguf_reader` | Tokenizer tables, EOS IDs, chat template, tensor views, malformed-file refusal |
-| `gguf_models` | GGUF model description matches `.flyx` description weight-for-weight via layout flags |
+| `gguf_models` | GGUF model description matches `.flyx` description weight-for-weight via layout flags; a drafter GGUF matches its `.flyx` drafter file block-for-block |
+| `dflash2_models` | Drafter GGUFs beside the tiny Qwen3 and Llama (block, taps, context nodes); drafter files refused for what they say or for the model they were made for |
 | `gguf_qwen2_nfc`, `gguf_qwen2_none` | Qwen2 pre-tokenizer regex splits vs HuggingFace `tokenizers` |
-| `gguf_cpu_ref`, `gguf_cuda`, `gguf_cuda_unfused`, `gguf_cuda_pdl`, `gguf_cuda_no_pdl` | End-to-end golden outputs, MTP/DFlash2 sidecars, packed CUDA vs `cpu_ref` across all block types + GGML NVFP4 |
+| `gguf_cpu_ref`, `gguf_cuda`, `gguf_cuda_unfused`, `gguf_cuda_pdl`, `gguf_cuda_no_pdl` | End-to-end golden outputs, MTP/DFlash2 sidecars (drafter GGUFs in BF16, Q8_0 and mixed block types; beside Qwen3.5, Qwen3 and Llama), packed CUDA vs `cpu_ref` across all block types + GGML NVFP4 |
 | `cuda_ops` (`test_blocks`) | Per-type bit-exact block decode, GEMMs vs float64, row-count bit invariance |
 | `golden_*_qwen3_gguf` | Tiny Qwen3 GGUF against `transformers` |

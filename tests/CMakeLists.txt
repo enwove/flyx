@@ -8,6 +8,8 @@
 #                        trees, selector table (ops/draft/) and canvas (ops/canvas/) vs the Python reference
 #   models/              a model's description from a GGUF file means the one from its .flyx file; DV's description
 #                        (blocks, state, programs, the drafter chosen) from the tiny Llama's DV file
+#   models/drafters/     the DFlash2 drafter the architectures share: its config, the dense targets that take one
+#                        from a GGUF drafter file, drafter files that are refused
 #   core/exec/           telemetry (what the server reports to monitors), the request pipeline, a reply's text,
 #                        the scheduler (requests taking turns), the C API
 #   core/render/         chat templates vs transformers
@@ -94,6 +96,7 @@ flyx_add_unit_test(sums_test ops/sums_test.cpp)
 flyx_add_unit_test(dv_tree_test ops/draft/dv_tree_test.cpp)
 flyx_add_unit_test(canvas_test ops/canvas/canvas_test.cpp)
 flyx_add_unit_test(gguf_models_test models/gguf_test.cpp)
+flyx_add_unit_test(dflash2_models_test models/drafters/dflash2_test.cpp)
 flyx_add_unit_test(dv_models_test models/dv_test.cpp)
 flyx_add_unit_test(llama_models_test models/llama/llama_test.cpp)
 flyx_add_unit_test(gguf_e2e_test e2e/gguf_test.cpp)
@@ -149,13 +152,16 @@ set_tests_properties(make_gguf_assets PROPERTIES FIXTURES_REQUIRED assets FIXTUR
 add_test(NAME gguf_reader COMMAND gguf_test ${ASSETS})
 add_test(NAME ggml_blocks COMMAND ggml_test ${ASSETS})
 add_test(NAME gguf_models COMMAND gguf_models_test ${ASSETS})
+# The DFlash2 drafter the architectures share (models/drafters/): its config checked before a tensor is bound, the
+# dense targets that take one from llama.cpp's GGUF layout, and what is refused of a drafter file.
+add_test(NAME dflash2_models COMMAND dflash2_models_test ${ASSETS})
 # Qwen2's pre-tokenizer split (the published Qwen3 checkpoints), from GGUF vocabularies, against tokenizers.
 add_test(NAME gguf_qwen2_nfc COMMAND tokenizer_test ${ASSETS}/qwen2_nfc.gguf ${ASSETS}/qwen2_nfc.json)
 add_test(NAME gguf_qwen2_none COMMAND tokenizer_test ${ASSETS}/qwen2_none.gguf ${ASSETS}/qwen2_none.json)
 # The tiny models from their GGUF files: the golden outputs, drafting, sampling, reuse.
 add_test(NAME gguf_cpu_ref COMMAND gguf_e2e_test ${ASSETS} cpu_ref)
 flyx_add_golden_test(golden_cpu_ref_qwen3_gguf ARGS cpu_ref qwen3 ${ASSETS}/tiny_qwen3_gguf.gguf FIXTURES gguf_assets)
-set_tests_properties(gguf_reader ggml_blocks gguf_models gguf_qwen2_nfc gguf_qwen2_none gguf_cpu_ref
+set_tests_properties(gguf_reader ggml_blocks gguf_models dflash2_models gguf_qwen2_nfc gguf_qwen2_none gguf_cpu_ref
                      PROPERTIES FIXTURES_REQUIRED gguf_assets)
 
 flyx_add_py_test(reference_vs_transformers ${CMAKE_SOURCE_DIR}/tests/python/reference/check_vs_hf.py

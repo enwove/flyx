@@ -27,8 +27,10 @@ core/                 Plain C++20 engine, zero CUDA headers
   os/                 OS abstraction (mmap, dynamic libraries, time, process/system stats, env.h, utf8.manifest)
 ops/<op>/ref.h        Float64 reference per op; ops/sampling/sampling.h (host/device token choice);
                       ops/dtype/ggml.h (GGML block float64 semantics)
-models/               Architecture descriptions (blocks, weights, state) and Programs: qwen35/, qwen3/, llama/,
-                      vision/ (VisionAdapter preprocessing, smart-resize, 3D MRoPE positions), gguf.h
+models/               Architecture descriptions (blocks, weights, state) and Programs: qwen35/, llama/ (Qwen3 and
+                      Llama), vision/ (VisionAdapter preprocessing, smart-resize, 3D MRoPE positions), gguf.h
+  drafters/           Drafters the architectures share: DFlash2 from a .flyx file, its authors' directory or a
+                      dflash GGUF (dflash2.cpp), claimed, attached and given their program nodes by registry.cpp
   formats/            Bidirectional chat formats: detection, reply parsing (tags/calls), XGrammar structural tags,
                       and byte-identical native renderers (qwen35.cpp)
 backends/cpu_ref/     Independent float64 reference backend (shared library)

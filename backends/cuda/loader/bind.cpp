@@ -227,12 +227,12 @@ DFlashLayer dflash_layer(WeightLoader& L, const flyx_dflash2_layer_block& b) {
   l.post_norm = norm(L, b.post_norm);
   l.q_norm = norm(L, b.q_norm);
   l.k_norm = norm(L, b.k_norm);
-  l.w_qkv = Lin{L.stack({b.q, b.k, b.v})};
-  l.w_o = Lin{L.mat(b.o)};
-  l.w_gu = Lin{L.stack({b.gate, b.up})};
-  l.w_down = Lin{L.mat(b.down)};
-  l.attn_proj = Lin{L.mat(b.attn_conv_proj)};
-  l.mlp_proj = Lin{L.mat(b.mlp_conv_proj)};
+  l.w_qkv = L.lin_stack({b.q, b.k, b.v});
+  l.w_o = L.lin(b.o);
+  l.w_gu = L.lin_stack({b.gate, b.up});
+  l.w_down = L.lin(b.down);
+  l.attn_proj = L.lin(b.attn_conv_proj);
+  l.mlp_proj = L.lin(b.mlp_conv_proj);
   l.attn_base = L.vec(b.attn_conv_base);
   l.mlp_base = L.vec(b.mlp_conv_base);
   return l;
@@ -261,12 +261,12 @@ DFlashBlock dflash(WeightLoader& L, const flyx_model_desc& d, const flyx_dflash2
   f.head = b.head;
   f.first_layer = b.first_layer;
   f.n_layers = b.layers;
-  f.fc = Lin{L.mat(b.fc)};
+  f.fc = L.lin(b.fc);
   f.hidden_norm = norm(L, b.hidden_norm);
   f.norm = norm(L, b.norm);
   f.sel_pred = L.mat(b.sel_pred);
   f.sel_succ = L.mat(b.sel_succ);
-  f.sel_hid = Lin{L.mat(b.sel_hid)};
+  f.sel_hid = L.lin(b.sel_hid);
   // Context K/V projections of every layer in one GEMM, their k norms side by side.
   std::vector<int> ctx, kn;
   double eps = 0;
@@ -282,7 +282,7 @@ DFlashBlock dflash(WeightLoader& L, const flyx_model_desc& d, const flyx_dflash2
     eps = l.k_norm.eps;
   }
   int rows = 0;
-  f.ctx = Lin{L.stack(ctx, &rows)};
+  f.ctx = L.lin_stack(ctx, &rows);
   expect(rows == f.ctx_width(), "DFlash2 context k|v rows do not match its dimensions");
   f.k_norms = {L.vecs(kn), 0.f, float(eps)};
   f.kv = state_of(sm.kv, b.kv, "K/V");

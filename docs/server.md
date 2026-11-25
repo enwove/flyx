@@ -35,7 +35,7 @@ All commands that load a model share the parser in `apps/common/engine_flags.cpp
 | `--backend` | `cuda` \| `cpu_ref` | first available (`cuda`) | Backend shared library to load. Select GPU with `CUDA_VISIBLE_DEVICES`. |
 | `--backend-opt` | `K=V` (repeatable) | none | Backend-specific option (also `FLYX_BACKEND_OPTIONS=K=V,...`). Unknown keys fail load. |
 | `--drafter` | `mtp` \| `dflash2` \| `dv` \| `all` \| `none` | auto | Active drafters. Default enables all `--drafter-file` drafters plus the model's embedded MTP (or embedded DFlash2). Multiple active drafters are selected dynamically per round. A DV drafter (in a DV `.flyx` file, [DV](design/dv.md)) drafts only when named (`dv` or `all`): its warm-up, its trees of 15 and of the file's width, plain decoding and lookup rounds are then chosen every round. |
-| `--drafter-file` | `PATH` \| `HF_REPO` (repeatable) | none | Sidecar MTP GGUF (`MTP/mtp-*.gguf`) or DFlash2 drafter (`.flyx` or HF repo directory). |
+| `--drafter-file` | `PATH` \| `HF_REPO` (repeatable) | none | Sidecar MTP GGUF (`MTP/mtp-*.gguf`) or DFlash2 drafter (`.flyx`, HF repo directory, or a `general.architecture=dflash` GGUF). |
 | `--mmproj` | `PATH` | auto (HF Hub) / none (local) | Multimodal vision projector GGUF (`mmproj-*.gguf`, e.g., `mmproj-BF16.gguf`) paired with the model file. Auto-fetched from Hugging Face Hub repos when available unless `--no-vision` is set. |
 | `--no-vision` | flag | off | Disable loading any vision encoder / `mmproj` projector even if available. |
 | `--vision-offload` | flag | on (`disk`) | Shorthand for `--vision-device disk`: offload vision weights to an auto-deleted temp file on disk (0 VRAM, 0 locked host RAM) and stream via OS page cache into GPU staging. |
