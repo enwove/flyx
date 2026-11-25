@@ -119,7 +119,8 @@ std::vector<LocalModel> scan_model_dirs(const std::vector<std::string>& dirs, in
       std::string rel = from_path(it->path().lexically_relative(root));
       std::replace(rel.begin(), rel.end(), '\\', '/');
       const bool is_mmproj = gguf && hub::mmproj_gguf_name(rel);
-      if (gguf && !is_mmproj && !hub::model_gguf_name(rel)) continue;
+      const bool is_drafter = gguf && !is_mmproj && hub::mtp_gguf_name(rel);
+      if (gguf && !is_mmproj && !is_drafter && !hub::model_gguf_name(rel)) continue;
       const fs::path canon = fs::weakly_canonical(it->path(), e2);
       if (e2 || !it->is_regular_file(e2) || e2 || !seen.insert(canon).second) continue;
       const auto sz = it->file_size(e2);
@@ -128,7 +129,7 @@ std::vector<LocalModel> scan_model_dirs(const std::vector<std::string>& dirs, in
       const auto mt = it->last_write_time(e3);
       const fs::file_time_type modified = e3 ? fs::file_time_type::min() : mt;
       hub::SplitGguf sp;
-      if (gguf && !is_mmproj && hub::parse_split_gguf_name(from_path(canon), &sp)) {
+      if (gguf && !is_mmproj && !is_drafter && hub::parse_split_gguf_name(from_path(canon), &sp)) {
         auto& acc = splits[{sp.prefix, sp.count}];
         acc.count = sp.count;
         acc.parts[sp.part] = {from_path(it->path()), name, uint64_t(sz), modified};
@@ -137,7 +138,7 @@ std::vector<LocalModel> scan_model_dirs(const std::vector<std::string>& dirs, in
       LocalModel m;
       m.path = from_path(it->path());
       m.file = name;
-      m.kind = is_mmproj ? "mmproj" : gguf ? "gguf" : "flyx";
+      m.kind = is_mmproj ? "mmproj" : is_drafter ? "drafter" : gguf ? "gguf" : "flyx";
       m.quant = hub::quant_in_name(name);
       m.size = uint64_t(sz);
       m.modified = modified;
@@ -200,9 +201,13 @@ bool one(const std::string& spec, const hub::ProgressFn& progress, const std::at
   return true;
 }
 
-// What kind of drafter a file or directory given beside a model holds: a GGUF, an MTP layer; a.flyx
-// file or a directory of config and safetensors, a DFlash2 drafter.
-std::string drafter_kind(const std::string& path) { return lower(path).ends_with(".gguf") ? "mtp" : "dflash2"; }
+// What kind of drafter a file or directory given beside a model holds: a GGUF holds a DFlash2 drafter or MTP layer;
+// a .flyx file or a directory of config and safetensors holds a DFlash2 drafter.
+std::string drafter_kind(const std::string& path) {
+  const std::string lp = lower(path);
+  if (lp.ends_with(".gguf")) return lp.find("dflash") != std::string::npos ? "dflash2" : "mtp";
+  return "dflash2";
+}
 
 }  // namespace
 
@@ -255,12 +260,12 @@ bool fetch_model(const std::string& model, const std::vector<std::string>& draft
          bytes_on_disk(path)});
   }
   if (want_vision && !mmproj.empty()) {
-    if (!exists_on_disk(mmproj)) return *err = mmproj + ": no such vision projector file", false;
-    out->mmproj = mmproj;
-    out->mmproj_source = mmproj;
-    std::error_code ec;
-    const auto sz = fs::file_size(to_path(mmproj), ec);
-    if (!ec) out->mmproj_size = uint64_t(sz);
+    hub::Repo mrepo;
+    std::string mpath;
+    if (!one(mmproj, progress, stop, &mpath, &mrepo, err)) return false;
+    out->mmproj = mpath;
+    out->mmproj_source = mrepo.id.empty() ? mpath : mmproj;
+    out->mmproj_size = bytes_on_disk(mpath);
   }
   if (repo.id.empty()) return true;  // a path: nothing more to know
   if (want_vision && out->mmproj.empty()) {
@@ -274,8 +279,11 @@ bool fetch_model(const std::string& model, const std::vector<std::string>& draft
     }
   }
   // unsloth keeps the MTP layer of GGUFs made without it in MTP/.
+  bool has_mtp_drafter = false;
+  for (const auto& ds : out->drafter_sources)
+    if (ds.kind == "mtp") has_mtp_drafter = true;
   const hub::RepoFile* mtp = hub::mtp_file(repo);
-  if (want_mtp && mtp && own_mtp == 0) {
+  if (want_mtp && mtp && own_mtp == 0 && !has_mtp_drafter) {
     std::vector<std::string> paths;
     if (!hub::fetch(repo, {*mtp}, &paths, progress, stop, err)) return false;
     out->drafters.push_back(paths[0]);

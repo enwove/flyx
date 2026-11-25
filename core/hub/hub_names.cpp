@@ -56,6 +56,39 @@ std::string url_path(const std::string& p) {
   return out;
 }
 
+std::string url_query(const std::string& s) {
+  static const char* hex = "0123456789ABCDEF";
+  std::string out;
+  for (unsigned char c : s) {
+    if (std::isalnum(c) || c == '-' || c == '_' || c == '.' || c == '~') out += char(c);
+    else out += '%', out += hex[c >> 4], out += hex[c & 15];
+  }
+  return out;
+}
+
+std::string url_decode(const std::string& s) {
+  auto hex_val = [](char c) -> int {
+    if (c >= '0' && c <= '9') return c - '0';
+    if (c >= 'a' && c <= 'f') return c - 'a' + 10;
+    if (c >= 'A' && c <= 'F') return c - 'A' + 10;
+    return -1;
+  };
+  std::string out;
+  out.reserve(s.size());
+  for (size_t i = 0; i < s.size(); ++i) {
+    if (s[i] == '%' && i + 2 < s.size()) {
+      const int hi = hex_val(s[i + 1]), lo = hex_val(s[i + 2]);
+      if (hi >= 0 && lo >= 0) {
+        out += char((hi << 4) | lo);
+        i += 2;
+        continue;
+      }
+    }
+    out += s[i];
+  }
+  return out;
+}
+
 bool hex_id(const std::string& s) {
   return !s.empty() && std::all_of(s.begin(), s.end(), [](char c) { return std::isxdigit(static_cast<unsigned char>(c)); });
 }
@@ -151,11 +184,28 @@ std::string quant_label(const std::string& stem, const std::string& shared) {
 
 bool parse_name(const std::string& s, Name* out) {
   std::string t = s;
+  bool stripped = false;
   for (const std::string_view p : {"https://huggingface.co/", "http://huggingface.co/", "huggingface.co/",
                                    "https://hf.co/", "hf.co/", "hf://"}) {
     if (t.starts_with(p)) {
       t = t.substr(p.size());
+      stripped = true;
       break;
+    }
+  }
+  if (!stripped) {
+    const std::string ep = endpoint();
+    if (!ep.empty()) {
+      const std::string ep_slash = ep + "/";
+      if (t.starts_with(ep_slash)) {
+        t = t.substr(ep_slash.size());
+      } else {
+        const size_t sep = ep.find("://");
+        if (sep != std::string::npos) {
+          const std::string host_slash = ep.substr(sep + 3) + "/";
+          if (t.starts_with(host_slash)) t = t.substr(host_slash.size());
+        }
+      }
     }
   }
   Name n;
@@ -197,12 +247,18 @@ bool mmproj_gguf_name(const std::string& path) {
   return false;
 }
 
+bool mtp_gguf_name(const std::string& path) {
+  const std::string p = detail::lower(path), base = detail::base_name(p);
+  if (!base.ends_with(".gguf") || base.find("imatrix") != std::string::npos) return false;
+  return base.starts_with("mtp-") || p.starts_with("mtp/") || p.find("/mtp/") != std::string::npos;
+}
+
 bool model_gguf_name(const std::string& path) {
   const std::string p = detail::lower(path), base = detail::base_name(p);
-  if (!base.ends_with(".gguf") || mmproj_gguf_name(path) ||
-      base.find("imatrix") != std::string::npos || base.starts_with("mtp-"))
+  if (!base.ends_with(".gguf") || mmproj_gguf_name(path) || mtp_gguf_name(path) ||
+      base.find("imatrix") != std::string::npos)
     return false;
-  return !p.starts_with("mtp/") && p.find("/mtp/") == std::string::npos;
+  return true;
 }
 
 bool parse_split_gguf_name(const std::string& path, SplitGguf* out) { return parse_split(path, out); }
@@ -274,6 +330,8 @@ std::vector<GgufChoice> gguf_choices(const Repo& r) {
 const RepoFile* mtp_file(const Repo& r) {
   for (const RepoFile& f : r.files)
     if (f.path.starts_with("MTP/") && detail::lower(f.path).ends_with(".gguf")) return &f;
+  for (const RepoFile& f : r.files)
+    if (mtp_gguf_name(f.path)) return &f;
   return nullptr;
 }
 
@@ -298,6 +356,25 @@ const RepoFile* mmproj_file(const Repo& r) {
     }
   }
   return best;
+}
+
+std::vector<CompanionFile> companion_files(const Repo& r) {
+  const RepoFile* def_mtp = mtp_file(r);
+  const RepoFile* def_mm = mmproj_file(r);
+  std::vector<CompanionFile> out;
+  for (const RepoFile& f : r.files) {
+    if (mtp_gguf_name(f.path))
+      out.push_back({f, "mtp", def_mtp && def_mtp->path == f.path});
+    else if (mmproj_gguf_name(f.path))
+      out.push_back({f, "mmproj", def_mm && def_mm->path == f.path});
+  }
+  auto order = [](const std::string& k) { return k == "mmproj" ? 1 : 0; };
+  std::sort(out.begin(), out.end(), [&](const CompanionFile& a, const CompanionFile& b) {
+    if (order(a.kind) != order(b.kind)) return order(a.kind) < order(b.kind);
+    if (a.is_default != b.is_default) return a.is_default > b.is_default;
+    return a.file.path < b.file.path;
+  });
+  return out;
 }
 
 bool select(const Repo& r, const Name& name, std::vector<RepoFile>* files, std::string* err) {
@@ -325,7 +402,39 @@ bool select(const Repo& r, const Name& name, std::vector<RepoFile>* files, std::
             (!pick || c.quant.size() < pick->quant.size()))
           pick = &c;
       }
-    if (!pick) return *err = r.id + " has no GGUF file for \"" + name.quant + "\"; it has:" + listing(), false;
+    if (!pick) {
+      // Also allow naming a companion file in the repository directly (e.g. org/repo:mmproj-BF16.gguf).
+      const std::vector<CompanionFile> comps = companion_files(r);
+      const CompanionFile* comp = nullptr;
+      for (const CompanionFile& c : comps)
+        if (detail::lower(c.file.path) == want) comp = &c;
+      if (!comp)
+        for (const CompanionFile& c : comps)
+          if (detail::lower(detail::base_name(c.file.path)) == want) {
+            comp = &c;
+            break;
+          }
+      if (comp) {
+        *files = {comp->file};
+        return true;
+      }
+      if (want.ends_with(".gguf")) {
+        const RepoFile* direct = nullptr;
+        for (const RepoFile& f : r.files)
+          if (detail::lower(f.path) == want) direct = &f;
+        if (!direct)
+          for (const RepoFile& f : r.files)
+            if (detail::lower(detail::base_name(f.path)) == want) {
+              direct = &f;
+              break;
+            }
+        if (direct) {
+          *files = {*direct};
+          return true;
+        }
+      }
+      return *err = r.id + " has no GGUF file for \"" + name.quant + "\"; it has:" + listing(), false;
+    }
     if (pick->split && !pick->complete)
       return *err = r.id + ":" + pick->quant + " is an incomplete split GGUF (" + std::to_string(pick->parts.size()) +
                     " parts found)", false;

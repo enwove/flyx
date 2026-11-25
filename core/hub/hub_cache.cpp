@@ -5,6 +5,7 @@
 #include <algorithm>
 #include <cctype>
 #include <fstream>
+#include <mutex>
 
 #include "core/os/env.h"
 #include "core/os/os.h"
@@ -174,10 +175,97 @@ std::string cache_source() {
   return "default";
 }
 
+namespace {
+
+std::mutex& endpoint_mutex() {
+  static std::mutex mu;
+  return mu;
+}
+std::string& endpoint_override() {
+  static std::string ep;
+  return ep;
+}
+
+}  // namespace
+
+bool normalize_endpoint(const std::string& raw, std::string* normalized, std::string* err) {
+  size_t a = 0, b = raw.size();
+  while (a < b && std::isspace(static_cast<unsigned char>(raw[a]))) ++a;
+  while (b > a && std::isspace(static_cast<unsigned char>(raw[b - 1]))) --b;
+  std::string s = raw.substr(a, b - a);
+  if (s.empty()) {
+    if (normalized) normalized->clear();
+    return true;
+  }
+  for (unsigned char c : s) {
+    if (c <= 0x20 || c == 0x7f || c == '?' || c == '#' || c == '\\' || c == '@') {
+      if (err) *err = "endpoint: invalid URL character";
+      return false;
+    }
+  }
+  const size_t scheme_sep = s.find("://");
+  std::string scheme, rest;
+  if (scheme_sep != std::string::npos) {
+    scheme = detail::lower(s.substr(0, scheme_sep));
+    if (scheme != "https" && scheme != "http") {
+      if (err) *err = "endpoint: URL must use http:// or https://";
+      return false;
+    }
+    rest = s.substr(scheme_sep + 3);
+  } else {
+    if (s.find(':') != std::string::npos) {
+      // Allow host:port without scheme, reject other scheme-like prefixes (e.g. javascript:...).
+      const size_t colon = s.find(':');
+      const size_t slash = s.find('/');
+      if (slash == std::string::npos || colon < slash) {
+        const std::string port = s.substr(colon + 1, slash == std::string::npos ? std::string::npos : slash - colon - 1);
+        const bool numeric = !port.empty() && std::all_of(port.begin(), port.end(),
+                                                          [](unsigned char c) { return std::isdigit(c) != 0; });
+        if (!numeric) {
+          if (err) *err = "endpoint: URL must use http:// or https://";
+          return false;
+        }
+      }
+    }
+    scheme = "https";
+    rest = s;
+  }
+  while (!rest.empty() && rest.back() == '/') rest.pop_back();
+  const size_t slash = rest.find('/');
+  const std::string hostport = slash == std::string::npos ? rest : rest.substr(0, slash);
+  if (hostport.empty() || hostport.front() == '.' || hostport.front() == ':' || hostport.find("..") != std::string::npos) {
+    if (err) *err = "endpoint: missing or invalid host name";
+    return false;
+  }
+  if (normalized) *normalized = scheme + "://" + rest;
+  return true;
+}
+
+bool set_endpoint(const std::string& url, std::string* err) {
+  std::string norm;
+  if (!normalize_endpoint(url, &norm, err)) return false;
+  std::lock_guard<std::mutex> lock(endpoint_mutex());
+  endpoint_override() = std::move(norm);
+  return true;
+}
+
 std::string endpoint() {
+  {
+    std::lock_guard<std::mutex> lock(endpoint_mutex());
+    if (!endpoint_override().empty()) return endpoint_override();
+  }
   std::string e = os::getenv_str(env::kHfEndpoint, "https://huggingface.co");
   while (!e.empty() && e.back() == '/') e.pop_back();
-  return e;
+  return e.empty() ? "https://huggingface.co" : e;
+}
+
+std::string endpoint_source() {
+  {
+    std::lock_guard<std::mutex> lock(endpoint_mutex());
+    if (!endpoint_override().empty()) return "setting";
+  }
+  if (!os::getenv_str(env::kHfEndpoint).empty()) return env::kHfEndpoint;
+  return "default";
 }
 
 bool offline() { return os::env_bool(env::kHfHubOffline).value_or(false); }

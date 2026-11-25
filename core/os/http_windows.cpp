@@ -96,7 +96,8 @@ HttpClient::~HttpClient() {
   if (handle_) WinHttpCloseHandle(static_cast<HINTERNET>(handle_));
 }
 
-bool HttpClient::get(const HttpGet& req, const HttpBody& body, int* status, std::string* err, std::string* final_url) {
+bool HttpClient::get(const HttpGet& req, const HttpBody& body, int* status, std::string* err, std::string* final_url,
+                     std::string* link_header) {
   if (!handle_)  // the session keeps its connections alive between requests
     handle_ = WinHttpOpen(to_wide(http_user_agent()).c_str(), WINHTTP_ACCESS_TYPE_AUTOMATIC_PROXY,
                           WINHTTP_NO_PROXY_NAME, WINHTTP_NO_PROXY_BYPASS, 0);
@@ -146,6 +147,25 @@ bool HttpClient::get(const HttpGet& req, const HttpBody& body, int* status, std:
       location.resize(bytes / sizeof(wchar_t));
       url = follow(u, to_utf8(location));
       continue;
+    }
+    if (link_header) {
+      link_header->clear();
+      for (DWORD index = 0;;) {
+        DWORD next_index = index;
+        DWORD bytes = 0;
+        WinHttpQueryHeaders(request.h, WINHTTP_QUERY_CUSTOM, L"Link", nullptr, &bytes, &next_index);
+        if (GetLastError() != ERROR_INSUFFICIENT_BUFFER || bytes == 0) break;
+        std::wstring val(bytes / sizeof(wchar_t), L'\0');
+        next_index = index;
+        if (!WinHttpQueryHeaders(request.h, WINHTTP_QUERY_CUSTOM, L"Link", val.data(), &bytes, &next_index)) break;
+        val.resize(bytes / sizeof(wchar_t));
+        while (!val.empty() && val.back() == L'\0') val.pop_back();
+        if (!val.empty()) {
+          if (!link_header->empty()) *link_header += ", ";
+          *link_header += to_utf8(val);
+        }
+        index = next_index;
+      }
     }
     std::vector<char> buf(1 << 20);
     for (;;) {

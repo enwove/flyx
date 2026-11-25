@@ -11,17 +11,20 @@ bool http_get(const HttpGet& req, const HttpBody& body, int* status, std::string
   return once.get(req, body, status, err);
 }
 
-bool http_get_text(const HttpGet& req, std::string* out, int* status, std::string* err, size_t limit) {
+bool http_get_text(const HttpGet& req, std::string* out, int* status, std::string* err, size_t limit,
+                   std::string* link_header) {
   out->clear();
+  if (link_header) link_header->clear();
   bool too_long = false;
-  const bool ok = http_get(
+  HttpClient once;
+  const bool ok = once.get(
       req,
       [&](int, const char* data, size_t n) {
         if (out->size() + n > limit) return !(too_long = true);
         out->append(data, n);
         return true;
       },
-      status, err);
+      status, err, nullptr, link_header);
   if (too_long) *err = req.url + ": an answer longer than " + std::to_string(limit) + " bytes";
   return ok;
 }

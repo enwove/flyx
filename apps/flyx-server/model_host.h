@@ -59,9 +59,11 @@ class ModelHost {
   // switch failed (fallback), and what the settings file remembers.
   ojson status() const;
 
-  // The settings file: the last model loaded, as it was named.
+  // The settings file: the last model loaded, as it was named, and optional Hub endpoint override.
   static std::string settings_path();
   static bool remembered(Want* w, const EngineOptions& base);
+  static std::string remembered_hub_endpoint();
+  static bool save_hub_endpoint(const std::string& endpoint, std::string* err = nullptr);
 
  private:
   struct BusyGuard {

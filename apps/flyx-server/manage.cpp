@@ -6,8 +6,12 @@
 //                         "drafter": "mtp|dflash2|dv|all|none", "speculative": BOOL, "kv": "fp8|16", "name": ID}
 //                         -> 202 and the state; 409 while one loads
 //   DELETE /v1/load       stops a fetch under way (what came stays for the next try)
-//   GET /v1/hub/search?q=TEXT&sort=trending|downloads|likes|updated|created&limit=N   the Hub's repositories with
-//                         GGUF files, by name; without q, those of the family this build runs (kHubFamily)
+//   GET /v1/hub/config    current Hugging Face Hub endpoint, default endpoint, source ("setting", "HF_ENDPOINT",
+//                         "default"), and offline flag
+//   POST /v1/hub/config   {"endpoint": URL or ""} sets or resets the Hub endpoint (persisted to serve.json)
+//   GET /v1/hub/search?q=TEXT&sort=trending|downloads|likes|updated|created&limit=N&cursor=C&arch=A   the Hub's
+//                         repositories with GGUF files; without q, filtered to the architectures this build runs
+//                         (optionally narrowed to arch=A), paginated via next_cursor
 //   GET /v1/hub/files?repo=ORG/NAME   a repository's models: its GGUFs by quantization with their sizes (and which
 //                         are in the cache already), its MTP file, the DFlash2 drafters known for it, what the Hub
 //                         says of it (downloads, license, its GGUFs' architecture) and whether this build runs that
@@ -263,12 +267,35 @@ bool in_use(const std::string& file, const std::vector<std::string>& used) {
 
 ojson repo_json(const hub::Repo& r) {
   const std::string snap = hub::snapshot_dir(r) + "/";
+  const bool dflash_gguf_repo = r.info.gguf_architecture == "dflash";
   ojson ggufs = ojson::array();
-  for (const hub::GgufChoice& c : hub::gguf_choices(r)) {
-    bool cached = c.complete;
-    for (const hub::RepoFile& p : c.parts) cached = cached && on_disk(snap + p.path);
-    ggufs.push_back({{"name", r.id + ":" + c.quant}, {"quant", c.quant}, {"size", c.total_size}, {"split", c.split},
-                     {"parts", int(c.parts.size())}, {"complete", c.complete}, {"cached", cached}});
+  ojson companions = ojson::array();
+  std::set<std::string> comp_paths;
+  auto push_comp = [&](const hub::RepoFile& f, const std::string& kind, bool is_default) {
+    if (!comp_paths.insert(f.path).second) return;
+    const std::string base = f.path.substr(f.path.rfind('/') + 1);
+    const bool cached = on_disk(snap + f.path);
+    const std::string disk = from_path((to_path(hub::snapshot_dir(r)) / to_path(f.path)).make_preferred());
+    companions.push_back({{"name", r.id + ":" + base},
+                          {"path", f.path},
+                          {"file", base},
+                          {"kind", kind},
+                          {"size", f.size},
+                          {"cached", cached},
+                          {"disk", cached ? ojson(disk) : ojson(nullptr)},
+                          {"default", is_default}});
+  };
+  const std::vector<hub::GgufChoice> choices = hub::gguf_choices(r);
+  if (dflash_gguf_repo) {
+    for (size_t idx = 0; idx < choices.size(); ++idx)
+      if (!choices[idx].split) push_comp(choices[idx].file, "dflash2", idx == 0);
+  } else {
+    for (const hub::GgufChoice& c : choices) {
+      bool cached = c.complete;
+      for (const hub::RepoFile& p : c.parts) cached = cached && on_disk(snap + p.path);
+      ggufs.push_back({{"name", r.id + ":" + c.quant}, {"quant", c.quant}, {"size", c.total_size}, {"split", c.split},
+                       {"parts", int(c.parts.size())}, {"complete", c.complete}, {"cached", cached}});
+    }
   }
   ojson mtp = nullptr;
   if (const hub::RepoFile* f = hub::mtp_file(r))
@@ -276,6 +303,7 @@ ojson repo_json(const hub::Repo& r) {
   ojson mmproj = nullptr;
   if (const hub::RepoFile* f = hub::mmproj_file(r))
     mmproj = {{"path", f->path}, {"size", f->size}, {"cached", on_disk(snap + f->path)}};
+  for (const hub::CompanionFile& c : hub::companion_files(r)) push_comp(c.file, c.kind, c.is_default);
   // A DFlash2 drafter's directory: config.json naming the architecture, and safetensors; no GGUF.
   uint64_t weights = 0;
   bool config = false;
@@ -288,9 +316,11 @@ ojson repo_json(const hub::Repo& r) {
   // What the Hub says of it; and, where it named the GGUFs' architecture, whether this build opens that one.
   const hub::RepoInfo& i = r.info;
   const std::vector<std::string> known = interfaces::model_architectures();
-  const ojson runs = i.gguf_architecture.empty()
-                         ? ojson(nullptr)
-                         : ojson(std::find(known.begin(), known.end(), i.gguf_architecture) != known.end());
+  const ojson runs = dflash_gguf_repo
+                         ? ojson(true)
+                         : i.gguf_architecture.empty()
+                               ? ojson(nullptr)
+                               : ojson(std::find(known.begin(), known.end(), i.gguf_architecture) != known.end());
   const ojson info = {{"downloads", i.downloads}, {"likes", i.likes}, {"updated", or_null(i.updated)},
                       {"license", or_null(i.license)}, {"pipeline", or_null(i.pipeline)}, {"gated", i.gated},
                       {"architecture", or_null(i.gguf_architecture)},
@@ -303,12 +333,15 @@ ojson repo_json(const hub::Repo& r) {
           {"ggufs", ggufs},
           {"mtp", mtp},
           {"mmproj", mmproj},
+          {"companions", companions},
           {"drafter", ggufs.empty() && config && weights > 0 && hub::is_drafter(r) ? ojson({{"size", weights}}) : ojson(nullptr)},
+          {"drafter_repo", dflash_gguf_repo},
           {"architectures", r.architectures},
           {"known_drafters", apps::known_drafters(r.base_models)},
           {"info", r.from_cache ? ojson(nullptr) : info},
           {"runs", runs},
-          {"build_architectures", known}};
+          {"build_architectures", known},
+          {"endpoint", hub::endpoint()}};
 }
 
 }  // namespace
@@ -333,6 +366,38 @@ void add_manage_routes(httplib::Server& http, Server* s) {
     s->host->cancel();
     send_json(r, 200, s->host->status());
   });
+  auto hub_config_json = []() -> ojson {
+    return {{"endpoint", hub::endpoint()},
+            {"default_endpoint", "https://huggingface.co"},
+            {"source", hub::endpoint_source()},
+            {"offline", hub::offline()}};
+  };
+  http.Get("/v1/hub/config", [s, hub_config_json](const httplib::Request& q, httplib::Response& r) {
+    if (!require_manage(*s, q, r, "configuring Hugging Face")) return;
+    send_json(r, 200, hub_config_json());
+  });
+  http.Post("/v1/hub/config", [s, hub_config_json](const httplib::Request& q, httplib::Response& r) {
+    if (!require_manage(*s, q, r, "configuring Hugging Face")) return;
+    const ojson body = interfaces::parse_json(q.body);
+    if (!body.is_object()) return error(r, 400, "request body is not a JSON object", "invalid_request_error");
+    std::string raw;
+    if (body.contains("endpoint") && !body["endpoint"].is_null()) {
+      if (!body["endpoint"].is_string())
+        return error(r, 400, "\"endpoint\": a URL such as https://hf-mirror.com, or empty to reset", "invalid_request_error");
+      raw = body["endpoint"].get<std::string>();
+    }
+    std::string normalized, err;
+    if (!hub::normalize_endpoint(raw, &normalized, &err)) return error(r, 400, err, "invalid_request_error");
+    // Clear the saved override when emptied, or when explicitly set back to huggingface.co with no HF_ENDPOINT env.
+    const std::string saved =
+        normalized.empty() || (normalized == "https://huggingface.co" && os::getenv_str(env::kHfEndpoint).empty())
+            ? std::string()
+            : normalized;
+    if (!hub::set_endpoint(saved, &err)) return error(r, 400, err, "invalid_request_error");
+    if (!ModelHost::save_hub_endpoint(saved, &err)) return error(r, 500, err, "server_error");
+    std::fprintf(stderr, "flyx-server: Hugging Face endpoint set to %s\n", hub::endpoint().c_str());
+    send_json(r, 200, hub_config_json());
+  });
   http.Get("/v1/hub/files", [s](const httplib::Request& q, httplib::Response& r) {
     if (!require_manage(*s, q, r, "loading models")) return;
     hub::Name name;
@@ -345,21 +410,123 @@ void add_manage_routes(httplib::Server& http, Server* s) {
   });
   http.Get("/v1/hub/search", [s](const httplib::Request& q, httplib::Response& r) {
     if (!require_manage(*s, q, r, "loading models")) return;
-    // Without a name asked for, the family this build runs: most of the Hub's GGUFs are of architectures it does not.
     const std::string asked = q.get_param_value("q");
-    const std::string query = asked.empty() ? apps::kHubFamily : asked;
+    const std::string sort = q.get_param_value("sort");
+    const std::string cursor = q.get_param_value("cursor");
+    const std::string arch_filter = q.get_param_value("arch");
+    const int limit = query_int(q, "limit", 20, 1, 100);
+    const std::vector<std::string> known = interfaces::model_architectures();
     std::vector<hub::Found> found;
-    std::string err;
-    if (!hub::search(query, q.get_param_value("sort"), query_int(q, "limit", 40, 1, 100), &found, &err))
-      return error(r, 502, err, "hub_error");
+    std::string next_cursor, err;
+    if (!asked.empty()) {
+      if (!hub::search(asked, sort, limit, &found, &err, cursor, &next_cursor, /*gguf_only=*/true))
+        return error(r, 502, err, "hub_error");
+      if (cursor.empty()) {
+        std::set<std::string> seen_ids;
+        for (const auto& f : found) seen_ids.insert(f.id);
+        std::string low = asked;
+        for (char& c : low) c = char(std::tolower(static_cast<unsigned char>(c)));
+        const bool drafter_query = low.find("dflash") != std::string::npos ||
+                                   low.find("drafter") != std::string::npos || low.find("mtp") != std::string::npos;
+        // Include safetensors DFlash2 drafter repos (which filter=gguf omits) when searching drafters or when no GGUF matches.
+        if (found.empty() || drafter_query) {
+          std::vector<hub::Found> extra;
+          std::string e2;
+          if (hub::search(asked, sort, limit, &extra, &e2, "", nullptr, /*gguf_only=*/false)) {
+            for (auto& x : extra) {
+              if (x.is_drafter && seen_ids.insert(x.id).second) found.push_back(std::move(x));
+            }
+          }
+        }
+        // If the query names an exact repository (org/name), look it up directly so safetensors drafters or newly
+        // published repos are always found even when Hub search omits them.
+        hub::Name exact;
+        if (hub::parse_name(asked, &exact) && seen_ids.insert(exact.repo).second) {
+          hub::Repo repo;
+          std::string e2;
+          if (hub::describe(exact.repo, exact.revision, &repo, &e2)) {
+            hub::Found f;
+            f.id = repo.id;
+            f.downloads = repo.info.downloads;
+            f.likes = repo.info.likes;
+            f.updated = repo.info.updated;
+            f.pipeline = repo.info.pipeline;
+            f.architecture = repo.info.gguf_architecture;
+            f.gated = repo.info.gated;
+            f.is_drafter = hub::is_drafter(repo) || repo.info.gguf_architecture == "dflash";
+            found.insert(found.begin(), std::move(f));
+          }
+        }
+      }
+    } else {
+      // Without a query, browse GGUF repositories of every architecture this build runs (or one chosen via `arch`),
+      // resuming cleanly across HF batches with a "<skip>:<hf_cursor>" cursor so nothing is skipped or duplicated.
+      std::set<std::string> allow;
+      if (!arch_filter.empty() && std::find(known.begin(), known.end(), arch_filter) != known.end())
+        allow.insert(arch_filter);
+      else
+        allow.insert(known.begin(), known.end());
+      size_t skip = 0;
+      std::string hf_cursor;
+      if (!cursor.empty()) {
+        const size_t colon = cursor.find(':');
+        if (colon != std::string::npos) {
+          try {
+            skip = std::stoull(cursor.substr(0, colon));
+          } catch (const std::exception&) {
+            skip = 0;
+          }
+          hf_cursor = cursor.substr(colon + 1);
+        } else {
+          hf_cursor = cursor;
+        }
+      }
+      constexpr int kMaxBatches = 4;
+      for (int step = 0; step < kMaxBatches && int(found.size()) < limit; ++step) {
+        const std::string batch_start = hf_cursor;
+        std::vector<hub::Found> batch;
+        std::string batch_next;
+        if (!hub::search("", sort, 100, &batch, &err, batch_start, &batch_next)) {
+          if (found.empty()) return error(r, 502, err, "hub_error");
+          break;
+        }
+        std::vector<hub::Found> matched;
+        for (auto& f : batch)
+          if (allow.count(f.architecture) > 0) matched.push_back(std::move(f));
+        size_t i = skip;
+        for (; i < matched.size() && int(found.size()) < limit; ++i) found.push_back(std::move(matched[i]));
+        if (int(found.size()) >= limit) {
+          if (i < matched.size()) next_cursor = std::to_string(i) + ":" + batch_start;
+          else if (!batch_next.empty()) next_cursor = "0:" + batch_next;
+          break;
+        }
+        skip = 0;
+        hf_cursor = batch_next;
+        if (hf_cursor.empty()) break;
+        if (step + 1 == kMaxBatches) next_cursor = "0:" + hf_cursor;
+      }
+    }
     std::set<std::string> here;  // repositories with a snapshot in the cache
     for (const hub::Cached& c : hub::cached()) here.insert(c.repo);
+    const std::set<std::string> known_set(known.begin(), known.end());
     ojson models = ojson::array();
-    for (const hub::Found& f : found)
+    for (const hub::Found& f : found) {
+      const bool drafter = f.is_drafter || f.architecture == "dflash";
+      const ojson runs = drafter ? ojson(true)
+                                 : f.architecture.empty() ? ojson(nullptr) : ojson(known_set.count(f.architecture) > 0);
       models.push_back({{"id", f.id}, {"downloads", f.downloads}, {"likes", f.likes}, {"updated", or_null(f.updated)},
                         {"created", or_null(f.created)}, {"pipeline", or_null(f.pipeline)}, {"gated", f.gated},
-                        {"cached", here.count(f.id) > 0}});
-    send_json(r, 200, {{"query", query}, {"family", asked.empty()}, {"endpoint", hub::endpoint()}, {"models", models}});
+                        {"cached", here.count(f.id) > 0}, {"architecture", or_null(f.architecture)}, {"runs", runs},
+                        {"drafter", drafter}});
+    }
+    send_json(r, 200,
+              {{"query", asked},
+               {"family", asked.empty()},
+               {"architectures", known},
+               {"arch", or_null(arch_filter)},
+               {"endpoint", hub::endpoint()},
+               {"next_cursor", or_null(next_cursor)},
+               {"models", models}});
   });
   http.Get("/v1/hub/dir", [s](const httplib::Request& q, httplib::Response& r) {
     if (!require_manage(*s, q, r, "loading models")) return;

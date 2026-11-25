@@ -63,12 +63,16 @@ struct Found {
   uint64_t downloads = 0, likes = 0;
   std::string updated, created;  // ISO 8601
   std::string pipeline;
+  std::string architecture;      // GGUF general.architecture from expand[]=gguf, empty when absent
   bool gated = false;
+  bool is_drafter = false;       // DFlash2 safetensors drafter or GGUF dflash drafter
 };
-// The Hub's repositories holding GGUF files whose names match `query` (every one when it is empty), at most `limit`,
-// ordered by `sort`: "trending", "downloads", "likes", "updated" or "created", the most first.  Only the Hub knows:
+// The Hub's repositories holding GGUF files (when `gguf_only` is true) whose names match `query` (every one when it is
+// empty), at most `limit`, ordered by `sort`: "trending", "downloads", "likes", "updated" or "created", the most first.
+// `cursor` resumes from a previous call's *next_cursor (from the Hub's Link rel="next" header).  Only the Hub knows:
 // false, with *err saying why, offline or when it cannot be reached.
-bool search(const std::string& query, const std::string& sort, int limit, std::vector<Found>* out, std::string* err);
+bool search(const std::string& query, const std::string& sort, int limit, std::vector<Found>* out, std::string* err,
+            const std::string& cursor = "", std::string* next_cursor = nullptr, bool gguf_only = true);
 
 // The GGUF files of a repository a model can be read from, each with the quantization its name carries ("UD-IQ3_XXS"
 // for Qwen3.8-27B-UD-IQ3_XXS.gguf).  Left out: projectors, importance matrices, files under MTP/; split models are
@@ -87,6 +91,15 @@ std::vector<GgufChoice> gguf_choices(const Repo& r);
 bool model_gguf_name(const std::string& path);
 // Whether a GGUF at `path` ('/' between directories) is a vision projector (mmproj) file by name/directory.
 bool mmproj_gguf_name(const std::string& path);
+// Whether a GGUF at `path` ('/' between directories) is an MTP drafter file by name/directory.
+bool mtp_gguf_name(const std::string& path);
+// A companion GGUF in a repository (vision projector or drafter) listed alongside its main models.
+struct CompanionFile {
+  RepoFile file;
+  std::string kind;      // "mmproj" or "mtp"
+  bool is_default = false;
+};
+std::vector<CompanionFile> companion_files(const Repo& r);
 // Parsed shard suffix of a split GGUF ("<prefix>-00001-of-00003.gguf").
 struct SplitGguf {
   std::string prefix;  // path before "-00001-of-00003.gguf"
@@ -146,7 +159,13 @@ bool remove_cached(const std::string& repo, const std::string& commit, const std
 
 std::string cache_dir();
 std::string cache_source();  // "HF_HUB_CACHE" | "HF_HOME" | "XDG_CACHE_HOME" | "default"
+// Normalizes and validates a Hub endpoint URL (e.g. "hf-mirror.com" -> "https://hf-mirror.com", trimming trailing
+// slashes). Empty input clears any override (falling back to HF_ENDPOINT or https://huggingface.co).
+bool normalize_endpoint(const std::string& raw, std::string* normalized, std::string* err);
+// Sets or clears a process-wide Hub endpoint override; empty restores HF_ENDPOINT / https://huggingface.co.
+bool set_endpoint(const std::string& url, std::string* err = nullptr);
 std::string endpoint();
+std::string endpoint_source();  // "setting" | "HF_ENDPOINT" | "default"
 bool offline();
 
 }  // namespace flyx::hub

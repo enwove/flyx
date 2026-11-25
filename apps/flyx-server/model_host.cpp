@@ -42,7 +42,12 @@ ojson want_json(const ModelHost::Want& w) {
           {"name", w.name}};
 }
 
-ojson read_settings() {
+std::mutex& settings_mutex() {
+  static std::mutex mu;
+  return mu;
+}
+
+ojson read_settings_locked() {
   std::ifstream f(to_path(ModelHost::settings_path()), std::ios::binary);
   if (!f) return nullptr;
   try {
@@ -50,6 +55,30 @@ ojson read_settings() {
   } catch (const std::exception&) {
     return nullptr;
   }
+}
+
+ojson read_settings() {
+  std::lock_guard<std::mutex> lock(settings_mutex());
+  return read_settings_locked();
+}
+
+bool write_settings_locked(const ojson& root, std::string* err) {
+  const fs::path p = to_path(ModelHost::settings_path());
+  if (p.empty()) return true;
+  std::error_code ec;
+  fs::create_directories(p.parent_path(), ec);
+  fs::path tmp = p;
+  tmp += "." + std::to_string(os::process_id()) + ".tmp";
+  std::ofstream f(tmp, std::ios::binary | std::ios::trunc);
+  f << root.dump(2) << "\n";
+  f.close();
+  if (f) fs::rename(tmp, p, ec);
+  if (!f || ec) {
+    fs::remove(tmp, ec);
+    if (err) *err = "could not save settings to " + ModelHost::settings_path();
+    return false;
+  }
+  return true;
 }
 
 // A model's requests end, and its memory comes back once the last of them lets go of it.
@@ -72,8 +101,6 @@ ojson drafters_json(const std::vector<apps::DrafterSource>& ds, const char* wher
 }
 
 void save_settings(const ModelHost::Want& w) {
-  const fs::path p = to_path(ModelHost::settings_path());
-  if (p.empty()) return;
   // A local model may be relaunched from another directory. Keep Hub names as requested
   // so their revision and quantization still go through the normal fetch path.
   auto remember_path = [](const std::string& spec) {
@@ -87,18 +114,13 @@ void save_settings(const ModelHost::Want& w) {
   last["model"] = remember_path(w.model);
   for (size_t i = 0; i < w.drafters.size(); ++i) last["drafters"][i] = remember_path(w.drafters[i]);
   if (!w.eo.mmproj_file.empty()) last["mmproj"] = remember_path(w.eo.mmproj_file);
-  std::error_code ec;
-  fs::create_directories(p.parent_path(), ec);
-  fs::path tmp = p;
-  tmp += "." + std::to_string(os::process_id()) + ".tmp";
-  std::ofstream f(tmp, std::ios::binary | std::ios::trunc);
-  f << ojson({{"last", std::move(last)}}).dump(2) << "\n";
-  f.close();
-  if (f) fs::rename(tmp, p, ec);
-  if (!f || ec) {
+  std::lock_guard<std::mutex> lock(settings_mutex());
+  ojson root = read_settings_locked();
+  if (!root.is_object()) root = ojson::object();
+  root["last"] = std::move(last);
+  std::string err;
+  if (!write_settings_locked(root, &err))
     std::fprintf(stderr, "flyx-server: could not save the last model to %s\n", ModelHost::settings_path().c_str());
-    fs::remove(tmp, ec);
-  }
 }
 
 }  // namespace
@@ -110,6 +132,7 @@ bool want_from_json(const ojson& j, const EngineOptions& base, ModelHost::Want* 
   out.model = j["model"].get<std::string>();
   out.eo = base;
   out.eo.drafter_files.clear();
+  out.eo.mmproj_file.clear();
   if (j.contains("drafters") && !j["drafters"].is_null()) {
     if (!j["drafters"].is_array()) return *err = "\"drafters\": a list of paths or Hub names", false;
     for (const auto& d : j["drafters"]) {
@@ -263,6 +286,22 @@ bool ModelHost::remembered(Want* w, const EngineOptions& base) {
   const ojson s = read_settings();
   std::string err;
   return s.is_object() && s.contains("last") && want_from_json(s["last"], base, w, &err);
+}
+
+std::string ModelHost::remembered_hub_endpoint() {
+  const ojson s = read_settings();
+  if (s.is_object() && s.contains("hub_endpoint") && s["hub_endpoint"].is_string())
+    return s["hub_endpoint"].get<std::string>();
+  return "";
+}
+
+bool ModelHost::save_hub_endpoint(const std::string& endpoint, std::string* err) {
+  std::lock_guard<std::mutex> lock(settings_mutex());
+  ojson root = read_settings_locked();
+  if (!root.is_object()) root = ojson::object();
+  if (endpoint.empty()) root.erase("hub_endpoint");
+  else root["hub_endpoint"] = endpoint;
+  return write_settings_locked(root, err);
 }
 
 ModelHost::~ModelHost() {

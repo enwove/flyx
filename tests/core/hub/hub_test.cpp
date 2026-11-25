@@ -112,6 +112,32 @@ void names() {
   for (const char* path : {"/home/me/model.gguf", "C:\\models\\x.gguf", "D:/models/x.gguf", "model.gguf", "a/b/c",
                            "../x", "org/..", "./x", "", "org/name:", "org/na me"})
     check(!flyx::hub::parse_name(path, &n), std::string("not a Hub name: \"") + path + "\"");
+  // Endpoint normalization, override, source reporting, and mirror URL parsing.
+  std::string norm, ep_err;
+  check(flyx::hub::normalize_endpoint("hf-mirror.com/", &norm, &ep_err) && norm == "https://hf-mirror.com",
+        "normalize_endpoint adds https:// and strips trailing slash");
+  check(flyx::hub::normalize_endpoint("http://127.0.0.1:8080/hf/", &norm, &ep_err) &&
+            norm == "http://127.0.0.1:8080/hf",
+        "normalize_endpoint keeps explicit http:// and path prefix");
+  check(flyx::hub::normalize_endpoint("http://[::1]:8080/", &norm, &ep_err) && norm == "http://[::1]:8080",
+        "normalize_endpoint keeps IPv6 literal host");
+  check(flyx::hub::normalize_endpoint("   ", &norm, &ep_err) && norm.empty(),
+        "normalize_endpoint treats blank as reset");
+  for (const char* bad : {"ftp://hf-mirror.com", "javascript:alert(1)", "https://hf-mirror.com?a=1",
+                          "https://hf-mirror.com#x", "https://user@hf-mirror.com", "https://", "https://bad host"})
+    check(!flyx::hub::normalize_endpoint(bad, &norm, &ep_err),
+          std::string("normalize_endpoint rejects invalid URL: ") + bad);
+  check(flyx::hub::set_endpoint("hf-mirror.com", &ep_err) && flyx::hub::endpoint() == "https://hf-mirror.com" &&
+            flyx::hub::endpoint_source() == "setting",
+        "set_endpoint overrides endpoint() and reports source=setting");
+  check(flyx::hub::parse_name("https://hf-mirror.com/org/model-GGUF:Q4_K_M", &n) && n.repo == "org/model-GGUF" &&
+            n.quant == "Q4_K_M",
+        "parse_name strips configured custom mirror URL");
+  check(flyx::hub::parse_name("hf-mirror.com/org/model-GGUF:Q8_0", &n) && n.repo == "org/model-GGUF" &&
+            n.quant == "Q8_0",
+        "parse_name strips configured custom mirror host without scheme");
+  check(flyx::hub::set_endpoint("", &ep_err) && flyx::hub::endpoint_source() != "setting",
+        "set_endpoint(\"\") clears custom override");
 }
 
 flyx::hub::RepoFile file(const std::string& path, uint64_t size, const std::string& sha256 = "ab") {
@@ -164,6 +190,26 @@ void choices() {
   check(!flyx::hub::select(r, n, &files, &err) && err.find("several") != std::string::npos, "no quantization named: which?");
   check(flyx::hub::mtp_file(r) && flyx::hub::mtp_file(r)->path == "MTP/mtp-Qwen3.8-27B-Q4_0.gguf", "the MTP file");
   check(flyx::hub::mmproj_file(r) && flyx::hub::mmproj_file(r)->path == "mmproj-F16.gguf", "the mmproj file");
+  {
+    const auto comps = flyx::hub::companion_files(r);
+    check(comps.size() == 2 && comps[0].kind == "mtp" && comps[0].is_default &&
+              comps[0].file.path == "MTP/mtp-Qwen3.8-27B-Q4_0.gguf" && comps[1].kind == "mmproj" &&
+              comps[1].is_default && comps[1].file.path == "mmproj-F16.gguf",
+          "companion_files lists MTP and mmproj with default flags");
+    check(flyx::hub::select(r, {r.id, "mmproj-F16.gguf"}, &files, &err) && files.size() == 1 &&
+              files[0].path == "mmproj-F16.gguf",
+          "select resolves repo:mmproj-F16.gguf companion directly");
+    check(flyx::hub::select(r, {r.id, "mtp-Qwen3.8-27B-Q4_0.gguf"}, &files, &err) && files.size() == 1 &&
+              files[0].path == "MTP/mtp-Qwen3.8-27B-Q4_0.gguf",
+          "select resolves repo:mtp-*.gguf companion by basename");
+    flyx::hub::Repo df;
+    df.id = "org/model-DFlash2-GGUF";
+    df.info.gguf_architecture = "dflash";
+    df.files = {file("Model-DFlash2-Draft-BF16.gguf", 5)};
+    check(flyx::hub::select(df, {df.id, "Model-DFlash2-Draft-BF16.gguf"}, &files, &err) && files.size() == 1 &&
+              files[0].path == "Model-DFlash2-Draft-BF16.gguf",
+          "select resolves repo:file.gguf directly for dflash GGUF drafter repos");
+  }
   // mmproj_gguf_name edge cases (subfolders, imatrix, MTP, negative qualifiers) and precision ranking.
   check(flyx::hub::mmproj_gguf_name("mmproj-BF16.gguf") && flyx::hub::mmproj_gguf_name("mmproj/vision.gguf") &&
             flyx::hub::mmproj_gguf_name("qwen-mmproj-f16.gguf") &&
@@ -399,6 +445,37 @@ struct FakeHub {
                       "application/json");
     });
     http.Get(R"(/api/models/acme/none/revision/main)", [](const httplib::Request&, httplib::Response& res) { res.status = 404; });
+    http.Get("/api/models", [this](const httplib::Request& q, httplib::Response& res) {
+      const std::string cursor = q.get_param_value("cursor");
+      if (cursor.empty()) {
+        res.set_header("Link", "<http://127.0.0.1:" + std::to_string(port) +
+                                   "/api/models?filter=gguf&cursor=page%2F2%2Btok%3D%3D>; rel=\"next\"");
+        res.set_content(nlohmann::json::array({
+                            {{"id", "acme/Inkling-2-Mini-GGUF"},
+                             {"downloads", 9000},
+                             {"likes", 120},
+                             {"lastModified", "2026-11-20T00:00:00.000Z"},
+                             {"gguf", {{"architecture", "inkling2_loop"}}}},
+                            {{"id", "acme/Qwen3-27B-GGUF"},
+                             {"downloads", 8000},
+                             {"likes", 90},
+                             {"gguf", {{"architecture", "qwen35"}}}},
+                        })
+                            .dump(),
+                        "application/json");
+      } else if (cursor == "page/2+tok==") {
+        res.set_content(nlohmann::json::array({
+                            {{"id", "acme/Third-Model-GGUF"},
+                             {"downloads", 500},
+                             {"likes", 10},
+                             {"gguf", {{"architecture", "qwen3"}}}},
+                        })
+                            .dump(),
+                        "application/json");
+      } else {
+        res.status = 400;
+      }
+    });
     http.Get(R"(/acme/tiny-GGUF/resolve/([0-9a-f]+)/(.*))", [this](const httplib::Request& q, httplib::Response& res) {
       res.status = 302;  // to the storage, an address relative to this host as the Hub gives
       res.set_header("Location", "/storage/" + q.matches[2].str() + "?sig=" + std::to_string(++sig));
@@ -560,6 +637,18 @@ void fetching(const fs::path& tmp) {
   check(flyx::hub::describe("acme/nullable-GGUF", "main", &nullable, &err) && nullable.commit == hub.commit &&
             nullable.files.size() == 1 && nullable.files[0].path == "m-Q4_0.gguf" && nullable.files[0].size == 1234,
         "describe accepts null config/cardData/sibling fields: " + err);
+  {
+    std::vector<flyx::hub::Found> page1, page2;
+    std::string next1, next2;
+    const bool ok1 = flyx::hub::search("", "trending", 20, &page1, &err, "", &next1);
+    check(ok1 && page1.size() == 2 && page1[0].id == "acme/Inkling-2-Mini-GGUF" &&
+              page1[0].architecture == "inkling2_loop" && page1[1].architecture == "qwen35" && next1 == "page/2+tok==",
+          "search parses gguf.architecture and Link rel=next cursor: " + err);
+    const bool ok2 = flyx::hub::search("", "trending", 20, &page2, &err, next1, &next2);
+    check(ok2 && page2.size() == 1 && page2[0].id == "acme/Third-Model-GGUF" && page2[0].architecture == "qwen3" &&
+              next2.empty(),
+          "search round-trips percent-encoded cursor to page 2: " + err);
+  }
   {
     // Sum of missing file sizes overflowing uint64_t must saturate and be rejected by has_room() before any download.
     set_env("HF_HUB_CACHE", from_path(tmp / "overflow_room"));
