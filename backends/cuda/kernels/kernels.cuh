@@ -85,13 +85,14 @@ enum PosSel : int { kPosPosition = 0, kPosStart = 1 };
 enum AttnImpl : int { kAttnAuto = 0, kAttnSplit = 1, kAttnPerHead = 2 };
 // Configurations of the staged packed expert dp4a GEMMs, all with the same bits. C counts output columns per warp
 // (gate/up pairs when fused), U counts K/32 units in flight per lane. Explicit choices also specialize grouped tiles
-// of one row; the default picks one by block type and rows (grouped_gate_up_dp4a) or keeps the original tiles.
+// of one row; the default picks one by block type and rows (grouped_gate_up_dp4a) or keeps the original tiles, which
+// `original` takes everywhere (the control the default rule was measured against).
 enum MoeDp4a : int {
   kMoeDp4aDefault, kMoeDp4aC1U1, kMoeDp4aC1U2, kMoeDp4aC2U1, kMoeDp4aC2U2, kMoeDp4aC4U1, kMoeDp4aC4U2,
-  kMoeDp4aCount
+  kMoeDp4aOriginal, kMoeDp4aCount
 };
 inline const char* moe_dp4a_name(MoeDp4a variant) {
-  static constexpr const char* names[] = {"default", "1x1", "1x2", "2x1", "2x2", "4x1", "4x2"};
+  static constexpr const char* names[] = {"default", "1x1", "1x2", "2x1", "2x2", "4x1", "4x2", "original"};
   static_assert(sizeof(names) / sizeof(names[0]) == kMoeDp4aCount);
   return names[variant];
 }
