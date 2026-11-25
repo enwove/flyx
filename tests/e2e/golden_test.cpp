@@ -1366,6 +1366,27 @@ void strata_rounds(const std::string& model, const std::string& backend, const s
                     "strata");
     check(tokens(all.get()) == want, "strata with every pair refined: the reference's tokens");
   }
+  {  // Rounds whose rows pass 128 and 256 keys.  A row whose keys fill one split more than the row's before it has
+     // shorter splits (attn_split_range: 128 keys are [0, 128); 129 are [0, 96) and [96, 129)), so in such a round the
+     // last row is not the one whose first split ends last, and every row still reads all of its own keys: drafted
+     // rounds give plain decoding's tokens.  The prompt repeated to 100 tokens, 180 decoded after it.
+    std::vector<int32_t> longer;
+    while (longer.size() < 100) longer.push_back(prompt[longer.size() % prompt.size()]);
+    const int more = 180;
+    auto across = [&](Engine* e) {
+      Session s(e);
+      if (!s.init(&err)) return std::vector<int32_t>{-1};
+      return gen(s, longer, more).tokens;
+    };
+    for (const char* method : {"strata", "strata:3"}) {
+      auto plain = make(model, backend, false, "", true, narrow, false, 512, kReferenceWidth, false, -1, method);
+      auto spec = make(model, backend, true, "dflash2", true, narrow, false, 512, kReferenceWidth, false, -1, method);
+      auto mtp = make(model, backend, true, "mtp", true, narrow, false, 512, kReferenceWidth, false, -1, method);
+      const auto t = across(plain.get());
+      check(t.size() == size_t(more) && across(spec.get()) == t && across(mtp.get()) == t,
+            std::string(method) + ": rounds across 128 and 256 keys: DFlash2 and MTP decode == plain decode");
+    }
+  }
   {  // auto: exact rows below the switch, the copy's from it, in the middle of the reply here. Before
      // it, the exact reference's tokens; across it, drafted rounds (some about the switch, reading both) give plain
      // decoding's tokens, rounds in flight and rounds of one row alike.
