@@ -16,7 +16,9 @@ bool valid_repo(const std::string& r);
 bool valid_word(const std::string& w);
 // A repository's file path that stays inside a snapshot: '/' separated, no "..", nothing absolute.
 bool safe_path(const std::string& p);
-std::string url_path(const std::string& p);  // percent-encoded, '/' kept
+std::string url_path(const std::string& p);   // percent-encoded, '/' kept
+std::string url_query(const std::string& s);  // percent-encoded query parameter value
+std::string url_decode(const std::string& s);
 bool hex_id(const std::string& s);
 bool is_commit(const std::string& s);
 std::string base_name(const std::string& path);

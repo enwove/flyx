@@ -72,21 +72,52 @@ CATALOG = {"cache": CACHE, "cache_from": "default", "dirs": [FOLDER], "models": 
     dir_model(FOLDER, "Other-12B-Q5_K_M.gguf", int(8.9 * GB), quant="Q5_K_M"),
     dir_model(FOLDER, "mmproj-BF16.gguf", int(0.9 * GB), kind="mmproj"),
     {"name": "acme/Tiny-27B-DFlash2", "kind": "drafter", "source": "hub", "repo": "acme/Tiny-27B-DFlash2", "size": int(1.9 * GB)}]}
-FOUND = {"query": "Qwen3", "family": True, "endpoint": "https://huggingface.co", "models": [
+FOUND = {"query": "", "family": True, "architectures": ["qwen35", "qwen3", "inkling2_loop"], "arch": None,
+         "endpoint": "https://huggingface.co", "next_cursor": "page2-tok", "models": [
     {"id": REPO, "downloads": 7383193, "likes": 6300, "updated": "2026-11-12T02:15:52.000Z", "created": None, "pipeline": None,
-     "gated": False, "cached": True},
+     "gated": False, "cached": True, "architecture": "qwen35", "runs": True},
+    {"id": "acme/Inkling-2-Mini-GGUF", "downloads": 1900000, "likes": 1200, "updated": "2026-11-20T02:15:52.000Z", "created": None,
+     "pipeline": "text-generation", "gated": False, "cached": False, "architecture": "inkling2_loop", "runs": True},
     {"id": "acme/Other-9B-GGUF", "downloads": 1200, "likes": 14, "updated": "2026-02-20T02:15:52.000Z", "created": None,
-     "pipeline": "text-generation", "gated": True, "cached": False}]}
+     "pipeline": "text-generation", "gated": True, "cached": False, "architecture": "gemma4", "runs": False}]}
+FOUND_PAGE2 = {"query": "", "family": True, "architectures": ["qwen35", "qwen3", "inkling2_loop"], "arch": None,
+               "endpoint": "https://huggingface.co", "next_cursor": None, "models": [
+    {"id": "acme/Page2-Model-GGUF", "downloads": 500, "likes": 9, "updated": "2026-11-01T02:15:52.000Z", "created": None,
+     "pipeline": "text-generation", "gated": False, "cached": False, "architecture": "qwen3", "runs": True}]}
 
 
 def repository(repo):
-    """GET /v1/hub/files: REPO as this build runs it, any other of an architecture it does not."""
+    """GET /v1/hub/files: REPO as this build runs it, a dflash GGUF drafter repo, a safetensors drafter repo, or unsupported."""
+    if repo == "acme/Model-DFlash2-GGUF":
+        return {"repo": repo, "from_cache": False, "drafter": None, "drafter_repo": True, "base_models": ["acme/Tiny-27B"],
+                "runs": True, "known_drafters": [], "build_architectures": ["qwen35", "qwen3"],
+                "mtp": None, "mmproj": None, "ggufs": [],
+                "companions": [{"name": repo + ":Model-DFlash2-Draft-BF16.gguf", "path": "Model-DFlash2-Draft-BF16.gguf",
+                                "file": "Model-DFlash2-Draft-BF16.gguf", "kind": "dflash2",
+                                "size": int(0.5 * GB), "cached": False, "disk": None, "default": True}],
+                "info": {"downloads": 12, "likes": 1, "updated": "2026-11-24T02:15:52.000Z", "license": "apache-2.0",
+                         "pipeline": "text-generation", "gated": False, "architecture": "dflash",
+                         "context": 1048576, "parameters": 495000000}}
+    if repo == "acme/Model-DFlash2":
+        return {"repo": repo, "from_cache": False, "drafter": {"size": int(0.9 * GB)}, "drafter_repo": False,
+                "base_models": ["acme/Tiny-27B"], "runs": None, "known_drafters": [],
+                "build_architectures": ["qwen35", "qwen3"], "mtp": None, "mmproj": None, "ggufs": [], "companions": [],
+                "info": {"downloads": 500, "likes": 25, "updated": "2026-11-24T02:15:52.000Z", "license": "apache-2.0",
+                         "pipeline": None, "gated": False, "architecture": None, "context": None, "parameters": None}}
     runs = repo == REPO
     quants = [("IQ3_XXS", 11.8, True), ("Q4_K_M", 17.6, True), ("Q5_K_M", 19.4, False), ("Q6_K", 22.3, False), ("BF16", 54.7, False)]
     return {"repo": repo, "from_cache": False, "drafter": None, "base_models": ["acme/Tiny-27B"], "runs": runs,
             "known_drafters": ["acme/Tiny-27B-DFlash2"] if runs else [], "build_architectures": ["qwen35", "qwen3"],
             "mtp": {"path": "MTP/mtp.gguf", "size": int(0.6 * GB), "cached": True} if runs else None,
             "mmproj": {"path": "mmproj-BF16.gguf", "size": int(0.9 * GB), "cached": True} if runs else None,
+            "companions": [
+                {"name": repo + ":mtp.gguf", "path": "MTP/mtp.gguf", "file": "mtp.gguf", "kind": "mtp",
+                 "size": int(0.6 * GB), "cached": True, "disk": None, "default": True},
+                {"name": repo + ":mmproj-BF16.gguf", "path": "mmproj-BF16.gguf", "file": "mmproj-BF16.gguf", "kind": "mmproj",
+                 "size": int(0.9 * GB), "cached": True, "disk": None, "default": True},
+                {"name": repo + ":mmproj-F16.gguf", "path": "mmproj-F16.gguf", "file": "mmproj-F16.gguf", "kind": "mmproj",
+                 "size": int(0.9 * GB), "cached": False, "disk": None, "default": False},
+            ] if runs else [],
             "info": {"downloads": 7383193, "likes": 6300, "updated": "2026-11-12T02:15:52.000Z", "license": "apache-2.0", "pipeline": None,
                      "gated": False, "architecture": "qwen35" if runs else "gemma4", "context": 262144, "parameters": 27320697856},
             "ggufs": [{"name": repo + ":" + q, "quant": q, "size": int(s * GB), "split": False, "parts": 1, "complete": True, "cached": c and runs}
@@ -118,6 +149,10 @@ class Server:
         self.tm, self.dialog, self.posted, self.deleted, self.dialogs = tm, dialog, [], [], []
         self.gpu_apps = copy.deepcopy(gpu_apps) if gpu_apps is not None else None
         self.closed = []
+        self.hub_endpoint = "https://huggingface.co"
+        self.hub_source = "default"
+        self.hub_fail = False
+        self.hub_configs = []
         page.route("**/dashboard/**", lambda r: serve(r, ROOT / "apps/flyx-server/dashboard"))
         page.route("**/v1/**", self.answer)
 
@@ -163,10 +198,42 @@ class Server:
             return route.fulfill(json=self.tm)
         if "/v1/hub/cached" in url:
             return route.fulfill(json=CATALOG)
+        if "/v1/hub/config" in url:
+            if method == "POST":
+                body = route.request.post_data_json or {}
+                raw = (body.get("endpoint") or "").strip()
+                self.hub_configs.append(raw)
+                if raw.startswith("ftp://"):
+                    return route.fulfill(status=400, json={"error": {"message": "endpoint: URL must use http:// or https://"}})
+                if not raw or raw.rstrip("/") == "https://huggingface.co":
+                    self.hub_endpoint, self.hub_source = "https://huggingface.co", "default"
+                else:
+                    norm = raw if raw.startswith(("http://", "https://")) else "https://" + raw
+                    self.hub_endpoint, self.hub_source = norm.rstrip("/"), "setting"
+            return route.fulfill(json={"endpoint": self.hub_endpoint, "default_endpoint": "https://huggingface.co",
+                                       "source": self.hub_source, "offline": False})
         if "/v1/hub/search" in url:
-            return route.fulfill(json=FOUND)
+            if self.hub_fail:
+                return route.fulfill(status=502, json={"error": {"message": "cannot reach the Hub (timed out)"}})
+            cursor = query.get("cursor", [""])[0]
+            arch = query.get("arch", [""])[0]
+            q_text = query.get("q", [""])[0]
+            if cursor == "page2-tok":
+                res = copy.deepcopy(FOUND_PAGE2)
+                res["endpoint"] = self.hub_endpoint
+                return route.fulfill(json=res)
+            res = copy.deepcopy(FOUND)
+            res["endpoint"] = self.hub_endpoint
+            if q_text:
+                res["query"], res["family"], res["next_cursor"] = q_text, False, None
+            elif arch:
+                res["arch"], res["next_cursor"] = arch, None
+                res["models"] = [m for m in res["models"] if m.get("architecture") == arch]
+            return route.fulfill(json=res)
         if "/v1/hub/files" in url:
-            return route.fulfill(json=repository(query["repo"][0]))
+            res = repository(query["repo"][0])
+            res["endpoint"] = self.hub_endpoint
+            return route.fulfill(json=res)
         if "/v1/hub/dir" in url:
             path = query.get("path", [""])[0]
             return route.fulfill(json=FOLDERS[path]) if path in FOLDERS else route.fulfill(
@@ -193,10 +260,22 @@ def confirm(page, button, action):
 
 
 def check_settings(page, server, want):
-    """The model served: its settings as loaded, a change against them, what a reload posts."""
+    """The model served: its settings as loaded, a change against them, what a reload posts, and active-status dots."""
     expect(page.locator("#mv-current")).to_be_visible()
     expect(page.locator("#mv-state")).to_have_text("local")
     expect(page.locator("#ld-ctx")).to_be_hidden()  # the context it asked for: nothing to explain
+    # Model status card offers Reload model alongside Unload.
+    expect(page.locator("#ld-reload")).to_be_visible()
+    expect(page.locator("#ld-unload")).to_be_visible()
+    confirm(page, "#ld-reload", "Reload")
+    assert server.posted[-1] == want, server.posted[-1]
+    # When neither a drafter nor a vision projector is loaded, both tab indicator dots stay gray (not .on) and show none.
+    spec_tab = page.locator('#lset-tabs [data-stab="spec"]')
+    vis_tab = page.locator('#lset-tabs [data-stab="vision"]')
+    expect(spec_tab.locator(".dot")).not_to_have_class(re.compile(r"\bon\b"))
+    expect(vis_tab.locator(".dot")).not_to_have_class(re.compile(r"\bon\b"))
+    expect(spec_tab.locator(".sum")).to_have_text("none")
+    expect(vis_tab.locator(".sum")).to_have_text("none")
     field, cmd = page.locator("#mf-kvgpu"), page.locator("#mf-cmd")
     expect(field).to_have_value("0")
     expect(cmd).to_contain_text("--kv-gpu 0")
@@ -335,29 +414,181 @@ def check_vision(page, server, open_page, want):
     off_page, _ = open_page(telemetry(dict(want, vision=False, mmproj="./stale.gguf")))
     expect(off_page.locator("#mf-reload")).to_have_count(0)
     off_page.close()
+    # A model that actually loaded a drafter and vision encoder lights both tab dots green, and toggling off grays them.
+    tm_on = telemetry(dict(want, drafter="", drafters=[]))
+    tm_on["model"]["drafter"] = "mtp"
+    tm_on["model"]["max_width"] = 4
+    tm_on["model"]["vision"] = True
+    tm_on["load"]["vision_projector"] = {"from": "acme/Tiny-27B-GGUF/mmproj-BF16.gguf", "size": int(0.9 * GB)}
+    on_page, _ = open_page(tm_on)
+    # Active drafter and vision sources live in their settings tabs rather than inflating the Serving card.
+    expect(on_page.locator(".srv #ld-drafters")).to_have_count(0)
+    expect(on_page.locator(".srv #ld-vision-src")).to_have_count(0)
+    spec_dot = on_page.locator('#lset-tabs [data-stab="spec"] .dot')
+    vis_dot = on_page.locator('#lset-tabs [data-stab="vision"] .dot')
+    expect(spec_dot).to_have_class(re.compile(r"\bon\b"))
+    expect(vis_dot).to_have_class(re.compile(r"\bon\b"))
+    expect(on_page.locator('#lset-tabs [data-stab="spec"] .sum')).to_have_text("default")
+    expect(on_page.locator('#lset-tabs [data-stab="vision"] .sum')).to_have_text("disk · q8")
+    on_page.locator('#lset-tabs [data-stab="spec"]').click()
+    expect(on_page.locator("#lset-spec #ld-drafters")).to_be_visible()
+    expect(on_page.locator("#lset-spec #ld-drafters")).to_contain_text("MTP")
+    on_page.locator('#lset-tabs [data-stab="vision"]').click()
+    expect(on_page.locator("#lset-vision #ld-vision-src")).to_be_visible()
+    expect(on_page.locator("#lset-vision #ld-vision-src")).to_contain_text("mmproj-BF16.gguf")
+    on_page.locator("#vs-on").uncheck(force=True)
+    expect(vis_dot).not_to_have_class(re.compile(r"\bon\b"))
+    on_page.close()
 
 
 def check_hub(page, server, want):
-    """The library's Hugging Face side: repositories found, one shown with its files, a file loaded."""
+    """The library's Hugging Face side: supported architectures, filter pills, pagination, files, a file loaded."""
     view(page, "library")
-    expect(page.locator("#hf-list .prow")).to_have_count(2)
-    expect(page.locator("#hf-family")).to_contain_text("Qwen3")
+    expect(page.locator("#hf-list .prow")).to_have_count(3)
+    expect(page.locator("#hf-family")).to_have_count(0)
+    expect(page.locator("#hf-archs button")).to_have_count(4)
+    expect(page.locator("#hf-archs")).to_contain_text("qwen35")
+    expect(page.locator("#hf-archs")).to_contain_text("inkling2_loop")
+    expect(page.locator("#hf-pager")).to_be_visible()
+    expect(page.locator("#hf-prev")).to_be_disabled()
+    expect(page.locator("#hf-page")).to_have_text("Page 1")
+    expect(page.locator("#hf-next")).to_be_enabled()
+    # Pagination advances to Page 2 and returns to Page 1 cleanly.
+    page.locator("#hf-next").click()
+    expect(page.locator("#hf-page")).to_have_text("Page 2")
+    expect(page.locator("#hf-list .prow")).to_have_count(1)
+    expect(page.locator('#hf-list .prow[data-repo="acme/Page2-Model-GGUF"]')).to_have_count(1)
+    expect(page.locator("#hf-prev")).to_be_enabled()
+    expect(page.locator("#hf-next")).to_be_disabled()
+    page.locator("#hf-prev").click()
+    expect(page.locator("#hf-page")).to_have_text("Page 1")
+    expect(page.locator("#hf-list .prow")).to_have_count(3)
+    # Architecture filter pills narrow the list and reset back to All.
+    page.locator('#hf-archs button[data-arch="inkling2_loop"]').click()
+    expect(page.locator("#hf-list .prow")).to_have_count(1)
+    expect(page.locator('#hf-list .prow[data-repo="acme/Inkling-2-Mini-GGUF"]')).to_have_count(1)
+    page.locator('#hf-archs button[data-arch=""]').click()
+    expect(page.locator("#hf-list .prow")).to_have_count(3)
     expect(page.locator("#hf-name")).to_have_text("Tiny-27B-GGUF")  # the first repository found is shown
+    expect(page.locator("#hf-detail .dchips")).to_contain_text("+ Vision")
+    expect(page.locator("#hf-detail .dchips")).to_contain_text("+ MTP")
     expect(page.locator("#mf-files .mrow")).to_have_count(5)
-    expect(page.locator("#hf-mmproj")).to_contain_text("mmproj-BF16.gguf")
+    expect(page.locator("#hf-companions .mrow")).to_have_count(3)
+    expect(page.locator('#hf-companions .mrow[data-kind="mtp"] .cmain svg use')).to_have_attribute("href", "#i-bolt")
+    expect(page.locator('#hf-companions .mrow[data-kind="mmproj"]').first.locator(".cmain svg use")).to_have_attribute("href", "#i-image")
     expect(page.locator("#mf-load")).to_be_disabled()
+    # Selecting a companion in Hugging Face detail turns the bottom-right CTA into Use as projector / Draft with it.
+    page.locator('#hf-companions .mrow[data-comp$=":mmproj-F16.gguf"]').click()
+    expect(page.locator("#mf-load")).to_have_text("Use as projector")
+    page.locator("#mf-load").click()
+    expect(page.locator("#mv-current")).to_be_visible()
+    expect(page.locator("#vs-file")).to_have_value(REPO + ":mmproj-F16.gguf")
+    expect(page.locator("#vs-custom .tag2")).to_have_text("Hugging Face")
+    page.locator("#mf-reset").click()
+    view(page, "library")
+    page.locator('#hf-companions .mrow[data-comp$=":mtp.gguf"]').click()
+    expect(page.locator("#mf-load")).to_have_text("Draft with it")
+    page.locator("#mf-load").click()
+    expect(page.locator("#sd-file")).to_have_value(REPO + ":mtp.gguf")
+    page.locator("#mf-reset").click()
+    view(page, "library")
+    # Selecting one drafter + one vision projector simultaneously applies both in one click.
+    page.locator('#hf-companions .mrow[data-comp$=":mtp.gguf"]').click()
+    page.locator('#hf-companions .mrow[data-comp$=":mmproj-F16.gguf"]').click()
+    expect(page.locator('#hf-companions .mrow[data-comp$=":mtp.gguf"]')).to_have_attribute("aria-selected", "true")
+    expect(page.locator('#hf-companions .mrow[data-comp$=":mmproj-F16.gguf"]')).to_have_attribute("aria-selected", "true")
+    # Picking another mmproj swaps only the projector while keeping the drafter selected.
+    page.locator('#hf-companions .mrow[data-comp$=":mmproj-BF16.gguf"]').click()
+    expect(page.locator('#hf-companions .mrow[data-comp$=":mtp.gguf"]')).to_have_attribute("aria-selected", "true")
+    expect(page.locator('#hf-companions .mrow[data-comp$=":mmproj-F16.gguf"]')).to_have_attribute("aria-selected", "false")
+    expect(page.locator('#hf-companions .mrow[data-comp$=":mmproj-BF16.gguf"]')).to_have_attribute("aria-selected", "true")
+    expect(page.locator("#mf-load")).to_have_text("Use selected companions")
+    page.locator("#mf-load").click()
+    expect(page.locator("#mv-current")).to_be_visible()
+    expect(page.locator("#sd-file")).to_have_value(REPO + ":mtp.gguf")
+    page.locator('#lset-tabs [data-stab="vision"]').click()
+    expect(page.locator("#vs-file")).to_have_value(REPO + ":mmproj-BF16.gguf")
+    page.locator("#mf-reset").click()
+    view(page, "library")
+    # Picking a quantization together with 1 drafter + 1 mmproj loads all three in one POST /v1/load.
+    page.locator('#mf-files .mrow[data-name$=":Q5_K_M"]').click()
+    page.locator('#hf-companions .mrow[data-comp$=":mtp.gguf"]').click()
+    page.locator('#hf-companions .mrow[data-comp$=":mmproj-F16.gguf"]').click()
+    expect(page.locator("#mf-load")).to_have_text("Switch to this model")
+    expect(page.locator("#mf-chosen-s")).to_contain_text("20.3 GB to download first")
+    expect(page.locator("#mf-chosen-s")).to_contain_text("mtp.gguf")
+    expect(page.locator("#mf-chosen-s")).to_contain_text("mmproj-F16.gguf")
+    confirm(page, "#mf-load", "Switch")
+    body = server.posted[-1]
+    assert (body["model"], body["drafter"], body["drafters"], body["mmproj"]) == (
+        REPO + ":Q5_K_M", "mtp", [REPO + ":mtp.gguf"], REPO + ":mmproj-F16.gguf"), body
+    # Selecting a quantization alone posts with default companions and exact quantization size.
+    view(page, "library")
+    page.locator('#mf-files .mrow[data-name$=":Q5_K_M"]').click()  # deselect previous Q5_K_M
     page.locator('#mf-files .mrow[data-name$=":Q5_K_M"]').click()
     expect(page.locator("#mf-load")).to_have_text("Switch to this model")
     expect(page.locator("#mf-chosen-s")).to_contain_text("19.4 GB to download first")
     confirm(page, "#mf-load", "Switch")
     body = server.posted[-1]  # another model, with the settings of the one served
-    assert (body["model"], body["ctx"], body["kv"], body["kv_gpu"]) == (REPO + ":Q5_K_M", want["ctx"], want["kv"], want["kv_gpu"]), body
+    assert (body["model"], body["ctx"], body["kv"], body["kv_gpu"], body["drafters"], body["mmproj"]) == (
+        REPO + ":Q5_K_M", want["ctx"], want["kv"], want["kv_gpu"], [], None), body
+    # Hub mirror endpoint selector: validate bad URL, apply mirror, update links, and reset back to default.
+    view(page, "library")
+    expect(page.locator("#hf-ep-toggle")).to_contain_text("huggingface.co")
+    page.locator("#hf-ep-toggle").click()
+    expect(page.locator("#hf-epbar")).to_be_visible()
+    page.locator("#hf-ep-input").fill("ftp://bad.example")
+    page.locator("#hf-ep-save").click()
+    expect(page.locator("#hf-ep-msg")).to_contain_text("http:// or https://")
+    page.locator("#hf-ep-input").fill("hf-mirror.com")
+    page.locator("#hf-ep-save").click()
+    expect(page.locator("#hf-ep-toggle")).to_contain_text("hf-mirror.com")
+    expect(page.locator("#hf-ep-toggle")).to_have_class(re.compile(r"\bon\b"))
+    expect(page.locator('#hf-detail a[href^="https://hf-mirror.com/"]')).to_have_count(1)
+    page.locator("#hf-ep-reset").click()
+    expect(page.locator("#hf-ep-toggle")).to_contain_text("huggingface.co")
+    expect(page.locator("#hf-ep-toggle")).not_to_have_class(re.compile(r"\bon\b"))
+    expect(page.locator("#hf-list .prow")).to_have_count(3)
+    page.locator("#hf-ep-toggle").click()
+    expect(page.locator("#hf-epbar")).to_have_count(0)
+    # When the Hub cannot be reached, the list shows a Use a mirror shortcut that opens the mirror bar.
+    server.hub_fail = True
+    page.locator("#hf-sort").select_option("downloads")
+    expect(page.locator("#hf-msg")).to_contain_text("cannot reach the Hub")
+    expect(page.locator("#hf-ep-help")).to_be_visible()
+    page.locator("#hf-ep-help").click()
+    expect(page.locator("#hf-epbar")).to_be_visible()
+    server.hub_fail = False
+    page.locator('#hf-epbar .chip[data-ep="https://hf-mirror.com"]').click()
+    expect(page.locator("#hf-list .prow")).to_have_count(3)
+    page.locator("#hf-ep-reset").click()
+    page.locator("#hf-ep-toggle").click()
+    page.locator("#hf-sort").select_option("trending")
     # A repository of an architecture this build does not run is not loaded.
     view(page, "library")
     page.locator('#hf-list .prow[data-repo="acme/Other-9B-GGUF"]').click()
     expect(page.locator("#hf-unsupported")).to_contain_text("gemma4")
     page.locator('#mf-files .mrow[data-name$=":Q5_K_M"]').click()
     expect(page.locator("#mf-load")).to_be_disabled()
+    # A dflash GGUF drafter repo is never marked unsupported and lets the user draft with its GGUF directly.
+    page.locator("#hf-q").fill("acme/Model-DFlash2-GGUF")
+    expect(page.locator("#hf-name")).to_have_text("Model-DFlash2-GGUF")
+    expect(page.locator("#hf-unsupported")).to_have_count(0)
+    expect(page.locator("#hf-drafter-repo")).to_be_visible()
+    page.locator('#hf-companions .mrow[data-kind="dflash2"]').click()
+    expect(page.locator("#mf-load")).to_have_text("Draft with it")
+    page.locator("#mf-load").click()
+    expect(page.locator("#mv-current")).to_be_visible()
+    expect(page.locator("#sd-file")).to_have_value("acme/Model-DFlash2-GGUF:Model-DFlash2-Draft-BF16.gguf")
+    expect(page.locator("#mf-cmd")).to_contain_text("--drafter dflash2")
+    page.locator("#mf-reset").click()
+    # Typing a safetensors DFlash2 repo org/name auto-opens it without Enter and offers Draft with it.
+    view(page, "library")
+    page.locator("#hf-q").fill("acme/Model-DFlash2")
+    expect(page.locator("#hf-name")).to_have_text("Model-DFlash2")
+    expect(page.locator("#hf-drafter-only")).to_be_visible()
+    expect(page.locator("#mf-load")).to_have_text("Draft with it")
+    page.locator("#hf-q").fill("")
     # A name with its quantization, in the search box: that file of that repository.
     page.locator("#hf-q").fill(REPO + ":q6_k")
     page.keyboard.press("Enter")
@@ -386,6 +617,10 @@ def check_local(page, server):
     expect(page.locator('#lc-list .prow.model[data-model$="tiny-bf16.flyx"] .pt')).to_have_text(".flyx")
     expect(page.locator('#lc-list .prow.model[data-model$="mmproj-BF16.gguf"] .pt')).to_have_text("mmproj")
     expect(page.locator('#lc-list .prow.model[data-model="acme/Tiny-27B-DFlash2"] .pt')).to_have_text("drafter")
+    # Every file under a folder carries a kind-specific icon (model, vision projector, drafter).
+    expect(page.locator('#lc-list .prow.model[data-model$="tiny-bf16.flyx"] .pn svg use')).to_have_attribute("href", "#i-model")
+    expect(page.locator('#lc-list .prow.model[data-model$="mmproj-BF16.gguf"] .pn svg use')).to_have_attribute("href", "#i-image")
+    expect(page.locator('#lc-list .prow.model[data-model="acme/Tiny-27B-DFlash2"] .pn svg use')).to_have_attribute("href", "#i-bolt")
     one.click()
     expect(page.locator("#lc-name")).to_have_text("Tiny-27B-GGUF · IQ3_XXS")
     expect(page.locator("#lc-detail .dchips")).to_contain_text("+ Vision")
@@ -400,16 +635,29 @@ def check_local(page, server):
     page.locator("#mf-q").fill("12b")
     expect(models).to_have_count(1)
     page.locator("#mf-q").fill("")
-    # A drafter or vision projector is not loaded on its own; a projector can be attached under Vision settings.
+    # Drafters and vision projectors use the bottom-right primary button instead of a duplicate banner button.
     page.locator('#lc-list .prow.model[data-model="acme/Tiny-27B-DFlash2"]').click()
-    expect(page.locator("#mf-load")).to_be_disabled()
+    expect(page.locator("#lc-detail .banner button")).to_have_count(0)
+    expect(page.locator("#mf-load")).to_have_text("Draft with it")
+    expect(page.locator("#mf-load")).to_be_enabled()
     page.locator('#lc-list .prow.model[data-model$="mmproj-BF16.gguf"]').click()
-    expect(page.locator("#mf-load")).to_be_disabled()
     expect(page.locator("#lc-detail")).to_contain_text("vision projector")
-    page.locator("#lc-use-mmproj").click()
+    expect(page.locator("#lc-detail .banner button")).to_have_count(0)
+    expect(page.locator("#mf-load")).to_have_text("Use as projector")
+    expect(page.locator("#mf-load")).to_be_enabled()
+    page.locator("#mf-load").click()
     expect(page.locator("#mv-current")).to_be_visible()
     expect(page.locator("#vs-file")).to_have_value(FOLDER + "\\mmproj-BF16.gguf")
     page.locator("#mf-reset").click()
+    view(page, "library")
+    page.locator('#src-seg [data-src="local"]').click()
+    folders.nth(1).click()
+    expect(page.locator("#lc-companions .mrow")).to_have_count(1)
+    page.locator('#mf-cached .mrow[data-name$="Other-12B-Q5_K_M.gguf"]').click()
+    page.locator('#lc-companions .mrow[data-comp$="mmproj-BF16.gguf"]').click()
+    confirm(page, "#mf-load", "Switch")
+    assert (server.posted[-1]["model"], server.posted[-1]["mmproj"]) == (
+        FOLDER + "\\Other-12B-Q5_K_M.gguf", FOLDER + "\\mmproj-BF16.gguf"), server.posted[-1]
     view(page, "library")
     page.locator('#src-seg [data-src="local"]').click()
     folders.nth(0).click()
@@ -457,6 +705,104 @@ def check_local(page, server):
     expect(page.locator('#lc-list .prow.folder[data-place="dir:D:\\\\"]')).to_have_count(0)
 
 
+def check_switch_companions(open_page, want):
+    """Switching to another model drops the served model's companions and API id unless picked or edited for the switch."""
+    served = dict(want, model=FOLDER + "\\Qwen3.8-27B.gguf", name="served-alias",
+                  drafter="dflash2", drafters=["acme/Tiny-27B-DFlash2"],
+                  mmproj=FOLDER + "\\mmproj-Qwen3.8.gguf",
+                  vision_device="host", vision_quant="nvfp4", vision_max_tokens=1024)
+    page, server = open_page(telemetry(served))
+    # Switching to a different local model clears stale mmproj, drafter, and API id while keeping general settings.
+    view(page, "library")
+    page.locator('#src-seg [data-src="local"]').click()
+    page.locator('#lc-list .prow.model[data-model$="Other-12B-Q5_K_M.gguf"]').click()
+    expect(page.locator("#mf-chosen-s")).to_contain_text("drafting default")
+    expect(page.locator("#mf-chosen-s")).not_to_contain_text("mmproj-Qwen3.8.gguf")
+    expect(page.locator("#mf-chosen-s")).not_to_contain_text("Tiny-27B-DFlash2")
+    expect(page.locator("#mf-strange")).to_have_count(0)
+    expect(page.locator("#mf-strange-vis")).to_have_count(0)
+    confirm(page, "#mf-load", "Switch")
+    body = server.posted[-1]
+    assert body["model"] == FOLDER + "\\Other-12B-Q5_K_M.gguf", body
+    assert (body["mmproj"], body["drafter"], body["drafters"], body["name"]) == (None, "", [], None), body
+    assert (body["ctx"], body["kv"], body["kv_gpu"], body["kv_ram"], body["speculative"]) == (
+        want["ctx"], want["kv"], want["kv_gpu"], want["kv_ram"], True), body
+    assert (body["vision"], body["vision_device"], body["vision_quant"], body["vision_max_tokens"]) == (
+        True, "host", "nvfp4", 1024), body
+    # The command line for the chosen other model agrees: no stale companion or alias flags.
+    args = command(page)
+    assert args[2] == FOLDER + "\\Other-12B-Q5_K_M.gguf", args
+    assert not ({"--mmproj", "--drafter", "--drafter-file", "--name"} & set(args)), args
+    # Switching to a Hugging Face model likewise drops stale companions.
+    view(page, "library")
+    page.locator('#src-seg [data-src="hub"]').click()
+    page.locator('#mf-files .mrow[data-name$=":Q5_K_M"]').click()
+    confirm(page, "#mf-load", "Switch")
+    body = server.posted[-1]
+    assert body["model"] == REPO + ":Q5_K_M", body
+    assert (body["mmproj"], body["drafter"], body["drafters"], body["name"]) == (None, "", [], None), body
+    # Explicitly picking a new projector for the switch keeps that projector while still dropping stale drafter/name.
+    view(page, "library")
+    page.locator('#src-seg [data-src="local"]').click()
+    page.locator('#lc-list .prow.model[data-model$="mmproj-BF16.gguf"]').click()
+    page.locator("#mf-load").click()
+    view(page, "library")
+    page.locator('#lc-list .prow.model[data-model$="Other-12B-Q5_K_M.gguf"]').click()
+    expect(page.locator("#mf-chosen-s")).to_contain_text("mmproj-BF16.gguf")
+    expect(page.locator("#mf-chosen-s")).to_contain_text("drafting default")
+    confirm(page, "#mf-load", "Switch")
+    body = server.posted[-1]
+    assert (body["mmproj"], body["drafter"], body["drafters"], body["name"]) == (
+        FOLDER + "\\mmproj-BF16.gguf", "", [], None), body
+    # Editing the drafter and API id keeps those edits while still dropping the untouched served mmproj.
+    page.locator("#mf-reset").click()
+    page.locator('#lset-tabs [data-stab="general"]').click()
+    page.locator("#mf-name").fill("custom-alias")
+    page.locator('#lset-tabs [data-stab="spec"]').click()
+    page.locator("#sd-file").fill("./new-mtp.gguf")
+    view(page, "library")
+    page.locator('#lc-list .prow.model[data-model$="Other-12B-Q5_K_M.gguf"]').click()
+    confirm(page, "#mf-load", "Switch")
+    body = server.posted[-1]
+    assert (body["mmproj"], body["drafter"], body["drafters"], body["name"]) == (
+        None, "mtp", ["./new-mtp.gguf"], "custom-alias"), body
+    # Reloading the same model still preserves all of its own companions and API id.
+    page.locator("#mf-reset").click()
+    page.locator('#lset-tabs [data-stab="general"]').click()
+    page.locator("#mf-ctx").fill("4096")
+    confirm(page, "#mf-reload", "Reload")
+    body = server.posted[-1]
+    assert body["model"] == served["model"] and body["ctx"] == 4096, body
+    assert (body["mmproj"], body["drafter"], body["drafters"], body["name"]) == (
+        served["mmproj"], "dflash2", ["acme/Tiny-27B-DFlash2"], "served-alias"), body
+    page.close()
+
+    # Explicitly re-picking the same mmproj via "Use as projector" carries it onto a compatible switch target.
+    same_mm = dict(served, mmproj=FOLDER + "\\mmproj-BF16.gguf")
+    page, server = open_page(telemetry(same_mm))
+    view(page, "library")
+    page.locator('#src-seg [data-src="local"]').click()
+    page.locator('#lc-list .prow.model[data-model$="mmproj-BF16.gguf"]').click()
+    page.locator("#mf-load").click()
+    view(page, "library")
+    page.locator('#lc-list .prow.model[data-model$="Other-12B-Q5_K_M.gguf"]').click()
+    confirm(page, "#mf-load", "Switch")
+    body = server.posted[-1]
+    assert (body["mmproj"], body["drafter"], body["drafters"]) == (FOLDER + "\\mmproj-BF16.gguf", "", []), body
+    page.close()
+
+    # A served model with a multi-file saved drafter config drops it on switch while keeping speculative=False.
+    saved_draft = dict(want, model="models/local.gguf", speculative=False,
+                       drafter="all", drafters=["./drafts/DFlash model.flyx", "./drafts/MTP layer.gguf"])
+    page, server = open_page(telemetry(saved_draft))
+    view(page, "library")
+    page.locator('#mf-files .mrow[data-name$=":Q5_K_M"]').click()
+    confirm(page, "#mf-load", "Switch")
+    body = server.posted[-1]
+    assert (body["speculative"], body["drafter"], body["drafters"]) == (False, "", []), body
+    page.close()
+
+
 def check_nothing_served(page, server, remembered):
     """No model: the library first; no settings to show, so a load takes the defaults; the last load as it was."""
     expect(page.locator("#mv-library")).to_be_visible()
@@ -473,6 +819,7 @@ def check_nothing_served(page, server, remembered):
     assert (body["model"], body["ctx"], body["kv"], body["kv_ram"], body["kv_gpu"], body["speculative"], body["drafter"], body["drafters"]) == \
         (REPO + ":Q5_K_M", None, "auto", "auto", None, True, "", []), body
     expect(page.locator("#mf-settings")).to_have_count(0)
+    expect(page.locator("#ld-reload")).to_be_hidden()
     expect(page.locator("#ld-unload")).to_be_hidden()
     page.locator("#ld-browse").click()
     expect(page.locator("#mv-library")).to_be_visible()
@@ -623,6 +970,7 @@ def check(browser):
     page.close()
     check_context_limit(open_page, want)
     check_vram_apps(open_page, want)
+    check_switch_companions(open_page, want)
     plain = dict(want, model="models/local.gguf")
     page, server = open_page(telemetry(plain))
     check_hub(page, server, plain)

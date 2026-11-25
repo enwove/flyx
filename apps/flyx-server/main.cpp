@@ -314,7 +314,8 @@ void add_base_routes(httplib::Server& http, ModelHost& models, const std::string
     send_json(res, 200, {{"name", "flyx"}, {"model", m.sched ? ojson(m.name) : ojson(nullptr)},
                          {"endpoints", {"/v1/chat/completions", "/v1/completions", "/v1/models", "/v1/responses",
                                         "/v1/messages", "/v1/messages/count_tokens", "/v1/telemetry", "/v1/load",
-                                        "/v1/unload", "/v1/hub/search", "/v1/hub/files", "/v1/hub/cached", "/v1/hub/dir", "/v1/requests",
+                                        "/v1/unload", "/v1/hub/config", "/v1/hub/search", "/v1/hub/files",
+                                        "/v1/hub/cached", "/v1/hub/dir", "/v1/requests",
                                         "/v1/logs", "/health",
                                         "/dashboard"}}});
   });
@@ -460,6 +461,14 @@ int run(int argc, char** argv) {
     std::fprintf(stderr, "flyx-server: port %d is in use; listening on %s instead\n", args.port, base.c_str());
 
   std::string err;
+  if (os::getenv_str(env::kHfEndpoint).empty()) {
+    const std::string saved_ep = ModelHost::remembered_hub_endpoint();
+    if (!saved_ep.empty()) {
+      std::string ep_err;
+      if (!hub::set_endpoint(saved_ep, &ep_err))
+        std::fprintf(stderr, "flyx-server: ignoring saved hub_endpoint (%s)\n", ep_err.c_str());
+    }
+  }
   ModelHost models(args.so);
   EngineOptions start_from = eo;
   start_from.drafter_files.clear();  // the command line's model's own: a model named on the page names its drafters

@@ -26,8 +26,5 @@ inline constexpr int kMinTerminalCols = 60;
 inline constexpr int kMaxCtx = 1 << 24;
 inline constexpr int kMaxDraftWidth = 64;
 inline constexpr double kMaxKvRamGb = 1e6;
-// What the dashboard's Hub list shows before a search: repositories named for the family whose architectures this
-// build runs (models/: qwen3, qwen35).  Most of the Hub's other GGUFs are of architectures it does not open.
-inline constexpr const char* kHubFamily = "Qwen3";
 
 }  // namespace flyx::apps

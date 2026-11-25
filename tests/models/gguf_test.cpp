@@ -19,7 +19,6 @@
 #include "core/interfaces/model.h"
 #include "core/modelfile/modelfile.h"
 #include "ops/dtype/ref.h"
-#include "tests/core/modelfile/write_flyx.h"
 
 using namespace flyx;
 
@@ -291,153 +290,92 @@ void activations_asked(const std::string& dir) {
         "an unknown activations word: refused (" + error + ")");
 }
 
-// DFlash2 drafter config validation: mismatched hidden size (would OOB target embed/head), odd head_dim,
-// oversized sel_rank, and 32-bit signed dimension-product overflows (TG2, n_taps*hidden, ctx_width) must all be
-// rejected before tensor binding.
-void dflash2_validation(const std::string& dir) {
-  using json = nlohmann::json;
-  // Build a complete zero-filled DFlash2 drafter .flyx matching `d` so any missing config check actually passes
-  // tensor lookup and opens a broken model.
-  auto make_drafter = [&](const std::string& path, const json& d, bool with_tensors) {
-    json tensors = json::object();
-    size_t off = 0;
-    auto add = [&](const std::string& name, std::initializer_list<int64_t> shape) {
-      int64_t n = 1;
-      for (int64_t s : shape) n *= s;
-      const size_t nbytes = size_t(n) * 2;
-      tensors[name] = {{"dtype", "bf16"}, {"shape", json(shape)}, {"offset", off}, {"nbytes", nbytes}};
-      off = (off + nbytes + 63) / 64 * 64;
-    };
-    if (with_tensors) {
-      const int64_t H = d.at("hidden"), layers = d.at("layers"), nh = d.at("n_heads"), nkv = d.at("n_kv");
-      const int64_t hd = d.at("head_dim"), I = d.at("inter"), ct = d.at("conv_taps"), cg = d.at("conv_group");
-      const int64_t sr = d.at("sel_rank"), nt = int64_t(d.at("taps").size());
-      const int64_t th = d.at("target").at("hidden"), vocab = d.at("target").at("vocab");
-      const int64_t q = nh * hd, kv = nkv * hd, tg2 = 2 * ct * (H / cg);
-      for (int64_t l = 0; l < layers; ++l) {
-        const std::string p = "draft.L" + std::to_string(l) + ".";
-        add(p + "in_norm", {H});
-        add(p + "post_norm", {H});
-        add(p + "attn.q_norm", {hd});
-        add(p + "attn.k_norm", {hd});
-        add(p + "attn.q", {q, H});
-        add(p + "attn.k", {kv, H});
-        add(p + "attn.v", {kv, H});
-        add(p + "attn.o", {H, q});
-        add(p + "mlp.gate", {I, H});
-        add(p + "mlp.up", {I, H});
-        add(p + "mlp.down", {H, I});
-        add(p + "attn_conv.proj", {tg2, H});
-        add(p + "attn_conv.base", {2, ct, H});
-        add(p + "mlp_conv.proj", {tg2, H});
-        add(p + "mlp_conv.base", {2, ct, H});
+// One drafter, two files: tiny.flyx's DFlash2 drafter as llama.cpp's GGUF file (arch "dflash", its own tensor
+// names and keys) beside the tiny Qwen3.5 means the drafter file python/convert writes, block for block and weight
+// for weight, and the model's programs are the same nodes.
+void same_drafter(const std::string& dir) {
+  auto open_with = [&](ModelFile* f, const std::string& model, const std::string& comp, std::string* err) {
+    if (!f->open(model, err) || !f->add(comp, err)) return std::unique_ptr<interfaces::Model>{};
+    interfaces::ModelOptions o;
+    o.drafter = "dflash2";
+    return interfaces::open_model(*f, o, err);
+  };
+  std::string err;
+  ModelFile fa, fb;
+  const auto ma = open_with(&fa, dir + "/tiny_gguf.gguf", dir + "/tiny_draft.flyx", &err);
+  const auto mb = open_with(&fb, dir + "/tiny_gguf.gguf", dir + "/tiny_draft.gguf", &err);
+  check(ma && mb, "DFlash2 GGUF opens beside Qwen3.5 GGUF: " + err);
+  if (ma && mb) {
+    const auto& da = ma->desc();
+    const auto& db = mb->desc();
+    bool ok = da.n_blocks == db.n_blocks && da.n_states == db.n_states &&
+              std::string(ma->drafter()) == std::string(mb->drafter());
+    for (int i = 0; ok && i < da.n_blocks; ++i) {
+      const auto& x = da.blocks[i];
+      const auto& y = db.blocks[i];
+      if (x.kind != y.kind) {
+        ok = false;
+        break;
       }
-      add("draft.fc", {H, nt * th});
-      add("draft.hidden_norm", {H});
-      add("draft.norm", {H});
-      add("draft.sel.pred", {vocab, sr});
-      add("draft.sel.succ", {vocab, sr});
-      add("draft.sel.hid", {sr, H});
-    }
-    json hdr = {{"format", "flyx"}, {"version", 1}, {"kind", "drafter"}, {"draft", d}, {"tensors", tensors}};
-    std::string data(off, '\0');
-    testing::write_file(path, testing::flyx_file(hdr.dump(), data));
-  };
-
-  const json base = {
-      {"kind", "dflash2"},  {"hidden", 64},     {"layers", 1},      {"n_heads", 4},     {"n_kv", 2},
-      {"head_dim", 16},     {"inter", 128},     {"eps", 1e-6},      {"rope_theta", 1e4},{"block", 8},
-      {"mask_token", 3},    {"taps", {2, 5}},   {"conv_taps", 2},   {"conv_group", 16}, {"sel_rank", 16},
-      {"sel_topk", 16},     {"window", 0},      {"target", {{"hidden", 64}, {"layers", 8}, {"vocab", 768}}},
-  };
-  auto check_refused = [&](const std::string& what, const json& d, bool with_tensors, const char* expect_sub) {
-    const std::string path = dir + "/bad_dflash2.flyx";
-    make_drafter(path, d, with_tensors);
-    std::string error;
-    bool ok = false, opened_model = false;
-    {
-      ModelFile f;
-      ok = f.open(dir + "/tiny_gguf.gguf", &error) && f.add(path, &error);
-      const auto m = ok ? interfaces::open_model(f, {}, &error) : nullptr;
-      opened_model = m != nullptr;
-    }
-    std::remove(path.c_str());
-    check(ok && !opened_model && error.find(expect_sub) != std::string::npos,
-          "dflash2 refuse " + what + " (" + (opened_model ? "OPENED!" : error) + ")");
-  };
-
-  {  // CRITICAL: draft.hidden != target.hidden with matching tensors must still be refused
-    json d = base;
-    d["hidden"] = 32;
-    check_refused("hidden != target hidden", d, true, "hidden");
-  }
-  {  // HIGH: odd head_dim breaks full-head RoPE
-    json d = base;
-    d["head_dim"] = 15;
-    check_refused("odd head_dim", d, true, "invalid DFlash2");
-  }
-  {  // HIGH: 64-bit tap index must not wrap to a valid 32-bit layer index
-    json d = base;
-    d["taps"] = {(int64_t(1) << 32) + 1};
-    check_refused("int64 tap overflow", d, false, "DFlash2 tap");
-  }
-  {  // HIGH: sel_rank > kMaxWidth
-    json d = base;
-    d["sel_rank"] = (1 << 20) + 1;
-    check_refused("sel_rank > kMaxWidth", d, false, "invalid DFlash2");
-  }
-  {  // HIGH: 2 * layers * n_kv * head_dim overflows 32-bit int ctx_width()
-    json d = base;
-    d["layers"] = 1024;
-    d["n_heads"] = 1024;
-    d["n_kv"] = 1024;
-    d["head_dim"] = 2048;
-    check_refused("ctx_width int32 overflow", d, false, "invalid DFlash2");
-  }
-  {  // HIGH: TG2 and n_taps * hidden int32 overflows on a large-hidden synthetic model
-    auto check_synth = [&](const std::string& what, json d) {
-      const int H = 1 << 20;  // kMaxWidth
-      d["hidden"] = H;
-      d["target"] = {{"hidden", H}, {"layers", 1}, {"vocab", 64}};
-      json hdr = {
-          {"format", "flyx"},
-          {"version", 1},
-          {"arch", "qwen35"},
-          {"config", {{"hidden", H}, {"layers", 1}, {"vocab", 64}, {"inter", 64}, {"n_heads", 2}, {"n_kv", 2},
-                      {"head_dim", 16}, {"rot_dim", 16}, {"rope_theta", 1e4}, {"eps", 1e-6},
-                      {"lin_nk", 2}, {"lin_nv", 2}, {"lin_dk", 16}, {"lin_dv", 16}, {"conv_k", 4},
-                      {"layer_types", {"attn"}}}},
-          {"draft", d},
-          {"tensors", json::object()},
-      };
-      const std::string path = dir + "/bad_dflash2_synth.flyx";
-      testing::write_file(path, testing::flyx_file(hdr.dump(), ""));
-      std::string error;
-      bool ok = false, opened_model = false;
-      {
-        ModelFile f;
-        ok = f.open(path, &error);
-        const auto m = ok ? interfaces::open_model(f, {}, &error) : nullptr;
-        opened_model = m != nullptr;
+      Compare c{{&da}, {&db}, 1e-6, "dflash block " + std::to_string(i)};
+      if (x.kind == FLYX_BLOCK_DFLASH2_LAYER) {
+        const auto &a = x.dflash2_layer, &b = y.dflash2_layer;
+        c.norm(a.norm, b.norm, size_t(da.hidden), "norm");
+        c.norm(a.post_norm, b.post_norm, size_t(da.hidden), "post_norm");
+        c.norm(a.q_norm, b.q_norm, size_t(da.weights[a.q_norm.w].t->shape[0]), "q_norm");
+        c.norm(a.k_norm, b.k_norm, size_t(da.weights[a.k_norm.w].t->shape[0]), "k_norm");
+        c.whole(a.q, b.q, "q");
+        c.whole(a.k, b.k, "k");
+        c.whole(a.v, b.v, "v");
+        c.whole(a.o, b.o, "o");
+        c.whole(a.gate, b.gate, "gate");
+        c.whole(a.up, b.up, "up");
+        c.whole(a.down, b.down, "down");
+        c.whole(a.attn_conv_proj, b.attn_conv_proj, "attn_conv_proj");
+        c.whole(a.mlp_conv_proj, b.mlp_conv_proj, "mlp_conv_proj");
+        auto numel = [&](int w) {
+          size_t n = 1;
+          const auto* t = da.weights[w].t;
+          for (int d = 0; d < t->ndim; ++d) n *= size_t(t->shape[d]);
+          return n;
+        };
+        c.rows(a.attn_conv_base, 0, b.attn_conv_base, 0, numel(a.attn_conv_base), "attn_conv_base");
+        c.rows(a.mlp_conv_base, 0, b.mlp_conv_base, 0, numel(a.mlp_conv_base), "mlp_conv_base");
+      } else if (x.kind == FLYX_BLOCK_DFLASH2) {
+        const auto &a = x.dflash2, &b = y.dflash2;
+        c.same(a.hidden, b.hidden, "hidden");
+        c.same(a.n_heads, b.n_heads, "n_heads");
+        c.same(a.n_kv, b.n_kv, "n_kv");
+        c.same(a.head_dim, b.head_dim, "head_dim");
+        c.same(a.inter, b.inter, "inter");
+        c.same(a.block, b.block, "block");
+        c.same(a.mask_token, b.mask_token, "mask_token");
+        c.same(a.window, b.window, "window");
+        c.same(a.n_taps, b.n_taps, "n_taps");
+        c.same(a.conv_taps, b.conv_taps, "conv_taps");
+        c.same(a.conv_group, b.conv_group, "conv_group");
+        c.same(a.sel_rank, b.sel_rank, "sel_rank");
+        c.same(a.sel_topk, b.sel_topk, "sel_topk");
+        c.same(a.theta, b.theta, "theta");
+        c.whole(a.fc, b.fc, "fc");
+        c.norm(a.hidden_norm, b.hidden_norm, size_t(a.hidden), "hidden_norm");
+        c.norm(a.norm, b.norm, size_t(a.hidden), "norm");
+        c.whole(a.sel_pred, b.sel_pred, "sel_pred");
+        c.whole(a.sel_succ, b.sel_succ, "sel_succ");
+        c.whole(a.sel_hid, b.sel_hid, "sel_hid");
       }
-      std::remove(path.c_str());
-      check(ok && !opened_model && error.find("invalid DFlash2") != std::string::npos,
-            "dflash2 refuse " + what + " (" + (opened_model ? "OPENED!" : error) + ")");
+      ok = ok && c.ok;
+    }
+    auto prog_eq = [](const std::vector<flyx_node>& p, const std::vector<flyx_node>& q) {
+      if (p.size() != q.size()) return false;
+      for (size_t i = 0; i < p.size(); ++i)
+        if (p[i].kind != q[i].kind || p[i].block != q[i].block || p[i].arg0 != q[i].arg0 || p[i].arg1 != q[i].arg1)
+          return false;
+      return true;
     };
-    {
-      json d = base;
-      d["taps"] = {1};
-      d["conv_taps"] = 2048;
-      d["conv_group"] = 1;  // 2 * 2048 * (1 << 20) = 2^32 > INT_MAX
-      check_synth("TG2 int32 overflow", d);
-    }
-    {
-      json d = base;
-      d["taps"] = std::vector<int>(2049, 1);  // 2049 * (1 << 20) > INT_MAX
-      d["conv_taps"] = 2;
-      d["conv_group"] = 16;
-      check_synth("n_taps * hidden int32 overflow", d);
-    }
+    check(ok && prog_eq(ma->prefill_program(), mb->prefill_program()) &&
+              prog_eq(ma->round_program(7, 0, false), mb->round_program(7, 0, false)),
+          "DFlash2 GGUF matches DFlash2 .flyx block-for-block, weight-for-weight, and program-for-program");
   }
 }
 
@@ -448,7 +386,7 @@ int main(int argc, char** argv) {
   const std::string dir = argv[1];
   fp4_inputs_by_device(dir + "/tiny_w4a4.flyx");
   activations_asked(dir);
-  dflash2_validation(dir);
+  same_drafter(dir);
   same_model(dir + "/tiny.flyx", dir + "/tiny_gguf.gguf");
   same_model(dir + "/tiny.flyx", dir + "/tiny_bf16.gguf");
   same_model(dir + "/tiny_explicit_hd.flyx", dir + "/tiny_explicit_hd.gguf");

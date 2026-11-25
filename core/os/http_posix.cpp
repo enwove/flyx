@@ -7,6 +7,7 @@
 #include <algorithm>
 #include <cstring>
 #include <mutex>
+#include <string_view>
 #include <type_traits>
 
 #include "core/os/http.h"
@@ -26,9 +27,11 @@ enum : int {
   kOptLowSpeedLimit = 19,
   kOptLowSpeedTime = 20,
   kOptHttpHeader = 10023,
+  kOptHeaderData = 10029,
   kOptFollowLocation = 52,
   kOptMaxRedirs = 68,
   kOptConnectTimeout = 78,
+  kOptHeaderFunction = 20079,
   kOptNoSignal = 99,
   kOptProtocols = 181,
   kOptRedirProtocols = 182,
@@ -110,13 +113,34 @@ size_t on_data(char* data, size_t size, size_t count, void* user) {
   return n;
 }
 
+size_t on_header(char* data, size_t size, size_t count, void* user) {
+  auto* link = static_cast<std::string*>(user);
+  const size_t n = size * count;
+  const std::string_view line(data, n);
+  if (line.starts_with("HTTP/")) {
+    link->clear();  // new response after a redirect
+    return n;
+  }
+  if (line.size() >= 5 && (line[0] == 'L' || line[0] == 'l') && (line[1] == 'I' || line[1] == 'i') &&
+      (line[2] == 'N' || line[2] == 'n') && (line[3] == 'K' || line[3] == 'k') && line[4] == ':') {
+    size_t s = 5;
+    while (s < line.size() && (line[s] == ' ' || line[s] == '\t')) ++s;
+    size_t e = line.size();
+    while (e > s && (line[e - 1] == '\r' || line[e - 1] == '\n' || line[e - 1] == ' ')) --e;
+    if (!link->empty()) *link += ", ";
+    link->append(line.substr(s, e - s));
+  }
+  return n;
+}
+
 }  // namespace
 
 HttpClient::~HttpClient() {
   if (handle_) curl().easy_cleanup(handle_);
 }
 
-bool HttpClient::get(const HttpGet& req, const HttpBody& body, int* status, std::string* err, std::string* final_url) {
+bool HttpClient::get(const HttpGet& req, const HttpBody& body, int* status, std::string* err, std::string* final_url,
+                     std::string* link_header) {
   const Curl& c = curl();
   if (!c.missing.empty()) return *err = c.missing, false;
   if (!handle_ && !(handle_ = c.easy_init())) return *err = "libcurl: no handle", false;
@@ -140,6 +164,11 @@ bool HttpClient::get(const HttpGet& req, const HttpBody& body, int* status, std:
   c.easy_setopt(h, kOptErrorBuffer, error);
   c.easy_setopt(h, kOptWriteFunction, &on_data);
   c.easy_setopt(h, kOptWriteData, &sink);
+  if (link_header) {
+    link_header->clear();
+    c.easy_setopt(h, kOptHeaderFunction, &on_header);
+    c.easy_setopt(h, kOptHeaderData, link_header);
+  }
   if (headers) c.easy_setopt(h, kOptHttpHeader, headers);
   if (req.ranged) c.easy_setopt(h, kOptRange, range.c_str());
   const int rc = c.easy_perform(h);
