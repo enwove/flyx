@@ -58,9 +58,9 @@ __device__ __forceinline__ float warp_tree_sum(float v) {
 }
 
 // ---- Fast pre-staged Q8 dp4a MoE kernel (R=1 direct or R>=2 compacted tasks, BT <= 4) ----------
-template <class F, bool FUSE_ACT, int C, int U, int BT>
+template <class F, bool FUSE_ACT, int C, int U, int BT, class Local>
 __device__ __forceinline__ void moe_dp4a_tile(
-    const Tables& T, const typename F::Local& local, const int8_t* __restrict__ q8_a, const float* __restrict__ q8_d,
+    const Tables& T, const Local& local, const int8_t* __restrict__ q8_a, const float* __restrict__ q8_d,
     const float* __restrict__ q8_s, const uint8_t* __restrict__ W, const uint16_t* __restrict__ D,
     const float* __restrict__ RS, int N_exp, int I_or_H, int K, int e, int nb, const int* s_pids, const int* s_rids,
     float situ_beta, float situ_linear_beta, float* __restrict__ out, int ld_out, bf16* __restrict__ act_bf16) {
@@ -207,8 +207,13 @@ __global__ void __launch_bounds__(32 * kMoeDp4aWarps)
                          float situ_linear_beta, float* __restrict__ out, int ld_out, bf16* __restrict__ act_bf16) {
   pdl_trigger();
   constexpr int BT = DIRECT_R1 ? 1 : 4;
+  // IQ3_XXS at one column (gate/up pair) a warp decodes its units from the global table of signed rows instead of
+  // the block's shared tables: no table fill a block, a lookup a word (cuda_bench moe, RTX 5070 Ti: 1x1 7% faster at
+  // one row, 2 to 3% at 2 to 6; at two columns a warp it was 3 to 5% slower, so those keep the shared tables).  The
+  // same int8 values, so the same bits.
+  constexpr bool kSignedRows = std::is_same_v<F, FIQ3_XXS> && C == 1 && EXPLICIT_CONFIG;
   int e, nb;
-  __shared__ typename F::Local local;
+  __shared__ std::conditional_t<kSignedRows, FIQ3_XXS::SignedRows, typename F::Local> local;
   __shared__ int s_pids[BT];
   __shared__ int s_rids[BT];
 
@@ -231,9 +236,11 @@ __global__ void __launch_bounds__(32 * kMoeDp4aWarps)
       s_rids[threadIdx.x] = IS_DOWN ? pid : (pid / top_k);
     }
   }
-  if constexpr (EXPLICIT_CONFIG) F::unit_tables(T, local);
-  else F::tables(T, local);
-  __syncthreads();
+  if constexpr (!kSignedRows) {
+    if constexpr (EXPLICIT_CONFIG) F::unit_tables(T, local);
+    else F::tables(T, local);
+  }
+  __syncthreads();  // the block's rows (s_pids, s_rids), and its tables where it has any
 
   if constexpr (EXPLICIT_CONFIG && !DIRECT_R1) {
     if (nb == 1) {
@@ -825,19 +832,20 @@ struct MoeDp4aConfig {
   static constexpr int units = U;  // zero selects the original prefetch depth and grouped loop
 };
 
-// The configuration a fused gate|up GEMM of 2 or more rows takes by default, by block type and rows (`cuda_bench moe`
-// on Inkling-2-Mini's experts, RTX 5070 Ti, against the original tiles): the 2-bit IQ types two gate/up pairs a warp
-// (9 to 25% faster at 2 to 16 rows); IQ3_XXS and IQ4_NL one pair up to 4 rows and two above (IQ3_XXS: 6% at 2 and
-// 4 rows, 8 to 12% at 6 to 16).  Q4_K keeps the original tiles, as do one-row launches and the projections without a
-// fused activation.  Every configuration gives the same bits.
+// The configuration a fused gate|up GEMM takes by default, by block type and rows (`cuda_bench moe` on
+// Inkling-2-Mini's experts, RTX 5070 Ti, against the original tiles): from 2 rows, the 2-bit IQ types two gate/up pairs
+// a warp (9 to 25% faster at 2 to 16 rows) and IQ4_NL one pair up to 4 rows, two above; IQ3_XXS one pair up to 6
+// rows, one row included, with its signed-row decode (k_moe_blocks_q8_dp4a; 8 to 11% faster at 1 to 6 rows), and two
+// pairs above (12 to 13% at 8 and 16).  Q4_K keeps the original tiles, as do the other types' one-row launches and
+// the projections without a fused activation.  Every configuration gives the same bits.
 template <class F>
-constexpr MoeDp4a grouped_gate_up_dp4a(int rows) {
+constexpr MoeDp4a gate_up_dp4a(int rows) {
   switch (F::kDtype) {
     case FLYX_DT_GGML_IQ2_XXS:
     case FLYX_DT_GGML_IQ2_XS:
-    case FLYX_DT_GGML_IQ2_S: return kMoeDp4aC2U1;
-    case FLYX_DT_GGML_IQ3_XXS:
-    case FLYX_DT_GGML_IQ4_NL: return rows <= 4 ? kMoeDp4aC1U1 : kMoeDp4aC2U1;
+    case FLYX_DT_GGML_IQ2_S: return rows > 1 ? kMoeDp4aC2U1 : kMoeDp4aDefault;
+    case FLYX_DT_GGML_IQ3_XXS: return rows <= 6 ? kMoeDp4aC1U1 : kMoeDp4aC2U1;
+    case FLYX_DT_GGML_IQ4_NL: return rows <= 1 ? kMoeDp4aDefault : rows <= 4 ? kMoeDp4aC1U1 : kMoeDp4aC2U1;
     default: return kMoeDp4aDefault;
   }
 }
@@ -864,7 +872,7 @@ void launch_dp4a_q8(MoeDp4a mode, const Tables& T, const ExpertMat& W, int I_or_
     else run(config, std::false_type{});
   };
   if constexpr (has_moe_dp4a_variants(F::kDtype)) {
-    if (FUSE_ACT && mode == kMoeDp4aDefault && rows > 1) mode = grouped_gate_up_dp4a<F>(rows);
+    if (FUSE_ACT && mode == kMoeDp4aDefault) mode = gate_up_dp4a<F>(rows);
     // A configuration the build does not compile (moe_dp4a_compiled; the option refuses it) takes the original tiles.
     switch (mode) {
       case kMoeDp4aC1U1: return launch(MoeDp4aConfig<1, 1>{});

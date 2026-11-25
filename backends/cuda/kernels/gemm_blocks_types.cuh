@@ -1504,6 +1504,20 @@ struct FIQ3_XXS {
       w[2 * j + 1] = negate_where(pick(T.iq3_s8[0][0], T.iq3_s8[0][1], L.rows[(rows >> 8) & 0xFFu]), signs.y);
     }
   }
+  // The same words from the global table of signed rows (BlockTables::iq3xxs_signed_rows): a lookup a word, no
+  // per-block tables.  A code's eighth sign is its seven bits' parity, as in the MmaLocal codes() above.
+  struct SignedRows {};
+  static __device__ __forceinline__ void unit_codes(const Tables& T, const SignedRows&, const Unit& u, int,
+                                                    uint32_t* w) {
+#pragma unroll
+    for (int j = 0; j < 4; ++j) {
+      const uint32_t rows = u.rows[j >> 1] >> (16 * (j & 1));
+      const uint32_t code = (u.aux >> (7 * j)) & 127u;
+      const uint32_t signs = code | (__popc(code) & 1u) << 7;
+      w[2 * j] = __ldg(&T.iq3xxs_signed_rows[(rows & 0xFFu) | (signs & 15u) << 8]);
+      w[2 * j + 1] = __ldg(&T.iq3xxs_signed_rows[((rows >> 8) & 0xFFu) | (signs >> 4) << 8]);
+    }
+  }
   static __device__ __forceinline__ void unit_factors(const Unit& u, int, float d0, float, float* f, float* m) {
     f[0] = 0.25f * d0 * float(2 * (u.aux >> 28) + 1), m[0] = 0.f;
   }
