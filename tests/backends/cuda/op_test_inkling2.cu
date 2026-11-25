@@ -4,6 +4,8 @@
 #include "backends/cuda/loader/exact_bf16.h"
 #include "tests/backends/cuda/op_test.cuh"
 
+#include "flyx/gemm_tables.inc"
+
 namespace flyx::optest {
 
 namespace {
@@ -1586,6 +1588,24 @@ void test_inkling2_moe_norm() {
 
 namespace {
 
+// The rules of a fused gate|up GEMM's configuration (variants: moe_gate_up) give every block type, at every row count a
+// pass may have on dp4a, a configuration this build compiles for it, by every GPU's table and by the defaults: a
+// release build compiles only the configurations the tables reach (moe_dp4a_compiled), and only the types
+// kMoeDp4aTypes names compile more than the original tiles.
+void test_moe_gate_up_rules() {
+  int bad = 0;
+  for (int tuning = -1; tuning < tables::kSkuCount; ++tuning)
+    for (const BlockType& bt : kBlockTypes)
+      for (int rows = 1; rows <= 64; ++rows) {
+        const int cfg = moe_gate_up_dp4a(tuning, bt.dtype, rows);
+        if (!moe_dp4a_compiled(bt.dtype, cfg) && bad++ < 4)
+          std::printf("  FAIL table %d, %s, %d rows: moe_dp4a configuration %d not compiled\n", tuning, bt.name, rows,
+                      cfg);
+      }
+  std::printf("  %-4s %-48s\n", bad ? "FAIL" : "ok", "MoE gate|up rules: compiled configurations");
+  if (bad) ++g_fail;
+}
+
 void test_moe_dp4a_variants() {
   // 72 units: U=2 must refill its first slot for just eight lanes. Odd widths exercise the final
   // partially occupied warp and column group. Padding after each float32 output catches extra stores.
@@ -1640,14 +1660,16 @@ void test_moe_dp4a_variants() {
       KernelOptions options{};
       Launch launch = TL;
       launch.opt = &options;
-      for (int v = 0; v < kMoeDp4aCount; ++v) {
-        options.moe_dp4a = static_cast<MoeDp4a>(v);
-        if (!moe_dp4a_compiled(options.moe_dp4a)) continue;  // a release build compiles the default's and original
+      // -1: the rules; then every configuration this build compiles for the type (a release build: those its tables
+      // reach, and the original tiles)
+      for (int v = -1; v < kMoeDp4aConfigCount; ++v) {
+        if (v >= 0 && !moe_dp4a_compiled(dtype, v)) continue;
+        options.moe_dp4a = v;
         for (int rows : {1, 2, 4, 8, R}) {
           const size_t words = size_t(rows) * words_per_row;
           CK(cudaMemset(got, 0xff, words * sizeof(float)));
           run(0, rows, launch, got);
-          const std::string label = std::string("MoE ") + bt.name + " " + op + " " + moe_dp4a_name(options.moe_dp4a) +
+          const std::string label = std::string("MoE ") + bt.name + " " + op + " " + moe_dp4a_name(v) +
                                     " R=" + std::to_string(rows) + " vs default R=1";
           expect_device_bits(label, got, alone, words);
         }
@@ -1692,6 +1714,7 @@ void test_moe_dp4a_variants() {
 
 void test_inkling2_moe() {
   test_inkling2_moe_norm();
+  test_moe_gate_up_rules();
   test_moe_dp4a_variants();
   std::printf("inkling2 moe (route, situ, gate_up, down)\n");
   // 1. moe_route: sigmoid+bias and softmax.

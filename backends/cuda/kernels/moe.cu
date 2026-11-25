@@ -1,6 +1,7 @@
 // Copyright 2026 The flyx Authors. SPDX-License-Identifier: Apache-2.0
 // Sparse MoE kernels: top-k routing, SiTU activation, compacted work-tile grouping, one-pass activation staging,
-// Tensor Core NVFP4 MoE (mma_bf16), BF16 MoE, and dispatch to modular GGML block MoE kernels (moe_blocks_*.cu).
+// Tensor Core NVFP4 MoE (mma_bf16), BF16 MoE, and dispatch to modular GGML block MoE kernels (moe_blocks_*.cu) with
+// the dp4a kernel's configuration the tuning tables give (variants/candidates.toml: moe_dp4a, moe_gate_up).
 //
 // Strict Gate 4 row-count invariance (0.00e+00 across R=1, R=2..16, R=256, fused vs unfused, sc vs nullptr):
 //   * NVFP4: fixed SPAN (128 when K%128==0 else 64) mma_bf16 (m16n8k16) across all row counts.
@@ -12,6 +13,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <stdexcept>
+#include <string>
 
 #include "backends/cuda/kernels/common/device.cuh"
 #include "backends/cuda/kernels/common/launch.h"
@@ -813,7 +815,40 @@ bool moe_round_scratch(const ExpertMat& W, int rows, int top_k, const MoeScratch
          top_k > 0 && top_k <= sc->max_top_k && sc->pairs && sc->tasks && sc->n_tasks && sc->offsets;
 }
 
+// The moe_dp4a configuration of a packed expert dp4a GEMM of `rows` rows of block type `dtype`: the options' where
+// they force one the type compiles, else a fused gate|up GEMM's by the rules, else the original tiles.
+int moe_dp4a_cfg(const KernelOptions& o, int dtype, int rows, bool fused_gate_up) {
+  if (o.moe_dp4a >= 0 && moe_dp4a_cfg_compiled(dtype, o.moe_dp4a)) return o.moe_dp4a;
+  return fused_gate_up ? moe_gate_up_dp4a(o.tuning, dtype, rows) : tables::kMoeDp4aOriginal;
+}
+
 }  // namespace
+
+const MoeDp4aConfig kMoeDp4aConfigs[] = {
+#define X(i, C, U) {C, U},
+    FLYX_MOE_DP4A(X)
+#undef X
+};
+const int kMoeDp4aConfigCount = FLYX_MOE_DP4A_COUNT;
+
+const char* moe_dp4a_name(int cfg) {
+  static constexpr const char* kNames[] = {
+#define X(i, C, U) C == 0 ? "original" : #C "x" #U,
+      FLYX_MOE_DP4A(X)
+#undef X
+  };
+  return cfg >= 0 && cfg < FLYX_MOE_DP4A_COUNT ? kNames[cfg] : "default";
+}
+
+bool moe_dp4a_compiled(int dtype, int cfg) { return moe_dp4a_cfg_compiled(dtype, cfg); }
+
+int moe_gate_up_dp4a(int tuning, int dtype, int rows) {
+  const int s = tables::rules_sku(tuning, tables::kFamilyMoeGateUp);
+  for (const tables::MoeGateUpRule& r : tables::kMoeGateUp)
+    if (r.sku == s && (r.dtype == dtype || r.dtype < 0) && rows >= r.lo && rows <= r.hi) return r.cfg;
+  // gen_gemm_tables.py: every list of these rules ends with one for the rest
+  throw std::runtime_error("moe_gate_up: no rule for " + std::to_string(rows) + " rows (variants)");
+}
 
 void moe_stage_q8(const float* x, int ldx, int K, int rows, const MoeScratch& sc, bool mins, cudaStream_t st) {
   if (mins) k_moe_stage_q8<true><<<rows, 256, 0, st>>>(x, ldx, K, sc.q8_a, sc.q8_d, sc.q8_s);
@@ -886,7 +921,7 @@ int moe_gate_up(const float* x, int ldx, const ExpertMat& W, const int* eidx, in
         grouped = rc == rows ? bm : 0;
       }
       ops->gu(xc, ldx, W, ec, rc, top_k, I, K, situ_beta, situ_linear_beta, fuse_act, oc, ld_out, sc, mt, use_mma,
-              opts(L).moe_dp4a, st, act_bf16);
+              moe_dp4a_cfg(opts(L), W.blk.dtype, rc, fuse_act), st, act_bf16);
     }
     return grouped;
   }
@@ -962,7 +997,7 @@ void moe_down(const float* act, int ld_act, const ExpertMat& W, const int* eidx,
         if (rc != rows || !tiles_serve(grouped, bm, rc)) group_tasks(ec, M, W.n_experts, bm, sc, st);
       }
       const bool wrote_buf = ops->down(ac, ld_act, W, ec, ewc, rc, top_k, H, K, oc, ld_out, accumulate, sc, mt,
-                                       use_mma, opts(L).moe_dp4a, st);
+                                       use_mma, moe_dp4a_cfg(opts(L), W.blk.dtype, rc, false), st);
       if (wrote_buf)
         k_moe_weighted_sum<<<dim3(ceil_div(H, 256), rc), 256, 0, st>>>(sc->down_buf, ewc, top_k, H, oc, ld_out,
                                                                        int(accumulate));

@@ -15,6 +15,7 @@
 #include <cmath>
 #include <cstdint>
 #include <stdexcept>
+#include <string>
 #include <type_traits>
 
 #include "backends/cuda/kernels/common/device.cuh"
@@ -826,39 +827,26 @@ void launch_mma_q8(const ExpertMat& W, int I_or_H, int K, int top_k, float situ_
       sc->n_tasks, sc->pairs, top_k, situ_beta, situ_linear_beta, out, ld_out);
 }
 
+// A moe_dp4a configuration's tile: C output columns a warp (gate/up pairs fused), U units a lane has in flight; 0 and
+// 0, the original tiles: one pair a warp fused, two columns otherwise, the original prefetch depth and grouped loop.
 template <int C, int U>
-struct MoeDp4aConfig {
+struct MoeDp4aTile {
   static constexpr int columns = C;
-  static constexpr int units = U;  // zero selects the original prefetch depth and grouped loop
+  static constexpr int units = U;
 };
 
-// The configuration a fused gate|up GEMM takes by default, by block type and rows (`cuda_bench moe` on
-// Inkling-2-Mini's experts, RTX 5070 Ti, against the original tiles): from 2 rows, the 2-bit IQ types two gate/up pairs
-// a warp (9 to 25% faster at 2 to 16 rows) and IQ4_NL one pair up to 4 rows, two above; IQ3_XXS one pair up to 6
-// rows, one row included, with its signed-row decode (k_moe_blocks_q8_dp4a; 8 to 11% faster at 1 to 6 rows), and two
-// pairs above (12 to 13% at 8 and 16).  Q4_K keeps the original tiles, as do the other types' one-row launches and
-// the projections without a fused activation.  Every configuration gives the same bits.
-template <class F>
-constexpr MoeDp4a gate_up_dp4a(int rows) {
-  switch (F::kDtype) {
-    case FLYX_DT_GGML_IQ2_XXS:
-    case FLYX_DT_GGML_IQ2_XS:
-    case FLYX_DT_GGML_IQ2_S: return rows > 1 ? kMoeDp4aC2U1 : kMoeDp4aDefault;
-    case FLYX_DT_GGML_IQ3_XXS: return rows <= 6 ? kMoeDp4aC1U1 : kMoeDp4aC2U1;
-    case FLYX_DT_GGML_IQ4_NL: return rows <= 1 ? kMoeDp4aDefault : rows <= 4 ? kMoeDp4aC1U1 : kMoeDp4aC2U1;
-    default: return kMoeDp4aDefault;
-  }
-}
-
+// The dp4a kernel in configuration `cfg` (moe.cu's moe_dp4a_cfg: the options', the rules' or the original tiles;
+// always one this build compiles for the type, moe_dp4a_cfg_compiled).
 template <class F, bool FUSE_ACT, bool IS_DOWN>
-void launch_dp4a_q8(MoeDp4a mode, const Tables& T, const ExpertMat& W, int I_or_H, int K, const int* eidx, int rows,
+void launch_dp4a_q8(int cfg, const Tables& T, const ExpertMat& W, int I_or_H, int K, const int* eidx, int rows,
                     int top_k, float situ_beta, float situ_linear_beta, float* out, int ld_out, const MoeScratch* sc,
                     int max_tiles, cudaStream_t st, bf16* act_bf16) {
   const int N_exp = IS_DOWN ? I_or_H : W.N;
   const int N_work = FUSE_ACT ? I_or_H : N_exp;
-  auto run = [&](auto config, auto direct) {
+  auto run = [&](auto tile, auto direct) {
     constexpr bool DIRECT_R1 = decltype(direct)::value;
-    constexpr int C = decltype(config)::columns, requested_u = decltype(config)::units;
+    constexpr int requested_c = decltype(tile)::columns, requested_u = decltype(tile)::units;
+    constexpr int C = requested_c ? requested_c : FUSE_ACT ? 1 : 2;
     constexpr int default_u = DIRECT_R1 && sizeof(typename F::Unit) <= 32 ? 2 : 1;
     constexpr int U = requested_u ? requested_u : default_u;
     const dim3 grid(ceil_div(N_work, kMoeDp4aWarps * C), DIRECT_R1 ? top_k : max_tiles);
@@ -867,38 +855,27 @@ void launch_dp4a_q8(MoeDp4a mode, const Tables& T, const ExpertMat& W, int I_or_
                                               N_exp, I_or_H, K, eidx, sc->tasks, sc->n_tasks, sc->pairs, top_k,
                                               situ_beta, situ_linear_beta, out, ld_out, act_bf16);
   };
-  auto launch = [&](auto config) {
-    if (rows == 1) run(config, std::true_type{});
-    else run(config, std::false_type{});
+  auto launch = [&](auto tile) {
+    if (rows == 1) run(tile, std::true_type{});
+    else run(tile, std::false_type{});
   };
-  if constexpr (has_moe_dp4a_variants(F::kDtype)) {
-    if (FUSE_ACT && mode == kMoeDp4aDefault) mode = gate_up_dp4a<F>(rows);
-    // A configuration the build does not compile (moe_dp4a_compiled; the option refuses it) takes the original tiles.
-    switch (mode) {
-      case kMoeDp4aC1U1: return launch(MoeDp4aConfig<1, 1>{});
-      case kMoeDp4aC1U2:
-        if constexpr (moe_dp4a_compiled(kMoeDp4aC1U2)) return launch(MoeDp4aConfig<1, 2>{});
-        break;
-      case kMoeDp4aC2U1: return launch(MoeDp4aConfig<2, 1>{});
-      case kMoeDp4aC2U2:
-        if constexpr (moe_dp4a_compiled(kMoeDp4aC2U2)) return launch(MoeDp4aConfig<2, 2>{});
-        break;
-      case kMoeDp4aC4U1:
-        if constexpr (moe_dp4a_compiled(kMoeDp4aC4U1)) return launch(MoeDp4aConfig<4, 1>{});
-        break;
-      case kMoeDp4aC4U2:
-        if constexpr (moe_dp4a_compiled(kMoeDp4aC4U2)) return launch(MoeDp4aConfig<4, 2>{});
-        break;
-      default: break;
-    }
+  switch (cfg) {
+#define X(i, C, U)                                                                          \
+  case i:                                                                                   \
+    if constexpr (moe_dp4a_cfg_compiled(F::kDtype, i)) return launch(MoeDp4aTile<C, U>{}); \
+    break;
+    FLYX_MOE_DP4A(X)
+#undef X
+    default: break;
   }
-  launch(MoeDp4aConfig<FUSE_ACT ? 1 : 2, 0>{});
+  throw std::runtime_error("moe dp4a: configuration " + std::to_string(cfg) + " is not compiled for block type " +
+                           std::to_string(F::kDtype));
 }
 
 template <class F>
 void moe_blocks_gu(const float* x, int ldx, const ExpertMat& W, const int* eidx, int rows, int top_k, int I, int K,
                    float situ_beta, float situ_linear_beta, bool fuse_act, float* out, int ld_out,
-                   const MoeScratch* sc, int max_tiles, bool use_mma, MoeDp4a dp4a, cudaStream_t st, bf16* act_bf16) {
+                   const MoeScratch* sc, int max_tiles, bool use_mma, int dp4a, cudaStream_t st, bf16* act_bf16) {
   const Tables T = block_tables();
   const int N_work = fuse_act ? I : 2 * I;
   const bool has_q8 = W.blk.q8 && sc && sc->q8_a && sc->stage_elems >= size_t(rows) * size_t(K);
@@ -953,7 +930,7 @@ void moe_blocks_gu(const float* x, int ldx, const ExpertMat& W, const int* eidx,
 template <class F>
 bool moe_blocks_down(const float* act, int ld_act, const ExpertMat& W, const int* eidx, const float* ew, int rows,
                      int top_k, int H, int K, float* out, int ld_out, bool accumulate, const MoeScratch* sc,
-                     int max_tiles, bool use_mma, MoeDp4a dp4a, cudaStream_t st) {
+                     int max_tiles, bool use_mma, int dp4a, cudaStream_t st) {
   const Tables T = block_tables();
   const bool has_q8 =
       W.blk.q8 && sc && sc->q8_a && sc->down_buf && sc->stage_elems >= size_t(rows) * size_t(top_k) * size_t(K);

@@ -83,30 +83,9 @@ enum PosSel : int { kPosPosition = 0, kPosStart = 1 };
 // Choices the shapes do not settle: one set per loaded model (the backend's
 // options), the defaults in tests and benchmarks.
 enum AttnImpl : int { kAttnAuto = 0, kAttnSplit = 1, kAttnPerHead = 2 };
-// Configurations of the staged packed expert dp4a GEMMs, all with the same bits. C counts output columns per warp
-// (gate/up pairs when fused), U counts K/32 units in flight per lane. Explicit choices also specialize grouped tiles
-// of one row; the default picks one by block type and rows (gate_up_dp4a) or keeps the original tiles, which
-// `original` takes everywhere (the control the default rule was measured against).
-enum MoeDp4a : int {
-  kMoeDp4aDefault, kMoeDp4aC1U1, kMoeDp4aC1U2, kMoeDp4aC2U1, kMoeDp4aC2U2, kMoeDp4aC4U1, kMoeDp4aC4U2,
-  kMoeDp4aOriginal, kMoeDp4aCount
-};
-inline const char* moe_dp4a_name(MoeDp4a variant) {
-  static constexpr const char* names[] = {"default", "1x1", "1x2", "2x1", "2x2", "4x1", "4x2", "original"};
-  static_assert(sizeof(names) / sizeof(names[0]) == kMoeDp4aCount);
-  return names[variant];
-}
-// The configurations a build compiles: all with the tuning candidates (FLYX_TUNE_CANDIDATES, as cuda_bench measures
-// them); a release build only those the default takes (1x1, 2x1) and the original tiles.
-constexpr bool moe_dp4a_compiled(MoeDp4a variant) {
-#if !defined(FLYX_TUNE_CANDIDATES) || FLYX_TUNE_CANDIDATES
-  return variant >= kMoeDp4aDefault && variant < kMoeDp4aCount;
-#else
-  return variant == kMoeDp4aDefault || variant == kMoeDp4aC1U1 || variant == kMoeDp4aC2U1 ||
-         variant == kMoeDp4aOriginal;
-#endif
-}
-// The formats for which extra configurations are compiled, also exercised by cuda_bench and cuda_op_test.
+// The block types the staged packed expert dp4a GEMMs compile every configuration for (variants/candidates.toml,
+// moe_dp4a; tools/codegen/gen_gemm_tables.py's MOE_DP4A_TYPES says the same): the other types the original tiles
+// alone.  Also those cuda_bench and cuda_op_test exercise.
 inline constexpr int kMoeDp4aTypes[] = {FLYX_DT_GGML_IQ3_XXS, FLYX_DT_GGML_IQ2_S, FLYX_DT_GGML_IQ2_XXS,
                                         FLYX_DT_GGML_IQ2_XS, FLYX_DT_GGML_IQ4_NL, FLYX_DT_GGML_Q4_K};
 constexpr bool has_moe_dp4a_variants(int dtype) {
@@ -129,7 +108,8 @@ struct KernelOptions {
   bool stacks = true;         // a stack's run and the next of another block type in one round launch where compiled
                               // (gemm_blocks_staged_runs)
   bool round_glu = true;      // a round's SwiGLU in its dp4a gate|up GEMM (gemm_blocks_round_glu_takes)
-  MoeDp4a moe_dp4a = kMoeDp4aDefault;  // measurement: packed expert dp4a kernel configuration
+  int moe_dp4a = -1;          // measurement: every packed expert dp4a GEMM of a type that compiles it in this
+                              // configuration (moe_dp4a_name); -1: the tables' rules (moe_gate_up_dp4a)
   bool side_stream = true;    // a round's narrow GEMMs of a stack on the launch's side stream (gemm_blocks_staged_runs)
   bool log_shapes = false;    // the backend prints every GEMM shape once
   bool prefill_fp4 = false;   // NVFP4 weights in prefill GEMMs take NVFP4 activations (W4A4, sm_120a; gemm_w4a4):
@@ -1733,6 +1713,22 @@ void moe_route(const float* logits, const float* bias, int rows, int n_experts, 
                bool norm_weights, float norm_eps, float route_scale, int* idx_out, float* w_out, cudaStream_t st);
 void situ_rows(const float* gu, int ld_gu, int I, float beta, float linear_beta, float* out, int ld_out, int rows,
                cudaStream_t st);
+// The staged packed expert dp4a GEMMs' configurations (variants/candidates.toml, moe_dp4a), all with the same bits:
+// output columns a warp (gate/up pairs where the activation is fused) and K/32 units a lane has in flight; columns 0
+// and units 0, the original tiles, which every block type compiles (kMoeDp4aTypes compile the others).  _name:
+// "original" or "<columns>x<units>"; _compiled: whether this build compiles configuration `cfg` for block type
+// `dtype` (with FLYX_TUNE_CANDIDATES every one of kMoeDp4aTypes, else those some table's rules reach);
+// moe_gate_up_dp4a: the configuration the rules (moe_gate_up) give a fused gate|up GEMM of `rows` rows of block type
+// `dtype` on a GPU of tuning table `tuning`.  Down GEMMs and unfused projections take the original tiles, unless
+// KernelOptions::moe_dp4a says otherwise.
+struct MoeDp4aConfig {
+  int columns, units;
+};
+extern const MoeDp4aConfig kMoeDp4aConfigs[];
+extern const int kMoeDp4aConfigCount;
+const char* moe_dp4a_name(int cfg);
+bool moe_dp4a_compiled(int dtype, int cfg);
+int moe_gate_up_dp4a(int tuning, int dtype, int rows);
 // What one of a fused round's MoE kernels may leave for the next without a staging launch between them, the
 // round's 1..16 rows in one chunk of the scratch.  moe_round_q8: the gate|up GEMM on W reads rows staged in 8 bits
 // (q8_ready below: staged already, by rmsnorm_moe_q8); moe_round_bf16_down: the down GEMM on W (NVFP4) reads bf16

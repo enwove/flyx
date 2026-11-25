@@ -1,8 +1,9 @@
 // Copyright 2026 The flyx Authors. SPDX-License-Identifier: Apache-2.0
 // What cuda_bench's benchmarks and its tuner (tune.cu) share: timing, random weights, the launches' scratch and
-// options, and the GGML block types and layers they measure.
+// options, the GGML block types and layers they measure, and the routes and buffers of their MoE layers.
 #pragma once
 
+#include <algorithm>
 #include <cstdio>
 #include <cstdlib>
 #include <vector>
@@ -144,6 +145,40 @@ inline void free_copies(std::vector<BlockMat>& w) {
   }
   w.clear();
 }
+
+// The experts kMoeRouteSets calls of `rows` rows take from a bank of E, top a row (E / 2 at least top): consecutive
+// rows keep two experts and slide the rest four a row; consecutive calls have disjoint sets, scattered over the bank
+// by a permutation (37 coprime to E).  With 128 experts and 8 a row, 32 calls complete a whole number of rotations at
+// every measured row count, including the wrap from one graph replay to the next.  Returns the distinct experts a
+// call reads.
+constexpr int kMoeRouteSets = 32;
+inline int make_moe_routes(int* indices, int rows, int E, int top) {
+  const int distinct = std::min(E / 2, top + 4 * (rows - 1));
+  std::vector<int> routes(size_t(kMoeRouteSets) * rows * top);
+  for (int i = 0; i < kMoeRouteSets; ++i)
+    for (int r = 0; r < rows; ++r)
+      for (int slot = 0; slot < top; ++slot) {
+        const int expert = slot < 2 ? slot : 2 + (4 * r + slot - 2) % (E / 2 - 2);
+        routes[(size_t(i) * rows + r) * top + slot] = (37 * (expert + i * distinct)) % E;
+      }
+  CK(cudaMemcpy(indices, routes.data(), routes.size() * sizeof(int), cudaMemcpyHostToDevice));
+  return distinct;
+}
+
+// Device buffers freed together.
+struct MoeBenchBuffers {
+  std::vector<void*> buffers;
+  template <class T>
+  T* alloc(size_t count) {
+    T* p;
+    CK(cudaMalloc(&p, count * sizeof(T)));
+    buffers.push_back(p);
+    return p;
+  }
+  ~MoeBenchBuffers() {
+    for (void* p : buffers) CK(cudaFree(p));
+  }
+};
 
 // cuda_bench tune [FAMILIES] [FILE...] (tune.cu): this GPU's tuning table.
 int tune(int argc, char** argv);

@@ -5,17 +5,33 @@
 #pragma once
 
 #include "backends/cuda/kernels/kernels.cuh"
+#include "flyx/gemm_tables.inc"
+
+#ifndef FLYX_TUNE_CANDIDATES
+#define FLYX_TUNE_CANDIDATES 1
+#endif
 
 namespace flyx::cuda {
 
+// Whether moe_dp4a configuration `cfg` (FLYX_MOE_DP4A) is compiled for block type `dtype`: the original tiles for
+// every type; the others for kMoeDp4aTypes, every one with FLYX_TUNE_CANDIDATES (as cuda_bench measures them), else
+// those some table's rules reach on any architecture (the launchers compile one set for all of them).
+constexpr bool moe_dp4a_cfg_compiled(int dtype, int cfg) {
+  if (cfg == tables::kMoeDp4aOriginal) return true;
+  if (cfg < 0 || cfg >= FLYX_MOE_DP4A_COUNT || !has_moe_dp4a_variants(dtype)) return false;
+  const int di = tables::ggml_type_index(dtype);
+  return FLYX_TUNE_CANDIDATES || (di >= 0 && (tables::kReachMoeDp4a[tables::kArchBucketAny][di] & (1u << cfg)) != 0);
+}
+
+// dp4a: the moe_dp4a configuration of the dp4a kernel, one compiled for the type (moe_dp4a_cfg_compiled).
 struct MoeBlockOps {
   bool mins;  // F::kFlatRun != 0 (requires q8_s half-group sums during staging)
   void (*gu)(const float* x, int ldx, const ExpertMat& W, const int* eidx, int rows, int top_k, int I, int K,
              float situ_beta, float situ_linear_beta, bool fuse_act, float* out, int ld_out, const MoeScratch* sc,
-             int max_tiles, bool use_mma, MoeDp4a dp4a, cudaStream_t st, bf16* act_bf16);
+             int max_tiles, bool use_mma, int dp4a, cudaStream_t st, bf16* act_bf16);
   bool (*down)(const float* act, int ld_act, const ExpertMat& W, const int* eidx, const float* ew, int rows, int top_k,
                int H, int K, float* out, int ld_out, bool accumulate, const MoeScratch* sc, int max_tiles, bool use_mma,
-               MoeDp4a dp4a, cudaStream_t st);
+               int dp4a, cudaStream_t st);
 };
 
 const MoeBlockOps* moe_block_ops_legacy(int dtype);   // Q4_0 Q4_1 Q5_0 Q5_1 Q8_0 MXFP4 Q2_0

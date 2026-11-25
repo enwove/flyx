@@ -173,36 +173,8 @@ void bench_skinny() {
   }
 }
 
-// One bank of 128 experts. Consecutive rows keep two experts and overlap two more in a sliding window of six.
-// Consecutive calls have disjoint sets, scattered over the bank by a permutation. 32 calls complete a whole
-// number of rotations at every measured row count, including the wrap from one graph replay to the next.
-constexpr int kMoeExperts = 128, kMoeTopK = 8, kMoeRouteSets = 32;
-int make_moe_routes(int* indices, int rows) {
-  const int distinct = std::min(kMoeExperts / 2, kMoeTopK + 4 * (rows - 1));
-  std::vector<int> routes(kMoeRouteSets * rows * kMoeTopK);
-  for (int i = 0; i < kMoeRouteSets; ++i)
-    for (int r = 0; r < rows; ++r)
-      for (int slot = 0; slot < kMoeTopK; ++slot) {
-        const int expert = slot < 2 ? slot : 2 + (4 * r + slot - 2) % (kMoeExperts / 2 - 2);
-        routes[(i * rows + r) * kMoeTopK + slot] = (37 * (expert + i * distinct)) % kMoeExperts;
-      }
-  CK(cudaMemcpy(indices, routes.data(), routes.size() * sizeof(int), cudaMemcpyHostToDevice));
-  return distinct;
-}
-
-struct MoeBenchBuffers {
-  std::vector<void*> buffers;
-  template <class T>
-  T* alloc(size_t count) {
-    T* p;
-    CK(cudaMalloc(&p, count * sizeof(T)));
-    buffers.push_back(p);
-    return p;
-  }
-  ~MoeBenchBuffers() {
-    for (void* p : buffers) CK(cudaFree(p));
-  }
-};
+// Inkling-2-Mini's MoE layers: a bank of 128 experts, 8 a token (make_moe_routes).
+constexpr int kMoeExperts = 128, kMoeTopK = 8;
 
 void bench_moe_projection(int dtype, bool down) {
   constexpr int H = 2304, I = 1152, E = kMoeExperts, top = kMoeTopK, max_pairs = kMaxBenchRows * top;
@@ -267,12 +239,12 @@ void bench_moe_projection(int dtype, bool down) {
   KernelOptions options;
   const Launch launch{st, nullptr, &options};
   for (int rows : {1, 2, 4, 6, 8, 16}) {
-    const int distinct = make_moe_routes(indices, rows);
+    const int distinct = make_moe_routes(indices, rows, E, top);
     const size_t bytes = distinct * expert_bytes;
-    const int variants = nvfp4 ? 1 : kMoeDp4aCount;
-    for (int v = 0; v < variants; ++v) {
-      options.moe_dp4a = static_cast<MoeDp4a>(v);
-      if (!moe_dp4a_compiled(options.moe_dp4a)) continue;  // a release build's
+    // -1: the rules (default); then every configuration this build compiles for the type
+    for (int v = -1; v < (nvfp4 ? 0 : kMoeDp4aConfigCount); ++v) {
+      if (v >= 0 && !moe_dp4a_compiled(dtype, v)) continue;
+      options.moe_dp4a = v;
       cudaGraph_t graph;
       cudaGraphExec_t exec;
       CK(cudaStreamBeginCapture(st, cudaStreamCaptureModeGlobal));

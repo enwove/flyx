@@ -209,14 +209,19 @@ const std::vector<OptionSpec>& option_specs() {
       kernel_flag_opt("round_glu", &KernelOptions::round_glu),
       {"moe_dp4a",
        [](const std::string& key, const std::string& val, BackendOptions* o, std::string* err) {
-         for (int i = 0; i < kMoeDp4aCount; ++i) {
-           const auto variant = static_cast<MoeDp4a>(i);
-           if (val != moe_dp4a_name(variant)) continue;
-           if (!moe_dp4a_compiled(variant)) {
-             *err = key + "=" + val + " is not compiled in this build (configure with -DFLYX_TUNE_CANDIDATES=ON)";
-             return false;
-           }
-           o->kernels.moe_dp4a = variant;
+         if (val == moe_dp4a_name(-1)) {
+           o->kernels.moe_dp4a = -1;
+           return true;
+         }
+         for (int i = 0; i < kMoeDp4aConfigCount; ++i) {
+           if (val != moe_dp4a_name(i)) continue;
+           // Every type that has configurations takes it, or none: a release build compiles those its tables reach.
+           for (int dtype : kMoeDp4aTypes)
+             if (!moe_dp4a_compiled(dtype, i)) {
+               *err = key + "=" + val + " is not compiled in this build (configure with -DFLYX_TUNE_CANDIDATES=ON)";
+               return false;
+             }
+           o->kernels.moe_dp4a = i;
            return true;
          }
          *err = "bad value \"" + val + "\" for " + key;

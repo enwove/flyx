@@ -249,7 +249,88 @@ with tempfile.TemporaryDirectory() as d:
 check("refused: a one-part configuration in a partition no K is given",
       err is not None and "parts 1 with chunks 8 or 16" in err, err)
 
+# MoE layers' fused gate|up GEMMs (moe_gate_up): a GPU's own rules by type and rows, the original tiles for every other
+# type; a release build compiles what they reach for that type, and the original tiles for every type everywhere.
+MOE = """
+sku = "a"
+[rules]
+moe_gate_up = [
+  { types = ["IQ2_S"], rows = [1, 3], columns = 4, units = 2 },
+  { types = ["IQ2_S"], columns = 1, units = 2 },
+  { columns = 0, units = 0 },
+]
+"""
+text, err = generate({"a": MOE})
+base, _ = generate({})
+check("a table with MoE gate|up rules of its own generates", text is not None, err)
+if text and base:
+    listed = text.split("#define FLYX_MOE_DP4A(X)")[1].split("#define FLYX_MOE_DP4A_COUNT")[0]
+    moe = {(int(c), int(u)): int(i) for i, c, u in re.findall(r"X\((\d+), (\d+), (\d+)\)", listed)}
+    original = moe.get((0, 0))
+    check("the original tiles are a configuration, named as such", original is not None and
+          f"kMoeDp4aOriginal = {original};" in text, sorted(moe))
+    own = [r for r in entries(text, "kMoeGateUp") if r.startswith("{0,")]
+    check("the GPU's MoE rules: its type's in order, then the original tiles for every type", own == [
+        f"{{0, FLYX_DT_GGML_IQ2_S, 1, 3, {moe[(4, 2)]}}}", f"{{0, FLYX_DT_GGML_IQ2_S, 1, {INF}, {moe[(1, 2)]}}}",
+        f"{{0, -1, 1, {INF}, {original}}}"], own)
+    moe_bit = 1 << list(gen.FAMILIES).index("moe_gate_up")
+    check("the GPU's table says it has the family", entries(text, "kSkus")[0] == f'{{"a", kDevices0, 0, -1, {moe_bit}u, false}}',
+          entries(text, "kSkus")[0])
+    check("the defaults end with the original tiles for every type",
+          entries(base, "kMoeGateUp")[-1] == f"{{-1, -1, 1, {INF}, {original}}}", entries(base, "kMoeGateUp")[-1])
+
+    def moe_reach(t):
+        body = re.search(r"kReachMoeDp4a\[7\]\[21\] = \{(.*?)\n\};", t, re.S).group(1)
+        return [[int(v.rstrip("u"), 16) for v in row.strip().strip("{},").split(", ")] for row in body.strip().splitlines()]
+    r, b = moe_reach(text), moe_reach(base)
+    s = gen.GGML_TYPES.index("IQ2_S")
+    added = (1 << moe[(4, 2)]) | (1 << moe[(1, 2)])
+    check("a release build compiles the table's configurations for its type on every architecture (a table of none)",
+          all(r[i][s] == b[i][s] | added for i in range(7)), [hex(row[s]) for row in r])
+    check("... and nothing more for the other types",
+          all(r[i][d] == b[i][d] for i in range(7) for d in range(len(gen.GGML_TYPES)) if d != s))
+    check("every type reaches the original tiles in every build",
+          all(v & (1 << original) for row in b for v in row))
+    allowed = sum(1 << i for i in moe.values())
+    check("the types without configurations of their own reach the original tiles alone",
+          all(b[i][d] == 1 << original for i in range(7) for d, t in enumerate(gen.GGML_TYPES)
+              if t not in gen.MOE_DP4A_TYPES) and all(v & ~allowed == 0 for row in b for v in row))
+with open(CANDIDATES, encoding="utf-8") as f:
+    no_original = f.read().replace("[[moe_dp4a]]\ncolumns = 0\nunits = 0\n", "", 1)
+with tempfile.TemporaryDirectory() as d:
+    path = os.path.join(d, "candidates.toml")
+    open(path, "w", encoding="utf-8").write(no_original)
+    try:
+        with contextlib.redirect_stderr(io.StringIO()):
+            gen.main(["--candidates", path, "--out", os.path.join(d, "out.inc")])
+        err = None
+    except SystemExit as e:
+        err = str(e)
+check("refused: MoE configurations without the original tiles", err is not None and "the original tiles" in err, err)
+
+MOE_REST = "{ columns = 0, units = 0 }"
 refusals = {
+    "a MoE rule for every type in a configuration the other types do not compile": (
+        "[rules]\nmoe_gate_up = [{ columns = 2, units = 1 }]\n", "beside the original tiles"),
+    "a MoE configuration for a type that compiles the original tiles alone": (
+        f'[rules]\nmoe_gate_up = [{{ types = ["Q8_0"], columns = 2, units = 1 }}, {MOE_REST}]\n',
+        "beside the original tiles"),
+    "a MoE configuration that is not compiled": (
+        f'[rules]\nmoe_gate_up = [{{ types = ["IQ2_S"], columns = 8, units = 1 }}, {MOE_REST}]\n',
+        "compiled moe_dp4a configuration"),
+    "MoE rules of a type that leave it rows to another list": (
+        f'[rules]\nmoe_gate_up = [{{ types = ["IQ2_S"], rows = [1, 4], columns = 2, units = 1 }}, {MOE_REST}]\n',
+        "end with a rule for the rest"),
+    "MoE rules without the rule for every type": (
+        '[rules]\nmoe_gate_up = [{ types = ["IQ2_S"], columns = 2, units = 1 }]\n', "end with a rule for the rest"),
+    "a MoE rule naming a type after the rules for every type": (
+        f'[rules]\nmoe_gate_up = [{MOE_REST}, {{ types = ["IQ2_S"], columns = 2, units = 1 }}]\n',
+        "come before the others"),
+    "a type in two lists of MoE rules": (
+        f'[rules]\nmoe_gate_up = [{{ types = ["IQ2_S"], columns = 2, units = 1 }}, '
+        f'{{ types = ["IQ2_S", "IQ2_XS"], columns = 1, units = 1 }}, {MOE_REST}]\n', "a type is named once"),
+    "a MoE rule with a key it does not take": (
+        "[rules]\nmoe_gate_up = [{ columns = 0, units = 0, n_max = 64 }]\n", "maybe rows, and columns and units"),
     "host-copy edges wider than the host copies": (PLACEMENT.replace("edge_host = 2", "edge_host = 7"), "invalid strata_placement"),
     "two placements for one strata layout": (PLACEMENT + PLACEMENT, "duplicate strata_placement"),
     "nonboolean half scan": (PLACEMENT.replace("scan_halves = true", "scan_halves = 2"), "scan_halves takes"),
