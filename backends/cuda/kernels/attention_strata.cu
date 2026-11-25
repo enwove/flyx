@@ -329,21 +329,27 @@ struct FoldSlots {
 
 // True when every row in [0, rows) gets the same starting key `cks` and is nonempty for `split`.
 // At long contexts this holds for all 64 splits (including the unaligned final split), so all rows run packed in 1 pass.
+// *end_out: the last key any of the rows reads in the split, plus one; *one_end_out: whether that is every row's end.
+// The ends do not grow with the rows: a row whose keys fill one split more than the row before it has shorter splits
+// (128 keys: [0, 128); 129 keys: [0, 96) and [96, 129); the same from 256 to 257), so the largest end is not the last
+// row's, and a scan that stopped at the last row's left the rows before it without their last keys.
 __device__ __forceinline__ bool strata_split_same_cks(int pos, int rows, int split, int splits, int* cks_out,
-                                                      int* e0_out = nullptr, int* el_out = nullptr) {
+                                                      int* end_out = nullptr, bool* one_end_out = nullptr) {
   int b0, e0;
   attn_split_range(pos + 1, split, splits, &b0, &e0);
   if (b0 >= e0) return false;
-  int el = e0;
+  int end = e0;
+  bool one_end = true;
   for (int r = 1; r < rows; ++r) {
     int br, er;
     attn_split_range(pos + r + 1, split, splits, &br, &er);
     if (br != b0 || br >= er) return false;
-    el = er;
+    one_end = one_end && er == e0;
+    end = max(end, er);
   }
   *cks_out = b0;
-  if (e0_out) *e0_out = e0;
-  if (el_out) *el_out = el;
+  if (end_out) *end_out = end;
+  if (one_end_out) *one_end_out = one_end;
   return true;
 }
 
@@ -813,10 +819,11 @@ __global__ void __launch_bounds__(32)
   const int total_warps = int(gridDim.x);
   const int total_cols = rows * G;
 
-  int b0 = 0, e0 = 0, el = 0;
-  const bool packed = strata_split_same_cks(P->position, rows, split, splits, &b0, &e0, &el);
+  int b0 = 0, end = 0;
+  bool one_end = false;
+  const bool packed = strata_split_same_cks(P->position, rows, split, splits, &b0, &end, &one_end);
   if constexpr (HD == 256 && BITS == 2) {
-    if (!rel.btab && packed && lse && e0 == el && e0 % kScanTile == 0) {
+    if (!rel.btab && packed && lse && one_end && end % kScanTile == 0) {
       bool cok[2];
       int lse_rh[2], cke[2];
       const int col_base = global_warp * 8;
@@ -827,10 +834,10 @@ __global__ void __launch_bounds__(32)
         const int cr = cok[j] ? cc / G : 0;
         const int ch = cok[j] ? cc - cr * G : 0;
         lse_rh[j] = cr * nh + kvh * G + ch;
-        cke[j] = e0;
+        cke[j] = end;
       }
       strata_scan_1w_body<HD, BITS, true, Compact>(
-          qr, kv, nh, nkv, G, rows, scale, part, lse, lse_stride, split, splits, kvh, global_warp, true, 0, b0, el,
+          qr, kv, nh, nkv, G, rows, scale, part, lse, lse_stride, split, splits, kvh, global_warp, true, 0, b0, end,
           cok, lse_rh, cke);
       return;
     }
@@ -840,7 +847,7 @@ __global__ void __launch_bounds__(32)
   for (int pass = 0; pass < passes; ++pass) {
     bool cok[2];
     int lse_rh[2], cke[2];
-    int my_cks = b0, max_cke_warp = el, tail_row = 0;
+    int my_cks = b0, max_cke_warp = end, tail_row = 0;
     if (packed) {
       const int col_base = global_warp * 8;
 #pragma unroll
@@ -924,8 +931,8 @@ __global__ void __launch_bounds__(32 * W, W == 3 ? 4 : (W == 2 ? 6 : 3))
   const int global_warp = int(blockIdx.x) * W + warp;
   const int total_warps = int(gridDim.x) * W;
 
-  int b0 = 0;
-  const bool packed = strata_split_same_cks(P->position, rows, split, splits, &b0);
+  int b0 = 0, packed_end = 0;
+  const bool packed = strata_split_same_cks(P->position, rows, split, splits, &b0, &packed_end);
   const int passes = packed ? 1 : ((rows + total_warps - 1) / total_warps);
 
   const size_t stride16 = Compact ? size_t(nkv) * 384 : size_t(nkv) * 16 * kv.words;
@@ -957,10 +964,8 @@ __global__ void __launch_bounds__(32 * W, W == 3 ? 4 : (W == 2 ? 6 : 3))
           cke[j] = re;
         }
       }
-      // CTA tile end = max over all rows in this split (last row has largest end).
-      int rb_last, re_last;
-      attn_split_range(P->position + rows, split, splits, &rb_last, &re_last);
-      max_cke_cta = re_last;
+      // The CTA's tiles end where the last of the rows' ranges does (not the last row's: strata_split_same_cks).
+      max_cke_cta = packed_end;
       t1_cta = (max_cke_cta - 1) / kScanTile;
     } else {
       my_active = tail_row < rows;

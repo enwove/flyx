@@ -142,7 +142,7 @@ struct HeadBlock {
   W12 w12;                     // a lossless 12-bit copy the target's logits read (1..16 rows); hi null: none
   int w12_escapes = 0;         // its escape list's length as allocated (what trim() gives back)
   SignHead coarse;             // drafts' 1-bit copy (draft_pick); bits null: none
-  float* cert = nullptr;       // option head_cert: the e4m3 copy's bound coefficient per row (head_cert_coef)
+  float* cert = nullptr;       // head_cert_coef: bound coefficients followed by e4m3 weight norms, each [vocab]
 };
 
 // Multi-token prediction: from (target hidden, next token) pairs one decoder

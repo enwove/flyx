@@ -349,18 +349,16 @@ int w12_finish(const bf16* W, int N, int K, W12* w, cudaStream_t st);
 // gemm_skinny's bits, written to y's column cols[j] (K % 32 == 0).
 void gemm_skinny_cols(const float* x, int ldx, const bf16* W, int K, const int* cols, const int* count, float* y,
                       int ldy, int rows, const Launch& L);
-// The certified output head, greedy, 1..16 rows. logits
-// holds every row's scores from the e4m3 copy (gemm_fp8_skinny), coef the per
-// row bound coefficients (head_cert_coef).  Afterwards each column that can
-// hold some row's largest exact score holds gemm_skinny(x, W)'s exact value in
-// every row, the others -inf: the largest entry of a row, lowest index on
-// ties, is that of gemm_skinny(x, W) over the whole vocabulary.  Scratch: hn
-// [rows] floats, key [rows] ints, cols [V] ints, count [1] int.
+// The certified output head, greedy, 1..16 rows. logits holds the scores from gemm_fp8_skinny and coef
+// holds the two planes from head_cert_coef. Afterwards each surviving column holds gemm_skinny's bits
+// in every row and the others hold -inf. Each row's largest entry (lowest index on ties) matches
+// gemm_skinny(x, W) over the whole vocabulary. Scratch holds
+// norms [2 * rows] (input norms then input rounding-error norms), key [rows], cols [V], count [1].
 void head_certify(const float* x, int ldx, const bf16* W, const float* coef, int V, int K, float* logits, int ldl,
-                  int rows, float* hn, int* key, int* cols, int* count, const Launch& L);
-// coef[n] = ||w_n - q_n|| + kHeadCertRounding (||w_n|| + ||q_n||), q_n the
-// e4m3 copy's row (Q times RS[n]): with ||x||, a bound on how far the copy's
-// score of row n (gemm_fp8_skinny) is from gemm_skinny's.
+                  int rows, float* norms, int* key, int* cols, int* count, const Launch& L);
+// The GEMMs' arithmetic allowance. coef[n] bounds ||w_n - q_n|| + kHeadCertRounding (||w_n|| + ||q_n||),
+// and coef[V + n] bounds ||q_n|| for the e4m3 row scaled by RS[n]. The score error is bounded by
+// ||x|| coef[n] + ||x - bf16(x)|| coef[V + n] on the sliced path and by ||x|| coef[n] on the three-part path.
 constexpr float kHeadCertRounding = 1e-3f;
 void head_cert_coef(const bf16* W, const uint8_t* Q, const float* RS, int V, int K, float* coef, cudaStream_t st);
 // 1..16 rows of x times W12 weights: the bits of gemm_skinny on the bf16 weights.
@@ -424,9 +422,10 @@ struct Fp4Config {
 extern const Fp4Config kFp4Configs[];
 extern const int kFp4ConfigCount;
 // FP8 weights for the output head (opt-in, KernelOptions::head_fp8): Q [N, K]
-// e4m3 codes, RS [N] = max|W[n]| / 448 (quantize_fp8_rows rounds to nearest);
-// gemm_fp8_skinny: 1..16 rows, K % 32 == 0, activations split as for gemm_skinny.
+// e4m3 codes, RS [N] = max|W[n]| / 448 (quantize_fp8_rows rounds to nearest).
 void quantize_fp8_rows(const bf16* W, int N, int K, uint8_t* Q, float* RS, cudaStream_t st);
+// gemm_fp8_skinny: 1..16 rows, K % 32 == 0. The sliced kernel reads only the bf16 high part of x.
+__host__ __device__ constexpr bool gemm_fp8_skinny_rounds_input(int K) { return K % 256 == 0; }
 void gemm_fp8_skinny(const float* x, int ldx, const uint8_t* W, const float* RS, int N, int K, float* y, int ldy,
                      int rows, bool accumulate, const Launch& L);
 // ---- GGML block weights (GGUF files) packed on the device (gemm_blocks.cu) ----

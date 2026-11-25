@@ -236,7 +236,7 @@ struct RowNeeds {
 // option head_cert: head_certify's scratch (row norms, bound keys, surviving columns and their count), shared in shape
 // by each sequence and by batch rounds.
 struct CertScratch {
-  float* hn = nullptr;
+  float* norms = nullptr;  // activation norms followed by input rounding residual norms, each [rows]
   int *key = nullptr, *cols = nullptr, *count = nullptr;
 };
 
@@ -1107,6 +1107,7 @@ void run_batch(const BatchPass& bp);
 RowNeeds row_needs(const flyx_bmodel* m);
 int max_drafts(const Block& drafter);  // most drafts a round of this drafter can verify (0: not a drafter)
 int ensure_prefill_rows(flyx_bmodel* m, int rows);
+void reserve_prefill_inputs(flyx_bmodel* m, size_t embed_rows, size_t position_rows);
 int seq_new(flyx_bmodel* m, int32_t max_ctx, flyx_seq** out);
 void seq_free(flyx_seq* s);
 int seq_bytes(flyx_bmodel* m, int32_t max_ctx, uint64_t* out);

@@ -102,6 +102,12 @@ int main() {
   test_strata(128, 16, 4, 5, 500, 3, false);   // head dim 128
   test_strata(64, 8, 2, 3, 300, 3, true);      // head dim 64 (the layout's shared words)
   test_strata(32, 4, 2, 5, 100, 3, false);     // the tiny model's
+  // A round whose later rows fill one split more than its first (129 keys after 128, 257 after 256): their splits are
+  // shorter (96 keys, not 128), so the round's last row is not the one whose first split ends last.
+  test_strata(256, 24, 4, 4, 254, 2, false);   // 255..258 keys, 2 bits: the scan a warp runs alone
+  test_strata(256, 24, 4, 7, 252, 3, true);    // 253..259 keys, 3 bits: the scan several warps run together
+  test_strata(256, 16, 4, 15, 114, 4, false);  // 115..129 keys: every row but the last ends past the last one's 96
+  test_strata(32, 4, 2, 5, 125, 2, true);      // the tiny model's, 126..130 keys
   test_pageable_kv_ops();
   // Every head dim the kernels take (the backend loads no other): decode, a prefill chunk on the tensor cores, and
   // the same with an FP8 cache.
@@ -136,6 +142,7 @@ int main() {
   test_gemm_fp8(1000, 2560);   // a partial column tile
   test_head_cert(5003, 256);   // a partial column group
   test_head_cert(20000, 2560);
+  test_head_cert_input_rounding();
   test_gemm_w12(1000, 2560);
   test_gemm_w12(64, 256);
   test_draft_pick(20000, 512, true);
