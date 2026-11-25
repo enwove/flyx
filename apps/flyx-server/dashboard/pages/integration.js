@@ -195,7 +195,7 @@ export function Integration({ active }) {
               <tr><td><code>name</code></td>${Td(String.raw`the model id the API reports`)}</tr>
             </tbody></table>
             <ul>${Li(String.raw`202 and the state; 409 while another load runs. The current model keeps answering while the new one is fetched.`)}
-              ${Li(String.raw`If the new model fails to load, the one served before is loaded again (<code>"fallback"</code> in the state names it).`)}</ul>
+              ${Li(String.raw`If the new model fails to load, no model is served until another is loaded (<code>"state": "failed"</code>).`)}</ul>
           </div></details>
         <details class="ep"><summary><span class="method delete">DELETE</span><span class="path">/v1/load</span><span class="what">${t("Stop a fetch")}</span><svg class="i"><use href="#i-chev"/></svg></summary>
           <div class="body"><ul>${Li(String.raw`What came stays in the cache; loading the same name again goes on from there.`)}</ul></div></details>
