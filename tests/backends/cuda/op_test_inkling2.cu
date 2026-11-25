@@ -77,60 +77,144 @@ void test_inkling2_softcap() {
   expect("softcap_rows finite", got_fin, want_fin, 2e-6);
 }
 
-void test_inkling2_attn_res() {
-  std::printf("inkling2 attn_res_mix\n");
-  for (int nb : {0, 1, 5}) {
-    for (int nq : {1, 3, 4}) {
-      const int R = 9, H = 512;
-      seed("inkling2_attn_res", nb, nq, R, H);
-      Vec bank = randv(size_t(nb) * R * H, 1.0);
-      Vec cur = randv(size_t(R) * H, 1.0);
-      Vec queries = randv(size_t(nq) * H, 0.5);
+namespace {
 
-      float* db = nb ? up(bank) : nullptr;
-      float* dc = up(cur);
-      float* dq = up(queries);
-      float* dout = dev<float>(size_t(nq) * R * H);
-      attn_res_mix(db, nb, dc, dq, nq, R, H, dout, 0);
-      Vec got = down(dout, size_t(nq) * R * H);
+void expect_device_bits(const std::string& what, const float* got, const float* want, size_t count);
 
-      // Reference (query-major [nq, R, H] matching CUDA layout).
-      Vec want(size_t(nq) * R * H, 0.0);
-      Vec tmp(size_t(nq) * H);
-      std::vector<const double*> ptrs(static_cast<size_t>(nb));
-      for (int r = 0; r < R; ++r) {
-        for (int b = 0; b < nb; ++b) ptrs[size_t(b)] = bank.data() + (size_t(b) * R + r) * H;
-        ops::attn_res_mix(ptrs.data(), nb, cur.data() + size_t(r) * H, queries.data(), nq, H, tmp.data());
-        for (int q = 0; q < nq; ++q)
-          std::copy_n(tmp.data() + size_t(q) * H, H, want.data() + (size_t(q) * R + r) * H);
+// One warp per (row, query). Scalar loads enumerate the original lane's channels, so this checks
+// the order of both FMA chains even if the fused and standalone implementations change together.
+__global__ void attn_res_order_reference(const float* states, const float* queries, int M, int R, int H,
+                                         int channels_per_lane, float* out) {
+  const int lane = threadIdx.x, r = blockIdx.x, q = blockIdx.y;
+  __shared__ float inv[64], scores[64];
+  for (int m = 0; m < M; ++m) {
+    const float* row = states + (size_t(m) * R + r) * H;
+    float ss = 0.f, dot = 0.f;
+    for (int i = lane * channels_per_lane; i < H; i += 32 * channels_per_lane) {
+      for (int j = 0; j < channels_per_lane; ++j) {
+        const float v = row[i + j];
+        ss = __fmaf_rn(v, v, ss);
+        dot = __fmaf_rn(v, queries[size_t(q) * H + i + j], dot);
       }
-      expect("attn_res_mix nb=" + std::to_string(nb) + " nq=" + std::to_string(nq), got, want, 1e-5);
-
-      // Row-count independence: row 3 alone vs in 9 rows.
-      const int rr = 3;
-      Vec bank1(size_t(nb) * H);
-      for (int b = 0; b < nb; ++b)
-        std::copy_n(bank.data() + (size_t(b) * R + rr) * H, H, bank1.data() + size_t(b) * H);
-      Vec cur1(cur.begin() + ptrdiff_t(rr) * H, cur.begin() + ptrdiff_t(rr + 1) * H);
-      float* db1 = nb ? up(bank1) : nullptr;
-      float* dc1 = up(cur1);
-      float* dout1 = dev<float>(size_t(nq) * H);
-      attn_res_mix(db1, nb, dc1, dq, nq, 1, H, dout1, 0);
-      Vec got1 = down(dout1, size_t(nq) * H);
-      Vec slice_r(size_t(nq) * H);
-      for (int q = 0; q < nq; ++q)
-        std::copy_n(got.data() + (size_t(q) * R + rr) * H, H, slice_r.data() + size_t(q) * H);
-      expect_bits("attn_res_mix R=1 vs R=9 nb=" + std::to_string(nb) + " nq=" + std::to_string(nq), got1, slice_r);
-
-      if (db) cudaFree(db);
-      if (db1) cudaFree(db1);
-      cudaFree(dc);
-      cudaFree(dc1);
-      cudaFree(dq);
-      cudaFree(dout);
-      cudaFree(dout1);
+    }
+    // Lane zero gets the same high-to-low butterfly as the production warp sum.
+    for (int d = 16; d > 0; d >>= 1) {
+      ss += __shfl_down_sync(0xffffffffu, ss, d);
+      dot += __shfl_down_sync(0xffffffffu, dot, d);
+    }
+    if (lane == 0) {
+      inv[m] = rsqrtf(ss / float(H) + 1e-6f);
+      scores[m] = dot * (inv[m] * rsqrtf(float(H)));
     }
   }
+  if (lane == 0) {
+    float mx = -INFINITY, z = 0.f;
+    for (int m = 0; m < M; ++m) mx = fmaxf(mx, scores[m]);
+    for (int m = 0; m < M; ++m) {
+      scores[m] = expf(scores[m] - mx);
+      z += scores[m];
+    }
+    const float inv_z = 1.f / z;
+    for (int m = 0; m < M; ++m) scores[m] = (scores[m] * inv_z) * inv[m];
+  }
+  __syncwarp();
+  for (int i = lane; i < H; i += 32) {
+    float mix = 0.f;
+    for (int m = 0; m < M; ++m) mix = __fmaf_rn(scores[m], states[(size_t(m) * R + r) * H + i], mix);
+    out[(size_t(q) * R + r) * H + i] = mix;
+  }
+}
+
+void check_attn_res_mix(int H, int M, int nq, int R, int input_offset = 0, int output_offset = 0,
+                        bool special_values = false) {
+  const int nb = M - 1;
+  seed("inkling2_attn_res", nb, nq, R, H);
+  const size_t row_bytes = size_t(H) * sizeof(float), count = size_t(nq) * R * H;
+  Vec storage = randv(input_offset + size_t(M) * R * H);
+  const Vec queries = randv(size_t(nq) * H, 0.5);
+  double* states = storage.data() + input_offset;
+  if (special_values) {
+    // Keep finite rows alongside the poisoned rows so signed zero and underflow in an individual
+    // channel reach the raw-word comparison. Only the current state contributes to channels 1 and 2.
+    const double sub = std::numeric_limits<float>::denorm_min();
+    const double nonfinite[] = {std::numeric_limits<float>::infinity(), -std::numeric_limits<float>::infinity(),
+                                std::numeric_limits<float>::quiet_NaN()};
+    for (int m = 0; m < M; ++m) {
+      for (int r = 0; r < R; ++r) {
+        double* row = states + (size_t(m) * R + r) * H;
+        row[0] = -0.0;
+        row[1] = m == nb ? sub : 0.0;
+        row[2] = m == nb ? -sub : -0.0;
+        row[3] = 512 * sub;
+        if (m == nb && r < 3) row[4] = nonfinite[r];
+      }
+    }
+  }
+  float* ds_base = up(storage);
+  float* ds = ds_base + input_offset;
+  float* dq = up(queries);
+  float* dout_base = dev<float>(output_offset + count);
+  float* dout = dout_base + output_offset;
+  float* dref = dev<float>(count);
+  attn_res_mix(nb ? ds : nullptr, nb, ds + size_t(nb) * R * H, dq, nq, R, H, dout, 0);
+  const int channels_per_lane = H % 4 == 0 && input_offset == 0 ? 4 : 1;
+  attn_res_order_reference<<<dim3(R, nq), 32>>>(ds, dq, M, R, H, channels_per_lane, dref);
+  CK(cudaGetLastError());
+  const std::string label = "attn_res_mix H=" + std::to_string(H) + " M=" + std::to_string(M) +
+                            " nq=" + std::to_string(nq) + " R=" + std::to_string(R) +
+                            (input_offset ? " shifted input" : "") + (output_offset ? " shifted output" : "") +
+                            (special_values ? " special values" : "");
+  expect_device_bits(label + " FMA order", dout, dref, count);
+
+  if (!special_values) {
+    Vec want(count), tmp(size_t(nq) * H);
+    std::vector<const double*> blocks(static_cast<size_t>(nb));
+    for (int r = 0; r < R; ++r) {
+      for (int b = 0; b < nb; ++b) blocks[b] = states + (size_t(b) * R + r) * H;
+      ops::attn_res_mix(blocks.data(), nb, states + (size_t(nb) * R + r) * H, queries.data(), nq, H, tmp.data());
+      for (int q = 0; q < nq; ++q)
+        std::copy_n(tmp.data() + size_t(q) * H, H, want.data() + (size_t(q) * R + r) * H);
+    }
+    expect(label + " f64", down(dout, count), want, 1e-5);
+  }
+
+  if (R > 1) {
+    const int r = R / 2;
+    float* ds1_base = dev<float>(input_offset + size_t(M) * H);
+    float* ds1 = ds1_base + input_offset;
+    float* dout1_base = dev<float>(output_offset + size_t(nq) * H);
+    float* dout1 = dout1_base + output_offset;
+    CK(cudaMemcpy2D(ds1, row_bytes, ds + size_t(r) * H, R * row_bytes, row_bytes, M, cudaMemcpyDeviceToDevice));
+    attn_res_mix(nb ? ds1 : nullptr, nb, ds1 + size_t(nb) * H, dq, nq, 1, H, dout1, 0);
+    CK(cudaMemcpy2D(dref, row_bytes, dout + size_t(r) * H, R * row_bytes, row_bytes, nq, cudaMemcpyDeviceToDevice));
+    expect_device_bits(label + " vs R=1", dout1, dref, size_t(nq) * H);
+    cudaFree(ds1_base);
+    cudaFree(dout1_base);
+  }
+  cudaFree(ds_base);
+  cudaFree(dq);
+  cudaFree(dout_base);
+  cudaFree(dref);
+}
+
+}  // namespace
+
+void test_inkling2_attn_res() {
+  std::printf("inkling2 attn_res_mix\n");
+  for (int nb : {0, 1, 5})
+    for (int nq : {1, 3, 4}) check_attn_res_mix(512, nb + 1, nq, 9);
+  // Every supported state depth and every round size, with a final float4 in just one lane.
+  for (int M = 1; M <= 64; ++M) check_attn_res_mix(260, M, 1 + (M - 1) % 4, 1 + (M - 1) % 16);
+  for (int H : {2304, 2560, 3072, 5120})
+    for (int R : {1, 4, 8, 16})
+      for (int nq : {1, 3, 4}) check_attn_res_mix(H, 10, nq, R);
+  // The larger launch groups four queries in a CTA. Its middle row must equal the split-query R=1 launch.
+  for (int nq : {1, 2, 3, 4, 7}) check_attn_res_mix(2304, 10, nq, 17);
+  for (int R : {8, 17}) check_attn_res_mix(260, 5, 4, R, 0, 0, true);
+  check_attn_res_mix(259, 17, 2, 4);          // scalar lane order and a partial warp
+  check_attn_res_mix(2308, 64, 4, 4);         // maximum depth and one float4 after 18 complete lane strides
+  check_attn_res_mix(2304, 10, 5, 8, 1);      // scalar lane order and a second query group
+  check_attn_res_mix(2304, 10, 5, 8, 0, 1);   // float4 dots with a scalar output mix
 }
 
 void test_inkling2_loop_ctrl() {
@@ -2184,177 +2268,173 @@ void test_inkling2_sublayer_fusion() {
     cudaFree(d_got);
   }
 
-  // 2. shortconv_res_mix_norm bit-identical across U=5 (H=2560) & U=10 (H=3072), R=1 & R=8,
-  //    res_push=false/true, nb=0/5, and all 4 SublayerNorm modes (None, F32, MoeQ8, AttnQ8Split).
   struct Case {
-    int R, H, nb, nq;
-    bool res_push, direct, moe_mins;
+    int rows, H, M, nq;
     SublayerNorm norm;
-    const char* name;
+    bool push, direct, moe_mins;
+    bool shift_xsrc = false;
   };
-  const Case cases[] = {
-      {1, 2560, 0, 1, false, true, false, SublayerNorm::None, "R=1 H=2560 nb=0 None direct"},
-      {8, 2560, 5, 3, true, false, false, SublayerNorm::None, "R=8 H=2560 nb=5 nq=3 push None"},
-      {8, 2560, 5, 1, true, false, false, SublayerNorm::F32, "R=8 H=2560 nb=5 push F32"},
-      {8, 2560, 5, 1, false, false, false, SublayerNorm::MoeQ8, "R=8 H=2560 nb=5 MoeQ8"},
-      {1, 2560, 5, 1, true, true, true, SublayerNorm::MoeQ8, "R=1 H=2560 nb=5 push MoeQ8+mins direct"},
-      {8, 2560, 5, 1, false, false, false, SublayerNorm::AttnQ8Split, "R=8 H=2560 nb=5 nq=1 AttnQ8Split"},
-      {8, 2560, 5, 3, true, false, false, SublayerNorm::AttnQ8Split, "R=8 H=2560 nb=5 nq=3 push AttnQ8Split"},
-      {4, 3072, 3, 3, true, false, false, SublayerNorm::AttnQ8Split, "R=4 H=3072 (U=10) nb=3 nq=3 AttnQ8Split"},
+  using Norm = SublayerNorm;
+  std::vector<Case> cases{
+      {16, 2304, 1, 1, Norm::None, false, true, false},
+      {16, 2308, 5, 2, Norm::None, true, false, false},    // partial warp of float4s
+      {16, 2305, 7, 3, Norm::None, false, true, false},    // scalar loads
+      {16, 2560, 16, 4, Norm::None, true, false, false},
+      {16, 2304, 10, 3, Norm::None, true, false, false},
+      {16, 2304, 9, 1, Norm::None, false, false, false},
+      {16, 2560, 6, 1, Norm::F32, true, false, false},
+      {16, 3072, 17, 1, Norm::F32, false, true, false},
+      {16, 3069, 10, 1, Norm::F32, false, false, false},   // scalar mix and a partial RMSNorm warp
+      {16, 2304, 8, 1, Norm::MoeQ8, false, false, false},
+      {16, 2560, 7, 1, Norm::MoeQ8, true, true, true},
+      {16, 5120, 3, 1, Norm::MoeQ8, false, true, true},
+      {16, 2304, 9, 1, Norm::AttnQ8Split, false, false, false},
+      {16, 2304, 10, 3, Norm::AttnQ8Split, true, false, false},
+      {16, 2304, 10, 3, Norm::AttnQ8Split, true, false, false, true},
+      {16, 2592, 15, 1, Norm::AttnQ8Split, false, false, false},
+      {16, 3072, 17, 3, Norm::AttnQ8Split, true, false, false},
+      {16, 5120, 4, 3, Norm::AttnQ8Split, true, false, false},
   };
+  // The compact bank makes every legal state count and row count inexpensive to exercise.
+  for (int m = 1; m <= 64; ++m)
+    cases.push_back({1 + (m - 1) % 16, 160, m, 1 + (m - 1) % 4, Norm::None, (m % 2) == 0, false, false});
+
+  // Separate scratch keeps all generic Q8 and split bits available across the prefix launches.
+  const size_t scratch_size = scratch_bytes(16, 5120, false);
+  uint8_t* scratch_mem = dev<uint8_t>(scratch_size);
+  const Scratch scratch = scratch_carve(scratch_mem, scratch_size, 16, 5120, false);
+  Launch fused_launch = TL;
+  fused_launch.scratch = &scratch;
+  auto moe_scratch = [](const Scratch& s) {
+    MoeScratch moe{};
+    moe.q8_a = s.q8;
+    moe.q8_d = s.q8_scale;
+    moe.q8_s = s.q8_sums;
+    return moe;
+  };
+  const MoeScratch msc_ref = moe_scratch(*TL.scratch), msc_got = moe_scratch(scratch);
+
   for (const Case& tc : cases) {
-    const int R = tc.R, H = tc.H, nb = tc.nb, nq = tc.nq, conv = 4, hist = conv - 1;
+    const int R = tc.rows, H = tc.H, nb = tc.M - 1 - int(tc.push), nq = tc.nq, conv = 4, hist = conv - 1;
     const int ch_off = 256, ch_total = ch_off + H;
-    seed("inkling2_sublayer_fusion", R, H, nb, nq, int(tc.res_push), int(tc.norm), int(tc.moe_mins));
-    Vec raw = randv(size_t(R) * H, 1.0);
-    Vec cw = randv(size_t(H) * conv, 0.3);
-    Vec st0 = randv(size_t(hist) * ch_total, 0.5);
-    Vec xsrc = randv(size_t(R) * H, 0.9);
-    Vec bank0 = randv(size_t(nb + 1) * R * H, 0.8);
-    Vec queries = randv(size_t(nq) * H, 0.5);
-    Vec nw = randv(H, 0.5);
+    const size_t w_stride = size_t(hist) * ch_total, r_stride = size_t(R) * ch_total;
+    const size_t elems = size_t(R) * H;
+    const int next_sel = tc.direct ? kSlotNext : -1;
     const float noff = 0.f, neps = 1e-6f;
-
+    seed("inkling2_sublayer_fusion", R, H, nb, nq, int(tc.push), int(tc.norm), int(tc.moe_mins));
     DevParams* P = params(0, 0);
-    const size_t w_stride = size_t(hist) * ch_total;
-    const size_t r_stride = size_t(R) * ch_total;
-    std::vector<float> h_st0(st0.begin(), st0.end());
-    float* d_raw = up(raw);
-    float* d_cw = up(cw);
-    float* d_xsrc = up(xsrc);
-    float* d_q = up(queries);
-    float* d_nw = up(nw);
-
+    float* d_raw = up(randv(elems, 1.0));
+    float* d_cw = up(randv(size_t(H) * conv, 0.3));
+    Vec xsrc = randv(elems, 0.9);
+    if (tc.shift_xsrc) xsrc.insert(xsrc.begin(), 0.);
+    float* xsrc_storage = up(xsrc);
+    float* d_xsrc = xsrc_storage + int(tc.shift_xsrc);
+    float* d_q = up(randv(size_t(nq) * H, 0.5));
+    float* d_nw = up(randv(H, 0.5));
+    Vec st0 = randv(w_stride, 0.5);
+    std::vector<float> history(st0.begin(), st0.end());
     float* d_win_ref = dev<float>(FLYX_ROUND_SLOTS * w_stride);
     float* d_win_got = dev<float>(FLYX_ROUND_SLOTS * w_stride);
-    CK(cudaMemcpy(d_win_ref, h_st0.data(), w_stride * sizeof(float), cudaMemcpyHostToDevice));
-    CK(cudaMemcpy(d_win_got, h_st0.data(), w_stride * sizeof(float), cudaMemcpyHostToDevice));
+    CK(cudaMemcpy(d_win_ref, history.data(), w_stride * sizeof(float), cudaMemcpyHostToDevice));
+    CK(cudaMemcpy(d_win_got, d_win_ref, w_stride * sizeof(float), cudaMemcpyDeviceToDevice));
     float* d_rep_ref = dev<float>(kGdnReplaySlots * r_stride);
     float* d_rep_got = dev<float>(kGdnReplaySlots * r_stride);
-    float* d_bank_ref = up(bank0);
-    float* d_bank_got = up(bank0);
-    float* d_x_ref = up(xsrc);
-    float* d_x_got = dev<float>(size_t(R) * H);
-    float* d_mix_ref = dev<float>(size_t(nq) * R * H);
-    float* d_mix_got = dev<float>(size_t(nq) * R * H);
-    float* d_ny_ref = dev<float>(size_t(R) * H);
-    float* d_ny_got = dev<float>(size_t(R) * H);
+    float* d_bank_ref = up(randv(size_t(nb + 1) * elems, 0.8));
+    float* d_bank_got = dev<float>(size_t(nb + 1) * elems);
+    // A shifted x_src selects the original fused scalar dot order even when x_dst is aligned.
+    // The unfused mix sees the current residual, so shift that input to reproduce the same lane ownership.
+    float* xref_storage = up(xsrc);
+    float* d_x_ref = xref_storage + int(tc.shift_xsrc);
+    float* d_x_got = dev<float>(elems);
+    float* d_mix_ref = dev<float>(nq * elems);
+    float* d_mix_got = dev<float>(nq * elems);
+    float* d_ny_ref = dev<float>(elems);
+    float* d_ny_got = dev<float>(elems);
 
-    // Reference: separate shortconv_pass + res_push + attn_res_mix + norm.
-    const int next_sel = tc.direct ? kSlotNext : -1;
-    int eff_nb = nb;
-    if (tc.res_push) {
-      CK(cudaMemcpy(d_bank_ref + size_t(nb) * R * H, d_x_ref, size_t(R) * H * sizeof(float), cudaMemcpyDeviceToDevice));
-      ++eff_nb;
-    }
+    if (tc.push)
+      CK(cudaMemcpy(d_bank_ref + nb * elems, d_x_ref, elems * sizeof(float), cudaMemcpyDeviceToDevice));
     shortconv_pass(d_raw, H, d_cw, nullptr, d_win_ref, w_stride, kSlotCur, next_sel, kSkipNever, d_rep_ref, r_stride,
-                   kSlotCur, ch_off, ch_total, H, conv, 0, P, R, d_x_ref, H, 0, !tc.res_push);
-    attn_res_mix(d_bank_ref, eff_nb, d_x_ref, d_q, nq, R, H, d_mix_ref, 0);
-
-    MoeScratch msc_ref{}, msc_got{};
-    const size_t q8_n = size_t(R) * H;
-    if (tc.norm == SublayerNorm::MoeQ8) {
-      msc_ref.q8_a = dev<int8_t>(q8_n);
-      msc_ref.q8_d = dev<float>(q8_n / 32);
-      msc_ref.q8_s = dev<float>(q8_n / 16);
-      msc_got.q8_a = dev<int8_t>(q8_n);
-      msc_got.q8_d = dev<float>(q8_n / 32);
-      msc_got.q8_s = dev<float>(q8_n / 16);
-      rmsnorm_moe_q8(d_mix_ref, H, d_nw, noff, neps, d_ny_ref, H, R, H, msc_ref, tc.moe_mins, 0);
-    } else if (tc.norm == SublayerNorm::F32) {
+                   kSlotCur, ch_off, ch_total, H, conv, 0, P, R, d_x_ref, H, 0, !tc.push);
+    attn_res_mix(d_bank_ref, tc.M - 1, d_x_ref, d_q, nq, R, H, d_mix_ref, 0);
+    if (tc.norm == Norm::F32)
       rmsnorm(d_mix_ref, H, d_nw, noff, neps, d_ny_ref, H, R, H, 0);
-    }
-
-    // Separate Scratch buffers for AttnQ8Split comparison.
-    std::vector<uint8_t> ref_q8, got_q8;
-    std::vector<float> ref_d, got_d, ref_s, got_s;
-    std::vector<uint16_t> ref_hi, got_hi, ref_mid, got_mid, ref_lo, got_lo;
-    if (tc.norm == SublayerNorm::AttnQ8Split) {
+    else if (tc.norm == Norm::MoeQ8)
+      rmsnorm_moe_q8(d_mix_ref, H, d_nw, noff, neps, d_ny_ref, H, R, H, msc_ref, tc.moe_mins, 0);
+    else if (tc.norm == Norm::AttnQ8Split)
       rmsnorm_q8_split(d_mix_ref, H, d_nw, noff, neps, R, H, TL);
-      CK(cudaDeviceSynchronize());
-      ref_q8.resize(q8_n);
-      ref_d.resize(q8_n / 32);
-      ref_s.resize(q8_n / 16);
-      ref_hi.resize(q8_n);
-      ref_mid.resize(q8_n);
-      ref_lo.resize(q8_n);
-      const size_t scap = TL.scratch->split_cap;
-      CK(cudaMemcpy(ref_q8.data(), TL.scratch->q8, q8_n, cudaMemcpyDeviceToHost));
-      CK(cudaMemcpy(ref_d.data(), TL.scratch->q8_scale, ref_d.size() * 4, cudaMemcpyDeviceToHost));
-      CK(cudaMemcpy(ref_s.data(), TL.scratch->q8_sums, ref_s.size() * 4, cudaMemcpyDeviceToHost));
-      CK(cudaMemcpy(ref_hi.data(), TL.scratch->split, q8_n * 2, cudaMemcpyDeviceToHost));
-      CK(cudaMemcpy(ref_mid.data(), TL.scratch->split + scap, q8_n * 2, cudaMemcpyDeviceToHost));
-      CK(cudaMemcpy(ref_lo.data(), TL.scratch->split + 2 * scap, q8_n * 2, cudaMemcpyDeviceToHost));
-      CK(cudaMemset(TL.scratch->q8, 0x55, q8_n));
-      CK(cudaMemset(TL.scratch->split, 0x55, q8_n * 2));
-      CK(cudaMemset(TL.scratch->split + scap, 0x55, q8_n * 2));
-      CK(cudaMemset(TL.scratch->split + 2 * scap, 0x55, q8_n * 2));
-    }
 
-    // Fused: shortconv_res_mix_norm.
-    SublayerPostConv spc{d_raw,    d_cw,  d_win_got, w_stride, kSlotCur, next_sel, kSkipNever,
-                         d_rep_got, r_stride, kSlotCur,  ch_off,   ch_total, conv,     tc.res_push};
-    shortconv_res_mix_norm(spc, d_xsrc, d_x_got, d_bank_got, nb, d_q, nq,
-                           (tc.norm == SublayerNorm::None || nq > 1) ? d_mix_got : nullptr, tc.norm, d_nw, noff, neps,
-                           d_ny_got, H, tc.norm == SublayerNorm::MoeQ8 ? &msc_got : nullptr, tc.moe_mins, P, R, H, TL);
+    // Every prefix has the same causal ShortConv inputs. Only the strides between bank states and
+    // between query outputs change. The separately launched operations at R give one oracle for all prefixes.
+    for (int rows = 1; rows <= R; ++rows) {
+      if (rows != 1 && rows != 4 && rows != 8 && rows != R) continue;
+      const size_t count = size_t(rows) * H, bytes = count * sizeof(float);
+      if (nb)
+        CK(cudaMemcpy2D(d_bank_got, bytes, d_bank_ref, elems * sizeof(float), bytes, nb, cudaMemcpyDeviceToDevice));
+      if (tc.push) CK(cudaMemset(d_bank_got + nb * count, 0x55, bytes));
+      CK(cudaMemset(d_x_got, 0x55, bytes));
+      CK(cudaMemset(d_mix_got, 0x55, nq * bytes));
+      CK(cudaMemset(d_ny_got, 0x55, bytes));
+      CK(cudaMemset2D(d_rep_got + ch_off, ch_total * sizeof(float), 0x55, H * sizeof(float), rows));
+      if (tc.direct)
+        CK(cudaMemset2D(d_win_got + w_stride + ch_off, ch_total * sizeof(float), 0x55, H * sizeof(float), hist));
+      if (tc.norm == Norm::MoeQ8 || tc.norm == Norm::AttnQ8Split) CK(cudaMemset(scratch_mem, 0x55, scratch_size));
 
-    const std::string tag = std::string("sublayer ") + tc.name;
-    expect_device_bits(tag + " x_dst", d_x_got, d_x_ref, size_t(R) * H);
-    expect_device_bits(tag + " replay", d_rep_got, d_rep_ref, r_stride);
-    if (tc.res_push) expect_device_bits(tag + " bank push", d_bank_got + size_t(nb) * R * H, d_bank_ref + size_t(nb) * R * H, size_t(R) * H);
-    if (tc.direct) expect_device_bits(tag + " win_out", d_win_got + w_stride, d_win_ref + w_stride, w_stride);
-    if (tc.norm == SublayerNorm::None) {
-      expect_device_bits(tag + " mix_out", d_mix_got, d_mix_ref, size_t(nq) * R * H);
-    } else if (tc.norm == SublayerNorm::F32) {
-      expect_device_bits(tag + " norm_y", d_ny_got, d_ny_ref, size_t(R) * H);
-    } else if (tc.norm == SublayerNorm::MoeQ8) {
-      expect_device_bits(tag + " moe norm_y", d_ny_got, d_ny_ref, size_t(R) * H);
-      expect_device_bits(tag + " moe q8_d", msc_got.q8_d, msc_ref.q8_d, q8_n / 32);
-      if (tc.moe_mins) expect_device_bits(tag + " moe q8_s", msc_got.q8_s, msc_ref.q8_s, q8_n / 16);
-      std::vector<int8_t> qa(q8_n), qb(q8_n);
-      CK(cudaMemcpy(qa.data(), msc_got.q8_a, q8_n, cudaMemcpyDeviceToHost));
-      CK(cudaMemcpy(qb.data(), msc_ref.q8_a, q8_n, cudaMemcpyDeviceToHost));
-      const bool q_ok = qa == qb;
-      std::printf("  %-4s %-48s %s\n", q_ok ? "ok" : "FAIL", (tag + " moe q8_a").c_str(),
-                  q_ok ? "bit-identical" : "BIT MISMATCH");
-      g_fail += !q_ok;
-    } else if (tc.norm == SublayerNorm::AttnQ8Split) {
-      CK(cudaDeviceSynchronize());
-      got_q8.resize(q8_n);
-      got_d.resize(q8_n / 32);
-      got_s.resize(q8_n / 16);
-      got_hi.resize(q8_n);
-      got_mid.resize(q8_n);
-      got_lo.resize(q8_n);
-      const size_t scap = TL.scratch->split_cap;
-      CK(cudaMemcpy(got_q8.data(), TL.scratch->q8, q8_n, cudaMemcpyDeviceToHost));
-      CK(cudaMemcpy(got_d.data(), TL.scratch->q8_scale, got_d.size() * 4, cudaMemcpyDeviceToHost));
-      CK(cudaMemcpy(got_s.data(), TL.scratch->q8_sums, got_s.size() * 4, cudaMemcpyDeviceToHost));
-      CK(cudaMemcpy(got_hi.data(), TL.scratch->split, q8_n * 2, cudaMemcpyDeviceToHost));
-      CK(cudaMemcpy(got_mid.data(), TL.scratch->split + scap, q8_n * 2, cudaMemcpyDeviceToHost));
-      CK(cudaMemcpy(got_lo.data(), TL.scratch->split + 2 * scap, q8_n * 2, cudaMemcpyDeviceToHost));
-      const bool ok_all = got_q8 == ref_q8 && got_d == ref_d && got_s == ref_s && got_hi == ref_hi &&
-                          got_mid == ref_mid && got_lo == ref_lo;
-      std::printf("  %-4s %-48s %s\n", ok_all ? "ok" : "FAIL", (tag + " q8+split").c_str(),
-                  ok_all ? "bit-identical" : "BIT MISMATCH");
-      g_fail += !ok_all;
-      if (nq > 1)
-        expect_device_bits(tag + " mix_out[1..nq-1]", d_mix_got + size_t(R) * H, d_mix_ref + size_t(R) * H,
-                           size_t(nq - 1) * R * H);
-    }
+      SublayerPostConv spc{d_raw, d_cw, d_win_got, w_stride, kSlotCur, next_sel, kSkipNever,
+                           d_rep_got, r_stride, kSlotCur, ch_off, ch_total, conv, tc.push};
+      shortconv_res_mix_norm(spc, d_xsrc, d_x_got, d_bank_got, nb, d_q, nq,
+                             tc.norm == Norm::None || nq > 1 ? d_mix_got : nullptr, tc.norm, d_nw, noff, neps,
+                             d_ny_got, H, tc.norm == Norm::MoeQ8 ? &msc_got : nullptr, tc.moe_mins, P, rows, H,
+                             fused_launch);
 
-    if (tc.norm == SublayerNorm::MoeQ8) {
-      cudaFree(msc_ref.q8_a);
-      cudaFree(msc_ref.q8_d);
-      cudaFree(msc_ref.q8_s);
-      cudaFree(msc_got.q8_a);
-      cudaFree(msc_got.q8_d);
-      cudaFree(msc_got.q8_s);
+      const std::string tag = "sublayer R=" + std::to_string(rows) + "/" + std::to_string(R) +
+                              " H=" + std::to_string(H) + " M=" + std::to_string(tc.M) + " nq=" + std::to_string(nq) +
+                              " norm=" + std::to_string(int(tc.norm)) + (tc.shift_xsrc ? " shifted x_src" : "");
+      bool ok = true;
+      auto check = [&](const std::string& name, const auto* got, const auto* ref, size_t n) {
+        const size_t nbytes = n * sizeof(*got);
+        std::vector<uint8_t> a(nbytes), b(nbytes);
+        CK(cudaMemcpy(a.data(), got, nbytes, cudaMemcpyDeviceToHost));
+        CK(cudaMemcpy(b.data(), ref, nbytes, cudaMemcpyDeviceToHost));
+        const auto diff = std::mismatch(a.begin(), a.end(), b.begin());
+        if (diff.first != a.end()) {
+          std::printf("  FAIL %s %s byte %zu: %02x != %02x\n", tag.c_str(), name.c_str(),
+                      size_t(diff.first - a.begin()), unsigned(*diff.first), unsigned(*diff.second));
+          ok = false;
+        }
+      };
+      check("x_dst", d_x_got, d_x_ref, count);
+      check("replay", d_rep_got, d_rep_ref, size_t(rows) * ch_total);
+      if (tc.push) check("bank push", d_bank_got + nb * count, d_bank_ref + nb * elems, count);
+      if (tc.direct && rows == R) {
+        check("next window", d_win_got + w_stride, d_win_ref + w_stride, w_stride);
+      } else if (tc.direct) {
+        // The saved window ends at the last row of this prefix.
+        for (int k = 0; k < hist; ++k) {
+          const int t = rows - hist + k;
+          const float* expected = t < 0 ? d_win_ref + size_t(hist + t) * ch_total + ch_off : d_raw + size_t(t) * H;
+          check("next window", d_win_got + w_stride + size_t(k) * ch_total + ch_off, expected, H);
+        }
+      }
+      for (int q = tc.norm == Norm::None ? 0 : 1; q < nq; ++q)
+        check("mix q=" + std::to_string(q), d_mix_got + q * count, d_mix_ref + q * elems, count);
+      if (tc.norm == Norm::F32 || tc.norm == Norm::MoeQ8) check("norm_y", d_ny_got, d_ny_ref, count);
+      if (tc.norm == Norm::MoeQ8 || tc.norm == Norm::AttnQ8Split) {
+        check("Q8 bytes", scratch.q8, TL.scratch->q8, count);
+        check("Q8 scales", scratch.q8_scale, TL.scratch->q8_scale, count / 32);
+        if (tc.moe_mins || tc.norm == Norm::AttnQ8Split)
+          check("Q8 sums", scratch.q8_sums, TL.scratch->q8_sums, count / 16);
+      }
+      if (tc.norm == Norm::AttnQ8Split)
+        for (int i = 0; i < 3; ++i)
+          check("BF16 part " + std::to_string(i), scratch.split + i * scratch.split_cap,
+                TL.scratch->split + i * TL.scratch->split_cap, count);
+      if (ok) std::printf("  ok   %-48s bit-identical\n", tag.c_str());
+      g_fail += !ok;
     }
     cudaFree(P);
     cudaFree(d_raw);
     cudaFree(d_cw);
-    cudaFree(d_xsrc);
+    cudaFree(xsrc_storage);
     cudaFree(d_q);
     cudaFree(d_nw);
     cudaFree(d_win_ref);
@@ -2363,13 +2443,14 @@ void test_inkling2_sublayer_fusion() {
     cudaFree(d_rep_got);
     cudaFree(d_bank_ref);
     cudaFree(d_bank_got);
-    cudaFree(d_x_ref);
+    cudaFree(xref_storage);
     cudaFree(d_x_got);
     cudaFree(d_mix_ref);
     cudaFree(d_mix_got);
     cudaFree(d_ny_ref);
     cudaFree(d_ny_got);
   }
+  cudaFree(scratch_mem);
 }
 
 void test_inkling2_rel_prep_kv_sc() {

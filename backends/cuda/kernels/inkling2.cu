@@ -27,10 +27,9 @@ __global__ void k_softcap_rows(float* logits, int ld, int V, float cap) {
 }
 
 // ---- attn_res_mix -------------------------------------------------------------------------
-// One block (512 threads, 16 warps) per row r. Computes up to 4 queries at a time over M = n_blocks + 1
+// A 512-thread block computes one row for one or more queries over M = n_blocks + 1
 // states (bank[0..n_blocks-1] and cur), each RMS-normalized (no gamma, eps = 1e-6).
-// Pass 1 assigns one warp per state (up to 16 states in parallel, float4 coalesced when H % 4 == 0)
-// for ~1.3 KB shared memory and zero local-stack spills; Pass 2 mixes states across all 512 threads.
+// One warp owns a state's dot products, one warp owns a query's softmax, and all threads mix the channels.
 constexpr int kMaxResStates = 64;
 
 // Exact block_sum order for 512-thread (16-warp) blocks in a single barrier (matches rows.cu::block512_sum).
@@ -44,51 +43,170 @@ __device__ __forceinline__ float block512_sum(float v) {
   return warp_sum(t);
 }
 
-// Per-state RMS and query dot products computed by 1 warp per state (shared by k_attn_res_mix and
-// k_shortconv_res_mix_norm so fused == generic bit-for-bit). Plain loads on `src` stay L1-coherent
-// with prior stores in the same block; read-only `queries` use __ldg.
+// A fused push reads its old residual directly from x_src. The current state can be the
+// ShortConv result in shared memory. The bank and standalone inputs are global.
+struct AttnResRow {
+  const float* bank;
+  size_t stride;
+  int n_blocks;
+  const float* pushed;
+  const float* cur;
+
+  __device__ __forceinline__ const float* state(int m) const {
+    if (m < n_blocks) return bank + size_t(m) * stride;
+    return pushed && m == n_blocks ? pushed : cur;
+  }
+};
+
+__device__ __forceinline__ float attn_res_dot(float a, float b, float sum) {
+  return __fmaf_rn(a, b, sum);
+}
+
+__device__ __forceinline__ float attn_res_dot(float4 a, float4 b, float sum) {
+  sum = __fmaf_rn(a.x, b.x, sum);
+  sum = __fmaf_rn(a.y, b.y, sum);
+  sum = __fmaf_rn(a.z, b.z, sum);
+  return __fmaf_rn(a.w, b.w, sum);
+}
+
+// Only the loads cross iterations. Each accumulator still visits i, i+32, ... in order,
+// with x/y/z/w consecutive in the vector path. A short batch never adds padding FMAs.
+template <int Batch, class T, int NQ>
+__device__ __forceinline__ void attn_res_dot_batch(const T* src, const T* queries, int stride, int i,
+                                                   float& ss, float (&dq)[NQ]) {
+  T v[Batch], w[NQ][Batch];
+#pragma unroll
+  for (int b = 0; b < Batch; ++b) v[b] = src[i + 32 * b];
+#pragma unroll
+  for (int q = 0; q < NQ; ++q)
+#pragma unroll
+    for (int b = 0; b < Batch; ++b) w[q][b] = __ldg(queries + size_t(q) * stride + i + 32 * b);
+#pragma unroll
+  for (int b = 0; b < Batch; ++b) {
+    ss = attn_res_dot(v[b], v[b], ss);
+#pragma unroll
+    for (int q = 0; q < NQ; ++q) dq[q] = attn_res_dot(v[b], w[q][b], dq[q]);
+  }
+}
+
+template <class T, int NQ>
+__device__ __forceinline__ void attn_res_state_dots(const T* src, const T* queries, int count, int lane,
+                                                    float& ss, float (&dq)[NQ]) {
+  // Bound the number of live float4s when several queries share the same state load.
+  constexpr int batch = NQ == 1 ? 6 : 3;
+  int i = lane;
+  for (; i < count - 32 * (batch - 1); i += 32 * batch)
+    attn_res_dot_batch<batch>(src, queries, count, i, ss, dq);
+  for (; i < count; i += 32) attn_res_dot_batch<1>(src, queries, count, i, ss, dq);
+}
+
 template <int NQ>
-__device__ __forceinline__ void attn_res_state_dots(const float* src, const float* __restrict__ queries, int q0, int H,
-                                                    bool vec4, int lane, float inv_sqrt_h, float& inv_out,
-                                                    float (&dot_out)[NQ]) {
-  float s0 = 0.f;
-  float dq[NQ];
+__device__ __forceinline__ void attn_res_weights(const AttnResRow& row, int M, const float* queries, int H,
+                                                 bool vec4, float (&alpha)[NQ][kMaxResStates]) {
+  const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
+  __shared__ float inv[kMaxResStates];
+  const float inv_sqrt_h = rsqrtf(float(H));
+  for (int m = warp; m < M; m += 16) {
+    const float* src = row.state(m);
+    float ss = 0.f, dq[NQ]{};
+    if (vec4)
+      attn_res_state_dots(reinterpret_cast<const float4*>(src), reinterpret_cast<const float4*>(queries),
+                          H / 4, lane, ss, dq);
+    else
+      attn_res_state_dots(src, queries, H, lane, ss, dq);
+    const float inv_rms = rsqrtf(warp_sum(ss) / float(H) + 1e-6f);
+    const float scale = inv_rms * inv_sqrt_h;
+    if (lane == 0) inv[m] = inv_rms;
 #pragma unroll
-  for (int q = 0; q < NQ; ++q) dq[q] = 0.f;
-  if (vec4) {
-    const int H4 = H >> 2;
-    const float4* src4 = reinterpret_cast<const float4*>(src);
-    for (int i = lane; i < H4; i += 32) {
-      const float4 v = src4[i];
-      s0 = __fmaf_rn(v.x, v.x, s0);
-      s0 = __fmaf_rn(v.y, v.y, s0);
-      s0 = __fmaf_rn(v.z, v.z, s0);
-      s0 = __fmaf_rn(v.w, v.w, s0);
-#pragma unroll
-      for (int q = 0; q < NQ; ++q) {
-        const float4 qv = __ldg(reinterpret_cast<const float4*>(queries + size_t(q0 + q) * H) + i);
-        float a = dq[q];
-        a = __fmaf_rn(v.x, qv.x, a);
-        a = __fmaf_rn(v.y, qv.y, a);
-        a = __fmaf_rn(v.z, qv.z, a);
-        a = __fmaf_rn(v.w, qv.w, a);
-        dq[q] = a;
-      }
-    }
-  } else {
-    for (int i = lane; i < H; i += 32) {
-      const float v = src[i];
-      s0 = __fmaf_rn(v, v, s0);
-#pragma unroll
-      for (int q = 0; q < NQ; ++q) dq[q] = __fmaf_rn(v, __ldg(queries + size_t(q0 + q) * H + i), dq[q]);
+    for (int q = 0; q < NQ; ++q) {
+      const float dot = warp_sum(dq[q]) * scale;
+      if (lane == 0) alpha[q][m] = dot;
     }
   }
-  s0 = warp_sum(s0);
-  const float inv = rsqrtf(s0 / float(H) + 1e-6f);
-  const float sc = inv * inv_sqrt_h;
-  inv_out = inv;
+  __syncthreads();
+
+  // One warp per query evaluates the independent exponentials together. Both folds broadcast
+  // exactly the M real states in ascending order, including when a lane owns a second state.
+  if (warp < NQ) {
+    static_assert(kMaxResStates == 64);
+    const int first = min(M, 32);
+    const float d0 = lane < first ? alpha[warp][lane] : 0.f;
+    const float d1 = lane + 32 < M ? alpha[warp][lane + 32] : 0.f;
+    float mx = -INFINITY;
+    for (int m = 0; m < first; ++m) mx = fmaxf(mx, __shfl_sync(0xffffffffu, d0, m));
+    for (int m = 0; m < M - 32; ++m) mx = fmaxf(mx, __shfl_sync(0xffffffffu, d1, m));
+    const float e0 = lane < first ? expf(d0 - mx) : 0.f;
+    const float e1 = lane + 32 < M ? expf(d1 - mx) : 0.f;
+    float z = 0.f;
+    for (int m = 0; m < first; ++m) z += __shfl_sync(0xffffffffu, e0, m);
+    for (int m = 0; m < M - 32; ++m) z += __shfl_sync(0xffffffffu, e1, m);
+    const float inv_z = 1.f / z;
+    if (lane < first) alpha[warp][lane] = (e0 * inv_z) * inv[lane];
+    if (lane + 32 < M) alpha[warp][lane + 32] = (e1 * inv_z) * inv[lane + 32];
+  }
+  __syncthreads();
+}
+
+__device__ __forceinline__ void attn_res_add(float a, float v, float& sum) {
+  sum = __fmaf_rn(a, v, sum);
+}
+
+__device__ __forceinline__ void attn_res_add(float a, float4 v, float4& sum) {
+  sum.x = __fmaf_rn(a, v.x, sum.x);
+  sum.y = __fmaf_rn(a, v.y, sum.y);
+  sum.z = __fmaf_rn(a, v.z, sum.z);
+  sum.w = __fmaf_rn(a, v.w, sum.w);
+}
+
+// The dot phase has finished reading cur. Each mixing thread owns its channels for the
+// whole state sweep, so it can replace them in-place with query zero in the fused kernel.
+template <class T, int NQ>
+__device__ __forceinline__ void attn_res_mix_channels(const AttnResRow& row, int M, int count,
+                                                      const float (&alpha)[NQ][kMaxResStates],
+                                                      T* out0, T* out, size_t query_stride) {
+  constexpr int batch = 4;
+  for (int i = threadIdx.x; i < count; i += 512) {
+    T mix[NQ]{};
+    for (int m = 0; m < M; m += batch) {
+      T v[batch];
+      float a[batch][NQ];
 #pragma unroll
-  for (int q = 0; q < NQ; ++q) dot_out[q] = warp_sum(dq[q]) * sc;
+      for (int b = 0; b < batch; ++b) {
+        if (m + b < M) {
+          v[b] = reinterpret_cast<const T*>(row.state(m + b))[i];
+#pragma unroll
+          for (int q = 0; q < NQ; ++q) a[b][q] = alpha[q][m + b];
+        }
+      }
+#pragma unroll
+      for (int b = 0; b < batch; ++b) {
+        if (m + b < M) {
+#pragma unroll
+          for (int q = 0; q < NQ; ++q) attn_res_add(a[b][q], v[b], mix[q]);
+        }
+      }
+    }
+    out0[i] = mix[0];
+    if constexpr (NQ > 1) {
+      if (out) {
+#pragma unroll
+        for (int q = 1; q < NQ; ++q) out[size_t(q) * query_stride + i] = mix[q];
+      }
+    }
+  }
+}
+
+template <int NQ>
+__device__ __forceinline__ void attn_res_mix_row(const AttnResRow& row, const float* queries, int H, bool vec4,
+                                                 float* out0, float* out) {
+  const int M = row.n_blocks + int(row.pushed != nullptr) + 1;
+  __shared__ float alpha[NQ][kMaxResStates];
+  attn_res_weights(row, M, queries, H, vec4, alpha);
+  if (vec4 && ((reinterpret_cast<uintptr_t>(out0) | reinterpret_cast<uintptr_t>(out)) & 15u) == 0)
+    attn_res_mix_channels(row, M, H / 4, alpha, reinterpret_cast<float4*>(out0),
+                          reinterpret_cast<float4*>(out), row.stride / 4);
+  else
+    attn_res_mix_channels(row, M, H, alpha, out0, out, row.stride);
 }
 
 template <int NQ>
@@ -96,77 +214,13 @@ __global__ void __launch_bounds__(512) k_attn_res_mix(const float* __restrict__ 
                                                       const float* __restrict__ cur, const float* __restrict__ queries,
                                                       int q0, int rows, int H, float* __restrict__ out) {
   pdl_trigger();
-  const int r = blockIdx.x, tid = threadIdx.x, lane = tid & 31, warp = tid >> 5;
-  const int M = n_blocks + 1;
-  __shared__ float s_inv[kMaxResStates];
-  __shared__ float s_dot[NQ][kMaxResStates];
-  __shared__ float s_alpha[NQ][kMaxResStates];
-
+  const size_t offset = size_t(blockIdx.x) * H, stride = size_t(rows) * H;
+  const AttnResRow row{n_blocks ? bank + offset : nullptr, stride, n_blocks, nullptr, cur + offset};
   const bool vec4 = (H & 3) == 0 && ((reinterpret_cast<uintptr_t>(bank) | reinterpret_cast<uintptr_t>(cur) |
                                       reinterpret_cast<uintptr_t>(queries)) & 15u) == 0;
-  const float inv_sqrt_h = rsqrtf(float(H));
-  for (int m = warp; m < M; m += 16) {
-    const float* src = (m < n_blocks) ? (bank + (size_t(m) * rows + r) * H) : (cur + size_t(r) * H);
-    float inv, dq[NQ];
-    attn_res_state_dots<NQ>(src, queries, q0, H, vec4, lane, inv_sqrt_h, inv, dq);
-    if (lane == 0) {
-      s_inv[m] = inv;
-#pragma unroll
-      for (int q = 0; q < NQ; ++q) s_dot[q][m] = dq[q];
-    }
-  }
-  __syncthreads();
-  if (tid < NQ) {
-    const int q = tid;
-    float mx = -INFINITY;
-    for (int m = 0; m < M; ++m) mx = fmaxf(mx, s_dot[q][m]);
-    float z = 0.f;
-    for (int m = 0; m < M; ++m) {
-      const float e = expf(s_dot[q][m] - mx);
-      s_alpha[q][m] = e;
-      z += e;
-    }
-    const float inv_z = 1.f / z;
-    for (int m = 0; m < M; ++m) s_alpha[q][m] = (s_alpha[q][m] * inv_z) * s_inv[m];
-  }
-  __syncthreads();
-  if (vec4 && (reinterpret_cast<uintptr_t>(out) & 15u) == 0) {
-    const int H4 = H >> 2;
-    for (int i = tid; i < H4; i += 512) {
-      float4 o[NQ];
-#pragma unroll
-      for (int q = 0; q < NQ; ++q) o[q] = make_float4(0.f, 0.f, 0.f, 0.f);
-      for (int m = 0; m < M; ++m) {
-        const float4* src4 = reinterpret_cast<const float4*>(
-            (m < n_blocks) ? (bank + (size_t(m) * rows + r) * H) : (cur + size_t(r) * H));
-        const float4 v = src4[i];
-#pragma unroll
-        for (int q = 0; q < NQ; ++q) {
-          const float a = s_alpha[q][m];
-          o[q].x = __fmaf_rn(a, v.x, o[q].x);
-          o[q].y = __fmaf_rn(a, v.y, o[q].y);
-          o[q].z = __fmaf_rn(a, v.z, o[q].z);
-          o[q].w = __fmaf_rn(a, v.w, o[q].w);
-        }
-      }
-#pragma unroll
-      for (int q = 0; q < NQ; ++q) reinterpret_cast<float4*>(out + (size_t(q0 + q) * rows + r) * H)[i] = o[q];
-    }
-  } else {
-    for (int i = tid; i < H; i += 512) {
-      float o[NQ];
-#pragma unroll
-      for (int q = 0; q < NQ; ++q) o[q] = 0.f;
-      for (int m = 0; m < M; ++m) {
-        const float* src = (m < n_blocks) ? (bank + (size_t(m) * rows + r) * H) : (cur + size_t(r) * H);
-        const float v = src[i];
-#pragma unroll
-        for (int q = 0; q < NQ; ++q) o[q] = __fmaf_rn(s_alpha[q][m], v, o[q]);
-      }
-#pragma unroll
-      for (int q = 0; q < NQ; ++q) out[(size_t(q0 + q) * rows + r) * H + i] = o[q];
-    }
-  }
+  const int query = q0 + int(blockIdx.y);
+  float* dest = out + size_t(query) * stride + offset;
+  attn_res_mix_row<NQ>(row, queries + size_t(query) * H, H, vec4, dest, dest);
 }
 
 // ---- loop_ctrl_prep, loop_ctrl_apply & loop_ctrl_apply_norm --------------------------------
@@ -675,8 +729,7 @@ __global__ void k_shortconv_pass(const float* __restrict__ x, int ldx, const flo
 // ---- shortconv_res_mix_norm ---------------------------------------------------------------
 // Fused sublayer boundary for rounds (1..16 rows, H <= 5120, n_blocks + res_push + 1 <= kMaxResStates):
 //   shortconv_pass(post_raw) + residual(+res_push to bank) + attn_res_mix + optional rmsnorm (F32/MoeQ8/AttnQ8Split).
-// Uses 1 block (512 threads, 16 warps) per row with 1 warp per state in Pass 1 (identical dot-product order
-// to k_attn_res_mix, ~1.3 KB smem, 0 stack) and a single bank sweep in Pass 2 for all NQ outputs.
+// The H-float shared row forwards the rounded residual to AttnRes and its first mixed query to RMSNorm.
 template <SublayerNorm NORM, int NQ, int U>
 __global__ void __launch_bounds__(512)
     k_shortconv_res_mix_norm(SublayerPostConv sc, const float* __restrict__ x_src, float* __restrict__ x_dst,
@@ -685,7 +738,9 @@ __global__ void __launch_bounds__(512)
                              float norm_eps, Out norm_o, int ldy, const DevParams* P, int rows, int H) {
   pdl_trigger();
   const int r = blockIdx.x, tid = threadIdx.x;
-  const int lane = tid & 31, warp = tid >> 5;
+  const int warp = tid >> 5;
+  extern __shared__ float4 sublayer_row[];
+  float* shared_row = reinterpret_cast<float*>(sublayer_row);
   const int hist = sc.conv - 1;
   const float inv_scale = rsqrtf(float(sc.conv + 1));
   const bool skip_sc = (sc.skip == kSkipIfStopped && P->stopped) || (sc.skip == kSkipIfNoop && P->noop);
@@ -725,6 +780,7 @@ __global__ void __launch_bounds__(512)
     const float xnew = push ? y : (xs + y);
     if (push) bank[(size_t(n_blocks) * rows + r) * H + c] = xs;
     x_dst[size_t(r) * H + c] = xnew;
+    shared_row[c] = xnew;
     if (rep_base) rep_base[size_t(r) * ch_total + ch_off + c] = xr;
     if (win_out) {
       for (int k = 0; k < hist; ++k) {
@@ -734,155 +790,35 @@ __global__ void __launch_bounds__(512)
       }
     }
   }
-  __syncthreads();  // make x_dst stores visible to warp-per-state loads in L1
+  __syncthreads();  // the state warp reads channels produced by other warps
 
-  const int eff_blocks = n_blocks + (sc.res_push ? 1 : 0);
-  const int M = eff_blocks + 1;
-  __shared__ float s_inv[kMaxResStates];
-  __shared__ float s_dot[NQ][kMaxResStates];
-  __shared__ float s_alpha[NQ][kMaxResStates];
-
+  const size_t offset = size_t(r) * H;
+  const AttnResRow row{n_blocks ? bank + offset : nullptr, size_t(rows) * H, n_blocks,
+                       push ? x_src + offset : nullptr, shared_row};
   const bool vec4 = (H & 3) == 0 && ((reinterpret_cast<uintptr_t>(bank) | reinterpret_cast<uintptr_t>(x_src) |
                                       reinterpret_cast<uintptr_t>(x_dst) | reinterpret_cast<uintptr_t>(queries)) &
                                      15u) == 0;
-  const float inv_sqrt_h = rsqrtf(float(H));
-  for (int m = warp; m < M; m += 16) {
-    const float* src = (m < n_blocks) ? (bank + (size_t(m) * rows + r) * H)
-                                      : (m == eff_blocks ? (x_dst + size_t(r) * H) : (x_src + size_t(r) * H));
-    float inv, dq[NQ];
-    attn_res_state_dots<NQ>(src, queries, 0, H, vec4, lane, inv_sqrt_h, inv, dq);
-    if (lane == 0) {
-      s_inv[m] = inv;
-#pragma unroll
-      for (int q = 0; q < NQ; ++q) s_dot[q][m] = dq[q];
-    }
-  }
-  __syncthreads();
-  if (tid < NQ) {
-    const int q = tid;
-    float mx = -INFINITY;
-    for (int m = 0; m < M; ++m) mx = fmaxf(mx, s_dot[q][m]);
-    float z = 0.f;
-    for (int m = 0; m < M; ++m) {
-      const float e = expf(s_dot[q][m] - mx);
-      s_alpha[q][m] = e;
-      z += e;
-    }
-    const float inv_z = 1.f / z;
-    for (int m = 0; m < M; ++m) s_alpha[q][m] = (s_alpha[q][m] * inv_z) * s_inv[m];
-  }
-  __syncthreads();
+  float* dest = mix_out ? mix_out + offset : nullptr;
+  attn_res_mix_row<NQ>(row, queries, H, vec4, NORM == SublayerNorm::None ? dest : shared_row, dest);
 
-  if constexpr (NORM == SublayerNorm::None) {
-    if (vec4 && (reinterpret_cast<uintptr_t>(mix_out) & 15u) == 0) {
-      const int H4 = H >> 2;
-      for (int i = tid; i < H4; i += 512) {
-        float4 o[NQ];
-#pragma unroll
-        for (int q = 0; q < NQ; ++q) o[q] = make_float4(0.f, 0.f, 0.f, 0.f);
-        for (int m = 0; m < M; ++m) {
-          const float* src = (m < n_blocks) ? (bank + (size_t(m) * rows + r) * H)
-                                            : (m == eff_blocks ? (x_dst + size_t(r) * H) : (x_src + size_t(r) * H));
-          const float4 v = reinterpret_cast<const float4*>(src)[i];
-#pragma unroll
-          for (int q = 0; q < NQ; ++q) {
-            const float a = s_alpha[q][m];
-            o[q].x = __fmaf_rn(a, v.x, o[q].x);
-            o[q].y = __fmaf_rn(a, v.y, o[q].y);
-            o[q].z = __fmaf_rn(a, v.z, o[q].z);
-            o[q].w = __fmaf_rn(a, v.w, o[q].w);
-          }
-        }
-#pragma unroll
-        for (int q = 0; q < NQ; ++q) reinterpret_cast<float4*>(mix_out + (size_t(q) * rows + r) * H)[i] = o[q];
-      }
-    } else {
-      for (int c = tid; c < H; c += 512) {
-        float o[NQ];
-#pragma unroll
-        for (int q = 0; q < NQ; ++q) o[q] = 0.f;
-        for (int m = 0; m < M; ++m) {
-          const float* src = (m < n_blocks) ? (bank + (size_t(m) * rows + r) * H)
-                                            : (m == eff_blocks ? (x_dst + size_t(r) * H) : (x_src + size_t(r) * H));
-          const float v = src[c];
-#pragma unroll
-          for (int q = 0; q < NQ; ++q) o[q] = __fmaf_rn(s_alpha[q][m], v, o[q]);
-        }
-#pragma unroll
-        for (int q = 0; q < NQ; ++q) mix_out[(size_t(q) * rows + r) * H + c] = o[q];
-      }
-    }
-  } else {
-    float mix0[U];
-#pragma unroll
-    for (int u = 0; u < U; ++u) mix0[u] = 0.f;
-    if constexpr (NQ > 1 && U <= 5) {
-      float mix_rest[NQ - 1][U];
-#pragma unroll
-      for (int q = 0; q < NQ - 1; ++q)
-#pragma unroll
-        for (int u = 0; u < U; ++u) mix_rest[q][u] = 0.f;
-      for (int m = 0; m < M; ++m) {
-        const float* src = (m < n_blocks) ? (bank + (size_t(m) * rows + r) * H)
-                                          : (m == eff_blocks ? (x_dst + size_t(r) * H) : (x_src + size_t(r) * H));
-        const float a0 = s_alpha[0][m];
-        float ar[NQ - 1];
-#pragma unroll
-        for (int q = 0; q < NQ - 1; ++q) ar[q] = s_alpha[q + 1][m];
-#pragma unroll
-        for (int u = 0; u < U; ++u) {
-          const int c = tid + u * 512;
-          if (c < H) {
-            const float v = src[c];
-            mix0[u] = __fmaf_rn(a0, v, mix0[u]);
-#pragma unroll
-            for (int q = 0; q < NQ - 1; ++q) mix_rest[q][u] = __fmaf_rn(ar[q], v, mix_rest[q][u]);
-          }
-        }
-      }
-      if (mix_out) {
-#pragma unroll
-        for (int q = 0; q < NQ - 1; ++q)
-#pragma unroll
-          for (int u = 0; u < U; ++u) {
-            const int c = tid + u * 512;
-            if (c < H) mix_out[(size_t(q + 1) * rows + r) * H + c] = mix_rest[q][u];
-          }
-      }
-    } else {
-      for (int m = 0; m < M; ++m) {
-        const float* src = (m < n_blocks) ? (bank + (size_t(m) * rows + r) * H)
-                                          : (m == eff_blocks ? (x_dst + size_t(r) * H) : (x_src + size_t(r) * H));
-        const float a0 = s_alpha[0][m];
-#pragma unroll
-        for (int u = 0; u < U; ++u) {
-          const int c = tid + u * 512;
-          if (c < H) mix0[u] = __fmaf_rn(a0, src[c], mix0[u]);
-        }
-      }
-      if constexpr (NQ > 1) {
-        if (mix_out) {
-          for (int c = tid; c < H; c += 512) {
-            float o[NQ - 1];
-#pragma unroll
-            for (int q = 0; q < NQ - 1; ++q) o[q] = 0.f;
-            for (int m = 0; m < M; ++m) {
-              const float* src = (m < n_blocks) ? (bank + (size_t(m) * rows + r) * H)
-                                                : (m == eff_blocks ? (x_dst + size_t(r) * H) : (x_src + size_t(r) * H));
-              const float v = src[c];
-#pragma unroll
-              for (int q = 0; q < NQ - 1; ++q) o[q] = __fmaf_rn(s_alpha[q + 1][m], v, o[q]);
-            }
-#pragma unroll
-            for (int q = 0; q < NQ - 1; ++q) mix_out[(size_t(q + 1) * rows + r) * H + c] = o[q];
-          }
-        }
-      }
-    }
-    float ss = 0.f;
+  if constexpr (NORM != SublayerNorm::None) {
+    float weight[U];
 #pragma unroll
     for (int u = 0; u < U; ++u) {
-      if (tid + u * 512 < H) ss = __fmaf_rn(mix0[u], mix0[u], ss);
+      const int c = tid + u * 512;
+      if (c < H) weight[u] = __ldg(norm_w + c);
+    }
+    // The vector mix owns consecutive float4s. Restore rmsnorm's tid + 512*u ownership before
+    // any square, so block512_sum and the Q8 groups see exactly the generic kernel's inputs.
+    __syncthreads();
+    float mix0[U], ss = 0.f;
+#pragma unroll
+    for (int u = 0; u < U; ++u) {
+      const int c = tid + u * 512;
+      if (c < H) {
+        mix0[u] = shared_row[c];
+        ss = __fmaf_rn(mix0[u], mix0[u], ss);
+      }
     }
     const float inv_rms = rsqrtf(block512_sum(ss) / float(H) + norm_eps);
 #pragma unroll
@@ -890,7 +826,7 @@ __global__ void __launch_bounds__(512)
       const int c = tid + u * 512;
       if (c < H) {
         const float unit = mix0[u] * inv_rms;
-        const float gain = norm_offset + __ldg(norm_w + c);
+        const float gain = norm_offset + weight[u];
         if constexpr (NORM == SublayerNorm::F32) {
           norm_o.y[size_t(r) * ldy + c] = unit * gain;
         } else if constexpr (NORM == SublayerNorm::MoeQ8) {
@@ -2040,6 +1976,12 @@ void attn_res_mix(const float* bank, int n_blocks, const float* cur, const float
     throw std::runtime_error("attn_res_mix: bank depth exceeds kMaxResStates");
   for (int q0 = 0; q0 < n_queries; q0 += 4) {
     const int nq = std::min(4, n_queries - q0);
+    // Round queries have independent outputs. One block per (row, query) duplicates only reads and
+    // the state RMS, with the same lane order as the grouped queries of a longer pass.
+    if (rows <= FLYX_MAX_ROWS) {
+      k_attn_res_mix<1><<<dim3(rows, nq), 512, 0, st>>>(bank, n_blocks, cur, queries, q0, rows, H, out);
+      continue;
+    }
     switch (nq) {
       case 1: k_attn_res_mix<1><<<rows, 512, 0, st>>>(bank, n_blocks, cur, queries, q0, rows, H, out); break;
       case 2: k_attn_res_mix<2><<<rows, 512, 0, st>>>(bank, n_blocks, cur, queries, q0, rows, H, out); break;
@@ -2160,8 +2102,8 @@ void shortconv_res_mix_norm(const SublayerPostConv& sc, const float* x_src, floa
     o.lo = parts.lo;
   }
 #define FLYX_SUBLAYER_CALL(N, Q, U_)                                                                                   \
-  k_shortconv_res_mix_norm<N, Q, U_><<<rows, 512, 0, L.st>>>(sc, x_src, x_dst, bank, n_blocks, queries, mix_out,       \
-                                                             norm_w, norm_offset, norm_eps, o, ldy, P, rows, H)
+  k_shortconv_res_mix_norm<N, Q, U_><<<rows, 512, size_t(H) * sizeof(float), L.st>>>(                                  \
+      sc, x_src, x_dst, bank, n_blocks, queries, mix_out, norm_w, norm_offset, norm_eps, o, ldy, P, rows, H)
 #define FLYX_SUBLAYER_NORM(N, Q)                                                                                       \
   if (H <= 2560) FLYX_SUBLAYER_CALL(N, Q, 5);                                                                          \
   else FLYX_SUBLAYER_CALL(N, Q, 10)

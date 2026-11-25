@@ -2,6 +2,8 @@
 // Every CUDA kernel against the float64 reference ops (ops/ops.h).
 //
 //   cuda_op_test            run all checks, exit 1 on any failure
+//   cuda_op_test --filter attn_res_mix
+//   cuda_op_test --filter shortconv_res_mix_norm
 //
 // Inputs are random; weights and caches go through bf16 on both sides, so
 // the remaining difference is float32 arithmetic (and bf16 activations in the
@@ -12,7 +14,21 @@
 
 using namespace flyx::optest;
 
-int main() {
+static int report_result() {
+  std::printf("%s (%d failures)\n", g_fail ? "FAILED" : "PASSED", g_fail);
+  return g_fail ? 1 : 0;
+}
+
+int main(int argc, char** argv) {
+  void (*filtered_test)() = nullptr;
+  if (argc == 3 && std::strcmp(argv[1], "--filter") == 0) {
+    if (std::strcmp(argv[2], "attn_res_mix") == 0) filtered_test = test_inkling2_attn_res;
+    if (std::strcmp(argv[2], "shortconv_res_mix_norm") == 0) filtered_test = test_inkling2_sublayer_fusion;
+  }
+  if (argc != 1 && !filtered_test) {
+    std::fprintf(stderr, "usage: cuda_op_test [--filter attn_res_mix|shortconv_res_mix_norm]\n");
+    return 2;
+  }
   // A nonfinite element between two matching ones must not disappear in the max-error reduction.
   const Vec finite{1., 2., 3.};
   for (double bad : {std::nan(""), std::numeric_limits<double>::infinity(), -std::numeric_limits<double>::infinity()}) {
@@ -29,8 +45,9 @@ int main() {
     return 2;
   }
   {  // scratch for every GEMM input the tests stage (prefill rows up to 1024, K up to 16384)
-    const size_t bytes = scratch_bytes(1024, 16384);
-    static Scratch sc = scratch_in(dev<unsigned char>(bytes), bytes, 1024, 16384);
+    const int rows = filtered_test ? 16 : 1024, width = filtered_test ? 5120 : 16384;
+    const size_t bytes = scratch_bytes(rows, width, !filtered_test);
+    static Scratch sc = scratch_in(dev<unsigned char>(bytes), bytes, rows, width, !filtered_test);
     TL.scratch = &sc;
   }
   cudaDeviceProp p{};
@@ -40,6 +57,10 @@ int main() {
   std::printf("a release build (FLYX_TUNE_CANDIDATES off): the GEMM configurations no tuning table gives on this GPU "
               "are not compiled, and the tests of every configuration skip them\n");
 #endif
+  if (filtered_test) {
+    filtered_test();
+    return report_result();
+  }
   test_gemm();
   test_gemm_round();
   test_gemm_draft_tables();
@@ -180,6 +201,5 @@ int main() {
   test_inkling2_rel_strata();
   test_inkling2_moe();
   test_dspark();
-  std::printf("%s (%d failures)\n", g_fail ? "FAILED" : "PASSED", g_fail);
-  return g_fail ? 1 : 0;
+  return report_result();
 }
