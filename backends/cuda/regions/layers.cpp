@@ -928,22 +928,31 @@ void moe_layer(const Pass& ps, const MoeBlock& f, bool fused) {
     cur = rv.b.attn_in;
   }
 
-  rmsnorm(cur, H, f.norm.w, f.norm.offset, f.norm.eps, rv.b.h, H, R, H, st);
+  // A fused round's kernels write what the next one reads, where the generic layer stages it from float32 rows in
+  // a launch between them: the norm the gate|up GEMM's 8-bit rows beside the router's float32 ones, and that GEMM
+  // the down GEMM's bf16 rows (in moe_act: the scratch's own bf16 rows lie over the 8-bit ones it is reading).
+  const MoeScratch* msc = rv.b.moe_sc.pairs ? &rv.b.moe_sc : nullptr;
+  const bool round_q8 = fused && ps.round && moe_round_q8(f.gate_up, R, K, H, msc);
+  if (round_q8)
+    rmsnorm_moe_q8(cur, H, f.norm.w, f.norm.offset, f.norm.eps, rv.b.h, H, R, H, *msc, moe_q8_mins(f.gate_up), st);
+  else
+    rmsnorm(cur, H, f.norm.w, f.norm.offset, f.norm.eps, rv.b.h, H, R, H, st);
   gemm(rv.b.h, H, f.router, E, H, rv.b.proj, E, R, false, L);
   moe_route(rv.b.proj, f.router_bias, R, E, K, f.gating_sigmoid, f.norm_weights, f.norm_eps, f.route_scale,
             rv.b.moe_idx, rv.b.moe_w, st);
 
-  const MoeScratch* msc = rv.b.moe_sc.pairs ? &rv.b.moe_sc : nullptr;
+  bf16* act_bf16 =
+      round_q8 && moe_round_bf16_down(f.down, R, K, I, msc) ? reinterpret_cast<bf16*>(rv.b.moe_act) : nullptr;
   if (fused) {
     moe_gate_up(rv.b.h, H, f.gate_up, rv.b.moe_idx, R, K, I, H, f.situ_beta, f.situ_linear_beta, true, rv.b.moe_act, I,
-                msc, L);
+                msc, L, round_q8, act_bf16);
   } else {
     moe_gate_up(rv.b.h, H, f.gate_up, rv.b.moe_idx, R, K, I, H, f.situ_beta, f.situ_linear_beta, false, rv.b.moe_gu,
                 2 * I, msc, L);
     situ_rows(rv.b.moe_gu, 2 * I, I, f.situ_beta, f.situ_linear_beta, rv.b.moe_act, I, R * K, st);
   }
   if (f.post_conv) {
-    moe_down(rv.b.moe_act, I, f.down, rv.b.moe_idx, rv.b.moe_w, R, K, H, I, rv.b.post_raw, H, false, msc, L);
+    moe_down(rv.b.moe_act, I, f.down, rv.b.moe_idx, rv.b.moe_w, R, K, H, I, rv.b.post_raw, H, false, msc, L, act_bf16);
     ShortConvBuf& sc = s->sconv[size_t(f.sconv)];
     const bool direct = ps.round && ps.p->width == 0;
     const int next_sel = ps.round ? (direct ? kSlotNext : -1) : kSlotCur;
@@ -953,7 +962,7 @@ void moe_layer(const Pass& ps, const MoeBlock& f, bool fused) {
     shortconv_pass(rv.b.post_raw, H, f.post_conv, nullptr, sc.win, sc.w_stride, kSlotCur, next_sel, skip, rep,
                    rep_stride, kSlotCur, f.sconv_offset, sc.channels, H, f.conv, 0, s->P, R, rv.b.x, H, st, true);
   } else {
-    moe_down(rv.b.moe_act, I, f.down, rv.b.moe_idx, rv.b.moe_w, R, K, H, I, rv.b.x, H, true, msc, L);
+    moe_down(rv.b.moe_act, I, f.down, rv.b.moe_idx, rv.b.moe_w, R, K, H, I, rv.b.x, H, true, msc, L, act_bf16);
   }
 }
 

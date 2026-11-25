@@ -1230,7 +1230,90 @@ void test_inkling2_rel_strata() {
   }
 }
 
+void test_inkling2_moe_norm() {
+  for (int n : {2304, 5248}) {
+    const int rows = n == 2304 ? 8 : 19;  // both spread and one-CTA-per-row generic RMSNorm
+    const int ldx = n + 3, ldy = n == 2304 ? n : n + 5;
+    const float offset = n == 2304 ? 0.f : 1.f, eps = n == 2304 ? 1e-6f : 0.f;
+    seed("inkling2_moe_norm", n);
+    Vec x = randv(size_t(rows) * ldx), w = randv(n, 0.5);
+    for (double& v : x) v = float(v);
+    for (double& v : w) v = float(v);
+    // A zero group, and exact halfway values on the unit-RMS row with zero epsilon.
+    std::fill_n(w.begin(), 32, -offset);
+    std::fill_n(x.begin(), n, 1.);
+    w[32] = 127.f - offset;
+    w[33] = 0.5f - offset;
+    w[34] = -1.5f - offset;
+    const size_t elems = size_t(rows) * n;
+    float *dx = up(x), *dw = up(w), *y = dev<float>(size_t(rows) * ldy), *y_ref = dev<float>(size_t(rows) * ldy);
+    MoeScratch sc{};
+    sc.q8_a = dev<int8_t>(elems);
+    sc.q8_d = dev<float>(elems / 32);
+    sc.q8_s = dev<float>(elems / 16);
+    auto read_q8 = [&](size_t count) {
+      Q8Rows h;
+      h.q.resize(count);
+      h.d.resize(count / 32);
+      h.sums.resize(count / 16);
+      CK(cudaMemcpy(h.q.data(), sc.q8_a, count, cudaMemcpyDeviceToHost));
+      CK(cudaMemcpy(h.d.data(), sc.q8_d, h.d.size() * sizeof(float), cudaMemcpyDeviceToHost));
+      CK(cudaMemcpy(h.sums.data(), sc.q8_s, h.sums.size() * sizeof(float), cudaMemcpyDeviceToHost));
+      return h;
+    };
+    rmsnorm(dx, ldx, dw, offset, eps, y_ref, ldy, rows, n, 0);
+    const Vec generic = down(y_ref, size_t(rows) * ldy);
+    Vec ref(generic.size(), 0.);
+    for (int r = 0; r < rows; ++r)
+      ops::rmsnorm(x.data() + size_t(r) * ldx, w.data(), n, eps, offset, ref.data() + size_t(r) * ldy);
+    for (bool mins : {false, true}) {
+      // Leave a nonzero sentinel where a type without minima must skip the sums.
+      CK(cudaMemset(sc.q8_s, 0x55, elems / 16 * sizeof(float)));
+      moe_stage_q8(y_ref, ldy, n, rows, sc, mins, 0);
+      const Q8Rows staged = read_q8(elems);
+      for (int nr : {1, rows}) {
+        const int first = nr == 1 ? rows / 2 : 0;
+        const size_t at = size_t(first) * n, count = size_t(nr) * n, row_at = size_t(first) * ldy;
+        CK(cudaMemset(y, 0, size_t(nr) * ldy * sizeof(float)));
+        CK(cudaMemset(sc.q8_a, 0x80, count));
+        CK(cudaMemset(sc.q8_d, 0xcd, count / 32 * sizeof(float)));
+        CK(cudaMemset(sc.q8_s, mins ? 0xcd : 0x55, count / 16 * sizeof(float)));
+        rmsnorm_moe_q8(dx + size_t(first) * ldx, ldx, dw, offset, eps, y, ldy, nr, n, sc, mins, 0);
+        const Vec got = down(y, size_t(nr) * ldy);
+        const std::string tag = " H=" + std::to_string(n) + " R=" + std::to_string(nr) + (mins ? " mins" : "");
+        expect("MoE router norm vs float64" + tag, got, Vec(ref.begin() + row_at, ref.begin() + row_at + got.size()),
+               1e-5);
+        expect_bits("MoE router norm vs rmsnorm" + tag, got,
+                    Vec(generic.begin() + row_at, generic.begin() + row_at + got.size()));
+        const Q8Rows fused = read_q8(count);
+        const bool same = std::equal(fused.q.begin(), fused.q.end(), staged.q.begin() + at) &&
+                          !std::memcmp(fused.d.data(), staged.d.data() + at / 32, fused.d.size() * sizeof(float)) &&
+                          !std::memcmp(fused.sums.data(), staged.sums.data() + at / 16, fused.sums.size() * sizeof(float));
+        std::printf("  %-4s MoE norm Q8 bytes, scales and sums vs separate stage%s\n", same ? "ok" : "FAIL", tag.c_str());
+        g_fail += !same;
+
+        // Reference quantization uses the norm's float32 result on each side of a rounding boundary.
+        std::vector<int8_t> q(count);
+        std::vector<float> d(count / 32), sums(count / 16);
+        for (int r = 0; r < nr; ++r)
+          ops::round_q8(got.data() + size_t(r) * ldy, n, q.data() + size_t(r) * n, d.data() + size_t(r) * (n / 32));
+        for (size_t h = 0; h < sums.size(); ++h) {
+          int sum = 0;
+          for (int i = 0; i < 16; ++i) sum += q[h * 16 + i];
+          sums[h] = d[h / 2] * float(sum);
+        }
+        const bool rounded = q == fused.q && !std::memcmp(d.data(), fused.d.data(), d.size() * sizeof(float)) &&
+                             (!mins || !std::memcmp(sums.data(), fused.sums.data(), sums.size() * sizeof(float)));
+        std::printf("  %-4s MoE norm Q8 vs round_q8%s\n", rounded ? "ok" : "FAIL", tag.c_str());
+        g_fail += !rounded;
+      }
+    }
+    for (void* p : std::initializer_list<void*>{dx, dw, y, y_ref, sc.q8_a, sc.q8_d, sc.q8_s}) CK(cudaFree(p));
+  }
+}
+
 void test_inkling2_moe() {
+  test_inkling2_moe_norm();
   std::printf("inkling2 moe (route, situ, gate_up, down)\n");
   // 1. moe_route: sigmoid+bias and softmax.
   for (int sig : {1, 0}) {
@@ -1321,6 +1404,7 @@ void test_inkling2_moe() {
   msc.max_experts = E;
   msc.max_top_k = top_k;
 
+  ExpertMat nvfp4_down{};
   auto run_and_check = [&](const std::string& label, const ExpertMat& w_gu, const ExpertMat& w_dn, const Vec& gu_f64,
                            const Vec& dn_f64, bool round_a16, bool round_q8, bool round_a16h, double tol) {
     // Reference in float64 with the exact input rounding contract of this weight format.
@@ -1367,6 +1451,57 @@ void test_inkling2_moe() {
     // situ clamps output to [-beta*lb, +beta*lb] even when random_blocks (e.g. Q6_K) raw dots reach ~1000.
     expect("moe_gate_up " + label, got_act_f, want_act, std::max(tol, 1.5e-4));
     expect_bits("moe_gate_up fused==unfused " + label, got_act_f, got_act_u);
+
+    if (round_q8 && w_gu.packed()) {
+      Vec expert_scales(E);
+      for (int e = 0; e < E; ++e) expert_scales[e] = 0.5 + e / 16.0;
+      ExpertMat scaled_gu = w_gu;
+      scaled_gu.rs = up(expert_scales);
+      bf16* packed_act = reinterpret_cast<bf16*>(d_act_unfused);
+      Vec solo;
+      for (int rows : {1, 8, 16}) {
+        const std::string tag = label + " R=" + std::to_string(rows);
+        const size_t elems = size_t(rows) * top_k * I;
+        moe_gate_up(d_x, H, scaled_gu, d_eidx, rows, top_k, I, H, beta, lb, true, d_act_unfused, I, &msc, TL);
+        moe_down(d_act_unfused, I, nvfp4_down, d_eidx, d_ew, rows, top_k, H, I, d_y_direct, H, false, &msc, TL);
+        const Vec staged = down_bf16(msc.bf16_a, elems);
+        const Vec y = down(d_y_direct, size_t(rows) * H);
+
+        moe_stage_q8(d_x, H, H, rows, msc, moe_q8_mins(scaled_gu), TL.st);
+        CK(cudaMemset(d_y_direct, 0, size_t(rows) * H * sizeof(float)));  // an accidental restage sees zeros
+        CK(cudaMemset(packed_act, 0xFF, elems * sizeof(bf16)));
+        moe_gate_up(d_y_direct, H, scaled_gu, d_eidx, rows, top_k, I, H, beta, lb, true, nullptr, I, &msc, TL, true,
+                    packed_act);
+        const Vec got = down_bf16(packed_act, elems);
+        expect_bits("moe BF16 SiTU == float SiTU + NVFP4 stage " + tag, got, staged);
+        moe_down(nullptr, I, nvfp4_down, d_eidx, d_ew, rows, top_k, H, I, d_y_direct, H, false, &msc, TL, packed_act);
+        expect_bits("moe NVFP4 down consumes BF16 SiTU " + tag, down(d_y_direct, size_t(rows) * H), y);
+        if (rows == 1) solo = got;
+        else expect_bits("moe BF16 SiTU row alone == grouped " + tag, solo, Vec(got.begin(), got.begin() + solo.size()));
+
+        // Only allow BF16 neighbors when the existing float accumulation tolerance spans their rounding boundary.
+        Vec ref(elems);
+        double magnitude = 0.0;
+        for (int slot = 0; slot < rows * top_k; ++slot) {
+          const double rs = expert_scales[eidx[slot]];
+          const double* gu = want_gu.data() + size_t(slot) * 2 * I;
+          for (int i = 0; i < I; ++i) {
+            const double a = ops::situ(rs * gu[i], rs * gu[I + i], beta, lb);
+            ref[size_t(slot) * I + i] = a;
+            magnitude = std::max(magnitude, std::fabs(a));
+          }
+        }
+        const double tolerance = magnitude * 1.5e-4;
+        bool within = true;
+        for (size_t i = 0; i < elems; ++i) {
+          const double lo = from_bf16(to_bf16(ref[i] - tolerance)), hi = from_bf16(to_bf16(ref[i] + tolerance));
+          within &= lo <= got[i] && got[i] <= hi;
+        }
+        std::printf("  %-4s moe BF16 SiTU against float64 %s\n", within ? "ok" : "FAIL", tag.c_str());
+        if (!within) ++g_fail;
+      }
+      cudaFree(const_cast<float*>(scaled_gu.rs));
+    }
 
     float* d_want_act = up(want_act);
     moe_down(d_want_act, I, w_dn, d_eidx, d_ew, R, top_k, H, I, d_y_grouped, H, false, &msc, TL);
@@ -1505,23 +1640,20 @@ void test_inkling2_moe() {
       out->s = d_s;
       out->rs = d_rs;
     };
-    ExpertMat w_gu{}, w_dn{};
+    ExpertMat w_gu{};
     Vec gu_f64, dn_f64;
     make_nvfp4_experts(gu_raw, 2 * I, H, &w_gu, &gu_f64);
-    make_nvfp4_experts(dn_raw, H, I, &w_dn, &dn_f64);
-    run_and_check("nvfp4", w_gu, w_dn, gu_f64, dn_f64, true, false, false, 3e-5);
+    make_nvfp4_experts(dn_raw, H, I, &nvfp4_down, &dn_f64);
+    run_and_check("nvfp4", w_gu, nvfp4_down, gu_f64, dn_f64, true, false, false, 3e-5);
     cudaFree(const_cast<uint8_t*>(w_gu.q));
     cudaFree(const_cast<uint8_t*>(w_gu.s));
     cudaFree(const_cast<float*>(w_gu.rs));
-    cudaFree(const_cast<uint8_t*>(w_dn.q));
-    cudaFree(const_cast<uint8_t*>(w_dn.s));
-    cudaFree(const_cast<float*>(w_dn.rs));
   }
 
   // (c) Packed GGML block experts: MXFP4, Q2_0, Q4_K, Q6_K, Q8_0, IQ2_XXS, IQ2_S, IQ3_XXS, IQ4_NL (Q8 and a16h).
   const int ggml_types[] = {FLYX_DT_GGML_MXFP4,  FLYX_DT_GGML_Q2_0,   FLYX_DT_GGML_Q4_K,
                             FLYX_DT_GGML_Q6_K,   FLYX_DT_GGML_Q8_0,   FLYX_DT_GGML_IQ2_XXS,
-                            FLYX_DT_GGML_IQ2_S,  FLYX_DT_GGML_IQ3_XXS, FLYX_DT_GGML_IQ4_NL};
+                            FLYX_DT_GGML_IQ2_S,  FLYX_DT_GGML_IQ3_XXS, FLYX_DT_GGML_IQ4_NL, FLYX_DT_GGML_IQ2_XS};
   for (int dt : ggml_types) {
     const BlockType& bt = block_type(dt);
     const int k_blk = flyx_block_values(dt);
@@ -1547,6 +1679,10 @@ void test_inkling2_moe() {
       cudaFree(const_cast<uint8_t*>(w_dn.blk.data));
     }
   }
+
+  cudaFree(const_cast<uint8_t*>(nvfp4_down.q));
+  cudaFree(const_cast<uint8_t*>(nvfp4_down.s));
+  cudaFree(const_cast<float*>(nvfp4_down.rs));
 
   // (d) Multi-span non-power-of-2 K (Inkling-2 dimensions: H = 2304 -> 3 spans tail 8; I = 1152 -> 2 spans tail 4).
   {

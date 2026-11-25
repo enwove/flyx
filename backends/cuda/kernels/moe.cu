@@ -580,7 +580,7 @@ void launch_nvfp4_gu(const float* x, int ldx, const ExpertMat& W, const int* eid
 template <int SPAN>
 void launch_nvfp4_down(const float* act, int ld_act, const ExpertMat& W, const int* eidx, const float* ew, int rows,
                        int top_k, int H, int K, float* out, int ld_out, bool accumulate, const MoeScratch* sc,
-                       cudaStream_t st) {
+                       cudaStream_t st, const bf16* act_bf16) {
   const bool has_down =
       sc && sc->down_buf && sc->tasks && sc->pairs && W.n_experts <= sc->max_experts && top_k <= sc->max_top_k;
   if (!has_down) {
@@ -591,11 +591,11 @@ void launch_nvfp4_down(const float* act, int ld_act, const ExpertMat& W, const i
   const int chunk = std::max(1, sc->chunk_rows);
   for (int r0 = 0; r0 < rows; r0 += chunk) {
     const int rc = std::min(chunk, rows - r0);
-    const float* ac = act + size_t(r0) * top_k * ld_act;
+    const float* ac = act_bf16 ? nullptr : act + size_t(r0) * top_k * ld_act;
     const int* ec = eidx + size_t(r0) * top_k;
     const int M = rc * top_k;
-    const bf16* bf_a = nullptr;
-    if (sc->bf16_a && sc->stage_elems >= size_t(M) * size_t(K)) {
+    const bf16* bf_a = act_bf16;
+    if (!bf_a && sc->bf16_a && sc->stage_elems >= size_t(M) * size_t(K)) {
       k_moe_stage_bf16<<<M, 256, 0, st>>>(ac, ld_act, K, sc->bf16_a);
       bf_a = sc->bf16_a;
     }
@@ -764,7 +764,17 @@ __global__ void __launch_bounds__(32 * kMoeWarps)
 // Use INT8 MMA (BM=16) only when average rows per expert is at least 2 (prefill); rounds stay on low-reg dp4a (BM=4).
 constexpr bool moe_use_mma(int rc, int M, int n_experts) { return rc > FLYX_MAX_ROWS && M >= 2 * n_experts; }
 
+bool moe_round_scratch(const ExpertMat& W, int rows, int top_k, const MoeScratch* sc) {
+  return rows > 0 && rows <= FLYX_MAX_ROWS && sc && rows <= sc->chunk_rows && W.n_experts <= sc->max_experts &&
+         top_k > 0 && top_k <= sc->max_top_k && sc->pairs && sc->tasks && sc->n_tasks && sc->counts && sc->offsets;
+}
+
 }  // namespace
+
+void moe_stage_q8(const float* x, int ldx, int K, int rows, const MoeScratch& sc, bool mins, cudaStream_t st) {
+  if (mins) k_moe_stage_q8<true><<<rows, 256, 0, st>>>(x, ldx, K, sc.q8_a, sc.q8_d, sc.q8_s);
+  else k_moe_stage_q8<false><<<rows, 256, 0, st>>>(x, ldx, K, sc.q8_a, sc.q8_d, sc.q8_s);
+}
 
 void moe_route(const float* logits, const float* bias, int rows, int n_experts, int top_k, bool gating_sigmoid,
                bool norm_weights, float norm_eps, float route_scale, int* idx_out, float* w_out, cudaStream_t st) {
@@ -781,11 +791,33 @@ void situ_rows(const float* gu, int ld_gu, int I, float beta, float linear_beta,
   k_situ_rows<<<dim3(ceil_div(I, 256), rows), 256, 0, st>>>(gu, ld_gu, I, beta, linear_beta, out, ld_out);
 }
 
+bool moe_q8_mins(const ExpertMat& W) {
+  const MoeBlockOps* ops = W.packed() ? moe_block_ops(W.blk.dtype) : nullptr;
+  return ops && ops->mins;
+}
+
+bool moe_round_q8(const ExpertMat& W, int rows, int top_k, int K, const MoeScratch* sc) {
+  if (!W.packed() || !W.blk.q8 || K <= 0 || K % 32 != 0 || !moe_round_scratch(W, rows, top_k, sc)) return false;
+  // A format with minima: whole warps of four groups only (K % 128), where k_moe_stage_q8's half-group sums, which
+  // rmsnorm_moe_q8 has to reproduce, have every lane of the warp behind them.
+  const bool sums_ok = !moe_q8_mins(W) || (sc->q8_s && K % 128 == 0);
+  return sums_ok && sc->q8_a && sc->q8_d && sc->stage_elems >= size_t(rows) * K;
+}
+
+bool moe_round_bf16_down(const ExpertMat& W, int rows, int top_k, int K, const MoeScratch* sc) {
+  return !W.packed() && W.q && K > 0 && K % 64 == 0 && moe_round_scratch(W, rows, top_k, sc) && sc->down_buf &&
+         sc->bf16_a && sc->stage_elems >= size_t(rows) * top_k * K;
+}
+
 void moe_gate_up(const float* x, int ldx, const ExpertMat& W, const int* eidx, int rows, int top_k, int I, int K,
                  float situ_beta, float situ_linear_beta, bool fuse_act, float* out, int ld_out, const MoeScratch* sc,
-                 const Launch& L) {
+                 const Launch& L, bool q8_ready, bf16* act_bf16) {
   cudaStream_t st = L.st;
   const int N_work = fuse_act ? I : 2 * I;
+  if ((q8_ready || act_bf16) && !moe_round_q8(W, rows, top_k, K, sc))
+    throw std::runtime_error("moe_gate_up: pre-staged input and BF16 output require a staged Q8 round");
+  if (act_bf16 && (!fuse_act || ld_out != I))
+    throw std::runtime_error("moe_gate_up: BF16 output requires contiguous fused activations");
   if (W.packed()) {
     blocks_init();
     const MoeBlockOps* ops = moe_block_ops(W.blk.dtype);
@@ -796,12 +828,9 @@ void moe_gate_up(const float* x, int ldx, const ExpertMat& W, const int* eidx, i
       const int rc = std::min(chunk, rows - r0);
       const float* xc = x + size_t(r0) * ldx;
       const int* ec = eidx + size_t(r0) * top_k;
-      float* oc = out + size_t(r0) * top_k * ld_out;
+      float* oc = act_bf16 ? nullptr : out + size_t(r0) * top_k * ld_out;
       const bool can_q8 = W.blk.q8 && sc && sc->q8_a && sc->stage_elems >= size_t(rc) * size_t(K);
-      if (can_q8) {
-        if (ops->mins) k_moe_stage_q8<true><<<rc, 256, 0, st>>>(xc, ldx, K, sc->q8_a, sc->q8_d, sc->q8_s);
-        else k_moe_stage_q8<false><<<rc, 256, 0, st>>>(xc, ldx, K, sc->q8_a, sc->q8_d, sc->q8_s);
-      }
+      if (can_q8 && !q8_ready) moe_stage_q8(xc, ldx, K, rc, *sc, ops->mins, st);
       const int M = rc * top_k;
       const bool use_mma = can_q8 && has_sc && moe_use_mma(rc, M, W.n_experts);
       int mt = 0;
@@ -811,7 +840,8 @@ void moe_gate_up(const float* x, int ldx, const ExpertMat& W, const int* eidx, i
         k_moe_group_tasks<<<1, 256, 0, st>>>(ec, M, W.n_experts, bm, sc->counts, sc->offsets, sc->pairs, sc->tasks,
                                              sc->n_tasks);
       }
-      ops->gu(xc, ldx, W, ec, rc, top_k, I, K, situ_beta, situ_linear_beta, fuse_act, oc, ld_out, sc, mt, use_mma, st);
+      ops->gu(xc, ldx, W, ec, rc, top_k, I, K, situ_beta, situ_linear_beta, fuse_act, oc, ld_out, sc, mt, use_mma,
+              st, act_bf16);
     }
     return;
   }
@@ -860,8 +890,11 @@ void moe_gate_up(const float* x, int ldx, const ExpertMat& W, const int* eidx, i
 }
 
 void moe_down(const float* act, int ld_act, const ExpertMat& W, const int* eidx, const float* ew, int rows, int top_k,
-              int H, int K, float* out, int ld_out, bool accumulate, const MoeScratch* sc, const Launch& L) {
+              int H, int K, float* out, int ld_out, bool accumulate, const MoeScratch* sc, const Launch& L,
+              const bf16* act_bf16) {
   cudaStream_t st = L.st;
+  if (act_bf16 && !moe_round_bf16_down(W, rows, top_k, K, sc))
+    throw std::runtime_error("moe_down: pre-staged BF16 input requires an NVFP4 round");
   if (W.packed()) {
     blocks_init();
     const MoeBlockOps* ops = moe_block_ops(W.blk.dtype);
@@ -877,10 +910,7 @@ void moe_down(const float* act, int ld_act, const ExpertMat& W, const int* eidx,
       float* oc = out + size_t(r0) * ld_out;
       const int M = rc * top_k;
       const bool can_q8 = W.blk.q8 && sc && sc->q8_a && sc->down_buf && sc->stage_elems >= size_t(M) * size_t(K);
-      if (can_q8) {
-        if (ops->mins) k_moe_stage_q8<true><<<M, 256, 0, st>>>(ac, ld_act, K, sc->q8_a, sc->q8_d, sc->q8_s);
-        else k_moe_stage_q8<false><<<M, 256, 0, st>>>(ac, ld_act, K, sc->q8_a, sc->q8_d, sc->q8_s);
-      }
+      if (can_q8) moe_stage_q8(ac, ld_act, K, M, *sc, ops->mins, st);
       const bool use_mma = can_q8 && has_sc && moe_use_mma(rc, M, W.n_experts);
       int mt = 0;
       if (rc > 1 && has_sc) {
@@ -899,9 +929,9 @@ void moe_down(const float* act, int ld_act, const ExpertMat& W, const int* eidx,
   }
   if (W.q) {
     if (K % 128 == 0)
-      launch_nvfp4_down<128>(act, ld_act, W, eidx, ew, rows, top_k, H, K, out, ld_out, accumulate, sc, st);
+      launch_nvfp4_down<128>(act, ld_act, W, eidx, ew, rows, top_k, H, K, out, ld_out, accumulate, sc, st, act_bf16);
     else if (K % 64 == 0)
-      launch_nvfp4_down<64>(act, ld_act, W, eidx, ew, rows, top_k, H, K, out, ld_out, accumulate, sc, st);
+      launch_nvfp4_down<64>(act, ld_act, W, eidx, ew, rows, top_k, H, K, out, ld_out, accumulate, sc, st, act_bf16);
     else
       throw std::runtime_error("moe_down: NVFP4 requires K multiple of 64 (got " + std::to_string(K) + ")");
     return;

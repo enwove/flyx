@@ -12,7 +12,7 @@ struct MoeBlockOps {
   bool mins;  // F::kFlatRun != 0 (requires q8_s half-group sums during staging)
   void (*gu)(const float* x, int ldx, const ExpertMat& W, const int* eidx, int rows, int top_k, int I, int K,
              float situ_beta, float situ_linear_beta, bool fuse_act, float* out, int ld_out, const MoeScratch* sc,
-             int max_tiles, bool use_mma, cudaStream_t st);
+             int max_tiles, bool use_mma, cudaStream_t st, bf16* act_bf16);
   bool (*down)(const float* act, int ld_act, const ExpertMat& W, const int* eidx, const float* ew, int rows, int top_k,
                int H, int K, float* out, int ld_out, bool accumulate, const MoeScratch* sc, int max_tiles, bool use_mma,
                cudaStream_t st);

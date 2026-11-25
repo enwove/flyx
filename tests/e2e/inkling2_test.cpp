@@ -307,6 +307,7 @@ struct TinySpec {
   int n_experts = 4, top_k = 2, inter = 64, vocab_padded = 320, vocab_unpadded = 272;
   float eps = 1e-6f, qk_clip = 6.f, rel_clip = 4.f, log_alpha = 0.2f;
   float route_scale = 1.5f, situ_beta = 6.f, situ_linear_beta = 8.f, softcap = 30.f;
+  bool packed_gate_nvfp4_down = false;
   std::vector<bool> is_swa = {true, false, true, false, true, false};
 };
 
@@ -500,7 +501,8 @@ void write_tiny_inkling2(const std::filesystem::path& path, const TinySpec& c, b
       else if (dt == kGgmlQ8_0) data = gen_q8_0(rng, n, 0.08f);
       w.add_tensor(name, {uint64_t(E), uint64_t(N), uint64_t(K)}, dt, std::move(data));
     };
-    add_3d(b + "ffn_gate_up_exps.weight", c.n_experts, 2 * c.inter, c.H, exp_dt);
+    const uint32_t gate_type = c.packed_gate_nvfp4_down && exp_dt == kGgmlNVFP4 ? kGgmlQ8_0 : exp_dt;
+    add_3d(b + "ffn_gate_up_exps.weight", c.n_experts, 2 * c.inter, c.H, gate_type);
     add_3d(b + "ffn_down_exps.weight", c.n_experts, c.H, c.inter, exp_dt);
     if (exp_dt == kGgmlNVFP4) {
       // Distinct positive per-expert F32 tensor scales!
@@ -1079,7 +1081,16 @@ int main(int argc, char** argv) {
     }
 
     if (backend == "cuda") {
+      // The attention's producers on the mixed weights; the MoE's on experts whose gate|up GEMM reads 8-bit rows
+      // and whose down GEMM is NVFP4.
       test_fused_rounds(mixed_gguf, "mixed weights", prompt);
+      {
+        TinySpec experts = spec;
+        experts.packed_gate_nvfp4_down = true;
+        const auto path = dir / "tiny_inkling2_mixed_experts.gguf";
+        write_tiny_inkling2(path, experts, true, 2002);
+        test_fused_rounds(path, "mixed experts", prompt);
+      }
       {
         auto held = [&](RoundMatrixCase round_case, const char* filename) {
           const auto path = dir / filename;

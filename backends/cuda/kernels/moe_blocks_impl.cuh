@@ -14,6 +14,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
+#include <stdexcept>
 
 #include "backends/cuda/kernels/common/device.cuh"
 #include "backends/cuda/kernels/common/launch.h"
@@ -63,7 +64,7 @@ __global__ void __launch_bounds__(32 * kMoeDp4aWarps)
                          const uint16_t* __restrict__ D, const float* __restrict__ RS, int N_exp, int I_or_H, int K,
                          const int* __restrict__ eidx, const MoeTask* __restrict__ tasks,
                          const int* __restrict__ n_tasks, const int* __restrict__ pairs, int top_k, float situ_beta,
-                         float situ_linear_beta, float* __restrict__ out, int ld_out) {
+                         float situ_linear_beta, float* __restrict__ out, int ld_out, bf16* __restrict__ act_bf16) {
   pdl_trigger();
   static constexpr int GROUPS = F::kValues / 32, SUB = F::kSub;
   static constexpr bool MINS = F::kFlatRun != 0;
@@ -240,7 +241,11 @@ __global__ void __launch_bounds__(32 * kMoeDp4aWarps)
       const float g = warp_tree_sum(acc[b][c]) * rs;
       if constexpr (FUSE_ACT) {
         const float u = warp_tree_sum(acc[b][C + c]) * rs;
-        if (lane == 0 && col0 + c < N_work) out[out_row + col0 + c] = moe_situ(g, u, situ_beta, situ_linear_beta);
+        if (lane == 0 && col0 + c < N_work) {
+          const float v = moe_situ(g, u, situ_beta, situ_linear_beta);
+          if (act_bf16) act_bf16[out_row + col0 + c] = __float2bfloat16_rn(v);
+          else out[out_row + col0 + c] = v;
+        }
       } else {
         if (lane == 0 && col0 + c < N_work) out[out_row + col0 + c] = g;
       }
@@ -824,10 +829,13 @@ void launch_mma_q8(const ExpertMat& W, int I_or_H, int K, int top_k, float situ_
 template <class F>
 void moe_blocks_gu(const float* x, int ldx, const ExpertMat& W, const int* eidx, int rows, int top_k, int I, int K,
                    float situ_beta, float situ_linear_beta, bool fuse_act, float* out, int ld_out,
-                   const MoeScratch* sc, int max_tiles, bool use_mma, cudaStream_t st) {
+                   const MoeScratch* sc, int max_tiles, bool use_mma, cudaStream_t st, bf16* act_bf16) {
   const Tables T = block_tables();
   const int N_work = fuse_act ? I : 2 * I;
   const bool has_q8 = W.blk.q8 && sc && sc->q8_a && sc->stage_elems >= size_t(rows) * size_t(K);
+  // Only the dp4a kernels that apply the activation write it in bf16: a round's, which moe_round_q8 promises.
+  if (act_bf16 && !(fuse_act && has_q8 && !use_mma && (rows == 1 || (sc->tasks && max_tiles > 0))))
+    throw std::runtime_error("moe_gate_up: bf16 activations asked of a kernel that writes float32");
   if (has_q8) {
     if (rows == 1) {
       constexpr int C_f = 1, C_u = 2;
@@ -835,12 +843,12 @@ void moe_blocks_gu(const float* x, int ldx, const ExpertMat& W, const int* eidx,
         k_moe_blocks_q8_dp4a<F, true, false, true, 1>
             <<<dim3(ceil_div(N_work, kMoeDp4aWarps * C_f), top_k), 32 * kMoeDp4aWarps, 0, st>>>(
                 T, sc->q8_a, sc->q8_d, sc->q8_s, W.blk.data, W.blk.scales, W.rs, W.N, I, K, eidx, nullptr, nullptr,
-                nullptr, top_k, situ_beta, situ_linear_beta, out, ld_out);
+                nullptr, top_k, situ_beta, situ_linear_beta, out, ld_out, act_bf16);
       else
         k_moe_blocks_q8_dp4a<F, false, false, true, 1>
             <<<dim3(ceil_div(N_work, kMoeDp4aWarps * C_u), top_k), 32 * kMoeDp4aWarps, 0, st>>>(
                 T, sc->q8_a, sc->q8_d, sc->q8_s, W.blk.data, W.blk.scales, W.rs, W.N, I, K, eidx, nullptr, nullptr,
-                nullptr, top_k, situ_beta, situ_linear_beta, out, ld_out);
+                nullptr, top_k, situ_beta, situ_linear_beta, out, ld_out, nullptr);
       return;
     }
     if (sc && sc->tasks && max_tiles > 0) {
@@ -853,12 +861,12 @@ void moe_blocks_gu(const float* x, int ldx, const ExpertMat& W, const int* eidx,
           k_moe_blocks_q8_dp4a<F, true, false, false, 4>
               <<<dim3(ceil_div(N_work, kMoeDp4aWarps * C_f), max_tiles), 32 * kMoeDp4aWarps, 0, st>>>(
                   T, sc->q8_a, sc->q8_d, sc->q8_s, W.blk.data, W.blk.scales, W.rs, W.N, I, K, eidx, sc->tasks,
-                  sc->n_tasks, sc->pairs, top_k, situ_beta, situ_linear_beta, out, ld_out);
+                  sc->n_tasks, sc->pairs, top_k, situ_beta, situ_linear_beta, out, ld_out, act_bf16);
         else
           k_moe_blocks_q8_dp4a<F, false, false, false, 4>
               <<<dim3(ceil_div(N_work, kMoeDp4aWarps * C_u), max_tiles), 32 * kMoeDp4aWarps, 0, st>>>(
                   T, sc->q8_a, sc->q8_d, sc->q8_s, W.blk.data, W.blk.scales, W.rs, W.N, I, K, eidx, sc->tasks,
-                  sc->n_tasks, sc->pairs, top_k, situ_beta, situ_linear_beta, out, ld_out);
+                  sc->n_tasks, sc->pairs, top_k, situ_beta, situ_linear_beta, out, ld_out, nullptr);
       }
       return;
     }
@@ -906,7 +914,7 @@ bool moe_blocks_down(const float* act, int ld_act, const ExpertMat& W, const int
       k_moe_blocks_q8_dp4a<F, false, true, true, 1>
           <<<dim3(ceil_div(H, kMoeDp4aWarps * C_u), top_k), 32 * kMoeDp4aWarps, 0, st>>>(
               T, sc->q8_a, sc->q8_d, sc->q8_s, W.blk.data, W.blk.scales, W.rs, H, H, K, eidx, nullptr, nullptr, nullptr,
-              top_k, 0.f, 0.f, sc->down_buf, H);
+              top_k, 0.f, 0.f, sc->down_buf, H, nullptr);
       return true;
     }
     if (sc->tasks && max_tiles > 0) {
@@ -916,7 +924,7 @@ bool moe_blocks_down(const float* act, int ld_act, const ExpertMat& W, const int
         k_moe_blocks_q8_dp4a<F, false, true, false, 4>
             <<<dim3(ceil_div(H, kMoeDp4aWarps * C_u), max_tiles), 32 * kMoeDp4aWarps, 0, st>>>(
                 T, sc->q8_a, sc->q8_d, sc->q8_s, W.blk.data, W.blk.scales, W.rs, H, H, K, eidx, sc->tasks, sc->n_tasks,
-                sc->pairs, top_k, 0.f, 0.f, sc->down_buf, H);
+                sc->pairs, top_k, 0.f, 0.f, sc->down_buf, H, nullptr);
       }
       return true;
     }

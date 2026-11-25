@@ -1638,18 +1638,37 @@ struct MoeScratch {
   int max_experts = 0;
   int max_top_k = 0;
 };
+// The rows of x in 8 bits where the expert GEMMs on packed blocks read them (sc.q8_a): a scale per 32 values and
+// the integers in place, not in round_q8_at's order; mins: also the scale times the sum of each 16 integers, which
+// a format with minima takes (moe_q8_mins).
+void moe_stage_q8(const float* x, int ldx, int K, int rows, const MoeScratch& sc, bool mins, cudaStream_t st);
+// A round's norm before a sparse MoE for both its readers at once (1..16 rows, n % 32 == 0): the float32 rows the
+// router reads (y), rmsnorm's bits, and what moe_stage_q8 makes of them for the gate|up GEMM.
+void rmsnorm_moe_q8(const float* x, int ldx, const float* w, float offset, float eps, float* y, int ldy, int rows,
+                    int n, const MoeScratch& sc, bool mins, cudaStream_t st);
 void moe_route(const float* logits, const float* bias, int rows, int n_experts, int top_k, bool gating_sigmoid,
                bool norm_weights, float norm_eps, float route_scale, int* idx_out, float* w_out, cudaStream_t st);
 void situ_rows(const float* gu, int ld_gu, int I, float beta, float linear_beta, float* out, int ld_out, int rows,
                cudaStream_t st);
+// What one of a fused round's MoE kernels may leave for the next without a staging launch between them, the
+// round's 1..16 rows in one chunk of the scratch.  moe_round_q8: the gate|up GEMM on W reads rows staged in 8 bits
+// (q8_ready below: staged already, by rmsnorm_moe_q8); moe_round_bf16_down: the down GEMM on W (NVFP4) reads bf16
+// rows (act_bf16 below: where the gate|up GEMM wrote them).
+bool moe_q8_mins(const ExpertMat& W);
+bool moe_round_q8(const ExpertMat& W, int rows, int top_k, int K, const MoeScratch* sc);
+bool moe_round_bf16_down(const ExpertMat& W, int rows, int top_k, int K, const MoeScratch* sc);
 // gate_up over selected experts eidx [rows, top_k]: fuse_act=false writes [rows*top_k, 2*I];
 // fuse_act=true applies SiTU/SwiGLU in registers and writes [rows*top_k, I] (bit-identical to unfused + situ_rows).
+// act_bf16 (with fuse_act and moe_round_q8): the activations there in bf16, each rounded to nearest as staging
+// rounds it, not in out; storage of its own, as sc->bf16_a lies over the 8-bit rows this GEMM is reading.
 void moe_gate_up(const float* x, int ldx, const ExpertMat& W, const int* eidx, int rows, int top_k, int I, int K,
                  float situ_beta, float situ_linear_beta, bool fuse_act, float* out, int ld_out, const MoeScratch* sc,
-                 const Launch& L);
+                 const Launch& L, bool q8_ready = false, bf16* act_bf16 = nullptr);
 // Weighted down-projection: out[r, n] (=|+=) sum_{k=0..top_k-1} ew[r, k] * down_{eidx[r, k]}(act[r * top_k + k])[n].
+// act_bf16 (with moe_round_bf16_down): its input [rows*top_k, K] in bf16 already, read in place of act.
 void moe_down(const float* act, int ld_act, const ExpertMat& W, const int* eidx, const float* ew, int rows, int top_k,
-              int H, int K, float* out, int ld_out, bool accumulate, const MoeScratch* sc, const Launch& L);
+              int H, int K, float* out, int ld_out, bool accumulate, const MoeScratch* sc, const Launch& L,
+              const bf16* act_bf16 = nullptr);
 
 // ---- DSpark drafter kernels (dspark.cu) -----------------------------------------------------
 // Weighted sum of n_taps tapped features [rows, ld_feats] -> RMSNorm -> out [rows, H].
