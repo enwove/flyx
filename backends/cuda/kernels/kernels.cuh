@@ -83,6 +83,26 @@ enum PosSel : int { kPosPosition = 0, kPosStart = 1 };
 // Choices the shapes do not settle: one set per loaded model (the backend's
 // options), the defaults in tests and benchmarks.
 enum AttnImpl : int { kAttnAuto = 0, kAttnSplit = 1, kAttnPerHead = 2 };
+// Configurations of the staged packed expert dp4a GEMMs, all with the same bits. C counts output columns per warp
+// (gate/up pairs when fused), U counts K/32 units in flight per lane. Explicit choices also specialize grouped tiles
+// of one row; the default picks one by block type and rows (grouped_gate_up_dp4a) or keeps the original tiles.
+enum MoeDp4a : int {
+  kMoeDp4aDefault, kMoeDp4aC1U1, kMoeDp4aC1U2, kMoeDp4aC2U1, kMoeDp4aC2U2, kMoeDp4aC4U1, kMoeDp4aC4U2,
+  kMoeDp4aCount
+};
+inline const char* moe_dp4a_name(MoeDp4a variant) {
+  static constexpr const char* names[] = {"default", "1x1", "1x2", "2x1", "2x2", "4x1", "4x2"};
+  static_assert(sizeof(names) / sizeof(names[0]) == kMoeDp4aCount);
+  return names[variant];
+}
+// The formats for which extra configurations are compiled, also exercised by cuda_bench and cuda_op_test.
+inline constexpr int kMoeDp4aTypes[] = {FLYX_DT_GGML_IQ3_XXS, FLYX_DT_GGML_IQ2_S, FLYX_DT_GGML_IQ2_XXS,
+                                        FLYX_DT_GGML_IQ2_XS, FLYX_DT_GGML_IQ4_NL, FLYX_DT_GGML_Q4_K};
+constexpr bool has_moe_dp4a_variants(int dtype) {
+  for (int t : kMoeDp4aTypes)
+    if (t == dtype) return true;
+  return false;
+}
 // The selection's chunks: about this many pairs each, at most kStrataSelChunks; never more than
 // kStrataSelChunk pairs (a thread of the selection holds 16 of them in registers), so a session's context is at most
 // kStrataSelChunk kStrataSelChunks pairs (4M positions).
@@ -98,6 +118,7 @@ struct KernelOptions {
   bool stacks = true;         // a stack's run and the next of another block type in one round launch where compiled
                               // (gemm_blocks_staged_runs)
   bool round_glu = true;      // a round's SwiGLU in its dp4a gate|up GEMM (gemm_blocks_round_glu_takes)
+  MoeDp4a moe_dp4a = kMoeDp4aDefault;  // measurement: packed expert dp4a kernel configuration
   bool side_stream = true;    // a round's narrow GEMMs of a stack on the launch's side stream (gemm_blocks_staged_runs)
   bool log_shapes = false;    // the backend prints every GEMM shape once
   bool prefill_fp4 = false;   // NVFP4 weights in prefill GEMMs take NVFP4 activations (W4A4, sm_120a; gemm_w4a4):

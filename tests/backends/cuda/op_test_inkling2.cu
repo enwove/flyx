@@ -1584,8 +1584,114 @@ void test_inkling2_moe_norm() {
   }
 }
 
+namespace {
+
+void test_moe_dp4a_variants() {
+  // 72 units: U=2 must refill its first slot for just eight lanes. Odd widths exercise the final
+  // partially occupied warp and column group. Padding after each float32 output catches extra stores.
+  constexpr int R = 16, E = 7, top_k = 2, K = 2304, I = 35, H = 37, ldx = K + 3;
+  constexpr int ld_down = H + 5;
+  seed("inkling2_moe_dp4a");
+  std::vector<int> ids(R * top_k);
+  for (int r = 0; r < R; ++r) {
+    // Expert 0 occurs in every row, in alternating slots. Expert 1 occurs once, the rest in threes.
+    ids[r * top_k + r % 2] = 0;
+    ids[r * top_k + 1 - r % 2] = r == 0 ? 1 : 2 + (r - 1) / 3;
+  }
+  int* eidx = dev<int>(ids.size());
+  CK(cudaMemcpy(eidx, ids.data(), ids.size() * sizeof(int), cudaMemcpyHostToDevice));
+  float* weights = up(randv(ids.size(), 0.5));
+  float* scales = up({0.75, 0.125, 0.625, 1.5, 0.5, 0.25, 1.25});
+  float* x = up(randv(size_t(R) * ldx, 0.125));
+  float* down_x = up(randv(size_t(R) * top_k * ldx, 0.125));
+  MoeScratch sc{};
+  sc.chunk_rows = R;
+  sc.max_experts = E;
+  sc.max_top_k = top_k;
+  sc.offsets = dev<int>(E + 1);
+  sc.pairs = dev<int>(ids.size());
+  sc.tasks = dev<MoeTask>(ids.size());
+  sc.n_tasks = dev<int>(1);
+  sc.stage_elems = ids.size() * K;
+  sc.q8_a = dev<int8_t>(sc.stage_elems);
+  sc.q8_d = dev<float>(sc.stage_elems / 32);
+  sc.q8_s = dev<float>(sc.stage_elems / 16);
+  float* pairs_out = dev<float>(ids.size() * H);
+  float* sum_out = dev<float>(size_t(R) * ld_down);
+
+  for (int dtype : kMoeDp4aTypes) {
+    seed("inkling2_moe_dp4a_weights", dtype);
+    const BlockType& bt = block_type(dtype);
+    auto matrix = [&](int cols) {
+      ExpertMat w{};
+      w.n_experts = E;
+      w.N = cols;
+      w.rs = scales;
+      w.blk = up_blocks(dtype, random_blocks(bt, size_t(E) * cols * (K / flyx_block_values(dtype))), E * cols);
+      w.blk.q8 = true;
+      return w;
+    };
+    const ExpertMat gu = matrix(2 * I), dn = matrix(H);
+    auto check = [&](const char* op, int words_per_row, auto run) {
+      float* alone = dev<float>(R * words_per_row);
+      float* got = dev<float>(R * words_per_row);
+      CK(cudaMemset(alone, 0xff, R * words_per_row * sizeof(float)));
+      for (int r = 0; r < R; ++r) run(r, 1, TL, alone + r * words_per_row);
+      KernelOptions options{};
+      Launch launch = TL;
+      launch.opt = &options;
+      for (int v = 0; v < kMoeDp4aCount; ++v) {
+        options.moe_dp4a = static_cast<MoeDp4a>(v);
+        for (int rows : {1, 2, 4, 8, R}) {
+          const size_t words = size_t(rows) * words_per_row;
+          CK(cudaMemset(got, 0xff, words * sizeof(float)));
+          run(0, rows, launch, got);
+          const std::string label = std::string("MoE ") + bt.name + " " + op + " " + moe_dp4a_name(options.moe_dp4a) +
+                                    " R=" + std::to_string(rows) + " vs default R=1";
+          expect_device_bits(label, got, alone, words);
+        }
+      }
+      CK(cudaFree(alone));
+      CK(cudaFree(got));
+    };
+
+    for (bool fused : {false, true}) {
+      const int ld = (fused ? I : 2 * I) + 5;
+      check(fused ? "SiTU" : "gate|up", top_k * ld, [&](int r, int rows, const Launch& L, float* out) {
+        moe_gate_up(x + r * ldx, ldx, gu, eidx + r * top_k, rows, top_k, I, K, 6.f, 8.f, fused, out, ld, &sc, L);
+      });
+    }
+    // Two BF16 expert slots per row occupy exactly I 32-bit words, so this compares the stored BF16 bits directly.
+    check("BF16 SiTU", I, [&](int r, int rows, const Launch& L, float* out) {
+      moe_stage_q8(x + r * ldx, ldx, K, rows, sc, moe_q8_mins(gu), L.st);
+      moe_gate_up(x + r * ldx, ldx, gu, eidx + r * top_k, rows, top_k, I, K, 6.f, 8.f, true, nullptr, I, &sc, L,
+                  true, reinterpret_cast<bf16*>(out));
+    });
+    // Inspect individual projections as well: rounding in the weighted sum can hide a difference in a single expert.
+    for (bool per_expert : {true, false}) {
+      check(per_expert ? "down experts" : "down sum", per_expert ? top_k * H : ld_down,
+            [&](int r, int rows, const Launch& L, float* out) {
+              MoeScratch down_sc = sc;
+              down_sc.down_buf = per_expert ? out : pairs_out;
+              moe_down(down_x + r * top_k * ldx, ldx, dn, eidx + r * top_k, weights + r * top_k, rows, top_k, H, K,
+                       per_expert ? sum_out : out, ld_down, false, &down_sc, L);
+            });
+    }
+    for (const ExpertMat& w : {gu, dn}) {
+      CK(cudaFree(const_cast<uint8_t*>(w.blk.data)));
+      CK(cudaFree(const_cast<uint16_t*>(w.blk.scales)));
+    }
+  }
+  for (void* p : std::initializer_list<void*>{eidx, weights, scales, x, down_x, sc.offsets, sc.pairs, sc.tasks,
+                                              sc.n_tasks, sc.q8_a, sc.q8_d, sc.q8_s, pairs_out, sum_out})
+    CK(cudaFree(p));
+}
+
+}  // namespace
+
 void test_inkling2_moe() {
   test_inkling2_moe_norm();
+  test_moe_dp4a_variants();
   std::printf("inkling2 moe (route, situ, gate_up, down)\n");
   // 1. moe_route: sigmoid+bias and softmax.
   for (int sig : {1, 0}) {

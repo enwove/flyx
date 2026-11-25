@@ -886,7 +886,7 @@ int moe_gate_up(const float* x, int ldx, const ExpertMat& W, const int* eidx, in
         grouped = rc == rows ? bm : 0;
       }
       ops->gu(xc, ldx, W, ec, rc, top_k, I, K, situ_beta, situ_linear_beta, fuse_act, oc, ld_out, sc, mt, use_mma,
-              st, act_bf16);
+              opts(L).moe_dp4a, st, act_bf16);
     }
     return grouped;
   }
@@ -961,8 +961,8 @@ void moe_down(const float* act, int ld_act, const ExpertMat& W, const int* eidx,
         mt = max_work_tiles(M, W.n_experts, bm);
         if (rc != rows || !tiles_serve(grouped, bm, rc)) group_tasks(ec, M, W.n_experts, bm, sc, st);
       }
-      const bool wrote_buf =
-          ops->down(ac, ld_act, W, ec, ewc, rc, top_k, H, K, oc, ld_out, accumulate, sc, mt, use_mma, st);
+      const bool wrote_buf = ops->down(ac, ld_act, W, ec, ewc, rc, top_k, H, K, oc, ld_out, accumulate, sc, mt,
+                                       use_mma, opts(L).moe_dp4a, st);
       if (wrote_buf)
         k_moe_weighted_sum<<<dim3(ceil_div(H, 256), rc), 256, 0, st>>>(sc->down_buf, ewc, top_k, H, oc, ld_out,
                                                                        int(accumulate));

@@ -5,6 +5,7 @@
 //   cuda_op_test --filter attn_res_mix              AttnRes mixes (standalone)
 //   cuda_op_test --filter shortconv_res_mix_norm    fused sublayer boundaries
 //   cuda_op_test --filter inkling2_rel_attn         relative attention and its K/V preparation
+//   cuda_op_test --filter inkling2_moe              MoE routing, expert GEMMs and their dp4a configurations
 //
 // Inputs are random; weights and caches go through bf16 on both sides, so
 // the remaining difference is float32 arithmetic (and bf16 activations in the
@@ -33,9 +34,11 @@ int main(int argc, char** argv) {
     if (std::strcmp(argv[2], "attn_res_mix") == 0) filtered_test = test_inkling2_attn_res;
     if (std::strcmp(argv[2], "shortconv_res_mix_norm") == 0) filtered_test = test_inkling2_sublayer_fusion;
     if (std::strcmp(argv[2], "inkling2_rel_attn") == 0) filtered_test = test_rel_attention;
+    if (std::strcmp(argv[2], "inkling2_moe") == 0) filtered_test = test_inkling2_moe;
   }
   if (argc != 1 && !filtered_test) {
-    std::fprintf(stderr, "usage: cuda_op_test [--filter attn_res_mix|shortconv_res_mix_norm|inkling2_rel_attn]\n");
+    std::fprintf(stderr,
+                 "usage: cuda_op_test [--filter attn_res_mix|shortconv_res_mix_norm|inkling2_rel_attn|inkling2_moe]\n");
     return 2;
   }
   // A nonfinite element between two matching ones must not disappear in the max-error reduction.

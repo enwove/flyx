@@ -173,6 +173,7 @@ Passed verbatim to the backend (`backends/cuda/backend.cpp`). Unknown keys or in
 | `draft_kv` | `fp8` \| `16` | `fp8` | MTP drafter KV cache dtype when target KV is FP8. |
 | `act_group` | `32` \| `64` \| `128` \| `256` | `32` | Measurement only: 8-bit activation scale group size (use with `fusion=0,round_glu=0`). |
 | `act_fp4` | `0` \| `1` \| `2` | `0` | Measurement only: round staged activations as NVFP4 (`1`) or MXFP8 (`2`). |
+| `moe_dp4a` | `default` \| `1x1` \| `1x2` \| `2x1` \| `2x2` \| `4x1` \| `4x2` | `default` | Measure packed expert dp4a GEMMs with staged 8-bit activations for IQ3_XXS, IQ2_S, IQ2_XXS, IQ2_XS, IQ4_NL and Q4_K. The two numbers select output columns per warp (gate/up pairs when fused) and K/32 units in flight per lane. Explicit choices specialize grouped tiles containing one row. `default` takes, in fused gate/up GEMMs of 2 or more rows, two gate/up pairs per warp for the 2-bit IQ types and, above 4 rows, for IQ3_XXS and IQ4_NL (one below); otherwise the original tiles. |
 
 ### Attention, Tiered KV, StrataFlux, and MTP Cache
 

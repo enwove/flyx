@@ -207,6 +207,22 @@ const std::vector<OptionSpec>& option_specs() {
       kernel_flag_opt("gdn_round", &KernelOptions::gdn_round),
       kernel_flag_opt("stacks", &KernelOptions::stacks),
       kernel_flag_opt("round_glu", &KernelOptions::round_glu),
+      {"moe_dp4a",
+       [](const std::string& key, const std::string& val, BackendOptions* o, std::string* err) {
+         for (int i = 0; i < kMoeDp4aCount; ++i) {
+           const auto variant = static_cast<MoeDp4a>(i);
+           if (val == moe_dp4a_name(variant)) {
+             o->kernels.moe_dp4a = variant;
+             return true;
+           }
+         }
+         *err = "bad value \"" + val + "\" for " + key;
+         return false;
+       },
+       [](const BackendOptions& o, const BackendOptions& def) -> std::string {
+         if (o.kernels.moe_dp4a == def.kernels.moe_dp4a) return "";
+         return std::string("moe_dp4a=") + moe_dp4a_name(o.kernels.moe_dp4a);
+       }},
       kernel_flag_opt("side_stream", &KernelOptions::side_stream),
       {"attention",
        [](const std::string& key, const std::string& val, BackendOptions* o, std::string* err) {

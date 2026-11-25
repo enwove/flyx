@@ -411,9 +411,12 @@ struct FIQ4_NL {  // q = the 16-value table's entry of the code
   static constexpr int kScales = 1, kS0 = 0, kS1 = -1, kPlanes = 1;
   static constexpr int kFlatRun = 0;
   using Local = Iq4Table;
+  static __device__ __forceinline__ void unit_tables(const Tables& T, Local& L) {
+    fetch(L.pairs8, T.pair_iq4_s8, 256);
+  }
   static __device__ __forceinline__ void tables(const Tables& T, Local& L) {
     fetch(L.pairs, T.pair_iq4, 256);
-    fetch(L.pairs8, T.pair_iq4_s8, 256);
+    unit_tables(T, L);
   }
   FLYX_NIBBLES32
   static __device__ __forceinline__ void words(const Local& L, const Lane& n, int, uint32_t* w0, uint32_t*) {
@@ -890,6 +893,7 @@ struct FQ4_K {
   static constexpr int kScales = 2, kS0 = 0, kS1 = 2, kPlanes = 2;
   static constexpr int kFlatRun = 32;  // the second plane: one value per 32 weights
   using Local = KTables;
+  static __device__ __forceinline__ void unit_tables(const Tables&, Local&) {}  // unit_codes extracts nibbles directly
   static __device__ __forceinline__ void tables(const Tables& T, Local& L) {
     fetch(L.pairs, T.pair_u4, 256);
     fetch(L.twice, T.twice_u6, 64);
@@ -1160,10 +1164,13 @@ struct FIQ2_XXS {
     uint4 scaled[16];
     uint32_t rows[256], signs[128];
   };
-  static __device__ __forceinline__ void tables(const Tables& T, Local& L) {
-    fetch(L.scaled, T.iq2_scaled, 16);
+  static __device__ __forceinline__ void unit_tables(const Tables& T, Local& L) {
     fetch(L.rows, T.iq2xxs, 256);
     fetch(L.signs, T.ksign_sel, 128);
+  }
+  static __device__ __forceinline__ void tables(const Tables& T, Local& L) {
+    fetch(L.scaled, T.iq2_scaled, 16);
+    unit_tables(T, L);
   }
   struct Raw {
     uint32_t own[kOwn];
@@ -1233,10 +1240,13 @@ struct FIQ2_XS {
     uint4 scaled[16];
     uint32_t rows[512], signs[128];
   };
-  static __device__ __forceinline__ void tables(const Tables& T, Local& L) {
-    fetch(L.scaled, T.iq2_scaled + 16, 16);
+  static __device__ __forceinline__ void unit_tables(const Tables& T, Local& L) {
     fetch(L.rows, T.iq2xs, 512);
     fetch(L.signs, T.ksign_sel, 128);
+  }
+  static __device__ __forceinline__ void tables(const Tables& T, Local& L) {
+    fetch(L.scaled, T.iq2_scaled + 16, 16);
+    unit_tables(T, L);
   }
   struct Raw {
     uint32_t own[kOwn], scales[2];
@@ -1315,10 +1325,13 @@ struct FIQ2_S {
     uint4 scaled[16];
     uint32_t rows[1024], signs[256];
   };
-  static __device__ __forceinline__ void tables(const Tables& T, Local& L) {
-    fetch(L.scaled, T.iq2_scaled + 32, 16);
+  static __device__ __forceinline__ void unit_tables(const Tables& T, Local& L) {
     fetch(L.rows, T.iq2s, 1024);
     fetch(L.signs, T.sign_sel, 256);
+  }
+  static __device__ __forceinline__ void tables(const Tables& T, Local& L) {
+    fetch(L.scaled, T.iq2_scaled + 32, 16);
+    unit_tables(T, L);
   }
   struct Raw {
     uint32_t own[kOwn], tail[4];  // a quarter's row and sign bytes; the block's qh and scales
@@ -1403,10 +1416,13 @@ struct FIQ3_XXS {
     uint2 signs[128];
     uint16_t rows[256];
   };
-  static __device__ __forceinline__ void tables(const Tables& T, Local& L) {
-    fetch(L.scaled, T.iq3xxs_scaled, 16);
+  static __device__ __forceinline__ void unit_tables(const Tables& T, Local& L) {
     fetch(L.signs, T.ksign_hi, 128);
     fetch(L.rows, T.iq3xxs, 256);
+  }
+  static __device__ __forceinline__ void tables(const Tables& T, Local& L) {
+    fetch(L.scaled, T.iq3xxs_scaled, 16);
+    unit_tables(T, L);
   }
   // The tables of the kernel that keeps the round's rows in dynamic shared memory (k_round_blocks_split): also a row
   // byte with its four sign bits (bit b: value b negative) -> the four values, signed: codes() through one load (16 KB;
