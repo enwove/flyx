@@ -77,7 +77,7 @@ function FitTag({ size }) {
   return html`<span class=${"tag2 " + (fits ? "ok" : "bad")} title=${t(title)}>${t(fits ? "fits" : "too big")}</span>`;
 }
 
-const drafterLabel = (k) => k === "mtp" ? "MTP" : k === "dflash2" ? "DFlash2" : k === "dspark" ? "DSpark" : k;
+const drafterLabel = (k) => k === "mtp" ? "MTP" : k === "dflash2" ? "DFlash2" : k;
 
 // What is served and its state, its facts, a fetch's or a load's progress, an error.  With nothing
 // served it is the view's whole content: `again` loads the model the server remembers, `browse` shows the library.
@@ -163,10 +163,9 @@ function Serving({ tm, again, retry, browse }) {
     </div>`;
 }
 
-// A drafter given as a GGUF is a DSpark, DFlash2, or MTP file; anything else a DFlash2 drafter.
+// A drafter given as a GGUF is a DFlash2 or MTP file; anything else a DFlash2 drafter.
 const kindOf = (d) => /\.gguf$/i.test(d)
-  ? (/(?:^|[\\/:-])dspark(?:[\\/._-]|$)/i.test(d) ? "dspark"
-     : /(?:^|[\\/:-])dflash2?(?:[\\/._-]|$)/i.test(d) ? "dflash2" : "mtp")
+  ? (/(?:^|[\\/:-])dflash2?(?:[\\/._-]|$)/i.test(d) ? "dflash2" : "mtp")
   : "dflash2";
 const normVisionDev = (v) => (v === "host" || v === "cpu") ? "host" : v === "gpu" ? "gpu" : v === "auto" ? "auto" : "disk";
 const normVisionQuant = (v) => (v === "exact" || v === "bf16") ? "exact" : (v === "nvfp4" || v === "fp4") ? "nvfp4" : "q8";
@@ -355,6 +354,8 @@ export function ModelPage({ active, libraryAsked, currentAsked }) {
   const hubEndpoint = (hubCfg && hubCfg.endpoint) || (found && found.endpoint) || "https://huggingface.co";
   const hubDefaultEndpoint = (hubCfg && hubCfg.default_endpoint) || "https://huggingface.co";
   const isCustomEndpoint = hubEndpoint.replace(/\/+$/, "").toLowerCase() !== hubDefaultEndpoint.replace(/\/+$/, "").toLowerCase();
+  const isHub = (v) => hubName(v, hubEndpoint);
+  const repoNameOf = (v) => repoOf(v, hubEndpoint);
 
   async function refreshHubConfig() {
     const r = await call("GET", "/v1/hub/config");
@@ -443,7 +444,7 @@ export function ModelPage({ active, libraryAsked, currentAsked }) {
   // The first repository shown: the served model's, else the first found.
   useEffect(() => {
     if (repoSel || view !== "library" || tab !== "hub" || !found) return;
-    const served = loadedWant && hubName(loadedWant.model) ? repoOf(loadedWant.model) : "";
+    const served = loadedWant && isHub(loadedWant.model) ? repoNameOf(loadedWant.model) : "";
     const first = served || (found.models[0] && found.models[0].id);
     if (first) showRepo(first, "");
   }, [found, tab, view]);
@@ -501,7 +502,7 @@ export function ModelPage({ active, libraryAsked, currentAsked }) {
   useEffect(() => {
     if (placed.current || view !== "library" || tab !== "local" || !catalog) return;
     placed.current = true;
-    const served = loadedWant && !hubName(loadedWant.model) && /[\\/]/.test(loadedWant.model) ? folderOf({ name: loadedWant.model }) : "";
+    const served = loadedWant && !isHub(loadedWant.model) && /[\\/]/.test(loadedWant.model) ? folderOf({ name: loadedWant.model }) : "";
     openPath(served || catalog.cache);
     const first = loadedWant ? loadedWant.model : (catalog.models.find((m) => m.source === "hub" && m.kind !== "drafter" && m.kind !== "mmproj") || {}).name;
     if (first) { setPicked(first); setTarget(first); }
@@ -609,7 +610,7 @@ export function ModelPage({ active, libraryAsked, currentAsked }) {
       const n = (st.running || 0) + (st.queued || 0);
       if (n) lines.push(n + (n === 1 ? " request is" : " requests are") + " running or waiting: " + (n === 1 ? "it is" : "they are") + " stopped.");
       lines.push(served + " is unloaded first; its GPU memory comes back before the new one loads.");
-      if (hubName(name) && !entryOf(name)) lines.push("The files are fetched first, while " + served + " keeps answering.");
+      if (isHub(name) && !entryOf(name)) lines.push("The files are fetched first, while " + served + " keeps answering.");
       lines.push("fallback" in L ? "If the new one fails to load, " + served + " is loaded again." :
                  "If the new one fails to load, no model is served until another is loaded.");
       if (!await confirmBox(same ? "Reload " + served + " with these settings?" : "Switch to " + (describe(entryOf(name) || { name }).quant || name) + "?",
@@ -762,14 +763,14 @@ export function ModelPage({ active, libraryAsked, currentAsked }) {
               <input type="radio" name="sd-src" aria-label=${t("Custom drafter")} checked=${custom} disabled=${specOff}/>
               <div class="grow">
                 <div class="dhead"><b>${t("Custom drafter")}</b>
-                  ${custom && own ? html`<span class=${"tag2 " + (ownCached ? "ok" : "")}>${t(ownCached ? "downloaded" : hubName(own) ? "Hugging Face" : "file")}</span>` : ""}
+                  ${custom && own ? html`<span class=${"tag2 " + (ownCached ? "ok" : "")}>${t(ownCached ? "downloaded" : isHub(own) ? "Hugging Face" : "file")}</span>` : ""}
                   <span class="was on">${was("drafter") !== null ? t("was " + t(was("drafter"))) : ""}</span></div>
                 <p class="ddesc">${t("A drafter of your own, in place of the default: a Hugging Face name or a path on the server's machine.")}</p>
                 <input type="text" id="sd-file" placeholder=${t("org/name, or a path")} spellcheck="false" autocomplete="off" disabled=${specOff}
                        value=${f.drafter} onFocus=${() => !custom && pickDraft("custom")}
                        onInput=${(e) => setF(Object.assign({}, f, { draftSource: "custom", drafter: e.target.value, draftPicked: false }))}/>
                 ${custom ? html`<em>${t(!own ? "Give a Hugging Face name or a path; empty, the default is used." : ownCached ? "On this machine." :
-                                         hubName(own) ? "Fetched from Hugging Face when the model loads." : "A file on the server's machine.")}</em>` : ""}
+                                         isHub(own) ? "Fetched from Hugging Face when the model loads." : "A file on the server's machine.")}</em>` : ""}
               </div>
             </div>
           </div>
@@ -816,7 +817,7 @@ export function ModelPage({ active, libraryAsked, currentAsked }) {
               <input type="radio" name="vs-src" aria-label=${t("Custom projector")} checked=${visCustom} disabled=${visOff}/>
               <div class="grow">
                 <div class="dhead"><b>${t("Custom projector")}</b>
-                  ${visCustom && mmOwn ? html`<span class="tag2">${t(hubName(mmOwn) ? "Hugging Face" : "file")}</span>` : ""}
+                  ${visCustom && mmOwn ? html`<span class="tag2">${t(isHub(mmOwn) ? "Hugging Face" : "file")}</span>` : ""}
                   <span class="was on">${was("mmproj") !== null ? t("was " + t(was("mmproj"))) : ""}</span></div>
                 <p class="ddesc">${t("Path to a companion mmproj-*.gguf file on the server's machine.")}</p>
                 <input type="text" id="vs-file" placeholder=${t("path to mmproj-*.gguf")} spellcheck="false" autocomplete="off" disabled=${visOff}
@@ -877,7 +878,7 @@ export function ModelPage({ active, libraryAsked, currentAsked }) {
     const drafts = comps.filter((c) => c.kind !== "mmproj"), mmprojs = comps.filter((c) => c.kind === "mmproj");
     const renderRow = (c, sel, onToggle) => {
       const isMm = c.kind === "mmproj";
-      const kindTag = isMm ? ["mmproj", "info"] : c.kind === "dspark" ? ["DSpark", "ok"]
+      const kindTag = isMm ? ["mmproj", "info"]
                     : c.kind === "dflash2" ? ["DFlash2", "ok"] : c.kind === "mtp" ? ["MTP", "ok"] : ["drafter", "ok"];
       const sub = c.path && c.path !== c.file ? c.path : "";
       return html`
@@ -981,7 +982,7 @@ export function ModelPage({ active, libraryAsked, currentAsked }) {
     if (busy) label = L.state === "fetching" ? "Fetching…" : "Loading…";
     else if (same) { label = effChanged.length ? "Reload with these settings" : "Loaded"; disabled = disabled || !effChanged.length; }
     else if (loadedWant && name) label = "Switch to this model";
-    const mainOnDisk = !name ? true : (!!m || !hubName(name));
+    const mainOnDisk = !name ? true : (!!m || !isHub(name));
     const extraFetch = (overrides && overrides.drafter && !overrides.drafterCached ? overrides.drafterSize : 0) +
                        (overrides && overrides.mmproj && !overrides.mmprojCached ? overrides.mmprojSize : 0);
     const extraTotal = (overrides && overrides.drafter ? overrides.drafterSize : 0) +
@@ -1070,7 +1071,9 @@ export function ModelPage({ active, libraryAsked, currentAsked }) {
       : null);
     const compOverrides = barState.overrides;
     const unsupported = j && j.runs === false;
-    const note = unsupported ? "This build does not run this architecture." : j && !rows.length && !j.drafter_repo && !j.drafter ? "Nothing here to load." : "";
+    const note = unsupported ? "This build does not run this architecture."
+      : j && j.drafter_repo && !rows.length ? "A drafter is not loaded on its own."
+      : j && !rows.length && !j.drafter ? "Nothing here to load." : "";
     const chips = [];
     if (info.pipeline) chips.push([info.pipeline, ""]);
     if (info.architecture) chips.push([info.architecture, unsupported ? "bad" : j.runs ? "ok" : ""]);
@@ -1079,7 +1082,6 @@ export function ModelPage({ active, libraryAsked, currentAsked }) {
     if (info.license) chips.push([info.license, ""]);
     if (info.gated) chips.push([t("gated"), "warn"]);
     if (comps.some((c) => c.kind === "mmproj")) chips.push([t("+ Vision"), "ok"]);
-    if (comps.some((c) => c.kind === "dspark")) chips.push(["+ DSpark", "ok"]);
     if (comps.some((c) => c.kind === "mtp")) chips.push(["+ MTP", "ok"]);
     const [org, short] = repoSel.split("/");
     return html`
@@ -1131,7 +1133,7 @@ export function ModelPage({ active, libraryAsked, currentAsked }) {
   // and the one remembered, those added here.
   const cacheDir = catalog ? catalog.cache : "", atCache = !!cacheDir && !!loc && samePath(loc, cacheDir);
   const places = cacheDir ? [cacheDir] : [];
-  const wanted = [loadedWant, L.remembered].filter((w) => w && w.model && !hubName(w.model) && /[\\/]/.test(w.model)).map((w) => folderOf({ name: w.model }));
+  const wanted = [loadedWant, L.remembered].filter((w) => w && w.model && !isHub(w.model) && /[\\/]/.test(w.model)).map((w) => folderOf({ name: w.model }));
   for (const x of [...known.keys(), ...wanted, ...folders]) if (!places.some((k) => samePath(k, x))) places.push(x);
   const sum = (list) => list.reduce((n, m) => n + (m.size || 0), 0);
   const ql = localQ.trim().toLowerCase(), hit = (text) => !ql || text.toLowerCase().includes(ql);

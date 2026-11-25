@@ -119,6 +119,8 @@ void names() {
   check(flyx::hub::normalize_endpoint("http://127.0.0.1:8080/hf/", &norm, &ep_err) &&
             norm == "http://127.0.0.1:8080/hf",
         "normalize_endpoint keeps explicit http:// and path prefix");
+  check(flyx::hub::normalize_endpoint("http://[::1]:8080/", &norm, &ep_err) && norm == "http://[::1]:8080",
+        "normalize_endpoint keeps IPv6 literal host");
   check(flyx::hub::normalize_endpoint("   ", &norm, &ep_err) && norm.empty(),
         "normalize_endpoint treats blank as reset");
   for (const char* bad : {"ftp://hf-mirror.com", "javascript:alert(1)", "https://hf-mirror.com?a=1",

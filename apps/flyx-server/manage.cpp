@@ -426,17 +426,15 @@ void add_manage_routes(httplib::Server& http, Server* s) {
         for (const auto& f : found) seen_ids.insert(f.id);
         std::string low = asked;
         for (char& c : low) c = char(std::tolower(static_cast<unsigned char>(c)));
-        const bool drafter_query = low.find("dflash") != std::string::npos || low.find("dspark") != std::string::npos ||
+        const bool drafter_query = low.find("dflash") != std::string::npos ||
                                    low.find("drafter") != std::string::npos || low.find("mtp") != std::string::npos;
         // Include safetensors DFlash2 drafter repos (which filter=gguf omits) when searching drafters or when no GGUF matches.
         if (found.empty() || drafter_query) {
           std::vector<hub::Found> extra;
           std::string e2;
-          if (hub::search(asked, sort, limit, &extra, &e2, "", found.empty() ? &next_cursor : nullptr,
-                          /*gguf_only=*/false)) {
-            const bool take_all = found.empty();
+          if (hub::search(asked, sort, limit, &extra, &e2, "", nullptr, /*gguf_only=*/false)) {
             for (auto& x : extra) {
-              if ((take_all || x.is_drafter) && seen_ids.insert(x.id).second) found.push_back(std::move(x));
+              if (x.is_drafter && seen_ids.insert(x.id).second) found.push_back(std::move(x));
             }
           }
         }
