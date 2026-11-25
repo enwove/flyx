@@ -258,6 +258,11 @@ DFlashBlock dflash(WeightLoader& L, const flyx_model_desc& d, const flyx_dflash2
   f.mask_token = b.mask_token;
   expect(b.window >= 0, "a DFlash2 window below zero");
   f.window = b.window;
+  expect(std::isfinite(b.softcap) && b.softcap >= 0.f, "a DFlash2 softcap out of range");
+  expect(b.softcap_mode == FLYX_DFLASH2_SOFTCAP_BEFORE || b.softcap_mode == FLYX_DFLASH2_SOFTCAP_AFTER,
+         "unsupported DFlash2 softcap mode");
+  f.softcap = b.softcap;
+  f.softcap_mode = b.softcap_mode;
   f.n_taps = b.n_taps;
   f.target_hidden = d.hidden;
   f.conv_taps = b.conv_taps;
@@ -843,6 +848,17 @@ void bind(flyx_bmodel* m, const flyx_model_desc& d, LoadTimes* times) {
       case FLYX_BLOCK_VIT_MLP: add(m, vit_mlp(L, b.vit_mlp)); break;
       case FLYX_BLOCK_VISION_MERGE: add(m, vision_merge(L, b.vision_merge)); break;
       default: throw std::runtime_error("block kind " + std::to_string(b.kind) + ": not implemented by this backend");
+    }
+  }
+  // Assign disjoint per-row tap offsets so multiple tap-consuming drafters (e.g. DSpark + DFlash2) can coexist.
+  int tap_off = 0;
+  for (Block& blk : m->blocks) {
+    if (auto* df = std::get_if<DFlashBlock>(&blk)) {
+      df->feats_offset = tap_off;
+      tap_off += df->n_taps * df->target_hidden;
+    } else if (auto* ds = std::get_if<DSparkBlock>(&blk)) {
+      ds->feats_offset = tap_off;
+      tap_off += ds->n_taps * m->hidden;
     }
   }
   // FLYX_NODE_RES_MIX names a [hidden] vector by its weight index (Inkling-2's output_res_query), and no block

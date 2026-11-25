@@ -556,6 +556,57 @@ void test_select() {
   }
   std::printf("  %-4s candidate walk\n", drafts == want ? "ok" : "FAIL");
   g_fail += drafts != want;
+  // Softcapped selector walk and tree (before_correction = 0 and after_correction = 1; ops/draft/ref.h).
+  {
+    const float sc = 3.0f;
+    float* dhid = up(hid);
+    bf16 *dpred = up_bf16(pred), *dsucc = up_bf16(succ);
+    TreeRows* dt_sc = dev<TreeRows>(1);
+    for (int mode : {0, 1}) {
+      selector_walk(P, ti, tv, k, dhid, rank, dpred, dsucc, width, nullptr, dr, 0, sc, mode);
+      const auto got_w = down_i(dr, width);
+      int prev_sc = 1234;
+      std::vector<int> want_w;
+      for (int s = 0; s < width; ++s) {
+        int best = 0;
+        double bs = -1e300;
+        for (int c = 0; c < k; ++c) {
+          double e = 0;
+          for (int i = 0; i < rank; ++i)
+            e += pred[size_t(prev_sc) * rank + i] * hid[size_t(s) * rank + i] *
+                 succ[size_t(want_idx[s * k + c]) * rank + i];
+          const double score = ops::dflash2_selector_score(want_val[s * k + c], e, double(sc), mode);
+          if (score > bs) {
+            bs = score;
+            best = c;
+          }
+        }
+        prev_sc = want_idx[s * k + best];
+        want_w.push_back(prev_sc);
+      }
+      const bool wok = got_w == want_w;
+      std::printf("  %-4s candidate walk (softcap=%.1f mode=%d)\n", wok ? "ok" : "FAIL", sc, mode);
+      g_fail += !wok;
+
+      const int tw = 9;
+      selector_tree(P, ti, tv, k, dhid, rank, dpred, dsucc, tw, rows, nullptr, dr, dt_sc, 0, sc, mode);
+      TreeRows t{};
+      CK(cudaMemcpy(&t, dt_sc, sizeof(t), cudaMemcpyDeviceToHost));
+      const auto got_t = down_i(dr, size_t(tw));
+      std::vector<int32_t> wd(static_cast<size_t>(tw)), wp(static_cast<size_t>(tw));
+      auto score_sc = [&](int32_t p, int d, int c) {
+        double e = 0;
+        for (int i = 0; i < rank; ++i)
+          e += pred[size_t(p) * rank + i] * hid[size_t(d) * rank + i] * succ[size_t(want_idx[d * k + c]) * rank + i];
+        return ops::dflash2_selector_score(want_val[d * k + c], e, double(sc), mode);
+      };
+      ops::best_first_tree(tw, rows, k, 1234, want_idx.data(), score_sc, wd.data(), wp.data());
+      bool tok = t.n == tw + 1 && std::vector<int32_t>(got_t.begin(), got_t.end()) == wd;
+      for (int i = 0; i < width; ++i) tok = tok && wd[size_t(i)] == want_w[size_t(i)] && wp[size_t(i)] == i - 1;
+      std::printf("  %-4s candidate tree (softcap=%.1f mode=%d)\n", tok ? "ok" : "FAIL", sc, mode);
+      g_fail += !tok;
+    }
+  }
   // The candidates as a tree (ops/draft/ref.h): drafts, parents, and the TreeRows the round reads; its trunk is the
   // walk's chain.  A tree wider than the positions (it must branch), one that fills a whole round, and one of 5 over
   // 2 positions.

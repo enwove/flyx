@@ -42,13 +42,13 @@ A file `llama.cpp` reads as a DFlash2 drafter (e.g. `z-lab/Qwen3.8-27B-DFlash2-G
 | Read | Keys / Tensors |
 |---|---|
 | Dimensions | `dflash.block_count`, `embedding_length` (the target's width), `feed_forward_length`, `attention.head_count`, `attention.head_count_kv`, `attention.key_length`, `rope.freq_base`, `attention.layer_norm_rms_epsilon` |
-| Drafting | `dflash.block_size`, `conv_kernel_size`, `conv_group_size`, `selector_rank`, `selector_top_k`, `target_layers` (the target's hidden states the drafter reads: after that many layers), `attention.sliding_window` with `attention.sliding_window_pattern`, and `tokenizer.ggml.mask_token_id` (or `dflash.mask_token_id`) |
+| Drafting | `dflash.block_size`, `conv_kernel_size`, `conv_group_size`, `selector_rank`, `selector_top_k`, `target_layers` (the target's hidden states the drafter reads: `1..layers-1` tap the residual stream after that layer, `layers` taps post-`output_norm`), optional `final_logit_softcapping` (the selector's soft cap on a candidate's logit) and `selector_softcap_mode` (`before_correction`, the default, or `after_correction`: before the pair's correction is added, or on their sum), `attention.sliding_window` with `attention.sliding_window_pattern`, and `tokenizer.ggml.mask_token_id` (or `dflash.mask_token_id`) |
 | Top-level tensors | `fc.weight`, `enc.output_norm.weight`, `output_norm.weight`, `selector_hidden.weight`, `selector_predecessor.weight`, `selector_successor.weight` |
 | Per layer (`blk.<i>.`) | The dense layer's names (`attn_norm`, `attn_q`/`k`/`v`/`output`, `attn_q_norm`, `attn_k_norm`, `ffn_norm`, `ffn_gate`/`up`/`down`) plus `attn_conv_base`, `attn_conv_proj.weight`, `ffn_conv_base`, `ffn_conv_proj.weight` |
 
-Its matrices stay as stored: GGML block types packed (mixed types in one stacked projection run as one GEMM per run of a type), BF16 as BF16 (quantized at load beside a quantized target, as a `.flyx` drafter's are). The file's own tokenizer is not read.
+Its matrices stay as stored: GGML block types packed (mixed types in one stacked projection run as one GEMM per run of a type), BF16 as BF16 (quantized at load beside a quantized target, as a `.flyx` drafter's are). The file's own tokenizer is not read. A file with `dflash.has_markov_context = true` is a DSpark drafter (`models/drafters/dspark.cpp`), never the plain block: it drafts beside a model whose programs tap for it (`inkling2_loop`) and is refused beside any other.
 
-Refused, with the file named: a width or vocabulary other than the target's (whether or not the drafter is chosen); and, when it is chosen to draft, causal layers, a sliding-window pattern that is not uniform, `dflash.sample_from_anchor`, `dflash.has_confidence_head`, `dflash.final_logit_softcapping`, `dflash.has_markov_context` (DSpark), and a `target_layers` entry equal to the target's layer count (its final hidden state, taken after the output norm, which a tap of the residual stream is not).
+Refused, with the file named: a width or vocabulary other than the target's (whether or not the drafter is chosen); and, when it is chosen to draft, causal layers, a sliding-window pattern that is not uniform, `dflash.sample_from_anchor`, and `dflash.has_confidence_head`.
 
 ### Qwen3.5 Layout Flags (Zero Weight Rewriting in `models/`)
 

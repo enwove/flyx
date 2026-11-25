@@ -181,7 +181,12 @@ void draft_block(flyx_seq* s, const DFlashBlock& b, int width, const Launch& L, 
   const int Tp = b.conv_taps, G = H / b.conv_group, TG = Tp * G, nqkv = (nh + 2 * nkv) * hd;
   cudaStream_t st = L.st;
   build_rows(s->P, nullptr, b.mask_token, s->dtok, B, st);
-  embed_tokens(E, s->dtok, s->dx, B, st);  // packed tables stay in host memory
+  if (E.has_norm) {
+    embed_tokens(E, s->dtok, s->dh, B, st);
+    rmsnorm(s->dh, H, E.norm.w, E.norm.offset, E.norm.eps, s->dx, H, B, H, st);
+  } else {
+    embed_tokens(E, s->dtok, s->dx, B, st);  // packed tables stay in host memory
+  }
   for (int j = 0; j < b.layers(); ++j) {
     const auto& l = block<DFlashLayer>(m, b.first_layer + j);
     kv16* Kj = kv.k16(j);
@@ -222,10 +227,10 @@ void draft_block(flyx_seq* s, const DFlashBlock& b, int width, const Launch& L, 
   gemm(s->dh, H, b.sel_hid, b.sel_rank, H, s->hid, b.sel_rank, nr, false, L);
   if (tree)
     selector_tree(s->P, s->cand, s->unary, b.sel_topk, s->hid, b.sel_rank, b.sel_pred, b.sel_succ, width, nr,
-                  s->oracle, s->drafts, s->tree, st);
+                  s->oracle, s->drafts, s->tree, st, b.softcap, b.softcap_mode);
   else
     selector_walk(s->P, s->cand, s->unary, b.sel_topk, s->hid, b.sel_rank, b.sel_pred, b.sel_succ, width, s->oracle,
-                  s->drafts, st);
+                  s->drafts, st, b.softcap, b.softcap_mode);
 }
 
 // One MTP draft step's attention for one sequence, the step's row at P->position + pos_offset: its key and value
@@ -1151,7 +1156,8 @@ void dspark_context(const Pass& ps, const DSparkBlock& b, bool /*fused*/) {
   cudaStream_t st = rv.L.st;
   const Launch& L = rv.L;
 
-  dspark_ctx_mix_norm(rv.b.feats, rv.ld_feats, b.markov_ctx_mix, b.markov_ctx_norm.w, b.markov_ctx_norm.eps, b.n_taps,
+  const float* feats = rv.b.feats + b.feats_offset;
+  dspark_ctx_mix_norm(feats, rv.ld_feats, b.markov_ctx_mix, b.markov_ctx_norm.w, b.markov_ctx_norm.eps, b.n_taps,
                       R, H, rv.b.cx, st);
   if (!ps.round && s->pass_snap > 0 && s->ring_snap) {
     const int snap_row = s->pass_snap - s->position;
@@ -1164,7 +1170,7 @@ void dspark_context(const Pass& ps, const DSparkBlock& b, bool /*fused*/) {
   for (int j = 0; j < b.layers(); ++j) {
     const auto& l = block<DSparkLayer>(m, b.first_layer + j);
     const KvBuf& kv = s->kv[size_t(l.kv)];
-    dspark_ctx_mix_norm(rv.b.feats, rv.ld_feats, l.ctx_mix, l.ctx_norm.w, l.ctx_norm.eps, b.n_taps, R, H, rv.b.cx, st);
+    dspark_ctx_mix_norm(feats, rv.ld_feats, l.ctx_mix, l.ctx_norm.w, l.ctx_norm.eps, b.n_taps, R, H, rv.b.cx, st);
     if (l.stacked_ctx_kv) {
       gemm(rv.b.cx, H, l.w_ctx_kv, 2 * nkv * hd, H, rv.b.ckv, rv.ld_ckv, R, false, L);
     } else {
@@ -1303,7 +1309,7 @@ void draft_context(const Pass& ps, const DFlashBlock& b, bool fused) {
   const int H = b.hidden, R = ps.rows, F = b.n_taps * b.target_hidden;
   cudaStream_t st = rv.L.st;
   const Launch& L = rv.L;
-  gemm(rv.b.feats, rv.ld_feats, b.fc, H, F, rv.b.cx, H, R, false, L);
+  gemm(rv.b.feats + b.feats_offset, rv.ld_feats, b.fc, H, F, rv.b.cx, H, R, false, L);
   norm_project(rv.b.cx, rv.b.h, rv.b.ckv, rv.ld_ckv, R, b.hidden_norm, b.ctx, b.ctx_width(), H, L, fused);
   draft_ctx_kv(rv.b.ckv, rv.ld_ckv, b.k_norms.w, b.k_norms.eps, b.theta, b.layers(), b.nkv, b.hd, R, s->P,
                ps.round ? kPosStart : kPosPosition, ps.round, kv.k16(), kv.v16(), kv.layer_stride, st);

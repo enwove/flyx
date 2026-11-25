@@ -95,5 +95,8 @@ std::unique_ptr<Model> open_model(const ModelFile& file, const ModelOptions& o, 
 // The architectures open_model knows, as model files name theirs, whose GGUF files it reads (a Llama: .flyx only):
 // for saying before a file is fetched whether this build runs it.
 std::vector<std::string> model_architectures();
+// The architectures open_model opens with a vision projector (--mmproj): for deciding before fetching a
+// repository's mmproj companion whether this build reads vision for the model.
+std::vector<std::string> vision_architectures();
 
 }  // namespace flyx::interfaces

@@ -170,7 +170,10 @@ struct DFlashBlock {
   double theta = 0;
   int block = 0, mask_token = 0;
   int window = 0;                             // sliding window of every layer (0: none)
+  float softcap = 0.f;                        // selector logit softcap (0: none)
+  int softcap_mode = FLYX_DFLASH2_SOFTCAP_BEFORE;  // flyx_dflash2_softcap_mode
   int n_taps = 0, target_hidden = 0;          // context features: n_taps target hidden rows
+  int feats_offset = 0;                       // float offset within RowBufs::feats row
   int conv_taps = 0, conv_group = 0, sel_rank = 0, sel_topk = 0;
   int embed = -1, head = -1;
   int first_layer = -1, n_layers = 0;         // blocks (DFlashLayer)
@@ -377,6 +380,7 @@ struct DSparkLayer {
 struct DSparkBlock {
   int hidden = 0, nh = 0, nkv = 0, hd = 0, inter = 0;
   int block = 0, n_taps = 0, markov_rank = 0, vocab_out = 0;
+  int feats_offset = 0;  // float offset within RowBufs::feats row
   double theta = 0;
   float softcap = 0.f;
   int embed = -1, head = -1, first_layer = -1, n_layers = 0;

@@ -87,16 +87,19 @@ struct GgufChoice {
 };
 std::vector<GgufChoice> gguf_choices(const Repo& r);
 // Whether a GGUF at `path` ('/' between directories) can hold a model by its name: not a projector, an importance
-// matrix or an MTP layer of its own (mtp-*.gguf, anything under an MTP directory).  Split parts count.
+// matrix, an MTP layer of its own (mtp-*.gguf, anything under an MTP directory), a DSpark drafter (dspark-*.gguf,
+// anything under a dspark directory) or a file under old_support/.  Split parts count.
 bool model_gguf_name(const std::string& path);
 // Whether a GGUF at `path` ('/' between directories) is a vision projector (mmproj) file by name/directory.
 bool mmproj_gguf_name(const std::string& path);
 // Whether a GGUF at `path` ('/' between directories) is an MTP drafter file by name/directory.
 bool mtp_gguf_name(const std::string& path);
+// Whether a GGUF at `path` ('/' between directories) is a DSpark drafter file by name/directory.
+bool dspark_gguf_name(const std::string& path);
 // A companion GGUF in a repository (vision projector or drafter) listed alongside its main models.
 struct CompanionFile {
   RepoFile file;
-  std::string kind;      // "mmproj" or "mtp"
+  std::string kind;      // "mmproj", "mtp" or "dspark"
   bool is_default = false;
 };
 std::vector<CompanionFile> companion_files(const Repo& r);

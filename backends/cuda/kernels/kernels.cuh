@@ -1219,12 +1219,13 @@ void grouped_conv(const float* x, int ldx, const float* delta, int ld_delta, con
                   int group, float* y, int ldy, int rows, bool accumulate, cudaStream_t st);
 // Greedy candidate walk; writes `width` drafts.  Uses oracle tokens when P->oracle_len > 0.
 void selector_walk(const DevParams* P, const int* cand, const float* unary, int k, const float* hid, int rank,
-                   const bf16* pred, const bf16* succ, int width, const int* oracle, int* drafts, cudaStream_t st);
+                   const bf16* pred, const bf16* succ, int width, const int* oracle, int* drafts, cudaStream_t st,
+                   float softcap = 0.f, int softcap_mode = FLYX_DFLASH2_SOFTCAP_BEFORE);
 // The candidates as a tree of `width` drafts, best first by the selector's scores (ops/draft/ref.h), candidates at
 // `depths` positions: drafts and the round's TreeRows.  The oracle tokens as a chain when P->oracle_len > 0.
 void selector_tree(const DevParams* P, const int* cand, const float* unary, int k, const float* hid, int rank,
                    const bf16* pred, const bf16* succ, int width, int depths, const int* oracle, int* drafts,
-                   TreeRows* tree, cudaStream_t st);
+                   TreeRows* tree, cudaStream_t st, float softcap = 0.f, int softcap_mode = FLYX_DFLASH2_SOFTCAP_BEFORE);
 // Copy rows of x into feats at column block `slot` (taps).
 void tap_copy(const float* x, int H, float* feats, int ld_feats, int slot, int rows, cudaStream_t st);
 void tap_copy(const bf16* x, int H, float* feats, int ld_feats, int slot, int rows, cudaStream_t st);

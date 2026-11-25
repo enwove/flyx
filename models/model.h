@@ -168,5 +168,7 @@ int32_t find_added_token(const ModelFile& file, std::string_view content);
 std::unique_ptr<Model> open(const ModelFile& file, const ModelOptions& o, std::string* err);
 // The architectures open() knows, as model files name theirs, whose GGUF files it reads (a Llama: .flyx only).
 std::vector<std::string> architectures();
+// The architectures open() opens with a vision projector (--mmproj).
+std::vector<std::string> vision_architectures();
 
 }  // namespace flyx::models

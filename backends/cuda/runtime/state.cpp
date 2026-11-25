@@ -62,15 +62,16 @@ RowNeeds row_needs(const flyx_bmodel* m) {
       n.mtp = true;
       ks({2 * m->hidden});
     } else if (const auto* d = std::get_if<DFlashBlock>(&blk)) {
-      n.feats = d->n_taps * d->target_hidden;
-      n.cx = d->hidden;
-      n.ckv = d->ctx_width();
-      ks({d->hidden, d->inter, d->nh * d->hd, n.feats});
+      const int df_feats = d->n_taps * d->target_hidden;
+      n.feats += df_feats;
+      n.cx = std::max(n.cx, d->hidden);
+      n.ckv = std::max(n.ckv, d->ctx_width());
+      ks({d->hidden, d->inter, d->nh * d->hd, df_feats});
     } else if (const auto* ds = std::get_if<DSparkBlock>(&blk)) {
       n.dspark = true;
-      n.feats = ds->n_taps * m->hidden;
-      n.cx = ds->hidden;
-      n.ckv = 2 * ds->nkv * ds->hd;
+      n.feats += ds->n_taps * m->hidden;
+      n.cx = std::max(n.cx, ds->hidden);
+      n.ckv = std::max(n.ckv, 2 * ds->nkv * ds->hd);
       ks({ds->hidden, ds->inter, ds->nh * ds->hd, 2 * ds->hidden + 2 * ds->markov_rank, ds->markov_rank});
     }
   }
@@ -112,7 +113,8 @@ void alloc_rows(const flyx_bmodel* m, int R, bool prefill, RowBufs* b, Alloc&& a
     } else if (const auto* r = std::get_if<RelAttnBlock>(&blk)) {
       part = std::max(part, attention_partial_floats(R, r->nh, r->hd, prefill ? kPrefillSplits : kRoundSplits));
     } else if (const auto* d = std::get_if<DFlashBlock>(&blk); d && !prefill) {
-      part = std::max(part, attention_partial_floats(d->block, d->nh, d->hd, kRoundSplits));
+      // Wide-block DFlash2 rounds can attend over up to max(d->block, FLYX_MAX_ROWS) rows (draft_block).
+      part = std::max(part, attention_partial_floats(std::max(d->block, FLYX_MAX_ROWS), d->nh, d->hd, kRoundSplits));
     } else if (const auto* ds = std::get_if<DSparkBlock>(&blk); ds && !prefill) {
       part = std::max(part, attention_partial_floats(ds->block, ds->nh, ds->hd, kRoundSplits));
     }
@@ -749,14 +751,20 @@ void alloc_state(const flyx_bmodel* m, flyx_seq* s) {
       }
     } else if (m->dspark_block >= 0 && k.draft && k.layers == 1 && m->opt.kernels.mtp_window > 0 &&
                s->cap > 8 * m->opt.kernels.mtp_window) {
-      // DSpark Full-attention layer at long contexts (> 8 * mtp_window): bound on-device draft KV to a sliding ring,
-      // matching MTP's mtp_window behavior (exact full context for shorter contexts, bounded VRAM at long contexts).
-      b.window = m->opt.kernels.mtp_window;
-      const int ring =
-          (b.window + std::max(FLYX_ROUND_SLOTS * FLYX_MAX_ROWS + m->wide_rows, s->rows_cap) + 63) / 64 * 64;
-      if (m->opt.kernels.mtp_ring && ring < s->cap) {
-        b.swa_ring = true;
-        b.ring = positions = ring;
+      bool is_dspark_kv = false;
+      const auto& ds = block<DSparkBlock>(m, m->dspark_block);
+      for (int j = 0; j < ds.layers(); ++j)
+        if (block<DSparkLayer>(m, ds.first_layer + j).kv == int(s->kv.size())) is_dspark_kv = true;
+      if (is_dspark_kv) {
+        // DSpark Full-attention layer at long contexts (> 8 * mtp_window): bound on-device draft KV to a sliding ring,
+        // matching MTP's mtp_window behavior (exact full context for shorter contexts, bounded VRAM at long contexts).
+        b.window = m->opt.kernels.mtp_window;
+        const int ring =
+            (b.window + std::max(FLYX_ROUND_SLOTS * FLYX_MAX_ROWS + m->wide_rows, s->rows_cap) + 63) / 64 * 64;
+        if (m->opt.kernels.mtp_ring && ring < s->cap) {
+          b.swa_ring = true;
+          b.ring = positions = ring;
+        }
       }
     }
     b.layer_stride = size_t(positions) * k.nkv * k.hd;

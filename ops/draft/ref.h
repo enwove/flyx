@@ -30,7 +30,19 @@
 #include <limits>
 #include <vector>
 
+#include "flyx/backend_abi.h"
+
 namespace flyx::ops {
+
+// A DFlash2 selector's score of a candidate: its logit (unary) plus the pair's bilinear correction (edge), with the
+// soft cap of flyx_dflash2_block, softcap * tanh(z / softcap), on the logit before the correction is added
+// (FLYX_DFLASH2_SOFTCAP_BEFORE) or on their sum (FLYX_DFLASH2_SOFTCAP_AFTER); no cap at softcap 0.
+inline double dflash2_selector_score(double unary, double edge, double softcap = 0.0,
+                                     int softcap_mode = FLYX_DFLASH2_SOFTCAP_BEFORE) {
+  if (softcap <= 0.0) return unary + edge;
+  if (softcap_mode == FLYX_DFLASH2_SOFTCAP_AFTER) return softcap * std::tanh((unary + edge) / softcap);
+  return softcap * std::tanh(unary / softcap) + edge;
+}
 
 template <class Score>
 void best_first_tree(int width, int depths, int k, int32_t anchor, const int32_t* cand, Score score, int32_t* drafts,

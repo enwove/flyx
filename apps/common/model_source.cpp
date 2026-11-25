@@ -10,6 +10,7 @@
 #include <memory>
 #include <set>
 
+#include "core/interfaces/model.h"
 #include "core/interfaces/options.h"
 #include "core/modelfile/modelfile.h"
 #include "core/os/env.h"
@@ -121,9 +122,12 @@ std::vector<LocalModel> scan_model_dirs(const std::vector<std::string>& dirs, in
       const bool is_mmproj = gguf && hub::mmproj_gguf_name(rel);
       // A DFlash2 drafter's GGUF says what it is in its header alone (general.architecture "dflash"), and reading
       // a header means reading through the file's tokenizer tables: only the files whose names suggest a drafter
-      // are opened here.  One named otherwise is listed as a model, and refused as one when it is opened.
+      // are opened here.  One named otherwise is listed as a model here (flyx serve's listing, which reads every
+      // GGUF's header once for its MTP layer, calls it a drafter then), and refused as one when it is opened.
       const bool maybe_dflash =
-          gguf && !is_mmproj && (low.find("dflash") != std::string::npos || low.find("draft") != std::string::npos);
+          gguf && !is_mmproj &&
+          (low.find("dflash") != std::string::npos || low.find("dspark") != std::string::npos ||
+           low.find("draft") != std::string::npos);
       const bool is_drafter =
           gguf && !is_mmproj &&
           (hub::mtp_gguf_name(rel) || (maybe_dflash && flyx::gguf_peek(from_path(it->path())).arch == "dflash"));
@@ -208,23 +212,28 @@ bool one(const std::string& spec, const hub::ProgressFn& progress, const std::at
   return true;
 }
 
-// What kind of drafter a file or directory given beside a model holds: read from the GGUF header when possible
-// (arch "dflash" vs MTP), falling back to filename/format for directories and .flyx drafter files.
-std::string drafter_kind(const std::string& path) {
-  const std::string lp = lower(path);
-  if (lp.ends_with(".gguf")) {
-    const flyx::GgufPeek p = flyx::gguf_peek(path);
-    if (p.valid) {
-      if (p.arch == "dflash") return lp.find("dspark") != std::string::npos ? "dspark" : "dflash2";
-      if (p.mtp_layers > 0) return "mtp";
-    }
-    if (lp.find("dspark") != std::string::npos) return "dspark";
-    return lp.find("dflash") != std::string::npos ? "dflash2" : "mtp";
+}  // namespace
+
+std::string drafter_kind(const std::string& path, const flyx::GgufPeek& header) {
+  if (header.valid) {
+    if (header.arch == "dflash") return header.has_markov_context ? "dspark" : "dflash2";
+    if (header.mtp_layers > 0) return "mtp";
   }
-  return "dflash2";
+  const std::string lp = lower(path);
+  if (!lp.ends_with(".gguf")) return "dflash2";  // a directory of config and safetensors, or a .flyx drafter file
+  if (lp.find("dspark") != std::string::npos) return "dspark";
+  return lp.find("dflash") != std::string::npos ? "dflash2" : "mtp";
 }
 
-}  // namespace
+std::string drafter_kind(const std::string& path) {
+  return drafter_kind(path, lower(path).ends_with(".gguf") ? flyx::gguf_peek(path) : flyx::GgufPeek{});
+}
+
+bool reads_vision(const std::string& arch) {
+  if (arch.empty()) return true;
+  const std::vector<std::string> vision = interfaces::vision_architectures();
+  return std::find(vision.begin(), vision.end(), arch) != vision.end();
+}
 
 std::string model_name_of(const std::string& path, bool local) {
   const fs::path file = to_path(path).filename();
@@ -240,6 +249,7 @@ std::vector<std::string> known_drafters(const std::vector<std::string>& base_mod
   static const std::pair<const char*, const char*> kKnown[] = {
       {"Qwen/Qwen3.8-27B", "z-lab/Qwen3.8-27B-DFlash2"},
       {"Qwen/Qwen3.5-4B", "vllm-project/Qwen3.5-4B-DFlash2"},
+      {"thinkingmachines/Inkling-2-Mini", "incoai/Inkling-2-Mini-DFlash2"},
   };
   std::vector<std::string> out;
   for (const std::string& b : base_models)
@@ -285,12 +295,16 @@ bool fetch_model(const std::string& model, const std::vector<std::string>& draft
   if (repo.id.empty()) return true;  // a path: nothing more to know
   if (want_vision && out->mmproj.empty()) {
     if (const hub::RepoFile* mm = hub::mmproj_file(repo)) {
-      std::vector<std::string> paths;
-      if (!hub::fetch(repo, {*mm}, &paths, progress, stop, err)) return false;
-      out->mmproj = paths[0];
-      out->mmproj_source = repo.id + "/" + mm->path;
-      out->mmproj_size = mm->size;
-      out->notes.push_back("the vision projector from " + repo.id + "/" + mm->path);
+      const flyx::GgufPeek pk = flyx::gguf_peek(out->model);
+      const std::string arch = pk.valid && !pk.arch.empty() ? pk.arch : repo.info.gguf_architecture;
+      if (reads_vision(arch)) {
+        std::vector<std::string> paths;
+        if (!hub::fetch(repo, {*mm}, &paths, progress, stop, err)) return false;
+        out->mmproj = paths[0];
+        out->mmproj_source = repo.id + "/" + mm->path;
+        out->mmproj_size = mm->size;
+        out->notes.push_back("the vision projector from " + repo.id + "/" + mm->path);
+      }
     }
   }
   // unsloth keeps the MTP layer of GGUFs made without it in MTP/.

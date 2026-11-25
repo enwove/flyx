@@ -3,6 +3,7 @@
 // into what python/convert/flyx_convert makes of it as a drafter file (--draft alone): the same "draft" description
 // (canonical_draft_config with no target) and the same tensors under the same names, their bytes read in place.
 #include <algorithm>
+#include <cmath>
 #include <cstring>
 #include <filesystem>
 #include <fstream>
@@ -43,7 +44,16 @@ json draft_config(const json& sc) {
     if (std::find(archs.begin(), archs.end(), "DFlash2DraftModel") == archs.end())
       throw std::runtime_error("drafter architectures " + archs.dump() + ": DFlash2DraftModel is supported");
     dc = sc.at("dflash_config"), tl = sc;
-    for (const auto& i : dc.at("target_layer_ids")) taps.push_back(i.get<int64_t>() + 1);
+    // target_layer_ids name the layers whose outputs the drafter reads (hidden_states[id + 1] in z-lab's code), so
+    // every id is below the target's layer count.  A list that reaches num_target_layers counts the hidden states
+    // themselves instead (0 the embedding, the last the final norm's output): Inco's drafter for Inkling-2, whose
+    // ids [5, 23, 41, 48] of 48 visits its reference hands, as they are, to the capture DSpark's ids go to.
+    std::vector<int64_t> ids;
+    for (const auto& i : dc.at("target_layer_ids")) ids.push_back(i.get<int64_t>());
+    const json n_target = sc.value("num_target_layers", json());
+    const bool hidden_states =
+        n_target.is_number_integer() && std::find(ids.begin(), ids.end(), n_target.get<int64_t>()) != ids.end();
+    for (int64_t id : ids) taps.push_back(hidden_states ? id : id + 1);
     vocab = tl.at("vocab_size").get<int64_t>(), target_hidden = tl.at("hidden_size").get<int64_t>();
     causal = sc.value("is_causal", json());
   } else {
@@ -107,6 +117,17 @@ json draft_config(const json& sc) {
   d["sel_rank"] = dc.value("selector_rank", json(256));
   d["sel_topk"] = dc.value("selector_top_k", json(16));
   d["window"] = window;
+  if (dc.contains("final_logit_softcapping") && dc["final_logit_softcapping"].is_number()) {
+    const double sc_val = dc["final_logit_softcapping"].get<double>();
+    if (!std::isfinite(sc_val) || sc_val < 0.0) throw std::runtime_error("draft final_logit_softcapping out of range");
+    if (sc_val > 0.0) d["softcap"] = sc_val;
+  }
+  if (dc.contains("selector_softcap_mode") && dc["selector_softcap_mode"].is_string()) {
+    const std::string sm = dc["selector_softcap_mode"].get<std::string>();
+    if (sm != "before_correction" && sm != "after_correction")
+      throw std::runtime_error("unsupported draft selector_softcap_mode: " + sm);
+    d["softcap_mode"] = sm;
+  }
   d["target"] = {{"hidden", target_hidden}, {"vocab", vocab}, {"layers", sc.value("num_target_layers", json())}};
   return d;
 }

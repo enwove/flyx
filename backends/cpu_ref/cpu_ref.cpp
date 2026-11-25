@@ -55,6 +55,7 @@ struct RefModel {
   mutable std::unordered_map<int, Vec> cache;
   int dflash = -1;  // the DFlash2 drafter block, -1: none
   int dspark = -1;  // the DSpark drafter block, -1: none
+  int dflash_tap_off = 0, dspark_tap_off = 0, total_taps = 0;
   int ring_width = 0;
   // Every residual add of the stack a weight with NVFP4 inputs and the embedding a bf16 table: the engine keeps a
   // prefill pass's residual in bf16 (as vLLM, SGLang and basalt do), each sum in float32 then rounded.
@@ -681,10 +682,11 @@ int32_t forced_draft(const RefSeq* s, int pos) {
 void draft_context(RefSeq* s, const flyx_dflash2_block& d, int n_rows) {
   const auto* M = s->m;
   const int H = d.hidden, F = d.n_taps * M->hidden, hd = d.head_dim;
+  const int F_row = M->total_taps * M->hidden, F_off = M->dflash_tap_off * M->hidden;
   Vec h(H), hn(H), k(size_t(d.n_kv) * hd), v(k.size()), tmp(hd);
   for (int r = 0; r < n_rows; ++r) {
     int pos = s->start + r;
-    lin(M, d.fc, &s->feats[size_t(r) * F], 1, F, H, h.data(), n_rows);
+    lin(M, d.fc, &s->feats[size_t(r) * size_t(F_row) + size_t(F_off)], 1, F, H, h.data(), n_rows);
     norm(M, d.hidden_norm, h.data(), H, hn.data());
     for (int j = 0; j < d.layers; ++j) {
       const auto& l = dlayer(M, d, j);
@@ -777,7 +779,8 @@ void draft_block(RefSeq* s, const flyx_dflash2_block& d, int width) {
     for (size_t i = 0; i < x.size(); ++i) x[i] += fin[i];
   }
   const auto& head = M->block(d.head).head;
-  const int V = head.vocab, K = d.sel_topk, Rk = d.sel_rank;
+  const int V = head.vocab_out > 0 ? head.vocab_out : head.vocab;  // the candidates: no padding row
+  const int K = d.sel_topk, Rk = d.sel_rank;
   Vec hn(H), logits(V), hid(Rk), val(K);
   std::vector<int> cand(K);
   const auto* pred = M->w(d.sel_pred);
@@ -795,7 +798,7 @@ void draft_block(RefSeq* s, const flyx_dflash2_block& d, int width) {
       double e = 0;
       for (int i = 0; i < Rk; ++i)
         e += load(pred, size_t(prev) * Rk + i) * hid[i] * load(succ, size_t(cand[c]) * Rk + i);
-      double sc = val[c] + e;
+      double sc = flyx::ops::dflash2_selector_score(val[c], e, double(d.softcap), d.softcap_mode);
       if (sc > best_score) {
         best_score = sc;
         best = c;
@@ -816,13 +819,14 @@ const flyx_dspark_layer_block& dspark_layer(const RefModel* M, const flyx_dspark
 
 void dspark_context(RefSeq* s, const flyx_dspark_block& d, int n_rows) {
   const auto* M = s->m;
-  const int H = d.hidden, nt = d.n_taps, F = nt * H, nkv = d.n_kv, hd = d.head_dim;
+  const int H = d.hidden, nt = d.n_taps, nkv = d.n_kv, hd = d.head_dim;
+  const int F_row = M->total_taps * H, F_off = M->dspark_tap_off * H;
   Vec mixed(static_cast<size_t>(H)), cn(static_cast<size_t>(H)), k(size_t(nkv) * size_t(hd)), v(k.size()),
       tmp(static_cast<size_t>(hd));
   const Vec& m_mix = M->vec(d.markov_ctx_mix);
   for (int r = 0; r < n_rows; ++r) {
     const int pos = s->start + r;
-    const double* fr = &s->feats[size_t(r) * size_t(F)];
+    const double* fr = &s->feats[size_t(r) * size_t(F_row) + size_t(F_off)];
     std::fill(mixed.begin(), mixed.end(), 0.0);
     for (int t = 0; t < nt; ++t) {
       const double a = m_mix[size_t(t)];
@@ -836,7 +840,7 @@ void dspark_context(RefSeq* s, const flyx_dspark_block& d, int n_rows) {
     const Vec& cmix = M->vec(l.ctx_mix);
     for (int r = 0; r < n_rows; ++r) {
       const int pos = s->start + r;
-      const double* fr = &s->feats[size_t(r) * size_t(F)];
+      const double* fr = &s->feats[size_t(r) * size_t(F_row) + size_t(F_off)];
       std::fill(mixed.begin(), mixed.end(), 0.0);
       for (int t = 0; t < nt; ++t) {
         const double a = cmix[size_t(t)];
@@ -1189,9 +1193,7 @@ const char* node_label(const flyx_node& n, const flyx_block* b, int phase) {
 void run_nodes(RefPlan* p, RefSeq* s) {
   const auto* M = s->m;
   const int H = M->hidden;
-  const int tap_slots = M->dflash >= 0 ? M->block(M->dflash).dflash2.n_taps
-                        : M->dspark >= 0 ? M->block(M->dspark).dspark.n_taps
-                                         : 0;
+  const int tap_slots = M->total_taps;
   for (const auto& n : p->nodes) {
     const flyx_block* b = n.block >= 0 ? &M->block(n.block) : nullptr;
     const auto t0 = std::chrono::steady_clock::now();
@@ -1225,15 +1227,17 @@ void run_nodes(RefPlan* p, RefSeq* s) {
         }
         break;
       case FLYX_NODE_TAP: {
-        const int nt = b->kind == FLYX_BLOCK_DSPARK ? b->dspark.n_taps : b->dflash2.n_taps;
-        const int F = nt * H;
-        if (b->kind == FLYX_BLOCK_DSPARK && n.arg1 == 1) {
-          const auto& head = M->block(b->dspark.head).head;
+        const int tap_off = b->kind == FLYX_BLOCK_DSPARK ? M->dspark_tap_off : M->dflash_tap_off;
+        const int head_idx = b->kind == FLYX_BLOCK_DSPARK ? b->dspark.head : b->dflash2.head;
+        const int F = M->total_taps * H;
+        const int col_off = (tap_off + n.arg0) * H;
+        if (n.arg1 == FLYX_TAP_NORMED) {
+          const auto& head = M->block(head_idx).head;
           for (int r = 0; r < s->rows; ++r)
-            norm(M, head.norm, &s->x[size_t(r) * size_t(H)], H, &s->feats[size_t(r) * size_t(F) + size_t(n.arg0) * size_t(H)]);
+            norm(M, head.norm, &s->x[size_t(r) * size_t(H)], H, &s->feats[size_t(r) * size_t(F) + size_t(col_off)]);
         } else {
           for (int r = 0; r < s->rows; ++r)
-            std::copy(&s->x[size_t(r) * H], &s->x[size_t(r) * H] + H, &s->feats[size_t(r) * F + size_t(n.arg0) * H]);
+            std::copy(&s->x[size_t(r) * H], &s->x[size_t(r) * H] + H, &s->feats[size_t(r) * F + size_t(col_off)]);
         }
         break;
       }
@@ -1439,8 +1443,16 @@ int open_model(const flyx_model_desc* desc, const flyx_open_options* opts, flyx_
         throw std::runtime_error("block kind " + std::to_string(k) + ": not implemented by cpu_ref");
       if (k == FLYX_BLOCK_VISION_STEM && b.vision_stem.cls_token >= 0)
         throw std::runtime_error("vision_stem: cls_token is not yet implemented by cpu_ref");
-      if (k == FLYX_BLOCK_DFLASH2) m->dflash = i;
-      if (k == FLYX_BLOCK_DSPARK) m->dspark = i;
+      if (k == FLYX_BLOCK_DFLASH2) {
+        m->dflash = i;
+        m->dflash_tap_off = m->total_taps;
+        m->total_taps += b.dflash2.n_taps;
+      }
+      if (k == FLYX_BLOCK_DSPARK) {
+        m->dspark = i;
+        m->dspark_tap_off = m->total_taps;
+        m->total_taps += b.dspark.n_taps;
+      }
       if (k == FLYX_BLOCK_ATTN || k == FLYX_BLOCK_MLP) {  // a target's own adapters (ABI 43)
         const flyx_lora* l = k == FLYX_BLOCK_ATTN ? b.attn.lora : b.mlp.lora;
         const int n = k == FLYX_BLOCK_ATTN ? 4 : 3;

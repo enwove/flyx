@@ -71,15 +71,20 @@ std::vector<int> Model::adaptive_checkpoints(int d) const {
   const DrafterBlock& b = drafters_.at(size_t(d));
   const DrafterTraits tr = drafter_traits(b.kind);
   if (b.max_drafts <= 0 || tr.tree_only) return {};  // tree-only drafters (DV): no intra-round chain stop
-  const std::vector<int> ws = draft_widths(d);
   // Intra-round GPU confidence stopping (stop_decide_step / stop_decide_block) pays whenever cutting verify width
   // saves substantial work:
   // - sequential drafters save both remaining draft steps and verify rows;
   // - targets with steep verify-cost scaling (e.g. sparse MoE active-expert fan-out) benefit on any block drafter.
   // Dense targets paired with block drafters have nearly flat verify cost across widths (RTX PRO 6000, QUASAR NVFP4
   // 27B + DFlash2: adaptive 425-439 vs fixed 443-494 tok/s on code) and avoid extra verify subgraphs in VRAM.
-  if (tr.sequential || verify_scales_with_width_) return ws.size() > 1 ? ws : std::vector<int>{};
-  return {};
+  if (!tr.sequential && !verify_scales_with_width_) return {};
+  // Keep a parallel block drafter's adaptive graph within its trained block (b.max_drafts); stretching every adaptive
+  // round past the trained block degrades bidirectional draft quality and adds draft/verify work (stretched widths
+  // stay in draft_widths for explicit --width or widened high-acceptance runs).
+  std::vector<int> cps;
+  for (int w : draft_widths(d))
+    if (w <= b.max_drafts) cps.push_back(w);
+  return cps.size() > 1 ? cps : std::vector<int>{};
 }
 
 int Model::block_drafts(int d) const {
@@ -356,15 +361,16 @@ bool reads_required(const ModelFile& file, const std::vector<std::string>& reads
 struct ArchEntry {
   const char* name;
   std::unique_ptr<Model> (*open)(const ModelFile&, const ModelOptions&, std::string*);
-  bool gguf;  // its GGUF files read too (a Llama's are not: llama.cpp's converter permutes its q and k rows)
+  bool gguf;    // its GGUF files read too (a Llama's are not: llama.cpp's converter permutes its q and k rows)
+  bool vision;  // its build opens a vision projector (--mmproj)
   const char* reads;  // a part a file may require (format 2's "requires") that the model reads, or null
 };
 
 constexpr ArchEntry kArchitectures[] = {
-    {"qwen35", qwen35::open, true, nullptr},
-    {"qwen3", llama::open, true, "lora"},  // Llama's layer with q/k norms; their own adapters (a V-LoRA)
-    {"llama", llama::open, false, "lora"},
-    {"inkling2_loop", inkling2::open, true, nullptr},
+    {"qwen35", qwen35::open, true, true, nullptr},
+    {"qwen3", llama::open, true, false, "lora"},  // Llama's layer with q/k norms; their own adapters (a V-LoRA)
+    {"llama", llama::open, false, false, "lora"},
+    {"inkling2_loop", inkling2::open, true, false, nullptr},
 };
 
 }  // namespace
@@ -410,6 +416,13 @@ std::vector<std::string> architectures() {
   return names;
 }
 
+std::vector<std::string> vision_architectures() {
+  std::vector<std::string> names;
+  for (const ArchEntry& entry : kArchitectures)
+    if (entry.vision) names.emplace_back(entry.name);
+  return names;
+}
+
 }  // namespace flyx::models
 
 namespace flyx::interfaces {
@@ -419,5 +432,6 @@ std::unique_ptr<Model> open_model(const ModelFile& file, const ModelOptions& o, 
 }
 
 std::vector<std::string> model_architectures() { return models::architectures(); }
+std::vector<std::string> vision_architectures() { return models::vision_architectures(); }
 
 }  // namespace flyx::interfaces

@@ -1,5 +1,5 @@
 // Copyright 2026 The flyx Authors. SPDX-License-Identifier: Apache-2.0
-// Inkling-2 looped MoE architecture (`inkling2_loop`) from its GGUF file, with optional DSpark companion GGUF:
+// Inkling-2 looped MoE architecture (`inkling2_loop`) from its GGUF file, with optional DSpark / DFlash2 drafters:
 //   * 24 physical layers unfolded across loop passes (middle core [core_start, core_end) run n_passes times),
 //     sharing physical weight indices while each logical visit owns its own KV cache and ShortConv state.
 //   * Relative-position-bias attention (no RoPE), per-query sink, Q/K/R L2 clipping, no-gamma V RMSNorm,
@@ -15,6 +15,7 @@
 #include <string>
 #include <vector>
 
+#include "models/drafters/registry.h"
 #include "models/gguf.h"
 
 namespace flyx::models::inkling2 {
@@ -45,8 +46,6 @@ struct Config {
   double eps = 1e-6, qk_clip = 0, rel_clip = 0, log_scale_alpha = 0;
   double route_scale = 1.0, situ_beta = 0, situ_linear_beta = 0, softcap = 0;
   std::vector<bool> is_swa;
-  bool dspark = false;
-  int dspark_companion = -1;
 };
 
 Config read_gguf_config(const ModelFile& file) {
@@ -108,23 +107,6 @@ Config read_gguf_config(const ModelFile& file) {
   return c;
 }
 
-void take_companions(const ModelFile& file, Config* c) {
-  for (int i = 0; i < file.companions(); ++i) {
-    const json& h = file.header().at("companions").at(size_t(i));
-    const std::string what = "drafter file " + std::to_string(i + 1) + ": ";
-    if (!GgufMeta::is_header(h) || h.value("arch", "") != "dflash")
-      throw std::runtime_error(what + "inkling2_loop takes only a DSpark (arch 'dflash') companion GGUF");
-    if (c->dspark) throw std::runtime_error(what + "a DSpark drafter is already loaded");
-    const GgufMeta cm(h);
-    if (cm.count("embedding_length") != c->hidden)
-      throw std::runtime_error(what + "DSpark embedding_length does not match target hidden size");
-    if (!cm.has("has_markov_context") || !cm.at("has_markov_context").get<bool>())
-      throw std::runtime_error(what + "DSpark GGUF must have dflash.has_markov_context = true");
-    c->dspark = true;
-    c->dspark_companion = i;
-  }
-}
-
 class Inkling2 final : public Model {
  public:
   explicit Inkling2(const ModelFile& file) : Model(file) {}
@@ -138,14 +120,12 @@ class Inkling2 final : public Model {
     int moe = -1;
   };
   LogicalLayer build_logical_layer(int ip, int pass, const Config& c);
-  int build_dspark(const ModelFile& file, const Config& c);
   void add_body(std::vector<flyx_node>* p) const;
 
   int embed_ = -1, head_ = -1, output_res_query_ = -1;
   int core_start_ = 0, core_end_ = 0, n_passes_ = 0, n_phys_ = 0, max_bank_ = 0;
   std::vector<LogicalLayer> visits_;  // 48 logical visits in execution order
-  int dspark_block_ = -1;
-  std::vector<int> dspark_taps_;      // 0..48 visit indices (48 = post output_norm)
+  drafters::DrafterRegistry drafters_reg_;
 };
 
 Inkling2::LogicalLayer Inkling2::build_logical_layer(int ip, int pass, const Config& c) {
@@ -277,137 +257,41 @@ Inkling2::LogicalLayer Inkling2::build_logical_layer(int ip, int pass, const Con
   return {attn_id, moe_id};
 }
 
-int Inkling2::build_dspark(const ModelFile& file, const Config& c) {
-  Tables& T = tables_;
-  const int comp = c.dspark_companion;
-  const json& ch = file.header().at("companions").at(size_t(comp));
-  const GgufMeta cm(ch);
-  auto cn = [&](const std::string& name) { return ModelFile::companion_name(comp, name); };
-
-  const int layers = cm.count("block_count");
-  const int H = cm.count("embedding_length");
-  const int I = cm.count("feed_forward_length");
-  const int nh = cm.count("attention.head_count");
-  const int nkv = cm.count("attention.head_count_kv");
-  const int hd = cm.count_or("attention.key_length", H / nh);
-  const int block = cm.count("block_size");
-  const double theta = cm.real_or("rope.freq_base", 1000000.0);
-  const double eps = cm.real_or("attention.layer_norm_rms_epsilon", 1e-6);
-  const double softcap = cm.has("final_logit_softcapping") ? cm.at("final_logit_softcapping").get<double>() : c.softcap;
-  const int swa_win = cm.count_or("attention.sliding_window", 0, 0);
-  std::vector<bool> swa_pat(size_t(layers), false);
-  if (swa_win > 0 && cm.has("attention.sliding_window_pattern")) {
-    const auto& pat = cm.at("attention.sliding_window_pattern");
-    if (!pat.is_array() || int(pat.size()) != layers)
-      throw std::runtime_error("DSpark sliding_window_pattern does not match block_count");
-    for (int i = 0; i < layers; ++i) swa_pat[size_t(i)] = pat[size_t(i)].get<bool>();
-  }
-  const auto raw_taps = cm.at("target_layers").get<std::vector<int>>();
-  const int n_visits = int(visits_.size());
-  if (raw_taps.empty()) throw std::runtime_error("DSpark target_layers is empty");
-  for (int t : raw_taps)
-    if (t < 0 || t > n_visits)
-      throw std::runtime_error("DSpark target_layers index " + std::to_string(t) + " out of range 0.." +
-                               std::to_string(n_visits));
-  dspark_taps_ = raw_taps;
-  const int n_taps = int(dspark_taps_.size());
-
-  const flyx_tensor_view* w1_t = file.tensor(cn("markov_w1.weight"));
-  if (!w1_t || w1_t->ndim != 2) throw std::runtime_error("DSpark missing markov_w1.weight");
-  if (w1_t->shape[0] != c.vocab_unpadded)
-    throw std::runtime_error("DSpark markov_w1.weight has " + std::to_string(w1_t->shape[0]) +
-                             " rows, expected unpadded vocab " + std::to_string(c.vocab_unpadded) +
-                             " (use mainline DSpark GGUF)");
-  const int rank = int(w1_t->shape[1]);
-  if (block < 2 || block > FLYX_MAX_ROWS || rank <= 0 || rank > kMaxWidth || nh % nkv != 0)
-    throw std::runtime_error("invalid DSpark drafter dimensions");
-
-  flyx_dspark_block d{};
-  d.hidden = H;
-  d.n_heads = nh;
-  d.n_kv = nkv;
-  d.head_dim = hd;
-  d.inter = I;
-  d.block = block;
-  d.n_taps = n_taps;
-  d.markov_rank = rank;
-  d.vocab_out = c.vocab_unpadded;
-  d.theta = theta;
-  d.softcap = float(softcap);
-  d.embed = embed_;
-  d.head = head_;
-  d.first_layer = int32_t(T.blocks.size());
-  d.layers = layers;
-  const int q_dim = nh * hd, kv_dim = nkv * hd;
-  for (int l = 0; l < layers; ++l) {
-    const std::string p = cn("blk." + std::to_string(l) + ".");
-    flyx_block lb{};
-    lb.kind = FLYX_BLOCK_DSPARK_LAYER;
-    auto& y = lb.dspark_layer;
-    flyx_state lkv{};
-    lkv.kind = FLYX_STATE_KV;
-    lkv.draft = 1;
-    lkv.layers = 1;
-    lkv.n_kv = nkv;
-    lkv.head_dim = hd;
-    lkv.window = swa_pat[size_t(l)] ? swa_win : 0;
-    y.window = lkv.window;
-    y.kv = T.state(lkv);
-    y.norm = T.norm(p + "attn_norm.weight", H, 0.0, eps);
-    y.post_norm = T.norm(p + "ffn_norm.weight", H, 0.0, eps);
-    y.q_norm = T.norm(p + "attn_q_norm.weight", hd, 0.0, eps);
-    y.k_norm = T.norm(p + "attn_k_norm.weight", hd, 0.0, eps);
-    y.k_ctx_norm = T.norm(p + "attn_k_ctx_norm.weight", hd, 0.0, eps);
-    y.ctx_norm = T.norm(p + "ctx_norm.weight", H, 0.0, eps);
-    y.q = T.weight(p + "attn_q.weight", {q_dim, H});
-    y.k = T.weight(p + "attn_k.weight", {kv_dim, H});
-    y.v = T.weight(p + "attn_v.weight", {kv_dim, H});
-    y.o = T.weight(p + "attn_output.weight", {H, q_dim});
-    y.k_ctx = T.weight(p + "attn_k_ctx.weight", {kv_dim, H});
-    y.v_ctx = T.weight(p + "attn_v_ctx.weight", {kv_dim, H});
-    y.ctx_mix = T.weight(p + "ctx_mix.weight", {n_taps});
-    y.gate = T.weight(p + "ffn_gate.weight", {I, H});
-    y.up = T.weight(p + "ffn_up.weight", {I, H});
-    y.down = T.weight(p + "ffn_down.weight", {H, I});
-    T.block(lb);
-  }
-  d.tok_norm = T.norm(cn("token_embd_norm.weight"), H, 0.0, eps);
-  d.norm = T.norm(cn("output_norm.weight"), H, 0.0, eps);
-  d.markov_ctx_norm = T.norm(cn("markov_ctx_norm.weight"), H, 0.0, eps);
-  d.mask_embd = T.weight(cn("mask_embd.weight"), {block - 1, H});
-  d.markov_ctx_mix = T.weight(cn("markov_ctx_mix.weight"), {n_taps});
-  d.markov_w1 = T.weight(cn("markov_w1.weight"), {c.vocab_unpadded, rank});
-  d.markov_w2 = T.weight(cn("markov_w2.weight"), {c.vocab_unpadded, rank});
-  d.markov_w2_b = T.has(cn("markov_w2.bias")) ? T.weight(cn("markov_w2.bias"), {c.vocab_unpadded}) : -1;
-  d.joint_proj = T.weight(cn("joint_proj.weight"), {3 * rank, 2 * H + 2 * rank});
-  d.joint_proj_b = T.weight(cn("joint_proj.bias"), {3 * rank});
-
-  flyx_state ring{};
-  ring.kind = FLYX_STATE_RING;
-  ring.draft = 1;
-  ring.width = H;
-  d.ring = T.state(ring);
-
-  flyx_block db{};
-  db.kind = FLYX_BLOCK_DSPARK;
-  db.dspark = d;
-  return T.block(db);
-}
-
 bool Inkling2::build(const ModelFile& file, const ModelOptions& o, std::string* err) {
   Config c = read_gguf_config(file);
-  take_companions(file, &c);
+  const int n_visits = c.core_start + c.n_passes * (c.core_end - c.core_start) + (c.n_phys - c.core_end);
+  drafters::TargetSpec target{};
+  target.arch = "inkling2_loop";
+  target.hidden = c.hidden;
+  target.vocab = c.vocab_unpadded;
+  target.vocab_padded = c.vocab_padded;
+  target.layers = n_visits;
+  target.softcap = float(c.softcap);
+  target.gguf = true;
+  target.has_post_norm_tap = true;
+  target.dspark_taps = true;
+
+  std::vector<int> unclaimed;
+  drafters_reg_.scan(file, target, nullptr, /*has_dv=*/false, &unclaimed);
+  if (!unclaimed.empty()) {
+    const int i = unclaimed.front();
+    const json& ch = file.header().at("companions").at(size_t(i));
+    if (ch.is_object() && ch.value("arch", "") == "clip")
+      return *err = "an inkling2_loop model does not support a vision projector (--mmproj)", false;
+    return *err = "companion file " + std::to_string(i + 1) +
+                  ": inkling2_loop takes only DSpark or DFlash2 companion drafters",
+           false;
+  }
+
   trained_ctx_ = c.trained_ctx;
   // Every row of a sparse MoE reads its own experts' weights, so verifying more drafts costs nearly in proportion:
   // a block drafter's rounds take the finer width ladder and stop on the device where its confidence falls
   // (Model::draft_widths, adaptive_checkpoints).
   verify_scales_with_width_ = true;
   // Default FP8 KV cache on non-roomy GPUs (matches Qwen3.8-27B default path; verified in docs/design/numerics.md).
-  DrafterSources sources{};
-  sources.dspark = c.dspark;
-  sources.dspark_beside = c.dspark_companion >= 0;
   std::vector<Drafter> drafters;
-  if (!choose_drafters(o, sources, &drafters, err)) return false;
+  if (!choose_drafters(o, drafters_reg_.sources(), &drafters, err)) return false;
+  drafters_reg_.validate_selected(file, drafters, target);
   if (!tables_.set_activations(o.activations, declared_activations(file), o.fp4_inputs, err)) return false;
 
   Tables& T = tables_;
@@ -445,53 +329,52 @@ bool Inkling2::build(const ModelFile& file, const ModelOptions& o, std::string* 
     for (int ip = c.core_start; ip < c.core_end; ++ip) visits_.push_back(build_logical_layer(ip, pass, c));
   for (int ip = c.core_end; ip < c.n_phys; ++ip) visits_.push_back(build_logical_layer(ip, 0, c));
 
+  target.embed = embed_;
+  target.head = head_;
   for (Drafter kind : drafters) {
-    if (kind == Drafter::kDSpark) {
-      dspark_block_ = build_dspark(file, c);
-      add_drafter(kind, dspark_block_, T.at(dspark_block_).dspark.block - 1);
-    }
+    int max_drafts = 0;
+    const int blk = drafters_reg_.attach(kind, file, T, target, nullptr, &max_drafts);
+    add_drafter(kind, blk, max_drafts);
   }
   finish(c.hidden, c.vocab_unpadded);
   return true;
 }
 
 void Inkling2::add_body(std::vector<flyx_node>* p) const {
-  auto tap_at = [&](int visit, int post_norm) {
-    if (dspark_block_ < 0) return;
-    for (size_t s = 0; s < dspark_taps_.size(); ++s)
-      if (dspark_taps_[s] == visit) p->push_back({FLYX_NODE_TAP, dspark_block_, int32_t(s), post_norm});
-  };
   p->push_back({FLYX_NODE_RES_RESET, -1, max_bank_, 0});
   int visit = 0;
   for (int i = 0; i < core_start_; ++i, ++visit) {
-    tap_at(visit, 0);
+    drafters_reg_.emit_pre_visit_taps(p, visit);
     p->push_back({FLYX_NODE_RUN, visits_[size_t(visit)].attn, 0, 0});
     p->push_back({FLYX_NODE_RUN, visits_[size_t(visit)].moe, 0, 0});
+    drafters_reg_.emit_taps(p, visit + 1);
   }
   p->push_back({FLYX_NODE_LOOP_PRELUDE, -1, 0, 0});
   const int core_len = core_end_ - core_start_;
   for (int pass = 0; pass < n_passes_; ++pass) {
     if (pass > 0) p->push_back({FLYX_NODE_LOOP_NEXT, -1, 0, 0});
     for (int j = 0; j < core_len; ++j, ++visit) {
-      tap_at(visit, 0);
+      drafters_reg_.emit_pre_visit_taps(p, visit);
       p->push_back({FLYX_NODE_RUN, visits_[size_t(visit)].attn, 0, 0});
       p->push_back({FLYX_NODE_RUN, visits_[size_t(visit)].moe, 0, 0});
+      drafters_reg_.emit_taps(p, visit + 1);
     }
   }
   for (int i = core_end_; i < n_phys_; ++i, ++visit) {
-    tap_at(visit, 0);
+    drafters_reg_.emit_pre_visit_taps(p, visit);
     p->push_back({FLYX_NODE_RUN, visits_[size_t(visit)].attn, 0, 0});
     p->push_back({FLYX_NODE_RUN, visits_[size_t(visit)].moe, 0, 0});
+    drafters_reg_.emit_taps(p, visit + 1);
   }
   p->push_back({FLYX_NODE_RES_MIX, -1, output_res_query_, 0});
-  tap_at(visit, 1);  // tap final output_norm(cur) for DSpark (visit == 48)
+  drafters_reg_.emit_post_norm_taps(p, visit);  // tap final output_norm(cur) for DSpark and DFlash2 (visit == 48)
 }
 
 std::vector<flyx_node> Inkling2::prefill_program() const {
   std::vector<flyx_node> p;
   p.push_back({FLYX_NODE_RUN, embed_, 0, 0});
   add_body(&p);
-  if (dspark_block_ >= 0) p.push_back({FLYX_NODE_CONTEXT, dspark_block_, 0, 0});
+  drafters_reg_.emit_contexts(&p);
   p.push_back({FLYX_NODE_RUN, head_, 1, 0});
   return p;
 }
@@ -505,7 +388,7 @@ std::vector<flyx_node> Inkling2::round_program(int width, int d, bool given) con
   p.push_back({FLYX_NODE_RUN, head_, 0, 0});
   p.push_back({FLYX_NODE_ACCEPT, -1, width, 0});
   p.push_back({FLYX_NODE_COMMIT, -1, 0, 0});
-  if (dspark_block_ >= 0) p.push_back({FLYX_NODE_CONTEXT, dspark_block_, 0, 0});
+  drafters_reg_.emit_contexts(&p);
   return p;
 }
 

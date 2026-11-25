@@ -30,7 +30,7 @@
 extern "C" {
 #endif
 
-#define FLYX_BACKEND_ABI_VERSION 45u
+#define FLYX_BACKEND_ABI_VERSION 46u
 #define FLYX_BACKEND_ENTRY "flyx_backend_get_api"
 /* How a backend library exports its entry. */
 #if defined(_WIN32)
@@ -386,6 +386,12 @@ typedef struct {
   int32_t ring;                        /* state (width hidden) */
 } flyx_mtp_block;
 
+/* Where a DFlash2 selector applies logit softcapping when softcap > 0 (ABI 46). */
+typedef enum {
+  FLYX_DFLASH2_SOFTCAP_BEFORE = 0,  /* cap * tanh(unary / cap) + edge */
+  FLYX_DFLASH2_SOFTCAP_AFTER = 1    /* cap * tanh((unary + edge) / cap) */
+} flyx_dflash2_softcap_mode;
+
 /* DFlash2 block drafter (python/reference/flyx_ref/draft.py): `block`
  * rows (the anchor, then mask_token) through its layers, attending to the
  * context K/V and to each other (not causal; with a window, only to the
@@ -404,6 +410,8 @@ typedef struct {
   int32_t fc, sel_pred, sel_succ, sel_hid;
   int32_t kv;                          /* state: one cache per layer */
   int32_t window;                      /* sliding window of every layer; 0: none */
+  float softcap;                       /* ABI 46: selector logit softcap (0 = none) */
+  int32_t softcap_mode;                /* ABI 46: flyx_dflash2_softcap_mode */
 } flyx_dflash2_block;
 
 /* A DFlash2 layer: attention (q, k, v, o; q/k norms; rotary on all dims) and
@@ -677,7 +685,8 @@ typedef struct {
 
 typedef enum {
   FLYX_NODE_RUN = 1,     /* run `block` on the pass's rows: embedding, mixer, MLP; head (arg0 = 1: last row only) */
-  FLYX_NODE_TAP,         /* residual rows -> feature slot arg0 of drafter `block` */
+  FLYX_NODE_TAP,         /* residual rows -> feature slot arg0 of drafter `block`; arg1 = FLYX_TAP_NORMED: through
+                             * the norm of the drafter's head block first (DSpark: ABI 45, DFlash2: ABI 46) */
   FLYX_NODE_DRAFT,       /* drafter `block` proposes arg0 tokens after the anchor; arg1 = FLYX_DRAFT_TREE: a
                              * tree of them, which the round verifies as a tree (ABI 24) */
   FLYX_NODE_CONTEXT,     /* drafter `block` takes the pass's rows (a round's: the accepted ones) as context; DV's
@@ -698,6 +707,9 @@ typedef enum {
   FLYX_NODE_RES_MIX = 11
 } flyx_node_kind;
 
+/* FLYX_NODE_TAP's arg1: the rows are copied after the norm of the drafter's head block (the target's output norm):
+ * the target's final hidden state, which a drafter made on transformers' last hidden state reads. */
+#define FLYX_TAP_NORMED 1
 /* FLYX_NODE_GIVEN's arg1: the round verifies a tree of drafts (docs/design/tree-verification.md). */
 #define FLYX_GIVEN_TREE 1
 /* FLYX_NODE_DRAFT's arg1: the drafter proposes its arg0 drafts as a tree, best first by its own scores (each node
