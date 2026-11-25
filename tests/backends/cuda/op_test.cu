@@ -2,8 +2,9 @@
 // Every CUDA kernel against the float64 reference ops (ops/ops.h).
 //
 //   cuda_op_test            run all checks, exit 1 on any failure
-//   cuda_op_test --filter attn_res_mix
-//   cuda_op_test --filter shortconv_res_mix_norm
+//   cuda_op_test --filter attn_res_mix              AttnRes mixes (standalone)
+//   cuda_op_test --filter shortconv_res_mix_norm    fused sublayer boundaries
+//   cuda_op_test --filter inkling2_rel_attn         relative attention and its K/V preparation
 //
 // Inputs are random; weights and caches go through bf16 on both sides, so
 // the remaining difference is float32 arithmetic (and bf16 activations in the
@@ -14,19 +15,27 @@
 
 using namespace flyx::optest;
 
-static int report_result() {
+namespace {
+void test_rel_attention() {
+  test_inkling2_rel_prep_kv_sc();
+  test_inkling2_rel_attn();
+}
+
+int report_result() {
   std::printf("%s (%d failures)\n", g_fail ? "FAILED" : "PASSED", g_fail);
   return g_fail ? 1 : 0;
 }
+}  // namespace
 
 int main(int argc, char** argv) {
   void (*filtered_test)() = nullptr;
   if (argc == 3 && std::strcmp(argv[1], "--filter") == 0) {
     if (std::strcmp(argv[2], "attn_res_mix") == 0) filtered_test = test_inkling2_attn_res;
     if (std::strcmp(argv[2], "shortconv_res_mix_norm") == 0) filtered_test = test_inkling2_sublayer_fusion;
+    if (std::strcmp(argv[2], "inkling2_rel_attn") == 0) filtered_test = test_rel_attention;
   }
   if (argc != 1 && !filtered_test) {
-    std::fprintf(stderr, "usage: cuda_op_test [--filter attn_res_mix|shortconv_res_mix_norm]\n");
+    std::fprintf(stderr, "usage: cuda_op_test [--filter attn_res_mix|shortconv_res_mix_norm|inkling2_rel_attn]\n");
     return 2;
   }
   // A nonfinite element between two matching ones must not disappear in the max-error reduction.
@@ -196,8 +205,7 @@ int main(int argc, char** argv) {
   test_inkling2_linear_f32();
   test_inkling2_shortconv();
   test_inkling2_sublayer_fusion();
-  test_inkling2_rel_prep_kv_sc();
-  test_inkling2_rel_attn();
+  test_rel_attention();
   test_inkling2_rel_strata();
   test_inkling2_moe();
   test_dspark();

@@ -1869,6 +1869,211 @@ __global__ void k_rel_attention_combine_win(const float* __restrict__ part, cons
   put(out, size_t(r) * ld_out + h * hd + d, size_t(r) * nh * hd + h * hd + d, o);
 }
 
+constexpr int kRelRoundTile = 16, kRelRoundWarps = 8;
+
+__device__ __forceinline__ int rel_round_used(int first, int p, int splits) {
+  return min(splits, p / kRelRoundTile - first / kRelRoundTile + 1);
+}
+
+// One warp finishes a head. Read the published partials through L2, including when a different CTA wrote them
+// earlier in this launch. The same lane owns a split's metadata irrespective of the finishing CTA or round size.
+__device__ __forceinline__ void rel_round_output(const float* part, const float* gate, int ld_gate, int nh, int row,
+                                                 int h, int splits, int used, Out out, int ld_out) {
+  constexpr int hd = 128;
+  const int lane = threadIdx.x & 31;
+  const float* pr = part + (size_t(row) * nh + h) * splits * (hd + 2);
+  const float ms = lane < used ? __ldcg(pr + lane) : -INFINITY;
+  const float ls = lane < used ? __ldcg(pr + splits + lane) : 0.f;
+  float M = fmaxf(0.f, ms);  // virtual zero-valued sink at logit 0
+#pragma unroll
+  for (int k = 16; k; k >>= 1) M = fmaxf(M, __shfl_xor_sync(0xffffffffu, M, k));
+  const float weight = __expf(__fsub_rn(ms, M));
+  const float L = __fadd_rn(warp_sum(__fmul_rn(ls, weight)), __expf(-M));
+  float acc[4] = {};
+#pragma unroll 4
+  for (int s = 0; s < used; ++s) {
+    const float f = __shfl_sync(0xffffffffu, weight, s);
+    const float* a = pr + 2 * splits + s * hd + lane;
+#pragma unroll
+    for (int g = 0; g < 4; ++g) acc[g] = __fmaf_rn(__ldcg(a + g * 32), f, acc[g]);
+  }
+#pragma unroll
+  for (int g = 0; g < 4; ++g) {
+    const int col = h * hd + g * 32 + lane;
+    float o = L > 0.f ? acc[g] / L : 0.f;
+    if (gate) o *= sigm(gate[size_t(row) * ld_gate + col]);
+    if (out.q8) put_q8(out, row, col / 32, o);
+    else put(out, size_t(row) * ld_out + col, size_t(row) * nh * hd + col, o);
+  }
+}
+
+__global__ void k_rel_round_combine(const float* part, const float* gate, int ld_gate, int nh, int window, int splits,
+                                    const DevParams* P, int pos_add, Out out, int ld_out) {
+  pdl_trigger();
+  const int row = blockIdx.y, warp = threadIdx.x >> 5;
+  const int p = P->position + pos_add + row;
+  const int first = window > 0 ? max(0, p - window + 1) : 0;
+  rel_round_output(part, gate, ld_gate, nh, row, blockIdx.x * 3 + warp, splits, rel_round_used(first, p, splits),
+                   out, ld_out);
+}
+
+// A lane holds four adjacent head dimensions and one component of the 16-dimensional relative query.
+struct RelRoundHead {
+  float q[4], a[4], r, sink, m, l;
+
+  __device__ __forceinline__ void add(const float (&k)[4], const float (&v)[4], float bias, float scale) {
+    float d = 0.f;
+#pragma unroll
+    for (int e = 0; e < 4; ++e) d = __fmaf_rn(q[e], k[e], d);
+    // Scale each lane's QK contribution before adding its relative term: one FP32 warp sum for the whole logit.
+    const float s = __fsub_rn(warp_sum(__fmaf_rn(d, scale, __fmul_rn(r, bias))), sink);
+    // At short contexts a stripe has just one or two keys. Its first key needs no exponential or rescale.
+    if (m == -INFINITY) {
+      m = s;
+      l = 1.f;
+#pragma unroll
+      for (int e = 0; e < 4; ++e) a[e] = v[e];
+    } else if (s > m) {
+      const float f = __expf(__fsub_rn(m, s));
+      l = __fmaf_rn(l, f, 1.f);
+#pragma unroll
+      for (int e = 0; e < 4; ++e) a[e] = __fmaf_rn(a[e], f, v[e]);
+      m = s;
+    } else {
+      const float f = __expf(__fsub_rn(s, m));
+      l = __fadd_rn(l, f);
+#pragma unroll
+      for (int e = 0; e < 4; ++e) a[e] = __fmaf_rn(v[e], f, a[e]);
+    }
+  }
+};
+
+// A CTA shares one load/dequantization of K and V between three heads and up to two adjacent queries.
+// A row owns absolute 16-key tiles starting with the tile containing its first visible key. Tile i goes to
+// slot i % splits (i relative to that first tile), and key j goes to warp j % 8. Pairing only widens the
+// range of loads. Each row visits precisely its own keys, in order within each (slot, warp).
+template <int RT, bool FP8>
+__global__ void __launch_bounds__(32 * kRelRoundWarps)
+    k_rel_round_gqa(const float* q, const float* r_q, KvRef kv, const float* rel_bias, const float* sink, int ld_sink,
+                    const float* gate, int ld_gate, int nh, int nkv, int rel_extent, int window, int rows, float scale,
+                    const DevParams* P, int pos_add, float* part, int splits, int* counts, Out out, int ld_out) {
+  pdl_trigger();
+  constexpr int hd = 128, heads = 3;
+  const int row0 = blockIdx.x * RT, kvh = blockIdx.y, sp = blockIdx.z;
+  const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
+  const int nrows = min(RT, rows - row0), p0 = P->position + pos_add + row0, last = p0 + nrows - 1;
+  const int first = window > 0 ? max(0, p0 - window + 1) : 0, first_tile = first / kRelRoundTile;
+  const int arrivals = rel_round_used(first, last, splits);
+  if (sp >= arrivals) return;
+
+  int lo[RT];
+  RelRoundHead head[RT][heads];
+#pragma unroll
+  for (int i = 0; i < RT; ++i) {
+    lo[i] = window > 0 ? max(0, p0 + i - window + 1) : 0;
+    // The spare register row of an odd tail may read the final query, but never writes a partial or an output.
+    const int row = row0 + min(i, nrows - 1);
+#pragma unroll
+    for (int h = 0; h < heads; ++h) {
+      const int hh = kvh * heads + h;
+      const size_t at = size_t(row) * nh + hh;
+      auto& z = head[i][h];
+      z.r = lane < 16 ? r_q[at * 16 + lane] : 0.f;
+      z.sink = sink[size_t(row) * ld_sink + hh];
+      z.m = -INFINITY;
+      z.l = 0.f;
+#pragma unroll
+      for (int e = 0; e < 4; ++e) {
+        z.q[e] = q[at * hd + lane * 4 + e];
+        z.a[e] = 0.f;
+      }
+    }
+  }
+
+  for (int tile = first_tile + sp; tile <= last / kRelRoundTile; tile += splits) {
+#pragma unroll
+    for (int offset = 0; offset < kRelRoundTile; offset += kRelRoundWarps) {
+      const int j = tile * kRelRoundTile + offset + warp;
+      if (j < first || j > last) continue;
+      float k[4], v[4];
+      rel_load_kv<4, FP8>(kv, kv.slot_of(j), kvh, nkv, hd, lane, k, v);
+#pragma unroll
+      for (int i = 0; i < RT; ++i) {
+        const int dist = p0 + i - j;
+        if (i >= nrows || j < lo[i] || dist < 0) continue;
+        const float bias = dist < rel_extent && lane < 16 ? __ldg(rel_bias + size_t(dist) * 16 + lane) : 0.f;
+#pragma unroll
+        for (int h = 0; h < heads; ++h) head[i][h].add(k, v, bias, scale);
+      }
+    }
+  }
+
+  __shared__ float2 ml[RT][heads][kRelRoundWarps];
+  __shared__ __align__(16) float numer[RT][heads][kRelRoundWarps][hd];
+#pragma unroll
+  for (int i = 0; i < RT; ++i) {
+#pragma unroll
+    for (int h = 0; h < heads; ++h) {
+      const auto& z = head[i][h];
+      if (!lane) ml[i][h][warp] = make_float2(z.m, z.l);
+      reinterpret_cast<float4*>(numer[i][h][warp])[lane] = make_float4(z.a[0], z.a[1], z.a[2], z.a[3]);
+    }
+  }
+  __syncthreads();
+
+  // One warp per query head publishes its partial. Transpose the eight key stripes back to consecutive columns.
+  const int i = warp / heads, h = warp % heads, hh = kvh * heads + h;
+  const int row_first = window > 0 ? max(0, p0 + i - window + 1) : 0;
+  const int used = rel_round_used(row_first, p0 + i, splits);
+  if (i < nrows) {
+    int slot = sp - (row_first / kRelRoundTile - first_tile);
+    if (slot < 0) slot += splits;
+    if (slot < used) {
+      const float2 stripe = ml[i][h][lane % kRelRoundWarps];
+      float M = stripe.x;
+#pragma unroll
+      for (int k = kRelRoundWarps / 2; k; k >>= 1) M = fmaxf(M, __shfl_xor_sync(0xffffffffu, M, k));
+      const float weight = M == -INFINITY ? 0.f : __expf(__fsub_rn(stripe.x, M));
+      float L = __fmul_rn(stripe.y, weight);
+#pragma unroll
+      for (int k = kRelRoundWarps / 2; k; k >>= 1) L += __shfl_xor_sync(0xffffffffu, L, k);
+      float* pr = part + (size_t(row0 + i) * nh + hh) * splits * (hd + 2);
+      if (!lane) {
+        pr[slot] = M;
+        pr[splits + slot] = L;
+      }
+      float acc[4] = {};
+#pragma unroll
+      for (int w = 0; w < kRelRoundWarps; ++w) {
+        const float f = __shfl_sync(0xffffffffu, weight, w);
+#pragma unroll
+        for (int g = 0; g < 4; ++g) acc[g] = __fmaf_rn(numer[i][h][w][g * 32 + lane], f, acc[g]);
+      }
+#pragma unroll
+      for (int g = 0; g < 4; ++g) pr[2 * splits + slot * hd + g * 32 + lane] = acc[g];
+    }
+  }
+  if (!counts) return;
+
+  // Every writer fences its partial stores device-wide before the block arrives; the block that arrives last fences
+  // again before its warps read the others' partials (through L2: __ldcg).  No block waits for another.  Plain
+  // atomics and fences, not <cuda/atomic>: on Windows that header brings in <windows.h>, whose macros (grp2 among
+  // them) collide with names of these kernels.
+  __threadfence();
+  __syncthreads();
+  __shared__ int finish;
+  if (threadIdx.x == 0) {
+    int* count = counts + size_t(blockIdx.x) * nkv + kvh;
+    finish = atomicAdd(count, 1) == arrivals - 1;
+    if (finish) {
+      __threadfence();
+      *count = 0;  // zero between stream-ordered calls and graph replays
+    }
+  }
+  __syncthreads();
+  if (finish && i < nrows) rel_round_output(part, gate, ld_gate, nh, row0 + i, hh, splits, used, out, ld_out);
+}
+
 template <int HD, bool FP8>
 bool launch_rel_flash(const float* q, const float* r, KvRef kv, const float* rel_bias, const float* sink, int ld_sink,
                       const float* gate, int ld_gate, int nh, int nkv, int d_rel, int rel_extent, int window, int rows,
@@ -1934,6 +2139,27 @@ void dispatch_rel_attention(const float* q, const float* r, KvRef kv, const floa
   const int eff_splits = std::min(std::max(1, splits), kAttnCoresSplits);
   const int k_lo = win.state ? win.k_lo : 0;
   const int k_hi = win.state ? win.k_hi : INT_MAX;
+  const Out dst = (!win.state || win.last) ? (out ? Out{out, nullptr, nullptr} : split_out(L, rows, nh * HD, q8))
+                                           : Out{nullptr, nullptr, nullptr};
+  if constexpr (HD == 128) {
+    if (!win.state && nkv > 0 && nh == 3 * nkv && d_rel == 16 && opts(L).attention != kAttnPerHead) {
+      const int tiles = ceil_div(rows, 2);
+      const int slots = std::min(eff_splits, 32);  // the final warp takes one split per lane
+      // Split GEMMs and attention use these zero-between-launch counters on the same stream. Some scratch
+      // layouts omit them. In that case the identical warp reduction runs in a stream-ordered second kernel.
+      int* counts = L.scratch && L.scratch->round_count_cap >= size_t(tiles) * nkv ? L.scratch->round_count : nullptr;
+      const dim3 grid(tiles, nkv, slots);
+      auto kernel = kv.fp8() ? k_rel_round_gqa<2, true> : k_rel_round_gqa<2, false>;
+      if (rows == 1) kernel = kv.fp8() ? k_rel_round_gqa<1, true> : k_rel_round_gqa<1, false>;
+      kernel<<<grid, 32 * kRelRoundWarps, 0, L.st>>>(q, r, kv, rel_bias, sink, ld_sink, gate, ld_gate, nh, nkv,
+                                                     rel_extent, window, rows, scale, P, pos_add, partial, slots,
+                                                     counts, dst, ld_out);
+      if (!counts)
+        k_rel_round_combine<<<dim3(nkv, rows), 96, 0, L.st>>>(partial, gate, ld_gate, nh, window, slots, P, pos_add,
+                                                              dst, ld_out);
+      return;
+    }
+  }
   const bool gqa_ok = opts(L).attention != kAttnPerHead &&
                       launch_rel_gqa<HD>(q, r, kv, rel_bias, sink, ld_sink, nh, nkv, d_rel, rel_extent, window, rows,
                                          scale, P, partial, eff_splits, L.st, pos_add, k_lo, k_hi);
@@ -1948,8 +2174,6 @@ void dispatch_rel_attention(const float* q, const float* r, KvRef kv, const floa
           eff_splits, k_lo, k_hi);
     }
   }
-  const Out dst = (!win.state || win.last) ? (out ? Out{out, nullptr, nullptr} : split_out(L, rows, nh * HD, q8))
-                                           : Out{nullptr, nullptr, nullptr};
   if (win.state) {
     k_rel_attention_combine_win<<<dim3(nh, rows), HD, 0, L.st>>>(partial, gate, ld_gate, nh, HD, window, eff_splits, P,
                                                                  pos_add, k_lo, k_hi, int(win.first), int(win.last),

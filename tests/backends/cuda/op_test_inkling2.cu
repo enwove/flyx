@@ -795,7 +795,7 @@ void test_inkling2_rel_attn() {
     int nh, nkv, hd, d_rel, rel_extent, window, ring, ctx, rows;
     bool fp8;
   };
-  const Case cases[] = {
+  std::vector<Case> cases = {
       {"swa ring f16 hd128 R=9", 8, 2, 128, 16, 16, 16, 64, 90, 9, false},
       {"global fp8 hd128 R=1", 24, 8, 128, 16, 64, 0, 0, 129, 1, true},
       {"swa ring f16 hd128 R=37", 12, 4, 128, 16, 32, 32, 96, 110, 37, false},
@@ -805,6 +805,15 @@ void test_inkling2_rel_attn() {
       {"global f16 hd32 R=8", 4, 2, 32, 8, 16, 0, 0, 40, 8, false},
       {"global fp8 hd32 R=1", 4, 2, 32, 8, 32, 0, 0, 40, 1, true},
   };
+  // Two KV heads exercise the cache/scales' head stride while keeping the long float64 checks inexpensive.
+  for (bool fp8 : {false, true}) {
+    const char* global = fp8 ? "global fp8 G3 R=16" : "global f16 G3 R=16";
+    const char* ring = fp8 ? "ring fp8 G3 R=16" : "ring f16 G3 R=16";
+    cases.push_back({global, 6, 2, 128, 16, 1024, 0, 0, 4088, 16, fp8});
+    // The window first fills, then its newest and oldest keys cross the physical seam inside a 16-key tile.
+    for (int ctx : {1016, 1033, 2057})
+      cases.push_back({ring, 6, 2, 128, 16, 1024, 1024, 1041, ctx, 16, fp8});
+  }
   for (const Case& c : cases) {
     seed("inkling2_rel_attn", c.hd, c.window, c.rows, int(c.fp8));
     const int total = c.ctx + c.rows;
@@ -939,7 +948,7 @@ void test_inkling2_rel_attn() {
     float* d_sink = up(sink);
     float* d_gate = up(gate);
     float* d_out = dev<float>(size_t(c.rows) * q_dim);
-    const int splits = 16;
+    const int splits = c.rows == 16 ? kAttnCoresSplits : 16;
     float* d_part = dev<float>(attention_partial_floats(c.rows, c.nh, c.hd, splits));
 
     rel_attn_prep(d_qin, q_dim, d_kin, kv_dim, d_vin, kv_dim, d_rin, c.nh * c.d_rel, d_qcw, d_rcw, qk_clip, rel_clip,
@@ -1069,6 +1078,142 @@ void test_inkling2_rel_attn() {
       cudaFree(d_wo);
       cudaFree(d_y0);
       cudaFree(d_y1);
+    }
+
+    if (c.rows == 16) {
+      // One absolute key tile every 16 positions, including the first reuse of split slot zero after 512.
+      // Before the cache wraps all earlier positions are available for the same queries. For a wrapped cache
+      // only the original round is resident. Reference K_all and V_all always use absolute positions.
+      std::vector<int> boundaries;
+      if (c.ring && total > c.ring) {
+        boundaries.push_back(c.ctx + 8);
+      } else {
+        boundaries.push_back(8);  // the two 8-key warp stripes of the first tile
+        for (int keys = 16; keys <= c.ctx + 8; keys += 16) boundaries.push_back(keys);
+      }
+      float* d_decode = dev<float>(3 * q_dim);
+      DevParams* P_round = params(0);
+      Launch round = TL;
+      round.round_rows = true;
+      Launch separate = round;
+      separate.scratch = nullptr;  // float output without the last-block counter uses the separate reducer
+      auto launch = [&](int first_row, int count, const DevParams* base, int add, float* dst, const Launch& L,
+                        int cap = kAttnCoresSplits) {
+        CK(cudaMemsetAsync(dst, 0xff, size_t(count) * q_dim * sizeof(float), L.st));
+        rel_attention(d_qout + size_t(first_row) * q_dim, d_rout + size_t(first_row) * c.nh * c.d_rel, kv, d_rb,
+                      d_sink + size_t(first_row) * c.nh, c.nh, d_gate + size_t(first_row) * q_dim, q_dim, c.nh, c.nkv,
+                      c.hd, c.d_rel, c.rel_extent, c.window, count, base, dst, q_dim, d_part, cap, L, add);
+      };
+      Launch replay = round;
+      CK(cudaStreamCreateWithFlags(&replay.st, cudaStreamNonBlocking));
+      cudaGraph_t graph;
+      cudaGraphExec_t executable;
+      CK(cudaStreamBeginCapture(replay.st, cudaStreamCaptureModeThreadLocal));
+      launch(0, 16, P, 0, d_out, replay);
+      CK(cudaStreamEndCapture(replay.st, &graph));
+      CK(cudaGraphInstantiate(&executable, graph, 0));
+      std::vector<float> decoded(3 * q_dim), got(decoded.size());
+      auto matches_decode = [&](int offset) {
+        CK(cudaMemcpy(got.data(), d_out + offset * q_dim, got.size() * sizeof(float), cudaMemcpyDeviceToHost));
+        return std::memcmp(got.data(), decoded.data(), got.size() * sizeof(float)) == 0;
+      };
+      double max_error = 0.0;
+      int worst_pos = 0, mismatch_rows = -1, mismatch_pos = -1;
+      for (int boundary : boundaries) {
+        // Input rows 6, 7, 8 see boundary - 1, boundary, boundary + 1 causal keys. Move those three queries
+        // between different indices (and both lanes of a row pair) while keeping their absolute positions fixed.
+        const int first_pos = boundary - 8;
+        for (int i = 0; i < 3; ++i) {
+          DevParams decode{};
+          decode.position = first_pos + 6 + i;
+          CK(cudaMemcpy(P, &decode, sizeof(decode), cudaMemcpyHostToDevice));
+          launch(6 + i, 1, P, 0, d_decode + i * q_dim, round);  // a plain decode step at the query's position
+        }
+        CK(cudaMemcpy(decoded.data(), d_decode, decoded.size() * sizeof(float), cudaMemcpyDeviceToHost));
+        // Rotate through all query heads and the three sides of each boundary for the independent reference.
+        const int index = (boundary / 16) % 3, h = (boundary / 16) % c.nh, rr = 6 + index;
+        const int pos = first_pos + rr;
+        const size_t q_at = size_t(rr * c.nh + h);
+        Vec ref(c.hd);
+        ops::attend_rel(q_ref.data() + q_at * c.hd, r_ref.data() + q_at * c.d_rel, K_all.data(), V_all.data(),
+                        rel_bias.data(), sink[q_at], pos, c.window, c.nkv, c.hd, c.d_rel, c.rel_extent,
+                        h / (c.nh / c.nkv), scale, ref.data());
+        for (int d = 0; d < c.hd; ++d) ref[d] *= ops::sigmoid(gate[q_at * c.hd + d]);
+        const auto begin = decoded.begin() + index * q_dim + h * c.hd;
+        const double error = relative_error(Vec(begin, begin + c.hd), ref);
+        if (error > max_error) {
+          max_error = error;
+          worst_pos = pos;
+        }
+
+        // R=1 also exercises a query addressed by its offset from the graph's base position. Compare the
+        // two-kernel fallback once per boundary with both grouped rows live, using the same float output contract.
+        for (int rows : {1, 3, 4, 8, 16}) {
+          int offset = 0;
+          if (rows == 1) {
+            for (int i = 0; i < 3; ++i)
+              launch(6 + i, 1, P_round, first_pos + 6 + i, d_out + i * q_dim, round);
+          } else if (rows == 16) {
+            DevParams base{};
+            base.position = first_pos;
+            CK(cudaMemcpyAsync(P, &base, sizeof(base), cudaMemcpyHostToDevice, replay.st));
+            CK(cudaGraphLaunch(executable, replay.st));
+            CK(cudaStreamSynchronize(replay.st));
+            offset = 6;
+          } else {
+            const int first_row = rows == 3 ? 6 : rows == 4 ? 5 : 3;
+            launch(first_row, rows, P_round, first_pos + first_row, d_out, round);
+            offset = 6 - first_row;
+          }
+          if (!matches_decode(offset) && mismatch_pos < 0) {
+            mismatch_rows = rows;
+            mismatch_pos = first_pos + 6;
+          }
+        }
+        launch(5, 4, P_round, first_pos + 5, d_out, separate);
+        if (!matches_decode(1) && mismatch_pos < 0) {
+          mismatch_rows = 0;  // separate reducer
+          mismatch_pos = first_pos + 6;
+        }
+        // Exercise the single slot and an odd number of slots at their first reuse and on both ring seams.
+        for (int cap : {1, 3}) {
+          if (boundary != 16 * cap && !(c.ring && total > c.ring)) continue;
+          launch(5, 4, P_round, first_pos + 5, d_out, round, cap);
+          for (int i = 0; i < 3; ++i)
+            launch(6 + i, 1, P_round, first_pos + 6 + i, d_decode + i * q_dim, round, cap);
+          CK(cudaMemcpy(decoded.data(), d_decode, decoded.size() * sizeof(float), cudaMemcpyDeviceToHost));
+          const bool same = matches_decode(1);
+          const std::string tag = std::string(c.name) + " boundary=" + std::to_string(boundary) +
+                                  " splits=" + std::to_string(cap);
+          std::printf("  %-4s relative attention decode vs R=4 (%s)\n", same ? "ok" : "FAIL", tag.c_str());
+          g_fail += !same;
+          expect("rel_attn " + tag, Vec(begin, begin + c.hd), ref, c.fp8 ? 5e-4 : 3e-5);
+        }
+      }
+      const double tol = c.fp8 ? 5e-4 : 3e-5;
+      std::printf("  %-4s relative attention boundaries vs float64 (%s, ctx=%d): worst %.2e at position %d\n",
+                  max_error <= tol ? "ok" : "FAIL", c.name, c.ctx, max_error, worst_pos);
+      g_fail += max_error > tol;
+      std::printf("  %-4s relative attention decode vs 1/3/4/8/16 and separate combine (%s, ctx=%d, %zu boundaries)\n",
+                  mismatch_pos < 0 ? "ok" : "FAIL", c.name, c.ctx, boundaries.size());
+      if (mismatch_pos >= 0) {
+        std::printf("       mismatch in positions %d..%d, rows=%d (0 for separate combine)\n",
+                    mismatch_pos, mismatch_pos + 2, mismatch_rows);
+        ++g_fail;
+      }
+      const size_t counters = size_t(c.rows / 2) * c.nkv;
+      if (round.scratch->round_count && round.scratch->round_count_cap >= counters) {
+        const auto counts = down_i(round.scratch->round_count, counters);
+        const bool zero = std::all_of(counts.begin(), counts.end(), [](int count) { return count == 0; });
+        std::printf("  %-4s relative attention graph releases all split counters (%s, ctx=%d)\n",
+                    zero ? "ok" : "FAIL", c.name, c.ctx);
+        g_fail += !zero;
+      }
+      CK(cudaGraphExecDestroy(executable));
+      CK(cudaGraphDestroy(graph));
+      CK(cudaStreamDestroy(replay.st));
+      cudaFree(d_decode);
+      cudaFree(P_round);
     }
 
     cudaFree(P);
