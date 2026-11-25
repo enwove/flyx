@@ -12,13 +12,16 @@ from urllib.request import urlopen
 from remembered_model import serve
 
 
-def gguf(layers):
+def gguf(layers, arch="test", has_markov=False):
     def string(text):
         return struct.pack("<Q", len(text)) + text.encode("ascii")
 
-    return (b"GGUF" + struct.pack("<IQQ", 3, 0, 2)
-            + string("general.architecture") + struct.pack("<I", 8) + string("test")
-            + string("test.nextn_predict_layers") + struct.pack("<II", 4, layers))
+    kv = [(string("general.architecture") + struct.pack("<I", 8) + string(arch))]
+    if arch == "dflash":
+        kv.append(string("dflash.has_markov_context") + struct.pack("<IB", 7, 1 if has_markov else 0))
+    else:
+        kv.append(string(arch + ".nextn_predict_layers") + struct.pack("<II", 4, layers))
+    return b"GGUF" + struct.pack("<IQQ", 3, 0, len(kv)) + b"".join(kv)
 
 
 def check_listing(url, file):
@@ -73,6 +76,30 @@ def check_listing(url, file):
             models2 = json.load(response)["models"]
         assert not any("dangling-Q4_K_M" in m["file"] for m in models2), models2
         assert all(0 <= m["size"] < (1 << 60) for m in models2), models2
+
+    # Cached Hub GGUFs with general.architecture=dflash (DFlash2 or DSpark) and local arch=dflash GGUFs
+    # must be classified as kind="drafter" (never as standalone models).
+    commit = "a" * 40
+    for repo_dir, fname, markov, want_dk in (
+        ("models--acme--Mini-DFlash2-GGUF", "Mini-DFlash2-Draft-BF16.gguf", False, "dflash2"),
+        ("models--acme--Mini-DSpark-GGUF", "Mini-DSpark-Draft-Q8_0.gguf", True, "dspark"),
+    ):
+        rdir = root / "hub" / repo_dir
+        (rdir / "refs").mkdir(parents=True, exist_ok=True)
+        (rdir / "refs" / "main").write_text(commit, encoding="ascii")
+        sdir = rdir / "snapshots" / commit
+        sdir.mkdir(parents=True, exist_ok=True)
+        (sdir / fname).write_bytes(gguf(0, arch="dflash", has_markov=markov))
+    (root / "unnamed-draft-Q8_0.gguf").write_bytes(gguf(0, arch="dflash", has_markov=False))
+    with urlopen(url + "/v1/hub/cached", timeout=5) as response:
+        models3 = json.load(response)["models"]
+    by_key = {(m["source"], m["file"]): m for m in models3}
+    df_row = by_key[("hub", "Mini-DFlash2-Draft-BF16.gguf")]
+    ds_row = by_key[("hub", "Mini-DSpark-Draft-Q8_0.gguf")]
+    loc_row = by_key[("dir", "unnamed-draft-Q8_0.gguf")]
+    assert df_row["kind"] == "drafter" and df_row["drafter_kind"] == "dflash2", df_row
+    assert ds_row["kind"] == "drafter" and ds_row["drafter_kind"] == "dspark", ds_row
+    assert loc_row["kind"] == "drafter" and loc_row["drafter_kind"] == "dflash2", loc_row
 
 
 if __name__ == "__main__":

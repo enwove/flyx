@@ -47,6 +47,7 @@
 #include "apps/flyx-server/gpu_apps.h"
 #include "apps/flyx-server/server.h"
 #include "core/interfaces/model.h"
+#include "core/modelfile/modelfile.h"
 #include "core/os/env.h"
 #include "core/os/os.h"
 #include "core/os/path.h"
@@ -80,22 +81,35 @@ void error(httplib::Response& res, int status, const std::string& message, const
   send_json(res, status, {{"error", {{"message", message}, {"type", type}}}});
 }
 
-// The MTP layers a GGUF holds, remembered by its path, size and time: its header is read once, not on every listing.
-int mtp_layers(const std::string& path, uint64_t size, fs::file_time_type modified) {
-  constexpr size_t kMaxCachedMtpEntries = 1024;
+// GGUF header metadata (architecture, MTP layer count, DSpark Markov flag), remembered by path, size and mtime:
+// each file's header is read once, not on every listing.
+flyx::GgufPeek gguf_info(const std::string& path, uint64_t size, fs::file_time_type modified) {
+  constexpr size_t kMaxCachedEntries = 1024;
   static std::mutex mu;
-  static std::map<std::string, std::tuple<uint64_t, fs::file_time_type, int>> known;
+  static std::map<std::string, std::tuple<uint64_t, fs::file_time_type, flyx::GgufPeek>> known;
   {
     std::lock_guard<std::mutex> lock(mu);
     const auto it = known.find(path);
     if (it != known.end() && std::get<0>(it->second) == size && std::get<1>(it->second) == modified)
       return std::get<2>(it->second);
   }
-  const int n = apps::gguf_mtp_layers(path);
+  const flyx::GgufPeek peek = flyx::gguf_peek(path);
   std::lock_guard<std::mutex> lock(mu);
-  if (known.size() >= kMaxCachedMtpEntries && known.find(path) == known.end()) known.clear();
-  known[path] = {size, modified, n};
-  return n;
+  if (known.size() >= kMaxCachedEntries && known.find(path) == known.end()) known.clear();
+  known[path] = {size, modified, peek};
+  return peek;
+}
+
+const char* drafter_kind_of(const flyx::GgufPeek& pk, const std::string& path) {
+  if (pk.valid) {
+    if (pk.arch == "dflash") return pk.has_markov_context ? "dspark" : "dflash2";
+    if (pk.mtp_layers > 0) return "mtp";
+  }
+  std::string low = path;
+  for (char& c : low) c = char(std::tolower(static_cast<unsigned char>(c)));
+  if (low.find("dspark") != std::string::npos) return "dspark";
+  if (low.find("dflash") != std::string::npos || !low.ends_with(".gguf")) return "dflash2";
+  return "mtp";
 }
 
 // One model of GET /v1/hub/cached, and what deleting it takes.
@@ -111,11 +125,16 @@ ojson or_null(const std::string& s) { return s.empty() ? ojson(nullptr) : ojson(
 // A model file of a directory, as the panel lists it: its path is the name that loads it.
 Listed dir_entry(const apps::LocalModel& m) {
   Listed l;
-  const bool gguf = m.kind == "gguf";
-  l.json = {{"name", m.path}, {"kind", m.kind}, {"source", "dir"}, {"repo", nullptr}, {"quant", or_null(m.quant)},
+  std::string kind = m.kind;
+  flyx::GgufPeek pk;
+  if (kind == "gguf" || kind == "drafter") pk = gguf_info(m.path, m.size, m.modified);
+  if (kind == "gguf" && m.parts <= 1 && pk.valid && pk.arch == "dflash") kind = "drafter";
+  const bool gguf = kind == "gguf";
+  l.json = {{"name", m.path}, {"kind", kind}, {"source", "dir"}, {"repo", nullptr}, {"quant", or_null(m.quant)},
             {"file", m.file}, {"path", m.path}, {"size", m.size}, {"modified", apps::modified_unix(m.modified)},
             {"revision", nullptr}, {"current", true},
-            {"mtp", gguf && mtp_layers(m.path, m.size, m.modified) > 0 ? ojson("in-file") : ojson(nullptr)}};
+            {"mtp", gguf && pk.valid && pk.mtp_layers > 0 ? ojson("in-file") : ojson(nullptr)}};
+  if (kind == "drafter") l.json["drafter_kind"] = drafter_kind_of(pk, m.path);
   if (m.parts > 1) l.json["parts"] = m.parts;
   l.on_disk = {m.path};
   return l;
@@ -142,14 +161,15 @@ std::vector<Listed> listing(const Server& s) {
     const std::string suffix = c.current ? "" : "@" + c.commit;
     auto disk_of = [&](const std::string& path) { return from_path((to_path(c.dir) / to_path(path)).make_preferred()); };
     auto entry = [&](const std::string& name, const char* kind, const std::string& quant, const std::string& file,
-                     const std::string& disk, uint64_t size) {
+                     const std::string& disk, uint64_t size, const flyx::GgufPeek* peek = nullptr) {
       Listed l;
       l.repo = c.repo, l.commit = c.commit;
       std::error_code ec;
       const auto modified = fs::last_write_time(to_path(disk), ec);
       ojson mtp = nullptr;
       if (std::string(kind) == "gguf") {
-        if (mtp_layers(disk, size, modified) > 0) mtp = "in-file";
+        const flyx::GgufPeek pk = peek ? *peek : gguf_info(disk, size, modified);
+        if (pk.valid && pk.mtp_layers > 0) mtp = "in-file";
         else if (repos_with_mtp.count(c.repo)) mtp = "in-repo";
       }
       l.json = {{"name", name + suffix}, {"kind", kind}, {"source", "hub"}, {"repo", c.repo}, {"quant", or_null(quant)},
@@ -158,14 +178,20 @@ std::vector<Listed> listing(const Server& s) {
                 {"mmproj", std::string(kind) == "gguf" && snaps_with_mmproj.count({c.repo, c.commit})
                                ? ojson("in-repo")
                                : ojson(nullptr)}};
+      if (std::string(kind) == "drafter")
+        l.json["drafter_kind"] = peek ? drafter_kind_of(*peek, disk) : "dflash2";
       return l;
     };
     const std::vector<hub::GgufChoice> ggufs = hub::gguf_choices(r);
     for (const hub::GgufChoice& g : ggufs) {
       if ((g.split && !g.complete) || !seen.insert({c.repo, g.file.path}).second) continue;
       const std::string disk = disk_of(g.file.path);
-      Listed l = entry(c.repo + ":" + g.quant, "gguf", g.quant, g.file.path.substr(g.file.path.rfind('/') + 1), disk,
-                       g.total_size);
+      std::error_code ec;
+      const auto modified = fs::last_write_time(to_path(disk), ec);
+      const flyx::GgufPeek pk = gguf_info(disk, g.total_size, modified);
+      const bool is_drafter = !g.split && pk.valid && pk.arch == "dflash";
+      Listed l = entry(c.repo + ":" + g.quant, is_drafter ? "drafter" : "gguf", g.quant,
+                       g.file.path.substr(g.file.path.rfind('/') + 1), disk, g.total_size, &pk);
       if (g.split) l.json["parts"] = int(g.parts.size());
       for (const hub::RepoFile& p : g.parts) l.files.push_back(p.path), l.on_disk.push_back(disk_of(p.path));
       out.push_back(std::move(l));
@@ -267,7 +293,20 @@ bool in_use(const std::string& file, const std::vector<std::string>& used) {
 
 ojson repo_json(const hub::Repo& r) {
   const std::string snap = hub::snapshot_dir(r) + "/";
-  const bool dflash_gguf_repo = r.info.gguf_architecture == "dflash";
+  const std::vector<hub::GgufChoice> choices = hub::gguf_choices(r);
+  bool dflash_gguf_repo = r.info.gguf_architecture == "dflash";
+  if (!dflash_gguf_repo && r.info.gguf_architecture.empty()) {
+    for (const hub::GgufChoice& c : choices) {
+      if (c.split || !on_disk(snap + c.file.path)) continue;
+      const std::string disk = from_path((to_path(hub::snapshot_dir(r)) / to_path(c.file.path)).make_preferred());
+      std::error_code ec;
+      const auto modified = fs::last_write_time(to_path(disk), ec);
+      if (gguf_info(disk, c.total_size, modified).arch == "dflash") {
+        dflash_gguf_repo = true;
+        break;
+      }
+    }
+  }
   ojson ggufs = ojson::array();
   ojson companions = ojson::array();
   std::set<std::string> comp_paths;
@@ -285,10 +324,19 @@ ojson repo_json(const hub::Repo& r) {
                           {"disk", cached ? ojson(disk) : ojson(nullptr)},
                           {"default", is_default}});
   };
-  const std::vector<hub::GgufChoice> choices = hub::gguf_choices(r);
   if (dflash_gguf_repo) {
-    for (size_t idx = 0; idx < choices.size(); ++idx)
-      if (!choices[idx].split) push_comp(choices[idx].file, "dflash2", idx == 0);
+    for (size_t idx = 0; idx < choices.size(); ++idx) {
+      if (choices[idx].split) continue;
+      std::string dkind = "dflash2";
+      if (on_disk(snap + choices[idx].file.path)) {
+        const std::string disk =
+            from_path((to_path(hub::snapshot_dir(r)) / to_path(choices[idx].file.path)).make_preferred());
+        std::error_code ec;
+        const auto modified = fs::last_write_time(to_path(disk), ec);
+        dkind = drafter_kind_of(gguf_info(disk, choices[idx].total_size, modified), disk);
+      }
+      push_comp(choices[idx].file, dkind, idx == 0);
+    }
   } else {
     for (const hub::GgufChoice& c : choices) {
       bool cached = c.complete;
