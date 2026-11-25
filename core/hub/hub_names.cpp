@@ -56,6 +56,39 @@ std::string url_path(const std::string& p) {
   return out;
 }
 
+std::string url_query(const std::string& s) {
+  static const char* hex = "0123456789ABCDEF";
+  std::string out;
+  for (unsigned char c : s) {
+    if (std::isalnum(c) || c == '-' || c == '_' || c == '.' || c == '~') out += char(c);
+    else out += '%', out += hex[c >> 4], out += hex[c & 15];
+  }
+  return out;
+}
+
+std::string url_decode(const std::string& s) {
+  auto hex_val = [](char c) -> int {
+    if (c >= '0' && c <= '9') return c - '0';
+    if (c >= 'a' && c <= 'f') return c - 'a' + 10;
+    if (c >= 'A' && c <= 'F') return c - 'A' + 10;
+    return -1;
+  };
+  std::string out;
+  out.reserve(s.size());
+  for (size_t i = 0; i < s.size(); ++i) {
+    if (s[i] == '%' && i + 2 < s.size()) {
+      const int hi = hex_val(s[i + 1]), lo = hex_val(s[i + 2]);
+      if (hi >= 0 && lo >= 0) {
+        out += char((hi << 4) | lo);
+        i += 2;
+        continue;
+      }
+    }
+    out += s[i];
+  }
+  return out;
+}
+
 bool hex_id(const std::string& s) {
   return !s.empty() && std::all_of(s.begin(), s.end(), [](char c) { return std::isxdigit(static_cast<unsigned char>(c)); });
 }

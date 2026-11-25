@@ -394,20 +394,55 @@ bool describe(const std::string& repo, const std::string& revision, Repo* out, s
   return false;
 }
 
-bool search(const std::string& query, const std::string& sort, int limit, std::vector<Found>* out, std::string* err) {
+// Pulls the `cursor` parameter from a Link header entry with rel="next" (RFC 8288), or empty when absent.
+std::string extract_next_cursor(const std::string& link) {
+  size_t pos = 0;
+  while (pos < link.size()) {
+    const size_t lt = link.find('<', pos);
+    if (lt == std::string::npos) break;
+    const size_t gt = link.find('>', lt + 1);
+    if (gt == std::string::npos) break;
+    const size_t comma = link.find(',', gt + 1);
+    const std::string url = link.substr(lt + 1, gt - lt - 1);
+    const std::string params = link.substr(gt + 1, comma == std::string::npos ? std::string::npos : comma - gt - 1);
+    pos = comma == std::string::npos ? link.size() : comma + 1;
+    if (params.find("rel=\"next\"") == std::string::npos && params.find("rel=next") == std::string::npos) continue;
+    const size_t q = url.find('?');
+    if (q == std::string::npos) return "";
+    size_t p = q + 1;
+    while (p < url.size()) {
+      const size_t amp = url.find('&', p);
+      const std::string part = url.substr(p, amp == std::string::npos ? std::string::npos : amp - p);
+      if (part.starts_with("cursor=")) return detail::url_decode(part.substr(7));
+      if (amp == std::string::npos) break;
+      p = amp + 1;
+    }
+    return "";
+  }
+  return "";
+}
+
+bool search(const std::string& query, const std::string& sort, int limit, std::vector<Found>* out, std::string* err,
+            const std::string& cursor, std::string* next_cursor) {
   out->clear();
+  if (next_cursor) next_cursor->clear();
   if (offline()) return *err = "HF_HUB_OFFLINE is set: the Hub is not asked", false;
   const char* by = sort == "downloads" ? "downloads" : sort == "likes" ? "likes" : sort == "updated" ? "lastModified"
                  : sort == "created" ? "createdAt" : "trendingScore";
   os::HttpGet g;
-  // full: with when each last changed and whether it is gated (and its files, which are not read here).
-  g.url = endpoint() + "/api/models?filter=gguf&full=true&direction=-1&sort=" + by + "&limit=" +
-          std::to_string(std::clamp(limit, 1, 100)) + (query.empty() ? "" : "&search=" + detail::url_path(query));
+  // expand[]: returns GGUF architecture, timestamps, counts and gated status without full sibling file lists.
+  g.url = endpoint() + "/api/models?filter=gguf&direction=-1&sort=" + by + "&limit=" +
+          std::to_string(std::clamp(limit, 1, 100)) +
+          "&expand[]=gguf&expand[]=downloads&expand[]=likes&expand[]=lastModified&expand[]=createdAt"
+          "&expand[]=pipeline_tag&expand[]=gated" +
+          (query.empty() ? "" : "&search=" + detail::url_query(query)) +
+          (cursor.empty() ? "" : "&cursor=" + detail::url_query(cursor));
   g.headers = detail::auth_headers();
   g.connect_timeout_s = 10, g.stall_timeout_s = 20;
-  std::string body, net;
+  std::string body, link, net;
   int status = 0;
-  if (!os::http_get_text(g, &body, &status, &net)) return *err = "cannot reach the Hub (" + net + ")", false;
+  if (!os::http_get_text(g, &body, &status, &net, 64u << 20, next_cursor ? &link : nullptr))
+    return *err = "cannot reach the Hub (" + net + ")", false;
   if (status != 200) return *err = "the Hub answered " + std::to_string(status), false;
   const auto j = nlohmann::json::parse(body, nullptr, false);
   if (!j.is_array()) return *err = "the Hub's answer is not a list of repositories", false;
@@ -419,8 +454,10 @@ bool search(const std::string& query, const std::string& sort, int limit, std::v
     f.downloads = u64_field(m, "downloads"), f.likes = u64_field(m, "likes");
     f.updated = str_field(m, "lastModified"), f.created = str_field(m, "createdAt");
     f.pipeline = str_field(m, "pipeline_tag"), f.gated = gated_field(m);
+    if (const auto gg = m.find("gguf"); gg != m.end() && gg->is_object()) f.architecture = str_field(*gg, "architecture");
     out->push_back(std::move(f));
   }
+  if (next_cursor) *next_cursor = extract_next_cursor(link);
   return true;
 }
 

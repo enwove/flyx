@@ -72,11 +72,18 @@ CATALOG = {"cache": CACHE, "cache_from": "default", "dirs": [FOLDER], "models": 
     dir_model(FOLDER, "Other-12B-Q5_K_M.gguf", int(8.9 * GB), quant="Q5_K_M"),
     dir_model(FOLDER, "mmproj-BF16.gguf", int(0.9 * GB), kind="mmproj"),
     {"name": "acme/Tiny-27B-DFlash2", "kind": "drafter", "source": "hub", "repo": "acme/Tiny-27B-DFlash2", "size": int(1.9 * GB)}]}
-FOUND = {"query": "Qwen3", "family": True, "endpoint": "https://huggingface.co", "models": [
+FOUND = {"query": "", "family": True, "architectures": ["qwen35", "qwen3", "inkling2_loop"], "arch": None,
+         "endpoint": "https://huggingface.co", "next_cursor": "page2-tok", "models": [
     {"id": REPO, "downloads": 7383193, "likes": 6300, "updated": "2026-11-12T02:15:52.000Z", "created": None, "pipeline": None,
-     "gated": False, "cached": True},
+     "gated": False, "cached": True, "architecture": "qwen35", "runs": True},
+    {"id": "acme/Inkling-2-Mini-GGUF", "downloads": 1900000, "likes": 1200, "updated": "2026-11-20T02:15:52.000Z", "created": None,
+     "pipeline": "text-generation", "gated": False, "cached": False, "architecture": "inkling2_loop", "runs": True},
     {"id": "acme/Other-9B-GGUF", "downloads": 1200, "likes": 14, "updated": "2026-02-20T02:15:52.000Z", "created": None,
-     "pipeline": "text-generation", "gated": True, "cached": False}]}
+     "pipeline": "text-generation", "gated": True, "cached": False, "architecture": "gemma4", "runs": False}]}
+FOUND_PAGE2 = {"query": "", "family": True, "architectures": ["qwen35", "qwen3", "inkling2_loop"], "arch": None,
+               "endpoint": "https://huggingface.co", "next_cursor": None, "models": [
+    {"id": "acme/Page2-Model-GGUF", "downloads": 500, "likes": 9, "updated": "2026-11-01T02:15:52.000Z", "created": None,
+     "pipeline": "text-generation", "gated": False, "cached": False, "architecture": "qwen3", "runs": True}]}
 
 
 def repository(repo):
@@ -164,7 +171,18 @@ class Server:
         if "/v1/hub/cached" in url:
             return route.fulfill(json=CATALOG)
         if "/v1/hub/search" in url:
-            return route.fulfill(json=FOUND)
+            cursor = query.get("cursor", [""])[0]
+            arch = query.get("arch", [""])[0]
+            q_text = query.get("q", [""])[0]
+            if cursor == "page2-tok":
+                return route.fulfill(json=FOUND_PAGE2)
+            res = copy.deepcopy(FOUND)
+            if q_text:
+                res["query"], res["family"], res["next_cursor"] = q_text, False, None
+            elif arch:
+                res["arch"], res["next_cursor"] = arch, None
+                res["models"] = [m for m in res["models"] if m.get("architecture") == arch]
+            return route.fulfill(json=res)
         if "/v1/hub/files" in url:
             return route.fulfill(json=repository(query["repo"][0]))
         if "/v1/hub/dir" in url:
@@ -193,10 +211,22 @@ def confirm(page, button, action):
 
 
 def check_settings(page, server, want):
-    """The model served: its settings as loaded, a change against them, what a reload posts."""
+    """The model served: its settings as loaded, a change against them, what a reload posts, and active-status dots."""
     expect(page.locator("#mv-current")).to_be_visible()
     expect(page.locator("#mv-state")).to_have_text("local")
     expect(page.locator("#ld-ctx")).to_be_hidden()  # the context it asked for: nothing to explain
+    # Model status card offers Reload model alongside Unload.
+    expect(page.locator("#ld-reload")).to_be_visible()
+    expect(page.locator("#ld-unload")).to_be_visible()
+    confirm(page, "#ld-reload", "Reload")
+    assert server.posted[-1] == want, server.posted[-1]
+    # When neither a drafter nor a vision projector is loaded, both tab indicator dots stay gray (not .on) and show none.
+    spec_tab = page.locator('#lset-tabs [data-stab="spec"]')
+    vis_tab = page.locator('#lset-tabs [data-stab="vision"]')
+    expect(spec_tab.locator(".dot")).not_to_have_class(re.compile(r"\bon\b"))
+    expect(vis_tab.locator(".dot")).not_to_have_class(re.compile(r"\bon\b"))
+    expect(spec_tab.locator(".sum")).to_have_text("none")
+    expect(vis_tab.locator(".sum")).to_have_text("none")
     field, cmd = page.locator("#mf-kvgpu"), page.locator("#mf-cmd")
     expect(field).to_have_value("0")
     expect(cmd).to_contain_text("--kv-gpu 0")
@@ -335,13 +365,50 @@ def check_vision(page, server, open_page, want):
     off_page, _ = open_page(telemetry(dict(want, vision=False, mmproj="./stale.gguf")))
     expect(off_page.locator("#mf-reload")).to_have_count(0)
     off_page.close()
+    # A model that actually loaded a drafter and vision encoder lights both tab dots green, and toggling off grays them.
+    tm_on = telemetry(dict(want, drafter="", drafters=[]))
+    tm_on["model"]["drafter"] = "mtp"
+    tm_on["model"]["max_width"] = 4
+    tm_on["model"]["vision"] = True
+    on_page, _ = open_page(tm_on)
+    spec_dot = on_page.locator('#lset-tabs [data-stab="spec"] .dot')
+    vis_dot = on_page.locator('#lset-tabs [data-stab="vision"] .dot')
+    expect(spec_dot).to_have_class(re.compile(r"\bon\b"))
+    expect(vis_dot).to_have_class(re.compile(r"\bon\b"))
+    expect(on_page.locator('#lset-tabs [data-stab="spec"] .sum')).to_have_text("default")
+    expect(on_page.locator('#lset-tabs [data-stab="vision"] .sum')).to_have_text("disk · q8")
+    on_page.locator('#lset-tabs [data-stab="vision"]').click()
+    on_page.locator("#vs-on").uncheck(force=True)
+    expect(vis_dot).not_to_have_class(re.compile(r"\bon\b"))
+    on_page.close()
 
 
 def check_hub(page, server, want):
-    """The library's Hugging Face side: repositories found, one shown with its files, a file loaded."""
+    """The library's Hugging Face side: supported architectures, filter pills, pagination, files, a file loaded."""
     view(page, "library")
-    expect(page.locator("#hf-list .prow")).to_have_count(2)
-    expect(page.locator("#hf-family")).to_contain_text("Qwen3")
+    expect(page.locator("#hf-list .prow")).to_have_count(3)
+    expect(page.locator("#hf-family")).to_contain_text("qwen35, qwen3, inkling2_loop")
+    expect(page.locator("#hf-archs button")).to_have_count(4)
+    expect(page.locator("#hf-pager")).to_be_visible()
+    expect(page.locator("#hf-prev")).to_be_disabled()
+    expect(page.locator("#hf-page")).to_have_text("Page 1")
+    expect(page.locator("#hf-next")).to_be_enabled()
+    # Pagination advances to Page 2 and returns to Page 1 cleanly.
+    page.locator("#hf-next").click()
+    expect(page.locator("#hf-page")).to_have_text("Page 2")
+    expect(page.locator("#hf-list .prow")).to_have_count(1)
+    expect(page.locator('#hf-list .prow[data-repo="acme/Page2-Model-GGUF"]')).to_have_count(1)
+    expect(page.locator("#hf-prev")).to_be_enabled()
+    expect(page.locator("#hf-next")).to_be_disabled()
+    page.locator("#hf-prev").click()
+    expect(page.locator("#hf-page")).to_have_text("Page 1")
+    expect(page.locator("#hf-list .prow")).to_have_count(3)
+    # Architecture filter pills narrow the list and reset back to All.
+    page.locator('#hf-archs button[data-arch="inkling2_loop"]').click()
+    expect(page.locator("#hf-list .prow")).to_have_count(1)
+    expect(page.locator('#hf-list .prow[data-repo="acme/Inkling-2-Mini-GGUF"]')).to_have_count(1)
+    page.locator('#hf-archs button[data-arch=""]').click()
+    expect(page.locator("#hf-list .prow")).to_have_count(3)
     expect(page.locator("#hf-name")).to_have_text("Tiny-27B-GGUF")  # the first repository found is shown
     expect(page.locator("#mf-files .mrow")).to_have_count(5)
     expect(page.locator("#hf-mmproj")).to_contain_text("mmproj-BF16.gguf")
@@ -386,6 +453,10 @@ def check_local(page, server):
     expect(page.locator('#lc-list .prow.model[data-model$="tiny-bf16.flyx"] .pt')).to_have_text(".flyx")
     expect(page.locator('#lc-list .prow.model[data-model$="mmproj-BF16.gguf"] .pt')).to_have_text("mmproj")
     expect(page.locator('#lc-list .prow.model[data-model="acme/Tiny-27B-DFlash2"] .pt')).to_have_text("drafter")
+    # Every file under a folder carries a kind-specific icon (model, vision projector, drafter).
+    expect(page.locator('#lc-list .prow.model[data-model$="tiny-bf16.flyx"] .pn svg use')).to_have_attribute("href", "#i-model")
+    expect(page.locator('#lc-list .prow.model[data-model$="mmproj-BF16.gguf"] .pn svg use')).to_have_attribute("href", "#i-image")
+    expect(page.locator('#lc-list .prow.model[data-model="acme/Tiny-27B-DFlash2"] .pn svg use')).to_have_attribute("href", "#i-bolt")
     one.click()
     expect(page.locator("#lc-name")).to_have_text("Tiny-27B-GGUF · IQ3_XXS")
     expect(page.locator("#lc-detail .dchips")).to_contain_text("+ Vision")
@@ -400,13 +471,17 @@ def check_local(page, server):
     page.locator("#mf-q").fill("12b")
     expect(models).to_have_count(1)
     page.locator("#mf-q").fill("")
-    # A drafter or vision projector is not loaded on its own; a projector can be attached under Vision settings.
+    # Drafters and vision projectors use the bottom-right primary button instead of a duplicate banner button.
     page.locator('#lc-list .prow.model[data-model="acme/Tiny-27B-DFlash2"]').click()
-    expect(page.locator("#mf-load")).to_be_disabled()
+    expect(page.locator("#lc-detail .banner button")).to_have_count(0)
+    expect(page.locator("#mf-load")).to_have_text("Draft with it")
+    expect(page.locator("#mf-load")).to_be_enabled()
     page.locator('#lc-list .prow.model[data-model$="mmproj-BF16.gguf"]').click()
-    expect(page.locator("#mf-load")).to_be_disabled()
     expect(page.locator("#lc-detail")).to_contain_text("vision projector")
-    page.locator("#lc-use-mmproj").click()
+    expect(page.locator("#lc-detail .banner button")).to_have_count(0)
+    expect(page.locator("#mf-load")).to_have_text("Use as projector")
+    expect(page.locator("#mf-load")).to_be_enabled()
+    page.locator("#mf-load").click()
     expect(page.locator("#mv-current")).to_be_visible()
     expect(page.locator("#vs-file")).to_have_value(FOLDER + "\\mmproj-BF16.gguf")
     page.locator("#mf-reset").click()
@@ -497,7 +572,7 @@ def check_switch_companions(open_page, want):
     view(page, "library")
     page.locator('#src-seg [data-src="local"]').click()
     page.locator('#lc-list .prow.model[data-model$="mmproj-BF16.gguf"]').click()
-    page.locator("#lc-use-mmproj").click()
+    page.locator("#mf-load").click()
     view(page, "library")
     page.locator('#lc-list .prow.model[data-model$="Other-12B-Q5_K_M.gguf"]').click()
     expect(page.locator("#mf-chosen-s")).to_contain_text("mmproj-BF16.gguf")
@@ -535,7 +610,7 @@ def check_switch_companions(open_page, want):
     view(page, "library")
     page.locator('#src-seg [data-src="local"]').click()
     page.locator('#lc-list .prow.model[data-model$="mmproj-BF16.gguf"]').click()
-    page.locator("#lc-use-mmproj").click()
+    page.locator("#mf-load").click()
     view(page, "library")
     page.locator('#lc-list .prow.model[data-model$="Other-12B-Q5_K_M.gguf"]').click()
     confirm(page, "#mf-load", "Switch")
@@ -571,6 +646,7 @@ def check_nothing_served(page, server, remembered):
     assert (body["model"], body["ctx"], body["kv"], body["kv_ram"], body["kv_gpu"], body["speculative"], body["drafter"], body["drafters"]) == \
         (REPO + ":Q5_K_M", None, "auto", "auto", None, True, "", []), body
     expect(page.locator("#mf-settings")).to_have_count(0)
+    expect(page.locator("#ld-reload")).to_be_hidden()
     expect(page.locator("#ld-unload")).to_be_hidden()
     page.locator("#ld-browse").click()
     expect(page.locator("#mv-library")).to_be_visible()

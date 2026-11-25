@@ -399,6 +399,37 @@ struct FakeHub {
                       "application/json");
     });
     http.Get(R"(/api/models/acme/none/revision/main)", [](const httplib::Request&, httplib::Response& res) { res.status = 404; });
+    http.Get("/api/models", [this](const httplib::Request& q, httplib::Response& res) {
+      const std::string cursor = q.get_param_value("cursor");
+      if (cursor.empty()) {
+        res.set_header("Link", "<http://127.0.0.1:" + std::to_string(port) +
+                                   "/api/models?filter=gguf&cursor=page%2F2%2Btok%3D%3D>; rel=\"next\"");
+        res.set_content(nlohmann::json::array({
+                            {{"id", "acme/Inkling-2-Mini-GGUF"},
+                             {"downloads", 9000},
+                             {"likes", 120},
+                             {"lastModified", "2026-11-20T00:00:00.000Z"},
+                             {"gguf", {{"architecture", "inkling2_loop"}}}},
+                            {{"id", "acme/Qwen3-27B-GGUF"},
+                             {"downloads", 8000},
+                             {"likes", 90},
+                             {"gguf", {{"architecture", "qwen35"}}}},
+                        })
+                            .dump(),
+                        "application/json");
+      } else if (cursor == "page/2+tok==") {
+        res.set_content(nlohmann::json::array({
+                            {{"id", "acme/Third-Model-GGUF"},
+                             {"downloads", 500},
+                             {"likes", 10},
+                             {"gguf", {{"architecture", "qwen3"}}}},
+                        })
+                            .dump(),
+                        "application/json");
+      } else {
+        res.status = 400;
+      }
+    });
     http.Get(R"(/acme/tiny-GGUF/resolve/([0-9a-f]+)/(.*))", [this](const httplib::Request& q, httplib::Response& res) {
       res.status = 302;  // to the storage, an address relative to this host as the Hub gives
       res.set_header("Location", "/storage/" + q.matches[2].str() + "?sig=" + std::to_string(++sig));
@@ -560,6 +591,18 @@ void fetching(const fs::path& tmp) {
   check(flyx::hub::describe("acme/nullable-GGUF", "main", &nullable, &err) && nullable.commit == hub.commit &&
             nullable.files.size() == 1 && nullable.files[0].path == "m-Q4_0.gguf" && nullable.files[0].size == 1234,
         "describe accepts null config/cardData/sibling fields: " + err);
+  {
+    std::vector<flyx::hub::Found> page1, page2;
+    std::string next1, next2;
+    const bool ok1 = flyx::hub::search("", "trending", 20, &page1, &err, "", &next1);
+    check(ok1 && page1.size() == 2 && page1[0].id == "acme/Inkling-2-Mini-GGUF" &&
+              page1[0].architecture == "inkling2_loop" && page1[1].architecture == "qwen35" && next1 == "page/2+tok==",
+          "search parses gguf.architecture and Link rel=next cursor: " + err);
+    const bool ok2 = flyx::hub::search("", "trending", 20, &page2, &err, next1, &next2);
+    check(ok2 && page2.size() == 1 && page2[0].id == "acme/Third-Model-GGUF" && page2[0].architecture == "qwen3" &&
+              next2.empty(),
+          "search round-trips percent-encoded cursor to page 2: " + err);
+  }
   {
     // Sum of missing file sizes overflowing uint64_t must saturate and be rejected by has_room() before any download.
     set_env("HF_HUB_CACHE", from_path(tmp / "overflow_room"));

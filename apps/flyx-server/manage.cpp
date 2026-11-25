@@ -6,8 +6,9 @@
 //                         "drafter": "mtp|dflash2|dv|all|none", "speculative": BOOL, "kv": "fp8|16", "name": ID}
 //                         -> 202 and the state; 409 while one loads
 //   DELETE /v1/load       stops a fetch under way (what came stays for the next try)
-//   GET /v1/hub/search?q=TEXT&sort=trending|downloads|likes|updated|created&limit=N   the Hub's repositories with
-//                         GGUF files, by name; without q, those of the family this build runs (kHubFamily)
+//   GET /v1/hub/search?q=TEXT&sort=trending|downloads|likes|updated|created&limit=N&cursor=C&arch=A   the Hub's
+//                         repositories with GGUF files; without q, filtered to the architectures this build runs
+//                         (optionally narrowed to arch=A), paginated via next_cursor
 //   GET /v1/hub/files?repo=ORG/NAME   a repository's models: its GGUFs by quantization with their sizes (and which
 //                         are in the cache already), its MTP file, the DFlash2 drafters known for it, what the Hub
 //                         says of it (downloads, license, its GGUFs' architecture) and whether this build runs that
@@ -345,21 +346,83 @@ void add_manage_routes(httplib::Server& http, Server* s) {
   });
   http.Get("/v1/hub/search", [s](const httplib::Request& q, httplib::Response& r) {
     if (!require_manage(*s, q, r, "loading models")) return;
-    // Without a name asked for, the family this build runs: most of the Hub's GGUFs are of architectures it does not.
     const std::string asked = q.get_param_value("q");
-    const std::string query = asked.empty() ? apps::kHubFamily : asked;
+    const std::string sort = q.get_param_value("sort");
+    const std::string cursor = q.get_param_value("cursor");
+    const std::string arch_filter = q.get_param_value("arch");
+    const int limit = query_int(q, "limit", 20, 1, 100);
+    const std::vector<std::string> known = interfaces::model_architectures();
     std::vector<hub::Found> found;
-    std::string err;
-    if (!hub::search(query, q.get_param_value("sort"), query_int(q, "limit", 40, 1, 100), &found, &err))
-      return error(r, 502, err, "hub_error");
+    std::string next_cursor, err;
+    if (!asked.empty()) {
+      if (!hub::search(asked, sort, limit, &found, &err, cursor, &next_cursor))
+        return error(r, 502, err, "hub_error");
+    } else {
+      // Without a query, browse GGUF repositories of every architecture this build runs (or one chosen via `arch`),
+      // resuming cleanly across HF batches with a "<skip>:<hf_cursor>" cursor so nothing is skipped or duplicated.
+      std::set<std::string> allow;
+      if (!arch_filter.empty() && std::find(known.begin(), known.end(), arch_filter) != known.end())
+        allow.insert(arch_filter);
+      else
+        allow.insert(known.begin(), known.end());
+      size_t skip = 0;
+      std::string hf_cursor;
+      if (!cursor.empty()) {
+        const size_t colon = cursor.find(':');
+        if (colon != std::string::npos) {
+          try {
+            skip = std::stoull(cursor.substr(0, colon));
+          } catch (const std::exception&) {
+            skip = 0;
+          }
+          hf_cursor = cursor.substr(colon + 1);
+        } else {
+          hf_cursor = cursor;
+        }
+      }
+      constexpr int kMaxBatches = 4;
+      for (int step = 0; step < kMaxBatches && int(found.size()) < limit; ++step) {
+        const std::string batch_start = hf_cursor;
+        std::vector<hub::Found> batch;
+        std::string batch_next;
+        if (!hub::search("", sort, 100, &batch, &err, batch_start, &batch_next)) {
+          if (found.empty()) return error(r, 502, err, "hub_error");
+          break;
+        }
+        std::vector<hub::Found> matched;
+        for (auto& f : batch)
+          if (allow.count(f.architecture) > 0) matched.push_back(std::move(f));
+        size_t i = skip;
+        for (; i < matched.size() && int(found.size()) < limit; ++i) found.push_back(std::move(matched[i]));
+        if (int(found.size()) >= limit) {
+          if (i < matched.size()) next_cursor = std::to_string(i) + ":" + batch_start;
+          else if (!batch_next.empty()) next_cursor = "0:" + batch_next;
+          break;
+        }
+        skip = 0;
+        hf_cursor = batch_next;
+        if (hf_cursor.empty()) break;
+        if (step + 1 == kMaxBatches) next_cursor = "0:" + hf_cursor;
+      }
+    }
     std::set<std::string> here;  // repositories with a snapshot in the cache
     for (const hub::Cached& c : hub::cached()) here.insert(c.repo);
+    const std::set<std::string> known_set(known.begin(), known.end());
     ojson models = ojson::array();
-    for (const hub::Found& f : found)
+    for (const hub::Found& f : found) {
+      const ojson runs = f.architecture.empty() ? ojson(nullptr) : ojson(known_set.count(f.architecture) > 0);
       models.push_back({{"id", f.id}, {"downloads", f.downloads}, {"likes", f.likes}, {"updated", or_null(f.updated)},
                         {"created", or_null(f.created)}, {"pipeline", or_null(f.pipeline)}, {"gated", f.gated},
-                        {"cached", here.count(f.id) > 0}});
-    send_json(r, 200, {{"query", query}, {"family", asked.empty()}, {"endpoint", hub::endpoint()}, {"models", models}});
+                        {"cached", here.count(f.id) > 0}, {"architecture", or_null(f.architecture)}, {"runs", runs}});
+    }
+    send_json(r, 200,
+              {{"query", asked},
+               {"family", asked.empty()},
+               {"architectures", known},
+               {"arch", or_null(arch_filter)},
+               {"endpoint", hub::endpoint()},
+               {"next_cursor", or_null(next_cursor)},
+               {"models", models}});
   });
   http.Get("/v1/hub/dir", [s](const httplib::Request& q, httplib::Response& r) {
     if (!require_manage(*s, q, r, "loading models")) return;

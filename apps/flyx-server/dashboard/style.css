@@ -333,7 +333,7 @@ textarea:focus, input:focus, select:focus { outline: none; border-color: var(--a
 .lset-nav { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; margin-bottom: 14px; }
 .lset-seg { flex-wrap: wrap; }
 .lset-seg button { gap: 7px; padding: 6px 13px; }
-.lset-seg .dot { width: 7px; height: 7px; border-radius: 50%; background: var(--border); flex: none; }
+.lset-seg .dot { width: 7px; height: 7px; border-radius: 50%; background: color-mix(in srgb, var(--faint) 65%, transparent); flex: none; }
 .lset-seg .dot.on { background: var(--accent); }
 .lset-seg .sum { font-family: var(--mono); font-size: 11px; font-weight: 400; color: var(--faint); }
 .lset-seg .chg { font-family: var(--mono); font-size: 11px; font-weight: 600; color: var(--accent); }
@@ -405,6 +405,9 @@ textarea:focus, input:focus, select:focus { outline: none; border-color: var(--a
 .hub-detail { display: flex; flex-direction: column; min-width: 0; min-height: 0; }
 .hub-scroll { flex: 1; min-height: 0; overflow-y: auto; padding: 20px var(--px) 20px 24px; }
 .hub-note { font-size: 12px; line-height: 1.5; color: var(--muted); padding: 6px 12px 10px; }
+.hub-archs { padding: 0 12px 8px; }
+.hub-pager { display: flex; align-items: center; justify-content: space-between; gap: 8px; padding: 10px 12px 4px; margin-top: 6px; border-top: 1px solid var(--border); }
+.hub-page { font-family: var(--mono); font-size: 12px; color: var(--muted); }
 .empty.pad { padding: 10px 12px; }
 /* A place: its name and a figure, under them whose it is and when or how much. */
 .prow { display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 2px 12px; width: 100%; padding: 9px 12px; border: 0; border-radius: var(--r-md);
@@ -420,9 +423,14 @@ div.prow { cursor: pointer; }
 /* A folder, and under it the models in it. */
 .prow.folder { margin-top: 6px; }
 .prow.folder:first-child { margin-top: 0; }
-.prow.model { padding: 6px 12px 6px 33px; }
+.prow.model { padding: 6px 12px 6px 26px; }
 .prow.model .pn { font-size: 13px; font-weight: 500; }
-.prow.model .ps { min-height: 17px; }
+.prow.model .pn.item { display: flex; align-items: center; gap: 7px; }
+.prow.model .pn.item svg.i { width: 14px; height: 14px; flex: none; color: var(--muted); }
+.prow.model .pn.item svg.i.k-mmproj { color: var(--info); }
+.prow.model .pn.item svg.i.k-drafter { color: var(--accent); }
+.prow .pn-t { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.prow.model .ps { min-height: 17px; padding-left: 21px; }
 .pnone { padding: 2px 12px 8px 33px; font-size: 12px; color: var(--faint); }
 .prow.add { margin-top: 8px; color: var(--accent); }
 .prow.add .pn { font-weight: 500; }

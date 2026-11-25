@@ -111,6 +111,8 @@ function Serving({ tm, again, retry, browse }) {
       </div>
       <div class="srv-acts">
         <button class="btn" id="ld-cancel" hidden=${L.state !== "fetching"} onClick=${stopFetch}>${t("Stop fetching")}</button>
+        <button class="btn" id="ld-reload" hidden=${!model.id || busy || !loadedWant}
+                onClick=${reloadServed}><${Icon} name="reload"/>${t("Reload model")}</button>
         <button class="btn danger" id="ld-unload" hidden=${!model.id || busy}
                 onClick=${async () => setMsg((await unloadServed()) || "")}><${Icon} name="eject"/>${t("Unload")}</button>
       </div>
@@ -272,9 +274,12 @@ export function ModelPage({ active, libraryAsked, currentAsked }) {
   const tm = live.last || {}, L = tm.load || { state: "none" }, model = tm.model || {};
   const loadedWant = model.id && L.loaded ? L.loaded : null, busy = busyLoad(L);
   const [tab, setTabState] = useState(() => saved.get("models_tab") === "local" ? "local" : "hub");
-  // Hugging Face: what was searched for, the repositories found, the one shown
+  // Hugging Face: what was searched for, the repositories found, pagination, and the one shown
   const [q, setQ] = useState("");
   const [sort, setSort] = useState("trending");
+  const [arch, setArch] = useState("");
+  const [page, setPage] = useState(0);
+  const [cursors, setCursors] = useState([""]);
   const [found, setFound] = useState(null);
   const [foundMsg, setFoundMsg] = useState("");
   const [repoSel, setRepoSel] = useState("");
@@ -322,15 +327,32 @@ export function ModelPage({ active, libraryAsked, currentAsked }) {
     try { setCatalog(await getJson("/v1/hub/cached")); setCatalogErr(""); } catch (e) { setCatalogErr(e.message); }
   }
   // ---- Hugging Face ----
-  async function search(text, by) {
+  async function search(text, by, archFilter = "", pageIdx = 0, cursorStr = "") {
     const n = ++searchSeq.current;
     setFoundMsg("Asking Hugging Face ...");
     const word = hubName(text) ? repoOf(text) : text.trim();  // a name with its quantization or revision: its repository
-    const a = await ask("/v1/hub/search?limit=40&sort=" + by + "&q=" + encodeURIComponent(word), "search Hugging Face");
+    let path = "/v1/hub/search?limit=20&sort=" + by + "&q=" + encodeURIComponent(word);
+    if (!word && archFilter) path += "&arch=" + encodeURIComponent(archFilter);
+    if (cursorStr) path += "&cursor=" + encodeURIComponent(cursorStr);
+    const a = await ask(path, "search Hugging Face");
     if (n !== searchSeq.current) return;
     if (a.error) { setFound(null); setFoundMsg(a.error); return; }
     setFound(a.j);
     setFoundMsg("");
+    setPage(pageIdx);
+    setCursors((old) => {
+      const next = pageIdx === 0 ? [""] : old.slice(0, pageIdx + 1);
+      if (a.j.next_cursor) next[pageIdx + 1] = a.j.next_cursor;
+      return next;
+    });
+  }
+  function goHubPage(nextPage) {
+    if (nextPage < 0) return;
+    const cur = nextPage === 0 ? "" : cursors[nextPage];
+    if (nextPage > 0 && !cur) return;
+    const listEl = document.getElementById("hf-list");
+    if (listEl) listEl.scrollTop = 0;
+    search(q, sort, arch, nextPage, cur);
   }
   // A repository's files and what the Hub says of it.  `quant`: the file to choose once they are known.
   async function showRepo(id, quant) {
@@ -356,9 +378,9 @@ export function ModelPage({ active, libraryAsked, currentAsked }) {
   }
   useEffect(() => {
     if (!active || view !== "library" || tab !== "hub") return;
-    const h = setTimeout(() => search(q, sort), found || foundMsg ? 350 : 0);
+    const h = setTimeout(() => search(q, sort, arch, 0, ""), found || foundMsg ? 350 : 0);
     return () => clearTimeout(h);
-  }, [active, view, tab, q, sort]);
+  }, [active, view, tab, q, sort, arch]);
   // The first repository shown: the served model's, else the first found.
   useEffect(() => {
     if (repoSel || view !== "library" || tab !== "hub" || !found) return;
@@ -573,8 +595,11 @@ export function ModelPage({ active, libraryAsked, currentAsked }) {
   const visChg = ["vision", "mmproj", "vision_device", "vision_quant", "vision_max_tokens"].filter((k) => changed.includes(k)).length;
 
   function settingsView(cmdModel) {
-    const specSum = !f.spec ? t("off") : f.draftSource === "custom" && own ? baseName(own) : f.draftSource === "saved" ? t("last loaded") : t("default");
-    const visSum = !f.vision ? t("off") : t(normVisionDev(f.vision_device)) + " · " + normVisionQuant(f.vision_quant);
+    const specLoaded = !!model.drafter, visLoaded = !!model.vision;
+    const specSum = !f.spec ? t("off") : f.draftSource === "custom" && own ? baseName(own) : f.draftSource === "saved" ? t("last loaded") :
+                    specLoaded ? t("default") : t("none");
+    const visSum = !f.vision ? t("off") : visLoaded ? t(normVisionDev(f.vision_device)) + " · " + normVisionQuant(f.vision_quant) :
+                   visCustom && mmOwn ? baseName(mmOwn) : t("none");
     return html`
       <div class="pane lset" id="mf-settings">
         <div class="lset-h">
@@ -594,13 +619,13 @@ export function ModelPage({ active, libraryAsked, currentAsked }) {
               ${genChg ? html`<span class="chg">+${genChg}</span>` : ""}
             </button>
             <button role="tab" data-stab="spec" aria-selected=${String(stab === "spec")} onClick=${() => setStab("spec")}>
-              <span class=${"dot" + (f.spec ? " on" : "")}></span>
+              <span class=${"dot" + (specLoaded && f.spec ? " on" : "")}></span>
               <span>${t("Speculative decoding")}</span>
               <span class="sum">${specSum}</span>
               ${specChg ? html`<span class="chg">+${specChg}</span>` : ""}
             </button>
             <button role="tab" data-stab="vision" aria-selected=${String(stab === "vision")} onClick=${() => setStab("vision")}>
-              <span class=${"dot" + (f.vision ? " on" : "")}></span>
+              <span class=${"dot" + (visLoaded && f.vision ? " on" : "")}></span>
               <span>${t("Vision encoder")}</span>
               <span class="sum">${visSum}</span>
               ${visChg ? html`<span class="chg">+${visChg}</span>` : ""}
@@ -762,7 +787,19 @@ export function ModelPage({ active, libraryAsked, currentAsked }) {
              del: m.source === "hub" ? m : null };
   };
   // `rows`: the ones shown, so a choice made elsewhere is not loaded from here.  `note`: what stands in the way.
-  function loadBox(rows, note) {
+  // `action` (optional): replaces loading with a companion action (e.g., attaching an mmproj or drafter).
+  function loadBox(rows, note, action) {
+    if (action) {
+      return html`
+        <div class="loadbox" id="mf-loadbox">
+          <div class="what">
+            ${action.title ? html`<div class="tn" id="mf-chosen" title=${action.title}>${action.title}</div>` : ""}
+            <div class="ts" id="mf-chosen-s">${t(action.sub || note)}</div>
+            ${msg ? html`<div class="ts bad" id="mf-msg">${t(msg)}</div>` : ""}
+          </div>
+          <button class="btn primary" id="mf-load" disabled=${!!action.disabled} onClick=${action.onClick}>${t(action.label)}</button>
+        </div>`;
+    }
     const row = rows.find((r) => r.name === target && !r.off), name = row ? row.name : "";
     const same = !!loadedWant && name === loadedWant.model, m = entryOf(name);
     let label = "Load model", disabled = !name || busy || !!note;
@@ -792,17 +829,34 @@ export function ModelPage({ active, libraryAsked, currentAsked }) {
   // ---- Hugging Face: the repositories found, the one shown ----
   function hubList() {
     const list = found ? found.models : [];
+    const archs = found && Array.isArray(found.architectures) ? found.architectures : [];
+    const familyText = archs.length
+      ? t("Showing supported models (" + archs.join(", ") + "). Search for any other.")
+      : found && found.query ? t("Showing " + found.query + " models, the family this build runs. Search for any other.") : "";
+    const showPager = !!found && !foundMsg && (page > 0 || !!found.next_cursor);
     return html`
-      ${found && found.family ? html`<div class="hub-note" id="hf-family">${t("Showing " + found.query + " models, the family this build runs. Search for any other.")}</div>` : ""}
+      ${found && found.family && familyText ? html`<div class="hub-note" id="hf-family">${familyText}</div>` : ""}
+      ${found && found.family && archs.length > 1 ? html`
+        <div class="hub-archs pills" id="hf-archs" role="group">
+          <button type="button" data-arch="" aria-pressed=${String(arch === "")} onClick=${() => setArch("")}>${t("All")}</button>
+          ${archs.map((a) => html`
+            <button type="button" data-arch=${a} aria-pressed=${String(arch === a)} onClick=${() => setArch(a)}>${a}</button>`)}
+        </div>` : ""}
       ${foundMsg ? html`<div class="empty pad" id="hf-msg">${t(foundMsg)}</div>` : ""}
       ${found && !list.length && !foundMsg ? html`<div class="empty pad">${t("Nothing matches.")}</div>` : ""}
       ${list.map((m) => html`
         <button class=${"prow" + (m.id === repoSel ? " sel" : "")} data-repo=${m.id} onClick=${() => showRepo(m.id, "")}>
           <span class="pn">${m.id.split("/")[1]}</span>
           <span class="pm"><${Icon} name="heart"/>${compact(m.likes)}<${Icon} name="dl"/>${compact(m.downloads)}</span>
-          <span class="ps">${m.id.split("/")[0]}${m.cached ? html` <span class="tag2 info">${t("downloaded")}</span>` : ""}${m.gated ? html` <span class="tag2">${t("gated")}</span>` : ""}</span>
+          <span class="ps">${m.id.split("/")[0]}${m.architecture ? html` <span class=${"tag2" + (m.runs === false ? " bad" : "")}>${m.architecture}</span>` : ""}${m.cached ? html` <span class="tag2 info">${t("downloaded")}</span>` : ""}${m.gated ? html` <span class="tag2">${t("gated")}</span>` : ""}</span>
           <span class="pt">${t(ago(m.updated || m.created))}</span>
-        </button>`)}`;
+        </button>`)}
+      ${showPager ? html`
+        <div class="hub-pager" id="hf-pager">
+          <button class="btn sm" id="hf-prev" disabled=${page === 0} onClick=${() => goHubPage(page - 1)}>${t("Prev page")}</button>
+          <span class="hub-page" id="hf-page">${t("Page " + (page + 1))}</span>
+          <button class="btn sm" id="hf-next" disabled=${!found.next_cursor} onClick=${() => goHubPage(page + 1)}>${t("Next page")}</button>
+        </div>` : ""}`;
   }
   function hubDetail() {
     if (!repoSel) return html`<div class="hub-scroll"><div class="empty">${t("Pick a repository on the left to see its files.")}</div></div>${loadBox([], "")}`;
@@ -890,6 +944,8 @@ export function ModelPage({ active, libraryAsked, currentAsked }) {
     }
   }, [active, view, tab, catalog, places.join("\n")]);
   const kindOfModel = (m) => m.kind === "drafter" ? "drafter" : m.kind === "mmproj" ? "mmproj" : m.kind === "flyx" ? ".flyx" : "GGUF";
+  const iconOfModel = (m) => m.kind === "mmproj" ? "image" : m.kind === "drafter" ? "bolt" : "model";
+  const kindCls = (m) => m.kind === "mmproj" ? "k-mmproj" : m.kind === "drafter" ? "k-drafter" : "k-model";
   // A model as the list names it: a repository's by its name and quantization, a file by its own name.
   const titleOf = (m) => {
     const d = describe(m);
@@ -925,7 +981,7 @@ export function ModelPage({ active, libraryAsked, currentAsked }) {
             const go = () => pickModel(m);
             return html`
               <div class=${"prow act model" + (picked === m.name ? " sel" : "")} role="button" tabindex="0" data-model=${m.name} onClick=${go} onKeyDown=${onEnter(go)}>
-                <span class="pn">${titleOf(m)}</span>
+                <span class="pn item"><${Icon} name=${iconOfModel(m)} cls=${kindCls(m)}/><span class="pn-t">${titleOf(m)}</span></span>
                 <span class="pm">${m.size ? sized(m.size) : ""}</span>
                 <span class="ps">${under}${serving && m.name === serving ? html` <span class="tag2 live">${t("serving")}</span>` : ""}</span>
                 <span class="pt">${t(kindOfModel(m))}</span>
@@ -948,10 +1004,17 @@ export function ModelPage({ active, libraryAsked, currentAsked }) {
     if (m.parts > 1) chips.push([t(m.parts + " parts"), ""]);
     if (m.current === false) chips.push([t("older revision"), "info"]);
     if (loadedWant && m.name === loadedWant.model) chips.push([t("serving"), "live"]);
+    const action = mmproj
+      ? { title: m.path || m.name, sub: "A vision projector is not loaded on its own.", label: "Use as projector",
+          disabled: !model.id || busy, onClick: () => projectWith(m.path || m.name) }
+      : drafter
+      ? { title: m.name, sub: "A drafter is not loaded on its own.", label: "Draft with it",
+          disabled: !model.id || busy, onClick: () => draftWith(m.name) }
+      : null;
     return html`
       <div class="hub-scroll" id="lc-detail">
         <div class="dh">
-          <div class="dh-icon"><${Icon} name=${mmproj ? "image" : "model"}/></div>
+          <div class="dh-icon"><${Icon} name=${iconOfModel(m)}/></div>
           <div class="dh-t"><h3 id="lc-name">${titleOf(m)}</h3><span>${hubModel ? (d.repo || "").split("/")[0] : folderOf(m)}</span></div>
           ${hubModel && !drafter && !mmproj ? html`<button class="btn ghost sm" id="lc-quants" onClick=${() => { setTab("hub"); showRepo(d.repo, ""); }}>${t("All its quantizations")}</button>` : ""}
           ${hubModel ? html`<button class="btn ghost sm" id="lc-delete" onClick=${() => removeCached(m)}><${Icon} name="trash"/>${t("Delete")}</button>` : ""}
@@ -965,12 +1028,10 @@ export function ModelPage({ active, libraryAsked, currentAsked }) {
         </dl>
         <div class="dsec">${t(m.kind === "drafter" ? "Folder" : "File")}</div>
         <${CodeSnippet} id="lc-path" text=${m.path || m.name}/>
-        ${drafter ? html`<div class="banner hint"><div class="grow2">${t(m.name + " is a drafter (" + gb(m.size) + " GB), not a model: it drafts for one, and is not loaded on its own.")}</div>
-          ${model.id ? html`<button class="btn sm" onClick=${() => draftWith(m.name)}>${t("Draft with it")}</button>` : ""}</div>` : ""}
-        ${mmproj ? html`<div class="banner hint"><div class="grow2">${t(m.file + " is a vision projector (" + gb(m.size) + " GB), not a standalone model: attach it to a compatible VLM.")}</div>
-          ${model.id ? html`<button class="btn sm" id="lc-use-mmproj" onClick=${() => projectWith(m.path || m.name)}>${t("Use as projector")}</button>` : ""}</div>` : ""}
+        ${drafter ? html`<div class="banner hint"><div class="grow2">${t(m.name + " is a drafter (" + gb(m.size) + " GB), not a model: it drafts for one, and is not loaded on its own.")}</div></div>` : ""}
+        ${mmproj ? html`<div class="banner hint"><div class="grow2">${t(m.file + " is a vision projector (" + gb(m.size) + " GB), not a standalone model: attach it to a compatible VLM.")}</div></div>` : ""}
       </div>
-      ${loadBox(drafter || mmproj ? [] : [localRow(m)], drafter ? "A drafter is not loaded on its own." : mmproj ? "A vision projector is not loaded on its own." : "")}`;
+      ${loadBox(drafter || mmproj ? [] : [localRow(m)], "", action)}`;
   }
   function localDetail() {
     const j = atCache ? null : dir, start = !!j && j.kind === "start";
@@ -1021,8 +1082,12 @@ export function ModelPage({ active, libraryAsked, currentAsked }) {
       return Object.assign(r, { sub: r.title === rel ? "" : rel });
     }).filter((r) => hit(r.title + " " + r.sub));
     const folderMmproj = j ? j.models.filter((m) => m.kind === "mmproj" && hit(m.file + " " + (m.path || ""))) : [];
-    const loadNote = start ? "Open a folder to see its model files."
-      : j && j.kind === "file" && folderMmproj.length ? "A vision projector is not loaded on its own." : "";
+    const singleMmproj = j && j.kind === "file" && folderMmproj.length === 1 ? folderMmproj[0] : null;
+    const mmAction = singleMmproj
+      ? { title: singleMmproj.path || singleMmproj.name, sub: "A vision projector is not loaded on its own.",
+          label: "Use as projector", disabled: !model.id || busy, onClick: () => projectWith(singleMmproj.path || singleMmproj.name) }
+      : null;
+    const loadNote = start ? "Open a folder to see its model files." : "";
     return html`
       <div class="hub-scroll" id="lc-detail">
         ${bar}
@@ -1034,12 +1099,12 @@ export function ModelPage({ active, libraryAsked, currentAsked }) {
         ${j && !start ? html`
           <div class="dsec">${t("Model files")}<span>${t(j.kind === "dir" ? "here and two folders down" : "")}</span></div>
           ${rows.length ? html`<div class="mrows" id="mf-cached" role="listbox">${rowsView(rows)}</div>`
-            : folderMmproj.length && j.kind === "file" ? ""
+            : singleMmproj ? ""
             : html`<div class="empty">${t(allModels.length ? "Nothing matches." : "No .gguf or .flyx model files here.")}</div>`}
           ${folderMmproj.map((mm) => html`<div class="banner hint" style="margin-top: 10px"><div class="grow2">${t(mm.file + " is a vision projector (" + gb(mm.size) + " GB), not a standalone model: attach it to a compatible VLM.")}</div>
-            ${model.id ? html`<button class="btn sm" onClick=${() => projectWith(mm.path || mm.name)}>${t("Use as projector")}</button>` : ""}</div>`)}` : ""}
+            ${!singleMmproj && model.id ? html`<button class="btn sm" onClick=${() => projectWith(mm.path || mm.name)}>${t("Use as projector")}</button>` : ""}</div>`)}` : ""}
       </div>
-      ${loadBox(rows, loadNote)}`;
+      ${loadBox(rows, loadNote, mmAction)}`;
   }
 
   const hubTab = tab === "hub";
@@ -1081,7 +1146,7 @@ export function ModelPage({ active, libraryAsked, currentAsked }) {
           <label class="search"><${Icon} name="search"/>
             ${hubTab ? html`<input type="text" id="hf-q" placeholder=${t("Search Hugging Face, or give a repository: org/name")} spellcheck="false" autocomplete="off"
                                    value=${q} onInput=${(e) => setQ(e.target.value)}
-                                   onKeyDown=${(e) => { if (e.key === "Enter") { e.preventDefault(); if (!named(q)) search(q, sort); } }}/>`
+                                   onKeyDown=${(e) => { if (e.key === "Enter") { e.preventDefault(); if (!named(q)) search(q, sort, arch, 0, ""); } }}/>`
                      : html`<input type="text" id="mf-q" placeholder=${t("Filter by name or quantization")} spellcheck="false" autocomplete="off"
                                    value=${localQ} onInput=${(e) => setLocalQ(e.target.value)}/>`}</label>
           ${hubTab ? html`<select id="hf-sort" aria-label=${t("Order")} value=${sort} onChange=${(e) => setSort(e.target.value)}>
