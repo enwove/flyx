@@ -532,7 +532,7 @@ export default {
     "The same body as <code>/v1/messages</code>.": "请求体与 <code>/v1/messages</code> 相同。",
     "<code>progress</code> (file, bytes done and in all, bytes a second), <code>error</code>, <code>notes</code>, what was loaded and what the settings file remembers": "<code>progress</code>（文件、已下载字节数和总字节数、每秒字节数）、<code>error</code>、<code>notes</code>、已加载的内容，以及设置文件记住的内容",
     "202 and the state; 409 while another load runs. The current model keeps answering while the new one is fetched.": "返回 202 和当前状态；已有加载在进行时返回 409。下载新模型期间，当前模型继续响应请求。",
-    "If the new model fails to load, the one served before is loaded again (<code>\"fallback\"</code> in the state names it).": "如果新模型加载失败，会重新加载之前服务的模型（状态中的 <code>\"fallback\"</code> 指明是哪个）。",
+    "If the new model fails to load, no model is served until another is loaded (<code>\"state\": \"failed\"</code>).": "如果新模型加载失败，在加载其他模型之前不会提供任何模型（<code>\"state\": \"failed\"</code>）。",
     "What came stays in the cache; loading the same name again goes on from there.": "已下载的部分保留在缓存中；再次加载同一名称时从那里继续。",
     "Active Hugging Face endpoint (<code>endpoint</code>), default endpoint, <code>source</code> (<code>setting</code>, <code>HF_ENDPOINT</code>, or <code>default</code>), and <code>offline</code> flag.": "当前生效的 Hugging Face 端点（<code>endpoint</code>）、默认端点、来源 <code>source</code>（<code>setting</code>、<code>HF_ENDPOINT</code> 或 <code>default</code>）及 <code>offline</code> 离线标志。",
     "Sets or resets the Hugging Face endpoint (<code>{\"endpoint\": \"https://hf-mirror.com\"}</code>, or <code>\"\"</code> to reset) and persists it in <code>serve.json</code>.": "设置或重置 Hugging Face 端点（<code>{\"endpoint\": \"https://hf-mirror.com\"}</code>，或传 <code>\"\"</code> 重置），并持久化到 <code>serve.json</code>。",
