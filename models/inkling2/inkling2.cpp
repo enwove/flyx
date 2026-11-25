@@ -269,6 +269,7 @@ bool Inkling2::build(const ModelFile& file, const ModelOptions& o, std::string* 
   target.softcap = float(c.softcap);
   target.gguf = true;
   target.has_post_norm_tap = true;
+  target.dspark_taps = true;
 
   std::vector<int> unclaimed;
   drafters_reg_.scan(file, target, nullptr, /*has_dv=*/false, &unclaimed);

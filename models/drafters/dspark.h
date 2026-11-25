@@ -9,6 +9,7 @@
 
 #include "core/modelfile/modelfile.h"
 #include "flyx/backend_abi.h"
+#include "models/drafters/dflash2.h"
 #include "models/drafters/target.h"
 #include "models/model.h"
 
@@ -27,11 +28,8 @@ struct DSparkSpec {
 // Returns true if a companion header describes a DSpark GGUF drafter (arch "dflash" + has_markov_context = true).
 bool is_dspark_companion(const nlohmann::json& header);
 
-// Throws unless the DSpark companion was made for this target (width and optional vocabulary).
-// Checked at scan() whether or not the drafter is chosen; internal config is read when chosen (parse_dspark_gguf).
-void check_dspark_made_for(const nlohmann::json& header, const TargetSpec& target);
-
-// Parse and validate a DSpark companion GGUF header + tensor shapes against `target`.
+// Parse and validate a DSpark companion GGUF header + tensor shapes against `target`.  What it was made for
+// (check_made_for, as a DFlash2 GGUF's: its width and vocabulary) is checked at scan() whether or not it is chosen.
 DSparkSpec parse_dspark_gguf(const ModelFile& file, const nlohmann::json& header, const TargetSpec& target,
                              int companion);
 

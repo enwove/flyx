@@ -18,35 +18,16 @@ bool is_dspark_companion(const json& header) {
          cm.at("has_markov_context").get<bool>();
 }
 
-void check_dspark_made_for(const json& header, const TargetSpec& target) {
-  const GgufMeta cm(header);
-  auto mismatch = [&] {
-    return "a drafter made for another model (this one: width " + std::to_string(target.hidden) + ", vocabulary " +
-           std::to_string(target.vocab) + ", " + std::to_string(target.layers) + " layers)";
-  };
-  if (cm.count("embedding_length") != target.hidden) throw std::runtime_error(mismatch());
-  if (cm.has("vocab_size")) {
-    const int dv = cm.count("vocab_size");
-    if (dv != target.vocab && dv != target.padded_vocab()) throw std::runtime_error(mismatch());
-  }
-}
-
 DSparkSpec parse_dspark_gguf(const ModelFile& file, const json& header, const TargetSpec& target, int companion) {
   const GgufMeta cm(header);
-  check_dspark_made_for(header, target);
+  check_made_for(header, target);
   auto cn = [&](const std::string& name) { return ModelFile::companion_name(companion, name); };
-
-  if (!cm.has("has_markov_context") || !cm.at("has_markov_context").is_boolean() ||
-      !cm.at("has_markov_context").get<bool>())
-    throw std::runtime_error("DSpark GGUF must have dflash.has_markov_context = true");
 
   DSparkSpec spec{};
   spec.companion = companion;
   flyx_dspark_block& d = spec.block;
   spec.layers = cm.count("block_count");
   d.hidden = cm.count("embedding_length");
-  if (d.hidden != target.hidden)
-    throw std::runtime_error("DSpark embedding_length does not match target hidden size");
   d.inter = cm.count("feed_forward_length");
   d.n_heads = cm.count("attention.head_count");
   d.n_kv = cm.count("attention.head_count_kv");
@@ -58,6 +39,8 @@ DSparkSpec parse_dspark_gguf(const ModelFile& file, const json& header, const Ta
   d.block = cm.count("block_size");
   d.theta = cm.real_or("rope.freq_base", 1000000.0);
   spec.eps = cm.real_or("attention.layer_norm_rms_epsilon", 1e-6);
+  if (cm.has("final_logit_softcapping") && !cm.at("final_logit_softcapping").is_number())
+    throw std::runtime_error("DSpark final_logit_softcapping must be a number");
   const double softcap =
       cm.has("final_logit_softcapping") ? cm.at("final_logit_softcapping").get<double>() : double(target.softcap);
   if (!std::isfinite(softcap) || softcap < 0.0) throw std::runtime_error("DSpark final_logit_softcapping out of range");
@@ -76,13 +59,16 @@ DSparkSpec parse_dspark_gguf(const ModelFile& file, const json& header, const Ta
     }
   }
 
-  const auto raw_taps = cm.at("target_layers").get<std::vector<int>>();
-  if (raw_taps.empty()) throw std::runtime_error("DSpark target_layers is empty");
-  for (int t : raw_taps)
+  const json& raw_taps = cm.at("target_layers");
+  if (!raw_taps.is_array() || raw_taps.empty()) throw std::runtime_error("DSpark target_layers is missing or empty");
+  for (const auto& item : raw_taps) {
+    if (!item.is_number_integer()) throw std::runtime_error("DSpark target_layers must be integers");
+    const int64_t t = item.get<int64_t>();
     if (t < 0 || t > target.layers)
       throw std::runtime_error("DSpark target_layers index " + std::to_string(t) + " out of range 0.." +
                                std::to_string(target.layers));
-  spec.taps = raw_taps;
+    spec.taps.push_back(int(t));
+  }
   d.n_taps = int32_t(spec.taps.size());
 
   const flyx_tensor_view* w1_t = file.tensor(cn("markov_w1.weight"));

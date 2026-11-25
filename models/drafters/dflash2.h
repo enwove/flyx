@@ -31,9 +31,10 @@ struct DFlash2Spec {
 // True if a companion header describes a non-Markov DFlash2 drafter container (.flyx, HF dir, or arch="dflash" GGUF).
 bool is_dflash_companion(const nlohmann::json& header);
 
-// Throws unless the drafter such a companion holds was made for this target (its width and vocabulary, and its
-// layer count where the drafter names one).  A drafter given beside another model is refused whether or not it is
-// chosen; the rest of its config is read only when it drafts (parse_dflash2_*).
+// Throws unless the drafter such a companion holds (or a DSpark one's: the same GGUF layout) was made for this
+// target (its width and vocabulary, and its layer count where the drafter names one).  A drafter given beside
+// another model is refused whether or not it is chosen; the rest of its config is read only when it drafts
+// (parse_dflash2_*, parse_dspark_gguf).
 void check_made_for(const nlohmann::json& header, const TargetSpec& target);
 
 // Parse and validate a DFlash2 spec from canonical JSON ("draft" section in .flyx or drafter_dir).

@@ -21,6 +21,9 @@ struct TargetSpec {
   float softcap = 0.0f;    // target logit softcap (default fallback for drafters without explicit key)
   bool gguf = false;       // true when the target model was opened from GGUF
   bool has_post_norm_tap = false;  // architecture calls emit_post_norm_taps() after its own final residual mix
+  bool dspark_taps = false;        // architecture's programs give a DSpark drafter its taps: emit_pre_visit_taps()
+                                   // before every layer and emit_post_norm_taps(); without them it drafts from
+                                   // rows nothing wrote, so its file is refused
 
   int padded_vocab() const { return vocab_padded > 0 ? vocab_padded : vocab; }
 };

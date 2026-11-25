@@ -256,17 +256,17 @@ void refusals(const std::string& dir) {
     check(!m && err.find(c.says) != std::string::npos && err.find("companion file 1: ") != std::string::npos,
           std::string("a DFlash2 GGUF with ") + c.what + ": refused, the file named (" + err + ")");
   }
-  {  // A GGUF with has_markov_context=true is classified as DSpark (not DFlash2); selecting dspark validates its tensors.
+  // A GGUF with a Markov context is a DSpark drafter, never the plain block: a dense model's programs give it no
+  // taps, so the file is refused beside one whatever drafter is asked for (tests/e2e/inkling2_test.cpp runs it
+  // beside the model it is made for).
+  for (const char* drafter : {"dflash2", "dspark", "none"}) {
     ModelFile f;
     std::string err;
-    const auto m_df = open_beside(&f, model, dir + "/tiny_draft_refused_dspark.gguf", "dflash2", &err);
-    check(!m_df && err.find("no DFlash2 drafter") != std::string::npos,
-          "a Markov-context GGUF is classified as DSpark, not DFlash2 (" + err + ")");
-    ModelFile f2;
-    std::string err2;
-    const auto m_ds = open_beside(&f2, model, dir + "/tiny_draft_refused_dspark.gguf", "dspark", &err2);
-    check(!m_ds && err2.find("companion file 1: ") != std::string::npos && err2.find("DSpark") != std::string::npos,
-          "a Markov-context GGUF missing DSpark tensors is refused under dspark, the file named (" + err2 + ")");
+    const auto m = open_beside(&f, model, dir + "/tiny_draft_refused_dspark.gguf", drafter, &err);
+    check(!m && err.find("companion file 1: a DSpark drafter") != std::string::npos &&
+              err.find("does not run") != std::string::npos,
+          std::string("a DSpark GGUF beside a model whose programs do not tap for it, --drafter ") + drafter +
+              ": refused, the file named (" + err + ")");
   }
   {  // Soft-capped DFlash2 GGUF is supported: sets softcap and default before_correction mode.
     ModelFile f;

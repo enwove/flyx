@@ -30,9 +30,11 @@ void DrafterRegistry::scan(const ModelFile& file, const TargetSpec& target, cons
     const json& h = hdr.at("companions").at(size_t(i));
     const std::string what = companion_label(i);
     if (is_dspark_companion(h)) {
+      if (!target.dspark_taps)
+        throw std::runtime_error(what + "a DSpark drafter, which a " + target.arch + " model does not run");
       if (sources_.dspark) throw std::runtime_error(what + "the model has a DSpark drafter already");
       try {
-        check_dspark_made_for(h, target);
+        check_made_for(h, target);
       } catch (const std::exception& e) {
         throw std::runtime_error(what + e.what());
       }
