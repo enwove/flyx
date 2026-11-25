@@ -13,7 +13,7 @@
 | `utf8proc` | `2.9.0` | MIT + Unicode | Unicode normalization for BPE (`third_party/utf8proc/LICENSE.md`) |
 | `llama.cpp` Jinja engine | commit `f7591a6` | MIT | Chat template execution (`common/jinja`, `common/json`, `common/unicode`; [local changes](../third_party/jinja/README.flyx.md)) |
 | `ggml` quantization header | commit `f7591a6` | MIT | `ggml-common.h` block layouts and codebooks, unchanged ([note](../third_party/ggml/README.flyx.md)) |
-| `XGrammar` C++ core | commit `8f9a127` | Apache-2.0 | Grammar compiler & matcher + `picojson` (BSD-2-Clause) + `dlpack` (Apache-2.0), unchanged ([note](../third_party/xgrammar/README.flyx.md)) |
+| `XGrammar` C++ core | commit `8f9a127` | Apache-2.0 | Grammar compiler & matcher + `picojson` (BSD-2-Clause) + `dlpack` (Apache-2.0) ([local changes](../third_party/xgrammar/README.flyx.md)) |
 | `Preact` + `htm` | `10.26.4` / `3.1.1` | MIT / Apache-2.0 | Zero-build dashboard UI components, unchanged ([Preact note](../third_party/preact/README.flyx.md), [htm note](../third_party/htm/README.flyx.md)) |
 | `stb_image` | `v2.34` | MIT / Public Domain | In-memory PNG/JPEG/BMP/GIF/TGA decoding for multimodal vision inputs (`third_party/stb/LICENSE`), unchanged ([note](../third_party/stb/README.flyx.md)) |
 

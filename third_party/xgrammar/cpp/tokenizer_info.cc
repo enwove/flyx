@@ -312,7 +312,8 @@ TokenizerInfo::Impl::Impl(
   std::stack<std::pair<std::string, int32_t>> prefix_stack;
   for (size_t i = 0; i < sorted_decoded_vocab_.size(); ++i) {
     const auto& token = sorted_decoded_vocab_[i].second;
-    while ((!prefix_stack.empty()) && (token.find(prefix_stack.top().first) == std::string::npos)) {
+    // flyx: a subtree ends where its prefix does; upstream kept any token that contains it (README.flyx.md).
+    while (!prefix_stack.empty() && token.rfind(prefix_stack.top().first, 0) != 0) {
       const auto& top_pair = prefix_stack.top();
       trie_subtree_nodes_range_[top_pair.second] = i;
       prefix_stack.pop();
