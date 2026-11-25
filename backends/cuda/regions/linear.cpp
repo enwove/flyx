@@ -64,6 +64,13 @@ void gemm(const float* x, int ldx, const Lin& W, int N, int K, float* y, int ldy
   else flyx::cuda::gemm(x, ldx, W.w, N, K, y, ldy, rows, accumulate, L);
 }
 
+// Whether gemm above reads these 1..16 rows of a round as three bf16 parts on the skinny kernel: a dense bf16 weight
+// that no exact control projection stands in for.  Then a producer that writes the parts itself, and gemm_presplit
+// after it, give the same bits.
+bool gemm_reads_split(const float* x, int ldx, const Lin& W, int K, const Launch& L) {
+  return !W.round.f32 && !W.round.b16 && !W.packed() && !W.q && W.w && gemm_skinny_takes(x, ldx, W.w, K, L);
+}
+
 // Draft logits for `rows` rows of x.
 void draft_logits(const HeadBlock& h, const float* x, int ldx, float* y, int rows, const Launch& L) {
   if (h.draft.q)

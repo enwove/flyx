@@ -258,6 +258,10 @@ Scratch side_scratch(const Scratch& s);
 // k_gemm_skinny_mt in one part (up to 64 rows).
 void gemm(const float* x, int ldx, const bf16* W, int N, int K, float* y, int ldy, int rows, bool accumulate,
           const Launch& L);
+// Whether gemm gives 1..16 of these rows to the skinny kernel, which reads each value as three bf16 parts (the
+// rows' and the weight's alignment, K % 32; never with option gemm=rows): a producer that writes those parts itself
+// then gives gemm_presplit gemm's bits.
+bool gemm_skinny_takes(const float* x, int ldx, const bf16* W, int K, const Launch& L);
 // Explicit paths (for tests).
 void gemm_rows(const float* x, int ldx, const bf16* W, int N, int K, float* y, int ldy, int rows, bool accumulate,
                cudaStream_t st);
@@ -1412,6 +1416,10 @@ void rmsnorm_split(const float* x, int ldx, const float* w, float offset, float 
 // The same of bf16 rows (a prefill pass's bf16 residual), more than 16 rows.
 void rmsnorm_split(const bf16* x, int ldx, const float* w, float offset, float eps, int rows, int n, const Launch& L,
                    bool q8 = false);
+// A round's 1..16 rows (n % 32 == 0) for two GEMMs that read them in different forms, in one launch: in 8 bits
+// (rmsnorm_split's q8 rows) and as the skinny GEMM's three bf16 parts, which lie apart in the scratch.
+void rmsnorm_q8_split(const float* x, int ldx, const float* w, float offset, float eps, int rows, int n,
+                      const Launch& L);
 void swiglu_split(const float* gu, int ld, int I, int rows, const Launch& L, bool q8 = false);
 void gdn_gated_norm_split(const float* o, const float* z, int ld_z, const float* w, float eps, int rows, GdnDims d,
                           const Launch& L, bool q8 = false);
@@ -1590,10 +1598,12 @@ struct RelWindow {
 };
 // Causal relative-position-bias attention with per-query sink, virtual 0 sink, optional sliding window & ring KV,
 // optional prefill key windowing, and optional sigmoid(gate) multiply. out == nullptr writes fused split_out.
+// q8 (a round's 1..16 rows, out == nullptr, no window state): the outputs in 8 bits where the output projection
+// reads them, a warp a group of 32 within a head, not as bf16 parts.
 void rel_attention(const float* q, const float* r, KvRef kv, const float* rel_bias, const float* sink, int ld_sink,
                    const float* gate, int ld_gate, int nh, int nkv, int hd, int d_rel, int rel_extent, int window,
                    int rows, const DevParams* P, float* out, int ld_out, float* partial, int splits, const Launch& L,
-                   int pos_add = 0, const RelWindow& win = {});
+                   int pos_add = 0, const RelWindow& win = {}, bool q8 = false);
 
 // Sparse MoE routing, SiTU activation, and row-independent expert GEMMs (ops/moe/ref.h, ops/activation/ref.h).
 struct ExpertMat {

@@ -184,6 +184,8 @@ void ggml_nvfp4_planes(const flyx_tensor_view* v, const std::function<size_t(siz
 void gemm(const float* x, int ldx, const Lin& W, int N, int K, float* y, int ldy, int rows, bool accumulate,
           const Launch& L);
 void gemm_presplit(const Lin& W, int N, int K, float* y, int ldy, int rows, bool accumulate, const Launch& L);
+// Whether gemm reads a round's 1..16 rows of x as three bf16 parts, which a producer may then write itself.
+bool gemm_reads_split(const float* x, int ldx, const Lin& W, int K, const Launch& L);
 // A prefill MLP (rows > 16): gate|up with SwiGLU in the GEMM's epilogue (the
 // scratch's bf16 rows in, its glu rows out), then a GEMM on those rows.
 void gemm_glu_presplit(const Lin& W, int I, int K, int rows, const Launch& L);

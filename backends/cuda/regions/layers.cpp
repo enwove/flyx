@@ -1,6 +1,8 @@
 // Copyright 2026 The flyx Authors. SPDX-License-Identifier: Apache-2.0
 // What each program node runs on its block: the generic implementation of every
 // region; fused=true is the override regions/plan.cpp may pick.
+#include <bit>
+
 #include "backends/cuda/regions/layers.h"
 
 namespace flyx::cuda {
@@ -646,6 +648,12 @@ namespace {
 // tokens in passes of 1,024, RTX 5070 Ti).
 bool loop_as_round(const Pass& ps) { return ps.round || ps.rows <= FLYX_MAX_ROWS; }
 
+// The same weights, offset and epsilon bit for bit: the same rows of the same input.
+bool same_norm(const Norm& a, const Norm& b) {
+  return a.w == b.w && std::bit_cast<uint32_t>(a.offset) == std::bit_cast<uint32_t>(b.offset) &&
+         std::bit_cast<uint32_t>(a.eps) == std::bit_cast<uint32_t>(b.eps);
+}
+
 LoopGate loop_gate(const LoopWeights& w, const float* cur, const float* msg, float* out) {
   return {cur, msg, w.down.round, w.gain.round, w.forget.round, out};
 }
@@ -739,43 +747,59 @@ void rel_attn_layer(const Pass& ps, const RelAttnBlock& a, bool fused) {
     }
   }
 
-  // Q / gate / rel / sink share q_norm_in(in_raw[0]) -> rv.b.h (non-aliasing).
-  rmsnorm(in_raw[0], H, a.q_norm_in.w, a.q_norm_in.offset, a.q_norm_in.eps, rv.b.h, H, R, H, st);
+  // A fused round's producers write a projection's input as its GEMM reads it, in the launch that computes it; the
+  // generic layer stages it from float32 rows in a launch of its own for each reader.
+  const bool round_q8 = fused && ps.round && R <= FLYX_MAX_ROWS;
+  // The norm of x for two projections that read it in different forms, w in 8 bits and its companion (a sink or
+  // dynamic-tap projection) as three bf16 parts: one launch writes both, which lie apart in the scratch.
+  auto project_pair = [&](const float* x, const Norm& n, const Lin& w, int cols, float* out, int ld_out,
+                          const Lin& companion, int companion_cols, float* companion_out) {
+    const bool dual = round_q8 && w.q8_inputs() && gemm_reads_split(rv.b.h, H, companion, H, L);
+    if (dual) {
+      rmsnorm_q8_split(x, H, n.w, n.offset, n.eps, R, H, L);
+      gemm_presplit(w, cols, H, out, ld_out, R, false, L);
+      gemm_presplit(companion, companion_cols, H, companion_out, companion_cols, R, false, L);
+    } else {
+      rmsnorm(x, H, n.w, n.offset, n.eps, rv.b.h, H, R, H, st);
+      gemm(rv.b.h, H, w, cols, H, out, ld_out, R, false, L);
+      gemm(rv.b.h, H, companion, companion_cols, H, companion_out, companion_cols, R, false, L);
+    }
+    return dual;
+  };
+
+  bool q_staged = false;
   if (a.stacked_qgr) {
-    gemm(rv.b.h, H, a.w_qgr, 2 * q_dim + nh * dr, H, rv.b.proj, rv.ld_proj, R, false, L);
+    q_staged = project_pair(in_raw[0], a.q_norm_in, a.w_qgr, 2 * q_dim + nh * dr, rv.b.proj, rv.ld_proj,
+                            a.w_sink, nh, rv.b.sink);
   } else {
+    rmsnorm(in_raw[0], H, a.q_norm_in.w, a.q_norm_in.offset, a.q_norm_in.eps, rv.b.h, H, R, H, st);
     gemm(rv.b.h, H, a.w_q, q_dim, H, rv.b.proj, rv.ld_proj, R, false, L);
     gemm(rv.b.h, H, a.w_gate, q_dim, H, rv.b.proj + q_dim, rv.ld_proj, R, false, L);
     gemm(rv.b.h, H, a.w_rel, nh * dr, H, rv.b.proj + 2 * q_dim, rv.ld_proj, R, false, L);
+    gemm(rv.b.h, H, a.w_sink, nh, H, rv.b.sink, nh, R, false, L);
   }
-  gemm(rv.b.h, H, a.w_sink, nh, H, rv.b.sink, nh, R, false, L);
 
-  // K input norm -> K projection -> ShortConv -> kv_conv[0..R*kv_dim).
-  float* k_dyn = nullptr;
-  if (is_swa) {
-    norm_project(in_raw[1], rv.b.h, rv.b.act, kv_dim, R, a.k_norm_in, a.w_k, kv_dim, H, L, fused && H % 64 == 0);
-  } else {
-    rmsnorm(in_raw[1], H, a.k_norm_in.w, a.k_norm_in.offset, a.k_norm_in.eps, rv.b.h, H, R, H, st);
-    gemm(rv.b.h, H, a.w_k, kv_dim, H, rv.b.act, kv_dim, R, false, L);
-    gemm(rv.b.h, H, a.w_k_conv_proj, nkv * a.conv, H, rv.b.kv_dyn, nkv * a.conv, R, false, L);
-    k_dyn = rv.b.kv_dyn;
-  }
-  shortconv_pass(rv.b.act, kv_dim, a.k_conv, k_dyn, sc.win, sc.w_stride, kSlotCur, next_sel, skip, rep, rep_stride,
-                 kSlotCur, 0, sc.channels, kv_dim, a.conv, nkv, s->P, R, rv.b.kv_conv, kv_dim, st, false);
-
-  // V input norm -> V projection -> ShortConv -> kv_conv[R*kv_dim..2*R*kv_dim).
-  float* v_dyn = nullptr;
-  if (is_swa) {
-    norm_project(in_raw[2], rv.b.h, rv.b.act, kv_dim, R, a.v_norm_in, a.w_v, kv_dim, H, L, fused && H % 64 == 0);
-  } else {
-    rmsnorm(in_raw[2], H, a.v_norm_in.w, a.v_norm_in.offset, a.v_norm_in.eps, rv.b.h, H, R, H, st);
-    gemm(rv.b.h, H, a.w_v, kv_dim, H, rv.b.act, kv_dim, R, false, L);
-    gemm(rv.b.h, H, a.w_v_conv_proj, nkv * a.conv, H, rv.b.kv_dyn, nkv * a.conv, R, false, L);
-    v_dyn = rv.b.kv_dyn;
-  }
-  shortconv_pass(rv.b.act, kv_dim, a.v_conv, v_dyn, sc.win, sc.w_stride, kSlotCur, next_sel, skip, rep, rep_stride,
-                 kSlotCur, kv_dim, sc.channels, kv_dim, a.conv, nkv, s->P, R, rv.b.kv_conv + size_t(R) * kv_dim,
-                 kv_dim, st, false);
+  // A sliding-window block's q, k and v read one input through one norm: q's 8-bit rows serve k and v too.  The
+  // sink's GEMM, the packed GEMMs and the ShortConv that run in between leave those rows as they are.
+  const bool reuse_q = q_staged && is_swa && in_raw[0] == in_raw[1] && in_raw[0] == in_raw[2] &&
+                       same_norm(a.q_norm_in, a.k_norm_in) && same_norm(a.q_norm_in, a.v_norm_in) &&
+                       a.w_k.q8_inputs() && a.w_v.q8_inputs();
+  auto project_kv = [&](const float* x, const Norm& n, const Lin& w, const Lin& taps, const float* conv, int offset) {
+    float* dyn = nullptr;
+    if (reuse_q) {
+      gemm_presplit(w, kv_dim, H, rv.b.act, kv_dim, R, false, L);
+    } else if (is_swa) {
+      norm_project(x, rv.b.h, rv.b.act, kv_dim, R, n, w, kv_dim, H, L, fused && H % 64 == 0);
+    } else {
+      dyn = rv.b.kv_dyn;
+      project_pair(x, n, w, kv_dim, rv.b.act, kv_dim, taps, nkv * a.conv, dyn);
+    }
+    shortconv_pass(rv.b.act, kv_dim, conv, dyn, sc.win, sc.w_stride, kSlotCur, next_sel, skip, rep, rep_stride,
+                   kSlotCur, offset, sc.channels, kv_dim, a.conv, nkv, s->P, R, rv.b.kv_conv + size_t(R) * offset,
+                   kv_dim, st, false);
+  };
+  project_kv(in_raw[1], a.k_norm_in, a.w_k, a.w_k_conv_proj, a.k_conv, 0);
+  project_kv(in_raw[2], a.v_norm_in, a.w_v, a.w_v_conv_proj, a.v_conv, kv_dim);
 
   const KvBuf& kb = s->kv[size_t(a.kv)];
   KvRef kv = kb.ref();
@@ -823,6 +847,9 @@ void rel_attn_layer(const Pass& ps, const RelAttnBlock& a, bool fused) {
   }
 
   const bool split = fused && !a.w_o.q8_inputs() && q_dim % 64 == 0;
+  // The output projection's 8-bit rows from the attention's last kernel (a warp a group of 32 within a head); a
+  // round that reads a low-bit copy ends in that copy's attention, which writes float32 rows.
+  const bool q8_out = round_q8 && a.w_o.q8_inputs() && hd % 32 == 0 && !ps.reads_copy(kb);
   if (ps.reads_cache(kb)) {
     if (const int windows = ps.round ? 0 : s->windows(kb, R)) {
       rel_attn_windows(ps, a, kb, windows, split ? nullptr : rv.b.act, q_dim);
@@ -831,7 +858,8 @@ void rel_attn_layer(const Pass& ps, const RelAttnBlock& a, bool fused) {
       if (kb.vk && !direct_kv) s->stage_before(kb, 0, R, st);
       rel_attention(rv.b.qbuf, rv.b.rel_q, (kb.vk && !direct_kv) ? kb.staged() : kb.ref(), a.rel_bias, rv.b.sink, nh,
                     rv.b.proj + q_dim, rv.ld_proj, nh, nkv, hd, dr, a.rel_extent, a.window, R, s->P,
-                    split ? nullptr : rv.b.act, q_dim, rv.b.part, ps.round ? kRoundSplits : kPrefillSplits, L, 0);
+                    split || q8_out ? nullptr : rv.b.act, q_dim, rv.b.part, ps.round ? kRoundSplits : kPrefillSplits,
+                    L, 0, {}, q8_out);
       if (kb.vk && !direct_kv) s->stage_after(kb, st);
     }
   }
@@ -861,7 +889,7 @@ void rel_attn_layer(const Pass& ps, const RelAttnBlock& a, bool fused) {
     if (only) s->stage_after(kb, st);
   }
 
-  if (split) gemm_presplit(a.w_o, H, q_dim, rv.b.post_raw, H, R, false, L);
+  if (split || q8_out) gemm_presplit(a.w_o, H, q_dim, rv.b.post_raw, H, R, false, L);
   else gemm(rv.b.act, q_dim, a.w_o, H, q_dim, rv.b.post_raw, H, R, false, L);
 
   if (a.res_push) {

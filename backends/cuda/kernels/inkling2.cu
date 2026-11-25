@@ -1216,6 +1216,7 @@ __global__ void __launch_bounds__(128) k_rel_attention_split(const float* __rest
   }
 }
 
+template <bool Q8>
 __global__ void k_rel_attention_combine(const float* __restrict__ part, const float* __restrict__ gate, int ld_gate,
                                         int nh, int hd, int window, int splits, const DevParams* P, int pos_add,
                                         Out out, int ld_out) {
@@ -1241,7 +1242,11 @@ __global__ void k_rel_attention_combine(const float* __restrict__ part, const fl
   }
   float o = L > 0.f ? A / L : 0.f;
   if (gate) o *= sigm(g);
-  put(out, size_t(r) * ld_out + h * hd + d, size_t(r) * nh * hd + h * hd + d, o);
+  if constexpr (Q8) {
+    put_q8(out, r, (h * hd + d) / 32, o);  // each warp owns a complete group within its head
+  } else {
+    put(out, size_t(r) * ld_out + h * hd + d, size_t(r) * nh * hd + h * hd + d, o);
+  }
 }
 
 __global__ void k_rel_attention_combine_win(const float* __restrict__ part, const float* __restrict__ gate, int ld_gate,
@@ -1343,7 +1348,7 @@ template <int HD>
 void dispatch_rel_attention(const float* q, const float* r, KvRef kv, const float* rel_bias, const float* sink,
                             int ld_sink, const float* gate, int ld_gate, int nh, int nkv, int d_rel, int rel_extent,
                             int window, int rows, float scale, const DevParams* P, float* out, int ld_out,
-                            float* partial, int splits, const Launch& L, int pos_add, const RelWindow& win) {
+                            float* partial, int splits, const Launch& L, int pos_add, const RelWindow& win, bool q8) {
   // Prefill (more causal rows than a round): tensor-core FlashAttention unless kAttnSplit is forced.
   if (rows > FLYX_MAX_ROWS && !L.round_rows && opts(L).attention != kAttnSplit) {
     const bool ok = kv.fp8()
@@ -1370,15 +1375,18 @@ void dispatch_rel_attention(const float* q, const float* r, KvRef kv, const floa
           eff_splits, k_lo, k_hi);
     }
   }
-  const Out dst = (!win.state || win.last) ? (out ? Out{out, nullptr, nullptr} : split_out(L, rows, nh * HD, false))
+  const Out dst = (!win.state || win.last) ? (out ? Out{out, nullptr, nullptr} : split_out(L, rows, nh * HD, q8))
                                            : Out{nullptr, nullptr, nullptr};
   if (win.state) {
     k_rel_attention_combine_win<<<dim3(nh, rows), HD, 0, L.st>>>(partial, gate, ld_gate, nh, HD, window, eff_splits, P,
                                                                  pos_add, k_lo, k_hi, int(win.first), int(win.last),
                                                                  win.state, dst, ld_out);
+  } else if (q8) {
+    k_rel_attention_combine<true><<<dim3(nh, rows), HD, 0, L.st>>>(partial, gate, ld_gate, nh, HD, window, eff_splits,
+                                                                   P, pos_add, dst, ld_out);
   } else {
-    k_rel_attention_combine<<<dim3(nh, rows), HD, 0, L.st>>>(partial, gate, ld_gate, nh, HD, window, eff_splits, P,
-                                                             pos_add, dst, ld_out);
+    k_rel_attention_combine<false><<<dim3(nh, rows), HD, 0, L.st>>>(partial, gate, ld_gate, nh, HD, window, eff_splits,
+                                                                    P, pos_add, dst, ld_out);
   }
 }
 
@@ -1491,24 +1499,26 @@ void rel_bias_table(const float* r_q, const float* rel_bias, int nh, int d_rel, 
 void rel_attention(const float* q, const float* r, KvRef kv, const float* rel_bias, const float* sink, int ld_sink,
                    const float* gate, int ld_gate, int nh, int nkv, int hd, int d_rel, int rel_extent, int window,
                    int rows, const DevParams* P, float* out, int ld_out, float* partial, int splits, const Launch& L,
-                   int pos_add, const RelWindow& win) {
+                   int pos_add, const RelWindow& win, bool q8) {
+  if (q8 && (out || win.state || rows < 1 || rows > FLYX_MAX_ROWS))
+    throw std::invalid_argument("rel_attention: Q8 output needs 1..16 rows, null out and no prefill window state");
   const float scale = 1.f / std::sqrt(float(hd));
   switch (hd) {
     case 32:
       dispatch_rel_attention<32>(q, r, kv, rel_bias, sink, ld_sink, gate, ld_gate, nh, nkv, d_rel, rel_extent, window,
-                                 rows, scale, P, out, ld_out, partial, splits, L, pos_add, win);
+                                 rows, scale, P, out, ld_out, partial, splits, L, pos_add, win, q8);
       return;
     case 64:
       dispatch_rel_attention<64>(q, r, kv, rel_bias, sink, ld_sink, gate, ld_gate, nh, nkv, d_rel, rel_extent, window,
-                                 rows, scale, P, out, ld_out, partial, splits, L, pos_add, win);
+                                 rows, scale, P, out, ld_out, partial, splits, L, pos_add, win, q8);
       return;
     case 128:
       dispatch_rel_attention<128>(q, r, kv, rel_bias, sink, ld_sink, gate, ld_gate, nh, nkv, d_rel, rel_extent, window,
-                                  rows, scale, P, out, ld_out, partial, splits, L, pos_add, win);
+                                  rows, scale, P, out, ld_out, partial, splits, L, pos_add, win, q8);
       return;
     case 256:
       dispatch_rel_attention<256>(q, r, kv, rel_bias, sink, ld_sink, gate, ld_gate, nh, nkv, d_rel, rel_extent, window,
-                                  rows, scale, P, out, ld_out, partial, splits, L, pos_add, win);
+                                  rows, scale, P, out, ld_out, partial, splits, L, pos_add, win, q8);
       return;
     default: throw std::runtime_error("rel_attention: unsupported head dim " + std::to_string(hd));
   }

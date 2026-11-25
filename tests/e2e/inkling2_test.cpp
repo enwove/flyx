@@ -3,7 +3,7 @@
 // on self-contained synthetic GGUF models (no PyTorch/assets dependency):
 //   * Looped core (prelude + 3-pass core + postlude), AttnRes, cross-pass loop gates, ShortConv (static + dynamic),
 //     relative-position-bias attention (SWA ring + Global log-scaled), padded->unpadded vocab + softcap,
-//     sparse MoE (SiTU, 3D NVFP4 with per-expert .scale, MXFP4, Q2_0, Q8_0, BF16, mixed-dtype F32 sink_proj).
+//     sparse MoE (SiTU, 3D NVFP4 with per-expert .scale, MXFP4, Q2_0, Q8_0, BF16), and BF16/F32 sinks and taps.
 //   * Gate 2: fusion=0 == fusion=1 bit-identical.
 //   * Gate 3: CUDA == float64 cpu_ref (greedy, seeded sampling with penalties, prefill chunking, rewind, edit).
 //   * Gate 4: Plain == DSpark speculative decoding (greedy & seeded sampling with penalties), CUDA graphs on/off,
@@ -449,14 +449,16 @@ void write_tiny_inkling2(const std::filesystem::path& path, const TinySpec& c, b
     const std::string b = "blk." + std::to_string(i) + ".";
     const bool swa = c.is_swa[size_t(i)];
     const int extent = swa ? c.window : c.rel_extent;
+    // Exercise both the split BF16 companion GEMM and the exact float32 control projection beside Q8 inputs.
+    const uint32_t companion_dt = mixed_quant && i % 3 != 1 ? kGgmlBF16 : kGgmlF32;
     if (swa) {
       add_vec(b + "attn_norm.weight", {uint64_t(c.H)}, 1.f, 0.1f);
     } else {
       add_vec(b + "attn_q_inp_norm.weight", {uint64_t(c.H)}, 1.f, 0.1f);
       add_vec(b + "attn_k_inp_norm.weight", {uint64_t(c.H)}, 1.f, 0.1f);
       add_vec(b + "attn_v_inp_norm.weight", {uint64_t(c.H)}, 1.f, 0.1f);
-      add_mat(b + "attn_k_conv_proj.weight", c.conv * c.nkv, c.H, kGgmlF32, 0.05f);
-      add_mat(b + "attn_v_conv_proj.weight", c.conv * c.nkv, c.H, kGgmlF32, 0.05f);
+      add_mat(b + "attn_k_conv_proj.weight", c.conv * c.nkv, c.H, companion_dt, 0.05f);
+      add_mat(b + "attn_v_conv_proj.weight", c.conv * c.nkv, c.H, companion_dt, 0.05f);
     }
     const uint32_t attn_dt = mixed_quant ? (i % 3 == 0 ? kGgmlQ8_0 : i % 3 == 1 ? kGgmlMXFP4 : kGgmlQ2_0) : kGgmlBF16;
     add_mat(b + "attn_q.weight", q_dim, c.H, attn_dt);
@@ -468,8 +470,7 @@ void write_tiny_inkling2(const std::filesystem::path& path, const TinySpec& c, b
     add_vec(b + "attn_rel_bias.weight", {uint64_t(extent), uint64_t(c.d_rel)}, 0.f, 0.2f);
     add_vec(b + "attn_q_clip.weight", {uint64_t(c.nh), uint64_t(c.hd)}, 1.f, 0.1f);
     add_vec(b + "attn_rel_clip.weight", {uint64_t(c.nh), uint64_t(c.d_rel)}, 1.f, 0.1f);
-    // Keep sink_proj F32 even in mixed_quant (matches real Inkling-2 GGUFs where sink_proj is F32!).
-    add_mat(b + "attn_sink_proj.weight", c.nh, c.H, kGgmlF32, 0.1f);
+    add_mat(b + "attn_sink_proj.weight", c.nh, c.H, companion_dt, 0.1f);
     add_vec(b + "attn_k_conv.weight", {uint64_t(kv_dim), uint64_t(c.conv)}, 0.f, 0.15f);
     add_vec(b + "attn_v_conv.weight", {uint64_t(kv_dim), uint64_t(c.conv)}, 0.f, 0.15f);
     add_vec(b + "attn_post_conv.weight", {uint64_t(c.H), uint64_t(c.conv)}, 0.f, 0.15f);
@@ -603,6 +604,7 @@ void write_tiny_dspark(const std::filesystem::path& path, const TinySpec& c, boo
 
 struct LoadOpts {
   bool speculative = false;
+  bool lookup = false;
   int max_ctx = 512;
   int prefill_chunk = 32;
   int width = 0;
@@ -623,7 +625,8 @@ std::unique_ptr<Engine> load_engine(const std::string& path, const std::string& 
   eo.backend_options = o.backend_opts;
   eo.max_ctx = o.max_ctx;
   eo.prefill_chunk = o.prefill_chunk;
-  eo.lookup = false;
+  eo.lookup = o.lookup;
+  eo.lookup_given = o.lookup;
   eo.speculative = o.speculative;
   eo.drafter = o.speculative ? o.drafter : "none";
   eo.width = o.speculative ? (o.width > 0 ? o.width : 7) : 0;
@@ -667,6 +670,64 @@ std::vector<int32_t> fresh_gen(Engine& e, const std::vector<int32_t>& prompt, in
   std::string err;
   if (!s.init(&err)) throw std::runtime_error("session init: " + err);
   return run_gen(s, prompt, n, sampled);
+}
+
+// Gate 2 on every row of a round: a fused round's producers, each writing what the next GEMM reads, against the
+// generic layers.  All of a four-row round's logits, with its last draft rejected, then the next round's, and the
+// round after a rewind into the accepted ones.
+void test_fused_rounds(const std::filesystem::path& path, const std::string& model,
+                       const std::vector<int32_t>& prompt) {
+  std::vector<int32_t> want;
+  std::vector<float> generic_logits;
+  for (const std::string fusion : {"fusion=0", "fusion=1"}) {
+    const std::string opts = "head_cert=0,blocks=packed," + fusion;
+    auto e = load_engine(path.string(), "cuda", {.speculative = true, .lookup = true, .backend_opts = opts});
+    if (e->lookup_widths().empty() || e->lookup_widths().front() != 3 || e->widths().front() != 0)
+      throw std::runtime_error("missing plain or three-draft test plan");
+    const int vocab = e->model().desc().vocab;
+    if (want.empty()) want = fresh_gen(*e, prompt, 5);
+    if (want.size() != 5) throw std::runtime_error("missing reference continuation");
+
+    Session s(e.get());
+    std::string err;
+    if (!s.init(&err)) throw std::runtime_error("session init: " + err);
+    const auto* api = e->api();
+    const int prefix = int(prompt.size());
+    flyx_gen_params plain{};
+    plain.top_p = 1.f;
+    flyx_round_result r{};
+    if (api->prefill(e->prefill_plan(), s.seq(), prompt.data(), prefix, &plain) || api->read(s.seq(), &r))
+      throw std::runtime_error(api->last_error());
+    bool matches = r.n_tokens == 1 && r.tokens[0] == want[0];
+    std::vector<float> logits;
+    auto round = [&](flyx_plan* p, const flyx_gen_params& g, int rows) {
+      if (api->launch(p, s.seq(), &g) || api->read(s.seq(), &r)) throw std::runtime_error(api->last_error());
+      for (int row = 0; row < rows; ++row) {
+        const size_t at = logits.size();
+        logits.resize(at + vocab);
+        if (api->logits(s.seq(), row, logits.data() + at)) throw std::runtime_error(api->last_error());
+      }
+    };
+
+    // Force rejection of only the last draft, then read the history folded from the three accepted inputs.
+    const int32_t drafts[] = {want[1], want[2], (want[3] + 1) % vocab};
+    flyx_gen_params given = plain;
+    given.drafts = drafts;
+    given.n_drafts = 3;
+    given.drafts_at = prefix + 1;
+    round(e->lookup_plan(0), given, 4);
+    matches = matches && r.n_accepted == 2 && r.n_tokens == 3 && std::equal(r.tokens, r.tokens + 3, want.begin() + 1);
+    round(e->round_plan(0), plain, 1);
+    matches = matches && r.n_tokens == 1 && r.tokens[0] == want[4];
+    if (api->rewind(s.seq(), prefix + 1, want[1]) != 1) throw std::runtime_error("rewinding inside the round");
+    round(e->round_plan(0), plain, 1);
+    matches = matches && r.n_tokens == 1 && r.tokens[0] == want[2] &&
+              std::memcmp(logits.data() + vocab, logits.data() + 5 * vocab, vocab * sizeof(float)) == 0;
+    if (fusion == "fusion=0") generic_logits = logits;
+    check(matches && std::memcmp(logits.data(), generic_logits.data(), logits.size() * sizeof(float)) == 0,
+          model + ": a four-row round, the round after it and the one after a rewind give the generic layers' "
+                  "logits (" + fusion + ")");
+  }
 }
 
 // Device bytes the backend's model holds (weights and the copies made of them).
@@ -1018,6 +1079,7 @@ int main(int argc, char** argv) {
     }
 
     if (backend == "cuda") {
+      test_fused_rounds(mixed_gguf, "mixed weights", prompt);
       {
         auto held = [&](RoundMatrixCase round_case, const char* filename) {
           const auto path = dir / filename;
@@ -1194,11 +1256,12 @@ int main(int argc, char** argv) {
                   " paired batches) == fresh");
       }
 
-      // ---- 4. Mixed quantization GGUF (NVFP4 + MXFP4 + Q2_0 + Q8_0 + F32 sink_proj + Q8 DSpark) ----
-      std::printf("Inkling-2 mixed-quant target (NVFP4 + MXFP4 + Q2_0 + Q8_0 + F32 sink_proj)\n");
+      // ---- 4. Mixed quantization GGUF with BF16 and F32 sinks/taps, plus Q8 DSpark ----
+      std::printf("Inkling-2 mixed-quant target (NVFP4 + MXFP4 + Q2_0 + Q8_0 + BF16/F32 sinks and taps)\n");
       auto ref_mix = load_engine(mixed_gguf.string(), "cpu_ref");
-      auto cu_mix = load_engine(mixed_gguf.string(), "cuda", {.prefill_chunk = 32});
-      auto cu_mix_unfused = load_engine(mixed_gguf.string(), "cuda", {.prefill_chunk = 32, .backend_opts = "fusion=0"});
+      auto cu_mix = load_engine(mixed_gguf.string(), "cuda", {.prefill_chunk = 32, .backend_opts = "head_cert=0"});
+      auto cu_mix_unfused = load_engine(mixed_gguf.string(), "cuda",
+                                       {.prefill_chunk = 32, .backend_opts = "fusion=0,head_cert=0"});
       auto cu_mix_dspark = load_engine(mixed_gguf.string(), "cuda",
                                        {.speculative = true,
                                         .prefill_chunk = 32,
@@ -1207,10 +1270,20 @@ int main(int argc, char** argv) {
       const auto ref_mix_tok = fresh_gen(*ref_mix, prompt, 16, false);
       const int tf_agree = teacher_forced_matches(*cu_mix, prompt, ref_mix_tok);
       check(tf_agree >= 15, "mixed-quant cuda teacher-forced vs cpu_ref (" + std::to_string(tf_agree) + "/16)");
-      const auto cu_mix_greedy = fresh_gen(*cu_mix, prompt, 24, false);
+      std::vector<int32_t> cu_mix_greedy;
+      {
+        Session fused(cu_mix.get()), generic(cu_mix_unfused.get());
+        std::string err;
+        if (!fused.init(&err) || !generic.init(&err)) throw std::runtime_error("session init: " + err);
+        cu_mix_greedy = run_gen(fused, prompt, 24);
+        check(same_tokens(run_gen(generic, prompt, 24), cu_mix_greedy), "mixed-quant Gate 2: fusion=0 == fusion=1");
+        std::vector<float> a(spec.vocab_unpadded), b(spec.vocab_unpadded);
+        check(cu_mix->api()->logits(fused.seq(), 0, a.data()) == 0 &&
+                  cu_mix_unfused->api()->logits(generic.seq(), 0, b.data()) == 0 &&
+                  std::memcmp(a.data(), b.data(), a.size() * sizeof(float)) == 0,
+              "mixed-quant Gate 2: identical final round logits with BF16 and F32 sinks and taps");
+      }
       const auto cu_mix_sampled = fresh_gen(*cu_mix, prompt, 24, true);
-      check(same_tokens(fresh_gen(*cu_mix_unfused, prompt, 24, false), cu_mix_greedy),
-            "mixed-quant Gate 2: fusion=0 == fusion=1");
       check(same_tokens(fresh_gen(*cu_mix_dspark, prompt, 24, false), cu_mix_greedy),
             "mixed-quant Gate 4: Q8 DSpark greedy == cuda plain");
       check(same_tokens(fresh_gen(*cu_mix_dspark, prompt, 24, true), cu_mix_sampled),

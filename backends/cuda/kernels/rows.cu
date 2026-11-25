@@ -78,7 +78,15 @@ __device__ __forceinline__ float rms_inv_spread(const float* xr, int n, float ep
   return rsqrtf(block512_sum(ss) / n + eps);
 }
 
-__device__ __forceinline__ float rms_value(float x, float inv, float offset, float w) { return x * inv * (offset + w); }
+// RoundProduct: the product rounded to float32 whatever the kernel takes from it next.  One that goes on to split the
+// value into bf16 parts could otherwise fuse this product with the first part's subtraction, and the generic layer
+// splits the float32 value it stored (numerics.md, rule 2).
+template <bool RoundProduct = false>
+__device__ __forceinline__ float rms_value(float x, float inv, float offset, float w) {
+  const float unit = x * inv, gain = offset + w;
+  if constexpr (RoundProduct) return __fmul_rn(unit, gain);
+  else return unit * gain;
+}
 
 template <class TIn = float>
 __global__ void __launch_bounds__(512, 2) k_rmsnorm(const TIn* x, int ldx, const float* w, float offset, float eps,
@@ -110,6 +118,11 @@ __global__ void __launch_bounds__(512, 2) k_rmsnorm(const TIn* x, int ldx, const
 // row's 1 / rms as k_rmsnorm does, then each of its 16 warps writes one group of 32 values, so a round's one row is
 // spread over the GPU (one block a row ran the 27B's 160 groups one after another: 5.4 us against 2.3).  A prefill
 // pass's rows fill the GPU anyway, and there every block would read its row again: k_rmsnorm writes them.
+// ALSO: what the same launch writes of the same values for a second reader of the row, which a kernel of its own
+// staged from a float32 row before.  Split: the three bf16 parts a bf16 GEMM reads (an attention block's sink or
+// dynamic-tap projection beside its packed ones).
+enum class Q8Also { None, Split };
+template <Q8Also ALSO>
 __global__ void __launch_bounds__(512) k_rmsnorm_q8(const float* x, int ldx, const float* w, float offset, float eps,
                                                     Out o, int n) {
   pdl_trigger();
@@ -119,7 +132,14 @@ __global__ void __launch_bounds__(512) k_rmsnorm_q8(const float* x, int ldx, con
   const float wi = i < n ? w[i] : 0.f;
   float xi = 0.f;
   const float inv = rms_inv_spread(xr, n, eps, int(blockIdx.y), i, &xi);
-  if (i < n) put_q8(o, blockIdx.x, grp, rms_value(xi, inv, offset, wi));
+  if (i < n) {
+    const float v = rms_value<ALSO == Q8Also::Split>(xi, inv, offset, wi);
+    put_q8(o, blockIdx.x, grp, v);
+    if constexpr (ALSO == Q8Also::Split) {
+      const size_t at = size_t(blockIdx.x) * n + i;
+      put(o, at, at, v);
+    }
+  }
 }
 
 // The same spread for a round's few rows in any other form (float32, or bf16 parts for the skinny GEMMs): grid (rows,
@@ -227,11 +247,24 @@ void rmsnorm(const float* x, int ldx, const float* w, float offset, float eps, f
 void rmsnorm_split(const float* x, int ldx, const float* w, float offset, float eps, int rows, int n,
                    const Launch& L, bool q8) {
   if (q8 && rows <= 16)
-    k_rmsnorm_q8<<<dim3(rows, ceil_div(n, 512)), 512, 0, L.st>>>(x, ldx, w, offset, eps, split_out(L, rows, n, true), n);
+    k_rmsnorm_q8<Q8Also::None><<<dim3(rows, ceil_div(n, 512)), 512, 0, L.st>>>(x, ldx, w, offset, eps,
+                                                                               split_out(L, rows, n, true), n);
   else if (rows <= 16)
     k_rmsnorm_spread<<<dim3(rows, ceil_div(n, 512)), 512, 0, L.st>>>(x, ldx, w, offset, eps,
                                                                       split_out(L, rows, n, false), n, n);
   else k_rmsnorm<<<rows, 512, 0, L.st>>>(x, ldx, w, offset, eps, split_out(L, rows, n, q8), n, n);
+}
+
+void rmsnorm_q8_split(const float* x, int ldx, const float* w, float offset, float eps, int rows, int n,
+                      const Launch& L) {
+  if (rows < 1 || rows > 16 || n <= 0 || n % 32)
+    throw std::runtime_error("rmsnorm_q8_split: expected 1..16 rows of complete Q8 groups");
+  Out o = split_out(L, rows, n, true);
+  const Out parts = split_out(L, rows, n);
+  o.hi = parts.hi;
+  o.mid = parts.mid;
+  o.lo = parts.lo;
+  k_rmsnorm_q8<Q8Also::Split><<<dim3(rows, ceil_div(n, 512)), 512, 0, L.st>>>(x, ldx, w, offset, eps, o, n);
 }
 
 void embed(const int* tokens, const bf16* E, int H, float* x, int rows, cudaStream_t st) {

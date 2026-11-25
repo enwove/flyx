@@ -613,8 +613,56 @@ void test_inkling2_shortconv() {
   }
 }
 
+namespace {
+// A single visible key with zero logits and gate gives V/4 exactly. Binary16 cache values can therefore
+// exercise Q8 rounding ties without moving across a tie because the float64 attention accumulated differently.
+void test_inkling2_rel_q8() {
+  constexpr int rows = 5, nh = 9, nkv = 3, hd = 128, K = nh * hd, splits = 16;
+  seed("inkling2_rel_q8");
+  Vec v = randv(size_t(rows) * nkv * hd, 10.0), zero(size_t(rows) * K);
+  for (size_t i = 0; i < v.size(); i += 32) {
+    if ((i / 32) % 4 == 0) {
+      std::fill_n(v.data() + i, 32, 0.0);
+    } else {
+      v[i] = 127.0;
+      v[i + 1] = 62.5;
+      v[i + 2] = -63.5;
+    }
+  }
+  round_f16(v);
+  Vec want(size_t(rows) * K);
+  for (int r = 0; r < rows; ++r) {
+    for (int h = 0; h < nh; ++h) {
+      double* head = want.data() + size_t(r) * K + h * hd;
+      ops::attend_rel(zero.data(), zero.data(), zero.data(), v.data(), zero.data(), 0.0, r, 1, nkv, hd, 1, 1,
+                      h / (nh / nkv), 1.0 / std::sqrt(double(hd)), head);
+      for (int i = 0; i < hd; ++i) head[i] *= ops::sigmoid(0.0);
+    }
+  }
+  const Q8Rows ref = reference_round_q8(want, K);  // 36 groups in each row, including a short final span
+  KvRef kv{dev<kv16>(v.size()), up_f16(v)};
+  float* d_zero = dev<float>(zero.size());
+  float* part = dev<float>(attention_partial_floats(rows, nh, hd, splits));
+  DevParams* P = params(0);
+  CK(cudaMemset(TL.scratch->q8, 0x80, ref.q.size()));
+  CK(cudaMemset(TL.scratch->q8_scale, 0xff, ref.d.size() * sizeof(float)));
+  CK(cudaMemset(TL.scratch->q8_sums, 0xff, ref.sums.size() * sizeof(float)));
+  rel_attention(d_zero, d_zero, kv, d_zero, d_zero, nh, d_zero, K, nh, nkv, hd, 1, 1, 1, rows, P, nullptr, K,
+                part, splits, TL, 0, {}, true);
+  const bool same = q8_rows(rows, K) == ref;
+  std::printf("  %-4s rel_attention Q8 codes, scales and sums vs float64\n", same ? "ok" : "FAIL");
+  g_fail += !same;
+  cudaFree(kv.k);
+  cudaFree(kv.v);
+  cudaFree(d_zero);
+  cudaFree(part);
+  cudaFree(P);
+}
+}  // namespace
+
 void test_inkling2_rel_attn() {
   std::printf("inkling2 rel_attn_prep + rel_attention\n");
+  test_inkling2_rel_q8();
   struct Case {
     const char* name;
     int nh, nkv, hd, d_rel, rel_extent, window, ring, ctx, rows;
@@ -622,6 +670,7 @@ void test_inkling2_rel_attn() {
   };
   const Case cases[] = {
       {"swa ring f16 hd128 R=9", 8, 2, 128, 16, 16, 16, 64, 90, 9, false},
+      {"global fp8 hd128 R=1", 24, 8, 128, 16, 64, 0, 0, 129, 1, true},
       {"swa ring f16 hd128 R=37", 12, 4, 128, 16, 32, 32, 96, 110, 37, false},
       {"global f16 hd128 R=37", 8, 2, 128, 16, 128, 0, 0, 50, 37, false},
       {"global fp8 hd128 R=37", 12, 4, 128, 16, 128, 0, 0, 50, 37, true},
@@ -775,6 +824,37 @@ void test_inkling2_rel_attn() {
     const bool is_flash = c.rows > FLYX_MAX_ROWS;
     expect(std::string("rel_attn ") + c.name, got_o, want_o, is_flash ? (c.fp8 ? 3e-3 : 2e-3) : (c.fp8 ? 5e-4 : 3e-5));
 
+    Q8Rows fused_q8;
+    if (c.rows <= FLYX_MAX_ROWS) {
+      rel_attention(d_qout, d_rout, kv, d_rb, d_sink, c.nh, d_gate, q_dim, c.nh, c.nkv, c.hd, c.d_rel, c.rel_extent,
+                    c.window, c.rows, P, nullptr, q_dim, d_part, splits, TL, 0, {}, true);
+      fused_q8 = q8_rows(c.rows, q_dim);
+      blocks_stage(d_out, q_dim, q_dim, c.rows, TL, true);
+      const bool same = fused_q8 == q8_rows(c.rows, q_dim);
+      std::printf("  %-4s rel_attention Q8 vs float32 + blocks_stage (%s)\n", same ? "ok" : "FAIL", c.name);
+      g_fail += !same;
+    }
+    // The same from the per-head kernels, which take a round's rows four at a time: nine rows end in a tile of one.
+    if (c.rows > 1 && c.rows <= FLYX_MAX_ROWS && !c.fp8) {
+      KernelOptions per_head{};
+      per_head.attention = kAttnPerHead;
+      Launch Lp = TL;
+      Lp.opt = &per_head;
+      float* d_op = dev<float>(size_t(c.rows) * q_dim);
+      auto attend = [&](float* out, bool q8) {
+        rel_attention(d_qout, d_rout, kv, d_rb, d_sink, c.nh, d_gate, q_dim, c.nh, c.nkv, c.hd, c.d_rel, c.rel_extent,
+                      c.window, c.rows, P, out, q_dim, d_part, splits, Lp, 0, {}, q8);
+      };
+      attend(nullptr, true);
+      const Q8Rows q8 = q8_rows(c.rows, q_dim);
+      attend(d_op, false);
+      blocks_stage(d_op, q_dim, q_dim, c.rows, TL, true);
+      const bool same = q8 == q8_rows(c.rows, q_dim);
+      std::printf("  %-4s rel_attention per head: Q8 vs float32 + blocks_stage (%s)\n", same ? "ok" : "FAIL", c.name);
+      g_fail += !same;
+      cudaFree(d_op);
+    }
+
     // When rows > FLYX_MAX_ROWS, also verify exact float32 kAttnSplit path (GQA + per-head) and R=1 bit-identity.
     if (is_flash) {
       KernelOptions kopt{};
@@ -804,12 +884,23 @@ void test_inkling2_rel_attn() {
       for (int rr : {0, c.rows - 1}) {
         DevParams* P1 = params(c.ctx + rr, 0);
         float* d_o1 = dev<float>(size_t(q_dim));
-        rel_attention(d_qout + size_t(rr) * q_dim, d_rout + size_t(rr) * c.nh * c.d_rel, kv, d_rb,
-                      d_sink + size_t(rr) * c.nh, c.nh, d_gate + size_t(rr) * q_dim, q_dim, c.nh, c.nkv, c.hd, c.d_rel,
-                      c.rel_extent, c.window, 1, P1, d_o1, q_dim, d_part, splits, TL);
+        auto single_row = [&](float* out, bool q8) {
+          rel_attention(d_qout + size_t(rr) * q_dim, d_rout + size_t(rr) * c.nh * c.d_rel, kv, d_rb,
+                        d_sink + size_t(rr) * c.nh, c.nh, d_gate + size_t(rr) * q_dim, q_dim, c.nh, c.nkv, c.hd,
+                        c.d_rel, c.rel_extent, c.window, 1, P1, out, q_dim, d_part, splits, TL, 0, {}, q8);
+        };
+        single_row(d_o1, false);
         Vec got_1 = down(d_o1, size_t(q_dim));
         Vec got_rr(got_o.begin() + ptrdiff_t(rr) * q_dim, got_o.begin() + ptrdiff_t(rr + 1) * q_dim);
         expect_bits(std::string("rel_attn R=1 vs multi r=") + std::to_string(rr) + " " + c.name, got_1, got_rr);
+        single_row(nullptr, true);
+        const Q8Rows one = q8_rows(1, q_dim);
+        auto same_row = [rr](const auto& single, const auto& batch) {
+          return std::memcmp(single.data(), batch.data() + rr * single.size(), single.size() * sizeof(single[0])) == 0;
+        };
+        const bool same = same_row(one.q, fused_q8.q) && same_row(one.d, fused_q8.d) && same_row(one.sums, fused_q8.sums);
+        std::printf("  %-4s rel_attention Q8 R=1 vs row %d (%s)\n", same ? "ok" : "FAIL", rr, c.name);
+        g_fail += !same;
         cudaFree(P1);
         cudaFree(d_o1);
       }
