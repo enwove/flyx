@@ -103,15 +103,16 @@ int main(int argc, char** argv) {
       check(f2.open(model, &err) && !f2.add(tmp.string(), &err) && err.find("nest") != std::string::npos,
             "deeply nested drafter config.json is rejected cleanly: " + err);
     }
-    // z-lab layout with a post-final-norm tap (target_layer_ids containing num_target_layers) keeps it at
-    // num_target_layers instead of turning it into num_target_layers + 1, and forwards optional softcap config.
+    // A config whose target_layer_ids reach num_target_layers counts the target's hidden states (Inco's drafter for
+    // Inkling-2): its ids are the taps as they are, the last the final norm's output; the selector's soft cap and its
+    // mode come along.
     fs::remove_all(tmp, ec);
     fs::copy(fs::path(dir) / "hf_draft_zlab", tmp, fs::copy_options::recursive, ec);
     {
       std::ifstream in(tmp / "config.json");
       auto cfg = nlohmann::json::parse(in);
       const int n_target = cfg.at("num_target_layers").get<int>();
-      cfg["dflash_config"]["target_layer_ids"] = {0, 2, n_target};
+      cfg["dflash_config"]["target_layer_ids"] = {1, 2, n_target};
       cfg["dflash_config"]["final_logit_softcapping"] = 30.0;
       cfg["dflash_config"]["selector_softcap_mode"] = "after_correction";
       std::ofstream out(tmp / "config.json", std::ios::binary | std::ios::trunc);
@@ -124,9 +125,10 @@ int main(int argc, char** argv) {
       const auto draft = ok ? f3.header()["companions"][0]["draft"] : nlohmann::json::object();
       const auto taps = ok ? draft["taps"].get<std::vector<int>>() : std::vector<int>{};
       const int n_target = ok ? draft["target"]["layers"].get<int>() : -1;
-      check(ok && taps == std::vector<int>({1, 3, n_target}) && draft.value("softcap", 0.0) == 30.0 &&
+      check(ok && taps == std::vector<int>({1, 2, n_target}) && draft.value("softcap", 0.0) == 30.0 &&
                 draft.value("softcap_mode", "") == "after_correction",
-            "target_layer_ids == num_target_layers stays unclamped and forwards softcap/mode: " + err);
+            "target_layer_ids that reach num_target_layers are the taps as they are, with the soft cap and its mode: " +
+                err);
     }
     fs::remove_all(tmp, ec);
   }

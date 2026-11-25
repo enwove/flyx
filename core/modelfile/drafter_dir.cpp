@@ -3,6 +3,7 @@
 // into what python/convert/flyx_convert makes of it as a drafter file (--draft alone): the same "draft" description
 // (canonical_draft_config with no target) and the same tensors under the same names, their bytes read in place.
 #include <algorithm>
+#include <cmath>
 #include <cstring>
 #include <filesystem>
 #include <fstream>
@@ -43,15 +44,16 @@ json draft_config(const json& sc) {
     if (std::find(archs.begin(), archs.end(), "DFlash2DraftModel") == archs.end())
       throw std::runtime_error("drafter architectures " + archs.dump() + ": DFlash2DraftModel is supported");
     dc = sc.at("dflash_config"), tl = sc;
-    const int64_t n_target_layers = sc.contains("num_target_layers") && sc["num_target_layers"].is_number_integer()
-                                        ? sc["num_target_layers"].get<int64_t>()
-                                        : -1;
-    for (const auto& i : dc.at("target_layer_ids")) {
-      const int64_t v = i.get<int64_t>();
-      // 0-based layer output i in [0, num_target_layers) becomes 1-based i + 1; an index equal to
-      // num_target_layers represents a post-final-norm capture and stays at num_target_layers.
-      taps.push_back(n_target_layers > 0 && v == n_target_layers ? v : v + 1);
-    }
+    // target_layer_ids name the layers whose outputs the drafter reads (hidden_states[id + 1] in z-lab's code), so
+    // every id is below the target's layer count.  A list that reaches num_target_layers counts the hidden states
+    // themselves instead (0 the embedding, the last the final norm's output): Inco's drafter for Inkling-2, whose
+    // ids [5, 23, 41, 48] of 48 visits its reference hands, as they are, to the capture DSpark's ids go to.
+    std::vector<int64_t> ids;
+    for (const auto& i : dc.at("target_layer_ids")) ids.push_back(i.get<int64_t>());
+    const json n_target = sc.value("num_target_layers", json());
+    const bool hidden_states =
+        n_target.is_number_integer() && std::find(ids.begin(), ids.end(), n_target.get<int64_t>()) != ids.end();
+    for (int64_t id : ids) taps.push_back(hidden_states ? id : id + 1);
     vocab = tl.at("vocab_size").get<int64_t>(), target_hidden = tl.at("hidden_size").get<int64_t>();
     causal = sc.value("is_causal", json());
   } else {
