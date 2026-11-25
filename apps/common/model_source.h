@@ -13,12 +13,13 @@
 
 #include "core/exec/engine.h"
 #include "core/hub/hub.h"
+#include "core/modelfile/modelfile.h"
 
 namespace flyx::apps {
 
 // A drafter that goes with a model, or one published for it.
 struct DrafterSource {
-  std::string kind;            // "mtp" or "dflash2"
+  std::string kind;            // "mtp", "dflash2" or "dspark" (drafter_kind)
   std::string from;            // "model file" (its own MTP layer), a Hub name or file of a repository, or a path
   std::optional<uint64_t> size;  // bytes on disk; none where only the Hub could tell (or inside the model's file)
 };
@@ -58,6 +59,16 @@ bool fetch_named(std::string* model, EngineOptions* eo, std::string* err);
 // Local paths recognize those extensions in any case; Hub model IDs keep their published spelling.
 std::string model_name_of(const std::string& path, bool local = true);
 
+// What kind of drafter ("mtp", "dflash2" or "dspark") a file or directory given beside a model holds: what its GGUF
+// header says where it has one (`header`: one read already), else what its name suggests; a directory of config and
+// safetensors and a .flyx drafter file hold a DFlash2 drafter.
+std::string drafter_kind(const std::string& path);
+std::string drafter_kind(const std::string& path, const flyx::GgufPeek& header);
+
+// Whether this build reads a vision projector beside a model of this architecture (interfaces::vision_architectures);
+// "" (the architecture is not known yet): not ruled out.
+bool reads_vision(const std::string& arch);
+
 // The MTP layers a GGUF says it holds (<arch>.nextn_predict_layers), read from its header alone: the metadata, never
 // the tensors.  -1: not a GGUF, or not readable.
 int gguf_mtp_layers(const std::string& path);
@@ -65,11 +76,12 @@ int gguf_mtp_layers(const std::string& path);
 // Model files in directories of the user's own (flyx serve --models-dir, FLYX_MODELS_DIR), found by name: *.gguf
 // (not projectors, importance matrices or MTP layers; complete split GGUFs grouped as one entry pointing to shard 1
 // with their summed size) and *.flyx,
-// at most 6 directories down, hidden directories and node_modules left out.  No file is opened.
+// at most 6 directories down, hidden directories and node_modules left out.  Of a GGUF whose name suggests a drafter
+// the header is read (a DFlash2 or DSpark drafter says what it is there alone); no other file is opened.
 struct LocalModel {
   std::string path;   // absolute
   std::string file;   // its name
-  std::string kind;   // "gguf", "flyx", or "mmproj"
+  std::string kind;   // "gguf", "flyx", "mmproj" or "drafter"
   std::string quant;  // from the name, "" when it names none
   uint64_t size = 0;
   int parts = 0;  // > 1 for a complete split GGUF (path points to shard 1, size is the sum)

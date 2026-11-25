@@ -100,18 +100,6 @@ flyx::GgufPeek gguf_info(const std::string& path, uint64_t size, fs::file_time_t
   return peek;
 }
 
-const char* drafter_kind_of(const flyx::GgufPeek& pk, const std::string& path) {
-  if (pk.valid) {
-    if (pk.arch == "dflash") return pk.has_markov_context ? "dspark" : "dflash2";
-    if (pk.mtp_layers > 0) return "mtp";
-  }
-  std::string low = path;
-  for (char& c : low) c = char(std::tolower(static_cast<unsigned char>(c)));
-  if (low.find("dspark") != std::string::npos) return "dspark";
-  if (low.find("dflash") != std::string::npos || !low.ends_with(".gguf")) return "dflash2";
-  return "mtp";
-}
-
 // One model of GET /v1/hub/cached, and what deleting it takes.
 struct Listed {
   ojson json;
@@ -134,16 +122,10 @@ Listed dir_entry(const apps::LocalModel& m) {
             {"file", m.file}, {"path", m.path}, {"size", m.size}, {"modified", apps::modified_unix(m.modified)},
             {"revision", nullptr}, {"current", true},
             {"mtp", gguf && pk.valid && pk.mtp_layers > 0 ? ojson("in-file") : ojson(nullptr)}};
-  if (kind == "drafter") l.json["drafter_kind"] = drafter_kind_of(pk, m.path);
+  if (kind == "drafter") l.json["drafter_kind"] = apps::drafter_kind(m.path, pk);
   if (m.parts > 1) l.json["parts"] = m.parts;
   l.on_disk = {m.path};
   return l;
-}
-
-bool supports_vision_arch(const std::string& arch) {
-  if (arch.empty()) return true;
-  const std::vector<std::string> vis = interfaces::vision_architectures();
-  return std::find(vis.begin(), vis.end(), arch) != vis.end();
 }
 
 // What GET /v1/hub/cached lists: the cache's snapshots, refs/main's first, a file under one path once (refs/main's
@@ -178,7 +160,7 @@ std::vector<Listed> listing(const Server& s) {
         const flyx::GgufPeek pk = peek ? *peek : gguf_info(disk, size, modified);
         if (pk.valid && pk.mtp_layers > 0) mtp = "in-file";
         else if (repos_with_mtp.count(c.repo)) mtp = "in-repo";
-        if (pk.valid) vision_ok = supports_vision_arch(pk.arch);
+        if (pk.valid) vision_ok = apps::reads_vision(pk.arch);
       }
       l.json = {{"name", name + suffix}, {"kind", kind}, {"source", "hub"}, {"repo", c.repo}, {"quant", or_null(quant)},
                 {"file", file}, {"path", disk}, {"size", size}, {"modified", apps::modified_unix(modified)},
@@ -187,7 +169,7 @@ std::vector<Listed> listing(const Server& s) {
                                ? ojson("in-repo")
                                : ojson(nullptr)}};
       if (std::string(kind) == "drafter")
-        l.json["drafter_kind"] = peek ? drafter_kind_of(*peek, disk) : "dflash2";
+        l.json["drafter_kind"] = peek ? apps::drafter_kind(disk, *peek) : std::string("dflash2");
       return l;
     };
     const std::vector<hub::GgufChoice> ggufs = hub::gguf_choices(r);
@@ -317,7 +299,7 @@ ojson repo_json(const hub::Repo& r) {
     }
   }
   const bool dflash_gguf_repo = repo_arch == "dflash";
-  const bool repo_vision = supports_vision_arch(repo_arch);
+  const bool repo_vision = apps::reads_vision(repo_arch);
   ojson ggufs = ojson::array();
   ojson companions = ojson::array();
   std::set<std::string> comp_paths;
@@ -344,7 +326,7 @@ ojson repo_json(const hub::Repo& r) {
             from_path((to_path(hub::snapshot_dir(r)) / to_path(choices[idx].file.path)).make_preferred());
         std::error_code ec;
         const auto modified = fs::last_write_time(to_path(disk), ec);
-        dkind = drafter_kind_of(gguf_info(disk, choices[idx].total_size, modified), disk);
+        dkind = apps::drafter_kind(disk, gguf_info(disk, choices[idx].total_size, modified));
       }
       push_comp(choices[idx].file, dkind, idx == 0);
     }
