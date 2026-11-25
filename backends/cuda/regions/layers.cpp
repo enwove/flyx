@@ -223,6 +223,37 @@ void draft_block(flyx_seq* s, const DFlashBlock& b, int width, const Launch& L, 
                   s->drafts, st);
 }
 
+// One MTP draft step's attention for one sequence, the step's row at P->position + pos_offset: its key and value
+// written, then attention over what the sequence keeps of the cache (its low-bit copy, its gathered window, or all
+// of it).  out null: the result stays in the split scratch for a fused output projection (gemm_presplit).
+void mtp_draft_attention(flyx_seq* s, const AttnBlock& a, const KvBuf& kv, int pos_offset, const float* proj,
+                         int ld_proj, float* q, float* out, float* part, const Launch& L) {
+  const int nh = a.nh, nkv = a.nkv, hd = a.hd;
+  const float* gate = a.gate ? proj + a.nh * a.hd : nullptr;
+  attn_prep(proj, ld_proj, 0, a.q_width(), a.q_width() + nkv * hd, a.q_norm.w, a.k_norm.w, a.q_norm.offset,
+            a.q_norm.eps, a.theta, a.rot, nh, nkv, hd, 1, s->P, kPosPosition, false, q, kv.ref(), L.st, pos_offset,
+            nullptr, 0, CanvasKeys{}, a.mrope());
+  s->stage_before(kv, pos_offset, 1, L.st);
+  if (kv.kq) {  // its copy of every position, the last ones exact
+    params_at(s->P, s->P_window, pos_offset, L.st);
+    attention_strata(q, kv.ref(), s->mtp_strata, nh, nkv, hd, 1, 1.f / std::sqrt(float(hd)), s->P_window, gate,
+                     ld_proj, out, nh * hd, part, kRoundSplits, L, 0, nullptr, s->P);
+  } else if (kv.window > 0) {  // its last positions, gathered
+    kv_window(kv.ref(), s->mtp_window, nkv, hd, kv.window, s->P, s->P_window, pos_offset, L.st);
+    // Not a programmatic dependent: the attention kernels read a row's position before they wait for the kernel
+    // before, and that kernel (kv_window) wrote it.
+    KernelOptions in_order = *L.opt;
+    in_order.pdl = false;
+    Launch after = L;
+    after.opt = &in_order;
+    attention(q, s->mtp_window, nh, nkv, hd, 1, true, 0, 1.f / std::sqrt(float(hd)), s->P_window, gate, ld_proj,
+              out, nh * hd, part, kRoundSplits, after, pos_offset);
+  } else {
+    attention(q, kv.staged(), nh, nkv, hd, 1, true, 0, 1.f / std::sqrt(float(hd)), s->P, gate, ld_proj, out, nh * hd,
+              part, kRoundSplits, L, pos_offset);
+  }
+}
+
 // MTP: one layer from (target hidden, next token) pairs, see python/reference/flyx_ref/mtp.py.
 // Draft step i runs at position P->position - 1 + i.
 void mtp_draft(flyx_seq* s, const MtpBlock& b, int width, const Launch& L, bool fused, int start) {
@@ -233,8 +264,7 @@ void mtp_draft(flyx_seq* s, const MtpBlock& b, int width, const Launch& L, bool 
   const auto& f = block<MlpBlock>(m, b.mlp);
   const KvBuf& kv = s->kv[size_t(a.kv)];
   const RowBufs& own = s->own;
-  const int H = a.hidden, nh = a.nh, nkv = a.nkv, hd = a.hd;
-  const float* gate = a.gate ? own.proj + nh * hd : nullptr;
+  const int H = a.hidden, nh = a.nh, hd = a.hd;
   const bool split_o = fused && !a.w_out.q8_inputs() && (nh * hd) % 64 == 0;
   cudaStream_t st = L.st;
   if (start == 0) build_rows(s->P, nullptr, 0, s->mtok, 1, st);  // mtok[0] = anchor
@@ -244,29 +274,7 @@ void mtp_draft(flyx_seq* s, const MtpBlock& b, int width, const Launch& L, bool 
                b.norm_emb.w, b.norm_hidden.w, b.norm_emb.offset, b.norm_emb.eps, H, 1, own.mcat, st);
     gemm(own.mcat, 2 * H, b.fc, H, 2 * H, own.mx, H, 1, false, L);
     norm_project(own.mx, own.h, own.proj, s->ld_proj, 1, a.norm, a.w_in, a.n_in(), H, L, fused);
-    attn_prep(own.proj, s->ld_proj, 0, a.q_width(), a.q_width() + nkv * hd, a.q_norm.w, a.k_norm.w, a.q_norm.offset,
-              a.q_norm.eps, a.theta, a.rot, nh, nkv, hd, 1, s->P, kPosPosition, false, own.qbuf, kv.ref(), st, i - 1,
-              nullptr, 0, CanvasKeys{}, a.mrope());
-    s->stage_before(kv, i - 1, 1, st);
-    if (kv.kq) {  // its copy of every position, the last ones exact
-      params_at(s->P, s->P_window, i - 1, st);
-      attention_strata(own.qbuf, kv.ref(), s->mtp_strata, nh, nkv, hd, 1, 1.f / std::sqrt(float(hd)), s->P_window,
-                       gate, s->ld_proj, split_o ? nullptr : own.act, nh * hd, own.part, kRoundSplits, L, 0, nullptr,
-                       s->P);
-    } else if (kv.window > 0) {  // its last positions, gathered
-      kv_window(kv.ref(), s->mtp_window, nkv, hd, kv.window, s->P, s->P_window, i - 1, st);
-      // Not a programmatic dependent: the attention kernels read a row's position before they wait for the kernel
-      // before, and that kernel (kv_window) wrote it.
-      KernelOptions in_order = *L.opt;
-      in_order.pdl = false;
-      Launch after = L;
-      after.opt = &in_order;
-      attention(own.qbuf, s->mtp_window, nh, nkv, hd, 1, true, 0, 1.f / std::sqrt(float(hd)), s->P_window, gate,
-                s->ld_proj, split_o ? nullptr : own.act, nh * hd, own.part, kRoundSplits, after, i - 1);
-    } else {
-      attention(own.qbuf, kv.staged(), nh, nkv, hd, 1, true, 0, 1.f / std::sqrt(float(hd)), s->P, gate, s->ld_proj,
-                split_o ? nullptr : own.act, nh * hd, own.part, kRoundSplits, L, i - 1);
-    }
+    mtp_draft_attention(s, a, kv, i - 1, own.proj, s->ld_proj, own.qbuf, split_o ? nullptr : own.act, own.part, L);
     if (split_o) gemm_presplit(a.w_out, H, nh * hd, own.mx, H, 1, true, L);
     else gemm(own.act, nh * hd, a.w_out, H, nh * hd, own.mx, H, 1, true, L);
     mlp_body(own.mx, f, 1, own.h, own.proj, s->ld_proj, own.act, s->ld_act, L, fused);

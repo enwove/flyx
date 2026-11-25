@@ -180,6 +180,35 @@ RowView rows_of(flyx_seq* s, RowBufs* bufs) {
   return v;
 }
 
+// The model's buffers for a multimodal pass's inputs, grown to hold embed_rows embedding rows with their row
+// indices and position_rows rows of 3-D positions (two sets of three); 0 leaves a buffer as it is.  Under
+// prefill_mu.
+void reserve_prefill_inputs(flyx_bmodel* m, size_t embed_rows, size_t position_rows) {
+  const size_t need_e = embed_rows * size_t(m->hidden);
+  if (need_e > m->prefill_embeds_cap) {
+    if (m->prefill_embeds) CK(cudaFree(m->prefill_embeds));
+    m->prefill_embeds = nullptr;
+    m->prefill_embeds_cap = 0;
+    m->prefill_embeds = static_cast<float*>(device_malloc(need_e * sizeof(float)));
+    m->prefill_embeds_cap = need_e;
+  }
+  if (embed_rows > m->prefill_embed_rows_cap) {
+    if (m->prefill_embed_rows) CK(cudaFree(m->prefill_embed_rows));
+    m->prefill_embed_rows = nullptr;
+    m->prefill_embed_rows_cap = 0;
+    m->prefill_embed_rows = static_cast<int32_t*>(device_malloc(embed_rows * sizeof(int32_t)));
+    m->prefill_embed_rows_cap = embed_rows;
+  }
+  const size_t need_p = position_rows * 6;
+  if (need_p > m->prefill_pos3d_cap) {
+    if (m->prefill_pos3d) CK(cudaFree(m->prefill_pos3d));
+    m->prefill_pos3d = nullptr;
+    m->prefill_pos3d_cap = 0;
+    m->prefill_pos3d = static_cast<int32_t*>(device_malloc(need_p * sizeof(int32_t)));
+    m->prefill_pos3d_cap = need_p;
+  }
+}
+
 // The prefill buffers all sessions share, for passes of up to `rows` rows: a
 // wider plan replaces them; sessions only borrow them during a pass.  Allocated
 // from one VMM slab when the driver supports VMM so tiered strata pools can
@@ -238,31 +267,7 @@ int ensure_prefill_rows(flyx_bmodel* m, int rows) {
         has_vision = true;
         break;
       }
-    if (has_vision) {
-      const size_t need_e = size_t(rows) * size_t(m->hidden);
-      if (need_e > m->prefill_embeds_cap) {
-        if (m->prefill_embeds) CK(cudaFree(m->prefill_embeds));
-        m->prefill_embeds = nullptr;
-        m->prefill_embeds_cap = 0;
-        m->prefill_embeds = static_cast<float*>(device_malloc(need_e * sizeof(float)));
-        m->prefill_embeds_cap = need_e;
-      }
-      if (size_t(rows) > m->prefill_embed_rows_cap) {
-        if (m->prefill_embed_rows) CK(cudaFree(m->prefill_embed_rows));
-        m->prefill_embed_rows = nullptr;
-        m->prefill_embed_rows_cap = 0;
-        m->prefill_embed_rows = static_cast<int32_t*>(device_malloc(size_t(rows) * sizeof(int32_t)));
-        m->prefill_embed_rows_cap = size_t(rows);
-      }
-      const size_t need_p = size_t(rows) * 6;
-      if (need_p > m->prefill_pos3d_cap) {
-        if (m->prefill_pos3d) CK(cudaFree(m->prefill_pos3d));
-        m->prefill_pos3d = nullptr;
-        m->prefill_pos3d_cap = 0;
-        m->prefill_pos3d = static_cast<int32_t*>(device_malloc(need_p * sizeof(int32_t)));
-        m->prefill_pos3d_cap = need_p;
-      }
-    }
+    if (has_vision) reserve_prefill_inputs(m, rows, rows);
     CK(cudaDeviceSynchronize());  // zero before any session's stream uses them: those do not wait for this one
   } catch (const std::exception& e) {
     prefill_vmm_free(m);
