@@ -138,14 +138,21 @@ void RoundChooser::candidates(const std::vector<int32_t>& tokens, int in_flight,
   const int pref_drafter = (*drafters_)[pref];
   // An intra-round stopping plan (adaptive) for a model drafter's chains; never DV's, whose rounds are trees and its
   // warm-up, and whose canvas follows its own rounds (keeps_state).  A run widened past what the drafter's adaptive
-  // round reaches keeps its fixed width.
+  // round reaches keeps its fixed width.  (A width the controller prefers outright past it does not: on
+  // Inkling-2-Mini those fixed rounds cost DSpark 1 to 2% and DFlash2 up to 2.6% against the adaptive round.)
   const bool past_adaptive = widened && pref_drafter >= 0 && size_t(pref_drafter) < stoppers_.size() &&
                              (*widths_)[pref] > stoppers_[size_t(pref_drafter)].max_width();
   const bool use_adaptive = adaptive_on_ && pref_drafter >= 0 && !spec_.is_tree(pref) && !spec_.keeps_state(pref) &&
                             stop_policy(pref_drafter) != nullptr && !past_adaptive;
   if (use_adaptive) {
-    out->push_back({{false, pref, stoppers_[size_t(pref_drafter)].max_width(), pref_drafter, true},
-                    spec_.round_tokens(pref), spec_.cost(pref, context_), false, true});
+    // Scored as the widest plan it reaches where the controller prefers a wider one: it verifies no more drafts.
+    const int reach = stoppers_[size_t(pref_drafter)].max_width();
+    size_t scored = pref;
+    if ((*widths_)[pref] > reach)
+      for (size_t i = 0; i < widths_->size(); ++i)
+        if ((*drafters_)[i] == pref_drafter && (*widths_)[i] == reach && !spec_.is_tree(i)) scored = i;
+    out->push_back({{false, pref, reach, pref_drafter, true}, spec_.round_tokens(scored), spec_.cost(scored, context_),
+                    false, true});
     // Still offer the fixed preferred width as batchable so concurrent scheduling can batch cleanly.
     out->push_back({{false, pref, (*widths_)[pref], pref_drafter, false}, spec_.round_tokens(pref),
                     spec_.cost(pref, context_), true, false});
@@ -246,9 +253,12 @@ void RoundChooser::result(const RoundChoice& round, bool emitted, int accepted, 
           }
       }
       spec_.observe(obs_index, accepted, trunk_accepted);  // the drafter's acceptance only
+      // A fixed round's tokens are credited at its own plan's cost: its width may lie past the stopper's checkpoints.
       if (!spec_.is_tree(round.index) && round.drafter >= 0 && size_t(round.drafter) < stoppers_.size() &&
           stoppers_[size_t(round.drafter)].ready())
-        stoppers_[size_t(round.drafter)].observe(eff_w, accepted, draft_prob, draft_margin);
+        stoppers_[size_t(round.drafter)].observe(eff_w, accepted, draft_prob, draft_margin,
+                                                 round.adaptive ? 0.0
+                                                                : spec_.cost(round.index, static_cast<int>(tokens.size())));
     }
     // The runs are a model drafter's chains (DFlash2's block): no tree's, and none of DV, whose canvas follows its
     // own rounds.

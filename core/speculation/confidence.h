@@ -28,8 +28,9 @@ class ConfidenceStopper {
   double bucket_cost(int width) const;
 
   // Update online calibrator from one completed round of `width` drafts (`accepted` accepted)
-  // with optional per-draft confidence arrays (may be null or zero when unavailable).
-  void observe(int width, int accepted, const float* draft_prob, const float* draft_margin);
+  // with optional per-draft confidence arrays (may be null or zero when unavailable).  `cost_ms`: what the round cost,
+  // for a fixed round of the drafter (its width may be none of the checkpoints); 0 takes its bucket's cost.
+  void observe(int width, int accepted, const float* draft_prob, const float* draft_margin, double cost_ms = 0);
 
  private:
   void init_rates();

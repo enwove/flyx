@@ -44,7 +44,8 @@ DrafterTraits drafter_traits(Drafter d) {
 // with width; it verifies 1, 2 or 3 of them.  Inkling-2-Mini (RTX 5070 Ti): DSpark's fourth to seventh drafts added
 // 0.07 to 0.2 tokens a round while every round drafted them, and its stop rule verified 3 or more of 7 in half the
 // rounds; capped, adaptive DSpark 151.5 -> 156.3 tok/s on chat prompts and 169.5 -> 172.3 on thinking ones, DFlash2
-// 166.1 -> 169.7 on chat.  Runs of fully accepted rounds still widen to the fixed rounds past it.
+// 166.1 -> 169.7 on chat.  The widths past it stay fixed rounds, for an explicit --width and the scheduler's
+// batched rounds; where the round controller prefers one of them, the adaptive round runs (RoundChooser).
 constexpr int kSteepBlockAdaptiveDrafts = 3;
 }  // namespace
 

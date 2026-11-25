@@ -660,6 +660,34 @@ int main() {
                                                   std::to_string(wide.width) + (wide.adaptive ? ", adaptive)" : ")"));
   }
 
+    // Where the controller prefers a width past the adaptive round's widest checkpoint (wide rounds nearly free: 7
+    // drafts preferred, checkpoints up to 3), the adaptive round runs and is scored as the plan of its widest
+    // checkpoint; a fixed round's tokens train the stopper's throughput at that round's own cost, not the widest's.
+  {
+    const std::vector<int> widths = {0, 1, 3, 7};
+    const std::vector<int> drafters = {-1, 0, 0, 0};
+    const std::vector<double> costs = {10.0, 10.05, 10.1, 10.2};
+    const std::vector<int> lk_widths = {};
+    const std::vector<std::vector<int>> cps = {{1, 3}};
+    RoundChooser rc;
+    rc.configure(&widths, &drafters, &costs, &lk_widths, nullptr, nullptr, &cps);
+    rc.begin(false, true, true);
+    std::vector<RoundCandidate> cands;
+    rc.candidates({}, 0, &cands);
+    const bool adaptive_first = !cands.empty() && cands.front().preferred && cands.front().choice.adaptive;
+    const bool prefers_7 = cands.size() > 1 && !cands[1].choice.adaptive && cands[1].choice.width == 7;
+    check(adaptive_first && prefers_7 && cands.front().choice.width == 3 &&
+              std::fabs(cands.front().solo_ms - 10.1) < 1e-9,
+          "a preferred 7 past adaptive checkpoints up to 3: the adaptive round, scored as the plan of 3");
+    ConfidenceStopper own, last;
+    own.configure({1, 3}, {10.0, 12.0}, 7.5);
+    last.configure({1, 3}, {10.0, 12.0}, 7.5);
+    own.observe(7, 7, nullptr, nullptr, 17.0);
+    last.observe(7, 7, nullptr, nullptr);
+    check(own.policy().lambda < last.policy().lambda,
+          "a fixed round of 7 past checkpoints up to 3 is credited at its own cost (17 ms), not the widest's (12 ms)");
+  }
+
     // ConfidenceStopper online calibration + RoundChooser adaptive candidate selection (solo adaptive, batched fixed).
   {
     const std::vector<int> widths = {0, 1, 3, 5, 7, 15};
