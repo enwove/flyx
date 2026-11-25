@@ -479,7 +479,7 @@ void run_batch(const BatchPass& bp) {
         feats_off = ds.feats_offset;
       }
       const flyx_bmodel* m = bp.seq[0].s->m;
-      if (n.arg1 == 1) {
+      if (n.arg1 == FLYX_TAP_NORMED) {
         const auto& hb = block<HeadBlock>(m, head_idx);
         rmsnorm(bp.v.b.x, m->hidden, hb.norm.w, hb.norm.offset, hb.norm.eps, bp.v.b.h, m->hidden, bp.rows, m->hidden,
                 bp.v.L.st);

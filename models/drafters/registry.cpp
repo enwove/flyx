@@ -162,17 +162,17 @@ void DrafterRegistry::emit_taps(std::vector<flyx_node>* p, int layer_1based) con
   if (is_post_norm && explicit_post_norm_) return;
   for (size_t s = 0; s < dflash2_taps_.size(); ++s)
     if (dflash2_taps_[s] == layer_1based)
-      p->push_back({FLYX_NODE_TAP, dflash2_block_, int32_t(s), is_post_norm ? 1 : 0});
+      p->push_back({FLYX_NODE_TAP, dflash2_block_, int32_t(s), is_post_norm ? FLYX_TAP_NORMED : 0});
 }
 
 void DrafterRegistry::emit_post_norm_taps(std::vector<flyx_node>* p, int n_layers) const {
   if (dspark_block_ >= 0) {
     for (size_t s = 0; s < dspark_taps_.size(); ++s)
-      if (dspark_taps_[s] == n_layers) p->push_back({FLYX_NODE_TAP, dspark_block_, int32_t(s), 1});
+      if (dspark_taps_[s] == n_layers) p->push_back({FLYX_NODE_TAP, dspark_block_, int32_t(s), FLYX_TAP_NORMED});
   }
   if (dflash2_block_ >= 0) {
     for (size_t s = 0; s < dflash2_taps_.size(); ++s)
-      if (dflash2_taps_[s] == n_layers) p->push_back({FLYX_NODE_TAP, dflash2_block_, int32_t(s), 1});
+      if (dflash2_taps_[s] == n_layers) p->push_back({FLYX_NODE_TAP, dflash2_block_, int32_t(s), FLYX_TAP_NORMED});
   }
 }
 

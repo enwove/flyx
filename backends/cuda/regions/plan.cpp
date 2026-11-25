@@ -373,7 +373,7 @@ void run_node(const Pass& ps, const flyx_node& n, const Block* b) {
         head_idx = ds.head;
         feats_off = ds.feats_offset;
       }
-      if (n.arg1 == 1) {
+      if (n.arg1 == FLYX_TAP_NORMED) {
         const auto& hb = block<HeadBlock>(s->m, head_idx);
         if (residual16(ps))
           rmsnorm(x16_of(rv), s->m->hidden, hb.norm.w, hb.norm.offset, hb.norm.eps, rv.b.h, s->m->hidden, ps.rows,

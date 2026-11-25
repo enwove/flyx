@@ -38,11 +38,11 @@ class DrafterRegistry {
   void emit_pre_visit_taps(std::vector<flyx_node>* p, int visit_0based) const;
 
   // Emit FLYX_NODE_TAP nodes for drafters that tap after 1-based layer `layer_1based` (DFlash2).
-  // When `target.has_post_norm_tap` is false, `layer_1based == target.layers` emits post-output_norm taps (arg1 = 1);
+  // When `target.has_post_norm_tap` is false, `layer_1based == target.layers` emits post-output_norm taps (FLYX_TAP_NORMED);
   // architectures with a final residual mix set `has_post_norm_tap = true` and call emit_post_norm_taps() after it.
   void emit_taps(std::vector<flyx_node>* p, int layer_1based) const;
 
-  // Emit FLYX_NODE_TAP nodes (arg1 = 1: post output_norm) for taps equal to `n_layers` (DFlash2 and DSpark).
+  // Emit FLYX_NODE_TAP nodes (FLYX_TAP_NORMED: post output_norm) for taps equal to `n_layers` (DFlash2 and DSpark).
   void emit_post_norm_taps(std::vector<flyx_node>* p, int n_layers) const;
 
   // Emit FLYX_NODE_CONTEXT nodes for all attached drafters managed by this registry (MTP, DFlash2, DSpark).

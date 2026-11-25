@@ -30,14 +30,17 @@
 #include <limits>
 #include <vector>
 
+#include "flyx/backend_abi.h"
+
 namespace flyx::ops {
 
-// DFlash2 selector candidate score: unary + edge, with optional tanh softcapping applied either to
-// the unary logit before adding the bilinear correction (`softcap_mode == 0`) or to their sum
-// (`softcap_mode == 1`, Inkling-2 DFlash2).
-inline double dflash2_selector_score(double unary, double edge, double softcap = 0.0, int softcap_mode = 0) {
+// A DFlash2 selector's score of a candidate: its logit (unary) plus the pair's bilinear correction (edge), with the
+// soft cap of flyx_dflash2_block, softcap * tanh(z / softcap), on the logit before the correction is added
+// (FLYX_DFLASH2_SOFTCAP_BEFORE) or on their sum (FLYX_DFLASH2_SOFTCAP_AFTER); no cap at softcap 0.
+inline double dflash2_selector_score(double unary, double edge, double softcap = 0.0,
+                                     int softcap_mode = FLYX_DFLASH2_SOFTCAP_BEFORE) {
   if (softcap <= 0.0) return unary + edge;
-  if (softcap_mode == 1) return softcap * std::tanh((unary + edge) / softcap);
+  if (softcap_mode == FLYX_DFLASH2_SOFTCAP_AFTER) return softcap * std::tanh((unary + edge) / softcap);
   return softcap * std::tanh(unary / softcap) + edge;
 }
 

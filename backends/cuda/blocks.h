@@ -171,7 +171,7 @@ struct DFlashBlock {
   int block = 0, mask_token = 0;
   int window = 0;                             // sliding window of every layer (0: none)
   float softcap = 0.f;                        // selector logit softcap (0: none)
-  int softcap_mode = 0;                       // flyx_dflash2_softcap_mode
+  int softcap_mode = FLYX_DFLASH2_SOFTCAP_BEFORE;  // flyx_dflash2_softcap_mode
   int n_taps = 0, target_hidden = 0;          // context features: n_taps target hidden rows
   int feats_offset = 0;                       // float offset within RowBufs::feats row
   int conv_taps = 0, conv_group = 0, sel_rank = 0, sel_topk = 0;

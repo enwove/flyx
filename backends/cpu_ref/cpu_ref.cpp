@@ -779,7 +779,7 @@ void draft_block(RefSeq* s, const flyx_dflash2_block& d, int width) {
     for (size_t i = 0; i < x.size(); ++i) x[i] += fin[i];
   }
   const auto& head = M->block(d.head).head;
-  const int V = d.vocab_out > 0 ? d.vocab_out : (head.vocab_out > 0 ? head.vocab_out : head.vocab);
+  const int V = head.vocab_out > 0 ? head.vocab_out : head.vocab;  // the candidates: no padding row
   const int K = d.sel_topk, Rk = d.sel_rank;
   Vec hn(H), logits(V), hid(Rk), val(K);
   std::vector<int> cand(K);
@@ -1231,7 +1231,7 @@ void run_nodes(RefPlan* p, RefSeq* s) {
         const int head_idx = b->kind == FLYX_BLOCK_DSPARK ? b->dspark.head : b->dflash2.head;
         const int F = M->total_taps * H;
         const int col_off = (tap_off + n.arg0) * H;
-        if (n.arg1 == 1) {
+        if (n.arg1 == FLYX_TAP_NORMED) {
           const auto& head = M->block(head_idx).head;
           for (int r = 0; r < s->rows; ++r)
             norm(M, head.norm, &s->x[size_t(r) * size_t(H)], H, &s->feats[size_t(r) * size_t(F) + size_t(col_off)]);

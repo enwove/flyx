@@ -28,7 +28,8 @@ __global__ void k_grouped_conv(const float* x, int ldx, const float* delta, int 
 
 __device__ __forceinline__ float dflash2_score(float u, float e, float softcap, int softcap_mode) {
   if (softcap > 0.f) {
-    return softcap_mode == 1 ? softcap * tanhf((u + e) / softcap) : softcap * tanhf(u / softcap) + e;
+    return softcap_mode == FLYX_DFLASH2_SOFTCAP_AFTER ? softcap * tanhf((u + e) / softcap)
+                                                      : softcap * tanhf(u / softcap) + e;
   }
   return u + e;
 }

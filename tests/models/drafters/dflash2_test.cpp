@@ -282,17 +282,17 @@ void refusals(const std::string& dir) {
     check(ok, "a DFlash2 GGUF with final_logit_softcapping opens with softcap=30 and before_correction mode (" + err +
                   ")");
   }
-  {  // A tap equal to target.layers taps post-output_norm (FLYX_NODE_TAP with arg1 == 1).
+  {  // A tap equal to target.layers taps post-output_norm (FLYX_NODE_TAP with arg1 FLYX_TAP_NORMED).
     ModelFile f;
     std::string err;
     const auto m = open_beside(&f, model, dir + "/tiny_draft_refused_last_layer.gguf", "dflash2", &err);
     bool has_post_norm = false;
     if (m) {
       for (const flyx_node& n : m->prefill_program())
-        if (n.kind == FLYX_NODE_TAP && n.arg1 == 1) has_post_norm = true;
+        if (n.kind == FLYX_NODE_TAP && n.arg1 == FLYX_TAP_NORMED) has_post_norm = true;
     }
     check(m && has_post_norm,
-          "a DFlash2 GGUF tapping target.layers emits a post-output_norm FLYX_NODE_TAP (arg1=1) (" + err + ")");
+          "a DFlash2 GGUF tapping target.layers emits a FLYX_NODE_TAP after the output norm (FLYX_TAP_NORMED) (" + err + ")");
   }
   {  // What a drafter's config says is read when it drafts: not chosen, the model opens without it.
     ModelFile f;
