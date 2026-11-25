@@ -43,8 +43,9 @@ DrafterTraits drafter_traits(Drafter d) {
 
 // Width ladder and intra-round adaptive stopping, driven by drafter traits + target structure:
 // - Sequential drafters (MTP, future EAGLE-4): tensor-core aligned 1, 3, 5, 7, ..., max_drafts (<= 15).
-// - Parallel block drafters: {3, 5, 7} when target verify cost scales steeply with width (e.g. sparse MoE),
-//   {3, 7} on dense targets, plus FLYX_MAX_ROWS - 1 when stretch_block allows drafting past max_drafts.
+// - Parallel block drafters: {1, 3, 5, 7} when target verify cost scales steeply with width (e.g. sparse MoE, where
+//   each draft row reads its own experts: one draft often pays where three do not), {3, 7} on dense targets, plus
+//   FLYX_MAX_ROWS - 1 when stretch_block allows drafting past max_drafts.
 // - Tree-only drafters (DV): up to FLYX_MAX_WIDE_ROWS - 1 (plus 15 when wider).
 std::vector<int> Model::draft_widths(int d) const {
   const DrafterBlock& b = drafters_.at(size_t(d));
@@ -56,9 +57,8 @@ std::vector<int> Model::draft_widths(int d) const {
     return {widest};
   }
   const int widest = tr.stretch_block ? b.max_drafts : std::min(FLYX_MAX_ROWS - 1, b.max_drafts);
-  const std::vector<int> ladder = tr.sequential              ? std::vector<int>{1, 3, 5, 7}
-                                  : verify_scales_with_width_ ? std::vector<int>{3, 5, 7}
-                                                              : std::vector<int>{3, 7};
+  const std::vector<int> ladder =
+      tr.sequential || verify_scales_with_width_ ? std::vector<int>{1, 3, 5, 7} : std::vector<int>{3, 7};
   std::vector<int> widths;
   for (int k : ladder)
     if (k < widest) widths.push_back(k);
