@@ -4,6 +4,8 @@
 // lower() resolves a program into a plan, forward() executes its nodes on a sequence (a prefill pass or a round).
 #include "backends/cuda/regions/layers.h"
 
+#include <algorithm>
+
 namespace flyx::cuda {
 
 std::string node_name(const flyx_node& n, const Block* b) {
@@ -563,6 +565,10 @@ int lower(flyx_bmodel* m, const flyx_program* prog, flyx_plan** out) {
   }
   if (prog->phase == FLYX_PHASE_ROUND && prog->width > most)
     return fail("round width exceeds what the drafter can propose");
+  // A round writes one entry of the result ring (its accept: new_entry), the one ring_publish copies to the host.
+  if (prog->phase == FLYX_PHASE_ROUND &&
+      std::count_if(p->nodes.begin(), p->nodes.end(), [](const flyx_node& n) { return n.kind == FLYX_NODE_ACCEPT; }) != 1)
+    return fail("lower: a round has exactly one accept node");
   if (prog->n_checkpoints > 0) {
 #if CUDART_VERSION < 12040
     return fail("lower: adaptive stopping plans need CUDA 12.4+");
