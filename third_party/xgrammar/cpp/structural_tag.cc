@@ -1843,8 +1843,7 @@ class StructuralTagGrammarConverter {
  public:
   /*!
    * \brief Convert a structural tag to a grammar.
-   * \param tokenizer_info Tokenizer metadata used to resolve named special tokens in Lark
-   * grammar formats.
+   * \param tokenizer_info Tokenizer metadata for atomic literals and named special tokens in Lark.
    */
   static Result<Grammar, ISTError> Convert(
       const StructuralTag& structural_tag, const std::optional<TokenizerInfo>& tokenizer_info
@@ -1887,6 +1886,8 @@ class StructuralTagGrammarConverter {
   );
 
   bool IsPrefix(const std::string& prefix, const std::string& full_str);
+  std::pair<size_t, int32_t> FindAtomicToken(const std::string& literal, size_t start = 0) const;
+  int BuildLiteral(const std::string& literal);
   int BuildBeginExpr(const TagFormat& tag);
   int BuildEndExpr(const TagFormat& tag);
 
@@ -1967,8 +1968,7 @@ Result<int, ISTError> StructuralTagGrammarConverter::Visit(const Format& format)
 }
 
 Result<int, ISTError> StructuralTagGrammarConverter::VisitSub(const ConstStringFormat& format) {
-  auto expr = format.value.empty() ? grammar_builder_.AddEmptyStr()
-                                   : grammar_builder_.AddByteString(format.value);
+  auto expr = format.value.empty() ? grammar_builder_.AddEmptyStr() : BuildLiteral(format.value);
   auto sequence_expr = grammar_builder_.AddSequence({expr});
   auto choices_expr = grammar_builder_.AddChoices({sequence_expr});
   return ResultOk(grammar_builder_.AddRuleWithHint("const_string", choices_expr));
@@ -2011,7 +2011,9 @@ Result<int, ISTError> StructuralTagGrammarConverter::VisitSub(const RegexFormat&
 Result<int, ISTError> StructuralTagGrammarConverter::VisitSub(const AnyTextFormat& format) {
   std::vector<std::string> all_excludes = format.excludes;
   for (const auto& s : format.detected_end_strs_) {
-    if (!s.empty()) {
+    // flyx: an end that holds an atomic token cannot occur as bytes; only an explicit exclusion keeps
+    // its spelling out of the text (README.flyx.md).
+    if (!s.empty() && FindAtomicToken(s).second == -1) {
       all_excludes.push_back(s);
     }
   }
@@ -2060,9 +2062,52 @@ Result<int, ISTError> StructuralTagGrammarConverter::VisitSub(const OrFormat& fo
   return ResultOk(grammar_builder_.AddRuleWithHint("or", expr));
 }
 
+// flyx: the leftmost atomic token whose text the literal holds from `start`, the longest there
+// (README.flyx.md).
+std::pair<size_t, int32_t> StructuralTagGrammarConverter::FindAtomicToken(
+    const std::string& literal, size_t start
+) const {
+  if (tokenizer_info_) {
+    const auto& ids = tokenizer_info_->ImplPtr()->GetAtomicTokenIds();
+    const auto& vocab = tokenizer_info_->GetDecodedVocab();
+    for (size_t pos = start; !ids.empty() && pos < literal.size(); ++pos) {
+      int32_t longest = -1;
+      for (int32_t id : ids) {
+        const auto& text = vocab[id];
+        if ((longest == -1 || text.size() > vocab[longest].size()) &&
+            literal.compare(pos, text.size(), text) == 0) {
+          longest = id;
+        }
+      }
+      if (longest != -1) return {pos, longest};
+    }
+  }
+  return {std::string::npos, -1};
+}
+
+// flyx: a literal as byte strings and the atomic tokens its text holds.
+int StructuralTagGrammarConverter::BuildLiteral(const std::string& literal) {
+  std::vector<int32_t> parts;
+  size_t start = 0;
+  while (start < literal.size()) {
+    auto [pos, id] = FindAtomicToken(literal, start);
+    if (id == -1) break;
+    if (pos > start) {
+      parts.push_back(grammar_builder_.AddByteString(literal.substr(start, pos - start)));
+    }
+    parts.push_back(grammar_builder_.AddTokenSet({id}));
+    start = pos + tokenizer_info_->GetDecodedVocab()[id].size();
+  }
+  if (parts.empty()) return grammar_builder_.AddByteString(literal);
+  if (start < literal.size()) {
+    parts.push_back(grammar_builder_.AddByteString(literal.substr(start)));
+  }
+  return parts.size() == 1 ? parts.front() : grammar_builder_.AddSequence(parts);
+}
+
 int StructuralTagGrammarConverter::BuildBeginExpr(const TagFormat& tag) {
   if (std::holds_alternative<std::string>(tag.begin)) {
-    return grammar_builder_.AddByteString(std::get<std::string>(tag.begin));
+    return BuildLiteral(std::get<std::string>(tag.begin));
   }
   return grammar_builder_.AddTokenSet({std::get<TokenFormat>(tag.begin).resolved_token_id_});
 }
@@ -2073,12 +2118,11 @@ int StructuralTagGrammarConverter::BuildEndExpr(const TagFormat& tag) {
   }
   const auto& ends = std::get<std::vector<std::string>>(tag.end);
   if (ends.size() == 1) {
-    return ends[0].empty() ? grammar_builder_.AddEmptyStr()
-                           : grammar_builder_.AddByteString(ends[0]);
+    return ends[0].empty() ? grammar_builder_.AddEmptyStr() : BuildLiteral(ends[0]);
   }
   std::vector<int> end_seq_ids;
   for (const auto& s : ends) {
-    auto e = s.empty() ? grammar_builder_.AddEmptyStr() : grammar_builder_.AddByteString(s);
+    auto e = s.empty() ? grammar_builder_.AddEmptyStr() : BuildLiteral(s);
     end_seq_ids.push_back(grammar_builder_.AddSequence({e}));
   }
   auto choice = grammar_builder_.AddChoices(end_seq_ids);
@@ -2102,6 +2146,12 @@ Result<int, ISTError> StructuralTagGrammarConverter::VisitSub(const TagFormat& f
 }
 
 Result<int, ISTError> StructuralTagGrammarConverter::VisitSub(const TriggeredTagsFormat& format) {
+  // flyx: dispatch scans bytes, which hold no atomic token (README.flyx.md).
+  for (const auto& trigger : format.triggers) {
+    if (FindAtomicToken(trigger).second != -1) {
+      return ResultErr<ISTError>("A trigger in triggered_tags contains the text of an atomic token");
+    }
+  }
   // Step 1. Visit all tags and add to grammar
   std::vector<std::vector<int>> trigger_to_tag_ids(format.triggers.size());
   std::vector<int> tag_content_rule_ids;
@@ -2115,6 +2165,9 @@ Result<int, ISTError> StructuralTagGrammarConverter::VisitSub(const TriggeredTag
       );
     }
     const auto& tag_begin = std::get<std::string>(tag.begin);
+    if (FindAtomicToken(tag_begin).second != -1) {
+      return ResultErr<ISTError>("A triggered_tags tag begin contains the text of an atomic token");
+    }
     int matched_trigger_id = -1;
     for (int it_trigger = 0; it_trigger < static_cast<int>(format.triggers.size()); ++it_trigger) {
       const auto& trigger = format.triggers[it_trigger];
@@ -2277,7 +2330,7 @@ Result<int, ISTError> StructuralTagGrammarConverter::VisitSub(const TagsWithSepa
 
   std::vector<int> sub_sequence_elements;
   if (!format.separator.empty()) {
-    sub_sequence_elements.push_back(grammar_builder_.AddByteString(format.separator));
+    sub_sequence_elements.push_back(BuildLiteral(format.separator));
   }
   sub_sequence_elements.push_back(all_tags_rule_ref_id);
   sub_sequence_elements.push_back(grammar_builder_.AddRuleRef(sub_rule_id));
@@ -2498,6 +2551,9 @@ Result<int, ISTError> StructuralTagGrammarConverter::VisitSub(const DispatchForm
   std::vector<std::pair<std::string, int32_t>> tag_rule_pairs;
   tag_rule_pairs.reserve(format.rules.size());
   for (const auto& pair : format.rules) {
+    if (FindAtomicToken(pair.first).second != -1) {
+      return ResultErr<ISTError>("A dispatch key contains the text of an atomic token");
+    }
     if (!pair.second) {
       return ResultErr<ISTError>("TagDispatch pair must have content");
     }

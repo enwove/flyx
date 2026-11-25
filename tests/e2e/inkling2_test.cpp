@@ -782,34 +782,43 @@ void test_chat_and_format(const std::string& model_path) {
   check(!grm.empty() && grm.find("<|content_invoke_tool_json|>") != std::string::npos,
         "Inkling-2 XGrammar structural tag generated");
 
-  // A reply as the model writes it, every marker its control token: the grammar takes it and lets it end there.  A
-  // grammar that knows no marker takes none of them (they are special tokens), which would leave a model to spell
-  // its sections out in ordinary tokens.  The stop token as in the real model's file, <|content_model_end_sampling|>.
   {
     std::vector<int32_t> markers;
     for (const std::string& text : e->chat().reply_tokens()) markers.push_back(tok.added_id(text));
-    // How many of the reply's tokens the grammar takes, and whether it may end after the last.
-    auto taken = [&](const std::string& tag, const std::string& reply, const std::vector<int32_t>& known,
-                     bool* ends) {
-      Grammar g;
-      g.init(tok, tok.n_tokens(), {tok.added_id("<|content_model_end_sampling|>")}, known);
+    // A reply as the model writes it, every marker its control token: the grammar takes a marker's token where a
+    // delimiter spells it and nowhere else.  A grammar that knows no marker takes none of them (they are special
+    // tokens) and is left with their spelling in ordinary tokens.  The stop token as in the real model's file,
+    // <|content_model_end_sampling|>: <|end_message|> closes a section and the reply may go on.
+    const int32_t eos = tok.added_id("<|content_model_end_sampling|>");
+    Grammar g;
+    auto matcher = [](Grammar& grammar, const std::string& tag) {
       std::string why;
-      auto m = g.matcher(tag, &why);
-      const std::vector<int32_t> ids = tok.encode(reply);
-      size_t n = 0;
-      while (m && n < ids.size() && m->accept(ids[n])) ++n;
-      *ends = m && n == ids.size() && m->can_end();
-      return n;
+      auto m = grammar.matcher(tag, &why);
+      if (!m) throw std::runtime_error(why);
+      return m;
     };
-    auto admits = [&](const std::string& tag, const std::string& reply, const std::vector<int32_t>& known) {
-      bool ends = false;
-      taken(tag, reply, known, &ends);
-      return ends;
+    auto take = [](GrammarMatcher& m, const std::vector<int32_t>& ids) {
+      for (int32_t id : ids)
+        if (!m.accept(id)) return false;
+      return true;
     };
+    auto admits = [&](const std::string& tag, const std::string& reply) {
+      auto m = matcher(g, tag);
+      return take(*m, tok.encode(reply)) && m->can_end();
+    };
+    auto mask_allows = [&](GrammarMatcher& m, int32_t id) {
+      std::vector<uint32_t> mask(g.words());
+      m.allowed(mask.data());
+      return (mask.at(size_t(id) / 32) & (1u << (size_t(id) % 32))) != 0;
+    };
+    const std::vector<TextSpan> no_literals;
+    const std::string text_begin = "<|message_model|><|content_text|>";
+    const std::string end_message = "<|end_message|>";
+    const int32_t end_id = tok.added_id(end_message);
     const std::string thought = "<|message_model|><|content_thinking|>plan<|end_message|>";
-    const std::string hello = "<|message_model|><|content_text|>hello<|end_message|>";
-    const std::string call = "<|message_model|>lookup<|content_invoke_tool_json|>"
-                             "{\"name\":\"lookup\",\"args\":{\"a\":2}}<|end_message|>";
+    const std::string hello = text_begin + "hello" + end_message;
+    const std::string call_begin = R"(<|message_model|>lookup<|content_invoke_tool_json|>{"name":"lookup","args":)";
+    const std::string call = call_begin + R"({"a":2}})" + end_message;
     const std::vector<int32_t> written = tok.encode(thought + call);
     const int64_t as_tokens = std::count_if(written.begin(), written.end(), [&](int32_t id) {
       return std::find(markers.begin(), markers.end(), id) != markers.end();
@@ -817,30 +826,83 @@ void test_chat_and_format(const std::string& model_path) {
     check(markers.size() == 5 && std::none_of(markers.begin(), markers.end(), [](int32_t id) { return id < 0; }) &&
               as_tokens == 6,
           "the format names its reply markers, each a control token of the model");
-    check(admits(grm, thought + call, markers), "the grammar takes a reply written with its control tokens");
-    check(!admits(grm, thought + call, {}), "a grammar that knows no marker takes none of them");
-    // A section's text ends at its own <|end_message|>, as the parser ends it: a marker that opens a section is
-    // text there (a reply may quote one), and after the section only what the grammar puts next is taken.
+    g.init(tok, tok.n_tokens(), {eos});
+    {
+      auto fallback = matcher(g, grm);
+      check(!fallback->accept(tok.added_id("<|message_model|>")) &&
+                take(*fallback, tok.encode(thought + call, &no_literals)) && fallback->can_end(),
+            "a grammar that knows no markers requires their ordinary spellings");
+    }
+    g.init(tok, tok.n_tokens(), {eos}, markers);
+    check(admits(grm, thought + call), "the same tag takes the control tokens after the vocabulary changes");
+
     const std::string auto_grm = e->chat().reply_grammar(tools, ReplyRules{}, rc);
-    const std::string quoting = "<|message_model|><|content_text|>a<|content_text|>b<|end_message|>";
-    bool ends = false;
-    const size_t n = taken(auto_grm, hello + thought, markers, &ends);
-    check(admits(auto_grm, quoting, markers) && n == tok.encode(hello).size() + 1 && !ends,
-          "a section's text may quote an opening marker; no thinking section after the text (" + std::to_string(n) +
-              " tokens taken)");
+    auto quoting = matcher(g, auto_grm);
+    const int32_t text_id = tok.added_id("<|content_text|>");
+    check(take(*quoting, tok.encode(text_begin + "a")) && !mask_allows(*quoting, text_id) &&
+              !quoting->accept(text_id) && take(*quoting, tok.encode("<|content_text|>", &no_literals)) &&
+              take(*quoting, tok.encode("b" + end_message)) && quoting->can_end(),
+          "a section can quote an opening marker only in ordinary tokens");
+    auto spelled_end = matcher(g, auto_grm);
+    check(take(*spelled_end, tok.encode(text_begin + "a")) &&
+              !take(*spelled_end, tok.encode(end_message, &no_literals)),
+          "a section refuses an end marker spelled in ordinary tokens");
+    auto closed = matcher(g, auto_grm);
+    check(take(*closed, tok.encode(hello)) && closed->can_end() && !take(*closed, tok.encode("b")) &&
+              closed->accept(tok.added_id("<|message_model|>")) &&
+              !closed->accept(tok.added_id("<|content_thinking|>")),
+          "the end token closes the text section, allowing a call header but no more text or thinking");
+    auto middle = matcher(e->grammar(), grm);
+    check(take(*middle, tok.encode("<|message_model|><|content_thinking|>plan")) && !middle->accept(end_id) &&
+              !take(*middle, tok.encode(end_message, &no_literals)),
+          "the tiny model's stop marker cannot close thinking before a required call, even spelled in ordinary tokens");
+    auto stopped = matcher(e->grammar(), auto_grm);
+    check(take(*stopped, tok.encode(text_begin + "hello")) && !stopped->can_end() &&
+              stopped->accept(end_id) && stopped->can_end(),
+          "the tiny model's stop marker completes a text reply at its section end");
+
+    ReplyRules json_answer;
+    json_answer.json = true;
+    json_answer.schema = ojson::parse(R"({"type":"object","properties":{"s":{"type":"string"}},"required":["s"]})");
+    auto string_case = [&](const std::string& tag, const std::string& prefix, const std::string& suffix) {
+      auto m = matcher(g, tag);
+      return take(*m, tok.encode(prefix)) && !mask_allows(*m, end_id) && !m->accept(end_id) &&
+             take(*m, tok.encode(suffix)) && mask_allows(*m, end_id) && m->accept(end_id) && m->can_end();
+    };
+    check(string_case(e->chat().reply_grammar({}, json_answer, rc), text_begin + R"({"s":"a)", R"("})"),
+          "JSON answer masks and refuses the end token inside a string and takes it after the object");
+    auto string_tools = tools;
+    auto& parameters = string_tools[0]["function"]["parameters"];
+    parameters = json_answer.schema;
+    parameters["properties"]["s"]["maxLength"] = 64;
+    check(string_case(e->chat().reply_grammar(string_tools, rules, rc), call_begin + R"({"s":"a)", R"("}})"),
+          "tool call masks and refuses the end token inside a bounded string argument and takes it after the call");
+
+    std::vector<ojson> marked_tools;
+    for (const std::string& marker : e->chat().reply_tokens()) {
+      auto tool = tools.front();
+      tool["function"]["name"] = "x" + marker + "y";
+      marked_tools.push_back(std::move(tool));
+    }
+    // A name that holds a reply marker would put the marker in its call's header: no grammar offers that call.
+    check(e->chat().reply_grammar(marked_tools, rules, rc).empty(),
+          "tools whose names all hold a reply marker leave no call a grammar could offer");
+    marked_tools.push_back(tools.front());
+    check(e->chat().reply_grammar(marked_tools, rules, rc) == grm,
+          "a tool whose name holds a reply marker is left out beside a callable one");
+
     // Thinking switched off: the reply has no thinking section, with tools and without, and is otherwise the
     // model's (as many text sections as it writes); left on, a reply with no tools is not held to anything.
     ReplyRules quiet;
     quiet.thinking = false;
     const std::string quiet_text = e->chat().reply_grammar({}, quiet, rc);
     const std::string quiet_tools = e->chat().reply_grammar(tools, quiet, rc);
-    check(e->chat().reply_grammar({}, ReplyRules{}, rc).empty() && admits(quiet_text, hello, markers) &&
-              !admits(quiet_text, thought + hello, markers) && admits(quiet_tools, hello, markers) &&
-              admits(quiet_tools, call, markers) && !admits(quiet_tools, thought + call, markers) &&
-              admits(auto_grm, thought + hello, markers) && admits(auto_grm, thought + call, markers),
+    check(e->chat().reply_grammar({}, ReplyRules{}, rc).empty() && admits(quiet_text, hello) &&
+              !admits(quiet_text, thought + hello) && admits(quiet_tools, hello) &&
+              admits(quiet_tools, call) && !admits(quiet_tools, thought + call) &&
+              admits(auto_grm, thought + hello) && admits(auto_grm, thought + call),
           "thinking off: text or calls, no thinking section; on: an optional one first");
-    check(admits(quiet_text, hello + hello, markers) && !admits(quiet_text, hello + thought, markers) &&
-              !admits(quiet_text, hello + call, markers),
+    check(admits(quiet_text, hello + hello) && !admits(quiet_text, hello + thought) && !admits(quiet_text, hello + call),
           "thinking off, no tools: text sections and nothing else");
   }
 

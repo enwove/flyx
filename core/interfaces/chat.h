@@ -180,11 +180,11 @@ class Chat {
     return "";
   }
   // The special tokens a reply in this format is written with, by their text: a format whose section and call
-  // markers are control tokens (Inkling-2's <|message_model|>, <|content_text|>, <|end_message|>).  A reply grammar
-  // matches these by that text, as it matches ordinary tokens, and so wherever it takes that text: a grammar tells
-  // a marker's token from the same characters in ordinary tokens nowhere (free text that must not hold a marker
-  // excludes its text).  Any other special token it never takes; the model's stop tokens end a reply and are not
-  // named here.  None where the markers are ordinary tokens (<think>, <tool_call>).
+  // markers are control tokens (Inkling-2's <|message_model|>, <|content_text|>, <|end_message|>).  Where a reply
+  // grammar's delimiter, separator or constant holds that text it takes the token and nothing else, and the token
+  // nowhere else: the same characters in ordinary tokens are text, which a section may quote where its grammar
+  // allows that text, and never a delimiter.  Any other special token a grammar never takes; the model's stop tokens
+  // end a reply and are not named here.  None where the markers are ordinary tokens (<think>, <tool_call>).
   virtual std::vector<std::string> reply_tokens() const { return {}; }
   // Template variables that say what the engine's own options say, for a template that has other names for them:
   // one with a thinking effort and no enable_thinking is given the effort of thinking switched off.  The request's

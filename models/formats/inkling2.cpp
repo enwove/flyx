@@ -2,6 +2,7 @@
 #include "models/formats/inkling2.h"
 
 #include <algorithm>
+#include <array>
 
 #include "models/formats/calls.h"
 
@@ -16,6 +17,7 @@ constexpr std::string_view kContentInvokeText = "<|content_invoke_tool_text|>";
 constexpr std::string_view kContentInvokeJson = "<|content_invoke_tool_json|>";
 constexpr std::string_view kEndMessage = "<|end_message|>";
 constexpr std::string_view kEndSampling = "<|content_model_end_sampling|>";
+constexpr std::array kReplyMarkers = {kMsgModel, kContentThinking, kContentText, kContentInvokeJson, kEndMessage};
 
 std::string dump_safe(const ojson& j) { return j.dump(-1, ' ', false, ojson::error_handler_t::replace); }
 
@@ -252,9 +254,10 @@ ojson arguments_schema(const ojson& fn) {
   return {{"type", "object"}};
 }
 
-// A section's text: anything but the two markers that end a section for the parser, as their tokens or spelled out.
-// The markers that open one are text here, as they are to the parser (a reply may quote them): a section begins only
-// after the one before it has ended, where the grammar puts it.
+// A section's text: anything but the two markers that end a section for the parser, spelled out in ordinary tokens
+// (as tokens no text holds them: inkling2_reply_tokens, and the stop token).  The markers that open one are text
+// here when spelled out, as they are to the parser (a reply may quote them): a section begins only after the one
+// before it has ended, where the grammar puts it.
 ojson any_section_body() {
   return {{"type", "any_text"}, {"excludes", ojson::array({std::string(kEndMessage), std::string(kEndSampling)})}};
 }
@@ -282,6 +285,14 @@ ojson json_text_section(const ojson& schema) {
           {"end", "<|end_message|>"}};
 }
 
+// A call's header holds the tool's name between two markers: a name holding a marker's text would put that marker
+// there, where the grammar takes its token and the parser reads the reply's own.
+bool holds_reply_marker(std::string_view name) {
+  for (std::string_view marker : kReplyMarkers)
+    if (name.find(marker) != std::string_view::npos) return true;
+  return false;
+}
+
 ojson call_section(const ojson& fn) {
   const std::string name = fn.contains("name") && fn["name"].is_string() ? fn["name"].get<std::string>() : "";
   const std::string quoted = dump_safe(ojson(name));
@@ -300,8 +311,7 @@ bool is_inkling2_template(std::string_view source) {
 }
 
 std::vector<std::string> inkling2_reply_tokens() {
-  return {std::string(kMsgModel), std::string(kContentThinking), std::string(kContentText),
-          std::string(kContentInvokeJson), std::string(kEndMessage)};
+  return {kReplyMarkers.begin(), kReplyMarkers.end()};
 }
 
 std::unique_ptr<interfaces::OutputParser> make_inkling2_parser(const std::vector<ojson>* tools) {
@@ -317,7 +327,8 @@ std::string inkling2_reply_grammar(const std::vector<ojson>& tools, const ReplyR
       const ojson* fn = function_of(t);
       const std::string fname =
           fn && fn->contains("name") && (*fn)["name"].is_string() ? (*fn)["name"].get<std::string>() : "";
-      if (!fn || (rules.tools == ReplyRules::kForced && fname != rules.forced)) continue;
+      // A tool no reply could call and be read back is not among the calls, as one that is no function is not.
+      if (!fn || holds_reply_marker(fname) || (rules.tools == ReplyRules::kForced && fname != rules.forced)) continue;
       call_tags.push_back(call_section(*fn));
     }
     if (call_tags.empty()) return "";
