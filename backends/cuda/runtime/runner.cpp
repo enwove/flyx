@@ -17,13 +17,13 @@ namespace flyx::cuda {
 
 namespace {
 
-// The result ring reaches the host through a kernel's stores into its mapped mirror: in CUPTI traces of Inkling-2
-// rounds (RTX 5070 Ti, Windows) a device-to-host copy node there started 50 to 150 us after the round's last
+// The pass's result reaches the host through a kernel's stores into the ring's mapped mirror: in CUPTI traces of
+// Inkling-2 rounds (RTX 5070 Ti, Windows) a device-to-host copy node there started 50 to 150 us after the round's last
 // kernel, where a kernel follows it at once.
 void copy_ring(flyx_seq* s, cudaStream_t st, bool drain = true) {
   if (drain && !s->page_layers.empty())
     kv_drain_pageable(s->page_drain_dev, int(s->page_layers.size()), s->P, s->ring_dev, s->m->wide_rows, st);
-  ring_publish(s->ring_dev, s->ring_host_dev, st);
+  ring_publish(s->ring_dev, s->ring_host_dev, s->P, st);
 }
 
 void copy_ring(flyx_seq* s, bool drain = true) { copy_ring(s, s->st, drain); }

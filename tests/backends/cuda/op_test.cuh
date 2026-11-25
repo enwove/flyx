@@ -266,6 +266,7 @@ void test_attention_fp8(int hd, int rot, int nh, int nkv, int rows, int ctx, dou
 void test_attention_tree(int hd, int nh, int nkv, int ctx);
 void test_strata(int hd, int nh, int nkv, int rows, int ctx, int bits, bool fp8);
 void test_pageable_kv_ops();
+void test_ring_publish();
 void test_quantize_nvfp4();
 void test_gdn(const GdnDims d, const int rows, const double tol);
 void test_gdn_chunk(const GdnDims d, const int rows, const int pos0, const double tol);

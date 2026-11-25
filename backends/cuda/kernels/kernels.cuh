@@ -1415,9 +1415,11 @@ void kv_stage_ring(const void* k, void* vk, const void* v, void* vv, size_t row,
 // tail ring into its mapped pinned drain slot (P->seq_no % kRing).
 void kv_drain_pageable(const PageDrainLayer* layers, int n_layers, const DevParams* P, const flyx_round_result* ring_dev,
                        int max_rows, cudaStream_t st);
-// The result ring [kRing] to its pinned host mirror (`host`: the mirror's mapped device address), stored by a kernel
-// and fenced for the host: the last node of a round, which a copy node would start only some time after.
-void ring_publish(const flyx_round_result* ring, flyx_round_result* host, cudaStream_t st);
+// The pass's entry of the result ring [kRing] (P->seq_no % kRing, where new_entry wrote it) to its pinned host mirror
+// (`host`: the mirror's mapped device address), stored by a kernel and fenced for the host: the last node of a round,
+// which a copy node would start only some time after.  The other entries stay as they are: the host may be reading the
+// entry before (two passes in flight).
+void ring_publish(const flyx_round_result* ring, flyx_round_result* host, const DevParams* P, cudaStream_t st);
 
 // After a prefill chunk: advance the position; optionally set the anchor from
 // choice[0] and emit it (counted in `reply` when G has a penalty).

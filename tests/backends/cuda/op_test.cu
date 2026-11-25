@@ -142,6 +142,7 @@ int main(int argc, char** argv) {
   test_strata(256, 16, 4, 15, 114, 4, false);  // 115..129 keys: every row but the last ends past the last one's 96
   test_strata(32, 4, 2, 5, 125, 2, true);      // the tiny model's, 126..130 keys
   test_pageable_kv_ops();
+  test_ring_publish();
   // Every head dim the kernels take (the backend loads no other): decode, a prefill chunk on the tensor cores, and
   // the same with an FP8 cache.
   for (int hd = 32; hd <= 256; hd += 32)
