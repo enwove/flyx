@@ -798,7 +798,7 @@ def model_panel_checks(cl: Client, model: str):
         return
     fields = {"name", "kind", "source", "repo", "quant", "file", "path", "size", "modified", "revision", "current", "mtp"}
     check(c.get("cache_from") in ("HF_HUB_CACHE", "HF_HOME", "default") and isinstance(c.get("dirs"), list) and
-          all(fields <= set(m) and m["kind"] in ("gguf", "flyx", "drafter") and m["source"] in ("hub", "dir") and
+          all(fields <= set(m) and m["kind"] in ("gguf", "flyx", "drafter", "mmproj") and m["source"] in ("hub", "dir") and
               m["mtp"] in ("in-file", "in-repo", None) for m in c["models"]),
           "GET /v1/hub/cached: every field of every model", json.dumps(c["models"][:2])[:300])
     names = [m["name"] for m in c["models"]]
