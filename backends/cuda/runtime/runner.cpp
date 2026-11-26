@@ -1457,7 +1457,7 @@ bool capture_adaptive_graph(flyx_plan* p, flyx_seq* s, const RoundPass& r, cudaG
                              p->earlier_checkpoints, s->st);
           }, nullptr))
         return false;
-      bodies.push_back(graph_size(body));
+      bodies.push_back(graph_size(body, s->m->graph_prices));
       prev = {cnode};
     }
   }
@@ -1483,11 +1483,11 @@ bool capture_adaptive_graph(flyx_plan* p, flyx_seq* s, const RoundPass& r, cudaG
           copy_ring(s);
         }, nullptr))
       return false;
-    bodies.push_back(graph_size(body));
+    bodies.push_back(graph_size(body, s->m->graph_prices));
   }
   // graph_size reads each conditional node's body, a graph of its own; a driver that gives none of them
   // (bodies_unknown) gets them priced as captured, so each body is counted once.
-  GraphSize total = graph_size(root);
+  GraphSize total = graph_size(root, s->m->graph_prices);
   if (total.bodies_unknown == bodies.size()) {
     for (const GraphSize& b : bodies) {
       add_size(total, b);
@@ -1520,7 +1520,7 @@ GraphSize round_graph_size(flyx_plan* p, flyx_seq* s) {
   for (;;) {
     Captured c;
     const bool ok = capture_graph(s->st, [&] { forward(r.ps, r.prefix); copy_ring(s); }, &c.graph);
-    const GraphSize size = ok ? graph_size(c.graph) : GraphSize{};
+    const GraphSize size = ok ? graph_size(c.graph, s->m->graph_prices) : GraphSize{};
     if ((!ok || size.bodies_unknown) && s->dv.body && s->dv.skip_noop) {
       s->dv.skip_noop = false;
       continue;
@@ -1590,7 +1590,7 @@ int launch(flyx_plan* p, flyx_seq* s, const flyx_gen_params* g) {
 #endif
         {
           captured = capture_graph(s->st, record, &c.graph);
-          if (captured) size = graph_size(c.graph);
+          if (captured) size = graph_size(c.graph, s->m->graph_prices);
         }
         if (!captured || (size.bodies_unknown && s->dv.body && s->dv.skip_noop)) {
           failed = true;
@@ -1790,12 +1790,12 @@ int launch_batch(flyx_plan* const* plans, flyx_seq* const* seqs, const flyx_gen_
           return any;
         };
         bool ok = capture_graph(B.st, record, &c.graph);
-        GraphSize size = ok ? graph_size(c.graph) : GraphSize{};
+        GraphSize size = ok ? graph_size(c.graph, m->graph_prices) : GraphSize{};
         if ((!ok || size.bodies_unknown) && inline_canvas()) {
           if (c.graph) cudaGraphDestroy(c.graph);
           c.graph = nullptr;
           ok = capture_graph(B.st, record, &c.graph);
-          size = ok ? graph_size(c.graph) : GraphSize{};
+          size = ok ? graph_size(c.graph, m->graph_prices) : GraphSize{};
         }
         // A share of what it takes in each sequence's room for graphs; no room: this batch without
         // (it comes kGraphWarmHits times more before the next capture).

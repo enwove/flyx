@@ -259,17 +259,32 @@ struct LoadTimes {
 // The driver keeps every node's launch and every graph's own in pieces of 2 MiB that the process's graphs share, and
 // keeps the pieces once the graphs are destroyed, for its next graphs.  What an instantiated graph takes at most, by
 // what it holds (`cuda_bench graphs` measures each kind of node; RTX 5060 Ti, driver 610.88; a node's figure there has
-// the graph's own 96 KiB in it): a kernel node kGraphKernelBytes (chains of 100, 400 and 1000: 3.5, 3.3 and 2.7 KiB a
+// the graph's own 96 KiB in it): a kernel node GraphPrices::kernel (chains of 100, 400 and 1000: 3.5, 3.3 and 2.7 KiB a
 // node; launched with programmatic dependent launch the same) while its parameters take kGraphParamBytes at most, and
-// kGraphParamCost times each byte past them (4 KB of parameters: 11.5 KiB a node); a copy node kGraphCopyBytes (100
+// kGraphParamCost times each byte past them (4 KB of parameters: 11.5 KiB a node); a copy node GraphPrices::copy (100
 // between device buffers: 5.8 KiB a node; 100 to or from pinned or host-mapped memory take no more than the graph's
 // own 96 KiB, as do 100 memsets); a memset node kGraphSetBytes; any other kGraphOtherBytes, and the graphs it holds
 // (a conditional node's bodies: DV's canvas pass, regions/layers.cpp; a child graph) each a graph of its own, its nodes
 // priced the same way (a conditional node with a body of 1, 100 and 400 kernels: 192, 256 and 1440 KiB a graph, 96 and
 // 128 KiB more than a chain of 1 and 400); the graph itself kGraphBytes (96 KiB for a graph of one node).
-constexpr size_t kGraphKernelBytes = 3584, kGraphParamBytes = 1024, kGraphParamCost = 3;
-constexpr size_t kGraphCopyBytes = 7 << 10, kGraphSetBytes = 1 << 10, kGraphOtherBytes = 16 << 10;
+constexpr size_t kGraphParamBytes = 1024, kGraphParamCost = 3;
+constexpr size_t kGraphSetBytes = 1 << 10, kGraphOtherBytes = 16 << 10;
 constexpr size_t kGraphBytes = 128 << 10;
+// A kernel node's and a device-to-device copy node's are the driver's for the GPU's architecture, three times apart
+// between the two measured (`cuda_bench graphs`, KiB a node in chains of 100, 400 and 1000 kernels; of 100 copies):
+//   sm_120  RTX 5060 Ti and RTX 5070 Ti, driver 610.88, Windows:  3.5, 3.3, 2.7;  5.8 a copy
+//   sm_86   RTX 3090, driver 615.71, Linux:                       9.0, 10.7, 8.5 (11.0 in chains of 200, and the
+//           same with 4 KB of parameters);  21.8 a copy
+// The other kinds and the graph's own are the same on both.  Priced at sm_120's, an RTX 3090's and an RTX 4090's
+// (sm_89) sessions took more of the device than the rooms they leased (the memory tests: 340 MiB in rooms of 225);
+// an RTX 5080's and an RTX 5090's on Linux did not.  So sm_120 has its prices and every other architecture, measured
+// or not, the larger ones: a room too large costs sessions, one too small is memory the plan does not know of.
+struct GraphPrices {
+  size_t kernel = 0, copy = 0;
+};
+constexpr GraphPrices graph_prices(int cc) {  // cc: the device's compute capability, major * 10 + minor
+  return cc / 10 == 12 ? GraphPrices{3584, 7 << 10} : GraphPrices{11776, 22 << 10};
+}
 // A graph's nodes by kind (a conditional node's bodies' among them), its largest kernel parameters, and what it takes
 // at most (graph_size).
 struct GraphSize {
@@ -453,6 +468,7 @@ struct flyx_bmodel {
   // Round graphs: every round plan lowered (plan_free forgets it) and its graph's size, counted when a
   // session's room for graphs is first asked after it was lowered (graph_room, which seq_bytes counts).
   std::mutex graph_mu;
+  flyx::cuda::GraphPrices graph_prices;  // the device's (graph_prices of its compute capability), set at open
   std::map<const flyx_plan*, flyx::cuda::PlanGraph> round_graphs;
 
   ~flyx_bmodel() {
@@ -1151,7 +1167,7 @@ void alloc_batch(flyx_bmodel* m);  // the batch rounds' buffers, at open
 // graphs (0 with graphs off; `count`: the plans no session captured yet sized first, on a session of their own, which
 // throws where that cannot be made); room for a graph of `bytes` beside the session's own and its shares of batch
 // graphs, the ones it ran least lately given up (false: none, the round runs without a graph).
-GraphSize graph_size(cudaGraph_t g);
+GraphSize graph_size(cudaGraph_t g, const GraphPrices& price);
 void plan_lowered(flyx_bmodel* m, const flyx_plan* p);
 void plan_counted(flyx_bmodel* m, const flyx_plan* p, size_t bytes);
 void forget_graphs(flyx_bmodel* m, const flyx_plan* p);

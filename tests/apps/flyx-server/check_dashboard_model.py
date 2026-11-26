@@ -258,6 +258,9 @@ def command(page):
 def confirm(page, button, action):
     """A load asked for and confirmed: it is posted, and the page shows the model's view, where its progress is."""
     page.locator(button).click()
+    if action == "Switch":
+        expect(page.locator(".modal")).to_contain_text("no model is served until another is loaded")
+        expect(page.locator(".modal")).not_to_contain_text("is loaded again")
     with page.expect_request(lambda r: r.method == "POST" and r.url.endswith("/v1/load")):
         page.locator(".modal").get_by_role("button", name=action).click()
     expect(page.locator("#mv-current")).to_be_visible()

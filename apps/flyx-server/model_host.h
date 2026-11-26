@@ -2,8 +2,8 @@
 // The model flyx serve serves, and loading another while it runs. flyx serve without a model starts
 // with none (or with the one it served last, remembered in the settings file); the dashboard's model panel names one
 // (POST /v1/load), and the host fetches it from the Hub while the current model still answers, then ends the current
-// one's requests, waits for its memory to come back, and loads the new one.  A new one that fails to load gives way
-// to the one served before it, loaded again.
+// one's requests, waits for its memory to come back, and loads the new one.  If the new one fails to load, no model is
+// served until another is loaded.
 #pragma once
 
 #include <atomic>
@@ -55,8 +55,7 @@ class ModelHost {
   // load can start; false (*err), without running it, while one is under way.
   bool with_files_in_use(const std::function<void(const std::vector<std::string>&)>& fn, std::string* err);
   // GET /v1/load: state ("none", "fetching", "loading", "ready", "failed"), what is wanted, the fetch's progress, the
-  // last error, notes, the served model's drafters and those published for it, the model served again after a
-  // switch failed (fallback), and what the settings file remembers.
+  // last error, notes, the served model's drafters and those published for it, and what the settings file remembers.
   ojson status() const;
 
   // The settings file: the last model loaded, as it was named, and optional Hub endpoint override.
@@ -92,7 +91,7 @@ class ModelHost {
   mutable std::mutex mu_;
   Served served_;
   apps::Fetched fetched_;  // the served model's files and drafters
-  std::string state_ = "none", error_, target_, fallback_;
+  std::string state_ = "none", error_, target_;
   std::vector<std::string> notes_;
   hub::Progress progress_;
   double since_ms_ = 0;

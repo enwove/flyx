@@ -620,6 +620,7 @@ int open_model(const flyx_model_desc* desc, const flyx_open_options* opts, flyx_
     // vector on the binary16 tensor cores (attention_rows.cu). And the loaded code must have them.
     const int dev_cc = prop.major * 10 + prop.minor;
     const int code_cc = compiled_arch();
+    m->graph_prices = graph_prices(dev_cc);
     m->opt.kernels.fp8_mma = dev_cc >= 90 && code_cc >= 89;
     // The GPU's own table, else its architecture's, unless the options name one or none.
     bool by_arch = false;

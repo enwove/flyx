@@ -1,5 +1,6 @@
 # Copyright 2026 The flyx Authors. SPDX-License-Identifier: Apache-2.0
-"""The model listing publishes stable Unix times and notices a changed, same-sized GGUF header."""
+"""The model listing publishes stable Unix times and notices a changed, same-sized GGUF header; a switch to a model
+that fails to load leaves none served."""
 import json
 import os
 from pathlib import Path
@@ -7,7 +8,8 @@ import shutil
 import struct
 import sys
 import tempfile
-from urllib.request import urlopen
+from urllib.request import Request, urlopen
+import time
 
 from remembered_model import serve
 
@@ -22,6 +24,30 @@ def gguf(layers, arch="test", has_markov=False):
     else:
         kv.append(string(arch + ".nextn_predict_layers") + struct.pack("<II", 4, layers))
     return b"GGUF" + struct.pack("<IQQ", 3, 0, len(kv)) + b"".join(kv)
+
+
+def check_failed_switch(url, root):
+    """A switch to a model that fails to load leaves the server with none (state "failed"): the model served before
+    is not loaded again, and what the settings file remembers stays, for a reload that is asked for."""
+    with urlopen(url + "/v1/load", timeout=5) as response:
+        before = json.load(response)
+    assert before["state"] == "ready" and before["model"] is not None and before["remembered"] is not None, before
+    bogus = root / "not-a-model.gguf"
+    bogus.write_bytes(b"not a valid gguf \x00\x01\x02")
+    req = Request(url + "/v1/load", data=json.dumps({"model": str(bogus)}).encode("utf-8"),
+                  headers={"Content-Type": "application/json"}, method="POST")
+    with urlopen(req, timeout=5) as response:
+        assert response.status == 202
+    deadline = time.monotonic() + 30
+    after = {}
+    while time.monotonic() < deadline:
+        with urlopen(url + "/v1/load", timeout=5) as response:
+            after = json.load(response)
+        if after.get("state") not in ("fetching", "loading"):
+            break
+        time.sleep(0.05)
+    assert after["state"] == "failed" and after["model"] is None and after["fallback"] is None, after
+    assert after["error"] and after["remembered"] == before["remembered"], after
 
 
 def check_listing(url, file):
@@ -135,4 +161,9 @@ if __name__ == "__main__":
         shutil.copyfile(asset, model)
         env = dict(os.environ, APPDATA=tmp, XDG_CONFIG_HOME=tmp, HF_HOME=tmp, HF_HUB_CACHE=str(root / "hub"),
                    HF_HUB_OFFLINE="1", FLYX_MODELS_DIR=tmp, FLYX_BACKEND_DIR=str(exe.parent))
-        serve(exe, root, env, [str(model)], lambda url: check_listing(url, root / "weights.gguf"))
+
+        def checks(url):
+            check_listing(url, root / "weights.gguf")
+            check_failed_switch(url, root)  # last: it leaves the server with no model
+
+        serve(exe, root, env, [str(model)], checks)

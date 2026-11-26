@@ -326,7 +326,6 @@ void ModelHost::reset_load_state_locked(const std::string& state, const std::str
   state_ = state;
   target_ = target;
   error_.clear();
-  fallback_.clear();
   notes_.clear();
   progress_ = {};
   since_ms_ = os::now_ms();
@@ -434,40 +433,24 @@ bool ModelHost::work(const Want& w, std::string* err) {
     return false;
   }
   for (const std::string& n : f.notes) std::fprintf(stderr, "flyx-server: %s\n", n.c_str());
-  // The model served now, kept to load again should the new one fail: memory for both at once is not to be had.
-  Served old;
-  Want old_want;
-  apps::Fetched old_files;
+  // Unload the model served now so its GPU memory is free before the new one loads.
+  std::shared_ptr<Scheduler> old;
   {
     std::lock_guard<std::mutex> lock(mu_);
     state_ = "loading", notes_ = f.notes;
-    old = std::move(served_), old_want = last_, old_files = std::move(fetched_);
+    old = std::move(served_.sched);
     served_ = {}, fetched_ = {};
   }
-  const bool switching = old.sched != nullptr;
-  retire(std::move(old.sched));
+  const bool switching = old != nullptr;
+  retire(std::move(old));
   std::string why;
   double load_s = 0;
   auto sched = open(f, w.eo, &load_s, &why);
   if (!sched) {
-    if (!switching) {
-      std::lock_guard<std::mutex> lock(mu_);
-      *err = error_ = why, state_ = "failed";
-      return false;
-    }
-    std::fprintf(stderr, "flyx-server: %s did not load: serving %s again\n", w.model.c_str(), old.name.c_str());
-    std::string again;
-    auto back = open(old_files, old_want.eo, &load_s, &again);
-    if (back) log_loaded(*back, old.name, load_s);
+    std::fprintf(stderr, "flyx-server: %s did not load: none served\n", w.model.c_str());
     std::lock_guard<std::mutex> lock(mu_);
-    if (back) {
-      served_ = {back, old.name}, fetched_ = std::move(old_files);
-      notes_ = fetched_.notes, state_ = "ready", fallback_ = old.name, error_ = w.model + ": " + why;
-    } else {
-      std::fprintf(stderr, "flyx-server: %s did not load again either: none served\n", old.name.c_str());
-      state_ = "failed", error_ = w.model + ": " + why + "; " + old.name + ", loaded again: " + again;
-    }
-    *err = error_;
+    *err = error_ = switching ? (w.model + ": " + why) : why;
+    state_ = "failed";
     return false;
   }
   const std::string name = !w.name.empty() ? w.name : f.name;
@@ -490,7 +473,7 @@ ojson ModelHost::status() const {
              {"target", target_.empty() ? ojson(nullptr) : ojson(target_)},
              {"error", error_.empty() ? ojson(nullptr) : ojson(error_)},
              {"notes", notes_},
-             {"fallback", fallback_.empty() ? ojson(nullptr) : ojson(fallback_)},
+             {"fallback", ojson(nullptr)},
              {"drafters", drafters_json(served_.sched ? fetched_.drafter_sources : std::vector<apps::DrafterSource>{}, "from")},
              {"suggested", drafters_json(served_.sched ? fetched_.suggested : std::vector<apps::DrafterSource>{}, "name")},
              {"vision_projector",

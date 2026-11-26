@@ -89,7 +89,7 @@ namespace {
 // g's nodes into out, each priced by its kind; the graphs a node holds (a conditional node's bodies, as DV's canvas
 // pass is one: regions/layers.cpp dv_context_unless_noop; a child graph) each a graph of its own, kGraphBytes and its
 // nodes the same way (cuda_bench graphs: a body of 400 kernels takes 128 KiB more than a chain of 400).
-void add_nodes(cudaGraph_t g, GraphSize& out) {
+void add_nodes(cudaGraph_t g, const GraphPrices& price, GraphSize& out) {
   size_t n = 0;
   CK(cudaGraphGetNodes(g, nullptr, &n));
   std::vector<cudaGraphNode_t> nodes(n);
@@ -106,10 +106,10 @@ void add_nodes(cudaGraph_t g, GraphSize& out) {
       ++out.kernels;
       out.params_unknown += known < 0 ? 1 : 0;
       out.params_most = std::max(out.params_most, known < 0 ? 0 : params);
-      out.bytes += kGraphKernelBytes + kGraphParamCost * (params > kGraphParamBytes ? params - kGraphParamBytes : 0);
+      out.bytes += price.kernel + kGraphParamCost * (params > kGraphParamBytes ? params - kGraphParamBytes : 0);
     } else if (type == cudaGraphNodeTypeMemcpy) {
       ++out.copies;
-      out.bytes += kGraphCopyBytes;
+      out.bytes += price.copy;
     } else if (type == cudaGraphNodeTypeMemset) {
       ++out.sets;
       out.bytes += kGraphSetBytes;
@@ -125,13 +125,13 @@ void add_nodes(cudaGraph_t g, GraphSize& out) {
         }
         for (unsigned b = 0; b < body_count; ++b) {
           ++out.bodies;
-          add_nodes(bodies[b], out);
+          add_nodes(bodies[b], price, out);
         }
       } else if (type == cudaGraphNodeTypeGraph) {
         cudaGraph_t child = nullptr;
         CK(cudaGraphChildGraphNodeGetGraph(node, &child));
         ++out.bodies;
-        add_nodes(child, out);
+        add_nodes(child, price, out);
       }
     }
   }
@@ -139,9 +139,9 @@ void add_nodes(cudaGraph_t g, GraphSize& out) {
 
 }  // namespace
 
-GraphSize graph_size(cudaGraph_t g) {
+GraphSize graph_size(cudaGraph_t g, const GraphPrices& price) {
   GraphSize out;
-  add_nodes(g, out);
+  add_nodes(g, price, out);
   return out;
 }
 
@@ -218,19 +218,19 @@ size_t graph_keep(const flyx_seq& s, bool count) {
     if (s.page_spill_auto) {
       // Auto mode may instantiate either all-pinned adaptive graphs or flat pageable graphs (up to s.copies layers).
       const size_t ad_branches = plan->adaptive() ? std::max<size_t>(1, plan->checkpoints.size()) : 1;
-      const size_t round_pinned = g.bytes + (ad_branches * kernels + kMtpWindowNodes * steps) * kGraphKernelBytes +
-                                  ad_branches * copies * kGraphCopyBytes + ad_branches * others * kGraphOtherBytes;
+      const size_t round_pinned = g.bytes + (ad_branches * kernels + kMtpWindowNodes * steps) * m->graph_prices.kernel +
+                                  ad_branches * copies * m->graph_prices.copy + ad_branches * others * kGraphOtherBytes;
       const size_t page_k = s.copies > 0 ? 1 + size_t(s.copies) : 0;
       const size_t page_o = s.copies > 0 ? size_t(s.copies) : 0;
-      const size_t round_paged = g.bytes + (kernels + page_k + kMtpWindowNodes * steps) * kGraphKernelBytes +
-                                 copies * kGraphCopyBytes + (others + page_o) * kGraphOtherBytes;
+      const size_t round_paged = g.bytes + (kernels + page_k + kMtpWindowNodes * steps) * m->graph_prices.kernel +
+                                 copies * m->graph_prices.copy + (others + page_o) * kGraphOtherBytes;
       round = std::max(round_pinned, round_paged);
     } else {
       const size_t branches = (plan->adaptive() && s.page_layers.empty())
                                   ? std::max<size_t>(1, plan->checkpoints.size())
                                   : 1;
-      round = g.bytes + (branches * kernels + kMtpWindowNodes * steps) * kGraphKernelBytes +
-              branches * copies * kGraphCopyBytes + branches * others * kGraphOtherBytes;
+      round = g.bytes + (branches * kernels + kMtpWindowNodes * steps) * m->graph_prices.kernel +
+              branches * copies * m->graph_prices.copy + branches * others * kGraphOtherBytes;
     }
     room += round;
     most = std::max(most, round);

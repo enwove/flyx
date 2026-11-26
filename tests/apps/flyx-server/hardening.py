@@ -164,8 +164,13 @@ def check_browser(url):
 
 
 def check_statuses(url):
-    """A schema no grammar can be made from is the request's error (400), told without the paths of the build."""
+    """Invalid launch options and schemas return a client error."""
     cl = Client(url, None)
+    # Reject invalid launch options before opening a desktop dialog or window on any platform.
+    for agent, mode in (("claude", "unknown"), ("claude", None), ("claude", ""), ("codex", "acceptEdits")):
+        status, result = cl.post("/v1/agents/launch", {
+            "agent": agent, "permission_mode": mode, "dir": str(Path(TMP) / "missing-project")})
+        assert status == 400 and "permission_mode" in result["error"]["message"], (agent, mode, status, result)
     for path, body in [("/v1/chat/completions", {"max_tokens": 4, "messages": ME, "response_format": {"type": "json_schema", "json_schema": {"name": "a", "schema": {"type": 5}}}}),
                        ("/v1/chat/completions", {"max_tokens": 4, "messages": ME, "stream": True, "response_format": {"type": "json_schema", "json_schema": {"name": "a", "schema": {"$ref": "#/$defs/nope"}}}}),
                        ("/v1/responses", {"max_output_tokens": 4, "input": "x", "text": {"format": {"type": "json_schema", "name": "a", "schema": {"enum": []}}}}),

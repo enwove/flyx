@@ -1,6 +1,6 @@
 // Copyright 2026 The flyx Authors. SPDX-License-Identifier: Apache-2.0
 // Coding agents the dashboard starts in a window of their own on the server's machine (POST /v1/agents/launch).  The
-// server writes their command from what it serves, never from the request: the page names an agent and a folder.
+// server writes their command from what it serves and the launch options accepted by the route.
 #pragma once
 
 #include <cstdint>
@@ -17,6 +17,7 @@ struct AgentTarget {
   std::string model;   // the API's model id
   int64_t context = 0;
   bool keyed = false;  // the server takes an API key: the window has it in FLYX_KEY, the command refers to that
+  std::string permission_mode = {};  // Claude Code only; empty follows the client's settings
 };
 
 // The Windows PowerShell command that starts `agent` against the server: the launch commands the Integration page shows
