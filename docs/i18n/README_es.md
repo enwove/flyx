@@ -50,7 +50,7 @@
 
 ## Novedades
 
-- **v0.2.1** — Inkling-2-Mini incorpora MoE disperso, kernels de decodificación optimizados y su drafter Markov DSpark, que se carga automáticamente. Qwen3.5/3.8 admite imágenes con un proyector compatible. El Hub descubre los archivos asociados y **Draft with it** permite elegir el drafter. La carga se adapta a la VRAM disponible. DFlash2 usa una caché KV circular para la ventana deslizante. El candidato de Windows sin PTX ocupa 57,15 MB frente a los 58,96 MB de v0.2.0.
+- **v0.2.1** — Inkling-2-Mini incorpora MoE disperso, kernels de decodificación optimizados y su drafter Markov DSpark, que se carga automáticamente. Qwen3.5/3.8 admite imágenes con un proyector compatible. El Hub descubre los archivos asociados y **Draft with it** permite elegir el drafter. La carga se adapta a la VRAM disponible. DFlash2 usa una caché KV circular para la ventana deslizante. El candidato de Windows sin PTX ocupa 57,14 MB frente a los 58,96 MB de v0.2.0.
 - **`v0.2.0`** — **Primer lanzamiento open-source de FLYX**: `.exe` independiente de ~59 MB para Windows y archivo tar.gz para Linux sin dependencias, inferencia GGUF y NVFP4 de contexto completo nativo con extensión automática de K/V entre GPU y RAM, decodificación especulativa integrada (MTP / DFlash2), panel web en 7 idiomas e integración en un clic con Claude Code / Codex CLI.
 
 ## Rendimiento
