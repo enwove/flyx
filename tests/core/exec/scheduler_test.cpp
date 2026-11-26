@@ -471,9 +471,12 @@ int main(int argc, char** argv) {
   eo.chat_template = "{% for m in messages %}{{ m.role }}:{{ m.content }}|{% endfor %}"
                      "{% if add_generation_prompt %}{{ messages[-1].content }}?{% endif %}";
   // A request that must still be running when the next one arrives: the tiny
-  // model writes hundreds of tokens in the time a thread may be held up (the
-  // float64 backend is slower, and gets fewer).
-  const int kLong = eo.backend == "cpu_ref" ? 300 : 1500;
+  // model writes hundreds of tokens in the time a thread may be held up.  The
+  // float64 backend is slower a round, but its lookup rounds take 8 to 11 of
+  // these repeating prompts' tokens each (some 4000 tokens a second): 300 of
+  // them were over in 44 to 74 ms, which a loaded machine outlasted (2 failed
+  // runs in at most 21 beside other tests at -j 6): 1200, some 300 ms.
+  const int kLong = eo.backend == "cpu_ref" ? 1200 : 1500;
   SchedulerOptions so;
   so.max_sessions = 2;
   so.host_cache_bytes = SnapshotStore::kPieceBytes;  // enough for one tiny checkpoint
@@ -581,7 +584,9 @@ int main(int argc, char** argv) {
     check(concurrent && another->done && working->done,
           "a title matching both resident conversations equally uses the idle slot while the main one runs");
   }
-  const int N = 40;
+  // Long enough that two requests sent one after the other run at once (they overlap in time, below): 40 tokens were
+  // 10 ms on cpu_ref, less than the test's thread may wait between the two sends on a loaded machine.
+  const int N = 200;
   const std::string a = "alpha beta gamma delta " + words("one two three", 4);
   const std::string b = "The quick brown fox " + words("jumps over", 6);
   std::printf("prompts of %d and %d tokens, context %d\n", sched.count_text_tokens(a), sched.count_text_tokens(b),
