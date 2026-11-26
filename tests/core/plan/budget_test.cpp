@@ -72,6 +72,37 @@ int seq_size_auto(flyx_bmodel* bm, const flyx_seq_layout* l, flyx_seq_size* out)
 
 const plan::KvTiers kGpuOnly{-1, 0};
 
+void check_shortfall_replay(flyx_backend_api api, plan::KvTiers tiers, const plan::Budget& before, int wanted,
+                            int min_ctx, bool longest = false) {
+  if (!before.ctx_need_more) return;
+  flyx_memory_info memory{};
+  api.memory(nullptr, &memory);
+  uint64_t room = before.sessions_room;
+  if (before.ctx_limit == plan::CtxLimit::kGpu) {
+    // A larger fake GPU with exactly the quoted extra session room after its reserve.
+    room += before.ctx_need_more;
+    memory.total = 64 * kGiB;
+    memory.free = memory.total / 40 + room;
+  } else {
+    tiers.ram = int64_t(before.host_budget + before.ctx_need_more);
+  }
+  api.memory = [](flyx_bmodel* bm, flyx_memory_info* out) {
+    *out = *reinterpret_cast<flyx_memory_info*>(bm);
+    return 0;
+  };
+  ResourceLedger ledger;
+  plan::Budget after;
+  int ctx = wanted;
+  std::string err;
+  const bool ok = plan::account(&api, reinterpret_cast<flyx_bmodel*>(&memory), false, false, &ctx, min_ctx, tiers,
+                                &ledger, &after, &err, longest);
+  check(ok && ctx == wanted && after.layout.max_ctx == wanted && after.sessions_room == room &&
+            after.host_budget == uint64_t(tiers.ram) &&
+            after.session_bytes <= after.sessions_room && after.session_host_bytes <= after.host_budget,
+        "adding the reported " + std::to_string(before.ctx_need_more) + " bytes holds " + std::to_string(wanted) +
+            " positions: " + err);
+}
+
 }  // namespace
 
 int main() {
@@ -193,6 +224,7 @@ int main() {
     seq_bytes(nullptr, 262144, &wanted_gpu);
     check(b.ctx_need_more == wanted_gpu - ledger.available(),
           "GPU-only shortfall matches exact bytes needed for max context");
+    check_shortfall_replay(api, kGpuOnly, b, 262144, 4096);
     uint64_t next = 0;
     seq_bytes(nullptr, ctx + 1024, &next);
     check(next > ledger.available(), "and 1024 more would not fit");
@@ -231,6 +263,7 @@ int main() {
     const int want = int((paged_left - kGiB) / (64 * 1024)) / 1024 * 1024;
     check(ok && ctx == want, "GPU memory Windows pages: 832 MiB reserve floor (" + std::to_string(ctx) + ", want " +
                                  std::to_string(want) + ")");
+    check_shortfall_replay(api, paged, b, 262144, 4096);
   }
   {  // on a large GPU where base reserve (total / 40) already exceeds 832 MiB, gpu_paged adds nothing extra
     auto large = fake();
@@ -289,6 +322,8 @@ int main() {
     check(plan::account(&api, nullptr, false, false, &ctx, 4096, tiers, &ledger, &b, &err) && ctx == longest &&
               b.layout.device_positions >= ctx && !b.session_host_bytes,
           "too little host memory for the rest: it shrinks as before (" + std::to_string(ctx) + ")");
+    check(b.ctx_limit == plan::CtxLimit::kGpu && b.ctx_need_more == 0,
+          "1 GiB of host RAM can cover K/V on reload: the GPU-only shortfall is unknown");
   }
   {
     ResourceLedger ledger;
@@ -341,6 +376,7 @@ int main() {
               why.find("does not fit host memory: 4.29 GB of it can be spared") != std::string::npos &&
               why.find("more RAM needed for max context") != std::string::npos,
           "and says host memory cut it with max-context shortfall: " + why);
+    check_shortfall_replay(api, tiers, b2, 262144, 0, true);
   }
   {  // --ctx max with --kv-method auto: 14 GiB of host memory hold 262,144 positions every one exact (each step then
      // reads the K/V past the GPU's part over the bus), not with the copy: --ctx 262144 takes the first, --ctx max a
@@ -359,6 +395,7 @@ int main() {
     check(ok2 && most_ctx > 131072 && most_ctx < 262144 && !most.auto_exact &&
               most.session_host_bytes <= uint64_t(14 * kGiB),
           "--ctx max with auto: the longest with the copy (" + std::to_string(most_ctx) + ") " + e2);
+    check_shortfall_replay(api_auto, tiers, most, 262144, 0, true);
   }
   {  // the copy: 300,000 positions' copies take 4.6 GiB on the GPU, more than the 4.1 GiB left beside
      // the fixed state; with 4 in host memory the other 12 and two stagings take 4.0 GiB, with 3 4.3 GiB
@@ -506,13 +543,23 @@ int main() {
     int ctx = 262144;
     const bool ok = plan::account(&api_copy, nullptr, false, false, &ctx, 1024, tiers, &ledger, &b, &err, true);
     const std::string why = plan::ctx_limit_note(b);
-    check(ok && ctx > 120000 && ctx <= 131072 && b.ctx_limit == plan::CtxLimit::kGpu && b.ctx_need_more > 0 &&
+    check(ok && ctx > 120000 && ctx <= 131072 && b.ctx_limit == plan::CtxLimit::kGpu && b.ctx_need_more == kGiB / 4 &&
               b.sessions_room == kGiB + kGiB / 4 &&
               why.find("does not fit the GPU: the sessions have 1.34 GB of it after the weights; other programs and "
                        "the driver hold") != std::string::npos &&
               why.find("more VRAM needed for max context") != std::string::npos &&
               why.find("(closing other programs gives a longer context)") != std::string::npos,
           "--ctx max cut by the GPU (" + std::to_string(ctx) + "): " + why + " " + err);
+    check_shortfall_replay(api_copy, tiers, b, 262144, 1024, true);
+    for (int host_gib : {15, 1}) {
+      ctx = 262144;
+      tiers.ram = int64_t(host_gib * kGiB);
+      const auto limit = host_gib == 15 ? plan::CtxLimit::kGpu : plan::CtxLimit::kHost;
+      check(plan::account(&api_copy, nullptr, false, false, &ctx, 1024, tiers, &ledger, &b, &err, true) &&
+                ctx < 262144 && b.ctx_limit == limit && b.ctx_need_more == 0,
+            "262144 positions with 1.25 GiB of GPU room and " + std::to_string(host_gib) +
+                " GiB of host RAM: the other side cannot hold the candidate layout");
+    }
     g_others = 0, g_split = false;
   }
   {  // FLYX_KV_AUTO falls back to exact at a short context (when Strata has a fixed staging floor), yet at max_ctx
@@ -548,6 +595,22 @@ int main() {
     check(ok && ctx > 0 && ctx < 262144 && b.ctx_limit == plan::CtxLimit::kGpu && b.ctx_need_more == want_strata_need,
           "FLYX_KV_AUTO exact-fallback shortfall reports Strata VRAM need (" + std::to_string(b.ctx_need_more) +
               " vs want " + std::to_string(want_strata_need) + ")");
+    check_shortfall_replay(api_auto, tiers, b, 262144, 1024, true);
+    for (int wanted : {32768, 36864}) {
+      // At 32768 the exact quote keeps Strata below its staging floor. At 36864 it would admit a shorter Strata
+      // context, which --ctx max would select, so only the Strata quote can deliver wanted.
+      ctx = wanted;
+      const uint64_t need = wanted == 32768 ? 256 * kMiB : 256 * kMiB + uint64_t(wanted) * 2048;
+      check(plan::account(&api_auto, nullptr, false, false, &ctx, 1024, tiers, &ledger, &b, &err, true) &&
+                ctx < wanted && b.ctx_limit == plan::CtxLimit::kGpu && b.ctx_need_more == need,
+            "AUTO reports the replayable shortfall for " + std::to_string(wanted) + " positions");
+      check_shortfall_replay(api_auto, tiers, b, wanted, 1024, true);
+    }
+    ctx = 262144;
+    tiers.ram = int64_t(15 * kGiB);
+    check(plan::account(&api_auto, nullptr, false, false, &ctx, 1024, tiers, &ledger, &b, &err, true) &&
+              ctx < 262144 && b.ctx_limit == plan::CtxLimit::kGpu && b.ctx_need_more == 0,
+          "AUTO reports no GPU shortfall when both Strata and exact candidates exceed the host budget");
     g_others = 0, g_split = false;
   }
   // What --kv-ram auto leaves to the rest of the machine: 2 GiB up to 32 GiB of RAM (a 32 GB machine shows 31.2 GiB
