@@ -32,7 +32,7 @@
   <a href="../../llms.txt">llms.txt</a>
 </p>
 
-**FLYX**는 의존성 제로 로컬 LLM 추론 엔진입니다. 지원하는 GGUF 모델을 직접 실행하고 OpenAI 및 Anthropic 호환 API로 브라우저, 스크립트, 코딩 에이전트에 연결합니다.
+**FLYX**는 의존성 제로 로컬 LLM 추론 엔진으로, Windows에서는 약 57 MB 단일 `.exe` 하나에 담깁니다. 빠른 추측 디코딩, 네이티브 롱 컨텍스트, GPU별 자동 튜닝을 제공하며 별도의 설정이 필요하지 않습니다. 지원하는 GGUF 모델을 변환 없이 그대로 실행하고 OpenAI 및 Anthropic 호환 API를 통해 브라우저, 스크립트, 코딩 에이전트에 바로 연결할 수 있습니다.
 
 <p align="center">
   <img src="../media/dashboard-light.png" width="900" alt="실시간 처리량, 롱 컨텍스트 세션, VRAM/RAM 사용량 및 최근 에이전트 요청을 표시하는 FLYX 내장 웹 대시보드">
@@ -41,39 +41,49 @@
 
 ## 주요 기능
 
-- 긴 컨텍스트에는 VRAM과 시스템 RAM을 함께 사용합니다. 한쪽 메모리 예산을 늘리면 요청한 길이에 도달할 때 필요한 추가 바이트 수를 표시합니다.
+- **출력을 바꾸지 않는 추측 디코딩** — MTP, DFlash2, DSpark 드래프터와 프롬프트 룩업을 내장했습니다. Qwen3.8-27B는 RTX 5090에서 코드를 **565.5 tok/s**(기본 디코딩의 **6.03×**)로 생성하며, 모든 토큰이 기본 디코딩 결과와 동일합니다([성능](#성능)).
+- **품질 저하 없는 네이티브 롱 컨텍스트** — 16 GB 카드를 포함한 단일 소비자용 GPU에서 Qwen3.8-27B의 262K 전체 컨텍스트를 그대로 활용합니다. K/V 캐시가 VRAM을 초과하더라도 잘라내거나 슬라이딩 윈도우를 쓰지 않고 시스템 RAM으로 매끄럽게 확장합니다: **RTX 5090(`NVFP4`) 256K에서 164.5 tok/s**, **24 GB RTX 4090 256K에서 122.7 tok/s**, 그리고 **32K–256K 롱 컨텍스트 검색(NIAH) 100% 정확도**([v0.2.0 측정값](../benchmarks.md#1-qwen38-27b-long-context-coding-benchmark)).
 - **GPU별 사전 튜닝, 수동 플래그 불필요** — 11종의 NVIDIA GPU에 대한 실측 커널 튜닝 테이블을 내장하고 있으며, 가용 메모리를 기준으로 컨텍스트 길이, K/V 정밀도, GPU/RAM 배치를 자동 결정합니다. 오프로드 레이어 수, 배치 크기, 캐시 타입을 직접 맞출 필요가 없습니다.
-- **설치 불필요, 의존성 제로, 약 57 MB** — Windows 실행 파일에는 CUDA 및 C++ 런타임이 포함됩니다.
+- **설치 불필요, 의존성 제로, 약 57 MB** — CUDA 및 C++ 런타임이 정적으로 링크되어 있어 NVIDIA 드라이버(≥ 580)만 있으면 됩니다. CUDA Toolkit, Python, Docker가 필요 없습니다. Windows에서는 약 57 MB 단일 `.exe`(더블 클릭 실행), Linux에서는 tar.gz 압축 파일로 제공됩니다.
+- **이미지 입력** — `mmproj` 프로젝터를 갖춘 비전 지원 모델은 CLI(`--image`), OpenAI 및 Anthropic API, 대시보드 붙여넣기 또는 드래그 앤 드롭으로 이미지를 받습니다.
 - **내장 웹 대시보드 및 터미널 모니터** — 실행 즉시 7개 언어를 지원하는 브라우저 UI가 열리며, 단계별 안내와 함께 Hugging Face 또는 로컬 모델 검색·다운로드, 채팅, 현지화된 API 문서 확인, 실시간 처리량·VRAM/RAM 분할·세션·요청·로그 모니터링을 제공합니다([모니터 가이드](../monitor.md)).
 - **원클릭 코딩 에이전트 연동** — 도구 호출과 멀티턴 프롬프트 재사용을 지원하는 OpenAI(Chat Completions, Responses) 및 Anthropic Messages API를 제공합니다. **연동(Integration)** 탭에서 프로젝트 폴더를 선택해 **Claude Code** 또는 **Codex CLI**를 바로 실행할 수 있으며(Windows), **DeepSeek Harness, OpenCode, Pi**용 실행 명령도 원클릭 복사할 수 있습니다.
-- CUDA 커널 테스트는 float64 참조값과 결과를 비교합니다. 벤치마크에서 추측 디코딩과 기본 디코딩의 출력 ID가 일치한 GPU와 프롬프트를 확인할 수 있습니다. [float64](../design/numerics.md).
+- **검증된 정확도** — 모든 GPU 커널을 `float64` 레퍼런스 구현과 대조 테스트합니다. 기본 FP8 K/V는 27B 모델에서 16-bit 대비 **KL 0.0009–0.0016** 이내를 유지하며, 추측 디코딩의 출력은 기본 디코딩과 **토큰 단위로 완전히 동일**합니다([수치 규격](../design/numerics.md)).
 
 ## 업데이트
 
-- **v0.2.1** — Inkling-2-Mini의 희소 MoE와 디코딩 커널을 최적화하고 Markov 드래프터 DSpark를 자동으로 연결합니다. Qwen3.5/3.8은 호환 프로젝터로 이미지를 처리합니다. Hub가 관련 파일을 찾으면 **Draft with it**으로 드래프터를 선택할 수 있습니다. 가용 VRAM에 맞춰 드래프터를 로드하며 슬라이딩 윈도 DFlash2에는 링 KV 캐시를 사용합니다. PTX가 없는 Windows 후보 버전은 57.14 MB로 v0.2.0의 58.96 MB보다 작습니다.
+- **`v0.2.1`** — **GPU 4종에서 검증한 속도, Inkling-2-Mini와 DSpark, 이미지 입력**:
+  - **Qwen3.8-27B + DFlash2**의 코드 생성 속도는 RTX 5090에서 **565.5 tok/s**(기본 디코딩의 **6.03×**), RTX 4090에서 **305.7**, 16 GB RTX 5070 Ti에서 **332.8**, RTX 3090에서 **234.1**입니다. 5090의 `NVFP4` W4A4 프리필은 **15,496 tok/s**입니다.
+  - **Inkling-2-Mini + DSpark** — 새로 지원하는 희소 MoE 모델이며 DSpark가 자동으로 연결됩니다. 코드 생성은 5090에서 **438.9 tok/s**(기본 디코딩의 **1.92×**), 4090에서 **322.4**, 5070 Ti에서 **276.2**, 3090에서 **222.0**입니다.
+  - **비전** — `mmproj` 프로젝터를 갖춘 비전 지원 모델에 CLI, OpenAI 및 Anthropic API, 대시보드 붙여넣기 / 드롭으로 이미지를 입력할 수 있습니다.
+  - **여전히 의존성 제로** — Windows 단일 `.exe`, 이제 약 57 MB.
 - **`v0.2.0`** — **FLYX 첫 오픈소스 릴리스**: 약 59 MB 무의존성 Windows 단일 `.exe` 및 Linux tar.gz, 자동 GPU/RAM K/V 확장을 갖춘 네이티브 풀 컨텍스트 GGUF & NVFP4 추론, 내장 추측 디코딩(MTP / DFlash2), 7개 언어 웹 대시보드, 원클릭 Claude Code / Codex CLI 연동 지원.
 
 ## 성능
 
-Qwen3.8-27B 디코딩 속도(토큰/초). 처음 세 열은 혼합 프롬프트 3개에서 각각 128토큰을 생성한 결과입니다. 마지막 열은 첫 번째 코드 프롬프트에서 검색 없이 128토큰을 생성한 값입니다.
+GPU 4종에서 검증한 v0.2.1 디코딩 속도(토큰/초, greedy)입니다. **기본**은 드래프터 없이 디코딩한 값이고, 두 **추측** 열은 채팅과 코드 프롬프트에서 드래프터를 켠 값이며 괄호 안은 기본 디코딩 대비 속도 향상 배수입니다.
 
-| GPU | Qwen3.8-27B | 기본 | MTP | DFlash2 | 코드 DFlash2 |
-|---|---|---:|---:|---:|---:|
-| RTX 5090 · Linux | NVFP4 | 93.8 | 286.6 | 315.5 | 565.5 |
-| RTX 4090 · Linux | UD-Q4_K_XL | 49.4 | 158.0 | 171.6 | 305.7 |
-| RTX 3090 · Linux | UD-Q4_K_XL | 42.8 | 121.7 | 131.2 | 234.1 |
-| RTX 5070 Ti · Windows | UD-IQ3_XXS | 68.8 | 167.2 | 154.4 | 332.8 |
+**Qwen3.8-27B + DFlash2** — 채팅 / 혼합: 프롬프트 3개 × 128토큰, 코드: 프롬프트 1개 × 128토큰.
 
-Inkling-2-Mini(UD-IQ3_XXS)의 기본 디코딩 → Markov DSpark(Q8_0) 속도(토큰/초). 각 쌍의 출력 토큰 ID가 일치했습니다.
+| GPU | 양자화 | 기본 | 추측 · 채팅 / 혼합 | 추측 · 코드 |
+|---|---|---:|---:|---:|
+| **RTX 5090** (32 GB) | `NVFP4` | 93.8 | **315.5** (3.36×) | **565.5** (6.03×) |
+| **RTX 4090** (24 GB) | `UD-Q4_K_XL` | 49.4 | **171.6** (3.47×) | **305.7** (6.18×) |
+| **RTX 3090** (24 GB) | `UD-Q4_K_XL` | 42.8 | **131.2** (3.06×) | **234.1** (5.46×) |
+| **RTX 5070 Ti** (16 GB) | `UD-IQ3_XXS` | 68.8 | **154.4** (2.24×) | **332.8** (4.84×) |
 
-| GPU | chat_short · 8 × 128 | code_short · 8 × 384 |
-|---|---:|---:|
-| RTX 5090 · Linux | 225.5 → 259.8 | 228.5 → 438.9 |
-| RTX 4090 · Linux | 166.7 → 202.9 | 167.9 → 322.4 |
-| RTX 3090 · Linux | 126.2 → 136.5 | 126.9 → 222.0 |
-| RTX 5070 Ti · Windows | 150.9 → 169.3 | 153.6 → 276.2 |
+**Inkling-2-Mini + DSpark** — 채팅 / 혼합: 프롬프트 8개 × 128토큰, 코드: 프롬프트 8개 × 384토큰.
 
-[측정값과 명령어](../benchmarks.md#v021-four-gpu-verified-benchmarks)
+| GPU | 양자화 | 기본 | 추측 · 채팅 / 혼합 | 추측 · 코드 |
+|---|---|---:|---:|---:|
+| **RTX 5090** (32 GB) | `UD-IQ3_XXS` | 225.5 | **259.8** (1.15×) | **438.9** (1.92×) |
+| **RTX 4090** (24 GB) | `UD-IQ3_XXS` | 166.7 | **202.9** (1.22×) | **322.4** (1.92×) |
+| **RTX 3090** (24 GB) | `UD-IQ3_XXS` | 126.2 | **136.5** (1.08×) | **222.0** (1.75×) |
+| **RTX 5070 Ti** (16 GB) | `UD-IQ3_XXS` | 150.9 | **169.3** (1.12×) | **276.2** (1.80×) |
+
+<sub>**×**는 같은 프롬프트에서 기본 디코딩 대비 속도 향상 배수이며 반올림 전 속도로 계산했습니다. **기본** 열은 채팅 / 혼합 측정값입니다. 토큰 ID를 기록한 모든 측정에서 추측 디코딩의 출력은 기본 디코딩과 토큰 단위로 일치했습니다(ID를 기록하지 않은 것은 Windows의 Qwen 혼합 측정뿐입니다). RTX 5070 Ti만 네이티브 Windows 11이고 나머지는 Linux입니다.</sub>
+
+<sub>**추가 측정:** Qwen3.8-27B에 내장된 **MTP** 드래프터(추가 파일 불필요)는 혼합 프롬프트에서 **286.6 / 158.0 / 121.7 / 167.2 tok/s**입니다(5090 / 4090 / 3090 / 5070 Ti). **RTX 5090 `NVFP4`:** W4A4 프리필 **15,496 tok/s**, 128K 컨텍스트에서 MTP **203.8 tok/s**(기본: 73.4), 256K에서 **164.5 tok/s**와 롱 컨텍스트 검색 정확도 **100%**(v0.2.0 측정). 하드웨어, 드라이버, 정확한 명령어는 [docs/benchmarks.md](../benchmarks.md#v021-four-gpu-verified-benchmarks)를 참고하세요.</sub>
 
 ## 빠른 시작
 
@@ -90,12 +100,12 @@ Inkling-2-Mini(UD-IQ3_XXS)의 기본 디코딩 → Markov DSpark(Q8_0) 속도(�
 ./bin/flyx serve unsloth/Qwen3.8-27B-GGUF:UD-Q4_K_XL
 ```
 
-Linux에서 Hub 다운로드에는 시스템 libcurl을 사용합니다.
-
-첫 번째 명령은 DSpark를 자동으로 연결합니다. 두 번째 명령은 Hub 프로젝터와 Qwen으로 이미지를 처리합니다.
+두 가지를 더 실행해 보세요. DSpark 드래프터와 비전 프로젝터는 모델과 함께 다운로드됩니다:
 
 ```sh
+# Inkling-2-Mini (DSpark 자동 연결)
 flyx serve unsloth/Inkling-2-Mini-GGUF:UD-IQ3_XXS
+# 이미지에 대해 질문하기
 flyx run unsloth/Qwen3.8-27B-GGUF:UD-Q4_K_XL --image photo.png --chat -p "Describe the image."
 ```
 
@@ -149,7 +159,9 @@ print(reply["content"])
 
 | 항목 | 지원 범위 | 참고 |
 |---|---|---|
-| 아키텍처 | GGUF: Qwen3 (`qwen3`), Qwen3.5/3.8 (`qwen35`), Inkling-2-Mini (`inkling2_loop`) | Qwen3.5/3.8 + `qwen3vl_merger` · Inkling-2-Mini + Markov DSpark · DFlash2 / DSpark: `dflash` · Llama: `.flyx` |
+| 아키텍처 | Qwen3.5 / Qwen3.8 (`qwen35`), Qwen3 (`qwen3`), Inkling-2-Mini (`inkling2_loop`, 희소 MoE), Llama (MiniCPM5-1B) | Llama는 `.flyx`만 지원 |
+| 추측 드래프터 | MTP, DFlash2, DSpark, 프롬프트 룩업 | MTP와 DSpark는 자동으로 연결됩니다. DFlash2는 별도 파일입니다(`--drafter-file` 또는 대시보드의 **Draft with it**). DSpark는 Inkling-2-Mini 전용입니다 |
+| 비전 | `mmproj` 프로젝터를 통한 이미지 입력(모델의 Hub 저장소에서 자동으로 가져옴) | 현재 Qwen3.5 / Qwen3.8 지원. Inkling-2-Mini는 텍스트 전용 |
 | 모델 형식 | GGUF (`F32`, `F16`, `BF16`, `Q4_0–Q8_0`, `Q2_K–Q6_K`, `IQ1–IQ4`, `MXFP4`, `Q2_0`, GGML NVFP4); `.flyx` (BF16, NVFP4; 포맷 2는 타깃 모델의 LoRA 어댑터인 V-LoRA를 병합 없이 실행 가능하며, DV 드래프터는 `--drafter dv` 지정 시에만 사용, [설계](../design/dv.md)) | 분할 GGUF 파일은 모두 같은 폴더에 둡니다. |
 | GPU | RTX 30 / 40 / 50 시리즈, L4, L40S, A100, H100 (`sm_80`–`sm_120`; Linux 릴리스는 `sm_100` 포함) | 프로세스당 단일 GPU (`CUDA_VISIBLE_DEVICES`); 드라이버 ≥ 580 |
 | 플랫폼 | Windows (네이티브 MSVC), Linux, WSL2 | Windows는 단일 `.exe` / ZIP / wheel; Linux는 tar.gz / `manylinux` wheel |
