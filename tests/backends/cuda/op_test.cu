@@ -77,6 +77,7 @@ int main(int argc, char** argv) {
   test_gemm_round();
   test_gemm_draft_tables();
   test_gemm_tables_compiled();
+  test_gemm_tuning_auto();
   test_blocks();
   test_blocks_round_stacks();
   test_blocks_round_glu();

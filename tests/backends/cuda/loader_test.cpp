@@ -1,5 +1,11 @@
 // Copyright 2026 The flyx Authors. SPDX-License-Identifier: Apache-2.0
 // Link the production binder and runtime with a backend.cpp whose device allocator can refuse a small request.
+#include <cstdlib>
+#include <cstring>
+#include <string>
+#include <utility>
+#include <vector>
+
 #include "backends/cuda/loader/loader.h"
 
 namespace flyx::cuda {
@@ -231,6 +237,110 @@ void held_labels() {
   require(std::string(held_precision({&q8, &q8, &fp4})) == "q8", "mostly Q8_0 blocks");
   require(std::string(held_precision({&fp4, &q8})) == "nvfp4", "NVFP4 planes on a tie");
 }
+// The environment apply_env_aliases reads in env_aliases: these names and values, every other name unset.
+std::vector<std::pair<const char*, const char*>> g_env;
+const char* fake_env(const char* name) {
+  for (const auto& [key, value] : g_env)
+    if (std::strcmp(key, name) == 0) return value;
+  return nullptr;
+}
+
+const char* const kAliasNames[] = {"FLYX_SC_CLUSTER", "FLYX_MOE_VEC", "FLYX_WARM", "FLYX_EXPERT_PREFETCH", "FLYX_GUESS",
+                                   "FLYX_GUESS_K", "FLYX_SIDE_LOOP_MSG", "FLYX_SIDE_COMPANION", "FLYX_SIDE_KV"};
+
+// The options a load gets from the legacy environment spellings and its options text (resolve_options).
+BackendOptions resolved(const char* text, std::vector<std::pair<const char*, const char*>> env) {
+  g_env = std::move(env);
+  BackendOptions o;
+  std::string err;
+  const bool ok = resolve_options(text, &o, &err, fake_env);
+  require(ok, err.c_str());
+  return o;
+}
+
+bool kernel_defaults(const KernelOptions& k) {
+  const KernelOptions def;
+  return k.sc_cluster == 8 && def.sc_cluster == 8 && !k.moe_vec && k.warm == 23 && def.warm == 23 &&
+         k.expert_prefetch == 2 && def.expert_prefetch == 2 && k.guess == 5 && def.guess == 5 && k.guess_k == 4 &&
+         def.guess_k == 4 && k.side_loop_msg && k.side_companion && k.side_kv;
+}
+
+// The nine options' environment spellings: unset, empty or not an integer leave the defaults (an empty value read as 0
+// turned warming, the expert guesses and the side streams off before); an integer keeps its old meaning; the options
+// given (FLYX_BACKEND_OPTIONS, --backend-opt) override them; and a load reads them again, not once for the process.
+void env_aliases() {
+  require(kernel_defaults(resolved(nullptr, {}).kernels), "no variables: the defaults");
+  std::vector<std::pair<const char*, const char*>> empty, junk, spaced;
+  for (const char* name : kAliasNames) {
+    empty.push_back({name, ""});
+    junk.push_back({name, "on"});
+    spaced.push_back({name, " 3"});
+  }
+  require(kernel_defaults(resolved(nullptr, empty).kernels), "empty variables: the defaults");
+  require(kernel_defaults(resolved(nullptr, junk).kernels), "variables that are no integer: the defaults");
+  require(kernel_defaults(resolved(nullptr, spaced).kernels), "an integer with a space before it: the defaults");
+  require(kernel_defaults(resolved(nullptr, {{"FLYX_WARM", "7x"}, {"FLYX_GUESS", "0x5"}}).kernels),
+          "a number followed by more: the defaults");
+  require(describe(resolved(nullptr, empty)) == "defaults", "empty variables describe as the defaults");
+
+  const KernelOptions set = resolved(nullptr, {{"FLYX_SC_CLUSTER", "4"}, {"FLYX_MOE_VEC", "1"}, {"FLYX_WARM", "0"},
+                                               {"FLYX_EXPERT_PREFETCH", "0"}, {"FLYX_GUESS", "0"},
+                                               {"FLYX_GUESS_K", "0"}, {"FLYX_SIDE_LOOP_MSG", "0"},
+                                               {"FLYX_SIDE_COMPANION", "0"}, {"FLYX_SIDE_KV", "0"}})
+                                .kernels;
+  require(set.sc_cluster == 4 && set.moe_vec && set.warm == 0 && set.expert_prefetch == 0 && set.guess == 0 &&
+              set.guess_k == 0 && !set.side_loop_msg && !set.side_companion && !set.side_kv,
+          "every variable read");
+  // The integers' old meanings, in the options' values.
+  const KernelOptions old = resolved(nullptr, {{"FLYX_SC_CLUSTER", "2"}, {"FLYX_MOE_VEC", "-3"}, {"FLYX_WARM", "-1"},
+                                               {"FLYX_EXPERT_PREFETCH", "5"}, {"FLYX_GUESS", "21"},
+                                               {"FLYX_GUESS_K", "-2"}, {"FLYX_SIDE_LOOP_MSG", "2"}})
+                                .kernels;
+  require(old.sc_cluster == 1 && old.moe_vec && old.warm == kWarmAll && old.expert_prefetch == 1 && old.guess == 5 &&
+              old.guess_k == 0 && old.side_loop_msg,
+          "integers keep their old meanings");
+  require(resolved(nullptr, {{"FLYX_SC_CLUSTER", "8"}, {"FLYX_GUESS", "-4"}}).kernels.guess == 0, "a negative guess");
+
+  // The options given override the variables, whichever way.
+  const BackendOptions over =
+      resolved("sc_cluster=8,moe_vec=0,warm=16,expert_prefetch=2,guess=9,guess_k=3,side_kv=1",
+               {{"FLYX_SC_CLUSTER", "1"}, {"FLYX_MOE_VEC", "1"}, {"FLYX_WARM", "0"}, {"FLYX_EXPERT_PREFETCH", "0"},
+                {"FLYX_GUESS", "0"}, {"FLYX_GUESS_K", "0"}, {"FLYX_SIDE_KV", "0"}});
+  const KernelOptions& k = over.kernels;
+  require(k.sc_cluster == 8 && !k.moe_vec && k.warm == 16 && k.expert_prefetch == 2 && k.guess == 9 &&
+              k.guess_k == 3 && k.side_kv,
+          "options override the variables");
+  require(describe(over) == "warm=16,guess=9,guess_k=3", "the options describe what differs from the defaults");
+  const KernelOptions given = resolved("sc_cluster=1,warm=0,side_companion=0", empty).kernels;
+  require(given.sc_cluster == 1 && given.warm == 0 && !given.side_companion, "options beside empty variables");
+
+  // The options' own values: strict.
+  for (const char* bad : {"sc_cluster=2", "moe_vec=2", "warm=8", "warm=-1", "expert_prefetch=3", "guess=16",
+                          "guess_k=-1", "side_kv=yes", "warm="}) {
+    BackendOptions o;
+    std::string err;
+    require(!parse_options(bad, &o, &err) && !err.empty(), bad);
+  }
+
+  // The process environment (no lookup given: std::getenv), read again at each load.
+  auto put = [](const char* name, const char* value) {
+#ifdef _WIN32
+    _putenv_s(name, value);  // "" removes the variable
+#else
+    setenv(name, value, 1);  // "" keeps it, empty
+#endif
+  };
+  for (const char* value : {"7", "", "19"}) {
+    put("FLYX_WARM", value);
+    BackendOptions o;
+    std::string err;
+    const bool ok = resolve_options("guess=3", &o, &err);
+    require(ok, err.c_str());
+    const int want = *value ? std::atoi(value) : 23;
+    require(o.kernels.warm == want && o.kernels.guess == 3, "FLYX_WARM from the process at each load");
+  }
+  put("FLYX_WARM", "");
+}
 }  // namespace
 
 void test_device_room(size_t) {
@@ -255,6 +365,7 @@ int main() {
     packed_drafter(false);
     packed_drafter(true);
     held_labels();
+    env_aliases();
   } catch (const std::exception& e) {
     std::fprintf(stderr, "%s\n", e.what());
     return 1;

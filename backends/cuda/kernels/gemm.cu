@@ -189,6 +189,31 @@ bool gemm_tuning_compiled_for(int tuning, int cc) {
 
 bool gemm_tuning_pdl(int tuning) { return tuning >= 0 && tables::kSkus[tuning].pdl; }
 
+int gemm_tuning_auto(const char* device_name, int device_cc, int code_cc, int* arch_cc,
+                     bool (*compiled)(int tuning, int cc)) {
+  if (!compiled) compiled = gemm_tuning_compiled_for;
+  bool by_arch = false;
+  int tuning = gemm_tuning_for(device_name, device_cc, &by_arch);
+  int cc = by_arch ? device_cc : 0;
+  // A table whose kernels the loaded code was not compiled for (a release build, an architecture list without the
+  // device's) gives way to the loaded code's architecture's table, and that one to the defaults.
+  if (tuning >= 0 && !compiled(tuning, code_cc)) {
+    tuning = gemm_tuning_for("", code_cc, &by_arch);
+    cc = code_cc;
+    if (tuning >= 0 && !compiled(tuning, code_cc)) tuning = -1;
+  }
+  if (arch_cc) *arch_cc = tuning >= 0 ? cc : 0;
+  return tuning;
+}
+
+std::string gemm_tuning_label(int tuning, int arch_cc, int device_cc) {
+  const char* name = gemm_tuning_name(tuning);
+  if (!name) return "none (defaults)";
+  if (!arch_cc) return name;
+  const char* whose = arch_cc == device_cc ? "this architecture's" : "the loaded code's architecture's";
+  return std::string(name) + " (" + whose + ": sm_" + std::to_string(arch_cc) + ")";
+}
+
 int gemm_config(int tuning, int fmt, int N, int K, int rows) { return pick_config(tuning, fmt, N, K, rows); }
 
 int gemm_draft_chunks(int K) { return tables::draft_chunks(K); }

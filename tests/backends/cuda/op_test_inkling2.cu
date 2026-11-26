@@ -1825,8 +1825,16 @@ void test_inkling2_moe() {
   msc.max_experts = E;
   msc.max_top_k = top_k;
 
-  const char* vec_env = std::getenv("FLYX_MOE_VEC");
-  const bool vec_nvfp4 = vec_env && std::atoi(vec_env) != 0;  // moe_vec_enabled(): the tensor-core path by default
+  // NVFP4 experts in either arithmetic contract (option moe_vec): bf16 inputs on tensor cores (the default) or float32
+  // inputs on the vector kernels, each against float64 with its own input rounding.
+  bool vec_nvfp4 = false;
+  const KernelOptions* const default_opts = TL.opt;
+  KernelOptions vec_opts = opts(TL);
+  vec_opts.moe_vec = true;
+  auto set_moe_vec = [&](bool vec) {
+    vec_nvfp4 = vec;
+    TL.opt = vec ? &vec_opts : default_opts;
+  };
   ExpertMat nvfp4_down{};
   auto run_and_check = [&](const std::string& label, const ExpertMat& w_gu, const ExpertMat& w_dn, const Vec& gu_f64,
                            const Vec& dn_f64, bool round_a16, bool round_q8, bool round_a16h, double tol) {
@@ -1891,7 +1899,7 @@ void test_inkling2_moe() {
         Vec staged = down(d_act_unfused, elems);
         const Vec y = down(d_y_direct, size_t(rows) * H);
 
-        const bool bf16_down = moe_round_bf16_down(nvfp4_down, rows, top_k, I, &msc);
+        const bool bf16_down = moe_round_bf16_down(nvfp4_down, rows, top_k, I, &msc, TL);
         if (bf16_down == vec_nvfp4) {
           std::printf("  FAIL mixed MoE down input representation %s\n", tag.c_str());
           ++g_fail;
@@ -2137,7 +2145,11 @@ void test_inkling2_moe() {
     Vec gu_f64, dn_f64;
     make_nvfp4_experts(gu_raw, 2 * I, H, &w_gu, &gu_f64);
     make_nvfp4_experts(dn_raw, H, I, &nvfp4_down, &dn_f64);
-    run_and_check("nvfp4", w_gu, nvfp4_down, gu_f64, dn_f64, !vec_nvfp4, false, false, 3e-5);
+    for (bool vec : {false, true}) {
+      set_moe_vec(vec);
+      run_and_check(vec ? "nvfp4 moe_vec" : "nvfp4", w_gu, nvfp4_down, gu_f64, dn_f64, !vec, false, false, 3e-5);
+    }
+    set_moe_vec(false);
     cudaFree(const_cast<uint8_t*>(w_gu.q));
     cudaFree(const_cast<uint8_t*>(w_gu.s));
     cudaFree(const_cast<float*>(w_gu.rs));
@@ -2168,6 +2180,11 @@ void test_inkling2_moe() {
       make_blk_experts(H, I, use_q8 != 0, &w_dn, &dn_f64);
       run_and_check(std::string(bt.name) + (use_q8 ? "_q8" : "_a16h"), w_gu, w_dn, gu_f64, dn_f64, false,
                     use_q8 != 0, use_q8 == 0, 5e-5);
+      if (dt == FLYX_DT_GGML_Q4_K && use_q8) {  // the mixed MoE's float32 SiTU into the vector NVFP4 down GEMM
+        set_moe_vec(true);
+        run_and_check(std::string(bt.name) + "_q8 moe_vec", w_gu, w_dn, gu_f64, dn_f64, false, true, false, 5e-5);
+        set_moe_vec(false);
+      }
       cudaFree(const_cast<uint8_t*>(w_gu.blk.data));
       cudaFree(const_cast<uint16_t*>(w_gu.blk.scales));
       cudaFree(const_cast<uint8_t*>(w_dn.blk.data));
@@ -2726,71 +2743,77 @@ void test_inkling2_sublayer_fusion() {
       rmsnorm_q8_split(d_mix_ref, H, d_nw, noff, neps, R, H, TL);
 
     // Every prefix has the same causal ShortConv inputs. Only the strides between bank states and
-    // between query outputs change. The separately launched operations at R give one oracle for all prefixes.
+    // between query outputs change. The separately launched operations at R give one oracle for all prefixes, and
+    // for a row over a cluster of 8 blocks (the default), 4 or one block (option sc_cluster).
     for (int rows = 1; rows <= R; ++rows) {
       if (rows != 1 && rows != 4 && rows != 8 && rows != R) continue;
       const size_t count = size_t(rows) * H, bytes = count * sizeof(float);
-      if (nb)
-        CK(cudaMemcpy2D(d_bank_got, bytes, d_bank_ref, elems * sizeof(float), bytes, nb, cudaMemcpyDeviceToDevice));
-      if (tc.push) CK(cudaMemset(d_bank_got + nb * count, 0x55, bytes));
-      CK(cudaMemset(d_x_got, 0x55, bytes));
-      CK(cudaMemset(d_mix_got, 0x55, nq * bytes));
-      CK(cudaMemset(d_ny_got, 0x55, bytes));
-      CK(cudaMemset2D(d_rep_got + ch_off, ch_total * sizeof(float), 0x55, H * sizeof(float), rows));
-      if (tc.direct)
-        CK(cudaMemset2D(d_win_got + w_stride + ch_off, ch_total * sizeof(float), 0x55, H * sizeof(float), hist));
-      if (tc.norm == Norm::MoeQ8 || tc.norm == Norm::AttnQ8Split) CK(cudaMemset(scratch_mem, 0x55, scratch_size));
-
-      SublayerPostConv spc{d_raw, d_cw, d_win_got, w_stride, kSlotCur, next_sel, kSkipNever,
-                           d_rep_got, r_stride, kSlotCur, ch_off, ch_total, conv, tc.push};
-      shortconv_res_mix_norm(spc, d_xsrc, d_x_got, d_bank_got, nb, d_q, nq,
-                             tc.norm == Norm::None || nq > 1 ? d_mix_got : nullptr, tc.norm, d_nw, noff, neps,
-                             d_ny_got, H, tc.norm == Norm::MoeQ8 ? &msc_got : nullptr, tc.moe_mins, P, rows, H,
-                             fused_launch);
-
       const std::string tag = "sublayer R=" + std::to_string(rows) + "/" + std::to_string(R) +
                               " H=" + std::to_string(H) + " M=" + std::to_string(tc.M) + " nq=" + std::to_string(nq) +
                               " norm=" + std::to_string(int(tc.norm)) + (tc.shift_xsrc ? " shifted x_src" : "");
       bool ok = true;
-      auto check = [&](const std::string& name, const auto* got, const auto* ref, size_t n) {
-        const size_t nbytes = n * sizeof(*got);
-        std::vector<uint8_t> a(nbytes), b(nbytes);
-        CK(cudaMemcpy(a.data(), got, nbytes, cudaMemcpyDeviceToHost));
-        CK(cudaMemcpy(b.data(), ref, nbytes, cudaMemcpyDeviceToHost));
-        const auto diff = std::mismatch(a.begin(), a.end(), b.begin());
-        if (diff.first != a.end()) {
-          std::printf("  FAIL %s %s byte %zu: %02x != %02x\n", tag.c_str(), name.c_str(),
-                      size_t(diff.first - a.begin()), unsigned(*diff.first), unsigned(*diff.second));
-          ok = false;
+      for (const int cluster : {8, 4, 1}) {
+        KernelOptions cluster_opts = opts(TL);
+        cluster_opts.sc_cluster = cluster;
+        fused_launch.opt = &cluster_opts;
+        if (nb)
+          CK(cudaMemcpy2D(d_bank_got, bytes, d_bank_ref, elems * sizeof(float), bytes, nb, cudaMemcpyDeviceToDevice));
+        if (tc.push) CK(cudaMemset(d_bank_got + nb * count, 0x55, bytes));
+        CK(cudaMemset(d_x_got, 0x55, bytes));
+        CK(cudaMemset(d_mix_got, 0x55, nq * bytes));
+        CK(cudaMemset(d_ny_got, 0x55, bytes));
+        CK(cudaMemset2D(d_rep_got + ch_off, ch_total * sizeof(float), 0x55, H * sizeof(float), rows));
+        if (tc.direct)
+          CK(cudaMemset2D(d_win_got + w_stride + ch_off, ch_total * sizeof(float), 0x55, H * sizeof(float), hist));
+        if (tc.norm == Norm::MoeQ8 || tc.norm == Norm::AttnQ8Split) CK(cudaMemset(scratch_mem, 0x55, scratch_size));
+
+        SublayerPostConv spc{d_raw, d_cw, d_win_got, w_stride, kSlotCur, next_sel, kSkipNever,
+                             d_rep_got, r_stride, kSlotCur, ch_off, ch_total, conv, tc.push};
+        shortconv_res_mix_norm(spc, d_xsrc, d_x_got, d_bank_got, nb, d_q, nq,
+                               tc.norm == Norm::None || nq > 1 ? d_mix_got : nullptr, tc.norm, d_nw, noff, neps,
+                               d_ny_got, H, tc.norm == Norm::MoeQ8 ? &msc_got : nullptr, tc.moe_mins, P, rows, H,
+                               fused_launch);
+
+        auto check = [&](const std::string& name, const auto* got, const auto* ref, size_t n) {
+          const size_t nbytes = n * sizeof(*got);
+          std::vector<uint8_t> a(nbytes), b(nbytes);
+          CK(cudaMemcpy(a.data(), got, nbytes, cudaMemcpyDeviceToHost));
+          CK(cudaMemcpy(b.data(), ref, nbytes, cudaMemcpyDeviceToHost));
+          const auto diff = std::mismatch(a.begin(), a.end(), b.begin());
+          if (diff.first != a.end()) {
+            std::printf("  FAIL %s cluster=%d %s byte %zu: %02x != %02x\n", tag.c_str(), cluster, name.c_str(),
+                        size_t(diff.first - a.begin()), unsigned(*diff.first), unsigned(*diff.second));
+            ok = false;
+          }
+        };
+        check("x_dst", d_x_got, d_x_ref, count);
+        check("replay", d_rep_got, d_rep_ref, size_t(rows) * ch_total);
+        if (tc.push) check("bank push", d_bank_got + nb * count, d_bank_ref + nb * elems, count);
+        if (tc.direct && rows == R) {
+          check("next window", d_win_got + w_stride, d_win_ref + w_stride, w_stride);
+        } else if (tc.direct) {
+          // The saved window ends at the last row of this prefix.
+          for (int k = 0; k < hist; ++k) {
+            const int t = rows - hist + k;
+            const float* expected = t < 0 ? d_win_ref + size_t(hist + t) * ch_total + ch_off : d_raw + size_t(t) * H;
+            check("next window", d_win_got + w_stride + size_t(k) * ch_total + ch_off, expected, H);
+          }
         }
-      };
-      check("x_dst", d_x_got, d_x_ref, count);
-      check("replay", d_rep_got, d_rep_ref, size_t(rows) * ch_total);
-      if (tc.push) check("bank push", d_bank_got + nb * count, d_bank_ref + nb * elems, count);
-      if (tc.direct && rows == R) {
-        check("next window", d_win_got + w_stride, d_win_ref + w_stride, w_stride);
-      } else if (tc.direct) {
-        // The saved window ends at the last row of this prefix.
-        for (int k = 0; k < hist; ++k) {
-          const int t = rows - hist + k;
-          const float* expected = t < 0 ? d_win_ref + size_t(hist + t) * ch_total + ch_off : d_raw + size_t(t) * H;
-          check("next window", d_win_got + w_stride + size_t(k) * ch_total + ch_off, expected, H);
+        for (int q = tc.norm == Norm::None ? 0 : 1; q < nq; ++q)
+          check("mix q=" + std::to_string(q), d_mix_got + q * count, d_mix_ref + q * elems, count);
+        if (tc.norm == Norm::F32 || tc.norm == Norm::MoeQ8) check("norm_y", d_ny_got, d_ny_ref, count);
+        if (tc.norm == Norm::MoeQ8 || tc.norm == Norm::AttnQ8Split) {
+          check("Q8 bytes", scratch.q8, TL.scratch->q8, count);
+          check("Q8 scales", scratch.q8_scale, TL.scratch->q8_scale, count / 32);
+          if (tc.moe_mins || tc.norm == Norm::AttnQ8Split)
+            check("Q8 sums", scratch.q8_sums, TL.scratch->q8_sums, count / 16);
         }
+        if (tc.norm == Norm::AttnQ8Split)
+          for (int i = 0; i < 3; ++i)
+            check("BF16 part " + std::to_string(i), scratch.split + i * scratch.split_cap,
+                  TL.scratch->split + i * TL.scratch->split_cap, count);
       }
-      for (int q = tc.norm == Norm::None ? 0 : 1; q < nq; ++q)
-        check("mix q=" + std::to_string(q), d_mix_got + q * count, d_mix_ref + q * elems, count);
-      if (tc.norm == Norm::F32 || tc.norm == Norm::MoeQ8) check("norm_y", d_ny_got, d_ny_ref, count);
-      if (tc.norm == Norm::MoeQ8 || tc.norm == Norm::AttnQ8Split) {
-        check("Q8 bytes", scratch.q8, TL.scratch->q8, count);
-        check("Q8 scales", scratch.q8_scale, TL.scratch->q8_scale, count / 32);
-        if (tc.moe_mins || tc.norm == Norm::AttnQ8Split)
-          check("Q8 sums", scratch.q8_sums, TL.scratch->q8_sums, count / 16);
-      }
-      if (tc.norm == Norm::AttnQ8Split)
-        for (int i = 0; i < 3; ++i)
-          check("BF16 part " + std::to_string(i), scratch.split + i * scratch.split_cap,
-                TL.scratch->split + i * TL.scratch->split_cap, count);
-      if (ok) std::printf("  ok   %-48s bit-identical\n", tag.c_str());
+      if (ok) std::printf("  ok   %-48s bit-identical (clusters of 8, 4, 1)\n", tag.c_str());
       g_fail += !ok;
     }
     cudaFree(P);

@@ -132,19 +132,19 @@ The engine and server register their environment variables in `core/os/env.h`. E
 | `HF_HUB_OFFLINE` | `1` | Use local HF cache only; make no network requests. |
 | `NO_COLOR` / `COLUMNS` | any / int | Terminal monitor formatting overrides. |
 
-The following CUDA overrides are temporary pending migration to backend options. CUDA reads each once on first use. Defaults apply when unset. An empty string or a value with no leading integer parses as zero.
+The CUDA backend also reads, at each model load, the environment spellings nine of its [Inkling-2 round options](#inkling-2-rounds) had before they were options: `FLYX_<NAME>=V` sets option `<name>`, and `FLYX_BACKEND_OPTIONS` and `--backend-opt` override it. A variable that is unset, empty, or not an integer (the whole value, no spaces) leaves the option's default; one that is not an integer also prints a warning. An integer keeps the meaning it had for the variable:
 
-| Variable | Default | Effect |
+| Variable | Option | An integer `V` sets |
 |---|---|---|
-| `FLYX_SC_CLUSTER` | `8` on eligible SM90+ devices, otherwise `1` | Request 4 or 8 blocks per Inkling fused sublayer cluster. Other values and unsupported shapes use one block. |
-| `FLYX_MOE_VEC` | `0` | Inkling NVFP4 experts use tensor-core MMA. Any nonzero value selects the float32 column-vector path for every round width. |
-| `FLYX_WARM` | `23` | Bit mask selecting which weights to warm in L2. Zero disables warming. |
-| `FLYX_EXPERT_PREFETCH` | `2` | Prefetch predicted expert weights early for multi-row rounds. Zero disables this early guess. Other nonzero values include eligible single-row rounds. |
-| `FLYX_GUESS` | `5` | For the separate single-row expert guess, a positive value selects prefetch planes with its low four bits. Zero or negative disables this guess. |
-| `FLYX_GUESS_K` | `4` | On the wide prefetch path, fetch up to this many of the top-scoring experts. Zero or negative uses all `top_k` experts. |
-| `FLYX_SIDE_LOOP_MSG` | `1` | Overlap loop-message computation on the side stream when available. Zero serializes it. |
-| `FLYX_SIDE_COMPANION` | `1` | Overlap the companion projection with the wide GEMM when a side stream is available. Zero serializes it. |
-| `FLYX_SIDE_KV` | `1` | Overlap eligible sliding-window K/V projections with the query path on the side stream. Zero serializes them. |
+| `FLYX_SC_CLUSTER` | `sc_cluster` | `4` or `8`; any other `V`: `1` |
+| `FLYX_MOE_VEC` | `moe_vec` | `1` for nonzero `V`, else `0` |
+| `FLYX_WARM` | `warm` | the bits of `V` among `1`, `2`, `4` and `16` |
+| `FLYX_EXPERT_PREFETCH` | `expert_prefetch` | `0` or `2`; any other `V`: `1` |
+| `FLYX_GUESS` | `guess` | the low four bits of a positive `V`; zero or negative: `0` |
+| `FLYX_GUESS_K` | `guess_k` | `V`; zero or negative: `0` |
+| `FLYX_SIDE_LOOP_MSG` | `side_loop_msg` | `1` for nonzero `V`, else `0` |
+| `FLYX_SIDE_COMPANION` | `side_companion` | `1` for nonzero `V`, else `0` |
+| `FLYX_SIDE_KV` | `side_kv` | `1` for nonzero `V`, else `0` |
 
 ---
 
@@ -220,6 +220,22 @@ Passed verbatim to the backend (`backends/cuda/backend.cpp`). Unknown keys or in
 | `mtp_sink` | `N` (≥ 0) | `64` | Initial sink positions kept exact for MTP when `mtp_copy=0`. |
 | `mtp_ring` | `0` \| `1` | `1` | Ring buffer storage for MTP exact window (`0` = linear slots, tests). |
 | `dflash_ring` | `0` \| `1` | `1` | Ring buffer storage for sliding-window DFlash2 context K/V (`0` = linear slots, tests). A checkpoint, snapshot or rewind whose drafter window later positions overwrote in the ring is refused, and the session recomputes instead. |
+
+### Inkling-2 Rounds
+
+Every option here but `moe_vec` changes only where and when kernels run, never a result bit. Each also has a legacy environment spelling ([Environment Variables](#4-environment-variables)).
+
+| Key | Allowed Values | Default | Effect |
+|---|---|---|---|
+| `moe_vec` | `0` \| `1` | `0` | NVFP4 experts with float32 inputs on column-at-a-time vector kernels at every width (`1`) instead of bf16 inputs on tensor cores: another arithmetic contract (both are tested against float64, [Numerics](design/numerics.md)), kept for measurement. |
+| `sc_cluster` | `1` \| `4` \| `8` | `8` | A fused sublayer's row over a cluster of this many blocks (sm_90 and later, where the device fits the cluster; otherwise, and with `1`, one block). |
+| `warm` | sum of `1`, `2`, `4`, `16` | `23` | L2 warming on the expert stream during rounds: the next MoE's router (`1`), loop controller (`2`), residual query and norm (`4`), and the next attention's small weights (`16`). `0`: none. |
+| `expert_prefetch` | `0` \| `1` \| `2` | `2` | Guess the next MoE's experts from the residual and prefetch their weights: in rounds of 2 or more rows (`2`), in every round (`1`) or never (`0`). |
+| `guess` | `0` to `15` | `5` | One-row rounds: a second guess from the mixed residual, prefetching these planes (bits: gate and up codes `1`, their scales `2`, down codes `4`, their scales `8`). `0`: none. |
+| `guess_k` | `N` (≥ 0) | `4` | Prefetch the `N` best-scored guessed experts (`0`: all `top_k`). |
+| `side_loop_msg` | `0` \| `1` | `1` | Loop messages on the side stream beside the sublayer's mix (needs `side_stream=1`). |
+| `side_companion` | `0` \| `1` | `1` | A sink or tap projection on the side stream beside the wide GEMM that shares its input (needs `side_stream=1`). |
+| `side_kv` | `0` \| `1` | `1` | A sliding-window round's K and V projections on the side stream beside the query path (needs `side_stream=1`). |
 
 ---
 

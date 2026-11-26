@@ -107,6 +107,8 @@ constexpr bool has_moe_dp4a_variants(int dtype) {
 // kStrataSelChunk pairs (a thread of the selection holds 16 of them in registers), so a session's context is at most
 // kStrataSelChunk kStrataSelChunks pairs (4M positions).
 constexpr int kStrataSelChunk = 16384, kStrataSelChunks = 128;
+// Every weight KernelOptions::warm can warm: its bits.
+inline constexpr int kWarmAll = 1 | 2 | 4 | 16;
 struct KernelOptions {
   int tuning = -1;            // GEMM tuning table (gemm_tuning_for), -1 = the defaults
   bool row_gemms = false;     // every GEMM on the CUDA-core row path (debugging)
@@ -164,6 +166,22 @@ struct KernelOptions {
   bool dflash_ring = true;    // a sliding-window DFlash2 context cache as a ring of slots (false: flat, for tests)
   int stage_window = 16384;   // FLYX_KV_STRATA / AUTO: a staging's positions, a multiple of kFlashWindowAlign; a
                               // prefill whose keys go past them reads them a window at a time
+  // Inkling-2 (the options' legacy environment spellings: backend.cpp's kEnvAliases).
+  int sc_cluster = 8;         // a fused sublayer's float4 row over a cluster of this many blocks, 4 or 8 (sm_90 and
+                              // later, where the device fits it); 1: one block a row.  Same bits
+  bool moe_vec = false;       // NVFP4 experts: float32 inputs and column-at-a-time vector kernels at every width,
+                              // instead of bf16 inputs on tensor cores (another arithmetic contract, not a tuning)
+  int warm = kWarmAll;        // rounds: L2 warming on the expert stream, a mask: the next MoE's router (1), loop
+                              // controller (2), residual query and norm (4); the next attention's small weights
+                              // (16).  0: none.  Same bits
+  int expert_prefetch = 2;    // the next MoE's experts guessed from the residual and prefetched on the expert stream:
+                              // 0 never, 2 rounds of 2 or more rows, any other value every round.  Same bits
+  int guess = 5;              // ... a one-row round's guess from the mixed residual: the planes it prefetches (low 4
+                              // bits: gate|up codes 1, scales 2, down codes 4, scales 8); 0: none.  Same bits
+  int guess_k = 4;            // ... of the best-scored this many experts (0: all top_k).  Same bits
+  bool side_loop_msg = true;  // side stream (with side_stream): the loop messages beside the sublayer's mix
+  bool side_companion = true; // ... a sink or tap projection beside the wide GEMM that shares its input
+  bool side_kv = true;        // ... a sliding-window round's K and V projections beside the q path
 };
 // Device scratch for GEMM inputs: the split activations of the 1..16-row
 // GEMMs (three bf16 parts, split_cap elements each) and the bf16 rows of the
@@ -270,14 +288,16 @@ struct Launch {
   // deterministic, not a row's bits alone.
   bool draft = false;
 };
+// The launch's options (the defaults when it has none).
+const KernelOptions& opts(const Launch& L);
 // The scratch whose 8-bit rows are the SwiGLU a gate|up GEMM left (Launch::glu): the down GEMM's input.
 Scratch glu_inputs(const Scratch& s);
 // The scratch of a launch on the side stream: the same rows, the split kernel's sums and counters of its own.
 Scratch side_scratch(const Scratch& s);
 // Both the current device and its kernel image support sm_90 instructions.
 bool sm90_or_newer();
-// Cache per-kernel cluster feasibility before a sequence captures its first round.
-void prepare_sublayer_clusters();
+// Cache per-kernel cluster feasibility for KernelOptions::sc_cluster before a sequence captures its first round.
+void prepare_sublayer_clusters(int cluster);
 
 // y[r, n] (=|+=) sum_k x[r, k] * W[n, k].  K % 8 == 0.  Chooses CUDA-core or tensor-core path by rows: 1..16 the
 // skinny kernel (gemm_rows where it does not fit, or with option row_gemms); more, the prefill kernels, or a round's
@@ -407,6 +427,18 @@ const char* gemm_tuning_name(int tuning);
 bool gemm_tuning_compiled_for(int tuning, int cc);
 // Whether kernels launch as programmatic dependents on the GPU of this table unless the options say.
 bool gemm_tuning_pdl(int tuning);
+// The table a device runs unless the options name one or none (option tuning=table; the engine and cuda_bench alike):
+// the device's own (gemm_tuning_for, by its name, else by its compute capability device_cc), where the loaded code
+// (compute capability code_cc, compiled_arch) has its kernels; else the loaded code's architecture's table, where it
+// has them; else -1 (the defaults).  *arch_cc (optional): the compute capability whose table it is when it is one by
+// architecture, device_cc or code_cc; 0 for a table by name, or none.  compiled: whether a table's kernels are
+// compiled for a compute capability (null: gemm_tuning_compiled_for; tests pass their own).
+int gemm_tuning_auto(const char* device_name, int device_cc, int code_cc, int* arch_cc = nullptr,
+                     bool (*compiled)(int tuning, int cc) = nullptr);
+// What gemm_tuning_auto's answer is, for a log: "none (defaults)", the table's name, and where arch_cc says it is a
+// table by architecture which one: "(this architecture's: sm_120)" on a device of that architecture, "(the loaded
+// code's architecture's: sm_80)" on another.
+std::string gemm_tuning_label(int tuning, int arch_cc, int device_cc);
 // The configuration index a GEMM gets (fmt 0 = bf16, 1 = nvfp4, 2 = w12; 17..64 rows on k_gemm_skinny_mt, a
 // kMtConfigs index: 3 = a round's, 4 = a drafting pass's) with a tuning table.
 int gemm_config(int tuning, int fmt, int N, int K, int rows);
@@ -1731,9 +1763,10 @@ void moe_guess_scores(const float* x, const float* norm_w, float norm_offset, co
                       const float* router_f32, const float* bias, bool sigmoid, int E, int H, float* scores,
                       cudaStream_t st);
 // Prefetch only immutable expert planes from private scores. Negative planes selects all top_k;
-// otherwise the bits choose gate/up codes/scales and down codes/scales for FLYX_GUESS_K experts.
+// otherwise the bits choose gate/up codes/scales and down codes/scales for the guess_k best-scored experts
+// (KernelOptions::guess_k; 0 or less: all top_k).
 void moe_prefetch(const float* scores, int E, int top_k, int H, int I, const ExpertMat& gu, const ExpertMat& down,
-                  int planes, cudaStream_t st);
+                  int planes, int guess_k, cudaStream_t st);
 // Byte ranges for L2 (l2_warm): asks L2 for them on st and returns; changes no result.
 struct L2Ranges {
   const void* p[8] = {};
@@ -1767,11 +1800,11 @@ bool moe_dp4a_compiled(int dtype, int cfg, bool fused_gate_up = true, int rows =
 int moe_gate_up_dp4a(int tuning, int dtype, int rows);
 // What one of a fused round's MoE kernels may leave for the next without a staging launch between them, the
 // round's 1..16 rows in one chunk of the scratch.  moe_round_q8: the gate|up GEMM on W reads rows staged in 8 bits
-// (q8_ready below: staged already, by rmsnorm_moe_q8); moe_round_bf16_down: the NVFP4 down GEMM in MMA mode reads bf16
-// rows (act_bf16 below: where the gate|up GEMM wrote them).
+// (q8_ready below: staged already, by rmsnorm_moe_q8); moe_round_bf16_down: the NVFP4 down GEMM in MMA mode (L's
+// options without moe_vec) reads bf16 rows (act_bf16 below: where the gate|up GEMM wrote them).
 bool moe_q8_mins(const ExpertMat& W);
 bool moe_round_q8(const ExpertMat& W, int rows, int top_k, int K, const MoeScratch* sc);
-bool moe_round_bf16_down(const ExpertMat& W, int rows, int top_k, int K, const MoeScratch* sc);
+bool moe_round_bf16_down(const ExpertMat& W, int rows, int top_k, int K, const MoeScratch* sc, const Launch& L);
 // gate_up over selected experts eidx [rows, top_k]: fuse_act=false writes [rows*top_k, 2*I];
 // fuse_act=true applies SiTU/SwiGLU in registers and writes [rows*top_k, I] (bit-identical to unfused + situ_rows).
 // act_bf16 (with fuse_act and moe_round_q8): the activations there in bf16, each rounded to nearest as staging
