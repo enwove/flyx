@@ -1,0 +1,121 @@
+# Copyright 2026 The flyx Authors. SPDX-License-Identifier: Apache-2.0
+name: Nightly
+
+# What pull requests do not run, once a night on main (tools/ci/README.md): every test of the cpu-full preset,
+# DV's included (a pull request runs them only when it changes DV's own files); the CPU tests on Windows; the CUDA
+# build with DV's tests registered, compiled and not run.
+on:
+  schedule:
+    - cron: "17 18 * * *"  # 18:17 UTC, off the hour (scheduled runs at :00 queue the longest)
+  workflow_dispatch:
+  # TEMPORARY, removed before the pull request is ready: runs this workflow on the pull request that adds it.
+  pull_request:
+    paths:
+      - ".github/workflows/nightly.yml"
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  cpu-full:
+    uses: ./.github/workflows/cpu-full.yml
+    with:
+      all: true
+
+  # TODO(FLYX_ENABLE_DV): once DV's code has a build switch of its own (off in the release package), dev-full turns it
+  # on (tools/ci/cuda-compile.sh), so that DV's kernels, left out of pull requests' builds, still compile every night.
+  cuda-compile:
+    uses: ./.github/workflows/cuda-compile.yml
+    with:
+      full: true
+
+  windows-cpu:
+    name: Windows CPU, quick tier then the rest (cpu-windows)
+    runs-on: windows-latest
+    timeout-minutes: 150
+    defaults:
+      run:
+        shell: pwsh
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: tests/requirements.txt
+
+      - name: Install Python test dependencies and Ninja
+        run: |
+          $PSNativeCommandUseErrorActionPreference = $true
+          python -m pip install -U pip
+          python -m pip install -r tests/requirements.txt ninja
+
+      # The x64 MSVC environment (what tools/windows/vsenv.ps1 imports on a developer's machine): the variables
+      # vcvars64.bat sets or changes, for the steps after this one.
+      - name: MSVC x64 environment
+        run: |
+          $vswhere = Join-Path ${env:ProgramFiles(x86)} 'Microsoft Visual Studio\Installer\vswhere.exe'
+          $vs = & $vswhere -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 `
+            -property installationPath
+          & $vswhere -latest -products * -property displayName
+          $before = @{}
+          Get-ChildItem env: | ForEach-Object { $before[$_.Name] = $_.Value }
+          cmd /s /c "`"$vs\VC\Auxiliary\Build\vcvars64.bat`" >nul 2>&1 && set" | ForEach-Object {
+            if ($_ -match '^([^=]+)=(.*)$' -and $before[$Matches[1]] -ne $Matches[2]) {
+              "$($Matches[1])=$($Matches[2])" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+            }
+          }
+
+      - name: Digest of what the test fixtures are made from
+        id: fixtures
+        run: '"core=$(python tests/e2e/make_tiny.py --digest --group core)" | Out-File $env:GITHUB_OUTPUT -Append'
+
+      - name: Cache test fixtures
+        uses: actions/cache@v4
+        with:
+          path: ~/flyx-build-cpu/assets
+          key: fixtures-core-${{ runner.os }}-${{ steps.fixtures.outputs.core }}
+
+      - name: Configure and build (cpu-windows preset)
+        run: |
+          $PSNativeCommandUseErrorActionPreference = $true
+          $t = [Diagnostics.Stopwatch]::StartNew()
+          cmake --preset cpu-windows
+          cmake --build --preset cpu-windows
+          "== configure and build: $([int]$t.Elapsed.TotalSeconds)s"
+
+      - name: Quick tier (cpu-quick-windows)
+        run: |
+          $PSNativeCommandUseErrorActionPreference = $true
+          New-Item -ItemType Directory -Force logs/ci | Out-Null
+          $t = [Diagnostics.Stopwatch]::StartNew()
+          ctest --preset cpu-quick-windows --output-junit "$PWD/logs/ci/ctest-quick.xml"
+          "== quick tier: $([int]$t.Elapsed.TotalSeconds)s"
+
+      # The tests of the cpu-windows preset (every test but DV's) the quick tier did not run.  By the tree, not the
+      # preset: an -LE given with a preset that excludes a label itself drops both exclusions (CTest 4.4).
+      - name: The rest of the cpu-windows preset
+        run: |
+          $PSNativeCommandUseErrorActionPreference = $true
+          $t = [Diagnostics.Stopwatch]::StartNew()
+          ctest --test-dir "$env:USERPROFILE/flyx-build-cpu" -j 8 --output-on-failure -LE '^(quick|dv)$' `
+            --output-junit "$PWD/logs/ci/ctest-rest.xml"
+          "== the rest: $([int]$t.Elapsed.TotalSeconds)s"
+
+      - name: Quick tier times (warnings only)
+        if: ${{ !cancelled() && hashFiles('logs/ci/ctest-quick.xml') != '' }}
+        run: python tools/check_test_tiers.py logs/ci/ctest-quick.xml --build "$env:USERPROFILE/flyx-build-cpu" --warn-only
+
+      - name: Upload test results (JUnit)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ctest-junit-windows-cpu-attempt-${{ github.run_attempt }}
+          path: logs/ci/ctest-*.xml
+          if-no-files-found: ignore
