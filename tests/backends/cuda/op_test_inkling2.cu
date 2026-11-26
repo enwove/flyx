@@ -2615,6 +2615,12 @@ void test_inkling2_sublayer_fusion() {
     shortconv_pass(d_raw, H, d_cw, nullptr, d_win, w_stride, kSlotCur, -1, kSkipNever, nullptr, 0, kSlotCur, ch_off,
                    ch_total, H, conv, 0, P, R, d_got, H, 0, true, d_xsrc);
     expect_device_bits("shortconv_pass res_src == in-place accumulate", d_got, d_ref, size_t(R) * H);
+    // An independently stored ShortConv result fixes the rounding before the residual add.
+    shortconv_pass(d_raw, H, d_cw, nullptr, d_win, w_stride, kSlotCur, -1, kSkipNever, nullptr, 0, kSlotCur, ch_off,
+                   ch_total, H, conv, 0, P, R, d_ref, H, 0, false);
+    Vec want = down(d_ref, xsrc.size());
+    for (size_t i = 0; i < want.size(); ++i) want[i] = float(want[i]) + float(xsrc[i]);
+    expect_bits("shortconv residual == stored convolution + residual", down(d_got, want.size()), want);
     cudaFree(P);
     cudaFree(d_win);
     cudaFree(d_raw);
