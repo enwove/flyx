@@ -85,7 +85,7 @@ struct GgufChoice {
   bool split = false;
   bool complete = true;          // false if split and any shard 1..N is missing
 };
-std::vector<GgufChoice> gguf_choices(const Repo& r);
+std::vector<GgufChoice> gguf_choices(const Repo& r, bool include_companions = false);
 // Whether a GGUF at `path` ('/' between directories) can hold a model by its name: not a projector, an importance
 // matrix or an MTP layer of its own (mtp-*.gguf, anything under an MTP directory).  Split parts count.
 bool model_gguf_name(const std::string& path);

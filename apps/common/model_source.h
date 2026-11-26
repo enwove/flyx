@@ -18,7 +18,7 @@ namespace flyx::apps {
 
 // A drafter that goes with a model, or one published for it.
 struct DrafterSource {
-  std::string kind;            // "mtp" or "dflash2"
+  std::string kind;            // header or Hub identity, empty if unknown
   std::string from;            // "model file" (its own MTP layer), a Hub name or file of a repository, or a path
   std::optional<uint64_t> size;  // bytes on disk; none where only the Hub could tell (or inside the model's file)
 };
@@ -59,16 +59,25 @@ bool fetch_named(std::string* model, EngineOptions* eo, std::string* err);
 std::string model_name_of(const std::string& path, bool local = true);
 
 // Canonical classification of any GGUF file on disk (local directories, Hub cache snapshots, and drafter attachment).
-// Uses a thread-safe (path, size, mtime) cache over flyx::gguf_peek() plus filename conventions so arch="dflash"
-// drafters (including DSpark and Hub cached GGUF drafters) and arch="clip" vision projectors are classified identically
-// across every listing and load path.
+// Header identities take precedence over filename conventions.
 struct GgufClassification {
   std::string kind;          // "gguf" (model), "drafter", "mmproj", or "" (ignored, e.g. imatrix)
-  std::string drafter_kind;  // "dflash2" or "mtp" when kind == "drafter", else ""
+  std::string drafter_kind;  // "dflash2", "dspark" or "mtp" when kind == "drafter", else ""
   int mtp_layers = -1;       // <arch>.nextn_predict_layers when valid, -1 if unreadable/invalid
 };
 GgufClassification classify_gguf(const std::string& path, const std::string& rel_name = "", uint64_t size = 0,
                                  std::filesystem::file_time_type modified = std::filesystem::file_time_type::min());
+
+// One Hub GGUF group with its local header identity, when available. The selector works with hub::select.
+struct HubGguf {
+  hub::GgufChoice choice;
+  GgufClassification cls;
+  std::string disk, selector;
+  bool cached = false;
+  std::filesystem::file_time_type modified = std::filesystem::file_time_type::min();
+};
+std::vector<HubGguf> hub_ggufs(const hub::Repo& repo);
+const HubGguf* preferred_companion(const std::vector<HubGguf>& ggufs, const std::string& kind);
 
 // The MTP layers a GGUF says it holds (<arch>.nextn_predict_layers), read from its header alone: the metadata, never
 // the tensors.  -1: not a GGUF, or not readable.
@@ -81,7 +90,7 @@ struct LocalModel {
   std::string path;          // absolute
   std::string file;          // its name
   std::string kind;          // "gguf", "flyx", "drafter", or "mmproj"
-  std::string drafter_kind;  // "dflash2" or "mtp" when kind == "drafter", else ""
+  std::string drafter_kind;  // "dflash2", "dspark" or "mtp" when kind == "drafter", else ""
   std::string quant;         // from the name, "" when it names none
   uint64_t size = 0;
   int parts = 0;             // > 1 for a complete split GGUF (path points to shard 1, size is the sum)

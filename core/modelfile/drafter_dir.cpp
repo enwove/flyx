@@ -145,6 +145,39 @@ bool canonical(const std::string& name, std::string* out) {
 
 }  // namespace
 
+namespace {
+
+// A drafter directory's config.json (at most 16 MiB, nested within json_depth_within).
+bool read_config_json(const fs::path& root, const std::string& dir, json* sc, std::string* err) {
+  constexpr size_t kMaxConfigBytes = 16u << 20;
+  std::ifstream f(root / "config.json", std::ios::binary | std::ios::ate);
+  const std::streamoff fsz = f.tellg();
+  if (!f || fsz < 0 || size_t(fsz) > kMaxConfigBytes)
+    return *err = dir + ": cannot read config.json (or larger than 16 MiB)", false;
+  f.seekg(0);
+  std::string cfg_text(size_t(fsz), '\0');
+  if (fsz > 0 && !f.read(cfg_text.data(), fsz)) return *err = dir + ": cannot read config.json", false;
+  if (!interfaces::json_depth_within(cfg_text)) return *err = dir + ": config.json nested too deeply", false;
+  *sc = json::parse(cfg_text);
+  return true;
+}
+
+}  // namespace
+
+std::string drafter_dir_kind(const std::string& dir) {
+  try {
+    json sc;
+    std::string err;
+    if (!read_config_json(to_path(dir), dir, &sc, &err) || !sc.is_object()) return "";
+    const auto archs = sc.value("architectures", json::array());
+    if (std::find(archs.begin(), archs.end(), "DFlash2DraftModel") != archs.end() ||
+        sc.value("speculators_model_type", "") == "dflash2") return "dflash2";
+    return "";
+  } catch (const std::exception&) {  // a config.json that is no JSON
+    return "";
+  }
+}
+
 bool is_drafter_dir(const std::string& path) {
   std::error_code ec;
   return fs::is_directory(to_path(path), ec) && fs::is_regular_file(to_path(path) / "config.json", ec);
@@ -161,19 +194,7 @@ bool read_drafter_dir(const std::string& dir, std::vector<std::unique_ptr<os::Ma
   if (shards.empty()) return *err = dir + ": no *.safetensors beside its config.json", false;
   try {
     json sc;
-    {
-      constexpr size_t kMaxConfigBytes = 16u << 20;
-      std::ifstream f(root / "config.json", std::ios::binary | std::ios::ate);
-      const std::streamoff fsz = f.tellg();
-      if (!f || fsz < 0 || size_t(fsz) > kMaxConfigBytes)
-        return *err = dir + ": cannot read config.json (or larger than 16 MiB)", false;
-      f.seekg(0);
-      std::string cfg_text(size_t(fsz), '\0');
-      if (fsz > 0 && !f.read(cfg_text.data(), fsz)) return *err = dir + ": cannot read config.json", false;
-      if (!interfaces::json_depth_within(cfg_text))
-        return *err = dir + ": config.json nested too deeply", false;
-      sc = json::parse(cfg_text);
-    }
+    if (!read_config_json(root, dir, &sc, err)) return false;
     const json draft = draft_config(sc);
     *out = {};
     out->arch = "drafter";

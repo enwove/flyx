@@ -179,6 +179,15 @@ void choices() {
         "incomplete split GGUF is marked incomplete");
   check(!flyx::hub::select(inc, {inc.id, "Q8_0"}, &files, &err) && err.find("incomplete") != std::string::npos,
         "incomplete split model is refused");
+  flyx::hub::Repo companion_split;
+  companion_split.id = "org/companion";
+  companion_split.files = {file("MTP/layer-00002-of-00002.gguf", 4), file("MTP/layer-00001-of-00002.gguf", 7)};
+  check(flyx::hub::select(companion_split, {companion_split.id, "layer-00001-of-00002.gguf"}, &files, &err) &&
+            files.size() == 2 && files[0].path == companion_split.files[1].path,
+        "an explicit split companion selects all shards starting at shard 1");
+  companion_split.files.pop_back();
+  check(!flyx::hub::select(companion_split, {companion_split.id, "layer-00002-of-00002.gguf"}, &files, &err) &&
+            err.find("incomplete") != std::string::npos, "an explicit incomplete companion is refused");
   // Single complete split model in a repo can be selected without :QUANT.
   flyx::hub::Repo lone_split;
   lone_split.id = "org/split-only";

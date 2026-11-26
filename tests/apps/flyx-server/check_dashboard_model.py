@@ -64,12 +64,14 @@ def dir_model(folder, file, size, kind="gguf", quant=None):
             "path": folder + "\\" + file, "size": size, "modified": 1.7e9, "revision": None, "current": True, "mtp": None}
 
 
+LOCAL_DRAFTER = dict(dir_model(FOLDER, "helper.gguf", int(0.3 * GB), kind="drafter"), drafter_kind="dflash2")
 CATALOG = {"cache": CACHE, "cache_from": "default", "dirs": [FOLDER], "models": [
     hub_model(REPO, "Q4_K_M", int(17.6 * GB), "in-file", mmproj="in-repo"),
     hub_model(REPO, "IQ3_XXS", int(11.8 * GB), "in-repo", mmproj="in-repo"),
     hub_model("acme/Tiny-4B-GGUF", "Q8_0", int(4.5 * GB), None, False),
     dir_model(FOLDER, "tiny-bf16.flyx", int(0.4 * GB), "flyx"),
     dir_model(FOLDER, "Other-12B-Q5_K_M.gguf", int(8.9 * GB), quant="Q5_K_M"),
+    LOCAL_DRAFTER,
     dir_model(FOLDER, "mmproj-BF16.gguf", int(0.9 * GB), kind="mmproj"),
     {"name": "acme/Tiny-27B-DFlash2", "kind": "drafter", "source": "hub", "repo": "acme/Tiny-27B-DFlash2", "size": int(1.9 * GB)}]}
 FOUND = {"query": "", "family": True, "architectures": ["qwen35", "qwen3", "inkling2_loop"], "arch": None,
@@ -92,14 +94,14 @@ def repository(repo):
         return {"repo": repo, "from_cache": False, "drafter": None, "drafter_repo": True, "base_models": ["acme/Tiny-27B"],
                 "runs": True, "known_drafters": [], "build_architectures": ["qwen35", "qwen3"],
                 "mtp": None, "mmproj": None, "ggufs": [],
-                "companions": [{"name": repo + ":Model-DFlash2-Draft-BF16.gguf", "path": "Model-DFlash2-Draft-BF16.gguf",
-                                "file": "Model-DFlash2-Draft-BF16.gguf", "kind": "dflash2",
+                "companions": [{"name": repo + ":helper.gguf", "path": "helper.gguf",
+                                "file": "helper.gguf", "kind": "dflash2",
                                 "size": int(0.5 * GB), "cached": False, "disk": None, "default": True}],
                 "info": {"downloads": 12, "likes": 1, "updated": "2026-11-24T02:15:52.000Z", "license": "apache-2.0",
                          "pipeline": "text-generation", "gated": False, "architecture": "dflash",
                          "context": 1048576, "parameters": 495000000}}
     if repo == "acme/Model-DFlash2":
-        return {"repo": repo, "from_cache": False, "drafter": {"size": int(0.9 * GB)}, "drafter_repo": False,
+        return {"repo": repo, "from_cache": False, "drafter": {"size": int(0.9 * GB), "kind": "dflash2"}, "drafter_repo": False,
                 "base_models": ["acme/Tiny-27B"], "runs": None, "known_drafters": [],
                 "build_architectures": ["qwen35", "qwen3"], "mtp": None, "mmproj": None, "ggufs": [], "companions": [],
                 "info": {"downloads": 500, "likes": 25, "updated": "2026-11-24T02:15:52.000Z", "license": "apache-2.0",
@@ -129,6 +131,7 @@ LISTING = {"path": PICKED, "parent": "E:\\", "kind": "dir", "dirs": [],
 FOLDERS = {"": {"path": "", "parent": None, "kind": "start", "dirs": [{"name": "D:\\", "path": "D:\\"}], "models": []},
            "D:\\": {"path": "D:\\", "parent": None, "kind": "dir", "dirs": [{"name": "models", "path": FOLDER}], "models": []},
            FOLDER: {"path": FOLDER, "parent": "D:\\", "kind": "dir", "dirs": [], "models": [m for m in CATALOG["models"] if m["source"] == "dir"]},
+           LOCAL_DRAFTER["path"]: {"path": LOCAL_DRAFTER["path"], "parent": FOLDER, "kind": "file", "dirs": [], "models": [LOCAL_DRAFTER]},
            PICKED: LISTING}
 
 
@@ -380,9 +383,22 @@ def check_drafters(page, server, want):
     page.locator("#sd-default").click()
     check_choice(True, "", [])
     page.locator("#sd-file").fill("./another.gguf")
-    check_choice(True, "mtp", ["./another.gguf"])
+    check_choice(True, "", ["./another.gguf"])
     page.locator("#mf-reset").click()
     expect(page.locator("#sd-saved input")).to_be_checked()
+
+    # A saved selection carries its header identity across restore. Editing the path drops that identity.
+    want.update(drafter="dflash2", drafters=["./helper.gguf"])
+    page.reload()
+    page.locator('#lset-tabs [data-stab="spec"]').click()
+    expect(page.locator("#sd-custom input[type=radio]")).to_be_checked()
+    expect(page.locator("#sd-file")).to_have_value("./helper.gguf")
+    page.locator("#sd-file").fill("./renamed.gguf")
+    check_choice(True, "", ["./renamed.gguf"])
+    page.locator("#mf-reset").click()
+    expect(page.locator("#mf-cmd")).to_contain_text("--drafter dflash2")
+    want.update(drafter="all", drafters=files)
+    page.reload()
 
 
 def check_vision(page, server, open_page, want):
@@ -509,6 +525,7 @@ def check_hub(page, server, want):
     page.locator("#mf-load").click()
     expect(page.locator("#mv-current")).to_be_visible()
     expect(page.locator("#sd-file")).to_have_value(REPO + ":mtp.gguf")
+    expect(page.locator("#mf-cmd")).to_contain_text("--drafter mtp")
     page.locator('#lset-tabs [data-stab="vision"]').click()
     expect(page.locator("#vs-file")).to_have_value(REPO + ":mmproj-BF16.gguf")
     page.locator("#mf-reset").click()
@@ -582,8 +599,11 @@ def check_hub(page, server, want):
     expect(page.locator("#mf-load")).to_have_text("Draft with it")
     page.locator("#mf-load").click()
     expect(page.locator("#mv-current")).to_be_visible()
-    expect(page.locator("#sd-file")).to_have_value("acme/Model-DFlash2-GGUF:Model-DFlash2-Draft-BF16.gguf")
+    expect(page.locator("#sd-file")).to_have_value("acme/Model-DFlash2-GGUF:helper.gguf")
     expect(page.locator("#mf-cmd")).to_contain_text("--drafter dflash2")
+    confirm(page, "#mf-reload", "Reload")
+    body = server.posted[-1]
+    assert (body["drafter"], body["drafters"]) == ("dflash2", ["acme/Model-DFlash2-GGUF:helper.gguf"]), body
     page.locator("#mf-reset").click()
     # Typing a safetensors DFlash2 repo org/name auto-opens it without Enter and offers Draft with it.
     view(page, "library")
@@ -612,7 +632,7 @@ def check_local(page, server):
     expect(folders).to_have_count(3)  # where Hugging Face downloads to, the model directory, the served model's folder
     expect(folders.nth(0).locator(".ps")).to_have_text(CACHE)
     expect(folders.nth(1).locator(".ps")).to_have_text(FOLDER)
-    expect(models).to_have_count(7)
+    expect(models).to_have_count(8)
     one = page.locator('#lc-list .prow.model[data-model="' + REPO + ':IQ3_XXS"]')
     expect(one.locator(".pn")).to_have_text("Tiny-27B-GGUF · IQ3_XXS")
     expect(one.locator(".pm")).to_have_text("11.8 GB")
@@ -655,10 +675,22 @@ def check_local(page, server):
     view(page, "library")
     page.locator('#src-seg [data-src="local"]').click()
     folders.nth(1).click()
-    expect(page.locator("#lc-companions .mrow")).to_have_count(1)
+    page.locator("#mf-path").fill(LOCAL_DRAFTER["path"])
+    page.locator("#mf-path").press("Enter")
+    expect(page.locator("#mf-load")).to_have_text("Draft with it")
+    page.locator("#mf-load").click()
+    confirm(page, "#mf-reload", "Reload")
+    body = server.posted[-1]
+    assert (body["drafter"], body["drafters"]) == ("dflash2", [LOCAL_DRAFTER["path"]]), body
+    page.locator("#mf-reset").click()
+    view(page, "library")
+    folders.nth(1).click()
+    expect(page.locator("#lc-companions .mrow")).to_have_count(2)
+    page.locator('#lc-companions .mrow[data-comp$="helper.gguf"]').click()
     page.locator('#mf-cached .mrow[data-name$="Other-12B-Q5_K_M.gguf"]').click()
     page.locator('#lc-companions .mrow[data-comp$="mmproj-BF16.gguf"]').click()
     confirm(page, "#mf-load", "Switch")
+    assert (server.posted[-1]["drafter"], server.posted[-1]["drafters"]) == ("dflash2", [FOLDER + "\\helper.gguf"])
     assert (server.posted[-1]["model"], server.posted[-1]["mmproj"]) == (
         FOLDER + "\\Other-12B-Q5_K_M.gguf", FOLDER + "\\mmproj-BF16.gguf"), server.posted[-1]
     view(page, "library")
@@ -768,7 +800,7 @@ def check_switch_companions(open_page, want):
     confirm(page, "#mf-load", "Switch")
     body = server.posted[-1]
     assert (body["mmproj"], body["drafter"], body["drafters"], body["name"]) == (
-        None, "mtp", ["./new-mtp.gguf"], "custom-alias"), body
+        None, "", ["./new-mtp.gguf"], "custom-alias"), body
     # Reloading the same model still preserves all of its own companions and API id.
     page.locator("#mf-reset").click()
     page.locator('#lset-tabs [data-stab="general"]').click()

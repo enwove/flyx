@@ -14,13 +14,14 @@ import time
 from remembered_model import serve
 
 
-def gguf(layers, arch="test"):
+def gguf(layers, arch="test", markov=False):
     def string(text):
         return struct.pack("<Q", len(text)) + text.encode("ascii")
 
-    return (b"GGUF" + struct.pack("<IQQ", 3, 0, 2)
+    extra = string("dflash.has_markov_context") + struct.pack("<I?", 7, True) if markov else b""
+    return (b"GGUF" + struct.pack("<IQQ", 3, 0, 2 + bool(extra))
             + string("general.architecture") + struct.pack("<I", 8) + string(arch)
-            + string(arch + ".nextn_predict_layers") + struct.pack("<II", 4, layers))
+            + string(arch + ".nextn_predict_layers") + struct.pack("<II", 4, layers) + extra)
 
 
 def check_failed_switch(url, root):
@@ -100,26 +101,51 @@ def check_listing(url, file):
         assert not any("dangling-Q4_K_M" in m["file"] for m in models2), models2
         assert all(0 <= m["size"] < (1 << 60) for m in models2), models2
 
-    # Unified GGUF header classification (apps::classify_gguf): arch="dflash" (even without "dflash" in the filename,
-    # e.g. DSpark or Hub cached GGUF drafters) -> kind="drafter", drafter_kind="dflash2"; arch="clip" -> kind="mmproj".
-    (root / "dspark-custom-Q8_0.gguf").write_bytes(gguf(0, arch="dflash"))
-    (root / "renamed-vision-BF16.gguf").write_bytes(gguf(0, arch="clip"))
+    # These are complete GGUF headers; filenames deliberately disagree with their contents.
+    repo = "acme/Mixed"
+    cached = root / "hub" / "models--acme--Mixed"
     commit = "a" * 40
-    hub_snap = root / "hub" / "models--acme--Test-DFlash2-GGUF" / "snapshots" / commit
-    hub_snap.mkdir(parents=True, exist_ok=True)
-    (hub_snap / "Test-DFlash2-Q4_K_M.gguf").write_bytes(gguf(0, arch="dflash"))
-    refs = root / "hub" / "models--acme--Test-DFlash2-GGUF" / "refs"
-    refs.mkdir(parents=True, exist_ok=True)
-    (refs / "main").write_text(commit, encoding="ascii")
+    snap = cached / "snapshots" / commit
+    old = snap.with_name("b" * 40)
+    old.mkdir(parents=True)
+    snap.mkdir()
+    (cached / "refs").mkdir()
+    (cached / "refs" / "main").write_text(commit, encoding="ascii")
+    for folder in [root, snap]:
+        (folder / "helper.gguf").write_bytes(gguf(0, "dflash"))
+        (folder / "mmproj-Q4_0.gguf").write_bytes(gguf(0, "dflash"))
+        (folder / "imatrix-ignored.gguf").write_bytes(gguf(0, "dflash"))
+        (folder / "mtp-vision.gguf").write_bytes(gguf(0, "clip"))
+        (folder / "mmproj-markov.gguf").write_bytes(gguf(0, "dflash", markov=True))
+    (snap / "Main-Q8_0.gguf").write_bytes(gguf(1))
+    (snap / "Plain-Q6_K.gguf").write_bytes(gguf(0))
+    (old / "Old-Q4_0.gguf").write_bytes(gguf(0))
+    (old / "mtp-layer.gguf").write_bytes(gguf(1))
+    (old / "mmproj-incomplete-00001-of-00002.gguf").write_bytes(gguf(0, "clip"))
+
     with urlopen(url + "/v1/hub/cached", timeout=5) as response:
-        models3 = json.load(response)["models"]
-    dspark = next(m for m in models3 if m["file"] == "dspark-custom-Q8_0.gguf")
-    assert dspark["kind"] == "drafter" and dspark["drafter_kind"] == "dflash2" and dspark["mtp"] is None, dspark
-    vis = next(m for m in models3 if m["file"] == "renamed-vision-BF16.gguf")
-    assert vis["kind"] == "mmproj" and vis["mtp"] is None, vis
-    hub_df = next(m for m in models3 if m["name"] == "acme/Test-DFlash2-GGUF:Q4_K_M")
-    assert hub_df["source"] == "hub" and hub_df["kind"] == "drafter" and hub_df["drafter_kind"] == "dflash2", hub_df
-    assert hub_df["mtp"] is None and hub_df["mmproj"] is None, hub_df
+        models = json.load(response)["models"]
+    for source in ["dir", "hub"]:
+        entries = {m["file"]: m for m in models if m["source"] == source
+                   and (source == "hub" or Path(m["path"]).parent == root)}
+        for name in ["helper.gguf", "mmproj-Q4_0.gguf", "mmproj-markov.gguf"]:
+            row = entries[name]
+            assert row["kind"] == "drafter" and row["drafter_kind"] == ("dspark" if "markov" in name else "dflash2"), row
+        assert entries["mtp-vision.gguf"]["kind"] == "mmproj"
+        assert "imatrix-ignored.gguf" not in entries and not any("mmproj-incomplete" in f for f in entries)
+    main = entries["Main-Q8_0.gguf"]
+    assert (main["kind"], main["mtp"], main["mmproj"], main["dflash2"]) == ("gguf", "in-file", "in-repo", "in-repo"), main
+    assert entries["Plain-Q6_K.gguf"]["mtp"] == "in-repo"  # MTP is shared across snapshots.
+    older = entries["Old-Q4_0.gguf"]
+    assert (older["mtp"], older["mmproj"], older["dflash2"]) == ("in-repo", None, None), older
+    assert entries["mtp-layer.gguf"]["drafter_kind"] == "mtp"
+    with urlopen(url + "/v1/hub/files?repo=" + repo, timeout=5) as response:
+        details = json.load(response)
+    assert {m["name"] for m in details["ggufs"]} == {repo + ":Q8_0", repo + ":Q6_K"}, details
+    assert {c["file"]: c["kind"] for c in details["companions"]} == {
+        "helper.gguf": "dflash2", "mmproj-Q4_0.gguf": "dflash2",
+        "mtp-vision.gguf": "mmproj", "mmproj-markov.gguf": "dspark"}, details
+    assert details["mmproj"]["path"] == "mtp-vision.gguf" and details["mtp"] is None, details
 
 
 if __name__ == "__main__":

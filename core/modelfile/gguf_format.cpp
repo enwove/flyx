@@ -815,12 +815,14 @@ class HeaderReader {
 
 namespace flyx {
 
+std::string gguf_header_path(const std::string& path) {
+  modelfile::SplitPath sp;
+  return modelfile::parse_split_suffix(path, &sp) && sp.part != 1 ? modelfile::shard_path(sp, 0) : path;
+}
+
 GgufPeek gguf_peek(const std::string& path) {
   GgufPeek out;
-  std::string target = path;
-  modelfile::SplitPath sp;
-  if (modelfile::parse_split_suffix(path, &sp) && sp.part != 1) target = modelfile::shard_path(sp, 0);
-  modelfile::HeaderReader r(target);
+  modelfile::HeaderReader r(gguf_header_path(path));
   char magic[4];
   uint32_t version = 0;
   if (!r.read(magic, 4) || std::memcmp(magic, "GGUF", 4) != 0 || !r.get(&version) || version < 1 || version > 3)
@@ -873,6 +875,7 @@ GgufPeek gguf_peek(const std::string& path) {
     const bool is_signed = type == 1 || type == 3 || type == 5 || type == 11;
     for (int b = size - 1; b >= 0; --b) v = (v << 8) | raw[b];  // GGUF is little-endian
     if (is_signed && size < 8 && (raw[size - 1] & 0x80)) v -= int64_t(1) << (8 * size);
+    if (key == "dflash.has_markov_context" && type == 7) out.has_markov_context = v != 0;
     static const std::string kKey = ".nextn_predict_layers";
     if (type != 6 && type != 12 && key.size() > kKey.size() && key.ends_with(kKey))
       layers[key.substr(0, key.size() - kKey.size())] = v;
