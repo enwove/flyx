@@ -544,6 +544,7 @@ struct flyx_plan {
   bool tree = false, drafted_tree = false, has_draft = false;
   std::vector<int> tree_kv;
   std::vector<int> checkpoints;  // sorted verify checkpoints for adaptive conditional round graph (empty: fixed width)
+  bool earlier_checkpoints = false;  // flyx_program's: a stop may verify a checkpoint before the one it drafted to
   bool adaptive() const { return checkpoints.size() > 1; }
 };
 
@@ -1107,7 +1108,6 @@ void forward(const Pass& ps, int copy_prefix = 0);
 void forward_target(const Pass& ps, int copy_prefix = 0);
 void draft_step_range(const Pass& ps, int start, int end);
 bool sequential_draft(const flyx_plan* p);
-bool cheap_draft_steps(const flyx_plan* p);
 void run_node(const Pass& ps, const flyx_node& n, const Block* b);  // the generic implementation of a node
 bool generic_impl(const RegionImpl* r);                                // r is the generic one (not a fused override)
 int lower(flyx_bmodel* m, const flyx_program* prog, flyx_plan** out);

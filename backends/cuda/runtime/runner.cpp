@@ -1319,7 +1319,7 @@ RoundPass round_pass(flyx_plan* p, flyx_seq* s, const flyx_gen_params* g, bool p
 #if CUDART_VERSION >= 12040
 // Flat GPU-resident conditional graph for an adaptive round plan:
 // - Step-wise drafters (MTP, EAGLE-4, DSpark Markov head): chunk 0 -> decide -> IF(draft chunk 1 -> decide) -> ... ->
-//   IF(verify w_j): the checkpoint the stop is at, or an earlier one where draft steps are cheap (cheap_draft_steps).
+//   IF(verify w_j): the checkpoint the stop is at, or an earlier one where the program allows it (earlier_checkpoints).
 // - Parallel block drafters (DFlash2): full block draft -> decide -> IF(verify w_j).
 // Zero CPU sync; full FLYX_MAX_IN_FLIGHT=2 pipelining; handles reset to 0 on every launch.
 bool capture_adaptive_graph(flyx_plan* p, flyx_seq* s, const RoundPass& r, cudaGraph_t* out, GraphSize* size_out) {
@@ -1332,7 +1332,6 @@ bool capture_adaptive_graph(flyx_plan* p, flyx_seq* s, const RoundPass& r, cudaG
   guard.graph = root;
   const int M = int(p->checkpoints.size());
   const bool seq_draft = sequential_draft(p);
-  const bool earlier_prefix = cheap_draft_steps(p);
 
   std::vector<cudaGraphConditionalHandle> h_ver(size_t(M), 0);
   std::vector<cudaGraphConditionalHandle> h_draft(size_t(M), 0);
@@ -1396,8 +1395,8 @@ bool capture_adaptive_graph(flyx_plan* p, flyx_seq* s, const RoundPass& r, cudaG
   if (seq_draft) {
     if (!capture_into(root, {}, [&] {
           draft_step_range(r.ps, 0, p->checkpoints[0]);
-          stop_decide_step(s->draft_prob, s->draft_margin, s->stop_dev, s->stop_state, 0, 0, p->checkpoints[0],
-                           static_cast<unsigned long long>(h_draft[1]), ver_handles, earlier_prefix, s->st);
+          stop_decide_step(s->draft_prob, s->draft_margin, s->stop_dev, s->stop_state, 0, p->checkpoints[0],
+                           static_cast<unsigned long long>(h_draft[1]), ver_handles, p->earlier_checkpoints, s->st);
         }, &prev))
       return false;
   } else {
@@ -1428,8 +1427,8 @@ bool capture_adaptive_graph(flyx_plan* p, flyx_seq* s, const RoundPass& r, cudaG
       const unsigned long long h_nxt = (j + 1 < M) ? static_cast<unsigned long long>(h_draft[size_t(j + 1)]) : 0ull;
       if (!capture_into(body, {}, [&] {
             draft_step_range(r.ps, w0, w1);
-            stop_decide_step(s->draft_prob, s->draft_margin, s->stop_dev, s->stop_state, j, w0, w1, h_nxt, ver_handles,
-                             earlier_prefix, s->st);
+            stop_decide_step(s->draft_prob, s->draft_margin, s->stop_dev, s->stop_state, j, w1, h_nxt, ver_handles,
+                             p->earlier_checkpoints, s->st);
           }, nullptr))
         return false;
       bodies.push_back(graph_size(body));

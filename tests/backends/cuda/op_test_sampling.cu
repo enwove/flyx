@@ -692,11 +692,10 @@ void test_stop_decide() {
     for (const bool earlier : {false, true}) {  // a stop verifies its own checkpoint, or the prefix that pays
       double ref_s = 1.0;
       for (int b = 0; b < cur.n_buckets; ++b) {
-        const int w0 = b == 0 ? 0 : cur.widths[b - 1];
         const int w1 = cur.widths[b];
         int want_v = -1;
-        const int want_c = ops::stop_decide_step_ref(dp.data(), dm.data(), cur, b, w0, w1, &ref_s, &want_v, earlier);
-        stop_decide_step(dprob, dmargin, dpol, dst, b, w0, w1, 0, zero_h, earlier, 0);
+        const int want_c = ops::stop_decide_step_ref(dp.data(), dm.data(), cur, b, w1, earlier, &ref_s, &want_v);
+        stop_decide_step(dprob, dmargin, dpol, dst, b, w1, 0, zero_h, earlier, 0);
         DevStopState got{};
         CK(cudaMemcpy(&got, dst, sizeof(got), cudaMemcpyDeviceToHost));
         got_s.push_back(double(got.survival));
@@ -723,7 +722,7 @@ void test_stop_decide() {
   for (int i = 0; i < FLYX_MAX_STOP_BUCKETS; ++i) oob.widths[i] = FLYX_MAX_ROWS + 32;
   CK(cudaMemcpy(dpol, &oob, sizeof(oob), cudaMemcpyHostToDevice));
   StopCondHandles zero_h{};
-  stop_decide_step(dprob, dmargin, dpol, dst, 0, 0, FLYX_MAX_ROWS + 5, 0, zero_h, true, 0);
+  stop_decide_step(dprob, dmargin, dpol, dst, 0, FLYX_MAX_ROWS + 5, 0, zero_h, true, 0);
   DevStopState got_oob_s{};
   CK(cudaMemcpy(&got_oob_s, dst, sizeof(got_oob_s), cudaMemcpyDeviceToHost));
   stop_decide_block(dprob, dmargin, dpol, dst, zero_h, 0);
@@ -781,8 +780,8 @@ void test_stop_decide() {
     };
     std::vector<cudaGraphNode_t> prev;
     capture(graph, {}, [&] {
-      stop_decide_step(dprob, dmargin, dpol, dst, 0, 0, ws[0], static_cast<unsigned long long>(h_draft[1]), ver,
-                       earlier, st);
+      stop_decide_step(dprob, dmargin, dpol, dst, 0, ws[0], static_cast<unsigned long long>(h_draft[1]), ver, earlier,
+                       st);
     }, &prev);
     for (int j = 1; j < M; ++j) {
       cudaGraphNode_t node = nullptr;
@@ -790,7 +789,7 @@ void test_stop_decide() {
       const unsigned long long next = j + 1 < M ? static_cast<unsigned long long>(h_draft[j + 1]) : 0ull;
       capture(body, {}, [&] {
         CK(cudaMemsetAsync(marks + j, 1, sizeof(int), st));
-        stop_decide_step(dprob, dmargin, dpol, dst, j, ws[j - 1], ws[j], next, ver, earlier, st);
+        stop_decide_step(dprob, dmargin, dpol, dst, j, ws[j], next, ver, earlier, st);
       }, nullptr);
       prev = {node};
     }
@@ -823,8 +822,7 @@ void test_stop_decide() {
       CK(cudaMemcpy(dmargin, hm.data(), sizeof(float) * FLYX_MAX_ROWS, cudaMemcpyHostToDevice));
       int stop = 0, verify = 0;  // the bucket whose step stops, the bucket it verifies
       for (;; ++stop) {
-        stop_decide_step(dprob, dmargin, dpol, dst, stop, stop ? ws[stop - 1] : 0, ws[stop], 0, StopCondHandles{},
-                         earlier, 0);
+        stop_decide_step(dprob, dmargin, dpol, dst, stop, ws[stop], 0, StopCondHandles{}, earlier, 0);
         DevStopState got{};
         CK(cudaMemcpy(&got, dst, sizeof(got), cudaMemcpyDeviceToHost));
         verify = got.verify_bucket;

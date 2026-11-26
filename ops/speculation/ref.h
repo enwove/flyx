@@ -22,11 +22,10 @@ inline double stop_draft_prob_ref(double prob, double margin, int pos, const fly
 // Updates *survival (cumulative survival through cur_w) and optional *verify_bucket (what to verify if stopping now:
 // `bucket`, or with `earlier_prefix` the best bucket in [0, bucket]); returns 1 to continue drafting, 0 to stop and
 // verify *verify_bucket.  The policy's costs are whole rounds', draft steps and verify rows: an earlier prefix is
-// priced right only where the steps already taken cost little beside the rows not verified (the caller's to say).
+// priced right only where the steps already taken cost little beside the rows not verified
+// (flyx_program::earlier_checkpoints).
 inline int stop_decide_step_ref(const double* prob, const double* margin, const flyx_stop_policy& pol, int bucket,
-                                int prev_w, int cur_w, double* survival, int* verify_bucket = nullptr,
-                                bool earlier_prefix = true) {
-  (void)prev_w;
+                                int cur_w, bool earlier_prefix, double* survival, int* verify_bucket = nullptr) {
   const int n = std::clamp(pol.n_buckets, 1, FLYX_MAX_STOP_BUCKETS);
   const int b_cur = std::clamp(bucket, 0, n - 1);
   const int hi = std::clamp(cur_w, 0, FLYX_MAX_ROWS);

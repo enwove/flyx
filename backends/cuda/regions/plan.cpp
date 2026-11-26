@@ -315,17 +315,6 @@ bool sequential_draft(const flyx_plan* p) {
   return false;
 }
 
-// Whether a stop may verify fewer drafts than its round has drafted (stop_decide_step's earlier_prefix): where a draft
-// step costs little beside a verify row.  DSpark's backbone drafts the block at once and a step is its Markov head's
-// alone; an MTP step is a block of the model's, about a verify row's work, so what it has drafted it verifies
-// (Qwen3.8-27B-UD-IQ3_XXS, RTX 5070 Ti, chat_short.jsonl: earlier prefixes gave its rounds 3.18 tokens against 3.24
-// and 1.3% fewer tokens a second, the checkpoints' costs counting draft steps a stop has paid as saved).
-bool cheap_draft_steps(const flyx_plan* p) {
-  for (size_t i = 0; i < p->nodes.size(); ++i)
-    if (p->nodes[i].kind == FLYX_NODE_DRAFT && p->block[i]) return std::holds_alternative<DSparkBlock>(*p->block[i]);
-  return false;
-}
-
 void draft_step_range(const Pass& ps, int start, int end) {
   for (size_t i = 0; i < ps.p->nodes.size(); ++i) {
     if (ps.p->nodes[i].kind != FLYX_NODE_DRAFT || !ps.p->block[i]) continue;
@@ -597,6 +586,7 @@ int lower(flyx_bmodel* m, const flyx_program* prog, flyx_plan** out) {
     if (prog->checkpoints[prog->n_checkpoints - 1] != prog->width)
       return fail("lower: last adaptive checkpoint must equal plan width");
     p->checkpoints.assign(prog->checkpoints, prog->checkpoints + prog->n_checkpoints);
+    p->earlier_checkpoints = prog->earlier_checkpoints != 0;
 #endif
   }
   if (!p->tree) p->tree_kv.clear();

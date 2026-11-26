@@ -2,9 +2,10 @@
 // Device-side intra-round confidence optimal stopping decisions for adaptive CUDA conditional graphs.
 // Works identically for step-wise drafters (MTP, EAGLE-4, DSpark Markov head) via stop_decide_step and parallel block
 // drafters (DFlash2) via stop_decide_block, using only drafter-agnostic (prob, margin) and core/speculation/'s
-// flyx_stop_policy.  A step that stops verifies what has been drafted, or, where the caller says a draft step costs
-// little beside a verify row (earlier_prefix), the prefix that pays: the policy's costs are whole rounds', so two
-// checkpoints differ by their draft steps too, which a stop has already paid.
+// flyx_stop_policy.  A step that stops verifies what has been drafted, or, where the round's program allows it
+// (earlier_prefix: flyx_program::earlier_checkpoints, the model's word that a draft step costs little beside a verify
+// row), the prefix that pays: the policy's costs are whole rounds', so two checkpoints differ by their draft steps
+// too, which a stop has already paid.
 #include "backends/cuda/kernels/common/device.cuh"
 #include "backends/cuda/kernels/kernels.cuh"
 
@@ -22,9 +23,8 @@ __device__ inline float d_stop_draft_prob(float prob, float margin, int pos, con
 
 __global__ void k_stop_decide_step(const float* __restrict__ prob, const float* __restrict__ margin,
                                    const flyx_stop_policy* __restrict__ pol, DevStopState* __restrict__ state,
-                                   int bucket, int prev_w, int cur_w, unsigned long long h_next_draft,
-                                   StopCondHandles h_ver, bool earlier_prefix) {
-  (void)prev_w;
+                                   int bucket, int cur_w, unsigned long long h_next_draft, StopCondHandles h_ver,
+                                   bool earlier_prefix) {
   const flyx_stop_policy P = *pol;
   int n_buckets = P.n_buckets < 1 ? 1 : (P.n_buckets > FLYX_MAX_STOP_BUCKETS ? FLYX_MAX_STOP_BUCKETS : P.n_buckets);
   if (h_ver.h[0]) {
@@ -144,10 +144,9 @@ __global__ void k_stop_decide_block(const float* __restrict__ prob, const float*
 }  // namespace
 
 void stop_decide_step(const float* prob, const float* margin, const flyx_stop_policy* pol, DevStopState* state,
-                      int bucket, int prev_w, int cur_w, unsigned long long h_next_draft, StopCondHandles h_ver,
+                      int bucket, int cur_w, unsigned long long h_next_draft, StopCondHandles h_ver,
                       bool earlier_prefix, cudaStream_t st) {
-  k_stop_decide_step<<<1, 1, 0, st>>>(prob, margin, pol, state, bucket, prev_w, cur_w, h_next_draft, h_ver,
-                                      earlier_prefix);
+  k_stop_decide_step<<<1, 1, 0, st>>>(prob, margin, pol, state, bucket, cur_w, h_next_draft, h_ver, earlier_prefix);
 }
 
 void stop_decide_block(const float* prob, const float* margin, const flyx_stop_policy* pol, DevStopState* state,

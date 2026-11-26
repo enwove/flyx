@@ -28,6 +28,12 @@ struct DrafterTraits {
   bool sequential;     // drafts one token per step; stopping early saves both draft and verify work
   bool tree_only;      // drafts trees over a persistent canvas (DV)
   bool stretch_block;  // shared mask token lets a parallel block draft past max_drafts up to FLYX_MAX_ROWS - 1
+  // A block drafted at once whose drafts a small head then refines one at a time: a step costs little beside the
+  // verify row its draft adds, so a round that stops may verify fewer drafts than it has (draft_steps_cheap).  Not a
+  // sequential drafter's, whose step is a pass of a layer: with earlier checkpoints allowed Qwen3.8-27B's MTP rounds
+  // gave up drafts that paid (RTX 5070 Ti, 24 chat prompts of 256 tokens: 3.06 -> 2.99 tokens a round, 144.4 ->
+  // 142.4 tok/s), the checkpoints' costs counting as saved the draft steps a stop has paid.
+  bool refines_by_step = false;
 };
 
 DrafterTraits drafter_traits(Drafter d) {
@@ -35,7 +41,7 @@ DrafterTraits drafter_traits(Drafter d) {
     case Drafter::kMtp: return {/*sequential=*/true, false, false};
     case Drafter::kDFlash2: return {false, false, /*stretch_block=*/true};
     case Drafter::kDv: return {false, /*tree_only=*/true, false};
-    case Drafter::kDSpark: return {false, false, false};  // block backbone + Markov head, its block at most
+    case Drafter::kDSpark: return {false, false, false, /*refines_by_step=*/true};  // backbone + Markov head
   }
   return {false, false, false};
 }
@@ -87,6 +93,8 @@ std::vector<int> Model::adaptive_checkpoints(int d) const {
     if (w <= b.max_drafts) cps.push_back(w);
   return cps.size() > 1 ? cps : std::vector<int>{};
 }
+
+bool Model::draft_steps_cheap(int d) const { return drafter_traits(drafters_.at(size_t(d)).kind).refines_by_step; }
 
 int Model::block_drafts(int d) const {
   const DrafterBlock& b = drafters_.at(size_t(d));
