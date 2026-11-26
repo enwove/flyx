@@ -41,7 +41,7 @@ struct Fetched {
 // Fetches what is missing. want_mtp: take the repository's MTP file for a GGUF without the layer.
 // want_vision: take the repository's mmproj GGUF when no explicit mmproj path was given.
 // want_dspark: with no DSpark drafter among `drafters`, take the one published beside the model: its repository's
-// default dspark-*.gguf (hub::companion_files), or for a model file on disk dspark_beside's; either only where its
+// preferred complete DSpark GGUF, or for a model file on disk dspark_beside's; either only where its
 // header says it is a DSpark drafter.
 bool fetch_model(const std::string& model, const std::vector<std::string>& drafters, bool want_mtp,
                  const hub::ProgressFn& progress, const std::atomic<bool>* stop, Fetched* out, std::string* err,

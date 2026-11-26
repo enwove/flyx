@@ -334,7 +334,9 @@ std::vector<GgufChoice> gguf_choices(const Repo& r, bool include_companions) {
     c.file = c.parts.front();
     out.push_back(std::move(c));
   }
-  std::sort(out.begin(), out.end(), [](const GgufChoice& a, const GgufChoice& b) { return a.total_size < b.total_size; });
+  std::sort(out.begin(), out.end(), [](const GgufChoice& a, const GgufChoice& b) {
+    return a.total_size != b.total_size ? a.total_size < b.total_size : a.file.path < b.file.path;
+  });
   return out;
 }
 
@@ -378,6 +380,8 @@ std::vector<CompanionFile> companion_files(const Repo& r) {
     if (mtp_gguf_name(f.path)) {
       out.push_back({f, "mtp", def_mtp && def_mtp->path == f.path});
     } else if (dspark_gguf_name(f.path)) {
+      SplitGguf sp;
+      if (parse_split(f.path, &sp) && sp.part != 1) continue;
       out.push_back({f, "dspark", !dspark_default_set});
       dspark_default_set = true;
     } else if (mmproj_gguf_name(f.path)) {

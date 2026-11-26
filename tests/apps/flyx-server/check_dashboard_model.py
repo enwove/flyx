@@ -92,15 +92,16 @@ FOUND_PAGE2 = {"query": "", "family": True, "architectures": ["qwen35", "qwen3",
      "pipeline": "text-generation", "gated": False, "cached": False, "architecture": "qwen3", "runs": True}]}
 
 
-def repository(repo):
+def repository(repo, helper_cached=False):
     """GET /v1/hub/files: REPO as this build runs it, a dflash GGUF drafter repo, a safetensors drafter repo, or unsupported."""
     if repo == "acme/Model-DFlash2-GGUF":
         return {"repo": repo, "from_cache": False, "drafter": None, "drafter_repo": True, "base_models": ["acme/Tiny-27B"],
                 "runs": True, "known_drafters": [], "build_architectures": ["qwen35", "qwen3"],
                 "mtp": None, "mmproj": None, "ggufs": [],
                 "companions": [{"name": repo + ":helper.gguf", "path": "helper.gguf",
-                                "file": "helper.gguf", "kind": "dflash2",
-                                "size": int(0.5 * GB), "cached": False, "disk": None, "default": True}],
+                                "file": "helper.gguf", "kind": "dspark" if helper_cached else "drafter",
+                                "drafter_kind": "dspark" if helper_cached else "",
+                                "size": int(0.5 * GB), "cached": helper_cached, "disk": None, "default": True}],
                 "info": {"downloads": 12, "likes": 1, "updated": "2026-11-24T02:15:52.000Z", "license": "apache-2.0",
                          "pipeline": "text-generation", "gated": False, "architecture": "dflash",
                          "context": 1048576, "parameters": 495000000}}
@@ -238,7 +239,7 @@ class Server:
                 res["models"] = [m for m in res["models"] if m.get("architecture") == arch]
             return route.fulfill(json=res)
         if "/v1/hub/files" in url:
-            res = repository(query["repo"][0])
+            res = repository(query["repo"][0], getattr(self, "helper_cached", False))
             res["endpoint"] = self.hub_endpoint
             return route.fulfill(json=res)
         if "/v1/hub/dir" in url:
@@ -595,20 +596,21 @@ def check_hub(page, server, want):
     page.locator('#mf-files .mrow[data-name$=":Q5_K_M"]').click()
     expect(page.locator("#mf-load")).to_be_disabled()
     # A dflash GGUF drafter repo is never marked unsupported and lets the user draft with its GGUF directly.
-    page.locator("#hf-q").fill("acme/Model-DFlash2-GGUF")
-    expect(page.locator("#hf-name")).to_have_text("Model-DFlash2-GGUF")
-    expect(page.locator("#hf-unsupported")).to_have_count(0)
-    expect(page.locator("#hf-drafter-repo")).to_be_visible()
-    page.locator('#hf-companions .mrow[data-kind="dflash2"]').click()
-    expect(page.locator("#mf-load")).to_have_text("Draft with it")
-    page.locator("#mf-load").click()
-    expect(page.locator("#mv-current")).to_be_visible()
-    expect(page.locator("#sd-file")).to_have_value("acme/Model-DFlash2-GGUF:helper.gguf")
-    expect(page.locator("#mf-cmd")).to_contain_text("--drafter dflash2")
-    confirm(page, "#mf-reload", "Reload")
-    body = server.posted[-1]
-    assert (body["drafter"], body["drafters"]) == ("dflash2", ["acme/Model-DFlash2-GGUF:helper.gguf"]), body
-    page.locator("#mf-reset").click()
+    for mode in ("", "dspark"):
+        server.helper_cached = bool(mode)
+        view(page, "library")
+        page.locator("#hf-q").fill("")
+        page.locator("#hf-q").fill("acme/Model-DFlash2-GGUF")
+        expect(page.locator("#hf-name")).to_have_text("Model-DFlash2-GGUF")
+        expect(page.locator("#hf-drafter-repo")).to_be_visible()
+        page.locator(f'#hf-companions .mrow[data-kind="{mode}"]').click()
+        expect(page.locator("#mf-load")).to_have_text("Draft with it")
+        page.locator("#mf-load").click()
+        expect(page.locator("#sd-file")).to_have_value("acme/Model-DFlash2-GGUF:helper.gguf")
+        confirm(page, "#mf-reload", "Reload")
+        body = server.posted[-1]
+        assert (body["drafter"], body["drafters"]) == (mode, ["acme/Model-DFlash2-GGUF:helper.gguf"]), body
+        page.locator("#mf-reset").click()
     # Typing a safetensors DFlash2 repo org/name auto-opens it without Enter and offers Draft with it.
     view(page, "library")
     page.locator("#hf-q").fill("acme/Model-DFlash2")

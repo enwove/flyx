@@ -1057,7 +1057,8 @@ export function ModelPage({ active, libraryAsked, currentAsked }) {
       ...(j && j.mmproj ? [{ name: repoSel + ":" + baseName(j.mmproj.path), path: j.mmproj.path, file: baseName(j.mmproj.path),
                              kind: "mmproj", size: j.mmproj.size, cached: !!j.mmproj.cached, disk: null, default: true }] : []),
     ];
-    const comps = rawComps.map((c) => Object.assign({}, c, { key: c.name, spec: c.disk || c.name }));
+    const comps = rawComps.map((c) => ({ ...c, key: c.name, spec: c.disk || c.name,
+      kind: c.kind === "mmproj" ? c.kind : (c.drafter_kind ?? c.kind) }));
     const selDraft = comps.find((c) => c.kind !== "mmproj" && c.key === hubDraft) || null;
     const selMm = comps.find((c) => c.kind === "mmproj" && c.key === hubMmproj) || null;
     const barState = companionBarState(rows, selDraft, selMm, () => { setHubDraft(""); setHubMmproj(""); });

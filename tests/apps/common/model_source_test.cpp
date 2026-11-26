@@ -141,6 +141,51 @@ int main() {
   for (const std::string& n : f.notes) said = said || n.find("is not a DSpark drafter") != std::string::npos;
   check(ok && f.drafters.empty() && said, "a dspark-*.gguf whose header is not a DSpark drafter's is not taken");
 
+  // A remote listing and a cold snapshot. Local blobs stand in for completed transfers to keep this test offline.
+  const auto split_repo = cached_repo("Ink-Split-GGUF", {});
+  const std::string first = "dspark-Ink-Q8_0-00001-of-00002.gguf", second = "dspark-Ink-Q8_0-00002-of-00002.gguf";
+  flyx::hub::Repo cold;
+  check(flyx::hub::in_cache(split_repo, "main", &cold), "split model cache exists");
+  cold.from_cache = false;
+  const auto snap = to_path(flyx::hub::snapshot_dir(cold));
+  const auto blobs = snap.parent_path().parent_path() / "blobs";
+  const std::string id1(40, 'a'), id2(40, 'b');
+  write_gguf(blobs / id1, "dflash", 1);
+  write_gguf(blobs / id2, "dflash");
+  cold.files.push_back({second, fs::file_size(blobs / id2), "", id2});
+  cold.files.push_back({first, fs::file_size(blobs / id1), "", id1});
+  const auto choices = flyx::apps::hub_ggufs(cold);
+  const auto* split = flyx::apps::preferred_companion(choices, "dspark");
+  std::vector<std::string> paths;
+  check(split && !split->cached && split->choice.file.path == first && split->choice.parts.size() == 2 &&
+            flyx::hub::fetch(cold, split->choice.parts, &paths, {}, nullptr, &err) &&
+            fs::exists(snap / first) && fs::exists(snap / second), "cold snapshot receives both DSpark shards");
+  uint64_t fetched_bytes = 0;
+  ok = flyx::apps::fetch_model(split_repo + ":Q4_K_M", {}, false,
+                              [&](const flyx::hub::Progress& p) { fetched_bytes = p.total; },
+                              nullptr, &f, &err, "", false, true);
+  const auto total = fs::file_size(blobs / id1) + fs::file_size(blobs / id2);
+  check(ok && f.drafters.size() == 1 && to_path(f.drafters.front()) == snap / first &&
+            f.drafter_sources.size() == 1 && f.drafter_sources.front().size == total && fetched_bytes == total,
+        "auto-fetch requests and reports the complete split");
+
+  const auto neutral_repo = cached_repo("Ink-Neutral-GGUF", {{"helper-Q8_0.gguf", 1}});
+  ok = fetched(neutral_repo + ":Q4_K_M", {}, true, &f, &err);
+  check(ok && f.drafter_sources.size() == 1 && f.drafter_sources.front().from == neutral_repo + "/helper-Q8_0.gguf",
+        "a cached Markov header identifies a neutral-name companion");
+
+  flyx::hub::Repo generic;
+  generic.id = "acme/Generic";
+  generic.commit = std::string(40, 'd');
+  generic.info.gguf_architecture = "dflash";
+  generic.files = {{"helper.gguf", 0, "", ""}};
+  auto listing = flyx::apps::hub_ggufs(generic);
+  check(listing.size() == 1 && !listing[0].cached && listing[0].cls.kind == "drafter" &&
+            listing[0].cls.drafter_kind.empty(), "uncached dflash GGUF is a selectable drafter of unknown type");
+  write_gguf(to_path(flyx::hub::snapshot_dir(generic)) / "helper.gguf", "dflash", 1);
+  listing = flyx::apps::hub_ggufs(generic);
+  check(listing.size() == 1 && listing[0].cached && listing[0].cls.drafter_kind == "dspark",
+        "cached selection uses the same file's Markov header");
   set_env("HF_HUB_OFFLINE", "");
   set_env("HF_HUB_CACHE", "");
   fs::remove_all(tmp, ec);

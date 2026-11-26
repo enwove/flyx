@@ -278,11 +278,12 @@ ojson repo_json(const hub::Repo& r) {
     const bool is_default =
         &item == preferred_mtp || &item == preferred_mm || &item == preferred_dspark || (is_dflash && !has_dflash);
     if (is_dflash) has_dflash = true;
-    if (is_dflash || item.cls.drafter_kind == "dspark") has_dflash_arch = true;
+    if (item.cls.kind == "drafter" && item.cls.drafter_kind != "mtp") has_dflash_arch = true;
     const auto& path = c.file.path;
     const auto base = path.substr(path.rfind('/') + 1);
     companions.push_back({{"name", r.id + ":" + base}, {"path", path}, {"file", base},
-                          {"kind", item.cls.kind == "mmproj" ? "mmproj" : item.cls.drafter_kind},
+                          {"kind", item.cls.drafter_kind.empty() ? item.cls.kind : item.cls.drafter_kind},
+                          {"drafter_kind", item.cls.drafter_kind},
                           {"size", c.total_size}, {"cached", item.cached}, {"disk", item.cached ? ojson(item.disk) : ojson(nullptr)},
                           {"default", is_default}});
     if (&item == preferred_mtp || &item == preferred_mm)

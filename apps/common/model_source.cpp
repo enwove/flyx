@@ -96,7 +96,10 @@ GgufClassification gguf_identity(const flyx::GgufPeek& peek, const std::string& 
   if (!peek.valid || peek.arch.empty()) {
     if (hub::mmproj_gguf_name(name)) return {"mmproj", "", arch, mtp};
     if (hub::dspark_gguf_name(name)) return {"drafter", "dspark", arch, mtp};
-    if (repo_arch == "dflash") return {"drafter", "dflash2", arch, mtp};
+    if (repo_arch == "dflash" && hub::model_gguf_name(name)) {
+      const auto base = lower(name.substr(name.rfind('/') + 1));
+      return {"drafter", base.starts_with("dflash2-") ? "dflash2" : "", arch, mtp};
+    }
   }
   // A model's header under a name that holds none (a file under old_support/): not listed.
   if (!hub::model_gguf_name(name) && !hub::mmproj_gguf_name(name) && !hub::dspark_gguf_name(name)) return {};
@@ -338,7 +341,6 @@ std::string drafter_kind(const std::string& path, const hub::Repo& repo) {
   if (lp.ends_with(".gguf")) {
     const GgufClassification cls = classify_gguf(path);
     if (!cls.drafter_kind.empty()) return cls.drafter_kind;
-    if (cls.kind == "gguf" && cls.mtp_layers < 0 && repo.info.gguf_architecture == "dflash") return "dflash2";
     if (cls.kind == "gguf" && cls.mtp_layers > 0) return "mtp";
     return "";
   }
@@ -467,7 +469,8 @@ bool fetch_model(const std::string& model, const std::vector<std::string>& draft
   const bool need_mmproj = want_vision && out->mmproj.empty();
   const bool need_mtp = want_mtp && own_mtp == 0 &&
       std::none_of(out->drafter_sources.begin(), out->drafter_sources.end(), [](const auto& ds) { return ds.kind == "mtp"; });
-  const auto ggufs = need_mmproj || need_mtp ? hub_ggufs(repo) : std::vector<HubGguf>{};
+  const bool need_dspark = want_dspark && !has_dspark;
+  const auto ggufs = need_mmproj || need_mtp || need_dspark ? hub_ggufs(repo) : std::vector<HubGguf>{};
   if (need_mmproj) {
     const std::string own_arch = classify_gguf(out->model).arch;
     const auto* mm = reads_vision(own_arch.empty() ? repo.info.gguf_architecture : own_arch)
@@ -490,22 +493,27 @@ bool fetch_model(const std::string& model, const std::vector<std::string>& draft
     out->drafter_sources.push_back({"mtp", repo.id + "/" + mtp->choice.file.path, mtp->choice.total_size});
     out->notes.push_back("the MTP layer from " + repo.id + "/" + mtp->choice.file.path + " (the model's file has none)");
   }
-  // A DSpark drafter published with the model (unsloth's Inkling-2 GGUFs: dspark-*.gguf) drafts with it by default,
-  // as the repository's MTP file does: the default one of its companion files, where its header says it is one.
-  if (want_dspark && !has_dspark)
-    for (const hub::CompanionFile& c : hub::companion_files(repo)) {
-      if (c.kind != "dspark" || !c.is_default) continue;
+  if (need_dspark) {
+    if (const auto* ds = preferred_companion(ggufs, "dspark")) {
+      const auto& choice = ds->choice;
       std::vector<std::string> paths;
-      if (!hub::fetch(repo, {c.file}, &paths, progress, stop, err)) return false;
-      if (!is_dspark_file(paths[0])) {
-        out->notes.push_back(repo.id + "/" + c.file.path + " is not a DSpark drafter: not drafting with it");
-        break;
+      if (!hub::fetch(repo, choice.parts, &paths, progress, stop, err)) return false;
+      const std::string source = repo.id + "/" + choice.file.path;
+      if (is_dspark_file(paths.front())) {
+        out->drafters.push_back(paths.front());
+        out->drafter_sources.push_back({"dspark", source, choice.total_size});
+        out->notes.push_back("the DSpark drafter from " + source);
+      } else {
+        out->notes.push_back(source + " is not a DSpark drafter: not drafting with it");
       }
-      out->drafters.push_back(paths[0]);
-      out->drafter_sources.push_back({"dspark", repo.id + "/" + c.file.path, bytes_on_disk(paths[0])});
-      out->notes.push_back("the DSpark drafter from " + repo.id + "/" + c.file.path);
-      break;
+    } else {
+      for (const auto& item : ggufs)
+        if (item.cached && hub::dspark_gguf_name(item.choice.file.path) && !item.cls.arch.empty()) {
+          out->notes.push_back(repo.id + "/" + item.choice.file.path + " is not a DSpark drafter: not drafting with it");
+          break;
+        }
     }
+  }
   for (const std::string& k : known_drafters(repo.base_models)) {
     bool given = false;
     for (const std::string& d : drafters) given = given || d.rfind(k, 0) == 0;
