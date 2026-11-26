@@ -17,16 +17,10 @@ import tempfile
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, os.path.join(HERE, "..", "..", "..", "bench", "ab"))
+sys.path.insert(0, os.path.join(HERE, "..", "..", "common"))
 
 import same_runs  # noqa: E402
-
-failures = []
-
-
-def check(ok, what):
-    print(("ok   " if ok else "FAIL ") + what)
-    if not ok:
-        failures.append(what)
+from check import check, finish  # noqa: E402
 
 
 def record(n, three_fields=True, kv="16"):
@@ -86,5 +80,4 @@ for p in shifted["prompts"]:
 code, out = run(shifted, record(2))
 check(code == 1 and "no prompt is in both records" in out, "no shared prompt fails")
 
-print("FAILED: " + "; ".join(failures) if failures else "PASSED")
-sys.exit(1 if failures else 0)
+sys.exit(finish("same_runs_test"))

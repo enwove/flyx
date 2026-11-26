@@ -10,21 +10,13 @@
 #include <string>
 
 #include "core/modelfile/modelfile.h"
+#include "tests/common/check.h"
 #include "tests/core/modelfile/write_flyx.h"
 
 using namespace flyx;
 using namespace flyx::testing;
 
 namespace {
-
-int failures = 0;
-
-void check(bool ok, const std::string& what) {
-  if (!ok) {
-    ++failures;
-    std::printf("FAIL %s\n", what.c_str());
-  }
-}
 
 std::string tensor(const std::string& offset, const std::string& nbytes, const std::string& shape = "[4]") {
   return R"({"arch": "test", "tensors": {"w": {"dtype": "u8", "shape": )" + shape + R"(, "offset": )" + offset +
@@ -49,7 +41,7 @@ int main(int argc, char** argv) {
   auto opens = [&](const std::string& bytes, std::string* err) {
     if (!write_file(path, bytes)) {
       std::printf("cannot write %s\n", path.c_str());
-      return ++failures, false;
+      return ++flyx::test::failures, false;
     }
     ModelFile f;
     return f.open(path, err);
@@ -148,6 +140,5 @@ int main(int argc, char** argv) {
   check(!opens(format(requiring(R"(["lora"])"), 3), &err) && err.find("reads 1 and 2") != std::string::npos,
         "format 3: refused (" + err + ")");
 
-  std::printf(failures ? "%d checks failed\n" : "the .flyx reader: ok\n", failures);
-  return failures ? 1 : 0;
+  return flyx::test::finish("flyx_format_test");
 }

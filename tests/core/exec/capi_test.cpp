@@ -10,15 +10,9 @@
 #include <vector>
 
 #include "flyx/flyx.h"
+#include "tests/common/check.h"
 
 namespace {
-
-int failures = 0;
-
-void check(bool ok, const std::string& what) {
-  std::printf("  %-4s %s\n", ok ? "ok" : "FAIL", what.c_str());
-  if (!ok) ++failures;
-}
 
 // A template of our own: ChatML after a line of plain text, so its prompt differs from the file's template.
 const char* kTemplate =
@@ -114,6 +108,7 @@ void check_handle_lifetime(const char* model, const char* backend) {
 }  // namespace
 
 int main(int argc, char** argv) {
+  flyx::test::print_passes = true;
   if (argc < 3) {
     std::fprintf(stderr, "usage: capi_test TINY.flyx BACKEND\n");
     return 2;
@@ -140,6 +135,5 @@ int main(int argc, char** argv) {
   check(over.tokens > 0 && over.tokens == over.override_ids && over.tokens != own.tokens,
         "chat_template in the load options renders the request (" + std::to_string(over.tokens) +
             " prompt tokens, the override's text " + std::to_string(over.override_ids) + ") " + err);
-  std::printf("capi: %s\n", failures ? "FAILED" : "ok");
-  return failures ? 1 : 0;
+  return flyx::test::finish("capi_test");
 }

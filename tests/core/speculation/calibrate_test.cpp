@@ -8,21 +8,12 @@
 #include <vector>
 
 #include "core/speculation/calibrate.h"
+#include "tests/common/check.h"
 
 using flyx::spec::costs_plausible;
 
-namespace {
-
-int failures = 0;
-
-void check(bool ok, const std::string& what) {
-  std::printf("  %s %s\n", ok ? "ok  " : "FAIL", what.c_str());
-  if (!ok) ++failures;
-}
-
-}  // namespace
-
 int main() {
+  flyx::test::print_passes = true;
   using V = std::vector<double>;
   // Plain decoding first, as the plans have it.
   check(costs_plausible(V{4.35, 13.13, 15.42, 11.77}, V{4.41, 14.50, 17.38, 12.77}, 0), "a quiet machine's costs");
@@ -36,6 +27,5 @@ int main() {
         "the warm-up 3% cheaper after the longer context");
   check(!costs_plausible(V{4.35, 13.13}, V{4.41}, 0) && !costs_plausible(V{4.35}, V{4.41}, 1),
         "costs that do not pair up, or no plain decoding's round among them");
-  std::printf("%s (%d failures)\n", failures ? "FAILED" : "PASSED", failures);
-  return failures ? 1 : 0;
+  return flyx::test::finish("calibrate_test");
 }

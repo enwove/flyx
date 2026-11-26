@@ -14,15 +14,11 @@ import subprocess
 import sys
 import tempfile
 
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", "common"))
+from check import check, finish  # noqa: E402
+
 FLYX, MODEL = sys.argv[1:3]
 OPENER = "<|message_model|><|content_text|>"
-failures = []
-
-
-def check(ok, what, got=None):
-    print(f"  {'ok' if ok else 'FAIL':4s} {what}" + ("" if ok or got is None else f": got {got!r}"))
-    if not ok:
-        failures.append(what)
 
 
 def flyx(*args):
@@ -50,5 +46,4 @@ with tempfile.TemporaryDirectory() as tmp:
     for p in rec["prompts"] if rec else []:
         check(p["ids"] == markers, f"prompt {p['i']}: the reply opens a text section with its control tokens", p["ids"])
 
-print(f"{len(failures)} failed" if failures else "all passed")
-sys.exit(1 if failures else 0)
+sys.exit(finish("bench_prompts_grammar_test"))

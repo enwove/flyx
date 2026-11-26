@@ -12,17 +12,12 @@
 
 #include "nlohmann/json.hpp"
 #include "ops/dtype/ref.h"
+#include "tests/common/check.h"
 
 using namespace flyx;
 using json = nlohmann::json;
 
 namespace {
-
-int failures = 0;
-void check(bool ok, const std::string& what) {
-  std::printf("%s %s\n", ok ? "ok" : "FAIL", what.c_str());
-  failures += !ok;
-}
 
 const std::map<std::string, int> kTypes = {
     {"Q4_0", FLYX_DT_GGML_Q4_0},       {"Q4_1", FLYX_DT_GGML_Q4_1},     {"Q5_0", FLYX_DT_GGML_Q5_0},
@@ -84,9 +79,9 @@ void halves() {
 }  // namespace
 
 int main(int argc, char** argv) {
+  flyx::test::print_passes = true;
   if (argc != 2) return 2;
   blocks(std::string(argv[1]) + "/gguf_quant_cases.json");
   halves();
-  std::printf("%d failures\n", failures);
-  return failures ? 1 : 0;
+  return flyx::test::finish("ggml_test");
 }

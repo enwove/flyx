@@ -10,16 +10,11 @@
 #include <string>
 
 #include "core/plan/budget.h"
+#include "tests/common/check.h"
 
 using namespace flyx;
 
 namespace {
-
-int failures = 0;
-void check(bool ok, const std::string& what) {
-  std::printf("%s %s\n", ok ? "ok" : "FAIL", what.c_str());
-  failures += !ok;
-}
 
 constexpr uint64_t kMiB = 1ull << 20, kGiB = 1ull << 30;
 // 16 GiB, 10 of them weights, 0.5 the workspace; a session 1 GiB plus 64 KiB a token.  g_weights: what the weights
@@ -106,6 +101,7 @@ void check_shortfall_replay(flyx_backend_api api, plan::KvTiers tiers, const pla
 }  // namespace
 
 int main() {
+  flyx::test::print_passes = true;
   const flyx_backend_api api = fake();
   // The budget: 16 GiB less the reserve (16 GiB / 40) = 15.6 GiB; 5.1 GiB after weights and workspace, so a context
   // of up to (5.1 GiB - 1 GiB) / 64 KiB = 65,536 tokens' worth less a little.
@@ -679,6 +675,5 @@ int main() {
               std::to_string(b.layout.copy_host) + ", dev=" + std::to_string(b.layout.device_positions));
   }
 
-  std::printf("%d failures\n", failures);
-  return failures ? 1 : 0;
+  return flyx::test::finish("budget_test");
 }

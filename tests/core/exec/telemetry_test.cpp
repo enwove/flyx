@@ -8,21 +8,9 @@
 
 #include "core/exec/telemetry.h"
 #include "core/os/os.h"
+#include "tests/common/check.h"
 
 using namespace flyx;
-
-namespace {
-
-int failures = 0;
-
-void check(bool ok, const std::string& what) {
-  if (!ok) {
-    ++failures;
-    std::printf("FAIL %s\n", what.c_str());
-  }
-}
-
-}  // namespace
 
 int main() {
   Telemetry t;
@@ -193,6 +181,5 @@ int main() {
             s.totals.requests == 3,
         "unloaded: no sessions, totals kept");
 
-  std::printf("telemetry: %s\n", failures ? "FAILED" : "ok");
-  return failures ? 1 : 0;
+  return flyx::test::finish("telemetry_test");
 }

@@ -21,8 +21,10 @@ import tempfile
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, os.path.join(HERE, "..", "..", "e2e"))
+sys.path.insert(0, os.path.join(HERE, "..", "..", "common"))
 
 import check_dv  # noqa: E402
+from check import check, finish  # noqa: E402
 
 FLYX, ASSETS, TEMPLATE = sys.argv[1:4]
 MODEL = os.path.join(ASSETS, "tiny.flyx")  # MTP drafts and lookup rounds: rounds that accept drafts
@@ -35,13 +37,6 @@ SUFFIX = "\nAnswer in " + BS + "boxed{}."
 # a new tiny model needs another).
 STOP_PROMPT = [438, 358, 741, 368, 506, 355, 204, 327, 349, 135, 299, 603, 211, 307, 94]
 STOP_ANSWER = [319, 319, 106, 106, 106, 106, 106] + [407] * 8 + [0]
-failures = []
-
-
-def check(ok, what, got=None):
-    print(f"  {'ok' if ok else 'FAIL':4s} {what}" + ("" if ok or got is None else f": got {got!r}"))
-    if not ok:
-        failures.append(what)
 
 
 def flyx(*args):
@@ -163,5 +158,4 @@ with tempfile.TemporaryDirectory() as tmp:
     check(r.returncode == 0 and os.path.exists(out) and "decode:" in r.stdout,
           "the built-in prompts: --json FILE, the summary on stdout", r.stdout)
 
-print(f"{len(failures)} failed" if failures else "all passed")
-sys.exit(1 if failures else 0)
+sys.exit(finish("bench_prompts_test"))

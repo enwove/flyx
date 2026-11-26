@@ -22,7 +22,9 @@ import numpy as np
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, os.path.join(HERE, "..", "..", "..", "python", "convert"))
+sys.path.insert(0, os.path.join(HERE, "..", "..", "common"))
 
+from check import check, finish  # noqa: E402
 import export_dv  # noqa: E402
 from flyx_convert.convert import (canonical_dense_config, canonical_draft_config,  # noqa: E402
                                   canonical_target_config, convert)
@@ -30,14 +32,6 @@ from flyx_convert.dv import add_dv, parse_tree, pool_size  # noqa: E402
 from flyx_convert.fileformat import MAGIC, Reader, Writer  # noqa: E402
 from flyx_convert.lora import add_lora  # noqa: E402
 from flyx_convert.tokenizer_export import MINICPM5_NUMBERS, MINICPM5_SPLIT, export  # noqa: E402
-
-failures = []
-
-
-def check(ok: bool, what: str):
-    print(f"  {'ok' if ok else 'FAIL':4s} {what}")
-    if not ok:
-        failures.append(what)
 
 
 def refused(f, arg, because: str) -> bool:
@@ -561,8 +555,7 @@ def main():
     dv_checkpoints()
     vlora_checkpoints()
     dv_settings()
-    print(f"convert: {len(failures)} failures")
-    sys.exit(1 if failures else 0)
+    sys.exit(finish("convert_test"))
 
 
 if __name__ == "__main__":

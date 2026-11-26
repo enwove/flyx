@@ -22,19 +22,11 @@
 #include "core/render/chat.h"
 #include "core/render/chat_json.h"
 #include "core/tokenizer/tokenizer.h"
+#include "tests/common/check.h"
 
 using namespace flyx;
 
 namespace {
-
-int failures = 0;
-
-void check(bool ok, const std::string& what) {
-  if (!ok) {
-    ++failures;
-    std::printf("FAIL %s\n", what.c_str());
-  }
-}
 
 std::string read_file(const std::string& path) {
   std::ifstream f(path, std::ios::binary);
@@ -496,6 +488,6 @@ int main(int argc, char** argv) {
           "Anthropic user message with single empty text block is preserved");
   }
 
-  std::printf("chat: %d renders, %s\n", n, failures ? "FAILED" : "all match transformers");
-  return failures ? 1 : 0;
+  std::printf("chat: %d renders compared with transformers\n", n);
+  return flyx::test::finish("chat_test");
 }
