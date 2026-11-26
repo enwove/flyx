@@ -5,6 +5,7 @@
 #include "backends/cuda/regions/layers.h"
 
 #include <algorithm>
+#include <cstdlib>
 
 namespace flyx::cuda {
 
@@ -275,16 +276,43 @@ void forward_nodes(const Pass& ps, size_t begin, size_t end, int copy_prefix) {
   res_state.x_cur = ps.v.b.x;
   Pass cur = ps;
   cur.res = &res_state;
+  // A round's experts read ahead (moe_prefetch): before an attention whose next node is a MoE, the expert stream
+  // guesses that MoE's experts and asks L2 for them while the attention runs; the round's stream joins it once, at
+  // the round's end (a join after each MoE made one-row rounds wait on it).  FLYX_EXPERT_PREFETCH: 0 off, 1 every
+  // round, 2 (default) rounds of two rows or more: on an RTX 5090 (Inkling-2-Mini UD-IQ4_XS) one-row rounds ran 2.5%
+  // slower with it (their attention too short to hide the reads), DSpark 3.4% faster.  No result depends on it.
+  static const int prefetch_env = [] {
+    const char* e = std::getenv("FLYX_EXPERT_PREFETCH");
+    return e ? std::atoi(e) : 2;
+  }();
+  const bool prefetch = prefetch_env != 0 && (prefetch_env != 2 || ps.rows > 1) && ps.round &&
+                        ps.rows <= FLYX_MAX_ROWS && s->expert_side.st && ps.v.L.st == s->st && ps.v.b.moe_guess;
+  bool prefetch_out = false;
   for (size_t i = begin; i < end; ++i) {
     const flyx_node& nd = ps.p->nodes[i];
     const Block* blk = ps.p->block[i];
     const bool takes_pending =
         nd.kind == FLYX_NODE_RUN && blk &&
         (std::holds_alternative<RelAttnBlock>(*blk) || std::holds_alternative<MoeBlock>(*blk));
+    if (prefetch && nd.kind == FLYX_NODE_RUN && blk && std::holds_alternative<RelAttnBlock>(*blk) &&
+        i + 1 < end && ps.p->nodes[i + 1].kind == FLYX_NODE_RUN && ps.p->block[i + 1] &&
+        std::holds_alternative<MoeBlock>(*ps.p->block[i + 1])) {
+      const MoeBlock& f = std::get<MoeBlock>(*ps.p->block[i + 1]);
+      const SideStream& es = s->expert_side;
+      CK(cudaEventRecord(es.fork, ps.v.L.st));
+      CK(cudaStreamWaitEvent(es.st, es.fork, 0));
+      const bf16* rb = f.router.round.b16 ? f.router.round.b16 : (f.router.round.f32 ? nullptr : f.router.w);
+      moe_prefetch(res_state.x_cur ? res_state.x_cur : ps.v.b.x, f.norm.w, f.norm.offset, rb,
+                   rb ? nullptr : f.router.round.f32, f.router_bias, f.gating_sigmoid, f.n_experts, f.top_k,
+                   f.hidden, f.inter, f.gate_up, f.down, ps.v.b.moe_guess, es.st);
+      CK(cudaEventRecord(es.join, es.st));
+      prefetch_out = true;
+    }
     if (!takes_pending) flush_pending_post_conv(cur, true);
     ps.p->impl[i]->fn(cur, nd, blk);
     if (prof) CK(cudaEventRecord(s->prof_ev[i - begin + 1], s->st));
   }
+  if (prefetch_out) CK(cudaStreamWaitEvent(ps.v.L.st, s->expert_side.join, 0));
   flush_pending_post_conv(cur, true);
   s->stage_end(ps.v.L.st);
   if (!prof) return;

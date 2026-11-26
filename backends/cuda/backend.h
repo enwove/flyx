@@ -217,6 +217,7 @@ struct RowBufs {
   float *rel_q = nullptr, *rel_btab = nullptr, *sink = nullptr, *kv_conv = nullptr, *kv_dyn = nullptr;
   float *post_raw = nullptr, *post_out = nullptr;
   int* moe_idx = nullptr;
+  float* moe_guess = nullptr;  // rounds: the experts' scores moe_prefetch guesses from (n_experts floats)
   // moe_act: the activations in float32, or in bf16 where a fused round's gate|up GEMM writes the down GEMM's input
   float *moe_w = nullptr, *moe_gu = nullptr, *moe_act = nullptr;
   MoeScratch moe_sc{};  // the expert GEMMs' staged inputs, their grouping and the down projection's slots
@@ -578,6 +579,8 @@ struct flyx_seq {
   int max_ctx = 0, cap = 0, rows_cap = 0;
   cudaStream_t st = nullptr;
   flyx::cuda::SideStream side{};  // a round's narrow GEMMs of a stack beside its wide ones (Launch::side)
+  // A round's expert reads ahead (moe_prefetch): a stream of its own, so they never queue before Launch::side's GEMMs.
+  flyx::cuda::SideStream expert_side{};
   std::vector<void*> allocs;
 
   flyx::cuda::DevParams* P = nullptr;
@@ -753,6 +756,7 @@ struct flyx_seq {
     if (st) cudaStreamSynchronize(st);
     if (stage_side.st) cudaStreamSynchronize(stage_side.st);
     if (side.st) cudaStreamSynchronize(side.st);
+    if (expert_side.st) cudaStreamSynchronize(expert_side.st);
     release_prefill_pool();
     if (profile) print_profile();
     for (auto e : prof_ev) cudaEventDestroy(e);
@@ -770,6 +774,7 @@ struct flyx_seq {
     flyx::cuda::destroy_side(stage_side);
     if (dv.body) cudaStreamDestroy(dv.body);
     flyx::cuda::destroy_side(side);
+    flyx::cuda::destroy_side(expert_side);
     if (st) cudaStreamDestroy(st);
   }
   // dry: count the bytes the allocations would take, allocate nothing (seq_bytes).

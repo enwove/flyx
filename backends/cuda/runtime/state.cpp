@@ -149,6 +149,7 @@ void alloc_rows(const flyx_bmodel* m, int R, bool prefill, RowBufs* b, Alloc&& a
   if (n.moe_experts > 0) {
     b->moe_idx = static_cast<int*>(alloc(size_t(R) * n.moe_topk * sizeof(int)));
     b->moe_w = f(size_t(R) * n.moe_topk);
+    if (!prefill) b->moe_guess = f(size_t(n.moe_experts));
     // moe_gu is dead during moe_down (and unused when fused), so down_buf safely aliases it.
     const size_t gu_or_down = std::max(size_t(2) * size_t(n.moe_inter), size_t(H));
     b->moe_gu = f(size_t(R) * size_t(n.moe_topk) * gu_or_down);
@@ -1205,6 +1206,7 @@ void build_seq(flyx_bmodel* m, int32_t max_ctx, flyx_seq* s) {
   if (!s->dry) {
     CK(cudaStreamCreateWithFlags(&s->st, cudaStreamNonBlocking));
     create_side(&s->side);
+    create_side(&s->expert_side);
     if (dv) CK(cudaStreamCreateWithFlags(&s->dv.body, cudaStreamNonBlocking));
     s->dv.skip_noop = m->opt.dv_conditional;
     for (auto& e : s->ev) CK(cudaEventCreateWithFlags(&e, cudaEventDisableTiming));

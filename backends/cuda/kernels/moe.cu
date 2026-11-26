@@ -848,6 +848,90 @@ int moe_dp4a_cfg(const KernelOptions& o, int dtype, int rows, bool fused_gate_up
   return fused_gate_up ? moe_gate_up_dp4a(o.tuning, dtype, rows) : tables::kMoeDp4aOriginal;
 }
 
+// ---- expert reads ahead (moe_prefetch) ------------------------------------------------------
+// While a round's attention runs, a stream of its own guesses the experts the MoE after it will take (its router on
+// the current residual row, normed by the MoE norm's gain only, in place of the mix the MoE will see) and asks L2 for
+// their NVFP4 weights.  Only L2 is touched: the MoE's own loads and sums are unchanged, so a wrong guess costs
+// bandwidth, never bits.
+constexpr int kGuessWarps = 8;
+
+template <class W>
+__global__ void __launch_bounds__(32 * kGuessWarps)
+    k_moe_guess(const float* x, const float* __restrict__ norm_w, float norm_offset, const W* __restrict__ router,
+                const float* __restrict__ bias, int sigmoid, int E, int H, float* scores) {
+  const int lane = threadIdx.x & 31, e = blockIdx.x * kGuessWarps + (threadIdx.x >> 5);
+  if (e >= E) return;
+  const W* w = router + size_t(e) * H;
+  float acc = 0.f;
+  for (int k = lane; k < H; k += 32) {
+    const float g = norm_w ? (norm_offset + __ldg(norm_w + k)) : 1.f;
+    acc = __fmaf_rn(float(w[k]), x[k] * g, acc);
+  }
+  acc = warp_tree_sum(acc);
+  if (lane == 0) scores[e] = (sigmoid ? sigm(acc) : acc) + (bias ? bias[e] : 0.f);
+}
+
+__device__ __forceinline__ void l2_prefetch_bulk(const void* p, uint32_t bytes) {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900
+  asm volatile("cp.async.bulk.prefetch.L2.global [%0], %1;" ::"l"(p), "r"(bytes) : "memory");
+#endif
+}
+
+// An expert-major plane: one expert's bytes contiguous, per_expert of them.
+struct PrefetchPlane {
+  const uint8_t* base;
+  size_t per_expert;
+};
+
+// One block of 256 threads (E <= 256): the top_k scores (a block argmax top_k times, lower index on ties), then
+// those experts' four planes asked of L2 in 32 KB pieces over the block.
+__global__ void __launch_bounds__(256) k_moe_prefetch(const float* scores, int E, int top_k, PrefetchPlane p0,
+                                                      PrefetchPlane p1, PrefetchPlane p2, PrefetchPlane p3) {
+  __shared__ float s_v[8];
+  __shared__ int s_i[8], s_pick[kRouteTop];
+  const int tid = threadIdx.x, lane = tid & 31, warp = tid >> 5;
+  float v = tid < E ? scores[tid] : -INFINITY;
+  for (int j = 0; j < top_k; ++j) {
+    float bv = v;
+    int bi = tid;
+#pragma unroll
+    for (int o = 16; o; o >>= 1) {
+      const float ov = __shfl_xor_sync(0xffffffffu, bv, o);
+      const int oi = __shfl_xor_sync(0xffffffffu, bi, o);
+      if (ov > bv || (ov == bv && oi < bi)) bv = ov, bi = oi;
+    }
+    if (lane == 0) s_v[warp] = bv, s_i[warp] = bi;
+    __syncthreads();
+    if (tid == 0) {
+      float b = s_v[0];
+      int i = s_i[0];
+      for (int w = 1; w < 8; ++w)
+        if (s_v[w] > b || (s_v[w] == b && s_i[w] < i)) b = s_v[w], i = s_i[w];
+      s_pick[j] = i;
+    }
+    __syncthreads();
+    if (tid == s_pick[j]) v = -INFINITY;
+  }
+  constexpr size_t kPiece = 32768;
+  const PrefetchPlane planes[4] = {p0, p1, p2, p3};
+  for (int j = 0; j < top_k; ++j) {
+    const int e = s_pick[j];
+    if (e < 0 || e >= E) continue;
+#pragma unroll
+    for (int q = 0; q < 4; ++q) {
+      const PrefetchPlane& pl = planes[q];
+      if (!pl.base) continue;
+      const uint8_t* a = pl.base + size_t(e) * pl.per_expert;
+      const size_t pieces = (pl.per_expert + kPiece - 1) / kPiece;
+      for (size_t c = tid; c < pieces; c += blockDim.x) {
+        const size_t off = c * kPiece;
+        const uint32_t n = uint32_t(min(kPiece, pl.per_expert - off)) & ~15u;
+        if (n && ((reinterpret_cast<uintptr_t>(a + off) & 15u) == 0)) l2_prefetch_bulk(a + off, n);
+      }
+    }
+  }
+}
+
 }  // namespace
 
 const MoeDp4aConfig kMoeDp4aConfigs[] = {
@@ -887,6 +971,26 @@ int moe_gate_up_dp4a(int tuning, int dtype, int rows) {
 void moe_stage_q8(const float* x, int ldx, int K, int rows, const MoeScratch& sc, bool mins, cudaStream_t st) {
   if (mins) k_moe_stage_q8<true><<<rows, 256, 0, st>>>(x, ldx, K, sc.q8_a, sc.q8_d, sc.q8_s);
   else k_moe_stage_q8<false><<<rows, 256, 0, st>>>(x, ldx, K, sc.q8_a, sc.q8_d, sc.q8_s);
+}
+
+void moe_prefetch(const float* x, const float* norm_w, float norm_offset, const bf16* router_b16,
+                  const float* router_f32, const float* bias, bool gating_sigmoid, int E, int top_k, int H, int I,
+                  const ExpertMat& gate_up, const ExpertMat& down, float* scores, cudaStream_t st) {
+  if (!x || !scores || E <= 0 || E > 256 || top_k <= 0 || top_k > std::min(E, kRouteTop)) return;
+  if (!router_b16 && !router_f32) return;
+  if (!gate_up.q || !gate_up.s || !down.q || !down.s || gate_up.packed() || down.packed()) return;  // NVFP4 planes
+  const int grid = (E + kGuessWarps - 1) / kGuessWarps;
+  if (router_b16)
+    k_moe_guess<bf16><<<grid, 32 * kGuessWarps, 0, st>>>(x, norm_w, norm_offset, router_b16, bias, int(gating_sigmoid),
+                                                          E, H, scores);
+  else
+    k_moe_guess<float><<<grid, 32 * kGuessWarps, 0, st>>>(x, norm_w, norm_offset, router_f32, bias,
+                                                           int(gating_sigmoid), E, H, scores);
+  const size_t gu_n = size_t(gate_up.N), dn_n = size_t(down.N);
+  k_moe_prefetch<<<1, 256, 0, st>>>(scores, E, top_k, PrefetchPlane{gate_up.q, gu_n * size_t(H) / 2},
+                                    PrefetchPlane{gate_up.s, gu_n * size_t(H) / 16},
+                                    PrefetchPlane{down.q, dn_n * size_t(I) / 2},
+                                    PrefetchPlane{down.s, dn_n * size_t(I) / 16});
 }
 
 void moe_route(const float* logits, const float* bias, int rows, int n_experts, int top_k, bool gating_sigmoid,
