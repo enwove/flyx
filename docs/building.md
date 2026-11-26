@@ -8,8 +8,8 @@ Build prerequisites, CMake presets, CMake options, and release packaging for Lin
 
 | Target | Required Tools |
 |---|---|
-| **Linux / WSL2 (CUDA)** | CUDA 13 (`nvcc` on `PATH`), CMake ≥ 3.24, Ninja, `g++` ≥ 11, Python 3.11+ (tuning table codegen & tests), `libcurl` (not linked: loaded at run time for HF Hub fetch, which the hub tests exercise) |
-| **Windows (native MSVC + CUDA)** | Visual Studio 2022 C++ Build Tools, CMake ≥ 3.24, Ninja, Python 3.11+, CUDA 13 (`nvcc`, or auto-installed from PyPI wheels by `packaging\package_windows.ps1`) |
+| **Linux / WSL2 (CUDA)** | CUDA 13 (`nvcc` on `PATH`), CMake ≥ 3.24, Ninja, `g++` ≥ 11, Python 3.11+ for table generation, Python 3.12+ for the pinned test requirements, `libcurl` (not linked: loaded at run time for HF Hub fetch, which the hub tests exercise) |
+| **Windows (native MSVC + CUDA)** | Visual Studio 2022 C++ Build Tools, CMake ≥ 3.24, Ninja, Python 3.11+ (Python 3.12+ for tests), CUDA 13 (`nvcc`, or auto-installed from PyPI wheels by `packaging\package_windows.ps1`) |
 | **CPU-only CLI (`-DFLYX_CUDA=OFF -DFLYX_TESTS=OFF`)** | CMake ≥ 3.24, Ninja, C++20 compiler (no Python required) |
 | **Runtime (release packages)** | Linux: `libc` + NVIDIA driver ≥ 580, and the system's `libcurl` to fetch models by name; Windows: NVIDIA driver ≥ 580 (CUDA and C++ runtimes linked statically). Python wheel: Python ≥ 3.9, no PyTorch required. |
 
@@ -27,7 +27,7 @@ Defined in [CMakePresets.json](../CMakePresets.json).
 | `dev-windows` | Windows (MSVC) | `%USERPROFILE%\flyx-build` | Release + tests, local GPU arch |
 | `cpu-windows` | Windows (MSVC) | `%USERPROFILE%\flyx-build-cpu` | CPU-only + tests |
 | `release-linux` | Linux / WSL2 | `~/flyx-build-release` | Static runtime, multi-arch (`sm_80,89,90,100,120` + `compute_120` PTX), compressed fatbins, pruned candidates |
-| `release-windows` | Windows (MSVC) | `%USERPROFILE%\flyx-build-release` | Windows desktop/workstation multi-arch (`sm_80,89,120` machine code only, no PTX, to keep the single `.exe` near 50 MB; omits datacenter-only `sm_90,100`), `FLYX_TESTS=OFF` |
+| `release-windows` | Windows (MSVC) | `%USERPROFILE%\flyx-build-release` | Windows desktop/workstation multi-arch (`sm_80,89,120` plus the specialized `120a-real` W4A4 target, zero PTX; omits datacenter-only `sm_90,100`), `FLYX_TESTS=OFF` |
 
 ```sh
 # Linux / WSL2 development build + tests
@@ -44,7 +44,7 @@ Build outputs in `<build-dir>/bin`: `flyx` (CLI + `flyx serve`; `flyx-server` sy
 | Option | Default (`dev` / `release`) | Effect |
 |---|---|---|
 | `FLYX_CUDA` | `ON` | Build CUDA backend (`OFF` for CPU-only). |
-| `FLYX_CUDA_ARCHS` | local GPU / Linux: `80;89;90;100;120;120-virtual`, Win: `80;89;120` (no PTX: a GPU of a later architecture than sm_120 needs the Linux package or a build of its own) | Semicolon-separated SM architectures (≥ 8.0). |
+| `FLYX_CUDA_ARCHS` | local GPU / Linux: `80-real;89-real;90-real;100-real;120-real;120-virtual`, Win: `80-real;89-real;120-real` (no PTX: a GPU of a later architecture than sm_120 needs the Linux package or a build of its own) | Semicolon-separated SM architectures (≥ 8.0). |
 | `FLYX_TESTS` | `ON` (`dev`) / `OFF` (`release-windows`) | Build unit, op, golden, and server tests (plus `flyx-trace` when CUPTI is present). |
 | `FLYX_STATIC_RUNTIME` | `OFF` / `ON` | Statically link C++/CUDA runtimes for portable release binaries. |
 | `FLYX_STANDALONE_EXE` | `OFF` | Also build a single-file `flyx-standalone` executable with `cuda` and `cpu_ref` backends linked in. |

@@ -11,6 +11,8 @@ Reference for supported model architectures (Qwen3.5 / Qwen3.8, Qwen3, Inkling-2
 | **GGUF** (native, zero conversion) | `qwen35` (Qwen3.5 / Qwen3.8 hybrid GDN + gated attention, plus multimodal vision via `--mmproj` `qwen3vl_merger` `mmproj-*.gguf`), `qwen3` (dense), `inkling2_loop` (Inkling-2 looped ShortConv + RelAttn + sparse MoE) | `F32`, `F16`, `BF16`, `Q2_0`, `Q4_0`, `Q4_1`, `Q5_0`, `Q5_1`, `Q8_0`, `Q2_K`–`Q6_K`, `IQ1_S`, `IQ1_M`, `IQ2_XXS`, `IQ2_XS`, `IQ2_S`, `IQ3_XXS`, `IQ3_S`, `IQ4_NL`, `IQ4_XS`, mixed quants, `MXFP4`, GGML `NVFP4`; a split file (`-00001-of-0000N.gguf`) with all its parts in one folder | Inkling-2 vision towers (`mmproj`), scaled RoPE, Llama GGUFs |
 | **`.flyx`** (via `python/convert`) | Qwen3.5 / Qwen3.8, Qwen3, Llama (e.g. MiniCPM5-1B) | `BF16`, NVIDIA ModelOpt `NVFP4` | Vision / MoE; a Llama GGUF |
 
+Inkling-2-Mini stores 24 layers. Running its 12-layer core three times gives 48 effective layer applications. It combines sliding-window and global relative attention, ShortConv and AttnRes with 128 experts, routing each token to eight. Its trained window is 1,048,576 tokens. The usable window depends on available VRAM and host RAM.
+
 Key execution properties:
 - **Packed GGUF blocks:** GGML block weights remain packed on GPU, decoded in registers, and multiplied by 8-bit quantized activations (matching `llama.cpp` precision; `--activations exact` forces exact activations).
 - **Host-resident untied embeddings:** When output head and token embedding are untied (e.g., Qwen3.8-27B's 0.42 GB embedding), the embedding stays in host RAM where under 32 GB of GPU memory are left after the weights, its rows fetched over PCIe at negligible cost; above that it goes to the GPU (`--backend-opt embed=host` or `embed=gpu` chooses).
@@ -23,9 +25,10 @@ Key execution properties:
 
 ## 2. Hugging Face Hub Resolution
 
-Any CLI or API `MODEL` or `--drafter-file` argument accepts a local path or a Hugging Face Hub specifier:
+The CLI and server model loader accept a local path or a Hugging Face Hub specifier for targets and companion files. Sidecar discovery happens in the app loader. When opening files directly through the C or Python API, pass the companion paths explicitly.
 
 ```sh
+flyx serve unsloth/Inkling-2-Mini-GGUF:UD-IQ3_XXS
 flyx run unsloth/Qwen3.8-27B-GGUF:UD-IQ3_XXS --chat -p "Hello"
 flyx serve unsloth/Qwen3.8-27B-GGUF:UD-IQ2_S --drafter-file z-lab/Qwen3.8-27B-DFlash2
 ```
@@ -35,7 +38,7 @@ flyx serve unsloth/Qwen3.8-27B-GGUF:UD-IQ2_S --drafter-file z-lab/Qwen3.8-27B-DF
 | `org/repo:QUANT` | Selects the GGUF carrying `QUANT` (falls back to `UD-<QUANT>` when unique). Passing `org/repo` without `:QUANT` lists available GGUFs and sizes. |
 | `org/repo:QUANT@REV` | Pins a branch or commit hash (also used to address older cached snapshots). |
 | Auto MTP sidecar | If a GGUF lacks an embedded MTP layer and the repo contains `MTP/*.gguf` (e.g., `unsloth/Qwen3.8-27B-GGUF`), `flyx` fetches and attaches it automatically. |
-| Auto DSpark sidecar | With no drafter file named (or `--drafter dspark`/`all`), `flyx` fetches and attaches the repo's first `dspark-*.gguf` (e.g., `unsloth/Inkling-2-Mini-GGUF`), or, for a model GGUF on disk, a `dspark-<model name>*.gguf` beside it (`Inkling-2-Mini-UD-IQ3_XXS.gguf` pairs with `dspark-Inkling-2-Mini-Q8_0.gguf`); either only when its header says it is a DSpark drafter (`arch=dflash`, `has_markov_context=true`). `--drafter mtp`/`dflash2`/`none`, `--no-spec` or a `--drafter-file` leaves it out. |
+| Auto DSpark sidecar | With no drafter file named (or `--drafter dspark`/`all`), `flyx` fetches and attaches the repo's first `dspark-*.gguf` (e.g., `unsloth/Inkling-2-Mini-GGUF`), or, for a model GGUF on disk, a `dspark-<model name>*.gguf` beside it (`Inkling-2-Mini-UD-IQ3_XXS.gguf` pairs with `dspark-Inkling-2-Mini-Q8_0.gguf`); either only when its header says it is a DSpark drafter (`arch=dflash`, `has_markov_context=true`). Use `--drafter none` for no neural drafter. The modes `mtp` and `dflash2` also suppress DSpark, as does `--no-spec`. In auto mode, naming a drafter suppresses implicit DSpark. With `dspark` or `all`, a named drafter of another kind still allows discovery. The first sorted adjacent basename match with a valid Markov header is used. |
 | Auto `mmproj` vision projector | If a Hub GGUF repo contains a vision projector (`mmproj-BF16.gguf` preferred over F16/F32), `flyx` fetches and attaches it automatically unless `--no-vision` or an explicit `--mmproj` path is given, or the model's architecture is one this build reads no vision for (anything but `qwen35`: a projector published beside such a model is left alone, and `--mmproj` with one is refused). |
 | Direct DFlash2 loading | `z-lab/*-DFlash2`, `vllm-project/*-DFlash2`, and `incoai/*-DFlash2` safetensors repos as well as llama.cpp `general.architecture=dflash` GGUF drafters (e.g. `z-lab/Qwen3.8-27B-DFlash2-GGUF`, `ufrik/Inkling-2-Mini-Dflash2-GGUF`) load directly with no conversion step across supported target architectures (`qwen35`, `qwen3`, `llama`, `inkling2_loop`). |
 | Downloader & cache | 16 parallel range connections, SHA-256 verified against Hub metadata, resumable across restarts, multi-process coordinated via `.flyx-lock` files in standard HF cache (`HF_HOME`, `HF_HUB_CACHE`, `HF_TOKEN`, `HF_ENDPOINT`, `HF_HUB_OFFLINE=1`). Requires `libcurl` on Linux; native WinHTTP on Windows. |
@@ -61,9 +64,11 @@ Control flags:
 - `--draft-trees` (opt-in DFlash2 dynamic trees; off by default; an `inkling2_loop` target verifies chains only: its relative-position attention and ShortConvs read a round's rows in order, so the CUDA backend refuses tree rounds there)
 - `--no-spec` (plain decoding, disables all drafters and lookup)
 - `--cycle I,J,...` (testing: a fixed cycle of round indices instead of the controller's choice; `-v` lists the rounds)
-- **Elastic VRAM loading (`serve`, `run`, `chat`):** Before uploading weights and on VRAM exhaustion, `flyx` preserves identical target output tokens while stepping down optional VRAM consumers in order: (1) moving GPU-resident vision weights to `disk` (0 VRAM, multimodal preserved), (2) compacting drafter weights to `nvfp4`, (3) skipping heavy DFlash2 while keeping DSpark beside it (`--drafter all`) or keeping or falling back to MTP, and (4) skipping remaining neural drafters (MTP, DSpark, DV) while keeping zero-VRAM Prompt Lookup. Steps 3 and 4 apply only to drafters the load chose (`--drafter auto` or `all`): a drafter named with `--drafter mtp\|dflash2\|dspark\|dv` is never skipped, and a load that cannot keep it fails with the reason. Every adjustment and the active configuration are logged clearly to stderr and reported in `/v1/load`, `/v1/telemetry`, and the dashboard without overwriting saved settings in `serve.json`. `flyx bench` keeps loading strict so benchmark runs never change configuration silently.
+- **Elastic VRAM loading (`serve`, `run`, `chat`):** Before uploading weights and on VRAM exhaustion, `flyx` preserves identical target output tokens while stepping down optional VRAM consumers in order: (1) moving GPU-resident vision weights to `disk` (no resident projector weights, multimodal preserved), (2) compacting drafter weights to `nvfp4`, (3) skipping heavy DFlash2 while keeping DSpark beside it (`--drafter all`) or keeping or falling back to MTP, and (4) skipping remaining neural drafters (MTP, DSpark, DV) while keeping zero-VRAM Prompt Lookup. Steps 3 and 4 apply only to drafters the load chose (`--drafter auto` or `all`): a drafter named with `--drafter mtp\|dflash2\|dspark\|dv` is never skipped, and a load that cannot keep it fails with the reason. Every adjustment and the active configuration are logged clearly to stderr and reported in `/v1/load`, `/v1/telemetry`, and the dashboard without overwriting saved settings in `serve.json`. `flyx bench` keeps loading strict so benchmark runs never change configuration silently.
 
 ---
+
+Windowed DFlash2 layers keep FP16 context keys and values in a ring even beside an FP8 target. Use `--backend-opt dflash_ring=0` for the flat control. DSpark has independent per-layer rings. CUDA's `held_precision()` classifies the bound drafter linears by their actual storage. The dashboard and telemetry report the resulting precision even when packed companion weights already came from disk in Q8_0.
 
 ## 4. Converting Hugging Face Checkpoints to `.flyx`
 
@@ -139,9 +144,9 @@ A target's own adapters (a **V-LoRA**: LoRA beside the target's linears, e.g. bi
 
 | GPU VRAM | Host RAM | Recommended Quantization & Flags | Typical Capability |
 |---|---|---|---|
-| **16 GB** (RTX 5070 Ti / 5080 / 4080S) | 32 GB | `unsloth/Qwen3.8-27B-GGUF:UD-IQ3_XXS` (10.9 GB) or `UD-IQ2_S` (8.4 GB); `--ctx max --sessions 1 --kv-disk ./flyx-cache:40` | Up to ~200K–311K context with 2-bit StrataFlux + MTP (~89 tok/s at 200K on RTX 5070 Ti); fits 27B comfortably with disk-backed session swaps |
+| **16 GB** (RTX 5070 Ti / 5080 / 4080S) | 32 GB | `unsloth/Qwen3.8-27B-GGUF:UD-IQ3_XXS` (10.9 GB) or `UD-IQ2_S` (8.4 GB); `--ctx max --sessions 1 --kv-disk ./flyx-cache:40` | The planner places excess KV in host RAM. Disk-backed snapshots allow inactive sessions to be swapped out |
 | **24 GB** (RTX 3090 / 4090) | 32–64 GB | `unsloth/Qwen3.8-27B-GGUF:UD-Q4_K_XL` (17.7 GB) or `UD-IQ3_XXS`; `--ctx max` | Fast GPU-resident context + high-speed 2-bit StrataFlux overflow to host RAM |
-| **32 GB** (RTX 5090) | 64+ GB | `unsloth/Qwen3.8-27B-GGUF:UD-Q4_K_XL` + `--drafter-file z-lab/Qwen3.8-27B-DFlash2 --ctx max` | 256.8 tok/s short-context (both drafters); exact FP8 KV past 256K; 500K+ context with StrataFlux |
+| **32 GB** (RTX 5090) | 64+ GB | `unsloth/Qwen3.8-27B-GGUF:UD-Q4_K_XL` + `--drafter-file z-lab/Qwen3.8-27B-DFlash2 --ctx max` | The planner caps the request at the trained 262,144 tokens and the available memory budget |
 
 > **8–10 GB GPUs (e.g., RTX 3080 10 GB, RTX 4060 / 5060 8 GB):** Cannot fit 27B weights alongside session recurrent state; use smaller models such as `Qwen/Qwen3.5-4B` (BF16/NVFP4/GGUF). On tight 8 GB desktop GPUs (where Windows WDDM reserves VRAM for desktop composition), `flyx` queries NVML free memory and automatically trims speed-only auxiliary copies (e.g., duplicate W12/FP8 head copies) when needed to fit prefill workspace and sessions.
 >

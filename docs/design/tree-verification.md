@@ -14,6 +14,8 @@ A tree round provides `token[i]` and `parent[i]` (`parent[0] = -1` for the ancho
 
 ---
 
+CUDA refuses given-tree and DFlash2 tree plans for a program containing relative attention or ShortConv. Inkling-2 uses chain verification because branching would require per-ancestor relative-attention and convolution state. Ring-backed state has a rewind floor: once a write overwrites a required position, the session must recompute from still-valid history.
+
 ## 2. Bitwise-Exact Tree Design (Phase 1, ≤ 16 Rows)
 
 1. **Tree payload (ABI 23, `FLYX_GIVEN_TREE`):** `flyx_gen_params` carries `drafts`, `n_drafts`, and `parents`. Host launch computes `TreeRows` (per-row `depth` and `path` ancestor table) and streams it via a pinned ring buffer so a single captured CUDA graph handles any tree topology of width `3`, `7`, or `15` (`Engine::tree_widths()`, `tree_plan()`). Chain rounds stay unchanged.

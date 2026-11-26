@@ -1,6 +1,6 @@
 # Copyright 2026 The flyx Authors. SPDX-License-Identifier: Apache-2.0
 cmake_minimum_required(VERSION 3.24)
-project(flyx VERSION 0.2.0 LANGUAGES C CXX)
+project(flyx VERSION 0.2.1 LANGUAGES C CXX)
 
 option(FLYX_CUDA "Build the CUDA backend (needs CUDA 13)" ON)
 option(FLYX_TESTS "Build tests" ON)

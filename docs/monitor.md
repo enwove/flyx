@@ -14,7 +14,7 @@ Read-only JSON snapshot (`Cache-Control: no-store`). Query parameter: `?recent=N
   "sampled_at": 1763500000.12,
   "server": {
     "name": "flyx-server",
-    "version": "0.2.0",
+    "version": "0.2.1",
     "pid": 12345,
     "started_at": 1763499900.0,
     "uptime_s": 100.12,
@@ -115,6 +115,12 @@ Field semantics (defined in `apps/flyx-server/telemetry.cpp`):
 - `recent[].cancel_reason`: Present (`"superseded"`) when replaced by a newer request for the same conversation.
 
 ---
+
+On the native Windows 5070 Ti capture, a 4,096-token Inkling session reported `drafter: "dspark"`, `draft_weights: "q8"`, `max_width: 7` and an empty `degraded` array. The saved load request can still say `auto`. **Restore full settings** retries the requested configuration. Check telemetry again to see what fit.
+
+In the constrained `elastic_load` fixture, prefill allocation failed on the first attempt. The retry compacted DFlash2 weights and logged `active config: drafter=mtp+dflash2 (nvfp4), vision=off, context=1024`. This is an injected allocation failure with a tiny model.
+
+The planner reports a byte shortfall only if increasing the indicated budget alone can reach `wanted`. If both budgets would need to change, or replaying its host/exact placement cannot reach that window, `need_more` is null. The driver's process memory counter and the planner's session budget measure different allocations.
 
 ## 2. Terminal Monitor (`flyx monitor`)
 
