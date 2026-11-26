@@ -903,6 +903,36 @@ void rel_attn_layer(const Pass& ps, const RelAttnBlock& a, bool fused) {
     return dual;
   };
 
+  // A sliding-window round's K and V projections (their own norms of their own inputs) beside the q path on the side
+  // stream, with the side's own 8-bit rows (side_scratch): they read inputs ready before the fork and write only
+  // the K/V ShortConv rows, which rel_attn_prep reads after the join.  FLYX_SIDE_KV=0: in turn.  Same bits.
+  static const bool kv_side_env = [] {
+    const char* e = std::getenv("FLYX_SIDE_KV");
+    return !e || std::atoi(e) != 0;
+  }();
+  const bool kv_shares_q = in_raw[0] == in_raw[1] && in_raw[0] == in_raw[2] && same_norm(a.q_norm_in, a.k_norm_in) &&
+                           same_norm(a.q_norm_in, a.v_norm_in);
+  const bool kv_beside = kv_side_env && ps.round && is_swa && fused && H % 64 == 0 && round_q8 && a.conv <= 64 &&
+                         !kv_shares_q && L.side && L.side->st && (!L.opt || L.opt->side_stream) && !q_normed;
+  if (kv_beside) {
+    // The side's 8-bit rows in the SwiGLU's buffers (Launch::glu), which no attention block uses: the q path's
+    // rows stay in q8 while the K and V norms write theirs.
+    Scratch side_scr = side_scratch(*L.scratch);
+    side_scr.q8 = side_scr.q8_glu;
+    side_scr.q8_scale = side_scr.q8_glu_scale;
+    side_scr.q8_sums = side_scr.q8_glu_sums;
+    Launch on = L;
+    on.st = L.side->st;
+    on.scratch = &side_scr;
+    on.side = nullptr;
+    CK(cudaEventRecord(L.side->fork, L.st));
+    CK(cudaStreamWaitEvent(on.st, L.side->fork, 0));
+    norm_project(in_raw[1], rv.b.h, rv.b.kv_conv, kv_dim, R, a.k_norm_in, a.w_k, kv_dim, H, on, true);
+    norm_project(in_raw[2], rv.b.h, rv.b.kv_conv + size_t(R) * kv_dim, kv_dim, R, a.v_norm_in, a.w_v, kv_dim, H, on,
+                 true);
+    CK(cudaEventRecord(L.side->join, on.st));
+  }
+
   if (q_staged) {
     gemm_presplit(a.w_qgr, 2 * q_dim + nh * dr, H, rv.b.proj, rv.ld_proj, R, false, L);
     gemm_presplit(a.w_sink, nh, H, rv.b.sink, nh, R, false, L);
@@ -955,8 +985,12 @@ void rel_attn_layer(const Pass& ps, const RelAttnBlock& a, bool fused) {
   };
   float* k_dyn = is_swa ? nullptr : rv.b.kv_dyn;
   float* v_dyn = is_swa ? nullptr : (fuse_kv_sc ? rv.b.kv_dyn + size_t(R) * nkv * a.conv : rv.b.kv_dyn);
-  project_kv(in_raw[1], a.k_norm_in, a.w_k, a.w_k_conv_proj, a.k_conv, 0, k_dyn);
-  project_kv(in_raw[2], a.v_norm_in, a.w_v, a.w_v_conv_proj, a.v_conv, kv_dim, v_dyn);
+  if (kv_beside) {
+    CK(cudaStreamWaitEvent(L.st, L.side->join, 0));
+  } else {
+    project_kv(in_raw[1], a.k_norm_in, a.w_k, a.w_k_conv_proj, a.k_conv, 0, k_dyn);
+    project_kv(in_raw[2], a.v_norm_in, a.w_v, a.w_v_conv_proj, a.v_conv, kv_dim, v_dyn);
+  }
 
   const KvBuf& kb = s->kv[size_t(a.kv)];
   KvRef kv = kb.ref();
