@@ -137,49 +137,41 @@ int DrafterRegistry::attach(Drafter kind, const ModelFile& file, Tables& T, cons
     if (max_drafts_out) *max_drafts_out = FLYX_MAX_ROWS - 1;
     return blk;
   }
+  auto record = [&](BlockTaps& attached, int block, const auto& spec) {
+    attached = {block, spec.taps};
+    context_blocks_.push_back(block);
+    if (max_drafts_out) *max_drafts_out = spec.block.block - 1;
+    return block;
+  };
   if (kind == Drafter::kDFlash2) {
     const DFlash2Spec& spec = ensure_dflash2_spec(file, target);
-    dflash2_block_ = build_dflash2(T, spec, target);
-    dflash2_taps_ = spec.taps;
-    context_blocks_.push_back(dflash2_block_);
-    if (max_drafts_out) *max_drafts_out = spec.block.block - 1;
-    return dflash2_block_;
+    return record(dflash2_, build_dflash2(T, spec, target), spec);
   }
   if (kind == Drafter::kDSpark) {
     const DSparkSpec& spec = ensure_dspark_spec(file, target);
-    dspark_block_ = build_dspark(T, file, spec, target);
-    dspark_taps_ = spec.taps;
-    context_blocks_.push_back(dspark_block_);
-    if (max_drafts_out) *max_drafts_out = spec.block.block - 1;
-    return dspark_block_;
+    return record(dspark_, build_dspark(T, file, spec, target), spec);
   }
   throw std::runtime_error("unsupported drafter kind in DrafterRegistry::attach");
 }
 
+void DrafterRegistry::BlockTaps::emit(std::vector<flyx_node>* p, int position, int flags) const {
+  for (size_t slot = 0; slot < taps.size(); ++slot)
+    if (taps[slot] == position) p->push_back({FLYX_NODE_TAP, block, int32_t(slot), flags});
+}
+
 void DrafterRegistry::emit_pre_visit_taps(std::vector<flyx_node>* p, int visit_0based) const {
-  if (dspark_block_ < 0) return;
-  for (size_t s = 0; s < dspark_taps_.size(); ++s)
-    if (dspark_taps_[s] == visit_0based) p->push_back({FLYX_NODE_TAP, dspark_block_, int32_t(s), 0});
+  dspark_.emit(p, visit_0based, 0);
 }
 
 void DrafterRegistry::emit_taps(std::vector<flyx_node>* p, int layer_1based) const {
-  if (dflash2_block_ < 0) return;
   const bool is_post_norm = layer_1based == target_layers_;
   if (is_post_norm && explicit_post_norm_) return;
-  for (size_t s = 0; s < dflash2_taps_.size(); ++s)
-    if (dflash2_taps_[s] == layer_1based)
-      p->push_back({FLYX_NODE_TAP, dflash2_block_, int32_t(s), is_post_norm ? FLYX_TAP_NORMED : 0});
+  dflash2_.emit(p, layer_1based, is_post_norm ? FLYX_TAP_NORMED : 0);
 }
 
 void DrafterRegistry::emit_post_norm_taps(std::vector<flyx_node>* p, int n_layers) const {
-  if (dspark_block_ >= 0) {
-    for (size_t s = 0; s < dspark_taps_.size(); ++s)
-      if (dspark_taps_[s] == n_layers) p->push_back({FLYX_NODE_TAP, dspark_block_, int32_t(s), FLYX_TAP_NORMED});
-  }
-  if (dflash2_block_ >= 0) {
-    for (size_t s = 0; s < dflash2_taps_.size(); ++s)
-      if (dflash2_taps_[s] == n_layers) p->push_back({FLYX_NODE_TAP, dflash2_block_, int32_t(s), FLYX_TAP_NORMED});
-  }
+  dspark_.emit(p, n_layers, FLYX_TAP_NORMED);
+  dflash2_.emit(p, n_layers, FLYX_TAP_NORMED);
 }
 
 void DrafterRegistry::emit_contexts(std::vector<flyx_node>* p) const {
