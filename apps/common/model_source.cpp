@@ -115,6 +115,22 @@ std::vector<LocalModel> scan_model_dirs(const std::vector<std::string>& dirs, in
       }
       const std::string low = lower(name);
       const bool gguf = low.ends_with(".gguf"), flyx = low.ends_with(".flyx");
+      if (name == "adapter_config.json") {  // a LoRA adapter as PEFT saves it: listed by its folder
+        const fs::path dir = it->path().parent_path(), weights = dir / "adapter_model.safetensors";
+        const fs::path canon = fs::weakly_canonical(dir, e2);
+        if (e2 || !fs::is_regular_file(weights, e2) || !seen.insert(canon).second) continue;
+        LocalModel m;
+        m.path = from_path(dir);
+        m.file = from_path(dir.filename());
+        m.kind = "lora";
+        m.size = uint64_t(fs::file_size(weights, e2));
+        if (e2) continue;
+        std::error_code e3;
+        const auto mt = fs::last_write_time(weights, e3);
+        m.modified = e3 ? fs::file_time_type::min() : mt;
+        out.push_back(std::move(m));
+        continue;
+      }
       if (!gguf && !flyx) continue;
       std::string rel = from_path(it->path().lexically_relative(root));
       std::replace(rel.begin(), rel.end(), '\\', '/');
@@ -257,7 +273,7 @@ bool wants_mtp(const EngineOptions& eo) {
 
 bool fetch_model(const std::string& model, const std::vector<std::string>& drafters, bool want_mtp,
                  const hub::ProgressFn& progress, const std::atomic<bool>* stop, Fetched* out, std::string* err,
-                 const std::string& mmproj, bool want_vision) {
+                 const std::string& mmproj, bool want_vision, const std::string& lora) {
   *out = {};
   hub::Repo repo;
   if (!one(model, progress, stop, &out->model, &repo, err)) return false;
@@ -281,6 +297,7 @@ bool fetch_model(const std::string& model, const std::vector<std::string>& draft
     out->mmproj_source = mrepo.id.empty() ? mpath : mmproj;
     out->mmproj_size = bytes_on_disk(mpath);
   }
+  if (!lora.empty() && !fetch_lora(lora, progress, stop, &out->lora, err)) return false;
   if (repo.id.empty()) return true;  // a path: nothing more to know
   if (want_vision && out->mmproj.empty()) {
     if (const hub::RepoFile* mm = hub::mmproj_file(repo)) {
@@ -323,6 +340,53 @@ bool fetch_model(const std::string& model, const std::vector<std::string>& draft
   return true;
 }
 
+bool fetch_lora(const std::string& spec, const hub::ProgressFn& progress, const std::atomic<bool>* stop,
+                std::string* path, std::string* err) {
+  if (exists_on_disk(spec)) {  // the directory, or a file of it (its adapter_config.json, adapter_model.safetensors)
+    std::error_code ec;
+    *path = fs::is_directory(to_path(spec), ec) ? spec : from_path(to_path(spec).parent_path());
+    return true;
+  }
+  hub::Name name;
+  if (!hub::parse_adapter_name(spec, &name))
+    return *err = spec + ": no such directory, and not a Hugging Face name (org/name, org/name:FOLDER)", false;
+  hub::Repo repo;
+  if (!hub::describe(name.repo, name.revision, &repo, err)) return false;
+  // The adapter named: the folder of that path, else the one folder whose last part it is.
+  const std::vector<hub::AdapterFolder> all = hub::adapter_folders(repo.id, repo.files);
+  auto listing = [&] {
+    std::string s;
+    for (const hub::AdapterFolder& a : all) s += "\n  " + a.name;
+    return s;
+  };
+  const hub::AdapterFolder* found = nullptr;
+  for (const hub::AdapterFolder& a : all)
+    if (a.folder == name.quant) found = &a;
+  if (!found && !name.quant.empty())
+    for (const hub::AdapterFolder& a : all)
+      if (a.folder.ends_with("/" + name.quant)) {
+        if (found) return *err = spec + ": more than one folder of that name holds an adapter:" + listing(), false;
+        found = &a;
+      }
+  if (!found) {
+    if (all.empty())
+      return *err = repo.id + ": no LoRA adapter there (adapter_config.json and adapter_model.safetensors)", false;
+    return *err = spec + ": no LoRA adapter " + (name.quant.empty() ? "at the repository's top" : "in that folder") +
+                  "; it has:" + listing(),
+           false;
+  }
+  if (!found->weights)
+    return *err = found->name + (found->pickle ? ": adapter_model.bin (a pickle) is not read; save the adapter as "
+                                                 "safetensors"
+                                               : ": no adapter_model.safetensors beside its adapter_config.json"),
+           false;
+  const std::vector<hub::RepoFile> files = {*found->config, *found->weights};
+  std::vector<std::string> paths;
+  if (!hub::fetch(repo, files, &paths, progress, stop, err)) return false;
+  *path = from_path(to_path(paths[0]).parent_path());
+  return true;
+}
+
 hub::ProgressFn make_progress_logger(const char* prefix, double interval_ms, hub::ProgressFn hook) {
   auto last = std::make_shared<double>(0.0);
   return [prefix, interval_ms, hook = std::move(hook), last](const hub::Progress& p) {
@@ -338,7 +402,8 @@ hub::ProgressFn make_progress_logger(const char* prefix, double interval_ms, hub
 bool fetch_named(std::string* model, EngineOptions* eo, std::string* err) {
   auto progress = make_progress_logger("flyx", 2000);
   Fetched f;
-  if (!fetch_model(*model, eo->drafter_files, wants_mtp(*eo), progress, nullptr, &f, err, eo->mmproj_file, eo->vision))
+  if (!fetch_model(*model, eo->drafter_files, wants_mtp(*eo), progress, nullptr, &f, err, eo->mmproj_file, eo->vision,
+                   eo->lora_file))
     return false;
   if (f.model != *model) std::fprintf(stderr, "flyx: %s is %s\n", model->c_str(), f.model.c_str());
   for (size_t i = 0; i < eo->drafter_files.size() && i < f.drafters.size(); ++i)
@@ -348,6 +413,8 @@ bool fetch_named(std::string* model, EngineOptions* eo, std::string* err) {
   *model = f.model;
   eo->drafter_files = f.drafters;
   eo->mmproj_file = f.mmproj;
+  if (f.lora != eo->lora_file) std::fprintf(stderr, "flyx: %s is %s\n", eo->lora_file.c_str(), f.lora.c_str());
+  eo->lora_file = f.lora;
   return true;
 }
 

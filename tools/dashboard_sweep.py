@@ -53,7 +53,7 @@ COLLECT = r"""() => {
 KEPT = {"mtp", "dflash2", "gpu", "vram", "ttft", "kv", "api", "json", "hugging", "face", "tok/s", "token", "tokens", "prompt",
         "drafter", "drafters", "flyx", "fp8", "gguf", "cuda", "rtx", "gib", "gb", "mb", "ms", "mhz", "chat", "messages",
         "responses", "openai", "anthropic", "claude", "code", "curl", "python", "telemetry", "ok", "pcie", "sse", "docs",
-        "jinja", "ctx", "nvidia", "geforce", "english", "http", "url", "cpu", "ram", "bearer", "post", "get", "delete",
+        "jinja", "lora", "ctx", "nvidia", "geforce", "english", "http", "url", "cpu", "ram", "bearer", "post", "get", "delete",
         "sdk", "sdks", "enter", "gen", "backend", "host", "streaming", "error", "info", "auto", "exact", "source",
         "message", "pages", "sessions", "session", "logs", "model", "models", "total", "endpoints", "text"}
 

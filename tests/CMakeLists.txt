@@ -190,6 +190,9 @@ flyx_add_py_test(cli_usage ${CMAKE_CURRENT_SOURCE_DIR}/apps/flyx-cli/usage.py
                  ARGS $<TARGET_FILE:flyx-cli> ${ASSETS}/tiny.flyx FIXTURES assets)
 flyx_add_py_test(remembered_model ${CMAKE_CURRENT_SOURCE_DIR}/apps/flyx-server/remembered_model.py
                  ARGS $<TARGET_FILE:flyx-cli> ${ASSETS}/tiny.flyx FIXTURES assets)
+flyx_add_py_test(lora_load ${CMAKE_CURRENT_SOURCE_DIR}/apps/flyx-server/lora_load.py
+                 ARGS $<TARGET_FILE:flyx-cli> ${ASSETS}/tiny_qwen3_gguf.gguf ${ASSETS}/peft_qwen3 FIXTURES gguf_assets
+                 TIMEOUT 120)
 flyx_add_py_test(queued_request_ttft ${CMAKE_CURRENT_SOURCE_DIR}/apps/flyx-server/queued_request_ttft.py
                  ARGS $<TARGET_FILE:flyx-cli> ${ASSETS}/tiny.flyx FIXTURES assets TIMEOUT 90)
 flyx_add_py_test(streaming_tool_calls ${CMAKE_CURRENT_SOURCE_DIR}/apps/flyx-server/streaming_tool_calls.py

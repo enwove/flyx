@@ -196,6 +196,15 @@ int main() {
     const bool ok = add(write_adapter(root, "init_gaussian", config(8, 16, {{"init_lora_weights", "gaussian"}}), q), &f, &err);
     check(ok, "init_lora_weights gaussian (the base as it was) read: " + err);
   }
+  // A tensor name longer than any model's is refused before it is matched, shown cut short.
+  {
+    flyx::ModelFile f;
+    std::string err;
+    const std::string longname = L0 + "mlp." + std::string(100000, 'a') + "_proj";
+    const bool ok = add(write_adapter(root, "long_name", config(8, 16), pair(longname, 8, 16, 16)), &f, &err);
+    check(!ok && err.find("bytes, not a decoder layer's LoRA") != std::string::npos && err.size() < 600,
+          "a 100 KB tensor name refused, its message short: " + err.substr(0, 300));
+  }
   {
     const fs::path dir = write_adapter(root, "pickle", config(8, 16), q, false);
     std::ofstream(dir / "adapter_model.bin") << "x";

@@ -101,6 +101,7 @@ function Serving({ tm, again, retry, browse }) {
     if (loadedWant) facts.push(["KV cache", loadedWant.kv === "16" ? "16-bit" : loadedWant.kv === "fp8" ? "fp8" : "auto"]);
     facts.push(["Sessions", fmt(model.max_sessions)]);
     facts.push(["Drafting", model.drafter ? model.drafter + ", up to " + model.max_width : "off", draftTip]);
+    if (loadedWant && loadedWant.lora) facts.push(["LoRA", baseName(loadedWant.lora.replace(/[\\/]+$/, "")), loadedWant.lora]);
     facts.push(["Vision", model.vision ? t(normVisionDev(model.vision_device)) + " · " + normVisionQuant(model.vision_quant) : "off", visionTip]);
     if (model.load_s) facts.push(["Load time", secs(model.load_s)]);
     if (tm.memory && tm.memory.ledger_used) facts.push(["Memory", gib(tm.memory.ledger_used) + " GiB"]);
@@ -162,6 +163,8 @@ function Serving({ tm, again, retry, browse }) {
     </div>`;
 }
 
+// A model the library can load by itself: not a drafter, a vision projector or a LoRA adapter (they go with one).
+const standalone = (m) => m.kind !== "drafter" && m.kind !== "mmproj" && m.kind !== "lora";
 // A drafter given as a GGUF is a DFlash2 or MTP file; anything else a DFlash2 drafter.
 const kindOf = (d) => /\.gguf$/i.test(d)
   ? (/(?:^|[\\/:-])dflash2?(?:[\\/._-]|$)/i.test(d) ? "dflash2" : "mtp")
@@ -179,6 +182,7 @@ function shown(w) {
            width: w.width === null || w.width === undefined ? "auto" : String(w.width),
            head: w.draft_head === "full" ? "full head" : "1-bit pick", weights: w.draft_weights === "exact" ? "exact" : "compact copy",
            lookup: w.lookup !== false ? "on" : "off", trees: w.draft_trees ? "on" : "off",
+           lora: w.lora || "none",
            vision: vOn ? "on" : "off", mmproj: vOn ? (w.mmproj || "auto") : "auto",
            vision_device: normVisionDev(w.vision_device), vision_quant: normVisionQuant(w.vision_quant),
            vision_max_tokens: w.vision_max_tokens > 0 ? String(w.vision_max_tokens) : "auto" };
@@ -196,7 +200,7 @@ function draftingOf(w) {
 function formOf(w) {
   const vOn = w.vision !== false;
   return { ctx: w.ctx || "", kv: w.kv === "16" || w.kv === "fp8" ? w.kv : "", kvram: typeof w.kv_ram === "number" ? String(w.kv_ram) : "",
-           kvgpu: typeof w.kv_gpu === "number" ? String(w.kv_gpu) : "", name: w.name || "",
+           kvgpu: typeof w.kv_gpu === "number" ? String(w.kv_gpu) : "", name: w.name || "", lora: w.lora || "", loraPicked: false,
            spec: w.speculative !== false, ...draftingOf(w), draftPicked: false,
            width: w.width === null || w.width === undefined ? "" : String(w.width), trees: !!w.draft_trees, lookup: w.lookup !== false,
            head: w.draft_head === "full" ? "full" : "", weights: w.draft_weights === "exact" ? "exact" : "",
@@ -210,7 +214,7 @@ const EMPTY_FORM = formOf({});
 function loadBody(chosen, f) {
   const ctxText = String(f.ctx).trim().toLowerCase(), ctxTokens = parseInt(ctxText, 10);
   const ctx = ctxText === "max" ? "max" : ctxTokens > 0 ? ctxTokens : null;  // "max": the model's own, or the longest that fits
-  const kvRam = parseFloat(f.kvram), kvGpu = parseInt(f.kvgpu, 10), name = f.name.trim();
+  const kvRam = parseFloat(f.kvram), kvGpu = parseInt(f.kvgpu, 10), name = f.name.trim(), lora = f.lora.trim();
   const own = f.draftSource === "custom" && f.spec ? f.drafter.trim() : "";
   const adv = { width: f.width ? parseInt(f.width, 10) : null, draft_trees: f.trees, lookup: f.lookup,
                 draft_head: f.head || null, draft_weights: f.weights || null };
@@ -223,7 +227,8 @@ function loadBody(chosen, f) {
                 vision_max_tokens: Number.isFinite(vmax) && vmax > 0 ? vmax : null };
   // kv "auto": the engine's default, not the server's --kv (null would keep that)
   return Object.assign({ model: chosen, ctx, kv: f.kv || "auto", kv_ram: kvRam >= 0 ? kvRam : "auto",
-                         kv_gpu: kvGpu >= 0 ? kvGpu : null, name: name || null, speculative: f.spec }, draft, adv, vis);
+                         kv_gpu: kvGpu >= 0 ? kvGpu : null, name: name || null, lora: lora || null, speculative: f.spec },
+                       draft, adv, vis);
 }
 
 // The command line that loads the same: what a user can put in a script.
@@ -231,7 +236,7 @@ function commandOf(b, shell) {
   const ps = shell === "powershell";
   // Windows PowerShell 5.1 drops literal double quotes and can consume a trailing backslash
   // when joining native arguments that contain spaces. Pass the native command line in these cases.
-  const strings = [b.model, b.name, b.mmproj, ...b.drafters];
+  const strings = [b.model, b.name, b.mmproj, b.lora, ...b.drafters];
   const native = ps && strings.some((s) => s && (s.includes('"') || (/\s/.test(s) && s.endsWith("\\"))));
   const nativeQuote = (s) => '"' + s.replace(/(\\*)"/g, '$1$1\\"').replace(/\\+$/, '$&$&') + '"';
   const q = native ? nativeQuote : ps ? psQuote : shQuote;
@@ -248,6 +253,7 @@ function commandOf(b, shell) {
   if (!b.lookup) parts.push("--no-lookup");
   if (b.draft_head) parts.push("--backend-opt draft_head=" + b.draft_head);
   if (b.draft_weights) parts.push("--backend-opt draft_weights=" + b.draft_weights);
+  if (b.lora) parts.push("--lora " + q(b.lora));
   if (b.vision === false) parts.push("--no-vision");
   if (b.mmproj) parts.push("--mmproj " + q(b.mmproj));
   if (b.vision !== false && b.vision_device && b.vision_device !== "disk") parts.push("--vision-device " + b.vision_device);
@@ -335,6 +341,14 @@ export function ModelPage({ active, libraryAsked, currentAsked }) {
   useEffect(() => { if (currentAsked) setView("current"); }, [currentAsked]);  // and to the model's card
   const [advOpen, setAdvOpen] = useState(false);
   const [stab, setStab] = useState("general");
+  // LoRA adapters on the Hub for the model's base (GET /v1/hub/loras): the base asked for ("": the model card's), the
+  // list, and one repository opened (GET /v1/hub/lora: its adapters, each loadable or why not)
+  const [loraBase, setLoraBase] = useState("");
+  const [loraBaseDraft, setLoraBaseDraft] = useState("");
+  const [loraHub, setLoraHub] = useState(null);
+  const [loraHubMsg, setLoraHubMsg] = useState("");
+  const [loraRepo, setLoraRepo] = useState(null);
+  const loraSeq = useRef(0);
   const [shell, setShell] = useState(defaultShell);
   const [msg, setMsg] = useState("");
   const filled = useRef(false), sawState = useRef(""), sawLoaded = useRef("");
@@ -376,6 +390,30 @@ export function ModelPage({ active, libraryAsked, currentAsked }) {
     }
     search(q, sort, arch, 0, "");
     if (repoSel) showRepo(repoSel, "");
+  }
+  async function findLoras(base, modelName) {
+    const n = ++loraSeq.current;
+    setLoraHubMsg("Asking Hugging Face ...");
+    try {
+      const q = base ? "base=" + encodeURIComponent(base) : "model=" + encodeURIComponent(modelName || "");
+      const d = await getJson("/v1/hub/loras?" + q + "&limit=30");
+      if (n !== loraSeq.current) return;
+      setLoraHub(d);
+      setLoraHubMsg("");
+      if (!base) setLoraBaseDraft(d.base || "");  // the model's base, or nothing for one whose base is not known
+    } catch (e) {
+      if (n === loraSeq.current) { setLoraHub(null); setLoraHubMsg(e.message); }
+    }
+  }
+  async function openLoraRepo(id) {
+    if (loraRepo && loraRepo.id === id) return setLoraRepo(null);
+    setLoraRepo({ id, loading: true });
+    try {
+      const d = await getJson("/v1/hub/lora?repo=" + encodeURIComponent(id));
+      setLoraRepo((cur) => cur && cur.id === id ? Object.assign({ id }, d) : cur);
+    } catch (e) {
+      setLoraRepo((cur) => cur && cur.id === id ? { id, err: e.message } : cur);
+    }
   }
   async function refreshCached() {
     try { setCatalog(await getJson("/v1/hub/cached")); setCatalogErr(""); } catch (e) { setCatalogErr(e.message); }
@@ -467,7 +505,7 @@ export function ModelPage({ active, libraryAsked, currentAsked }) {
     setDirMsg("");
     setLoc(a.j.path);
     setPathText(a.j.path);
-    if (a.j.kind === "file" && a.j.models.length === 1 && a.j.models[0].kind !== "mmproj" && a.j.models[0].kind !== "drafter") setTarget(a.j.models[0].name);
+    if (a.j.kind === "file" && a.j.models.length === 1 && standalone(a.j.models[0])) setTarget(a.j.models[0].name);
   }
   const kept = folders.some((x) => samePath(x, loc));
   const keep = () => setFolders(kept ? folders.filter((x) => !samePath(x, loc)) : [...folders, loc]);
@@ -503,7 +541,7 @@ export function ModelPage({ active, libraryAsked, currentAsked }) {
     placed.current = true;
     const served = loadedWant && !isHub(loadedWant.model) && /[\\/]/.test(loadedWant.model) ? folderOf({ name: loadedWant.model }) : "";
     openPath(served || catalog.cache);
-    const first = loadedWant ? loadedWant.model : (catalog.models.find((m) => m.source === "hub" && m.kind !== "drafter" && m.kind !== "mmproj") || {}).name;
+    const first = loadedWant ? loadedWant.model : (catalog.models.find((m) => m.source === "hub" && standalone(m)) || {}).name;
     if (first) { setPicked(first); setTarget(first); }
   }, [catalog, tab, view]);
 
@@ -575,12 +613,14 @@ export function ModelPage({ active, libraryAsked, currentAsked }) {
   const keepDraft = changed.includes("drafter") || !!use.draftPicked;
   const keepMmproj = changed.includes("mmproj") || !!use.mmprojPicked;
   const keepName = changed.includes("name");
+  const keepLora = changed.includes("lora") || !!use.loraPicked;
   function settingsFor(name, overrides) {
     const next = Object.assign({}, use);
     if (loadedWant && name && name !== loadedWant.model) {
       if (!keepDraft) { next.draftSource = "default"; next.savedDraft = null; next.drafter = ""; }
       if (!keepMmproj) { next.visionSource = "default"; next.mmproj = ""; }
       if (!keepName) next.name = "";
+      if (!keepLora) next.lora = "";
     }
     if (overrides && overrides.drafter) {
       next.spec = true;
@@ -657,6 +697,12 @@ export function ModelPage({ active, libraryAsked, currentAsked }) {
     setStab("vision");
     setTimeout(() => { const row = document.getElementById("vs-custom"); if (row) row.scrollIntoView({ behavior: "smooth", block: "center" }); }, 60);
   };
+  const loraWith = (path) => {
+    setF((current) => Object.assign({}, current, { lora: path, loraPicked: true }));
+    setView("current");
+    setStab("lora");
+    setTimeout(() => { const row = document.getElementById("mf-lora"); if (row) row.scrollIntoView({ behavior: "smooth", block: "center" }); }, 60);
+  };
   const applyCompanions = (draftSpec, mmprojSpec) => {
     setF((current) => Object.assign({}, current,
       draftSpec ? { spec: true, draftSource: "custom", savedDraft: null, drafter: draftSpec, draftPicked: true } : {},
@@ -678,6 +724,7 @@ export function ModelPage({ active, libraryAsked, currentAsked }) {
   const vdflt = visDefault();
   const genChg = ["ctx", "kv", "kv_ram", "kv_gpu", "name"].filter((k) => changed.includes(k)).length;
   const specChg = ["spec", "drafter", "width", "head", "weights", "lookup", "trees"].filter((k) => changed.includes(k)).length;
+  const loraChg = changed.includes("lora") ? 1 : 0;
   const visChg = ["vision", "mmproj", "vision_device", "vision_quant", "vision_max_tokens"].filter((k) => changed.includes(k)).length;
 
   function settingsView(cmdModel) {
@@ -689,6 +736,10 @@ export function ModelPage({ active, libraryAsked, currentAsked }) {
                     specLoaded ? t("default") : t("none");
     const visSum = !f.vision ? t("off") : visLoaded ? t(normVisionDev(f.vision_device)) + " · " + normVisionQuant(f.vision_quant) :
                    visCustom && mmOwn ? baseName(mmOwn) : t("none");
+    const loraName = (p) => baseName(String(p).replace(/[\\/]+$/, ""));
+    const loraOwn = (f.lora || "").trim(), loraLoaded = !!(loadedWant && loadedWant.lora);
+    const adapters = catalog ? catalog.models.filter((m) => m.kind === "lora") : [];
+    const adapterOf = (m) => m.source === "hub" ? m.name : m.path || m.name;
     return html`
       <div class="pane lset" id="mf-settings">
         <div class="lset-h">
@@ -719,6 +770,12 @@ export function ModelPage({ active, libraryAsked, currentAsked }) {
               <span class="sum">${visSum}</span>
               ${visChg ? html`<span class="chg">+${visChg}</span>` : ""}
             </button>
+            <button role="tab" data-stab="lora" aria-selected=${String(stab === "lora")} onClick=${() => setStab("lora")}>
+              <span class=${"dot" + (loraLoaded && loraOwn ? " on" : "")}></span>
+              <span>${t("LoRA")}</span>
+              <span class="sum">${loraOwn ? loraName(loraOwn) : t("none")}</span>
+              ${loraChg ? html`<span class="chg">+${loraChg}</span>` : ""}
+            </button>
           </div>
         </div>
         <div class="lset-panel" id="lset-general" role="tabpanel" hidden=${stab !== "general"}>
@@ -736,6 +793,64 @@ export function ModelPage({ active, libraryAsked, currentAsked }) {
             <${Field} k="name" label="API model id" was=${was("name")}>
               <input type="text" id="mf-name" placeholder=${t("the file's name")} spellcheck="false" autocomplete="off" value=${f.name} onInput=${set("name")}/><//>
           </div>
+        </div>
+        <div class="lset-panel" id="lset-lora" role="tabpanel" hidden=${stab !== "lora"}>
+          <div class="pane-h"><h2>${t("LoRA adapter")}</h2></div>
+          ${loraLoaded && !busy ? html`<div class="srv-dr in-panel" id="ld-lora-src">
+            <div class="dr"><span class="tag2 ok">${t("in use")}</span><span class="k">${t("LoRA")}</span>
+              <span class="f">${loadedWant.lora}</span></div></div>` : null}
+          <div class="opts">
+            <${Field} k="lora" label="LoRA adapter" was=${was("lora")} hint="A PEFT adapter's folder on the server's machine, or a Hugging Face name; empty: none.">
+              <input type="text" id="mf-lora" placeholder=${t("none")} spellcheck="false" autocomplete="off" value=${f.lora}
+                     onInput=${(e) => setF(Object.assign({}, f, { lora: e.target.value, loraPicked: false }))}/><//>
+          </div>
+          ${adapters.length ? html`<div class="sdopts" id="lora-list">
+            <div class=${"sdrow pick" + (!loraOwn ? " sel" : "")} data-lora="" onClick=${() => setF(Object.assign({}, f, { lora: "", loraPicked: true }))}>
+              <input type="radio" name="lora-src" aria-label=${t("None")} checked=${!loraOwn}/>
+              <div class="grow"><div class="dhead"><b>${t("None")}</b></div><em class="sd-what">${t("The model alone.")}</em></div>
+            </div>
+            ${adapters.map((m) => html`<div class=${"sdrow pick" + (loraOwn === adapterOf(m) ? " sel" : "")} data-lora=${adapterOf(m)}
+                 onClick=${() => setF(Object.assign({}, f, { lora: adapterOf(m), loraPicked: true }))}>
+              <input type="radio" name="lora-src" aria-label=${loraName(m.name)} checked=${loraOwn === adapterOf(m)}/>
+              <div class="grow"><div class="dhead"><b>${m.source === "hub" ? m.name : loraName(m.path || m.name)}</b>
+                <span class="tag2">${m.size ? gb(m.size) + " GB" : ""}</span></div>
+                <em class="sd-what">${m.path || m.name}</em></div>
+            </div>`)}
+          </div>` : html`<p class="note" id="lora-none">${t("No LoRA adapter in the library's folders; type its folder or Hugging Face name above.")}</p>`}
+          <div class="pane-h lora-hub-h"><h3>${t("On Hugging Face")}</h3></div>
+          <form class="lora-base" onSubmit=${(e) => { e.preventDefault(); const b = loraBaseDraft.trim(); setLoraRepo(null);
+                                                       if (b === loraBase || (!loraBase && loraHub && b === loraHub.base)) findLoras(loraBase, cmdModel); else setLoraBase(b); }}>
+            <label for="lora-base">${t("Adapters made for")}</label>
+            <input type="text" id="lora-base" placeholder="org/name" spellcheck="false" autocomplete="off" value=${loraBaseDraft}
+                   onInput=${(e) => setLoraBaseDraft(e.target.value)}/>
+            <button class="btn" id="lora-find" type="submit">${t("Find")}</button>
+            ${loraHub && loraHub.base && !loraBase && loraHub.from === "model card" ? html`<span class="note">${t("the model card's base")}</span>` : ""}
+          </form>
+          ${loraHubMsg ? html`<p class="note" id="lora-hub-msg">${t(loraHubMsg)}</p>` :
+            loraHub && !loraHub.base ? html`<p class="note" id="lora-hub-msg">${t("The model's base is not known: type the Hugging Face model the adapters were trained on.")}</p>` :
+            loraHub && !loraHub.models.length ? html`<p class="note" id="lora-hub-msg">${t("Hugging Face lists no LoRA adapter for this model.")}</p>` : ""}
+          ${loraHub && loraHub.models.length ? html`<div class="lora-hub" id="lora-hub">
+            ${loraHub.models.map((m) => html`<div class=${"lora-repo" + (loraRepo && loraRepo.id === m.id ? " open" : "")} data-repo=${m.id}>
+              <button type="button" class="lora-repo-h" onClick=${() => openLoraRepo(m.id)}>
+                <b>${m.id}</b>${m.cached ? html`<span class="tag2 ok">${t("downloaded")}</span>` : ""}${m.gated ? html`<span class="tag2 warn">${t("gated")}</span>` : ""}
+                <span class="pm"><${Icon} name="heart"/>${compact(m.likes)}<${Icon} name="dl"/>${compact(m.downloads)}</span></button>
+              ${loraRepo && loraRepo.id === m.id ? html`<div class="lora-ads">
+                ${loraRepo.loading ? html`<p class="note">${t("Reading its adapters ...")}</p>` :
+                  loraRepo.err ? html`<p class="note bad">${t(loraRepo.err)}</p>` :
+                  !(loraRepo.adapters || []).length ? html`<p class="note">${t("No adapter_config.json in this repository.")}</p>` :
+                  loraRepo.adapters.map((a) => html`<div class=${"lora-ad" + (a.why ? " no" : "") + (loraOwn === a.name ? " sel" : "")} data-name=${a.name}>
+                    <div class="grow">
+                      <div class="dhead"><b>${a.folder || t("(top folder)")}</b>
+                        ${a.rank ? html`<span class="tag2">r${a.rank}</span>` : ""}${a.size ? html`<span class="tag2">${gb(a.size)} GB</span>` : ""}</div>
+                      <em class="sd-what">${a.why ? t("Cannot load") + ": " + a.why :
+                        (a.layers ? a.layers + " " + t("layers") + " · " : "") + (a.linears || []).join(", ") + (a.base ? " · " + t("trained on") + " " + a.base : "")}</em>
+                    </div>
+                    ${a.why ? "" : html`<button type="button" class="btn" disabled=${loraOwn === a.name}
+                        onClick=${() => setF(Object.assign({}, f, { lora: a.name, loraPicked: true }))}>${loraOwn === a.name ? t("Chosen") : t("Use")}</button>`}
+                  </div>`)}
+              </div>` : ""}
+            </div>`)}
+          </div>` : ""}
         </div>
         <div class="lset-panel" id="lset-spec" role="tabpanel" hidden=${stab !== "spec"}>
           <div class="pane-h"><h2>${t("Speculative decoding")}</h2>
@@ -1147,15 +1262,15 @@ export function ModelPage({ active, libraryAsked, currentAsked }) {
         setListings((old) => Object.assign({}, old, { [folder]: a.error ? { models: [], error: a.error } : { models: a.j.models } })));
     }
   }, [active, view, tab, catalog, places.join("\n")]);
-  const kindOfModel = (m) => m.kind === "drafter" ? "drafter" : m.kind === "mmproj" ? "mmproj" : m.kind === "flyx" ? ".flyx" : "GGUF";
-  const iconOfModel = (m) => m.kind === "mmproj" ? "image" : m.kind === "drafter" ? "bolt" : "model";
-  const kindCls = (m) => m.kind === "mmproj" ? "k-mmproj" : m.kind === "drafter" ? "k-drafter" : "k-model";
+  const kindOfModel = (m) => m.kind === "drafter" ? "drafter" : m.kind === "mmproj" ? "mmproj" : m.kind === "lora" ? "LoRA" : m.kind === "flyx" ? ".flyx" : "GGUF";
+  const iconOfModel = (m) => m.kind === "mmproj" ? "image" : m.kind === "drafter" ? "bolt" : m.kind === "lora" ? "plus" : "model";
+  const kindCls = (m) => m.kind === "mmproj" ? "k-mmproj" : m.kind === "drafter" ? "k-drafter" : m.kind === "lora" ? "k-lora" : "k-model";
   // A model as the list names it: a repository's by its name and quantization, a file by its own name.
   const titleOf = (m) => {
     const d = describe(m);
     return m.source === "hub" && d.repo ? d.repo.split("/")[1] + (d.quant ? " \u00b7 " + d.quant : "") : d.file || baseName(m.name);
   };
-  const pickModel = (m) => { setPicked(m.name); setTarget(m.kind === "drafter" || m.kind === "mmproj" ? "" : m.name); setMsg(""); };
+  const pickModel = (m) => { setPicked(m.name); setTarget(standalone(m) ? m.name : ""); setMsg(""); };
   function localList() {
     if (catalogErr) return html`<div class="empty pad">${catalogErr}</div>`;
     if (!catalog) return html`<div class="empty pad">${t("Looking...")}</div>`;
@@ -1200,7 +1315,7 @@ export function ModelPage({ active, libraryAsked, currentAsked }) {
   }
   // One model of the list: what it is, where its file is, and the box that loads it.
   function modelDetail(m) {
-    const d = describe(m), hubModel = m.source === "hub", drafter = m.kind === "drafter", mmproj = m.kind === "mmproj";
+    const d = describe(m), hubModel = m.source === "hub", drafter = m.kind === "drafter", mmproj = m.kind === "mmproj", lora = m.kind === "lora";
     const chips = [[t(kindOfModel(m)), ""]];
     if (d.quant) chips.push([d.quant, ""]);
     if (m.mtp === "in-file") chips.push([t("MTP inside"), "ok"]); else if (m.mtp === "in-repo") chips.push([t("+ MTP file"), "ok"]);
@@ -1214,28 +1329,32 @@ export function ModelPage({ active, libraryAsked, currentAsked }) {
       : drafter
       ? { title: m.name, sub: "A drafter is not loaded on its own.", label: "Draft with it",
           disabled: !model.id || busy, onClick: () => draftWith(m.name) }
+      : lora
+      ? { title: m.path || m.name, sub: "A LoRA adapter is not loaded on its own.", label: "Use with the model",
+          disabled: !model.id || busy, onClick: () => loraWith(m.source === "hub" ? m.name : m.path || m.name) }
       : null;
     return html`
       <div class="hub-scroll" id="lc-detail">
         <div class="dh">
           <div class="dh-icon"><${Icon} name=${iconOfModel(m)}/></div>
           <div class="dh-t"><h3 id="lc-name">${titleOf(m)}</h3><span>${hubModel ? (d.repo || "").split("/")[0] : folderOf(m)}</span></div>
-          ${hubModel && !drafter && !mmproj ? html`<button class="btn ghost sm" id="lc-quants" onClick=${() => { setTab("hub"); showRepo(d.repo, ""); }}>${t("All its quantizations")}</button>` : ""}
+          ${hubModel && standalone(m) ? html`<button class="btn ghost sm" id="lc-quants" onClick=${() => { setTab("hub"); showRepo(d.repo, ""); }}>${t("All its quantizations")}</button>` : ""}
           ${hubModel ? html`<button class="btn ghost sm" id="lc-delete" onClick=${() => removeCached(m)}><${Icon} name="trash"/>${t("Delete")}</button>` : ""}
         </div>
-        <div class="dchips">${chips.map(([text, tone]) => html`<span class=${"tag2 " + tone}>${text}</span>`)}${drafter || mmproj ? "" : html`<${FitTag} size=${m.size}/>`}</div>
+        <div class="dchips">${chips.map(([text, tone]) => html`<span class=${"tag2 " + tone}>${text}</span>`)}${standalone(m) ? html`<${FitTag} size=${m.size}/>` : ""}</div>
         <dl class="stats small">
           <div><dt>${t("Size")}</dt><dd>${m.size ? sized(m.size) : "-"}</dd></div>
           ${m.modified ? html`<div><dt>${t("Modified")}</dt><dd>${t(ago(m.modified))}</dd></div>` : ""}
           ${hubModel && d.repo ? html`<div><dt>${t("Repository")}</dt><dd>${d.repo}</dd></div>` : ""}
           ${m.revision ? html`<div><dt>${t("Revision")}</dt><dd>${String(m.revision).slice(0, 8)}</dd></div>` : ""}
         </dl>
-        <div class="dsec">${t(m.kind === "drafter" ? "Folder" : "File")}</div>
+        <div class="dsec">${t(m.kind === "drafter" || lora ? "Folder" : "File")}</div>
         <${CodeSnippet} id="lc-path" text=${m.path || m.name}/>
         ${drafter ? html`<div class="banner hint"><div class="grow2">${t(m.name + " is a drafter (" + gb(m.size) + " GB), not a model: it drafts for one, and is not loaded on its own.")}</div></div>` : ""}
         ${mmproj ? html`<div class="banner hint"><div class="grow2">${t(m.file + " is a vision projector (" + gb(m.size) + " GB), not a standalone model: attach it to a compatible VLM.")}</div></div>` : ""}
+        ${lora ? html`<div class="banner hint"><div class="grow2">${t(m.file + " is a LoRA adapter (" + gb(m.size) + " GB), not a model: it runs beside the model it was trained for.")}</div></div>` : ""}
       </div>
-      ${loadBox(drafter || mmproj ? [] : [localRow(m)], "", action)}`;
+      ${loadBox(standalone(m) ? [localRow(m)] : [], "", action)}`;
   }
   function localDetail() {
     const j = atCache ? null : dir, start = !!j && j.kind === "start";
@@ -1258,7 +1377,7 @@ export function ModelPage({ active, libraryAsked, currentAsked }) {
       const rows = [];
       const body = groups.map(([name, all]) => {
         const list = all.slice().sort((x, y) => (x.size || 0) - (y.size || 0));
-        const mine = list.filter((m) => m.kind !== "drafter" && m.kind !== "mmproj").map(localRow), drafter = list.find((m) => m.kind === "drafter");
+        const mine = list.filter(standalone).map(localRow), drafter = list.find((m) => m.kind === "drafter");
         rows.push(...mine);
         return html`
           <div class="rgroup" data-repo=${name}>
@@ -1280,7 +1399,7 @@ export function ModelPage({ active, libraryAsked, currentAsked }) {
         ${loadBox(rows, rows.length ? "" : "Nothing here to load.")}`;
     }
     // Any other folder: the folders in it, the model files in it and under it.
-    const allModels = j ? j.models.filter((m) => m.kind !== "mmproj" && m.kind !== "drafter") : [];
+    const allModels = j ? j.models.filter(standalone) : [];
     const rows = allModels.map((m) => {
       const r = localRow(m), rel = j.kind === "dir" && m.path.length > j.path.length ? m.path.slice(j.path.length).replace(/^[\\/]+/, "") : m.file;
       return Object.assign(r, { sub: r.title === rel ? "" : rel });
@@ -1338,9 +1457,14 @@ export function ModelPage({ active, libraryAsked, currentAsked }) {
   const pickedModel = picked ? places.flatMap(modelsOf).find((m) => m.name === picked) : null;
   const shownRows = hubTab ? (hub && hub.repo === repoSel ? (hub.j.ggufs || []).filter(whole).map((g) => g.name) : [])
                   : pickedModel ? [pickedModel.name]
-                  : atCache ? local.filter((m) => m.source === "hub" && m.kind !== "drafter" && m.kind !== "mmproj").map((m) => m.name)
-                  : dir ? dir.models.filter((m) => m.kind !== "mmproj" && m.kind !== "drafter").map((m) => m.name) : [];
+                  : atCache ? local.filter((m) => m.source === "hub" && standalone(m)).map((m) => m.name)
+                  : dir ? dir.models.filter(standalone).map((m) => m.name) : [];
   const cmdModel = shownRows.includes(target) ? target : loadedWant ? loadedWant.model : L.remembered ? L.remembered.model : "";
+  // The Hub's adapters, asked for when the LoRA tab is shown, again for another model or another base.  A base typed
+  // by hand is the model's then shown: another model's is its own again.
+  useEffect(() => setLoraBase(""), [cmdModel]);
+  const loraKey = view === "current" && stab === "lora" ? (loraBase || "model:" + cmdModel) : "";
+  useEffect(() => { if (loraKey) findLoras(loraBase, cmdModel); }, [loraKey]);
   const again = L.remembered ? { model: L.remembered.model, load: () => loadModel(L.remembered.model, L.remembered) } : null;
   const retryWant = L.target
     ? (lastAttempt.current && lastAttempt.current.model === L.target ? lastAttempt.current
@@ -1368,7 +1492,7 @@ export function ModelPage({ active, libraryAsked, currentAsked }) {
           <div class="seg" role="tablist" id="src-seg">
             <button role="tab" data-src="hub" aria-selected=${String(hubTab)} onClick=${() => setTab("hub")}><${Icon} name="hf"/>Hugging Face</button>
             <button role="tab" data-src="local" aria-selected=${String(!hubTab)} onClick=${() => setTab("local")}>
-              <${Icon} name="machine"/>${t("On this machine")}${local.length ? html`<span class="n" id="mf-count">${local.filter((m) => m.kind !== "drafter" && m.kind !== "mmproj").length}</span>` : ""}</button>
+              <${Icon} name="machine"/>${t("On this machine")}${local.length ? html`<span class="n" id="mf-count">${local.filter(standalone).length}</span>` : ""}</button>
           </div>
           <label class="search"><${Icon} name="search"/>
             ${hubTab ? html`<input type="text" id="hf-q" placeholder=${t("Search Hugging Face, or give a repository: org/name")} spellcheck="false" autocomplete="off"

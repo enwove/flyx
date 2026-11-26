@@ -30,6 +30,7 @@ struct Fetched {
   std::string mmproj;                 // path to multimodal vision projector GGUF (empty: none)
   std::string mmproj_source;          // display label: repo/path (Hub) or local path
   std::optional<uint64_t> mmproj_size;  // bytes on disk
+  std::string lora;                   // the LoRA adapter's directory (fetch_lora; empty: none)
   std::string name;                   // the model's name for the API: its file's, without the extension
   std::vector<std::string> notes;     // for the log: a drafter published for this model, the MTP file taken
   std::vector<DrafterSource> drafter_sources;  // what the model drafts with: its own MTP layer, the files above
@@ -37,10 +38,17 @@ struct Fetched {
 };
 
 // Fetches what is missing. want_mtp: take the repository's MTP file for a GGUF without the layer.
-// want_vision: take the repository's mmproj GGUF when no explicit mmproj path was given.
+// want_vision: take the repository's mmproj GGUF when no explicit mmproj path was given.  lora: an adapter
+// (fetch_lora; empty: none).
 bool fetch_model(const std::string& model, const std::vector<std::string>& drafters, bool want_mtp,
                  const hub::ProgressFn& progress, const std::atomic<bool>* stop, Fetched* out, std::string* err,
-                 const std::string& mmproj = "", bool want_vision = true);
+                 const std::string& mmproj = "", bool want_vision = true, const std::string& lora = "");
+
+// A LoRA adapter as Hugging Face PEFT saves it: a directory as it is, else a Hub repository's adapter_config.json
+// and adapter_model.safetensors fetched into the cache, "org/name" at its top, "org/name:FOLDER" in a folder of it
+// (a repository of several: the folder's path or its last part), "@REV" for a revision.  `path`: the directory.
+bool fetch_lora(const std::string& spec, const hub::ProgressFn& progress, const std::atomic<bool>* stop,
+                std::string* path, std::string* err);
 
 // Whether `eo` drafts with the MTP layer when the model has one (not --no-spec, not --drafter dflash2 or none).
 bool wants_mtp(const EngineOptions& eo);
@@ -51,7 +59,8 @@ std::vector<std::string> known_drafters(const std::vector<std::string>& base_mod
 // Throttled Hub fetch progress logger writing to stderr, optionally forwarding every tick to `hook`.
 hub::ProgressFn make_progress_logger(const char* prefix, double interval_ms, hub::ProgressFn hook = {});
 
-// The command line's way: the model and --drafter-file arguments made paths in place, progress on standard error.
+// The command line's way: the model, --drafter-file and --lora arguments made paths in place, progress on standard
+// error.
 bool fetch_named(std::string* model, EngineOptions* eo, std::string* err);
 
 // A model's name for the API from its path: the file's name without .gguf / .flyx.
@@ -64,12 +73,12 @@ int gguf_mtp_layers(const std::string& path);
 
 // Model files in directories of the user's own (flyx serve --models-dir, FLYX_MODELS_DIR), found by name: *.gguf
 // (not projectors, importance matrices or MTP layers; complete split GGUFs grouped as one entry pointing to shard 1
-// with their summed size) and *.flyx,
+// with their summed size), *.flyx, and LoRA adapters' folders (adapter_config.json beside adapter_model.safetensors),
 // at most 6 directories down, hidden directories and node_modules left out.  No file is opened.
 struct LocalModel {
   std::string path;   // absolute
   std::string file;   // its name
-  std::string kind;   // "gguf", "flyx", or "mmproj"
+  std::string kind;   // "gguf", "flyx", "mmproj", "drafter", or "lora" (a PEFT adapter: path its folder)
   std::string quant;  // from the name, "" when it names none
   uint64_t size = 0;
   int parts = 0;  // > 1 for a complete split GGUF (path points to shard 1, size is the sum)

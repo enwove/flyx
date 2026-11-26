@@ -36,6 +36,15 @@ using os::to_path;
 constexpr const char* kConfig = "adapter_config.json";
 constexpr const char* kWeights = "adapter_model.safetensors";
 
+// A string of a file as an error message or a listing shows it: at most its first 117 bytes and "...", cut between
+// two UTF-8 characters (JSON's strings are UTF-8: a character cut in two would not dump).
+std::string shown(const std::string& s) {
+  if (s.size() <= 120) return s;
+  size_t n = 117;
+  while (n > 0 && (static_cast<unsigned char>(s[n]) & 0xC0) == 0x80) --n;
+  return s.substr(0, n) + "...";
+}
+
 int dtype_of(const std::string& s) {
   static const std::map<std::string, int> m = {{"BF16", FLYX_DT_BF16}, {"F16", FLYX_DT_F16}, {"F32", FLYX_DT_F32}};
   auto it = m.find(s);
@@ -108,6 +117,9 @@ json lora_config(const json& c) {
 //                                                                                        that extract a LoRA by SVD
 //                                                                                        name it)
 bool parse_name(const std::string& name, int* layer, std::string* linear, char* side, std::string* why) {
+  // Longer than any model's (the longest above is 85 bytes): refused before the regex, whose backtracking takes a
+  // frame of the stack a character.
+  if (name.size() > 256) return *why = "a name of " + std::to_string(name.size()) + " bytes, not a decoder layer's LoRA", false;
   static const std::regex re(
       R"(^(?:base_model\.model\.)?(?:model\.)?(?:language_model\.)?(?:model\.)?layers\.(\d+)\.)"
       R"((self_attn|mlp|linear_attn)\.(\w+)\.(?:lora_(A|B)(?:\.\w+)?\.weight|weight\.lora_(A|B)(?:\.\w+)?)$)");
@@ -137,7 +149,78 @@ bool parse_name(const std::string& name, int* layer, std::string* linear, char* 
   return true;
 }
 
+// One tensor of the safetensors header as read_peft_dir reads it: a decoder layer's linear, F32, BF16 or F16, lora_A
+// [r, in] or lora_B [out, r].  false with `why` (its name first).
+struct Tensor {
+  int layer = 0, dtype = -1;
+  std::string linear;
+  char side = 0;
+  std::vector<int64_t> shape;
+};
+bool check_tensor(const std::string& key, const json& r, int64_t rank, Tensor* t, std::string* why) {
+  const std::string name = shown(key);
+  std::string no;
+  if (!parse_name(key, &t->layer, &t->linear, &t->side, &no)) return *why = name + ": " + no, false;
+  const std::string dtype = shown(r.at("dtype").get<std::string>());
+  t->dtype = dtype_of(dtype);
+  if (t->dtype < 0) return *why = name + ": dtype " + dtype + " (F32, BF16 or F16)", false;
+  t->shape = r.at("shape").get<std::vector<int64_t>>();
+  if (t->shape.size() != 2 || t->shape[0] <= 0 || t->shape[1] <= 0) return *why = name + ": not a matrix", false;
+  if ((t->side == 'A' ? t->shape[0] : t->shape[1]) != rank)
+    return *why = name + ": shape [" + std::to_string(t->shape[0]) + ", " + std::to_string(t->shape[1]) +
+                  "] is not of rank r = " + std::to_string(rank) + " (lora_A [r, in], lora_B [out, r])",
+           false;
+  return true;
+}
+
 }  // namespace
+
+bool peft_config_ok(const std::string& text, PeftConfig* out, std::string* why) {
+  try {
+    if (!interfaces::json_depth_within(text)) throw std::runtime_error("nested too deeply");
+    const json c = json::parse(text);
+    if (!c.is_object()) throw std::runtime_error("not a JSON object");
+    if (c.contains("base_model_name_or_path") && c["base_model_name_or_path"].is_string())
+      out->base = shown(c["base_model_name_or_path"].get<std::string>());
+    if (c.contains("target_modules") && c["target_modules"].is_string())
+      out->targets = {shown(c["target_modules"].get<std::string>())};
+    else if (c.contains("target_modules") && c["target_modules"].is_array())
+      for (const json& t : c["target_modules"])
+        if (t.is_string() && out->targets.size() < 64) out->targets.push_back(shown(t.get<std::string>()));
+    const json lora = lora_config(c);
+    out->rank = int(lora["rank"].get<int64_t>());
+    out->scale = lora["scale"].get<double>();
+    return true;
+  } catch (const std::exception& e) {
+    *why = e.what();
+    return false;
+  }
+}
+
+bool peft_header_ok(const std::string& header, int rank, std::string* why, std::vector<std::string>* linears,
+                    int* layers) {
+  try {
+    if (!interfaces::json_depth_within(header)) throw std::runtime_error("nested too deeply");
+    const json h = json::parse(header);
+    if (!h.is_object()) throw std::runtime_error("not a JSON object");
+    std::set<std::string> seen;
+    int last = 0;
+    for (auto it = h.begin(); it != h.end(); ++it) {
+      if (it.key() == "__metadata__") continue;
+      Tensor t;
+      if (!check_tensor(it.key(), it.value(), rank, &t, why)) return false;
+      seen.insert(t.linear);
+      last = std::max(last, t.layer + 1);
+    }
+    if (seen.empty()) return *why = std::string("no LoRA tensors in ") + kWeights, false;
+    if (linears) linears->assign(seen.begin(), seen.end());
+    if (layers) *layers = last;
+    return true;
+  } catch (const std::exception& e) {
+    *why = e.what();
+    return false;
+  }
+}
 
 bool is_peft_dir(const std::string& path) {
   std::error_code ec;
@@ -177,21 +260,16 @@ bool read_peft_dir(const std::string& dir, std::vector<std::unique_ptr<os::Mappe
     int layers = 0;
     for (auto it = h.begin(); it != h.end(); ++it) {
       if (it.key() == "__metadata__") continue;
-      int layer = 0;
-      std::string linear, why;
-      char side = 0;
-      if (!parse_name(it.key(), &layer, &linear, &side, &why)) return *err = dir + ": " + it.key() + ": " + why, false;
-      const json& r = it.value();
+      Tensor t;
+      std::string why;
+      if (!check_tensor(it.key(), it.value(), rank, &t, &why)) return *err = dir + ": " + why, false;
+      const int layer = t.layer;
+      const std::string& linear = t.linear;
+      const char side = t.side;
+      const std::vector<int64_t>& shape = t.shape;
+      const auto offsets = it.value().at("data_offsets").get<std::vector<uint64_t>>();
       flyx_tensor_view v{};
-      v.dtype = dtype_of(r.at("dtype").get<std::string>());
-      const auto shape = r.at("shape").get<std::vector<int64_t>>();
-      const auto offsets = r.at("data_offsets").get<std::vector<uint64_t>>();
-      if (v.dtype < 0) return *err = dir + ": " + it.key() + ": dtype " + r.at("dtype").get<std::string>() + " (F32, BF16 or F16)", false;
-      if (shape.size() != 2 || shape[0] <= 0 || shape[1] <= 0) return *err = dir + ": " + it.key() + ": not a matrix", false;
-      if ((side == 'A' ? shape[0] : shape[1]) != rank)
-        return *err = dir + ": " + it.key() + ": shape [" + std::to_string(shape[0]) + ", " + std::to_string(shape[1]) +
-                      "] is not of rank r = " + std::to_string(rank) + " (lora_A [r, in], lora_B [out, r])",
-               false;
+      v.dtype = t.dtype;
       if (offsets.size() != 2 || offsets[0] > offsets[1] || offsets[1] > data_size)
         return *err = dir + ": " + it.key() + ": outside the file (truncated download?)", false;
       uint64_t want = 0;

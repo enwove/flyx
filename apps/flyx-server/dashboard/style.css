@@ -990,3 +990,22 @@ td.txt1.muted { color: var(--muted); }
 .hint-marks { display: inline-flex; gap: 6px; align-items: center; color: var(--muted); }
 .hint-marks .agent-logo { width: 16px; height: 16px; }
 
+
+/* The LoRA tab's adapters on Hugging Face: a base to ask for, its repositories, one opened to its adapters. */
+.lora-hub-h { margin-top: 18px; }
+.lora-base { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; margin: 4px 0 10px; }
+.lora-base input { flex: 1 1 220px; min-width: 0; }
+.lora-hub { display: flex; flex-direction: column; border: 1px solid var(--border); border-radius: 8px; overflow: hidden; }
+.lora-repo + .lora-repo { border-top: 1px solid var(--border); }
+.lora-repo-h { display: flex; width: 100%; align-items: center; gap: 8px; padding: 9px 12px; background: none; border: 0;
+               color: inherit; font: inherit; text-align: left; cursor: pointer; }
+.lora-repo-h b { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; min-width: 0; }
+.lora-repo-h .pm { margin-left: auto; display: inline-flex; align-items: center; gap: 4px; color: var(--faint); font-size: 12px; flex: none; }
+.lora-repo-h:hover, .lora-repo.open .lora-repo-h { background: color-mix(in srgb, var(--accent) 6%, transparent); }
+.lora-ads { padding: 2px 12px 10px 24px; display: flex; flex-direction: column; }
+.lora-ad { display: flex; align-items: center; gap: 12px; padding: 8px 0; border-top: 1px dashed var(--border); }
+.lora-ad:first-child { border-top: 0; }
+.lora-ad .grow { flex: 1; min-width: 0; display: flex; flex-direction: column; gap: 4px; }
+.lora-ad .sd-what { overflow-wrap: anywhere; }
+.lora-ad.no .sd-what { color: var(--danger); }
+.lora-ad.sel b { color: var(--accent); }

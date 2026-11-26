@@ -80,5 +80,21 @@ bool read_drafter_dir(const std::string& dir, std::vector<std::unique_ptr<os::Ma
 bool is_peft_dir(const std::string& path);
 bool read_peft_dir(const std::string& dir, std::vector<std::unique_ptr<os::MappedFile>>* maps,
                    ModelFile::Contents* out, std::string* err);
+// What an adapter_config.json says of its adapter, for a list of them: rank, scale (alpha / r, or / sqrt(r)), the
+// model it was trained on and the modules it targets ("" and none when not strings; a regex is one).
+struct PeftConfig {
+  int rank = 0;
+  double scale = 0;
+  std::string base;
+  std::vector<std::string> targets;
+};
+// Whether an adapter_config.json's text is one read_peft_dir takes (plain LoRA, read_peft_dir's rules for the config;
+// its tensors' names are checked only when it is read).  false with *why; *out filled as far as the text is JSON.
+bool peft_config_ok(const std::string& text, PeftConfig* out, std::string* why);
+// Whether adapter_model.safetensors's header (its JSON, without the 8 bytes of its length) holds what read_peft_dir
+// reads for an adapter of rank r: decoder layers' linears, F32, BF16 or F16, [r, in] and [out, r].  false with *why;
+// *linears: those it sits beside ("attn.q", "gdn.qkv", ...), *layers: one past its last layer.
+bool peft_header_ok(const std::string& header, int rank, std::string* why, std::vector<std::string>* linears = nullptr,
+                    int* layers = nullptr);
 
 }  // namespace flyx::modelfile
