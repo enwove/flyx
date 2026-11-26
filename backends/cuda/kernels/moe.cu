@@ -1137,6 +1137,36 @@ __global__ void __launch_bounds__(256) k_moe_prefetch(const float* scores, int E
   }
 }
 
+// Many blocks (moe_prefetch_mixed): block (j, q) asks L2 for plane q of the expert whose score ranks j-th (higher
+// first, lower index on ties), a 16 KB piece a thread, so the requests go out at once.
+__global__ void __launch_bounds__(256) k_moe_prefetch_wide(const float* scores, int E, PrefetchPlane p0,
+                                                           PrefetchPlane p1, PrefetchPlane p2, PrefetchPlane p3) {
+  __shared__ float s_sc[256];
+  __shared__ int s_e;
+  const int tid = threadIdx.x, j = blockIdx.x;
+  if (tid == 0) s_e = -1;
+  if (tid < E) s_sc[tid] = scores[tid];
+  __syncthreads();
+  if (tid < E) {
+    const float v = s_sc[tid];
+    int rank = 0;
+    for (int i = 0; i < E; ++i) rank += s_sc[i] > v || (s_sc[i] == v && i < tid);
+    if (rank == j) s_e = tid;
+  }
+  __syncthreads();
+  const int e = s_e;
+  const PrefetchPlane pl = blockIdx.y == 0 ? p0 : blockIdx.y == 1 ? p1 : blockIdx.y == 2 ? p2 : p3;
+  if (e < 0 || !pl.base) return;
+  constexpr size_t kPiece = 16384;
+  const uint8_t* a = pl.base + size_t(e) * pl.per_expert;
+  const size_t pieces = (pl.per_expert + kPiece - 1) / kPiece;
+  for (size_t c = tid; c < pieces; c += blockDim.x) {
+    const size_t off = c * kPiece;
+    const uint32_t n = uint32_t(min(kPiece, pl.per_expert - off)) & ~15u;
+    if (n && ((reinterpret_cast<uintptr_t>(a + off) & 15u) == 0)) l2_prefetch_bulk(a + off, n);
+  }
+}
+
 }  // namespace
 
 const MoeDp4aConfig kMoeDp4aConfigs[] = {
@@ -1171,6 +1201,36 @@ int moe_gate_up_dp4a(int tuning, int dtype, int rows) {
     if (r.sku == s && (r.dtype == dtype || r.dtype < 0) && rows >= r.lo && rows <= r.hi) return r.cfg;
   // gen_gemm_tables.py: every list of these rules ends with one for the rest
   throw std::runtime_error("moe_gate_up: no rule for " + std::to_string(rows) + " rows (variants)");
+}
+
+void moe_prefetch_mixed(const float* x, const float* norm_w, float norm_offset, const bf16* router_b16,
+                        const float* router_f32, const float* bias, bool gating_sigmoid, int E, int top_k, int H,
+                        int I, const ExpertMat& gate_up, const ExpertMat& down, float* scores, int planes,
+                        cudaStream_t st) {
+  if (!x || !scores || E <= 0 || E > 256 || top_k <= 0 || top_k > std::min(E, kRouteTop)) return;
+  if (!router_b16 && !router_f32) return;
+  if (!gate_up.q || !gate_up.s || !down.q || !down.s || gate_up.packed() || down.packed()) return;
+  const int grid = (E + kGuessWarps - 1) / kGuessWarps;
+  if (router_b16)
+    k_moe_guess<bf16><<<grid, 32 * kGuessWarps, 0, st>>>(x, norm_w, norm_offset, router_b16, bias, int(gating_sigmoid),
+                                                          E, H, scores);
+  else
+    k_moe_guess<float><<<grid, 32 * kGuessWarps, 0, st>>>(x, norm_w, norm_offset, router_f32, bias,
+                                                           int(gating_sigmoid), E, H, scores);
+  if (!planes) return;
+  const size_t gu_n = size_t(gate_up.N), dn_n = size_t(down.N);
+  const PrefetchPlane none{nullptr, 0};
+  // The best-scored guesses only (FLYX_GUESS_K, default 4): the rest are wrong more often than the bandwidth pays.
+  static const int guess_k = [] {
+    const char* e = std::getenv("FLYX_GUESS_K");
+    return e ? std::atoi(e) : 4;
+  }();
+  const int k = guess_k > 0 ? std::min(guess_k, top_k) : top_k;
+  k_moe_prefetch_wide<<<dim3(k, 4), 256, 0, st>>>(
+      scores, E, (planes & 1) ? PrefetchPlane{gate_up.q, gu_n * size_t(H) / 2} : none,
+      (planes & 2) ? PrefetchPlane{gate_up.s, gu_n * size_t(H) / 16} : none,
+      (planes & 4) ? PrefetchPlane{down.q, dn_n * size_t(I) / 2} : none,
+      (planes & 8) ? PrefetchPlane{down.s, dn_n * size_t(I) / 16} : none);
 }
 
 void moe_stage_q8(const float* x, int ldx, int K, int rows, const MoeScratch& sc, bool mins, cudaStream_t st) {

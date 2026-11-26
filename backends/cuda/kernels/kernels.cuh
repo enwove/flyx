@@ -1726,6 +1726,12 @@ void rmsnorm_moe_q8(const float* x, int ldx, const float* w, float offset, float
 void moe_prefetch(const float* x, const float* norm_w, float norm_offset, const bf16* router_b16,
                   const float* router_f32, const float* bias, bool gating_sigmoid, int E, int top_k, int H, int I,
                   const ExpertMat& gate_up, const ExpertMat& down, float* scores, cudaStream_t st);
+// moe_prefetch's guess from an already mixed row x, then planes (1 gate|up codes, 2 their scales, 4 down codes, 8
+// theirs) of its top_k experts asked of L2 by many blocks at once.  Changes no result.
+void moe_prefetch_mixed(const float* x, const float* norm_w, float norm_offset, const bf16* router_b16,
+                        const float* router_f32, const float* bias, bool gating_sigmoid, int E, int top_k, int H,
+                        int I, const ExpertMat& gate_up, const ExpertMat& down, float* scores, int planes,
+                        cudaStream_t st);
 // Byte ranges for L2 (l2_warm): asks L2 for them on st and returns; changes no result.
 struct L2Ranges {
   const void* p[8] = {};

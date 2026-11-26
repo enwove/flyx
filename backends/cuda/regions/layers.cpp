@@ -897,6 +897,30 @@ void rel_attn_layer(const Pass& ps, const RelAttnBlock& a, bool fused) {
       if (warm & 8) r.add(rv.b.res_bank, size_t(ps.res->res_n) * R * HH * 4);
       warm_side(s, st, r);
     }
+    // The next MoE's experts guessed from the bank as it stands mixed with its query (the attention's output not yet
+    // in it; 65% of the experts right, against 8% from the residual row alone), and asked of L2 while the attention
+    // runs (FLYX_GUESS: planes mask, moe_prefetch_mixed; 16 the guess alone; 0 off).  Changes no result.  RTX 5090,
+    // Inkling-2-Mini UD-IQ4_XS plain decoding, top 4 guesses (FLYX_GUESS_K): 0 215.7, 1 (gate|up codes) 220.4,
+    // 5 (and down codes) 221.5, 15 (and scales) 218.1 tok/s; with all 8 guesses 5 214.2.  35k-token prompt: 165.7 -> 167.4.
+    static const int guess_planes = [] {
+      const char* e = std::getenv("FLYX_GUESS");
+      return e ? std::atoi(e) : 5;
+    }();
+    if (guess_planes > 0 && R == 1 && ps.next_moe && ps.next_moe->res_query && rv.b.moe_guess &&
+        s->expert_side.st && ps.round) {
+      const MoeBlock& f = *ps.next_moe;
+      const SideStream& es = s->expert_side;
+      float* mixed = rv.b.moe_guess + f.n_experts;
+      CK(cudaEventRecord(es.fork, st));
+      CK(cudaStreamWaitEvent(es.st, es.fork, 0));
+      attn_res_mix(rv.b.res_bank, ps.res->res_n, x_dst, f.res_query, 1, 1, H, mixed, es.st);
+      const bf16* rb = f.router.round.b16 ? f.router.round.b16 : (f.router.round.f32 ? nullptr : f.router.w);
+      moe_prefetch_mixed(mixed, f.norm.w, f.norm.offset, rb, rb ? nullptr : f.router.round.f32, f.router_bias,
+                         f.gating_sigmoid, f.n_experts, f.top_k, f.hidden, f.inter, f.gate_up, f.down, rv.b.moe_guess,
+                         guess_planes & 15, es.st);
+      CK(cudaEventRecord(es.join, es.st));
+      s->warm_out = true;
+    }
     in_raw[0] = rv.b.attn_in;
     in_raw[1] = is_swa ? rv.b.attn_in : rv.b.attn_in + size_t(R) * H;
     in_raw[2] = is_swa ? rv.b.attn_in : rv.b.attn_in + size_t(2) * R * H;
