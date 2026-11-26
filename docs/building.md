@@ -27,7 +27,7 @@ Defined in [CMakePresets.json](../CMakePresets.json).
 | `dev-windows` | Windows (MSVC) | `%USERPROFILE%\flyx-build` | Release + tests, local GPU arch |
 | `cpu-windows` | Windows (MSVC) | `%USERPROFILE%\flyx-build-cpu` | CPU-only + tests |
 | `release-linux` | Linux / WSL2 | `~/flyx-build-release` | Static runtime, multi-arch (`sm_80,89,90,100,120` + `compute_120` PTX), compressed fatbins, pruned candidates |
-| `release-windows` | Windows (MSVC) | `%USERPROFILE%\flyx-build-release` | Windows desktop/workstation multi-arch (`sm_80,89,120` + `compute_120` PTX; omits datacenter-only `sm_90,100`), `FLYX_TESTS=OFF` |
+| `release-windows` | Windows (MSVC) | `%USERPROFILE%\flyx-build-release` | Windows desktop/workstation multi-arch (`sm_80,89,120` machine code only, no PTX, to keep the single `.exe` near 50 MB; omits datacenter-only `sm_90,100`), `FLYX_TESTS=OFF` |
 
 ```sh
 # Linux / WSL2 development build + tests
@@ -44,7 +44,7 @@ Build outputs in `<build-dir>/bin`: `flyx` (CLI + `flyx serve`; `flyx-server` sy
 | Option | Default (`dev` / `release`) | Effect |
 |---|---|---|
 | `FLYX_CUDA` | `ON` | Build CUDA backend (`OFF` for CPU-only). |
-| `FLYX_CUDA_ARCHS` | local GPU / Linux: `80;89;90;100;120;120-virtual`, Win: `80;89;120;120-virtual` | Semicolon-separated SM architectures (≥ 8.0). |
+| `FLYX_CUDA_ARCHS` | local GPU / Linux: `80;89;90;100;120;120-virtual`, Win: `80;89;120` (no PTX: a GPU of a later architecture than sm_120 needs the Linux package or a build of its own) | Semicolon-separated SM architectures (≥ 8.0). |
 | `FLYX_TESTS` | `ON` (`dev`) / `OFF` (`release-windows`) | Build unit, op, golden, and server tests (plus `flyx-trace` when CUPTI is present). |
 | `FLYX_STATIC_RUNTIME` | `OFF` / `ON` | Statically link C++/CUDA runtimes for portable release binaries. |
 | `FLYX_STANDALONE_EXE` | `OFF` | Also build a single-file `flyx-standalone` executable with `cuda` and `cpu_ref` backends linked in. |
