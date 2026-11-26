@@ -811,8 +811,25 @@ void rel_attn_layer(const Pass& ps, const RelAttnBlock& a, bool fused) {
   float* rep = ps.round ? sc.replay : nullptr;
   const size_t rep_stride = ps.round ? sc.r_stride : 0;
 
-  if (a.loop_msg_query)
-    attn_res_mix(rv.b.loop_bank, ps.res->loop_n, rv.b.loop_bank_out, a.loop_msg_query, 4, R, H, rv.b.loop_msg, st);
+  // The loop messages read only the loop bank, which no kernel of the pass writes: on the side stream beside the
+  // sublayer's mix, joined before the controllers read them (FLYX_SIDE_LOOP_MSG=0: in turn).  Same bits.
+  static const bool loop_msg_env = [] {
+    const char* e = std::getenv("FLYX_SIDE_LOOP_MSG");
+    return !e || std::atoi(e) != 0;
+  }();
+  bool loop_msg_side = false;
+  if (a.loop_msg_query) {
+    if (loop_msg_env && ps.round && L.side && L.side->st && (!L.opt || L.opt->side_stream)) {
+      CK(cudaEventRecord(L.side->fork, st));
+      CK(cudaStreamWaitEvent(L.side->st, L.side->fork, 0));
+      attn_res_mix(rv.b.loop_bank, ps.res->loop_n, rv.b.loop_bank_out, a.loop_msg_query, 4, R, H, rv.b.loop_msg,
+                   L.side->st);
+      CK(cudaEventRecord(L.side->join, L.side->st));
+      loop_msg_side = true;
+    } else {
+      attn_res_mix(rv.b.loop_bank, ps.res->loop_n, rv.b.loop_bank_out, a.loop_msg_query, 4, R, H, rv.b.loop_msg, st);
+    }
+  }
 
   // A fused round's producers write a projection's input as its GEMM reads it, in the launch that computes it; the
   // generic layer stages it from float32 rows in a launch of its own for each reader.
@@ -896,6 +913,7 @@ void rel_attn_layer(const Pass& ps, const RelAttnBlock& a, bool fused) {
       in_raw[2] = is_swa ? rv.b.attn_in : rv.b.attn_in + size_t(2) * R * H;
     }
   }
+  if (loop_msg_side) CK(cudaStreamWaitEvent(st, L.side->join, 0));
   if (a.loop_rank > 0 && loop_as_round(ps)) {
     // The q, k and v controllers at once, each writing where its input was mixed (attn_in + j R H).  An SWA block
     // mixes one input for all three there, which the first would write over while the others read it: that one
