@@ -49,6 +49,7 @@ bool same_tokens(const std::vector<int32_t>& got, const std::vector<int32_t>& wa
 struct Load {
   bool speculative = false;
   int prefill_chunk = 16;
+  int max_ctx = 256;
   std::string drafter = "mtp";  // when speculative
   std::vector<std::string> drafter_files{};
   std::string options{};  // backend options, after the tested backend's own
@@ -62,7 +63,7 @@ std::unique_ptr<Engine> engine(const std::string& path, const std::string& backe
   options.backend = backend;
   if (backend == tested) options.backend_options = tested_options;
   if (!how.options.empty()) options.backend_options += (options.backend_options.empty() ? "" : ",") + how.options;
-  options.max_ctx = 256;
+  options.max_ctx = how.max_ctx;
   options.prefill_chunk = how.prefill_chunk;
   options.lookup = false;
   options.width = !how.speculative ? 0 : how.drafter == "mtp" ? 3 : 15;  // the reference's rounds
@@ -389,6 +390,84 @@ void dflash_file(const std::string& dir, const std::string& backend) {
         same_drafts = a[i].n_drafts == b[i].n_drafts &&
                       std::equal(a[i].drafts, a[i].drafts + a[i].n_drafts, b[i].drafts);
       check(same_drafts, which + ": fused == generic (fusion=0) tokens and drafts");
+    }
+    // Sliding-window DFlash2 KV ring buffer: with max_ctx=512, prefill_chunk=64, window=8, the context cache wraps
+    // around a 128-slot ring multiple times over a 300-token prompt + 48 generated tokens, shrinking session VRAM
+    // while reproducing flat (dflash_ring=0) drafts and target tokens bit-for-bit, including across snapshots.
+    if (backend != "cpu_ref") {
+      std::vector<int32_t> wrap_p;
+      while (wrap_p.size() < 300) wrap_p.insert(wrap_p.end(), p.begin(), p.end());
+      wrap_p.resize(300);
+      const Load ring_load = {.speculative = true,
+                              .prefill_chunk = 64,
+                              .max_ctx = 512,
+                              .drafter = "dflash2",
+                              .drafter_files = {window_gguf}};
+      Load flat_load = ring_load;
+      flat_load.options = "dflash_ring=0";
+      auto ring_eng = engine(dir + "/tiny_gguf.gguf", backend, ring_load);
+      auto flat_eng = engine(dir + "/tiny_gguf.gguf", backend, flat_load);
+      uint64_t ring_bytes = 0, flat_bytes = 0;
+      const bool sized = ring_eng->api()->seq_bytes(ring_eng->bmodel(), 512, &ring_bytes) == 0 &&
+                         flat_eng->api()->seq_bytes(flat_eng->bmodel(), 512, &flat_bytes) == 0;
+      check(sized && ring_bytes < flat_bytes,
+            "sliding-window DFlash2 ring shrinks session VRAM (" + std::to_string(ring_bytes) + " < " +
+                std::to_string(flat_bytes) + ")");
+      std::vector<int32_t> tr_toks, fl_toks;
+      const auto tr = traced(*ring_eng, wrap_p, 48, &tr_toks);
+      const auto fl = traced(*flat_eng, wrap_p, 48, &fl_toks);
+      bool same_ring = same_tokens(tr_toks, fl_toks) && tr.size() == fl.size() && tr.size() > 1;
+      for (size_t i = 1; same_ring && i < tr.size(); ++i)
+        same_ring = tr[i].n_drafts == fl[i].n_drafts &&
+                    std::equal(tr[i].drafts, tr[i].drafts + tr[i].n_drafts, fl[i].drafts);
+      check(same_ring, "sliding-window DFlash2 ring across wraps: bit-identical tokens and drafts vs flat");
+      // Snapshot round-trip after ring wrap: saved ring restores bit-identical continuation and drafts.
+      {
+        const auto* api = ring_eng->api();
+        Session src(ring_eng.get()), dst(ring_eng.get());
+        std::string err;
+        bool ok = src.init(&err) && dst.init(&err);
+        for (size_t off = 0; ok && off < wrap_p.size(); off += 64) {
+          const int32_t n = int32_t(std::min<size_t>(64, wrap_p.size() - off));
+          ok = api->prefill(ring_eng->prefill_plan(), src.seq(), wrap_p.data() + off, n, nullptr) == 0;
+        }
+        const int32_t ck_pos = ok ? api->checkpoint(src.seq(), 0) : -1;
+        uint64_t sb = 0;
+        ok = ok && ck_pos == int32_t(wrap_p.size()) && api->snapshot_bytes(src.seq(), 0, 0, &sb) == 0 && sb > 0;
+        std::vector<uint8_t> buf(size_t(std::max<uint64_t>(1, sb)));
+        void* q = buf.data();
+        flyx_host_pieces pieces{&q, 1, 0, sb};
+        ok = ok && api->snapshot_save(src.seq(), 0, 0, &pieces, sb) == ck_pos;
+        ok = ok && api->snapshot_load(dst.seq(), &pieces, sb, wrap_p.back()) == ck_pos;
+        Session flat_s(flat_eng.get());
+        ok = ok && flat_s.init(&err);
+        for (size_t off = 0; ok && off < wrap_p.size(); off += 64) {
+          const int32_t n = int32_t(std::min<size_t>(64, wrap_p.size() - off));
+          ok = flat_eng->api()->prefill(flat_eng->prefill_plan(), flat_s.seq(), wrap_p.data() + off, n, nullptr) == 0;
+        }
+        auto run_from = [&](Engine& e, Session& s, std::vector<int32_t>* toks, std::vector<int32_t>* dr) {
+          flyx_gen_params g{};
+          g.top_p = 1.f;
+          flyx_round_result rr{};
+          const int32_t extra_tok = p.front();
+          if (e.api()->prefill(e.prefill_plan(), s.seq(), &extra_tok, 1, &g) != 0 ||
+              e.api()->read(s.seq(), &rr) != 0 || rr.n_tokens != 1)
+            return false;
+          toks->push_back(rr.tokens[0]);
+          while (toks->size() < 24) {
+            if (e.api()->launch(e.round_plan(e.widths().size() - 1), s.seq(), &g) != 0 ||
+                e.api()->read(s.seq(), &rr) != 0 || rr.n_tokens <= 0)
+              return false;
+            dr->insert(dr->end(), rr.drafts, rr.drafts + rr.n_drafts);
+            for (int k = 0; k < rr.n_tokens && toks->size() < 24; ++k) toks->push_back(rr.tokens[k]);
+          }
+          return true;
+        };
+        std::vector<int32_t> got_snap, want_snap, got_dr, want_dr;
+        ok = ok && run_from(*ring_eng, dst, &got_snap, &got_dr) && run_from(*flat_eng, flat_s, &want_snap, &want_dr);
+        check(ok && same_tokens(got_snap, want_snap) && !got_dr.empty() && got_dr == want_dr,
+              "sliding-window DFlash2 ring snapshot across wraps: bit-identical tokens and drafts vs flat");
+      }
     }
   }
   // The dense targets with a DFlash2 GGUF drafter made for them: Qwen3 (GGUF and .flyx) and Llama (plain and with

@@ -189,6 +189,29 @@ void test_attention(int hd, int rot, int nh, int nkv, int rows, int ctx, bool ca
       }
   }
   expect("attention " + tag, down(dout, out.size()), out, ctx > 1000 ? 1e-4 : 2e-5);  // float32 sums over the keys
+  if (window > 0) {  // sliding-window ring buffer (KvRef::ring > 0): bit-identical to flat cache across ring wraps
+    const int ring = window + rows + 7;
+    const size_t stride = size_t(nkv) * hd;
+    Vec Kring(size_t(ring) * stride, 0.0), Vring(size_t(ring) * stride, 0.0);
+    const int keep_from = std::max(0, ctx - ring);
+    for (int p = keep_from; p < ctx; ++p) {
+      const int cell = p % ring;
+      std::copy_n(&Kc[size_t(p) * stride], stride, &Kring[size_t(cell) * stride]);
+      std::copy_n(&Vc[size_t(p) * stride], stride, &Vring[size_t(cell) * stride]);
+    }
+    kv16 *dKr = up_f16(Kring), *dVr = up_f16(Vring);
+    float *dqr = dev<float>(q.size()), *doutr = dev<float>(out.size());
+    KvRef kvr;
+    kvr.k = dKr;
+    kvr.v = dVr;
+    kvr.ring = ring;
+    attn_prep(dqkv, ld, 0, 2 * nh * hd, 2 * nh * hd + nkv * hd, dqn, dkn, offset, 1e-6f, theta, rot, nh, nkv, hd, rows,
+              P, kPosPosition, false, dqr, kvr, 0);
+    attention_split(dqr, kvr, nh, nkv, hd, rows, causal, rows, float(1.0 / std::sqrt(hd)), P, dqkv + nh * hd, ld, doutr,
+                    nh * hd, part, splits, TL, 0, window);
+    expect("attention, sliding-window ring: same bits " + tag, down(doutr, out.size()), down(dout, out.size()), 0);
+    for (void* p : std::initializer_list<void*>{dKr, dVr, dqr, doutr}) CK(cudaFree(p));
+  }
   if (causal) {  // each row alone (decoding) gives the bits of all rows together (verification)
     const Vec all = down(dout, out.size());
     float* dout1 = dev<float>(out.size());

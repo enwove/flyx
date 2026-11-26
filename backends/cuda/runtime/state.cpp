@@ -618,6 +618,8 @@ void alloc_state(const flyx_bmodel* m, flyx_seq* s) {
   // The MTP layer's cache: its draft steps attend to its last mtp_window positions, which a ring holds
   // (with the rows a pass writes at once and those past the accepted ones besides).
   const int mtp_kv = m->mtp_block >= 0 ? block<AttnBlock>(m, block<MtpBlock>(m, m->mtp_block).attn).kv : -1;
+  const DFlashBlock* dflash = m->dflash_block >= 0 ? &block<DFlashBlock>(m, m->dflash_block) : nullptr;
+  const int dflash_kv = dflash ? dflash->kv : -1;
   for (const KvSpec& k : m->states.kv) {
     KvBuf b;
     int positions = s->cap;
@@ -635,6 +637,15 @@ void alloc_state(const flyx_bmodel* m, flyx_seq* s) {
       b.sink = mtp_copy ? 0 : m->opt.kernels.mtp_sink;  // with a copy, the copy has the first positions
       const int ring = (b.sink + std::max(b.window + 2 * FLYX_MAX_ROWS, s->rows_cap) + 63) / 64 * 64;
       if (m->opt.kernels.mtp_ring && ring < s->cap) b.ring = positions = ring;
+    } else if (int(s->kv.size()) == dflash_kv && dflash && dflash->window > 0) {
+      // Sliding-window DFlash2 context K/V: a draft block at position p attends to [p - window + 1, p + B),
+      // while a prefill pass writes up to s->rows_cap rows in parallel and rewinds may step back across
+      // FLYX_ROUND_SLOTS rounds of up to wide_rows rows. Keep at least window + extra slots so parallel
+      // prefill writes, mid-pass checkpoints, rejected rows, and rewinds never clobber live window keys.
+      const int B = std::max(dflash->block, FLYX_MAX_ROWS);
+      const int extra = std::max(s->rows_cap, FLYX_ROUND_SLOTS * std::max(B, m->wide_rows));
+      const int ring = (dflash->window + extra + 63) / 64 * 64;
+      if (m->opt.kernels.dflash_ring && ring < s->cap) b.ring = positions = ring;
     }
     b.layer_stride = size_t(positions) * k.nkv * k.hd;
     const size_t n = size_t(k.layers) * b.layer_stride;

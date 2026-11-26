@@ -363,8 +363,8 @@ struct KvBuf {
   uint8_t* hot = nullptr;
   int hot_bits = 0;
   size_t hot_tags = 0;  // slots, all heads
-  // The MTP layer's: its draft steps attend to its first `sink` positions and its last `window` (0:
-  // all), which a ring of `ring` slots holds (0: a slot a position).
+  // Sliding-window drafter caches (MTP's sink + window, or DFlash2's sliding window): `ring` physical slots
+  // holding positions via KvRef::slot_of (0: a slot a position). `window` / `sink` are MTP's gather parameters.
   int ring = 0, sink = 0, window = 0;
   // Pageable host K/V backing (Windows WDDM overflow): full [0, cap) cold K/V in pageable RAM while GPU k/v holds
   // [0, device_positions) plus a rolling tail ring (`page_ring` total slots, `page_safe` guaranteed valid in ring).
@@ -418,6 +418,14 @@ struct KvBuf {
   }
   kv16* k16(int layer = 0) const { return static_cast<kv16*>(k) + size_t(layer) * layer_stride; }
   kv16* v16(int layer = 0) const { return static_cast<kv16*>(v) + size_t(layer) * layer_stride; }
+  KvRef layer_ref(int layer) const {
+    KvRef r;
+    r.k = k16(layer);
+    r.v = v16(layer);
+    r.ring = ring;
+    r.sink = sink;
+    return r;
+  }
 };
 struct GdnBuf {
   float *S = nullptr, *win = nullptr;  // FLYX_ROUND_SLOTS slots each
