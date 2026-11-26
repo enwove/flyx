@@ -522,8 +522,9 @@ void write_tiny_inkling2(const std::filesystem::path& path, const TinySpec& c, b
       // Distinct positive per-expert F32 tensor scales!
       std::vector<uint8_t> sc_gu(size_t(c.n_experts) * 4), sc_dn(size_t(c.n_experts) * 4);
       for (int e = 0; e < c.n_experts; ++e) {
-        const float s1 = 0.04f + 0.015f * float(e);
-        const float s2 = 0.03f + 0.012f * float(e);
+        // In double, where the products are exact: in float a compiler that fuses them rounds another bit.
+        const float s1 = float(double(0.04f) + double(0.015f) * e);
+        const float s2 = float(double(0.03f) + double(0.012f) * e);
         std::memcpy(sc_gu.data() + e * 4, &s1, 4);
         std::memcpy(sc_dn.data() + e * 4, &s2, 4);
       }
