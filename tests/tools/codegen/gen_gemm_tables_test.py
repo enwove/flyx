@@ -280,21 +280,36 @@ if text and base:
           entries(base, "kMoeGateUp")[-1] == f"{{-1, -1, 1, {INF}, {original}}}", entries(base, "kMoeGateUp")[-1])
 
     def moe_reach(t):
-        body = re.search(r"kReachMoeDp4a\[7\]\[21\] = \{(.*?)\n\};", t, re.S).group(1)
-        return [[int(v.rstrip("u"), 16) for v in row.strip().strip("{},").split(", ")] for row in body.strip().splitlines()]
+        body = re.search(r"kReachMoeDp4a\[7\]\[2\]\[21\] = \{(.*?)\n\};", t, re.S).group(1)
+        rows = [[int(v.rstrip("u"), 16) for v in m.split(", ")] for m in re.findall(r"\{([0-9a-fxu, ]+)\}", body)]
+        assert len(rows) == 14
+        return [[rows[2 * i], rows[2 * i + 1]] for i in range(7)]
     r, b = moe_reach(text), moe_reach(base)
     s = gen.GGML_TYPES.index("IQ2_S")
-    added = (1 << moe[(4, 2)]) | (1 << moe[(1, 2)])
-    check("a release build compiles the table's configurations for its type on every architecture (a table of none)",
-          all(r[i][s] == b[i][s] | added for i in range(7)), [hex(row[s]) for row in r])
+    # rows = [1, 3] hits both rows == 1 (band 0) and rows >= 2 (band 1); the fallback (1x2) is shadowed at rows == 1.
+    add_r1 = 1 << moe[(4, 2)]
+    add_r2 = (1 << moe[(4, 2)]) | (1 << moe[(1, 2)])
+    check("a release build compiles the table's configurations per row band for its type on every architecture",
+          all(r[i][0][s] == (b[i][0][s] | add_r1) and r[i][1][s] == (b[i][1][s] | add_r2) for i in range(7)),
+          [(hex(row[0][s]), hex(row[1][s])) for row in r])
     check("... and nothing more for the other types",
-          all(r[i][d] == b[i][d] for i in range(7) for d in range(len(gen.GGML_TYPES)) if d != s))
-    check("every type reaches the original tiles in every build",
-          all(v & (1 << original) for row in b for v in row))
+          all(r[i][band][d] == b[i][band][d] for i in range(7) for band in (0, 1)
+              for d in range(len(gen.GGML_TYPES)) if d != s))
+    check("every type reaches the original tiles in both row bands in every build",
+          all(v & (1 << original) for row in b for band in row for v in band))
     allowed = sum(1 << i for i in moe.values())
     check("the types without configurations of their own reach the original tiles alone",
-          all(b[i][d] == 1 << original for i in range(7) for d, t in enumerate(gen.GGML_TYPES)
-              if t not in gen.MOE_DP4A_TYPES) and all(v & ~allowed == 0 for row in b for v in row))
+          all(b[i][band][d] == 1 << original for i in range(7) for band in (0, 1)
+              for d, t in enumerate(gen.GGML_TYPES) if t not in gen.MOE_DP4A_TYPES)
+          and all(v & ~allowed == 0 for row in b for band in row for v in band))
+    arch_t, arch_err = generate({"a": 'architectures = ["12.0"]\n' + MOE})
+    check("an architecture-scoped MoE gate|up table generates", arch_t is not None, arch_err)
+    if arch_t:
+        ar = moe_reach(arch_t)
+        check("architecture-scoped MoE rules add reachability only on sm_120 (bucket 5) and any (bucket 6)",
+              all(ar[i][0][s] == (b[i][0][s] | (add_r1 if i >= 5 else 0)) and
+                  ar[i][1][s] == (b[i][1][s] | (add_r2 if i >= 5 else 0)) for i in range(7)),
+              [(hex(row[0][s]), hex(row[1][s])) for row in ar])
 with open(CANDIDATES, encoding="utf-8") as f:
     no_original = f.read().replace("[[moe_dp4a]]\ncolumns = 0\nunits = 0\n", "", 1)
 with tempfile.TemporaryDirectory() as d:

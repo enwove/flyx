@@ -212,7 +212,6 @@ void bench_moe_projection(int dtype, bool down) {
   sc.chunk_rows = kMaxBenchRows;
   sc.max_experts = E;
   sc.max_top_k = top;
-  sc.offsets = mem.alloc<int>(E + 1);
   sc.pairs = mem.alloc<int>(max_pairs);
   sc.tasks = mem.alloc<MoeTask>(max_pairs);
   sc.n_tasks = mem.alloc<int>(1);
@@ -223,7 +222,7 @@ void bench_moe_projection(int dtype, bool down) {
   sc.down_buf = mem.alloc<float>(size_t(max_pairs) * H);
   float* x = mem.alloc<float>(input_elems);
   k_fill_f<<<64, 256>>>(x, input_elems, 31u, -1.f, 2.f);
-  bf16* act = mem.alloc<bf16>(size_t(max_pairs) * I);
+  bf16* act = mem.alloc<bf16>(std::max(size_t(max_pairs) * I, nvfp4 ? input_elems : size_t(0)));
   if (nvfp4) {
     k_fill_bf16<<<64, 256>>>(act, input_elems, 31u, -1.f, 2.f);
     sc.bf16_a = act;
@@ -236,14 +235,14 @@ void bench_moe_projection(int dtype, bool down) {
   k_fill_f<<<1, 256>>>(ew, max_pairs, 23u, 0.1f, 0.05f);
   cudaStream_t st;
   CK(cudaStreamCreateWithFlags(&st, cudaStreamNonBlocking));
-  KernelOptions options;
+  KernelOptions options = g_bench_opts;
   const Launch launch{st, nullptr, &options};
   for (int rows : {1, 2, 4, 6, 8, 16}) {
     const int distinct = make_moe_routes(indices, rows, E, top);
     const size_t bytes = distinct * expert_bytes;
-    // -1: the rules (default); then every configuration this build compiles for the type
+    // -1: the rules (default); then every configuration this build compiles for the type, op and row band
     for (int v = -1; v < (nvfp4 ? 0 : kMoeDp4aConfigCount); ++v) {
-      if (v >= 0 && !moe_dp4a_compiled(dtype, v)) continue;
+      if (v >= 0 && !moe_dp4a_compiled(dtype, v, !down, rows)) continue;
       options.moe_dp4a = v;
       cudaGraph_t graph;
       cudaGraphExec_t exec;
@@ -2422,10 +2421,6 @@ int main(int argc, char** argv) {
   std::string what = argc > 1 ? argv[1] : "gemm";
   // This tuning family uses the recorded decode timings from real model runs.
   if (what == "tune" && argc > 2 && std::string(argv[2]) == "strata_placement") return tune(argc - 2, argv + 2);
-  if (what == "moe") {  // uses its own routing and staging scratch
-    bench_moe();
-    return 0;
-  }
 #if !FLYX_TUNE_CANDIDATES
   if (what == "skinny" || what == "fp4" || what == "fp4cfgs" || what == "fp4rows" || what == "tune" ||
       what == "w12" || (what == "blocks" && argc > 3) || what == "q8runs" || what == "rounds" || what == "glu") {
@@ -2435,17 +2430,23 @@ int main(int argc, char** argv) {
   }
 #endif
   {
-    void* mem = nullptr;
-    // K up to the 27B's MLP down projection (17408).
-    const size_t bytes = scratch_bytes(2048, 17408);
-    CK(cudaMalloc(&mem, bytes));
-    g_bench_scratch = scratch_in(mem, bytes, 2048, 17408);
     cudaDeviceProp prop{};
     CK(cudaGetDeviceProperties(&prop, 0));
     g_bench_opts.tuning = gemm_tuning_for(prop.name, prop.major * 10 + prop.minor);
     // Kernels launch as the engine launches them on this GPU; FLYX_BENCH_PDL=0|1 says otherwise.
     g_bench_opts.pdl = gemm_tuning_pdl(g_bench_opts.tuning);
     if (const char* e = std::getenv("FLYX_BENCH_PDL")) g_bench_opts.pdl = std::string(e) == "1";
+  }
+  if (what == "moe") {  // uses its own routing and staging scratch
+    bench_moe();
+    return 0;
+  }
+  {
+    void* mem = nullptr;
+    // K up to the 27B's MLP down projection (17408).
+    const size_t bytes = scratch_bytes(2048, 17408);
+    CK(cudaMalloc(&mem, bytes));
+    g_bench_scratch = scratch_in(mem, bytes, 2048, 17408);
   }
   if (what == "gemm") bench_gemm();
   else if (what == "skinny") bench_skinny();

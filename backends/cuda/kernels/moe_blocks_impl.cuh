@@ -198,7 +198,7 @@ __device__ __forceinline__ void moe_dp4a_tile(
   }
 }
 
-template <class F, bool FUSE_ACT, bool IS_DOWN, bool DIRECT_R1, int C, int U, bool EXPLICIT_CONFIG>
+template <class F, bool FUSE_ACT, bool IS_DOWN, bool DIRECT_R1, int CFG, int C, int U, bool EXPLICIT_CONFIG>
 __global__ void __launch_bounds__(32 * kMoeDp4aWarps)
     k_moe_blocks_q8_dp4a(Tables T, const int8_t* __restrict__ q8_a, const float* __restrict__ q8_d,
                          const float* __restrict__ q8_s, const uint8_t* __restrict__ W,
@@ -206,6 +206,11 @@ __global__ void __launch_bounds__(32 * kMoeDp4aWarps)
                          const int* __restrict__ eidx, const MoeTask* __restrict__ tasks,
                          const int* __restrict__ n_tasks, const int* __restrict__ pairs, int top_k, float situ_beta,
                          float situ_linear_beta, float* __restrict__ out, int ld_out, bf16* __restrict__ act_bf16) {
+#if defined(__CUDA_ARCH__) && !FLYX_TUNE_CANDIDATES
+  if constexpr (!moe_dp4a_kernel_active<F, CFG, FUSE_ACT, DIRECT_R1>(__CUDA_ARCH__ / 10)) {
+    __trap();
+  } else {
+#endif
   pdl_trigger();
   constexpr int BT = DIRECT_R1 ? 1 : 4;
   // IQ3_XXS at one column (gate/up pair) a warp decodes its units from the global table of signed rows instead of
@@ -252,6 +257,9 @@ __global__ void __launch_bounds__(32 * kMoeDp4aWarps)
   }
   moe_dp4a_tile<F, FUSE_ACT, C, U, BT>(T, local, q8_a, q8_d, q8_s, W, D, RS, N_exp, I_or_H, K, e, nb,
                                        s_pids, s_rids, situ_beta, situ_linear_beta, out, ld_out, act_bf16);
+#if defined(__CUDA_ARCH__) && !FLYX_TUNE_CANDIDATES
+  }
+#endif
 }
 
 // ---- INT8 Tensor Core mma.m16n8k32 grouped MoE kernel (BM = 16 rows/task, CT = 2 -> 16 cols/block) ----
@@ -829,14 +837,15 @@ void launch_mma_q8(const ExpertMat& W, int I_or_H, int K, int top_k, float situ_
 
 // A moe_dp4a configuration's tile: C output columns a warp (gate/up pairs fused), U units a lane has in flight; 0 and
 // 0, the original tiles: one pair a warp fused, two columns otherwise, the original prefetch depth and grouped loop.
-template <int C, int U>
+template <int CFG, int C, int U>
 struct MoeDp4aTile {
+  static constexpr int cfg = CFG;
   static constexpr int columns = C;
   static constexpr int units = U;
 };
 
 // The dp4a kernel in configuration `cfg` (moe.cu's moe_dp4a_cfg: the options', the rules' or the original tiles;
-// always one this build compiles for the type, moe_dp4a_cfg_compiled).
+// always one this build compiles for the type, op and row band, moe_dp4a_cfg_compiled).
 template <class F, bool FUSE_ACT, bool IS_DOWN>
 void launch_dp4a_q8(int cfg, const Tables& T, const ExpertMat& W, int I_or_H, int K, const int* eidx, int rows,
                     int top_k, float situ_beta, float situ_linear_beta, float* out, int ld_out, const MoeScratch* sc,
@@ -845,24 +854,28 @@ void launch_dp4a_q8(int cfg, const Tables& T, const ExpertMat& W, int I_or_H, in
   const int N_work = FUSE_ACT ? I_or_H : N_exp;
   auto run = [&](auto tile, auto direct) {
     constexpr bool DIRECT_R1 = decltype(direct)::value;
-    constexpr int requested_c = decltype(tile)::columns, requested_u = decltype(tile)::units;
-    constexpr int C = requested_c ? requested_c : FUSE_ACT ? 1 : 2;
-    constexpr int default_u = DIRECT_R1 && sizeof(typename F::Unit) <= 32 ? 2 : 1;
-    constexpr int U = requested_u ? requested_u : default_u;
-    const dim3 grid(ceil_div(N_work, kMoeDp4aWarps * C), DIRECT_R1 ? top_k : max_tiles);
-    k_moe_blocks_q8_dp4a<F, FUSE_ACT, IS_DOWN, DIRECT_R1, C, U, (requested_u != 0)>
-        <<<grid, 32 * kMoeDp4aWarps, 0, st>>>(T, sc->q8_a, sc->q8_d, sc->q8_s, W.blk.data, W.blk.scales, W.rs,
-                                              N_exp, I_or_H, K, eidx, sc->tasks, sc->n_tasks, sc->pairs, top_k,
-                                              situ_beta, situ_linear_beta, out, ld_out, act_bf16);
+    constexpr int CFG = decltype(tile)::cfg;
+    if constexpr (moe_dp4a_cfg_compiled(F::kDtype, CFG, FUSE_ACT, DIRECT_R1 ? 1 : 2)) {
+      constexpr int requested_c = decltype(tile)::columns, requested_u = decltype(tile)::units;
+      constexpr int C = requested_c ? requested_c : FUSE_ACT ? 1 : 2;
+      constexpr int default_u = DIRECT_R1 && sizeof(typename F::Unit) <= 32 ? 2 : 1;
+      constexpr int U = requested_u ? requested_u : default_u;
+      constexpr bool EXPLICIT_CONFIG = requested_c != 0 || requested_u != 0;
+      const dim3 grid(ceil_div(N_work, kMoeDp4aWarps * C), DIRECT_R1 ? top_k : max_tiles);
+      k_moe_blocks_q8_dp4a<F, FUSE_ACT, IS_DOWN, DIRECT_R1, CFG, C, U, EXPLICIT_CONFIG>
+          <<<grid, 32 * kMoeDp4aWarps, 0, st>>>(T, sc->q8_a, sc->q8_d, sc->q8_s, W.blk.data, W.blk.scales, W.rs,
+                                                N_exp, I_or_H, K, eidx, sc->tasks, sc->n_tasks, sc->pairs, top_k,
+                                                situ_beta, situ_linear_beta, out, ld_out, act_bf16);
+      return true;
+    } else {
+      return false;
+    }
   };
-  auto launch = [&](auto tile) {
-    if (rows == 1) run(tile, std::true_type{});
-    else run(tile, std::false_type{});
-  };
+  auto launch = [&](auto tile) { return rows == 1 ? run(tile, std::true_type{}) : run(tile, std::false_type{}); };
   switch (cfg) {
-#define X(i, C, U)                                                                          \
-  case i:                                                                                   \
-    if constexpr (moe_dp4a_cfg_compiled(F::kDtype, i)) return launch(MoeDp4aTile<C, U>{}); \
+#define X(i, C, U)                                        \
+  case i:                                                 \
+    if (launch(MoeDp4aTile<i, C, U>{})) return;           \
     break;
     FLYX_MOE_DP4A(X)
 #undef X

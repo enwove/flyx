@@ -796,7 +796,7 @@ __global__ void __launch_bounds__(512)
   const AttnResRow row{n_blocks ? bank + offset : nullptr, size_t(rows) * H, n_blocks,
                        push ? x_src + offset : nullptr, shared_row};
   const bool vec4 = (H & 3) == 0 && ((reinterpret_cast<uintptr_t>(bank) | reinterpret_cast<uintptr_t>(x_src) |
-                                      reinterpret_cast<uintptr_t>(x_dst) | reinterpret_cast<uintptr_t>(queries)) &
+                                      reinterpret_cast<uintptr_t>(queries)) &
                                      15u) == 0;
   float* dest = mix_out ? mix_out + offset : nullptr;
   attn_res_mix_row<NQ>(row, queries, H, vec4, NORM == SublayerNorm::None ? dest : shared_row, dest);
@@ -2198,14 +2198,15 @@ void attn_res_mix(const float* bank, int n_blocks, const float* cur, const float
                   int H, float* out, cudaStream_t st) {
   if (n_blocks < 0 || n_blocks >= kMaxResStates)
     throw std::runtime_error("attn_res_mix: bank depth exceeds kMaxResStates");
-  for (int q0 = 0; q0 < n_queries; q0 += 4) {
-    const int nq = std::min(4, n_queries - q0);
+  if (rows <= 0 || n_queries <= 0) return;
+  if (rows <= FLYX_MAX_ROWS) {
     // Round queries have independent outputs. One block per (row, query) duplicates only reads and
     // the state RMS, with the same lane order as the grouped queries of a longer pass.
-    if (rows <= FLYX_MAX_ROWS) {
-      k_attn_res_mix<1><<<dim3(rows, nq), 512, 0, st>>>(bank, n_blocks, cur, queries, q0, rows, H, out);
-      continue;
-    }
+    k_attn_res_mix<1><<<dim3(rows, n_queries), 512, 0, st>>>(bank, n_blocks, cur, queries, 0, rows, H, out);
+    return;
+  }
+  for (int q0 = 0; q0 < n_queries; q0 += 4) {
+    const int nq = std::min(4, n_queries - q0);
     switch (nq) {
       case 1: k_attn_res_mix<1><<<rows, 512, 0, st>>>(bank, n_blocks, cur, queries, q0, rows, H, out); break;
       case 2: k_attn_res_mix<2><<<rows, 512, 0, st>>>(bank, n_blocks, cur, queries, q0, rows, H, out); break;

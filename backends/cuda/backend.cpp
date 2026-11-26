@@ -215,12 +215,15 @@ const std::vector<OptionSpec>& option_specs() {
          }
          for (int i = 0; i < kMoeDp4aConfigCount; ++i) {
            if (val != moe_dp4a_name(i)) continue;
-           // Every type that has configurations takes it, or none: a release build compiles those its tables reach.
+           // Every type, op kind and row band must compile it: a release build compiles only fused gate|up
+           // configurations its tables reach, so non-original overrides require FLYX_TUNE_CANDIDATES=ON.
            for (int dtype : kMoeDp4aTypes)
-             if (!moe_dp4a_compiled(dtype, i)) {
-               *err = key + "=" + val + " is not compiled in this build (configure with -DFLYX_TUNE_CANDIDATES=ON)";
-               return false;
-             }
+             for (bool fused : {false, true})
+               for (int r : {1, 2})
+                 if (!moe_dp4a_compiled(dtype, i, fused, r)) {
+                   *err = key + "=" + val + " is not compiled in this build (configure with -DFLYX_TUNE_CANDIDATES=ON)";
+                   return false;
+                 }
            o->kernels.moe_dp4a = i;
            return true;
          }

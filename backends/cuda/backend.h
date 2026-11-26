@@ -123,7 +123,9 @@ inline void destroy_side(SideStream& s) {
 //                         moe_dp4a): columns per warp x K/32 units in flight per lane, a fused column a gate/up pair;
 //                         these specialize one-row grouped tiles.  default: the tables' rules (moe_gate_up) for fused
 //                         gate|up GEMMs, the original tiles elsewhere; original: those tiles everywhere.  A release
-//                         build takes only what it compiles for all six types (the configurations its tables reach).
+//                         build compiles non-original configurations only for fused gate|up in the row bands and
+//                         architectures its tables reach, so forcing a non-original override requires
+//                         FLYX_TUNE_CANDIDATES=ON.
 enum class WaitMode { poll, spin, automatic };  // option wait=poll|spin|auto
 enum class PageableKvMode { off, on, automatic };  // option pageable_kv=off|on|auto
 struct BackendOptions {

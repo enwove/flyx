@@ -1204,13 +1204,15 @@ void test_inkling2_rel_attn() {
         ++g_fail;
       }
       const size_t counters = size_t(c.rows / 2) * c.nkv;
-      if (round.scratch->round_count && round.scratch->round_count_cap >= counters) {
+      const bool have_counters = round.scratch->round_count && round.scratch->round_count_cap >= counters;
+      bool zero = false;
+      if (have_counters) {
         const auto counts = down_i(round.scratch->round_count, counters);
-        const bool zero = std::all_of(counts.begin(), counts.end(), [](int count) { return count == 0; });
-        std::printf("  %-4s relative attention graph releases all split counters (%s, ctx=%d)\n",
-                    zero ? "ok" : "FAIL", c.name, c.ctx);
-        g_fail += !zero;
+        zero = std::all_of(counts.begin(), counts.end(), [](int count) { return count == 0; });
       }
+      std::printf("  %-4s relative attention graph releases all split counters (%s, ctx=%d)\n",
+                  have_counters && zero ? "ok" : "FAIL", c.name, c.ctx);
+      g_fail += !(have_counters && zero);
       CK(cudaGraphExecDestroy(executable));
       CK(cudaGraphDestroy(graph));
       CK(cudaStreamDestroy(replay.st));
@@ -1588,20 +1590,38 @@ void test_inkling2_moe_norm() {
 
 namespace {
 
-// The rules of a fused gate|up GEMM's configuration (variants: moe_gate_up) give every block type, at every row count a
-// pass may have on dp4a, a configuration this build compiles for it, by every GPU's table and by the defaults: a
-// release build compiles only the configurations the tables reach (moe_dp4a_compiled), and only the types
-// kMoeDp4aTypes names compile more than the original tiles.
+// The rules of a fused gate|up GEMM's configuration (variants: moe_gate_up) give every block type, at every row count
+// a pass may have on dp4a, a configuration reachable on every architecture whose cubin runs that table, and compiled
+// in this build for every table this build's cubin runs.
 void test_moe_gate_up_rules() {
+  namespace t = tables;
+  constexpr int kBucketCc[] = {80, 86, 89, 90, 100, 120};  // t::arch_bucket's, then kArchBucketAny
+  auto runs = [&](int bucket, int arch) {
+    if (bucket == t::kArchBucketAny || arch == 0) return true;
+    return arch == kBucketCc[bucket] || (bucket == 0 && (arch == 86 || arch == 89));
+  };
+  const int arch = compiled_arch();
   int bad = 0;
-  for (int tuning = -1; tuning < tables::kSkuCount; ++tuning)
-    for (const BlockType& bt : kBlockTypes)
+  for (int tuning = -1; tuning < t::kSkuCount; ++tuning) {
+    const int tbl_arch = tuning < 0 ? 0 : t::kSkuArch[tuning];
+    const bool live = arch > 0 && gemm_tuning_compiled_for(tuning, arch);
+    for (const BlockType& bt : kBlockTypes) {
+      const int di = t::ggml_type_index(bt.dtype);
       for (int rows = 1; rows <= 64; ++rows) {
         const int cfg = moe_gate_up_dp4a(tuning, bt.dtype, rows);
-        if (!moe_dp4a_compiled(bt.dtype, cfg) && bad++ < 4)
-          std::printf("  FAIL table %d, %s, %d rows: moe_dp4a configuration %d not compiled\n", tuning, bt.name, rows,
-                      cfg);
+        const int band = rows == 1 ? 0 : 1;
+        for (int b = 0; b < t::kArchBucketCount; ++b) {
+          if (!runs(b, tbl_arch)) continue;
+          if ((di < 0 || cfg < 0 || cfg >= 32 || !(t::kReachMoeDp4a[b][band][di] & (1u << cfg))) && bad++ < 4)
+            std::printf("  FAIL table %s, bucket %d, %s, %d rows: moe_dp4a configuration %d not reachable\n",
+                        tuning < 0 ? "defaults" : t::kSkus[tuning].name, b, bt.name, rows, cfg);
+        }
+        if (live && !moe_dp4a_compiled(bt.dtype, cfg, true, rows) && bad++ < 4)
+          std::printf("  FAIL table %s, %s, %d rows: moe_dp4a configuration %d not compiled on sm_%d\n",
+                      tuning < 0 ? "defaults" : t::kSkus[tuning].name, bt.name, rows, cfg, arch);
       }
+    }
+  }
   std::printf("  %-4s %-48s\n", bad ? "FAIL" : "ok", "MoE gate|up rules: compiled configurations");
   if (bad) ++g_fail;
 }
@@ -1628,7 +1648,6 @@ void test_moe_dp4a_variants() {
   sc.chunk_rows = R;
   sc.max_experts = E;
   sc.max_top_k = top_k;
-  sc.offsets = dev<int>(E + 1);
   sc.pairs = dev<int>(ids.size());
   sc.tasks = dev<MoeTask>(ids.size());
   sc.n_tasks = dev<int>(1);
@@ -1652,7 +1671,7 @@ void test_moe_dp4a_variants() {
       return w;
     };
     const ExpertMat gu = matrix(2 * I), dn = matrix(H);
-    auto check = [&](const char* op, int words_per_row, auto run) {
+    auto check = [&](const char* op, bool fused_gate_up, int words_per_row, auto run) {
       float* alone = dev<float>(R * words_per_row);
       float* got = dev<float>(R * words_per_row);
       CK(cudaMemset(alone, 0xff, R * words_per_row * sizeof(float)));
@@ -1660,12 +1679,12 @@ void test_moe_dp4a_variants() {
       KernelOptions options{};
       Launch launch = TL;
       launch.opt = &options;
-      // -1: the rules; then every configuration this build compiles for the type (a release build: those its tables
-      // reach, and the original tiles)
+      // -1: the rules; then every configuration this build compiles for the type, op and row band (a release build:
+      // fused gate|up configs reached on this architecture, and the original tiles everywhere)
       for (int v = -1; v < kMoeDp4aConfigCount; ++v) {
-        if (v >= 0 && !moe_dp4a_compiled(dtype, v)) continue;
         options.moe_dp4a = v;
         for (int rows : {1, 2, 4, 8, R}) {
+          if (v >= 0 && !moe_dp4a_compiled(dtype, v, fused_gate_up, rows)) continue;
           const size_t words = size_t(rows) * words_per_row;
           CK(cudaMemset(got, 0xff, words * sizeof(float)));
           run(0, rows, launch, got);
@@ -1680,19 +1699,19 @@ void test_moe_dp4a_variants() {
 
     for (bool fused : {false, true}) {
       const int ld = (fused ? I : 2 * I) + 5;
-      check(fused ? "SiTU" : "gate|up", top_k * ld, [&](int r, int rows, const Launch& L, float* out) {
+      check(fused ? "SiTU" : "gate|up", fused, top_k * ld, [&](int r, int rows, const Launch& L, float* out) {
         moe_gate_up(x + r * ldx, ldx, gu, eidx + r * top_k, rows, top_k, I, K, 6.f, 8.f, fused, out, ld, &sc, L);
       });
     }
     // Two BF16 expert slots per row occupy exactly I 32-bit words, so this compares the stored BF16 bits directly.
-    check("BF16 SiTU", I, [&](int r, int rows, const Launch& L, float* out) {
+    check("BF16 SiTU", true, I, [&](int r, int rows, const Launch& L, float* out) {
       moe_stage_q8(x + r * ldx, ldx, K, rows, sc, moe_q8_mins(gu), L.st);
       moe_gate_up(x + r * ldx, ldx, gu, eidx + r * top_k, rows, top_k, I, K, 6.f, 8.f, true, nullptr, I, &sc, L,
                   true, reinterpret_cast<bf16*>(out));
     });
     // Inspect individual projections as well: rounding in the weighted sum can hide a difference in a single expert.
     for (bool per_expert : {true, false}) {
-      check(per_expert ? "down experts" : "down sum", per_expert ? top_k * H : ld_down,
+      check(per_expert ? "down experts" : "down sum", false, per_expert ? top_k * H : ld_down,
             [&](int r, int rows, const Launch& L, float* out) {
               MoeScratch down_sc = sc;
               down_sc.down_buf = per_expert ? out : pairs_out;
@@ -1705,8 +1724,8 @@ void test_moe_dp4a_variants() {
       CK(cudaFree(const_cast<uint16_t*>(w.blk.scales)));
     }
   }
-  for (void* p : std::initializer_list<void*>{eidx, weights, scales, x, down_x, sc.offsets, sc.pairs, sc.tasks,
-                                              sc.n_tasks, sc.q8_a, sc.q8_d, sc.q8_s, pairs_out, sum_out})
+  for (void* p : std::initializer_list<void*>{eidx, weights, scales, x, down_x, sc.pairs, sc.tasks, sc.n_tasks,
+                                              sc.q8_a, sc.q8_d, sc.q8_s, pairs_out, sum_out})
     CK(cudaFree(p));
 }
 
@@ -1786,7 +1805,6 @@ void test_inkling2_moe() {
   CK(cudaMemcpy(d_eidx, eidx.data(), eidx.size() * 4, cudaMemcpyHostToDevice));
   float* d_ew = up(ew);
   MoeScratch msc{};
-  msc.offsets = dev<int>(E + 1);
   msc.pairs = dev<int>(size_t(R) * top_k);
   msc.tasks = dev<MoeTask>(size_t(R) * top_k);
   msc.n_tasks = dev<int>(1);
@@ -2008,7 +2026,7 @@ void test_inkling2_moe() {
         bf16* d_bf = up_bf16(e_f);
         uint8_t* dq = dev<uint8_t>(size_t(N) * (K / 2));
         uint8_t* ds = dev<uint8_t>(size_t(N) * (K / 16));
-        float* drs = dev<float>(1);
+        float* drs = dev<float>(size_t(N));
         quantize_nvfp4(d_bf, N, K, dq, ds, drs, 0);
         CK(cudaDeviceSynchronize());
         std::vector<uint8_t> hq(size_t(N) * (K / 2)), hs(size_t(N) * (K / 16));
@@ -2089,7 +2107,9 @@ void test_inkling2_moe() {
       run_and_check(std::string(bt.name) + (use_q8 ? "_q8" : "_a16h"), w_gu, w_dn, gu_f64, dn_f64, false,
                     use_q8 != 0, use_q8 == 0, 5e-5);
       cudaFree(const_cast<uint8_t*>(w_gu.blk.data));
+      cudaFree(const_cast<uint16_t*>(w_gu.blk.scales));
       cudaFree(const_cast<uint8_t*>(w_dn.blk.data));
+      cudaFree(const_cast<uint16_t*>(w_dn.blk.scales));
     }
   }
 
@@ -2113,7 +2133,6 @@ void test_inkling2_moe() {
     CK(cudaMemcpy(deim, eim.data(), eim.size() * 4, cudaMemcpyHostToDevice));
     float* dewm = up(ewm);
     MoeScratch sm{};
-    sm.offsets = dev<int>(EM + 1);
     sm.pairs = dev<int>(size_t(RM) * KM);
     sm.tasks = dev<MoeTask>(size_t(RM) * KM);
     sm.n_tasks = dev<int>(1);
@@ -2167,12 +2186,13 @@ void test_inkling2_moe() {
       expect_bits(std::string("moe multispan 2304x1152 R=8==R=19 ") + gbt.name,
                   Vec(y8.begin() + ptrdiff_t(rr - 8) * HM, y8.begin() + ptrdiff_t(rr - 7) * HM), yref);
       cudaFree(const_cast<uint8_t*>(wgu.blk.data));
+      cudaFree(const_cast<uint16_t*>(wgu.blk.scales));
       cudaFree(const_cast<uint8_t*>(wdn.blk.data));
+      cudaFree(const_cast<uint16_t*>(wdn.blk.scales));
     }
     cudaFree(dxm);
     cudaFree(deim);
     cudaFree(dewm);
-    cudaFree(sm.offsets);
     cudaFree(sm.pairs);
     cudaFree(sm.tasks);
     cudaFree(sm.n_tasks);
@@ -2206,7 +2226,6 @@ void test_inkling2_moe() {
     CK(cudaMemcpy(deig, eig.data(), eig.size() * 4, cudaMemcpyHostToDevice));
     float* dewg = up(ewg);
     MoeScratch sg{};
-    sg.offsets = dev<int>(EG + 1);
     sg.pairs = dev<int>(size_t(RG) * KG);
     sg.tasks = dev<MoeTask>(size_t(RG) * KG);
     sg.n_tasks = dev<int>(1);
@@ -2262,7 +2281,9 @@ void test_inkling2_moe() {
       if (!same) ++g_fail;
       if (packed) {
         cudaFree(const_cast<uint8_t*>(wgu.blk.data));
+        cudaFree(const_cast<uint16_t*>(wgu.blk.scales));
         cudaFree(const_cast<uint8_t*>(wdn.blk.data));
+        cudaFree(const_cast<uint16_t*>(wdn.blk.scales));
       } else {
         cudaFree(const_cast<bf16*>(wgu.w));
         cudaFree(const_cast<bf16*>(wdn.w));
@@ -2271,7 +2292,6 @@ void test_inkling2_moe() {
     cudaFree(dxg);
     cudaFree(deig);
     cudaFree(dewg);
-    cudaFree(sg.offsets);
     cudaFree(sg.pairs);
     cudaFree(sg.tasks);
     cudaFree(sg.n_tasks);
@@ -2286,7 +2306,6 @@ void test_inkling2_moe() {
   cudaFree(d_x);
   cudaFree(d_eidx);
   cudaFree(d_ew);
-  cudaFree(msc.offsets);
   cudaFree(msc.pairs);
   cudaFree(msc.tasks);
   cudaFree(msc.n_tasks);

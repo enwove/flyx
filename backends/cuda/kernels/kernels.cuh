@@ -88,10 +88,19 @@ enum AttnImpl : int { kAttnAuto = 0, kAttnSplit = 1, kAttnPerHead = 2 };
 // alone.  Also those cuda_bench and cuda_op_test exercise.
 inline constexpr int kMoeDp4aTypes[] = {FLYX_DT_GGML_IQ3_XXS, FLYX_DT_GGML_IQ2_S, FLYX_DT_GGML_IQ2_XXS,
                                         FLYX_DT_GGML_IQ2_XS, FLYX_DT_GGML_IQ4_NL, FLYX_DT_GGML_Q4_K};
+#ifdef __CUDACC__
+__host__ __device__
+#endif
 constexpr bool has_moe_dp4a_variants(int dtype) {
-  for (int t : kMoeDp4aTypes)
-    if (t == dtype) return true;
-  return false;
+  switch (dtype) {
+    case FLYX_DT_GGML_IQ3_XXS:
+    case FLYX_DT_GGML_IQ2_S:
+    case FLYX_DT_GGML_IQ2_XXS:
+    case FLYX_DT_GGML_IQ2_XS:
+    case FLYX_DT_GGML_IQ4_NL:
+    case FLYX_DT_GGML_Q4_K: return true;
+    default: return false;
+  }
 }
 // The selection's chunks: about this many pairs each, at most kStrataSelChunks; never more than
 // kStrataSelChunk pairs (a thread of the selection holds 16 of them in registers), so a session's context is at most
@@ -185,7 +194,8 @@ struct Scratch {
   size_t q8_parts_cap = 0;
   int* q8_count = nullptr;
   // A round's GEMM in 8 bits whose streams are split among blocks of threads (k_round_blocks_split): each set's sums
-  // a tile of 8 columns (round_parts_cap floats), and a counter per tile (round_count_cap), zero between GEMMs.
+  // a tile of 8 columns (round_parts_cap floats), and a counter per tile (round_count_cap), zero between launches.
+  // k_rel_round_gqa also shares round_count as its zero-between-launch last-block combine counters.
   float* round_parts = nullptr;
   size_t round_parts_cap = 0;
   int* round_count = nullptr;
@@ -1686,7 +1696,6 @@ struct MoeTask {
   int nb;      // count of pairs in this tile (1..BM)
 };
 struct MoeScratch {
-  int* offsets = nullptr;      // [max_experts + 1]
   int* pairs = nullptr;        // [chunk_rows * max_top_k]
   MoeTask* tasks = nullptr;    // [chunk_rows * max_top_k] (compacted per-expert BM-row tiles)
   int* n_tasks = nullptr;      // [1]
@@ -1717,17 +1726,18 @@ void situ_rows(const float* gu, int ld_gu, int I, float beta, float linear_beta,
 // output columns a warp (gate/up pairs where the activation is fused) and K/32 units a lane has in flight; columns 0
 // and units 0, the original tiles, which every block type compiles (kMoeDp4aTypes compile the others).  _name:
 // "original" or "<columns>x<units>"; _compiled: whether this build compiles configuration `cfg` for block type
-// `dtype` (with FLYX_TUNE_CANDIDATES every one of kMoeDp4aTypes, else those some table's rules reach);
-// moe_gate_up_dp4a: the configuration the rules (moe_gate_up) give a fused gate|up GEMM of `rows` rows of block type
-// `dtype` on a GPU of tuning table `tuning`.  Down GEMMs and unfused projections take the original tiles, unless
-// KernelOptions::moe_dp4a says otherwise.
+// `dtype`, op kind (`fused_gate_up`) and row band (`rows == 1` vs `rows > 1`) on the loaded device architecture (with
+// FLYX_TUNE_CANDIDATES every one of kMoeDp4aTypes for all ops/rows, else the fused gate|up rules reached on this
+// architecture); moe_gate_up_dp4a: the configuration the rules (moe_gate_up) give a fused gate|up GEMM of `rows` rows
+// of block type `dtype` on a GPU of tuning table `tuning`.  Down GEMMs and unfused projections take the original
+// tiles, unless KernelOptions::moe_dp4a says otherwise.
 struct MoeDp4aConfig {
   int columns, units;
 };
 extern const MoeDp4aConfig kMoeDp4aConfigs[];
 extern const int kMoeDp4aConfigCount;
 const char* moe_dp4a_name(int cfg);
-bool moe_dp4a_compiled(int dtype, int cfg);
+bool moe_dp4a_compiled(int dtype, int cfg, bool fused_gate_up = true, int rows = 2);
 int moe_gate_up_dp4a(int tuning, int dtype, int rows);
 // What one of a fused round's MoE kernels may leave for the next without a staging launch between them, the
 // round's 1..16 rows in one chunk of the scratch.  moe_round_q8: the gate|up GEMM on W reads rows staged in 8 bits

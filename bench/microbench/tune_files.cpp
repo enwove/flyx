@@ -6,6 +6,7 @@
 
 #include "bench/microbench/tune_files.h"
 #include "core/modelfile/modelfile.h"
+#include "flyx/backend_abi.h"
 
 namespace flyx::bench {
 
@@ -36,7 +37,16 @@ bool file_experts(const std::string& path, std::vector<FileExperts>* out, std::s
       *err = "expert matrices without " + key;
       return false;
     }
-    out->push_back({t->dtype, int(t->shape[0]), int(t->shape[1]), int(t->shape[2]), h.at("gguf").at(key).get<int>()});
+    const int n_experts = int(t->shape[0]), N = int(t->shape[1]), K = int(t->shape[2]);
+    const int top_k = h.at("gguf").at(key).get<int>();
+    const int blk = flyx_block_values(t->dtype);
+    if (n_experts <= 0 || top_k <= 0 || top_k > n_experts || N <= 0 || (N & 1) != 0 || K <= 0 ||
+        (blk > 0 && K % blk != 0)) {
+      *err = "invalid expert matrix " + name + " (" + std::to_string(n_experts) + "x" + std::to_string(N) + "x" +
+             std::to_string(K) + ", top_k=" + std::to_string(top_k) + ")";
+      return false;
+    }
+    out->push_back({t->dtype, n_experts, N, K, top_k});
   }
   return true;
 }

@@ -136,19 +136,19 @@ __global__ void k_situ_rows(const float* __restrict__ gu, int ld_gu, int I, floa
 }
 
 // ---- Compacted work-tile grouping & one-pass activation staging ---------------------------
-// Sorts M = rc * top_k pairs into per-expert ranges [offsets[e], offsets[e + 1]) and emits
-// load-balanced BM-row tiles into tasks[0 .. *n_tasks) so hot experts split across SMs and
-// empty experts consume zero blocks (fixed upper-bound grid, 100% CUDA Graph safe).
+// Sorts M = rc * top_k pairs into per-expert ranges in pairs[] and emits load-balanced BM-row
+// tiles into tasks[0 .. *n_tasks) so hot experts split across SMs and empty experts consume
+// zero blocks (fixed upper-bound grid, 100% CUDA Graph safe).
 // One block of kGroupThreads: the counts in shared memory, one block-wide scan of every thread's run of experts (their
-// pairs and their tiles), then every thread writes its own experts' offsets and tiles; no thread walks all the experts
+// pairs and their tiles), then every thread writes its own experts' tiles; no thread walks all the experts
 // (a walk through global memory, one expert after another, took 20 us of a round's every MoE GEMM).  Tiles go in
 // ascending expert order; an expert's pairs in the order the atomics give them, which no result depends on: each
 // pair's row is its own.
 constexpr int kGroupThreads = 256;
 
 __global__ void __launch_bounds__(kGroupThreads)
-    k_moe_group_tasks(const int* __restrict__ eidx, int M, int E, int bm, int* __restrict__ offsets,
-                      int* __restrict__ pairs, MoeTask* __restrict__ tasks, int* __restrict__ n_tasks) {
+    k_moe_group_tasks(const int* __restrict__ eidx, int M, int E, int bm, int* __restrict__ pairs,
+                      MoeTask* __restrict__ tasks, int* __restrict__ n_tasks) {
   pdl_trigger();
   extern __shared__ int s_group[];  // [E] pairs an expert has, then [E] where its next pair goes
   int* cnt = s_group;
@@ -187,22 +187,18 @@ __global__ void __launch_bounds__(kGroupThreads)
   }
   for (int e = e0; e < e1; ++e) {
     const int c = cnt[e];
-    offsets[e] = p;
     cur[e] = p;
     for (int off = 0; off < c; off += bm) tasks[t++] = MoeTask{e, p + off, min(bm, c - off)};
     p += c;
   }
-  if (tid == kGroupThreads - 1) {  // its run is the last: its ends are the totals
-    offsets[E] = p;
-    *n_tasks = t;
-  }
+  if (tid == kGroupThreads - 1) *n_tasks = t;  // its run is the last: its end is the total
   __syncthreads();
   for (int i = tid; i < M; i += kGroupThreads) pairs[atomicAdd(&cur[eidx[i]], 1)] = i;
 }
 
 void group_tasks(const int* eidx, int M, int E, int bm, const MoeScratch* sc, cudaStream_t st) {
-  k_moe_group_tasks<<<1, kGroupThreads, size_t(2) * E * sizeof(int), st>>>(eidx, M, E, bm, sc->offsets, sc->pairs,
-                                                                            sc->tasks, sc->n_tasks);
+  k_moe_group_tasks<<<1, kGroupThreads, size_t(2) * E * sizeof(int), st>>>(eidx, M, E, bm, sc->pairs, sc->tasks,
+                                                                           sc->n_tasks);
 }
 
 // Whether the tiles moe_gate_up left (`grouped` rows a tile, every one of `rows` rows in one chunk) serve a kernel
@@ -812,13 +808,13 @@ constexpr bool moe_use_mma(int rc, int M, int n_experts) { return rc > FLYX_MAX_
 
 bool moe_round_scratch(const ExpertMat& W, int rows, int top_k, const MoeScratch* sc) {
   return rows > 0 && rows <= FLYX_MAX_ROWS && sc && rows <= sc->chunk_rows && W.n_experts <= sc->max_experts &&
-         top_k > 0 && top_k <= sc->max_top_k && sc->pairs && sc->tasks && sc->n_tasks && sc->offsets;
+         top_k > 0 && top_k <= sc->max_top_k && sc->pairs && sc->tasks && sc->n_tasks;
 }
 
 // The moe_dp4a configuration of a packed expert dp4a GEMM of `rows` rows of block type `dtype`: the options' where
-// they force one the type compiles, else a fused gate|up GEMM's by the rules, else the original tiles.
+// they force one compiled for this op and row band, else a fused gate|up GEMM's by the rules, else the original tiles.
 int moe_dp4a_cfg(const KernelOptions& o, int dtype, int rows, bool fused_gate_up) {
-  if (o.moe_dp4a >= 0 && moe_dp4a_cfg_compiled(dtype, o.moe_dp4a)) return o.moe_dp4a;
+  if (o.moe_dp4a >= 0 && moe_dp4a_compiled(dtype, o.moe_dp4a, fused_gate_up, rows)) return o.moe_dp4a;
   return fused_gate_up ? moe_gate_up_dp4a(o.tuning, dtype, rows) : tables::kMoeDp4aOriginal;
 }
 
@@ -840,7 +836,15 @@ const char* moe_dp4a_name(int cfg) {
   return cfg >= 0 && cfg < FLYX_MOE_DP4A_COUNT ? kNames[cfg] : "default";
 }
 
-bool moe_dp4a_compiled(int dtype, int cfg) { return moe_dp4a_cfg_compiled(dtype, cfg); }
+bool moe_dp4a_compiled(int dtype, int cfg, bool fused_gate_up, int rows) {
+#if FLYX_TUNE_CANDIDATES
+  return moe_dp4a_cfg_compiled(dtype, cfg, fused_gate_up, rows, 0);
+#else
+  if (cfg == tables::kMoeDp4aOriginal) return true;
+  const int arch = compiled_arch();
+  return arch > 0 && moe_dp4a_cfg_compiled(dtype, cfg, fused_gate_up, rows, arch);
+#endif
+}
 
 int moe_gate_up_dp4a(int tuning, int dtype, int rows) {
   const int s = tables::rules_sku(tuning, tables::kFamilyMoeGateUp);

@@ -931,7 +931,6 @@ Costs time_moe(const std::vector<MoeMat>& mats) {
     sc.chunk_rows = kMaxRows;
     sc.max_experts = a.E;
     sc.max_top_k = a.top_k;
-    sc.offsets = mem.alloc<int>(a.E + 1);
     sc.pairs = mem.alloc<int>(max_pairs);
     sc.tasks = mem.alloc<MoeTask>(max_pairs);
     sc.n_tasks = mem.alloc<int>(1);

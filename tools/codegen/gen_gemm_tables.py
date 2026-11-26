@@ -570,8 +570,10 @@ def compute_reachability(c: Compiled, skus, sku_archs, rules, families):
     w12_mask = [[0, 0] for _ in range(n_b)]
     fp4_mask = [[0, 0] for _ in range(n_b)]
     mt_mask = [0] * n_b  # bf16_mt configurations (k_gemm_skinny_mt, 17..64 rows)
-    # moe_dp4a configurations: the original tiles for every type everywhere (down GEMMs, unfused projections)
-    moe = [[1 << c.moe.index(MOE_ORIGINAL)] * n_dt for _ in range(n_b)]
+    # moe_dp4a configurations for fused gate|up by rows band (0: rows == 1, 1: rows >= 2);
+    # the original tiles stay compiled for every type in both bands (and for down / unfused projections).
+    orig_bit = 1 << c.moe.index(MOE_ORIGINAL)
+    moe = [[[orig_bit] * n_dt for _ in range(2)] for _ in range(n_b)]
 
     # Per-SKU shape rules; bf16_rows and bf16_draft (fmt 3, 4) name bf16_mt configurations, not a 1..16-row kernel's
     rules_by_sku = {}
@@ -659,16 +661,16 @@ def compute_reachability(c: Compiled, skus, sku_archs, rules, families):
                                 elif eng == 5:
                                     round_tc[bi][di] |= 1 << (6 if rows <= 8 else 7)
                                 break
-        # moe_gate_up (exact first-match by type and rows)
+        # moe_gate_up (exact first-match by type and rows; band 0: rows == 1, band 1: rows >= 2)
         for sid in bskus:
             mr = resolve(sid, "moe_gate_up")
-            probes = sorted({1, INF} | {v for _, lo, hi, _ in mr for v in (lo, hi, hi + 1) if v <= INF})
+            probes = sorted({1, 2, INF} | {v for _, lo, hi, _ in mr for v in (lo, hi, hi + 1) if v <= INF})
             for dt in GGML_TYPES:
                 di = dt_idx[dt]
                 for rows in probes:
                     for types, lo, hi, cfg in mr:
                         if (not types or dt in types) and lo <= rows <= hi:
-                            moe[bi][di] |= 1 << cfg
+                            moe[bi][0 if rows == 1 else 1][di] |= 1 << cfg
                             break
     return {
         "round_dp4a": round_dp4a, "round_stack": round_stack, "round_glu": round_glu,
@@ -852,7 +854,14 @@ def emit(c: Compiled, skus, rules, families, archs=(), flash_gqa=(), strata_plac
     emit_mat("kReachRoundGlu", reach["round_glu"])
     emit_mat("kReachRoundTc", reach["round_tc"])  # bits: 0:mma8 1:mma16 2:cols8 3:split8 4:split16 5:split_cols8 6:warps8 7:warps16
     emit_mat("kReachBlocksQ8", reach["blocks_q8"])
-    emit_mat("kReachMoeDp4a", reach["moe"])  # bit i: moe_dp4a configuration i
+    # bit i: moe_dp4a configuration i for fused gate|up ([arch_bucket][rows > 1][ggml_type])
+    out.append(f"inline constexpr unsigned kReachMoeDp4a[{n_buckets}][2][{len(GGML_TYPES)}] = {{")
+    for bmat in reach["moe"]:
+        out.append("    {")
+        for row in bmat:
+            out.append("        {" + ", ".join(f"{v:#x}u" for v in row) + "},")
+        out.append("    },")
+    out.append("};")
     out.append(f"inline constexpr unsigned kReachBlocksSkinny[{n_buckets}] = {{" +
                ", ".join(f"{v:#x}u" for v in reach["blocks_skinny"]) + "};")
     out.append("inline constexpr unsigned kReachBf16Mt[7] = {" + ", ".join(f"{v:#x}u" for v in reach["mt"]) + "};")

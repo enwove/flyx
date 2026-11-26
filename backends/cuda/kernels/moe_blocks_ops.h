@@ -13,14 +13,48 @@
 
 namespace flyx::cuda {
 
-// Whether moe_dp4a configuration `cfg` (FLYX_MOE_DP4A) is compiled for block type `dtype`: the original tiles for
-// every type; the others for kMoeDp4aTypes, every one with FLYX_TUNE_CANDIDATES (as cuda_bench measures them), else
-// those some table's rules reach on any architecture (the launchers compile one set for all of them).
-constexpr bool moe_dp4a_cfg_compiled(int dtype, int cfg) {
+// Whether moe_dp4a configuration `cfg` (FLYX_MOE_DP4A) is compiled for block type `dtype`, op kind (`fused_gate_up`:
+// fused gate|up vs unfused gate|up or down), row band (`rows == 1` vs `rows > 1`), and compute capability `cc`
+// (0: union of all architectures).  Original tiles stay compiled everywhere; with FLYX_TUNE_CANDIDATES every
+// configuration of kMoeDp4aTypes stays compiled for all ops and rows; else a release build compiles only fused gate|up
+// configurations reached by tables on `cc` (host dispatch checks cc=0; each kernel body traps on unreachable arches).
+constexpr bool moe_dp4a_cfg_compiled(int dtype, int cfg, bool fused_gate_up = true, int rows = 2, int cc = 0) {
   if (cfg == tables::kMoeDp4aOriginal) return true;
   if (cfg < 0 || cfg >= FLYX_MOE_DP4A_COUNT || !has_moe_dp4a_variants(dtype)) return false;
+#if FLYX_TUNE_CANDIDATES
+  (void)fused_gate_up, (void)rows, (void)cc;
+  return true;
+#else
+  if (!fused_gate_up) return false;
   const int di = tables::ggml_type_index(dtype);
-  return FLYX_TUNE_CANDIDATES || (di >= 0 && (tables::kReachMoeDp4a[tables::kArchBucketAny][di] & (1u << cfg)) != 0);
+  return di >= 0 && (tables::kReachMoeDp4a[tables::arch_bucket(cc)][rows == 1 ? 0 : 1][di] & (1u << cfg)) != 0;
+#endif
+}
+
+// Compile-time reachability predicate for a k_moe_blocks_q8_dp4a template instance on compute capability `cc`.
+template <class F, int CFG, bool FUSE_ACT, bool DIRECT_R1>
+#ifdef __CUDACC__
+__host__ __device__
+#endif
+constexpr bool moe_dp4a_kernel_active(int cc) {
+  if constexpr (CFG == tables::kMoeDp4aOriginal) {
+    (void)cc;
+    return true;
+  } else {
+#if FLYX_TUNE_CANDIDATES
+    (void)cc;
+    return CFG >= 0 && CFG < FLYX_MOE_DP4A_COUNT && has_moe_dp4a_variants(F::kDtype);
+#else
+    if constexpr (!FUSE_ACT || CFG < 0 || CFG >= FLYX_MOE_DP4A_COUNT || !has_moe_dp4a_variants(F::kDtype)) {
+      (void)cc;
+      return false;
+    } else {
+      constexpr int di = tables::ggml_type_index(F::kDtype);
+      if constexpr (di < 0) return false;
+      else return (tables::kReachMoeDp4a[tables::arch_bucket(cc)][DIRECT_R1 ? 0 : 1][di] & (1u << CFG)) != 0;
+    }
+#endif
+  }
 }
 
 // dp4a: the moe_dp4a configuration of the dp4a kernel, one compiled for the type (moe_dp4a_cfg_compiled).

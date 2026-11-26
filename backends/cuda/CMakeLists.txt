@@ -80,8 +80,8 @@ function(flyx_configure_cuda_lib target archs)
   cmake_parse_arguments(ARG "USES_TABLES" "" "" ${ARGN})
   set_target_properties(${target} PROPERTIES CUDA_ARCHITECTURES "${archs}")
   target_compile_options(${target} PRIVATE "$<$<COMPILE_LANGUAGE:CUDA>:${FLYX_CUDA_DEVICE_FLAGS}>")
-  # Every library alike: an inline function a header shares (moe_blocks_ops.h's moe_dp4a_cfg_compiled) reads it, and
-  # must read the same in every translation unit, whatever else a library includes.
+  # Define uniformly across all CUDA libraries so shared inline helpers (e.g. moe_dp4a_cfg_compiled) see the same value
+  # in every translation unit.
   target_compile_definitions(${target} PUBLIC FLYX_TUNE_CANDIDATES=$<IF:$<BOOL:${FLYX_TUNE_CANDIDATES}>,1,0>)
   if(ARG_USES_TABLES)
     add_dependencies(${target} flyx_gemm_tables)

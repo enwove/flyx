@@ -6,6 +6,7 @@
 #include <algorithm>
 #include <cstdio>
 #include <cstdlib>
+#include <numeric>
 #include <vector>
 
 #include "backends/cuda/kernels/kernels.cuh"
@@ -146,20 +147,25 @@ inline void free_copies(std::vector<BlockMat>& w) {
   w.clear();
 }
 
-// The experts kMoeRouteSets calls of `rows` rows take from a bank of E, top a row (E / 2 at least top): consecutive
-// rows keep two experts and slide the rest four a row; consecutive calls have disjoint sets, scattered over the bank
-// by a permutation (37 coprime to E).  With 128 experts and 8 a row, 32 calls complete a whole number of rotations at
-// every measured row count, including the wrap from one graph replay to the next.  Returns the distinct experts a
-// call reads.
+// The experts kMoeRouteSets calls of `rows` rows take from a bank of E, top a row (top <= E): consecutive
+// rows keep two experts (or top if smaller) and slide the rest four a row; consecutive calls rotate sets over the
+// bank by a permutation (stride >= 37 coprime to E).  With 128 experts and 8 a row, 32 calls complete a whole number
+// of rotations at every measured row count, including the wrap from one graph replay to the next.  Returns the
+// distinct experts a call reads.
 constexpr int kMoeRouteSets = 32;
 inline int make_moe_routes(int* indices, int rows, int E, int top) {
-  const int distinct = std::min(E / 2, top + 4 * (rows - 1));
+  const int pool = std::max(top, E / 2);
+  const int distinct = std::min(pool, top + 4 * (rows - 1));
+  const int keep = std::min(2, top);
+  const int rest = pool - keep;
+  int stride = 37;
+  while (E > 1 && std::gcd(stride, E) != 1) ++stride;
   std::vector<int> routes(size_t(kMoeRouteSets) * rows * top);
   for (int i = 0; i < kMoeRouteSets; ++i)
     for (int r = 0; r < rows; ++r)
       for (int slot = 0; slot < top; ++slot) {
-        const int expert = slot < 2 ? slot : 2 + (4 * r + slot - 2) % (E / 2 - 2);
-        routes[(size_t(i) * rows + r) * top + slot] = (37 * (expert + i * distinct)) % E;
+        const int expert = slot < keep || rest <= 0 ? slot : keep + (4 * r + slot - keep) % rest;
+        routes[(size_t(i) * rows + r) * top + slot] = int((int64_t(stride) * (expert + int64_t(i) * distinct)) % E);
       }
   CK(cudaMemcpy(indices, routes.data(), routes.size() * sizeof(int), cudaMemcpyHostToDevice));
   return distinct;
