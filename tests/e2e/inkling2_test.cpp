@@ -219,21 +219,42 @@ std::string gpt2_byte_token(int b) {
   return s;
 }
 
+// The tiny models' draws, the same on every platform.  <random>'s engines are specified and its distributions are not
+// (libstdc++ and MSVC make other values of one engine's bits), so Linux and Windows wrote two different models from
+// the same seeds, and what a check counts against cpu_ref was another count on each (the mixed-quant model, teacher
+// forced: 12 or 13 of 16 on Linux under a check that wants 15).  Integers from the engine, and exact arithmetic on
+// them up to one rounding.
+int draw_int(std::mt19937& rng, int lo, int hi) { return lo + int(rng() % uint32_t(hi - lo + 1)); }  // lo .. hi
+
+// lo + (hi - lo) * u, u in [0, 1) of 24 bits: the product of two floats is exact in a double, so the sum rounds once
+// whether or not a compiler fuses it.
+float draw_uniform(std::mt19937& rng, float lo, float hi) {
+  const double u = double(rng() >> 8) * 0x1p-24;
+  return float(double(lo) + double(hi - lo) * u);
+}
+
+// A normal's mean and deviation and nearly its shape (Irwin-Hall: twelve uniforms of 16 bits, variance 1, within 6).
+// The sum is exact in an integer and its product with sd exact in a double (20 and 24 bits).
+float draw_normal(std::mt19937& rng, float mean, float sd) {
+  uint32_t sum = 0;
+  for (int i = 0; i < 12; ++i) sum += rng() >> 16;
+  const double z = (double(sum) - 6.0 * 65536.0) * 0x1p-16;
+  return float(double(mean) + double(sd) * z);
+}
+
 std::vector<uint8_t> gen_f32(std::mt19937& rng, size_t n, float mean, float sd) {
-  std::normal_distribution<float> d(mean, sd);
   std::vector<uint8_t> out(n * 4);
   for (size_t i = 0; i < n; ++i) {
-    const float v = d(rng);
+    const float v = draw_normal(rng, mean, sd);
     std::memcpy(out.data() + i * 4, &v, 4);
   }
   return out;
 }
 
 std::vector<uint8_t> gen_bf16(std::mt19937& rng, size_t n, float sd) {
-  std::normal_distribution<float> d(0.f, sd);
   std::vector<uint8_t> out(n * 2);
   for (size_t i = 0; i < n; ++i) {
-    const uint16_t h = f32_to_bf16(d(rng));
+    const uint16_t h = f32_to_bf16(draw_normal(rng, 0.f, sd));
     std::memcpy(out.data() + i * 2, &h, 2);
   }
   return out;
@@ -241,12 +262,11 @@ std::vector<uint8_t> gen_bf16(std::mt19937& rng, size_t n, float sd) {
 
 std::vector<uint8_t> gen_q8_0(std::mt19937& rng, size_t n, float sd) {
   const size_t nb = n / 32;
-  std::normal_distribution<float> d(0.f, sd);
   std::vector<uint8_t> out(nb * 34);
   for (size_t b = 0; b < nb; ++b) {
     float vals[32], amax = 0.f;
     for (int i = 0; i < 32; ++i) {
-      vals[i] = d(rng);
+      vals[i] = draw_normal(rng, 0.f, sd);
       amax = std::max(amax, std::fabs(vals[i]));
     }
     const float scale = amax > 0.f ? amax / 127.f : 1e-4f;
@@ -263,40 +283,34 @@ std::vector<uint8_t> gen_q8_0(std::mt19937& rng, size_t n, float sd) {
 
 std::vector<uint8_t> gen_mxfp4(std::mt19937& rng, size_t n) {
   const size_t nb = n / 32;
-  std::uniform_int_distribution<int> ed(120, 124);
-  std::uniform_int_distribution<int> qd(0, 255);
   std::vector<uint8_t> out(nb * 17);
   for (size_t b = 0; b < nb; ++b) {
     uint8_t* dst = out.data() + b * 17;
-    dst[0] = uint8_t(ed(rng));
-    for (int i = 0; i < 16; ++i) dst[1 + i] = uint8_t(qd(rng));
+    dst[0] = uint8_t(draw_int(rng, 120, 124));
+    for (int i = 0; i < 16; ++i) dst[1 + i] = uint8_t(draw_int(rng, 0, 255));
   }
   return out;
 }
 
 std::vector<uint8_t> gen_q2_0(std::mt19937& rng, size_t n) {
   const size_t nb = n / 64;
-  std::uniform_real_distribution<float> sd(0.01f, 0.08f);
-  std::uniform_int_distribution<int> qd(0, 255);
   std::vector<uint8_t> out(nb * 18);
   for (size_t b = 0; b < nb; ++b) {
     uint8_t* dst = out.data() + b * 18;
-    const uint16_t dh = f32_to_f16(sd(rng));
+    const uint16_t dh = f32_to_f16(draw_uniform(rng, 0.01f, 0.08f));
     std::memcpy(dst, &dh, 2);
-    for (int i = 0; i < 16; ++i) dst[2 + i] = uint8_t(qd(rng));
+    for (int i = 0; i < 16; ++i) dst[2 + i] = uint8_t(draw_int(rng, 0, 255));
   }
   return out;
 }
 
 std::vector<uint8_t> gen_nvfp4(std::mt19937& rng, size_t n) {
   const size_t nb = n / 64;
-  std::uniform_int_distribution<int> sd(0x18, 0x38);  // valid positive E4M3 scales (never 0x7F/0xFF)
-  std::uniform_int_distribution<int> qd(0, 255);
   std::vector<uint8_t> out(nb * 36);
   for (size_t b = 0; b < nb; ++b) {
     uint8_t* dst = out.data() + b * 36;
-    for (int g = 0; g < 4; ++g) dst[g] = uint8_t(sd(rng));
-    for (int i = 0; i < 32; ++i) dst[4 + i] = uint8_t(qd(rng));
+    for (int g = 0; g < 4; ++g) dst[g] = uint8_t(draw_int(rng, 0x18, 0x38));  // positive E4M3 scales, none 0x7F/0xFF
+    for (int i = 0; i < 32; ++i) dst[4 + i] = uint8_t(draw_int(rng, 0, 255));
   }
   return out;
 }
