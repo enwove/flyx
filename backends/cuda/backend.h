@@ -87,7 +87,7 @@ inline void destroy_side(SideStream& s) {
 //   attention=split|head  prefill attention in float32 / no KV-head grouping (and no FP8 K/V)
 //   gemm=rows             every GEMM on the CUDA-core row path
 //   pdl=0|1 programmatic dependent launch off / on (default: the GPU's table)
-//   head_cert=0 greedy choices read the whole head, not the certified head
+//   head_cert=0 greedy choices read the whole head, not the certified head (a softcapped head is never certified)
 //   wait=spin|poll|auto   wait for the device by spinning (lowest latency, one core busy), by polling with short sleeps
 //                         (the default on Linux), or (auto, the default on Windows) spinning while the last waits for a
 //                         round's result took under 1.5 ms (a sleep ends ~0.5 ms late), polling past that (runner.cpp)

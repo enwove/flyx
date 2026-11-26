@@ -266,11 +266,21 @@ void release_sign_head(flyx_bmodel* m, SignHead* sh, int N, int K) {
 // the bytes of bf16; the bf16 stays, it may be the embedding table).  The
 // certified head's copy (head_cert) is for speed only: where the GPU has no room
 // for it (device_malloc) the whole head chooses, the same tokens.
+// A softcapped head (softcap > 0) chooses from cap * tanh(z / cap), and the certificate bounds z: two scores it
+// bounds apart can round or saturate to one capped score, where the choice is the lower token id, a column the screen
+// may have cut.  Such a head chooses from the whole head (no copy for it); with no head to certify, no session takes
+// head_certify's scratch.
 void make_head_fp8(flyx_bmodel* m) {
   auto& ko = m->opt.kernels;
   if (!ko.head_fp8 && !ko.head_cert) return;
   for (Block& b : m->blocks)  // the head blocks (m->head_block is only the one drafts read)
     if (auto* h = std::get_if<HeadBlock>(&b); h && h->w && h->hidden % 32 == 0 && !h->w8) {
+      if (!ko.head_fp8 && h->softcap > 0.f) {
+        if (m->verbose)
+          std::fprintf(stderr, "flyx-cuda: no certified head for a softcapped head (softcap %g); the whole head\n",
+                       double(h->softcap));
+        continue;
+      }
       try {
         h->w8 = m->alloc<uint8_t>(size_t(h->vocab) * h->hidden);
         h->rs8 = m->alloc<float>(h->vocab);
@@ -291,6 +301,12 @@ void make_head_fp8(flyx_bmodel* m) {
                        double(h->vocab) * h->hidden / 1e6, h->vocab, h->hidden);
       }
     }
+  if (ko.head_cert && !ko.head_fp8) {
+    bool any = false;
+    for (const Block& b : m->blocks)
+      if (const auto* h = std::get_if<HeadBlock>(&b); h && h->cert) any = true;
+    ko.head_cert = any;
+  }
   CK(cudaDeviceSynchronize());
 }
 

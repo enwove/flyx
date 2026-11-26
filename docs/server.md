@@ -166,7 +166,7 @@ Passed verbatim to the backend (`backends/cuda/backend.cpp`). Unknown keys or in
 | `vision` | `disk` \| `host` \| `gpu` \| `auto` | `disk` | Vision encoder weight placement (`disk`: auto-deleted flushed temp file, 0 VRAM & 0 locked host RAM, 3-stage streamed via OS page cache + 16 MiB lazy pinned ring; `host`: pinned host RAM, 0 VRAM; `gpu`: GPU resident; `auto`: `gpu` when >= 8 GB free after weights, else `disk`). |
 | `vision_quant` | `q8` \| `exact` \| `nvfp4` | `q8` | On-the-fly quantization of floating-point vision linears (`q8`: Q8_0, `exact`: file precision, `nvfp4`: NVFP4; pre-quantized GGML blocks stay packed). |
 | `head_w12` | `0` \| `1` | `1` | Lossless 12-bit packed bf16 output head for 1..16 rows (`0` saves ~0.95 GB on 4B, ~5% slower plain). |
-| `head_cert` | `0` \| `1` | `1` | Certified FP8-filtered exact greedy head (bit-identical greedy tokens; `0` saves ~0.64 GB on 4B). |
+| `head_cert` | `0` \| `1` | `1` | Certified FP8-filtered exact greedy head (bit-identical greedy tokens; `0` saves ~0.64 GB on 4B). A softcapped head (Inkling-2) is never certified: capped scores can tie where the raw ones do not, so greedy decoding reads the whole head. |
 | `head_fp8` | `0` \| `1` | `0` | Lossy FP8 output head (trades accuracy for decode speed). |
 | `draft_head` | `pick` \| `full` | `pick` | Draft candidate scoring: 1-bit top-256 prefilter + exact score (`pick`) vs full NVFP4 head (`full`). |
 | `draft_weights` | `nvfp4` \| `exact` | `nvfp4` | Quantized (`nvfp4`/Q8_0) vs exact bf16 drafter weights. |

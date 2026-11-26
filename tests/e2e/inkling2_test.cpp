@@ -1334,6 +1334,46 @@ int main(int argc, char** argv) {
         check(inexact == exact + (router + forget) * sizeof(float),
               "one low bit in each repeated core matrix retains exactly one F32 router and one F32 forget matrix");
       }
+      // A softcap small enough to saturate: cap * tanh(z / cap) is the cap itself for every score well above the
+      // cap, and the greedy choice the lowest token id of those, which a screen bounding z apart would have cut.  A
+      // softcapped head holds no certified copy: greedy decoding with head_cert on (the default) reads the whole head,
+      // in plain rounds and in lookup rounds of several rows, token for token what head_cert=0 gives.
+      {
+        TinySpec capped = spec;
+        capped.softcap = 0.01f;
+        const auto path = dir / "tiny_inkling2_saturated_cap.gguf";
+        write_tiny_inkling2(path, capped, false, 1001);
+        auto whole = load_engine(path.string(), "cuda", {.backend_opts = "head_cert=0"});
+        auto cert = load_engine(path.string(), "cuda");
+        auto cert_rows = load_engine(path.string(), "cuda", {.speculative = true, .lookup = true, .width = 0});
+        const auto want = fresh_gen(*whole, prompt, 32, false);
+        // The tie is there: the first token's capped scores have their highest at two or more ids, the lowest chosen.
+        int ties = 0, lowest = -1;
+        {
+          Session s(whole.get());
+          std::string err;
+          if (!s.init(&err)) throw std::runtime_error(err);
+          const auto* api = whole->api();
+          flyx_gen_params gp{};
+          gp.top_p = 1.f;
+          flyx_round_result rr{};
+          std::vector<float> z(size_t(whole->model().desc().vocab));
+          if (api->prefill(whole->prefill_plan(), s.seq(), prompt.data(), int32_t(prompt.size()), &gp) ||
+              api->read(s.seq(), &rr) || api->logits(s.seq(), 0, z.data()))
+            throw std::runtime_error(api->last_error());
+          const float top = *std::max_element(z.begin(), z.end());
+          for (size_t v = 0; v < z.size(); ++v)
+            if (z[v] == top && ties++ == 0) lowest = int(v);
+        }
+        check(ties >= 2 && !want.empty() && want[0] == lowest,
+              "saturating softcap: " + std::to_string(ties) + " ids tie at the cap, the lowest (" +
+                  std::to_string(lowest) + ") chosen");
+        check(weight_bytes(*cert) == weight_bytes(*whole), "a softcapped head holds no certified copy");
+        check(same_tokens(fresh_gen(*cert, prompt, 32, false), want),
+              "saturating softcap: greedy with head_cert on == the whole head");
+        check(same_tokens(fresh_gen(*cert_rows, prompt, 32, false), want),
+              "saturating softcap: greedy with head_cert on, lookup rounds of several rows == the whole head");
+      }
       // ---- 2. CUDA vs cpu_ref, Gate 2 (fusion=0 == fusion=1), Gate 4 (plain == DSpark), CUDA graphs ----
       auto cu_plain = load_engine(bf16_gguf.string(), "cuda", {.prefill_chunk = 32});
       auto cu_unfused = load_engine(bf16_gguf.string(), "cuda", {.prefill_chunk = 32, .backend_opts = "fusion=0"});
