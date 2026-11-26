@@ -415,6 +415,9 @@ flyx_add_py_test(gemm_tables ${CMAKE_SOURCE_DIR}/tests/tools/codegen/gen_gemm_ta
 add_test(NAME scheduler_cpu_ref COMMAND scheduler_test ${ASSETS}/tiny.flyx cpu_ref)
 add_test(NAME scheduler_queue COMMAND scheduler_test ${ASSETS}/tiny.flyx cpu_ref queue)
 add_test(NAME scheduler_prewarmed_history COMMAND scheduler_test ${ASSETS}/tiny.flyx cpu_ref history)
+# Raw prompts of different clients (the same text, or one extending another's) each run to their own end; a shared
+# conversation id replaces.
+add_test(NAME scheduler_raw_clients COMMAND scheduler_test ${ASSETS}/tiny.flyx cpu_ref raw-clients)
 add_test(NAME scheduler_interrupted_prewarm COMMAND scheduler_test ${ASSETS}/tiny.flyx cpu_ref interrupted-prewarm)
 add_test(NAME scheduler_reassigned_prewarm COMMAND scheduler_test ${ASSETS}/tiny.flyx cpu_ref reassigned-prewarm)
 add_test(NAME scheduler_repeated_prewarm COMMAND scheduler_test ${ASSETS}/tiny.flyx cpu_ref repeated-prewarm)
@@ -447,7 +450,8 @@ flyx_add_golden_test(golden_cpu_ref_gdn128 ARGS cpu_ref gdn128)
 flyx_add_golden_test(golden_cpu_ref_window ARGS cpu_ref window)
 
 set_tests_properties(tokenizer tokenizer_minicpm5 chat chat_qwen35 reply_grammars request reply_text
-                     scheduler_cpu_ref scheduler_queue scheduler_prewarmed_history scheduler_interrupted_prewarm
+                     scheduler_cpu_ref scheduler_queue scheduler_prewarmed_history scheduler_raw_clients
+                     scheduler_interrupted_prewarm
                      scheduler_reassigned_prewarm scheduler_repeated_prewarm scheduler_marked_system session_host_budget generation_edges elastic_load capi
                      llama_models PROPERTIES FIXTURES_REQUIRED assets)
 
