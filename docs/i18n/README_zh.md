@@ -41,12 +41,11 @@
 
 ## 核心特性
 
-- **投机解码提速，输出一字不差** — 内置 MTP、DFlash2、DSpark 草稿器与提示查找：Qwen3.8-27B 在 RTX 5090 上写代码达 **565.5 tok/s**，是普通解码的 **6.03×**，且每个 token 都与普通解码的结果完全一致（[实测性能](#实测性能)）。
-- **原生长上下文，不降智** — Qwen3.8-27B 的完整 262K 上下文，单张消费级显卡即可跑通，16 GB 显卡也不例外。K/V 缓存超出显存时无缝延展至系统内存，不截断、不滑窗：RTX 5090（`NVFP4`）在 256K 达 **164.5 tok/s**，24 GB RTX 4090 在 256K 仍达 **122.7 tok/s**，且 **32K–256K 大海捞针 100% 精准召回**（[v0.2.0 实测](../benchmarks.md#1-qwen38-27b-long-context-coding-benchmark)）。
+- **最高 6× 生成加速** — 内置投机解码（MTP、DFlash2、DSpark 与提示查找）：在 RTX 5090 上，Qwen3.8-27B 达 **565.5 tok/s**，Inkling-2-Mini 达 **438.9 tok/s**（[实测性能](#实测性能)）。
+- **消费级 PC 上最高 1M 原生上下文** — 16 GB 显存 + 32 GB 内存即可运行 Inkling-2-Mini 的 1M 上下文。
 - **逐卡调优，告别反复试超参** — 内置 11 款主流 NVIDIA 显卡的实测 kernel 调优表，启动时根据可用显存与内存自动配置上下文长度、KV 精度与显存/内存配比，不再手动折腾卸载层数、batch 和缓存类型。
 - **免安装、免依赖、约 57 MB** — CUDA 与 C++ 运行库全部静态内置，只需 NVIDIA 驱动（≥ 580），不装 CUDA Toolkit、Python 或 Docker。Windows 是单个约 57 MB 的 `.exe`（双击即运行），Linux 为压缩包。
-- **图像输入** — 具备视觉能力的模型配合 `mmproj` 投影器即可读图：命令行（`--image`）、OpenAI 与 Anthropic API、控制台粘贴或拖放均可。
-- **自带图形面板 & 终端监控** — 启动自动打开多语言 Web 控制台（中/英/日/韩/德/法/西 7 种语言），带实时状态引导与完整本地化 API 文档；可直接检索加载 Hugging Face 或本地模型、发起对话，并实时查看速度、显存/内存分布、会话上下文、请求详情与日志（[面板说明](../monitor.md)）。
+- **自带图形面板 & 终端监控** — 启动自动打开多语言 Web 控制台（中/英/日/韩/德/法/西 7 种语言），带实时状态引导与完整本地化 API 文档；可直接检索加载 Hugging Face 或本地模型、发起对话（文字与图片），并实时查看速度、显存/内存分布、会话上下文、请求详情与日志（[面板说明](../monitor.md)）。
 - **一键接入多个 Coding Agent** — 同时兼容 OpenAI（Chat Completions / Responses）与 Anthropic Messages 协议，支持工具调用与多轮前缀缓存；在面板 **Integration** 页即可**一键选目录拉起 Claude Code 或 Codex CLI**（Windows），或复制命令接入 **DeepSeek Harness、OpenCode、Pi**。
 - **精度可验证，绝不暗中掉点** — 全算子对标 `float64` 参考实现回归测试；默认 FP8 KV 在 27B 上相对 16-bit 的 KL 仅 **0.0009–0.0016**；投机解码与普通解码**逐 token 完全一致**（[精度与数值契约](../design/numerics.md)）。
 
