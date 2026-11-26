@@ -1,6 +1,8 @@
 // Copyright 2026 The flyx Authors. SPDX-License-Identifier: Apache-2.0
 #include "apps/flyx-server/model_host.h"
 
+#include <chrono>
+#include <condition_variable>
 #include <cstdint>
 #include <cstdio>
 #include <filesystem>
@@ -81,16 +83,42 @@ bool write_settings_locked(const ojson& root, std::string* err) {
   return true;
 }
 
-// A model's requests end, and its memory comes back once the last of them lets go of it.
+// A served scheduler's end: set once it is destroyed (its worker joined, its engine and the backend's model closed),
+// on whichever thread let go of it last.  A weak pointer expires as that owner starts the destructor, before any of
+// the memory comes back.
+struct Teardown {
+  std::mutex mu;
+  std::condition_variable cv;
+  bool done = false;
+};
+
+struct SignalTeardown {
+  std::shared_ptr<Teardown> teardown;
+  void operator()(Scheduler* s) const {
+    delete s;
+    {
+      std::lock_guard<std::mutex> lock(teardown->mu);
+      teardown->done = true;
+    }
+    teardown->cv.notify_all();
+  }
+};
+
+// A model's requests end, and its memory comes back once the last of them lets go of it: returns when it has.
 void retire(std::shared_ptr<Scheduler> old) {
   if (!old) return;
   old->close();
+  const SignalTeardown* signal = std::get_deleter<SignalTeardown>(old);
+  const std::shared_ptr<Teardown> teardown = signal ? signal->teardown : nullptr;
   std::weak_ptr<Scheduler> gone = old;
   old.reset();
-  for (int i = 0; !gone.expired(); ++i) {
-    if (i == 100) std::fprintf(stderr, "flyx-server: waiting for the last model's requests to end\n");
-    os::sleep_ms(50);
+  if (!teardown) {  // not one ModelHost::open made: only its last owner is known to have let go
+    while (!gone.expired()) os::sleep_ms(50);
+    return;
   }
+  std::unique_lock<std::mutex> lock(teardown->mu);
+  for (int i = 0; !teardown->cv.wait_for(lock, std::chrono::milliseconds(50), [&] { return teardown->done; }); ++i)
+    if (i == 100) std::fprintf(stderr, "flyx-server: waiting for the last model's requests to end\n");
 }
 
 ojson drafters_json(const std::vector<apps::DrafterSource>& ds, const char* where) {
@@ -415,7 +443,8 @@ std::shared_ptr<Scheduler> ModelHost::open(const apps::Fetched& f, const EngineO
   const double t0 = os::now_ms();
   std::shared_ptr<Scheduler> sched;
   try {
-    sched = std::make_shared<Scheduler>(f.model, eo, so_);
+    // A deleter that says when it is gone, for retire() to wait on before the next model loads.
+    sched = std::shared_ptr<Scheduler>(new Scheduler(f.model, eo, so_), SignalTeardown{std::make_shared<Teardown>()});
   } catch (const std::exception& e) {
     // A model file no check foresaw: a load that failed with its reason, not the end of the server.
     *err = e.what();

@@ -1,0 +1,218 @@
+// Copyright 2026 The flyx Authors. SPDX-License-Identifier: Apache-2.0
+// ModelHost (apps/flyx-server/model_host.h): a model switch loads the new model only once the old one is gone, not
+// merely once nobody holds it.  The last reference to the old model's scheduler is a request's (an HTTP handler's),
+// let go on a thread of its own while the backend's close of the old model is held up there: the new model must not
+// start to load until that close has returned.  The tiny model on a backend that hands every call to the float64 one,
+// holding at most one model open at a time (a GPU with room for one).
+//
+//   model_host_test MODEL.flyx
+#include <stdlib.h>
+
+#include <atomic>
+#include <chrono>
+#include <condition_variable>
+#include <cstdio>
+#include <filesystem>
+#include <functional>
+#include <memory>
+#include <mutex>
+#include <string>
+#include <thread>
+#include <vector>
+
+#include "apps/flyx-server/model_host.h"
+#include "core/exec/engine.h"
+#include "core/os/os.h"
+#include "core/os/path.h"
+
+using namespace flyx;
+using flyx::server::ModelHost;
+
+extern "C" void flyx_test_delegate(const flyx_backend_api*);
+
+namespace {
+
+int failures = 0;
+
+void check(bool ok, const std::string& what) {
+  std::printf("  %-4s %s\n", ok ? "ok" : "FAIL", what.c_str());
+  if (!ok) ++failures;
+}
+
+void set_env(const char* name, const std::string& value) {
+#if defined(_WIN32)
+  _putenv_s(name, value.c_str());
+#else
+  setenv(name, value.c_str(), 1);
+#endif
+}
+
+// The backend's models, as the delegating backend sees them.
+const flyx_backend_api* cpu = nullptr;
+std::mutex mu;
+std::condition_variable cv;
+int open_models = 0;           // held now: one at most
+int opens = 0, closes = 0;
+bool refused = false;          // an open came while another model was still open
+bool hold_next_close = false;  // the next close waits for release_close
+bool closing = false;          // a held close has begun
+bool release_close = false;
+std::vector<std::string> events;
+
+int one_model_open(const flyx_model_desc* model, const flyx_open_options* opts, flyx_bmodel** out) {
+  {
+    std::lock_guard<std::mutex> lock(mu);
+    events.push_back("open");
+    if (open_models > 0) {
+      refused = true;
+      return -1;  // no room for a second model
+    }
+  }
+  const int rc = cpu->open(model, opts, out);
+  std::lock_guard<std::mutex> lock(mu);
+  if (rc == 0) ++open_models, ++opens;
+  return rc;
+}
+
+void held_close(flyx_bmodel* m) {
+  std::unique_lock<std::mutex> lock(mu);
+  events.push_back("close begins");
+  if (hold_next_close) {
+    hold_next_close = false;
+    closing = true;
+    cv.notify_all();
+    cv.wait(lock, [] { return release_close; });
+  }
+  lock.unlock();
+  cpu->close(m);
+  lock.lock();
+  --open_models, ++closes;
+  events.push_back("close ends");
+  cv.notify_all();
+}
+
+bool wait_for(const std::function<bool()>& done, int ms) {
+  const double until = os::now_ms() + ms;
+  while (!done()) {
+    if (os::now_ms() > until) return false;
+    std::this_thread::sleep_for(std::chrono::milliseconds(2));
+  }
+  return true;
+}
+
+}  // namespace
+
+int main(int argc, char** argv) {
+  if (argc < 2) {
+    std::fprintf(stderr, "usage: model_host_test MODEL.flyx\n");
+    return 2;
+  }
+  // The settings file a load writes: in a directory of this run's own, never the user's.
+  namespace fs = std::filesystem;
+  const fs::path config = fs::temp_directory_path() / ("flyx-model-host-test-" + std::to_string(os::process_id()));
+  std::error_code ec;
+  fs::create_directories(config, ec);
+  set_env("APPDATA", os::from_path(config));
+  set_env("XDG_CONFIG_HOME", os::from_path(config));
+  const std::string settings = ModelHost::settings_path();
+  if (settings.rfind(os::from_path(config), 0) != 0) {
+    std::printf("the settings file would be %s, not in %s\n", settings.c_str(), os::from_path(config).c_str());
+    return 1;
+  }
+
+  EngineOptions eo;
+  eo.backend = "cpu_ref";
+  eo.max_ctx = 256;
+  eo.speculative = false;
+  std::unique_ptr<os::DynLib> lib;
+  flyx_device_info device{};
+  std::string err;
+  if (!open_backend(eo, &lib, &cpu, &device, &err)) {
+    std::printf("backend: %s\n", err.c_str());
+    return 1;
+  }
+  static flyx_backend_api one_at_a_time = *cpu;
+  one_at_a_time.open = one_model_open;
+  one_at_a_time.close = held_close;
+  flyx_test_delegate(&one_at_a_time);
+  eo.backend = "test-host-kv";
+
+  SchedulerOptions so;
+  so.max_sessions = 1;
+  {
+    ModelHost host(so);
+    ModelHost::Want want;
+    want.model = argv[1];
+    want.eo = eo;
+    check(host.run(want, &err), "the first model loads " + err);
+    int opens_before = 0;
+    {
+      std::lock_guard<std::mutex> lock(mu);
+      opens_before = opens;
+      events.clear();
+      hold_next_close = true;
+    }
+    // A request's hold on the model: once the switch has let go of the host's, the last one.
+    std::shared_ptr<Scheduler> request = host.served().sched;
+    std::atomic<bool> switched{false};
+    bool switch_ok = false;
+    std::string switch_err;
+    std::thread switcher([&] {
+      switch_ok = host.run(want, &switch_err);
+      switched.store(true);
+    });
+    const bool let_go = wait_for([&] { return request.use_count() == 1; }, 30000);
+    check(let_go, "the switch lets go of the host's reference to the old model");
+    // The request ends on its own thread, and the old model's close is held up there.
+    std::thread request_end([r = std::move(request)]() mutable { r.reset(); });
+    bool held = false;
+    {
+      std::unique_lock<std::mutex> lock(mu);
+      held = cv.wait_for(lock, std::chrono::seconds(30), [] { return closing; });
+    }
+    check(held, "the old model's close begins on the thread of the request that held it last");
+    // Long enough for a switch that only waits for nobody to hold the old model (as it polled: every 50 ms) to load.
+    std::this_thread::sleep_for(std::chrono::milliseconds(600));
+    {
+      std::lock_guard<std::mutex> lock(mu);
+      check(held && opens == opens_before && !refused && !switched.load() &&
+                events == std::vector<std::string>{"close begins"},
+            "while the old model closes, the switch waits and the new model does not start to load");
+      release_close = true;
+    }
+    cv.notify_all();
+    request_end.join();
+    switcher.join();
+    {
+      std::lock_guard<std::mutex> lock(mu);
+      std::string order;
+      for (const auto& e : events) order += (order.empty() ? "" : ", ") + e;
+      check(switch_ok && !refused && opens == opens_before + 1 && open_models == 1 && events.size() >= 3 &&
+                events[0] == "close begins" && events[1] == "close ends" && events[2] == "open",
+            "the new model loads once the old one's close has returned (" + order + ") " + switch_err);
+    }
+    // The new model serves.
+    Request rq;
+    rq.chat = false;
+    rq.text = "The new model answers";
+    rq.gen.max_new_tokens = 2;
+    rq.gen.ignore_eos = true;
+    auto served = host.served().sched;
+    int status = 0;
+    auto job = served ? served->submit(rq, &err, &status) : nullptr;
+    JobEvent ev;
+    bool answered = false;
+    while (job && job->next(&ev, 60000)) {
+      if (ev.kind == JobEvent::kDone) answered = ev.result.usage.new_tokens == 2;
+      if (ev.kind == JobEvent::kDone || ev.kind == JobEvent::kError) break;
+    }
+    check(answered, "the new model answers a request " + err);
+  }
+  {
+    std::lock_guard<std::mutex> lock(mu);
+    check(open_models == 0 && closes == opens, "every model the backend opened is closed with the host");
+  }
+  fs::remove_all(config, ec);
+  std::printf("model_host: %s\n", failures ? "FAILED" : "ok");
+  return failures ? 1 : 0;
+}
