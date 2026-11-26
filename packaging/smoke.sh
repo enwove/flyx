@@ -23,6 +23,7 @@ for required in bin/flyx bin/flyx-server lib/libflyx.so lib/flyx/libflyx-cpu_ref
                 include/flyx/flyx.h python/flyx/__init__.py LICENSE NOTICE; do
   [[ -f "$P/$required" ]] || { echo "  FAIL package is missing $required"; exit 1; }
 done
+python3 "$(dirname "$0")/check_glibc.py" --max-glibc "${MAX_GLIBC:-2.35}" "$P"
 bad=0
 for f in "$P"/bin/* "$P"/lib/*.so "$P"/lib/flyx/*.so; do
   if ! linked=$(ldd "$f"); then echo "  FAIL could not inspect $(basename "$f")"; exit 1; fi

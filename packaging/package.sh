@@ -100,6 +100,7 @@ EOF
 python -m pip wheel --no-deps --no-build-isolation -q -w "$W/out" "$W"
 # Let the linked ELF libraries determine the minimum compatible platform, in both the filename and WHEEL metadata.
 python -m auditwheel repair --plat auto -w "$W/checked" "$W"/out/*.whl
+python packaging/check_glibc.py --max-glibc "${MAX_GLIBC:-2.35}" "$W"/checked/*.whl
 python -m pip install --no-index --no-deps -q --target "$W/installed" "$W"/checked/*.whl
 python -I packaging/smoke_binding.py "$W/installed" "$BUILD/assets/tiny.flyx"
 mv "$W"/checked/*.whl dist/
