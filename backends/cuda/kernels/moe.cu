@@ -420,10 +420,20 @@ __global__ void __launch_bounds__(32 * NW)
   // One row (DIRECT_R1) loads a span ahead; more rows keep a span's loads beside its products (ahead measured 1-2%
   // slower on 3-7 row rounds there: the registers, where the rows already keep a warp's loads busy).
   constexpr bool kAhead = DIRECT_R1;
+  // One row loads two spans ahead (a0/a1 hold span s + 1 while span s + 2 loads): one row's 4-5 warps an SM keep too
+  // few bytes in flight with one (RTX 5090 Inkling-2-Mini decode +1.1% over one ahead).
+  constexpr bool kAhead2 = DIRECT_R1;
   Wspan w0, w1;  // w1 unused (and dead) unless FUSE_ACT
+  Wspan a0, a1;  // span s + 1 (kAhead2)
   if (kAhead && works) {
     load_w(qp0, sp0, 0, w0);
     if constexpr (FUSE_ACT) load_w(qp1, sp1, 0, w1);
+    if constexpr (kAhead2) {
+      if (spans > 1) {
+        load_w(qp0, sp0, SPAN, a0);
+        if constexpr (FUSE_ACT) load_w(qp1, sp1, SPAN, a1);
+      }
+    }
   }
   stage(0, 0);
   for (int s_idx = 0; s_idx < spans; ++s_idx) {
@@ -445,19 +455,27 @@ __global__ void __launch_bounds__(32 * NW)
         }
       }
       Wspan n0, n1;
-      const bool more = kAhead && s_idx + 1 < spans;
+      const int ahead = kAhead2 ? 2 : 1;
+      const bool more = kAhead && s_idx + ahead < spans;
       if (!kAhead) {
         load_w(qp0, sp0, s_idx * SPAN, w0);
         if constexpr (FUSE_ACT) load_w(qp1, sp1, s_idx * SPAN, w1);
       }
       if (more) {
-        const int kn = (s_idx + 1) * SPAN;
+        const int kn = (s_idx + ahead) * SPAN;
         load_w(qp0, sp0, kn, n0);
         if constexpr (FUSE_ACT) load_w(qp1, sp1, kn, n1);
       }
       mma_half(w0, av, bv, acc0);
       if constexpr (FUSE_ACT) mma_half(w1, av, bv, acc1);
-      if (more) {
+      if constexpr (kAhead2) {
+        w0 = a0;
+        if constexpr (FUSE_ACT) w1 = a1;
+        if (more) {
+          a0 = n0;
+          if constexpr (FUSE_ACT) a1 = n1;
+        }
+      } else if (more) {
         w0 = n0;
         if constexpr (FUSE_ACT) w1 = n1;
       }
