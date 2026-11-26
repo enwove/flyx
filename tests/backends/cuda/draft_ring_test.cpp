@@ -58,6 +58,14 @@ void history() {
   r.wrote(305, 306);  // 305 overwrites 177
   check(!r.kept(1), "  then refused");
 
+  r.init(128, 8);
+  r.wrote(0, 64);
+  r.keep(0, 64);
+  r.keep(1, 60);
+  r.restored(1);
+  r.wrote(60, 64);
+  check(!r.kept(0) && r.kept(1), "divergent rows [60, 64) overwrite only the checkpoint at 64 without wrapping");
+
   // Restore: the floor is the checkpoint's window; the positions before it are no longer held.
   r.init(128, 8);
   r.wrote(0, 64);

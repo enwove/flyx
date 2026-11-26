@@ -48,13 +48,13 @@ class DraftRing {
     if (slots_ == 0 || to <= from) return;
     floor_ = std::max(floor_, to - slots_);
     for (Kept& k : kept_)
-      if (k.ok && (from < k.low || to - slots_ > k.low)) k.ok = false;
+      if (k.ok && (from < k.end || to - slots_ > k.low)) k.ok = false;
   }
   // The sequence back at position 0: nothing before it to hold.  Checkpoints keep what they hold.
   void reset() { floor_ = 0; }
   // Checkpoint c taken at pos: its window, if the ring holds it now (else the checkpoint keeps none).
   bool keep(int c, int pos) {
-    kept_[c] = {holds(pos), low(pos)};
+    kept_[c] = {holds(pos), low(pos), pos};
     return kept_[c].ok;
   }
   // Checkpoint c's window is still in the ring: it may be restored or saved as a snapshot.
@@ -79,7 +79,7 @@ class DraftRing {
  private:
   struct Kept {
     bool ok = false;
-    int low = 0;
+    int low = 0, end = 0;
   };
   int slots_ = 0, reach_ = 0, floor_ = 0;
   Kept kept_[FLYX_CHECKPOINTS]{};
