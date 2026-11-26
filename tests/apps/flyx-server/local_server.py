@@ -8,8 +8,10 @@ test's server takes none of that from the shell that started the test: what is t
 import json
 import os
 from pathlib import Path
-import socket
+import re
 import subprocess
+import sys
+import threading
 import time
 from urllib.error import URLError
 from urllib.request import urlopen
@@ -44,25 +46,39 @@ def _without_inherited(env):
     return {k: v for k, v in env.items() if not (_shell_setting(k) and os.environ.get(k) == v)}
 
 
-def free_port():
-    with socket.socket() as sock:
-        sock.bind(("127.0.0.1", 0))
-        return sock.getsockname()[1]
+_LISTENING = re.compile(rb"listening on (http://[^\s,]+)")
 
 
 def serve(exe, cwd, env, model=(), on_ready=None, *, ctx=128, options=(), expect_name="test model", stderr=False):
-    """Starts `exe serve` on `model` (cpu_ref, a port of its own), waits until it has loaded the model named
-    `expect_name`, calls on_ready(origin), and ends it.  Returns what it wrote to stderr where `stderr` is true."""
-    port = free_port()
-    command = [exe, "serve", *model, "--backend", "cpu_ref", "--ctx", str(ctx), "--port", str(port),
+    """Starts `exe serve` on `model` (cpu_ref, on a port the OS chooses: --port 0, read back from where the server
+    says it listens), waits until it has loaded the model named `expect_name`, calls on_ready(origin), and ends it.
+    What the server writes to stderr goes on to this process's stderr, or is returned where `stderr` is true."""
+    command = [exe, "serve", *model, "--backend", "cpu_ref", "--ctx", str(ctx), "--port", "0",
                "--no-monitor", "--no-browser", *options]
-    server = subprocess.Popen(command, cwd=cwd, env=_without_inherited(env),
-                              stderr=subprocess.PIPE if stderr else None)
+    server = subprocess.Popen(command, cwd=cwd, env=_without_inherited(env), stderr=subprocess.PIPE)
+    said, origin, listening = [], [], threading.Event()
+
+    def read():
+        for line in iter(server.stderr.readline, b""):
+            said.append(line)
+            if not stderr:
+                sys.stderr.buffer.write(line)
+                sys.stderr.flush()
+            if not origin and (m := _LISTENING.search(line)):
+                origin.append(m[1].decode())
+                listening.set()
+        listening.set()  # the server ended without saying where
+
+    reader = threading.Thread(target=read, daemon=True)
+    reader.start()
     try:
         deadline = time.monotonic() + 30
+        listening.wait(30)
+        if not origin:
+            raise RuntimeError(f"server did not say where it listens (exit {server.poll()})")
         while server.poll() is None and time.monotonic() < deadline:
             try:
-                with urlopen(f"http://127.0.0.1:{port}/health", timeout=1) as reply:
+                with urlopen(origin[0] + "/health", timeout=1) as reply:
                     health = json.load(reply)
                 if health.get("loaded"):
                     assert health["model"] == expect_name, health
@@ -75,12 +91,13 @@ def serve(exe, cwd, env, model=(), on_ready=None, *, ctx=128, options=(), expect
         else:
             raise RuntimeError(f"server did not load the model (exit {server.poll()})")
         if on_ready:
-            on_ready(f"http://127.0.0.1:{port}")
+            on_ready(origin[0])
     finally:
         server.terminate()
         try:
-            said = server.communicate(timeout=10)[1]
+            server.wait(timeout=10)
         except subprocess.TimeoutExpired:
             server.kill()
-            said = server.communicate()[1]
-    return said
+            server.wait()
+        reader.join(timeout=10)
+    return b"".join(said) if stderr else None
