@@ -11,6 +11,13 @@ RowNeeds row_needs(const flyx_bmodel* m) {
   RowNeeds n;
   int k = 0;  // largest GEMM K
   auto ks = [&](std::initializer_list<int> l) { k = std::max(k, std::max(l)); };
+  // lora_down_rows' slice sums a row: the stacked a's (`linears` of them on the block's input, K `in`), the last's (K
+  // `last_in`)
+  auto lora_part = [&](int linears, int rank, int in, int last_in) {
+    if (rank)
+      n.lora_part = std::max({n.lora_part, lora_down_part_floats(linears * rank, in, 1),
+                              lora_down_part_floats(rank, last_in, 1)});
+  };
   for (const Block& blk : m->blocks) {
     if (const auto* a = std::get_if<AttnBlock>(&blk)) {
       n.proj = std::max(n.proj, a->n_in());
@@ -19,17 +26,21 @@ RowNeeds row_needs(const flyx_bmodel* m) {
       n.attn_state = std::max(n.attn_state, a->nh * kFlashStateFloats(a->hd));
       n.split_state = std::max(n.split_state, a->nh * kSplitStateFloats(a->hd));
       n.lora = std::max(n.lora, 3 * a->lora.rank);
+      lora_part(3, a->lora.rank, a->hidden, a->nh * a->hd);
       ks({a->hidden, a->nh * a->hd, a->lora.rank});
     } else if (const auto* g = std::get_if<GdnBlock>(&blk)) {
       n.proj = std::max(n.proj, g->n_in());
       n.act = std::max(n.act, g->v_width());
       n.gdn_o = std::max(n.gdn_o, g->v_width());
-      ks({g->hidden, g->v_width()});
+      n.lora = std::max(n.lora, 4 * g->lora.rank);  // qkv|z|b|a's
+      lora_part(4, g->lora.rank, g->hidden, g->v_width());
+      ks({g->hidden, g->v_width(), g->lora.rank});
     } else if (const auto* f = std::get_if<MlpBlock>(&blk)) {
       n.proj = std::max(n.proj, 2 * f->inter);
       n.act = std::max(n.act, f->inter);
       if (!f->w_gu.packed() && !f->w_down.packed()) n.glu = true;
       n.lora = std::max(n.lora, 2 * f->lora.rank);
+      lora_part(2, f->lora.rank, f->hidden, f->inter);
       ks({f->hidden, f->inter, f->lora.rank});
     } else if (const auto* h = std::get_if<HeadBlock>(&blk)) {
       ks({h->hidden});
@@ -67,6 +78,7 @@ void alloc_rows(const flyx_bmodel* m, int R, bool prefill, RowBufs* b, Alloc&& a
   b->choice = static_cast<int*>(alloc(size_t(R) * sizeof(int)));
   b->x = f(size_t(R) * H);
   if (n.lora) b->lora = f(size_t(R) * n.lora);  // live beside every buffer below: a layer's linears read it
+  if (n.lora_part) b->lora_part = f(size_t(std::min(R, kLoraEarlyRows)) * n.lora_part);
   // Prefill attention runs on tensor cores (no partials) above FLYX_MAX_ROWS rows, every head dim the backend
   // loads (attention_head_dim) included; the split kernel then only takes a last chunk of at most that many rows.
   size_t part = 0;

@@ -99,6 +99,8 @@ struct KernelOptions {
                               // (gemm_blocks_staged_runs)
   bool round_glu = true;      // a round's SwiGLU in its dp4a gate|up GEMM (gemm_blocks_round_glu_takes)
   bool side_stream = true;    // a round's narrow GEMMs of a stack on the launch's side stream (gemm_blocks_staged_runs)
+  int lora_lanes = 0;         // measurement: an adapter's second product with this many lanes an output (lora_lanes)
+  bool lora_glu = true;       // the SwiGLU takes gate's and up's adapter products, for ranks of one lane (LoraGlu)
   bool log_shapes = false;    // the backend prints every GEMM shape once
   bool prefill_fp4 = false;   // NVFP4 weights in prefill GEMMs take NVFP4 activations (W4A4, sm_120a; gemm_w4a4):
                               // set from the model's weights (FLYX_ACT_NVFP4), not an option
@@ -253,7 +255,7 @@ Scratch side_scratch(const Scratch& s);
 
 // y[r, n] (=|+=) sum_k x[r, k] * W[n, k].  K % 8 == 0.  Chooses CUDA-core or tensor-core path by rows: 1..16 the
 // skinny kernel (gemm_rows where it does not fit, or with option row_gemms); more, the prefill kernels, or a round's
-// rows (Launch::round_rows: a linear's bf16 weights, regions/linear.cpp, and an adapter's) k_gemm_skinny_mt in three
+// rows (Launch::round_rows: a linear's bf16 weights, regions/linear.cpp) k_gemm_skinny_mt in three
 // parts (up to 64 rows; else the 1..16-row choice 16 rows at a time), a drafting pass's (Launch::draft)
 // k_gemm_skinny_mt in one part (up to 64 rows).
 void gemm(const float* x, int ldx, const bf16* W, int N, int K, float* y, int ldy, int rows, bool accumulate,
@@ -1166,7 +1168,7 @@ bool gdn_round_fits(const GdnDims& d, int rows, const float* S, size_t s_stride,
 bool gdn_round(const float* proj, int ld, const float* conv_w, float* win, size_t win_stride, float* S,
                size_t s_stride, int next_sel, const float* A_log, const float* dt_bias, const float* gw, float eps,
                GdnBufs bufs, const DevParams* P, int rows, float* y, const Launch& L, bool q8 = false,
-               int total_rows = 0, int row_offset = 0);
+               int total_rows = 0, int row_offset = 0, float* also = nullptr);  // also: Out::also, beside the split
 
 // ---- head, drafter, round bookkeeping -----------------------------------------------
 // out[r] = argmax_v logits[r, v] (lowest index on ties).
@@ -1398,24 +1400,73 @@ bool gemm_on_glu_bf16(const uint8_t* Q, const uint8_t* S, const float* RS, int N
 // bits as the unfused pair.  attention() with out == nullptr does the same.
 // q8: for GGML block weights whose inputs are 8 bits, the output in 8 bits
 // where the block kernels read it (blocks_stage's work, the same bits; the
-// width a multiple of 32, of 64 for SwiGLU); gemm_presplit then stages nothing.
+// width a multiple of 32, of 64 for SwiGLU); gemm_presplit then stages nothing.  also: the same values in float32
+// [rows][n] beside them (a block's adapters read those; null: none).
 void rmsnorm_split(const float* x, int ldx, const float* w, float offset, float eps, int rows, int n, const Launch& L,
-                   bool q8 = false);
+                   bool q8 = false, float* also = nullptr);
 // The same of bf16 rows (a prefill pass's bf16 residual), more than 16 rows.
 void rmsnorm_split(const bf16* x, int ldx, const float* w, float offset, float eps, int rows, int n, const Launch& L,
                    bool q8 = false);
-void swiglu_split(const float* gu, int ld, int I, int rows, const Launch& L, bool q8 = false);
+// An MLP's adapters' second products on gate and up (lora_up's, the same bits) taken by the SwiGLU as it reads them:
+// u [rows][ldu] (gate's at 0, up's at rank, unscaled), gate and up their b's [I, rank].  rank 0: none.
+struct LoraGlu {
+  const float* u = nullptr;
+  int ldu = 0;
+  const bf16 *gate = nullptr, *up = nullptr;
+  int rank = 0;
+  float scale = 1.f;
+};
+void swiglu_split(const float* gu, int ld, int I, int rows, const Launch& L, bool q8 = false, float* also = nullptr,
+                  const LoraGlu& lora = {});
 void gdn_gated_norm_split(const float* o, const float* z, int ld_z, const float* w, float eps, int rows, GdnDims d,
                           const Launch& L, bool q8 = false);
 void gdn_gated_norm_split(const float* o, const bf16* z, int ld_z, const float* w, float eps, int rows, GdnDims d,
                           const Launch& L, bool q8 = false);  // z: bf16 rows (gdn_conv's bf16 overload)
 void gemm_presplit(const bf16* W, int N, int K, float* y, int ldy, int rows, bool accumulate, const Launch& L);
 // A low-rank adapter's first product beside a linear (backend_abi.h flyx_lora): u [rows][ldu] = scale (x a^T), a
-// [n, K] bf16 (the a's of the linears that read x, stacked), on the rows the linear read: x through gemm(), or, x
-// null, the input a fused producer left in the scratch through gemm_presplit(), the same bits (F).  The second
-// product, y += u b^T, is gemm() on u.  The scale is one float32 product after the sums (none for scale 1).
+// [n, K] bf16 (the a's of the linears that read x, stacked), on the float32 rows the linear read, through gemm() (a
+// prefill pass's past kLoraEarlyRows rows, DV's canvas).  The second product, y += u b^T, is gemm() on u, or lora_up /
+// lora_up_rows.  The scale is one float32 product after the sums (none for scale 1).
 void lora_down(const float* x, int ldx, const bf16* a, int n, int K, float scale, float* u, int ldu, int rows,
                const Launch& L);
+// An adapter's first product for a round (any number of rows, a row's bits alone; one launch): one block an output,
+// up to 64 rows a block, each row's sum in an order K alone sets (k = 8 (t + 256 s) a thread, then the 256 sums warp
+// by warp).
+void lora_down_round(const float* x, int ldx, const bf16* a, int n, int K, float* u, int ldu, int rows,
+                     cudaStream_t st);
+// A block's adapters' first product for a prefill pass's rows (any number: a row's bits alone), no scratch (so it may
+// run on a side stream beside the linear's own GEMM): u [rows][ldu] = x a^T, unscaled (lora_up takes the scale), a [n, K]
+// bf16, x float32, K % 8 == 0; in slices of 256 of K, each row's slice sums added in order: a row's bits whatever the
+// rows.  A few rows split over the slices (their sums in part, lora_down_part_floats of them for part_rows rows).
+int lora_down_part_floats(int n, int K, int rows);
+void lora_down_rows(const float* x, int ldx, const bf16* a, int n, int K, float* u, int ldu, int rows, float* part,
+                    int part_rows, cudaStream_t st);
+// The second products of a block's adapters in one launch (any number of rows): y[r][col_i + n] += sum_k
+// (scale u[r][u_i + k]) b_i[n][k] for every linear i and output n, the products scale u[r][.] rounded to float32
+// (lora_down's scale step, done here: its u unscaled) and the sum in an order the rank alone sets, one row at a time:
+// a row's bits whatever the rows beside it.  b_i [n_i, rank] bf16, rank % 8 == 0; u's rows on 16 bytes.
+// The lanes lora_up gives an output for a rank (each 16 bytes of its b row a step, two steps at least, up to 8): its
+// order of the sum, which every kernel taking an adapter's second product keeps (LoraGlu).  want (option lora_lanes,
+// measurement): that many instead, or the most below it that divide the steps.
+inline int lora_lanes(int rank, int want = 0) {
+  const int c = rank / 8;
+  if (want > 0) {
+    int g = 8;
+    while (g > 1 && (g > want || c % g)) g /= 2;
+    return g;
+  }
+  return c % 16 == 0 ? 8 : c % 8 == 0 ? 4 : c % 4 == 0 ? 2 : 1;
+}
+struct LoraUp {
+  const bf16* b[5] = {};
+  int n[5] = {}, u_col[5] = {}, y_col[5] = {};
+  int linears = 0;
+};
+void lora_up(const float* u, int ldu, int rank, float scale, const LoraUp& up, float* y, int ldy, int rows,
+             const Launch& L);
+// The same for a prefill pass's many rows (tiles of 64 rows by 64 outputs, a launch a linear; not a row's bits alone).
+void lora_up_rows(const float* u, int ldu, int rank, float scale, const LoraUp& up, float* y, int ldy, int rows,
+                  const Launch& L);
 void gemm_fp4_presplit(const uint8_t* Q, const uint8_t* S, const float* RS, int N, int K, float* y, int ldy, int rows,
                        bool accumulate, const Launch& L);
 // A prefill MLP's gate|up GEMM with SwiGLU in its epilogue (rows > 16, I % 8 == 0): the

@@ -82,6 +82,29 @@ void add_nodes(cudaGraph_t g, const GraphPrices& price, GraphSize& out) {
   std::vector<cudaGraphNode_t> nodes(n);
   CK(cudaGraphGetNodes(g, nodes.data(), &n));
   out.bytes += kGraphBytes;
+  // forks: each node's edges out past its first (programmatic ones among them: their data asked for too, which the
+  // driver otherwise refuses to leave out)
+  size_t n_edges = 0;
+#if CUDART_VERSION >= 13000
+  CK(cudaGraphGetEdges(g, nullptr, nullptr, nullptr, &n_edges));
+#else
+  CK(cudaGraphGetEdges_v2(g, nullptr, nullptr, nullptr, &n_edges));
+#endif
+  if (n_edges > 0) {
+    std::vector<cudaGraphNode_t> from(n_edges), to(n_edges);
+    std::vector<cudaGraphEdgeData> data(n_edges);
+#if CUDART_VERSION >= 13000
+    CK(cudaGraphGetEdges(g, from.data(), to.data(), data.data(), &n_edges));
+#else
+    CK(cudaGraphGetEdges_v2(g, from.data(), to.data(), data.data(), &n_edges));
+#endif
+    from.resize(n_edges);
+    std::sort(from.begin(), from.end());
+    size_t forks = 0;
+    for (size_t i = 1; i < from.size(); ++i) forks += from[i] == from[i - 1];
+    if (forks) out.bytes += kGraphForkBytes + (forks - 1) * kGraphForkMoreBytes;
+    out.forks += forks;
+  }
   for (cudaGraphNode_t node : nodes) {
     cudaGraphNodeType type{};
     CK(cudaGraphNodeGetType(node, &type));

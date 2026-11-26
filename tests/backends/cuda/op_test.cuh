@@ -244,6 +244,7 @@ void test_draft_pick_blocks();
 void test_quantize_q8_0();
 void test_fused_producers();
 void test_lora();
+void test_lora_kernels();
 void test_grouped_conv();
 void test_fp4();
 void test_penalize();

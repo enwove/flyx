@@ -121,6 +121,7 @@ int main() {
   test_quantize_nvfp4();
   test_fused_producers();
   test_lora();
+  test_lora_kernels();
   test_gdn(GdnDims{2, 4, 16, 16, 4}, 7, 1e-5);     // tiny model
   test_gdn(GdnDims{2, 4, 64, 48, 4}, 37, 1e-5);    // several staged chunks, a partial block of state rows
   test_gdn(GdnDims{1, 2, 128, 128, 4}, 300, 1e-5); // Qwen3.5 head dims, more rows than a conv block

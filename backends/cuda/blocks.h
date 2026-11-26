@@ -46,7 +46,7 @@ struct Adapters {
   int rank = 0;
   float scale = 1.f;
   bf16 *a_in = nullptr, *a_out = nullptr;
-  bf16* b[4] = {};
+  bf16* b[5] = {};  // each linear's b: q, k, v, o; gate, up, down; a GDN's qkv, z, b, a, out
   explicit operator bool() const { return rank > 0; }
 };
 
@@ -106,6 +106,7 @@ struct GdnBlock {
   Lin w_in, w_out;
   float *conv_w = nullptr, *A_log = nullptr, *dt_bias = nullptr;
   int state = -1;              // StateTable::gdn
+  Adapters lora;               // its own adapters on qkv, z, b, a and out (ABI 45)
   int v_width() const { return gd.nv * gd.dv; }
   int n_in() const { return gd.C() + v_width() + 2 * gd.nv; }
 };

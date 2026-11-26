@@ -151,6 +151,8 @@ Passed verbatim to the backend (`backends/cuda/backend.cpp`). Unknown keys or in
 | `stacks` | `0` \| `1` | `1` | Combine adjacent mixed-type projection runs in one round launch. |
 | `round_glu` | `0` \| `1` | `1` | Fuse SwiGLU into dp4a gate\|up GEMM on GGUF rounds. |
 | `side_stream` | `0` \| `1` | `1` | Run narrow stack GEMMs concurrently on a side stream. |
+| `lora_lanes` | `0` \| `1` \| `2` \| `4` \| `8` | `0` | Measurement: a LoRA adapter's second product with this many lanes an output (`0`: by its rank). Other bits than the default. |
+| `lora_glu` | `0` \| `1` | `1` | The SwiGLU takes gate's and up's LoRA products for ranks of one lane (`0`: in their own launch). |
 | `pdl` | `0` \| `1` | GPU table | Programmatic Dependent Launch (`sm_90+`). Default set by GPU tuning table (on for RTX 5090). |
 | `wait` | `auto` \| `spin` \| `poll` | `auto` (Win) / `poll` (Linux) | Host wait mode for device completion (`auto` uses a high-resolution timer sleep followed by a short spin on Windows). |
 | `tuning` | `table` \| `defaults` \| `NAME` | `table` | Kernel tuning table (`defaults` disables GPU table; `NAME` forces a named table e.g. `rtx4090`). |

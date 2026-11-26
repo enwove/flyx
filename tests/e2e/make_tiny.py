@@ -715,7 +715,8 @@ def make_llama_lora(out: str, ldir: str, prompts) -> tuple[int, int]:
 
 def make_qwen3_peft(out: str, q3dir: str, prompts) -> int:
     """A LoRA adapter for the tiny Qwen3 as Hugging Face PEFT saves one (peft_qwen3/: adapter_config.json and
-    adapter_model.safetensors, the engine's --lora; core/modelfile/peft_dir.cpp): rank 8, lora_alpha 16 (scale 2), on
+    adapter_model.safetensors, the engine's --lora; core/modelfile/peft_dir.cpp): rank 6, lora_alpha 12 (scale 2: a rank
+    that is not a multiple of 8, which the CUDA backend widens with zeros, as the Hub's ranks 1, 3 and 4), on
     q, v, o, gate and down of layers 0 to 2, none on k and up nor on layer 3 (a block's linears without one run as
     zeros beside those with one), float32 values that bf16 holds (the engines run adapters in bf16); and its golden
     tokens from transformers in float64 with it merged (golden_qwen3_lora.json; write_golden_hf).  The adapter changes
@@ -723,7 +724,7 @@ def make_qwen3_peft(out: str, q3dir: str, prompts) -> int:
     from safetensors.torch import save_file
     from transformers import AutoConfig
     cfg = AutoConfig.from_pretrained(q3dir)
-    rank, alpha, layers = 8, 16, (0, 1, 2)
+    rank, alpha, layers = 6, 12, (0, 1, 2)
     q, kv, H, I = cfg.num_attention_heads * cfg.head_dim, cfg.num_key_value_heads * cfg.head_dim, \
         cfg.hidden_size, cfg.intermediate_size
     shapes = {"q": ("self_attn", H, q), "v": ("self_attn", H, kv), "o": ("self_attn", q, H),

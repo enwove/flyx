@@ -222,6 +222,9 @@ struct Out {
   // [rows][K] in float32: a prefill pass's rows when NVFP4 weights take NVFP4 inputs (Scratch::af32), which the
   // W4A4 kernels round once from these values
   float* f32 = nullptr;
+  // [rows][K] in float32 beside whichever form the GEMM reads (null: none): the rows a block's adapters read
+  // (regions/layers.cpp norm_project_adapted, lora_begin) when the GEMM's own input is in 8 bits or bf16 pairs
+  float* also = nullptr;
 };
 
 // A group of 32 values in 8 bits, as the staging kernels round them (gemm_blocks.cu): d = (their largest
@@ -245,6 +248,7 @@ __device__ __forceinline__ int q8_of(float v, float dg) {
 // A warp's 32 values, lane l value 32 grp + l of the row (every lane of the warp calls it).
 __device__ __forceinline__ void put_q8(const Out& o, int row, int grp, float v) {
   const int lane = threadIdx.x & 31;
+  if (o.also) o.also[size_t(row) * o.q8_k + 32 * grp + lane] = v;
   float m = fabsf(v);
 #pragma unroll
   for (int s = 16; s; s >>= 1) m = fmaxf(m, __shfl_xor_sync(0xffffffffu, m, s));
@@ -264,6 +268,10 @@ __device__ __forceinline__ void put_q8(const Out& o, int row, int grp, float v) 
 // 2 grp2, lanes 16..31 the next (every lane of the warp calls it).
 __device__ __forceinline__ void put_q8_pairs(const Out& o, int row, int grp2, float a, float b) {
   const int lane = threadIdx.x & 31, l = lane & 15, grp = 2 * grp2 + (lane >> 4);
+  if (o.also) {
+    o.also[size_t(row) * o.q8_k + 64 * grp2 + 2 * lane] = a;
+    o.also[size_t(row) * o.q8_k + 64 * grp2 + 2 * lane + 1] = b;
+  }
   float m = fmaxf(fabsf(a), fabsf(b));
 #pragma unroll
   for (int s = 8; s; s >>= 1) m = fmaxf(m, __shfl_xor_sync(0xffffffffu, m, s));  // within the half warp
@@ -284,6 +292,7 @@ __device__ __forceinline__ void put_q8_pairs(const Out& o, int row, int grp2, fl
 }
 
 __device__ __forceinline__ void put(const Out& o, size_t at_y, size_t at_split, float v) {
+  if (o.also) o.also[at_split] = v;
   if (o.f32) {
     o.f32[at_split] = v;
   } else if (o.hi) {

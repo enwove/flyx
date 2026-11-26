@@ -1,7 +1,5 @@
 // Copyright 2026 The flyx Authors. SPDX-License-Identifier: Apache-2.0
 // Kernel tests: the rest of a layer: rmsnorm and the fused producers.
-#include <functional>
-
 #include "tests/backends/cuda/op_test.cuh"
 
 namespace flyx::optest {
@@ -141,99 +139,9 @@ void test_fused_producers() {
   }
 }
 
-namespace {
-// The kernels run() launches, by name: captured from a stream of its own into a graph, whose kernel nodes are read.
-std::vector<std::string> kernels_launched(const std::function<void(const Launch&)>& run) {
-  cudaStream_t st;
-  CK(cudaStreamCreateWithFlags(&st, cudaStreamNonBlocking));
-  Launch L = TL;
-  L.st = st;
-  cudaGraph_t g;
-  CK(cudaStreamBeginCapture(st, cudaStreamCaptureModeThreadLocal));
-  run(L);
-  CK(cudaStreamEndCapture(st, &g));
-  size_t n = 0;
-  CK(cudaGraphGetNodes(g, nullptr, &n));
-  std::vector<cudaGraphNode_t> nodes(n);
-  CK(cudaGraphGetNodes(g, nodes.data(), &n));
-  std::vector<std::string> names;
-  for (cudaGraphNode_t node : nodes) {
-    cudaGraphNodeType type;
-    CK(cudaGraphNodeGetType(node, &type));
-    if (type != cudaGraphNodeTypeKernel) continue;
-    cudaKernelNodeParams p{};
-    CK(cudaGraphKernelNodeGetParams(node, &p));
-    const char* name = nullptr;
-    CK(cudaFuncGetName(&name, p.func));
-    names.emplace_back(name ? name : "?");
-  }
-  CK(cudaGraphDestroy(g));
-  CK(cudaStreamDestroy(st));
-  return names;
-}
-
-// A V-LoRA's GEMMs in a round's rows past 16 as an attention block's adapters run them (regions/layers.cpp lora_in):
-// q|k|v's a stacked [3 rank, H] in one GEMM, their products side by side in u (3 rank apart), each b reading its
-// rank columns of u into its own columns of y.  Every row the bits it has alone, and every GEMM whose K is a multiple
-// of 32 (the a's; the b's at a rank such as lora_g_b2h's 64) one launch of k_gemm_skinny_mt, the weights read once
-// for every 16-row tile, not a launch a tile.
-void lora_round_layout(int r, float scale, const std::string& tag) {
-  const int H = 256, out[3] = {128, 64, 64}, ldy = 256, ldu = 3 * r;
-  seed("lora round layout", r, int(scale * 1000));
-  bf16* da = up_bf16(randv(size_t(ldu) * H, 1.0 / std::sqrt(H)));
-  bf16* db[3];
-  for (int i = 0; i < 3; ++i) db[i] = up_bf16(randv(size_t(out[i]) * r, 0.5 / std::sqrt(r)));
-  auto adapters = [&](const float* x, float* u, float* y, int rows, const Launch& L) {
-    lora_down(x, H, da, ldu, H, scale, u, ldu, rows, L);
-    for (int i = 0, col = 0; i < 3; col += out[i], ++i)
-      gemm(u + i * r, ldu, db[i], out[i], r, y + col, ldy, rows, true, L);
-  };
-  Launch LR = TL;
-  LR.round_rows = true;
-  for (const int rows : {17, 32, 64}) {
-    const Vec x = randv(size_t(rows) * H), y0 = randv(size_t(rows) * ldy);
-    float *dx = up(x), *y = up(y0), *start = up(y0), *u = dev<float>(size_t(rows) * ldu), *y1 = dev<float>(ldy),
-          *u1 = dev<float>(ldu);
-    adapters(dx, u, y, rows, LR);
-    const Vec all = down(y, size_t(rows) * ldy);
-    bool same = true;
-    for (int row = 0; row < rows; ++row) {
-      CK(cudaMemcpy(y1, start + size_t(row) * ldy, ldy * 4, cudaMemcpyDeviceToDevice));
-      adapters(dx + size_t(row) * H, u1, y1, 1, TL);
-      const Vec one = down(y1, ldy);
-      same &= std::equal(one.begin(), one.end(), all.begin() + size_t(row) * ldy);
-    }
-    const std::string rt = tag + ", a round of " + std::to_string(rows) + " rows";
-    std::printf("  %-4s q|k|v's adapters as lora_in runs them%s: every row the bits it has alone\n",
-                same ? "ok" : "FAIL", rt.c_str());
-    g_fail += !same;
-    int multi = 0, other = 0;
-    const auto kernels = kernels_launched([&](const Launch& L) {
-      Launch round = L;
-      round.round_rows = true;
-      adapters(dx, u, y, rows, round);
-    });
-    for (const std::string& k : kernels) {
-      if (k.find("k_gemm_skinny_mt") != std::string::npos) ++multi;
-      else if (k.find("k_scale_rows") == std::string::npos) ++other;  // the scale's own kernel is no GEMM's
-    }
-    const int want = 1 + (r % 32 == 0 ? 3 : 0);  // the a's GEMM; the b's where their K, the rank, takes the kernel
-    const bool routed = multi == want && (r % 32 != 0 || other == 0);
-    std::printf("  %-4s %d of its 4 GEMMs one launch of k_gemm_skinny_mt each%s (%d other kernels)\n",
-                routed ? "ok" : "FAIL", multi, rt.c_str(), other);
-    g_fail += !routed;
-    for (void* p : std::initializer_list<void*>{dx, y, start, u, y1, u1}) CK(cudaFree(p));
-  }
-  CK(cudaFree(da));
-  for (bf16* p : db) CK(cudaFree(p));
-}
-}  // namespace
-
 // A linear with a low-rank adapter (ABI 43, a V-LoRA: lora_down, then gemm on its product, accumulating): against
 // ops::linear and ops::linear_lora in float64 (1..16 rows: the inputs as three bf16 parts, float32's; a prefill pass's:
-// bf16 inputs on the tensor cores, which the reference rounds first, u included); a fused producer's staged input
-// gives the generic producer's bits (F) for bf16 and NVFP4 weights; a round's rows past 16 (Launch::round_rows) each the
-// bits it has alone (R), the adapter's two GEMMs included.  Scale 1 (bifill-dv's) and another.
+// bf16 inputs on the tensor cores, which the reference rounds first, u included).  Scale 1 (bifill-dv's) and another.
 void test_lora() {
   std::printf("adapters (lora_down)\n");
   const int H = 256, N = 192;
@@ -248,15 +156,11 @@ void test_lora() {
       const flyx_tensor_view tw = view_of(w, &sw, N, H), ta = view_of(a, &sa, r, H), tb = view_of(b, &sb, N, r);
       float* dwn = up(wn);
       bf16 *dw = up_bf16(w), *da = up_bf16(a), *db = up_bf16(b);
-      uint8_t *fq = dev<uint8_t>(size_t(N) * H / 2), *fs = dev<uint8_t>(size_t(N) * H / 16);
-      float* frs = dev<float>(N);
-      quantize_nvfp4(dw, N, H, fq, fs, frs, 0);
       for (const int rows : {1, 5, 16, 40}) {
         const std::string rt = tag + ", " + std::to_string(rows) + " rows";
         const Vec x = randv(size_t(rows) * H);
-        float *dx = up(x), *h = dev<float>(size_t(rows) * H), *y1 = dev<float>(size_t(rows) * N),
-              *y2 = dev<float>(size_t(rows) * N);
-        float *u1 = dev<float>(size_t(rows) * r), *u2 = dev<float>(size_t(rows) * r);
+        float *dx = up(x), *h = dev<float>(size_t(rows) * H), *y1 = dev<float>(size_t(rows) * N);
+        float* u1 = dev<float>(size_t(rows) * r);
         rmsnorm(dx, H, dwn, 0.f, 1e-6f, h, H, rows, H, 0);
         gemm(h, H, dw, N, H, y1, N, rows, false, TL);
         lora_down(h, H, da, r, H, float(scale), u1, r, rows, TL);
@@ -287,49 +191,124 @@ void test_lora() {
           ops::linear_lora(hn.data(), rows, H, &ta, &tb, r, scale, N, ref.data());
           expect("ops::linear_lora" + rt, down(y1, want.size()), ref, 2e-5);
         }
-        // fused: the producer stages the input; the linear's GEMM and the adapter's first read it
-        rmsnorm_split(dx, H, dwn, 0.f, 1e-6f, rows, H, TL);
-        gemm_presplit(dw, N, H, y2, N, rows, false, TL);
-        lora_down(nullptr, H, da, r, H, float(scale), u2, r, rows, TL);
-        gemm(u2, r, db, N, r, y2, N, rows, true, TL);
-        expect("a fused producer: the adapter's product the generic one's" + rt, down(u2, size_t(rows) * r),
-               down(u1, size_t(rows) * r), 0);
-        expect("a fused producer: the generic bits, bf16 weights" + rt, down(y2, want.size()), down(y1, want.size()),
-               0);
-        gemm_fp4(h, H, fq, fs, frs, N, H, y1, N, rows, false, TL);
-        lora_down(h, H, da, r, H, float(scale), u1, r, rows, TL);
-        gemm(u1, r, db, N, r, y1, N, rows, true, TL);
-        rmsnorm_split(dx, H, dwn, 0.f, 1e-6f, rows, H, TL);
-        gemm_fp4_presplit(fq, fs, frs, N, H, y2, N, rows, false, TL);
-        lora_down(nullptr, H, da, r, H, float(scale), u2, r, rows, TL);
-        gemm(u2, r, db, N, r, y2, N, rows, true, TL);
-        expect("a fused producer: the generic bits, NVFP4 weights" + rt, down(y2, want.size()), down(y1, want.size()),
-               0);
       }
-      // A round's rows past 16: every row, through both of the adapter's GEMMs, the bits it has alone.
-      Launch LR = TL;
-      LR.round_rows = true;
-      for (const int rows : {17, 32, 64}) {
-        const Vec x = randv(size_t(rows) * H);
-        float *dx = up(x), *y = dev<float>(size_t(rows) * N), *u = dev<float>(size_t(rows) * r), *y1 = dev<float>(N),
-              *u1 = dev<float>(r);
-        gemm(dx, H, dw, N, H, y, N, rows, false, LR);
-        lora_down(dx, H, da, r, H, float(scale), u, r, rows, LR);
-        gemm(u, r, db, N, r, y, N, rows, true, LR);
-        const Vec all = down(y, size_t(rows) * N);
-        bool same = true;
-        for (int row = 0; row < rows; ++row) {
-          gemm(dx + size_t(row) * H, H, dw, N, H, y1, N, 1, false, TL);
-          lora_down(dx + size_t(row) * H, H, da, r, H, float(scale), u1, r, 1, TL);
-          gemm(u1, r, db, N, r, y1, N, 1, true, TL);
-          const Vec one = down(y1, N);
-          same &= std::equal(one.begin(), one.end(), all.begin() + size_t(row) * N);
+    }
+}
+
+// An adapter's own kernels (linear_lora on float32 rows): lora_down_round and lora_down_rows (u = x a^T, unscaled)
+// and lora_up / lora_up_rows (y += (u scale) b^T) against float64; a round's kernels a row's bits alone (R);
+// lora_down_rows split over K (part, rows <= part_rows) the bits of its one-pass grid; the SwiGLU taking the second
+// products (LoraGlu) lora_up's bits added before swiglu_split.  K a multiple of 256 and one past it by 64.
+void test_lora_kernels() {
+  std::printf("adapters (lora_down_round, lora_down_rows, lora_up, lora_up_rows, swiglu_split with LoraGlu)\n");
+  for (const int K : {512, 320})
+    for (const int r : {16, 64}) {
+      seed("lora kernels", K, r);
+      const int n = 2 * r, N = 192, I = 128;  // two linears' a's stacked (as an MLP's gate and up)
+      const float scale = 0.75f;
+      const std::string tag = " (K " + std::to_string(K) + ", rank " + std::to_string(r) + ")";
+      Vec a = randv(size_t(n) * K, 1.0 / std::sqrt(K)), b = randv(size_t(N) * r, 0.5 / std::sqrt(r));
+      round_bf16(a);
+      round_bf16(b);
+      bf16 *da = up_bf16(a), *db = up_bf16(b);
+      const int part_rows = 128;
+      float* part = dev<float>(size_t(lora_down_part_floats(n, K, part_rows)));
+      for (const int rows : {1, 3, 16, 40, 128, 200}) {
+        const std::string rt = tag + ", " + std::to_string(rows) + " rows";
+        const Vec x = randv(size_t(rows) * K);
+        float *dx = up(x), *u1 = dev<float>(size_t(rows) * n), *u2 = dev<float>(size_t(rows) * n),
+              *u3 = dev<float>(size_t(rows) * n);
+        Vec want(size_t(rows) * n, 0.0);
+        for (int row = 0; row < rows; ++row)
+          for (int j = 0; j < n; ++j) {
+            double t = 0;
+            for (int k = 0; k < K; ++k) t += x[size_t(row) * K + k] * a[size_t(j) * K + k];
+            want[size_t(row) * n + j] = t;
+          }
+        lora_down_round(dx, K, da, n, K, u1, n, rows, 0);
+        expect("lora_down_round, against float64" + rt, down(u1, want.size()), want, 2e-5);
+        lora_down_rows(dx, K, da, n, K, u2, n, rows, part, part_rows, 0);
+        lora_down_rows(dx, K, da, n, K, u3, n, rows, nullptr, 0, 0);
+        expect("lora_down_rows, against float64" + rt, down(u2, want.size()), want, 2e-5);
+        expect("lora_down_rows: split over K the bits of one pass" + rt, down(u2, want.size()),
+               down(u3, want.size()), 0);
+        {  // a round's rows: each the bits it has alone
+          const Vec all = down(u1, want.size());
+          bool same = true;
+          for (int row = 0; row < rows; ++row) {
+            lora_down_round(dx + size_t(row) * K, K, da, n, K, u3, n, 1, 0);
+            const Vec one = down(u3, size_t(n));
+            same &= std::equal(one.begin(), one.end(), all.begin() + size_t(row) * n);
+          }
+          std::printf("  %-4s lora_down_round%s: every row the bits it has alone\n", same ? "ok" : "FAIL", rt.c_str());
+          g_fail += !same;
         }
-        std::printf("  %-4s a round of %d rows%s: every row the bits it has alone\n", same ? "ok" : "FAIL", rows,
-                    tag.c_str());
-        g_fail += !same;
+        // the second product on the first linear's u (columns 0..r), into y over a base y0
+        const Vec u = down(u1, want.size()), y0 = randv(size_t(rows) * N);
+        Vec wy = y0;
+        for (int row = 0; row < rows; ++row)
+          for (int o = 0; o < N; ++o) {
+            double t = 0;
+            for (int k = 0; k < r; ++k)
+              t += double(float(u[size_t(row) * n + k] * scale)) * b[size_t(o) * r + k];
+            wy[size_t(row) * N + o] += t;
+          }
+        LoraUp lu;
+        lu.b[0] = db;
+        lu.n[0] = N;
+        lu.linears = 1;
+        float *y1 = up(y0), *y2 = up(y0), *y3 = dev<float>(N);
+        lora_up(u1, n, r, scale, lu, y1, N, rows, TL);
+        expect("lora_up, against float64" + rt, down(y1, wy.size()), wy, 2e-5);
+        if (rows > 16) {
+          lora_up_rows(u1, n, r, scale, lu, y2, N, rows, TL);
+          expect("lora_up_rows, against float64" + rt, down(y2, wy.size()), wy, 2e-5);
+        }
+        {
+          const Vec all = down(y1, wy.size());
+          bool same = true;
+          for (int row = 0; row < rows; ++row) {
+            const Vec base(y0.begin() + size_t(row) * N, y0.begin() + size_t(row + 1) * N);
+            CK(cudaMemcpy(y3, std::vector<float>(base.begin(), base.end()).data(), sizeof(float) * N,
+                          cudaMemcpyHostToDevice));
+            lora_up(u1 + size_t(row) * n, n, r, scale, lu, y3, N, 1, TL);
+            const Vec one = down(y3, size_t(N));
+            same &= std::equal(one.begin(), one.end(), all.begin() + size_t(row) * N);
+          }
+          std::printf("  %-4s lora_up%s: every row the bits it has alone\n", same ? "ok" : "FAIL", rt.c_str());
+          g_fail += !same;
+        }
+        // an MLP's: gate|up rows [rows][2 I], the adapters' second products taken by the SwiGLU (LoraGlu) against
+        // lora_up's added first, then swiglu_split without them
+        Vec bg = randv(size_t(I) * r, 0.5 / std::sqrt(r)), bu = randv(size_t(I) * r, 0.5 / std::sqrt(r));
+        round_bf16(bg);
+        round_bf16(bu);
+        bf16 *dbg = up_bf16(bg), *dbu = up_bf16(bu);
+        const Vec gu = randv(size_t(rows) * 2 * I);
+        float *g1 = up(gu), *g2 = up(gu), *o1 = dev<float>(size_t(rows) * I), *o2 = dev<float>(size_t(rows) * I);
+        LoraUp two;
+        two.b[0] = dbg;
+        two.b[1] = dbu;
+        two.n[0] = two.n[1] = I;
+        two.u_col[1] = r;
+        two.y_col[1] = I;
+        two.linears = 2;
+        lora_up(u1, n, r, scale, two, g2, 2 * I, rows, TL);
+        swiglu_split(g2, 2 * I, I, rows, TL, false, o2);
+        LoraGlu lg;
+        lg.u = u1;
+        lg.ldu = n;
+        lg.gate = dbg;
+        lg.up = dbu;
+        lg.rank = r;
+        lg.scale = scale;
+        swiglu_split(g1, 2 * I, I, rows, TL, false, o1, lg);
+        expect("swiglu_split with LoraGlu: lora_up's bits, then the SwiGLU" + rt, down(o1, size_t(rows) * I),
+               down(o2, size_t(rows) * I), 0);
+        for (void* p : std::initializer_list<void*>{dx, u1, u2, u3, y1, y2, y3, dbg, dbu, g1, g2, o1, o2})
+          CK(cudaFree(p));
       }
-      lora_round_layout(r, float(scale), tag);
+      for (void* p : std::initializer_list<void*>{da, db, part}) CK(cudaFree(p));
     }
 }
 

@@ -456,6 +456,10 @@ if(TARGET flyx-cuda)
                        ${ASSETS}/peft_qwen35 FIXTURES gguf_assets)
   flyx_add_golden_test(golden_cuda_qwen3_lora_unfused ARGS cuda qwen3_lora ${ASSETS}/tiny_qwen3.flyx
                        ${ASSETS}/peft_qwen3 ENV FLYX_BACKEND_OPTIONS=fusion=0)
+  # Its adapters' rank (6, padded to 8) one lane an output: the SwiGLU takes gate's and up's products by default, here
+  # lora_up (the same bits).
+  flyx_add_golden_test(golden_cuda_qwen3_lora_no_glu ARGS cuda qwen3_lora ${ASSETS}/tiny_qwen3.flyx
+                       ${ASSETS}/peft_qwen3 ENV FLYX_BACKEND_OPTIONS=lora_glu=0)
   # The tiny Qwen3's head is not its embedding: the table in host memory by default, here on the GPU.
   flyx_add_golden_test(golden_cuda_qwen3_embed_gpu ARGS cuda qwen3 ENV FLYX_BACKEND_OPTIONS=embed=gpu)
   # Llama without q/k norms: the generic regions too, and its 16 query heads on 2 KV heads on tensor cores for every

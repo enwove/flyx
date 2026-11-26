@@ -79,7 +79,7 @@ bool residual16_model(flyx_bmodel* m) {
       const Block& b = m->blocks[i];
       if (const auto* e = std::get_if<EmbedBlock>(&b)) ok = e->table != nullptr;
       else if (const auto* g = std::get_if<GdnBlock>(&b))
-        ok = g->w_in.q && g->w_out.q && g->hidden % 128 == 0 && g->v_width() % 128 == 0;
+        ok = g->w_in.q && g->w_out.q && g->hidden % 128 == 0 && g->v_width() % 128 == 0 && !g->lora;
       else if (const auto* a = std::get_if<AttnBlock>(&b))  // adapters (ABI 43) add float32 products: float32 rows
         ok = a->w_in.q && a->w_out.q && a->hidden % 128 == 0 && a->nh * a->hd % 128 == 0 && !a->lora;
       else if (const auto* f = std::get_if<MlpBlock>(&b))
@@ -331,6 +331,12 @@ void mtp_context(const Pass& ps, const MtpBlock& b, bool fused) {
 // fused: the producers write the next GEMM's input already rounded (split for 1..16 rows,
 // bf16 for more), so the GEMM reads it as is.
 void gdn_layer(const Pass& ps, const GdnBlock& g, bool fused) {
+  // Adapters (ABI 45) read float32 rows: the normed input (the fused producer writes them beside its staged ones,
+  // norm_project_adapted) and the gated norm's output (gdn_round writes them beside its staged ones in a round, else
+  // the generic producer); their products go to the in-projection's rows before the convolution and the gates read
+  // them, then to the residual after the out projection.
+  const bool fused_mixer = fused;
+  if (g.lora) fused = false;  // outside gdn_round: the generic producers
   const RowView& rv = ps.v;
   auto* s = ps.s;
   GdnBuf& sb = s->gdn[size_t(g.state)];
@@ -363,6 +369,10 @@ void gdn_layer(const Pass& ps, const GdnBlock& g, bool fused) {
     }
     if (x16) throw std::logic_error("cuda: a bf16 residual's in-projection is a W4A4 GEMM");
     gemm_presplit(g.w_in, g.n_in(), H, rv.b.proj, rv.ld_proj, R, false, L);
+  } else if (g.lora) {  // the producer's float32 rows (beside a fused one's staged ones) for the adapters
+    norm_project_adapted(rv, R, g.norm, g.w_in, g.n_in(), H, fused_mixer, g.lora, 4, s->m->need.lora);
+    const int out[4] = {C, vd, gd.nv, gd.nv};
+    lora_in_end(rv, g.lora, 4, out, rv.b.h, H, H, R, s->m->need.lora, L);
   } else {
     norm_and_project(rv, R, g.norm, g.w_in, g.n_in(), H, fused);
   }
@@ -374,10 +384,13 @@ void gdn_layer(const Pass& ps, const GdnBlock& g, bool fused) {
   const bool direct = ps.round && ps.p->width == 0;
   const int next = direct ? kSlotNext : -1;
   const TreeRows* tree = tree_of(ps);
-  if (fused && ps.round && !tree &&
+  if (fused_mixer && ps.round && !tree &&
       gdn_round(rv.b.proj, rv.ld_proj, g.conv_w, sb.win, sb.w_stride, sb.S, sb.s_stride, next, g.A_log, g.dt_bias,
-                g.gated.w, g.gated.eps, sb.replay, s->P, R, nullptr, L, g.w_out.q8_inputs())) {
+                g.gated.w, g.gated.eps, sb.replay, s->P, R, nullptr, L, g.w_out.q8_inputs(), 0, 0,
+                g.lora ? rv.b.act : nullptr)) {
+    if (g.lora) lora_begin(rv, g.lora.a_out, g.lora.rank, rv.b.act, vd, vd, R, s->m->need.lora, L);
     gemm_presplit(g.w_out, H, vd, rv.b.x, H, R, true, L);
+    if (g.lora) lora_out_end(rv, g.lora, 4, rv.b.act, vd, vd, H, R, s->m->need.lora, L);  // the gated norm's rows
     return;
   }
   if (ps.round) {
@@ -405,6 +418,7 @@ void gdn_layer(const Pass& ps, const GdnBlock& g, bool fused) {
       gdn_recur(sb.S, sb.s_stride, kSlotCur, kSlotCur, bf, kSlotCur, s->P, rv.b.gdn_o, R, nullptr, false, st);
   }
   gdn_out_project(rv, g, R, fused);
+  if (g.lora) lora_out(rv, g.lora, 4, rv.b.act, vd, vd, H, R, s->m->need.lora, L);  // the gated norm's rows
 }
 
 // A prefill's attention over a cache whose keys go past its stagings: the device part's whole 64s
@@ -470,23 +484,95 @@ void attn_windows(const Pass& ps, const AttnBlock& a, const KvBuf& kb, int windo
 
 }  // namespace
 
-// A block's own adapters (ABI 43, Adapters) beside its linears, on the rows the linears read (x null: a fused
-// producer's staged input, which the adapter's first GEMM reads as the linear's did): u = scale (a x), then each
-// linear's y += b u.  The a's of the linears that read one input are one GEMM (q|k|v, gate|up), each b its own, every
-// GEMM gemm()'s: a round's rows past 16 (Launch::round_rows) on k_gemm_skinny_mt, the weights read once for every 16-row
-// tile (16 rows at a time where K is no multiple of 32), so a row has the bits it has alone.
-void lora_in(const RowView& rv, const Adapters& l, int linears, const int* out, const float* x, int ldx, int K, int R,
-             int ldu, const Launch& L) {
-  const int r = l.rank;
-  lora_down(x, ldx, l.a_in, linears * r, K, l.scale, rv.b.lora, ldu, R, L);
-  for (int i = 0, col = 0; i < linears; col += out[i], ++i)
-    gemm(rv.b.lora + i * r, ldu, l.b[i], out[i], r, rv.b.proj + col, rv.ld_proj, R, true, L);
+// A block's own adapters (ABI 43, Adapters) beside its linears, on the float32 rows the linears read: u = scale (a x),
+// then each linear's y += b u.  The a's of the linears that read one input are one GEMM (q|k|v, gate|up).  A round's
+// rows, and a prefill pass's up to kLoraEarlyRows: u before the linear's own GEMM, by lora_down_round (a round) or
+// lora_down_rows (a row's bits alone) on the side stream beside that GEMM where there is one (it needs no scratch).
+// More rows: u after the linear's GEMM, by gemm (tensor cores; gemm() stages its input in the scratch the linear's
+// staged input is in).  Then every b: in one launch for a round (lora_up), a launch a linear for a prefill pass
+// (lora_up_rows), either taking the scale step; an MLP's gate and up in its SwiGLU where the rank allows (mlp_layer).
+namespace {
+bool round_adapters(int R, const Launch& L) { return R <= 16 || L.round_rows; }
+// u before the linear's GEMM (lora_begin), else after it (lora_*_end): a round's and up to kLoraEarlyRows
+bool down_early(int R, const Launch& L) { return round_adapters(R, L) || R <= kLoraEarlyRows; }
+bool adapters_beside(int R, const Launch& L) {
+  return down_early(R, L) && L.side && L.side->st && (!L.opt || L.opt->side_stream);
 }
+// u ready for a consumer of its own after the linear's GEMM (lora_*_end's first step): a prefill pass's u (unscaled:
+// lora_up takes the scale) where lora_begin left it, else the join with lora_begin's side stream.
+void lora_ready(const RowView& rv, const bf16* a, int n, const float* x, int ldx, int K, int R, int ldu,
+                const Launch& L) {
+  if (!down_early(R, L)) lora_down(x, ldx, a, n, K, 1.f, rv.b.lora, ldu, R, L);
+  if (adapters_beside(R, L)) CK(cudaStreamWaitEvent(L.st, L.side->join, 0));
+}
+// y += b u: lora_up for a round, lora_up_rows for a prefill pass.
+void lora_up_any(const RowView& rv, const Adapters& l, const LoraUp& up, float* y, int ldy, int R, int ldu,
+                 const Launch& L) {
+  if (round_adapters(R, L)) lora_up(rv.b.lora, ldu, l.rank, l.scale, up, y, ldy, R, L);
+  else lora_up_rows(rv.b.lora, ldu, l.rank, l.scale, up, y, ldy, R, L);
+}
+}  // namespace
+
+void lora_begin(const RowView& rv, const bf16* a, int n, const float* x, int ldx, int K, int R, int ldu,
+                const Launch& L) {
+  if (!down_early(R, L)) return;  // lora_*_end's
+  // a round's one launch (lora_down_round, decoding's latency), a prefill pass's split over K (its tiles fill the GPU)
+  auto down = [&](cudaStream_t st) {
+    if (round_adapters(R, L)) lora_down_round(x, ldx, a, n, K, rv.b.lora, ldu, R, st);
+    else lora_down_rows(x, ldx, a, n, K, rv.b.lora, ldu, R, rv.b.lora_part, kLoraEarlyRows, st);
+  };
+  if (adapters_beside(R, L)) {
+    CK(cudaEventRecord(L.side->fork, L.st));
+    CK(cudaStreamWaitEvent(L.side->st, L.side->fork, 0));
+    down(L.side->st);
+    CK(cudaEventRecord(L.side->join, L.side->st));
+  } else {
+    down(L.st);
+  }
+}
+
+void lora_in_end(const RowView& rv, const Adapters& l, int linears, const int* out, const float* x, int ldx, int K,
+                 int R, int ldu, const Launch& L) {
+  const int r = l.rank;
+  lora_ready(rv, l.a_in, linears * r, x, ldx, K, R, ldu, L);
+  LoraUp up;
+  up.linears = linears;
+  for (int i = 0, col = 0; i < linears; col += out[i], ++i) {
+    up.b[i] = l.b[i];
+    up.n[i] = out[i];
+    up.u_col[i] = i * r;
+    up.y_col[i] = col;
+  }
+  lora_up_any(rv, l, up, rv.b.proj, rv.ld_proj, R, ldu, L);
+}
+
+void lora_out_end(const RowView& rv, const Adapters& l, int linear, const float* x, int ldx, int K, int H, int R,
+                  int ldu, const Launch& L) {
+  lora_ready(rv, l.a_out, l.rank, x, ldx, K, R, ldu, L);
+  LoraUp up;
+  up.linears = 1;
+  up.b[0] = l.b[linear];
+  up.n[0] = H;
+  lora_up_any(rv, l, up, rv.b.x, H, R, ldu, L);
+}
+
 // The last linear's (o, down), whose product goes to the residual rows.
 void lora_out(const RowView& rv, const Adapters& l, int linear, const float* x, int ldx, int K, int H, int R, int ldu,
               const Launch& L) {
-  lora_down(x, ldx, l.a_out, l.rank, K, l.scale, rv.b.lora, ldu, R, L);
-  gemm(rv.b.lora, ldu, l.b[linear], H, l.rank, rv.b.x, H, R, true, L);
+  lora_begin(rv, l.a_out, l.rank, x, ldx, K, R, ldu, L);
+  lora_out_end(rv, l, linear, x, ldx, K, H, R, ldu, L);
+}
+
+// A block's norm and in-projection (norm_project), its adapters' first product beside the projection, from the
+// producer's float32 rows (rv.b.h).
+void norm_project_adapted(const RowView& rv, int R, const Norm& n, const Lin& w, int N, int H, bool fused,
+                          const Adapters& l, int linears, int ldu) {
+  const Launch& L = rv.L;
+  if (fused) rmsnorm_split(rv.b.x, H, n.w, n.offset, n.eps, R, H, L, w.q8_inputs(), rv.b.h);
+  else rmsnorm(rv.b.x, H, n.w, n.offset, n.eps, rv.b.h, H, R, H, L.st);
+  lora_begin(rv, l.a_in, linears * l.rank, rv.b.h, H, H, R, ldu, L);
+  if (fused) gemm_presplit(w, N, H, rv.b.proj, rv.ld_proj, R, false, L);
+  else gemm(rv.b.h, H, w, N, H, rv.b.proj, rv.ld_proj, R, false, L);
 }
 
 void attn_layer(const Pass& ps, const AttnBlock& a, bool fused) {
@@ -496,17 +582,20 @@ void attn_layer(const Pass& ps, const AttnBlock& a, bool fused) {
   cudaStream_t st = rv.L.st;
   const Launch& L = rv.L;
   const bool x16 = residual16(ps);
+  // Adapters read float32 rows (lora_down_rows: a row's bits whatever the rows, and a wide round's attention writes
+  // float32 rows, not the staged ones): the fused producer writes them beside its staged ones (rv.b.h), the attention
+  // its output in float32 (rv.b.act), which the out projection's GEMM stages.
+  const int ldu = s->m->need.lora;
   if (x16) {
     if (!fused) throw std::logic_error("cuda: a bf16 residual's pass runs the fused producers");
     rmsnorm_split(x16_of(rv), H, a.norm.w, a.norm.offset, a.norm.eps, R, H, L, a.w_in.q8_inputs());
     gemm_presplit(a.w_in, a.n_in(), H, rv.b.proj, rv.ld_proj, R, false, L);
+  } else if (a.lora) {
+    norm_project_adapted(rv, R, a.norm, a.w_in, a.n_in(), H, fused, a.lora, 3, ldu);
+    const int out[3] = {a.q_width(), nkv * hd, nkv * hd};  // q's covers the gate's rows (with one)
+    lora_in_end(rv, a.lora, 3, out, rv.b.h, H, H, R, ldu, L);
   } else {
     norm_and_project(rv, R, a.norm, a.w_in, a.n_in(), H, fused);
-  }
-  const int ldu = s->m->need.lora;
-  if (a.lora) {
-    const int out[3] = {nh * hd, nkv * hd, nkv * hd};
-    lora_in(rv, a.lora, 3, out, fused ? nullptr : rv.b.h, H, H, R, ldu, L);
   }
   const KvBuf& kb = s->kv[size_t(a.kv)];
   KvRef kv = kb.ref();
@@ -553,7 +642,7 @@ void attn_layer(const Pass& ps, const AttnBlock& a, bool fused) {
     }
   }
   // The attention writes the out projection's input itself, but not in 8 bits: for such weights it stays float32.
-  const bool split = fused && !a.w_out.q8_inputs();
+  const bool split = fused && !a.w_out.q8_inputs() && !a.lora;
   if (ps.reads_cache(kb)) {
     if (const int windows = ps.round ? 0 : s->windows(kb, R)) {
       attn_windows(ps, a, kb, windows, split ? nullptr : rv.b.act, nh * hd);
@@ -592,6 +681,7 @@ void attn_layer(const Pass& ps, const AttnBlock& a, bool fused) {
     }
     if (only) s->stage_after(kb, st);
   }
+  if (a.lora) lora_begin(rv, a.lora.a_out, a.lora.rank, rv.b.act, nh * hd, nh * hd, R, ldu, L);
   if (x16) {
     if (!split || !gemm_staged_bf16(a.w_out.q, a.w_out.s, a.w_out.rs, H, nh * hd, x16_of(rv), H, R, L, true))
       throw std::logic_error("cuda: a bf16 residual's out projection is a W4A4 GEMM");
@@ -600,7 +690,7 @@ void attn_layer(const Pass& ps, const AttnBlock& a, bool fused) {
   } else {
     gemm(rv.b.act, nh * hd, a.w_out, H, nh * hd, rv.b.x, H, R, true, L);
   }
-  if (a.lora) lora_out(rv, a.lora, FLYX_LIN_O, split ? nullptr : rv.b.act, nh * hd, nh * hd, H, R, ldu, L);
+  if (a.lora) lora_out_end(rv, a.lora, FLYX_LIN_O, rv.b.act, nh * hd, nh * hd, H, R, ldu, L);
 }
 
 void mlp_layer(const Pass& ps, const MlpBlock& f, bool fused) {
@@ -619,27 +709,41 @@ void mlp_layer(const Pass& ps, const MlpBlock& f, bool fused) {
     return;
   }
   // The block's own adapters (ABI 43): the gate and up rows take their products before the SwiGLU, so the gate|up GEMM
-  // and then the SwiGLU, never the SwiGLU in the GEMM's epilogue (nor block weights, which bind refuses with them).
+  // and then the SwiGLU, never the SwiGLU in the GEMM's epilogue.
   const int H = f.hidden, R = ps.rows, I = f.inter, ldu = ps.s->m->need.lora;
   const Norm& n = f.norm;
   cudaStream_t st = rv.L.st;
   const Launch& L = rv.L;
   const int gu[2] = {I, I};
-  if (fused) {
-    rmsnorm_split(rv.b.x, H, n.w, n.offset, n.eps, R, H, L, f.w_gu.q8_inputs());
-    gemm_presplit(f.w_gu, 2 * I, H, rv.b.proj, rv.ld_proj, R, false, L);
-    lora_in(rv, f.lora, 2, gu, nullptr, H, H, R, ldu, L);
-    swiglu_split(rv.b.proj, rv.ld_proj, I, R, L, f.w_down.q8_inputs());
-    gemm_presplit(f.w_down, H, I, rv.b.x, H, R, true, L);
-    lora_out(rv, f.lora, 2, nullptr, I, I, H, R, ldu, L);
-    return;
+  norm_project_adapted(rv, R, n, f.w_gu, 2 * I, H, fused, f.lora, 2, ldu);
+  // the SwiGLU rows: I apart beside staged ones, rv.ld_act apart from the generic producer
+  const int lda = fused ? I : rv.ld_act;
+  const float* act = rv.b.act;  // the SwiGLU's float32 rows (beside the staged ones), the adapters' (attn_layer)
+  // The SwiGLU takes gate's and up's second products (lora_up's bits) as it reads them, for an adapter of one lane an
+  // output (lora_lanes: rank 16, 24, 40, ...): a round's one launch fewer, a prefill pass's (16 rows a block) no pass
+  // over gate|up's rows of its own.  More lanes: their b rows (64 bytes an output and more) outrun the L1 a block's
+  // 16 rows share, and their work the launch the SwiGLU saves.  Measured as lora_up's lanes are (option lora_glu=0:
+  // gate's and up's in lora_up): rank 16, plain decoding 85.7 tok/s against 85.1, MTP 57.5 rounds/s against 57.0.
+  const bool glu = !L.opt || L.opt->lora_glu;
+  if (fused && glu && lora_lanes(f.lora.rank, L.opt ? L.opt->lora_lanes : 0) == 1) {
+    lora_ready(rv, f.lora.a_in, 2 * f.lora.rank, rv.b.h, H, H, R, ldu, L);
+    LoraGlu lg;
+    lg.u = rv.b.lora;
+    lg.ldu = ldu;
+    lg.gate = f.lora.b[0];
+    lg.up = f.lora.b[1];
+    lg.rank = f.lora.rank;
+    lg.scale = f.lora.scale;
+    swiglu_split(rv.b.proj, rv.ld_proj, I, R, L, f.w_down.q8_inputs(), rv.b.act, lg);
+  } else {
+    lora_in_end(rv, f.lora, 2, gu, rv.b.h, H, H, R, ldu, L);
+    if (fused) swiglu_split(rv.b.proj, rv.ld_proj, I, R, L, f.w_down.q8_inputs(), rv.b.act);
+    else swiglu(rv.b.proj, rv.ld_proj, I, rv.b.act, rv.ld_act, R, st);
   }
-  rmsnorm(rv.b.x, H, n.w, n.offset, n.eps, rv.b.h, H, R, H, st);
-  gemm(rv.b.h, H, f.w_gu, 2 * I, H, rv.b.proj, rv.ld_proj, R, false, L);
-  lora_in(rv, f.lora, 2, gu, rv.b.h, H, H, R, ldu, L);
-  swiglu(rv.b.proj, rv.ld_proj, I, rv.b.act, rv.ld_act, R, st);
-  gemm(rv.b.act, rv.ld_act, f.w_down, H, I, rv.b.x, H, R, true, L);
-  lora_out(rv, f.lora, 2, rv.b.act, rv.ld_act, I, H, R, ldu, L);  // the SwiGLU rows, rv.ld_act apart
+  lora_begin(rv, f.lora.a_out, f.lora.rank, act, lda, I, R, ldu, L);
+  if (fused) gemm_presplit(f.w_down, H, I, rv.b.x, H, R, true, L);
+  else gemm(rv.b.act, rv.ld_act, f.w_down, H, I, rv.b.x, H, R, true, L);
+  lora_out_end(rv, f.lora, 2, act, lda, I, H, R, ldu, L);
 }
 
 void head(const Pass& ps, const HeadBlock& h, bool last_only) {

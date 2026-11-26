@@ -931,11 +931,12 @@ bool gdn_round_fits(const GdnDims& d, int rows, const float* S, size_t s_stride,
 bool gdn_round(const float* proj, int ld, const float* conv_w, float* win, size_t win_stride, float* S,
                size_t s_stride, int next_sel, const float* A_log, const float* dt_bias, const float* gw, float eps,
                GdnBufs bufs, const DevParams* P, int rows, float* y, const Launch& L, bool q8,
-               int total_rows, int row_offset) {
+               int total_rows, int row_offset, float* also) {
   if (!gdn_round_fits(bufs.d, rows, S, s_stride, L, q8)) return false;
   const cudaStream_t st = L.st;
-  const Out out = y ? Out{y, nullptr, nullptr}
-                    : split_out_slice(L, total_rows > 0 ? total_rows : rows, row_offset, bufs.d.nv * bufs.d.dv, q8);
+  Out out = y ? Out{y, nullptr, nullptr}
+              : split_out_slice(L, total_rows > 0 ? total_rows : rows, row_offset, bufs.d.nv * bufs.d.dv, q8);
+  if (!y) out.also = also;
   auto launch = [&](auto dk) {
     constexpr int DK = decltype(dk)::value;
     if (rows <= kGdnRoundFew)
