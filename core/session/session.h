@@ -40,7 +40,9 @@ class Session {
   // continues this session's published history (else that of a conversation
   // whose checkpoints are in the store), the history keeps its tokens and only
   // the rest is encoded: re-encoding a reply can split it into other tokens
-  // than the ones generated, which would end the reusable prefix early.
+  // than the ones generated, which would end the reusable prefix early.  Only
+  // where `literal` reads the history's prompt as it was read (PromptEncoding);
+  // else the whole text is encoded, as for a session without a history.
   // literal: where special tokens are read (RenderedChat::literal); null: everywhere.
   std::vector<int32_t> tokenize(const std::string& text, const std::vector<TextSpan>* literal = nullptr,
                                 std::string* how = nullptr) const;
@@ -101,11 +103,13 @@ class Session {
   void reset_after_error();
   // The reply ended.  What the client saw of it (the first `published` of
   // `reply`, and the stop token when all of it was shown) becomes, after the
-  // prompt, the history the next request is compared with.
+  // prompt, the history the next request is compared with.  encoding: how the
+  // prompt's text was read (null: not known, as for a prompt given as tokens).
   void publish(const std::vector<int32_t>& prompt, const std::vector<int32_t>& reply, size_t published,
                int32_t stop_token, const std::vector<interfaces::MediaSpan>* media = nullptr,
                const std::string* rendered_text = nullptr,
-               const std::vector<interfaces::RenderedImage>* rendered_images = nullptr);
+               const std::vector<interfaces::RenderedImage>* rendered_images = nullptr,
+               const PromptEncoding* encoding = nullptr);
   // Every token the state has seen or emitted; the last one is its next input.
   const std::vector<int32_t>& tokens() const { return tokens_; }
   int state_pos() const { return state_pos_; }
@@ -143,6 +147,7 @@ class Session {
   int state_pos_ = 0;             // tokens processed into the device state
   std::vector<int32_t> history_;  // prompt + published output of the last generation
   std::string history_text_;      // its text (unexpanded template text + reply for multimodal)
+  PromptEncoding history_encoding_;  // how its prompt was read
   std::vector<interfaces::MediaSpan> history_media_;
   std::vector<interfaces::RenderedImage> history_images_;
   std::atomic<bool> cancel_{false};

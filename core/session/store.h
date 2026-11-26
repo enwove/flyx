@@ -37,6 +37,17 @@
 
 namespace flyx {
 
+// How a prompt's text became its tokens: where special tokens were read (Tokenizer::encode's `literal`; a chat
+// template reads them only in its own text, a raw prompt everywhere).  The same bytes read under other rules can be
+// other tokens (a user's "<|im_end|>" is text in a chat, the special token in a raw prompt), so a history keeps its
+// tokens for a request whose rules read its prompt alike (Session::tokenize).
+struct PromptEncoding {
+  bool known = false;                         // encoded from text here; false: given as tokens (or with media)
+  std::vector<interfaces::TextSpan> literal;  // where special tokens were read, in the prompt's text
+  // A history's: its prompt's bytes at the start of its text and tokens at the start of its tokens (Session::publish).
+  size_t bytes = 0, tokens = 0;
+};
+
 // A piece of host memory: the backend's (host_alloc: the device copies at the bus's speed) when it gives some, else
 // the store's own.
 class HostBuffer {
@@ -105,6 +116,7 @@ class SnapshotStore {
     std::string text;
     std::vector<interfaces::MediaSpan> media{};
     std::vector<interfaces::RenderedImage> images{};
+    PromptEncoding encoding{};  // how its prompt was read
   };
   struct Spill;
   struct Entry {

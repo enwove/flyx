@@ -305,6 +305,7 @@ bool prepare_request(Engine& e, const Session& s, const Request& rq, const Rende
     if (!prepare_multimodal_prompt(e, s, rc, out, err)) return false;
   } else {
     gen.prompt = s.tokenize(rc.text, &rc.literal, &out->tokenized);
+    gen.prompt_encoding = {true, rc.literal};
     gen.checkpoints = token_positions(e.tokenizer(), gen.prompt, rc.boundaries);
     gen.cache_prefixes = token_positions(e.tokenizer(), gen.prompt, rc.cache_prefixes);
     if (rc.system_end) gen.system_end = token_positions(e.tokenizer(), gen.prompt, {rc.system_end}).front();
