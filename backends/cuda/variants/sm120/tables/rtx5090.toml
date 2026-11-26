@@ -378,3 +378,19 @@ blocks_round = [
 # blocks_round, rounds of 6 rows: 264133 us with these rules, 300249 with the defaults (-12.0%), 262268 with the best for each
 # blocks_round, rounds of 8 rows: 288393 us with these rules, 330452 with the defaults (-12.7%), 286626 with the best for each
 # blocks_round, rounds of 16 rows: 536350 us with these rules, 538542 with the defaults (-0.4%), 530505 with the best for each
+# MoE layers' fused gate|up GEMMs: `cuda_bench tune moe_gate_up Inkling-2-Mini-UD-IQ3_XXS.gguf` on this GPU (driver 580.178.04,
+# Linux), against the original tiles (the defaults):
+# moe_gate_up, passes of 1 rows: 334 us with these rules, 357 with the defaults (-6.4%), 334 with the best for each
+# moe_gate_up, passes of 2 rows: 547 us with these rules, 584 with the defaults (-6.2%), 547 with the best for each
+# moe_gate_up, passes of 4 rows: 864 us with these rules, 935 with the defaults (-7.6%), 864 with the best for each
+# moe_gate_up, passes of 6 rows: 1240 us with these rules, 1367 with the defaults (-9.3%), 1240 with the best for each
+# moe_gate_up, passes of 8 rows: 1574 us with these rules, 1752 with the defaults (-10.2%), 1574 with the best for each
+# moe_gate_up, passes of 16 rows: 2917 us with these rules, 3301 with the defaults (-11.6%), 2917 with the best for each
+moe_gate_up = [
+  { types = ["IQ2_XXS", "IQ2_S"], rows = [1, 2], columns = 1, units = 1 },
+  { types = ["IQ2_XXS", "IQ2_S"], columns = 2, units = 1 },
+  { types = ["IQ2_XS"], rows = [1, 4], columns = 1, units = 1 },
+  { types = ["IQ2_XS"], columns = 2, units = 1 },
+  { types = ["IQ3_XXS"], columns = 1, units = 1 },
+  { columns = 0, units = 0 },
+]
