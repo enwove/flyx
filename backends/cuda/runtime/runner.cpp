@@ -135,21 +135,6 @@ void ensure_checkpoint_slot(flyx_seq* s, int c) {
       kb.ckp_vs[c] = take(sbytes);
     }
   }
-  for (auto& sc : s->sconv) sc.ckp_win[c] = take(sc.w_stride * sizeof(float));
-  for (size_t i = 0; i < s->kv.size(); ++i) {
-    auto& kb = s->kv[i];
-    if (!kb.swa_ring) continue;
-    const KvSpec& ks = s->m->states.kv[i];
-    const size_t elem = ks.fp8 ? 1 : sizeof(kv16);
-    const size_t bytes = size_t(kb.ring) * size_t(ks.nkv) * size_t(ks.hd) * elem;
-    kb.ckp_k[c] = take_raw(bytes);
-    kb.ckp_v[c] = take_raw(bytes);
-    if (ks.fp8) {
-      const size_t sbytes = size_t(kb.ring) * size_t(ks.nkv) * sizeof(float);
-      kb.ckp_ks[c] = take(sbytes);
-      kb.ckp_vs[c] = take(sbytes);
-    }
-  }
   if (const int w = s->m->states.ring_width) {
     s->ring_ckp[c] = take(size_t(w) * sizeof(float));
     std::memset(s->ring_ckp[c], 0, size_t(w) * sizeof(float));

@@ -48,7 +48,6 @@
 #include "apps/flyx-server/gpu_apps.h"
 #include "apps/flyx-server/server.h"
 #include "core/interfaces/model.h"
-#include "core/modelfile/modelfile.h"
 #include "core/os/env.h"
 #include "core/os/os.h"
 #include "core/os/path.h"
@@ -91,12 +90,8 @@ ojson or_null(const std::string& s) { return s.empty() ? ojson(nullptr) : ojson(
 // A model file of a directory, as the panel lists it: its path is the name that loads it.
 Listed dir_entry(const apps::LocalModel& m) {
   Listed l;
-  std::string kind = m.kind;
-  flyx::GgufPeek pk;
-  if (kind == "gguf" || kind == "drafter") pk = gguf_info(m.path, m.size, m.modified);
-  if (kind == "gguf" && m.parts <= 1 && pk.valid && pk.arch == "dflash") kind = "drafter";
-  const bool gguf = kind == "gguf";
-  l.json = {{"name", m.path}, {"kind", kind}, {"source", "dir"}, {"repo", nullptr}, {"quant", or_null(m.quant)},
+  const bool gguf = m.kind == "gguf";
+  l.json = {{"name", m.path}, {"kind", m.kind}, {"source", "dir"}, {"repo", nullptr}, {"quant", or_null(m.quant)},
             {"file", m.file}, {"path", m.path}, {"size", m.size}, {"modified", apps::modified_unix(m.modified)},
             {"revision", nullptr}, {"current", true},
             {"mtp", gguf && m.mtp_layers > 0 ? ojson("in-file") : ojson(nullptr)}};

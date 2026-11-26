@@ -348,15 +348,7 @@ std::string drafter_kind(const std::string& path, const hub::Repo& repo) {
   return kind.empty() && hub::is_drafter(repo) ? "dflash2" : kind;
 }
 
-std::string drafter_kind(const std::string& path) {
-  return drafter_kind(path, lower(path).ends_with(".gguf") ? flyx::gguf_peek(path) : flyx::GgufPeek{});
-}
-
-bool reads_vision(const std::string& arch) {
-  if (arch.empty()) return true;
-  const std::vector<std::string> vision = interfaces::vision_architectures();
-  return std::find(vision.begin(), vision.end(), arch) != vision.end();
-}
+}  // namespace
 
 bool reads_vision(const std::string& arch) {
   if (arch.empty()) return true;
