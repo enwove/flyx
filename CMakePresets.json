@@ -126,6 +126,22 @@
     {
       "name": "test-base",
       "hidden": true,
+      "description": "The engine's and server's settings (core/os/env.h) cleared: an empty value is no setting, so the tests run on what they give the engine (a test's own ENVIRONMENT still sets its own), never on the shell's FLYX_BACKEND_DIR, FLYX_BACKEND_OPTIONS or FLYX_API_KEY; PYTHONOPTIMIZE cleared, which would take the asserts out of the Python tests.",
+      "environment": {
+        "FLYX_BACKEND": "",
+        "FLYX_BACKEND_DIR": "",
+        "FLYX_DRAFTER": "",
+        "FLYX_ACTIVATIONS": "",
+        "FLYX_BACKEND_OPTIONS": "",
+        "FLYX_CHAT_NATIVE": "",
+        "FLYX_LOOKUP": "",
+        "FLYX_DRAFT_TREES": "",
+        "FLYX_ADAPTIVE": "",
+        "FLYX_API_KEY": "",
+        "FLYX_KEY": "",
+        "FLYX_MODELS_DIR": "",
+        "PYTHONOPTIMIZE": ""
+      },
       "output": { "outputOnFailure": true },
       "execution": { "jobs": 8, "resourceSpecFile": "${sourceDir}/tests/gpu_resources.json" }
     },

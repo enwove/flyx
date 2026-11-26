@@ -2,13 +2,12 @@
 """The scheduler emits the first output after the queue wait, before the HTTP handler observes it."""
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import closing
-import os
 from pathlib import Path
 import sys
 import tempfile
 
 from check_server import Client, wait_telemetry
-from remembered_model import serve
+from local_server import serve, server_env
 
 
 def check_times(url):
@@ -102,7 +101,7 @@ def reasoning_only(url):
 if __name__ == "__main__":
     exe, asset = (Path(arg).resolve() for arg in sys.argv[1:])
     with tempfile.TemporaryDirectory() as tmp:
-        env = dict(os.environ, APPDATA=tmp, XDG_CONFIG_HOME=tmp, FLYX_BACKEND_DIR=str(exe.parent))
+        env = server_env(tmp, exe)
         # Distinct rendered conversations let all four requests wait without replacing each other.
         template = Path(tmp) / "chat.jinja"
         template.write_text("{% for m in messages %}{{ m.role }}:{{ m.content }}|{% endfor %}", encoding="utf-8")

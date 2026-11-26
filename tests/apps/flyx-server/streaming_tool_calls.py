@@ -1,13 +1,12 @@
 # Copyright 2026 The flyx Authors. SPDX-License-Identifier: Apache-2.0
 """Streaming tool calls emit the function name first and argument JSON incrementally on all three APIs."""
 import json
-import os
 from pathlib import Path
 import sys
 import tempfile
 
 from check_server import Client
-from remembered_model import serve
+from local_server import serve, server_env
 
 
 WEATHER_SCHEMA = {
@@ -169,7 +168,7 @@ def check_all_apis(url, label):
 if __name__ == "__main__":
     exe, asset = (Path(arg).resolve() for arg in sys.argv[1:])
     with tempfile.TemporaryDirectory() as tmp:
-        env = dict(os.environ, APPDATA=tmp, XDG_CONFIG_HOME=tmp, FLYX_BACKEND_DIR=str(exe.parent))
+        env = server_env(tmp, exe)
         template = Path(tmp) / "chat.jinja"
         # XML tool-call syntax (qwen3_coder / qwen35)
         template.write_text("{# XML tool syntax: <tool_call> <function= <parameter= #}"
