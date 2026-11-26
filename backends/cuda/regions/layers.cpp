@@ -5,6 +5,8 @@
 
 #include "backends/cuda/regions/layers.h"
 
+#include <cstdlib>
+
 namespace flyx::cuda {
 
 // Draft head top-k / argmax dispatch (1-bit rough pick on packed or bf16 head, else full draft logits).
@@ -872,8 +874,27 @@ void rel_attn_layer(const Pass& ps, const RelAttnBlock& a, bool fused) {
     const bool dual = round_q8 && w.q8_inputs() && gemm_reads_split(rv.b.h, H, companion, H, L);
     if (dual) {
       rmsnorm_q8_split(x, H, n.w, n.offset, n.eps, R, H, L);
-      gemm_presplit(w, cols, H, out, ld_out, R, false, L);
-      gemm_presplit(companion, companion_cols, H, companion_out, companion_cols, R, false, L);
+      // The companion (the sink's 24 columns: a 3-block launch, ~3.5 us) beside the wide GEMM on the side stream: it
+      // reads only the split rows, which nothing writes until the join after the wide GEMM, and writes only its
+      // own output.  FLYX_SIDE_COMPANION=0: in turn.  Same launches, same bits.
+      static const bool beside = [] {
+        const char* e = std::getenv("FLYX_SIDE_COMPANION");
+        return !e || std::atoi(e) != 0;
+      }();
+      if (beside && ps.round && L.side && L.side->st && (!L.opt || L.opt->side_stream)) {
+        Launch on = L;
+        on.st = L.side->st;
+        on.side = nullptr;
+        CK(cudaEventRecord(L.side->fork, L.st));
+        CK(cudaStreamWaitEvent(on.st, L.side->fork, 0));
+        gemm_presplit(companion, companion_cols, H, companion_out, companion_cols, R, false, on);
+        CK(cudaEventRecord(L.side->join, on.st));
+        gemm_presplit(w, cols, H, out, ld_out, R, false, L);
+        CK(cudaStreamWaitEvent(L.st, L.side->join, 0));
+      } else {
+        gemm_presplit(w, cols, H, out, ld_out, R, false, L);
+        gemm_presplit(companion, companion_cols, H, companion_out, companion_cols, R, false, L);
+      }
     } else {
       rmsnorm(x, H, n.w, n.offset, n.eps, rv.b.h, H, R, H, st);
       gemm(rv.b.h, H, w, cols, H, out, ld_out, R, false, L);
