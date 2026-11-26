@@ -914,52 +914,94 @@ __global__ void k_rel_attn_prep(const float* __restrict__ q_in, int ldq, const f
       const float* win_in = kv_sc.win + size_t(slot_of(P, kv_sc.in_sel)) * kv_sc.win_stride;
       float* rep_base =
           kv_sc.replay ? (kv_sc.replay + size_t(replay_slot_of(P, kv_sc.replay_sel)) * kv_sc.replay_stride) : nullptr;
-      // K ShortConv (ch_off = 0)
-      {
-        const float xr = k_in[size_t(r) * ldk + c];
-        if (!skip_sc && rep_base) rep_base[size_t(r) * kv_sc.ch_total + c] = xr;
-        const float* wrow = kv_sc.k_w + size_t(c) * kv_sc.conv;
-        float acc = 0.f;
-        for (int k = 0; k < hist; ++k) {
-          const int t = r - hist + k;
-          const float hv = t < 0 ? win_in[size_t(hist + t) * kv_sc.ch_total + c] : k_in[size_t(t) * ldk + c];
-          acc = __fmaf_rn(hv, __ldg(wrow + k), acc);
+      if (kv_sc.conv == 4) {
+        // conv 4 (Inkling-2's): K's and V's loads all go out before any of their sums (one memory latency, where the
+        // loops below wait for each tap in turn); the same products in the same order, the dynamic taps' window
+        // values the static taps' (lag l is tap 3 - l).
+        const float* kd = kv_sc.k_dyn ? kv_sc.k_dyn + (size_t(r) * nkv + kh) * 4 : nullptr;
+        const float* vd = kv_sc.v_dyn ? kv_sc.v_dyn + (size_t(r) * nkv + kh) * 4 : nullptr;
+        float kx[4], vx[4], kw[4], vw[4], kdv[4] = {0.f, 0.f, 0.f, 0.f}, vdv[4] = {0.f, 0.f, 0.f, 0.f};
+#pragma unroll
+        for (int k = 0; k < 3; ++k) {
+          const int t = r - 3 + k;
+          kx[k] = t < 0 ? win_in[size_t(3 + t) * kv_sc.ch_total + c] : k_in[size_t(t) * ldk + c];
+          vx[k] = t < 0 ? win_in[size_t(3 + t) * kv_sc.ch_total + kv_dim + c] : v_in[size_t(t) * ldv + c];
         }
-        acc = __fmaf_rn(xr, __ldg(wrow + hist), acc);
-        if (kv_sc.k_dyn) {
-          const float* dh = kv_sc.k_dyn + (size_t(r) * nkv + kh) * kv_sc.conv;
-          acc = __fmaf_rn(xr, dh[0], acc);
-          for (int lag = 1; lag < kv_sc.conv; ++lag) {
-            const int t = r - lag;
+        kx[3] = k_in[size_t(r) * ldk + c];
+        vx[3] = v_in[size_t(r) * ldv + c];
+#pragma unroll
+        for (int k = 0; k < 4; ++k) {
+          kw[k] = __ldg(kv_sc.k_w + size_t(c) * 4 + k);
+          vw[k] = __ldg(kv_sc.v_w + size_t(c) * 4 + k);
+          if (kd) kdv[k] = kd[k];
+          if (vd) vdv[k] = vd[k];
+        }
+        if (!skip_sc && rep_base) {
+          rep_base[size_t(r) * kv_sc.ch_total + c] = kx[3];
+          rep_base[size_t(r) * kv_sc.ch_total + kv_dim + c] = vx[3];
+        }
+        auto conv4 = [](const float (&x)[4], const float (&w)[4], const float* dyn, const float (&dv)[4]) {
+          float acc = 0.f;
+#pragma unroll
+          for (int k = 0; k < 3; ++k) acc = __fmaf_rn(x[k], w[k], acc);
+          acc = __fmaf_rn(x[3], w[3], acc);
+          if (dyn) {
+            acc = __fmaf_rn(x[3], dv[0], acc);
+#pragma unroll
+            for (int lag = 1; lag < 4; ++lag) acc = __fmaf_rn(x[3 - lag], dv[lag], acc);
+          }
+          return (x[3] + acc) * rsqrtf(float((dyn ? 2 : 1) * 4 + 1));
+        };
+        kv_val = conv4(kx, kw, kd, kdv);
+        vv_val = conv4(vx, vw, vd, vdv);
+      } else {
+        // K ShortConv (ch_off = 0)
+        {
+          const float xr = k_in[size_t(r) * ldk + c];
+          if (!skip_sc && rep_base) rep_base[size_t(r) * kv_sc.ch_total + c] = xr;
+          const float* wrow = kv_sc.k_w + size_t(c) * kv_sc.conv;
+          float acc = 0.f;
+          for (int k = 0; k < hist; ++k) {
+            const int t = r - hist + k;
             const float hv = t < 0 ? win_in[size_t(hist + t) * kv_sc.ch_total + c] : k_in[size_t(t) * ldk + c];
-            acc = __fmaf_rn(hv, dh[lag], acc);
+            acc = __fmaf_rn(hv, __ldg(wrow + k), acc);
           }
-        }
-        kv_val = (xr + acc) * rsqrtf(float((kv_sc.k_dyn ? 2 : 1) * kv_sc.conv + 1));
-      }
-      // V ShortConv (ch_off = kv_dim)
-      {
-        const float xr = v_in[size_t(r) * ldv + c];
-        if (!skip_sc && rep_base) rep_base[size_t(r) * kv_sc.ch_total + kv_dim + c] = xr;
-        const float* wrow = kv_sc.v_w + size_t(c) * kv_sc.conv;
-        float acc = 0.f;
-        for (int k = 0; k < hist; ++k) {
-          const int t = r - hist + k;
-          const float hv = t < 0 ? win_in[size_t(hist + t) * kv_sc.ch_total + kv_dim + c] : v_in[size_t(t) * ldv + c];
-          acc = __fmaf_rn(hv, __ldg(wrow + k), acc);
-        }
-        acc = __fmaf_rn(xr, __ldg(wrow + hist), acc);
-        if (kv_sc.v_dyn) {
-          const float* dh = kv_sc.v_dyn + (size_t(r) * nkv + kh) * kv_sc.conv;
-          acc = __fmaf_rn(xr, dh[0], acc);
-          for (int lag = 1; lag < kv_sc.conv; ++lag) {
-            const int t = r - lag;
-            const float hv =
-                t < 0 ? win_in[size_t(hist + t) * kv_sc.ch_total + kv_dim + c] : v_in[size_t(t) * ldv + c];
-            acc = __fmaf_rn(hv, dh[lag], acc);
+          acc = __fmaf_rn(xr, __ldg(wrow + hist), acc);
+          if (kv_sc.k_dyn) {
+            const float* dh = kv_sc.k_dyn + (size_t(r) * nkv + kh) * kv_sc.conv;
+            acc = __fmaf_rn(xr, dh[0], acc);
+            for (int lag = 1; lag < kv_sc.conv; ++lag) {
+              const int t = r - lag;
+              const float hv = t < 0 ? win_in[size_t(hist + t) * kv_sc.ch_total + c] : k_in[size_t(t) * ldk + c];
+              acc = __fmaf_rn(hv, dh[lag], acc);
+            }
           }
+          kv_val = (xr + acc) * rsqrtf(float((kv_sc.k_dyn ? 2 : 1) * kv_sc.conv + 1));
         }
-        vv_val = (xr + acc) * rsqrtf(float((kv_sc.v_dyn ? 2 : 1) * kv_sc.conv + 1));
+        // V ShortConv (ch_off = kv_dim)
+        {
+          const float xr = v_in[size_t(r) * ldv + c];
+          if (!skip_sc && rep_base) rep_base[size_t(r) * kv_sc.ch_total + kv_dim + c] = xr;
+          const float* wrow = kv_sc.v_w + size_t(c) * kv_sc.conv;
+          float acc = 0.f;
+          for (int k = 0; k < hist; ++k) {
+            const int t = r - hist + k;
+            const float hv = t < 0 ? win_in[size_t(hist + t) * kv_sc.ch_total + kv_dim + c] : v_in[size_t(t) * ldv + c];
+            acc = __fmaf_rn(hv, __ldg(wrow + k), acc);
+          }
+          acc = __fmaf_rn(xr, __ldg(wrow + hist), acc);
+          if (kv_sc.v_dyn) {
+            const float* dh = kv_sc.v_dyn + (size_t(r) * nkv + kh) * kv_sc.conv;
+            acc = __fmaf_rn(xr, dh[0], acc);
+            for (int lag = 1; lag < kv_sc.conv; ++lag) {
+              const int t = r - lag;
+              const float hv =
+                  t < 0 ? win_in[size_t(hist + t) * kv_sc.ch_total + kv_dim + c] : v_in[size_t(t) * ldv + c];
+              acc = __fmaf_rn(hv, dh[lag], acc);
+            }
+          }
+          vv_val = (xr + acc) * rsqrtf(float((kv_sc.v_dyn ? 2 : 1) * kv_sc.conv + 1));
+        }
       }
       // Ascending k guarantees hist + src_r = k + 1 > k when nrows == 1 (race-free even if next_sel == in_sel;
       // launcher rejects next_sel == in_sel when nrows > 1).
