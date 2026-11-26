@@ -299,6 +299,8 @@ flyx_add_py_test(server_ephemeral_port ${CMAKE_CURRENT_SOURCE_DIR}/apps/flyx-ser
                  ARGS $<TARGET_FILE:flyx-cli> TIMEOUT 45)
 flyx_add_py_test(remembered_model ${CMAKE_CURRENT_SOURCE_DIR}/apps/flyx-server/remembered_model.py
                  ARGS $<TARGET_FILE:flyx-cli> ${ASSETS}/tiny.flyx FIXTURES assets)
+flyx_add_py_test(server_lan_access ${CMAKE_CURRENT_SOURCE_DIR}/apps/flyx-server/lan_access.py
+                 ARGS $<TARGET_FILE:flyx-cli> ${ASSETS}/tiny.flyx FIXTURES assets)
 flyx_add_py_test(queued_request_ttft ${CMAKE_CURRENT_SOURCE_DIR}/apps/flyx-server/queued_request_ttft.py
                  ARGS $<TARGET_FILE:flyx-cli> ${ASSETS}/tiny.flyx FIXTURES assets TIMEOUT 90)
 flyx_add_py_test(streaming_tool_calls ${CMAKE_CURRENT_SOURCE_DIR}/apps/flyx-server/streaming_tool_calls.py

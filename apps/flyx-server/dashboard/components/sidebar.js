@@ -10,6 +10,7 @@ import { live, phaseOf, phaseNames, ttftSeconds, memoryOf } from "../lib/telemet
 export const PAGES = [
   ["overview", "Overview", "overview"], ["model", "Model", "model"], ["requests", "Requests", "requests"],
   ["chat", "Chat", "chat"], ["logs", "Logs", "logs"], ["integration", "Integration", "integration"],
+  ["settings", "Server settings", "gear"],
 ];
 
 // The figures both views show, from the last telemetry.

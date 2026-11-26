@@ -29,6 +29,7 @@
 #include <filesystem>
 #include <fstream>
 #include <memory>
+#include <optional>
 #include <string>
 #include <string_view>
 #include <thread>
@@ -49,11 +50,23 @@ namespace {
 
 volatile std::sig_atomic_t g_stop_signal = 0;
 
+class Listener : public httplib::Server {
+ public:
+  std::string bound_host(const std::string& requested) const {
+    std::string address;
+    int port = 0;
+    httplib::detail::get_local_ip_and_port(svr_sock_, address, port);
+    return address.empty() ? requested : address;
+  }
+};
+
 void on_signal(int) { g_stop_signal = 1; }
 
 // The address a browser on this machine reaches a server listening on `host` at.
 std::string local_url(const std::string& host, int port) {
-  std::string h = host == "0.0.0.0" || host == "::" || host.empty() ? "127.0.0.1" : host;
+  std::string h = host;
+  if (h == "::") h = "::1";
+  else if (h == "0.0.0.0" || h.empty()) h = "127.0.0.1";
   if (h.find(':') != std::string::npos && h.front() != '[') h = "[" + h + "]";
   return "http://" + h + ":" + std::to_string(port);
 }
@@ -81,7 +94,7 @@ void pause_owned_console() {
                "  MODEL                a .gguf or .flyx file, or a Hugging Face name (org/name:QUANT), fetched into\n"
                "                       the Hugging Face cache; without it the last model served, or none until the\n"
                "                       dashboard's model panel loads one\n"
-               "  --host H             address to listen on (default 127.0.0.1)\n"
+               "  --host H             listen address, overriding the dashboard LAN setting (default 127.0.0.1)\n"
                "  --port P             port (default 8080, 0 lets the OS choose)\n"
                "  --name NAME          model name reported by the API (default: the file's name)\n"
                "  --models-dir DIR     a directory of model files (.gguf, .flyx) the dashboard lists beside the\n"
@@ -166,7 +179,8 @@ namespace {
 
 // What the command line asks for.
 struct ServeArgs {
-  std::string model, name, host = flyx::apps::kDefaultHost;
+  std::string model, name;
+  std::optional<std::string> host;
   std::vector<std::string> models_dirs;
   std::string dashboard_dir;  // --dashboard-dir: the page's files read from here first
   int port = flyx::apps::kDefaultPort, threads = flyx::apps::kDefaultHttpThreads;
@@ -315,7 +329,7 @@ void add_base_routes(httplib::Server& http, ModelHost& models, const std::string
                                         "/v1/messages", "/v1/messages/count_tokens", "/v1/telemetry", "/v1/load",
                                         "/v1/unload", "/v1/hub/config", "/v1/hub/search", "/v1/hub/files",
                                         "/v1/hub/cached", "/v1/hub/dir", "/v1/requests",
-                                        "/v1/logs", "/health",
+                                        "/v1/logs", "/v1/settings/network", "/health",
                                         "/dashboard"}}});
   });
   http.Get("/favicon.ico", [file](const httplib::Request&, httplib::Response& res) { file("brand/favicon.ico", res); });
@@ -341,7 +355,8 @@ void add_base_routes(httplib::Server& http, ModelHost& models, const std::string
 
 int run(int argc, char** argv) {
   const ServeArgs args = parse_args(argc, argv);
-  const std::string &model = args.model, &host = args.host;
+  const std::string& model = args.model;
+  const std::string host = args.host ? *args.host : ModelHost::lan_access() ? "0.0.0.0" : apps::kDefaultHost;
   int port = args.port;
   const EngineOptions& eo = args.eo;
   const Config& cfg = args.cfg;
@@ -353,7 +368,7 @@ int run(int argc, char** argv) {
   // kernel then deals connections between the two; SO_REUSEADDR on Windows, where which of them answers is not
   // defined), so a second `flyx serve` started by mistake would take half the requests with another model.
   auto make_http = [] {
-    auto s = std::make_unique<httplib::Server>();
+    auto s = std::make_unique<Listener>();
     s->set_socket_options([](socket_t sock) {
       const int on = 1;
 #ifdef _WIN32
@@ -364,7 +379,7 @@ int run(int argc, char** argv) {
     });
     return s;
   };
-  std::unique_ptr<httplib::Server> http_ptr;
+  std::unique_ptr<Listener> http_ptr;
   for (int p = port; p > 0 && p <= std::min(65535, port + 32); ++p) {
     auto cand = make_http();
     if (cand->bind_to_port(host, p)) {
@@ -402,6 +417,7 @@ int run(int argc, char** argv) {
     return 1;
   }
   httplib::Server& http = *http_ptr;
+  const std::string bound_host = http_ptr->bound_host(host);
 
   // On a terminal: the dashboard from now on (what the process writes to standard error goes into its log), and the
   // page in the browser once the server answers.
@@ -528,6 +544,7 @@ int run(int argc, char** argv) {
   add_openai_responses_routes(http, &srv);
   add_telemetry_routes(http, &srv);
   add_manage_routes(http, &srv);
+  add_network_routes(http, &srv, bound_host, port, args.host.has_value());
   add_request_log_routes(http, &srv);
   add_system_log_routes(http, &srv);
 

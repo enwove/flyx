@@ -117,6 +117,7 @@ void add_anthropic_messages_routes(httplib::Server& http, Server* s);
 void add_openai_responses_routes(httplib::Server& http, Server* s);
 void add_telemetry_routes(httplib::Server& http, Server* s);
 void add_manage_routes(httplib::Server& http, Server* s);  // manage.cpp: the dashboard's model panel
+void add_network_routes(httplib::Server& http, Server* s, const std::string& host, int port, bool host_from_cli);
 void add_request_log_routes(httplib::Server& http, Server* s);  // request_log.cpp: GET /v1/requests
 void add_system_log_routes(httplib::Server& http, Server* s);   // system_log.cpp: GET /v1/logs
 
