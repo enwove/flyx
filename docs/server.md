@@ -82,7 +82,7 @@ All commands that load a model share the parser in `apps/common/engine_flags.cpp
 | Flag | Values | Default | Behavior |
 |---|---|---|---|
 | `--host` | IP / hostname | `127.0.0.1` | Listen address. Use `--api-key` when binding outside loopback. |
-| `--port` | `1..65535` | `8080` | Listen port. If omitted and 8080 is held by another program, picks the next free port automatically (if held by an existing `flyx serve`, Explorer launches open its dashboard). |
+| `--port` | `0..65535` | `8080` | With `--port 0`, the OS assigns a free port and the server prints the dashboard URL at startup. If omitted and 8080 is held by another program, picks the next free port automatically (if held by an existing `flyx serve`, Explorer launches open its dashboard). |
 | `--name` | string | filename / HF name | Model ID reported in `/v1/models` and responses. |
 | `--models-dir` | `DIR` (repeatable) | none | Extra local directories scanned (depth 6) for `.gguf`/`.flyx` in `/v1/hub/cached` and dashboard (never deleted by `flyx`). |
 | `--sessions` | `N` (≥ 1) | `8` (capped by memory) | Target concurrent GPU sessions (allocated on demand). Planner sizes full context for 1 session first, then attempts 2 within memory budgets when tight, admitting up to `N` sessions that fit (reported as `model.max_sessions`). |
