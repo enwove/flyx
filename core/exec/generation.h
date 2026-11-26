@@ -59,6 +59,7 @@ struct SamplingParams {
 
 struct GenerateRequest {
   std::vector<int32_t> prompt;            // the whole conversation, as tokens
+  PromptEncoding prompt_encoding;         // how its text was read (prepare_request); unknown for given tokens
   std::vector<int32_t> checkpoints;       // prompt positions worth a checkpoint (message boundaries)
   std::vector<int32_t> cache_prefixes;    // explicit client cache breakpoints in ascending order
   int32_t system_end = 0;                 // system instructions and tools precede the first user

@@ -239,6 +239,11 @@ flyx_add_unit_test(elastic_load_test core/exec/elastic_load_test.cpp flyx-test-h
 add_dependencies(elastic_load_test flyx-cpu_ref)
 flyx_add_unit_test(plans_test core/plan/plans_test.cpp)
 flyx_add_unit_test(scheduler_test core/exec/scheduler_test.cpp flyx-test-host-kv)
+# A model switch in flyx serve's host: the server's model host and model sources over the tiny model.
+flyx_add_unit_test(model_host_test apps/flyx-server/model_host_test.cpp flyx-test-host-kv)
+target_sources(model_host_test PRIVATE ${CMAKE_SOURCE_DIR}/apps/flyx-server/model_host.cpp
+                                       ${CMAKE_SOURCE_DIR}/apps/common/model_source.cpp)
+add_dependencies(model_host_test flyx-cpu_ref)
 
 add_executable(capi_test core/exec/capi_test.cpp ${CMAKE_SOURCE_DIR}/core/exec/capi.cpp)
 target_compile_definitions(capi_test PRIVATE FLYX_BUILDING)
@@ -420,11 +425,17 @@ flyx_add_py_test(gemm_tables ${CMAKE_SOURCE_DIR}/tests/tools/codegen/gen_gemm_ta
 add_test(NAME scheduler_cpu_ref COMMAND scheduler_test ${ASSETS}/tiny.flyx cpu_ref)
 add_test(NAME scheduler_queue COMMAND scheduler_test ${ASSETS}/tiny.flyx cpu_ref queue)
 add_test(NAME scheduler_prewarmed_history COMMAND scheduler_test ${ASSETS}/tiny.flyx cpu_ref history)
+# Raw prompts of different clients (the same text, or one extending another's) each run to their own end; a shared
+# conversation id replaces.
+flyx_register_test(scheduler_raw_clients scheduler_test ${ASSETS}/tiny.flyx cpu_ref raw-clients)
 add_test(NAME scheduler_interrupted_prewarm COMMAND scheduler_test ${ASSETS}/tiny.flyx cpu_ref interrupted-prewarm)
 add_test(NAME scheduler_reassigned_prewarm COMMAND scheduler_test ${ASSETS}/tiny.flyx cpu_ref reassigned-prewarm)
 add_test(NAME scheduler_repeated_prewarm COMMAND scheduler_test ${ASSETS}/tiny.flyx cpu_ref repeated-prewarm)
 add_test(NAME scheduler_marked_system COMMAND scheduler_test ${ASSETS}/tiny.flyx cpu_ref marked-system)
 add_test(NAME session_host_budget COMMAND session_budget_test ${ASSETS}/tiny.flyx)
+# A model switch loads the new model once the old one is closed, not once nobody holds it: the last request lets go
+# of it on its own thread while the backend's close is held up there, and the backend holds one model at a time.
+flyx_register_test(model_host model_host_test ${ASSETS}/tiny.flyx)
 add_test(NAME generation_edges COMMAND generation_test ${ASSETS}/tiny.flyx)
 flyx_register_test(elastic_load elastic_load_test ${ASSETS}/tiny.flyx)
 # The C API: a chat request with the file's template, and with the one the load options give.
@@ -452,8 +463,10 @@ flyx_add_golden_test(golden_cpu_ref_gdn128 ARGS cpu_ref gdn128)
 flyx_add_golden_test(golden_cpu_ref_window ARGS cpu_ref window)
 
 set_tests_properties(tokenizer tokenizer_minicpm5 chat chat_qwen35 reply_grammars request reply_text
-                     scheduler_cpu_ref scheduler_queue scheduler_prewarmed_history scheduler_interrupted_prewarm
+                     scheduler_cpu_ref scheduler_queue scheduler_prewarmed_history scheduler_raw_clients
+                     scheduler_interrupted_prewarm
                      scheduler_reassigned_prewarm scheduler_repeated_prewarm scheduler_marked_system session_host_budget generation_edges elastic_load capi
+                     model_host
                      llama_models PROPERTIES FIXTURES_REQUIRED assets)
 
 # The tests that need the GPU (label gpu): the ones below, and those above that take the CUDA backend too.

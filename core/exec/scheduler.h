@@ -14,7 +14,9 @@
 //   max_sessions run at once, and one whose session is running another
 //   request waits for it without holding up the jobs behind it.
 // * A new request for a conversation that is generating right now (a retry,
-//   or a follow-up sent without waiting) cancels the running one.
+//   or a follow-up sent without waiting) cancels the running one.  Chat
+//   messages say which conversation they continue; a raw prompt does not, so a
+//   raw generation is replaced only by a request with its conversation_id.
 // * Cancelling a job stops it at the next round, or between prefill passes.
 // * Idle tiers: after idle_unload_ms without requests the sessions are
 //   freed (weights stay; the next request recomputes its prompt); after

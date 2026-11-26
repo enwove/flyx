@@ -380,7 +380,7 @@ bool Generation::finish_prefill() {
     result_.usage.finish_reason = cancelled() ? FLYX_FINISH_CANCEL : FLYX_FINISH_LENGTH;
     s_->publish(req_.prompt, {}, 0, -1, req_.media_spans.empty() ? nullptr : &req_.media_spans,
                 req_.rendered_text.empty() ? nullptr : &req_.rendered_text,
-                req_.rendered_images.empty() ? nullptr : &req_.rendered_images);
+                req_.rendered_images.empty() ? nullptr : &req_.rendered_images, &req_.prompt_encoding);
     phase_ = Phase::kDone;
     return false;
   }
@@ -612,7 +612,7 @@ bool Generation::finish_up() {
   s_->publish(req_.prompt, reply_.tokens(), reply_.published(), result_.stop_token,
               req_.media_spans.empty() ? nullptr : &req_.media_spans,
               req_.rendered_text.empty() ? nullptr : &req_.rendered_text,
-              req_.rendered_images.empty() ? nullptr : &req_.rendered_images);
+              req_.rendered_images.empty() ? nullptr : &req_.rendered_images, &req_.prompt_encoding);
   phase_ = Phase::kDone;
   return false;
 }

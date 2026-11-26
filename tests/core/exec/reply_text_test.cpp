@@ -1,12 +1,15 @@
 // Copyright 2026 The flyx Authors. SPDX-License-Identifier: Apache-2.0
 // ReplyText (core/exec/reply_text.h): a reply's tokens as text, shown as its
 // characters complete, ending before the first stop string, and the tokens
-// the shown text covers.  No engine and no device: a tokenizer only.
+// the shown text covers.  Overlapping stop strings end the reply where they
+// would a byte at a time, however the tokens are grouped (a speculative
+// round's width).  No engine and no device: a tokenizer only.
 //
 //   reply_text_test MODEL.flyx
 #include <algorithm>
 #include <cstdio>
 #include <string>
+#include <utility>
 #include <vector>
 
 #include "core/exec/reply_text.h"
@@ -82,6 +85,73 @@ void run(const Tokenizer& tok, const std::string& text, const std::vector<std::s
   if (want_stop.empty()) check(reply.tokens() == ids, what + "keeps every token pushed");
 }
 
+
+// The rule, a byte at a time: the reply ends before the stop string that completes first; of those completing at the
+// same byte, before the one that starts first.  What is shown, and the stop string ("" for none).
+std::pair<std::string, std::string> ends_at(const std::string& text, const std::vector<std::string>& stop) {
+  for (size_t k = 1; k <= text.size(); ++k) {
+    size_t start = std::string::npos;
+    std::string which;
+    for (const auto& s : stop)
+      if (!s.empty() && s.size() <= k && text.compare(k - s.size(), s.size(), s) == 0 && k - s.size() < start) {
+        start = k - s.size();
+        which = s;
+      }
+    if (start != std::string::npos) return {text.substr(0, start), which};
+  }
+  return {text, ""};
+}
+
+// A token whose text is exactly `bytes` (-1: none).
+int32_t token_of(const Tokenizer& tok, const std::string& bytes) {
+  for (int32_t id = 0; id < tok.n_tokens(); ++id)
+    if (!tok.special(id) && tok.token_bytes(id) == bytes) return id;
+  return -1;
+}
+
+// `ids` pushed in every grouping there is (2^(n-1) of them: a speculative round of any width at any point): each shows
+// the same text, ends on the same stop string and publishes the same tokens, those of the rule a byte at a time.
+void every_grouping(const Tokenizer& tok, const std::vector<int32_t>& ids, const std::vector<std::string>& stop,
+                    const std::string& what) {
+  std::string text;
+  for (int32_t id : ids) text += tok.token_bytes(id);
+  const auto [want, want_stop] = ends_at(text, stop);
+  size_t bytes = 0, covered = 0;
+  for (int32_t id : ids) {
+    bytes += tok.token_bytes(id).size();
+    if (bytes > want.size()) break;
+    ++covered;
+  }
+  const std::vector<int32_t> want_tokens(ids.begin(), ids.begin() + static_cast<std::ptrdiff_t>(covered));
+  const size_t n = ids.size();
+  int differ = 0;
+  for (uint32_t cuts = 0; cuts < (1u << (n - 1)); ++cuts) {  // bit i: a push ends after token i
+    Seen seen;
+    ReplyText reply(tok, stop, [&](std::string_view t, const int32_t* toks, int k) {
+      seen.text += t;
+      seen.tokens.insert(seen.tokens.end(), toks, toks + k);
+      seen.whole = seen.whole && whole_utf8(t);
+      return true;
+    });
+    std::string groups;
+    for (size_t i = 0, from = 0; i < n; ++i) {
+      if (i + 1 < n && !(cuts >> i & 1)) continue;
+      reply.push(ids.data() + from, static_cast<int>(i + 1 - from));
+      groups += (groups.empty() ? "" : "|") + std::to_string(i + 1 - from);
+      from = i + 1;
+    }
+    reply.end();
+    const bool same = seen.text == want && reply.stop_string() == want_stop && seen.tokens == want_tokens &&
+                      reply.published() == covered && seen.whole;
+    if (!same && differ++ < 4)
+      check(false, what + ", pushes of " + groups + " tokens: shows '" + seen.text + "' (want '" + want +
+                       "'), stop '" + reply.stop_string() + "' (want '" + want_stop + "'), published " +
+                       std::to_string(reply.published()) + " (want " + std::to_string(covered) + ")");
+  }
+  check(differ == 0, what + ": every grouping of " + std::to_string(n) + " tokens shows '" + want + "' and stops at '" +
+                         want_stop + "' (" + std::to_string(differ) + " differ)");
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -120,6 +190,52 @@ int main(int argc, char** argv) {
     for (int step : {1, 2, 5, 1000}) run(tok, text, c.stop, step, want, c.stop_found);
   }
 
+  // Overlapping stop strings, the same token ids grouped every way a round can group them.
+  {
+    std::vector<int32_t> letter(26, -1);
+    bool found = true;
+    for (char c = 'a'; c <= 'z'; ++c)
+      found = (letter[size_t(c - 'a')] = token_of(tok, std::string(1, c))) >= 0 && found;
+    check(found, "the tokenizer has a token for each letter");
+    auto spell = [&](const std::string& word) {
+      std::vector<int32_t> ids;
+      for (char c : word) ids.push_back(letter[size_t(c - 'a')]);
+      return ids;
+    };
+    if (found) {
+      // The case that was wrong: one id at a time saw "b" end first, all three at once preferred "abc", which starts
+      // first (empty text, no token published).
+      every_grouping(tok, spell("abc"), {"abc", "b"}, "'abc' stops 'abc', 'b'");
+      every_grouping(tok, spell("abc"), {"b", "abc"}, "'abc' stops 'b', 'abc'");
+      every_grouping(tok, spell("abcd"), {"abcd", "bc"}, "'abcd' stops 'abcd', 'bc' (inside, ending first)");
+      every_grouping(tok, spell("abcd"), {"bcd", "abc"}, "'abcd' stops 'bcd', 'abc' (overlapping)");
+      // Stop strings that share a prefix: the shorter ends first; a false start of the longer.
+      every_grouping(tok, spell("abcde"), {"abcd", "ab"}, "'abcde' stops 'abcd', 'ab' (shared prefix)");
+      every_grouping(tok, spell("abce"), {"abcd", "abce"}, "'abce' stops 'abcd', 'abce' (shared prefix, false start)");
+      every_grouping(tok, spell("xabyab"), {"aby", "abz"}, "'xabyab' stops 'aby', 'abz'");
+      // Ending at the same byte: the one that starts first.
+      every_grouping(tok, spell("abc"), {"bc", "abc"}, "'abc' stops 'bc', 'abc' (same end)");
+      every_grouping(tok, spell("abcd"), {"d", "cd", "bcd"}, "'abcd' stops 'd', 'cd', 'bcd' (same end)");
+      every_grouping(tok, spell("abcabc"), {"ca", "bcab", "cab"}, "'abcabc' stops 'ca', 'bcab', 'cab'");
+    }
+    // A character split across two tokens: nothing of it shows until it is whole, and a stop string ending with it
+    // ends where it completes.
+    const int32_t lead = token_of(tok, "\xC3"), cont = token_of(tok, "\xA9");
+    check(lead >= 0 && cont >= 0, "the tokenizer has a token for each byte of a two-byte character");
+    if (found && lead >= 0 && cont >= 0) {
+      const std::vector<int32_t> cafe = {letter['c' - 'a'], letter['a' - 'a'], letter['f' - 'a'], lead, cont,
+                                         letter['s' - 'a']};
+      every_grouping(tok, cafe, {"\xC3\xA9s", "f\xC3\xA9"}, "'caf\xC3\xA9s' stops '\xC3\xA9s', 'f\xC3\xA9'");
+      every_grouping(tok, cafe, {"\xC3\xA9", "af\xC3\xA9"}, "'caf\xC3\xA9s' stops '\xC3\xA9', 'af\xC3\xA9' (same end)");
+      every_grouping(tok, cafe, {"\xC3\xA9s", "s"}, "'caf\xC3\xA9s' stops '\xC3\xA9s', 's' (same end)");
+      every_grouping(tok, cafe, {"fa"}, "'caf\xC3\xA9s' no stop");
+    }
+    // The tokenizer's own tokens of a phrase.
+    const auto ids = tok.encode("beta gamma");
+    check(ids.size() >= 3 && ids.size() <= 14, "a phrase of a few tokens (" + std::to_string(ids.size()) + ")");
+    if (ids.size() >= 3 && ids.size() <= 14)
+      every_grouping(tok, ids, {"beta gamma", "ta g", "a gam"}, "'beta gamma' overlapping stops");
+  }
   // The sink says stop: reported, for the caller to cancel.
   {
     const auto ids = tok.encode(text);

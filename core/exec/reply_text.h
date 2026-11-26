@@ -24,7 +24,8 @@ using TextSink = std::function<bool(std::string_view text, const int32_t* tokens
 
 class ReplyText {
  public:
-  // stop: the reply ends before the first of these strings.  sink may be empty.
+  // stop: the reply ends before the first of these strings to complete (of those completing at the same byte, the
+  // one that starts first), however the tokens are grouped into pushes.  sink may be empty.
   ReplyText(const Tokenizer& tok, std::vector<std::string> stop, TextSink sink);
 
   // The next generated tokens, in order (no stop token among them).

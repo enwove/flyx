@@ -416,9 +416,14 @@ std::shared_ptr<Job> Scheduler::submit(Request in, std::string* err, int* status
     auto same = [&](const std::shared_ptr<Job>& other) {
       const Request& a = other->in_;
       const Request& b = job->in_;
-      if (!a.conversation_id.empty() && !b.conversation_id.empty() && a.conversation_id != b.conversation_id)
-        return false;
+      const bool identified = !a.conversation_id.empty() && !b.conversation_id.empty();
+      if (identified && a.conversation_id != b.conversation_id) return false;
       if (b.gen.prefill_only && !a.gen.prefill_only) return false;
+      // A raw prompt is the caller's own text: its bytes say nothing of who sent it, so two clients whose prompts
+      // are the same, or one of which extends the other's, sent two requests.  Without a shared conversation id a
+      // raw prompt replaces only a raw prewarm (no reply anyone waits for; it takes over the prewarm's work), and
+      // neither replaces nor is replaced by a chat request.
+      if ((!a.chat || !b.chat) && !identified && (a.chat != b.chat || !a.gen.prefill_only)) return false;
       if (const size_t end = other->prompt_.conversation_end)
         return job->prompt_.text.compare(0, end, other->prompt_.text, 0, end) == 0 &&
                same_rendered_images_prefix(other->prompt_, job->prompt_, end);

@@ -4,6 +4,8 @@
 // tables, stop tokens and chat template of the .flyx file of the same
 // model, the file's own metadata, and its tensors under their GGUF names with
 // row-major shapes; a damaged file is rejected with a message, nothing kept.
+// A vision projector beside a model is the same split into shards as in one
+// file, opened from any shard; a projector is never the model.
 #include <algorithm>
 #include <atomic>
 #include <cmath>
@@ -12,6 +14,8 @@
 #include <filesystem>
 #include <fstream>
 #include <iterator>
+#include <map>
+#include <memory>
 #include <string>
 #include <vector>
 
@@ -283,6 +287,183 @@ void split_gguf(const std::string& dir) {
   cleanup();
 }
 
+// A GGUF file of float tensors, as a projector's converter writes one: its metadata (strings, split.no and
+// split.count as u16, split.tensors.count as i32) and its tensors, row-major shapes given.
+class GgufBytes {
+ public:
+  void str(const std::string& key, const std::string& v) {
+    this->key(key, 8);
+    u64(v.size());
+    bytes(v);
+  }
+  void u16(const std::string& key, uint16_t v) {
+    this->key(key, 2);
+    raw(&v, 2);
+  }
+  void i32(const std::string& key, int32_t v) {
+    this->key(key, 5);
+    raw(&v, 4);
+  }
+  void tensor(const std::string& name, const std::vector<uint64_t>& shape, const std::vector<float>& values) {
+    tensors_.push_back({name, shape, values});
+  }
+  void write(const std::filesystem::path& path) const {
+    std::vector<uint8_t> out = {'G', 'G', 'U', 'F'};
+    auto put = [&](const void* p, size_t n) { out.insert(out.end(), static_cast<const uint8_t*>(p), static_cast<const uint8_t*>(p) + n); };
+    const uint32_t version = 3;
+    const uint64_t n_tensors = tensors_.size(), n_kv = n_kv_;
+    put(&version, 4);
+    put(&n_tensors, 8);
+    put(&n_kv, 8);
+    out.insert(out.end(), kv_.begin(), kv_.end());
+    uint64_t offset = 0;
+    for (const auto& t : tensors_) {
+      const uint64_t len = t.name.size();
+      const uint32_t rank = uint32_t(t.shape.size()), f32 = 0;
+      put(&len, 8);
+      put(t.name.data(), t.name.size());
+      put(&rank, 4);
+      for (size_t d = t.shape.size(); d-- > 0;) put(&t.shape[d], 8);  // the fastest dimension first
+      put(&f32, 4);
+      put(&offset, 8);
+      offset += (t.values.size() * 4 + 31) / 32 * 32;
+    }
+    out.resize((out.size() + 31) / 32 * 32);
+    for (const auto& t : tensors_) {
+      put(t.values.data(), t.values.size() * 4);
+      out.resize((out.size() + 31) / 32 * 32);
+    }
+    std::ofstream f(path, std::ios::binary | std::ios::trunc);
+    f.write(reinterpret_cast<const char*>(out.data()), std::streamsize(out.size()));
+  }
+
+ private:
+  struct Tensor {
+    std::string name;
+    std::vector<uint64_t> shape;
+    std::vector<float> values;
+  };
+  void raw(const void* p, size_t n) { kv_.insert(kv_.end(), static_cast<const uint8_t*>(p), static_cast<const uint8_t*>(p) + n); }
+  void u64(uint64_t v) { raw(&v, 8); }
+  void bytes(const std::string& v) { kv_.insert(kv_.end(), v.begin(), v.end()); }
+  void key(const std::string& k, uint32_t type) {
+    u64(k.size());
+    bytes(k);
+    raw(&type, 4);
+    ++n_kv_;
+  }
+  std::vector<uint8_t> kv_;
+  uint64_t n_kv_ = 0;
+  std::vector<Tensor> tensors_;
+};
+
+// A vision projector (general.type mmproj) beside a model: one file, and the same tensors in two shards whose second
+// says nothing of its type, or says the same; opened from either shard, each gives the one file's tensors.  Refused:
+// a projector as the model, single or split, and shards of two types.
+void projector_split(const std::string& dir) {
+  namespace fs = std::filesystem;
+  const fs::path tmp = fs::temp_directory_path() / ("flyx-mmproj-split-test-" + std::to_string(os::process_id()));
+  std::error_code ec;
+  fs::remove_all(tmp, ec);
+  fs::create_directories(tmp, ec);
+  struct T {
+    std::string name;
+    std::vector<uint64_t> shape;
+    std::vector<float> values;
+  };
+  const std::vector<T> tensors = {{"v.patch_embd.weight", {2, 3}, {0.5f, -1.25f, 2, 3.75f, -0.125f, 6}},
+                                  {"v.blk.0.attn_q.weight", {4}, {1, 2, 4, 8}},
+                                  {"mm.0.weight", {3, 2}, {-6, 5, -4, 3, -2, 1}}};
+  // first..last of `tensors` into one file: its metadata, then split keys when it is one of `count` shards.
+  auto write = [&](const std::string& file, size_t first, size_t last, const char* type, int no, int count) {
+    GgufBytes g;
+    g.str("general.architecture", "clip");
+    if (type) g.str("general.type", type);
+    if (count > 1) {
+      g.u16("split.no", uint16_t(no));
+      g.u16("split.count", uint16_t(count));
+      g.i32("split.tensors.count", int32_t(tensors.size()));
+    }
+    for (size_t i = first; i < last; ++i) g.tensor(tensors[i].name, tensors[i].shape, tensors[i].values);
+    g.write(tmp / file);
+    return os::from_path(tmp / file);
+  };
+  const std::string single = write("mmproj.gguf", 0, 3, "mmproj", 0, 1);
+  const std::string split1 = write("mmproj-00001-of-00002.gguf", 0, 2, "mmproj", 0, 2);
+  const std::string split2 = write("mmproj-00002-of-00002.gguf", 2, 3, nullptr, 1, 2);       // says no type
+  const std::string typed1 = write("typed-00001-of-00002.gguf", 0, 1, "mmproj", 0, 2);
+  const std::string typed2 = write("typed-00002-of-00002.gguf", 1, 3, "mmproj", 1, 2);       // says the same
+  const std::string mixed1 = write("mixed-00001-of-00002.gguf", 0, 2, "mmproj", 0, 2);
+  const std::string mixed2 = write("mixed-00002-of-00002.gguf", 2, 3, "model", 1, 2);        // another type
+  const std::string model1 = write("modelmix-00001-of-00002.gguf", 0, 2, nullptr, 0, 2);
+  const std::string model2 = write("modelmix-00002-of-00002.gguf", 2, 3, "mmproj", 1, 2);   // a model's shard 1
+
+  // The reader, as ModelFile::add calls it (no tokenizer): the names and the values, in order.
+  auto contents = [](const std::string& path, std::vector<std::unique_ptr<os::MappedFile>>* maps,
+                     ModelFile::Contents* c, std::string* err) {
+    maps->clear();
+    maps->push_back(std::make_unique<os::MappedFile>());
+    return maps->back()->open(path, err) && modelfile::read_gguf(maps, path, c, err, /*need_tokenizer=*/false);
+  };
+  std::vector<std::unique_ptr<os::MappedFile>> one_maps;
+  ModelFile::Contents one;
+  std::string err;
+  check(contents(single, &one_maps, &one, &err), "a single-file projector opens beside a model: " + err);
+  bool values_ok = one.names.size() == tensors.size();
+  for (const T& t : tensors) {
+    const auto it = one.index.find(t.name);
+    values_ok = values_ok && it != one.index.end() && one.tensors[it->second].nbytes == t.values.size() * 4 &&
+                std::memcmp(one.tensors[it->second].data, t.values.data(), t.values.size() * 4) == 0;
+  }
+  check(values_ok, "the single-file projector's tensors are the ones written");
+  for (const std::string& path : {split1, split2, typed1, typed2}) {
+    std::vector<std::unique_ptr<os::MappedFile>> maps;
+    ModelFile::Contents c;
+    err.clear();
+    const bool opened = contents(path, &maps, &c, &err);
+    bool same = opened && c.names == one.names && c.header.at("source").at("shards") == 2 &&
+                c.arch == one.arch && c.header.at("gguf").at("general.type") == "mmproj";
+    for (size_t i = 0; same && i < one.tensors.size(); ++i) {
+      const auto& a = one.tensors[i];
+      const auto& b = c.tensors[c.index.at(one.names[i])];
+      same = a.dtype == b.dtype && a.ndim == b.ndim && a.nbytes == b.nbytes &&
+             std::equal(a.shape, a.shape + a.ndim, b.shape) && std::memcmp(a.data, b.data, a.nbytes) == 0;
+    }
+    check(same, "a split projector opened from " + fs::path(path).filename().string() +
+                    " gives the single file's tensor names and values " + err);
+  }
+  // Through ModelFile, beside the tiny model: one companion per projector, its tensors under companion names.
+  ModelFile mf;
+  err.clear();
+  bool added = mf.open(dir + "/tiny_gguf.gguf", &err) && mf.add(single, &err) && mf.add(split1, &err) &&
+               mf.add(split2, &err) && mf.add(typed2, &err);
+  check(added && mf.companions() == 4, "ModelFile::add takes a single and a split projector from either shard " + err);
+  bool companions_same = added && mf.companions() == 4;
+  for (int i = 1; companions_same && i < 4; ++i)
+    for (const T& t : tensors) {
+      const auto* a = mf.tensor(ModelFile::companion_name(0, t.name));
+      const auto* b = mf.tensor(ModelFile::companion_name(i, t.name));
+      companions_same = companions_same && a && b && a->nbytes == b->nbytes && std::memcmp(a->data, b->data, a->nbytes) == 0;
+    }
+  check(companions_same, "the split projector's companions hold the single file's tensors");
+
+  // Refused: a projector as the model (single, split from either shard), and shards of two types.
+  for (const std::string& path : {single, split1, split2}) {
+    ModelFile primary;
+    err.clear();
+    const bool refused = !primary.open(path, &err) && err.find("multimodal projector") != std::string::npos;
+    check(refused, "a projector is not the model (" + fs::path(path).filename().string() + "): " + err);
+  }
+  for (const std::string& path : {mixed1, mixed2, model1, model2}) {
+    ModelFile beside;
+    err.clear();
+    const bool refused = beside.open(dir + "/tiny_gguf.gguf", &err) && !beside.add(path, &err) &&
+                         err.find("general.type") != std::string::npos && err.find("does not match") != std::string::npos;
+    check(refused, "shards of two types are refused (" + fs::path(path).filename().string() + "): " + err);
+  }
+  fs::remove_all(tmp, ec);
+}
+
 void companion_skips_tokenizer(const std::string& path) {
   const auto original = read(path);
   ModelFile::Contents c;
@@ -364,6 +545,7 @@ int main(int argc, char** argv) {
   quantization_version(dir + "/quant_Q4_K.gguf");
   split_gguf(dir);
   companion_skips_tokenizer(dir + "/tiny_gguf.gguf");
+  projector_split(dir);
   array_stride_bounds();
   dflash_gguf_peek_and_open(dir);
   std::printf("%d failures\n", failures);
