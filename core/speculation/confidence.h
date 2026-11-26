@@ -19,7 +19,7 @@ class ConfidenceStopper {
   void configure(const std::vector<int>& widths, const std::vector<double>& costs_ms, double plain_ms);
 
   // Start a new reply: resets per-reply throughput and position acceptance counts while retaining
-  // learned head calibration (with softened curvature so topic/format shifts adapt quickly).
+  // learned head calibration.
   void begin();
 
   bool ready() const { return policy_.n_buckets > 1; }

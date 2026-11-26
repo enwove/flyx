@@ -379,7 +379,9 @@ blocks_round = [
 # blocks_round, rounds of 8 rows: 288393 us with these rules, 330452 with the defaults (-12.7%), 286626 with the best for each
 # blocks_round, rounds of 16 rows: 536350 us with these rules, 538542 with the defaults (-0.4%), 530505 with the best for each
 # MoE layers' fused gate|up GEMMs: `cuda_bench tune moe_gate_up Inkling-2-Mini-UD-IQ3_XXS.gguf` on this GPU (driver 580.178.04,
-# Linux), against the original tiles (the defaults):
+# Linux), against the original tiles (the defaults).  As this table's other rules they also serve the sm_120 GPUs
+# without a table of their own, on this GPU's measurement alone (an RTX 5080's and an RTX 5070 Ti's own rules differ
+# in the rows where they change configuration, not in the configurations):
 # moe_gate_up, passes of 1 rows: 334 us with these rules, 357 with the defaults (-6.4%), 334 with the best for each
 # moe_gate_up, passes of 2 rows: 547 us with these rules, 584 with the defaults (-6.2%), 547 with the best for each
 # moe_gate_up, passes of 4 rows: 864 us with these rules, 935 with the defaults (-7.6%), 864 with the best for each
