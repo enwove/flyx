@@ -293,8 +293,8 @@ void test_empty_history_text_tokenize(const char* model, const flyx_backend_api*
       break;
     }
   }
-  if (empty_id < 0) {
-    std::printf("  skip no empty-decoding token in tiny model\n");
+  if (empty_id < 0) {  // the tiny model has one: without it the history text below would be tested on nothing
+    check(false, "the tiny model has a token whose decode() is empty (a padding id or an empty piece)");
     return;
   }
 

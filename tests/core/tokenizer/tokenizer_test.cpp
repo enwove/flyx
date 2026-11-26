@@ -62,5 +62,6 @@ int main(int argc, char** argv) {
     }
   }
   std::printf("%d / %d cases match\n", n - bad, n);
-  return bad ? 1 : 0;
+  if (n == 0) std::printf("FAIL %s holds no cases: nothing was compared\n", argv[2]);
+  return bad || n == 0 ? 1 : 0;
 }

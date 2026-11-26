@@ -69,12 +69,23 @@ int main(int argc, char** argv) {
                 checkpoint, branch.result.usage.reused_tokens, back.result.usage.reused_tokens,
                 back.result.reuse.c_str(), back.result.parked.c_str());
     if (checkpoint < 256 || branch.result.usage.reused_tokens != checkpoint ||
-        back.result.parked.empty() || back.result.usage.reused_tokens != checkpoint) return 1;
+        back.result.parked.empty() || back.result.usage.reused_tokens != checkpoint) {
+      std::fprintf(stderr, "FAIL the branch and the deep edit both reuse the checkpoint of at least 256 tokens, the "
+                           "edit with the branch parked\n");
+      return 1;
+    }
     Scheduler cold(argv[1], engine, options);
     if (!cold.ok(&err)) throw std::runtime_error(err);
     const Reply fresh = ask(cold, edited);
-    return back.result.usage.new_tokens != 4 || fresh.result.usage.new_tokens != 4 ||
-           back.text.empty() || back.text != fresh.text;
+    if (back.result.usage.new_tokens != 4 || fresh.result.usage.new_tokens != 4 || back.text.empty() ||
+        back.text != fresh.text) {
+      std::fprintf(stderr, "FAIL the edited prompt's reply (%d tokens) is a cold start's (%d tokens, 4 each): \"%s\" "
+                           "vs \"%s\"\n", back.result.usage.new_tokens, fresh.result.usage.new_tokens,
+                   back.text.c_str(), fresh.text.c_str());
+      return 1;
+    }
+    std::printf("parked_edit: ok\n");
+    return 0;
   } catch (const std::exception& error) {
     std::fprintf(stderr, "%s\n", error.what());
     return 1;
