@@ -43,6 +43,10 @@ nlohmann/json is ours (`third_party/nlohmann`). Differences from upstream:
   (`tests/core/render/chat_test.cpp`, the twin with the client's special-token
   text taken out).  Marked `fastest:` in the source; a candidate to send
   upstream.
+* `jinja/value.cpp`, `jinja/value.h`: `tojson(sort_keys=true)` is implemented
+  (sorting object keys lexicographically in UTF-8 order, matching Python's
+  `json.dumps(..., sort_keys=True)`); upstream threw `not_implemented_exception`.
+  Needed by Inkling-2-Mini's chat template. Marked `flyx:` in the source.
 
 Everything else is byte-for-byte upstream.
 

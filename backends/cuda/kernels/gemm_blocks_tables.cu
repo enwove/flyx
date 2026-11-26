@@ -190,6 +190,16 @@ BlockTables build() {
   };
   t.iq3xxs_scaled = iq3_scaled(0, selectors(iq3xxs_grid, 256, 4, &s16));
   t.iq3xxs = upload(s16);
+  std::vector<uint32_t> iq3xxs_signed_rows(16 * 256);
+  for (unsigned i = 0; i < iq3xxs_signed_rows.size(); ++i) {
+    const uint32_t row = iq3xxs_grid[i & 255u];
+    for (int j = 0; j < 4; ++j) {
+      const int magnitude = int((row >> (8 * j)) & 255u);
+      const int value = (i & (1u << (8 + j))) ? -magnitude : magnitude;
+      iq3xxs_signed_rows[i] |= uint32_t(uint8_t(value)) << (8 * j);
+    }
+  }
+  t.iq3xxs_signed_rows = upload(iq3xxs_signed_rows);
   t.iq3s_scaled = iq3_scaled(1, selectors(iq3s_grid, 512, 4, &s16));
   t.iq3s = upload(s16);
 
@@ -221,17 +231,20 @@ BlockTables build() {
   t.ksign_sel = upload(ksel), t.sign_sel = upload(sel), t.ksign_hi = upload(khi), t.sign_hi = upload(shi);
 
   // Bit fields.
-  std::vector<uint32_t> pu(256), ps(256), pi(256), parts8(256);
-  std::vector<uint2> qu(256), qh(256), qm(16);
-  std::vector<uint16_t> i8(256), pi8(256);
+  std::vector<uint32_t> pu(256), ps(256), pi(256), pmx(256), parts8(256);
+  std::vector<uint2> qu(256), qs2(256), qh(256), qm(16);
+  std::vector<uint16_t> i8(256), pi8(256), pmx8(256);
   for (int b = 0; b < 256; ++b) {
     const int lo4 = b & 15, hi4 = b >> 4;
     pu[size_t(b)] = pair(lo4, hi4);
     ps[size_t(b)] = pair(lo4 - 8, hi4 - 8);
     pi[size_t(b)] = pair(kvalues_iq4nl[lo4], kvalues_iq4nl[hi4]);
     pi8[size_t(b)] = uint16_t(int8_word({kvalues_iq4nl[lo4], kvalues_iq4nl[hi4]}, 0, 1));
+    pmx[size_t(b)] = pair(kvalues_mxfp4[lo4], kvalues_mxfp4[hi4]);
+    pmx8[size_t(b)] = uint16_t(int8_word({kvalues_mxfp4[lo4], kvalues_mxfp4[hi4]}, 0, 1));
     const int c[4] = {b & 3, (b >> 2) & 3, (b >> 4) & 3, (b >> 6) & 3};
     qu[size_t(b)] = quad(c[0], c[1], c[2], c[3]);
+    qs2[size_t(b)] = quad(c[0] - 1, c[1] - 1, c[2] - 1, c[3] - 1);
     qh[size_t(b)] = quad(16 * c[0] - 32, 16 * c[1] - 32, 16 * c[2] - 32, 16 * c[3] - 32);
     const int s = int(int8_t(b));
     i8[size_t(b)] = half_bits(s);
@@ -240,10 +253,11 @@ BlockTables build() {
   }
   for (int b = 0; b < 16; ++b) qm[size_t(b)] = quad(4 * (b & 1) - 4, 4 * ((b >> 1) & 1) - 4, 4 * ((b >> 2) & 1) - 4, 4 * (b >> 3) - 4);
   t.pair_u4 = upload(pu), t.pair_s4 = upload(ps), t.pair_iq4 = upload(pi), t.pair_iq4_s8 = upload(pi8);
+  t.pair_mxfp4 = upload(pmx), t.pair_mxfp4_s8 = upload(pmx8);
   for (int w = 0; w < 4; ++w)
     t.iq4_s8[w] = int8_word({kvalues_iq4nl[4 * w], kvalues_iq4nl[4 * w + 1], kvalues_iq4nl[4 * w + 2],
                              kvalues_iq4nl[4 * w + 3]}, 0, 1);
-  t.quad_u2 = upload(qu), t.quad_hi6 = upload(qh), t.quad_mask = upload(qm);
+  t.quad_u2 = upload(qu), t.quad_s2 = upload(qs2), t.quad_hi6 = upload(qh), t.quad_mask = upload(qm);
   t.int8 = upload(i8), t.parts_s8 = upload(parts8);
 
   // Scales of a group.

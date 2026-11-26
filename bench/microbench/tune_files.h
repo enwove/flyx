@@ -14,4 +14,13 @@ struct FileMatrix {
 // head too.  False and *err: the file could not be read.
 bool file_matrices(const std::string& path, std::vector<FileMatrix>* out, std::string* err);
 
+struct FileExperts {
+  int dtype, n_experts, N, K, top_k;  // flyx_dtype, experts, an expert's rows (gate and up: 2 x intermediate), K, and
+                                      // the experts a token takes
+};
+// The fused gate|up expert matrices of a GGUF file's MoE layers (blk.*.ffn_gate_up_exps.weight: experts x 2
+// intermediate x hidden, as models/inkling2 reads them), the experts a token takes from <arch>.expert_used_count.
+// False and *err: the file could not be read, or it has such matrices and not that key.
+bool file_experts(const std::string& path, std::vector<FileExperts>* out, std::string* err);
+
 }  // namespace flyx::bench

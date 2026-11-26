@@ -18,6 +18,7 @@
 #include "backends/cuda/kernels/common/device.cuh"
 #include "backends/cuda/kernels/common/launch.h"
 #include "backends/cuda/kernels/kernels.cuh"
+#include "ops/sampling/sampling.h"
 
 namespace flyx::cuda {
 namespace {
@@ -635,16 +636,119 @@ k_draft_combine_cands(const float* __restrict__ add, int ld_add, const float* __
 }
 
 // One warp per row: the top k of the candidates by exact logit, high to low, the lowest index on ties.
-// When prob_out or margin_out is non-null, also records the top candidate's truncated softmax probability over all
-// scored candidates and its logit margin above the runner-up (drafter-agnostic confidence signal).
+// When G && P && G->temperature > 0 && k_out == 1, applies coupled Gumbel-Max sampling over the exact scored
+// candidates with the same top_k/top_p/kSampleZMin filters and ops::sample_uniform(G->seed, pos, vid) noise as
+// k_sample (ops/sampling/sampling.h), so probabilistic drafters couple directly to target verification while keeping
+// the same CUDA graph for greedy and sampled requests.
+// When prob_out or margin_out is non-null, records the top candidate's truncated softmax probability over all scored
+// candidates and its logit margin above the runner-up (in Gumbel-perturbed logit space when sampling).
 __global__ void k_draft_topk(float* __restrict__ rough, int ld_rough, int k_out, int* __restrict__ idx_out,
                              float* __restrict__ val_out, float* __restrict__ prob_out,
-                             float* __restrict__ margin_out) {
+                             float* __restrict__ margin_out, const DevParams* P, int pos_add, const DevGen* G) {
   const int r = blockIdx.x, lane = threadIdx.x;
   float* row = rough + size_t(r) * ld_rough;
   int* cand_i = reinterpret_cast<int*>(row);
   const float* cand_v = row + kCandCap;
   const int count = cand_i[2 * kCandCap];
+  if (G && P && G->temperature > 0.f && k_out == 1) {
+    __shared__ float s_z[kCandCap];
+    const float T = G->temperature, invT = 1.f / T;
+    float m1 = -INFINITY;
+    for (int c = lane; c < count; c += 32) m1 = fmaxf(m1, cand_v[c]);
+#pragma unroll
+    for (int s = 16; s > 0; s >>= 1) m1 = fmaxf(m1, __shfl_xor_sync(0xffffffffu, m1, s));
+    int nc = 0;
+    for (int c = lane; c < count; c += 32) {
+      const float d = cand_v[c] - m1;
+      const float z = isinf(invT) ? __fdiv_rn(d, T) : d * invT;
+      s_z[c] = z;
+      nc += (z > ops::kSampleZMin) ? 1 : 0;
+    }
+#pragma unroll
+    for (int s = 16; s > 0; s >>= 1) nc += __shfl_xor_sync(0xffffffffu, nc, s);
+    uint32_t thr = 0;
+    const int k = G->top_k;
+    if (k > 0 && k < nc) {
+      uint32_t lo = 0, hi = 0xFFFFFFFFu;
+      while (lo < hi) {
+        const uint32_t mid = uint32_t((uint64_t(lo) + hi + 1) >> 1);
+        int cnt = 0;
+        for (int c = lane; c < count; c += 32) {
+          const float z = s_z[c];
+          cnt += (z > ops::kSampleZMin && ops::float_key(__float_as_uint(z)) >= mid) ? 1 : 0;
+        }
+#pragma unroll
+        for (int s = 16; s > 0; s >>= 1) cnt += __shfl_xor_sync(0xffffffffu, cnt, s);
+        if (cnt >= k) lo = mid;
+        else hi = mid - 1;
+      }
+      thr = lo;
+    }
+    if (G->top_p < 1.f) {
+      float ms = 0.f;
+      for (int c = lane; c < count; c += 32) {
+        const float z = s_z[c];
+        if (z > ops::kSampleZMin && ops::float_key(__float_as_uint(z)) >= thr) ms += __expf(z);
+      }
+      const float target = G->top_p * warp_sum(ms);
+      uint32_t lo = thr, hi = 0xFFFFFFFFu;
+      while (lo < hi) {
+        const uint32_t mid = uint32_t((uint64_t(lo) + hi + 1) >> 1);
+        float sm = 0.f;
+        for (int c = lane; c < count; c += 32) {
+          const float z = s_z[c];
+          if (z > ops::kSampleZMin && ops::float_key(__float_as_uint(z)) >= mid) sm += __expf(z);
+        }
+        if (warp_sum(sm) >= target) lo = mid;
+        else hi = mid - 1;
+      }
+      thr = lo;
+    }
+    const int64_t pos = int64_t(P->position) + pos_add + r;
+    float best = -INFINITY;
+    int bi = INT_MAX, bc = -1;
+    for (int c = lane; c < count; c += 32) {
+      const float z = s_z[c];
+      if (!(z > ops::kSampleZMin) || ops::float_key(__float_as_uint(z)) < thr) continue;
+      const int vid = cand_i[c];
+      const float u = ops::sample_uniform(G->seed, pos, vid);
+      const float gs = z - __logf(-__logf(u));
+      if (score_better(gs, vid, best, bi)) best = gs, bi = vid, bc = c;
+    }
+#pragma unroll
+    for (int s = 16; s > 0; s >>= 1) {
+      const float ov = __shfl_xor_sync(0xffffffffu, best, s);
+      const int oi = __shfl_xor_sync(0xffffffffu, bi, s), oc = __shfl_xor_sync(0xffffffffu, bc, s);
+      if (score_better(ov, oi, best, bi)) best = ov, bi = oi, bc = oc;
+    }
+    if (prob_out || margin_out) {
+      const float s1 = __shfl_sync(0xffffffffu, best, 0);
+      const int c1 = __shfl_sync(0xffffffffu, bc, 0);
+      float zsum = 0.f, s2 = -INFINITY;
+      for (int c = lane; c < count; c += 32) {
+        const float z = s_z[c];
+        if (!(z > ops::kSampleZMin) || ops::float_key(__float_as_uint(z)) < thr) continue;
+        const float u = ops::sample_uniform(G->seed, pos, cand_i[c]);
+        const float gs = z - __logf(-__logf(u));
+        zsum += expf(gs - s1);
+        if (c != c1 && gs > s2) s2 = gs;
+      }
+#pragma unroll
+      for (int s = 16; s > 0; s >>= 1) {
+        zsum += __shfl_xor_sync(0xffffffffu, zsum, s);
+        s2 = fmaxf(s2, __shfl_xor_sync(0xffffffffu, s2, s));
+      }
+      if (lane == 0) {
+        if (prob_out) prob_out[r] = (c1 >= 0 && zsum > 0.f) ? (1.f / zsum) : 0.f;
+        if (margin_out) margin_out[r] = (c1 >= 0) ? (isfinite(s2) ? fmaxf(0.f, s1 - s2) : 12.f) : 0.f;
+      }
+    }
+    if (lane == 0) {
+      idx_out[r] = bi == INT_MAX ? 0 : bi;
+      if (val_out) val_out[r] = bc >= 0 ? cand_v[bc] : -INFINITY;
+    }
+    return;
+  }
   if (prob_out || margin_out) {
     float m1 = -INFINITY;
     int i1 = INT_MAX, c1 = -1;
@@ -789,9 +893,9 @@ void draft_combine_cands(const float* add, int ld_add, const float* bias, float 
 }
 
 void draft_pick_topk(float* rough, int ld, int rows, int k, int* idx, float* val, cudaStream_t st, float* prob,
-                     float* margin) {
+                     float* margin, const DevParams* P, int pos_add, const DevGen* G) {
   if (rows <= 0 || k <= 0) return;
-  k_draft_topk<<<rows, 32, 0, st>>>(rough, ld, k, idx, val, prob, margin);
+  k_draft_topk<<<rows, 32, 0, st>>>(rough, ld, k, idx, val, prob, margin, P, pos_add, G);
 }
 
 void draft_pick(const float* x, int ldx, const SignHead& h, const bf16* W, int V, int K, int rows, int k, int* idx,

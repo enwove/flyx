@@ -1166,7 +1166,7 @@ void EarleyParser::AdvanceFsm(const ParserState& state, const uint8_t ch) {
   }
 }
 
-void EarleyParser::ScanAtomicToken(const ParserState& state, int32_t token_id) {
+void EarleyParser::ScanAtomicToken(const ParserState& state, int32_t token_id, bool explicit_only) {
   if (state.rule_id == -1) return;
   XGRAMMAR_DCHECK(grammar_->per_rule_fsms[state.rule_id].has_value());
   const auto& current_fsm = grammar_->per_rule_fsms[state.rule_id].value();
@@ -1175,7 +1175,7 @@ void EarleyParser::ScanAtomicToken(const ParserState& state, int32_t token_id) {
     if (edge.IsToken()) {
       auto info = current_fsm.GetFsm().GetFsm().GetTokenEdgeInfo(edge.GetAuxIndex());
       matched = info.Contains(token_id);
-    } else if (edge.IsExcludeToken()) {
+    } else if (!explicit_only && edge.IsExcludeToken()) {
       auto info = current_fsm.GetFsm().GetFsm().GetExcludeTokenEdgeInfo(edge.GetAuxIndex());
       matched = info.Accepts(token_id);
     }
@@ -1192,7 +1192,7 @@ void EarleyParser::ScanAtomicToken(const ParserState& state, int32_t token_id) {
 }
 
 bool EarleyParser::AdvanceAtomicToken(
-    int32_t token_id, bool debug_print, int32_t token_char_count
+    int32_t token_id, bool debug_print, int32_t token_char_count, bool explicit_only
 ) {
   XGRAMMAR_DCHECK(tmp_process_state_queue_.empty())
       << "The tmp_process_state_queue_ should be empty before AdvanceAtomicToken.";
@@ -1209,7 +1209,7 @@ bool EarleyParser::AdvanceAtomicToken(
     if (skip_expired_states_ && IsExpiredState(state)) {
       continue;
     }
-    ScanAtomicToken(state, token_id);
+    ScanAtomicToken(state, token_id, explicit_only);
   }
   if (tmp_process_state_queue_.empty() && tmp_states_to_be_added_.empty()) {
     if (has_char_budget_rules_) {

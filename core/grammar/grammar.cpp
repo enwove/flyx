@@ -24,8 +24,8 @@ GrammarMatcher::GrammarMatcher(std::unique_ptr<Impl> impl) : impl_(std::move(imp
 GrammarMatcher::~GrammarMatcher() = default;
 
 bool GrammarMatcher::accept(int32_t token) {
-  // Special and padding tokens never match text: answered here, so XGrammar
-  // does not log a warning for each one a model emits.
+  // Special tokens no reply is written with and padding ids never match: answered here, so XGrammar does not log a
+  // warning for each one a model emits.
   if (token < 0 || size_t(token) >= impl_->never->size() || (*impl_->never)[size_t(token)]) return false;
   return impl_->m.AcceptToken(token);
 }
@@ -48,7 +48,7 @@ struct Grammar::Impl {
   std::unique_ptr<xgrammar::TokenizerInfo> info;
   std::unique_ptr<xgrammar::GrammarCompiler> compiler;
   int words = 0;
-  std::vector<bool> never;  // special tokens (not stop tokens) and padding ids
+  std::vector<bool> never;  // special tokens (neither stop tokens nor a reply's markers) and padding ids
   // The cache, held only to look in it or add to it, so a lookup never waits for a compile; compile_mu: one compile
   // at a time (sessions of one engine may run on several threads, and requests are made warm ahead on others).
   std::mutex mu, compile_mu;
@@ -71,18 +71,31 @@ struct Grammar::Impl {
 Grammar::Grammar() : impl_(std::make_unique<Impl>()) {}
 Grammar::~Grammar() = default;
 
-void Grammar::init(const Tokenizer& tok, int vocab, std::vector<int32_t> stop_ids) {
+void Grammar::init(const Tokenizer& tok, int vocab, std::vector<int32_t> stop_ids,
+                   const std::vector<int32_t>& markers) {
   std::vector<std::string> text(static_cast<size_t>(vocab));
   impl_->never.assign(size_t(vocab), true);
+  auto add_token = [&](int32_t id) {
+    text[size_t(id)] = tok.token_bytes(id);  // "" = never matches text
+    impl_->never[size_t(id)] = false;
+  };
   for (int32_t id = 0; id < vocab && id < tok.n_tokens(); ++id)
-    if (!tok.special(id)) {
-      text[size_t(id)] = tok.token_bytes(id);  // "" = never matches text
-      impl_->never[size_t(id)] = false;
-    }
+    if (!tok.special(id)) add_token(id);
+  // A reply's own markers: without them a format that writes its sections with control tokens could only spell
+  // them, a character at a time, in ordinary tokens the model never saw there.  Each is one token to XGrammar
+  // (atomic): taken where a grammar's delimiter spells it, and no part of any text.
+  std::vector<int32_t> atomic;
+  for (int32_t id : markers) {
+    if (id < 0 || id >= vocab || id >= tok.n_tokens() || !tok.special(id) || tok.token_bytes(id).empty()) continue;
+    add_token(id);
+    atomic.push_back(id);
+  }
   for (int32_t id : stop_ids)
     if (id >= 0 && id < vocab) impl_->never[size_t(id)] = false;
-  impl_->info = std::make_unique<xgrammar::TokenizerInfo>(text, xgrammar::VocabType::RAW, vocab, std::move(stop_ids));
+  impl_->info = std::make_unique<xgrammar::TokenizerInfo>(text, xgrammar::VocabType::RAW, vocab, std::move(stop_ids),
+                                                         /*add_prefix_space=*/false, atomic);
   impl_->compiler = std::make_unique<xgrammar::GrammarCompiler>(*impl_->info, /*max_threads=*/4);
+  impl_->compiled.clear();  // compiled for the vocabulary before
   impl_->words = xgrammar::GetBitmaskSize(vocab);
 }
 

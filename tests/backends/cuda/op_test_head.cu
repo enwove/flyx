@@ -580,6 +580,63 @@ void test_draft_pick(int V, int K, bool plant, bool pick) {
                          std::abs(gm1[0] - (m1 - m2)) < 1e-5 && tb_id == 120 && tb_m[0] == 0.0;
       std::printf("  %-4s %-48s\n", ok_pk ? "ok" : "FAIL", "draft_pick_topk (argmax/prob/margin/tie)");
       g_fail += !ok_pk;
+
+      // Coupled Gumbel-Max sampling (G->temperature > 0): draft_pick_topk matches sample_rows bit-for-bit on the
+      // same candidate set (with T == 0 leaving greedy unchanged), across top_k, top_p, seeds, and pos_add.
+      constexpr int Vs = 97;
+      std::vector<float> s_row(kDraftPickFloats, 0.f);
+      std::vector<float> s_dense(Vs, -1e30f);
+      int* s_ci = reinterpret_cast<int*>(s_row.data());
+      for (int c = 0; c < Vs; ++c) {
+        s_ci[c] = c;
+        s_row[kDraftCandCap + c] = float(got_v[c]);
+        s_dense[c] = float(got_v[c]);
+      }
+      s_ci[2 * kDraftCandCap] = Vs;
+      float* d_srow = up_raw(s_row);
+      float* d_sdense = up_raw(s_dense);
+      float* d_cz = dev<float>(Vs);
+      int* d_ci = dev<int>(Vs);
+      int* d_ref_tok = dev<int>(1);
+      DevParams hPs{};
+      hPs.position = 137;
+      DevParams* d_Ps = dev<DevParams>(1);
+      CK(cudaMemcpy(d_Ps, &hPs, sizeof(hPs), cudaMemcpyHostToDevice));
+      DevGen* d_Gs = dev<DevGen>(1);
+      bool ok_sample = true;
+      for (int tc = 0; tc < 4; ++tc) {
+        DevGen hGs{};
+        hGs.temperature = tc == 0 ? 0.f : (tc == 1 ? 0.7f : (tc == 2 ? 1.0f : 1.3f));
+        hGs.top_k = tc == 2 ? 20 : 0;
+        hGs.top_p = tc == 3 ? 0.85f : (tc == 1 ? 0.95f : 1.0f);
+        hGs.seed = 42ULL + uint64_t(tc) * 997ULL;
+        const int pos_add = 1 + tc;
+        CK(cudaMemcpy(d_Gs, &hGs, sizeof(hGs), cudaMemcpyHostToDevice));
+        CK(cudaMemcpy(d_srow, s_row.data(), s_row.size() * sizeof(float), cudaMemcpyHostToDevice));
+        draft_pick_topk(d_srow, kDraftPickFloats, 1, 1, d_idx, nullptr, 0, d_p, d_m, d_Ps, pos_add, d_Gs);
+        int got_tok = -1, ref_tok = -2;
+        if (hGs.temperature > 0.f) {
+          sample_rows(d_sdense, Vs, Vs, 1, d_Ps, pos_add, d_Gs, nullptr, d_cz, d_ci, d_ref_tok, 0);
+          CK(cudaDeviceSynchronize());
+          CK(cudaMemcpy(&ref_tok, d_ref_tok, 4, cudaMemcpyDeviceToHost));
+        } else {
+          ref_tok = best_c;  // cand_i[c] == c, so dense argmax equals best_c
+        }
+        CK(cudaDeviceSynchronize());
+        CK(cudaMemcpy(&got_tok, d_idx, 4, cudaMemcpyDeviceToHost));
+        const Vec sp = down(d_p, 1), sm = down(d_m, 1);
+        ok_sample = ok_sample && got_tok == ref_tok && sp[0] > 0.0 && sp[0] <= 1.0 + 1e-6 && sm[0] >= 0.0;
+      }
+      std::printf("  %-4s %-48s\n", ok_sample ? "ok" : "FAIL",
+                  "draft_pick_topk coupled Gumbel-Max == sample_rows");
+      g_fail += !ok_sample;
+      CK(cudaFree(d_srow));
+      CK(cudaFree(d_sdense));
+      CK(cudaFree(d_cz));
+      CK(cudaFree(d_ci));
+      CK(cudaFree(d_ref_tok));
+      CK(cudaFree(d_Ps));
+      CK(cudaFree(d_Gs));
       CK(cudaFree(d_row));
       CK(cudaFree(d_add));
       CK(cudaFree(d_w2b));

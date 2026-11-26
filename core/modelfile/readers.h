@@ -70,6 +70,8 @@ bool read_gguf(std::vector<std::unique_ptr<os::MappedFile>>* maps, const std::st
 
 // A DFlash2 drafter as published (drafter_dir.cpp): a directory with its config.json and *.safetensors,
 // read as python/convert would write it into a drafter file.  The shards stay mapped in `maps`.
+std::string drafter_dir_kind(const std::string& path);
+std::string flyx_draft_kind(const std::string& path);
 bool is_drafter_dir(const std::string& path);
 bool read_drafter_dir(const std::string& dir, std::vector<std::unique_ptr<os::MappedFile>>* maps,
                       ModelFile::Contents* out, std::string* err);

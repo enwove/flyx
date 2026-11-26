@@ -556,6 +556,57 @@ void test_select() {
   }
   std::printf("  %-4s candidate walk\n", drafts == want ? "ok" : "FAIL");
   g_fail += drafts != want;
+  // Softcapped selector walk and tree (before_correction = 0 and after_correction = 1; ops/draft/ref.h).
+  {
+    const float sc = 3.0f;
+    float* dhid = up(hid);
+    bf16 *dpred = up_bf16(pred), *dsucc = up_bf16(succ);
+    TreeRows* dt_sc = dev<TreeRows>(1);
+    for (int mode : {0, 1}) {
+      selector_walk(P, ti, tv, k, dhid, rank, dpred, dsucc, width, nullptr, dr, 0, sc, mode);
+      const auto got_w = down_i(dr, width);
+      int prev_sc = 1234;
+      std::vector<int> want_w;
+      for (int s = 0; s < width; ++s) {
+        int best = 0;
+        double bs = -1e300;
+        for (int c = 0; c < k; ++c) {
+          double e = 0;
+          for (int i = 0; i < rank; ++i)
+            e += pred[size_t(prev_sc) * rank + i] * hid[size_t(s) * rank + i] *
+                 succ[size_t(want_idx[s * k + c]) * rank + i];
+          const double score = ops::dflash2_selector_score(want_val[s * k + c], e, double(sc), mode);
+          if (score > bs) {
+            bs = score;
+            best = c;
+          }
+        }
+        prev_sc = want_idx[s * k + best];
+        want_w.push_back(prev_sc);
+      }
+      const bool wok = got_w == want_w;
+      std::printf("  %-4s candidate walk (softcap=%.1f mode=%d)\n", wok ? "ok" : "FAIL", sc, mode);
+      g_fail += !wok;
+
+      const int tw = 9;
+      selector_tree(P, ti, tv, k, dhid, rank, dpred, dsucc, tw, rows, nullptr, dr, dt_sc, 0, sc, mode);
+      TreeRows t{};
+      CK(cudaMemcpy(&t, dt_sc, sizeof(t), cudaMemcpyDeviceToHost));
+      const auto got_t = down_i(dr, size_t(tw));
+      std::vector<int32_t> wd(static_cast<size_t>(tw)), wp(static_cast<size_t>(tw));
+      auto score_sc = [&](int32_t p, int d, int c) {
+        double e = 0;
+        for (int i = 0; i < rank; ++i)
+          e += pred[size_t(p) * rank + i] * hid[size_t(d) * rank + i] * succ[size_t(want_idx[d * k + c]) * rank + i];
+        return ops::dflash2_selector_score(want_val[d * k + c], e, double(sc), mode);
+      };
+      ops::best_first_tree(tw, rows, k, 1234, want_idx.data(), score_sc, wd.data(), wp.data());
+      bool tok = t.n == tw + 1 && std::vector<int32_t>(got_t.begin(), got_t.end()) == wd;
+      for (int i = 0; i < width; ++i) tok = tok && wd[size_t(i)] == want_w[size_t(i)] && wp[size_t(i)] == i - 1;
+      std::printf("  %-4s candidate tree (softcap=%.1f mode=%d)\n", tok ? "ok" : "FAIL", sc, mode);
+      g_fail += !tok;
+    }
+  }
   // The candidates as a tree (ops/draft/ref.h): drafts, parents, and the TreeRows the round reads; its trunk is the
   // walk's chain.  A tree wider than the positions (it must branch), one that fills a whole round, and one of 5 over
   // 2 positions.
@@ -601,8 +652,8 @@ void test_stop_decide() {
     pol.widths[i] = ws[i];
     pol.costs[i] = cs[i];
   }
-  for (int k = 0; k < FLYX_MAX_ROWS; ++k) pol.p_pos[k] = k < 7 ? 0.80f : 0.72f;
-  pol.w_bias = -0.35f;
+  for (int k = 0; k < FLYX_MAX_ROWS; ++k) pol.p_pos[k] = std::max(0.20f, 0.90f - 0.045f * float(k));
+  pol.w_bias = -0.60f;
   pol.w_margin = 0.27f;
   pol.w_logit_p = 0.20f;
   pol.lambda = 0.165f;
@@ -637,21 +688,23 @@ void test_stop_decide() {
     CK(cudaMemcpy(dprob, hp.data(), sizeof(float) * FLYX_MAX_ROWS, cudaMemcpyHostToDevice));
     CK(cudaMemcpy(dmargin, hm.data(), sizeof(float) * FLYX_MAX_ROWS, cudaMemcpyHostToDevice));
 
-    double ref_s = 1.0;
-    for (int b = 0; b < cur.n_buckets; ++b) {
-      const int w0 = b == 0 ? 0 : cur.widths[b - 1];
-      const int w1 = cur.widths[b];
-      const int want_c = ops::stop_decide_step_ref(dp.data(), dm.data(), cur, b, w0, w1, &ref_s);
-      stop_decide_step(dprob, dmargin, dpol, dst, b, w0, w1, 0, 0, 0);
-      DevStopState got{};
-      CK(cudaMemcpy(&got, dst, sizeof(got), cudaMemcpyDeviceToHost));
-      got_s.push_back(double(got.survival));
-      want_s.push_back(ref_s);
-      step_ok = step_ok && (got.decision == want_c);
+    StopCondHandles zero_h{};
+    for (const bool earlier : {false, true}) {  // a stop verifies its own checkpoint, or the prefix that pays
+      double ref_s = 1.0;
+      for (int b = 0; b < cur.n_buckets; ++b) {
+        const int w1 = cur.widths[b];
+        int want_v = -1;
+        const int want_c = ops::stop_decide_step_ref(dp.data(), dm.data(), cur, b, w1, earlier, &ref_s, &want_v);
+        stop_decide_step(dprob, dmargin, dpol, dst, b, w1, 0, zero_h, earlier, 0);
+        DevStopState got{};
+        CK(cudaMemcpy(&got, dst, sizeof(got), cudaMemcpyDeviceToHost));
+        got_s.push_back(double(got.survival));
+        want_s.push_back(ref_s);
+        step_ok = step_ok && (got.decision == want_c) && (got.verify_bucket == want_v) && (earlier || want_v == b);
+      }
     }
 
     const int want_b = ops::stop_decide_block_ref(dp.data(), dm.data(), cur);
-    StopCondHandles zero_h{};
     stop_decide_block(dprob, dmargin, dpol, dst, zero_h, 0);
     DevStopState got_b{};
     CK(cudaMemcpy(&got_b, dst, sizeof(got_b), cudaMemcpyDeviceToHost));
@@ -669,16 +722,132 @@ void test_stop_decide() {
   for (int i = 0; i < FLYX_MAX_STOP_BUCKETS; ++i) oob.widths[i] = FLYX_MAX_ROWS + 32;
   CK(cudaMemcpy(dpol, &oob, sizeof(oob), cudaMemcpyHostToDevice));
   StopCondHandles zero_h{};
-  stop_decide_step(dprob, dmargin, dpol, dst, 0, 0, FLYX_MAX_ROWS + 5, 0, 0, 0);
+  stop_decide_step(dprob, dmargin, dpol, dst, 0, FLYX_MAX_ROWS + 5, 0, zero_h, true, 0);
   DevStopState got_oob_s{};
   CK(cudaMemcpy(&got_oob_s, dst, sizeof(got_oob_s), cudaMemcpyDeviceToHost));
   stop_decide_block(dprob, dmargin, dpol, dst, zero_h, 0);
   DevStopState got_oob_b{};
   CK(cudaMemcpy(&got_oob_b, dst, sizeof(got_oob_b), cudaMemcpyDeviceToHost));
   const bool oob_ok = std::isfinite(got_oob_s.survival) && std::isfinite(got_oob_b.survival) &&
+                      got_oob_s.verify_bucket >= 0 && got_oob_s.verify_bucket < FLYX_MAX_STOP_BUCKETS &&
                       got_oob_b.decision >= 0 && got_oob_b.decision < FLYX_MAX_STOP_BUCKETS;
   std::printf("  %-4s stop_decide clamps out-of-bounds n_buckets and widths\n", oob_ok ? "ok" : "FAIL");
   g_fail += !oob_ok;
+
+#if CUDART_VERSION >= 12040
+  // The step decisions inside a conditional graph, as an adaptive round captures them (runtime/runner.cpp): each
+  // step's kernel sets the next draft body's handle or one verify body's, and here the bodies leave marks.  Against
+  // the same kernel's decisions a step at a time (checked against float64 above): the draft bodies up to the stop ran
+  // and no other, and of the verify bodies only one: the stop's own checkpoint's, or with earlier_prefix the one of
+  // the prefix the stop chose.
+  for (const bool earlier : {false, true}) {
+    constexpr int M = 5;  // pol.n_buckets
+    cudaStream_t st;
+    CK(cudaStreamCreate(&st));
+    int* marks = dev<int>(2 * M);  // [1, M): the draft bodies; [M, 2 M): the verify bodies
+    cudaGraph_t graph;
+    CK(cudaGraphCreate(&graph, 0));
+    cudaGraphConditionalHandle h_ver[M] = {}, h_draft[M] = {};
+    StopCondHandles ver{};
+    for (int j = 0; j < M; ++j) {
+      CK(cudaGraphConditionalHandleCreate(&h_ver[j], graph, 0, cudaGraphCondAssignDefault));
+      ver.h[j] = static_cast<unsigned long long>(h_ver[j]);
+      if (j > 0) CK(cudaGraphConditionalHandleCreate(&h_draft[j], graph, 0, cudaGraphCondAssignDefault));
+    }
+    auto capture = [&](cudaGraph_t into, const std::vector<cudaGraphNode_t>& deps, auto&& fn,
+                       std::vector<cudaGraphNode_t>* leaves) {
+      CK(cudaStreamBeginCaptureToGraph(st, into, deps.empty() ? nullptr : deps.data(), nullptr, deps.size(),
+                                       cudaStreamCaptureModeThreadLocal));
+      fn();
+      if (leaves) {
+        cudaStreamCaptureStatus status{};
+        const cudaGraphNode_t* last = nullptr;
+        size_t n_last = 0;
+        CK(cudaStreamGetCaptureInfo(st, &status, nullptr, nullptr, &last, nullptr, &n_last));
+        leaves->assign(last, last + n_last);
+      }
+      cudaGraph_t ended = nullptr;
+      CK(cudaStreamEndCapture(st, &ended));
+    };
+    auto body_of = [&](cudaGraphConditionalHandle h, const std::vector<cudaGraphNode_t>& deps, cudaGraphNode_t* node) {
+      cudaGraphNodeParams np{};
+      np.type = cudaGraphNodeTypeConditional;
+      np.conditional.handle = h;
+      np.conditional.type = cudaGraphCondTypeIf;
+      np.conditional.size = 1;
+      CK(cudaGraphAddNode(node, graph, deps.empty() ? nullptr : deps.data(), nullptr, deps.size(), &np));
+      return np.conditional.phGraph_out[0];
+    };
+    std::vector<cudaGraphNode_t> prev;
+    capture(graph, {}, [&] {
+      stop_decide_step(dprob, dmargin, dpol, dst, 0, ws[0], static_cast<unsigned long long>(h_draft[1]), ver, earlier,
+                       st);
+    }, &prev);
+    for (int j = 1; j < M; ++j) {
+      cudaGraphNode_t node = nullptr;
+      const cudaGraph_t body = body_of(h_draft[j], prev, &node);
+      const unsigned long long next = j + 1 < M ? static_cast<unsigned long long>(h_draft[j + 1]) : 0ull;
+      capture(body, {}, [&] {
+        CK(cudaMemsetAsync(marks + j, 1, sizeof(int), st));
+        stop_decide_step(dprob, dmargin, dpol, dst, j, ws[j], next, ver, earlier, st);
+      }, nullptr);
+      prev = {node};
+    }
+    for (int j = 0; j < M; ++j) {
+      cudaGraphNode_t node = nullptr;
+      const cudaGraph_t body = body_of(h_ver[j], prev, &node);
+      capture(body, {}, [&] { CK(cudaMemsetAsync(marks + M + j, 1, sizeof(int), st)); }, nullptr);
+    }
+    cudaGraphExec_t exec;
+    CK(cudaGraphInstantiate(&exec, graph, 0));
+
+    bool graph_ok = true;
+    int before = 0, widest = 0;  // stops that verify an earlier prefix; walks through the last checkpoint
+    for (int trial = 0; trial < 24; ++trial) {
+      flyx_stop_policy cur = pol;
+      if (trial == 0) cur.enabled = 0;  // every draft body, the last verify body
+      CK(cudaMemcpy(dpol, &cur, sizeof(cur), cudaMemcpyHostToDevice));
+      std::vector<float> hp(FLYX_MAX_ROWS), hm(FLYX_MAX_ROWS);
+      for (int k = 0; k < FLYX_MAX_ROWS; ++k) {
+        hp[size_t(k)] = float(u_prob(rng));
+        hm[size_t(k)] = float(u_margin(rng));
+        // A sure first draft and unsure ones after it: steps are taken on the positions' rates, and with the drafts'
+        // confidences in hand a prefix shorter than what was drafted is the one that pays.
+        if (trial == 1) {
+          hp[size_t(k)] = k == 0 ? 0.995f : 0.16f;
+          hm[size_t(k)] = k == 0 ? 10.f : 0.05f;
+        }
+      }
+      CK(cudaMemcpy(dprob, hp.data(), sizeof(float) * FLYX_MAX_ROWS, cudaMemcpyHostToDevice));
+      CK(cudaMemcpy(dmargin, hm.data(), sizeof(float) * FLYX_MAX_ROWS, cudaMemcpyHostToDevice));
+      int stop = 0, verify = 0;  // the bucket whose step stops, the bucket it verifies
+      for (;; ++stop) {
+        stop_decide_step(dprob, dmargin, dpol, dst, stop, ws[stop], 0, StopCondHandles{}, earlier, 0);
+        DevStopState got{};
+        CK(cudaMemcpy(&got, dst, sizeof(got), cudaMemcpyDeviceToHost));
+        verify = got.verify_bucket;
+        if (!got.decision || stop + 1 == M) break;
+      }
+      before += verify < stop;
+      widest += stop == M - 1;
+      if (trial == 1) graph_ok = graph_ok && stop > 0 && (earlier ? verify < stop : verify == stop);
+      CK(cudaMemset(marks, 0, 2 * M * sizeof(int)));
+      CK(cudaGraphLaunch(exec, st));
+      CK(cudaStreamSynchronize(st));
+      const auto ran = down_i(marks, 2 * M);
+      for (int j = 1; j < M; ++j) graph_ok = graph_ok && (ran[size_t(j)] != 0) == (j <= stop);
+      for (int j = 0; j < M; ++j) graph_ok = graph_ok && (ran[size_t(M + j)] != 0) == (j == verify);
+    }
+    graph_ok = graph_ok && widest > 0 && (earlier ? before > 0 : before == 0);
+    std::printf("  %-4s stop_decide_step in a conditional graph (%s): the draft bodies up to the stop, one verify "
+                "body (%d of 24 an earlier prefix, %d through the last checkpoint)\n",
+                graph_ok ? "ok" : "FAIL", earlier ? "earlier prefixes" : "its own checkpoint", before, widest);
+    g_fail += !graph_ok;
+    CK(cudaGraphExecDestroy(exec));
+    CK(cudaGraphDestroy(graph));
+    CK(cudaStreamDestroy(st));
+  }
+#endif
 }
 
 }  // namespace flyx::optest

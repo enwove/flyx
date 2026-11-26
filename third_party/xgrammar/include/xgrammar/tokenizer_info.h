@@ -27,12 +27,15 @@ enum class VocabType : int {
 
 class TokenizerInfo {
  public:
+  /*! \param atomic_token_ids flyx: ids with decoded text that match only explicit token terminals
+   * (README.flyx.md). */
   TokenizerInfo(
       const std::vector<std::string>& encoded_vocab,
       VocabType vocab_type = VocabType::RAW,
       std::optional<int> vocab_size = std::nullopt,
       std::optional<std::vector<int32_t>> stop_token_ids = std::nullopt,
-      bool add_prefix_space = false
+      bool add_prefix_space = false,
+      const std::vector<int32_t>& atomic_token_ids = {}
   );
 
   VocabType GetVocabType() const;

@@ -30,7 +30,19 @@
 #include <limits>
 #include <vector>
 
+#include "flyx/backend_abi.h"
+
 namespace flyx::ops {
+
+// A DFlash2 selector's score of a candidate: its logit (unary) plus the pair's bilinear correction (edge), with the
+// soft cap of flyx_dflash2_block, softcap * tanh(z / softcap), on the logit before the correction is added
+// (FLYX_DFLASH2_SOFTCAP_BEFORE) or on their sum (FLYX_DFLASH2_SOFTCAP_AFTER); no cap at softcap 0.
+inline double dflash2_selector_score(double unary, double edge, double softcap = 0.0,
+                                     int softcap_mode = FLYX_DFLASH2_SOFTCAP_BEFORE) {
+  if (softcap <= 0.0) return unary + edge;
+  if (softcap_mode == FLYX_DFLASH2_SOFTCAP_AFTER) return softcap * std::tanh((unary + edge) / softcap);
+  return softcap * std::tanh(unary / softcap) + edge;
+}
 
 template <class Score>
 void best_first_tree(int width, int depths, int k, int32_t anchor, const int32_t* cand, Score score, int32_t* drafts,
@@ -245,6 +257,17 @@ void pool_tree(int width, int ranks, int depths, int k, const int32_t* cand, con
     const int d = depth[p];
     drafts[t] = live[d - 1] ? cand[(d - 1) * k + idx[p]] : mask;
     parents[t] = d == 1 ? -1 : node[size_t(parent[p])];
+  }
+}
+
+// DSpark Markov RNN head step (Inkling-2): updates `state` [rank] in place and writes `markov` [rank]
+// from joint_out = joint_proj([state | w1_prev | hidden_i | f_rnn]) + joint_proj_b ([3 * rank]).
+inline void dspark_markov_gate(const double* joint_out, int rank, double* state, double* markov) {
+  for (int j = 0; j < rank; ++j) {
+    const double g = 1.0 / (1.0 + std::exp(-joint_out[j]));
+    const double c = std::tanh(joint_out[rank + j]);
+    state[j] = c + g * (state[j] - c);
+    markov[j] = std::tanh(joint_out[2 * rank + j]);
   }
 }
 

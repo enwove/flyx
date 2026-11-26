@@ -7,6 +7,7 @@
 #include <vector>
 
 #include "models/formats/calls.h"
+#include "models/formats/inkling2.h"
 #include "models/formats/tags.h"
 
 using namespace flyx::models::formats;
@@ -224,6 +225,44 @@ int main() {
       if (e.kind == OutputEvent::kToolCall) got_call = true;
     }
     check(got_call && ojson::parse(d) == ojson{{"location", "Tokyo"}}, "json finalizes cleanly after streaming");
+  }
+
+  // Inkling-2 multi-section parser (thinking, text, JSON tool calls) across arbitrary chunk sizes + grammar.
+  {
+    const std::string reply =
+        "<|message_model|><|content_thinking|>Need weather.<|end_message|>"
+        "<|message_model|><|content_text|>Checking now.<|end_message|>"
+        "<|message_model|>get_weather<|content_invoke_tool_json|>"
+        "{\"name\":\"get_weather\",\"args\":{\"location\":\"Tokyo\",\"days\":3}}<|end_message|>"
+        "<|content_model_end_sampling|>";
+    for (size_t step : {size_t(1), size_t(3), size_t(17), reply.size()}) {
+      auto p = make_inkling2_parser(&kTools);
+      std::string got_think, got_text, got_args, got_name;
+      int calls = 0;
+      auto consume = [&](const std::vector<OutputEvent>& evs) {
+        for (const auto& e : evs) {
+          if (e.kind == OutputEvent::kReasoning) got_think += e.text;
+          else if (e.kind == OutputEvent::kContent) got_text += e.text;
+          else if (e.kind == OutputEvent::kToolCall) {
+            ++calls;
+            got_name = e.call.name;
+            got_args = e.call.arguments.dump();
+          }
+        }
+      };
+      for (size_t i = 0; i < reply.size(); i += step) consume(p->feed(std::string_view(reply).substr(i, step)));
+      consume(p->finish());
+      check(got_think == "Need weather." && got_text == "Checking now." && calls == 1 && got_name == "get_weather" &&
+                got_args == "{\"location\":\"Tokyo\",\"days\":3}" && p->tool_calls() == 1,
+            "inkling2 parser step=" + std::to_string(step));
+    }
+    flyx::interfaces::ReplyRules rules;
+    rules.tools = flyx::interfaces::ReplyRules::kRequired;
+    const std::string g = inkling2_reply_grammar(kTools, rules);
+    const ojson gj = ojson::parse(g, nullptr, false);
+    check(!gj.is_discarded() && gj.contains("type") && gj["type"] == "structural_tag" &&
+              g.find("<|content_invoke_tool_json|>") != std::string::npos,
+          "inkling2 reply grammar produces valid structural_tag JSON");
   }
 
   std::printf("tagged: %s\n", failures ? "FAILED" : "ok");

@@ -94,9 +94,10 @@ double ConfidenceStopper::bucket_cost(int width) const {
   return double(policy_.costs[policy_.n_buckets - 1]);
 }
 
-void ConfidenceStopper::observe(int width, int accepted, const float* draft_prob, const float* draft_margin) {
+void ConfidenceStopper::observe(int width, int accepted, const float* draft_prob, const float* draft_margin,
+                                double cost_ms) {
   if (!ready() || width <= 0) return;
-  const double c = bucket_cost(width);
+  const double c = cost_ms > 0 ? cost_ms : bucket_cost(width);
   const float rate = static_cast<float>((accepted + 1) / c);
   policy_.lambda = kLamDecay * policy_.lambda + (1.f - kLamDecay) * rate;
 

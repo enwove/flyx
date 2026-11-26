@@ -663,6 +663,13 @@ void choose_rows(const float* logits, int ld, int V, int rows, const DevParams* 
   k_sample<<<rows, kSampleThreads, 0, st>>>(logits, ld, V, P, base_add, G, mask, cz, ci, out, tree, tree_from);
 }
 
+void sample_rows(const float* logits, int ld, int V, int rows, const DevParams* P, int base_add, const DevGen* G,
+                 const uint32_t* mask, float* cz, int* ci, int* out, cudaStream_t st, const TreeRows* tree,
+                 int tree_from) {
+  if (rows <= 0 || !G || !P) return;
+  k_sample<<<rows, kSampleThreads, 0, st>>>(logits, ld, V, P, base_add, G, mask, cz, ci, out, tree, tree_from);
+}
+
 void penalize_rows(float* logits, int ld, int V, int rows, const DevGen* G, Reply reply, const int* drafts,
                    cudaStream_t st, const TreeRows* tree, int tree_from) {
   k_penalize<<<rows, 256, 0, st>>>(logits, ld, V, G, reply.count, reply.seen, reply.n_seen, drafts, tree, tree_from);

@@ -143,10 +143,10 @@ def check_compat(url):
         body.update(bad)
         st, err = cl.post("/v1/load", body)
         assert st == 400 and err["error"]["type"] == "invalid_request_error", (bad, st, err)
-    # a drafter of the wrong type is told the same choices as an unknown one's, dv among them
+    # a drafter of the wrong type is told the same choices as an unknown one's, dspark and dv among them
     for bad in (123, "eagle"):
         st, err = cl.post("/v1/load", {"model": "dummy.flyx", "drafter": bad})
-        assert st == 400 and err["error"]["message"] == '"drafter": mtp, dflash2, dv, all or none', (bad, st, err)
+        assert st == 400 and err["error"]["message"] == '"drafter": mtp, dflash2, dspark, dv, all or none', (bad, st, err)
 
     # 6. Unloaded model -> GET /v1/models/:id returns 404
     st, _ = cl.post("/v1/unload", {})

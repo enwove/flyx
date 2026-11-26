@@ -20,7 +20,7 @@ void expect(bool ok, const std::string& what) {
 
 // The state indices of the description -> this backend's tables.
 struct StateMap {
-  std::vector<int> kv, gdn;  // per description state: index in StateTable::kv / ::gdn, else -1
+  std::vector<int> kv, gdn, sconv;  // per description state: index in StateTable::kv / ::gdn / ::sconv, else -1
   std::vector<bool> ring, canvas;
 };
 
@@ -36,6 +36,7 @@ StateMap bind_states(flyx_bmodel* m, const flyx_model_desc& d) {
     const flyx_state& s = d.states[i];
     sm.kv.push_back(-1);
     sm.gdn.push_back(-1);
+    sm.sconv.push_back(-1);
     sm.ring.push_back(false);
     sm.canvas.push_back(false);
     switch (s.kind) {
@@ -46,11 +47,16 @@ StateMap bind_states(flyx_bmodel* m, const flyx_model_desc& d) {
         // drafter's of any number of layers, stay binary16.
         m->states.kv.push_back({s.layers, s.n_kv, s.head_dim,
                                 m->kv_fp8 && s.layers == 1 && !(s.draft && m->opt.draft_kv16) && !dflash_kv[size_t(i)],
-                                s.draft != 0});
+                                s.draft != 0, s.window});
         break;
       case FLYX_STATE_GDN:
         sm.gdn.back() = int(m->states.gdn.size());
         m->states.gdn.push_back({s.nk, s.nv, s.dk, s.dv, s.conv, s.head_order == FLYX_GDN_HEADS_TILED});
+        break;
+      case FLYX_STATE_SHORTCONV:
+        sm.sconv.back() = int(m->states.sconv.size());
+        expect(s.conv >= 2 && s.channels > 0, "ShortConv state: invalid conv or channels");
+        m->states.sconv.push_back({s.conv, s.channels});
         break;
       case FLYX_STATE_RING:
         expect(m->states.ring_width == 0, "more than one hidden ring");
@@ -259,6 +265,11 @@ DFlashBlock dflash(WeightLoader& L, const flyx_model_desc& d, const flyx_dflash2
   f.mask_token = b.mask_token;
   expect(b.window >= 0, "a DFlash2 window below zero");
   f.window = b.window;
+  expect(std::isfinite(b.softcap) && b.softcap >= 0.f, "a DFlash2 softcap out of range");
+  expect(b.softcap_mode == FLYX_DFLASH2_SOFTCAP_BEFORE || b.softcap_mode == FLYX_DFLASH2_SOFTCAP_AFTER,
+         "unsupported DFlash2 softcap mode");
+  f.softcap = b.softcap;
+  f.softcap_mode = b.softcap_mode;
   f.n_taps = b.n_taps;
   f.target_hidden = d.hidden;
   f.conv_taps = b.conv_taps;
@@ -383,6 +394,195 @@ DvBlock dv(WeightLoader& L, const flyx_model_desc& d, const flyx_dv_block& b, co
   const flyx_state& c = d.states[b.canvas];
   expect(c.slots == b.slots && c.topk == b.topk && c.rank == b.sel_rank, "DV and its canvas differ in shape");
   return v;
+}
+
+LoopWeights loop_weights(WeightLoader& L, int down, int gain, int forget, int hidden, int rank) {
+  auto shaped = [&](int w, int N, int K) {
+    const flyx_tensor_view* v = L.t(w);
+    return v->ndim == 2 && v->shape[0] == N && v->shape[1] == K;
+  };
+  expect(shaped(down, rank, 2 * hidden) && shaped(gain, hidden, rank) && shaped(forget, hidden, rank),
+         "a loop gate controller of other shapes than [rank, 2 hidden], [hidden, rank], [hidden, rank]");
+  LoopWeights weights;
+  weights.down = L.lin(down);
+  weights.stacked = L.can_stack({gain, forget});
+  if (weights.stacked) {
+    weights.gain_forget = L.lin_stack({gain, forget});
+  } else {
+    weights.gain = L.lin(gain);
+    weights.forget = L.lin(forget);
+  }
+  // The dense stack keeps both [hidden, rank] matrices in row order, gain first.
+  const bf16* gf = weights.gain_forget.w;
+  weights.down.round = L.round_weight(down, weights.down.w);
+  weights.gain.round = L.round_weight(gain, gf ? gf : weights.gain.w);
+  weights.forget.round = L.round_weight(forget, gf ? gf + size_t(hidden) * rank : weights.forget.w);
+  return weights;
+}
+
+RelAttnBlock rel_attn(WeightLoader& L, const flyx_rel_attn_block& b, const StateMap& sm) {
+  RelAttnBlock a;
+  a.hidden = b.hidden;
+  a.nh = b.n_heads;
+  a.nkv = b.n_kv;
+  a.hd = b.head_dim;
+  a.d_rel = b.d_rel;
+  a.rel_extent = b.rel_extent;
+  a.window = b.window;
+  a.conv = b.conv;
+  a.log_scale_floor = b.log_scale_floor;
+  a.qk_clip = b.qk_clip;
+  a.rel_clip = b.rel_clip;
+  a.log_scale_alpha = b.log_scale_alpha;
+  a.eps = b.eps;
+  a.q_norm_in = norm(L, b.q_norm_in);
+  a.k_norm_in = norm(L, b.k_norm_in);
+  a.v_norm_in = norm(L, b.v_norm_in);
+  if (L.can_stack({b.q, b.gate, b.rel})) {
+    a.w_qgr = L.lin_stack({b.q, b.gate, b.rel});
+    a.stacked_qgr = true;
+  } else {
+    a.w_q = L.lin(b.q);
+    a.w_gate = L.lin(b.gate);
+    a.w_rel = L.lin(b.rel);
+  }
+  a.w_k = L.lin(b.k);
+  a.w_v = L.lin(b.v);
+  a.w_o = L.lin(b.o);
+  a.w_sink = L.lin_f32(b.sink_proj);
+  if (b.k_conv_proj >= 0) a.w_k_conv_proj = L.lin_f32(b.k_conv_proj);
+  if (b.v_conv_proj >= 0) a.w_v_conv_proj = L.lin_f32(b.v_conv_proj);
+  a.rel_bias = L.vec(b.rel_bias);
+  a.q_clip_w = L.vec(b.q_clip_w);
+  a.rel_clip_w = L.vec(b.rel_clip_w);
+  a.k_conv = L.vec(b.k_conv);
+  a.v_conv = L.vec(b.v_conv);
+  a.post_conv = L.vec(b.post_conv);
+  if (b.res_query >= 0) a.res_query = L.vec(b.res_query);
+  if (b.loop_msg_query >= 0) a.loop_msg_query = L.vec(b.loop_msg_query);
+  a.res_push = b.res_push;
+  a.loop_rank = b.loop_rank;
+  if (b.loop_rank > 0) {
+    for (int j = 0; j < 3; ++j)
+      a.loop_ctrl[j] = loop_weights(L, b.loop_ctrl_down[j], b.loop_ctrl_gain[j], b.loop_ctrl_forget[j], b.hidden,
+                                   b.loop_rank);
+  }
+  a.kv = state_of(sm.kv, b.kv, "K/V");
+  a.sconv = state_of(sm.sconv, b.sconv, "ShortConv");
+  return a;
+}
+
+MoeBlock moe(WeightLoader& L, const flyx_moe_block& b, const StateMap& sm) {
+  MoeBlock f;
+  f.hidden = b.hidden;
+  f.inter = b.inter;
+  f.n_experts = b.n_experts;
+  f.top_k = b.top_k;
+  f.conv = b.conv;
+  f.gating_sigmoid = b.gating != 0;
+  f.norm_weights = b.norm_weights != 0;
+  f.route_scale = b.route_scale;
+  f.norm_eps = b.norm_eps;
+  f.situ_beta = b.situ_beta;
+  f.situ_linear_beta = b.situ_linear_beta;
+  f.norm = norm(L, b.norm);
+  f.router = L.lin_f32(b.router);
+  if (b.router_bias >= 0) f.router_bias = L.vec(b.router_bias);
+  f.gate_up = L.expert_mat(b.gate_up);
+  f.down = L.expert_mat(b.down);
+  if (b.post_conv >= 0) f.post_conv = L.vec(b.post_conv);
+  if (b.res_query >= 0) f.res_query = L.vec(b.res_query);
+  f.loop_rank = b.loop_rank;
+  if (b.loop_rank > 0)
+    f.loop_ctrl = loop_weights(L, b.loop_ctrl_down, b.loop_ctrl_gain, b.loop_ctrl_forget, b.hidden, b.loop_rank);
+  if (b.sconv >= 0) {
+    f.sconv = state_of(sm.sconv, b.sconv, "ShortConv");
+    f.sconv_offset = b.sconv_offset;
+  }
+  return f;
+}
+
+DSparkLayer dspark_layer(WeightLoader& L, const flyx_dspark_layer_block& b, const StateMap& sm) {
+  DSparkLayer l;
+  l.window = b.window;
+  l.kv = state_of(sm.kv, b.kv, "K/V");
+  KvSpec& k = L.model()->states.kv[size_t(l.kv)];
+  expect(k.layers == 1, "DSpark layer cache must have 1 layer");
+  k.fp8 = false;  // DSpark draft kernels (draft_ctx_kv / dspark_block_attention) read binary16 KV
+  l.norm = norm(L, b.norm);
+  l.post_norm = norm(L, b.post_norm);
+  l.q_norm = norm(L, b.q_norm);
+  l.k_norm = norm(L, b.k_norm);
+  l.k_ctx_norm = norm(L, b.k_ctx_norm);
+  l.ctx_norm = norm(L, b.ctx_norm);
+  if (L.can_stack({b.q, b.k, b.v})) {
+    l.w_qkv = L.lin_stack({b.q, b.k, b.v});
+    l.stacked_qkv = true;
+  } else {
+    l.w_q = L.lin(b.q);
+    l.w_k = L.lin(b.k);
+    l.w_v = L.lin(b.v);
+  }
+  l.w_o = L.lin(b.o);
+  if (L.can_stack({b.k_ctx, b.v_ctx})) {
+    l.w_ctx_kv = L.lin_stack({b.k_ctx, b.v_ctx});
+    l.stacked_ctx_kv = true;
+  } else {
+    l.w_k_ctx = L.lin(b.k_ctx);
+    l.w_v_ctx = L.lin(b.v_ctx);
+  }
+  if (L.can_stack({b.gate, b.up})) {
+    l.w_gu = L.lin_stack({b.gate, b.up});
+    l.stacked_gu = true;
+  } else {
+    l.w_gate = L.lin(b.gate);
+    l.w_up = L.lin(b.up);
+  }
+  l.w_down = L.lin(b.down);
+  l.ctx_mix = L.vec(b.ctx_mix);
+  return l;
+}
+
+DSparkBlock dspark(WeightLoader& L, const flyx_model_desc& d, const flyx_dspark_block& b, const StateMap& sm) {
+  DSparkBlock f;
+  f.hidden = b.hidden;
+  f.nh = b.n_heads;
+  f.nkv = b.n_kv;
+  f.hd = b.head_dim;
+  f.inter = b.inter;
+  f.block = b.block;
+  f.n_taps = b.n_taps;
+  f.markov_rank = b.markov_rank;
+  f.vocab_out = b.vocab_out;
+  f.theta = b.theta;
+  f.softcap = b.softcap;
+  rope_register(f.theta, f.hd);
+  f.embed = b.embed;
+  f.head = b.head;
+  f.first_layer = b.first_layer;
+  f.n_layers = b.layers;
+  for (int j = 0; j < b.layers; ++j)
+    expect(b.first_layer >= 0 && b.first_layer + j < d.n_blocks &&
+               d.blocks[b.first_layer + j].kind == FLYX_BLOCK_DSPARK_LAYER,
+           "DSpark layers are not its layer blocks");
+  f.tok_norm = norm(L, b.tok_norm);
+  f.norm = norm(L, b.norm);
+  f.markov_ctx_norm = norm(L, b.markov_ctx_norm);
+  f.mask_embd = L.vec(b.mask_embd);
+  f.markov_ctx_mix = L.vec(b.markov_ctx_mix);
+  if (L.packable(b.markov_w1)) f.markov_w1_blk = L.pack(b.markov_w1);
+  else f.markov_w1 = L.mat(b.markov_w1);
+  f.markov_w2 = L.lin(b.markov_w2);
+  if (b.markov_w2_b >= 0) f.markov_w2_b = L.vec(b.markov_w2_b);
+  f.joint_proj = L.lin(b.joint_proj);
+  f.joint_proj_b = L.vec(b.joint_proj_b);
+  for (int j = 0; j < b.layers; ++j) {
+    const int lkv = state_of(sm.kv, d.blocks[b.first_layer + j].dspark_layer.kv, "K/V");
+    const KvSpec& k = L.model()->states.kv[size_t(lkv)];
+    expect(k.layers == 1 && k.nkv == f.nkv && k.hd == f.hd, "DSpark layer context cache differs from its dims");
+  }
+  expect(b.ring >= 0 && b.ring < d.n_states && sm.ring[size_t(b.ring)], "DSpark names no hidden ring state");
+  return f;
 }
 
 VNorm bind_vnorm(WeightLoader& L, const flyx_vnorm& n) {
@@ -552,6 +752,8 @@ void bind(flyx_bmodel* m, const flyx_model_desc& d, LoadTimes* times) {
         EmbedBlock e;
         e.hidden = b.embed.hidden;
         e.vocab = b.embed.vocab;
+        e.has_norm = b.embed.has_norm != 0;
+        if (e.has_norm) e.norm = norm(L, b.embed.norm);
         // Every kernel that reads the table gathers the rows of a pass's tokens, a few kilobytes: a table no head
         // reads stays in host memory and frees its size on the GPU, unless the GPU has room (embed=auto, open_model).
         const bool host = m->opt.embed == 1 && !head_reads(d, b.embed.table);
@@ -569,16 +771,23 @@ void bind(flyx_bmodel* m, const flyx_model_desc& d, LoadTimes* times) {
       case FLYX_BLOCK_HEAD: {
         HeadBlock h;
         h.hidden = b.head.hidden;
-        h.vocab = b.head.vocab;
+        h.vocab = b.head.vocab_out > 0 ? b.head.vocab_out : b.head.vocab;
+        h.softcap = b.head.softcap;
         h.norm = norm(L, b.head.norm);
-        if (L.packable(b.head.w)) h.wb = L.pack(b.head.w);  // a tied head: the embedding's blocks
-        else h.w = L.mat(b.head.w);
+        if (L.packable(b.head.w)) {
+          h.wb = L.pack(b.head.w);  // a tied head: the embedding's blocks
+          h.wb.rows = h.vocab;      // truncate padded output rows to vocab_out
+        } else {
+          h.w = L.mat(b.head.w);
+        }
         add(m, h);
         break;
       }
       case FLYX_BLOCK_ATTN: add(m, attention(L, b.attn, sm, carve)); break;
       case FLYX_BLOCK_GDN: add(m, gdn(L, b.gdn, sm)); break;
       case FLYX_BLOCK_MLP: add(m, mlp(L, b.mlp, carve)); break;
+      case FLYX_BLOCK_REL_ATTN: add(m, rel_attn(L, b.rel_attn, sm)); break;
+      case FLYX_BLOCK_MOE: add(m, moe(L, b.moe, sm)); break;
       case FLYX_BLOCK_MTP: {
         MtpBlock t;
         t.embed = ref(b.mtp.embed, FLYX_BLOCK_EMBED, "embedding");
@@ -614,6 +823,21 @@ void bind(flyx_bmodel* m, const flyx_model_desc& d, LoadTimes* times) {
         break;
       }
       case FLYX_BLOCK_DFLASH2_LAYER: add(m, dflash_layer(L, b.dflash2_layer)); break;
+      case FLYX_BLOCK_DSPARK: {
+        const int e = ref(b.dspark.embed, FLYX_BLOCK_EMBED, "embedding");
+        const int head = ref(b.dspark.head, FLYX_BLOCK_HEAD, "head");
+        const auto& E = block<EmbedBlock>(m, e);
+        const auto& Hd = block<HeadBlock>(m, head);
+        expect((E.table || E.blk.data) && (Hd.w || Hd.wb.data),
+               "the DSpark drafter reads an embedding and a head of bf16 or packed GGML blocks");
+        expect(m->dspark_block < 0, "more than one DSpark drafter");
+        expect(m->head_block < 0 || m->head_block == head, "drafters that read different heads");
+        m->dspark_block = i;
+        m->head_block = head;
+        add(m, dspark(L, d, b.dspark, sm));
+        break;
+      }
+      case FLYX_BLOCK_DSPARK_LAYER: add(m, dspark_layer(L, b.dspark_layer, sm)); break;
       case FLYX_BLOCK_DV: {
         const int e = ref(b.dv.embed, FLYX_BLOCK_EMBED, "embedding");
         const int head = ref(b.dv.head, FLYX_BLOCK_HEAD, "head");
@@ -633,6 +857,26 @@ void bind(flyx_bmodel* m, const flyx_model_desc& d, LoadTimes* times) {
       case FLYX_BLOCK_VISION_MERGE: add(m, vision_merge(L, b.vision_merge)); break;
       default: throw std::runtime_error("block kind " + std::to_string(b.kind) + ": not implemented by this backend");
     }
+  }
+  // Assign disjoint per-row tap offsets so multiple tap-consuming drafters (e.g. DSpark + DFlash2) can coexist.
+  int64_t tap_off = 0;  // kernel_limits checked the total before binding
+  for (Block& blk : m->blocks) {
+    if (auto* df = std::get_if<DFlashBlock>(&blk)) {
+      df->feats_offset = int(tap_off);
+      tap_off += int64_t(df->n_taps) * df->target_hidden;
+    } else if (auto* ds = std::get_if<DSparkBlock>(&blk)) {
+      ds->feats_offset = int(tap_off);
+      tap_off += int64_t(ds->n_taps) * m->hidden;
+    }
+  }
+  // FLYX_NODE_RES_MIX names a [hidden] vector by its weight index (Inkling-2's output_res_query), and no block
+  // owns it: the vectors of that shape that no block's binding read go on the device for it.  A block's own vectors
+  // stay where the block put them (a vision block's in host memory or on disk when the options say so, a drafter's
+  // in the layout its kernels read), so a model without such a node holds nothing more for it.
+  for (int w = 0; w < d.n_weights; ++w) {
+    const flyx_tensor_view* v = d.weights[w].t;
+    if (v && v->ndim == 1 && v->shape[0] == d.hidden && WeightLoader::numbers(v) && !L.asked(w))
+      m->vec_weights[w] = L.vec(w);
   }
   m->vision_disk.flush_clean();
   L.finish();
