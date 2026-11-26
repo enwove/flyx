@@ -2260,7 +2260,7 @@ __global__ void __launch_bounds__(32 * kRelRoundWarps)
   const int last_tile = last / kRelRoundTile, t0 = first_tile + sp;
   const int n_keys = t0 <= last_tile ? 2 * ((last_tile - t0) / splits + 1) : 0;
   auto key_of = [&](int n) { return (t0 + (n >> 1) * splits) * kRelRoundTile + (n & 1) * kRelRoundWarps + warp; };
-  RelRoundRaw<FP8> ahead[kRelRoundAhead];
+  RelRoundRaw<FP8> ahead[kRelRoundAhead]{};
 #pragma unroll
   for (int d = 0; d < kRelRoundAhead; ++d) {
     const int j = key_of(d);

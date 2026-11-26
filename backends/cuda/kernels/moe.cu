@@ -835,21 +835,18 @@ int launch_nvfp4_gu(const float* x, int ldx, const ExpertMat& W, const int* eidx
     }
     const bf16* bf_a = nullptr;
     if (rc > 1 && sc && sc->bf16_a && sc->stage_elems >= size_t(rc) * size_t(K)) {
-      launch_dependent(k_moe_stage_bf16, dim3(rc), dim3(256), L,
-            xc, ldx, K, sc->bf16_a);
+      launch_dependent(k_moe_stage_bf16, dim3(rc), dim3(256), L, xc, ldx, K, sc->bf16_a);
       bf_a = sc->bf16_a;
     }
     if (rc == 1) {
       if (fuse_act)
-        launch_dependent(k_moe_nvfp4_mma<SPAN, true, false, true, 4, 1>, dim3(ceil_div(N_work, 32), top_k), dim3(128), L,
-            
-            xc, ldx, bf_a, W.q, W.s, W.rs, W.N, I, K, ec, nullptr, nullptr, nullptr, top_k, situ_beta, situ_linear_beta,
-            oc, ld_out);
+        launch_dependent(k_moe_nvfp4_mma<SPAN, true, false, true, 4, 1>, dim3(ceil_div(N_work, 32), top_k),
+                         dim3(128), L, xc, ldx, bf_a, W.q, W.s, W.rs, W.N, I, K, ec, nullptr, nullptr, nullptr, top_k,
+                         situ_beta, situ_linear_beta, oc, ld_out);
       else
-        launch_dependent(k_moe_nvfp4_mma<SPAN, false, false, true, 4, 2>, dim3(ceil_div(N_work, 64), top_k), dim3(128), L,
-            
-            xc, ldx, bf_a, W.q, W.s, W.rs, W.N, I, K, ec, nullptr, nullptr, nullptr, top_k, situ_beta, situ_linear_beta,
-            oc, ld_out);
+        launch_dependent(k_moe_nvfp4_mma<SPAN, false, false, true, 4, 2>, dim3(ceil_div(N_work, 64), top_k),
+                         dim3(128), L, xc, ldx, bf_a, W.q, W.s, W.rs, W.N, I, K, ec, nullptr, nullptr, nullptr, top_k,
+                         situ_beta, situ_linear_beta, oc, ld_out);
     } else if (has_sc) {
       const int M = rc * top_k;
       const int mt = max_work_tiles(M, W.n_experts, 16);
@@ -857,27 +854,25 @@ int launch_nvfp4_gu(const float* x, int ldx, const ExpertMat& W, const int* eidx
       grouped = rc == rows ? 16 : 0;
       if (fuse_act)
         launch_dependent(k_moe_nvfp4_mma<SPAN, true, false, false, 4, 1>, dim3(ceil_div(N_work, 32), mt), dim3(128), L,
-            
-            xc, ldx, bf_a, W.q, W.s, W.rs, W.N, I, K, ec, sc->tasks, sc->n_tasks, sc->pairs, top_k, situ_beta,
-            situ_linear_beta, oc, ld_out);
+                         xc, ldx, bf_a, W.q, W.s, W.rs, W.N, I, K, ec, sc->tasks, sc->n_tasks, sc->pairs, top_k,
+                         situ_beta, situ_linear_beta, oc, ld_out);
       else
-        launch_dependent(k_moe_nvfp4_mma<SPAN, false, false, false, 4, 2>, dim3(ceil_div(N_work, 64), mt), dim3(128), L,
-            
-            xc, ldx, bf_a, W.q, W.s, W.rs, W.N, I, K, ec, sc->tasks, sc->n_tasks, sc->pairs, top_k, situ_beta,
-            situ_linear_beta, oc, ld_out);
+        launch_dependent(k_moe_nvfp4_mma<SPAN, false, false, false, 4, 2>, dim3(ceil_div(N_work, 64), mt), dim3(128),
+                         L, xc, ldx, bf_a, W.q, W.s, W.rs, W.N, I, K, ec, sc->tasks, sc->n_tasks, sc->pairs, top_k,
+                         situ_beta, situ_linear_beta, oc, ld_out);
     } else {
       // No-scratch multi-row fallback: 1 row at a time via DIRECT_R1 (exact same bits).
       for (int rr = 0; rr < rc; ++rr) {
         if (fuse_act)
-          launch_dependent(k_moe_nvfp4_mma<SPAN, true, false, true, 4, 1>, dim3(ceil_div(N_work, 32), top_k), dim3(128), L,
-            
-              xc + size_t(rr) * ldx, ldx, nullptr, W.q, W.s, W.rs, W.N, I, K, ec + size_t(rr) * top_k, nullptr, nullptr,
-              nullptr, top_k, situ_beta, situ_linear_beta, oc + size_t(rr) * top_k * ld_out, ld_out);
+          launch_dependent(k_moe_nvfp4_mma<SPAN, true, false, true, 4, 1>, dim3(ceil_div(N_work, 32), top_k),
+                           dim3(128), L, xc + size_t(rr) * ldx, ldx, nullptr, W.q, W.s, W.rs, W.N, I, K,
+                           ec + size_t(rr) * top_k, nullptr, nullptr, nullptr, top_k, situ_beta, situ_linear_beta,
+                           oc + size_t(rr) * top_k * ld_out, ld_out);
         else
-          launch_dependent(k_moe_nvfp4_mma<SPAN, false, false, true, 4, 2>, dim3(ceil_div(N_work, 64), top_k), dim3(128), L,
-            
-              xc + size_t(rr) * ldx, ldx, nullptr, W.q, W.s, W.rs, W.N, I, K, ec + size_t(rr) * top_k, nullptr, nullptr,
-              nullptr, top_k, situ_beta, situ_linear_beta, oc + size_t(rr) * top_k * ld_out, ld_out);
+          launch_dependent(k_moe_nvfp4_mma<SPAN, false, false, true, 4, 2>, dim3(ceil_div(N_work, 64), top_k),
+                           dim3(128), L, xc + size_t(rr) * ldx, ldx, nullptr, W.q, W.s, W.rs, W.N, I, K,
+                           ec + size_t(rr) * top_k, nullptr, nullptr, nullptr, top_k, situ_beta, situ_linear_beta,
+                           oc + size_t(rr) * top_k * ld_out, ld_out);
       }
     }
   }
@@ -928,25 +923,22 @@ void launch_nvfp4_down(const float* act, int ld_act, const ExpertMat& W, const i
     }
     const bf16* bf_a = act_bf16;
     if (!bf_a && rc > 1 && sc->bf16_a && sc->stage_elems >= size_t(M) * size_t(K)) {
-      launch_dependent(k_moe_stage_bf16, dim3(M), dim3(256), L,
-            ac, ld_act, K, sc->bf16_a);
+      launch_dependent(k_moe_stage_bf16, dim3(M), dim3(256), L, ac, ld_act, K, sc->bf16_a);
       bf_a = sc->bf16_a;
     }
     if (rc == 1) {
       launch_dependent(k_moe_nvfp4_mma<SPAN, false, true, true, 4, 1>, dim3(ceil_div(H, 32), top_k), dim3(128), L,
-            
-          ac, ld_act, bf_a, W.q, W.s, W.rs, H, H, K, ec, nullptr, nullptr, nullptr, top_k, 0.f, 0.f, sc->down_buf, H);
+                       ac, ld_act, bf_a, W.q, W.s, W.rs, H, H, K, ec, nullptr, nullptr, nullptr, top_k, 0.f, 0.f,
+                       sc->down_buf, H);
     } else {
       const int mt = max_work_tiles(M, W.n_experts, 16);
       if (rc != rows || !tiles_serve(grouped, 16, rc)) group_tasks(ec, M, W.n_experts, 16, sc, st);
       launch_dependent(k_moe_nvfp4_mma<SPAN, false, true, false, 4, 2>, dim3(ceil_div(H, 64), mt), dim3(128), L,
-            
-          ac, ld_act, bf_a, W.q, W.s, W.rs, H, H, K, ec, sc->tasks, sc->n_tasks, sc->pairs, top_k, 0.f, 0.f,
-          sc->down_buf, H);
+                       ac, ld_act, bf_a, W.q, W.s, W.rs, H, H, K, ec, sc->tasks, sc->n_tasks, sc->pairs, top_k, 0.f,
+                       0.f, sc->down_buf, H);
     }
-    launch_dependent(k_moe_weighted_sum, dim3(ceil_div(H, 256), rc), dim3(256), L,
-            sc->down_buf, ew + size_t(r0) * top_k, top_k, H,
-                                                                   out + size_t(r0) * ld_out, ld_out, int(accumulate));
+    launch_dependent(k_moe_weighted_sum, dim3(ceil_div(H, 256), rc), dim3(256), L, sc->down_buf,
+                     ew + size_t(r0) * top_k, top_k, H, out + size_t(r0) * ld_out, ld_out, int(accumulate));
   }
 }
 
