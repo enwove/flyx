@@ -253,11 +253,18 @@ bool mtp_gguf_name(const std::string& path) {
   return base.starts_with("mtp-") || p.starts_with("mtp/") || p.find("/mtp/") != std::string::npos;
 }
 
+bool dspark_gguf_name(const std::string& path) {
+  const std::string p = detail::lower(path), base = detail::base_name(p);
+  if (!base.ends_with(".gguf") || base.find("imatrix") != std::string::npos) return false;
+  return base.starts_with("dspark-") || p.starts_with("dspark/") || p.find("/dspark/") != std::string::npos;
+}
+
 bool model_gguf_name(const std::string& path) {
   const std::string p = detail::lower(path), base = detail::base_name(p);
-  if (!base.ends_with(".gguf") || mmproj_gguf_name(path) || mtp_gguf_name(path) ||
+  if (!base.ends_with(".gguf") || mmproj_gguf_name(path) || mtp_gguf_name(path) || dspark_gguf_name(path) ||
       base.find("imatrix") != std::string::npos)
     return false;
+  if (p.starts_with("old_support/") || p.find("/old_support/") != std::string::npos) return false;
   return true;
 }
 
@@ -361,12 +368,17 @@ const RepoFile* mmproj_file(const Repo& r) {
 std::vector<CompanionFile> companion_files(const Repo& r) {
   const RepoFile* def_mtp = mtp_file(r);
   const RepoFile* def_mm = mmproj_file(r);
+  bool dspark_default_set = false;
   std::vector<CompanionFile> out;
   for (const RepoFile& f : r.files) {
-    if (mtp_gguf_name(f.path))
+    if (mtp_gguf_name(f.path)) {
       out.push_back({f, "mtp", def_mtp && def_mtp->path == f.path});
-    else if (mmproj_gguf_name(f.path))
+    } else if (dspark_gguf_name(f.path)) {
+      out.push_back({f, "dspark", !dspark_default_set});
+      dspark_default_set = true;
+    } else if (mmproj_gguf_name(f.path)) {
       out.push_back({f, "mmproj", def_mm && def_mm->path == f.path});
+    }
   }
   auto order = [](const std::string& k) { return k == "mmproj" ? 1 : 0; };
   std::sort(out.begin(), out.end(), [&](const CompanionFile& a, const CompanionFile& b) {

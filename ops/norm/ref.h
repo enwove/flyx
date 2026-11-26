@@ -6,12 +6,16 @@
 
 namespace flyx::ops {
 
-// offset 1: Qwen3.5 zero-centred weight (x * (1 + w)); offset 0: plain (x * w).
+// offset 1: Qwen3.5 zero-centred weight (x * (1 + w)); offset 0: plain (x * w); w == nullptr: no gamma (x * inv).
 inline void rmsnorm(const double* x, const double* w, int n, double eps, double offset, double* y) {
   double ss = 0;
   for (int i = 0; i < n; ++i) ss += x[i] * x[i];
   double inv = 1.0 / std::sqrt(ss / n + eps);
-  for (int i = 0; i < n; ++i) y[i] = x[i] * inv * (offset + w[i]);
+  if (!w) {
+    for (int i = 0; i < n; ++i) y[i] = x[i] * inv;
+  } else {
+    for (int i = 0; i < n; ++i) y[i] = x[i] * inv * (offset + w[i]);
+  }
 }
 
 inline void l2norm(double* x, int n, double eps) {

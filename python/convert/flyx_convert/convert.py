@@ -34,6 +34,7 @@ from __future__ import annotations
 import argparse
 import glob
 import json
+import math
 import os
 import re
 import struct
@@ -192,15 +193,22 @@ def canonical_draft_config(sc: dict, target: dict | None) -> dict:
       speculators' ("speculators_model_type": "dflash2"; the layers under "transformer_layer_config";
         aux_hidden_state_layer_ids: indices into the target's hidden states, 0 the embedding);
       z-lab's and Inco's ("architectures": ["DFlash2DraftModel"], "dflash_config"; target_layer_ids: the target
-        layers whose outputs it reads, hidden_states[id + 1] in their code).
-    taps: the residual stream after that many target layers.  window: each position attends to the positions less
-    than that far from it, both ways (0: all).  target: the model's canonical config, or None for a drafter file of
-    its own (the engine checks it against the model it is given with; "target" below names what it was made for)."""
+        layers whose outputs it reads, hidden_states[id + 1] in their code; a list that reaches num_target_layers
+        counts the hidden states themselves instead, the last the final norm's output, as Inco's drafter for
+        Inkling-2 does: its reference hands the ids to the capture DSpark's go to, as they are).
+    taps: the target's hidden state after that many layers; after all of them, the final norm's output.  softcap,
+    softcap_mode: the selector's soft cap on a candidate's logit (final_logit_softcapping), before it adds the
+    pair's correction or after (selector_softcap_mode).  window: each position attends to the positions less than
+    that far from it, both ways (0: all).  target: the model's canonical config, or None for a drafter file of its
+    own (the engine checks it against the model it is given with; "target" below names what it was made for)."""
     if "dflash_config" in sc:
         if "DFlash2DraftModel" not in sc.get("architectures", []):
             raise ValueError(f"drafter architectures {sc.get('architectures')!r}: DFlash2DraftModel is supported")
         dc, tl = sc["dflash_config"], sc
-        taps = [int(i) + 1 for i in dc["target_layer_ids"]]
+        ids = [int(i) for i in dc["target_layer_ids"]]
+        n_target = sc.get("num_target_layers")
+        hidden_states = isinstance(n_target, int) and not isinstance(n_target, bool) and n_target in ids
+        taps = ids if hidden_states else [i + 1 for i in ids]
         vocab, target_hidden = tl["vocab_size"], tl["hidden_size"]
         causal = sc.get("is_causal")  # their attention: None = causal where the layer slides
     else:
@@ -233,7 +241,7 @@ def canonical_draft_config(sc: dict, target: dict | None) -> dict:
         if any(not 1 <= t <= target["layers"] for t in taps):
             raise ValueError(f"drafter taps {taps} outside the target's {target['layers']} layers")
     hd = tl.get("head_dim") or tl["hidden_size"] // tl["num_attention_heads"]
-    return {
+    draft = {
         "kind": "dflash2", "hidden": tl["hidden_size"], "layers": tl["num_hidden_layers"],
         "n_heads": tl["num_attention_heads"], "n_kv": tl["num_key_value_heads"], "head_dim": hd,
         "inter": tl["intermediate_size"], "eps": tl["rms_norm_eps"],
@@ -245,6 +253,18 @@ def canonical_draft_config(sc: dict, target: dict | None) -> dict:
         "target": {"hidden": target_hidden, "vocab": vocab,
                    "layers": target["layers"] if target else sc.get("num_target_layers")},
     }
+    softcap = dc.get("final_logit_softcapping")
+    if isinstance(softcap, (int, float)) and not isinstance(softcap, bool):
+        if not math.isfinite(softcap) or softcap < 0:
+            raise ValueError("draft final_logit_softcapping out of range")
+        if softcap > 0:
+            draft["softcap"] = float(softcap)
+    mode = dc.get("selector_softcap_mode")
+    if isinstance(mode, str):
+        if mode not in ("before_correction", "after_correction"):
+            raise ValueError(f"unsupported draft selector_softcap_mode: {mode}")
+        draft["softcap_mode"] = mode
+    return draft
 
 
 _T_RULES = [

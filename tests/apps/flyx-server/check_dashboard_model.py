@@ -71,7 +71,11 @@ CATALOG = {"cache": CACHE, "cache_from": "default", "dirs": [FOLDER], "models": 
     dir_model(FOLDER, "tiny-bf16.flyx", int(0.4 * GB), "flyx"),
     dir_model(FOLDER, "Other-12B-Q5_K_M.gguf", int(8.9 * GB), quant="Q5_K_M"),
     dir_model(FOLDER, "mmproj-BF16.gguf", int(0.9 * GB), kind="mmproj"),
-    {"name": "acme/Tiny-27B-DFlash2", "kind": "drafter", "source": "hub", "repo": "acme/Tiny-27B-DFlash2", "size": int(1.9 * GB)}]}
+    {"name": "acme/Tiny-27B-DFlash2", "kind": "drafter", "drafter_kind": "dflash2", "source": "hub", "repo": "acme/Tiny-27B-DFlash2", "size": int(1.9 * GB)},
+    {"name": "acme/Model-DFlash2-GGUF:BF16", "kind": "drafter", "drafter_kind": "dflash2", "source": "hub",
+     "repo": "acme/Model-DFlash2-GGUF", "quant": "BF16", "file": "Model-DFlash2-Draft-BF16.gguf",
+     "path": CACHE + "\\Model-DFlash2-Draft-BF16.gguf", "size": int(1.0 * GB), "modified": 1.7e9,
+     "revision": "def456", "current": True, "mtp": None, "mmproj": None}]}
 FOUND = {"query": "", "family": True, "architectures": ["qwen35", "qwen3", "inkling2_loop"], "arch": None,
          "endpoint": "https://huggingface.co", "next_cursor": "page2-tok", "models": [
     {"id": REPO, "downloads": 7383193, "likes": 6300, "updated": "2026-11-12T02:15:52.000Z", "created": None, "pipeline": None,
@@ -612,7 +616,7 @@ def check_local(page, server):
     expect(folders).to_have_count(3)  # where Hugging Face downloads to, the model directory, the served model's folder
     expect(folders.nth(0).locator(".ps")).to_have_text(CACHE)
     expect(folders.nth(1).locator(".ps")).to_have_text(FOLDER)
-    expect(models).to_have_count(7)
+    expect(models).to_have_count(8)
     one = page.locator('#lc-list .prow.model[data-model="' + REPO + ':IQ3_XXS"]')
     expect(one.locator(".pn")).to_have_text("Tiny-27B-GGUF · IQ3_XXS")
     expect(one.locator(".pm")).to_have_text("11.8 GB")
@@ -620,10 +624,12 @@ def check_local(page, server):
     expect(page.locator('#lc-list .prow.model[data-model$="tiny-bf16.flyx"] .pt')).to_have_text(".flyx")
     expect(page.locator('#lc-list .prow.model[data-model$="mmproj-BF16.gguf"] .pt')).to_have_text("mmproj")
     expect(page.locator('#lc-list .prow.model[data-model="acme/Tiny-27B-DFlash2"] .pt')).to_have_text("drafter")
+    expect(page.locator('#lc-list .prow.model[data-model="acme/Model-DFlash2-GGUF:BF16"] .pt')).to_have_text("drafter")
     # Every file under a folder carries a kind-specific icon (model, vision projector, drafter).
     expect(page.locator('#lc-list .prow.model[data-model$="tiny-bf16.flyx"] .pn svg use')).to_have_attribute("href", "#i-model")
     expect(page.locator('#lc-list .prow.model[data-model$="mmproj-BF16.gguf"] .pn svg use')).to_have_attribute("href", "#i-image")
     expect(page.locator('#lc-list .prow.model[data-model="acme/Tiny-27B-DFlash2"] .pn svg use')).to_have_attribute("href", "#i-bolt")
+    expect(page.locator('#lc-list .prow.model[data-model="acme/Model-DFlash2-GGUF:BF16"] .pn svg use')).to_have_attribute("href", "#i-bolt")
     one.click()
     expect(page.locator("#lc-name")).to_have_text("Tiny-27B-GGUF · IQ3_XXS")
     expect(page.locator("#lc-detail .dchips")).to_contain_text("+ Vision")
@@ -641,6 +647,14 @@ def check_local(page, server):
     # Drafters and vision projectors use the bottom-right primary button instead of a duplicate banner button.
     page.locator('#lc-list .prow.model[data-model="acme/Tiny-27B-DFlash2"]').click()
     expect(page.locator("#lc-detail .banner button")).to_have_count(0)
+    expect(page.locator("#lc-detail .dsec")).to_have_text("Folder")
+    expect(page.locator("#mf-load")).to_have_text("Draft with it")
+    expect(page.locator("#mf-load")).to_be_enabled()
+    # A cached Hub GGUF drafter shows File (not Folder), a DFlash2 chip, and Draft with it (never Load model).
+    page.locator('#lc-list .prow.model[data-model="acme/Model-DFlash2-GGUF:BF16"]').click()
+    expect(page.locator("#lc-detail .dchips")).to_contain_text("DFlash2")
+    expect(page.locator("#lc-detail .dsec")).to_have_text("File")
+    expect(page.locator("#lc-quants")).to_be_visible()
     expect(page.locator("#mf-load")).to_have_text("Draft with it")
     expect(page.locator("#mf-load")).to_be_enabled()
     page.locator('#lc-list .prow.model[data-model$="mmproj-BF16.gguf"]').click()
@@ -665,7 +679,7 @@ def check_local(page, server):
     page.locator('#src-seg [data-src="local"]').click()
     folders.nth(0).click()
     expect(page.locator("#mf-path")).to_have_value(CACHE)
-    expect(page.locator("#mf-cached .rgroup")).to_have_count(3)
+    expect(page.locator("#mf-cached .rgroup")).to_have_count(4)
     # A folder added through the system's dialog (the server shows it), kept by the browser, then removed.
     page.locator("#mf-add").click()
     added = page.locator('#lc-list .prow.folder[data-place="dir:' + selector(PICKED) + '"]')

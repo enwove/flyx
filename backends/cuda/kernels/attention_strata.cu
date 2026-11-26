@@ -87,7 +87,8 @@ __device__ __forceinline__ uint32_t compact3_code(const uint32_t* tile, int pos,
 template <int HD, int G, int BITS, bool Compact = false>
 __global__ void __launch_bounds__(128) k_strata_scan(const float* __restrict__ q, KvRef kv, int nh, int nkv,
                                                      float scale, const DevParams* P, float* __restrict__ part,
-                                                     int slots, __half* __restrict__ lse, int lse_stride) {
+                                                     int slots, __half* __restrict__ lse, int lse_stride,
+                                                     RelStrata rel = {}) {
   pdl_trigger();
   constexpr int DPL = HD / 32, VB = 4;
   constexpr StrataLayout SL(HD, BITS);
@@ -159,8 +160,14 @@ __global__ void __launch_bounds__(128) k_strata_scan(const float* __restrict__ q
         }
         // dot = q.(1 + c / 2^BITS): the key lo + (c + 1/2) step is a (1 + c / 2^BITS) + b, a = 2^BITS step.
         const float a = __fmul_rn(sl.y, float(1 << BITS)), b = __fsub_rn(__fmaf_rn(0.5f, sl.y, sl.x), a);
+        const int dist = P->position + r - j;
 #pragma unroll
-        for (int g = 0; g < G; ++g) sc[g] = __fmul_rn(__fmaf_rn(a, dot[g], __fmul_rn(b, s_qsum[g])), scale);
+        for (int g = 0; g < G; ++g) {
+          float s = __fmul_rn(__fmaf_rn(a, dot[g], __fmul_rn(b, s_qsum[g])), scale);
+          if (rel.btab && dist >= 0 && dist < rel.extent)
+            s = __fadd_rn(s, __ldg(rel.btab + (size_t(r) * nh + kvh * G + g) * rel.extent + dist));
+          sc[g] = s;
+        }
       } else {
 #pragma unroll
         for (int g = 0; g < G; ++g) sc[g] = -INFINITY;
@@ -350,13 +357,15 @@ template <int HD, int BITS, bool FullAligned, bool Compact = false>
 __device__ __forceinline__ void strata_scan_1w_body(
     const float* qr, KvRef kv, int nh, int nkv, int G, int rows, float scale, float* __restrict__ part,
     __half* __restrict__ lse, int lse_stride, int split, int splits, int kvh, int global_warp, bool packed,
-    int tail_row, int my_cks, int max_cke_warp, const bool (&cok)[2], const int (&lse_rh)[2], const int (&cke)[2]) {
+    int tail_row, int my_cks, int max_cke_warp, const bool (&cok)[2], const int (&lse_rh)[2], const int (&cke)[2],
+    int pos0 = 0, RelStrata rel = {}) {
   constexpr StrataLayout L(HD, BITS);
   constexpr int KS = HD / 16, SUB = kScanTile / 16, RB = FoldSlots<BITS>::R * BITS;
   constexpr int KWL = L.kown + (L.kleft ? 1 : 0), VWL = L.vown + (L.vleft ? 1 : 0);
   constexpr uint32_t FULL = 0xffffffffu;
   const int lane = threadIdx.x, g = lane >> 2, t = lane & 3;
   const int total_cols = rows * G;
+  const int col_pos[2] = {rel.btab ? pos0 + lse_rh[0] / nh : 0, rel.btab ? pos0 + lse_rh[1] / nh : 0};
 
   uint32_t bq[KS][2];
   int sh = 0;
@@ -554,7 +563,18 @@ __device__ __forceinline__ void strata_scan_1w_body(
         const int j = e & 1, h = e >> 1, key = tile * kScanTile + 16 * sb + g + 8 * h;
         const float x = __fmaf_rn(kstep[h], __fsub_rn(__fadd_rn(sp[sb][0][e], sp[sb][1][e]), qoff[j]),
                                   __fmul_rn(kbase[h], qsum[j]));
-        v_out[sb][e] = cok[j] && (FullAligned || key < cke[j]) ? __fmul_rn(x, cs[j]) : -INFINITY;
+        float sc = -INFINITY;
+        if (cok[j] && (FullAligned || key < cke[j])) {
+          sc = __fmul_rn(x, cs[j]);
+          if constexpr (!FullAligned) {
+            if (rel.btab) {
+              const int dist = col_pos[j] - key;
+              if (dist >= 0 && dist < rel.extent)
+                sc = __fadd_rn(sc, __ldg(rel.btab + size_t(lse_rh[j]) * rel.extent + dist));
+            }
+          }
+        }
+        v_out[sb][e] = sc;
       }
     }
   };
@@ -788,7 +808,7 @@ template <int HD, int BITS, bool Compact = false>
 __global__ void __launch_bounds__(32)
     k_strata_scan_mma(const float* qr, KvRef kv, int nh, int nkv, int rows, float scale, const DevParams* P,
                                 float* __restrict__ part, __half* __restrict__ lse, int lse_stride,
-                                int first_split = 0, int total_splits = 0) {
+                                int first_split = 0, int total_splits = 0, RelStrata rel = {}) {
   pdl_trigger();
   const int split = (int(gridDim.z) - 1 - int(blockIdx.z)) + first_split;
   const int splits = total_splits ? total_splits : int(gridDim.z);
@@ -803,7 +823,7 @@ __global__ void __launch_bounds__(32)
   bool one_end = false;
   const bool packed = strata_split_same_cks(P->position, rows, split, splits, &b0, &end, &one_end);
   if constexpr (HD == 256 && BITS == 2) {
-    if (packed && lse && one_end && end % kScanTile == 0) {
+    if (!rel.btab && packed && lse && one_end && end % kScanTile == 0) {
       bool cok[2];
       int lse_rh[2], cke[2];
       const int col_base = global_warp * 8;
@@ -869,7 +889,7 @@ __global__ void __launch_bounds__(32)
     }
     strata_scan_1w_body<HD, BITS, false, Compact>(
         qr, kv, nh, nkv, G, rows, scale, part, lse, lse_stride, split, splits, kvh, global_warp, packed, tail_row,
-        my_cks, max_cke_warp, cok, lse_rh, cke);
+        my_cks, max_cke_warp, cok, lse_rh, cke, P->position, rel);
   }
 }
 
@@ -882,7 +902,7 @@ template <int HD, int BITS, int W, bool Compact = false>
 __global__ void __launch_bounds__(32 * W, W == 3 ? 4 : (W == 2 ? 6 : 3))
     k_strata_scan_mma_cta(const float* qr, KvRef kv, int nh, int nkv, int rows, float scale, const DevParams* P,
                              float* __restrict__ part, __half* __restrict__ lse, int lse_stride,
-                             int first_split = 0, int total_splits = 0) {
+                             int first_split = 0, int total_splits = 0, RelStrata rel = {}) {
   pdl_trigger();
   constexpr StrataLayout L(HD, BITS);
   constexpr int KS = HD / 16, SUB = kScanTile / 16, RB = FoldSlots<BITS>::R * BITS;
@@ -986,6 +1006,7 @@ __global__ void __launch_bounds__(32 * W, W == 3 ? 4 : (W == 2 ? 6 : 3))
     }
 
     const int my_t0 = my_active ? (my_cks / kScanTile) : (t1_cta + 1);
+    const int col_pos[2] = {rel.btab ? P->position + lse_rh[0] / nh : 0, rel.btab ? P->position + lse_rh[1] / nh : 0};
 
     uint32_t bq[KS - BQ_SMEM][2];
     int sh = 0;
@@ -1190,7 +1211,16 @@ __global__ void __launch_bounds__(32 * W, W == 3 ? 4 : (W == 2 ? 6 : 3))
           const int j = e & 1, h = e >> 1, key = tile * kScanTile + 16 * sb + g + 8 * h;
           const float x = __fmaf_rn(kstep[h], __fsub_rn(__fadd_rn(sp[sb][0][e], sp[sb][1][e]), qoff[j]),
                                     __fmul_rn(kbase[h], qsum[j]));
-          v_out[sb][e] = tile_ok && cok[j] && key < cke[j] ? __fmul_rn(x, cs[j]) : -INFINITY;
+          float sc = -INFINITY;
+          if (tile_ok && cok[j] && key < cke[j]) {
+            sc = __fmul_rn(x, cs[j]);
+            if (rel.btab) {
+              const int dist = col_pos[j] - key;
+              if (dist >= 0 && dist < rel.extent)
+                sc = __fadd_rn(sc, __ldg(rel.btab + size_t(lse_rh[j]) * rel.extent + dist));
+            }
+          }
+          v_out[sb][e] = sc;
         }
       }
     };
@@ -1574,7 +1604,7 @@ __device__ __forceinline__ void sel_chunk(int ng, int chunk, int chunks, int* c0
 __global__ void __launch_bounds__(kSelPartThreads, 2)
     k_strata_select_part(const float* part, int nh, int nkv, int G, int hd, int slots, int used_cap, const __half* lse,
                          int lse_stride, uint32_t* cand_key, int* cand, int* cand_n, int sel_stride,
-                         const DevParams* P, StrataSel how) {
+                         const DevParams* P, StrataSel how, RelStrata rel = {}) {
   pdl_trigger();
   __shared__ float s_c[16];
   const int r = blockIdx.x, kvh = blockIdx.y, chunk = blockIdx.z, chunks = gridDim.z, tid = threadIdx.x;
@@ -1587,7 +1617,8 @@ __global__ void __launch_bounds__(kSelPartThreads, 2)
   const int warp = tid >> 5, lane = tid & 31;
   if (warp < G) {  // 1 warp per query head (kSelPartThreads / 32 = 16 >= G)
     const float* pr = part + (size_t(r) * nh + kvh * G + warp) * slots * (hd + 2);
-    float M = -INFINITY;
+    const float sk = rel.sink ? rel.sink[size_t(r) * rel.ld_sink + kvh * G + warp] : -INFINITY;
+    float M = sk;
     for (int s = lane; s < used; s += 32) M = fmaxf(M, pr[s * (hd + 2)]);
 #pragma unroll
     for (int o = 16; o > 0; o >>= 1) M = fmaxf(M, __shfl_xor_sync(0xffffffffu, M, o));
@@ -1599,7 +1630,10 @@ __global__ void __launch_bounds__(kSelPartThreads, 2)
       }
 #pragma unroll
     for (int o = 16; o > 0; o >>= 1) L += __shfl_xor_sync(0xffffffffu, L, o);
-    if (lane == 0) s_c[warp] = M + __logf(L);  // log of the head's softmax denominator
+    if (lane == 0) {
+      if (rel.sink) L += __expf(sk - M);
+      s_c[warp] = M + __logf(L);  // log of the head's softmax denominator
+    }
   }
   __syncthreads();
   // The thread's run of the chunk's pairs (a multiple of 8, in thread order), their keys in registers: the log-sum-exps
@@ -1910,7 +1944,8 @@ __global__ void __launch_bounds__(32 * kDeltaWarps, 12 / kDeltaWarps)
     k_strata_delta(const float* __restrict__ q, const float* __restrict__ qr, KvRef kv, int nh, int nkv, float scale,
                    const DevParams* P, const DevParams* P_hot,
                    const float* __restrict__ part, int slots, int used_cap, const int* __restrict__ sel,
-                   int sel_stride, const int* __restrict__ sel_n, float* __restrict__ delta, PageBounce pb = {}) {
+                   int sel_stride, const int* __restrict__ sel_n, float* __restrict__ delta, RelStrata rel = {},
+                   PageBounce pb = {}) {
   pdl_trigger();
   constexpr int DPL = HD / 32, NW = kDeltaWarps;
   constexpr StrataLayout SL(HD, BITS);
@@ -1937,7 +1972,7 @@ __global__ void __launch_bounds__(32 * kDeltaWarps, 12 / kDeltaWarps)
   // Warp-parallel M-only reduction across splits (0 __expf, bit-identical to head_mass's M).
   for (int g = warp; g < G; g += NW) {
     const float* pr = part + (size_t(r) * nh + kvh * G + g) * slots * (HD + 2);
-    float M = -INFINITY;
+    float M = rel.sink ? rel.sink[size_t(r) * rel.ld_sink + kvh * G + g] : -INFINITY;
     for (int s = lane; s < used; s += 32) M = fmaxf(M, pr[s * (HD + 2)]);
 #pragma unroll
     for (int o = 16; o > 0; o >>= 1) M = fmaxf(M, __shfl_xor_sync(FULL, M, o));
@@ -1969,6 +2004,7 @@ __global__ void __launch_bounds__(32 * kDeltaWarps, 12 / kDeltaWarps)
 
     // Issue all exact-KV and low-bit-KV loads up front so DRAM / PCIe latencies overlap.
     float kscale = 1.f, vscale = 1.f;
+    uint32_t kx4 = 0, vx4 = 0;
     uint2 kx8 = {0, 0}, vx8 = {0, 0};
     uint4 kx16 = {0, 0, 0, 0}, vx16 = {0, 0, 0, 0};
     float kf_small[DPL], vf_small[DPL];
@@ -2002,7 +2038,7 @@ __global__ void __launch_bounds__(32 * kDeltaWarps, 12 / kDeltaWarps)
           }
         }
       }
-    } else if constexpr (FP8 && DPL == 8) {
+    } else if constexpr (FP8 && (DPL == 8 || DPL == 4)) {
       if (kv.hot) {
         const int q_pair = j >> 1, sl = kv.hot_slot(q_pair);
         if (hot_pair(kv, q_pair, P_hot->position) && kv.hot_tag[(size_t(kvh) << kv.hot_bits) + sl] == q_pair) {
@@ -2016,7 +2052,12 @@ __global__ void __launch_bounds__(32 * kDeltaWarps, 12 / kDeltaWarps)
         }
       }
     }
-    if constexpr (FP8 && DPL == 8) {
+    if constexpr (FP8 && DPL == 4) {
+      kx4 = *reinterpret_cast<const uint32_t*>(ksrc);
+      vx4 = *reinterpret_cast<const uint32_t*>(vsrc);
+      kscale = kscale_at ? *kscale_at : kv.kscales(cj)[size_t(cj) * nkv + kvh];
+      vscale = vscale_at ? *vscale_at : kv.vscales(cj)[size_t(cj) * nkv + kvh];
+    } else if constexpr (FP8 && DPL == 8) {
       kx8 = *reinterpret_cast<const uint2*>(ksrc);
       vx8 = *reinterpret_cast<const uint2*>(vsrc);
       kscale = kscale_at ? *kscale_at : kv.kscales(cj)[size_t(cj) * nkv + kvh];
@@ -2056,11 +2097,24 @@ __global__ void __launch_bounds__(32 * kDeltaWarps, 12 / kDeltaWarps)
     const __half2 kqs_h = __ldg(kv.kqs + size_t(j) * nkv + kvh);
     const __half2 vqs_h = __ldg(kv.vqs + size_t(j) * nkv + kvh);
 
+    const int dist = (total - 1) - j;
+    float rb[G];
+    if (rel.btab && dist >= 0 && dist < rel.extent) {
+#pragma unroll
+      for (int g = 0; g < G; ++g)
+        rb[g] = __ldg(rel.btab + (size_t(r) * nh + kvh * G + g) * rel.extent + dist);
+    } else {
+#pragma unroll
+      for (int g = 0; g < G; ++g) rb[g] = 0.f;
+    }
+
     // Phase 1: Exact K -> pf[G], then Exact V -> accF[G][DPL] (reusing one DPL temp array).
     float kv_tmp[DPL];
     if constexpr (FP8 && DPL == 8) {
       e4m3x4_to_float(kx8.x, kv_tmp);
       e4m3x4_to_float(kx8.y, kv_tmp + 4);
+    } else if constexpr (FP8 && DPL == 4) {
+      e4m3x4_to_float(kx4, kv_tmp);
     } else if constexpr (!FP8 && DPL == 8) {
       const uint32_t kw4[4] = {kx16.x, kx16.y, kx16.z, kx16.w};
 #pragma unroll
@@ -2080,11 +2134,15 @@ __global__ void __launch_bounds__(32 * kDeltaWarps, 12 / kDeltaWarps)
 #pragma unroll
       for (int e = 0; e < DPL; ++e) df = __fmaf_rn(sm.q.q[g][e][lane], kv_tmp[e], df);
       df = warp_sum(df);
-      pf[g] = __expf(__fmul_rn(__fmul_rn(df, kscale), scale) - s_M[g]);
+      float sf = __fmul_rn(__fmul_rn(df, kscale), scale);
+      if (rel.btab) sf = __fadd_rn(sf, rb[g]);
+      pf[g] = __expf(sf - s_M[g]);
     }
     if constexpr (FP8 && DPL == 8) {
       e4m3x4_to_float(vx8.x, kv_tmp);
       e4m3x4_to_float(vx8.y, kv_tmp + 4);
+    } else if constexpr (FP8 && DPL == 4) {
+      e4m3x4_to_float(vx4, kv_tmp);
     } else if constexpr (!FP8 && DPL == 8) {
       const uint32_t vw4[4] = {vx16.x, vx16.y, vx16.z, vx16.w};
 #pragma unroll
@@ -2134,7 +2192,9 @@ __global__ void __launch_bounds__(32 * kDeltaWarps, 12 / kDeltaWarps)
 #pragma unroll
       for (int e = 0; e < DPL; ++e) dc = __fmaf_rn(sm.q.qr[g][e][lane], kv_tmp[e], dc);
       dc = warp_sum(dc);
-      pc[g] = __expf(__fmul_rn(dc, scale) - s_M[g]);
+      float sc = __fmul_rn(dc, scale);
+      if (rel.btab) sc = __fadd_rn(sc, rb[g]);
+      pc[g] = __expf(sc - s_M[g]);
       dl[g] += pf[g] - pc[g];
     }
     {
@@ -2204,7 +2264,7 @@ template <int HD>
 __global__ void __launch_bounds__(HD)
     k_strata_finish(int nh, int nkv, const DevParams* P, const float* __restrict__ part, int slots, int used_cap,
                     const float* __restrict__ delta, int slices, const float* gate, int ld_gate, Out out, int ld_out,
-                    int from) {
+                    int from, RelStrata rel = {}) {
   pdl_trigger();
   __shared__ float sA[HD];
   __shared__ float s_w[128];
@@ -2214,8 +2274,9 @@ __global__ void __launch_bounds__(HD)
   const int total = P->position + r + 1, used = attn_split_used(total, used_cap);
   const float* dr = delta + (size_t(r) * nkv + kvh) * slices * G * (2 * HD + 1) + size_t(g) * (2 * HD + 1);
   const float* pr = part + (size_t(r) * nh + h) * slots * (HD + 2);
+  const float sk = rel.sink ? rel.sink[size_t(r) * rel.ld_sink + h] : -INFINITY;
   if (d < 32) {
-    float M = -INFINITY;
+    float M = sk;
     for (int s = d; s < used; s += 32) M = fmaxf(M, pr[s * (HD + 2)]);
 #pragma unroll
     for (int o = 16; o > 0; o >>= 1) M = fmaxf(M, __shfl_xor_sync(0xffffffffu, M, o));
@@ -2231,7 +2292,7 @@ __global__ void __launch_bounds__(HD)
   }
   __syncthreads();
   if (d == 0) {
-    float L = 0.f;
+    float L = rel.sink ? __expf(sk - M) : 0.f;
     if (M != -INFINITY) {
       for (int s = 0; s < used; ++s) {
         const float w = s < 128 ? s_w[s] : (pr[s * (HD + 2)] == -INFINITY ? 0.f : __expf(pr[s * (HD + 2)] - M));
@@ -2275,7 +2336,8 @@ void prefer_shared_scan_mma_cta() {
 template <int HD, int G, int BITS, bool Compact = false>
 void launch_strata(const float* q, KvRef kv, const StrataScratch& sc, int nh, int nkv, int rows, float scale,
                    const DevParams* P, const float* gate, int ld_gate, Out o, int ld_out, float* partial, int slots,
-                   cudaStream_t st, bool cores, int from, cudaEvent_t second_ready, const DevParams* P_hot) {
+                   cudaStream_t st, bool cores, int from, cudaEvent_t second_ready, const DevParams* P_hot,
+                   RelStrata rel) {
   k_strata_rotate_q<HD><<<dim3(rows, nh), HD, 0, st>>>(q, sc.qr);
   auto wait_for_copy = [&] {
     const cudaError_t status = cudaStreamWaitEvent(st, second_ready, 0);
@@ -2297,7 +2359,7 @@ void launch_strata(const float* q, KvRef kv, const StrataScratch& sc, int nh, in
           prefer_shared_scan_mma_cta<HD, BITS, W, Compact>();
           const int bx = (total_warps + W - 1) / W;
           k_strata_scan_mma_cta<HD, BITS, W, Compact><<<dim3(bx, nkv, count), 32 * W, 0, st>>>(
-              sc.qr, kv, nh, nkv, rows, scale, P, partial, sc.lse, sc.lse_stride, fs, ts);
+              sc.qr, kv, nh, nkv, rows, scale, P, partial, sc.lse, sc.lse_stride, fs, ts, rel);
         };
         if (total_warps == 2) run_packed(std::integral_constant<int, 2>{});
         else if (total_warps == 3 || total_warps % 3 == 0) run_packed(std::integral_constant<int, 3>{});
@@ -2306,12 +2368,12 @@ void launch_strata(const float* q, KvRef kv, const StrataScratch& sc, int nh, in
       }
     }
     k_strata_scan_mma<HD, BITS, Compact><<<dim3(total_warps, nkv, count), 32, 0, st>>>(
-        sc.qr, kv, nh, nkv, rows, scale, P, partial, sc.lse, sc.lse_stride, fs, ts);
+        sc.qr, kv, nh, nkv, rows, scale, P, partial, sc.lse, sc.lse_stride, fs, ts, rel);
   };
   if (cores) {  // the float32 scan (measurement): 64 splits measured slower than 32 (3.03 against 2.70 ms a step)
     splits = std::min(slots, kAttnCoresSplits);
     k_strata_scan<HD, G, BITS, Compact><<<dim3(rows, nkv, splits), 128, 0, st>>>(q, kv, nh, nkv, scale, P, partial, slots,
-                                                                         sc.lse, sc.lse_stride);
+                                                                         sc.lse, sc.lse_stride, rel);
   } else if (second_ready) {
     // Each block keeps the original split, key order and partial output slot. The first grid can read its
     // complete key ranges while DMA fills the remaining codes and grids.
@@ -2327,7 +2389,7 @@ void launch_strata(const float* q, KvRef kv, const StrataScratch& sc, int nh, in
   if (sc.lse) {
     k_strata_select_part<<<dim3(rows, nkv, sc.chunks), kSelPartThreads, 0, st>>>(
         partial, nh, nkv, G, HD, slots, splits, sc.lse, sc.lse_stride, sc.cand_key, sc.cand, sc.cand_n, sc.sel_stride, P,
-        sc.how);
+        sc.how, rel);
     k_strata_select<<<dim3(rows, nkv), kSelThreads, 0, st>>>(nkv, sc.cand_key, sc.cand, sc.cand_n, sc.chunks,
                                                               sc.gathered, sc.gathered_key, sc.sel, sc.sel_stride,
                                                               sc.sel_n, P, sc.how);
@@ -2365,7 +2427,8 @@ void launch_strata(const float* q, KvRef kv, const StrataScratch& sc, int nh, in
     }();
     (void)delta_fp8_carveout;
     k_strata_delta<HD, G, BITS, true, Compact><<<dg, 32 * kDeltaWarps, 0, st>>>(
-        q, sc.qr, kv, nh, nkv, scale, P, P_hot, partial, slots, splits, sc.sel, sc.sel_stride, sc.sel_n, sc.delta, pb);
+        q, sc.qr, kv, nh, nkv, scale, P, P_hot, partial, slots, splits, sc.sel, sc.sel_stride, sc.sel_n, sc.delta, rel,
+        pb);
   } else {
     static const bool delta_f16_carveout = [] {
       cudaFuncSetAttribute(k_strata_delta<HD, G, BITS, false, Compact>,
@@ -2374,31 +2437,32 @@ void launch_strata(const float* q, KvRef kv, const StrataScratch& sc, int nh, in
     }();
     (void)delta_f16_carveout;
     k_strata_delta<HD, G, BITS, false, Compact><<<dg, 32 * kDeltaWarps, 0, st>>>(
-        q, sc.qr, kv, nh, nkv, scale, P, P_hot, partial, slots, splits, sc.sel, sc.sel_stride, sc.sel_n, sc.delta, pb);
+        q, sc.qr, kv, nh, nkv, scale, P, P_hot, partial, slots, splits, sc.sel, sc.sel_stride, sc.sel_n, sc.delta, rel,
+        pb);
   }
   k_strata_finish<HD><<<dim3(rows, nh), HD, 0, st>>>(nh, nkv, P, partial, slots, splits, sc.delta, kStrataSlices,
-                                                      gate, ld_gate, o, ld_out, from);
+                                                      gate, ld_gate, o, ld_out, from, rel);
 }
 
 template <int HD, int G>
 bool by_bits(const float* q, KvRef kv, const StrataScratch& sc, int nh, int nkv, int rows, float scale,
              const DevParams* P, const float* gate, int ld_gate, Out o, int ld_out, float* partial, int slots,
-             cudaStream_t st, bool cores, int from, cudaEvent_t second_ready, const DevParams* P_hot) {
+             cudaStream_t st, bool cores, int from, cudaEvent_t second_ready, const DevParams* P_hot, RelStrata rel) {
   switch (kv.bits) {
     case 2: launch_strata<HD, G, 2>(q, kv, sc, nh, nkv, rows, scale, P, gate, ld_gate, o, ld_out, partial, slots, st,
-                                    cores, from, second_ready, P_hot);
+                                    cores, from, second_ready, P_hot, rel);
       return true;
     case 3:
       if constexpr (HD == 256) if (kv.words == 24) {
         launch_strata<HD, G, 3, true>(q, kv, sc, nh, nkv, rows, scale, P, gate, ld_gate, o, ld_out, partial, slots,
-                                      st, cores, from, second_ready, P_hot);
+                                      st, cores, from, second_ready, P_hot, rel);
         return true;
       }
       launch_strata<HD, G, 3>(q, kv, sc, nh, nkv, rows, scale, P, gate, ld_gate, o, ld_out, partial, slots, st,
-                                    cores, from, second_ready, P_hot);
+                                    cores, from, second_ready, P_hot, rel);
       return true;
     case 4: launch_strata<HD, G, 4>(q, kv, sc, nh, nkv, rows, scale, P, gate, ld_gate, o, ld_out, partial, slots, st,
-                                    cores, from, second_ready, P_hot);
+                                    cores, from, second_ready, P_hot, rel);
       return true;
     default: return false;
   }
@@ -2410,8 +2474,8 @@ bool strata_supported(int nh, int nkv, int hd, int bits) {
   if (nkv <= 0 || nh % nkv != 0 || bits < 2 || bits > 4) return false;
   const int g = nh / nkv;
   if (hd == 256) return g == 1 || g == 2 || g == 4 || g == 6 || g == 8;
-  if (hd == 128) return g == 1 || g == 2 || g == 4;
-  if (hd == 64 || hd == 32) return g == 1 || g == 2 || g == 4;
+  if (hd == 128) return g == 1 || g == 2 || g == 3 || g == 4;
+  if (hd == 64 || hd == 32) return g == 1 || g == 2 || g == 3 || g == 4;
   return false;
 }
 
@@ -2422,17 +2486,17 @@ int strata_words(int hd, int bits) {  // codes of a position and head, in 32-bit
 void attention_strata(const float* q, KvRef kv, const StrataScratch& sc, int nh, int nkv, int hd, int rows,
                       float scale, const DevParams* P, const float* gate, int ld_gate, float* out, int ld_out,
                       float* partial, int slots, const Launch& L, int from, cudaEvent_t second_ready,
-                      const DevParams* P_hot) {
+                      const DevParams* P_hot, RelStrata rel) {
   const DevParams* hot_P = P_hot ? P_hot : P;
   const Out o = out ? Out{out, nullptr, nullptr} : split_out(L, rows, nh * hd);
   const int g = nh / nkv;
   bool ok = false;
 #define FLYX_STRATA(HD_, G_) \
   if (hd == HD_ && g == G_) ok = by_bits<HD_, G_>(q, kv, sc, nh, nkv, rows, scale, P, gate, ld_gate, o, ld_out, partial, slots, L.st, \
-                                    !opts(L).strata_mma, from, second_ready, hot_P);
-  FLYX_STRATA(32, 1) FLYX_STRATA(32, 2) FLYX_STRATA(32, 4)
-  FLYX_STRATA(64, 1) FLYX_STRATA(64, 2) FLYX_STRATA(64, 4)
-  FLYX_STRATA(128, 1) FLYX_STRATA(128, 2) FLYX_STRATA(128, 4)
+                                    !opts(L).strata_mma, from, second_ready, hot_P, rel);
+  FLYX_STRATA(32, 1) FLYX_STRATA(32, 2) FLYX_STRATA(32, 3) FLYX_STRATA(32, 4)
+  FLYX_STRATA(64, 1) FLYX_STRATA(64, 2) FLYX_STRATA(64, 3) FLYX_STRATA(64, 4)
+  FLYX_STRATA(128, 1) FLYX_STRATA(128, 2) FLYX_STRATA(128, 3) FLYX_STRATA(128, 4)
   FLYX_STRATA(256, 1) FLYX_STRATA(256, 2) FLYX_STRATA(256, 4) FLYX_STRATA(256, 6) FLYX_STRATA(256, 8)
 #undef FLYX_STRATA
   if (!ok)  // the backend refuses other shapes at load (strata_supported)

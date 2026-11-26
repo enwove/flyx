@@ -2,6 +2,10 @@
 // Every CUDA kernel against the float64 reference ops (ops/ops.h).
 //
 //   cuda_op_test            run all checks, exit 1 on any failure
+//   cuda_op_test --filter attn_res_mix              AttnRes mixes (standalone)
+//   cuda_op_test --filter shortconv_res_mix_norm    fused sublayer boundaries
+//   cuda_op_test --filter inkling2_rel_attn         relative attention and its K/V preparation
+//   cuda_op_test --filter inkling2_moe              MoE routing, expert GEMMs and their dp4a configurations
 //
 // Inputs are random; weights and caches go through bf16 on both sides, so
 // the remaining difference is float32 arithmetic (and bf16 activations in the
@@ -12,7 +16,31 @@
 
 using namespace flyx::optest;
 
-int main() {
+namespace {
+void test_rel_attention() {
+  test_inkling2_rel_prep_kv_sc();
+  test_inkling2_rel_attn();
+}
+
+int report_result() {
+  std::printf("%s (%d failures)\n", g_fail ? "FAILED" : "PASSED", g_fail);
+  return g_fail ? 1 : 0;
+}
+}  // namespace
+
+int main(int argc, char** argv) {
+  void (*filtered_test)() = nullptr;
+  if (argc == 3 && std::strcmp(argv[1], "--filter") == 0) {
+    if (std::strcmp(argv[2], "attn_res_mix") == 0) filtered_test = test_inkling2_attn_res;
+    if (std::strcmp(argv[2], "shortconv_res_mix_norm") == 0) filtered_test = test_inkling2_sublayer_fusion;
+    if (std::strcmp(argv[2], "inkling2_rel_attn") == 0) filtered_test = test_rel_attention;
+    if (std::strcmp(argv[2], "inkling2_moe") == 0) filtered_test = test_inkling2_moe;
+  }
+  if (argc != 1 && !filtered_test) {
+    std::fprintf(stderr,
+                 "usage: cuda_op_test [--filter attn_res_mix|shortconv_res_mix_norm|inkling2_rel_attn|inkling2_moe]\n");
+    return 2;
+  }
   // A nonfinite element between two matching ones must not disappear in the max-error reduction.
   const Vec finite{1., 2., 3.};
   for (double bad : {std::nan(""), std::numeric_limits<double>::infinity(), -std::numeric_limits<double>::infinity()}) {
@@ -29,8 +57,9 @@ int main() {
     return 2;
   }
   {  // scratch for every GEMM input the tests stage (prefill rows up to 1024, K up to 16384)
-    const size_t bytes = scratch_bytes(1024, 16384);
-    static Scratch sc = scratch_in(dev<unsigned char>(bytes), bytes, 1024, 16384);
+    const int rows = filtered_test ? 16 : 1024, width = filtered_test ? 5120 : 16384;
+    const size_t bytes = scratch_bytes(rows, width, !filtered_test);
+    static Scratch sc = scratch_in(dev<unsigned char>(bytes), bytes, rows, width, !filtered_test);
     TL.scratch = &sc;
   }
   cudaDeviceProp p{};
@@ -40,6 +69,10 @@ int main() {
   std::printf("a release build (FLYX_TUNE_CANDIDATES off): the GEMM configurations no tuning table gives on this GPU "
               "are not compiled, and the tests of every configuration skip them\n");
 #endif
+  if (filtered_test) {
+    filtered_test();
+    return report_result();
+  }
   test_gemm();
   test_gemm_round();
   test_gemm_draft_tables();
@@ -109,6 +142,7 @@ int main() {
   test_strata(256, 16, 4, 15, 114, 4, false);  // 115..129 keys: every row but the last ends past the last one's 96
   test_strata(32, 4, 2, 5, 125, 2, true);      // the tiny model's, 126..130 keys
   test_pageable_kv_ops();
+  test_ring_publish();
   // Every head dim the kernels take (the backend loads no other): decode, a prefill chunk on the tensor cores, and
   // the same with an FP8 cache.
   for (int hd = 32; hd <= 256; hd += 32)
@@ -168,6 +202,16 @@ int main() {
   test_vision_avg_pool();
   test_embed_scatter();
   test_mrope();
-  std::printf("%s (%d failures)\n", g_fail ? "FAILED" : "PASSED", g_fail);
-  return g_fail ? 1 : 0;
+  test_inkling2_softcap();
+  test_inkling2_attn_res();
+  test_inkling2_loop_ctrl();
+  test_inkling2_loop_control();
+  test_inkling2_linear_f32();
+  test_inkling2_shortconv();
+  test_inkling2_sublayer_fusion();
+  test_rel_attention();
+  test_inkling2_rel_strata();
+  test_inkling2_moe();
+  test_dspark();
+  return report_result();
 }

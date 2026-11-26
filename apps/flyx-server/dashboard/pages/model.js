@@ -77,7 +77,7 @@ function FitTag({ size }) {
   return html`<span class=${"tag2 " + (fits ? "ok" : "bad")} title=${t(title)}>${t(fits ? "fits" : "too big")}</span>`;
 }
 
-const drafterLabel = (k) => k === "mtp" ? "MTP" : k === "dflash2" ? "DFlash2" : k;
+const drafterLabel = (k) => k === "mtp" ? "MTP" : k === "dflash2" ? "DFlash2" : k === "dspark" ? "DSpark" : k;
 
 // What is served and its state, its facts, a fetch's or a load's progress, an error.  With nothing
 // served it is the view's whole content: `again` loads the model the server remembers, `browse` shows the library.
@@ -162,9 +162,9 @@ function Serving({ tm, again, retry, browse }) {
     </div>`;
 }
 
-// A drafter given as a GGUF is a DFlash2 or MTP file; anything else a DFlash2 drafter.
-const kindOf = (d) => /\.gguf$/i.test(d)
-  ? (/(?:^|[\\/:-])dflash2?(?:[\\/._-]|$)/i.test(d) ? "dflash2" : "mtp")
+// A drafter given as a GGUF is a DSpark, DFlash2, or MTP file; anything else a DFlash2 drafter.
+const kindOf = (d) => /(?:^|[\\/:-])dspark(?:[\\/._-]|$)/i.test(d) ? "dspark"
+  : /\.gguf$/i.test(d) ? (/(?:^|[\\/:-])dflash2?(?:[\\/._-]|$)/i.test(d) ? "dflash2" : "mtp")
   : "dflash2";
 const normVisionDev = (v) => (v === "host" || v === "cpu") ? "host" : v === "gpu" ? "gpu" : v === "auto" ? "auto" : "disk";
 const normVisionQuant = (v) => (v === "exact" || v === "bf16") ? "exact" : (v === "nvfp4" || v === "fp4") ? "nvfp4" : "q8";
@@ -632,7 +632,7 @@ export function ModelPage({ active, libraryAsked, currentAsked }) {
   // its default; else what a model brings along.
   function defaultDrafter() {
     if (loadedWant && loadedWant.speculative !== false && !loadedWant.drafter && !loadedWant.drafters?.length) {
-      const list = draftersOf(L).map((d) => (d.kind === "mtp" ? "MTP" : d.kind === "dflash2" ? "DFlash2" : d.kind) + " · " +
+      const list = draftersOf(L).map((d) => drafterLabel(d.kind) + " · " +
         (d.from === "model file" ? t("the model file's own layer") : t("from " + d.from + (d.size ? " (" + gb(d.size) + " GB)" : ""))));
       if (!list.length && model.drafter) list.push(model.drafter.toUpperCase() + " · " + t("the model file's own layer"));
       return list.length ? { tag: "in use", tone: "ok", lines: list } : { tag: "none", tone: "", lines: [t("This model loaded no drafter: plain decoding.")] };
@@ -877,7 +877,7 @@ export function ModelPage({ active, libraryAsked, currentAsked }) {
     const renderRow = (c, sel, onToggle) => {
       const isMm = c.kind === "mmproj";
       const kindTag = isMm ? ["mmproj", "info"]
-                    : c.kind === "dflash2" ? ["DFlash2", "ok"] : c.kind === "mtp" ? ["MTP", "ok"] : ["drafter", "ok"];
+                    : c.kind === "dflash2" ? ["DFlash2", "ok"] : c.kind === "dspark" ? ["DSpark", "ok"] : c.kind === "mtp" ? ["MTP", "ok"] : ["drafter", "ok"];
       const sub = c.path && c.path !== c.file ? c.path : "";
       return html`
         <div class=${"mrow comp" + (sel ? " sel" : "")} data-comp=${c.key} data-kind=${c.kind} role="option" aria-selected=${String(sel)}
@@ -1201,7 +1201,8 @@ export function ModelPage({ active, libraryAsked, currentAsked }) {
   // One model of the list: what it is, where its file is, and the box that loads it.
   function modelDetail(m) {
     const d = describe(m), hubModel = m.source === "hub", drafter = m.kind === "drafter", mmproj = m.kind === "mmproj";
-    const chips = [[t(kindOfModel(m)), ""]];
+    const isDrafterFile = drafter && /\.(gguf|flyx)$/i.test(m.path || m.file || "");
+    const chips = [[drafter && m.drafter_kind ? drafterLabel(m.drafter_kind) : t(kindOfModel(m)), drafter ? "ok" : mmproj ? "info" : ""]];
     if (d.quant) chips.push([d.quant, ""]);
     if (m.mtp === "in-file") chips.push([t("MTP inside"), "ok"]); else if (m.mtp === "in-repo") chips.push([t("+ MTP file"), "ok"]);
     if (m.mmproj === "in-repo") chips.push([t("+ Vision"), "ok"]);
@@ -1220,7 +1221,7 @@ export function ModelPage({ active, libraryAsked, currentAsked }) {
         <div class="dh">
           <div class="dh-icon"><${Icon} name=${iconOfModel(m)}/></div>
           <div class="dh-t"><h3 id="lc-name">${titleOf(m)}</h3><span>${hubModel ? (d.repo || "").split("/")[0] : folderOf(m)}</span></div>
-          ${hubModel && !drafter && !mmproj ? html`<button class="btn ghost sm" id="lc-quants" onClick=${() => { setTab("hub"); showRepo(d.repo, ""); }}>${t("All its quantizations")}</button>` : ""}
+          ${hubModel && d.repo && ((!drafter && !mmproj) || (drafter && d.quant)) ? html`<button class="btn ghost sm" id="lc-quants" onClick=${() => { setTab("hub"); showRepo(d.repo, ""); }}>${t("All its quantizations")}</button>` : ""}
           ${hubModel ? html`<button class="btn ghost sm" id="lc-delete" onClick=${() => removeCached(m)}><${Icon} name="trash"/>${t("Delete")}</button>` : ""}
         </div>
         <div class="dchips">${chips.map(([text, tone]) => html`<span class=${"tag2 " + tone}>${text}</span>`)}${drafter || mmproj ? "" : html`<${FitTag} size=${m.size}/>`}</div>
@@ -1230,7 +1231,7 @@ export function ModelPage({ active, libraryAsked, currentAsked }) {
           ${hubModel && d.repo ? html`<div><dt>${t("Repository")}</dt><dd>${d.repo}</dd></div>` : ""}
           ${m.revision ? html`<div><dt>${t("Revision")}</dt><dd>${String(m.revision).slice(0, 8)}</dd></div>` : ""}
         </dl>
-        <div class="dsec">${t(m.kind === "drafter" ? "Folder" : "File")}</div>
+        <div class="dsec">${t(drafter && !isDrafterFile ? "Folder" : "File")}</div>
         <${CodeSnippet} id="lc-path" text=${m.path || m.name}/>
         ${drafter ? html`<div class="banner hint"><div class="grow2">${t(m.name + " is a drafter (" + gb(m.size) + " GB), not a model: it drafts for one, and is not loaded on its own.")}</div></div>` : ""}
         ${mmproj ? html`<div class="banner hint"><div class="grow2">${t(m.file + " is a vision projector (" + gb(m.size) + " GB), not a standalone model: attach it to a compatible VLM.")}</div></div>` : ""}
@@ -1258,17 +1259,18 @@ export function ModelPage({ active, libraryAsked, currentAsked }) {
       const rows = [];
       const body = groups.map(([name, all]) => {
         const list = all.slice().sort((x, y) => (x.size || 0) - (y.size || 0));
-        const mine = list.filter((m) => m.kind !== "drafter" && m.kind !== "mmproj").map(localRow), drafter = list.find((m) => m.kind === "drafter");
+        const mine = list.filter((m) => m.kind !== "drafter" && m.kind !== "mmproj").map(localRow);
+        const drafters = list.filter((m) => m.kind === "drafter");
         rows.push(...mine);
         return html`
           <div class="rgroup" data-repo=${name}>
             <div class="rgroup-h"><b>${name}</b><span>${sized(sum(list))}</span><span class="grow"></span>
-              ${mine.length ? html`<button class="btn ghost sm" onClick=${() => { setTab("hub"); showRepo(name, ""); }}>${t("All its quantizations")}</button>` : ""}
+              ${mine.length || drafters.some((d) => !!d.quant) ? html`<button class="btn ghost sm" onClick=${() => { setTab("hub"); showRepo(name, ""); }}>${t("All its quantizations")}</button>` : ""}
               <button class="iconbtn del" title=${t("Delete from the Hugging Face cache")} aria-label=${t("Delete")}
                       onClick=${() => removeRepo(name, all)}><${Icon} name="trash"/></button></div>
             ${mine.length ? html`<div class="mrows" role="listbox">${rowsView(mine)}</div>` : ""}
-            ${drafter ? html`<div class="banner hint"><div class="grow2">${t(name + " is a drafter (" + gb(drafter.size) + " GB), not a model: it drafts for one, and is not loaded on its own.")}</div>
-              ${model.id ? html`<button class="btn sm" onClick=${() => draftWith(drafter.name)}>${t("Draft with it")}</button>` : ""}</div>` : ""}
+            ${drafters.map((dr) => html`<div class="banner hint"><div class="grow2">${t(dr.name + " is a drafter (" + gb(dr.size) + " GB), not a model: it drafts for one, and is not loaded on its own.")}</div>
+              ${model.id ? html`<button class="btn sm" onClick=${() => draftWith(dr.name)}>${t("Draft with it")}</button>` : ""}</div>`)}
           </div>`;
       });
       return html`
@@ -1293,7 +1295,7 @@ export function ModelPage({ active, libraryAsked, currentAsked }) {
     const localComps = [
       ...folderDrafters.map((m) => ({
         key: m.path || m.name, spec: m.path || m.name, file: m.file, path: relOf(m),
-        kind: kindOf(m.file || m.name), size: m.size, cached: true, default: false,
+        kind: m.drafter_kind || kindOf(m.file || m.name), size: m.size, cached: true, default: false,
       })),
       ...folderMmproj.map((m) => ({
         key: m.path || m.name, spec: m.path || m.name, file: m.file, path: relOf(m),

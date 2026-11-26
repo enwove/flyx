@@ -54,6 +54,8 @@ struct RefModel {
   std::unordered_set<const flyx_tensor_view*> a4;    // NVFP4 weights whose inputs are NVFP4 in those passes
   mutable std::unordered_map<int, Vec> cache;
   int dflash = -1;  // the DFlash2 drafter block, -1: none
+  int dspark = -1;  // the DSpark drafter block, -1: none
+  int dflash_tap_off = 0, dspark_tap_off = 0, total_taps = 0;
   int ring_width = 0;
   // Every residual add of the stack a weight with NVFP4 inputs and the embedding a bf16 table: the engine keeps a
   // prefill pass's residual in bf16 (as vLLM, SGLang and basalt do), each sum in float32 then rounded.
@@ -114,6 +116,22 @@ void lin(const RefModel* M, int wi, const double* x, int rows, int K, int N, dou
   else flyx::ops::linear(x, rows, K, w, N, y);
 }
 
+// Single-row linear against expert `e` of a 3D weight [E, N, K] decoded to FLYX_DT_F64, with the same input rounding.
+void lin_expert(const RefModel* M, int wi, int e, const double* x, int K, int N, double* y, int gemm_rows) {
+  const flyx_tensor_view* w = M->w(wi);
+  flyx_tensor_view slice = *w;
+  slice.ndim = 2;
+  slice.shape[0] = N;
+  slice.shape[1] = K;
+  slice.data = static_cast<const double*>(w->data) + size_t(e) * size_t(N) * size_t(K);
+  slice.nbytes = uint64_t(N) * uint64_t(K) * sizeof(double);
+  if (M->q8.count(w)) flyx::ops::linear_a8(x, 1, K, &slice, N, y);
+  else if (gemm_rows > FLYX_MAX_ROWS && M->a4.count(w)) flyx::ops::linear_a4(x, 1, K, &slice, N, y);
+  else if (M->a16h.count(w)) flyx::ops::linear_a16h(x, 1, K, &slice, N, y);
+  else if (M->a16.count(w)) flyx::ops::linear_a16(x, 1, K, &slice, N, y);
+  else flyx::ops::linear(x, 1, K, &slice, N, y);
+}
+
 // A linear's adapter (ABI 43, flyx_lora; rank 0: none): y += scale b (a x) over the same rows, in float64.
 void lora(const RefModel* M, const flyx_lora& l, const double* x, int rows, int K, int N, double* y) {
   if (l.rank > 0) flyx::ops::linear_lora(x, rows, K, M->w(l.a), M->w(l.b), l.rank, l.scale, N, y);
@@ -166,10 +184,12 @@ struct RefPlan {
 // Per state of the description (empty where the state is of another kind).
 struct Slot {
   std::vector<Vec> S, conv;                  // GDN
+  std::vector<Vec> sc;                       // SHORTCONV: [(conv - 1) * channels]
   bool replay_valid = false;                 // replay below describes the round that started here
   int start_pos = 0, rows = 0;               // committed rows of that round
   int rope_delta = 0;                        // decode rope_delta when this round ran
   std::vector<Vec> k, v, beta, g, mixed;     // GDN, [max_rows * ...]
+  std::vector<Vec> sc_in;                    // SHORTCONV, [rows * channels]
 };
 
 struct Ckpt {
@@ -177,14 +197,15 @@ struct Ckpt {
   int pos = 0;
   int rope_delta = 0;
   std::vector<Vec> S, conv;
-  Vec ring_h;  // the ring's vector at pos - 1 (the MTP drafter's next input)
+  std::vector<Vec> sc;
+  Vec ring_h;  // the ring's vector at pos - 1 (the MTP / DSpark drafter's next input)
 };
 
 struct RefSeq {
   RefModel* m;
   int max_ctx;
   std::vector<std::vector<Vec>> K, V;  // per KV state: per layer, by position
-  Vec hidden_at;                       // the ring: normalised target hidden by position (MTP input)
+  Vec hidden_at;                       // the ring: per-position vector (MTP hidden or DSpark f_rnn)
   Slot slot[FLYX_ROUND_SLOTS];
   Ckpt ck[FLYX_CHECKPOINTS];
   int position = 0, anchor = 0, round = 0;
@@ -206,6 +227,9 @@ struct RefSeq {
   std::unordered_map<int, const float*> embed_override;
   const int32_t* pos_3d = nullptr;
   Vec x, feats;
+  // Pass-local depth-residual and looped-pass scratch (ABI 45).
+  std::vector<Vec> res_bank, prelude_blocks, loop_bank;
+  Vec prelude_cur, loop_bank_out, loop_msg;
   int last_n = 0, last_slot = 0;
 };
 
@@ -220,13 +244,18 @@ void reset_state(RefSeq* s) {
   for (auto& sl : s->slot) {
     sl.S.assign(states.size(), {});
     sl.conv.assign(states.size(), {});
+    sl.sc.assign(states.size(), {});
     sl.replay_valid = false;
-    for (size_t i = 0; i < states.size(); ++i)
+    for (size_t i = 0; i < states.size(); ++i) {
       if (states[i].kind == FLYX_STATE_GDN) {
         const auto& g = states[i];
         sl.S[i].assign(size_t(g.nv) * g.dv * g.dk, 0.0);
         sl.conv[i].assign(size_t(g.conv - 1) * cdim_of(g), 0.0);
+      } else if (states[i].kind == FLYX_STATE_SHORTCONV) {
+        const auto& sc = states[i];
+        sl.sc[i].assign(size_t(sc.conv - 1) * size_t(sc.channels), 0.0);
       }
+    }
   }
   s->position = 0;
   s->round = 0;
@@ -240,11 +269,13 @@ void embed_rows(RefSeq* s, const flyx_embed_block& e, const int32_t* ids, int n,
   const int H = e.hidden;
   x->assign(size_t(n) * H, 0.0);
   for (int r = 0; r < n; ++r) {
+    double* row = &(*x)[size_t(r) * H];
     auto ov = s->embed_override.find(r);
     if (ov != s->embed_override.end()) {
-      for (int c = 0; c < H; ++c) (*x)[size_t(r) * H + c] = double(ov->second[c]);
+      for (int c = 0; c < H; ++c) row[c] = double(ov->second[c]);
     } else {
-      for (int c = 0; c < H; ++c) (*x)[size_t(r) * H + c] = load(E, size_t(ids[r]) * H + c);
+      for (int c = 0; c < H; ++c) row[c] = load(E, size_t(ids[r]) * H + c);
+      if (e.has_norm) norm(s->m, e.norm, row, H, row);
     }
   }
 }
@@ -389,6 +420,216 @@ void mlp(const RefModel* M, const flyx_mlp_block& B, double* x, int R) {
   }
 }
 
+// Depth-wise attention over `bank` blocks plus `cur` (each [R, H]) for `nq` queries [nq, H]; out is [R, nq, H].
+void mix_bank(const std::vector<Vec>& bank, const Vec& cur, const double* queries, int nq, int R, int H, Vec* out) {
+  Vec res(size_t(R) * size_t(nq) * size_t(H), 0.0);
+  const int nb = int(bank.size());
+  std::vector<const double*> ptrs(static_cast<size_t>(nb));
+  for (int r = 0; r < R; ++r) {
+    for (int b = 0; b < nb; ++b) ptrs[size_t(b)] = bank[size_t(b)].data() + size_t(r) * size_t(H);
+    attn_res_mix(ptrs.data(), nb, cur.data() + size_t(r) * size_t(H), queries, nq, H,
+                 res.data() + size_t(r) * size_t(nq) * size_t(H));
+  }
+  *out = std::move(res);
+}
+
+// Run one causal shortconv slice inside FLYX_STATE_SHORTCONV state L at channel offset `off` (length `len`).
+// In prefill (!verify), advances sl.sc[L] in place; in a round (verify), records inputs in sl.sc_in[L].
+void run_shortconv_slice(RefSeq* s, int L, int off, int len, int conv, int n_heads, const double* in, int w_idx,
+                         const double* dyn, bool verify, Vec* out) {
+  const int R = s->rows;
+  const int C_tot = s->m->states[size_t(L)].channels;
+  const int hist = conv - 1;
+  Slot& sl = s->slot[cur_slot(s)];
+  Vec sub_st(size_t(hist) * size_t(len), 0.0);
+  for (int k = 0; k < hist; ++k)
+    std::copy_n(sl.sc[size_t(L)].data() + size_t(k) * size_t(C_tot) + size_t(off), len,
+                sub_st.data() + size_t(k) * size_t(len));
+  const Vec& w = s->m->vec(w_idx);
+  out->assign(size_t(R) * size_t(len), 0.0);
+  shortconv(in, w.data(), dyn, sub_st.data(), R, len, conv, n_heads, out->data());
+  if (!verify) {
+    for (int k = 0; k < hist; ++k)
+      std::copy_n(sub_st.data() + size_t(k) * size_t(len), len,
+                  sl.sc[size_t(L)].data() + size_t(k) * size_t(C_tot) + size_t(off));
+  } else {
+    for (int r = 0; r < R; ++r)
+      std::copy_n(in + size_t(r) * size_t(len), len,
+                  sl.sc_in[size_t(L)].data() + size_t(r) * size_t(C_tot) + size_t(off));
+  }
+}
+
+void rel_attn_mixer(RefSeq* s, const flyx_rel_attn_block& B, bool verify) {
+  const auto* M = s->m;
+  const int H = B.hidden, nh = B.n_heads, nkv = B.n_kv, hd = B.head_dim, R = s->rows;
+  const int q_dim = nh * hd, kv_dim = nkv * hd, dr = B.d_rel;
+  const bool is_swa = B.window > 0;
+  const int Lsc = B.sconv;
+  if (verify) {
+    Slot& sl = s->slot[cur_slot(s)];
+    sl.sc_in[size_t(Lsc)].assign(size_t(R) * size_t(M->states[size_t(Lsc)].channels), 0.0);
+  }
+  const Vec inpSA = s->x;
+  if (B.loop_msg_query >= 0) {
+    const Vec& mq = M->vec(B.loop_msg_query);
+    mix_bank(s->loop_bank, s->loop_bank_out, mq.data(), 4, R, H, &s->loop_msg);
+  }
+  Vec inputs[3] = {inpSA, inpSA, inpSA};
+  if (B.res_query >= 0) {
+    const Vec& rq = M->vec(B.res_query);
+    const int nq = is_swa ? 1 : 3;
+    Vec mixed;
+    mix_bank(s->res_bank, inpSA, rq.data(), nq, R, H, &mixed);
+    if (is_swa) {
+      inputs[0] = inputs[1] = inputs[2] = std::move(mixed);
+    } else {
+      for (int j = 0; j < 3; ++j) {
+        inputs[j].resize(size_t(R) * size_t(H));
+        for (int r = 0; r < R; ++r)
+          std::copy_n(mixed.data() + (size_t(r) * 3 + size_t(j)) * size_t(H), H,
+                      inputs[j].data() + size_t(r) * size_t(H));
+      }
+    }
+  }
+  if (B.loop_rank > 0) {
+    Vec msg_j(size_t(R) * size_t(H)), out_j(size_t(R) * size_t(H));
+    for (int j = 0; j < 3; ++j) {
+      for (int r = 0; r < R; ++r)
+        std::copy_n(s->loop_msg.data() + (size_t(r) * 4 + size_t(j)) * size_t(H), H,
+                    msg_j.data() + size_t(r) * size_t(H));
+      loop_control(inputs[j].data(), msg_j.data(), R, H, B.loop_rank, M->w(B.loop_ctrl_down[j]),
+                   M->w(B.loop_ctrl_gain[j]), M->w(B.loop_ctrl_forget[j]), out_j.data());
+      inputs[j] = out_j;
+    }
+  }
+  const flyx_norm in_norms[3] = {B.q_norm_in, B.k_norm_in, B.v_norm_in};
+  for (int j = 0; j < 3; ++j)
+    for (int r = 0; r < R; ++r)
+      norm(M, in_norms[j], inputs[j].data() + size_t(r) * size_t(H), H, inputs[j].data() + size_t(r) * size_t(H));
+
+  Vec q(size_t(R) * size_t(q_dim)), k_raw(size_t(R) * size_t(kv_dim)), v_raw(size_t(R) * size_t(kv_dim));
+  Vec rel_q(size_t(R) * size_t(nh) * size_t(dr)), sink(size_t(R) * size_t(nh)), gate(size_t(R) * size_t(q_dim));
+  lin(M, B.q, inputs[0].data(), R, H, q_dim, q.data(), R);
+  lin(M, B.k, inputs[1].data(), R, H, kv_dim, k_raw.data(), R);
+  lin(M, B.v, inputs[2].data(), R, H, kv_dim, v_raw.data(), R);
+  lin(M, B.rel, inputs[0].data(), R, H, nh * dr, rel_q.data(), R);
+  lin(M, B.sink_proj, inputs[0].data(), R, H, nh, sink.data(), R);
+  lin(M, B.gate, inputs[0].data(), R, H, q_dim, gate.data(), R);
+
+  Vec k_dyn, v_dyn;
+  if (B.k_conv_proj >= 0) {
+    k_dyn.assign(size_t(R) * size_t(nkv) * size_t(B.conv), 0.0);
+    v_dyn.assign(size_t(R) * size_t(nkv) * size_t(B.conv), 0.0);
+    lin(M, B.k_conv_proj, inputs[1].data(), R, H, nkv * B.conv, k_dyn.data(), R);
+    lin(M, B.v_conv_proj, inputs[2].data(), R, H, nkv * B.conv, v_dyn.data(), R);
+  }
+  Vec k_conv, v_conv;
+  run_shortconv_slice(s, Lsc, 0, kv_dim, B.conv, nkv, k_raw.data(), B.k_conv,
+                      k_dyn.empty() ? nullptr : k_dyn.data(), verify, &k_conv);
+  run_shortconv_slice(s, Lsc, kv_dim, kv_dim, B.conv, nkv, v_raw.data(), B.v_conv,
+                      v_dyn.empty() ? nullptr : v_dyn.data(), verify, &v_conv);
+
+  const Vec& q_clip_w = M->vec(B.q_clip_w);
+  const Vec& rel_clip_w = M->vec(B.rel_clip_w);
+  const Vec& rel_bias = M->vec(B.rel_bias);
+  Vec& KC = s->K[size_t(B.kv)][0];
+  Vec& VC = s->V[size_t(B.kv)][0];
+  Vec tmp_q(static_cast<size_t>(hd)), tmp_r(static_cast<size_t>(dr));
+  for (int r = 0; r < R; ++r) {
+    const int pos = s->start + r;
+    const double tau = is_swa ? 1.0 : log_pos_scale(pos, B.log_scale_floor, B.log_scale_alpha);
+    for (int hh = 0; hh < nh; ++hh) {
+      double* qp = &q[(size_t(r) * size_t(nh) + size_t(hh)) * size_t(hd)];
+      l2_clip(qp, &q_clip_w[size_t(hh) * size_t(hd)], hd, B.qk_clip, tmp_q.data());
+      for (int i = 0; i < hd; ++i) qp[i] = tmp_q[size_t(i)] * tau;
+      double* rp = &rel_q[(size_t(r) * size_t(nh) + size_t(hh)) * size_t(dr)];
+      l2_clip(rp, &rel_clip_w[size_t(hh) * size_t(dr)], dr, B.rel_clip, tmp_r.data());
+      for (int i = 0; i < dr; ++i) rp[i] = tmp_r[size_t(i)] * tau;
+    }
+    for (int kh = 0; kh < nkv; ++kh) {
+      l2_clip(&k_conv[(size_t(r) * size_t(nkv) + size_t(kh)) * size_t(hd)], nullptr, hd, B.qk_clip,
+              &KC[(size_t(pos) * size_t(nkv) + size_t(kh)) * size_t(hd)]);
+      rmsnorm(&v_conv[(size_t(r) * size_t(nkv) + size_t(kh)) * size_t(hd)], nullptr, hd, B.eps, 0.0,
+              &VC[(size_t(pos) * size_t(nkv) + size_t(kh)) * size_t(hd)]);
+    }
+  }
+  Vec o(size_t(R) * size_t(q_dim), 0.0);
+  const double scale = 1.0 / std::sqrt(double(hd));
+  for (int r = 0; r < R; ++r) {
+    const int pos = s->start + r;
+    for (int hh = 0; hh < nh; ++hh) {
+      attend_rel(&q[(size_t(r) * size_t(nh) + size_t(hh)) * size_t(hd)],
+                 &rel_q[(size_t(r) * size_t(nh) + size_t(hh)) * size_t(dr)], KC.data(), VC.data(), rel_bias.data(),
+                 sink[size_t(r) * size_t(nh) + size_t(hh)], pos, B.window, nkv, hd, dr, B.rel_extent,
+                 hh / (nh / nkv), scale, &o[(size_t(r) * size_t(nh) + size_t(hh)) * size_t(hd)]);
+    }
+  }
+  for (size_t i = 0; i < o.size(); ++i) o[i] *= sigmoid(gate[i]);
+  Vec ao(size_t(R) * size_t(H));
+  lin(M, B.o, o.data(), R, q_dim, H, ao.data(), R);
+  Vec attn_out;
+  run_shortconv_slice(s, Lsc, 2 * kv_dim, H, B.conv, 0, ao.data(), B.post_conv, nullptr, verify, &attn_out);
+  if (B.res_push) {
+    s->res_bank.push_back(inpSA);
+    s->x = std::move(attn_out);
+  } else {
+    for (size_t i = 0; i < s->x.size(); ++i) s->x[i] = inpSA[i] + attn_out[i];
+  }
+}
+
+void moe_ffn(RefSeq* s, const flyx_moe_block& B, bool verify) {
+  const auto* M = s->m;
+  const int H = B.hidden, I = B.inter, E = B.n_experts, K = B.top_k, R = s->rows;
+  const Vec ffn_inp = s->x;
+  Vec cur = ffn_inp;
+  if (B.res_query >= 0) {
+    const Vec& rq = M->vec(B.res_query);
+    mix_bank(s->res_bank, cur, rq.data(), 1, R, H, &cur);
+  }
+  if (B.loop_rank > 0) {
+    Vec msg(size_t(R) * size_t(H)), out_c(size_t(R) * size_t(H));
+    for (int r = 0; r < R; ++r)
+      std::copy_n(s->loop_msg.data() + (size_t(r) * 4 + 3) * size_t(H), H, msg.data() + size_t(r) * size_t(H));
+    loop_control(cur.data(), msg.data(), R, H, B.loop_rank, M->w(B.loop_ctrl_down), M->w(B.loop_ctrl_gain),
+                 M->w(B.loop_ctrl_forget), out_c.data());
+    cur = std::move(out_c);
+  }
+  Vec h(size_t(R) * size_t(H));
+  for (int r = 0; r < R; ++r)
+    norm(M, B.norm, cur.data() + size_t(r) * size_t(H), H, h.data() + size_t(r) * size_t(H));
+  Vec r_logits(size_t(R) * size_t(E));
+  lin(M, B.router, h.data(), R, H, E, r_logits.data(), R);
+  const double* r_bias = B.router_bias >= 0 ? M->vec(B.router_bias).data() : nullptr;
+
+  Vec moe_raw(size_t(R) * size_t(H), 0.0);
+  Vec gu(static_cast<size_t>(2 * I)), act(static_cast<size_t>(I)), down_out(static_cast<size_t>(H));
+  std::vector<int32_t> eidx(static_cast<size_t>(K));
+  Vec ew(static_cast<size_t>(K));
+  for (int r = 0; r < R; ++r) {
+    moe_route(&r_logits[size_t(r) * size_t(E)], r_bias, E, K, B.gating != 0, B.norm_weights != 0, B.norm_eps,
+              B.route_scale, eidx.data(), ew.data());
+    double* dst = &moe_raw[size_t(r) * size_t(H)];
+    const double* hr = &h[size_t(r) * size_t(H)];
+    for (int k = 0; k < K; ++k) {
+      lin_expert(M, B.gate_up, eidx[size_t(k)], hr, H, 2 * I, gu.data(), R);
+      for (int i = 0; i < I; ++i)
+        act[size_t(i)] = B.situ_beta > 0.f ? situ(gu[size_t(i)], gu[size_t(I + i)], B.situ_beta, B.situ_linear_beta)
+                                           : silu(gu[size_t(i)]) * gu[size_t(I + i)];
+      lin_expert(M, B.down, eidx[size_t(k)], act.data(), I, H, down_out.data(), R);
+      const double w = ew[size_t(k)];
+      for (int c = 0; c < H; ++c) dst[c] += w * down_out[size_t(c)];
+    }
+  }
+  Vec moe_out;
+  if (B.post_conv >= 0) {
+    run_shortconv_slice(s, B.sconv, B.sconv_offset, H, B.conv, 0, moe_raw.data(), B.post_conv, nullptr, verify,
+                        &moe_out);
+  } else {
+    moe_out = std::move(moe_raw);
+  }
+  for (size_t i = 0; i < s->x.size(); ++i) s->x[i] = ffn_inp[i] + moe_out[i];
+}
+
 bool penalized(const flyx_gen_params& g) { return g.presence_penalty != 0.f || g.frequency_penalty != 0.f; }
 
 // A token the reply now has (accept, the first token of a reply).
@@ -400,7 +641,7 @@ void count_token(RefSeq* s, int32_t t) {
 
 // round: rows after the first read drafts, which count as the reply for the rows after them.
 void head_rows(RefSeq* s, const flyx_head_block& B, int r0, int r1, bool round) {
-  const int H = B.hidden, V = B.vocab;
+  const int H = B.hidden, V = B.vocab_out > 0 ? B.vocab_out : B.vocab;
   Vec hn(H), logits(V);
   std::vector<int> counts;
   if (penalized(s->gen)) {
@@ -410,6 +651,8 @@ void head_rows(RefSeq* s, const flyx_head_block& B, int r0, int r1, bool round) 
   for (int r = r0; r < r1; ++r) {
     norm(s->m, B.norm, &s->x[size_t(r) * H], H, hn.data());
     lin(s->m, B.w, hn.data(), 1, H, V, logits.data(), r1 - r0);
+    if (B.softcap > 0.f)
+      for (int v = 0; v < V; ++v) logits[size_t(v)] = softcap(logits[size_t(v)], double(B.softcap));
     if (s->head_logits.size() < size_t(r + 1) * V) s->head_logits.resize(size_t(r + 1) * V);
     std::copy(logits.begin(), logits.end(), s->head_logits.begin() + ptrdiff_t(r) * V);
     if (round && r > 0 && !counts.empty()) ++counts[size_t(s->drafts[size_t(r) - 1])];
@@ -439,10 +682,11 @@ int32_t forced_draft(const RefSeq* s, int pos) {
 void draft_context(RefSeq* s, const flyx_dflash2_block& d, int n_rows) {
   const auto* M = s->m;
   const int H = d.hidden, F = d.n_taps * M->hidden, hd = d.head_dim;
+  const int F_row = M->total_taps * M->hidden, F_off = M->dflash_tap_off * M->hidden;
   Vec h(H), hn(H), k(size_t(d.n_kv) * hd), v(k.size()), tmp(hd);
   for (int r = 0; r < n_rows; ++r) {
     int pos = s->start + r;
-    lin(M, d.fc, &s->feats[size_t(r) * F], 1, F, H, h.data(), n_rows);
+    lin(M, d.fc, &s->feats[size_t(r) * size_t(F_row) + size_t(F_off)], 1, F, H, h.data(), n_rows);
     norm(M, d.hidden_norm, h.data(), H, hn.data());
     for (int j = 0; j < d.layers; ++j) {
       const auto& l = dlayer(M, d, j);
@@ -535,7 +779,8 @@ void draft_block(RefSeq* s, const flyx_dflash2_block& d, int width) {
     for (size_t i = 0; i < x.size(); ++i) x[i] += fin[i];
   }
   const auto& head = M->block(d.head).head;
-  const int V = head.vocab, K = d.sel_topk, Rk = d.sel_rank;
+  const int V = head.vocab_out > 0 ? head.vocab_out : head.vocab;  // the candidates: no padding row
+  const int K = d.sel_topk, Rk = d.sel_rank;
   Vec hn(H), logits(V), hid(Rk), val(K);
   std::vector<int> cand(K);
   const auto* pred = M->w(d.sel_pred);
@@ -553,7 +798,7 @@ void draft_block(RefSeq* s, const flyx_dflash2_block& d, int width) {
       double e = 0;
       for (int i = 0; i < Rk; ++i)
         e += load(pred, size_t(prev) * Rk + i) * hid[i] * load(succ, size_t(cand[c]) * Rk + i);
-      double sc = val[c] + e;
+      double sc = flyx::ops::dflash2_selector_score(val[c], e, double(d.softcap), d.softcap_mode);
       if (sc > best_score) {
         best_score = sc;
         best = c;
@@ -564,6 +809,159 @@ void draft_block(RefSeq* s, const flyx_dflash2_block& d, int width) {
   }
   if (forced_drafts(s))
     for (int i = 0; i < width; ++i) s->drafts[i] = forced_draft(s, ctx + 1 + i);
+}
+
+// ---- DSpark drafter (Inkling-2) ------------------------------------------------
+
+const flyx_dspark_layer_block& dspark_layer(const RefModel* M, const flyx_dspark_block& d, int j) {
+  return M->block(d.first_layer + j).dspark_layer;
+}
+
+void dspark_context(RefSeq* s, const flyx_dspark_block& d, int n_rows) {
+  const auto* M = s->m;
+  const int H = d.hidden, nt = d.n_taps, nkv = d.n_kv, hd = d.head_dim;
+  const int F_row = M->total_taps * H, F_off = M->dspark_tap_off * H;
+  Vec mixed(static_cast<size_t>(H)), cn(static_cast<size_t>(H)), k(size_t(nkv) * size_t(hd)), v(k.size()),
+      tmp(static_cast<size_t>(hd));
+  const Vec& m_mix = M->vec(d.markov_ctx_mix);
+  for (int r = 0; r < n_rows; ++r) {
+    const int pos = s->start + r;
+    const double* fr = &s->feats[size_t(r) * size_t(F_row) + size_t(F_off)];
+    std::fill(mixed.begin(), mixed.end(), 0.0);
+    for (int t = 0; t < nt; ++t) {
+      const double a = m_mix[size_t(t)];
+      const double* ft = fr + size_t(t) * size_t(H);
+      for (int c = 0; c < H; ++c) mixed[size_t(c)] += a * ft[c];
+    }
+    norm(M, d.markov_ctx_norm, mixed.data(), H, &s->hidden_at[size_t(pos) * size_t(H)]);
+  }
+  for (int j = 0; j < d.layers; ++j) {
+    const auto& l = dspark_layer(M, d, j);
+    const Vec& cmix = M->vec(l.ctx_mix);
+    for (int r = 0; r < n_rows; ++r) {
+      const int pos = s->start + r;
+      const double* fr = &s->feats[size_t(r) * size_t(F_row) + size_t(F_off)];
+      std::fill(mixed.begin(), mixed.end(), 0.0);
+      for (int t = 0; t < nt; ++t) {
+        const double a = cmix[size_t(t)];
+        const double* ft = fr + size_t(t) * size_t(H);
+        for (int c = 0; c < H; ++c) mixed[size_t(c)] += a * ft[c];
+      }
+      norm(M, l.ctx_norm, mixed.data(), H, cn.data());
+      lin(M, l.k_ctx, cn.data(), 1, H, nkv * hd, k.data(), n_rows);
+      lin(M, l.v_ctx, cn.data(), 1, H, nkv * hd, v.data(), n_rows);
+      for (int kh = 0; kh < nkv; ++kh) {
+        norm(M, l.k_ctx_norm, &k[size_t(kh) * size_t(hd)], hd, tmp.data());
+        rope(tmp.data(), pos, d.theta, hd);
+        std::copy(tmp.begin(), tmp.end(), &s->K[size_t(l.kv)][0][(size_t(pos) * size_t(nkv) + size_t(kh)) * size_t(hd)]);
+        std::copy_n(&v[size_t(kh) * size_t(hd)], hd,
+                    &s->V[size_t(l.kv)][0][(size_t(pos) * size_t(nkv) + size_t(kh)) * size_t(hd)]);
+      }
+    }
+  }
+}
+
+void dspark_draft(RefSeq* s, const flyx_dspark_block& d, int width) {
+  const auto* M = s->m;
+  const int B = std::min(d.block, width + 1);
+  const int H = d.hidden, nh = d.n_heads, nkv = d.n_kv, hd = d.head_dim, I = d.inter;
+  const int ctx = s->position;
+  Vec x(size_t(B) * size_t(H), 0.0);
+  // Row 0: anchor embedding followed by DSpark tok_norm; rows 1..B-1: mask_embd[0..B-2].
+  const auto* E = M->w(M->block(d.embed).embed.table);
+  for (int c = 0; c < H; ++c) x[size_t(c)] = load(E, size_t(s->anchor) * size_t(H) + size_t(c));
+  norm(M, d.tok_norm, x.data(), H, x.data());
+  const Vec& masks = M->vec(d.mask_embd);
+  for (int r = 1; r < B; ++r)
+    std::copy_n(masks.data() + size_t(r - 1) * size_t(H), H, x.data() + size_t(r) * size_t(H));
+
+  Vec h(size_t(B) * size_t(H)), q(size_t(B) * size_t(nh) * size_t(hd));
+  Vec k(size_t(B) * size_t(nkv) * size_t(hd)), v(k.size()), tmp(static_cast<size_t>(hd));
+  Vec o(size_t(B) * size_t(nh) * size_t(hd)), ao(size_t(B) * size_t(H));
+  Vec g(size_t(B) * size_t(I)), u(size_t(B) * size_t(I)), mo(size_t(B) * size_t(H));
+  const double scale = 1.0 / std::sqrt(double(hd));
+  for (int j = 0; j < d.layers; ++j) {
+    const auto& l = dspark_layer(M, d, j);
+    const Vec& dK = s->K[size_t(l.kv)][0];
+    const Vec& dV = s->V[size_t(l.kv)][0];
+    for (int r = 0; r < B; ++r) norm(M, l.norm, &x[size_t(r) * size_t(H)], H, &h[size_t(r) * size_t(H)]);
+    lin(M, l.q, h.data(), B, H, nh * hd, q.data(), B);
+    lin(M, l.k, h.data(), B, H, nkv * hd, k.data(), B);
+    lin(M, l.v, h.data(), B, H, nkv * hd, v.data(), B);
+    // Block-uniform SWA window: every query in the block sees context [lo, ctx) plus all B block rows.
+    const int lo = l.window > 0 ? std::max(0, ctx - l.window + 1) : 0;
+    const int n_ctx = ctx - lo;
+    const int n_keys = n_ctx + B;
+    Vec KA(size_t(n_keys) * size_t(nkv) * size_t(hd)), VA(KA.size());
+    if (n_ctx > 0) {
+      std::copy_n(dK.data() + size_t(lo) * size_t(nkv) * size_t(hd), size_t(n_ctx) * size_t(nkv) * size_t(hd), KA.data());
+      std::copy_n(dV.data() + size_t(lo) * size_t(nkv) * size_t(hd), size_t(n_ctx) * size_t(nkv) * size_t(hd), VA.data());
+    }
+    for (int r = 0; r < B; ++r)
+      for (int kh = 0; kh < nkv; ++kh) {
+        norm(M, l.k_norm, &k[(size_t(r) * size_t(nkv) + size_t(kh)) * size_t(hd)], hd, tmp.data());
+        rope(tmp.data(), ctx + r, d.theta, hd);
+        std::copy(tmp.begin(), tmp.end(), &KA[(size_t(n_ctx + r) * size_t(nkv) + size_t(kh)) * size_t(hd)]);
+        std::copy_n(&v[(size_t(r) * size_t(nkv) + size_t(kh)) * size_t(hd)], hd,
+                    &VA[(size_t(n_ctx + r) * size_t(nkv) + size_t(kh)) * size_t(hd)]);
+      }
+    for (int r = 0; r < B; ++r) {
+      const int qp = ctx + r;
+      for (int hh = 0; hh < nh; ++hh) {
+        norm(M, l.q_norm, &q[(size_t(r) * size_t(nh) + size_t(hh)) * size_t(hd)], hd, tmp.data());
+        rope(tmp.data(), qp, d.theta, hd);
+        attend(tmp.data(), KA.data(), VA.data(), n_keys, nkv, hd, hh / (nh / nkv), scale,
+               &o[(size_t(r) * size_t(nh) + size_t(hh)) * size_t(hd)]);
+      }
+    }
+    lin(M, l.o, o.data(), B, nh * hd, H, ao.data(), B);
+    for (size_t i = 0; i < x.size(); ++i) x[i] += ao[i];
+    for (int r = 0; r < B; ++r) norm(M, l.post_norm, &x[size_t(r) * size_t(H)], H, &h[size_t(r) * size_t(H)]);
+    lin(M, l.gate, h.data(), B, H, I, g.data(), B);
+    lin(M, l.up, h.data(), B, H, I, u.data(), B);
+    for (size_t i = 0; i < g.size(); ++i) g[i] = silu(g[i]) * u[i];
+    lin(M, l.down, g.data(), B, I, H, mo.data(), B);
+    for (size_t i = 0; i < x.size(); ++i) x[i] += mo[i];
+  }
+  Vec hn(size_t(B) * size_t(H));
+  for (int r = 0; r < B; ++r) norm(M, d.norm, &x[size_t(r) * size_t(H)], H, &hn[size_t(r) * size_t(H)]);
+
+  const auto& head = M->block(d.head).head;
+  const int V = d.vocab_out > 0 ? d.vocab_out : head.vocab;
+  const int Rk = d.markov_rank;
+  const auto* w1 = M->w(d.markov_w1);
+  const Vec& jb = M->vec(d.joint_proj_b);
+  const double* w2b = d.markov_w2_b >= 0 ? M->vec(d.markov_w2_b).data() : nullptr;
+  Vec f_rnn(size_t(H), 0.0);
+  if (ctx > 0 && !s->hidden_at.empty())
+    std::copy_n(&s->hidden_at[size_t(ctx - 1) * size_t(H)], H, f_rnn.data());
+
+  Vec state(static_cast<size_t>(Rk), 0.0), markov(static_cast<size_t>(Rk)), joint(static_cast<size_t>(2 * Rk + 2 * H)),
+      joint_out(static_cast<size_t>(3 * Rk));
+  Vec base(static_cast<size_t>(V)), bias(static_cast<size_t>(V)), col(static_cast<size_t>(V));
+  int prev = s->anchor;
+  s->drafts.assign(size_t(width), 0);
+  for (int st = 0; st < B - 1 && st < width; ++st) {
+    const int i = st + 1;
+    std::copy(state.begin(), state.end(), joint.begin());
+    for (int k_i = 0; k_i < Rk; ++k_i) joint[size_t(Rk + k_i)] = load(w1, size_t(prev) * size_t(Rk) + size_t(k_i));
+    std::copy_n(&hn[size_t(i) * size_t(H)], H, joint.data() + size_t(2 * Rk));
+    std::copy_n(f_rnn.data(), H, joint.data() + size_t(2 * Rk + H));
+    lin(M, d.joint_proj, joint.data(), 1, 2 * Rk + 2 * H, 3 * Rk, joint_out.data(), 1);
+    for (int k_i = 0; k_i < 3 * Rk; ++k_i) joint_out[size_t(k_i)] += jb[size_t(k_i)];
+    dspark_markov_gate(joint_out.data(), Rk, state.data(), markov.data());
+    lin(M, d.markov_w2, markov.data(), 1, Rk, V, bias.data(), 1);
+    if (w2b)
+      for (int v_i = 0; v_i < V; ++v_i) bias[size_t(v_i)] += w2b[v_i];
+    lin(M, head.w, &hn[size_t(i) * size_t(H)], 1, H, V, base.data(), B);
+    for (int v_i = 0; v_i < V; ++v_i)
+      col[size_t(v_i)] = d.softcap > 0.f ? softcap(base[size_t(v_i)] + bias[size_t(v_i)], double(d.softcap))
+                                         : base[size_t(v_i)] + bias[size_t(v_i)];
+    prev = argmax(col.data(), V);
+    s->drafts[size_t(st)] = prev;
+  }
+  if (forced_drafts(s))
+    for (int i = 0; i < width; ++i) s->drafts[size_t(i)] = forced_draft(s, ctx + 1 + i);
 }
 
 // ---- MTP drafter (python/reference/flyx_ref/mtp.py) ----------------------------
@@ -714,25 +1112,31 @@ void accept(RefSeq* s, int width) {
   s->ring.push_back(r);
 }
 
-// New state = old slot state advanced by `rows` replayed rows, for every GDN state.
+// New state = old slot state advanced by `rows` replayed rows, for every GDN and SHORTCONV state.
 void fold_into(RefSeq* s, int from, int to, int rows) {
   const auto& states = s->m->states;
   Slot& a = s->slot[from];
   Slot& b = s->slot[to];
   for (size_t L = 0; L < states.size(); ++L) {
     const auto& st = states[L];
-    if (st.kind != FLYX_STATE_GDN) continue;
-    const int nv = st.nv, dk = st.dk, dv = st.dv, cdim = cdim_of(st);
-    Vec S = a.S[L], win = a.conv[L];
-    for (int r = 0; r < rows; ++r) {
-      for (int vh = 0; vh < nv; ++vh)
-        gdn_row(&S[size_t(vh) * dv * dk], &a.k[L][(size_t(r) * nv + vh) * dk] /*q unused*/,
-                &a.k[L][(size_t(r) * nv + vh) * dk], &a.v[L][(size_t(r) * nv + vh) * dv],
-                a.beta[L][size_t(r) * nv + vh], a.g[L][size_t(r) * nv + vh], dk, dv, nullptr);
-      conv_push(win.data(), &a.mixed[L][size_t(r) * cdim], cdim, st.conv);
+    if (st.kind == FLYX_STATE_GDN) {
+      const int nv = st.nv, dk = st.dk, dv = st.dv, cdim = cdim_of(st);
+      Vec S = a.S[L], win = a.conv[L];
+      for (int r = 0; r < rows; ++r) {
+        for (int vh = 0; vh < nv; ++vh)
+          gdn_row(&S[size_t(vh) * dv * dk], &a.k[L][(size_t(r) * nv + vh) * dk] /*q unused*/,
+                  &a.k[L][(size_t(r) * nv + vh) * dk], &a.v[L][(size_t(r) * nv + vh) * dv],
+                  a.beta[L][size_t(r) * nv + vh], a.g[L][size_t(r) * nv + vh], dk, dv, nullptr);
+        conv_push(win.data(), &a.mixed[L][size_t(r) * cdim], cdim, st.conv);
+      }
+      b.S[L] = std::move(S);
+      b.conv[L] = std::move(win);
+    } else if (st.kind == FLYX_STATE_SHORTCONV) {
+      Vec win = a.sc[L];
+      for (int r = 0; r < rows; ++r)
+        conv_push(win.data(), &a.sc_in[L][size_t(r) * size_t(st.channels)], st.channels, st.conv);
+      b.sc[L] = std::move(win);
     }
-    b.S[L] = std::move(S);
-    b.conv[L] = std::move(win);
   }
 }
 
@@ -755,6 +1159,7 @@ void ensure_slot_buffers(RefSeq* s) {
     sl.beta.resize(n);
     sl.g.resize(n);
     sl.mixed.resize(n);
+    sl.sc_in.resize(n);
   }
 }
 
@@ -768,13 +1173,18 @@ const char* node_label(const flyx_node& n, const flyx_block* b, int phase) {
         case FLYX_BLOCK_GDN: return pre ? "prefill gdn" : "round gdn";
         case FLYX_BLOCK_ATTN: return pre ? "prefill attention" : "round attention";
         case FLYX_BLOCK_MLP: return pre ? "prefill mlp" : "round mlp";
+        case FLYX_BLOCK_REL_ATTN: return pre ? "prefill rel_attn" : "round rel_attn";
+        case FLYX_BLOCK_MOE: return pre ? "prefill moe" : "round moe";
         case FLYX_BLOCK_HEAD: return pre ? "prefill head" : "round head";
         default: return "run";
       }
-    case FLYX_NODE_DRAFT: return b->kind == FLYX_BLOCK_MTP ? "draft mtp" : "draft dflash2";
+    case FLYX_NODE_DRAFT:
+      if (b->kind == FLYX_BLOCK_MTP) return "draft mtp";
+      return b->kind == FLYX_BLOCK_DSPARK ? "draft dspark" : "draft dflash2";
     case FLYX_NODE_CONTEXT:
       if (b->kind == FLYX_BLOCK_DV) return "context dv";
-      return b->kind == FLYX_BLOCK_MTP ? "context mtp" : "context dflash2";
+      if (b->kind == FLYX_BLOCK_MTP) return "context mtp";
+      return b->kind == FLYX_BLOCK_DSPARK ? "context dspark" : "context dflash2";
     case FLYX_NODE_ACCEPT: return "accept";
     default: return "other nodes";
   }
@@ -783,6 +1193,7 @@ const char* node_label(const flyx_node& n, const flyx_block* b, int phase) {
 void run_nodes(RefPlan* p, RefSeq* s) {
   const auto* M = s->m;
   const int H = M->hidden;
+  const int tap_slots = M->total_taps;
   for (const auto& n : p->nodes) {
     const flyx_block* b = n.block >= 0 ? &M->block(n.block) : nullptr;
     const auto t0 = std::chrono::steady_clock::now();
@@ -797,12 +1208,14 @@ void run_nodes(RefPlan* p, RefSeq* s) {
               s->start = s->position;
             }
             embed_rows(s, b->embed, s->tok.data(), s->rows, &s->x);
-            s->feats.assign(size_t(s->rows) * (M->dflash >= 0 ? M->block(M->dflash).dflash2.n_taps : 0) * H, 0.0);
+            s->feats.assign(size_t(s->rows) * size_t(tap_slots) * size_t(H), 0.0);
             s->choice.assign(s->rows, 0);
             break;
           case FLYX_BLOCK_GDN: gdn_mixer(s, b->gdn, p->phase == FLYX_PHASE_ROUND); break;
           case FLYX_BLOCK_ATTN: attn_mixer(s, b->attn); break;
           case FLYX_BLOCK_MLP: mlp(M, b->mlp, s->x.data(), s->rows); break;
+          case FLYX_BLOCK_REL_ATTN: rel_attn_mixer(s, b->rel_attn, p->phase == FLYX_PHASE_ROUND); break;
+          case FLYX_BLOCK_MOE: moe_ffn(s, b->moe, p->phase == FLYX_PHASE_ROUND); break;
           case FLYX_BLOCK_HEAD:
             if (n.arg0) {
               if (s->sample_last) head_rows(s, b->head, s->rows - 1, s->rows, false);
@@ -814,13 +1227,23 @@ void run_nodes(RefPlan* p, RefSeq* s) {
         }
         break;
       case FLYX_NODE_TAP: {
-        const int F = b->dflash2.n_taps * H;
-        for (int r = 0; r < s->rows; ++r)
-          std::copy(&s->x[size_t(r) * H], &s->x[size_t(r) * H] + H, &s->feats[size_t(r) * F + size_t(n.arg0) * H]);
+        const int tap_off = b->kind == FLYX_BLOCK_DSPARK ? M->dspark_tap_off : M->dflash_tap_off;
+        const int head_idx = b->kind == FLYX_BLOCK_DSPARK ? b->dspark.head : b->dflash2.head;
+        const int F = M->total_taps * H;
+        const int col_off = (tap_off + n.arg0) * H;
+        if (n.arg1 == FLYX_TAP_NORMED) {
+          const auto& head = M->block(head_idx).head;
+          for (int r = 0; r < s->rows; ++r)
+            norm(M, head.norm, &s->x[size_t(r) * size_t(H)], H, &s->feats[size_t(r) * size_t(F) + size_t(col_off)]);
+        } else {
+          for (int r = 0; r < s->rows; ++r)
+            std::copy(&s->x[size_t(r) * H], &s->x[size_t(r) * H] + H, &s->feats[size_t(r) * F + size_t(col_off)]);
+        }
         break;
       }
       case FLYX_NODE_DRAFT:
         if (b->kind == FLYX_BLOCK_MTP) mtp_draft(s, b->mtp, n.arg0);
+        else if (b->kind == FLYX_BLOCK_DSPARK) dspark_draft(s, b->dspark, n.arg0);
         else draft_block(s, b->dflash2, n.arg0);
         break;
       case FLYX_NODE_CONTEXT: {
@@ -828,6 +1251,7 @@ void run_nodes(RefPlan* p, RefSeq* s) {
         const int rows = p->phase == FLYX_PHASE_PREFILL ? s->rows : s->noop ? 0 : s->last_n + 1;
         if (rows == 0) break;
         if (b->kind == FLYX_BLOCK_MTP) mtp_context(s, b->mtp, rows);
+        else if (b->kind == FLYX_BLOCK_DSPARK) dspark_context(s, b->dspark, rows);
         else draft_context(s, b->dflash2, rows);
         break;
       }
@@ -836,6 +1260,33 @@ void run_nodes(RefPlan* p, RefSeq* s) {
       case FLYX_NODE_GIVEN:
         for (int i = 0; i < n.arg0; ++i) s->drafts[size_t(i)] = forced_draft(s, s->position + 1 + i);
         break;
+      case FLYX_NODE_RES_RESET:
+        s->res_bank.clear();
+        s->prelude_cur.clear();
+        s->prelude_blocks.clear();
+        s->loop_bank.clear();
+        s->loop_bank_out.clear();
+        break;
+      case FLYX_NODE_LOOP_PRELUDE:
+        s->prelude_cur = s->x;
+        s->prelude_blocks = s->res_bank;
+        break;
+      case FLYX_NODE_LOOP_NEXT: {
+        const size_t skip = s->prelude_blocks.size() + 1;
+        s->loop_bank.clear();
+        for (size_t i = skip; i < s->res_bank.size(); ++i) s->loop_bank.push_back(s->res_bank[i]);
+        s->loop_bank_out = s->x;
+        s->x = s->prelude_cur;
+        s->res_bank = s->prelude_blocks;
+        break;
+      }
+      case FLYX_NODE_RES_MIX: {
+        const Vec& rq = M->vec(n.arg0);
+        Vec mixed;
+        mix_bank(s->res_bank, s->x, rq.data(), 1, s->rows, H, &mixed);
+        s->x = std::move(mixed);
+        break;
+      }
       default: throw std::runtime_error("cpu_ref: unknown node kind " + std::to_string(n.kind));
     }
     M->timed(node_label(n, b, p->phase), t0);
@@ -925,6 +1376,19 @@ int open_model(const flyx_model_desc* desc, const flyx_open_options* opts, flyx_
       auto data = std::make_unique<std::vector<double>>(nvfp4 && !ggml_fp4
                                                             ? flyx::ops::dequant_nvfp4(w.t, w.scale, w.scale2)
                                                             : flyx::ops::to_vec(w.t));
+      // Optional per-tensor [1] or per-expert [E] scale tensor (e.g. GGML NVFP4 or requantized 3D MoE experts).
+      if ((!nvfp4 || ggml_fp4) && w.scale2) {
+        if (w.scale2->shape[0] == 1) {
+          const double g = flyx::ops::load(w.scale2, 0);
+          for (double& x : *data) x *= g;
+        } else if (w.t->ndim == 3 && w.scale2->shape[0] == w.t->shape[0]) {
+          const size_t E = size_t(w.t->shape[0]), slice = data->size() / E;
+          for (size_t e = 0; e < E; ++e) {
+            const double g = flyx::ops::load(w.scale2, e);
+            for (size_t j = 0; j < slice; ++j) (*data)[e * slice + j] *= g;
+          }
+        }
+      }
       bool q_q8 = false, q_fp4 = false;
       if (floats && w.t->ndim == 2 && vision_lin_w.count(i)) {
         const int N = int(w.t->shape[0]), K = int(w.t->shape[1]);
@@ -975,11 +1439,20 @@ int open_model(const flyx_model_desc* desc, const flyx_open_options* opts, flyx_
       const flyx_block& b = desc->blocks[i];
       const int k = b.kind;
       // DV's blocks (ABI 42) are taken and never run: such a model decodes here as without DV (lower).
-      if (k < FLYX_BLOCK_EMBED || k > FLYX_BLOCK_VISION_MERGE)
+      if (k < FLYX_BLOCK_EMBED || k > FLYX_BLOCK_DSPARK_LAYER)
         throw std::runtime_error("block kind " + std::to_string(k) + ": not implemented by cpu_ref");
       if (k == FLYX_BLOCK_VISION_STEM && b.vision_stem.cls_token >= 0)
         throw std::runtime_error("vision_stem: cls_token is not yet implemented by cpu_ref");
-      if (k == FLYX_BLOCK_DFLASH2) m->dflash = i;
+      if (k == FLYX_BLOCK_DFLASH2) {
+        m->dflash = i;
+        m->dflash_tap_off = m->total_taps;
+        m->total_taps += b.dflash2.n_taps;
+      }
+      if (k == FLYX_BLOCK_DSPARK) {
+        m->dspark = i;
+        m->dspark_tap_off = m->total_taps;
+        m->total_taps += b.dspark.n_taps;
+      }
       if (k == FLYX_BLOCK_ATTN || k == FLYX_BLOCK_MLP) {  // a target's own adapters (ABI 43)
         const flyx_lora* l = k == FLYX_BLOCK_ATTN ? b.attn.lora : b.mlp.lora;
         const int n = k == FLYX_BLOCK_ATTN ? 4 : 3;
@@ -1015,10 +1488,12 @@ int open_model(const flyx_model_desc* desc, const flyx_open_options* opts, flyx_
         if (drafter[size_t(i)]) continue;
         const flyx_block& b = desc->blocks[i];
         if (b.kind == FLYX_BLOCK_EMBED)  // the file's table (W holds float64 copies)
-          ok = desc->weights[b.embed.table].t && desc->weights[b.embed.table].t->dtype == FLYX_DT_BF16;
+          ok = !b.embed.has_norm && desc->weights[b.embed.table].t &&
+               desc->weights[b.embed.table].t->dtype == FLYX_DT_BF16;
         else if (b.kind == FLYX_BLOCK_GDN) ok = m->a4.count(m->w(b.gdn.out)) > 0;
         else if (b.kind == FLYX_BLOCK_ATTN) ok = m->a4.count(m->w(b.attn.o)) > 0 && !adapters(b.attn.lora, 4);
         else if (b.kind == FLYX_BLOCK_MLP) ok = m->a4.count(m->w(b.mlp.down)) > 0 && !adapters(b.mlp.lora, 3);
+        else if (b.kind == FLYX_BLOCK_REL_ATTN || b.kind == FLYX_BLOCK_MOE) ok = false;
       }
       m->res16 = ok;
       if (opts && opts->verbose)
@@ -1026,7 +1501,7 @@ int open_model(const flyx_model_desc* desc, const flyx_open_options* opts, flyx_
                      m->res16 ? "bf16" : "float32");
     }
     for (const auto& st : m->states) {
-      if (st.kind < FLYX_STATE_KV || st.kind > FLYX_STATE_CANVAS)  // DV's canvas: never kept (no DV rounds here)
+      if (st.kind < FLYX_STATE_KV || st.kind > FLYX_STATE_SHORTCONV)  // DV's canvas: never kept (no DV rounds here)
         throw std::runtime_error("state kind " + std::to_string(st.kind) + ": not implemented by cpu_ref");
       if (st.kind == FLYX_STATE_RING) m->ring_width = st.width;
     }
@@ -1066,7 +1541,9 @@ int lower(flyx_bmodel* bm, const flyx_program* prog, flyx_plan** out) {
   int most = 0;  // drafts the round may verify: up to a full round of given ones, else what its drafter proposes
   for (int i = 0; i < prog->n_nodes; ++i) {
     const flyx_node& n = prog->nodes[i];
-    const bool none = n.kind == FLYX_NODE_ACCEPT || n.kind == FLYX_NODE_COMMIT || n.kind == FLYX_NODE_GIVEN;
+    const bool none = n.kind == FLYX_NODE_ACCEPT || n.kind == FLYX_NODE_COMMIT || n.kind == FLYX_NODE_GIVEN ||
+                      n.kind == FLYX_NODE_RES_RESET || n.kind == FLYX_NODE_LOOP_PRELUDE ||
+                      n.kind == FLYX_NODE_LOOP_NEXT || n.kind == FLYX_NODE_RES_MIX;
     if (!none && (n.block < 0 || n.block >= int(m->blocks.size()))) return fail("node names block " + std::to_string(n.block));
     // DV's rounds are trees (a tree round is not in this backend either), and its canvas pass is not: a model with
     // DV decodes here as without it (plain decoding and lookup rounds, plan::build), its prefill's CONTEXT (the canvas
@@ -1081,6 +1558,7 @@ int lower(flyx_bmodel* bm, const flyx_program* prog, flyx_plan** out) {
     if (n.kind == FLYX_NODE_DRAFT) {
       const flyx_block& b = m->block(n.block);
       most = b.kind == FLYX_BLOCK_DFLASH2 ? std::max(b.dflash2.block, FLYX_MAX_ROWS) - 1
+             : b.kind == FLYX_BLOCK_DSPARK ? b.dspark.block - 1
              : b.kind == FLYX_BLOCK_MTP  ? FLYX_MAX_ROWS - 1
                                          : 0;
     }
@@ -1530,7 +2008,7 @@ int checkpoint(flyx_seq* bs, int32_t c) {
   RefSeq* s = as_s(bs);
   if (c < 0 || c >= FLYX_CHECKPOINTS) return fail("bad checkpoint slot");
   const Slot& sl = s->slot[cur_slot(s)];
-  s->ck[c] = {true, s->position, s->rope_delta, sl.S, sl.conv, {}};
+  s->ck[c] = {true, s->position, s->rope_delta, sl.S, sl.conv, sl.sc, {}};
   if (!s->hidden_at.empty() && s->position > 0) {
     const size_t W = size_t(s->m->ring_width);
     s->ck[c].ring_h.assign(s->hidden_at.begin() + (s->position - 1) * W, s->hidden_at.begin() + s->position * W);
@@ -1545,6 +2023,7 @@ int restore(flyx_seq* bs, int32_t c, int32_t anchor) {
   Slot& sl = s->slot[cur_slot(s)];
   sl.S = s->ck[c].S;
   sl.conv = s->ck[c].conv;
+  sl.sc = s->ck[c].sc;
   s->position = s->ck[c].pos;
   s->rope_delta = s->ck[c].rope_delta;
   s->prev_pos3d_at = -1;
@@ -1627,13 +2106,16 @@ using flyx::backends::SnapshotHeader;
 uint64_t layout_hash(const RefModel* m) {
   uint64_t h = flyx::backends::kFnv1aOffset;  // FNV-1a over the state table, eight bytes a field
   for (const auto& st : m->states)
-    for (int32_t v : {st.kind, st.layers, st.n_kv, st.head_dim, st.nk, st.nv, st.dk, st.dv, st.conv, st.width})
+    for (int32_t v : {st.kind, st.layers, st.n_kv, st.head_dim, st.nk, st.nv, st.dk, st.dv, st.conv, st.width,
+                      st.window, st.channels})
       flyx::backends::fnv1a64_mix(&h, uint64_t(uint32_t(v)));
   return h;
 }
 
 size_t recurrent_doubles(const flyx_state& st) {
-  return st.kind == FLYX_STATE_GDN ? size_t(st.nv) * st.dv * st.dk + size_t(st.conv - 1) * cdim_of(st) : 0;
+  if (st.kind == FLYX_STATE_GDN) return size_t(st.nv) * st.dv * st.dk + size_t(st.conv - 1) * cdim_of(st);
+  if (st.kind == FLYX_STATE_SHORTCONV) return size_t(st.conv - 1) * size_t(st.channels);
+  return 0;
 }
 
 uint64_t snapshot_size(const RefSeq* s, int begin, int pos) {
@@ -1673,11 +2155,14 @@ int snapshot_save(flyx_seq* bs, int32_t c, int32_t begin, const flyx_host_pieces
         put(s->K[i][size_t(l)].data() + begin * width, (ck.pos - begin) * width);
         put(s->V[i][size_t(l)].data() + begin * width, (ck.pos - begin) * width);
       }
-  for (size_t i = 0; i < states.size(); ++i)
-    if (recurrent_doubles(states[i])) {
+  for (size_t i = 0; i < states.size(); ++i) {
+    if (states[i].kind == FLYX_STATE_GDN) {
       put(ck.S[i].data(), ck.S[i].size());
       put(ck.conv[i].data(), ck.conv[i].size());
+    } else if (states[i].kind == FLYX_STATE_SHORTCONV) {
+      put(ck.sc[i].data(), ck.sc[i].size());
     }
+  }
   const Vec zeros(size_t(s->m->ring_width), 0.0);
   put(ck.ring_h.empty() ? zeros.data() : ck.ring_h.data(), zeros.size());
   return ck.pos;
@@ -1703,13 +2188,18 @@ int snapshot_load(flyx_seq* bs, const flyx_host_pieces* src, uint64_t bytes, int
       }
   for (auto& sl : s->slot) sl.replay_valid = false;
   Slot& sl = s->slot[cur_slot(s)];
-  for (size_t i = 0; i < states.size(); ++i)
-    if (const size_t n = recurrent_doubles(states[i])) {
+  for (size_t i = 0; i < states.size(); ++i) {
+    if (states[i].kind == FLYX_STATE_GDN) {
+      const size_t n = recurrent_doubles(states[i]);
       sl.S[i].resize(size_t(states[i].nv) * states[i].dv * states[i].dk);
       sl.conv[i].resize(n - sl.S[i].size());
       get(sl.S[i].data(), sl.S[i].size());
       get(sl.conv[i].data(), sl.conv[i].size());
+    } else if (states[i].kind == FLYX_STATE_SHORTCONV) {
+      sl.sc[i].resize(recurrent_doubles(states[i]));
+      get(sl.sc[i].data(), sl.sc[i].size());
     }
+  }
   // Straight to its place: a load a few pieces at a time (ABI 31) leaves what a skipped piece would set as it is.
   if (s->m->ring_width > 0 && h.pos > 0)
     get(s->hidden_at.data() + size_t(h.pos - 1) * s->m->ring_width, size_t(s->m->ring_width));

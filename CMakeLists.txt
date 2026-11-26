@@ -198,11 +198,11 @@ target_link_libraries(flyx_core PRIVATE flyx_jinja flyx_xgrammar)
 # (interfaces::open_model, interfaces::open_chat); their objects go into the core library, so whatever links
 # core has them.
 add_library(flyx_models OBJECT models/model.cpp models/dv.cpp
-            models/drafters/dflash2.cpp models/drafters/registry.cpp
-            models/llama/llama.cpp models/qwen35/qwen35.cpp
+            models/drafters/dflash2.cpp models/drafters/dspark.cpp models/drafters/registry.cpp
+            models/llama/llama.cpp models/qwen35/qwen35.cpp models/inkling2/inkling2.cpp
             models/vision/preprocess.cpp
             models/formats/formats.cpp models/formats/pytext.cpp models/formats/calls.cpp
-            models/formats/tags.cpp models/formats/grammar.cpp models/formats/qwen35.cpp)
+            models/formats/tags.cpp models/formats/grammar.cpp models/formats/qwen35.cpp models/formats/inkling2.cpp)
 target_include_directories(flyx_models PRIVATE ${CMAKE_SOURCE_DIR} ${CMAKE_SOURCE_DIR}/include
                            ${CMAKE_SOURCE_DIR}/third_party)
 target_sources(flyx_core PRIVATE $<TARGET_OBJECTS:flyx_models>)

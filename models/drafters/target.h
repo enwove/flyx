@@ -13,11 +13,19 @@ namespace flyx::models::drafters {
 struct TargetSpec {
   std::string arch;        // target architecture name as the file reports it ("qwen35", "qwen3", "llama", ...)
   int hidden = 0;          // residual stream width
-  int vocab = 0;           // vocabulary size (the rows of the embedding the drafters share)
+  int vocab = 0;           // effective (unpadded) vocabulary size
+  int vocab_padded = 0;    // storage vocabulary size (0 means same as vocab)
   int layers = 0;          // logical layer / visit count (1..layers are valid tap indices)
   int embed = -1;          // target FLYX_BLOCK_EMBED index (populated before attach)
   int head = -1;           // target FLYX_BLOCK_HEAD index (populated before attach)
+  float softcap = 0.0f;    // target logit softcap (default fallback for drafters without explicit key)
   bool gguf = false;       // true when the target model was opened from GGUF
+  bool has_post_norm_tap = false;  // architecture calls emit_post_norm_taps() after its own final residual mix
+  bool dspark_taps = false;        // architecture's programs give a DSpark drafter its taps: emit_pre_visit_taps()
+                                   // before every layer and emit_post_norm_taps(); without them it drafts from
+                                   // rows nothing wrote, so its file is refused
+
+  int padded_vocab() const { return vocab_padded > 0 ? vocab_padded : vocab; }
 };
 
 // Optional architecture callbacks for targets that can host an embedded or sidecar-GGUF MTP layer.

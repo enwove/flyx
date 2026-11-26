@@ -67,6 +67,8 @@ class ChatTemplate {
   std::unique_ptr<OutputParser> parser(const RenderedChat& r, const std::vector<ojson>* tools) const;
   // The grammar the reply to a rendered prompt must match (interfaces::Chat::reply_grammar), "" for none.
   std::string reply_grammar(const std::vector<ojson>& tools, const ReplyRules& rules, const RenderedChat& r) const;
+  // The special tokens replies are written with (interfaces::Chat::reply_tokens); none without a template.
+  std::vector<std::string> reply_tokens() const;
 
  private:
   struct Impl;

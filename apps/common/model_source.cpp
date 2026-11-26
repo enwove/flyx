@@ -10,6 +10,7 @@
 #include <memory>
 #include <set>
 
+#include "core/interfaces/model.h"
 #include "core/interfaces/options.h"
 #include "core/modelfile/modelfile.h"
 #include "core/os/env.h"
@@ -121,9 +122,12 @@ std::vector<LocalModel> scan_model_dirs(const std::vector<std::string>& dirs, in
       const bool is_mmproj = gguf && hub::mmproj_gguf_name(rel);
       // A DFlash2 drafter's GGUF says what it is in its header alone (general.architecture "dflash"), and reading
       // a header means reading through the file's tokenizer tables: only the files whose names suggest a drafter
-      // are opened here.  One named otherwise is listed as a model, and refused as one when it is opened.
+      // are opened here.  One named otherwise is listed as a model here (flyx serve's listing, which reads every
+      // GGUF's header once for its MTP layer, calls it a drafter then), and refused as one when it is opened.
       const bool maybe_dflash =
-          gguf && !is_mmproj && (low.find("dflash") != std::string::npos || low.find("draft") != std::string::npos);
+          gguf && !is_mmproj &&
+          (low.find("dflash") != std::string::npos || low.find("dspark") != std::string::npos ||
+           low.find("draft") != std::string::npos);
       const bool is_drafter =
           gguf && !is_mmproj &&
           (hub::mtp_gguf_name(rel) || (maybe_dflash && flyx::gguf_peek(from_path(it->path())).arch == "dflash"));
@@ -208,22 +212,28 @@ bool one(const std::string& spec, const hub::ProgressFn& progress, const std::at
   return true;
 }
 
-// What kind of drafter a file or directory given beside a model holds: read from the GGUF header when possible
-// (arch "dflash" vs MTP), falling back to filename/format for directories and .flyx drafter files.
-std::string drafter_kind(const std::string& path) {
-  const std::string lp = lower(path);
-  if (lp.ends_with(".gguf")) {
-    const flyx::GgufPeek p = flyx::gguf_peek(path);
-    if (p.valid) {
-      if (p.arch == "dflash") return "dflash2";
-      if (p.mtp_layers > 0) return "mtp";
-    }
-    return lp.find("dflash") != std::string::npos ? "dflash2" : "mtp";
+}  // namespace
+
+std::string drafter_kind(const std::string& path, const flyx::GgufPeek& header) {
+  if (header.valid) {
+    if (header.arch == "dflash") return header.has_markov_context ? "dspark" : "dflash2";
+    if (header.mtp_layers > 0) return "mtp";
   }
-  return "dflash2";
+  const std::string lp = lower(path);
+  if (!lp.ends_with(".gguf")) return "dflash2";  // a directory of config and safetensors, or a .flyx drafter file
+  if (lp.find("dspark") != std::string::npos) return "dspark";
+  return lp.find("dflash") != std::string::npos ? "dflash2" : "mtp";
 }
 
-}  // namespace
+std::string drafter_kind(const std::string& path) {
+  return drafter_kind(path, lower(path).ends_with(".gguf") ? flyx::gguf_peek(path) : flyx::GgufPeek{});
+}
+
+bool reads_vision(const std::string& arch) {
+  if (arch.empty()) return true;
+  const std::vector<std::string> vision = interfaces::vision_architectures();
+  return std::find(vision.begin(), vision.end(), arch) != vision.end();
+}
 
 std::string model_name_of(const std::string& path, bool local) {
   const fs::path file = to_path(path).filename();
@@ -239,6 +249,7 @@ std::vector<std::string> known_drafters(const std::vector<std::string>& base_mod
   static const std::pair<const char*, const char*> kKnown[] = {
       {"Qwen/Qwen3.8-27B", "z-lab/Qwen3.8-27B-DFlash2"},
       {"Qwen/Qwen3.5-4B", "vllm-project/Qwen3.5-4B-DFlash2"},
+      {"thinkingmachines/Inkling-2-Mini", "incoai/Inkling-2-Mini-DFlash2"},
   };
   std::vector<std::string> out;
   for (const std::string& b : base_models)
@@ -255,9 +266,53 @@ bool wants_mtp(const EngineOptions& eo) {
           mode == interfaces::DrafterMode::kAll);
 }
 
+bool wants_dspark(const EngineOptions& eo, const std::vector<std::string>& drafters) {
+  if (!eo.speculative) return false;
+  interfaces::DrafterMode mode = interfaces::DrafterMode::kAuto;
+  if (!interfaces::parse_drafter_mode(eo.drafter, &mode)) return false;
+  return mode == interfaces::DrafterMode::kDSpark || mode == interfaces::DrafterMode::kAll ||
+         (mode == interfaces::DrafterMode::kAuto && drafters.empty());
+}
+
+namespace {
+
+bool is_dspark_file(const std::string& path) {
+  const flyx::GgufPeek h = flyx::gguf_peek(path);
+  return h.valid && h.arch == "dflash" && h.has_markov_context;
+}
+
+}  // namespace
+
+std::string dspark_beside(const std::string& model_path) {
+  std::error_code ec;
+  const fs::path p = to_path(model_path);
+  if (lower(from_path(p.extension())) != ".gguf" || !fs::is_regular_file(p, ec)) return "";
+  // The model's name without its quantization: what a drafter made for it is named after.
+  std::string name = model_name_of(model_path);
+  const std::string quant = hub::quant_in_name(from_path(p.filename()));
+  if (!quant.empty() && name.size() > quant.size() && lower(name).ends_with(lower(quant))) {
+    name.resize(name.size() - quant.size());
+    while (!name.empty() && (name.back() == '-' || name.back() == '_' || name.back() == '.')) name.pop_back();
+  }
+  if (name.empty()) return "";
+  const std::string want = "dspark-" + lower(name);
+  std::vector<std::string> found;
+  const fs::path dir = p.has_parent_path() ? p.parent_path() : fs::path(".");
+  for (fs::directory_iterator it(dir, ec), end; !ec && it != end; it.increment(ec)) {
+    const std::string low = lower(from_path(it->path().filename()));
+    if (!low.ends_with(".gguf") || !low.starts_with(want) || low.size() <= want.size()) continue;
+    if (const char next = low[want.size()]; next != '-' && next != '_' && next != '.') continue;  // another name
+    std::error_code e2;
+    if (!it->is_regular_file(e2) || e2 || !is_dspark_file(from_path(it->path()))) continue;
+    found.push_back(from_path(it->path()));
+  }
+  std::sort(found.begin(), found.end());
+  return found.empty() ? "" : found.front();
+}
+
 bool fetch_model(const std::string& model, const std::vector<std::string>& drafters, bool want_mtp,
                  const hub::ProgressFn& progress, const std::atomic<bool>* stop, Fetched* out, std::string* err,
-                 const std::string& mmproj, bool want_vision) {
+                 const std::string& mmproj, bool want_vision, bool want_dspark) {
   *out = {};
   hub::Repo repo;
   if (!one(model, progress, stop, &out->model, &repo, err)) return false;
@@ -281,15 +336,29 @@ bool fetch_model(const std::string& model, const std::vector<std::string>& draft
     out->mmproj_source = mrepo.id.empty() ? mpath : mmproj;
     out->mmproj_size = bytes_on_disk(mpath);
   }
-  if (repo.id.empty()) return true;  // a path: nothing more to know
+  bool has_dspark = false;  // named: none other is taken
+  for (const auto& ds : out->drafter_sources) has_dspark = has_dspark || ds.kind == "dspark";
+  if (repo.id.empty()) {  // a path: only a DSpark drafter beside it to know of
+    if (want_dspark && !has_dspark)
+      if (const std::string d = dspark_beside(out->model); !d.empty()) {
+        out->drafters.push_back(d);
+        out->drafter_sources.push_back({"dspark", d, bytes_on_disk(d)});
+        out->notes.push_back("the DSpark drafter beside the model: " + d);
+      }
+    return true;
+  }
   if (want_vision && out->mmproj.empty()) {
     if (const hub::RepoFile* mm = hub::mmproj_file(repo)) {
-      std::vector<std::string> paths;
-      if (!hub::fetch(repo, {*mm}, &paths, progress, stop, err)) return false;
-      out->mmproj = paths[0];
-      out->mmproj_source = repo.id + "/" + mm->path;
-      out->mmproj_size = mm->size;
-      out->notes.push_back("the vision projector from " + repo.id + "/" + mm->path);
+      const flyx::GgufPeek pk = flyx::gguf_peek(out->model);
+      const std::string arch = pk.valid && !pk.arch.empty() ? pk.arch : repo.info.gguf_architecture;
+      if (reads_vision(arch)) {
+        std::vector<std::string> paths;
+        if (!hub::fetch(repo, {*mm}, &paths, progress, stop, err)) return false;
+        out->mmproj = paths[0];
+        out->mmproj_source = repo.id + "/" + mm->path;
+        out->mmproj_size = mm->size;
+        out->notes.push_back("the vision projector from " + repo.id + "/" + mm->path);
+      }
     }
   }
   // unsloth keeps the MTP layer of GGUFs made without it in MTP/.
@@ -304,6 +373,22 @@ bool fetch_model(const std::string& model, const std::vector<std::string>& draft
     out->drafter_sources.push_back({"mtp", repo.id + "/" + mtp->path, bytes_on_disk(paths[0])});
     out->notes.push_back("the MTP layer from " + repo.id + "/" + mtp->path + " (the model's file has none)");
   }
+  // A DSpark drafter published with the model (unsloth's Inkling-2 GGUFs: dspark-*.gguf) drafts with it by default,
+  // as the repository's MTP file does: the default one of its companion files, where its header says it is one.
+  if (want_dspark && !has_dspark)
+    for (const hub::CompanionFile& c : hub::companion_files(repo)) {
+      if (c.kind != "dspark" || !c.is_default) continue;
+      std::vector<std::string> paths;
+      if (!hub::fetch(repo, {c.file}, &paths, progress, stop, err)) return false;
+      if (!is_dspark_file(paths[0])) {
+        out->notes.push_back(repo.id + "/" + c.file.path + " is not a DSpark drafter: not drafting with it");
+        break;
+      }
+      out->drafters.push_back(paths[0]);
+      out->drafter_sources.push_back({"dspark", repo.id + "/" + c.file.path, bytes_on_disk(paths[0])});
+      out->notes.push_back("the DSpark drafter from " + repo.id + "/" + c.file.path);
+      break;
+    }
   for (const std::string& k : known_drafters(repo.base_models)) {
     bool given = false;
     for (const std::string& d : drafters) given = given || d.rfind(k, 0) == 0;
@@ -338,7 +423,8 @@ hub::ProgressFn make_progress_logger(const char* prefix, double interval_ms, hub
 bool fetch_named(std::string* model, EngineOptions* eo, std::string* err) {
   auto progress = make_progress_logger("flyx", 2000);
   Fetched f;
-  if (!fetch_model(*model, eo->drafter_files, wants_mtp(*eo), progress, nullptr, &f, err, eo->mmproj_file, eo->vision))
+  if (!fetch_model(*model, eo->drafter_files, wants_mtp(*eo), progress, nullptr, &f, err, eo->mmproj_file, eo->vision,
+                   wants_dspark(*eo, eo->drafter_files)))
     return false;
   if (f.model != *model) std::fprintf(stderr, "flyx: %s is %s\n", model->c_str(), f.model.c_str());
   for (size_t i = 0; i < eo->drafter_files.size() && i < f.drafters.size(); ++i)

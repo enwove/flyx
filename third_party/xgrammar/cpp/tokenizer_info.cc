@@ -14,6 +14,7 @@
 #include <stack>
 #include <string>
 #include <unordered_map>
+#include <unordered_set>
 #include <variant>
 #include <vector>
 
@@ -270,7 +271,8 @@ TokenizerInfo::Impl::Impl(
     VocabType vocab_type,
     std::optional<int> vocab_size,
     std::optional<std::vector<int32_t>> stop_token_ids,
-    bool add_prefix_space
+    bool add_prefix_space,
+    const std::vector<int32_t>& atomic_token_ids
 )
     : vocab_type_(vocab_type),
       vocab_size_(vocab_size.value_or(encoded_vocab.size())),
@@ -282,16 +284,27 @@ TokenizerInfo::Impl::Impl(
       << encoded_vocab.size() << ").";
   decoded_vocab_.reserve(encoded_vocab.size());
   sorted_decoded_vocab_.reserve(encoded_vocab.size());
+  // flyx: atomic tokens keep their text and stay out of the sorted byte vocabulary (README.flyx.md).
+  const std::unordered_set<int32_t> atomic_ids(atomic_token_ids.begin(), atomic_token_ids.end());
+  for (int32_t id : atomic_ids) {
+    XGRAMMAR_CHECK(id >= 0 && static_cast<size_t>(id) < encoded_vocab.size())
+        << "Atomic token id out of range: " << id;
+  }
   for (int i = 0; i < static_cast<int>(encoded_vocab.size()); ++i) {
     const std::string& token = TokenDecoder::DecodeToken(encoded_vocab[i], vocab_type_);
     decoded_vocab_.push_back(token);
+    const bool atomic = atomic_ids.count(i) != 0;
+    if (atomic) {
+      XGRAMMAR_CHECK(!token.empty()) << "Atomic token must have decoded text: " << i;
+      special_token_ids_.push_back(i);
+    }
     if ((!stop_token_ids && DETECTION_STOP_TOKENS.count(token)) ||
         (stop_token_ids &&
          std::find(stop_token_ids->begin(), stop_token_ids->end(), i) != stop_token_ids->end())) {
       stop_token_ids_.push_back(i);
     } else if (IsSpecialToken(token)) {
       special_token_ids_.push_back(i);
-    } else {
+    } else if (!atomic) {
       sorted_decoded_vocab_.push_back({i, token});
     }
   }
@@ -306,13 +319,15 @@ TokenizerInfo::Impl::Impl(
   std::sort(sorted_decoded_vocab_.begin(), sorted_decoded_vocab_.end(), f_compare_token);
 
   BuildTokenIdToSortedVocabIndex();
+  BuildAtomicTokenIds();
 
   // The value means: the subtree is [i, trie_subtree_nodes_range[i]).
   trie_subtree_nodes_range_.resize(sorted_decoded_vocab_.size(), 0);
   std::stack<std::pair<std::string, int32_t>> prefix_stack;
   for (size_t i = 0; i < sorted_decoded_vocab_.size(); ++i) {
     const auto& token = sorted_decoded_vocab_[i].second;
-    while ((!prefix_stack.empty()) && (token.find(prefix_stack.top().first) == std::string::npos)) {
+    // flyx: a subtree ends where its prefix does; upstream kept any token that contains it (README.flyx.md).
+    while (!prefix_stack.empty() && token.rfind(prefix_stack.top().first, 0) != 0) {
       const auto& top_pair = prefix_stack.top();
       trie_subtree_nodes_range_[top_pair.second] = i;
       prefix_stack.pop();
@@ -356,6 +371,21 @@ void TokenizerInfo::Impl::BuildTokenIdToSortedVocabIndex() {
   }
 }
 
+// flyx: the special ids that have text are the atomic ones (README.flyx.md).
+void TokenizerInfo::Impl::BuildAtomicTokenIds() {
+  atomic_token_ids_.clear();
+  for (int32_t id : special_token_ids_) {
+    if (static_cast<size_t>(id) < decoded_vocab_.size() && !decoded_vocab_[id].empty()) {
+      atomic_token_ids_.push_back(id);
+    }
+  }
+  std::sort(atomic_token_ids_.begin(), atomic_token_ids_.end());
+}
+
+bool TokenizerInfo::Impl::IsAtomicToken(int32_t id) const {
+  return std::binary_search(atomic_token_ids_.begin(), atomic_token_ids_.end(), id);
+}
+
 void TokenizerInfo::Impl::BuildTokenCharData() {
   token_char_counts_.assign(sorted_decoded_vocab_.size(), 0);
   int32_t max_chars = 0;
@@ -390,6 +420,9 @@ picojson::value TokenizerInfo::Impl::DumpMetadataValue() const {
     stop_token_ids_array.push_back(picojson::value(static_cast<int64_t>(id)));
   }
   obj["stop_token_ids"] = picojson::value(std::move(stop_token_ids_array));
+  if (!atomic_token_ids_.empty()) {
+    obj["atomic_token_ids"] = AutoSerializeJSONValue(atomic_token_ids_);
+  }
 
   return picojson::value(std::move(obj));
 }
@@ -445,6 +478,11 @@ std::optional<std::runtime_error> TokenizerInfo::Impl::CheckMetadataMatch(
   if (stop_token_ids_vec != stop_token_ids_) {
     return std::runtime_error("Stop token ids mismatch");
   }
+  auto atomic = object.find("atomic_token_ids");
+  if (atomic == object.end() ? !atomic_token_ids_.empty()
+                             : atomic->second != AutoSerializeJSONValue(atomic_token_ids_)) {
+    return std::runtime_error("Atomic token ids mismatch");
+  }
   return std::nullopt;
 }
 
@@ -479,8 +517,13 @@ std::shared_ptr<TokenizerInfo::Impl> TokenizerInfo::Impl::FromVocabAndMetadata(
     XGRAMMAR_CHECK(id.is<int64_t>()) << "Stop token id is not an integer";
     stop_token_ids.push_back(static_cast<int32_t>(id.get<int64_t>()));
   }
+  std::vector<int32_t> atomic_token_ids;
+  if (auto it = obj.find("atomic_token_ids"); it != obj.end()) {
+    auto error = AutoDeserializeJSONValue(&atomic_token_ids, it->second, "atomic_token_ids");
+    XGRAMMAR_CHECK(!error.has_value()) << "Invalid 'atomic_token_ids' in metadata";
+  }
   return std::make_shared<Impl>(
-      encoded_vocab, vocab_type, vocab_size, stop_token_ids, add_prefix_space
+      encoded_vocab, vocab_type, vocab_size, stop_token_ids, add_prefix_space, atomic_token_ids
   );
 }
 
@@ -506,10 +549,11 @@ TokenizerInfo::TokenizerInfo(
     VocabType vocab_type,
     std::optional<int> vocab_size,
     std::optional<std::vector<int32_t>> stop_token_ids,
-    bool add_prefix_space
+    bool add_prefix_space,
+    const std::vector<int32_t>& atomic_token_ids
 )
     : pimpl_(std::make_shared<Impl>(
-          encoded_vocab, vocab_type, vocab_size, stop_token_ids, add_prefix_space
+          encoded_vocab, vocab_type, vocab_size, stop_token_ids, add_prefix_space, atomic_token_ids
       )) {}
 
 int TokenizerInfo::GetVocabSize() const { return pimpl_->GetVocabSize(); }
@@ -555,6 +599,7 @@ std::variant<TokenizerInfo, SerializationError> TokenizerInfo::DeserializeJSON(
   }
   // Derived per-token arrays are not serialized; rebuild them like the constructor does.
   tokenizer_info->BuildTokenIdToSortedVocabIndex();
+  tokenizer_info->BuildAtomicTokenIds();
   tokenizer_info->BuildTokenCharData();
   return tokenizer_info;
 }

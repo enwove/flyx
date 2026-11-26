@@ -8,7 +8,7 @@
 
 namespace flyx::interfaces {
 
-enum class DrafterMode { kAuto, kMtp, kDFlash2, kDv, kAll, kNone };
+enum class DrafterMode { kAuto, kMtp, kDFlash2, kDv, kDSpark, kAll, kNone };
 
 inline bool parse_drafter_mode(std::string_view value, DrafterMode* out) {
   if (value.empty()) {
@@ -25,6 +25,10 @@ inline bool parse_drafter_mode(std::string_view value, DrafterMode* out) {
   }
   if (value == "dv") {
     *out = DrafterMode::kDv;
+    return true;
+  }
+  if (value == "dspark") {
+    *out = DrafterMode::kDSpark;
     return true;
   }
   if (value == "all") {

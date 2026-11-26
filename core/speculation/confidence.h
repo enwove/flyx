@@ -19,7 +19,7 @@ class ConfidenceStopper {
   void configure(const std::vector<int>& widths, const std::vector<double>& costs_ms, double plain_ms);
 
   // Start a new reply: resets per-reply throughput and position acceptance counts while retaining
-  // learned head calibration (with softened curvature so topic/format shifts adapt quickly).
+  // learned head calibration.
   void begin();
 
   bool ready() const { return policy_.n_buckets > 1; }
@@ -28,8 +28,9 @@ class ConfidenceStopper {
   double bucket_cost(int width) const;
 
   // Update online calibrator from one completed round of `width` drafts (`accepted` accepted)
-  // with optional per-draft confidence arrays (may be null or zero when unavailable).
-  void observe(int width, int accepted, const float* draft_prob, const float* draft_margin);
+  // with optional per-draft confidence arrays (may be null or zero when unavailable).  `cost_ms`: what the round cost,
+  // for a fixed round of the drafter (its width may be none of the checkpoints); 0 takes its bucket's cost.
+  void observe(int width, int accepted, const float* draft_prob, const float* draft_margin, double cost_ms = 0);
 
  private:
   void init_rates();

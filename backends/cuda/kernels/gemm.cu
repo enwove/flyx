@@ -256,14 +256,18 @@ void gemm_fp4(const float* x, int ldx, const uint8_t* Q, const uint8_t* S, const
     gemm_fp4_mma(x, ldx, Q, S, RS, N, K, y, ldy, rows, accumulate, L.st);
 }
 
+bool gemm_skinny_takes(const float* x, int ldx, const bf16* W, int K, const Launch& L) {
+  return !opts(L).row_gemms && skinny_fits(x, ldx, W, K);
+}
+
 void gemm(const float* x, int ldx, const bf16* W, int N, int K, float* y, int ldy, int rows, bool accumulate,
           const Launch& L) {
-  const bool row_path = opts(L).row_gemms;
+  const bool row_path = opts(L).row_gemms, skinny = gemm_skinny_takes(x, ldx, W, K, L);
   if (rows > 16 && (L.round_rows || L.draft)) {
     // Every tile of 16 rows the 1..16-row kernel's arithmetic, the weights read once (a round's: a linear's bf16
     // weights, regions/linear.cpp, and an adapter's; numerics.md R, C), or bf16 inputs (a drafting pass's:
     // deterministic).
-    if (rows <= 64 && !row_path && skinny_fits(x, ldx, W, K)) {
+    if (rows <= 64 && skinny) {
       const int fmt = L.round_rows ? kFmtBf16Rows : kFmtBf16Draft;
       gemm_skinny_mt_cfg(pick_config(opts(L).tuning, fmt, N, K, rows), x, ldx, W, N, K, y, ldy, rows, accumulate, L);
       return;
@@ -274,8 +278,7 @@ void gemm(const float* x, int ldx, const bf16* W, int N, int K, float* y, int ld
       return;
     }
   }
-  if (rows <= 16 && !row_path && skinny_fits(x, ldx, W, K))
-    gemm_skinny(x, ldx, W, N, K, y, ldy, rows, accumulate, L);
+  if (rows <= 16 && skinny) gemm_skinny(x, ldx, W, N, K, y, ldy, rows, accumulate, L);
   else if (rows <= 16 || row_path || (ldx % 4) != 0) gemm_rows(x, ldx, W, N, K, y, ldy, rows, accumulate, L.st);
   else if (tc_fits(x, ldx, K)) gemm_tc(x, ldx, W, N, K, y, ldy, rows, accumulate, L);
   else gemm_mma(x, ldx, W, N, K, y, ldy, rows, accumulate, L.st);
