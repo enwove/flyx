@@ -4,6 +4,138 @@ Reproducible long-context coding, `flyx bench` decode, drafter, and Needle-in-a-
 
 ---
 
+## v0.2.1 four-GPU verified benchmarks
+
+Linux captures used CUDA 13.0.88 on Ubuntu 24.04 with PTX JIT disabled. The hardware table below describes the original `5fa1a32` runs. The RTX 4090 and 3090 Inkling decode results come from a second capture on `078022fc`. Windows measurements used native Windows 11 (WDDM), with Inkling and the dashboard on `5fa1a32`, and Qwen, the 20K ring and cold start on `42e3734` before the Inkling decode changes. The Windows candidate passed 170/170 GPU-suite tests. Its standalone executable contained 115 cubins and zero PTX images and weighed 57,148,928 bytes (57.15 MB), compared with 58,960,384 bytes in v0.2.0. These captures predate the version bump.
+
+| GPU | Driver | Power limit | Qwen3.8-27B GGUF | GPU weight GB | Effective / rated GB/s | Share |
+|---|---|---:|---|---:|---:|---:|
+| RTX 5090 32 GB | 615.71.09 | 575 W | NVFP4-MTP-N4_0 | 14.77 | 1,385 / 1,792 | 77.3% |
+| RTX 4090 24 GB | 595.91.07 | 450 W | UD-Q4_K_XL | 16.81 | 830 / 1,008 | 82.4% |
+| RTX 3090 24 GB | 595.71.05 | 350 W | UD-Q4_K_XL | 16.81 | 719 / 936 | 76.9% |
+| RTX 5070 Ti 16 GB | 610.88 | 300 W | UD-IQ3_XXS | 10.28 | 707 / 896 | 78.9% |
+
+Effective bandwidth estimates bytes read per token from GPU weight size times plain decode rate. The range was 76.9%–82.4% of rated bandwidth. Verbose Linux runs recorded graph execution for every round, with zero eager fallbacks, including on the 3090 using the compatible sm_80 cubin.
+
+### Qwen3.8-27B
+
+Mixed decode uses the three built-in prompts, 128 tokens each. Linux ran their JSONL equivalents to capture IDs (one warm-up, then the median of three runs). Windows ran the built-in benchmark once per mode. Its mixed record omits token IDs. Linux mixed IDs and all four cards' separate single-code-prompt OFF/ON IDs matched. Each Qwen file includes MTP. DFlash2 used the same Q4_K_M companion on all cards. Rates are tokens/s.
+
+| GPU | Mixed plain | Mixed MTP | Mixed DFlash2 | Mixed all | First code prompt plain / DFlash2 | 5,791-token prefill |
+|---|---:|---:|---:|---:|---:|---:|
+| RTX 5090 | 93.8 | 286.6 | 315.5 | 323.9 | 93.8 / 565.5 | 15,496 |
+| RTX 4090 | 49.4 | 158.0 | 171.6 | 165.6 | 49.5 / 305.7 | 2,678 |
+| RTX 3090 | 42.8 | 121.7 | 131.2 | 125.0 | 42.8 / 234.1 | 954 |
+| RTX 5070 Ti | 68.8 | 167.2 | 154.4 | 156.1 | 68.8 / 332.8 | — |
+
+On the 6,293-token Inkling prefill workload (same input file, different tokenizer), the 3090, 4090 and 5090 reached 1,829, 3,855 and 5,409 tok/s respectively. These plain prefill timings come from the original candidate.
+
+The 5090 used W4A4 prefill on the NVFP4 target. On the same prompt, explicit `--activations exact` (BF16 inputs) gave 3,602 tok/s on the first pass and 3,598 on the second. At 128,000 input tokens, plain decode reached 73.4 tok/s and MTP reached 203.8 tok/s with identical output text over 256 tokens.
+
+### Inkling-2-Mini and Markov DSpark
+
+The target was `Inkling-2-Mini-UD-IQ3_XXS.gguf`, the companion `dspark-Inkling-2-Mini-Q8_0.gguf`. Each cell shows plain → DSpark decode tok/s on the same GPU, with exact KV reads and lookup disabled. All four GPUs matched prompt IDs, output IDs and output lengths between plain and DSpark for every prompt in the warm-up and three measured runs. The RTX 5090 and 5070 Ti used `5fa1a32`. The 4090 and 3090 used `078022fc`, which rounds the scaled ShortConv result before adding the residual. On each of those two GPUs, the fused and generic paths matched on all eight chat prompts, and all four GPU tests passed (`cuda_ops`, `inkling2_cuda`, `cuda_loader`, `elastic_load_cuda`).
+
+| GPU | chat_short, 8 × 128 | code_short, 8 × 384 |
+|---|---:|---:|
+| RTX 5090 | 225.5 → 259.8 | 228.5 → 438.9 |
+| RTX 4090 | 166.7 → 202.9 | 167.9 → 322.4 |
+| RTX 3090 | 126.2 → 136.5 | 126.9 → 222.0 |
+| RTX 5070 Ti | 150.9 → 169.3 | 153.6 → 276.2 |
+
+The RTX 4090 recheck used a 500 W limit and driver 595.91.07. The RTX 3090 recheck used 350 W and driver 580.178.04. The ranges below cover the three measured runs. Speedups use the unrounded rates. The single-prompt rows used the first `chat_short` prompt (`--limit 1 -n 128`) once per mode.
+
+| GPU | Workload | Plain tok/s (min–max) | DSpark tok/s (min–max) | DSpark tokens/round | Speedup |
+|---|---|---:|---:|---:|---:|
+| RTX 4090 | Chat, 8 × 128 | 166.6–166.7 | 202.7–202.9 | 1.79 | 1.217× |
+| RTX 4090 | Code, 8 × 384 | 167.9–168.0 | 321.6–322.6 | 3.38–3.39 | 1.920× |
+| RTX 4090 | First chat prompt, 1 × 128 | 166.5 | 257.2 | 2.76 | 1.545× |
+| RTX 3090 | Chat, 8 × 128 | 126.1–126.4 | 135.8–139.0 | 1.60–1.67 | 1.082× |
+| RTX 3090 | Code, 8 × 384 | 126.8–127.0 | 220.9–222.7 | 3.48–3.49 | 1.749× |
+| RTX 3090 | First chat prompt, 1 × 128 | 126.1 | 180.1 | 2.82 | 1.429× |
+
+### DFlash2 ring memory and Windows latency
+
+With a 17,993-token prompt and 20,480-token context, single-session memory (decimal GB, flat → ring) fell from 1.87 → 1.51 on the 3090 and 4090, 1.82 → 1.46 on the 5070 Ti (0.36 GB saved), and 1.82 → 1.52 on the 5090. Flat and ring output IDs matched. With 59,976 prompt tokens and a 65,536-token context on the 5090, the same comparison gave 4.24 → 3.02 GB (1.22 GB saved), with identical text and accepted tokens each round.
+
+On the 5070 Ti, three fresh Inkling plain processes with warm OS file cache took 2,381, 2,353 and 2,347 ms from spawn to first visible text (median **2,353 ms**). In a separate live dashboard request the active drafter read **dspark · q8**. The server decoded **237.8 tok/s** (128 tokens, 3.34 tokens/round). Client time to first streamed content was 106 ms.
+
+### Reproduce the captures
+
+Set `Q` to the Qwen file in the hardware table (akopytko's NVFP4 GGUF or Unsloth's UD GGUF), `D` to z-lab's `Qwen3.8-27B-DFlash2-Q4_K_M.gguf`, and `I` and `S` to the two Inkling files above from Unsloth. From the repository root, run the following in Bash. For the Windows mixed timing, omit `--prompts mixed3.jsonl` to use the built-in workload. For repeated measurements, warm up each variant once and alternate their order over three repetitions.
+
+```bash
+cat > mixed3.jsonl <<'JSONL'
+{"question": "Write a Python function that parses an ISO 8601 date string without using datetime, with tests."}
+{"question": "Explain how a CPU cache works to a new engineer, with a concrete example of a cache miss."}
+{"question": "Copy this list exactly, one item per line: alpha, bravo, charlie, delta, echo, foxtrot, golf, hotel, india, juliet, kilo, lima, mike, november, oscar, papa, quebec, romeo, sierra, tango, uniform, victor, whiskey."}
+JSONL
+export CUDA_DISABLE_PTX_JIT=1
+common=(--backend cuda --no-vision --ctx 4096 --temperature 0 --seed 42 --ignore-eos)
+for mode in plain mtp dflash2 all; do
+  case "$mode" in
+    plain) opts=(--no-spec --no-lookup) ;;
+    mtp) opts=(--drafter mtp) ;;
+    *) opts=(--drafter "$mode" --drafter-file "$D") ;;
+  esac
+  flyx bench "$Q" "${common[@]}" "${opts[@]}" --prompts mixed3.jsonl -n 128 --json "mixed-$mode.json"
+done
+for mode in plain dflash2; do
+  opts=(--no-spec)
+  if [[ $mode == dflash2 ]]; then opts=(--drafter dflash2 --drafter-file "$D"); fi
+  flyx bench "$Q" "${common[@]}" --prompts bench/prompts/code_short.jsonl --limit 1 --no-lookup "${opts[@]}" -n 128
+done
+for set in chat_short code_short; do
+  n=128
+  if [[ $set == code_short ]]; then n=384; fi
+  for mode in plain dspark; do
+    opts=(--no-spec)
+    if [[ $mode == dspark ]]; then opts=(--drafter dspark --drafter-file "$S"); fi
+    flyx bench "$I" "${common[@]}" --kv-method exact --no-lookup --prompts "bench/prompts/$set.jsonl" --limit 8 -n "$n" "${opts[@]}" --json "$set-$mode.json"
+  done
+done
+runner=(--backend cuda --no-vision --chat --no-think --seed 42 --temperature 0 --ignore-eos)
+for model in "$Q" "$I"; do
+  flyx run "$model" "${runner[@]}" --no-spec --no-lookup --ctx 8192 -f bench/prompts/prompt_6k.txt -n 16
+done
+flyx run "$Q" "${runner[@]}" --no-spec --ctx 8192 -f bench/prompts/prompt_6k.txt -n 32 --activations exact -v
+python bench/prompts/make_coding_prompt.py --flyx flyx --model "$Q" --tokens 128000 -o long128k.txt
+flyx run "$Q" "${runner[@]}" --ctx 131072 -f long128k.txt --no-spec --no-lookup -n 256 -v
+flyx run "$Q" "${runner[@]}" --ctx 131072 -f long128k.txt --drafter mtp -n 256 -v
+python bench/prompts/make_coding_prompt.py --flyx flyx --model "$Q" --tokens 60000 -o long60k.txt
+for ring in 0 1; do
+  flyx run "$Q" "${runner[@]}" --ctx 65536 -f long60k.txt --drafter dflash2 --drafter-file "$D" --no-lookup --backend-opt dflash_ring="$ring" -n 256 -v
+done
+```
+
+For the 20K ring comparison, build the single JSONL prompt from the three repository fixtures in their original order. The prefix and blank lines are part of the input.
+
+```bash
+python - <<'PY'
+from pathlib import Path
+import json
+root = Path("bench/prompts")
+files = ["long.txt", "prompt_6k.txt", "summarize_tree_verification.txt"]
+body = "\n\n".join((root / name).read_text(encoding="utf-8") for name in files)
+question = "Summarize the following text and code in detail:\n\n" + body
+Path("ring.jsonl").write_text(json.dumps({"question": question}) + "\n", encoding="utf-8")
+PY
+for ring in 0 1; do
+  flyx bench "$Q" --backend cuda --no-vision --ctx 20480 --kv-method exact --no-lookup --temperature 0 --seed 42 --ignore-eos --prompts ring.jsonl -n 128 --drafter dflash2 --drafter-file "$D" --backend-opt dflash_ring="$ring" --json "ring-$ring.json" -v
+done
+```
+
+To repeat the Windows startup measurement, time the process through its first visible reply with the OS cache warm. For the live measurement, start the server below and stream a chat completion for `Write a detailed Python ISO 8601 parser with unit tests. Start with code.` with thinking disabled, temperature 0, seed 42 and a 128-token limit.
+
+```bash
+flyx run "$I" --backend cuda --ctx 4096 --no-spec --no-lookup --chat --no-think --temperature 0 --seed 42 --ignore-eos -p "Reply with the single letter A." -n 4 -v
+flyx serve "$I" --drafter dspark --drafter-file "$S" --no-lookup --ctx 4096 --host 127.0.0.1 --port 18080 --no-browser --no-monitor
+```
+
+## Historical v0.2.0 results
+
+Sections 1–3 below preserve the original six-card measurements on `b950329b`, including the WSL2 run. The independent DV study in section 5 uses a different model and workload.
+
 ## 1. Qwen3.8-27B Long-Context Coding Benchmark
 
 All rows below were measured on the same `release-linux` build (`flyx 0.2.0`, commit `b950329b`, CUDA `13.0`, per-GPU tuning tables) at full native context (`--ctx max` = `262,144` tokens) with built-in **MTP** speculative decoding (plus `MTP + DFlash2` on RTX 5090 `NVFP4`):
@@ -141,6 +273,8 @@ python bench/prompts/make_coding_prompt.py --flyx ./bin/flyx --model MODEL.gguf 
 ---
 
 ## 5. MiniCPM5-1B with DV (RTX 5060 Ti 8 GB)
+
+Historical study using private drafter inputs. The original capture did not record a release commit.
 
 Hardware: RTX 5060 Ti 8 GB, driver `610.88`, CUDA `13.5`, Windows 11 (native, MSVC), the desktop holding about 3.3 GB of the GPU. Model: `openbmb/MiniCPM5-1B` in BF16, its DV files made from bifill-dv's checkpoints on Hugging Face (`panmz/bifill-dv`, a private repository: without access to it the DV rows below cannot be reproduced; [models](models.md) has the commands, [DV](design/dv.md#the-description-and-the-file-abi-42) the files), binary16 K/V (`--kv 16`). Prompts: GSM8K's first 100 test questions as bifill-dv prompts them (`gsm8k_test.jsonl`, made from the public `openai/gsm8k` as below; the instruction below after each), greedy, at most 512 new tokens. Every DV run generates plain decoding's tokens for all 100 (`tests/e2e/check_dv.py`).
 

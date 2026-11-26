@@ -121,6 +121,8 @@ Defined in `core/os/env.h` (plus CUDA / Python standard variables). Explicit CLI
 | `FLYX_LOOKUP` | `0` \| `1` | Enable/disable prompt lookup (`0` = `--no-lookup`). |
 | `FLYX_DRAFT_TREES` | `0` \| `1` | Enable/disable DFlash2 draft trees (`1` = `--draft-trees`). |
 | `FLYX_ADAPTIVE` | `0` \| `1` | Enable/disable intra-round confidence optimal stopping on adaptive drafter plans (`1`, default). Enabled for sequential drafters (MTP) and for drafters (DSpark, with step-wise Markov early stopping and optimal prefix verification, and DFlash2) on targets whose verify cost scales steeply with width (such as sparse MoE `inkling2_loop`, across checkpoints up to the drafter's trained block `{1, 2, 3, 5, 7}`, with sustained high-acceptance runs widening past the trained block when supported); dense targets paired with block drafters (DFlash2) verify the chooser's fixed widths. |
+| `FLYX_SC_CLUSTER` | `1`, `4`, `8` | Inkling fused sublayer blocks per cluster (default 8 on eligible devices). Unsupported devices or shapes use one block. |
+| `FLYX_MOE_VEC` | `0`, `1` | Inkling NVFP4 experts use tensor-core MMA by default. Set 1 to use the float32 column-vector path for every round width. |
 | `FLYX_CHAT_NATIVE` | `0` \| `1` | Force Jinja engine (`0`) instead of native chat renderer (`1`, default). |
 | `FLYX_API_KEY` / `FLYX_KEY` | string | Default server API key when `--api-key` is unset. |
 | `FLYX_MODELS_DIR` | paths (`:` Linux / `;` Win) | Additional local model directories appended to `--models-dir`. |
@@ -226,6 +228,14 @@ Base URLs: OpenAI clients use `http://127.0.0.1:8080/v1`; Anthropic clients use 
 | `POST /v1/messages` | Anthropic Messages | `system`, content blocks (`text`, base64 `image`, `tool_use`, `tool_result`, `thinking`), `tools`, `tool_choice` (`auto`, `any`, `tool`, `none`; `disable_parallel_tool_use`), `thinking` (`enabled`/`disabled`), `output_config.format` (`json_schema`; incompatible with assistant prefill), `stop_sequences`, `stream`, `max_tokens`. Reused tokens reported in `usage.cache_read_input_tokens`. **Prewarm mode:** `max_tokens: 0` with `stream: false` prefills and caches the prompt (rejects enabled thinking, `output_config.format`, or required tool use with HTTP 400). |
 | `POST /v1/messages/count_tokens` | Anthropic Messages | Returns prompt token count for a Messages payload without generating (including expanded vision tokens when a vision encoder is loaded). |
 
+For image input, load a supported `qwen35` target and its matching `qwen3vl_merger` projector. The Hub can fetch it automatically, or select a local companion with **Use as projector**. The dashboard accepts pasted or dropped images. In a user message, send one of these content blocks alongside a text instruction (replace `BASE64` with the encoded PNG bytes).
+
+| Endpoint | Image content block |
+|---|---|
+| `/v1/chat/completions` | `{"type":"image_url","image_url":{"url":"data:image/png;base64,BASE64"}}` |
+| `/v1/responses` | `{"type":"input_image","image_url":"data:image/png;base64,BASE64"}` |
+| `/v1/messages` | `{"type":"image","source":{"type":"base64","media_type":"image/png","data":"BASE64"}}` |
+
 ### Management, Telemetry, and Hub Endpoints
 
 `GET /health` answers anyone who reaches the port. `GET /v1/telemetry` and `GET /v1/load` take the API key when one is set (HTTP 401 without it). The others (`/v1/requests`, `/v1/logs`, `POST`/`DELETE /v1/load`, `/v1/unload`, `/v1/hub/*`) are for this machine, or with `--api-key` for the key's holder (HTTP 403 otherwise). This machine means a connection from the loopback address that no proxy passed on: a request carrying `Forwarded`, `X-Forwarded-*`, `X-Real-IP` or `Via` is taken as coming from elsewhere, so behind a reverse proxy or an HTTP tunnel set `--api-key`.
@@ -251,6 +261,8 @@ Base URLs: OpenAI clients use `http://127.0.0.1:8080/v1`; Anthropic clients use 
 | `POST /v1/hub/dir` | Opens the desktop's own folder dialog on the server's machine (body `{"title", "start"}`, both optional) and waits: answers as `GET /v1/hub/dir` for the folder chosen, `{"path": null}` when cancelled. Loopback requests only (HTTP 403 otherwise); HTTP 501 where no dialog can be shown (SSH session, no display, a service; Linux needs `zenity` or `kdialog`); HTTP 409 while one is open. |
 | `DELETE /v1/hub/cached?name=NAME` | Deletes a cached HF snapshot + unreferenced blobs (`{"deleted", "freed"}`). Refuses active models (409) and `--models-dir` files (400). |
 | `GET /`, `GET /dashboard` | Browser dashboard UI (non-browser clients at `/` get JSON endpoint index). |
+
+To load Inkling and discover its DSpark companion, post `{"model":"unsloth/Inkling-2-Mini-GGUF:UD-IQ3_XXS"}` to `/v1/load`. To choose files explicitly, pass their paths in the `drafters` array and the mode in `drafter`. A 202 starts the operation. Poll `GET /v1/load` until `ready` or `failed`. **Draft with it** applies a companion to the chosen target. Local and cached GGUF classification uses header metadata, including the Markov discriminator. Remote listings can use repository metadata and filenames until the file is available locally.
 
 ### Semantics & Error Codes Agents Should Expect
 

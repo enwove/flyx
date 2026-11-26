@@ -90,6 +90,8 @@ round instead of two. In flyx that needs rows in one pass that are not verified 
 weights): row groups, per-group norms, adapters and key maps, and a GEMM whose verify tiles keep plain decoding's bits
 beside canvas tiles.
 
+v0.2.1 uses backend ABI `48u`. The ABI numbers below date individual features. DV uses a compatible Llama target. Programs with relative attention or ShortConv cannot lower CUDA verification trees. Target-owned V-LoRA remains a format 2 feature.
+
 ## The Description and the File (ABI 42)
 
 * `FLYX_BLOCK_DV_LAYER` (`flyx_dv_layer_block`): one per target layer, naming the target's attention and MLP blocks
