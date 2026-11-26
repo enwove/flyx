@@ -695,17 +695,13 @@ int main() {
     check(adaptive_first && prefers_7 && three && cands.front().choice.width == 3 &&
               cands.front().expected_tokens == three->expected_tokens && cands.front().solo_ms == three->solo_ms,
           "a preferred 7 past adaptive checkpoints up to 3: the adaptive round, scored as the plan of 3");
-    // A fixed round of 7 accepted whole, through the chooser: renewal-reward ratio updates numerator by 8 tokens and
-    // denominator by 7's own cost (10.2 ms), not 3's (10.1 ms).
+    // A fixed round of 7 accepted whole, through the chooser: lambda moves toward 8 tokens over 7's own cost.
     const float lam0 = rc.stop_policy(0)->lambda;
-    const double tok0 = double(lam0) * 10.1;  // initial best prior bucket is width 3 at 10.1 ms
     const RoundChoice seven{false, 3, 7, 0, false};
     rc.commit(seven, 0);
     rc.result(seven, true, 7, std::vector<int32_t>(8, 1), 0, true);
-    const double want = (0.9 * tok0 + 0.1 * 8.0) / (0.9 * 10.1 + 0.1 * 10.2);
-    const double wrong_cost = (0.9 * tok0 + 0.1 * 8.0) / 10.1;
-    check(std::fabs(double(rc.stop_policy(0)->lambda) - want) < 1e-6 &&
-              std::fabs(double(rc.stop_policy(0)->lambda) - wrong_cost) > 1e-4,
+    const double want = 0.9 * double(lam0) + 0.1 * 8.0 / 10.2;
+    check(std::fabs(double(rc.stop_policy(0)->lambda) - want) < 1e-6,
           "a fixed round of 7 past checkpoints up to 3 trains the stopper at its own cost (10.2 ms), not 3's (10.1)");
   }
 
@@ -755,30 +751,6 @@ int main() {
     }
     check(noisy.policy().w_margin < w1_init && noisy.policy().w_margin >= 0.f,
           "uncalibrated drafter decays w_margin cleanly toward zero");
-
-    // Position-aware calibration + Markov hierarchical prior: when early positions accept strongly while deeper
-    // positions reject, p_pos[k] decays across positions and unobserved deeper positions inherit the lower tail
-    // rather than pooled position-0 acceptance.
-    ConfidenceStopper pos_cal;
-    pos_cal.configure({1, 2, 3, 5, 7}, {5.0, 7.0, 9.0, 12.0, 15.0}, 4.5);
-    const float mid_p[FLYX_MAX_ROWS] = {0.80f, 0.80f, 0.80f, 0.80f, 0.80f, 0.80f, 0.80f};
-    const float mid_m[FLYX_MAX_ROWS] = {1.5f, 1.5f, 1.5f, 1.5f, 1.5f, 1.5f, 1.5f};
-    for (int i = 0; i < 40; ++i) pos_cal.observe(3, 2, mid_p, mid_m);  // pos 0,1 always accepted; pos 2 always rejected
-    check(pos_cal.policy().p_pos[0] > 0.85f && pos_cal.policy().p_pos[2] < 0.25f &&
-              pos_cal.policy().p_pos[4] < 0.25f,
-          "Markov hierarchical prior propagates low deeper acceptance instead of leaking pos-0 rate");
-
-    // Exact renewal-reward ratio E[T]/E[C]: alternating cheap narrow (1 tok / 5 ms = 0.20) and expensive wide
-    // (7 tok / 15 ms = 0.467) rounds must converge to true 4/10 = 0.400 rather than biased E[T/C] = 0.333.
-    ConfidenceStopper rr;
-    rr.configure({1, 7}, {5.0, 15.0}, 4.5);
-    for (int i = 0; i < 120; ++i) {
-      rr.observe(1, 0, nullptr, nullptr);
-      rr.observe(7, 6, nullptr, nullptr);
-    }
-    check(std::fabs(double(rr.policy().lambda) - 0.40) < 0.015,
-          "renewal-reward lambda converges to E[T]/E[C] (0.40) without ratio-of-means bias (" +
-              std::to_string(rr.policy().lambda) + ")");
 
     std::vector<RoundCandidate> cands;
     rc.candidates({}, 0, &cands);

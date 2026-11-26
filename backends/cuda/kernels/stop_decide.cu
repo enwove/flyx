@@ -12,14 +12,11 @@ namespace flyx::cuda {
 namespace {
 
 __device__ inline float d_stop_draft_prob(float prob, float margin, int pos, const flyx_stop_policy& pol) {
-  const float p_pos = pol.p_pos[pos < FLYX_MAX_ROWS ? pos : FLYX_MAX_ROWS - 1];
-  if (prob <= 0.f) return p_pos;
-  const float p_base = fminf(fmaxf(p_pos, 1e-4f), 1.f - 1e-4f);
-  const float base_logit = fminf(fmaxf(logf(p_base / (1.f - p_base)), -6.f), 6.f);
+  if (prob <= 0.f) return pol.p_pos[pos < FLYX_MAX_ROWS ? pos : FLYX_MAX_ROWS - 1];
   const float p = fminf(fmaxf(prob, 1e-5f), 1.f - 1e-5f);
   const float lp = fminf(fmaxf(logf(p / (1.f - p)), -6.f), 10.f);
   const float mg = fminf(fmaxf(margin, 0.f), 12.f);
-  const float z = fminf(fmaxf(base_logit + pol.w_bias + pol.w_margin * mg + pol.w_logit_p * lp, -20.f), 20.f);
+  const float z = fminf(fmaxf(pol.w_bias + pol.w_margin * mg + pol.w_logit_p * lp, -20.f), 20.f);
   return 1.f / (1.f + expf(-z));
 }
 

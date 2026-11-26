@@ -10,15 +10,11 @@
 namespace flyx::ops {
 
 inline double stop_draft_prob_ref(double prob, double margin, int pos, const flyx_stop_policy& pol) {
-  const double p_pos = double(pol.p_pos[pos < FLYX_MAX_ROWS ? pos : FLYX_MAX_ROWS - 1]);
-  if (prob <= 0.0) return p_pos;
-  const double p_base = std::clamp(p_pos, 1e-4, 1.0 - 1e-4);
-  const double base_logit = std::clamp(std::log(p_base / (1.0 - p_base)), -6.0, 6.0);
+  if (prob <= 0.0) return double(pol.p_pos[pos < FLYX_MAX_ROWS ? pos : FLYX_MAX_ROWS - 1]);
   const double p = std::clamp(prob, 1e-5, 1.0 - 1e-5);
   const double lp = std::clamp(std::log(p / (1.0 - p)), -6.0, 10.0);
   const double mg = std::clamp(margin, 0.0, 12.0);
-  const double z =
-      std::clamp(base_logit + double(pol.w_bias) + double(pol.w_margin) * mg + double(pol.w_logit_p) * lp, -20.0, 20.0);
+  const double z = std::clamp(double(pol.w_bias) + double(pol.w_margin) * mg + double(pol.w_logit_p) * lp, -20.0, 20.0);
   return 1.0 / (1.0 + std::exp(-z));
 }
 
