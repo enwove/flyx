@@ -76,11 +76,14 @@ jobs:
         id: fixtures
         run: echo "core=$(python tests/e2e/make_tiny.py --digest --group core)" >> "$GITHUB_OUTPUT"
 
+      # cpu-full.yml's caches hold core's fixtures too (and DV's, which this job's stamps leave alone).
       - name: Cache test fixtures
         uses: actions/cache@v4
         with:
           path: ~/flyx-build-cpu/assets
           key: fixtures-core-${{ runner.os }}-${{ steps.fixtures.outputs.core }}
+          restore-keys: |
+            fixtures-all-${{ runner.os }}-${{ steps.fixtures.outputs.core }}-
 
       - name: Build and test (cpu preset)
         run: |

@@ -1,0 +1,153 @@
+# Copyright 2026 The flyx Authors. SPDX-License-Identifier: Apache-2.0
+name: CPU full
+
+# DV's tests, which ci.yml's cpu job leaves out (FLYX_TEST_DV: DV is not in production), on the cpu-full preset.
+# On a pull request that changes DV's code (the paths of AGENTS.md's gate 3, which requires DV's tests for such a
+# change), DV's tests alone: the cpu-dv check.  Every night from nightly.yml, every test: a change to code DV shares
+# with the rest (the round graphs, the kernels) runs no DV test on its pull request, and this is where DV breaking
+# shows.
+on:
+  pull_request:
+    paths:
+      - "models/dv.*"
+      - "ops/draft/**"
+      - "ops/canvas/**"
+      - "backends/cuda/kernels/dv.cu"
+      - "python/reference/flyx_ref/dv.py"
+      - "python/reference/dv_*.py"
+      - "python/convert/flyx_convert/dv.py"
+      - "python/convert/export_dv.py"
+      - "bench/replay/dv_choice*"
+      - "tests/**/*dv*"
+      - ".github/workflows/cpu-full.yml"
+  workflow_call:
+    inputs:
+      all:
+        description: "every test of the cpu-full preset (nightly), not DV's alone"
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+jobs:
+  cpu-full:
+    name: ${{ inputs.all && 'CPU full, every test with DV''s (Ubuntu)' || 'cpu-dv, DV''s tests (Ubuntu)' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    # github.workflow is the caller's name when nightly.yml calls this: a group of its own beside the caller's (a job
+    # in its caller's group would wait for itself) and beside this workflow's run on the same pull request.
+    concurrency:
+      group: ${{ github.workflow }}-cpu-full-${{ github.ref }}
+      cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+    env:
+      CCACHE_MAXSIZE: 500M
+      CCACHE_SLOPPINESS: pch_defines,time_macros,include_file_mtime,include_file_ctime
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install build tools
+        run: |
+          sudo apt-get update && sudo apt-get install -y ninja-build ccache
+          echo "CCACHE_DIR=$HOME/.cache/ccache" >> "$GITHUB_ENV"
+
+      # cpu-full compiles what cpu does (FLYX_TEST_DV registers tests, it builds nothing more): ci.yml's cpu job's
+      # caches serve as well (restore-keys), under a name of its own so that the two jobs of one commit do not race to
+      # save one key.
+      - name: Restore compiler cache
+        id: ccache
+        uses: actions/cache/restore@v4
+        with:
+          path: ~/.cache/ccache
+          key: ccache-${{ runner.os }}-full-${{ github.sha }}
+          restore-keys: |
+            ccache-${{ runner.os }}-
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Cache pip downloads
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/pip
+          key: pip-${{ runner.os }}-py312-${{ hashFiles('tests/requirements.txt') }}
+          restore-keys: |
+            pip-${{ runner.os }}-py312-
+
+      - name: Install Python test dependencies
+        run: |
+          python -m pip install -U pip
+          python -m pip install -r tests/requirements.txt
+
+      # Both groups' fixtures, under both digests.  A cache that holds core's alone (ci.yml's) or DV's made from other
+      # inputs is restored too: each group's stamp in the directory decides what is made again (make_tiny.py), so only
+      # the group whose inputs changed is.  Saved only when both stamps match (a run that stopped while making them
+      # leaves one missing), never under a key that then holds less than it says.
+      - name: Digests of what the test fixtures are made from
+        id: fixtures
+        run: |
+          echo "core=$(python tests/e2e/make_tiny.py --digest --group core)" >> "$GITHUB_OUTPUT"
+          echo "dv=$(python tests/e2e/make_tiny.py --digest --group dv)" >> "$GITHUB_OUTPUT"
+
+      - name: Restore test fixtures
+        id: fixtures-cache
+        uses: actions/cache/restore@v4
+        with:
+          path: ~/flyx-build-cpu/assets
+          key: fixtures-all-${{ runner.os }}-${{ steps.fixtures.outputs.core }}-${{ steps.fixtures.outputs.dv }}
+          restore-keys: |
+            fixtures-all-${{ runner.os }}-${{ steps.fixtures.outputs.core }}-
+            fixtures-core-${{ runner.os }}-${{ steps.fixtures.outputs.core }}
+
+      - name: Build and test (cpu-full preset${{ inputs.all && ', every test' || ', DV''s tests' }})
+        run: |
+          ccache --zero-stats
+          bash tools/ci/cpu.sh cpu-full ${{ inputs.all && ' ' || '-L ''^dv$''' }}
+
+      - name: Quick tier times (warnings only)
+        if: ${{ !cancelled() && hashFiles('logs/ci/ctest.xml') != '' }}
+        run: python tools/check_test_tiers.py logs/ci/ctest.xml --build ~/flyx-build-cpu --warn-only
+
+      - name: Compiler cache statistics
+        if: always()
+        run: ccache --show-stats --verbose
+
+      - name: Save compiler cache
+        if: ${{ !cancelled() && steps.ccache.outputs.cache-hit != 'true' }}
+        uses: actions/cache/save@v4
+        with:
+          path: ~/.cache/ccache
+          key: ${{ steps.ccache.outputs.cache-primary-key }}
+
+      - name: Are both fixture groups made?
+        id: fixtures-made
+        if: ${{ !cancelled() && steps.fixtures-cache.outputs.cache-hit != 'true' }}
+        run: |
+          a=~/flyx-build-cpu/assets
+          if [[ "$(cat "$a/.inputs-core" 2>/dev/null)" == "${{ steps.fixtures.outputs.core }}" &&
+                "$(cat "$a/.inputs-dv" 2>/dev/null)" == "${{ steps.fixtures.outputs.dv }}" ]]; then
+            echo "made=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Save test fixtures
+        if: ${{ !cancelled() && steps.fixtures-made.outputs.made == 'true' }}
+        uses: actions/cache/save@v4
+        with:
+          path: ~/flyx-build-cpu/assets
+          key: ${{ steps.fixtures-cache.outputs.cache-primary-key }}
+
+      - name: Upload test results (JUnit)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ctest-junit-cpu-full-${{ inputs.all && 'all' || 'dv' }}-attempt-${{ github.run_attempt }}
+          path: logs/ci/ctest.xml
+
+      - name: Upload the log on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ci-cpu-full-log
+          path: logs/ci/cpu-full.log
