@@ -5,10 +5,11 @@
 namespace flyx::optest {
 
 // ---- GGML block weights kept packed (gemm_blocks.cu) -------------------------------------------
-const BlockType kBlockTypes[19] = {
+const BlockType kBlockTypes[21] = {
     {FLYX_DT_GGML_Q4_0, "Q4_0", {0}},       {FLYX_DT_GGML_Q4_1, "Q4_1", {0, 2}},
     {FLYX_DT_GGML_Q5_0, "Q5_0", {0}},       {FLYX_DT_GGML_Q5_1, "Q5_1", {0, 2}},
-    {FLYX_DT_GGML_Q8_0, "Q8_0", {0}},       {FLYX_DT_GGML_Q2_K, "Q2_K", {80, 82}},
+    {FLYX_DT_GGML_Q8_0, "Q8_0", {0}},       {FLYX_DT_GGML_MXFP4, "MXFP4", {}},
+    {FLYX_DT_GGML_Q2_0, "Q2_0", {0}},       {FLYX_DT_GGML_Q2_K, "Q2_K", {80, 82}},
     {FLYX_DT_GGML_Q3_K, "Q3_K", {108}},     {FLYX_DT_GGML_Q4_K, "Q4_K", {0, 2}},
     {FLYX_DT_GGML_Q5_K, "Q5_K", {0, 2}},    {FLYX_DT_GGML_Q6_K, "Q6_K", {208}},
     {FLYX_DT_GGML_IQ2_XXS, "IQ2_XXS", {0}}, {FLYX_DT_GGML_IQ2_XS, "IQ2_XS", {0}},
@@ -39,6 +40,9 @@ std::vector<uint8_t> random_blocks(const BlockType& bt, size_t n) {
     if (bt.dtype == FLYX_DT_GGML_IQ1_M) {  // its scale: the top nibbles of the four scale words
       const uint16_t h = scale();
       for (int j = 0; j < 4; ++j) b[49 + 2 * j] = uint8_t((b[49 + 2 * j] & 0x0F) | (((h >> (4 * j)) & 0xF) << 4));
+    }
+    if (bt.dtype == FLYX_DT_GGML_MXFP4) {  // E8M0 exponent: finite scales ~1/128..1/8 (e in 120..124)
+      b[0] = uint8_t(120u + (rng() % 5u));
     }
   }
   return file;
@@ -702,7 +706,26 @@ void test_quantize_q8_0() {
   const bool same = pay == want_pay && sc == want_sc;
   std::printf("  %-4s %-60s\n", same ? "ok" : "FAIL", "codes and scales as the host's, as blocks_pack lays them out");
   g_fail += !same;
-  for (void* p : std::initializer_list<void*>{dw, dpay, dsc}) CK(cudaFree(p));
+
+  // Row-chunked streaming quantization on a stream must match whole-matrix quantization bit for bit.
+  uint8_t* dpay2 = dev<uint8_t>(size_t(nb) * 32);
+  uint16_t* dsc2 = dev<uint16_t>(size_t(nb));
+  cudaStream_t st = nullptr;
+  CK(cudaStreamCreate(&st));
+  for (int r0 = 0; r0 < N; r0 += 7) {
+    const int nr = std::min(7, N - r0);
+    quantize_q8_0(dw + size_t(r0) * K, nr, K, dpay2 + size_t(r0) * K, dsc2 + size_t(r0) * (K / 32), st);
+  }
+  CK(cudaStreamSynchronize(st));
+  CK(cudaStreamDestroy(st));
+  std::vector<uint8_t> pay2(pay.size());
+  std::vector<uint16_t> sc2(nb);
+  CK(cudaMemcpy(pay2.data(), dpay2, pay2.size(), cudaMemcpyDeviceToHost));
+  CK(cudaMemcpy(sc2.data(), dsc2, sc2.size() * 2, cudaMemcpyDeviceToHost));
+  const bool same_chunk = pay == pay2 && sc == sc2;
+  std::printf("  %-4s %-60s\n", same_chunk ? "ok" : "FAIL", "chunked streaming == whole matrix (bit-identical)");
+  g_fail += !same_chunk;
+  for (void* p : std::initializer_list<void*>{dw, dpay, dsc, dpay2, dsc2}) CK(cudaFree(p));
 }
 
 // The drafts' two-stage head on a packed head (draft_pick_blocks): the 1-bit copy made from the rows

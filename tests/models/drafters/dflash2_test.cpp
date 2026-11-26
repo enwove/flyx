@@ -8,7 +8,8 @@
 //    and in a plain round;
 //  * a drafter made for another model is refused whether or not it is chosen; what a drafter's own config says is
 //    read when it drafts, and a GGUF drafter saying what the block here does not run is refused then
-//    (tiny_draft_refused_*.gguf), with the file named.
+//    (tiny_draft_refused_*.gguf), with the file named; a soft cap on the selector's logits and a tap after the
+//    last layer are run (tiny_draft_softcap.gguf, tiny_draft_last_layer.gguf).
 #include <cstdio>
 #include <initializer_list>
 #include <memory>
@@ -239,6 +240,38 @@ void dense_targets(const std::string& dir) {
   }
 }
 
+// What a GGUF drafter may say beyond the plain block, and the block then runs (tiny_draft_softcap.gguf,
+// tiny_draft_last_layer.gguf).
+void said_and_run(const std::string& dir) {
+  const std::string model = dir + "/tiny_gguf.gguf";
+  {  // The selector's soft cap, and where it applies when the file does not say: before the correction.
+    ModelFile f;
+    std::string err;
+    const auto m = open_beside(&f, model, dir + "/tiny_draft_softcap.gguf", "dflash2", &err);
+    bool ok = false;
+    if (m) {
+      const flyx_model_desc d = m->desc();
+      for (int i = 0; i < d.n_blocks; ++i)
+        if (d.blocks[i].kind == FLYX_BLOCK_DFLASH2)
+          ok = d.blocks[i].dflash2.softcap == 30.0f && d.blocks[i].dflash2.softcap_mode == FLYX_DFLASH2_SOFTCAP_BEFORE;
+    }
+    check(ok, "a DFlash2 GGUF with final_logit_softcapping opens with softcap=30 and before_correction mode (" + err +
+                  ")");
+  }
+  {  // A tap after the model's last layer reads its final hidden state: after the output norm (FLYX_TAP_NORMED).
+    ModelFile f;
+    std::string err;
+    const auto m = open_beside(&f, model, dir + "/tiny_draft_last_layer.gguf", "dflash2", &err);
+    bool has_post_norm = false;
+    if (m) {
+      for (const flyx_node& n : m->prefill_program())
+        if (n.kind == FLYX_NODE_TAP && n.arg1 == FLYX_TAP_NORMED) has_post_norm = true;
+    }
+    check(m && has_post_norm,
+          "a DFlash2 GGUF tapping the model's last layer: a tap after the output norm (" + err + ")");
+  }
+}
+
 void refusals(const std::string& dir) {
   const std::string model = dir + "/tiny_gguf.gguf";
   struct Case {
@@ -247,18 +280,26 @@ void refusals(const std::string& dir) {
     const char* what;
   };
   for (const Case& c : {Case{"tiny_draft_refused_causal.gguf", "causal", "causal layers"},
-                        Case{"tiny_draft_refused_dspark.gguf", "DSpark", "a Markov context (DSpark)"},
                         Case{"tiny_draft_refused_anchor.gguf", "sample_from_anchor", "sampling from the anchor"},
                         Case{"tiny_draft_refused_confidence.gguf", "confidence head", "a confidence head"},
-                        Case{"tiny_draft_refused_softcap.gguf", "soft-capping", "soft-capped logits"},
-                        Case{"tiny_draft_refused_last_layer.gguf", "final hidden state",
-                             "a tap on the target's final hidden state"},
                         Case{"tiny_draft_refused_pattern.gguf", "must be uniform", "layers that do not all slide"}}) {
     ModelFile f;
     std::string err;
     const auto m = open_beside(&f, model, dir + "/" + c.file, "dflash2", &err);
     check(!m && err.find(c.says) != std::string::npos && err.find("companion file 1: ") != std::string::npos,
           std::string("a DFlash2 GGUF with ") + c.what + ": refused, the file named (" + err + ")");
+  }
+  // A GGUF with a Markov context is a DSpark drafter, never the plain block: a dense model's programs give it no
+  // taps, so the file is refused beside one whatever drafter is asked for (tests/e2e/inkling2_test.cpp runs it
+  // beside the model it is made for).
+  for (const char* drafter : {"dflash2", "dspark", "none"}) {
+    ModelFile f;
+    std::string err;
+    const auto m = open_beside(&f, model, dir + "/tiny_draft_refused_dspark.gguf", drafter, &err);
+    check(!m && err.find("companion file 1: a DSpark drafter") != std::string::npos &&
+              err.find("does not run") != std::string::npos,
+          std::string("a DSpark GGUF beside a model whose programs do not tap for it, --drafter ") + drafter +
+              ": refused, the file named (" + err + ")");
   }
   {  // What a drafter's config says is read when it drafts: not chosen, the model opens without it.
     ModelFile f;
@@ -300,6 +341,7 @@ int main(int argc, char** argv) {
   const std::string dir = argv[1];
   dflash2_validation(dir);
   dense_targets(dir);
+  said_and_run(dir);
   refusals(dir);
   std::printf("%s (%d failures)\n", failures ? "FAILED" : "PASSED", failures);
   return failures ? 1 : 0;

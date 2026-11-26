@@ -3,6 +3,7 @@
 // into what python/convert/flyx_convert makes of it as a drafter file (--draft alone): the same "draft" description
 // (canonical_draft_config with no target) and the same tensors under the same names, their bytes read in place.
 #include <algorithm>
+#include <cmath>
 #include <cstring>
 #include <filesystem>
 #include <fstream>
@@ -43,7 +44,16 @@ json draft_config(const json& sc) {
     if (std::find(archs.begin(), archs.end(), "DFlash2DraftModel") == archs.end())
       throw std::runtime_error("drafter architectures " + archs.dump() + ": DFlash2DraftModel is supported");
     dc = sc.at("dflash_config"), tl = sc;
-    for (const auto& i : dc.at("target_layer_ids")) taps.push_back(i.get<int64_t>() + 1);
+    // target_layer_ids name the layers whose outputs the drafter reads (hidden_states[id + 1] in z-lab's code), so
+    // every id is below the target's layer count.  A list that reaches num_target_layers counts the hidden states
+    // themselves instead (0 the embedding, the last the final norm's output): Inco's drafter for Inkling-2, whose
+    // ids [5, 23, 41, 48] of 48 visits its reference hands, as they are, to the capture DSpark's ids go to.
+    std::vector<int64_t> ids;
+    for (const auto& i : dc.at("target_layer_ids")) ids.push_back(i.get<int64_t>());
+    const json n_target = sc.value("num_target_layers", json());
+    const bool hidden_states =
+        n_target.is_number_integer() && std::find(ids.begin(), ids.end(), n_target.get<int64_t>()) != ids.end();
+    for (int64_t id : ids) taps.push_back(hidden_states ? id : id + 1);
     vocab = tl.at("vocab_size").get<int64_t>(), target_hidden = tl.at("hidden_size").get<int64_t>();
     causal = sc.value("is_causal", json());
   } else {
@@ -107,6 +117,17 @@ json draft_config(const json& sc) {
   d["sel_rank"] = dc.value("selector_rank", json(256));
   d["sel_topk"] = dc.value("selector_top_k", json(16));
   d["window"] = window;
+  if (dc.contains("final_logit_softcapping") && dc["final_logit_softcapping"].is_number()) {
+    const double sc_val = dc["final_logit_softcapping"].get<double>();
+    if (!std::isfinite(sc_val) || sc_val < 0.0) throw std::runtime_error("draft final_logit_softcapping out of range");
+    if (sc_val > 0.0) d["softcap"] = sc_val;
+  }
+  if (dc.contains("selector_softcap_mode") && dc["selector_softcap_mode"].is_string()) {
+    const std::string sm = dc["selector_softcap_mode"].get<std::string>();
+    if (sm != "before_correction" && sm != "after_correction")
+      throw std::runtime_error("unsupported draft selector_softcap_mode: " + sm);
+    d["softcap_mode"] = sm;
+  }
   d["target"] = {{"hidden", target_hidden}, {"vocab", vocab}, {"layers", sc.value("num_target_layers", json())}};
   return d;
 }
@@ -145,6 +166,39 @@ bool canonical(const std::string& name, std::string* out) {
 
 }  // namespace
 
+namespace {
+
+// A drafter directory's config.json (at most 16 MiB, nested within json_depth_within).
+bool read_config_json(const fs::path& root, const std::string& dir, json* sc, std::string* err) {
+  constexpr size_t kMaxConfigBytes = 16u << 20;
+  std::ifstream f(root / "config.json", std::ios::binary | std::ios::ate);
+  const std::streamoff fsz = f.tellg();
+  if (!f || fsz < 0 || size_t(fsz) > kMaxConfigBytes)
+    return *err = dir + ": cannot read config.json (or larger than 16 MiB)", false;
+  f.seekg(0);
+  std::string cfg_text(size_t(fsz), '\0');
+  if (fsz > 0 && !f.read(cfg_text.data(), fsz)) return *err = dir + ": cannot read config.json", false;
+  if (!interfaces::json_depth_within(cfg_text)) return *err = dir + ": config.json nested too deeply", false;
+  *sc = json::parse(cfg_text);
+  return true;
+}
+
+}  // namespace
+
+std::string drafter_dir_kind(const std::string& dir) {
+  try {
+    json sc;
+    std::string err;
+    if (!read_config_json(to_path(dir), dir, &sc, &err) || !sc.is_object()) return "";
+    const auto archs = sc.value("architectures", json::array());
+    if (std::find(archs.begin(), archs.end(), "DFlash2DraftModel") != archs.end() ||
+        sc.value("speculators_model_type", "") == "dflash2") return "dflash2";
+    return "";
+  } catch (const std::exception&) {  // a config.json that is no JSON
+    return "";
+  }
+}
+
 bool is_drafter_dir(const std::string& path) {
   std::error_code ec;
   return fs::is_directory(to_path(path), ec) && fs::is_regular_file(to_path(path) / "config.json", ec);
@@ -161,19 +215,7 @@ bool read_drafter_dir(const std::string& dir, std::vector<std::unique_ptr<os::Ma
   if (shards.empty()) return *err = dir + ": no *.safetensors beside its config.json", false;
   try {
     json sc;
-    {
-      constexpr size_t kMaxConfigBytes = 16u << 20;
-      std::ifstream f(root / "config.json", std::ios::binary | std::ios::ate);
-      const std::streamoff fsz = f.tellg();
-      if (!f || fsz < 0 || size_t(fsz) > kMaxConfigBytes)
-        return *err = dir + ": cannot read config.json (or larger than 16 MiB)", false;
-      f.seekg(0);
-      std::string cfg_text(size_t(fsz), '\0');
-      if (fsz > 0 && !f.read(cfg_text.data(), fsz)) return *err = dir + ": cannot read config.json", false;
-      if (!interfaces::json_depth_within(cfg_text))
-        return *err = dir + ": config.json nested too deeply", false;
-      sc = json::parse(cfg_text);
-    }
+    if (!read_config_json(root, dir, &sc, err)) return false;
     const json draft = draft_config(sc);
     *out = {};
     out->arch = "drafter";

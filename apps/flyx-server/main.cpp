@@ -39,6 +39,7 @@
 #include "apps/common/numbers.h"
 #include "apps/flyx-cli/monitor.h"
 #include "apps/flyx-server/server.h"
+#include "core/interfaces/options.h"
 #include "core/os/env.h"
 #include "core/os/os.h"
 #include "core/os/path.h"
@@ -485,7 +486,15 @@ int run(int argc, char** argv) {
   if (!model.empty()) {
     EngineOptions init_eo = start_from;
     init_eo.mmproj_file = eo.vision ? eo.mmproj_file : "";
-    if (!models.run(ModelHost::Want{model, eo.drafter_files, init_eo, args.name}, &err)) {
+    std::string init_dh = flyx::interfaces::backend_opt_get(init_eo.backend_options, "draft_head");
+    if (init_dh != "full") init_dh.clear();
+    std::string init_dw;
+    if (const std::string raw_dw = flyx::interfaces::backend_opt_get(init_eo.backend_options, "draft_weights");
+        !raw_dw.empty()) {
+      std::string canon;
+      if (flyx::interfaces::parse_draft_weights(raw_dw, nullptr, &canon, nullptr) && canon != "auto") init_dw = canon;
+    }
+    if (!models.run(ModelHost::Want{model, eo.drafter_files, init_eo, args.name, init_dh, init_dw}, &err)) {
       end_dashboard(true);
       os::write_original_stderr("error: " + err + "\n");
       pause_owned_console();

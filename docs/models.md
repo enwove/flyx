@@ -1,6 +1,6 @@
 # Models, Drafters, and Long-Context Sizing
 
-Reference for supported model architectures (Qwen3.5 / Qwen3.8, Qwen3, Llama), file formats, Hugging Face Hub loading, speculative drafters, and GPU/RAM/disk KV sizing.
+Reference for supported model architectures (Qwen3.5 / Qwen3.8, Qwen3, Inkling-2, Llama), file formats, Hugging Face Hub loading, speculative drafters, and GPU/RAM/disk KV sizing.
 
 ---
 
@@ -8,7 +8,7 @@ Reference for supported model architectures (Qwen3.5 / Qwen3.8, Qwen3, Llama), f
 
 | Format | Supported Architectures | Supported Weight Types | Refused / Unsupported |
 |---|---|---|---|
-| **GGUF** (native, zero conversion) | `qwen35` (Qwen3.5 / Qwen3.8 hybrid GDN + gated attention, plus multimodal vision via `--mmproj` `qwen3vl_merger` `mmproj-*.gguf`), `qwen3` (dense) | `F32`, `F16`, `BF16`, `Q4_0`, `Q4_1`, `Q5_0`, `Q5_1`, `Q8_0`, `Q2_K`–`Q6_K`, `IQ1_S`, `IQ1_M`, `IQ2_XXS`, `IQ2_XS`, `IQ2_S`, `IQ3_XXS`, `IQ3_S`, `IQ4_NL`, `IQ4_XS`, mixed quants, GGML `NVFP4`; a split file (`-00001-of-0000N.gguf`) with all its parts in one folder | `MXFP4`, MoE experts, sliding-window target attention, scaled RoPE |
+| **GGUF** (native, zero conversion) | `qwen35` (Qwen3.5 / Qwen3.8 hybrid GDN + gated attention, plus multimodal vision via `--mmproj` `qwen3vl_merger` `mmproj-*.gguf`), `qwen3` (dense), `inkling2_loop` (Inkling-2 looped ShortConv + RelAttn + sparse MoE) | `F32`, `F16`, `BF16`, `Q2_0`, `Q4_0`, `Q4_1`, `Q5_0`, `Q5_1`, `Q8_0`, `Q2_K`–`Q6_K`, `IQ1_S`, `IQ1_M`, `IQ2_XXS`, `IQ2_XS`, `IQ2_S`, `IQ3_XXS`, `IQ3_S`, `IQ4_NL`, `IQ4_XS`, mixed quants, `MXFP4`, GGML `NVFP4`; a split file (`-00001-of-0000N.gguf`) with all its parts in one folder | Inkling-2 vision towers (`mmproj`), scaled RoPE, Llama GGUFs |
 | **`.flyx`** (via `python/convert`) | Qwen3.5 / Qwen3.8, Qwen3, Llama (e.g. MiniCPM5-1B) | `BF16`, NVIDIA ModelOpt `NVFP4` | Vision / MoE; a Llama GGUF |
 
 Key execution properties:
@@ -35,30 +35,33 @@ flyx serve unsloth/Qwen3.8-27B-GGUF:UD-IQ2_S --drafter-file z-lab/Qwen3.8-27B-DF
 | `org/repo:QUANT` | Selects the GGUF carrying `QUANT` (falls back to `UD-<QUANT>` when unique). Passing `org/repo` without `:QUANT` lists available GGUFs and sizes. |
 | `org/repo:QUANT@REV` | Pins a branch or commit hash (also used to address older cached snapshots). |
 | Auto MTP sidecar | If a GGUF lacks an embedded MTP layer and the repo contains `MTP/*.gguf` (e.g., `unsloth/Qwen3.8-27B-GGUF`), `flyx` fetches and attaches it automatically. |
-| Auto `mmproj` vision projector | If a Hub GGUF repo contains a vision projector (`mmproj-BF16.gguf` preferred over F16/F32), `flyx` fetches and attaches it automatically unless `--no-vision` or an explicit `--mmproj` path is given. |
-| Direct DFlash2 loading | `z-lab/*-DFlash2` and `vllm-project/*-DFlash2` safetensors repos as well as llama.cpp `general.architecture=dflash` GGUF drafters (e.g. `z-lab/Qwen3.8-27B-DFlash2-GGUF`) load directly with no conversion step across supported target architectures (`qwen35`, `qwen3`, `llama`). |
+| Auto DSpark sidecar | With no drafter file named (or `--drafter dspark`/`all`), `flyx` fetches and attaches the repo's first `dspark-*.gguf` (e.g., `unsloth/Inkling-2-Mini-GGUF`), or, for a model GGUF on disk, a `dspark-<model name>*.gguf` beside it (`Inkling-2-Mini-UD-IQ3_XXS.gguf` pairs with `dspark-Inkling-2-Mini-Q8_0.gguf`); either only when its header says it is a DSpark drafter (`arch=dflash`, `has_markov_context=true`). `--drafter mtp`/`dflash2`/`none`, `--no-spec` or a `--drafter-file` leaves it out. |
+| Auto `mmproj` vision projector | If a Hub GGUF repo contains a vision projector (`mmproj-BF16.gguf` preferred over F16/F32), `flyx` fetches and attaches it automatically unless `--no-vision` or an explicit `--mmproj` path is given, or the model's architecture is one this build reads no vision for (anything but `qwen35`: a projector published beside such a model is left alone, and `--mmproj` with one is refused). |
+| Direct DFlash2 loading | `z-lab/*-DFlash2`, `vllm-project/*-DFlash2`, and `incoai/*-DFlash2` safetensors repos as well as llama.cpp `general.architecture=dflash` GGUF drafters (e.g. `z-lab/Qwen3.8-27B-DFlash2-GGUF`, `ufrik/Inkling-2-Mini-Dflash2-GGUF`) load directly with no conversion step across supported target architectures (`qwen35`, `qwen3`, `llama`, `inkling2_loop`). |
 | Downloader & cache | 16 parallel range connections, SHA-256 verified against Hub metadata, resumable across restarts, multi-process coordinated via `.flyx-lock` files in standard HF cache (`HF_HOME`, `HF_HUB_CACHE`, `HF_TOKEN`, `HF_ENDPOINT`, `HF_HUB_OFFLINE=1`). Requires `libcurl` on Linux; native WinHTTP on Windows. |
 
 ---
 
 ## 3. Speculative Drafters
 
-`flyx` supports four drafter sources and can run multiple simultaneously; a per-round controller (`RoundChooser`) chooses the drafter and width dynamically from load-time measured costs and live acceptance rates.
+`flyx` supports five drafter sources and can run multiple simultaneously; a per-round controller (`RoundChooser`) chooses the drafter and width dynamically from load-time measured costs and live acceptance rates.
 
 | Drafter | Source | Notes |
 |---|---|---|
 | **MTP** (Multi-Token Prediction) | Embedded in GGUF/HF checkpoint, or sidecar `--drafter-file MTP/mtp-*.gguf` | Default when present. Shares target embedding/head. At long contexts (> 32K), uses 4096-token exact ring + 2-bit StrataFlux copy (`mtp_window`, `mtp_copy`). |
-| **DFlash2** (block diffusion) | HF safetensors repo (`--drafter-file z-lab/Qwen3.8-27B-DFlash2`), `arch=dflash` GGUF (BF16 or quantized GGML blocks), or converted `.flyx` | For Qwen3.5 / Qwen3.8, Qwen3, and Llama targets (a drafter made for another model is refused). Beside GGUF targets, floating-point DFlash2 projections are quantized to Q8_0 (pre-quantized GGUF drafters stay packed). A GGUF drafter that is causal, samples from the anchor, has a confidence head, soft-capped logits or a Markov context (DSpark), or reads the target's final hidden state, is refused. Strongest on code/structured text; `--drafter dflash2` selects it exclusively. |
+| **DFlash2** (block diffusion) | HF safetensors repo (`--drafter-file z-lab/Qwen3.8-27B-DFlash2` or `incoai/Inkling-2-Mini-DFlash2`), `arch=dflash` GGUF (BF16 or quantized GGML blocks), or converted `.flyx` | For Qwen3.5 / Qwen3.8, Qwen3, Llama, and Inkling-2 (`inkling2_loop`) targets (a drafter made for another model is refused; supports target embedding norm, unpadded vocab clamping, post-`output_norm` taps, and `before_correction` / `after_correction` selector softcapping). Under default `draft_weights=auto`, floating-point DFlash2 weights stream-quantize directly on GPU (32 MiB staging, no full BF16 upload spike) into target-matched precision when VRAM allows (BF16 beside BF16, Q8_0 beside GGUF, NVFP4 beside NVFP4; pre-quantized GGUF drafters stay packed) and drop automatically to NVFP4 (4-bit) when VRAM is tight; override via `--backend-opt draft_weights=auto\|nvfp4\|q8\|exact`. Beside `inkling2_loop`, adaptive rounds verify `{1, 2, 3, 5, 7}` by confidence and widen sustained high-acceptance runs to stretched width `15`. A GGUF drafter that is causal, samples from the anchor, or has a confidence head is refused. Strongest on code/structured text; `--drafter dflash2` selects it exclusively. |
+| **DSpark** (block diffusion + Markov RNN head) | Sidecar GGUF (`--drafter-file dspark-Inkling-2-Mini-*.gguf`, `arch=dflash` with `has_markov_context=true`), attached by default from the model's repository or directory (Auto DSpark sidecar above) | Companion 3-layer block-uniform SWA/Full drafter with autoregressive Markov refinement for `inkling2_loop` (its file beside any other model is refused); it can run alongside DFlash2 under `--drafter all`. Its layers' linears follow `draft_weights` as DFlash2's do (a Q8_0 file stays packed under `auto`). Uses bounded per-layer binary16 KV rings (`window = 1025` on SWA layers, `mtp_window` ring on the Full layer above 32K) to cap drafter KV at ~28 MiB at any context length. Its drafts are picked from 1-bit copies of the target's head and of its Markov head together and only the candidates scored exactly on both (`draft_head=full` reads both heads whole). On CUDA, adaptive rounds run the parallel backbone once and advance the sequential Markov head step-wise across checkpoints `{1, 2, 3, 5, 7}`, stopping early to skip remaining Markov head steps and choosing the optimal already-drafted verification prefix (`stop_decide_step`). |
 | **DV** (bifill-dv's canvas drafter) | A DV `.flyx` file: a Llama with bifill-dv's canvas and selector written in (`flyx_convert --dv`) | Only when named (`--drafter dv` or `all`). A canvas pass of the target's weights with its own adapter over 32 slots after the anchor, then a selector that grows a tree of the file's width (31) or of 15, verified exactly (rounds of up to 64 rows). Its warm-up, its trees of 15 and of 31, plain decoding and lookup rounds are chosen every round by tokens per ms at the context; `--width N` pins it. CUDA backend only; see [DV](design/dv.md). |
 | **Prompt Lookup** | Built-in (enabled by default) | Verifies 15 drafts copied from matching 6-token n-grams in the current sequence with zero drafter forward pass. Big speedup on agent code edits/repeats; backs off for 32 tokens after poor rounds (`--no-lookup` disables). |
 
 Control flags:
-- `--drafter mtp|dflash2|dv|all|none`
+- `--drafter mtp|dflash2|dv|dspark|all|none`
 - `--drafter-file PATH_OR_HF` (repeatable)
 - `--width N` (pin model drafter width; lookup remains active unless `--no-lookup`)
-- `--draft-trees` (opt-in DFlash2 dynamic trees; off by default)
+- `--draft-trees` (opt-in DFlash2 dynamic trees; off by default; an `inkling2_loop` target verifies chains only: its relative-position attention and ShortConvs read a round's rows in order, so the CUDA backend refuses tree rounds there)
 - `--no-spec` (plain decoding, disables all drafters and lookup)
 - `--cycle I,J,...` (testing: a fixed cycle of round indices instead of the controller's choice; `-v` lists the rounds)
+- **Elastic VRAM loading (`serve`, `run`, `chat`):** Before uploading weights and on VRAM exhaustion, `flyx` preserves identical target output tokens while stepping down optional VRAM consumers in order: (1) moving GPU-resident vision weights to `disk` (0 VRAM, multimodal preserved), (2) compacting drafter weights to `nvfp4`, (3) skipping heavy DFlash2 while keeping DSpark beside it (`--drafter all`) or keeping or falling back to MTP, and (4) skipping remaining neural drafters (MTP, DSpark, DV) while keeping zero-VRAM Prompt Lookup. Steps 3 and 4 apply only to drafters the load chose (`--drafter auto` or `all`): a drafter named with `--drafter mtp\|dflash2\|dspark\|dv` is never skipped, and a load that cannot keep it fails with the reason. Every adjustment and the active configuration are logged clearly to stderr and reported in `/v1/load`, `/v1/telemetry`, and the dashboard without overwriting saved settings in `serve.json`. `flyx bench` keeps loading strict so benchmark runs never change configuration silently.
 
 ---
 

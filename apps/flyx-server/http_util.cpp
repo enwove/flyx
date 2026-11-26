@@ -84,8 +84,8 @@ bool read_reasoning_effort(const ojson& v, const char* field, ojson* effort, boo
                            std::string* err) {
   if (!v.is_string()) return *err = std::string(field) + " must be a string", false;
   const std::string s = v.get<std::string>();
-  if (s != "none" && s != "minimal" && s != "low" && s != "medium" && s != "high" && s != "xhigh")
-    return *err = std::string(field) + " must be none, minimal, low, medium, high, or xhigh", false;
+  if (s != "none" && s != "minimal" && s != "low" && s != "medium" && s != "high" && s != "xhigh" && s != "max")
+    return *err = std::string(field) + " must be none, minimal, low, medium, high, xhigh, or max", false;
   if (effort) *effort = s;
   if (thinking) *thinking = s != "none";
   if (kwargs) (*kwargs)["reasoning_effort"] = s;

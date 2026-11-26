@@ -10,6 +10,7 @@
 #include <string>
 #include <vector>
 
+#include "core/exec/telemetry.h"
 #include "core/grammar/grammar.h"
 #include "core/interfaces/model.h"
 #include "core/modelfile/modelfile.h"
@@ -127,6 +128,10 @@ struct EngineOptions {
   // Intra-round confidence optimal stopping on drafters that support adaptive plans; FLYX_ADAPTIVE=0 turns it off.
   bool adaptive = true;
   bool adaptive_given = false;
+  // Automatically step down VRAM-heavy optional features on tight GPUs (vision gpu->disk, draft_weights->nvfp4,
+  // drop DFlash2 keeping MTP, drop drafters keeping prompt lookup). Never changes target output tokens.
+  // Benchmarks set this to false so measurements never silently alter configuration.
+  bool elastic_load = true;
 };
 
 // Fills the options the caller left unset from the environment: FLYX_BACKEND,
@@ -165,6 +170,10 @@ class Engine {
   // The drafters in use ("mtp+dflash2", "none"): the model's, but one whose rounds the backend runs at no width (DV on
   // a backend without its kernels: refused() says why).
   const char* drafter() const { return drafter_.c_str(); }
+  // Effective drafter weight precision ("nvfp4", "q8", "exact"; empty when no neural drafter is active).
+  const std::string& draft_weights() const { return active_draft_weights_; }
+  // Automatic VRAM-saving adjustments applied during load() (empty when requested settings fit as-is).
+  const std::vector<LoadAdjustment>& load_adjustments() const { return load_adjustments_; }
   // Widths of a drafter the backend did not lower, each with why ("dv 31: ..."); empty: none.
   const std::string& refused() const { return plans_.refused; }
   const EngineOptions& options() const { return opt_; }
@@ -219,8 +228,8 @@ class Engine {
   int prefill_align() const { return prefill_align_; }
   // Rows per prefill pass: the option, as a multiple of prefill_align().
   int prefill_chunk() const { return prefill_chunk_; }
+  bool roomy() const { return roomy_; }  // at least 32 GB free after the text target weights
   int auto_prefill_chunk() const;  // opt_.prefill_chunk == 0: by the device memory left
-  bool roomy() const;  // 32 GB of GPU memory free after the weights: binary16 K/V, GPU embeddings by default
   const std::vector<int32_t>& eos() const { return eos_; }
   // The model's vocabulary as grammars see it (core/grammar), built on first use.
   Grammar& grammar();
@@ -271,11 +280,14 @@ class Engine {
   const flyx_backend_api* api_ = nullptr;
   std::string backend_name_;
   flyx_device_info device_{};
+  bool roomy_ = false;
   std::unique_ptr<interfaces::Model> model_;          // the file as blocks, with the drafters in use
   flyx_bmodel* bm_ = nullptr;
   int prefill_align_ = 1, prefill_chunk_ = 1024;
   plan::Plans plans_;
   std::string drafter_ = "none";            // drafter(): the model's drafters whose rounds the plans have
+  std::string active_draft_weights_;        // effective drafter weights precision (nvfp4/q8/exact, or empty)
+  std::vector<LoadAdjustment> load_adjustments_;  // automatic VRAM adjustments applied during load()
   std::vector<double> round_ms_;            // measured cost of each round plan (core/speculation)
   std::vector<double> lookup_ms_;           // measured cost of each lookup plan (core/speculation)
   std::vector<double> round_ms_per_token_;  // ... more for every token of context past round_ms_at_

@@ -36,6 +36,8 @@ struct Plans {
   std::string refused;
   // That drafter when the backend lowered none of its widths (the rounds are then the ones without it); else -1.
   int refused_drafter = -1;
+  // True when build() failed due to device memory exhaustion (FLYX_ERR_OOM).
+  bool oom = false;
 
   int widest() const;  // the most drafts a round verifies
   void free(const flyx_backend_api* api);

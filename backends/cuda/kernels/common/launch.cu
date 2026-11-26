@@ -56,10 +56,11 @@ uintptr_t lay_out(uintptr_t base, int rows, int k_max, bool q8_parts, bool f32_r
   Carve c{base};
   // Dedicated zeroed tile counters and per-row scales (tiny, shared across paths).
   s->row_scale = c.take<float>(size_t(std::max(rows, 16) + 3) / 4 * 4, 16);
+  // Shared by split Q8 round GEMMs (k_round_blocks_split) and fused relative-attention round combine (k_rel_round_gqa).
+  s->round_count_cap = kRoundPartsColumns / 8;
+  s->round_count = c.take<int>(s->round_count_cap, 16);
   if (rows > 16 && q8_parts) s->q8_count = c.take<int>(kQ8Tiles, 16);
   if (q8_parts) {
-    s->round_count_cap = kRoundPartsColumns / 8;
-    s->round_count = c.take<int>(s->round_count_cap, 16);
     s->side_count_cap = kSideColumns / 8;
     s->side_count = c.take<int>(s->side_count_cap, 16);
   }

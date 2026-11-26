@@ -1,0 +1,1045 @@
+// Copyright 2026 The flyx Authors. SPDX-License-Identifier: Apache-2.0
+// Sparse MoE kernels: top-k routing, SiTU activation, compacted work-tile grouping, one-pass activation staging,
+// Tensor Core NVFP4 MoE (mma_bf16), BF16 MoE, and dispatch to modular GGML block MoE kernels (moe_blocks_*.cu) with
+// the dp4a kernel's configuration the tuning tables give (variants/candidates.toml: moe_dp4a, moe_gate_up).
+//
+// Strict Gate 4 row-count invariance (0.00e+00 across R=1, R=2..16, R=256, fused vs unfused, sc vs nullptr):
+//   * NVFP4: fixed SPAN (128 when K%128==0 else 64) mma_bf16 (m16n8k16) across all row counts.
+//   * GGML blocks (q8): fixed 32-stream ascending K accumulation + balanced xor tree (1,2,4,8,16) shared by
+//     both k_moe_blocks_q8_dp4a and INT8 Tensor Core k_moe_blocks_q8_mma.
+//   * BF16: fixed kMoeKT=1024 per-lane FMA + balanced xor tree across decode and compacted grouped tasks.
+#include <algorithm>
+#include <cmath>
+#include <cstdio>
+#include <cstdlib>
+#include <stdexcept>
+#include <string>
+
+#include "backends/cuda/kernels/common/device.cuh"
+#include "backends/cuda/kernels/common/launch.h"
+#include "backends/cuda/kernels/gemm_internal.h"
+#include "backends/cuda/kernels/kernels.cuh"
+#include "backends/cuda/kernels/moe_blocks_ops.h"
+
+namespace flyx::cuda {
+namespace {
+
+constexpr int kMoeWarps = 4;
+constexpr int kMoeKT = 1024;
+constexpr int kRouteThreads = 128, kRouteTop = kMoeRouteMaxTopK;  // threads a row; the most experts a row takes
+
+__device__ __forceinline__ float situ_val(float g, float u, float beta, float linear_beta) {
+  if (beta > 0.f) {
+    const float act = beta * tanhf(g / beta) * sigm(g);
+    const float lin = linear_beta > 0.f ? (linear_beta * tanhf(u / linear_beta)) : u;
+    return act * lin;
+  }
+  return silu(g) * u;
+}
+
+__device__ __forceinline__ float warp_tree_sum(float v) {
+#pragma unroll
+  for (int o = 1; o < 32; o <<= 1) v += __shfl_xor_sync(0xffffffffu, v, o);
+  return v;
+}
+
+inline int max_work_tiles(int M, int E, int bm) {
+  const int k_max = std::min(E, M);
+  return k_max + (M - k_max) / bm;
+}
+
+const MoeBlockOps* moe_block_ops(int dtype) {
+  for (const MoeBlockOps* (*grp)(int) :
+       {moe_block_ops_legacy, moe_block_ops_k, moe_block_ops_iq_low, moe_block_ops_iq_high})
+    if (const MoeBlockOps* ops = grp(dtype)) return ops;
+  return nullptr;
+}
+
+// ---- moe_route & situ_rows ----------------------------------------------------------------
+__global__ void __launch_bounds__(kRouteThreads) k_moe_route(const float* __restrict__ logits,
+                                                             const float* __restrict__ bias, int E, int top_k,
+                                                             int gating_sigmoid, int norm_weights, float norm_eps,
+                                                             float route_scale, int* __restrict__ idx_out,
+                                                             float* __restrict__ w_out) {
+  pdl_trigger();
+  const int r = blockIdx.x, tid = threadIdx.x;
+  const float* lr = logits + size_t(r) * E;
+  extern __shared__ float sh[];  // probs[E], sel[E]
+  float* probs = sh;
+  float* sel = sh + E;
+  __shared__ int s_top_i[kRouteTop];
+  __shared__ float s_top_w[kRouteTop];
+  __shared__ float s_norm;
+
+  if (gating_sigmoid) {
+    for (int e = tid; e < E; e += kRouteThreads) {
+      const float p = sigm(lr[e]);
+      probs[e] = p;
+      sel[e] = p + (bias ? bias[e] : 0.f);
+    }
+  } else {
+    float mx = -INFINITY;
+    for (int e = tid; e < E; e += kRouteThreads) mx = fmaxf(mx, lr[e]);
+    mx = block_max(mx);
+    float z = 0.f;
+    for (int e = tid; e < E; e += kRouteThreads) {
+      const float v = expf(lr[e] - mx);
+      probs[e] = v;
+      z += v;
+    }
+    z = block_sum(z);
+    const float inv_z = 1.f / z;
+    for (int e = tid; e < E; e += kRouteThreads) {
+      const float p = probs[e] * inv_z;
+      probs[e] = p;
+      sel[e] = p + (bias ? bias[e] : 0.f);
+    }
+  }
+  __syncthreads();
+
+  // The top_k best in order: a thread counts, for each of its experts, those better than it (score_better is a total
+  // order, ties to the lower index), and an expert with fewer than top_k before it is the choice of that rank: what
+  // choosing one best at a time gave, each behind two barriers, with two barriers for all of them (a round runs this
+  // once a layer visit, and a launch lasts as long as its barriers).
+  for (int e = tid; e < E; e += kRouteThreads) {
+    const float v = sel[e];
+    int before = 0;
+    for (int j = 0; j < E; ++j) before += (j != e && score_better(sel[j], j, v, e)) ? 1 : 0;
+    if (before < top_k) {
+      s_top_i[before] = e;
+      s_top_w[before] = probs[e];
+    }
+  }
+  __syncthreads();
+  if (tid == 0) {
+    float sum_w = 0.f;
+    for (int k = 0; k < top_k; ++k) sum_w += s_top_w[k];
+    s_norm = norm_weights ? (route_scale / (sum_w + norm_eps)) : route_scale;
+  }
+  __syncthreads();
+  int* out_i = idx_out + size_t(r) * top_k;
+  float* out_w = w_out + size_t(r) * top_k;
+  for (int k = tid; k < top_k; k += kRouteThreads) {
+    out_i[k] = s_top_i[k];
+    out_w[k] = s_top_w[k] * s_norm;
+  }
+}
+
+__global__ void k_situ_rows(const float* __restrict__ gu, int ld_gu, int I, float beta, float linear_beta,
+                            float* __restrict__ out, int ld_out) {
+  pdl_trigger();
+  const int i = blockIdx.x * blockDim.x + threadIdx.x;
+  const int r = blockIdx.y;
+  if (i >= I) return;
+  const float* row = gu + size_t(r) * ld_gu;
+  out[size_t(r) * ld_out + i] = situ_val(row[i], row[I + i], beta, linear_beta);
+}
+
+// ---- Compacted work-tile grouping & one-pass activation staging ---------------------------
+// Sorts M = rc * top_k pairs into per-expert ranges in pairs[] and emits load-balanced BM-row
+// tiles into tasks[0 .. *n_tasks) so hot experts split across SMs and empty experts consume
+// zero blocks (fixed upper-bound grid, 100% CUDA Graph safe).
+// One block of kGroupThreads: the counts in shared memory, one block-wide scan of every thread's run of experts (their
+// pairs and their tiles), then every thread writes its own experts' tiles; no thread walks all the experts
+// (a walk through global memory, one expert after another, took 20 us of a round's every MoE GEMM).  Tiles go in
+// ascending expert order; an expert's pairs in the order the atomics give them, which no result depends on: each
+// pair's row is its own.
+constexpr int kGroupThreads = 256;
+
+__global__ void __launch_bounds__(kGroupThreads)
+    k_moe_group_tasks(const int* __restrict__ eidx, int M, int E, int bm, int* __restrict__ pairs,
+                      MoeTask* __restrict__ tasks, int* __restrict__ n_tasks) {
+  pdl_trigger();
+  extern __shared__ int s_group[];  // [E] pairs an expert has, then [E] where its next pair goes
+  int* cnt = s_group;
+  int* cur = s_group + E;
+  __shared__ int s_warp_pairs[kGroupThreads / 32], s_warp_tiles[kGroupThreads / 32];
+  const int tid = threadIdx.x, lane = tid & 31, warp = tid >> 5;
+  for (int e = tid; e < E; e += kGroupThreads) cnt[e] = 0;
+  __syncthreads();
+  for (int i = tid; i < M; i += kGroupThreads) atomicAdd(&cnt[eidx[i]], 1);
+  __syncthreads();
+  const int per = (E + kGroupThreads - 1) / kGroupThreads;
+  const int e0 = min(E, tid * per), e1 = min(E, e0 + per);
+  int my_pairs = 0, my_tiles = 0;
+  for (int e = e0; e < e1; ++e) {
+    my_pairs += cnt[e];
+    my_tiles += (cnt[e] + bm - 1) / bm;
+  }
+  int in_pairs = my_pairs, in_tiles = my_tiles;  // inclusive scans within the warp
+#pragma unroll
+  for (int o = 1; o < 32; o <<= 1) {
+    const int a = __shfl_up_sync(0xffffffffu, in_pairs, o), b = __shfl_up_sync(0xffffffffu, in_tiles, o);
+    if (lane >= o) {
+      in_pairs += a;
+      in_tiles += b;
+    }
+  }
+  if (lane == 31) {
+    s_warp_pairs[warp] = in_pairs;
+    s_warp_tiles[warp] = in_tiles;
+  }
+  __syncthreads();
+  int p = in_pairs - my_pairs, t = in_tiles - my_tiles;
+  for (int w = 0; w < warp; ++w) {
+    p += s_warp_pairs[w];
+    t += s_warp_tiles[w];
+  }
+  for (int e = e0; e < e1; ++e) {
+    const int c = cnt[e];
+    cur[e] = p;
+    for (int off = 0; off < c; off += bm) tasks[t++] = MoeTask{e, p + off, min(bm, c - off)};
+    p += c;
+  }
+  if (tid == kGroupThreads - 1) *n_tasks = t;  // its run is the last: its end is the total
+  __syncthreads();
+  for (int i = tid; i < M; i += kGroupThreads) pairs[atomicAdd(&cur[eidx[i]], 1)] = i;
+}
+
+void group_tasks(const int* eidx, int M, int E, int bm, const MoeScratch* sc, cudaStream_t st) {
+  k_moe_group_tasks<<<1, kGroupThreads, size_t(2) * E * sizeof(int), st>>>(eidx, M, E, bm, sc->pairs, sc->tasks,
+                                                                           sc->n_tasks);
+}
+
+// Whether the tiles moe_gate_up left (`grouped` rows a tile, every one of `rows` rows in one chunk) serve a kernel
+// that takes `bm` rows a tile over the same rows: they are its tiles where both hold all the rows an expert can have,
+// as a row picks an expert once.
+bool tiles_serve(int grouped, int bm, int rows) {
+  return grouped > 0 && (grouped == bm || (grouped >= rows && bm >= rows));
+}
+
+template <bool MINS>
+__global__ void __launch_bounds__(256)
+    k_moe_stage_q8(const float* __restrict__ x, int ldx, int K, int8_t* __restrict__ q8_a, float* __restrict__ q8_d,
+                   float* __restrict__ q8_s) {
+  pdl_trigger();
+  const int r = blockIdx.x, warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
+  const int units = K >> 5;
+  const int sub = lane & 7, g_in_warp = lane >> 3;
+  const size_t row_at = size_t(r) * ldx;
+  const bool aligned4 = (ldx & 3) == 0 && (reinterpret_cast<uintptr_t>(x) & 15u) == 0;
+  for (int base = warp * 4; base < units; base += (int(blockDim.x) >> 5) * 4) {
+    const int grp = base + g_in_warp;
+    float4 v = make_float4(0.f, 0.f, 0.f, 0.f);
+    if (grp < units) {
+      const float* src = x + row_at + size_t(grp) * 32 + 4 * sub;
+      if (aligned4) v = *reinterpret_cast<const float4*>(src);
+      else v = make_float4(src[0], src[1], src[2], src[3]);
+    }
+    float m = fmaxf(fmaxf(fabsf(v.x), fabsf(v.y)), fmaxf(fabsf(v.z), fabsf(v.w)));
+#pragma unroll
+    for (int o = 4; o > 0; o >>= 1) m = fmaxf(m, __shfl_xor_sync(0xffffffffu, m, o));
+    if (grp < units) {
+      const float dg = m / 127.f;
+      const int p0 = q8_of(v.x, dg), p1 = q8_of(v.y, dg), p2 = q8_of(v.z, dg), p3 = q8_of(v.w, dg);
+      const uint32_t packed = uint32_t(uint8_t(int8_t(p0))) | (uint32_t(uint8_t(int8_t(p1))) << 8) |
+                              (uint32_t(uint8_t(int8_t(p2))) << 16) | (uint32_t(uint8_t(int8_t(p3))) << 24);
+      reinterpret_cast<uint32_t*>(q8_a + size_t(r) * K + size_t(grp) * 32)[sub] = packed;
+      if (sub == 0) q8_d[size_t(r) * units + grp] = dg;
+      if constexpr (MINS) {
+        int s16 = p0 + p1 + p2 + p3;
+        s16 += __shfl_xor_sync(0xffffffffu, s16, 1);
+        s16 += __shfl_xor_sync(0xffffffffu, s16, 2);
+        if ((sub & 3) == 0) q8_s[(size_t(r) * units + grp) * 2 + (sub >> 2)] = dg * float(s16);
+      }
+    }
+  }
+}
+
+__global__ void __launch_bounds__(256)
+    k_moe_stage_bf16(const float* __restrict__ x, int ldx, int K, bf16* __restrict__ out) {
+  pdl_trigger();
+  const int r = blockIdx.x;
+  const float* src = x + size_t(r) * ldx;
+  bf16* dst = out + size_t(r) * K;
+  const bool aligned4 = (ldx & 3) == 0 && (K & 3) == 0 && (reinterpret_cast<uintptr_t>(x) & 15u) == 0;
+  if (aligned4) {
+    const int k4 = K >> 2;
+    for (int i = threadIdx.x; i < k4; i += blockDim.x) {
+      const float4 v = reinterpret_cast<const float4*>(src)[i];
+      const __nv_bfloat162 a = __floats2bfloat162_rn(v.x, v.y);
+      const __nv_bfloat162 b = __floats2bfloat162_rn(v.z, v.w);
+      reinterpret_cast<uint2*>(dst)[i] = make_uint2(*reinterpret_cast<const uint32_t*>(&a),
+                                                    *reinterpret_cast<const uint32_t*>(&b));
+    }
+  } else {
+    for (int i = threadIdx.x; i < K; i += blockDim.x) dst[i] = __float2bfloat16_rn(src[i]);
+  }
+}
+
+__global__ void k_moe_weighted_sum(const float* __restrict__ down_buf, const float* __restrict__ ew, int top_k, int H,
+                                   float* __restrict__ out, int ld_out, int accumulate) {
+  pdl_trigger();
+  const int n = blockIdx.x * blockDim.x + threadIdx.x;
+  const int r = blockIdx.y;
+  if (n >= H) return;
+  float total = 0.f;
+  const float* w = ew + size_t(r) * top_k;
+  const float* base = down_buf + size_t(r) * top_k * H + n;
+  for (int k = 0; k < top_k; ++k) total = __fmaf_rn(w[k], base[size_t(k) * H], total);
+  float* dst = out + size_t(r) * ld_out + n;
+  *dst = accumulate ? (*dst + total) : total;
+}
+
+// ---- Tensor Core NVFP4 MoE (mma_bf16 m16n8k16, exact e2m1 * e4m3 in bf16) -----------------
+// Unified bit-identical math across R=1 (DIRECT_R1), R=2..16, and R=256 (compacted 16-row tasks).
+template <int SPAN, bool FUSE_ACT, bool IS_DOWN, bool DIRECT_R1, int NW, int NT>
+__global__ void __launch_bounds__(32 * NW)
+    k_moe_nvfp4_mma(const float* __restrict__ x, int ldx, const bf16* __restrict__ bf16_a,
+                    const uint8_t* __restrict__ Q, const uint8_t* __restrict__ S, const float* __restrict__ RS,
+                    int N_exp, int I_or_H, int K, const int* __restrict__ eidx, const MoeTask* __restrict__ tasks,
+                    const int* __restrict__ n_tasks, const int* __restrict__ pairs, int top_k, float situ_beta,
+                    float situ_linear_beta, float* __restrict__ out, int ld_out) {
+  pdl_trigger();
+  static constexpr int VPL = SPAN / 4, WORDS = VPL / 8, BW = VPL / 2;
+  static constexpr int THREADS = 32 * NW;
+  static constexpr int SM_ROWS = DIRECT_R1 ? 1 : 16;
+
+  int e, nb;
+  __shared__ alignas(16) bf16 sm_x[2][SM_ROWS][SPAN];
+  __shared__ int s_pids[SM_ROWS];
+  __shared__ int s_rids[SM_ROWS];
+
+  if constexpr (DIRECT_R1) {
+    e = eidx[blockIdx.y];
+    nb = 1;
+    if (threadIdx.x == 0) {
+      s_pids[0] = int(blockIdx.y);
+      s_rids[0] = IS_DOWN ? int(blockIdx.y) : 0;
+    }
+  } else {
+    const int tid_y = int(blockIdx.y);
+    if (tid_y >= *n_tasks) return;
+    const MoeTask tk = tasks[tid_y];
+    e = tk.expert;
+    nb = tk.nb;
+    if (int(threadIdx.x) < nb) {
+      const int pid = pairs[tk.p0 + int(threadIdx.x)];
+      s_pids[threadIdx.x] = pid;
+      s_rids[threadIdx.x] = IS_DOWN ? pid : (pid / top_k);
+    }
+  }
+  __syncthreads();
+
+  const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31, g = lane >> 2, t4 = lane & 3;
+  const int N_work = FUSE_ACT ? I_or_H : N_exp;
+  const int n_base = (int(blockIdx.x) * NW + warp) * 8 * NT;
+  const int spans = K / SPAN;
+  const float rs = RS ? RS[e] : 1.f;
+
+  const uint8_t *qp0[NT], *sp0[NT];
+  const uint8_t *qp1[FUSE_ACT ? NT : 1], *sp1[FUSE_ACT ? NT : 1];
+  bool wv0[NT];
+  float acc0[NT][4], acc1[FUSE_ACT ? NT : 1][4];
+#pragma unroll
+  for (int i = 0; i < NT; ++i) {
+    const int col = n_base + i * 8 + g;
+    wv0[i] = col < N_work;
+    const size_t r0 = size_t(e) * N_exp + min(col, N_exp - 1);
+    qp0[i] = Q + r0 * (K >> 1) + (VPL / 2) * t4;
+    sp0[i] = S + r0 * (K >> 4) + (VPL / 16) * t4;
+    acc0[i][0] = acc0[i][1] = acc0[i][2] = acc0[i][3] = 0.f;
+    if constexpr (FUSE_ACT) {
+      const size_t r1 = size_t(e) * N_exp + min(col + I_or_H, N_exp - 1);
+      qp1[i] = Q + r1 * (K >> 1) + (VPL / 2) * t4;
+      sp1[i] = S + r1 * (K >> 4) + (VPL / 16) * t4;
+      acc1[i][0] = acc1[i][1] = acc1[i][2] = acc1[i][3] = 0.f;
+    }
+  }
+
+  auto stage = [&](int buf, int k) {
+    if (bf16_a) {
+      constexpr int chunks = SPAN / 8;  // 16 bytes = 8 bf16 values
+      for (int idx = threadIdx.x; idx < nb * chunks; idx += THREADS) {
+        const int b = DIRECT_R1 ? 0 : (idx / chunks);
+        const int c = DIRECT_R1 ? idx : (idx - b * chunks);
+        cp_async16(&sm_x[buf][b][8 * c], bf16_a + size_t(s_rids[b]) * K + k + 8 * c);
+      }
+      cp_async_commit();
+    } else {
+      for (int idx = threadIdx.x; idx < nb * SPAN; idx += THREADS) {
+        const int b = DIRECT_R1 ? 0 : (idx / SPAN);
+        const int j = DIRECT_R1 ? idx : (idx - b * SPAN);
+        sm_x[buf][b][j] = __float2bfloat16_rn(x[size_t(s_rids[b]) * ldx + k + j]);
+      }
+    }
+  };
+
+  // Decode one fp4x8 word (4 bf16x2 regs) at a time and feed two mma_bf16 steps immediately:
+  // keeps exact K-accumulation order (0.00e+00 vs R=1/R=256/serial) while slashing registers from ~89 to ~56.
+  auto mma_half = [&](const uint8_t* const* qp, const uint8_t* const* sp, int k, const uint32_t* av, const uint32_t* bv,
+                      float (*acc)[4]) {
+    uint32_t wq[NT][WORDS];
+    uint32_t sc[NT];
+#pragma unroll
+    for (int i = 0; i < NT; ++i) {
+      if constexpr (SPAN == 128) {
+        const uint4 v = wv0[i] ? ldg_stream(qp[i] + (k >> 1)) : make_uint4(0, 0, 0, 0);
+        wq[i][0] = v.x, wq[i][1] = v.y, wq[i][2] = v.z, wq[i][3] = v.w;
+        sc[i] = wv0[i] ? *reinterpret_cast<const uint16_t*>(sp[i] + (k >> 4)) : 0u;
+      } else {
+        const uint2 v = wv0[i] ? ldg_stream2(qp[i] + (k >> 1)) : make_uint2(0, 0);
+        wq[i][0] = v.x, wq[i][1] = v.y;
+        sc[i] = wv0[i] ? sp[i][k >> 4] : 0u;
+      }
+    }
+#pragma unroll
+    for (int i = 0; i < NT; ++i) {
+#pragma unroll
+      for (int b = 0; b < VPL / 16; ++b) {
+        const __nv_bfloat162 s2 = e4m3_bf16x2((sc[i] >> (8 * b)) & 0xFFu);
+#pragma unroll
+        for (int q_in_b = 0; q_in_b < 2; ++q_in_b) {
+          const int q = 2 * b + q_in_b;
+          uint32_t bw[4];
+          fp4x8_to_bf16(wq[i][q], bw);
+#pragma unroll
+          for (int e4 = 0; e4 < 4; ++e4) bw[e4] = bf16x2_mul(bw[e4], s2);
+          const uint32_t a0[4] = {av[4 * q], DIRECT_R1 ? 0u : bv[4 * q], av[4 * q + 1],
+                                  DIRECT_R1 ? 0u : bv[4 * q + 1]};
+          const uint32_t bf0[2] = {bw[0], bw[1]};
+          mma_bf16(acc[i], a0, bf0);
+          const uint32_t a1[4] = {av[4 * q + 2], DIRECT_R1 ? 0u : bv[4 * q + 2], av[4 * q + 3],
+                                  DIRECT_R1 ? 0u : bv[4 * q + 3]};
+          const uint32_t bf1[2] = {bw[2], bw[3]};
+          mma_bf16(acc[i], a1, bf1);
+        }
+      }
+    }
+  };
+
+  const bool ra = g < nb, rb = !DIRECT_R1 && ((g + 8) < nb);
+  stage(0, 0);
+  for (int s_idx = 0; s_idx < spans; ++s_idx) {
+    if (bf16_a) cp_async_wait<0>();
+    __syncthreads();
+    if (s_idx + 1 < spans) stage((s_idx + 1) & 1, (s_idx + 1) * SPAN);
+    if (n_base < N_work) {
+      const int buf = s_idx & 1;
+      uint32_t av[BW];
+      uint32_t bv[DIRECT_R1 ? 1 : BW];
+      const uint4 z = make_uint4(0, 0, 0, 0);
+#pragma unroll
+      for (int q = 0; q < VPL / 8; ++q) {
+        const uint4 va = ra ? *reinterpret_cast<const uint4*>(&sm_x[buf][DIRECT_R1 ? 0 : g][VPL * t4 + 8 * q]) : z;
+        av[4 * q] = va.x, av[4 * q + 1] = va.y, av[4 * q + 2] = va.z, av[4 * q + 3] = va.w;
+        if constexpr (!DIRECT_R1) {
+          const uint4 vb = rb ? *reinterpret_cast<const uint4*>(&sm_x[buf][g + 8][VPL * t4 + 8 * q]) : z;
+          bv[4 * q] = vb.x, bv[4 * q + 1] = vb.y, bv[4 * q + 2] = vb.z, bv[4 * q + 3] = vb.w;
+        }
+      }
+      const int k = s_idx * SPAN;
+      mma_half(qp0, sp0, k, av, bv, acc0);
+      if constexpr (FUSE_ACT) mma_half(qp1, sp1, k, av, bv, acc1);
+    }
+  }
+
+  if (n_base < N_work) {
+#pragma unroll
+    for (int e_row = 0; e_row < (DIRECT_R1 ? 2 : 4); e_row += 2) {
+      const int b = g + (e_row >> 1) * 8;
+      if (b >= nb) continue;
+      const size_t out_row = size_t(s_pids[DIRECT_R1 ? 0 : b]) * ld_out;
+#pragma unroll
+      for (int i = 0; i < NT; ++i) {
+#pragma unroll
+        for (int j = 0; j < 2; ++j) {
+          const int col = n_base + i * 8 + 2 * t4 + j;
+          if (col < N_work) {
+            const float gv = acc0[i][e_row + j] * rs;
+            if constexpr (FUSE_ACT) {
+              const float uv = acc1[i][e_row + j] * rs;
+              out[out_row + col] = situ_val(gv, uv, situ_beta, situ_linear_beta);
+            } else {
+              out[out_row + col] = gv;
+            }
+          }
+        }
+      }
+    }
+  }
+}
+
+// No-scratch fallback for NVFP4 moe_down (sc == nullptr): identical mma_bf16 span order + ew FMA order.
+template <int SPAN, int NW, int NT>
+__global__ void __launch_bounds__(32 * NW)
+    k_moe_nvfp4_down_serial(const float* __restrict__ act, int ld_act, const uint8_t* __restrict__ Q,
+                            const uint8_t* __restrict__ S, const float* __restrict__ RS, int H, int K,
+                            const int* __restrict__ eidx, const float* __restrict__ ew, int top_k,
+                            float* __restrict__ out, int ld_out, int accumulate) {
+  pdl_trigger();
+  static constexpr int VPL = SPAN / 4, STEPS = VPL / 4, WORDS = VPL / 8, BW = VPL / 2;
+  __shared__ alignas(16) bf16 sm_x[SPAN];
+  const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31, g = lane >> 2, t4 = lane & 3;
+  const int n_base = (int(blockIdx.x) * NW + warp) * 8 * NT;
+  const int r = int(blockIdx.y), spans = K / SPAN;
+
+  float total[NT][2];
+#pragma unroll
+  for (int i = 0; i < NT; ++i) total[i][0] = total[i][1] = 0.f;
+
+  for (int k_slot = 0; k_slot < top_k; ++k_slot) {
+    const int e = eidx[r * top_k + k_slot];
+    const float rs = RS ? RS[e] : 1.f;
+    const float w_e = ew[r * top_k + k_slot];
+    const uint8_t *qp[NT], *sp[NT];
+    bool wv[NT];
+    float acc[NT][4];
+#pragma unroll
+    for (int i = 0; i < NT; ++i) {
+      const int col = n_base + i * 8 + g;
+      wv[i] = col < H;
+      const size_t r0 = size_t(e) * H + min(col, H - 1);
+      qp[i] = Q + r0 * (K >> 1) + (VPL / 2) * t4;
+      sp[i] = S + r0 * (K >> 4) + (VPL / 16) * t4;
+      acc[i][0] = acc[i][1] = acc[i][2] = acc[i][3] = 0.f;
+    }
+    const float* arow = act + size_t(r * top_k + k_slot) * ld_act;
+    for (int s_idx = 0; s_idx < spans; ++s_idx) {
+      const int k = s_idx * SPAN;
+      for (int j = threadIdx.x; j < SPAN; j += blockDim.x) sm_x[j] = __float2bfloat16_rn(arow[k + j]);
+      __syncthreads();
+      if (n_base < H) {
+        uint32_t av[BW];
+        const uint4 z = make_uint4(0, 0, 0, 0);
+#pragma unroll
+        for (int q = 0; q < VPL / 8; ++q) {
+          const uint4 va = (g == 0) ? *reinterpret_cast<const uint4*>(&sm_x[VPL * t4 + 8 * q]) : z;
+          av[4 * q] = va.x, av[4 * q + 1] = va.y, av[4 * q + 2] = va.z, av[4 * q + 3] = va.w;
+        }
+        uint32_t wq[NT][WORDS], sc[NT], bw[NT][BW];
+#pragma unroll
+        for (int i = 0; i < NT; ++i) {
+          if constexpr (SPAN == 128) {
+            const uint4 v = wv[i] ? ldg_stream(qp[i] + (k >> 1)) : z;
+            wq[i][0] = v.x, wq[i][1] = v.y, wq[i][2] = v.z, wq[i][3] = v.w;
+            sc[i] = wv[i] ? *reinterpret_cast<const uint16_t*>(sp[i] + (k >> 4)) : 0u;
+          } else {
+            const uint2 v = wv[i] ? ldg_stream2(qp[i] + (k >> 1)) : make_uint2(0, 0);
+            wq[i][0] = v.x, wq[i][1] = v.y;
+            sc[i] = wv[i] ? sp[i][k >> 4] : 0u;
+          }
+#pragma unroll
+          for (int q = 0; q < WORDS; ++q) fp4x8_to_bf16(wq[i][q], bw[i] + 4 * q);
+#pragma unroll
+          for (int b = 0; b < VPL / 16; ++b) {
+            const __nv_bfloat162 s2 = e4m3_bf16x2((sc[i] >> (8 * b)) & 0xFFu);
+#pragma unroll
+            for (int e8 = 0; e8 < 8; ++e8) bw[i][8 * b + e8] = bf16x2_mul(bw[i][8 * b + e8], s2);
+          }
+        }
+#pragma unroll
+        for (int j = 0; j < STEPS; ++j) {
+          const uint32_t a[4] = {av[2 * j], 0u, av[2 * j + 1], 0u};
+#pragma unroll
+          for (int i = 0; i < NT; ++i) {
+            const uint32_t bf[2] = {bw[i][2 * j], bw[i][2 * j + 1]};
+            mma_bf16(acc[i], a, bf);
+          }
+        }
+      }
+      __syncthreads();
+    }
+    if (g == 0 && n_base < H) {
+#pragma unroll
+      for (int i = 0; i < NT; ++i) {
+        total[i][0] = __fmaf_rn(w_e, acc[i][0] * rs, total[i][0]);
+        total[i][1] = __fmaf_rn(w_e, acc[i][1] * rs, total[i][1]);
+      }
+    }
+  }
+  if (g == 0 && n_base < H) {
+#pragma unroll
+    for (int i = 0; i < NT; ++i) {
+#pragma unroll
+      for (int j = 0; j < 2; ++j) {
+        const int col = n_base + i * 8 + 2 * t4 + j;
+        if (col < H) {
+          float* dst = out + size_t(r) * ld_out + col;
+          *dst = accumulate ? (*dst + total[i][j]) : total[i][j];
+        }
+      }
+    }
+  }
+}
+
+template <int SPAN>
+int launch_nvfp4_gu(const float* x, int ldx, const ExpertMat& W, const int* eidx, int rows, int top_k, int I, int K,
+                    float situ_beta, float situ_linear_beta, bool fuse_act, float* out, int ld_out,
+                    const MoeScratch* sc, cudaStream_t st) {
+  const int N_work = fuse_act ? I : 2 * I;
+  const bool has_sc = sc && sc->tasks && sc->pairs && W.n_experts <= sc->max_experts && top_k <= sc->max_top_k;
+  const int chunk = has_sc ? std::max(1, sc->chunk_rows) : rows;
+  int grouped = 0;
+  for (int r0 = 0; r0 < rows; r0 += chunk) {
+    const int rc = std::min(chunk, rows - r0);
+    const float* xc = x + size_t(r0) * ldx;
+    const int* ec = eidx + size_t(r0) * top_k;
+    float* oc = out + size_t(r0) * top_k * ld_out;
+    const bf16* bf_a = nullptr;
+    if (sc && sc->bf16_a && sc->stage_elems >= size_t(rc) * size_t(K)) {
+      k_moe_stage_bf16<<<rc, 256, 0, st>>>(xc, ldx, K, sc->bf16_a);
+      bf_a = sc->bf16_a;
+    }
+    if (rc == 1) {
+      if (fuse_act)
+        k_moe_nvfp4_mma<SPAN, true, false, true, 4, 1><<<dim3(ceil_div(N_work, 32), top_k), 128, 0, st>>>(
+            xc, ldx, bf_a, W.q, W.s, W.rs, W.N, I, K, ec, nullptr, nullptr, nullptr, top_k, situ_beta, situ_linear_beta,
+            oc, ld_out);
+      else
+        k_moe_nvfp4_mma<SPAN, false, false, true, 4, 2><<<dim3(ceil_div(N_work, 64), top_k), 128, 0, st>>>(
+            xc, ldx, bf_a, W.q, W.s, W.rs, W.N, I, K, ec, nullptr, nullptr, nullptr, top_k, situ_beta, situ_linear_beta,
+            oc, ld_out);
+    } else if (has_sc) {
+      const int M = rc * top_k;
+      const int mt = max_work_tiles(M, W.n_experts, 16);
+      group_tasks(ec, M, W.n_experts, 16, sc, st);
+      grouped = rc == rows ? 16 : 0;
+      if (fuse_act)
+        k_moe_nvfp4_mma<SPAN, true, false, false, 4, 1><<<dim3(ceil_div(N_work, 32), mt), 128, 0, st>>>(
+            xc, ldx, bf_a, W.q, W.s, W.rs, W.N, I, K, ec, sc->tasks, sc->n_tasks, sc->pairs, top_k, situ_beta,
+            situ_linear_beta, oc, ld_out);
+      else
+        k_moe_nvfp4_mma<SPAN, false, false, false, 4, 2><<<dim3(ceil_div(N_work, 64), mt), 128, 0, st>>>(
+            xc, ldx, bf_a, W.q, W.s, W.rs, W.N, I, K, ec, sc->tasks, sc->n_tasks, sc->pairs, top_k, situ_beta,
+            situ_linear_beta, oc, ld_out);
+    } else {
+      // No-scratch multi-row fallback: 1 row at a time via DIRECT_R1 (exact same bits).
+      for (int rr = 0; rr < rc; ++rr) {
+        if (fuse_act)
+          k_moe_nvfp4_mma<SPAN, true, false, true, 4, 1><<<dim3(ceil_div(N_work, 32), top_k), 128, 0, st>>>(
+              xc + size_t(rr) * ldx, ldx, nullptr, W.q, W.s, W.rs, W.N, I, K, ec + size_t(rr) * top_k, nullptr, nullptr,
+              nullptr, top_k, situ_beta, situ_linear_beta, oc + size_t(rr) * top_k * ld_out, ld_out);
+        else
+          k_moe_nvfp4_mma<SPAN, false, false, true, 4, 2><<<dim3(ceil_div(N_work, 64), top_k), 128, 0, st>>>(
+              xc + size_t(rr) * ldx, ldx, nullptr, W.q, W.s, W.rs, W.N, I, K, ec + size_t(rr) * top_k, nullptr, nullptr,
+              nullptr, top_k, situ_beta, situ_linear_beta, oc + size_t(rr) * top_k * ld_out, ld_out);
+      }
+    }
+  }
+  return grouped;
+}
+
+template <int SPAN>
+void launch_nvfp4_down(const float* act, int ld_act, const ExpertMat& W, const int* eidx, const float* ew, int rows,
+                       int top_k, int H, int K, float* out, int ld_out, bool accumulate, const MoeScratch* sc,
+                       cudaStream_t st, const bf16* act_bf16, int grouped) {
+  const bool has_down =
+      sc && sc->down_buf && sc->tasks && sc->pairs && W.n_experts <= sc->max_experts && top_k <= sc->max_top_k;
+  if (!has_down) {
+    k_moe_nvfp4_down_serial<SPAN, 4, 2><<<dim3(ceil_div(H, 64), rows), 128, 0, st>>>(
+        act, ld_act, W.q, W.s, W.rs, H, K, eidx, ew, top_k, out, ld_out, int(accumulate));
+    return;
+  }
+  const int chunk = std::max(1, sc->chunk_rows);
+  for (int r0 = 0; r0 < rows; r0 += chunk) {
+    const int rc = std::min(chunk, rows - r0);
+    const float* ac = act_bf16 ? nullptr : act + size_t(r0) * top_k * ld_act;
+    const int* ec = eidx + size_t(r0) * top_k;
+    const int M = rc * top_k;
+    const bf16* bf_a = act_bf16;
+    if (!bf_a && sc->bf16_a && sc->stage_elems >= size_t(M) * size_t(K)) {
+      k_moe_stage_bf16<<<M, 256, 0, st>>>(ac, ld_act, K, sc->bf16_a);
+      bf_a = sc->bf16_a;
+    }
+    if (rc == 1) {
+      k_moe_nvfp4_mma<SPAN, false, true, true, 4, 1><<<dim3(ceil_div(H, 32), top_k), 128, 0, st>>>(
+          ac, ld_act, bf_a, W.q, W.s, W.rs, H, H, K, ec, nullptr, nullptr, nullptr, top_k, 0.f, 0.f, sc->down_buf, H);
+    } else {
+      const int mt = max_work_tiles(M, W.n_experts, 16);
+      if (rc != rows || !tiles_serve(grouped, 16, rc)) group_tasks(ec, M, W.n_experts, 16, sc, st);
+      k_moe_nvfp4_mma<SPAN, false, true, false, 4, 2><<<dim3(ceil_div(H, 64), mt), 128, 0, st>>>(
+          ac, ld_act, bf_a, W.q, W.s, W.rs, H, H, K, ec, sc->tasks, sc->n_tasks, sc->pairs, top_k, 0.f, 0.f,
+          sc->down_buf, H);
+    }
+    k_moe_weighted_sum<<<dim3(ceil_div(H, 256), rc), 256, 0, st>>>(sc->down_buf, ew + size_t(r0) * top_k, top_k, H,
+                                                                   out + size_t(r0) * ld_out, ld_out, int(accumulate));
+  }
+}
+
+// ---- BF16 Expert Kernels (float32 activations, compacted work tiles + xor tree) -----------
+template <int BT>
+__device__ __forceinline__ void stage_f32_tile(const float* __restrict__ x, int ldx, const int* row_ids, int nb, int k0,
+                                               int kt, float sm[BT][kMoeKT]) {
+  for (int idx = threadIdx.x; idx < nb * kt; idx += blockDim.x) {
+    const int b = idx / kt, j = idx - b * kt;
+    sm[b][j] = x[size_t(row_ids[b]) * ldx + k0 + j];
+  }
+}
+
+template <int BT>
+__device__ __forceinline__ void bf16_row_step(const bf16* __restrict__ w_row, int k0, int kt, int lane, int nb,
+                                              const float sm[BT][kMoeKT], float acc[BT]) {
+  for (int j = lane; j < kt; j += 32) {
+    const float wv = __bfloat162float(w_row[k0 + j]);
+#pragma unroll
+    for (int b = 0; b < BT; ++b)
+      if (b < nb) acc[b] = __fmaf_rn(sm[b][j], wv, acc[b]);
+  }
+}
+
+template <bool FUSE_ACT>
+__global__ void __launch_bounds__(32 * kMoeWarps)
+    k_moe_bf16_gu_decode(const float* __restrict__ x, int ldx, const bf16* __restrict__ W, const float* __restrict__ RS,
+                         int N_exp, int I, int K, const int* __restrict__ eidx, int top_k, float situ_beta,
+                         float situ_linear_beta, float* __restrict__ out, int ld_out) {
+  pdl_trigger();
+  __shared__ float sm[1][kMoeKT];
+  const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
+  const int col = blockIdx.x * kMoeWarps + warp;
+  const int N_work = FUSE_ACT ? I : 2 * I;
+  const int k_slot = blockIdx.y, r = blockIdx.z;
+  const int e = eidx[r * top_k + k_slot];
+  const float rs = RS ? RS[e] : 1.f;
+  const bf16* w0 = W + (size_t(e) * N_exp + min(col, N_exp - 1)) * K;
+  const bf16* w1 = FUSE_ACT ? (W + (size_t(e) * N_exp + min(col + I, N_exp - 1)) * K) : nullptr;
+  float ag[1] = {0.f}, au[1] = {0.f};
+  const int rids[1] = {r};
+  for (int k0 = 0; k0 < K; k0 += kMoeKT) {
+    const int kt = min(kMoeKT, K - k0);
+    stage_f32_tile<1>(x, ldx, rids, 1, k0, kt, sm);
+    __syncthreads();
+    if (col < N_work) {
+      bf16_row_step<1>(w0, k0, kt, lane, 1, sm, ag);
+      if constexpr (FUSE_ACT) bf16_row_step<1>(w1, k0, kt, lane, 1, sm, au);
+    }
+    __syncthreads();
+  }
+  if (col < N_work) {
+    const float g = warp_tree_sum(ag[0]) * rs;
+    if constexpr (FUSE_ACT) {
+      const float u = warp_tree_sum(au[0]) * rs;
+      if (lane == 0) out[size_t(r * top_k + k_slot) * ld_out + col] = situ_val(g, u, situ_beta, situ_linear_beta);
+    } else if (lane == 0) {
+      out[size_t(r * top_k + k_slot) * ld_out + col] = g;
+    }
+  }
+}
+
+__global__ void __launch_bounds__(32 * kMoeWarps)
+    k_moe_bf16_down_decode(const float* __restrict__ act, int ld_act, const bf16* __restrict__ W,
+                           const float* __restrict__ RS, int H, int K, const int* __restrict__ eidx,
+                           const float* __restrict__ ew, int top_k, float* __restrict__ out, int ld_out,
+                           int accumulate) {
+  pdl_trigger();
+  __shared__ float sm[1][kMoeKT];
+  const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
+  const int col = blockIdx.x * kMoeWarps + warp;
+  const int r = blockIdx.y;
+  float total = 0.f;
+  for (int k_slot = 0; k_slot < top_k; ++k_slot) {
+    const int e = eidx[r * top_k + k_slot];
+    const float rs = RS ? RS[e] : 1.f;
+    const bf16* w0 = W + (size_t(e) * H + min(col, H - 1)) * K;
+    const int rids[1] = {r * top_k + k_slot};
+    float acc[1] = {0.f};
+    for (int k0 = 0; k0 < K; k0 += kMoeKT) {
+      const int kt = min(kMoeKT, K - k0);
+      stage_f32_tile<1>(act, ld_act, rids, 1, k0, kt, sm);
+      __syncthreads();
+      if (col < H) bf16_row_step<1>(w0, k0, kt, lane, 1, sm, acc);
+      __syncthreads();
+    }
+    if (col < H) {
+      const float v = warp_tree_sum(acc[0]) * rs;
+      if (lane == 0) total = __fmaf_rn(ew[r * top_k + k_slot], v, total);
+    }
+  }
+  if (col < H && lane == 0) {
+    float* dst = out + size_t(r) * ld_out + col;
+    *dst = accumulate ? (*dst + total) : total;
+  }
+}
+
+template <bool FUSE_ACT, bool IS_DOWN>
+__global__ void __launch_bounds__(32 * kMoeWarps)
+    k_moe_bf16_grouped(const float* __restrict__ x, int ldx, const bf16* __restrict__ W, const float* __restrict__ RS,
+                       int N_exp, int I_or_H, int K, const MoeTask* __restrict__ tasks, const int* __restrict__ n_tasks,
+                       const int* __restrict__ pairs, int top_k, float situ_beta, float situ_linear_beta,
+                       float* __restrict__ out, int ld_out) {
+  constexpr int BT = 8;
+  const int tid_y = int(blockIdx.y);
+  if (tid_y >= *n_tasks) return;
+  const MoeTask tk = tasks[tid_y];
+  const int e = tk.expert, nb = tk.nb;
+
+  __shared__ float sm[BT][kMoeKT];
+  const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
+  const int col = blockIdx.x * kMoeWarps + warp;
+  const int N_work = FUSE_ACT ? I_or_H : N_exp;
+  const float rs = RS ? RS[e] : 1.f;
+  const bf16* w0 = W + (size_t(e) * N_exp + min(col, N_exp - 1)) * K;
+  const bf16* w1 = FUSE_ACT ? (W + (size_t(e) * N_exp + min(col + I_or_H, N_exp - 1)) * K) : nullptr;
+
+  int rids[BT], pids[BT];
+#pragma unroll
+  for (int b = 0; b < BT; ++b) {
+    pids[b] = b < nb ? pairs[tk.p0 + b] : 0;
+    rids[b] = IS_DOWN ? pids[b] : (pids[b] / top_k);
+  }
+  float ag[BT] = {}, au[BT] = {};
+  for (int k0 = 0; k0 < K; k0 += kMoeKT) {
+    const int kt = min(kMoeKT, K - k0);
+    stage_f32_tile<BT>(x, ldx, rids, nb, k0, kt, sm);
+    __syncthreads();
+    if (col < N_work) {
+      bf16_row_step<BT>(w0, k0, kt, lane, nb, sm, ag);
+      if constexpr (FUSE_ACT) bf16_row_step<BT>(w1, k0, kt, lane, nb, sm, au);
+    }
+    __syncthreads();
+  }
+  if (col < N_work) {
+#pragma unroll
+    for (int b = 0; b < BT; ++b) {
+      if (b >= nb) break;
+      const float g = warp_tree_sum(ag[b]) * rs;
+      if constexpr (FUSE_ACT) {
+        const float u = warp_tree_sum(au[b]) * rs;
+        if (lane == 0) out[size_t(pids[b]) * ld_out + col] = situ_val(g, u, situ_beta, situ_linear_beta);
+      } else if (lane == 0) {
+        out[size_t(pids[b]) * ld_out + col] = g;
+      }
+    }
+  }
+}
+
+// Use INT8 MMA (BM=16) only when average rows per expert is at least 2 (prefill); rounds stay on low-reg dp4a (BM=4).
+constexpr bool moe_use_mma(int rc, int M, int n_experts) { return rc > FLYX_MAX_ROWS && M >= 2 * n_experts; }
+
+bool moe_round_scratch(const ExpertMat& W, int rows, int top_k, const MoeScratch* sc) {
+  return rows > 0 && rows <= FLYX_MAX_ROWS && sc && rows <= sc->chunk_rows && W.n_experts <= sc->max_experts &&
+         top_k > 0 && top_k <= sc->max_top_k && sc->pairs && sc->tasks && sc->n_tasks;
+}
+
+// The moe_dp4a configuration of a packed expert dp4a GEMM of `rows` rows of block type `dtype`: the options' where
+// they force one compiled for this op and row band, else a fused gate|up GEMM's by the rules, else the original tiles.
+int moe_dp4a_cfg(const KernelOptions& o, int dtype, int rows, bool fused_gate_up) {
+  if (o.moe_dp4a >= 0 && moe_dp4a_compiled(dtype, o.moe_dp4a, fused_gate_up, rows)) return o.moe_dp4a;
+  return fused_gate_up ? moe_gate_up_dp4a(o.tuning, dtype, rows) : tables::kMoeDp4aOriginal;
+}
+
+}  // namespace
+
+const MoeDp4aConfig kMoeDp4aConfigs[] = {
+#define X(i, C, U) {C, U},
+    FLYX_MOE_DP4A(X)
+#undef X
+};
+const int kMoeDp4aConfigCount = FLYX_MOE_DP4A_COUNT;
+
+const char* moe_dp4a_name(int cfg) {
+  static constexpr const char* kNames[] = {
+#define X(i, C, U) C == 0 ? "original" : #C "x" #U,
+      FLYX_MOE_DP4A(X)
+#undef X
+  };
+  return cfg >= 0 && cfg < FLYX_MOE_DP4A_COUNT ? kNames[cfg] : "default";
+}
+
+bool moe_dp4a_compiled(int dtype, int cfg, bool fused_gate_up, int rows) {
+#if FLYX_TUNE_CANDIDATES
+  return moe_dp4a_cfg_compiled(dtype, cfg, fused_gate_up, rows, 0);
+#else
+  if (cfg == tables::kMoeDp4aOriginal) return true;
+  const int arch = compiled_arch();
+  return arch > 0 && moe_dp4a_cfg_compiled(dtype, cfg, fused_gate_up, rows, arch);
+#endif
+}
+
+int moe_gate_up_dp4a(int tuning, int dtype, int rows) {
+  const int s = tables::rules_sku(tuning, tables::kFamilyMoeGateUp);
+  for (const tables::MoeGateUpRule& r : tables::kMoeGateUp)
+    if (r.sku == s && (r.dtype == dtype || r.dtype < 0) && rows >= r.lo && rows <= r.hi) return r.cfg;
+  // gen_gemm_tables.py: every list of these rules ends with one for the rest
+  throw std::runtime_error("moe_gate_up: no rule for " + std::to_string(rows) + " rows (variants)");
+}
+
+void moe_stage_q8(const float* x, int ldx, int K, int rows, const MoeScratch& sc, bool mins, cudaStream_t st) {
+  if (mins) k_moe_stage_q8<true><<<rows, 256, 0, st>>>(x, ldx, K, sc.q8_a, sc.q8_d, sc.q8_s);
+  else k_moe_stage_q8<false><<<rows, 256, 0, st>>>(x, ldx, K, sc.q8_a, sc.q8_d, sc.q8_s);
+}
+
+void moe_route(const float* logits, const float* bias, int rows, int n_experts, int top_k, bool gating_sigmoid,
+               bool norm_weights, float norm_eps, float route_scale, int* idx_out, float* w_out, cudaStream_t st) {
+  if (rows <= 0 || n_experts <= 0 || n_experts > kMoeRouteMaxExperts || top_k <= 0 || top_k > n_experts ||
+      top_k > kRouteTop)
+    throw std::runtime_error("moe_route: invalid dimensions");
+  const size_t smem = size_t(2) * size_t(n_experts) * sizeof(float);
+  k_moe_route<<<rows, kRouteThreads, smem, st>>>(logits, bias, n_experts, top_k, int(gating_sigmoid), int(norm_weights),
+                                                 norm_eps, route_scale, idx_out, w_out);
+}
+
+void situ_rows(const float* gu, int ld_gu, int I, float beta, float linear_beta, float* out, int ld_out, int rows,
+               cudaStream_t st) {
+  if (rows <= 0 || I <= 0) return;
+  k_situ_rows<<<dim3(ceil_div(I, 256), rows), 256, 0, st>>>(gu, ld_gu, I, beta, linear_beta, out, ld_out);
+}
+
+bool moe_q8_mins(const ExpertMat& W) {
+  const MoeBlockOps* ops = W.packed() ? moe_block_ops(W.blk.dtype) : nullptr;
+  return ops && ops->mins;
+}
+
+bool moe_round_q8(const ExpertMat& W, int rows, int top_k, int K, const MoeScratch* sc) {
+  if (!W.packed() || !W.blk.q8 || K <= 0 || K % 32 != 0 || !moe_round_scratch(W, rows, top_k, sc)) return false;
+  // A format with minima: whole warps of four groups only (K % 128), where k_moe_stage_q8's half-group sums, which
+  // rmsnorm_moe_q8 has to reproduce, have every lane of the warp behind them.
+  const bool sums_ok = !moe_q8_mins(W) || (sc->q8_s && K % 128 == 0);
+  return sums_ok && sc->q8_a && sc->q8_d && sc->stage_elems >= size_t(rows) * K;
+}
+
+bool moe_round_bf16_down(const ExpertMat& W, int rows, int top_k, int K, const MoeScratch* sc) {
+  return !W.packed() && W.q && K > 0 && K % 64 == 0 && moe_round_scratch(W, rows, top_k, sc) && sc->down_buf &&
+         sc->bf16_a && sc->stage_elems >= size_t(rows) * top_k * K;
+}
+
+int moe_gate_up(const float* x, int ldx, const ExpertMat& W, const int* eidx, int rows, int top_k, int I, int K,
+                float situ_beta, float situ_linear_beta, bool fuse_act, float* out, int ld_out, const MoeScratch* sc,
+                const Launch& L, bool q8_ready, bf16* act_bf16) {
+  cudaStream_t st = L.st;
+  const int N_work = fuse_act ? I : 2 * I;
+  if ((q8_ready || act_bf16) && !moe_round_q8(W, rows, top_k, K, sc))
+    throw std::runtime_error("moe_gate_up: pre-staged input and BF16 output require a staged Q8 round");
+  if (act_bf16 && (!fuse_act || ld_out != I))
+    throw std::runtime_error("moe_gate_up: BF16 output requires contiguous fused activations");
+  if (W.packed()) {
+    blocks_init();
+    const MoeBlockOps* ops = moe_block_ops(W.blk.dtype);
+    if (!ops) throw std::runtime_error("moe_gate_up: unsupported GGML block dtype " + std::to_string(W.blk.dtype));
+    const bool has_sc = sc && sc->tasks && sc->pairs && W.n_experts <= sc->max_experts && top_k <= sc->max_top_k;
+    const int chunk = has_sc ? std::max(1, sc->chunk_rows) : rows;
+    int grouped = 0;
+    for (int r0 = 0; r0 < rows; r0 += chunk) {
+      const int rc = std::min(chunk, rows - r0);
+      const float* xc = x + size_t(r0) * ldx;
+      const int* ec = eidx + size_t(r0) * top_k;
+      float* oc = act_bf16 ? nullptr : out + size_t(r0) * top_k * ld_out;
+      const bool can_q8 = W.blk.q8 && sc && sc->q8_a && sc->stage_elems >= size_t(rc) * size_t(K);
+      if (can_q8 && !q8_ready) moe_stage_q8(xc, ldx, K, rc, *sc, ops->mins, st);
+      const int M = rc * top_k;
+      const bool use_mma = can_q8 && has_sc && moe_use_mma(rc, M, W.n_experts);
+      int mt = 0;
+      if (rc > 1 && has_sc) {
+        const int bm = use_mma ? 16 : 4;
+        mt = max_work_tiles(M, W.n_experts, bm);
+        group_tasks(ec, M, W.n_experts, bm, sc, st);
+        grouped = rc == rows ? bm : 0;
+      }
+      ops->gu(xc, ldx, W, ec, rc, top_k, I, K, situ_beta, situ_linear_beta, fuse_act, oc, ld_out, sc, mt, use_mma,
+              moe_dp4a_cfg(opts(L), W.blk.dtype, rc, fuse_act), st, act_bf16);
+    }
+    return grouped;
+  }
+  if (W.q) {
+    if (K % 128 == 0)
+      return launch_nvfp4_gu<128>(x, ldx, W, eidx, rows, top_k, I, K, situ_beta, situ_linear_beta, fuse_act, out,
+                                  ld_out, sc, st);
+    if (K % 64 == 0)
+      return launch_nvfp4_gu<64>(x, ldx, W, eidx, rows, top_k, I, K, situ_beta, situ_linear_beta, fuse_act, out,
+                                 ld_out, sc, st);
+    throw std::runtime_error("moe_gate_up: NVFP4 requires K multiple of 64 (got " + std::to_string(K) + ")");
+  }
+  const bool tiled = rows > 1 && sc && sc->tasks && sc->pairs && W.n_experts <= sc->max_experts &&
+                     top_k <= sc->max_top_k;
+  if (!tiled) {
+    const dim3 grid(ceil_div(N_work, kMoeWarps), top_k, rows);
+    if (fuse_act)
+      k_moe_bf16_gu_decode<true><<<grid, 32 * kMoeWarps, 0, st>>>(
+          x, ldx, W.w, W.rs, W.N, I, K, eidx, top_k, situ_beta, situ_linear_beta, out, ld_out);
+    else
+      k_moe_bf16_gu_decode<false><<<grid, 32 * kMoeWarps, 0, st>>>(
+          x, ldx, W.w, W.rs, W.N, I, K, eidx, top_k, situ_beta, situ_linear_beta, out, ld_out);
+    return 0;
+  }
+  const int chunk = std::max(1, sc->chunk_rows);
+  for (int r0 = 0; r0 < rows; r0 += chunk) {
+    const int rc = std::min(chunk, rows - r0);
+    const int M = rc * top_k;
+    const int mt = max_work_tiles(M, W.n_experts, 8);
+    group_tasks(eidx + size_t(r0) * top_k, M, W.n_experts, 8, sc, st);
+    const dim3 grid(ceil_div(N_work, kMoeWarps), mt);
+    const float* xc = x + size_t(r0) * ldx;
+    float* oc = out + size_t(r0) * top_k * ld_out;
+    if (fuse_act)
+      k_moe_bf16_grouped<true, false><<<grid, 32 * kMoeWarps, 0, st>>>(
+          xc, ldx, W.w, W.rs, W.N, I, K, sc->tasks, sc->n_tasks, sc->pairs, top_k, situ_beta, situ_linear_beta, oc,
+          ld_out);
+    else
+      k_moe_bf16_grouped<false, false><<<grid, 32 * kMoeWarps, 0, st>>>(
+          xc, ldx, W.w, W.rs, W.N, I, K, sc->tasks, sc->n_tasks, sc->pairs, top_k, situ_beta, situ_linear_beta, oc,
+          ld_out);
+  }
+  return rows <= chunk ? 8 : 0;
+}
+
+void moe_down(const float* act, int ld_act, const ExpertMat& W, const int* eidx, const float* ew, int rows, int top_k,
+              int H, int K, float* out, int ld_out, bool accumulate, const MoeScratch* sc, const Launch& L,
+              const bf16* act_bf16, int grouped) {
+  cudaStream_t st = L.st;
+  if (act_bf16 && !moe_round_bf16_down(W, rows, top_k, K, sc))
+    throw std::runtime_error("moe_down: pre-staged BF16 input requires an NVFP4 round");
+  if (W.packed()) {
+    blocks_init();
+    const MoeBlockOps* ops = moe_block_ops(W.blk.dtype);
+    if (!ops) throw std::runtime_error("moe_down: unsupported GGML block dtype " + std::to_string(W.blk.dtype));
+    const bool has_sc =
+        sc && sc->tasks && sc->pairs && sc->down_buf && W.n_experts <= sc->max_experts && top_k <= sc->max_top_k;
+    const int chunk = has_sc ? std::max(1, sc->chunk_rows) : rows;
+    for (int r0 = 0; r0 < rows; r0 += chunk) {
+      const int rc = std::min(chunk, rows - r0);
+      const float* ac = act + size_t(r0) * top_k * ld_act;
+      const int* ec = eidx + size_t(r0) * top_k;
+      const float* ewc = ew + size_t(r0) * top_k;
+      float* oc = out + size_t(r0) * ld_out;
+      const int M = rc * top_k;
+      const bool can_q8 = W.blk.q8 && sc && sc->q8_a && sc->down_buf && sc->stage_elems >= size_t(M) * size_t(K);
+      if (can_q8) moe_stage_q8(ac, ld_act, K, M, *sc, ops->mins, st);
+      const bool use_mma = can_q8 && has_sc && moe_use_mma(rc, M, W.n_experts);
+      int mt = 0;
+      if (rc > 1 && has_sc) {
+        const int bm = use_mma ? 16 : 4;
+        mt = max_work_tiles(M, W.n_experts, bm);
+        if (rc != rows || !tiles_serve(grouped, bm, rc)) group_tasks(ec, M, W.n_experts, bm, sc, st);
+      }
+      const bool wrote_buf = ops->down(ac, ld_act, W, ec, ewc, rc, top_k, H, K, oc, ld_out, accumulate, sc, mt,
+                                       use_mma, moe_dp4a_cfg(opts(L), W.blk.dtype, rc, false), st);
+      if (wrote_buf)
+        k_moe_weighted_sum<<<dim3(ceil_div(H, 256), rc), 256, 0, st>>>(sc->down_buf, ewc, top_k, H, oc, ld_out,
+                                                                       int(accumulate));
+    }
+    return;
+  }
+  if (W.q) {
+    if (K % 128 == 0)
+      launch_nvfp4_down<128>(act, ld_act, W, eidx, ew, rows, top_k, H, K, out, ld_out, accumulate, sc, st, act_bf16,
+                             grouped);
+    else if (K % 64 == 0)
+      launch_nvfp4_down<64>(act, ld_act, W, eidx, ew, rows, top_k, H, K, out, ld_out, accumulate, sc, st, act_bf16,
+                            grouped);
+    else
+      throw std::runtime_error("moe_down: NVFP4 requires K multiple of 64 (got " + std::to_string(K) + ")");
+    return;
+  }
+  const bool tiled = rows > 1 && sc && sc->tasks && sc->pairs && sc->down_buf && W.n_experts <= sc->max_experts &&
+                     top_k <= sc->max_top_k;
+  if (!tiled) {
+    k_moe_bf16_down_decode<<<dim3(ceil_div(H, kMoeWarps), rows), 32 * kMoeWarps, 0, st>>>(
+        act, ld_act, W.w, W.rs, H, K, eidx, ew, top_k, out, ld_out, int(accumulate));
+    return;
+  }
+  const int chunk = std::max(1, sc->chunk_rows);
+  for (int r0 = 0; r0 < rows; r0 += chunk) {
+    const int rc = std::min(chunk, rows - r0);
+    const int M = rc * top_k;
+    const int mt = max_work_tiles(M, W.n_experts, 8);
+    if (rc != rows || !tiles_serve(grouped, 8, rc)) group_tasks(eidx + size_t(r0) * top_k, M, W.n_experts, 8, sc, st);
+    const dim3 grid(ceil_div(H, kMoeWarps), mt);
+    k_moe_bf16_grouped<false, true><<<grid, 32 * kMoeWarps, 0, st>>>(
+        act + size_t(r0) * top_k * ld_act, ld_act, W.w, W.rs, H, H, K, sc->tasks, sc->n_tasks, sc->pairs, top_k, 0.f,
+        0.f, sc->down_buf, H);
+    k_moe_weighted_sum<<<dim3(ceil_div(H, 256), rc), 256, 0, st>>>(sc->down_buf, ew + size_t(r0) * top_k, top_k, H,
+                                                                   out + size_t(r0) * ld_out, ld_out, int(accumulate));
+  }
+}
+
+}  // namespace flyx::cuda

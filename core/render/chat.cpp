@@ -154,6 +154,7 @@ jinja::value message_to_jinja(const ChatMessage& m) {
     insert_input_lit(obj, "tool_calls", std::move(calls));
   }
   if (!m.tool_call_id.empty()) insert_input_lit(obj, "tool_call_id", make_jinja_string(m.tool_call_id, true));
+  if (!m.name.empty()) insert_input_lit(obj, "name", make_jinja_string(m.name, true));
   return obj;
 }
 
@@ -247,6 +248,7 @@ void hash_chat_message(uint64_t& h, const ChatMessage& m) {
     hash_ojson(h, c.arguments);
   }
   hash_str(h, m.tool_call_id);
+  hash_str(h, m.name);
   hash_u64(h, m.parts.size());
   for (const auto& p : m.parts) {
     hash_u64(h, static_cast<uint64_t>(p.kind));
@@ -261,7 +263,7 @@ void hash_chat_message(uint64_t& h, const ChatMessage& m) {
 
 bool same_chat_message(const ChatMessage& a, const ChatMessage& b) {
   if (a.role != b.role || a.content != b.content || a.reasoning != b.reasoning || a.tool_call_id != b.tool_call_id ||
-      a.tool_calls.size() != b.tool_calls.size() || a.parts.size() != b.parts.size())
+      a.name != b.name || a.tool_calls.size() != b.tool_calls.size() || a.parts.size() != b.parts.size())
     return false;
   for (size_t i = 0; i < a.tool_calls.size(); ++i)
     if (a.tool_calls[i].id != b.tool_calls[i].id || a.tool_calls[i].name != b.tool_calls[i].name ||
@@ -367,6 +369,11 @@ struct ChatTemplate::Impl {
     ctx.set_val("add_generation_prompt", jinja::mk_val<jinja::value_bool>(gen));
     if (!opt.kwargs.is_object() || !opt.kwargs.contains("enable_thinking"))
       ctx.set_val("enable_thinking", jinja::mk_val<jinja::value_bool>(opt.enable_thinking));
+    // The same options under the names this template reads them by, unless the request set those itself.
+    const ojson named = chat->option_variables(opt);
+    for (auto it = named.begin(); it != named.end(); ++it)
+      if (!opt.kwargs.is_object() || !opt.kwargs.contains(it.key()))
+        ctx.set_val(it.key(), to_jinja_value(it.value(), false, 0));
 
     jinja::runtime runtime(ctx);
     const jinja::value result = runtime.execute(program);
@@ -734,6 +741,10 @@ bool ChatTemplate::render(const std::vector<ChatMessage>& msgs, const std::vecto
 std::string ChatTemplate::reply_grammar(const std::vector<ojson>& tools, const ReplyRules& rules,
                                         const RenderedChat& r) const {
   return impl_ ? impl_->chat->reply_grammar(tools, rules, r.in_reasoning) : std::string();
+}
+
+std::vector<std::string> ChatTemplate::reply_tokens() const {
+  return impl_ ? impl_->chat->reply_tokens() : std::vector<std::string>();
 }
 
 std::unique_ptr<OutputParser> ChatTemplate::parser(const RenderedChat& r, const std::vector<ojson>* tools) const {

@@ -354,6 +354,34 @@ ahead = 0
 warps = 16
 staged = 2
 
+# MoE layers' packed expert GEMMs with inputs in 8 bits on dp4a (k_moe_blocks_q8_dp4a: rounds, and passes of fewer
+# rows than its MMA kernel takes): the output columns a warp takes (gate/up pairs where the activation is fused) and
+# the K/32 units a lane has in flight.  `columns = 0, units = 0`: the original tiles (one pair a warp fused, two
+# columns otherwise; two units at one row where a unit is 32 bytes or less, one otherwise), the configuration every
+# block type compiles; the others, for the types gen_gemm_tables.py's MOE_DP4A_TYPES names, load only the tables
+# their units decode with and run a grouped tile of one row through the one-row loop.  Every one gives the same bits.
+[[moe_dp4a]]
+columns = 0
+units = 0
+[[moe_dp4a]]
+columns = 1
+units = 1
+[[moe_dp4a]]
+columns = 1
+units = 2
+[[moe_dp4a]]
+columns = 2
+units = 1
+[[moe_dp4a]]
+columns = 2
+units = 2
+[[moe_dp4a]]
+columns = 4
+units = 1
+[[moe_dp4a]]
+columns = 4
+units = 2
+
 # The rules for shapes no table lists, on every GPU whose table (or one it inherits) has no rules of that family.
 [defaults]
 # bf16: three input planes; 5..8 rows read them for every 8 columns of an nt = 1 tile (RTX 5090:
@@ -490,4 +518,12 @@ blocks = [
   { n_max = 12288, rows = [1, 16], nt = 1, nw = 4, kw = 2 },
   { n_max = 65536, rows = [1, 16], nt = 1, nw = 8, kw = 1 },
   { rows = [1, 16], nt = 2, nw = 8, kw = 1 },               # the output head
+]
+# MoE layers' fused gate|up GEMMs on dp4a (a moe_dp4a configuration; their down GEMMs and unfused projections take
+# the original tiles): the first rule that matches the block type and the pass's rows.  Rules naming types come
+# first; each list of types, and the rules for every other type, ends with a rule for the rest (no rows), and only
+# the original tiles serve every type.  Defaults stay conservative (original tiles everywhere); per-GPU rules tuned
+# by `cuda_bench tune moe_gate_up` belong under variants/<arch>/tables/<sku>.toml.
+moe_gate_up = [
+  { columns = 0, units = 0 },
 ]

@@ -28,22 +28,26 @@ void Plans::free(const flyx_backend_api* api) {
   adaptive_checkpoints.clear();
   refused.clear();
   refused_drafter = -1;
+  oom = false;
   prefill = nullptr;
   vision = nullptr;
 }
 
 bool build(const flyx_backend_api* api, flyx_bmodel* bm, const interfaces::Model& model, int prefill_chunk,
            int fixed_width, bool given, bool draft_trees, Plans* out, std::string* err, bool adaptive) {
+  out->oom = false;
   auto pre = model.prefill_program();
   flyx_program pp{FLYX_PHASE_PREFILL, 0, prefill_chunk, static_cast<int32_t>(pre.size()), pre.data()};
-  if (api->lower(bm, &pp, &out->prefill) != 0) {
+  if (const int rc = api->lower(bm, &pp, &out->prefill); rc != 0) {
+    out->oom = rc == FLYX_ERR_OOM;
     *err = std::string("lower prefill: ") + api->last_error();
     return false;
   }
   if (auto vp = model.vision_program(); !vp.empty()) {
     constexpr int32_t kMaxVisionPatches = 16384;
     flyx_program vprog{FLYX_PHASE_VISION, 0, kMaxVisionPatches, static_cast<int32_t>(vp.size()), vp.data()};
-    if (api->lower(bm, &vprog, &out->vision) != 0) {
+    if (const int rc = api->lower(bm, &vprog, &out->vision); rc != 0) {
+      out->oom = rc == FLYX_ERR_OOM;
       *err = std::string("lower vision: ") + api->last_error();
       return false;
     }
@@ -54,7 +58,9 @@ bool build(const flyx_backend_api* api, flyx_bmodel* bm, const interfaces::Model
     out->drafters.push_back(drafter);
     out->drafter_trees.push_back(false);
   };
-  auto lower_round = [&](int k, int drafter, bool given_drafts, std::vector<flyx_plan*>* to, bool tree = false) {
+  auto lower_round = [&](int k, int drafter, bool given_drafts, std::vector<flyx_plan*>* to, bool tree = false,
+                         bool* is_oom = nullptr) {
+    if (is_oom) *is_oom = false;
     auto rnd = model.round_program(k, drafter, given_drafts);
     for (auto& n : rnd) {  // the tree is the round's (DV's say so themselves): the node of its drafts says so
       if (tree && n.kind == FLYX_NODE_GIVEN) n.arg1 = FLYX_GIVEN_TREE;
@@ -62,7 +68,9 @@ bool build(const flyx_backend_api* api, flyx_bmodel* bm, const interfaces::Model
     }
     flyx_program rp{FLYX_PHASE_ROUND, k, k + 1, static_cast<int32_t>(rnd.size()), rnd.data()};
     flyx_plan* plan = nullptr;
-    if (api->lower(bm, &rp, &plan) != 0) {
+    if (const int rc = api->lower(bm, &rp, &plan); rc != 0) {
+      if (is_oom) *is_oom = rc == FLYX_ERR_OOM;
+      else out->oom = rc == FLYX_ERR_OOM;
       *err = std::string("lower round: ") + api->last_error();
       return false;
     }
@@ -71,14 +79,19 @@ bool build(const flyx_backend_api* api, flyx_bmodel* bm, const interfaces::Model
   };
   // A round the engine can do without: lowered where the backend takes it, else the backend's refusal.  *err is
   // left as it was.
+  struct ProbeErr {
+    std::string msg;
+    bool oom = false;
+  };
   auto probe_round = [&](int k, int drafter, bool given_drafts, std::vector<flyx_plan*>* to,
-                         bool tree) -> std::optional<std::string> {
+                         bool tree) -> std::optional<ProbeErr> {
     std::string e;
+    bool oom = false;
     std::swap(e, *err);
-    const bool ok = lower_round(k, drafter, given_drafts, to, tree);
+    const bool ok = lower_round(k, drafter, given_drafts, to, tree, &oom);
     std::swap(e, *err);
     if (ok) return std::nullopt;
-    return e;
+    return ProbeErr{std::move(e), oom};
   };
   auto lower_given_trees = [&]() {
     for (int k : tree_widths()) {
@@ -116,8 +129,8 @@ bool build(const flyx_backend_api* api, flyx_bmodel* bm, const interfaces::Model
       if (auto why = probe_round(k, d, false, &lowered, true)) {
         // Memory the load can give back (engine.cpp: trim) is not a reason to draft without it: the load lowers
         // the plans again once it has (the ones lowered here freed first).
-        if (why->find("out of GPU memory") != std::string::npos) return free_lowered(), *err = *why, false;
-        refuse(k, *why);
+        if (why->oom) return free_lowered(), out->oom = true, *err = why->msg, false;
+        refuse(k, why->msg);
         continue;
       }
       widths.push_back(k);
@@ -125,8 +138,8 @@ bool build(const flyx_backend_api* api, flyx_bmodel* bm, const interfaces::Model
     }
     if (!widths.empty() && fixed_width < 0 && model.restarts(d)) {
       if (auto why = probe_round(0, d, false, &lowered, false)) {
-        if (why->find("out of GPU memory") != std::string::npos) return free_lowered(), *err = *why, false;
-        refuse(0, *why);  // without its warm-up the drafter is not run: its rounds after others' would draft nothing
+        if (why->oom) return free_lowered(), out->oom = true, *err = why->msg, false;
+        refuse(0, why->msg);  // without its warm-up the drafter is not run: its rounds after others' would draft nothing
         widths.clear();
       } else {
         widths.push_back(0);
@@ -206,7 +219,7 @@ bool build(const flyx_backend_api* api, flyx_bmodel* bm, const interfaces::Model
       if (cps.size() < 2 || cps.size() > FLYX_MAX_STOP_BUCKETS) continue;
       auto rnd = model.round_program(cps.back(), d, false);
       flyx_program rp{FLYX_PHASE_ROUND, cps.back(), cps.back() + 1, static_cast<int32_t>(rnd.size()), rnd.data(),
-                      static_cast<int32_t>(cps.size()), cps.data()};
+                      static_cast<int32_t>(cps.size()), cps.data(), model.draft_steps_cheap(d) ? 1 : 0};
       flyx_plan* plan = nullptr;
       if (api->lower(bm, &rp, &plan) == 0 && plan) {
         out->adaptive[size_t(d)] = plan;

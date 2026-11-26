@@ -227,12 +227,15 @@ struct Out {
 // A group of 32 values in 8 bits, as the staging kernels round them (gemm_blocks.cu): d = (their largest
 // magnitude) / 127 and p = the nearest integer of value / d, both in float32, written where the GEMM reads them.
 // p: this lane's integer, `at` (0..31) its place in the group; s16: the sum of its half's 16 integers (the half
-// at / 16); first: the lane that writes the group's d and its halves' sums.
+// at / 16); first: the lane that writes the group's d and its halves' sums.  CONTIGUOUS: the integers in place beside
+// the sums too, as the expert GEMMs read them (moe_stage_q8), not where round_q8_at puts the two halves.
+template <bool CONTIGUOUS = false>
 __device__ __forceinline__ void q8_store(const Out& o, int row, int grp, int at, int p, float dg, int s16, bool first16,
                                          bool first) {
   const int units = o.q8_k / 32;
   if (o.q8_sums) {
-    o.q8[size_t(row) * o.q8_k + round_q8_at(grp, units, at >> 4) + (at & 15)] = int8_t(p);
+    const int i = CONTIGUOUS ? 32 * grp + at : round_q8_at(grp, units, at >> 4) + (at & 15);
+    o.q8[size_t(row) * o.q8_k + i] = int8_t(p);
     if (first16) o.q8_sums[(size_t(row) * units + grp) * 2 + (at >> 4)] = dg * float(s16);
   } else {
     o.q8[size_t(row) * o.q8_k + 32 * grp + at] = int8_t(p);
@@ -243,6 +246,7 @@ __device__ __forceinline__ int q8_of(float v, float dg) {
   return dg > 0.f && dg <= 3.402823466e38f ? __float2int_rn(v / dg) : 0;
 }
 // A warp's 32 values, lane l value 32 grp + l of the row (every lane of the warp calls it).
+template <bool CONTIGUOUS = false>
 __device__ __forceinline__ void put_q8(const Out& o, int row, int grp, float v) {
   const int lane = threadIdx.x & 31;
   float m = fabsf(v);
@@ -258,7 +262,7 @@ __device__ __forceinline__ void put_q8(const Out& o, int row, int grp, float v) 
   int s16 = p;
 #pragma unroll
   for (int s = 8; s; s >>= 1) s16 += __shfl_xor_sync(0xffffffffu, s16, s);
-  q8_store(o, row, grp, lane, p, dg, s16, !(lane & 15), !lane);
+  q8_store<CONTIGUOUS>(o, row, grp, lane, p, dg, s16, !(lane & 15), !lane);
 }
 // A warp's 64 values in pairs, lane l values 2 l and 2 l + 1 from 64 grp2 of the row: lanes 0..15 the group
 // 2 grp2, lanes 16..31 the next (every lane of the warp calls it).

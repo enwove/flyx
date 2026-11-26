@@ -33,7 +33,16 @@ static std::string asked(size_t bytes) {
   return s;
 }
 
+#ifdef FLYX_TEST_DEVICE_ALLOC
+// Only the loader test executable supplies these. The production module always calls the driver.
+void test_device_room(size_t bytes);
+cudaError_t test_cuda_malloc(void** ptr, size_t bytes);
+#endif
+
 void device_room(size_t bytes) {
+#ifdef FLYX_TEST_DEVICE_ALLOC
+  test_device_room(bytes);
+#endif
 #if defined(_WIN32)
   // Windows' driver places an allocation past what its video memory manager keeps free in host memory instead of
   // refusing it: refused here first, against NVML's free memory (gpu_memory) less kPagedFloor.
@@ -56,7 +65,11 @@ void* device_malloc(size_t bytes) {
   char m[240];
   // The driver refuses elsewhere; on Windows it may too (another program between device_room and the allocation).
   void* p = nullptr;
+#ifdef FLYX_TEST_DEVICE_ALLOC
+  const cudaError_t e = test_cuda_malloc(&p, bytes);
+#else
   const cudaError_t e = cudaMalloc(&p, bytes);
+#endif
   if (e == cudaErrorMemoryAllocation) {
     cudaGetLastError();  // not sticky: clear it
     std::snprintf(m, sizeof(m), "out of GPU memory: %s asked, the driver refused it", asked(bytes).c_str());
@@ -69,6 +82,11 @@ void* device_malloc(size_t bytes) {
 int fail(const std::string& m) {
   g_error = m;
   return -1;
+}
+
+int fail_oom(const std::string& m) {
+  g_error = m;
+  return FLYX_ERR_OOM;
 }
 
 int no_sequence(const char* call) {
@@ -207,6 +225,33 @@ const std::vector<OptionSpec>& option_specs() {
       kernel_flag_opt("gdn_round", &KernelOptions::gdn_round),
       kernel_flag_opt("stacks", &KernelOptions::stacks),
       kernel_flag_opt("round_glu", &KernelOptions::round_glu),
+      {"moe_dp4a",
+       [](const std::string& key, const std::string& val, BackendOptions* o, std::string* err) {
+         if (val == moe_dp4a_name(-1)) {
+           o->kernels.moe_dp4a = -1;
+           return true;
+         }
+         for (int i = 0; i < kMoeDp4aConfigCount; ++i) {
+           if (val != moe_dp4a_name(i)) continue;
+           // Every type, op kind and row band must compile it: a release build compiles only fused gate|up
+           // configurations its tables reach, so non-original overrides require FLYX_TUNE_CANDIDATES=ON.
+           for (int dtype : kMoeDp4aTypes)
+             for (bool fused : {false, true})
+               for (int r : {1, 2})
+                 if (!moe_dp4a_compiled(dtype, i, fused, r)) {
+                   *err = key + "=" + val + " is not compiled in this build (configure with -DFLYX_TUNE_CANDIDATES=ON)";
+                   return false;
+                 }
+           o->kernels.moe_dp4a = i;
+           return true;
+         }
+         *err = "bad value \"" + val + "\" for " + key;
+         return false;
+       },
+       [](const BackendOptions& o, const BackendOptions& def) -> std::string {
+         if (o.kernels.moe_dp4a == def.kernels.moe_dp4a) return "";
+         return std::string("moe_dp4a=") + moe_dp4a_name(o.kernels.moe_dp4a);
+       }},
       kernel_flag_opt("side_stream", &KernelOptions::side_stream),
       {"attention",
        [](const std::string& key, const std::string& val, BackendOptions* o, std::string* err) {
@@ -245,7 +290,15 @@ const std::vector<OptionSpec>& option_specs() {
          if (o.wait == def.wait) return "";
          return o.wait == WaitMode::spin ? "wait=spin" : o.wait == WaitMode::poll ? "wait=poll" : "wait=auto";
        }},
-      bool_choice_opt("draft_weights", &BackendOptions::exact_drafts, "exact", "nvfp4"),
+      {"draft_weights",
+       [](const std::string&, const std::string& val, BackendOptions* o, std::string* err) {
+         return interfaces::parse_draft_weights(val, &o->draft_weights, nullptr, err);
+       },
+       [](const BackendOptions& o, const BackendOptions& def) -> std::string {
+         return o.draft_weights != def.draft_weights
+                    ? std::string("draft_weights=") + interfaces::draft_weights_name(o.draft_weights)
+                    : "";
+       }},
       kernel_int_choice_opt("act_group", &KernelOptions::act_group, {"32", "64", "128", "256"}),
       kernel_int_choice_opt("act_fp4", &KernelOptions::act_fp4, {"0", "1", "2"}),
       bool_choice_opt("draft_head", &BackendOptions::full_draft_head, "full", "pick"),
@@ -382,6 +435,7 @@ const std::vector<OptionSpec>& option_specs() {
       kernel_whole_opt("mtp_copy", &KernelOptions::mtp_copy),
       kernel_whole_opt("mtp_sink", &KernelOptions::mtp_sink),
       kernel_flag_opt("mtp_ring", &KernelOptions::mtp_ring),
+      kernel_flag_opt("dflash_ring", &KernelOptions::dflash_ring),
       {"pageable_kv",
        [](const std::string& key, const std::string& val, BackendOptions* o, std::string* err) {
          if (!check_choice(key, val, {"auto", "on", "off"}, err)) return false;
@@ -441,7 +495,7 @@ bool nvfp4_inputs(const flyx_model_desc& desc, bool* on, std::string* err) {
     const flyx_weight& w = desc.weights[i];
     if (!w.t || (w.t->dtype != FLYX_DT_NVFP4 && w.t->dtype != FLYX_DT_GGML_NVFP4)) continue;
     if (w.activations != FLYX_ACT_NVFP4) {
-      ++without;
+      if (w.t->ndim == 2) ++without;  // 3D MoE experts always use bf16 activations (FLYX_ACT_FORMAT)
       continue;
     }
     ++with;
@@ -508,8 +562,17 @@ int open_model(const flyx_model_desc* desc, const flyx_open_options* opts, flyx_
     cudaGetDeviceProperties(&prop, 0);
     std::string err;
     if (opts) {
+      if (opts->lock_auto_from) m->opt.kernels.strata_from = opts->auto_from;
       m->opt.vision = opts->vision_device;
       m->opt.vision_quant = opts->vision_quant;
+      if (opts->draft_weights == FLYX_DRAFT_WEIGHTS_NVFP4)
+        m->opt.draft_weights = interfaces::DraftWeightsMode::kNvfp4;
+      else if (opts->draft_weights == FLYX_DRAFT_WEIGHTS_Q8)
+        m->opt.draft_weights = interfaces::DraftWeightsMode::kQ8;
+      else if (opts->draft_weights == FLYX_DRAFT_WEIGHTS_EXACT)
+        m->opt.draft_weights = interfaces::DraftWeightsMode::kExact;
+      else
+        m->opt.draft_weights = interfaces::DraftWeightsMode::kAuto;
     }
     if (!parse_options(opts ? opts->options : nullptr, &m->opt, &err)) return fail("options: " + err);
     if (!nvfp4_inputs(*desc, &m->opt.kernels.prefill_fp4, &err)) return fail(err);
@@ -527,65 +590,12 @@ int open_model(const flyx_model_desc* desc, const flyx_open_options* opts, flyx_
       m->opt.embed = roomy ? 2 : 1;
     }
     if (m->opt.vision == FLYX_VISION_DEV_AUTO) {
-      // vision=auto: keep vision encoder weights on the GPU when >= 8 GB of free VRAM remain after LLM + vision
-      // weights (for KV cache, drafters, and round graphs); otherwise keep them in an auto-deleted temp file on disk
-      // (0 VRAM, 0 locked host RAM) and 3-stage stream each linear to the GPU during encode_vision().
-      std::vector<char> is_vis(size_t(desc->n_weights), 0), is_vis_lin(size_t(desc->n_weights), 0);
-      auto mv = [&](int w) {
-        if (w >= 0 && w < desc->n_weights) is_vis[size_t(w)] = 1;
-      };
-      auto ml = [&](int w) {
-        if (w >= 0 && w < desc->n_weights) is_vis[size_t(w)] = 1, is_vis_lin[size_t(w)] = 1;
-      };
-      auto mn = [&](const flyx_vnorm& n) { mv(n.w), mv(n.b); };
-      for (int i = 0; i < desc->n_blocks; ++i) {
-        const flyx_block& b = desc->blocks[i];
-        if (b.kind == FLYX_BLOCK_VISION_STEM) {
-          mv(b.vision_stem.patch_w), mv(b.vision_stem.patch_w2), mv(b.vision_stem.patch_b), mv(b.vision_stem.pos_w),
-              mv(b.vision_stem.cls_token);
-          mn(b.vision_stem.pre_norm);
-        } else if (b.kind == FLYX_BLOCK_VIT_ATTN) {
-          mn(b.vit_attn.norm), mn(b.vit_attn.q_norm), mn(b.vit_attn.k_norm);
-          ml(b.vit_attn.qkv), ml(b.vit_attn.q), ml(b.vit_attn.k), ml(b.vit_attn.v), ml(b.vit_attn.o);
-          mv(b.vit_attn.qkv_b), mv(b.vit_attn.q_b), mv(b.vit_attn.k_b), mv(b.vit_attn.v_b), mv(b.vit_attn.o_b),
-              mv(b.vit_attn.layer_scale);
-        } else if (b.kind == FLYX_BLOCK_VIT_MLP) {
-          mn(b.vit_mlp.norm);
-          ml(b.vit_mlp.fc1), ml(b.vit_mlp.gate), ml(b.vit_mlp.fc2);
-          mv(b.vit_mlp.fc1_b), mv(b.vit_mlp.gate_b), mv(b.vit_mlp.fc2_b), mv(b.vit_mlp.layer_scale);
-        } else if (b.kind == FLYX_BLOCK_VISION_MERGE) {
-          mn(b.vision_merge.norm);
-          ml(b.vision_merge.fc1), ml(b.vision_merge.fc2);
-          mv(b.vision_merge.fc1_b), mv(b.vision_merge.fc2_b);
-        }
+      size_t free_b = 0, total_b = 0;
+      if (!gpu_memory(&free_b, &total_b) && cudaMemGetInfo(&free_b, &total_b) != cudaSuccess) {
+        cudaGetLastError();
+        free_b = 0;
       }
-      uint64_t llm_bytes = 0, vis_bytes = 0;
-      for (int i = 0; i < desc->n_weights; ++i) {
-        const flyx_tensor_view* t = desc->weights[i].t;
-        if (!t) continue;
-        if (!is_vis[size_t(i)]) {
-          llm_bytes += t->nbytes;
-          continue;
-        }
-        uint64_t nb = t->nbytes;
-        const bool flt = t->dtype == FLYX_DT_BF16 || t->dtype == FLYX_DT_F16 || t->dtype == FLYX_DT_F32;
-        if (is_vis_lin[size_t(i)] && flt) {
-          if (m->opt.vision_quant == FLYX_VISION_QUANT_Q8) nb = (nb * 55) / 100;
-          else if (m->opt.vision_quant == FLYX_VISION_QUANT_NVFP4) nb = (nb * 30) / 100;
-        }
-        vis_bytes += nb;
-      }
-      if (vis_bytes > 0) {
-        size_t free_b = 0, total_b = 0;
-        bool ok_mem = gpu_memory(&free_b, &total_b);
-        if (!ok_mem) {
-          ok_mem = cudaMemGetInfo(&free_b, &total_b) == cudaSuccess;
-          cudaGetLastError();
-        }
-        const bool roomy = ok_mem && free_b > llm_bytes + vis_bytes &&
-                           free_b - (llm_bytes + vis_bytes) >= size_t(8) * 1000000000;
-        m->opt.vision = roomy ? FLYX_VISION_DEV_GPU : FLYX_VISION_DEV_DISK;
-      }
+      m->opt.vision = resolve_vision_device(*desc, m->opt, free_b, nullptr);
     }
     // FP8 tensor cores whose e4m3 sums are float32's: sm_90 and later.  Ada's (sm_89: L4, L40S) sum in fewer bits:
     // attention with q in e4m3 came out about 50 times past the op test's tolerance (relative error up to 1.5e-3
@@ -633,6 +643,8 @@ int open_model(const flyx_model_desc* desc, const flyx_open_options* opts, flyx_
                    table.c_str(), inputs.c_str());
     }
   }
+  // The kernels' hard limits, before anything is allocated for the model.
+  if (std::string why; !kernel_limits(*desc, &why)) return fail(why);
   double t[6] = {load_clock(), 0, 0, 0, 0, 0};  // the load's steps, for its report
   LoadTimes load_times{};
   try {
@@ -672,6 +684,7 @@ int open_model(const flyx_model_desc* desc, const flyx_open_options* opts, flyx_
         if (const auto* g = std::get_if<GdnBlock>(&b)) nvfp4 = nvfp4 && g->w_in.q && g->w_out.q;
         else if (const auto* a = std::get_if<AttnBlock>(&b)) nvfp4 = nvfp4 && a->w_in.q && a->w_out.q;
         else if (const auto* f = std::get_if<MlpBlock>(&b)) nvfp4 = nvfp4 && f->w_gu.q && f->w_down.q;
+        else if (std::holds_alternative<RelAttnBlock>(b) || std::holds_alternative<MoeBlock>(b)) nvfp4 = false;
       }
       size_t free_b = 0, total_b = 0;
       const bool roomy = gpu_memory(&free_b, &total_b) && free_b >= size_t(24) * 1000000000;
@@ -701,7 +714,8 @@ int open_model(const flyx_model_desc* desc, const flyx_open_options* opts, flyx_
     // From the description: a drafter's layers may come before its block, and run out of memory before it is bound.
     bool drafter = false;
     for (int i = 0; i < desc->n_blocks; ++i)
-      for (int k : {FLYX_BLOCK_MTP, FLYX_BLOCK_DFLASH2, FLYX_BLOCK_DFLASH2_LAYER, FLYX_BLOCK_DV, FLYX_BLOCK_DV_LAYER})
+      for (int k : {FLYX_BLOCK_MTP, FLYX_BLOCK_DFLASH2, FLYX_BLOCK_DFLASH2_LAYER, FLYX_BLOCK_DV, FLYX_BLOCK_DV_LAYER,
+                    FLYX_BLOCK_DSPARK, FLYX_BLOCK_DSPARK_LAYER})
         drafter = drafter || desc->blocks[i].kind == k;
     char head[160] = "Not enough VRAM while loading weights.";
     if (has_others)
@@ -714,7 +728,7 @@ int open_model(const flyx_model_desc* desc, const flyx_open_options* opts, flyx_
                          ", or use a smaller quantization."
                    : (drafter ? " Disable speculative decoding or use a smaller quantization."
                               : " Use a smaller quantization.");
-    return fail(std::string(head) + fix);
+    return fail_oom(std::string(head) + fix);
   } catch (const std::exception& e) {
     return fail(std::string("uploading weights: ") + e.what());
   }
@@ -766,13 +780,15 @@ void pinned_free(void* p) {
   if (p) (void)cudaFreeHost(p);
 }
 
+const char* draft_weights_active(flyx_bmodel* m) { return m ? m->active_draft_weights.c_str() : ""; }
+
 const flyx_backend_api kApi = {
     FLYX_BACKEND_ABI_VERSION, sizeof(flyx_backend_api), "cuda",
     probe, open_model, close_model, lower, plan_free, seq_new, seq_free,
     prefill, launch, read_result, rewind, checkpoint, restore, set_oracle, last_error, memory, seq_bytes,
     prefill_align, device_stats, ready, set_reply, snapshot_bytes, snapshot_save, snapshot_load, launch_batch,
     pinned_alloc, pinned_free, read_logits, seq_new_in, seq_size, trim, graph_stats, prefill_snapshot,
-    encode_vision, prefill_ex,
+    encode_vision, prefill_ex, estimate_load, draft_weights_active,
 };
 
 }  // namespace flyx::cuda

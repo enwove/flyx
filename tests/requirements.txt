@@ -1,0 +1,64 @@
+# Copyright 2026 The flyx Authors. SPDX-License-Identifier: Apache-2.0
+#
+# The Python packages the tests need: the fixtures (tests/e2e/make_tiny.py), the float64 reference, the converter and
+# the checks against transformers.
+#
+#   python -m pip install -r tests/requirements.txt
+#
+# Every version is the one CI resolved on main before these pins (run 45775573054 at 069e8d8, Python 3.12, Ubuntu),
+# so a package's new release changes neither the tests' numbers nor which fixtures CI's cache holds.  make_tiny.py's
+# digest names torch, transformers, tokenizers, safetensors and jinja2 by version: changing one of those pins makes
+# every fixture again (the cache is named by that digest).  The fixtures are made on the CPU, so torch is the CPU
+# build from PyTorch's index (macOS has only the plain build there); tests/e2e/check_real_model.py, outside ctest,
+# runs transformers on the GPU only with a CUDA build of torch.  These versions need Python 3.12 or newer.
+--extra-index-url https://download.pytorch.org/whl/cpu
+
+# In make_tiny.py's digest
+torch==2.15.0+cpu; sys_platform != "darwin"
+torch==2.15.0; sys_platform == "darwin"
+transformers==5.24.1
+tokenizers==0.23.3
+safetensors==0.8.0
+jinja2==3.1.6
+
+# Used directly by the tests and the converter
+gguf==0.19.0
+numpy==2.5.5
+
+# What those depend on, as resolved in the same run
+annotated-doc==0.0.7
+annotated-types==0.8.0
+anyio==4.16.0
+certifi==2026.11.20
+charset-normalizer==3.5.3
+click==8.5.1
+filelock==4.2.4
+fsspec==2026.9.0
+h11==0.16.0
+hf-xet==1.8.0
+httpcore2==2.16.2
+httpx2==2.16.2
+huggingface-hub==2.4.0
+idna==3.20
+markdown-it-py==4.3.0
+markupsafe==3.0.3
+mdurl==0.1.2
+mpmath==1.3.0
+networkx==3.7
+packaging==26.4
+pydantic==2.14.4
+pydantic-core==2.50.5
+pygments==2.21.0
+pyyaml==6.0.4
+regex==2026.11.25
+requests==2.34.2
+rich==15.0.0
+setuptools==78.1.0
+shellingham==1.5.4
+sympy==1.14.0
+tqdm==4.70.1
+truststore==0.10.5
+typer==0.29.2
+typing-extensions==4.16.0
+typing-inspection==0.4.5
+urllib3==2.8.0

@@ -18,14 +18,15 @@
 #                        alone (DV)
 #   models/formats/      chat formats: reading replies back; renderers written for a template vs the Jinja engine;
 #                        reply grammars
-#   backends/cuda/       every CUDA kernel vs the float64 ops (ops/)
+#   backends/cuda/       every CUDA kernel vs the float64 ops (ops/); a DFlash2 drafter's context ring (its slots,
+#                        the positions it still holds for rewinds, restores and snapshots)
 #   e2e/                 the whole engine vs the Python reference (golden; make_tiny.py builds the tiny
 #                        models and their golden outputs), and a real model vs transformers; a drafter on a
 #                        prompt set vs plain decoding and bifill-dv's references (check_dv.py: its counting and
 #                        scoring, and its rounds against the teacher-forced reference's, tested in check_dv_test.py)
 #   apps/flyx-server/    the stored responses and the HTTP API (run against a live server)
 #   apps/flyx-cli/       the command line's file paths and flags, flyx bench on a prompt set (the tiny model)
-#   apps/common/         numbers given on the command line
+#   apps/common/         numbers given on the command line, the drafters fetched beside a model
 #   bench/ab/            two builds' records of one prompt set compared answer for answer, round for round
 #                        (same_runs.py)
 #   python/reference/    the Python reference vs transformers; its DV drafting emits plain decoding's tokens, its
@@ -81,6 +82,7 @@ flyx_add_unit_test(chat_test core/render/chat_test.cpp)
 flyx_add_unit_test(tags_test models/formats/tags_test.cpp)
 flyx_add_unit_test(qwen35_format_test models/formats/qwen35_test.cpp)
 flyx_add_unit_test(grammar_test models/formats/grammar_test.cpp)
+flyx_add_unit_test(xgrammar_local_changes_test third_party/xgrammar/local_changes_test.cpp flyx_xgrammar)
 flyx_add_unit_test(telemetry_test core/exec/telemetry_test.cpp)
 flyx_add_unit_test(snapshot_store_test core/session/store_test.cpp)
 flyx_add_unit_test(parked_edit_test core/session/parked_edit_test.cpp)
@@ -105,11 +107,20 @@ add_dependencies(vision_test flyx-cpu_ref)
 if(TARGET flyx-cuda)
   add_dependencies(vision_test flyx-cuda)
 endif()
+flyx_add_unit_test(inkling2_test e2e/inkling2_test.cpp)
+add_dependencies(inkling2_test flyx-cpu_ref)
+# Each run writes the models it reads: a directory of its own, so the two can run at once (ctest -j).
+add_test(NAME inkling2_cpu_ref COMMAND inkling2_test ${CMAKE_BINARY_DIR}/inkling2_assets/cpu_ref cpu_ref)
+set_tests_properties(inkling2_cpu_ref PROPERTIES FIXTURES_SETUP inkling2_models)
 
 add_executable(numbers_test apps/common/numbers_test.cpp ${CMAKE_SOURCE_DIR}/apps/common/numbers.cpp)
 target_include_directories(numbers_test PRIVATE ${CMAKE_SOURCE_DIR})
+add_executable(model_source_test apps/common/model_source_test.cpp ${CMAKE_SOURCE_DIR}/apps/common/model_source.cpp)
+target_link_libraries(model_source_test PRIVATE flyx_core)
 add_executable(strata_snapshot_test backends/cuda/strata_snapshot_test.cpp)
 target_include_directories(strata_snapshot_test PRIVATE ${CMAKE_SOURCE_DIR})
+add_executable(draft_ring_test backends/cuda/draft_ring_test.cpp)
+target_include_directories(draft_ring_test PRIVATE ${CMAKE_SOURCE_DIR} ${CMAKE_SOURCE_DIR}/include)
 add_executable(response_store_test apps/flyx-server/response_store_test.cpp)
 target_include_directories(response_store_test PRIVATE ${CMAKE_SOURCE_DIR} ${CMAKE_SOURCE_DIR}/third_party)
 target_link_libraries(response_store_test PRIVATE Threads::Threads)
@@ -129,6 +140,8 @@ flyx_add_unit_test(session_budget_test core/session/budget_test.cpp flyx-test-ho
 add_dependencies(session_budget_test flyx-cpu_ref)
 flyx_add_unit_test(generation_test core/exec/generation_test.cpp flyx-test-host-kv)
 add_dependencies(generation_test flyx-cpu_ref)
+flyx_add_unit_test(elastic_load_test core/exec/elastic_load_test.cpp flyx-test-host-kv)
+add_dependencies(elastic_load_test flyx-cpu_ref)
 flyx_add_unit_test(plans_test core/plan/plans_test.cpp)
 flyx_add_unit_test(scheduler_test core/exec/scheduler_test.cpp flyx-test-host-kv)
 
@@ -216,15 +229,20 @@ set_tests_properties(drafter_dir PROPERTIES FIXTURES_REQUIRED gguf_assets)
 
 # Numbers on the command line: all of the text a number, inside what the option takes.
 add_test(NAME flag_numbers COMMAND numbers_test)
+# The DSpark drafter published beside a model, taken by default: beside a GGUF on disk, and in its repository (a
+# Hugging Face cache read offline).
+add_test(NAME model_source COMMAND model_source_test)
 add_test(NAME chat_replies COMMAND tags_test)
 # Qwen3.5's own renderer against the Jinja engine on generated conversations, and its calls read back.
 add_test(NAME chat_qwen35 COMMAND qwen35_format_test ${ASSETS}/tiny.flyx
                                   ${CMAKE_SOURCE_DIR}/tests/core/render/templates/qwen3.5.jinja)
 # Reply grammars (tool_choice, response_format) in both call languages, on the tiny model's tokenizer.
 add_test(NAME reply_grammars COMMAND grammar_test ${ASSETS}/tiny.flyx)
+add_test(NAME xgrammar_local_changes COMMAND xgrammar_local_changes_test)
 add_test(NAME telemetry COMMAND telemetry_test)
 add_test(NAME snapshot_store COMMAND snapshot_store_test)
 add_test(NAME strata_snapshot COMMAND strata_snapshot_test)
+add_test(NAME draft_ring COMMAND draft_ring_test)
 add_test(NAME parked_edit COMMAND parked_edit_test ${ASSETS}/tiny.flyx)
 set_tests_properties(parked_edit PROPERTIES FIXTURES_REQUIRED assets)
 add_test(NAME response_store COMMAND response_store_test)
@@ -318,6 +336,11 @@ flyx_add_py_test(dv_counts ${CMAKE_SOURCE_DIR}/tests/e2e/check_dv_test.py)
 flyx_add_py_test(bench_prompts ${CMAKE_SOURCE_DIR}/tests/apps/flyx-cli/bench_prompts_test.py
                  ARGS $<TARGET_FILE:flyx-cli> ${ASSETS} ${CMAKE_SOURCE_DIR}/tests/core/render/templates/qwen3.5.jinja
                  FIXTURES assets)
+# The same where a chat without thinking carries a reply grammar (the tiny Inkling-2 model inkling2_cpu_ref writes):
+# every prompt of the set keeps its grammar until it runs, and its reply is held to it.
+flyx_add_py_test(bench_prompts_grammar ${CMAKE_SOURCE_DIR}/tests/apps/flyx-cli/bench_prompts_grammar_test.py
+                 ARGS $<TARGET_FILE:flyx-cli> ${CMAKE_BINARY_DIR}/inkling2_assets/cpu_ref/tiny_inkling2_bf16.gguf
+                 FIXTURES inkling2_models)
 # Two builds' flyx bench --prompts records of one command: the same answers and rounds over the prompts both hold, and
 # what fails (bench/ab/same_runs.py; records made up, no model).
 flyx_add_py_test(same_runs ${CMAKE_SOURCE_DIR}/tests/bench/ab/same_runs_test.py)
@@ -354,6 +377,7 @@ add_test(NAME scheduler_repeated_prewarm COMMAND scheduler_test ${ASSETS}/tiny.f
 add_test(NAME scheduler_marked_system COMMAND scheduler_test ${ASSETS}/tiny.flyx cpu_ref marked-system)
 add_test(NAME session_host_budget COMMAND session_budget_test ${ASSETS}/tiny.flyx)
 add_test(NAME generation_edges COMMAND generation_test ${ASSETS}/tiny.flyx)
+add_test(NAME elastic_load COMMAND elastic_load_test ${ASSETS}/tiny.flyx)
 # The C API: a chat request with the file's template, and with the one the load options give.
 add_test(NAME capi COMMAND capi_test ${ASSETS}/tiny.flyx cpu_ref)
 flyx_add_py_test(python_binding ${CMAKE_CURRENT_SOURCE_DIR}/python/flyx/binding_test.py
@@ -386,10 +410,17 @@ flyx_add_golden_test(golden_cpu_ref_window ARGS cpu_ref window)
 
 set_tests_properties(tokenizer tokenizer_minicpm5 chat chat_qwen35 reply_grammars request reply_text
                      scheduler_cpu_ref scheduler_queue scheduler_prewarmed_history scheduler_interrupted_prewarm
-                     scheduler_reassigned_prewarm scheduler_repeated_prewarm scheduler_marked_system session_host_budget generation_edges capi
+                     scheduler_reassigned_prewarm scheduler_repeated_prewarm scheduler_marked_system session_host_budget generation_edges elastic_load capi
                      dv_trees dv_canvas dv_models llama_models PROPERTIES FIXTURES_REQUIRED assets)
 
 if(TARGET flyx-cuda)
+  add_executable(cuda_loader_test backends/cuda/loader_test.cpp ${CMAKE_SOURCE_DIR}/backends/cuda/backend.cpp)
+  target_compile_definitions(cuda_loader_test PRIVATE FLYX_TEST_DEVICE_ALLOC)
+  target_link_libraries(cuda_loader_test PRIVATE flyx_cuda_host)
+  add_test(NAME cuda_loader COMMAND cuda_loader_test)
+  add_test(NAME elastic_load_cuda COMMAND elastic_load_test ${ASSETS}/tiny.flyx cuda)
+  set_tests_properties(elastic_load_cuda PROPERTIES FIXTURES_REQUIRED assets)
+
   # Packed block weights against the float64 backend on the same files; the generic regions too.
   add_test(NAME gguf_cuda COMMAND gguf_e2e_test ${ASSETS} cuda)
   add_test(NAME gguf_cuda_unfused COMMAND gguf_e2e_test ${ASSETS} cuda fusion=0)
@@ -410,11 +441,14 @@ if(TARGET flyx-cuda)
   add_executable(cuda_op_test backends/cuda/op_test.cu backends/cuda/op_test_gemm.cu backends/cuda/op_test_blocks.cu
                  backends/cuda/op_test_attention.cu backends/cuda/op_test_gdn.cu backends/cuda/op_test_nvfp4.cu
                  backends/cuda/op_test_head.cu backends/cuda/op_test_sampling.cu backends/cuda/op_test_layers.cu
-                 backends/cuda/op_test_dv.cu backends/cuda/op_test_vision.cu)
+                 backends/cuda/op_test_dv.cu backends/cuda/op_test_vision.cu
+                 backends/cuda/op_test_inkling2.cu)
   target_link_libraries(cuda_op_test PRIVATE flyx_cuda_kernels)
   add_dependencies(cuda_op_test flyx_gemm_tables)  # op_test_gemm.cu reads the generated tables
   set_target_properties(cuda_op_test PROPERTIES CUDA_ARCHITECTURES "${FLYX_CUDA_ARCHS}")
   add_test(NAME cuda_ops COMMAND cuda_op_test)
+  add_dependencies(inkling2_test flyx-cuda)
+  add_test(NAME inkling2_cuda COMMAND inkling2_test ${CMAKE_BINARY_DIR}/inkling2_assets/cuda cuda)
 
   add_test(NAME scheduler_cuda COMMAND scheduler_test ${ASSETS}/tiny.flyx cuda)
   set_tests_properties(scheduler_cuda PROPERTIES FIXTURES_REQUIRED assets)

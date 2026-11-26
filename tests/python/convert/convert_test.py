@@ -24,7 +24,8 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, os.path.join(HERE, "..", "..", "..", "python", "convert"))
 
 import export_dv  # noqa: E402
-from flyx_convert.convert import canonical_dense_config, canonical_target_config, convert  # noqa: E402
+from flyx_convert.convert import (canonical_dense_config, canonical_draft_config,  # noqa: E402
+                                  canonical_target_config, convert)
 from flyx_convert.dv import add_dv, parse_tree, pool_size  # noqa: E402
 from flyx_convert.fileformat import MAGIC, Reader, Writer  # noqa: E402
 from flyx_convert.lora import add_lora  # noqa: E402
@@ -518,8 +519,37 @@ def dv_settings():
           "a tree the slots cannot hold: refused")
 
 
+def draft_taps():
+    """A DFlash2 drafter's target_layer_ids as its taps (core/modelfile/drafter_dir.cpp reads a directory the same
+    way): the layers whose outputs it reads, or, where the list reaches num_target_layers, the hidden states."""
+    print("a DFlash2 drafter's config")
+    drafter = {"architectures": ["DFlash2DraftModel"], "hidden_size": 64, "intermediate_size": 128,
+               "num_hidden_layers": 2, "num_attention_heads": 4, "num_key_value_heads": 2, "rms_norm_eps": 1e-6,
+               "vocab_size": 100, "is_causal": False}
+    # z-lab's for Qwen3.8-27B: five of 64 layers.
+    zlab = dict(drafter, num_target_layers=64,
+                dflash_config={"block_size": 8, "mask_token_id": 3, "target_layer_ids": [5, 19, 33, 47, 61]})
+    d = canonical_draft_config(zlab, None)
+    check(d["taps"] == [6, 20, 34, 48, 62] and "softcap" not in d and "softcap_mode" not in d,
+          "target_layer_ids below num_target_layers: the state after each layer, no soft cap")
+    # Inco's for Inkling-2-Mini: four of 48 visits' hidden states, the last the final norm's output.
+    inco = dict(drafter, num_target_layers=48,
+                dflash_config={"block_size": 8, "mask_token_id": 3, "target_layer_ids": [5, 23, 41, 48],
+                               "final_logit_softcapping": 30.0, "selector_softcap_mode": "after_correction"})
+    d = canonical_draft_config(inco, None)
+    check(d["taps"] == [5, 23, 41, 48] and d["softcap"] == 30.0 and d["softcap_mode"] == "after_correction",
+          "target_layer_ids that reach num_target_layers: the hidden states as numbered, the soft cap and its mode")
+    check(refused(lambda c: canonical_draft_config(c, None),
+                  dict(inco, dflash_config=dict(inco["dflash_config"], selector_softcap_mode="sometimes")),
+                  "selector_softcap_mode"), "a soft cap mode the engine does not run is refused")
+    check(refused(lambda c: canonical_draft_config(c, None),
+                  dict(inco, dflash_config=dict(inco["dflash_config"], final_logit_softcapping=-1.0)),
+                  "final_logit_softcapping"), "a soft cap below zero is refused")
+
+
 def main():
     rotary()
+    draft_taps()
     with tempfile.TemporaryDirectory() as tmp:
         post_processor(tmp)
     with tempfile.TemporaryDirectory() as tmp:

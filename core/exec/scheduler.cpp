@@ -231,6 +231,7 @@ void Scheduler::publish_model() {
   m.device = engine_->device().name;
   m.backend = engine_->backend_name();
   m.drafter = engine_->drafter();
+  m.draft_weights = engine_->draft_weights();
   m.chat_format = chat_.format();
   m.chat_ok = chat_.ok();
   m.chat_native = chat_.native();
@@ -246,6 +247,7 @@ void Scheduler::publish_model() {
   m.max_sessions = max_sessions_;
   m.ledger_budget = engine_->ledger().budget();
   m.load_s = load_s_;
+  m.load_adjustments = engine_->load_adjustments();
   m.ctx_limit = engine_->budget().ctx_limit;
   m.wanted_ctx = engine_->wanted_ctx();
   m.kv_gpu_tokens = std::max(0, std::min(engine_->budget().layout.device_positions, m.max_ctx));
@@ -386,12 +388,14 @@ std::shared_ptr<Job> Scheduler::submit(Request in, std::string* err, int* status
   }
   job->in_ = std::move(in);
   const bool prewarm = job->in_.gen.prefill_only;
-  const bool needs_grammar = job->in_.chat && (!job->in_.tools.empty() || job->in_.rules.json);
-  auto warm = [&] {  // Compile on the caller, outside the thread serving other requests' rounds.
+  // The reply's grammar, compiled on the caller, outside the thread serving other requests' rounds.  Whether a reply
+  // has one is its format's to say (tools, a JSON answer, thinking switched off where only a grammar keeps it out):
+  // warm_request asks it, and compiles nothing for a reply that has none.
+  auto warm = [&] {
     std::shared_lock<std::shared_mutex> lock(engine_mu_);
     if (engine_) warm_request(*engine_, job->in_, job->prompt_);
   };
-  if (!prewarm && needs_grammar) warm();
+  if (!prewarm) warm();
   job->queued_at_ = os::now_ms();
   {
     std::lock_guard<std::mutex> lock(mu_);
@@ -444,7 +448,7 @@ std::shared_ptr<Job> Scheduler::submit(Request in, std::string* err, int* status
   }
   cv_.notify_all();
   // A prompt prewarm needs no reply grammar itself. Compile for its next turn while its prompt is running.
-  if (prewarm && needs_grammar) warm();
+  if (prewarm) warm();
   return job;
 }
 

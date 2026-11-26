@@ -1,0 +1,8 @@
+{"question": "Write a Python function that merges two sorted lists into one sorted list, with type hints and three unit tests."}
+{"question": "Write a JSON object describing a user with fields id, name, email, roles (a list) and address (street, city, zip). Output only the JSON."}
+{"question": "Write a SQL query that returns the ten customers with the highest total order value in 2025, from tables customers(id, name) and orders(id, customer_id, amount, created_at)."}
+{"question": "Convert this Python function to JavaScript:\ndef fib(n):\n    a, b = 0, 1\n    for _ in range(n):\n        a, b = b, a + b\n    return a"}
+{"question": "Write a bash script that finds all .log files older than 7 days under /var/log and compresses them with gzip, printing each file name."}
+{"question": "Write a C function that reverses a singly linked list in place, with the struct definition."}
+{"question": "Rewrite the following list as a Markdown table with columns Name, Language, Year: Python (1991), Java (1995), Rust (2015), Go (2009), Kotlin (2011)."}
+{"question": "Write a Python class Stack with push, pop, peek and is_empty methods, and docstrings."}

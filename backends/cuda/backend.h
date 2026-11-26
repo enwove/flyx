@@ -31,8 +31,11 @@
 #include <vector>
 
 #include "backends/cuda/blocks.h"
+#include "backends/cuda/errors.h"
 #include "backends/cuda/kernels/kernels.cuh"
+#include "backends/cuda/runtime/draft_ring.h"
 #include "backends/cuda/runtime/vision_disk.h"
+#include "core/interfaces/options.h"
 #include "flyx/backend_abi.h"
 #include "ops/dtype/ref.h"
 
@@ -41,9 +44,6 @@ namespace flyx::cuda {
 // ---- errors ----------------------------------------------------------------------------------
 // The message last_error() returns (per thread).
 extern thread_local std::string g_error;
-struct CudaError : std::runtime_error {
-  using std::runtime_error::runtime_error;
-};
 void ck(cudaError_t e, const char* what);
 #define CK(x) ::flyx::cuda::ck((x), #x)
 // The model's device memory (flyx_bmodel::alloc) and the prefill buffers: cudaMalloc that never takes more than the
@@ -51,13 +51,11 @@ void ck(cudaError_t e, const char* what);
 // every round (Qwen3.5-4B NVFP4 beside other programs holding 4.7 of 8 GB: 12.5 tok/s plain against 132.4); this
 // throws OutOfDeviceMemory instead (and so does a refusal by the driver).  device_room: the same check alone, for
 // memory the driver maps (a VMM slab), throwing where device_malloc would.
-struct OutOfDeviceMemory : CudaError {
-  using CudaError::CudaError;
-};
 void device_room(size_t bytes);
 void* device_malloc(size_t bytes);
-// Records m for last_error(); returns -1.
+// Records m for last_error(); returns -1 (or FLYX_ERR_OOM for device memory exhaustion).
 int fail(const std::string& m);
+int fail_oom(const std::string& m);
 // fail() for a call given no sequence (a session whose seq_new failed or was never made): an error, not a crash.
 int no_sequence(const char* call);
 
@@ -87,11 +85,12 @@ inline void destroy_side(SideStream& s) {
 //   attention=split|head  prefill attention in float32 / no KV-head grouping (and no FP8 K/V)
 //   gemm=rows             every GEMM on the CUDA-core row path
 //   pdl=0|1 programmatic dependent launch off / on (default: the GPU's table)
-//   head_cert=0 greedy choices read the whole head, not the certified head
+//   head_cert=0 greedy choices read the whole head, not the certified head (a softcapped head is never certified)
 //   wait=spin|poll|auto   wait for the device by spinning (lowest latency, one core busy), by polling with short sleeps
 //                         (the default on Linux), or (auto, the default on Windows) spinning while the last waits for a
 //                         round's result took under 1.5 ms (a sleep ends ~0.5 ms late), polling past that (runner.cpp)
-//   draft_weights=exact   drafts read the bf16 head, MTP layer and DFlash2 drafter, not NVFP4 or Q8_0 copies
+//   draft_weights=auto|nvfp4|q8|exact  drafter weight precision (auto: target-matched when roomy, NVFP4 when VRAM is
+//                         tight; nvfp4: 4-bit; q8: Q8_0; exact: file precision and uncompacted draft head)
 //   draft_kv=16           the MTP layer's K/V cache in binary16, not FP8 with the target's (when they are FP8)
 //   blocks=bf16           GGML block weights (GGUF) decoded to bf16 at load instead of kept packed
 //   embed=gpu an embedding table no head reads on the GPU, not in host memory
@@ -109,20 +108,30 @@ inline void destroy_side(SideStream& s) {
 //                         through a copy of mtp_copy=BITS bits (2; 0, or heads strata attention is not compiled
 //                         for: none, then its first mtp_sink=N exactly, 64);
 //                         mtp_ring=0: its cache a slot a position, not a ring (tests)
+//                         dflash_ring=0: a sliding-window DFlash2 cache flat, not a ring (tests)
 //   strata_denom=N strata attention refines one pair of positions in N a row (default 16 with
 //                         a 2-bit copy, 64 with more; 0: none, the copy alone), at least strata_least=N pairs (32),
 //                         plus the last strata_recent=N positions, and at most strata_most=N pairs (256; 0: no
 //                         bound); strata_scan=cores, strata_grid=normal: measurement
-//   strata_from=N         --kv-method auto: rounds read the copy from position N on (default: the GPU's part of
-//                         the K/V, i.e. 0 tokens of exact host overhang)
+//   strata_from=N         --kv-method auto: read the copy from position N on (overrides the engine's
+//                         target-only reference position)
 //   act_group=64|128|256  measurement: 8-bit inputs with one scale this many values (bench/quality/kld.cpp; with
 //                         fusion=0 and round_glu=0, whose producers round their own outputs per 32)
 //   act_fp4=1|2           measurement: inputs first rounded as NVFP4 (1) or MXFP8 (2) activations would be
+//   moe_dp4a=default|original|1x1|1x2|2x1|2x2|4x1|4x2  measurement: every staged IQ3_XXS, IQ2_S, IQ2_XXS,
+//                         IQ2_XS, IQ4_NL and Q4_K expert dp4a GEMM in one configuration (variants/candidates.toml,
+//                         moe_dp4a): columns per warp x K/32 units in flight per lane, a fused column a gate/up pair;
+//                         these specialize one-row grouped tiles.  default: the tables' rules (moe_gate_up) for fused
+//                         gate|up GEMMs, the original tiles elsewhere; original: those tiles everywhere.  A release
+//                         build compiles non-original configurations only for fused gate|up in the row bands and
+//                         architectures its tables reach, so forcing a non-original override requires
+//                         FLYX_TUNE_CANDIDATES=ON.
 enum class WaitMode { poll, spin, automatic };  // option wait=poll|spin|auto
 enum class PageableKvMode { off, on, automatic };  // option pageable_kv=off|on|auto
 struct BackendOptions {
   KernelOptions kernels;  // the ones launches consult
-  bool profile = false, graphs = true, fusion = true, exact_drafts = false;
+  bool profile = false, graphs = true, fusion = true;
+  interfaces::DraftWeightsMode draft_weights = interfaces::DraftWeightsMode::kAuto;
   bool dv_conditional = true;  // option dv_conditional=0 clears it: DV's canvas pass inline in a round's graph
   bool stage_dma = true;
   // How a thread waits for the device (runner.cpp; on WSL2 every CUDA wait spins a core, so the default polls).  On
@@ -184,6 +193,8 @@ void ggml_nvfp4_planes(const flyx_tensor_view* v, const std::function<size_t(siz
 void gemm(const float* x, int ldx, const Lin& W, int N, int K, float* y, int ldy, int rows, bool accumulate,
           const Launch& L);
 void gemm_presplit(const Lin& W, int N, int K, float* y, int ldy, int rows, bool accumulate, const Launch& L);
+// Whether gemm reads a round's 1..16 rows of x as three bf16 parts, which a producer may then write itself.
+bool gemm_reads_split(const float* x, int ldx, const Lin& W, int K, const Launch& L);
 // A prefill MLP (rows > 16): gate|up with SwiGLU in the GEMM's epilogue (the
 // scratch's bf16 rows in, its glu rows out), then a GEMM on those rows.
 void gemm_glu_presplit(const Lin& W, int I, int K, int rows, const Launch& L);
@@ -198,6 +209,18 @@ struct RowBufs {
         *part = nullptr, *attn_state = nullptr, *split_state = nullptr, *feats = nullptr, *cx = nullptr,
         *ckv = nullptr, *mcat = nullptr, *mx = nullptr, *mhn = nullptr;
   float* lora = nullptr;  // the target's adapters' first products (RowNeeds::lora a row; none without adapters)
+  // Inkling-2 pass-local scratch (null for models without RelAttnBlock / MoeBlock).
+  float *res_bank = nullptr, *prelude_cur = nullptr, *prelude_blocks = nullptr;
+  float *loop_bank = nullptr, *loop_bank_out = nullptr, *loop_msg = nullptr;
+  float *inp_saved = nullptr, *attn_in = nullptr;
+  float *ctrl_cat = nullptr, *ctrl_gate = nullptr, *ctrl_gf = nullptr;
+  float* ctrl_scratch = nullptr;  // loop_control's (rounds, and passes of FLYX_MAX_ROWS rows or fewer)
+  float *rel_q = nullptr, *rel_btab = nullptr, *sink = nullptr, *kv_conv = nullptr, *kv_dyn = nullptr;
+  float *post_raw = nullptr, *post_out = nullptr;
+  int* moe_idx = nullptr;
+  // moe_act: the activations in float32, or in bf16 where a fused round's gate|up GEMM writes the down GEMM's input
+  float *moe_w = nullptr, *moe_gu = nullptr, *moe_act = nullptr;
+  MoeScratch moe_sc{};  // the expert GEMMs' staged inputs, their grouping and the down projection's slots
   GdnBufs pre{};  // GDN prefill scratch (prefill set only)
   Scratch scratch{};  // the GEMM inputs the kernels stage
 };
@@ -208,11 +231,15 @@ struct RowNeeds {
   int attn_state = 0;                       // prefill windowed flash attention softmax state (floats per row)
   int split_state = 0;                      // prefill windowed split attention warp state (floats per row, <= 16 rows)
   int lora = 0;                             // the target's adapters' first products: q|k|v's (3 rank), gate|up's
-  int feats = 0, cx = 0, ckv = 0;           // DFlash2 context: tapped features, fc output, K/V projections
+  int feats = 0, cx = 0, ckv = 0;           // DFlash2/DSpark context: tapped features, fc output, K/V projections
   bool mtp = false;                         // MTP context rows (2 x hidden, hidden, hidden)
   bool glu = false;                         // non-packed MLP weights (prefill gemm_glu_staged)
   int k_max = 0;                            // largest GEMM K: the scratch staging GEMM inputs is sized by it
   bool q8 = false;  // weights with inputs in 8 bits: a prefill scratch holds their GEMMs' runs of K side by side
+  int max_bank = 0, max_loop_rank = 0;      // Inkling-2 AttnRes bank depth & loop gate rank
+  int rel_q = 0, max_rel_nh = 0, max_rel_extent = 0, sink = 0, kv_dim = 0, kv_dyn = 0;
+  int moe_experts = 0, moe_topk = 0, moe_inter = 0;
+  bool dspark = false;
 };
 
 // option head_cert: head_certify's scratch (row norms, bound keys, surviving columns and their count), shared in shape
@@ -404,8 +431,9 @@ struct flyx_bmodel {
   flyx::cuda::StateTable states;
   int hidden = 0, vocab = 0;  // the residual stream's width, the vocabulary
   int mtp_block = -1, dflash_block = -1;  // the drafters (at most one of each), -1: none
-  int dv_block = -1;                      // DV (docs/design/dv.md), -1: none
+  int dv_block = -1, dspark_block = -1;   // DV and DSpark drafters, -1: none
   int head_block = -1;                    // the head they read
+  std::unordered_map<int, float*> vec_weights;  // 1D device vectors referenced by FLYX_NODE_RES_MIX (weight index -> GPU)
   flyx::cuda::RowNeeds need;
 
   int prefill_rows = 0;  // rows of the widest prefill plan lowered: the shared prefill buffers hold them
@@ -437,6 +465,7 @@ struct flyx_bmodel {
   std::mutex prefill_mu;                // lock order: prefill_mu before batch->mu
   bool kv_fp8 = false;   // the target's K/V caches in e4m3 (open option)
   flyx::cuda::BackendOptions opt;    // open()'s options; opt.kernels is what every launch for this model consults
+  std::string active_draft_weights;  // effective drafter precision ("nvfp4", "q8", "exact", or "" when none)
   std::unique_ptr<flyx::cuda::BatchRounds> batch;  // rounds of several sequences
   // Round graphs: every round plan lowered (plan_free forgets it) and its graph's size, counted when a
   // session's room for graphs is first asked after it was lowered (graph_room, which seq_bytes counts).
@@ -533,6 +562,7 @@ struct flyx_plan {
   bool tree = false, drafted_tree = false, has_draft = false;
   std::vector<int> tree_kv;
   std::vector<int> checkpoints;  // sorted verify checkpoints for adaptive conditional round graph (empty: fixed width)
+  bool earlier_checkpoints = false;  // flyx_program's: a stop may verify a checkpoint before the one it drafted to
   bool adaptive() const { return checkpoints.size() > 1; }
 };
 
@@ -579,17 +609,22 @@ struct flyx_seq {
   int mask_words = 0;
   flyx::cuda::Reply reply{};                       // the reply's tokens as the penalties count them (set_reply, accept)
   flyx_round_result* ring_dev = nullptr;
-  flyx_round_result* ring_host = nullptr;  // pinned mirror
+  flyx_round_result* ring_host = nullptr;      // pinned mirror
+  flyx_round_result* ring_host_dev = nullptr;  // the mirror as kernels address it (mapped: ring_publish writes it)
   int* tok_host = nullptr;             // pinned staging for prefill tokens
   cudaEvent_t ev[flyx::cuda::kRing]{};
 
   // state, as the model's state table declares it
   std::vector<flyx::cuda::KvBuf> kv;
   std::vector<flyx::cuda::GdnBuf> gdn;
+  std::vector<flyx::cuda::ShortConvBuf> sconv;
   // Every gated delta net's state, window and replay buffers on the device, for a round's commit in two launches
   // (gdn_fold_layers); null where the layers are not alike or their states not 16-byte aligned.
   flyx::cuda::GdnLayer* gdn_layers = nullptr;
-  float* ring = nullptr;               // the hidden ring (MTP input), kHring x ring_width
+  // Every ShortConv layer's window and replay buffers on the device, for a round's commit in one launch.
+  flyx::cuda::ShortConvLayer* sconv_layers = nullptr;
+  bool sconv_alike = false;
+  float* ring = nullptr;               // the hidden ring (MTP/DSpark input), kHring x ring_width
   float* ring_snap = nullptr;          // 1-row hidden snapshot at pass_snap - 1 (preserved past kHring overwrites)
   float* ring_ckp[FLYX_CHECKPOINTS]{};  // host memory, as the GDN checkpoints (host_alloc)
   flyx::cuda::RowBufs own;              // this session's row buffers (rounds)
@@ -598,6 +633,10 @@ struct flyx_seq {
     int pos = 0;
     int rope_delta = 0;
   } ckp[FLYX_CHECKPOINTS];
+  // A sliding-window DFlash2 context cache kept as a ring (KvBuf::ring, alloc_state): the positions it still holds
+  // for the drafter's window, at the position and at each checkpoint.  A rewind, restore or snapshot whose window a
+  // later position overwrote is refused (runtime/runner.cpp: ring_wrote).
+  flyx::cuda::DraftRing dring;
 
   // drafter scratch
   float* mg = nullptr;                 // MTP normalized draft hidden
@@ -663,7 +702,13 @@ struct flyx_seq {
   flyx::cuda::CertScratch cert{};  // option head_cert: head_certify's scratch
   float *dx = nullptr, *dh = nullptr, *dhc = nullptr, *dtmp = nullptr, *dproj = nullptr, *dact = nullptr,
         *ddelta = nullptr, *dq = nullptr;
+  // DSpark drafter scratch (null when m->dspark_block < 0).
+  float *ds_x = nullptr, *ds_h = nullptr, *ds_proj = nullptr, *ds_act = nullptr, *ds_q = nullptr;
+  float *ds_hn = nullptr, *ds_state = nullptr, *ds_joint = nullptr, *ds_jout = nullptr, *ds_markov = nullptr,
+        *ds_bias = nullptr;
+  int* ds_prev = nullptr;
   int ld_proj = 0, ld_act = 0, ld_feats = 0, ld_dproj = 0, ld_dact = 0, ld_ckv = 0;
+  int ld_ds_proj = 0, ld_ds_act = 0;
 
   // host mirror (valid whenever nothing is in flight)
   int position = 0, round = 0;
@@ -688,6 +733,14 @@ struct flyx_seq {
     return total;
   }
   void update_write_hi() { write_hi.store(position + in_flight_rows(), std::memory_order_release); }
+  // One past the highest position a pass or a round read since has written to the caches kept in a ring of slots
+  // (KvBuf::swa_ring: the target's sliding-window layers, DSpark's), since a reset, restore or snapshot load set it to
+  // the position: such a ring holds [ring_hi - (ring - sink), ring_hi), the positions before that overwritten.
+  // Prefill passes advance it without a round, past what the rounds' rollback span keeps (rewind_floor).
+  int ring_hi = 0;
+  // The first position a rewind can return to: from there on, every ring still holds the window the row at that
+  // position reads ([pos - window + 1, pos)).  A rewind to before it is outside the rollback window.
+  int rewind_floor() const;
   double round_wait_us = 0;            // moving average of the waits for round results
   cudaEvent_t idle_ev = nullptr;       // recorded to wait for the stream without spinning
   cudaEvent_t ready_ev = nullptr;      // everything queued on the stream: a batch round waits for it (launch_batch)
@@ -923,7 +976,8 @@ struct flyx_seq {
   void stage_text(const flyx::cuda::KvBuf& kb, cudaStream_t st);
   void create_stage_stream();
   std::vector<void*> host_allocs;
-  // Small pinned host staging (not counted in dry_host_bytes; freed with host_allocs).
+  // Small pinned host staging, mapped into the device's address space (a kernel writes the result ring there:
+  // ring_publish); not counted in dry_host_bytes; freed with host_allocs.
   template <class T>
   T* pinned_alloc(size_t n) {
     const size_t bytes = n * sizeof(T);
@@ -939,7 +993,7 @@ struct flyx_seq {
       return reinterpret_cast<T*>(p);  // zeroed once with the arena
     }
     void* p = nullptr;
-    CK(cudaMallocHost(&p, bytes));
+    CK(cudaHostAlloc(&p, bytes, cudaHostAllocMapped));
     host_allocs.push_back(p);
     return static_cast<T*>(p);
   }
@@ -1013,6 +1067,22 @@ struct RowView {
 // The sequence's row buffers (its own when bufs is null, or the prefill buffers it borrows), on its stream.
 RowView rows_of(flyx_seq* s, RowBufs* bufs = nullptr);
 
+// Deferred post-sublayer ShortConv + residual update fused into the next sublayer's AttnRes + RMSNorm in rounds.
+struct PendingPostConv {
+  const float* post_raw = nullptr;
+  const float* conv_w = nullptr;
+  int sconv = -1, ch_off = 0, conv = 0;
+  bool res_push = false;
+};
+
+// Pass-local host counters for Inkling-2 Block Attention Residuals / loop passes (compile-time constants per node,
+// safe during CUDA graph capture).
+struct ResState {
+  int res_n = 0, prelude_n = 0, loop_n = 0;
+  float* x_cur = nullptr;       // active residual buffer (rv.b.x or rv.b.post_out)
+  PendingPostConv pending{};    // deferred post_conv to fuse into next sublayer
+};
+
 struct Pass {
   flyx_plan* p;
   flyx_seq* s;
@@ -1033,6 +1103,7 @@ struct Pass {
   const int32_t* pos_3d = nullptr;
   const int32_t* mtp_pos_3d = nullptr;
   RowView v{};           // the rows it works on (rows_of(s) for a sequence's own pass)
+  ResState* res = nullptr;  // pass-local AttnRes / loop bank counters (stack-owned by forward_nodes)
   int width() const { return accept_width >= 0 ? accept_width : p->width; }
   bool reads_copy(const KvBuf& kb) const { return round && kb.kq && strata != kStrataNone; }
   bool reads_cache(const KvBuf& kb) const { return !reads_copy(kb) || strata == kStrataBoth; }
@@ -1042,6 +1113,12 @@ struct Pass {
 
 // loader/bind.cpp: blocks and the state table from the description's tables; uploads the weights.
 void bind(flyx_bmodel* m, const flyx_model_desc& d, LoadTimes* times = nullptr);
+// Resolve placement from the representation the loader uploads. Optionally report resident bytes and vision weights.
+int resolve_vision_device(const flyx_model_desc& desc, const BackendOptions& opt, uint64_t free_vram,
+                          uint64_t* resident_bytes, std::vector<char>* vision_weights = nullptr);
+// Pre-flight device memory estimate (ABI 45: flyx_backend_api::estimate_load).
+int estimate_load(const flyx_model_desc* desc, const flyx_open_options* opts, uint64_t free_vram,
+                  uint64_t total_vram, flyx_load_estimate* out);
 // The DV block i's selector token tables (DvBlock::sel_ta, sel_tb: [vocab][sel_rank] float32 each, counted with the
 // weights), made once, when lowering a plan that drafts with them: past bind, where out of GPU memory is no refusal
 // of the model but a plan the engine lowers again once the backend has given back what it keeps for speed (trim).
@@ -1059,6 +1136,7 @@ void draft_logits(const HeadBlock& h, const float* x, int ldx, float* y, int row
 // regions/plan.cpp: which blocks the kernels take, the block a node runs, the
 // implementation lower() picks for it, and running a plan's nodes.
 bool supported(const flyx_bmodel* m, const Block& b, std::string* why);
+bool kernel_limits(const flyx_model_desc& d, std::string* why);
 const Block* block_of(const flyx_bmodel* m, const flyx_node& n, std::string* err);
 const RegionImpl* resolve(const flyx_bmodel* m, const flyx_node& n, const Block* b, int max_rows);
 extern const RegionImpl kGeneric;  // every node's generic implementation

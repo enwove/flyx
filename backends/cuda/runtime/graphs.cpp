@@ -6,8 +6,10 @@
 
 #include <algorithm>
 #include <memory>
+#include <mutex>
 #include <stdexcept>
 #include <type_traits>
+#include <unordered_map>
 #include <vector>
 
 #include "backends/cuda/backend.h"
@@ -17,8 +19,15 @@ namespace flyx::cuda {
 namespace {
 
 // The bytes a kernel's parameters take (the driver's cuFuncGetParamInfo, from CUDA 12.4; through the runtime, as
-// runtime/tiers.cpp takes the driver's functions); -1 where the driver has no answer.
+// runtime/tiers.cpp takes the driver's functions); -1 where the driver has no answer.  Cached per function pointer:
+// a kernel's parameter layout is fixed at compile time, avoiding thousands of driver queries per graph capture.
 long long kernel_param_bytes(void* func) {
+  static std::mutex mu;
+  static std::unordered_map<void*, long long> cache;
+  {
+    std::lock_guard<std::mutex> lock(mu);
+    if (const auto it = cache.find(func); it != cache.end()) return it->second;
+  }
   using ParamInfo = CUresult (*)(CUfunction, size_t, size_t*, size_t*);
   static const ParamInfo info = [] {
     void* p = nullptr;
@@ -30,18 +39,22 @@ long long kernel_param_bytes(void* func) {
     }
     return reinterpret_cast<ParamInfo>(p);
   }();
+  long long bytes = -1;
   cudaFunction_t f = nullptr;
-  if (!info || cudaGetFuncBySymbol(&f, func) != cudaSuccess) {
+  if (info && cudaGetFuncBySymbol(&f, func) == cudaSuccess) {
+    size_t end = 0;
+    for (size_t i = 0;; ++i) {
+      size_t offset = 0, size = 0;
+      if (info(reinterpret_cast<CUfunction>(f), i, &offset, &size) != CUDA_SUCCESS) break;
+      end = std::max(end, offset + size);
+    }
+    bytes = static_cast<long long>(end);
+  } else {
     cudaGetLastError();
-    return -1;
   }
-  size_t end = 0;
-  for (size_t i = 0;; ++i) {
-    size_t offset = 0, size = 0;
-    if (info(reinterpret_cast<CUfunction>(f), i, &offset, &size) != CUDA_SUCCESS) break;
-    end = std::max(end, offset + size);
-  }
-  return static_cast<long long>(end);
+  std::lock_guard<std::mutex> lock(mu);
+  cache.emplace(func, bytes);
+  return bytes;
 }
 
 // A conditional node's body graphs (the driver's cuGraphNodeGetParams, from CUDA 13.2, through the runtime so
@@ -165,7 +178,11 @@ void count_round_graphs(flyx_bmodel* m) {
   for (const auto& [plan, g] : m->round_graphs) all = all && g.counted;
   if (all) return;
   flyx_seq* s = nullptr;
-  if (seq_new(m, kGraphCountCtx, &s) != 0) throw std::runtime_error("sizing the round graphs: " + g_error);
+  if (const int rc = seq_new(m, kGraphCountCtx, &s); rc != 0) {
+    const auto why = "sizing the round graphs: " + g_error;
+    if (rc == FLYX_ERR_OOM) throw OutOfDeviceMemory(why);
+    throw std::runtime_error(why);
+  }
   const std::unique_ptr<flyx_seq> scratch(s);
   for (auto& [plan, g] : m->round_graphs)
     if (!g.counted) {

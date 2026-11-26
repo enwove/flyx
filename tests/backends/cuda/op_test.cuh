@@ -167,7 +167,7 @@ struct BlockType {
   const char* name;
   std::vector<int> scales_at;
 };
-extern const BlockType kBlockTypes[19];
+extern const BlockType kBlockTypes[21];
 const BlockType& block_type(int dtype);
 std::vector<uint8_t> random_blocks(const BlockType& bt, size_t n);
 BlockMat up_blocks(int dtype, const std::vector<uint8_t>& file, int rows, bool host = false);
@@ -177,7 +177,12 @@ BlockMat up_blocks(int dtype, const std::vector<uint8_t>& file, int rows, bool h
 struct Q8Rows {
   std::vector<int8_t> q;
   std::vector<float> d, sums;
-  bool operator==(const Q8Rows& o) const { return q == o.q && d == o.d && sums == o.sums; }
+  bool operator==(const Q8Rows& o) const {
+    auto same_bits = [](const std::vector<float>& a, const std::vector<float>& b) {
+      return a.size() == b.size() && (a.empty() || std::memcmp(a.data(), b.data(), a.size() * sizeof(float)) == 0);
+    };
+    return q == o.q && same_bits(d, o.d) && same_bits(sums, o.sums);
+  }
 };
 inline Q8Rows q8_rows(int rows, int K) {
   CK(cudaDeviceSynchronize());
@@ -192,6 +197,37 @@ inline Q8Rows q8_rows(int rows, int K) {
     CK(cudaMemcpy(r.sums.data(), sc.q8_sums, r.sums.size() * 4, cudaMemcpyDeviceToHost));
   }
   return r;
+}
+
+// What a round's 8-bit producer writes of rows of K values by the float64 reference (ops::round_q8 a row): the
+// integers where round_q8_at puts them and each group's scale times the sum of each 16.  For values whose integers
+// fit 8 bits, which every group with a normal float32 scale gives; the kernels sum the integers before they narrow
+// them, and a subnormal scale (or none) tells the two apart: those groups are held to the staging kernels' bytes
+// (test_rmsnorm_q8_split).
+inline Q8Rows reference_round_q8(const Vec& values, int K) {
+  Q8Rows out;
+  out.q.resize(values.size());
+  out.d.resize(values.size() / 32);
+  out.sums.resize(values.size() / 16);
+  std::vector<int8_t> row(static_cast<size_t>(K));
+  for (size_t base = 0; base < values.size(); base += K) {
+    ops::round_q8(values.data() + base, K, row.data(), out.d.data() + base / 32);
+    // Within each span of up to 32 groups, all first halves precede all second halves.
+    for (int first = 0; first < K / 32; first += 32) {
+      const int groups = std::min(32, K / 32 - first);
+      for (int half = 0; half < 2; ++half) {
+        for (int g = 0; g < groups; ++g) {
+          const int group = first + g;
+          const int8_t* src = row.data() + 32 * group + 16 * half;
+          std::copy_n(src, 16, out.q.data() + base + first * 32 + (half * groups + g) * 16);
+          int sum = 0;
+          for (int i = 0; i < 16; ++i) sum += src[i];
+          out.sums[base / 16 + group * 2 + half] = out.d[base / 32 + group] * float(sum);
+        }
+      }
+    }
+  }
+  return out;
 }
 
 inline DevParams* params(int position, int round = 0) {
@@ -230,6 +266,7 @@ void test_attention_fp8(int hd, int rot, int nh, int nkv, int rows, int ctx, dou
 void test_attention_tree(int hd, int nh, int nkv, int ctx);
 void test_strata(int hd, int nh, int nkv, int rows, int ctx, int bits, bool fp8);
 void test_pageable_kv_ops();
+void test_ring_publish();
 void test_quantize_nvfp4();
 void test_gdn(const GdnDims d, const int rows, const double tol);
 void test_gdn_chunk(const GdnDims d, const int rows, const int pos0, const double tol);
@@ -269,5 +306,17 @@ void test_vision_attention();
 void test_vision_avg_pool();
 void test_embed_scatter();
 void test_mrope();
+void test_inkling2_softcap();
+void test_inkling2_attn_res();
+void test_inkling2_loop_ctrl();
+void test_inkling2_loop_control();
+void test_inkling2_linear_f32();
+void test_inkling2_shortconv();
+void test_inkling2_sublayer_fusion();
+void test_inkling2_rel_prep_kv_sc();
+void test_inkling2_rel_attn();
+void test_inkling2_rel_strata();
+void test_inkling2_moe();
+void test_dspark();
 
 }  // namespace flyx::optest

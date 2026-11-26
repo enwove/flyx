@@ -59,7 +59,8 @@ bool draft_head_additive_ready(const HeadBlock& head, const Lin& extra, const Si
 void draft_head_pick_additive_step(const HeadBlock& head, const float* x_base, const Lin& extra,
                                    const SignHead& extra_coarse, const float* extra_bias, const float* x_extra,
                                    int K_extra, float softcap, float* cand_row, int ld, float* scratch_add, int k,
-                                   int* idx_out, float* val_out, float* prob_out, float* margin_out, const Launch& L);
+                                   int* idx_out, float* val_out, float* prob_out, float* margin_out, const Launch& L,
+                                   const DevParams* P = nullptr, int pos_add = 0, const DevGen* G = nullptr);
 
 // Drafting works on the sequence's own buffers and scratch, on the stream of L (the sequence's, or a batch round's).
 // DFlash2: one block of drafts; tree: `width` of its candidates as a tree (FLYX_DRAFT_TREE), the TreeRows with them
@@ -68,6 +69,12 @@ void mtp_draft(flyx_seq* s, const MtpBlock& b, int width, const Launch& L, bool 
 void mtp_context(const Pass& ps, const MtpBlock& b, bool fused = false);  // MTP K/V for the rows of a pass
 void gdn_layer(const Pass& ps, const GdnBlock& g, bool fused = false);
 void attn_layer(const Pass& ps, const AttnBlock& a, bool fused = false);
+void rel_attn_layer(const Pass& ps, const RelAttnBlock& a, bool fused = false);
+void moe_layer(const Pass& ps, const MoeBlock& f, bool fused = false);
+void flush_pending_post_conv(const Pass& ps, bool require_in_x = true);
+void dspark_draft(flyx_seq* s, const DSparkBlock& b, int width, const Launch& L, bool fused = false, int start = 0,
+                  int total_width = -1);
+void dspark_context(const Pass& ps, const DSparkBlock& b, bool fused = false);
 // A block's own adapters (ABI 43) on the linears that read one input (x null: a fused producer's staged rows; else
 // ldx apart), added to rv.b.proj's columns in turn (out[i] each), and on its last linear, added to rv.b.x; ldu:
 // RowNeeds::lora.

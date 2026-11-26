@@ -5,6 +5,7 @@
 #include <stdexcept>
 
 #include "core/interfaces/options.h"
+#include "models/inkling2/inkling2.h"
 #include "models/llama/llama.h"
 #include "models/qwen35/qwen35.h"
 
@@ -15,6 +16,7 @@ const char* drafter_name(Drafter d) {
     case Drafter::kMtp: return "mtp";
     case Drafter::kDFlash2: return "dflash2";
     case Drafter::kDv: return "dv";
+    case Drafter::kDSpark: return "dspark";
     default: return "none";
   }
 }
@@ -26,6 +28,12 @@ struct DrafterTraits {
   bool sequential;     // drafts one token per step; stopping early saves both draft and verify work
   bool tree_only;      // drafts trees over a persistent canvas (DV)
   bool stretch_block;  // shared mask token lets a parallel block draft past max_drafts up to FLYX_MAX_ROWS - 1
+  // A block drafted at once whose drafts a small head then refines one at a time: a step costs little beside the
+  // verify row its draft adds, so a round that stops may verify fewer drafts than it has (draft_steps_cheap).  Not a
+  // sequential drafter's, whose step is a pass of a layer: with earlier checkpoints allowed Qwen3.8-27B's MTP rounds
+  // gave up drafts that paid (RTX 5070 Ti, 24 chat prompts of 256 tokens: 3.06 -> 2.99 tokens a round, 144.4 ->
+  // 142.4 tok/s), the checkpoints' costs counting as saved the draft steps a stop has paid.
+  bool refines_by_step = false;
 };
 
 DrafterTraits drafter_traits(Drafter d) {
@@ -33,6 +41,7 @@ DrafterTraits drafter_traits(Drafter d) {
     case Drafter::kMtp: return {/*sequential=*/true, false, false};
     case Drafter::kDFlash2: return {false, false, /*stretch_block=*/true};
     case Drafter::kDv: return {false, /*tree_only=*/true, false};
+    case Drafter::kDSpark: return {false, false, false, /*refines_by_step=*/true};  // backbone + Markov head
   }
   return {false, false, false};
 }
@@ -40,8 +49,9 @@ DrafterTraits drafter_traits(Drafter d) {
 
 // Width ladder and intra-round adaptive stopping, driven by drafter traits + target structure:
 // - Sequential drafters (MTP, future EAGLE-4): tensor-core aligned 1, 3, 5, 7, ..., max_drafts (<= 15).
-// - Parallel block drafters: {3, 5, 7} when target verify cost scales steeply with width (e.g. sparse MoE),
-//   {3, 7} on dense targets, plus FLYX_MAX_ROWS - 1 when stretch_block allows drafting past max_drafts.
+// - Parallel block drafters: {1, 2, 3, 5, 7} when target verify cost scales steeply with width (e.g. sparse MoE, where
+//   each draft row reads its own experts: one or two drafts often pay where three do not), {3, 7} on dense targets,
+//   plus FLYX_MAX_ROWS - 1 when stretch_block allows drafting past max_drafts.
 // - Tree-only drafters (DV): up to FLYX_MAX_WIDE_ROWS - 1 (plus 15 when wider).
 std::vector<int> Model::draft_widths(int d) const {
   const DrafterBlock& b = drafters_.at(size_t(d));
@@ -53,8 +63,8 @@ std::vector<int> Model::draft_widths(int d) const {
     return {widest};
   }
   const int widest = tr.stretch_block ? b.max_drafts : std::min(FLYX_MAX_ROWS - 1, b.max_drafts);
-  const std::vector<int> ladder = tr.sequential              ? std::vector<int>{1, 3, 5, 7}
-                                  : verify_scales_with_width_ ? std::vector<int>{3, 5, 7}
+  const std::vector<int> ladder = tr.sequential                ? std::vector<int>{1, 3, 5, 7}
+                                  : verify_scales_with_width_ ? std::vector<int>{1, 2, 3, 5, 7}
                                                               : std::vector<int>{3, 7};
   std::vector<int> widths;
   for (int k : ladder)
@@ -68,16 +78,23 @@ std::vector<int> Model::adaptive_checkpoints(int d) const {
   const DrafterBlock& b = drafters_.at(size_t(d));
   const DrafterTraits tr = drafter_traits(b.kind);
   if (b.max_drafts <= 0 || tr.tree_only) return {};  // tree-only drafters (DV): no intra-round chain stop
-  const std::vector<int> ws = draft_widths(d);
   // Intra-round GPU confidence stopping (stop_decide_step / stop_decide_block) pays whenever cutting verify width
   // saves substantial work:
   // - sequential drafters save both remaining draft steps and verify rows;
   // - targets with steep verify-cost scaling (e.g. sparse MoE active-expert fan-out) benefit on any block drafter.
   // Dense targets paired with block drafters have nearly flat verify cost across widths (RTX PRO 6000, QUASAR NVFP4
   // 27B + DFlash2: adaptive 425-439 vs fixed 443-494 tok/s on code) and avoid extra verify subgraphs in VRAM.
-  if (tr.sequential || verify_scales_with_width_) return ws.size() > 1 ? ws : std::vector<int>{};
-  return {};
+  if (!tr.sequential && !verify_scales_with_width_) return {};
+  // Keep a drafter's adaptive graph within its trained block (b.max_drafts); stretching every adaptive round past the
+  // trained block degrades bidirectional draft quality and adds draft/verify work (stretched widths stay in
+  // draft_widths for explicit --width or widened high-acceptance runs).
+  std::vector<int> cps;
+  for (int w : draft_widths(d))
+    if (w <= b.max_drafts) cps.push_back(w);
+  return cps.size() > 1 ? cps : std::vector<int>{};
 }
+
+bool Model::draft_steps_cheap(int d) const { return drafter_traits(drafters_.at(size_t(d)).kind).refines_by_step; }
 
 int Model::block_drafts(int d) const {
   const DrafterBlock& b = drafters_.at(size_t(d));
@@ -99,9 +116,9 @@ bool choose_drafters(const ModelOptions& o, const DrafterSources& has, std::vect
   out->clear();
   interfaces::DrafterMode mode = interfaces::DrafterMode::kAuto;
   if (!interfaces::parse_drafter_mode(o.drafter, &mode))
-    return *err = "unknown drafter '" + o.drafter + "' (mtp, dflash2, dv, all or none)", false;
+    return *err = "unknown drafter '" + o.drafter + "' (mtp, dflash2, dv, dspark, all or none)", false;
   if (!o.speculative || mode == interfaces::DrafterMode::kNone) return true;
-  bool mtp = false, dflash2 = false, dv = false;
+  bool mtp = false, dflash2 = false, dv = false, dspark = false;
   switch (mode) {
     case interfaces::DrafterMode::kMtp:
       if (!has.mtp) return *err = "the model file has no MTP layer", false;
@@ -115,27 +132,35 @@ bool choose_drafters(const ModelOptions& o, const DrafterSources& has, std::vect
       if (!has.dv) return *err = "the model file has no DV drafter", false;
       dv = true;
       break;
+    case interfaces::DrafterMode::kDSpark:
+      if (!has.dspark) return *err = "the model file has no DSpark drafter", false;
+      dspark = true;
+      break;
     case interfaces::DrafterMode::kAll:
       mtp = has.mtp;
       dflash2 = has.dflash2;
       dv = has.dv;
+      dspark = has.dspark;
       break;
     case interfaces::DrafterMode::kAuto: {
       // Every drafter given in a file of its own; of the model file's own, the MTP layer if it has one, else DFlash2
       // (MTP was measured faster on the 4B, 462 against 341 tok/s: a file with both keeps it until choosing between
       // them every round is measured there).  DV only when named (dv, all).
       const bool own_mtp = has.mtp && !has.mtp_beside, own_dflash2 = has.dflash2 && !has.dflash2_beside;
+      const bool own_dspark = has.dspark && !has.dspark_beside;
       mtp = has.mtp_beside || own_mtp;
       dflash2 = has.dflash2_beside || (own_dflash2 && !own_mtp);
+      dspark = has.dspark_beside || own_dspark;
       break;
     }
     case interfaces::DrafterMode::kNone: break;
   }
   // DV's canvas follows its own rounds only, and the controller weighs its warm-up against plain decoding's and
   // lookup's rounds alone: no drafter beside it.
-  if (dv && (mtp || dflash2)) return *err = "DV drafts alone: not beside another drafter", false;
+  if (dv && (mtp || dflash2 || dspark)) return *err = "DV drafts alone: not beside another drafter", false;
   if (mtp) out->push_back(Drafter::kMtp);
   if (dflash2) out->push_back(Drafter::kDFlash2);
+  if (dspark) out->push_back(Drafter::kDSpark);
   if (dv) out->push_back(Drafter::kDv);
   return true;
 }
@@ -147,7 +172,7 @@ std::string declared_activations(const ModelFile& file) {
   return q.contains("activations") && q.at("activations").is_string() ? q.at("activations").get<std::string>() : "";
 }
 
-int Tables::weight(const std::string& name, std::vector<int64_t> shape) {
+int Tables::weight(const std::string& name, std::vector<int64_t> shape, const std::string& ggml_scale_name) {
   auto it = index_.find(name);
   if (it != index_.end()) return it->second;
   const flyx_tensor_view* t = file_->tensor(name);
@@ -167,7 +192,8 @@ int Tables::weight(const std::string& name, std::vector<int64_t> shape) {
   // ones), bf16 in rounds (finer than its 8 bits).
   const bool fp4 = t->dtype == FLYX_DT_NVFP4 || t->dtype == FLYX_DT_GGML_NVFP4;
   if (flyx_block_values(t->dtype) && !fp4 && !exact_) w.activations = FLYX_ACT_Q8;
-  if (fp4 && !exact_ && nvfp4_inputs_) w.activations = FLYX_ACT_NVFP4;
+  // 3D NVFP4 expert tensors keep bf16 activations (finer than FP4 and row-independent across sparse MoE dispatches).
+  if (fp4 && t->ndim == 2 && !exact_ && nvfp4_inputs_) w.activations = FLYX_ACT_NVFP4;
   if (t->dtype == FLYX_DT_NVFP4) {
     w.scale = file_->tensor(name + ".scale");
     w.scale2 = file_->tensor(name + ".scale2");
@@ -178,6 +204,13 @@ int Tables::weight(const std::string& name, std::vector<int64_t> shape) {
     const bool ok_scale2 = w.scale2 && w.scale2->dtype == FLYX_DT_F32 && w.scale2->nbytes >= sizeof(float);
     if (!ok_scale || !ok_scale2)
       throw std::runtime_error(name + ": NVFP4 without valid scales");
+  } else if (!ggml_scale_name.empty()) {
+    if (const flyx_tensor_view* s2 = file_->tensor(ggml_scale_name)) {
+      const bool ok_s2 = s2->dtype == FLYX_DT_F32 && s2->ndim == 1 &&
+                         (s2->shape[0] == 1 || (t->ndim == 3 && s2->shape[0] == t->shape[0]));
+      if (!ok_s2) throw std::runtime_error(ggml_scale_name + ": invalid GGML scale tensor");
+      w.scale2 = s2;
+    }
   }
   weights.push_back(w);
   return index_[name] = int(weights.size()) - 1;
@@ -209,7 +242,8 @@ bool Tables::set_activations(const std::string& how, const std::string& declared
   bool other_k = false;
   for (const auto& name : file_->tensor_names()) {
     const flyx_tensor_view* t = file_->tensor(name);
-    other_k = other_k || (t && t->dtype == FLYX_DT_GGML_NVFP4 && t->ndim == 2 && t->shape[1] % 128);
+    other_k = other_k || (t && t->dtype == FLYX_DT_GGML_NVFP4 && (t->ndim == 2 || t->ndim == 3) &&
+                          t->shape[t->ndim - 1] % 128);
   }
   // Asked for by name, NVFP4 weights take NVFP4 inputs whatever the file says: a file converted with bf16 inputs
   // takes them without a second conversion, and neither the device nor the GGUF rules above
@@ -336,14 +370,16 @@ bool reads_required(const ModelFile& file, const std::vector<std::string>& reads
 struct ArchEntry {
   const char* name;
   std::unique_ptr<Model> (*open)(const ModelFile&, const ModelOptions&, std::string*);
-  bool gguf;  // its GGUF files read too (a Llama's are not: llama.cpp's converter permutes its q and k rows)
+  bool gguf;    // its GGUF files read too (a Llama's are not: llama.cpp's converter permutes its q and k rows)
+  bool vision;  // its build opens a vision projector (--mmproj)
   const char* reads;  // a part a file may require (format 2's "requires") that the model reads, or null
 };
 
 constexpr ArchEntry kArchitectures[] = {
-    {"qwen35", qwen35::open, true, nullptr},
-    {"qwen3", llama::open, true, "lora"},  // Llama's layer with q/k norms; their own adapters (a V-LoRA)
-    {"llama", llama::open, false, "lora"},
+    {"qwen35", qwen35::open, true, true, nullptr},
+    {"qwen3", llama::open, true, false, "lora"},  // Llama's layer with q/k norms; their own adapters (a V-LoRA)
+    {"llama", llama::open, false, false, "lora"},
+    {"inkling2_loop", inkling2::open, true, false, nullptr},
 };
 
 }  // namespace
@@ -389,6 +425,13 @@ std::vector<std::string> architectures() {
   return names;
 }
 
+std::vector<std::string> vision_architectures() {
+  std::vector<std::string> names;
+  for (const ArchEntry& entry : kArchitectures)
+    if (entry.vision) names.emplace_back(entry.name);
+  return names;
+}
+
 }  // namespace flyx::models
 
 namespace flyx::interfaces {
@@ -398,5 +441,6 @@ std::unique_ptr<Model> open_model(const ModelFile& file, const ModelOptions& o, 
 }
 
 std::vector<std::string> model_architectures() { return models::architectures(); }
+std::vector<std::string> vision_architectures() { return models::vision_architectures(); }
 
 }  // namespace flyx::interfaces

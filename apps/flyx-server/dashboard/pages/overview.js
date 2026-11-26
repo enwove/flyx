@@ -109,6 +109,8 @@ export function Overview({ active, go, explore, showModel, onOpenMem }) {
     tpr: c.rounds > 0 ? 1 + (c.accepted || 0) / c.rounds : null, acc: c.rounds > 0 ? acceptance(c.accepted, c.drafted) : null,
   })) : [];
   const sys = tm.system || {}, memory = memoryOf(tm);
+  const activeDraft = model.drafter && model.drafter !== "none" ? model.drafter : "";
+  const draftSummary = activeDraft ? activeDraft + (model.draft_weights ? " · " + model.draft_weights : "") + ", up to " + model.max_width : "";
   return html`
     <div class="now">
       <span class=${"badge " + phaseTone(phase)} id="act-badge">${t(phaseNames[phase] || phase)}</span>
@@ -134,7 +136,7 @@ export function Overview({ active, go, explore, showModel, onOpenMem }) {
       </div>
       <div class="pane chart" id="ov-spec">
         <div class="pane-h"><h2>${t("Speculative decoding")}</h2>
-          <span class="aside">${model.drafter ? t(model.drafter + ", up to " + model.max_width) :
+          <span class="aside">${draftSummary ? t(draftSummary) :
                                 model.loaded ? t("no drafter") : ""}</span></div>
         <div class="fig pair">${drafting(tm, phase, recent).map((f) => html`
           <div><b>${figure(f.v, f.d, f.unit)}</b><span>${t(f.what)}</span></div>`)}</div>
@@ -187,7 +189,7 @@ export function Overview({ active, go, explore, showModel, onOpenMem }) {
         <${Kv} pairs=${[
           ["Backend", model.backend || "-"],
           ["Context", model.context ? fmt(model.context) : "-"],
-          ["Drafter", model.drafter ? model.drafter + ", up to " + model.max_width : "none"],
+          ["Drafter", draftSummary || "none"],
           ["Chat format", model.chat_format || "-"],
           ["Sessions", model.max_sessions ? fmt(model.max_sessions) : "-"],
           ["Load time", model.load_s ? secs(model.load_s) : "-"],

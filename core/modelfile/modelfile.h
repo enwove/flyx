@@ -78,12 +78,17 @@ class ModelFile {
   std::vector<std::unique_ptr<Companion>> companions_;
 };
 
+// An explicit non-GGUF companion, identified by its directory config or .flyx draft header.
+std::string drafter_source_kind(const std::string& path);
+
 // Lightweight header metadata peeked from a GGUF file without mapping the whole file.
 struct GgufPeek {
   bool valid = false;
   std::string arch;    // general.architecture ("dflash": a drafter alone)
   int mtp_layers = 0;  // <arch>.nextn_predict_layers, 0 if absent
+  bool has_markov_context = false;  // dflash.has_markov_context (DSpark vs DFlash2)
 };
+std::string gguf_header_path(const std::string& path);  // shard 1 for a split GGUF
 GgufPeek gguf_peek(const std::string& path);
 
 // Peeks a GGUF file's header (without mapping the whole file) and returns its

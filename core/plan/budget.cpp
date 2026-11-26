@@ -10,6 +10,16 @@ namespace flyx::plan {
 
 uint64_t host_keep(uint64_t total_ram) { return std::max<uint64_t>(2ull << 30, total_ram / 16); }
 
+uint64_t device_reserve(uint64_t total_vram, bool gpu_paged) {
+  // Windows pages a process's GPU memory out rather than refuse it, and does so before the GPU is full: a 27B
+  // session filling the budget on a 16 GB card under WSL2 (15.8 of 16.3 GB in use) prefilled 12 times slower, one
+  // with 0.15 GB less ran as fast as ever; large allocations start paging around 560-690 MiB free (kPagedFloor is
+  // 768 MiB). Hold at least 768 MiB + 64 MiB desktop cushion where Windows pages, without stacking on top of base.
+  const uint64_t base = std::max<uint64_t>(384ull << 20, total_vram / 40);
+  constexpr uint64_t kPagedReserve = (768ull + 64ull) << 20;
+  return gpu_paged ? std::max(base, kPagedReserve) : base;
+}
+
 namespace {
 
 // The host memory K/V may take: as asked, or what the machine can spare (its available memory less host_keep(), and
@@ -110,10 +120,12 @@ KvTiers exact_of(KvTiers t) {
 
 // A session's device bytes at `ctx` with every K/V position on the GPU, read by the tiers' method.
 bool device_bytes(const flyx_backend_api* api, flyx_bmodel* bm, int ctx, const KvTiers& tiers, uint64_t* out,
-                  std::string* err = nullptr) {
+                  std::string* err = nullptr, bool* oom = nullptr) {
+  if (oom) *oom = false;
   const flyx_seq_layout l{ctx, INT32_MAX, tiers.method, tiers.method_arg, 0};
   flyx_seq_size s{};
-  if (api->seq_size(bm, &l, &s) != 0) {
+  if (const int rc = api->seq_size(bm, &l, &s); rc != 0) {
+    if (oom) *oom = rc == FLYX_ERR_OOM;
     if (err) {
       const char* msg = api->last_error ? api->last_error() : nullptr;
       *err = (msg && *msg) ? msg : "could not size a session";
@@ -191,19 +203,14 @@ bool init_device_budget(const flyx_backend_api* api, flyx_bmodel* bm, const KvTi
   out->held = held_of(*mi);
   uint64_t reserve = 0;
   auto fail_vram = [&] {
+    out->oom = true;
     const uint64_t overhead = mi->workspace + out->held.runtime + reserve;
     const uint64_t missing = reserve > mi->free ? reserve - mi->free : 0;
     *err = vram_short_error(out->held, mi->weights, 0, overhead, missing, has_drafter, mostly_bf16);
     return false;
   };
   if (reported) {
-    // Windows pages a process's GPU memory out rather than refuse it, and does so before the GPU is full: a 27B
-    // session filling the budget on a 16 GB card under WSL2 (15.8 of 16.3 GB in use) prefilled 12 times slower, one
-    // with 0.15 GB less ran as fast as ever; large allocations start paging around 560-690 MiB free (kPagedFloor is
-    // 768 MiB). Hold at least 768 MiB + 64 MiB desktop cushion where Windows pages, without stacking on top of base.
-    const uint64_t base = std::max<uint64_t>(384ull << 20, mi->total / 40);
-    constexpr uint64_t kPagedReserve = (768ull + 64ull) << 20;
-    reserve = tiers.gpu_paged ? std::max(base, kPagedReserve) : base;
+    reserve = device_reserve(mi->total, tiers.gpu_paged);
     *reserve_out = reserve;
     const uint64_t have = mi->free + mi->weights + mi->workspace;
     // Zero is the ledger's sentinel for a backend that does not report a budget.
@@ -234,7 +241,7 @@ struct TierPlacer {
     if (by) *by = CtxLimit::kNone;
     bool placed = tiered(api, bm, ctx, tiers, room, l, s, &e);
     out->auto_exact = false;
-    if (exact_ok && (!placed || s->host > out->host_budget) && tiers.method == FLYX_KV_AUTO) {
+    if (tiers.allow_auto_exact && exact_ok && (!placed || s->host > out->host_budget) && tiers.method == FLYX_KV_AUTO) {
       out->copy_note = !placed ? "it does not fit on the GPU"
                                : "it would take " + gb(s->host) + " of host memory, " + gb(out->host_budget) +
                                      " can be spared";
@@ -361,7 +368,8 @@ uint64_t least_session(const TierPlacer& placer, bool in_host) {
   uint64_t bytes = 0;
   if (!in_host) return device_bytes(placer.api, placer.bm, kLeastCtx, placer.tiers, &bytes) ? bytes : 0;
   // FLYX_KV_AUTO falls back to exact when Strata copies do not fit, so the true floor is exact.
-  const KvTiers t = placer.tiers.method == FLYX_KV_AUTO ? exact_of(placer.tiers) : placer.tiers;
+  const bool exact = placer.tiers.allow_auto_exact && placer.tiers.method == FLYX_KV_AUTO;
+  const KvTiers t = exact ? exact_of(placer.tiers) : placer.tiers;
   const flyx_seq_layout l{kLeastCtx, 0, t.method, t.method_arg, INT32_MAX};
   flyx_seq_size s{};
   return placer.api->seq_size(placer.bm, &l, &s) == 0 ? s.device : 0;
@@ -435,7 +443,7 @@ bool account(const flyx_backend_api* api, flyx_bmodel* bm, bool has_drafter, boo
   uint64_t reserve = 0;
   if (!init_device_budget(api, bm, tiers, has_drafter, mostly_bf16, ledger, out, &mi, &reserve, err)) return false;
   uint64_t sb = 0;
-  if (!device_bytes(api, bm, max_ctx, tiers, &sb, err)) return false;
+  if (!device_bytes(api, bm, max_ctx, tiers, &sb, err, &out->oom)) return false;
   out->session_bytes = sb;
 
   const TierPlacer placer{api, bm, tiers, ledger->budget() ? ledger->available() : UINT64_MAX, out};
@@ -460,7 +468,7 @@ bool account(const flyx_backend_api* api, flyx_bmodel* bm, bool has_drafter, boo
       // when the copy fits nowhere, every position exact.
       bool exact_ok = false;
       int ctx = placer.longest_placed(max_ctx, &l, &s, exact_ok);
-      if (ctx == 0) {
+      if (ctx == 0 && tiers.allow_auto_exact) {
         exact_ok = true;
         ctx = placer.place(max_ctx, &l, &s, &out->tier_note) ? max_ctx : placer.longest_placed(max_ctx, &l, &s);
       }
@@ -486,7 +494,10 @@ bool account(const flyx_backend_api* api, flyx_bmodel* bm, bool has_drafter, boo
       if (!tiers_on) out->ctx_need_more = sb - placer.room;
       return true;
     }
+    out->oom = true;
     *err = format_oom_error(placer, mi, reserve, max_ctx, has_drafter, mostly_bf16, tiers_on);
+    if (tiers.method == FLYX_KV_AUTO && !tiers.allow_auto_exact)
+      *err += " The requested context must keep the target model's AUTO attention switch.";
     return false;
   }
   return true;

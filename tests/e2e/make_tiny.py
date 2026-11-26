@@ -29,7 +29,8 @@ drafter alone as z-lab publishes DFlash2 drafters (hf_draft_zlab/) converted
 to a drafter file (tiny_draft.flyx), with blocks of 8 and 7 (tiny_block8.flyx and tiny_block7.flyx),
 and with a sliding window of 8
 (hf_draft_window/: tiny_window.flyx with the target, golden_window.json,
-and alone, tiny_draft_window.flyx).  dv_cases.json: DV's trees, selector tables and
+and alone, tiny_draft_window.flyx; cut to its first layer, hf_draft_1layer/ and
+tiny_draft_1layer.flyx).  dv_cases.json: DV's trees, selector tables and
 canvas steps from the Python reference, for the float64 references in ops/
 (tests/ops/draft/dv_tree_test.cpp, tests/ops/canvas/canvas_test.cpp).
 
@@ -52,7 +53,8 @@ STAMP = ".inputs"
 OUTPUTS = ("tiny.flyx", "tiny_nvfp4.flyx", "tiny_qwen3.flyx", "tiny_gdn128.flyx", "tiny_w4a4.flyx",
            "golden.json", "golden_nvfp4.json", "golden_qwen3.json", "golden_gdn128.json", "tokenizer_cases.json",
            "chat_cases.json", "tiny_draft.flyx", "tiny_block8.flyx", "tiny_block7.flyx",
-           "tiny_window.flyx", "golden_window.json", "tiny_draft_window.flyx", "tiny_w4a4_a16.flyx",
+           "tiny_window.flyx", "golden_window.json", "tiny_draft_window.flyx", "tiny_draft_1layer.flyx",
+           "tiny_w4a4_a16.flyx",
            "tiny_llama.flyx", "golden_llama.json",
            "tokenizer_cases_minicpm5.json", "dv_cases.json", "tiny_llama_dv.flyx", "tiny_llama_dv_pool.flyx",
            "tiny_llama_dv32.flyx", "tiny_llama_dv31.flyx", "tiny_llama_dv31_pool.flyx", "tiny_llama_dv31_wide.flyx",
@@ -414,6 +416,20 @@ def zlab_drafter(src: str, dst: str, target_layers: int, window: int = 0, block:
     json.dump(cfg, open(os.path.join(dst, "config.json"), "w", encoding="utf-8"), indent=1)
 
 
+def one_layer_drafter(src: str, dst: str):
+    """The drafter in src (z-lab's layout) cut to its first layer: its context cache then has one layer, as the MTP
+    layer's has, and a target whose caches are FP8 must still keep it in binary16 for DFlash2's kernels."""
+    from safetensors.torch import load_file, save_file
+    os.makedirs(dst, exist_ok=True)
+    w = load_file(os.path.join(src, "model.safetensors"))
+    save_file({k: v.contiguous() for k, v in w.items() if not k.startswith("layers.") or k.startswith("layers.0.")},
+              os.path.join(dst, "model.safetensors"))
+    cfg = json.load(open(os.path.join(src, "config.json"), encoding="utf-8"))
+    cfg["num_hidden_layers"] = 1
+    cfg["layer_types"] = cfg["layer_types"][:1]
+    json.dump(cfg, open(os.path.join(dst, "config.json"), "w", encoding="utf-8"), indent=1)
+
+
 def same_drafter(model_path: str, drafter_path: str):
     """A drafter file holds what the model file holds of its drafter: the same config and tensors."""
     with Reader(model_path) as a, Reader(drafter_path) as b:
@@ -462,6 +478,9 @@ def main(out):
     convert(tdir, wpath, wdir, log=lambda *_: None)
     write_golden(wpath, os.path.join(out, "golden_window.json"), prompts, vocab)
     convert_draft(wdir, os.path.join(out, "tiny_draft_window.flyx"), log=lambda *_: None)
+    odir = os.path.join(out, "hf_draft_1layer")  # no random draws: what is made after it stays as it was
+    one_layer_drafter(wdir, odir)
+    convert_draft(odir, os.path.join(out, "tiny_draft_1layer.flyx"), log=lambda *_: None)
     # Chains of 15 widen the 8-row block. With 7 native rows, two widened chains of 7 fit in one batch.
     for block in (8, 7):
         bdir = os.path.join(out, f"hf_draft_block{block}")
@@ -551,7 +570,8 @@ def main(out):
           f"tokenizer_cases_minicpm5.json ({len(lcases)}), "
           f"tiny_gdn128.flyx, golden_gdn128.json, tiny_draft.flyx, tiny_block8.flyx, tiny_block7.flyx, "
           f"tiny_window.flyx, golden_window.json, "
-          f"tiny_draft_window.flyx, tiny_w4a4.flyx, tiny_w4a4_a16.flyx, dv_cases.json, tiny_llama_dv.flyx, "
+          f"tiny_draft_window.flyx, tiny_draft_1layer.flyx, tiny_w4a4.flyx, tiny_w4a4_a16.flyx, dv_cases.json, "
+          f"tiny_llama_dv.flyx, "
           f"tiny_llama_dv_pool.flyx, tiny_llama_dv32.flyx, tiny_llama_dv31.flyx, tiny_llama_dv31_pool.flyx, "
           f"tiny_llama_dv31_wide.flyx, tiny_llama_dv31_wide_pool.flyx, golden_llama_dv.json ({nd} rounds), "
           f"tiny_llama_nvfp4.flyx, golden_llama_nvfp4.json, tiny_llama_lora.flyx, golden_llama_lora.json and "

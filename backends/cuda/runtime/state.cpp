@@ -1,5 +1,6 @@
 // Copyright 2026 The flyx Authors. SPDX-License-Identifier: Apache-2.0
 // Sequence state and row buffers, sized from the blocks and the state table.
+#include "backends/cuda/runtime/checked_size.h"
 #include "backends/cuda/backend.h"
 #include "flyx/gemm_tables.inc"
 
@@ -10,6 +11,8 @@ namespace flyx::cuda {
 RowNeeds row_needs(const flyx_bmodel* m) {
   RowNeeds n;
   int k = 0;  // largest GEMM K
+  int pass0_pushes = 0;
+  bool has_rel_attn = false;
   auto ks = [&](std::initializer_list<int> l) { k = std::max(k, std::max(l)); };
   for (const Block& blk : m->blocks) {
     if (const auto* a = std::get_if<AttnBlock>(&blk)) {
@@ -19,30 +22,78 @@ RowNeeds row_needs(const flyx_bmodel* m) {
       n.attn_state = std::max(n.attn_state, a->nh * kFlashStateFloats(a->hd));
       n.split_state = std::max(n.split_state, a->nh * kSplitStateFloats(a->hd));
       n.lora = std::max(n.lora, 3 * a->lora.rank);
+      if (a->w_in.q8_inputs() || a->w_out.q8_inputs()) n.q8 = true;
       ks({a->hidden, a->nh * a->hd, a->lora.rank});
     } else if (const auto* g = std::get_if<GdnBlock>(&blk)) {
       n.proj = std::max(n.proj, g->n_in());
       n.act = std::max(n.act, g->v_width());
       n.gdn_o = std::max(n.gdn_o, g->v_width());
+      if (g->w_in.q8_inputs() || g->w_out.q8_inputs()) n.q8 = true;
       ks({g->hidden, g->v_width()});
     } else if (const auto* f = std::get_if<MlpBlock>(&blk)) {
       n.proj = std::max(n.proj, 2 * f->inter);
       n.act = std::max(n.act, f->inter);
       if (!f->w_gu.packed() && !f->w_down.packed()) n.glu = true;
+      if (f->w_gu.q8_inputs() || f->w_down.q8_inputs()) n.q8 = true;
       n.lora = std::max(n.lora, 2 * f->lora.rank);
       ks({f->hidden, f->inter, f->lora.rank});
+    } else if (const auto* r = std::get_if<RelAttnBlock>(&blk)) {
+      has_rel_attn = true;
+      const int q_dim = r->nh * r->hd, kv_dim = r->nkv * r->hd;
+      n.proj = std::max({n.proj, 2 * q_dim + r->nh * r->d_rel, kv_dim, r->nh});
+      n.act = std::max({n.act, q_dim, kv_dim});
+      n.q = std::max(n.q, q_dim);
+      n.attn_state = std::max(n.attn_state, r->nh * kFlashStateFloats(r->hd));
+      n.rel_q = std::max(n.rel_q, r->nh * r->d_rel);
+      n.max_rel_nh = std::max(n.max_rel_nh, r->nh);
+      n.max_rel_extent = std::max(n.max_rel_extent, r->rel_extent);
+      n.sink = std::max(n.sink, r->nh);
+      n.kv_dim = std::max(n.kv_dim, kv_dim);
+      if (r->window == 0) n.kv_dyn = std::max(n.kv_dyn, r->nkv * r->conv);
+      n.max_loop_rank = std::max(n.max_loop_rank, r->loop_rank);
+      if (r->res_push && r->loop_rank == 0) ++pass0_pushes;
+      ks({r->hidden, q_dim, 2 * r->hidden, r->loop_rank});
+    } else if (const auto* e = std::get_if<MoeBlock>(&blk)) {
+      n.proj = std::max(n.proj, e->n_experts);
+      n.moe_experts = std::max(n.moe_experts, e->n_experts);
+      n.moe_topk = std::max(n.moe_topk, e->top_k);
+      n.moe_inter = std::max(n.moe_inter, e->inter);
+      n.max_loop_rank = std::max(n.max_loop_rank, e->loop_rank);
+      ks({e->hidden, e->inter, 2 * e->hidden, e->loop_rank});
     } else if (const auto* h = std::get_if<HeadBlock>(&blk)) {
+      if (h->wb.data && h->wb.q8) n.q8 = true;
       ks({h->hidden});
-    } else if (std::holds_alternative<MtpBlock>(blk)) {
+    } else if (const auto* t = std::get_if<MtpBlock>(&blk)) {
       n.mtp = true;
+      if (t->fc.q8_inputs()) n.q8 = true;
       ks({2 * m->hidden});
     } else if (const auto* d = std::get_if<DFlashBlock>(&blk)) {
-      n.feats = d->n_taps * d->target_hidden;
-      n.cx = d->hidden;
-      n.ckv = d->ctx_width();
-      ks({d->hidden, d->inter, d->nh * d->hd, n.feats});
+      const int df_feats = d->n_taps * d->target_hidden;
+      n.feats += df_feats;
+      n.cx = std::max(n.cx, d->hidden);
+      n.ckv = std::max(n.ckv, d->ctx_width());
+      if (d->fc.q8_inputs() || d->ctx.q8_inputs() || d->sel_hid.q8_inputs()) n.q8 = true;
+      ks({d->hidden, d->inter, d->nh * d->hd, df_feats});
+    } else if (const auto* dl = std::get_if<DFlashLayer>(&blk)) {
+      if (dl->w_qkv.q8_inputs() || dl->w_o.q8_inputs() || dl->w_gu.q8_inputs() || dl->w_down.q8_inputs() ||
+          dl->attn_proj.q8_inputs() || dl->mlp_proj.q8_inputs())
+        n.q8 = true;
+    } else if (const auto* ds = std::get_if<DSparkBlock>(&blk)) {
+      n.dspark = true;
+      n.feats += ds->n_taps * m->hidden;
+      n.cx = std::max(n.cx, ds->hidden);
+      n.ckv = std::max(n.ckv, 2 * ds->nkv * ds->hd);
+      if (ds->markov_w2.q8_inputs() || ds->joint_proj.q8_inputs()) n.q8 = true;
+      ks({ds->hidden, ds->inter, ds->nh * ds->hd, 2 * ds->hidden + 2 * ds->markov_rank, ds->markov_rank});
+    } else if (const auto* dsl = std::get_if<DSparkLayer>(&blk)) {
+      // Its linears made Q8_0 at load (draft_weights q8, or auto beside GGML block weights) declare no 8-bit inputs
+      // in the file: the staging for them is asked here.
+      for (const Lin* l : {&dsl->w_qkv, &dsl->w_q, &dsl->w_k, &dsl->w_v, &dsl->w_o, &dsl->w_ctx_kv, &dsl->w_k_ctx,
+                           &dsl->w_v_ctx, &dsl->w_gu, &dsl->w_gate, &dsl->w_up, &dsl->w_down})
+        if (l->q8_inputs()) n.q8 = true;
     }
   }
+  if (has_rel_attn) n.max_bank = std::max(pass0_pushes + 2, 4);
   n.k_max = (k + 63) / 64 * 64;
   return n;
 }
@@ -50,6 +101,7 @@ RowNeeds row_needs(const flyx_bmodel* m) {
 int max_drafts(const Block& drafter) {
   // DFlash2: its block, or a round's rows drafted at once (draft_block's wide block)
   if (const auto* d = std::get_if<DFlashBlock>(&drafter)) return std::max(d->block, FLYX_MAX_ROWS) - 1;
+  if (const auto* ds = std::get_if<DSparkBlock>(&drafter)) return ds->block - 1;
   if (const auto* v = std::get_if<DvBlock>(&drafter)) return v->tree_width;
   return std::holds_alternative<MtpBlock>(drafter) ? FLYX_MAX_ROWS - 1 : 0;
 }
@@ -76,11 +128,70 @@ void alloc_rows(const flyx_bmodel* m, int R, bool prefill, RowBufs* b, Alloc&& a
       part = std::max(part, prefill ? attention_partial_floats(flash ? std::min(R, FLYX_MAX_ROWS) : R, a->nh, a->hd,
                                                                kPrefillSplits)
                                     : attention_partial_floats(R, a->nh, a->hd, kRoundSplits));
+    } else if (const auto* r = std::get_if<RelAttnBlock>(&blk)) {
+      part = std::max(part, attention_partial_floats(R, r->nh, r->hd, prefill ? kPrefillSplits : kRoundSplits));
     } else if (const auto* d = std::get_if<DFlashBlock>(&blk); d && !prefill) {
-      part = std::max(part, attention_partial_floats(d->block, d->nh, d->hd, kRoundSplits));
+      // Wide-block DFlash2 rounds can attend over up to max(d->block, FLYX_MAX_ROWS) rows (draft_block).
+      part = std::max(part, attention_partial_floats(std::max(d->block, FLYX_MAX_ROWS), d->nh, d->hd, kRoundSplits));
+    } else if (const auto* ds = std::get_if<DSparkBlock>(&blk); ds && !prefill) {
+      part = std::max(part, attention_partial_floats(ds->block, ds->nh, ds->hd, kRoundSplits));
     }
   }
-  if (n.feats) b->feats = f(size_t(R) * n.feats);  // DFlash2 taps survive across layers
+  if (n.feats) b->feats = f(size_t(R) * n.feats);  // DFlash2/DSpark taps survive across layers
+  if (n.max_bank > 0) {
+    b->res_bank = f(size_t(n.max_bank) * R * H);
+    b->attn_in = f(size_t(3) * R * H);
+    if (n.max_loop_rank > 0) {
+      b->prelude_cur = f(size_t(R) * H);
+      b->prelude_blocks = f(size_t(n.max_bank) * R * H);
+      b->loop_bank = f(size_t(n.max_bank) * R * H);
+      b->loop_bank_out = f(size_t(R) * H);
+      b->loop_msg = f(size_t(4) * R * H);
+      b->ctrl_cat = f(size_t(R) * 2 * H);
+      b->ctrl_gate = f(size_t(R) * n.max_loop_rank);
+      b->ctrl_gf = f(size_t(R) * 2 * H);
+      b->ctrl_scratch = f(size_t(kLoopGates) * (prefill ? std::min(R, FLYX_MAX_ROWS) : R) *
+                          loop_row_floats(n.max_loop_rank));
+    }
+  }
+  if (n.rel_q > 0) {
+    b->rel_q = f(size_t(R) * n.rel_q);
+    b->sink = f(size_t(R) * n.sink);
+    b->kv_conv = f(size_t(R) * 2 * n.kv_dim);
+    if (n.kv_dyn > 0) b->kv_dyn = f(size_t(R) * 2 * n.kv_dyn);
+  }
+  if (n.rel_q > 0 || n.moe_experts > 0) {
+    b->post_raw = f(size_t(R) * H);
+    if (!prefill) b->post_out = f(size_t(R) * H);
+  }
+  if (n.moe_experts > 0) {
+    b->moe_idx = static_cast<int*>(alloc(size_t(R) * n.moe_topk * sizeof(int)));
+    b->moe_w = f(size_t(R) * n.moe_topk);
+    // moe_gu is dead during moe_down (and unused when fused), so down_buf safely aliases it.
+    const size_t gu_or_down = std::max(size_t(2) * size_t(n.moe_inter), size_t(H));
+    b->moe_gu = f(size_t(R) * size_t(n.moe_topk) * gu_or_down);
+    b->moe_act = f(size_t(R) * size_t(n.moe_topk) * size_t(n.moe_inter));
+    const int chunk = std::min(R, 256);
+    b->moe_sc.pairs = static_cast<int*>(alloc(size_t(chunk) * size_t(n.moe_topk) * sizeof(int)));
+    b->moe_sc.tasks = static_cast<MoeTask*>(alloc(size_t(chunk) * size_t(n.moe_topk) * sizeof(MoeTask)));
+    b->moe_sc.n_tasks = static_cast<int*>(alloc(sizeof(int)));
+    b->moe_sc.down_buf = b->moe_gu;
+    const size_t stage_elems =
+        std::max(size_t(chunk) * size_t(H), size_t(chunk) * size_t(n.moe_topk) * size_t(n.moe_inter));
+    const size_t q8_a_bytes = (stage_elems + 255) / 256 * 256;
+    const size_t q8_d_bytes = (((stage_elems + 31) / 32) * sizeof(float) + 255) / 256 * 256;
+    const size_t q8_s_bytes = (((stage_elems + 15) / 16) * sizeof(float) + 255) / 256 * 256;
+    const size_t stage_bytes = std::max(stage_elems * sizeof(bf16), q8_a_bytes + q8_d_bytes + q8_s_bytes);
+    auto* stage_base = static_cast<uint8_t*>(alloc(stage_bytes));
+    b->moe_sc.q8_a = reinterpret_cast<int8_t*>(stage_base);
+    b->moe_sc.q8_d = reinterpret_cast<float*>(stage_base + q8_a_bytes);
+    b->moe_sc.q8_s = reinterpret_cast<float*>(stage_base + q8_a_bytes + q8_d_bytes);
+    b->moe_sc.bf16_a = reinterpret_cast<bf16*>(stage_base);
+    b->moe_sc.stage_elems = stage_elems;
+    b->moe_sc.chunk_rows = chunk;
+    b->moe_sc.max_experts = n.moe_experts;
+    b->moe_sc.max_top_k = n.moe_topk;
+  }
 
   if (prefill) {
     // Disjoint layer-local scratch regions for prefill (verified across mlp, attn, gdn, mtp_context, draft_context, head):
@@ -119,14 +230,20 @@ void alloc_rows(const flyx_bmodel* m, int R, bool prefill, RowBufs* b, Alloc&& a
     const size_t part_span = align_f(part);
     // Windowed split attention's state of a round's rows, twice: read from one, written to the other (SplitWindow).
     const size_t split_st = 2 * size_t(std::min(R, FLYX_MAX_ROWS)) * n.split_state;
-    const size_t attn_aux = std::max(size_t(R) * n.attn_state, part_span + split_st);
+    // AttnBlock's flash prefill never uses part, so attn_state aliases part; RelAttnBlock's windowed prefill uses
+    // split-K part and attn_state at once, so with a RelAttnBlock attn_state lies past part (where an AttnBlock's
+    // split_state is, which no RelAttnBlock reads).
+    const bool separate_state = n.max_rel_extent > 0 && n.attn_state > 0;
+    const size_t state_floats = size_t(R) * n.attn_state;
+    const size_t attn_aux = separate_state ? part_span + std::max(split_st, state_floats)
+                                           : std::max(state_floats, part_span + split_st);
     const size_t slot_b = std::max({size_t(R) * H, size_t(R) * n.gdn_o, q_off + attn_aux});
     float* base_b = f(slot_b);
     b->h = base_b;
     b->gdn_o = base_b;
     b->qbuf = base_b;
-    if (n.attn_state > 0) b->attn_state = base_b + q_off;
     b->part = base_b + q_off;
+    if (n.attn_state > 0) b->attn_state = separate_state ? b->part + part_span : base_b + q_off;
     if (n.split_state > 0) b->split_state = b->part + part_span;
   } else {
     // Round buffers: mtp_draft keeps mx live across the MTP layer, so mx stays separate from act/proj/h.
@@ -138,6 +255,8 @@ void alloc_rows(const flyx_bmodel* m, int R, bool prefill, RowBufs* b, Alloc&& a
     b->gdn_o = oq;
     b->qbuf = oq;
     b->part = f(part);
+    if (n.max_rel_nh > 0 && n.max_rel_extent > 0)
+      b->rel_btab = f(size_t(std::min(R, FLYX_MAX_ROWS)) * n.max_rel_nh * n.max_rel_extent);
     if (n.feats) {
       b->cx = f(size_t(R) * n.cx);
       b->ckv = f(size_t(R) * n.ckv);
@@ -276,7 +395,8 @@ int ensure_prefill_rows(flyx_bmodel* m, int rows) {
     m->prefill_bytes = 0;
     m->prefill_bufs = {};
     m->prefill_rows = 0;
-    return fail(std::string("prefill buffers: ") + e.what());
+    const bool oom = dynamic_cast<const OutOfDeviceMemory*>(&e) != nullptr;
+    return (oom ? fail_oom : fail)(std::string("prefill buffers: ") + e.what());
   }
   m->prefill_rows = rows;
   return 0;
@@ -285,8 +405,8 @@ int ensure_prefill_rows(flyx_bmodel* m, int rows) {
 void build_seq(flyx_bmodel* m, int32_t max_ctx, flyx_seq* s);
 
 // The layout's method for the sequence: exact, strata with a low-bit copy of 2 to 4 bits, or exact
-// below a switch and strata past it. The switch (unless the option sets it): kStrataHostExact
-// positions past the device's part; a session whose every position is exact keeps no copy.
+// below a switch and strata past it. The engine sets the switch before preflight. Direct ABI callers
+// can leave it at the layout default. A session whose every position is exact keeps no copy.
 bool take_method(const flyx_bmodel* m, const flyx_seq_layout* layout, flyx_seq* s) {
   if (!layout) return false;
   if (layout->method == FLYX_KV_READ_ALL) return true;
@@ -324,6 +444,8 @@ int seq_new_in(flyx_bmodel* m, const flyx_seq_layout* layout, flyx_seq** out) {
   probe.copy_host = std::max(0, layout->copy_host);
   try {
     build_seq(m, layout->max_ctx, &probe);
+  } catch (const OutOfDeviceMemory& e) {
+    return fail_oom(std::string("seq_new: ") + e.what());
   } catch (const std::exception& e) {
     return fail(std::string("seq_new: ") + e.what());
   }
@@ -337,6 +459,8 @@ int seq_new_in(flyx_bmodel* m, const flyx_seq_layout* layout, flyx_seq** out) {
   s->arena_host_bytes = probe.arena_host_bytes;
   try {
     build_seq(m, layout->max_ctx, s.get());
+  } catch (const OutOfDeviceMemory& e) {
+    return fail_oom(std::string("seq_new: ") + e.what());
   } catch (const std::exception& e) {
     return fail(std::string("seq_new: ") + e.what());
   }
@@ -360,6 +484,8 @@ int seq_size(flyx_bmodel* m, const flyx_seq_layout* layout, flyx_seq_size* out) 
   try {
     build_seq(m, layout->max_ctx, &s);
     room = graph_room(s, true);  // plans no session captured yet sized first (graphs.cpp)
+  } catch (const OutOfDeviceMemory& e) {
+    return fail_oom(e.what());
   } catch (const std::exception& e) {
     return fail(e.what());
   }
@@ -432,6 +558,56 @@ void strata_scratch(const flyx_bmodel* m, flyx_seq* s, StrataScratch& st, int ro
     st.delta = s->alloc<float>(delta_floats);
 }
 
+// The slots of the ring of the state table's cache i (KvBuf::swa_ring: a sliding-window layer, the target's or
+// DSpark's, and a DSpark Full layer past 8 of option mtp_window's windows): the window its rows read plus one prefill
+// chunk or rollback span, in 64s; 0 where that is not fewer than the context's positions (a slot a position).  The
+// cache's allocation and every checkpoint's copy of it (checkpoint_slot_bytes) take this many.
+int swa_ring_slots(const flyx_bmodel* m, const flyx_seq* s, size_t i) {
+  const KvSpec& k = m->states.kv[i];
+  const auto& ko = m->opt.kernels;
+  const bool long_ctx = ko.mtp_window > 0 && (long long)s->cap > 8ll * ko.mtp_window;
+  const int mtp_kv = m->mtp_block >= 0 ? block<AttnBlock>(m, block<MtpBlock>(m, m->mtp_block).attn).kv : -1;
+  if (int(i) == mtp_kv && long_ctx) return 0;  // the MTP layer's own ring (KvBuf::ring, not checkpointed)
+  long long window = 0;
+  if (k.window > 0) {
+    window = k.window;
+  } else if (m->dspark_block >= 0 && k.draft && k.layers == 1 && long_ctx && ko.mtp_ring) {
+    const auto& ds = block<DSparkBlock>(m, m->dspark_block);
+    for (int j = 0; j < ds.layers(); ++j)
+      if (block<DSparkLayer>(m, ds.first_layer + j).kv == int(i)) window = ko.mtp_window;
+  }
+  if (window == 0) return 0;
+  const long long span = std::max(FLYX_ROUND_SLOTS * FLYX_MAX_ROWS + m->wide_rows, s->rows_cap);
+  const long long ring = (window + span + 63) / 64 * 64;
+  return ring < s->cap ? int(ring) : 0;
+}
+
+// The bytes of a checkpoint's slot in host memory (ensure_checkpoint_slot lays it out): per gated delta net its
+// state and convolution window, per ring of slots its K and V (and their FP8 scales), per ShortConv its window, and
+// the hidden ring's row, each 256-byte aligned.  The pinned budget's split (alloc_state) and the dry sizing count
+// FLYX_CHECKPOINTS of them, which the checkpoints take as they are made.
+size_t checkpoint_slot_bytes(const flyx_bmodel* m, const flyx_seq* s) {
+  size_t n = 0;
+  auto add = [&](size_t bytes, size_t copies = 1) { n = size_add(n, size_mul(copies, checkpoint_align(bytes))); };
+  for (const GdnDims& gd : m->states.gdn) {
+    const size_t values = size_mul(gd.nv, gd.dv);
+    add(size_mul(size_mul(values, gd.dk), sizeof(float)));
+    const size_t channels = size_add(size_mul(2, size_mul(gd.nk, gd.dk)), values);
+    add(size_mul(size_mul(gd.ck - 1, channels), sizeof(float)));
+  }
+  for (const ShortConvSpec& sc : m->states.sconv)
+    add(size_mul(size_mul(sc.conv - 1, sc.channels), sizeof(float)));
+  for (size_t i = 0; i < m->states.kv.size(); ++i)
+    if (const int ring = swa_ring_slots(m, s, i)) {
+      const KvSpec& k = m->states.kv[i];
+      const size_t heads = size_mul(ring, k.nkv);
+      add(size_mul(size_mul(heads, k.hd), k.fp8 ? 1 : sizeof(kv16)), 2);
+      if (k.fp8) add(size_mul(heads, sizeof(float)), 2);
+    }
+  if (m->states.ring_width) add(size_mul(m->states.ring_width, sizeof(float)));
+  return n;
+}
+
 // The state the table declares, for positions [0, s->cap).
 void alloc_state(const flyx_bmodel* m, flyx_seq* s) {
   // Caches in tiers: the target's, one layer's each, of a size two or more share, since the caches
@@ -439,31 +615,34 @@ void alloc_state(const flyx_bmodel* m, flyx_seq* s) {
   // device memory.  A drafter's stays on the device: its draft steps read it a row at a time.
   auto row_of = [](const KvSpec& k) { return size_t(k.nkv) * k.hd * (k.fp8 ? 1 : sizeof(kv16)); };
   auto tiered = [&](const KvSpec& k) {
-    if (k.layers != 1 || k.draft) return false;
+    if (k.layers != 1 || k.draft || k.window > 0) return false;
     int n = 0;
-    for (const KvSpec& o : m->states.kv) n += o.layers == 1 && !o.draft && row_of(o) == row_of(k);
+    for (const KvSpec& o : m->states.kv) n += o.layers == 1 && !o.draft && o.window == 0 && row_of(o) == row_of(k);
     return n >= 2;
   };
   // Strata attention reads those caches through a low-bit copy; the query heads each one's attention
   // blocks have, for the shapes its kernels take and the scratch.
   const bool strata = s->kv_method == FLYX_KV_STRATA;
   int nh_most = 0, nkv_most = 0, hd_most = 0, g_hd_most = 0;  // the most of each, and of query heads times head dim
-  for (const Block& blk : m->blocks)
-    if (const auto* a = std::get_if<AttnBlock>(&blk)) {
-      const KvSpec& k = m->states.kv[size_t(a->kv)];
-      if (!strata || !tiered(k)) continue;
-      if (!strata_supported(a->nh, a->nkv, a->hd, s->kv_bits))
-        throw std::runtime_error("strata attention: not compiled for " + std::to_string(a->nh) + " query heads of " +
-                                 std::to_string(a->hd) + " over " + std::to_string(a->nkv) + " KV heads at " +
-                                 std::to_string(s->kv_bits) + " bits");
-      nh_most = std::max(nh_most, a->nh);
-      nkv_most = std::max(nkv_most, a->nkv);
-      g_hd_most = std::max(g_hd_most, a->nh / a->nkv * a->hd);
-      hd_most = std::max(hd_most, a->hd);
-    }
+  auto check_strata = [&](int kv_idx, int nh, int nkv, int hd) {
+    const KvSpec& k = m->states.kv[size_t(kv_idx)];
+    if (!strata || !tiered(k)) return;
+    if (!strata_supported(nh, nkv, hd, s->kv_bits))
+      throw std::runtime_error("strata attention: not compiled for " + std::to_string(nh) + " query heads of " +
+                               std::to_string(hd) + " over " + std::to_string(nkv) + " KV heads at " +
+                               std::to_string(s->kv_bits) + " bits");
+    nh_most = std::max(nh_most, nh);
+    nkv_most = std::max(nkv_most, nkv);
+    g_hd_most = std::max(g_hd_most, nh / nkv * hd);
+    hd_most = std::max(hd_most, hd);
+  };
+  for (const Block& blk : m->blocks) {
+    if (const auto* a = std::get_if<AttnBlock>(&blk)) check_strata(a->kv, a->nh, a->nkv, a->hd);
+    else if (const auto* r = std::get_if<RelAttnBlock>(&blk)) check_strata(r->kv, r->nh, r->nkv, r->hd);
+  }
   // The stagings' size: with strata attention a prefill reads keys past them a window at a time, on
   // the tensor-core kernel (the option attention=split keeps them as large as the host parts).
-  if (strata && m->opt.kernels.attention != kAttnSplit) {
+  if (strata && nh_most > 0 && m->opt.kernels.attention != kAttnSplit) {
     s->stage_window = m->opt.kernels.stage_window;
     s->stage_reach =
         s->strata_from > 0 ? s->strata_from + std::max(FLYX_ROUND_SLOTS * FLYX_MAX_ROWS, FLYX_MAX_ROWS + m->wide_rows)
@@ -546,14 +725,9 @@ void alloc_state(const flyx_bmodel* m, flyx_seq* s) {
       const size_t gran = vmm_granularity();
       auto round_up_g = [&](size_t n) { return (n + gran - 1) / gran * gran; };
       // Priority-1 base pinned bytes (host Strata copies + checkpoints + small staging/arena overhead; bounce & drain
-      // are only added if at least one layer spills to pageable RAM).
-      uint64_t prio1_base = 32ull << 20;
-      for (const GdnDims& gd : m->states.gdn)
-        prio1_base += size_t(FLYX_CHECKPOINTS) *
-                      (align256(size_t(gd.nv) * gd.dv * gd.dk * sizeof(float)) +
-                       align256(size_t(gd.ck - 1) * gd.C() * sizeof(float)));
-      if (m->states.ring_width)
-        prio1_base += size_t(FLYX_CHECKPOINTS) * align256(size_t(m->states.ring_width) * sizeof(float));
+      // are only added if at least one layer spills to pageable RAM).  The checkpoints: what the dry sizing counts
+      // and ensure_checkpoint_slot takes (rings of slots and ShortConvs included).
+      uint64_t prio1_base = size_add(32u << 20, size_mul(FLYX_CHECKPOINTS, checkpoint_slot_bytes(m, s)));
       int ci = 0;
       std::vector<uint64_t> layer_kv_pinned, layer_drain;
       layer_kv_pinned.reserve(size_t(s->copies));
@@ -618,12 +792,14 @@ void alloc_state(const flyx_bmodel* m, flyx_seq* s) {
   // The MTP layer's cache: its draft steps attend to its last mtp_window positions, which a ring holds
   // (with the rows a pass writes at once and those past the accepted ones besides).
   const int mtp_kv = m->mtp_block >= 0 ? block<AttnBlock>(m, block<MtpBlock>(m, m->mtp_block).attn).kv : -1;
+  const DFlashBlock* dflash = m->dflash_block >= 0 ? &block<DFlashBlock>(m, m->dflash_block) : nullptr;
+  const int dflash_kv = dflash ? dflash->kv : -1;
   for (const KvSpec& k : m->states.kv) {
     KvBuf b;
     int positions = s->cap;
     // past 8 windows (a whole cache of fewer is small, and its every position read exactly anyway)
     const bool mtp_part = int(s->kv.size()) == mtp_kv && m->opt.kernels.mtp_window > 0 &&
-                          s->cap > 8 * m->opt.kernels.mtp_window;
+                          s->cap > 8LL * m->opt.kernels.mtp_window;
     // with a copy where strata attention is compiled for the MTP layer's heads; elsewhere its first positions instead
     bool mtp_copy = mtp_part && m->opt.kernels.mtp_copy > 0;
     if (mtp_copy) {
@@ -632,9 +808,44 @@ void alloc_state(const flyx_bmodel* m, flyx_seq* s) {
     }
     if (mtp_part) {
       b.window = m->opt.kernels.mtp_window;
-      b.sink = mtp_copy ? 0 : m->opt.kernels.mtp_sink;  // with a copy, the copy has the first positions
-      const int ring = (b.sink + std::max(b.window + 2 * FLYX_MAX_ROWS, s->rows_cap) + 63) / 64 * 64;
-      if (m->opt.kernels.mtp_ring && ring < s->cap) b.ring = positions = ring;
+      // Sink and window cover at most the entire context, including when the requested sink is very large.
+      b.sink = mtp_copy ? 0 : std::min(m->opt.kernels.mtp_sink, s->cap - b.window);
+      const int64_t span = std::max<int64_t>(int64_t(b.window) + 2 * FLYX_MAX_ROWS, s->rows_cap);
+      const int64_t ring = (b.sink + span + 63) / 64 * 64;
+      if (m->opt.kernels.mtp_ring && ring < s->cap) b.ring = positions = int(ring);
+    } else if (k.window > 0) {
+      // SWA fixed GPU ring (target SWA and DSpark SWA layers): holds the window plus one prefill chunk or rollback span.
+      if (const int ring = swa_ring_slots(m, s, s->kv.size())) {
+        b.swa_ring = true;
+        b.ring = positions = ring;
+      }
+    } else if (int(s->kv.size()) == dflash_kv && dflash && dflash->window > 0) {
+      // Sliding-window DFlash2 context K/V: a draft block at position p attends to [p - window + 1, p + B),
+      // while a prefill pass writes up to s->rows_cap rows in parallel and rewinds may step back across
+      // FLYX_ROUND_SLOTS rounds of up to wide_rows rows. Keep at least window + extra slots so parallel
+      // prefill writes, mid-pass checkpoints, rejected rows, and rewinds never clobber live window keys
+      // (dflash_ring_slots); older positions s->dring says are gone.
+      const int ring = dflash_ring_slots(m->opt.kernels.dflash_ring, dflash->window, dflash->block, s->rows_cap,
+                                         m->wide_rows, s->cap);
+      if (ring > 0) {
+        b.ring = positions = ring;
+        s->dring.init(ring, dflash->window);
+      }
+    } else if (m->dspark_block >= 0 && k.draft && k.layers == 1 && m->opt.kernels.mtp_window > 0 &&
+               (long long)s->cap > 8ll * m->opt.kernels.mtp_window) {
+      bool is_dspark_kv = false;
+      const auto& ds = block<DSparkBlock>(m, m->dspark_block);
+      for (int j = 0; j < ds.layers(); ++j)
+        if (block<DSparkLayer>(m, ds.first_layer + j).kv == int(s->kv.size())) is_dspark_kv = true;
+      if (is_dspark_kv) {
+        // DSpark Full-attention layer at long contexts (> 8 * mtp_window): bound on-device draft KV to a sliding ring,
+        // matching MTP's mtp_window behavior (exact full context for shorter contexts, bounded VRAM at long contexts).
+        b.window = m->opt.kernels.mtp_window;
+        if (const int ring = swa_ring_slots(m, s, s->kv.size())) {  // option mtp_ring, and fewer slots than positions
+          b.swa_ring = true;
+          b.ring = positions = ring;
+        }
+      }
     }
     b.layer_stride = size_t(positions) * k.nkv * k.hd;
     const size_t n = size_t(k.layers) * b.layer_stride;
@@ -745,9 +956,10 @@ void alloc_state(const flyx_bmodel* m, flyx_seq* s) {
       st.how.recent = b.window;
       st.how.most = b.window / 2;
       strata_scratch(m, s, st, 1, a.nh, a.nkv, a.hd);
-    } else if (b.window > 0) {  // the draft step's gathered positions
-      const size_t w = size_t(m->opt.kernels.mtp_sink + b.window) * k.nkv;
-      s->mtp_window = KvRef{s->alloc<uint8_t>(w * k.hd * elem), s->alloc<uint8_t>(w * k.hd * elem),
+    } else if (mtp_part && b.window > 0) {  // the draft step's gathered positions
+      const size_t w = size_mul(size_add(b.sink, b.window), k.nkv);
+      const size_t bytes = size_mul(size_mul(w, k.hd), elem);
+      s->mtp_window = KvRef{s->alloc<uint8_t>(bytes), s->alloc<uint8_t>(bytes),
                             k.fp8 ? s->alloc<float>(w) : nullptr, k.fp8 ? s->alloc<float>(w) : nullptr};
       s->P_window = s->alloc<DevParams>(1);
     }
@@ -937,8 +1149,7 @@ void alloc_state(const flyx_bmodel* m, flyx_seq* s) {
     b.win = s->alloc<float>(FLYX_ROUND_SLOTS * b.w_stride);
     b.replay = GdnBufs::round(m->wide_rows, gd);  // a round's rows: 64 where lookup rounds may be wide
     b.replay.base = s->alloc<float>(kGdnReplaySlots * b.replay.slot_stride);
-    // Checkpoint host buffers are allocated lazily per slot in checkpoint.
-    s->ckp_slot_bytes += align256(b.s_stride * sizeof(float)) + align256(b.w_stride * sizeof(float));
+    // Checkpoint host buffers are allocated lazily per slot in checkpoint (checkpoint_slot_bytes).
     s->gdn.push_back(b);
   }
   // The commit's table of layers (layers.cpp: commit): when every gated delta net has the first's dims, strides and
@@ -961,12 +1172,40 @@ void alloc_state(const flyx_bmodel* m, flyx_seq* s) {
       CK(cudaStreamSynchronize(s->st));
     }
   }
+  for (const ShortConvSpec& sc : m->states.sconv) {
+    ShortConvBuf b;
+    b.conv = sc.conv;
+    b.channels = sc.channels;
+    b.w_stride = size_t(sc.conv - 1) * size_t(sc.channels);
+    b.r_stride = size_t(m->wide_rows) * size_t(sc.channels);
+    b.win = s->alloc<float>(FLYX_ROUND_SLOTS * b.w_stride);
+    b.replay = s->alloc<float>(kGdnReplaySlots * b.r_stride);
+    s->sconv.push_back(b);
+  }
+  if (!s->sconv.empty()) {
+    bool sc_alike = true;
+    const ShortConvBuf& f0 = s->sconv[0];
+    for (const ShortConvBuf& b : s->sconv)
+      sc_alike = sc_alike && b.conv == f0.conv && b.channels == f0.channels && b.w_stride == f0.w_stride &&
+                 b.r_stride == f0.r_stride;
+    s->sconv_alike = sc_alike;
+    s->sconv_layers = s->alloc<ShortConvLayer>(s->sconv.size());
+    if (!s->dry) {
+      std::vector<ShortConvLayer> host;
+      host.reserve(s->sconv.size());
+      for (const ShortConvBuf& b : s->sconv) host.push_back({b.win, b.replay});
+      CK(cudaMemcpyAsync(s->sconv_layers, host.data(), host.size() * sizeof(ShortConvLayer), cudaMemcpyHostToDevice,
+                         s->st));
+      CK(cudaStreamSynchronize(s->st));
+    }
+  }
   if (const int w = m->states.ring_width) {
     s->ring = s->alloc<float>(size_t(kHring) * w);
     s->ring_snap = s->alloc<float>(size_t(w));
-    s->ckp_slot_bytes += align256(size_t(w) * sizeof(float));
   }
-  if (s->dry) s->dry_host_bytes += size_t(FLYX_CHECKPOINTS) * s->ckp_slot_bytes;
+  // One count of a checkpoint's bytes for the pinned budget's split above, the dry sizing and the checkpoints.
+  s->ckp_slot_bytes = checkpoint_slot_bytes(m, s);
+  if (s->dry) s->dry_host_bytes = size_add(s->dry_host_bytes, size_mul(FLYX_CHECKPOINTS, s->ckp_slot_bytes));
 }
 
 // DV's canvas, what its pass leaves, the round's selector table and the canvas pass's rows (flyx_seq::DvRows), for
@@ -1028,6 +1267,7 @@ void build_seq(flyx_bmodel* m, int32_t max_ctx, flyx_seq* s) {
   const int H = m->hidden, V = m->vocab, R = m->wide_rows;
   const int prefill_rows = std::max(m->prefill_rows > 0 ? m->prefill_rows : 256, FLYX_MAX_ROWS);
   const DFlashBlock* d = m->dflash_block >= 0 ? &block<DFlashBlock>(m, m->dflash_block) : nullptr;
+  const DSparkBlock* ds = m->dspark_block >= 0 ? &block<DSparkBlock>(m, m->dspark_block) : nullptr;
   const DvBlock* dv = m->dv_block >= 0 ? &block<DvBlock>(m, m->dv_block) : nullptr;
   s->m = m;
   s->max_ctx = max_ctx;
@@ -1048,16 +1288,16 @@ void build_seq(flyx_bmodel* m, int32_t max_ctx, flyx_seq* s) {
     CK(cudaEventCreateWithFlags(&s->idle_ev, cudaEventDisableTiming));
     CK(cudaEventCreateWithFlags(&s->ready_ev, cudaEventDisableTiming));
     if (s->arena_dev_bytes > 0) {
-      void* p = nullptr;
-      CK(cudaMalloc(&p, s->arena_dev_bytes));
-      CK(cudaMemsetAsync(p, 0, s->arena_dev_bytes, s->st));
+      s->allocs.reserve(s->allocs.size() + 1);
+      void* p = device_malloc(s->arena_dev_bytes);
       s->allocs.push_back(p);
+      CK(cudaMemsetAsync(p, 0, s->arena_dev_bytes, s->st));
       s->dev_arena = static_cast<unsigned char*>(p);
       s->dev_arena_cap = s->arena_dev_bytes;
     }
     if (s->arena_host_bytes > 0) {
       void* p = nullptr;
-      CK(cudaHostAlloc(&p, s->arena_host_bytes, cudaHostAllocDefault));
+      CK(cudaHostAlloc(&p, s->arena_host_bytes, cudaHostAllocMapped));
       std::memset(p, 0, s->arena_host_bytes);
       s->host_allocs.push_back(p);
       s->host_arena = static_cast<unsigned char*>(p);
@@ -1071,6 +1311,7 @@ void build_seq(flyx_bmodel* m, int32_t max_ctx, flyx_seq* s) {
   s->tree_host = s->pinned_alloc<TreeRows>(size_t(flyx_seq::kDraftSlots));
   s->stop_host = s->pinned_alloc<flyx_stop_policy>(size_t(flyx_seq::kDraftSlots));
   s->ring_host = s->pinned_alloc<flyx_round_result>(size_t(kRing));
+  if (!s->dry) CK(cudaHostGetDevicePointer(reinterpret_cast<void**>(&s->ring_host_dev), s->ring_host, 0));
   s->tok_host = s->pinned_alloc<int>(size_t(prefill_rows));
   s->P = s->alloc<DevParams>(1);
   s->G = s->alloc<DevGen>(1);
@@ -1088,8 +1329,8 @@ void build_seq(flyx_bmodel* m, int32_t max_ctx, flyx_seq* s) {
   alloc_rows(m, R, false, &s->own, seq_bytes_alloc);
   s->drafts = s->alloc<int>(size_t(m->wide_rows));
   if (m->wide_rows > FLYX_MAX_ROWS) s->P_shift = s->alloc<DevParams>(1);
-  const int head_rows = std::max(FLYX_MAX_ROWS, d ? d->block : 1);
-  const int logit_cols = std::max(V, (d || m->mtp_block >= 0) ? kDraftPickFloats : 0);
+  const int head_rows = std::max({FLYX_MAX_ROWS, d ? d->block : 1, ds ? ds->block : 1});
+  const int logit_cols = std::max(V, (d || ds || m->mtp_block >= 0) ? kDraftPickFloats : 0);
   const int chunks = (V + 4095) / 4096;
   s->argv = s->alloc<float>(size_t(head_rows) * chunks);
   s->argi = s->alloc<int>(size_t(head_rows) * chunks);
@@ -1138,6 +1379,26 @@ void build_seq(flyx_bmodel* m, int32_t max_ctx, flyx_seq* s) {
     s->ddelta = s->alloc<float>(size_t(B) * 2 * d->conv_taps * G);
     s->dq = s->alloc<float>(size_t(B) * d->nh * d->hd);
     s->ld_ckv = n.ckv;
+  }
+  if (ds) {
+    const int B = ds->block, DH = ds->hidden, Rk = ds->markov_rank;
+    s->ld_feats = n.feats;
+    s->ld_ckv = n.ckv;
+    if (!s->dtok) s->dtok = s->alloc<int>(B);
+    s->ds_x = s->alloc<float>(size_t(B) * DH);
+    s->ds_h = s->alloc<float>(size_t(B) * DH);
+    s->ld_ds_proj = std::max((ds->nh + 2 * ds->nkv) * ds->hd, 2 * ds->inter);
+    s->ld_ds_act = std::max(ds->nh * ds->hd, ds->inter);
+    s->ds_proj = s->alloc<float>(size_t(B) * s->ld_ds_proj);
+    s->ds_act = s->alloc<float>(size_t(B) * s->ld_ds_act);
+    s->ds_q = s->alloc<float>(size_t(B) * ds->nh * ds->hd);
+    s->ds_hn = s->alloc<float>(size_t(B) * DH);
+    s->ds_state = s->alloc<float>(size_t(Rk));
+    s->ds_joint = s->alloc<float>(size_t(2 * Rk + 2 * DH));
+    s->ds_jout = s->alloc<float>(size_t(3 * Rk));
+    s->ds_markov = s->alloc<float>(size_t(Rk));
+    s->ds_bias = s->alloc<float>(size_t(V));
+    s->ds_prev = s->alloc<int>(1);
   }
   alloc_cert_scratch(m, &s->cert, seq_bytes_alloc);
   // Drafts by position: the test oracle's and the given drafts of a round
