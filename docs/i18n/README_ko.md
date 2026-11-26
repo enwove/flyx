@@ -50,7 +50,7 @@
 
 ## 업데이트
 
-- **v0.2.1** — Inkling-2-Mini의 희소 MoE와 디코딩 커널을 최적화하고 Markov 드래프터 DSpark를 자동으로 연결합니다. Qwen3.5/3.8은 호환 프로젝터로 이미지를 처리합니다. Hub가 관련 파일을 찾으면 **Draft with it**으로 드래프터를 선택할 수 있습니다. 가용 VRAM에 맞춰 드래프터를 로드하며 슬라이딩 윈도 DFlash2에는 링 KV 캐시를 사용합니다. PTX가 없는 Windows 후보 버전은 57.15 MB로 v0.2.0의 58.96 MB보다 작습니다.
+- **v0.2.1** — Inkling-2-Mini의 희소 MoE와 디코딩 커널을 최적화하고 Markov 드래프터 DSpark를 자동으로 연결합니다. Qwen3.5/3.8은 호환 프로젝터로 이미지를 처리합니다. Hub가 관련 파일을 찾으면 **Draft with it**으로 드래프터를 선택할 수 있습니다. 가용 VRAM에 맞춰 드래프터를 로드하며 슬라이딩 윈도 DFlash2에는 링 KV 캐시를 사용합니다. PTX가 없는 Windows 후보 버전은 57.14 MB로 v0.2.0의 58.96 MB보다 작습니다.
 - **`v0.2.0`** — **FLYX 첫 오픈소스 릴리스**: 약 59 MB 무의존성 Windows 단일 `.exe` 및 Linux tar.gz, 자동 GPU/RAM K/V 확장을 갖춘 네이티브 풀 컨텍스트 GGUF & NVFP4 추론, 내장 추측 디코딩(MTP / DFlash2), 7개 언어 웹 대시보드, 원클릭 Claude Code / Codex CLI 연동 지원.
 
 ## 성능

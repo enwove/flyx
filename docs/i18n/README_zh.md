@@ -50,7 +50,7 @@
 
 ## 更新动态
 
-- **v0.2.1** — 新增 Inkling-2-Mini 稀疏 MoE，优化解码内核，并自动挂载配套的 Markov DSpark 草稿器。Qwen3.5/3.8 可配合投影器读取图片。Hub 自动发现配套文件，也可通过 **Draft with it** 选择草稿器。引擎根据可用显存弹性加载草稿器，滑窗 DFlash2 使用环形 KV 缓存。Windows 候选版单文件不含 PTX，实测 57.15 MB，小于 v0.2.0 的 58.96 MB。
+- **v0.2.1** — 新增 Inkling-2-Mini 稀疏 MoE，优化解码内核，并自动挂载配套的 Markov DSpark 草稿器。Qwen3.5/3.8 可配合投影器读取图片。Hub 自动发现配套文件，也可通过 **Draft with it** 选择草稿器。引擎根据可用显存弹性加载草稿器，滑窗 DFlash2 使用环形 KV 缓存。Windows 候选版单文件不含 PTX，实测 57.14 MB，小于 v0.2.0 的 58.96 MB。
 - **`v0.2.0`** — **FLYX 首次开源发布**：提供约 59 MB 零依赖 Windows 单文件 `.exe` 与 Linux 压缩包，开箱支持 GGUF / NVFP4 原生全上下文推理与显存/内存自动延展、内置精确投机解码（MTP / DFlash2）、7 语言 Web 控制台，以及一键接入 Claude Code / Codex CLI。
 
 ## 实测性能

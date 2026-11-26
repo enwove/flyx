@@ -50,7 +50,7 @@
 
 ## Updates
 
-- **v0.2.1** — Inkling-2-Mini adds sparse MoE inference, optimized decode kernels and automatic pairing with its Markov DSpark drafter. Qwen3.5/3.8 accepts images with a matching projector. The Hub discovers companions, and **Draft with it** attaches a selected drafter. Elastic loading adapts the drafter to available VRAM. Sliding-window DFlash2 uses a ring KV cache. The zero-PTX Windows candidate is 57.15 MB, down from 58.96 MB in v0.2.0.
+- **v0.2.1** — Inkling-2-Mini adds sparse MoE inference, optimized decode kernels and automatic pairing with its Markov DSpark drafter. Qwen3.5/3.8 accepts images with a matching projector. The Hub discovers companions, and **Draft with it** attaches a selected drafter. Elastic loading adapts the drafter to available VRAM. Sliding-window DFlash2 uses a ring KV cache. The zero-PTX Windows candidate is 57.14 MB, down from 58.96 MB in v0.2.0.
 - **`v0.2.0`** — **Initial open-source release of FLYX**: standalone ~59 MB zero-dependency Windows `.exe` & Linux tarball, native full-context GGUF & NVFP4 inference with automatic GPU/RAM K/V extension, built-in speculative decoding (MTP / DFlash2), 7-language web dashboard, and one-click Claude Code / Codex CLI integration.
 
 ## Performance

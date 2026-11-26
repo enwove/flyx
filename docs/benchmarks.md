@@ -6,7 +6,7 @@ Reproducible long-context coding, `flyx bench` decode, drafter, and Needle-in-a-
 
 ## v0.2.1 four-GPU verified benchmarks
 
-Linux captures used CUDA 13.0.88 on Ubuntu 24.04 with PTX JIT disabled. The hardware table below describes the original `5fa1a32` runs. The RTX 4090 and 3090 Inkling decode results come from a second capture on `078022fc`. Windows measurements used native Windows 11 (WDDM), with Inkling and the dashboard on `5fa1a32`, and Qwen, the 20K ring and cold start on `42e3734` before the Inkling decode changes. The Windows candidate passed 170/170 GPU-suite tests. Its standalone executable contained 115 cubins and zero PTX images and weighed 57,148,928 bytes (57.15 MB), compared with 58,960,384 bytes in v0.2.0. These captures predate the version bump.
+Linux captures used CUDA 13.0.88 on Ubuntu 24.04 with PTX JIT disabled. The hardware table below describes the original `5fa1a32` runs. The RTX 4090 and 3090 Inkling decode results come from a second capture on `078022fc`. Windows measurements used native Windows 11 (WDDM), with Inkling and the dashboard on `5fa1a32`, and Qwen, the 20K ring and cold start on `42e3734` before the Inkling decode changes. The Windows candidate passed 170/170 GPU-suite tests. Its standalone executable contained 115 cubins and zero PTX images and weighed 57,144,832 bytes (57.14 MB), compared with 58,960,384 bytes in v0.2.0. These captures predate the version bump.
 
 | GPU | Driver | Power limit | Qwen3.8-27B GGUF | GPU weight GB | Effective / rated GB/s | Share |
 |---|---|---:|---|---:|---:|---:|
