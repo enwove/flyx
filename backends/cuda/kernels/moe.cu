@@ -367,22 +367,29 @@ __global__ void __launch_bounds__(32 * NW)
 
   // Decode one fp4x8 word (4 bf16x2 regs) at a time and feed two mma_bf16 steps immediately:
   // keeps exact K-accumulation order (0.00e+00 vs R=1/R=256/serial) while slashing registers from ~89 to ~56.
-  auto mma_half = [&](const uint8_t* const* qp, const uint8_t* const* sp, int k, const uint32_t* av, const uint32_t* bv,
-                      float (*acc)[4]) {
+  // A span's weights and scales, loaded one span ahead of their products (the next span's loads are in flight while
+  // this span's mma run: twice the bytes in flight a warp, the same products in the same order).
+  struct Wspan {
     uint32_t wq[NT][WORDS];
     uint32_t sc[NT];
+  };
+  auto load_w = [&](const uint8_t* const* qp, const uint8_t* const* sp, int k, Wspan& w) {
 #pragma unroll
     for (int i = 0; i < NT; ++i) {
       if constexpr (SPAN == 128) {
         const uint4 v = wv0[i] ? ldg_stream(qp[i] + (k >> 1)) : make_uint4(0, 0, 0, 0);
-        wq[i][0] = v.x, wq[i][1] = v.y, wq[i][2] = v.z, wq[i][3] = v.w;
-        sc[i] = wv0[i] ? *reinterpret_cast<const uint16_t*>(sp[i] + (k >> 4)) : 0u;
+        w.wq[i][0] = v.x, w.wq[i][1] = v.y, w.wq[i][2] = v.z, w.wq[i][3] = v.w;
+        w.sc[i] = wv0[i] ? *reinterpret_cast<const uint16_t*>(sp[i] + (k >> 4)) : 0u;
       } else {
         const uint2 v = wv0[i] ? ldg_stream2(qp[i] + (k >> 1)) : make_uint2(0, 0);
-        wq[i][0] = v.x, wq[i][1] = v.y;
-        sc[i] = wv0[i] ? sp[i][k >> 4] : 0u;
+        w.wq[i][0] = v.x, w.wq[i][1] = v.y;
+        w.sc[i] = wv0[i] ? sp[i][k >> 4] : 0u;
       }
     }
+  };
+  auto mma_half = [&](const Wspan& w, const uint32_t* av, const uint32_t* bv, float (*acc)[4]) {
+    const auto& wq = w.wq;
+    const auto& sc = w.sc;
 #pragma unroll
     for (int i = 0; i < NT; ++i) {
 #pragma unroll
@@ -409,6 +416,15 @@ __global__ void __launch_bounds__(32 * NW)
   };
 
   const bool ra = g < nb, rb = !DIRECT_R1 && ((g + 8) < nb);
+  const bool works = n_base < N_work;
+  // One row (DIRECT_R1) loads a span ahead; more rows keep a span's loads beside its products (ahead measured 1-2%
+  // slower on 3-7 row rounds there: the registers, where the rows already keep a warp's loads busy).
+  constexpr bool kAhead = DIRECT_R1;
+  Wspan w0, w1;  // w1 unused (and dead) unless FUSE_ACT
+  if (kAhead && works) {
+    load_w(qp0, sp0, 0, w0);
+    if constexpr (FUSE_ACT) load_w(qp1, sp1, 0, w1);
+  }
   stage(0, 0);
   for (int s_idx = 0; s_idx < spans; ++s_idx) {
     if (bf16_a) cp_async_wait<0>();
@@ -428,9 +444,23 @@ __global__ void __launch_bounds__(32 * NW)
           bv[4 * q] = vb.x, bv[4 * q + 1] = vb.y, bv[4 * q + 2] = vb.z, bv[4 * q + 3] = vb.w;
         }
       }
-      const int k = s_idx * SPAN;
-      mma_half(qp0, sp0, k, av, bv, acc0);
-      if constexpr (FUSE_ACT) mma_half(qp1, sp1, k, av, bv, acc1);
+      Wspan n0, n1;
+      const bool more = kAhead && s_idx + 1 < spans;
+      if (!kAhead) {
+        load_w(qp0, sp0, s_idx * SPAN, w0);
+        if constexpr (FUSE_ACT) load_w(qp1, sp1, s_idx * SPAN, w1);
+      }
+      if (more) {
+        const int kn = (s_idx + 1) * SPAN;
+        load_w(qp0, sp0, kn, n0);
+        if constexpr (FUSE_ACT) load_w(qp1, sp1, kn, n1);
+      }
+      mma_half(w0, av, bv, acc0);
+      if constexpr (FUSE_ACT) mma_half(w1, av, bv, acc1);
+      if (more) {
+        w0 = n0;
+        if constexpr (FUSE_ACT) w1 = n1;
+      }
     }
   }
 
