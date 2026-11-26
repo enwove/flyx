@@ -654,6 +654,19 @@ void finalize_contents(json&& meta, const RawTokenizer& raw_tok, uint32_t versio
   result->header["gguf"] = std::move(meta);
 }
 
+// What a file opened on its own is (general.type; "model" where it says nothing), refused where it cannot be that:
+// a model, and beside one (a companion: need_tokenizer false) a multimodal projector too; a DFlash2 drafter is never
+// a model.  The same for a single file and a split one (its first shard's word; the other shards may only agree).
+std::string file_type(const json& meta, bool need_tokenizer) {
+  if (need_tokenizer && meta.value("general.architecture", "") == "dflash")
+    invalid("GGUF holds a drafter alone, not a model: give it beside the model (--drafter-file)");
+  const std::string type = meta.value("general.type", "model");
+  if (type != "model" && (need_tokenizer || type != "mmproj"))
+    invalid(type == "mmproj" ? "GGUF is a multimodal projector (pass beside a model with --mmproj)"
+                             : "GGUF is not a complete model");
+  return type;
+}
+
 }  // namespace
 
 bool is_gguf(const uint8_t* data, size_t size) { return size >= 4 && std::memcmp(data, "GGUF", 4) == 0; }
@@ -662,10 +675,7 @@ bool read_gguf(const uint8_t* data, size_t size, const std::string& path, ModelF
                std::string* err, bool need_tokenizer) {
   try {
     ShardHeader h = parse_shard_header(data, size, false, need_tokenizer);
-    const std::string gtype = h.meta.value("general.type", "model");
-    if (gtype != "model" && (need_tokenizer || gtype != "mmproj"))
-      invalid(gtype == "mmproj" ? "GGUF is a multimodal projector (pass beside a model with --mmproj)"
-                                : "GGUF is not a complete model");
+    file_type(h.meta, need_tokenizer);
     if (h.meta.contains("split.count") && integer(h.meta.at("split.count"), "split.count", 0, INT_MAX) > 1)
       invalid("split GGUF requires opening its files from disk");
     ModelFile::Contents result;
@@ -690,12 +700,7 @@ bool read_gguf(std::vector<std::unique_ptr<os::MappedFile>>* maps, const std::st
         initial.meta.contains("split.count") ? int(integer(initial.meta.at("split.count"), "split.count", 0, 99999)) : 1;
     if (split_count <= 1) {
       if (initial.n_tensors == 0) invalid("invalid GGUF tensor/metadata counts");
-      if (need_tokenizer && initial.meta.value("general.architecture", "") == "dflash")
-        invalid("GGUF holds a drafter alone, not a model: give it beside the model (--drafter-file)");
-      const std::string gtype = initial.meta.value("general.type", "model");
-      if (gtype != "model" && (need_tokenizer || gtype != "mmproj"))
-        invalid(gtype == "mmproj" ? "GGUF is a multimodal projector (pass beside a model with --mmproj)"
-                                  : "GGUF is not a complete model");
+      file_type(initial.meta, need_tokenizer);
       ModelFile::Contents result;
       bool quantized = false;
       append_shard_tensors((*maps)[0]->data(), (*maps)[0]->size(), initial, &result, &quantized);
@@ -731,7 +736,7 @@ bool read_gguf(std::vector<std::unique_ptr<os::MappedFile>>* maps, const std::st
 
     ShardHeader h0 = initial_no == 0 ? std::move(initial)
                                      : parse_shard_header(shards[0]->data(), shards[0]->size(), true, need_tokenizer);
-    if (h0.meta.value("general.type", "model") != "model") invalid("GGUF is not a complete model");
+    const std::string type = file_type(h0.meta, need_tokenizer);
     if (!h0.meta.contains("split.count") || int(integer(h0.meta.at("split.count"), "split.count", 0, 99999)) != split_count)
       invalid("shard 1 split.count does not match");
     if (h0.meta.contains("split.no") && integer(h0.meta.at("split.no"), "split.no", 0, split_count - 1) != 0)
@@ -747,8 +752,9 @@ bool read_gguf(std::vector<std::unique_ptr<os::MappedFile>>* maps, const std::st
       ShardHeader hi =
           i == initial_no ? std::move(initial)
                           : parse_shard_header(shards[size_t(i)]->data(), shards[size_t(i)]->size(), true, false);
-      if (hi.meta.contains("general.type") && hi.meta.value("general.type", "model") != "model")
-        invalid("shard " + std::to_string(i + 1) + " is not a model shard");
+      if (hi.meta.contains("general.type") && hi.meta.value("general.type", "model") != type)
+        invalid("shard " + std::to_string(i + 1) + " general.type " + hi.meta.value("general.type", "model") +
+                " does not match shard 1's " + type);
       if (!hi.meta.contains("split.count") ||
           int(integer(hi.meta.at("split.count"), "split.count", 0, 99999)) != split_count)
         invalid("shard " + std::to_string(i + 1) + " split.count does not match");
