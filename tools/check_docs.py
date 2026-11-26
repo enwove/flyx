@@ -8,12 +8,13 @@ Checks:
 * llms.txt indexes every markdown document under docs/ plus core root docs.
 * No internal/dev residue in public docs (vast.ai, ninfer, docs/perf/, docs/decisions/,
   decision 00xx, personal paths, CJK text, stray .patch/.txt files under docs/).
-* Every engine/server CLI flag (apps/common/engine_flags.cpp, apps/flyx-server/main.cpp) and
-  CUDA backend option (backends/cuda/backend.cpp) is documented in docs/server.md.
+* docs/server.md covers engine/server CLI flags, runtime environment variables and CUDA backend options.
+* First-party runtime sources route FLYX_* reads through the registry, except for legacy CUDA overrides.
 """
 from __future__ import annotations
 
 import os
+from pathlib import Path
 import re
 import sys
 
@@ -86,6 +87,38 @@ def _extract_links(text: str) -> list[str]:
     for srcset in re.findall(r'srcset="([^"]+)"', stripped):
         links += [c.split()[0] for c in srcset.split(",") if c.strip()]
     return links
+
+
+# Temporary exceptions for first-use CUDA overrides pending migration to backend options.
+_LEGACY_CUDA_ENV = {
+    "backends/cuda/kernels/inkling2.cu": {"FLYX_SC_CLUSTER"},
+    "backends/cuda/kernels/moe.cu": {"FLYX_MOE_VEC", "FLYX_GUESS_K"},
+    "backends/cuda/regions/layers.cpp": {
+        "FLYX_WARM", "FLYX_EXPERT_PREFETCH", "FLYX_SIDE_LOOP_MSG", "FLYX_GUESS",
+        "FLYX_SIDE_COMPANION", "FLYX_SIDE_KV",
+    },
+}
+
+
+def _check_raw_env(root: Path, bad: list[str]) -> None:
+    # getenv takes the name first, _dupenv_s takes it after the output buffer and length.
+    read = re.compile(r'\b(?:getenv\s*\(|_dupenv_s\s*\([^,;]*,[^,;]*,)\s*"(FLYX_[A-Za-z0-9_]+)"')
+    for layer in ("core", "models", "backends", "apps"):
+        for path in (root / layer).rglob("*"):
+            if path.suffix not in {".c", ".h", ".cc", ".cpp", ".cxx", ".hpp", ".hh", ".cu", ".cuh", ".inc", ".inl"}:
+                continue
+            rel = path.relative_to(root).as_posix()
+            if rel == "core/os/env.h":
+                continue
+            src = path.read_text(encoding="utf-8")
+            allowed = _LEGACY_CUDA_ENV.get(rel, set()).copy()
+            for match in read.finditer(src):
+                name = match[1]
+                if name in allowed:
+                    allowed.remove(name)
+                else:
+                    line = src.count("\n", 0, match.start()) + 1
+                    bad.append(f"{rel}:{line}: raw read of {name}; register and resolve it through core/os/env.h")
 
 
 def main(root: str) -> int:
@@ -177,9 +210,12 @@ def main(root: str) -> int:
     env_vars = set(re.findall(r'"((?:FLYX|HF)_[A-Z0-9_]+)"', env_src))
     if not env_vars:
         bad.append("core/os/env.h: failed to extract any FLYX_*/HF_* environment variables")
-    for var in sorted(env_vars):
-        if f"`{var}`" not in server_doc:
-            bad.append(f"docs/server.md: missing env var `{var}` from core/os/env.h")
+    _check_raw_env(Path(root), bad)
+    env_vars.update(set().union(*_LEGACY_CUDA_ENV.values()))
+    first_cells = re.findall(r"^\|\s*([^|\n]+)\|", server_doc, re.M)
+    documented = {var for cell in first_cells for var in re.findall(r"`((?:FLYX|HF)_[A-Z0-9_]+)`", cell)}
+    for var in sorted(env_vars - documented):
+        bad.append(f"docs/server.md: missing environment variable row for `{var}`")
 
     cuda_src = _read(os.path.join(root, "backends/cuda/backend.cpp"))
     m_specs = re.search(r"const std::vector<OptionSpec>& option_specs\(\)(.*?)return specs;", cuda_src, re.S)

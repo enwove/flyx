@@ -23,6 +23,7 @@
 
 #include "core/hub/hub.h"
 #include "core/hub/sha256.h"
+#include "core/os/env.h"
 #include "core/os/os.h"
 #include "core/os/path.h"
 #include "httplib/httplib.h"
@@ -138,6 +139,63 @@ void names() {
         "parse_name strips configured custom mirror host without scheme");
   check(flyx::hub::set_endpoint("", &ep_err) && flyx::hub::endpoint_source() != "setting",
         "set_endpoint(\"\") clears custom override");
+}
+
+void hub_settings() {
+  using namespace flyx::hub;
+  auto check_endpoint = [](const std::string& url, const std::string& source) {
+    const auto setting = resolve_endpoint();
+    check(setting.value == url && setting.source == source, "endpoint from " + source + ": " + url);
+  };
+  set_env("HF_ENDPOINT", "");
+  check_endpoint(kDefaultEndpoint, "default");
+  set_env("HF_ENDPOINT", "///");
+  check_endpoint(kDefaultEndpoint, "default");
+  set_env("HF_ENDPOINT", "https://env.test/hub///");
+  check_endpoint("https://env.test/hub", "HF_ENDPOINT");
+  check(set_endpoint("mirror.test/"), "set runtime mirror over HF_ENDPOINT");
+  check_endpoint("https://mirror.test", "setting");
+  const auto before_reset = resolve_endpoint();
+  check(set_endpoint("  "), "blank runtime mirror resets to HF_ENDPOINT");
+  check_endpoint("https://env.test/hub", "HF_ENDPOINT");
+  check(before_reset.value == "https://mirror.test" && before_reset.source == "setting",
+        "a snapshot retains its value and source after reset");
+
+  std::atomic<bool> started{false}, stop{false};
+  std::thread writer([&] {
+    do {
+      set_endpoint("mirror.test");
+      started = true;
+      set_endpoint("");
+    } while (!stop);
+  });
+  while (!started) std::this_thread::yield();
+  bool consistent = true;
+  for (int i = 0; i < 2000; ++i) {
+    const auto setting = resolve_endpoint();
+    consistent &= (setting.source == "setting" && setting.value == "https://mirror.test") ||
+                  (setting.source == "HF_ENDPOINT" && setting.value == "https://env.test/hub");
+  }
+  stop = true;
+  writer.join();
+  check(consistent, "concurrent overrides and resets always report a matching endpoint and source");
+  set_env("HF_ENDPOINT", "");
+
+  auto check_cache = [](const std::string& dir, const std::string& source) {
+    const auto cache = resolve_cache_dir();
+    check(cache.value == from_path(to_path(dir).make_preferred()) && cache.source == source,
+          "cache directory from " + source + ": " + dir);
+  };
+  set_env("HF_HUB_CACHE", "cache/direct");
+  set_env("HF_HOME", "cache/hf");
+  set_env("XDG_CACHE_HOME", "cache/xdg");
+  check_cache("cache/direct", "HF_HUB_CACHE");
+  set_env("HF_HUB_CACHE", "");
+  check_cache("cache/hf/hub", "HF_HOME");
+  set_env("HF_HOME", "");
+  check_cache("cache/xdg/huggingface/hub", "XDG_CACHE_HOME");
+  set_env("XDG_CACHE_HOME", "");
+  check_cache(flyx::os::home_dir() + "/.cache/huggingface/hub", "default");
 }
 
 flyx::hub::RepoFile file(const std::string& path, uint64_t size, const std::string& sha256 = "ab") {
@@ -729,6 +787,7 @@ int main(int argc, char** argv) {
   }
   hashes();
   names();
+  hub_settings();
   choices();
   const TestDirectory tmp;
   cache_snapshots(tmp.path / "snapshots");

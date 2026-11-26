@@ -20,6 +20,14 @@ using os::to_path;
 
 namespace {
 
+ResolvedSetting resolve_hf_home() {
+  const std::string home = os::getenv_str(env::kHfHome);
+  if (!home.empty()) return {home, env::kHfHome};
+  const std::string xdg = os::getenv_str(env::kXdgCacheHome);
+  if (!xdg.empty()) return {xdg + "/huggingface", env::kXdgCacheHome};
+  return {os::home_dir() + "/.cache/huggingface", "default"};
+}
+
 std::string token() {
   std::string t = os::getenv_str(env::kHfToken);
   if (t.empty()) {
@@ -86,12 +94,7 @@ bool same_contents(const fs::path& a, const fs::path& b, uint64_t size) {
 
 namespace detail {
 
-std::string hf_home() {
-  const std::string h = os::getenv_str(env::kHfHome);
-  if (!h.empty()) return h;
-  const std::string xdg = os::getenv_str(env::kXdgCacheHome);
-  return (xdg.empty() ? os::home_dir() + "/.cache" : xdg) + "/huggingface";
-}
+std::string hf_home() { return resolve_hf_home().value; }
 
 std::vector<std::string> auth_headers() {
   const std::string t = token();
@@ -159,21 +162,20 @@ bool place(const fs::path& blob, const fs::path& dst, std::string* err) {
 
 }  // namespace detail
 
-std::string cache_dir() {
-  std::string c = os::getenv_str(env::kHfHubCache);
-  if (c.empty()) c = detail::hf_home() + "/hub";
+ResolvedSetting resolve_cache_dir() {
+  ResolvedSetting cache{os::getenv_str(env::kHfHubCache), env::kHfHubCache};
+  if (cache.value.empty()) {
+    cache = resolve_hf_home();
+    cache.value += "/hub";
+  }
 #if defined(_WIN32)
-  std::replace(c.begin(), c.end(), '/', '\\');  // as Windows shows paths (huggingface_hub's too)
+  std::replace(cache.value.begin(), cache.value.end(), '/', '\\');  // as Windows shows paths (huggingface_hub's too)
 #endif
-  return c;
+  return cache;
 }
 
-std::string cache_source() {
-  if (!os::getenv_str(env::kHfHubCache).empty()) return env::kHfHubCache;
-  if (!os::getenv_str(env::kHfHome).empty()) return env::kHfHome;
-  if (!os::getenv_str(env::kXdgCacheHome).empty()) return env::kXdgCacheHome;
-  return "default";
-}
+std::string cache_dir() { return resolve_cache_dir().value; }
+std::string cache_source() { return resolve_cache_dir().source; }
 
 namespace {
 
@@ -249,24 +251,17 @@ bool set_endpoint(const std::string& url, std::string* err) {
   return true;
 }
 
-std::string endpoint() {
-  {
-    std::lock_guard<std::mutex> lock(endpoint_mutex());
-    if (!endpoint_override().empty()) return endpoint_override();
-  }
-  std::string e = os::getenv_str(env::kHfEndpoint, "https://huggingface.co");
+ResolvedSetting resolve_endpoint() {
+  std::lock_guard<std::mutex> lock(endpoint_mutex());
+  if (!endpoint_override().empty()) return {endpoint_override(), "setting"};
+  std::string e = os::getenv_str(env::kHfEndpoint);
   while (!e.empty() && e.back() == '/') e.pop_back();
-  return e.empty() ? "https://huggingface.co" : e;
+  if (e.empty()) return {kDefaultEndpoint, "default"};
+  return {std::move(e), env::kHfEndpoint};
 }
 
-std::string endpoint_source() {
-  {
-    std::lock_guard<std::mutex> lock(endpoint_mutex());
-    if (!endpoint_override().empty()) return "setting";
-  }
-  if (!os::getenv_str(env::kHfEndpoint).empty()) return env::kHfEndpoint;
-  return "default";
-}
+std::string endpoint() { return resolve_endpoint().value; }
+std::string endpoint_source() { return resolve_endpoint().source; }
 
 bool offline() { return os::env_bool(env::kHfHubOffline).value_or(false); }
 
