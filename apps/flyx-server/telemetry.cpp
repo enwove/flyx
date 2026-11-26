@@ -102,6 +102,7 @@ ojson snapshot_json(const Server& s, int recent) {
                                 {"wanted", m.wanted_ctx},
                                 {"short", m.ctx_short},
                                 {"left", gpu ? m.sessions_room : m.host_budget},
+                                {"need_more", m.ctx_need_more > 0 ? ojson(m.ctx_need_more) : ojson(nullptr)},
                                 {"gpu_tokens", m.kv_gpu_tokens},
                                 {"others", gpu ? ojson(m.held.others) : ojson(nullptr)},
                                 {"closable", gpu && plan::closable(m.held)},

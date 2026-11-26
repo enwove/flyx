@@ -710,6 +710,8 @@ export default {
     [/^Not enough free RAM \(([\d.]+) GB available for KV\)\. Free RAM or raise "KV in host RAM" for a longer context\.$/, "Nicht genug freier RAM ($1 GB für KV verfügbar). RAM freigeben oder „KV im Host-RAM“ erhöhen verlängert den Kontext."],
     [/^Not enough VRAM left \(([\d.]+) GB used by other apps\)\. Close other apps and reload for a longer context\.$/, "Nicht genug VRAM frei ($1 GB durch andere Programme belegt). Andere Programme schließen und neu laden verlängert den Kontext."],
     [/^Not enough VRAM left\. Disable speculative decoding or use a smaller quantization for a longer context\.$/, "Nicht genug VRAM frei. Spekulatives Dekodieren deaktivieren oder eine kleinere Quantisierung wählen verlängert den Kontext."],
+    [/^Needs ([\d.]+) GB more VRAM for max context\.$/, "Für den maximalen Kontext werden noch $1 GB mehr VRAM benötigt."],
+    [/^Needs ([\d.]+) GB more RAM for max context\.$/, "Für den maximalen Kontext werden noch $1 GB mehr RAM benötigt."],
     [/^If the new one fails to load, no model is served until another is loaded\.$/, "Schlägt das Laden des neuen Modells fehl, ist kein Modell aktiv, bis ein anderes geladen wird."],
     [/^The files are fetched first, while (.+) keeps answering\.$/, "Die Dateien werden zuerst heruntergeladen, während $1 weiter antwortet."],
     [/^(\d+) requests? (?:is|are) running or waiting: (?:it is|they are) stopped\.$/, "$1 laufende oder wartende Anfrage(n) werden abgebrochen."],

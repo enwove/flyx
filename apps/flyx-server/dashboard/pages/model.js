@@ -168,7 +168,7 @@ function Serving({ tm, again, retry, browse }) {
       <div class="prog" id="ld-sub">${sub}</div>
       <div class="banner bad" id="ld-err" hidden=${!L.error && !msg}>${L.error ? tErr(L.error) : t(msg)}</div>
       <${VramApps} open=${showMemPanel} kind=${panelKind} id="ld-vram-apps"
-                   needBytes=${vramErr ? parseVramNeeded(L.error) : 0}
+                   needBytes=${vramErr ? parseVramNeeded(L.error) : (ctxLimit && ctxLimit.need_more > 0 && panelKind === (ctxLimit.by === "host" ? "ram" : "vram") ? ctxLimit.need_more : 0)}
                    onRetry=${vramErr ? retry : (model.id && loadedWant ? reloadServed : null)}
                    retryLabel=${vramErr ? "Retry loading" : "Reload model"}
                    onClose=${!vramErr ? () => setVramOpen(false) : null}/>

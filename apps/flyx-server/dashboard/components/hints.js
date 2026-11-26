@@ -63,9 +63,15 @@ const RULES = [
     const l = c.served && c.model.context_limit;
     if (!l || !l.short) return null;
     const gb = (b) => (b / 1e9).toFixed(1) + " GB";
+    const gb2 = (b) => (b / 1e9).toFixed(2);
     const fix = l.by === "host" ? "Free system memory or raise the host KV cache limit, then reload the model."
       : l.closable ? "Other processes are using " + gb(l.others) + " of GPU memory. Close them and reload the model."
       : "Disable speculative decoding or use a smaller quantization to free GPU memory.";
+    const need = l.need_more > 0
+      ? (l.by === "host"
+          ? "Needs " + gb2(l.need_more) + " GB more RAM for max context."
+          : "Needs " + gb2(l.need_more) + " GB more VRAM for max context.")
+      : "";
     const acts = l.by === "host"
       ? [{ label: "Manage RAM", primary: true, run: (n) => n.openMem && n.openMem("ram") },
          { label: "View details", run: (n) => n.showModel() }]
@@ -75,7 +81,8 @@ const RULES = [
         : [{ label: "View details", primary: true, run: (n) => n.showModel() }];
     return { key: "short:" + c.model.id + ":" + c.model.context, tone: "warn", hideOn: ["model"],
       title: "Context limited to " + fmt(c.model.context) + " tokens (model supports " + fmt(l.wanted) + ")",
-      text: ["Coding agents may run out of context in long sessions.", fix],
+      text: need ? ["Coding agents may run out of context in long sessions.", fix, need]
+                 : ["Coding agents may run out of context in long sessions.", fix],
       actions: acts };
   }],
   // Model loaded with automatic VRAM-saving adjustments (e.g. drafter quantized to NVFP4 or skipped, vision offloaded).

@@ -231,13 +231,12 @@ struct TierPlacer {
   const flyx_backend_api* api;
   flyx_bmodel* bm;
   const KvTiers& tiers;
-  const ResourceLedger* ledger;
+  uint64_t room;
   Budget* out;
 
   // *by, where given: which memory did not hold it, when it is not placed.
   bool place(int ctx, flyx_seq_layout* l, flyx_seq_size* s, std::string* note, bool exact_ok = true,
              CtxLimit* by = nullptr) const {
-    const uint64_t room = ledger->budget() ? ledger->available() : UINT64_MAX;
     std::string e;
     if (by) *by = CtxLimit::kNone;
     bool placed = tiered(api, bm, ctx, tiers, room, l, s, &e);
@@ -280,6 +279,47 @@ struct TierPlacer {
     out->auto_exact = auto_exact;
     out->copy_note = copy_note;
     return by;
+  }
+
+  // Extra bytes on one side that would place wanted_ctx under --ctx max, or zero if no candidate does.
+  uint64_t need_more_for(int wanted_ctx, CtxLimit by, bool exact_ok) const {
+    if (by == CtxLimit::kNone || wanted_ctx <= 0) return 0;
+    if (by == CtxLimit::kGpu && room == UINT64_MAX) return 0;
+    auto shortfall = [&](const KvTiers& t) -> uint64_t {
+      uint64_t device = room;
+      flyx_seq_layout l{};
+      flyx_seq_size s{};
+      std::string why;
+      if (by == CtxLimit::kGpu) {
+        int copy_host = t.method == FLYX_KV_READ_ALL ? 0 : INT32_MAX;
+        if (copy_host && t.copy_gpu >= 0) {
+          flyx_seq_size all{};
+          const flyx_seq_layout la{wanted_ctx, 0, t.method, t.method_arg, INT32_MAX};
+          if (api->seq_size(bm, &la, &all) != 0) return 0;
+          copy_host = std::max(0, all.copies - t.copy_gpu);
+        }
+        l = {wanted_ctx, 0, t.method, t.method_arg, copy_host};
+        if (api->seq_size(bm, &l, &s) != 0 || s.host > out->host_budget || s.device <= room) return 0;
+        device = s.device;
+      }
+      if (!tiered(api, bm, wanted_ctx, t, device, &l, &s, &why)) return 0;
+      if (by == CtxLimit::kGpu) return s.host <= out->host_budget ? device - room : 0;
+      return s.host > out->host_budget ? s.host - out->host_budget : 0;
+    };
+    const uint64_t need = shortfall(tiers);
+    if (!exact_ok || tiers.method != FLYX_KV_AUTO) return need;
+    const uint64_t exact = shortfall(exact_of(tiers));
+    if (!exact || (need && need <= exact)) return need;
+
+    // More memory can enable a shorter Strata context, which --ctx max prefers to exact at wanted_ctx.
+    Budget probe;
+    probe.host_budget = out->host_budget + (by == CtxLimit::kHost ? exact : 0);
+    const TierPlacer replay{api, bm, tiers, room + (by == CtxLimit::kGpu ? exact : 0), &probe};
+    flyx_seq_layout l{};
+    flyx_seq_size s{};
+    std::string why;
+    if (!replay.place(wanted_ctx, &l, &s, &why, false) && replay.longest_placed(wanted_ctx, &l, &s, false)) return need;
+    return exact;
   }
 
   // The longest context below max_ctx, a multiple of 1024, that the GPU and host memory hold together (0: none): a
@@ -338,7 +378,7 @@ uint64_t least_session(const TierPlacer& placer, bool in_host) {
 std::string format_oom_error(const TierPlacer& placer, const flyx_memory_info& mi, uint64_t reserve, int max_ctx,
                              bool has_drafter, bool mostly_bf16, bool tiers_on) {
   const GpuHeld& held = placer.out->held;
-  const uint64_t left = placer.ledger->available();
+  const uint64_t left = placer.room;
   int fit_ctx = 0;
   if (tiers_on) {  // the longest the GPU and host memory hold together
     flyx_seq_layout l{};
@@ -383,11 +423,13 @@ bool closable(const GpuHeld& h) { return h.others >= (h.runtime_known ? 256ull <
 std::string ctx_limit_note(const Budget& b) {
   if (b.ctx_limit == CtxLimit::kHost)
     return "a longer context does not fit host memory: " + gb(b.host_budget) +
-           " of it can be spared for K/V (--kv-ram GB gives more)";
+           " of it can be spared for K/V (--kv-ram GB gives more)" +
+           (b.ctx_need_more ? " (" + gb(b.ctx_need_more) + " more RAM needed for max context)" : "");
   if (b.ctx_limit != CtxLimit::kGpu) return "";
   const std::string others = held_note(b.held);
   return "a longer context does not fit the GPU: the sessions have " + gb(b.sessions_room) +
          " of it after the weights" + (others.empty() ? "" : "; " + others) +
+         (b.ctx_need_more ? "; " + gb(b.ctx_need_more) + " more VRAM needed for max context" : "") +
          (closable(b.held) ? " (closing other programs gives a longer context)" : "");
 }
 
@@ -404,10 +446,10 @@ bool account(const flyx_backend_api* api, flyx_bmodel* bm, bool has_drafter, boo
   if (!device_bytes(api, bm, max_ctx, tiers, &sb, err, &out->oom)) return false;
   out->session_bytes = sb;
 
-  const TierPlacer placer{api, bm, tiers, ledger, out};
+  const TierPlacer placer{api, bm, tiers, ledger->budget() ? ledger->available() : UINT64_MAX, out};
   const bool tiers_on = tiers.ram != 0 && out->host_budget > 0;
   const bool limited = tiers.gpu >= 0 && tiers.gpu < max_ctx;
-  if (limited || (ledger->budget() && out->session_bytes > ledger->available())) {
+  if (limited || out->session_bytes > placer.room) {
     flyx_seq_layout l{};
     flyx_seq_size s{};
     if (tiers.ram == 0) {
@@ -437,14 +479,19 @@ bool account(const flyx_backend_api* api, flyx_bmodel* bm, bool has_drafter, boo
         out->session_host_bytes = s.host;
         out->session_host_mapped = s.host_mapped;
         out->tier_note.clear();
-        if (ctx < max_ctx) out->ctx_limit = placer.limit_past(ctx, max_ctx, exact_ok);
+        if (ctx < max_ctx) {
+          out->ctx_limit = placer.limit_past(ctx, max_ctx, exact_ok);
+          out->ctx_need_more = placer.need_more_for(max_ctx, out->ctx_limit, exact_ok);
+        }
         return true;
       }
     }
   }
-  if (ledger->budget() && out->session_bytes > ledger->available()) {
-    if (min_ctx > 0 && fit_gpu_only(api, bm, tiers, ledger->available(), max_ctx, min_ctx, fitted_ctx, out)) {
+  if (out->session_bytes > placer.room) {
+    if (min_ctx > 0 && fit_gpu_only(api, bm, tiers, placer.room, max_ctx, min_ctx, fitted_ctx, out)) {
       out->ctx_limit = CtxLimit::kGpu;
+      // With host RAM, reloading the wanted context tries tiered placement before this GPU-only fallback.
+      if (!tiers_on) out->ctx_need_more = sb - placer.room;
       return true;
     }
     out->oom = true;

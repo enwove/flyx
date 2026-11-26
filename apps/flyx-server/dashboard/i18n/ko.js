@@ -710,6 +710,8 @@ export default {
     [/^Not enough free RAM \(([\d.]+) GB available for KV\)\. Free RAM or raise "KV in host RAM" for a longer context\.$/, "사용 가능한 RAM이 부족합니다(KV용 $1 GB 사용 가능). RAM을 확보하거나 '호스트 RAM의 KV'를 늘리면 컨텍스트를 더 늘릴 수 있습니다."],
     [/^Not enough VRAM left \(([\d.]+) GB used by other apps\)\. Close other apps and reload for a longer context\.$/, "남은 VRAM이 부족합니다(다른 앱이 $1 GB 사용 중). 다른 앱을 닫고 다시 로드하면 컨텍스트를 더 늘릴 수 있습니다."],
     [/^Not enough VRAM left\. Disable speculative decoding or use a smaller quantization for a longer context\.$/, "남은 VRAM이 부족합니다. 추측 디코딩을 끄거나 더 작은 양자화를 사용하면 컨텍스트를 더 늘릴 수 있습니다."],
+    [/^Needs ([\d.]+) GB more VRAM for max context\.$/, "최대 컨텍스트를 위해 $1 GB의 VRAM이 더 필요합니다."],
+    [/^Needs ([\d.]+) GB more RAM for max context\.$/, "최대 컨텍스트를 위해 $1 GB의 RAM이 더 필요합니다."],
     [/^If the new one fails to load, no model is served until another is loaded\.$/, "새 모델 로드에 실패하면 다른 모델을 로드할 때까지 서비스되는 모델이 없습니다."],
     [/^The files are fetched first, while (.+) keeps answering\.$/, "파일을 먼저 다운로드하며, 그동안 $1이(가) 계속 응답합니다."],
     [/^(\d+) requests? (?:is|are) running or waiting: (?:it is|they are) stopped\.$/, "실행 중이거나 대기 중인 요청 $1개가 중단됩니다."],

@@ -59,7 +59,7 @@ struct ModelInfo {
   int wanted_ctx = 0;
   int kv_gpu_tokens = 0;          // K/V positions placed on the GPU (0..max_ctx)
   bool ctx_short = false;
-  uint64_t sessions_room = 0, host_budget = 0;
+  uint64_t sessions_room = 0, host_budget = 0, ctx_need_more = 0;
   plan::GpuHeld held;
 };
 

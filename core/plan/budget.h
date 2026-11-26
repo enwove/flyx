@@ -31,6 +31,7 @@ struct Budget {
   uint64_t sessions_room = 0;  // of the budget after the weights and the workspace: what the sessions share
   GpuHeld held;
   CtxLimit ctx_limit = CtxLimit::kNone;
+  uint64_t ctx_need_more = 0;  // extra bytes on ctx_limit's side needed to reach the wanted context (0: unknown/none)
   // Where a session's K/V caches go, the host memory that takes, and how much may be taken.
   flyx_seq_layout layout{0, INT32_MAX, FLYX_KV_READ_ALL, 0, 0};
   uint64_t session_host_bytes = 0, host_budget = 0;

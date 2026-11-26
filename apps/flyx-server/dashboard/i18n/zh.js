@@ -444,6 +444,8 @@ export default {
     [/^Not enough free RAM \(([\d.]+) GB available for KV\)\. Free RAM or raise "KV in host RAM" for a longer context\.$/, "可用内存不足（可供 KV 使用 $1 GB），释放系统内存或调大「内存 KV 上限」可延长上下文。"],
     [/^Not enough VRAM left \(([\d.]+) GB used by other apps\)\. Close other apps and reload for a longer context\.$/, "剩余显存不足（其他程序占用 $1 GB），关闭其他程序并重新加载可延长上下文。"],
     [/^Not enough VRAM left\. Disable speculative decoding or use a smaller quantization for a longer context\.$/, "剩余显存不足，关闭投机解码或换用更小量化可延长上下文。"],
+    [/^Needs ([\d.]+) GB more VRAM for max context\.$/, "达到最大上下文还需 $1 GB 显存。"],
+    [/^Needs ([\d.]+) GB more RAM for max context\.$/, "达到最大上下文还需 $1 GB 内存。"],
     [/^If the new one fails to load, no model is served until another is loaded\.$/, "如果新模型加载失败，在加载其他模型之前将没有模型可用。"],
     [/^The files are fetched first, while (.+) keeps answering\.$/, "先下载文件，期间 $1 继续服务。"],
     [/^(\d+) requests? (?:is|are) running or waiting: (?:it is|they are) stopped\.$/, "$1 个正在运行或排队的请求会被中断。"],
