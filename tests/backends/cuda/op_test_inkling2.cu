@@ -1883,7 +1883,9 @@ void test_inkling2_moe() {
         const size_t elems = size_t(rows) * top_k * I;
         moe_gate_up(d_x, H, scaled_gu, d_eidx, rows, top_k, I, H, beta, lb, true, d_act_unfused, I, &msc, TL);
         moe_down(d_act_unfused, I, nvfp4_down, d_eidx, d_ew, rows, top_k, H, I, d_y_direct, H, false, &msc, TL);
-        const Vec staged = down_bf16(msc.bf16_a, elems);
+        // NVFP4 rounds take float32 SiTU outputs (k_moe_nvfp4_vec): the BF16 SiTU is those, rounded once.
+        Vec staged = down(d_act_unfused, elems);
+        round_bf16(staged);
         const Vec y = down(d_y_direct, size_t(rows) * H);
 
         moe_stage_q8(d_x, H, H, rows, msc, moe_q8_mins(scaled_gu), TL.st);
@@ -1894,7 +1896,8 @@ void test_inkling2_moe() {
         const Vec got = down_bf16(packed_act, elems);
         expect_bits("moe BF16 SiTU == float SiTU + NVFP4 stage " + tag, got, staged);
         moe_down(nullptr, I, nvfp4_down, d_eidx, d_ew, rows, top_k, H, I, d_y_direct, H, false, &msc, TL, packed_act);
-        expect_bits("moe NVFP4 down consumes BF16 SiTU " + tag, down(d_y_direct, size_t(rows) * H), y);
+        // The BF16-input down keeps the tensor-core kernel: the float32-input round's result to within its rounding.
+        expect("moe NVFP4 down consumes BF16 SiTU " + tag, down(d_y_direct, size_t(rows) * H), y, 1e-2);
         if (rows == 1) solo = got;
         else expect_bits("moe BF16 SiTU row alone == grouped " + tag, solo, Vec(got.begin(), got.begin() + solo.size()));
 
@@ -1928,7 +1931,13 @@ void test_inkling2_moe() {
     expect("moe_down " + label, got_y_grp_clean, want_out, tol);
     cudaFree(d_want_act);
 
-    // Gate 4: R=1 (sc=nullptr), R=1 (sc=&msc), R=8 grouped (sc=&msc), and R=37 grouped (sc=&msc) MUST BE BIT-IDENTICAL!
+    // Gate 4: a row's bits in every round (R=1 with and without scratch, R=8 grouped) are one; NVFP4 prefill passes
+    // (R=37, tensor cores) are their own and equal them to within the tolerance (GGML blocks: all four bit-identical).
+    const bool round_bits_only = w_gu.q && !w_gu.packed();
+    auto expect_round = [&](const std::string& what, const Vec& got, const Vec& want) {
+      if (round_bits_only) expect(what, got, want, 1e-2);  // prefill's BF16 activations vs the rounds' float32
+      else expect_bits(what, got, want);
+    };
     moe_down(d_act_fused, I, w_dn, d_eidx, d_ew, R, top_k, H, I, d_y_grouped, H, false, &msc, TL);
     Vec got_y_grp = down(d_y_grouped, size_t(R) * H);
     const int rr = 19;
@@ -1940,13 +1949,14 @@ void test_inkling2_moe() {
              nullptr, TL);
     Vec got_y1 = down(d_y_1, size_t(H));
     Vec got_ygrp_rr(got_y_grp.begin() + ptrdiff_t(rr) * H, got_y_grp.begin() + ptrdiff_t(rr + 1) * H);
-    expect_bits("moe R=1 direct == R=37 grouped " + label, got_y1, got_ygrp_rr);
+    expect_round("moe R=1 direct == R=37 grouped " + label, got_y1, got_ygrp_rr);
 
     moe_gate_up(d_x + size_t(rr) * H, H, w_gu, d_eidx + size_t(rr) * top_k, 1, top_k, I, H, beta, lb, true, d_act_1, I,
                 &msc, TL);
     moe_down(d_act_1, I, w_dn, d_eidx + size_t(rr) * top_k, d_ew + size_t(rr) * top_k, 1, top_k, H, I, d_y_1, H, false,
              &msc, TL);
-    expect_bits("moe R=1 staged == R=37 grouped " + label, down(d_y_1, size_t(H)), got_ygrp_rr);
+    const Vec got_y1_staged = down(d_y_1, size_t(H));
+    expect_round("moe R=1 staged == R=37 grouped " + label, got_y1_staged, got_ygrp_rr);
 
     const int r8_0 = 16;  // covers rr = 19 at offset 3
     float* d_act_8 = dev<float>(size_t(16) * top_k * I);  // 16 rows: the grouping checks below
@@ -1956,8 +1966,30 @@ void test_inkling2_moe() {
     moe_down(d_act_8, I, w_dn, d_eidx + size_t(r8_0) * top_k, d_ew + size_t(r8_0) * top_k, 8, top_k, H, I, d_y_8, H,
              false, &msc, TL);
     Vec got_y8 = down(d_y_8, size_t(8) * H);
+    if (round_bits_only) {
+      // NVFP4 round kernels (k_moe_nvfp4_vec, float32 inputs) against float64 without input rounding: rows
+      // 16..23's SiTU outputs and their down products.
+      Vec want8(size_t(8) * top_k * I, 0.0);
+      Vec wanty(size_t(8) * H, 0.0);
+      {
+        for (int r = 0; r < 8; ++r)
+          for (int k = 0; k < top_k; ++k) {
+            const int slot = (r8_0 + r) * top_k + k, e = eidx[size_t(slot)];
+            Vec gu(static_cast<size_t>(2 * I), 0.0), dn(static_cast<size_t>(H), 0.0);
+            ops::linear_expert_f64(x.data() + ptrdiff_t(r8_0 + r) * H, H, gu_f64.data(), e, 2 * I, gu.data());
+            double* a = want8.data() + ptrdiff_t(r * top_k + k) * I;
+            for (int i = 0; i < I; ++i) a[i] = ops::situ(gu[i], gu[I + i], beta, lb);
+            ops::linear_expert_f64(a, I, dn_f64.data(), e, H, dn.data());
+            for (int c = 0; c < H; ++c) wanty[size_t(r) * H + c] += ew[size_t(slot)] * dn[c];
+          }
+      }
+      const Vec act8 = down(d_act_8, size_t(8) * top_k * I);
+      expect("moe_gate_up R=8 round vs float64 " + label, act8, want8, std::max(tol, 1.5e-4));
+      expect("moe_down R=8 round vs float64 " + label, got_y8, wanty, std::max(tol, 1.5e-4));
+    }
     Vec got_y8_rr(got_y8.begin() + ptrdiff_t(rr - r8_0) * H, got_y8.begin() + ptrdiff_t(rr - r8_0 + 1) * H);
-    expect_bits("moe R=8 grouped == R=37 grouped " + label, got_y8_rr, got_ygrp_rr);
+    expect_round("moe R=8 grouped == R=37 grouped " + label, got_y8_rr, got_ygrp_rr);
+    expect_bits("moe R=8 grouped == R=1 staged " + label, got_y8_rr, got_y1_staged);
 
     // The down GEMM takes over the grouping by expert that the gate|up GEMM leaves (moe_gate_up's return) where its
     // tiles are the ones it would make, else groups again: the same bits either way, at row counts where the two

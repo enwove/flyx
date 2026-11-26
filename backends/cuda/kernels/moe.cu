@@ -508,6 +508,129 @@ __global__ void __launch_bounds__(32 * NW)
   }
 }
 
+// ---- NVFP4 expert products a column at a time (rounds: 1..FLYX_MAX_ROWS rows) ----------------
+// A warp takes kVecRows weight rows of one expert (FUSE_ACT: two columns' gate and up rows); lane l takes the
+// 16-value groups l, l + 32, ... of K, each group's sum of fp4 * x in value order times its e4m3 scale into the
+// lane's float32 sum, then the warp's xor tree and the expert's scale.  Every routed (row, expert) pair's sums are
+// these, in this order, whichever other rows the round holds: a column's bits do not depend on the round's width
+// (plain decode == speculative verify).  float32 activations (no bf16 staging); weights read once a block for up
+// to BMAX pairs of the expert.
+constexpr int kVecWarps = 4, kVecRows = 4;
+
+template <bool FUSE_ACT, bool IS_DOWN, int BMAX>
+__global__ void __launch_bounds__(32 * kVecWarps)
+    k_moe_nvfp4_vec(const float* __restrict__ x, int ldx, const uint8_t* __restrict__ Q,
+                    const uint8_t* __restrict__ S, const float* __restrict__ RS, int N_exp, int I_or_H, int K,
+                    const int* __restrict__ eidx, const MoeTask* __restrict__ tasks, const int* __restrict__ n_tasks,
+                    const int* __restrict__ pairs, int top_k, float situ_beta, float situ_linear_beta,
+                    float* __restrict__ out, int ld_out) {
+  pdl_trigger();
+  int e, nb;
+  int pid[BMAX];
+  if constexpr (BMAX == 1) {
+    pid[0] = int(blockIdx.y);
+    e = eidx[pid[0]];
+    nb = 1;
+  } else {
+    if (int(blockIdx.y) >= *n_tasks) return;
+    const MoeTask tk = tasks[blockIdx.y];
+    e = tk.expert;
+    nb = tk.nb;
+#pragma unroll
+    for (int b = 0; b < BMAX; ++b) pid[b] = pairs[tk.p0 + (b < nb ? b : 0)];
+  }
+  constexpr int COLS = FUSE_ACT ? kVecRows / 2 : kVecRows;
+  const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
+  const int N_work = FUSE_ACT ? I_or_H : N_exp;
+  const int c0 = (int(blockIdx.x) * kVecWarps + warp) * COLS;
+  if (c0 >= N_work) return;
+
+  const uint8_t* qr[kVecRows];
+  const uint8_t* sr[kVecRows];
+#pragma unroll
+  for (int i = 0; i < kVecRows; ++i) {
+    const int col = min(c0 + (FUSE_ACT ? i / 2 : i), N_work - 1);
+    const int row = FUSE_ACT && (i & 1) ? col + I_or_H : col;
+    const size_t r0 = size_t(e) * N_exp + row;
+    qr[i] = Q + r0 * size_t(K >> 1);
+    sr[i] = S + r0 * size_t(K >> 4);
+  }
+  const float* xr[BMAX];
+#pragma unroll
+  for (int b = 0; b < BMAX; ++b) xr[b] = x + size_t(IS_DOWN ? pid[b] : pid[b] / top_k) * ldx;
+
+  float acc[BMAX][kVecRows];
+#pragma unroll
+  for (int b = 0; b < BMAX; ++b)
+#pragma unroll
+    for (int i = 0; i < kVecRows; ++i) acc[b][i] = 0.f;
+
+  const int groups = K >> 4;
+#pragma unroll 2
+  for (int s = lane; s < groups; s += 32) {
+    uint2 wq[kVecRows];
+    float sc[kVecRows];
+#pragma unroll
+    for (int i = 0; i < kVecRows; ++i) {
+      wq[i] = ldg_stream2(qr[i] + 8 * size_t(s));
+      sc[i] = __low2float(e4m3_bf16x2(sr[i][s]));
+    }
+#pragma unroll
+    for (int b = 0; b < BMAX; ++b) {
+      if (b >= nb) break;
+      float xv[16];
+      const float4* xp = reinterpret_cast<const float4*>(xr[b] + 16 * size_t(s));
+#pragma unroll
+      for (int q = 0; q < 4; ++q) {
+        const float4 v = __ldg(xp + q);
+        xv[4 * q] = v.x, xv[4 * q + 1] = v.y, xv[4 * q + 2] = v.z, xv[4 * q + 3] = v.w;
+      }
+#pragma unroll
+      for (int i = 0; i < kVecRows; ++i) {
+        uint32_t h[8];
+        fp4x8_to_bf16(wq[i].x, h);
+        fp4x8_to_bf16(wq[i].y, h + 4);
+        float g = 0.f;
+#pragma unroll
+        for (int p = 0; p < 8; ++p) {
+          const float2 f = __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162*>(&h[p]));
+          g = __fmaf_rn(f.x, xv[2 * p], g);
+          g = __fmaf_rn(f.y, xv[2 * p + 1], g);
+        }
+        acc[b][i] = __fmaf_rn(g, sc[i], acc[b][i]);
+      }
+    }
+  }
+
+  const float rs = RS ? RS[e] : 1.f;
+#pragma unroll
+  for (int b = 0; b < BMAX; ++b) {
+    if (b >= nb) break;
+#pragma unroll
+    for (int i = 0; i < kVecRows; ++i) acc[b][i] = warp_tree_sum(acc[b][i]);
+    if (lane != 0) continue;
+    float* orow = out + size_t(pid[b]) * ld_out;
+#pragma unroll
+    for (int c = 0; c < COLS; ++c) {
+      const int col = c0 + c;
+      if (col >= N_work) break;
+      if constexpr (FUSE_ACT)
+        orow[col] = situ_val(acc[b][2 * c] * rs, acc[b][2 * c + 1] * rs, situ_beta, situ_linear_beta);
+      else
+        orow[col] = acc[b][c] * rs;
+    }
+  }
+}
+
+// FLYX_MOE_VEC=0: rounds keep the tensor-core kernel below (its own bits).
+inline bool moe_vec_rounds() {
+  static const bool on = [] {
+    const char* e = std::getenv("FLYX_MOE_VEC");
+    return !e || std::atoi(e) != 0;
+  }();
+  return on;
+}
+
 // No-scratch fallback for NVFP4 moe_down (sc == nullptr): identical mma_bf16 span order + ew FMA order.
 template <int SPAN, int NW, int NT>
 __global__ void __launch_bounds__(32 * NW)
@@ -624,6 +747,33 @@ int launch_nvfp4_gu(const float* x, int ldx, const ExpertMat& W, const int* eidx
     const float* xc = x + size_t(r0) * ldx;
     const int* ec = eidx + size_t(r0) * top_k;
     float* oc = out + size_t(r0) * top_k * ld_out;
+    if (rc <= FLYX_MAX_ROWS && (rc == 1 || has_sc) && ldx % 4 == 0 && moe_vec_rounds()) {
+      const int gx = ceil_div(N_work, kVecWarps * (fuse_act ? kVecRows / 2 : kVecRows));
+      if (rc == 1) {
+        if (fuse_act)
+          k_moe_nvfp4_vec<true, false, 1><<<dim3(gx, top_k), 32 * kVecWarps, 0, st>>>(
+              xc, ldx, W.q, W.s, W.rs, W.N, I, K, ec, nullptr, nullptr, nullptr, top_k, situ_beta, situ_linear_beta,
+              oc, ld_out);
+        else
+          k_moe_nvfp4_vec<false, false, 1><<<dim3(gx, top_k), 32 * kVecWarps, 0, st>>>(
+              xc, ldx, W.q, W.s, W.rs, W.N, I, K, ec, nullptr, nullptr, nullptr, top_k, situ_beta, situ_linear_beta,
+              oc, ld_out);
+      } else {
+        const int M = rc * top_k;
+        const int mt = max_work_tiles(M, W.n_experts, 4);
+        group_tasks(ec, M, W.n_experts, 4, sc, st);
+        grouped = rc == rows ? 4 : 0;
+        if (fuse_act)
+          k_moe_nvfp4_vec<true, false, 4><<<dim3(gx, mt), 32 * kVecWarps, 0, st>>>(
+              xc, ldx, W.q, W.s, W.rs, W.N, I, K, ec, sc->tasks, sc->n_tasks, sc->pairs, top_k, situ_beta,
+              situ_linear_beta, oc, ld_out);
+        else
+          k_moe_nvfp4_vec<false, false, 4><<<dim3(gx, mt), 32 * kVecWarps, 0, st>>>(
+              xc, ldx, W.q, W.s, W.rs, W.N, I, K, ec, sc->tasks, sc->n_tasks, sc->pairs, top_k, situ_beta,
+              situ_linear_beta, oc, ld_out);
+      }
+      continue;
+    }
     const bf16* bf_a = nullptr;
     if (sc && sc->bf16_a && sc->stage_elems >= size_t(rc) * size_t(K)) {
       k_moe_stage_bf16<<<rc, 256, 0, st>>>(xc, ldx, K, sc->bf16_a);
@@ -685,6 +835,23 @@ void launch_nvfp4_down(const float* act, int ld_act, const ExpertMat& W, const i
     const float* ac = act_bf16 ? nullptr : act + size_t(r0) * top_k * ld_act;
     const int* ec = eidx + size_t(r0) * top_k;
     const int M = rc * top_k;
+    if (!act_bf16 && rc <= FLYX_MAX_ROWS && ld_act % 4 == 0 && moe_vec_rounds()) {
+      const int gx = ceil_div(H, kVecWarps * kVecRows);
+      if (rc == 1) {
+        k_moe_nvfp4_vec<false, true, 1><<<dim3(gx, top_k), 32 * kVecWarps, 0, st>>>(
+            ac, ld_act, W.q, W.s, W.rs, H, H, K, ec, nullptr, nullptr, nullptr, top_k, 0.f, 0.f, sc->down_buf, H);
+      } else {
+        const int mt = max_work_tiles(M, W.n_experts, 4);
+        if (rc != rows || !tiles_serve(grouped, 4, rc)) group_tasks(ec, M, W.n_experts, 4, sc, st);
+        k_moe_nvfp4_vec<false, true, 4><<<dim3(gx, mt), 32 * kVecWarps, 0, st>>>(
+            ac, ld_act, W.q, W.s, W.rs, H, H, K, ec, sc->tasks, sc->n_tasks, sc->pairs, top_k, 0.f, 0.f,
+            sc->down_buf, H);
+      }
+      k_moe_weighted_sum<<<dim3(ceil_div(H, 256), rc), 256, 0, st>>>(sc->down_buf, ew + size_t(r0) * top_k, top_k, H,
+                                                                     out + size_t(r0) * ld_out, ld_out,
+                                                                     int(accumulate));
+      continue;
+    }
     const bf16* bf_a = act_bf16;
     if (!bf_a && sc->bf16_a && sc->stage_elems >= size_t(M) * size_t(K)) {
       k_moe_stage_bf16<<<M, 256, 0, st>>>(ac, ld_act, K, sc->bf16_a);
