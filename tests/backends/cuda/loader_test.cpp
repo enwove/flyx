@@ -37,6 +37,15 @@ void oom_paths() {
   allocation_error = cudaSuccess;
 }
 
+void residual_query_extent() {
+  RelAttnBlock a;
+  a.hidden = 2304;
+  a.window = 1024;
+  require(a.res_query_bytes() == 2304 * sizeof(float), "SWA warms one residual query");
+  a.window = 0;
+  require(a.res_query_bytes() == 3 * 2304 * sizeof(float), "full attention warms three residual queries");
+}
+
 void staging_width() {
   const size_t limit = kLoadSlotBytes / sizeof(uint16_t);
   require(quant_row_bytes(limit, "matrix") == kLoadSlotBytes, "a BF16 row fits at the limit");
@@ -238,6 +247,7 @@ int main() {
   try {
     vision_estimates();
     expert_estimates();
+    residual_query_extent();
     staging_width();
     oom_paths();
     quantized_bytes(DraftQuant::kQ8);

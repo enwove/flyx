@@ -274,6 +274,10 @@ struct Launch {
 Scratch glu_inputs(const Scratch& s);
 // The scratch of a launch on the side stream: the same rows, the split kernel's sums and counters of its own.
 Scratch side_scratch(const Scratch& s);
+// Both the current device and its kernel image support sm_90 instructions.
+bool sm90_or_newer();
+// Cache per-kernel cluster feasibility before a sequence captures its first round.
+void prepare_sublayer_clusters();
 
 // y[r, n] (=|+=) sum_k x[r, k] * W[n, k].  K % 8 == 0.  Chooses CUDA-core or tensor-core path by rows: 1..16 the
 // skinny kernel (gemm_rows where it does not fit, or with option row_gemms); more, the prefill kernels, or a round's
@@ -1722,8 +1726,26 @@ void moe_stage_q8(const float* x, int ldx, int K, int rows, const MoeScratch& sc
 // router reads (y), rmsnorm's bits, and what moe_stage_q8 makes of them for the gate|up GEMM.
 void rmsnorm_moe_q8(const float* x, int ldx, const float* w, float offset, float eps, float* y, int ldy, int rows,
                     int n, const MoeScratch& sc, bool mins, cudaStream_t st);
+// Scores of the experts for the first row of x. The caller orders the input lifetime independently of the L2 reads.
+void moe_guess_scores(const float* x, const float* norm_w, float norm_offset, const bf16* router_b16,
+                      const float* router_f32, const float* bias, bool sigmoid, int E, int H, float* scores,
+                      cudaStream_t st);
+// Prefetch only immutable expert planes from private scores. Negative planes selects all top_k;
+// otherwise the bits choose gate/up codes/scales and down codes/scales for FLYX_GUESS_K experts.
+void moe_prefetch(const float* scores, int E, int top_k, int H, int I, const ExpertMat& gu, const ExpertMat& down,
+                  int planes, cudaStream_t st);
+// Byte ranges for L2 (l2_warm): asks L2 for them on st and returns; changes no result.
+struct L2Ranges {
+  const void* p[8] = {};
+  size_t n[8] = {};
+  int count = 0;
+  void add(const void* ptr, size_t bytes) {
+    if (ptr && bytes && count < 8) p[count] = ptr, n[count++] = bytes;
+  }
+};
+void l2_warm(const L2Ranges& r, cudaStream_t st);
 void moe_route(const float* logits, const float* bias, int rows, int n_experts, int top_k, bool gating_sigmoid,
-               bool norm_weights, float norm_eps, float route_scale, int* idx_out, float* w_out, cudaStream_t st);
+               bool norm_weights, float norm_eps, float route_scale, int* idx_out, float* w_out, const Launch& L);
 void situ_rows(const float* gu, int ld_gu, int I, float beta, float linear_beta, float* out, int ld_out, int rows,
                cudaStream_t st);
 // The staged packed expert dp4a GEMMs' configurations (variants/candidates.toml, moe_dp4a), all with the same bits:
@@ -1745,7 +1767,7 @@ bool moe_dp4a_compiled(int dtype, int cfg, bool fused_gate_up = true, int rows =
 int moe_gate_up_dp4a(int tuning, int dtype, int rows);
 // What one of a fused round's MoE kernels may leave for the next without a staging launch between them, the
 // round's 1..16 rows in one chunk of the scratch.  moe_round_q8: the gate|up GEMM on W reads rows staged in 8 bits
-// (q8_ready below: staged already, by rmsnorm_moe_q8); moe_round_bf16_down: the down GEMM on W (NVFP4) reads bf16
+// (q8_ready below: staged already, by rmsnorm_moe_q8); moe_round_bf16_down: the NVFP4 down GEMM in MMA mode reads bf16
 // rows (act_bf16 below: where the gate|up GEMM wrote them).
 bool moe_q8_mins(const ExpertMat& W);
 bool moe_round_q8(const ExpertMat& W, int rows, int top_k, int K, const MoeScratch* sc);

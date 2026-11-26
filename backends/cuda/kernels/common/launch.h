@@ -7,6 +7,8 @@
 #include <atomic>
 #include <cstddef>
 #include <mutex>
+#include <stdexcept>
+#include <string>
 
 #include "backends/cuda/kernels/common/device.cuh"
 #include "backends/cuda/kernels/kernels.cuh"
@@ -24,9 +26,6 @@ void check_fits(size_t n, size_t cap, const char* what);
 Out split_out(const Launch& L, int rows, int K, bool q8 = false);
 // A sequence's slice starting at `row_offset` inside a `total_rows` presplit buffer (batched rounds).
 Out split_out_slice(const Launch& L, int total_rows, int row_offset, int K, bool q8 = false);
-// Thread block clusters and programmatic dependent launch: compute capability 9.0+, and this build's code for the
-// device compiled for 9.0+ (not an older architecture's PTX compiled at load).
-bool sm90_or_newer();
 // Cached device hardware queries (single-GPU backend).
 int device_sm_count();
 size_t device_max_smem_optin();
@@ -127,7 +126,8 @@ void launch_dependent_smem(void (*kernel)(KArgs...), dim3 grid, dim3 block, size
   at.val.programmaticStreamSerializationAllowed = 1;
   cfg.attrs = &at;
   cfg.numAttrs = opts(L).pdl && sm90_or_newer() ? 1 : 0;
-  cudaLaunchKernelEx(&cfg, kernel, static_cast<KArgs>(args)...);
+  const auto err = cudaLaunchKernelEx(&cfg, kernel, static_cast<KArgs>(args)...);
+  if (err != cudaSuccess) throw std::runtime_error(std::string("cudaLaunchKernelEx: ") + cudaGetErrorString(err));
 }
 
 template <class... KArgs, class... Args>

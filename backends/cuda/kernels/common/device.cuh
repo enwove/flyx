@@ -264,10 +264,11 @@ __device__ __forceinline__ void put_q8(const Out& o, int row, int grp, float v) 
   for (int s = 8; s; s >>= 1) s16 += __shfl_xor_sync(0xffffffffu, s16, s);
   q8_store<CONTIGUOUS>(o, row, grp, lane, p, dg, s16, !(lane & 15), !lane);
 }
-// A warp's 64 values in pairs, lane l values 2 l and 2 l + 1 from 64 grp2 of the row: lanes 0..15 the group
-// 2 grp2, lanes 16..31 the next (every lane of the warp calls it).
-__device__ __forceinline__ void put_q8_pairs(const Out& o, int row, int grp2, float a, float b) {
-  const int lane = threadIdx.x & 31, l = lane & 15, grp = 2 * grp2 + (lane >> 4);
+// A warp's 64 values in pairs, lane l values 2 l and 2 l + 1 from 64 pair_group of the row: lanes 0..15 the group
+// 2 pair_group, lanes 16..31 the next (every lane of the warp calls it).  Not named grp2: <windows.h> (dlgs.h), which
+// <cooperative_groups.h> brings in on Windows before this header, defines that name as a macro.
+__device__ __forceinline__ void put_q8_pairs(const Out& o, int row, int pair_group, float a, float b) {
+  const int lane = threadIdx.x & 31, l = lane & 15, grp = 2 * pair_group + (lane >> 4);
   float m = fmaxf(fabsf(a), fabsf(b));
 #pragma unroll
   for (int s = 8; s; s >>= 1) m = fmaxf(m, __shfl_xor_sync(0xffffffffu, m, s));  // within the half warp

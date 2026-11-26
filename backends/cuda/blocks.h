@@ -345,6 +345,8 @@ struct RelAttnBlock {
   float *k_conv = nullptr, *v_conv = nullptr, *post_conv = nullptr;
   float *res_query = nullptr, *loop_msg_query = nullptr;
   int res_push = 0, loop_rank = 0;
+  constexpr int res_queries() const { return window > 0 ? 1 : 3; }
+  constexpr size_t res_query_bytes() const { return size_t(res_queries()) * size_t(hidden) * sizeof(float); }
   LoopWeights loop_ctrl[3];
   int kv = -1, sconv = -1;
 };

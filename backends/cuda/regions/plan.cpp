@@ -333,9 +333,18 @@ void forward_nodes(const Pass& ps, size_t begin, size_t end, int copy_prefix) {
         nd.kind == FLYX_NODE_RUN && blk &&
         (std::holds_alternative<RelAttnBlock>(*blk) || std::holds_alternative<MoeBlock>(*blk));
     if (!takes_pending) flush_pending_post_conv(cur, true);
+    cur.next_moe = (i + 1 < end && ps.p->nodes[i + 1].kind == FLYX_NODE_RUN && ps.p->block[i + 1] &&
+                    std::holds_alternative<MoeBlock>(*ps.p->block[i + 1]))
+                       ? &std::get<MoeBlock>(*ps.p->block[i + 1])
+                       : nullptr;
+    cur.next_attn = (i + 1 < end && ps.p->nodes[i + 1].kind == FLYX_NODE_RUN && ps.p->block[i + 1] &&
+                     std::holds_alternative<RelAttnBlock>(*ps.p->block[i + 1]))
+                        ? &std::get<RelAttnBlock>(*ps.p->block[i + 1])
+                        : nullptr;
     ps.p->impl[i]->fn(cur, nd, blk);
     if (prof) CK(cudaEventRecord(s->prof_ev[i - begin + 1], s->st));
   }
+  if (res_state.expert_work) CK(cudaStreamWaitEvent(ps.v.L.st, s->expert_side.join, 0));
   flush_pending_post_conv(cur, true);
   s->stage_end(ps.v.L.st);
   if (!prof) return;

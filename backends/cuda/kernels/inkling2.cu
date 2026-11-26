@@ -8,6 +8,8 @@
 #include <cstdlib>
 #include <stdexcept>
 
+#include <cooperative_groups.h>
+
 #include "backends/cuda/kernels/common/device.cuh"
 #include "backends/cuda/kernels/common/launch.h"
 #include "backends/cuda/kernels/kernels.cuh"
@@ -41,6 +43,55 @@ __device__ __forceinline__ float block512_sum(float v) {
   __syncthreads();
   const float t = lane < 16 ? sh[lane] : 0.f;
   return warp_sum(t);
+}
+
+// The 512-thread row spread over a cluster of CL blocks of 512 / CL threads (block rank b holds the row's warps
+// [b 16 / CL, (b + 1) 16 / CL)): a thread's row index, warp and barrier, so a kernel written for the 512-thread row
+// runs the same per-thread work across CL SMs.  CL == 1 is the one-block row (grid: rows; __syncthreads).
+template <int CL>
+struct RowSpan {
+  static constexpr int kThreads = 512 / CL, kWarps = 16 / CL;
+  __device__ static int tid() {
+    if constexpr (CL == 1) return threadIdx.x;
+    else return int(blockIdx.x) * kThreads + int(threadIdx.x);
+  }
+  __device__ static int row() {
+    if constexpr (CL == 1) return blockIdx.x;
+    else return blockIdx.y;  // grid (CL, rows)
+  }
+  // Every thread of the row; orders global and shared stores before the loads after it (release / acquire).
+  __device__ static void sync() {
+    if constexpr (CL == 1) __syncthreads();
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900
+    else cooperative_groups::this_cluster().sync();
+#endif
+  }
+  // The copy of the shared array a in the block of the row's thread t.
+  template <class T>
+  __device__ static T* of_thread(T* a, int t) {
+    if constexpr (CL == 1) return a;
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900
+    else return cooperative_groups::this_cluster().map_shared_rank(a, t / kThreads);
+#else
+    else return a;  // CL > 1 kernels are stubs in this image.
+#endif
+  }
+};
+
+// block512_sum over the row of RowSpan<CL>: the same warp sums added in the same order.
+template <int CL>
+__device__ __forceinline__ float row512_sum(float v) {
+  if constexpr (CL == 1) {
+    return block512_sum(v);
+  } else {
+    __shared__ float sh[16];
+    const int lane = threadIdx.x & 31, warp = RowSpan<CL>::tid() >> 5;
+    v = warp_sum(v);
+    if (lane == 0) sh[warp] = v;
+    RowSpan<CL>::sync();
+    const float t = lane < 16 ? RowSpan<CL>::of_thread(sh, lane * 32)[lane] : 0.f;
+    return warp_sum(t);
+  }
 }
 
 // A fused push reads its old residual directly from x_src. The current state can be the
@@ -100,11 +151,15 @@ __device__ __forceinline__ void attn_res_state_dots(const T* src, const T* queri
   for (; i < count; i += 32) attn_res_dot_batch<1>(src, queries, count, i, ss, dq);
 }
 
-template <int NQ>
+// CL > 1 (RowSpan): each state's values stay in the block of the warp that took them and every block copies all M,
+// so each takes the same softmax.
+template <int NQ, int CL = 1>
 __device__ __forceinline__ void attn_res_weights(const AttnResRow& row, int M, const float* queries, int H,
                                                  bool vec4, float (&alpha)[NQ][kMaxResStates]) {
-  const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
-  __shared__ float inv[kMaxResStates];
+  const int lane = threadIdx.x & 31, warp = RowSpan<CL>::tid() >> 5;
+  __shared__ float inv_own[kMaxResStates], dots[CL > 1 ? NQ : 1][kMaxResStates], inv_all[CL > 1 ? kMaxResStates : 1];
+  float* inv = inv_own;
+  float (*raw)[kMaxResStates] = CL > 1 ? dots : alpha;
   const float inv_sqrt_h = rsqrtf(float(H));
   for (int m = warp; m < M; m += 16) {
     const float* src = row.state(m);
@@ -120,18 +175,27 @@ __device__ __forceinline__ void attn_res_weights(const AttnResRow& row, int M, c
 #pragma unroll
     for (int q = 0; q < NQ; ++q) {
       const float dot = warp_sum(dq[q]) * scale;
-      if (lane == 0) alpha[q][m] = dot;
+      if (lane == 0) raw[q][m] = dot;
     }
   }
-  __syncthreads();
+  RowSpan<CL>::sync();
+  if constexpr (CL > 1) {
+    for (int k = threadIdx.x; k < (NQ + 1) * M; k += blockDim.x) {
+      const int q = k / M, m = k % M, owner = (m % 16) * 32;  // state m: warp m % 16
+      if (q < NQ) alpha[q][m] = RowSpan<CL>::of_thread(&dots[0][0], owner)[q * kMaxResStates + m];
+      else inv_all[m] = RowSpan<CL>::of_thread(inv_own, owner)[m];
+    }
+    inv = inv_all;
+    __syncthreads();
+  }
 
   // One warp per query evaluates the independent exponentials together. Both folds broadcast
   // exactly the M real states in ascending order, including when a lane owns a second state.
-  if (warp < NQ) {
+  for (int w = threadIdx.x >> 5; w < NQ; w += blockDim.x >> 5) {
     static_assert(kMaxResStates == 64);
     const int first = min(M, 32);
-    const float d0 = lane < first ? alpha[warp][lane] : 0.f;
-    const float d1 = lane + 32 < M ? alpha[warp][lane + 32] : 0.f;
+    const float d0 = lane < first ? alpha[w][lane] : 0.f;
+    const float d1 = lane + 32 < M ? alpha[w][lane + 32] : 0.f;
     float mx = -INFINITY;
     for (int m = 0; m < first; ++m) mx = fmaxf(mx, __shfl_sync(0xffffffffu, d0, m));
     for (int m = 0; m < M - 32; ++m) mx = fmaxf(mx, __shfl_sync(0xffffffffu, d1, m));
@@ -141,8 +205,8 @@ __device__ __forceinline__ void attn_res_weights(const AttnResRow& row, int M, c
     for (int m = 0; m < first; ++m) z += __shfl_sync(0xffffffffu, e0, m);
     for (int m = 0; m < M - 32; ++m) z += __shfl_sync(0xffffffffu, e1, m);
     const float inv_z = 1.f / z;
-    if (lane < first) alpha[warp][lane] = (e0 * inv_z) * inv[lane];
-    if (lane + 32 < M) alpha[warp][lane + 32] = (e1 * inv_z) * inv[lane + 32];
+    if (lane < first) alpha[w][lane] = (e0 * inv_z) * inv[lane];
+    if (lane + 32 < M) alpha[w][lane + 32] = (e1 * inv_z) * inv[lane + 32];
   }
   __syncthreads();
 }
@@ -160,12 +224,12 @@ __device__ __forceinline__ void attn_res_add(float a, float4 v, float4& sum) {
 
 // The dot phase has finished reading cur. Each mixing thread owns its channels for the
 // whole state sweep, so it can replace them in-place with query zero in the fused kernel.
-template <class T, int NQ>
+template <int CL, class T, int NQ>
 __device__ __forceinline__ void attn_res_mix_channels(const AttnResRow& row, int M, int count,
                                                       const float (&alpha)[NQ][kMaxResStates],
                                                       T* out0, T* out, size_t query_stride) {
   constexpr int batch = 4;
-  for (int i = threadIdx.x; i < count; i += 512) {
+  for (int i = RowSpan<CL>::tid(); i < count; i += 512) {
     T mix[NQ]{};
     for (int m = 0; m < M; m += batch) {
       T v[batch];
@@ -196,17 +260,17 @@ __device__ __forceinline__ void attn_res_mix_channels(const AttnResRow& row, int
   }
 }
 
-template <int NQ>
+template <int NQ, int CL = 1>
 __device__ __forceinline__ void attn_res_mix_row(const AttnResRow& row, const float* queries, int H, bool vec4,
                                                  float* out0, float* out) {
   const int M = row.n_blocks + int(row.pushed != nullptr) + 1;
   __shared__ float alpha[NQ][kMaxResStates];
-  attn_res_weights(row, M, queries, H, vec4, alpha);
+  attn_res_weights<NQ, CL>(row, M, queries, H, vec4, alpha);
   if (vec4 && ((reinterpret_cast<uintptr_t>(out0) | reinterpret_cast<uintptr_t>(out)) & 15u) == 0)
-    attn_res_mix_channels(row, M, H / 4, alpha, reinterpret_cast<float4*>(out0),
-                          reinterpret_cast<float4*>(out), row.stride / 4);
+    attn_res_mix_channels<CL>(row, M, H / 4, alpha, reinterpret_cast<float4*>(out0),
+                              reinterpret_cast<float4*>(out), row.stride / 4);
   else
-    attn_res_mix_channels(row, M, H, alpha, out0, out, row.stride);
+    attn_res_mix_channels<CL>(row, M, H, alpha, out0, out, row.stride);
 }
 
 template <int NQ>
@@ -730,14 +794,17 @@ __global__ void k_shortconv_pass(const float* __restrict__ x, int ldx, const flo
 // Fused sublayer boundary for rounds (1..16 rows, H <= 5120, n_blocks + res_push + 1 <= kMaxResStates):
 //   shortconv_pass(post_raw) + residual(+res_push to bank) + attn_res_mix + optional rmsnorm (F32/MoeQ8/AttnQ8Split).
 // The H-float shared row forwards the rounded residual to AttnRes and its first mixed query to RMSNorm.
-template <SublayerNorm NORM, int NQ, int U>
-__global__ void __launch_bounds__(512)
-    k_shortconv_res_mix_norm(SublayerPostConv sc, const float* __restrict__ x_src, float* __restrict__ x_dst,
+// CL > 1: the row over a cluster of CL blocks (RowSpan), each thread the one-block row's thread tid, the residual
+// read back from x_dst and the mixed row from the block of the thread that mixed it; the host picks it for float4
+// rows only, so every sum is the one-block row's.
+template <SublayerNorm NORM, int NQ, int U, int CL = 1>
+__device__ __forceinline__ void
+    shortconv_res_mix_norm_row(SublayerPostConv sc, const float* __restrict__ x_src, float* __restrict__ x_dst,
                              float* __restrict__ bank, int n_blocks, const float* __restrict__ queries,
                              float* __restrict__ mix_out, const float* __restrict__ norm_w, float norm_offset,
                              float norm_eps, Out norm_o, int ldy, const DevParams* P, int rows, int H) {
   pdl_trigger();
-  const int r = blockIdx.x, tid = threadIdx.x;
+  const int r = RowSpan<CL>::row(), tid = RowSpan<CL>::tid();
   const int warp = tid >> 5;
   extern __shared__ float4 sublayer_row[];
   float* shared_row = reinterpret_cast<float*>(sublayer_row);
@@ -755,7 +822,53 @@ __global__ void __launch_bounds__(512)
   const int ch_off = sc.ch_off, ch_total = sc.ch_total, conv = sc.conv;
   const bool push = sc.res_push;
 
-  for (int c = tid; c < H; c += 512) {
+  // conv 4 (Inkling-2's): a thread's channels' loads all go out before any of their sums, one memory latency for
+  // all of them where the loop below waits for each channel's in turn; the same products in the same order.
+  constexpr int kConvAhead = 5;
+  const bool conv4_ahead = conv == 4 && H <= 512 * kConvAhead;
+  if (conv4_ahead) {
+    float xr[kConvAhead], hv[kConvAhead][3], wv[kConvAhead][4], xs[kConvAhead];
+#pragma unroll
+    for (int u = 0; u < kConvAhead; ++u) {
+      const int c = tid + u * 512;
+      if (c < H) {
+        xr[u] = post_raw[size_t(r) * H + c];
+        xs[u] = x_src[size_t(r) * H + c];
+#pragma unroll
+        for (int k = 0; k < 4; ++k) wv[u][k] = __ldg(conv_w + size_t(c) * 4 + k);
+#pragma unroll
+        for (int k = 0; k < 3; ++k) {
+          const int t = r - 3 + k;
+          hv[u][k] = t < 0 ? win_in[size_t(3 + t) * ch_total + ch_off + c] : post_raw[size_t(t) * H + c];
+        }
+      }
+    }
+#pragma unroll
+    for (int u = 0; u < kConvAhead; ++u) {
+      const int c = tid + u * 512;
+      if (c < H) {
+        float acc = 0.f;
+#pragma unroll
+        for (int k = 0; k < 3; ++k) acc = __fmaf_rn(hv[u][k], wv[u][k], acc);
+        acc = __fmaf_rn(xr[u], wv[u][3], acc);
+        const float y = (xr[u] + acc) * inv_scale;
+        const float xnew = push ? y : (xs[u] + y);
+        if (push) bank[(size_t(n_blocks) * rows + r) * H + c] = xs[u];
+        x_dst[size_t(r) * H + c] = xnew;
+        if constexpr (CL == 1) shared_row[c] = xnew;
+        if (rep_base) rep_base[size_t(r) * ch_total + ch_off + c] = xr[u];
+        if (win_out) {
+#pragma unroll
+          for (int k = 0; k < 3; ++k) {
+            const int src_r = rows - 3 + k;
+            win_out[size_t(k) * ch_total + ch_off + c] =
+                src_r < 0 ? win_in[size_t(3 + src_r) * ch_total + ch_off + c] : post_raw[size_t(src_r) * H + c];
+          }
+        }
+      }
+    }
+  }
+  for (int c = conv4_ahead ? H : tid; c < H; c += 512) {
     const float* wrow = conv_w + size_t(c) * conv;
     const float xr = post_raw[size_t(r) * H + c];
     float acc = 0.f;
@@ -780,7 +893,7 @@ __global__ void __launch_bounds__(512)
     const float xnew = push ? y : (xs + y);
     if (push) bank[(size_t(n_blocks) * rows + r) * H + c] = xs;
     x_dst[size_t(r) * H + c] = xnew;
-    shared_row[c] = xnew;
+    if constexpr (CL == 1) shared_row[c] = xnew;
     if (rep_base) rep_base[size_t(r) * ch_total + ch_off + c] = xr;
     if (win_out) {
       for (int k = 0; k < hist; ++k) {
@@ -790,16 +903,16 @@ __global__ void __launch_bounds__(512)
       }
     }
   }
-  __syncthreads();  // the state warp reads channels produced by other warps
+  RowSpan<CL>::sync();  // the state warp reads channels produced by other warps
 
   const size_t offset = size_t(r) * H;
   const AttnResRow row{n_blocks ? bank + offset : nullptr, size_t(rows) * H, n_blocks,
-                       push ? x_src + offset : nullptr, shared_row};
+                       push ? x_src + offset : nullptr, CL == 1 ? shared_row : x_dst + offset};
   const bool vec4 = (H & 3) == 0 && ((reinterpret_cast<uintptr_t>(bank) | reinterpret_cast<uintptr_t>(x_src) |
                                       reinterpret_cast<uintptr_t>(queries)) &
                                      15u) == 0;
   float* dest = mix_out ? mix_out + offset : nullptr;
-  attn_res_mix_row<NQ>(row, queries, H, vec4, NORM == SublayerNorm::None ? dest : shared_row, dest);
+  attn_res_mix_row<NQ, CL>(row, queries, H, vec4, NORM == SublayerNorm::None ? dest : shared_row, dest);
 
   if constexpr (NORM != SublayerNorm::None) {
     float weight[U];
@@ -810,17 +923,17 @@ __global__ void __launch_bounds__(512)
     }
     // The vector mix owns consecutive float4s. Restore rmsnorm's tid + 512*u ownership before
     // any square, so block512_sum and the Q8 groups see exactly the generic kernel's inputs.
-    __syncthreads();
+    RowSpan<CL>::sync();
     float mix0[U], ss = 0.f;
 #pragma unroll
     for (int u = 0; u < U; ++u) {
       const int c = tid + u * 512;
       if (c < H) {
-        mix0[u] = shared_row[c];
+        mix0[u] = RowSpan<CL>::of_thread(shared_row, (c / 4) % 512)[c];  // float4 c / 4: thread (c / 4) % 512
         ss = __fmaf_rn(mix0[u], mix0[u], ss);
       }
     }
-    const float inv_rms = rsqrtf(block512_sum(ss) / float(H) + norm_eps);
+    const float inv_rms = rsqrtf(row512_sum<CL>(ss) / float(H) + norm_eps);
 #pragma unroll
     for (int u = 0; u < U; ++u) {
       const int c = tid + u * 512;
@@ -842,6 +955,68 @@ __global__ void __launch_bounds__(512)
       }
     }
   }
+  if constexpr (CL > 1) RowSpan<CL>::sync();  // no block leaves while another reads its shared memory
+}
+
+template <SublayerNorm NORM, int NQ, int U, int CL = 1>
+__global__ void __launch_bounds__(512 / CL)
+    k_shortconv_res_mix_norm(SublayerPostConv sc, const float* __restrict__ x_src, float* __restrict__ x_dst,
+                             float* __restrict__ bank, int n_blocks, const float* __restrict__ queries,
+                             float* __restrict__ mix_out, const float* __restrict__ norm_w, float norm_offset,
+                             float norm_eps, Out norm_o, int ldy, const DevParams* P, int rows, int H) {
+#if !defined(__CUDA_ARCH__) || __CUDA_ARCH__ < 900
+  if constexpr (CL > 1) {
+    __trap();  // The host selects only CL=1 for this image.
+  } else
+#endif
+  {
+    shortconv_res_mix_norm_row<NORM, NQ, U, CL>(sc, x_src, x_dst, bank, n_blocks, queries, mix_out, norm_w,
+                                                norm_offset, norm_eps, norm_o, ldy, P, rows, H);
+  }
+}
+
+struct SublayerVariant {
+  using Kernel = decltype(&k_shortconv_res_mix_norm<SublayerNorm::None, 1, 1, 1>);
+  SublayerNorm norm;
+  int queries, unroll, cluster;
+  Kernel single, clustered;
+};
+
+template <SublayerNorm N, int Q, int U>
+SublayerVariant sublayer_variant(int requested) {
+  SublayerVariant v{N, Q, U, 1, k_shortconv_res_mix_norm<N, Q, U, 1>, nullptr};
+  if (requested != 4 && requested != 8) return v;
+  auto kernel = requested == 4 ? k_shortconv_res_mix_norm<N, Q, U, 4> : k_shortconv_res_mix_norm<N, Q, U, 8>;
+  cudaLaunchConfig_t cfg{};
+  cfg.gridDim = dim3(requested);
+  cfg.blockDim = dim3(512 / requested);
+  // Test the largest shared row this specialization takes. All smaller rows fit the same cluster.
+  cfg.dynamicSmemBytes = (U == 5 ? 2560 : 5120) * sizeof(float);
+  int limit = 0;
+  if (cudaOccupancyMaxPotentialClusterSize(&limit, kernel, &cfg) != cudaSuccess) {
+    cudaGetLastError();
+  } else if (limit >= requested) {
+    v.cluster = requested;
+    v.clustered = kernel;
+  }
+  return v;
+}
+
+const auto& sublayer_variants() {
+  static const int cl = [] {
+    if (!sm90_or_newer()) return 1;
+    const char* e = std::getenv("FLYX_SC_CLUSTER");
+    return e ? std::atoi(e) : 8;
+  }();
+  using N = SublayerNorm;
+  static const SublayerVariant variants[] = {
+      sublayer_variant<N::None, 1, 1>(cl), sublayer_variant<N::None, 2, 1>(cl),
+      sublayer_variant<N::None, 3, 1>(cl), sublayer_variant<N::None, 4, 1>(cl),
+      sublayer_variant<N::F32, 1, 5>(cl), sublayer_variant<N::F32, 1, 10>(cl),
+      sublayer_variant<N::MoeQ8, 1, 5>(cl), sublayer_variant<N::MoeQ8, 1, 10>(cl),
+      sublayer_variant<N::AttnQ8Split, 1, 5>(cl), sublayer_variant<N::AttnQ8Split, 1, 10>(cl),
+      sublayer_variant<N::AttnQ8Split, 3, 5>(cl), sublayer_variant<N::AttnQ8Split, 3, 10>(cl)};
+  return variants;
 }
 
 __global__ void k_shortconv_fold(const ShortConvLayer* __restrict__ layers, size_t win_stride, size_t replay_stride,
@@ -914,52 +1089,94 @@ __global__ void k_rel_attn_prep(const float* __restrict__ q_in, int ldq, const f
       const float* win_in = kv_sc.win + size_t(slot_of(P, kv_sc.in_sel)) * kv_sc.win_stride;
       float* rep_base =
           kv_sc.replay ? (kv_sc.replay + size_t(replay_slot_of(P, kv_sc.replay_sel)) * kv_sc.replay_stride) : nullptr;
-      // K ShortConv (ch_off = 0)
-      {
-        const float xr = k_in[size_t(r) * ldk + c];
-        if (!skip_sc && rep_base) rep_base[size_t(r) * kv_sc.ch_total + c] = xr;
-        const float* wrow = kv_sc.k_w + size_t(c) * kv_sc.conv;
-        float acc = 0.f;
-        for (int k = 0; k < hist; ++k) {
-          const int t = r - hist + k;
-          const float hv = t < 0 ? win_in[size_t(hist + t) * kv_sc.ch_total + c] : k_in[size_t(t) * ldk + c];
-          acc = __fmaf_rn(hv, __ldg(wrow + k), acc);
+      if (kv_sc.conv == 4) {
+        // conv 4 (Inkling-2's): K's and V's loads all go out before any of their sums (one memory latency, where the
+        // loops below wait for each tap in turn); the same products in the same order, the dynamic taps' window
+        // values the static taps' (lag l is tap 3 - l).
+        const float* kd = kv_sc.k_dyn ? kv_sc.k_dyn + (size_t(r) * nkv + kh) * 4 : nullptr;
+        const float* vd = kv_sc.v_dyn ? kv_sc.v_dyn + (size_t(r) * nkv + kh) * 4 : nullptr;
+        float kx[4], vx[4], kw[4], vw[4], kdv[4] = {0.f, 0.f, 0.f, 0.f}, vdv[4] = {0.f, 0.f, 0.f, 0.f};
+#pragma unroll
+        for (int k = 0; k < 3; ++k) {
+          const int t = r - 3 + k;
+          kx[k] = t < 0 ? win_in[size_t(3 + t) * kv_sc.ch_total + c] : k_in[size_t(t) * ldk + c];
+          vx[k] = t < 0 ? win_in[size_t(3 + t) * kv_sc.ch_total + kv_dim + c] : v_in[size_t(t) * ldv + c];
         }
-        acc = __fmaf_rn(xr, __ldg(wrow + hist), acc);
-        if (kv_sc.k_dyn) {
-          const float* dh = kv_sc.k_dyn + (size_t(r) * nkv + kh) * kv_sc.conv;
-          acc = __fmaf_rn(xr, dh[0], acc);
-          for (int lag = 1; lag < kv_sc.conv; ++lag) {
-            const int t = r - lag;
+        kx[3] = k_in[size_t(r) * ldk + c];
+        vx[3] = v_in[size_t(r) * ldv + c];
+#pragma unroll
+        for (int k = 0; k < 4; ++k) {
+          kw[k] = __ldg(kv_sc.k_w + size_t(c) * 4 + k);
+          vw[k] = __ldg(kv_sc.v_w + size_t(c) * 4 + k);
+          if (kd) kdv[k] = kd[k];
+          if (vd) vdv[k] = vd[k];
+        }
+        if (!skip_sc && rep_base) {
+          rep_base[size_t(r) * kv_sc.ch_total + c] = kx[3];
+          rep_base[size_t(r) * kv_sc.ch_total + kv_dim + c] = vx[3];
+        }
+        auto conv4 = [](const float (&x)[4], const float (&w)[4], const float* dyn, const float (&dv)[4]) {
+          float acc = 0.f;
+#pragma unroll
+          for (int k = 0; k < 3; ++k) acc = __fmaf_rn(x[k], w[k], acc);
+          acc = __fmaf_rn(x[3], w[3], acc);
+          if (dyn) {
+            acc = __fmaf_rn(x[3], dv[0], acc);
+#pragma unroll
+            for (int lag = 1; lag < 4; ++lag) acc = __fmaf_rn(x[3 - lag], dv[lag], acc);
+          }
+          return (x[3] + acc) * rsqrtf(float((dyn ? 2 : 1) * 4 + 1));
+        };
+        kv_val = conv4(kx, kw, kd, kdv);
+        vv_val = conv4(vx, vw, vd, vdv);
+      } else {
+        // K ShortConv (ch_off = 0)
+        {
+          const float xr = k_in[size_t(r) * ldk + c];
+          if (!skip_sc && rep_base) rep_base[size_t(r) * kv_sc.ch_total + c] = xr;
+          const float* wrow = kv_sc.k_w + size_t(c) * kv_sc.conv;
+          float acc = 0.f;
+          for (int k = 0; k < hist; ++k) {
+            const int t = r - hist + k;
             const float hv = t < 0 ? win_in[size_t(hist + t) * kv_sc.ch_total + c] : k_in[size_t(t) * ldk + c];
-            acc = __fmaf_rn(hv, dh[lag], acc);
+            acc = __fmaf_rn(hv, __ldg(wrow + k), acc);
           }
-        }
-        kv_val = (xr + acc) * rsqrtf(float((kv_sc.k_dyn ? 2 : 1) * kv_sc.conv + 1));
-      }
-      // V ShortConv (ch_off = kv_dim)
-      {
-        const float xr = v_in[size_t(r) * ldv + c];
-        if (!skip_sc && rep_base) rep_base[size_t(r) * kv_sc.ch_total + kv_dim + c] = xr;
-        const float* wrow = kv_sc.v_w + size_t(c) * kv_sc.conv;
-        float acc = 0.f;
-        for (int k = 0; k < hist; ++k) {
-          const int t = r - hist + k;
-          const float hv = t < 0 ? win_in[size_t(hist + t) * kv_sc.ch_total + kv_dim + c] : v_in[size_t(t) * ldv + c];
-          acc = __fmaf_rn(hv, __ldg(wrow + k), acc);
-        }
-        acc = __fmaf_rn(xr, __ldg(wrow + hist), acc);
-        if (kv_sc.v_dyn) {
-          const float* dh = kv_sc.v_dyn + (size_t(r) * nkv + kh) * kv_sc.conv;
-          acc = __fmaf_rn(xr, dh[0], acc);
-          for (int lag = 1; lag < kv_sc.conv; ++lag) {
-            const int t = r - lag;
-            const float hv =
-                t < 0 ? win_in[size_t(hist + t) * kv_sc.ch_total + kv_dim + c] : v_in[size_t(t) * ldv + c];
-            acc = __fmaf_rn(hv, dh[lag], acc);
+          acc = __fmaf_rn(xr, __ldg(wrow + hist), acc);
+          if (kv_sc.k_dyn) {
+            const float* dh = kv_sc.k_dyn + (size_t(r) * nkv + kh) * kv_sc.conv;
+            acc = __fmaf_rn(xr, dh[0], acc);
+            for (int lag = 1; lag < kv_sc.conv; ++lag) {
+              const int t = r - lag;
+              const float hv = t < 0 ? win_in[size_t(hist + t) * kv_sc.ch_total + c] : k_in[size_t(t) * ldk + c];
+              acc = __fmaf_rn(hv, dh[lag], acc);
+            }
           }
+          kv_val = (xr + acc) * rsqrtf(float((kv_sc.k_dyn ? 2 : 1) * kv_sc.conv + 1));
         }
-        vv_val = (xr + acc) * rsqrtf(float((kv_sc.v_dyn ? 2 : 1) * kv_sc.conv + 1));
+        // V ShortConv (ch_off = kv_dim)
+        {
+          const float xr = v_in[size_t(r) * ldv + c];
+          if (!skip_sc && rep_base) rep_base[size_t(r) * kv_sc.ch_total + kv_dim + c] = xr;
+          const float* wrow = kv_sc.v_w + size_t(c) * kv_sc.conv;
+          float acc = 0.f;
+          for (int k = 0; k < hist; ++k) {
+            const int t = r - hist + k;
+            const float hv = t < 0 ? win_in[size_t(hist + t) * kv_sc.ch_total + kv_dim + c] : v_in[size_t(t) * ldv + c];
+            acc = __fmaf_rn(hv, __ldg(wrow + k), acc);
+          }
+          acc = __fmaf_rn(xr, __ldg(wrow + hist), acc);
+          if (kv_sc.v_dyn) {
+            const float* dh = kv_sc.v_dyn + (size_t(r) * nkv + kh) * kv_sc.conv;
+            acc = __fmaf_rn(xr, dh[0], acc);
+            for (int lag = 1; lag < kv_sc.conv; ++lag) {
+              const int t = r - lag;
+              const float hv =
+                  t < 0 ? win_in[size_t(hist + t) * kv_sc.ch_total + kv_dim + c] : v_in[size_t(t) * ldv + c];
+              acc = __fmaf_rn(hv, dh[lag], acc);
+            }
+          }
+          vv_val = (xr + acc) * rsqrtf(float((kv_sc.v_dyn ? 2 : 1) * kv_sc.conv + 1));
+        }
       }
       // Ascending k guarantees hist + src_r = k + 1 > k when nrows == 1 (race-free even if next_sel == in_sel;
       // launcher rejects next_sel == in_sel when nrows > 1).
@@ -2298,6 +2515,8 @@ void shortconv_pass(const float* x, int ldx, const float* w, const float* dyn, f
       conv, n_heads, P, rows, tile_rows, out, ldo, int(accumulate), res_src);
 }
 
+void prepare_sublayer_clusters() { (void)sublayer_variants(); }
+
 void shortconv_res_mix_norm(const SublayerPostConv& sc, const float* x_src, float* x_dst, float* bank, int n_blocks,
                             const float* queries, int n_queries, float* mix_out, SublayerNorm norm_mode,
                             const float* norm_w, float norm_offset, float norm_eps, float* norm_y, int ldy,
@@ -2326,37 +2545,33 @@ void shortconv_res_mix_norm(const SublayerPostConv& sc, const float* x_src, floa
     o.mid = parts.mid;
     o.lo = parts.lo;
   }
-#define FLYX_SUBLAYER_CALL(N, Q, U_)                                                                                   \
-  k_shortconv_res_mix_norm<N, Q, U_><<<rows, 512, size_t(H) * sizeof(float), L.st>>>(                                  \
-      sc, x_src, x_dst, bank, n_blocks, queries, mix_out, norm_w, norm_offset, norm_eps, o, ldy, P, rows, H)
-#define FLYX_SUBLAYER_NORM(N, Q)                                                                                       \
-  if (H <= 2560) FLYX_SUBLAYER_CALL(N, Q, 5);                                                                          \
-  else FLYX_SUBLAYER_CALL(N, Q, 10)
-  switch (norm_mode) {
-    case SublayerNorm::None:
-      switch (n_queries) {
-        case 1: FLYX_SUBLAYER_CALL(SublayerNorm::None, 1, 1); break;
-        case 2: FLYX_SUBLAYER_CALL(SublayerNorm::None, 2, 1); break;
-        case 3: FLYX_SUBLAYER_CALL(SublayerNorm::None, 3, 1); break;
-        default: FLYX_SUBLAYER_CALL(SublayerNorm::None, 4, 1); break;
-      }
-      break;
-    case SublayerNorm::F32:
-      if (n_queries == 1) { FLYX_SUBLAYER_NORM(SublayerNorm::F32, 1); }
-      else throw std::invalid_argument("shortconv_res_mix_norm: F32 expects n_queries == 1");
-      break;
-    case SublayerNorm::MoeQ8:
-      if (n_queries == 1) { FLYX_SUBLAYER_NORM(SublayerNorm::MoeQ8, 1); }
-      else throw std::invalid_argument("shortconv_res_mix_norm: MoeQ8 expects n_queries == 1");
-      break;
-    case SublayerNorm::AttnQ8Split:
-      if (n_queries == 1) { FLYX_SUBLAYER_NORM(SublayerNorm::AttnQ8Split, 1); }
-      else if (n_queries == 3) { FLYX_SUBLAYER_NORM(SublayerNorm::AttnQ8Split, 3); }
-      else throw std::invalid_argument("shortconv_res_mix_norm: AttnQ8Split expects n_queries == 1 or 3");
-      break;
+  // A row over a cluster of 8 SMs (float4 rows only: the one-block row's sums); FLYX_SC_CLUSTER=1 keeps the
+  // one-block row (4: 4 blocks).  RTX 5090, Inkling-2-Mini UD-IQ4_XS plain decoding 219.1 -> 222.2 tok/s.
+  const bool vec4 = (H & 3) == 0 && ((reinterpret_cast<uintptr_t>(bank) | reinterpret_cast<uintptr_t>(x_src) |
+                                      reinterpret_cast<uintptr_t>(x_dst) | reinterpret_cast<uintptr_t>(queries) |
+                                      reinterpret_cast<uintptr_t>(mix_out)) & 15u) == 0;
+  const int unroll = norm_mode == SublayerNorm::None ? 1 : H <= 2560 ? 5 : 10;
+  for (const auto& v : sublayer_variants()) {
+    if (v.norm != norm_mode || v.queries != n_queries || v.unroll != unroll) continue;
+    const int cl = vec4 ? v.cluster : 1;
+    cudaLaunchConfig_t cfg{};
+    cfg.gridDim = cl == 1 ? dim3(rows) : dim3(cl, rows);
+    cfg.blockDim = dim3(512 / cl);
+    cfg.dynamicSmemBytes = size_t(H) * sizeof(float);
+    cfg.stream = L.st;
+    cudaLaunchAttribute at{};
+    if (cl > 1) {
+      at.id = cudaLaunchAttributeClusterDimension;
+      at.val.clusterDim = {unsigned(cl), 1, 1};
+      cfg.attrs = &at;
+      cfg.numAttrs = 1;
+    }
+    const auto err = cudaLaunchKernelEx(&cfg, cl == 1 ? v.single : v.clustered, sc, x_src, x_dst, bank, n_blocks,
+                                        queries, mix_out, norm_w, norm_offset, norm_eps, o, ldy, P, rows, H);
+    if (err != cudaSuccess) throw std::runtime_error(std::string("shortconv_res_mix_norm: ") + cudaGetErrorString(err));
+    return;
   }
-#undef FLYX_SUBLAYER_NORM
-#undef FLYX_SUBLAYER_CALL
+  throw std::invalid_argument("shortconv_res_mix_norm: unsupported norm and query count");
 }
 
 void shortconv_fold(const ShortConvLayer* layers, int n, size_t win_stride, size_t replay_stride, int in_sel,

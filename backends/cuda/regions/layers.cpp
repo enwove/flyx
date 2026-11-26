@@ -5,6 +5,8 @@
 
 #include "backends/cuda/regions/layers.h"
 
+#include <cstdlib>
+
 namespace flyx::cuda {
 
 // Draft head top-k / argmax dispatch (1-bit rough pick on packed or bf16 head, else full draft logits).
@@ -773,6 +775,33 @@ void flush_pending_post_conv(const Pass& ps, bool require_in_x) {
   }
 }
 
+// The expert stream rejoins the main stream at the end of this pass.
+static void warm_side(const Pass& ps, const L2Ranges& r) {
+  auto* s = ps.s;
+  const cudaStream_t st = ps.v.L.st;
+  if (!r.count || !ps.res || !s->expert_side.st || st != s->st) return;  // a sequence's own stream (batched passes: not)
+  const SideStream& es = s->expert_side;
+  CK(cudaEventRecord(es.fork, st));
+  CK(cudaStreamWaitEvent(es.st, es.fork, 0));
+  l2_warm(r, es.st);
+  CK(cudaEventRecord(es.join, es.st));
+  ps.res->expert_work = true;
+}
+
+// A linear's round weights (Lin::round) of n values: binary16 or float32.
+static void add_round(L2Ranges& r, const Lin& w, size_t n) {
+  if (w.round.b16) r.add(w.round.b16, n * 2);
+  else r.add(w.round.f32, n * 4);
+}
+
+static int warm_flags() {
+  static const int w = [] {
+    const char* e = std::getenv("FLYX_WARM");
+    return e ? std::atoi(e) : 23;
+  }();
+  return w;
+}
+
 void rel_attn_layer(const Pass& ps, const RelAttnBlock& a, bool fused) {
   const RowView& rv = ps.v;
   auto* s = ps.s;
@@ -788,8 +817,64 @@ void rel_attn_layer(const Pass& ps, const RelAttnBlock& a, bool fused) {
   float* rep = ps.round ? sc.replay : nullptr;
   const size_t rep_stride = ps.round ? sc.r_stride : 0;
 
-  if (a.loop_msg_query)
-    attn_res_mix(rv.b.loop_bank, ps.res->loop_n, rv.b.loop_bank_out, a.loop_msg_query, 4, R, H, rv.b.loop_msg, st);
+  // Each guess consumes the residual on the expert stream. Only that read must finish before an
+  // in-place ShortConv or the next layer can reuse the row/bank. Prefetching weights can continue.
+  bool expert_read_pending = false;
+  auto guess_experts = [&](const float* row, bool mix, int planes) {
+    if (!ps.round || !ps.res || !ps.next_moe || !rv.b.moe_guess || !s->expert_side.st || st != s->st) return;
+    const MoeBlock& f = *ps.next_moe;
+    const bf16* rb = f.router.round.b16 ? f.router.round.b16 : (f.router.round.f32 ? nullptr : f.router.w);
+    if ((!rb && !f.router.round.f32) || f.n_experts < 1 || f.n_experts > 256 ||
+        f.top_k < 1 || f.top_k > std::min(f.n_experts, kMoeRouteMaxTopK) ||
+        !f.gate_up.q || !f.gate_up.s || !f.down.q || !f.down.s || f.gate_up.packed() || f.down.packed() ||
+        (mix && !f.res_query)) return;
+    const SideStream& es = s->expert_side;
+    CK(cudaEventRecord(es.fork, st));
+    CK(cudaStreamWaitEvent(es.st, es.fork, 0));
+    if (mix) {
+      float* mixed = rv.b.moe_guess + f.n_experts;
+      attn_res_mix(rv.b.res_bank, ps.res->res_n, row, f.res_query, 1, 1, H, mixed, es.st);
+      CK(cudaEventRecord(s->expert_read, es.st));
+      row = mixed;
+    }
+    moe_guess_scores(row, f.norm.w, f.norm.offset, rb, rb ? nullptr : f.router.round.f32,
+                     f.router_bias, f.gating_sigmoid, f.n_experts, H, rv.b.moe_guess, es.st);
+    if (!mix) CK(cudaEventRecord(s->expert_read, es.st));
+    expert_read_pending = true;
+    moe_prefetch(rv.b.moe_guess, f.n_experts, f.top_k, H, f.inter, f.gate_up, f.down, planes, es.st);
+    CK(cudaEventRecord(es.join, es.st));
+    ps.res->expert_work = true;
+  };
+  auto finish_residual_read = [&] {
+    if (expert_read_pending) CK(cudaStreamWaitEvent(st, s->expert_read, 0));
+    expert_read_pending = false;
+  };
+  static const int prefetch = [] {
+    const char* e = std::getenv("FLYX_EXPERT_PREFETCH");
+    return e ? std::atoi(e) : 2;
+  }();
+  if (prefetch && (prefetch != 2 || R > 1) && R <= FLYX_MAX_ROWS && ps.res)
+    guess_experts(ps.res->x_cur ? ps.res->x_cur : rv.b.x, false, -1);
+
+  // The loop messages read only the loop bank, which no kernel of the pass writes: on the side stream beside the
+  // sublayer's mix, joined before the controllers read them (FLYX_SIDE_LOOP_MSG=0: in turn).  Same bits.
+  static const bool loop_msg_env = [] {
+    const char* e = std::getenv("FLYX_SIDE_LOOP_MSG");
+    return !e || std::atoi(e) != 0;
+  }();
+  bool loop_msg_side = false;
+  if (a.loop_msg_query) {
+    if (loop_msg_env && ps.round && L.side && L.side->st && (!L.opt || L.opt->side_stream)) {
+      CK(cudaEventRecord(L.side->fork, st));
+      CK(cudaStreamWaitEvent(L.side->st, L.side->fork, 0));
+      attn_res_mix(rv.b.loop_bank, ps.res->loop_n, rv.b.loop_bank_out, a.loop_msg_query, 4, R, H, rv.b.loop_msg,
+                   L.side->st);
+      CK(cudaEventRecord(L.side->join, L.side->st));
+      loop_msg_side = true;
+    } else {
+      attn_res_mix(rv.b.loop_bank, ps.res->loop_n, rv.b.loop_bank_out, a.loop_msg_query, 4, R, H, rv.b.loop_msg, st);
+    }
+  }
 
   // A fused round's producers write a projection's input as its GEMM reads it, in the launch that computes it; the
   // generic layer stages it from float32 rows in a launch of its own for each reader.
@@ -806,7 +891,7 @@ void rel_attn_layer(const Pass& ps, const RelAttnBlock& a, bool fused) {
     const SublayerPostConv spc = make_sublayer_post_conv(ps, pend);
     float* x_src = ps.res->x_cur ? ps.res->x_cur : rv.b.x;
     float* x_dst = (x_src == rv.b.x) ? rv.b.post_out : rv.b.x;
-    const int nq = is_swa ? 1 : 3;
+    const int nq = a.res_queries();
     const bool q_dual = a.loop_rank == 0 && a.stacked_qgr && a.w_qgr.q8_inputs() && (H % 32 == 0) &&
                         gemm_reads_split(rv.b.h, H, a.w_sink, H, L);
     const bool swa_reuse = is_swa && same_norm(a.q_norm_in, a.k_norm_in) && same_norm(a.q_norm_in, a.v_norm_in) &&
@@ -820,22 +905,56 @@ void rel_attn_layer(const Pass& ps, const RelAttnBlock& a, bool fused) {
     if (pend.res_push) ++ps.res->res_n;
     ps.res->pending = {};
     ps.res->x_cur = x_dst;
+    // The next MoE's router, loop controller, query and norm (FLYX_WARM bits 1, 2, 4), while the attention runs:
+    // RTX 5090, Inkling-2-Mini UD-IQ4_XS plain decoding 204.7 -> 207.5 tok/s with all three (the bank too: no gain).
+    const int warm = warm_flags();
+    if (warm && s->expert_side.st && ps.next_moe && ps.round) {
+      const MoeBlock& f = *ps.next_moe;
+      L2Ranges r;
+      const size_t HH = size_t(f.hidden);
+      if (warm & 1) add_round(r, f.router, size_t(f.n_experts) * HH);
+      if ((warm & 2) && f.loop_rank > 0) {
+        const size_t rk = size_t(f.loop_rank);
+        add_round(r, f.loop_ctrl.down, rk * 2 * HH);
+        if (f.loop_ctrl.stacked) {
+          add_round(r, f.loop_ctrl.gain_forget, rk * 2 * HH);
+        } else {
+          add_round(r, f.loop_ctrl.gain, rk * HH);
+          add_round(r, f.loop_ctrl.forget, rk * HH);
+        }
+      }
+      if (warm & 4) {
+        r.add(f.res_query, HH * 4);
+        r.add(f.norm.w, HH * 4);
+      }
+      warm_side(ps, r);
+    }
+    // The one-row guess uses the mixed residual before the attention adds its contribution.
+    static const int guess_planes = [] {
+      const char* e = std::getenv("FLYX_GUESS");
+      return e ? std::atoi(e) : 5;
+    }();
+    if (guess_planes > 0 && R == 1) guess_experts(x_dst, true, guess_planes & 15);
     in_raw[0] = rv.b.attn_in;
     in_raw[1] = is_swa ? rv.b.attn_in : rv.b.attn_in + size_t(R) * H;
     in_raw[2] = is_swa ? rv.b.attn_in : rv.b.attn_in + size_t(2) * R * H;
     q_staged = fuse_q_norm;
   } else {
-    if (has_pending) flush_pending_post_conv(ps, false);
+    if (has_pending) {
+      finish_residual_read();
+      flush_pending_post_conv(ps, false);
+    }
     const float* cur_x = (ps.res && ps.res->x_cur) ? ps.res->x_cur : rv.b.x;
     in_raw[0] = in_raw[1] = in_raw[2] = cur_x;
     if (a.res_query) {
-      const int nq = is_swa ? 1 : 3;
+      const int nq = a.res_queries();
       attn_res_mix(rv.b.res_bank, ps.res->res_n, cur_x, a.res_query, nq, R, H, rv.b.attn_in, st);
       in_raw[0] = rv.b.attn_in;
       in_raw[1] = is_swa ? rv.b.attn_in : rv.b.attn_in + size_t(R) * H;
       in_raw[2] = is_swa ? rv.b.attn_in : rv.b.attn_in + size_t(2) * R * H;
     }
   }
+  if (loop_msg_side) CK(cudaStreamWaitEvent(st, L.side->join, 0));
   if (a.loop_rank > 0 && loop_as_round(ps)) {
     // The q, k and v controllers at once, each writing where its input was mixed (attn_in + j R H).  An SWA block
     // mixes one input for all three there, which the first would write over while the others read it: that one
@@ -871,8 +990,27 @@ void rel_attn_layer(const Pass& ps, const RelAttnBlock& a, bool fused) {
     const bool dual = round_q8 && w.q8_inputs() && gemm_reads_split(rv.b.h, H, companion, H, L);
     if (dual) {
       rmsnorm_q8_split(x, H, n.w, n.offset, n.eps, R, H, L);
-      gemm_presplit(w, cols, H, out, ld_out, R, false, L);
-      gemm_presplit(companion, companion_cols, H, companion_out, companion_cols, R, false, L);
+      // The companion (the sink's 24 columns: a 3-block launch, ~3.5 us) beside the wide GEMM on the side stream: it
+      // reads only the split rows, which nothing writes until the join after the wide GEMM, and writes only its
+      // own output.  FLYX_SIDE_COMPANION=0: in turn.  Same launches, same bits.
+      static const bool beside = [] {
+        const char* e = std::getenv("FLYX_SIDE_COMPANION");
+        return !e || std::atoi(e) != 0;
+      }();
+      if (beside && ps.round && L.side && L.side->st && (!L.opt || L.opt->side_stream)) {
+        Launch on = L;
+        on.st = L.side->st;
+        on.side = nullptr;
+        CK(cudaEventRecord(L.side->fork, L.st));
+        CK(cudaStreamWaitEvent(on.st, L.side->fork, 0));
+        gemm_presplit(companion, companion_cols, H, companion_out, companion_cols, R, false, on);
+        CK(cudaEventRecord(L.side->join, on.st));
+        gemm_presplit(w, cols, H, out, ld_out, R, false, L);
+        CK(cudaStreamWaitEvent(L.st, L.side->join, 0));
+      } else {
+        gemm_presplit(w, cols, H, out, ld_out, R, false, L);
+        gemm_presplit(companion, companion_cols, H, companion_out, companion_cols, R, false, L);
+      }
     } else {
       rmsnorm(x, H, n.w, n.offset, n.eps, rv.b.h, H, R, H, st);
       gemm(rv.b.h, H, w, cols, H, out, ld_out, R, false, L);
@@ -880,6 +1018,39 @@ void rel_attn_layer(const Pass& ps, const RelAttnBlock& a, bool fused) {
     }
     return dual;
   };
+
+  // A sliding-window round's K and V projections (their own norms of their own inputs) beside the q path on the side
+  // stream, with the side's own 8-bit rows (side_scratch): they read inputs ready before the fork and write only
+  // the K/V ShortConv rows, which rel_attn_prep reads after the join.  FLYX_SIDE_KV=0: in turn.  Same bits.
+  static const bool kv_side_env = [] {
+    const char* e = std::getenv("FLYX_SIDE_KV");
+    return !e || std::atoi(e) != 0;
+  }();
+  const bool kv_shares_q = in_raw[0] == in_raw[1] && in_raw[0] == in_raw[2] && same_norm(a.q_norm_in, a.k_norm_in) &&
+                           same_norm(a.q_norm_in, a.v_norm_in);
+  // K and V weights in 8 bits only: their norms then write the side scratch's q8 rows, never the bf16 split rows
+  // the q path's GEMMs share (rmsnorm_split of other weights writes Scratch::split).
+  const bool kv_beside = kv_side_env && ps.round && is_swa && fused && H % 64 == 0 && round_q8 && a.conv <= 64 &&
+                         a.w_k.q8_inputs() && a.w_v.q8_inputs() &&
+                         !kv_shares_q && L.side && L.side->st && (!L.opt || L.opt->side_stream) && !q_normed;
+  if (kv_beside) {
+    // The side's 8-bit rows in the SwiGLU's buffers (Launch::glu), which no attention block uses: the q path's
+    // rows stay in q8 while the K and V norms write theirs.
+    Scratch side_scr = side_scratch(*L.scratch);
+    side_scr.q8 = side_scr.q8_glu;
+    side_scr.q8_scale = side_scr.q8_glu_scale;
+    side_scr.q8_sums = side_scr.q8_glu_sums;
+    Launch on = L;
+    on.st = L.side->st;
+    on.scratch = &side_scr;
+    on.side = nullptr;
+    CK(cudaEventRecord(L.side->fork, L.st));
+    CK(cudaStreamWaitEvent(on.st, L.side->fork, 0));
+    norm_project(in_raw[1], rv.b.h, rv.b.kv_conv, kv_dim, R, a.k_norm_in, a.w_k, kv_dim, H, on, true);
+    norm_project(in_raw[2], rv.b.h, rv.b.kv_conv + size_t(R) * kv_dim, kv_dim, R, a.v_norm_in, a.w_v, kv_dim, H, on,
+                 true);
+    CK(cudaEventRecord(L.side->join, on.st));
+  }
 
   if (q_staged) {
     gemm_presplit(a.w_qgr, 2 * q_dim + nh * dr, H, rv.b.proj, rv.ld_proj, R, false, L);
@@ -933,8 +1104,12 @@ void rel_attn_layer(const Pass& ps, const RelAttnBlock& a, bool fused) {
   };
   float* k_dyn = is_swa ? nullptr : rv.b.kv_dyn;
   float* v_dyn = is_swa ? nullptr : (fuse_kv_sc ? rv.b.kv_dyn + size_t(R) * nkv * a.conv : rv.b.kv_dyn);
-  project_kv(in_raw[1], a.k_norm_in, a.w_k, a.w_k_conv_proj, a.k_conv, 0, k_dyn);
-  project_kv(in_raw[2], a.v_norm_in, a.w_v, a.w_v_conv_proj, a.v_conv, kv_dim, v_dyn);
+  if (kv_beside) {
+    CK(cudaStreamWaitEvent(L.st, L.side->join, 0));
+  } else {
+    project_kv(in_raw[1], a.k_norm_in, a.w_k, a.w_k_conv_proj, a.k_conv, 0, k_dyn);
+    project_kv(in_raw[2], a.v_norm_in, a.w_v, a.w_v_conv_proj, a.v_conv, kv_dim, v_dyn);
+  }
 
   const KvBuf& kb = s->kv[size_t(a.kv)];
   KvRef kv = kb.ref();
@@ -1029,6 +1204,7 @@ void rel_attn_layer(const Pass& ps, const RelAttnBlock& a, bool fused) {
   if (split || q8_out) gemm_presplit(a.w_o, H, q_dim, rv.b.post_raw, H, R, false, L);
   else gemm(rv.b.act, q_dim, a.w_o, H, q_dim, rv.b.post_raw, H, R, false, L);
 
+  finish_residual_read();
   if (round_q8 && ps.res && a.post_conv && rv.b.post_out && H <= 5120) {
     ps.res->pending = PendingPostConv{rv.b.post_raw, a.post_conv, a.sconv, 2 * kv_dim, a.conv, a.res_push != 0};
     return;
@@ -1088,6 +1264,29 @@ void moe_layer(const Pass& ps, const MoeBlock& f, bool fused) {
       cur = rv.b.attn_in;
     }
   }
+  // The next attention's controllers, queries, ShortConv taps, sink, norm, relative bias and Q clip (FLYX_WARM bit
+  // 16), while this MoE runs: 207.5 -> 211.5 tok/s, 35k-token prompt 159.5 -> 163.3 (its K and V blocks too: a loss).
+  if (s->expert_side.st && (warm_flags() & 16) && ps.next_attn && ps.round) {
+    const RelAttnBlock& a = *ps.next_attn;
+    const size_t HH = size_t(a.hidden), kvd = size_t(a.nkv) * a.hd;
+    L2Ranges ctrl, small;  // L2Ranges holds 8 ranges
+    if (a.loop_rank > 0)
+      for (int j = 0; j < 3; ++j) {
+        const size_t rk = size_t(a.loop_rank);
+        add_round(ctrl, a.loop_ctrl[j].down, rk * 2 * HH);
+        if (a.loop_ctrl[j].stacked) add_round(ctrl, a.loop_ctrl[j].gain_forget, rk * 2 * HH);
+      }
+    small.add(a.res_query, a.res_query_bytes());
+    small.add(a.k_conv, kvd * a.conv * 4);
+    small.add(a.v_conv, kvd * a.conv * 4);
+    small.add(a.post_conv, HH * a.conv * 4);
+    small.add(a.w_sink.w, size_t(a.nh) * HH * 2);
+    small.add(a.q_norm_in.w, HH * 4);
+    small.add(a.rel_bias, size_t(a.rel_extent) * a.d_rel * 4);
+    small.add(a.q_clip_w, size_t(a.nh) * a.hd * 4);
+    warm_side(ps, ctrl);
+    warm_side(ps, small);
+  }
   if (f.loop_rank > 0) {
     const float* msg = rv.b.loop_msg + size_t(3) * R * H;
     if (loop_as_round(ps)) {
@@ -1113,7 +1312,7 @@ void moe_layer(const Pass& ps, const MoeBlock& f, bool fused) {
   }
   gemm(rv.b.h, H, f.router, E, H, rv.b.proj, E, R, false, L);
   moe_route(rv.b.proj, f.router_bias, R, E, K, f.gating_sigmoid, f.norm_weights, f.norm_eps, f.route_scale,
-            rv.b.moe_idx, rv.b.moe_w, st);
+            rv.b.moe_idx, rv.b.moe_w, L);
 
   bf16* act_bf16 =
       round_q8 && moe_round_bf16_down(f.down, R, K, I, msc) ? reinterpret_cast<bf16*>(rv.b.moe_act) : nullptr;

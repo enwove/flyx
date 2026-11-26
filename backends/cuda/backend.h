@@ -218,6 +218,8 @@ struct RowBufs {
   float *rel_q = nullptr, *rel_btab = nullptr, *sink = nullptr, *kv_conv = nullptr, *kv_dyn = nullptr;
   float *post_raw = nullptr, *post_out = nullptr;
   int* moe_idx = nullptr;
+  float* moe_guess = nullptr;  // rounds: the experts' scores moe_prefetch guesses from (n_experts floats), then
+                              // the mixed row moe_guess_scores reads (hidden floats)
   // moe_act: the activations in float32, or in bf16 where a fused round's gate|up GEMM writes the down GEMM's input
   float *moe_w = nullptr, *moe_gu = nullptr, *moe_act = nullptr;
   MoeScratch moe_sc{};  // the expert GEMMs' staged inputs, their grouping and the down projection's slots
@@ -596,6 +598,9 @@ struct flyx_seq {
   int max_ctx = 0, cap = 0, rows_cap = 0;
   cudaStream_t st = nullptr;
   flyx::cuda::SideStream side{};  // a round's narrow GEMMs of a stack beside its wide ones (Launch::side)
+  // A round's expert reads ahead (moe_prefetch): a stream of its own, so they never queue before Launch::side's GEMMs.
+  flyx::cuda::SideStream expert_side{};
+  cudaEvent_t expert_read = nullptr;  // last read of mutable residuals, before the immutable weight prefetch
   std::vector<void*> allocs;
 
   flyx::cuda::DevParams* P = nullptr;
@@ -783,6 +788,7 @@ struct flyx_seq {
     if (st) cudaStreamSynchronize(st);
     if (stage_side.st) cudaStreamSynchronize(stage_side.st);
     if (side.st) cudaStreamSynchronize(side.st);
+    if (expert_side.st) cudaStreamSynchronize(expert_side.st);
     release_prefill_pool();
     if (profile) print_profile();
     for (auto e : prof_ev) cudaEventDestroy(e);
@@ -800,6 +806,8 @@ struct flyx_seq {
     flyx::cuda::destroy_side(stage_side);
     if (dv.body) cudaStreamDestroy(dv.body);
     flyx::cuda::destroy_side(side);
+    if (expert_read) cudaEventDestroy(expert_read);
+    flyx::cuda::destroy_side(expert_side);
     if (st) cudaStreamDestroy(st);
   }
   // dry: count the bytes the allocations would take, allocate nothing (seq_bytes).
@@ -1081,6 +1089,7 @@ struct ResState {
   int res_n = 0, prelude_n = 0, loop_n = 0;
   float* x_cur = nullptr;       // active residual buffer (rv.b.x or rv.b.post_out)
   PendingPostConv pending{};    // deferred post_conv to fuse into next sublayer
+  bool expert_work = false;     // this pass forked onto expert_side and must rejoin before leaving capture
 };
 
 struct Pass {
@@ -1104,6 +1113,8 @@ struct Pass {
   const int32_t* mtp_pos_3d = nullptr;
   RowView v{};           // the rows it works on (rows_of(s) for a sequence's own pass)
   ResState* res = nullptr;  // pass-local AttnRes / loop bank counters (stack-owned by forward_nodes)
+  const MoeBlock* next_moe = nullptr;       // the MoE right after this node (forward_nodes): its L2 warm-up
+  const RelAttnBlock* next_attn = nullptr;  // the attention right after this node: its L2 warm-up
   int width() const { return accept_width >= 0 ? accept_width : p->width; }
   bool reads_copy(const KvBuf& kb) const { return round && kb.kq && strata != kStrataNone; }
   bool reads_cache(const KvBuf& kb) const { return !reads_copy(kb) || strata == kStrataBoth; }
@@ -1116,7 +1127,7 @@ void bind(flyx_bmodel* m, const flyx_model_desc& d, LoadTimes* times = nullptr);
 // Resolve placement from the representation the loader uploads. Optionally report resident bytes and vision weights.
 int resolve_vision_device(const flyx_model_desc& desc, const BackendOptions& opt, uint64_t free_vram,
                           uint64_t* resident_bytes, std::vector<char>* vision_weights = nullptr);
-// Pre-flight device memory estimate (ABI 45: flyx_backend_api::estimate_load).
+// Pre-flight device memory estimate (ABI 48: flyx_backend_api::estimate_load).
 int estimate_load(const flyx_model_desc* desc, const flyx_open_options* opts, uint64_t free_vram,
                   uint64_t total_vram, flyx_load_estimate* out);
 // The DV block i's selector token tables (DvBlock::sel_ta, sel_tb: [vocab][sel_rank] float32 each, counted with the
