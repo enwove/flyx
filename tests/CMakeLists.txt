@@ -422,7 +422,7 @@ add_test(NAME scheduler_queue COMMAND scheduler_test ${ASSETS}/tiny.flyx cpu_ref
 add_test(NAME scheduler_prewarmed_history COMMAND scheduler_test ${ASSETS}/tiny.flyx cpu_ref history)
 # Raw prompts of different clients (the same text, or one extending another's) each run to their own end; a shared
 # conversation id replaces.
-add_test(NAME scheduler_raw_clients COMMAND scheduler_test ${ASSETS}/tiny.flyx cpu_ref raw-clients)
+flyx_register_test(scheduler_raw_clients scheduler_test ${ASSETS}/tiny.flyx cpu_ref raw-clients)
 add_test(NAME scheduler_interrupted_prewarm COMMAND scheduler_test ${ASSETS}/tiny.flyx cpu_ref interrupted-prewarm)
 add_test(NAME scheduler_reassigned_prewarm COMMAND scheduler_test ${ASSETS}/tiny.flyx cpu_ref reassigned-prewarm)
 add_test(NAME scheduler_repeated_prewarm COMMAND scheduler_test ${ASSETS}/tiny.flyx cpu_ref repeated-prewarm)
