@@ -1426,7 +1426,7 @@ int main(int argc, char** argv) {
         check(same_tokens(fresh_gen(*cu_both, prompt, 24, true), cu_sampled),
               "Gate 4: cuda DSpark + DFlash2 (--drafter all) sampled+penalties == cuda plain");
 
-        // 16-row (width=15) row-count invariance + adaptive conditional graph (width=0) + oracle + lookup.
+        // 16-row (width=15) row-count invariance + adaptive conditional graphs (rounds chosen) + oracle + lookup.
         for (const bool mixed : {false, true}) {
           const std::string tag = mixed ? "mixed-quant" : "bf16";
           const auto& tgt = mixed ? mixed_gguf : bf16_gguf;
@@ -1544,10 +1544,14 @@ int main(int argc, char** argv) {
             GenerateResult res;
             check(same_tokens(run_gen(so, prompt, 48, false, {}, -1, &res), want48),
                   tag + " Gate 4: adaptive " + name + " + oracle (forced accepted runs) greedy == plain");
+            // Launched on the adaptive plan, not on a fixed round the engine falls back to (a round launched as the
+            // reply ends is counted there and never read, so the count may pass the drafter's rounds read by one or
+            // two); and drafts accepted beyond the lookup rounds'.
             const int drafted = res.drafter_rounds.empty() ? 0 : res.drafter_rounds[0];
-            check(drafted > 0 && res.usage.accepted_drafts > 0,
-                  tag + " adaptive " + name + " + oracle: the drafter's rounds ran (" + std::to_string(drafted) +
-                      " rounds, " + std::to_string(res.usage.accepted_drafts) + " drafts accepted)");
+            check(res.adaptive_rounds > 0 && drafted > 0 && res.usage.accepted_drafts > res.lookup_accepted,
+                  tag + " adaptive " + name + " + oracle: rounds launched on the adaptive plan (" +
+                      std::to_string(res.adaptive_rounds) + "; the drafter's rounds read " + std::to_string(drafted) +
+                      ", " + std::to_string(res.usage.accepted_drafts - res.lookup_accepted) + " drafts accepted)");
           }
           // Fixed width=15 DFlash2 + oracle.
           auto e_w15 = load_engine(tgt.string(), "cuda",
