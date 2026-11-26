@@ -280,8 +280,8 @@ void reset_state(flyx_seq* s, int anchor) {
   for (auto& mt : s->meta) mt = {};
   s->rope_delta = 0;
   s->prev_pos3d_at = -1;
-  s->dring.reset();
   s->ring_hi = 0;  // the rings are written again from position 0, in order
+  s->dring.reset();
   set_params(s, 0, anchor, 0);
 }
 

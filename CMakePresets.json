@@ -83,7 +83,7 @@
       "displayName": "Release package: Windows x86_64, MSVC 2022, CUDA 13, driver only at run time",
       "binaryDir": "$env{USERPROFILE}/flyx-build-release",
       "cacheVariables": {
-        "FLYX_CUDA_ARCHS": "80-real;89-real;120-real;120-virtual",
+        "FLYX_CUDA_ARCHS": "80-real;89-real;120-real",
         "FLYX_TESTS": "OFF",
         "CMAKE_INSTALL_PREFIX": "$env{USERPROFILE}/flyx-build-release/stage"
       }
