@@ -191,16 +191,15 @@ void draft_block(flyx_seq* s, const DFlashBlock& b, int width, const Launch& L, 
   }
   for (int j = 0; j < b.layers(); ++j) {
     const auto& l = block<DFlashLayer>(m, b.first_layer + j);
-    kv16* Kj = kv.k16(j);
-    kv16* Vj = kv.v16(j);
+    const KvRef kvr = kv.layer_ref(j);
     rmsnorm(s->dx, H, l.norm.w, l.norm.offset, l.norm.eps, s->dh, H, B, H, st);
     gemm(s->dh, H, l.attn_proj, 2 * TG, H, s->ddelta, 2 * TG, B, false, L);
     grouped_conv(s->dh, H, s->ddelta, 2 * TG, l.attn_base, H, Tp, b.conv_group, s->dhc, H, B, false, st);
     gemm(s->dhc, H, l.w_qkv, nqkv, H, s->dproj, s->ld_dproj, B, false, L);
     attn_prep(s->dproj, s->ld_dproj, 0, nh * hd, (nh + nkv) * hd, l.q_norm.w, l.k_norm.w, l.q_norm.offset,
-              l.q_norm.eps, b.theta, hd, nh, nkv, hd, B, s->P, kPosPosition, false, s->dq, Kj, Vj, st);
+              l.q_norm.eps, b.theta, hd, nh, nkv, hd, B, s->P, kPosPosition, false, s->dq, kvr, st);
     const bool split_o = fused && !l.w_o.q8_inputs() && (nh * hd) % 64 == 0;
-    attention(s->dq, Kj, Vj, nh, nkv, hd, B, false, B, 1.f / std::sqrt(float(hd)), s->P, nullptr, 0,
+    attention(s->dq, kvr, nh, nkv, hd, B, false, B, 1.f / std::sqrt(float(hd)), s->P, nullptr, 0,
               split_o ? nullptr : s->dact, s->ld_dact, s->own.part, kRoundSplits, L, 0, b.window);
     if (split_o) gemm_presplit(l.w_o, H, nh * hd, s->dtmp, H, B, false, L);
     else gemm(s->dact, s->ld_dact, l.w_o, H, nh * hd, s->dtmp, H, B, false, L);
@@ -776,16 +775,17 @@ void flush_pending_post_conv(const Pass& ps, bool require_in_x) {
   }
 }
 
-// Small weights a later latency-bound kernel reads, asked of L2 on the expert stream (FLYX_WARM): joined at the
-// round's end (flyx_seq::warm_out).  Changes no result.
-static void warm_side(flyx_seq* s, cudaStream_t st, const L2Ranges& r) {
-  if (!r.count || !s->expert_side.st || st != s->st) return;  // a sequence's own stream (batched passes: not)
+// The expert stream rejoins the main stream at the end of this pass.
+static void warm_side(const Pass& ps, const L2Ranges& r) {
+  auto* s = ps.s;
+  const cudaStream_t st = ps.v.L.st;
+  if (!r.count || !ps.res || !s->expert_side.st || st != s->st) return;  // a sequence's own stream (batched passes: not)
   const SideStream& es = s->expert_side;
   CK(cudaEventRecord(es.fork, st));
   CK(cudaStreamWaitEvent(es.st, es.fork, 0));
   l2_warm(r, es.st);
   CK(cudaEventRecord(es.join, es.st));
-  s->warm_out = true;
+  ps.res->expert_work = true;
 }
 
 // A linear's round weights (Lin::round) of n values: binary16 or float32.
@@ -816,6 +816,45 @@ void rel_attn_layer(const Pass& ps, const RelAttnBlock& a, bool fused) {
   const int skip = ps.round && direct ? kSkipIfStopped : kSkipNever;
   float* rep = ps.round ? sc.replay : nullptr;
   const size_t rep_stride = ps.round ? sc.r_stride : 0;
+
+  // Each guess consumes the residual on the expert stream. Only that read must finish before an
+  // in-place ShortConv or the next layer can reuse the row/bank. Prefetching weights can continue.
+  bool expert_read_pending = false;
+  auto guess_experts = [&](const float* row, bool mix, int planes) {
+    if (!ps.round || !ps.res || !ps.next_moe || !rv.b.moe_guess || !s->expert_side.st || st != s->st) return;
+    const MoeBlock& f = *ps.next_moe;
+    const bf16* rb = f.router.round.b16 ? f.router.round.b16 : (f.router.round.f32 ? nullptr : f.router.w);
+    if ((!rb && !f.router.round.f32) || f.n_experts < 1 || f.n_experts > 256 ||
+        f.top_k < 1 || f.top_k > std::min(f.n_experts, kMoeRouteMaxTopK) ||
+        !f.gate_up.q || !f.gate_up.s || !f.down.q || !f.down.s || f.gate_up.packed() || f.down.packed() ||
+        (mix && !f.res_query)) return;
+    const SideStream& es = s->expert_side;
+    CK(cudaEventRecord(es.fork, st));
+    CK(cudaStreamWaitEvent(es.st, es.fork, 0));
+    if (mix) {
+      float* mixed = rv.b.moe_guess + f.n_experts;
+      attn_res_mix(rv.b.res_bank, ps.res->res_n, row, f.res_query, 1, 1, H, mixed, es.st);
+      CK(cudaEventRecord(s->expert_read, es.st));
+      row = mixed;
+    }
+    moe_guess_scores(row, f.norm.w, f.norm.offset, rb, rb ? nullptr : f.router.round.f32,
+                     f.router_bias, f.gating_sigmoid, f.n_experts, H, rv.b.moe_guess, es.st);
+    if (!mix) CK(cudaEventRecord(s->expert_read, es.st));
+    expert_read_pending = true;
+    moe_prefetch(rv.b.moe_guess, f.n_experts, f.top_k, H, f.inter, f.gate_up, f.down, planes, es.st);
+    CK(cudaEventRecord(es.join, es.st));
+    ps.res->expert_work = true;
+  };
+  auto finish_residual_read = [&] {
+    if (expert_read_pending) CK(cudaStreamWaitEvent(st, s->expert_read, 0));
+    expert_read_pending = false;
+  };
+  static const int prefetch = [] {
+    const char* e = std::getenv("FLYX_EXPERT_PREFETCH");
+    return e ? std::atoi(e) : 2;
+  }();
+  if (prefetch && (prefetch != 2 || R > 1) && R <= FLYX_MAX_ROWS && ps.res)
+    guess_experts(ps.res->x_cur ? ps.res->x_cur : rv.b.x, false, -1);
 
   // The loop messages read only the loop bank, which no kernel of the pass writes: on the side stream beside the
   // sublayer's mix, joined before the controllers read them (FLYX_SIDE_LOOP_MSG=0: in turn).  Same bits.
@@ -852,7 +891,7 @@ void rel_attn_layer(const Pass& ps, const RelAttnBlock& a, bool fused) {
     const SublayerPostConv spc = make_sublayer_post_conv(ps, pend);
     float* x_src = ps.res->x_cur ? ps.res->x_cur : rv.b.x;
     float* x_dst = (x_src == rv.b.x) ? rv.b.post_out : rv.b.x;
-    const int nq = is_swa ? 1 : 3;
+    const int nq = a.res_queries();
     const bool q_dual = a.loop_rank == 0 && a.stacked_qgr && a.w_qgr.q8_inputs() && (H % 32 == 0) &&
                         gemm_reads_split(rv.b.h, H, a.w_sink, H, L);
     const bool swa_reuse = is_swa && same_norm(a.q_norm_in, a.k_norm_in) && same_norm(a.q_norm_in, a.v_norm_in) &&
@@ -869,7 +908,7 @@ void rel_attn_layer(const Pass& ps, const RelAttnBlock& a, bool fused) {
     // The next MoE's router, loop controller, query and norm (FLYX_WARM bits 1, 2, 4), while the attention runs:
     // RTX 5090, Inkling-2-Mini UD-IQ4_XS plain decoding 204.7 -> 207.5 tok/s with all three (the bank too: no gain).
     const int warm = warm_flags();
-    if (warm && ps.next_moe && ps.round) {
+    if (warm && s->expert_side.st && ps.next_moe && ps.round) {
       const MoeBlock& f = *ps.next_moe;
       L2Ranges r;
       const size_t HH = size_t(f.hidden);
@@ -888,44 +927,27 @@ void rel_attn_layer(const Pass& ps, const RelAttnBlock& a, bool fused) {
         r.add(f.res_query, HH * 4);
         r.add(f.norm.w, HH * 4);
       }
-      warm_side(s, st, r);
+      warm_side(ps, r);
     }
-    // The next MoE's experts guessed from the bank as it stands mixed with its query (the attention's output not yet
-    // in it; 65% of the experts right, against 8% from the residual row alone), and asked of L2 while the attention
-    // runs (FLYX_GUESS: planes mask, moe_prefetch_mixed; 16 the guess alone; 0 off).  Changes no result: the
-    // expert stream joins only at the round's end, so a later sublayer may rewrite x_dst under it, which costs only
-    // the guess.  RTX 5090,
-    // Inkling-2-Mini UD-IQ4_XS plain decoding, top 4 guesses (FLYX_GUESS_K): 0 215.7, 1 (gate|up codes) 220.4,
-    // 5 (and down codes) 221.5, 15 (and scales) 218.1 tok/s; with all 8 guesses 5 214.2.  35k-token prompt: 165.7 -> 167.4.
+    // The one-row guess uses the mixed residual before the attention adds its contribution.
     static const int guess_planes = [] {
       const char* e = std::getenv("FLYX_GUESS");
       return e ? std::atoi(e) : 5;
     }();
-    if (guess_planes > 0 && R == 1 && ps.next_moe && ps.next_moe->res_query && rv.b.moe_guess &&
-        s->expert_side.st && st == s->st && ps.round) {
-      const MoeBlock& f = *ps.next_moe;
-      const SideStream& es = s->expert_side;
-      float* mixed = rv.b.moe_guess + f.n_experts;
-      CK(cudaEventRecord(es.fork, st));
-      CK(cudaStreamWaitEvent(es.st, es.fork, 0));
-      attn_res_mix(rv.b.res_bank, ps.res->res_n, x_dst, f.res_query, 1, 1, H, mixed, es.st);
-      const bf16* rb = f.router.round.b16 ? f.router.round.b16 : (f.router.round.f32 ? nullptr : f.router.w);
-      moe_prefetch_mixed(mixed, f.norm.w, f.norm.offset, rb, rb ? nullptr : f.router.round.f32, f.router_bias,
-                         f.gating_sigmoid, f.n_experts, f.top_k, f.hidden, f.inter, f.gate_up, f.down, rv.b.moe_guess,
-                         guess_planes & 15, es.st);
-      CK(cudaEventRecord(es.join, es.st));
-      s->warm_out = true;
-    }
+    if (guess_planes > 0 && R == 1) guess_experts(x_dst, true, guess_planes & 15);
     in_raw[0] = rv.b.attn_in;
     in_raw[1] = is_swa ? rv.b.attn_in : rv.b.attn_in + size_t(R) * H;
     in_raw[2] = is_swa ? rv.b.attn_in : rv.b.attn_in + size_t(2) * R * H;
     q_staged = fuse_q_norm;
   } else {
-    if (has_pending) flush_pending_post_conv(ps, false);
+    if (has_pending) {
+      finish_residual_read();
+      flush_pending_post_conv(ps, false);
+    }
     const float* cur_x = (ps.res && ps.res->x_cur) ? ps.res->x_cur : rv.b.x;
     in_raw[0] = in_raw[1] = in_raw[2] = cur_x;
     if (a.res_query) {
-      const int nq = is_swa ? 1 : 3;
+      const int nq = a.res_queries();
       attn_res_mix(rv.b.res_bank, ps.res->res_n, cur_x, a.res_query, nq, R, H, rv.b.attn_in, st);
       in_raw[0] = rv.b.attn_in;
       in_raw[1] = is_swa ? rv.b.attn_in : rv.b.attn_in + size_t(R) * H;
@@ -1182,6 +1204,7 @@ void rel_attn_layer(const Pass& ps, const RelAttnBlock& a, bool fused) {
   if (split || q8_out) gemm_presplit(a.w_o, H, q_dim, rv.b.post_raw, H, R, false, L);
   else gemm(rv.b.act, q_dim, a.w_o, H, q_dim, rv.b.post_raw, H, R, false, L);
 
+  finish_residual_read();
   if (round_q8 && ps.res && a.post_conv && rv.b.post_out && H <= 5120) {
     ps.res->pending = PendingPostConv{rv.b.post_raw, a.post_conv, a.sconv, 2 * kv_dim, a.conv, a.res_push != 0};
     return;
@@ -1243,7 +1266,7 @@ void moe_layer(const Pass& ps, const MoeBlock& f, bool fused) {
   }
   // The next attention's controllers, queries, ShortConv taps, sink, norm, relative bias and Q clip (FLYX_WARM bit
   // 16), while this MoE runs: 207.5 -> 211.5 tok/s, 35k-token prompt 159.5 -> 163.3 (its K and V blocks too: a loss).
-  if ((warm_flags() & 16) && ps.next_attn && ps.round) {
+  if (s->expert_side.st && (warm_flags() & 16) && ps.next_attn && ps.round) {
     const RelAttnBlock& a = *ps.next_attn;
     const size_t HH = size_t(a.hidden), kvd = size_t(a.nkv) * a.hd;
     L2Ranges ctrl, small;  // L2Ranges holds 8 ranges
@@ -1253,7 +1276,7 @@ void moe_layer(const Pass& ps, const MoeBlock& f, bool fused) {
         add_round(ctrl, a.loop_ctrl[j].down, rk * 2 * HH);
         if (a.loop_ctrl[j].stacked) add_round(ctrl, a.loop_ctrl[j].gain_forget, rk * 2 * HH);
       }
-    small.add(a.res_query, 3 * HH * 4);
+    small.add(a.res_query, a.res_query_bytes());
     small.add(a.k_conv, kvd * a.conv * 4);
     small.add(a.v_conv, kvd * a.conv * 4);
     small.add(a.post_conv, HH * a.conv * 4);
@@ -1261,8 +1284,8 @@ void moe_layer(const Pass& ps, const MoeBlock& f, bool fused) {
     small.add(a.q_norm_in.w, HH * 4);
     small.add(a.rel_bias, size_t(a.rel_extent) * a.d_rel * 4);
     small.add(a.q_clip_w, size_t(a.nh) * a.hd * 4);
-    warm_side(s, st, ctrl);
-    warm_side(s, st, small);
+    warm_side(ps, ctrl);
+    warm_side(ps, small);
   }
   if (f.loop_rank > 0) {
     const float* msg = rv.b.loop_msg + size_t(3) * R * H;
@@ -1289,11 +1312,10 @@ void moe_layer(const Pass& ps, const MoeBlock& f, bool fused) {
   }
   gemm(rv.b.h, H, f.router, E, H, rv.b.proj, E, R, false, L);
   moe_route(rv.b.proj, f.router_bias, R, E, K, f.gating_sigmoid, f.norm_weights, f.norm_eps, f.route_scale,
-            rv.b.moe_idx, rv.b.moe_w, st);
+            rv.b.moe_idx, rv.b.moe_w, L);
 
-  bf16* act_bf16 = round_q8 && !moe_round_vec(f.down, L) && moe_round_bf16_down(f.down, R, K, I, msc)
-                       ? reinterpret_cast<bf16*>(rv.b.moe_act)
-                       : nullptr;
+  bf16* act_bf16 =
+      round_q8 && moe_round_bf16_down(f.down, R, K, I, msc) ? reinterpret_cast<bf16*>(rv.b.moe_act) : nullptr;
   // The grouping of the rows by expert that the gate|up GEMM leaves in the scratch, which the down GEMM takes over.
   int grouped = 0;
   if (fused) {
@@ -1497,7 +1519,7 @@ void draft_context(const Pass& ps, const DFlashBlock& b, bool fused) {
   gemm(rv.b.feats + b.feats_offset, rv.ld_feats, b.fc, H, F, rv.b.cx, H, R, false, L);
   norm_project(rv.b.cx, rv.b.h, rv.b.ckv, rv.ld_ckv, R, b.hidden_norm, b.ctx, b.ctx_width(), H, L, fused);
   draft_ctx_kv(rv.b.ckv, rv.ld_ckv, b.k_norms.w, b.k_norms.eps, b.theta, b.layers(), b.nkv, b.hd, R, s->P,
-               ps.round ? kPosStart : kPosPosition, ps.round, kv.k16(), kv.v16(), kv.layer_stride, st);
+               ps.round ? kPosStart : kPosPosition, ps.round, kv.k16(), kv.v16(), kv.layer_stride, st, kv.ring);
 }
 
 // The selector's table over the slots the tree reaches (slots - 1 at most: the last slot never has candidates after

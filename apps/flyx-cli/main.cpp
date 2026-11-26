@@ -287,9 +287,10 @@ std::string widths_str(const Engine& e) {
   return s;
 }
 
-std::unique_ptr<Engine> load(const Args& a) {
+std::unique_ptr<Engine> load(const Args& a, bool elastic = true) {
   EngineOptions o = a.engine;
   o.verbose = a.verbose;
+  o.elastic_load = elastic;
   auto e = std::make_unique<Engine>();
   std::string err;
   if (!e->load(a.model, o, &err)) {
@@ -569,7 +570,7 @@ int cmd_bench_prompts(const Args& a) {
   std::ofstream out;
   if (!open_record(a, &out)) return 1;
 
-  auto e = load(a);
+  auto e = load(a, /*elastic=*/false);
   const int max_new = a.n_given ? a.n : kPromptSetMaxNew;
   // The prompts as tokens (a fresh session's: no history to continue), each one the engine can run.  Each stays with
   // its PreparedRequest, which owns the reply grammar its GenerateRequest points to: a chat without thinking has one
@@ -718,7 +719,7 @@ int cmd_bench(const Args& a) {
   if (!a.prompts.empty()) return cmd_bench_prompts(a);
   std::ofstream out;
   if (!open_record(a, &out)) return 1;
-  auto e = load(a);
+  auto e = load(a, /*elastic=*/false);
   std::vector<std::string> round_names;
   for (size_t i = 0; i < e->widths().size(); ++i) round_names.push_back(e->round_name(i));
   nlohmann::json record = {{"model", a.model},

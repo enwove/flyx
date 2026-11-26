@@ -1,6 +1,8 @@
 // Copyright 2026 The flyx Authors. SPDX-License-Identifier: Apache-2.0
 // CUDA kernel tests for Inkling-2 target ops (softcap, AttnRes, loop control, ShortConv,
 // relative-position-bias attention, sparse MoE) and DSpark drafter kernels against float64 refs.
+#include <cstdlib>
+
 #include "backends/cuda/loader/exact_bf16.h"
 #include "tests/backends/cuda/op_test.cuh"
 
@@ -1732,8 +1734,6 @@ void test_moe_dp4a_variants() {
 }  // namespace
 
 void test_inkling2_moe() {
-  Launch TR = TL;  // a round's calls (a sequence's own buffers): NVFP4 experts on k_moe_nvfp4_vec
-  TR.round_rows = true;
   test_inkling2_moe_norm();
   test_moe_gate_up_rules();
   test_moe_dp4a_variants();
@@ -1748,7 +1748,7 @@ void test_inkling2_moe() {
     float* db = sig ? up(bias) : nullptr;
     int* di = dev<int>(size_t(R) * top_k);
     float* dw = dev<float>(size_t(R) * top_k);
-    moe_route(dl, db, R, E, top_k, sig != 0, true, 1e-20f, 2.5f, di, dw, 0);
+    moe_route(dl, db, R, E, top_k, sig != 0, true, 1e-20f, 2.5f, di, dw, TL);
     auto got_i = down_i(di, size_t(R) * top_k);
     Vec got_w = down(dw, size_t(R) * top_k);
 
@@ -1825,6 +1825,8 @@ void test_inkling2_moe() {
   msc.max_experts = E;
   msc.max_top_k = top_k;
 
+  const char* vec_env = std::getenv("FLYX_MOE_VEC");
+  const bool vec_nvfp4 = vec_env && std::atoi(vec_env) != 0;  // moe_vec_enabled(): the tensor-core path by default
   ExpertMat nvfp4_down{};
   auto run_and_check = [&](const std::string& label, const ExpertMat& w_gu, const ExpertMat& w_dn, const Vec& gu_f64,
                            const Vec& dn_f64, bool round_a16, bool round_q8, bool round_a16h, double tol) {
@@ -1883,25 +1885,30 @@ void test_inkling2_moe() {
       for (int rows : {1, 8, 16}) {
         const std::string tag = label + " R=" + std::to_string(rows);
         const size_t elems = size_t(rows) * top_k * I;
-        moe_gate_up(d_x, H, scaled_gu, d_eidx, rows, top_k, I, H, beta, lb, true, d_act_unfused, I, &msc, TR);
-        moe_down(d_act_unfused, I, nvfp4_down, d_eidx, d_ew, rows, top_k, H, I, d_y_direct, H, false, &msc, TR);
-        // NVFP4 rounds take float32 SiTU outputs (k_moe_nvfp4_vec): the BF16 SiTU is those, rounded once.
+        moe_gate_up(d_x, H, scaled_gu, d_eidx, rows, top_k, I, H, beta, lb, false, d_gu_raw, 2 * I, &msc, TL);
+        situ_rows(d_gu_raw, 2 * I, I, beta, lb, d_act_unfused, I, rows * top_k, TL.st);
+        moe_down(d_act_unfused, I, nvfp4_down, d_eidx, d_ew, rows, top_k, H, I, d_y_direct, H, false, &msc, TL);
         Vec staged = down(d_act_unfused, elems);
-        round_bf16(staged);
         const Vec y = down(d_y_direct, size_t(rows) * H);
 
+        const bool bf16_down = moe_round_bf16_down(nvfp4_down, rows, top_k, I, &msc);
+        if (bf16_down == vec_nvfp4) {
+          std::printf("  FAIL mixed MoE down input representation %s\n", tag.c_str());
+          ++g_fail;
+        }
+        if (bf16_down) round_bf16(staged);
         moe_stage_q8(d_x, H, H, rows, msc, moe_q8_mins(scaled_gu), TL.st);
         CK(cudaMemset(d_y_direct, 0, size_t(rows) * H * sizeof(float)));  // an accidental restage sees zeros
-        CK(cudaMemset(packed_act, 0xFF, elems * sizeof(bf16)));
-        moe_gate_up(d_y_direct, H, scaled_gu, d_eidx, rows, top_k, I, H, beta, lb, true, nullptr, I, &msc, TR, true,
-                    packed_act);
-        const Vec got = down_bf16(packed_act, elems);
-        expect_bits("moe BF16 SiTU == float SiTU + NVFP4 stage " + tag, got, staged);
-        moe_down(nullptr, I, nvfp4_down, d_eidx, d_ew, rows, top_k, H, I, d_y_direct, H, false, &msc, TR, packed_act);
-        // The BF16-input down keeps the tensor-core kernel: the float32-input round's result to within its rounding.
-        expect("moe NVFP4 down consumes BF16 SiTU " + tag, down(d_y_direct, size_t(rows) * H), y, 1e-2);
+        CK(cudaMemset(d_act_unfused, 0xFF, elems * sizeof(float)));
+        moe_gate_up(d_y_direct, H, scaled_gu, d_eidx, rows, top_k, I, H, beta, lb, true,
+                    bf16_down ? nullptr : d_act_unfused, I, &msc, TL, true, bf16_down ? packed_act : nullptr);
+        const Vec got = bf16_down ? down_bf16(packed_act, elems) : down(d_act_unfused, elems);
+        expect_bits("mixed MoE fused SiTU == generic " + tag, got, staged);
+        moe_down(bf16_down ? nullptr : d_act_unfused, I, nvfp4_down, d_eidx, d_ew, rows, top_k, H, I,
+                 d_y_direct, H, false, &msc, TL, bf16_down ? packed_act : nullptr);
+        expect_bits("mixed MoE NVFP4 down fused == generic " + tag, down(d_y_direct, size_t(rows) * H), y);
         if (rows == 1) solo = got;
-        else expect_bits("moe BF16 SiTU row alone == grouped " + tag, solo, Vec(got.begin(), got.begin() + solo.size()));
+        else expect_bits("mixed SiTU row alone == grouped " + tag, solo, Vec(got.begin(), got.begin() + solo.size()));
 
         // Only allow BF16 neighbors when the existing float accumulation tolerance spans their rounding boundary.
         Vec ref(elems);
@@ -1919,9 +1926,9 @@ void test_inkling2_moe() {
         bool within = true;
         for (size_t i = 0; i < elems; ++i) {
           const double lo = from_bf16(to_bf16(ref[i] - tolerance)), hi = from_bf16(to_bf16(ref[i] + tolerance));
-          within &= lo <= got[i] && got[i] <= hi;
+          within &= bf16_down ? (lo <= got[i] && got[i] <= hi) : std::fabs(ref[i] - got[i]) <= tolerance;
         }
-        std::printf("  %-4s moe BF16 SiTU against float64 %s\n", within ? "ok" : "FAIL", tag.c_str());
+        std::printf("  %-4s mixed MoE SiTU against float64 %s\n", within ? "ok" : "FAIL", tag.c_str());
         if (!within) ++g_fail;
       }
       cudaFree(const_cast<float*>(scaled_gu.rs));
@@ -1933,75 +1940,96 @@ void test_inkling2_moe() {
     expect("moe_down " + label, got_y_grp_clean, want_out, tol);
     cudaFree(d_want_act);
 
-    // Gate 4: a row's bits in every round (R=1 with and without scratch, R=8 grouped) are one; NVFP4 prefill passes
-    // (R=37, tensor cores) are their own and equal them to within the tolerance (GGML blocks: all four bit-identical).
-    const bool round_bits_only = w_gu.q && !w_gu.packed();
-    auto expect_round = [&](const std::string& what, const Vec& got, const Vec& want) {
-      if (round_bits_only) expect(what, got, want, 1e-2);  // prefill's BF16 activations vs the rounds' float32
-      else expect_bits(what, got, want);
-    };
+    // Gate 4 includes prefill, verify and scratch-free calls.
     moe_down(d_act_fused, I, w_dn, d_eidx, d_ew, R, top_k, H, I, d_y_grouped, H, false, &msc, TL);
     Vec got_y_grp = down(d_y_grouped, size_t(R) * H);
     const int rr = 19;
     float* d_act_1 = dev<float>(size_t(top_k) * I);
     float* d_y_1 = dev<float>(size_t(H));
     moe_gate_up(d_x + size_t(rr) * H, H, w_gu, d_eidx + size_t(rr) * top_k, 1, top_k, I, H, beta, lb, true, d_act_1, I,
-                nullptr, TR);
+                nullptr, TL);
     moe_down(d_act_1, I, w_dn, d_eidx + size_t(rr) * top_k, d_ew + size_t(rr) * top_k, 1, top_k, H, I, d_y_1, H, false,
-             nullptr, TR);
+             nullptr, TL);
     Vec got_y1 = down(d_y_1, size_t(H));
     Vec got_ygrp_rr(got_y_grp.begin() + ptrdiff_t(rr) * H, got_y_grp.begin() + ptrdiff_t(rr + 1) * H);
-    expect_round("moe R=1 direct == R=37 grouped " + label, got_y1, got_ygrp_rr);
+    expect_bits("moe R=1 direct == R=37 grouped " + label, got_y1, got_ygrp_rr);
 
     moe_gate_up(d_x + size_t(rr) * H, H, w_gu, d_eidx + size_t(rr) * top_k, 1, top_k, I, H, beta, lb, true, d_act_1, I,
-                &msc, TR);
+                &msc, TL);
     moe_down(d_act_1, I, w_dn, d_eidx + size_t(rr) * top_k, d_ew + size_t(rr) * top_k, 1, top_k, H, I, d_y_1, H, false,
-             &msc, TR);
+             &msc, TL);
     const Vec got_y1_staged = down(d_y_1, size_t(H));
-    expect_round("moe R=1 staged == R=37 grouped " + label, got_y1_staged, got_ygrp_rr);
+    expect_bits("moe R=1 staged == R=37 grouped " + label, got_y1_staged, got_ygrp_rr);
 
     const int r8_0 = 16;  // covers rr = 19 at offset 3
     float* d_act_8 = dev<float>(size_t(16) * top_k * I);  // 16 rows: the grouping checks below
     float* d_y_8 = dev<float>(size_t(16) * H);
     moe_gate_up(d_x + size_t(r8_0) * H, H, w_gu, d_eidx + size_t(r8_0) * top_k, 8, top_k, I, H, beta, lb, true, d_act_8,
-                I, &msc, TR);
+                I, &msc, TL);
     moe_down(d_act_8, I, w_dn, d_eidx + size_t(r8_0) * top_k, d_ew + size_t(r8_0) * top_k, 8, top_k, H, I, d_y_8, H,
-             false, &msc, TR);
+             false, &msc, TL);
     Vec got_y8 = down(d_y_8, size_t(8) * H);
-    if (round_bits_only) {
-      // NVFP4 round kernels (k_moe_nvfp4_vec, float32 inputs) against float64 without input rounding: rows
-      // 16..23's SiTU outputs and their down products.
-      Vec want8(size_t(8) * top_k * I, 0.0);
-      Vec wanty(size_t(8) * H, 0.0);
-      {
-        for (int r = 0; r < 8; ++r)
-          for (int k = 0; k < top_k; ++k) {
-            const int slot = (r8_0 + r) * top_k + k, e = eidx[size_t(slot)];
-            Vec gu(static_cast<size_t>(2 * I), 0.0), dn(static_cast<size_t>(H), 0.0);
-            ops::linear_expert_f64(x.data() + ptrdiff_t(r8_0 + r) * H, H, gu_f64.data(), e, 2 * I, gu.data());
-            double* a = want8.data() + ptrdiff_t(r * top_k + k) * I;
-            for (int i = 0; i < I; ++i) a[i] = ops::situ(gu[i], gu[I + i], beta, lb);
-            ops::linear_expert_f64(a, I, dn_f64.data(), e, H, dn.data());
-            for (int c = 0; c < H; ++c) wanty[size_t(r) * H + c] += ew[size_t(slot)] * dn[c];
-          }
-      }
-      const Vec act8 = down(d_act_8, size_t(8) * top_k * I);
-      expect("moe_gate_up R=8 round vs float64 " + label, act8, want8, std::max(tol, 1.5e-4));
-      expect("moe_down R=8 round vs float64 " + label, got_y8, wanty, std::max(tol, 1.5e-4));
+    if (w_gu.q && !w_gu.packed() && vec_nvfp4) {
+      const auto a = want_act.begin() + ptrdiff_t(r8_0) * top_k * I;
+      const auto y = want_out.begin() + ptrdiff_t(r8_0) * H;
+      expect("NVFP4 R=8 SiTU vs float64", down(d_act_8, size_t(8) * top_k * I), Vec(a, a + 8 * top_k * I), 1.5e-4);
+      expect("NVFP4 R=8 down vs float64", got_y8, Vec(y, y + 8 * H), 1.5e-4);
     }
     Vec got_y8_rr(got_y8.begin() + ptrdiff_t(rr - r8_0) * H, got_y8.begin() + ptrdiff_t(rr - r8_0 + 1) * H);
-    expect_round("moe R=8 grouped == R=37 grouped " + label, got_y8_rr, got_ygrp_rr);
+    expect_bits("moe R=8 grouped == R=37 grouped " + label, got_y8_rr, got_ygrp_rr);
     expect_bits("moe R=8 grouped == R=1 staged " + label, got_y8_rr, got_y1_staged);
+
+    if (w_gu.q && !w_gu.packed() && vec_nvfp4) {
+      // Repeat reference rows across the scratch/microtile boundaries. Shift the input and output of gate/up
+      // by a float and pad the input stride so both aligned and scalar loads must produce the same bits.
+      constexpr int max_rows = 257;
+      const int stride = H + 1;
+      Vec padded(1 + size_t(max_rows) * stride), weights(size_t(max_rows) * top_k);
+      std::vector<int> ids(size_t(max_rows) * top_k);
+      Vec acts(size_t(max_rows) * top_k * I), outputs(size_t(max_rows) * H);
+      for (int r = 0; r < max_rows; ++r) {
+        const int src = r % R;
+        std::copy_n(x.data() + src * H, H, padded.data() + 1 + r * stride);
+        std::copy_n(eidx.data() + src * top_k, top_k, ids.data() + r * top_k);
+        std::copy_n(ew.data() + src * top_k, top_k, weights.data() + r * top_k);
+        std::copy_n(got_act_f.data() + src * top_k * I, top_k * I, acts.data() + r * top_k * I);
+        std::copy_n(got_y_grp.data() + src * H, H, outputs.data() + r * H);
+      }
+      float* input = up(padded);
+      float* weight = up(weights);
+      int* expert = dev<int>(ids.size());
+      CK(cudaMemcpy(expert, ids.data(), ids.size() * sizeof(int), cudaMemcpyHostToDevice));
+      float* activation = dev<float>(1 + acts.size());
+      float* output = dev<float>(outputs.size());
+      const MoeScratch* scratch_modes[] = {&msc, nullptr};
+      for (const MoeScratch* scratch : scratch_modes) {
+        for (int nr : {1, 8, 16, 17, 37, 256, 257}) {
+          const int grouped = moe_gate_up(input + 1, stride, w_gu, expert, nr, top_k, I, H, beta, lb, true,
+                                          activation + 1, I, scratch, TL);
+          moe_down(activation + 1, I, w_dn, expert, weight, nr, top_k, H, I, output, H, false, scratch, TL,
+                   nullptr, grouped);
+          const size_t ac = size_t(nr) * top_k * I, yc = size_t(nr) * H;
+          const std::string tag = std::to_string(nr) + (scratch ? " with scratch" : " without scratch");
+          expect_bits("NVFP4 gate/up R=" + tag, down(activation + 1, ac), Vec(acts.begin(), acts.begin() + ac));
+          expect_bits("NVFP4 down R=" + tag, down(output, yc), Vec(outputs.begin(), outputs.begin() + yc));
+        }
+      }
+      CK(cudaFree(input));
+      CK(cudaFree(weight));
+      CK(cudaFree(expert));
+      CK(cudaFree(activation));
+      CK(cudaFree(output));
+    }
 
     // The down GEMM takes over the grouping by expert that the gate|up GEMM leaves (moe_gate_up's return) where its
     // tiles are the ones it would make, else groups again: the same bits either way, at row counts where the two
     // GEMMs' tiles are alike and where they are not.
     for (int rows : {2, 4, 8, 16}) {
       const std::string tag = label + " R=" + std::to_string(rows);
-      const int grouped = moe_gate_up(d_x, H, w_gu, d_eidx, rows, top_k, I, H, beta, lb, true, d_act_8, I, &msc, TR);
-      moe_down(d_act_8, I, w_dn, d_eidx, d_ew, rows, top_k, H, I, d_y_8, H, false, &msc, TR, nullptr, grouped);
+      const int grouped = moe_gate_up(d_x, H, w_gu, d_eidx, rows, top_k, I, H, beta, lb, true, d_act_8, I, &msc, TL);
+      moe_down(d_act_8, I, w_dn, d_eidx, d_ew, rows, top_k, H, I, d_y_8, H, false, &msc, TL, nullptr, grouped);
       const Vec taken = down(d_y_8, size_t(rows) * H);
-      moe_down(d_act_8, I, w_dn, d_eidx, d_ew, rows, top_k, H, I, d_y_8, H, false, &msc, TR);
+      moe_down(d_act_8, I, w_dn, d_eidx, d_ew, rows, top_k, H, I, d_y_8, H, false, &msc, TL);
       expect_bits("moe down on gate|up's grouping == its own " + tag, taken, down(d_y_8, size_t(rows) * H));
     }
     cudaFree(d_act_8);
@@ -2109,7 +2137,7 @@ void test_inkling2_moe() {
     Vec gu_f64, dn_f64;
     make_nvfp4_experts(gu_raw, 2 * I, H, &w_gu, &gu_f64);
     make_nvfp4_experts(dn_raw, H, I, &nvfp4_down, &dn_f64);
-    run_and_check("nvfp4", w_gu, nvfp4_down, gu_f64, dn_f64, true, false, false, 3e-5);
+    run_and_check("nvfp4", w_gu, nvfp4_down, gu_f64, dn_f64, !vec_nvfp4, false, false, 3e-5);
     cudaFree(const_cast<uint8_t*>(w_gu.q));
     cudaFree(const_cast<uint8_t*>(w_gu.s));
     cudaFree(const_cast<float*>(w_gu.rs));

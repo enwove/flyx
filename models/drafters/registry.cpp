@@ -97,9 +97,13 @@ const DSparkSpec& DrafterRegistry::ensure_dspark_spec(const ModelFile& file, con
 
 void DrafterRegistry::validate_selected(const ModelFile& file, const std::vector<Drafter>& selected,
                                         const TargetSpec& target) {
+  int64_t stride = 0;
   for (Drafter kind : selected) {
-    if (kind == Drafter::kDFlash2) (void)ensure_dflash2_spec(file, target);
-    else if (kind == Drafter::kDSpark) (void)ensure_dspark_spec(file, target);
+    int taps = 0;
+    if (kind == Drafter::kDFlash2) taps = ensure_dflash2_spec(file, target).block.n_taps;
+    else if (kind == Drafter::kDSpark) taps = ensure_dspark_spec(file, target).block.n_taps;
+    stride += int64_t(taps) * target.hidden;
+    if (stride > INT_MAX) throw std::runtime_error("combined drafter feature stride exceeds int32");
   }
 }
 

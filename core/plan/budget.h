@@ -31,6 +31,7 @@ struct Budget {
   uint64_t sessions_room = 0;  // of the budget after the weights and the workspace: what the sessions share
   GpuHeld held;
   CtxLimit ctx_limit = CtxLimit::kNone;
+  uint64_t ctx_need_more = 0;  // extra bytes on ctx_limit's side needed to reach the wanted context (0: unknown/none)
   // Where a session's K/V caches go, the host memory that takes, and how much may be taken.
   flyx_seq_layout layout{0, INT32_MAX, FLYX_KV_READ_ALL, 0, 0};
   uint64_t session_host_bytes = 0, host_budget = 0;
@@ -40,6 +41,8 @@ struct Budget {
   // FLYX_KV_AUTO placed with every position exact: its copy did not fit beside the K/V (why: copy_note).
   bool auto_exact = false;
   std::string copy_note;
+  // True when account() returned false due to insufficient device memory (not a non-OOM backend error).
+  bool oom = false;
 };
 
 // The tiers a session's K/V caches may use (EngineOptions::kv_gpu, kv_ram): positions on the GPU at most (-1: as
@@ -53,12 +56,16 @@ struct KvTiers {
   uint64_t reserved = 0;
   int method = FLYX_KV_READ_ALL, method_arg = 0;  // how rounds read the K/V (flyx_seq_layout)
   bool gpu_paged = false;  // the GPU's memory is Windows' to page (os::gpu_memory_paged): reserve at least 832 MiB
+  bool allow_auto_exact = true;  // a locked AUTO switch must survive placement and retries
 };
 
 // The host memory kv_ram's auto leaves to the system and other programs, of a machine with `total_ram` bytes: a
 // sixteenth of it, at least 2 GiB (32 GB: 2 GiB; 64 GB: 4; 128 GB: 8).  The K/V's host memory is page-locked, so
 // nothing else can have it back while the model is served.
 uint64_t host_keep(uint64_t total_ram);
+
+// Device VRAM held back for the CUDA context, fragmentation, and desktop stability (at least 832 MiB on paged WDDM).
+uint64_t device_reserve(uint64_t total_vram, bool gpu_paged);
 
 // Sets the ledger's budget (what the device has now plus what the model already
 // took, less a reserve for the CUDA context, fragmentation and other programs;

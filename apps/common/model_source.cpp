@@ -8,7 +8,9 @@
 #include <filesystem>
 #include <map>
 #include <memory>
+#include <mutex>
 #include <set>
+#include <tuple>
 
 #include "core/interfaces/model.h"
 #include "core/interfaces/options.h"
@@ -54,9 +56,130 @@ uint64_t bytes_on_disk(const std::string& path) {
   return n;
 }
 
+// The cache key describes the same shard gguf_peek actually reads.
+flyx::GgufPeek gguf_peek_cached(const std::string& requested, uint64_t size, fs::file_time_type modified) {
+  const std::string path = flyx::gguf_header_path(requested);
+  if (path != requested || modified == fs::file_time_type::min()) {
+    std::error_code ec;
+    const fs::path p = to_path(path);
+    size = fs::file_size(p, ec);
+    if (ec) return flyx::gguf_peek(path);
+    modified = fs::last_write_time(p, ec);
+    if (ec) return flyx::gguf_peek(path);
+  }
+  constexpr size_t kMaxCachedEntries = 2048;
+  static std::mutex mu;
+  static std::map<std::string, std::tuple<uint64_t, fs::file_time_type, flyx::GgufPeek>> cache;
+  {
+    std::lock_guard<std::mutex> lock(mu);
+    const auto it = cache.find(path);
+    if (it != cache.end() && std::get<0>(it->second) == size && std::get<1>(it->second) == modified)
+      return std::get<2>(it->second);
+  }
+  const flyx::GgufPeek peek = flyx::gguf_peek(path);
+  std::lock_guard<std::mutex> lock(mu);
+  if (cache.size() >= kMaxCachedEntries && cache.find(path) == cache.end()) cache.clear();
+  cache[path] = {size, modified, peek};
+  return peek;
+}
+
+GgufClassification gguf_identity(const flyx::GgufPeek& peek, const std::string& name,
+                                 const std::string& repo_arch = {}) {
+  const int mtp = peek.valid ? peek.mtp_layers : -1;
+  const std::string arch = peek.valid ? peek.arch : "";
+  if (peek.valid && peek.arch == "clip") return {"mmproj", "", arch, mtp};
+  if (peek.valid && (peek.arch == "dflash" || peek.has_markov_context))
+    return {"drafter", peek.has_markov_context ? "dspark" : "dflash2", arch, mtp};
+  // An MTP sidecar shares the target architecture. Its directory or prefix distinguishes it
+  // from a main GGUF that embeds exactly the same nextn_predict_layers metadata.
+  if (hub::mtp_gguf_name(name)) return {"drafter", "mtp", arch, mtp};
+  if (!peek.valid || peek.arch.empty()) {
+    if (hub::mmproj_gguf_name(name)) return {"mmproj", "", arch, mtp};
+    if (hub::dspark_gguf_name(name)) return {"drafter", "dspark", arch, mtp};
+    if (repo_arch == "dflash" && hub::model_gguf_name(name)) {
+      const auto base = lower(name.substr(name.rfind('/') + 1));
+      return {"drafter", base.starts_with("dflash2-") ? "dflash2" : "", arch, mtp};
+    }
+  }
+  // A model's header under a name that holds none (a file under old_support/): not listed.
+  if (!hub::model_gguf_name(name) && !hub::mmproj_gguf_name(name) && !hub::dspark_gguf_name(name)) return {};
+  return {"gguf", "", arch, mtp};
+}
+
 }  // namespace
 
-int gguf_mtp_layers(const std::string& path) { return flyx::gguf_peek_mtp_layers(path); }
+GgufClassification classify_gguf(const std::string& path, const std::string& rel_name, uint64_t size,
+                                 fs::file_time_type modified) {
+  std::string name = rel_name.empty() ? path : rel_name;
+  std::replace(name.begin(), name.end(), '\\', '/');
+  const std::string base = lower(name.substr(name.rfind('/') + 1));
+  if (!base.ends_with(".gguf") || base.find("imatrix") != std::string::npos) return {};
+  return gguf_identity(gguf_peek_cached(path, size, modified), name);
+}
+
+std::vector<HubGguf> hub_ggufs(const hub::Repo& repo) {
+  const fs::path root = to_path(hub::snapshot_dir(repo));
+  auto choices = hub::gguf_choices(repo, /*include_companions=*/true);
+  std::map<std::string, int> labels;
+  for (const auto& g : choices)
+    if (hub::model_gguf_name(g.file.path)) ++labels[lower(g.quant)];
+  std::vector<HubGguf> out;
+  for (auto& g : choices) {
+    HubGguf item;
+    const auto& path = g.file.path;
+    item.disk = from_path((root / to_path(path)).make_preferred());
+    flyx::GgufPeek peek;
+    item.cached = g.complete;
+    for (const auto& part : g.parts) {
+      std::error_code ec;
+      const auto size = fs::file_size(root / to_path(part.path), ec);
+      if (ec || (part.size && size != part.size)) {
+        item.cached = false;
+        continue;
+      }
+      if (g.complete && part.path == path) {
+        item.modified = fs::last_write_time(to_path(item.disk), ec);
+        peek = gguf_peek_cached(item.disk, size, item.modified);
+      }
+    }
+    item.cls = gguf_identity(peek, path, repo.info.gguf_architecture);
+    item.selector = hub::model_gguf_name(path) && labels[lower(g.quant)] == 1
+                        ? g.quant : from_path(to_path(path).filename());
+    item.choice = std::move(g);
+    out.push_back(std::move(item));
+  }
+  return out;
+}
+
+const HubGguf* preferred_companion(const std::vector<HubGguf>& ggufs, const std::string& kind) {
+  hub::Repo candidates;
+  const HubGguf* first = nullptr;
+  for (const auto& item : ggufs) {
+    if (!item.choice.complete || (item.cls.kind != kind && item.cls.drafter_kind != kind)) continue;
+    if (!first) first = &item;
+    candidates.files.push_back(item.choice.file);
+  }
+  // Preserve the Hub's preferred precision, MTP directory and default DSpark drafter when conventionally named
+  // candidates exist.
+  std::string preferred;
+  if (kind == "mmproj") {
+    if (const hub::RepoFile* f = hub::mmproj_file(candidates)) preferred = f->path;
+  } else if (kind == "mtp") {
+    if (const hub::RepoFile* f = hub::mtp_file(candidates)) preferred = f->path;
+  } else if (kind == "dspark") {
+    for (const hub::CompanionFile& c : hub::companion_files(candidates))
+      if (c.kind == "dspark" && c.is_default) preferred = c.file.path;
+  }
+  if (!preferred.empty())
+    for (const auto& item : ggufs)
+      if (item.choice.file.path == preferred) return &item;
+  return first;
+}
+
+int gguf_mtp_layers(const std::string& path) {
+  const flyx::GgufPeek p = gguf_peek_cached(path, 0, fs::file_time_type::min());
+  return p.valid ? p.mtp_layers : -1;
+}
 
 double modified_unix(fs::file_time_type modified) {
   if (modified == fs::file_time_type::min()) return 0;
@@ -90,7 +213,7 @@ std::vector<LocalModel> scan_model_dirs(const std::vector<std::string>& dirs, in
   std::vector<LocalModel> out;
   std::set<fs::path> seen;  // a file reached from two of the directories (one inside the other) once
   struct LocalShard {
-    std::string path, file;
+    std::string path, file, rel;
     uint64_t size = 0;
     fs::file_time_type modified{};
   };
@@ -119,19 +242,7 @@ std::vector<LocalModel> scan_model_dirs(const std::vector<std::string>& dirs, in
       if (!gguf && !flyx) continue;
       std::string rel = from_path(it->path().lexically_relative(root));
       std::replace(rel.begin(), rel.end(), '\\', '/');
-      const bool is_mmproj = gguf && hub::mmproj_gguf_name(rel);
-      // A DFlash2 drafter's GGUF says what it is in its header alone (general.architecture "dflash"), and reading
-      // a header means reading through the file's tokenizer tables: only the files whose names suggest a drafter
-      // are opened here.  One named otherwise is listed as a model here (flyx serve's listing, which reads every
-      // GGUF's header once for its MTP layer, calls it a drafter then), and refused as one when it is opened.
-      const bool maybe_dflash =
-          gguf && !is_mmproj &&
-          (low.find("dflash") != std::string::npos || low.find("dspark") != std::string::npos ||
-           low.find("draft") != std::string::npos);
-      const bool is_drafter =
-          gguf && !is_mmproj &&
-          (hub::mtp_gguf_name(rel) || (maybe_dflash && flyx::gguf_peek(from_path(it->path())).arch == "dflash"));
-      if (gguf && !is_mmproj && !is_drafter && !hub::model_gguf_name(rel)) continue;
+      if (gguf && low.find("imatrix") != std::string::npos) continue;
       const fs::path canon = fs::weakly_canonical(it->path(), e2);
       if (e2 || !it->is_regular_file(e2) || e2 || !seen.insert(canon).second) continue;
       const auto sz = it->file_size(e2);
@@ -140,16 +251,24 @@ std::vector<LocalModel> scan_model_dirs(const std::vector<std::string>& dirs, in
       const auto mt = it->last_write_time(e3);
       const fs::file_time_type modified = e3 ? fs::file_time_type::min() : mt;
       hub::SplitGguf sp;
-      if (gguf && !is_mmproj && !is_drafter && hub::parse_split_gguf_name(from_path(canon), &sp)) {
+      if (gguf && hub::parse_split_gguf_name(from_path(it->path()), &sp)) {
         auto& acc = splits[{sp.prefix, sp.count}];
         acc.count = sp.count;
-        acc.parts[sp.part] = {from_path(it->path()), name, uint64_t(sz), modified};
+        acc.parts[sp.part] = {from_path(it->path()), name, rel, uint64_t(sz), modified};
         continue;
       }
       LocalModel m;
       m.path = from_path(it->path());
       m.file = name;
-      m.kind = is_mmproj ? "mmproj" : is_drafter ? "drafter" : gguf ? "gguf" : "flyx";
+      if (gguf) {
+        const GgufClassification cls = classify_gguf(m.path, rel, uint64_t(sz), modified);
+        if (cls.kind.empty()) continue;
+        m.kind = cls.kind;
+        m.drafter_kind = cls.drafter_kind;
+        m.mtp_layers = cls.mtp_layers;
+      } else {
+        m.kind = "flyx";
+      }
       m.quant = hub::quant_in_name(name);
       m.size = uint64_t(sz);
       m.modified = modified;
@@ -172,10 +291,14 @@ std::vector<LocalModel> scan_model_dirs(const std::vector<std::string>& dirs, in
     }
     if (!complete) continue;
     const LocalShard& first = acc.parts.begin()->second;
+    const GgufClassification cls = classify_gguf(first.path, first.rel, first.size, first.modified);
+    if (cls.kind.empty()) continue;
     LocalModel m;
     m.path = first.path;
     m.file = first.file;
-    m.kind = "gguf";
+    m.kind = cls.kind;
+    m.drafter_kind = cls.drafter_kind;
+    m.mtp_layers = cls.mtp_layers;
     m.quant = hub::quant_in_name(first.file);
     m.size = total;
     m.parts = acc.count;
@@ -212,21 +335,27 @@ bool one(const std::string& spec, const hub::ProgressFn& progress, const std::at
   return true;
 }
 
-}  // namespace
-
-std::string drafter_kind(const std::string& path, const flyx::GgufPeek& header) {
-  if (header.valid) {
-    if (header.arch == "dflash") return header.has_markov_context ? "dspark" : "dflash2";
-    if (header.mtp_layers > 0) return "mtp";
-  }
+// What kind of drafter a file or directory given beside a model holds, via classify_gguf().
+std::string drafter_kind(const std::string& path, const hub::Repo& repo) {
   const std::string lp = lower(path);
-  if (!lp.ends_with(".gguf")) return "dflash2";  // a directory of config and safetensors, or a .flyx drafter file
-  if (lp.find("dspark") != std::string::npos) return "dspark";
-  return lp.find("dflash") != std::string::npos ? "dflash2" : "mtp";
+  if (lp.ends_with(".gguf")) {
+    const GgufClassification cls = classify_gguf(path);
+    if (!cls.drafter_kind.empty()) return cls.drafter_kind;
+    if (cls.kind == "gguf" && cls.mtp_layers > 0) return "mtp";
+    return "";
+  }
+  const auto kind = flyx::drafter_source_kind(path);
+  return kind.empty() && hub::is_drafter(repo) ? "dflash2" : kind;
 }
 
 std::string drafter_kind(const std::string& path) {
   return drafter_kind(path, lower(path).ends_with(".gguf") ? flyx::gguf_peek(path) : flyx::GgufPeek{});
+}
+
+bool reads_vision(const std::string& arch) {
+  if (arch.empty()) return true;
+  const std::vector<std::string> vision = interfaces::vision_architectures();
+  return std::find(vision.begin(), vision.end(), arch) != vision.end();
 }
 
 bool reads_vision(const std::string& arch) {
@@ -266,9 +395,53 @@ bool wants_mtp(const EngineOptions& eo) {
           mode == interfaces::DrafterMode::kAll);
 }
 
+bool wants_dspark(const EngineOptions& eo, const std::vector<std::string>& drafters) {
+  if (!eo.speculative) return false;
+  interfaces::DrafterMode mode = interfaces::DrafterMode::kAuto;
+  if (!interfaces::parse_drafter_mode(eo.drafter, &mode)) return false;
+  return mode == interfaces::DrafterMode::kDSpark || mode == interfaces::DrafterMode::kAll ||
+         (mode == interfaces::DrafterMode::kAuto && drafters.empty());
+}
+
+namespace {
+
+bool is_dspark_file(const std::string& path) {
+  const flyx::GgufPeek h = flyx::gguf_peek(path);
+  return h.valid && h.arch == "dflash" && h.has_markov_context;
+}
+
+}  // namespace
+
+std::string dspark_beside(const std::string& model_path) {
+  std::error_code ec;
+  const fs::path p = to_path(model_path);
+  if (lower(from_path(p.extension())) != ".gguf" || !fs::is_regular_file(p, ec)) return "";
+  // The model's name without its quantization: what a drafter made for it is named after.
+  std::string name = model_name_of(model_path);
+  const std::string quant = hub::quant_in_name(from_path(p.filename()));
+  if (!quant.empty() && name.size() > quant.size() && lower(name).ends_with(lower(quant))) {
+    name.resize(name.size() - quant.size());
+    while (!name.empty() && (name.back() == '-' || name.back() == '_' || name.back() == '.')) name.pop_back();
+  }
+  if (name.empty()) return "";
+  const std::string want = "dspark-" + lower(name);
+  std::vector<std::string> found;
+  const fs::path dir = p.has_parent_path() ? p.parent_path() : fs::path(".");
+  for (fs::directory_iterator it(dir, ec), end; !ec && it != end; it.increment(ec)) {
+    const std::string low = lower(from_path(it->path().filename()));
+    if (!low.ends_with(".gguf") || !low.starts_with(want) || low.size() <= want.size()) continue;
+    if (const char next = low[want.size()]; next != '-' && next != '_' && next != '.') continue;  // another name
+    std::error_code e2;
+    if (!it->is_regular_file(e2) || e2 || !is_dspark_file(from_path(it->path()))) continue;
+    found.push_back(from_path(it->path()));
+  }
+  std::sort(found.begin(), found.end());
+  return found.empty() ? "" : found.front();
+}
+
 bool fetch_model(const std::string& model, const std::vector<std::string>& drafters, bool want_mtp,
                  const hub::ProgressFn& progress, const std::atomic<bool>* stop, Fetched* out, std::string* err,
-                 const std::string& mmproj, bool want_vision) {
+                 const std::string& mmproj, bool want_vision, bool want_dspark) {
   *out = {};
   hub::Repo repo;
   if (!one(model, progress, stop, &out->model, &repo, err)) return false;
@@ -280,9 +453,7 @@ bool fetch_model(const std::string& model, const std::vector<std::string>& draft
     std::string path;
     if (!one(d, progress, stop, &path, &drepo, err)) return false;
     out->drafters.push_back(path);
-    out->drafter_sources.push_back(
-        {drepo.id.empty() || !hub::is_drafter(drepo) ? drafter_kind(path) : "dflash2", drepo.id.empty() ? path : d,
-         bytes_on_disk(path)});
+    out->drafter_sources.push_back({drafter_kind(path, drepo), drepo.id.empty() ? path : d, bytes_on_disk(path)});
   }
   if (want_vision && !mmproj.empty()) {
     hub::Repo mrepo;
@@ -292,32 +463,64 @@ bool fetch_model(const std::string& model, const std::vector<std::string>& draft
     out->mmproj_source = mrepo.id.empty() ? mpath : mmproj;
     out->mmproj_size = bytes_on_disk(mpath);
   }
-  if (repo.id.empty()) return true;  // a path: nothing more to know
-  if (want_vision && out->mmproj.empty()) {
-    if (const hub::RepoFile* mm = hub::mmproj_file(repo)) {
-      const flyx::GgufPeek pk = flyx::gguf_peek(out->model);
-      const std::string arch = pk.valid && !pk.arch.empty() ? pk.arch : repo.info.gguf_architecture;
-      if (reads_vision(arch)) {
-        std::vector<std::string> paths;
-        if (!hub::fetch(repo, {*mm}, &paths, progress, stop, err)) return false;
-        out->mmproj = paths[0];
-        out->mmproj_source = repo.id + "/" + mm->path;
-        out->mmproj_size = mm->size;
-        out->notes.push_back("the vision projector from " + repo.id + "/" + mm->path);
+  bool has_dspark = false;  // named: none other is taken
+  for (const auto& ds : out->drafter_sources) has_dspark = has_dspark || ds.kind == "dspark";
+  if (repo.id.empty()) {  // a path: only a DSpark drafter beside it to know of
+    if (want_dspark && !has_dspark)
+      if (const std::string d = dspark_beside(out->model); !d.empty()) {
+        out->drafters.push_back(d);
+        out->drafter_sources.push_back({"dspark", d, bytes_on_disk(d)});
+        out->notes.push_back("the DSpark drafter beside the model: " + d);
       }
+    return true;
+  }
+  const bool need_mmproj = want_vision && out->mmproj.empty();
+  const bool need_mtp = want_mtp && own_mtp == 0 &&
+      std::none_of(out->drafter_sources.begin(), out->drafter_sources.end(), [](const auto& ds) { return ds.kind == "mtp"; });
+  const bool need_dspark = want_dspark && !has_dspark;
+  const auto ggufs = need_mmproj || need_mtp || need_dspark ? hub_ggufs(repo) : std::vector<HubGguf>{};
+  if (need_mmproj) {
+    const std::string own_arch = classify_gguf(out->model).arch;
+    const auto* mm = reads_vision(own_arch.empty() ? repo.info.gguf_architecture : own_arch)
+                         ? preferred_companion(ggufs, "mmproj") : nullptr;
+    if (mm) {
+      std::vector<std::string> paths;
+      if (!hub::fetch(repo, mm->choice.parts, &paths, progress, stop, err)) return false;
+      out->mmproj = paths[0];
+      out->mmproj_source = repo.id + "/" + mm->choice.file.path;
+      out->mmproj_size = mm->choice.total_size;
+      out->notes.push_back("the vision projector from " + repo.id + "/" + mm->choice.file.path);
     }
   }
   // unsloth keeps the MTP layer of GGUFs made without it in MTP/.
-  bool has_mtp_drafter = false;
-  for (const auto& ds : out->drafter_sources)
-    if (ds.kind == "mtp") has_mtp_drafter = true;
-  const hub::RepoFile* mtp = hub::mtp_file(repo);
-  if (want_mtp && mtp && own_mtp == 0 && !has_mtp_drafter) {
+  const auto* mtp = need_mtp ? preferred_companion(ggufs, "mtp") : nullptr;
+  if (mtp) {
     std::vector<std::string> paths;
-    if (!hub::fetch(repo, {*mtp}, &paths, progress, stop, err)) return false;
+    if (!hub::fetch(repo, mtp->choice.parts, &paths, progress, stop, err)) return false;
     out->drafters.push_back(paths[0]);
-    out->drafter_sources.push_back({"mtp", repo.id + "/" + mtp->path, bytes_on_disk(paths[0])});
-    out->notes.push_back("the MTP layer from " + repo.id + "/" + mtp->path + " (the model's file has none)");
+    out->drafter_sources.push_back({"mtp", repo.id + "/" + mtp->choice.file.path, mtp->choice.total_size});
+    out->notes.push_back("the MTP layer from " + repo.id + "/" + mtp->choice.file.path + " (the model's file has none)");
+  }
+  if (need_dspark) {
+    if (const auto* ds = preferred_companion(ggufs, "dspark")) {
+      const auto& choice = ds->choice;
+      std::vector<std::string> paths;
+      if (!hub::fetch(repo, choice.parts, &paths, progress, stop, err)) return false;
+      const std::string source = repo.id + "/" + choice.file.path;
+      if (is_dspark_file(paths.front())) {
+        out->drafters.push_back(paths.front());
+        out->drafter_sources.push_back({"dspark", source, choice.total_size});
+        out->notes.push_back("the DSpark drafter from " + source);
+      } else {
+        out->notes.push_back(source + " is not a DSpark drafter: not drafting with it");
+      }
+    } else {
+      for (const auto& item : ggufs)
+        if (item.cached && hub::dspark_gguf_name(item.choice.file.path) && !item.cls.arch.empty()) {
+          out->notes.push_back(repo.id + "/" + item.choice.file.path + " is not a DSpark drafter: not drafting with it");
+          break;
+        }
+    }
   }
   for (const std::string& k : known_drafters(repo.base_models)) {
     bool given = false;
@@ -353,7 +556,8 @@ hub::ProgressFn make_progress_logger(const char* prefix, double interval_ms, hub
 bool fetch_named(std::string* model, EngineOptions* eo, std::string* err) {
   auto progress = make_progress_logger("flyx", 2000);
   Fetched f;
-  if (!fetch_model(*model, eo->drafter_files, wants_mtp(*eo), progress, nullptr, &f, err, eo->mmproj_file, eo->vision))
+  if (!fetch_model(*model, eo->drafter_files, wants_mtp(*eo), progress, nullptr, &f, err, eo->mmproj_file, eo->vision,
+                   wants_dspark(*eo, eo->drafter_files)))
     return false;
   if (f.model != *model) std::fprintf(stderr, "flyx: %s is %s\n", model->c_str(), f.model.c_str());
   for (size_t i = 0; i < eo->drafter_files.size() && i < f.drafters.size(); ++i)

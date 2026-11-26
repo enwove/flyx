@@ -5,7 +5,7 @@
 #include "backends/cuda/regions/layers.h"
 
 #include <algorithm>
-#include <cstdlib>
+#include <climits>
 
 namespace flyx::cuda {
 
@@ -60,6 +60,9 @@ bool supported(const flyx_bmodel* m, const Block& blk, std::string* why) {
   } else if (const auto* e = std::get_if<MoeBlock>(&blk)) {
     if (e->n_experts < 1 || e->top_k < 1 || e->top_k > e->n_experts || (e->post_conv && (e->conv < 2 || e->conv > 64)))
       return no("MoE dimensions outside what the CUDA kernels support");
+    if (e->top_k > kMoeRouteMaxTopK || e->n_experts > kMoeRouteMaxExperts)
+      return no("MoE routing outside what the CUDA kernels take (top_k up to " + std::to_string(kMoeRouteMaxTopK) +
+                ", up to " + std::to_string(kMoeRouteMaxExperts) + " experts)");
   } else if (const auto* g = std::get_if<GdnBlock>(&blk)) {
     if (g->gd.dk > 128 || g->gd.ck > 8 || g->gd.nk < 1 || g->gd.nv % g->gd.nk)
       return no("gated delta net dimensions outside what the CUDA kernels support (key head dim up to 128, conv up to 8)");
@@ -96,6 +99,53 @@ bool supported(const flyx_bmodel* m, const Block& blk, std::string* why) {
     if (merged % 8 || (vm->w_fc1.present() && vm->w_fc2.present() && vm->merge_hidden % 8))
       return no("vision_merge dimensions must be multiples of 8");
   }
+  return true;
+}
+
+// The kernels' hard limits on a model description, before the load allocates anything (supported() checks the bound
+// blocks again): MoE routing (moe_route), the AttnRes bank's depth (row_needs: max_bank, which attn_res_mix and
+// shortconv_res_mix_norm read with the current state), the ShortConvs' taps.  Counts in 64 bits: a description's
+// int32 fields can multiply past an int.
+bool kernel_limits(const flyx_model_desc& d, std::string* why) {
+  auto no = [&](const std::string& w) { return *why = w, false; };
+  if (d.n_blocks < 0 || (d.n_blocks > 0 && !d.blocks)) return no("a model description without its blocks");
+  int64_t tap_stride = 0;
+  long long pass0_pushes = 0;
+  bool rel_attn = false;
+  for (int i = 0; i < d.n_blocks; ++i) {
+    const flyx_block& b = d.blocks[i];
+    if (b.kind == FLYX_BLOCK_DFLASH2 || b.kind == FLYX_BLOCK_DSPARK) {
+      const int taps = b.kind == FLYX_BLOCK_DFLASH2 ? b.dflash2.n_taps : b.dspark.n_taps;
+      if (d.hidden <= 0 || taps <= 0) return no("invalid drafter feature dimensions");
+      const int64_t width = int64_t(taps) * d.hidden;
+      if ((b.kind == FLYX_BLOCK_DFLASH2 && width > INT_MAX - 63) || width > INT_MAX - tap_stride)
+        return no("drafter feature width exceeds CUDA row dimensions");
+      tap_stride += width;
+    }
+    if (b.kind == FLYX_BLOCK_MOE) {
+      const flyx_moe_block& e = b.moe;
+      if (e.top_k > kMoeRouteMaxTopK || e.n_experts > kMoeRouteMaxExperts)
+        return no("MoE block " + std::to_string(i) + ": " + std::to_string(e.top_k) + " of " +
+                  std::to_string(e.n_experts) + " experts a row, where the CUDA kernels route to up to " +
+                  std::to_string(kMoeRouteMaxTopK) + " of up to " + std::to_string(kMoeRouteMaxExperts));
+      if (e.post_conv >= 0 && (e.conv < 2 || e.conv > 64))
+        return no("MoE block " + std::to_string(i) + ": ShortConv of " + std::to_string(e.conv) +
+                  " taps, where the CUDA kernels take 2..64");
+    } else if (b.kind == FLYX_BLOCK_REL_ATTN) {
+      const flyx_rel_attn_block& r = b.rel_attn;
+      if (r.d_rel < 1 || r.d_rel > 1024) return no("CUDA relative attention width must be in 1..1024");
+      rel_attn = true;
+      if (r.res_push && r.loop_rank == 0) ++pass0_pushes;
+      if (r.conv < 2 || r.conv > 64)
+        return no("rel_attn block " + std::to_string(i) + ": ShortConv of " + std::to_string(r.conv) +
+                  " taps, where the CUDA kernels take 2..64");
+    }
+  }
+  // row_needs' bank: the pushes of the first pass and two more, at least 4; a mix reads them and the current state.
+  const long long bank = rel_attn ? std::max(pass0_pushes + 2, 4ll) : 0;
+  if (bank >= kAttnResMaxStates)
+    return no("an AttnRes bank of " + std::to_string(bank) + " blocks, where the CUDA kernels mix fewer than " +
+              std::to_string(kAttnResMaxStates));
   return true;
 }
 
@@ -276,38 +326,12 @@ void forward_nodes(const Pass& ps, size_t begin, size_t end, int copy_prefix) {
   res_state.x_cur = ps.v.b.x;
   Pass cur = ps;
   cur.res = &res_state;
-  // A round's experts read ahead (moe_prefetch): before an attention whose next node is a MoE, the expert stream
-  // guesses that MoE's experts and asks L2 for them while the attention runs; the round's stream joins it once, at
-  // the round's end (a join after each MoE made one-row rounds wait on it).  FLYX_EXPERT_PREFETCH: 0 off, 1 every
-  // round, 2 (default) rounds of two rows or more: on an RTX 5090 (Inkling-2-Mini UD-IQ4_XS) one-row rounds ran 2.5%
-  // slower with it (their attention too short to hide the reads), DSpark 3.4% faster.  No result depends on it.
-  static const int prefetch_env = [] {
-    const char* e = std::getenv("FLYX_EXPERT_PREFETCH");
-    return e ? std::atoi(e) : 2;
-  }();
-  const bool prefetch = prefetch_env != 0 && (prefetch_env != 2 || ps.rows > 1) && ps.round &&
-                        ps.rows <= FLYX_MAX_ROWS && s->expert_side.st && ps.v.L.st == s->st && ps.v.b.moe_guess;
-  bool prefetch_out = false;
   for (size_t i = begin; i < end; ++i) {
     const flyx_node& nd = ps.p->nodes[i];
     const Block* blk = ps.p->block[i];
     const bool takes_pending =
         nd.kind == FLYX_NODE_RUN && blk &&
         (std::holds_alternative<RelAttnBlock>(*blk) || std::holds_alternative<MoeBlock>(*blk));
-    if (prefetch && nd.kind == FLYX_NODE_RUN && blk && std::holds_alternative<RelAttnBlock>(*blk) &&
-        i + 1 < end && ps.p->nodes[i + 1].kind == FLYX_NODE_RUN && ps.p->block[i + 1] &&
-        std::holds_alternative<MoeBlock>(*ps.p->block[i + 1])) {
-      const MoeBlock& f = std::get<MoeBlock>(*ps.p->block[i + 1]);
-      const SideStream& es = s->expert_side;
-      CK(cudaEventRecord(es.fork, ps.v.L.st));
-      CK(cudaStreamWaitEvent(es.st, es.fork, 0));
-      const bf16* rb = f.router.round.b16 ? f.router.round.b16 : (f.router.round.f32 ? nullptr : f.router.w);
-      moe_prefetch(res_state.x_cur ? res_state.x_cur : ps.v.b.x, f.norm.w, f.norm.offset, rb,
-                   rb ? nullptr : f.router.round.f32, f.router_bias, f.gating_sigmoid, f.n_experts, f.top_k,
-                   f.hidden, f.inter, f.gate_up, f.down, ps.v.b.moe_guess, es.st);
-      CK(cudaEventRecord(es.join, es.st));
-      prefetch_out = true;
-    }
     if (!takes_pending) flush_pending_post_conv(cur, true);
     cur.next_moe = (i + 1 < end && ps.p->nodes[i + 1].kind == FLYX_NODE_RUN && ps.p->block[i + 1] &&
                     std::holds_alternative<MoeBlock>(*ps.p->block[i + 1]))
@@ -320,8 +344,7 @@ void forward_nodes(const Pass& ps, size_t begin, size_t end, int copy_prefix) {
     ps.p->impl[i]->fn(cur, nd, blk);
     if (prof) CK(cudaEventRecord(s->prof_ev[i - begin + 1], s->st));
   }
-  if (prefetch_out || s->warm_out) CK(cudaStreamWaitEvent(ps.v.L.st, s->expert_side.join, 0));
-  s->warm_out = false;
+  if (res_state.expert_work) CK(cudaStreamWaitEvent(ps.v.L.st, s->expert_side.join, 0));
   flush_pending_post_conv(cur, true);
   s->stage_end(ps.v.L.st);
   if (!prof) return;
@@ -566,6 +589,8 @@ int lower(flyx_bmodel* m, const flyx_program* prog, flyx_plan** out) {
       if (n.kind == FLYX_NODE_DRAFT) {
         try {
           make_dv_tables(m, n.block);  // out of GPU memory: the engine has the backend trim, and lowers again
+        } catch (const OutOfDeviceMemory& e) {
+          return fail_oom(std::string("lower: DV's selector tables: ") + e.what());
         } catch (const std::exception& e) {
           return fail(std::string("lower: DV's selector tables: ") + e.what());
         }
@@ -628,12 +653,26 @@ int lower(flyx_bmodel* m, const flyx_program* prog, flyx_plan** out) {
   }
   if (!p->tree) p->tree_kv.clear();
   if (p->tree && (p->phase != FLYX_PHASE_ROUND || p->width < 1)) return fail("lower: a tree is a round's drafts");
+  // A tree's row reads its ancestors' history, not its siblings': the tree masks of attention (tree_kv) and the gated
+  // delta net's tree recurrence give it that.  Relative-position attention scores row r at base + r against the rows
+  // before it, and a ShortConv (relative attention's K/V and output convolutions, the MoE's) folds the round's rows
+  // in order, with no replay of a fork: a draft after its sibling would read the sibling.  Such a target verifies
+  // plain rounds, chains (its drafters' and lookup's) only.
+  if (p->tree)
+    for (const Block* b : p->block) {
+      if (b && std::holds_alternative<RelAttnBlock>(*b))
+        return fail("lower: tree rounds on relative-position attention (its rows are consecutive, not a tree's)");
+      if (const auto* e = b ? std::get_if<MoeBlock>(b) : nullptr; e && e->sconv >= 0)
+        return fail("lower: tree rounds on a ShortConv state (it folds the rows in order, no fork replay)");
+    }
   if (wide && p->tree)  // a wide chain runs on a gated delta net (its replay holds the rows); a wide tree does not
     for (const Block* b : p->block)
       if (b && std::holds_alternative<GdnBlock>(*b))
         return fail("lower: tree rounds of more than " + std::to_string(FLYX_MAX_ROWS) +
                     " rows on a gated delta net (its tree recurrence stages 16 rows)");
-  if (prog->phase == FLYX_PHASE_PREFILL && ensure_prefill_rows(m, prog->max_rows) != 0) return -1;
+  if (prog->phase == FLYX_PHASE_PREFILL) {
+    if (const int rc = ensure_prefill_rows(m, prog->max_rows); rc != 0) return rc;
+  }
   if (m->verbose && !used.empty()) {
     std::fprintf(stderr, "flyx-cuda: %s plan (%d rows):", p->phase == FLYX_PHASE_ROUND ? "round" : "prefill",
                  p->max_rows);

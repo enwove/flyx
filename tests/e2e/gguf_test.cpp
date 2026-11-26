@@ -49,10 +49,12 @@ bool same_tokens(const std::vector<int32_t>& got, const std::vector<int32_t>& wa
 struct Load {
   bool speculative = false;
   int prefill_chunk = 16;
+  int max_ctx = 256;
   std::string drafter = "mtp";  // when speculative
   std::vector<std::string> drafter_files{};
   std::string options{};  // backend options, after the tested backend's own
   std::string activations{};  // EngineOptions::activations ("": as the file has it)
+  int kv = FLYX_KV_16;  // the golden tokens and drafts are binary16 K/V's
 };
 
 // The engine; a load that fails throws, or with `failed` says why there.
@@ -62,7 +64,7 @@ std::unique_ptr<Engine> engine(const std::string& path, const std::string& backe
   options.backend = backend;
   if (backend == tested) options.backend_options = tested_options;
   if (!how.options.empty()) options.backend_options += (options.backend_options.empty() ? "" : ",") + how.options;
-  options.max_ctx = 256;
+  options.max_ctx = how.max_ctx;
   options.prefill_chunk = how.prefill_chunk;
   options.lookup = false;
   options.width = !how.speculative ? 0 : how.drafter == "mtp" ? 3 : 15;  // the reference's rounds
@@ -70,7 +72,7 @@ std::unique_ptr<Engine> engine(const std::string& path, const std::string& backe
   options.drafter = how.speculative ? how.drafter : "none";
   options.drafter_files = how.drafter_files;
   options.activations = how.activations;
-  options.kv = FLYX_KV_16;  // the golden tokens and drafts are binary16 K/V's
+  options.kv = how.kv;
   auto result = std::make_unique<Engine>();
   std::string error;
   if (!result->load(path, options, &error)) {
@@ -284,6 +286,250 @@ void split_mtp(const std::string& dir, const std::string& backend) {
   check(why.find("has its MTP layer") != std::string::npos, "a model with its MTP layer takes no drafter file (" + why + ")");
 }
 
+// Prefill tokens [from, to) of t at the sequence's position, in passes of up to 64 rows that choose no token.
+bool prefill_span(Engine& e, Session& s, const std::vector<int32_t>& t, size_t from, size_t to) {
+  for (size_t off = from; off < to; off += 64) {
+    const int32_t n = int32_t(std::min<size_t>(64, to - off));
+    if (e.api()->prefill(e.prefill_plan(), s.seq(), t.data() + off, n, nullptr) != 0) return false;
+  }
+  return true;
+}
+
+// From the sequence's position: `first` prefilled, choosing the token after it, then greedy rounds of the widest plan,
+// one at a time, until n tokens are out: every token, every round's drafts, and the last result.
+bool decode_from(Engine& e, Session& s, int32_t first, size_t n, std::vector<int32_t>* tokens,
+                 std::vector<int32_t>* drafts, flyx_round_result* last = nullptr) {
+  const auto* api = e.api();
+  flyx_gen_params g{};
+  g.top_p = 1.f;
+  flyx_round_result rr{};
+  if (api->prefill(e.prefill_plan(), s.seq(), &first, 1, &g) != 0 || api->read(s.seq(), &rr) != 0 || rr.n_tokens != 1)
+    return false;
+  tokens->push_back(rr.tokens[0]);
+  while (tokens->size() < n) {
+    if (api->launch(e.round_plan(e.widths().size() - 1), s.seq(), &g) != 0 || api->read(s.seq(), &rr) != 0 ||
+        rr.n_tokens <= 0)
+      return false;
+    drafts->insert(drafts->end(), rr.drafts, rr.drafts + rr.n_drafts);
+    tokens->insert(tokens->end(), rr.tokens, rr.tokens + rr.n_tokens);
+  }
+  if (last) *last = rr;
+  return true;
+}
+
+// Greedy through a session, the prompt checkpointed at `checkpoints`: the tokens, every result the device gave, and
+// how many of the prompt's tokens the session's state already held (and how it got them).
+std::vector<int32_t> generate_traced(Session& s, const std::vector<int32_t>& prompt, int n,
+                                     const std::vector<int32_t>& checkpoints, std::vector<flyx_round_result>* trace,
+                                     int* reused = nullptr, std::string* how = nullptr) {
+  GenerateRequest request;
+  request.prompt = prompt;
+  request.max_new_tokens = n;
+  request.ignore_eos = true;
+  request.checkpoints = checkpoints;
+  std::string error;
+  GenerateResult result;
+  std::vector<int32_t> tokens;
+  s.trace = trace;
+  const int failed = generate(s, request,
+                              [&](std::string_view, const int32_t* ids, int count) {
+                                tokens.insert(tokens.end(), ids, ids + count);
+                                return true;
+                              },
+                              &result, &error);
+  s.trace = nullptr;
+  if (failed) throw std::runtime_error(error);
+  if (reused) *reused = result.usage.reused_tokens;
+  if (how) *how = result.reuse;
+  return tokens;
+}
+
+// The same results, round by round: tokens and drafts.
+bool same_rounds(const std::vector<flyx_round_result>& a, const std::vector<flyx_round_result>& b) {
+  if (a.size() != b.size() || a.size() < 2) return false;
+  for (size_t i = 0; i < a.size(); ++i)
+    if (a[i].n_tokens != b[i].n_tokens || !std::equal(a[i].tokens, a[i].tokens + a[i].n_tokens, b[i].tokens) ||
+        a[i].n_drafts != b[i].n_drafts || !std::equal(a[i].drafts, a[i].drafts + a[i].n_drafts, b[i].drafts))
+      return false;
+  return true;
+}
+
+// A sliding-window DFlash2 drafter's context cache as a ring of slots (backend option dflash_ring, on by default)
+// beside the same cache a slot a position (dflash_ring=0): at max_ctx 512, prefill passes of 64 rows and rounds of 16,
+// the window of 8 in a ring of 128 slots (256 with wide rounds) that a 300-token prompt and its reply wrap around.
+// * Fewer bytes, and none fewer where the ring would hold no fewer positions than the cache.
+// * The flat cache's tokens and drafts across the wraps, and from a snapshot of the ring loaded elsewhere; plain
+//   decoding's tokens.  The same with the drafter cut to one layer beside FP8 caches: its cache binary16, as its
+//   kernels write and read it, not the FP8 of the MTP layer's (a one-layer cache too).
+// * The ring holds the drafter's window of the last positions only.  A checkpoint whose window later positions
+//   overwrote is neither restored nor saved; a rewind past prefill passes that overwrote the window there is refused
+//   (the state reset, as outside the rollback window); a session then recomputes, with a fresh session's tokens and
+//   drafts.  A checkpoint or round the ring still holds is restored, saved after more rows, or rewound to, with the
+//   flat cache's tokens and drafts.
+void dflash_ring(const std::string& dir, const std::string& backend, const std::vector<int32_t>& p) {
+  const std::string model = dir + "/tiny_gguf.gguf";
+  std::vector<int32_t> wrap_p, filler;
+  while (wrap_p.size() < 300) wrap_p.insert(wrap_p.end(), p.begin(), p.end());
+  wrap_p.resize(300);
+  while (filler.size() < 320) filler.insert(filler.end(), p.rbegin(), p.rend());
+  filler.resize(320);
+  // Ring and flat side by side: what they take, the tokens and drafts across the wraps, a snapshot of the ring.
+  auto against_flat = [&](const std::string& drafter, int kv, const std::string& which) {
+    const Load ring_load = {.speculative = true,
+                            .prefill_chunk = 64,
+                            .max_ctx = 512,
+                            .drafter = "dflash2",
+                            .drafter_files = {drafter},
+                            .kv = kv};
+    Load flat_load = ring_load;
+    flat_load.options = "dflash_ring=0";
+    auto ring_eng = engine(model, backend, ring_load);
+    auto flat_eng = engine(model, backend, flat_load);
+    auto bytes = [&](Engine& e, int ctx) {
+      uint64_t b = 0;
+      return e.api()->seq_bytes(e.bmodel(), ctx, &b) == 0 ? b : uint64_t(0);
+    };
+    const uint64_t ring_bytes = bytes(*ring_eng, 512), flat_bytes = bytes(*flat_eng, 512);
+    check(ring_bytes > 0 && ring_bytes < flat_bytes,
+          which + ": the ring shrinks a session (" + std::to_string(ring_bytes) + " < " + std::to_string(flat_bytes) +
+              " bytes)");
+    // The cache's max_ctx + 32 positions: at 96 no more than the ring's 128 slots, at 64 fewer.
+    for (int ctx : {64, 96})
+      check(bytes(*ring_eng, ctx) > 0 && bytes(*ring_eng, ctx) == bytes(*flat_eng, ctx),
+            "  at max_ctx " + std::to_string(ctx) + ", a cache no longer than the ring: no ring, the flat bytes");
+    std::vector<int32_t> tr_toks, fl_toks;
+    const auto tr = traced(*ring_eng, wrap_p, 48, &tr_toks);
+    const auto fl = traced(*flat_eng, wrap_p, 48, &fl_toks);
+    check(same_tokens(tr_toks, fl_toks) && same_rounds(tr, fl),
+          which + ": across the ring's wraps, the flat cache's tokens and drafts");
+    {
+      Load plain_load = ring_load;
+      plain_load.speculative = false;
+      check(same_tokens(tr_toks, tokens_of(*engine(model, backend, plain_load), wrap_p, 48)),
+            "  plain decoding's tokens");
+    }
+    const auto* api = ring_eng->api();
+    Session src(ring_eng.get()), dst(ring_eng.get()), fresh(flat_eng.get());
+    std::string err;
+    bool ok = src.init(&err) && dst.init(&err) && fresh.init(&err) && prefill_span(*ring_eng, src, wrap_p, 0, 300);
+    const int32_t at = ok ? api->checkpoint(src.seq(), 0) : -1;  // 300, or a chunk boundary the last pass crossed
+    uint64_t sb = 0;
+    ok = ok && at > 0 && at <= 300 && api->snapshot_bytes(src.seq(), 0, 0, &sb) == 0 && sb > 0;
+    std::vector<uint8_t> buf(size_t(std::max<uint64_t>(1, sb)));
+    void* q = buf.data();
+    flyx_host_pieces pieces{&q, 1, 0, sb};
+    const int32_t next = at > 0 && at < 300 ? wrap_p[size_t(at)] : p.front();
+    ok = ok && api->snapshot_save(src.seq(), 0, 0, &pieces, sb) == at &&
+         api->snapshot_load(dst.seq(), &pieces, sb, next) == at &&
+         prefill_span(*flat_eng, fresh, wrap_p, 0, size_t(at));
+    std::vector<int32_t> got, want, got_dr, want_dr;
+    ok = ok && decode_from(*ring_eng, dst, next, 24, &got, &got_dr) &&
+         decode_from(*flat_eng, fresh, next, 24, &want, &want_dr);
+    check(ok && same_tokens(got, want) && !got_dr.empty() && got_dr == want_dr,
+          which + ": a snapshot of the ring after its wraps, loaded elsewhere: the flat cache's tokens and drafts");
+    return std::make_pair(std::move(ring_eng), std::move(flat_eng));
+  };
+  {
+    auto [ring_eng, flat_eng] =
+        against_flat(dir + "/tiny_draft_window.gguf", FLYX_KV_16, "sliding-window DFlash2 ring");
+    const auto* api = ring_eng->api();
+    // A checkpoint after the first pass, and one after the prompt; then 16 rows more.  The first one's window's slots
+    // hold later positions by then; the second's still hold its window.
+    {
+      Session src(ring_eng.get()), dst(ring_eng.get()), fresh(flat_eng.get());
+      std::string err;
+      bool ok = src.init(&err) && dst.init(&err) && fresh.init(&err) && prefill_span(*ring_eng, src, wrap_p, 0, 64);
+      ok = ok && api->checkpoint(src.seq(), 0) == 64 && prefill_span(*ring_eng, src, wrap_p, 64, 300);
+      const int32_t at = ok ? api->checkpoint(src.seq(), 1) : -1;  // 300, or a chunk boundary the last pass crossed
+      ok = ok && at > 0 && at <= 300 && prefill_span(*ring_eng, src, filler, 0, 16);
+      uint64_t sb = 0;
+      check(ok && api->restore(src.seq(), 0, wrap_p[64]) < 0 && api->snapshot_bytes(src.seq(), 0, 0, &sb) != 0,
+            "  a checkpoint whose window later positions overwrote in the ring: neither restored nor saved");
+      // The one the ring still holds, saved and restored after the rows past it: the flat cache's continuation.
+      ok = ok && api->snapshot_bytes(src.seq(), 1, 0, &sb) == 0 && sb > 0;
+      std::vector<uint8_t> buf(size_t(std::max<uint64_t>(1, sb)));
+      void* q = buf.data();
+      flyx_host_pieces pieces{&q, 1, 0, sb};
+      const int32_t next = at > 0 && at < 300 ? wrap_p[size_t(at)] : p.front();
+      ok = ok && api->snapshot_save(src.seq(), 1, 0, &pieces, sb) == at &&
+           api->snapshot_load(dst.seq(), &pieces, sb, next) == at && api->restore(src.seq(), 1, next) == at &&
+           prefill_span(*flat_eng, fresh, wrap_p, 0, size_t(at));
+      std::vector<int32_t> want, want_dr, restored, restored_dr, loaded, loaded_dr;
+      ok = ok && decode_from(*flat_eng, fresh, next, 24, &want, &want_dr) &&
+           decode_from(*ring_eng, src, next, 24, &restored, &restored_dr) &&
+           decode_from(*ring_eng, dst, next, 24, &loaded, &loaded_dr);
+      check(ok && !want_dr.empty() && same_tokens(restored, want) && restored_dr == want_dr &&
+                same_tokens(loaded, want) && loaded_dr == want_dr,
+            "  one the ring still holds, restored, and saved after more rows: the flat cache's tokens and drafts");
+    }
+    // Rounds after a prompt, prefill passes past them (the next turn's prompt, its reply not asked for), then a rewind
+    // into the last round: past one pass the ring still holds the window there, past five it does not.
+    auto rounds_then_passes = [&](Engine& e, Session& s, size_t passes, std::vector<int32_t>* history, int32_t* pos) {
+      std::vector<int32_t> tokens, drafts;
+      flyx_round_result last{};
+      if (!prefill_span(e, s, wrap_p, 0, 63) || !decode_from(e, s, wrap_p[63], 8, &tokens, &drafts, &last))
+        return false;
+      history->assign(wrap_p.begin(), wrap_p.begin() + 64);  // position 64 + i: tokens[i], the last the anchor
+      history->insert(history->end(), tokens.begin(), tokens.end());
+      *pos = last.position - 1;  // inside the last round: [position - n_tokens, position]
+      return last.n_tokens >= 1 && prefill_span(e, s, filler, 0, passes * 64);
+    };
+    for (size_t passes : {size_t(1), size_t(5)}) {
+      Session rs(ring_eng.get()), fs(flat_eng.get()), fresh(flat_eng.get());
+      std::string err;
+      std::vector<int32_t> hist_r, hist_f;
+      int32_t pos_r = -1, pos_f = -1;
+      bool ok = rs.init(&err) && fs.init(&err) && fresh.init(&err) &&
+                rounds_then_passes(*ring_eng, rs, passes, &hist_r, &pos_r) &&
+                rounds_then_passes(*flat_eng, fs, passes, &hist_f, &pos_f) && hist_r == hist_f && pos_r == pos_f &&
+                pos_r >= 64;
+      const int32_t anchor = ok ? hist_r[size_t(pos_r)] : 0;
+      const int ring_rewind = ok ? api->rewind(rs.seq(), pos_r, anchor) : -1;
+      const int flat_rewind = ok ? flat_eng->api()->rewind(fs.seq(), pos_r, anchor) : -1;
+      std::vector<int32_t> got, got_dr, want, want_dr;
+      if (passes == 1) {
+        ok = ok && ring_rewind == 1 && flat_rewind == 1 && decode_from(*ring_eng, rs, anchor, 24, &got, &got_dr) &&
+             decode_from(*flat_eng, fs, anchor, 24, &want, &want_dr);
+        check(ok && same_tokens(got, want) && !want_dr.empty() && got_dr == want_dr,
+              "  a rewind into the last round past one prefill pass: done, the flat cache's tokens and drafts");
+      } else {
+        // The ring's state reset: the sequence again from its start, as a fresh session of the flat cache.
+        ok = ok && ring_rewind == 0 && flat_rewind == 1 && prefill_span(*ring_eng, rs, hist_r, 0, size_t(pos_r)) &&
+             prefill_span(*flat_eng, fresh, hist_r, 0, size_t(pos_r)) &&
+             decode_from(*ring_eng, rs, anchor, 24, &got, &got_dr) &&
+             decode_from(*flat_eng, fresh, anchor, 24, &want, &want_dr);
+        check(ok && same_tokens(got, want) && !want_dr.empty() && got_dr == want_dr,
+              "  past five prefill passes that overwrote its window: refused (" + std::to_string(ring_rewind) +
+                  ", flat " + std::to_string(flat_rewind) + "); recomputed, a fresh prefill's tokens and drafts");
+      }
+    }
+    // Through sessions: a 300-token prompt checkpointed at 64, and its reply; then the prompt cut at 64 and three
+    // other tokens, whose rounds draft from the window before 64.  The flat cache restores the checkpoint; the ring,
+    // whose window there later positions overwrote, recomputes; both give a fresh session's tokens and drafts.
+    {
+      std::vector<int32_t> edited(wrap_p.begin(), wrap_p.begin() + 64);
+      edited.insert(edited.end(), {wrap_p[64] == 5 ? 6 : 5, 17, 33});
+      Session rs(ring_eng.get()), fs(flat_eng.get()), fresh(flat_eng.get());
+      std::string err;
+      if (!rs.init(&err) || !fs.init(&err) || !fresh.init(&err)) throw std::runtime_error(err);
+      std::vector<flyx_round_result> first, tr, tf, tn;
+      generate_traced(rs, wrap_p, 48, {64}, &first);
+      generate_traced(fs, wrap_p, 48, {64}, &first);
+      int reused_r = -1, reused_f = -1;
+      std::string how_r, how_f;
+      const auto got_r = generate_traced(rs, edited, 24, {}, &tr, &reused_r, &how_r);
+      const auto got_f = generate_traced(fs, edited, 24, {}, &tf, &reused_f, &how_f);
+      const auto want = generate_traced(fresh, edited, 24, {}, &tn);
+      check(reused_r == 0 && reused_f == 64 && same_tokens(got_r, want) && same_tokens(got_f, want) &&
+                same_rounds(tr, tn) && same_rounds(tf, tn),
+            "  a prompt edited at a checkpoint whose window the ring lost: recomputed (" + how_r +
+                "), the flat cache's restored (" + how_f + "); both a fresh session's tokens and drafts");
+    }
+  }
+  // The engines above given back before these load (dflash_file: no more alive at a time than in its loop).
+  against_flat(dir + "/tiny_draft_1layer.flyx", FLYX_KV_FP8, "a DFlash2 drafter of one layer beside FP8 caches");
+}
+
 // A DFlash2 drafter in a file of its own (z-lab publishes them so), beside a model of either format.
 // * tiny.flyx's drafter alone (tiny_draft.flyx, converted from z-lab's layout) beside the tiny Qwen3.5 as GGUF
 //   (float32, no drafter): the golden tokens, and on the float64 backend the reference's drafts, round by round;
@@ -369,7 +615,7 @@ void dflash_file(const std::string& dir, const std::string& backend) {
   // than in the loop above.
   plain.reset();
   // The packed drafters beside a BF16 target (packed GGML weights inside DFlash2 when the target itself is
-  // non-quantized), plus fusion=0 parity on CUDA.
+  // non-quantized), plus fusion=0 parity and draft_weights=nvfp4/q8 regressions on CUDA.
   {
     const auto p = golden.at("cases").at(0).at("prompt").get<std::vector<int32_t>>();
     const auto want = tokens_of(*engine(dir + "/tiny_gguf.gguf", backend), p, 32);
@@ -389,7 +635,43 @@ void dflash_file(const std::string& dir, const std::string& backend) {
         same_drafts = a[i].n_drafts == b[i].n_drafts &&
                       std::equal(a[i].drafts, a[i].drafts + a[i].n_drafts, b[i].drafts);
       check(same_drafts, which + ": fused == generic (fusion=0) tokens and drafts");
+      fused.reset();
+      generic.reset();
+      // Streaming GGML->NVFP4 conversion on Q8_0 and mixed Q4_0+Q8_0 stacks (where attn.v is shared across
+      // layer w_qkv and context ctx): must never release shared WeightLoader::packs_ entries and must preserve output.
+      Load fp4_load = drafted;
+      fp4_load.prefill_chunk = 64;
+      fp4_load.options = "draft_weights=nvfp4";
+      auto fp4 = engine(dir + "/tiny_gguf.gguf", backend, fp4_load);
+      Load fp4_gen = fp4_load;
+      fp4_gen.options = "draft_weights=nvfp4,fusion=0";
+      auto fp4_g = engine(dir + "/tiny_gguf.gguf", backend, fp4_gen);
+      std::vector<int32_t> tfa, tfb;
+      const auto fa = traced(*fp4, p, 32, &tfa), fb = traced(*fp4_g, p, 32, &tfb);
+      bool same_fp4 = same_tokens(tfa, want) && tfa == tfb && fa.size() == fb.size();
+      for (size_t i = 1; same_fp4 && i < fa.size(); ++i)
+        same_fp4 = fa[i].n_drafts == fb[i].n_drafts &&
+                   std::equal(fa[i].drafts, fa[i].drafts + fa[i].n_drafts, fb[i].drafts);
+      check(same_fp4, which + " draft_weights=nvfp4: exact target tokens and fused == generic drafts");
     }
+    // On-the-fly Q8_0 drafter weights beside a BF16 target (desc has no FLYX_ACT_Q8 weights) with >16-row prefill:
+    // exercises RowNeeds::q8 propagation from bound drafter blocks so q8_parts/round_parts scratch is allocated.
+    if (backend != "cpu_ref") {
+      std::vector<int32_t> long_p = p;
+      while (long_p.size() < 48) long_p.insert(long_p.end(), p.begin(), p.end());
+      long_p.resize(48);
+      const auto want_long = tokens_of(*engine(dir + "/tiny_gguf.gguf", backend, {.prefill_chunk = 64}), long_p, 24);
+      auto bf16_q8_draft = engine(dir + "/tiny_gguf.gguf", backend,
+                                  {.speculative = true,
+                                   .prefill_chunk = 64,
+                                   .drafter = "dflash2",
+                                   .drafter_files = {drafter},
+                                   .options = "draft_weights=q8"});
+      check(same_tokens(tokens_of(*bf16_q8_draft, long_p, 24), want_long),
+            "BF16 target + DFlash2 draft_weights=q8 with >16-row prefill: plain decoding's tokens");
+    }
+    // The sliding-window drafter's context cache as a ring of slots (dflash_ring).
+    if (backend != "cpu_ref") dflash_ring(dir, backend, p);
   }
   // The dense targets with a DFlash2 GGUF drafter made for them: Qwen3 (GGUF and .flyx) and Llama (plain and with
   // its own adapters, a V-LoRA).

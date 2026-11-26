@@ -706,7 +706,26 @@ void test_quantize_q8_0() {
   const bool same = pay == want_pay && sc == want_sc;
   std::printf("  %-4s %-60s\n", same ? "ok" : "FAIL", "codes and scales as the host's, as blocks_pack lays them out");
   g_fail += !same;
-  for (void* p : std::initializer_list<void*>{dw, dpay, dsc}) CK(cudaFree(p));
+
+  // Row-chunked streaming quantization on a stream must match whole-matrix quantization bit for bit.
+  uint8_t* dpay2 = dev<uint8_t>(size_t(nb) * 32);
+  uint16_t* dsc2 = dev<uint16_t>(size_t(nb));
+  cudaStream_t st = nullptr;
+  CK(cudaStreamCreate(&st));
+  for (int r0 = 0; r0 < N; r0 += 7) {
+    const int nr = std::min(7, N - r0);
+    quantize_q8_0(dw + size_t(r0) * K, nr, K, dpay2 + size_t(r0) * K, dsc2 + size_t(r0) * (K / 32), st);
+  }
+  CK(cudaStreamSynchronize(st));
+  CK(cudaStreamDestroy(st));
+  std::vector<uint8_t> pay2(pay.size());
+  std::vector<uint16_t> sc2(nb);
+  CK(cudaMemcpy(pay2.data(), dpay2, pay2.size(), cudaMemcpyDeviceToHost));
+  CK(cudaMemcpy(sc2.data(), dsc2, sc2.size() * 2, cudaMemcpyDeviceToHost));
+  const bool same_chunk = pay == pay2 && sc == sc2;
+  std::printf("  %-4s %-60s\n", same_chunk ? "ok" : "FAIL", "chunked streaming == whole matrix (bit-identical)");
+  g_fail += !same_chunk;
+  for (void* p : std::initializer_list<void*>{dw, dpay, dsc, dpay2, dsc2}) CK(cudaFree(p));
 }
 
 // The drafts' two-stage head on a packed head (draft_pick_blocks): the 1-bit copy made from the rows

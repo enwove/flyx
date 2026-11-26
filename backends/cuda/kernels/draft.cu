@@ -202,8 +202,8 @@ __global__ void k_draft_ctx_kv(const float* kv, int ld, const float* k_norms, fl
   if (rope) rope_cs_inv(pos, rope[i], &c, &s);  // rope_table's factor, or its pow
   else rope_cs(pos, i, hd, theta, &c, &s);
   const float out = d < half ? nv * c - sh[d + half] * s : nv * c + sh[d - half] * s;
-  const int slot = ring > 0 ? (pos % ring) : pos;
-  const size_t at = size_t(layer) * layer_stride + (size_t(slot) * nkv + kh) * hd + d;
+  const int cell = ring > 0 ? pos % ring : pos;
+  const size_t at = size_t(layer) * layer_stride + (size_t(cell) * nkv + kh) * hd + d;
   dK[at] = __float2half_rn(out);
   dV[at] = __float2half_rn(row[nkv * hd + kh * hd + d]);
 }

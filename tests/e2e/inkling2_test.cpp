@@ -355,7 +355,7 @@ const char* kInkling2Template = R"jinja(
 enum class RoundMatrixCase { Generated, ExactBf16, OneLowBit };
 
 void write_tiny_inkling2(const std::filesystem::path& path, const TinySpec& c, bool mixed_quant, uint32_t seed_val,
-                         RoundMatrixCase round_case = RoundMatrixCase::Generated) {
+                         RoundMatrixCase round_case = RoundMatrixCase::Generated, uint32_t header_heads = 0) {
   std::mt19937 rng(seed_val);
   GgufWriter w;
   const std::string arch = "inkling2_loop";
@@ -366,7 +366,7 @@ void write_tiny_inkling2(const std::filesystem::path& path, const TinySpec& c, b
   w.add_u32(arch + ".embedding_length", uint32_t(c.H));
   w.add_u32(arch + ".vocab_size", uint32_t(c.vocab_padded));
   w.add_u32(arch + ".vocab_size_unpadded", uint32_t(c.vocab_unpadded));
-  w.add_u32(arch + ".attention.head_count", uint32_t(c.nh));
+  w.add_u32(arch + ".attention.head_count", header_heads ? header_heads : uint32_t(c.nh));
   w.add_u32(arch + ".attention.head_count_kv", uint32_t(c.nkv));
   w.add_u32(arch + ".attention.key_length", uint32_t(c.hd));
   w.add_u32(arch + ".attention.value_length", uint32_t(c.hd));
@@ -548,7 +548,7 @@ void write_tiny_inkling2(const std::filesystem::path& path, const TinySpec& c, b
 }
 
 void write_tiny_dspark(const std::filesystem::path& path, const TinySpec& c, bool packed_w1, uint32_t seed_val,
-                       int rank = 32) {
+                       int rank = 32, uint32_t header_heads = 0) {
   std::mt19937 rng(seed_val);
   GgufWriter w;
   const std::string arch = "dflash";
@@ -563,7 +563,7 @@ void write_tiny_dspark(const std::filesystem::path& path, const TinySpec& c, boo
   w.add_u32(arch + ".block_count", uint32_t(layers));
   w.add_u32(arch + ".embedding_length", uint32_t(c.H));
   w.add_u32(arch + ".feed_forward_length", uint32_t(c.inter));
-  w.add_u32(arch + ".attention.head_count", uint32_t(c.nh));
+  w.add_u32(arch + ".attention.head_count", header_heads ? header_heads : uint32_t(c.nh));
   w.add_u32(arch + ".attention.head_count_kv", uint32_t(c.nkv));
   w.add_u32(arch + ".attention.key_length", uint32_t(c.hd));
   w.add_u32(arch + ".block_size", uint32_t(block));
@@ -803,6 +803,7 @@ struct LoadOpts {
   std::vector<std::string> drafter_files{};
   std::string backend_opts{};
   std::string activations{};
+  bool draft_trees = false;  // EngineOptions::draft_trees: the drafters' trees beside their chains
 };
 
 std::unique_ptr<Engine> load_engine(const std::string& path, const std::string& backend, const LoadOpts& o = {}) {
@@ -823,6 +824,7 @@ std::unique_ptr<Engine> load_engine(const std::string& path, const std::string& 
   eo.kv_copy_gpu = o.kv_copy_gpu;
   eo.kv_ram = o.kv_ram;
   eo.kv_method = o.kv_method;
+  if (o.draft_trees) eo.draft_trees = eo.draft_trees_given = true;
   auto e = std::make_unique<Engine>();
   std::string err;
   if (!e->load(path, eo, &err)) throw std::runtime_error("load(" + backend + "): " + err);
@@ -1187,6 +1189,25 @@ int main(int argc, char** argv) {
     write_tiny_dflash2_gguf(dflash2_q8, spec, true, /*padded_codebook=*/false, 6006, 32, spec.nh * 2);
     write_tiny_dflash2_dir(dflash2_dir, spec, 7007);
 
+    for (bool drafter : {false, true}) {
+      const auto bad = dir / (drafter ? "dspark_excess_heads.gguf" : "inkling_excess_heads.gguf");
+      EngineOptions opts{};
+      opts.backend = "cpu_ref";
+      if (drafter) {
+        write_tiny_dspark(bad, spec, false, 3003, 32, 1u << 27);
+        opts.drafter = "dspark";
+        opts.speculative = true;
+        opts.drafter_files = {bad.string()};
+      } else {
+        write_tiny_inkling2(bad, spec, false, 1001, RoundMatrixCase::Generated, 1u << 27);
+      }
+      Engine engine;
+      std::string why;
+      check(!engine.load((drafter ? bf16_gguf : bad).string(), opts, &why) &&
+                why.find(drafter ? "invalid DSpark drafter dimensions" : "invalid inkling2_loop GGUF configuration") !=
+                    std::string::npos,
+            "excessive attention head count rejected before forming weight dimensions");
+    }
     test_chat_and_format(bf16_gguf.string());
 
     std::vector<int32_t> prompt;
@@ -1224,6 +1245,27 @@ int main(int argc, char** argv) {
           "cpu_ref DFlash2 HF dir greedy == cpu_ref plain");
     check(same_tokens(fresh_gen(*ref_both, prompt, 24, false), ref_greedy),
           "cpu_ref DSpark + DFlash2 (--drafter all) greedy == cpu_ref plain");
+    // A MoE that routes each row to more experts than the CUDA kernels take (65 of 72; moe_route keeps 64): cpu_ref
+    // runs it, and the CUDA load refuses it before allocating anything, saying why.
+    {
+      TinySpec routed = spec;
+      routed.n_experts = 72;
+      routed.top_k = 65;
+      const auto path = dir / "tiny_inkling2_top65.gguf";
+      write_tiny_inkling2(path, routed, false, 1001);
+      check(fresh_gen(*load_engine(path.string(), "cpu_ref"), prompt, 4, false).size() == 4,
+            "cpu_ref runs a MoE routing each row to 65 of 72 experts");
+      if (backend == "cuda") {
+        std::string why;
+        try {
+          (void)load_engine(path.string(), "cuda");
+        } catch (const std::exception& e) {
+          why = e.what();
+        }
+        check(why.find("route to up to 64") != std::string::npos,
+              "the CUDA load refuses a MoE routing to 65 experts a row (" + why + ")");
+      }
+    }
     {
       const auto clip_gguf = dir / "mmproj-BF16.gguf";
       GgufWriter cw;
@@ -1331,6 +1373,46 @@ int main(int argc, char** argv) {
         const size_t router = size_t(spec.n_experts) * spec.H, forget = size_t(spec.H) * spec.gate_rank;
         check(inexact == exact + (router + forget) * sizeof(float),
               "one low bit in each repeated core matrix retains exactly one F32 router and one F32 forget matrix");
+      }
+      // A softcap small enough to saturate: cap * tanh(z / cap) is the cap itself for every score well above the
+      // cap, and the greedy choice the lowest token id of those, which a screen bounding z apart would have cut.  A
+      // softcapped head holds no certified copy: greedy decoding with head_cert on (the default) reads the whole head,
+      // in plain rounds and in lookup rounds of several rows, token for token what head_cert=0 gives.
+      {
+        TinySpec capped = spec;
+        capped.softcap = 0.01f;
+        const auto path = dir / "tiny_inkling2_saturated_cap.gguf";
+        write_tiny_inkling2(path, capped, false, 1001);
+        auto whole = load_engine(path.string(), "cuda", {.backend_opts = "head_cert=0"});
+        auto cert = load_engine(path.string(), "cuda");
+        auto cert_rows = load_engine(path.string(), "cuda", {.speculative = true, .lookup = true, .width = 0});
+        const auto want = fresh_gen(*whole, prompt, 32, false);
+        // The tie is there: the first token's capped scores have their highest at two or more ids, the lowest chosen.
+        int ties = 0, lowest = -1;
+        {
+          Session s(whole.get());
+          std::string err;
+          if (!s.init(&err)) throw std::runtime_error(err);
+          const auto* api = whole->api();
+          flyx_gen_params gp{};
+          gp.top_p = 1.f;
+          flyx_round_result rr{};
+          std::vector<float> z(size_t(whole->model().desc().vocab));
+          if (api->prefill(whole->prefill_plan(), s.seq(), prompt.data(), int32_t(prompt.size()), &gp) ||
+              api->read(s.seq(), &rr) || api->logits(s.seq(), 0, z.data()))
+            throw std::runtime_error(api->last_error());
+          const float top = *std::max_element(z.begin(), z.end());
+          for (size_t v = 0; v < z.size(); ++v)
+            if (z[v] == top && ties++ == 0) lowest = int(v);
+        }
+        check(ties >= 2 && !want.empty() && want[0] == lowest,
+              "saturating softcap: " + std::to_string(ties) + " ids tie at the cap, the lowest (" +
+                  std::to_string(lowest) + ") chosen");
+        check(weight_bytes(*cert) == weight_bytes(*whole), "a softcapped head holds no certified copy");
+        check(same_tokens(fresh_gen(*cert, prompt, 32, false), want),
+              "saturating softcap: greedy with head_cert on == the whole head");
+        check(same_tokens(fresh_gen(*cert_rows, prompt, 32, false), want),
+              "saturating softcap: greedy with head_cert on, lookup rounds of several rows == the whole head");
       }
       // ---- 2. CUDA vs cpu_ref, Gate 2 (fusion=0 == fusion=1), Gate 4 (plain == DSpark), CUDA graphs ----
       auto cu_plain = load_engine(bf16_gguf.string(), "cuda", {.prefill_chunk = 32});
@@ -1576,6 +1658,52 @@ int main(int argc, char** argv) {
         }
       }
 
+      // ---- 2c. Tree rounds: an Inkling-2 target verifies chains only ----
+      // Relative-position attention scores a round's rows as consecutive positions and its ShortConvs (and the
+      // MoE's) fold them in order, with no replay of a fork: of two siblings, the second would read the first.  The
+      // backend refuses every tree round (given, and DFlash2's drafted), so that no tree reaches a launch; the engine
+      // keeps plain rounds, its drafters' chains and lookup's.
+      std::printf("Inkling-2 tree rounds refused (relative-position attention, ShortConv)\n");
+      {
+        auto e = load_engine(bf16_gguf.string(), "cuda",
+                             {.speculative = true,
+                              .lookup = true,
+                              .prefill_chunk = 32,
+                              .width = kChosen,
+                              .drafter = "dflash2",
+                              .drafter_files = {dflash2_bf16.string()},
+                              .draft_trees = true});
+        const auto& trees = e->round_trees();
+        check(e->tree_widths().empty() && !e->lookup_widths().empty() && e->widths().size() > 1 &&
+                  std::find(trees.begin(), trees.end(), true) == trees.end(),
+              "with draft trees asked for, the engine lowers DFlash2's chains, lookup's and plain rounds, no tree");
+        const auto* api = e->api();
+        auto lowers = [&](std::vector<flyx_node> rnd, int k, std::string* why) {
+          flyx_program rp{FLYX_PHASE_ROUND, k, k + 1, int32_t(rnd.size()), rnd.data()};
+          flyx_plan* plan = nullptr;
+          const int rc = api->lower(e->bmodel(), &rp, &plan);
+          if (plan) api->plan_free(plan);
+          *why = rc != 0 && api->last_error() ? api->last_error() : "";
+          return rc == 0;
+        };
+        // The tree of three given drafts the lookup would send with parents {-1, -1, 0}: drafts 0 and 1 siblings.
+        std::string why;
+        auto given_tree = e->model().round_program(3, -1, true);
+        for (auto& n : given_tree)
+          if (n.kind == FLYX_NODE_GIVEN) n.arg1 = FLYX_GIVEN_TREE;
+        check(!lowers(given_tree, 3, &why) && why.find("tree rounds on relative-position attention") != std::string::npos,
+              "a round verifying a tree of given drafts (siblings) is refused at lower (" + why + ")");
+        auto drafted_tree = e->model().round_program(9, 0, false);
+        for (auto& n : drafted_tree)
+          if (n.kind == FLYX_NODE_DRAFT) n.arg1 = FLYX_DRAFT_TREE;
+        check(!lowers(drafted_tree, 9, &why) && why.find("tree rounds on relative-position attention") != std::string::npos,
+              "a round verifying DFlash2's drafted tree is refused at lower (" + why + ")");
+        check(lowers(e->model().round_program(3, -1, true), 3, &why) && lowers(e->model().round_program(7, 0, false), 7, &why),
+              "the same rounds as chains (given drafts, DFlash2's) still lower");
+        check(same_tokens(fresh_gen(*e, prompt, 24, false), cu_greedy),
+              "Gate 4: DFlash2 + lookup with draft trees asked for (chains only) greedy == cuda plain");
+      }
+
       // ---- 3. Rewind, edited prompt, and SWA ring wraparound checkpoint/restore & snapshot ----
       std::printf("Inkling-2 rewind, edit, and SWA ring wraparound checkpoint/snapshot\n");
       {
@@ -1639,6 +1767,90 @@ int main(int argc, char** argv) {
               "fresh session prepared pos 260 from snapshot (" + how + ")");
         auto after_snap = run_gen(s2, prefix261, 16, false);
         check(same_tokens(after_snap, want_from_261), "snapshot_load after SWA ring wraparound == fresh");
+      }
+
+      // A rewind into a committed round after prefill passes appended past it: the passes move the position on and
+      // not the round, so the round is still a rollback source of the recurrent state (ShortConv); the SWA ring (128
+      // slots, window 8) holds the positions the row there reads only while the passes have not gone round it.
+      // Within the ring, the rewind is taken and the rounds after it are those of the same rewind without the passes;
+      // past it, the rewind is refused (0: the caller restores a checkpoint or prefills again), never a rollback that
+      // reads slots overwritten since.
+      {
+        auto e = load_engine(bf16_gguf.string(), "cuda", {.prefill_chunk = 32});
+        const auto* api = e->api();
+        const int vocab = e->model().desc().vocab;
+        flyx_gen_params gp{};
+        gp.top_p = 1.f;
+        const int P = int(prompt.size());
+        std::vector<int32_t> extra(240);
+        for (int i = 0; i < 240; ++i) extra[size_t(i)] = 7 + (i * 19) % 230;
+        // Prefill the prompt, three plain rounds (from positions P, P + 1 and P + 2), then `appended` tokens in passes
+        // of at most 32 and of `appends` calls; then the rewind to P + 2 with another anchor, and 8 rounds.
+        auto rewound = [&](int appended, int appends, int* rc) {
+          Session s(e.get());
+          std::string err;
+          if (!s.init(&err)) throw std::runtime_error(err);
+          flyx_round_result rr{};
+          std::vector<int32_t> got;
+          auto round = [&] {
+            if (api->launch(e->round_plan(0), s.seq(), &gp) || api->read(s.seq(), &rr))
+              throw std::runtime_error(api->last_error());
+            got.push_back(rr.tokens[0]);
+          };
+          if (api->prefill(e->prefill_plan(), s.seq(), prompt.data(), P, &gp) || api->read(s.seq(), &rr))
+            throw std::runtime_error(api->last_error());
+          got.push_back(rr.tokens[0]);
+          for (int i = 0; i < 3; ++i) round();
+          for (int a = 0, done = 0; a < appends; ++a)
+            for (const int end = appended * (a + 1) / appends; done < end;) {
+              const int n = std::min(32, end - done);
+              if (api->prefill(e->prefill_plan(), s.seq(), extra.data() + done, n, nullptr))
+                throw std::runtime_error(api->last_error());
+              done += n;
+            }
+          const int32_t anchor = (got[2] + 1) % vocab;
+          *rc = api->rewind(s.seq(), P + 2, anchor);
+          if (*rc != 1) return std::vector<int32_t>{};
+          got.clear();
+          for (int i = 0; i < 8; ++i) round();
+          return got;
+        };
+        int rc_none = -1, rc_within = -1, rc_past = -1;
+        const auto after_none = rewound(0, 1, &rc_none);
+        const auto after_within = rewound(8, 1, &rc_within);
+        (void)rewound(240, 2, &rc_past);
+        check(rc_none == 1 && rc_within == 1 && after_none.size() == 8 && same_tokens(after_within, after_none),
+              "a rewind into a round after 8 appended tokens (inside the SWA ring) is taken, its rounds those of the "
+              "rewind without them");
+        check(rc_past == 0,
+              "a rewind into a round after prefill passes went round the SWA ring (240 tokens in two appends) is "
+              "refused, not rolled back over overwritten slots (" + std::to_string(rc_past) + ")");
+
+        // The same through sessions, from plain and DSpark rounds: a reply, a long continuation of the conversation
+        // in two turns (prefill passes, no rounds of their own past the first token), then the conversation edited
+        // back inside the reply: the state the session brings it to (a checkpoint and a prefill, the rewind refused)
+        // continues as a fresh prefill of the edited prompt does.
+        for (Engine* eng : {cu_plain.get(), cu_dspark.get()}) {
+          const std::string tag = eng == cu_dspark.get() ? "DSpark" : "plain";
+          Session s(eng);
+          std::string err;
+          if (!s.init(&err)) throw std::runtime_error(err);
+          const auto reply = run_gen(s, prompt, 6, false);
+          std::vector<int32_t> convo = prompt;
+          convo.insert(convo.end(), reply.begin(), reply.end());
+          for (int turn = 0; turn < 2; ++turn) {
+            convo.insert(convo.end(), extra.begin() + 120 * turn, extra.begin() + 120 * (turn + 1));
+            (void)run_gen(s, convo, 1, false, {int32_t(convo.size())});
+          }
+          std::vector<int32_t> edit = prompt;
+          edit.insert(edit.end(), reply.begin(), reply.begin() + 3);
+          edit.push_back((reply[3] + 1) % vocab);
+          GenerateResult res;
+          const auto got = run_gen(s, edit, 12, false, {}, -1, &res);
+          check(same_tokens(got, fresh_gen(*cu_plain, edit, 12, false)),
+                tag + ": the conversation edited back into a reply after 240 appended tokens == a fresh prefill (" +
+                    std::to_string(res.usage.reused_tokens) + " of " + std::to_string(edit.size()) + " reused)");
+        }
       }
 
       // Multi-sequence concurrent generation on one Engine (exercises launch_batch fallback + independent state).

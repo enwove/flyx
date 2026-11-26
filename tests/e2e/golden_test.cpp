@@ -3612,6 +3612,8 @@ int main(int argc, char** argv) {
   // exact weights; the others draft from NVFP4 copies (the output must not
   // change, only the drafts may).
   auto spec_exact = backend == "cpu_ref" ? nullptr : make(model, backend, true, "dflash2", false, "draft_weights=exact");
+  auto spec_nvfp4 = backend == "cpu_ref" ? nullptr : make(model, backend, true, "dflash2", false, "draft_weights=nvfp4");
+  auto spec_q8 = backend == "cpu_ref" ? nullptr : make(model, backend, true, "dflash2", false, "draft_weights=q8");
   auto mtp = make(model, backend, true, "mtp", false, backend == "cuda" ? "draft_weights=exact" : "");
   auto mtp_q = make(model, backend, true, "mtp");
   // Every drafter the model has: rounds of each at a fixed width (MTP 7, DFlash2 15), and the
@@ -3677,6 +3679,11 @@ int main(int argc, char** argv) {
       check(same_tokens && total > 0 && same * 10 >= total * 9,
             "DFlash2 from exact weights: the reference's tokens, its drafts " + std::to_string(same) + " / " +
                 std::to_string(total));
+      Session s4(spec_nvfp4.get()), s8(spec_q8.get());
+      init_checked(s4);
+      init_checked(s8);
+      check(gen(s4, prompt, N).tokens == want && gen(s8, prompt, N).tokens == want,
+            "DFlash2 streaming nvfp4 and q8 draft_weights: exact target tokens");
     }
 
     Session so(spec.get());

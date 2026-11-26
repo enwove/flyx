@@ -32,7 +32,7 @@ __global__ void k_softcap_rows(float* logits, int ld, int V, float cap) {
 // A 512-thread block computes one row for one or more queries over M = n_blocks + 1
 // states (bank[0..n_blocks-1] and cur), each RMS-normalized (no gamma, eps = 1e-6).
 // One warp owns a state's dot products, one warp owns a query's softmax, and all threads mix the channels.
-constexpr int kMaxResStates = 64;
+constexpr int kMaxResStates = kAttnResMaxStates;
 
 // Exact block_sum order for 512-thread (16-warp) blocks in a single barrier (matches rows.cu::block512_sum).
 __device__ __forceinline__ float block512_sum(float v) {
@@ -62,13 +62,19 @@ struct RowSpan {
   // Every thread of the row; orders global and shared stores before the loads after it (release / acquire).
   __device__ static void sync() {
     if constexpr (CL == 1) __syncthreads();
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900
     else cooperative_groups::this_cluster().sync();
+#endif
   }
   // The copy of the shared array a in the block of the row's thread t.
   template <class T>
   __device__ static T* of_thread(T* a, int t) {
     if constexpr (CL == 1) return a;
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900
     else return cooperative_groups::this_cluster().map_shared_rank(a, t / kThreads);
+#else
+    else return a;  // CL > 1 kernels are stubs in this image.
+#endif
   }
 };
 
@@ -792,8 +798,8 @@ __global__ void k_shortconv_pass(const float* __restrict__ x, int ldx, const flo
 // read back from x_dst and the mixed row from the block of the thread that mixed it; the host picks it for float4
 // rows only, so every sum is the one-block row's.
 template <SublayerNorm NORM, int NQ, int U, int CL = 1>
-__global__ void __launch_bounds__(512 / CL)
-    k_shortconv_res_mix_norm(SublayerPostConv sc, const float* __restrict__ x_src, float* __restrict__ x_dst,
+__device__ __forceinline__ void
+    shortconv_res_mix_norm_row(SublayerPostConv sc, const float* __restrict__ x_src, float* __restrict__ x_dst,
                              float* __restrict__ bank, int n_blocks, const float* __restrict__ queries,
                              float* __restrict__ mix_out, const float* __restrict__ norm_w, float norm_offset,
                              float norm_eps, Out norm_o, int ldy, const DevParams* P, int rows, int H) {
@@ -950,6 +956,67 @@ __global__ void __launch_bounds__(512 / CL)
     }
   }
   if constexpr (CL > 1) RowSpan<CL>::sync();  // no block leaves while another reads its shared memory
+}
+
+template <SublayerNorm NORM, int NQ, int U, int CL = 1>
+__global__ void __launch_bounds__(512 / CL)
+    k_shortconv_res_mix_norm(SublayerPostConv sc, const float* __restrict__ x_src, float* __restrict__ x_dst,
+                             float* __restrict__ bank, int n_blocks, const float* __restrict__ queries,
+                             float* __restrict__ mix_out, const float* __restrict__ norm_w, float norm_offset,
+                             float norm_eps, Out norm_o, int ldy, const DevParams* P, int rows, int H) {
+#if !defined(__CUDA_ARCH__) || __CUDA_ARCH__ < 900
+  if constexpr (CL > 1) {
+    __trap();  // The host selects only CL=1 for this image.
+  } else
+#endif
+  {
+    shortconv_res_mix_norm_row<NORM, NQ, U, CL>(sc, x_src, x_dst, bank, n_blocks, queries, mix_out, norm_w,
+                                                norm_offset, norm_eps, norm_o, ldy, P, rows, H);
+  }
+}
+
+struct SublayerVariant {
+  using Kernel = decltype(&k_shortconv_res_mix_norm<SublayerNorm::None, 1, 1, 1>);
+  SublayerNorm norm;
+  int queries, unroll, cluster;
+  Kernel single, clustered;
+};
+
+template <SublayerNorm N, int Q, int U>
+SublayerVariant sublayer_variant(int requested) {
+  SublayerVariant v{N, Q, U, 1, k_shortconv_res_mix_norm<N, Q, U, 1>, nullptr};
+  if (requested != 4 && requested != 8) return v;
+  auto kernel = requested == 4 ? k_shortconv_res_mix_norm<N, Q, U, 4> : k_shortconv_res_mix_norm<N, Q, U, 8>;
+  cudaLaunchConfig_t cfg{};
+  cfg.gridDim = dim3(requested);
+  cfg.blockDim = dim3(512 / requested);
+  // Test the largest shared row this specialization takes. All smaller rows fit the same cluster.
+  cfg.dynamicSmemBytes = (U == 5 ? 2560 : 5120) * sizeof(float);
+  int limit = 0;
+  if (cudaOccupancyMaxPotentialClusterSize(&limit, kernel, &cfg) != cudaSuccess) {
+    cudaGetLastError();
+  } else if (limit >= requested) {
+    v.cluster = requested;
+    v.clustered = kernel;
+  }
+  return v;
+}
+
+const auto& sublayer_variants() {
+  static const int cl = [] {
+    if (!sm90_or_newer()) return 1;
+    const char* e = std::getenv("FLYX_SC_CLUSTER");
+    return e ? std::atoi(e) : 8;
+  }();
+  using N = SublayerNorm;
+  static const SublayerVariant variants[] = {
+      sublayer_variant<N::None, 1, 1>(cl), sublayer_variant<N::None, 2, 1>(cl),
+      sublayer_variant<N::None, 3, 1>(cl), sublayer_variant<N::None, 4, 1>(cl),
+      sublayer_variant<N::F32, 1, 5>(cl), sublayer_variant<N::F32, 1, 10>(cl),
+      sublayer_variant<N::MoeQ8, 1, 5>(cl), sublayer_variant<N::MoeQ8, 1, 10>(cl),
+      sublayer_variant<N::AttnQ8Split, 1, 5>(cl), sublayer_variant<N::AttnQ8Split, 1, 10>(cl),
+      sublayer_variant<N::AttnQ8Split, 3, 5>(cl), sublayer_variant<N::AttnQ8Split, 3, 10>(cl)};
+  return variants;
 }
 
 __global__ void k_shortconv_fold(const ShortConvLayer* __restrict__ layers, size_t win_stride, size_t replay_stride,
@@ -2448,6 +2515,8 @@ void shortconv_pass(const float* x, int ldx, const float* w, const float* dyn, f
       conv, n_heads, P, rows, tile_rows, out, ldo, int(accumulate), res_src);
 }
 
+void prepare_sublayer_clusters() { (void)sublayer_variants(); }
+
 void shortconv_res_mix_norm(const SublayerPostConv& sc, const float* x_src, float* x_dst, float* bank, int n_blocks,
                             const float* queries, int n_queries, float* mix_out, SublayerNorm norm_mode,
                             const float* norm_w, float norm_offset, float norm_eps, float* norm_y, int ldy,
@@ -2481,59 +2550,28 @@ void shortconv_res_mix_norm(const SublayerPostConv& sc, const float* x_src, floa
   const bool vec4 = (H & 3) == 0 && ((reinterpret_cast<uintptr_t>(bank) | reinterpret_cast<uintptr_t>(x_src) |
                                       reinterpret_cast<uintptr_t>(x_dst) | reinterpret_cast<uintptr_t>(queries) |
                                       reinterpret_cast<uintptr_t>(mix_out)) & 15u) == 0;
-  static const int cl_env = [] {
-    const char* e = std::getenv("FLYX_SC_CLUSTER");
-    return e ? std::atoi(e) : 8;
-  }();
-  const int cl = vec4 && (cl_env == 4 || cl_env == 8) ? cl_env : 1;
-  auto launch = [&](auto kern1, auto kern4, auto kern8) {
+  const int unroll = norm_mode == SublayerNorm::None ? 1 : H <= 2560 ? 5 : 10;
+  for (const auto& v : sublayer_variants()) {
+    if (v.norm != norm_mode || v.queries != n_queries || v.unroll != unroll) continue;
+    const int cl = vec4 ? v.cluster : 1;
     cudaLaunchConfig_t cfg{};
     cfg.gridDim = cl == 1 ? dim3(rows) : dim3(cl, rows);
     cfg.blockDim = dim3(512 / cl);
     cfg.dynamicSmemBytes = size_t(H) * sizeof(float);
     cfg.stream = L.st;
     cudaLaunchAttribute at{};
-    at.id = cudaLaunchAttributeClusterDimension;
-    at.val.clusterDim.x = cl;
-    at.val.clusterDim.y = 1;
-    at.val.clusterDim.z = 1;
-    cfg.attrs = &at;
-    cfg.numAttrs = cl > 1 ? 1 : 0;
-    auto kern = cl == 1 ? kern1 : cl == 4 ? kern4 : kern8;
-    cudaLaunchKernelEx(&cfg, kern, sc, x_src, x_dst, bank, n_blocks, queries, mix_out, norm_w, norm_offset, norm_eps,
-                       o, ldy, P, rows, H);
-  };
-#define FLYX_SUBLAYER_CALL(N, Q, U_)                                                                                   \
-  launch(k_shortconv_res_mix_norm<N, Q, U_, 1>, k_shortconv_res_mix_norm<N, Q, U_, 4>,                                 \
-         k_shortconv_res_mix_norm<N, Q, U_, 8>)
-#define FLYX_SUBLAYER_NORM(N, Q)                                                                                       \
-  if (H <= 2560) FLYX_SUBLAYER_CALL(N, Q, 5);                                                                          \
-  else FLYX_SUBLAYER_CALL(N, Q, 10)
-  switch (norm_mode) {
-    case SublayerNorm::None:
-      switch (n_queries) {
-        case 1: FLYX_SUBLAYER_CALL(SublayerNorm::None, 1, 1); break;
-        case 2: FLYX_SUBLAYER_CALL(SublayerNorm::None, 2, 1); break;
-        case 3: FLYX_SUBLAYER_CALL(SublayerNorm::None, 3, 1); break;
-        default: FLYX_SUBLAYER_CALL(SublayerNorm::None, 4, 1); break;
-      }
-      break;
-    case SublayerNorm::F32:
-      if (n_queries == 1) { FLYX_SUBLAYER_NORM(SublayerNorm::F32, 1); }
-      else throw std::invalid_argument("shortconv_res_mix_norm: F32 expects n_queries == 1");
-      break;
-    case SublayerNorm::MoeQ8:
-      if (n_queries == 1) { FLYX_SUBLAYER_NORM(SublayerNorm::MoeQ8, 1); }
-      else throw std::invalid_argument("shortconv_res_mix_norm: MoeQ8 expects n_queries == 1");
-      break;
-    case SublayerNorm::AttnQ8Split:
-      if (n_queries == 1) { FLYX_SUBLAYER_NORM(SublayerNorm::AttnQ8Split, 1); }
-      else if (n_queries == 3) { FLYX_SUBLAYER_NORM(SublayerNorm::AttnQ8Split, 3); }
-      else throw std::invalid_argument("shortconv_res_mix_norm: AttnQ8Split expects n_queries == 1 or 3");
-      break;
+    if (cl > 1) {
+      at.id = cudaLaunchAttributeClusterDimension;
+      at.val.clusterDim = {unsigned(cl), 1, 1};
+      cfg.attrs = &at;
+      cfg.numAttrs = 1;
+    }
+    const auto err = cudaLaunchKernelEx(&cfg, cl == 1 ? v.single : v.clustered, sc, x_src, x_dst, bank, n_blocks,
+                                        queries, mix_out, norm_w, norm_offset, norm_eps, o, ldy, P, rows, H);
+    if (err != cudaSuccess) throw std::runtime_error(std::string("shortconv_res_mix_norm: ") + cudaGetErrorString(err));
+    return;
   }
-#undef FLYX_SUBLAYER_NORM
-#undef FLYX_SUBLAYER_CALL
+  throw std::invalid_argument("shortconv_res_mix_norm: unsupported norm and query count");
 }
 
 void shortconv_fold(const ShortConvLayer* layers, int n, size_t win_stride, size_t replay_stride, int in_sel,

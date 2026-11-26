@@ -31,8 +31,11 @@
 #include <vector>
 
 #include "backends/cuda/blocks.h"
+#include "backends/cuda/errors.h"
 #include "backends/cuda/kernels/kernels.cuh"
+#include "backends/cuda/runtime/draft_ring.h"
 #include "backends/cuda/runtime/vision_disk.h"
+#include "core/interfaces/options.h"
 #include "flyx/backend_abi.h"
 #include "ops/dtype/ref.h"
 
@@ -41,9 +44,6 @@ namespace flyx::cuda {
 // ---- errors ----------------------------------------------------------------------------------
 // The message last_error() returns (per thread).
 extern thread_local std::string g_error;
-struct CudaError : std::runtime_error {
-  using std::runtime_error::runtime_error;
-};
 void ck(cudaError_t e, const char* what);
 #define CK(x) ::flyx::cuda::ck((x), #x)
 // The model's device memory (flyx_bmodel::alloc) and the prefill buffers: cudaMalloc that never takes more than the
@@ -51,13 +51,11 @@ void ck(cudaError_t e, const char* what);
 // every round (Qwen3.5-4B NVFP4 beside other programs holding 4.7 of 8 GB: 12.5 tok/s plain against 132.4); this
 // throws OutOfDeviceMemory instead (and so does a refusal by the driver).  device_room: the same check alone, for
 // memory the driver maps (a VMM slab), throwing where device_malloc would.
-struct OutOfDeviceMemory : CudaError {
-  using CudaError::CudaError;
-};
 void device_room(size_t bytes);
 void* device_malloc(size_t bytes);
-// Records m for last_error(); returns -1.
+// Records m for last_error(); returns -1 (or FLYX_ERR_OOM for device memory exhaustion).
 int fail(const std::string& m);
+int fail_oom(const std::string& m);
 // fail() for a call given no sequence (a session whose seq_new failed or was never made): an error, not a crash.
 int no_sequence(const char* call);
 
@@ -87,11 +85,12 @@ inline void destroy_side(SideStream& s) {
 //   attention=split|head  prefill attention in float32 / no KV-head grouping (and no FP8 K/V)
 //   gemm=rows             every GEMM on the CUDA-core row path
 //   pdl=0|1 programmatic dependent launch off / on (default: the GPU's table)
-//   head_cert=0 greedy choices read the whole head, not the certified head
+//   head_cert=0 greedy choices read the whole head, not the certified head (a softcapped head is never certified)
 //   wait=spin|poll|auto   wait for the device by spinning (lowest latency, one core busy), by polling with short sleeps
 //                         (the default on Linux), or (auto, the default on Windows) spinning while the last waits for a
 //                         round's result took under 1.5 ms (a sleep ends ~0.5 ms late), polling past that (runner.cpp)
-//   draft_weights=exact   drafts read the bf16 head, MTP layer and DFlash2 drafter, not NVFP4 or Q8_0 copies
+//   draft_weights=auto|nvfp4|q8|exact  drafter weight precision (auto: target-matched when roomy, NVFP4 when VRAM is
+//                         tight; nvfp4: 4-bit; q8: Q8_0; exact: file precision and uncompacted draft head)
 //   draft_kv=16           the MTP layer's K/V cache in binary16, not FP8 with the target's (when they are FP8)
 //   blocks=bf16           GGML block weights (GGUF) decoded to bf16 at load instead of kept packed
 //   embed=gpu an embedding table no head reads on the GPU, not in host memory
@@ -109,12 +108,13 @@ inline void destroy_side(SideStream& s) {
 //                         through a copy of mtp_copy=BITS bits (2; 0, or heads strata attention is not compiled
 //                         for: none, then its first mtp_sink=N exactly, 64);
 //                         mtp_ring=0: its cache a slot a position, not a ring (tests)
+//                         dflash_ring=0: a sliding-window DFlash2 cache flat, not a ring (tests)
 //   strata_denom=N strata attention refines one pair of positions in N a row (default 16 with
 //                         a 2-bit copy, 64 with more; 0: none, the copy alone), at least strata_least=N pairs (32),
 //                         plus the last strata_recent=N positions, and at most strata_most=N pairs (256; 0: no
 //                         bound); strata_scan=cores, strata_grid=normal: measurement
-//   strata_from=N         --kv-method auto: rounds read the copy from position N on (default: the GPU's part of
-//                         the K/V, i.e. 0 tokens of exact host overhang)
+//   strata_from=N         --kv-method auto: read the copy from position N on (overrides the engine's
+//                         target-only reference position)
 //   act_group=64|128|256  measurement: 8-bit inputs with one scale this many values (bench/quality/kld.cpp; with
 //                         fusion=0 and round_glu=0, whose producers round their own outputs per 32)
 //   act_fp4=1|2           measurement: inputs first rounded as NVFP4 (1) or MXFP8 (2) activations would be
@@ -130,7 +130,8 @@ enum class WaitMode { poll, spin, automatic };  // option wait=poll|spin|auto
 enum class PageableKvMode { off, on, automatic };  // option pageable_kv=off|on|auto
 struct BackendOptions {
   KernelOptions kernels;  // the ones launches consult
-  bool profile = false, graphs = true, fusion = true, exact_drafts = false;
+  bool profile = false, graphs = true, fusion = true;
+  interfaces::DraftWeightsMode draft_weights = interfaces::DraftWeightsMode::kAuto;
   bool dv_conditional = true;  // option dv_conditional=0 clears it: DV's canvas pass inline in a round's graph
   bool stage_dma = true;
   // How a thread waits for the device (runner.cpp; on WSL2 every CUDA wait spins a core, so the default polls).  On
@@ -218,7 +219,7 @@ struct RowBufs {
   float *post_raw = nullptr, *post_out = nullptr;
   int* moe_idx = nullptr;
   float* moe_guess = nullptr;  // rounds: the experts' scores moe_prefetch guesses from (n_experts floats), then
-                              // the row moe_prefetch_mixed guesses them from (hidden floats)
+                              // the mixed row moe_guess_scores reads (hidden floats)
   // moe_act: the activations in float32, or in bf16 where a fused round's gate|up GEMM writes the down GEMM's input
   float *moe_w = nullptr, *moe_gu = nullptr, *moe_act = nullptr;
   MoeScratch moe_sc{};  // the expert GEMMs' staged inputs, their grouping and the down projection's slots
@@ -261,17 +262,32 @@ struct LoadTimes {
 // The driver keeps every node's launch and every graph's own in pieces of 2 MiB that the process's graphs share, and
 // keeps the pieces once the graphs are destroyed, for its next graphs.  What an instantiated graph takes at most, by
 // what it holds (`cuda_bench graphs` measures each kind of node; RTX 5060 Ti, driver 610.88; a node's figure there has
-// the graph's own 96 KiB in it): a kernel node kGraphKernelBytes (chains of 100, 400 and 1000: 3.5, 3.3 and 2.7 KiB a
+// the graph's own 96 KiB in it): a kernel node GraphPrices::kernel (chains of 100, 400 and 1000: 3.5, 3.3 and 2.7 KiB a
 // node; launched with programmatic dependent launch the same) while its parameters take kGraphParamBytes at most, and
-// kGraphParamCost times each byte past them (4 KB of parameters: 11.5 KiB a node); a copy node kGraphCopyBytes (100
+// kGraphParamCost times each byte past them (4 KB of parameters: 11.5 KiB a node); a copy node GraphPrices::copy (100
 // between device buffers: 5.8 KiB a node; 100 to or from pinned or host-mapped memory take no more than the graph's
 // own 96 KiB, as do 100 memsets); a memset node kGraphSetBytes; any other kGraphOtherBytes, and the graphs it holds
 // (a conditional node's bodies: DV's canvas pass, regions/layers.cpp; a child graph) each a graph of its own, its nodes
 // priced the same way (a conditional node with a body of 1, 100 and 400 kernels: 192, 256 and 1440 KiB a graph, 96 and
 // 128 KiB more than a chain of 1 and 400); the graph itself kGraphBytes (96 KiB for a graph of one node).
-constexpr size_t kGraphKernelBytes = 3584, kGraphParamBytes = 1024, kGraphParamCost = 3;
-constexpr size_t kGraphCopyBytes = 7 << 10, kGraphSetBytes = 1 << 10, kGraphOtherBytes = 16 << 10;
+constexpr size_t kGraphParamBytes = 1024, kGraphParamCost = 3;
+constexpr size_t kGraphSetBytes = 1 << 10, kGraphOtherBytes = 16 << 10;
 constexpr size_t kGraphBytes = 128 << 10;
+// A kernel node's and a device-to-device copy node's are the driver's for the GPU's architecture, three times apart
+// between the two measured (`cuda_bench graphs`, KiB a node in chains of 100, 400 and 1000 kernels; of 100 copies):
+//   sm_120  RTX 5060 Ti and RTX 5070 Ti, driver 610.88, Windows:  3.5, 3.3, 2.7;  5.8 a copy
+//   sm_86   RTX 3090, driver 615.71, Linux:                       9.0, 10.7, 8.5 (11.0 in chains of 200, and the
+//           same with 4 KB of parameters);  21.8 a copy
+// The other kinds and the graph's own are the same on both.  Priced at sm_120's, an RTX 3090's and an RTX 4090's
+// (sm_89) sessions took more of the device than the rooms they leased (the memory tests: 340 MiB in rooms of 225);
+// an RTX 5080's and an RTX 5090's on Linux did not.  So sm_120 has its prices and every other architecture, measured
+// or not, the larger ones: a room too large costs sessions, one too small is memory the plan does not know of.
+struct GraphPrices {
+  size_t kernel = 0, copy = 0;
+};
+constexpr GraphPrices graph_prices(int cc) {  // cc: the device's compute capability, major * 10 + minor
+  return cc / 10 == 12 ? GraphPrices{3584, 7 << 10} : GraphPrices{11776, 22 << 10};
+}
 // A graph's nodes by kind (a conditional node's bodies' among them), its largest kernel parameters, and what it takes
 // at most (graph_size).
 struct GraphSize {
@@ -451,10 +467,12 @@ struct flyx_bmodel {
   std::mutex prefill_mu;                // lock order: prefill_mu before batch->mu
   bool kv_fp8 = false;   // the target's K/V caches in e4m3 (open option)
   flyx::cuda::BackendOptions opt;    // open()'s options; opt.kernels is what every launch for this model consults
+  std::string active_draft_weights;  // effective drafter precision ("nvfp4", "q8", "exact", or "" when none)
   std::unique_ptr<flyx::cuda::BatchRounds> batch;  // rounds of several sequences
   // Round graphs: every round plan lowered (plan_free forgets it) and its graph's size, counted when a
   // session's room for graphs is first asked after it was lowered (graph_room, which seq_bytes counts).
   std::mutex graph_mu;
+  flyx::cuda::GraphPrices graph_prices;  // the device's (graph_prices of its compute capability), set at open
   std::map<const flyx_plan*, flyx::cuda::PlanGraph> round_graphs;
 
   ~flyx_bmodel() {
@@ -582,7 +600,7 @@ struct flyx_seq {
   flyx::cuda::SideStream side{};  // a round's narrow GEMMs of a stack beside its wide ones (Launch::side)
   // A round's expert reads ahead (moe_prefetch): a stream of its own, so they never queue before Launch::side's GEMMs.
   flyx::cuda::SideStream expert_side{};
-  bool warm_out = false;  // a round's L2 warm-ups on expert_side, joined at its end (regions/plan.cpp)
+  cudaEvent_t expert_read = nullptr;  // last read of mutable residuals, before the immutable weight prefetch
   std::vector<void*> allocs;
 
   flyx::cuda::DevParams* P = nullptr;
@@ -620,6 +638,10 @@ struct flyx_seq {
     int pos = 0;
     int rope_delta = 0;
   } ckp[FLYX_CHECKPOINTS];
+  // A sliding-window DFlash2 context cache kept as a ring (KvBuf::ring, alloc_state): the positions it still holds
+  // for the drafter's window, at the position and at each checkpoint.  A rewind, restore or snapshot whose window a
+  // later position overwrote is refused (runtime/runner.cpp: ring_wrote).
+  flyx::cuda::DraftRing dring;
 
   // drafter scratch
   float* mg = nullptr;                 // MTP normalized draft hidden
@@ -716,6 +738,14 @@ struct flyx_seq {
     return total;
   }
   void update_write_hi() { write_hi.store(position + in_flight_rows(), std::memory_order_release); }
+  // One past the highest position a pass or a round read since has written to the caches kept in a ring of slots
+  // (KvBuf::swa_ring: the target's sliding-window layers, DSpark's), since a reset, restore or snapshot load set it to
+  // the position: such a ring holds [ring_hi - (ring - sink), ring_hi), the positions before that overwritten.
+  // Prefill passes advance it without a round, past what the rounds' rollback span keeps (rewind_floor).
+  int ring_hi = 0;
+  // The first position a rewind can return to: from there on, every ring still holds the window the row at that
+  // position reads ([pos - window + 1, pos)).  A rewind to before it is outside the rollback window.
+  int rewind_floor() const;
   double round_wait_us = 0;            // moving average of the waits for round results
   cudaEvent_t idle_ev = nullptr;       // recorded to wait for the stream without spinning
   cudaEvent_t ready_ev = nullptr;      // everything queued on the stream: a batch round waits for it (launch_batch)
@@ -776,6 +806,7 @@ struct flyx_seq {
     flyx::cuda::destroy_side(stage_side);
     if (dv.body) cudaStreamDestroy(dv.body);
     flyx::cuda::destroy_side(side);
+    if (expert_read) cudaEventDestroy(expert_read);
     flyx::cuda::destroy_side(expert_side);
     if (st) cudaStreamDestroy(st);
   }
@@ -1058,6 +1089,7 @@ struct ResState {
   int res_n = 0, prelude_n = 0, loop_n = 0;
   float* x_cur = nullptr;       // active residual buffer (rv.b.x or rv.b.post_out)
   PendingPostConv pending{};    // deferred post_conv to fuse into next sublayer
+  bool expert_work = false;     // this pass forked onto expert_side and must rejoin before leaving capture
 };
 
 struct Pass {
@@ -1092,6 +1124,12 @@ struct Pass {
 
 // loader/bind.cpp: blocks and the state table from the description's tables; uploads the weights.
 void bind(flyx_bmodel* m, const flyx_model_desc& d, LoadTimes* times = nullptr);
+// Resolve placement from the representation the loader uploads. Optionally report resident bytes and vision weights.
+int resolve_vision_device(const flyx_model_desc& desc, const BackendOptions& opt, uint64_t free_vram,
+                          uint64_t* resident_bytes, std::vector<char>* vision_weights = nullptr);
+// Pre-flight device memory estimate (ABI 48: flyx_backend_api::estimate_load).
+int estimate_load(const flyx_model_desc* desc, const flyx_open_options* opts, uint64_t free_vram,
+                  uint64_t total_vram, flyx_load_estimate* out);
 // The DV block i's selector token tables (DvBlock::sel_ta, sel_tb: [vocab][sel_rank] float32 each, counted with the
 // weights), made once, when lowering a plan that drafts with them: past bind, where out of GPU memory is no refusal
 // of the model but a plan the engine lowers again once the backend has given back what it keeps for speed (trim).
@@ -1109,6 +1147,7 @@ void draft_logits(const HeadBlock& h, const float* x, int ldx, float* y, int row
 // regions/plan.cpp: which blocks the kernels take, the block a node runs, the
 // implementation lower() picks for it, and running a plan's nodes.
 bool supported(const flyx_bmodel* m, const Block& b, std::string* why);
+bool kernel_limits(const flyx_model_desc& d, std::string* why);
 const Block* block_of(const flyx_bmodel* m, const flyx_node& n, std::string* err);
 const RegionImpl* resolve(const flyx_bmodel* m, const flyx_node& n, const Block* b, int max_rows);
 extern const RegionImpl kGeneric;  // every node's generic implementation
@@ -1151,7 +1190,7 @@ void alloc_batch(flyx_bmodel* m);  // the batch rounds' buffers, at open
 // graphs (0 with graphs off; `count`: the plans no session captured yet sized first, on a session of their own, which
 // throws where that cannot be made); room for a graph of `bytes` beside the session's own and its shares of batch
 // graphs, the ones it ran least lately given up (false: none, the round runs without a graph).
-GraphSize graph_size(cudaGraph_t g);
+GraphSize graph_size(cudaGraph_t g, const GraphPrices& price);
 void plan_lowered(flyx_bmodel* m, const flyx_plan* p);
 void plan_counted(flyx_bmodel* m, const flyx_plan* p, size_t bytes);
 void forget_graphs(flyx_bmodel* m, const flyx_plan* p);

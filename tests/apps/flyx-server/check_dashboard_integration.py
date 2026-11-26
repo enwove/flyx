@@ -38,17 +38,23 @@ LABELS = {"en": "Integration", "zh": "集成", "es": "Integración", "de": "Inte
           "fr": "Intégration", "ja": "連携", "ko": "연동"}
 
 
-def claude_settings(command, shell, keyed):
+@cache
+def claude_settings(command, shell, keyed, mode):
+    flags = " --permission-mode " + mode if mode else ""
+    assert command.count(" --permission-mode ") == (1 if mode else 0)
     if shell == "sh":
         if keyed:
             # The quoted heredoc goes to jq. The actual key is read from the environment at launch.
+            assert '  claude --settings "$file"' + flags in command.splitlines()
             assert ".env.ANTHROPIC_AUTH_TOKEN = env.FLYX_KEY" in command
             settings = json.loads(command.split("<<'FLYX_JSON'\n", 1)[1].split("\nFLYX_JSON\n", 1)[0])
         else:
-            cli, flag, value = shlex.split(command)
+            cli, flag, value, *args = shlex.split(command)
             assert (cli, flag) == ("claude", "--settings")
+            assert args == flags.split()
             settings = json.loads(value)
     else:
+        assert "    claude --settings $file" + flags in command.splitlines()
         ps = shutil.which("powershell") or shutil.which("pwsh")
         if not ps:
             return  # Still check the rendered command on hosts without PowerShell.
@@ -74,6 +80,7 @@ def guide_prose(panel):
         elements.flatMap(el => [...el.childNodes].filter(n => n.nodeType === Node.TEXT_NODE)
           .map(n => n.textContent.trim()).filter(s => /\p{L}/u.test(s)))""")
     words.extend(label.split(" · ")[-1] for label in panel.locator("#agent-guide a").all_text_contents())
+    words.extend(panel.locator("#agent-guide .field span, #agent-guide option, #agent-guide .field em").all_text_contents())
     words.extend(panel.locator("#agent-guide [role=group]").evaluate_all(
         "groups => groups.map(el => el.getAttribute('aria-label'))"))
     return set(words)
@@ -164,12 +171,17 @@ def guides(panel, keyed):
         snippets = panel.locator("#agent-guide pre").all_text_contents()
         assert snippets and all(KEY not in value for value in snippets)
         if agent == "claude":
+            modes = panel.locator("#claude-permission")
+            assert modes.input_value() == "bypassPermissions"
+            assert "--permission-mode bypassPermissions" in snippets[0]
             for shell in ("powershell", "sh"):
                 panel.locator(f"button[data-shell={shell}]").click()
                 prose.update(guide_prose(panel))
-                command = panel.locator("#agent-guide pre").inner_text()
-                assert "--settings" in command and KEY not in command
-                claude_settings(command, shell, keyed)
+                for mode in ("acceptEdits", "default", "auto", "bypassPermissions", ""):
+                    modes.select_option(mode)
+                    command = panel.locator("#agent-guide pre").inner_text()
+                    assert "--settings" in command and KEY not in command
+                    claude_settings(command, shell, keyed, mode)
         elif agent == "codex":
             cfg = tomllib.loads(snippets[0])
             provider = cfg["model_providers"][cfg["model_provider"]]
@@ -242,7 +254,7 @@ def follow_links(page):
 
 def check_launch(browser, telemetry, errors):
     """The agents the server starts itself, for each it lists: the project folder first (the desktop's dialog, kept
-    for next time), then the start, naming the agent and that folder and nothing else."""
+    for next time), then the start with the selected Claude permission mode."""
     sent = []
     folder = r"C:\work\project"
 
@@ -262,11 +274,15 @@ def check_launch(browser, telemetry, errors):
     page.goto(ORIGIN + "/dashboard/#integration")
     panel = page.locator("#tab-integration")
     dialog = page.locator("#project-dialog")
-    for agent in ("claude", "codex"):
+    for agent, mode in (("claude", "bypassPermissions"), ("claude", "acceptEdits"), ("claude", ""), ("codex", "")):
         panel.locator(f"button[data-agent={agent}]").click()
+        if agent == "codex":
+            assert panel.locator("#claude-permission").count() == 0
+        elif sent:  # The first launch uses the selection already on the page.
+            panel.locator("#claude-permission").select_option(mode)
         panel.locator("#agent-launch-go").click()
         dialog.wait_for()
-        if agent == "claude":
+        if not sent:
             assert dialog.locator("#pdlg-go").is_disabled()  # no folder yet
             dialog.locator("#pdlg-choose").click()
         # one folder: the one chosen, then the one used last
@@ -275,7 +291,10 @@ def check_launch(browser, telemetry, errors):
         dialog.locator("#pdlg-go").click()
         dialog.wait_for(state="detached")
         panel.locator("#agent-launch .launch-note.ok").wait_for()
-        assert sent[-1] == {"agent": agent, "dir": folder}, sent
+        expected = {"agent": agent, "dir": folder}
+        if mode:
+            expected["permission_mode"] = mode
+        assert sent[-1] == expected, sent
     for agent in ("deepseek", "opencode", "pi", "other"):
         panel.locator(f"button[data-agent={agent}]").click()
         assert panel.locator("#agent-launch").count() == 0, agent

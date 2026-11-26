@@ -86,8 +86,10 @@ function Serving({ tm, again, retry, browse }) {
   const loadedWant = model.id && L.loaded ? L.loaded : null, busy = busyLoad(L);
   const [msg, setMsg] = useState("");
   const [vramOpen, setVramOpen] = useState(false);
+  const activeDraft = model.drafter && model.drafter !== "none" ? model.drafter : "";
+  const degraded = model.loaded && !busy ? ((Array.isArray(L.degraded) && L.degraded.length ? L.degraded : model.degraded) || []) : [];
   const drafters = model.loaded && !busy ? draftersOf(L).slice() : [];
-  if (model.loaded && !busy && model.drafter && /mtp/.test(model.drafter) && !drafters.some((d) => d.kind === "mtp"))
+  if (model.loaded && !busy && activeDraft && /mtp/.test(activeDraft) && !drafters.some((d) => d.kind === "mtp"))
     drafters.unshift({ kind: "mtp", from: "model file" });
   const draftTip = drafters.map((d) => drafterLabel(d.kind) + ": " + d.from + (d.size ? " · " + gb(d.size) + " GB" : "")).join("\n");
   const visionTip = model.loaded && !busy && model.vision
@@ -100,7 +102,7 @@ function Serving({ tm, again, retry, browse }) {
     facts.push(["Context", fmt(model.context)]);
     if (loadedWant) facts.push(["KV cache", loadedWant.kv === "16" ? "16-bit" : loadedWant.kv === "fp8" ? "fp8" : "auto"]);
     facts.push(["Sessions", fmt(model.max_sessions)]);
-    facts.push(["Drafting", model.drafter ? model.drafter + ", up to " + model.max_width : "off", draftTip]);
+    facts.push(["Drafting", activeDraft ? activeDraft + (model.draft_weights ? " · " + model.draft_weights : "") + ", up to " + model.max_width : "off", draftTip]);
     facts.push(["Vision", model.vision ? t(normVisionDev(model.vision_device)) + " · " + normVisionQuant(model.vision_quant) : "off", visionTip]);
     if (model.load_s) facts.push(["Load time", secs(model.load_s)]);
     if (tm.memory && tm.memory.ledger_used) facts.push(["Memory", gib(tm.memory.ledger_used) + " GiB"]);
@@ -119,7 +121,7 @@ function Serving({ tm, again, retry, browse }) {
     : ctxLimit.by === "host" ? "ram"
     : ctxLimit.by === "gpu" && ctxLimit.closable ? "vram" : "";
   const vramErr = !busy && isVramError(L.error);
-  const showMemPanel = vramErr || (!!ctxMemKind && vramOpen);
+  const showMemPanel = vramErr || ((!!ctxMemKind || degraded.length > 0) && vramOpen);
   const panelKind = vramErr ? "vram" : (ctxMemKind || "vram");
   const stateName = { none: "Nothing loaded", fetching: "Fetching", loading: "Loading", ready: "Serving", failed: "Failed" }[L.state] || L.state;
   const tone = L.state === "ready" ? "ok" : L.state === "failed" ? "bad" : busy ? "warn" : "";
@@ -146,6 +148,17 @@ function Serving({ tm, again, retry, browse }) {
           <${Icon} name="play"/>${t("Load the last model again")}</button>` : ""}
         <button class=${"btn" + (again ? "" : " primary")} id="ld-browse" onClick=${browse}>${t("Explore the model library")}</button></div>` : ""}
       <dl class="stats" id="ld-facts" hidden=${!facts.length}>${facts.map(([k, v, tip]) => html`<div title=${tip || undefined}><dt>${t(k)}</dt><dd>${t(v)}</dd></div>`)}</dl>
+      <div class="banner warn" id="ld-degraded" hidden=${!degraded.length}>
+        <div class="grow2">
+          <b>${t("Loaded with VRAM adjustments")}</b>
+          ${degraded.map((d) => html`<div class="deg-item">${t(d.detail || "")}</div>`)}
+          <div class="deg-now">${t("Active now:")} ${t("Drafting")} ${activeDraft ? activeDraft + (model.draft_weights ? " (" + model.draft_weights + ")" : "") : t("off")} · ${t("Vision")} ${model.vision ? t(normVisionDev(model.vision_device)) + " (" + normVisionQuant(model.vision_quant) + ")" : t("off")}</div>
+        </div>
+        <div class="deg-acts">
+          <button class="btn sm" id="ld-deg-vram" onClick=${() => setVramOpen((v) => !v)}>${t(vramOpen ? "Hide apps" : "Manage VRAM")}</button>
+          ${loadedWant ? html`<button class="btn sm primary" id="ld-deg-restore" onClick=${reloadServed}>${t("Restore full settings")}</button>` : ""}
+        </div>
+      </div>
       <div class=${"banner " + (limit && limit.short ? "warn" : "hint")} id="ld-ctx" hidden=${!limit}>
         <div class="grow2">${limit ? limit.parts.map((s) => t(s)).join(" ").replace(/([。！？]) /g, "$1") : ""}</div>
         ${ctxMemKind ? html`<button class="btn sm" id="ld-vram-toggle" onClick=${() => setVramOpen((v) => !v)}>
@@ -153,32 +166,35 @@ function Serving({ tm, again, retry, browse }) {
       <div class=${"bar" + (L.state === "loading" ? " busy" : "")} id="ld-prog" hidden=${!busy}>
         <i style=${{ width: L.state === "loading" ? "" : (p.total ? 100 * p.done / p.total : 0) + "%" }}></i></div>
       <div class="prog" id="ld-sub">${sub}</div>
-      <div class=${"banner " + (L.fallback ? "warn" : "bad")} id="ld-err" hidden=${!L.error && !msg}>
-        ${L.error ? (L.fallback ? [t("The new model did not load."), tErr(L.error), t(L.fallback + " was loaded again.")].join(" ").replace(/([。！？]) /g, "$1") : tErr(L.error)) : t(msg)}</div>
+      <div class="banner bad" id="ld-err" hidden=${!L.error && !msg}>${L.error ? tErr(L.error) : t(msg)}</div>
       <${VramApps} open=${showMemPanel} kind=${panelKind} id="ld-vram-apps"
-                   needBytes=${vramErr ? parseVramNeeded(L.error) : 0}
+                   needBytes=${vramErr ? parseVramNeeded(L.error) : (ctxLimit && ctxLimit.need_more > 0 && panelKind === (ctxLimit.by === "host" ? "ram" : "vram") ? ctxLimit.need_more : 0)}
                    onRetry=${vramErr ? retry : (model.id && loadedWant ? reloadServed : null)}
                    retryLabel=${vramErr ? "Retry loading" : "Reload model"}
                    onClose=${!vramErr ? () => setVramOpen(false) : null}/>
     </div>`;
 }
 
-// A drafter given as a GGUF is a DSpark, DFlash2, or MTP file; anything else a DFlash2 drafter.
-const kindOf = (d) => /(?:^|[\\/:-])dspark(?:[\\/._-]|$)/i.test(d) ? "dspark"
-  : /\.gguf$/i.test(d) ? (/(?:^|[\\/:-])dflash2?(?:[\\/._-]|$)/i.test(d) ? "dflash2" : "mtp")
-  : "dflash2";
+// File-specific drafter identities. Unknown companions still go to the loader.
+const fileDrafterKinds = ["dflash2", "mtp", "dspark"];
+const pickedDrafter = (path, kind) => ({
+  spec: true, draftSource: "custom", savedDraft: null, drafter: path, drafterKind: fileDrafterKinds.includes(kind) ? kind : "", draftPicked: true,
+});
 const normVisionDev = (v) => (v === "host" || v === "cpu") ? "host" : v === "gpu" ? "gpu" : v === "auto" ? "auto" : "disk";
 const normVisionQuant = (v) => (v === "exact" || v === "bf16") ? "exact" : (v === "nvfp4" || v === "fp4") ? "nvfp4" : "q8";
+const normDraftWeights = (v) => (v === "nvfp4" || v === "fp4") ? "nvfp4" : (v === "q8" || v === "q8_0") ? "q8" : (v === "exact" || v === "bf16") ? "exact" : "";
 
 // The settings of a want as the form shows them, for comparing with what is loaded.
 function shown(w) {
   const vOn = w.vision !== false;
+  const dw = normDraftWeights(w.draft_weights);
   return { ctx: w.ctx || "auto", kv: w.kv === "16" ? "16-bit" : w.kv === "fp8" ? "fp8" : "auto",
            kv_ram: typeof w.kv_ram === "number" ? w.kv_ram + " GB" : "auto", kv_gpu: typeof w.kv_gpu === "number" ? fmt(w.kv_gpu) : "as many as fit",
            name: w.name || "the file's name",
            spec: w.speculative === false ? "off" : "on", drafter: [w.drafter || "default", ...(w.drafters || [])],
            width: w.width === null || w.width === undefined ? "auto" : String(w.width),
-           head: w.draft_head === "full" ? "full head" : "1-bit pick", weights: w.draft_weights === "exact" ? "exact" : "compact copy",
+           head: w.draft_head === "full" ? "full head" : "1-bit pick",
+           weights: dw === "nvfp4" ? "NVFP4" : dw === "q8" ? "Q8_0" : dw === "exact" ? "exact" : "auto",
            lookup: w.lookup !== false ? "on" : "off", trees: w.draft_trees ? "on" : "off",
            vision: vOn ? "on" : "off", mmproj: vOn ? (w.mmproj || "auto") : "auto",
            vision_device: normVisionDev(w.vision_device), vision_quant: normVisionQuant(w.vision_quant),
@@ -188,9 +204,9 @@ function shown(w) {
 function draftingOf(w) {
   const files = w.drafters || [], mode = w.drafter || "", own = files.length === 1 ? files[0] : "";
   // The single custom-file control also selects its kind. Keep configurations it cannot express as a separate choice.
-  const custom = w.speculative !== false && files.length === 1 && own === own.trim() && mode === kindOf(own);
+  const custom = w.speculative !== false && files.length === 1 && own === own.trim() && (!mode || fileDrafterKinds.includes(mode));
   const savedDraft = !custom && (mode || files.length) ? { drafter: mode, drafters: files } : null;
-  return { draftSource: savedDraft ? "saved" : custom ? "custom" : "default", savedDraft, drafter: own };
+  return { draftSource: savedDraft ? "saved" : custom ? "custom" : "default", savedDraft, drafter: own, drafterKind: custom ? mode : "" };
 }
 
 // The form's fields from a want ({model, ctx, kv, drafters, ...}).
@@ -200,7 +216,7 @@ function formOf(w) {
            kvgpu: typeof w.kv_gpu === "number" ? String(w.kv_gpu) : "", name: w.name || "",
            spec: w.speculative !== false, ...draftingOf(w), draftPicked: false,
            width: w.width === null || w.width === undefined ? "" : String(w.width), trees: !!w.draft_trees, lookup: w.lookup !== false,
-           head: w.draft_head === "full" ? "full" : "", weights: w.draft_weights === "exact" ? "exact" : "",
+           head: w.draft_head === "full" ? "full" : "", weights: normDraftWeights(w.draft_weights),
            vision: vOn, visionSource: vOn && w.mmproj ? "custom" : "default", mmproj: vOn ? (w.mmproj || "") : "", mmprojPicked: false,
            vision_device: normVisionDev(w.vision_device), vision_quant: normVisionQuant(w.vision_quant),
            vision_max_tokens: w.vision_max_tokens > 0 ? String(w.vision_max_tokens) : "" };
@@ -215,7 +231,9 @@ function loadBody(chosen, f) {
   const own = f.draftSource === "custom" && f.spec ? f.drafter.trim() : "";
   const adv = { width: f.width ? parseInt(f.width, 10) : null, draft_trees: f.trees, lookup: f.lookup,
                 draft_head: f.head || null, draft_weights: f.weights || null };
-  const draft = f.draftSource === "saved" ? f.savedDraft : { drafter: own ? kindOf(own) : "", drafters: own ? [own] : [] };
+  const draft = f.draftSource === "saved" ? f.savedDraft : {
+    drafter: own ? f.drafterKind : "", drafters: own ? [own] : [],
+  };
   const mmproj = f.vision && f.visionSource === "custom" && f.mmproj.trim() ? f.mmproj.trim() : null;
   const vmaxRaw = String(f.vision_max_tokens).trim();
   const vmax = vmaxRaw ? parseInt(vmaxRaw, 10) : NaN;
@@ -579,17 +597,11 @@ export function ModelPage({ active, libraryAsked, currentAsked }) {
   function settingsFor(name, overrides) {
     const next = Object.assign({}, use);
     if (loadedWant && name && name !== loadedWant.model) {
-      if (!keepDraft) { next.draftSource = "default"; next.savedDraft = null; next.drafter = ""; }
+      if (!keepDraft) { next.draftSource = "default"; next.savedDraft = null; next.drafter = ""; next.drafterKind = ""; }
       if (!keepMmproj) { next.visionSource = "default"; next.mmproj = ""; }
       if (!keepName) next.name = "";
     }
-    if (overrides && overrides.drafter) {
-      next.spec = true;
-      next.draftSource = "custom";
-      next.savedDraft = null;
-      next.drafter = overrides.drafter;
-      next.draftPicked = true;
-    }
+    if (overrides && overrides.drafter) Object.assign(next, pickedDrafter(overrides.drafter, overrides.drafterKind));
     if (overrides && overrides.mmproj) {
       next.vision = true;
       next.visionSource = "custom";
@@ -611,8 +623,7 @@ export function ModelPage({ active, libraryAsked, currentAsked }) {
       if (n) lines.push(n + (n === 1 ? " request is" : " requests are") + " running or waiting: " + (n === 1 ? "it is" : "they are") + " stopped.");
       lines.push(served + " is unloaded first; its GPU memory comes back before the new one loads.");
       if (isHub(name) && !entryOf(name)) lines.push("The files are fetched first, while " + served + " keeps answering.");
-      lines.push("fallback" in L ? "If the new one fails to load, " + served + " is loaded again." :
-                 "If the new one fails to load, no model is served until another is loaded.");
+      lines.push("If the new one fails to load, no model is served until another is loaded.");
       if (!await confirmBox(same ? "Reload " + served + " with these settings?" : "Switch to " + (describe(entryOf(name) || { name }).quant || name) + "?",
                             lines, same ? "Reload" : "Switch")) return;
     }
@@ -633,22 +644,23 @@ export function ModelPage({ active, libraryAsked, currentAsked }) {
   // The default drafter, as the settings say it: what the server loaded with the model served, when that drafts with
   // its default; else what a model brings along.
   function defaultDrafter() {
+    const activeDraft = model.drafter && model.drafter !== "none" ? model.drafter : "";
     if (loadedWant && loadedWant.speculative !== false && !loadedWant.drafter && !loadedWant.drafters?.length) {
       const list = draftersOf(L).map((d) => drafterLabel(d.kind) + " · " +
         (d.from === "model file" ? t("the model file's own layer") : t("from " + d.from + (d.size ? " (" + gb(d.size) + " GB)" : ""))));
-      if (!list.length && model.drafter) list.push(model.drafter.toUpperCase() + " · " + t("the model file's own layer"));
+      if (!list.length && activeDraft) list.push(activeDraft.toUpperCase() + " · " + t("the model file's own layer"));
       return list.length ? { tag: "in use", tone: "ok", lines: list } : { tag: "none", tone: "", lines: [t("This model loaded no drafter: plain decoding.")] };
     }
     return { tag: "", tone: "", lines: [t("The model's own MTP layer, if it has one.")] };
   }
   const dflt = defaultDrafter(), own = f.drafter.trim();
-  const ownCached = !!own && !!catalog && catalog.models.some((x) => x.kind === "drafter" && x.name === own);
+  const ownCached = !!own && !!catalog && catalog.models.some((x) => x.kind === "drafter" && (x.name === own || x.path === own));
   const specOff = !f.spec, custom = f.draftSource === "custom";
   const savedDraft = f.draftSource === "saved" ? f.savedDraft : draftingOf(loadedWant || L.remembered || {}).savedDraft;
   const pickDraft = (source) => { if (!specOff) setF(Object.assign({}, f, { draftSource: source, savedDraft, draftPicked: false })); };
   // A drafter named by the page (one of the cache, one published for a repository's model) goes to the settings.
-  const draftWith = (name) => {
-    setF((current) => Object.assign({}, current, { spec: true, draftSource: "custom", savedDraft: null, drafter: name, draftPicked: true }));
+  const draftWith = (name, kind) => {
+    setF((current) => Object.assign({}, current, pickedDrafter(name, kind)));
     setView("current");
     setStab("spec");
     setTimeout(() => { const row = document.getElementById("sd-custom"); if (row) row.scrollIntoView({ behavior: "smooth", block: "center" }); }, 60);
@@ -659,12 +671,12 @@ export function ModelPage({ active, libraryAsked, currentAsked }) {
     setStab("vision");
     setTimeout(() => { const row = document.getElementById("vs-custom"); if (row) row.scrollIntoView({ behavior: "smooth", block: "center" }); }, 60);
   };
-  const applyCompanions = (draftSpec, mmprojSpec) => {
+  const applyCompanions = (draft, mmprojSpec) => {
     setF((current) => Object.assign({}, current,
-      draftSpec ? { spec: true, draftSource: "custom", savedDraft: null, drafter: draftSpec, draftPicked: true } : {},
+      pickedDrafter(draft.spec, draft.kind),
       mmprojSpec ? { vision: true, visionSource: "custom", mmproj: mmprojSpec, mmprojPicked: true } : {}));
     setView("current");
-    setStab(draftSpec ? "spec" : "vision");
+    setStab("spec");
   };
   const visOff = !f.vision, visCustom = f.visionSource === "custom", mmOwn = f.mmproj.trim();
   const pickVision = (source) => { if (!visOff) setF(Object.assign({}, f, { visionSource: source, mmprojPicked: false })); };
@@ -683,9 +695,10 @@ export function ModelPage({ active, libraryAsked, currentAsked }) {
   const visChg = ["vision", "mmproj", "vision_device", "vision_quant", "vision_max_tokens"].filter((k) => changed.includes(k)).length;
 
   function settingsView(cmdModel) {
-    const specLoaded = !!model.drafter, visLoaded = !!model.vision;
+    const activeDraft = model.drafter && model.drafter !== "none" ? model.drafter : "";
+    const specLoaded = !!activeDraft, visLoaded = !!model.vision;
     const activeDrafters = model.loaded && !busy ? draftersOf(L).slice() : [];
-    if (model.loaded && !busy && model.drafter && /mtp/.test(model.drafter) && !activeDrafters.some((d) => d.kind === "mtp"))
+    if (model.loaded && !busy && activeDraft && /mtp/.test(activeDraft) && !activeDrafters.some((d) => d.kind === "mtp"))
       activeDrafters.unshift({ kind: "mtp", from: "model file" });
     const specSum = !f.spec ? t("off") : f.draftSource === "custom" && own ? baseName(own) : f.draftSource === "saved" ? t("last loaded") :
                     specLoaded ? t("default") : t("none");
@@ -768,7 +781,7 @@ export function ModelPage({ active, libraryAsked, currentAsked }) {
                 <p class="ddesc">${t("A drafter of your own, in place of the default: a Hugging Face name or a path on the server's machine.")}</p>
                 <input type="text" id="sd-file" placeholder=${t("org/name, or a path")} spellcheck="false" autocomplete="off" disabled=${specOff}
                        value=${f.drafter} onFocus=${() => !custom && pickDraft("custom")}
-                       onInput=${(e) => setF(Object.assign({}, f, { draftSource: "custom", drafter: e.target.value, draftPicked: false }))}/>
+                       onInput=${(e) => setF(Object.assign({}, f, { draftSource: "custom", drafter: e.target.value, drafterKind: "", draftPicked: false }))}/>
                 ${custom ? html`<em>${t(!own ? "Give a Hugging Face name or a path; empty, the default is used." : ownCached ? "On this machine." :
                                          isHub(own) ? "Fetched from Hugging Face when the model loads." : "A file on the server's machine.")}</em>` : ""}
               </div>
@@ -786,9 +799,13 @@ export function ModelPage({ active, libraryAsked, currentAsked }) {
               <${Field} k="head" label="Draft head" was=${was("head")} hint="How drafts choose their tokens.">
                 <select id="sd-head" value=${f.head} onChange=${set("head")} disabled=${specOff}>
                   <option value="">${t("1-bit pick (default)")}</option><option value="full">${t("Full head")}</option></select><//>
-              <${Field} k="weights" label="Drafter weights" was=${was("weights")} hint="Only the drafts can change, never the output.">
+              <${Field} k="weights" label="Drafter weights" was=${was("weights")} hint="Auto picks best precision when VRAM allows, and drops to NVFP4 when tight. Only drafts change, never output.">
                 <select id="sd-weights" value=${f.weights} onChange=${set("weights")} disabled=${specOff}>
-                  <option value="">${t("Compact copy (default)")}</option><option value="exact">${t("Exact")}</option></select><//>
+                  <option value="">${t("Auto (default)")}</option>
+                  <option value="nvfp4">${t("NVFP4 (4-bit)")}</option>
+                  <option value="q8">${t("Q8_0 (8-bit)")}</option>
+                  <option value="exact">${t("Exact")}</option>
+                </select><//>
               <${Field} k="lookup" label="Drafts from repeated text" was=${was("lookup")} hint="Where the reply repeats earlier text, that text is proposed too.">
                 <label class="switch"><input type="checkbox" id="sd-lookup" checked=${f.lookup} onChange=${set("lookup")} disabled=${specOff}/><i></i>${t(f.lookup ? "on" : "off")}</label><//>
               <${Field} k="trees" label="Draft trees" was=${was("trees")} hint="The drafter proposes several branches at once, not one line.">
@@ -878,8 +895,7 @@ export function ModelPage({ active, libraryAsked, currentAsked }) {
     const drafts = comps.filter((c) => c.kind !== "mmproj"), mmprojs = comps.filter((c) => c.kind === "mmproj");
     const renderRow = (c, sel, onToggle) => {
       const isMm = c.kind === "mmproj";
-      const kindTag = isMm ? ["mmproj", "info"]
-                    : c.kind === "dflash2" ? ["DFlash2", "ok"] : c.kind === "dspark" ? ["DSpark", "ok"] : c.kind === "mtp" ? ["MTP", "ok"] : ["drafter", "ok"];
+      const kindTag = isMm ? ["mmproj", "info"] : [drafterLabel(c.kind) || "drafter", "ok"];
       const sub = c.path && c.path !== c.file ? c.path : "";
       return html`
         <div class=${"mrow comp" + (sel ? " sel" : "")} data-comp=${c.key} data-kind=${c.kind} role="option" aria-selected=${String(sel)}
@@ -914,6 +930,7 @@ export function ModelPage({ active, libraryAsked, currentAsked }) {
     if (hasMain) {
       const overrides = (selDraft || selMm) ? {
         drafter: selDraft ? selDraft.spec : null,
+        drafterKind: selDraft?.kind,
         mmproj: selMm ? selMm.spec : null,
         drafterSize: selDraft ? (selDraft.size || 0) : 0,
         drafterCached: selDraft ? !!selDraft.cached : true,
@@ -931,7 +948,7 @@ export function ModelPage({ active, libraryAsked, currentAsked }) {
     if (selDraft && selMm) {
       return {
         action: { title: selDraft.file + " + " + selMm.file, sub, label: "Use selected companions",
-                  disabled: !model.id || busy, onClick: () => { applyCompanions(selDraft.spec, selMm.spec); clearPicked(); } },
+                  disabled: !model.id || busy, onClick: () => { applyCompanions(selDraft, selMm.spec); clearPicked(); } },
         overrides: null,
       };
     }
@@ -944,7 +961,7 @@ export function ModelPage({ active, libraryAsked, currentAsked }) {
     }
     return {
       action: { title: selDraft.file, sub, label: "Draft with it", disabled: !model.id || busy,
-                onClick: () => { draftWith(selDraft.spec); clearPicked(); } },
+                onClick: () => { draftWith(selDraft.spec, selDraft.kind); clearPicked(); } },
       overrides: null,
     };
   }
@@ -953,6 +970,7 @@ export function ModelPage({ active, libraryAsked, currentAsked }) {
     if (m.kind === "flyx") tags.push([".flyx"]);
     if (m.kind === "mmproj") tags.push(["mmproj", "info"]);
     if (m.mtp === "in-file") tags.push(["MTP inside", "ok"]); else if (m.mtp === "in-repo") tags.push(["+ MTP file", "ok"]);
+    if (m.dflash2 === "in-repo") tags.push(["+ DFlash2", "ok"]);
     if (m.mmproj === "in-repo") tags.push(["+ Vision", "ok"]);
     if (m.current === false) tags.push(["older revision", "info"]);
     if (m.parts > 1) tags.push([m.parts + " parts"]);
@@ -1061,13 +1079,14 @@ export function ModelPage({ active, libraryAsked, currentAsked }) {
       ...(j && j.mmproj ? [{ name: repoSel + ":" + baseName(j.mmproj.path), path: j.mmproj.path, file: baseName(j.mmproj.path),
                              kind: "mmproj", size: j.mmproj.size, cached: !!j.mmproj.cached, disk: null, default: true }] : []),
     ];
-    const comps = rawComps.map((c) => Object.assign({}, c, { key: c.name, spec: c.disk || c.name }));
+    const comps = rawComps.map((c) => ({ ...c, key: c.name, spec: c.disk || c.name,
+      kind: c.kind === "mmproj" ? c.kind : (c.drafter_kind ?? c.kind) }));
     const selDraft = comps.find((c) => c.kind !== "mmproj" && c.key === hubDraft) || null;
     const selMm = comps.find((c) => c.kind === "mmproj" && c.key === hubMmproj) || null;
     const barState = companionBarState(rows, selDraft, selMm, () => { setHubDraft(""); setHubMmproj(""); });
     const compAction = barState.action || (j && j.drafter && !rows.length && !comps.length
       ? { title: repoSel, sub: (entryOf(repoSel) ? sized(j.drafter.size) + " on disk" : sized(j.drafter.size) + " to download first"),
-          label: "Draft with it", disabled: !model.id || busy, onClick: () => draftWith(repoSel) }
+          label: "Draft with it", disabled: !model.id || busy, onClick: () => draftWith(repoSel, j.drafter.kind) }
       : null);
     const compOverrides = barState.overrides;
     const unsupported = j && j.runs === false;
@@ -1083,6 +1102,7 @@ export function ModelPage({ active, libraryAsked, currentAsked }) {
     if (info.gated) chips.push([t("gated"), "warn"]);
     if (comps.some((c) => c.kind === "mmproj")) chips.push([t("+ Vision"), "ok"]);
     if (comps.some((c) => c.kind === "mtp")) chips.push(["+ MTP", "ok"]);
+    if (rows.length && comps.some((c) => c.kind === "dflash2")) chips.push(["+ DFlash2", "ok"]);
     const [org, short] = repoSel.split("/");
     return html`
       <div class="hub-scroll" id="hf-detail">
@@ -1116,7 +1136,7 @@ export function ModelPage({ active, libraryAsked, currentAsked }) {
         ${j && (j.known_drafters || []).length ? html`
           <div class="banner hint" id="hf-drafters"><div class="grow2">${t("A DFlash2 drafter is published for this model.")} ${t("It often adds speed on top of MTP:")}
             ${" "}<code>${j.known_drafters[0]}</code></div>
-            ${model.id ? html`<button class="btn sm" onClick=${() => draftWith(j.known_drafters[0])}>${t("Add to settings")}</button>` : ""}</div>` : ""}
+            ${model.id ? html`<button class="btn sm" onClick=${() => draftWith(j.known_drafters[0], "dflash2")}>${t("Add to settings")}</button>` : ""}</div>` : ""}
       </div>
       ${loadBox(rows, note, compAction, compOverrides)}`;
   }
@@ -1207,6 +1227,7 @@ export function ModelPage({ active, libraryAsked, currentAsked }) {
     const chips = [[drafter && m.drafter_kind ? drafterLabel(m.drafter_kind) : t(kindOfModel(m)), drafter ? "ok" : mmproj ? "info" : ""]];
     if (d.quant) chips.push([d.quant, ""]);
     if (m.mtp === "in-file") chips.push([t("MTP inside"), "ok"]); else if (m.mtp === "in-repo") chips.push([t("+ MTP file"), "ok"]);
+    if (m.dflash2 === "in-repo") chips.push(["+ DFlash2", "ok"]);
     if (m.mmproj === "in-repo") chips.push([t("+ Vision"), "ok"]);
     if (m.parts > 1) chips.push([t(m.parts + " parts"), ""]);
     if (m.current === false) chips.push([t("older revision"), "info"]);
@@ -1216,7 +1237,7 @@ export function ModelPage({ active, libraryAsked, currentAsked }) {
           disabled: !model.id || busy, onClick: () => projectWith(m.path || m.name) }
       : drafter
       ? { title: m.name, sub: "A drafter is not loaded on its own.", label: "Draft with it",
-          disabled: !model.id || busy, onClick: () => draftWith(m.name) }
+          disabled: !model.id || busy, onClick: () => draftWith(m.path || m.name, m.drafter_kind) }
       : null;
     return html`
       <div class="hub-scroll" id="lc-detail">
@@ -1272,7 +1293,7 @@ export function ModelPage({ active, libraryAsked, currentAsked }) {
                       onClick=${() => removeRepo(name, all)}><${Icon} name="trash"/></button></div>
             ${mine.length ? html`<div class="mrows" role="listbox">${rowsView(mine)}</div>` : ""}
             ${drafters.map((dr) => html`<div class="banner hint"><div class="grow2">${t(dr.name + " is a drafter (" + gb(dr.size) + " GB), not a model: it drafts for one, and is not loaded on its own.")}</div>
-              ${model.id ? html`<button class="btn sm" onClick=${() => draftWith(dr.name)}>${t("Draft with it")}</button>` : ""}</div>`)}
+              ${model.id ? html`<button class="btn sm" onClick=${() => draftWith(dr.path || dr.name, dr.drafter_kind)}>${t("Draft with it")}</button>` : ""}</div>`)}
           </div>`;
       });
       return html`
@@ -1297,7 +1318,7 @@ export function ModelPage({ active, libraryAsked, currentAsked }) {
     const localComps = [
       ...folderDrafters.map((m) => ({
         key: m.path || m.name, spec: m.path || m.name, file: m.file, path: relOf(m),
-        kind: m.drafter_kind || kindOf(m.file || m.name), size: m.size, cached: true, default: false,
+        kind: m.drafter_kind || "", size: m.size, cached: true, default: false,
       })),
       ...folderMmproj.map((m) => ({
         key: m.path || m.name, spec: m.path || m.name, file: m.file, path: relOf(m),
@@ -1312,7 +1333,7 @@ export function ModelPage({ active, libraryAsked, currentAsked }) {
           overrides: null }
       : singleDrafter
       ? { action: { title: singleDrafter.path || singleDrafter.name, sub: "A drafter is not loaded on its own.",
-                    label: "Draft with it", disabled: !model.id || busy, onClick: () => draftWith(singleDrafter.path || singleDrafter.name) },
+                    label: "Draft with it", disabled: !model.id || busy, onClick: () => draftWith(singleDrafter.path || singleDrafter.name, singleDrafter.drafter_kind) },
           overrides: null }
       : companionBarState(rows, selLocalDraft, selLocalMm, () => { setLocalDraft(""); setLocalMmproj(""); });
     const loadNote = start ? "Open a folder to see its model files." : "";

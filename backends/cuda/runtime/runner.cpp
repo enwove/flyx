@@ -1,6 +1,7 @@
 // Copyright 2026 The flyx Authors. SPDX-License-Identifier: Apache-2.0
 // Prefill passes and rounds (graphs, the token ring), waiting for the device, rollback, checkpoints and their
 // snapshots in host memory.
+#include "backends/cuda/runtime/checked_size.h"
 #include <algorithm>
 #include <condition_variable>
 #include <cstddef>
@@ -32,6 +33,8 @@ template <class Fn>
 int guarded(Fn&& fn) {
   try {
     return fn();
+  } catch (const OutOfDeviceMemory& e) {
+    return fail_oom(e.what());
   } catch (const std::exception& e) {
     return fail(e.what());
   }
@@ -102,18 +105,35 @@ void ensure_checkpoint_slot(flyx_seq* s, int c) {
   CK(cudaHostAlloc(&p, s->ckp_slot_bytes, cudaHostAllocDefault));
   s->host_allocs.push_back(p);
   auto* base = static_cast<unsigned char*>(p);
-  s->ckp_arena[c] = base;
   size_t off = 0;
   auto take_raw = [&](size_t bytes) -> void* {
-    const size_t aligned = (bytes + 255) / 256 * 256;
+    const size_t aligned = checkpoint_align(bytes);
+    // checkpoint_slot_bytes counts what is taken here (the pinned budget's split and the dry sizing count it too)
+    if (off > s->ckp_slot_bytes || aligned > s->ckp_slot_bytes - off)
+      throw std::logic_error("a checkpoint's state past checkpoint_slot_bytes");
     void* ptr = base + off;
     off += aligned;
     return ptr;
   };
   auto take = [&](size_t bytes) -> float* { return static_cast<float*>(take_raw(bytes)); };
   for (auto& g : s->gdn) {
-    g.ckp_S[c] = take(g.s_stride * sizeof(float));
-    g.ckp_win[c] = take(g.w_stride * sizeof(float));
+    g.ckp_S[c] = take(size_mul(g.s_stride, sizeof(float)));
+    g.ckp_win[c] = take(size_mul(g.w_stride, sizeof(float)));
+  }
+  for (auto& sc : s->sconv) sc.ckp_win[c] = take(size_mul(sc.w_stride, sizeof(float)));
+  for (size_t i = 0; i < s->kv.size(); ++i) {
+    auto& kb = s->kv[i];
+    if (!kb.swa_ring) continue;
+    const KvSpec& ks = s->m->states.kv[i];
+    const size_t elem = ks.fp8 ? 1 : sizeof(kv16);
+    const size_t bytes = size_mul(size_mul(size_mul(kb.ring, ks.nkv), ks.hd), elem);
+    kb.ckp_k[c] = take_raw(bytes);
+    kb.ckp_v[c] = take_raw(bytes);
+    if (ks.fp8) {
+      const size_t sbytes = size_mul(size_mul(kb.ring, ks.nkv), sizeof(float));
+      kb.ckp_ks[c] = take(sbytes);
+      kb.ckp_vs[c] = take(sbytes);
+    }
   }
   for (auto& sc : s->sconv) sc.ckp_win[c] = take(sc.w_stride * sizeof(float));
   for (size_t i = 0; i < s->kv.size(); ++i) {
@@ -134,6 +154,7 @@ void ensure_checkpoint_slot(flyx_seq* s, int c) {
     s->ring_ckp[c] = take(size_t(w) * sizeof(float));
     std::memset(s->ring_ckp[c], 0, size_t(w) * sizeof(float));
   }
+  s->ckp_arena[c] = base;
 }
 
 void copy_checkpoint_state(flyx_seq* s, int c, int sl, int pos, bool save, bool snap = false) {
@@ -274,8 +295,22 @@ void reset_state(flyx_seq* s, int anchor) {
   for (auto& mt : s->meta) mt = {};
   s->rope_delta = 0;
   s->prev_pos3d_at = -1;
+  s->dring.reset();
+  s->ring_hi = 0;  // the rings are written again from position 0, in order
   set_params(s, 0, anchor, 0);
 }
+
+namespace {
+// Positions [from, to) of a sliding-window DFlash2 context ring written (s->dring): what they overwrote is gone.  A
+// round whose every rewind target lost the drafter's window is no longer a rollback source; rewind() checks the
+// position it is given as well.
+void ring_wrote(flyx_seq* s, int from, int to) {
+  if (!s->dring.slots()) return;
+  s->dring.wrote(from, to);
+  for (auto& mt : s->meta)
+    if (mt.valid && !s->dring.holds(mt.start + mt.rows)) mt.valid = false;
+}
+}  // namespace
 
 // Upload generation parameters when they changed (rounds read them on the device).
 void set_gen(flyx_seq* s, const flyx_gen_params* g) {
@@ -463,6 +498,7 @@ int prefill_ex(flyx_plan* p, flyx_seq* s, const flyx_prefill_input* in, const fl
     s->copy_home(false);
     s->copy_written(s->position);
     s->staged(s->position + n);
+    ring_wrote(s, s->position, s->position + n);  // its context rows, counted first: a pass that fails wrote some
     forward(ps);
     s->flush_page_prefill(s->position, n);
     s->snap_pos = s->pass_snap;
@@ -483,6 +519,7 @@ int prefill_ex(flyx_plan* p, flyx_seq* s, const flyx_prefill_input* in, const fl
     prefill_done(s->P, n, m->prefill_bufs.choice, sample_last, s->ring_dev, s->G, s->reply, s->st);
     CK(cudaEventRecord(m->prefill_ev, s->st));
     s->position += n;
+    s->ring_hi = std::max(s->ring_hi, s->position);
     if (sample_last) {
       copy_ring(s, false);
       ++s->seq_no;
@@ -490,6 +527,13 @@ int prefill_ex(flyx_plan* p, flyx_seq* s, const flyx_prefill_input* in, const fl
       s->pending.push_back({'P', 0});
     }
     s->update_write_hi();
+    // A pass moves the position on and not the round: the rounds before it stay rollback sources, their recurrent
+    // state (gated delta nets, ShortConvs) in their own slots and replay rows, which a pass leaves as they are.  The
+    // rings it writes do not keep the positions of those rounds once the passes have gone round (rewind_floor): a
+    // round all of whose positions are before the floor is no source any more.
+    const int rewind_from = s->rewind_floor();
+    for (auto& mt : s->meta)
+      if (mt.valid && mt.start + mt.rows < rewind_from) mt.valid = false;
     if (in->n_embeds > 0 || in->pos_3d || in->set_rope_delta) sync_stream(s);
     CK(cudaGetLastError());
     return 0;
@@ -1213,6 +1257,19 @@ void flyx_seq::forget_hot() {
     }
 }
 
+// A ring of `ring` slots keeps its first `sink` positions for good and the others in turn (KvRef::slot_of): of those,
+// the ring_hi - (ring - sink) latest.  The row at pos reads [pos - window + 1, pos], its own written by the round.
+int flyx_seq::rewind_floor() const {
+  long long first = 0;
+  for (size_t i = 0; i < kv.size(); ++i) {
+    const flyx::cuda::KvBuf& b = kv[i];
+    if (!b.swa_ring) continue;
+    const long long window = b.window > 0 ? b.window : m->states.kv[i].window;
+    first = std::max(first, (long long)ring_hi - (b.ring - b.sink) + window - 1);
+  }
+  return int(std::min<long long>(first, INT32_MAX));
+}
+
 // The rows of a round launched now: the first at the position the host last read or past it (the
 // rounds in flight move it on by at most their rows), the last at most their rows plus this round's further.
 int flyx_seq::strata_phase(int rows) const {
@@ -1431,7 +1488,7 @@ bool capture_adaptive_graph(flyx_plan* p, flyx_seq* s, const RoundPass& r, cudaG
                              p->earlier_checkpoints, s->st);
           }, nullptr))
         return false;
-      bodies.push_back(graph_size(body));
+      bodies.push_back(graph_size(body, s->m->graph_prices));
       prev = {cnode};
     }
   }
@@ -1457,11 +1514,11 @@ bool capture_adaptive_graph(flyx_plan* p, flyx_seq* s, const RoundPass& r, cudaG
           copy_ring(s);
         }, nullptr))
       return false;
-    bodies.push_back(graph_size(body));
+    bodies.push_back(graph_size(body, s->m->graph_prices));
   }
   // graph_size reads each conditional node's body, a graph of its own; a driver that gives none of them
   // (bodies_unknown) gets them priced as captured, so each body is counted once.
-  GraphSize total = graph_size(root);
+  GraphSize total = graph_size(root, s->m->graph_prices);
   if (total.bodies_unknown == bodies.size()) {
     for (const GraphSize& b : bodies) {
       add_size(total, b);
@@ -1494,7 +1551,7 @@ GraphSize round_graph_size(flyx_plan* p, flyx_seq* s) {
   for (;;) {
     Captured c;
     const bool ok = capture_graph(s->st, [&] { forward(r.ps, r.prefix); copy_ring(s); }, &c.graph);
-    const GraphSize size = ok ? graph_size(c.graph) : GraphSize{};
+    const GraphSize size = ok ? graph_size(c.graph, s->m->graph_prices) : GraphSize{};
     if ((!ok || size.bodies_unknown) && s->dv.body && s->dv.skip_noop) {
       s->dv.skip_noop = false;
       continue;
@@ -1564,7 +1621,7 @@ int launch(flyx_plan* p, flyx_seq* s, const flyx_gen_params* g) {
 #endif
         {
           captured = capture_graph(s->st, record, &c.graph);
-          if (captured) size = graph_size(c.graph);
+          if (captured) size = graph_size(c.graph, s->m->graph_prices);
         }
         if (!captured || (size.bodies_unknown && s->dv.body && s->dv.skip_noop)) {
           failed = true;
@@ -1764,12 +1821,12 @@ int launch_batch(flyx_plan* const* plans, flyx_seq* const* seqs, const flyx_gen_
           return any;
         };
         bool ok = capture_graph(B.st, record, &c.graph);
-        GraphSize size = ok ? graph_size(c.graph) : GraphSize{};
+        GraphSize size = ok ? graph_size(c.graph, m->graph_prices) : GraphSize{};
         if ((!ok || size.bodies_unknown) && inline_canvas()) {
           if (c.graph) cudaGraphDestroy(c.graph);
           c.graph = nullptr;
           ok = capture_graph(B.st, record, &c.graph);
-          size = ok ? graph_size(c.graph) : GraphSize{};
+          size = ok ? graph_size(c.graph, m->graph_prices) : GraphSize{};
         }
         // A share of what it takes in each sequence's room for graphs; no room: this batch without
         // (it comes kGraphWarmHits times more before the next capture).
@@ -1834,7 +1891,10 @@ int read_result(flyx_seq* s, flyx_round_result* out) {
     *out = s->ring_host[seq % kRing];
     if (out->seq_no != seq) return fail("ring entry out of order (" + std::to_string(out->seq_no) + ")");
     s->read_no = seq;
-    char kind = s->pending.front().kind;
+    const char kind = s->pending.front().kind;
+    const int rows = s->pending.front().rows;
+    // A round writes its rows from the position it started at (its accepted ones, then the rest), stopped or not.
+    if (kind == 'R') s->ring_hi = std::max(s->ring_hi, out->position - out->n_tokens + rows);
     s->pending.pop_front();
     if (kind == 'R' && out->n_tokens > 0) {
       s->drain_page_host(seq, out->position, out->n_tokens);
@@ -1843,6 +1903,11 @@ int read_result(flyx_seq* s, flyx_round_result* out) {
       s->meta[flyx_round_slot(s->round)].valid = false;
     }
     s->position = out->position;
+    // A round wrote its rows from its start, and its draft block its own rows there: rejected ones too.
+    if (kind == 'R') {
+      const int start = out->position - out->n_tokens;
+      ring_wrote(s, start, start + std::max(rows, FLYX_MAX_ROWS));
+    }
     s->update_write_hi();
     return 0;
   });
@@ -1920,11 +1985,18 @@ int rewind(flyx_seq* s, int32_t pos, int32_t anchor) {
       set_params(s, pos, anchor, s->round);
       return 1;
     }
+    if (!s->dring.holds(pos)) {  // the drafter's window at pos: overwritten in its ring since (prefill, rounds)
+      reset_state(s, anchor);
+      return 0;
+    }
     for (int back = 1; back < FLYX_ROUND_SLOTS && s->round - back >= 0; ++back) {
       const int r = s->round - back, sl = flyx_round_slot(r), to = flyx_round_slot(r + 1);
       const int rsl = r % kGdnReplaySlots;
       const auto& mt = s->meta[sl];
       if (!mt.valid || pos < mt.start || pos > mt.start + mt.rows) continue;
+      // The round's recurrent state is there, but a ring no longer holds the window the row at pos reads (prefill
+      // passes since have gone round it): outside the rollback window, a checkpoint or a new prefill instead.
+      if (pos < s->rewind_floor()) break;
       const int rows = pos - mt.start;
       for (auto& g : s->gdn) {
         gdn_recur(g.S, g.s_stride, kSlotExplicit + sl, kSlotExplicit + to, g.replay, kSlotExplicit + rsl, s->P, nullptr,
@@ -1971,7 +2043,12 @@ int checkpoint(flyx_seq* s, int32_t c) {
     const bool snap = s->snap_pos >= 0;
     const int pos = snap ? s->snap_pos : s->position;
     const int sl = snap ? s->snap_slot : flyx_round_slot(s->round);
+    if (!s->dring.holds(pos)) {
+      s->ckp[c].valid = false;
+      return fail("checkpoint: the drafter's window at " + std::to_string(pos) + " is no longer in its ring");
+    }
     copy_checkpoint_state(s, c, sl, pos, true, snap);
+    s->dring.keep(c, pos);
     s->ckp[c].valid = true;
     s->ckp[c].pos = pos;
     s->ckp[c].rope_delta = snap ? s->snap_rope_delta : s->rope_delta;
@@ -1988,13 +2065,19 @@ int prefill_snapshot(flyx_seq* s, int32_t pos) {
 int restore(flyx_seq* s, int32_t c, int32_t anchor) {
   if (!s) return no_sequence("restore");
   if (c < 0 || c >= FLYX_CHECKPOINTS || !s->ckp[c].valid) return -1;
+  // The checkpoint keeps no drafter window of its own: what the ring held of it, a later position overwrote.
+  if (!s->dring.kept(c)) return fail("restore: the drafter's window of that checkpoint is no longer in its ring");
   return guarded([&] {
     check_idle(s);
     copy_checkpoint_state(s, c, flyx_round_slot(s->round), s->ckp[c].pos, false);
     for (auto& mt : s->meta) mt = {};
     s->rope_delta = s->ckp[c].rope_delta;
     s->prev_pos3d_at = -1;
+    // The rings as the checkpoint saved them, at most a pass past its position (which their headroom covers); the
+    // rounds rewinds go back to are those after it.
+    s->ring_hi = s->ckp[c].pos;
     set_params(s, s->ckp[c].pos, anchor, s->round);
+    s->dring.restored(c);
     s->reload_page_ring(s->position);
     return s->position;
   });
@@ -2196,6 +2279,8 @@ int snapshot_bytes(flyx_seq* s, int32_t c, int32_t begin, uint64_t* out) {
   if (!s) return no_sequence("snapshot_bytes");
   if (c < 0 || c >= FLYX_CHECKPOINTS || !s->ckp[c].valid) return fail("no checkpoint in that slot");
   if (begin < 0 || begin > s->ckp[c].pos) return fail("snapshot starts outside the checkpoint");
+  // A ring is saved as its slots are now: the checkpoint's window must still be there.
+  if (!s->dring.kept(c)) return fail("snapshot: the drafter's window of that checkpoint is no longer in its ring");
   *out = snapshot_size(s, begin, s->ckp[c].pos);
   return 0;
 }
@@ -2231,13 +2316,16 @@ int snapshot_load(flyx_seq* s, const flyx_host_pieces* src, uint64_t bytes, int3
     check_idle(s);
     HostCursor host{src, sizeof h};
     s->copy_home(false);  // the copy loaded to its host home, every position changed
+    s->dring.replacing();  // a ring's every slot
     snapshot_parts(s, -1, h.begin, h.pos, host, false);
     s->reload_page_ring(h.pos);
     s->copy_written(h.begin);
     for (auto& mt : s->meta) mt = {};
     s->rope_delta = h.rope_delta;
     s->prev_pos3d_at = -1;
+    s->ring_hi = h.pos;  // as restore: the rings the snapshot's checkpoint saved
     set_params(s, h.pos, anchor, s->round);
+    s->dring.loaded(h.pos);
     sync_stream(s);  // the bytes are the caller's
     return s->position;
   });

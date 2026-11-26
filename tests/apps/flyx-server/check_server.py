@@ -783,14 +783,16 @@ def model_panel_checks(cl: Client, model: str):
           "GET /v1/load: serving the model", json.dumps(s)[:200])
     for body in ({}, {"model": ""}, {"model": 7}, {"model": "x/y", "ctx": -1}, {"model": "x/y", "drafter": "nope"},
                  {"model": "x/y", "drafters": "z-lab/a"},
-                 {"model": "x/y", "width": -1}, {"model": "x/y", "draft_head": "nope"}, {"model": "x/y", "draft_weights": 7}):
+                 {"model": "x/y", "width": -1}, {"model": "x/y", "draft_head": "nope"}, {"model": "x/y", "draft_weights": 7},
+                 {"model": "x/y", "draft_weights": "nope"}):
         st, j = cl.post("/v1/load", body)
         check(st == 400 and "error" in j, f"POST /v1/load {json.dumps(body)}: 400", f"{st} {json.dumps(j)[:120]}")
     st, t = cl.get("/v1/telemetry")
     check(st == 200 and t["load"]["state"] == "ready" and t["model"]["id"] == model, "telemetry's load: the same")
     check(st == 200 and isinstance(s.get("drafters"), list) and isinstance(s.get("suggested"), list) and
+          isinstance(s.get("degraded"), list) and
           "fallback" in s and all({"kind", "from", "size"} <= set(d) for d in s.get("drafters", [])),
-          "GET /v1/load: drafters, suggested, fallback", json.dumps({k: s.get(k) for k in ("drafters", "suggested")}))
+          "GET /v1/load: drafters, suggested, degraded, fallback", json.dumps({k: s.get(k) for k in ("drafters", "suggested", "degraded")}))
     st, c = cl.get("/v1/hub/cached")
     check(st == 200 and isinstance(c.get("models"), list) and c.get("cache"), "GET /v1/hub/cached: a list",
           json.dumps(c)[:200])
@@ -798,7 +800,7 @@ def model_panel_checks(cl: Client, model: str):
         return
     fields = {"name", "kind", "source", "repo", "quant", "file", "path", "size", "modified", "revision", "current", "mtp"}
     check(c.get("cache_from") in ("HF_HUB_CACHE", "HF_HOME", "default") and isinstance(c.get("dirs"), list) and
-          all(fields <= set(m) and m["kind"] in ("gguf", "flyx", "drafter") and m["source"] in ("hub", "dir") and
+          all(fields <= set(m) and m["kind"] in ("gguf", "flyx", "drafter", "mmproj") and m["source"] in ("hub", "dir") and
               m["mtp"] in ("in-file", "in-repo", None) for m in c["models"]),
           "GET /v1/hub/cached: every field of every model", json.dumps(c["models"][:2])[:300])
     names = [m["name"] for m in c["models"]]
@@ -868,22 +870,32 @@ def chat_status(cl: Client, model: str) -> int:
     return st
 
 
-def fallback_checks(cl: Client, model: str):
-    """a model that fails to load gives way to the one served before it, loaded again."""
-    print("a failed switch falls back")
+def failed_switch_checks(cl: Client, model: str):
+    """a model that fails to load stays unloaded in state 'failed' (no auto-reload of the previous model)."""
+    print("a failed switch stays unloaded")
+    st_b, before = cl.get("/v1/load")
+    remembered = before.get("remembered") if st_b == 200 else None
     bogus = os.path.join(tempfile.mkdtemp(prefix="flyx_check_"), "bogus.gguf")
     with open(bogus, "wb") as f:
         f.write(b"not a model at all \x00\x01\x02\xff")
     st, s = cl.post("/v1/load", {"model": bogus})
     if st == 403:
-        print("  note POST /v1/load: 403 (not this machine and no --key): the fallback is not checked")
+        print("  note POST /v1/load: 403 (not this machine and no --key): failed switch is not checked")
         return
     check(st == 202, "POST /v1/load of a bogus file: started", f"{st} {json.dumps(s)[:200]}")
     s = wait_load(cl, 180)
-    check(s.get("state") == "ready" and s.get("fallback") == model and s.get("model") == model and
-          bool(s.get("error")), "it fails, and the old model is served again", json.dumps(s)[:300])
-    check(chat_status(cl, model) == 200, "a chat request after the fallback")
+    check(s.get("state") == "failed" and s.get("fallback") is None and s.get("model") is None and
+          bool(s.get("error")), "it fails without auto-reloading the old model", json.dumps(s)[:300])
+    check(chat_status(cl, model) == 503, "a chat request after a failed switch: 503")
     os.remove(bogus)
+    check(bool(remembered), "the settings file still remembers the previous model", json.dumps(before)[:200])
+    if not remembered:
+        return
+    st, s = cl.post("/v1/load", remembered)
+    check(st == 202, "POST /v1/load of the remembered model after failed switch", f"{st} {json.dumps(s)[:200]}")
+    s = wait_load(cl, 300)
+    check(s.get("state") == "ready" and s.get("model") == model, "served again after explicit reload", json.dumps(s)[:200])
+    check(chat_status(cl, model) == 200, "a chat request after explicit reload")
 
 
 def unload_checks(cl: Client, model: str):
@@ -1062,7 +1074,7 @@ def request_log_checks(cl: Client, model: str):
 
 
 def system_log_checks(cl: Client):
-    """The system log: GET /v1/logs has the server's own lines (fallback_checks, run before, made it
+    """The system log: GET /v1/logs has the server's own lines (failed_switch_checks, run before, made it
     write that a model did not load), numbered in order, and gives only what came after a number."""
     print("system log")
     st, j = cl.get("/v1/logs?limit=2000")
@@ -1075,7 +1087,7 @@ def system_log_checks(cl: Client):
     check(bool(lines) and seqs == sorted(seqs) and len(set(seqs)) == len(seqs) and j.get("next") == seqs[-1],
           "lines numbered in order, next is the last", json.dumps(j)[:300])
     check(all(isinstance(l.get("t"), (int, float)) and isinstance(l.get("text"), str) for l in lines), "each has t and text")
-    check(any("did not load" in l.get("text", "") for l in lines), "the failed load (fallback check) is in the log",
+    check(any("did not load" in l.get("text", "") for l in lines), "the failed load (the failed switch check) is in the log",
           json.dumps([l.get("text") for l in lines[-8:]])[:400])
     st, k = cl.get(f"/v1/logs?after={j['next']}")
     check(st == 200 and all(l["seq"] > j["next"] for l in k.get("lines", [])), "?after=N: only the lines past N")
@@ -1325,7 +1337,7 @@ def main():
     dashboard_checks(cl)
     model_panel_checks(cl, model)
     request_log_checks(cl, model)
-    fallback_checks(cl, model)
+    failed_switch_checks(cl, model)
     system_log_checks(cl)
     security_checks(cl, model)
     unload_checks(cl, model)  # last: the model goes and comes back

@@ -132,6 +132,47 @@ inline bool parse_vision_quant(std::string_view value, VisionQuantMode* out, std
   return false;
 }
 
+enum class DraftWeightsMode { kAuto, kNvfp4, kQ8, kExact };
+
+inline const char* draft_weights_name(DraftWeightsMode m) {
+  switch (m) {
+    case DraftWeightsMode::kAuto: return "auto";
+    case DraftWeightsMode::kNvfp4: return "nvfp4";
+    case DraftWeightsMode::kQ8: return "q8";
+    case DraftWeightsMode::kExact: return "exact";
+  }
+  return "auto";
+}
+
+inline bool parse_draft_weights(std::string_view value, DraftWeightsMode* out, std::string* canonical,
+                                std::string* err) {
+  std::string lo(value);
+  for (char& c : lo)
+    if (c >= 'A' && c <= 'Z') c = char(c - 'A' + 'a');
+  if (lo.empty() || lo == "auto") {
+    if (out) *out = DraftWeightsMode::kAuto;
+    if (canonical) *canonical = "auto";
+    return true;
+  }
+  if (lo == "nvfp4" || lo == "fp4") {
+    if (out) *out = DraftWeightsMode::kNvfp4;
+    if (canonical) *canonical = "nvfp4";
+    return true;
+  }
+  if (lo == "q8" || lo == "q8_0") {
+    if (out) *out = DraftWeightsMode::kQ8;
+    if (canonical) *canonical = "q8";
+    return true;
+  }
+  if (lo == "exact" || lo == "bf16") {
+    if (out) *out = DraftWeightsMode::kExact;
+    if (canonical) *canonical = "exact";
+    return true;
+  }
+  if (err) *err = "bad value \"" + std::string(value) + "\" for draft_weights (auto, nvfp4, q8, or exact)";
+  return false;
+}
+
 inline bool normalize_image_detail(std::string_view value, std::string* canonical, std::string* err) {
   std::string lo(value);
   for (char& c : lo)
@@ -146,6 +187,47 @@ inline bool normalize_image_detail(std::string_view value, std::string* canonica
   }
   if (err) *err = "invalid image detail '" + std::string(value) + "' (expected auto, low, or high)";
   return false;
+}
+
+// Helpers for comma-separated "key=value,key=value" backend option strings (last value wins).
+inline std::string backend_opt_get(std::string_view opts, std::string_view key) {
+  std::string val;
+  size_t i = 0;
+  while (i < opts.size()) {
+    size_t j = opts.find(',', i);
+    if (j == std::string_view::npos) j = opts.size();
+    const std::string_view kv = opts.substr(i, j - i);
+    i = j + 1;
+    const size_t eq = kv.find('=');
+    if (eq != std::string_view::npos && kv.substr(0, eq) == key) val = std::string(kv.substr(eq + 1));
+  }
+  return val;
+}
+
+inline std::string backend_opt_strip(std::string_view opts, std::string_view key) {
+  std::string out;
+  size_t i = 0;
+  while (i < opts.size()) {
+    size_t j = opts.find(',', i);
+    if (j == std::string_view::npos) j = opts.size();
+    const std::string_view kv = opts.substr(i, j - i);
+    i = j + 1;
+    if (kv.empty()) continue;
+    const size_t eq = kv.find('=');
+    if (eq != std::string_view::npos && kv.substr(0, eq) == key) continue;
+    if (!out.empty()) out += ',';
+    out.append(kv);
+  }
+  return out;
+}
+
+inline std::string backend_opt_set(std::string_view opts, std::string_view key, std::string_view value) {
+  std::string out = backend_opt_strip(opts, key);
+  if (!out.empty()) out += ',';
+  out.append(key);
+  out += '=';
+  out.append(value);
+  return out;
 }
 
 }  // namespace flyx::interfaces

@@ -26,12 +26,12 @@ using nlohmann::json;
 int int_or_uniform_arr(const GgufMeta& m, const std::string& key, int expected_len, int min_v = 1) {
   const auto& v = m.at(key);
   if (v.is_number_integer()) return m.count(key, min_v);
-  if (!v.is_array() || int(v.size()) != expected_len || v.empty())
+  if (!v.is_array() || v.size() != size_t(expected_len) || v.empty())
     throw std::runtime_error("GGUF " + key + ": expected scalar or array of length " + std::to_string(expected_len));
+  if (!v[0].is_number_integer() || v[0] < min_v || v[0] > INT_MAX) throw std::runtime_error("GGUF " + key + ": value out of range");
   const int first = v[0].get<int>();
-  if (first < min_v) throw std::runtime_error("GGUF " + key + ": value out of range");
   for (int i = 1; i < expected_len; ++i)
-    if (v[size_t(i)].get<int>() != first)
+    if (!v[size_t(i)].is_number_integer() || v[size_t(i)] != first)
       throw std::runtime_error("GGUF " + key + ": non-uniform per-layer dimensions are not supported");
   return first;
 }
@@ -53,9 +53,11 @@ Config read_gguf_config(const ModelFile& file) {
   const GgufMeta m(file);
   Config c{};
   c.n_phys = m.count("block_count");
+  if (c.n_phys > kMaxLayers) throw std::runtime_error("inkling2_loop: too many physical layers");
   c.hidden = m.count("embedding_length");
   const auto* embed = file.tensor("token_embd.weight");
   if (!embed || embed->ndim != 2) throw std::runtime_error("GGUF without token_embd.weight");
+  if (embed->shape[0] < 1 || embed->shape[0] > kMaxVocab) throw std::runtime_error("invalid token embedding rows");
   c.vocab_padded = m.count_or("vocab_size", int(embed->shape[0]));
   c.vocab_unpadded = m.count_or("vocab_size_unpadded", c.vocab_padded);
   c.n_heads = int_or_uniform_arr(m, "attention.head_count", c.n_phys);
@@ -90,7 +92,7 @@ Config read_gguf_config(const ModelFile& file) {
     throw std::runtime_error("inkling2_loop: variable-pass looping is not supported");
 
   const auto& pat = m.at("attention.sliding_window_pattern");
-  if (!pat.is_array() || int(pat.size()) != c.n_phys)
+  if (!pat.is_array() || pat.size() != size_t(c.n_phys))
     throw std::runtime_error("inkling2_loop: sliding_window_pattern does not match block_count");
   c.is_swa.reserve(size_t(c.n_phys));
   for (int i = 0; i < c.n_phys; ++i) c.is_swa.push_back(pat[size_t(i)].get<bool>());
@@ -98,12 +100,21 @@ Config read_gguf_config(const ModelFile& file) {
   if (c.hidden <= 0 || c.hidden > kMaxWidth || c.inter <= 0 || c.inter > kMaxWidth ||
       c.vocab_padded <= 0 || c.vocab_padded > kMaxVocab || c.vocab_unpadded <= 0 ||
       c.vocab_unpadded > c.vocab_padded || c.n_phys <= 0 || c.n_phys > kMaxLayers ||
-      c.n_heads <= 0 || c.n_kv <= 0 || c.n_heads % c.n_kv != 0 || c.head_dim <= 0 || c.head_dim > kMaxHeadDim ||
+      c.n_heads > kMaxHeads || c.n_kv <= 0 || c.n_heads % c.n_kv != 0 || c.head_dim <= 0 || c.head_dim > kMaxHeadDim ||
       c.top_k <= 0 || c.top_k > c.n_experts || c.n_passes < 2 || c.core_start <= 0 || c.core_start >= c.core_end ||
-      c.core_end > c.n_phys || c.core_start % c.attn_res_block != 0 || c.core_end % c.attn_res_block != 0 ||
+      c.core_end > c.n_phys || c.attn_res_block <= 0 || c.core_start % c.attn_res_block != 0 ||
+      c.core_end % c.attn_res_block != 0 || c.gate_rank > kMaxWidth ||
+      int64_t(c.n_heads) * (2LL * c.head_dim + c.d_rel) > INT_MAX ||
+      int64_t(c.n_experts) * std::max(2 * c.inter, c.hidden) > INT_MAX ||
       c.conv < 2 || c.conv > 64 || !(c.eps > 0) || !(c.qk_clip > 0) || !(c.rel_clip > 0) || !(c.situ_beta > 0) ||
       !(c.situ_linear_beta > 0) || c.log_scale_alpha < 0.0 || !std::isfinite(c.log_scale_alpha))
     throw std::runtime_error("invalid inkling2_loop GGUF configuration");
+  // The logical layers the loop unfolds to (each with its own K/V and ShortConv state), counted in 64 bits.
+  const long long visits = (long long)c.core_start + (long long)c.n_passes * (c.core_end - c.core_start) +
+                           (c.n_phys - c.core_end);
+  if (visits > kMaxLayers)
+    throw std::runtime_error("inkling2_loop: " + std::to_string(c.n_passes) + " passes unfold to " +
+                             std::to_string(visits) + " logical layers, more than " + std::to_string(kMaxLayers));
   return c;
 }
 

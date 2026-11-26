@@ -7,6 +7,8 @@
 #include <atomic>
 #include <cstddef>
 #include <mutex>
+#include <stdexcept>
+#include <string>
 
 #include "backends/cuda/kernels/common/device.cuh"
 #include "backends/cuda/kernels/kernels.cuh"
@@ -24,9 +26,6 @@ void check_fits(size_t n, size_t cap, const char* what);
 Out split_out(const Launch& L, int rows, int K, bool q8 = false);
 // A sequence's slice starting at `row_offset` inside a `total_rows` presplit buffer (batched rounds).
 Out split_out_slice(const Launch& L, int total_rows, int row_offset, int K, bool q8 = false);
-// Thread block clusters and programmatic dependent launch: compute capability 9.0+, and this build's code for the
-// device compiled for 9.0+ (not an older architecture's PTX compiled at load).
-bool sm90_or_newer();
 // Cached device hardware queries (single-GPU backend).
 int device_sm_count();
 size_t device_max_smem_optin();
@@ -127,28 +126,8 @@ void launch_dependent_smem(void (*kernel)(KArgs...), dim3 grid, dim3 block, size
   at.val.programmaticStreamSerializationAllowed = 1;
   cfg.attrs = &at;
   cfg.numAttrs = opts(L).pdl && sm90_or_newer() ? 1 : 0;
-  cudaLaunchKernelEx(&cfg, kernel, static_cast<KArgs>(args)...);
-}
-
-// Whether kernels launched with a stream alone (launch_pdl) are programmatic dependents: KernelOptions::pdl of the
-// model whose sequence was made last (set_stream_pdl), for the process: launchers that have a Launch use opts(L).
-std::atomic<bool>& stream_pdl();
-
-// launch_dependent_smem for a launch that has only a stream: a programmatic dependent when stream_pdl().  The
-// kernel calls pdl_wait() before it reads anything an earlier kernel wrote, and before it returns.
-template <class... KArgs, class... Args>
-void launch_pdl(void (*kernel)(KArgs...), dim3 grid, dim3 block, size_t smem, cudaStream_t st, Args... args) {
-  cudaLaunchConfig_t cfg{};
-  cfg.gridDim = grid;
-  cfg.blockDim = block;
-  cfg.dynamicSmemBytes = smem;
-  cfg.stream = st;
-  cudaLaunchAttribute at{};
-  at.id = cudaLaunchAttributeProgrammaticStreamSerialization;
-  at.val.programmaticStreamSerializationAllowed = 1;
-  cfg.attrs = &at;
-  cfg.numAttrs = stream_pdl().load(std::memory_order_relaxed) && sm90_or_newer() ? 1 : 0;
-  cudaLaunchKernelEx(&cfg, kernel, static_cast<KArgs>(args)...);
+  const auto err = cudaLaunchKernelEx(&cfg, kernel, static_cast<KArgs>(args)...);
+  if (err != cudaSuccess) throw std::runtime_error(std::string("cudaLaunchKernelEx: ") + cudaGetErrorString(err));
 }
 
 template <class... KArgs, class... Args>

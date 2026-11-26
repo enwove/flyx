@@ -30,7 +30,7 @@
 extern "C" {
 #endif
 
-#define FLYX_BACKEND_ABI_VERSION 47u
+#define FLYX_BACKEND_ABI_VERSION 48u
 #define FLYX_BACKEND_ENTRY "flyx_backend_get_api"
 /* How a backend library exports its entry. */
 #if defined(_WIN32)
@@ -876,18 +876,43 @@ typedef enum {
   FLYX_VISION_QUANT_NVFP4 = 2   /* quantize float vision linears to NVFP4 (4.5 bpw, ~70% smaller) */
 } flyx_vision_quant;
 
+/* Drafter linear weight precision policy (ABI 48). */
+typedef enum {
+  FLYX_DRAFT_WEIGHTS_AUTO  = 0, /* default: target-matched precision (e.g. Q8_0 beside packed targets, BF16 beside BF16) */
+  FLYX_DRAFT_WEIGHTS_NVFP4 = 1, /* quantize float/wider drafter linears to NVFP4 (~4.5 bpw) when it shrinks VRAM */
+  FLYX_DRAFT_WEIGHTS_Q8    = 2, /* quantize float drafter linears to Q8_0 (~8.5 bpw); pre-quantized stay packed */
+  FLYX_DRAFT_WEIGHTS_EXACT = 3  /* keep drafter weights in file format (and uncompacted draft head) */
+} flyx_draft_weights;
+
 typedef struct {
   int32_t max_ctx;              /* tokens per sequence */
   int32_t verbose;
   int32_t kv_fp8;               /* K/V caches the target reads (state.draft == 0) in FP8 (e4m3, a scale per position and
-                                   head); a drafter's as the backend chooses (CUDA: a one-layer one too) */
+                                   head); a drafter's as the backend chooses (CUDA: the MTP layer's too, a
+                                   DFlash2 drafter's never) */
   /* Backend options, "key=value,key=value" (NULL or "" = none).  Each backend
    * documents its keys and fails open() on one it does not know; a key given
    * twice takes the later value.  The engine passes them through unread. */
   const char* options;
   int32_t vision_device;        /* flyx_vision_device (ABI 44; 0 = disk) */
   int32_t vision_quant;         /* flyx_vision_quant (ABI 44; 0 = q8) */
+  int32_t draft_weights;        /* flyx_draft_weights (ABI 48; 0 = auto) */
+  /* ABI 48: use this target-only position as AUTO's default switch on every layout. An explicit backend
+   * switch still wins. A zero-initialized direct caller retains layout-dependent AUTO. */
+  int32_t lock_auto_from, auto_from;
 } flyx_open_options;
+
+/* Pre-flight device memory estimate before open() allocates (ABI 48).
+ * All figures are in device bytes for the backend's current device and the given model + open options. */
+typedef struct {
+  uint64_t weights_bytes;         /* total target + active drafter + resident vision weights on device */
+  uint64_t draft_weights_bytes;   /* portion of weights_bytes belonging to neural drafter blocks */
+  uint64_t draft_compact_savings; /* device bytes saved by stepping draft_weights to NVFP4 (0 if none) */
+  uint64_t min_runtime_bytes;     /* minimum non-weight device overhead (context, workspace, tiny KV/graphs) */
+  uint64_t comfort_margin_bytes;  /* headroom above weights + min_runtime to keep full auto drafter precision */
+  uint64_t target_kv_bytes_per_position; /* resident exact target K/V, including scales, before placement (ABI 48) */
+  int32_t vision_device;                 /* resolved flyx_vision_device for this estimate (ABI 48) */
+} flyx_load_estimate;
 
 /* Device memory as the backend sees it (0 = unknown, e.g. a CPU backend). */
 typedef struct {
@@ -984,7 +1009,9 @@ typedef struct {
 } flyx_prefill_input;
 
 /* All functions return 0 on success unless stated otherwise; on failure
- * last_error() describes what happened. */
+ * last_error() describes what happened.  FLYX_ERR_OOM (-2, ABI 48) signals
+ * device memory exhaustion (open, lower, seq_new, seq_new_in, seq_size). */
+#define FLYX_ERR_OOM (-2)
 typedef struct flyx_backend_api {
   uint32_t abi_version;
   uint32_t struct_size;
@@ -1016,7 +1043,8 @@ typedef struct flyx_backend_api {
    * pass crossed and kept (the last one it crossed, or prefill_snapshot's).
    * Returns that position, negative on error. */
   int (*checkpoint)(flyx_seq* s, int32_t slot);
-  /* Restore a checkpoint; returns its position, or negative if the slot is empty. */
+  /* Restore a checkpoint; returns its position, or negative if the slot is empty or what it needs is gone (the CUDA
+   * backend: a drafter's window a later position overwrote in its ring), the state then left as it was. */
   int (*restore)(flyx_seq* s, int32_t slot, int32_t anchor);
   /* Testing: replace drafts with tokens[pos] (0 past the end). n = 0 turns it off. */
   int (*set_oracle)(flyx_seq* s, const int32_t* tokens, int32_t n);
@@ -1117,6 +1145,15 @@ typedef struct flyx_backend_api {
   /* Extended prefill pass (ABI 44) supporting external embeddings (vision/audio) and 3D MRoPE positions.
    * NULL: text-only backend (engine falls back to prefill() when inputs are text-only). */
   int (*prefill_ex)(flyx_plan* p, flyx_seq* s, const flyx_prefill_input* in, const flyx_gen_params* sample);
+  /* Pre-flight device memory estimate (ABI 48): estimates device bytes for `model` + `opts` before open() allocates,
+   * given `free_vram` and `total_vram` (0 = unknown).  Returns 0 on success, non-zero if unavailable.
+   * NULL when the backend has no device memory budget (e.g. a CPU backend). */
+  int (*estimate_load)(const flyx_model_desc* model, const flyx_open_options* opts, uint64_t free_vram,
+                       uint64_t total_vram, flyx_load_estimate* out);
+  /* Effective drafter linear weight precision active on `m` (ABI 48), as the drafter's linears are held (not the
+   * policy asked): "nvfp4", "q8" (Q8_0 blocks), "exact" (the file's own precision: bf16, or GGML blocks of another
+   * type kept as stored), or "" when no neural drafter is active.  NULL: backend does not report it. */
+  const char* (*draft_weights)(flyx_bmodel* m);
 } flyx_backend_api;
 
 typedef const flyx_backend_api* (*flyx_backend_entry_fn)(void);
