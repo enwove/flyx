@@ -113,17 +113,25 @@ the GPU (`nvidia-smi`'s processes; on Windows, where `nvidia-smi` gives no proce
 counter):
 
 ```text
-gpu_preflight: GPU 0 (NVIDIA GeForce RTX 5070 Ti): 2296 of 16303 MiB already in use before the GPU tests, more than 2560 MiB (FLYX_TEST_GPU_MAX_USED_MIB).
+ 4/93 Test  #93: gpu_preflight ....................***Failed    1.34 sec
+gpu_preflight: GPU 0 (NVIDIA GeForce RTX 5070 Ti): 13387 of 16303 MiB already in use before the GPU tests, more than 2560 MiB (FLYX_TEST_GPU_MAX_USED_MIB).
 Beside it engine loads would be refused ("Not enough VRAM ... used by other apps") and the tests measuring free memory (cuda_device_memory*) would fail.
-In use on GPU 0 (NVIDIA GeForce RTX 5070 Ti), MiB (Windows' GPU Process Memory counter):
-      318  pid 42956   D:\other-tree\bin\golden_test.exe
+In use on GPU 0 (NVIDIA GeForce RTX 5070 Ti), MiB (Windows' GPU Process Memory counter, read after the check):
+    12844  pid 52228   D:\flyx-wt\b-pr38\bin\flyx.exe
+      154  pid 54032   C:\Windows\explorer.exe
       ...
+  ... and 19 more, 15 MiB or less each
+  (pid 2652 dwm.exe, the desktop's compositor: 8361 MiB counted, the surfaces it shares with other programs included)
 Stop what holds it or wait for it, or allow more: FLYX_TEST_GPU_MAX_USED_MIB=<MiB> (docs/testing.md, section 2).
-...
+
+      Start  98: gguf_cuda_pdl
 Failed test dependencies: gpu_preflight
+ 5/93 Test  #98: gguf_cuda_pdl ....................***Not Run   0.00 sec
 ...
 The following tests FAILED:
-         97 - cuda_ops (Not Run)
+         56 - vision (Not Run)                                  gpu quick smoke unit
+         93 - gpu_preflight (Failed)                            gpu unit
+         ...
 ```
 
 ---

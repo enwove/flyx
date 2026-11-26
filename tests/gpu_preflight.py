@@ -32,10 +32,11 @@ def skip(why):
     sys.exit(SKIP)
 
 
-def windows_memory(gpu_used_mib):
+def windows_memory(used_before, read_used):
     """{pid: MiB} on the GPU from Windows' counters (nvidia-smi reports no process's memory under WDDM)."""
     out, _ = run(["typeperf", r"\GPU Process Memory(*)\Dedicated Usage", r"\GPU Adapter Memory(*)\Dedicated Usage",
                   "-sc", "1"])
+    used = [used_before, read_used()]
     rows = [r for r in csv.reader((out or "").splitlines()) if len(r) > 1]
     if len(rows) < 2:
         return {}
@@ -51,9 +52,40 @@ def windows_memory(gpu_used_mib):
             adapter[m.group(1)] = mib
     if not adapter:
         return {}
-    # The counters name adapters by LUID, nvidia-smi by index: this GPU is the adapter using what nvidia-smi says.
-    luid = min(adapter, key=lambda a: abs(adapter[a] - gpu_used_mib))
+    # The counters name adapters by LUID, nvidia-smi by index: this GPU is the adapter using what nvidia-smi says,
+    # before or after the sample (a model loading moves it by gigabytes in a second).
+    luid = min(adapter, key=lambda a: min(abs(adapter[a] - u) for u in used if u is not None))
     return process.get(luid, {})
+
+
+def windows_names():
+    """{pid: executable name} of every process (a Toolhelp snapshot: tasklist takes seconds on a busy machine)."""
+    import ctypes
+    from ctypes import wintypes
+
+    class Entry(ctypes.Structure):
+        _fields_ = [("size", wintypes.DWORD), ("usage", wintypes.DWORD), ("pid", wintypes.DWORD),
+                    ("heap", ctypes.c_size_t), ("module", wintypes.DWORD), ("threads", wintypes.DWORD),
+                    ("parent", wintypes.DWORD), ("priority", ctypes.c_long), ("flags", wintypes.DWORD),
+                    ("exe", ctypes.c_wchar * 260)]
+
+    kernel = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel.CreateToolhelp32Snapshot.restype = wintypes.HANDLE
+    kernel.CreateToolhelp32Snapshot.argtypes = [wintypes.DWORD, wintypes.DWORD]
+    for step in (kernel.Process32FirstW, kernel.Process32NextW):
+        step.argtypes = [wintypes.HANDLE, ctypes.POINTER(Entry)]
+    kernel.CloseHandle.argtypes = [wintypes.HANDLE]
+    snapshot = kernel.CreateToolhelp32Snapshot(2, 0)  # TH32CS_SNAPPROCESS
+    if snapshot in (None, wintypes.HANDLE(-1).value):
+        return {}
+    names, entry = {}, Entry()
+    entry.size = ctypes.sizeof(Entry)
+    more = kernel.Process32FirstW(snapshot, ctypes.byref(entry))
+    while more:
+        names[entry.pid] = entry.exe
+        more = kernel.Process32NextW(snapshot, ctypes.byref(entry))
+    kernel.CloseHandle(snapshot)
+    return names
 
 
 def main():
@@ -80,6 +112,10 @@ def main():
     if not used.isdigit():
         skip(f"nvidia-smi reports no memory in use for GPU {index} ({used})")
     used, gpu = int(used), f"GPU {index} ({name})"
+
+    def read_used():
+        now, _ = run([smi, "--query-gpu=memory.used", "--format=csv,noheader,nounits", "-i", uuid])
+        return int(now.strip()) if now and now.strip().isdigit() else None
     if used <= limit:
         print(f"gpu_preflight: {gpu}: {used} of {total} MiB in use, the limit {limit} MiB ({LIMIT_VAR}): ok")
         return 0
@@ -94,23 +130,22 @@ def main():
         if len(fields) >= 4 and fields[0] == uuid and fields[1].isdigit():
             mib = fields[-1]
             procs[int(fields[1])] = [", ".join(fields[2:-1]), float(mib) if mib.isdigit() else None]
-    source, overcounted = "nvidia-smi", []
+    source, compositor = "nvidia-smi", []
     if sys.platform == "win32" and not any(m for _, m in procs.values()):
-        counted = windows_memory(used)
+        counted = windows_memory(used, read_used)
         if counted:
-            source = "Windows' GPU Process Memory counter"
+            source = "Windows' GPU Process Memory counter, read after the check"
             for pid, mib in counted.items():
                 procs.setdefault(pid, ["", None])[1] = mib
             # Names nvidia-smi could not read ([Insufficient Permissions]) from the process list.
-            listed, _ = run(["tasklist", "/FO", "CSV", "/NH"])
-            names = {int(r[1]): r[0] for r in csv.reader((listed or "").splitlines()) if len(r) > 1 and r[1].isdigit()}
+            names = windows_names()
             for pid, p in procs.items():
                 if not p[0] or p[0].startswith("["):
                     p[0] = names.get(pid, p[0] or "?")
-            # The compositor's counter (dwm.exe) also counts the surfaces it shares with other programs: above what
-            # the whole GPU has in use it says nothing about who holds it.
-            overcounted = [(pid, p) for pid, p in procs.items() if p[1] and p[1] > used]
-            for pid, _ in overcounted:
+            # The desktop compositor's counter takes in the surfaces it shares with every other program (it reads
+            # gigabytes on an idle GPU): it says nothing about who holds the memory.
+            compositor = [(pid, p) for pid, p in procs.items() if re.search(r"(^|[\\/])dwm\.exe$", p[0], re.I)]
+            for pid, _ in compositor:
                 del procs[pid]
     held = sorted(procs.items(), key=lambda p: -(p[1][1] or 0))
     if any(mib is not None for _, mib in procs.values()):
@@ -123,9 +158,9 @@ def main():
         rest = [mib or 0 for _, (_, mib) in held[len(shown):]]
         if rest:
             print(f"  ... and {len(rest)} more, {round(max(rest))} MiB or less each")
-        for pid, (exe, mib) in overcounted:
-            print(f"  (pid {pid} {exe}: {round(mib)} MiB counted, more than the GPU's {used} in use: surfaces it "
-                  "shares with other programs)")
+        for pid, (exe, mib) in compositor:
+            print(f"  (pid {pid} {exe}, the desktop's compositor: {round(mib or 0)} MiB counted, the surfaces it "
+                  "shares with other programs included)")
     else:
         print("nvidia-smi names no process on it (WSL and containers do not see the host's processes).")
     print(f"Stop what holds it or wait for it, or allow more: {LIMIT_VAR}=<MiB> (docs/testing.md, section 2).")
