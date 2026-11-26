@@ -541,3 +541,17 @@ blocks_round = [
 # blocks_round, rounds of 6 rows: 468370 us with these rules, 535984 with the defaults (-12.6%), 460468 with the best for each
 # blocks_round, rounds of 8 rows: 490282 us with these rules, 583655 with the defaults (-16.0%), 480056 with the best for each
 # blocks_round, rounds of 16 rows: 616884 us with these rules, 882912 with the defaults (-30.1%), 614595 with the best for each
+# `cuda_bench moe` on Inkling-2-Mini's experts (E 128, top 8, H 2304, I 1152), RTX 5070 Ti, against the original tiles:
+# from 2 rows the 2-bit IQ types take two gate/up pairs a warp (9 to 25% faster at 2 to 16 rows) and IQ4_NL one pair up
+# to 4 rows, two above; IQ3_XXS one pair up to 6 rows, one row included, decoded from a global table of signed rows
+# (8 to 11% faster at 1 to 6 rows), two pairs above (12 to 13% at 8 and 16).  Q4_K and the other types keep original.
+moe_gate_up = [
+  { types = ["IQ2_XXS", "IQ2_XS", "IQ2_S"], rows = [1, 1], columns = 0, units = 0 },
+  { types = ["IQ2_XXS", "IQ2_XS", "IQ2_S"], columns = 2, units = 1 },
+  { types = ["IQ3_XXS"], rows = [1, 6], columns = 1, units = 1 },
+  { types = ["IQ3_XXS"], columns = 2, units = 1 },
+  { types = ["IQ4_NL"], rows = [1, 1], columns = 0, units = 0 },
+  { types = ["IQ4_NL"], rows = [2, 4], columns = 1, units = 1 },
+  { types = ["IQ4_NL"], columns = 2, units = 1 },
+  { columns = 0, units = 0 },
+]
