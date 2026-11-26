@@ -15,6 +15,7 @@
 // its taps and context nodes go into the programs here; DV still drafts alone.
 #include "models/llama/llama.h"
 
+#include <algorithm>
 #include <cmath>
 #include <stdexcept>
 
@@ -150,6 +151,11 @@ bool Llama::build(const ModelFile& file, const ModelOptions& o, std::string* err
            false;
   const Config c = GgufMeta::is(file) ? read_gguf_config(file) : read_config(file.header().at("config"));
   const Lora lora = GgufMeta::is(file) ? Lora{} : read_lora(file);
+  // A PEFT adapter given beside the model (--lora): Hugging Face's rows, which are this family's in either format.
+  const CompanionLora peft = find_lora(
+      file, {"attn.q", "attn.k", "attn.v", "attn.o", "mlp.gate", "mlp.up", "mlp.down"}, c.layers);
+  if (peft && lora.rank) return *err = "a LoRA adapter (--lora) beside a file with adapters of its own", false;
+  if (peft && has_dv) return *err = "a LoRA adapter (--lora) beside a DV drafter", false;
   trained_ctx_ = c.trained_ctx;
 
   drafters::TargetSpec target{};
@@ -161,6 +167,9 @@ bool Llama::build(const ModelFile& file, const ModelOptions& o, std::string* err
 
   std::vector<int> unclaimed;
   drafters_reg_.scan(file, target, /*mtp=*/nullptr, has_dv, &unclaimed);
+  // a PEFT adapter beside the model (--lora) is no drafter: find_lora read it above
+  unclaimed.erase(std::remove_if(unclaimed.begin(), unclaimed.end(), [&](int i) { return is_lora_companion(file, i); }),
+                  unclaimed.end());
   if (!unclaimed.empty()) {  // a file beside the model that is no drafter of its: the family reads nothing else
     const int i = unclaimed.front();
     const json& ch = file.header().at("companions").at(size_t(i));
@@ -179,8 +188,10 @@ bool Llama::build(const ModelFile& file, const ModelOptions& o, std::string* err
   const double eps = c.eps;
   auto n = [&](const std::string& name) { return c.gguf ? gguf_name(name) : name; };  // the file's name for a tensor
   Tables& T = tables_;
-  // A linear's adapter: its a [rank, in] and b [out, rank] beside the linear's weight (python/convert --lora).
+  // A linear's adapter: its a [rank, in] and b [out, rank] beside the linear's weight (python/convert --lora), bf16;
+  // or the PEFT adapter's (--lora), none (rank 0) on a linear it leaves out.
   auto adapter = [&](const std::string& linear, int64_t out, int64_t in) {
+    if (peft) return T.lora(peft, linear, out, in);
     const flyx_lora l{T.weight(linear + ".lora_a", {lora.rank, in}), T.weight(linear + ".lora_b", {out, lora.rank}),
                       lora.rank, lora.scale};
     for (int w : {l.a, l.b})
@@ -188,6 +199,7 @@ bool Llama::build(const ModelFile& file, const ModelOptions& o, std::string* err
         throw std::runtime_error(std::string(T.weights[size_t(w)].t->name) + ": an adapter that is not bf16");
     return l;
   };
+  const bool adapted = lora.rank || peft;
   embed_ = T.embed_block(H, V, n);
   head_ = T.head_block(H, V, embed_, 0.0, c.eps, n);
   target.embed = embed_;
@@ -200,7 +212,7 @@ bool Llama::build(const ModelFile& file, const ModelOptions& o, std::string* err
     if (!qk_norm && (T.has(n(p + "attn.q_norm")) || T.has(n(p + "attn.k_norm"))))
       throw std::runtime_error(p + "attn: q/k norms in a Llama file (a Qwen3 checkpoint converted as Llama?)");
     layers_.push_back(T.attn_block(p, attn_spec, n));
-    if (lora.rank) {
+    if (adapted) {
       flyx_attn_block& a = T.blocks[size_t(layers_.back())].attn;
       a.lora[0] = adapter(p + "attn.q", nh * hd, H);
       a.lora[1] = adapter(p + "attn.k", nkv * hd, H);
@@ -212,7 +224,7 @@ bool Llama::build(const ModelFile& file, const ModelOptions& o, std::string* err
           throw std::runtime_error(p + l + ": adapters without the header's lora section");
     }
     layers_.push_back(T.mlp_block(p, H, I, 0.0, c.eps, n));
-    if (lora.rank) {
+    if (adapted) {
       flyx_mlp_block& f = T.blocks[size_t(layers_.back())].mlp;
       f.lora[0] = adapter(p + "mlp.gate", I, H);
       f.lora[1] = adapter(p + "mlp.up", I, H);

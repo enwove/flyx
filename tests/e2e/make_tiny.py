@@ -8,7 +8,8 @@ from transformers itself.
 
 Outputs in OUT_DIR: hf_target/, hf_draft/, tiny.flyx, golden.json,
 tokenizer_cases.json, chat_cases.json, hf_qwen3/, tiny_qwen3.flyx,
-golden_qwen3.json, hf_llama/, tiny_llama.flyx, golden_llama.json (a Llama
+golden_qwen3.json, peft_qwen3/ and golden_qwen3_lora.json (a LoRA adapter for it as Hugging Face PEFT
+saves one, on some of its linears and layers: make_qwen3_peft), hf_llama/, tiny_llama.flyx, golden_llama.json (a Llama
 without q/k norms, MiniCPM5's layers, with golden outputs from
 transformers), tiny_llama_dv.flyx (the same with a tiny DV drafter: dv_tiny/
 holds its bifill-dv checkpoints and what export_dv.py made of them),
@@ -58,7 +59,9 @@ OUTPUTS = ("tiny.flyx", "tiny_nvfp4.flyx", "tiny_qwen3.flyx", "tiny_gdn128.flyx"
            "tiny_llama_dv32.flyx", "tiny_llama_dv31.flyx", "tiny_llama_dv31_pool.flyx", "tiny_llama_dv31_wide.flyx",
            "tiny_llama_dv31_wide_pool.flyx", "golden_llama_dv.json", "tiny_llama_nvfp4.flyx", "golden_llama_nvfp4.json",
            "tiny_llama_lora.flyx", "golden_llama_lora.json", "tiny_llama_dv_lora.flyx", "golden_llama_dv_lora.json",
-           "tiny_llama_dv31_lora.flyx", "tiny_llama_nvfp4_lora.flyx", "golden_llama_nvfp4_lora.json")
+           "tiny_llama_dv31_lora.flyx", "tiny_llama_nvfp4_lora.flyx", "golden_llama_nvfp4_lora.json",
+           "peft_qwen3/adapter_model.safetensors", "golden_qwen3_lora.json",
+           "peft_qwen35/adapter_model.safetensors", "golden_qwen35_lora.json")
 
 
 def inputs_digest() -> str:
@@ -233,9 +236,17 @@ def save_dense(model, out_dir: str, tok_dir: str | None, gen):
         shutil.copy(os.path.join(tok_dir, f), os.path.join(out_dir, f))
 
 
+# A layer's linears by the names adapters go by (L<i>.<name>.lora_a, .lora_b): Hugging Face's module and projection.
+_HF_LINEARS = {"q": ("self_attn", "q_proj"), "k": ("self_attn", "k_proj"), "v": ("self_attn", "v_proj"),
+               "o": ("self_attn", "o_proj"), "gate": ("mlp", "gate_proj"), "up": ("mlp", "up_proj"),
+               "down": ("mlp", "down_proj"), "gdn.qkv": ("linear_attn", "in_proj_qkv"),
+               "gdn.z": ("linear_attn", "in_proj_z"), "gdn.b": ("linear_attn", "in_proj_b"),
+               "gdn.a": ("linear_attn", "in_proj_a"), "gdn.out": ("linear_attn", "out_proj")}
+
+
 def write_golden_hf(hf_dir: str, out_json: str, prompts, n=48, min_margin=0.02, lora=None):
     """Greedy tokens from transformers itself (float64 weights and activations), prompts with clear margins.  lora:
-    (an export_dv.py --vlora directory's tensors, its scale): the target's own adapters merged into its weights in
+    (an export_dv.py --vlora directory's tensors, or make_qwen3_peft's, and its scale): the target's own adapters merged into its weights in
     float64, W + scale B A (the same model as the engine's unmerged one, to float64's rounding)."""
     from transformers import AutoModelForCausalLM
     model = AutoModelForCausalLM.from_pretrained(hf_dir, dtype=torch.float64).eval()
@@ -243,8 +254,10 @@ def write_golden_hf(hf_dir: str, out_json: str, prompts, n=48, min_margin=0.02, 
         tensors, scale = lora
         with torch.no_grad():
             for l, layer in enumerate(model.model.layers):
-                for name, blk in dv._LINEARS:
-                    w = getattr(layer.self_attn if blk == "attn" else layer.mlp, name + "_proj").weight
+                for name, (blk, proj) in _HF_LINEARS.items():
+                    if f"L{l}.{name}.lora_a" not in tensors:  # a PEFT adapter's linears: some of them
+                        continue
+                    w = getattr(getattr(layer, blk), proj).weight
                     w += scale * (tensors[f"L{l}.{name}.lora_b"].double() @ tensors[f"L{l}.{name}.lora_a"].double())
     golden = {"eos": [2], "plain_only": True, "cases": []}
     with torch.no_grad():
@@ -448,6 +461,7 @@ def main(out):
     prompts = [tok.encode(t).ids for t in ("The quick brown fox", "def add(a, b):\n", "推理引擎需要")]
     prompts.append([5, 17, 33, 9])
     write_golden(path, os.path.join(out, "golden.json"), prompts, vocab)
+    n35 = make_qwen35_peft(out, tdir, prompts)
     # The drafter as z-lab publishes DFlash2 drafters, converted alone: what tiny.flyx holds of
     # its drafter.  Then with a sliding window of 8, shorter than the prompts and their 48 tokens: with the target
     # (golden drafts from the reference's window) and alone.
@@ -485,6 +499,7 @@ def main(out):
     q3path = os.path.join(out, "tiny_qwen3.flyx")
     convert(q3dir, q3path, None, log=lambda *_: None)
     n3 = write_golden_hf(q3dir, os.path.join(out, "golden_qwen3.json"), prompts + more)
+    n3l = make_qwen3_peft(out, q3dir, prompts + more)
     # GDN heads of 128 (Qwen3.5's): prefill takes the chunked recurrence on bf16
     # tensor cores, so these cases avoid near-ties as the NVFP4 ones do.
     gdir = os.path.join(out, "hf_gdn128")
@@ -547,7 +562,8 @@ def main(out):
         f.write(made_from + "\n")
     print(f"wrote {out}: tiny.flyx, tiny_nvfp4.flyx, golden.json, golden_nvfp4.json ({len(prompts)} prompts), "
           f"tokenizer_cases.json ({len(cases)}), chat_cases.json ({n_chat}), tiny_qwen3.flyx, "
-          f"golden_qwen3.json ({n3} prompts), tiny_llama.flyx, golden_llama.json ({nl} prompts), "
+          f"peft_qwen35/, golden_qwen35_lora.json ({n35} prompts), "
+          f"golden_qwen3.json ({n3} prompts), peft_qwen3/, golden_qwen3_lora.json ({n3l} prompts), tiny_llama.flyx, golden_llama.json ({nl} prompts), "
           f"tokenizer_cases_minicpm5.json ({len(lcases)}), "
           f"tiny_gdn128.flyx, golden_gdn128.json, tiny_draft.flyx, tiny_block8.flyx, tiny_block7.flyx, "
           f"tiny_window.flyx, golden_window.json, "
@@ -695,6 +711,96 @@ def make_llama_lora(out: str, ldir: str, prompts) -> tuple[int, int]:
         if not set(map(tuple, tokens)).isdisjoint(set(map(tuple, base))):
             raise RuntimeError(f"{golden}: the V-LoRA leaves some case's tokens the plain model's")
     return kept[0], kept[1]
+
+
+def make_qwen3_peft(out: str, q3dir: str, prompts) -> int:
+    """A LoRA adapter for the tiny Qwen3 as Hugging Face PEFT saves one (peft_qwen3/: adapter_config.json and
+    adapter_model.safetensors, the engine's --lora; core/modelfile/peft_dir.cpp): rank 8, lora_alpha 16 (scale 2), on
+    q, v, o, gate and down of layers 0 to 2, none on k and up nor on layer 3 (a block's linears without one run as
+    zeros beside those with one), float32 values that bf16 holds (the engines run adapters in bf16); and its golden
+    tokens from transformers in float64 with it merged (golden_qwen3_lora.json; write_golden_hf).  The adapter changes
+    every case's tokens.  Returns the prompts kept.  Its own generator: nothing above changes."""
+    from safetensors.torch import save_file
+    from transformers import AutoConfig
+    cfg = AutoConfig.from_pretrained(q3dir)
+    rank, alpha, layers = 8, 16, (0, 1, 2)
+    q, kv, H, I = cfg.num_attention_heads * cfg.head_dim, cfg.num_key_value_heads * cfg.head_dim, \
+        cfg.hidden_size, cfg.intermediate_size
+    shapes = {"q": ("self_attn", H, q), "v": ("self_attn", H, kv), "o": ("self_attn", q, H),
+              "gate": ("mlp", H, I), "down": ("mlp", I, H)}
+    gen = torch.Generator().manual_seed(8)
+    saved, tensors = {}, {}
+    for l in layers:
+        for name, (blk, inp, outp) in shapes.items():
+            a = (torch.randn(rank, inp, generator=gen) / math.sqrt(inp)).to(torch.bfloat16).float()
+            b = (torch.randn(outp, rank, generator=gen) * 0.3 / math.sqrt(rank)).to(torch.bfloat16).float()
+            p = f"base_model.model.model.layers.{l}.{blk}.{name}_proj"
+            saved[p + ".lora_A.weight"], saved[p + ".lora_B.weight"] = a, b
+            tensors[f"L{l}.{name}.lora_a"], tensors[f"L{l}.{name}.lora_b"] = a, b
+    pdir = os.path.join(out, "peft_qwen3")
+    os.makedirs(pdir, exist_ok=True)
+    save_file(saved, os.path.join(pdir, "adapter_model.safetensors"))
+    json.dump({"peft_type": "LORA", "task_type": "CAUSAL_LM", "base_model_name_or_path": "tiny_qwen3", "r": rank,
+               "lora_alpha": alpha, "lora_dropout": 0.0, "bias": "none", "use_rslora": False, "use_dora": False,
+               "fan_in_fan_out": False, "target_modules": [n + "_proj" for n in shapes],
+               "layers_to_transform": list(layers)},
+              open(os.path.join(pdir, "adapter_config.json"), "w", encoding="utf-8"), indent=1)
+    golden = os.path.join(out, "golden_qwen3_lora.json")
+    kept = write_golden_hf(q3dir, golden, prompts, lora=(tensors, alpha / rank))
+    base = {tuple(c["prompt"]): c["tokens"]
+            for c in json.load(open(os.path.join(out, "golden_qwen3.json"), encoding="utf-8"))["cases"]}
+    for c in json.load(open(golden, encoding="utf-8"))["cases"]:
+        if base.get(tuple(c["prompt"])) == c["tokens"]:
+            raise RuntimeError(f"golden_qwen3_lora.json: the adapter leaves {c['prompt']}'s tokens the plain model's")
+    return kept
+
+
+def make_qwen35_peft(out: str, tdir: str, prompts) -> int:
+    """A LoRA adapter for the tiny Qwen3.5 as Hugging Face PEFT saves one (peft_qwen35/; the engine's --lora): rank 8,
+    lora_alpha 16, on its attention layers' q (each head's q and gate rows, Hugging Face's layout), v and o, its GDN
+    layers' qkv, z, a and out (none on b: zeros beside them), every MLP's gate and down, float32 values that bf16
+    holds; tiny.flyx keeps a head's q rows before its gate rows and a key head's value heads together, tiny_gguf.gguf
+    each head's gate after its q and the value heads tiled, so the backends' reordering of the adapter's rows to the
+    weights' is held on both.  Its golden tokens from transformers in float64 with it merged (golden_qwen35_lora.json),
+    which change every case's.  Returns the prompts kept.  Its own generator: nothing above changes."""
+    from safetensors.torch import save_file
+    from transformers import AutoConfig
+    cfg = AutoConfig.from_pretrained(tdir)
+    cfg = getattr(cfg, "text_config", cfg)
+    H, I = cfg.hidden_size, cfg.intermediate_size
+    q, kv = cfg.num_attention_heads * cfg.head_dim, cfg.num_key_value_heads * cfg.head_dim
+    nk, nv = cfg.linear_num_key_heads, cfg.linear_num_value_heads
+    kd, vd = nk * cfg.linear_key_head_dim, nv * cfg.linear_value_head_dim
+    attn = {"q": (2 * q, H), "v": (kv, H), "o": (H, q)}
+    gdn = {"gdn.qkv": (2 * kd + vd, H), "gdn.z": (vd, H), "gdn.a": (nv, H), "gdn.out": (H, vd)}
+    mlp = {"gate": (I, H), "down": (H, I)}
+    rank, alpha = 8, 16
+    gen = torch.Generator().manual_seed(35)
+    saved, tensors = {}, {}
+    for l, kind in enumerate(cfg.layer_types):
+        for name, (outp, inp) in {**(attn if kind == "full_attention" else gdn), **mlp}.items():
+            a = (torch.randn(rank, inp, generator=gen) / math.sqrt(inp)).to(torch.bfloat16).float()
+            b = (torch.randn(outp, rank, generator=gen) * 0.3 / math.sqrt(rank)).to(torch.bfloat16).float()
+            blk, proj = _HF_LINEARS[name]
+            p = f"base_model.model.model.layers.{l}.{blk}.{proj}"
+            saved[p + ".lora_A.weight"], saved[p + ".lora_B.weight"] = a, b
+            tensors[f"L{l}.{name}.lora_a"], tensors[f"L{l}.{name}.lora_b"] = a, b
+    pdir = os.path.join(out, "peft_qwen35")
+    os.makedirs(pdir, exist_ok=True)
+    save_file(saved, os.path.join(pdir, "adapter_model.safetensors"))
+    json.dump({"peft_type": "LORA", "task_type": "CAUSAL_LM", "r": rank, "lora_alpha": alpha, "use_rslora": False,
+               "bias": "none", "target_modules": ["q_proj", "v_proj", "o_proj", "in_proj_qkv", "in_proj_z",
+                                                  "in_proj_a", "out_proj", "gate_proj", "down_proj"]},
+              open(os.path.join(pdir, "adapter_config.json"), "w", encoding="utf-8"), indent=1)
+    golden = os.path.join(out, "golden_qwen35_lora.json")
+    kept = write_golden_hf(tdir, golden, prompts, min_margin=0.05, lora=(tensors, alpha / rank))
+    base = {tuple(c["prompt"]): c["tokens"]
+            for c in json.load(open(os.path.join(out, "golden.json"), encoding="utf-8"))["cases"]}
+    for c in json.load(open(golden, encoding="utf-8"))["cases"]:
+        plain = base.get(tuple(c["prompt"]))
+        if plain is not None and plain[:len(c["tokens"])] == c["tokens"]:
+            raise RuntimeError(f"golden_qwen35_lora.json: the adapter leaves {c['prompt']}'s tokens the plain model's")
+    return kept
 
 
 # golden_test's DV rounds (tests/e2e/golden_test.cpp, dv_rounds): every third round from the second (rounds 1, 4, 7,

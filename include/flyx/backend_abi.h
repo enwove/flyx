@@ -30,7 +30,7 @@
 extern "C" {
 #endif
 
-#define FLYX_BACKEND_ABI_VERSION 44u
+#define FLYX_BACKEND_ABI_VERSION 45u
 #define FLYX_BACKEND_ENTRY "flyx_backend_get_api"
 /* How a backend library exports its entry. */
 #if defined(_WIN32)
@@ -211,7 +211,8 @@ typedef struct {
 } flyx_vnorm;
 
 /* A low-rank adapter on a linear y = W x (ABI 42): y = W x + scale b (a x), a [rank, in], b [out, rank], both bf16
- * (ABI 43: the scale; DV's canvas adapters have none, scale 1).  rank 0: none, as a block built zeroed has. */
+ * (ABI 43: the scale; DV's canvas adapters have none, scale 1); a target's own may also be f16 or f32 (a PEFT adapter
+ * given beside the model), which the backends run as bf16.  rank 0: none, as a block built zeroed has. */
 typedef struct {
   int32_t a, b, rank;
   float scale;
@@ -223,6 +224,12 @@ typedef enum {
   FLYX_LIN_GATE = 4, FLYX_LIN_UP = 5, FLYX_LIN_DOWN = 6,
   FLYX_LINS = 7
 } flyx_linear;
+
+/* A gated delta net's linears, in the order its array of adapters lists them (ABI 45). */
+typedef enum {
+  FLYX_GDN_LIN_QKV = 0, FLYX_GDN_LIN_Z = 1, FLYX_GDN_LIN_B = 2, FLYX_GDN_LIN_A = 3, FLYX_GDN_LIN_OUT = 4,
+  FLYX_GDN_LINS = 5
+} flyx_gdn_linear;
 
 typedef enum {
   FLYX_STATE_KV = 1,     /* `layers` K/V caches of n_kv x head_dim per position */
@@ -313,12 +320,16 @@ typedef struct {
   int32_t q, k, v, o;
   int32_t kv;                          /* state: its K/V cache (layers 1) */
   /* ABI 43: the block's own adapters on q, k, v and o (flyx_linear order), in every pass that runs it (a V-LoRA,
-   * python/convert --lora), all four or none, one rank; none with an output gate. */
+   * python/convert --lora, or a PEFT adapter: --lora), one rank and scale on the linears that have one (rank 0 on the
+   * others: none there).  With an output gate (ABI 45) q's covers the gate's rows too, its b's rows in lora_gate's
+   * layout, which may be another than the weight's (a PEFT adapter's are Hugging Face's, FLYX_GATE_PER_HEAD): the
+   * backend reads them as it reads the weight's. */
   flyx_lora lora[4];
   /* ABI 44: 3D Multimodal RoPE (Qwen3.5/3.8). mrope_section[0..2] = (T, H, W) frequency pair counts summing to
    * rot_dim / 2 (all 0 = standard 1D RoPE). mrope_interleaved: 1 = interleaved T,H,W; 0 = contiguous chunks. */
   int32_t mrope_section[3];
   int32_t mrope_interleaved;
+  int32_t lora_gate;                   /* ABI 45: flyx_gate_layout of lora[FLYX_LIN_Q]'s b rows (gate only) */
 } flyx_attn_block;
 
 /* Gated delta net, as ops/ops.h: from h = norm(x), mixed = qkv(h) through
@@ -335,6 +346,12 @@ typedef struct {
   int32_t state;                       /* its GDN state */
   int32_t head_order;                  /* flyx_gdn_head_order, the state's too */
   int32_t decay;                       /* flyx_gdn_decay */
+  /* ABI 45: the block's own adapters on qkv, z, b, a and out (flyx_gdn_linear order), as an attention block's (one
+   * rank and scale on those that have one), their per-value-head rows (qkv's value rows, z's, b's, a's) and out's a's
+   * columns in lora_head_order, which may be another than the weights' (a PEFT adapter's are Hugging Face's,
+   * FLYX_GDN_HEADS_GROUPED): the backend reads them as it reads the weights. */
+  flyx_lora lora[FLYX_GDN_LINS];
+  int32_t lora_head_order;             /* flyx_gdn_head_order */
 } flyx_gdn_block;
 
 /* x += down(silu(gate(h)) * up(h)), h = norm(x). */
@@ -342,7 +359,7 @@ typedef struct {
   int32_t hidden, inter;
   flyx_norm norm;
   int32_t gate, up, down;
-  flyx_lora lora[3];                   /* ABI 43: on gate, up and down, as an attention block's (all or none) */
+  flyx_lora lora[3];                   /* ABI 43: on gate, up and down, as an attention block's */
 } flyx_mlp_block;
 
 /* logits = w(norm(x)), then the token choice per row (ops/sampling/sampling.h). */

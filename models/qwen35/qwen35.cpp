@@ -227,6 +227,7 @@ void take_vision_companions(const ModelFile& file, const std::vector<int>& uncla
   for (int i : unclaimed) {
     const json& h = file.header().at("companions").at(size_t(i));
     const std::string what = "companion file " + std::to_string(i + 1) + ": ";
+    if (is_lora_companion(file, i)) continue;  // a PEFT adapter (--lora): find_lora
     if (is_mmproj_header(h)) {
       if (!load_vision) continue;
       if (f->vision.enabled) throw std::runtime_error(what + "the model already has a vision encoder");
@@ -531,10 +532,45 @@ bool Qwen35::build(const ModelFile& file, const ModelOptions& o, std::string* er
   head_ = T.head_block(c.hidden, c.vocab, embed_, one(), c.eps, nf);
   target.embed = embed_;
   target.head = head_;
+  // A PEFT adapter given beside the model (--lora): Hugging Face's rows (each head's gate rows after its q rows, a
+  // key head's value heads side by side), which the blocks say for the backend to read as it reads the weights.
+  const CompanionLora peft = find_lora(file,
+                                       {"attn.q", "attn.k", "attn.v", "attn.o", "mlp.gate", "mlp.up", "mlp.down",
+                                        "gdn.qkv", "gdn.z", "gdn.b", "gdn.a", "gdn.out"},
+                                       c.layers);
+  const int H = c.hidden, qw = c.n_heads * c.head_dim, kvw = c.n_kv * c.head_dim, vw = c.nv * c.dv;
   for (int i = 0; i < c.layers; ++i) {
     const std::string p = "target.L" + std::to_string(i) + ".";
-    mixer_.push_back(c.is_attn[size_t(i)] ? attention(p, c, false) : gdn(p, c));
+    const bool attn = c.is_attn[size_t(i)];
+    mixer_.push_back(attn ? attention(p, c, false) : gdn(p, c));
     mlp_.push_back(mlp(p, c));
+    if (!peft) continue;
+    // An adapter on a linear this layer does not have (a GDN's on an attention layer): refused, never left unread.
+    for (const char* l : {"attn.q", "attn.k", "attn.v", "attn.o", "gdn.qkv", "gdn.z", "gdn.b", "gdn.a", "gdn.out"})
+      if ((std::string(l).rfind("attn.", 0) == 0) != attn &&
+          T.has(ModelFile::companion_name(peft.companion, p + l + ".lora_a")))
+        throw std::runtime_error("lora: an adapter on " + p + l + ", which this layer (" + (attn ? "attention" : "GDN") +
+                                 ") does not have");
+    if (attn) {
+      flyx_attn_block& a = T.at(mixer_.back()).attn;
+      a.lora[FLYX_LIN_Q] = T.lora(peft, p + "attn.q", 2 * qw, H);  // q and the gate's rows
+      a.lora[FLYX_LIN_K] = T.lora(peft, p + "attn.k", kvw, H);
+      a.lora[FLYX_LIN_V] = T.lora(peft, p + "attn.v", kvw, H);
+      a.lora[FLYX_LIN_O] = T.lora(peft, p + "attn.o", H, qw);
+      a.lora_gate = FLYX_GATE_PER_HEAD;
+    } else {
+      flyx_gdn_block& g = T.at(mixer_.back()).gdn;
+      g.lora[FLYX_GDN_LIN_QKV] = T.lora(peft, p + "gdn.qkv", 2 * c.nk * c.dk + vw, H);
+      g.lora[FLYX_GDN_LIN_Z] = T.lora(peft, p + "gdn.z", vw, H);
+      g.lora[FLYX_GDN_LIN_B] = T.lora(peft, p + "gdn.b", c.nv, H);
+      g.lora[FLYX_GDN_LIN_A] = T.lora(peft, p + "gdn.a", c.nv, H);
+      g.lora[FLYX_GDN_LIN_OUT] = T.lora(peft, p + "gdn.out", H, vw);
+      g.lora_head_order = FLYX_GDN_HEADS_GROUPED;
+    }
+    flyx_mlp_block& f = T.at(mlp_.back()).mlp;
+    f.lora[0] = T.lora(peft, p + "mlp.gate", c.inter, H);
+    f.lora[1] = T.lora(peft, p + "mlp.up", c.inter, H);
+    f.lora[2] = T.lora(peft, p + "mlp.down", H, c.inter);
   }
   for (Drafter kind : drafters) {
     int max_drafts = 0;

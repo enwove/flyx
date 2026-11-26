@@ -74,4 +74,11 @@ bool is_drafter_dir(const std::string& path);
 bool read_drafter_dir(const std::string& dir, std::vector<std::unique_ptr<os::MappedFile>>* maps,
                       ModelFile::Contents* out, std::string* err);
 
+// A LoRA adapter as Hugging Face PEFT saves it (peft_dir.cpp): a directory with adapter_config.json and
+// adapter_model.safetensors, read as a "lora" companion whose tensors carry a .flyx file's adapter names
+// (target.L{l}.{attn,mlp,gdn}.<linear>.lora_{a,b}) in the file's dtype and Hugging Face row order.
+bool is_peft_dir(const std::string& path);
+bool read_peft_dir(const std::string& dir, std::vector<std::unique_ptr<os::MappedFile>>* maps,
+                   ModelFile::Contents* out, std::string* err);
+
 }  // namespace flyx::modelfile

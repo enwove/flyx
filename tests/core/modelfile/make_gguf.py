@@ -10,7 +10,8 @@
 * random blocks of every GGML block type with the values `gguf.quants`
   decodes them to (gguf_quant_cases.json), and a tiny Qwen3 per type whose
   matrices are such blocks (quant_<type>.gguf), and golden_test's prompts for
-  them (golden_quant.json: each file held to its own plain decoding)
+  them (golden_quant.json: each file held to its own plain decoding), and a
+  LoRA adapter for them as Hugging Face PEFT saves one (peft_quant/)
 * the tiny Qwen3.5 with its matrices quantized (tiny_q8.gguf: the block types
   of 32 weights, mixed, as its matrices are 64 and 128 wide)
 """
@@ -284,6 +285,35 @@ def quant_models(out):
     cases = [{"prompt": c["prompt"]} for c in golden["cases"]]
     (out / "golden_quant.json").write_text(json.dumps({"eos": golden["eos"], "plain_only": True, "cases": cases}),
                                            encoding="utf-8")
+    peft_quant(out, dims)
+
+
+def peft_quant(out, dims):
+    """A LoRA adapter for the quant_<type>.gguf files as Hugging Face PEFT saves one (peft_quant/; the engine's --lora):
+    rank 8, lora_alpha 16, on q, v, o, gate and down (none on k and up: zeros beside them), float16 values that bf16
+    holds (the engines run adapters in bf16).  gguf_test.cpp holds the backends' block GEMMs beside it to the float64
+    backend's."""
+    from safetensors.numpy import save_file
+    rng = np.random.default_rng(8)
+    rank, alpha, tensors = 8, 16, {}
+
+    def bf16(a):  # round to bf16 (nearest even), kept in float16
+        b = np.ascontiguousarray(a, np.float32).view(np.uint32)
+        b = ((b + 0x7FFF + ((b >> 16) & 1)) & 0xFFFF0000).astype(np.uint32)
+        return b.view(np.float32).astype(np.float16)
+
+    for name, blk in (("q", "self_attn"), ("v", "self_attn"), ("o", "self_attn"), ("gate", "mlp"), ("down", "mlp")):
+        n, k = dims[f"target.L0.{'attn' if blk == 'self_attn' else 'mlp'}.{name}"]
+        p = f"base_model.model.model.layers.0.{blk}.{name}_proj"
+        tensors[p + ".lora_A.weight"] = bf16(rng.standard_normal((rank, k)) / np.sqrt(k))
+        tensors[p + ".lora_B.weight"] = bf16(rng.standard_normal((n, rank)) * 0.5 / np.sqrt(rank))
+    d = out / "peft_quant"
+    d.mkdir(exist_ok=True)
+    save_file(tensors, str(d / "adapter_model.safetensors"))
+    (d / "adapter_config.json").write_text(json.dumps(
+        {"peft_type": "LORA", "task_type": "CAUSAL_LM", "r": rank, "lora_alpha": alpha, "use_rslora": False,
+         "target_modules": ["q_proj", "v_proj", "o_proj", "gate_proj", "down_proj"], "bias": "none"}),
+        encoding="utf-8")
 
 
 def quantized_tiny(out):

@@ -553,6 +553,9 @@ std::vector<flyx_round_result> tree_rounds(Engine* e, const std::vector<int32_t>
 
 constexpr int kReferenceWidth = -2;
 
+// A PEFT adapter given beside the model (the sixth argument, --lora): every engine of the run loads it.
+std::string g_lora_file;
+
 std::unique_ptr<Engine> make(const std::string& path, const std::string& backend, bool spec,
                              const std::string& drafter = "dflash2", bool kv_fp8 = false,
                              const std::string& backend_options = "", bool lookup = false, int max_ctx = 512,
@@ -574,6 +577,7 @@ std::unique_ptr<Engine> make(const std::string& path, const std::string& backend
   o.kv = kv_fp8 ? FLYX_KV_FP8 : FLYX_KV_16;
   o.max_ctx = max_ctx;
   o.backend = backend;
+  o.lora_file = g_lora_file;
   o.speculative = spec;
   o.drafter = drafter;
   o.prefill_chunk = prefill_chunk;  // several chunks per prompt
@@ -3006,7 +3010,9 @@ int plain_only(const json& g, const std::string& model, const std::string& backe
     EngineOptions o;
     o.backend = backend;
     o.max_ctx = 512;
-    o.drafter = mine;
+    // The file's drafters by name: one ("dv"), or all of them where it has several ("mtp+dflash2": the tiny Qwen3.5's).
+    o.drafter = mine.find('+') == std::string::npos ? mine : "all";
+    o.lora_file = g_lora_file;
     std::string why;
     Engine named;
     const bool loaded = named.load(model, o, &why);
@@ -3019,8 +3025,8 @@ int plain_only(const json& g, const std::string& model, const std::string& backe
     // and, made when its rounds are lowered, its token tables A E and B E, [vocab][rank] float32 each.
     flyx_memory_info with{}, without{};
     const Engine &a = *drafting[0], &b = *drafting[1];
-    if (a.api()->memory && a.api()->memory(a.bmodel(), &with) == 0 && b.api()->memory(b.bmodel(), &without) == 0 &&
-        with.weights > 0) {
+    if (dv_file && a.api()->memory && a.api()->memory(a.bmodel(), &with) == 0 &&
+        b.api()->memory(b.bmodel(), &without) == 0 && with.weights > 0) {
       uint64_t want = 0;
       const flyx_model_desc& desc = a.model().desc();
       for (int i = 0; i < desc.n_weights; ++i) {
@@ -3121,7 +3127,12 @@ int plain_only(const json& g, const std::string& model, const std::string& backe
         batch_rounds(plain.get(), {prompt, other, twice}, {round, round, round},
                      "rounds of three sequences, plain decoding");
     }
-    if (k == 1 && backend == "cuda") {  // a second architecture's tree rounds (attention only)
+    // A gated delta net's tree recurrence stages 16 rows: a file with one (the tiny Qwen3.5 beside a LoRA adapter)
+    // lowers no tree past them, which golden.json's checks hold.
+    bool attention_only = true;
+    const flyx_model_desc& desc = plain->model().desc();
+    for (int i = 0; i < desc.n_blocks; ++i) attention_only = attention_only && desc.blocks[i].kind != FLYX_BLOCK_GDN;
+    if (k == 1 && backend == "cuda" && attention_only) {  // a second architecture's tree rounds (attention only)
       SamplingParams greedy, sampled, penalized;
       sampled.temperature = 0.8f;
       sampled.seed = 7;
@@ -3565,7 +3576,8 @@ int device_memory(const std::string& model, const std::string& backend, const st
 int main(int argc, char** argv) {
   const auto args = os::utf8_arguments(argc, argv);
   if (args.size() < 3) {
-    std::fprintf(stderr, "usage: golden_test ASSET_DIR BACKEND [VARIANT [MODEL]]  (FLYX_TEST_DEVICE_MEMORY=1: "
+    std::fprintf(stderr, "usage: golden_test ASSET_DIR BACKEND [VARIANT [MODEL [LORA_DIR]]]  "
+                         "(FLYX_TEST_DEVICE_MEMORY=1: "
                          "the device memory checks alone)\n");
     return 2;
   }
@@ -3588,6 +3600,7 @@ int main(int argc, char** argv) {
     return 1;
   }
   const std::string model = args.size() > 4 ? args[4] : dir + "/tiny" + variant + ".flyx";
+  if (args.size() > 5) g_lora_file = args[5];
   if (const char* which = std::getenv("FLYX_TEST_DEVICE_MEMORY")) {
     const auto prompt = g["cases"][0]["prompt"].get<std::vector<int32_t>>();
     const std::string mode = which;
