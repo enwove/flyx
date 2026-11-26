@@ -698,6 +698,8 @@ export default {
     [/^Not enough free RAM \(([\d.]+) GB available for KV\)\. Free RAM or raise "KV in host RAM" for a longer context\.$/, "空き RAM が不足しています（KV 用に $1 GB 利用可能）。RAM を空けるか「ホスト RAM 上の KV」を増やすとコンテキストを延ばせます。"],
     [/^Not enough VRAM left \(([\d.]+) GB used by other apps\)\. Close other apps and reload for a longer context\.$/, "空き VRAM が不足しています（他のアプリが $1 GB 使用中）。他のアプリを閉じて再読み込みするとコンテキストを延ばせます。"],
     [/^Not enough VRAM left\. Disable speculative decoding or use a smaller quantization for a longer context\.$/, "空き VRAM が不足しています。投機的デコードをオフにするか、より小さい量子化を使うとコンテキストを延ばせます。"],
+    [/^Needs ([\d.]+) GB more VRAM for max context\.$/, "最大コンテキストにはあと $1 GB の VRAM が必要です。"],
+    [/^Needs ([\d.]+) GB more RAM for max context\.$/, "最大コンテキストにはあと $1 GB の RAM が必要です。"],
     [/^If the new one fails to load, no model is served until another is loaded\.$/, "新しいモデルの読み込みに失敗した場合、別のモデルを読み込むまでモデルは提供されません。"],
     [/^The files are fetched first, while (.+) keeps answering\.$/, "先にファイルをダウンロードします。その間も $1 は応答を続けます。"],
     [/^(\d+) requests? (?:is|are) running or waiting: (?:it is|they are) stopped\.$/, "実行中または待機中の $1 件のリクエストは中断されます。"],

@@ -139,7 +139,9 @@ function App() {
     : t("No model loaded") + " · FLYX";
 
   const page = (id, body) => html`<section id=${"tab-" + id} hidden=${tab !== id}>${body}</section>`;
-  const modalNeed = memKind === "vram" && L && !busyLoad(L) && isVramError(L.error) ? parseVramNeeded(L.error) : 0;
+  const ctxLim = tm && tm.model && tm.model.context_limit;
+  const ctxNeed = ctxLim && ctxLim.need_more > 0 && memKind === (ctxLim.by === "host" ? "ram" : "vram") ? ctxLim.need_more : 0;
+  const modalNeed = memKind === "vram" && L && !busyLoad(L) && isVramError(L.error) ? parseVramNeeded(L.error) : ctxNeed;
   const modalRetry = tm && tm.model && tm.model.id && L && L.loaded
     ? () => { setMemKind(""); reloadServed(); }
     : L && L.state === "failed" && L.target

@@ -303,17 +303,19 @@ def check_settings(page, server, want):
 def check_context_limit(open_page, want):
     """A context memory cut under the model's own: the status card says where K/V lives, which memory cut it and what
     would give more; a short one as a warning, on the Overview too."""
-    gpu = {"by": "gpu", "wanted": 262144, "short": True, "left": 820_000_000, "gpu_tokens": 8192,
-           "others": 3_600_000_000, "closable": True, "runtime": 540_000_000}
+    gpu = {"by": "gpu", "wanted": 262144, "short": True, "left": 820_000_000, "need_more": 5_120_000_000,
+           "gpu_tokens": 8192, "others": 3_600_000_000, "closable": True, "runtime": 540_000_000}
     cases = [
         (gpu, "warn", "Limited context window 8,192 / 262,144. Not enough VRAM left "
-                      "(3.60 GB used by other apps). Close other apps and reload for a longer context."),
-        (dict(gpu, others=100_000_000, closable=False), "warn",
+                      "(3.60 GB used by other apps). Close other apps and reload for a longer context. "
+                      "Needs 5.12 GB more VRAM for max context."),
+        (dict(gpu, others=100_000_000, closable=False, need_more=None), "warn",
          "Limited context window 8,192 / 262,144. Not enough VRAM left. "
          "Disable speculative decoding or use a smaller quantization for a longer context."),
-        ({"by": "host", "wanted": 262144, "short": False, "left": 7_300_000_000, "gpu_tokens": 4096,
-          "others": None, "closable": False, "runtime": None}, "hint",
-         "Limited context window 8,192 / 262,144. Not enough free RAM (7.30 GB available for KV)."),
+        ({"by": "host", "wanted": 262144, "short": False, "left": 7_300_000_000, "need_more": 4_500_000_000,
+          "gpu_tokens": 4096, "others": None, "closable": False, "runtime": None}, "hint",
+         "Limited context window 8,192 / 262,144. Not enough free RAM (7.30 GB available for KV). "
+         "Free RAM or raise \"KV in host RAM\" for a longer context. Needs 4.50 GB more RAM for max context."),
         ({"by": "host", "wanted": 262144, "short": False, "left": 7_300_000_000, "gpu_tokens": 0,
           "others": None, "closable": False, "runtime": None}, "hint",
          "Limited context window 8,192 / 262,144. Not enough free RAM (7.30 GB available for KV)."),

@@ -186,9 +186,13 @@ int main() {
     int ctx = 262144;
     const bool ok = plan::account(&api, nullptr, false, false, &ctx, 4096, kGpuOnly, &ledger, &b, &err);
     check(ok && ctx == longest && b.session_bytes <= ledger.available() && b.layout.max_ctx == ctx &&
-              b.ctx_limit == plan::CtxLimit::kGpu,
+              b.ctx_limit == plan::CtxLimit::kGpu && b.ctx_need_more > 0,
           "one that does not shrinks to the longest multiple of 1024 that fits (" + std::to_string(ctx) + ", want " +
               std::to_string(longest) + "), and says the GPU cut it: " + plan::ctx_limit_note(b));
+    uint64_t wanted_gpu = 0;
+    seq_bytes(nullptr, 262144, &wanted_gpu);
+    check(b.ctx_need_more == wanted_gpu - ledger.available(),
+          "GPU-only shortfall matches exact bytes needed for max context");
     uint64_t next = 0;
     seq_bytes(nullptr, ctx + 1024, &next);
     check(next > ledger.available(), "and 1024 more would not fit");
@@ -333,9 +337,10 @@ int main() {
               !plan::account(&api, nullptr, false, false, &one_more, 0, tiers, &ledger3, &b3, &err3),
           "--ctx max: the longest context the GPU and host memory hold (" + std::to_string(longest) + ") " + err2);
     const std::string why = plan::ctx_limit_note(b2);
-    check(b2.ctx_limit == plan::CtxLimit::kHost &&
-              why.find("does not fit host memory: 4.29 GB of it can be spared") != std::string::npos,
-          "and says host memory cut it: " + why);
+    check(b2.ctx_limit == plan::CtxLimit::kHost && b2.ctx_need_more > 0 &&
+              why.find("does not fit host memory: 4.29 GB of it can be spared") != std::string::npos &&
+              why.find("more RAM needed for max context") != std::string::npos,
+          "and says host memory cut it with max-context shortfall: " + why);
   }
   {  // --ctx max with --kv-method auto: 14 GiB of host memory hold 262,144 positions every one exact (each step then
      // reads the K/V past the GPU's part over the bus), not with the copy: --ctx 262144 takes the first, --ctx max a
@@ -501,12 +506,48 @@ int main() {
     int ctx = 262144;
     const bool ok = plan::account(&api_copy, nullptr, false, false, &ctx, 1024, tiers, &ledger, &b, &err, true);
     const std::string why = plan::ctx_limit_note(b);
-    check(ok && ctx > 120000 && ctx <= 131072 && b.ctx_limit == plan::CtxLimit::kGpu &&
+    check(ok && ctx > 120000 && ctx <= 131072 && b.ctx_limit == plan::CtxLimit::kGpu && b.ctx_need_more > 0 &&
               b.sessions_room == kGiB + kGiB / 4 &&
               why.find("does not fit the GPU: the sessions have 1.34 GB of it after the weights; other programs and "
                        "the driver hold") != std::string::npos &&
+              why.find("more VRAM needed for max context") != std::string::npos &&
               why.find("(closing other programs gives a longer context)") != std::string::npos,
           "--ctx max cut by the GPU (" + std::to_string(ctx) + "): " + why + " " + err);
+    g_others = 0, g_split = false;
+  }
+  {  // FLYX_KV_AUTO falls back to exact at a short context (when Strata has a fixed staging floor), yet at max_ctx
+     // Strata needs far less VRAM than exact: need_more_for must report Strata's smaller shortfall, not exact's.
+    flyx_backend_api api_auto = fake();
+    api_auto.seq_size = [](flyx_bmodel*, const flyx_seq_layout* l, flyx_seq_size* out) -> int {
+      const int dev = std::min(l->device_positions, l->max_ctx);
+      out->device_positions = dev;
+      out->copies = kCopies;
+      if (l->method == FLYX_KV_AUTO) {
+        // Strata: fixed 1.5 GiB floor (fails at 1.2 GiB room even at 1024 ctx), small growth to 2.0 GiB at 262144.
+        out->device = kGiB + 512 * kMiB + uint64_t(dev) * 64 * 1024 + uint64_t(l->max_ctx) * 2048;
+        out->host = uint64_t(l->max_ctx - dev) * 64 * 1024;
+        out->strata_from = dev;
+      } else {
+        // Exact: 1.0 GiB floor (fits at 1.2 GiB room for short ctx), but non-windowed staging grows to 5.0 GiB at 262144.
+        out->device = kGiB + uint64_t(dev) * 64 * 1024 + uint64_t(l->max_ctx) * 16 * 1024;
+        out->host = uint64_t(l->max_ctx - dev) * 64 * 1024;
+        out->strata_from = l->max_ctx;
+      }
+      return 0;
+    };
+    g_split = true;
+    g_others = left - (kGiB + 256 * kMiB);  // 1.25 GiB sessions_room: exact fits ~16K, Strata needs ~2.0 GiB at 262K
+    plan::KvTiers tiers{-1, int64_t(64 * kGiB)};
+    tiers.method = FLYX_KV_AUTO;
+    ResourceLedger ledger;
+    plan::Budget b;
+    std::string err;
+    int ctx = 262144;
+    const bool ok = plan::account(&api_auto, nullptr, false, false, &ctx, 1024, tiers, &ledger, &b, &err, true);
+    const uint64_t want_strata_need = (kGiB + 512 * kMiB + uint64_t(262144) * 2048) - (kGiB + 256 * kMiB);
+    check(ok && ctx > 0 && ctx < 262144 && b.ctx_limit == plan::CtxLimit::kGpu && b.ctx_need_more == want_strata_need,
+          "FLYX_KV_AUTO exact-fallback shortfall reports Strata VRAM need (" + std::to_string(b.ctx_need_more) +
+              " vs want " + std::to_string(want_strata_need) + ")");
     g_others = 0, g_split = false;
   }
   // What --kv-ram auto leaves to the rest of the machine: 2 GiB up to 32 GiB of RAM (a 32 GB machine shows 31.2 GiB

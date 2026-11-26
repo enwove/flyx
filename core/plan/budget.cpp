@@ -275,6 +275,59 @@ struct TierPlacer {
     return by;
   }
 
+  // Minimum extra bytes needed on `by`'s side (GPU or host) to place `wanted_ctx` in the active K/V mode.
+  uint64_t need_more_for(int wanted_ctx, CtxLimit by, bool exact_ok) const {
+    if (by == CtxLimit::kNone || wanted_ctx <= 0) return 0;
+    const uint64_t room = ledger->budget() ? ledger->available() : UINT64_MAX;
+    if (by == CtxLimit::kGpu && room == UINT64_MAX) return 0;
+    auto eval = [&](const KvTiers& t, uint64_t* need, bool* fits_other) -> bool {
+      const bool copy = t.method != FLYX_KV_READ_ALL;
+      int copy_host = 0;
+      if (copy) {
+        if (t.copy_gpu >= 0) {
+          flyx_seq_size all{};
+          const flyx_seq_layout la{wanted_ctx, 0, t.method, t.method_arg, INT32_MAX};
+          if (api->seq_size(bm, &la, &all) == 0) copy_host = std::max(0, all.copies - t.copy_gpu);
+        } else {
+          copy_host = INT32_MAX;
+        }
+      }
+      if (by == CtxLimit::kGpu) {
+        const flyx_seq_layout l{wanted_ctx, 0, t.method, t.method_arg, copy_host};
+        flyx_seq_size s{};
+        if (api->seq_size(bm, &l, &s) != 0) return false;
+        *need = s.device > room ? s.device - room : 0;
+        *fits_other = s.host <= out->host_budget;
+        return true;
+      }
+      flyx_seq_layout l{};
+      flyx_seq_size s{};
+      std::string why;
+      if (!tiered(api, bm, wanted_ctx, t, room, &l, &s, &why)) {
+        const flyx_seq_layout l0{wanted_ctx, 0, t.method, t.method_arg, copy_host};
+        if (api->seq_size(bm, &l0, &s) != 0) return false;
+      }
+      *need = s.host > out->host_budget ? s.host - out->host_budget : 0;
+      *fits_other = s.device <= room;
+      return true;
+    };
+    uint64_t need_a = 0;
+    bool fits_a = false;
+    const bool ok_a = eval(tiers, &need_a, &fits_a);
+    // In AUTO mode, even if a short context fell back to exact, freeing room may allow Strata at wanted_ctx first.
+    if (exact_ok && tiers.method == FLYX_KV_AUTO) {
+      uint64_t need_e = 0;
+      bool fits_e = false;
+      const bool ok_e = eval(exact_of(tiers), &need_e, &fits_e);
+      if (ok_a && ok_e) {
+        if (fits_a != fits_e) return fits_a ? need_a : need_e;
+        return std::min(need_a, need_e);
+      }
+      return ok_e ? need_e : (ok_a ? need_a : 0);
+    }
+    return ok_a ? need_a : 0;
+  }
+
   // The longest context below max_ctx, a multiple of 1024, that the GPU and host memory hold together (0: none): a
   // binary search, then the next 16 steps one by one (placing is not monotone everywhere: past auto's switch a copy
   // appears).  Placed again at the end, so *out's notes are that context's.
@@ -375,11 +428,13 @@ bool closable(const GpuHeld& h) { return h.others >= (h.runtime_known ? 256ull <
 std::string ctx_limit_note(const Budget& b) {
   if (b.ctx_limit == CtxLimit::kHost)
     return "a longer context does not fit host memory: " + gb(b.host_budget) +
-           " of it can be spared for K/V (--kv-ram GB gives more)";
+           " of it can be spared for K/V (--kv-ram GB gives more)" +
+           (b.ctx_need_more ? " (" + gb(b.ctx_need_more) + " more RAM needed for max context)" : "");
   if (b.ctx_limit != CtxLimit::kGpu) return "";
   const std::string others = held_note(b.held);
   return "a longer context does not fit the GPU: the sessions have " + gb(b.sessions_room) +
          " of it after the weights" + (others.empty() ? "" : "; " + others) +
+         (b.ctx_need_more ? "; " + gb(b.ctx_need_more) + " more VRAM needed for max context" : "") +
          (closable(b.held) ? " (closing other programs gives a longer context)" : "");
 }
 
@@ -429,7 +484,10 @@ bool account(const flyx_backend_api* api, flyx_bmodel* bm, bool has_drafter, boo
         out->session_host_bytes = s.host;
         out->session_host_mapped = s.host_mapped;
         out->tier_note.clear();
-        if (ctx < max_ctx) out->ctx_limit = placer.limit_past(ctx, max_ctx, exact_ok);
+        if (ctx < max_ctx) {
+          out->ctx_limit = placer.limit_past(ctx, max_ctx, exact_ok);
+          out->ctx_need_more = placer.need_more_for(max_ctx, out->ctx_limit, exact_ok);
+        }
         return true;
       }
     }
@@ -437,6 +495,8 @@ bool account(const flyx_backend_api* api, flyx_bmodel* bm, bool has_drafter, boo
   if (ledger->budget() && out->session_bytes > ledger->available()) {
     if (min_ctx > 0 && fit_gpu_only(api, bm, tiers, ledger->available(), max_ctx, min_ctx, fitted_ctx, out)) {
       out->ctx_limit = CtxLimit::kGpu;
+      const uint64_t room = ledger->available();
+      out->ctx_need_more = sb > room ? sb - room : 0;
       return true;
     }
     *err = format_oom_error(placer, mi, reserve, max_ctx, has_drafter, mostly_bf16, tiers_on);

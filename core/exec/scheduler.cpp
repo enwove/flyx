@@ -252,6 +252,7 @@ void Scheduler::publish_model() {
   m.ctx_short = engine_->ctx_short();
   m.sessions_room = engine_->budget().sessions_room;
   m.host_budget = engine_->host_budget();
+  m.ctx_need_more = engine_->budget().ctx_need_more;
   m.held = engine_->budget().held;
   telemetry_.loaded(m, engine_->ledger().used());
 }
