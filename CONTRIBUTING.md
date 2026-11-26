@@ -13,6 +13,7 @@ Read [AGENTS.md](AGENTS.md) first—it defines the directory layering boundaries
 # CUDA development build + full test suite
 cmake --preset dev && cmake --build --preset dev
 pip install -r tests/requirements.txt
+ctest --preset quick                     # while editing: unit, tiny and smoke tests (docs/testing.md section 2)
 ctest --preset dev --output-on-failure
 
 # CPU-only build (no GPU required)

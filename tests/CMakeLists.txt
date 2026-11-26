@@ -34,6 +34,80 @@
 #                        teacher-forced)
 #   python/convert/      the converter: configs and tokenizer pipelines it refuses, a post-processor's prefix; DV's
 #                        export and what is refused of it; a DV file's tensors are its sources' (check_dv_convert.py)
+#
+# Labels (docs/testing.md; the test presets in CMakePresets.json select by them).  Every test has one tier, what it
+# needs and so about what it costs:
+#   unit    no fixture, no model file: seconds        tiny    the tiny models (make_assets): seconds
+#   golden  a whole golden_test or gguf_e2e_test run  tools   a bench or tools script's own test (not the engine's)
+# and any of these aspects: gpu (a CUDA device: every test of the CUDA block below, and the ones above it that take
+# the CUDA backend too), gpu_serial (the device's free memory measured: runs alone), smoke (a golden or GPU test the
+# quick preset runs anyway), dv (DV's, not in production), server (starts flyx serve).  The registering functions
+# below label what they know; flyx_finish_test_labels() (each directory's end) gives a test without a tier one (tiny
+# with a fixture, else unit), adds quick (unit and tiny tests that need neither the GPU nor DV, and the smoke ones),
+# and refuses the configure where a test breaks these rules.  The labels it cannot infer are at this file's end.
+# Labels are only ever appended (set_property(TEST ... APPEND PROPERTY LABELS ...)): one set elsewhere stays.
+
+# After a directory's last test: the tier where none was given, quick, the GPU tests' resource group, the rules.
+function(flyx_finish_test_labels)
+  set(tier_labels unit tiny golden tools)
+  set(aspect_labels gpu gpu_serial smoke dv server)
+  get_property(tests DIRECTORY PROPERTY TESTS)
+  set(errors "")
+  foreach(t IN LISTS tests)
+    get_test_property(${t} LABELS labels)
+    if(NOT labels)
+      set(labels "")
+    endif()
+    list(REMOVE_DUPLICATES labels)
+    get_test_property(${t} FIXTURES_REQUIRED fixtures)
+    get_test_property(${t} RUN_SERIAL serial)
+    # DV's tests by their names (dv, _dv, dv31_, ...): llama_models reads a DV file too, but is the V-LoRA's.
+    if(t MATCHES "(^|_)dv([0-9_]|$)" AND NOT "dv" IN_LIST labels)
+      set_property(TEST ${t} APPEND PROPERTY LABELS dv)
+      list(APPEND labels dv)
+    endif()
+    set(tier ${labels})
+    list(FILTER tier INCLUDE REGEX "^(unit|tiny|golden|tools)$")
+    list(LENGTH tier n)
+    if(n EQUAL 0)
+      if(fixtures)
+        set(tier tiny)
+      else()
+        set(tier unit)
+      endif()
+      set_property(TEST ${t} APPEND PROPERTY LABELS ${tier})
+      list(APPEND labels ${tier})
+    elseif(n GREATER 1)
+      string(APPEND errors "  ${t}: tiers ${tier} (one only)\n")
+    endif()
+    foreach(l IN LISTS labels)
+      if(NOT l IN_LIST tier_labels AND NOT l IN_LIST aspect_labels)
+        string(APPEND errors "  ${t}: unknown label ${l} (the tiers: ${tier_labels}; the aspects: ${aspect_labels})\n")
+      endif()
+    endforeach()
+    if(serial AND NOT "gpu_serial" IN_LIST labels)
+      string(APPEND errors "  ${t}: RUN_SERIAL is for the tests measuring the device (flyx_add_golden_test SERIAL)\n")
+    endif()
+    if("gpu_serial" IN_LIST labels AND NOT "gpu" IN_LIST labels)
+      string(APPEND errors "  ${t}: gpu_serial outside a GPU test\n")
+    endif()
+    if("smoke" IN_LIST labels AND "dv" IN_LIST labels)
+      string(APPEND errors "  ${t}: smoke on a DV test (quick runs no DV)\n")
+    endif()
+    # A slot of the GPU (tests/gpu_resources.json, the presets' resourceSpecFile): CPU tests run beside the GPU's at
+    # any -j, the GPU's bounded on their own.  Without a resource spec (no preset) ctest ignores it.
+    if("gpu" IN_LIST labels)
+      set_property(TEST ${t} PROPERTY RESOURCE_GROUPS "gpus:1")
+    endif()
+    if("smoke" IN_LIST labels OR (tier MATCHES "^(unit|tiny)$" AND NOT "gpu" IN_LIST labels
+                                  AND NOT "dv" IN_LIST labels))
+      set_property(TEST ${t} APPEND PROPERTY LABELS quick)
+    endif()
+  endforeach()
+  if(errors)
+    message(FATAL_ERROR "test labels (tests/CMakeLists.txt, flyx_finish_test_labels):\n${errors}")
+  endif()
+endfunction()
 
 function(flyx_register_test name target)
   add_test(NAME ${name} COMMAND ${target} ${ARGN})
@@ -45,7 +119,7 @@ function(flyx_add_unit_test target source)
 endfunction()
 
 function(flyx_add_py_test name script)
-  cmake_parse_arguments(ARG "" "TIMEOUT;SKIP_RETURN_CODE" "ARGS;FIXTURES;ENVIRONMENT;PY_FLAGS" ${ARGN})
+  cmake_parse_arguments(ARG "" "TIMEOUT;SKIP_RETURN_CODE" "ARGS;FIXTURES;ENVIRONMENT;PY_FLAGS;LABELS" ${ARGN})
   add_test(NAME ${name} COMMAND ${Python3_EXECUTABLE} ${ARG_PY_FLAGS} ${script} ${ARG_ARGS})
   if(ARG_FIXTURES)
     set_tests_properties(${name} PROPERTIES FIXTURES_REQUIRED "${ARG_FIXTURES}")
@@ -59,10 +133,20 @@ function(flyx_add_py_test name script)
   if(ARG_ENVIRONMENT)
     set_tests_properties(${name} PROPERTIES ENVIRONMENT "${ARG_ENVIRONMENT}")
   endif()
+  set(labels ${ARG_LABELS})
+  if(script MATCHES "/bench/")
+    list(APPEND labels tools)  # a bench script's own test
+  endif()
+  if(script MATCHES "/apps/flyx-server/")
+    list(APPEND labels server)
+  endif()
+  if(labels)
+    set_property(TEST ${name} APPEND PROPERTY LABELS ${labels})
+  endif()
 endfunction()
 
 function(flyx_add_golden_test name)
-  cmake_parse_arguments(ARG "SERIAL" "ENV" "ARGS;FIXTURES" ${ARGN})
+  cmake_parse_arguments(ARG "SERIAL" "ENV" "ARGS;FIXTURES;LABELS" ${ARGN})
   add_test(NAME ${name} COMMAND golden_test ${ASSETS} ${ARG_ARGS})
   set(fixtures ${ARG_FIXTURES})
   if(NOT fixtures)
@@ -72,9 +156,12 @@ function(flyx_add_golden_test name)
   if(ARG_ENV)
     set_tests_properties(${name} PROPERTIES ENVIRONMENT "${ARG_ENV}")
   endif()
+  set(labels golden ${ARG_LABELS})
   if(ARG_SERIAL)
     set_tests_properties(${name} PROPERTIES RUN_SERIAL TRUE)
+    list(APPEND labels gpu_serial)
   endif()
+  set_property(TEST ${name} APPEND PROPERTY LABELS ${labels})
 endfunction()
 
 flyx_add_unit_test(tokenizer_test core/tokenizer/tokenizer_test.cpp)
@@ -417,6 +504,8 @@ set_tests_properties(tokenizer tokenizer_minicpm5 chat chat_qwen35 reply_grammar
                      scheduler_reassigned_prewarm scheduler_repeated_prewarm scheduler_marked_system session_host_budget generation_edges elastic_load capi
                      dv_trees dv_canvas dv_models llama_models PROPERTIES FIXTURES_REQUIRED assets)
 
+# The tests that need the GPU (label gpu): the ones below, and those above that take the CUDA backend too.
+get_property(flyx_cpu_tests DIRECTORY PROPERTY TESTS)
 if(TARGET flyx-cuda)
   add_executable(cuda_loader_test backends/cuda/loader_test.cpp ${CMAKE_SOURCE_DIR}/backends/cuda/backend.cpp)
   target_compile_definitions(cuda_loader_test PRIVATE FLYX_TEST_DEVICE_ALLOC)
@@ -557,6 +646,9 @@ if(TARGET flyx-cuda)
   # exits 1 when a timing's first round starts elsewhere (every one after the first did, each where the last ended).
   add_test(NAME tree_bench_context COMMAND tree_bench ${ASSETS}/tiny_llama.flyx --ctx-at 40 --widths 1,3,7 --rounds 4)
   set_tests_properties(tree_bench_context PROPERTIES FIXTURES_REQUIRED assets)
+  get_property(flyx_gpu_tests DIRECTORY PROPERTY TESTS)
+  list(REMOVE_ITEM flyx_gpu_tests ${flyx_cpu_tests})
+  set_property(TEST ${flyx_gpu_tests} residual_decision vision APPEND PROPERTY LABELS gpu)
 endif()
 
 # On Windows these programs read their files by UTF-8 paths as flyx does (a build tree under a user folder named in
@@ -568,3 +660,22 @@ foreach(t IN LISTS flyx_dir_targets)
     flyx_program(${t})
   endif()
 endforeach()
+
+# Labels flyx_finish_test_labels cannot infer (the registering functions give golden, gpu_serial, server and tools;
+# the CUDA block gpu).  smoke: the golden and GPU tests quick runs too, a few seconds each where they can be: the
+# second architecture against transformers (gate 3, from its .flyx and its GGUF file), and on the GPU every kernel
+# against float64 (gate 1), the tiny Qwen3.5 (MTP, DFlash2, sampling: gates 3 and 4), Qwen3 and Llama against
+# transformers, packed GGML blocks, Inkling-2 (fused == generic, DSpark == plain: gates 2 and 4) and the loader.
+set_property(TEST make_assets APPEND PROPERTY LABELS tiny)          # makes the tiny models (no fixture before it)
+set_property(TEST gguf_cpu_ref APPEND PROPERTY LABELS golden)       # gguf_e2e_test: the golden outputs from GGUF
+set_property(TEST golden_cpu_ref_qwen3 golden_cpu_ref_qwen3_gguf APPEND PROPERTY LABELS smoke)
+if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+  set_property(TEST quickstart_venv APPEND PROPERTY LABELS tools)   # tools/quickstart.sh's environment
+endif()
+if(TARGET flyx-cuda)
+  set_property(TEST gguf_cuda gguf_cuda_unfused gguf_cuda_pdl gguf_cuda_no_pdl APPEND PROPERTY LABELS golden)
+  set_property(TEST tree_bench_context APPEND PROPERTY LABELS tools)
+  set_property(TEST cuda_ops golden_cuda_pdl golden_cuda_qwen3 golden_cuda_llama golden_cuda_quant_q4_k inkling2_cuda
+                    cuda_loader elastic_load_cuda vision residual_decision APPEND PROPERTY LABELS smoke)
+endif()
+flyx_finish_test_labels()
