@@ -272,6 +272,8 @@ struct Launch {
 Scratch glu_inputs(const Scratch& s);
 // The scratch of a launch on the side stream: the same rows, the split kernel's sums and counters of its own.
 Scratch side_scratch(const Scratch& s);
+// Kernels launched with a stream alone as programmatic dependents (common/launch.h launch_pdl).
+void set_stream_pdl(bool on);
 
 // y[r, n] (=|+=) sum_k x[r, k] * W[n, k].  K % 8 == 0.  Chooses CUDA-core or tensor-core path by rows: 1..16 the
 // skinny kernel (gemm_rows where it does not fit, or with option row_gemms); more, the prefill kernels, or a round's

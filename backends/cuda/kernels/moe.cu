@@ -56,12 +56,13 @@ const MoeBlockOps* moe_block_ops(int dtype) {
 }
 
 // ---- moe_route & situ_rows ----------------------------------------------------------------
-__global__ void __launch_bounds__(kRouteThreads) k_moe_route(const float* __restrict__ logits,
+__global__ void __launch_bounds__(kRouteThreads) k_moe_route(const float* logits,
                                                              const float* __restrict__ bias, int E, int top_k,
                                                              int gating_sigmoid, int norm_weights, float norm_eps,
                                                              float route_scale, int* __restrict__ idx_out,
                                                              float* __restrict__ w_out) {
   pdl_trigger();
+  pdl_wait();
   const int r = blockIdx.x, tid = threadIdx.x;
   const float* lr = logits + size_t(r) * E;
   extern __shared__ float sh[];  // probs[E], sel[E]
@@ -267,9 +268,10 @@ __global__ void __launch_bounds__(256)
   }
 }
 
-__global__ void k_moe_weighted_sum(const float* __restrict__ down_buf, const float* __restrict__ ew, int top_k, int H,
-                                   float* __restrict__ out, int ld_out, int accumulate) {
+__global__ void k_moe_weighted_sum(const float* down_buf, const float* ew, int top_k, int H, float* out, int ld_out,
+                                   int accumulate) {
   pdl_trigger();
+  pdl_wait();
   const int n = blockIdx.x * blockDim.x + threadIdx.x;
   const int r = blockIdx.y;
   if (n >= H) return;
@@ -519,12 +521,12 @@ constexpr int kVecWarps = 4, kVecRows = 4;
 
 template <bool FUSE_ACT, bool IS_DOWN, int BMAX>
 __global__ void __launch_bounds__(32 * kVecWarps)
-    k_moe_nvfp4_vec(const float* __restrict__ x, int ldx, const uint8_t* __restrict__ Q,
-                    const uint8_t* __restrict__ S, const float* __restrict__ RS, int N_exp, int I_or_H, int K,
-                    const int* __restrict__ eidx, const MoeTask* __restrict__ tasks, const int* __restrict__ n_tasks,
-                    const int* __restrict__ pairs, int top_k, float situ_beta, float situ_linear_beta,
+    k_moe_nvfp4_vec(const float* x, int ldx, const uint8_t* __restrict__ Q, const uint8_t* __restrict__ S,
+                    const float* __restrict__ RS, int N_exp, int I_or_H, int K, const int* eidx, const MoeTask* tasks,
+                    const int* n_tasks, const int* pairs, int top_k, float situ_beta, float situ_linear_beta,
                     float* __restrict__ out, int ld_out) {
   pdl_trigger();
+  pdl_wait();  // x, the experts and the tasks: the kernels before
   int e, nb;
   int pid[BMAX];
   if constexpr (BMAX == 1) {
@@ -582,7 +584,7 @@ __global__ void __launch_bounds__(32 * kVecWarps)
       const float4* xp = reinterpret_cast<const float4*>(xr[b] + 16 * size_t(s));
 #pragma unroll
       for (int q = 0; q < 4; ++q) {
-        const float4 v = __ldg(xp + q);
+        const float4 v = xp[q];
         xv[4 * q] = v.x, xv[4 * q + 1] = v.y, xv[4 * q + 2] = v.z, xv[4 * q + 3] = v.w;
       }
 #pragma unroll
@@ -751,11 +753,11 @@ int launch_nvfp4_gu(const float* x, int ldx, const ExpertMat& W, const int* eidx
       const int gx = ceil_div(N_work, kVecWarps * (fuse_act ? kVecRows / 2 : kVecRows));
       if (rc == 1) {
         if (fuse_act)
-          k_moe_nvfp4_vec<true, false, 1><<<dim3(gx, top_k), 32 * kVecWarps, 0, st>>>(
+          launch_pdl(k_moe_nvfp4_vec<true, false, 1>, dim3(gx, top_k), dim3(32 * kVecWarps), 0, st, (const float*)
               xc, ldx, W.q, W.s, W.rs, W.N, I, K, ec, nullptr, nullptr, nullptr, top_k, situ_beta, situ_linear_beta,
               oc, ld_out);
         else
-          k_moe_nvfp4_vec<false, false, 1><<<dim3(gx, top_k), 32 * kVecWarps, 0, st>>>(
+          launch_pdl(k_moe_nvfp4_vec<false, false, 1>, dim3(gx, top_k), dim3(32 * kVecWarps), 0, st, (const float*)
               xc, ldx, W.q, W.s, W.rs, W.N, I, K, ec, nullptr, nullptr, nullptr, top_k, situ_beta, situ_linear_beta,
               oc, ld_out);
       } else {
@@ -764,11 +766,11 @@ int launch_nvfp4_gu(const float* x, int ldx, const ExpertMat& W, const int* eidx
         group_tasks(ec, M, W.n_experts, 4, sc, st);
         grouped = rc == rows ? 4 : 0;
         if (fuse_act)
-          k_moe_nvfp4_vec<true, false, 4><<<dim3(gx, mt), 32 * kVecWarps, 0, st>>>(
+          launch_pdl(k_moe_nvfp4_vec<true, false, 4>, dim3(gx, mt), dim3(32 * kVecWarps), 0, st, (const float*)
               xc, ldx, W.q, W.s, W.rs, W.N, I, K, ec, sc->tasks, sc->n_tasks, sc->pairs, top_k, situ_beta,
               situ_linear_beta, oc, ld_out);
         else
-          k_moe_nvfp4_vec<false, false, 4><<<dim3(gx, mt), 32 * kVecWarps, 0, st>>>(
+          launch_pdl(k_moe_nvfp4_vec<false, false, 4>, dim3(gx, mt), dim3(32 * kVecWarps), 0, st, (const float*)
               xc, ldx, W.q, W.s, W.rs, W.N, I, K, ec, sc->tasks, sc->n_tasks, sc->pairs, top_k, situ_beta,
               situ_linear_beta, oc, ld_out);
       }
@@ -838,18 +840,18 @@ void launch_nvfp4_down(const float* act, int ld_act, const ExpertMat& W, const i
     if (!act_bf16 && rc <= FLYX_MAX_ROWS && ld_act % 4 == 0 && moe_vec_rounds()) {
       const int gx = ceil_div(H, kVecWarps * kVecRows);
       if (rc == 1) {
-        k_moe_nvfp4_vec<false, true, 1><<<dim3(gx, top_k), 32 * kVecWarps, 0, st>>>(
+        launch_pdl(k_moe_nvfp4_vec<false, true, 1>, dim3(gx, top_k), dim3(32 * kVecWarps), 0, st, (const float*)
             ac, ld_act, W.q, W.s, W.rs, H, H, K, ec, nullptr, nullptr, nullptr, top_k, 0.f, 0.f, sc->down_buf, H);
       } else {
         const int mt = max_work_tiles(M, W.n_experts, 4);
         if (rc != rows || !tiles_serve(grouped, 4, rc)) group_tasks(ec, M, W.n_experts, 4, sc, st);
-        k_moe_nvfp4_vec<false, true, 4><<<dim3(gx, mt), 32 * kVecWarps, 0, st>>>(
+        launch_pdl(k_moe_nvfp4_vec<false, true, 4>, dim3(gx, mt), dim3(32 * kVecWarps), 0, st, (const float*)
             ac, ld_act, W.q, W.s, W.rs, H, H, K, ec, sc->tasks, sc->n_tasks, sc->pairs, top_k, 0.f, 0.f,
             sc->down_buf, H);
       }
-      k_moe_weighted_sum<<<dim3(ceil_div(H, 256), rc), 256, 0, st>>>(sc->down_buf, ew + size_t(r0) * top_k, top_k, H,
-                                                                     out + size_t(r0) * ld_out, ld_out,
-                                                                     int(accumulate));
+      launch_pdl(k_moe_weighted_sum, dim3(ceil_div(H, 256), rc), dim3(256), 0, st, (const float*)sc->down_buf,
+                 (const float*)(ew + size_t(r0) * top_k), top_k, H, out + size_t(r0) * ld_out, ld_out,
+                 int(accumulate));
       continue;
     }
     const bf16* bf_a = act_bf16;
@@ -1183,8 +1185,8 @@ void moe_route(const float* logits, const float* bias, int rows, int n_experts, 
   if (rows <= 0 || n_experts <= 0 || top_k <= 0 || top_k > n_experts || top_k > kRouteTop)
     throw std::runtime_error("moe_route: invalid dimensions");
   const size_t smem = size_t(2) * size_t(n_experts) * sizeof(float);
-  k_moe_route<<<rows, kRouteThreads, smem, st>>>(logits, bias, n_experts, top_k, int(gating_sigmoid), int(norm_weights),
-                                                 norm_eps, route_scale, idx_out, w_out);
+  launch_pdl(k_moe_route, dim3(rows), dim3(kRouteThreads), smem, st, logits, bias, n_experts, top_k,
+             int(gating_sigmoid), int(norm_weights), norm_eps, route_scale, idx_out, w_out);
 }
 
 void situ_rows(const float* gu, int ld_gu, int I, float beta, float linear_beta, float* out, int ld_out, int rows,

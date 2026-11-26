@@ -1207,6 +1207,7 @@ void build_seq(flyx_bmodel* m, int32_t max_ctx, flyx_seq* s) {
     CK(cudaStreamCreateWithFlags(&s->st, cudaStreamNonBlocking));
     create_side(&s->side);
     create_side(&s->expert_side);
+    set_stream_pdl(m->opt.kernels.pdl);
     if (dv) CK(cudaStreamCreateWithFlags(&s->dv.body, cudaStreamNonBlocking));
     s->dv.skip_noop = m->opt.dv_conditional;
     for (auto& e : s->ev) CK(cudaEventCreateWithFlags(&e, cudaEventDisableTiming));
