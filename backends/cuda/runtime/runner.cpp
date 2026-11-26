@@ -1,6 +1,7 @@
 // Copyright 2026 The flyx Authors. SPDX-License-Identifier: Apache-2.0
 // Prefill passes and rounds (graphs, the token ring), waiting for the device, rollback, checkpoints and their
 // snapshots in host memory.
+#include "backends/cuda/runtime/checked_size.h"
 #include <algorithm>
 #include <condition_variable>
 #include <cstddef>
@@ -102,32 +103,32 @@ void ensure_checkpoint_slot(flyx_seq* s, int c) {
   CK(cudaHostAlloc(&p, s->ckp_slot_bytes, cudaHostAllocDefault));
   s->host_allocs.push_back(p);
   auto* base = static_cast<unsigned char*>(p);
-  s->ckp_arena[c] = base;
   size_t off = 0;
   auto take_raw = [&](size_t bytes) -> void* {
-    const size_t aligned = (bytes + 255) / 256 * 256;
+    const size_t aligned = checkpoint_align(bytes);
     // checkpoint_slot_bytes counts what is taken here (the pinned budget's split and the dry sizing count it too)
-    if (off + aligned > s->ckp_slot_bytes) throw std::logic_error("a checkpoint's state past checkpoint_slot_bytes");
+    if (off > s->ckp_slot_bytes || aligned > s->ckp_slot_bytes - off)
+      throw std::logic_error("a checkpoint's state past checkpoint_slot_bytes");
     void* ptr = base + off;
     off += aligned;
     return ptr;
   };
   auto take = [&](size_t bytes) -> float* { return static_cast<float*>(take_raw(bytes)); };
   for (auto& g : s->gdn) {
-    g.ckp_S[c] = take(g.s_stride * sizeof(float));
-    g.ckp_win[c] = take(g.w_stride * sizeof(float));
+    g.ckp_S[c] = take(size_mul(g.s_stride, sizeof(float)));
+    g.ckp_win[c] = take(size_mul(g.w_stride, sizeof(float)));
   }
-  for (auto& sc : s->sconv) sc.ckp_win[c] = take(sc.w_stride * sizeof(float));
+  for (auto& sc : s->sconv) sc.ckp_win[c] = take(size_mul(sc.w_stride, sizeof(float)));
   for (size_t i = 0; i < s->kv.size(); ++i) {
     auto& kb = s->kv[i];
     if (!kb.swa_ring) continue;
     const KvSpec& ks = s->m->states.kv[i];
     const size_t elem = ks.fp8 ? 1 : sizeof(kv16);
-    const size_t bytes = size_t(kb.ring) * size_t(ks.nkv) * size_t(ks.hd) * elem;
+    const size_t bytes = size_mul(size_mul(size_mul(kb.ring, ks.nkv), ks.hd), elem);
     kb.ckp_k[c] = take_raw(bytes);
     kb.ckp_v[c] = take_raw(bytes);
     if (ks.fp8) {
-      const size_t sbytes = size_t(kb.ring) * size_t(ks.nkv) * sizeof(float);
+      const size_t sbytes = size_mul(size_mul(kb.ring, ks.nkv), sizeof(float));
       kb.ckp_ks[c] = take(sbytes);
       kb.ckp_vs[c] = take(sbytes);
     }
@@ -136,6 +137,7 @@ void ensure_checkpoint_slot(flyx_seq* s, int c) {
     s->ring_ckp[c] = take(size_t(w) * sizeof(float));
     std::memset(s->ring_ckp[c], 0, size_t(w) * sizeof(float));
   }
+  s->ckp_arena[c] = base;
 }
 
 void copy_checkpoint_state(flyx_seq* s, int c, int sl, int pos, bool save, bool snap = false) {

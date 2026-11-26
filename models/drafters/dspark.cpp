@@ -27,10 +27,13 @@ DSparkSpec parse_dspark_gguf(const ModelFile& file, const json& header, const Ta
   spec.companion = companion;
   flyx_dspark_block& d = spec.block;
   spec.layers = cm.count("block_count");
+  if (spec.layers > kMaxLayers) throw std::runtime_error("too many DSpark layers");
   d.hidden = cm.count("embedding_length");
   d.inter = cm.count("feed_forward_length");
   d.n_heads = cm.count("attention.head_count");
   d.n_kv = cm.count("attention.head_count_kv");
+  if (d.hidden != target.hidden || d.hidden > kMaxWidth || d.n_heads > kMaxHeads)
+    throw std::runtime_error("invalid DSpark drafter dimensions");
   if (!cm.has("attention.key_length") && d.hidden % d.n_heads)
     throw std::runtime_error("DSpark GGUF hidden size is not a whole number of heads");
   d.head_dim = cm.count_or("attention.key_length", d.hidden / d.n_heads);
@@ -50,7 +53,7 @@ DSparkSpec parse_dspark_gguf(const ModelFile& file, const json& header, const Ta
   spec.swa_pattern.assign(size_t(spec.layers), false);
   if (spec.swa_window > 0 && cm.has("attention.sliding_window_pattern")) {
     const auto& pat = cm.at("attention.sliding_window_pattern");
-    if (!pat.is_array() || int(pat.size()) != spec.layers)
+    if (!pat.is_array() || pat.size() != size_t(spec.layers))
       throw std::runtime_error("DSpark sliding_window_pattern does not match block_count");
     for (int i = 0; i < spec.layers; ++i) {
       if (!pat[size_t(i)].is_boolean())
@@ -61,6 +64,7 @@ DSparkSpec parse_dspark_gguf(const ModelFile& file, const json& header, const Ta
 
   const json& raw_taps = cm.at("target_layers");
   if (!raw_taps.is_array() || raw_taps.empty()) throw std::runtime_error("DSpark target_layers is missing or empty");
+  if (raw_taps.size() > size_t(INT_MAX / d.hidden)) throw std::runtime_error("DSpark tap width exceeds int32");
   for (const auto& item : raw_taps) {
     if (!item.is_number_integer()) throw std::runtime_error("DSpark target_layers must be integers");
     const int64_t t = item.get<int64_t>();
@@ -77,6 +81,7 @@ DSparkSpec parse_dspark_gguf(const ModelFile& file, const json& header, const Ta
     throw std::runtime_error("DSpark markov_w1.weight has " + std::to_string(w1_t->shape[0]) +
                              " rows, expected unpadded vocab " + std::to_string(target.vocab) +
                              " (use mainline DSpark GGUF)");
+  if (w1_t->shape[1] < 1 || w1_t->shape[1] > kMaxWidth) throw std::runtime_error("invalid DSpark Markov rank");
   d.markov_rank = int32_t(w1_t->shape[1]);
   d.vocab_out = target.vocab;
   if (d.block < 2 || d.block > FLYX_MAX_ROWS || d.markov_rank <= 0 || d.markov_rank > kMaxWidth ||

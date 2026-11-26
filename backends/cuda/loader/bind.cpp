@@ -851,14 +851,14 @@ void bind(flyx_bmodel* m, const flyx_model_desc& d, LoadTimes* times) {
     }
   }
   // Assign disjoint per-row tap offsets so multiple tap-consuming drafters (e.g. DSpark + DFlash2) can coexist.
-  int tap_off = 0;
+  int64_t tap_off = 0;  // kernel_limits checked the total before binding
   for (Block& blk : m->blocks) {
     if (auto* df = std::get_if<DFlashBlock>(&blk)) {
-      df->feats_offset = tap_off;
-      tap_off += df->n_taps * df->target_hidden;
+      df->feats_offset = int(tap_off);
+      tap_off += int64_t(df->n_taps) * df->target_hidden;
     } else if (auto* ds = std::get_if<DSparkBlock>(&blk)) {
-      ds->feats_offset = tap_off;
-      tap_off += ds->n_taps * m->hidden;
+      ds->feats_offset = int(tap_off);
+      tap_off += int64_t(ds->n_taps) * m->hidden;
     }
   }
   // FLYX_NODE_RES_MIX names a [hidden] vector by its weight index (Inkling-2's output_res_query), and no block

@@ -355,7 +355,7 @@ const char* kInkling2Template = R"jinja(
 enum class RoundMatrixCase { Generated, ExactBf16, OneLowBit };
 
 void write_tiny_inkling2(const std::filesystem::path& path, const TinySpec& c, bool mixed_quant, uint32_t seed_val,
-                         RoundMatrixCase round_case = RoundMatrixCase::Generated) {
+                         RoundMatrixCase round_case = RoundMatrixCase::Generated, uint32_t header_heads = 0) {
   std::mt19937 rng(seed_val);
   GgufWriter w;
   const std::string arch = "inkling2_loop";
@@ -366,7 +366,7 @@ void write_tiny_inkling2(const std::filesystem::path& path, const TinySpec& c, b
   w.add_u32(arch + ".embedding_length", uint32_t(c.H));
   w.add_u32(arch + ".vocab_size", uint32_t(c.vocab_padded));
   w.add_u32(arch + ".vocab_size_unpadded", uint32_t(c.vocab_unpadded));
-  w.add_u32(arch + ".attention.head_count", uint32_t(c.nh));
+  w.add_u32(arch + ".attention.head_count", header_heads ? header_heads : uint32_t(c.nh));
   w.add_u32(arch + ".attention.head_count_kv", uint32_t(c.nkv));
   w.add_u32(arch + ".attention.key_length", uint32_t(c.hd));
   w.add_u32(arch + ".attention.value_length", uint32_t(c.hd));
@@ -548,7 +548,7 @@ void write_tiny_inkling2(const std::filesystem::path& path, const TinySpec& c, b
 }
 
 void write_tiny_dspark(const std::filesystem::path& path, const TinySpec& c, bool packed_w1, uint32_t seed_val,
-                       int rank = 32) {
+                       int rank = 32, uint32_t header_heads = 0) {
   std::mt19937 rng(seed_val);
   GgufWriter w;
   const std::string arch = "dflash";
@@ -563,7 +563,7 @@ void write_tiny_dspark(const std::filesystem::path& path, const TinySpec& c, boo
   w.add_u32(arch + ".block_count", uint32_t(layers));
   w.add_u32(arch + ".embedding_length", uint32_t(c.H));
   w.add_u32(arch + ".feed_forward_length", uint32_t(c.inter));
-  w.add_u32(arch + ".attention.head_count", uint32_t(c.nh));
+  w.add_u32(arch + ".attention.head_count", header_heads ? header_heads : uint32_t(c.nh));
   w.add_u32(arch + ".attention.head_count_kv", uint32_t(c.nkv));
   w.add_u32(arch + ".attention.key_length", uint32_t(c.hd));
   w.add_u32(arch + ".block_size", uint32_t(block));
@@ -1189,6 +1189,25 @@ int main(int argc, char** argv) {
     write_tiny_dflash2_gguf(dflash2_q8, spec, true, /*padded_codebook=*/false, 6006, 32, spec.nh * 2);
     write_tiny_dflash2_dir(dflash2_dir, spec, 7007);
 
+    for (bool drafter : {false, true}) {
+      const auto bad = dir / (drafter ? "dspark_excess_heads.gguf" : "inkling_excess_heads.gguf");
+      EngineOptions opts{};
+      opts.backend = "cpu_ref";
+      if (drafter) {
+        write_tiny_dspark(bad, spec, false, 3003, 32, 1u << 27);
+        opts.drafter = "dspark";
+        opts.speculative = true;
+        opts.drafter_files = {bad.string()};
+      } else {
+        write_tiny_inkling2(bad, spec, false, 1001, RoundMatrixCase::Generated, 1u << 27);
+      }
+      Engine engine;
+      std::string why;
+      check(!engine.load((drafter ? bf16_gguf : bad).string(), opts, &why) &&
+                why.find(drafter ? "invalid DSpark drafter dimensions" : "invalid inkling2_loop GGUF configuration") !=
+                    std::string::npos,
+            "excessive attention head count rejected before forming weight dimensions");
+    }
     test_chat_and_format(bf16_gguf.string());
 
     std::vector<int32_t> prompt;

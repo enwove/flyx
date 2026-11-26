@@ -5,6 +5,7 @@
 #include "backends/cuda/regions/layers.h"
 
 #include <algorithm>
+#include <climits>
 
 namespace flyx::cuda {
 
@@ -108,10 +109,19 @@ bool supported(const flyx_bmodel* m, const Block& blk, std::string* why) {
 bool kernel_limits(const flyx_model_desc& d, std::string* why) {
   auto no = [&](const std::string& w) { return *why = w, false; };
   if (d.n_blocks < 0 || (d.n_blocks > 0 && !d.blocks)) return no("a model description without its blocks");
+  int64_t tap_stride = 0;
   long long pass0_pushes = 0;
   bool rel_attn = false;
   for (int i = 0; i < d.n_blocks; ++i) {
     const flyx_block& b = d.blocks[i];
+    if (b.kind == FLYX_BLOCK_DFLASH2 || b.kind == FLYX_BLOCK_DSPARK) {
+      const int taps = b.kind == FLYX_BLOCK_DFLASH2 ? b.dflash2.n_taps : b.dspark.n_taps;
+      if (d.hidden <= 0 || taps <= 0) return no("invalid drafter feature dimensions");
+      const int64_t width = int64_t(taps) * d.hidden;
+      if ((b.kind == FLYX_BLOCK_DFLASH2 && width > INT_MAX - 63) || width > INT_MAX - tap_stride)
+        return no("drafter feature width exceeds CUDA row dimensions");
+      tap_stride += width;
+    }
     if (b.kind == FLYX_BLOCK_MOE) {
       const flyx_moe_block& e = b.moe;
       if (e.top_k > kMoeRouteMaxTopK || e.n_experts > kMoeRouteMaxExperts)
@@ -123,6 +133,7 @@ bool kernel_limits(const flyx_model_desc& d, std::string* why) {
                   " taps, where the CUDA kernels take 2..64");
     } else if (b.kind == FLYX_BLOCK_REL_ATTN) {
       const flyx_rel_attn_block& r = b.rel_attn;
+      if (r.d_rel < 1 || r.d_rel > 1024) return no("CUDA relative attention width must be in 1..1024");
       rel_attn = true;
       if (r.res_push && r.loop_rank == 0) ++pass0_pushes;
       if (r.conv < 2 || r.conv > 64)
