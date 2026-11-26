@@ -1689,6 +1689,90 @@ int main(int argc, char** argv) {
         check(same_tokens(after_snap, want_from_261), "snapshot_load after SWA ring wraparound == fresh");
       }
 
+      // A rewind into a committed round after prefill passes appended past it: the passes move the position on and
+      // not the round, so the round is still a rollback source of the recurrent state (ShortConv); the SWA ring (128
+      // slots, window 8) holds the positions the row there reads only while the passes have not gone round it.
+      // Within the ring, the rewind is taken and the rounds after it are those of the same rewind without the passes;
+      // past it, the rewind is refused (0: the caller restores a checkpoint or prefills again), never a rollback that
+      // reads slots overwritten since.
+      {
+        auto e = load_engine(bf16_gguf.string(), "cuda", {.prefill_chunk = 32});
+        const auto* api = e->api();
+        const int vocab = e->model().desc().vocab;
+        flyx_gen_params gp{};
+        gp.top_p = 1.f;
+        const int P = int(prompt.size());
+        std::vector<int32_t> extra(240);
+        for (int i = 0; i < 240; ++i) extra[size_t(i)] = 7 + (i * 19) % 230;
+        // Prefill the prompt, three plain rounds (from positions P, P + 1 and P + 2), then `appended` tokens in passes
+        // of at most 32 and of `appends` calls; then the rewind to P + 2 with another anchor, and 8 rounds.
+        auto rewound = [&](int appended, int appends, int* rc) {
+          Session s(e.get());
+          std::string err;
+          if (!s.init(&err)) throw std::runtime_error(err);
+          flyx_round_result rr{};
+          std::vector<int32_t> got;
+          auto round = [&] {
+            if (api->launch(e->round_plan(0), s.seq(), &gp) || api->read(s.seq(), &rr))
+              throw std::runtime_error(api->last_error());
+            got.push_back(rr.tokens[0]);
+          };
+          if (api->prefill(e->prefill_plan(), s.seq(), prompt.data(), P, &gp) || api->read(s.seq(), &rr))
+            throw std::runtime_error(api->last_error());
+          got.push_back(rr.tokens[0]);
+          for (int i = 0; i < 3; ++i) round();
+          for (int a = 0, done = 0; a < appends; ++a)
+            for (const int end = appended * (a + 1) / appends; done < end;) {
+              const int n = std::min(32, end - done);
+              if (api->prefill(e->prefill_plan(), s.seq(), extra.data() + done, n, nullptr))
+                throw std::runtime_error(api->last_error());
+              done += n;
+            }
+          const int32_t anchor = (got[2] + 1) % vocab;
+          *rc = api->rewind(s.seq(), P + 2, anchor);
+          if (*rc != 1) return std::vector<int32_t>{};
+          got.clear();
+          for (int i = 0; i < 8; ++i) round();
+          return got;
+        };
+        int rc_none = -1, rc_within = -1, rc_past = -1;
+        const auto after_none = rewound(0, 1, &rc_none);
+        const auto after_within = rewound(8, 1, &rc_within);
+        (void)rewound(240, 2, &rc_past);
+        check(rc_none == 1 && rc_within == 1 && after_none.size() == 8 && same_tokens(after_within, after_none),
+              "a rewind into a round after 8 appended tokens (inside the SWA ring) is taken, its rounds those of the "
+              "rewind without them");
+        check(rc_past == 0,
+              "a rewind into a round after prefill passes went round the SWA ring (240 tokens in two appends) is "
+              "refused, not rolled back over overwritten slots (" + std::to_string(rc_past) + ")");
+
+        // The same through sessions, from plain and DSpark rounds: a reply, a long continuation of the conversation
+        // in two turns (prefill passes, no rounds of their own past the first token), then the conversation edited
+        // back inside the reply: the state the session brings it to (a checkpoint and a prefill, the rewind refused)
+        // continues as a fresh prefill of the edited prompt does.
+        for (Engine* eng : {cu_plain.get(), cu_dspark.get()}) {
+          const std::string tag = eng == cu_dspark.get() ? "DSpark" : "plain";
+          Session s(eng);
+          std::string err;
+          if (!s.init(&err)) throw std::runtime_error(err);
+          const auto reply = run_gen(s, prompt, 6, false);
+          std::vector<int32_t> convo = prompt;
+          convo.insert(convo.end(), reply.begin(), reply.end());
+          for (int turn = 0; turn < 2; ++turn) {
+            convo.insert(convo.end(), extra.begin() + 120 * turn, extra.begin() + 120 * (turn + 1));
+            (void)run_gen(s, convo, 1, false, {int32_t(convo.size())});
+          }
+          std::vector<int32_t> edit = prompt;
+          edit.insert(edit.end(), reply.begin(), reply.begin() + 3);
+          edit.push_back((reply[3] + 1) % vocab);
+          GenerateResult res;
+          const auto got = run_gen(s, edit, 12, false, {}, -1, &res);
+          check(same_tokens(got, fresh_gen(*cu_plain, edit, 12, false)),
+                tag + ": the conversation edited back into a reply after 240 appended tokens == a fresh prefill (" +
+                    std::to_string(res.usage.reused_tokens) + " of " + std::to_string(edit.size()) + " reused)");
+        }
+      }
+
       // Multi-sequence concurrent generation on one Engine (exercises launch_batch fallback + independent state).
       {
         std::vector<int32_t> prompt_b(16);

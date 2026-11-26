@@ -274,6 +274,7 @@ void reset_state(flyx_seq* s, int anchor) {
   for (auto& mt : s->meta) mt = {};
   s->rope_delta = 0;
   s->prev_pos3d_at = -1;
+  s->ring_hi = 0;  // the rings are written again from position 0, in order
   set_params(s, 0, anchor, 0);
 }
 
@@ -483,6 +484,7 @@ int prefill_ex(flyx_plan* p, flyx_seq* s, const flyx_prefill_input* in, const fl
     prefill_done(s->P, n, m->prefill_bufs.choice, sample_last, s->ring_dev, s->G, s->reply, s->st);
     CK(cudaEventRecord(m->prefill_ev, s->st));
     s->position += n;
+    s->ring_hi = std::max(s->ring_hi, s->position);
     if (sample_last) {
       copy_ring(s, false);
       ++s->seq_no;
@@ -490,6 +492,13 @@ int prefill_ex(flyx_plan* p, flyx_seq* s, const flyx_prefill_input* in, const fl
       s->pending.push_back({'P', 0});
     }
     s->update_write_hi();
+    // A pass moves the position on and not the round: the rounds before it stay rollback sources, their recurrent
+    // state (gated delta nets, ShortConvs) in their own slots and replay rows, which a pass leaves as they are.  The
+    // rings it writes do not keep the positions of those rounds once the passes have gone round (rewind_floor): a
+    // round all of whose positions are before the floor is no source any more.
+    const int rewind_from = s->rewind_floor();
+    for (auto& mt : s->meta)
+      if (mt.valid && mt.start + mt.rows < rewind_from) mt.valid = false;
     if (in->n_embeds > 0 || in->pos_3d || in->set_rope_delta) sync_stream(s);
     CK(cudaGetLastError());
     return 0;
@@ -1213,6 +1222,19 @@ void flyx_seq::forget_hot() {
     }
 }
 
+// A ring of `ring` slots keeps its first `sink` positions for good and the others in turn (KvRef::slot_of): of those,
+// the ring_hi - (ring - sink) latest.  The row at pos reads [pos - window + 1, pos], its own written by the round.
+int flyx_seq::rewind_floor() const {
+  long long first = 0;
+  for (size_t i = 0; i < kv.size(); ++i) {
+    const flyx::cuda::KvBuf& b = kv[i];
+    if (!b.swa_ring) continue;
+    const long long window = b.window > 0 ? b.window : m->states.kv[i].window;
+    first = std::max(first, (long long)ring_hi - (b.ring - b.sink) + window - 1);
+  }
+  return int(std::min<long long>(first, INT32_MAX));
+}
+
 // The rows of a round launched now: the first at the position the host last read or past it (the
 // rounds in flight move it on by at most their rows), the last at most their rows plus this round's further.
 int flyx_seq::strata_phase(int rows) const {
@@ -1835,6 +1857,8 @@ int read_result(flyx_seq* s, flyx_round_result* out) {
     if (out->seq_no != seq) return fail("ring entry out of order (" + std::to_string(out->seq_no) + ")");
     s->read_no = seq;
     char kind = s->pending.front().kind;
+    // A round writes its rows from the position it started at (its accepted ones, then the rest), stopped or not.
+    if (kind == 'R') s->ring_hi = std::max(s->ring_hi, out->position - out->n_tokens + s->pending.front().rows);
     s->pending.pop_front();
     if (kind == 'R' && out->n_tokens > 0) {
       s->drain_page_host(seq, out->position, out->n_tokens);
@@ -1925,6 +1949,9 @@ int rewind(flyx_seq* s, int32_t pos, int32_t anchor) {
       const int rsl = r % kGdnReplaySlots;
       const auto& mt = s->meta[sl];
       if (!mt.valid || pos < mt.start || pos > mt.start + mt.rows) continue;
+      // The round's recurrent state is there, but a ring no longer holds the window the row at pos reads (prefill
+      // passes since have gone round it): outside the rollback window, a checkpoint or a new prefill instead.
+      if (pos < s->rewind_floor()) break;
       const int rows = pos - mt.start;
       for (auto& g : s->gdn) {
         gdn_recur(g.S, g.s_stride, kSlotExplicit + sl, kSlotExplicit + to, g.replay, kSlotExplicit + rsl, s->P, nullptr,
@@ -1994,6 +2021,9 @@ int restore(flyx_seq* s, int32_t c, int32_t anchor) {
     for (auto& mt : s->meta) mt = {};
     s->rope_delta = s->ckp[c].rope_delta;
     s->prev_pos3d_at = -1;
+    // The rings as the checkpoint saved them, at most a pass past its position (which their headroom covers); the
+    // rounds rewinds go back to are those after it.
+    s->ring_hi = s->ckp[c].pos;
     set_params(s, s->ckp[c].pos, anchor, s->round);
     s->reload_page_ring(s->position);
     return s->position;
@@ -2237,6 +2267,7 @@ int snapshot_load(flyx_seq* s, const flyx_host_pieces* src, uint64_t bytes, int3
     for (auto& mt : s->meta) mt = {};
     s->rope_delta = h.rope_delta;
     s->prev_pos3d_at = -1;
+    s->ring_hi = h.pos;  // as restore: the rings the snapshot's checkpoint saved
     set_params(s, h.pos, anchor, s->round);
     sync_stream(s);  // the bytes are the caller's
     return s->position;

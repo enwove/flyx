@@ -711,6 +711,14 @@ struct flyx_seq {
     return total;
   }
   void update_write_hi() { write_hi.store(position + in_flight_rows(), std::memory_order_release); }
+  // One past the highest position a pass or a round read since has written to the caches kept in a ring of slots
+  // (KvBuf::swa_ring: the target's sliding-window layers, DSpark's), since a reset, restore or snapshot load set it to
+  // the position: such a ring holds [ring_hi - (ring - sink), ring_hi), the positions before that overwritten.
+  // Prefill passes advance it without a round, past what the rounds' rollback span keeps (rewind_floor).
+  int ring_hi = 0;
+  // The first position a rewind can return to: from there on, every ring still holds the window the row at that
+  // position reads ([pos - window + 1, pos)).  A rewind to before it is outside the rollback window.
+  int rewind_floor() const;
   double round_wait_us = 0;            // moving average of the waits for round results
   cudaEvent_t idle_ev = nullptr;       // recorded to wait for the stream without spinning
   cudaEvent_t ready_ev = nullptr;      // everything queued on the stream: a batch round waits for it (launch_batch)
