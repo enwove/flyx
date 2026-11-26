@@ -44,6 +44,9 @@ class WeightLoader {
   void finish();
 
   const flyx_tensor_view* t(int w) const;
+  // Whether a block's binding read weight w (anything the loader was asked for).  One that none read is a program
+  // node's (FLYX_NODE_RES_MIX names its vector by weight index).
+  bool asked(int w) const { return w >= 0 && size_t(w) < asked_.size() && asked_[size_t(w)]; }
   static size_t numel(const flyx_tensor_view* v);
   static bool numbers(const flyx_tensor_view* v);
 
@@ -59,6 +62,8 @@ class WeightLoader {
 
   // Whether a matrix stays packed: a GGML block type the kernels take (and option blocks is not bf16).
   bool packable(int w) const;
+  // Whether several 2D weights share format and activation rounding so lin_stack keeps them packed/NVFP4 together.
+  bool can_stack(const std::vector<int>& ws) const;
   // A packable matrix on the device as gemm_blocks reads it.
   BlockMat pack(int w, const RowOrder& order = {});
   // The same in host memory (host_alloc), for row gathers only: not shared through packs.
@@ -73,9 +78,15 @@ class WeightLoader {
   // Several linears with the same K stacked by rows (one GEMM computes them all; packed blocks: one GEMM per run
   // of neighbouring tensors of one block type, each run one matrix, on the shared input).
   Lin lin_stack(const std::vector<int>& ws, int* rows_out = nullptr, const std::vector<RowOrder>& orders = {});
+  // A 3D stacked MoE expert weight [E, N, K] (NVFP4 with optional per-expert scale2, packed GGML blocks, or bf16).
+  ExpertMat expert_mat(int w);
 
   std::vector<float> host_f32(int w) const;
-  float* vec(int w) { return vecs({w}); }
+  // A round's exact float32 values, sharing the row-major prefill matrix (or its slice) when bf16 holds them.
+  RoundWeight round_weight(int w, const bf16* prefill);
+  // A small control linear with exact float32 weights and activations in rounds for F32, F16 and F64 files.
+  Lin lin_f32(int w);
+  float* vec(int w);
   float* vecs(const std::vector<int>& ws);
   float* put(const std::vector<float>& values);
 
@@ -91,8 +102,13 @@ class WeightLoader {
   flyx_bmodel* m_ = nullptr;
   const flyx_weight* weights_ = nullptr;
   int n_weights_ = 0;
+  mutable std::vector<bool> asked_;          // t(w) was called
   std::unordered_map<int, bf16*> mats_;      // matrices uploaded once (a tied head is the embedding)
   std::unordered_map<int, BlockMat> packs_;  // block weights packed once
+  std::unordered_map<int, float*> vecs_;     // 1D/small float vectors uploaded once (shared across loop passes)
+  std::unordered_map<int, RoundWeight> round_weights_;  // one decision and upload across all loop passes
+  std::map<std::vector<int>, Lin> lins_;     // stacked/single linears uploaded once (shared across loop passes)
+  std::unordered_map<int, ExpertMat> experts_;  // 3D expert tensors uploaded once (shared across loop passes)
   std::unique_ptr<LoadStaging> staging_;
   std::unique_ptr<RowPool> pool_;            // destroyed before staging_ if unwinding without finish()
   LoadTimes times_{};

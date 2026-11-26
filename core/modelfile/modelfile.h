@@ -86,7 +86,7 @@ struct GgufPeek {
   bool valid = false;
   std::string arch;    // general.architecture ("dflash": a drafter alone)
   int mtp_layers = 0;  // <arch>.nextn_predict_layers, 0 if absent
-  bool has_markov_context = false;  // dflash.has_markov_context (DSpark)
+  bool has_markov_context = false;  // dflash.has_markov_context (DSpark vs DFlash2)
 };
 std::string gguf_header_path(const std::string& path);  // shard 1 for a split GGUF
 GgufPeek gguf_peek(const std::string& path);

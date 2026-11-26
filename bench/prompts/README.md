@@ -26,6 +26,8 @@ thinking off):
 | File | Bytes | Prompts | MD5 | Purpose |
 |---|---:|---:|---|---|
 | `chat_short.jsonl` | 2,197 | 24 | `abd29de8b71aa54b54b3f3a6f611d768` | Short chat requests unlike GSM8K (code, explanations, stories, poems, a translation, an email, lists): where a drafter trained on math answers drafts little |
+| `code_short.jsonl` | 1,151 | 8 | `777d118bfb91ceb04cc5a5149731851a` | Short coding requests (a function with tests, JSON, SQL, a class, a shell script: structured text a drafter's long runs show on) |
+| `inkling2_think8.jsonl` | 1,948 | 8 | `fb3614397ed4cc530d4b8f5c53a96cf5` | Eight questions with thinking on, as Inkling-2 token ids (`{"ids": ...}`: its chat template's thinking prompt, rendered) |
 
 `dv_sets.py` writes the sets DV's per-round choice was tuned on from GSM8K's test split (`gsm8k_test.jsonl`, not
 kept here: the public `openai/gsm8k`, config `main`, split `test`, one `{"question", "answer"}` object a line in the

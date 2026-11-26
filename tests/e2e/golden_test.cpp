@@ -4051,6 +4051,44 @@ int main(int argc, char** argv) {
       }
     }
 
+    // A request that goes on past the end of its reply (ignore_eos: a measurement's fixed number of tokens) under a
+    // grammar.  The grammar holds the reply to its end, the stop token it ends with included, and nothing after
+    // it: the matcher has ended there and is not asked about the tokens that follow, nor for a mask where every
+    // round's first token is masked (the reference).  With and without drafts.
+    {
+      const std::string tag = R"({"type": "structural_tag", "format": {"type": "const_string", "value": "a"}})";
+      auto run = [&](Engine* e, bool reference = false) {
+        std::string gerr;
+        auto m = e->grammar().matcher(tag, &gerr);
+        std::vector<int32_t> toks;
+        if (!m) {
+          check(false, "grammar compiles: " + gerr);
+          return toks;
+        }
+        GenerateRequest rq;
+        rq.prompt = prompt;
+        rq.max_new_tokens = 24;
+        rq.ignore_eos = true;
+        rq.grammar = m.get();
+        rq.grammar_reference = reference;
+        Session s(e);
+        init_checked(s);
+        GenerateResult res;
+        if (generate(s, rq, [&](std::string_view, const int32_t* t, int nt) {
+              toks.insert(toks.end(), t, t + nt);
+              return true;
+            }, &res, &err) != 0)
+          check(false, "generate past a grammar's end: " + err);
+        return toks;
+      };
+      const auto a = run(plain.get()), b = run(spec.get()), m = run(mtp.get()), ref = run(plain.get(), true);
+      const auto& eos = plain->eos();
+      check(a.size() == 24 && plain->tokenizer().token_bytes(a[0]) == "a" &&
+                std::find(eos.begin(), eos.end(), a[1]) != eos.end() && b == a && m == a && ref == a,
+            "grammar, past the reply's end (ignore_eos): the reply, its stop token, then tokens nothing holds; "
+            "plain, DFlash2, MTP and every round masked: " + str(a, 6));
+    }
+
     // Drafts looked up in the sequence itself: text that
     // recurs makes rounds take their drafts from where it appeared before;
     // its rounds verify them with no drafter run, up to 15 at once.  MTP,

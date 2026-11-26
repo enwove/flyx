@@ -571,9 +571,10 @@ int cmd_bench_prompts(const Args& a) {
 
   auto e = load(a);
   const int max_new = a.n_given ? a.n : kPromptSetMaxNew;
-  // The prompts as tokens (a fresh session's: no history to continue), each one the engine can run.  A prompt set
-  // names no tools, so no reply grammar outlives its PreparedRequest.
-  std::vector<GenerateRequest> gens;
+  // The prompts as tokens (a fresh session's: no history to continue), each one the engine can run.  Each stays with
+  // its PreparedRequest, which owns the reply grammar its GenerateRequest points to: a chat without thinking has one
+  // where only a grammar keeps the thinking out (Inkling-2's format).
+  std::vector<PreparedRequest> prepared(set.size());
   {
     Session fresh(e.get());
     for (size_t i = 0; i < set.size(); ++i) {
@@ -582,12 +583,10 @@ int cmd_bench_prompts(const Args& a) {
       rq.gen.ignore_eos = a.ignore_eos;
       rq.gen.sampling = a.sampling;
       RenderedChat rc;
-      PreparedRequest pr;
       std::string err;
       if (!render_request(e->chat(), e->tokenizer(), rq, &rc, &err, false) ||
-          !prepare_request(*e, fresh, rq, rc, &pr, &err) || !prompt_runs(*e, pr.gen.prompt, &err))
+          !prepare_request(*e, fresh, rq, rc, &prepared[i], &err) || !prompt_runs(*e, prepared[i].gen.prompt, &err))
         return std::fprintf(stderr, "error: %s line %d: %s\n", a.prompts.c_str(), line_of[i], err.c_str()), 1;
-      gens.push_back(pr.gen);
     }
   }
   std::vector<std::string> round_names;
@@ -650,7 +649,9 @@ int cmd_bench_prompts(const Args& a) {
     text += " ]\n}\n";
     return write_record(text, a, out) && error.empty() ? 0 : 1;
   };
-  for (size_t i = 0; i < gens.size(); ++i) {
+  for (size_t i = 0; i < prepared.size(); ++i) {
+    const PreparedRequest ran = std::move(prepared[i]);  // its grammar's state goes with it once the prompt has run
+    const GenerateRequest& gen = ran.gen;
     std::string err;
     Session s(e.get());
     // The reply's tokens as they are shown (no stop strings here: all of them), then the end token that ended it.
@@ -664,7 +665,7 @@ int cmd_bench_prompts(const Args& a) {
     s.trace = &trace;
     s.trace_rounds = &which;
     GenerateResult res;
-    if (!s.init(&err) || generate(s, gens[i], sink, &res, &err) != 0) {
+    if (!s.init(&err) || generate(s, gen, sink, &res, &err) != 0) {
       const std::string error = a.prompts + " line " + std::to_string(line_of[i]) + ": " + err;
       std::fprintf(stderr, "error: %s\n", error.c_str());
       return finish(error);
@@ -686,7 +687,7 @@ int cmd_bench_prompts(const Args& a) {
     std::fprintf(stderr,
                  "%4zu/%zu | prompt %3d tok | prefill %6.1f ms | %3d tok %7.1f ms = %6.1f tok/s | %.2f tok/round "
                  "| %s\n",
-                 i + 1, gens.size(), u.prompt_tokens, u.prefill_ms, u.new_tokens, u.decode_ms,
+                 i + 1, prepared.size(), u.prompt_tokens, u.prefill_ms, u.new_tokens, u.decode_ms,
                  u.decode_ms > 0 ? (u.new_tokens - 1) * 1000.0 / u.decode_ms : 0,
                  u.rounds ? double(u.new_tokens - 1) / u.rounds : 0, finish_reason);
     tok += u.new_tokens - 1;
@@ -705,7 +706,7 @@ int cmd_bench_prompts(const Args& a) {
                                    {"round_accepted", res.round_accepted},
                                    {"lookup_rounds", res.lookup_rounds},
                                    {"finish", finish_reason},
-                                   {"prompt_ids", gens[i].prompt},
+                                   {"prompt_ids", gen.prompt},
                                    {"ids", ids},
                                    {"trace", steps}}
                         .dump());

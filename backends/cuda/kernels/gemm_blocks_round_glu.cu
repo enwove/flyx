@@ -46,8 +46,8 @@ GluFn glu_of(int dtype) {
 }  // namespace
 
 bool round_glu(int cfg, const BlockMat& W, int K, float* y, int ldy, int rows, bool accumulate, const Launch& L) {
-  const GluFn launch = glu_of<FQ4_0, FQ4_1, FQ5_0, FQ5_1, FQ8_0, FQ2_K, FQ3_K, FQ4_K, FQ5_K, FQ6_K, FIQ1_S, FIQ1_M,
-                              FIQ2_XXS, FIQ2_XS, FIQ2_S, FIQ3_XXS, FIQ3_S, FIQ4_NL, FIQ4_XS>(W.dtype);
+  const GluFn launch = glu_of<FQ4_0, FQ4_1, FQ5_0, FQ5_1, FQ8_0, FMXFP4, FQ2_0, FQ2_K, FQ3_K, FQ4_K, FQ5_K, FQ6_K,
+                              FIQ1_S, FIQ1_M, FIQ2_XXS, FIQ2_XS, FIQ2_S, FIQ3_XXS, FIQ3_S, FIQ4_NL, FIQ4_XS>(W.dtype);
   if (!launch) {
     std::fprintf(stderr, "flyx-cuda: a round's SwiGLU on dtype %d, not a GGML block type\n", W.dtype);
     std::abort();

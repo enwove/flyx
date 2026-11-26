@@ -146,6 +146,9 @@ bool Generation::start() {
   // checkpoint at a message boundary keeps the boundary before it.
   const int align = e_->prefill_align();
   for (int32_t at : req_.checkpoints) {
+    // A boundary at the prompt's very end: a template that opens the reply with nothing of its own (Inkling-2's), so
+    // that the conversation ends where the prompt does.  No pass is cut there; prefill() keeps the last pass's start.
+    if (at == n_) ends_at_boundary_ = true;
     at = at / align * align;
     if (at > reused && at < n_ && !vision::inside_media_span(req_.media_spans, at)) cuts_.push_back(at);
   }
@@ -202,10 +205,15 @@ bool Generation::prefill() {
       anchor = Session::Anchor::Prefix;
   }
   // An identical follow-up must run its last token to choose its own first output. If the end checkpoint
-  // would include that token, keep the preceding prefill pass boundary. Before the first pass, the reused
+  // would include that token, keep the preceding prefill pass boundary: for a prompt only prefilled, and for one whose
+  // conversation ends where it does (ends_at_boundary_), which has no boundary before its end for the same prompt
+  // asked again (a retry, another sample) to start from; that request computed its whole prompt once the reply had
+  // left the rollback window (6,303 tokens on Inkling-2-Mini: 2.9 s). It now runs this last pass again, the rows that
+  // ran here, so its first token is computed as this one's was. Before the first pass, the reused
   // state can come directly from decode and must not become a restorable prefill checkpoint.
   const bool last = end == n_;
-  const bool before_last = req_.prefill_only && last && n_ % align == 0 && pos_ > result_.usage.reused_tokens;
+  const bool before_last = (req_.prefill_only || ends_at_boundary_) && last && n_ % align == 0 &&
+                           pos_ > result_.usage.reused_tokens;
   if (checkpoint_due_ || anchor != Session::Anchor::None || before_last) {
     if (!vision::inside_media_span(req_.media_spans, pos_)) {
       s_->advanced(prompt, pos_, media);
@@ -296,7 +304,10 @@ bool Generation::prefill() {
     due_keep_ = (crossed >= 0 ? crossed : pos_) == keep_;
     return true;
   }
-  end_keep_ = crossed >= 0 && crossed == keep_;
+  // The question's checkpoint, kept through the tool calls that follow it, is the one taken at the prompt's end where
+  // the last pass crossed the question's end, or where the question ends with the prompt (no generation prompt after
+  // it: the next question's prompt differs from this conversation right there).
+  end_keep_ = (crossed >= 0 && crossed == keep_) || keep_ == n_;
   s_->advanced(prompt, n_, media);
   g_.mask = nullptr;  // rounds run unmasked unless a token has to be chosen again
   phase_ = Phase::kFinishPrefill;
@@ -304,9 +315,18 @@ bool Generation::prefill() {
 }
 
 int Generation::rejected(const flyx_round_result& r) {
-  if (!req_.grammar || finish_) return -1;
-  for (int i = 0; i < r.n_tokens; ++i)
+  if (!req_.grammar || finish_ || grammar_over_) return -1;
+  for (int i = 0; i < r.n_tokens; ++i) {
     if (!req_.grammar->accept(r.tokens[i])) return i;
+    // A stop token the request goes on past (ignore_eos: a measurement's fixed number of tokens) is where the reply
+    // the grammar holds ends.  What follows is no reply's, so nothing holds it; the matcher, which has ended, is not
+    // asked again (it takes no token after a stop token, and has no mask to give).
+    const std::vector<int32_t>& eos = e_->eos();
+    if (req_.ignore_eos && std::find(eos.begin(), eos.end(), r.tokens[i]) != eos.end()) {
+      grammar_over_ = true;
+      return -1;
+    }
+  }
   return -1;
 }
 
@@ -401,6 +421,8 @@ bool Generation::finish_prefill() {
 
 void Generation::prepare_round(const RoundChoice& round, bool masked, flyx_gen_params* params, flyx_plan** plan) {
   *params = g_;
+  // No mask once the reply the grammar holds has ended (rejected()): its matcher has none to give.
+  masked = masked && !grammar_over_;
   if (masked) {
     req_.grammar->allowed(mask_.data());
     params->mask = mask_.data();
@@ -433,6 +455,7 @@ bool Generation::launch(const RoundChoice& round, bool masked) {
     return false;
   }
   launched_[in_flight_++] = round;
+  result_.adaptive_rounds += params.stop_policy != nullptr;  // as launched(): the adaptive plan's rounds
   return true;
 }
 

@@ -320,6 +320,23 @@ int main(int argc, char** argv) {
     check(!loads(t, &err), "added tokens that are not JSON");
   }
 
+  // Inkling-2 (GPT-4o / o200k) pre-tokenizer splits: camelCase, contractions, 1..3 digit chunks, punctuation + /.
+  {
+    auto split = [](std::string_view s) { return Tokenizer::pretokenize(s, Pretokenizer::kInkling2); };
+    check(split("HelloWorld's 12345") == std::vector<std::string>({"Hello", "World's", " ", "123", "45"}),
+          "inkling2 pretokenizer: camelCase + contraction + 3-digit numbers");
+    check(split("HTTP_Server don't\n/foo") == std::vector<std::string>({"HTTP", "_Server", " don't", "\n", "/foo"}),
+          "inkling2 pretokenizer: acronym + underscore + contraction + newline + slash");
+    check(split("HTTPServer") == std::vector<std::string>({"HTTPServer"}),
+          "inkling2 pretokenizer: upper run followed by lower stays one piece");
+    check(split("!!!\n/a") == std::vector<std::string>({"!!!\n/", "a"}),
+          "inkling2 pretokenizer: punctuation consumes trailing newline and slash");
+    check(split("你好World 42") == std::vector<std::string>({"你好World", " ", "42"}),
+          "inkling2 pretokenizer: CJK (Lo) + TitleCase stays one U*L+ piece");
+    check(split("你好ABC") == std::vector<std::string>({"你好", "ABC"}),
+          "inkling2 pretokenizer: CJK (Lo) followed by uppercase backtracks U*L+ before Lu");
+  }
+
   std::printf(failures ? "%d checks failed\n" : "%d texts as the rule gives them\n", failures ? failures : texts);
   return failures ? 1 : 0;
 }

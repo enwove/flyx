@@ -636,7 +636,8 @@ class EarleyParser {
    * \brief Scan a token edge: check if token_id matches any kToken or kExcludeToken edge from
    * state.
    */
-  void ScanAtomicToken(const ParserState& state, int32_t token_id);
+  // flyx: explicit_only leaves out the exclude-token edges (README.flyx.md).
+  void ScanAtomicToken(const ParserState& state, int32_t token_id, bool explicit_only);
 
   /*!
    * \brief Advance the parser by accepting a whole token via kToken/kExcludeToken edges.
@@ -644,7 +645,10 @@ class EarleyParser {
    * \param debug_print Whether to print debug info.
    * \return True if any state advanced, false otherwise.
    */
-  bool AdvanceAtomicToken(int32_t token_id, bool debug_print = false, int32_t token_char_count = 0);
+  bool AdvanceAtomicToken(
+      int32_t token_id, bool debug_print = false, int32_t token_char_count = 0,
+      bool explicit_only = false
+  );
 
   /*!
    * \brief Find the latest of the last num_rows rows (row i holds the states after the first i

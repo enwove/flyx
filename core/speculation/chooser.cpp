@@ -126,26 +126,42 @@ void RoundChooser::candidates(const std::vector<int32_t>& tokens, int in_flight,
   size_t pref = static_cast<size_t>(spec_.preview(context_, FLYX_MAX_ROWS - 1, true, &forced, &untried));
   bool widened = false;
   if (!forced && run_drafter_ >= 0 && (*drafters_)[pref] == run_drafter_ &&
-      (runs_pay() || run_skips_ >= kRunProbe)) {  // a run: one width wider than its round
+      (runs_pay() || run_skips_ >= kRunProbe)) {  // a run: one width wider than its round (or hold max widened width)
     size_t wider = pref;
     for (size_t i = 0; i < widths_->size(); ++i)
       if ((*drafters_)[i] == run_drafter_ && !spec_.is_tree(i) && (*widths_)[i] > run_width_ &&
           (wider == pref || (*widths_)[i] < (*widths_)[wider]) && (*widths_)[i] > (*widths_)[pref])
         wider = i;
+    if (wider == pref && run_width_ > (*widths_)[pref]) {
+      for (size_t i = 0; i < widths_->size(); ++i)
+        if ((*drafters_)[i] == run_drafter_ && !spec_.is_tree(i) && (*widths_)[i] == run_width_) {
+          wider = i;
+          break;
+        }
+    }
     widened = wider != pref;
     pref = wider;
   }
   const int pref_drafter = (*drafters_)[pref];
   // An intra-round stopping plan (adaptive) for a model drafter's chains; never DV's, whose rounds are trees and its
   // warm-up, and whose canvas follows its own rounds (keeps_state).  A run widened past what the drafter's adaptive
-  // round reaches keeps its fixed width.
-  const bool past_adaptive = widened && pref_drafter >= 0 && size_t(pref_drafter) < stoppers_.size() &&
+  // round reaches (e.g., a stretched DFlash2 width past its trained block) keeps its fixed width while the run holds.
+  const bool in_wide_run =
+      widened || (!forced && run_drafter_ >= 0 && run_drafter_ == pref_drafter &&
+                  size_t(pref_drafter) < stoppers_.size() && run_width_ > stoppers_[size_t(pref_drafter)].max_width());
+  const bool past_adaptive = in_wide_run && pref_drafter >= 0 && size_t(pref_drafter) < stoppers_.size() &&
                              (*widths_)[pref] > stoppers_[size_t(pref_drafter)].max_width();
   const bool use_adaptive = adaptive_on_ && pref_drafter >= 0 && !spec_.is_tree(pref) && !spec_.keeps_state(pref) &&
                             stop_policy(pref_drafter) != nullptr && !past_adaptive;
   if (use_adaptive) {
-    out->push_back({{false, pref, stoppers_[size_t(pref_drafter)].max_width(), pref_drafter, true},
-                    spec_.round_tokens(pref), spec_.cost(pref, context_), false, true});
+    // Scored as the widest plan it reaches where the controller prefers a wider one: it verifies no more drafts.
+    const int reach = stoppers_[size_t(pref_drafter)].max_width();
+    size_t scored = pref;
+    if ((*widths_)[pref] > reach)
+      for (size_t i = 0; i < widths_->size(); ++i)
+        if ((*drafters_)[i] == pref_drafter && (*widths_)[i] == reach && !spec_.is_tree(i)) scored = i;
+    out->push_back({{false, pref, reach, pref_drafter, true}, spec_.round_tokens(scored), spec_.cost(scored, context_),
+                    false, true});
     // Still offer the fixed preferred width as batchable so concurrent scheduling can batch cleanly.
     out->push_back({{false, pref, (*widths_)[pref], pref_drafter, false}, spec_.round_tokens(pref),
                     spec_.cost(pref, context_), true, false});
@@ -246,16 +262,22 @@ void RoundChooser::result(const RoundChoice& round, bool emitted, int accepted, 
           }
       }
       spec_.observe(obs_index, accepted, trunk_accepted);  // the drafter's acceptance only
+      // A fixed round's tokens are credited at its own plan's cost, at the context it ran at (tokens holds its own
+      // already): its width may lie past the stopper's checkpoints.
       if (!spec_.is_tree(round.index) && round.drafter >= 0 && size_t(round.drafter) < stoppers_.size() &&
-          stoppers_[size_t(round.drafter)].ready())
-        stoppers_[size_t(round.drafter)].observe(eff_w, accepted, draft_prob, draft_margin);
+          stoppers_[size_t(round.drafter)].ready()) {
+        const int ran_at = std::max(0, static_cast<int>(tokens.size()) - (accepted + 1));
+        stoppers_[size_t(round.drafter)].observe(eff_w, accepted, draft_prob, draft_margin,
+                                                 round.adaptive ? 0.0 : spec_.cost(round.index, ran_at));
+      }
     }
     // The runs are a model drafter's chains (DFlash2's block): no tree's, and none of DV, whose canvas follows its
-    // own rounds.
-    const bool chains = !round.lookup && !round.adaptive && !spec_.is_tree(round.index) && round.drafter >= 0 &&
+    // own rounds.  An adaptive round whose chosen checkpoint reaches kRunWidth can also trigger run widening.
+    const bool chains = !round.lookup && !spec_.is_tree(round.index) && round.drafter >= 0 &&
                         !spec_.keeps_state(round.index);
+    const int eff_w = round.adaptive && actual_width > 0 ? actual_width : round.width;
     const int at = static_cast<int>(tokens.size());
-    if (chains && round.width > kRunWidth) {  // a wider round against the narrow one
+    if (chains && !round.adaptive && round.width > kRunWidth) {  // a wider round against the narrow one
       double alt_cost = 0;
       for (size_t i = 0; i < widths_->size(); ++i)
         if ((*drafters_)[i] == round.drafter && !spec_.is_tree(i) && (*widths_)[i] <= kRunWidth)
@@ -268,10 +290,10 @@ void RoundChooser::result(const RoundChoice& round, bool emitted, int accepted, 
       }
       run_skips_ = 0;
     }
-    const bool run = chains && round.width >= kRunWidth && accepted >= round.width - 1;
-    if (run && round.width == kRunWidth && !runs_pay()) ++run_skips_;  // a run not widened (it did not pay)
+    const bool run = chains && eff_w >= kRunWidth && accepted >= eff_w - 1;
+    if (run && eff_w == kRunWidth && !runs_pay()) ++run_skips_;  // a run not widened (it did not pay)
     run_drafter_ = run ? round.drafter : -1;
-    run_width_ = run ? round.width : 0;
+    run_width_ = run ? eff_w : 0;
   }
   // Text that also appears earlier: launch nothing more until the round
   // ahead is read, then draft by lookup from where it ends.

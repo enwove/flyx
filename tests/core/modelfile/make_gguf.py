@@ -490,7 +490,10 @@ def dflash2_ggufs(out: Path):
     tiny_draft*.gguf: tiny.flyx's drafter in BF16, with a sliding window, in Q8_0, and with the types mixed as a
       Q4_K_M file mixes them (the stacked q|k|v and context k|v of more than one type);
     tiny_qwen3_draft.gguf, tiny_llama_draft.gguf: random drafters for the tiny Qwen3 and the tiny Llama;
-    tiny_draft_refused_*.gguf: tiny.flyx's drafter saying what the engine does not run."""
+    tiny_draft_softcap.gguf, tiny_draft_last_layer.gguf: tiny.flyx's drafter with a soft cap on its selector's
+      logits, and reading the model's final hidden state;
+    tiny_draft_refused_*.gguf: tiny.flyx's drafter saying what the engine does not run (a DSpark drafter's Markov
+      context: not beside a dense model)."""
     types = gguf.GGMLQuantizationType
     export_dflash2_gguf(out / "tiny_draft.flyx", out / "tiny_draft.gguf")
     with Reader(str(out / "tiny_draft_window.flyx")) as r:
@@ -510,9 +513,11 @@ def dflash2_ggufs(out: Path):
         "dspark": {"extra": [("dflash.has_markov_context", True)]},
         "anchor": {"extra": [("dflash.sample_from_anchor", True)]},
         "confidence": {"extra": [("dflash.has_confidence_head", True)]},
-        "softcap": {"extra": [("dflash.final_logit_softcapping", 30.0)]},
-        "last_layer": {"taps": d["taps"][:-1] + [d["target"]["layers"]]},
     }
+    export_dflash2_gguf(out / "tiny_draft.flyx", out / "tiny_draft_softcap.gguf",
+                        extra=[("dflash.final_logit_softcapping", 30.0)])
+    export_dflash2_gguf(out / "tiny_draft.flyx", out / "tiny_draft_last_layer.gguf",
+                        taps=d["taps"][:-1] + [d["target"]["layers"]])
     for name, keys in refused.items():
         export_dflash2_gguf(out / "tiny_draft.flyx", out / f"tiny_draft_refused_{name}.gguf", **keys)
     export_dflash2_gguf(out / "tiny_draft_window.flyx", out / "tiny_draft_refused_pattern.gguf",

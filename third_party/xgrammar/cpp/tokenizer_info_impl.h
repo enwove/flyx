@@ -24,7 +24,8 @@ class TokenizerInfo::Impl {
       VocabType vocab_type,
       std::optional<int> vocab_size,
       std::optional<std::vector<int32_t>> stop_token_ids,
-      bool add_prefix_space
+      bool add_prefix_space,
+      const std::vector<int32_t>& atomic_token_ids
   );
 
   VocabType GetVocabType() const { return vocab_type_; }
@@ -33,6 +34,9 @@ class TokenizerInfo::Impl {
   const std::vector<std::string>& GetDecodedVocab() { return decoded_vocab_; }
   const std::vector<int32_t>& GetStopTokenIds() const { return stop_token_ids_; }
   const std::vector<int32_t>& GetSpecialTokenIds() const { return special_token_ids_; }
+  // flyx: atomic tokens (README.flyx.md).
+  const std::vector<int32_t>& GetAtomicTokenIds() const { return atomic_token_ids_; }
+  bool IsAtomicToken(int32_t id) const;
   const std::vector<std::pair<int32_t, std::string>>& GetSortedDecodedVocab() const {
     return sorted_decoded_vocab_;
   }
@@ -43,6 +47,7 @@ class TokenizerInfo::Impl {
   const std::vector<int32_t>& GetTokenCharCounts() const;
   int32_t GetMaxTokenChars() const;
   void BuildTokenIdToSortedVocabIndex();
+  void BuildAtomicTokenIds();
   void BuildTokenCharData();
 
   /*!
@@ -89,6 +94,9 @@ class TokenizerInfo::Impl {
   /*! \brief The special tokens. These tokens are ignored (masked out) during the grammar-guided
    * generation. */
   std::vector<int32_t> special_token_ids_;
+  /*! \brief flyx: the special tokens with decoded text (stop tokens among them), sorted. They match
+   * explicit token edges only. Derived from special_token_ids_ (BuildAtomicTokenIds). */
+  std::vector<int32_t> atomic_token_ids_;
   /*! \brief Reverse mapping: token_id -> index in sorted_decoded_vocab_. -1 if not present. */
   std::vector<int32_t> token_id_to_sorted_vocab_index_;
   /*! \brief Unicode codepoint counts for the sorted decoded vocabulary. */

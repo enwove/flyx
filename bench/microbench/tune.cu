@@ -7,11 +7,17 @@
 // and from the same timings the bf16 and nvfp4 rules for shapes no table lists), rows (bf16 GEMMs of 17..64 rows on
 // MiniCPM5-1B's layers, DV's adapters and head: bf16_rows, a round's in three parts, and bf16_draft, a drafting pass's
 // in one, shape by shape and as rules), blocks, blocks_q8, blocks_q8_runs, blocks_round (the GGML block kernels'
-// rules: candidates.toml's families of those names), and flash_gqa (FP8 grouped-query prefill on a full staged
-// window). FILE: GGUF files; the
-// block families are measured on their block matrices, each type and shape once, weighed by how many the files hold.
+// rules: candidates.toml's families of those names), flash_gqa (FP8 grouped-query prefill on a full staged
+// window), and moe_gate_up (MoE layers' fused gate|up GEMMs on dp4a: a moe_dp4a configuration by block type and rows).
+// FILE: GGUF files; the
+// block families are measured on their block matrices, each type and shape once, weighed by how many the files hold,
+// and moe_gate_up on their fused gate|up expert matrices (ffn_gate_up_exps).
 // Without files: every block type on Qwen3.8-27B's and Qwen3.5-4B's layers, each as many times as those models have
-// it.
+// it, and every type that compiles moe_dp4a configurations on Inkling-2-Mini's experts.
+//
+// moe_gate_up's rules: per type and class of rows (1, 2, 3-4, 5-6, 7-8, more), the configuration with the least time
+// over the type's matrices where that saves 3% of the time of the original tiles, which every type compiles and the
+// rule for every type takes.
 //
 // A block family's rules: per class of rows (rounds of 1, 2, 3-4, 5-6, 7-8 and 9-16 rows; passes of 17-128 rows
 // and more) and of width (up to 64, 2048, 5120, 6144, 12288 or 65536 columns, and wider), the candidate with the least
@@ -861,7 +867,186 @@ void tune_flash_gqa() {
   for (int rows : {256, 1024}) tune_flash_gqa_rows(rows);
 }
 
-const char* const kFamilies[] = {"gemm", "rows", "blocks", "blocks_q8", "blocks_q8_runs", "blocks_round", "flash_gqa"};
+// ---- MoE layers' fused gate|up GEMMs on dp4a (moe_gate_up) ----------------------------------------------------------
+// A fused gate|up expert matrix the family is measured on: its type, experts, an expert's rows (gate and up), K and the
+// experts a token takes, and how many of it the files hold.
+struct MoeMat {
+  int dtype, E, N, K, top_k;
+  double count;
+};
+
+// The files' fused gate|up expert matrices of the types that compile configurations beside the original tiles (the
+// others have nothing to choose); without files Inkling-2-Mini's (128 experts, 8 a token, H 2304, I 1152) in each of
+// those types, as many times as the model has MoE layers (24).
+std::vector<MoeMat> moe_matrices(const std::vector<std::string>& files) {
+  std::map<std::tuple<int, int, int, int, int>, double> count;
+  if (files.empty())
+    for (int dtype : kMoeDp4aTypes) count[{dtype, 128, 2 * 1152, 2304, 8}] = 24;
+  for (const std::string& f : files) {
+    std::vector<FileExperts> es;
+    std::string err;
+    if (!file_experts(f, &es, &err)) {
+      std::fprintf(stderr, "cuda_bench tune: %s: %s\n", f.c_str(), err.c_str());
+      std::exit(2);
+    }
+    for (const FileExperts& e : es)
+      if (has_moe_dp4a_variants(e.dtype)) count[{e.dtype, e.n_experts, e.N, e.K, e.top_k}] += 1;
+  }
+  std::vector<MoeMat> out;
+  for (const auto& [k, n] : count)
+    out.push_back({std::get<0>(k), std::get<1>(k), std::get<2>(k), std::get<3>(k), std::get<4>(k), n});
+  return out;
+}
+
+// The rows of a pass on the dp4a kernel: rounds of 1, 2, 3-4, 5-6 and 7-8 rows, and more (up to where its MMA kernel
+// takes a pass), measured at 16.
+const RowClass kMoeClasses[] = {{1, 1, 1}, {2, 2, 2}, {3, 4, 4}, {5, 6, 6}, {7, 8, 8}, {9, int(kInf), 16}};
+constexpr int kMoeClassCount = 6;
+
+// us a call of each matrix's gate|up GEMM, by class of rows and configuration this build compiles for its type, as a
+// round runs it (cuda_bench moe's): rows staged in 8 bits, the activations written in bf16, kMoeRouteSets calls a
+// graph on rotating sets of experts.
+Costs time_moe(const std::vector<MoeMat>& mats) {
+  constexpr int kMaxRows = 16;
+  Costs out(mats.size(), std::vector<std::map<int, double>>(kMoeClassCount));
+  blocks_init();  // the block tables, before a capture
+  cudaStream_t st;
+  CK(cudaStreamCreateWithFlags(&st, cudaStreamNonBlocking));
+  KernelOptions options = g_bench_opts;
+  const Launch L{st, nullptr, &options};
+  for (size_t m = 0; m < mats.size(); ++m) {
+    const MoeMat& a = mats[m];
+    const int I = a.N / 2, max_pairs = kMaxRows * a.top_k;
+    MoeBenchBuffers mem;
+    std::vector<BlockMat> packed = block_copies(a.dtype, a.E * a.N, a.K);
+    ExpertMat W{};
+    W.n_experts = a.E;
+    W.N = a.N;
+    W.blk = packed.front();
+    W.blk.q8 = true;
+    float* rs = mem.alloc<float>(a.E);
+    k_fill_f<<<1, 256>>>(rs, a.E, 7u, 0.5f, 0.5f);
+    W.rs = rs;
+    MoeScratch sc{};
+    sc.chunk_rows = kMaxRows;
+    sc.max_experts = a.E;
+    sc.max_top_k = a.top_k;
+    sc.pairs = mem.alloc<int>(max_pairs);
+    sc.tasks = mem.alloc<MoeTask>(max_pairs);
+    sc.n_tasks = mem.alloc<int>(1);
+    sc.stage_elems = size_t(kMaxRows) * a.K;
+    sc.q8_a = mem.alloc<int8_t>(sc.stage_elems);
+    sc.q8_d = mem.alloc<float>(sc.stage_elems / 32);
+    sc.q8_s = mem.alloc<float>(sc.stage_elems / 16);
+    float* x = mem.alloc<float>(sc.stage_elems);
+    k_fill_f<<<64, 256>>>(x, sc.stage_elems, 31u, -1.f, 2.f);
+    moe_stage_q8(x, a.K, a.K, kMaxRows, sc, moe_q8_mins(W), 0);
+    bf16* act = mem.alloc<bf16>(size_t(max_pairs) * I);
+    int* indices = mem.alloc<int>(size_t(kMoeRouteSets) * max_pairs);
+    std::vector<int> cands;
+    for (int k = 0; k < kMoeDp4aConfigCount; ++k)
+      if (moe_dp4a_compiled(a.dtype, k)) cands.push_back(k);
+    for (int c = 0; c < kMoeClassCount; ++c) {
+      const int rows = kMoeClasses[c].rows;
+      make_moe_routes(indices, rows, a.E, a.top_k);
+      auto timed = [&](int k, int reps) {
+        options.moe_dp4a = k;
+        cudaGraph_t graph;
+        cudaGraphExec_t exec;
+        CK(cudaStreamBeginCapture(st, cudaStreamCaptureModeGlobal));
+        for (int i = 0; i < kMoeRouteSets; ++i)
+          moe_gate_up(x, a.K, W, indices + size_t(i) * rows * a.top_k, rows, a.top_k, I, a.K, 6.f, 8.f, true,
+                      nullptr, I, &sc, L, true, act);
+        CK(cudaStreamEndCapture(st, &graph));
+        CK(cudaGraphInstantiate(&exec, graph, 0));
+        const double ms = time_ms([&] { CK(cudaGraphLaunch(exec, 0)); }, reps) / kMoeRouteSets;
+        CK(cudaGraphExecDestroy(exec));
+        CK(cudaGraphDestroy(graph));
+        return ms;
+      };
+      // The clocks settle; then every candidate in order and in reverse, twice, the fastest of the four (as rounds).
+      timed(cands[0], 20);
+      for (int pass = 0; pass < 4; ++pass)
+        for (size_t j = 0; j < cands.size(); ++j) {
+          const int k = cands[pass % 2 ? cands.size() - 1 - j : j];
+          const double us = timed(k, 5) * 1e3;
+          const auto it = out[m][c].find(k);
+          out[m][c][k] = it == out[m][c].end() ? us : std::min(it->second, us);
+        }
+    }
+    free_copies(packed);
+    std::fprintf(stderr, "moe: %s %d x %d x %d (%zu of %zu)\n", block_type_name(a.dtype), a.E, a.N, a.K, m + 1,
+                 mats.size());
+  }
+  CK(cudaStreamDestroy(st));
+  return out;
+}
+
+// A type's configuration a class of rows: the one with the least time over its matrices where that saves 3% of the
+// original tiles' time there, else the original tiles, the rule for every type.  No floor in microseconds (the block
+// families' kMinUs): that weighs an exception against the best rule for every type, and here the rule for every type
+// is the original tiles whatever their time, so a floor would keep a type of few layers on them.  Types with the same
+// choices share a list of rules (neighbouring classes with one configuration as one rule, the last for the rest);
+// types whose every choice is the original tiles have none.
+void tune_moe(const std::vector<MoeMat>& mats) {
+  const Costs costs = time_moe(mats);
+  int original = 0;
+  while (kMoeDp4aConfigs[original].columns != 0) ++original;
+  std::map<int, std::vector<size_t>> by_type;
+  for (size_t m = 0; m < mats.size(); ++m) by_type[mats[m].dtype].push_back(m);
+  auto cost = [&](const std::vector<size_t>& ms, int c, int k) {
+    double t = 0;
+    for (size_t m : ms) {
+      const auto it = costs[m][c].find(k);
+      if (it == costs[m][c].end()) return kInfiniteCost;
+      t += mats[m].count * it->second;
+    }
+    return t;
+  };
+  std::map<int, std::vector<int>> pick;  // type -> [class]
+  std::vector<std::pair<std::vector<int>, std::vector<int>>> lists;  // types, their configuration a class
+  for (const auto& [t, ms] : by_type) {
+    std::vector<int>& v = pick[t];
+    v.assign(kMoeClassCount, original);
+    for (int c = 0; c < kMoeClassCount; ++c) {
+      int best = original;
+      for (const auto& [k, us] : costs[ms[0]][c])
+        if (cost(ms, c, k) < cost(ms, c, best)) best = k;
+      if (cost(ms, c, original) - cost(ms, c, best) >= kMinGain * cost(ms, c, original)) v[c] = best;
+    }
+    if (std::all_of(v.begin(), v.end(), [&](int k) { return k == original; })) continue;
+    auto same = std::find_if(lists.begin(), lists.end(), [&](const auto& l) { return l.second == v; });
+    if (same != lists.end()) same->first.push_back(t);
+    else lists.push_back({{t}, v});
+  }
+  std::printf("moe_gate_up = [\n");
+  for (const auto& [types, v] : lists)
+    for (int c = 0; c < kMoeClassCount;) {
+      int e = c;
+      while (e + 1 < kMoeClassCount && v[e + 1] == v[c]) ++e;
+      std::printf("  { %s", types_list(types).c_str());
+      if (e + 1 < kMoeClassCount) std::printf("rows = [%d, %d], ", kMoeClasses[c].lo, kMoeClasses[e].hi);
+      std::printf("columns = %d, units = %d },\n", kMoeDp4aConfigs[v[c]].columns, kMoeDp4aConfigs[v[c]].units);
+      c = e + 1;
+    }
+  std::printf("  { columns = 0, units = 0 },\n]\n");
+  for (int c = 0; c < kMoeClassCount; ++c) {
+    double rules = 0, defaults = 0, best = 0;
+    for (size_t m = 0; m < mats.size(); ++m) {
+      const std::map<int, double>& us = costs[m][c];
+      rules += mats[m].count * us.at(pick[mats[m].dtype][c]);
+      defaults += mats[m].count * us.at(moe_gate_up_dp4a(-1, mats[m].dtype, kMoeClasses[c].rows));
+      double b = kInfiniteCost;
+      for (const auto& [k, t] : us) b = std::min(b, t);
+      best += mats[m].count * b;
+    }
+    std::printf("# moe_gate_up, passes of %d rows: %.0f us with these rules, %.0f with the defaults (%+.1f%%), %.0f "
+                "with the best for each\n", kMoeClasses[c].rows, rules, defaults, 100 * (rules / defaults - 1), best);
+  }
+}
+
+const char* const kFamilies[] = {"gemm",           "rows",         "blocks",    "blocks_q8",
+                                 "blocks_q8_runs", "blocks_round", "flash_gqa", "moe_gate_up"};
 
 // Placement overlaps PCIe transfers with a particular model's verification and draft steps. Use whole
 // generations timed with that model. The file contains one shape and the warm decode times for each schedule.
@@ -1080,7 +1265,7 @@ int tune(int argc, char** argv) {
       const std::string f = a.substr(p, e - p);
       if (std::find(std::begin(kFamilies), std::end(kFamilies), f) == std::end(kFamilies)) {
         std::fprintf(stderr, "cuda_bench tune: unknown family %s (gemm, rows, blocks, blocks_q8, blocks_q8_runs, "
-                             "blocks_round, flash_gqa)\n", f.c_str());
+                             "blocks_round, flash_gqa, moe_gate_up)\n", f.c_str());
         return 2;
       }
       families.insert(f);
@@ -1116,12 +1301,19 @@ int tune(int argc, char** argv) {
   if (want("rows")) mt_ms = tune_mt_shapes();
   const bool blocks = want("blocks") || want("blocks_q8") || want("blocks_q8_runs") || want("blocks_round");
   const std::vector<Mat> mats = blocks ? block_matrices(files) : std::vector<Mat>();
-  if (gemm_ms.empty() && mt_ms.empty() && mats.empty()) return 0;
+  const std::vector<MoeMat> moe = want("moe_gate_up") ? moe_matrices(files) : std::vector<MoeMat>();
+  if (gemm_ms.empty() && mt_ms.empty() && mats.empty() && moe.empty()) return 0;
   std::printf("\n# This GPU's rules: for shapes no [[gemm]] lists, and the GGML block kernels'%s.\n"
               "[rules]\n", files.empty() ? " on Qwen3.8-27B's and Qwen3.5-4B's layers, every block type" :
                                           " on the files' block matrices");
   if (!gemm_ms.empty()) print_gemm_rules(gemm_ms);
   if (!mt_ms.empty()) print_mt_rules(mt_ms);
+  if (!moe.empty()) {
+    std::printf("# MoE layers' fused gate|up GEMMs on %s\n", files.empty() ? "Inkling-2-Mini's experts, every type that "
+                "compiles moe_dp4a configurations" : "the files' gate|up expert matrices");
+    std::fflush(stdout);
+    tune_moe(moe);
+  }
   if (mats.empty()) return 0;
   int k_max = 0, n_rows = 0, n_head = 0;
   for (const Mat& m : mats) {

@@ -21,22 +21,26 @@ struct DFlash2Spec {
   flyx_dflash2_block block{};
   int layers = 0;
   int tg2 = 0;
+  int sel_vocab = 0;       // selector codebook row count (vocab or padded_vocab)
   double eps = 0.0;
-  std::vector<int> taps;   // 1-based layer indices (1..target.layers)
+  std::vector<int> taps;   // 1-based layer indices (1..target.layers; target.layers = post output_norm tap)
   bool gguf = false;       // the file's tensor names are llama.cpp's (arch "dflash")
   int companion = -1;      // -1: embedded in target file; >= 0: companion index
 };
 
-// True if a companion header describes a DFlash2 or arch="dflash" drafter container.
+// True if a companion header describes a non-Markov DFlash2 drafter container (.flyx, HF dir, or arch="dflash" GGUF).
 bool is_dflash_companion(const nlohmann::json& header);
 
-// Throws unless the drafter such a companion holds was made for this target (its width and vocabulary, and its
-// layer count where the drafter names one).  A drafter given beside another model is refused whether or not it is
-// chosen; the rest of its config is read only when it drafts (parse_dflash2_*).
+// Throws unless the drafter such a companion holds (or a DSpark one's: the same GGUF layout) was made for this
+// target (its width and vocabulary, and its layer count where the drafter names one).  A drafter given beside
+// another model is refused whether or not it is chosen; the rest of its config is read only when it drafts
+// (parse_dflash2_*, parse_dspark_gguf).
 void check_made_for(const nlohmann::json& header, const TargetSpec& target);
 
-// Parse and validate a DFlash2 spec from canonical JSON ("draft" section in .flyx or drafter_dir).
-DFlash2Spec parse_dflash2_json(const nlohmann::json& j, const TargetSpec& target, int companion);
+// Parse and validate a DFlash2 spec from canonical JSON ("draft" section in .flyx or drafter_dir); `file` holds its
+// tensors (the selector's codebooks say whether they have the target's padding rows).
+DFlash2Spec parse_dflash2_json(const ModelFile& file, const nlohmann::json& j, const TargetSpec& target,
+                               int companion);
 
 // Parse and validate a DFlash2 spec from a GGUF companion header with general.architecture == "dflash".
 DFlash2Spec parse_dflash2_gguf(const ModelFile& file, const nlohmann::json& header, const TargetSpec& target,
