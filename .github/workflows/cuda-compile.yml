@@ -49,6 +49,9 @@ jobs:
       # As ci.yml's cpu job (CMakeLists.txt compiles through ccache, nvcc's compiles too); room for the device code.
       CCACHE_MAXSIZE: 2G
       CCACHE_SLOPPINESS: pch_defines,time_macros,include_file_mtime,include_file_ctime
+      # ccache names a compiler by its file's size and time (compiler_check=mtime): pip installs nvcc anew each run, so
+      # its time changes and no CUDA compile would ever hit.  By its bytes instead.
+      CCACHE_COMPILERCHECK: content
     steps:
       - uses: actions/checkout@v4
 

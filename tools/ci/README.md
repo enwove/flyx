@@ -36,7 +36,9 @@ The hosted workflows compile through ccache (`CMakeLists.txt` picks it up when i
 and keep its directory per commit: `ccache-<os>-<commit>` for the CPU jobs (the `cpu` and `cpu-full` builds are the
 same compiles), `ccache-cuda-<os>-<commit>` for the CUDA one. A run restores the newest cache saved under its prefix
 (its pull request's last push, else `main`'s last run: the nightly's for the CUDA build) and compiles only what
-changed. A run on `main` is never cancelled once it has started; a pull request's newer push cancels its older run.
+changed. The CUDA job has ccache tell compilers apart by their bytes (`CCACHE_COMPILERCHECK=content`): by default
+it goes by a compiler file's time, and pip installs `nvcc` anew on every run. A run on `main` is never cancelled
+once it has started; a pull request's newer push cancels its older run.
 
 The tests' fixtures (`tests/e2e/make_tiny.py`) are made again only when what they are made from changed (the Python
 reference, the converter, the chat templates, the versions of the packages that build them). Each group, core's and
