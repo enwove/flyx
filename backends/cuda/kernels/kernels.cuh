@@ -160,6 +160,7 @@ struct KernelOptions {
   int mtp_copy = 2;           // ... and every position through a copy of this many bits (2 to 4; strata attention over
                               // the MTP layer's cache; 0: none, only the positions above)
   bool mtp_ring = true;       // ... which a ring of slots holds (false: a slot a position, for tests)
+  bool dflash_ring = true;    // a sliding-window DFlash2 context cache as a ring of slots (false: flat, for tests)
   int stage_window = 16384;   // FLYX_KV_STRATA / AUTO: a staging's positions, a multiple of kFlashWindowAlign; a
                               // prefill whose keys go past them reads them a window at a time
 };
@@ -1251,7 +1252,8 @@ void selector_tree(const DevParams* P, const int* cand, const float* unary, int 
 // Copy rows of x into feats at column block `slot` (taps).
 void tap_copy(const float* x, int H, float* feats, int ld_feats, int slot, int rows, cudaStream_t st);
 void tap_copy(const bf16* x, int H, float* feats, int ld_feats, int slot, int rows, cudaStream_t st);
-// Draft context K/V: kv rows [rows, layers * 2 * nkv * hd] = per layer [k | v]; k -> rmsnorm -> rope -> dK[layer][pos].
+// Draft context K/V: kv rows [rows, layers * 2 * nkv * hd] = per layer [k | v]; k -> rmsnorm -> rope -> dK[layer][slot].
+// ring > 0: slot = pos % ring (sliding-window DFlash2 context ring; rotary still uses logical pos).
 void draft_ctx_kv(const float* kv, int ld, const float* k_norms, float eps, double theta, int layers, int nkv, int hd,
                   int rows, const DevParams* P, int pos_sel, bool skip_if_noop, kv16* dK, kv16* dV,
                   size_t layer_stride, cudaStream_t st, int ring = 0);

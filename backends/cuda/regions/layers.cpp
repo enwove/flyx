@@ -189,16 +189,15 @@ void draft_block(flyx_seq* s, const DFlashBlock& b, int width, const Launch& L, 
   }
   for (int j = 0; j < b.layers(); ++j) {
     const auto& l = block<DFlashLayer>(m, b.first_layer + j);
-    kv16* Kj = kv.k16(j);
-    kv16* Vj = kv.v16(j);
+    const KvRef kvr = kv.layer_ref(j);
     rmsnorm(s->dx, H, l.norm.w, l.norm.offset, l.norm.eps, s->dh, H, B, H, st);
     gemm(s->dh, H, l.attn_proj, 2 * TG, H, s->ddelta, 2 * TG, B, false, L);
     grouped_conv(s->dh, H, s->ddelta, 2 * TG, l.attn_base, H, Tp, b.conv_group, s->dhc, H, B, false, st);
     gemm(s->dhc, H, l.w_qkv, nqkv, H, s->dproj, s->ld_dproj, B, false, L);
     attn_prep(s->dproj, s->ld_dproj, 0, nh * hd, (nh + nkv) * hd, l.q_norm.w, l.k_norm.w, l.q_norm.offset,
-              l.q_norm.eps, b.theta, hd, nh, nkv, hd, B, s->P, kPosPosition, false, s->dq, Kj, Vj, st);
+              l.q_norm.eps, b.theta, hd, nh, nkv, hd, B, s->P, kPosPosition, false, s->dq, kvr, st);
     const bool split_o = fused && !l.w_o.q8_inputs() && (nh * hd) % 64 == 0;
-    attention(s->dq, Kj, Vj, nh, nkv, hd, B, false, B, 1.f / std::sqrt(float(hd)), s->P, nullptr, 0,
+    attention(s->dq, kvr, nh, nkv, hd, B, false, B, 1.f / std::sqrt(float(hd)), s->P, nullptr, 0,
               split_o ? nullptr : s->dact, s->ld_dact, s->own.part, kRoundSplits, L, 0, b.window);
     if (split_o) gemm_presplit(l.w_o, H, nh * hd, s->dtmp, H, B, false, L);
     else gemm(s->dact, s->ld_dact, l.w_o, H, nh * hd, s->dtmp, H, B, false, L);
@@ -1321,7 +1320,7 @@ void draft_context(const Pass& ps, const DFlashBlock& b, bool fused) {
   gemm(rv.b.feats + b.feats_offset, rv.ld_feats, b.fc, H, F, rv.b.cx, H, R, false, L);
   norm_project(rv.b.cx, rv.b.h, rv.b.ckv, rv.ld_ckv, R, b.hidden_norm, b.ctx, b.ctx_width(), H, L, fused);
   draft_ctx_kv(rv.b.ckv, rv.ld_ckv, b.k_norms.w, b.k_norms.eps, b.theta, b.layers(), b.nkv, b.hd, R, s->P,
-               ps.round ? kPosStart : kPosPosition, ps.round, kv.k16(), kv.v16(), kv.layer_stride, st);
+               ps.round ? kPosStart : kPosPosition, ps.round, kv.k16(), kv.v16(), kv.layer_stride, st, kv.ring);
 }
 
 // The selector's table over the slots the tree reaches (slots - 1 at most: the last slot never has candidates after

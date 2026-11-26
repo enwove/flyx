@@ -250,13 +250,11 @@ void draft_block_rows(const BatchPass& bp, const DFlashBlock& b, const std::vect
       for (size_t g = 0; g < n; ++g) {
         flyx_seq* s = bp.seq[members[off + g]].s;
         const KvBuf& kv = s->kv[size_t(b.kv)];
-        kv16* Kj = kv.k16(j);
-        kv16* Vj = kv.v16(j);
+        const KvRef kvr = kv.layer_ref(j);
         float* q_g = df.dq + g * B * nh * hd;
         attn_prep(df.dproj + g * B * df.ld_dproj, df.ld_dproj, 0, nh * hd, (nh + nkv) * hd, l.q_norm.w, l.k_norm.w,
-                  l.q_norm.offset, l.q_norm.eps, b.theta, hd, nh, nkv, hd, B, s->P, kPosPosition, false, q_g, Kj, Vj,
-                  st);
-        attention(q_g, Kj, Vj, nh, nkv, hd, B, false, B, 1.f / std::sqrt(float(hd)), s->P, nullptr, 0,
+                  l.q_norm.offset, l.q_norm.eps, b.theta, hd, nh, nkv, hd, B, s->P, kPosPosition, false, q_g, kvr, st);
+        attention(q_g, kvr, nh, nkv, hd, B, false, B, 1.f / std::sqrt(float(hd)), s->P, nullptr, 0,
                   df.dact + g * B * df.ld_dact, df.ld_dact, v.b.part, kRoundSplits, L, 0, b.window);
       }
       gemm(df.dact, df.ld_dact, l.w_o, H, nh * hd, df.dtmp, H, R, false, L);
@@ -383,7 +381,7 @@ void draft_context_rows(const BatchPass& bp, const DFlashBlock& b, bool fused) {
   for (const Pass& ps : bp.seq) {
     const KvBuf& kv = ps.s->kv[size_t(b.kv)];
     draft_ctx_kv(ps.v.b.ckv, ps.v.ld_ckv, b.k_norms.w, b.k_norms.eps, b.theta, b.layers(), b.nkv, b.hd, ps.rows,
-                 ps.s->P, kPosStart, true, kv.k16(), kv.v16(), kv.layer_stride, st);
+                 ps.s->P, kPosStart, true, kv.k16(), kv.v16(), kv.layer_stride, st, kv.ring);
   }
 }
 

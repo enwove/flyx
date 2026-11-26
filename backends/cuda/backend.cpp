@@ -409,6 +409,7 @@ const std::vector<OptionSpec>& option_specs() {
       kernel_whole_opt("mtp_copy", &KernelOptions::mtp_copy),
       kernel_whole_opt("mtp_sink", &KernelOptions::mtp_sink),
       kernel_flag_opt("mtp_ring", &KernelOptions::mtp_ring),
+      kernel_flag_opt("dflash_ring", &KernelOptions::dflash_ring),
       {"pageable_kv",
        [](const std::string& key, const std::string& val, BackendOptions* o, std::string* err) {
          if (!check_choice(key, val, {"auto", "on", "off"}, err)) return false;

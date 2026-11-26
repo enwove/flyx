@@ -880,7 +880,8 @@ typedef struct {
   int32_t max_ctx;              /* tokens per sequence */
   int32_t verbose;
   int32_t kv_fp8;               /* K/V caches the target reads (state.draft == 0) in FP8 (e4m3, a scale per position and
-                                   head); a drafter's as the backend chooses (CUDA: a one-layer one too) */
+                                   head); a drafter's as the backend chooses (CUDA: the MTP layer's too, a
+                                   DFlash2 drafter's never) */
   /* Backend options, "key=value,key=value" (NULL or "" = none).  Each backend
    * documents its keys and fails open() on one it does not know; a key given
    * twice takes the later value.  The engine passes them through unread. */
@@ -1016,7 +1017,8 @@ typedef struct flyx_backend_api {
    * pass crossed and kept (the last one it crossed, or prefill_snapshot's).
    * Returns that position, negative on error. */
   int (*checkpoint)(flyx_seq* s, int32_t slot);
-  /* Restore a checkpoint; returns its position, or negative if the slot is empty. */
+  /* Restore a checkpoint; returns its position, or negative if the slot is empty or what it needs is gone (the CUDA
+   * backend: a drafter's window a later position overwrote in its ring), the state then left as it was. */
   int (*restore)(flyx_seq* s, int32_t slot, int32_t anchor);
   /* Testing: replace drafts with tokens[pos] (0 past the end). n = 0 turns it off. */
   int (*set_oracle)(flyx_seq* s, const int32_t* tokens, int32_t n);

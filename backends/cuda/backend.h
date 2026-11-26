@@ -32,6 +32,7 @@
 
 #include "backends/cuda/blocks.h"
 #include "backends/cuda/kernels/kernels.cuh"
+#include "backends/cuda/runtime/draft_ring.h"
 #include "backends/cuda/runtime/vision_disk.h"
 #include "flyx/backend_abi.h"
 #include "ops/dtype/ref.h"
@@ -109,6 +110,7 @@ inline void destroy_side(SideStream& s) {
 //                         through a copy of mtp_copy=BITS bits (2; 0, or heads strata attention is not compiled
 //                         for: none, then its first mtp_sink=N exactly, 64);
 //                         mtp_ring=0: its cache a slot a position, not a ring (tests)
+//                         dflash_ring=0: a sliding-window DFlash2 cache flat, not a ring (tests)
 //   strata_denom=N strata attention refines one pair of positions in N a row (default 16 with
 //                         a 2-bit copy, 64 with more; 0: none, the copy alone), at least strata_least=N pairs (32),
 //                         plus the last strata_recent=N positions, and at most strata_most=N pairs (256; 0: no
@@ -631,6 +633,10 @@ struct flyx_seq {
     int pos = 0;
     int rope_delta = 0;
   } ckp[FLYX_CHECKPOINTS];
+  // A sliding-window DFlash2 context cache kept as a ring (KvBuf::ring, alloc_state): the positions it still holds
+  // for the drafter's window, at the position and at each checkpoint.  A rewind, restore or snapshot whose window a
+  // later position overwrote is refused (runtime/runner.cpp: ring_wrote).
+  flyx::cuda::DraftRing dring;
 
   // drafter scratch
   float* mg = nullptr;                 // MTP normalized draft hidden

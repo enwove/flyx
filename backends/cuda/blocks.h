@@ -452,9 +452,10 @@ struct KvBuf {
   uint8_t* hot = nullptr;
   int hot_bits = 0;
   size_t hot_tags = 0;  // slots, all heads
-  // The MTP layer's: its draft steps attend to its first `sink` positions and its last `window` (0:
-  // all), which a ring of `ring` slots holds (0: a slot a position).
-  // SWA target layers (KvSpec::window > 0): fixed GPU ring buffer (`swa_ring = true`), checkpointed on host.
+  // Sliding-window caches kept as a ring of `ring` physical slots holding positions via KvRef::slot_of (0: a slot a
+  // position): the MTP layer's (its draft steps attend to its first `sink` positions and its last `window`), a
+  // sliding-window DFlash2 drafter's context (s->dring says what it still holds), and the SWA target layers and
+  // DSpark's (KvSpec::window > 0, or DSpark's Full layer at long contexts: `swa_ring = true`, checkpointed on host).
   int ring = 0, sink = 0, window = 0;
   bool swa_ring = false;
   void* ckp_k[FLYX_CHECKPOINTS]{};
@@ -513,6 +514,14 @@ struct KvBuf {
   }
   kv16* k16(int layer = 0) const { return static_cast<kv16*>(k) + size_t(layer) * layer_stride; }
   kv16* v16(int layer = 0) const { return static_cast<kv16*>(v) + size_t(layer) * layer_stride; }
+  KvRef layer_ref(int layer) const {
+    KvRef r;
+    r.k = k16(layer);
+    r.v = v16(layer);
+    r.ring = ring;
+    r.sink = sink;
+    return r;
+  }
 };
 struct GdnBuf {
   float *S = nullptr, *win = nullptr;  // FLYX_ROUND_SLOTS slots each
