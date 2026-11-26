@@ -659,6 +659,8 @@ int open_model(const flyx_model_desc* desc, const flyx_open_options* opts, flyx_
                    table.c_str(), inputs.c_str());
     }
   }
+  // The kernels' hard limits, before anything is allocated for the model.
+  if (std::string why; !kernel_limits(*desc, &why)) return fail(why);
   double t[6] = {load_clock(), 0, 0, 0, 0, 0};  // the load's steps, for its report
   LoadTimes load_times{};
   try {

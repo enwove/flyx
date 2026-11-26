@@ -1552,6 +1552,10 @@ void embed_scatter(float* x, bf16* x16, int H, const float* embeds, const int32_
                    cudaStream_t st);
 
 // ---- Inkling-2 target ops (inkling2.cu, moe.cu) ---------------------------------------------
+// The kernels' hard limits, which a load checks before it allocates (kernel_limits): the experts a MoE row routes to
+// (moe_route's top list) and those it chooses among (their scores in its shared memory), and the states an AttnRes
+// mix reads, the bank's blocks and the current one (attn_res_mix, shortconv_res_mix_norm).
+constexpr int kMoeRouteMaxTopK = 64, kMoeRouteMaxExperts = 4096, kAttnResMaxStates = 64;
 // In-place logit softcapping: z = cap * tanh(z / cap) for finite z (leaves -inf untouched for head_cert).
 void softcap_rows(float* logits, int ld, int V, int rows, float cap, cudaStream_t st);
 

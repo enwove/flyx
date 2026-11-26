@@ -30,7 +30,7 @@ __global__ void k_softcap_rows(float* logits, int ld, int V, float cap) {
 // A 512-thread block computes one row for one or more queries over M = n_blocks + 1
 // states (bank[0..n_blocks-1] and cur), each RMS-normalized (no gamma, eps = 1e-6).
 // One warp owns a state's dot products, one warp owns a query's softmax, and all threads mix the channels.
-constexpr int kMaxResStates = 64;
+constexpr int kMaxResStates = kAttnResMaxStates;
 
 // Exact block_sum order for 512-thread (16-warp) blocks in a single barrier (matches rows.cu::block512_sum).
 __device__ __forceinline__ float block512_sum(float v) {

@@ -100,10 +100,17 @@ Config read_gguf_config(const ModelFile& file) {
       c.vocab_unpadded > c.vocab_padded || c.n_phys <= 0 || c.n_phys > kMaxLayers ||
       c.n_heads <= 0 || c.n_kv <= 0 || c.n_heads % c.n_kv != 0 || c.head_dim <= 0 || c.head_dim > kMaxHeadDim ||
       c.top_k <= 0 || c.top_k > c.n_experts || c.n_passes < 2 || c.core_start <= 0 || c.core_start >= c.core_end ||
-      c.core_end > c.n_phys || c.core_start % c.attn_res_block != 0 || c.core_end % c.attn_res_block != 0 ||
+      c.core_end > c.n_phys || c.attn_res_block <= 0 || c.core_start % c.attn_res_block != 0 ||
+      c.core_end % c.attn_res_block != 0 ||
       c.conv < 2 || c.conv > 64 || !(c.eps > 0) || !(c.qk_clip > 0) || !(c.rel_clip > 0) || !(c.situ_beta > 0) ||
       !(c.situ_linear_beta > 0) || c.log_scale_alpha < 0.0 || !std::isfinite(c.log_scale_alpha))
     throw std::runtime_error("invalid inkling2_loop GGUF configuration");
+  // The logical layers the loop unfolds to (each with its own K/V and ShortConv state), counted in 64 bits.
+  const long long visits = (long long)c.core_start + (long long)c.n_passes * (c.core_end - c.core_start) +
+                           (c.n_phys - c.core_end);
+  if (visits > kMaxLayers)
+    throw std::runtime_error("inkling2_loop: " + std::to_string(c.n_passes) + " passes unfold to " +
+                             std::to_string(visits) + " logical layers, more than " + std::to_string(kMaxLayers));
   return c;
 }
 

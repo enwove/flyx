@@ -1226,6 +1226,27 @@ int main(int argc, char** argv) {
           "cpu_ref DFlash2 HF dir greedy == cpu_ref plain");
     check(same_tokens(fresh_gen(*ref_both, prompt, 24, false), ref_greedy),
           "cpu_ref DSpark + DFlash2 (--drafter all) greedy == cpu_ref plain");
+    // A MoE that routes each row to more experts than the CUDA kernels take (65 of 72; moe_route keeps 64): cpu_ref
+    // runs it, and the CUDA load refuses it before allocating anything, saying why.
+    {
+      TinySpec routed = spec;
+      routed.n_experts = 72;
+      routed.top_k = 65;
+      const auto path = dir / "tiny_inkling2_top65.gguf";
+      write_tiny_inkling2(path, routed, false, 1001);
+      check(fresh_gen(*load_engine(path.string(), "cpu_ref"), prompt, 4, false).size() == 4,
+            "cpu_ref runs a MoE routing each row to 65 of 72 experts");
+      if (backend == "cuda") {
+        std::string why;
+        try {
+          (void)load_engine(path.string(), "cuda");
+        } catch (const std::exception& e) {
+          why = e.what();
+        }
+        check(why.find("route to up to 64") != std::string::npos,
+              "the CUDA load refuses a MoE routing to 65 experts a row (" + why + ")");
+      }
+    }
     {
       const auto clip_gguf = dir / "mmproj-BF16.gguf";
       GgufWriter cw;

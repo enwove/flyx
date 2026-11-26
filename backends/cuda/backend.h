@@ -1108,6 +1108,7 @@ void draft_logits(const HeadBlock& h, const float* x, int ldx, float* y, int row
 // regions/plan.cpp: which blocks the kernels take, the block a node runs, the
 // implementation lower() picks for it, and running a plan's nodes.
 bool supported(const flyx_bmodel* m, const Block& b, std::string* why);
+bool kernel_limits(const flyx_model_desc& d, std::string* why);
 const Block* block_of(const flyx_bmodel* m, const flyx_node& n, std::string* err);
 const RegionImpl* resolve(const flyx_bmodel* m, const flyx_node& n, const Block* b, int max_rows);
 extern const RegionImpl kGeneric;  // every node's generic implementation

@@ -26,7 +26,7 @@ namespace {
 
 constexpr int kMoeWarps = 4;
 constexpr int kMoeKT = 1024;
-constexpr int kRouteThreads = 128, kRouteTop = 64;  // threads a row; the most experts a row takes
+constexpr int kRouteThreads = 128, kRouteTop = kMoeRouteMaxTopK;  // threads a row; the most experts a row takes
 
 __device__ __forceinline__ float situ_val(float g, float u, float beta, float linear_beta) {
   if (beta > 0.f) {
@@ -861,7 +861,8 @@ void moe_stage_q8(const float* x, int ldx, int K, int rows, const MoeScratch& sc
 
 void moe_route(const float* logits, const float* bias, int rows, int n_experts, int top_k, bool gating_sigmoid,
                bool norm_weights, float norm_eps, float route_scale, int* idx_out, float* w_out, cudaStream_t st) {
-  if (rows <= 0 || n_experts <= 0 || top_k <= 0 || top_k > n_experts || top_k > kRouteTop)
+  if (rows <= 0 || n_experts <= 0 || n_experts > kMoeRouteMaxExperts || top_k <= 0 || top_k > n_experts ||
+      top_k > kRouteTop)
     throw std::runtime_error("moe_route: invalid dimensions");
   const size_t smem = size_t(2) * size_t(n_experts) * sizeof(float);
   k_moe_route<<<rows, kRouteThreads, smem, st>>>(logits, bias, n_experts, top_k, int(gating_sigmoid), int(norm_weights),

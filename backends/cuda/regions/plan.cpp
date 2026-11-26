@@ -59,6 +59,9 @@ bool supported(const flyx_bmodel* m, const Block& blk, std::string* why) {
   } else if (const auto* e = std::get_if<MoeBlock>(&blk)) {
     if (e->n_experts < 1 || e->top_k < 1 || e->top_k > e->n_experts || (e->post_conv && (e->conv < 2 || e->conv > 64)))
       return no("MoE dimensions outside what the CUDA kernels support");
+    if (e->top_k > kMoeRouteMaxTopK || e->n_experts > kMoeRouteMaxExperts)
+      return no("MoE routing outside what the CUDA kernels take (top_k up to " + std::to_string(kMoeRouteMaxTopK) +
+                ", up to " + std::to_string(kMoeRouteMaxExperts) + " experts)");
   } else if (const auto* g = std::get_if<GdnBlock>(&blk)) {
     if (g->gd.dk > 128 || g->gd.ck > 8 || g->gd.nk < 1 || g->gd.nv % g->gd.nk)
       return no("gated delta net dimensions outside what the CUDA kernels support (key head dim up to 128, conv up to 8)");
@@ -95,6 +98,43 @@ bool supported(const flyx_bmodel* m, const Block& blk, std::string* why) {
     if (merged % 8 || (vm->w_fc1.present() && vm->w_fc2.present() && vm->merge_hidden % 8))
       return no("vision_merge dimensions must be multiples of 8");
   }
+  return true;
+}
+
+// The kernels' hard limits on a model description, before the load allocates anything (supported() checks the bound
+// blocks again): MoE routing (moe_route), the AttnRes bank's depth (row_needs: max_bank, which attn_res_mix and
+// shortconv_res_mix_norm read with the current state), the ShortConvs' taps.  Counts in 64 bits: a description's
+// int32 fields can multiply past an int.
+bool kernel_limits(const flyx_model_desc& d, std::string* why) {
+  auto no = [&](const std::string& w) { return *why = w, false; };
+  if (d.n_blocks < 0 || (d.n_blocks > 0 && !d.blocks)) return no("a model description without its blocks");
+  long long pass0_pushes = 0;
+  bool rel_attn = false;
+  for (int i = 0; i < d.n_blocks; ++i) {
+    const flyx_block& b = d.blocks[i];
+    if (b.kind == FLYX_BLOCK_MOE) {
+      const flyx_moe_block& e = b.moe;
+      if (e.top_k > kMoeRouteMaxTopK || e.n_experts > kMoeRouteMaxExperts)
+        return no("MoE block " + std::to_string(i) + ": " + std::to_string(e.top_k) + " of " +
+                  std::to_string(e.n_experts) + " experts a row, where the CUDA kernels route to up to " +
+                  std::to_string(kMoeRouteMaxTopK) + " of up to " + std::to_string(kMoeRouteMaxExperts));
+      if (e.post_conv >= 0 && (e.conv < 2 || e.conv > 64))
+        return no("MoE block " + std::to_string(i) + ": ShortConv of " + std::to_string(e.conv) +
+                  " taps, where the CUDA kernels take 2..64");
+    } else if (b.kind == FLYX_BLOCK_REL_ATTN) {
+      const flyx_rel_attn_block& r = b.rel_attn;
+      rel_attn = true;
+      if (r.res_push && r.loop_rank == 0) ++pass0_pushes;
+      if (r.conv < 2 || r.conv > 64)
+        return no("rel_attn block " + std::to_string(i) + ": ShortConv of " + std::to_string(r.conv) +
+                  " taps, where the CUDA kernels take 2..64");
+    }
+  }
+  // row_needs' bank: the pushes of the first pass and two more, at least 4; a mix reads them and the current state.
+  const long long bank = rel_attn ? std::max(pass0_pushes + 2, 4ll) : 0;
+  if (bank >= kAttnResMaxStates)
+    return no("an AttnRes bank of " + std::to_string(bank) + " blocks, where the CUDA kernels mix fewer than " +
+              std::to_string(kAttnResMaxStates));
   return true;
 }
 
