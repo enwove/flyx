@@ -33,6 +33,7 @@ bool g_takes_drafter = true;  // the backend lowers the drafter's DRAFT nodes
 bool g_takes_warm_up = true;  // ... and its CONTEXT node in a round of no drafts (its warm-up)
 std::vector<int> g_refuses;   // ... but not of these widths
 std::string g_why = "no rounds of this drafter here";
+int g_fail_rc = -1;
 std::string g_error;
 
 int lower(flyx_bmodel*, const flyx_program* p, flyx_plan** out) {
@@ -41,11 +42,12 @@ int lower(flyx_bmodel*, const flyx_program* p, flyx_plan** out) {
     if (p->nodes[i].kind == FLYX_NODE_DRAFT) {
       block = p->nodes[i].block;
       tree = p->nodes[i].arg1;
-      if (!g_takes_drafter || std::count(g_refuses.begin(), g_refuses.end(), p->width)) return g_error = g_why, -1;
+      if (!g_takes_drafter || std::count(g_refuses.begin(), g_refuses.end(), p->width))
+        return g_error = g_why, g_fail_rc;
     }
     if (p->nodes[i].kind == FLYX_NODE_CONTEXT && p->phase == FLYX_PHASE_ROUND && p->width == 0) {
       block = p->nodes[i].block;  // a warm-up
-      if (!g_takes_drafter || !g_takes_warm_up) return g_error = g_why, -1;
+      if (!g_takes_drafter || !g_takes_warm_up) return g_error = g_why, g_fail_rc;
     }
   }
   *out = new flyx_plan{p->width, block, tree};
@@ -112,11 +114,12 @@ struct Built {
 
 Built build(const interfaces::Model& m, int fixed_width, bool given, bool draft_trees, bool takes,
             std::vector<int> refuses = {}, const std::string& why = "no rounds of this drafter here",
-            bool warm_up = true) {
+            bool warm_up = true, int fail_rc = -1) {
   g_takes_drafter = takes;
   g_takes_warm_up = warm_up;
   g_refuses = std::move(refuses);
   g_why = why;
+  g_fail_rc = fail_rc;
   const flyx_backend_api api = fake_backend();
   Built b;
   b.ok = plan::build(&api, nullptr, m, 64, fixed_width, given, draft_trees, &b.plans, &b.err);
@@ -204,12 +207,12 @@ int main() {
     p.free(&api);
   }
   {  // Out of GPU memory is no refusal: the load gives back what the backend keeps for speed, then builds again.
-    Built b = build(dv, -1, true, false, false, {}, "out of GPU memory: 300 MiB asked");
-    check(!b.ok && b.err.find("out of GPU memory") != std::string::npos && b.plans.refused_drafter < 0,
+    Built b = build(dv, -1, true, false, false, {}, "out of GPU memory: 300 MiB asked", true, FLYX_ERR_OOM);
+    check(!b.ok && b.plans.oom && b.err.find("out of GPU memory") != std::string::npos && b.plans.refused_drafter < 0,
           "a tree drafter refused for want of GPU memory: the build fails (" + b.err + ")");
     b.plans.free(&api);
-    b = build(dv, -1, true, false, true, {}, "out of GPU memory: 20 MiB asked", false);
-    check(!b.ok && b.err.find("out of GPU memory") != std::string::npos,
+    b = build(dv, -1, true, false, true, {}, "out of GPU memory: 20 MiB asked", false, FLYX_ERR_OOM);
+    check(!b.ok && b.plans.oom && b.err.find("out of GPU memory") != std::string::npos,
           "  its warm-up refused for want of GPU memory: the build fails (" + b.err + ")");
     b.plans.free(&api);
   }

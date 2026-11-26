@@ -33,6 +33,8 @@ template <class Fn>
 int guarded(Fn&& fn) {
   try {
     return fn();
+  } catch (const OutOfDeviceMemory& e) {
+    return fail_oom(e.what());
   } catch (const std::exception& e) {
     return fail(e.what());
   }

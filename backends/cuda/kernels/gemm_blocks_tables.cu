@@ -17,10 +17,13 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <memory>
 #include <stdexcept>
 #include <string>
+#include <type_traits>
 #include <vector>
 
+#include "backends/cuda/errors.h"
 #include "backends/cuda/kernels/gemm_internal.h"
 
 namespace flyx::cuda {
@@ -105,15 +108,6 @@ std::vector<int> selectors(const Row* grid, size_t rows, int width, std::vector<
   return values;
 }
 
-template <class T>
-const T* upload(const std::vector<T>& v) {
-  void* p = nullptr;
-  if (cudaMalloc(&p, v.size() * sizeof(T)) != cudaSuccess ||
-      cudaMemcpy(p, v.data(), v.size() * sizeof(T), cudaMemcpyHostToDevice) != cudaSuccess)
-    die("no device memory");
-  return static_cast<const T*>(p);
-}
-
 // The products the kernels form in registers (a table's value times a group's scale, or plus a bias first):
 // each must be an integer binary16 holds, or the multiplication would round.
 void check_products() {
@@ -153,6 +147,30 @@ uint2 sign_bytes(uint32_t bits) {
 
 BlockTables build() {
   check_products();
+  struct Free {
+    void operator()(void* p) const { cudaFree(p); }
+  };
+  using Allocation = std::unique_ptr<void, Free>;
+  std::vector<Allocation> allocations;
+  auto checked = [](cudaError_t rc, const char* operation) {
+    if (rc == cudaSuccess) return;
+    const std::string message = std::string("block tables: ") + operation + ": " + cudaGetErrorString(rc);
+    if (rc == cudaErrorMemoryAllocation) {
+      cudaGetLastError();
+      throw OutOfDeviceMemory(message);
+    }
+    throw CudaError(message);
+  };
+  auto upload = [&](const auto& values) {
+    using T = typename std::decay_t<decltype(values)>::value_type;
+    const size_t bytes = values.size() * sizeof(T);
+    void* ptr = nullptr;
+    checked(cudaMalloc(&ptr, bytes), "allocating");
+    Allocation owner(ptr);
+    checked(cudaMemcpy(ptr, values.data(), bytes, cudaMemcpyHostToDevice), "copying");
+    allocations.push_back(std::move(owner));
+    return static_cast<const T*>(ptr);
+  };
   BlockTables t{};
   std::vector<uint32_t> s32;
   std::vector<uint16_t> s16;
@@ -269,6 +287,7 @@ BlockTables build() {
     parts6[size_t(v)] = pair(high, low);
   }
   t.twice_u6 = upload(tu), t.twice_s6 = upload(ts), t.parts_s6 = upload(parts6);
+  for (auto& allocation : allocations) allocation.release();  // published together by block_tables()
   return t;
 }
 

@@ -22,16 +22,19 @@ RowNeeds row_needs(const flyx_bmodel* m) {
       n.attn_state = std::max(n.attn_state, a->nh * kFlashStateFloats(a->hd));
       n.split_state = std::max(n.split_state, a->nh * kSplitStateFloats(a->hd));
       n.lora = std::max(n.lora, 3 * a->lora.rank);
+      if (a->w_in.q8_inputs() || a->w_out.q8_inputs()) n.q8 = true;
       ks({a->hidden, a->nh * a->hd, a->lora.rank});
     } else if (const auto* g = std::get_if<GdnBlock>(&blk)) {
       n.proj = std::max(n.proj, g->n_in());
       n.act = std::max(n.act, g->v_width());
       n.gdn_o = std::max(n.gdn_o, g->v_width());
+      if (g->w_in.q8_inputs() || g->w_out.q8_inputs()) n.q8 = true;
       ks({g->hidden, g->v_width()});
     } else if (const auto* f = std::get_if<MlpBlock>(&blk)) {
       n.proj = std::max(n.proj, 2 * f->inter);
       n.act = std::max(n.act, f->inter);
       if (!f->w_gu.packed() && !f->w_down.packed()) n.glu = true;
+      if (f->w_gu.q8_inputs() || f->w_down.q8_inputs()) n.q8 = true;
       n.lora = std::max(n.lora, 2 * f->lora.rank);
       ks({f->hidden, f->inter, f->lora.rank});
     } else if (const auto* r = std::get_if<RelAttnBlock>(&blk)) {
@@ -58,22 +61,36 @@ RowNeeds row_needs(const flyx_bmodel* m) {
       n.max_loop_rank = std::max(n.max_loop_rank, e->loop_rank);
       ks({e->hidden, e->inter, 2 * e->hidden, e->loop_rank});
     } else if (const auto* h = std::get_if<HeadBlock>(&blk)) {
+      if (h->wb.data && h->wb.q8) n.q8 = true;
       ks({h->hidden});
-    } else if (std::holds_alternative<MtpBlock>(blk)) {
+    } else if (const auto* t = std::get_if<MtpBlock>(&blk)) {
       n.mtp = true;
+      if (t->fc.q8_inputs()) n.q8 = true;
       ks({2 * m->hidden});
     } else if (const auto* d = std::get_if<DFlashBlock>(&blk)) {
       const int df_feats = d->n_taps * d->target_hidden;
       n.feats += df_feats;
       n.cx = std::max(n.cx, d->hidden);
       n.ckv = std::max(n.ckv, d->ctx_width());
+      if (d->fc.q8_inputs() || d->ctx.q8_inputs() || d->sel_hid.q8_inputs()) n.q8 = true;
       ks({d->hidden, d->inter, d->nh * d->hd, df_feats});
+    } else if (const auto* dl = std::get_if<DFlashLayer>(&blk)) {
+      if (dl->w_qkv.q8_inputs() || dl->w_o.q8_inputs() || dl->w_gu.q8_inputs() || dl->w_down.q8_inputs() ||
+          dl->attn_proj.q8_inputs() || dl->mlp_proj.q8_inputs())
+        n.q8 = true;
     } else if (const auto* ds = std::get_if<DSparkBlock>(&blk)) {
       n.dspark = true;
       n.feats += ds->n_taps * m->hidden;
       n.cx = std::max(n.cx, ds->hidden);
       n.ckv = std::max(n.ckv, 2 * ds->nkv * ds->hd);
+      if (ds->markov_w2.q8_inputs() || ds->joint_proj.q8_inputs()) n.q8 = true;
       ks({ds->hidden, ds->inter, ds->nh * ds->hd, 2 * ds->hidden + 2 * ds->markov_rank, ds->markov_rank});
+    } else if (const auto* dsl = std::get_if<DSparkLayer>(&blk)) {
+      // Its linears made Q8_0 at load (draft_weights q8, or auto beside GGML block weights) declare no 8-bit inputs
+      // in the file: the staging for them is asked here.
+      for (const Lin* l : {&dsl->w_qkv, &dsl->w_q, &dsl->w_k, &dsl->w_v, &dsl->w_o, &dsl->w_ctx_kv, &dsl->w_k_ctx,
+                           &dsl->w_v_ctx, &dsl->w_gu, &dsl->w_gate, &dsl->w_up, &dsl->w_down})
+        if (l->q8_inputs()) n.q8 = true;
     }
   }
   if (has_rel_attn) n.max_bank = std::max(pass0_pushes + 2, 4);
@@ -378,7 +395,8 @@ int ensure_prefill_rows(flyx_bmodel* m, int rows) {
     m->prefill_bytes = 0;
     m->prefill_bufs = {};
     m->prefill_rows = 0;
-    return fail(std::string("prefill buffers: ") + e.what());
+    const bool oom = dynamic_cast<const OutOfDeviceMemory*>(&e) != nullptr;
+    return (oom ? fail_oom : fail)(std::string("prefill buffers: ") + e.what());
   }
   m->prefill_rows = rows;
   return 0;
@@ -387,8 +405,8 @@ int ensure_prefill_rows(flyx_bmodel* m, int rows) {
 void build_seq(flyx_bmodel* m, int32_t max_ctx, flyx_seq* s);
 
 // The layout's method for the sequence: exact, strata with a low-bit copy of 2 to 4 bits, or exact
-// below a switch and strata past it. The switch (unless the option sets it): kStrataHostExact
-// positions past the device's part; a session whose every position is exact keeps no copy.
+// below a switch and strata past it. The engine sets the switch before preflight. Direct ABI callers
+// can leave it at the layout default. A session whose every position is exact keeps no copy.
 bool take_method(const flyx_bmodel* m, const flyx_seq_layout* layout, flyx_seq* s) {
   if (!layout) return false;
   if (layout->method == FLYX_KV_READ_ALL) return true;
@@ -426,6 +444,8 @@ int seq_new_in(flyx_bmodel* m, const flyx_seq_layout* layout, flyx_seq** out) {
   probe.copy_host = std::max(0, layout->copy_host);
   try {
     build_seq(m, layout->max_ctx, &probe);
+  } catch (const OutOfDeviceMemory& e) {
+    return fail_oom(std::string("seq_new: ") + e.what());
   } catch (const std::exception& e) {
     return fail(std::string("seq_new: ") + e.what());
   }
@@ -439,6 +459,8 @@ int seq_new_in(flyx_bmodel* m, const flyx_seq_layout* layout, flyx_seq** out) {
   s->arena_host_bytes = probe.arena_host_bytes;
   try {
     build_seq(m, layout->max_ctx, s.get());
+  } catch (const OutOfDeviceMemory& e) {
+    return fail_oom(std::string("seq_new: ") + e.what());
   } catch (const std::exception& e) {
     return fail(std::string("seq_new: ") + e.what());
   }
@@ -462,6 +484,8 @@ int seq_size(flyx_bmodel* m, const flyx_seq_layout* layout, flyx_seq_size* out) 
   try {
     build_seq(m, layout->max_ctx, &s);
     room = graph_room(s, true);  // plans no session captured yet sized first (graphs.cpp)
+  } catch (const OutOfDeviceMemory& e) {
+    return fail_oom(e.what());
   } catch (const std::exception& e) {
     return fail(e.what());
   }
@@ -821,7 +845,6 @@ void alloc_state(const flyx_bmodel* m, flyx_seq* s) {
           b.swa_ring = true;
           b.ring = positions = ring;
         }
-      }
       }
     }
     b.layer_stride = size_t(positions) * k.nkv * k.hd;
@@ -1265,10 +1288,10 @@ void build_seq(flyx_bmodel* m, int32_t max_ctx, flyx_seq* s) {
     CK(cudaEventCreateWithFlags(&s->idle_ev, cudaEventDisableTiming));
     CK(cudaEventCreateWithFlags(&s->ready_ev, cudaEventDisableTiming));
     if (s->arena_dev_bytes > 0) {
-      void* p = nullptr;
-      CK(cudaMalloc(&p, s->arena_dev_bytes));
-      CK(cudaMemsetAsync(p, 0, s->arena_dev_bytes, s->st));
+      s->allocs.reserve(s->allocs.size() + 1);
+      void* p = device_malloc(s->arena_dev_bytes);
       s->allocs.push_back(p);
+      CK(cudaMemsetAsync(p, 0, s->arena_dev_bytes, s->st));
       s->dev_arena = static_cast<unsigned char*>(p);
       s->dev_arena_cap = s->arena_dev_bytes;
     }

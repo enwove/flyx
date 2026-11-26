@@ -178,7 +178,11 @@ void count_round_graphs(flyx_bmodel* m) {
   for (const auto& [plan, g] : m->round_graphs) all = all && g.counted;
   if (all) return;
   flyx_seq* s = nullptr;
-  if (seq_new(m, kGraphCountCtx, &s) != 0) throw std::runtime_error("sizing the round graphs: " + g_error);
+  if (const int rc = seq_new(m, kGraphCountCtx, &s); rc != 0) {
+    const auto why = "sizing the round graphs: " + g_error;
+    if (rc == FLYX_ERR_OOM) throw OutOfDeviceMemory(why);
+    throw std::runtime_error(why);
+  }
   const std::unique_ptr<flyx_seq> scratch(s);
   for (auto& [plan, g] : m->round_graphs)
     if (!g.counted) {

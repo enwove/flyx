@@ -31,9 +31,18 @@ struct RequestRecord {
   std::string response_id;
 };
 
+// One automatic VRAM-saving adjustment made during Engine::load() when the requested configuration
+// did not fit comfortably in available GPU memory. Never changes target model output tokens.
+struct LoadAdjustment {
+  std::string kind;    // "vision_device" | "draft_weights" | "drafter"
+  std::string from;    // requested value
+  std::string to;      // active value
+  std::string detail;  // clear human-readable explanation
+};
+
 // The loaded model, as of its load.
 struct ModelInfo {
-  std::string device, backend, drafter, chat_format, memory;  // memory: Engine::memory_report()
+  std::string device, backend, drafter, draft_weights, chat_format, memory;  // memory: Engine::memory_report()
   bool chat_ok = false, chat_native = false;
   bool vision = false;
   std::string vision_device, vision_quant;
@@ -42,6 +51,7 @@ struct ModelInfo {
   int max_ctx = 0, max_sessions = 0;
   uint64_t ledger_budget = 0;     // device bytes the engine may use (0 = unknown)
   double load_s = 0;
+  std::vector<LoadAdjustment> load_adjustments;
   // Where memory cut the context under the one wanted (Engine::budget): which memory, the context wanted, whether
   // the one it has is short (kShortCtx), and the figures behind it: the GPU's part the sessions share and what holds
   // the rest, the host memory K/V may take.

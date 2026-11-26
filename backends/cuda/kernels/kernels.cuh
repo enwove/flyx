@@ -17,6 +17,7 @@
 #include <cstdint>
 #include <string>
 
+#include "backends/cuda/kernels/block_layout.h"
 #include "flyx/backend_abi.h"
 
 namespace flyx::cuda {
@@ -463,10 +464,6 @@ struct BlockMat {
   int rows = 0;
   bool q8 = false;                  // every pass takes its inputs in 8 bits (FLYX_ACT_Q8)
 };
-struct BlockLayout {
-  int values, bytes, stride, scales;  // per block: weights, bytes in the file, payload bytes and scales on the device
-};
-BlockLayout blocks_layout(int dtype);  // values 0: not a type the kernels take
 // Builds the device tables the decoders read (ggml's codebooks as selectors
 // of their rows' magnitudes, bit fields and scales as binary16), once per
 // process.  The launchers below build them on first use; a backend calls

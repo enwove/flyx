@@ -31,9 +31,11 @@
 #include <vector>
 
 #include "backends/cuda/blocks.h"
+#include "backends/cuda/errors.h"
 #include "backends/cuda/kernels/kernels.cuh"
 #include "backends/cuda/runtime/draft_ring.h"
 #include "backends/cuda/runtime/vision_disk.h"
+#include "core/interfaces/options.h"
 #include "flyx/backend_abi.h"
 #include "ops/dtype/ref.h"
 
@@ -42,9 +44,6 @@ namespace flyx::cuda {
 // ---- errors ----------------------------------------------------------------------------------
 // The message last_error() returns (per thread).
 extern thread_local std::string g_error;
-struct CudaError : std::runtime_error {
-  using std::runtime_error::runtime_error;
-};
 void ck(cudaError_t e, const char* what);
 #define CK(x) ::flyx::cuda::ck((x), #x)
 // The model's device memory (flyx_bmodel::alloc) and the prefill buffers: cudaMalloc that never takes more than the
@@ -52,13 +51,11 @@ void ck(cudaError_t e, const char* what);
 // every round (Qwen3.5-4B NVFP4 beside other programs holding 4.7 of 8 GB: 12.5 tok/s plain against 132.4); this
 // throws OutOfDeviceMemory instead (and so does a refusal by the driver).  device_room: the same check alone, for
 // memory the driver maps (a VMM slab), throwing where device_malloc would.
-struct OutOfDeviceMemory : CudaError {
-  using CudaError::CudaError;
-};
 void device_room(size_t bytes);
 void* device_malloc(size_t bytes);
-// Records m for last_error(); returns -1.
+// Records m for last_error(); returns -1 (or FLYX_ERR_OOM for device memory exhaustion).
 int fail(const std::string& m);
+int fail_oom(const std::string& m);
 // fail() for a call given no sequence (a session whose seq_new failed or was never made): an error, not a crash.
 int no_sequence(const char* call);
 
@@ -92,7 +89,8 @@ inline void destroy_side(SideStream& s) {
 //   wait=spin|poll|auto   wait for the device by spinning (lowest latency, one core busy), by polling with short sleeps
 //                         (the default on Linux), or (auto, the default on Windows) spinning while the last waits for a
 //                         round's result took under 1.5 ms (a sleep ends ~0.5 ms late), polling past that (runner.cpp)
-//   draft_weights=exact   drafts read the bf16 head, MTP layer and DFlash2 drafter, not NVFP4 or Q8_0 copies
+//   draft_weights=auto|nvfp4|q8|exact  drafter weight precision (auto: target-matched when roomy, NVFP4 when VRAM is
+//                         tight; nvfp4: 4-bit; q8: Q8_0; exact: file precision and uncompacted draft head)
 //   draft_kv=16           the MTP layer's K/V cache in binary16, not FP8 with the target's (when they are FP8)
 //   blocks=bf16           GGML block weights (GGUF) decoded to bf16 at load instead of kept packed
 //   embed=gpu an embedding table no head reads on the GPU, not in host memory
@@ -115,8 +113,8 @@ inline void destroy_side(SideStream& s) {
 //                         a 2-bit copy, 64 with more; 0: none, the copy alone), at least strata_least=N pairs (32),
 //                         plus the last strata_recent=N positions, and at most strata_most=N pairs (256; 0: no
 //                         bound); strata_scan=cores, strata_grid=normal: measurement
-//   strata_from=N         --kv-method auto: rounds read the copy from position N on (default: the GPU's part of
-//                         the K/V, i.e. 0 tokens of exact host overhang)
+//   strata_from=N         --kv-method auto: read the copy from position N on (overrides the engine's
+//                         target-only reference position)
 //   act_group=64|128|256  measurement: 8-bit inputs with one scale this many values (bench/quality/kld.cpp; with
 //                         fusion=0 and round_glu=0, whose producers round their own outputs per 32)
 //   act_fp4=1|2           measurement: inputs first rounded as NVFP4 (1) or MXFP8 (2) activations would be
@@ -132,7 +130,8 @@ enum class WaitMode { poll, spin, automatic };  // option wait=poll|spin|auto
 enum class PageableKvMode { off, on, automatic };  // option pageable_kv=off|on|auto
 struct BackendOptions {
   KernelOptions kernels;  // the ones launches consult
-  bool profile = false, graphs = true, fusion = true, exact_drafts = false;
+  bool profile = false, graphs = true, fusion = true;
+  interfaces::DraftWeightsMode draft_weights = interfaces::DraftWeightsMode::kAuto;
   bool dv_conditional = true;  // option dv_conditional=0 clears it: DV's canvas pass inline in a round's graph
   bool stage_dma = true;
   // How a thread waits for the device (runner.cpp; on WSL2 every CUDA wait spins a core, so the default polls).  On
@@ -466,6 +465,7 @@ struct flyx_bmodel {
   std::mutex prefill_mu;                // lock order: prefill_mu before batch->mu
   bool kv_fp8 = false;   // the target's K/V caches in e4m3 (open option)
   flyx::cuda::BackendOptions opt;    // open()'s options; opt.kernels is what every launch for this model consults
+  std::string active_draft_weights;  // effective drafter precision ("nvfp4", "q8", "exact", or "" when none)
   std::unique_ptr<flyx::cuda::BatchRounds> batch;  // rounds of several sequences
   // Round graphs: every round plan lowered (plan_free forgets it) and its graph's size, counted when a
   // session's room for graphs is first asked after it was lowered (graph_room, which seq_bytes counts).
@@ -1113,6 +1113,12 @@ struct Pass {
 
 // loader/bind.cpp: blocks and the state table from the description's tables; uploads the weights.
 void bind(flyx_bmodel* m, const flyx_model_desc& d, LoadTimes* times = nullptr);
+// Resolve placement from the representation the loader uploads. Optionally report resident bytes and vision weights.
+int resolve_vision_device(const flyx_model_desc& desc, const BackendOptions& opt, uint64_t free_vram,
+                          uint64_t* resident_bytes, std::vector<char>* vision_weights = nullptr);
+// Pre-flight device memory estimate (ABI 45: flyx_backend_api::estimate_load).
+int estimate_load(const flyx_model_desc* desc, const flyx_open_options* opts, uint64_t free_vram,
+                  uint64_t total_vram, flyx_load_estimate* out);
 // The DV block i's selector token tables (DvBlock::sel_ta, sel_tb: [vocab][sel_rank] float32 each, counted with the
 // weights), made once, when lowering a plan that drafts with them: past bind, where out of GPU memory is no refusal
 // of the model but a plan the engine lowers again once the backend has given back what it keeps for speed (trim).

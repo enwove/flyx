@@ -615,7 +615,7 @@ void dflash_file(const std::string& dir, const std::string& backend) {
   // than in the loop above.
   plain.reset();
   // The packed drafters beside a BF16 target (packed GGML weights inside DFlash2 when the target itself is
-  // non-quantized), plus fusion=0 parity on CUDA.
+  // non-quantized), plus fusion=0 parity and draft_weights=nvfp4/q8 regressions on CUDA.
   {
     const auto p = golden.at("cases").at(0).at("prompt").get<std::vector<int32_t>>();
     const auto want = tokens_of(*engine(dir + "/tiny_gguf.gguf", backend), p, 32);
@@ -635,6 +635,40 @@ void dflash_file(const std::string& dir, const std::string& backend) {
         same_drafts = a[i].n_drafts == b[i].n_drafts &&
                       std::equal(a[i].drafts, a[i].drafts + a[i].n_drafts, b[i].drafts);
       check(same_drafts, which + ": fused == generic (fusion=0) tokens and drafts");
+      fused.reset();
+      generic.reset();
+      // Streaming GGML->NVFP4 conversion on Q8_0 and mixed Q4_0+Q8_0 stacks (where attn.v is shared across
+      // layer w_qkv and context ctx): must never release shared WeightLoader::packs_ entries and must preserve output.
+      Load fp4_load = drafted;
+      fp4_load.prefill_chunk = 64;
+      fp4_load.options = "draft_weights=nvfp4";
+      auto fp4 = engine(dir + "/tiny_gguf.gguf", backend, fp4_load);
+      Load fp4_gen = fp4_load;
+      fp4_gen.options = "draft_weights=nvfp4,fusion=0";
+      auto fp4_g = engine(dir + "/tiny_gguf.gguf", backend, fp4_gen);
+      std::vector<int32_t> tfa, tfb;
+      const auto fa = traced(*fp4, p, 32, &tfa), fb = traced(*fp4_g, p, 32, &tfb);
+      bool same_fp4 = same_tokens(tfa, want) && tfa == tfb && fa.size() == fb.size();
+      for (size_t i = 1; same_fp4 && i < fa.size(); ++i)
+        same_fp4 = fa[i].n_drafts == fb[i].n_drafts &&
+                   std::equal(fa[i].drafts, fa[i].drafts + fa[i].n_drafts, fb[i].drafts);
+      check(same_fp4, which + " draft_weights=nvfp4: exact target tokens and fused == generic drafts");
+    }
+    // On-the-fly Q8_0 drafter weights beside a BF16 target (desc has no FLYX_ACT_Q8 weights) with >16-row prefill:
+    // exercises RowNeeds::q8 propagation from bound drafter blocks so q8_parts/round_parts scratch is allocated.
+    if (backend != "cpu_ref") {
+      std::vector<int32_t> long_p = p;
+      while (long_p.size() < 48) long_p.insert(long_p.end(), p.begin(), p.end());
+      long_p.resize(48);
+      const auto want_long = tokens_of(*engine(dir + "/tiny_gguf.gguf", backend, {.prefill_chunk = 64}), long_p, 24);
+      auto bf16_q8_draft = engine(dir + "/tiny_gguf.gguf", backend,
+                                  {.speculative = true,
+                                   .prefill_chunk = 64,
+                                   .drafter = "dflash2",
+                                   .drafter_files = {drafter},
+                                   .options = "draft_weights=q8"});
+      check(same_tokens(tokens_of(*bf16_q8_draft, long_p, 24), want_long),
+            "BF16 target + DFlash2 draft_weights=q8 with >16-row prefill: plain decoding's tokens");
     }
     // The sliding-window drafter's context cache as a ring of slots (dflash_ring).
     if (backend != "cpu_ref") dflash_ring(dir, backend, p);

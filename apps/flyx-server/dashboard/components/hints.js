@@ -78,6 +78,16 @@ const RULES = [
       text: ["Coding agents may run out of context in long sessions.", fix],
       actions: acts };
   }],
+  // Model loaded with automatic VRAM-saving adjustments (e.g. drafter quantized to NVFP4 or skipped, vision offloaded).
+  ["degraded", (c) => {
+    const deg = c.served ? ((Array.isArray(c.L.degraded) && c.L.degraded.length ? c.L.degraded : c.model.degraded) || []) : [];
+    if (!deg.length) return null;
+    return { key: "degraded:" + c.model.id + ":" + deg.map((d) => d.kind + "=" + d.to).join(","), tone: "warn", hideOn: ["model"],
+      title: "Loaded with VRAM adjustments",
+      text: deg.map((d) => d.detail).filter(Boolean),
+      actions: [{ label: "Manage VRAM", primary: true, run: (n) => n.openMem && n.openMem("vram") },
+                { label: "View details", run: (n) => n.showModel() }] };
+  }],
   // A model served, and Integration never opened: connect a client.
   ["connect", (c) => {
     if (!c.served || c.visited("integration")) return null;
