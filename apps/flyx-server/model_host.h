@@ -30,8 +30,8 @@ class ModelHost {
     std::vector<std::string> drafters;  // likewise
     EngineOptions eo;                   // the server's engine options, with what the panel changed
     std::string name;                   // the API's model id; empty: the file's name
-    // The drafters' backend options the panel chose ("full" / "exact"; empty: the backend's defaults), also folded
-    // into eo.backend_options; kept apart so GET /v1/load can say what was asked.
+    // The drafters' backend options the panel chose ("full", "nvfp4" / "q8" / "exact"; empty: the backend's defaults),
+    // also folded into eo.backend_options; kept apart so GET /v1/load can say what was asked.
     std::string draft_head{}, draft_weights{};
   };
 

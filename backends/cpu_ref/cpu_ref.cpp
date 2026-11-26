@@ -1751,6 +1751,8 @@ const flyx_backend_api kApi = {
     nullptr,  // prefill_snapshot: prefill_align 1, a pass crosses no boundary it keeps
     encode_vision,
     prefill_ex,
+    nullptr,  // estimate_load: CPU reference has no GPU VRAM budget
+    nullptr,  // draft_weights: CPU reference keeps exact float64 weights
 };
 
 }  // namespace

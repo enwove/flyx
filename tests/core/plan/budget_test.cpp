@@ -515,18 +515,25 @@ int main() {
             plan::host_keep(64 * kGiB) == 4 * kGiB && plan::host_keep(128 * kGiB) == 8 * kGiB,
         "host memory kv_ram auto leaves: 2 GiB at least, a sixteenth of the RAM");
 
-  // seq_size() failure must fail plan::account() with the backend's error instead of succeeding with session_bytes == 0.
+  // seq_size() failure must fail plan::account() with the backend's error instead of succeeding with session_bytes == 0,
+  // and distinguish FLYX_ERR_OOM from generic non-OOM failures.
   {
     flyx_backend_api api_fail = fake();
-    api_fail.seq_size = [](flyx_bmodel*, const flyx_seq_layout*, flyx_seq_size*) -> int { return -1; };
+    api_fail.seq_size = [](flyx_bmodel*, const flyx_seq_layout*, flyx_seq_size*) -> int { return FLYX_ERR_OOM; };
     api_fail.last_error = []() -> const char* { return "sizing the round graphs: out of GPU memory"; };
     ResourceLedger ledger;
     plan::Budget b;
     std::string err;
     int ctx = 8192;
     const bool ok = plan::account(&api_fail, nullptr, false, false, &ctx, 4096, kGpuOnly, &ledger, &b, &err);
-    check(!ok && err.find("sizing the round graphs") != std::string::npos,
-          "seq_size failure fails plan::account with backend error: " + err);
+    check(!ok && b.oom && err.find("sizing the round graphs") != std::string::npos,
+          "seq_size OOM fails plan::account with b.oom=true and backend error: " + err);
+    api_fail.seq_size = [](flyx_bmodel*, const flyx_seq_layout*, flyx_seq_size*) -> int { return -1; };
+    api_fail.last_error = []() -> const char* { return "unsupported layout"; };
+    err.clear();
+    const bool ok2 = plan::account(&api_fail, nullptr, false, false, &ctx, 4096, kGpuOnly, &ledger, &b, &err);
+    check(!ok2 && !b.oom && err.find("unsupported layout") != std::string::npos,
+          "seq_size non-OOM fails plan::account with b.oom=false: " + err);
   }
 
   // fit_second_session() must preserve non-1024-aligned device_positions (e.g. 512-token VMM granularity -> 1536)

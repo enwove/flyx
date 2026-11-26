@@ -86,8 +86,10 @@ function Serving({ tm, again, retry, browse }) {
   const loadedWant = model.id && L.loaded ? L.loaded : null, busy = busyLoad(L);
   const [msg, setMsg] = useState("");
   const [vramOpen, setVramOpen] = useState(false);
+  const activeDraft = model.drafter && model.drafter !== "none" ? model.drafter : "";
+  const degraded = model.loaded && !busy ? ((Array.isArray(L.degraded) && L.degraded.length ? L.degraded : model.degraded) || []) : [];
   const drafters = model.loaded && !busy ? draftersOf(L).slice() : [];
-  if (model.loaded && !busy && model.drafter && /mtp/.test(model.drafter) && !drafters.some((d) => d.kind === "mtp"))
+  if (model.loaded && !busy && activeDraft && /mtp/.test(activeDraft) && !drafters.some((d) => d.kind === "mtp"))
     drafters.unshift({ kind: "mtp", from: "model file" });
   const draftTip = drafters.map((d) => drafterLabel(d.kind) + ": " + d.from + (d.size ? " · " + gb(d.size) + " GB" : "")).join("\n");
   const visionTip = model.loaded && !busy && model.vision
@@ -100,7 +102,7 @@ function Serving({ tm, again, retry, browse }) {
     facts.push(["Context", fmt(model.context)]);
     if (loadedWant) facts.push(["KV cache", loadedWant.kv === "16" ? "16-bit" : loadedWant.kv === "fp8" ? "fp8" : "auto"]);
     facts.push(["Sessions", fmt(model.max_sessions)]);
-    facts.push(["Drafting", model.drafter ? model.drafter + ", up to " + model.max_width : "off", draftTip]);
+    facts.push(["Drafting", activeDraft ? activeDraft + (model.draft_weights ? " · " + model.draft_weights : "") + ", up to " + model.max_width : "off", draftTip]);
     facts.push(["Vision", model.vision ? t(normVisionDev(model.vision_device)) + " · " + normVisionQuant(model.vision_quant) : "off", visionTip]);
     if (model.load_s) facts.push(["Load time", secs(model.load_s)]);
     if (tm.memory && tm.memory.ledger_used) facts.push(["Memory", gib(tm.memory.ledger_used) + " GiB"]);
@@ -119,7 +121,7 @@ function Serving({ tm, again, retry, browse }) {
     : ctxLimit.by === "host" ? "ram"
     : ctxLimit.by === "gpu" && ctxLimit.closable ? "vram" : "";
   const vramErr = !busy && isVramError(L.error);
-  const showMemPanel = vramErr || (!!ctxMemKind && vramOpen);
+  const showMemPanel = vramErr || ((!!ctxMemKind || degraded.length > 0) && vramOpen);
   const panelKind = vramErr ? "vram" : (ctxMemKind || "vram");
   const stateName = { none: "Nothing loaded", fetching: "Fetching", loading: "Loading", ready: "Serving", failed: "Failed" }[L.state] || L.state;
   const tone = L.state === "ready" ? "ok" : L.state === "failed" ? "bad" : busy ? "warn" : "";
@@ -146,6 +148,17 @@ function Serving({ tm, again, retry, browse }) {
           <${Icon} name="play"/>${t("Load the last model again")}</button>` : ""}
         <button class=${"btn" + (again ? "" : " primary")} id="ld-browse" onClick=${browse}>${t("Explore the model library")}</button></div>` : ""}
       <dl class="stats" id="ld-facts" hidden=${!facts.length}>${facts.map(([k, v, tip]) => html`<div title=${tip || undefined}><dt>${t(k)}</dt><dd>${t(v)}</dd></div>`)}</dl>
+      <div class="banner warn" id="ld-degraded" hidden=${!degraded.length}>
+        <div class="grow2">
+          <b>${t("Loaded with VRAM adjustments")}</b>
+          ${degraded.map((d) => html`<div class="deg-item">${t(d.detail || "")}</div>`)}
+          <div class="deg-now">${t("Active now:")} ${t("Drafting")} ${activeDraft ? activeDraft + (model.draft_weights ? " (" + model.draft_weights + ")" : "") : t("off")} · ${t("Vision")} ${model.vision ? t(normVisionDev(model.vision_device)) + " (" + normVisionQuant(model.vision_quant) + ")" : t("off")}</div>
+        </div>
+        <div class="deg-acts">
+          <button class="btn sm" id="ld-deg-vram" onClick=${() => setVramOpen((v) => !v)}>${t(vramOpen ? "Hide apps" : "Manage VRAM")}</button>
+          ${loadedWant ? html`<button class="btn sm primary" id="ld-deg-restore" onClick=${reloadServed}>${t("Restore full settings")}</button>` : ""}
+        </div>
+      </div>
       <div class=${"banner " + (limit && limit.short ? "warn" : "hint")} id="ld-ctx" hidden=${!limit}>
         <div class="grow2">${limit ? limit.parts.map((s) => t(s)).join(" ").replace(/([。！？]) /g, "$1") : ""}</div>
         ${ctxMemKind ? html`<button class="btn sm" id="ld-vram-toggle" onClick=${() => setVramOpen((v) => !v)}>
@@ -168,16 +181,19 @@ const kindOf = (d) => /\.gguf$/i.test(d)
   : "dflash2";
 const normVisionDev = (v) => (v === "host" || v === "cpu") ? "host" : v === "gpu" ? "gpu" : v === "auto" ? "auto" : "disk";
 const normVisionQuant = (v) => (v === "exact" || v === "bf16") ? "exact" : (v === "nvfp4" || v === "fp4") ? "nvfp4" : "q8";
+const normDraftWeights = (v) => (v === "nvfp4" || v === "fp4") ? "nvfp4" : (v === "q8" || v === "q8_0") ? "q8" : (v === "exact" || v === "bf16") ? "exact" : "";
 
 // The settings of a want as the form shows them, for comparing with what is loaded.
 function shown(w) {
   const vOn = w.vision !== false;
+  const dw = normDraftWeights(w.draft_weights);
   return { ctx: w.ctx || "auto", kv: w.kv === "16" ? "16-bit" : w.kv === "fp8" ? "fp8" : "auto",
            kv_ram: typeof w.kv_ram === "number" ? w.kv_ram + " GB" : "auto", kv_gpu: typeof w.kv_gpu === "number" ? fmt(w.kv_gpu) : "as many as fit",
            name: w.name || "the file's name",
            spec: w.speculative === false ? "off" : "on", drafter: [w.drafter || "default", ...(w.drafters || [])],
            width: w.width === null || w.width === undefined ? "auto" : String(w.width),
-           head: w.draft_head === "full" ? "full head" : "1-bit pick", weights: w.draft_weights === "exact" ? "exact" : "compact copy",
+           head: w.draft_head === "full" ? "full head" : "1-bit pick",
+           weights: dw === "nvfp4" ? "NVFP4" : dw === "q8" ? "Q8_0" : dw === "exact" ? "exact" : "auto",
            lookup: w.lookup !== false ? "on" : "off", trees: w.draft_trees ? "on" : "off",
            vision: vOn ? "on" : "off", mmproj: vOn ? (w.mmproj || "auto") : "auto",
            vision_device: normVisionDev(w.vision_device), vision_quant: normVisionQuant(w.vision_quant),
@@ -199,7 +215,7 @@ function formOf(w) {
            kvgpu: typeof w.kv_gpu === "number" ? String(w.kv_gpu) : "", name: w.name || "",
            spec: w.speculative !== false, ...draftingOf(w), draftPicked: false,
            width: w.width === null || w.width === undefined ? "" : String(w.width), trees: !!w.draft_trees, lookup: w.lookup !== false,
-           head: w.draft_head === "full" ? "full" : "", weights: w.draft_weights === "exact" ? "exact" : "",
+           head: w.draft_head === "full" ? "full" : "", weights: normDraftWeights(w.draft_weights),
            vision: vOn, visionSource: vOn && w.mmproj ? "custom" : "default", mmproj: vOn ? (w.mmproj || "") : "", mmprojPicked: false,
            vision_device: normVisionDev(w.vision_device), vision_quant: normVisionQuant(w.vision_quant),
            vision_max_tokens: w.vision_max_tokens > 0 ? String(w.vision_max_tokens) : "" };
@@ -631,10 +647,11 @@ export function ModelPage({ active, libraryAsked, currentAsked }) {
   // The default drafter, as the settings say it: what the server loaded with the model served, when that drafts with
   // its default; else what a model brings along.
   function defaultDrafter() {
+    const activeDraft = model.drafter && model.drafter !== "none" ? model.drafter : "";
     if (loadedWant && loadedWant.speculative !== false && !loadedWant.drafter && !loadedWant.drafters?.length) {
       const list = draftersOf(L).map((d) => (d.kind === "mtp" ? "MTP" : d.kind === "dflash2" ? "DFlash2" : d.kind) + " · " +
         (d.from === "model file" ? t("the model file's own layer") : t("from " + d.from + (d.size ? " (" + gb(d.size) + " GB)" : ""))));
-      if (!list.length && model.drafter) list.push(model.drafter.toUpperCase() + " · " + t("the model file's own layer"));
+      if (!list.length && activeDraft) list.push(activeDraft.toUpperCase() + " · " + t("the model file's own layer"));
       return list.length ? { tag: "in use", tone: "ok", lines: list } : { tag: "none", tone: "", lines: [t("This model loaded no drafter: plain decoding.")] };
     }
     return { tag: "", tone: "", lines: [t("The model's own MTP layer, if it has one.")] };
@@ -681,9 +698,10 @@ export function ModelPage({ active, libraryAsked, currentAsked }) {
   const visChg = ["vision", "mmproj", "vision_device", "vision_quant", "vision_max_tokens"].filter((k) => changed.includes(k)).length;
 
   function settingsView(cmdModel) {
-    const specLoaded = !!model.drafter, visLoaded = !!model.vision;
+    const activeDraft = model.drafter && model.drafter !== "none" ? model.drafter : "";
+    const specLoaded = !!activeDraft, visLoaded = !!model.vision;
     const activeDrafters = model.loaded && !busy ? draftersOf(L).slice() : [];
-    if (model.loaded && !busy && model.drafter && /mtp/.test(model.drafter) && !activeDrafters.some((d) => d.kind === "mtp"))
+    if (model.loaded && !busy && activeDraft && /mtp/.test(activeDraft) && !activeDrafters.some((d) => d.kind === "mtp"))
       activeDrafters.unshift({ kind: "mtp", from: "model file" });
     const specSum = !f.spec ? t("off") : f.draftSource === "custom" && own ? baseName(own) : f.draftSource === "saved" ? t("last loaded") :
                     specLoaded ? t("default") : t("none");
@@ -784,9 +802,13 @@ export function ModelPage({ active, libraryAsked, currentAsked }) {
               <${Field} k="head" label="Draft head" was=${was("head")} hint="How drafts choose their tokens.">
                 <select id="sd-head" value=${f.head} onChange=${set("head")} disabled=${specOff}>
                   <option value="">${t("1-bit pick (default)")}</option><option value="full">${t("Full head")}</option></select><//>
-              <${Field} k="weights" label="Drafter weights" was=${was("weights")} hint="Only the drafts can change, never the output.">
+              <${Field} k="weights" label="Drafter weights" was=${was("weights")} hint="Auto picks best precision when VRAM allows, and drops to NVFP4 when tight. Only drafts change, never output.">
                 <select id="sd-weights" value=${f.weights} onChange=${set("weights")} disabled=${specOff}>
-                  <option value="">${t("Compact copy (default)")}</option><option value="exact">${t("Exact")}</option></select><//>
+                  <option value="">${t("Auto (default)")}</option>
+                  <option value="nvfp4">${t("NVFP4 (4-bit)")}</option>
+                  <option value="q8">${t("Q8_0 (8-bit)")}</option>
+                  <option value="exact">${t("Exact")}</option>
+                </select><//>
               <${Field} k="lookup" label="Drafts from repeated text" was=${was("lookup")} hint="Where the reply repeats earlier text, that text is proposed too.">
                 <label class="switch"><input type="checkbox" id="sd-lookup" checked=${f.lookup} onChange=${set("lookup")} disabled=${specOff}/><i></i>${t(f.lookup ? "on" : "off")}</label><//>
               <${Field} k="trees" label="Draft trees" was=${was("trees")} hint="The drafter proposes several branches at once, not one line.">

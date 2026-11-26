@@ -231,6 +231,7 @@ void Scheduler::publish_model() {
   m.device = engine_->device().name;
   m.backend = engine_->backend_name();
   m.drafter = engine_->drafter();
+  m.draft_weights = engine_->draft_weights();
   m.chat_format = chat_.format();
   m.chat_ok = chat_.ok();
   m.chat_native = chat_.native();
@@ -246,6 +247,7 @@ void Scheduler::publish_model() {
   m.max_sessions = max_sessions_;
   m.ledger_budget = engine_->ledger().budget();
   m.load_s = load_s_;
+  m.load_adjustments = engine_->load_adjustments();
   m.ctx_limit = engine_->budget().ctx_limit;
   m.wanted_ctx = engine_->wanted_ctx();
   m.kv_gpu_tokens = std::max(0, std::min(engine_->budget().layout.device_positions, m.max_ctx));

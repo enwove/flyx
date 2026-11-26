@@ -355,6 +355,9 @@ textarea:focus, input:focus, select:focus { outline: none; border-color: var(--a
 .banner .grow2 { flex: 1; min-width: 0; overflow-wrap: anywhere; }
 .banner .btn { flex: none; }
 .banner code { background: rgba(255, 255, 255, 0.5); }
+.deg-item { margin-top: 2px; }
+.deg-now { margin-top: 4px; font-size: 12px; color: var(--muted); }
+.deg-acts { display: flex; flex-wrap: wrap; gap: 6px; align-items: center; }
 .vapps { grid-column: 1 / -1; margin-top: 2px; padding: 12px 14px; border: 1px solid var(--border); border-radius: var(--r-lg); background: var(--surface); }
 .modal.vram-modal { width: min(560px, 100%); padding: 0; overflow: hidden; }
 .vapps.in-modal { margin-top: 0; border: 0; border-radius: 0; padding: 18px 20px 16px; }

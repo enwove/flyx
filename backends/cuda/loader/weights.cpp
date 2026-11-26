@@ -126,107 +126,18 @@ uint16_t float_to_bf16(float f) {
 
 // ---- weights -------------------------------------------------------------------------------
 // Drafts never reach the output (the target verifies each one), so the
-// weights only drafting reads are NVFP4, made at load: a quarter of the bytes;
-// only the acceptance can change.
+// weights only drafting reads are quantized on the fly during bind() via
+// WeightLoader::lin_stack_quant (streaming through a 32 MiB device staging
+// pair so load peak VRAM stays flat):
 // * Draft logits (each MTP step, the DFlash2 block) read the whole head, ~2 ms
-//   in bf16 for Qwen3.5's 248K x 2560: an NVFP4 copy (the target keeps its own).
-// * The MTP layer (projections and fc, bf16 in the checkpoints) runs only for
-//   drafts and their context: quantized in place, the bf16 freed; the DFlash2
-//   drafter too, in NVFP4 beside an NVFP4 target and in Q8_0 (8-bit inputs,
-//   the block kernels) beside GGML block weights.
-// Option draft_weights=exact keeps them exact.
+//   in bf16 for Qwen3.5's 248K x 2560: a 1-bit SignHead or NVFP4 copy (the
+//   target keeps its own).
+// * The MTP layer (projections and fc) runs only for drafts and their context.
+// * The DFlash2 drafter defaults to target-matched precision when VRAM allows
+//   (BF16 beside BF16, Q8_0 beside GGUF, NVFP4 beside NVFP4) and drops to NVFP4
+//   when VRAM is tight.
+// Option draft_weights=auto|nvfp4|q8|exact selects the policy.
 void rows_to_bf16(const float* x, int ldx, int rows, int K, bf16* out, cudaStream_t st);
-
-void quantize_in_place(flyx_bmodel* m, Lin& l, int N, int K) {
-  if (l.q || !l.w || K % 64 != 0) return;  // already NVFP4, or not a shape the NVFP4 GEMMs take
-  l.q = m->alloc<uint8_t>(size_t(N) * K / 2);
-  l.s = m->alloc<uint8_t>(size_t(N) * K / 16);
-  l.rs = m->alloc<float>(N);
-  quantize_nvfp4(l.w, N, K, l.q, l.s, l.rs, 0);
-  CK(cudaDeviceSynchronize());
-  m->release(l.w, size_t(N) * K * sizeof(bf16));
-  l.w = nullptr;
-}
-
-void quantize_packed_in_place(flyx_bmodel* m, Lin& l, int N, int K) {
-  if (!l.packed() || l.q || K % 64 != 0) return;
-  int total_rows = 0;
-  size_t old_bytes = 0;
-  for (const BlockMat& bm : l.blk) {
-    if (!bm.data || bm.rows <= 0) return;
-    total_rows += bm.rows;
-    const BlockLayout lo = blocks_layout(bm.dtype);
-    const size_t per_row = size_t(K) / size_t(lo.values);
-    old_bytes += size_t(bm.rows) * per_row * (size_t(lo.stride) + size_t(lo.scales) * sizeof(uint16_t));
-  }
-  if (total_rows != N) return;
-  // Never inflate ultra-low-bit (2-3 bpw) GGUF drafter weights into 4.5-bpw NVFP4.
-  const size_t new_bytes = size_t(N) * K / 2 + size_t(N) * K / 16 + size_t(N) * sizeof(float);
-  if (old_bytes * 10 < new_bytes * 9) return;
-  uint8_t *q = nullptr, *s = nullptr;
-  float* rs = nullptr;
-  try {
-    q = m->alloc<uint8_t>(size_t(N) * K / 2);
-    s = m->alloc<uint8_t>(size_t(N) * K / 16);
-    rs = m->alloc<float>(N);
-  } catch (const OutOfDeviceMemory&) {
-    if (q) m->release(q, size_t(N) * K / 2);
-    if (s) m->release(s, size_t(N) * K / 16);
-    if (rs) m->release(rs, size_t(N) * sizeof(float));
-    return;
-  }
-  constexpr int kRun = 1024;
-  std::vector<int> ids(kRun);
-  struct DeviceGuard {
-    void* p = nullptr;
-    ~DeviceGuard() {
-      if (p) cudaFree(p);
-    }
-  } dids_g, f32_g, bf16_g;
-  CK(cudaMalloc(&dids_g.p, sizeof(int) * kRun));
-  CK(cudaMalloc(&f32_g.p, sizeof(float) * size_t(kRun) * K));
-  CK(cudaMalloc(&bf16_g.p, sizeof(bf16) * size_t(kRun) * K));
-  int* dids = static_cast<int*>(dids_g.p);
-  float* f32 = static_cast<float*>(f32_g.p);
-  bf16* b16 = static_cast<bf16*>(bf16_g.p);
-  int dst_row = 0;
-  for (const BlockMat& bm : l.blk) {
-    for (int r0 = 0; r0 < bm.rows; r0 += kRun) {
-      const int n = std::min(kRun, bm.rows - r0);
-      for (int i = 0; i < n; ++i) ids[size_t(i)] = r0 + i;
-      CK(cudaMemcpy(dids, ids.data(), sizeof(int) * size_t(n), cudaMemcpyHostToDevice));
-      embed_blocks(dids, bm, K, f32, n, 0);
-      rows_to_bf16(f32, K, n, K, b16, 0);
-      quantize_nvfp4(b16, n, K, q + size_t(dst_row) * K / 2, s + size_t(dst_row) * K / 16, rs + dst_row, 0);
-      dst_row += n;
-    }
-  }
-  CK(cudaDeviceSynchronize());
-  for (const BlockMat& bm : l.blk) {
-    const BlockLayout lo = blocks_layout(bm.dtype);
-    const size_t per_row = size_t(K) / size_t(lo.values);
-    m->release(const_cast<uint8_t*>(bm.data), size_t(bm.rows) * per_row * size_t(lo.stride));
-    m->release(const_cast<uint16_t*>(bm.scales), size_t(bm.rows) * per_row * size_t(lo.scales) * sizeof(uint16_t));
-  }
-  l.blk.clear();
-  l.q = q;
-  l.s = s;
-  l.rs = rs;
-}
-
-// A bf16 matrix as Q8_0 blocks whose inputs are 8 bits (FLYX_ACT_Q8), the bf16 freed: the DFlash2 drafter's
-// projections beside a target of GGML block weights (half their bytes a round).
-void q8_in_place(flyx_bmodel* m, Lin& l, int N, int K) {
-  if (l.packed() || l.q || !l.w || K % 32 != 0) return;
-  const size_t blocks = size_t(N) * (K / 32);
-  uint8_t* payload = m->alloc<uint8_t>(blocks * 32);
-  uint16_t* scales = m->alloc<uint16_t>(blocks);
-  quantize_q8_0(l.w, N, K, payload, scales, 0);
-  CK(cudaDeviceSynchronize());
-  m->release(l.w, size_t(N) * K * sizeof(bf16));
-  l.w = nullptr;
-  l.blk = {BlockMat{payload, scales, FLYX_DT_GGML_Q8_0, N, true}};
-}
 
 namespace {
 
@@ -397,20 +308,6 @@ uint64_t trim(flyx_bmodel* m, uint64_t bytes) {
 
 namespace {
 
-enum class TargetQuant { kFloat, kNvfp4, kPacked };
-
-// Target precision from its own MLP layers (excluding MTP's own MLP, which is quantized separately).
-TargetQuant target_quant_kind(const flyx_bmodel* m) {
-  bool fp4 = false, packed = false;
-  const int mtp_mlp = m->mtp_block >= 0 ? block<MtpBlock>(m, m->mtp_block).mlp : -1;
-  for (size_t i = 0; i < m->blocks.size(); ++i)
-    if (const auto* f = std::get_if<MlpBlock>(&m->blocks[i]); f && int(i) != mtp_mlp) {
-      fp4 = fp4 || f->w_gu.q;
-      packed = packed || f->w_gu.packed();
-    }
-  return fp4 ? TargetQuant::kNvfp4 : packed ? TargetQuant::kPacked : TargetQuant::kFloat;
-}
-
 // Unified 1-bit SignHead builder for either a bf16 matrix (w) or a packed GGML BlockMat (wb).
 // Returns false without throwing if the GPU lacks room (caller falls back cleanly to the full matrix).
 bool make_sign_head_for(flyx_bmodel* m, const bf16* w, const BlockMat* wb, int N, int K, SignHead* out,
@@ -461,62 +358,11 @@ bool make_sign_head_for(flyx_bmodel* m, const bf16* w, const BlockMat* wb, int N
   return true;
 }
 
-// Quantize MTP's single sequential layer to NVFP4 (both BF16 and Q8_0/packed checkpoints).
-void quantize_mtp_weights(flyx_bmodel* m) {
-  if (m->mtp_block < 0) return;
-  auto& b = block<MtpBlock>(m, m->mtp_block);
-  auto& a = block<AttnBlock>(m, b.attn);
-  auto& f = block<MlpBlock>(m, b.mlp);
-  const size_t before = m->bytes;
-  auto q_mtp = [&](Lin& l, int N, int K) {
-    if (l.packed()) quantize_packed_in_place(m, l, N, K);
-    else quantize_in_place(m, l, N, K);
-  };
-  q_mtp(b.fc, a.hidden, 2 * a.hidden);
-  q_mtp(a.w_in, a.n_in(), a.hidden);
-  q_mtp(a.w_out, a.hidden, a.nh * a.hd);
-  q_mtp(f.w_gu, 2 * f.inter, f.hidden);
-  q_mtp(f.w_down, f.hidden, f.inter);
-  if (m->verbose && m->bytes != before)
-    std::fprintf(stderr, "flyx-cuda: MTP layer -> NVFP4 (VRAM delta %+.2f GB)\n",
-                 double(int64_t(m->bytes) - int64_t(before)) / 1e9);
-}
-
-// Shared block-drafter weight policy (DFlash2 and future parallel block drafters): quantize BF16 projections to
-// NVFP4 beside an NVFP4 target (drafted against a BF16 target NVFP4 lost 9% acceptance, -2.6% overall; NVFP4 target
-// +9.6%) or Q8_0 beside GGML block weights (the 27B's drafter reads 3.3 GB of bf16 a round), leaving already-quantized
-// block drafters intact.
-void quantize_block_drafter_weights(flyx_bmodel* m, TargetQuant tq) {
-  if (tq == TargetQuant::kFloat) return;
-  auto copy = [&](Lin& l, int N, int K) {
-    if (tq == TargetQuant::kNvfp4) quantize_in_place(m, l, N, K);
-    else q8_in_place(m, l, N, K);
-  };
-  if (m->dflash_block >= 0) {
-    auto& d = block<DFlashBlock>(m, m->dflash_block);
-    const int H = d.hidden, TG = d.conv_taps * (H / d.conv_group), nqkv = (d.nh + 2 * d.nkv) * d.hd;
-    for (int j = 0; j < d.layers(); ++j) {
-      auto& l = block<DFlashLayer>(m, d.first_layer + j);
-      copy(l.attn_proj, 2 * TG, H);
-      copy(l.w_qkv, nqkv, H);
-      copy(l.w_o, H, d.nh * d.hd);
-      copy(l.mlp_proj, 2 * TG, H);
-      copy(l.w_gu, 2 * d.inter, H);
-      copy(l.w_down, H, d.inter);
-    }
-    copy(d.fc, H, d.n_taps * d.target_hidden);
-    copy(d.ctx, d.ctx_width(), H);
-    copy(d.sel_hid, d.sel_rank, H);
-  }
-}
-
 }  // namespace
 
 void make_draft_weights(flyx_bmodel* m) {
-  if (m->opt.exact_drafts || (m->mtp_block < 0 && m->dflash_block < 0)) return;
-  // Quantize drafter layers first so freed VRAM is available for optional 1-bit SignHead copies.
-  quantize_mtp_weights(m);
-  quantize_block_drafter_weights(m, target_quant_kind(m));
+  if (m->opt.draft_weights == interfaces::DraftWeightsMode::kExact || (m->mtp_block < 0 && m->dflash_block < 0))
+    return;
 
   auto& h = block<HeadBlock>(m, m->head_block);
   const bool want_sign =
@@ -525,9 +371,20 @@ void make_draft_weights(flyx_bmodel* m) {
     make_sign_head_for(m, h.wb.data ? nullptr : h.w, h.wb.data ? &h.wb : nullptr, h.vocab, h.hidden, &h.coarse,
                        "draft head");
   } else if (!h.wb.data && h.w && h.hidden % 32 == 0) {
-    h.draft.q = m->alloc<uint8_t>(size_t(h.vocab) * h.hidden / 2);
-    h.draft.s = m->alloc<uint8_t>(size_t(h.vocab) * h.hidden / 16);
-    h.draft.rs = m->alloc<float>(h.vocab);
+    const size_t VH = size_t(h.vocab) * size_t(h.hidden);
+    try {
+      h.draft.q = m->alloc<uint8_t>(VH / 2);
+      h.draft.s = m->alloc<uint8_t>(VH / 16);
+      h.draft.rs = m->alloc<float>(h.vocab);
+    } catch (const OutOfDeviceMemory& e) {
+      if (h.draft.q) m->release(h.draft.q, VH / 2);
+      if (h.draft.s) m->release(h.draft.s, VH / 16);
+      if (h.draft.rs) m->release(h.draft.rs, size_t(h.vocab) * sizeof(float));
+      h.draft = Lin{};
+      if (m->verbose)
+        std::fprintf(stderr, "flyx-cuda: no room for NVFP4 draft head (%s); reading bf16 head\n", e.what());
+      return;
+    }
     quantize_nvfp4(h.w, h.vocab, h.hidden, h.draft.q, h.draft.s, h.draft.rs, 0);
   }
 }
@@ -592,6 +449,7 @@ void WeightLoader::finish() {
     CK(cudaStreamSynchronize(staging_->st));
     staging_.reset();
   }
+  packed_scratch_.reset();
 }
 
 const flyx_tensor_view* WeightLoader::t(int w) const {
@@ -805,6 +663,245 @@ Lin WeightLoader::lin_stack(const std::vector<int>& ws, int* rows_out, const std
     std::vector<float> g(nr, static_cast<const float*>(s2->data)[0]);
     CK(cudaMemcpy(L.rs + r0, g.data(), nr * 4, cudaMemcpyHostToDevice));
     r0 += nr;
+  }
+  if (rows_out) *rows_out = int(rows);
+  return L;
+}
+
+PackedQuantScratch::~PackedQuantScratch() {
+  if (dids) cudaFree(dids);
+  if (d_data) cudaFree(d_data);
+  if (d_scales) cudaFree(d_scales);
+  if (f32) cudaFree(f32);
+  if (b16) cudaFree(b16);
+}
+
+void PackedQuantScratch::ensure(size_t run, size_t max_row_bytes, size_t max_row_scales, size_t K, cudaStream_t st) {
+  auto grow = [&](auto*& ptr, size_t& cap, size_t need) {
+    if (need <= cap) return false;
+    if (ptr) {
+      CK(cudaStreamSynchronize(st));
+      cudaFree(ptr);
+      ptr = nullptr;
+      cap = 0;
+    }
+    ptr = static_cast<std::remove_reference_t<decltype(ptr)>>(device_malloc(need * sizeof(*ptr)));
+    cap = need;
+    return true;
+  };
+  if (grow(dids, cap_ids, run)) {
+    std::vector<int> ids(run);
+    for (size_t i = 0; i < run; ++i) ids[i] = int(i);
+    CK(cudaMemcpyAsync(dids, ids.data(), sizeof(int) * run, cudaMemcpyHostToDevice, st));
+    CK(cudaStreamSynchronize(st));
+  }
+  grow(d_data, cap_data, run * max_row_bytes);
+  grow(d_scales, cap_scales, run * max_row_scales);
+  grow(f32, cap_f32, run * K);
+  grow(b16, cap_b16, run * K);
+}
+
+Lin WeightLoader::pack_quantize_nvfp4(const std::vector<int>& ws, int* rows_out, const std::vector<RowOrder>& orders) {
+  blocks_init();
+  const size_t K = size_t(t(ws[0])->shape[1]);
+  size_t rows = 0, max_row_bytes = 0, max_row_scales = 0;
+  for (int w : ws) {
+    const auto* v = t(w);
+    const BlockLayout lo = blocks_layout(v->dtype);
+    const size_t per_row = K / size_t(lo.values);
+    rows += size_t(v->shape[0]);
+    max_row_bytes = std::max(max_row_bytes, per_row * size_t(lo.stride));
+    max_row_scales = std::max(max_row_scales, per_row * size_t(lo.scales));
+  }
+  if (rows_out) *rows_out = int(rows);
+  Lin L;
+  if (rows == 0) return L;
+  L.q = m_->alloc<uint8_t>(rows * K / 2);
+  L.s = m_->alloc<uint8_t>(rows * K / 16);
+  L.rs = m_->alloc<float>(rows);
+
+  // Stream each tensor in bounded row chunks (~16 MiB float32 staging) directly into NVFP4 without
+  // touching WeightLoader::packs_ or allocating full-matrix packed buffers alongside the output.
+  if (!staging_) staging_ = std::make_unique<LoadStaging>();
+  if (!packed_scratch_) packed_scratch_ = std::make_unique<PackedQuantScratch>();
+  cudaStream_t st = staging_->st;
+  const size_t kRun = std::max<size_t>(1, std::min<size_t>(1024, (size_t(16) << 20) / (K * sizeof(float))));
+  packed_scratch_->ensure(kRun, max_row_bytes, max_row_scales, K, st);
+  int* dids = packed_scratch_->dids;
+  uint8_t* d_data = packed_scratch_->d_data;
+  uint16_t* d_scales = packed_scratch_->d_scales;
+  float* f32 = packed_scratch_->f32;
+  bf16* b16 = packed_scratch_->b16;
+
+  std::vector<uint8_t> h_data(kRun * max_row_bytes);
+  std::vector<uint16_t> h_scales(kRun * max_row_scales);
+
+  size_t dst_row = 0;
+  for (size_t i = 0; i < ws.size(); ++i) {
+    const int w = ws[i];
+    const auto* v = t(w);
+    const BlockLayout lo = blocks_layout(v->dtype);
+    const size_t nrows = size_t(v->shape[0]);
+    const size_t per_row = K / size_t(lo.values);
+    const size_t row_bytes = per_row * size_t(lo.stride);
+    const size_t row_scales = per_row * size_t(lo.scales);
+    const size_t file_row = per_row * size_t(lo.bytes);
+    const auto* file = static_cast<const uint8_t*>(v->data);
+    const int dtype = v->dtype;
+    const RowOrder none, &order = i < orders.size() ? orders[i] : none;
+    times_.file_bytes += nrows * file_row;
+    for (size_t r0 = 0; r0 < nrows; r0 += kRun) {
+      const size_t n = std::min(kRun, nrows - r0);
+      const double t0 = load_clock();
+      parallel_rows(n, [&](size_t a, size_t e) {
+        if (!order) {
+          blocks_pack(dtype, file + (r0 + a) * file_row, (e - a) * per_row, h_data.data() + a * row_bytes,
+                      h_scales.data() + a * row_scales);
+        } else {
+          for (size_t r = a; r < e; ++r)
+            blocks_pack(dtype, file + order(r0 + r) * file_row, per_row, h_data.data() + r * row_bytes,
+                        h_scales.data() + r * row_scales);
+        }
+      });
+      times_.pack_s += load_clock() - t0;
+      CK(cudaMemcpyAsync(d_data, h_data.data(), n * row_bytes, cudaMemcpyHostToDevice, st));
+      CK(cudaMemcpyAsync(d_scales, h_scales.data(), n * row_scales * sizeof(uint16_t), cudaMemcpyHostToDevice, st));
+      const BlockMat chunk_bm{d_data, d_scales, dtype, int(n), false};
+      embed_blocks(dids, chunk_bm, int(K), f32, int(n), st);
+      rows_to_bf16(f32, int(K), int(n), int(K), b16, st);
+      quantize_nvfp4(b16, int(n), int(K), L.q + dst_row * K / 2, L.s + dst_row * K / 16, L.rs + dst_row, st);
+      CK(cudaStreamSynchronize(st));
+      dst_row += n;
+    }
+  }
+  return L;
+}
+
+Lin WeightLoader::lin_stack_quant(const std::vector<int>& ws, DraftQuant q, int* rows_out,
+                                  const std::vector<RowOrder>& orders) {
+  if (ws.empty() || q == DraftQuant::kNone) return lin_stack(ws, rows_out, orders);
+
+  // Pre-quantized GGML block weights: keep packed unless NVFP4 was requested AND streaming into NVFP4
+  // meaningfully shrinks the additional GPU bytes needed (never inflating 2-3 bpw or ~4.5-5 bpw Q4_K_M,
+  // and never releasing shared WeightLoader::packs_ entries).
+  bool all_packable = true;
+  for (int w : ws) all_packable = all_packable && packable(w) && t(w)->shape[1] == t(ws[0])->shape[1];
+  if (all_packable) {
+    const size_t K = size_t(t(ws[0])->shape[1]);
+    size_t rows = 0, added_packed_bytes = 0;
+    for (size_t i = 0; i < ws.size();) {
+      size_t end = i + 1;
+      while (end < ws.size() && t(ws[end])->dtype == t(ws[i])->dtype) ++end;
+      const BlockLayout lo = blocks_layout(t(ws[i])->dtype);
+      const size_t per_row = K / size_t(lo.values);
+      size_t run_rows = 0;
+      for (size_t j = i; j < end; ++j) run_rows += size_t(t(ws[j])->shape[0]);
+      rows += run_rows;
+      const bool has_order = i < orders.size() && bool(orders[i]);
+      // A single-tensor run already cached in packs_ costs 0 extra GPU bytes if kept packed.
+      const bool cached = (end - i == 1) && !has_order && packs_.find(ws[i]) != packs_.end();
+      if (!cached)
+        added_packed_bytes += run_rows * per_row * (size_t(lo.stride) + size_t(lo.scales) * sizeof(uint16_t));
+      i = end;
+    }
+    const size_t new_bytes = rows * K / 2 + rows * K / 16 + rows * sizeof(float);
+    if (q == DraftQuant::kNvfp4 && K % 64 == 0 && added_packed_bytes * 10 >= new_bytes * 11)
+      return pack_quantize_nvfp4(ws, rows_out, orders);
+    return lin_stack(ws, rows_out, orders);
+  }
+
+  // Already NVFP4: upload planes directly.
+  auto is_fp4 = [&](int w) { return t(w)->dtype == FLYX_DT_NVFP4 || t(w)->dtype == FLYX_DT_GGML_NVFP4; };
+  const bool fp4 = is_fp4(ws[0]);
+  for (int w : ws)
+    if (is_fp4(w) != fp4) throw std::runtime_error(std::string(t(w)->name) + ": mixed weight formats in one stack");
+  if (fp4) return lin_stack(ws, rows_out, orders);
+
+  const size_t K = size_t(t(ws[0])->shape[1]);
+  size_t rows = 0;
+  for (int w : ws) {
+    const auto* v = t(w);
+    if (!numbers(v)) throw std::runtime_error(std::string(v->name) + ": a bf16 matrix from this dtype");
+    if (v->ndim != 2 || size_t(v->shape[1]) != K)
+      throw std::runtime_error(std::string(v->name) + ": stacked linear width mismatch");
+    rows += size_t(v->shape[0]);
+  }
+  if ((q == DraftQuant::kNvfp4 && K % 64 != 0) || (q == DraftQuant::kQ8 && K % 32 != 0))
+    return lin_stack(ws, rows_out, orders);
+
+  // Allocate ONLY the final quantized output buffers and stream row chunks through a 2 x 16 MiB
+  // double-buffered device BF16 staging pair on staging_->st (zero BF16 VRAM spike, no per-matrix sync).
+  Lin L;
+  uint8_t* q8_payload = nullptr;
+  uint16_t* q8_scales = nullptr;
+  if (q == DraftQuant::kNvfp4) {
+    L.q = m_->alloc<uint8_t>(rows * K / 2);
+    L.s = m_->alloc<uint8_t>(rows * K / 16);
+    L.rs = m_->alloc<float>(rows);
+  } else {
+    blocks_init();
+    const size_t blocks = rows * (K / 32);
+    q8_payload = m_->alloc<uint8_t>(blocks * 32);
+    q8_scales = m_->alloc<uint16_t>(blocks);
+    L.blk = {BlockMat{q8_payload, q8_scales, FLYX_DT_GGML_Q8_0, int(rows), true}};
+  }
+
+  if (!staging_) staging_ = std::make_unique<LoadStaging>();
+  LoadStaging& S = *staging_;
+  const size_t row_bytes = K * sizeof(bf16);
+  S.ensure_quant_staging(row_bytes);
+  const size_t stage_cap = std::min(LoadStaging::kBytes, S.d_quant_bytes);
+  const size_t chunk = std::max<size_t>(1, stage_cap / row_bytes);
+  constexpr size_t kStripe = size_t(1) << 20;
+
+  size_t r_out = 0;
+  for (size_t i = 0; i < ws.size(); ++i) {
+    const auto* v = t(ws[i]);
+    const size_t nr_all = size_t(v->shape[0]);
+    const RowOrder none, &order = i < orders.size() ? orders[i] : none;
+    for (size_t r0 = 0; r0 < nr_all; r0 += chunk) {
+      const size_t nr = std::min(chunk, nr_all - r0);
+      const int b = S.next;
+      S.next ^= 1;
+      CK(cudaEventSynchronize(S.done[b]));
+      auto* hp = reinterpret_cast<uint16_t*>(S.buf[b]);
+      if (v->dtype == FLYX_DT_BF16 && !order) {
+        const auto* in = static_cast<const uint8_t*>(v->data) + r0 * row_bytes;
+        const size_t nbytes = nr * row_bytes;
+        const size_t stripes = (nbytes + kStripe - 1) / kStripe;
+        parallel_rows(stripes, [&](size_t a, size_t e) {
+          const size_t p0 = a * kStripe;
+          const size_t p1 = std::min(nbytes, e * kStripe);
+          std::memcpy(S.buf[b] + p0, in + p0, p1 - p0);
+        });
+      } else {
+        parallel_rows(nr, [&](size_t a, size_t e) {
+          if (v->dtype == FLYX_DT_BF16) {
+            const auto* in = static_cast<const uint16_t*>(v->data);
+            for (size_t r = a; r < e; ++r) {
+              const size_t src_r = order ? order(r0 + r) : (r0 + r);
+              std::memcpy(hp + r * K, in + src_r * K, row_bytes);
+            }
+          } else {
+            for (size_t r = a; r < e; ++r) {
+              const size_t from = (order ? order(r0 + r) : (r0 + r)) * K;
+              for (size_t k = 0; k < K; ++k)
+                hp[r * K + k] = float_to_bf16(static_cast<float>(flyx::ops::load(v, from + k)));
+            }
+          }
+        });
+      }
+      CK(cudaMemcpyAsync(S.d_quant[b], hp, nr * row_bytes, cudaMemcpyHostToDevice, S.st));
+      if (q == DraftQuant::kNvfp4) {
+        quantize_nvfp4(S.d_quant[b], int(nr), int(K), L.q + (r_out + r0) * K / 2, L.s + (r_out + r0) * K / 16,
+                       L.rs + (r_out + r0), S.st);
+      } else {
+        quantize_q8_0(S.d_quant[b], int(nr), int(K), q8_payload + (r_out + r0) * K,
+                      q8_scales + (r_out + r0) * (K / 32), S.st);
+      }
+      CK(cudaEventRecord(S.done[b], S.st));
+    }
+    r_out += nr_all;
   }
   if (rows_out) *rows_out = int(rows);
   return L;
@@ -1221,10 +1318,42 @@ LoadStaging::LoadStaging() {
 LoadStaging::~LoadStaging() {
   if (st) cudaStreamSynchronize(st);
   for (int i = 0; i < 2; ++i) {
+    if (d_quant[i]) cudaFree(d_quant[i]);
     if (done[i]) cudaEventDestroy(done[i]);
     if (buf[i]) cudaFreeHost(buf[i]);
   }
   if (st) cudaStreamDestroy(st);
+}
+
+void LoadStaging::ensure_quant_staging(size_t min_bytes) {
+  min_bytes = (min_bytes + 255) / 256 * 256;
+  if (d_quant[0] && d_quant_bytes >= min_bytes) return;
+  if (d_quant[0] || d_quant[1]) {
+    if (st) CK(cudaStreamSynchronize(st));
+    for (int i = 0; i < 2; ++i) {
+      if (d_quant[i]) cudaFree(d_quant[i]);
+      d_quant[i] = nullptr;
+    }
+    d_quant_bytes = 0;
+  }
+  const size_t tries[] = {std::max(kQuantBytes, min_bytes), std::max(size_t(4) << 20, min_bytes),
+                          std::max(size_t(1) << 20, min_bytes), min_bytes};
+  for (size_t idx = 0; idx < 4; ++idx) {
+    const size_t sz = tries[idx];
+    if (idx > 0 && sz == tries[idx - 1]) continue;
+    try {
+      d_quant[0] = static_cast<bf16*>(device_malloc(sz));
+      d_quant[1] = static_cast<bf16*>(device_malloc(sz));
+      d_quant_bytes = sz;
+      return;
+    } catch (const OutOfDeviceMemory&) {
+      for (int i = 0; i < 2; ++i) {
+        if (d_quant[i]) cudaFree(d_quant[i]);
+        d_quant[i] = nullptr;
+      }
+      if (idx == 3 || sz == min_bytes) throw;
+    }
+  }
 }
 
 // One tensor's rows packed at data and scales: laid out by parallel_rows, into host memory directly (host) or into a

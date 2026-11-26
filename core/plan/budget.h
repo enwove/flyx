@@ -40,6 +40,8 @@ struct Budget {
   // FLYX_KV_AUTO placed with every position exact: its copy did not fit beside the K/V (why: copy_note).
   bool auto_exact = false;
   std::string copy_note;
+  // True when account() returned false due to insufficient device memory (not a non-OOM backend error).
+  bool oom = false;
 };
 
 // The tiers a session's K/V caches may use (EngineOptions::kv_gpu, kv_ram): positions on the GPU at most (-1: as
@@ -59,6 +61,9 @@ struct KvTiers {
 // sixteenth of it, at least 2 GiB (32 GB: 2 GiB; 64 GB: 4; 128 GB: 8).  The K/V's host memory is page-locked, so
 // nothing else can have it back while the model is served.
 uint64_t host_keep(uint64_t total_ram);
+
+// Device VRAM held back for the CUDA context, fragmentation, and desktop stability (at least 832 MiB on paged WDDM).
+uint64_t device_reserve(uint64_t total_vram, bool gpu_paged);
 
 // Sets the ledger's budget (what the device has now plus what the model already
 // took, less a reserve for the CUDA context, fragmentation and other programs;

@@ -19,28 +19,38 @@ RowNeeds row_needs(const flyx_bmodel* m) {
       n.attn_state = std::max(n.attn_state, a->nh * kFlashStateFloats(a->hd));
       n.split_state = std::max(n.split_state, a->nh * kSplitStateFloats(a->hd));
       n.lora = std::max(n.lora, 3 * a->lora.rank);
+      if (a->w_in.q8_inputs() || a->w_out.q8_inputs()) n.q8 = true;
       ks({a->hidden, a->nh * a->hd, a->lora.rank});
     } else if (const auto* g = std::get_if<GdnBlock>(&blk)) {
       n.proj = std::max(n.proj, g->n_in());
       n.act = std::max(n.act, g->v_width());
       n.gdn_o = std::max(n.gdn_o, g->v_width());
+      if (g->w_in.q8_inputs() || g->w_out.q8_inputs()) n.q8 = true;
       ks({g->hidden, g->v_width()});
     } else if (const auto* f = std::get_if<MlpBlock>(&blk)) {
       n.proj = std::max(n.proj, 2 * f->inter);
       n.act = std::max(n.act, f->inter);
       if (!f->w_gu.packed() && !f->w_down.packed()) n.glu = true;
+      if (f->w_gu.q8_inputs() || f->w_down.q8_inputs()) n.q8 = true;
       n.lora = std::max(n.lora, 2 * f->lora.rank);
       ks({f->hidden, f->inter, f->lora.rank});
     } else if (const auto* h = std::get_if<HeadBlock>(&blk)) {
+      if (h->wb.data && h->wb.q8) n.q8 = true;
       ks({h->hidden});
-    } else if (std::holds_alternative<MtpBlock>(blk)) {
+    } else if (const auto* t = std::get_if<MtpBlock>(&blk)) {
       n.mtp = true;
+      if (t->fc.q8_inputs()) n.q8 = true;
       ks({2 * m->hidden});
     } else if (const auto* d = std::get_if<DFlashBlock>(&blk)) {
       n.feats = d->n_taps * d->target_hidden;
       n.cx = d->hidden;
       n.ckv = d->ctx_width();
+      if (d->fc.q8_inputs() || d->ctx.q8_inputs() || d->sel_hid.q8_inputs()) n.q8 = true;
       ks({d->hidden, d->inter, d->nh * d->hd, n.feats});
+    } else if (const auto* dl = std::get_if<DFlashLayer>(&blk)) {
+      if (dl->w_qkv.q8_inputs() || dl->w_o.q8_inputs() || dl->w_gu.q8_inputs() || dl->w_down.q8_inputs() ||
+          dl->attn_proj.q8_inputs() || dl->mlp_proj.q8_inputs())
+        n.q8 = true;
     }
   }
   n.k_max = (k + 63) / 64 * 64;
@@ -276,7 +286,8 @@ int ensure_prefill_rows(flyx_bmodel* m, int rows) {
     m->prefill_bytes = 0;
     m->prefill_bufs = {};
     m->prefill_rows = 0;
-    return fail(std::string("prefill buffers: ") + e.what());
+    const bool oom = dynamic_cast<const OutOfDeviceMemory*>(&e) != nullptr;
+    return (oom ? fail_oom : fail)(std::string("prefill buffers: ") + e.what());
   }
   m->prefill_rows = rows;
   return 0;
@@ -324,6 +335,8 @@ int seq_new_in(flyx_bmodel* m, const flyx_seq_layout* layout, flyx_seq** out) {
   probe.copy_host = std::max(0, layout->copy_host);
   try {
     build_seq(m, layout->max_ctx, &probe);
+  } catch (const OutOfDeviceMemory& e) {
+    return fail_oom(std::string("seq_new: ") + e.what());
   } catch (const std::exception& e) {
     return fail(std::string("seq_new: ") + e.what());
   }
@@ -337,6 +350,8 @@ int seq_new_in(flyx_bmodel* m, const flyx_seq_layout* layout, flyx_seq** out) {
   s->arena_host_bytes = probe.arena_host_bytes;
   try {
     build_seq(m, layout->max_ctx, s.get());
+  } catch (const OutOfDeviceMemory& e) {
+    return fail_oom(std::string("seq_new: ") + e.what());
   } catch (const std::exception& e) {
     return fail(std::string("seq_new: ") + e.what());
   }
@@ -360,6 +375,8 @@ int seq_size(flyx_bmodel* m, const flyx_seq_layout* layout, flyx_seq_size* out) 
   try {
     build_seq(m, layout->max_ctx, &s);
     room = graph_room(s, true);  // plans no session captured yet sized first (graphs.cpp)
+  } catch (const OutOfDeviceMemory& e) {
+    return fail_oom(e.what());
   } catch (const std::exception& e) {
     return fail(e.what());
   }

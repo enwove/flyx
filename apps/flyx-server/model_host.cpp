@@ -100,6 +100,25 @@ ojson drafters_json(const std::vector<apps::DrafterSource>& ds, const char* wher
   return out;
 }
 
+bool drafter_active(std::string_view active, std::string_view kind) {
+  if (active.empty() || active == "none") return false;
+  size_t i = 0;
+  while (i < active.size()) {
+    size_t j = active.find('+', i);
+    if (j == std::string_view::npos) j = active.size();
+    if (active.substr(i, j - i) == kind) return true;
+    i = j + 1;
+  }
+  return false;
+}
+
+ojson degraded_json(const std::vector<LoadAdjustment>& list) {
+  ojson out = ojson::array();
+  for (const LoadAdjustment& a : list)
+    out.push_back({{"kind", a.kind}, {"from", a.from}, {"to", a.to}, {"detail", a.detail}});
+  return out;
+}
+
 void save_settings(const ModelHost::Want& w) {
   // A local model may be relaunched from another directory. Keep Hub names as requested
   // so their revision and quantization still go through the normal fetch path.
@@ -260,19 +279,42 @@ bool want_from_json(const ojson& j, const EngineOptions& base, ModelHost::Want* 
     out.eo.lookup = j["lookup"].get<bool>();
     out.eo.lookup_given = true;
   }
-  // The drafters' CUDA backend options (--backend-opt draft_head=..., draft_weights=...), after the command line's.
+  // The drafters' CUDA backend options (--backend-opt draft_head=..., draft_weights=...), overriding any value from
+  // the server's command line. Explicit null/default resets to the default so the dashboard can clear CLI overrides.
   // Skip appending CUDA-only options when running on cpu_ref, which rejects unknown backend options.
   auto drafting_option = [&](const char* key, const char* a, const char* b, std::string* to) {
-    if (!j.contains(key) || j[key].is_null()) return true;
+    if (!j.contains(key)) return true;
+    if (j[key].is_null()) {
+      out.eo.backend_options = interfaces::backend_opt_strip(out.eo.backend_options, key);
+      to->clear();
+      return true;
+    }
     const std::string v = j[key].is_string() ? j[key].get<std::string>() : "";
     if (v != a && v != b) return *err = std::string("\"") + key + "\": " + a + " or " + b, false;
-    *to = v;
+    *to = v == a ? "" : v;
     if (out.eo.backend != "cpu_ref")
-      out.eo.backend_options += (out.eo.backend_options.empty() ? "" : ",") + std::string(key) + "=" + v;
+      out.eo.backend_options = interfaces::backend_opt_set(out.eo.backend_options, key, v);
+    else
+      out.eo.backend_options = interfaces::backend_opt_strip(out.eo.backend_options, key);
     return true;
   };
   if (!drafting_option("draft_head", "pick", "full", &out.draft_head)) return false;
-  if (!drafting_option("draft_weights", "nvfp4", "exact", &out.draft_weights)) return false;
+  if (j.contains("draft_weights")) {
+    if (j["draft_weights"].is_null()) {
+      out.draft_weights.clear();
+      out.eo.backend_options = interfaces::backend_opt_strip(out.eo.backend_options, "draft_weights");
+    } else {
+      if (!j["draft_weights"].is_string()) return *err = "\"draft_weights\": auto, nvfp4, q8 or exact", false;
+      std::string canon;
+      if (!interfaces::parse_draft_weights(j["draft_weights"].get<std::string>(), nullptr, &canon, nullptr))
+        return *err = "\"draft_weights\": auto, nvfp4, q8 or exact", false;
+      out.draft_weights = canon == "auto" ? "" : canon;
+      if (canon != "auto")
+        out.eo.backend_options = interfaces::backend_opt_set(out.eo.backend_options, "draft_weights", canon);
+      else
+        out.eo.backend_options = interfaces::backend_opt_strip(out.eo.backend_options, "draft_weights");
+    }
+  }
   *w = std::move(out);
   return true;
 }
@@ -467,14 +509,34 @@ bool ModelHost::work(const Want& w, std::string* err) {
 ojson ModelHost::status() const {
   // A slow settings drive must not hold up requests for the model already in memory.
   const ojson s = read_settings();
+  std::shared_ptr<Scheduler> active_sched;
+  {
+    std::lock_guard<std::mutex> lock(mu_);
+    active_sched = served_.sched;
+  }
+  ModelInfo active_model;
+  bool has_active = false;
+  if (active_sched) {
+    TelemetrySnapshot snap;
+    flyx_device_stats dev{};
+    bool dev_ok = false;
+    active_sched->telemetry(&snap, &dev, &dev_ok);
+    if (snap.loaded) active_model = std::move(snap.model), has_active = true;
+  }
   std::lock_guard<std::mutex> lock(mu_);
+  std::vector<apps::DrafterSource> active_drafters;
+  if (served_.sched) {
+    for (const apps::DrafterSource& d : fetched_.drafter_sources)
+      if (!has_active || drafter_active(active_model.drafter, d.kind)) active_drafters.push_back(d);
+  }
   ojson j = {{"state", state_},
              {"model", served_.sched ? ojson(served_.name) : ojson(nullptr)},
              {"target", target_.empty() ? ojson(nullptr) : ojson(target_)},
              {"error", error_.empty() ? ojson(nullptr) : ojson(error_)},
              {"notes", notes_},
              {"fallback", ojson(nullptr)},
-             {"drafters", drafters_json(served_.sched ? fetched_.drafter_sources : std::vector<apps::DrafterSource>{}, "from")},
+             {"degraded", served_.sched && has_active ? degraded_json(active_model.load_adjustments) : ojson::array()},
+             {"drafters", drafters_json(active_drafters, "from")},
              {"suggested", drafters_json(served_.sched ? fetched_.suggested : std::vector<apps::DrafterSource>{}, "name")},
              {"vision_projector",
               served_.sched && served_.sched->has_vision() && !fetched_.mmproj_source.empty()
@@ -496,14 +558,18 @@ void log_loaded(const Scheduler& sched, const std::string& name, double load_s) 
   bool dev_ok = false;
   sched.telemetry(&snap, &dev, &dev_ok);
   const ModelInfo& m = snap.model;
-  std::fprintf(stderr, "flyx-server: %s on %s (%s), context %d, drafter %s (up to %d per round), loaded in %.1f s\n",
-               name.c_str(), m.device.c_str(), m.backend.c_str(), m.max_ctx, m.drafter.c_str(), m.width, load_s);
+  const std::string dw = m.draft_weights.empty() ? "" : (m.draft_weights + ", ");
+  std::fprintf(stderr, "flyx-server: %s on %s (%s), context %d, drafter %s (%sup to %d per round), loaded in %.1f s\n",
+               name.c_str(), m.device.c_str(), m.backend.c_str(), m.max_ctx, m.drafter.c_str(), dw.c_str(), m.width,
+               load_s);
   std::fprintf(stderr, "flyx-server: memory: %s; up to %d session%s\n", m.memory.c_str(),
                m.max_sessions, m.max_sessions == 1 ? "" : "s");
   if (m.vision) {
     std::fprintf(stderr, "flyx-server: vision: %s (%s)%s\n", m.vision_device.c_str(), m.vision_quant.c_str(),
                  m.vision_max_tokens > 0 ? (" max " + std::to_string(m.vision_max_tokens) + " tok/img").c_str() : "");
   }
+  for (const LoadAdjustment& a : m.load_adjustments)
+    std::fprintf(stderr, "flyx-server: VRAM adjustment: %s\n", a.detail.c_str());
   std::fprintf(stderr, "flyx-server: chat template: %s\n",
                !m.chat_ok ? "none (chat endpoints answer 400)"
                : m.chat_native

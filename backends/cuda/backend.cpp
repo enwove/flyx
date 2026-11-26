@@ -71,6 +71,11 @@ int fail(const std::string& m) {
   return -1;
 }
 
+int fail_oom(const std::string& m) {
+  g_error = m;
+  return FLYX_ERR_OOM;
+}
+
 int no_sequence(const char* call) {
   return fail(std::string(call) + ": no sequence (seq_new failed or was not called)");
 }
@@ -245,7 +250,15 @@ const std::vector<OptionSpec>& option_specs() {
          if (o.wait == def.wait) return "";
          return o.wait == WaitMode::spin ? "wait=spin" : o.wait == WaitMode::poll ? "wait=poll" : "wait=auto";
        }},
-      bool_choice_opt("draft_weights", &BackendOptions::exact_drafts, "exact", "nvfp4"),
+      {"draft_weights",
+       [](const std::string&, const std::string& val, BackendOptions* o, std::string* err) {
+         return interfaces::parse_draft_weights(val, &o->draft_weights, nullptr, err);
+       },
+       [](const BackendOptions& o, const BackendOptions& def) -> std::string {
+         return o.draft_weights != def.draft_weights
+                    ? std::string("draft_weights=") + interfaces::draft_weights_name(o.draft_weights)
+                    : "";
+       }},
       kernel_int_choice_opt("act_group", &KernelOptions::act_group, {"32", "64", "128", "256"}),
       kernel_int_choice_opt("act_fp4", &KernelOptions::act_fp4, {"0", "1", "2"}),
       bool_choice_opt("draft_head", &BackendOptions::full_draft_head, "full", "pick"),
@@ -510,6 +523,14 @@ int open_model(const flyx_model_desc* desc, const flyx_open_options* opts, flyx_
     if (opts) {
       m->opt.vision = opts->vision_device;
       m->opt.vision_quant = opts->vision_quant;
+      if (opts->draft_weights == FLYX_DRAFT_WEIGHTS_NVFP4)
+        m->opt.draft_weights = interfaces::DraftWeightsMode::kNvfp4;
+      else if (opts->draft_weights == FLYX_DRAFT_WEIGHTS_Q8)
+        m->opt.draft_weights = interfaces::DraftWeightsMode::kQ8;
+      else if (opts->draft_weights == FLYX_DRAFT_WEIGHTS_EXACT)
+        m->opt.draft_weights = interfaces::DraftWeightsMode::kExact;
+      else
+        m->opt.draft_weights = interfaces::DraftWeightsMode::kAuto;
     }
     if (!parse_options(opts ? opts->options : nullptr, &m->opt, &err)) return fail("options: " + err);
     if (!nvfp4_inputs(*desc, &m->opt.kernels.prefill_fp4, &err)) return fail(err);
@@ -530,51 +551,8 @@ int open_model(const flyx_model_desc* desc, const flyx_open_options* opts, flyx_
       // vision=auto: keep vision encoder weights on the GPU when >= 8 GB of free VRAM remain after LLM + vision
       // weights (for KV cache, drafters, and round graphs); otherwise keep them in an auto-deleted temp file on disk
       // (0 VRAM, 0 locked host RAM) and 3-stage stream each linear to the GPU during encode_vision().
-      std::vector<char> is_vis(size_t(desc->n_weights), 0), is_vis_lin(size_t(desc->n_weights), 0);
-      auto mv = [&](int w) {
-        if (w >= 0 && w < desc->n_weights) is_vis[size_t(w)] = 1;
-      };
-      auto ml = [&](int w) {
-        if (w >= 0 && w < desc->n_weights) is_vis[size_t(w)] = 1, is_vis_lin[size_t(w)] = 1;
-      };
-      auto mn = [&](const flyx_vnorm& n) { mv(n.w), mv(n.b); };
-      for (int i = 0; i < desc->n_blocks; ++i) {
-        const flyx_block& b = desc->blocks[i];
-        if (b.kind == FLYX_BLOCK_VISION_STEM) {
-          mv(b.vision_stem.patch_w), mv(b.vision_stem.patch_w2), mv(b.vision_stem.patch_b), mv(b.vision_stem.pos_w),
-              mv(b.vision_stem.cls_token);
-          mn(b.vision_stem.pre_norm);
-        } else if (b.kind == FLYX_BLOCK_VIT_ATTN) {
-          mn(b.vit_attn.norm), mn(b.vit_attn.q_norm), mn(b.vit_attn.k_norm);
-          ml(b.vit_attn.qkv), ml(b.vit_attn.q), ml(b.vit_attn.k), ml(b.vit_attn.v), ml(b.vit_attn.o);
-          mv(b.vit_attn.qkv_b), mv(b.vit_attn.q_b), mv(b.vit_attn.k_b), mv(b.vit_attn.v_b), mv(b.vit_attn.o_b),
-              mv(b.vit_attn.layer_scale);
-        } else if (b.kind == FLYX_BLOCK_VIT_MLP) {
-          mn(b.vit_mlp.norm);
-          ml(b.vit_mlp.fc1), ml(b.vit_mlp.gate), ml(b.vit_mlp.fc2);
-          mv(b.vit_mlp.fc1_b), mv(b.vit_mlp.gate_b), mv(b.vit_mlp.fc2_b), mv(b.vit_mlp.layer_scale);
-        } else if (b.kind == FLYX_BLOCK_VISION_MERGE) {
-          mn(b.vision_merge.norm);
-          ml(b.vision_merge.fc1), ml(b.vision_merge.fc2);
-          mv(b.vision_merge.fc1_b), mv(b.vision_merge.fc2_b);
-        }
-      }
       uint64_t llm_bytes = 0, vis_bytes = 0;
-      for (int i = 0; i < desc->n_weights; ++i) {
-        const flyx_tensor_view* t = desc->weights[i].t;
-        if (!t) continue;
-        if (!is_vis[size_t(i)]) {
-          llm_bytes += t->nbytes;
-          continue;
-        }
-        uint64_t nb = t->nbytes;
-        const bool flt = t->dtype == FLYX_DT_BF16 || t->dtype == FLYX_DT_F16 || t->dtype == FLYX_DT_F32;
-        if (is_vis_lin[size_t(i)] && flt) {
-          if (m->opt.vision_quant == FLYX_VISION_QUANT_Q8) nb = (nb * 55) / 100;
-          else if (m->opt.vision_quant == FLYX_VISION_QUANT_NVFP4) nb = (nb * 30) / 100;
-        }
-        vis_bytes += nb;
-      }
+      vision_weight_bytes(*desc, m->opt.vision_quant, &llm_bytes, &vis_bytes);
       if (vis_bytes > 0) {
         size_t free_b = 0, total_b = 0;
         bool ok_mem = gpu_memory(&free_b, &total_b);
@@ -714,7 +692,7 @@ int open_model(const flyx_model_desc* desc, const flyx_open_options* opts, flyx_
                          ", or use a smaller quantization."
                    : (drafter ? " Disable speculative decoding or use a smaller quantization."
                               : " Use a smaller quantization.");
-    return fail(std::string(head) + fix);
+    return fail_oom(std::string(head) + fix);
   } catch (const std::exception& e) {
     return fail(std::string("uploading weights: ") + e.what());
   }
@@ -766,13 +744,15 @@ void pinned_free(void* p) {
   if (p) (void)cudaFreeHost(p);
 }
 
+const char* draft_weights_active(flyx_bmodel* m) { return m ? m->active_draft_weights.c_str() : ""; }
+
 const flyx_backend_api kApi = {
     FLYX_BACKEND_ABI_VERSION, sizeof(flyx_backend_api), "cuda",
     probe, open_model, close_model, lower, plan_free, seq_new, seq_free,
     prefill, launch, read_result, rewind, checkpoint, restore, set_oracle, last_error, memory, seq_bytes,
     prefill_align, device_stats, ready, set_reply, snapshot_bytes, snapshot_save, snapshot_load, launch_batch,
     pinned_alloc, pinned_free, read_logits, seq_new_in, seq_size, trim, graph_stats, prefill_snapshot,
-    encode_vision, prefill_ex,
+    encode_vision, prefill_ex, estimate_load, draft_weights_active,
 };
 
 }  // namespace flyx::cuda

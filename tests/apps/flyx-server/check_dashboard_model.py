@@ -385,6 +385,59 @@ def check_drafters(page, server, want):
     expect(page.locator("#sd-saved input")).to_be_checked()
 
 
+def check_degraded_and_draft_weights(open_page, want):
+    """Drafter weight precision choices (auto/nvfp4/q8/exact) and VRAM adjustment banner + restore action."""
+    base = dict(want, drafter="dflash2", drafters=["acme/Tiny-27B-DFlash2"])
+    tm = telemetry(base)
+    tm["model"]["drafter"] = "mtp"
+    tm["model"]["draft_weights"] = "nvfp4"
+    tm["model"]["max_width"] = 7
+    tm["load"]["degraded"] = [
+        {"kind": "drafter", "from": "dflash2", "to": "mtp",
+         "detail": "DFlash2 drafter skipped due to tight VRAM; falling back to MTP"}
+    ]
+    tm["model"]["degraded"] = tm["load"]["degraded"]
+    snap = {
+        "supported": True, "can_close": True, "device": "NVIDIA GeForce RTX 5070 Ti",
+        "mem_total": int(17.09 * GB), "mem_used": int(14.5 * GB), "mem_free": int(2.59 * GB),
+        "own_bytes": int(10.8 * GB), "others_bytes": int(3.7 * GB), "system_bytes": int(0.8 * GB),
+        "idle_igpu": None,
+        "apps": [{"id": "slack", "name": "Slack", "process": "Slack", "bytes": int(0.4 * GB),
+                  "local_bytes": int(0.4 * GB), "processes": 1, "closable": True, "reason": None}],
+    }
+    page, server = open_page(tm, gpu_apps=snap)
+    # Degraded banner clearly explains what was degraded and what is actively running.
+    deg = page.locator("#ld-degraded")
+    expect(deg).to_be_visible()
+    expect(deg).to_contain_text("Loaded with VRAM adjustments")
+    expect(deg).to_contain_text("DFlash2 drafter skipped due to tight VRAM; falling back to MTP")
+    expect(deg).to_contain_text("Active now:")
+    expect(deg).to_contain_text("mtp (nvfp4)")
+    # Manage VRAM opens the VRAM manager inline; Restore full settings reloads the preserved requested config.
+    page.locator("#ld-deg-vram").click()
+    expect(page.locator("#ld-vram-apps")).to_be_visible()
+    confirm(page, "#ld-deg-restore", "Reload")
+    assert server.posted[-1]["drafter"] == "dflash2" and server.posted[-1]["drafters"] == ["acme/Tiny-27B-DFlash2"], server.posted[-1]
+    # Overview also shows the global degraded hint banner with Manage VRAM.
+    page.locator('.side nav .navi[data-tab="overview"]').click()
+    hint = page.locator('#hint[data-hint="degraded"]')
+    expect(hint).to_be_visible()
+    expect(hint).to_contain_text("Loaded with VRAM adjustments")
+    hint.get_by_role("button", name="View details").click()
+    expect(page.locator("#tab-model")).to_be_visible()
+    # Advanced drafter weights dropdown supports auto (default), nvfp4, q8, and exact.
+    page.locator('#lset-tabs [data-stab="spec"]').click()
+    if page.locator("#sd-adv").get_attribute("open") is None:
+        page.locator("#sd-adv summary").click()
+    expect(page.locator("#sd-weights")).to_have_value("")
+    for val in ("nvfp4", "q8", "exact"):
+        page.locator("#sd-weights").select_option(val)
+        assert "--backend-opt" in command(page) and f"draft_weights={val}" in command(page), command(page)
+        confirm(page, "#mf-reload", "Reload")
+        assert server.posted[-1]["draft_weights"] == val, server.posted[-1]
+    page.close()
+
+
 def check_vision(page, server, open_page, want):
     """Vision encoder settings tab: custom mmproj, storage/precision/max-tokens, disable toggle."""
     page.locator('#lset-tabs [data-stab="vision"]').click()
@@ -972,6 +1025,7 @@ def check(browser):
     check_vision(page, server, open_page, want)
     page.close()
     check_context_limit(open_page, want)
+    check_degraded_and_draft_weights(open_page, want)
     check_vram_apps(open_page, want)
     check_switch_companions(open_page, want)
     plain = dict(want, model="models/local.gguf")

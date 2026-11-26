@@ -776,14 +776,16 @@ def model_panel_checks(cl: Client, model: str):
           "GET /v1/load: serving the model", json.dumps(s)[:200])
     for body in ({}, {"model": ""}, {"model": 7}, {"model": "x/y", "ctx": -1}, {"model": "x/y", "drafter": "nope"},
                  {"model": "x/y", "drafters": "z-lab/a"},
-                 {"model": "x/y", "width": -1}, {"model": "x/y", "draft_head": "nope"}, {"model": "x/y", "draft_weights": 7}):
+                 {"model": "x/y", "width": -1}, {"model": "x/y", "draft_head": "nope"}, {"model": "x/y", "draft_weights": 7},
+                 {"model": "x/y", "draft_weights": "nope"}):
         st, j = cl.post("/v1/load", body)
         check(st == 400 and "error" in j, f"POST /v1/load {json.dumps(body)}: 400", f"{st} {json.dumps(j)[:120]}")
     st, t = cl.get("/v1/telemetry")
     check(st == 200 and t["load"]["state"] == "ready" and t["model"]["id"] == model, "telemetry's load: the same")
     check(st == 200 and isinstance(s.get("drafters"), list) and isinstance(s.get("suggested"), list) and
+          isinstance(s.get("degraded"), list) and
           "fallback" in s and all({"kind", "from", "size"} <= set(d) for d in s.get("drafters", [])),
-          "GET /v1/load: drafters, suggested, fallback", json.dumps({k: s.get(k) for k in ("drafters", "suggested")}))
+          "GET /v1/load: drafters, suggested, degraded, fallback", json.dumps({k: s.get(k) for k in ("drafters", "suggested", "degraded")}))
     st, c = cl.get("/v1/hub/cached")
     check(st == 200 and isinstance(c.get("models"), list) and c.get("cache"), "GET /v1/hub/cached: a list",
           json.dumps(c)[:200])

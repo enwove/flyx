@@ -398,6 +398,8 @@ int lower(flyx_bmodel* m, const flyx_program* prog, flyx_plan** out) {
       if (n.kind == FLYX_NODE_DRAFT) {
         try {
           make_dv_tables(m, n.block);  // out of GPU memory: the engine has the backend trim, and lowers again
+        } catch (const OutOfDeviceMemory& e) {
+          return fail_oom(std::string("lower: DV's selector tables: ") + e.what());
         } catch (const std::exception& e) {
           return fail(std::string("lower: DV's selector tables: ") + e.what());
         }

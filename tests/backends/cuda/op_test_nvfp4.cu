@@ -42,6 +42,26 @@ void test_quantize_nvfp4() {
   const bool ok = worst <= limit;
   std::printf("  %-4s %-48s %.3f (limit %.3f)\n", ok ? "ok" : "FAIL", "round trip: |error| / block max", worst, limit);
   if (!ok) ++g_fail;
+
+  // Row-chunked streaming quantization on a stream must match whole-matrix quantization bit for bit.
+  uint8_t *dq2 = dev<uint8_t>(size_t(N) * K / 2), *ds2 = dev<uint8_t>(size_t(N) * K / 16);
+  float* drs2 = dev<float>(N);
+  cudaStream_t st = nullptr;
+  CK(cudaStreamCreate(&st));
+  for (int r0 = 0; r0 < N; r0 += 7) {
+    const int nr = std::min(7, N - r0);
+    quantize_nvfp4(dw + size_t(r0) * K, nr, K, dq2 + size_t(r0) * K / 2, ds2 + size_t(r0) * K / 16, drs2 + r0, st);
+  }
+  CK(cudaStreamSynchronize(st));
+  CK(cudaStreamDestroy(st));
+  std::vector<uint8_t> q2(q.size()), sc2(sc.size());
+  std::vector<float> rs2(N);
+  CK(cudaMemcpy(q2.data(), dq2, q2.size(), cudaMemcpyDeviceToHost));
+  CK(cudaMemcpy(sc2.data(), ds2, sc2.size(), cudaMemcpyDeviceToHost));
+  CK(cudaMemcpy(rs2.data(), drs2, rs2.size() * 4, cudaMemcpyDeviceToHost));
+  const bool same = q == q2 && sc == sc2 && std::memcmp(rs.data(), rs2.data(), rs.size() * 4) == 0;
+  std::printf("  %-4s %-48s\n", same ? "ok" : "FAIL", "chunked streaming == whole matrix (bit-identical)");
+  if (!same) ++g_fail;
 }
 
 void test_gemm_w4a4(int M, int N, int K) {

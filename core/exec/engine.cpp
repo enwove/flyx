@@ -39,6 +39,24 @@ int32_t to_abi_vision_quant(interfaces::VisionQuantMode m) {
   return FLYX_VISION_QUANT_Q8;
 }
 
+int32_t to_abi_draft_weights(interfaces::DraftWeightsMode m) {
+  switch (m) {
+    case interfaces::DraftWeightsMode::kAuto: return FLYX_DRAFT_WEIGHTS_AUTO;
+    case interfaces::DraftWeightsMode::kNvfp4: return FLYX_DRAFT_WEIGHTS_NVFP4;
+    case interfaces::DraftWeightsMode::kQ8: return FLYX_DRAFT_WEIGHTS_Q8;
+    case interfaces::DraftWeightsMode::kExact: return FLYX_DRAFT_WEIGHTS_EXACT;
+  }
+  return FLYX_DRAFT_WEIGHTS_AUTO;
+}
+
+// Require meaningful VRAM savings (>= 128 MiB and >= 10% of drafter weights) before elastic loading steps
+// draft_weights down to NVFP4 — avoids spurious downgrades on already-4-bit GGUF drafters like Q4_K_M.
+bool meaningful_draft_savings(const flyx_load_estimate& est) {
+  constexpr uint64_t kMinSavingsBytes = 128ull << 20;
+  return est.draft_compact_savings >= kMinSavingsBytes &&
+         est.draft_compact_savings * 10 >= est.draft_weights_bytes;
+}
+
 bool set_kv_method(const EngineOptions& opt, plan::KvTiers* tiers, std::string* err) {
   interfaces::KvMethodSpec spec;
   if (!interfaces::parse_kv_method(opt.kv_method, &spec, err)) return false;
@@ -82,6 +100,18 @@ class ReadAhead {
 int long_calibration(int max_ctx, int align) {
   const int at = std::min(1024, max_ctx - 640) / align * align;
   return at >= 256 ? at : 0;
+}
+
+std::string model_drafters_str(const interfaces::Model& m) {
+  std::string out;
+  for (int d = 0; d < m.drafters(); ++d) out += (out.empty() ? "" : "+") + std::string(m.drafter_name(d));
+  return out;
+}
+
+bool model_has_drafter(const interfaces::Model& m, std::string_view name) {
+  for (int d = 0; d < m.drafters(); ++d)
+    if (name == m.drafter_name(d)) return true;
+  return false;
 }
 
 }  // namespace
@@ -362,7 +392,7 @@ bool Engine::lower_and_time(std::string* err) {
       return true;
     }
     lower_ms_ += os::now_ms() - t0;
-    if (err->find("out of GPU memory") == std::string::npos) return false;
+    if (!plans_.oom) return false;
     if (!give_back()) {  // out of GPU memory with nothing left to give back: what would make room (as the budget's)
       *err += std::string(". Close other apps") +
               (model_->drafters() > 0 ? ", disable speculative decoding" : "") +
@@ -512,6 +542,8 @@ void Engine::log_memory_plan(int asked_ctx) const {
 
 bool Engine::load(const std::string& path, const EngineOptions& opt, std::string* err, int session_limit) {
   opt_ = opt;
+  load_adjustments_.clear();
+  active_draft_weights_.clear();
   apply_environment(&opt_);
   interfaces::VisionDeviceMode vdev = interfaces::VisionDeviceMode::kDisk;
   interfaces::VisionQuantMode vquant = interfaces::VisionQuantMode::kQ8;
@@ -543,18 +575,34 @@ bool Engine::load(const std::string& path, const EngineOptions& opt, std::string
   // The device first: the inputs NVFP4 weights take depend on it.
   if (!load_backend(err)) return false;
   t[3] = os::now_ms();
-  // The model as blocks, with its drafters: the one asked for, else every one it has.
-  interfaces::ModelOptions mo;
-  mo.drafter = opt_.drafter;
-  mo.speculative = opt_.speculative;
-  mo.vision = opt_.vision;
-  mo.activations = opt_.activations;
-  mo.fp4_inputs = device_.fp4_inputs != 0;
-  model_ = interfaces::open_model(file_, mo, err);
-  if (!model_) return false;
+
+  const int initial_kv = opt_.kv;
+  const int initial_max_ctx = opt_.max_ctx;
+  const std::string initial_backend_opts = opt_.backend_options;
+  const std::string req_dw_raw = interfaces::backend_opt_get(initial_backend_opts, "draft_weights");
+  interfaces::DraftWeightsMode req_dw = interfaces::DraftWeightsMode::kAuto;
+  const bool req_dw_valid =
+      req_dw_raw.empty() || interfaces::parse_draft_weights(req_dw_raw, &req_dw, nullptr, nullptr);
+  // Strip valid draft_weights= from the opaque options string and pass it via typed flyx_open_options::draft_weights
+  // (ABI 45); leave invalid values intact so the backend reports its normal option error.
+  const std::string clean_backend_opts =
+      req_dw_valid ? interfaces::backend_opt_strip(initial_backend_opts, "draft_weights") : initial_backend_opts;
+  interfaces::DraftWeightsMode cur_dw = req_dw;
+
+  auto open_model_cur = [&](std::string* open_err) -> bool {
+    interfaces::ModelOptions mo;
+    mo.drafter = opt_.drafter;
+    mo.speculative = opt_.speculative;
+    mo.vision = opt_.vision;
+    mo.activations = opt_.activations;
+    mo.fp4_inputs = device_.fp4_inputs != 0;
+    model_ = interfaces::open_model(file_, mo, open_err);
+    return model_ != nullptr;
+  };
+  if (!open_model_cur(err)) return false;
   if (opt_.vision && !opt_.mmproj_file.empty() && !model_->vision())
     return *err = "--mmproj " + opt_.mmproj_file + ": file is not a supported vision projector (mmproj)", false;
-  if (opt_.verbose && !mo.fp4_inputs && opt_.activations.empty()) {
+  if (opt_.verbose && device_.fp4_inputs == 0 && opt_.activations.empty()) {
     int nvfp4 = 0;
     for (int i = 0; i < model_->desc().n_weights; ++i) {
       const flyx_tensor_view* w = model_->desc().weights[i].t;
@@ -564,30 +612,225 @@ bool Engine::load(const std::string& path, const EngineOptions& opt, std::string
       log::info("flyx: %d NVFP4 weights take bf16 inputs on this GPU (no FP4 tensor cores)", nvfp4);
   }
   eos_ = file_.eos_ids();
-  t[4] = os::now_ms();
-  flyx_open_options oo{};
-  oo.max_ctx = opt_.max_ctx;
-  oo.verbose = opt_.verbose;
-  if (opt_.kv == FLYX_KV_DEFAULT) opt_.kv = roomy() || !model_->kv_fp8_by_default() ? FLYX_KV_16 : FLYX_KV_FP8;
-  oo.kv_fp8 = opt_.kv == FLYX_KV_FP8 ? 1 : 0;
-  oo.options = opt_.backend_options.c_str();
-  oo.vision_device = to_abi_vision_device(vdev);
-  oo.vision_quant = to_abi_vision_quant(vquant);
-  if (api_->open(&model_->desc(), &oo, &bm_) != 0) {
-    *err = std::string("backend open: ") + api_->last_error();
+
+  const bool orig_has_vision = model_->vision() != nullptr;
+  const std::string orig_drafters_str = model_drafters_str(*model_);
+  const bool gpu_paged = os::gpu_memory_paged();
+
+  auto upsert_adj = [&](const std::string& kind, const std::string& from, const std::string& to,
+                        const std::string& detail) {
+    for (LoadAdjustment& a : load_adjustments_) {
+      if (a.kind == kind) {
+        a.to = to;
+        a.detail = detail;
+        return;
+      }
+    }
+    load_adjustments_.push_back({kind, from, to, detail});
+  };
+  auto erase_adj = [&](const std::string& kind) {
+    load_adjustments_.erase(
+        std::remove_if(load_adjustments_.begin(), load_adjustments_.end(),
+                       [&](const LoadAdjustment& a) { return a.kind == kind; }),
+        load_adjustments_.end());
+  };
+
+  auto query_vram = [&](uint64_t* free_out, uint64_t* total_out) {
+    *free_out = device_.mem_free;
+    *total_out = device_.mem_total;
+    flyx_device_stats ds{};
+    if (device_stats(&ds) && ds.mem_total > 0) {
+      *total_out = ds.mem_total;
+      *free_out = ds.mem_total > ds.mem_used ? ds.mem_total - ds.mem_used : 0;
+    }
+  };
+
+  auto make_open_options = [&]() {
+    flyx_open_options oo{};
+    oo.max_ctx = opt_.max_ctx;
+    oo.verbose = opt_.verbose;
+    oo.kv_fp8 = opt_.kv == FLYX_KV_FP8 ? 1 : 0;
+    oo.options = clean_backend_opts.c_str();
+    oo.vision_device = to_abi_vision_device(vdev);
+    oo.vision_quant = to_abi_vision_quant(vquant);
+    oo.draft_weights = to_abi_draft_weights(cur_dw);
+    return oo;
+  };
+
+  auto query_estimate = [&](uint64_t free_vram, uint64_t total_vram, flyx_load_estimate* out) -> bool {
+    *out = {};
+    if (!api_->estimate_load) return false;
+    const flyx_open_options oo = make_open_options();
+    return api_->estimate_load(&model_->desc(), &oo, free_vram, total_vram, out) == 0;
+  };
+
+  // Ordered VRAM degradation ladder (each step preserves identical target output tokens):
+  //   1) vision_device: gpu -> disk (frees 100% vision VRAM while keeping multimodal)
+  //   2) draft_weights -> nvfp4 (when backend estimates meaningful VRAM savings >= 128 MiB and >= 10%)
+  //   3) drop heavy DFlash2 drafter while retaining or falling back to lightweight MTP
+  //   4) drop remaining neural drafters, keeping zero-VRAM prompt lookup (or plain decoding if lookup is off)
+  auto step_down = [&](bool comfort_only, const flyx_load_estimate* est) -> bool {
+    const bool has_mtp = model_has_drafter(*model_, "mtp");
+    const bool has_dflash2 = model_has_drafter(*model_, "dflash2");
+    const bool has_dv = model_has_drafter(*model_, "dv");
+
+    if (!comfort_only && orig_has_vision && vdev == interfaces::VisionDeviceMode::kGpu) {
+      vdev = interfaces::VisionDeviceMode::kDisk;
+      opt_.vision_device = "disk";
+      upsert_adj("vision_device", "gpu", "disk", "Vision encoder moved from GPU to disk (0 VRAM; multimodal kept)");
+      return true;
+    }
+    if (req_dw_valid && cur_dw != interfaces::DraftWeightsMode::kNvfp4 && est && meaningful_draft_savings(*est) &&
+        (!comfort_only || req_dw == interfaces::DraftWeightsMode::kAuto)) {
+      cur_dw = interfaces::DraftWeightsMode::kNvfp4;
+      const std::string detail = has_dflash2 ? "DFlash2 drafter weights quantized to NVFP4 (4-bit) to save VRAM"
+                                             : "Drafter weights quantized to NVFP4 (4-bit) to save VRAM";
+      upsert_adj("draft_weights", interfaces::draft_weights_name(req_dw), "nvfp4", detail);
+      return true;
+    }
+    if (comfort_only) return false;
+    if (has_dflash2) {
+      interfaces::ModelOptions mo_mtp;
+      mo_mtp.drafter = "mtp";
+      mo_mtp.speculative = opt_.speculative;
+      mo_mtp.vision = opt_.vision;
+      mo_mtp.activations = opt_.activations;
+      mo_mtp.fp4_inputs = device_.fp4_inputs != 0;
+      std::string probe_err;
+      if (auto mtp_model = interfaces::open_model(file_, mo_mtp, &probe_err)) {
+        opt_.drafter = "mtp";
+        model_ = std::move(mtp_model);
+        if (req_dw == interfaces::DraftWeightsMode::kAuto) {
+          erase_adj("draft_weights");
+          cur_dw = req_dw;
+        } else if (cur_dw == interfaces::DraftWeightsMode::kNvfp4) {
+          upsert_adj("draft_weights", interfaces::draft_weights_name(req_dw), "nvfp4",
+                     "Drafter weights quantized to NVFP4 (4-bit) to save VRAM");
+        }
+        const std::string detail = has_mtp ? "DFlash2 drafter skipped due to tight VRAM; running with MTP"
+                                           : "DFlash2 drafter skipped due to tight VRAM; falling back to MTP";
+        upsert_adj("drafter", orig_drafters_str, "mtp", detail);
+        return true;
+      }
+    }
+    if (has_dflash2 || has_mtp || has_dv) {
+      interfaces::ModelOptions mo_none;
+      mo_none.drafter = "none";
+      mo_none.speculative = opt_.speculative;
+      mo_none.vision = opt_.vision;
+      mo_none.activations = opt_.activations;
+      mo_none.fp4_inputs = device_.fp4_inputs != 0;
+      std::string none_err;
+      if (auto plain_model = interfaces::open_model(file_, mo_none, &none_err)) {
+        opt_.drafter = "none";
+        model_ = std::move(plain_model);
+        erase_adj("draft_weights");
+        cur_dw = req_dw;
+        const bool lookup_active = opt_.lookup && opt_.speculative;
+        const std::string detail = "Speculative drafter (" + orig_drafters_str +
+                                   ") skipped due to tight VRAM; " +
+                                   (lookup_active ? "running with prompt lookup" : "running plain decoding");
+        upsert_adj("drafter", orig_drafters_str, "none", detail);
+        return true;
+      }
+    }
     return false;
+  };
+
+  // Pre-flight backend-reported VRAM check (avoids wasting seconds uploading weights that cannot fit).
+  if (opt_.elastic_load && api_->estimate_load) {
+    uint64_t free_vram = 0, total_vram = 0;
+    query_vram(&free_vram, &total_vram);
+    if (total_vram > 0 && free_vram > 0) {
+      const uint64_t reserve = plan::device_reserve(total_vram, gpu_paged);
+      for (;;) {
+        flyx_load_estimate est{};
+        if (!query_estimate(free_vram, total_vram, &est)) break;
+        const uint64_t hard_need = est.weights_bytes + reserve + est.min_runtime_bytes;
+        const uint64_t comfort_need = hard_need + est.comfort_margin_bytes;
+        if (hard_need > free_vram) {
+          if (!step_down(/*comfort_only=*/false, &est)) break;
+          continue;
+        }
+        if (req_dw == interfaces::DraftWeightsMode::kAuto && cur_dw == interfaces::DraftWeightsMode::kAuto &&
+            meaningful_draft_savings(est) && comfort_need > free_vram) {
+          if (step_down(/*comfort_only=*/true, &est)) continue;
+        }
+        break;
+      }
+    }
   }
-  t[5] = os::now_ms();
-  // The plans, and every round run and timed: again when the backend gives back memory (trim).  Their time over every
-  // pass, for the load's report.
-  lower_ms_ = timed_ms_ = 0;
-  given_back_ = 0;
-  if (!lower_and_time(err)) return false;
-  if (opt_.verbose && has_vision()) log::info("flyx: vision encoder loaded");
+  t[4] = os::now_ms();
+
   int asked_ctx = 0;
-  if (!plan_memory(&tiers, session_limit, &asked_ctx, err)) return false;
+  for (;;) {
+    opt_.kv = initial_kv;
+    opt_.max_ctx = initial_max_ctx;
+    plan::KvTiers attempt_tiers = tiers;
+    if (opt_.kv == FLYX_KV_DEFAULT) opt_.kv = roomy() || !model_->kv_fp8_by_default() ? FLYX_KV_16 : FLYX_KV_FP8;
+    const flyx_open_options oo = make_open_options();
+
+    std::string attempt_err;
+    bool ok = true;
+    bool oom = false;
+    if (const int rc = api_->open(&model_->desc(), &oo, &bm_); rc != 0) {
+      attempt_err = std::string("backend open: ") + api_->last_error();
+      ok = false;
+      oom = rc == FLYX_ERR_OOM;
+    }
+    t[5] = os::now_ms();
+    if (ok) {
+      lower_ms_ = timed_ms_ = 0;
+      given_back_ = 0;
+      ok = lower_and_time(&attempt_err);
+      oom = !ok && plans_.oom;
+    }
+    if (ok) {
+      ok = plan_memory(&attempt_tiers, session_limit, &asked_ctx, &attempt_err);
+      oom = !ok && budget_.oom;
+    }
+    if (ok) break;
+
+    if (!opt_.elastic_load || !oom) {
+      *err = attempt_err;
+      return false;
+    }
+    // Tear down partial GPU allocations before stepping down a tier and retrying.
+    plans_.free(api_);
+    if (bm_) {
+      api_->close(bm_);
+      bm_ = nullptr;
+    }
+    budget_ = plan::Budget{};
+    ledger_.set_budget(0);
+
+    uint64_t free_vram = 0, total_vram = 0;
+    query_vram(&free_vram, &total_vram);
+    flyx_load_estimate est{};
+    const bool have_est = query_estimate(free_vram, total_vram, &est);
+    if (!step_down(/*comfort_only=*/false, have_est ? &est : nullptr)) {
+      *err = attempt_err;
+      return false;
+    }
+    log::warn("flyx: tight VRAM during load (%s); retrying with: %s", attempt_err.c_str(),
+              load_adjustments_.back().detail.c_str());
+  }
+
+  // Record effective active drafter weight precision directly from the backend (ABI 45).
+  if (drafter_ != "none" && api_->draft_weights) {
+    if (const char* dw = api_->draft_weights(bm_); dw && *dw) active_draft_weights_ = dw;
+  }
+
+  if (opt_.verbose && has_vision()) log::info("flyx: vision encoder loaded");
   wanted_ctx_ = asked_ctx;
   log_memory_plan(asked_ctx);
+  if (!load_adjustments_.empty()) {
+    log::warn("flyx: adjusted load for available VRAM:");
+    for (const LoadAdjustment& a : load_adjustments_) log::warn("flyx:   - %s", a.detail.c_str());
+    const std::string dw_tag = active_draft_weights_.empty() ? "" : (" (" + active_draft_weights_ + ")");
+    log::warn("flyx: active config: drafter=%s%s, vision=%s, context=%d", drafter_.c_str(), dw_tag.c_str(),
+              has_vision() ? opt_.vision_device.c_str() : "off", opt_.max_ctx);
+  }
   t[6] = os::now_ms();
   if (opt_.verbose)
     log::info("flyx: load %.2f s: file %.2f s (%s), tokenizer and chat template %.2f s, backend library "

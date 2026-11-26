@@ -129,6 +129,8 @@ flyx_add_unit_test(session_budget_test core/session/budget_test.cpp flyx-test-ho
 add_dependencies(session_budget_test flyx-cpu_ref)
 flyx_add_unit_test(generation_test core/exec/generation_test.cpp flyx-test-host-kv)
 add_dependencies(generation_test flyx-cpu_ref)
+flyx_add_unit_test(elastic_load_test core/exec/elastic_load_test.cpp flyx-test-host-kv)
+add_dependencies(elastic_load_test flyx-cpu_ref)
 flyx_add_unit_test(plans_test core/plan/plans_test.cpp)
 flyx_add_unit_test(scheduler_test core/exec/scheduler_test.cpp flyx-test-host-kv)
 
@@ -354,6 +356,7 @@ add_test(NAME scheduler_repeated_prewarm COMMAND scheduler_test ${ASSETS}/tiny.f
 add_test(NAME scheduler_marked_system COMMAND scheduler_test ${ASSETS}/tiny.flyx cpu_ref marked-system)
 add_test(NAME session_host_budget COMMAND session_budget_test ${ASSETS}/tiny.flyx)
 add_test(NAME generation_edges COMMAND generation_test ${ASSETS}/tiny.flyx)
+add_test(NAME elastic_load COMMAND elastic_load_test ${ASSETS}/tiny.flyx)
 # The C API: a chat request with the file's template, and with the one the load options give.
 add_test(NAME capi COMMAND capi_test ${ASSETS}/tiny.flyx cpu_ref)
 flyx_add_py_test(python_binding ${CMAKE_CURRENT_SOURCE_DIR}/python/flyx/binding_test.py
@@ -386,7 +389,7 @@ flyx_add_golden_test(golden_cpu_ref_window ARGS cpu_ref window)
 
 set_tests_properties(tokenizer tokenizer_minicpm5 chat chat_qwen35 reply_grammars request reply_text
                      scheduler_cpu_ref scheduler_queue scheduler_prewarmed_history scheduler_interrupted_prewarm
-                     scheduler_reassigned_prewarm scheduler_repeated_prewarm scheduler_marked_system session_host_budget generation_edges capi
+                     scheduler_reassigned_prewarm scheduler_repeated_prewarm scheduler_marked_system session_host_budget generation_edges elastic_load capi
                      dv_trees dv_canvas dv_models llama_models PROPERTIES FIXTURES_REQUIRED assets)
 
 if(TARGET flyx-cuda)
