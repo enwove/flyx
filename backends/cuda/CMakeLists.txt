@@ -112,19 +112,21 @@ set_source_files_properties(${FLYX_CUDA_TABLE_SOURCES} runtime/state.cpp
 
 # Host code only: built by the C++ compiler, kernels come from the static library.
 set(FLYX_CUDA_HOST_SOURCES
-  backend.cpp
   loader/bind.cpp loader/weights.cpp
   runtime/state.cpp runtime/runner.cpp runtime/graphs.cpp runtime/sleep.cpp runtime/device_stats.cpp runtime/tiers.cpp
   runtime/vision_disk.cpp
   regions/batch.cpp regions/layers.cpp regions/linear.cpp regions/plan.cpp)
-add_library(flyx-cuda MODULE ${FLYX_CUDA_HOST_SOURCES})
-target_link_libraries(flyx-cuda PRIVATE flyx_cuda_kernels CUDA::cudart_static ${CMAKE_DL_LIBS})
+# Reuse the same loader, plan and sequence objects in the allocation-failure integration test.
+add_library(flyx_cuda_host STATIC ${FLYX_CUDA_HOST_SOURCES})
+target_link_libraries(flyx_cuda_host PUBLIC flyx_cuda_kernels CUDA::cudart_static ${CMAKE_DL_LIBS})
+add_library(flyx-cuda MODULE backend.cpp)
+target_link_libraries(flyx-cuda PRIVATE flyx_cuda_host)
 set_target_properties(flyx-cuda PROPERTIES PREFIX "lib" CUDA_ARCHITECTURES "${FLYX_CUDA_ARCHS}")
 
 if(FLYX_STANDALONE_EXE)
-  add_library(flyx_cuda_static STATIC ${FLYX_CUDA_HOST_SOURCES})
+  add_library(flyx_cuda_static STATIC backend.cpp)
   target_compile_definitions(flyx_cuda_static PRIVATE FLYX_STATIC_BACKEND)
-  target_link_libraries(flyx_cuda_static PUBLIC flyx_cuda_kernels CUDA::cudart_static ${CMAKE_DL_LIBS})
+  target_link_libraries(flyx_cuda_static PUBLIC flyx_cuda_host)
   set_target_properties(flyx_cuda_static PROPERTIES CUDA_ARCHITECTURES "${FLYX_CUDA_ARCHS}")
 endif()
 

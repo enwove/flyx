@@ -30,7 +30,7 @@
 extern "C" {
 #endif
 
-#define FLYX_BACKEND_ABI_VERSION 45u
+#define FLYX_BACKEND_ABI_VERSION 46u
 #define FLYX_BACKEND_ENTRY "flyx_backend_get_api"
 /* How a backend library exports its entry. */
 #if defined(_WIN32)
@@ -778,6 +778,9 @@ typedef struct {
   int32_t vision_device;        /* flyx_vision_device (ABI 44; 0 = disk) */
   int32_t vision_quant;         /* flyx_vision_quant (ABI 44; 0 = q8) */
   int32_t draft_weights;        /* flyx_draft_weights (ABI 45; 0 = auto) */
+  /* ABI 46: use this target-only position as AUTO's default switch on every layout. An explicit backend
+   * switch still wins. A zero-initialized direct caller retains layout-dependent AUTO. */
+  int32_t lock_auto_from, auto_from;
 } flyx_open_options;
 
 /* Pre-flight device memory estimate before open() allocates (ABI 45).
@@ -788,6 +791,8 @@ typedef struct {
   uint64_t draft_compact_savings; /* device bytes saved by stepping draft_weights to NVFP4 (0 if none) */
   uint64_t min_runtime_bytes;     /* minimum non-weight device overhead (context, workspace, tiny KV/graphs) */
   uint64_t comfort_margin_bytes;  /* headroom above weights + min_runtime to keep full auto drafter precision */
+  uint64_t target_kv_bytes_per_position; /* resident exact target K/V, including scales, before placement (ABI 46) */
+  int32_t vision_device;                 /* resolved flyx_vision_device for this estimate (ABI 46) */
 } flyx_load_estimate;
 
 /* Device memory as the backend sees it (0 = unknown, e.g. a CPU backend). */

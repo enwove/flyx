@@ -9,6 +9,7 @@
 #include <vector>
 
 #include "backends/cuda/backend.h"
+#include "backends/cuda/loader/layout.h"
 
 namespace flyx::cuda {
 
@@ -17,12 +18,22 @@ namespace flyx::cuda {
 // Also owns a small double-buffered device BF16 staging pair (2 x 16 MiB, allocated lazily) so drafter linears
 // stream-quantize directly into NVFP4/Q8_0 on `st` without uploading a full BF16 copy first.
 struct LoadStaging {
-  static constexpr size_t kBytes = size_t(64) << 20;
+  static constexpr size_t kBytes = kLoadSlotBytes;
   static constexpr size_t kQuantBytes = size_t(16) << 20;
-  uint8_t* buf[2] = {nullptr, nullptr};
+  struct Slot {
+    uint8_t* buf = nullptr;
+    cudaEvent_t done = nullptr;
+    Slot() = default;
+    Slot(const Slot&) = delete;
+    Slot& operator=(const Slot&) = delete;
+    ~Slot() {
+      if (done) cudaEventDestroy(done);
+      if (buf) cudaFreeHost(buf);
+    }
+  };
+  Slot slots[2];
   bf16* d_quant[2] = {nullptr, nullptr};
   size_t d_quant_bytes = 0;
-  cudaEvent_t done[2] = {nullptr, nullptr};  // the last copy/kernel out of each
   cudaStream_t st = nullptr;
   int next = 0;
   LoadStaging();

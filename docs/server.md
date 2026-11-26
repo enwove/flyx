@@ -187,7 +187,7 @@ Passed verbatim to the backend (`backends/cuda/backend.cpp`). Unknown keys or in
 | `stage_dma` | `0` \| `1` | `1` | Use async H2D DMA transfers for committed StrataFlux prefixes (single-session decode) and aligned historical FP8 prefill windows. |
 | `stage_blocks` | `N` (≥ 1) | `4` | CUDA blocks allocated to kernel-based `kv_stage` copy. |
 | `stage_window` | multiple of 64 | `16384` | Device staging window positions for prefill over host KV. |
-| `strata_from` | `N` (≥ 0) | `kv_gpu` | Position threshold where `--kv-method auto` switches from exact attention to StrataFlux. |
+| `strata_from` | `N` (≥ 0) | Requested GPU position cap or estimated capacity of the text target alone | Position threshold where `--kv-method auto` switches from exact attention to StrataFlux. |
 | `strata_denom` | `N` (≥ 0) | `16` (2-bit) / `64` (3–4-bit) | Refine 1 key pair in `N` per row (`0` = no refinement, scan copy only). |
 | `strata_least` | `N` (≥ 1) | `32` | Minimum refined key pairs per row. |
 | `strata_most` | `N` (≥ 0) | `256` | Maximum refined key pairs per row (`0` = unbounded). |

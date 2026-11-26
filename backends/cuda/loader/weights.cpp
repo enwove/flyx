@@ -483,15 +483,15 @@ void WeightLoader::upload_staged(void* dst, const void* src, size_t bytes) {
     const size_t n = std::min(LoadStaging::kBytes, bytes - off);
     const int b = S.next;
     S.next ^= 1;
-    CK(cudaEventSynchronize(S.done[b]));
+    CK(cudaEventSynchronize(S.slots[b].done));
     const size_t stripes = (n + kStripe - 1) / kStripe;
     parallel_rows(stripes, [&](size_t a, size_t e) {
       const size_t p0 = a * kStripe;
       const size_t p1 = std::min(n, e * kStripe);
-      std::memcpy(S.buf[b] + p0, in + off + p0, p1 - p0);
+      std::memcpy(S.slots[b].buf + p0, in + off + p0, p1 - p0);
     });
-    CK(cudaMemcpyAsync(out + off, S.buf[b], n, cudaMemcpyHostToDevice, S.st));
-    CK(cudaEventRecord(S.done[b], S.st));
+    CK(cudaMemcpyAsync(out + off, S.slots[b].buf, n, cudaMemcpyHostToDevice, S.st));
+    CK(cudaEventRecord(S.slots[b].done, S.st));
   }
 }
 
@@ -552,11 +552,11 @@ void WeightLoader::put_bf16(bf16* dst, int w, const RowOrder& order, bool host) 
     const size_t nr = std::min(chunk, rows - r0);
     const int b = S.next;
     S.next ^= 1;
-    CK(cudaEventSynchronize(S.done[b]));
-    auto* hp = reinterpret_cast<uint16_t*>(S.buf[b]);
+    CK(cudaEventSynchronize(S.slots[b].done));
+    auto* hp = reinterpret_cast<uint16_t*>(S.slots[b].buf);
     parallel_rows(nr, [&](size_t a, size_t e) { convert_rows(r0 + a, e - a, hp + a * K); });
     CK(cudaMemcpyAsync(dst + r0 * K, hp, nr * row_bytes, cudaMemcpyHostToDevice, S.st));
-    CK(cudaEventRecord(S.done[b], S.st));
+    CK(cudaEventRecord(S.slots[b].done, S.st));
   }
 }
 
@@ -787,6 +787,8 @@ Lin WeightLoader::lin_stack_quant(const std::vector<int>& ws, DraftQuant q, int*
   bool all_packable = true;
   for (int w : ws) all_packable = all_packable && packable(w) && t(w)->shape[1] == t(ws[0])->shape[1];
   if (all_packable) {
+    if (q != DraftQuant::kNvfp4 || m_->opt.draft_weights != interfaces::DraftWeightsMode::kNvfp4)
+      return lin_stack(ws, rows_out, orders);
     const size_t K = size_t(t(ws[0])->shape[1]);
     size_t rows = 0, added_packed_bytes = 0;
     for (size_t i = 0; i < ws.size();) {
@@ -805,7 +807,7 @@ Lin WeightLoader::lin_stack_quant(const std::vector<int>& ws, DraftQuant q, int*
       i = end;
     }
     const size_t new_bytes = rows * K / 2 + rows * K / 16 + rows * sizeof(float);
-    if (q == DraftQuant::kNvfp4 && K % 64 == 0 && added_packed_bytes * 10 >= new_bytes * 11)
+    if (K % 64 == 0 && added_packed_bytes * 10 >= new_bytes * 11)
       return pack_quantize_nvfp4(ws, rows_out, orders);
     return lin_stack(ws, rows_out, orders);
   }
@@ -826,6 +828,7 @@ Lin WeightLoader::lin_stack_quant(const std::vector<int>& ws, DraftQuant q, int*
       throw std::runtime_error(std::string(v->name) + ": stacked linear width mismatch");
     rows += size_t(v->shape[0]);
   }
+  const size_t row_bytes = quant_row_bytes(K, t(ws[0])->name);
   if ((q == DraftQuant::kNvfp4 && K % 64 != 0) || (q == DraftQuant::kQ8 && K % 32 != 0))
     return lin_stack(ws, rows_out, orders);
 
@@ -848,10 +851,9 @@ Lin WeightLoader::lin_stack_quant(const std::vector<int>& ws, DraftQuant q, int*
 
   if (!staging_) staging_ = std::make_unique<LoadStaging>();
   LoadStaging& S = *staging_;
-  const size_t row_bytes = K * sizeof(bf16);
   S.ensure_quant_staging(row_bytes);
   const size_t stage_cap = std::min(LoadStaging::kBytes, S.d_quant_bytes);
-  const size_t chunk = std::max<size_t>(1, stage_cap / row_bytes);
+  const size_t chunk = stage_cap / row_bytes;
   constexpr size_t kStripe = size_t(1) << 20;
 
   size_t r_out = 0;
@@ -863,8 +865,8 @@ Lin WeightLoader::lin_stack_quant(const std::vector<int>& ws, DraftQuant q, int*
       const size_t nr = std::min(chunk, nr_all - r0);
       const int b = S.next;
       S.next ^= 1;
-      CK(cudaEventSynchronize(S.done[b]));
-      auto* hp = reinterpret_cast<uint16_t*>(S.buf[b]);
+      CK(cudaEventSynchronize(S.slots[b].done));
+      auto* hp = reinterpret_cast<uint16_t*>(S.slots[b].buf);
       if (v->dtype == FLYX_DT_BF16 && !order) {
         const auto* in = static_cast<const uint8_t*>(v->data) + r0 * row_bytes;
         const size_t nbytes = nr * row_bytes;
@@ -872,7 +874,7 @@ Lin WeightLoader::lin_stack_quant(const std::vector<int>& ws, DraftQuant q, int*
         parallel_rows(stripes, [&](size_t a, size_t e) {
           const size_t p0 = a * kStripe;
           const size_t p1 = std::min(nbytes, e * kStripe);
-          std::memcpy(S.buf[b] + p0, in + p0, p1 - p0);
+          std::memcpy(S.slots[b].buf + p0, in + p0, p1 - p0);
         });
       } else {
         parallel_rows(nr, [&](size_t a, size_t e) {
@@ -899,7 +901,7 @@ Lin WeightLoader::lin_stack_quant(const std::vector<int>& ws, DraftQuant q, int*
         quantize_q8_0(S.d_quant[b], int(nr), int(K), q8_payload + (r_out + r0) * K,
                       q8_scales + (r_out + r0) * (K / 32), S.st);
       }
-      CK(cudaEventRecord(S.done[b], S.st));
+      CK(cudaEventRecord(S.slots[b].done, S.st));
     }
     r_out += nr_all;
   }
@@ -1124,11 +1126,12 @@ VisionLin WeightLoader::vision_lin_stack(const std::vector<int>& ws, int* rows_o
   // 3. On-the-fly Q8_0 quantization (8.5 bpw, ~46% smaller, zero-padded to K % 32 == 0).
   if (vq == FLYX_VISION_QUANT_Q8) {
     blocks_init();
-    const size_t K_pad = (K + 31) / 32 * 32;
+    const auto layout = VisionQuantLayout::q8(total_rows, K);
+    const size_t K_pad = layout.width;
     const size_t blocks_per_row = K_pad / 32;
     vl.K_pad = int(K_pad);
-    const size_t pay_bytes = total_rows * K_pad;
-    const size_t sc_elems = total_rows * blocks_per_row;
+    const size_t pay_bytes = layout.payload;
+    const size_t sc_elems = layout.scales / sizeof(uint16_t);
     uint8_t* pay_host = nullptr;
     uint16_t* sc_host = nullptr;
     std::vector<uint8_t> pay_tmp;
@@ -1177,10 +1180,11 @@ VisionLin WeightLoader::vision_lin_stack(const std::vector<int>& ws, int* rows_o
 
   // 4. On-the-fly NVFP4 quantization (4.5 bpw, ~70% smaller, zero-padded to K % 64 == 0).
   if (vq == FLYX_VISION_QUANT_NVFP4) {
-    const size_t K_pad = (K + 63) / 64 * 64;
+    const auto layout = VisionQuantLayout::nvfp4(total_rows, K);
+    const size_t K_pad = layout.width;
     vl.K_pad = int(K_pad);
-    const size_t q_bytes = total_rows * K_pad / 2;
-    const size_t s_bytes = total_rows * K_pad / 16;
+    const size_t q_bytes = layout.payload;
+    const size_t s_bytes = layout.scales;
     uint8_t *q_host = nullptr, *s_host = nullptr;
     float* rs_host = nullptr;
     std::vector<uint8_t> q_tmp, s_tmp;
@@ -1308,9 +1312,9 @@ void parallel_rows(size_t n, const std::function<void(size_t, size_t)>& fn) {
 }
 
 LoadStaging::LoadStaging() {
-  for (int i = 0; i < 2; ++i) {
-    CK(cudaHostAlloc(&buf[i], kBytes, cudaHostAllocDefault));
-    CK(cudaEventCreateWithFlags(&done[i], cudaEventDisableTiming));
+  for (Slot& slot : slots) {
+    CK(cudaHostAlloc(&slot.buf, kBytes, cudaHostAllocDefault));
+    CK(cudaEventCreateWithFlags(&slot.done, cudaEventDisableTiming));
   }
   CK(cudaStreamCreate(&st));  // a blocking stream: work on the legacy stream after waits for its copies
 }
@@ -1319,8 +1323,6 @@ LoadStaging::~LoadStaging() {
   if (st) cudaStreamSynchronize(st);
   for (int i = 0; i < 2; ++i) {
     if (d_quant[i]) cudaFree(d_quant[i]);
-    if (done[i]) cudaEventDestroy(done[i]);
-    if (buf[i]) cudaFreeHost(buf[i]);
   }
   if (st) cudaStreamDestroy(st);
 }
@@ -1393,14 +1395,14 @@ void WeightLoader::pack_rows(int w, const RowOrder& order, uint8_t* data, uint16
     const int b = S.next;
     S.next ^= 1;
     const double t0 = load_clock();
-    CK(cudaEventSynchronize(S.done[b]));  // the buffer's last copy is done
+    CK(cudaEventSynchronize(S.slots[b].done));  // the buffer's last copy is done
     const double t1 = load_clock();
-    uint8_t* hp = S.buf[b];
+    uint8_t* hp = S.slots[b].buf;
     auto* hs = reinterpret_cast<uint16_t*>(hp + (n * row_bytes + 15) / 16 * 16);
     parallel_rows(n, [&](size_t a, size_t e) { lay_out(r0 + a, e - a, hp + a * row_bytes, hs + a * row_scales); });
     CK(cudaMemcpyAsync(data + r0 * row_bytes, hp, n * row_bytes, cudaMemcpyHostToDevice, S.st));
     CK(cudaMemcpyAsync(scales + r0 * row_scales, hs, n * scale_bytes, cudaMemcpyHostToDevice, S.st));
-    CK(cudaEventRecord(S.done[b], S.st));
+    CK(cudaEventRecord(S.slots[b].done, S.st));
     times_.copy_s += t1 - t0;
     times_.pack_s += load_clock() - t1;
   }

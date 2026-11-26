@@ -296,8 +296,8 @@ int ensure_prefill_rows(flyx_bmodel* m, int rows) {
 void build_seq(flyx_bmodel* m, int32_t max_ctx, flyx_seq* s);
 
 // The layout's method for the sequence: exact, strata with a low-bit copy of 2 to 4 bits, or exact
-// below a switch and strata past it. The switch (unless the option sets it): kStrataHostExact
-// positions past the device's part; a session whose every position is exact keeps no copy.
+// below a switch and strata past it. The engine sets the switch before preflight. Direct ABI callers
+// can leave it at the layout default. A session whose every position is exact keeps no copy.
 bool take_method(const flyx_bmodel* m, const flyx_seq_layout* layout, flyx_seq* s) {
   if (!layout) return false;
   if (layout->method == FLYX_KV_READ_ALL) return true;
@@ -1065,10 +1065,10 @@ void build_seq(flyx_bmodel* m, int32_t max_ctx, flyx_seq* s) {
     CK(cudaEventCreateWithFlags(&s->idle_ev, cudaEventDisableTiming));
     CK(cudaEventCreateWithFlags(&s->ready_ev, cudaEventDisableTiming));
     if (s->arena_dev_bytes > 0) {
-      void* p = nullptr;
-      CK(cudaMalloc(&p, s->arena_dev_bytes));
-      CK(cudaMemsetAsync(p, 0, s->arena_dev_bytes, s->st));
+      s->allocs.reserve(s->allocs.size() + 1);
+      void* p = device_malloc(s->arena_dev_bytes);
       s->allocs.push_back(p);
+      CK(cudaMemsetAsync(p, 0, s->arena_dev_bytes, s->st));
       s->dev_arena = static_cast<unsigned char*>(p);
       s->dev_arena_cap = s->arena_dev_bytes;
     }

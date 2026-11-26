@@ -354,6 +354,12 @@ int main() {
     check(ok2 && most_ctx > 131072 && most_ctx < 262144 && !most.auto_exact &&
               most.session_host_bytes <= uint64_t(14 * kGiB),
           "--ctx max with auto: the longest with the copy (" + std::to_string(most_ctx) + ") " + e2);
+    tiers.allow_auto_exact = false;
+    ResourceLedger locked_ledger;
+    plan::Budget locked;
+    check(!plan::account(&api_auto, nullptr, false, false, &ctx, 0, tiers, &locked_ledger, &locked, &e1) &&
+              locked.oom && !locked.auto_exact && e1.find("AUTO attention switch") != std::string::npos,
+          "a locked target switch refuses an exact-only fallback");
   }
   {  // the copy: 300,000 positions' copies take 4.6 GiB on the GPU, more than the 4.1 GiB left beside
      // the fixed state; with 4 in host memory the other 12 and two stagings take 4.0 GiB, with 3 4.3 GiB

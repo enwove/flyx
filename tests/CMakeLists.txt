@@ -393,6 +393,13 @@ set_tests_properties(tokenizer tokenizer_minicpm5 chat chat_qwen35 reply_grammar
                      dv_trees dv_canvas dv_models llama_models PROPERTIES FIXTURES_REQUIRED assets)
 
 if(TARGET flyx-cuda)
+  add_executable(cuda_loader_test backends/cuda/loader_test.cpp ${CMAKE_SOURCE_DIR}/backends/cuda/backend.cpp)
+  target_compile_definitions(cuda_loader_test PRIVATE FLYX_TEST_DEVICE_ALLOC)
+  target_link_libraries(cuda_loader_test PRIVATE flyx_cuda_host)
+  add_test(NAME cuda_loader COMMAND cuda_loader_test)
+  add_test(NAME elastic_load_cuda COMMAND elastic_load_test ${ASSETS}/tiny.flyx cuda)
+  set_tests_properties(elastic_load_cuda PROPERTIES FIXTURES_REQUIRED assets)
+
   # Packed block weights against the float64 backend on the same files; the generic regions too.
   add_test(NAME gguf_cuda COMMAND gguf_e2e_test ${ASSETS} cuda)
   add_test(NAME gguf_cuda_unfused COMMAND gguf_e2e_test ${ASSETS} cuda fusion=0)

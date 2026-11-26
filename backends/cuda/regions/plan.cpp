@@ -456,7 +456,9 @@ int lower(flyx_bmodel* m, const flyx_program* prog, flyx_plan** out) {
       if (b && std::holds_alternative<GdnBlock>(*b))
         return fail("lower: tree rounds of more than " + std::to_string(FLYX_MAX_ROWS) +
                     " rows on a gated delta net (its tree recurrence stages 16 rows)");
-  if (prog->phase == FLYX_PHASE_PREFILL && ensure_prefill_rows(m, prog->max_rows) != 0) return -1;
+  if (prog->phase == FLYX_PHASE_PREFILL) {
+    if (const int rc = ensure_prefill_rows(m, prog->max_rows); rc != 0) return rc;
+  }
   if (m->verbose && !used.empty()) {
     std::fprintf(stderr, "flyx-cuda: %s plan (%d rows):", p->phase == FLYX_PHASE_ROUND ? "round" : "prefill",
                  p->max_rows);

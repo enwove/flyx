@@ -31,6 +31,7 @@
 #include <vector>
 
 #include "backends/cuda/blocks.h"
+#include "backends/cuda/errors.h"
 #include "backends/cuda/kernels/kernels.cuh"
 #include "backends/cuda/runtime/vision_disk.h"
 #include "core/interfaces/options.h"
@@ -42,9 +43,6 @@ namespace flyx::cuda {
 // ---- errors ----------------------------------------------------------------------------------
 // The message last_error() returns (per thread).
 extern thread_local std::string g_error;
-struct CudaError : std::runtime_error {
-  using std::runtime_error::runtime_error;
-};
 void ck(cudaError_t e, const char* what);
 #define CK(x) ::flyx::cuda::ck((x), #x)
 // The model's device memory (flyx_bmodel::alloc) and the prefill buffers: cudaMalloc that never takes more than the
@@ -52,9 +50,6 @@ void ck(cudaError_t e, const char* what);
 // every round (Qwen3.5-4B NVFP4 beside other programs holding 4.7 of 8 GB: 12.5 tok/s plain against 132.4); this
 // throws OutOfDeviceMemory instead (and so does a refusal by the driver).  device_room: the same check alone, for
 // memory the driver maps (a VMM slab), throwing where device_malloc would.
-struct OutOfDeviceMemory : CudaError {
-  using CudaError::CudaError;
-};
 void device_room(size_t bytes);
 void* device_malloc(size_t bytes);
 // Records m for last_error(); returns -1 (or FLYX_ERR_OOM for device memory exhaustion).
@@ -116,8 +111,8 @@ inline void destroy_side(SideStream& s) {
 //                         a 2-bit copy, 64 with more; 0: none, the copy alone), at least strata_least=N pairs (32),
 //                         plus the last strata_recent=N positions, and at most strata_most=N pairs (256; 0: no
 //                         bound); strata_scan=cores, strata_grid=normal: measurement
-//   strata_from=N         --kv-method auto: rounds read the copy from position N on (default: the GPU's part of
-//                         the K/V, i.e. 0 tokens of exact host overhang)
+//   strata_from=N         --kv-method auto: read the copy from position N on (overrides the engine's
+//                         target-only reference position)
 //   act_group=64|128|256  measurement: 8-bit inputs with one scale this many values (bench/quality/kld.cpp; with
 //                         fusion=0 and round_glu=0, whose producers round their own outputs per 32)
 //   act_fp4=1|2           measurement: inputs first rounded as NVFP4 (1) or MXFP8 (2) activations would be
@@ -1047,8 +1042,9 @@ struct Pass {
 
 // loader/bind.cpp: blocks and the state table from the description's tables; uploads the weights.
 void bind(flyx_bmodel* m, const flyx_model_desc& d, LoadTimes* times = nullptr);
-// Estimate LLM and vision weight bytes (honoring vision_quant) from a model description before uploading.
-void vision_weight_bytes(const flyx_model_desc& desc, int vision_quant, uint64_t* llm_bytes, uint64_t* vis_bytes);
+// Resolve placement from the representation the loader uploads. Optionally report resident bytes and vision weights.
+int resolve_vision_device(const flyx_model_desc& desc, const BackendOptions& opt, uint64_t free_vram,
+                          uint64_t* resident_bytes, std::vector<char>* vision_weights = nullptr);
 // Pre-flight device memory estimate (ABI 45: flyx_backend_api::estimate_load).
 int estimate_load(const flyx_model_desc* desc, const flyx_open_options* opts, uint64_t free_vram,
                   uint64_t total_vram, flyx_load_estimate* out);

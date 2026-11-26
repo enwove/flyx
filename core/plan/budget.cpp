@@ -242,7 +242,7 @@ struct TierPlacer {
     if (by) *by = CtxLimit::kNone;
     bool placed = tiered(api, bm, ctx, tiers, room, l, s, &e);
     out->auto_exact = false;
-    if (exact_ok && (!placed || s->host > out->host_budget) && tiers.method == FLYX_KV_AUTO) {
+    if (tiers.allow_auto_exact && exact_ok && (!placed || s->host > out->host_budget) && tiers.method == FLYX_KV_AUTO) {
       out->copy_note = !placed ? "it does not fit on the GPU"
                                : "it would take " + gb(s->host) + " of host memory, " + gb(out->host_budget) +
                                      " can be spared";
@@ -328,7 +328,8 @@ uint64_t least_session(const TierPlacer& placer, bool in_host) {
   uint64_t bytes = 0;
   if (!in_host) return device_bytes(placer.api, placer.bm, kLeastCtx, placer.tiers, &bytes) ? bytes : 0;
   // FLYX_KV_AUTO falls back to exact when Strata copies do not fit, so the true floor is exact.
-  const KvTiers t = placer.tiers.method == FLYX_KV_AUTO ? exact_of(placer.tiers) : placer.tiers;
+  const bool exact = placer.tiers.allow_auto_exact && placer.tiers.method == FLYX_KV_AUTO;
+  const KvTiers t = exact ? exact_of(placer.tiers) : placer.tiers;
   const flyx_seq_layout l{kLeastCtx, 0, t.method, t.method_arg, INT32_MAX};
   flyx_seq_size s{};
   return placer.api->seq_size(placer.bm, &l, &s) == 0 ? s.device : 0;
@@ -425,7 +426,7 @@ bool account(const flyx_backend_api* api, flyx_bmodel* bm, bool has_drafter, boo
       // when the copy fits nowhere, every position exact.
       bool exact_ok = false;
       int ctx = placer.longest_placed(max_ctx, &l, &s, exact_ok);
-      if (ctx == 0) {
+      if (ctx == 0 && tiers.allow_auto_exact) {
         exact_ok = true;
         ctx = placer.place(max_ctx, &l, &s, &out->tier_note) ? max_ctx : placer.longest_placed(max_ctx, &l, &s);
       }
@@ -448,6 +449,8 @@ bool account(const flyx_backend_api* api, flyx_bmodel* bm, bool has_drafter, boo
     }
     out->oom = true;
     *err = format_oom_error(placer, mi, reserve, max_ctx, has_drafter, mostly_bf16, tiers_on);
+    if (tiers.method == FLYX_KV_AUTO && !tiers.allow_auto_exact)
+      *err += " The requested context must keep the target model's AUTO attention switch.";
     return false;
   }
   return true;

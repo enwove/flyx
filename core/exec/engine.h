@@ -228,8 +228,8 @@ class Engine {
   int prefill_align() const { return prefill_align_; }
   // Rows per prefill pass: the option, as a multiple of prefill_align().
   int prefill_chunk() const { return prefill_chunk_; }
+  bool roomy() const { return roomy_; }  // at least 32 GB free after the text target weights
   int auto_prefill_chunk() const;  // opt_.prefill_chunk == 0: by the device memory left
-  bool roomy() const;  // 32 GB of GPU memory free after the weights: binary16 K/V, GPU embeddings by default
   const std::vector<int32_t>& eos() const { return eos_; }
   // The model's vocabulary as grammars see it (core/grammar), built on first use.
   Grammar& grammar();
@@ -280,6 +280,7 @@ class Engine {
   const flyx_backend_api* api_ = nullptr;
   std::string backend_name_;
   flyx_device_info device_{};
+  bool roomy_ = false;
   std::unique_ptr<interfaces::Model> model_;          // the file as blocks, with the drafters in use
   flyx_bmodel* bm_ = nullptr;
   int prefill_align_ = 1, prefill_chunk_ = 1024;

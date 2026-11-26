@@ -600,6 +600,8 @@ void bind(flyx_bmodel* m, const flyx_model_desc& d, LoadTimes* times) {
         try {
           if (L.packable(b.embed.table)) e.blk = host ? L.pack_host(b.embed.table) : L.pack(b.embed.table);
           else e.table = host ? L.mat_host(b.embed.table) : L.mat(b.embed.table);
+        } catch (const OutOfDeviceMemory&) {
+          throw;  // Packed host embeddings can still require tables on the device.
         } catch (const CudaError& err) {
           if (!host) throw;
           throw std::runtime_error(std::string("the embedding in host memory: ") + err.what() +
@@ -730,13 +732,26 @@ void bind(flyx_bmodel* m, const flyx_model_desc& d, LoadTimes* times) {
   if (times) *times = L.times();
 }
 
-void vision_weight_bytes(const flyx_model_desc& desc, int vision_quant, uint64_t* llm_bytes, uint64_t* vis_bytes) {
-  std::vector<char> is_vis(size_t(desc.n_weights), 0), is_vis_lin(size_t(desc.n_weights), 0);
+int resolve_vision_device(const flyx_model_desc& desc, const BackendOptions& opt, uint64_t free_vram,
+                          uint64_t* resident_bytes, std::vector<char>* vision_weights) {
+  enum class Linear { none, native_packed, convert };
+  std::vector<char> is_vis(size_t(desc.n_weights), 0);
+  std::vector<Linear> linear(size_t(desc.n_weights), Linear::none);
+  uint64_t padded_bias = 0;
   auto mv = [&](int w) {
     if (w >= 0 && w < desc.n_weights) is_vis[size_t(w)] = 1;
   };
-  auto ml = [&](int w) {
-    if (w >= 0 && w < desc.n_weights) is_vis[size_t(w)] = 1, is_vis_lin[size_t(w)] = 1;
+  auto ml = [&](std::initializer_list<int> ws) {
+    // vision_lin_stack keeps file blocks only when every member of the stack is packable.
+    const bool packed = opt.packed_blocks && std::all_of(ws.begin(), ws.end(), [&](int w) {
+      const auto* t = w >= 0 && w < desc.n_weights ? desc.weights[w].t : nullptr;
+      return t && t->ndim == 2 && blocks_supported(t->dtype, int(t->shape[1]));
+    });
+    for (int w : ws) {
+      if (w < 0 || w >= desc.n_weights) continue;
+      mv(w);
+      linear[size_t(w)] = packed ? Linear::native_packed : Linear::convert;
+    }
   };
   auto mn = [&](const flyx_vnorm& n) { mv(n.w), mv(n.b); };
   for (int i = 0; i < desc.n_blocks; ++i) {
@@ -746,21 +761,29 @@ void vision_weight_bytes(const flyx_model_desc& desc, int vision_quant, uint64_t
           mv(b.vision_stem.cls_token);
       mn(b.vision_stem.pre_norm);
     } else if (b.kind == FLYX_BLOCK_VIT_ATTN) {
+      // Separate Q/K/V biases are uploaded as one vector, with missing lanes zero-filled.
+      if (b.vit_attn.qkv < 0) {
+        ml({b.vit_attn.q, b.vit_attn.k, b.vit_attn.v});
+        const int biases = int(b.vit_attn.q_b >= 0) + int(b.vit_attn.k_b >= 0) + int(b.vit_attn.v_b >= 0);
+        if (biases) padded_bias += uint64_t(3 - biases) * b.vit_attn.n_heads * b.vit_attn.head_dim * sizeof(float);
+      } else {
+        ml({b.vit_attn.qkv});
+      }
       mn(b.vit_attn.norm), mn(b.vit_attn.q_norm), mn(b.vit_attn.k_norm);
-      ml(b.vit_attn.qkv), ml(b.vit_attn.q), ml(b.vit_attn.k), ml(b.vit_attn.v), ml(b.vit_attn.o);
+      ml({b.vit_attn.o});
       mv(b.vit_attn.qkv_b), mv(b.vit_attn.q_b), mv(b.vit_attn.k_b), mv(b.vit_attn.v_b), mv(b.vit_attn.o_b),
           mv(b.vit_attn.layer_scale);
     } else if (b.kind == FLYX_BLOCK_VIT_MLP) {
       mn(b.vit_mlp.norm);
-      ml(b.vit_mlp.fc1), ml(b.vit_mlp.gate), ml(b.vit_mlp.fc2);
+      ml({b.vit_mlp.fc1}), ml({b.vit_mlp.gate}), ml({b.vit_mlp.fc2});
       mv(b.vit_mlp.fc1_b), mv(b.vit_mlp.gate_b), mv(b.vit_mlp.fc2_b), mv(b.vit_mlp.layer_scale);
     } else if (b.kind == FLYX_BLOCK_VISION_MERGE) {
       mn(b.vision_merge.norm);
-      ml(b.vision_merge.fc1), ml(b.vision_merge.fc2);
+      ml({b.vision_merge.fc1}), ml({b.vision_merge.fc2});
       mv(b.vision_merge.fc1_b), mv(b.vision_merge.fc2_b);
     }
   }
-  uint64_t llm = 0, vis = 0;
+  uint64_t llm = 0, vis = padded_bias;
   for (int i = 0; i < desc.n_weights; ++i) {
     const flyx_tensor_view* t = desc.weights[i].t;
     if (!t) continue;
@@ -768,16 +791,33 @@ void vision_weight_bytes(const flyx_model_desc& desc, int vision_quant, uint64_t
       llm += t->nbytes;
       continue;
     }
-    uint64_t nb = t->nbytes;
-    const bool flt = t->dtype == FLYX_DT_BF16 || t->dtype == FLYX_DT_F16 || t->dtype == FLYX_DT_F32;
-    if (is_vis_lin[size_t(i)] && flt) {
-      if (vision_quant == FLYX_VISION_QUANT_Q8) nb = (nb * 55) / 100;
-      else if (vision_quant == FLYX_VISION_QUANT_NVFP4) nb = (nb * 30) / 100;
+    uint64_t nb = WeightLoader::numel(t) * sizeof(float);  // stem, biases and norms are uploaded as float
+    if (linear[size_t(i)] != Linear::none && t->ndim == 2) {
+      const size_t rows = size_t(t->shape[0]), cols = size_t(t->shape[1]);
+      if (linear[size_t(i)] == Linear::native_packed) {
+        const auto lo = blocks_layout(t->dtype);
+        nb = rows * (cols / lo.values) * (lo.stride + lo.scales * sizeof(uint16_t));
+      } else if (t->dtype == FLYX_DT_NVFP4 || t->dtype == FLYX_DT_GGML_NVFP4) {
+        nb = rows * (cols / 2 + cols / 16 + sizeof(float));
+      } else if (opt.vision_quant == FLYX_VISION_QUANT_Q8) {
+        nb = VisionQuantLayout::q8(rows, cols).bytes();
+      } else if (opt.vision_quant == FLYX_VISION_QUANT_NVFP4) {
+        nb = VisionQuantLayout::nvfp4(rows, cols).bytes();
+      } else {
+        nb = rows * cols * sizeof(uint16_t);
+      }
     }
     vis += nb;
   }
-  if (llm_bytes) *llm_bytes = llm;
-  if (vis_bytes) *vis_bytes = vis;
+  if (vision_weights) *vision_weights = std::move(is_vis);
+  int placement = opt.vision;
+  if (placement == FLYX_VISION_DEV_AUTO) {
+    const bool roomy = free_vram >= llm && free_vram - llm >= vis &&
+                       free_vram - llm - vis >= uint64_t(8) * 1000000000;
+    placement = vis && roomy ? FLYX_VISION_DEV_GPU : FLYX_VISION_DEV_DISK;
+  }
+  if (resident_bytes) *resident_bytes = placement == FLYX_VISION_DEV_GPU ? vis : 0;
+  return placement;
 }
 
 int estimate_load(const flyx_model_desc* desc, const flyx_open_options* opts, uint64_t free_vram,
@@ -801,13 +841,12 @@ int estimate_load(const flyx_model_desc* desc, const flyx_open_options* opts, ui
   if (!parse_options(opts ? opts->options : nullptr, &bo, &err)) return -1;
 
   const int nw = desc->n_weights;
-  std::vector<char> is_vis(size_t(nw), 0), is_mtp_w(size_t(nw), 0), is_dflash_w(size_t(nw), 0),
+  std::vector<char> is_vis, is_mtp_w(size_t(nw), 0), is_dflash_w(size_t(nw), 0),
       is_dflash_lin(size_t(nw), 0), is_mtp_lin(size_t(nw), 0), is_dv_w(size_t(nw), 0), is_host_embed(size_t(nw), 0);
   auto mark = [&](std::vector<char>& vec, int w) {
     if (w >= 0 && w < nw) vec[size_t(w)] = 1;
   };
   auto mark_norm = [&](std::vector<char>& vec, const flyx_norm& n) { mark(vec, n.w); };
-  auto mark_vnorm = [&](const flyx_vnorm& n) { mark(is_vis, n.w), mark(is_vis, n.b); };
 
   // Identify MTP's referenced attn/mlp blocks so they are accounted as drafter weights rather than target weights.
   std::vector<char> is_draft_blk(size_t(desc->n_blocks), 0), is_mtp_blk(size_t(desc->n_blocks), 0);
@@ -832,12 +871,8 @@ int estimate_load(const flyx_model_desc* desc, const flyx_open_options* opts, ui
     const bool roomy = free_vram > raw_weights && free_vram - raw_weights >= uint64_t(32) * 1000000000;
     bo.embed = roomy ? 2 : 1;
   }
-  uint64_t llm_raw = 0, vis_raw = 0;
-  vision_weight_bytes(*desc, bo.vision_quant, &llm_raw, &vis_raw);
-  if (bo.vision == FLYX_VISION_DEV_AUTO) {
-    const bool roomy = free_vram > llm_raw + vis_raw && free_vram - (llm_raw + vis_raw) >= uint64_t(8) * 1000000000;
-    bo.vision = roomy ? FLYX_VISION_DEV_GPU : FLYX_VISION_DEV_DISK;
-  }
+  uint64_t vision_gpu_bytes = 0;
+  out->vision_device = resolve_vision_device(*desc, bo, free_vram, &vision_gpu_bytes, &is_vis);
 
   bool target_fp4 = false, target_packed = false;
   uint64_t dv_extra = 0;
@@ -853,24 +888,6 @@ int estimate_load(const flyx_model_desc* desc, const flyx_open_options* opts, ui
     const flyx_block& b = desc->blocks[i];
     if (b.kind == FLYX_BLOCK_EMBED) {
       if (bo.embed == 1 && !head_reads(*desc, b.embed.table)) mark(is_host_embed, b.embed.table);
-    } else if (b.kind == FLYX_BLOCK_VISION_STEM) {
-      mark(is_vis, b.vision_stem.patch_w), mark(is_vis, b.vision_stem.patch_w2), mark(is_vis, b.vision_stem.patch_b),
-          mark(is_vis, b.vision_stem.pos_w), mark(is_vis, b.vision_stem.cls_token);
-      mark_vnorm(b.vision_stem.pre_norm);
-    } else if (b.kind == FLYX_BLOCK_VIT_ATTN) {
-      mark_vnorm(b.vit_attn.norm), mark_vnorm(b.vit_attn.q_norm), mark_vnorm(b.vit_attn.k_norm);
-      for (int w : {b.vit_attn.qkv, b.vit_attn.q, b.vit_attn.k, b.vit_attn.v, b.vit_attn.o, b.vit_attn.qkv_b,
-                    b.vit_attn.q_b, b.vit_attn.k_b, b.vit_attn.v_b, b.vit_attn.o_b, b.vit_attn.layer_scale})
-        mark(is_vis, w);
-    } else if (b.kind == FLYX_BLOCK_VIT_MLP) {
-      mark_vnorm(b.vit_mlp.norm);
-      for (int w : {b.vit_mlp.fc1, b.vit_mlp.gate, b.vit_mlp.fc2, b.vit_mlp.fc1_b, b.vit_mlp.gate_b, b.vit_mlp.fc2_b,
-                    b.vit_mlp.layer_scale})
-        mark(is_vis, w);
-    } else if (b.kind == FLYX_BLOCK_VISION_MERGE) {
-      mark_vnorm(b.vision_merge.norm);
-      for (int w : {b.vision_merge.fc1, b.vision_merge.fc2, b.vision_merge.fc1_b, b.vision_merge.fc2_b})
-        mark(is_vis, w);
     } else if (b.kind == FLYX_BLOCK_MTP) {
       mark_norm(is_mtp_w, b.mtp.norm_emb), mark_norm(is_mtp_w, b.mtp.norm_hidden), mark_norm(is_mtp_w, b.mtp.norm);
       mark(is_mtp_w, b.mtp.fc), mark(is_mtp_lin, b.mtp.fc);
@@ -934,7 +951,7 @@ int estimate_load(const flyx_model_desc* desc, const flyx_open_options* opts, ui
   resolve_draft_quant(bo.draft_weights, &cur_mtp_q, &cur_df_q);
 
   // Exact device byte formula mirroring WeightLoader::lin_stack / lin_stack_quant / mat / vec.
-  auto tensor_dev_bytes = [&](const flyx_tensor_view* v, bool is_lin, DraftQuant q) -> uint64_t {
+  auto tensor_dev_bytes = [&](const flyx_tensor_view* v, bool is_lin, DraftQuant q, bool compact = false) -> uint64_t {
     if (!v) return 0;
     uint64_t nel = 1;
     for (int d = 0; d < v->ndim; ++d) nel *= uint64_t(v->shape[d]);
@@ -954,7 +971,7 @@ int estimate_load(const flyx_model_desc* desc, const flyx_open_options* opts, ui
         const BlockLayout lo = blocks_layout(v->dtype);
         const uint64_t per_row = K / uint64_t(lo.values);
         const uint64_t packed_b = R * per_row * (uint64_t(lo.stride) + uint64_t(lo.scales) * sizeof(uint16_t));
-        if (q == DraftQuant::kNvfp4 && K % 64 == 0 && packed_b * 10 >= nvfp4_b * 11) return nvfp4_b;
+        if (compact && K % 64 == 0 && packed_b * 10 >= nvfp4_b * 11) return nvfp4_b;
         return packed_b;
       }
       if (q == DraftQuant::kNvfp4 && K % 64 == 0) return nvfp4_b;
@@ -972,15 +989,16 @@ int estimate_load(const flyx_model_desc* desc, const flyx_open_options* opts, ui
   };
 
   uint64_t target_bytes = 0, dv_bytes = dv_extra, cur_draft_bytes = 0, nvfp4_draft_bytes = 0;
+  const bool compact = bo.draft_weights == interfaces::DraftWeightsMode::kNvfp4;
   for (int i = 0; i < nw; ++i) {
     const flyx_tensor_view* v = desc->weights[i].t;
     if (!v || is_vis[size_t(i)]) continue;
     if (is_dflash_w[size_t(i)]) {
-      cur_draft_bytes += tensor_dev_bytes(v, is_dflash_lin[size_t(i)] != 0, cur_df_q);
-      nvfp4_draft_bytes += tensor_dev_bytes(v, is_dflash_lin[size_t(i)] != 0, DraftQuant::kNvfp4);
+      cur_draft_bytes += tensor_dev_bytes(v, is_dflash_lin[size_t(i)] != 0, cur_df_q, compact);
+      nvfp4_draft_bytes += tensor_dev_bytes(v, is_dflash_lin[size_t(i)] != 0, DraftQuant::kNvfp4, true);
     } else if (is_mtp_w[size_t(i)]) {
-      cur_draft_bytes += tensor_dev_bytes(v, is_mtp_lin[size_t(i)] != 0, cur_mtp_q);
-      nvfp4_draft_bytes += tensor_dev_bytes(v, is_mtp_lin[size_t(i)] != 0, DraftQuant::kNvfp4);
+      cur_draft_bytes += tensor_dev_bytes(v, is_mtp_lin[size_t(i)] != 0, cur_mtp_q, compact);
+      nvfp4_draft_bytes += tensor_dev_bytes(v, is_mtp_lin[size_t(i)] != 0, DraftQuant::kNvfp4, true);
     } else if (is_dv_w[size_t(i)]) {
       dv_bytes += tensor_dev_bytes(v, false, DraftQuant::kNone);
     } else if (!is_host_embed[size_t(i)]) {
@@ -989,10 +1007,16 @@ int estimate_load(const flyx_model_desc* desc, const flyx_open_options* opts, ui
   }
   for (int w : dflash_ctx_ws) {
     if (w < 0 || w >= nw || !desc->weights[w].t) continue;
-    cur_draft_bytes += tensor_dev_bytes(desc->weights[w].t, true, cur_df_q);
-    nvfp4_draft_bytes += tensor_dev_bytes(desc->weights[w].t, true, DraftQuant::kNvfp4);
+    cur_draft_bytes += tensor_dev_bytes(desc->weights[w].t, true, cur_df_q, compact);
+    nvfp4_draft_bytes += tensor_dev_bytes(desc->weights[w].t, true, DraftQuant::kNvfp4, true);
   }
-  const uint64_t vision_gpu_bytes = bo.vision == FLYX_VISION_DEV_GPU ? vis_raw : 0;
+  for (int i = 0; i < desc->n_states; ++i) {
+    const flyx_state& state = desc->states[i];
+    if (state.kind != FLYX_STATE_KV || state.draft) continue;
+    const bool fp8 = opts && opts->kv_fp8 && state.layers == 1;
+    const uint64_t head_bytes = fp8 ? state.head_dim + sizeof(float) : state.head_dim * sizeof(uint16_t);
+    out->target_kv_bytes_per_position += 2ull * state.layers * state.n_kv * head_bytes;
+  }
   out->draft_weights_bytes = cur_draft_bytes + dv_bytes;
   out->draft_compact_savings = cur_draft_bytes > nvfp4_draft_bytes ? cur_draft_bytes - nvfp4_draft_bytes : 0;
   out->weights_bytes = target_bytes + vision_gpu_bytes + out->draft_weights_bytes;

@@ -33,7 +33,16 @@ static std::string asked(size_t bytes) {
   return s;
 }
 
+#ifdef FLYX_TEST_DEVICE_ALLOC
+// Only the loader test executable supplies these. The production module always calls the driver.
+void test_device_room(size_t bytes);
+cudaError_t test_cuda_malloc(void** ptr, size_t bytes);
+#endif
+
 void device_room(size_t bytes) {
+#ifdef FLYX_TEST_DEVICE_ALLOC
+  test_device_room(bytes);
+#endif
 #if defined(_WIN32)
   // Windows' driver places an allocation past what its video memory manager keeps free in host memory instead of
   // refusing it: refused here first, against NVML's free memory (gpu_memory) less kPagedFloor.
@@ -56,7 +65,11 @@ void* device_malloc(size_t bytes) {
   char m[240];
   // The driver refuses elsewhere; on Windows it may too (another program between device_room and the allocation).
   void* p = nullptr;
+#ifdef FLYX_TEST_DEVICE_ALLOC
+  const cudaError_t e = test_cuda_malloc(&p, bytes);
+#else
   const cudaError_t e = cudaMalloc(&p, bytes);
+#endif
   if (e == cudaErrorMemoryAllocation) {
     cudaGetLastError();  // not sticky: clear it
     std::snprintf(m, sizeof(m), "out of GPU memory: %s asked, the driver refused it", asked(bytes).c_str());
@@ -521,6 +534,7 @@ int open_model(const flyx_model_desc* desc, const flyx_open_options* opts, flyx_
     cudaGetDeviceProperties(&prop, 0);
     std::string err;
     if (opts) {
+      if (opts->lock_auto_from) m->opt.kernels.strata_from = opts->auto_from;
       m->opt.vision = opts->vision_device;
       m->opt.vision_quant = opts->vision_quant;
       if (opts->draft_weights == FLYX_DRAFT_WEIGHTS_NVFP4)
@@ -548,22 +562,12 @@ int open_model(const flyx_model_desc* desc, const flyx_open_options* opts, flyx_
       m->opt.embed = roomy ? 2 : 1;
     }
     if (m->opt.vision == FLYX_VISION_DEV_AUTO) {
-      // vision=auto: keep vision encoder weights on the GPU when >= 8 GB of free VRAM remain after LLM + vision
-      // weights (for KV cache, drafters, and round graphs); otherwise keep them in an auto-deleted temp file on disk
-      // (0 VRAM, 0 locked host RAM) and 3-stage stream each linear to the GPU during encode_vision().
-      uint64_t llm_bytes = 0, vis_bytes = 0;
-      vision_weight_bytes(*desc, m->opt.vision_quant, &llm_bytes, &vis_bytes);
-      if (vis_bytes > 0) {
-        size_t free_b = 0, total_b = 0;
-        bool ok_mem = gpu_memory(&free_b, &total_b);
-        if (!ok_mem) {
-          ok_mem = cudaMemGetInfo(&free_b, &total_b) == cudaSuccess;
-          cudaGetLastError();
-        }
-        const bool roomy = ok_mem && free_b > llm_bytes + vis_bytes &&
-                           free_b - (llm_bytes + vis_bytes) >= size_t(8) * 1000000000;
-        m->opt.vision = roomy ? FLYX_VISION_DEV_GPU : FLYX_VISION_DEV_DISK;
+      size_t free_b = 0, total_b = 0;
+      if (!gpu_memory(&free_b, &total_b) && cudaMemGetInfo(&free_b, &total_b) != cudaSuccess) {
+        cudaGetLastError();
+        free_b = 0;
       }
+      m->opt.vision = resolve_vision_device(*desc, m->opt, free_b, nullptr);
     }
     // FP8 tensor cores whose e4m3 sums are float32's: sm_90 and later.  Ada's (sm_89: L4, L40S) sum in fewer bits:
     // attention with q in e4m3 came out about 50 times past the op test's tolerance (relative error up to 1.5e-3

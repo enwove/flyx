@@ -407,16 +407,6 @@ bool Engine::lower_and_time(std::string* err) {
 // passes, each reading every weight once and each a prefix checkpoint for the server.  An RTX PRO 6000 (96 GB),
 // QUASAR's NVFP4 27B through the server: a 3.6K-token prompt 350-390 -> 295 ms.  The same bits at any pass length
 // (numerics.md: K).
-bool Engine::roomy() const {
-  // The FP8 K/V default buys context on cards the weights nearly fill; where 32 GB stay free after them (a
-  // 96 GB card under the 27B: 70), binary16 costs no context worth having and is finer and faster to fill (the 27B,
-  // RTX PRO 6000: a 14K-token prefill 6 to 9% faster, decoding the same).
-  uint64_t weights = 0;
-  for (int i = 0; i < model_->desc().n_weights; ++i)
-    if (const flyx_tensor_view* w = model_->desc().weights[i].t) weights += w->nbytes;
-  return device_.mem_free > weights && device_.mem_free - weights >= uint64_t(32) * 1000000000;
-}
-
 int Engine::auto_prefill_chunk() const {
   flyx_memory_info info{};
   if (!api_->memory || api_->memory(bm_, &info) != 0 || info.total == 0) return 1024;
@@ -451,15 +441,11 @@ bool Engine::plan_memory(plan::KvTiers* tiers, int session_limit, int* asked_ctx
               drafter_.c_str(), plans_.widest(), plans_.refused.c_str());
   if (opt_.ctx_max) opt_.max_ctx = model_->trained_ctx() > 0 ? model_->trained_ctx() : kCtxMaxUnnamed;
   *asked_ctx = opt_.max_ctx;
-  // Trees of drafts read every position, a drafter's that drafts nothing else (DV) as --draft-trees': set_kv_method
-  // chose the method before the model and the plans said which drafters draft trees.  A file that holds DV reads every
-  // position by default whether DV is asked for or not, so that naming it changes no token (AGENTS.md gate 4): auto
-  // would read strata past its switch without DV.  Strata asked for stays where no round drafts a tree.
+  // A file that drafts trees already locked AUTO to exact attention before preflight.
   const bool trees =
       std::find(plans_.drafter_trees.begin(), plans_.drafter_trees.end(), true) != plans_.drafter_trees.end();
-  if (trees && tiers->method == FLYX_KV_STRATA)
+  if (trees && tiers->method != FLYX_KV_READ_ALL)
     return *err = drafter_ + ": strata attention reads chains of drafts only", false;
-  if (trees || (model_->file_drafts_trees() && tiers->method == FLYX_KV_AUTO)) tiers->method = FLYX_KV_READ_ALL;
   // The model file's pages the load read are cached, not used: on Windows they count as available only once the
   // process lets go of them, and the host memory K/V may take is measured next.
   os::release_working_set();
@@ -481,7 +467,10 @@ bool Engine::plan_memory(plan::KvTiers* tiers, int session_limit, int* asked_ctx
       if (given_back_) *err += " (" + gb(given_back_) + " the backend kept for speed already given back)";
       return false;
     }
-    if (!lower_and_time(err)) return false;
+    if (!lower_and_time(err)) {
+      budget_.oom = plans_.oom;
+      return false;
+    }
   }
   if (given_back_)
     log::info("flyx: %s of GPU memory the backend kept only for speed given back so that a session fits (the same "
@@ -576,7 +565,6 @@ bool Engine::load(const std::string& path, const EngineOptions& opt, std::string
   if (!load_backend(err)) return false;
   t[3] = os::now_ms();
 
-  const int initial_kv = opt_.kv;
   const int initial_max_ctx = opt_.max_ctx;
   const std::string initial_backend_opts = opt_.backend_options;
   const std::string req_dw_raw = interfaces::backend_opt_get(initial_backend_opts, "draft_weights");
@@ -585,21 +573,31 @@ bool Engine::load(const std::string& path, const EngineOptions& opt, std::string
       req_dw_raw.empty() || interfaces::parse_draft_weights(req_dw_raw, &req_dw, nullptr, nullptr);
   // Strip valid draft_weights= from the opaque options string and pass it via typed flyx_open_options::draft_weights
   // (ABI 45); leave invalid values intact so the backend reports its normal option error.
-  const std::string clean_backend_opts =
+  std::string clean_backend_opts =
       req_dw_valid ? interfaces::backend_opt_strip(initial_backend_opts, "draft_weights") : initial_backend_opts;
   interfaces::DraftWeightsMode cur_dw = req_dw;
 
-  auto open_model_cur = [&](std::string* open_err) -> bool {
-    interfaces::ModelOptions mo;
-    mo.drafter = opt_.drafter;
-    mo.speculative = opt_.speculative;
-    mo.vision = opt_.vision;
-    mo.activations = opt_.activations;
-    mo.fp4_inputs = device_.fp4_inputs != 0;
-    model_ = interfaces::open_model(file_, mo, open_err);
-    return model_ != nullptr;
-  };
-  if (!open_model_cur(err)) return false;
+  // Legacy backend keys take precedence over the typed request once. An elastic retry can then pass disk
+  // without a stale vision=gpu overriding it at open.
+  for (const char* key : {"vision", "vision_quant"}) {
+    const std::string value = interfaces::backend_opt_get(clean_backend_opts, key);
+    if (value.empty()) continue;
+    if (std::string_view(key) == "vision") {
+      if (!interfaces::parse_vision_device(value, &vdev, &opt_.vision_device, err)) return false;
+    } else if (!interfaces::parse_vision_quant(value, &vquant, &opt_.vision_quant, err)) {
+      return false;
+    }
+    clean_backend_opts = interfaces::backend_opt_strip(clean_backend_opts, key);
+  }
+
+  interfaces::ModelOptions mo;
+  mo.drafter = opt_.drafter;
+  mo.speculative = opt_.speculative;
+  mo.vision = opt_.vision;
+  mo.activations = opt_.activations;
+  mo.fp4_inputs = device_.fp4_inputs != 0;
+  model_ = interfaces::open_model(file_, mo, err);
+  if (!model_) return false;
   if (opt_.vision && !opt_.mmproj_file.empty() && !model_->vision())
     return *err = "--mmproj " + opt_.mmproj_file + ": file is not a supported vision projector (mmproj)", false;
   if (opt_.verbose && device_.fp4_inputs == 0 && opt_.activations.empty()) {
@@ -645,10 +643,13 @@ bool Engine::load(const std::string& path, const EngineOptions& opt, std::string
     }
   };
 
+  int auto_from = opt_.kv_gpu >= 0 && opt_.kv_ram != 0 ? opt_.kv_gpu : INT32_MAX;
   auto make_open_options = [&]() {
     flyx_open_options oo{};
     oo.max_ctx = opt_.max_ctx;
     oo.verbose = opt_.verbose;
+    oo.lock_auto_from = tiers.method == FLYX_KV_AUTO;
+    oo.auto_from = auto_from;
     oo.kv_fp8 = opt_.kv == FLYX_KV_FP8 ? 1 : 0;
     oo.options = clean_backend_opts.c_str();
     oo.vision_device = to_abi_vision_device(vdev);
@@ -657,12 +658,66 @@ bool Engine::load(const std::string& path, const EngineOptions& opt, std::string
     return oo;
   };
 
+  // Resolve target arithmetic from the same text-only, drafter-free description as plain decoding.
+  // This is a metadata open. No device allocations or timing runs are needed to set the contract.
+  {
+    std::unique_ptr<interfaces::Model> plain;
+    if (model_->drafters() || model_->vision()) {
+      interfaces::ModelOptions base = mo;
+      base.drafter = "none";
+      base.speculative = false;
+      base.vision = false;
+      plain = interfaces::open_model(file_, base, err);
+      if (!plain) return false;
+    }
+    const auto& target = plain ? *plain : *model_;
+    uint64_t weights = 0;
+    for (int i = 0; i < target.desc().n_weights; ++i)
+      if (const auto* w = target.desc().weights[i].t) weights += w->nbytes;
+    roomy_ = device_.mem_free >= weights && device_.mem_free - weights >= 32000000000ull;
+    if (opt_.kv == FLYX_KV_DEFAULT)
+      opt_.kv = roomy() || !target.kv_fp8_by_default() ? FLYX_KV_16 : FLYX_KV_FP8;
+    if (target.file_drafts_trees() && tiers.method == FLYX_KV_AUTO) tiers.method = FLYX_KV_READ_ALL;
+    if (tiers.method == FLYX_KV_AUTO) {
+      tiers.allow_auto_exact = false;
+      // With automatic placement use the exact target K/V that fits beside the plain weights and runtime.
+      // The physical split can still move. An explicit GPU cap or strata_from selects its own switch.
+      if (opt_.kv_gpu < 0 && opt_.kv_ram != 0 && api_->estimate_load && device_.mem_total) {
+        const auto oo = make_open_options();
+        flyx_load_estimate base{};
+        if (api_->estimate_load(&target.desc(), &oo, device_.mem_free, device_.mem_total, &base) == 0 &&
+            base.target_kv_bytes_per_position) {
+          uint64_t room = device_.mem_free;
+          for (uint64_t held : {base.weights_bytes, base.min_runtime_bytes,
+                                plan::device_reserve(device_.mem_total, gpu_paged)})
+            room -= std::min(room, held);
+          auto_from = int(std::min<uint64_t>(INT32_MAX, room / base.target_kv_bytes_per_position));
+        }
+      }
+    }
+  }
+
   auto query_estimate = [&](uint64_t free_vram, uint64_t total_vram, flyx_load_estimate* out) -> bool {
     *out = {};
     if (!api_->estimate_load) return false;
     const flyx_open_options oo = make_open_options();
     return api_->estimate_load(&model_->desc(), &oo, free_vram, total_vram, out) == 0;
   };
+
+  if (orig_has_vision && vdev == interfaces::VisionDeviceMode::kAuto) {
+    uint64_t free_vram = 0, total_vram = 0;
+    query_vram(&free_vram, &total_vram);
+    flyx_load_estimate est{};
+    if (query_estimate(free_vram, total_vram, &est)) {
+      if (est.vision_device == FLYX_VISION_DEV_GPU) {
+        vdev = interfaces::VisionDeviceMode::kGpu;
+        opt_.vision_device = "gpu";
+      } else if (est.vision_device == FLYX_VISION_DEV_DISK) {
+        vdev = interfaces::VisionDeviceMode::kDisk;
+        opt_.vision_device = "disk";
+      }
+    }
+  }
 
   // Ordered VRAM degradation ladder (each step preserves identical target output tokens):
   //   1) vision_device: gpu -> disk (frees 100% vision VRAM while keeping multimodal)
@@ -690,12 +745,8 @@ bool Engine::load(const std::string& path, const EngineOptions& opt, std::string
     }
     if (comfort_only) return false;
     if (has_dflash2) {
-      interfaces::ModelOptions mo_mtp;
+      interfaces::ModelOptions mo_mtp = mo;
       mo_mtp.drafter = "mtp";
-      mo_mtp.speculative = opt_.speculative;
-      mo_mtp.vision = opt_.vision;
-      mo_mtp.activations = opt_.activations;
-      mo_mtp.fp4_inputs = device_.fp4_inputs != 0;
       std::string probe_err;
       if (auto mtp_model = interfaces::open_model(file_, mo_mtp, &probe_err)) {
         opt_.drafter = "mtp";
@@ -714,12 +765,8 @@ bool Engine::load(const std::string& path, const EngineOptions& opt, std::string
       }
     }
     if (has_dflash2 || has_mtp || has_dv) {
-      interfaces::ModelOptions mo_none;
+      interfaces::ModelOptions mo_none = mo;
       mo_none.drafter = "none";
-      mo_none.speculative = opt_.speculative;
-      mo_none.vision = opt_.vision;
-      mo_none.activations = opt_.activations;
-      mo_none.fp4_inputs = device_.fp4_inputs != 0;
       std::string none_err;
       if (auto plain_model = interfaces::open_model(file_, mo_none, &none_err)) {
         opt_.drafter = "none";
@@ -764,10 +811,8 @@ bool Engine::load(const std::string& path, const EngineOptions& opt, std::string
 
   int asked_ctx = 0;
   for (;;) {
-    opt_.kv = initial_kv;
     opt_.max_ctx = initial_max_ctx;
     plan::KvTiers attempt_tiers = tiers;
-    if (opt_.kv == FLYX_KV_DEFAULT) opt_.kv = roomy() || !model_->kv_fp8_by_default() ? FLYX_KV_16 : FLYX_KV_FP8;
     const flyx_open_options oo = make_open_options();
 
     std::string attempt_err;
