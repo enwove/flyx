@@ -820,12 +820,14 @@ class HeaderReader {
 
 namespace flyx {
 
+std::string gguf_header_path(const std::string& path) {
+  modelfile::SplitPath sp;
+  return modelfile::parse_split_suffix(path, &sp) && sp.part != 1 ? modelfile::shard_path(sp, 0) : path;
+}
+
 GgufPeek gguf_peek(const std::string& path) {
   GgufPeek out;
-  std::string target = path;
-  modelfile::SplitPath sp;
-  if (modelfile::parse_split_suffix(path, &sp) && sp.part != 1) target = modelfile::shard_path(sp, 0);
-  modelfile::HeaderReader r(target);
+  modelfile::HeaderReader r(gguf_header_path(path));
   char magic[4];
   uint32_t version = 0;
   if (!r.read(magic, 4) || std::memcmp(magic, "GGUF", 4) != 0 || !r.get(&version) || version < 1 || version > 3)

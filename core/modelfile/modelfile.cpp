@@ -24,6 +24,10 @@ bool read(std::vector<std::unique_ptr<os::MappedFile>>* maps, const std::string&
 
 }  // namespace
 
+std::string drafter_source_kind(const std::string& path) {
+  return modelfile::is_drafter_dir(path) ? modelfile::drafter_dir_kind(path) : modelfile::flyx_draft_kind(path);
+}
+
 bool ModelFile::open(const std::string& path, std::string* err) {
   companions_.clear();
   maps_.clear();
