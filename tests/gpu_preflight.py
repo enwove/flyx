@@ -1,0 +1,136 @@
+# Copyright 2026 The flyx Authors. SPDX-License-Identifier: Apache-2.0
+"""ctest's gpu_preflight: the GPU not already in use before the GPU tests start (every test labelled gpu needs it).
+
+Tests beside another program's GPU memory fail for its reasons, not theirs: an engine load is refused ("Not enough
+VRAM ... used by other apps") and the tests measuring the device's free memory (cuda_device_memory*) read the other
+program's allocations as theirs.  So this fails at once, naming who holds the memory, when more than
+FLYX_TEST_GPU_MAX_USED_MIB (2560 by default) is in use.  The GPU checked is the one the tests take: the first of
+CUDA_VISIBLE_DEVICES, else nvidia-smi's GPU 0.  Without nvidia-smi (or without a GPU it can read) nothing is checked
+and the test is skipped (exit 77): the GPU tests then say for themselves what they find.
+"""
+import csv
+import os
+import re
+import shutil
+import subprocess
+import sys
+
+SKIP = 77
+LIMIT_VAR = "FLYX_TEST_GPU_MAX_USED_MIB"
+
+
+def run(command):
+    try:
+        done = subprocess.run(command, capture_output=True, text=True, timeout=60)
+    except (OSError, subprocess.TimeoutExpired) as e:
+        return None, str(e)
+    return (done.stdout if done.returncode == 0 else None), (done.stdout + done.stderr).strip()
+
+
+def skip(why):
+    print(f"gpu_preflight: {why}: the GPU's memory is not checked")
+    sys.exit(SKIP)
+
+
+def windows_memory(gpu_used_mib):
+    """{pid: MiB} on the GPU from Windows' counters (nvidia-smi reports no process's memory under WDDM)."""
+    out, _ = run(["typeperf", r"\GPU Process Memory(*)\Dedicated Usage", r"\GPU Adapter Memory(*)\Dedicated Usage",
+                  "-sc", "1"])
+    rows = [r for r in csv.reader((out or "").splitlines()) if len(r) > 1]
+    if len(rows) < 2:
+        return {}
+    process, adapter = {}, {}
+    for name, value in zip(rows[0][1:], rows[1][1:]):
+        try:
+            mib = float(value) / 2**20
+        except ValueError:
+            continue
+        if m := re.search(r"Process Memory\(pid_(\d+)_luid_(\w+?_phys_\d+)\)", name):
+            process.setdefault(m.group(2), {})[int(m.group(1))] = mib
+        elif m := re.search(r"Adapter Memory\(luid_(\w+?_phys_\d+)\)", name):
+            adapter[m.group(1)] = mib
+    if not adapter:
+        return {}
+    # The counters name adapters by LUID, nvidia-smi by index: this GPU is the adapter using what nvidia-smi says.
+    luid = min(adapter, key=lambda a: abs(adapter[a] - gpu_used_mib))
+    return process.get(luid, {})
+
+
+def main():
+    limit = os.environ.get(LIMIT_VAR, "2560")
+    if not limit.isdigit():
+        print(f"gpu_preflight: {LIMIT_VAR}={limit!r} is not a number of MiB")
+        return 1
+    limit = int(limit)
+    smi = shutil.which("nvidia-smi")
+    if not smi:
+        skip("no nvidia-smi on PATH")
+    visible = os.environ.get("CUDA_VISIBLE_DEVICES")
+    pick = []
+    if visible is not None:
+        first = visible.split(",")[0].strip()
+        if not first or first.startswith("-"):
+            skip(f"CUDA_VISIBLE_DEVICES={visible!r} names no GPU")
+        pick = ["-i", first]
+    out, said = run([smi, "--query-gpu=index,uuid,name,memory.used,memory.total", "--format=csv,noheader,nounits",
+                     *pick])
+    if not out or not out.strip():
+        skip(f"nvidia-smi found no GPU ({said or 'no output'})")
+    index, uuid, name, used, total = [f.strip() for f in out.strip().splitlines()[0].split(",")]
+    if not used.isdigit():
+        skip(f"nvidia-smi reports no memory in use for GPU {index} ({used})")
+    used, gpu = int(used), f"GPU {index} ({name})"
+    if used <= limit:
+        print(f"gpu_preflight: {gpu}: {used} of {total} MiB in use, the limit {limit} MiB ({LIMIT_VAR}): ok")
+        return 0
+
+    print(f"gpu_preflight: {gpu}: {used} of {total} MiB already in use before the GPU tests, more than "
+          f"{limit} MiB ({LIMIT_VAR}).\nBeside it engine loads would be refused (\"Not enough VRAM ... used by "
+          "other apps\") and the tests measuring free memory (cuda_device_memory*) would fail.")
+    apps, _ = run([smi, "--query-compute-apps=gpu_uuid,pid,process_name,used_memory", "--format=csv,noheader,nounits"])
+    procs = {}
+    for line in (apps or "").splitlines():
+        fields = [f.strip() for f in line.split(",")]
+        if len(fields) >= 4 and fields[0] == uuid and fields[1].isdigit():
+            mib = fields[-1]
+            procs[int(fields[1])] = [", ".join(fields[2:-1]), float(mib) if mib.isdigit() else None]
+    source, overcounted = "nvidia-smi", []
+    if sys.platform == "win32" and not any(m for _, m in procs.values()):
+        counted = windows_memory(used)
+        if counted:
+            source = "Windows' GPU Process Memory counter"
+            for pid, mib in counted.items():
+                procs.setdefault(pid, ["", None])[1] = mib
+            # Names nvidia-smi could not read ([Insufficient Permissions]) from the process list.
+            listed, _ = run(["tasklist", "/FO", "CSV", "/NH"])
+            names = {int(r[1]): r[0] for r in csv.reader((listed or "").splitlines()) if len(r) > 1 and r[1].isdigit()}
+            for pid, p in procs.items():
+                if not p[0] or p[0].startswith("["):
+                    p[0] = names.get(pid, p[0] or "?")
+            # The compositor's counter (dwm.exe) also counts the surfaces it shares with other programs: above what
+            # the whole GPU has in use it says nothing about who holds it.
+            overcounted = [(pid, p) for pid, p in procs.items() if p[1] and p[1] > used]
+            for pid, _ in overcounted:
+                del procs[pid]
+    held = sorted(procs.items(), key=lambda p: -(p[1][1] or 0))
+    if any(mib is not None for _, mib in procs.values()):
+        held = [p for p in held if p[1][1] is not None]
+    shown = [p for p in held if p[1][1] is None or p[1][1] >= 16][:12]
+    if shown:
+        print(f"In use on {gpu}, MiB ({source}):")
+        for pid, (exe, mib) in shown:
+            print(f"  {'?' if mib is None else round(mib):>7}  pid {pid:<7} {exe}")
+        rest = [mib or 0 for _, (_, mib) in held[len(shown):]]
+        if rest:
+            print(f"  ... and {len(rest)} more, {round(max(rest))} MiB or less each")
+        for pid, (exe, mib) in overcounted:
+            print(f"  (pid {pid} {exe}: {round(mib)} MiB counted, more than the GPU's {used} in use: surfaces it "
+                  "shares with other programs)")
+    else:
+        print("nvidia-smi names no process on it (WSL and containers do not see the host's processes).")
+    print(f"Stop what holds it or wait for it, or allow more: {LIMIT_VAR}=<MiB> (docs/testing.md, section 2).")
+    return 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())

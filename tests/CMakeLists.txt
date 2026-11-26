@@ -48,7 +48,7 @@
 # The labels it cannot infer are at this file's end.
 # Labels are only ever appended (set_property(TEST ... APPEND PROPERTY LABELS ...)): one set elsewhere stays.
 
-# After a directory's last test: the tier where none was given, quick, the GPU tests' resource group, the rules.
+# After a directory's last test: the tier where none was given, quick, the GPU tests' slot and preflight, the rules.
 function(flyx_finish_test_labels)
   set(tier_labels unit tiny golden tools)
   set(aspect_labels gpu gpu_serial smoke dv server)
@@ -61,6 +61,7 @@ function(flyx_finish_test_labels)
     endif()
     list(REMOVE_DUPLICATES labels)
     get_test_property(${t} FIXTURES_REQUIRED fixtures)
+    get_test_property(${t} FIXTURES_SETUP setups)
     get_test_property(${t} RUN_SERIAL serial)
     # DV's tests are tests/dv.cmake's (labelled dv there): one named as DV's (dv, _dv, dv31_, ...) or needing DV's
     # assets elsewhere would run without FLYX_TEST_DV and in every preset.
@@ -96,9 +97,11 @@ function(flyx_finish_test_labels)
       string(APPEND errors "  ${t}: smoke on a DV test (quick runs no DV)\n")
     endif()
     # A slot of the GPU (tests/gpu_resources.json, the presets' resourceSpecFile): CPU tests run beside the GPU's at
-    # any -j, the GPU's bounded on their own.  Without a resource spec (no preset) ctest ignores it.
-    if("gpu" IN_LIST labels)
+    # any -j, the GPU's bounded on their own.  Without a resource spec (no preset) ctest ignores it.  And
+    # gpu_preflight before it (the GPU not already in use by another program), which takes no slot itself.
+    if("gpu" IN_LIST labels AND NOT "gpu_preflight" IN_LIST setups)
       set_property(TEST ${t} PROPERTY RESOURCE_GROUPS "gpus:1")
+      set_property(TEST ${t} APPEND PROPERTY FIXTURES_REQUIRED gpu_preflight)
     endif()
     if("smoke" IN_LIST labels OR (tier MATCHES "^(unit|tiny)$" AND NOT "gpu" IN_LIST labels
                                   AND NOT "dv" IN_LIST labels))
@@ -454,6 +457,10 @@ set_tests_properties(tokenizer tokenizer_minicpm5 chat chat_qwen35 reply_grammar
 # The tests that need the GPU (label gpu): the ones below, and those above that take the CUDA backend too.
 get_property(flyx_cpu_tests DIRECTORY PROPERTY TESTS)
 if(TARGET flyx-cuda)
+  # Before every GPU test (flyx_finish_test_labels: FIXTURES_REQUIRED gpu_preflight): fails, naming who holds it, when
+  # another program has more than FLYX_TEST_GPU_MAX_USED_MIB (2560) of the GPU; skipped without nvidia-smi.
+  add_test(NAME gpu_preflight COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/gpu_preflight.py)
+  set_tests_properties(gpu_preflight PROPERTIES FIXTURES_SETUP gpu_preflight SKIP_RETURN_CODE 77)
   add_executable(cuda_loader_test backends/cuda/loader_test.cpp ${CMAKE_SOURCE_DIR}/backends/cuda/backend.cpp)
   target_compile_definitions(cuda_loader_test PRIVATE FLYX_TEST_DEVICE_ALLOC)
   target_link_libraries(cuda_loader_test PRIVATE flyx_cuda_host)

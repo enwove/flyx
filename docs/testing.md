@@ -51,7 +51,8 @@ preset that excludes a label itself (`dev`, `gpu`, `cpu` and their Windows twins
 | `quick` | derived | `unit` or `tiny`, neither `gpu` nor `dv`; or `smoke` | `flyx_finish_test_labels()` |
 
 `flyx_finish_test_labels()` runs at the end of `tests/CMakeLists.txt` and `bench/CMakeLists.txt`. It gives a test
-without a tier one, adds `quick`, gives every `gpu` test a slot of the GPU (`RESOURCE_GROUPS gpus:1`), and refuses the
+without a tier one, adds `quick`, gives every `gpu` test a slot of the GPU (`RESOURCE_GROUPS gpus:1`) and
+`gpu_preflight` before it (`FIXTURES_REQUIRED`, below), and refuses the
 configure (`FATAL_ERROR`, naming the test) on a test with two tiers, an unknown label, `RUN_SERIAL` without
 `gpu_serial`, `gpu_serial` without `gpu`, `smoke` on a DV test, or a DV test (named as one: `dv`, `_dv`, `dv31_`, ...;
 or needing DV's assets) outside `tests/dv.cmake`. Labels are only ever appended
@@ -84,10 +85,46 @@ The fixtures come in two groups, each with its own digest and stamp in the asset
 `.inputs-dv`): `make_assets` makes core's (`make_tiny.py --group core`), `make_dv_assets` DV's from them. DV's
 draw their random weights from generators of their own, so core's files are the same bytes with or without DV's.
 
-Every test preset runs 8 tests at once and hands the GPU tests out over `tests/gpu_resources.json`: one GPU of 8
-slots, a slot a test, the same as `-j 8` alone gave them. On a GPU with less memory, copy the file with fewer slots and
-pass it: `ctest --preset gpu --resource-spec-file my_gpu.json`. CPU tests take no slot, so `-j` can go higher than the
-slots. Without a preset (and without `--resource-spec-file`) ctest ignores the slots.
+**The GPU's slots.** Every test preset runs 8 tests at once and hands the GPU tests out over
+`tests/gpu_resources.json`: one GPU of 8 slots, a slot a test, the same as `-j 8` alone gave them. CPU tests take no
+slot, so `-j` can go higher than the slots. Without a preset (and without `--resource-spec-file`) ctest ignores the
+slots. Eight suit a 16 GB card: on an RTX 5070 Ti, sampled every second, the `gpu` preset's tests held at most 3.2 GB
+of it at once and `full`'s 4.8 GB, beside the 0.3 GB the idle desktop held (the `cuda_device_memory*` tests, which run
+alone, fill what is free on purpose whatever the slots). A card of 8 GB, or a desktop holding several GB of one, wants
+fewer. Write a file of your own outside the source tree, `my_gpu.json` here:
+
+```json
+{ "version": { "major": 1, "minor": 0 }, "local": [ { "gpus": [ { "id": "0", "slots": 4 } ] } ] }
+```
+
+and pass it to each run in the preset's stead (`ctest --preset gpu --resource-spec-file /path/to/my_gpu.json`), or
+once, in a test preset of your `CMakeUserPresets.json` that inherits `gpu` and sets `execution.resourceSpecFile`.
+Four is an estimate (half the peaks above if the memory halves with the slots), not a measurement on an 8 GB card.
+
+**`gpu_preflight`.** Every GPU test requires the fixture `gpu_preflight` (`tests/gpu_preflight.py`), so it runs first,
+in a fraction of a second, whenever a GPU test is selected. It fails when the GPU already has more than 2560 MiB in use
+before the GPU tests start: tests beside another program's memory fail for its reasons (an engine load refused, "Not
+enough VRAM ... used by other apps"; a `cuda_device_memory*` test reading the other program's allocations as its own).
+`FLYX_TEST_GPU_MAX_USED_MIB` in the environment changes the limit (`FLYX_TEST_GPU_MAX_USED_MIB=4096 ctest --preset
+gpu`; in PowerShell `$env:FLYX_TEST_GPU_MAX_USED_MIB = 4096` first). The GPU checked is the first of
+`CUDA_VISIBLE_DEVICES`, else `nvidia-smi`'s GPU 0. Without `nvidia-smi` on `PATH` (or a GPU it can read) it is skipped
+and the GPU tests run. When it fails, the CPU tests still run, every GPU test is Not Run, and the output says who holds
+the GPU (`nvidia-smi`'s processes; on Windows, where `nvidia-smi` gives no process's memory, Windows' GPU Process Memory
+counter):
+
+```text
+gpu_preflight: GPU 0 (NVIDIA GeForce RTX 5070 Ti): 2296 of 16303 MiB already in use before the GPU tests, more than 2560 MiB (FLYX_TEST_GPU_MAX_USED_MIB).
+Beside it engine loads would be refused ("Not enough VRAM ... used by other apps") and the tests measuring free memory (cuda_device_memory*) would fail.
+In use on GPU 0 (NVIDIA GeForce RTX 5070 Ti), MiB (Windows' GPU Process Memory counter):
+      318  pid 42956   D:\other-tree\bin\golden_test.exe
+      ...
+Stop what holds it or wait for it, or allow more: FLYX_TEST_GPU_MAX_USED_MIB=<MiB> (docs/testing.md, section 2).
+...
+Failed test dependencies: gpu_preflight
+...
+The following tests FAILED:
+         97 - cuda_ops (Not Run)
+```
 
 ---
 
@@ -96,6 +133,7 @@ slots. Without a preset (and without `--resource-spec-file`) ctest ignores the s
 | Test(s) | Scope |
 |---|---|
 | `layering`, `numerics`, `docs` | Static gates: directory include boundaries (`tools/check_layering.py`), `docs/design/numerics.md` launcher/test coverage (`tools/check_numerics.py`), public doc links and hygiene (`tools/check_docs.py`). |
+| `gpu_preflight` | Before every GPU test (their fixture): fails, naming the processes, when the GPU already has more than `FLYX_TEST_GPU_MAX_USED_MIB` (2560) in use; skipped without `nvidia-smi` (section 2). |
 | `make_assets`, `make_gguf_assets` | Fixture generators: tiny Qwen3.5 + DFlash2 (BF16/NVFP4) with float64 reference golden outputs, tiny Qwen3 with `transformers` golden outputs, and GGUF fixtures across all GGML block types. |
 | `reference_vs_transformers` | Checks `python/reference` float64 reference against HuggingFace `transformers`. |
 | `cuda_ops` | Every CUDA kernel (`tests/backends/cuda/op_test_*.cu`) against `ops/<op>/ref.h` and `ops/sampling/sampling.h` (seeded; override via `FLYX_OPS_SEED`). |
