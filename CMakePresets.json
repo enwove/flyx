@@ -103,12 +103,24 @@
       "name": "test-base",
       "hidden": true,
       "output": { "outputOnFailure": true },
-      "execution": { "jobs": 8 }
+      "execution": { "jobs": 8, "resourceSpecFile": "${sourceDir}/tests/gpu_resources.json" }
     },
+    { "name": "quick-base", "hidden": true, "inherits": "test-base", "filter": { "include": { "label": "^quick$" } } },
+    { "name": "no-dv-base", "hidden": true, "inherits": "test-base", "filter": { "exclude": { "label": "^dv$" } } },
     { "name": "dev", "inherits": "test-base", "configurePreset": "dev" },
     { "name": "cpu", "inherits": "test-base", "configurePreset": "cpu" },
     { "name": "dev-windows", "inherits": "test-base", "configurePreset": "dev-windows" },
     { "name": "cpu-windows", "inherits": "test-base", "configurePreset": "cpu-windows" },
+    { "name": "quick", "inherits": "quick-base", "configurePreset": "dev" },
+    { "name": "gpu", "inherits": "no-dv-base", "configurePreset": "dev" },
+    { "name": "full", "inherits": "test-base", "configurePreset": "dev" },
+    { "name": "cpu-quick", "inherits": "quick-base", "configurePreset": "cpu" },
+    { "name": "cpu-full", "inherits": "test-base", "configurePreset": "cpu" },
+    { "name": "quick-windows", "inherits": "quick-base", "configurePreset": "dev-windows" },
+    { "name": "gpu-windows", "inherits": "no-dv-base", "configurePreset": "dev-windows" },
+    { "name": "full-windows", "inherits": "test-base", "configurePreset": "dev-windows" },
+    { "name": "cpu-quick-windows", "inherits": "quick-base", "configurePreset": "cpu-windows" },
+    { "name": "cpu-full-windows", "inherits": "test-base", "configurePreset": "cpu-windows" },
     { "name": "release-linux", "inherits": "test-base", "configurePreset": "release-linux" }
   ]
 }

@@ -9,6 +9,7 @@ GPU tracing and end-to-end verification. Read [AGENTS.md](../AGENTS.md) before c
 
 ```sh
 pip install -r tests/requirements.txt    # test fixtures & HF reference (pinned, CPU torch; Python 3.12+)
+ctest --preset quick                     # while editing: unit and tiny tests, the smoke tests (section 2)
 ctest --preset dev --output-on-failure   # full GPU + CPU suite
 ctest --preset cpu --output-on-failure   # CPU-only (no GPU required)
 ```
@@ -24,7 +25,51 @@ CI scripts: `tools/ci/cpu.sh` (hosted CPU runner) and `tools/ci/gpu.sh` (self-ho
 
 ---
 
-## 2. Test Suite Map
+## 2. Tiers, Labels and Presets
+
+Every test has one **tier**, what it needs and so about what it costs, and any number of **aspects**. The test presets
+select by these labels (`ctest -L` / `-LE` select by them too: `ctest --preset dev -L '^golden$'`).
+
+| Label | Kind | Meaning | Given by |
+|---|---|---|---|
+| `unit` | tier | no fixture, no model file: seconds | inferred: no `FIXTURES_REQUIRED` |
+| `tiny` | tier | the tiny models `make_assets` makes, not a whole golden run: seconds | inferred: a `FIXTURES_REQUIRED` |
+| `golden` | tier | a whole `golden_test` or `gguf_e2e_test` run: seconds to minutes | `flyx_add_golden_test`; the `gguf_*` runs by hand |
+| `tools` | tier | a bench or tools script's own test, not the engine's | `flyx_add_py_test` for scripts under `bench/`; others by hand |
+| `gpu` | aspect | needs a CUDA device | every test registered in the CUDA block of `tests/CMakeLists.txt`; `vision` and `residual_decision`, registered before it but taking the CUDA backend too, by hand at its end |
+| `gpu_serial` | aspect | measures the device's free memory, so runs alone (`RUN_SERIAL`) | `flyx_add_golden_test(... SERIAL)` |
+| `smoke` | aspect | a golden or GPU test the quick preset runs anyway | by hand, at the end of `tests/CMakeLists.txt` |
+| `dv` | aspect | DV's tests (DV is not in production) | by name (`dv`, `_dv`, `dv31_`, ...) |
+| `server` | aspect | starts a `flyx serve` | `flyx_add_py_test` for scripts under `tests/apps/flyx-server/` |
+| `quick` | derived | `unit` or `tiny`, neither `gpu` nor `dv`; or `smoke` | `flyx_finish_test_labels()` |
+
+`flyx_finish_test_labels()` runs at the end of `tests/CMakeLists.txt` and `bench/CMakeLists.txt`. It gives a test
+without a tier one, adds `quick`, gives every `gpu` test a slot of the GPU (`RESOURCE_GROUPS gpus:1`), and refuses the
+configure (`FATAL_ERROR`, naming the test) on a test with two tiers, an unknown label, `RUN_SERIAL` without
+`gpu_serial`, `gpu_serial` without `gpu`, or `smoke` on a DV test. Labels are only ever appended
+(`set_property(TEST ... APPEND PROPERTY LABELS ...)`), so a label given in one place is never lost in another.
+
+A new test usually needs nothing: its tier and aspects follow from where and how it is registered. Label it by hand
+when that is not enough: a test registered outside the CUDA block that takes the CUDA backend (`gpu`), a golden run
+not made by `flyx_add_golden_test` (`golden`), a new smoke test (keep them a few seconds each). The inference cannot
+see how long a test takes: a slow test inferred `tiny` lands in `quick`, so look at its time in the JUnit report
+(`ctest --output-junit`).
+
+| Test preset (Windows: `-windows` suffix) | Runs | When |
+|---|---|---|
+| `quick` / `cpu-quick` | label `quick` | after each build while editing (a minute or two with the GPU's smoke tests) |
+| `gpu` | every test but DV's (`-LE ^dv$`) | before a pull request, on a GPU machine |
+| `dev` / `cpu` | every test | as before |
+| `full` / `cpu-full` | every test | before a release |
+
+Every test preset runs 8 tests at once and hands the GPU tests out over `tests/gpu_resources.json`: one GPU of 8
+slots, a slot a test, the same as `-j 8` alone gave them. On a GPU with less memory, copy the file with fewer slots and
+pass it: `ctest --preset gpu --resource-spec-file my_gpu.json`. CPU tests take no slot, so `-j` can go higher than the
+slots. Without a preset (and without `--resource-spec-file`) ctest ignores the slots.
+
+---
+
+## 3. Test Suite Map
 
 | Test(s) | Scope |
 |---|---|
@@ -57,7 +102,7 @@ CI scripts: `tools/ci/cpu.sh` (hosted CPU runner) and `tools/ci/gpu.sh` (self-ho
 
 ---
 
-## 3. CUDA Graph Tracing on Windows (CUPTI)
+## 4. CUDA Graph Tracing on Windows (CUPTI)
 
 When configured with `FLYX_TESTS=ON` and CUPTI headers + `cupti.lib` present (optional `cufilt.lib` + `nv_decode.h` for symbol demangling), CMake builds `flyx-trace`. Place the matching CUPTI runtime DLL on `PATH`:
 
@@ -74,7 +119,7 @@ The TSV logs GPU kernel, copy, and memset intervals (`%p` expands PID for multi-
 
 ---
 
-## 4. Coding Agent & Dashboard Checks
+## 5. Coding Agent & Dashboard Checks
 
 ### Dashboard Tests
 
