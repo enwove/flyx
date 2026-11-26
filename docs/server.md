@@ -82,7 +82,7 @@ All commands that load a model share the parser in `apps/common/engine_flags.cpp
 | Flag | Values | Default | Behavior |
 |---|---|---|---|
 | `--host` | IP / hostname | `127.0.0.1` | Listen address. Use `--api-key` when binding outside loopback. |
-| `--port` | `1..65535` | `8080` | Listen port. If omitted and 8080 is held by another program, picks the next free port automatically (if held by an existing `flyx serve`, Explorer launches open its dashboard). |
+| `--port` | `0..65535` | `8080` | With `--port 0`, the OS assigns a free port and the server prints the dashboard URL at startup. If omitted and 8080 is held by another program, picks the next free port automatically (if held by an existing `flyx serve`, Explorer launches open its dashboard). |
 | `--name` | string | filename / HF name | Model ID reported in `/v1/models` and responses. |
 | `--models-dir` | `DIR` (repeatable) | none | Extra local directories scanned (depth 6) for `.gguf`/`.flyx` in `/v1/hub/cached` and dashboard (never deleted by `flyx`). |
 | `--sessions` | `N` (≥ 1) | `8` (capped by memory) | Target concurrent GPU sessions (allocated on demand). Planner sizes full context for 1 session first, then attempts 2 within memory budgets when tight, admitting up to `N` sessions that fit (reported as `model.max_sessions`). |
@@ -109,7 +109,7 @@ All commands that load a model share the parser in `apps/common/engine_flags.cpp
 
 ## 4. Environment Variables
 
-Defined in `core/os/env.h` (plus CUDA / Python standard variables). Explicit CLI flags take precedence over environment variables.
+The engine and server register their environment variables in `core/os/env.h`. Explicit CLI flags take precedence where available.
 
 | Variable | Values | Effect |
 |---|---|---|
@@ -121,8 +121,6 @@ Defined in `core/os/env.h` (plus CUDA / Python standard variables). Explicit CLI
 | `FLYX_LOOKUP` | `0` \| `1` | Enable/disable prompt lookup (`0` = `--no-lookup`). |
 | `FLYX_DRAFT_TREES` | `0` \| `1` | Enable/disable DFlash2 draft trees (`1` = `--draft-trees`). |
 | `FLYX_ADAPTIVE` | `0` \| `1` | Enable/disable intra-round confidence optimal stopping on adaptive drafter plans (`1`, default). Enabled for sequential drafters (MTP) and for drafters (DSpark, with step-wise Markov early stopping and optimal prefix verification, and DFlash2) on targets whose verify cost scales steeply with width (such as sparse MoE `inkling2_loop`, across checkpoints up to the drafter's trained block `{1, 2, 3, 5, 7}`, with sustained high-acceptance runs widening past the trained block when supported); dense targets paired with block drafters (DFlash2) verify the chooser's fixed widths. |
-| `FLYX_SC_CLUSTER` | `1`, `4`, `8` | Inkling fused sublayer blocks per cluster (default 8 on eligible devices). Unsupported devices or shapes use one block. |
-| `FLYX_MOE_VEC` | `0`, `1` | Inkling NVFP4 experts use tensor-core MMA by default. Set 1 to use the float32 column-vector path for every round width. |
 | `FLYX_CHAT_NATIVE` | `0` \| `1` | Force Jinja engine (`0`) instead of native chat renderer (`1`, default). |
 | `FLYX_API_KEY` / `FLYX_KEY` | string | Default server API key when `--api-key` is unset. |
 | `FLYX_MODELS_DIR` | paths (`:` Linux / `;` Win) | Additional local model directories appended to `--models-dir`. |
@@ -133,6 +131,20 @@ Defined in `core/os/env.h` (plus CUDA / Python standard variables). Explicit CLI
 | `HF_ENDPOINT` | URL | Hugging Face Hub mirror URL (takes precedence over a saved `hub_endpoint` in `serve.json` at startup; can still be overridden at runtime via `POST /v1/hub/config`). |
 | `HF_HUB_OFFLINE` | `1` | Use local HF cache only; make no network requests. |
 | `NO_COLOR` / `COLUMNS` | any / int | Terminal monitor formatting overrides. |
+
+The following CUDA overrides are temporary pending migration to backend options. CUDA reads each once on first use. Defaults apply when unset. An empty string or a value with no leading integer parses as zero.
+
+| Variable | Default | Effect |
+|---|---|---|
+| `FLYX_SC_CLUSTER` | `8` on eligible SM90+ devices, otherwise `1` | Request 4 or 8 blocks per Inkling fused sublayer cluster. Other values and unsupported shapes use one block. |
+| `FLYX_MOE_VEC` | `0` | Inkling NVFP4 experts use tensor-core MMA. Any nonzero value selects the float32 column-vector path for every round width. |
+| `FLYX_WARM` | `23` | Bit mask selecting which weights to warm in L2. Zero disables warming. |
+| `FLYX_EXPERT_PREFETCH` | `2` | Prefetch predicted expert weights early for multi-row rounds. Zero disables this early guess. Other nonzero values include eligible single-row rounds. |
+| `FLYX_GUESS` | `5` | For the separate single-row expert guess, a positive value selects prefetch planes with its low four bits. Zero or negative disables this guess. |
+| `FLYX_GUESS_K` | `4` | On the wide prefetch path, fetch up to this many of the top-scoring experts. Zero or negative uses all `top_k` experts. |
+| `FLYX_SIDE_LOOP_MSG` | `1` | Overlap loop-message computation on the side stream when available. Zero serializes it. |
+| `FLYX_SIDE_COMPANION` | `1` | Overlap the companion projection with the wide GEMM when a side stream is available. Zero serializes it. |
+| `FLYX_SIDE_KV` | `1` | Overlap eligible sliding-window K/V projections with the query path on the side stream. Zero serializes them. |
 
 ---
 

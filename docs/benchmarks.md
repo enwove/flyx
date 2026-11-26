@@ -6,7 +6,7 @@ Reproducible long-context coding, `flyx bench` decode, drafter, and Needle-in-a-
 
 ## v0.2.1 four-GPU verified benchmarks
 
-Linux captures used CUDA 13.0.88 on Ubuntu 24.04 with PTX JIT disabled. The hardware table below describes the original `5fa1a32` runs. The RTX 4090 and 3090 Inkling decode results come from a second capture on `078022fc`. Windows measurements used native Windows 11 (WDDM), with Inkling and the dashboard on `5fa1a32`, and Qwen, the 20K ring and cold start on `42e3734` before the Inkling decode changes. The Windows candidate passed 170/170 GPU-suite tests. Its standalone executable contained 115 cubins and zero PTX images and weighed 57,144,832 bytes (57.14 MB), compared with 58,960,384 bytes in v0.2.0. These captures predate the version bump.
+Linux captures used CUDA 13.0.88 on Ubuntu 24.04 with PTX JIT disabled. The hardware table below describes the original `5fa1a32` runs. The RTX 4090 and 3090 Inkling decode results come from a second capture on `078022fc`. Windows measurements used native Windows 11 (WDDM), with Inkling and the dashboard on `5fa1a32`, and Qwen, the 20K ring and cold start on `42e3734` before the Inkling decode changes. The Windows candidate passed 170/170 GPU-suite tests. Its standalone executable contained 115 cubins and zero PTX images and weighed 57,144,832 bytes (57.14 MB), compared with 58,960,384 bytes in v0.2.0. Those four-GPU captures predate the version bump; the RTX 5070 Ti 256K coding rerun below used the tagged `v0.2.1` release binary (`flyx-0.2.1-windows-x86_64-cuda13.exe`, commit `7f0de79`).
 
 | GPU | Driver | Power limit | Qwen3.8-27B GGUF | GPU weight GB | Effective / rated GB/s | Share |
 |---|---|---:|---|---:|---:|---:|
@@ -31,6 +31,30 @@ Mixed decode uses the three built-in prompts, 128 tokens each. Linux ran their J
 On the 6,293-token Inkling prefill workload (same input file, different tokenizer), the 3090, 4090 and 5090 reached 1,829, 3,855 and 5,409 tok/s respectively. These plain prefill timings come from the original candidate.
 
 The 5090 used W4A4 prefill on the NVFP4 target. On the same prompt, explicit `--activations exact` (BF16 inputs) gave 3,602 tok/s on the first pass and 3,598 on the second. At 128,000 input tokens, plain decode reached 73.4 tok/s and MTP reached 203.8 tok/s with identical output text over 256 tokens.
+
+### RTX 5070 Ti 256K coding rerun (v0.2.1 native Windows 11)
+
+Measured with the official GitHub Release binary `flyx-0.2.1-windows-x86_64-cuda13.exe` (`57,144,832 B` / `57.14 MB`, tag `v0.2.1`, commit `7f0de79`) on an NVIDIA GeForce RTX 5070 Ti (`16,303 MiB` VRAM, `300 W` TDP, driver `610.88`), **native Windows 11 Pro** (`10.0.26300`), and **32 GB system RAM**, running `unsloth/Qwen3.8-27B-GGUF` (`Qwen3.8-27B-UD-IQ3_XXS.gguf`, `10.93 GB`; `10.83 GB` GPU weights + `0.42 GB` host embedding + `0.35 GB` MTP on GPU).
+
+- **Automatic 262K (`--ctx max`) K/V placement (`14.89 GB` WDDM budget):** `16,384` tokens K/V on GPU (`3.71 GB` session VRAM) + `245,760` tokens in host RAM (`9.70 GB` host memory incl. checkpoints); exact K/V reads up to `123,203` tokens (`strata_from=123203`), then 2-bit StrataFlux + exact hot reads *(vs `v0.2.0` WSL2 baseline: `2,048` GPU KV + `260,096` RAM KV, exact up to `34,816`)*.
+- **Decode (`260,051` prompt tokens, 512 new tokens, greedy MTP):** **`113.5 tok/s`** (`512` tokens in `4,501.9 ms`, `106` rounds, `4.82 tok/round`, `6.3 drafts/round`, `lookup 3`) — **1.85× faster (+85%)** than the `v0.2.0` WSL2 baseline (`61.2 tok/s`).
+- **Prefill:** **`787.2 tok/s`** (`330.37 s` / `330,368.9 ms` for `260,051` tokens; vs `v0.2.0` WSL2 `382.49 s` / `679.9 tok/s`).
+- **Needle recall (50% depth at 256K):** **PASS** (verbatim recall: `# Calibration verification passphrase: emerald-falcon-4829`).
+
+| Metric | v0.2.0 WSL2 (`b950329b`) | v0.2.1 Native Win11 (`7f0de79`) | Delta |
+|---|---:|---:|---:|
+| WDDM / GPU KV budget | `13.51 GB` (`2,048` GPU + `260,096` RAM) | `14.89 GB` (`16,384` GPU + `245,760` RAM) | `8×` GPU KV tokens |
+| Exact K/V threshold | `34,816` tokens | `123,203` tokens (`strata_from=123203`) | `3.54×` exact span |
+| 256K prefill (`~260K` tokens) | `382.49 s` (`679.9 tok/s`) | **`330.37 s` (`787.2 tok/s`)** | **`+15.8%`** |
+| 256K decode (512 new, MTP) | `61.2 tok/s` (`3.70 tok/rnd`) | **`113.5 tok/s` (`4.82 tok/rnd`, `6.3 drafts/rnd`)** | **`1.85× (+85%)`** |
+| 256K needle recall (50% depth) | pass | **pass** | — |
+
+Only the 256K coding prompt (with its 50%-depth needle) was rerun on `v0.2.1` native Windows 11; the `1K`/`128K` coding rows and `5/5 + 4/4` NIAH grid in Sections 1 and 3 remain from the `v0.2.0` WSL2 baseline.
+
+```sh
+python bench/prompts/make_coding_prompt.py --flyx ./flyx.exe --model Qwen3.8-27B-UD-IQ3_XXS.gguf --tokens 260000 -o prompt_256k.txt
+./flyx.exe run Qwen3.8-27B-UD-IQ3_XXS.gguf --drafter mtp --ctx max --chat --no-think -n 512 --ignore-eos -v -f prompt_256k.txt
+```
 
 ### Inkling-2-Mini and Markov DSpark
 
@@ -134,19 +158,19 @@ flyx serve "$I" --drafter dspark --drafter-file "$S" --no-lookup --ctx 4096 --ho
 
 ## Historical v0.2.0 results
 
-Sections 1–3 below preserve the original six-card measurements on `b950329b`, including the WSL2 run. The independent DV study in section 5 uses a different model and workload.
+Sections 1–3 below preserve the original six-card measurements on `b950329b`, including the WSL2 run, alongside the updated `v0.2.1` native Windows 11 RTX 5070 Ti 256K rerun (`7f0de79`, **`113.5 tok/s`**) in Sections 1 and 3. The independent DV study in section 5 uses a different model and workload.
 
 ## 1. Qwen3.8-27B Long-Context Coding Benchmark
 
-All rows below were measured on the same `release-linux` build (`flyx 0.2.0`, commit `b950329b`, CUDA `13.0`, per-GPU tuning tables) at full native context (`--ctx max` = `262,144` tokens) with built-in **MTP** speculative decoding (plus `MTP + DFlash2` on RTX 5090 `NVFP4`):
+Except for the `v0.2.1` native Windows 11 RTX 5070 Ti 256K rerun (`flyx-0.2.1-windows-x86_64-cuda13.exe`, tag `v0.2.1`, commit `7f0de79`), all rows below were measured on the same `release-linux` build (`flyx 0.2.0`, commit `b950329b`, CUDA `13.0`, per-GPU tuning tables) at full native context (`--ctx max` = `262,144` tokens) with built-in **MTP** speculative decoding (plus `MTP + DFlash2` on RTX 5090 `NVFP4`):
 
 - **RTX 5090 (Blackwell native FP4):** [`akopytko/Qwen3.8-27B-NVFP4-GGUF`](https://huggingface.co/akopytko/Qwen3.8-27B-NVFP4-GGUF) `Qwen3.8-27B-NVFP4-MTP-N4_0.gguf` (`NVFP4`, `15.72 GB` file, `15.20 GB` GPU weights; 504 GGML NVFP4 tensors executing on native `sm_120a` W4A4 FP4 tensor cores in prefill + built-in MTP).
 - **24 GB GPUs (RTX 4090, RTX 3090):** [`unsloth/Qwen3.8-27B-GGUF`](https://huggingface.co/unsloth/Qwen3.8-27B-GGUF) `UD-Q4_K_XL` (`17.66 GB` file, `17.24 GB` GPU weights).
-- **16 GB GPUs (RTX 5080, RTX 5070 Ti, RTX 4080):** `unsloth/Qwen3.8-27B-GGUF:UD-IQ3_XXS` (`10.93 GB` file, `10.72 GB` GPU weights).
+- **16 GB GPUs (RTX 5080, RTX 5070 Ti, RTX 4080):** `unsloth/Qwen3.8-27B-GGUF:UD-IQ3_XXS` (`10.93 GB` file; `10.72 GB` GPU weights on `v0.2.0`, `10.83 GB` GPU weights + `0.42 GB` host embedding + `0.35 GB` MTP on GPU on `v0.2.1` Win11).
 
 ### Workload & Reproducible Commands
 
-Each prompt embeds a calibration passphrase at 50% depth inside tracked C++ repository sources (`1,022` / `131,081` / `260,049` tokens) and asks the model to recall the passphrase and write a fresh 512-token pure-Python ISO 8601 date/timestamp parser with unit tests (greedy decoding; no repeated Python code in the prompt so prompt-lookup hits stay at 0–3 rounds).
+Each prompt embeds a calibration passphrase at 50% depth inside tracked C++ repository sources (`1,022` / `131,081` / `260,049` tokens on `v0.2.0`; `260,051` tokens on the `v0.2.1` rerun) and asks the model to recall the passphrase and write a fresh 512-token pure-Python ISO 8601 date/timestamp parser with unit tests (greedy decoding; no repeated Python code in the prompt so prompt-lookup hits stay at 0–3 rounds).
 
 ```sh
 # 1. Generate deterministic 1K / 128K / 256K prompts from this repository
@@ -165,7 +189,8 @@ python bench/prompts/make_coding_prompt.py --flyx ./bin/flyx --model MODEL.gguf 
 |---|---|---|---|
 | **RTX 5090** | `NVFP4` (`15.72 GB`) | `32,607 MiB` · `575 W` · driver `615.71.09` | Full `262,144` tokens exact FP8 K/V on GPU (`9.64 GB` VRAM); W4A4 NVFP4 prefill |
 | **RTX 5080** | `UD-IQ3_XXS` (`10.93 GB`) | `16,303 MiB` · `360 W` · driver `610.57.04` | `43,008` tokens on GPU (`4.49 GB`) + `219,136` in RAM (`8.55 GB`); exact to `75,776`, then 2-bit StrataFlux + exact hot reads |
-| **RTX 5070 Ti** (WSL2) | `UD-IQ3_XXS` (`10.93 GB`) | `16,303 MiB` · `300 W` · driver `610.88` | `2,048` tokens on GPU (`2.42 GB`, `13.51 GB` WSL2/WDDM budget) + `260,096` in RAM (`10.62 GB`); exact to `34,816`, then 2-bit StrataFlux + exact hot reads |
+| **RTX 5070 Ti** (Win11, v0.2.1) | `UD-IQ3_XXS` (`10.93 GB`) | `16,303 MiB` · `300 W` · driver `610.88` · 32 GB RAM | `16,384` tokens on GPU (`3.71 GB`, `14.89 GB` WDDM budget) + `245,760` in RAM (`9.70 GB` incl. checkpoints); exact to `123,203` (`strata_from=123203`), then 2-bit StrataFlux + exact hot reads |
+| **RTX 5070 Ti** (WSL2, v0.2.0) | `UD-IQ3_XXS` (`10.93 GB`) | `16,303 MiB` · `300 W` · driver `610.88` | `2,048` tokens on GPU (`2.42 GB`, `13.51 GB` WSL2/WDDM budget) + `260,096` in RAM (`10.62 GB`); exact to `34,816`, then 2-bit StrataFlux + exact hot reads |
 | **RTX 4090** | `UD-Q4_K_XL` (`17.66 GB`) | `24,564 MiB` · `450 W` · driver `590.48.01` | `88,064` tokens on GPU + `174,080` in RAM; exact to `120,832`, then 2-bit StrataFlux + exact hot reads |
 | **RTX 4080** | `UD-IQ3_XXS` (`10.93 GB`) | `16,376 MiB` · `340 W` · driver `580.178.04` | `43,008` tokens on GPU (`4.49 GB`) + `219,136` in RAM (`8.55 GB`); exact to `75,776`, then 2-bit StrataFlux + exact hot reads |
 | **RTX 3090** | `UD-Q4_K_XL` (`17.66 GB`) | `24,576 MiB` · `300 W` cap · driver `595.58.03` | `92,160` tokens on GPU (`6.14 GB`) + `169,984` in RAM (`6.94 GB`); exact to `124,928`, then 2-bit StrataFlux + exact hot reads |
@@ -182,9 +207,10 @@ python bench/prompts/make_coding_prompt.py --flyx ./bin/flyx --model MODEL.gguf 
 | **RTX 5080** (16 GB) | `UD-IQ3_XXS` + MTP | 1K (`1,022`) | `0.44 s` | `2,312.7` | **225.9** | `5.06` (`6.2`) | pass |
 | **RTX 5080** (16 GB) | `UD-IQ3_XXS` + MTP | 128K (`131,081`) | `100.64 s` | `1,302.4` | **161.0** | `5.27` (`6.7`) | pass |
 | **RTX 5080** (16 GB) | `UD-IQ3_XXS` + MTP | 256K (`260,049`) | `283.49 s` | `917.3` | **105.8** | `3.84` (`5.6`) | pass |
-| **RTX 5070 Ti** (16 GB, WSL2) | `UD-IQ3_XXS` + MTP | 1K (`1,022`) | `0.63 s` | `1,611.2` | **167.4** | `4.48` (`5.0`) | pass |
-| **RTX 5070 Ti** (16 GB, WSL2) | `UD-IQ3_XXS` + MTP | 128K (`131,081`) | `135.09 s` | `970.3` | **104.6** | `5.21` (`6.5`) | pass |
-| **RTX 5070 Ti** (16 GB, WSL2) | `UD-IQ3_XXS` + MTP | 256K (`260,049`) | `382.49 s` | `679.9` | **61.2** | `3.70` (`5.0`) | pass |
+| **RTX 5070 Ti** (16 GB, Win11, v0.2.1) | `UD-IQ3_XXS` + MTP | 256K (`260,051`) | `330.37 s` | `787.2` | **113.5** | `4.82` (`6.3`) | pass |
+| **RTX 5070 Ti** (16 GB, WSL2, v0.2.0) | `UD-IQ3_XXS` + MTP | 1K (`1,022`) | `0.63 s` | `1,611.2` | **167.4** | `4.48` (`5.0`) | pass |
+| **RTX 5070 Ti** (16 GB, WSL2, v0.2.0) | `UD-IQ3_XXS` + MTP | 128K (`131,081`) | `135.09 s` | `970.3` | **104.6** | `5.21` (`6.5`) | pass |
+| **RTX 5070 Ti** (16 GB, WSL2, v0.2.0) | `UD-IQ3_XXS` + MTP | 256K (`260,049`) | `382.49 s` | `679.9` | **61.2** | `3.70` (`5.0`) | pass |
 | **RTX 4090** (24 GB) | `UD-Q4_K_XL` + MTP | 1K (`1,022`) | `0.37 s` | `2,763.7` | **193.6** | `5.94` (`9.0`) | pass |
 | **RTX 4090** (24 GB) | `UD-Q4_K_XL` + MTP | 128K (`131,081`) | `85.10 s` | `1,540.4` | **155.9** | `5.94` (`8.3`) | pass |
 | **RTX 4090** (24 GB) | `UD-Q4_K_XL` + MTP | 256K (`260,049`) | `241.20 s` | `1,078.2` | **122.7** | `5.06` (`6.9`) | pass |
@@ -194,6 +220,8 @@ python bench/prompts/make_coding_prompt.py --flyx ./bin/flyx --model MODEL.gguf 
 | **RTX 3090** (24 GB, 300 W) | `UD-Q4_K_XL` + MTP | 1K (`1,022`) | `1.15 s` | `888.1` | **135.8** | `5.49` (`7.6`) | pass |
 | **RTX 3090** (24 GB, 300 W) | `UD-Q4_K_XL` + MTP | 128K (`131,081`) | `254.71 s` | `514.6` | **97.5** | `5.55` (`7.3`) | pass |
 | **RTX 3090** (24 GB, 300 W) | `UD-Q4_K_XL` + MTP | 256K (`260,049`) | `694.67 s` | `374.3` | **68.1** | `4.41` (`6.4`) | pass |
+
+Note: The `RTX 5070 Ti (16 GB, Win11, v0.2.1)` row (`113.5 tok/s`, `512` tokens in `4,501.9 ms`, `106` rounds, `lookup 3`, `1.85×` vs `v0.2.0` WSL2 `61.2 tok/s`) ran the official `flyx-0.2.1-windows-x86_64-cuda13.exe` binary on native Windows 11 Pro (`10.0.26300`, 32 GB RAM). Only the 256K prompt (with 50%-depth needle recall) was rerun on `v0.2.1` Win11; the `1K` and `128K` RTX 5070 Ti rows above are from the earlier `v0.2.0` WSL2 run (`b950329b`).
 
 ---
 
@@ -233,7 +261,7 @@ Important caveats:
 
 ## 3. Long-Context Attention Fidelity (Needle-in-a-Haystack Suite)
 
-To verify that neither default FP8 K/V nor tiered Host-RAM + 2-bit StrataFlux attention degrades long-range retrieval, we verified single-needle recall (`5%`, `25%`, `50%`, `75%`, `95%` depths across `32K–256K` plus `1K / 128K / 256K` 50%-depth recall on every GPU) and 4-needle simultaneous retrieval at `256K` (`ALPHA` / `BETA` / `GAMMA` / `DELTA` embedded at `10%`, `35%`, `65%`, `90%` depth) on `b950329b`: **51/51 (100%) exact recall across all 6 consumer GPUs, zero failures**.
+To verify that neither default FP8 K/V nor tiered Host-RAM + 2-bit StrataFlux attention degrades long-range retrieval, we verified single-needle recall (`5%`, `25%`, `50%`, `75%`, `95%` depths across `32K–256K` plus `1K / 128K / 256K` 50%-depth recall on every GPU) and 4-needle simultaneous retrieval at `256K` (`ALPHA` / `BETA` / `GAMMA` / `DELTA` embedded at `10%`, `35%`, `65%`, `90%` depth) on `b950329b`: **51/51 (100%) exact recall across all 6 consumer GPUs, zero failures**. On `v0.2.1` native Windows 11 (`7f0de79`), the RTX 5070 Ti 256K coding rerun also passed its 50%-depth needle recall (`1/1`; the 5-depth and 4-needle grids were not rerun on `v0.2.1` Win11).
 
 ```sh
 # Generate and run the 256K 4-needle NIAH prompt
@@ -245,7 +273,8 @@ python bench/prompts/make_coding_prompt.py --flyx ./bin/flyx --model MODEL.gguf 
 |---|---|---:|---:|---:|
 | **RTX 5090** (32 GB) | `NVFP4` · Full 262K GPU exact FP8 | `3/3` (`1K / 128K / 256K` @ `50%`) | `4/4` (`b950329b`) | **7/7 (100%)** |
 | **RTX 5080** (16 GB) | `UD-IQ3_XXS` · 43K GPU + 219K RAM, 2-bit StrataFlux > 75K | `5/5` (`256K` @ `5%–95%`) | — | **5/5 (100%)** |
-| **RTX 5070 Ti** (16 GB, WSL2) | `UD-IQ3_XXS` · 2K GPU + 260K RAM, 2-bit StrataFlux > 34K | `5/5` (`256K` @ `5%–95%`) | `4/4` (`b950329b`) | **9/9 (100%)** |
+| **RTX 5070 Ti** (16 GB, Win11, v0.2.1) | `UD-IQ3_XXS` · `16,384` GPU + `245,760` RAM, 2-bit StrataFlux > `123,203` | `1/1` (`256K` @ `50%`, `7f0de79`) | — | **1/1 (100%)** |
+| **RTX 5070 Ti** (16 GB, WSL2, v0.2.0) | `UD-IQ3_XXS` · 2K GPU + 260K RAM, 2-bit StrataFlux > 34K | `5/5` (`256K` @ `5%–95%`) | `4/4` (`b950329b`) | **9/9 (100%)** |
 | **RTX 4090** (24 GB) | `UD-Q4_K_XL` · 88K GPU + 174K RAM, 2-bit StrataFlux > 120K | `20/20` (`32K–256K` @ `5%–95%`) | `4/4` (`b950329b`) | **24/24 (100%)** |
 | **RTX 4080** (16 GB) | `UD-IQ3_XXS` · 43K GPU + 219K RAM, 2-bit StrataFlux > 75K | `3/3` (`1K / 128K / 256K` @ `50%`) | — | **3/3 (100%)** |
 | **RTX 3090** (24 GB, 300 W) | `UD-Q4_K_XL` · 92K GPU + 170K RAM, 2-bit StrataFlux > 124K | `3/3` (`1K / 128K / 256K` @ `50%`) | — | **3/3 (100%)** |

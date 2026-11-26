@@ -22,6 +22,7 @@
 #include <string>
 #include <vector>
 
+#include "apps/common/api_key.h"
 #include "apps/common/defaults.h"
 #include "apps/common/numbers.h"
 #include "apps/flyx-cli/monitor.h"
@@ -673,10 +674,7 @@ int run(int argc, char** argv) {
                          "through a tunnel to its port)\n", o.url.c_str());
     return 1;
   }
-  if (o.key.empty()) {
-    o.key = os::getenv_str(env::kApiKey);
-    if (o.key.empty()) o.key = os::getenv_str(env::kKeyAlias);
-  }
+  if (o.key.empty()) o.key = apps::api_key_from_env();
   while (!o.url.empty() && o.url.back() == '/') o.url.pop_back();
   g_stop = false;
   TermStyle style{!os::env_exists(env::kNoColor)};

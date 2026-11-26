@@ -33,6 +33,7 @@
 #include <string_view>
 #include <thread>
 
+#include "apps/common/api_key.h"
 #include "apps/common/defaults.h"
 #include "apps/common/engine_flags.h"
 #include "apps/common/model_source.h"
@@ -81,7 +82,7 @@ void pause_owned_console() {
                "                       the Hugging Face cache; without it the last model served, or none until the\n"
                "                       dashboard's model panel loads one\n"
                "  --host H             address to listen on (default 127.0.0.1)\n"
-               "  --port P             port (default 8080)\n"
+               "  --port P             port (default 8080, 0 lets the OS choose)\n"
                "  --name NAME          model name reported by the API (default: the file's name)\n"
                "  --models-dir DIR     a directory of model files (.gguf, .flyx) the dashboard lists beside the\n"
                "                       Hugging Face cache's, searched 6 directories deep (repeatable; FLYX_MODELS_DIR:\n"
@@ -192,7 +193,7 @@ ServeArgs parse_args(int argc, char** argv) {
     };
     if (f == "--host") a.host = next();
     else if (f == "--port") {
-      a.port = apps::whole_flag("--port", next(), 1, 65535);
+      a.port = apps::whole_flag("--port", next(), 0, 65535);
       a.port_given = true;
     }
     else if (f == "--name") a.name = next();
@@ -229,10 +230,7 @@ ServeArgs parse_args(int argc, char** argv) {
   }
   sampling_overrides.apply(&a.cfg.think_defaults);
   sampling_overrides.apply(&a.cfg.plain_defaults);
-  if (a.cfg.api_key.empty()) {
-    a.cfg.api_key = os::getenv_str(env::kApiKey);
-    if (a.cfg.api_key.empty()) a.cfg.api_key = os::getenv_str(env::kKeyAlias);
-  }
+  if (a.cfg.api_key.empty()) a.cfg.api_key = apps::api_key_from_env();
   for (const std::string& d : apps::models_dirs_from_env()) a.models_dirs.push_back(d);
   return a;
 }
@@ -366,13 +364,12 @@ int run(int argc, char** argv) {
     });
     return s;
   };
-  std::unique_ptr<httplib::Server> http_ptr = make_http();
-  bool bound = false;
-  for (int p = port; p <= std::min(65535, port + 32); ++p) {
-    if (p > port) http_ptr = make_http();
-    if (http_ptr->bind_to_port(host, p)) {
+  std::unique_ptr<httplib::Server> http_ptr;
+  for (int p = port; p > 0 && p <= std::min(65535, port + 32); ++p) {
+    auto cand = make_http();
+    if (cand->bind_to_port(host, p)) {
+      http_ptr = std::move(cand);
       port = p;
-      bound = true;
       break;
     }
     if (args.port_given) break;
@@ -390,16 +387,15 @@ int run(int argc, char** argv) {
       return 1;
     }
   }
-  if (!bound && !args.port_given) {
+  if (!http_ptr && (port == 0 || !args.port_given)) {
     auto cand = make_http();
     const int any = cand->bind_to_any_port(host);
     if (any > 0) {
       http_ptr = std::move(cand);
       port = any;
-      bound = true;
     }
   }
-  if (!bound) {
+  if (!http_ptr) {
     os::write_original_stderr("error: cannot listen on " + host + ":" + std::to_string(port) +
                               " (in use by another flyx serve or another program? --port N takes another)\n");
     pause_owned_console();
@@ -458,7 +454,7 @@ int run(int argc, char** argv) {
     for (const auto& l : system_log.last(12)) tail += l + "\n";
     os::write_original_stderr(tail);
   };
-  if (port != args.port)
+  if (!args.port_given && port != args.port)
     std::fprintf(stderr, "flyx-server: port %d is in use; listening on %s instead\n", args.port, base.c_str());
 
   std::string err;

@@ -12,3 +12,4 @@ models/**/.cache/
 .venv/
 build-*/
 dist/
+CMakeUserPresets.json

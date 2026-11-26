@@ -61,10 +61,12 @@ class DrafterRegistry {
 
   int target_layers_ = 0;
   bool explicit_post_norm_ = false;
-  int dflash2_block_ = -1;
-  std::vector<int> dflash2_taps_;
-  int dspark_block_ = -1;
-  std::vector<int> dspark_taps_;
+  struct BlockTaps {
+    int block = -1;
+    std::vector<int> taps;
+    void emit(std::vector<flyx_node>* p, int position, int flags) const;
+  };
+  BlockTaps dflash2_, dspark_;
   std::vector<int> context_blocks_;
 };
 

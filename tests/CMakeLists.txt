@@ -48,7 +48,7 @@
 # The labels it cannot infer are at this file's end.
 # Labels are only ever appended (set_property(TEST ... APPEND PROPERTY LABELS ...)): one set elsewhere stays.
 
-# After a directory's last test: the tier where none was given, quick, the GPU tests' resource group, the rules.
+# After a directory's last test: the tier where none was given, quick, the GPU tests' slot and preflight, the rules.
 function(flyx_finish_test_labels)
   set(tier_labels unit tiny golden tools)
   set(aspect_labels gpu gpu_serial smoke dv server)
@@ -61,6 +61,7 @@ function(flyx_finish_test_labels)
     endif()
     list(REMOVE_DUPLICATES labels)
     get_test_property(${t} FIXTURES_REQUIRED fixtures)
+    get_test_property(${t} FIXTURES_SETUP setups)
     get_test_property(${t} RUN_SERIAL serial)
     # DV's tests are tests/dv.cmake's (labelled dv there): one named as DV's (dv, _dv, dv31_, ...) or needing DV's
     # assets elsewhere would run without FLYX_TEST_DV and in every preset.
@@ -96,9 +97,11 @@ function(flyx_finish_test_labels)
       string(APPEND errors "  ${t}: smoke on a DV test (quick runs no DV)\n")
     endif()
     # A slot of the GPU (tests/gpu_resources.json, the presets' resourceSpecFile): CPU tests run beside the GPU's at
-    # any -j, the GPU's bounded on their own.  Without a resource spec (no preset) ctest ignores it.
-    if("gpu" IN_LIST labels)
+    # any -j, the GPU's bounded on their own.  Without a resource spec (no preset) ctest ignores it.  And
+    # gpu_preflight before it (the GPU not already in use by another program), which takes no slot itself.
+    if("gpu" IN_LIST labels AND NOT "gpu_preflight" IN_LIST setups)
       set_property(TEST ${t} PROPERTY RESOURCE_GROUPS "gpus:1")
+      set_property(TEST ${t} APPEND PROPERTY FIXTURES_REQUIRED gpu_preflight)
     endif()
     if("smoke" IN_LIST labels OR (tier MATCHES "^(unit|tiny)$" AND NOT "gpu" IN_LIST labels
                                   AND NOT "dv" IN_LIST labels))
@@ -285,6 +288,8 @@ flyx_add_py_test(kv_method_flags ${CMAKE_CURRENT_SOURCE_DIR}/apps/flyx-cli/kv_me
                  ARGS $<TARGET_FILE:flyx-cli> ${ASSETS}/tiny.flyx FIXTURES assets)
 flyx_add_py_test(cli_usage ${CMAKE_CURRENT_SOURCE_DIR}/apps/flyx-cli/usage.py
                  ARGS $<TARGET_FILE:flyx-cli> ${ASSETS}/tiny.flyx FIXTURES assets)
+flyx_add_py_test(server_ephemeral_port ${CMAKE_CURRENT_SOURCE_DIR}/apps/flyx-server/ephemeral_port.py
+                 ARGS $<TARGET_FILE:flyx-cli> TIMEOUT 45)
 flyx_add_py_test(remembered_model ${CMAKE_CURRENT_SOURCE_DIR}/apps/flyx-server/remembered_model.py
                  ARGS $<TARGET_FILE:flyx-cli> ${ASSETS}/tiny.flyx FIXTURES assets)
 flyx_add_py_test(queued_request_ttft ${CMAKE_CURRENT_SOURCE_DIR}/apps/flyx-server/queued_request_ttft.py
@@ -454,6 +459,10 @@ set_tests_properties(tokenizer tokenizer_minicpm5 chat chat_qwen35 reply_grammar
 # The tests that need the GPU (label gpu): the ones below, and those above that take the CUDA backend too.
 get_property(flyx_cpu_tests DIRECTORY PROPERTY TESTS)
 if(TARGET flyx-cuda)
+  # Before every GPU test (flyx_finish_test_labels: FIXTURES_REQUIRED gpu_preflight): fails, naming who holds it, when
+  # another program has more than FLYX_TEST_GPU_MAX_USED_MIB (2560) of the GPU; skipped without nvidia-smi.
+  add_test(NAME gpu_preflight COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/gpu_preflight.py)
+  set_tests_properties(gpu_preflight PROPERTIES FIXTURES_SETUP gpu_preflight SKIP_RETURN_CODE 77)
   add_executable(cuda_loader_test backends/cuda/loader_test.cpp ${CMAKE_SOURCE_DIR}/backends/cuda/backend.cpp)
   target_compile_definitions(cuda_loader_test PRIVATE FLYX_TEST_DEVICE_ALLOC)
   target_link_libraries(cuda_loader_test PRIVATE flyx_cuda_host)
@@ -571,10 +580,13 @@ else()
 endif()
 
 # Labels flyx_finish_test_labels cannot infer (the registering functions give golden, gpu_serial, server and tools;
-# the CUDA block gpu).  smoke: the golden and GPU tests quick runs too, a few seconds each where they can be: the
+# the CUDA block gpu).  smoke: the golden and GPU tests quick runs too.  quick takes as long as its longest tests,
+# cuda_ops and golden_cuda_pdl (about 35 s each alone on an RTX 5070 Ti): the others a few seconds each, so that
+# they run beside those two (the gguf_cuda runs, as long as them or longer, would set quick's time instead).  The
 # second architecture against transformers (gate 3, from its .flyx and its GGUF file), and on the GPU every kernel
-# against float64 (gate 1), the tiny Qwen3.5 (MTP, DFlash2, sampling: gates 3 and 4), Qwen3 and Llama against
-# transformers, packed GGML blocks, Inkling-2 (fused == generic, DSpark == plain: gates 2 and 4) and the loader.
+# against float64 (gate 1), the tiny Qwen3.5 (MTP, DFlash2, sampling: gates 3 and 4), Qwen3 against transformers
+# fused and generic (gates 2 and 3), Llama against transformers and its NVFP4 copy (NVFP4 on CUDA: gate 3), packed
+# GGML blocks in tree rounds, Inkling-2 (fused == generic, DSpark == plain: gates 2 and 4) and the loader.
 set_property(TEST make_assets APPEND PROPERTY LABELS tiny)          # makes the tiny models (no fixture before it)
 set_property(TEST gguf_cpu_ref APPEND PROPERTY LABELS golden)       # gguf_e2e_test: the golden outputs from GGUF
 set_property(TEST golden_cpu_ref_qwen3 golden_cpu_ref_qwen3_gguf APPEND PROPERTY LABELS smoke)
@@ -584,7 +596,8 @@ endif()
 if(TARGET flyx-cuda)
   set_property(TEST gguf_cuda gguf_cuda_unfused gguf_cuda_pdl gguf_cuda_no_pdl APPEND PROPERTY LABELS golden)
   set_property(TEST tree_bench_context APPEND PROPERTY LABELS tools)
-  set_property(TEST cuda_ops golden_cuda_pdl golden_cuda_qwen3 golden_cuda_llama golden_cuda_quant_q4_k inkling2_cuda
-                    cuda_loader elastic_load_cuda vision residual_decision APPEND PROPERTY LABELS smoke)
+  set_property(TEST cuda_ops golden_cuda_pdl golden_cuda_qwen3 golden_cuda_qwen3_unfused golden_cuda_llama
+                    golden_cuda_llama_nvfp4 golden_cuda_quant_q4_k inkling2_cuda cuda_loader elastic_load_cuda vision
+                    residual_decision APPEND PROPERTY LABELS smoke)
 endif()
 flyx_finish_test_labels()
