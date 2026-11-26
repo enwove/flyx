@@ -163,6 +163,14 @@ struct BackendOptions {
   int pinned_host_mb = -1;  // override pinned host budget in MiB (-1: query DXGI NON_LOCAL on Windows, unlimited else)
 };
 bool parse_options(const char* text, BackendOptions* o, std::string* err);
+// The environment as apply_env_aliases reads it (null: std::getenv; tests pass their own).
+using EnvLookup = const char* (*)(const char* name);
+// The options' legacy environment spellings (backend.cpp's kEnvAliases, docs/server.md): FLYX_SC_CLUSTER for option
+// sc_cluster and so on; a variable unset, empty or not an integer leaves its option as it is.
+void apply_env_aliases(BackendOptions* o, EnvLookup lookup = nullptr);
+// The options a load runs with: those environment spellings, then `text` (FLYX_BACKEND_OPTIONS and --backend-opt),
+// which overrides them.
+bool resolve_options(const char* text, BackendOptions* o, std::string* err, EnvLookup lookup = nullptr);
 
 // runtime/device_stats.cpp: NVML figures of the device probe() chose.
 void remember_device(int device);

@@ -1283,7 +1283,7 @@ void build_seq(flyx_bmodel* m, int32_t max_ctx, flyx_seq* s) {
   if (!s->dry) {
     CK(cudaStreamCreateWithFlags(&s->st, cudaStreamNonBlocking));
     create_side(&s->side);
-    if (m->need.max_bank) prepare_sublayer_clusters();
+    if (m->need.max_bank) prepare_sublayer_clusters(m->opt.kernels.sc_cluster);
     if (m->need.moe_experts && sm90_or_newer()) {
       create_side(&s->expert_side);
       CK(cudaEventCreateWithFlags(&s->expert_read, cudaEventDisableTiming));

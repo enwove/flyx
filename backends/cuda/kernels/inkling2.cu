@@ -2,6 +2,7 @@
 // Inkling-2 target kernels: logit softcapping, Block Attention Residuals, cross-pass loop control,
 // causal depthwise ShortConv (with optional per-head dynamic taps), and relative-position-bias attention.
 #include <algorithm>
+#include <array>
 #include <climits>
 #include <cmath>
 #include <cstdio>
@@ -1007,21 +1008,32 @@ SublayerVariant sublayer_variant(int requested) {
   return v;
 }
 
-const auto& sublayer_variants() {
-  static const int cl = [] {
-    if (!sm90_or_newer()) return 1;
-    const char* e = std::getenv("FLYX_SC_CLUSTER");
-    return e ? std::atoi(e) : 8;
-  }();
+using SublayerVariants = std::array<SublayerVariant, 12>;
+
+SublayerVariants make_sublayer_variants(int cl) {
   using N = SublayerNorm;
-  static const SublayerVariant variants[] = {
-      sublayer_variant<N::None, 1, 1>(cl), sublayer_variant<N::None, 2, 1>(cl),
-      sublayer_variant<N::None, 3, 1>(cl), sublayer_variant<N::None, 4, 1>(cl),
-      sublayer_variant<N::F32, 1, 5>(cl), sublayer_variant<N::F32, 1, 10>(cl),
-      sublayer_variant<N::MoeQ8, 1, 5>(cl), sublayer_variant<N::MoeQ8, 1, 10>(cl),
-      sublayer_variant<N::AttnQ8Split, 1, 5>(cl), sublayer_variant<N::AttnQ8Split, 1, 10>(cl),
-      sublayer_variant<N::AttnQ8Split, 3, 5>(cl), sublayer_variant<N::AttnQ8Split, 3, 10>(cl)};
-  return variants;
+  return {sublayer_variant<N::None, 1, 1>(cl), sublayer_variant<N::None, 2, 1>(cl),
+          sublayer_variant<N::None, 3, 1>(cl), sublayer_variant<N::None, 4, 1>(cl),
+          sublayer_variant<N::F32, 1, 5>(cl), sublayer_variant<N::F32, 1, 10>(cl),
+          sublayer_variant<N::MoeQ8, 1, 5>(cl), sublayer_variant<N::MoeQ8, 1, 10>(cl),
+          sublayer_variant<N::AttnQ8Split, 1, 5>(cl), sublayer_variant<N::AttnQ8Split, 1, 10>(cl),
+          sublayer_variant<N::AttnQ8Split, 3, 5>(cl), sublayer_variant<N::AttnQ8Split, 3, 10>(cl)};
+}
+
+// The variants for a requested cluster size (KernelOptions::sc_cluster: 4 or 8, else one block), each size's
+// feasibility on this device asked once for the process: the device stays, the models' options may differ.
+const SublayerVariants& sublayer_variants(int requested) {
+  const int cl = sm90_or_newer() && (requested == 4 || requested == 8) ? requested : 1;
+  if (cl == 8) {
+    static const SublayerVariants eight = make_sublayer_variants(8);
+    return eight;
+  }
+  if (cl == 4) {
+    static const SublayerVariants four = make_sublayer_variants(4);
+    return four;
+  }
+  static const SublayerVariants one = make_sublayer_variants(1);
+  return one;
 }
 
 __global__ void k_shortconv_fold(const ShortConvLayer* __restrict__ layers, size_t win_stride, size_t replay_stride,
@@ -2583,7 +2595,7 @@ void shortconv_pass(const float* x, int ldx, const float* w, const float* dyn, f
       conv, n_heads, P, rows, tile_rows, out, ldo, int(accumulate), res_src);
 }
 
-void prepare_sublayer_clusters() { (void)sublayer_variants(); }
+void prepare_sublayer_clusters(int cluster) { (void)sublayer_variants(cluster); }
 
 void shortconv_res_mix_norm(const SublayerPostConv& sc, const float* x_src, float* x_dst, float* bank, int n_blocks,
                             const float* queries, int n_queries, float* mix_out, SublayerNorm norm_mode,
@@ -2613,13 +2625,13 @@ void shortconv_res_mix_norm(const SublayerPostConv& sc, const float* x_src, floa
     o.mid = parts.mid;
     o.lo = parts.lo;
   }
-  // A row over a cluster of 8 SMs (float4 rows only: the one-block row's sums); FLYX_SC_CLUSTER=1 keeps the
+  // A row over a cluster of 8 SMs (float4 rows only: the one-block row's sums); option sc_cluster=1 keeps the
   // one-block row (4: 4 blocks).  RTX 5090, Inkling-2-Mini UD-IQ4_XS plain decoding 219.1 -> 222.2 tok/s.
   const bool vec4 = (H & 3) == 0 && ((reinterpret_cast<uintptr_t>(bank) | reinterpret_cast<uintptr_t>(x_src) |
                                       reinterpret_cast<uintptr_t>(x_dst) | reinterpret_cast<uintptr_t>(queries) |
                                       reinterpret_cast<uintptr_t>(mix_out)) & 15u) == 0;
   const int unroll = norm_mode == SublayerNorm::None ? 1 : H <= 2560 ? 5 : 10;
-  for (const auto& v : sublayer_variants()) {
+  for (const auto& v : sublayer_variants(opts(L).sc_cluster)) {
     if (v.norm != norm_mode || v.queries != n_queries || v.unroll != unroll) continue;
     const int cl = vec4 ? v.cluster : 1;
     cudaLaunchConfig_t cfg{};

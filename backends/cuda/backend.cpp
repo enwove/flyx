@@ -13,8 +13,10 @@
 #include "backends/cuda/backend.h"
 #include "backends/cuda/regions/layers.h"
 
+#include <charconv>
 #include <climits>
 #include <cstdlib>
+#include <cstring>
 
 namespace flyx::cuda {
 
@@ -180,13 +182,14 @@ OptionSpec kernel_bool_choice_opt(const char* name, T KernelOptions::*ptr, const
   };
 }
 
-OptionSpec kernel_whole_opt(const char* name, int KernelOptions::*ptr, int min_val = 0) {
+OptionSpec kernel_whole_opt(const char* name, int KernelOptions::*ptr, int min_val = 0, int max_val = INT_MAX) {
   return {
       name,
-      [ptr, min_val](const std::string& key, const std::string& val, BackendOptions* o, std::string* err) {
+      [ptr, min_val, max_val](const std::string& key, const std::string& val, BackendOptions* o, std::string* err) {
         if (!parse_whole_val(key, val, &(o->kernels.*ptr), err)) return false;
-        if (o->kernels.*ptr < min_val) {
-          *err = key + " takes " + std::to_string(min_val) + " or more";
+        if (o->kernels.*ptr < min_val || o->kernels.*ptr > max_val) {
+          *err = key + " takes " + std::to_string(min_val) +
+                 (max_val == INT_MAX ? " or more" : " to " + std::to_string(max_val));
           return false;
         }
         return true;
@@ -436,6 +439,27 @@ const std::vector<OptionSpec>& option_specs() {
       kernel_whole_opt("mtp_sink", &KernelOptions::mtp_sink),
       kernel_flag_opt("mtp_ring", &KernelOptions::mtp_ring),
       kernel_flag_opt("dflash_ring", &KernelOptions::dflash_ring),
+      // Inkling-2's rounds (kEnvAliases: the environment spellings they had before they were options).
+      kernel_int_choice_opt("sc_cluster", &KernelOptions::sc_cluster, {"1", "4", "8"}),
+      kernel_flag_opt("moe_vec", &KernelOptions::moe_vec),
+      {"warm",
+       [](const std::string& key, const std::string& val, BackendOptions* o, std::string* err) {
+         if (!parse_whole_val(key, val, &o->kernels.warm, err)) return false;
+         if (o->kernels.warm & ~kWarmAll) {
+           *err = key + " takes a sum of 1, 2, 4 and 16";
+           return false;
+         }
+         return true;
+       },
+       [](const BackendOptions& o, const BackendOptions& def) -> std::string {
+         return o.kernels.warm != def.kernels.warm ? "warm=" + std::to_string(o.kernels.warm) : "";
+       }},
+      kernel_int_choice_opt("expert_prefetch", &KernelOptions::expert_prefetch, {"0", "1", "2"}),
+      kernel_whole_opt("guess", &KernelOptions::guess, 0, 15),
+      kernel_whole_opt("guess_k", &KernelOptions::guess_k),
+      kernel_flag_opt("side_loop_msg", &KernelOptions::side_loop_msg),
+      kernel_flag_opt("side_companion", &KernelOptions::side_companion),
+      kernel_flag_opt("side_kv", &KernelOptions::side_kv),
       {"pageable_kv",
        [](const std::string& key, const std::string& val, BackendOptions* o, std::string* err) {
          if (!check_choice(key, val, {"auto", "on", "off"}, err)) return false;
@@ -459,7 +483,50 @@ const std::vector<OptionSpec>& option_specs() {
   return specs;
 }
 
+// The environment spellings some options had while the kernels that take them read them at first use, FLYX_<NAME>
+// for option <name> (docs/server.md).  resolve_options reads them at every load, before the options given, which
+// override them; unset, empty or not an integer (the whole value): the option keeps its default.  An integer keeps
+// the meaning it had there, among the option's values.
+struct EnvAlias {
+  const char* env;
+  const char* option;
+  void (*set)(KernelOptions* k, int v);
+};
+const EnvAlias kEnvAliases[] = {
+    {"FLYX_SC_CLUSTER", "sc_cluster", [](KernelOptions* k, int v) { k->sc_cluster = v == 4 || v == 8 ? v : 1; }},
+    {"FLYX_MOE_VEC", "moe_vec", [](KernelOptions* k, int v) { k->moe_vec = v != 0; }},
+    {"FLYX_WARM", "warm", [](KernelOptions* k, int v) { k->warm = v & kWarmAll; }},
+    {"FLYX_EXPERT_PREFETCH", "expert_prefetch",
+     [](KernelOptions* k, int v) { k->expert_prefetch = v == 0 || v == 2 ? v : 1; }},
+    {"FLYX_GUESS", "guess", [](KernelOptions* k, int v) { k->guess = v > 0 ? v & 15 : 0; }},
+    {"FLYX_GUESS_K", "guess_k", [](KernelOptions* k, int v) { k->guess_k = std::max(v, 0); }},
+    {"FLYX_SIDE_LOOP_MSG", "side_loop_msg", [](KernelOptions* k, int v) { k->side_loop_msg = v != 0; }},
+    {"FLYX_SIDE_COMPANION", "side_companion", [](KernelOptions* k, int v) { k->side_companion = v != 0; }},
+    {"FLYX_SIDE_KV", "side_kv", [](KernelOptions* k, int v) { k->side_kv = v != 0; }},
+};
+
 }  // namespace
+
+void apply_env_aliases(BackendOptions* o, EnvLookup lookup) {
+  for (const EnvAlias& a : kEnvAliases) {
+    const char* text = lookup ? lookup(a.env) : std::getenv(a.env);
+    if (!text || !*text) continue;
+    const char* end = text + std::strlen(text);
+    int v = 0;
+    const auto [stop, ec] = std::from_chars(text, end, v);
+    if (ec != std::errc{} || stop != end) {
+      std::fprintf(stderr, "flyx-cuda: %s=\"%s\" is not an integer: ignored (option %s keeps its default)\n", a.env,
+                   text, a.option);
+      continue;
+    }
+    a.set(&o->kernels, v);
+  }
+}
+
+bool resolve_options(const char* text, BackendOptions* o, std::string* err, EnvLookup lookup) {
+  apply_env_aliases(o, lookup);
+  return parse_options(text, o, err);
+}
 
 bool parse_options(const char* text, BackendOptions* o, std::string* err) {
   const auto& specs = option_specs();
@@ -574,7 +641,7 @@ int open_model(const flyx_model_desc* desc, const flyx_open_options* opts, flyx_
       else
         m->opt.draft_weights = interfaces::DraftWeightsMode::kAuto;
     }
-    if (!parse_options(opts ? opts->options : nullptr, &m->opt, &err)) return fail("options: " + err);
+    if (!resolve_options(opts ? opts->options : nullptr, &m->opt, &err)) return fail("options: " + err);
     if (!nvfp4_inputs(*desc, &m->opt.kernels.prefill_fp4, &err)) return fail(err);
     if (m->opt.embed == 0) {
       // embed=auto: host memory frees the table's GPU memory for a few kilobytes of reads a token; where 32 GB stay

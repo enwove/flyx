@@ -4,7 +4,7 @@
 // the dp4a kernel's configuration the tuning tables give (variants/candidates.toml: moe_dp4a, moe_gate_up).
 //
 // Strict Gate 4 row-count invariance (0.00e+00 across R=1, R=2..16, R=256, fused vs unfused, sc vs nullptr):
-//   * NVFP4: fixed per-column F32 dot across all rows; FLYX_MOE_VEC=0 uses one fixed MMA span per K.
+//   * NVFP4: one fixed MMA span per K (bf16 inputs); option moe_vec=1: a fixed per-column F32 dot across all rows.
 //   * GGML blocks (q8): fixed 32-stream ascending K accumulation + balanced xor tree (1,2,4,8,16) shared by
 //     both k_moe_blocks_q8_dp4a and INT8 Tensor Core k_moe_blocks_q8_mma.
 //   * BF16: fixed kMoeKT=1024 per-lane FMA + balanced xor tree across decode and compacted grouped tasks.
@@ -672,19 +672,12 @@ __global__ void k_moe_nvfp4_vec_sum(const float* act, int ld, const uint8_t* Q, 
   }
 }
 
-// Select one arithmetic contract for both rounds and prefill: the tensor-core path (bf16 inputs, MMA at every width)
-// by default; FLYX_MOE_VEC=1 selects the F32 column-at-a-time vector kernels instead.  Measured on an RTX 5070 Ti
-// (Inkling-2-Mini UD-IQ3_XXS, --ctx 4096, exact K/V): the vector kernels gave plain decoding 1% more, but
-// DSpark's rounds of 5 and 7 rows took 9-10% longer (decode -8% to -9% against the tensor-core path) and prefill,
-// split into 16-row chunks, lost 18-25%; the tensor-core path also keeps the greedy outputs of the build before
-// these kernels bit for bit.
-inline bool moe_vec_enabled() {
-  static const bool on = [] {
-    const char* e = std::getenv("FLYX_MOE_VEC");
-    return e && std::atoi(e) != 0;
-  }();
-  return on;
-}
+// One arithmetic contract for both rounds and prefill: the tensor-core path (bf16 inputs, MMA at every width) by
+// default; option moe_vec=1 (KernelOptions::moe_vec) selects the F32 column-at-a-time vector kernels instead.
+// Measured on an RTX 5070 Ti (Inkling-2-Mini UD-IQ3_XXS, --ctx 4096, exact K/V): the vector kernels gave plain
+// decoding 1% more, but DSpark's rounds of 5 and 7 rows took 9-10% longer (decode -8% to -9% against the tensor-core
+// path) and prefill, split into 16-row chunks, lost 18-25%; the tensor-core path also keeps the greedy outputs of the
+// build before these kernels bit for bit.
 
 // No-scratch fallback for NVFP4 moe_down (sc == nullptr): identical mma_bf16 span order + ew FMA order.
 template <int SPAN, int NW, int NT>
@@ -797,7 +790,7 @@ int launch_nvfp4_gu(const float* x, int ldx, const ExpertMat& W, const int* eidx
   const int N_work = fuse_act ? I : 2 * I;
   const bool has_sc = sc && sc->tasks && sc->n_tasks && sc->pairs && W.n_experts <= sc->max_experts &&
                       top_k <= sc->max_top_k;
-  const bool vec = moe_vec_enabled();
+  const bool vec = opts(L).moe_vec;
   const int capacity = has_sc ? std::max(1, sc->chunk_rows) : rows;
   const int chunk = vec ? std::min(capacity, FLYX_MAX_ROWS) : capacity;
   int grouped = 0;
@@ -886,7 +879,7 @@ void launch_nvfp4_down(const float* act, int ld_act, const ExpertMat& W, const i
   cudaStream_t st = L.st;
   const bool has_down = sc && sc->down_buf && sc->tasks && sc->n_tasks && sc->pairs &&
                         W.n_experts <= sc->max_experts && top_k <= sc->max_top_k;
-  const bool vec = !act_bf16 && moe_vec_enabled();
+  const bool vec = !act_bf16 && opts(L).moe_vec;
   if (!vec && !has_down) {
     k_moe_nvfp4_down_serial<SPAN, 4, 2><<<dim3(ceil_div(H, 64), rows), 128, 0, st>>>(
         act, ld_act, W.q, W.s, W.rs, H, K, eidx, ew, top_k, out, ld_out, int(accumulate));
@@ -1285,7 +1278,7 @@ void moe_guess_scores(const float* x, const float* norm_w, float norm_offset, co
 }
 
 void moe_prefetch(const float* scores, int E, int top_k, int H, int I, const ExpertMat& gate_up, const ExpertMat& down,
-                  int planes, cudaStream_t st) {
+                  int planes, int guess_k, cudaStream_t st) {
   if (!sm90_or_newer() || !planes || !scores || E < 1 || E > 256 || top_k < 1 || top_k > std::min(E, kRouteTop) ||
       gate_up.packed() || down.packed()) return;
   const size_t gu_n = size_t(gate_up.N), dn_n = size_t(down.N);
@@ -1297,11 +1290,7 @@ void moe_prefetch(const float* scores, int E, int top_k, int H, int I, const Exp
     return;
   }
   const PrefetchPlane none{nullptr, 0};
-  // The best-scored guesses only (FLYX_GUESS_K, default 4): the rest are wrong more often than the bandwidth pays.
-  static const int guess_k = [] {
-    const char* e = std::getenv("FLYX_GUESS_K");
-    return e ? std::atoi(e) : 4;
-  }();
+  // The best-scored guesses only (option guess_k, default 4): the rest are wrong more often than the bandwidth pays.
   const int k = guess_k > 0 ? std::min(guess_k, top_k) : top_k;
   k_moe_prefetch_wide<<<dim3(k, 4), 256, 0, st>>>(
       scores, E, (planes & 1) ? PrefetchPlane{gate_up.q, gu_n * size_t(H) / 2} : none,
@@ -1352,8 +1341,8 @@ bool moe_round_q8(const ExpertMat& W, int rows, int top_k, int K, const MoeScrat
   return sums_ok && sc->q8_a && sc->q8_d && sc->stage_elems >= size_t(rows) * K;
 }
 
-bool moe_round_bf16_down(const ExpertMat& W, int rows, int top_k, int K, const MoeScratch* sc) {
-  return !moe_vec_enabled() && !W.packed() && W.q && K > 0 && K % 64 == 0 && moe_round_scratch(W, rows, top_k, sc) &&
+bool moe_round_bf16_down(const ExpertMat& W, int rows, int top_k, int K, const MoeScratch* sc, const Launch& L) {
+  return !opts(L).moe_vec && !W.packed() && W.q && K > 0 && K % 64 == 0 && moe_round_scratch(W, rows, top_k, sc) &&
          sc->down_buf && sc->bf16_a && sc->stage_elems >= size_t(rows) * top_k * K;
 }
 
@@ -1440,7 +1429,7 @@ void moe_down(const float* act, int ld_act, const ExpertMat& W, const int* eidx,
               int H, int K, float* out, int ld_out, bool accumulate, const MoeScratch* sc, const Launch& L,
               const bf16* act_bf16, int grouped) {
   cudaStream_t st = L.st;
-  if (act_bf16 && !moe_round_bf16_down(W, rows, top_k, K, sc))
+  if (act_bf16 && !moe_round_bf16_down(W, rows, top_k, K, sc, L))
     throw std::runtime_error("moe_down: pre-staged BF16 input requires an NVFP4 round");
   if (W.packed()) {
     blocks_init();

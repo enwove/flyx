@@ -17,8 +17,7 @@ namespace flyx::cuda {
 
 inline int ceil_div(int a, int b) { return (a + b - 1) / b; }
 
-// The launch's options (the defaults when it has none) and scratch (aborts when it has none).
-const KernelOptions& opts(const Launch& L);
+// The launch's scratch (aborts when it has none); its options: opts (kernels.cuh).
 const Scratch& scratch(const Launch& L);
 // Aborts with a message when n elements do not fit (a sizing bug in the backend, not a condition to recover from).
 void check_fits(size_t n, size_t cap, const char* what);
