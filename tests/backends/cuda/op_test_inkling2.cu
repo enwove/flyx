@@ -1203,7 +1203,7 @@ void test_inkling2_rel_attn() {
                     mismatch_pos, mismatch_pos + 2, mismatch_rows);
         ++g_fail;
       }
-      const size_t counters = size_t(c.rows / 2) * c.nkv;
+      const size_t counters = size_t((c.rows + 1) / 2) * c.nkv;  // a tile of two rows: k_rel_round_gqa's grid
       const bool have_counters = round.scratch->round_count && round.scratch->round_count_cap >= counters;
       bool zero = false;
       if (have_counters) {
