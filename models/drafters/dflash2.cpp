@@ -8,6 +8,7 @@
 #include <string>
 #include <string_view>
 
+#include "models/drafters/qwen3_layer.h"
 #include "models/gguf.h"
 
 namespace flyx::models::drafters {
@@ -15,29 +16,9 @@ namespace {
 
 using nlohmann::json;
 
-int req_int(const json& j, const char* key) {
-  const auto& v = j.at(key);
-  if (!v.is_number_integer()) throw std::runtime_error("invalid DFlash2 drafter config");
-  const int64_t n = v.get<int64_t>();
-  if (n < INT_MIN || n > INT_MAX) throw std::runtime_error("invalid DFlash2 drafter config");
-  return int(n);
-}
-
 std::string mismatch_msg(const TargetSpec& target) {
   return "a drafter made for another model (this one: width " + std::to_string(target.hidden) + ", vocabulary " +
          std::to_string(target.vocab) + ", " + std::to_string(target.layers) + " layers)";
-}
-
-// A canonical config ("draft"): a DFlash2 or DSpark drafter, made for this target where it says what it was made for.
-void check_json_target(const json& j, const TargetSpec& target) {
-  if (block_drafter_kind(j) == Drafter::kNone) throw std::runtime_error(mismatch_msg(target));
-  if (!j.contains("target") || !j["target"].is_object()) return;
-  const json& t = j["target"];
-  const int tv = t.value("vocab", target.vocab);
-  const bool vocab_ok = tv == target.vocab || tv == target.padded_vocab();
-  const bool layers_ok = !t.contains("layers") || t["layers"].is_null() || t["layers"].get<int>() == target.layers;
-  if (t.value("hidden", target.hidden) != target.hidden || !vocab_ok || !layers_ok)
-    throw std::runtime_error(mismatch_msg(target));
 }
 
 // An arch "dflash" GGUF header: the drafter reads the target's embedding and head, so its width is the target's.
@@ -126,6 +107,25 @@ Drafter block_drafter_kind(const json& draft) {
   return is_block_drafter(k) ? k : Drafter::kNone;
 }
 
+int config_int(const json& j, const char* key, const std::string& drafter) {
+  const auto& v = j.at(key);
+  if (!v.is_number_integer()) throw std::runtime_error("invalid " + drafter + " drafter config");
+  const int64_t n = v.get<int64_t>();
+  if (n < INT_MIN || n > INT_MAX) throw std::runtime_error("invalid " + drafter + " drafter config");
+  return int(n);
+}
+
+void check_config_target(const json& j, const TargetSpec& target) {
+  if (block_drafter_kind(j) == Drafter::kNone) throw std::runtime_error(mismatch_msg(target));
+  if (!j.contains("target") || !j["target"].is_object()) return;
+  const json& t = j["target"];
+  const int tv = t.value("vocab", target.vocab);
+  const bool vocab_ok = tv == target.vocab || tv == target.padded_vocab();
+  const bool layers_ok = !t.contains("layers") || t["layers"].is_null() || t["layers"].get<int>() == target.layers;
+  if (t.value("hidden", target.hidden) != target.hidden || !vocab_ok || !layers_ok)
+    throw std::runtime_error(mismatch_msg(target));
+}
+
 bool is_dflash_companion(const json& header) {
   if (!header.is_object()) return false;
   if (header.value("kind", "") == "drafter" && header.contains("draft") && header["draft"].is_object()) return true;
@@ -137,33 +137,33 @@ bool is_dflash_companion(const json& header) {
 
 void check_made_for(const json& header, const TargetSpec& target) {
   if (GgufMeta::is_header(header)) check_gguf_target(GgufMeta(header), target);
-  else check_json_target(header.at("draft"), target);
+  else check_config_target(header.at("draft"), target);
 }
 
 DFlash2Spec parse_dflash2_json(const ModelFile& file, const json& j, const TargetSpec& target, int companion) {
-  check_json_target(j, target);
+  check_config_target(j, target);
   DFlash2Spec spec{};
   spec.gguf = false;
   spec.companion = companion;
   flyx_dflash2_block& d = spec.block;
-  d.hidden = req_int(j, "hidden");
-  spec.layers = req_int(j, "layers");
-  d.n_heads = req_int(j, "n_heads");
-  d.n_kv = req_int(j, "n_kv");
-  d.head_dim = req_int(j, "head_dim");
-  d.inter = req_int(j, "inter");
-  d.block = req_int(j, "block");
-  d.mask_token = req_int(j, "mask_token");
+  d.hidden = config_int(j, "hidden", "DFlash2");
+  spec.layers = config_int(j, "layers", "DFlash2");
+  d.n_heads = config_int(j, "n_heads", "DFlash2");
+  d.n_kv = config_int(j, "n_kv", "DFlash2");
+  d.head_dim = config_int(j, "head_dim", "DFlash2");
+  d.inter = config_int(j, "inter", "DFlash2");
+  d.block = config_int(j, "block", "DFlash2");
+  d.mask_token = config_int(j, "mask_token", "DFlash2");
   const auto raw_taps = j.at("taps").get<std::vector<int64_t>>();
   spec.taps.reserve(raw_taps.size());
   for (int64_t t : raw_taps) {
     if (t < 1 || t > target.layers) throw std::runtime_error("DFlash2 tap after layer " + std::to_string(t));
     spec.taps.push_back(int(t));
   }
-  d.conv_taps = req_int(j, "conv_taps");
-  d.conv_group = req_int(j, "conv_group");
-  d.sel_rank = req_int(j, "sel_rank");
-  d.sel_topk = req_int(j, "sel_topk");
+  d.conv_taps = config_int(j, "conv_taps", "DFlash2");
+  d.conv_group = config_int(j, "conv_group", "DFlash2");
+  d.sel_rank = config_int(j, "sel_rank", "DFlash2");
+  d.sel_topk = config_int(j, "sel_topk", "DFlash2");
   d.theta = j.at("rope_theta").get<double>();
   const int64_t win = j.value("window", int64_t(0));
   if (win < 0 || win > INT_MAX) throw std::runtime_error("DFlash2 window out of range");
@@ -179,7 +179,7 @@ DFlash2Spec parse_dflash2_json(const ModelFile& file, const json& j, const Targe
       companion >= 0 ? ModelFile::companion_name(companion, "draft.sel.pred") : std::string("draft.sel.pred");
   spec.sel_vocab = resolve_sel_vocab(file, pred_name, target);
   spec.kind = block_drafter_kind(j);
-  const int64_t from = req_int(j, "draft_from");
+  const int64_t from = config_int(j, "draft_from", "DFlash2");
   if (from != 0 && from != 1) throw std::runtime_error("block drafter draft_from " + std::to_string(from));
   d.draft_from = int32_t(from);
   if (!j.contains("sel_gate") || !j["sel_gate"].is_boolean()) throw std::runtime_error("block drafter sel_gate missing");
@@ -296,8 +296,7 @@ int build_dflash2(Tables& T, const DFlash2Spec& spec, const TargetSpec& target) 
   flyx_dflash2_block d = spec.block;
   const int layers = spec.layers;
   const double eps = spec.eps;
-  const int H = d.hidden, q = d.n_heads * d.head_dim, kv = d.n_kv * d.head_dim, I = d.inter;
-  const int TG2 = spec.tg2;
+  const int H = d.hidden, TG2 = spec.tg2;
   // The file's name for a drafter tensor ("draft.fc"): in the model file, or in its drafter file.
   auto dn = [&](const std::string& name) {
     const std::string in_file = spec.gguf ? gguf_draft_name(name) : name;
@@ -313,17 +312,7 @@ int build_dflash2(Tables& T, const DFlash2Spec& spec, const TargetSpec& target) 
     flyx_block b{};
     b.kind = FLYX_BLOCK_DFLASH2_LAYER;
     auto& y = b.dflash2_layer;
-    y.norm = T.norm(dn(p + "in_norm"), H, 0.0, eps);
-    y.post_norm = T.norm(dn(p + "post_norm"), H, 0.0, eps);
-    y.q_norm = T.norm(dn(p + "attn.q_norm"), d.head_dim, 0.0, eps);
-    y.k_norm = T.norm(dn(p + "attn.k_norm"), d.head_dim, 0.0, eps);
-    y.q = T.weight(dn(p + "attn.q"), {q, H});
-    y.k = T.weight(dn(p + "attn.k"), {kv, H});
-    y.v = T.weight(dn(p + "attn.v"), {kv, H});
-    y.o = T.weight(dn(p + "attn.o"), {H, q});
-    y.gate = T.weight(dn(p + "mlp.gate"), {I, H});
-    y.up = T.weight(dn(p + "mlp.up"), {I, H});
-    y.down = T.weight(dn(p + "mlp.down"), {H, I});
+    bind_qwen3_layer(T, y, dn, l, H, d.n_heads, d.n_kv, d.head_dim, d.inter, eps);
     const bool conv = d.conv_taps > 0;  // none: -1
     y.attn_conv_proj = conv ? T.weight(dn(p + "attn_conv.proj"), {TG2, H}) : -1;
     y.attn_conv_base = conv ? T.weight(dn(p + "attn_conv.base"), {2, d.conv_taps, H}) : -1;
@@ -337,15 +326,8 @@ int build_dflash2(Tables& T, const DFlash2Spec& spec, const TargetSpec& target) 
   d.sel_pred = T.weight(dn("draft.sel.pred"), {spec.sel_vocab, d.sel_rank});
   d.sel_succ = T.weight(dn("draft.sel.succ"), {spec.sel_vocab, d.sel_rank});
   d.sel_hid = spec.sel_gate ? T.weight(dn("draft.sel.hid"), {d.sel_rank, H}) : -1;  // -1: a unit gate
-  d.q8_weights = drafts_q8_beside_float(spec.kind) ? 1 : 0;
-
-  flyx_state st{};
-  st.kind = FLYX_STATE_KV;
-  st.draft = 1;
-  st.layers = layers;
-  st.n_kv = d.n_kv;
-  st.head_dim = d.head_dim;
-  d.kv = T.state(st);
+  d.float_weights = draft_weights_beside_float(spec.kind);
+  d.kv = draft_kv_state(T, layers, d.n_kv, d.head_dim);
   flyx_block b{};
   b.kind = FLYX_BLOCK_DFLASH2;
   b.dflash2 = d;

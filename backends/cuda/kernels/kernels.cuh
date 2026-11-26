@@ -337,10 +337,12 @@ struct Bf16Config {
 };
 extern const Bf16Config kBf16Configs[];
 extern const int kSkinnyConfigs;
-// 17..64 rows of bf16 weights in one launch (backends/cuda/variants/candidates.toml, bf16_mt): each span of weights
-// read once for every 16-row tile.  parts 3: every row the bits the 1..16-row kernel gives it (chunks 16; the kernel
-// splits the float32 rows x itself); parts 1: bf16 inputs (in abuf), deterministic, those of no other kernel, and
-// x == nullptr the bf16 rows a producer left in abuf.
+// k_gemm_skinny_mt's rows in three parts (a round's, 64 a grid row): what gemm_skinny_mt_cfg takes at most.
+constexpr int kMtMostRows = 64 * 64;
+// 17..64 rows of bf16 weights a launch (backends/cuda/variants/candidates.toml, bf16_mt; parts 3: any rows, 64 a grid
+// row): each span of weights read once for every 16-row tile.  parts 3: every row the bits the 1..16-row kernel gives
+// it (chunks 16; the kernel splits the float32 rows x itself); parts 1: bf16 inputs (in abuf), deterministic, those
+// of no other kernel, and x == nullptr the bf16 rows a producer left in abuf.
 struct MtConfig {
   int nt, chunks, unroll, parts;
 };
@@ -1292,6 +1294,29 @@ void selector_walk(const DevParams* P, const int* cand, const float* unary, int 
 void selector_tree(const DevParams* P, const int* cand, const float* unary, int k, const float* hid, int rank,
                    const bf16* pred, const bf16* succ, int width, int depths, const int* oracle, int* drafts,
                    TreeRows* tree, cudaStream_t st, float softcap, int softcap_mode, const DevGen* G);
+// DSpine (kernels/dspine.cu, ops/dspine/ref.h; regions/layers.cpp's dspine_block runs them between its GEMMs).
+// The bridge's write after a layer: per row rms = sqrt(mean(x^2)) and xn = x / (rms + eps) (the read GEMM's input);
+// the read rows' codes in place (row 0: sqrt(C) codebook[P->anchor]; else sqrt(C) u / (|u| + eps)); the messages
+// from the gate | pred | prev rows [rows][3R] (m_0 = 0, m_r = sigmoid(q_r + s_{r-1} + bias) * v_{r-1}; g, when not
+// null, each row's q); x_r += rms_r d_r for r >= 1 (before, when not null, x as it was).
+void dspine_normalize(const float* x, int H, float eps, int rows, float* xn, float* rms, cudaStream_t st);
+void dspine_codes(float* codes, int C, const bf16* codebook, const DevParams* P, float eps, int rows,
+                  cudaStream_t st);
+void dspine_message(const float* gates, int R, const float* bias, int rows, float* msg, float* g, cudaStream_t st);
+void dspine_apply(float* x, const float* d, const float* rms, int H, int rows, float* before, cudaStream_t st);
+// The walk.  For the n = rows * k candidates cand (row t's at t k): heads[i] = head[cand[i]] * nw (W null: heads holds
+// the rows already, embed_blocks') and base[i] = <before_{t+1}, heads[i]>; the senders' codes (0: the anchor's, i >= 1
+// candidate i - 1's); for each sender the best candidate of the row after it (pick; sv the codes' pred | prev
+// [senders][2R], tg the candidates' heads through the last write [n][R], g and rms the rows' before it); the chain of
+// `width` drafts from the picks (the test's oracle tokens when P->oracle_len > 0).
+void dspine_heads(const int* cand, const bf16* W, const float* nw, const float* before, int H, int k, int n,
+                  float* heads, float* base, cudaStream_t st);
+void dspine_senders(const DevParams* P, const int* cand, const bf16* codebook, int C, int senders, float* codes,
+                    cudaStream_t st);
+void dspine_scores(const float* g, const float* sv, const float* bias, const float* tg, const float* base,
+                   const float* rms, int R, int k, int senders, int* pick, cudaStream_t st);
+void dspine_walk(const DevParams* P, const int* cand, const int* pick, int k, int width, const int* oracle,
+                 int* drafts, cudaStream_t st);
 // Copy rows of x into feats at column block `slot` (taps).
 void tap_copy(const float* x, int H, float* feats, int ld_feats, int slot, int rows, cudaStream_t st);
 void tap_copy(const bf16* x, int H, float* feats, int ld_feats, int slot, int rows, cudaStream_t st);

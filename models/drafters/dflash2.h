@@ -10,6 +10,7 @@
 // a GGUF file's own names are mapped from those, as an architecture's are (models/gguf.h).
 #pragma once
 
+#include <string>
 #include <vector>
 
 #include "core/modelfile/modelfile.h"
@@ -37,15 +38,22 @@ struct DFlash2Spec {
 // The block drafter a canonical config ("draft") says it is (its "kind"), kNone when it is no block drafter.
 Drafter block_drafter_kind(const nlohmann::json& draft);
 
-// True if a companion header describes a block drafter of DFlash2's block (a drafter file's "draft", or a non-Markov
-// arch="dflash" GGUF).
+// True if a companion header describes a block drafter of DFlash2's block or DSpine's (a drafter file's "draft"), or
+// a non-Markov arch="dflash" GGUF.
 bool is_dflash_companion(const nlohmann::json& header);
 
 // Throws unless the drafter such a companion holds (or a DSpark one's: the same GGUF layout) was made for this
 // target (its width and vocabulary, and its layer count where the drafter names one).  A drafter given beside
 // another model is refused whether or not it is chosen; the rest of its config is read only when it drafts
-// (parse_dflash2_*, parse_dspark_gguf).
+// (parse_dflash2_*, parse_dspark_gguf, parse_dspine_json).
 void check_made_for(const nlohmann::json& header, const TargetSpec& target);
+
+// A drafter config's integer `key`: a whole number in int's range, else "invalid <drafter> drafter config".
+int config_int(const nlohmann::json& j, const char* key, const std::string& drafter);
+
+// Throws unless a block drafter's canonical config ("draft") is of a kind this build reads and was made for this target
+// where it says what it was made for (its width, vocabulary, padded or not, and layer count).
+void check_config_target(const nlohmann::json& draft, const TargetSpec& target);
 
 // Parse and validate a DFlash2 spec from canonical JSON ("draft" section in .flyx or drafter_dir); `file` holds its
 // tensors (the selector's codebooks say whether they have the target's padding rows).

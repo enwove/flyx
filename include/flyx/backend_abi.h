@@ -30,7 +30,7 @@
 extern "C" {
 #endif
 
-#define FLYX_BACKEND_ABI_VERSION 49u
+#define FLYX_BACKEND_ABI_VERSION 50u
 #define FLYX_BACKEND_ENTRY "flyx_backend_get_api"
 /* How a backend library exports its entry. */
 #if defined(_WIN32)
@@ -39,6 +39,7 @@ extern "C" {
 #define FLYX_BACKEND_EXPORT __attribute__((visibility("default")))
 #endif
 #define FLYX_MAX_ROWS 16       /* rows in one round: the anchor plus up to 15 drafts */
+#define FLYX_DSPINE_MAX_TOPK 16 /* the head's candidates DSpine's walk scores a row, at most (ABI 50) */
 /* Rows of a round whose drafts are given (a lookup round, ABI 36), where the backend lowers such plans: a copy of
  * the context verified up to 63 drafts at once.  A round result holds this many tokens. */
 #define FLYX_MAX_WIDE_ROWS 64
@@ -303,7 +304,9 @@ typedef enum {
   FLYX_BLOCK_REL_ATTN = 15,    /* ABI 45: relative-bias + sink + shortconv + optional SWA attention */
   FLYX_BLOCK_MOE = 16,         /* ABI 45: sparse MoE with SiTU/SwiGLU + optional shortconv & attn-res/loop */
   FLYX_BLOCK_DSPARK = 17,      /* ABI 45: DSpark parallel block drafter with Markov RNN head */
-  FLYX_BLOCK_DSPARK_LAYER = 18 /* ABI 45: one layer of DSpark */
+  FLYX_BLOCK_DSPARK_LAYER = 18, /* ABI 45: one layer of DSpark */
+  FLYX_BLOCK_DSPINE = 19,       /* ABI 50: DSpine, a block drafter whose rows pass a code bridge's message on */
+  FLYX_BLOCK_DSPINE_LAYER = 20  /* ABI 50: a DSpine layer: a Qwen3 layer, then its bridge's read and write */
 } flyx_block_kind;
 
 /* Token rows -> residual rows: x = table[token], optionally followed by RMSNorm (has_norm != 0, ABI 45). */
@@ -403,8 +406,10 @@ typedef enum {
  * ABI 49: convolutions optional (conv_taps 0: attn_conv_* and mlp_conv_* are
  * -1), the block's first drafting row draft_from (1: rows 1.., 0: the anchor's
  * too, predicting the token after it: up to `block` drafts), sel_hid optional
- * (-1: the selector's score with a unit gate), and q8_weights (1: the model
- * asks its projections in Q8_0 beside a target of float weights). */
+ * (-1: the selector's score with a unit gate).  ABI 50: float_weights, what
+ * the model asks its projections in under draft_weights=auto beside a target
+ * of float weights (a flyx_draft_weights: AUTO the backend's own, Q8 or
+ * NVFP4). */
 typedef struct {
   int32_t hidden, n_heads, n_kv, head_dim, inter;
   int32_t block, mask_token, n_taps, conv_taps, conv_group, sel_rank, sel_topk;
@@ -418,7 +423,7 @@ typedef struct {
   float softcap;                       /* ABI 46: selector logit softcap (0 = none) */
   int32_t softcap_mode;                /* ABI 46: flyx_dflash2_softcap_mode */
   int32_t draft_from;                  /* ABI 49: the block's first row that drafts: 1, or 0 (the anchor's) */
-  int32_t q8_weights;                  /* ABI 49: 1: its projections Q8_0 beside a target of float weights */
+  int32_t float_weights;               /* ABI 50: flyx_draft_weights beside a float target (AUTO, Q8, NVFP4) */
 } flyx_dflash2_block;
 
 /* A DFlash2 layer: attention (q, k, v, o; q/k norms; rotary on all dims) and
@@ -430,6 +435,46 @@ typedef struct {
   int32_t q, k, v, o, gate, up, down;
   int32_t attn_conv_proj, attn_conv_base, mlp_conv_proj, mlp_conv_base;
 } flyx_dflash2_layer_block;
+
+/* DSpine block drafter (ABI 50; python/reference/flyx_ref/dspine.py): `block` rows (the anchor, then mask_token)
+ * through its layers (DSPINE_LAYER blocks), each a Qwen3 layer whose attention sees the context K/V and the block's
+ * rows up to its own (causal; with a window, only the positions less than `window` before its own), then the code
+ * bridge's write.  With x_r row r's residual after the layer, rms_r = sqrt(mean(x_r^2)):
+ *   c_r = sqrt(code) u_r / (|u_r| + bridge_eps), u_r = read (x_r / (rms_r + bridge_eps))      (r >= 1)
+ *   c_0 = sqrt(code) codebook[anchor]
+ *   x_r += rms_r write m_r,  m_r = sigmoid(gate c_r + pred c_{r-1} + gate_bias) * (prev c_{r-1})   (r >= 1)
+ * (read and write the layer's).  Then per row r >= 1: norm, the head's `topk` best tokens (high to low, the lower
+ * id on ties), and the walk: row r's draft is the candidate t maximising <x'_r, norm.w * head[t]> (the first on
+ * ties), x'_r the row's last write redone with e = sqrt(code) codebook[the draft before it] (the anchor for row 1)
+ * in place of c_{r-1}, from the x_r and c_r before that write.  No row reads a row after it: a block of fewer rows
+ * drafts the same first drafts.  Its context is DFlash2's: fc(the residual rows tapped at n_taps points) ->
+ * hidden_norm -> each layer's k (k_norm, rope) and v into its cache.  The embedding and head blocks may hold packed
+ * GGML blocks.  Only drafting reads it: it never changes the output. */
+typedef struct {
+  int32_t hidden, n_heads, n_kv, head_dim, inter;
+  int32_t block, mask_token, n_taps;
+  int32_t code, rank, topk;            /* the bridge's code size and message rank; the walk's candidates (<= 16) */
+  int32_t window;                      /* sliding window of every layer; 0: none */
+  double theta, bridge_eps;
+  int32_t embed, head;                 /* blocks */
+  int32_t first_layer, layers;         /* blocks of kind DSPINE_LAYER */
+  flyx_norm hidden_norm, norm;
+  int32_t fc;
+  int32_t codebook;                    /* [vocab, code] */
+  int32_t gate, pred, prev;            /* [rank, code] */
+  int32_t gate_bias;                   /* [rank] */
+  int32_t kv;                          /* state: one cache per layer */
+  int32_t float_weights;               /* flyx_draft_weights beside a float target (AUTO, Q8, NVFP4) */
+} flyx_dspine_block;
+
+/* A DSpine layer: attention (q, k, v, o; q/k norms; rotary on all dims), MLP, and the bridge's read [code, hidden]
+ * and write [hidden, rank] after them. */
+typedef struct {
+  flyx_norm norm, post_norm, q_norm, k_norm;
+  int32_t q, k, v, o, gate, up, down;
+  int32_t read, write;
+  int32_t pad0;
+} flyx_dspine_layer_block;
 
 /* The tree DV drafts (flyx_dv_block.tree; ops/draft/ref.h). */
 typedef enum {
@@ -678,6 +723,8 @@ typedef struct {
     flyx_moe_block moe;                /* ABI 45 */
     flyx_dspark_block dspark;          /* ABI 45 */
     flyx_dspark_layer_block dspark_layer; /* ABI 45 */
+    flyx_dspine_block dspine;             /* ABI 50 */
+    flyx_dspine_layer_block dspine_layer; /* ABI 50 */
   };
 } flyx_block;
 

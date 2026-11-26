@@ -1,7 +1,9 @@
 // Copyright 2026 The flyx Authors. SPDX-License-Identifier: Apache-2.0
-// A block drafter (DFlash2, or DeepSpec's DSpark) as its authors publish it: config.json and *.safetensors in a directory. Read
-// into what python/convert/flyx_convert makes of it as a drafter file (--draft alone): the same "draft" description
-// (canonical_draft_config with no target) and the same tensors under the same names, their bytes read in place.
+// A block drafter (DFlash2, DeepSpec's DSpark or Tencent's DSpine) as its authors publish it: config.json and
+// *.safetensors in a directory.  Read into what python/convert/flyx_convert makes of it as a drafter file (--draft
+// alone): the same "draft" description (canonical_draft_config with no target) and the same tensors under the same
+// names, their bytes read in place (a DSpine drafter's stacked bridge tensors as views of each layer's part,
+// flyx_convert/dspine.py).
 #include <algorithm>
 #include <cctype>
 #include <cmath>
@@ -86,10 +88,141 @@ json dspark_config(const json& sc) {
   return d;
 }
 
+bool falsy(const json& v) {
+  return v.is_null() || (v.is_boolean() && !v.get<bool>()) || (v.is_number() && v.get<double>() == 0) ||
+         (v.is_string() && v.get<std::string>().empty()) || (v.is_array() && v.empty()) ||
+         (v.is_object() && v.empty());
+}
+
+void dspine_require(bool ok, const std::string& what) {
+  if (!ok) throw std::runtime_error("DSpine drafter: " + what);
+}
+
+// python/convert/flyx_convert/dspine.py's canonical_dspine_config(config, target=None): the variant both released
+// drafters are (Tencent's DSpineDraftModel), anything else refused.
+json dspine_config(const json& sc) {
+  dspine_require(sc.contains("dflash_config") && sc["dflash_config"].is_object(), "no dflash_config");
+  const json& dc = sc["dflash_config"];
+  const int64_t layers = sc.at("num_hidden_layers").get<int64_t>();
+  dspine_require(layers > 0 && layers <= 1024, "num_hidden_layers out of range");
+  dspine_require(sc.value("model_type", "qwen3") == "qwen3", "model_type (qwen3 layers)");
+  dspine_require(sc.value("hidden_act", "silu") == "silu", "hidden_act (silu)");
+  dspine_require(!sc.value("attention_bias", false), "attention biases");
+  dspine_require(dc.value("draft_block_causal", json()) == json(true), "draft_block_causal must be true");
+  dspine_require(dc.value("selected_prefix_terminal", json()) == json(false), "a terminal write");
+  dspine_require(dc.value("selected_prefix_decode_mode", "") == "serial", "decode mode (serial)");
+  dspine_require(dc.value("selected_prefix_feature_writes", json()) == json(true) &&
+                     dc.value("selected_prefix_feature_write_mode", "") == "independent",
+                 "independent writes after the layers");
+  json every = json::array();
+  for (int64_t i = 1; i <= layers; ++i) every.push_back(i);
+  dspine_require(dc.value("selected_prefix_feature_layers", json()) == every, "a write after every layer");
+  dspine_require(falsy(dc.value("selected_prefix_terminal_residual_rank", json())), "a terminal residual");
+  dspine_require(falsy(dc.value("selected_prefix_feature_next_token_rows", json())), "next-token rows");
+  dspine_require(dc.value("selected_prefix_feature_reliability", json()).is_null(), "feature reliability weights");
+  dspine_require(dc.value("attention_value_scale", json()).is_null(), "an attention value scale");
+  for (const char* k : {"conv_kernel_size", "conv_group_size", "selector_rank", "selector_top_k", "projector_type",
+                        "attention_sink_bias"})
+    dspine_require(falsy(dc.value(k, json())), std::string(k) + " (DFlash2's parts)");
+  std::vector<int64_t> widths;
+  // The refinement's weight and the bridge's kappa are training's (the refinement loss's weight, the code's scale in
+  // training): Tencent's own readers check them (Tencent/DSpine sglang_dspine/models/dspine.py, dspine_mlx/config.py)
+  // and no inference reads them; these readers take the same keys and values, and nothing else.
+  const json refine = dc.value("selected_prefix_last_write_refine", json());
+  if (!refine.is_null()) {
+    const auto keys = {"kind", "version", "head_topk", "weight"};
+    dspine_require(refine.is_object() && refine.size() == keys.size() &&
+                       std::all_of(keys.begin(), keys.end(), [&](const char* k) { return refine.contains(k); }) &&
+                       refine["kind"] == "exact_sender" && refine["version"] == 1 &&
+                       refine["head_topk"].is_number_integer() && refine["weight"].is_number() &&
+                       refine["weight"].get<double>() >= 0,
+                   "last-write refinement (exact_sender, version 1, head_topk, a weight >= 0)");
+    widths.push_back(refine["head_topk"].get<int64_t>());
+  }
+  const json second = sc.value("code_bridge_second_pass", json());
+  if (!second.is_null()) {
+    dspine_require(second.value("mode", "") == "serial_table" && second.value("first_exact", int64_t(-1)) == layers - 1,
+                   "second pass (serial_table, the last layer's write)");
+    widths.push_back(second.at("head_topk").get<int64_t>());
+  }
+  dspine_require(!widths.empty() &&
+                     std::all_of(widths.begin(), widths.end(), [&](int64_t w) { return w == widths[0]; }),
+                 "refinement widths (one, given at least once)");
+  dspine_require(widths[0] >= 2 && widths[0] <= 16, "refinement width (2..16)");
+  const json bridge = dc.value("selected_prefix_code_bridge", json());
+  dspine_require(bridge.is_object() && bridge.value("code_size", json()).is_number_integer() &&
+                     bridge.value("rank", json()).is_number_integer() && bridge.value("eps", json()).is_number() &&
+                     std::all_of(bridge.items().begin(), bridge.items().end(),
+                                 [](const auto& e) {
+                                   return e.key() == "code_size" || e.key() == "rank" || e.key() == "eps" ||
+                                          (e.key() == "kappa" && (e.value().is_null() || e.value().is_number()));
+                                 }),
+                 "selected_prefix_code_bridge (code_size, rank, eps; kappa: training's)");
+  json rp = sc.value("rope_parameters", json::object());  // null: none, as python's `or {}`
+  if (rp.is_null()) rp = json::object();
+  dspine_require((rp.is_object() && rp.value("rope_type", rp.value("type", "default")) == "default") &&
+                     sc.value("rope_scaling", json()).is_null(),
+                 "rope scaling (default rotary only)");
+  dspine_require(rp.value("rope_theta", sc.value("rope_theta", json())).is_number(), "no rope_theta");
+  std::vector<std::string> types(size_t(layers), "full_attention");
+  if (sc.contains("layer_types") && sc["layer_types"].is_array() && !sc["layer_types"].empty())
+    types = sc["layer_types"].get<std::vector<std::string>>();
+  auto all = [&](const char* t) {
+    return std::all_of(types.begin(), types.end(), [&](const std::string& x) { return x == t; });
+  };
+  int64_t window = 0;
+  if (all("full_attention")) {
+    dspine_require(!sc.value("use_sliding_window", false), "use_sliding_window without sliding layers");
+  } else {
+    const json w = sc.value("sliding_window", json());
+    dspine_require(all("sliding_attention") && sc.value("use_sliding_window", false) &&
+                       sc.value("max_window_layers", layers) == layers && w.is_number_integer() &&
+                       w.get<int64_t>() > 0,
+                   "layer types: all full, or all sliding with one window");
+    window = w.get<int64_t>();
+  }
+  std::vector<int64_t> taps;
+  for (const auto& i : dc.at("target_layer_ids")) taps.push_back(i.get<int64_t>() + 1);
+  const int64_t vocab = sc.at("vocab_size").get<int64_t>();
+  const json dvocab = sc.value("draft_vocab_size", json());
+  dspine_require(falsy(dvocab) || dvocab.get<int64_t>() == vocab, "a draft vocabulary of its own");
+  dspine_require(!sc.value("tie_word_embeddings", false), "tied embeddings (it reads the target's head)");
+  json d = layer_fields(sc);
+  d["kind"] = "dspine";
+  d["block"] = dc.contains("block_size") ? dc["block_size"] : sc.at("block_size");
+  d["mask_token"] = dc.at("mask_token_id");
+  d["taps"] = taps;
+  d["window"] = window;
+  d["code"] = bridge.at("code_size");
+  d["rank"] = bridge.at("rank");
+  d["bridge_eps"] = bridge.at("eps").get<double>();
+  d["topk"] = widths[0];
+  d["target"] = {{"hidden", d["hidden"]}, {"vocab", vocab}, {"layers", sc.value("num_target_layers", json())}};
+  return d;
+}
+
+// A DSpine drafter's tensors that only say which variant it is: each holds 1 (flyx_convert/dspine.py's VERSIONS).
+bool dspine_version(const std::string& inner) {
+  return inner == "draft_block_causal_version" || inner == "last_write_refine_version" ||
+         inner == "selected_prefix_bridge.independent_write_version" ||
+         inner == "selected_prefix_bridge.terminal_disabled_version";
+}
+// Its terminal write's projection, which a drafter without one holds as zeros.
+constexpr const char* kTerminal = "selected_prefix_bridge.out.weight";
+// Its stacked tensors: 1 the last layer's read (read_weight), 2 the other layers' (early_read_weights), 3 every
+// layer's write (feature_write_weights); 0 none.
+int dspine_stacked(const std::string& inner) {
+  if (inner == "selected_prefix_bridge.read_weight") return 1;
+  if (inner == "selected_prefix_bridge.early_read_weights") return 2;
+  if (inner == "selected_prefix_bridge.feature_write_weights") return 3;
+  return 0;
+}
+
 // The block drafters a config.json names by its architecture, and the kind each reads as (draft_config).
 constexpr std::pair<std::string_view, std::string_view> kDrafterArchitectures[] = {
     {"DFlash2DraftModel", "dflash2"},
     {"Qwen3DSparkModel", "dspark"},
+    {"DSpineDraftModel", "dspine"},
 };
 
 std::string architectures_kind(const std::vector<std::string>& architectures) {
@@ -110,7 +243,9 @@ std::string drafter_config_kind(const json& sc) {
 
 // python/convert's canonical_draft_config(config, target=None).
 json draft_config(const json& sc) {
-  if (drafter_config_kind(sc) == "dspark") return dspark_config(sc);
+  const std::string kind = drafter_config_kind(sc);
+  if (kind == "dspark") return dspark_config(sc);
+  if (kind == "dspine") return dspine_config(sc);
   json dc, tl;
   std::vector<int64_t> taps;
   int64_t vocab, target_hidden;
@@ -189,8 +324,12 @@ json draft_config(const json& sc) {
   return d;
 }
 
+// A tensor's name without the "model." some checkpoints put before it.
+std::string inner_name(const std::string& name) { return name.rfind("model.", 0) == 0 ? name.substr(6) : name; }
+
 // python/convert's _D_SKIP and _D_RULES: the drafter's tensor names as the engine knows them, or "" to leave out.
-bool canonical(const std::string& name, std::string* out) {
+// layers_only: a drafter without the convolutions and selector (DSpine's layers), whose names they are not.
+bool canonical(const std::string& name, std::string* out, bool layers_only = false) {
   static const std::regex skip(R"(^(embed_tokens\.|lm_head\.|verifier_norm\.|verifier_lm_head\.|t2d|d2t|mask_embedding|)"
                                R"(confidence_head\.).*)");
   static const std::vector<std::pair<std::regex, std::string>> rules = {
@@ -210,9 +349,10 @@ bool canonical(const std::string& name, std::string* out) {
       {std::regex(R"(markov_head\.markov_w1\.weight)"), "sel.pred"},  // DSpark: W1[previous token]
       {std::regex(R"(markov_head\.markov_w2\.weight)"), "sel.succ"},  // W2: [vocab, rank]
   };
-  const std::string inner = name.rfind("model.", 0) == 0 ? name.substr(6) : name;
+  const std::string inner = inner_name(name);
   if (std::regex_match(inner, skip)) return out->clear(), true;
   for (const auto& [re, fmt] : rules) {
+    if (layers_only && (fmt.find("conv") != std::string::npos || fmt.rfind("sel.", 0) == 0)) continue;
     std::smatch m;
     if (!std::regex_match(inner, m, re)) continue;
     std::string s = m.format(fmt);
@@ -222,6 +362,19 @@ bool canonical(const std::string& name, std::string* out) {
     return true;
   }
   return false;
+}
+
+// The same for a DSpine drafter (flyx_convert/dspine.py's _LAYER_RULES and _BRIDGE_NAMES): its layers' tensors as
+// DFlash2's are named, the bridge's own; "" for a tensor that only says the variant (checked by the caller), or a
+// stacked one the caller cuts (read_weight, early_read_weights, feature_write_weights).
+bool canonical_dspine(const std::string& name, std::string* out) {
+  static const std::map<std::string, std::string> bridge = {
+      {"selected_prefix_bridge.codebook", "bridge.codebook"}, {"selected_prefix_bridge.gate.weight", "bridge.gate"},
+      {"selected_prefix_bridge.gate.bias", "bridge.gate_bias"},
+      {"selected_prefix_bridge.predecessor_gate.weight", "bridge.pred"},
+      {"selected_prefix_bridge.prev.weight", "bridge.prev"}};
+  if (auto it = bridge.find(inner_name(name)); it != bridge.end()) return *out = it->second, true;
+  return canonical(name, out, /*layers_only=*/true);
 }
 
 }  // namespace
@@ -273,6 +426,7 @@ bool read_drafter_dir(const std::string& dir, std::vector<std::unique_ptr<os::Ma
     json sc;
     if (!read_config_json(root, dir, &sc, err)) return false;
     const json draft = draft_config(sc);
+    const bool dspine = draft.at("kind") == "dspine";
     *out = {};
     out->arch = "drafter";
     out->header = {{"arch", "drafter"}, {"kind", "drafter"}, {"draft", draft},
@@ -294,9 +448,16 @@ bool read_drafter_dir(const std::string& dir, std::vector<std::unique_ptr<os::Ma
       const size_t data_start = 8 + size_t(hlen), data_size = size - data_start;
       for (auto it = h.begin(); it != h.end(); ++it) {
         if (it.key() == "__metadata__") continue;
+        const std::string inner = inner_name(it.key());
+        // A DSpine drafter's tensors that only say its variant, its terminal projection (none: zero), and the
+        // stacked ones cut below.
+        const bool version = dspine && dspine_version(inner), terminal = dspine && inner == kTerminal;
+        const int stacked = dspine ? dspine_stacked(inner) : 0;
         std::string canon;
-        if (!canonical(it.key(), &canon)) return *err = "unknown draft tensor " + it.key(), false;
-        if (canon.empty()) continue;  // the engine uses the target's embedding and head
+        if (!version && !terminal && !stacked &&
+            !(dspine ? canonical_dspine(it.key(), &canon) : canonical(it.key(), &canon)))
+          return *err = "unknown draft tensor " + it.key(), false;
+        if (!version && !terminal && !stacked && canon.empty()) continue;  // the target's embedding and head
         const json& r = it.value();
         flyx_tensor_view v{};
         v.dtype = dtype_of(r.at("dtype").get<std::string>());
@@ -315,25 +476,70 @@ bool read_drafter_dir(const std::string& dir, std::vector<std::unique_ptr<os::Ma
           return *err = it.key() + ": byte size does not match shape and dtype", false;
         v.data = p + data_start + offsets[0];
         v.nbytes = offsets[1] - offsets[0];
-        const std::string name = "draft." + canon;
-        out->index[name] = out->tensors.size();
-        out->names.push_back(name);
-        out->tensors.push_back(v);
-        seen.push_back(canon);
+        auto add = [&](const std::string& c, const flyx_tensor_view& t) {
+          const std::string name = "draft." + c;
+          out->index[name] = out->tensors.size();
+          out->names.push_back(name);
+          out->tensors.push_back(t);
+          seen.push_back(c);
+        };
+        if (version) {
+          // one integer of any width holding 1 (little-endian: its low bytes first)
+          const uint64_t width =
+              v.dtype == FLYX_DT_I64 ? 8 : v.dtype == FLYX_DT_I32 ? 4 : v.dtype == FLYX_DT_U8 ? 1 : 0;
+          int64_t one = 0;
+          if (!width || v.nbytes != width || (std::memcpy(&one, v.data, size_t(width)), one != 1))
+            return *err = dir + ": DSpine drafter: " + inner + " is not 1", false;
+        } else if (terminal) {
+          // a sign bit alone (an element's top byte 0x80, the rest 0) is a zero too
+          const auto* b = static_cast<const uint8_t*>(v.data);
+          const uint64_t es = v.dtype == FLYX_DT_F64 ? 8 : v.dtype == FLYX_DT_F32 ? 4 : 2;
+          for (uint64_t i = 0; i < v.nbytes; ++i)
+            if (b[i] && !(i % es == es - 1 && b[i] == 0x80))
+              return *err = dir + ": DSpine drafter: a terminal projection that is not zero", false;
+        } else if (stacked) {
+          // [n, ...] -> n views of one layer each; the last layer's read stands alone (read_weight)
+          const int64_t layers = draft.at("layers").get<int64_t>();
+          const bool read = stacked != 3, last = stacked == 1;
+          const int64_t n = last ? 1 : v.shape[0];
+          if (!last && (v.ndim != 3 || n != (read ? layers - 1 : layers)))
+            return *err = dir + ": DSpine drafter: " + inner + " is not one per layer", false;
+          if (n == 0) continue;  // a drafter of one layer: no layer before the last reads
+          flyx_tensor_view part = v;
+          if (!last) {
+            part.ndim = 2;
+            part.shape[0] = v.shape[1];
+            part.shape[1] = v.shape[2];
+            part.shape[2] = 0;
+            part.nbytes = v.nbytes / uint64_t(n);
+          }
+          for (int64_t j = 0; j < n; ++j) {
+            part.data = static_cast<const uint8_t*>(v.data) + uint64_t(j) * part.nbytes;
+            add("L" + std::to_string(last ? layers - 1 : j) + (read ? ".bridge.read" : ".bridge.write"), part);
+          }
+        } else {
+          add(canon, v);
+        }
       }
       maps->push_back(std::move(map));
     }
     for (size_t i = 0; i < out->tensors.size(); ++i) out->tensors[i].name = out->names[i].c_str();
-    // python/convert's _check_draft
-    // The tensors its config says it has: convolutions where it has taps of them, the selector's hidden gate where
-    // it has one (sel_gate).
-    const bool conv = draft.at("conv_taps").get<int64_t>() > 0, gate = draft.at("sel_gate").get<bool>();
-    std::vector<std::string> need = {"fc", "hidden_norm", "norm", "sel.pred", "sel.succ"};
-    if (gate) need.push_back("sel.hid");
+    // python/convert's _check_draft (flyx_convert/dspine.py's check_dspine): the tensors its config says it has.
+    // DFlash2's block: convolutions where it has taps of them, the selector's hidden gate where it has one (sel_gate);
+    // DSpine: its bridge, its read and write after every layer.
+    const bool conv = !dspine && draft.at("conv_taps").get<int64_t>() > 0;
+    std::vector<std::string> need = {"fc", "hidden_norm", "norm"};
+    if (dspine)
+      need.insert(need.end(), {"bridge.codebook", "bridge.gate", "bridge.gate_bias", "bridge.pred", "bridge.prev"});
+    else
+      need.insert(need.end(), {"sel.pred", "sel.succ"});
+    if (!dspine && draft.at("sel_gate").get<bool>()) need.push_back("sel.hid");
     for (int64_t j = 0; j < draft.at("layers").get<int64_t>(); ++j) {
       for (const char* n : {"in_norm", "post_norm", "attn.q", "attn.k", "attn.v", "attn.o", "attn.q_norm",
                             "attn.k_norm", "mlp.gate", "mlp.up", "mlp.down"})
         need.push_back("L" + std::to_string(j) + "." + n);
+      if (dspine)
+        for (const char* n : {"bridge.read", "bridge.write"}) need.push_back("L" + std::to_string(j) + "." + n);
       if (conv)
         for (const char* n : {"attn_conv.base", "attn_conv.proj", "mlp_conv.base", "mlp_conv.proj"})
           need.push_back("L" + std::to_string(j) + "." + n);

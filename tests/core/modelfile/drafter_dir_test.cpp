@@ -1,8 +1,9 @@
 // Copyright 2026 The flyx Authors. SPDX-License-Identifier: Apache-2.0
-// A DFlash2 drafter read from its authors' directory (config.json and safetensors) is what
+// A block drafter read from its authors' directory (config.json and safetensors) is what
 // python/convert makes of it as a drafter file: the same "draft" description and the same tensors, byte for byte.
 // The tiny assets hold the drafter as z-lab publishes it (hf_draft_zlab), with a sliding window (hf_draft_window)
-// and in speculators' layout (hf_draft), and python/convert's files of the first two.
+// and in speculators' layout (hf_draft), and python/convert's files of the first two; and a DSpine drafter as
+// tencent publishes it (hf_dspine) with python/convert's file of it.
 #include <cstdio>
 #include <cstring>
 #include <filesystem>
@@ -64,6 +65,8 @@ int main(int argc, char** argv) {
   same(dir, model, "hf_draft_zlab", "tiny_draft.flyx");
   same(dir, model, "hf_draft_window", "tiny_draft_window.flyx");
   same(dir, model, "hf_draft", "tiny_draft.flyx", false);  // speculators' layout: the same drafter
+  same(dir, model, "hf_dspine", "tiny_draft_dspine.flyx");   // DSpine, its stacked bridge tensors cut per layer
+  same(dir, model, "hf_dspine1", "tiny_draft_dspine1.flyx");  // one layer: no early reads ([0, code, hidden])
   {
     flyx::ModelFile f;
     std::string err;
@@ -130,6 +133,36 @@ int main(int argc, char** argv) {
             "target_layer_ids that reach num_target_layers are the taps as they are, with the soft cap and its mode: " +
                 err);
     }
+    fs::remove_all(tmp, ec);
+  }
+  {
+    // DSpine's training-only fields (the refinement's weight, the bridge's kappa) take Tencent's readers' values, and
+    // nothing else is read: a negative weight, a bridge key of another kind or a kappa that is no number is refused.
+    namespace fs = std::filesystem;
+    const fs::path tmp = fs::temp_directory_path() / ("flyx-dspine-dir-test-" + std::to_string(flyx::os::process_id()));
+    std::error_code ec;
+    auto refused = [&](const char* what, auto edit) {
+      fs::remove_all(tmp, ec);
+      fs::copy(fs::path(dir) / "hf_dspine", tmp, fs::copy_options::recursive, ec);
+      nlohmann::json cfg;
+      {
+        std::ifstream in(tmp / "config.json");
+        cfg = nlohmann::json::parse(in);
+      }
+      edit(cfg["dflash_config"]);
+      {
+        std::ofstream out(tmp / "config.json", std::ios::binary | std::ios::trunc);
+        out << cfg.dump();
+      }
+      flyx::ModelFile f;
+      std::string err;
+      check(f.open(model, &err) && !f.add(tmp.string(), &err) && err.find("DSpine") != std::string::npos,
+            std::string("a DSpine config with ") + what + " refused: " + err);
+    };
+    refused("a negative refinement weight",
+            [](nlohmann::json& dc) { dc["selected_prefix_last_write_refine"]["weight"] = -1; });
+    refused("a bridge key of another kind", [](nlohmann::json& dc) { dc["selected_prefix_code_bridge"]["scale"] = 2; });
+    refused("a kappa that is no number", [](nlohmann::json& dc) { dc["selected_prefix_code_bridge"]["kappa"] = "10"; });
     fs::remove_all(tmp, ec);
   }
   std::printf("%s\n", failures ? "FAILED" : "all passed");

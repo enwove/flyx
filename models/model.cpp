@@ -19,7 +19,7 @@ struct DrafterTraits {
   bool tree_only;         // drafts trees over a persistent canvas (DV)
   bool block;             // a parallel block drafter (models/drafters/registry.h)
   bool trees_by_default;  // its trees beside its chains pay on attention-only targets (drafts_trees_by_default)
-  bool q8_beside_float;   // its projections Q8_0 beside a float target lose nothing (drafts_q8_beside_float)
+  flyx_draft_weights beside_float;  // its projections beside a float target (draft_weights_beside_float)
   // A block drafted at once whose drafts a small head then refines one at a time: a step costs little beside the
   // verify row its draft adds, so a round that stops may verify fewer drafts than it has (draft_steps_cheap).  Not a
   // sequential drafter's, whose step is a pass of a layer: with earlier checkpoints allowed Qwen3.8-27B's MTP rounds
@@ -38,12 +38,17 @@ struct DrafterInfo {
 };
 // DSpark's trees and Q8_0 projections: Qwen3-8B bf16 with DeepSpec's dspark_qwen3_8b_block7 on an RTX PRO 6000,
 // DeepSpec's 9 datasets: trees 5.51 tokens a round against 5.01 for chains of 7; Q8_0 5.53 against 5.50 in bf16,
-// 384 against 362 tok/s.
+// 384 against 362 tok/s.  DSpine's NVFP4 layers beside a BF16 target: Qwen3-8B on the same GPU at 15 drafts, the eight
+// prompt sets of docs/benchmarks.md section 6, a round 2-3% faster than with Q8_0 layers at most 1% fewer tokens a
+// round (its walk re-scores the head's top 16 through its bf16 bridge); DFlash2's lost 9% of their acceptance in NVFP4
+// there.  DSpine drafts its block at most (DrafterReach).
 constexpr DrafterInfo kDrafters[] = {
     {Drafter::kMtp, interfaces::DrafterMode::kMtp, "MTP", {.sequential = true}},
     {Drafter::kDFlash2, interfaces::DrafterMode::kDFlash2, "DFlash2", {.block = true}},
     {Drafter::kDSpark, interfaces::DrafterMode::kDSpark, "DSpark",
-     {.block = true, .trees_by_default = true, .q8_beside_float = true, .refines_by_step = true}},
+     {.block = true, .trees_by_default = true, .beside_float = FLYX_DRAFT_WEIGHTS_Q8, .refines_by_step = true}},
+    {Drafter::kDSpine, interfaces::DrafterMode::kDSpine, "DSpine",
+     {.block = true, .beside_float = FLYX_DRAFT_WEIGHTS_NVFP4}},
     {Drafter::kDv, interfaces::DrafterMode::kDv, "DV", {.tree_only = true}},
 };
 
@@ -83,7 +88,7 @@ Drafter drafter_named(std::string_view name) {
 
 bool is_block_drafter(Drafter d) { return drafter_traits(d).block; }
 bool drafts_trees_by_default(Drafter d) { return drafter_traits(d).trees_by_default; }
-bool drafts_q8_beside_float(Drafter d) { return drafter_traits(d).q8_beside_float; }
+flyx_draft_weights draft_weights_beside_float(Drafter d) { return drafter_traits(d).beside_float; }
 
 // Width ladder and intra-round adaptive stopping, driven by drafter traits + target structure:
 // - Sequential drafters (MTP, future EAGLE-4): tensor-core aligned 1, 3, 5, 7, ..., max_drafts (<= 15).

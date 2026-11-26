@@ -159,11 +159,27 @@ struct MtpBlock {
 // DFlash2: a block of `block` rows (the anchor, then mask tokens) through its
 // layers attending to the context K/V, then unary top-k from the head and the
 // selector walk.  Its layers wrap attention and MLP in grouped dynamic convs.
+// DSpine (flyx_dspine_block, regions/layers.cpp dspine_block) is the same block with causal attention, no convs, the
+// code bridge's write after every layer (read and write) and its walk in place of the selector's (DSpineBridge).
 struct DFlashLayer {
   Norm norm, post_norm, q_norm, k_norm;
   Lin w_qkv, w_o, w_gu, w_down;
   Lin attn_proj, mlp_proj;                    // the convs' coefficient deltas (none: conv_taps 0)
   float *attn_base = nullptr, *mlp_base = nullptr;  // and bases, [2][taps][hidden]
+  Lin read, write;                            // DSpine's bridge: read [code, hidden], write [hidden, rank] (bf16)
+};
+// DSpine's code bridge: its codebook, its gate's three projections of a code stacked (gate | pred | prev [3 rank,
+// code]; pv: the pred | prev rows, which the walk takes of a sender's code), the gate's bias, and the last layer's
+// write transposed ([rank, hidden]: a candidate's head row through it, the walk's).  All bf16: the walk's scores are
+// differences of the rows' messages, which coarser copies would move.  code 0: not DSpine.
+struct DSpineBridge {
+  int code = 0, rank = 0, topk = 0;
+  float eps = 0.f;
+  const bf16* codebook = nullptr;             // [vocab, code]
+  Lin packed, pv;
+  float* gate_bias = nullptr;                 // [rank]
+  Lin write_t;
+  explicit operator bool() const { return code > 0; }
 };
 struct DFlashBlock {
   int hidden = 0, nh = 0, nkv = 0, hd = 0, inter = 0;
@@ -185,9 +201,13 @@ struct DFlashBlock {
   // unit_hid (FLYX_MAX_ROWS rows of ones) in its place.
   int draft_from = 1;
   float* unit_hid = nullptr;
+  DSpineBridge dspine;                        // a DSpine drafter's (sel_topk: its topk; no convs, no selector)
   int layers() const { return n_layers; }
   int ctx_width() const { return layers() * 2 * nkv * hd; }
   bool conv() const { return conv_taps > 0; }
+  // A grouped conv's coefficient columns (its taps a group of channels); 0: no convs.
+  int conv_cols() const { return conv() ? conv_taps * (hidden / conv_group) : 0; }
+  const char* name() const { return dspine ? "dspine" : "dflash2"; }  // the plan's node names
   // Its chains drafted with other sequences' in one pass (BatchDFlash, batch.cpp): convolutions, rows from 1, a
   // selector gate, two blocks within a pass's rows; the batch's grouped buffers exist only for such a block.
   bool groups() const { return conv() && draft_from == 1 && !unit_hid && block > 0 && block * 2 <= FLYX_MAX_ROWS; }

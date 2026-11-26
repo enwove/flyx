@@ -11,7 +11,7 @@
 // canvas runs this model's own attention and MLP blocks, and a .flyx file of
 // either may hold the target's own adapters (a V-LoRA, python/convert --lora:
 // the header's "lora" section), on every linear of every layer, in every pass.
-// A model of either takes a DFlash2 drafter made for it (models/drafters/):
+// A model of either takes a DFlash2 or DSpine drafter made for it (models/drafters/):
 // its taps and context nodes go into the programs here; DV still drafts alone.
 #include "models/llama/llama.h"
 
@@ -269,7 +269,7 @@ std::vector<flyx_node> Llama::prefill_program() const {
   return p;
 }
 
-// Plain decoding, a round of given drafts, a DFlash2 round, or DV's round or warm-up (width 0; models/dv.h).
+// Plain decoding, a round of given drafts, a block drafter's round, or DV's round or warm-up (width 0; models/dv.h).
 // Only DV's rounds run its canvas: a round of another kind leaves it behind, and DV's next round starts it over.
 std::vector<flyx_node> Llama::round_program(int width, int d, bool given) const {
   if (!given && d >= 0 && drafters_.at(size_t(d)).kind == Drafter::kDv) {

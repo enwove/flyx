@@ -265,6 +265,7 @@ void test_attention(int hd, int rot, int nh, int nkv, int rows, int ctx, bool ca
                     bool qk_norm = true);
 void test_attention_fp8(int hd, int rot, int nh, int nkv, int rows, int ctx, double theta, bool qk_norm = true);
 void test_attention_tree(int hd, int nh, int nkv, int ctx);
+void test_kv16_saturation();
 void test_strata(int hd, int nh, int nkv, int rows, int ctx, int bits, bool fp8);
 void test_pageable_kv_ops();
 void test_ring_publish();
@@ -290,6 +291,7 @@ void test_sample();
 void test_select();
 void test_stop_decide();
 void test_dv();
+void test_dspine();
 void test_dv_selector_tables(int vocab, int hidden, int rank);
 void test_canvas_input(int slots, int hidden);
 void test_canvas_stats(int slots, int vocab, int hidden, int rank);

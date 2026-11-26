@@ -480,7 +480,8 @@ bool select(const Repo& r, const Name& name, std::vector<RepoFile>* files, std::
   if (safetensors && config)
     return *err = r.id + " is a transformers checkpoint (" +
                   (r.architectures.empty() ? std::string("its config names no architecture") : r.architectures[0]) +
-                  "): flyx reads GGUF files (a GGUF repository of it, org/name-GGUF:QUANT) and DFlash2 or DSpark drafters",
+                  "): flyx reads GGUF files (a GGUF repository of it, org/name-GGUF:QUANT) and block drafters "
+                  "(DFlash2, DSpark, DSpine)",
            false;
   files->clear();
   if (flyx.size() == 1) {

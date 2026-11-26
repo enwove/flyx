@@ -2,8 +2,9 @@
 // Unified speculative drafter discovery, attachment, and program-node emission shared across
 // all target model architectures. Any architecture supplies a TargetSpec (and optional MtpHooks)
 // to automatically support its block drafter (DFlash2: .flyx / HF safetensors / arch="dflash" GGUF; DSpark: DeepSpec's
-// safetensors or .flyx as DFlash2's block, llama.cpp's DSpark GGUF as its own) and MTP.  A model holds one drafter of
-// DFlash2's block at most, and llama.cpp's DSpark GGUF beside it (one DSpark of either).
+// safetensors or .flyx as DFlash2's block, llama.cpp's DSpark GGUF as its own; DSpine: .flyx / HF safetensors) and MTP.
+// A model holds one block drafter of DFlash2's block or DSpine's at most, and llama.cpp's DSpark GGUF beside it (one
+// DSpark of either).
 #pragma once
 
 #include <optional>
@@ -13,6 +14,7 @@
 #include "flyx/backend_abi.h"
 #include "models/drafters/dflash2.h"
 #include "models/drafters/dspark.h"
+#include "models/drafters/dspine.h"
 #include "models/drafters/target.h"
 #include "models/model.h"
 
@@ -52,14 +54,17 @@ class DrafterRegistry {
   void emit_contexts(std::vector<flyx_node>* p) const;
 
  private:
+  // The block drafter's spec, read once: DSpine's own, or DFlash2's block (DFlash2, DSpark).
   const DFlash2Spec& ensure_dflash2_spec(const ModelFile& file, const TargetSpec& target);
   const DSparkSpec& ensure_dspark_spec(const ModelFile& file, const TargetSpec& target);
+  const DSpineSpec& ensure_dspine_spec(const ModelFile& file, const TargetSpec& target);
 
   DrafterSources sources_{};
   int mtp_companion_ = -1;
-  int block_companion_ = -1;   // the companion holding the drafter of DFlash2's block, -1: the model file ("draft")
+  int block_companion_ = -1;   // the companion holding the block drafter (DFlash2's block, DSpine), -1: the model file
   int dspark_companion_ = -1;  // the companion holding llama.cpp's DSpark GGUF
   std::optional<DFlash2Spec> dflash2_spec_;
+  std::optional<DSpineSpec> dspine_spec_;
   std::optional<DSparkSpec> dspark_spec_;
 
   int target_layers_ = 0;
@@ -69,7 +74,7 @@ class DrafterRegistry {
     std::vector<int> taps;
     void emit(std::vector<flyx_node>* p, int position, int flags) const;
   };
-  BlockTaps dflash2_, dspark_;  // DFlash2's block (DFlash2's or DeepSpec's DSpark), llama.cpp's DSpark GGUF
+  BlockTaps block_, dspark_;  // the block drafter's (DFlash2's block or DSpine's), llama.cpp's DSpark GGUF
   std::vector<int> context_blocks_;
 };
 

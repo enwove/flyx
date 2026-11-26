@@ -51,9 +51,9 @@ typedef struct {
   const char* backend_dir;  /* where backend libraries live; NULL = next to the executable */
   int32_t speculative;      /* use the model's drafters (default 1) */
   int32_t verbose;
-  const char* drafter;      /* "mtp" | "dflash2" | "dspark" | "dv" | "all" (chosen every round) | "none" | NULL =
-                               the drafter files' drafters and the model file's MTP layer, else its block drafter
-                               (DFlash2 or DSpark); its DV drafter only when named ("dv", "all").  DV (a
+  const char* drafter;      /* "mtp" | "dflash2" | "dspark" | "dspine" | "dv" | "all" (chosen every round) | "none" |
+                               NULL = the drafter files' drafters and the model file's MTP layer, else its block
+                               drafter (DFlash2, DSpark or DSpine); its DV drafter only when named ("dv", "all").  DV (a
                                Llama file converted with python/convert --dv; docs/design/dv.md) drafts trees, its
                                rounds chosen every round beside plain decoding's and lookup's; with a width, its rounds
                                alone.  Where the backend cannot run its rounds, the model decodes as without it
@@ -69,7 +69,7 @@ typedef struct {
                                "nvfp4" = NVFP4 weights take NVFP4 inputs in prefill passes whatever the file says
                                (a backend that cannot compute them refuses the model) */
   const char* chat_template; /* a Jinja chat template's source, used instead of the model file's; NULL = the file's */
-  const char* drafter_file; /* drafters in files of their own: a GGUF holding the MTP layer, or a DFlash2 drafter file
+  const char* drafter_file; /* drafters in files of their own: a GGUF holding the MTP layer, or a block drafter's file
                                (python/convert --draft alone); several separated by newlines; NULL = none */
   const char* mmproj_file;  /* multimodal projector / vision encoder companion GGUF (e.g. mmproj-BF16.gguf); NULL = none */
   int32_t no_vision;        /* 1 = skip loading any vision encoder even if present in the model or companion */
