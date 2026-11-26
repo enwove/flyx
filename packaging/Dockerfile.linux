@@ -1,0 +1,15 @@
+# Copyright 2026 The flyx Authors. SPDX-License-Identifier: Apache-2.0
+ARG CUDA_IMAGE=nvidia/cuda:13.0.2-devel-ubuntu22.04@sha256:1c517d4fb96528c8999e14e6e6b16d7e2ff9ae8d194fd788d60fdc88e693e982
+FROM ${CUDA_IMAGE}
+RUN apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+    binutils build-essential ca-certificates git libcurl4 ninja-build python3 \
+    && rm -rf /var/lib/apt/lists/*
+
+# Jammy ships Python 3.10. Build and run the pinned test dependencies with 3.12.
+COPY --from=ghcr.io/astral-sh/uv:0.13.10 /uv /usr/local/bin/uv
+ENV UV_PYTHON_INSTALL_DIR=/opt/python VENV=/opt/flyx-venv
+RUN uv venv --seed --python 3.12.12 "$VENV"
+ENV PATH="/opt/flyx-venv/bin:${PATH}"
+COPY tests/requirements.txt /tmp/flyx-requirements.txt
+RUN python -m pip install --no-cache-dir -r /tmp/flyx-requirements.txt \
+    cmake==4.1.3 auditwheel==6.8.2 patchelf==0.19.3.0 wheel==0.45.1
