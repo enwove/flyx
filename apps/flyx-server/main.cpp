@@ -33,6 +33,7 @@
 #include <string_view>
 #include <thread>
 
+#include "apps/common/api_key.h"
 #include "apps/common/defaults.h"
 #include "apps/common/engine_flags.h"
 #include "apps/common/model_source.h"
@@ -229,10 +230,7 @@ ServeArgs parse_args(int argc, char** argv) {
   }
   sampling_overrides.apply(&a.cfg.think_defaults);
   sampling_overrides.apply(&a.cfg.plain_defaults);
-  if (a.cfg.api_key.empty()) {
-    a.cfg.api_key = os::getenv_str(env::kApiKey);
-    if (a.cfg.api_key.empty()) a.cfg.api_key = os::getenv_str(env::kKeyAlias);
-  }
+  if (a.cfg.api_key.empty()) a.cfg.api_key = apps::api_key_from_env();
   for (const std::string& d : apps::models_dirs_from_env()) a.models_dirs.push_back(d);
   return a;
 }

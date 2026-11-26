@@ -353,9 +353,10 @@ void add_manage_routes(httplib::Server& http, Server* s) {
     send_json(r, 200, s->host->status());
   });
   auto hub_config_json = []() -> ojson {
-    return {{"endpoint", hub::endpoint()},
-            {"default_endpoint", "https://huggingface.co"},
-            {"source", hub::endpoint_source()},
+    const auto endpoint = hub::resolve_endpoint();
+    return {{"endpoint", endpoint.value},
+            {"default_endpoint", hub::kDefaultEndpoint},
+            {"source", endpoint.source},
             {"offline", hub::offline()}};
   };
   http.Get("/v1/hub/config", [s, hub_config_json](const httplib::Request& q, httplib::Response& r) {
@@ -376,7 +377,7 @@ void add_manage_routes(httplib::Server& http, Server* s) {
     if (!hub::normalize_endpoint(raw, &normalized, &err)) return error(r, 400, err, "invalid_request_error");
     // Clear the saved override when emptied, or when explicitly set back to huggingface.co with no HF_ENDPOINT env.
     const std::string saved =
-        normalized.empty() || (normalized == "https://huggingface.co" && os::getenv_str(env::kHfEndpoint).empty())
+        normalized.empty() || (normalized == hub::kDefaultEndpoint && os::getenv_str(env::kHfEndpoint).empty())
             ? std::string()
             : normalized;
     if (!hub::set_endpoint(saved, &err)) return error(r, 400, err, "invalid_request_error");
@@ -545,7 +546,8 @@ void add_manage_routes(httplib::Server& http, Server* s) {
     if (!require_manage(*s, q, r, "loading models")) return;
     ojson models = ojson::array();
     for (Listed& l : listing(*s)) models.push_back(std::move(l.json));
-    send_json(r, 200, {{"cache", hub::cache_dir()}, {"cache_from", hub::cache_source()}, {"dirs", s->models_dirs},
+    const auto cache = hub::resolve_cache_dir();
+    send_json(r, 200, {{"cache", cache.value}, {"cache_from", cache.source}, {"dirs", s->models_dirs},
                        {"models", models}});
   });
   http.Delete("/v1/hub/cached", [s](const httplib::Request& q, httplib::Response& r) {

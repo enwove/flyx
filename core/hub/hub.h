@@ -162,15 +162,22 @@ std::vector<Cached> cached();
 bool remove_cached(const std::string& repo, const std::string& commit, const std::vector<std::string>& paths,
                    uint64_t* freed, std::string* err);
 
+struct ResolvedSetting {
+  std::string value, source;
+};
+
+ResolvedSetting resolve_cache_dir();  // source: "HF_HUB_CACHE" | "HF_HOME" | "XDG_CACHE_HOME" | "default"
 std::string cache_dir();
-std::string cache_source();  // "HF_HUB_CACHE" | "HF_HOME" | "XDG_CACHE_HOME" | "default"
+std::string cache_source();
+inline constexpr char kDefaultEndpoint[] = "https://huggingface.co";
 // Normalizes and validates a Hub endpoint URL (e.g. "hf-mirror.com" -> "https://hf-mirror.com", trimming trailing
 // slashes). Empty input clears any override (falling back to HF_ENDPOINT or https://huggingface.co).
 bool normalize_endpoint(const std::string& raw, std::string* normalized, std::string* err);
 // Sets or clears a process-wide Hub endpoint override; empty restores HF_ENDPOINT / https://huggingface.co.
 bool set_endpoint(const std::string& url, std::string* err = nullptr);
+ResolvedSetting resolve_endpoint();  // source: "setting" | "HF_ENDPOINT" | "default"
 std::string endpoint();
-std::string endpoint_source();  // "setting" | "HF_ENDPOINT" | "default"
+std::string endpoint_source();
 bool offline();
 
 }  // namespace flyx::hub
