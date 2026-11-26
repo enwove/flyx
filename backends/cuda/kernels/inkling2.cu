@@ -726,6 +726,11 @@ __global__ void __launch_bounds__(kLoopLinearBlock)
 // ---- shortconv_pass & shortconv_fold ------------------------------------------------------
 constexpr int kMaxShortConv = 64;
 
+// The standalone convolution stores this float before a residual add. Preserve that rounding in fused paths.
+__device__ __forceinline__ float shortconv_output(float x, float taps, float inv_scale) {
+  return __fmul_rn(x + taps, inv_scale);
+}
+
 __global__ void k_shortconv_pass(const float* __restrict__ x, int ldx, const float* __restrict__ w,
                                  const float* __restrict__ dyn, float* __restrict__ win, size_t win_stride, int in_sel,
                                  int next_sel, int skip, float* __restrict__ replay, size_t replay_stride,
@@ -772,7 +777,7 @@ __global__ void k_shortconv_pass(const float* __restrict__ x, int ldx, const flo
         acc = __fmaf_rn(hv, dh[lag], acc);
       }
     }
-    const float y = (xr + acc) * inv_scale;
+    const float y = shortconv_output(xr, acc, inv_scale);
     float* dst = out + size_t(r) * ldo + c;
     const float base = res_src ? res_src[size_t(r) * ldo + c] : *dst;
     *dst = accumulate ? (base + y) : y;
@@ -851,7 +856,7 @@ __device__ __forceinline__ void
 #pragma unroll
         for (int k = 0; k < 3; ++k) acc = __fmaf_rn(hv[u][k], wv[u][k], acc);
         acc = __fmaf_rn(xr[u], wv[u][3], acc);
-        const float y = (xr[u] + acc) * inv_scale;
+        const float y = shortconv_output(xr[u], acc, inv_scale);
         const float xnew = push ? y : (xs[u] + y);
         if (push) bank[(size_t(n_blocks) * rows + r) * H + c] = xs[u];
         x_dst[size_t(r) * H + c] = xnew;
@@ -888,7 +893,7 @@ __device__ __forceinline__ void
       }
       acc = __fmaf_rn(xr, __ldg(wrow + hist), acc);
     }
-    const float y = (xr + acc) * inv_scale;
+    const float y = shortconv_output(xr, acc, inv_scale);
     const float xs = x_src[size_t(r) * H + c];
     const float xnew = push ? y : (xs + y);
     if (push) bank[(size_t(n_blocks) * rows + r) * H + c] = xs;
