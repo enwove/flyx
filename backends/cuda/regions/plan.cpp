@@ -310,7 +310,8 @@ void forward_target(const Pass& ps, int copy_prefix) {
 
 bool sequential_draft(const flyx_plan* p) {
   for (size_t i = 0; i < p->nodes.size(); ++i)
-    if (p->nodes[i].kind == FLYX_NODE_DRAFT && p->block[i]) return std::holds_alternative<MtpBlock>(*p->block[i]);
+    if (p->nodes[i].kind == FLYX_NODE_DRAFT && p->block[i])
+      return std::holds_alternative<MtpBlock>(*p->block[i]) || std::holds_alternative<DSparkBlock>(*p->block[i]);
   return false;
 }
 
@@ -323,7 +324,7 @@ void draft_step_range(const Pass& ps, int start, int end) {
     } else if (const auto* d = std::get_if<DFlashBlock>(ps.p->block[i])) {
       draft_block(ps.s, *d, end, ps.v.L, ps.p->nodes[i].arg1 == FLYX_DRAFT_TREE, fused);
     } else if (const auto* ds = std::get_if<DSparkBlock>(ps.p->block[i])) {
-      dspark_draft(ps.s, *ds, end, ps.v.L, fused);
+      dspark_draft(ps.s, *ds, end, ps.v.L, fused, start, ps.p->width);
     }
     return;
   }

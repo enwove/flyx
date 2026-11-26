@@ -652,8 +652,8 @@ void test_stop_decide() {
     pol.widths[i] = ws[i];
     pol.costs[i] = cs[i];
   }
-  for (int k = 0; k < FLYX_MAX_ROWS; ++k) pol.p_pos[k] = k < 7 ? 0.80f : 0.72f;
-  pol.w_bias = -0.35f;
+  for (int k = 0; k < FLYX_MAX_ROWS; ++k) pol.p_pos[k] = std::max(0.20f, 0.90f - 0.045f * float(k));
+  pol.w_bias = -0.60f;
   pol.w_margin = 0.27f;
   pol.w_logit_p = 0.20f;
   pol.lambda = 0.165f;
@@ -689,20 +689,21 @@ void test_stop_decide() {
     CK(cudaMemcpy(dmargin, hm.data(), sizeof(float) * FLYX_MAX_ROWS, cudaMemcpyHostToDevice));
 
     double ref_s = 1.0;
+    StopCondHandles zero_h{};
     for (int b = 0; b < cur.n_buckets; ++b) {
       const int w0 = b == 0 ? 0 : cur.widths[b - 1];
       const int w1 = cur.widths[b];
-      const int want_c = ops::stop_decide_step_ref(dp.data(), dm.data(), cur, b, w0, w1, &ref_s);
-      stop_decide_step(dprob, dmargin, dpol, dst, b, w0, w1, 0, 0, 0);
+      int want_v = b;
+      const int want_c = ops::stop_decide_step_ref(dp.data(), dm.data(), cur, b, w0, w1, &ref_s, &want_v);
+      stop_decide_step(dprob, dmargin, dpol, dst, b, w0, w1, 0, zero_h, 0);
       DevStopState got{};
       CK(cudaMemcpy(&got, dst, sizeof(got), cudaMemcpyDeviceToHost));
       got_s.push_back(double(got.survival));
       want_s.push_back(ref_s);
-      step_ok = step_ok && (got.decision == want_c);
+      step_ok = step_ok && (got.decision == want_c) && (got.verify_bucket == want_v);
     }
 
     const int want_b = ops::stop_decide_block_ref(dp.data(), dm.data(), cur);
-    StopCondHandles zero_h{};
     stop_decide_block(dprob, dmargin, dpol, dst, zero_h, 0);
     DevStopState got_b{};
     CK(cudaMemcpy(&got_b, dst, sizeof(got_b), cudaMemcpyDeviceToHost));
@@ -720,13 +721,14 @@ void test_stop_decide() {
   for (int i = 0; i < FLYX_MAX_STOP_BUCKETS; ++i) oob.widths[i] = FLYX_MAX_ROWS + 32;
   CK(cudaMemcpy(dpol, &oob, sizeof(oob), cudaMemcpyHostToDevice));
   StopCondHandles zero_h{};
-  stop_decide_step(dprob, dmargin, dpol, dst, 0, 0, FLYX_MAX_ROWS + 5, 0, 0, 0);
+  stop_decide_step(dprob, dmargin, dpol, dst, 0, 0, FLYX_MAX_ROWS + 5, 0, zero_h, 0);
   DevStopState got_oob_s{};
   CK(cudaMemcpy(&got_oob_s, dst, sizeof(got_oob_s), cudaMemcpyDeviceToHost));
   stop_decide_block(dprob, dmargin, dpol, dst, zero_h, 0);
   DevStopState got_oob_b{};
   CK(cudaMemcpy(&got_oob_b, dst, sizeof(got_oob_b), cudaMemcpyDeviceToHost));
   const bool oob_ok = std::isfinite(got_oob_s.survival) && std::isfinite(got_oob_b.survival) &&
+                      got_oob_s.verify_bucket >= 0 && got_oob_s.verify_bucket < FLYX_MAX_STOP_BUCKETS &&
                       got_oob_b.decision >= 0 && got_oob_b.decision < FLYX_MAX_STOP_BUCKETS;
   std::printf("  %-4s stop_decide clamps out-of-bounds n_buckets and widths\n", oob_ok ? "ok" : "FAIL");
   g_fail += !oob_ok;

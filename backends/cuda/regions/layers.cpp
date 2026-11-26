@@ -1186,67 +1186,72 @@ void dspark_context(const Pass& ps, const DSparkBlock& b, bool /*fused*/) {
   }
 }
 
-void dspark_draft(flyx_seq* s, const DSparkBlock& b, int width, const Launch& L, bool fused) {
+void dspark_draft(flyx_seq* s, const DSparkBlock& b, int width, const Launch& L, bool fused, int start,
+                  int total_width) {
   const auto* m = s->m;
   const auto& E = block<EmbedBlock>(m, b.embed);
   const auto& head = block<HeadBlock>(m, b.head);
-  const int B = std::min(b.block, width + 1);
+  const int total = total_width > 0 ? total_width : width;
+  const int B = std::min(b.block, total + 1);
   const int H = b.hidden, nh = b.nh, nkv = b.nkv, hd = b.hd, I = b.inter;
   const int V = head.vocab, Rk = b.markov_rank, nqkv = (nh + 2 * nkv) * hd;
-  cudaStream_t st = L.st;
-
-  // Row 0: raw anchor embedding -> DSpark tok_norm; rows 1..B-1: mask_embd[0..B-2]; init prev & Markov state.
-  build_rows(s->P, nullptr, 0, s->dtok, 1, st);
-  embed_tokens(E, s->dtok, s->ds_h, 1, st);
-  dspark_prep_block(s->P, s->ds_h, b.tok_norm.w, b.tok_norm.eps, b.mask_embd, B, H, s->ds_x, s->ds_prev, s->ds_state,
-                    Rk, st);
-
-  const float scale = 1.f / std::sqrt(float(hd));
-  for (int j = 0; j < b.layers(); ++j) {
-    const auto& l = block<DSparkLayer>(m, b.first_layer + j);
-    const KvBuf& kv = s->kv[size_t(l.kv)];
-    const int eff_win = l.window > 0 ? l.window : kv.window;
-    if (l.stacked_qkv) {
-      norm_project(s->ds_x, s->ds_h, s->ds_proj, s->ld_ds_proj, B, l.norm, l.w_qkv, nqkv, H, L, fused);
-    } else {
-      rmsnorm(s->ds_x, H, l.norm.w, l.norm.offset, l.norm.eps, s->ds_h, H, B, H, st);
-      gemm(s->ds_h, H, l.w_q, nh * hd, H, s->ds_proj, s->ld_ds_proj, B, false, L);
-      gemm(s->ds_h, H, l.w_k, nkv * hd, H, s->ds_proj + nh * hd, s->ld_ds_proj, B, false, L);
-      gemm(s->ds_h, H, l.w_v, nkv * hd, H, s->ds_proj + (nh + nkv) * hd, s->ld_ds_proj, B, false, L);
-    }
-    attn_prep(s->ds_proj, s->ld_ds_proj, 0, nh * hd, (nh + nkv) * hd, l.q_norm.w, l.k_norm.w, l.q_norm.offset,
-              l.q_norm.eps, b.theta, hd, nh, nkv, hd, B, s->P, kPosPosition, false, s->ds_q, kv.ref(), st);
-    dspark_block_attention(s->ds_q, kv.k16(0), kv.v16(0), nh, nkv, hd, B, eff_win, scale, s->P, s->ds_act, nh * hd,
-                           s->own.part, kRoundSplits, L, kv.ring);
-    gemm(s->ds_act, nh * hd, l.w_o, H, nh * hd, s->ds_x, H, B, true, L);
-    if (l.stacked_gu) {
-      norm_project(s->ds_x, s->ds_h, s->ds_proj, s->ld_ds_proj, B, l.post_norm, l.w_gu, 2 * I, H, L, fused);
-    } else {
-      rmsnorm(s->ds_x, H, l.post_norm.w, l.post_norm.offset, l.post_norm.eps, s->ds_h, H, B, H, st);
-      gemm(s->ds_h, H, l.w_gate, I, H, s->ds_proj, s->ld_ds_proj, B, false, L);
-      gemm(s->ds_h, H, l.w_up, I, H, s->ds_proj + I, s->ld_ds_proj, B, false, L);
-    }
-    if (fused) {
-      swiglu_split(s->ds_proj, s->ld_ds_proj, I, B, L, l.w_down.q8_inputs());
-      gemm_presplit(l.w_down, H, I, s->ds_x, H, B, true, L);
-    } else {
-      swiglu(s->ds_proj, s->ld_ds_proj, I, s->ds_act, s->ld_ds_act, B, st);
-      gemm(s->ds_act, s->ld_ds_act, l.w_down, H, I, s->ds_x, H, B, true, L);
-    }
-  }
-
-  // The drafts' logits are softcap(head(hn) + markov_w2(markov) + bias), a step's Markov vector made from the draft
-  // before it.  With 1-bit copies of both heads (loader/weights.cpp) the rows' rough head scores are made at once and
-  // each step adds its rough Markov scores, picks its candidates from the sum and scores only those exactly on both
-  // heads (draft_head_pick_additive_step); picked from the head's rough scores alone, the drafts the Markov head
-  // moves up were lost.  Otherwise both heads are read whole: the head once for every row, the Markov head a step.
-  const int nr = std::min(width, B - 1);
-  rmsnorm(s->ds_x + H, H, b.norm.w, b.norm.offset, b.norm.eps, s->ds_hn, H, nr, H, st);
+  const int nr_total = std::min(total, B - 1);
+  const int nr_end = std::min(width, nr_total);
   const bool two_stage = draft_head_additive_ready(head, b.markov_w2, b.markov_coarse, Rk);
   const int ld = two_stage ? std::max(V, kDraftPickFloats) : V;
-  if (two_stage) gemm_sign_rough(s->ds_hn, H, head.coarse, V, H, s->logits, ld, nr, L);
-  else draft_logits(head, s->ds_hn, H, s->logits, nr, L);
-  for (int step = 0; step < nr; ++step) {
+  cudaStream_t st = L.st;
+
+  if (start == 0) {
+    // Row 0: raw anchor embedding -> DSpark tok_norm; rows 1..B-1: mask_embd[0..B-2]; init prev & Markov state.
+    build_rows(s->P, nullptr, 0, s->dtok, 1, st);
+    embed_tokens(E, s->dtok, s->ds_h, 1, st);
+    dspark_prep_block(s->P, s->ds_h, b.tok_norm.w, b.tok_norm.eps, b.mask_embd, B, H, s->ds_x, s->ds_prev, s->ds_state,
+                      Rk, st);
+
+    const float scale = 1.f / std::sqrt(float(hd));
+    for (int j = 0; j < b.layers(); ++j) {
+      const auto& l = block<DSparkLayer>(m, b.first_layer + j);
+      const KvBuf& kv = s->kv[size_t(l.kv)];
+      const int eff_win = l.window > 0 ? l.window : kv.window;
+      if (l.stacked_qkv) {
+        norm_project(s->ds_x, s->ds_h, s->ds_proj, s->ld_ds_proj, B, l.norm, l.w_qkv, nqkv, H, L, fused);
+      } else {
+        rmsnorm(s->ds_x, H, l.norm.w, l.norm.offset, l.norm.eps, s->ds_h, H, B, H, st);
+        gemm(s->ds_h, H, l.w_q, nh * hd, H, s->ds_proj, s->ld_ds_proj, B, false, L);
+        gemm(s->ds_h, H, l.w_k, nkv * hd, H, s->ds_proj + nh * hd, s->ld_ds_proj, B, false, L);
+        gemm(s->ds_h, H, l.w_v, nkv * hd, H, s->ds_proj + (nh + nkv) * hd, s->ld_ds_proj, B, false, L);
+      }
+      attn_prep(s->ds_proj, s->ld_ds_proj, 0, nh * hd, (nh + nkv) * hd, l.q_norm.w, l.k_norm.w, l.q_norm.offset,
+                l.q_norm.eps, b.theta, hd, nh, nkv, hd, B, s->P, kPosPosition, false, s->ds_q, kv.ref(), st);
+      dspark_block_attention(s->ds_q, kv.k16(0), kv.v16(0), nh, nkv, hd, B, eff_win, scale, s->P, s->ds_act, nh * hd,
+                             s->own.part, kRoundSplits, L, kv.ring);
+      gemm(s->ds_act, nh * hd, l.w_o, H, nh * hd, s->ds_x, H, B, true, L);
+      if (l.stacked_gu) {
+        norm_project(s->ds_x, s->ds_h, s->ds_proj, s->ld_ds_proj, B, l.post_norm, l.w_gu, 2 * I, H, L, fused);
+      } else {
+        rmsnorm(s->ds_x, H, l.post_norm.w, l.post_norm.offset, l.post_norm.eps, s->ds_h, H, B, H, st);
+        gemm(s->ds_h, H, l.w_gate, I, H, s->ds_proj, s->ld_ds_proj, B, false, L);
+        gemm(s->ds_h, H, l.w_up, I, H, s->ds_proj + I, s->ld_ds_proj, B, false, L);
+      }
+      if (fused) {
+        swiglu_split(s->ds_proj, s->ld_ds_proj, I, B, L, l.w_down.q8_inputs());
+        gemm_presplit(l.w_down, H, I, s->ds_x, H, B, true, L);
+      } else {
+        swiglu(s->ds_proj, s->ld_ds_proj, I, s->ds_act, s->ld_ds_act, B, st);
+        gemm(s->ds_act, s->ld_ds_act, l.w_down, H, I, s->ds_x, H, B, true, L);
+      }
+    }
+
+    // The drafts' logits are softcap(head(hn) + markov_w2(markov) + bias), a step's Markov vector made from the draft
+    // before it.  With 1-bit copies of both heads (loader/weights.cpp) the rows' rough head scores are made at once and
+    // each step adds its rough Markov scores, picks its candidates from the sum and scores only those exactly on both
+    // heads (draft_head_pick_additive_step); picked from the head's rough scores alone, the drafts the Markov head
+    // moves up were lost.  Otherwise both heads are read whole: the head once for every row, the Markov head a step.
+    rmsnorm(s->ds_x + H, H, b.norm.w, b.norm.offset, b.norm.eps, s->ds_hn, H, nr_total, H, st);
+    if (two_stage) gemm_sign_rough(s->ds_hn, H, head.coarse, V, H, s->logits, ld, nr_total, L);
+    else draft_logits(head, s->ds_hn, H, s->logits, nr_total, L);
+  }
+  for (int step = start; step < nr_end; ++step) {
     if (b.markov_w1_blk.data) embed_blocks(s->ds_prev, b.markov_w1_blk, Rk, s->ds_joint + Rk, 1, st);
     else embed(s->ds_prev, b.markov_w1, Rk, s->ds_joint + Rk, 1, st);
     dspark_markov_pack(s->P, s->ds_state, nullptr, s->ds_hn + size_t(step) * H, s->ring, Rk, H, s->ds_joint, st);

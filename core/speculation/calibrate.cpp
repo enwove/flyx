@@ -74,35 +74,40 @@ void time_rounds(const flyx_backend_api* api, flyx_bmodel* bm, flyx_plan* prefil
     const auto& rounds = *grp.rounds;
     const auto& labels = *grp.labels;
     auto& ms = *grp.out;
-    for (size_t i = 0; ok && i < rounds.size(); ++i) {
-      // On the very first round after model load, GPUs often sit in an idle P-state while weights streamed from disk.
-      // Run a short untimed burst (up to ~200 ms / 12 launches) so clocks settle before timing width 0.
-      if (!clocks_warm) {
-        ok = scratch.start(g);
-        if (ok) ok = api->launch(rounds[i], seq, &g) == 0 && api->read(seq, &r) == 0;  // capture graph / load modules
-        const double wake_t0 = os::now_ms();
-        int in_flight = 0;
-        for (int w = 0; ok && w < 12; ++w) {
-          if (w >= 2 && os::now_ms() - wake_t0 >= 200.0) break;
-          ok = api->launch(rounds[i], seq, &g) == 0;
-          if (++in_flight == FLYX_MAX_IN_FLIGHT && ok) {
-            ok = api->read(seq, &r) == 0;
-            --in_flight;
+    // Interleaved whole-sweep timing: when repeats >= 2, sweep 0 warms and captures every plan's CUDA graph so clocks
+    // settle across the full model, and subsequent sweeps time all plans contiguously in one steady-state pass.
+    // We always keep a complete sweep vector (never element-wise min across sweeps) so plans measured in different GPU
+    // boost/power regimes are never mixed against each other.
+    const int reps = std::max(1, grp.repeats);
+    const int warm = 1, timed = 3;
+    double best_sum = 0.0;
+    bool have_best = false;
+    for (int rep = 0; ok && rep < reps; ++rep) {
+      std::vector<double> sweep(rounds.size(), 1.0);
+      double sweep_sum = 0.0;
+      for (size_t i = 0; ok && i < rounds.size(); ++i) {
+        // On the very first round after model load, GPUs often sit in an idle P-state while weights streamed from disk.
+        // Run a short untimed burst (up to ~200 ms / 12 launches) so clocks settle before timing width 0.
+        if (!clocks_warm) {
+          ok = scratch.start(g);
+          if (ok) ok = api->launch(rounds[i], seq, &g) == 0 && api->read(seq, &r) == 0;  // capture graph / load modules
+          const double wake_t0 = os::now_ms();
+          int in_flight = 0;
+          for (int w = 0; ok && w < 12; ++w) {
+            if (w >= 2 && os::now_ms() - wake_t0 >= 200.0) break;
+            ok = api->launch(rounds[i], seq, &g) == 0;
+            if (++in_flight == FLYX_MAX_IN_FLIGHT && ok) {
+              ok = api->read(seq, &r) == 0;
+              --in_flight;
+            }
+          }
+          while (ok && in_flight > 0 && api->read(seq, &r) == 0) --in_flight;
+          clocks_warm = true;
+          if (!ok) {
+            if (verbose) log::warn("flyx: calibrating %s failed: %s", labels[i].c_str(), api->last_error());
+            break;
           }
         }
-        while (ok && in_flight > 0 && api->read(seq, &r) == 0) --in_flight;
-        clocks_warm = true;
-        if (!ok) {
-          if (verbose) log::warn("flyx: calibrating %s failed: %s", labels[i].c_str(), api->last_error());
-          break;
-        }
-      }
-      // One round untimed (its graph captured, its kernels' modules loaded), then three timed: the device takes the
-      // same time for the same work, to well under the 2 ms one more draft row costs the 27B.  The group's repeats,
-      // the fastest kept.
-      const int warm = 1, timed = 3;
-      double best = 0;
-      for (int rep = 0; ok && rep < std::max(1, grp.repeats); ++rep) {
         ok = scratch.start(g);
         double t0 = 0;
         int in_flight = 0;
@@ -119,10 +124,22 @@ void time_rounds(const flyx_backend_api* api, flyx_bmodel* bm, flyx_plan* prefil
         }
         while (ok && in_flight > 0 && api->read(seq, &r) == 0) --in_flight;
         const double t = (os::now_ms() - t0) / timed;
-        if (ok && (rep == 0 || t < best)) best = t;
+        if (ok) {
+          sweep[i] = t;
+          sweep_sum += t;
+        } else if (verbose) {
+          log::warn("flyx: calibrating %s failed: %s", labels[i].c_str(), api->last_error());
+        }
       }
-      if (ok) ms[i] = best;
-      else if (verbose) log::warn("flyx: calibrating %s failed: %s", labels[i].c_str(), api->last_error());
+      if (ok && (reps == 1 || rep > 0)) {
+        if (!have_best || sweep_sum < best_sum) {
+          ms = sweep;
+          best_sum = sweep_sum;
+          have_best = true;
+        }
+      } else if (ok && !have_best) {
+        ms = sweep;
+      }
     }
     if (verbose && !rounds.empty()) {
       std::string line = std::string("flyx: ") + grp.what + " cost:";

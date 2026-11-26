@@ -35,18 +35,10 @@ DrafterTraits drafter_traits(Drafter d) {
     case Drafter::kMtp: return {/*sequential=*/true, false, false};
     case Drafter::kDFlash2: return {false, false, /*stretch_block=*/true};
     case Drafter::kDv: return {false, /*tree_only=*/true, false};
-    case Drafter::kDSpark: return {false, false, false};  // a block at once, its block at most
+    case Drafter::kDSpark: return {false, false, false};  // block backbone + Markov head, its block at most
   }
   return {false, false, false};
 }
-
-// The drafts a parallel block drafter's adaptive round drafts at most on a target whose verify cost climbs steeply
-// with width; it verifies 1, 2 or 3 of them.  Inkling-2-Mini (RTX 5070 Ti): DSpark's fourth to seventh drafts added
-// 0.07 to 0.2 tokens a round while every round drafted them, and its stop rule verified 3 or more of 7 in half the
-// rounds; capped, adaptive DSpark 151.5 -> 156.3 tok/s on chat prompts and 169.5 -> 172.3 on thinking ones, DFlash2
-// 166.1 -> 169.7 on chat.  The widths past it stay fixed rounds, for an explicit --width and the scheduler's
-// batched rounds; where the round controller prefers one of them, the adaptive round runs (RoundChooser).
-constexpr int kSteepBlockAdaptiveDrafts = 3;
 }  // namespace
 
 // Width ladder and intra-round adaptive stopping, driven by drafter traits + target structure:
@@ -87,14 +79,12 @@ std::vector<int> Model::adaptive_checkpoints(int d) const {
   // Dense targets paired with block drafters have nearly flat verify cost across widths (RTX PRO 6000, QUASAR NVFP4
   // 27B + DFlash2: adaptive 425-439 vs fixed 443-494 tok/s on code) and avoid extra verify subgraphs in VRAM.
   if (!tr.sequential && !verify_scales_with_width_) return {};
-  // Keep a parallel block drafter's adaptive graph within its trained block (b.max_drafts); stretching every adaptive
-  // round past the trained block degrades bidirectional draft quality and adds draft/verify work (stretched widths
-  // stay in draft_widths for explicit --width or widened high-acceptance runs).  On a steep-verify target its adaptive
-  // round drafts at most kSteepBlockAdaptiveDrafts.
-  const int most = tr.sequential ? b.max_drafts : std::min(b.max_drafts, kSteepBlockAdaptiveDrafts);
+  // Keep a drafter's adaptive graph within its trained block (b.max_drafts); stretching every adaptive round past the
+  // trained block degrades bidirectional draft quality and adds draft/verify work (stretched widths stay in
+  // draft_widths for explicit --width or widened high-acceptance runs).
   std::vector<int> cps;
   for (int w : draft_widths(d))
-    if (w <= most) cps.push_back(w);
+    if (w <= b.max_drafts) cps.push_back(w);
   return cps.size() > 1 ? cps : std::vector<int>{};
 }
 

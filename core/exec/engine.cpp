@@ -313,16 +313,45 @@ bool Engine::build_and_calibrate_plans(double* t_plans, double* t_rounds, std::s
     bool restarting = false;
     for (size_t i = 0; i < plans_.widths.size(); ++i)
       restarting = restarting || (plans_.drafters[i] >= 0 && plans_.widths[i] == 0);
-    std::vector<spec::TimedGroup> groups = {{&plans_.rounds, &labels, "round", &round_ms_, restarting ? 2 : 1}};
-    if (!plans_.given.empty()) groups.push_back({&plans_.given, &given_labels, "lookup round", &lookup_ms_});
+    // Run two interleaved sweeps across all round plans so graphs capture on sweep 0 and sweep 1 re-times every width
+    // at settled GPU clocks, rejecting single-width OS/WDDM spikes.
+    std::vector<spec::TimedGroup> groups = {{&plans_.rounds, &labels, "round", &round_ms_, 2}};
+    if (!plans_.given.empty()) groups.push_back({&plans_.given, &given_labels, "lookup round", &lookup_ms_, 1});
     spec::time_rounds(api_, bm_, plans_.prefill, prefill_chunk_, prompt, groups, opt_.verbose);
+    // Guard against a residual single-width preemption inverting ascending chain widths or making a drafted width
+    // measure faster than plain decoding: take one whole-sweep retry (never mixing elements across different clock
+    // regimes) and adopt it when cleaner.
+    auto chain_inversions = [&](const std::vector<double>& c) {
+      int bad = 0;
+      double plain_c = 0.0;
+      for (size_t i = 0; i < plans_.widths.size() && i < c.size(); ++i)
+        if (plans_.drafters[i] < 0 && plans_.widths[i] == 0) plain_c = c[i];
+      for (size_t i = 0; i < plans_.widths.size() && i < c.size(); ++i) {
+        if (plans_.drafters[i] < 0 || plans_.drafter_trees[i] || plans_.widths[i] <= 0) continue;
+        if (plain_c > 0.0 && c[i] < plain_c * 0.98) ++bad;
+        for (size_t j = 0; j < i; ++j)
+          if (plans_.drafters[j] == plans_.drafters[i] && !plans_.drafter_trees[j] &&
+              plans_.widths[j] > 0 && plans_.widths[j] < plans_.widths[i] &&
+              c[i] < c[j] * 0.995)
+            ++bad;
+      }
+      return bad;
+    };
+    const int inv0 = chain_inversions(round_ms_);
+    if (inv0 > 0) {
+      std::vector<double> extra;
+      spec::time_rounds(api_, bm_, plans_.prefill, prefill_chunk_, prompt,
+                        {{&plans_.rounds, &labels, "round (retry)", &extra, 2}}, opt_.verbose);
+      if (extra.size() == round_ms_.size() && chain_inversions(extra) <= inv0) round_ms_ = std::move(extra);
+    }
     round_ms_at_ = static_cast<int>(prompt.size());
     // And after a longer context: a round's attention reads every key, the more the more rows it has (DV's 32 verify
     // rows and 32 canvas rows a round of 31).  Its cost per token of context past the first.
     const int longer = restarting ? long_calibration(opt_.max_ctx, prefill_align_) : 0;
-    if (longer > round_ms_at_) {
+    if (longer > round_ms_at_ && !prompt.empty()) {
       std::vector<int32_t> context;  // the prompt repeated, its last copy whole: both timings draft after its end
-      while (static_cast<int>(context.size()) < longer) context.insert(context.begin(), prompt.begin(), prompt.end());
+      context.reserve(static_cast<size_t>(longer) + prompt.size());
+      while (static_cast<int>(context.size()) < longer) context.insert(context.end(), prompt.begin(), prompt.end());
       context.erase(context.begin(), context.end() - longer);
       const std::string what = "round at " + std::to_string(longer) + " tokens";
       auto time_at = [&](const std::vector<int32_t>& tokens, const std::string& label) {

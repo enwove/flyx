@@ -1504,12 +1504,13 @@ void gemm_w4a4(const uint8_t* Aq, const uint8_t* As, const float* Ar, const uint
 struct DevStopState {
   float survival;
   int32_t decision;
+  int32_t verify_bucket;
 };
 struct StopCondHandles {
   unsigned long long h[FLYX_MAX_STOP_BUCKETS];
 };
 void stop_decide_step(const float* prob, const float* margin, const flyx_stop_policy* pol, DevStopState* state,
-                      int bucket, int prev_w, int cur_w, unsigned long long h_next_draft, unsigned long long h_ver,
+                      int bucket, int prev_w, int cur_w, unsigned long long h_next_draft, StopCondHandles h_ver,
                       cudaStream_t st);
 void stop_decide_block(const float* prob, const float* margin, const flyx_stop_policy* pol, DevStopState* state,
                        StopCondHandles h_ver, cudaStream_t st);

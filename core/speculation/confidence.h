@@ -44,6 +44,8 @@ class ConfidenceStopper {
   std::array<float, FLYX_MAX_ROWS> pos_hits_{};
   std::array<float, FLYX_MAX_ROWS> pos_trials_{};
   float tot_hits_ = 0.f, tot_trials_ = 0.f;
+  // Decayed renewal-reward numerator (tokens) and denominator (ms) so lambda = E[T] / E[C].
+  float tok_ema_ = 1.f, ms_ema_ = 1.f;
 };
 
 }  // namespace flyx
