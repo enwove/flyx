@@ -164,7 +164,7 @@ function Serving({ tm, again, retry, browse }) {
 
 // A drafter given as a GGUF is a DFlash2 or MTP file; anything else a DFlash2 drafter.
 const kindOf = (d) => /\.gguf$/i.test(d)
-  ? (/(?:^|[\\/:-])dflash2?(?:[\\/._-]|$)/i.test(d) ? "dflash2" : "mtp")
+  ? (/(?:^|[\\/:-])(?:dflash2?|dspark)(?:[\\/._-]|$)/i.test(d) ? "dflash2" : "mtp")
   : "dflash2";
 const normVisionDev = (v) => (v === "host" || v === "cpu") ? "host" : v === "gpu" ? "gpu" : v === "auto" ? "auto" : "disk";
 const normVisionQuant = (v) => (v === "exact" || v === "bf16") ? "exact" : (v === "nvfp4" || v === "fp4") ? "nvfp4" : "q8";
@@ -1230,7 +1230,7 @@ export function ModelPage({ active, libraryAsked, currentAsked }) {
           ${hubModel && d.repo ? html`<div><dt>${t("Repository")}</dt><dd>${d.repo}</dd></div>` : ""}
           ${m.revision ? html`<div><dt>${t("Revision")}</dt><dd>${String(m.revision).slice(0, 8)}</dd></div>` : ""}
         </dl>
-        <div class="dsec">${t(m.kind === "drafter" ? "Folder" : "File")}</div>
+        <div class="dsec">${t(m.kind === "drafter" && !/\.(gguf|flyx)$/i.test(m.file || m.path || "") ? "Folder" : "File")}</div>
         <${CodeSnippet} id="lc-path" text=${m.path || m.name}/>
         ${drafter ? html`<div class="banner hint"><div class="grow2">${t(m.name + " is a drafter (" + gb(m.size) + " GB), not a model: it drafts for one, and is not loaded on its own.")}</div></div>` : ""}
         ${mmproj ? html`<div class="banner hint"><div class="grow2">${t(m.file + " is a vision projector (" + gb(m.size) + " GB), not a standalone model: attach it to a compatible VLM.")}</div></div>` : ""}
@@ -1258,7 +1258,8 @@ export function ModelPage({ active, libraryAsked, currentAsked }) {
       const rows = [];
       const body = groups.map(([name, all]) => {
         const list = all.slice().sort((x, y) => (x.size || 0) - (y.size || 0));
-        const mine = list.filter((m) => m.kind !== "drafter" && m.kind !== "mmproj").map(localRow), drafter = list.find((m) => m.kind === "drafter");
+        const mine = list.filter((m) => m.kind !== "drafter" && m.kind !== "mmproj").map(localRow);
+        const drafters = list.filter((m) => m.kind === "drafter");
         rows.push(...mine);
         return html`
           <div class="rgroup" data-repo=${name}>
@@ -1267,8 +1268,8 @@ export function ModelPage({ active, libraryAsked, currentAsked }) {
               <button class="iconbtn del" title=${t("Delete from the Hugging Face cache")} aria-label=${t("Delete")}
                       onClick=${() => removeRepo(name, all)}><${Icon} name="trash"/></button></div>
             ${mine.length ? html`<div class="mrows" role="listbox">${rowsView(mine)}</div>` : ""}
-            ${drafter ? html`<div class="banner hint"><div class="grow2">${t(name + " is a drafter (" + gb(drafter.size) + " GB), not a model: it drafts for one, and is not loaded on its own.")}</div>
-              ${model.id ? html`<button class="btn sm" onClick=${() => draftWith(drafter.name)}>${t("Draft with it")}</button>` : ""}</div>` : ""}
+            ${drafters.map((dr) => html`<div class="banner hint"><div class="grow2">${t(dr.name + " is a drafter (" + gb(dr.size) + " GB), not a model: it drafts for one, and is not loaded on its own.")}</div>
+              ${model.id ? html`<button class="btn sm" onClick=${() => draftWith(dr.name)}>${t("Draft with it")}</button>` : ""}</div>`)}
           </div>`;
       });
       return html`
@@ -1293,7 +1294,7 @@ export function ModelPage({ active, libraryAsked, currentAsked }) {
     const localComps = [
       ...folderDrafters.map((m) => ({
         key: m.path || m.name, spec: m.path || m.name, file: m.file, path: relOf(m),
-        kind: kindOf(m.file || m.name), size: m.size, cached: true, default: false,
+        kind: m.drafter_kind || kindOf(m.file || m.name), size: m.size, cached: true, default: false,
       })),
       ...folderMmproj.map((m) => ({
         key: m.path || m.name, spec: m.path || m.name, file: m.file, path: relOf(m),

@@ -81,24 +81,6 @@ void error(httplib::Response& res, int status, const std::string& message, const
   send_json(res, status, {{"error", {{"message", message}, {"type", type}}}});
 }
 
-// The MTP layers a GGUF holds, remembered by its path, size and time: its header is read once, not on every listing.
-int mtp_layers(const std::string& path, uint64_t size, fs::file_time_type modified) {
-  constexpr size_t kMaxCachedMtpEntries = 1024;
-  static std::mutex mu;
-  static std::map<std::string, std::tuple<uint64_t, fs::file_time_type, int>> known;
-  {
-    std::lock_guard<std::mutex> lock(mu);
-    const auto it = known.find(path);
-    if (it != known.end() && std::get<0>(it->second) == size && std::get<1>(it->second) == modified)
-      return std::get<2>(it->second);
-  }
-  const int n = apps::gguf_mtp_layers(path);
-  std::lock_guard<std::mutex> lock(mu);
-  if (known.size() >= kMaxCachedMtpEntries && known.find(path) == known.end()) known.clear();
-  known[path] = {size, modified, n};
-  return n;
-}
-
 // One model of GET /v1/hub/cached, and what deleting it takes.
 struct Listed {
   ojson json;
@@ -116,7 +98,8 @@ Listed dir_entry(const apps::LocalModel& m) {
   l.json = {{"name", m.path}, {"kind", m.kind}, {"source", "dir"}, {"repo", nullptr}, {"quant", or_null(m.quant)},
             {"file", m.file}, {"path", m.path}, {"size", m.size}, {"modified", apps::modified_unix(m.modified)},
             {"revision", nullptr}, {"current", true},
-            {"mtp", gguf && mtp_layers(m.path, m.size, m.modified) > 0 ? ojson("in-file") : ojson(nullptr)}};
+            {"mtp", gguf && m.mtp_layers > 0 ? ojson("in-file") : ojson(nullptr)}};
+  if (m.kind == "drafter" && !m.drafter_kind.empty()) l.json["drafter_kind"] = m.drafter_kind;
   if (m.parts > 1) l.json["parts"] = m.parts;
   l.on_disk = {m.path};
   return l;
@@ -142,31 +125,35 @@ std::vector<Listed> listing(const Server& s) {
     r.architectures = c.architectures, r.from_cache = true;
     const std::string suffix = c.current ? "" : "@" + c.commit;
     auto disk_of = [&](const std::string& path) { return from_path((to_path(c.dir) / to_path(path)).make_preferred()); };
-    auto entry = [&](const std::string& name, const char* kind, const std::string& quant, const std::string& file,
-                     const std::string& disk, uint64_t size) {
+    auto entry = [&](const std::string& name, const std::string& kind, const std::string& quant,
+                     const std::string& file, const std::string& disk, uint64_t size, fs::file_time_type modified,
+                     int mtp_count, const std::string& drafter_kind) {
       Listed l;
       l.repo = c.repo, l.commit = c.commit;
-      std::error_code ec;
-      const auto modified = fs::last_write_time(to_path(disk), ec);
       ojson mtp = nullptr;
-      if (std::string(kind) == "gguf") {
-        if (mtp_layers(disk, size, modified) > 0) mtp = "in-file";
+      if (kind == "gguf") {
+        if (mtp_count > 0) mtp = "in-file";
         else if (repos_with_mtp.count(c.repo)) mtp = "in-repo";
       }
       l.json = {{"name", name + suffix}, {"kind", kind}, {"source", "hub"}, {"repo", c.repo}, {"quant", or_null(quant)},
                 {"file", file}, {"path", disk}, {"size", size}, {"modified", apps::modified_unix(modified)},
                 {"revision", c.commit}, {"current", c.current}, {"mtp", mtp},
-                {"mmproj", std::string(kind) == "gguf" && snaps_with_mmproj.count({c.repo, c.commit})
+                {"mmproj", kind == "gguf" && snaps_with_mmproj.count({c.repo, c.commit})
                                ? ojson("in-repo")
                                : ojson(nullptr)}};
+      if (kind == "drafter" && !drafter_kind.empty()) l.json["drafter_kind"] = drafter_kind;
       return l;
     };
     const std::vector<hub::GgufChoice> ggufs = hub::gguf_choices(r);
     for (const hub::GgufChoice& g : ggufs) {
       if ((g.split && !g.complete) || !seen.insert({c.repo, g.file.path}).second) continue;
       const std::string disk = disk_of(g.file.path);
-      Listed l = entry(c.repo + ":" + g.quant, "gguf", g.quant, g.file.path.substr(g.file.path.rfind('/') + 1), disk,
-                       g.total_size);
+      std::error_code ec;
+      const auto modified = fs::last_write_time(to_path(disk), ec);
+      const apps::GgufClassification cls = apps::classify_gguf(disk, g.file.path, g.file.size, modified);
+      if (cls.kind.empty()) continue;
+      Listed l = entry(c.repo + ":" + g.quant, cls.kind, g.quant, g.file.path.substr(g.file.path.rfind('/') + 1), disk,
+                       g.total_size, modified, cls.mtp_layers, cls.drafter_kind);
       if (g.split) l.json["parts"] = int(g.parts.size());
       for (const hub::RepoFile& p : g.parts) l.files.push_back(p.path), l.on_disk.push_back(disk_of(p.path));
       out.push_back(std::move(l));
@@ -180,12 +167,16 @@ std::vector<Listed> listing(const Server& s) {
     Listed l;
     uint64_t size = 0;
     for (const hub::RepoFile& f : files) size += f.size;
+    std::error_code ec;
     if (drafter) {
-      l = entry(c.repo, "drafter", "", c.repo.substr(c.repo.find('/') + 1), from_path(to_path(c.dir).make_preferred()),
-                size);
+      const std::string disk = from_path(to_path(c.dir).make_preferred());
+      const auto modified = fs::last_write_time(to_path(disk), ec);
+      l = entry(c.repo, "drafter", "", c.repo.substr(c.repo.find('/') + 1), disk, size, modified, -1, "dflash2");
     } else {
       const std::string base = files[0].path.substr(files[0].path.rfind('/') + 1);
-      l = entry(c.repo, "flyx", hub::quant_in_name(base), base, disk_of(files[0].path), size);
+      const std::string disk = disk_of(files[0].path);
+      const auto modified = fs::last_write_time(to_path(disk), ec);
+      l = entry(c.repo, "flyx", hub::quant_in_name(base), base, disk, size, modified, -1, "");
     }
     for (const hub::RepoFile& f : files) l.files.push_back(f.path), l.on_disk.push_back(disk_of(f.path));
     out.push_back(std::move(l));

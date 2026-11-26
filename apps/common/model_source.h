@@ -58,21 +58,34 @@ bool fetch_named(std::string* model, EngineOptions* eo, std::string* err);
 // Local paths recognize those extensions in any case; Hub model IDs keep their published spelling.
 std::string model_name_of(const std::string& path, bool local = true);
 
+// Canonical classification of any GGUF file on disk (local directories, Hub cache snapshots, and drafter attachment).
+// Uses a thread-safe (path, size, mtime) cache over flyx::gguf_peek() plus filename conventions so arch="dflash"
+// drafters (including DSpark and Hub cached GGUF drafters) and arch="clip" vision projectors are classified identically
+// across every listing and load path.
+struct GgufClassification {
+  std::string kind;          // "gguf" (model), "drafter", "mmproj", or "" (ignored, e.g. imatrix)
+  std::string drafter_kind;  // "dflash2" or "mtp" when kind == "drafter", else ""
+  int mtp_layers = -1;       // <arch>.nextn_predict_layers when valid, -1 if unreadable/invalid
+};
+GgufClassification classify_gguf(const std::string& path, const std::string& rel_name = "", uint64_t size = 0,
+                                 std::filesystem::file_time_type modified = std::filesystem::file_time_type::min());
+
 // The MTP layers a GGUF says it holds (<arch>.nextn_predict_layers), read from its header alone: the metadata, never
 // the tensors.  -1: not a GGUF, or not readable.
 int gguf_mtp_layers(const std::string& path);
 
-// Model files in directories of the user's own (flyx serve --models-dir, FLYX_MODELS_DIR), found by name: *.gguf
-// (not projectors, importance matrices or MTP layers; complete split GGUFs grouped as one entry pointing to shard 1
-// with their summed size) and *.flyx,
-// at most 6 directories down, hidden directories and node_modules left out.  No file is opened.
+// Model, drafter, and vision projector files in directories of the user's own (flyx serve --models-dir,
+// FLYX_MODELS_DIR): *.gguf (classified via classify_gguf; complete split GGUFs grouped as one entry pointing to
+// shard 1 with their summed size) and *.flyx, at most 6 directories down, hidden directories and node_modules left out.
 struct LocalModel {
-  std::string path;   // absolute
-  std::string file;   // its name
-  std::string kind;   // "gguf", "flyx", or "mmproj"
-  std::string quant;  // from the name, "" when it names none
+  std::string path;          // absolute
+  std::string file;          // its name
+  std::string kind;          // "gguf", "flyx", "drafter", or "mmproj"
+  std::string drafter_kind;  // "dflash2" or "mtp" when kind == "drafter", else ""
+  std::string quant;         // from the name, "" when it names none
   uint64_t size = 0;
-  int parts = 0;  // > 1 for a complete split GGUF (path points to shard 1, size is the sum)
+  int parts = 0;             // > 1 for a complete split GGUF (path points to shard 1, size is the sum)
+  int mtp_layers = -1;       // cached <arch>.nextn_predict_layers for kind == "gguf"
   std::filesystem::file_time_type modified = std::filesystem::file_time_type::min();
 };
 // `deepest`: how many directories down a file may be (1: only in the directory named).

@@ -14,13 +14,13 @@ import time
 from remembered_model import serve
 
 
-def gguf(layers):
+def gguf(layers, arch="test"):
     def string(text):
         return struct.pack("<Q", len(text)) + text.encode("ascii")
 
     return (b"GGUF" + struct.pack("<IQQ", 3, 0, 2)
-            + string("general.architecture") + struct.pack("<I", 8) + string("test")
-            + string("test.nextn_predict_layers") + struct.pack("<II", 4, layers))
+            + string("general.architecture") + struct.pack("<I", 8) + string(arch)
+            + string(arch + ".nextn_predict_layers") + struct.pack("<II", 4, layers))
 
 
 def check_failed_switch(url, root):
@@ -99,6 +99,27 @@ def check_listing(url, file):
             models2 = json.load(response)["models"]
         assert not any("dangling-Q4_K_M" in m["file"] for m in models2), models2
         assert all(0 <= m["size"] < (1 << 60) for m in models2), models2
+
+    # Unified GGUF header classification (apps::classify_gguf): arch="dflash" (even without "dflash" in the filename,
+    # e.g. DSpark or Hub cached GGUF drafters) -> kind="drafter", drafter_kind="dflash2"; arch="clip" -> kind="mmproj".
+    (root / "dspark-custom-Q8_0.gguf").write_bytes(gguf(0, arch="dflash"))
+    (root / "renamed-vision-BF16.gguf").write_bytes(gguf(0, arch="clip"))
+    commit = "a" * 40
+    hub_snap = root / "hub" / "models--acme--Test-DFlash2-GGUF" / "snapshots" / commit
+    hub_snap.mkdir(parents=True, exist_ok=True)
+    (hub_snap / "Test-DFlash2-Q4_K_M.gguf").write_bytes(gguf(0, arch="dflash"))
+    refs = root / "hub" / "models--acme--Test-DFlash2-GGUF" / "refs"
+    refs.mkdir(parents=True, exist_ok=True)
+    (refs / "main").write_text(commit, encoding="ascii")
+    with urlopen(url + "/v1/hub/cached", timeout=5) as response:
+        models3 = json.load(response)["models"]
+    dspark = next(m for m in models3 if m["file"] == "dspark-custom-Q8_0.gguf")
+    assert dspark["kind"] == "drafter" and dspark["drafter_kind"] == "dflash2" and dspark["mtp"] is None, dspark
+    vis = next(m for m in models3 if m["file"] == "renamed-vision-BF16.gguf")
+    assert vis["kind"] == "mmproj" and vis["mtp"] is None, vis
+    hub_df = next(m for m in models3 if m["name"] == "acme/Test-DFlash2-GGUF:Q4_K_M")
+    assert hub_df["source"] == "hub" and hub_df["kind"] == "drafter" and hub_df["drafter_kind"] == "dflash2", hub_df
+    assert hub_df["mtp"] is None and hub_df["mmproj"] is None, hub_df
 
 
 if __name__ == "__main__":

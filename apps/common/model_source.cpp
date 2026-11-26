@@ -8,7 +8,9 @@
 #include <filesystem>
 #include <map>
 #include <memory>
+#include <mutex>
 #include <set>
+#include <tuple>
 
 #include "core/interfaces/options.h"
 #include "core/modelfile/modelfile.h"
@@ -53,9 +55,71 @@ uint64_t bytes_on_disk(const std::string& path) {
   return n;
 }
 
+// Thread-safe cache of flyx::gguf_peek() keyed by (path, size, mtime) so every GGUF header is read at most once
+// across scan_model_dirs(), GET /v1/hub/cached, GET /v1/hub/dir, and fetch_model().
+flyx::GgufPeek gguf_peek_cached(const std::string& path, uint64_t size, fs::file_time_type modified) {
+  if (size == 0 && modified == fs::file_time_type::min()) {
+    std::error_code ec;
+    const fs::path p = to_path(path);
+    const auto sz = fs::file_size(p, ec);
+    if (!ec) size = uint64_t(sz);
+    ec.clear();
+    const auto mt = fs::last_write_time(p, ec);
+    if (!ec) modified = mt;
+  }
+  constexpr size_t kMaxCachedEntries = 2048;
+  static std::mutex mu;
+  static std::map<std::string, std::tuple<uint64_t, fs::file_time_type, flyx::GgufPeek>> cache;
+  {
+    std::lock_guard<std::mutex> lock(mu);
+    const auto it = cache.find(path);
+    if (it != cache.end() && std::get<0>(it->second) == size && std::get<1>(it->second) == modified)
+      return std::get<2>(it->second);
+  }
+  const flyx::GgufPeek peek = flyx::gguf_peek(path);
+  std::lock_guard<std::mutex> lock(mu);
+  if (cache.size() >= kMaxCachedEntries && cache.find(path) == cache.end()) cache.clear();
+  cache[path] = {size, modified, peek};
+  return peek;
+}
+
 }  // namespace
 
-int gguf_mtp_layers(const std::string& path) { return flyx::gguf_peek_mtp_layers(path); }
+GgufClassification classify_gguf(const std::string& path, const std::string& rel_name, uint64_t size,
+                                 fs::file_time_type modified) {
+  GgufClassification out;
+  const std::string name = rel_name.empty() ? from_path(to_path(path).filename()) : rel_name;
+  const std::string low = lower(name);
+  const size_t slash = low.find_last_of("/\\");
+  const std::string base = slash == std::string::npos ? low : low.substr(slash + 1);
+  if (!base.ends_with(".gguf") || base.find("imatrix") != std::string::npos) return out;
+
+  const flyx::GgufPeek peek = gguf_peek_cached(path, size, modified);
+  out.mtp_layers = peek.valid ? peek.mtp_layers : -1;
+
+  // Authoritative GGUF header architecture first, backed by filename conventions (e.g. MTP sidecars or stub files).
+  if (hub::mmproj_gguf_name(name) || (peek.valid && peek.arch == "clip")) {
+    out.kind = "mmproj";
+    return out;
+  }
+  if (peek.valid && peek.arch == "dflash") {
+    out.kind = "drafter";
+    out.drafter_kind = "dflash2";
+    return out;
+  }
+  if (hub::mtp_gguf_name(name)) {
+    out.kind = "drafter";
+    out.drafter_kind = "mtp";
+    return out;
+  }
+  out.kind = "gguf";
+  return out;
+}
+
+int gguf_mtp_layers(const std::string& path) {
+  const flyx::GgufPeek p = gguf_peek_cached(path, 0, fs::file_time_type::min());
+  return p.valid ? p.mtp_layers : -1;
+}
 
 double modified_unix(fs::file_time_type modified) {
   if (modified == fs::file_time_type::min()) return 0;
@@ -118,16 +182,7 @@ std::vector<LocalModel> scan_model_dirs(const std::vector<std::string>& dirs, in
       if (!gguf && !flyx) continue;
       std::string rel = from_path(it->path().lexically_relative(root));
       std::replace(rel.begin(), rel.end(), '\\', '/');
-      const bool is_mmproj = gguf && hub::mmproj_gguf_name(rel);
-      // A DFlash2 drafter's GGUF says what it is in its header alone (general.architecture "dflash"), and reading
-      // a header means reading through the file's tokenizer tables: only the files whose names suggest a drafter
-      // are opened here.  One named otherwise is listed as a model, and refused as one when it is opened.
-      const bool maybe_dflash =
-          gguf && !is_mmproj && (low.find("dflash") != std::string::npos || low.find("draft") != std::string::npos);
-      const bool is_drafter =
-          gguf && !is_mmproj &&
-          (hub::mtp_gguf_name(rel) || (maybe_dflash && flyx::gguf_peek(from_path(it->path())).arch == "dflash"));
-      if (gguf && !is_mmproj && !is_drafter && !hub::model_gguf_name(rel)) continue;
+      if (gguf && low.find("imatrix") != std::string::npos) continue;
       const fs::path canon = fs::weakly_canonical(it->path(), e2);
       if (e2 || !it->is_regular_file(e2) || e2 || !seen.insert(canon).second) continue;
       const auto sz = it->file_size(e2);
@@ -136,7 +191,8 @@ std::vector<LocalModel> scan_model_dirs(const std::vector<std::string>& dirs, in
       const auto mt = it->last_write_time(e3);
       const fs::file_time_type modified = e3 ? fs::file_time_type::min() : mt;
       hub::SplitGguf sp;
-      if (gguf && !is_mmproj && !is_drafter && hub::parse_split_gguf_name(from_path(canon), &sp)) {
+      if (gguf && !hub::mmproj_gguf_name(rel) && !hub::mtp_gguf_name(rel) &&
+          hub::parse_split_gguf_name(from_path(canon), &sp)) {
         auto& acc = splits[{sp.prefix, sp.count}];
         acc.count = sp.count;
         acc.parts[sp.part] = {from_path(it->path()), name, uint64_t(sz), modified};
@@ -145,7 +201,15 @@ std::vector<LocalModel> scan_model_dirs(const std::vector<std::string>& dirs, in
       LocalModel m;
       m.path = from_path(it->path());
       m.file = name;
-      m.kind = is_mmproj ? "mmproj" : is_drafter ? "drafter" : gguf ? "gguf" : "flyx";
+      if (gguf) {
+        const GgufClassification cls = classify_gguf(m.path, rel, uint64_t(sz), modified);
+        if (cls.kind.empty()) continue;
+        m.kind = cls.kind;
+        m.drafter_kind = cls.drafter_kind;
+        m.mtp_layers = cls.mtp_layers;
+      } else {
+        m.kind = "flyx";
+      }
       m.quant = hub::quant_in_name(name);
       m.size = uint64_t(sz);
       m.modified = modified;
@@ -168,10 +232,14 @@ std::vector<LocalModel> scan_model_dirs(const std::vector<std::string>& dirs, in
     }
     if (!complete) continue;
     const LocalShard& first = acc.parts.begin()->second;
+    const GgufClassification cls = classify_gguf(first.path, first.file, first.size, first.modified);
+    if (cls.kind.empty()) continue;
     LocalModel m;
     m.path = first.path;
     m.file = first.file;
-    m.kind = "gguf";
+    m.kind = cls.kind;
+    m.drafter_kind = cls.drafter_kind;
+    m.mtp_layers = cls.mtp_layers;
     m.quant = hub::quant_in_name(first.file);
     m.size = total;
     m.parts = acc.count;
@@ -208,17 +276,14 @@ bool one(const std::string& spec, const hub::ProgressFn& progress, const std::at
   return true;
 }
 
-// What kind of drafter a file or directory given beside a model holds: read from the GGUF header when possible
-// (arch "dflash" vs MTP), falling back to filename/format for directories and .flyx drafter files.
+// What kind of drafter a file or directory given beside a model holds, via classify_gguf().
 std::string drafter_kind(const std::string& path) {
   const std::string lp = lower(path);
   if (lp.ends_with(".gguf")) {
-    const flyx::GgufPeek p = flyx::gguf_peek(path);
-    if (p.valid) {
-      if (p.arch == "dflash") return "dflash2";
-      if (p.mtp_layers > 0) return "mtp";
-    }
-    return lp.find("dflash") != std::string::npos ? "dflash2" : "mtp";
+    const GgufClassification cls = classify_gguf(path);
+    if (!cls.drafter_kind.empty()) return cls.drafter_kind;
+    if (cls.mtp_layers > 0) return "mtp";
+    return lp.find("dflash") != std::string::npos || lp.find("dspark") != std::string::npos ? "dflash2" : "mtp";
   }
   return "dflash2";
 }
