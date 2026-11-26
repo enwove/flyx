@@ -2434,9 +2434,13 @@ int main(int argc, char** argv) {
     CK(cudaGetDeviceProperties(&prop, 0));
     g_bench_opts.tuning = gemm_tuning_for(prop.name, prop.major * 10 + prop.minor);
     // As the engine (backend.cpp): a table whose kernels the code loaded for this device was not compiled for (a
-    // release build, an architecture list without the device's) gives way to the defaults.
-    if (g_bench_opts.tuning >= 0 && !gemm_tuning_compiled_for(g_bench_opts.tuning, compiled_arch()))
-      g_bench_opts.tuning = -1;
+    // release build, an architecture list without the device's) gives way to the loaded code's architecture's table,
+    // and that one to the defaults.
+    const int code_cc = compiled_arch();
+    if (g_bench_opts.tuning >= 0 && !gemm_tuning_compiled_for(g_bench_opts.tuning, code_cc)) {
+      g_bench_opts.tuning = gemm_tuning_for("", code_cc);
+      if (g_bench_opts.tuning >= 0 && !gemm_tuning_compiled_for(g_bench_opts.tuning, code_cc)) g_bench_opts.tuning = -1;
+    }
     // Kernels launch as the engine launches them on this GPU; FLYX_BENCH_PDL=0|1 says otherwise.
     g_bench_opts.pdl = gemm_tuning_pdl(g_bench_opts.tuning);
     if (const char* e = std::getenv("FLYX_BENCH_PDL")) g_bench_opts.pdl = std::string(e) == "1";
