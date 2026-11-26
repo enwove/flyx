@@ -34,17 +34,23 @@ set(FLYX_CUDA_COMPAT_BLOCK_SOURCES
     kernels/gemm_blocks_iq_low.cu kernels/gemm_blocks_iq_high.cu
     kernels/gemm_blocks_round_legacy.cu kernels/gemm_blocks_round_k.cu
     kernels/gemm_blocks_round_iq_low.cu kernels/gemm_blocks_round_iq_high.cu kernels/gemm_blocks_round_glu.cu)
-set(FLYX_CUDA_COMPAT_SOURCES ${FLYX_CUDA_COMPAT_BLOCK_SOURCES} kernels/attention_strata.cu kernels/gdn.cu)
+set(FLYX_CUDA_COMPAT_SOURCES ${FLYX_CUDA_COMPAT_BLOCK_SOURCES}
+    kernels/moe_blocks_legacy.cu kernels/moe_blocks_k.cu
+    kernels/moe_blocks_iq_low.cu kernels/moe_blocks_iq_high.cu
+    kernels/attention_strata.cu kernels/gdn.cu)
 set(FLYX_CUDA_TABLE_SOURCES
     kernels/gemm.cu kernels/gemm_decode.cu kernels/attention_flash.cu
-    kernels/gemm_blocks.cu kernels/gemm_blocks_round.cu ${FLYX_CUDA_COMPAT_BLOCK_SOURCES})
+    kernels/gemm_blocks.cu kernels/gemm_blocks_round.cu ${FLYX_CUDA_COMPAT_BLOCK_SOURCES}
+    kernels/moe.cu kernels/moe_blocks_legacy.cu kernels/moe_blocks_k.cu
+    kernels/moe_blocks_iq_low.cu kernels/moe_blocks_iq_high.cu)
 set(FLYX_CUDA_KERNEL_SOURCES
     kernels/common/launch.cu
     kernels/gemm.cu kernels/gemm_decode.cu kernels/gemm_prefill.cu
     kernels/gemm_blocks.cu kernels/gemm_blocks_round.cu kernels/gemm_blocks_tables.cu
     kernels/attention.cu kernels/attention_flash.cu kernels/attention_rows.cu kernels/tree.cu
     kernels/gdn_chunk.cu kernels/rows.cu kernels/sampling.cu kernels/draft.cu kernels/draft_head.cu
-    kernels/dv.cu kernels/head_cert.cu kernels/stop_decide.cu kernels/vision.cu)
+    kernels/dv.cu kernels/head_cert.cu kernels/stop_decide.cu kernels/vision.cu kernels/inkling2.cu
+    kernels/moe.cu kernels/dspark.cu)
 
 # The device code's flags: line tables unless left out, the fatbinary's compression (top-level CMakeLists.txt).
 set(FLYX_CUDA_DEVICE_FLAGS "")
@@ -74,11 +80,13 @@ function(flyx_configure_cuda_lib target archs)
   cmake_parse_arguments(ARG "USES_TABLES" "" "" ${ARGN})
   set_target_properties(${target} PROPERTIES CUDA_ARCHITECTURES "${archs}")
   target_compile_options(${target} PRIVATE "$<$<COMPILE_LANGUAGE:CUDA>:${FLYX_CUDA_DEVICE_FLAGS}>")
+  # Define uniformly across all CUDA libraries so shared inline helpers (e.g. moe_dp4a_cfg_compiled) see the same value
+  # in every translation unit.
+  target_compile_definitions(${target} PUBLIC FLYX_TUNE_CANDIDATES=$<IF:$<BOOL:${FLYX_TUNE_CANDIDATES}>,1,0>)
   if(ARG_USES_TABLES)
     add_dependencies(${target} flyx_gemm_tables)
     target_include_directories(${target} PUBLIC ${CMAKE_SOURCE_DIR} ${CMAKE_SOURCE_DIR}/include
                                ${CMAKE_SOURCE_DIR}/third_party ${FLYX_GEN_DIR})
-    target_compile_definitions(${target} PUBLIC FLYX_TUNE_CANDIDATES=$<IF:$<BOOL:${FLYX_TUNE_CANDIDATES}>,1,0>)
   else()
     target_include_directories(${target} PUBLIC ${CMAKE_SOURCE_DIR} ${CMAKE_SOURCE_DIR}/include)
   endif()

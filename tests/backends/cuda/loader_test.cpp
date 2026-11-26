@@ -155,6 +155,42 @@ void vision_estimates() {
           "mixed-format Q/K/V estimate uses the upload format of the stack");
 }
 
+void expert_estimates() {
+  constexpr int e = 2, n = 3, k = 256;
+  struct Case { int dtype, file_row, device_row; bool packed, scale; };
+  for (const auto& c : {
+           Case{FLYX_DT_GGML_Q4_K, 144, 148, true, false}, Case{FLYX_DT_GGML_Q4_K, 144, 148, true, true},
+           Case{FLYX_DT_GGML_Q4_K, 144, 512, false, true}, Case{FLYX_DT_GGML_Q8_0, 272, 272, true, false},
+           Case{FLYX_DT_GGML_NVFP4, 144, 144, true, false}, Case{FLYX_DT_GGML_NVFP4, 144, 144, false, true},
+           Case{FLYX_DT_F32, 1024, 512, true, true}, Case{FLYX_DT_BF16, 512, 512, true, false}}) {
+    std::vector<uint8_t> data(e * n * c.file_row);
+    float scales[e] = {1.f, 2.f};
+    flyx_tensor_view v{"experts", c.dtype, 3, {e, n, k}, data.data(), data.size()};
+    flyx_tensor_view s{"scales", FLYX_DT_F32, 1, {e}, scales, sizeof(scales)};
+    flyx_weight w{&v, nullptr, c.scale ? &s : nullptr};
+    flyx_block b{};
+    b.kind = FLYX_BLOCK_MOE;
+    b.moe.gate_up = b.moe.down = 0;
+    b.moe.router = -1;
+    flyx_model_desc d{};
+    d.weights = &w;
+    d.n_weights = 1;
+    d.blocks = &b;
+    d.n_blocks = 1;
+    flyx_open_options opts{};
+    opts.options = c.packed ? "blocks=packed" : "blocks=bf16";
+    flyx_load_estimate est{};
+    const size_t expected = e * n * c.device_row + (c.scale || c.dtype == FLYX_DT_GGML_NVFP4 ? e * sizeof(float) : 0);
+    require(estimate_load(&d, &opts, 0, 0, &est) == 0 && est.weights_bytes == expected, "exact expert estimate");
+    flyx_bmodel m;
+    m.opt.packed_blocks = c.packed;
+    WeightLoader loader(&m, d);
+    loader.expert_mat(0);
+    loader.finish();
+    require(m.bytes == expected, "actual expert upload matches estimate");
+  }
+}
+
 void packed_drafter(bool compact) {
   constexpr int cols = 64;
   std::vector<uint8_t> data(68);  // two zero Q8_0 blocks
@@ -169,6 +205,22 @@ void packed_drafter(bool compact) {
   const Lin lin = loader.lin_quant(0, DraftQuant::kNvfp4);  // DFlash2 beside an NVFP4 target
   loader.finish();
   require(compact ? lin.q && m.bytes == 40 : lin.packed() && m.bytes == 68, "packed drafter policy and bytes");
+  // What is reported is what the drafter holds: a Q8_0 file kept packed under auto is q8, not the nvfp4 asked.
+  require(std::string(held_precision({&lin})) == (compact ? "nvfp4" : "q8"), "a drafter's precision as it is held");
+}
+
+void held_labels() {
+  Lin dense, fp4, q8, q4k, unbound;
+  dense.w = reinterpret_cast<bf16*>(uintptr_t(16));  // only the pointers' presence is read
+  fp4.q = reinterpret_cast<uint8_t*>(uintptr_t(16));
+  q8.blk = {BlockMat{nullptr, nullptr, FLYX_DT_GGML_Q8_0, 1, true}};
+  q4k.blk = {BlockMat{nullptr, nullptr, FLYX_DT_GGML_Q4_K, 1, true}};
+  require(std::string(held_precision({})).empty() && std::string(held_precision({&unbound})).empty(),
+          "no drafter linear");
+  require(std::string(held_precision({&dense, &dense, &fp4})) == "exact", "mostly the file's bf16");
+  require(std::string(held_precision({&q4k, &q4k})) == "exact", "GGML blocks of another type kept as they are");
+  require(std::string(held_precision({&q8, &q8, &fp4})) == "q8", "mostly Q8_0 blocks");
+  require(std::string(held_precision({&fp4, &q8})) == "nvfp4", "NVFP4 planes on a tie");
 }
 }  // namespace
 
@@ -185,12 +237,14 @@ int main() {
   using namespace flyx::cuda;
   try {
     vision_estimates();
+    expert_estimates();
     staging_width();
     oom_paths();
     quantized_bytes(DraftQuant::kQ8);
     quantized_bytes(DraftQuant::kNvfp4);
     packed_drafter(false);
     packed_drafter(true);
+    held_labels();
   } catch (const std::exception& e) {
     std::fprintf(stderr, "%s\n", e.what());
     return 1;

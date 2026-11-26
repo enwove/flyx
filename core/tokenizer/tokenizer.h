@@ -34,7 +34,9 @@ using interfaces::TextSpan;
 //   kQwen2     Qwen2's and Qwen3's: letters without marks, one number at a time
 //   kMiniCPM5  numbers cut into groups of up to three from the left first, then Qwen2's split on each piece, a run
 //              of numbers as one
-enum class Pretokenizer { kQwen35, kQwen2, kMiniCPM5 };
+//   kInkling2  GPT-4o / o200k case-aware letter runs with optional contractions, numbers in groups of 1..3,
+//              punctuation with trailing newlines or slashes
+enum class Pretokenizer { kQwen35, kQwen2, kMiniCPM5, kInkling2 };
 
 class Tokenizer {
  public:

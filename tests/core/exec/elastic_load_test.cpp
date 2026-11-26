@@ -1,5 +1,5 @@
 // Copyright 2026 The flyx Authors. SPDX-License-Identifier: Apache-2.0
-// Elastic VRAM loading (Engine::load, ABI 45): verifies the ordered degradation ladder on FLYX_ERR_OOM and
+// Elastic VRAM loading (Engine::load, ABI 48): verifies the ordered degradation ladder on FLYX_ERR_OOM and
 // backend-reported pre-flight estimates (estimate_load / draft_weights), meaningful NVFP4 savings threshold,
 // strict non-degradation when elastic_load=false (bench mode), immediate failure on non-OOM errors (even if the
 // error message mentions VRAM), and Gate 4 bit-identical greedy outputs across every degraded tier.
@@ -333,7 +333,36 @@ int main(int argc, char** argv) {
     check(tokens(fitted, 510) == plain_greedy && tokens(fitted, 510, true) == plain_sampled,
           "preflight preserves greedy and fixed-seed decoding across the switch");
   }
-  if (probe_eo.backend == "cuda") return g_failures ? 1 : 0;
+  if (probe_eo.backend == "cuda") {
+    // A packed down projection selects Q8 for an otherwise floating target. A single packed member of a fixed
+    // gate|up stack is converted to BF16 along with the other member. The drafter projection reveals AUTO's choice.
+    const flyx_tensor_view dense{"float", FLYX_DT_BF16, 2, {3, 256, 0, 0}, nullptr, 3 * 512};
+    const flyx_tensor_view packed{"down", FLYX_DT_GGML_Q4_K, 2, {3, 256, 0, 0}, nullptr, 3 * 144};
+    const flyx_weight ws[] = {{&dense, nullptr, nullptr, FLYX_ACT_Q8, 0}, {&packed, nullptr, nullptr, FLYX_ACT_Q8, 0},
+                              {&dense, nullptr, nullptr, FLYX_ACT_Q8, 0}};
+    flyx_block blocks[2]{};
+    blocks[0].kind = FLYX_BLOCK_MLP;
+    blocks[0].mlp.gate = blocks[0].mlp.up = 0;
+    blocks[0].mlp.down = 1;
+    blocks[1].kind = FLYX_BLOCK_DFLASH2;
+    auto& df = blocks[1].dflash2;
+    df.fc = 2;
+    df.hidden_norm.w = df.norm.w = df.sel_hid = df.sel_pred = df.sel_succ = -1;
+    flyx_model_desc d{};
+    d.n_weights = 3;
+    d.weights = ws;
+    d.n_blocks = 2;
+    d.blocks = blocks;
+    flyx_open_options opts{};
+    flyx_load_estimate est{};
+    auto draft_bytes = [&] {
+      return g_backend->estimate_load(&d, &opts, 0, 0, &est) == 0 ? est.draft_weights_bytes : UINT64_MAX;
+    };
+    check(draft_bytes() == 3 * 272, "AUTO sees the packed down projection of a mixed target");
+    std::swap(blocks[0].mlp.up, blocks[0].mlp.down);
+    check(draft_bytes() == 3 * 512, "AUTO sees the BF16 resident format of the mixed gate/up stack");
+    return g_failures ? 1 : 0;
+  }
 
   // 1. Roomy VRAM: both MTP and DFlash2 load with zero adjustments and backend-reported draft_weights.
   {
@@ -399,7 +428,9 @@ int main(int argc, char** argv) {
     check(tokens(e) == ref_tokens, "MTP-fallback matches plain greedy tokens");
   }
 
-  // 4. Explicit --drafter dflash2 on a model that also has embedded MTP: falls back to MTP cleanly.
+  // 4. Explicit --drafter dflash2 on a model that also has embedded MTP: a drafter the caller named is never skipped.
+  // Its weights may still step down to NVFP4 (the drafter stays); when that does not fit either, the load fails as a
+  // load without elastic loading does, and says why.
   {
     reset_hooks();
     g_total_vram = 24ull << 30;
@@ -410,11 +441,11 @@ int main(int argc, char** argv) {
     eo.max_ctx = 128;
     eo.drafter = "dflash2";
     Engine e;
-    check(e.load(model, eo, &err), "explicit dflash2 OOM falls back to embedded MTP: " + err);
-    check(std::string(e.drafter()) == "mtp" && e.load_adjustments().size() == 1 &&
-              e.load_adjustments()[0].from == "dflash2" && e.load_adjustments()[0].to == "mtp",
-          "dflash2 -> mtp fallback reported clearly");
-    check(tokens(e) == ref_tokens, "dflash2->mtp fallback matches plain greedy tokens");
+    err.clear();
+    check(!e.load(model, eo, &err) && err.find("Not enough VRAM") != std::string::npos,
+          "explicit dflash2 that does not fit fails instead of falling back to MTP: " + err);
+    check(g_open_calls == 2 && g_seen_dw.back() == FLYX_DRAFT_WEIGHTS_NVFP4,
+          "explicit dflash2 tried its NVFP4 weights once, and no drafter was dropped");
   }
 
   // 5. FLYX_ERR_OOM on all neural drafters: drops all drafters, keeps prompt lookup, single coalesced adjustment.
@@ -456,7 +487,7 @@ int main(int argc, char** argv) {
           "elastic_load=false refuses OOM immediately without retrying or degrading");
   }
 
-  // 7. Non-OOM error never triggers elastic retries (even if the message mentions VRAM — ABI 45 checks FLYX_ERR_OOM).
+  // 7. Non-OOM error never triggers elastic retries (even if the message mentions VRAM — ABI 48 checks FLYX_ERR_OOM).
   {
     reset_hooks();
     g_total_vram = 24ull << 30;

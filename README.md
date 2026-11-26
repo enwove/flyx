@@ -132,8 +132,8 @@ print(reply["content"])
 
 | Dimension | Supported | Notes |
 |---|---|---|
-| Architectures | Qwen3.5 / Qwen3.8 (hybrid GDN + gated attention), Qwen3 dense, Llama (MiniCPM5-1B) | Dense text only (no MoE, no vision); Llama from `.flyx` only |
-| Model formats | GGUF (`F32`, `F16`, `BF16`, `Q4_0–Q8_0`, `Q2_K–Q6_K`, `IQ1–IQ4`, GGML NVFP4); `.flyx` (BF16, NVFP4; format 2 with the target's own LoRA adapters, V-LoRA, run unmerged; a DV drafter, drafting only when named: `--drafter dv`, [design](docs/design/dv.md)) | MXFP4 refused; split GGUFs need all parts in one folder |
+| Architectures | Qwen3.5 / Qwen3.8 (hybrid GDN + gated attention), Qwen3 dense, Inkling-2 (`inkling2_loop` looped ShortConv + RelAttn + sparse MoE + DSpark), Llama (MiniCPM5-1B) | Text only (no vision); Llama from `.flyx` only |
+| Model formats | GGUF (`F32`, `F16`, `BF16`, `Q2_0`, `Q4_0–Q8_0`, `Q2_K–Q6_K`, `IQ1–IQ4`, `MXFP4`, GGML `NVFP4`); `.flyx` (BF16, NVFP4; format 2 with the target's own LoRA adapters, V-LoRA, run unmerged; a DV drafter, drafting only when named: `--drafter dv`, [design](docs/design/dv.md)) | Split GGUFs need all parts in one folder |
 | GPUs | RTX 30 / 40 / 50 series, L4, L40S, A100, H100 (`sm_80`–`sm_120`; `sm_100` in Linux release) | Single GPU per process (`CUDA_VISIBLE_DEVICES`); driver ≥ 580 |
 | Platforms | Windows (native MSVC), Linux, WSL2 | Single-file `.exe` / ZIP / wheel on Windows; tarball / `manylinux` wheel on Linux |
 

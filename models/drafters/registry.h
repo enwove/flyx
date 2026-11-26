@@ -10,6 +10,7 @@
 #include "core/modelfile/modelfile.h"
 #include "flyx/backend_abi.h"
 #include "models/drafters/dflash2.h"
+#include "models/drafters/dspark.h"
 #include "models/drafters/target.h"
 #include "models/model.h"
 
@@ -29,26 +30,41 @@ class DrafterRegistry {
   // Validate specs of chosen drafters before target tensor binding (refuses bad configs early).
   void validate_selected(const ModelFile& file, const std::vector<Drafter>& selected, const TargetSpec& target);
 
-  // Build blocks for `kind` (kMtp or kDFlash2) in `T`, returning the drafter block index and its max drafts.
+  // Build blocks for `kind` (kMtp, kDFlash2, or kDSpark) in `T`, returning the drafter block index and its max drafts.
   int attach(Drafter kind, const ModelFile& file, Tables& T, const TargetSpec& target, const MtpHooks* mtp,
              int* max_drafts_out);
 
-  // Emit FLYX_NODE_TAP nodes for all active tap-consuming drafters after 1-based layer `layer_1based`.
+  // Emit FLYX_NODE_TAP nodes for drafters that tap the pre-layer input (0-based visit index, e.g., DSpark).
+  void emit_pre_visit_taps(std::vector<flyx_node>* p, int visit_0based) const;
+
+  // Emit FLYX_NODE_TAP nodes for drafters that tap after 1-based layer `layer_1based` (DFlash2).
+  // When `target.has_post_norm_tap` is false, `layer_1based == target.layers` emits post-output_norm taps (FLYX_TAP_NORMED);
+  // architectures with a final residual mix set `has_post_norm_tap = true` and call emit_post_norm_taps() after it.
   void emit_taps(std::vector<flyx_node>* p, int layer_1based) const;
 
-  // Emit FLYX_NODE_CONTEXT nodes for all attached drafters managed by this registry (MTP, DFlash2).
+  // Emit FLYX_NODE_TAP nodes (FLYX_TAP_NORMED: post output_norm) for taps equal to `n_layers` (DFlash2 and DSpark).
+  void emit_post_norm_taps(std::vector<flyx_node>* p, int n_layers) const;
+
+  // Emit FLYX_NODE_CONTEXT nodes for all attached drafters managed by this registry (MTP, DFlash2, DSpark).
   void emit_contexts(std::vector<flyx_node>* p) const;
 
  private:
   const DFlash2Spec& ensure_dflash2_spec(const ModelFile& file, const TargetSpec& target);
+  const DSparkSpec& ensure_dspark_spec(const ModelFile& file, const TargetSpec& target);
 
   DrafterSources sources_{};
   int mtp_companion_ = -1;
   int dflash2_companion_ = -1;  // the companion holding the DFlash2 drafter, -1: the model file ("draft")
   std::optional<DFlash2Spec> dflash2_spec_;
+  int dspark_companion_ = -1;
+  std::optional<DSparkSpec> dspark_spec_;
 
+  int target_layers_ = 0;
+  bool explicit_post_norm_ = false;
   int dflash2_block_ = -1;
   std::vector<int> dflash2_taps_;
+  int dspark_block_ = -1;
+  std::vector<int> dspark_taps_;
   std::vector<int> context_blocks_;
 };
 

@@ -204,6 +204,21 @@ inline double value(int32_t dtype, const uint8_t* data, size_t i) {
       const double scale = x == 0x7F ? 0.0 : e == 0 ? std::ldexp(double(m), -9) : std::ldexp(double(8 + m), e - 10);
       return kvalues_mxfp4[l < 8 ? q & 15 : q >> 4] * scale * 0.5;
     }
+    // MXFP4: 32 doubled e2m1 codes with one E8M0 scale, halved (ggml_e8m0_to_fp32_half).
+    case FLYX_DT_GGML_MXFP4: {
+      const auto b = block_at<block_mxfp4>(data, at);
+      const uint32_t bits = b.e < 2 ? (0x00200000u << b.e) : (uint32_t(b.e - 1) << 23);
+      float d = 0.f;
+      std::memcpy(&d, &bits, 4);
+      const uint8_t q = b.qs[j & 15];
+      return double(d) * kvalues_mxfp4[j < 16 ? (q & 15) : (q >> 4)];
+    }
+    // Q2_0: 64 2-bit codes (00=-1, 01=0, 10=+1, 11=+2) with one binary16 scale.
+    case FLYX_DT_GGML_Q2_0: {
+      const auto b = block_at<block_q2_0>(data, at);
+      const int code = (b.qs[j >> 2] >> ((j & 3) * 2)) & 3;
+      return half(b.d) * double(code - 1);
+    }
     default: throw std::runtime_error("GGML block type " + std::to_string(dtype) + " has no reference decoder");
   }
 }

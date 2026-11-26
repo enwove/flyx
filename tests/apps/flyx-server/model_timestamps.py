@@ -14,13 +14,14 @@ import time
 from remembered_model import serve
 
 
-def gguf(layers):
+def gguf(layers, arch="test", markov=False):
     def string(text):
         return struct.pack("<Q", len(text)) + text.encode("ascii")
 
-    return (b"GGUF" + struct.pack("<IQQ", 3, 0, 2)
-            + string("general.architecture") + struct.pack("<I", 8) + string("test")
-            + string("test.nextn_predict_layers") + struct.pack("<II", 4, layers))
+    extra = string("dflash.has_markov_context") + struct.pack("<I?", 7, True) if markov else b""
+    return (b"GGUF" + struct.pack("<IQQ", 3, 0, 2 + bool(extra))
+            + string("general.architecture") + struct.pack("<I", 8) + string(arch)
+            + string(arch + ".nextn_predict_layers") + struct.pack("<II", 4, layers) + extra)
 
 
 def check_failed_switch(url, root):
@@ -99,6 +100,102 @@ def check_listing(url, file):
             models2 = json.load(response)["models"]
         assert not any("dangling-Q4_K_M" in m["file"] for m in models2), models2
         assert all(0 <= m["size"] < (1 << 60) for m in models2), models2
+
+    # Cached Hub GGUFs with general.architecture=dflash (DFlash2 or DSpark) and local arch=dflash GGUFs
+    # must be classified as kind="drafter" (never as standalone models).
+    commit = "a" * 40
+    for repo_dir, fname, markov, want_dk in (
+        ("models--acme--Mini-DFlash2-GGUF", "Mini-DFlash2-Draft-BF16.gguf", False, "dflash2"),
+        ("models--acme--Mini-DSpark-GGUF", "Mini-DSpark-Draft-Q8_0.gguf", True, "dspark"),
+    ):
+        rdir = root / "hub" / repo_dir
+        (rdir / "refs").mkdir(parents=True, exist_ok=True)
+        (rdir / "refs" / "main").write_text(commit, encoding="ascii")
+        sdir = rdir / "snapshots" / commit
+        sdir.mkdir(parents=True, exist_ok=True)
+        (sdir / fname).write_bytes(gguf(0, arch="dflash", markov=markov))
+    (root / "unnamed-draft-Q8_0.gguf").write_bytes(gguf(0, arch="dflash"))
+    with urlopen(url + "/v1/hub/cached", timeout=5) as response:
+        models3 = json.load(response)["models"]
+    by_key = {(m["source"], m["file"]): m for m in models3}
+    df_row = by_key[("hub", "Mini-DFlash2-Draft-BF16.gguf")]
+    ds_row = by_key[("hub", "Mini-DSpark-Draft-Q8_0.gguf")]
+    loc_row = by_key[("dir", "unnamed-draft-Q8_0.gguf")]
+    assert df_row["kind"] == "drafter" and df_row["drafter_kind"] == "dflash2", df_row
+    assert ds_row["kind"] == "drafter" and ds_row["drafter_kind"] == "dspark", ds_row
+    assert loc_row["kind"] == "drafter" and loc_row["drafter_kind"] == "dflash2", loc_row
+
+    # Cached Hub repos with an mmproj file: vision-capable arch (qwen35) advertises mmproj; non-vision arch
+    # (inkling2_loop) suppresses mmproj in both /v1/hub/cached and /v1/hub/files.
+    for repo_dir, fname, arch in (
+        ("models--acme--Mini-Qwen35-GGUF", "Mini-Qwen35-Q4_K_M.gguf", "qwen35"),
+        ("models--acme--Mini-Inkling2-GGUF", "Mini-Inkling2-Q4_K_M.gguf", "inkling2_loop"),
+    ):
+        rdir = root / "hub" / repo_dir
+        (rdir / "refs").mkdir(parents=True, exist_ok=True)
+        (rdir / "refs" / "main").write_text(commit, encoding="ascii")
+        sdir = rdir / "snapshots" / commit
+        sdir.mkdir(parents=True, exist_ok=True)
+        (sdir / fname).write_bytes(gguf(0, arch=arch))
+        (sdir / "mmproj-BF16.gguf").write_bytes(gguf(0, arch="clip"))
+    with urlopen(url + "/v1/hub/cached", timeout=5) as response:
+        by_key4 = {(m["source"], m["file"]): m for m in json.load(response)["models"]}
+    assert by_key4[("hub", "Mini-Qwen35-Q4_K_M.gguf")]["mmproj"] == "in-repo", by_key4[("hub", "Mini-Qwen35-Q4_K_M.gguf")]
+    assert by_key4[("hub", "Mini-Inkling2-Q4_K_M.gguf")]["mmproj"] is None, by_key4[("hub", "Mini-Inkling2-Q4_K_M.gguf")]
+    with urlopen(url + "/v1/hub/files?repo=acme/Mini-Qwen35-GGUF", timeout=5) as response:
+        q_repo = json.load(response)
+    assert q_repo["mmproj"] is not None and any(c["kind"] == "mmproj" for c in q_repo["companions"]), q_repo
+    with urlopen(url + "/v1/hub/files?repo=acme/Mini-Inkling2-GGUF", timeout=5) as response:
+        i_repo = json.load(response)
+    assert i_repo["mmproj"] is None and not any(c["kind"] == "mmproj" for c in i_repo["companions"]), i_repo
+
+
+    # These are complete GGUF headers; filenames deliberately disagree with their contents.  The models are of an
+    # architecture this build reads a projector beside (qwen35).
+    repo = "acme/Mixed"
+    cached = root / "hub" / "models--acme--Mixed"
+    commit = "a" * 40
+    snap = cached / "snapshots" / commit
+    old = snap.with_name("b" * 40)
+    old.mkdir(parents=True)
+    snap.mkdir()
+    (cached / "refs").mkdir()
+    (cached / "refs" / "main").write_text(commit, encoding="ascii")
+    for folder in [root, snap]:
+        (folder / "helper.gguf").write_bytes(gguf(0, "dflash"))
+        (folder / "mmproj-Q4_0.gguf").write_bytes(gguf(0, "dflash"))
+        (folder / "imatrix-ignored.gguf").write_bytes(gguf(0, "dflash"))
+        (folder / "mtp-vision.gguf").write_bytes(gguf(0, "clip"))
+        (folder / "mmproj-markov.gguf").write_bytes(gguf(0, "dflash", markov=True))
+    (snap / "Main-Q8_0.gguf").write_bytes(gguf(1, "qwen35"))
+    (snap / "Plain-Q6_K.gguf").write_bytes(gguf(0, "qwen35"))
+    (old / "Old-Q4_0.gguf").write_bytes(gguf(0, "qwen35"))
+    (old / "mtp-layer.gguf").write_bytes(gguf(1, "qwen35"))
+    (old / "mmproj-incomplete-00001-of-00002.gguf").write_bytes(gguf(0, "clip"))
+
+    with urlopen(url + "/v1/hub/cached", timeout=5) as response:
+        models = json.load(response)["models"]
+    for source in ["dir", "hub"]:
+        entries = {m["file"]: m for m in models if m["source"] == source
+                   and (source == "hub" or Path(m["path"]).parent == root)}
+        for name in ["helper.gguf", "mmproj-Q4_0.gguf", "mmproj-markov.gguf"]:
+            row = entries[name]
+            assert row["kind"] == "drafter" and row["drafter_kind"] == ("dspark" if "markov" in name else "dflash2"), row
+        assert entries["mtp-vision.gguf"]["kind"] == "mmproj"
+        assert "imatrix-ignored.gguf" not in entries and not any("mmproj-incomplete" in f for f in entries)
+    main = entries["Main-Q8_0.gguf"]
+    assert (main["kind"], main["mtp"], main["mmproj"], main["dflash2"]) == ("gguf", "in-file", "in-repo", "in-repo"), main
+    assert entries["Plain-Q6_K.gguf"]["mtp"] == "in-repo"  # MTP is shared across snapshots.
+    older = entries["Old-Q4_0.gguf"]
+    assert (older["mtp"], older["mmproj"], older["dflash2"]) == ("in-repo", None, None), older
+    assert entries["mtp-layer.gguf"]["drafter_kind"] == "mtp"
+    with urlopen(url + "/v1/hub/files?repo=" + repo, timeout=5) as response:
+        details = json.load(response)
+    assert {m["name"] for m in details["ggufs"]} == {repo + ":Q8_0", repo + ":Q6_K"}, details
+    assert {c["file"]: c["kind"] for c in details["companions"]} == {
+        "helper.gguf": "dflash2", "mmproj-Q4_0.gguf": "dflash2",
+        "mtp-vision.gguf": "mmproj", "mmproj-markov.gguf": "dspark"}, details
+    assert details["mmproj"]["path"] == "mtp-vision.gguf" and details["mtp"] is None, details
 
 
 if __name__ == "__main__":

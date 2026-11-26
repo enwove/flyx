@@ -5,10 +5,11 @@
 namespace flyx::optest {
 
 // ---- GGML block weights kept packed (gemm_blocks.cu) -------------------------------------------
-const BlockType kBlockTypes[19] = {
+const BlockType kBlockTypes[21] = {
     {FLYX_DT_GGML_Q4_0, "Q4_0", {0}},       {FLYX_DT_GGML_Q4_1, "Q4_1", {0, 2}},
     {FLYX_DT_GGML_Q5_0, "Q5_0", {0}},       {FLYX_DT_GGML_Q5_1, "Q5_1", {0, 2}},
-    {FLYX_DT_GGML_Q8_0, "Q8_0", {0}},       {FLYX_DT_GGML_Q2_K, "Q2_K", {80, 82}},
+    {FLYX_DT_GGML_Q8_0, "Q8_0", {0}},       {FLYX_DT_GGML_MXFP4, "MXFP4", {}},
+    {FLYX_DT_GGML_Q2_0, "Q2_0", {0}},       {FLYX_DT_GGML_Q2_K, "Q2_K", {80, 82}},
     {FLYX_DT_GGML_Q3_K, "Q3_K", {108}},     {FLYX_DT_GGML_Q4_K, "Q4_K", {0, 2}},
     {FLYX_DT_GGML_Q5_K, "Q5_K", {0, 2}},    {FLYX_DT_GGML_Q6_K, "Q6_K", {208}},
     {FLYX_DT_GGML_IQ2_XXS, "IQ2_XXS", {0}}, {FLYX_DT_GGML_IQ2_XS, "IQ2_XS", {0}},
@@ -39,6 +40,9 @@ std::vector<uint8_t> random_blocks(const BlockType& bt, size_t n) {
     if (bt.dtype == FLYX_DT_GGML_IQ1_M) {  // its scale: the top nibbles of the four scale words
       const uint16_t h = scale();
       for (int j = 0; j < 4; ++j) b[49 + 2 * j] = uint8_t((b[49 + 2 * j] & 0x0F) | (((h >> (4 * j)) & 0xF) << 4));
+    }
+    if (bt.dtype == FLYX_DT_GGML_MXFP4) {  // E8M0 exponent: finite scales ~1/128..1/8 (e in 120..124)
+      b[0] = uint8_t(120u + (rng() % 5u));
     }
   }
   return file;

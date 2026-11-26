@@ -138,7 +138,7 @@ struct RoundColumns {
 #pragma unroll
         for (int c = 0; c < C; ++c) {
           F::unit_codes(T, local, raw[i][c], G, w[c]);
-          F::unit_factors(raw[i][c], G, half_of(d0[i][c]), F::kScales > 1 ? half_of(d1[i][c]) : 0.f, f[c], m[c]);
+          F::unit_factors(raw[i][c], G, scale_bits<F>(d0[i][c]), F::kScales > 1 ? scale_bits<F>(d1[i][c]) : 0.f, f[c], m[c]);
         }
         if (u + 32 * U < pf) load(i, u + 32 * U);  // the slot's next group, on its way meanwhile
         const int at0 = round_q8_at(u, units, 0) - 32 * ubase, at1 = round_q8_at(u, units, 1) - 32 * ubase;
@@ -591,8 +591,8 @@ k_round_blocks_mma(Tables T, const int8_t* A, const float* dA, const float* sA, 
       for (int bi = 0; bi < BPW; ++bi) {
         const int b0 = (32 * j + 8 * wi) / GROUPS + bi, b = b0 < blocks ? b0 : blocks - 1;
         r[bi] = block_load<F>(wn, dn, size_t(b), t);
-        s[bi][0] = scale_at(dn, size_t(b) * F::kScales);
-        s[bi][1] = F::kScales > 1 ? scale_at(dn, size_t(b) * F::kScales + 1) : 0.f;
+        s[bi][0] = scale_of<F>(dn, size_t(b) * F::kScales);
+        s[bi][1] = F::kScales > 1 ? scale_of<F>(dn, size_t(b) * F::kScales + 1) : 0.f;
       }
     };
     float acc[8][E];
@@ -792,8 +792,8 @@ k_round_blocks_cols(Tables T, const int8_t* A, const float* dA, const float* sA,
 #pragma unroll
         for (int h = 0; h < 2; ++h) {
           r[bi][h] = block_load<F>(wn[h], dn[h], size_t(b), t);
-          s[bi][h][0] = scale_at(dn[h], size_t(b) * F::kScales);
-          s[bi][h][1] = F::kScales > 1 ? scale_at(dn[h], size_t(b) * F::kScales + 1) : 0.f;
+          s[bi][h][0] = scale_of<F>(dn[h], size_t(b) * F::kScales);
+          s[bi][h][1] = F::kScales > 1 ? scale_of<F>(dn[h], size_t(b) * F::kScales + 1) : 0.f;
         }
       }
     };
@@ -1022,8 +1022,8 @@ k_round_blocks_split(Tables T, const int8_t* A, const float* dA, const float* sA
       for (int bi = 0; bi < BPW; ++bi) {
         const int b0 = (32 * j + 8 * q) / GROUPS + bi, b = b0 < blocks ? b0 : blocks - 1;
         r[h][bi] = block_load<F>(wn, dn, size_t(b), t);
-        s[h][bi][0] = scale_at(dn, size_t(b) * F::kScales);
-        s[h][bi][1] = F::kScales > 1 ? scale_at(dn, size_t(b) * F::kScales + 1) : 0.f;
+        s[h][bi][0] = scale_of<F>(dn, size_t(b) * F::kScales);
+        s[h][bi][1] = F::kScales > 1 ? scale_of<F>(dn, size_t(b) * F::kScales + 1) : 0.f;
       }
     }
   };

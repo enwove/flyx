@@ -26,10 +26,18 @@ __global__ void k_grouped_conv(const float* x, int ldx, const float* delta, int 
   *dst = accumulate ? *dst + acc : acc;
 }
 
+__device__ __forceinline__ float dflash2_score(float u, float e, float softcap, int softcap_mode) {
+  if (softcap > 0.f) {
+    return softcap_mode == FLYX_DFLASH2_SOFTCAP_AFTER ? softcap * tanhf((u + e) / softcap)
+                                                      : softcap * tanhf(u / softcap) + e;
+  }
+  return u + e;
+}
+
 // One block of 32*k threads: warp c scores candidate c.
 __global__ void k_selector_walk(const DevParams* P, const int* cand, const float* unary, int k, const float* hid,
                                 int rank, const bf16* pred, const bf16* succ, int width, const int* oracle,
-                                int* drafts) {
+                                int* drafts, float softcap, int softcap_mode) {
   pdl_trigger();
   __shared__ float score[kTopMax];
   __shared__ int prev;
@@ -52,7 +60,7 @@ __global__ void k_selector_walk(const DevParams* P, const int* cand, const float
       float e = 0.f;
       for (int i = lane; i < rank; i += 32) e += __bfloat162float(pr[i]) * hs[i] * __bfloat162float(sc[i]);
       e = warp_sum(e);
-      if (lane == 0) score[warp] = unary[s * k + warp] + e;
+      if (lane == 0) score[warp] = dflash2_score(unary[s * k + warp], e, softcap, softcap_mode);
     }
     __syncthreads();
     if (threadIdx.x == 0) {
@@ -72,7 +80,7 @@ __global__ void k_selector_walk(const DevParams* P, const int* cand, const float
 // normalises them and picks the next node.  With the test's drafts (P->oracle_len), a chain of them.
 __global__ void k_selector_tree(const DevParams* P, const int* cand, const float* unary, int k, const float* hid,
                                 int rank, const bf16* pred, const bf16* succ, int width, int depths,
-                                const int* oracle, int* drafts, TreeRows* tree) {
+                                const int* oracle, int* drafts, TreeRows* tree, float softcap, int softcap_mode) {
   pdl_trigger();
   constexpr int kRows = FLYX_MAX_ROWS;
   __shared__ float val[kRows * kTopMax];  // node n's child c at n * k + c; -inf: none, or taken
@@ -109,7 +117,7 @@ __global__ void k_selector_tree(const DevParams* P, const int* cand, const float
           float e = 0.f;
           for (int i = lane; i < rank; i += 32) e += __bfloat162float(pr[i]) * hs[i] * __bfloat162float(sc[i]);
           e = warp_sum(e);
-          if (lane == 0) score[warp] = unary[d * k + warp] + e;
+          if (lane == 0) score[warp] = dflash2_score(unary[d * k + warp], e, softcap, softcap_mode);
         }
         __syncthreads();
         if (warp == 0) {
@@ -177,7 +185,7 @@ __global__ void k_tap_copy(const TIn* x, int H, float* feats, int ld, int slot) 
 // grid (layers * nkv, rows); block hd.
 __global__ void k_draft_ctx_kv(const float* kv, int ld, const float* k_norms, float eps, double theta, int nkv, int hd,
                                const DevParams* P, int pos_sel, int skip_if_noop, kv16* dK, kv16* dV,
-                               size_t layer_stride, const double* rope) {
+                               size_t layer_stride, const double* rope, int ring) {
   pdl_trigger();
   extern __shared__ float sh[];
   if (skip_if_noop && P->noop) return;
@@ -194,7 +202,8 @@ __global__ void k_draft_ctx_kv(const float* kv, int ld, const float* k_norms, fl
   if (rope) rope_cs_inv(pos, rope[i], &c, &s);  // rope_table's factor, or its pow
   else rope_cs(pos, i, hd, theta, &c, &s);
   const float out = d < half ? nv * c - sh[d + half] * s : nv * c + sh[d - half] * s;
-  const size_t at = size_t(layer) * layer_stride + (size_t(pos) * nkv + kh) * hd + d;
+  const int cell = ring > 0 ? pos % ring : pos;
+  const size_t at = size_t(layer) * layer_stride + (size_t(cell) * nkv + kh) * hd + d;
   dK[at] = __float2half_rn(out);
   dV[at] = __float2half_rn(row[nkv * hd + kh * hd + d]);
 }
@@ -349,17 +358,19 @@ void grouped_conv(const float* x, int ldx, const float* delta, int ld_delta, con
 }
 
 void selector_walk(const DevParams* P, const int* cand, const float* unary, int k, const float* hid, int rank,
-                   const bf16* pred, const bf16* succ, int width, const int* oracle, int* drafts, cudaStream_t st) {
-  k_selector_walk<<<1, 32 * (k > 1 ? k : 1), 0, st>>>(P, cand, unary, k, hid, rank, pred, succ, width, oracle, drafts);
+                   const bf16* pred, const bf16* succ, int width, const int* oracle, int* drafts, cudaStream_t st,
+                   float softcap, int softcap_mode) {
+  k_selector_walk<<<1, 32 * (k > 1 ? k : 1), 0, st>>>(P, cand, unary, k, hid, rank, pred, succ, width, oracle, drafts,
+                                                      softcap, softcap_mode);
 }
 
 void selector_tree(const DevParams* P, const int* cand, const float* unary, int k, const float* hid, int rank,
                    const bf16* pred, const bf16* succ, int width, int depths, const int* oracle, int* drafts,
-                   TreeRows* tree, cudaStream_t st) {
+                   TreeRows* tree, cudaStream_t st, float softcap, int softcap_mode) {
   if (k < 1 || k > kTopMax || width < 1 || width >= FLYX_MAX_ROWS)
     throw std::runtime_error("selector_tree: candidates or width out of range");
   k_selector_tree<<<1, 32 * (k > 1 ? k : 1), 0, st>>>(P, cand, unary, k, hid, rank, pred, succ, width, depths, oracle,
-                                                      drafts, tree);
+                                                      drafts, tree, softcap, softcap_mode);
 }
 
 void tap_copy(const float* x, int H, float* feats, int ld_feats, int slot, int rows, cudaStream_t st) {
@@ -372,10 +383,10 @@ void tap_copy(const bf16* x, int H, float* feats, int ld_feats, int slot, int ro
 
 void draft_ctx_kv(const float* kv, int ld, const float* k_norms, float eps, double theta, int layers, int nkv, int hd,
                   int rows, const DevParams* P, int pos_sel, bool skip_if_noop, kv16* dK, kv16* dV,
-                  size_t layer_stride, cudaStream_t st) {
+                  size_t layer_stride, cudaStream_t st, int ring) {
   k_draft_ctx_kv<<<dim3(layers * nkv, rows), hd, hd * sizeof(float), st>>>(kv, ld, k_norms, eps, theta, nkv, hd, P,
                                                                             pos_sel, skip_if_noop, dK, dV,
-                                                                            layer_stride, rope_table(theta, hd));
+                                                                            layer_stride, rope_table(theta, hd), ring);
 }
 
 }  // namespace flyx::cuda

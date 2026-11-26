@@ -233,7 +233,12 @@ void draft_block_rows(const BatchPass& bp, const DFlashBlock& b, const std::vect
       flyx_seq* s = bp.seq[members[off + g]].s;
       build_rows(s->P, nullptr, b.mask_token, df.dtok + g * B, B, st);
     }
-    embed_tokens(E, df.dtok, df.dx, R, st);
+    if (E.has_norm) {
+      embed_tokens(E, df.dtok, df.dh, R, st);
+      rmsnorm(df.dh, H, E.norm.w, E.norm.offset, E.norm.eps, df.dx, H, R, H, st);
+    } else {
+      embed_tokens(E, df.dtok, df.dx, R, st);
+    }
     for (int j = 0; j < b.layers(); ++j) {
       const auto& l = block<DFlashLayer>(m, b.first_layer + j);
       rmsnorm(df.dx, H, l.norm.w, l.norm.offset, l.norm.eps, df.dh, H, R, H, st);
@@ -245,13 +250,11 @@ void draft_block_rows(const BatchPass& bp, const DFlashBlock& b, const std::vect
       for (size_t g = 0; g < n; ++g) {
         flyx_seq* s = bp.seq[members[off + g]].s;
         const KvBuf& kv = s->kv[size_t(b.kv)];
-        kv16* Kj = kv.k16(j);
-        kv16* Vj = kv.v16(j);
+        const KvRef kvr = kv.layer_ref(j);
         float* q_g = df.dq + g * B * nh * hd;
         attn_prep(df.dproj + g * B * df.ld_dproj, df.ld_dproj, 0, nh * hd, (nh + nkv) * hd, l.q_norm.w, l.k_norm.w,
-                  l.q_norm.offset, l.q_norm.eps, b.theta, hd, nh, nkv, hd, B, s->P, kPosPosition, false, q_g, Kj, Vj,
-                  st);
-        attention(q_g, Kj, Vj, nh, nkv, hd, B, false, B, 1.f / std::sqrt(float(hd)), s->P, nullptr, 0,
+                  l.q_norm.offset, l.q_norm.eps, b.theta, hd, nh, nkv, hd, B, s->P, kPosPosition, false, q_g, kvr, st);
+        attention(q_g, kvr, nh, nkv, hd, B, false, B, 1.f / std::sqrt(float(hd)), s->P, nullptr, 0,
                   df.dact + g * B * df.ld_dact, df.ld_dact, v.b.part, kRoundSplits, L, 0, b.window);
       }
       gemm(df.dact, df.ld_dact, l.w_o, H, nh * hd, df.dtmp, H, R, false, L);
@@ -310,7 +313,8 @@ void draft_block_rows(const BatchPass& bp, const DFlashBlock& b, const std::vect
         const int width = ps.p->nodes[0].arg0;
         const size_t row0 = static_cast<size_t>(batch_off[bi]);
         selector_walk(s->P, df.cand + row0 * b.sel_topk, df.unary + row0 * b.sel_topk, b.sel_topk,
-                      df.hid + row0 * b.sel_rank, b.sel_rank, b.sel_pred, b.sel_succ, width, s->oracle, s->drafts, st);
+                      df.hid + row0 * b.sel_rank, b.sel_rank, b.sel_pred, b.sel_succ, width, s->oracle, s->drafts, st,
+                      b.softcap, b.softcap_mode);
       }
     }
     for (size_t g = 0; g < n; ++g) {
@@ -331,7 +335,7 @@ void draft_block_rows(const BatchPass& bp, const DFlashBlock& b, const std::vect
       draft_head_pick(head, s->dh, nr, b.sel_topk, s->cand, s->unary, s, L);
       gemm(s->dh, H, b.sel_hid, b.sel_rank, H, s->hid, b.sel_rank, nr, false, L);
       selector_walk(s->P, s->cand, s->unary, b.sel_topk, s->hid, b.sel_rank, b.sel_pred, b.sel_succ, width, s->oracle,
-                    s->drafts, st);
+                    s->drafts, st, b.softcap, b.softcap_mode);
     }
     off += n;
   }
@@ -372,12 +376,12 @@ void draft_context_rows(const BatchPass& bp, const DFlashBlock& b, bool fused) {
   const int H = b.hidden, R = bp.rows, F = b.n_taps * b.target_hidden;
   cudaStream_t st = v.L.st;
   const Launch& L = v.L;
-  gemm(v.b.feats, v.ld_feats, b.fc, H, F, v.b.cx, H, R, false, L);
+  gemm(v.b.feats + b.feats_offset, v.ld_feats, b.fc, H, F, v.b.cx, H, R, false, L);
   norm_project(v.b.cx, v.b.h, v.b.ckv, v.ld_ckv, R, b.hidden_norm, b.ctx, b.ctx_width(), H, L, fused);
   for (const Pass& ps : bp.seq) {
     const KvBuf& kv = ps.s->kv[size_t(b.kv)];
     draft_ctx_kv(ps.v.b.ckv, ps.v.ld_ckv, b.k_norms.w, b.k_norms.eps, b.theta, b.layers(), b.nkv, b.hd, ps.rows,
-                 ps.s->P, kPosStart, true, kv.k16(), kv.v16(), kv.layer_stride, st);
+                 ps.s->P, kPosStart, true, kv.k16(), kv.v16(), kv.layer_stride, st, kv.ring);
   }
 }
 
@@ -463,12 +467,30 @@ void run_batch(const BatchPass& bp) {
       continue;
     }
     if (n.kind == FLYX_NODE_TAP) {  // row by row too
-      tap_copy(bp.v.b.x, bp.seq[0].s->m->hidden, bp.v.b.feats, bp.v.ld_feats, n.arg0, bp.rows, bp.v.L.st);
+      int head_idx = -1, feats_off = 0;
+      if (const auto* df = std::get_if<DFlashBlock>(b)) {
+        head_idx = df->head;
+        feats_off = df->feats_offset;
+      } else {
+        const auto& ds = std::get<DSparkBlock>(*b);
+        head_idx = ds.head;
+        feats_off = ds.feats_offset;
+      }
+      const flyx_bmodel* m = bp.seq[0].s->m;
+      if (n.arg1 == FLYX_TAP_NORMED) {
+        const auto& hb = block<HeadBlock>(m, head_idx);
+        rmsnorm(bp.v.b.x, m->hidden, hb.norm.w, hb.norm.offset, hb.norm.eps, bp.v.b.h, m->hidden, bp.rows, m->hidden,
+                bp.v.L.st);
+        tap_copy(bp.v.b.h, m->hidden, bp.v.b.feats + feats_off, bp.v.ld_feats, n.arg0, bp.rows, bp.v.L.st);
+      } else {
+        tap_copy(bp.v.b.x, m->hidden, bp.v.b.feats + feats_off, bp.v.ld_feats, n.arg0, bp.rows, bp.v.L.st);
+      }
       continue;
     }
-    // Share drafter context GEMMs across all batch rows; DV's canvas pass (a warm-up's: its trees run alone) reads
-    // and writes the sequence's own canvas, a sequence at a time below.
-    if (n.kind == FLYX_NODE_CONTEXT && !std::holds_alternative<DvBlock>(*b)) {
+    // Share drafter context GEMMs across all batch rows; DV's canvas pass (a warm-up's: its trees run alone) and
+    // DSpark's per-layer K/V + Markov context update run a sequence at a time below.
+    if (n.kind == FLYX_NODE_CONTEXT && !std::holds_alternative<DvBlock>(*b) &&
+        !std::holds_alternative<DSparkBlock>(*b)) {
       if (const auto* t = std::get_if<MtpBlock>(b)) mtp_context_rows(bp, *t, fused);
       else draft_context_rows(bp, std::get<DFlashBlock>(*b), fused);
       continue;

@@ -266,7 +266,12 @@ bool Engine::load_backend(std::string* err) {
 
 Grammar& Engine::grammar() {
   std::lock_guard<std::mutex> lock(grammar_mu_);
-  if (!grammar_.ready()) grammar_.init(tok_, model_->desc().vocab, eos_);
+  if (!grammar_.ready()) {
+    std::vector<int32_t> markers;  // the special tokens the chat format writes replies with
+    for (const std::string& text : chat_.reply_tokens())
+      if (const int32_t id = tok_.added_id(text); tok_.special(id)) markers.push_back(id);
+    grammar_.init(tok_, model_->desc().vocab, eos_, markers);
+  }
   return grammar_;
 }
 
@@ -314,9 +319,14 @@ bool Engine::build_and_calibrate_plans(double* t_plans, double* t_rounds, std::s
                              : std::min(plans_.widths[i], chain > 0 ? chain : plans_.widths[i]);
     }
   *t_plans = os::now_ms();
+  // The rounds are timed where this prompt ends, on the drafts that follow it.  Prose, not a count: after "1, 2, 3, 4,
+  // 5, 6," the drafts are digits and commas, and a sparse-MoE target routes a round of those few tokens to few experts,
+  // so its wide rounds timed cheap (Inkling-2-Mini: 2 -> 3 drafts +0.7 ms timed, +1.5 ms on chat prompts).  A tokenizer
+  // that makes more than 64 tokens of it keeps its end, and the longer context below ends with it too.
   std::vector<int32_t> prompt = tok_.encode("The quick brown fox jumps over the lazy dog. In the beginning was the word, and "
-                                            "the word was with the engine, and the engine was fast. 1, 2, 3, 4, 5, 6,");
-  if (prompt.size() > 64) prompt.resize(64);
+                                            "the word was with the engine, and the engine was fast. When the evening "
+                                            "came, the travellers");
+  if (prompt.size() > 64) prompt.erase(prompt.begin(), prompt.end() - 64);
   std::vector<std::string> labels, given_labels;
   for (size_t i = 0; i < plans_.widths.size(); ++i) labels.push_back(round_name(i));
   for (int k : plans_.given_widths) given_labels.push_back(std::to_string(k));
@@ -340,10 +350,11 @@ bool Engine::build_and_calibrate_plans(double* t_plans, double* t_rounds, std::s
     // And after a longer context: a round's attention reads every key, the more the more rows it has (DV's 32 verify
     // rows and 32 canvas rows a round of 31).  Its cost per token of context past the first.
     const int longer = restarting ? long_calibration(opt_.max_ctx, prefill_align_) : 0;
-    if (longer > round_ms_at_) {
-      std::vector<int32_t> context;
+    if (longer > round_ms_at_ && !prompt.empty()) {
+      std::vector<int32_t> context;  // the prompt repeated, its last copy whole: both timings draft after its end
+      context.reserve(static_cast<size_t>(longer) + prompt.size());
       while (static_cast<int>(context.size()) < longer) context.insert(context.end(), prompt.begin(), prompt.end());
-      context.resize(size_t(longer));
+      context.erase(context.begin(), context.end() - longer);
       const std::string what = "round at " + std::to_string(longer) + " tokens";
       auto time_at = [&](const std::vector<int32_t>& tokens, const std::string& label) {
         std::vector<double> ms;
@@ -572,7 +583,7 @@ bool Engine::load(const std::string& path, const EngineOptions& opt, std::string
   const bool req_dw_valid =
       req_dw_raw.empty() || interfaces::parse_draft_weights(req_dw_raw, &req_dw, nullptr, nullptr);
   // Strip valid draft_weights= from the opaque options string and pass it via typed flyx_open_options::draft_weights
-  // (ABI 45); leave invalid values intact so the backend reports its normal option error.
+  // (ABI 48); leave invalid values intact so the backend reports its normal option error.
   std::string clean_backend_opts =
       req_dw_valid ? interfaces::backend_opt_strip(initial_backend_opts, "draft_weights") : initial_backend_opts;
   interfaces::DraftWeightsMode cur_dw = req_dw;
@@ -719,14 +730,24 @@ bool Engine::load(const std::string& path, const EngineOptions& opt, std::string
     }
   }
 
+  // A drafter the caller named (--drafter mtp, dflash2, dspark, dv) is never skipped: a load that cannot keep it
+  // fails, as one without elastic loading does.  auto and all leave the drafters to the load.
+  interfaces::DrafterMode asked_drafter = interfaces::DrafterMode::kAuto;
+  const bool drafter_named = interfaces::parse_drafter_mode(opt_.drafter, &asked_drafter) &&
+                             asked_drafter != interfaces::DrafterMode::kAuto &&
+                             asked_drafter != interfaces::DrafterMode::kAll &&
+                             asked_drafter != interfaces::DrafterMode::kNone;
+
   // Ordered VRAM degradation ladder (each step preserves identical target output tokens):
   //   1) vision_device: gpu -> disk (frees 100% vision VRAM while keeping multimodal)
   //   2) draft_weights -> nvfp4 (when backend estimates meaningful VRAM savings >= 128 MiB and >= 10%)
-  //   3) drop heavy DFlash2 drafter while retaining or falling back to lightweight MTP
+  //   3) drop heavy DFlash2 drafter while retaining DSpark beside it, or retaining or falling back to MTP
   //   4) drop remaining neural drafters, keeping zero-VRAM prompt lookup (or plain decoding if lookup is off)
+  // Steps 3 and 4 only for drafters the load chose (drafter_named: none).
   auto step_down = [&](bool comfort_only, const flyx_load_estimate* est) -> bool {
     const bool has_mtp = model_has_drafter(*model_, "mtp");
     const bool has_dflash2 = model_has_drafter(*model_, "dflash2");
+    const bool has_dspark = model_has_drafter(*model_, "dspark");
     const bool has_dv = model_has_drafter(*model_, "dv");
 
     if (!comfort_only && orig_has_vision && vdev == interfaces::VisionDeviceMode::kGpu) {
@@ -738,33 +759,41 @@ bool Engine::load(const std::string& path, const EngineOptions& opt, std::string
     if (req_dw_valid && cur_dw != interfaces::DraftWeightsMode::kNvfp4 && est && meaningful_draft_savings(*est) &&
         (!comfort_only || req_dw == interfaces::DraftWeightsMode::kAuto)) {
       cur_dw = interfaces::DraftWeightsMode::kNvfp4;
-      const std::string detail = has_dflash2 ? "DFlash2 drafter weights quantized to NVFP4 (4-bit) to save VRAM"
-                                             : "Drafter weights quantized to NVFP4 (4-bit) to save VRAM";
+      const std::string detail = has_dflash2   ? "DFlash2 drafter weights quantized to NVFP4 (4-bit) to save VRAM"
+                                 : has_dspark ? "DSpark drafter weights quantized to NVFP4 (4-bit) to save VRAM"
+                                              : "Drafter weights quantized to NVFP4 (4-bit) to save VRAM";
       upsert_adj("draft_weights", interfaces::draft_weights_name(req_dw), "nvfp4", detail);
       return true;
     }
-    if (comfort_only) return false;
-    if (has_dflash2) {
-      interfaces::ModelOptions mo_mtp = mo;
-      mo_mtp.drafter = "mtp";
+    if (comfort_only || drafter_named) return false;
+    // The drafters but one: the model opened with `keep` alone (its weights' precision as asked again).
+    auto keep_only = [&](const char* keep, const std::string& detail) {
+      interfaces::ModelOptions mo_keep = mo;
+      mo_keep.drafter = keep;
       std::string probe_err;
-      if (auto mtp_model = interfaces::open_model(file_, mo_mtp, &probe_err)) {
-        opt_.drafter = "mtp";
-        model_ = std::move(mtp_model);
-        if (req_dw == interfaces::DraftWeightsMode::kAuto) {
-          erase_adj("draft_weights");
-          cur_dw = req_dw;
-        } else if (cur_dw == interfaces::DraftWeightsMode::kNvfp4) {
-          upsert_adj("draft_weights", interfaces::draft_weights_name(req_dw), "nvfp4",
-                     "Drafter weights quantized to NVFP4 (4-bit) to save VRAM");
-        }
-        const std::string detail = has_mtp ? "DFlash2 drafter skipped due to tight VRAM; running with MTP"
-                                           : "DFlash2 drafter skipped due to tight VRAM; falling back to MTP";
-        upsert_adj("drafter", orig_drafters_str, "mtp", detail);
-        return true;
+      auto kept = interfaces::open_model(file_, mo_keep, &probe_err);
+      if (!kept) return false;
+      opt_.drafter = keep;
+      model_ = std::move(kept);
+      if (req_dw == interfaces::DraftWeightsMode::kAuto) {
+        erase_adj("draft_weights");
+        cur_dw = req_dw;
+      } else if (cur_dw == interfaces::DraftWeightsMode::kNvfp4) {
+        upsert_adj("draft_weights", interfaces::draft_weights_name(req_dw), "nvfp4",
+                   "Drafter weights quantized to NVFP4 (4-bit) to save VRAM");
       }
-    }
-    if (has_dflash2 || has_mtp || has_dv) {
+      upsert_adj("drafter", orig_drafters_str, keep, detail);
+      return true;
+    };
+    // DSpark beside DFlash2 (--drafter all): DFlash2 goes first, the larger of the two (its weights and its context
+    // cache, which grows with the context where DSpark's stays bounded).
+    if (has_dflash2 && has_dspark &&
+        keep_only("dspark", "DFlash2 drafter skipped due to tight VRAM; running with DSpark"))
+      return true;
+    if (has_dflash2 && keep_only("mtp", has_mtp ? "DFlash2 drafter skipped due to tight VRAM; running with MTP"
+                                                : "DFlash2 drafter skipped due to tight VRAM; falling back to MTP"))
+      return true;
+    if (has_dflash2 || has_mtp || has_dv || has_dspark) {
       interfaces::ModelOptions mo_none = mo;
       mo_none.drafter = "none";
       std::string none_err;
@@ -861,7 +890,7 @@ bool Engine::load(const std::string& path, const EngineOptions& opt, std::string
               load_adjustments_.back().detail.c_str());
   }
 
-  // Record effective active drafter weight precision directly from the backend (ABI 45).
+  // Record effective active drafter weight precision directly from the backend (ABI 48).
   if (drafter_ != "none" && api_->draft_weights) {
     if (const char* dw = api_->draft_weights(bm_); dw && *dw) active_draft_weights_ = dw;
   }

@@ -219,7 +219,7 @@ bool build(const flyx_backend_api* api, flyx_bmodel* bm, const interfaces::Model
       if (cps.size() < 2 || cps.size() > FLYX_MAX_STOP_BUCKETS) continue;
       auto rnd = model.round_program(cps.back(), d, false);
       flyx_program rp{FLYX_PHASE_ROUND, cps.back(), cps.back() + 1, static_cast<int32_t>(rnd.size()), rnd.data(),
-                      static_cast<int32_t>(cps.size()), cps.data()};
+                      static_cast<int32_t>(cps.size()), cps.data(), model.draft_steps_cheap(d) ? 1 : 0};
       flyx_plan* plan = nullptr;
       if (api->lower(bm, &rp, &plan) == 0 && plan) {
         out->adaptive[size_t(d)] = plan;

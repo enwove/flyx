@@ -178,11 +178,11 @@ bool want_from_json(const ojson& j, const EngineOptions& base, ModelHost::Want* 
     }
   }
   if (j.contains("drafter") && !j["drafter"].is_null()) {
-    if (!j["drafter"].is_string()) return *err = "\"drafter\": mtp, dflash2, dv, all or none", false;
+    if (!j["drafter"].is_string()) return *err = "\"drafter\": mtp, dflash2, dspark, dv, all or none", false;
     const std::string d = j["drafter"].get<std::string>();
     interfaces::DrafterMode mode = interfaces::DrafterMode::kAuto;
     if (!interfaces::parse_drafter_mode(d, &mode))
-      return *err = "\"drafter\": mtp, dflash2, dv, all or none", false;
+      return *err = "\"drafter\": mtp, dflash2, dspark, dv, all or none", false;
     out.eo.drafter = d;
   }
   if (j.contains("speculative") && !j["speculative"].is_null()) {
@@ -468,7 +468,7 @@ bool ModelHost::work(const Want& w, std::string* err) {
     progress_ = p;
   });
   if (!apps::fetch_model(w.model, w.drafters, apps::wants_mtp(w.eo), logged, &stop_, &f, err, w.eo.mmproj_file,
-                         w.eo.vision)) {
+                         w.eo.vision, apps::wants_dspark(w.eo, w.drafters))) {
     std::fprintf(stderr, "flyx-server: %s: %s\n", w.model.c_str(), err->c_str());
     std::lock_guard<std::mutex> lock(mu_);
     error_ = *err, state_ = served_.sched ? "ready" : "failed";
