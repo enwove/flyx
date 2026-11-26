@@ -213,6 +213,8 @@ void gemm_on_glu(const Lin& W, int N, int K, float* y, int ldy, int rows, bool a
 // all sessions (one pass runs at a time), so a large chunk costs memory once.
 struct RowBufs {
   int *tokens = nullptr, *choice = nullptr;
+  int* mcand = nullptr;  // a batched MTP step's kMtpCands candidates a row, and their logits (mtp_choose)
+  float* mval = nullptr;
   float *x = nullptr, *h = nullptr, *proj = nullptr, *act = nullptr, *gdn_o = nullptr, *qbuf = nullptr,
         *part = nullptr, *attn_state = nullptr, *split_state = nullptr, *feats = nullptr, *cx = nullptr,
         *ckv = nullptr, *mcat = nullptr, *mx = nullptr, *mhn = nullptr;
@@ -654,6 +656,8 @@ struct flyx_seq {
   // drafter scratch
   float* mg = nullptr;                 // MTP normalized draft hidden
   int* mtok = nullptr;                 // MTP: [anchor, d1, ..., dK]
+  int* mcand = nullptr;                // MTP: a draft step's kMtpCands candidates and their logits (mtp_choose)
+  float* mval = nullptr;
   int* oracle = nullptr;
   int oracle_cap = 0;
   // gen.drafts: written where the oracle is read, through a ring of pinned

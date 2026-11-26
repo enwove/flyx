@@ -4122,6 +4122,22 @@ int main(int argc, char** argv) {
       check(a == b && static_cast<int>(a.size()) == N,
             "sampled (T=" + std::to_string(sp_cfg.temperature).substr(0, 3) + "): DFlash2 == plain for one seed");
       check(c2 == a, "  both drafters, chosen every round == plain for one seed");
+      {  // MTP alone: its drafts chosen as the sampler chooses (ops::draft_choice) change only how many are accepted
+        Session sm(mtp_q.get());
+        init_checked(sm);
+        std::vector<flyx_round_result> trace;
+        sm.trace = &trace;
+        std::vector<int32_t> toks;
+        GenerateResult res;
+        generate(sm, rq, [&](std::string_view, const int32_t* t, int nt) {
+          toks.insert(toks.end(), t, t + nt);
+          return true;
+        }, &res, &err);
+        int accepted = 0, drafts = 0;
+        for (size_t i = 1; i < trace.size(); ++i) accepted += trace[i].n_accepted, drafts += trace[i].n_drafts;
+        check(toks == a, "  MTP, its drafts chosen as the sampler chooses == plain for one seed (" +
+                             std::to_string(accepted) + " of " + std::to_string(drafts) + " drafts accepted)");
+      }
     }
 
     // Penalties on the tokens a reply already has: plain

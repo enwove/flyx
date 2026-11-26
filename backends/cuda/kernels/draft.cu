@@ -332,6 +332,22 @@ __global__ void k_mtp_oracle(const DevParams* P, const int* oracle, int step, in
   mtok[step + 1] = pos < P->oracle_len ? oracle[pos] : 0;
 }
 
+__global__ void k_mtp_choose(const DevParams* P, const DevGen* G, const int* reply_count, const int* cand,
+                             const float* val, int k, int vocab, int step, int* mtok) {
+  pdl_trigger();
+  // each candidate's count as the row verifying this draft counts it: the reply's and the round's drafts before it
+  // (a candidate outside the vocabulary is none: draft_choice skips it)
+  int count[ops::kMtpCands];
+  const bool pen = G->presence != 0.f || G->frequency != 0.f;
+  for (int c = 0; pen && c < k; ++c) {
+    if (cand[c] < 0 || cand[c] >= vocab) continue;
+    count[c] = reply_count[cand[c]];
+    for (int j = 1; j <= step; ++j) count[c] += mtok[j] == cand[c];
+  }
+  mtok[step + 1] = ops::draft_choice(cand, val, pen ? count : nullptr, k, vocab, G->temperature, G->top_p, G->top_k,
+                                     G->presence, G->frequency, G->seed, int64_t(P->position) + 1 + step);
+}
+
 __global__ void k_given_drafts(const DevParams* P, const int* oracle, int width, int* drafts) {
   pdl_trigger();
   const int i = threadIdx.x;
@@ -361,6 +377,12 @@ void hring_put(const DevParams* P, int pos_sel, bool skip_if_noop, const float* 
 
 void mtp_oracle(const DevParams* P, const int* oracle, int step, int* mtok, cudaStream_t st) {
   k_mtp_oracle<<<1, 1, 0, st>>>(P, oracle, step, mtok);
+}
+
+void mtp_choose(const DevParams* P, const DevGen* G, const int* reply_count, const int* cand, const float* val, int k,
+                int vocab, int step, int* mtok, cudaStream_t st) {
+  if (k < 1 || k > ops::kMtpCands || k > vocab) throw std::runtime_error("mtp_choose: candidates out of range");
+  k_mtp_choose<<<1, 1, 0, st>>>(P, G, reply_count, cand, val, k, vocab, step, mtok);
 }
 
 __global__ void k_shift_params(const DevParams* P, DevParams* dst, int add) {

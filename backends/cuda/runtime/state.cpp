@@ -4,6 +4,7 @@
 #include "backends/cuda/runtime/window_ring.h"
 #include "backends/cuda/backend.h"
 #include "flyx/gemm_tables.inc"
+#include "ops/sampling/sampling.h"
 
 #include <algorithm>
 
@@ -118,6 +119,10 @@ void alloc_rows(const flyx_bmodel* m, int R, bool prefill, RowBufs* b, Alloc&& a
   auto f = [&](size_t count) { return static_cast<float*>(alloc(count * sizeof(float))); };
   b->tokens = static_cast<int*>(alloc(size_t(R) * sizeof(int)));
   b->choice = static_cast<int*>(alloc(size_t(R) * sizeof(int)));
+  if (n.mtp && !prefill) {  // a batched MTP step's candidates (mtp_choose)
+    b->mcand = static_cast<int*>(alloc(size_t(R) * ops::kMtpCands * sizeof(int)));
+    b->mval = f(size_t(R) * ops::kMtpCands);
+  }
   b->x = f(size_t(R) * H);
   if (n.lora) b->lora = f(size_t(R) * n.lora);  // live beside every buffer below: a layer's linears read it
   // Prefill attention runs on tensor cores (no partials) above FLYX_MAX_ROWS rows, every head dim the backend
@@ -1432,6 +1437,8 @@ void build_seq(flyx_bmodel* m, int32_t max_ctx, flyx_seq* s) {
   if (m->mtp_block >= 0) {
     s->mg = s->alloc<float>(H);
     s->mtok = s->alloc<int>(FLYX_MAX_ROWS + 1);
+    s->mcand = s->alloc<int>(ops::kMtpCands);
+    s->mval = s->alloc<float>(ops::kMtpCands);
   }
   // Tree rounds and relaxed acceptance (runner.cpp), last: the buffers above keep the addresses they have without them.
   s->tree = s->alloc<TreeRows>(1);
