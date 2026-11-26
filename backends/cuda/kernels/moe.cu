@@ -1064,6 +1064,24 @@ __device__ __forceinline__ void l2_prefetch_bulk(const void* p, uint32_t bytes) 
 #endif
 }
 
+// L2 warm-up of small weights a later latency-bound kernel reads (l2_warm): thread t of the grid asks for the
+// t-th 16 KB piece of the ranges laid end to end.
+__global__ void k_l2_warm(L2Ranges r) {
+  constexpr size_t kPiece = 16384;
+  size_t t = size_t(blockIdx.x) * blockDim.x + threadIdx.x;
+  for (int i = 0; i < r.count; ++i) {
+    const size_t pieces = (r.n[i] + kPiece - 1) / kPiece;
+    if (t < pieces) {
+      const size_t off = t * kPiece;
+      const uint32_t n = uint32_t(min(kPiece, r.n[i] - off)) & ~15u;
+      const uint8_t* a = static_cast<const uint8_t*>(r.p[i]) + off;
+      if (n && (reinterpret_cast<uintptr_t>(a) & 15u) == 0) l2_prefetch_bulk(a, n);
+      return;
+    }
+    t -= pieces;
+  }
+}
+
 // An expert-major plane: one expert's bytes contiguous, per_expert of them.
 struct PrefetchPlane {
   const uint8_t* base;
@@ -1178,6 +1196,13 @@ void moe_prefetch(const float* x, const float* norm_w, float norm_offset, const 
                                     PrefetchPlane{gate_up.s, gu_n * size_t(H) / 16},
                                     PrefetchPlane{down.q, dn_n * size_t(I) / 2},
                                     PrefetchPlane{down.s, dn_n * size_t(I) / 16});
+}
+
+void l2_warm(const L2Ranges& r, cudaStream_t st) {
+  size_t pieces = 0;
+  for (int i = 0; i < r.count; ++i) pieces += (r.n[i] + 16383) / 16384;
+  if (!pieces) return;
+  k_l2_warm<<<unsigned((pieces + 127) / 128), 128, 0, st>>>(r);
 }
 
 void moe_route(const float* logits, const float* bias, int rows, int n_experts, int top_k, bool gating_sigmoid,

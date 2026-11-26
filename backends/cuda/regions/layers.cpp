@@ -776,6 +776,26 @@ void flush_pending_post_conv(const Pass& ps, bool require_in_x) {
   }
 }
 
+// Small weights a later latency-bound kernel reads, asked of L2 on the expert stream (FLYX_WARM): joined at the
+// round's end (flyx_seq::warm_out).  Changes no result.
+static void warm_side(flyx_seq* s, cudaStream_t st, const L2Ranges& r) {
+  if (!r.count || !s->expert_side.st) return;
+  const SideStream& es = s->expert_side;
+  CK(cudaEventRecord(es.fork, st));
+  CK(cudaStreamWaitEvent(es.st, es.fork, 0));
+  l2_warm(r, es.st);
+  CK(cudaEventRecord(es.join, es.st));
+  s->warm_out = true;
+}
+
+static int warm_flags() {
+  static const int w = [] {
+    const char* e = std::getenv("FLYX_WARM");
+    return e ? std::atoi(e) : 23;
+  }();
+  return w;
+}
+
 void rel_attn_layer(const Pass& ps, const RelAttnBlock& a, bool fused) {
   const RowView& rv = ps.v;
   auto* s = ps.s;
@@ -823,6 +843,43 @@ void rel_attn_layer(const Pass& ps, const RelAttnBlock& a, bool fused) {
     if (pend.res_push) ++ps.res->res_n;
     ps.res->pending = {};
     ps.res->x_cur = x_dst;
+    // The next MoE's router, loop controller, query and norm (FLYX_WARM bits 1, 2, 4; 8 the bank too), while the
+    // attention runs: RTX 5090, Inkling-2-Mini UD-IQ4_XS plain decoding 204.7 -> 207.5 tok/s with bits 1|2|4.
+    const int warm = warm_flags();
+    if (warm && ps.next_moe && s->expert_side.st && ps.round) {
+      const MoeBlock& f = *ps.next_moe;
+      const SideStream& es = s->expert_side;
+      auto lin = [](const Lin& w, size_t n) {
+        return w.round.b16 ? std::pair<const void*, size_t>{w.round.b16, n * 2}
+                           : std::pair<const void*, size_t>{w.round.f32, n * 4};
+      };
+      L2Ranges r;
+      const size_t EH = size_t(f.n_experts) * f.hidden, HH = size_t(f.hidden);
+      if (warm & 1) {
+        auto [p, n] = lin(f.router, EH);
+        r.add(p, n);
+      }
+      if ((warm & 2) && f.loop_rank > 0) {
+        const size_t rk = size_t(f.loop_rank);
+        auto [p0, n0] = lin(f.loop_ctrl.down, rk * 2 * HH);
+        r.add(p0, n0);
+        if (f.loop_ctrl.stacked) {
+          auto [p1, n1] = lin(f.loop_ctrl.gain_forget, rk * 2 * HH);
+          r.add(p1, n1);
+        } else {
+          auto [p1, n1] = lin(f.loop_ctrl.gain, rk * HH);
+          auto [p2, n2] = lin(f.loop_ctrl.forget, rk * HH);
+          r.add(p1, n1);
+          r.add(p2, n2);
+        }
+      }
+      if (warm & 4) {
+        r.add(f.res_query, HH * 4);
+        r.add(f.norm.w, HH * 4);
+      }
+      if (warm & 8) r.add(rv.b.res_bank, size_t(ps.res->res_n) * R * HH * 4);
+      warm_side(s, st, r);
+    }
     in_raw[0] = rv.b.attn_in;
     in_raw[1] = is_swa ? rv.b.attn_in : rv.b.attn_in + size_t(R) * H;
     in_raw[2] = is_swa ? rv.b.attn_in : rv.b.attn_in + size_t(2) * R * H;
@@ -1142,6 +1199,52 @@ void moe_layer(const Pass& ps, const MoeBlock& f, bool fused) {
     if (f.res_query) {
       attn_res_mix(rv.b.res_bank, ps.res->res_n, cur_x, f.res_query, 1, R, H, rv.b.attn_in, st);
       cur = rv.b.attn_in;
+    }
+  }
+  // The next attention's controllers, queries, ShortConv taps, sink, norm and relative bias (FLYX_WARM bit 16; 32
+  // its K and V blocks too, which lost), while this MoE runs: 207.5 -> 211.5 tok/s, 30k context 159.5 -> 163.3.
+  if ((warm_flags() & 16) && ps.next_attn && ps.round) {
+    const RelAttnBlock& a = *ps.next_attn;
+    const size_t HH = size_t(a.hidden), kvd = size_t(a.nkv) * a.hd;
+    auto lin = [](const Lin& w, size_t n) {
+      return w.round.b16 ? std::pair<const void*, size_t>{w.round.b16, n * 2}
+                         : std::pair<const void*, size_t>{w.round.f32, n * 4};
+    };
+    L2Ranges r0, r1;
+    if (a.loop_rank > 0)
+      for (int j = 0; j < 3; ++j) {
+        const size_t rk = size_t(a.loop_rank);
+        auto [p0, n0] = lin(a.loop_ctrl[j].down, rk * 2 * HH);
+        r0.add(p0, n0);
+        if (a.loop_ctrl[j].stacked) {
+          auto [p1, n1] = lin(a.loop_ctrl[j].gain_forget, rk * 2 * HH);
+          r0.add(p1, n1);
+        }
+      }
+    r1.add(a.res_query, 3 * HH * 4);
+    r1.add(a.k_conv, kvd * a.conv * 4);
+    r1.add(a.v_conv, kvd * a.conv * 4);
+    r1.add(a.post_conv, HH * a.conv * 4);
+    r1.add(a.w_sink.w, size_t(a.nh) * HH * 2);
+    r1.add(a.q_norm_in.w, HH * 4);
+    r1.add(a.rel_bias, size_t(a.rel_extent) * a.d_rel * 4);
+    r1.add(a.q_clip_w, size_t(a.nh) * a.hd * 4);
+    r1.add(a.rel_clip_w, size_t(a.nh) * a.d_rel * 4);
+    warm_side(s, st, r0);
+    warm_side(s, st, r1);
+    if (warm_flags() & 32) {  // the K and V projections' blocks
+      L2Ranges r2;
+      for (const Lin* w : {&a.w_k, &a.w_v}) {
+        if (!w->packed()) continue;
+        for (const BlockMat& b : w->blk) {
+          const BlockLayout bl = blocks_layout(b.dtype);
+          if (!bl.values) continue;
+          const size_t nb = size_t(b.rows) * HH / bl.values;
+          r2.add(b.data, nb * bl.stride);
+          r2.add(b.scales, nb * bl.scales * 2);
+        }
+      }
+      warm_side(s, st, r2);
     }
   }
   if (f.loop_rank > 0) {

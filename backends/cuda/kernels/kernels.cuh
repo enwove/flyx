@@ -1726,6 +1726,16 @@ void rmsnorm_moe_q8(const float* x, int ldx, const float* w, float offset, float
 void moe_prefetch(const float* x, const float* norm_w, float norm_offset, const bf16* router_b16,
                   const float* router_f32, const float* bias, bool gating_sigmoid, int E, int top_k, int H, int I,
                   const ExpertMat& gate_up, const ExpertMat& down, float* scores, cudaStream_t st);
+// Byte ranges for L2 (l2_warm): asks L2 for them on st and returns; changes no result.
+struct L2Ranges {
+  const void* p[8] = {};
+  size_t n[8] = {};
+  int count = 0;
+  void add(const void* ptr, size_t bytes) {
+    if (ptr && bytes && count < 8) p[count] = ptr, n[count++] = bytes;
+  }
+};
+void l2_warm(const L2Ranges& r, cudaStream_t st);
 void moe_route(const float* logits, const float* bias, int rows, int n_experts, int top_k, bool gating_sigmoid,
                bool norm_weights, float norm_eps, float route_scale, int* idx_out, float* w_out, cudaStream_t st);
 void situ_rows(const float* gu, int ld_gu, int I, float beta, float linear_beta, float* out, int ld_out, int rows,

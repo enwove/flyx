@@ -581,6 +581,7 @@ struct flyx_seq {
   flyx::cuda::SideStream side{};  // a round's narrow GEMMs of a stack beside its wide ones (Launch::side)
   // A round's expert reads ahead (moe_prefetch): a stream of its own, so they never queue before Launch::side's GEMMs.
   flyx::cuda::SideStream expert_side{};
+  bool warm_out = false;  // a round's L2 warm-ups on expert_side, joined at its end (regions/plan.cpp)
   std::vector<void*> allocs;
 
   flyx::cuda::DevParams* P = nullptr;
@@ -1079,6 +1080,8 @@ struct Pass {
   const int32_t* mtp_pos_3d = nullptr;
   RowView v{};           // the rows it works on (rows_of(s) for a sequence's own pass)
   ResState* res = nullptr;  // pass-local AttnRes / loop bank counters (stack-owned by forward_nodes)
+  const MoeBlock* next_moe = nullptr;       // the MoE right after this node (forward_nodes): its L2 warm-up
+  const RelAttnBlock* next_attn = nullptr;  // the attention right after this node: its L2 warm-up
   int width() const { return accept_width >= 0 ? accept_width : p->width; }
   bool reads_copy(const KvBuf& kb) const { return round && kb.kq && strata != kStrataNone; }
   bool reads_cache(const KvBuf& kb) const { return !reads_copy(kb) || strata == kStrataBoth; }
