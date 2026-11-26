@@ -69,6 +69,8 @@ Inkling-2-Mini (UD-IQ3_XXS), ohne Drafter → Markov DSpark (Q8_0), in Token/s. 
 | GPU | chat_short · 8 × 128 | code_short · 8 × 384 |
 |---|---:|---:|
 | RTX 5090 · Linux | 225.5 → 259.8 | 228.5 → 438.9 |
+| RTX 4090 · Linux | 166.7 → 202.9 | 167.9 → 322.4 |
+| RTX 3090 · Linux | 126.2 → 136.5 | 126.9 → 222.0 |
 | RTX 5070 Ti · Windows | 150.9 → 169.3 | 153.6 → 276.2 |
 
 [Messwerte und Befehle](../benchmarks.md#v021-four-gpu-verified-benchmarks)

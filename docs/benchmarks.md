@@ -6,7 +6,7 @@ Reproducible long-context coding, `flyx bench` decode, drafter, and Needle-in-a-
 
 ## v0.2.1 four-GPU verified benchmarks
 
-The Linux measurements used one CUDA 13.0.88 build of candidate `5fa1a32` on Ubuntu 24.04 with PTX JIT disabled. Windows measurements used native Windows 11 (WDDM), with Inkling and the dashboard on `5fa1a32`, and Qwen, the 20K ring and cold start on `42e3734` before the Inkling decode changes. The Windows candidate passed 170/170 GPU-suite tests. Its standalone executable contained 115 cubins and zero PTX images and weighed 57,148,928 bytes (57.15 MB), compared with 58,960,384 bytes in v0.2.0. These captures predate the version bump.
+Linux captures used CUDA 13.0.88 on Ubuntu 24.04 with PTX JIT disabled. The hardware table below describes the original `5fa1a32` runs. The RTX 4090 and 3090 Inkling decode results come from a second capture on `078022fc`. Windows measurements used native Windows 11 (WDDM), with Inkling and the dashboard on `5fa1a32`, and Qwen, the 20K ring and cold start on `42e3734` before the Inkling decode changes. The Windows candidate passed 170/170 GPU-suite tests. Its standalone executable contained 115 cubins and zero PTX images and weighed 57,148,928 bytes (57.15 MB), compared with 58,960,384 bytes in v0.2.0. These captures predate the version bump.
 
 | GPU | Driver | Power limit | Qwen3.8-27B GGUF | GPU weight GB | Effective / rated GB/s | Share |
 |---|---|---:|---|---:|---:|---:|
@@ -34,14 +34,25 @@ The 5090 used W4A4 prefill on the NVFP4 target. On the same prompt, explicit `--
 
 ### Inkling-2-Mini and Markov DSpark
 
-The target was `Inkling-2-Mini-UD-IQ3_XXS.gguf`, the companion `dspark-Inkling-2-Mini-Q8_0.gguf`. Each cell shows plain → DSpark decode tok/s on the same GPU, with exact KV reads and lookup disabled. The 5090 and 5070 Ti runs matched prompt IDs, output IDs and output lengths for every prompt and repetition. The Ampere and Ada Inkling captures at `5fa1a32` failed that comparison. The two pending rows require fresh rates and parity checks on the sm_80/sm_89 ShortConv correction (`078022fc`).
+The target was `Inkling-2-Mini-UD-IQ3_XXS.gguf`, the companion `dspark-Inkling-2-Mini-Q8_0.gguf`. Each cell shows plain → DSpark decode tok/s on the same GPU, with exact KV reads and lookup disabled. All four GPUs matched prompt IDs, output IDs and output lengths between plain and DSpark for every prompt in the warm-up and three measured runs. The RTX 5090 and 5070 Ti used `5fa1a32`. The 4090 and 3090 used `078022fc`, which rounds the scaled ShortConv result before adding the residual. On each of those two GPUs, the fused and generic paths matched on all eight chat prompts, and all four GPU tests passed (`cuda_ops`, `inkling2_cuda`, `cuda_loader`, `elastic_load_cuda`).
 
 | GPU | chat_short, 8 × 128 | code_short, 8 × 384 |
 |---|---:|---:|
 | RTX 5090 | 225.5 → 259.8 | 228.5 → 438.9 |
-| RTX 4090 | TBD_4090_INK2 | TBD_4090_INK2 |
-| RTX 3090 | TBD_3090_INK2 | TBD_3090_INK2 |
+| RTX 4090 | 166.7 → 202.9 | 167.9 → 322.4 |
+| RTX 3090 | 126.2 → 136.5 | 126.9 → 222.0 |
 | RTX 5070 Ti | 150.9 → 169.3 | 153.6 → 276.2 |
+
+The RTX 4090 recheck used a 500 W limit and driver 595.91.07. The RTX 3090 recheck used 350 W and driver 580.178.04. The ranges below cover the three measured runs. Speedups use the unrounded rates. The single-prompt rows used the first `chat_short` prompt (`--limit 1 -n 128`) once per mode.
+
+| GPU | Workload | Plain tok/s (min–max) | DSpark tok/s (min–max) | DSpark tokens/round | Speedup |
+|---|---|---:|---:|---:|---:|
+| RTX 4090 | Chat, 8 × 128 | 166.6–166.7 | 202.7–202.9 | 1.79 | 1.217× |
+| RTX 4090 | Code, 8 × 384 | 167.9–168.0 | 321.6–322.6 | 3.38–3.39 | 1.920× |
+| RTX 4090 | First chat prompt, 1 × 128 | 166.5 | 257.2 | 2.76 | 1.545× |
+| RTX 3090 | Chat, 8 × 128 | 126.1–126.4 | 135.8–139.0 | 1.60–1.67 | 1.082× |
+| RTX 3090 | Code, 8 × 384 | 126.8–127.0 | 220.9–222.7 | 3.48–3.49 | 1.749× |
+| RTX 3090 | First chat prompt, 1 × 128 | 126.1 | 180.1 | 2.82 | 1.429× |
 
 ### DFlash2 ring memory and Windows latency
 
