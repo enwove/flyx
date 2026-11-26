@@ -14,8 +14,7 @@ import sys
 import tempfile
 import time
 
-from check_server import Client
-from local_server import serve, server_env
+from local_server import Client, serve, server_env
 
 DEEP = "[" * 200000 + "]" * 200000
 ME = [{"role": "user", "content": "x"}]

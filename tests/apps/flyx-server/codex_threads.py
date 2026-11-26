@@ -3,8 +3,8 @@
 from concurrent.futures import ThreadPoolExecutor
 from functools import partial
 
-from check_server import Client
 from client_conversations import post, queued_pair, running_pair, serve_cases
+from local_server import Client
 
 
 def check(url):

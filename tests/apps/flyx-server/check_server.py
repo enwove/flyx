@@ -9,7 +9,6 @@ Needs a real model (tool calls must be meaningful); every check prints ok / FAIL
 from __future__ import annotations
 
 import argparse
-import http.client
 import json
 import os
 import sys
@@ -17,6 +16,8 @@ import tempfile
 import threading
 import time
 import urllib.parse
+
+from local_server import Client, wait_load, wait_telemetry  # also this module's, for api_compat.py
 
 FAILS = 0
 # Room for a reply with thinking on (the question of the streamed checks); one that still runs out is checked as cut.
@@ -27,72 +28,6 @@ def check(ok: bool, what: str, detail: str = ""):
     global FAILS
     print(f"  {'ok  ' if ok else 'FAIL'} {what}" + (f"  [{detail}]" if detail and not ok else ""))
     FAILS += 0 if ok else 1
-
-
-class Client:
-    def __init__(self, url: str, key: str | None):
-        u = urllib.parse.urlparse(url)
-        self.host, self.port = u.hostname, u.port or 80
-        self.key = key
-
-    def _conn(self):
-        return http.client.HTTPConnection(self.host, self.port, timeout=600)
-
-    def _headers(self):
-        h = {"Content-Type": "application/json"}
-        if self.key:
-            h["Authorization"] = "Bearer " + self.key
-        return h
-
-    def get_raw(self, path, headers=None):
-        c = self._conn()
-        try:
-            c.request("GET", path, headers={**self._headers(), **(headers or {})})
-            r = c.getresponse()
-            return r.status, r.headers, r.read()
-        finally:
-            c.close()
-
-    def get(self, path):
-        status, _, data = self.get_raw(path)
-        return status, json.loads(data or b"null")
-
-    def post(self, path, body, headers=None):
-        c = self._conn()
-        c.request("POST", path, body=json.dumps(body), headers={**self._headers(), **(headers or {})})
-        r = c.getresponse()
-        return r.status, json.loads(r.read() or b"null")
-
-    def delete(self, path):
-        c = self._conn()
-        c.request("DELETE", path, headers=self._headers())
-        r = c.getresponse()
-        return r.status, json.loads(r.read() or b"null")
-
-    def stream(self, path, body, stop_after=None):
-        """Yields (event_name, data) of an SSE response; stop_after closes the connection early."""
-        c = self._conn()
-        c.request("POST", path, body=json.dumps(body), headers=self._headers())
-        r = c.getresponse()
-        if r.status != 200:
-            yield "http_error", {"status": r.status, "body": r.read().decode()}
-            return
-        event, n = None, 0
-        while True:
-            line = r.readline()
-            if not line:
-                break
-            line = line.decode().rstrip("\r\n")
-            if line.startswith("event:"):
-                event = line[6:].strip()
-            elif line.startswith("data:"):
-                data = line[5:].strip()
-                yield event, (data if data == "[DONE]" else json.loads(data))
-                event = None
-                n += 1
-                if stop_after and n >= stop_after:
-                    c.close()
-                    return
 
 
 WEATHER = {"type": "function", "function": {
@@ -609,15 +544,6 @@ def concurrent_checks(cl: Client, model: str):
           f"short {short.get('text')!r} / {alone_short.get('text')!r}, long {len(long.get('text', ''))} chars")
 
 
-def wait_telemetry(cl, predicate, seconds):
-    end = time.monotonic() + seconds
-    while True:
-        _, t = cl.get("/v1/telemetry?recent=1")
-        if predicate(t) or time.monotonic() >= end:
-            return t
-        time.sleep(0.02)
-
-
 def superseded_response_checks(cl: Client, model: str):
     path = "/v1/responses"
     body = {"model": model, "input": "Spell out the numbers from 1 to 2000, one per line.",
@@ -849,18 +775,6 @@ def served_entry(cached: dict, status: dict):
         if m["name"].lower() == want.lower() or (path and os.path.normcase(m["path"]) == path):
             return m
     return None
-
-
-def wait_load(cl: Client, timeout_s: float) -> dict:
-    """GET /v1/load until no fetch or load is under way, at most timeout_s."""
-    deadline = time.time() + timeout_s
-    s = {}
-    while time.time() < deadline:
-        st, s = cl.get("/v1/load")
-        if st == 200 and s.get("state") not in ("fetching", "loading"):
-            return s
-        time.sleep(1)
-    return s
 
 
 def chat_status(cl: Client, model: str) -> int:
