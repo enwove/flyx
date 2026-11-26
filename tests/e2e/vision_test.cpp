@@ -12,6 +12,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <filesystem>
 #include <memory>
 #include <random>
 #include <string>
@@ -20,6 +21,8 @@
 #include "core/exec/engine.h"
 #include "core/interfaces/chat.h"
 #include "core/interfaces/vision.h"
+#include "core/os/os.h"
+#include "core/os/path.h"
 #include "core/render/chat_json.h"
 #include "core/session/store.h"
 #include "core/vision/image.h"
@@ -1185,13 +1188,18 @@ void test_tiny_vlm_backends() {
       "  ok   cpu_ref tiny VLM (exact/q8/nvfp4 + pre-quantized Q8_0, padded kVInter=%d, MTP == plain, ckpt+snapshot)\n",
       TinyVlm::kVInter);
 
-  // Run CUDA if a CUDA backend and device are available in this build.
+  // The CUDA half where this build has a CUDA backend (its module beside this program, where the probe looks first):
+  // there this test is a GPU test (label gpu), and a backend that does not load or finds no device fails it instead
+  // of leaving it to pass on cpu_ref alone.  A build without one runs the cpu_ref half only.
   EngineOptions probe_opt;
   probe_opt.backend = "cuda";
   std::string bname, perr;
   flyx_device_info dinfo{};
+  const std::string cuda_module = os::executable_dir() + "/libflyx-cuda" + os::kDynLibSuffix;
+  const bool cuda_built = std::filesystem::exists(os::to_path(cuda_module));
   if (!probe_device(probe_opt, &bname, &dinfo, &perr)) {
-    std::printf("  skip cuda tiny VLM (%s)\n", perr.c_str());
+    CHECK(!cuda_built, "this build has a CUDA backend (" + cuda_module + "), and it is not usable here: " + perr);
+    std::printf("  skip cuda tiny VLM: no CUDA backend in this build (%s)\n", perr.c_str());
     return;
   }
 
