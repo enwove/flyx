@@ -13,7 +13,7 @@ Mandatory rules for anyone modifying this repository (humans and coding agents a
 | `models/drafters/` | Drafters the architectures share (DFlash2, DSpark; MTP's block from an architecture's hooks): which drafter a file or a companion holds, its config checked against the target, its blocks and state, its tap and context nodes | Knows an architecture's layers or its tensor names; reads a drafter's config before it is chosen, beyond what says which model it was made for |
 | `models/formats/` | Bidirectional chat formats: reply parsing (thinking, tool calls), format detection from template text, reply grammars (`tool_choice`, JSON schemas), and exact native renderers verified against Jinja | Renders a template it was not written for byte-for-byte |
 | `backends/<name>/` | Block execution: kernels, fusion, weight layouts, CUDA graphs, rollback mechanics | Knows which model it is; alters token acceptance beyond program rules; allocates outside `seq_bytes` / reported memory |
-| `backends/cuda/variants/` | Kernel configuration selection per shape, row count, and GPU | Changes math (tables only pick bit-identical configs or fix one K partition per shape); puts single-GPU rules in `candidates.toml` `[defaults]` (defaults stay conservative; SKU rules go in `<arch>/tables/<sku>.toml`) |
+| `backends/cuda/variants/` | Kernel configuration selection per shape, row count, and GPU | Changes math (tables only pick bit-identical configs or fix one K partition per shape); adds a rule measured on one GPU to `candidates.toml` `[defaults]` (it goes in that GPU's `<arch>/tables/<sku>.toml`; the defaults take a new rule only where it holds on every GPU measured) |
 | `apps/` | Wire formats (CLI, OpenAI / Anthropic HTTP, dashboard) | Touches device state directly |
 | `python/` | Weight conversion, float64 reference, `ctypes` binding | Runs inside the C++ engine |
 
@@ -47,7 +47,7 @@ For kernel or model-path changes, also run the real-model and HTTP checks (`tool
 
 - Base every speed claim on reproducible measurements stating model, quantization, GPU, driver, prompt set, and exact command (`flyx bench` / `cuda_bench`).
 - Generate per-GPU tuning tables with `cuda_bench tune`, verify end-to-end equivalence and speedups, and commit them under `backends/cuda/variants/`.
-- Never hardcode single-GPU, single-model, or single-prompt tuning caps or dispatch rules in `core/`, `models/`, or `backends/cuda/variants/candidates.toml` `[defaults]`. Fix adaptive scheduling or stopping weaknesses in the general online algorithm (or execution granularity), and keep every hardware-specific dispatch rule strictly inside `backends/cuda/variants/<arch>/tables/<sku>.toml`.
+- Never hardcode single-GPU, single-model, or single-prompt tuning caps or dispatch rules in `core/` or `models/`, and add no rule measured on one GPU to `backends/cuda/variants/candidates.toml` `[defaults]` (the defaults there name the GPUs they were measured on; a new one needs more than one GPU). Fix adaptive scheduling or stopping weaknesses in the general online algorithm (or execution granularity), and put a rule measured on one GPU in `backends/cuda/variants/<arch>/tables/<sku>.toml`.
 
 ## Code and Licensing Standards
 
