@@ -3,7 +3,9 @@
 a W4A4 GEMM keeps a prefill pass's residual in bf16 (tiny_llama_nvfp4.flyx with --activations nvfp4), and the same
 stack with the target's own adapters (ABI 43, tiny_llama_nvfp4_lora.flyx) keeps it in float32, as its adapters add
 float32 products to float32 rows.  No golden file reaches the second case on its own (none has NVFP4 inputs and
-adapters), so the decision is what is held, on each backend given.
+adapters), so the decision is what is held, on each backend given.  A device without FP4 tensor cores computes no
+NVFP4 inputs and refuses the file at open (gguf_test's nvfp4_inputs holds it to that refusal): there is no residual
+to decide there, and the refusal is what is held.
 
     residual_decision.py FLYX ASSET_DIR BACKEND [BACKEND ...]
 """
@@ -12,6 +14,7 @@ import sys
 from pathlib import Path
 
 LINE = "prefill passes of more than 16 rows keep the residual in "
+REFUSED = "NVFP4 inputs, which this device or build cannot compute"  # backends/cuda/backend.cpp: nvfp4_inputs
 
 
 def decision(flyx, model, backend):
@@ -21,6 +24,8 @@ def decision(flyx, model, backend):
     for line in run.stderr.splitlines():
         if LINE in line:
             return line.split(LINE, 1)[1].strip()
+    if run.returncode != 0 and REFUSED in run.stderr:
+        return None
     sys.exit(f"{backend}, {model.name}: no decision reported (exit {run.returncode}):\n{run.stderr[-3000:]}")
 
 
@@ -30,6 +35,9 @@ def main():
     for backend in backends:
         for name, want in (("tiny_llama_nvfp4.flyx", "bf16"), ("tiny_llama_nvfp4_lora.flyx", "float32")):
             got = decision(flyx, assets / name, backend)
+            if got is None:
+                print(f"  ok   {backend}, {name}: NVFP4 inputs refused where the device cannot compute them")
+                continue
             ok = got == want
             failed += not ok
             print(f"  {'ok' if ok else 'FAIL':4} {backend}, {name}: the residual in {got} (want {want})")
