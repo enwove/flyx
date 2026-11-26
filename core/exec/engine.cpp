@@ -14,6 +14,7 @@
 #include "core/os/env.h"
 #include "core/os/log.h"
 #include "core/os/os.h"
+#include "core/os/path.h"
 #include "core/speculation/calibrate.h"
 
 namespace flyx {
@@ -182,7 +183,7 @@ bool open_backend(const EngineOptions& opt, std::unique_ptr<os::DynLib>* out_lib
           tried += "\n  built-in " + n + ": " + api->last_error();
           continue;
         }
-        if (n != names.front() && tried.find(names.front()) != std::string::npos)
+        if (n != names.front())
           log::warn("flyx: the %s backend is not usable here, so %s runs:%s", names.front().c_str(), n.c_str(),
                     tried.c_str());
         *out_lib = nullptr;
@@ -195,27 +196,31 @@ bool open_backend(const EngineOptions& opt, std::unique_ptr<os::DynLib>* out_lib
     const std::string file = "libflyx-" + n + os::kDynLibSuffix;
     std::vector<std::string> paths = {dir + "/" + file, dir + "/../lib/flyx/" + file, dir + "/flyx/" + file,
                                       dir + "/backends/" + file};
+    std::string failures;
     for (const auto& path : paths) {
       std::string e;
       auto lib = std::make_unique<os::DynLib>();
       if (!lib->open(path, &e)) {
-        tried += "\n  " + path + ": " + e;
+        // A missing dependency can produce the same loader error as a missing backend library.
+        std::error_code ec;
+        if (std::filesystem::status(os::to_path(path), ec).type() != std::filesystem::file_type::not_found)
+          failures += "\n  " + path + ": " + e;
         continue;
       }
       auto entry = reinterpret_cast<flyx_backend_entry_fn>(lib->symbol(FLYX_BACKEND_ENTRY));
       const flyx_backend_api* api = entry ? entry() : nullptr;
       if (!api || api->abi_version != FLYX_BACKEND_ABI_VERSION || api->struct_size < sizeof(flyx_backend_api)) {
-        tried += "\n  " + path + ": incompatible backend ABI";
+        failures += "\n  " + path + ": incompatible backend ABI";
         continue;
       }
       flyx_device_info info{};
       if (api->probe(&info) != 0) {
-        tried += "\n  " + path + ": " + api->last_error();
+        failures += "\n  " + path + ": " + api->last_error();
         continue;
       }
       // A backend passed over is said without -v: on Windows, Smart App Control once refused an unsigned
       // libflyx-cuda.dll and a real model ran on the float64 reference, a minute a 6000-token prefill, unexplained.
-      if (n != names.front() && tried.find(names.front()) != std::string::npos)
+      if (n != names.front())
         log::warn("flyx: the %s backend is not usable here, so %s runs:%s", names.front().c_str(), n.c_str(),
                   tried.c_str());
       *out_lib = std::move(lib);
@@ -223,6 +228,7 @@ bool open_backend(const EngineOptions& opt, std::unique_ptr<os::DynLib>* out_lib
       *out_info = info;
       return true;
     }
+    tried += failures.empty() ? "\n  " + file + " not found in backend paths relative to " + dir : failures;
   }
   *err = "no usable backend" + tried;
   return false;
