@@ -32,6 +32,7 @@
 
 #include "backends/cuda/blocks.h"
 #include "backends/cuda/kernels/kernels.cuh"
+#include "backends/cuda/runtime/draft_ring.h"
 #include "backends/cuda/runtime/vision_disk.h"
 #include "flyx/backend_abi.h"
 #include "ops/dtype/ref.h"
@@ -599,6 +600,10 @@ struct flyx_seq {
     int pos = 0;
     int rope_delta = 0;
   } ckp[FLYX_CHECKPOINTS];
+  // A sliding-window DFlash2 context cache kept as a ring (KvBuf::ring, alloc_state): the positions it still holds
+  // for the drafter's window, at the position and at each checkpoint.  A rewind, restore or snapshot whose window a
+  // later position overwrote is refused (runtime/runner.cpp: ring_wrote).
+  flyx::cuda::DraftRing dring;
 
   // drafter scratch
   float* mg = nullptr;                 // MTP normalized draft hidden

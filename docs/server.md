@@ -204,7 +204,7 @@ Passed verbatim to the backend (`backends/cuda/backend.cpp`). Unknown keys or in
 | `mtp_copy` | `0` \| `2..4` | `2` | StrataFlux bit-width for MTP layer beyond `mtp_window` (`0` = disabled). |
 | `mtp_sink` | `N` (≥ 0) | `64` | Initial sink positions kept exact for MTP when `mtp_copy=0`. |
 | `mtp_ring` | `0` \| `1` | `1` | Ring buffer storage for MTP exact window (`0` = linear slots, tests). |
-| `dflash_ring` | `0` \| `1` | `1` | Ring buffer storage for sliding-window DFlash2 context K/V (`0` = linear slots, tests). |
+| `dflash_ring` | `0` \| `1` | `1` | Ring buffer storage for sliding-window DFlash2 context K/V (`0` = linear slots, tests). A checkpoint, snapshot or rewind whose drafter window later positions overwrote in the ring is refused, and the session recomputes instead. |
 
 ---
 

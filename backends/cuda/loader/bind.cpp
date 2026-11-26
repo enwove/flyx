@@ -26,6 +26,12 @@ struct StateMap {
 
 StateMap bind_states(flyx_bmodel* m, const flyx_model_desc& d) {
   StateMap sm;
+  // The caches DFlash2 blocks keep their context in: their kernels write and read binary16, one layer or more.
+  std::vector<bool> dflash_kv(size_t(std::max(d.n_states, 0)), false);
+  for (int b = 0; b < d.n_blocks; ++b)
+    if (const flyx_block& blk = d.blocks[b]; blk.kind == FLYX_BLOCK_DFLASH2 && blk.dflash2.kv >= 0 &&
+                                             blk.dflash2.kv < d.n_states)
+      dflash_kv[size_t(blk.dflash2.kv)] = true;
   for (int i = 0; i < d.n_states; ++i) {
     const flyx_state& s = d.states[i];
     sm.kv.push_back(-1);
@@ -36,9 +42,11 @@ StateMap bind_states(flyx_bmodel* m, const flyx_model_desc& d) {
       case FLYX_STATE_KV:
         sm.kv.back() = int(m->states.kv.size());
         // FP8 for the target's caches and the MTP layer's beside them (only drafting reads it, so its
-        // rounding moves how many drafts are accepted, never the output); a stacked drafter's stays binary16.
+        // rounding moves how many drafts are accepted, never the output); a stacked drafter's, and a DFlash2
+        // drafter's of any number of layers, stay binary16.
         m->states.kv.push_back({s.layers, s.n_kv, s.head_dim,
-                                m->kv_fp8 && s.layers == 1 && !(s.draft && m->opt.draft_kv16), s.draft != 0});
+                                m->kv_fp8 && s.layers == 1 && !(s.draft && m->opt.draft_kv16) && !dflash_kv[size_t(i)],
+                                s.draft != 0});
         break;
       case FLYX_STATE_GDN:
         sm.gdn.back() = int(m->states.gdn.size());
@@ -288,6 +296,7 @@ DFlashBlock dflash(WeightLoader& L, const flyx_model_desc& d, const flyx_dflash2
   f.kv = state_of(sm.kv, b.kv, "K/V");
   const KvSpec& k = L.model()->states.kv[size_t(f.kv)];
   expect(k.layers == f.layers() && k.nkv == f.nkv && k.hd == f.hd, "DFlash2 context cache differs from its layers");
+  expect(!k.fp8, "DFlash2 context cache is not binary16");  // what draft_ctx_kv and the draft block write and read
   return f;
 }
 

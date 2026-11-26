@@ -235,8 +235,21 @@ void reset_state(flyx_seq* s, int anchor) {
   for (auto& mt : s->meta) mt = {};
   s->rope_delta = 0;
   s->prev_pos3d_at = -1;
+  s->dring.reset();
   set_params(s, 0, anchor, 0);
 }
+
+namespace {
+// Positions [from, to) of a sliding-window DFlash2 context ring written (s->dring): what they overwrote is gone.  A
+// round whose every rewind target lost the drafter's window is no longer a rollback source; rewind() checks the
+// position it is given as well.
+void ring_wrote(flyx_seq* s, int from, int to) {
+  if (!s->dring.slots()) return;
+  s->dring.wrote(from, to);
+  for (auto& mt : s->meta)
+    if (mt.valid && !s->dring.holds(mt.start + mt.rows)) mt.valid = false;
+}
+}  // namespace
 
 // Upload generation parameters when they changed (rounds read them on the device).
 void set_gen(flyx_seq* s, const flyx_gen_params* g) {
@@ -424,6 +437,7 @@ int prefill_ex(flyx_plan* p, flyx_seq* s, const flyx_prefill_input* in, const fl
     s->copy_home(false);
     s->copy_written(s->position);
     s->staged(s->position + n);
+    ring_wrote(s, s->position, s->position + n);  // its context rows, counted first: a pass that fails wrote some
     forward(ps);
     s->flush_page_prefill(s->position, n);
     s->snap_pos = s->pass_snap;
@@ -1790,7 +1804,8 @@ int read_result(flyx_seq* s, flyx_round_result* out) {
     *out = s->ring_host[seq % kRing];
     if (out->seq_no != seq) return fail("ring entry out of order (" + std::to_string(out->seq_no) + ")");
     s->read_no = seq;
-    char kind = s->pending.front().kind;
+    const char kind = s->pending.front().kind;
+    const int rows = s->pending.front().rows;
     s->pending.pop_front();
     if (kind == 'R' && out->n_tokens > 0) {
       s->drain_page_host(seq, out->position, out->n_tokens);
@@ -1799,6 +1814,11 @@ int read_result(flyx_seq* s, flyx_round_result* out) {
       s->meta[flyx_round_slot(s->round)].valid = false;
     }
     s->position = out->position;
+    // A round wrote its rows from its start, and its draft block its own rows there: rejected ones too.
+    if (kind == 'R') {
+      const int start = out->position - out->n_tokens;
+      ring_wrote(s, start, start + std::max(rows, FLYX_MAX_ROWS));
+    }
     s->update_write_hi();
     return 0;
   });
@@ -1876,6 +1896,10 @@ int rewind(flyx_seq* s, int32_t pos, int32_t anchor) {
       set_params(s, pos, anchor, s->round);
       return 1;
     }
+    if (!s->dring.holds(pos)) {  // the drafter's window at pos: overwritten in its ring since (prefill, rounds)
+      reset_state(s, anchor);
+      return 0;
+    }
     for (int back = 1; back < FLYX_ROUND_SLOTS && s->round - back >= 0; ++back) {
       const int r = s->round - back, sl = flyx_round_slot(r), to = flyx_round_slot(r + 1);
       const int rsl = r % kGdnReplaySlots;
@@ -1913,7 +1937,12 @@ int checkpoint(flyx_seq* s, int32_t c) {
     const bool snap = s->snap_pos >= 0;
     const int pos = snap ? s->snap_pos : s->position;
     const int sl = snap ? s->snap_slot : flyx_round_slot(s->round);
+    if (!s->dring.holds(pos)) {
+      s->ckp[c].valid = false;
+      return fail("checkpoint: the drafter's window at " + std::to_string(pos) + " is no longer in its ring");
+    }
     copy_checkpoint_state(s, c, sl, pos, true, snap);
+    s->dring.keep(c, pos);
     s->ckp[c].valid = true;
     s->ckp[c].pos = pos;
     s->ckp[c].rope_delta = snap ? s->snap_rope_delta : s->rope_delta;
@@ -1930,6 +1959,8 @@ int prefill_snapshot(flyx_seq* s, int32_t pos) {
 int restore(flyx_seq* s, int32_t c, int32_t anchor) {
   if (!s) return no_sequence("restore");
   if (c < 0 || c >= FLYX_CHECKPOINTS || !s->ckp[c].valid) return -1;
+  // The checkpoint keeps no drafter window of its own: what the ring held of it, a later position overwrote.
+  if (!s->dring.kept(c)) return fail("restore: the drafter's window of that checkpoint is no longer in its ring");
   return guarded([&] {
     check_idle(s);
     copy_checkpoint_state(s, c, flyx_round_slot(s->round), s->ckp[c].pos, false);
@@ -1937,6 +1968,7 @@ int restore(flyx_seq* s, int32_t c, int32_t anchor) {
     s->rope_delta = s->ckp[c].rope_delta;
     s->prev_pos3d_at = -1;
     set_params(s, s->ckp[c].pos, anchor, s->round);
+    s->dring.restored(c);
     s->reload_page_ring(s->position);
     return s->position;
   });
@@ -2115,6 +2147,8 @@ int snapshot_bytes(flyx_seq* s, int32_t c, int32_t begin, uint64_t* out) {
   if (!s) return no_sequence("snapshot_bytes");
   if (c < 0 || c >= FLYX_CHECKPOINTS || !s->ckp[c].valid) return fail("no checkpoint in that slot");
   if (begin < 0 || begin > s->ckp[c].pos) return fail("snapshot starts outside the checkpoint");
+  // A ring is saved as its slots are now: the checkpoint's window must still be there.
+  if (!s->dring.kept(c)) return fail("snapshot: the drafter's window of that checkpoint is no longer in its ring");
   *out = snapshot_size(s, begin, s->ckp[c].pos);
   return 0;
 }
@@ -2150,6 +2184,7 @@ int snapshot_load(flyx_seq* s, const flyx_host_pieces* src, uint64_t bytes, int3
     check_idle(s);
     HostCursor host{src, sizeof h};
     s->copy_home(false);  // the copy loaded to its host home, every position changed
+    s->dring.replacing();  // a ring's every slot
     snapshot_parts(s, -1, h.begin, h.pos, host, false);
     s->reload_page_ring(h.pos);
     s->copy_written(h.begin);
@@ -2157,6 +2192,7 @@ int snapshot_load(flyx_seq* s, const flyx_host_pieces* src, uint64_t bytes, int3
     s->rope_delta = h.rope_delta;
     s->prev_pos3d_at = -1;
     set_params(s, h.pos, anchor, s->round);
+    s->dring.loaded(h.pos);
     sync_stream(s);  // the bytes are the caller's
     return s->position;
   });

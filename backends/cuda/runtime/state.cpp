@@ -641,11 +641,14 @@ void alloc_state(const flyx_bmodel* m, flyx_seq* s) {
       // Sliding-window DFlash2 context K/V: a draft block at position p attends to [p - window + 1, p + B),
       // while a prefill pass writes up to s->rows_cap rows in parallel and rewinds may step back across
       // FLYX_ROUND_SLOTS rounds of up to wide_rows rows. Keep at least window + extra slots so parallel
-      // prefill writes, mid-pass checkpoints, rejected rows, and rewinds never clobber live window keys.
-      const int B = std::max(dflash->block, FLYX_MAX_ROWS);
-      const int extra = std::max(s->rows_cap, FLYX_ROUND_SLOTS * std::max(B, m->wide_rows));
-      const int ring = (dflash->window + extra + 63) / 64 * 64;
-      if (m->opt.kernels.dflash_ring && ring < s->cap) b.ring = positions = ring;
+      // prefill writes, mid-pass checkpoints, rejected rows, and rewinds never clobber live window keys
+      // (dflash_ring_slots); older positions s->dring says are gone.
+      const int ring = dflash_ring_slots(m->opt.kernels.dflash_ring, dflash->window, dflash->block, s->rows_cap,
+                                         m->wide_rows, s->cap);
+      if (ring > 0) {
+        b.ring = positions = ring;
+        s->dring.init(ring, dflash->window);
+      }
     }
     b.layer_stride = size_t(positions) * k.nkv * k.hd;
     const size_t n = size_t(k.layers) * b.layer_stride;
