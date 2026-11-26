@@ -25,7 +25,7 @@
 #                        scoring, and its rounds against the teacher-forced reference's, tested in check_dv_test.py)
 #   apps/flyx-server/    the stored responses and the HTTP API (run against a live server)
 #   apps/flyx-cli/       the command line's file paths and flags, flyx bench on a prompt set (the tiny model)
-#   apps/common/         numbers given on the command line
+#   apps/common/         numbers given on the command line, the drafters fetched beside a model
 #   bench/ab/            two builds' records of one prompt set compared answer for answer, round for round
 #                        (same_runs.py)
 #   python/reference/    the Python reference vs transformers; its DV drafting emits plain decoding's tokens, its
@@ -114,6 +114,8 @@ set_tests_properties(inkling2_cpu_ref PROPERTIES FIXTURES_SETUP inkling2_models)
 
 add_executable(numbers_test apps/common/numbers_test.cpp ${CMAKE_SOURCE_DIR}/apps/common/numbers.cpp)
 target_include_directories(numbers_test PRIVATE ${CMAKE_SOURCE_DIR})
+add_executable(model_source_test apps/common/model_source_test.cpp ${CMAKE_SOURCE_DIR}/apps/common/model_source.cpp)
+target_link_libraries(model_source_test PRIVATE flyx_core)
 add_executable(strata_snapshot_test backends/cuda/strata_snapshot_test.cpp)
 target_include_directories(strata_snapshot_test PRIVATE ${CMAKE_SOURCE_DIR})
 add_executable(response_store_test apps/flyx-server/response_store_test.cpp)
@@ -222,6 +224,9 @@ set_tests_properties(drafter_dir PROPERTIES FIXTURES_REQUIRED gguf_assets)
 
 # Numbers on the command line: all of the text a number, inside what the option takes.
 add_test(NAME flag_numbers COMMAND numbers_test)
+# The DSpark drafter published beside a model, taken by default: beside a GGUF on disk, and in its repository (a
+# Hugging Face cache read offline).
+add_test(NAME model_source COMMAND model_source_test)
 add_test(NAME chat_replies COMMAND tags_test)
 # Qwen3.5's own renderer against the Jinja engine on generated conversations, and its calls read back.
 add_test(NAME chat_qwen35 COMMAND qwen35_format_test ${ASSETS}/tiny.flyx

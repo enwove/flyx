@@ -26,8 +26,9 @@ struct DrafterSource {
 
 struct Fetched {
   std::string model;                  // a path
-  std::vector<std::string> drafters;  // paths: the ones named, and the MTP file of the model's repository when the
-                                      // model's GGUF lacks the layer
+  std::vector<std::string> drafters;  // paths: the ones named, the MTP file of the model's repository when the
+                                      // model's GGUF lacks the layer, and the DSpark drafter published beside the
+                                      // model (want_dspark)
   std::string mmproj;                 // path to multimodal vision projector GGUF (empty: none)
   std::string mmproj_source;          // display label: repo/path (Hub) or local path
   std::optional<uint64_t> mmproj_size;  // bytes on disk
@@ -39,12 +40,25 @@ struct Fetched {
 
 // Fetches what is missing. want_mtp: take the repository's MTP file for a GGUF without the layer.
 // want_vision: take the repository's mmproj GGUF when no explicit mmproj path was given.
+// want_dspark: with no DSpark drafter among `drafters`, take the one published beside the model: its repository's
+// default dspark-*.gguf (hub::companion_files), or for a model file on disk dspark_beside's; either only where its
+// header says it is a DSpark drafter.
 bool fetch_model(const std::string& model, const std::vector<std::string>& drafters, bool want_mtp,
                  const hub::ProgressFn& progress, const std::atomic<bool>* stop, Fetched* out, std::string* err,
-                 const std::string& mmproj = "", bool want_vision = true);
+                 const std::string& mmproj = "", bool want_vision = true, bool want_dspark = false);
 
 // Whether `eo` drafts with the MTP layer when the model has one (not --no-spec, not --drafter dflash2 or none).
 bool wants_mtp(const EngineOptions& eo);
+
+// Whether `eo` drafts with a DSpark drafter published beside the model, none being named: --drafter dspark or all,
+// or the default (auto) with no drafter file named (`drafters`: the ones named, by the command line or the server).
+bool wants_dspark(const EngineOptions& eo, const std::vector<std::string>& drafters);
+
+// The DSpark drafter beside a model GGUF on disk: in its directory, a dspark-<model's name>[-_.]*.gguf whose header
+// says it is one (general.architecture dflash with dflash.has_markov_context), the model's name being its file's
+// without the quantization ("Inkling-2-Mini" for Inkling-2-Mini-UD-IQ3_XXS.gguf); of several, the first by name.
+// "" for none.
+std::string dspark_beside(const std::string& model_path);
 
 // DFlash2 drafters published for models made from these base models (a model card's base_model), by repository.
 std::vector<std::string> known_drafters(const std::vector<std::string>& base_models);

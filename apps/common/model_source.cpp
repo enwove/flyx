@@ -266,9 +266,53 @@ bool wants_mtp(const EngineOptions& eo) {
           mode == interfaces::DrafterMode::kAll);
 }
 
+bool wants_dspark(const EngineOptions& eo, const std::vector<std::string>& drafters) {
+  if (!eo.speculative) return false;
+  interfaces::DrafterMode mode = interfaces::DrafterMode::kAuto;
+  if (!interfaces::parse_drafter_mode(eo.drafter, &mode)) return false;
+  return mode == interfaces::DrafterMode::kDSpark || mode == interfaces::DrafterMode::kAll ||
+         (mode == interfaces::DrafterMode::kAuto && drafters.empty());
+}
+
+namespace {
+
+bool is_dspark_file(const std::string& path) {
+  const flyx::GgufPeek h = flyx::gguf_peek(path);
+  return h.valid && h.arch == "dflash" && h.has_markov_context;
+}
+
+}  // namespace
+
+std::string dspark_beside(const std::string& model_path) {
+  std::error_code ec;
+  const fs::path p = to_path(model_path);
+  if (lower(from_path(p.extension())) != ".gguf" || !fs::is_regular_file(p, ec)) return "";
+  // The model's name without its quantization: what a drafter made for it is named after.
+  std::string name = model_name_of(model_path);
+  const std::string quant = hub::quant_in_name(from_path(p.filename()));
+  if (!quant.empty() && name.size() > quant.size() && lower(name).ends_with(lower(quant))) {
+    name.resize(name.size() - quant.size());
+    while (!name.empty() && (name.back() == '-' || name.back() == '_' || name.back() == '.')) name.pop_back();
+  }
+  if (name.empty()) return "";
+  const std::string want = "dspark-" + lower(name);
+  std::vector<std::string> found;
+  const fs::path dir = p.has_parent_path() ? p.parent_path() : fs::path(".");
+  for (fs::directory_iterator it(dir, ec), end; !ec && it != end; it.increment(ec)) {
+    const std::string low = lower(from_path(it->path().filename()));
+    if (!low.ends_with(".gguf") || !low.starts_with(want) || low.size() <= want.size()) continue;
+    if (const char next = low[want.size()]; next != '-' && next != '_' && next != '.') continue;  // another name
+    std::error_code e2;
+    if (!it->is_regular_file(e2) || e2 || !is_dspark_file(from_path(it->path()))) continue;
+    found.push_back(from_path(it->path()));
+  }
+  std::sort(found.begin(), found.end());
+  return found.empty() ? "" : found.front();
+}
+
 bool fetch_model(const std::string& model, const std::vector<std::string>& drafters, bool want_mtp,
                  const hub::ProgressFn& progress, const std::atomic<bool>* stop, Fetched* out, std::string* err,
-                 const std::string& mmproj, bool want_vision) {
+                 const std::string& mmproj, bool want_vision, bool want_dspark) {
   *out = {};
   hub::Repo repo;
   if (!one(model, progress, stop, &out->model, &repo, err)) return false;
@@ -292,7 +336,17 @@ bool fetch_model(const std::string& model, const std::vector<std::string>& draft
     out->mmproj_source = mrepo.id.empty() ? mpath : mmproj;
     out->mmproj_size = bytes_on_disk(mpath);
   }
-  if (repo.id.empty()) return true;  // a path: nothing more to know
+  bool has_dspark = false;  // named: none other is taken
+  for (const auto& ds : out->drafter_sources) has_dspark = has_dspark || ds.kind == "dspark";
+  if (repo.id.empty()) {  // a path: only a DSpark drafter beside it to know of
+    if (want_dspark && !has_dspark)
+      if (const std::string d = dspark_beside(out->model); !d.empty()) {
+        out->drafters.push_back(d);
+        out->drafter_sources.push_back({"dspark", d, bytes_on_disk(d)});
+        out->notes.push_back("the DSpark drafter beside the model: " + d);
+      }
+    return true;
+  }
   if (want_vision && out->mmproj.empty()) {
     if (const hub::RepoFile* mm = hub::mmproj_file(repo)) {
       const flyx::GgufPeek pk = flyx::gguf_peek(out->model);
@@ -319,6 +373,22 @@ bool fetch_model(const std::string& model, const std::vector<std::string>& draft
     out->drafter_sources.push_back({"mtp", repo.id + "/" + mtp->path, bytes_on_disk(paths[0])});
     out->notes.push_back("the MTP layer from " + repo.id + "/" + mtp->path + " (the model's file has none)");
   }
+  // A DSpark drafter published with the model (unsloth's Inkling-2 GGUFs: dspark-*.gguf) drafts with it by default,
+  // as the repository's MTP file does: the default one of its companion files, where its header says it is one.
+  if (want_dspark && !has_dspark)
+    for (const hub::CompanionFile& c : hub::companion_files(repo)) {
+      if (c.kind != "dspark" || !c.is_default) continue;
+      std::vector<std::string> paths;
+      if (!hub::fetch(repo, {c.file}, &paths, progress, stop, err)) return false;
+      if (!is_dspark_file(paths[0])) {
+        out->notes.push_back(repo.id + "/" + c.file.path + " is not a DSpark drafter: not drafting with it");
+        break;
+      }
+      out->drafters.push_back(paths[0]);
+      out->drafter_sources.push_back({"dspark", repo.id + "/" + c.file.path, bytes_on_disk(paths[0])});
+      out->notes.push_back("the DSpark drafter from " + repo.id + "/" + c.file.path);
+      break;
+    }
   for (const std::string& k : known_drafters(repo.base_models)) {
     bool given = false;
     for (const std::string& d : drafters) given = given || d.rfind(k, 0) == 0;
@@ -353,7 +423,8 @@ hub::ProgressFn make_progress_logger(const char* prefix, double interval_ms, hub
 bool fetch_named(std::string* model, EngineOptions* eo, std::string* err) {
   auto progress = make_progress_logger("flyx", 2000);
   Fetched f;
-  if (!fetch_model(*model, eo->drafter_files, wants_mtp(*eo), progress, nullptr, &f, err, eo->mmproj_file, eo->vision))
+  if (!fetch_model(*model, eo->drafter_files, wants_mtp(*eo), progress, nullptr, &f, err, eo->mmproj_file, eo->vision,
+                   wants_dspark(*eo, eo->drafter_files)))
     return false;
   if (f.model != *model) std::fprintf(stderr, "flyx: %s is %s\n", model->c_str(), f.model.c_str());
   for (size_t i = 0; i < eo->drafter_files.size() && i < f.drafters.size(); ++i)

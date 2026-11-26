@@ -427,7 +427,7 @@ bool ModelHost::work(const Want& w, std::string* err) {
     progress_ = p;
   });
   if (!apps::fetch_model(w.model, w.drafters, apps::wants_mtp(w.eo), logged, &stop_, &f, err, w.eo.mmproj_file,
-                         w.eo.vision)) {
+                         w.eo.vision, apps::wants_dspark(w.eo, w.drafters))) {
     std::fprintf(stderr, "flyx-server: %s: %s\n", w.model.c_str(), err->c_str());
     std::lock_guard<std::mutex> lock(mu_);
     error_ = *err, state_ = served_.sched ? "ready" : "failed";
