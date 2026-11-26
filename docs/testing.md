@@ -8,9 +8,9 @@ GPU tracing and end-to-end verification. Read [AGENTS.md](../AGENTS.md) before c
 ## 1. Testing Setup
 
 ```sh
-pip install torch transformers tokenizers safetensors gguf   # test fixtures & HF reference
-ctest --preset dev --output-on-failure                       # full GPU + CPU suite
-ctest --preset cpu --output-on-failure                       # CPU-only (no GPU required)
+pip install -r tests/requirements.txt    # test fixtures & HF reference (pinned, CPU torch; Python 3.12+)
+ctest --preset dev --output-on-failure   # full GPU + CPU suite
+ctest --preset cpu --output-on-failure   # CPU-only (no GPU required)
 ```
 
 End-to-end verification (http request to the qwen model server):

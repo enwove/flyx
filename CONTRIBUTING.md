@@ -12,7 +12,7 @@ Read [AGENTS.md](AGENTS.md) first—it defines the directory layering boundaries
 ```sh
 # CUDA development build + full test suite
 cmake --preset dev && cmake --build --preset dev
-pip install torch transformers tokenizers safetensors gguf
+pip install -r tests/requirements.txt
 ctest --preset dev --output-on-failure
 
 # CPU-only build (no GPU required)
