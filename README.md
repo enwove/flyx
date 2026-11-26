@@ -32,7 +32,7 @@
   <a href="llms.txt">llms.txt</a>
 </p>
 
-**FLYX** is a local LLM engine with zero dependencies. Run supported GGUF models directly and serve browsers, scripts and coding agents through OpenAI- and Anthropic-compatible APIs.
+**FLYX** is a zero-dependency local LLM engine that fits in a single ~57 MB Windows `.exe` — fast speculative decoding, native long context, tuned per GPU, no setup required. Run supported GGUF models as they are and serve them to your browser, scripts, and coding agents over OpenAI- and Anthropic-compatible APIs.
 
 <p align="center">
   <img src="docs/media/dashboard-light.png" width="900" alt="FLYX built-in web dashboard showing live throughput, long-context sessions, VRAM and RAM usage, and recent agent requests">
@@ -41,39 +41,49 @@
 
 ## Key Features
 
-- Long context uses both VRAM and host RAM. The planner sizes each session to the memory available and reports the additional bytes needed when increasing one budget would fit the requested window.
+- **Speculative decoding that never changes the output** — Built-in MTP, DFlash2, and DSpark drafters plus prompt lookup: Qwen3.8-27B writes code at **565.5 tok/s** on an RTX 5090, **6.03×** plain decoding, and every token is the one plain decoding would have produced ([Performance](#performance)).
+- **Native long context, no quality loss** — Runs Qwen3.8-27B at its full 262K context on a single consumer GPU, 16 GB cards included. When the K/V cache outgrows VRAM, it spills cleanly into system RAM instead of truncating or sliding-windowing: **164.5 tok/s at 256K on an RTX 5090** (`NVFP4`), **122.7 tok/s at 256K on a 24 GB RTX 4090**, and **100% long-context retrieval across 32K–256K** ([v0.2.0 measurements](docs/benchmarks.md#1-qwen38-27b-long-context-coding-benchmark)).
 - **Tuned per GPU, zero manual flags** — Ships measured kernel tuning tables for 11 NVIDIA GPUs and automatically sizes context length, K/V precision, and GPU/RAM placement from available memory. No guessing offload counts, batch sizes, or cache types.
-- **No install, no dependencies, ~57 MB** — The single Windows executable includes the CUDA and C++ runtimes.
+- **No install, no dependencies, ~57 MB** — CUDA and C++ runtimes are linked in; only the NVIDIA driver (≥ 580) is required. No CUDA Toolkit, Python, or Docker. Single ~57 MB `.exe` on Windows (double-click to run), or a tarball on Linux.
+- **Image input** — Vision-capable models with an `mmproj` projector take images from the CLI (`--image`), the OpenAI and Anthropic APIs, and paste or drag-and-drop in the dashboard.
 - **Built-in web dashboard & terminal monitor** — Starts straight into a browser UI (7 languages) with guided next-step hints to search/download Hugging Face or local models, chat, read localized API docs, and watch live throughput, VRAM/RAM split, sessions, requests, and logs ([monitor guide](docs/monitor.md)).
 - **One-click coding agent integration** — Speaks OpenAI (Chat Completions, Responses) and Anthropic Messages with tool calls and multi-turn prompt reuse. Launch **Claude Code** or **Codex CLI** straight into your project folder from **Integration** (Windows), or copy ready-to-run commands for **DeepSeek Harness, OpenCode, and Pi**.
-- Kernel tests compare CUDA results against float64 references. Release benchmarks report the workloads and devices on which speculative output IDs matched plain decoding. [Numerics](docs/design/numerics.md).
+- **Verified accuracy** — Every GPU kernel is tested against a `float64` reference; default FP8 K/V stays within **KL 0.0009–0.0016** of 16-bit on 27B; speculative decoding is **token-for-token identical** to plain decoding ([numerics](docs/design/numerics.md)).
 
 ## Updates
 
-- **v0.2.1** — Inkling-2-Mini adds sparse MoE inference, optimized decode kernels and automatic pairing with its Markov DSpark drafter. Qwen3.5/3.8 accepts images with a matching projector. The Hub discovers companions, and **Draft with it** attaches a selected drafter. Elastic loading adapts the drafter to available VRAM. Sliding-window DFlash2 uses a ring KV cache. The zero-PTX Windows candidate is 57.14 MB, down from 58.96 MB in v0.2.0.
+- **`v0.2.1`** — **Speeds verified on four GPUs, Inkling-2-Mini with DSpark, and image input**:
+  - **Qwen3.8-27B + DFlash2** writes code at **565.5 tok/s** on an RTX 5090 (**6.03×** plain decoding), **305.7** on an RTX 4090, **332.8** on a 16 GB RTX 5070 Ti, and **234.1** on an RTX 3090. `NVFP4` W4A4 prefill on the 5090 runs at **15,496 tok/s**.
+  - **Inkling-2-Mini + DSpark** — a new sparse-MoE model, with DSpark attached automatically: **438.9 tok/s** on code on the 5090 (**1.92×** plain decoding), **322.4** on the 4090, **276.2** on the 5070 Ti, and **222.0** on the 3090.
+  - **Vision** — image input from the CLI, the OpenAI and Anthropic APIs, and dashboard paste / drop, for vision-capable models with an `mmproj` projector.
+  - **Still zero dependencies** — one Windows `.exe`, now ~57 MB.
 - **`v0.2.0`** — **Initial open-source release of FLYX**: standalone ~59 MB zero-dependency Windows `.exe` & Linux tarball, native full-context GGUF & NVFP4 inference with automatic GPU/RAM K/V extension, built-in speculative decoding (MTP / DFlash2), 7-language web dashboard, and one-click Claude Code / Codex CLI integration.
 
 ## Performance
 
-Qwen3.8-27B decode in tokens/s. The first three rates use three mixed prompts × 128 tokens. The last rate uses the first code prompt × 128 with lookup disabled.
+v0.2.1 decode speed in tokens/s, verified on four GPUs (greedy). **Plain** is decoding with no drafter; the two **Speculative** columns turn the drafter on for chat and for code prompts, with the speedup over plain in parentheses.
 
-| GPU | Qwen3.8-27B | Plain | MTP | DFlash2 | DFlash2 on code |
-|---|---|---:|---:|---:|---:|
-| RTX 5090 · Linux | NVFP4 | 93.8 | 286.6 | 315.5 | 565.5 |
-| RTX 4090 · Linux | UD-Q4_K_XL | 49.4 | 158.0 | 171.6 | 305.7 |
-| RTX 3090 · Linux | UD-Q4_K_XL | 42.8 | 121.7 | 131.2 | 234.1 |
-| RTX 5070 Ti · Windows | UD-IQ3_XXS | 68.8 | 167.2 | 154.4 | 332.8 |
+**Qwen3.8-27B + DFlash2** — chat / mixed: 3 prompts × 128 tokens; code: 1 prompt × 128 tokens.
 
-Inkling-2-Mini (UD-IQ3_XXS), plain → Markov DSpark (Q8_0), tokens/s. Each pair produced identical output IDs.
+| GPU | Quant | Plain | Speculative · chat / mixed | Speculative · code |
+|---|---|---:|---:|---:|
+| **RTX 5090** (32 GB) | `NVFP4` | 93.8 | **315.5** (3.36×) | **565.5** (6.03×) |
+| **RTX 4090** (24 GB) | `UD-Q4_K_XL` | 49.4 | **171.6** (3.47×) | **305.7** (6.18×) |
+| **RTX 3090** (24 GB) | `UD-Q4_K_XL` | 42.8 | **131.2** (3.06×) | **234.1** (5.46×) |
+| **RTX 5070 Ti** (16 GB) | `UD-IQ3_XXS` | 68.8 | **154.4** (2.24×) | **332.8** (4.84×) |
 
-| GPU | chat_short · 8 × 128 | code_short · 8 × 384 |
-|---|---:|---:|
-| RTX 5090 · Linux | 225.5 → 259.8 | 228.5 → 438.9 |
-| RTX 4090 · Linux | 166.7 → 202.9 | 167.9 → 322.4 |
-| RTX 3090 · Linux | 126.2 → 136.5 | 126.9 → 222.0 |
-| RTX 5070 Ti · Windows | 150.9 → 169.3 | 153.6 → 276.2 |
+**Inkling-2-Mini + DSpark** — chat / mixed: 8 prompts × 128 tokens; code: 8 prompts × 384 tokens.
 
-[Measurements and commands](docs/benchmarks.md#v021-four-gpu-verified-benchmarks)
+| GPU | Quant | Plain | Speculative · chat / mixed | Speculative · code |
+|---|---|---:|---:|---:|
+| **RTX 5090** (32 GB) | `UD-IQ3_XXS` | 225.5 | **259.8** (1.15×) | **438.9** (1.92×) |
+| **RTX 4090** (24 GB) | `UD-IQ3_XXS` | 166.7 | **202.9** (1.22×) | **322.4** (1.92×) |
+| **RTX 3090** (24 GB) | `UD-IQ3_XXS` | 126.2 | **136.5** (1.08×) | **222.0** (1.75×) |
+| **RTX 5070 Ti** (16 GB) | `UD-IQ3_XXS` | 150.9 | **169.3** (1.12×) | **276.2** (1.80×) |
+
+<sub>**×** is the speedup over plain decoding on the same prompts, from unrounded rates; **Plain** shows the chat / mixed run. Speculative output matched plain decoding token for token in every run that recorded token IDs (all but the Windows Qwen mixed run). Linux, except the RTX 5070 Ti on native Windows 11.</sub>
+
+<sub>**Also measured:** Qwen3.8-27B's built-in **MTP** drafter (no extra file) reaches **286.6 / 158.0 / 121.7 / 167.2 tok/s** on the mixed prompts (5090 / 4090 / 3090 / 5070 Ti). **RTX 5090 `NVFP4`:** W4A4 prefill at **15,496 tok/s**; **203.8 tok/s** with MTP at 128K context (plain: 73.4); **164.5 tok/s** at 256K with **100%** needle retrieval (v0.2.0 run). Hardware, drivers, and exact commands: [docs/benchmarks.md](docs/benchmarks.md#v021-four-gpu-verified-benchmarks).</sub>
 
 ## Quick Start
 
@@ -90,12 +100,12 @@ Grab the latest release from [GitHub Releases](https://github.com/enwove/flyx/re
 ./bin/flyx serve unsloth/Qwen3.8-27B-GGUF:UD-Q4_K_XL
 ```
 
-Linux Hub downloads use system libcurl.
-
-The first command pairs Inkling with DSpark. The second sends an image to Qwen using the matching Hub projector.
+Two more to try — the DSpark drafter and the vision projector download with the model:
 
 ```sh
+# Inkling-2-Mini, with DSpark attached automatically
 flyx serve unsloth/Inkling-2-Mini-GGUF:UD-IQ3_XXS
+# Ask about an image
 flyx run unsloth/Qwen3.8-27B-GGUF:UD-Q4_K_XL --image photo.png --chat -p "Describe the image."
 ```
 
@@ -149,7 +159,9 @@ print(reply["content"])
 
 | Dimension | Supported | Notes |
 |---|---|---|
-| Architectures | GGUF: Qwen3 (`qwen3`), Qwen3.5/3.8 (`qwen35`), Inkling-2-Mini (`inkling2_loop`) | Qwen3.5/3.8 + `qwen3vl_merger` · Inkling-2-Mini + Markov DSpark · DFlash2 / DSpark: `dflash` · Llama: `.flyx` |
+| Architectures | Qwen3.5 / Qwen3.8 (`qwen35`), Qwen3 (`qwen3`), Inkling-2-Mini (`inkling2_loop`, sparse MoE), Llama (MiniCPM5-1B) | Llama from `.flyx` only |
+| Speculative drafters | MTP, DFlash2, DSpark, prompt lookup | MTP and DSpark attach automatically; DFlash2 is a companion file (`--drafter-file`, or **Draft with it** in the dashboard); DSpark pairs with Inkling-2-Mini |
+| Vision | Image input with an `mmproj` projector, fetched automatically from the model's Hub repo | Qwen3.5 / Qwen3.8 today; Inkling-2-Mini is text-only |
 | Model formats | GGUF (`F32`, `F16`, `BF16`, `Q2_0`, `Q4_0–Q8_0`, `Q2_K–Q6_K`, `IQ1–IQ4`, `MXFP4`, GGML `NVFP4`); `.flyx` (BF16, NVFP4; format 2 with the target's own LoRA adapters, V-LoRA, run unmerged; a DV drafter, drafting only when named: `--drafter dv`, [design](docs/design/dv.md)) | Keep all split GGUF parts in the same folder. |
 | GPUs | RTX 30 / 40 / 50 series, L4, L40S, A100, H100 (`sm_80`–`sm_120`; `sm_100` in Linux release) | Single GPU per process (`CUDA_VISIBLE_DEVICES`); driver ≥ 580 |
 | Platforms | Windows (native MSVC), Linux, WSL2 | Single-file `.exe` / ZIP / wheel on Windows; tarball / `manylinux` wheel on Linux |
