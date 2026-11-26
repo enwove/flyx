@@ -1,6 +1,7 @@
 // Copyright 2026 The flyx Authors. SPDX-License-Identifier: Apache-2.0
 // Sequence state and row buffers, sized from the blocks and the state table.
 #include "backends/cuda/runtime/checked_size.h"
+#include "backends/cuda/runtime/window_ring.h"
 #include "backends/cuda/backend.h"
 #include "flyx/gemm_tables.inc"
 
@@ -559,28 +560,52 @@ void strata_scratch(const flyx_bmodel* m, flyx_seq* s, StrataScratch& st, int ro
     st.delta = s->alloc<float>(delta_floats);
 }
 
+namespace {
+// The MTP layer's part of the state table's cache i past 8 of option mtp_window's windows (a whole cache of fewer is
+// small, and its every position read exactly anyway): its draft steps read its last `window` positions exactly and
+// the others through a copy of mtp_copy bits where strata attention is compiled for its heads (`copy`), else its first
+// `sink` positions only, at most what the window leaves of the context.  `on` false: no such part (another cache, or a
+// shorter context).
+struct MtpPart {
+  bool on = false, copy = false;
+  int window = 0, sink = 0;
+};
+MtpPart mtp_part(const flyx_bmodel* m, const flyx_seq* s, size_t i) {
+  const auto& ko = m->opt.kernels;
+  MtpPart p;
+  if (m->mtp_block < 0 || ko.mtp_window <= 0 || (long long)s->cap <= 8ll * ko.mtp_window) return p;
+  const auto& a = block<AttnBlock>(m, block<MtpBlock>(m, m->mtp_block).attn);
+  if (int(i) != a.kv) return p;
+  p.on = true;
+  p.copy = ko.mtp_copy > 0 && strata_supported(a.nh, a.nkv, a.hd, ko.mtp_copy);
+  p.window = ko.mtp_window;
+  p.sink = p.copy ? 0 : std::min(ko.mtp_sink, s->cap - p.window);
+  return p;
+}
+}  // namespace
+
 // The slots of the ring of the state table's cache i (KvBuf::swa_ring: a sliding-window layer, the target's or
-// DSpark's, and a DSpark Full layer past 8 of option mtp_window's windows): the window its rows read plus one prefill
-// chunk or rollback span, in 64s; 0 where that is not fewer than the context's positions (a slot a position).  The
-// cache's allocation and every checkpoint's copy of it (checkpoint_slot_bytes) take this many.
+// DSpark's, and past 8 of option mtp_window's windows a DSpark Full layer and the MTP layer, with option mtp_ring): its
+// sink, the window its rows read and one prefill chunk or rollback span (window_ring_slots); 0 where that is not fewer
+// than the context's positions (a slot a position).  The cache's allocation and every checkpoint's copy of it
+// (checkpoint_slot_bytes) take this many.
 int swa_ring_slots(const flyx_bmodel* m, const flyx_seq* s, size_t i) {
   const KvSpec& k = m->states.kv[i];
   const auto& ko = m->opt.kernels;
   const bool long_ctx = ko.mtp_window > 0 && (long long)s->cap > 8ll * ko.mtp_window;
-  const int mtp_kv = m->mtp_block >= 0 ? block<AttnBlock>(m, block<MtpBlock>(m, m->mtp_block).attn).kv : -1;
-  if (int(i) == mtp_kv && long_ctx) return 0;  // the MTP layer's own ring (KvBuf::ring, not checkpointed)
-  long long window = 0;
-  if (k.window > 0) {
+  int64_t window = 0, sink = 0;
+  if (const MtpPart mp = mtp_part(m, s, i); mp.on) {
+    if (!ko.mtp_ring) return 0;
+    window = mp.window;
+    sink = mp.sink;
+  } else if (k.window > 0) {
     window = k.window;
   } else if (m->dspark_block >= 0 && k.draft && k.layers == 1 && long_ctx && ko.mtp_ring) {
     const auto& ds = block<DSparkBlock>(m, m->dspark_block);
     for (int j = 0; j < ds.layers(); ++j)
       if (block<DSparkLayer>(m, ds.first_layer + j).kv == int(i)) window = ko.mtp_window;
   }
-  if (window == 0) return 0;
-  const long long span = std::max(FLYX_ROUND_SLOTS * FLYX_MAX_ROWS + m->wide_rows, s->rows_cap);
-  const long long ring = (window + span + 63) / 64 * 64;
-  return ring < s->cap ? int(ring) : 0;
+  return window_ring_slots(window, sink, s->rows_cap, m->wide_rows, s->cap);
 }
 
 // The bytes of a checkpoint's slot in host memory (ensure_checkpoint_slot lays it out): per gated delta net its
@@ -790,30 +815,23 @@ void alloc_state(const flyx_bmodel* m, flyx_seq* s) {
       64 * 64;
 
   int copy_i = 0, copy_streamed = 0;
-  // The MTP layer's cache: its draft steps attend to its last mtp_window positions, which a ring holds
-  // (with the rows a pass writes at once and those past the accepted ones besides).
-  const int mtp_kv = m->mtp_block >= 0 ? block<AttnBlock>(m, block<MtpBlock>(m, m->mtp_block).attn).kv : -1;
   const DFlashBlock* dflash = m->dflash_block >= 0 ? &block<DFlashBlock>(m, m->dflash_block) : nullptr;
   const int dflash_kv = dflash ? dflash->kv : -1;
   for (const KvSpec& k : m->states.kv) {
     KvBuf b;
     int positions = s->cap;
-    // past 8 windows (a whole cache of fewer is small, and its every position read exactly anyway)
-    const bool mtp_part = int(s->kv.size()) == mtp_kv && m->opt.kernels.mtp_window > 0 &&
-                          s->cap > 8LL * m->opt.kernels.mtp_window;
-    // with a copy where strata attention is compiled for the MTP layer's heads; elsewhere its first positions instead
-    bool mtp_copy = mtp_part && m->opt.kernels.mtp_copy > 0;
-    if (mtp_copy) {
-      const auto& a = block<AttnBlock>(m, block<MtpBlock>(m, m->mtp_block).attn);
-      mtp_copy = strata_supported(a.nh, a.nkv, a.hd, m->opt.kernels.mtp_copy);
-    }
-    if (mtp_part) {
-      b.window = m->opt.kernels.mtp_window;
-      // Sink and window cover at most the entire context, including when the requested sink is very large.
-      b.sink = mtp_copy ? 0 : std::min(m->opt.kernels.mtp_sink, s->cap - b.window);
-      const int64_t span = std::max<int64_t>(int64_t(b.window) + 2 * FLYX_MAX_ROWS, s->rows_cap);
-      const int64_t ring = (b.sink + span + 63) / 64 * 64;
-      if (m->opt.kernels.mtp_ring && ring < s->cap) b.ring = positions = int(ring);
+    // The MTP layer's cache at long contexts (mtp_part): its draft steps attend to its first sink positions and its
+    // last window (and to every position through a copy, mtp.copy), which a ring of slots holds as a sliding-window
+    // layer's does: copied with every checkpoint, since later positions overwrite the window a restore, a snapshot or
+    // a rewind goes back to.
+    const MtpPart mtp = mtp_part(m, s, s->kv.size());
+    if (mtp.on) {
+      b.window = mtp.window;
+      b.sink = mtp.sink;
+      if (const int ring = swa_ring_slots(m, s, s->kv.size())) {  // option mtp_ring, and fewer slots than positions
+        b.swa_ring = true;
+        b.ring = positions = ring;
+      }
     } else if (k.window > 0) {
       // SWA fixed GPU ring (target SWA and DSpark SWA layers): holds the window plus one prefill chunk or rollback span.
       if (const int ring = swa_ring_slots(m, s, s->kv.size())) {
@@ -940,7 +958,7 @@ void alloc_state(const flyx_bmodel* m, flyx_seq* s) {
       b.ks = s->alloc<float>(size_t(k.layers) * positions * k.nkv);
       b.vs = s->alloc<float>(size_t(k.layers) * positions * k.nkv);
     }
-    if (mtp_copy) {  // every position's copy (strata's layout), read by strata attention
+    if (mtp.copy) {  // every position's copy (strata's layout), read by strata attention
       const auto& a = block<AttnBlock>(m, block<MtpBlock>(m, m->mtp_block).attn);
       b.bits = m->opt.kernels.mtp_copy;
       b.words = strata_words(k.hd, b.bits);
@@ -957,7 +975,7 @@ void alloc_state(const flyx_bmodel* m, flyx_seq* s) {
       st.how.recent = b.window;
       st.how.most = b.window / 2;
       strata_scratch(m, s, st, 1, a.nh, a.nkv, a.hd);
-    } else if (mtp_part && b.window > 0) {  // the draft step's gathered positions
+    } else if (mtp.on) {  // the draft step's gathered positions
       const size_t w = size_mul(size_add(b.sink, b.window), k.nkv);
       const size_t bytes = size_mul(size_mul(w, k.hd), elem);
       s->mtp_window = KvRef{s->alloc<uint8_t>(bytes), s->alloc<uint8_t>(bytes),

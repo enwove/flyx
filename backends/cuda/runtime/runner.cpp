@@ -13,6 +13,7 @@
 #include "backends/common/snapshot_format.h"
 #include "backends/cuda/backend.h"
 #include "backends/cuda/runtime/strata_snapshot.h"
+#include "backends/cuda/runtime/window_ring.h"
 
 namespace flyx::cuda {
 
@@ -1242,17 +1243,18 @@ void flyx_seq::forget_hot() {
     }
 }
 
-// A ring of `ring` slots keeps its first `sink` positions for good and the others in turn (KvRef::slot_of): of those,
-// the ring_hi - (ring - sink) latest.  The row at pos reads [pos - window + 1, pos], its own written by the round.
+// The highest floor of the rings of slots checkpointed on host (KvBuf::swa_ring, the MTP layer's too:
+// window_ring_floor).  One keeps its first `sink` positions for good and the others in turn (KvRef::slot_of), of those
+// the ring_hi - (ring - sink) latest.
 int flyx_seq::rewind_floor() const {
-  long long first = 0;
+  int64_t first = 0;
   for (size_t i = 0; i < kv.size(); ++i) {
     const flyx::cuda::KvBuf& b = kv[i];
     if (!b.swa_ring) continue;
-    const long long window = b.window > 0 ? b.window : m->states.kv[i].window;
-    first = std::max(first, (long long)ring_hi - (b.ring - b.sink) + window - 1);
+    const int64_t window = b.window > 0 ? b.window : m->states.kv[i].window;
+    first = std::max(first, flyx::cuda::window_ring_floor(ring_hi, b.ring, b.sink, window));
   }
-  return int(std::min<long long>(first, INT32_MAX));
+  return int(std::min<int64_t>(first, INT32_MAX));
 }
 
 // The rows of a round launched now: the first at the position the host last read or past it (the

@@ -19,7 +19,8 @@
 #   models/formats/      chat formats: reading replies back; renderers written for a template vs the Jinja engine;
 #                        reply grammars
 #   backends/cuda/       every CUDA kernel vs the float64 ops (ops/); a DFlash2 drafter's context ring (its slots,
-#                        the positions it still holds for rewinds, restores and snapshots)
+#                        the positions it still holds for rewinds, restores and snapshots); the rings checkpoints
+#                        copy (sliding-window layers', the MTP layer's: their slots, what they hold for rewinds)
 #   e2e/                 the whole engine vs the Python reference (golden; make_tiny.py builds the tiny
 #                        models and their golden outputs), and a real model vs transformers; a drafter on a
 #                        prompt set vs plain decoding and bifill-dv's references (check_dv.py: its counting and
@@ -216,6 +217,8 @@ add_executable(strata_snapshot_test backends/cuda/strata_snapshot_test.cpp)
 target_include_directories(strata_snapshot_test PRIVATE ${CMAKE_SOURCE_DIR})
 add_executable(draft_ring_test backends/cuda/draft_ring_test.cpp)
 target_include_directories(draft_ring_test PRIVATE ${CMAKE_SOURCE_DIR} ${CMAKE_SOURCE_DIR}/include)
+add_executable(window_ring_test backends/cuda/window_ring_test.cpp)
+target_include_directories(window_ring_test PRIVATE ${CMAKE_SOURCE_DIR} ${CMAKE_SOURCE_DIR}/include)
 add_executable(response_store_test apps/flyx-server/response_store_test.cpp)
 target_include_directories(response_store_test PRIVATE ${CMAKE_SOURCE_DIR} ${CMAKE_SOURCE_DIR}/third_party)
 target_link_libraries(response_store_test PRIVATE Threads::Threads)
@@ -347,6 +350,7 @@ add_test(NAME telemetry COMMAND telemetry_test)
 add_test(NAME snapshot_store COMMAND snapshot_store_test)
 add_test(NAME strata_snapshot COMMAND strata_snapshot_test)
 flyx_register_test(draft_ring draft_ring_test)
+flyx_register_test(window_ring window_ring_test)
 add_test(NAME parked_edit COMMAND parked_edit_test ${ASSETS}/tiny.flyx)
 set_tests_properties(parked_edit PROPERTIES FIXTURES_REQUIRED assets)
 add_test(NAME response_store COMMAND response_store_test)

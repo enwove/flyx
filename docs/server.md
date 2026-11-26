@@ -218,7 +218,7 @@ Passed verbatim to the backend (`backends/cuda/backend.cpp`). Unknown keys or in
 | `mtp_window` | `N` (≥ 0) | `4096` | Above `8 * N` context, MTP reads last `N` positions exact (`0` = full exact device cache). |
 | `mtp_copy` | `0` \| `2..4` | `2` | StrataFlux bit-width for MTP layer beyond `mtp_window` (`0` = disabled). |
 | `mtp_sink` | `N` (≥ 0) | `64` | Initial sink positions kept exact for MTP when `mtp_copy=0`. |
-| `mtp_ring` | `0` \| `1` | `1` | Ring buffer storage for MTP exact window (`0` = linear slots, tests). |
+| `mtp_ring` | `0` \| `1` | `1` | Ring buffer storage for MTP exact window: the window, one prefill pass and the sink, copied to host memory with every checkpoint as a sliding-window layer's ring is (`0` = linear slots, tests). A rewind whose window later positions overwrote in the ring is refused, and the session recomputes instead. |
 | `dflash_ring` | `0` \| `1` | `1` | Ring buffer storage for sliding-window DFlash2 context K/V (`0` = linear slots, tests). A checkpoint, snapshot or rewind whose drafter window later positions overwrote in the ring is refused, and the session recomputes instead. |
 
 ### Inkling-2 Rounds
