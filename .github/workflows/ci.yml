@@ -70,16 +70,17 @@ jobs:
       # The tests' fixtures take most of this job to make (make_assets) and change only with what make_tiny.py makes
       # them from: the Python reference, the converter, the chat templates and the packages installed above.  Its own
       # digest of those names the cache, and its stamp in the directory still decides on every run whether anything
-      # is made again, so a cache it does not match is made over, never trusted.
+      # is made again, so a cache it does not match is made over, never trusted.  A group's own digest and stamp: the
+      # cpu preset makes core's alone (DV's tests are FLYX_TEST_DV's), so a change to DV's inputs keeps this cache.
       - name: Digest of what the test fixtures are made from
         id: fixtures
-        run: echo "digest=$(python tests/e2e/make_tiny.py --digest)" >> "$GITHUB_OUTPUT"
+        run: echo "core=$(python tests/e2e/make_tiny.py --digest --group core)" >> "$GITHUB_OUTPUT"
 
       - name: Cache test fixtures
         uses: actions/cache@v4
         with:
           path: ~/flyx-build-cpu/assets
-          key: fixtures-${{ runner.os }}-${{ steps.fixtures.outputs.digest }}
+          key: fixtures-core-${{ runner.os }}-${{ steps.fixtures.outputs.core }}
 
       - name: Build and test (cpu preset)
         run: |

@@ -148,13 +148,15 @@ std::string with_header(const std::string& path, const std::string& dir, const s
 
 int main(int argc, char** argv) {
   if (argc < 2) {
-    std::fprintf(stderr, "usage: llama_models_test ASSET_DIR\n");
+    std::fprintf(stderr, "usage: llama_models_test ASSET_DIR [nodv]\n");
     return 2;
   }
   const std::string dir = argv[1], path = dir + "/tiny_llama_lora.flyx";
+  // nodv: without tiny_llama_dv_lora.flyx, one of DV's assets (make_tiny.py --group dv: FLYX_TEST_DV's tests alone)
+  const bool with_dv = !(argc > 2 && std::string(argv[2]) == "nodv");
   ModelFile f, fd, fp;
   std::string error;
-  if (!f.open(path, &error) || !fd.open(dir + "/tiny_llama_dv_lora.flyx", &error) ||
+  if (!f.open(path, &error) || (with_dv && !fd.open(dir + "/tiny_llama_dv_lora.flyx", &error)) ||
       !fp.open(dir + "/tiny_llama.flyx", &error)) {
     std::printf("FAIL open: %s\n", error.c_str());
     return 1;
@@ -164,10 +166,12 @@ int main(int argc, char** argv) {
   check(plain && m, "tiny_llama.flyx and tiny_llama_lora.flyx open: " + error);
   if (!plain || !m) return 1;
   check(m->drafters() == 0, "a V-LoRA alone: no drafter");
-  for (const std::string name : {"tiny_llama_lora.flyx", "tiny_llama_dv_lora.flyx"})
+  for (const std::string name : {"tiny_llama_lora.flyx", "tiny_llama_dv_lora.flyx"}) {
+    if (!with_dv && name != "tiny_llama_lora.flyx") continue;
     check(format_of(dir + "/" + name) == 2 && (name == "tiny_llama_lora.flyx" ? f : fd).header().at("requires") ==
                                                   json::array({"lora"}),
           name + ": .flyx format 2, requiring its adapters (a build of format 1 only refuses it)");
+  }
   check(format_of(dir + "/tiny_llama.flyx") == 1 && !fp.header().contains("requires"),
         "tiny_llama.flyx: format 1, nothing required (every build reads it)");
   adapters(*m, *plain, 16, 0.5f, "tiny_llama_lora.flyx");
@@ -180,24 +184,26 @@ int main(int argc, char** argv) {
     }
     check(none, "tiny_llama.flyx: no adapters (rank 0, as its blocks are built zeroed)");
   }
-  const auto dv = open(fd, "dv", &error);
-  const auto dv_none = open(fd, "none", &error);
-  check(dv && dv_none && dv->drafters() == 1 && std::string(dv->drafter()) == "dv" && dv_none->drafters() == 0,
-        "tiny_llama_dv_lora.flyx: DV with --drafter dv, none with --drafter none (" + error + ")");
-  if (dv && dv_none) {
-    adapters(*dv, *plain, 32, 1.f, "tiny_llama_dv_lora.flyx, DV");
-    adapters(*dv_none, *plain, 32, 1.f, "tiny_llama_dv_lora.flyx, --drafter none");
-    const flyx_model_desc& d = dv->desc();
-    const flyx_dv_block& v = d.blocks[d.n_blocks - 1].dv;
-    bool canvas = d.blocks[d.n_blocks - 1].kind == FLYX_BLOCK_DV && v.layers == LAYERS;
-    for (int j = 0; canvas && j < v.layers; ++j) {
-      const flyx_dv_layer_block& l = d.blocks[v.first_layer + j].dv_layer;
-      canvas = d.blocks[l.attn].kind == FLYX_BLOCK_ATTN && d.blocks[l.mlp].kind == FLYX_BLOCK_MLP &&
-               std::string(name_of(d, l.lora[FLYX_LIN_Q].a)) == "dv.L" + std::to_string(j) + ".q.lora_a" &&
-               l.lora[FLYX_LIN_DOWN].scale == 1.f && l.lora[FLYX_LIN_Q].rank == 32;
+  if (with_dv) {
+    const auto dv = open(fd, "dv", &error);
+    const auto dv_none = open(fd, "none", &error);
+    check(dv && dv_none && dv->drafters() == 1 && std::string(dv->drafter()) == "dv" && dv_none->drafters() == 0,
+          "tiny_llama_dv_lora.flyx: DV with --drafter dv, none with --drafter none (" + error + ")");
+    if (dv && dv_none) {
+      adapters(*dv, *plain, 32, 1.f, "tiny_llama_dv_lora.flyx, DV");
+      adapters(*dv_none, *plain, 32, 1.f, "tiny_llama_dv_lora.flyx, --drafter none");
+      const flyx_model_desc& d = dv->desc();
+      const flyx_dv_block& v = d.blocks[d.n_blocks - 1].dv;
+      bool canvas = d.blocks[d.n_blocks - 1].kind == FLYX_BLOCK_DV && v.layers == LAYERS;
+      for (int j = 0; canvas && j < v.layers; ++j) {
+        const flyx_dv_layer_block& l = d.blocks[v.first_layer + j].dv_layer;
+        canvas = d.blocks[l.attn].kind == FLYX_BLOCK_ATTN && d.blocks[l.mlp].kind == FLYX_BLOCK_MLP &&
+                 std::string(name_of(d, l.lora[FLYX_LIN_Q].a)) == "dv.L" + std::to_string(j) + ".q.lora_a" &&
+                 l.lora[FLYX_LIN_DOWN].scale == 1.f && l.lora[FLYX_LIN_Q].rank == 32;
+      }
+      check(canvas, "DV's canvas layers: the target's blocks (whose adapters the canvas never runs) and their own "
+                    "adapters, scale 1");
     }
-    check(canvas, "DV's canvas layers: the target's blocks (whose adapters the canvas never runs) and their own "
-                  "adapters, scale 1");
   }
 
   struct Bad {

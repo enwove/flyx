@@ -23,15 +23,20 @@ Mandatory rules for anyone modifying this repository (humans and coding agents a
 
 1. **Every op against float64.** Each CUDA kernel is tested against its `ops/<op>/ref.h` (or `ops/sampling/sampling.h`) in `tests/backends/cuda/op_test_<family>.cu` on seeded inputs (`FLYX_OPS_SEED` varies seeds). If a kernel rounds inputs (e.g., bf16 activations for NVFP4 weights), the reference applies the identical rounding first; tolerances cover accumulation order only. Add or update its row in `docs/design/numerics.md` in the same change (`tools/check_numerics.py` enforces coverage).
 2. **Fused == generic.** Every fused region override must match the generic implementation; golden tests verify both (`fusion=0`).
-3. **Whole-model verification.** `golden_test` covers tiny BF16 and NVFP4 models on both backends (plain, MTP, DFlash2, forced long accepted runs, rollback, checkpoint restore, edited prompts, sampling, stop strings) plus tiny Qwen3 against `transformers` (adding a model must not require backend changes). `tests/e2e/check_real_model.py` validates real checkpoints against `transformers` and confirms all drafters reproduce plain decoding; DV's runs against plain decoding are `tests/e2e/check_dv.py`'s.
+3. **Whole-model verification.** `golden_test` covers tiny BF16 and NVFP4 models on both backends (plain, MTP, DFlash2, forced long accepted runs, rollback, checkpoint restore, edited prompts, sampling, stop strings) plus tiny Qwen3 against `transformers` (adding a model must not require backend changes). `tests/e2e/check_real_model.py` validates real checkpoints against `transformers` and confirms all drafters reproduce plain decoding. DV is not in production: its tests (gates 3 and 4 for DV, `tests/dv.cmake`) are registered only with `FLYX_TEST_DV=ON` and run in `ctest --preset full` (`cpu-full` without a GPU). A change to DV's code (`models/dv.*`, `ops/draft/`, `ops/canvas/`, `backends/cuda/kernels/dv.cu`, `python/reference/flyx_ref/dv.py`, `python/reference/dv_*.py`, `python/convert/flyx_convert/dv.py`, `python/convert/export_dv.py`, `bench/replay/dv_choice*`, `tests/**/*dv*`) must pass them, and `tests/e2e/check_dv.py` against plain decoding, before landing.
 4. **Speculation never changes output.** Greedy decoding produces identical tokens with and without drafters. Sampled decoding produces identical tokens for a fixed seed. Any optimization making a row depend on concurrent row count (e.g., variable K split or reduction order) violates this gate and is forbidden.
 5. **No obvious quality drop.** On the same model file, default rounding (inputs, caches, state, sums) must be as fine as `llama.cpp`'s default CUDA path on the same GPU, unless real-model measurements (KL divergence and top-1 agreement against the finer rounding) show no visible drop. Opt-in user flags are exempt. `docs/design/numerics.md` tracks the comparison place by place.
 
 ## Verification Commands
 
 ```sh
-cmake --build --preset dev && ctest --preset dev --output-on-failure
+cmake --build --preset dev && ctest --preset dev --output-on-failure    # every test but DV's (= ctest --preset gpu)
 ```
+
+While editing, `ctest --preset quick` runs the unit and tiny tests and the smoke tests (on a CUDA build the GPU's
+too) in a minute or two. A change to DV's code (gate 3) also needs `cmake --preset dev-full && ctest --preset full`:
+the same build tree with DV's tests registered (`dv_not_configured` fails a full run in a tree configured without
+them); `cmake --preset dev` takes them out again. `docs/testing.md` lists the tiers, labels and presets.
 
 Individual static checks (also run by `ctest`):
 

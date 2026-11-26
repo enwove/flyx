@@ -5,9 +5,9 @@
 #
 #   bash tools/ci/gpu.sh            # MODELS=~/models by default
 #
-# CUDA build (dev preset) and every suite (kernel tests; golden tests on
-# CUDA, fused and unfused), the real-model check against transformers, the
-# HTTP API check, then the benchmark.  Output in logs/ci/.
+# CUDA build (dev preset) and every suite but DV's (kernel tests; golden
+# tests on CUDA, fused and unfused), the real-model check against
+# transformers, the HTTP API check, then the benchmark.  Output in logs/ci/.
 set -euo pipefail
 cd "$(dirname "$0")/../.."
 mkdir -p logs/ci

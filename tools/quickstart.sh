@@ -86,7 +86,7 @@ if want deps; then CUR=deps
   fi
   . "$VENV/bin/activate"
   run "pip" python -m pip install -q -U pip
-  run "python packages" python -m pip install -q "cmake>=3.24" ninja sccache "torch==2.13.0" transformers tokenizers \
+  run "python packages" python -m pip install -q "cmake>=3.24" ninja sccache "torch==2.15.0" transformers tokenizers \
       gguf safetensors "huggingface_hub[cli]"
   if ! find_nvcc; then
     echo "no CUDA toolkit found: installing the CUDA 13.0 compiler into $VENV"

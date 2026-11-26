@@ -37,7 +37,7 @@
       "inherits": "base-ninja",
       "displayName": "Development (Release, tests, this machine's GPU architectures)",
       "binaryDir": "$env{HOME}/flyx-build",
-      "cacheVariables": { "FLYX_TESTS": "ON" }
+      "cacheVariables": { "FLYX_TESTS": "ON", "FLYX_TEST_DV": "OFF" }
     },
     {
       "name": "debug",
@@ -58,7 +58,7 @@
       "inherits": "base-windows",
       "displayName": "Development on Windows (Release, tests, MSVC, this machine's GPU)",
       "binaryDir": "$env{USERPROFILE}/flyx-build",
-      "cacheVariables": { "FLYX_TESTS": "ON" }
+      "cacheVariables": { "FLYX_TESTS": "ON", "FLYX_TEST_DV": "OFF" }
     },
     {
       "name": "cpu-windows",
@@ -66,6 +66,30 @@
       "displayName": "CPU only on Windows (float64 reference backend)",
       "binaryDir": "$env{USERPROFILE}/flyx-build-cpu",
       "cacheVariables": { "FLYX_CUDA": "OFF" }
+    },
+    {
+      "name": "dev-full",
+      "inherits": "dev",
+      "displayName": "dev's build tree with DV's tests registered too (test preset full)",
+      "cacheVariables": { "FLYX_TEST_DV": "ON" }
+    },
+    {
+      "name": "cpu-full",
+      "inherits": "cpu",
+      "displayName": "cpu's build tree with DV's tests registered too (test preset cpu-full)",
+      "cacheVariables": { "FLYX_TEST_DV": "ON" }
+    },
+    {
+      "name": "dev-windows-full",
+      "inherits": "dev-windows",
+      "displayName": "dev-windows's build tree with DV's tests registered too (test preset full-windows)",
+      "cacheVariables": { "FLYX_TEST_DV": "ON" }
+    },
+    {
+      "name": "cpu-windows-full",
+      "inherits": "cpu-windows",
+      "displayName": "cpu-windows's build tree with DV's tests registered too (test preset cpu-full-windows)",
+      "cacheVariables": { "FLYX_TEST_DV": "ON" }
     },
     {
       "name": "release-linux",
@@ -107,20 +131,26 @@
     },
     { "name": "quick-base", "hidden": true, "inherits": "test-base", "filter": { "include": { "label": "^quick$" } } },
     { "name": "no-dv-base", "hidden": true, "inherits": "test-base", "filter": { "exclude": { "label": "^dv$" } } },
-    { "name": "dev", "inherits": "test-base", "configurePreset": "dev" },
-    { "name": "cpu", "inherits": "test-base", "configurePreset": "cpu" },
-    { "name": "dev-windows", "inherits": "test-base", "configurePreset": "dev-windows" },
-    { "name": "cpu-windows", "inherits": "test-base", "configurePreset": "cpu-windows" },
+    {
+      "name": "full-base",
+      "hidden": true,
+      "inherits": "test-base",
+      "environment": { "FLYX_TEST_REQUIRE_DV": "1" }
+    },
+    { "name": "dev", "inherits": "no-dv-base", "configurePreset": "dev" },
+    { "name": "cpu", "inherits": "no-dv-base", "configurePreset": "cpu" },
+    { "name": "dev-windows", "inherits": "no-dv-base", "configurePreset": "dev-windows" },
+    { "name": "cpu-windows", "inherits": "no-dv-base", "configurePreset": "cpu-windows" },
     { "name": "quick", "inherits": "quick-base", "configurePreset": "dev" },
     { "name": "gpu", "inherits": "no-dv-base", "configurePreset": "dev" },
-    { "name": "full", "inherits": "test-base", "configurePreset": "dev" },
+    { "name": "full", "inherits": "full-base", "configurePreset": "dev-full" },
     { "name": "cpu-quick", "inherits": "quick-base", "configurePreset": "cpu" },
-    { "name": "cpu-full", "inherits": "test-base", "configurePreset": "cpu" },
+    { "name": "cpu-full", "inherits": "full-base", "configurePreset": "cpu-full" },
     { "name": "quick-windows", "inherits": "quick-base", "configurePreset": "dev-windows" },
     { "name": "gpu-windows", "inherits": "no-dv-base", "configurePreset": "dev-windows" },
-    { "name": "full-windows", "inherits": "test-base", "configurePreset": "dev-windows" },
+    { "name": "full-windows", "inherits": "full-base", "configurePreset": "dev-windows-full" },
     { "name": "cpu-quick-windows", "inherits": "quick-base", "configurePreset": "cpu-windows" },
-    { "name": "cpu-full-windows", "inherits": "test-base", "configurePreset": "cpu-windows" },
-    { "name": "release-linux", "inherits": "test-base", "configurePreset": "release-linux" }
+    { "name": "cpu-full-windows", "inherits": "full-base", "configurePreset": "cpu-windows-full" },
+    { "name": "release-linux", "inherits": "no-dv-base", "configurePreset": "release-linux" }
   ]
 }
