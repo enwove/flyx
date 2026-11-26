@@ -1107,6 +1107,7 @@ void forward(const Pass& ps, int copy_prefix = 0);
 void forward_target(const Pass& ps, int copy_prefix = 0);
 void draft_step_range(const Pass& ps, int start, int end);
 bool sequential_draft(const flyx_plan* p);
+bool cheap_draft_steps(const flyx_plan* p);
 void run_node(const Pass& ps, const flyx_node& n, const Block* b);  // the generic implementation of a node
 bool generic_impl(const RegionImpl* r);                                // r is the generic one (not a fused override)
 int lower(flyx_bmodel* m, const flyx_program* prog, flyx_plan** out);

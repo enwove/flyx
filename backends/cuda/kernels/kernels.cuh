@@ -1511,7 +1511,7 @@ struct StopCondHandles {
 };
 void stop_decide_step(const float* prob, const float* margin, const flyx_stop_policy* pol, DevStopState* state,
                       int bucket, int prev_w, int cur_w, unsigned long long h_next_draft, StopCondHandles h_ver,
-                      cudaStream_t st);
+                      bool earlier_prefix, cudaStream_t st);
 void stop_decide_block(const float* prob, const float* margin, const flyx_stop_policy* pol, DevStopState* state,
                        StopCondHandles h_ver, cudaStream_t st);
 

@@ -23,10 +23,13 @@ inline double stop_draft_prob_ref(double prob, double margin, int pos, const fly
 }
 
 // Step-wise drafter decision at checkpoint `bucket` covering drafts [0, cur_w).
-// Updates *survival (cumulative survival through cur_w) and optional *verify_bucket (the best verify bucket in
-// [0, bucket] if stopping now); returns 1 to continue drafting, 0 to stop and verify *verify_bucket.
+// Updates *survival (cumulative survival through cur_w) and optional *verify_bucket (what to verify if stopping now:
+// `bucket`, or with `earlier_prefix` the best bucket in [0, bucket]); returns 1 to continue drafting, 0 to stop and
+// verify *verify_bucket.  The policy's costs are whole rounds', draft steps and verify rows: an earlier prefix is
+// priced right only where the steps already taken cost little beside the rows not verified (the caller's to say).
 inline int stop_decide_step_ref(const double* prob, const double* margin, const flyx_stop_policy& pol, int bucket,
-                                int prev_w, int cur_w, double* survival, int* verify_bucket = nullptr) {
+                                int prev_w, int cur_w, double* survival, int* verify_bucket = nullptr,
+                                bool earlier_prefix = true) {
   (void)prev_w;
   const int n = std::clamp(pol.n_buckets, 1, FLYX_MAX_STOP_BUCKETS);
   const int b_cur = std::clamp(bucket, 0, n - 1);
@@ -44,10 +47,10 @@ inline int stop_decide_step_ref(const double* prob, const double* margin, const 
   }
   *survival = prod;
   const double c0 = double(pol.costs[0]);
-  int best = 0;
+  int best = earlier_prefix ? 0 : b_cur;
   double best_val = -1e30;
   double etok_cur = 1.0;
-  for (int b = 0; b <= b_cur; ++b) {
+  for (int b = best; b <= b_cur; ++b) {
     const int wb = std::clamp(pol.widths[b], 0, hi);
     double etok = 1.0;
     for (int k = 0; k < wb; ++k) etok += S[k];

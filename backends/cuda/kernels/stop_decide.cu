@@ -1,8 +1,10 @@
 // Copyright 2026 The flyx Authors. SPDX-License-Identifier: Apache-2.0
 // Device-side intra-round confidence optimal stopping decisions for adaptive CUDA conditional graphs.
-// Works identically for step-wise drafters (MTP, EAGLE-4, DSpark Markov head) via stop_decide_step (which can
-// fall back to any earlier verify prefix h_ver[best] when stopping) and parallel block drafters (DFlash2) via
-// stop_decide_block, using only drafter-agnostic (prob, margin) and core/speculation/'s flyx_stop_policy.
+// Works identically for step-wise drafters (MTP, EAGLE-4, DSpark Markov head) via stop_decide_step and parallel block
+// drafters (DFlash2) via stop_decide_block, using only drafter-agnostic (prob, margin) and core/speculation/'s
+// flyx_stop_policy.  A step that stops verifies what has been drafted, or, where the caller says a draft step costs
+// little beside a verify row (earlier_prefix), the prefix that pays: the policy's costs are whole rounds', so two
+// checkpoints differ by their draft steps too, which a stop has already paid.
 #include "backends/cuda/kernels/common/device.cuh"
 #include "backends/cuda/kernels/kernels.cuh"
 
@@ -24,7 +26,7 @@ __device__ inline float d_stop_draft_prob(float prob, float margin, int pos, con
 __global__ void k_stop_decide_step(const float* __restrict__ prob, const float* __restrict__ margin,
                                    const flyx_stop_policy* __restrict__ pol, DevStopState* __restrict__ state,
                                    int bucket, int prev_w, int cur_w, unsigned long long h_next_draft,
-                                   StopCondHandles h_ver) {
+                                   StopCondHandles h_ver, bool earlier_prefix) {
   (void)prev_w;
   const flyx_stop_policy P = *pol;
   int n_buckets = P.n_buckets < 1 ? 1 : (P.n_buckets > FLYX_MAX_STOP_BUCKETS ? FLYX_MAX_STOP_BUCKETS : P.n_buckets);
@@ -45,10 +47,10 @@ __global__ void k_stop_decide_step(const float* __restrict__ prob, const float* 
       S[k] = prod;
     }
     const float c0 = P.costs[0];
-    best = 0;
+    best = earlier_prefix ? 0 : b_cur;
     float best_val = -1e30f;
     float etok_cur = 1.f;
-    for (int b = 0; b <= b_cur; ++b) {
+    for (int b = best; b <= b_cur; ++b) {
       int wb = P.widths[b];
       if (wb < 0) wb = 0;
       if (wb > hi) wb = hi;
@@ -146,8 +148,9 @@ __global__ void k_stop_decide_block(const float* __restrict__ prob, const float*
 
 void stop_decide_step(const float* prob, const float* margin, const flyx_stop_policy* pol, DevStopState* state,
                       int bucket, int prev_w, int cur_w, unsigned long long h_next_draft, StopCondHandles h_ver,
-                      cudaStream_t st) {
-  k_stop_decide_step<<<1, 1, 0, st>>>(prob, margin, pol, state, bucket, prev_w, cur_w, h_next_draft, h_ver);
+                      bool earlier_prefix, cudaStream_t st) {
+  k_stop_decide_step<<<1, 1, 0, st>>>(prob, margin, pol, state, bucket, prev_w, cur_w, h_next_draft, h_ver,
+                                      earlier_prefix);
 }
 
 void stop_decide_block(const float* prob, const float* margin, const flyx_stop_policy* pol, DevStopState* state,
