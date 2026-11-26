@@ -106,6 +106,8 @@ void ensure_checkpoint_slot(flyx_seq* s, int c) {
   size_t off = 0;
   auto take_raw = [&](size_t bytes) -> void* {
     const size_t aligned = (bytes + 255) / 256 * 256;
+    // checkpoint_slot_bytes counts what is taken here (the pinned budget's split and the dry sizing count it too)
+    if (off + aligned > s->ckp_slot_bytes) throw std::logic_error("a checkpoint's state past checkpoint_slot_bytes");
     void* ptr = base + off;
     off += aligned;
     return ptr;

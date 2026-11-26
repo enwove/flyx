@@ -533,6 +533,51 @@ void strata_scratch(const flyx_bmodel* m, flyx_seq* s, StrataScratch& st, int ro
     st.delta = s->alloc<float>(delta_floats);
 }
 
+// The slots of the ring of the state table's cache i (KvBuf::swa_ring: a sliding-window layer, the target's or
+// DSpark's, and a DSpark Full layer past 8 of option mtp_window's windows): the window its rows read plus one prefill
+// chunk or rollback span, in 64s; 0 where that is not fewer than the context's positions (a slot a position).  The
+// cache's allocation and every checkpoint's copy of it (checkpoint_slot_bytes) take this many.
+int swa_ring_slots(const flyx_bmodel* m, const flyx_seq* s, size_t i) {
+  const KvSpec& k = m->states.kv[i];
+  const auto& ko = m->opt.kernels;
+  const bool long_ctx = ko.mtp_window > 0 && (long long)s->cap > 8ll * ko.mtp_window;
+  const int mtp_kv = m->mtp_block >= 0 ? block<AttnBlock>(m, block<MtpBlock>(m, m->mtp_block).attn).kv : -1;
+  if (int(i) == mtp_kv && long_ctx) return 0;  // the MTP layer's own ring (KvBuf::ring, not checkpointed)
+  long long window = 0;
+  if (k.window > 0) {
+    window = k.window;
+  } else if (m->dspark_block >= 0 && k.draft && k.layers == 1 && long_ctx && ko.mtp_ring) {
+    const auto& ds = block<DSparkBlock>(m, m->dspark_block);
+    for (int j = 0; j < ds.layers(); ++j)
+      if (block<DSparkLayer>(m, ds.first_layer + j).kv == int(i)) window = ko.mtp_window;
+  }
+  if (window == 0) return 0;
+  const long long span = std::max(FLYX_ROUND_SLOTS * FLYX_MAX_ROWS + m->wide_rows, s->rows_cap);
+  const long long ring = (window + span + 63) / 64 * 64;
+  return ring < s->cap ? int(ring) : 0;
+}
+
+// The bytes of a checkpoint's slot in host memory (ensure_checkpoint_slot lays it out): per gated delta net its
+// state and convolution window, per ring of slots its K and V (and their FP8 scales), per ShortConv its window, and
+// the hidden ring's row, each 256-byte aligned.  The pinned budget's split (alloc_state) and the dry sizing count
+// FLYX_CHECKPOINTS of them, which the checkpoints take as they are made.
+size_t checkpoint_slot_bytes(const flyx_bmodel* m, const flyx_seq* s) {
+  auto align256 = [](size_t bytes) { return (bytes + 255) / 256 * 256; };
+  size_t n = 0;
+  for (const GdnDims& gd : m->states.gdn)
+    n += align256(size_t(gd.nv) * gd.dv * gd.dk * sizeof(float)) + align256(size_t(gd.ck - 1) * gd.C() * sizeof(float));
+  for (const ShortConvSpec& sc : m->states.sconv) n += align256(size_t(sc.conv - 1) * size_t(sc.channels) * sizeof(float));
+  for (size_t i = 0; i < m->states.kv.size(); ++i)
+    if (const int ring = swa_ring_slots(m, s, i)) {
+      const KvSpec& k = m->states.kv[i];
+      const size_t elem = k.fp8 ? 1 : sizeof(kv16);
+      n += 2 * align256(size_t(ring) * k.nkv * k.hd * elem);
+      if (k.fp8) n += 2 * align256(size_t(ring) * k.nkv * sizeof(float));
+    }
+  if (m->states.ring_width) n += align256(size_t(m->states.ring_width) * sizeof(float));
+  return n;
+}
+
 // The state the table declares, for positions [0, s->cap).
 void alloc_state(const flyx_bmodel* m, flyx_seq* s) {
   // Caches in tiers: the target's, one layer's each, of a size two or more share, since the caches
@@ -650,14 +695,9 @@ void alloc_state(const flyx_bmodel* m, flyx_seq* s) {
       const size_t gran = vmm_granularity();
       auto round_up_g = [&](size_t n) { return (n + gran - 1) / gran * gran; };
       // Priority-1 base pinned bytes (host Strata copies + checkpoints + small staging/arena overhead; bounce & drain
-      // are only added if at least one layer spills to pageable RAM).
-      uint64_t prio1_base = 32ull << 20;
-      for (const GdnDims& gd : m->states.gdn)
-        prio1_base += size_t(FLYX_CHECKPOINTS) *
-                      (align256(size_t(gd.nv) * gd.dv * gd.dk * sizeof(float)) +
-                       align256(size_t(gd.ck - 1) * gd.C() * sizeof(float)));
-      if (m->states.ring_width)
-        prio1_base += size_t(FLYX_CHECKPOINTS) * align256(size_t(m->states.ring_width) * sizeof(float));
+      // are only added if at least one layer spills to pageable RAM).  The checkpoints: what the dry sizing counts
+      // and ensure_checkpoint_slot takes (rings of slots and ShortConvs included).
+      uint64_t prio1_base = (32ull << 20) + uint64_t(FLYX_CHECKPOINTS) * checkpoint_slot_bytes(m, s);
       int ci = 0;
       std::vector<uint64_t> layer_kv_pinned, layer_drain;
       layer_kv_pinned.reserve(size_t(s->copies));
@@ -741,14 +781,12 @@ void alloc_state(const flyx_bmodel* m, flyx_seq* s) {
       if (m->opt.kernels.mtp_ring && ring < s->cap) b.ring = positions = ring;
     } else if (k.window > 0) {
       // SWA fixed GPU ring (target SWA and DSpark SWA layers): holds the window plus one prefill chunk or rollback span.
-      const int ring =
-          (k.window + std::max(FLYX_ROUND_SLOTS * FLYX_MAX_ROWS + m->wide_rows, s->rows_cap) + 63) / 64 * 64;
-      if (ring < s->cap) {
+      if (const int ring = swa_ring_slots(m, s, s->kv.size())) {
         b.swa_ring = true;
         b.ring = positions = ring;
       }
     } else if (m->dspark_block >= 0 && k.draft && k.layers == 1 && m->opt.kernels.mtp_window > 0 &&
-               s->cap > 8 * m->opt.kernels.mtp_window) {
+               (long long)s->cap > 8ll * m->opt.kernels.mtp_window) {
       bool is_dspark_kv = false;
       const auto& ds = block<DSparkBlock>(m, m->dspark_block);
       for (int j = 0; j < ds.layers(); ++j)
@@ -757,9 +795,7 @@ void alloc_state(const flyx_bmodel* m, flyx_seq* s) {
         // DSpark Full-attention layer at long contexts (> 8 * mtp_window): bound on-device draft KV to a sliding ring,
         // matching MTP's mtp_window behavior (exact full context for shorter contexts, bounded VRAM at long contexts).
         b.window = m->opt.kernels.mtp_window;
-        const int ring =
-            (b.window + std::max(FLYX_ROUND_SLOTS * FLYX_MAX_ROWS + m->wide_rows, s->rows_cap) + 63) / 64 * 64;
-        if (m->opt.kernels.mtp_ring && ring < s->cap) {
+        if (const int ring = swa_ring_slots(m, s, s->kv.size())) {  // option mtp_ring, and fewer slots than positions
           b.swa_ring = true;
           b.ring = positions = ring;
         }
@@ -879,11 +915,6 @@ void alloc_state(const flyx_bmodel* m, flyx_seq* s) {
       s->mtp_window = KvRef{s->alloc<uint8_t>(w * k.hd * elem), s->alloc<uint8_t>(w * k.hd * elem),
                             k.fp8 ? s->alloc<float>(w) : nullptr, k.fp8 ? s->alloc<float>(w) : nullptr};
       s->P_window = s->alloc<DevParams>(1);
-    }
-    if (b.swa_ring) {
-      auto align256_kv = [](size_t bytes) { return (bytes + 255) / 256 * 256; };
-      s->ckp_slot_bytes += 2 * align256_kv(size_t(b.ring) * k.nkv * k.hd * elem);
-      if (k.fp8) s->ckp_slot_bytes += 2 * align256_kv(size_t(b.ring) * k.nkv * sizeof(float));
     }
     s->kv.push_back(b);
   }
@@ -1071,8 +1102,7 @@ void alloc_state(const flyx_bmodel* m, flyx_seq* s) {
     b.win = s->alloc<float>(FLYX_ROUND_SLOTS * b.w_stride);
     b.replay = GdnBufs::round(m->wide_rows, gd);  // a round's rows: 64 where lookup rounds may be wide
     b.replay.base = s->alloc<float>(kGdnReplaySlots * b.replay.slot_stride);
-    // Checkpoint host buffers are allocated lazily per slot in checkpoint.
-    s->ckp_slot_bytes += align256(b.s_stride * sizeof(float)) + align256(b.w_stride * sizeof(float));
+    // Checkpoint host buffers are allocated lazily per slot in checkpoint (checkpoint_slot_bytes).
     s->gdn.push_back(b);
   }
   // The commit's table of layers (layers.cpp: commit): when every gated delta net has the first's dims, strides and
@@ -1103,7 +1133,6 @@ void alloc_state(const flyx_bmodel* m, flyx_seq* s) {
     b.r_stride = size_t(m->wide_rows) * size_t(sc.channels);
     b.win = s->alloc<float>(FLYX_ROUND_SLOTS * b.w_stride);
     b.replay = s->alloc<float>(kGdnReplaySlots * b.r_stride);
-    s->ckp_slot_bytes += align256(b.w_stride * sizeof(float));
     s->sconv.push_back(b);
   }
   if (!s->sconv.empty()) {
@@ -1126,8 +1155,9 @@ void alloc_state(const flyx_bmodel* m, flyx_seq* s) {
   if (const int w = m->states.ring_width) {
     s->ring = s->alloc<float>(size_t(kHring) * w);
     s->ring_snap = s->alloc<float>(size_t(w));
-    s->ckp_slot_bytes += align256(size_t(w) * sizeof(float));
   }
+  // One count of a checkpoint's bytes for the pinned budget's split above, the dry sizing and the checkpoints.
+  s->ckp_slot_bytes = checkpoint_slot_bytes(m, s);
   if (s->dry) s->dry_host_bytes += size_t(FLYX_CHECKPOINTS) * s->ckp_slot_bytes;
 }
 
