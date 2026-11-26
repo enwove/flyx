@@ -578,10 +578,13 @@ else()
 endif()
 
 # Labels flyx_finish_test_labels cannot infer (the registering functions give golden, gpu_serial, server and tools;
-# the CUDA block gpu).  smoke: the golden and GPU tests quick runs too, a few seconds each where they can be: the
+# the CUDA block gpu).  smoke: the golden and GPU tests quick runs too.  quick takes as long as its longest tests,
+# cuda_ops and golden_cuda_pdl (about 35 s each alone on an RTX 5070 Ti): the others a few seconds each, so that
+# they run beside those two (the gguf_cuda runs, as long as them or longer, would set quick's time instead).  The
 # second architecture against transformers (gate 3, from its .flyx and its GGUF file), and on the GPU every kernel
-# against float64 (gate 1), the tiny Qwen3.5 (MTP, DFlash2, sampling: gates 3 and 4), Qwen3 and Llama against
-# transformers, packed GGML blocks, Inkling-2 (fused == generic, DSpark == plain: gates 2 and 4) and the loader.
+# against float64 (gate 1), the tiny Qwen3.5 (MTP, DFlash2, sampling: gates 3 and 4), Qwen3 against transformers
+# fused and generic (gates 2 and 3), Llama against transformers and its NVFP4 copy (NVFP4 on CUDA: gate 3), packed
+# GGML blocks in tree rounds, Inkling-2 (fused == generic, DSpark == plain: gates 2 and 4) and the loader.
 set_property(TEST make_assets APPEND PROPERTY LABELS tiny)          # makes the tiny models (no fixture before it)
 set_property(TEST gguf_cpu_ref APPEND PROPERTY LABELS golden)       # gguf_e2e_test: the golden outputs from GGUF
 set_property(TEST golden_cpu_ref_qwen3 golden_cpu_ref_qwen3_gguf APPEND PROPERTY LABELS smoke)
@@ -591,7 +594,8 @@ endif()
 if(TARGET flyx-cuda)
   set_property(TEST gguf_cuda gguf_cuda_unfused gguf_cuda_pdl gguf_cuda_no_pdl APPEND PROPERTY LABELS golden)
   set_property(TEST tree_bench_context APPEND PROPERTY LABELS tools)
-  set_property(TEST cuda_ops golden_cuda_pdl golden_cuda_qwen3 golden_cuda_llama golden_cuda_quant_q4_k inkling2_cuda
-                    cuda_loader elastic_load_cuda vision residual_decision APPEND PROPERTY LABELS smoke)
+  set_property(TEST cuda_ops golden_cuda_pdl golden_cuda_qwen3 golden_cuda_qwen3_unfused golden_cuda_llama
+                    golden_cuda_llama_nvfp4 golden_cuda_quant_q4_k inkling2_cuda cuda_loader elastic_load_cuda vision
+                    residual_decision APPEND PROPERTY LABELS smoke)
 endif()
 flyx_finish_test_labels()
