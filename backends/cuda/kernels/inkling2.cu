@@ -2091,7 +2091,7 @@ __global__ void k_rel_attention_combine_win(const float* __restrict__ part, cons
   put(out, size_t(r) * ld_out + h * hd + d, size_t(r) * nh * hd + h * hd + d, o);
 }
 
-constexpr int kRelRoundTile = 16, kRelRoundWarps = 8;
+constexpr int kRelRoundTile = 16, kRelRoundWarps = 8, kRelRoundAhead = 4;
 
 __device__ __forceinline__ int rel_round_used(int first, int p, int splits) {
   return min(splits, p / kRelRoundTile - first / kRelRoundTile + 1);
@@ -2137,6 +2137,52 @@ __global__ void k_rel_round_combine(const float* part, const float* gate, int ld
   const int first = window > 0 ? max(0, p - window + 1) : 0;
   rel_round_output(part, gate, ld_gate, nh, row, blockIdx.x * 3 + warp, splits, rel_round_used(first, p, splits),
                    out, ld_out);
+}
+
+// A lane's four values of a key's K and V as loaded; rel_round_widen makes of them what rel_load_kv<4, FP8> does.
+template <bool FP8>
+struct RelRoundRaw {
+  uint32_t k, v;
+  float ks, vs;
+};
+template <>
+struct RelRoundRaw<false> {
+  uint2 k, v;
+};
+
+template <bool FP8>
+__device__ __forceinline__ void rel_round_load(const KvRef& kv, int cell, int kvh, int nkv, int lane,
+                                               RelRoundRaw<FP8>& w) {
+  const size_t at = (size_t(cell) * nkv + kvh) * 128 + lane * 4;
+  if constexpr (FP8) {
+    w.ks = kv.kscales(cell)[size_t(cell) * nkv + kvh];
+    w.vs = kv.vscales(cell)[size_t(cell) * nkv + kvh];
+    w.k = *reinterpret_cast<const uint32_t*>(static_cast<const uint8_t*>(kv.k) + at);
+    w.v = *reinterpret_cast<const uint32_t*>(static_cast<const uint8_t*>(kv.v) + at);
+  } else {
+    w.k = *reinterpret_cast<const uint2*>(static_cast<const kv16*>(kv.k) + at);
+    w.v = *reinterpret_cast<const uint2*>(static_cast<const kv16*>(kv.v) + at);
+  }
+}
+
+template <bool FP8>
+__device__ __forceinline__ void rel_round_widen(const RelRoundRaw<FP8>& w, float (&k)[4], float (&v)[4]) {
+  if constexpr (FP8) {
+    e4m3x4_to_float(w.k, k);
+    e4m3x4_to_float(w.v, v);
+#pragma unroll
+    for (int e = 0; e < 4; ++e) {
+      k[e] *= w.ks;
+      v[e] *= w.vs;
+    }
+  } else {
+    const float2 k0 = __half22float2(*reinterpret_cast<const __half2*>(&w.k.x));
+    const float2 k1 = __half22float2(*reinterpret_cast<const __half2*>(&w.k.y));
+    const float2 v0 = __half22float2(*reinterpret_cast<const __half2*>(&w.v.x));
+    const float2 v1 = __half22float2(*reinterpret_cast<const __half2*>(&w.v.y));
+    k[0] = k0.x, k[1] = k0.y, k[2] = k1.x, k[3] = k1.y;
+    v[0] = v0.x, v[1] = v0.y, v[2] = v1.x, v[3] = v1.y;
+  }
 }
 
 // A lane holds four adjacent head dimensions and one component of the 16-dimensional relative query.
@@ -2212,13 +2258,30 @@ __global__ void __launch_bounds__(32 * kRelRoundWarps)
     }
   }
 
-  for (int tile = first_tile + sp; tile <= last / kRelRoundTile; tile += splits) {
+  // The warp's keys n = 0, 1, ...: tile first_tile + sp + (n / 2) splits, offset (n % 2) 8, in the order of the
+  // tiles and their offsets. kRelRoundAhead keys' loads are in flight while a key's sums run (a 30k-token Global row
+  // walks about 120 keys a warp, each waiting on its load before); the same sums in the same order.
+  static_assert(kRelRoundTile == 2 * kRelRoundWarps, "a tile is two keys a warp");
+  const int last_tile = last / kRelRoundTile, t0 = first_tile + sp;
+  const int n_keys = t0 <= last_tile ? 2 * ((last_tile - t0) / splits + 1) : 0;
+  auto key_of = [&](int n) { return (t0 + (n >> 1) * splits) * kRelRoundTile + (n & 1) * kRelRoundWarps + warp; };
+  RelRoundRaw<FP8> ahead[kRelRoundAhead]{};
 #pragma unroll
-    for (int offset = 0; offset < kRelRoundTile; offset += kRelRoundWarps) {
-      const int j = tile * kRelRoundTile + offset + warp;
+  for (int d = 0; d < kRelRoundAhead; ++d) {
+    const int j = key_of(d);
+    if (d < n_keys && j >= first && j <= last) rel_round_load<FP8>(kv, kv.slot_of(j), kvh, nkv, lane, ahead[d]);
+  }
+  for (int n0 = 0; n0 < n_keys; n0 += kRelRoundAhead) {
+#pragma unroll
+    for (int d = 0; d < kRelRoundAhead; ++d) {
+      const int n = n0 + d, j = key_of(n), jn = key_of(n + kRelRoundAhead);
+      if (n >= n_keys) break;
+      const RelRoundRaw<FP8> w = ahead[d];
+      if (n + kRelRoundAhead < n_keys && jn >= first && jn <= last)
+        rel_round_load<FP8>(kv, kv.slot_of(jn), kvh, nkv, lane, ahead[d]);
       if (j < first || j > last) continue;
       float k[4], v[4];
-      rel_load_kv<4, FP8>(kv, kv.slot_of(j), kvh, nkv, hd, lane, k, v);
+      rel_round_widen<FP8>(w, k, v);
 #pragma unroll
       for (int i = 0; i < RT; ++i) {
         const int dist = p0 + i - j;
