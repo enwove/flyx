@@ -8,10 +8,6 @@ on:
   schedule:
     - cron: "17 18 * * *"  # 18:17 UTC, off the hour (scheduled runs at :00 queue the longest)
   workflow_dispatch:
-  # TEMPORARY, removed before the pull request is ready: runs this workflow on the pull request that adds it.
-  pull_request:
-    paths:
-      - ".github/workflows/nightly.yml"
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}

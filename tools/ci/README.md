@@ -51,12 +51,13 @@ over, never trusted.
 `release-smoke.yml` downloads a release's assets with `gh release download` and checks:
 
 - every asset against `SHA256SUMS.txt` (`sha256sum -c --strict`), and no asset the file leaves out;
-- the Linux tarball and wheel in containers of `ubuntu:22.04`, `ubuntu:24.04`, `debian:12`, `fedora:latest` and
-  `archlinux:latest`, as pulled (`tools/ci/release_smoke.sh`, run as root): the libraries each binary needs and the
-  GLIBC version they ask for (`ldd`), `flyx --version`, `flyx --help`, `flyx-server --help`, a run on the CUDA
-  backend refused with a reason and not a crash, a first token of the tiny model on the float64 backend the CLI
-  falls back to (timed), then, with the distribution's own Python installed, the tarball's Python binding and its
-  server (`packaging/smoke_model.py`) and the wheel installed by `pip` and generating (`packaging/smoke_binding.py`);
+- the Linux tarball and wheel in containers of `ubuntu:22.04`, `ubuntu:24.04`, `ubuntu:26.04`, `debian:12`,
+  `debian:13`, `fedora:latest` and `archlinux:latest`, as pulled (`tools/ci/release_smoke.sh`, run as root): the
+  libraries each binary needs and the GLIBC version they ask for (`ldd`), `flyx --version`, `flyx --help`,
+  `flyx-server --help`, a run on the CUDA backend refused with a reason and not a crash, a first token of the tiny
+  model on the float64 backend the CLI falls back to (timed), then, with the distribution's own Python installed, the
+  tarball's Python binding and its server (`packaging/smoke_model.py`) and the wheel installed by `pip` and
+  generating (`packaging/smoke_binding.py`);
 - the Windows executable and the zip's `flyx.exe` on a Windows runner (`tools/ci/release_smoke_windows.ps1`): the
   DLLs they import (no Visual C++ runtime, no CUDA or driver DLL: `dumpbin /dependents`), the same CLI checks, the
   server (and the zip's Python binding), then the wheel installed by `pip`.

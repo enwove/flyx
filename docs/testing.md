@@ -25,7 +25,7 @@ python tests/apps/flyx-server/check_server.py --url http://127.0.0.1:8080
 CI runs on hosted runners without a GPU: every pull request the `cpu` preset on Ubuntu (`tools/ci/cpu.sh`), and
 DV's tests (`cpu-dv`) or the CUDA build, compiled and not run (`cuda-compile`), when it touches their paths; every
 night `cpu-full`, the CPU tests on Windows and the CUDA build with DV's tests registered; and a published release's
-assets on five Linux distributions and Windows. The GPU suite (`tools/ci/gpu.sh`) runs on a maintainer's machine:
+assets on seven Linux distributions and Windows. The GPU suite (`tools/ci/gpu.sh`) runs on a maintainer's machine:
 there is no GPU runner. See [tools/ci/README.md](../tools/ci/README.md).
 
 ---
