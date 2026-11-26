@@ -22,14 +22,20 @@ python tests/e2e/check_real_model.py --hf ~/models/Qwen3.5-4B --model ~/models/q
 python tests/apps/flyx-server/check_server.py --url http://127.0.0.1:8080
 ```
 
-CI scripts: `tools/ci/cpu.sh` (hosted CPU runner) and `tools/ci/gpu.sh` (self-hosted GPU runner); see [tools/ci/README.md](../tools/ci/README.md).
+CI runs on hosted runners without a GPU: every pull request the `cpu` preset on Ubuntu (`tools/ci/cpu.sh`), and
+DV's tests (`cpu-dv`) or the CUDA build, compiled and not run (`cuda-compile`), when it touches their paths; every
+night `cpu-full`, the CPU tests on Windows and the CUDA build with DV's tests registered; and a published release's
+assets on five Linux distributions and Windows. The GPU suite (`tools/ci/gpu.sh`) runs on a maintainer's machine:
+there is no GPU runner. See [tools/ci/README.md](../tools/ci/README.md).
 
 ---
 
 ## 2. Tiers, Labels and Presets
 
 Every test has one **tier**, what it needs and so about what it costs, and any number of **aspects**. The test presets
-select by these labels (`ctest -L` / `-LE` select by them too: `ctest --preset dev -L '^golden$'`).
+select by these labels (`ctest -L` / `-LE` select by them too: `ctest --preset dev -L '^golden$'`). An `-LE` beside a
+preset that excludes a label itself (`dev`, `gpu`, `cpu` and their Windows twins exclude `^dv$`) drops both exclusions
+(CTest 4.4): give it with `--test-dir` instead of the preset.
 
 | Label | Kind | Meaning | Given by |
 |---|---|---|---|
@@ -55,13 +61,14 @@ A new test usually needs nothing: its tier and aspects follow from where and how
 when that is not enough: a test registered outside the CUDA block that takes the CUDA backend (`gpu`), a golden run
 not made by `flyx_add_golden_test` (`golden`), a new smoke test (keep them a few seconds each). The inference cannot
 see how long a test takes: a slow test inferred `tiny` lands in `quick`, so look at its time in the JUnit report
-(`ctest --output-junit`).
+(`ctest --output-junit`): `python tools/check_test_tiers.py REPORT.xml` names every quick test over 20 s (the nightly
+CI runs warn of them).
 
 | Test preset (Windows: `-windows` suffix) | Runs | When |
 |---|---|---|
 | `quick` / `cpu-quick` | label `quick` | after each build while editing (a minute or two with the GPU's smoke tests) |
 | `dev` (= `gpu`) / `cpu` | every test but DV's (`-LE ^dv$`) | before a pull request; CI's `cpu` |
-| `full` / `cpu-full` | every test, DV's too | a change to DV's code (AGENTS.md gate 3), before a release |
+| `full` / `cpu-full` | every test, DV's too | a change to DV's code (AGENTS.md gate 3), before a release; CI's nightly `cpu-full` (and `cpu-dv`: DV's alone) |
 
 **DV's tests are opt-in.** DV is not in production, so its tests (`tests/dv.cmake`) and their fixtures (`make_tiny.py
 --group dv`, test `make_dv_assets`) are registered only in a tree configured with `FLYX_TEST_DV=ON`: the configure

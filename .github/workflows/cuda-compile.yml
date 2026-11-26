@@ -34,8 +34,11 @@ permissions:
 
 jobs:
   cuda-compile:
-    name: CUDA compile, sm_120, nothing run (Ubuntu)
-    runs-on: ubuntu-latest
+    name: CUDA compile, sm_120, nothing run (Ubuntu 24.04)
+    # The release package's build machine (docs/benchmarks.md: CUDA 13.0.88 on Ubuntu 24.04).  Not ubuntu-latest:
+    # CUDA 13.0's crt/math_functions.h declares rsqrt and rsqrtf, which glibc 2.41 and later declare too with another
+    # exception specification, and nvcc then fails on every file (ubuntu-latest is 26.04, glibc 2.43).
+    runs-on: ubuntu-24.04
     timeout-minutes: 120
     # github.workflow is the caller's name when nightly.yml calls this: a group of its own beside the caller's (a job
     # in its caller's group would wait for itself) and beside this workflow's run on the same pull request.
