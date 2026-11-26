@@ -285,6 +285,8 @@ flyx_add_py_test(kv_method_flags ${CMAKE_CURRENT_SOURCE_DIR}/apps/flyx-cli/kv_me
                  ARGS $<TARGET_FILE:flyx-cli> ${ASSETS}/tiny.flyx FIXTURES assets)
 flyx_add_py_test(cli_usage ${CMAKE_CURRENT_SOURCE_DIR}/apps/flyx-cli/usage.py
                  ARGS $<TARGET_FILE:flyx-cli> ${ASSETS}/tiny.flyx FIXTURES assets)
+flyx_add_py_test(server_ephemeral_port ${CMAKE_CURRENT_SOURCE_DIR}/apps/flyx-server/ephemeral_port.py
+                 ARGS $<TARGET_FILE:flyx-cli> TIMEOUT 45)
 flyx_add_py_test(remembered_model ${CMAKE_CURRENT_SOURCE_DIR}/apps/flyx-server/remembered_model.py
                  ARGS $<TARGET_FILE:flyx-cli> ${ASSETS}/tiny.flyx FIXTURES assets)
 flyx_add_py_test(queued_request_ttft ${CMAKE_CURRENT_SOURCE_DIR}/apps/flyx-server/queued_request_ttft.py
