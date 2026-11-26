@@ -831,6 +831,21 @@ std::string gguf_header_path(const std::string& path) {
   return modelfile::parse_split_suffix(path, &sp) && sp.part != 1 ? modelfile::shard_path(sp, 0) : path;
 }
 
+namespace {
+
+// "org/name" of a Hub repository's URL as llama.cpp writes it (https://huggingface.co/org/name); "" for other text.
+std::string hub_repo_of_url(const std::string& url) {
+  static const std::string kHub = "https://huggingface.co/";
+  if (!url.starts_with(kHub)) return "";
+  const std::string id = url.substr(kHub.size());
+  const size_t slash = id.find('/');
+  return slash == std::string::npos || slash == 0 || slash + 1 == id.size() || id.find('/', slash + 1) != std::string::npos
+             ? ""
+             : id;
+}
+
+}  // namespace
+
 GgufPeek gguf_peek(const std::string& path) {
   GgufPeek out;
   modelfile::HeaderReader r(gguf_header_path(path));
@@ -877,7 +892,13 @@ GgufPeek gguf_peek(const std::string& path) {
       continue;
     }
     if (type == 8) {
-      if (!text(key == "general.architecture" ? &arch : nullptr)) return out;
+      const bool repo = key == "general.source.repo_url" ||
+                        (key.starts_with("general.base_model.") && key.ends_with(".repo_url"));
+      std::string value;
+      if (!text(key == "general.architecture" ? &arch : repo ? &value : nullptr)) return out;
+      if (const std::string id = hub_repo_of_url(value);
+          !id.empty() && std::find(out.base_models.begin(), out.base_models.end(), id) == out.base_models.end())
+        out.base_models.push_back(id);
       continue;
     }
     int64_t v = 0;
@@ -899,11 +920,6 @@ GgufPeek gguf_peek(const std::string& path) {
   out.mtp_layers = it == layers.end() || it->second < 0 ? 0 : int(std::min<int64_t>(it->second, 1 << 20));
   out.has_markov_context = arch == "dflash" && has_markov;
   return out;
-}
-
-int gguf_peek_mtp_layers(const std::string& path) {
-  const GgufPeek p = gguf_peek(path);
-  return p.valid ? p.mtp_layers : -1;
 }
 
 }  // namespace flyx

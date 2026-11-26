@@ -27,6 +27,7 @@
 #include <atomic>
 #include <condition_variable>
 #include <deque>
+#include <functional>
 #include <memory>
 #include <mutex>
 #include <shared_mutex>
@@ -121,6 +122,8 @@ struct SchedulerOptions {
   bool batch_rounds = true;
   int queue_limit = 16;
   int queue_timeout_ms = 600000;
+  // Every request decoded, with its record (status: stop, length, tool_calls or cancelled), on the scheduler thread.
+  std::function<void(const RequestRecord&)> on_finished;
   int idle_unload_ms = 0;            // free the sessions after this long idle; 0 = never
   int keep_alive_ms = 0;             // unload the model after this long idle; 0 = never
   int verbose = 0;

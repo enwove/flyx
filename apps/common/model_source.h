@@ -17,12 +17,24 @@
 
 namespace flyx::apps {
 
-// A drafter that goes with a model, or one published for it.
+// A drafter that goes with a model.
 struct DrafterSource {
   std::string kind;            // "mtp", or a block drafter's ("dflash2", "dspark"), as its header or the Hub says;
                                // "" if unknown
   std::string from;            // "model file" (its own MTP layer), a Hub name or file of a repository, or a path
   std::optional<uint64_t> size;  // bytes on disk; none where only the Hub could tell (or inside the model's file)
+};
+
+// A drafter verified with flyx (its output plain decoding's, and faster) for the models made from a base model (a model
+// card's base_model): the list drafters.json in the Hub's Enwove/flyx-drafters keeps (docs/models.md).
+struct KnownDrafter {
+  std::string repo;      // its Hub name
+  std::string kind;      // --drafter's word for it ("dflash2", "dspark")
+  std::string base;      // the model it was made (and verified) for
+  bool exact = false;    // the model is that one (its own repository); else it names it as a base model: inferred
+  std::string relation;  // inferred: how the Hub says the model was made from its base ("quantized", ...), or ""
+  // its files' bytes where the Hugging Face cache has them (a load's suggestions); unknown elsewhere
+  std::optional<uint64_t> size = std::nullopt;
 };
 
 struct Fetched {
@@ -36,7 +48,7 @@ struct Fetched {
   std::string name;                   // the model's name for the API: its file's, without the extension
   std::vector<std::string> notes;     // for the log: a drafter published for this model, the MTP file taken
   std::vector<DrafterSource> drafter_sources;  // what the model drafts with: its own MTP layer, the files above
-  std::vector<DrafterSource> suggested;        // DFlash2 drafters published for it and not named (from: the Hub name)
+  std::vector<KnownDrafter> suggested;         // the verified drafters for it (known_drafters) not named
 };
 
 // Fetches what is missing. want_mtp: take the repository's MTP file for a GGUF without the layer.
@@ -47,6 +59,13 @@ struct Fetched {
 bool fetch_model(const std::string& model, const std::vector<std::string>& drafters, bool want_mtp,
                  const hub::ProgressFn& progress, const std::atomic<bool>* stop, Fetched* out, std::string* err,
                  const std::string& mmproj = "", bool want_vision = true, bool want_dspark = false);
+
+// The drafter a file or directory holds, as its own fields say ("mtp", "dflash2", "dspark"; "" when they say none): a
+// GGUF's header (general.architecture "dflash", or MTP layers), a drafter directory's config.json, a .flyx file's
+// "draft".  The file is not mapped; no name is read for it.
+std::string drafter_kind(const std::string& path);
+// The same of a Hub repository, from what the Hub says (its config's architecture, its GGUFs' architecture).
+std::string drafter_kind(const hub::Repo& r);
 
 // Whether `eo` drafts with the MTP layer when the model has one (not --no-spec, not --drafter dflash2 or none).
 bool wants_mtp(const EngineOptions& eo);
@@ -61,8 +80,17 @@ bool wants_dspark(const EngineOptions& eo, const std::vector<std::string>& draft
 // "" for none.
 std::string dspark_beside(const std::string& model_path);
 
-// DFlash2 drafters published for models made from these base models (a model card's base_model), by repository.
-std::vector<std::string> known_drafters(const std::vector<std::string>& base_models);
+// The verified drafters this build runs (a kind it does not know left out) for a model: those made for the repository
+// it is (`repo`, "" when unknown), then, inferred, those made for the base models it names (`base_models`), each in the
+// list's order.  `hub`: `repo` is a Hub repository and the call talks to the Hub anyway: the list is the Hub's (asked
+// once a process), and an inferred drafter's relation is how the Hub says `repo` was made from its base; else the list
+// is the Hugging Face cache's copy, read without the network, and no relation is known.
+std::vector<KnownDrafter> known_drafters(const std::string& repo, const std::vector<std::string>& base_models,
+                                         bool hub);
+// The same from drafters.json's text, with `relation` for the inferred ones: none when the text is not version 1 of the
+// list throughout (an entry that is no {base, repo, kind} of strings, a kind of auto, all or none, a repository twice).
+std::vector<KnownDrafter> known_drafters_in(const std::string& list, const std::string& repo,
+                                            const std::vector<std::string>& base_models, const std::string& relation);
 
 // Throttled Hub fetch progress logger writing to stderr, optionally forwarding every tick to `hook`.
 hub::ProgressFn make_progress_logger(const char* prefix, double interval_ms, hub::ProgressFn hook = {});
@@ -105,9 +133,9 @@ std::vector<HubGguf> hub_ggufs(const hub::Repo& repo);
 // the first complete one listed.
 const HubGguf* preferred_companion(const std::vector<HubGguf>& ggufs, const std::string& kind);
 
-// The MTP layers a GGUF says it holds (<arch>.nextn_predict_layers), read from its header alone: the metadata, never
-// the tensors.  -1: not a GGUF, or not readable.
-int gguf_mtp_layers(const std::string& path);
+// A GGUF's header (flyx::gguf_peek: its architecture, MTP layers, the repositories it comes from), read once while
+// the file keeps its size and time; valid false when it is no GGUF.
+flyx::GgufPeek gguf_header(const std::string& path);
 
 // Model, drafter, and vision projector files in directories of the user's own (flyx serve --models-dir,
 // FLYX_MODELS_DIR): *.gguf (classified via classify_gguf; complete split GGUFs grouped as one entry pointing to

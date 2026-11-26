@@ -13,8 +13,10 @@
 //                         repositories with GGUF files; without q, filtered to the architectures this build runs
 //                         (optionally narrowed to arch=A), paginated via next_cursor
 //   GET /v1/hub/files?repo=ORG/NAME   a repository's models: its GGUFs by quantization with their sizes (and which
-//                         are in the cache already), its MTP file, the DFlash2 drafters known for it, what the Hub
+//                         are in the cache already), its MTP file, the drafters verified for it, what the Hub
 //                         says of it (downloads, license, its GGUFs' architecture) and whether this build runs that
+//   GET /v1/hub/drafter?name=NAME   the drafter a path or a Hub name holds, as its own fields say: {"name", "kind"};
+//                         400 for neither, 404 for a Hub name the Hub does not have
 //   GET /v1/hub/dir?path=PATH   a folder of this machine: the folders in it, and the model files in it and two folders
 //                         down, as names the panel can load; a model file's own path lists that file.  Without
 //                         path: where to start from (the model directories, the home directory, on Windows the disks)
@@ -23,7 +25,8 @@
 //                         they cancel).  For a browser on that machine only: 403 from another, 501 where no dialog
 //                         can be shown, 409 while one is open
 //   GET /v1/hub/cached    the models on this machine, as names the panel can load: every snapshot of the Hugging Face
-//                         cache's repositories, and the model files in --models-dir / FLYX_MODELS_DIR
+//                         cache's repositories, and the model files in --models-dir / FLYX_MODELS_DIR; a model's
+//                         verified drafters (known_drafters), a drafter's kind (drafter_kind)
 //   DELETE /v1/hub/cached?name=NAME   deletes a model the cache holds (never a file of those directories), unless it
 //                         is being served or a load is under way: 409
 //   POST /v1/unload       the model served goes; the settings file still names it
@@ -45,9 +48,11 @@
 #include <tuple>
 
 #include "apps/flyx-server/agent_launch.h"
+#include "apps/flyx-server/drafter_speeds.h"
 #include "apps/flyx-server/gpu_apps.h"
 #include "apps/flyx-server/server.h"
 #include "core/interfaces/model.h"
+#include "core/modelfile/modelfile.h"
 #include "core/os/env.h"
 #include "core/os/os.h"
 #include "core/os/path.h"
@@ -95,6 +100,11 @@ Listed dir_entry(const apps::LocalModel& m) {
             {"file", m.file}, {"path", m.path}, {"size", m.size}, {"modified", apps::modified_unix(m.modified)},
             {"revision", nullptr}, {"current", true},
             {"mtp", gguf && m.mtp_layers > 0 ? ojson("in-file") : ojson(nullptr)}};
+  if (m.kind == "gguf" || m.kind == "flyx") {  // what its file says it is and comes from
+    const flyx::ModelOrigin o =
+        gguf ? flyx::ModelOrigin{"", apps::gguf_header(m.path).base_models} : flyx::model_origin(m.path);
+    l.json["known_drafters"] = known_drafters_json(m.path, apps::known_drafters(o.repo, o.base_models, false));
+  }
   if (m.kind == "drafter" && !m.drafter_kind.empty()) l.json["drafter_kind"] = m.drafter_kind;
   if (m.parts > 1) l.json["parts"] = m.parts;
   l.on_disk = {m.path};
@@ -126,6 +136,12 @@ std::vector<Listed> listing(const Server& s) {
                 {"revision", c.commit}, {"current", c.current}, {"mtp", kind == "gguf" && mtp_count > 0 ? ojson("in-file") : ojson(nullptr)},
                 {"mmproj", nullptr}, {"dflash2", nullptr}};
       if (kind == "drafter" && !drafter_kind.empty()) l.json["drafter_kind"] = drafter_kind;
+      if (kind == "gguf" || kind == "flyx")  // what its file says it comes from
+        l.json["known_drafters"] = known_drafters_json(
+            name + suffix,
+            apps::known_drafters(c.repo, kind == "gguf" ? apps::gguf_header(disk).base_models
+                                                        : flyx::model_origin(disk).base_models,
+                                 false));
       return l;
     };
     const auto ggufs = apps::hub_ggufs(r);
@@ -158,7 +174,9 @@ std::vector<Listed> listing(const Server& s) {
     if (drafter) {
       const std::string disk = from_path(to_path(c.dir).make_preferred());
       const auto modified = fs::last_write_time(to_path(disk), ec);
-      l = entry(c.repo, "drafter", "", c.repo.substr(c.repo.find('/') + 1), disk, size, modified, -1, "dflash2");
+      // its config's kind ("dflash2", "dspark")
+      l = entry(c.repo, "drafter", "", c.repo.substr(c.repo.find('/') + 1), disk, size, modified, -1,
+                flyx::drafter_source_kind(c.dir));
     } else {
       const std::string base = files[0].path.substr(files[0].path.rfind('/') + 1);
       const std::string disk = disk_of(files[0].path);
@@ -320,10 +338,12 @@ ojson repo_json(const hub::Repo& r) {
           {"mtp", mtp},
           {"mmproj", mmproj},
           {"companions", companions},
-          {"drafter", ggufs.empty() && config && weights > 0 && hub::is_drafter(r) ? ojson({{"size", weights}, {"kind", "dflash2"}}) : ojson(nullptr)},
+          {"drafter", ggufs.empty() && config && weights > 0 && hub::is_drafter(r)
+                          ? ojson({{"size", weights}, {"kind", hub::drafter_kind(r)}})
+                          : ojson(nullptr)},
           {"drafter_repo", dflash_gguf_repo},
           {"architectures", r.architectures},
-          {"known_drafters", apps::known_drafters(r.base_models)},
+          {"known_drafters", known_drafters_json(r.id, apps::known_drafters(r.id, r.base_models, true))},
           {"info", r.from_cache ? ojson(nullptr) : info},
           {"runs", runs},
           {"build_architectures", known},
@@ -394,6 +414,24 @@ void add_manage_routes(httplib::Server& http, Server* s) {
     std::string err;
     if (!hub::describe(name.repo, name.revision, &repo, &err)) return error(r, 404, err, "not_found");
     send_json(r, 200, repo_json(repo));
+  });
+  http.Get("/v1/hub/drafter", [s](const httplib::Request& q, httplib::Response& r) {
+    if (!require_manage(*s, q, r, "loading models")) return;
+    const std::string name = q.get_param_value("name");
+    std::error_code ec;
+    hub::Name hn;
+    std::string kind;
+    if (!name.empty() && fs::exists(to_path(name), ec)) {
+      kind = apps::drafter_kind(name);
+    } else if (hub::parse_name(name, &hn)) {
+      hub::Repo repo;
+      std::string err;
+      if (!hub::describe(hn.repo, hn.revision, &repo, &err)) return error(r, 404, err, "not_found");
+      kind = apps::drafter_kind(repo);
+    } else {
+      return error(r, 400, "name: a drafter's path or Hugging Face name", "invalid_request_error");
+    }
+    send_json(r, 200, {{"name", name}, {"kind", or_null(kind)}});
   });
   http.Get("/v1/hub/search", [s](const httplib::Request& q, httplib::Response& r) {
     if (!require_manage(*s, q, r, "loading models")) return;

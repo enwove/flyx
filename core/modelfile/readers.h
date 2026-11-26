@@ -77,6 +77,8 @@ bool is_drafter_dir(const std::string& path);
 std::string drafter_dir_kind(const std::string& dir);
 // A .flyx file's "draft" section's kind, from its header alone ("dflash2", "dspark"); "" when it holds none.
 std::string flyx_draft_kind(const std::string& path);
+// A .flyx file's header alone, read from its first bytes (the file not mapped); false when it is none.
+bool peek_flyx_header(const std::string& path, nlohmann::json* h);
 bool read_drafter_dir(const std::string& dir, std::vector<std::unique_ptr<os::MappedFile>>* maps,
                       ModelFile::Contents* out, std::string* err);
 

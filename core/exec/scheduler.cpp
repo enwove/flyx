@@ -778,6 +778,7 @@ void Scheduler::finish(Running& r) {
   rec.grammar_fixes = res.grammar_fixes;
   rec.superseded = u.finish_reason == FLYX_FINISH_CANCEL && r.job->superseded_.load();
   telemetry_.finish(r.telemetry_id, rec);
+  if (opt_.on_finished) opt_.on_finished(rec);
   telemetry_.memory(engine_->ledger().used(), engine_->host_mapped_in_use(), session_slots(*prefix_cache_));
   JobEvent done{};
   done.kind = JobEvent::kDone;

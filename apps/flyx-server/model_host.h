@@ -86,8 +86,8 @@ class ModelHost {
   void reset_load_state_locked(const std::string& state, const std::string& target);
   bool work(const Want& w, std::string* err);
   // A scheduler of `f`'s files, or nullptr (*err); *load_s: the seconds it took.
-  std::shared_ptr<Scheduler> open(const apps::Fetched& f, const EngineOptions& options, double* load_s,
-                                  std::string* err) const;
+  std::shared_ptr<Scheduler> open(const std::string& model, const apps::Fetched& f, const EngineOptions& options,
+                                  double* load_s, std::string* err) const;
 
   SchedulerOptions so_;
   mutable std::mutex mu_;

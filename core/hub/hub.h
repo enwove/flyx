@@ -120,6 +120,10 @@ bool split_gguf_name(const std::string& file_name);
 // names one.
 std::string quant_in_name(const std::string& file_name);
 
+// How the Hub says a repository was made from its base models ("quantized", "finetune", "adapter", "merge"; its
+// baseModels relation), asked of the Hub; "" when it says none, or offline.
+std::string base_relation(const std::string& repo);
+
 // Whether the repository holds a block drafter (its config's architecture: DFlash2, or DeepSpec's DSpark), not a
 // transformers model; and which ("dflash2", "dspark").
 bool is_drafter(const Repo& r);

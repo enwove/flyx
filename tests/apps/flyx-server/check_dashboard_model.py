@@ -92,6 +92,10 @@ FOUND_PAGE2 = {"query": "", "family": True, "architectures": ["qwen35", "qwen3",
      "pipeline": "text-generation", "gated": False, "cached": False, "architecture": "qwen3", "runs": True}]}
 
 
+# What GET /v1/hub/drafter says of the drafters the checks type in.
+DRAFTER_KINDS = {"./another.gguf": "mtp", "./new-mtp.gguf": "mtp", "./drafts/Speedy": "dspark"}
+
+
 def repository(repo, helper_cached=False):
     """GET /v1/hub/files: REPO as this build runs it, a dflash GGUF drafter repo, a safetensors drafter repo, or unsupported."""
     if repo == "acme/Model-DFlash2-GGUF":
@@ -111,10 +115,18 @@ def repository(repo, helper_cached=False):
                 "build_architectures": ["qwen35", "qwen3"], "mtp": None, "mmproj": None, "ggufs": [], "companions": [],
                 "info": {"downloads": 500, "likes": 25, "updated": "2026-11-24T02:15:52.000Z", "license": "apache-2.0",
                          "pipeline": None, "gated": False, "architecture": None, "context": None, "parameters": None}}
+    if repo == "acme/Speedy-Drafter":  # a DSpark drafter whose name does not say so: the server says its kind
+        return {"repo": repo, "from_cache": False, "drafter": {"size": int(0.8 * GB), "kind": "dspark"},
+                "drafter_repo": False, "base_models": ["acme/Tiny-27B"], "runs": None, "known_drafters": [],
+                "build_architectures": ["qwen35", "qwen3"], "mtp": None, "mmproj": None, "ggufs": [], "companions": [],
+                "info": {"downloads": 50, "likes": 2, "updated": "2026-11-24T02:15:52.000Z", "license": "mit",
+                         "pipeline": None, "gated": False, "architecture": None, "context": None, "parameters": None}}
     runs = repo == REPO
     quants = [("IQ3_XXS", 11.8, True), ("Q4_K_M", 17.6, True), ("Q5_K_M", 19.4, False), ("Q6_K", 22.3, False), ("BF16", 54.7, False)]
     return {"repo": repo, "from_cache": False, "drafter": None, "base_models": ["acme/Tiny-27B"], "runs": runs,
-            "known_drafters": ["acme/Tiny-27B-DFlash2"] if runs else [], "build_architectures": ["qwen35", "qwen3"],
+            "known_drafters": [{"repo": "acme/Tiny-27B-DFlash2", "kind": "dflash2", "base": "acme/Tiny-27B", "exact": False,
+                                "relation": "quantized", "tok_s": None}]
+            if runs else [], "build_architectures": ["qwen35", "qwen3"],
             "mtp": {"path": "MTP/mtp.gguf", "size": int(0.6 * GB), "cached": True} if runs else None,
             "mmproj": {"path": "mmproj-BF16.gguf", "size": int(0.9 * GB), "cached": True} if runs else None,
             "companions": [
@@ -238,6 +250,9 @@ class Server:
                 res["arch"], res["next_cursor"] = arch, None
                 res["models"] = [m for m in res["models"] if m.get("architecture") == arch]
             return route.fulfill(json=res)
+        if "/v1/hub/drafter" in url:  # a drafter's kind, as its fields say (none read from its name)
+            name = query.get("name", [""])[0]
+            return route.fulfill(json={"name": name, "kind": DRAFTER_KINDS.get(name)})
         if "/v1/hub/files" in url:
             res = repository(query["repo"][0], getattr(self, "helper_cached", False))
             res["endpoint"] = self.hub_endpoint
@@ -390,9 +405,31 @@ def check_drafters(page, server, want):
     page.locator("#sd-default").click()
     check_choice(True, "", [])
     page.locator("#sd-file").fill("./another.gguf")
-    check_choice(True, "", ["./another.gguf"])
+    expect(page.locator("#mf-cmd")).to_contain_text("--drafter mtp")  # the kind the server read
+    check_choice(True, "mtp", ["./another.gguf"])
+    # A drafter whose name says nothing of its kind: the server's word for it, DSpark's here.
+    page.locator("#sd-file").fill("./drafts/Speedy")
+    expect(page.locator("#mf-cmd")).to_contain_text("--drafter dspark")
+    page.locator("#sd-file").fill("./unknown.flyx")  # nothing says what it is: no --drafter
+    page.wait_for_timeout(800)
+    assert "--drafter" not in command(page) and "./unknown.flyx" in command(page), command(page)
     page.locator("#mf-reset").click()
     expect(page.locator("#sd-saved input")).to_be_checked()
+    # Draft trees: the drafter's default, on, or off (--no-draft-trees: a DSpark drafter's default trees off).
+    page.locator('#lset-tabs [data-stab="spec"]').click()
+    if not page.locator("#sd-adv").evaluate("e => e.open"):
+        page.locator("#sd-adv > summary").click()
+    expect(page.locator("#sd-trees")).to_be_visible()
+    expect(page.locator("#sd-trees")).to_have_value("on")  # as loaded
+    page.locator("#sd-trees").select_option("off")
+    assert "--no-draft-trees" in command(page) and "--draft-trees" not in command(page), command(page)
+    confirm(page, "#mf-reload", "Reload")
+    assert server.posted[-1]["draft_trees"] is False, server.posted[-1]
+    page.locator("#sd-trees").select_option("")
+    assert "--draft-trees" not in command(page) and "--no-draft-trees" not in command(page), command(page)
+    confirm(page, "#mf-reload", "Reload")
+    assert server.posted[-1]["draft_trees"] is None, server.posted[-1]
+    page.locator("#mf-reset").click()
 
     # A saved selection carries its header identity across restore. Editing the path drops that identity.
     want.update(drafter="dflash2", drafters=["./helper.gguf"])
@@ -624,7 +661,8 @@ def check_hub(page, server, want):
     page.locator("#hf-ep-save").click()
     expect(page.locator("#hf-ep-toggle")).to_contain_text("hf-mirror.com")
     expect(page.locator("#hf-ep-toggle")).to_have_class(re.compile(r"\bon\b"))
-    expect(page.locator('#hf-detail a[href^="https://hf-mirror.com/"]')).to_have_count(1)
+    expect(page.locator('#hf-detail .dh a[href^="https://hf-mirror.com/"]')).to_have_count(1)
+    expect(page.locator('#hf-detail a[href^="https://huggingface.co/"]')).to_have_count(0)  # every link: the mirror
     page.locator("#hf-ep-reset").click()
     expect(page.locator("#hf-ep-toggle")).to_contain_text("huggingface.co")
     expect(page.locator("#hf-ep-toggle")).not_to_have_class(re.compile(r"\bon\b"))
@@ -672,15 +710,43 @@ def check_hub(page, server, want):
     expect(page.locator("#hf-name")).to_have_text("Model-DFlash2")
     expect(page.locator("#hf-drafter-only")).to_be_visible()
     expect(page.locator("#mf-load")).to_have_text("Draft with it")
+    # A DSpark drafter repo: drafted with as the kind the server says (--drafter dspark), whatever its name.
+    page.locator("#hf-q").fill("acme/Speedy-Drafter")
+    expect(page.locator("#hf-name")).to_have_text("Speedy-Drafter")
+    expect(page.locator("#hf-drafter-only")).to_be_visible()
+    page.locator("#mf-load").click()
+    expect(page.locator("#sd-file")).to_have_value("acme/Speedy-Drafter")
+    expect(page.locator("#mf-cmd")).to_contain_text("--drafter dspark")
+    page.locator("#mf-reset").click()
+    view(page, "library")
     page.locator("#hf-q").fill("")
     # A name with its quantization, in the search box: that file of that repository.
     page.locator("#hf-q").fill(REPO + ":q6_k")
     page.keyboard.press("Enter")
     expect(page.locator("#mf-files .mrow.sel")).to_have_attribute("data-name", REPO + ":Q6_K")
     expect(page.locator("#hf-drafters")).to_contain_text("acme/Tiny-27B-DFlash2")
+    expect(page.locator("#hf-drafters")).to_contain_text("DFlash2")
+    expect(page.locator("#hf-drafters")).to_contain_text("N/A")  # not run on this machine yet
     page.locator("#hf-drafters .btn").click()  # the drafter published for it goes to the settings
     expect(page.locator("#mv-current")).to_be_visible()
     expect(page.locator("#sd-file")).to_have_value("acme/Tiny-27B-DFlash2")
+    # The settings offer it beside the default, under the drafters for its base model, chosen now, as its kind; the
+    # custom drafter is not.
+    page.locator('#lset-tabs [data-stab="spec"]').click()
+    base = page.locator("#sd-base")
+    expect(base).to_contain_text("acme/Tiny-27B")
+    expect(base).to_contain_text("quantized")
+    expect(base).to_have_class(re.compile(r"\bsel\b"))
+    base.click()  # its drafters, shown
+    verified = page.locator('.sdrow[data-verified="acme/Tiny-27B-DFlash2"]')
+    expect(verified).to_have_class(re.compile(r"\bsel\b"))
+    expect(verified).to_contain_text("N/A")
+    expect(page.locator("#sd-custom")).not_to_have_class(re.compile(r"\bsel\b"))
+    expect(page.locator("#mf-cmd")).to_contain_text("--drafter dflash2")
+    page.locator("#sd-default").click()
+    expect(verified).to_be_visible()
+    verified.click()
+    expect(page.locator("#mf-cmd")).to_contain_text(re.compile(r"--drafter-file '?acme/Tiny-27B-DFlash2"))
     page.locator("#mf-reset").click()
 
 
@@ -866,12 +932,13 @@ def check_switch_companions(open_page, want):
     page.locator("#mf-name").fill("custom-alias")
     page.locator('#lset-tabs [data-stab="spec"]').click()
     page.locator("#sd-file").fill("./new-mtp.gguf")
+    expect(page.locator("#mf-cmd")).to_contain_text("--drafter mtp")
     view(page, "library")
     page.locator('#lc-list .prow.model[data-model$="Other-12B-Q5_K_M.gguf"]').click()
     confirm(page, "#mf-load", "Switch")
     body = server.posted[-1]
     assert (body["mmproj"], body["drafter"], body["drafters"], body["name"]) == (
-        None, "", ["./new-mtp.gguf"], "custom-alias"), body
+        None, "mtp", ["./new-mtp.gguf"], "custom-alias"), body  # its kind as its fields say (DRAFTER_KINDS)
     # Reloading the same model still preserves all of its own companions and API id.
     page.locator("#mf-reset").click()
     page.locator('#lset-tabs [data-stab="general"]').click()

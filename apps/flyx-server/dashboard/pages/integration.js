@@ -190,7 +190,7 @@ export function Integration({ active }) {
               <tr><td><code>model</code></td>${Td(String.raw`required: a path or <code>org/name:QUANT</code>`)}</tr>
               <tr><td><code>drafters</code></td>${Td(String.raw`more drafters, paths or Hub names (as <code>--drafter-file</code>)`)}</tr>
               <tr><td><code>ctx</code></td>${Td(String.raw`context per session, or <code>"max"</code>; left out (auto): the model's own, or the longest the GPU and host memory hold`)}</tr>
-              <tr><td><code>drafter</code>, <code>speculative</code></td>${Td(String.raw`<code>mtp</code> | <code>dflash2</code> | <code>all</code> | <code>none</code>; <code>false</code> for plain decoding`)}</tr>
+              <tr><td><code>drafter</code>, <code>speculative</code></td>${Td(String.raw`<code>mtp</code> | <code>dflash2</code> | <code>dspark</code> | <code>all</code> | <code>none</code>; <code>false</code> for plain decoding`)}</tr>
               <tr><td><code>kv</code>, <code>kv_ram</code>, <code>kv_gpu</code></td>${Td(String.raw`as <code>--kv</code>, <code>--kv-ram</code> (GB or <code>"auto"</code>), <code>--kv-gpu</code>`)}</tr>
               <tr><td><code>name</code></td>${Td(String.raw`the model id the API reports`)}</tr>
             </tbody></table>
@@ -208,7 +208,9 @@ export function Integration({ active }) {
         <details class="ep"><summary><span class="method get">GET</span><span class="path">/v1/hub/search?q=TEXT</span><span class="what">${t("Repositories on Hugging Face")}</span><svg class="i"><use href="#i-chev"/></svg></summary>
           <div class="body"><ul>${Li(String.raw`GGUF repositories and drafters matching <code>q</code> (or an exact <code>org/name</code>), ordered by <code>sort</code> (<code>trending</code>, <code>downloads</code>, <code>likes</code>, <code>updated</code>, <code>created</code>), paginated with <code>limit</code> and <code>cursor</code>; without <code>q</code>, supported architectures (optionally narrowed by <code>arch</code>).`)}</ul></div></details>
         <details class="ep"><summary><span class="method get">GET</span><span class="path">/v1/hub/files?repo=ORG/NAME</span><span class="what">${t("A repository's models")}</span><svg class="i"><use href="#i-chev"/></svg></summary>
-          <div class="body"><ul>${Li(String.raw`Its GGUFs by quantization with their sizes and whether cached, its companion files (<code>companions</code>: drafters and <code>mmproj</code> projectors), the DFlash2 drafters known for it; what Hugging Face says of it, and whether this build runs its architecture.`)}</ul></div></details>
+          <div class="body"><ul>${Li(String.raw`Its GGUFs by quantization with their sizes and whether cached, its companion files (<code>companions</code>: drafters and <code>mmproj</code> projectors), the drafters verified with FLYX for it; what Hugging Face says of it, and whether this build runs its architecture.`)}</ul></div></details>
+        <details class="ep"><summary><span class="method get">GET</span><span class="path">/v1/hub/drafter?name=NAME</span><span class="what">${t("A drafter's kind")}</span><svg class="i"><use href="#i-chev"/></svg></summary>
+          <div class="body"><ul>${Li(String.raw`The drafter a path or a Hugging Face name holds, as its own fields say (<code>mtp</code>, <code>dflash2</code>, <code>dspark</code>; <code>null</code> when they say none); nothing is fetched. 400 for a <code>name</code> that is neither, 404 for a Hub name Hugging Face does not have.`)}</ul></div></details>
         <details class="ep"><summary><span class="method get">GET</span><span class="path">/v1/hub/cached</span><span class="what">${t("Models on this machine")}</span><svg class="i"><use href="#i-chev"/></svg></summary>
           <div class="body"><ul>${Li(String.raw`Every snapshot in the Hugging Face cache, and the folders of <code>--models-dir</code> / <code>FLYX_MODELS_DIR</code>: models, <code>mmproj</code> projectors and local drafters, each by the name that loads it, with its quantization, size, revision and whether it carries an MTP layer.`)}</ul></div></details>
         <details class="ep"><summary><span class="method get">GET</span><span class="path">/v1/hub/dir?path=PATH</span><span class="what">${t("A folder's model files")}</span><svg class="i"><use href="#i-chev"/></svg></summary>
@@ -322,11 +324,11 @@ export function Integration({ active }) {
           <tr><td><code>--kv-ram GB|auto</code></td>${Td(String.raw`host memory for the K/V past the GPU's part (auto; 0: the context shrinks to fit the GPU)`)}</tr>
           <tr><td><code>--kv-gpu N</code></td>${Td(String.raw`at most N tokens' K/V on the GPU, the rest in host memory`)}</tr>
           <tr><td><code>--kv-method M</code></td>${Td(String.raw`<code>auto</code> = <code>auto:2</code> (default), <code>exact</code>, <code>strata</code> = <code>strata:2</code>. <code>auto:3</code> uses a 3-bit scan after the switch.`)}</tr>
-          <tr><td><code>--drafter D</code></td><td><code>mtp</code> | <code>dflash2</code> | <code>dv</code> | <code>all</code> | <code>none</code></td></tr>
-          <tr><td><code>--drafter-file F</code></td>${Td(String.raw`a drafter in a file or Hub repository of its own (repeatable): an MTP GGUF, or DFlash2`)}</tr>
+          <tr><td><code>--drafter D</code></td><td><code>mtp</code> | <code>dflash2</code> | <code>dspark</code> | <code>dv</code> | <code>all</code> | <code>none</code></td></tr>
+          <tr><td><code>--drafter-file F</code></td>${Td(String.raw`a drafter in a file or Hub repository of its own (repeatable): an MTP GGUF, DFlash2 or DSpark`)}</tr>
           <tr><td><code>--no-spec</code>, <code>--no-lookup</code></td>${Td(String.raw`plain decoding; no drafts from the text where it repeats`)}</tr>
           <tr><td><code>--width N</code></td>${Td(String.raw`fix the model drafter's width at N, up to its maximum (default: chosen per round). Prompt lookup can still verify 15 drafts from earlier text. Use <code>--no-lookup</code> to disable it. Not beside a DV drafter: its rounds then run alone, its widest of at most N every round.`)}</tr>
-          <tr><td><code>--draft-trees</code></td>${Td(String.raw`drafters also propose trees`)}</tr>
+          <tr><td><code>--draft-trees</code> / <code>--no-draft-trees</code></td>${Td(String.raw`drafters also propose trees`)}</tr>
           <tr><td><code>--prefill-chunk N</code></td>${Td(String.raw`prompt rows per prefill pass (1024 to 4096 by free GPU memory)`)}</tr>
           <tr><td><code>--backend cuda|cpu_ref</code></td>${Td(String.raw`the GPU, or the float64 reference; <code>CUDA_VISIBLE_DEVICES</code> picks the GPU`)}</tr>
           <tr><td><code>--backend-opt K=V</code></td>${Td(String.raw`a backend option, repeatable (also <code>FLYX_BACKEND_OPTIONS</code>)`)}</tr>

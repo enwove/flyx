@@ -11,6 +11,7 @@
 #include <initializer_list>
 
 #include "apps/common/defaults.h"
+#include "apps/flyx-server/drafter_speeds.h"
 #include "core/interfaces/options.h"
 #include "core/os/env.h"
 #include "core/os/os.h"
@@ -147,6 +148,14 @@ ojson degraded_json(const std::vector<LoadAdjustment>& list) {
   for (const LoadAdjustment& a : list)
     out.push_back({{"kind", a.kind}, {"from", a.from}, {"to", a.to}, {"detail", a.detail}});
   return out;
+}
+
+// The model a drafter's speeds are kept under (drafter_speeds.h): a Hub name as named, else its file's absolute path.
+std::string speed_model(const std::string& named, const std::string& path) {
+  std::error_code ec;
+  hub::Name n;
+  return !fs::exists(to_path(named), ec) && hub::parse_name(named, &n) ? named
+                                                                         : os::from_path(fs::absolute(to_path(path), ec));
 }
 
 void save_settings(const ModelHost::Want& w) {
@@ -451,17 +460,36 @@ bool ModelHost::with_files_in_use(const std::function<void(const std::vector<std
   return true;
 }
 
-std::shared_ptr<Scheduler> ModelHost::open(const apps::Fetched& f, const EngineOptions& options, double* load_s,
-                                           std::string* err) const {
+std::shared_ptr<Scheduler> ModelHost::open(const std::string& model, const apps::Fetched& f,
+                                           const EngineOptions& options, double* load_s, std::string* err) const {
   EngineOptions eo = options;
   eo.drafter_files = f.drafters;
   eo.mmproj_file = f.mmproj;
   std::fprintf(stderr, "flyx-server: loading %s\n", f.model.c_str());
   const double t0 = os::now_ms();
+  // Each request that runs to its end and drafts counts for the speed of the Hub drafters the model drafts with
+  // (drafting: once loaded, the kinds the engine drafts with), by model: a Hub name as named, a path made absolute.
+  SchedulerOptions so = so_;
+  std::vector<std::pair<std::string, std::string>> hub_drafters;  // repository, kind
+  std::error_code ec;
+  for (const apps::DrafterSource& d : f.drafter_sources) {
+    hub::Name n;
+    if (d.kind != "mtp" && !fs::exists(to_path(d.from), ec) && hub::parse_name(d.from, &n))
+      hub_drafters.push_back({n.repo, d.kind});
+  }
+  const std::string model_key = speed_model(model, f.model);
+  auto drafting = std::make_shared<std::vector<std::string>>();  // filled once the engine says what it drafts with
+  auto drafting_mu = std::make_shared<std::mutex>();
+  if (eo.speculative && !hub_drafters.empty())
+    so.on_finished = [model_key, drafting, drafting_mu](const RequestRecord& r) {
+      if (r.status == "cancelled" || r.status == "error" || r.drafted <= 0) return;
+      std::lock_guard<std::mutex> lock(*drafting_mu);
+      add_drafter_speed(model_key, *drafting, r.output_tokens, r.decode_ms);
+    };
   std::shared_ptr<Scheduler> sched;
   try {
     // A deleter that says when it is gone, for retire() to wait on before the next model loads.
-    sched = std::shared_ptr<Scheduler>(new Scheduler(f.model, eo, so_), SignalTeardown{std::make_shared<Teardown>()});
+    sched = std::shared_ptr<Scheduler>(new Scheduler(f.model, eo, so), SignalTeardown{std::make_shared<Teardown>()});
   } catch (const std::exception& e) {
     // A model file no check foresaw: a load that failed with its reason, not the end of the server.
     *err = e.what();
@@ -471,6 +499,12 @@ std::shared_ptr<Scheduler> ModelHost::open(const apps::Fetched& f, const EngineO
   if (!sched->ok(err)) {
     std::fprintf(stderr, "flyx-server: %s: %s\n", f.model.c_str(), err->c_str());
     return nullptr;
+  }
+  if (so.on_finished && sched->engine()) {  // the Hub drafters among those the engine drafts with ("mtp+dspark")
+    const std::string with = std::string("+") + sched->engine()->drafter() + "+";
+    std::lock_guard<std::mutex> lock(*drafting_mu);
+    for (const auto& [repo, kind] : hub_drafters)
+      if (with.find("+" + kind + "+") != std::string::npos) drafting->push_back(repo);
   }
   *load_s = (os::now_ms() - t0) / 1000;
   return sched;
@@ -533,7 +567,7 @@ bool ModelHost::work(const Want& w, std::string* err) {
   retire(std::move(old));
   std::string why;
   double load_s = 0;
-  auto sched = open(f, w.eo, &load_s, &why);
+  auto sched = open(w.model, f, w.eo, &load_s, &why);
   if (!sched) {
     std::fprintf(stderr, "flyx-server: %s did not load: none served\n", w.model.c_str());
     std::lock_guard<std::mutex> lock(mu_);
@@ -583,7 +617,9 @@ ojson ModelHost::status() const {
              {"fallback", ojson(nullptr)},
              {"degraded", served_.sched && has_active ? degraded_json(active_model.load_adjustments) : ojson::array()},
              {"drafters", drafters_json(active_drafters, "from")},
-             {"suggested", drafters_json(served_.sched ? fetched_.suggested : std::vector<apps::DrafterSource>{}, "name")},
+             {"suggested", served_.sched
+                               ? known_drafters_json(speed_model(last_.model, fetched_.model), fetched_.suggested)
+                               : ojson::array()},
              {"vision_projector",
               served_.sched && served_.sched->has_vision() && !fetched_.mmproj_source.empty()
                   ? ojson({{"from", fetched_.mmproj_source},

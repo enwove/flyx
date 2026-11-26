@@ -145,7 +145,7 @@ bool read_flyx(const uint8_t* p, size_t size, const std::string& path, ModelFile
   return true;
 }
 
-static bool peek_flyx_header(const std::string& path, nlohmann::json* h) {
+bool peek_flyx_header(const std::string& path, nlohmann::json* h) {
   std::ifstream f(os::to_path(path), std::ios::binary);
   std::string bytes(24, '\0');
   if (!f.read(bytes.data(), 24) || !is_flyx(reinterpret_cast<const uint8_t*>(bytes.data()), 24)) return false;

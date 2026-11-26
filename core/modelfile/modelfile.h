@@ -84,13 +84,21 @@ struct GgufPeek {
   std::string arch;    // general.architecture ("dflash": a drafter alone)
   int mtp_layers = 0;  // <arch>.nextn_predict_layers, 0 if absent
   bool has_markov_context = false;  // dflash.has_markov_context (DSpark vs DFlash2)
+  // The Hub repositories it says it comes from ("org/name"): the model it was converted from (general.source.repo_url)
+  // and its base models (general.base_model.<i>.repo_url), as llama.cpp's converter writes them from the model card.
+  std::vector<std::string> base_models;
 };
 std::string gguf_header_path(const std::string& path);  // shard 1 for a split GGUF
 GgufPeek gguf_peek(const std::string& path);
-
-// Peeks a GGUF file's header (without mapping the whole file) and returns its
-// <arch>.nextn_predict_layers count, 0 if absent, or -1 if the file is not a valid GGUF.
-int gguf_peek_mtp_layers(const std::string& path);
+// Where a model file says it comes from, read from its header alone: the Hub repository it is (a .flyx file's
+// "source": "repo", as flyx_convert --repo writes it; a GGUF never says which repository holds it) and the
+// repositories it names as its bases (a GGUF's GgufPeek::base_models, general.source.repo_url included; a .flyx file's
+// "source": "base_models").
+struct ModelOrigin {
+  std::string repo;
+  std::vector<std::string> base_models;
+};
+ModelOrigin model_origin(const std::string& path);
 
 // The block drafter a config.json's architectures name, by one table (core/modelfile/drafter_dir.cpp): "dflash2",
 // "dspark"; "" for none.
