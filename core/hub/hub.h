@@ -85,6 +85,8 @@ struct GgufChoice {
   bool split = false;
   bool complete = true;          // false if split and any shard 1..N is missing
 };
+// The model GGUFs of a repository as quantizations to choose from; `include_companions`: its projector, MTP and DSpark
+// GGUFs as well (by name), with the models' labels as they are without them.
 std::vector<GgufChoice> gguf_choices(const Repo& r, bool include_companions = false);
 // Whether a GGUF at `path` ('/' between directories) can hold a model by its name: not a projector, an importance
 // matrix, an MTP layer of its own (mtp-*.gguf, anything under an MTP directory), a DSpark drafter (dspark-*.gguf,

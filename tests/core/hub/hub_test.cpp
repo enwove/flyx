@@ -303,6 +303,11 @@ void cache_snapshots(const fs::path& tmp) {
     check(comps.size() == 2 && comps[0].kind == "dspark" && comps[0].is_default && comps[1].kind == "dspark" &&
               !comps[1].is_default && flyx::hub::gguf_choices(ir).size() == 1,
           "companion_files lists a repository's DSpark drafters, one the default; they are no quantizations of it");
+    std::vector<flyx::hub::RepoFile> picked;
+    std::string why;
+    check(flyx::hub::select(ir, {ir.id, "dspark-Inkling-Q8_0.gguf"}, &picked, &why) && picked.size() == 1 &&
+              picked[0].path == "dspark-Inkling-Q8_0.gguf",
+          "select resolves repo:dspark-*.gguf companion directly (--drafter-file ORG/NAME:dspark-*.gguf)");
   }
   const std::string old_c = "1111111111111111111111111111111111111111", new_c = "2222222222222222222222222222222222222222";
   const fs::path repo = tmp / "models--acme--two-GGUF";

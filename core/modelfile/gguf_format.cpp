@@ -881,7 +881,6 @@ GgufPeek gguf_peek(const std::string& path) {
     const bool is_signed = type == 1 || type == 3 || type == 5 || type == 11;
     for (int b = size - 1; b >= 0; --b) v = (v << 8) | raw[b];  // GGUF is little-endian
     if (is_signed && size < 8 && (raw[size - 1] & 0x80)) v -= int64_t(1) << (8 * size);
-    if (key == "dflash.has_markov_context" && type == 7) out.has_markov_context = v != 0;
     static const std::string kKey = ".nextn_predict_layers";
     if (type != 6 && type != 12 && key.size() > kKey.size() && key.ends_with(kKey))
       layers[key.substr(0, key.size() - kKey.size())] = v;

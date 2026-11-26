@@ -293,7 +293,7 @@ std::vector<GgufChoice> gguf_choices(const Repo& r, bool include_companions) {
   // Keep the model quantization labels stable when listing sidecars as well.
   if (include_companions)
     for (const RepoFile& f : r.files)
-      if (mmproj_gguf_name(f.path) || mtp_gguf_name(f.path)) ggufs.push_back(&f);
+      if (mmproj_gguf_name(f.path) || mtp_gguf_name(f.path) || dspark_gguf_name(f.path)) ggufs.push_back(&f);
   struct SplitGroup {
     int count = 0;
     std::string quant;
