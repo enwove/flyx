@@ -149,7 +149,7 @@ void alloc_rows(const flyx_bmodel* m, int R, bool prefill, RowBufs* b, Alloc&& a
   if (n.moe_experts > 0) {
     b->moe_idx = static_cast<int*>(alloc(size_t(R) * n.moe_topk * sizeof(int)));
     b->moe_w = f(size_t(R) * n.moe_topk);
-    if (!prefill) b->moe_guess = f(size_t(n.moe_experts) + size_t(R) * H);  // scores, then a mixed row
+    if (!prefill) b->moe_guess = f(size_t(n.moe_experts) + size_t(H));  // scores, then a mixed row (R == 1)
     // moe_gu is dead during moe_down (and unused when fused), so down_buf safely aliases it.
     const size_t gu_or_down = std::max(size_t(2) * size_t(n.moe_inter), size_t(H));
     b->moe_gu = f(size_t(R) * size_t(n.moe_topk) * gu_or_down);

@@ -779,13 +779,19 @@ void flush_pending_post_conv(const Pass& ps, bool require_in_x) {
 // Small weights a later latency-bound kernel reads, asked of L2 on the expert stream (FLYX_WARM): joined at the
 // round's end (flyx_seq::warm_out).  Changes no result.
 static void warm_side(flyx_seq* s, cudaStream_t st, const L2Ranges& r) {
-  if (!r.count || !s->expert_side.st) return;
+  if (!r.count || !s->expert_side.st || st != s->st) return;  // a sequence's own stream (batched passes: not)
   const SideStream& es = s->expert_side;
   CK(cudaEventRecord(es.fork, st));
   CK(cudaStreamWaitEvent(es.st, es.fork, 0));
   l2_warm(r, es.st);
   CK(cudaEventRecord(es.join, es.st));
   s->warm_out = true;
+}
+
+// A linear's round weights (Lin::round) of n values: binary16 or float32.
+static void add_round(L2Ranges& r, const Lin& w, size_t n) {
+  if (w.round.b16) r.add(w.round.b16, n * 2);
+  else r.add(w.round.f32, n * 4);
 }
 
 static int warm_flags() {
@@ -860,46 +866,35 @@ void rel_attn_layer(const Pass& ps, const RelAttnBlock& a, bool fused) {
     if (pend.res_push) ++ps.res->res_n;
     ps.res->pending = {};
     ps.res->x_cur = x_dst;
-    // The next MoE's router, loop controller, query and norm (FLYX_WARM bits 1, 2, 4; 8 the bank too), while the
-    // attention runs: RTX 5090, Inkling-2-Mini UD-IQ4_XS plain decoding 204.7 -> 207.5 tok/s with bits 1|2|4.
+    // The next MoE's router, loop controller, query and norm (FLYX_WARM bits 1, 2, 4), while the attention runs:
+    // RTX 5090, Inkling-2-Mini UD-IQ4_XS plain decoding 204.7 -> 207.5 tok/s with all three (the bank too: no gain).
     const int warm = warm_flags();
-    if (warm && ps.next_moe && s->expert_side.st && ps.round) {
+    if (warm && ps.next_moe && ps.round) {
       const MoeBlock& f = *ps.next_moe;
-      const SideStream& es = s->expert_side;
-      auto lin = [](const Lin& w, size_t n) {
-        return w.round.b16 ? std::pair<const void*, size_t>{w.round.b16, n * 2}
-                           : std::pair<const void*, size_t>{w.round.f32, n * 4};
-      };
       L2Ranges r;
-      const size_t EH = size_t(f.n_experts) * f.hidden, HH = size_t(f.hidden);
-      if (warm & 1) {
-        auto [p, n] = lin(f.router, EH);
-        r.add(p, n);
-      }
+      const size_t HH = size_t(f.hidden);
+      if (warm & 1) add_round(r, f.router, size_t(f.n_experts) * HH);
       if ((warm & 2) && f.loop_rank > 0) {
         const size_t rk = size_t(f.loop_rank);
-        auto [p0, n0] = lin(f.loop_ctrl.down, rk * 2 * HH);
-        r.add(p0, n0);
+        add_round(r, f.loop_ctrl.down, rk * 2 * HH);
         if (f.loop_ctrl.stacked) {
-          auto [p1, n1] = lin(f.loop_ctrl.gain_forget, rk * 2 * HH);
-          r.add(p1, n1);
+          add_round(r, f.loop_ctrl.gain_forget, rk * 2 * HH);
         } else {
-          auto [p1, n1] = lin(f.loop_ctrl.gain, rk * HH);
-          auto [p2, n2] = lin(f.loop_ctrl.forget, rk * HH);
-          r.add(p1, n1);
-          r.add(p2, n2);
+          add_round(r, f.loop_ctrl.gain, rk * HH);
+          add_round(r, f.loop_ctrl.forget, rk * HH);
         }
       }
       if (warm & 4) {
         r.add(f.res_query, HH * 4);
         r.add(f.norm.w, HH * 4);
       }
-      if (warm & 8) r.add(rv.b.res_bank, size_t(ps.res->res_n) * R * HH * 4);
       warm_side(s, st, r);
     }
     // The next MoE's experts guessed from the bank as it stands mixed with its query (the attention's output not yet
     // in it; 65% of the experts right, against 8% from the residual row alone), and asked of L2 while the attention
-    // runs (FLYX_GUESS: planes mask, moe_prefetch_mixed; 16 the guess alone; 0 off).  Changes no result.  RTX 5090,
+    // runs (FLYX_GUESS: planes mask, moe_prefetch_mixed; 16 the guess alone; 0 off).  Changes no result: the
+    // expert stream joins only at the round's end, so a later sublayer may rewrite x_dst under it, which costs only
+    // the guess.  RTX 5090,
     // Inkling-2-Mini UD-IQ4_XS plain decoding, top 4 guesses (FLYX_GUESS_K): 0 215.7, 1 (gate|up codes) 220.4,
     // 5 (and down codes) 221.5, 15 (and scales) 218.1 tok/s; with all 8 guesses 5 214.2.  35k-token prompt: 165.7 -> 167.4.
     static const int guess_planes = [] {
@@ -907,7 +902,7 @@ void rel_attn_layer(const Pass& ps, const RelAttnBlock& a, bool fused) {
       return e ? std::atoi(e) : 5;
     }();
     if (guess_planes > 0 && R == 1 && ps.next_moe && ps.next_moe->res_query && rv.b.moe_guess &&
-        s->expert_side.st && ps.round) {
+        s->expert_side.st && st == s->st && ps.round) {
       const MoeBlock& f = *ps.next_moe;
       const SideStream& es = s->expert_side;
       float* mixed = rv.b.moe_guess + f.n_experts;
@@ -1011,7 +1006,10 @@ void rel_attn_layer(const Pass& ps, const RelAttnBlock& a, bool fused) {
   }();
   const bool kv_shares_q = in_raw[0] == in_raw[1] && in_raw[0] == in_raw[2] && same_norm(a.q_norm_in, a.k_norm_in) &&
                            same_norm(a.q_norm_in, a.v_norm_in);
+  // K and V weights in 8 bits only: their norms then write the side scratch's q8 rows, never the bf16 split rows
+  // the q path's GEMMs share (rmsnorm_split of other weights writes Scratch::split).
   const bool kv_beside = kv_side_env && ps.round && is_swa && fused && H % 64 == 0 && round_q8 && a.conv <= 64 &&
+                         a.w_k.q8_inputs() && a.w_v.q8_inputs() &&
                          !kv_shares_q && L.side && L.side->st && (!L.opt || L.opt->side_stream) && !q_normed;
   if (kv_beside) {
     // The side's 8-bit rows in the SwiGLU's buffers (Launch::glu), which no attention block uses: the q path's
@@ -1243,51 +1241,28 @@ void moe_layer(const Pass& ps, const MoeBlock& f, bool fused) {
       cur = rv.b.attn_in;
     }
   }
-  // The next attention's controllers, queries, ShortConv taps, sink, norm and relative bias (FLYX_WARM bit 16; 32
-  // its K and V blocks too, which lost), while this MoE runs: 207.5 -> 211.5 tok/s, 30k context 159.5 -> 163.3.
+  // The next attention's controllers, queries, ShortConv taps, sink, norm, relative bias and Q clip (FLYX_WARM bit
+  // 16), while this MoE runs: 207.5 -> 211.5 tok/s, 35k-token prompt 159.5 -> 163.3 (its K and V blocks too: a loss).
   if ((warm_flags() & 16) && ps.next_attn && ps.round) {
     const RelAttnBlock& a = *ps.next_attn;
     const size_t HH = size_t(a.hidden), kvd = size_t(a.nkv) * a.hd;
-    auto lin = [](const Lin& w, size_t n) {
-      return w.round.b16 ? std::pair<const void*, size_t>{w.round.b16, n * 2}
-                         : std::pair<const void*, size_t>{w.round.f32, n * 4};
-    };
-    L2Ranges r0, r1;
+    L2Ranges ctrl, small;  // L2Ranges holds 8 ranges
     if (a.loop_rank > 0)
       for (int j = 0; j < 3; ++j) {
         const size_t rk = size_t(a.loop_rank);
-        auto [p0, n0] = lin(a.loop_ctrl[j].down, rk * 2 * HH);
-        r0.add(p0, n0);
-        if (a.loop_ctrl[j].stacked) {
-          auto [p1, n1] = lin(a.loop_ctrl[j].gain_forget, rk * 2 * HH);
-          r0.add(p1, n1);
-        }
+        add_round(ctrl, a.loop_ctrl[j].down, rk * 2 * HH);
+        if (a.loop_ctrl[j].stacked) add_round(ctrl, a.loop_ctrl[j].gain_forget, rk * 2 * HH);
       }
-    r1.add(a.res_query, 3 * HH * 4);
-    r1.add(a.k_conv, kvd * a.conv * 4);
-    r1.add(a.v_conv, kvd * a.conv * 4);
-    r1.add(a.post_conv, HH * a.conv * 4);
-    r1.add(a.w_sink.w, size_t(a.nh) * HH * 2);
-    r1.add(a.q_norm_in.w, HH * 4);
-    r1.add(a.rel_bias, size_t(a.rel_extent) * a.d_rel * 4);
-    r1.add(a.q_clip_w, size_t(a.nh) * a.hd * 4);
-    r1.add(a.rel_clip_w, size_t(a.nh) * a.d_rel * 4);
-    warm_side(s, st, r0);
-    warm_side(s, st, r1);
-    if (warm_flags() & 32) {  // the K and V projections' blocks
-      L2Ranges r2;
-      for (const Lin* w : {&a.w_k, &a.w_v}) {
-        if (!w->packed()) continue;
-        for (const BlockMat& b : w->blk) {
-          const BlockLayout bl = blocks_layout(b.dtype);
-          if (!bl.values) continue;
-          const size_t nb = size_t(b.rows) * HH / bl.values;
-          r2.add(b.data, nb * bl.stride);
-          r2.add(b.scales, nb * bl.scales * 2);
-        }
-      }
-      warm_side(s, st, r2);
-    }
+    small.add(a.res_query, 3 * HH * 4);
+    small.add(a.k_conv, kvd * a.conv * 4);
+    small.add(a.v_conv, kvd * a.conv * 4);
+    small.add(a.post_conv, HH * a.conv * 4);
+    small.add(a.w_sink.w, size_t(a.nh) * HH * 2);
+    small.add(a.q_norm_in.w, HH * 4);
+    small.add(a.rel_bias, size_t(a.rel_extent) * a.d_rel * 4);
+    small.add(a.q_clip_w, size_t(a.nh) * a.hd * 4);
+    warm_side(s, st, ctrl);
+    warm_side(s, st, small);
   }
   if (f.loop_rank > 0) {
     const float* msg = rv.b.loop_msg + size_t(3) * R * H;

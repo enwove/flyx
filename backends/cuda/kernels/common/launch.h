@@ -130,9 +130,9 @@ void launch_dependent_smem(void (*kernel)(KArgs...), dim3 grid, dim3 block, size
   cudaLaunchKernelEx(&cfg, kernel, static_cast<KArgs>(args)...);
 }
 
-// Whether kernels launched with a stream alone (launch_pdl) are programmatic dependents: the model's
-// KernelOptions::pdl, set when a sequence is made (set_stream_pdl); FLYX_STREAM_PDL=0 turns it off.
-bool& stream_pdl();
+// Whether kernels launched with a stream alone (launch_pdl) are programmatic dependents: KernelOptions::pdl of the
+// model whose sequence was made last (set_stream_pdl), for the process: launchers that have a Launch use opts(L).
+std::atomic<bool>& stream_pdl();
 
 // launch_dependent_smem for a launch that has only a stream: a programmatic dependent when stream_pdl().  The
 // kernel calls pdl_wait() before it reads anything an earlier kernel wrote, and before it returns.
@@ -147,7 +147,7 @@ void launch_pdl(void (*kernel)(KArgs...), dim3 grid, dim3 block, size_t smem, cu
   at.id = cudaLaunchAttributeProgrammaticStreamSerialization;
   at.val.programmaticStreamSerializationAllowed = 1;
   cfg.attrs = &at;
-  cfg.numAttrs = stream_pdl() && sm90_or_newer() ? 1 : 0;
+  cfg.numAttrs = stream_pdl().load(std::memory_order_relaxed) && sm90_or_newer() ? 1 : 0;
   cudaLaunchKernelEx(&cfg, kernel, static_cast<KArgs>(args)...);
 }
 

@@ -217,7 +217,8 @@ struct RowBufs {
   float *rel_q = nullptr, *rel_btab = nullptr, *sink = nullptr, *kv_conv = nullptr, *kv_dyn = nullptr;
   float *post_raw = nullptr, *post_out = nullptr;
   int* moe_idx = nullptr;
-  float* moe_guess = nullptr;  // rounds: the experts' scores moe_prefetch guesses from (n_experts floats)
+  float* moe_guess = nullptr;  // rounds: the experts' scores moe_prefetch guesses from (n_experts floats), then
+                              // the row moe_prefetch_mixed guesses them from (hidden floats)
   // moe_act: the activations in float32, or in bf16 where a fused round's gate|up GEMM writes the down GEMM's input
   float *moe_w = nullptr, *moe_gu = nullptr, *moe_act = nullptr;
   MoeScratch moe_sc{};  // the expert GEMMs' staged inputs, their grouping and the down projection's slots

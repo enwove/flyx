@@ -9,11 +9,11 @@
 namespace flyx::cuda {
 
 // ---- scratch and options ----------------------------------------------------------------
-bool& stream_pdl() {
-  static bool on = false;
+std::atomic<bool>& stream_pdl() {
+  static std::atomic<bool> on{false};
   return on;
 }
-void set_stream_pdl(bool on) { stream_pdl() = on; }
+void set_stream_pdl(bool on) { stream_pdl().store(on, std::memory_order_relaxed); }
 
 const KernelOptions& opts(const Launch& L) {
   static const KernelOptions defaults;
