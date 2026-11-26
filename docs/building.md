@@ -9,9 +9,11 @@ Build prerequisites, CMake presets, CMake options, and release packaging for Lin
 | Target | Required Tools |
 |---|---|
 | **Linux / WSL2 (CUDA)** | CUDA 13 (`nvcc` on `PATH`), CMake ≥ 3.24, Ninja, `g++` ≥ 11, Python 3.11+ for table generation, Python 3.12+ for the pinned test requirements, `libcurl` (not linked: loaded at run time for HF Hub fetch, which the hub tests exercise) |
-| **Windows (native MSVC + CUDA)** | Visual Studio 2022 C++ Build Tools, CMake ≥ 3.24, Ninja, Python 3.11+ (Python 3.12+ for tests), CUDA 13 (`nvcc`, or auto-installed from PyPI wheels by `packaging\package_windows.ps1`) |
+| **Windows (native MSVC + CUDA)** | Visual Studio 2022 or newer with C++ Build Tools, CMake ≥ 3.24, Ninja, Python 3.11+ (Python 3.12+ for tests), CUDA 13 (`nvcc`, or auto-installed from PyPI wheels by `packaging\package_windows.ps1`) |
 | **CPU-only CLI (`-DFLYX_CUDA=OFF -DFLYX_TESTS=OFF`)** | CMake ≥ 3.24, Ninja, C++20 compiler (no Python required) |
 | **Runtime (release packages)** | Linux x86-64 requires glibc ≥ 2.35, the NVIDIA driver ≥ 580 for CUDA, and the system's `libcurl` to fetch models by name. Windows requires the NVIDIA driver ≥ 580 for CUDA (CUDA and C++ runtimes linked statically). The wheel requires Python ≥ 3.9. |
+
+**CUDA 13.0.88 on Linux.** On glibc 2.41 or newer (Ubuntu 26.04 and recent Fedora and Arch releases), `nvcc` fails because the declarations of `rsqrt` and `rsqrtf` in `crt/math_functions.h` have different exception specifications from glibc's. Use Ubuntu 24.04, build in the Ubuntu 22.04 CUDA 13 container with [packaging/package_linux_docker.sh](../packaging/package_linux_docker.sh), or use a newer CUDA toolkit that supports your host distribution.
 
 ---
 
@@ -98,7 +100,7 @@ powershell -ExecutionPolicy Bypass -File packaging\package_windows.ps1 -Assets D
 - Pass `-BuildDir DIR` for a custom build directory; `-Assets DIR` points to `tiny.flyx` from a test build to smoke-test both the unpacked ZIP (`cpu_ref`, `cuda`, HTTP server) and the wheel in an isolated virtual environment.
 - Windows executables embed `core/os/utf8.manifest` (UTF-8 active code page); CUDA 13.1+ MSVC `/Zc:preprocessor` flags are handled automatically by `CMakeLists.txt`.
 
-Native Windows development build (in PowerShell, dot-source `tools\windows\vsenv.ps1` to configure VS 2022, Ninja, CMake, `nvcc`, and `~\.venvs\flyx` / `~\.venvs\flyx-win`):
+Native Windows development build (in PowerShell, dot-source `tools\windows\vsenv.ps1` to configure Visual Studio 2022 or newer, Ninja, CMake, `nvcc`, and `~\.venvs\flyx` / `~\.venvs\flyx-win`):
 
 ```powershell
 . .\tools\windows\vsenv.ps1
