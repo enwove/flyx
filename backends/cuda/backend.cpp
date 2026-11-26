@@ -673,7 +673,7 @@ int open_model(const flyx_model_desc* desc, const flyx_open_options* opts, flyx_
     m->graph_prices = graph_prices(dev_cc);
     m->opt.kernels.fp8_mma = dev_cc >= 90 && code_cc >= 89;
     // The GPU's own table, else its architecture's, unless the options name one or none.
-    bool by_arch = false;
+    int arch_cc = 0;
     if (m->opt.tuning_defaults) {
       m->opt.kernels.tuning = -1;
     } else if (!m->opt.tuning_table.empty()) {
@@ -684,20 +684,11 @@ int open_model(const flyx_model_desc* desc, const flyx_open_options* opts, flyx_
         return fail("options: tuning table \"" + m->opt.tuning_table + "\" is not compiled for loaded sm_" +
                     std::to_string(code_cc) + " code in this release build");
     } else {
-      m->opt.kernels.tuning = gemm_tuning_for(prop.name, dev_cc, &by_arch);
-      if (m->opt.kernels.tuning >= 0 && !gemm_tuning_compiled_for(m->opt.kernels.tuning, code_cc)) {
-        m->opt.kernels.tuning = gemm_tuning_for("", code_cc, &by_arch);
-        if (m->opt.kernels.tuning >= 0 && !gemm_tuning_compiled_for(m->opt.kernels.tuning, code_cc))
-          m->opt.kernels.tuning = -1;
-      }
+      m->opt.kernels.tuning = gemm_tuning_auto(prop.name, dev_cc, code_cc, &arch_cc);
     }
     if (!m->opt.pdl_given) m->opt.kernels.pdl = gemm_tuning_pdl(m->opt.kernels.tuning);
     if (m->verbose) {
-      const char* named = gemm_tuning_name(m->opt.kernels.tuning);
-      const std::string table = !named ? "none (defaults)"
-                                : by_arch ? std::string(named) + " (this architecture's: sm_" +
-                                                std::to_string(prop.major) + std::to_string(prop.minor) + ")"
-                                          : named;
+      const std::string table = gemm_tuning_label(m->opt.kernels.tuning, arch_cc, dev_cc);
       int q8 = 0, a4 = 0;  // the weights' inputs, as their file says
       for (int i = 0; i < desc->n_weights; ++i) {
         q8 += desc->weights[i].activations == FLYX_ACT_Q8;

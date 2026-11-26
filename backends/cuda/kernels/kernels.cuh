@@ -427,6 +427,18 @@ const char* gemm_tuning_name(int tuning);
 bool gemm_tuning_compiled_for(int tuning, int cc);
 // Whether kernels launch as programmatic dependents on the GPU of this table unless the options say.
 bool gemm_tuning_pdl(int tuning);
+// The table a device runs unless the options name one or none (option tuning=table; the engine and cuda_bench alike):
+// the device's own (gemm_tuning_for, by its name, else by its compute capability device_cc), where the loaded code
+// (compute capability code_cc, compiled_arch) has its kernels; else the loaded code's architecture's table, where it
+// has them; else -1 (the defaults).  *arch_cc (optional): the compute capability whose table it is when it is one by
+// architecture, device_cc or code_cc; 0 for a table by name, or none.  compiled: whether a table's kernels are
+// compiled for a compute capability (null: gemm_tuning_compiled_for; tests pass their own).
+int gemm_tuning_auto(const char* device_name, int device_cc, int code_cc, int* arch_cc = nullptr,
+                     bool (*compiled)(int tuning, int cc) = nullptr);
+// What gemm_tuning_auto's answer is, for a log: "none (defaults)", the table's name, and where arch_cc says it is a
+// table by architecture which one: "(this architecture's: sm_120)" on a device of that architecture, "(the loaded
+// code's architecture's: sm_80)" on another.
+std::string gemm_tuning_label(int tuning, int arch_cc, int device_cc);
 // The configuration index a GEMM gets (fmt 0 = bf16, 1 = nvfp4, 2 = w12; 17..64 rows on k_gemm_skinny_mt, a
 // kMtConfigs index: 3 = a round's, 4 = a drafting pass's) with a tuning table.
 int gemm_config(int tuning, int fmt, int N, int K, int rows);

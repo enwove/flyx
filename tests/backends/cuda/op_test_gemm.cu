@@ -479,4 +479,86 @@ void test_gemm_tables_compiled() {
   g_fail += missing != 0;
 }
 
+namespace {
+// The tables gemm_tuning_auto may take in test_gemm_tuning_auto: those the loaded code "has the kernels of".
+std::set<int> g_compiled;
+bool fake_compiled(int tuning, int) { return g_compiled.count(tuning) > 0; }
+}  // namespace
+
+// The table a device runs by default (gemm_tuning_auto, the engine's and cuda_bench's): its own by name, its
+// architecture's, the loaded code's architecture's where the loaded code lacks the others' kernels, and the defaults.
+void test_gemm_tuning_auto() {
+  std::printf("the tuning table a device runs (gemm_tuning_auto)\n");
+  namespace t = tables;
+  int wrong = 0, checked = 0;
+  auto expect_table = [&](const char* what, const char* device, int device_cc, int code_cc, int want, int want_cc,
+                          bool (*compiled)(int, int)) {
+    int arch_cc = -1;
+    const int got = gemm_tuning_auto(device, device_cc, code_cc, &arch_cc, compiled);
+    ++checked;
+    if (got == want && arch_cc == want_cc && gemm_tuning_auto(device, device_cc, code_cc, nullptr, compiled) == got)
+      return;
+    if (++wrong <= 8)
+      std::printf("       %s: \"%s\" sm_%d, code sm_%d: table %d (sm_%d), not %d (sm_%d)\n", what, device, device_cc,
+                  code_cc, got, arch_cc, want, want_cc);
+  };
+  std::set<int> every;
+  for (int s = 0; s < t::kSkuCount; ++s) every.insert(s);
+  const char* const unknown = "A GPU no table names";
+  // A device's own table by name, whatever its compute capability says, where the code has its kernels.
+  g_compiled = every;
+  for (int s = 0; s < t::kSkuCount; ++s)
+    for (int d = 0; d < t::kSkus[s].n_devices; ++d)
+      expect_table("by name", t::kSkus[s].devices[d], 75, 120, s, 0, fake_compiled);
+  // A device of no table's name: its architecture's table, else the defaults.
+  std::set<int> arch_ccs;
+  std::vector<t::ArchTable> archs;  // the first table of each compute capability, the one a lookup finds
+  for (int i = 0; i < t::kArchTableCount; ++i)
+    if (arch_ccs.insert(t::kArchTables[i].cc).second) archs.push_back(t::kArchTables[i]);
+  for (const auto& a : archs) expect_table("by architecture", unknown, a.cc, a.cc, a.sku, a.cc, fake_compiled);
+  for (int cc : {0, 75, 101, 999})
+    if (!arch_ccs.count(cc)) expect_table("no table", unknown, cc, cc, -1, 0, fake_compiled);
+  // Loaded code without the kernels of the device's table: the loaded code's architecture's table where it has those,
+  // else the defaults; the label says whose table it is.
+  for (const auto& a : archs) {
+    g_compiled = {a.sku};
+    for (int s = 0; s < t::kSkuCount; ++s)
+      for (int d = 0; d < t::kSkus[s].n_devices; ++d)
+        expect_table("the loaded code's", t::kSkus[s].devices[d], 120, a.cc, a.sku, s == a.sku ? 0 : a.cc,
+                     fake_compiled);
+    for (const auto& b : archs)
+      expect_table("the loaded code's, by architecture", unknown, b.cc, a.cc, a.sku, b.sku == a.sku ? b.cc : a.cc,
+                   fake_compiled);
+    g_compiled = {};
+    expect_table("no table compiled", unknown, a.cc, a.cc, -1, 0, fake_compiled);
+  }
+  if (t::kSkuCount > 0 && t::kSkus[0].n_devices > 0) {
+    g_compiled = {};
+    for (int cc : {0, 75, 999})
+      if (!arch_ccs.count(cc))
+        expect_table("no table for the loaded code", t::kSkus[0].devices[0], 120, cc, -1, 0, fake_compiled);
+  }
+  std::printf("  %-4s %d devices, architectures and loaded code: the table each runs, %d not\n",
+              wrong == 0 ? "ok" : "FAIL", checked, wrong);
+  g_fail += wrong != 0;
+
+  // The labels, and this device under the real build: a table whose kernels the loaded code has.
+  const int named = t::kSkuCount > 0 ? 0 : -1;
+  const std::string name = named >= 0 ? t::kSkus[0].name : "";
+  const bool labels = gemm_tuning_label(-1, 0, 120) == "none (defaults)" &&
+                      (named < 0 || (gemm_tuning_label(named, 0, 120) == name &&
+                                     gemm_tuning_label(named, 120, 120) == name + " (this architecture's: sm_120)" &&
+                                     gemm_tuning_label(named, 80, 86) ==
+                                         name + " (the loaded code's architecture's: sm_80)"));
+  cudaDeviceProp prop{};
+  CK(cudaGetDeviceProperties(&prop, 0));
+  const int dev_cc = prop.major * 10 + prop.minor, code_cc = compiled_arch();
+  int arch_cc = 0;
+  const int here = gemm_tuning_auto(prop.name, dev_cc, code_cc, &arch_cc);
+  const bool live = here < 0 || gemm_tuning_compiled_for(here, code_cc);
+  std::printf("  %-4s labels; this device (sm_%d, code sm_%d): %s\n", labels && live ? "ok" : "FAIL", dev_cc, code_cc,
+              gemm_tuning_label(here, arch_cc, dev_cc).c_str());
+  g_fail += !(labels && live);
+}
+
 }  // namespace flyx::optest
