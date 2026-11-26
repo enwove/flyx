@@ -66,7 +66,7 @@ try {
 
   Write-Host "== zip"
   $Zip = Join-Path $Work "$Name.zip"
-  Compress-Archive -LiteralPath $Pkg -DestinationPath $Zip
+  & "$PSScriptRoot/create_release_zip.ps1" -Package $Pkg -Destination $Zip
   $Test = Join-Path $Work "unpacked"
   Expand-Archive -LiteralPath $Zip -DestinationPath $Test
   $P = Join-Path $Test $Name
