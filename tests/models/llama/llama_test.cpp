@@ -118,9 +118,9 @@ uint32_t format_of(const std::string& path) {
   return v;
 }
 
-// A copy of the file with its header changed (dir/lora_changed.flyx; format 2 when the header has "requires"),
-// opened; "" when it opened.  The model is closed before the next copy is written over the file.
-std::string with_header(const std::string& path, const std::string& dir, const std::function<void(json&)>& change) {
+// A copy of the file with its header changed (written to `out`; format 2 when the header has "requires"), opened; ""
+// when it opened.  The model is closed before the next copy is written over the file.
+std::string with_header(const std::string& path, const std::string& out, const std::function<void(json&)>& change) {
   std::ifstream in(path, std::ios::binary);
   const std::string bytes{std::istreambuf_iterator<char>(in), {}};
   uint64_t hlen = 0;
@@ -128,7 +128,6 @@ std::string with_header(const std::string& path, const std::string& dir, const s
   json h = json::parse(bytes.substr(24, size_t(hlen)));
   change(h);
   const size_t data = (24 + size_t(hlen) + 4095) / 4096 * 4096;
-  const std::string out = dir + "/lora_changed.flyx";
   const std::string header = h.dump();
   if (!testing::write_file(out, testing::flyx_file(header, bytes.substr(data), header.size(),
                                                    h.contains("requires") ? 2 : 1)))
@@ -150,6 +149,9 @@ int main(int argc, char** argv) {
   const std::string dir = argv[1], path = dir + "/tiny_llama_lora.flyx";
   // nodv: without tiny_llama_dv_lora.flyx, one of DV's assets (make_tiny.py --group dv: FLYX_TEST_DV's tests alone)
   const bool with_dv = !(argc > 2 && std::string(argv[2]) == "nodv");
+  // The copies with_header writes: a file for each of the two runs, which ctest starts at once on the same ASSET_DIR
+  // (llama_models with nodv, llama_models_dv without).
+  const std::string changed = dir + (with_dv ? "/lora_changed.flyx" : "/lora_changed_nodv.flyx");
   ModelFile f, fd, fp;
   std::string error;
   if (!f.open(path, &error) || (with_dv && !fd.open(dir + "/tiny_llama_dv_lora.flyx", &error)) ||
@@ -223,7 +225,7 @@ int main(int argc, char** argv) {
        [](json& h) { h["requires"].push_back("later"); }},
   };
   for (const Bad& b : bad) {
-    const std::string e = with_header(path, dir, b.change);
+    const std::string e = with_header(path, changed, b.change);
     check(e.find(b.because) != std::string::npos, std::string("a V-LoRA with a bad ") + b.what + ": refused (" + e +
                                                        ")");
   }
@@ -232,7 +234,7 @@ int main(int argc, char** argv) {
   for (const std::string kept : {"attn.q.lora_b", "attn.k.lora_b", "attn.v.lora_b", "attn.o.lora_b", "mlp.gate.lora_b",
                                  "mlp.up.lora_b", "mlp.down.lora_b", "attn.k.lora_a"}) {
     const std::string name = "target.L1." + kept;
-    const std::string e = with_header(path, dir, [&](json& h) {
+    const std::string e = with_header(path, changed, [&](json& h) {
       h.erase("lora");
       json& t = h["tensors"];
       for (auto it = t.begin(); it != t.end();)
@@ -243,12 +245,12 @@ int main(int argc, char** argv) {
           "adapters without the lora section, " + name + " alone: refused (" + e + ")");
   }
   {
-    const std::string nan = with_header(path, dir, [](json& h) { h["lora"]["scale"] = std::nan(""); });
+    const std::string nan = with_header(path, changed, [](json& h) { h["lora"]["scale"] = std::nan(""); });
     check(!nan.empty(), "a V-LoRA whose scale is not a number: refused (" + nan + ")");
   }
-  check(with_header(path, dir, [](json&) {}).empty(), "the same header rewritten: opens");
+  check(with_header(path, changed, [](json&) {}).empty(), "the same header rewritten: opens");
   {
-    const std::string e = with_header(dir + "/tiny.flyx", dir, [](json& h) { h["requires"] = {"lora"}; });
+    const std::string e = with_header(dir + "/tiny.flyx", changed, [](json& h) { h["requires"] = {"lora"}; });
     check(e.find("this build's qwen35 model does not read") != std::string::npos,
           "a Qwen3.5 file requiring adapters, which its model does not read: refused (" + e + ")");
   }
