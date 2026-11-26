@@ -41,12 +41,11 @@
 
 ## Key Features
 
-- **Speculative decoding that never changes the output** — Built-in MTP, DFlash2, and DSpark drafters plus prompt lookup: Qwen3.8-27B writes code at **565.5 tok/s** on an RTX 5090, **6.03×** plain decoding, and every token is the one plain decoding would have produced ([Performance](#performance)).
-- **Native long context, no quality loss** — Runs Qwen3.8-27B at its full 262K context on a single consumer GPU, 16 GB cards included. When the K/V cache outgrows VRAM, it spills cleanly into system RAM instead of truncating or sliding-windowing: **164.5 tok/s at 256K on an RTX 5090** (`NVFP4`), **122.7 tok/s at 256K on a 24 GB RTX 4090**, and **100% long-context retrieval across 32K–256K** ([v0.2.0 measurements](docs/benchmarks.md#1-qwen38-27b-long-context-coding-benchmark)).
+- **Up to 6× faster generation** — Built-in speculative decoding (MTP, DFlash2, DSpark, and prompt lookup): **565.5 tok/s** on Qwen3.8-27B and **438.9 tok/s** on Inkling-2-Mini on an RTX 5090 ([Performance](#performance)).
+- **Up to 1M native context on a consumer PC** — Runs Inkling-2-Mini at 1M context on 16 GB VRAM + 32 GB RAM.
 - **Tuned per GPU, zero manual flags** — Ships measured kernel tuning tables for 11 NVIDIA GPUs and automatically sizes context length, K/V precision, and GPU/RAM placement from available memory. No guessing offload counts, batch sizes, or cache types.
 - **No install, no dependencies, ~57 MB** — CUDA and C++ runtimes are linked in; only the NVIDIA driver (≥ 580) is required. No CUDA Toolkit, Python, or Docker. Single ~57 MB `.exe` on Windows (double-click to run), or a tarball on Linux.
-- **Image input** — Vision-capable models with an `mmproj` projector take images from the CLI (`--image`), the OpenAI and Anthropic APIs, and paste or drag-and-drop in the dashboard.
-- **Built-in web dashboard & terminal monitor** — Starts straight into a browser UI (7 languages) with guided next-step hints to search/download Hugging Face or local models, chat, read localized API docs, and watch live throughput, VRAM/RAM split, sessions, requests, and logs ([monitor guide](docs/monitor.md)).
+- **Built-in web dashboard & terminal monitor** — Starts straight into a browser UI (7 languages) with guided next-step hints to search/download Hugging Face or local models, chat (text & images), read localized API docs, and watch live throughput, VRAM/RAM split, sessions, requests, and logs ([monitor guide](docs/monitor.md)).
 - **One-click coding agent integration** — Speaks OpenAI (Chat Completions, Responses) and Anthropic Messages with tool calls and multi-turn prompt reuse. Launch **Claude Code** or **Codex CLI** straight into your project folder from **Integration** (Windows), or copy ready-to-run commands for **DeepSeek Harness, OpenCode, and Pi**.
 - **Verified accuracy** — Every GPU kernel is tested against a `float64` reference; default FP8 K/V stays within **KL 0.0009–0.0016** of 16-bit on 27B; speculative decoding is **token-for-token identical** to plain decoding ([numerics](docs/design/numerics.md)).
 
