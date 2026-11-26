@@ -28,6 +28,12 @@ struct DrafterTraits {
   bool sequential;     // drafts one token per step; stopping early saves both draft and verify work
   bool tree_only;      // drafts trees over a persistent canvas (DV)
   bool stretch_block;  // shared mask token lets a parallel block draft past max_drafts up to FLYX_MAX_ROWS - 1
+  // A block drafted at once whose drafts a small head then refines one at a time: a step costs little beside the
+  // verify row its draft adds, so a round that stops may verify fewer drafts than it has (draft_steps_cheap).  Not a
+  // sequential drafter's, whose step is a pass of a layer: with earlier checkpoints allowed Qwen3.8-27B's MTP rounds
+  // gave up drafts that paid (RTX 5070 Ti, 24 chat prompts of 256 tokens: 3.06 -> 2.99 tokens a round, 144.4 ->
+  // 142.4 tok/s), the checkpoints' costs counting as saved the draft steps a stop has paid.
+  bool refines_by_step = false;
 };
 
 DrafterTraits drafter_traits(Drafter d) {
@@ -35,7 +41,7 @@ DrafterTraits drafter_traits(Drafter d) {
     case Drafter::kMtp: return {/*sequential=*/true, false, false};
     case Drafter::kDFlash2: return {false, false, /*stretch_block=*/true};
     case Drafter::kDv: return {false, /*tree_only=*/true, false};
-    case Drafter::kDSpark: return {false, false, false};  // a block at once, its block at most
+    case Drafter::kDSpark: return {false, false, false, /*refines_by_step=*/true};  // backbone + Markov head
   }
   return {false, false, false};
 }
@@ -43,8 +49,9 @@ DrafterTraits drafter_traits(Drafter d) {
 
 // Width ladder and intra-round adaptive stopping, driven by drafter traits + target structure:
 // - Sequential drafters (MTP, future EAGLE-4): tensor-core aligned 1, 3, 5, 7, ..., max_drafts (<= 15).
-// - Parallel block drafters: {3, 5, 7} when target verify cost scales steeply with width (e.g. sparse MoE),
-//   {3, 7} on dense targets, plus FLYX_MAX_ROWS - 1 when stretch_block allows drafting past max_drafts.
+// - Parallel block drafters: {1, 2, 3, 5, 7} when target verify cost scales steeply with width (e.g. sparse MoE, where
+//   each draft row reads its own experts: one or two drafts often pay where three do not), {3, 7} on dense targets,
+//   plus FLYX_MAX_ROWS - 1 when stretch_block allows drafting past max_drafts.
 // - Tree-only drafters (DV): up to FLYX_MAX_WIDE_ROWS - 1 (plus 15 when wider).
 std::vector<int> Model::draft_widths(int d) const {
   const DrafterBlock& b = drafters_.at(size_t(d));
@@ -56,8 +63,8 @@ std::vector<int> Model::draft_widths(int d) const {
     return {widest};
   }
   const int widest = tr.stretch_block ? b.max_drafts : std::min(FLYX_MAX_ROWS - 1, b.max_drafts);
-  const std::vector<int> ladder = tr.sequential              ? std::vector<int>{1, 3, 5, 7}
-                                  : verify_scales_with_width_ ? std::vector<int>{3, 5, 7}
+  const std::vector<int> ladder = tr.sequential                ? std::vector<int>{1, 3, 5, 7}
+                                  : verify_scales_with_width_ ? std::vector<int>{1, 2, 3, 5, 7}
                                                               : std::vector<int>{3, 7};
   std::vector<int> widths;
   for (int k : ladder)
@@ -78,14 +85,16 @@ std::vector<int> Model::adaptive_checkpoints(int d) const {
   // Dense targets paired with block drafters have nearly flat verify cost across widths (RTX PRO 6000, QUASAR NVFP4
   // 27B + DFlash2: adaptive 425-439 vs fixed 443-494 tok/s on code) and avoid extra verify subgraphs in VRAM.
   if (!tr.sequential && !verify_scales_with_width_) return {};
-  // Keep a parallel block drafter's adaptive graph within its trained block (b.max_drafts); stretching every adaptive
-  // round past the trained block degrades bidirectional draft quality and adds draft/verify work (stretched widths
-  // stay in draft_widths for explicit --width or widened high-acceptance runs).
+  // Keep a drafter's adaptive graph within its trained block (b.max_drafts); stretching every adaptive round past the
+  // trained block degrades bidirectional draft quality and adds draft/verify work (stretched widths stay in
+  // draft_widths for explicit --width or widened high-acceptance runs).
   std::vector<int> cps;
   for (int w : draft_widths(d))
     if (w <= b.max_drafts) cps.push_back(w);
   return cps.size() > 1 ? cps : std::vector<int>{};
 }
+
+bool Model::draft_steps_cheap(int d) const { return drafter_traits(drafters_.at(size_t(d)).kind).refines_by_step; }
 
 int Model::block_drafts(int d) const {
   const DrafterBlock& b = drafters_.at(size_t(d));

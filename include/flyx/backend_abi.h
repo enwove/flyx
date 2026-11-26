@@ -30,7 +30,7 @@
 extern "C" {
 #endif
 
-#define FLYX_BACKEND_ABI_VERSION 46u
+#define FLYX_BACKEND_ABI_VERSION 47u
 #define FLYX_BACKEND_ENTRY "flyx_backend_get_api"
 /* How a backend library exports its entry. */
 #if defined(_WIN32)
@@ -733,6 +733,11 @@ typedef struct {
    * w_0 < ... < w_{n-1} == width.  Backends that do not lower adaptive plans may refuse n_checkpoints > 0. */
   int32_t n_checkpoints;
   const int32_t* checkpoints;
+  /* With checkpoints (ABI 47): nonzero where a round that stops drafting may verify any checkpoint up to the one it
+   * drafted to, the one that pays by the stop policy.  The policy's costs are whole rounds', draft steps and verify
+   * rows, and a stop has paid its steps: an earlier checkpoint is priced right only where a step costs little beside
+   * a verify row, which is the model's to say (interfaces/model.h: draft_steps_cheap).  0: the checkpoint it is at. */
+  int32_t earlier_checkpoints;
 } flyx_program;
 
 /* Drafter-agnostic online confidence stopping parameters (ABI 41): computed by core/speculation/ from observed

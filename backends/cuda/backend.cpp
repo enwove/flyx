@@ -207,6 +207,33 @@ const std::vector<OptionSpec>& option_specs() {
       kernel_flag_opt("gdn_round", &KernelOptions::gdn_round),
       kernel_flag_opt("stacks", &KernelOptions::stacks),
       kernel_flag_opt("round_glu", &KernelOptions::round_glu),
+      {"moe_dp4a",
+       [](const std::string& key, const std::string& val, BackendOptions* o, std::string* err) {
+         if (val == moe_dp4a_name(-1)) {
+           o->kernels.moe_dp4a = -1;
+           return true;
+         }
+         for (int i = 0; i < kMoeDp4aConfigCount; ++i) {
+           if (val != moe_dp4a_name(i)) continue;
+           // Every type, op kind and row band must compile it: a release build compiles only fused gate|up
+           // configurations its tables reach, so non-original overrides require FLYX_TUNE_CANDIDATES=ON.
+           for (int dtype : kMoeDp4aTypes)
+             for (bool fused : {false, true})
+               for (int r : {1, 2})
+                 if (!moe_dp4a_compiled(dtype, i, fused, r)) {
+                   *err = key + "=" + val + " is not compiled in this build (configure with -DFLYX_TUNE_CANDIDATES=ON)";
+                   return false;
+                 }
+           o->kernels.moe_dp4a = i;
+           return true;
+         }
+         *err = "bad value \"" + val + "\" for " + key;
+         return false;
+       },
+       [](const BackendOptions& o, const BackendOptions& def) -> std::string {
+         if (o.kernels.moe_dp4a == def.kernels.moe_dp4a) return "";
+         return std::string("moe_dp4a=") + moe_dp4a_name(o.kernels.moe_dp4a);
+       }},
       kernel_flag_opt("side_stream", &KernelOptions::side_stream),
       {"attention",
        [](const std::string& key, const std::string& val, BackendOptions* o, std::string* err) {

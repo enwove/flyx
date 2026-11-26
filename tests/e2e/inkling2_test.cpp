@@ -219,21 +219,42 @@ std::string gpt2_byte_token(int b) {
   return s;
 }
 
+// The tiny models' draws, the same on every platform.  <random>'s engines are specified and its distributions are not
+// (libstdc++ and MSVC make other values of one engine's bits), so Linux and Windows wrote two different models from
+// the same seeds, and what a check counts against cpu_ref was another count on each (the mixed-quant model, teacher
+// forced: 12 or 13 of 16 on Linux under a check that wants 15).  Integers from the engine, and exact arithmetic on
+// them up to one rounding.
+int draw_int(std::mt19937& rng, int lo, int hi) { return lo + int(rng() % uint32_t(hi - lo + 1)); }  // lo .. hi
+
+// lo + (hi - lo) * u, u in [0, 1) of 24 bits: the product of two floats is exact in a double, so the sum rounds once
+// whether or not a compiler fuses it.
+float draw_uniform(std::mt19937& rng, float lo, float hi) {
+  const double u = double(rng() >> 8) * 0x1p-24;
+  return float(double(lo) + double(hi - lo) * u);
+}
+
+// A normal's mean and deviation and nearly its shape (Irwin-Hall: twelve uniforms of 16 bits, variance 1, within 6).
+// The sum is exact in an integer and its product with sd exact in a double (20 and 24 bits).
+float draw_normal(std::mt19937& rng, float mean, float sd) {
+  uint32_t sum = 0;
+  for (int i = 0; i < 12; ++i) sum += rng() >> 16;
+  const double z = (double(sum) - 6.0 * 65536.0) * 0x1p-16;
+  return float(double(mean) + double(sd) * z);
+}
+
 std::vector<uint8_t> gen_f32(std::mt19937& rng, size_t n, float mean, float sd) {
-  std::normal_distribution<float> d(mean, sd);
   std::vector<uint8_t> out(n * 4);
   for (size_t i = 0; i < n; ++i) {
-    const float v = d(rng);
+    const float v = draw_normal(rng, mean, sd);
     std::memcpy(out.data() + i * 4, &v, 4);
   }
   return out;
 }
 
 std::vector<uint8_t> gen_bf16(std::mt19937& rng, size_t n, float sd) {
-  std::normal_distribution<float> d(0.f, sd);
   std::vector<uint8_t> out(n * 2);
   for (size_t i = 0; i < n; ++i) {
-    const uint16_t h = f32_to_bf16(d(rng));
+    const uint16_t h = f32_to_bf16(draw_normal(rng, 0.f, sd));
     std::memcpy(out.data() + i * 2, &h, 2);
   }
   return out;
@@ -241,12 +262,11 @@ std::vector<uint8_t> gen_bf16(std::mt19937& rng, size_t n, float sd) {
 
 std::vector<uint8_t> gen_q8_0(std::mt19937& rng, size_t n, float sd) {
   const size_t nb = n / 32;
-  std::normal_distribution<float> d(0.f, sd);
   std::vector<uint8_t> out(nb * 34);
   for (size_t b = 0; b < nb; ++b) {
     float vals[32], amax = 0.f;
     for (int i = 0; i < 32; ++i) {
-      vals[i] = d(rng);
+      vals[i] = draw_normal(rng, 0.f, sd);
       amax = std::max(amax, std::fabs(vals[i]));
     }
     const float scale = amax > 0.f ? amax / 127.f : 1e-4f;
@@ -263,40 +283,34 @@ std::vector<uint8_t> gen_q8_0(std::mt19937& rng, size_t n, float sd) {
 
 std::vector<uint8_t> gen_mxfp4(std::mt19937& rng, size_t n) {
   const size_t nb = n / 32;
-  std::uniform_int_distribution<int> ed(120, 124);
-  std::uniform_int_distribution<int> qd(0, 255);
   std::vector<uint8_t> out(nb * 17);
   for (size_t b = 0; b < nb; ++b) {
     uint8_t* dst = out.data() + b * 17;
-    dst[0] = uint8_t(ed(rng));
-    for (int i = 0; i < 16; ++i) dst[1 + i] = uint8_t(qd(rng));
+    dst[0] = uint8_t(draw_int(rng, 120, 124));
+    for (int i = 0; i < 16; ++i) dst[1 + i] = uint8_t(draw_int(rng, 0, 255));
   }
   return out;
 }
 
 std::vector<uint8_t> gen_q2_0(std::mt19937& rng, size_t n) {
   const size_t nb = n / 64;
-  std::uniform_real_distribution<float> sd(0.01f, 0.08f);
-  std::uniform_int_distribution<int> qd(0, 255);
   std::vector<uint8_t> out(nb * 18);
   for (size_t b = 0; b < nb; ++b) {
     uint8_t* dst = out.data() + b * 18;
-    const uint16_t dh = f32_to_f16(sd(rng));
+    const uint16_t dh = f32_to_f16(draw_uniform(rng, 0.01f, 0.08f));
     std::memcpy(dst, &dh, 2);
-    for (int i = 0; i < 16; ++i) dst[2 + i] = uint8_t(qd(rng));
+    for (int i = 0; i < 16; ++i) dst[2 + i] = uint8_t(draw_int(rng, 0, 255));
   }
   return out;
 }
 
 std::vector<uint8_t> gen_nvfp4(std::mt19937& rng, size_t n) {
   const size_t nb = n / 64;
-  std::uniform_int_distribution<int> sd(0x18, 0x38);  // valid positive E4M3 scales (never 0x7F/0xFF)
-  std::uniform_int_distribution<int> qd(0, 255);
   std::vector<uint8_t> out(nb * 36);
   for (size_t b = 0; b < nb; ++b) {
     uint8_t* dst = out.data() + b * 36;
-    for (int g = 0; g < 4; ++g) dst[g] = uint8_t(sd(rng));
-    for (int i = 0; i < 32; ++i) dst[4 + i] = uint8_t(qd(rng));
+    for (int g = 0; g < 4; ++g) dst[g] = uint8_t(draw_int(rng, 0x18, 0x38));  // positive E4M3 scales, none 0x7F/0xFF
+    for (int i = 0; i < 32; ++i) dst[4 + i] = uint8_t(draw_int(rng, 0, 255));
   }
   return out;
 }
@@ -508,8 +522,9 @@ void write_tiny_inkling2(const std::filesystem::path& path, const TinySpec& c, b
       // Distinct positive per-expert F32 tensor scales!
       std::vector<uint8_t> sc_gu(size_t(c.n_experts) * 4), sc_dn(size_t(c.n_experts) * 4);
       for (int e = 0; e < c.n_experts; ++e) {
-        const float s1 = 0.04f + 0.015f * float(e);
-        const float s2 = 0.03f + 0.012f * float(e);
+        // In double, where the products are exact: in float a compiler that fuses them rounds another bit.
+        const float s1 = float(double(0.04f) + double(0.015f) * e);
+        const float s2 = float(double(0.03f) + double(0.012f) * e);
         std::memcpy(sc_gu.data() + e * 4, &s1, 4);
         std::memcpy(sc_dn.data() + e * 4, &s2, 4);
       }
@@ -770,12 +785,15 @@ void write_tiny_dflash2_dir(const std::filesystem::path& dir, const TinySpec& c,
   out.write(reinterpret_cast<const char*>(blob.data()), std::streamsize(blob.size()));
 }
 
+// LoadOpts::width: the rounds chosen every round as in real use (EngineOptions::width -1), adaptive rounds included.
+constexpr int kChosen = -2;
+
 struct LoadOpts {
   bool speculative = false;
   bool lookup = false;
   int max_ctx = 512;
   int prefill_chunk = 32;
-  int width = -1;  // -1: default pinned 7 when speculative; 0: adaptive / auto
+  int width = -1;  // -1: pinned 7 when speculative; 0: no drafter's rounds (plain decoding, lookup rounds); kChosen
   int kv = FLYX_KV_16;
   int kv_gpu = -1;
   int kv_copy_gpu = -1;
@@ -797,7 +815,7 @@ std::unique_ptr<Engine> load_engine(const std::string& path, const std::string& 
   eo.lookup_given = o.lookup;
   eo.speculative = o.speculative;
   eo.drafter = o.speculative ? o.drafter : "none";
-  eo.width = o.speculative ? (o.width >= 0 ? o.width : 7) : 0;
+  eo.width = !o.speculative ? 0 : o.width == kChosen ? -1 : o.width >= 0 ? o.width : 7;
   eo.drafter_files = o.drafter_files;
   eo.activations = o.activations;
   eo.kv = o.kv;
@@ -812,7 +830,8 @@ std::unique_ptr<Engine> load_engine(const std::string& path, const std::string& 
 }
 
 std::vector<int32_t> run_gen(Session& s, const std::vector<int32_t>& prompt, int n, bool sampled = false,
-                             const std::vector<int32_t>& ckps = {}, int32_t keep_ckpt = -1) {
+                             const std::vector<int32_t>& ckps = {}, int32_t keep_ckpt = -1,
+                             GenerateResult* result = nullptr) {
   GenerateRequest req;
   req.prompt = prompt;
   req.max_new_tokens = n;
@@ -830,6 +849,7 @@ std::vector<int32_t> run_gen(Session& s, const std::vector<int32_t>& prompt, int
                },
                &res, &err) != 0)
     throw std::runtime_error("generate: " + err);
+  if (result) *result = res;
   return out;
 }
 
@@ -1407,7 +1427,7 @@ int main(int argc, char** argv) {
         check(same_tokens(fresh_gen(*cu_both, prompt, 24, true), cu_sampled),
               "Gate 4: cuda DSpark + DFlash2 (--drafter all) sampled+penalties == cuda plain");
 
-        // 16-row (width=15) row-count invariance + adaptive conditional graph (width=0) + oracle + lookup.
+        // 16-row (width=15) row-count invariance + adaptive conditional graphs (rounds chosen) + oracle + lookup.
         for (const bool mixed : {false, true}) {
           const std::string tag = mixed ? "mixed-quant" : "bf16";
           const auto& tgt = mixed ? mixed_gguf : bf16_gguf;
@@ -1494,19 +1514,27 @@ int main(int argc, char** argv) {
             }
           }
 
-          // Adaptive DFlash2 (width=0, lookup=true) both free and with oracle forcing long accepted runs.
-          auto e_adapt = load_engine(tgt.string(), "cuda",
-                                     {.speculative = true,
-                                      .lookup = true,
-                                      .prefill_chunk = 32,
-                                      .width = 0,
-                                      .drafter = "dflash2",
-                                      .drafter_files = {df.string()}});
-          check(same_tokens(fresh_gen(*e_adapt, prompt, 48, false), want48),
-                tag + " Gate 4: adaptive DFlash2 + lookup greedy == plain");
-          check(same_tokens(fresh_gen(*e_adapt, prompt, 48, true), want48_s),
-                tag + " Gate 4: adaptive DFlash2 + lookup sampled+penalties == plain");
-          {
+          // Adaptive rounds (the rounds chosen every round, lookup rounds too): a block drafter's whole block and one
+          // decision (DFlash2, stop_decide_block); DSpark's backbone once and its Markov head a checkpoint at a time,
+          // each step's decision on the device (stop_decide_step: another step, or the verify body of the prefix that
+          // pays).  Free, and with the oracle, whose accepted runs make the drafter's rounds pay so that they run and
+          // reach the later checkpoints.  (Pinned at a width, 0 included, an engine has no adaptive plan.)
+          for (const std::string which : {"dflash2", "dspark"}) {
+            const auto& file = which == "dspark" ? (mixed ? dspark_q8 : dspark_bf16) : df;
+            const std::string name = which == "dspark" ? "DSpark" : "DFlash2";
+            auto e_adapt = load_engine(tgt.string(), "cuda",
+                                       {.speculative = true,
+                                        .lookup = true,
+                                        .prefill_chunk = 32,
+                                        .width = kChosen,
+                                        .drafter = which,
+                                        .drafter_files = {file.string()}});
+            check(e_adapt->model().drafters() == 1 && e_adapt->adaptive_plan(0) != nullptr,
+                  tag + " adaptive " + name + ": the drafter has an adaptive round plan");
+            check(same_tokens(fresh_gen(*e_adapt, prompt, 48, false), want48),
+                  tag + " Gate 4: adaptive " + name + " + lookup greedy == plain");
+            check(same_tokens(fresh_gen(*e_adapt, prompt, 48, true), want48_s),
+                  tag + " Gate 4: adaptive " + name + " + lookup sampled+penalties == plain");
             Session so(e_adapt.get());
             std::string serr;
             if (!so.init(&serr)) throw std::runtime_error(serr);
@@ -1514,8 +1542,17 @@ int main(int argc, char** argv) {
             oracle.insert(oracle.end(), want48.begin(), want48.end());
             if (e_adapt->api()->set_oracle(so.seq(), oracle.data(), int32_t(oracle.size())) != 0)
               throw std::runtime_error(e_adapt->api()->last_error());
-            check(same_tokens(run_gen(so, prompt, 48, false), want48),
-                  tag + " Gate 4: adaptive DFlash2 + oracle (forced accepted runs) greedy == plain");
+            GenerateResult res;
+            check(same_tokens(run_gen(so, prompt, 48, false, {}, -1, &res), want48),
+                  tag + " Gate 4: adaptive " + name + " + oracle (forced accepted runs) greedy == plain");
+            // Launched on the adaptive plan, not on a fixed round the engine falls back to (a round launched as the
+            // reply ends is counted there and never read, so the count may pass the drafter's rounds read by one or
+            // two); and drafts accepted beyond the lookup rounds'.
+            const int drafted = res.drafter_rounds.empty() ? 0 : res.drafter_rounds[0];
+            check(res.adaptive_rounds > 0 && drafted > 0 && res.usage.accepted_drafts > res.lookup_accepted,
+                  tag + " adaptive " + name + " + oracle: rounds launched on the adaptive plan (" +
+                      std::to_string(res.adaptive_rounds) + "; the drafter's rounds read " + std::to_string(drafted) +
+                      ", " + std::to_string(res.usage.accepted_drafts - res.lookup_accepted) + " drafts accepted)");
           }
           // Fixed width=15 DFlash2 + oracle.
           auto e_w15 = load_engine(tgt.string(), "cuda",

@@ -4,6 +4,8 @@
 #include "backends/cuda/loader/exact_bf16.h"
 #include "tests/backends/cuda/op_test.cuh"
 
+#include "flyx/gemm_tables.inc"
+
 namespace flyx::optest {
 
 namespace {
@@ -77,60 +79,144 @@ void test_inkling2_softcap() {
   expect("softcap_rows finite", got_fin, want_fin, 2e-6);
 }
 
-void test_inkling2_attn_res() {
-  std::printf("inkling2 attn_res_mix\n");
-  for (int nb : {0, 1, 5}) {
-    for (int nq : {1, 3, 4}) {
-      const int R = 9, H = 512;
-      seed("inkling2_attn_res", nb, nq, R, H);
-      Vec bank = randv(size_t(nb) * R * H, 1.0);
-      Vec cur = randv(size_t(R) * H, 1.0);
-      Vec queries = randv(size_t(nq) * H, 0.5);
+namespace {
 
-      float* db = nb ? up(bank) : nullptr;
-      float* dc = up(cur);
-      float* dq = up(queries);
-      float* dout = dev<float>(size_t(nq) * R * H);
-      attn_res_mix(db, nb, dc, dq, nq, R, H, dout, 0);
-      Vec got = down(dout, size_t(nq) * R * H);
+void expect_device_bits(const std::string& what, const float* got, const float* want, size_t count);
 
-      // Reference (query-major [nq, R, H] matching CUDA layout).
-      Vec want(size_t(nq) * R * H, 0.0);
-      Vec tmp(size_t(nq) * H);
-      std::vector<const double*> ptrs(static_cast<size_t>(nb));
-      for (int r = 0; r < R; ++r) {
-        for (int b = 0; b < nb; ++b) ptrs[size_t(b)] = bank.data() + (size_t(b) * R + r) * H;
-        ops::attn_res_mix(ptrs.data(), nb, cur.data() + size_t(r) * H, queries.data(), nq, H, tmp.data());
-        for (int q = 0; q < nq; ++q)
-          std::copy_n(tmp.data() + size_t(q) * H, H, want.data() + (size_t(q) * R + r) * H);
+// One warp per (row, query). Scalar loads enumerate the original lane's channels, so this checks
+// the order of both FMA chains even if the fused and standalone implementations change together.
+__global__ void attn_res_order_reference(const float* states, const float* queries, int M, int R, int H,
+                                         int channels_per_lane, float* out) {
+  const int lane = threadIdx.x, r = blockIdx.x, q = blockIdx.y;
+  __shared__ float inv[64], scores[64];
+  for (int m = 0; m < M; ++m) {
+    const float* row = states + (size_t(m) * R + r) * H;
+    float ss = 0.f, dot = 0.f;
+    for (int i = lane * channels_per_lane; i < H; i += 32 * channels_per_lane) {
+      for (int j = 0; j < channels_per_lane; ++j) {
+        const float v = row[i + j];
+        ss = __fmaf_rn(v, v, ss);
+        dot = __fmaf_rn(v, queries[size_t(q) * H + i + j], dot);
       }
-      expect("attn_res_mix nb=" + std::to_string(nb) + " nq=" + std::to_string(nq), got, want, 1e-5);
-
-      // Row-count independence: row 3 alone vs in 9 rows.
-      const int rr = 3;
-      Vec bank1(size_t(nb) * H);
-      for (int b = 0; b < nb; ++b)
-        std::copy_n(bank.data() + (size_t(b) * R + rr) * H, H, bank1.data() + size_t(b) * H);
-      Vec cur1(cur.begin() + ptrdiff_t(rr) * H, cur.begin() + ptrdiff_t(rr + 1) * H);
-      float* db1 = nb ? up(bank1) : nullptr;
-      float* dc1 = up(cur1);
-      float* dout1 = dev<float>(size_t(nq) * H);
-      attn_res_mix(db1, nb, dc1, dq, nq, 1, H, dout1, 0);
-      Vec got1 = down(dout1, size_t(nq) * H);
-      Vec slice_r(size_t(nq) * H);
-      for (int q = 0; q < nq; ++q)
-        std::copy_n(got.data() + (size_t(q) * R + rr) * H, H, slice_r.data() + size_t(q) * H);
-      expect_bits("attn_res_mix R=1 vs R=9 nb=" + std::to_string(nb) + " nq=" + std::to_string(nq), got1, slice_r);
-
-      if (db) cudaFree(db);
-      if (db1) cudaFree(db1);
-      cudaFree(dc);
-      cudaFree(dc1);
-      cudaFree(dq);
-      cudaFree(dout);
-      cudaFree(dout1);
+    }
+    // Lane zero gets the same high-to-low butterfly as the production warp sum.
+    for (int d = 16; d > 0; d >>= 1) {
+      ss += __shfl_down_sync(0xffffffffu, ss, d);
+      dot += __shfl_down_sync(0xffffffffu, dot, d);
+    }
+    if (lane == 0) {
+      inv[m] = rsqrtf(ss / float(H) + 1e-6f);
+      scores[m] = dot * (inv[m] * rsqrtf(float(H)));
     }
   }
+  if (lane == 0) {
+    float mx = -INFINITY, z = 0.f;
+    for (int m = 0; m < M; ++m) mx = fmaxf(mx, scores[m]);
+    for (int m = 0; m < M; ++m) {
+      scores[m] = expf(scores[m] - mx);
+      z += scores[m];
+    }
+    const float inv_z = 1.f / z;
+    for (int m = 0; m < M; ++m) scores[m] = (scores[m] * inv_z) * inv[m];
+  }
+  __syncwarp();
+  for (int i = lane; i < H; i += 32) {
+    float mix = 0.f;
+    for (int m = 0; m < M; ++m) mix = __fmaf_rn(scores[m], states[(size_t(m) * R + r) * H + i], mix);
+    out[(size_t(q) * R + r) * H + i] = mix;
+  }
+}
+
+void check_attn_res_mix(int H, int M, int nq, int R, int input_offset = 0, int output_offset = 0,
+                        bool special_values = false) {
+  const int nb = M - 1;
+  seed("inkling2_attn_res", nb, nq, R, H);
+  const size_t row_bytes = size_t(H) * sizeof(float), count = size_t(nq) * R * H;
+  Vec storage = randv(input_offset + size_t(M) * R * H);
+  const Vec queries = randv(size_t(nq) * H, 0.5);
+  double* states = storage.data() + input_offset;
+  if (special_values) {
+    // Keep finite rows alongside the poisoned rows so signed zero and underflow in an individual
+    // channel reach the raw-word comparison. Only the current state contributes to channels 1 and 2.
+    const double sub = std::numeric_limits<float>::denorm_min();
+    const double nonfinite[] = {std::numeric_limits<float>::infinity(), -std::numeric_limits<float>::infinity(),
+                                std::numeric_limits<float>::quiet_NaN()};
+    for (int m = 0; m < M; ++m) {
+      for (int r = 0; r < R; ++r) {
+        double* row = states + (size_t(m) * R + r) * H;
+        row[0] = -0.0;
+        row[1] = m == nb ? sub : 0.0;
+        row[2] = m == nb ? -sub : -0.0;
+        row[3] = 512 * sub;
+        if (m == nb && r < 3) row[4] = nonfinite[r];
+      }
+    }
+  }
+  float* ds_base = up(storage);
+  float* ds = ds_base + input_offset;
+  float* dq = up(queries);
+  float* dout_base = dev<float>(output_offset + count);
+  float* dout = dout_base + output_offset;
+  float* dref = dev<float>(count);
+  attn_res_mix(nb ? ds : nullptr, nb, ds + size_t(nb) * R * H, dq, nq, R, H, dout, 0);
+  const int channels_per_lane = H % 4 == 0 && input_offset == 0 ? 4 : 1;
+  attn_res_order_reference<<<dim3(R, nq), 32>>>(ds, dq, M, R, H, channels_per_lane, dref);
+  CK(cudaGetLastError());
+  const std::string label = "attn_res_mix H=" + std::to_string(H) + " M=" + std::to_string(M) +
+                            " nq=" + std::to_string(nq) + " R=" + std::to_string(R) +
+                            (input_offset ? " shifted input" : "") + (output_offset ? " shifted output" : "") +
+                            (special_values ? " special values" : "");
+  expect_device_bits(label + " FMA order", dout, dref, count);
+
+  if (!special_values) {
+    Vec want(count), tmp(size_t(nq) * H);
+    std::vector<const double*> blocks(static_cast<size_t>(nb));
+    for (int r = 0; r < R; ++r) {
+      for (int b = 0; b < nb; ++b) blocks[b] = states + (size_t(b) * R + r) * H;
+      ops::attn_res_mix(blocks.data(), nb, states + (size_t(nb) * R + r) * H, queries.data(), nq, H, tmp.data());
+      for (int q = 0; q < nq; ++q)
+        std::copy_n(tmp.data() + size_t(q) * H, H, want.data() + (size_t(q) * R + r) * H);
+    }
+    expect(label + " f64", down(dout, count), want, 1e-5);
+  }
+
+  if (R > 1) {
+    const int r = R / 2;
+    float* ds1_base = dev<float>(input_offset + size_t(M) * H);
+    float* ds1 = ds1_base + input_offset;
+    float* dout1_base = dev<float>(output_offset + size_t(nq) * H);
+    float* dout1 = dout1_base + output_offset;
+    CK(cudaMemcpy2D(ds1, row_bytes, ds + size_t(r) * H, R * row_bytes, row_bytes, M, cudaMemcpyDeviceToDevice));
+    attn_res_mix(nb ? ds1 : nullptr, nb, ds1 + size_t(nb) * H, dq, nq, 1, H, dout1, 0);
+    CK(cudaMemcpy2D(dref, row_bytes, dout + size_t(r) * H, R * row_bytes, row_bytes, nq, cudaMemcpyDeviceToDevice));
+    expect_device_bits(label + " vs R=1", dout1, dref, size_t(nq) * H);
+    cudaFree(ds1_base);
+    cudaFree(dout1_base);
+  }
+  cudaFree(ds_base);
+  cudaFree(dq);
+  cudaFree(dout_base);
+  cudaFree(dref);
+}
+
+}  // namespace
+
+void test_inkling2_attn_res() {
+  std::printf("inkling2 attn_res_mix\n");
+  for (int nb : {0, 1, 5})
+    for (int nq : {1, 3, 4}) check_attn_res_mix(512, nb + 1, nq, 9);
+  // Every supported state depth and every round size, with a final float4 in just one lane.
+  for (int M = 1; M <= 64; ++M) check_attn_res_mix(260, M, 1 + (M - 1) % 4, 1 + (M - 1) % 16);
+  for (int H : {2304, 2560, 3072, 5120})
+    for (int R : {1, 4, 8, 16})
+      for (int nq : {1, 3, 4}) check_attn_res_mix(H, 10, nq, R);
+  // The larger launch groups four queries in a CTA. Its middle row must equal the split-query R=1 launch.
+  for (int nq : {1, 2, 3, 4, 7}) check_attn_res_mix(2304, 10, nq, 17);
+  for (int R : {8, 17}) check_attn_res_mix(260, 5, 4, R, 0, 0, true);
+  check_attn_res_mix(259, 17, 2, 4);          // scalar lane order and a partial warp
+  check_attn_res_mix(2308, 64, 4, 4);         // maximum depth and one float4 after 18 complete lane strides
+  check_attn_res_mix(2304, 10, 5, 8, 1);      // scalar lane order and a second query group
+  check_attn_res_mix(2304, 10, 5, 8, 0, 1);   // float4 dots with a scalar output mix
 }
 
 void test_inkling2_loop_ctrl() {
@@ -711,7 +797,7 @@ void test_inkling2_rel_attn() {
     int nh, nkv, hd, d_rel, rel_extent, window, ring, ctx, rows;
     bool fp8;
   };
-  const Case cases[] = {
+  std::vector<Case> cases = {
       {"swa ring f16 hd128 R=9", 8, 2, 128, 16, 16, 16, 64, 90, 9, false},
       {"global fp8 hd128 R=1", 24, 8, 128, 16, 64, 0, 0, 129, 1, true},
       {"swa ring f16 hd128 R=37", 12, 4, 128, 16, 32, 32, 96, 110, 37, false},
@@ -721,6 +807,15 @@ void test_inkling2_rel_attn() {
       {"global f16 hd32 R=8", 4, 2, 32, 8, 16, 0, 0, 40, 8, false},
       {"global fp8 hd32 R=1", 4, 2, 32, 8, 32, 0, 0, 40, 1, true},
   };
+  // Two KV heads exercise the cache/scales' head stride while keeping the long float64 checks inexpensive.
+  for (bool fp8 : {false, true}) {
+    const char* global = fp8 ? "global fp8 G3 R=16" : "global f16 G3 R=16";
+    const char* ring = fp8 ? "ring fp8 G3 R=16" : "ring f16 G3 R=16";
+    cases.push_back({global, 6, 2, 128, 16, 1024, 0, 0, 4088, 16, fp8});
+    // The window first fills, then its newest and oldest keys cross the physical seam inside a 16-key tile.
+    for (int ctx : {1016, 1033, 2057})
+      cases.push_back({ring, 6, 2, 128, 16, 1024, 1024, 1041, ctx, 16, fp8});
+  }
   for (const Case& c : cases) {
     seed("inkling2_rel_attn", c.hd, c.window, c.rows, int(c.fp8));
     const int total = c.ctx + c.rows;
@@ -855,7 +950,7 @@ void test_inkling2_rel_attn() {
     float* d_sink = up(sink);
     float* d_gate = up(gate);
     float* d_out = dev<float>(size_t(c.rows) * q_dim);
-    const int splits = 16;
+    const int splits = c.rows == 16 ? kAttnCoresSplits : 16;
     float* d_part = dev<float>(attention_partial_floats(c.rows, c.nh, c.hd, splits));
 
     rel_attn_prep(d_qin, q_dim, d_kin, kv_dim, d_vin, kv_dim, d_rin, c.nh * c.d_rel, d_qcw, d_rcw, qk_clip, rel_clip,
@@ -985,6 +1080,144 @@ void test_inkling2_rel_attn() {
       cudaFree(d_wo);
       cudaFree(d_y0);
       cudaFree(d_y1);
+    }
+
+    if (c.rows == 16) {
+      // One absolute key tile every 16 positions, including the first reuse of split slot zero after 512.
+      // Before the cache wraps all earlier positions are available for the same queries. For a wrapped cache
+      // only the original round is resident. Reference K_all and V_all always use absolute positions.
+      std::vector<int> boundaries;
+      if (c.ring && total > c.ring) {
+        boundaries.push_back(c.ctx + 8);
+      } else {
+        boundaries.push_back(8);  // the two 8-key warp stripes of the first tile
+        for (int keys = 16; keys <= c.ctx + 8; keys += 16) boundaries.push_back(keys);
+      }
+      float* d_decode = dev<float>(3 * q_dim);
+      DevParams* P_round = params(0);
+      Launch round = TL;
+      round.round_rows = true;
+      Launch separate = round;
+      separate.scratch = nullptr;  // float output without the last-block counter uses the separate reducer
+      auto launch = [&](int first_row, int count, const DevParams* base, int add, float* dst, const Launch& L,
+                        int cap = kAttnCoresSplits) {
+        CK(cudaMemsetAsync(dst, 0xff, size_t(count) * q_dim * sizeof(float), L.st));
+        rel_attention(d_qout + size_t(first_row) * q_dim, d_rout + size_t(first_row) * c.nh * c.d_rel, kv, d_rb,
+                      d_sink + size_t(first_row) * c.nh, c.nh, d_gate + size_t(first_row) * q_dim, q_dim, c.nh, c.nkv,
+                      c.hd, c.d_rel, c.rel_extent, c.window, count, base, dst, q_dim, d_part, cap, L, add);
+      };
+      Launch replay = round;
+      CK(cudaStreamCreateWithFlags(&replay.st, cudaStreamNonBlocking));
+      cudaGraph_t graph;
+      cudaGraphExec_t executable;
+      CK(cudaStreamBeginCapture(replay.st, cudaStreamCaptureModeThreadLocal));
+      launch(0, 16, P, 0, d_out, replay);
+      CK(cudaStreamEndCapture(replay.st, &graph));
+      CK(cudaGraphInstantiate(&executable, graph, 0));
+      std::vector<float> decoded(3 * q_dim), got(decoded.size());
+      auto matches_decode = [&](int offset) {
+        CK(cudaMemcpy(got.data(), d_out + offset * q_dim, got.size() * sizeof(float), cudaMemcpyDeviceToHost));
+        return std::memcmp(got.data(), decoded.data(), got.size() * sizeof(float)) == 0;
+      };
+      double max_error = 0.0;
+      int worst_pos = 0, mismatch_rows = -1, mismatch_pos = -1;
+      for (int boundary : boundaries) {
+        // Input rows 6, 7, 8 see boundary - 1, boundary, boundary + 1 causal keys. Move those three queries
+        // between different indices (and both lanes of a row pair) while keeping their absolute positions fixed.
+        const int first_pos = boundary - 8;
+        for (int i = 0; i < 3; ++i) {
+          DevParams decode{};
+          decode.position = first_pos + 6 + i;
+          CK(cudaMemcpy(P, &decode, sizeof(decode), cudaMemcpyHostToDevice));
+          launch(6 + i, 1, P, 0, d_decode + i * q_dim, round);  // a plain decode step at the query's position
+        }
+        CK(cudaMemcpy(decoded.data(), d_decode, decoded.size() * sizeof(float), cudaMemcpyDeviceToHost));
+        // Rotate through all query heads and the three sides of each boundary for the independent reference.
+        const int index = (boundary / 16) % 3, h = (boundary / 16) % c.nh, rr = 6 + index;
+        const int pos = first_pos + rr;
+        const size_t q_at = size_t(rr * c.nh + h);
+        Vec ref(c.hd);
+        ops::attend_rel(q_ref.data() + q_at * c.hd, r_ref.data() + q_at * c.d_rel, K_all.data(), V_all.data(),
+                        rel_bias.data(), sink[q_at], pos, c.window, c.nkv, c.hd, c.d_rel, c.rel_extent,
+                        h / (c.nh / c.nkv), scale, ref.data());
+        for (int d = 0; d < c.hd; ++d) ref[d] *= ops::sigmoid(gate[q_at * c.hd + d]);
+        const auto begin = decoded.begin() + index * q_dim + h * c.hd;
+        const double error = relative_error(Vec(begin, begin + c.hd), ref);
+        if (error > max_error) {
+          max_error = error;
+          worst_pos = pos;
+        }
+
+        // R=1 also exercises a query addressed by its offset from the graph's base position. Compare the
+        // two-kernel fallback once per boundary with both grouped rows live, using the same float output contract.
+        for (int rows : {1, 3, 4, 8, 16}) {
+          int offset = 0;
+          if (rows == 1) {
+            for (int i = 0; i < 3; ++i)
+              launch(6 + i, 1, P_round, first_pos + 6 + i, d_out + i * q_dim, round);
+          } else if (rows == 16) {
+            DevParams base{};
+            base.position = first_pos;
+            CK(cudaMemcpyAsync(P, &base, sizeof(base), cudaMemcpyHostToDevice, replay.st));
+            CK(cudaGraphLaunch(executable, replay.st));
+            CK(cudaStreamSynchronize(replay.st));
+            offset = 6;
+          } else {
+            const int first_row = rows == 3 ? 6 : rows == 4 ? 5 : 3;
+            launch(first_row, rows, P_round, first_pos + first_row, d_out, round);
+            offset = 6 - first_row;
+          }
+          if (!matches_decode(offset) && mismatch_pos < 0) {
+            mismatch_rows = rows;
+            mismatch_pos = first_pos + 6;
+          }
+        }
+        launch(5, 4, P_round, first_pos + 5, d_out, separate);
+        if (!matches_decode(1) && mismatch_pos < 0) {
+          mismatch_rows = 0;  // separate reducer
+          mismatch_pos = first_pos + 6;
+        }
+        // Exercise the single slot and an odd number of slots at their first reuse and on both ring seams.
+        for (int cap : {1, 3}) {
+          if (boundary != 16 * cap && !(c.ring && total > c.ring)) continue;
+          launch(5, 4, P_round, first_pos + 5, d_out, round, cap);
+          for (int i = 0; i < 3; ++i)
+            launch(6 + i, 1, P_round, first_pos + 6 + i, d_decode + i * q_dim, round, cap);
+          CK(cudaMemcpy(decoded.data(), d_decode, decoded.size() * sizeof(float), cudaMemcpyDeviceToHost));
+          const bool same = matches_decode(1);
+          const std::string tag = std::string(c.name) + " boundary=" + std::to_string(boundary) +
+                                  " splits=" + std::to_string(cap);
+          std::printf("  %-4s relative attention decode vs R=4 (%s)\n", same ? "ok" : "FAIL", tag.c_str());
+          g_fail += !same;
+          expect("rel_attn " + tag, Vec(begin, begin + c.hd), ref, c.fp8 ? 5e-4 : 3e-5);
+        }
+      }
+      const double tol = c.fp8 ? 5e-4 : 3e-5;
+      std::printf("  %-4s relative attention boundaries vs float64 (%s, ctx=%d): worst %.2e at position %d\n",
+                  max_error <= tol ? "ok" : "FAIL", c.name, c.ctx, max_error, worst_pos);
+      g_fail += max_error > tol;
+      std::printf("  %-4s relative attention decode vs 1/3/4/8/16 and separate combine (%s, ctx=%d, %zu boundaries)\n",
+                  mismatch_pos < 0 ? "ok" : "FAIL", c.name, c.ctx, boundaries.size());
+      if (mismatch_pos >= 0) {
+        std::printf("       mismatch in positions %d..%d, rows=%d (0 for separate combine)\n",
+                    mismatch_pos, mismatch_pos + 2, mismatch_rows);
+        ++g_fail;
+      }
+      const size_t counters = size_t((c.rows + 1) / 2) * c.nkv;  // a tile of two rows: k_rel_round_gqa's grid
+      const bool have_counters = round.scratch->round_count && round.scratch->round_count_cap >= counters;
+      bool zero = false;
+      if (have_counters) {
+        const auto counts = down_i(round.scratch->round_count, counters);
+        zero = std::all_of(counts.begin(), counts.end(), [](int count) { return count == 0; });
+      }
+      std::printf("  %-4s relative attention graph releases all split counters (%s, ctx=%d)\n",
+                  have_counters && zero ? "ok" : "FAIL", c.name, c.ctx);
+      g_fail += !(have_counters && zero);
+      CK(cudaGraphExecDestroy(executable));
+      CK(cudaGraphDestroy(graph));
+      CK(cudaStreamDestroy(replay.st));
+      cudaFree(d_decode);
+      cudaFree(P_round);
     }
 
     cudaFree(P);
@@ -1355,8 +1588,153 @@ void test_inkling2_moe_norm() {
   }
 }
 
+namespace {
+
+// The rules of a fused gate|up GEMM's configuration (variants: moe_gate_up) give every block type, at every row count
+// a pass may have on dp4a, a configuration reachable on every architecture whose cubin runs that table, and compiled
+// in this build for every table this build's cubin runs.
+void test_moe_gate_up_rules() {
+  namespace t = tables;
+  constexpr int kBucketCc[] = {80, 86, 89, 90, 100, 120};  // t::arch_bucket's, then kArchBucketAny
+  auto runs = [&](int bucket, int arch) {
+    if (bucket == t::kArchBucketAny || arch == 0) return true;
+    return arch == kBucketCc[bucket] || (bucket == 0 && (arch == 86 || arch == 89));
+  };
+  const int arch = compiled_arch();
+  int bad = 0;
+  for (int tuning = -1; tuning < t::kSkuCount; ++tuning) {
+    const int tbl_arch = tuning < 0 ? 0 : t::kSkuArch[tuning];
+    const bool live = arch > 0 && gemm_tuning_compiled_for(tuning, arch);
+    for (const BlockType& bt : kBlockTypes) {
+      const int di = t::ggml_type_index(bt.dtype);
+      for (int rows = 1; rows <= 64; ++rows) {
+        const int cfg = moe_gate_up_dp4a(tuning, bt.dtype, rows);
+        const int band = rows == 1 ? 0 : 1;
+        for (int b = 0; b < t::kArchBucketCount; ++b) {
+          if (!runs(b, tbl_arch)) continue;
+          if ((di < 0 || cfg < 0 || cfg >= 32 || !(t::kReachMoeDp4a[b][band][di] & (1u << cfg))) && bad++ < 4)
+            std::printf("  FAIL table %s, bucket %d, %s, %d rows: moe_dp4a configuration %d not reachable\n",
+                        tuning < 0 ? "defaults" : t::kSkus[tuning].name, b, bt.name, rows, cfg);
+        }
+        if (live && !moe_dp4a_compiled(bt.dtype, cfg, true, rows) && bad++ < 4)
+          std::printf("  FAIL table %s, %s, %d rows: moe_dp4a configuration %d not compiled on sm_%d\n",
+                      tuning < 0 ? "defaults" : t::kSkus[tuning].name, bt.name, rows, cfg, arch);
+      }
+    }
+  }
+  std::printf("  %-4s %-48s\n", bad ? "FAIL" : "ok", "MoE gate|up rules: compiled configurations");
+  if (bad) ++g_fail;
+}
+
+void test_moe_dp4a_variants() {
+  // 72 units: U=2 must refill its first slot for just eight lanes. Odd widths exercise the final
+  // partially occupied warp and column group. Padding after each float32 output catches extra stores.
+  constexpr int R = 16, E = 7, top_k = 2, K = 2304, I = 35, H = 37, ldx = K + 3;
+  constexpr int ld_down = H + 5;
+  seed("inkling2_moe_dp4a");
+  std::vector<int> ids(R * top_k);
+  for (int r = 0; r < R; ++r) {
+    // Expert 0 occurs in every row, in alternating slots. Expert 1 occurs once, the rest in threes.
+    ids[r * top_k + r % 2] = 0;
+    ids[r * top_k + 1 - r % 2] = r == 0 ? 1 : 2 + (r - 1) / 3;
+  }
+  int* eidx = dev<int>(ids.size());
+  CK(cudaMemcpy(eidx, ids.data(), ids.size() * sizeof(int), cudaMemcpyHostToDevice));
+  float* weights = up(randv(ids.size(), 0.5));
+  float* scales = up({0.75, 0.125, 0.625, 1.5, 0.5, 0.25, 1.25});
+  float* x = up(randv(size_t(R) * ldx, 0.125));
+  float* down_x = up(randv(size_t(R) * top_k * ldx, 0.125));
+  MoeScratch sc{};
+  sc.chunk_rows = R;
+  sc.max_experts = E;
+  sc.max_top_k = top_k;
+  sc.pairs = dev<int>(ids.size());
+  sc.tasks = dev<MoeTask>(ids.size());
+  sc.n_tasks = dev<int>(1);
+  sc.stage_elems = ids.size() * K;
+  sc.q8_a = dev<int8_t>(sc.stage_elems);
+  sc.q8_d = dev<float>(sc.stage_elems / 32);
+  sc.q8_s = dev<float>(sc.stage_elems / 16);
+  float* pairs_out = dev<float>(ids.size() * H);
+  float* sum_out = dev<float>(size_t(R) * ld_down);
+
+  for (int dtype : kMoeDp4aTypes) {
+    seed("inkling2_moe_dp4a_weights", dtype);
+    const BlockType& bt = block_type(dtype);
+    auto matrix = [&](int cols) {
+      ExpertMat w{};
+      w.n_experts = E;
+      w.N = cols;
+      w.rs = scales;
+      w.blk = up_blocks(dtype, random_blocks(bt, size_t(E) * cols * (K / flyx_block_values(dtype))), E * cols);
+      w.blk.q8 = true;
+      return w;
+    };
+    const ExpertMat gu = matrix(2 * I), dn = matrix(H);
+    auto check = [&](const char* op, bool fused_gate_up, int words_per_row, auto run) {
+      float* alone = dev<float>(R * words_per_row);
+      float* got = dev<float>(R * words_per_row);
+      CK(cudaMemset(alone, 0xff, R * words_per_row * sizeof(float)));
+      for (int r = 0; r < R; ++r) run(r, 1, TL, alone + r * words_per_row);
+      KernelOptions options{};
+      Launch launch = TL;
+      launch.opt = &options;
+      // -1: the rules; then every configuration this build compiles for the type, op and row band (a release build:
+      // fused gate|up configs reached on this architecture, and the original tiles everywhere)
+      for (int v = -1; v < kMoeDp4aConfigCount; ++v) {
+        options.moe_dp4a = v;
+        for (int rows : {1, 2, 4, 8, R}) {
+          if (v >= 0 && !moe_dp4a_compiled(dtype, v, fused_gate_up, rows)) continue;
+          const size_t words = size_t(rows) * words_per_row;
+          CK(cudaMemset(got, 0xff, words * sizeof(float)));
+          run(0, rows, launch, got);
+          const std::string label = std::string("MoE ") + bt.name + " " + op + " " + moe_dp4a_name(v) +
+                                    " R=" + std::to_string(rows) + " vs default R=1";
+          expect_device_bits(label, got, alone, words);
+        }
+      }
+      CK(cudaFree(alone));
+      CK(cudaFree(got));
+    };
+
+    for (bool fused : {false, true}) {
+      const int ld = (fused ? I : 2 * I) + 5;
+      check(fused ? "SiTU" : "gate|up", fused, top_k * ld, [&](int r, int rows, const Launch& L, float* out) {
+        moe_gate_up(x + r * ldx, ldx, gu, eidx + r * top_k, rows, top_k, I, K, 6.f, 8.f, fused, out, ld, &sc, L);
+      });
+    }
+    // Two BF16 expert slots per row occupy exactly I 32-bit words, so this compares the stored BF16 bits directly.
+    check("BF16 SiTU", true, I, [&](int r, int rows, const Launch& L, float* out) {
+      moe_stage_q8(x + r * ldx, ldx, K, rows, sc, moe_q8_mins(gu), L.st);
+      moe_gate_up(x + r * ldx, ldx, gu, eidx + r * top_k, rows, top_k, I, K, 6.f, 8.f, true, nullptr, I, &sc, L,
+                  true, reinterpret_cast<bf16*>(out));
+    });
+    // Inspect individual projections as well: rounding in the weighted sum can hide a difference in a single expert.
+    for (bool per_expert : {true, false}) {
+      check(per_expert ? "down experts" : "down sum", false, per_expert ? top_k * H : ld_down,
+            [&](int r, int rows, const Launch& L, float* out) {
+              MoeScratch down_sc = sc;
+              down_sc.down_buf = per_expert ? out : pairs_out;
+              moe_down(down_x + r * top_k * ldx, ldx, dn, eidx + r * top_k, weights + r * top_k, rows, top_k, H, K,
+                       per_expert ? sum_out : out, ld_down, false, &down_sc, L);
+            });
+    }
+    for (const ExpertMat& w : {gu, dn}) {
+      CK(cudaFree(const_cast<uint8_t*>(w.blk.data)));
+      CK(cudaFree(const_cast<uint16_t*>(w.blk.scales)));
+    }
+  }
+  for (void* p : std::initializer_list<void*>{eidx, weights, scales, x, down_x, sc.pairs, sc.tasks, sc.n_tasks,
+                                              sc.q8_a, sc.q8_d, sc.q8_s, pairs_out, sum_out})
+    CK(cudaFree(p));
+}
+
+}  // namespace
+
 void test_inkling2_moe() {
   test_inkling2_moe_norm();
+  test_moe_gate_up_rules();
+  test_moe_dp4a_variants();
   std::printf("inkling2 moe (route, situ, gate_up, down)\n");
   // 1. moe_route: sigmoid+bias and softmax.
   for (int sig : {1, 0}) {
@@ -1427,8 +1805,6 @@ void test_inkling2_moe() {
   CK(cudaMemcpy(d_eidx, eidx.data(), eidx.size() * 4, cudaMemcpyHostToDevice));
   float* d_ew = up(ew);
   MoeScratch msc{};
-  msc.counts = dev<int>(E);
-  msc.offsets = dev<int>(E + 1);
   msc.pairs = dev<int>(size_t(R) * top_k);
   msc.tasks = dev<MoeTask>(size_t(R) * top_k);
   msc.n_tasks = dev<int>(1);
@@ -1573,8 +1949,8 @@ void test_inkling2_moe() {
     expect_bits("moe R=1 staged == R=37 grouped " + label, down(d_y_1, size_t(H)), got_ygrp_rr);
 
     const int r8_0 = 16;  // covers rr = 19 at offset 3
-    float* d_act_8 = dev<float>(size_t(8) * top_k * I);
-    float* d_y_8 = dev<float>(size_t(8) * H);
+    float* d_act_8 = dev<float>(size_t(16) * top_k * I);  // 16 rows: the grouping checks below
+    float* d_y_8 = dev<float>(size_t(16) * H);
     moe_gate_up(d_x + size_t(r8_0) * H, H, w_gu, d_eidx + size_t(r8_0) * top_k, 8, top_k, I, H, beta, lb, true, d_act_8,
                 I, &msc, TL);
     moe_down(d_act_8, I, w_dn, d_eidx + size_t(r8_0) * top_k, d_ew + size_t(r8_0) * top_k, 8, top_k, H, I, d_y_8, H,
@@ -1582,6 +1958,18 @@ void test_inkling2_moe() {
     Vec got_y8 = down(d_y_8, size_t(8) * H);
     Vec got_y8_rr(got_y8.begin() + ptrdiff_t(rr - r8_0) * H, got_y8.begin() + ptrdiff_t(rr - r8_0 + 1) * H);
     expect_bits("moe R=8 grouped == R=37 grouped " + label, got_y8_rr, got_ygrp_rr);
+
+    // The down GEMM takes over the grouping by expert that the gate|up GEMM leaves (moe_gate_up's return) where its
+    // tiles are the ones it would make, else groups again: the same bits either way, at row counts where the two
+    // GEMMs' tiles are alike and where they are not.
+    for (int rows : {2, 4, 8, 16}) {
+      const std::string tag = label + " R=" + std::to_string(rows);
+      const int grouped = moe_gate_up(d_x, H, w_gu, d_eidx, rows, top_k, I, H, beta, lb, true, d_act_8, I, &msc, TL);
+      moe_down(d_act_8, I, w_dn, d_eidx, d_ew, rows, top_k, H, I, d_y_8, H, false, &msc, TL, nullptr, grouped);
+      const Vec taken = down(d_y_8, size_t(rows) * H);
+      moe_down(d_act_8, I, w_dn, d_eidx, d_ew, rows, top_k, H, I, d_y_8, H, false, &msc, TL);
+      expect_bits("moe down on gate|up's grouping == its own " + tag, taken, down(d_y_8, size_t(rows) * H));
+    }
     cudaFree(d_act_8);
     cudaFree(d_y_8);
 
@@ -1638,7 +2026,7 @@ void test_inkling2_moe() {
         bf16* d_bf = up_bf16(e_f);
         uint8_t* dq = dev<uint8_t>(size_t(N) * (K / 2));
         uint8_t* ds = dev<uint8_t>(size_t(N) * (K / 16));
-        float* drs = dev<float>(1);
+        float* drs = dev<float>(size_t(N));
         quantize_nvfp4(d_bf, N, K, dq, ds, drs, 0);
         CK(cudaDeviceSynchronize());
         std::vector<uint8_t> hq(size_t(N) * (K / 2)), hs(size_t(N) * (K / 16));
@@ -1719,7 +2107,9 @@ void test_inkling2_moe() {
       run_and_check(std::string(bt.name) + (use_q8 ? "_q8" : "_a16h"), w_gu, w_dn, gu_f64, dn_f64, false,
                     use_q8 != 0, use_q8 == 0, 5e-5);
       cudaFree(const_cast<uint8_t*>(w_gu.blk.data));
+      cudaFree(const_cast<uint16_t*>(w_gu.blk.scales));
       cudaFree(const_cast<uint8_t*>(w_dn.blk.data));
+      cudaFree(const_cast<uint16_t*>(w_dn.blk.scales));
     }
   }
 
@@ -1743,8 +2133,6 @@ void test_inkling2_moe() {
     CK(cudaMemcpy(deim, eim.data(), eim.size() * 4, cudaMemcpyHostToDevice));
     float* dewm = up(ewm);
     MoeScratch sm{};
-    sm.counts = dev<int>(EM);
-    sm.offsets = dev<int>(EM + 1);
     sm.pairs = dev<int>(size_t(RM) * KM);
     sm.tasks = dev<MoeTask>(size_t(RM) * KM);
     sm.n_tasks = dev<int>(1);
@@ -1798,13 +2186,13 @@ void test_inkling2_moe() {
       expect_bits(std::string("moe multispan 2304x1152 R=8==R=19 ") + gbt.name,
                   Vec(y8.begin() + ptrdiff_t(rr - 8) * HM, y8.begin() + ptrdiff_t(rr - 7) * HM), yref);
       cudaFree(const_cast<uint8_t*>(wgu.blk.data));
+      cudaFree(const_cast<uint16_t*>(wgu.blk.scales));
       cudaFree(const_cast<uint8_t*>(wdn.blk.data));
+      cudaFree(const_cast<uint16_t*>(wdn.blk.scales));
     }
     cudaFree(dxm);
     cudaFree(deim);
     cudaFree(dewm);
-    cudaFree(sm.counts);
-    cudaFree(sm.offsets);
     cudaFree(sm.pairs);
     cudaFree(sm.tasks);
     cudaFree(sm.n_tasks);
@@ -1818,11 +2206,106 @@ void test_inkling2_moe() {
     cudaFree(d_y_8);
   }
 
+  // (e) The grouping by expert with more experts and more (row, expert) pairs than k_moe_group_tasks has threads
+  // (each thread scans a run of experts; pairs go round in several passes), and experts with more pairs than a tile
+  // holds: every row of a 70-row launch equals the row alone, through gate|up and down.
+  {
+    const int RG = 70, EG = 300, KG = 4, HG = 128, IG = 64;
+    seed("inkling2_moe_grouping", RG, EG, KG, HG, IG);
+    Vec xg = randv(size_t(RG) * HG, 0.5);
+    Vec rlg = randv(size_t(RG) * EG, 1.0);
+    for (int r = 0; r < RG; ++r)  // a few hot experts, so some hold more pairs than a tile of 4 or 8
+      for (int e = 0; e < 3; ++e) rlg[size_t(r) * EG + e] += 3.0;
+    std::vector<int> eig(size_t(RG) * KG);
+    Vec ewg(size_t(RG) * KG);
+    for (int r = 0; r < RG; ++r)
+      ops::moe_route(&rlg[size_t(r) * EG], nullptr, EG, KG, true, true, 1e-20, 1.0, &eig[size_t(r) * KG],
+                     &ewg[size_t(r) * KG]);
+    float* dxg = up(xg);
+    int* deig = dev<int>(eig.size());
+    CK(cudaMemcpy(deig, eig.data(), eig.size() * 4, cudaMemcpyHostToDevice));
+    float* dewg = up(ewg);
+    MoeScratch sg{};
+    sg.pairs = dev<int>(size_t(RG) * KG);
+    sg.tasks = dev<MoeTask>(size_t(RG) * KG);
+    sg.n_tasks = dev<int>(1);
+    sg.down_buf = dev<float>(size_t(RG) * KG * HG);
+    sg.stage_elems = std::max(size_t(RG) * HG, size_t(RG) * KG * IG);
+    const size_t qa = (sg.stage_elems + 255) / 256 * 256;
+    const size_t qd = (((sg.stage_elems + 31) / 32) * sizeof(float) + 255) / 256 * 256;
+    const size_t qs = (((sg.stage_elems + 15) / 16) * sizeof(float) + 255) / 256 * 256;
+    uint8_t* sbuf = dev<uint8_t>(std::max(sg.stage_elems * sizeof(bf16), qa + qd + qs));
+    sg.q8_a = reinterpret_cast<int8_t*>(sbuf);
+    sg.q8_d = reinterpret_cast<float*>(sbuf + qa);
+    sg.q8_s = reinterpret_cast<float*>(sbuf + qa + qd);
+    sg.bf16_a = reinterpret_cast<bf16*>(sbuf);
+    sg.chunk_rows = RG;
+    sg.max_experts = EG;
+    sg.max_top_k = KG;
+    float* d_act_g = dev<float>(size_t(RG) * KG * IG);
+    float* d_y_g = dev<float>(size_t(RG) * HG);
+    float* d_act_1 = dev<float>(size_t(KG) * IG);
+    float* d_y_1 = dev<float>(size_t(HG));
+    const BlockType& qbt = block_type(FLYX_DT_GGML_Q8_0);
+    for (int packed : {1, 0}) {
+      ExpertMat wgu{}, wdn{};
+      wgu.n_experts = wdn.n_experts = EG;
+      wgu.N = 2 * IG;
+      wdn.N = HG;
+      if (packed) {
+        wgu.blk = up_blocks(FLYX_DT_GGML_Q8_0, random_blocks(qbt, size_t(EG) * 2 * IG * (HG / 32)), EG * 2 * IG);
+        wdn.blk = up_blocks(FLYX_DT_GGML_Q8_0, random_blocks(qbt, size_t(EG) * HG * (IG / 32)), EG * HG);
+        wgu.blk.q8 = wdn.blk.q8 = true;
+      } else {
+        Vec gu = randv(size_t(EG) * 2 * IG * HG, 0.1), dn = randv(size_t(EG) * HG * IG, 0.1);
+        round_bf16(gu);
+        round_bf16(dn);
+        wgu.w = up_bf16(gu);
+        wdn.w = up_bf16(dn);
+      }
+      const char* name = packed ? "Q8_0" : "bf16";
+      const int grouped = moe_gate_up(dxg, HG, wgu, deig, RG, KG, IG, HG, beta, lb, true, d_act_g, IG, &sg, TL);
+      moe_down(d_act_g, IG, wdn, deig, dewg, RG, KG, HG, IG, d_y_g, HG, false, &sg, TL, nullptr, grouped);
+      const Vec yg = down(d_y_g, size_t(RG) * HG);
+      bool same = true;
+      for (int rr : {0, 1, 33, 68, 69}) {
+        moe_gate_up(dxg + size_t(rr) * HG, HG, wgu, deig + size_t(rr) * KG, 1, KG, IG, HG, beta, lb, true, d_act_1, IG,
+                    &sg, TL);
+        moe_down(d_act_1, IG, wdn, deig + size_t(rr) * KG, dewg + size_t(rr) * KG, 1, KG, HG, IG, d_y_1, HG, false,
+                 &sg, TL);
+        const Vec y1 = down(d_y_1, size_t(HG));
+        same &= std::memcmp(y1.data(), yg.data() + size_t(rr) * HG, size_t(HG) * sizeof(double)) == 0;
+      }
+      std::printf("  %-4s moe grouping of %d experts, %d pairs: rows alone == R=%d (%s)\n", same ? "ok" : "FAIL", EG,
+                  RG * KG, RG, name);
+      if (!same) ++g_fail;
+      if (packed) {
+        cudaFree(const_cast<uint8_t*>(wgu.blk.data));
+        cudaFree(const_cast<uint16_t*>(wgu.blk.scales));
+        cudaFree(const_cast<uint8_t*>(wdn.blk.data));
+        cudaFree(const_cast<uint16_t*>(wdn.blk.scales));
+      } else {
+        cudaFree(const_cast<bf16*>(wgu.w));
+        cudaFree(const_cast<bf16*>(wdn.w));
+      }
+    }
+    cudaFree(dxg);
+    cudaFree(deig);
+    cudaFree(dewg);
+    cudaFree(sg.pairs);
+    cudaFree(sg.tasks);
+    cudaFree(sg.n_tasks);
+    cudaFree(sg.down_buf);
+    cudaFree(sbuf);
+    cudaFree(d_act_g);
+    cudaFree(d_y_g);
+    cudaFree(d_act_1);
+    cudaFree(d_y_1);
+  }
+
   cudaFree(d_x);
   cudaFree(d_eidx);
   cudaFree(d_ew);
-  cudaFree(msc.counts);
-  cudaFree(msc.offsets);
   cudaFree(msc.pairs);
   cudaFree(msc.tasks);
   cudaFree(msc.n_tasks);
@@ -2079,177 +2562,173 @@ void test_inkling2_sublayer_fusion() {
     cudaFree(d_got);
   }
 
-  // 2. shortconv_res_mix_norm bit-identical across U=5 (H=2560) & U=10 (H=3072), R=1 & R=8,
-  //    res_push=false/true, nb=0/5, and all 4 SublayerNorm modes (None, F32, MoeQ8, AttnQ8Split).
   struct Case {
-    int R, H, nb, nq;
-    bool res_push, direct, moe_mins;
+    int rows, H, M, nq;
     SublayerNorm norm;
-    const char* name;
+    bool push, direct, moe_mins;
+    bool shift_xsrc = false;
   };
-  const Case cases[] = {
-      {1, 2560, 0, 1, false, true, false, SublayerNorm::None, "R=1 H=2560 nb=0 None direct"},
-      {8, 2560, 5, 3, true, false, false, SublayerNorm::None, "R=8 H=2560 nb=5 nq=3 push None"},
-      {8, 2560, 5, 1, true, false, false, SublayerNorm::F32, "R=8 H=2560 nb=5 push F32"},
-      {8, 2560, 5, 1, false, false, false, SublayerNorm::MoeQ8, "R=8 H=2560 nb=5 MoeQ8"},
-      {1, 2560, 5, 1, true, true, true, SublayerNorm::MoeQ8, "R=1 H=2560 nb=5 push MoeQ8+mins direct"},
-      {8, 2560, 5, 1, false, false, false, SublayerNorm::AttnQ8Split, "R=8 H=2560 nb=5 nq=1 AttnQ8Split"},
-      {8, 2560, 5, 3, true, false, false, SublayerNorm::AttnQ8Split, "R=8 H=2560 nb=5 nq=3 push AttnQ8Split"},
-      {4, 3072, 3, 3, true, false, false, SublayerNorm::AttnQ8Split, "R=4 H=3072 (U=10) nb=3 nq=3 AttnQ8Split"},
+  using Norm = SublayerNorm;
+  std::vector<Case> cases{
+      {16, 2304, 1, 1, Norm::None, false, true, false},
+      {16, 2308, 5, 2, Norm::None, true, false, false},    // partial warp of float4s
+      {16, 2305, 7, 3, Norm::None, false, true, false},    // scalar loads
+      {16, 2560, 16, 4, Norm::None, true, false, false},
+      {16, 2304, 10, 3, Norm::None, true, false, false},
+      {16, 2304, 9, 1, Norm::None, false, false, false},
+      {16, 2560, 6, 1, Norm::F32, true, false, false},
+      {16, 3072, 17, 1, Norm::F32, false, true, false},
+      {16, 3069, 10, 1, Norm::F32, false, false, false},   // scalar mix and a partial RMSNorm warp
+      {16, 2304, 8, 1, Norm::MoeQ8, false, false, false},
+      {16, 2560, 7, 1, Norm::MoeQ8, true, true, true},
+      {16, 5120, 3, 1, Norm::MoeQ8, false, true, true},
+      {16, 2304, 9, 1, Norm::AttnQ8Split, false, false, false},
+      {16, 2304, 10, 3, Norm::AttnQ8Split, true, false, false},
+      {16, 2304, 10, 3, Norm::AttnQ8Split, true, false, false, true},
+      {16, 2592, 15, 1, Norm::AttnQ8Split, false, false, false},
+      {16, 3072, 17, 3, Norm::AttnQ8Split, true, false, false},
+      {16, 5120, 4, 3, Norm::AttnQ8Split, true, false, false},
   };
+  // The compact bank makes every legal state count and row count inexpensive to exercise.
+  for (int m = 1; m <= 64; ++m)
+    cases.push_back({1 + (m - 1) % 16, 160, m, 1 + (m - 1) % 4, Norm::None, (m % 2) == 0, false, false});
+
+  // Separate scratch keeps all generic Q8 and split bits available across the prefix launches.
+  const size_t scratch_size = scratch_bytes(16, 5120, false);
+  uint8_t* scratch_mem = dev<uint8_t>(scratch_size);
+  const Scratch scratch = scratch_carve(scratch_mem, scratch_size, 16, 5120, false);
+  Launch fused_launch = TL;
+  fused_launch.scratch = &scratch;
+  auto moe_scratch = [](const Scratch& s) {
+    MoeScratch moe{};
+    moe.q8_a = s.q8;
+    moe.q8_d = s.q8_scale;
+    moe.q8_s = s.q8_sums;
+    return moe;
+  };
+  const MoeScratch msc_ref = moe_scratch(*TL.scratch), msc_got = moe_scratch(scratch);
+
   for (const Case& tc : cases) {
-    const int R = tc.R, H = tc.H, nb = tc.nb, nq = tc.nq, conv = 4, hist = conv - 1;
+    const int R = tc.rows, H = tc.H, nb = tc.M - 1 - int(tc.push), nq = tc.nq, conv = 4, hist = conv - 1;
     const int ch_off = 256, ch_total = ch_off + H;
-    seed("inkling2_sublayer_fusion", R, H, nb, nq, int(tc.res_push), int(tc.norm), int(tc.moe_mins));
-    Vec raw = randv(size_t(R) * H, 1.0);
-    Vec cw = randv(size_t(H) * conv, 0.3);
-    Vec st0 = randv(size_t(hist) * ch_total, 0.5);
-    Vec xsrc = randv(size_t(R) * H, 0.9);
-    Vec bank0 = randv(size_t(nb + 1) * R * H, 0.8);
-    Vec queries = randv(size_t(nq) * H, 0.5);
-    Vec nw = randv(H, 0.5);
+    const size_t w_stride = size_t(hist) * ch_total, r_stride = size_t(R) * ch_total;
+    const size_t elems = size_t(R) * H;
+    const int next_sel = tc.direct ? kSlotNext : -1;
     const float noff = 0.f, neps = 1e-6f;
-
+    seed("inkling2_sublayer_fusion", R, H, nb, nq, int(tc.push), int(tc.norm), int(tc.moe_mins));
     DevParams* P = params(0, 0);
-    const size_t w_stride = size_t(hist) * ch_total;
-    const size_t r_stride = size_t(R) * ch_total;
-    std::vector<float> h_st0(st0.begin(), st0.end());
-    float* d_raw = up(raw);
-    float* d_cw = up(cw);
-    float* d_xsrc = up(xsrc);
-    float* d_q = up(queries);
-    float* d_nw = up(nw);
-
+    float* d_raw = up(randv(elems, 1.0));
+    float* d_cw = up(randv(size_t(H) * conv, 0.3));
+    Vec xsrc = randv(elems, 0.9);
+    if (tc.shift_xsrc) xsrc.insert(xsrc.begin(), 0.);
+    float* xsrc_storage = up(xsrc);
+    float* d_xsrc = xsrc_storage + int(tc.shift_xsrc);
+    float* d_q = up(randv(size_t(nq) * H, 0.5));
+    float* d_nw = up(randv(H, 0.5));
+    Vec st0 = randv(w_stride, 0.5);
+    std::vector<float> history(st0.begin(), st0.end());
     float* d_win_ref = dev<float>(FLYX_ROUND_SLOTS * w_stride);
     float* d_win_got = dev<float>(FLYX_ROUND_SLOTS * w_stride);
-    CK(cudaMemcpy(d_win_ref, h_st0.data(), w_stride * sizeof(float), cudaMemcpyHostToDevice));
-    CK(cudaMemcpy(d_win_got, h_st0.data(), w_stride * sizeof(float), cudaMemcpyHostToDevice));
+    CK(cudaMemcpy(d_win_ref, history.data(), w_stride * sizeof(float), cudaMemcpyHostToDevice));
+    CK(cudaMemcpy(d_win_got, d_win_ref, w_stride * sizeof(float), cudaMemcpyDeviceToDevice));
     float* d_rep_ref = dev<float>(kGdnReplaySlots * r_stride);
     float* d_rep_got = dev<float>(kGdnReplaySlots * r_stride);
-    float* d_bank_ref = up(bank0);
-    float* d_bank_got = up(bank0);
-    float* d_x_ref = up(xsrc);
-    float* d_x_got = dev<float>(size_t(R) * H);
-    float* d_mix_ref = dev<float>(size_t(nq) * R * H);
-    float* d_mix_got = dev<float>(size_t(nq) * R * H);
-    float* d_ny_ref = dev<float>(size_t(R) * H);
-    float* d_ny_got = dev<float>(size_t(R) * H);
+    float* d_bank_ref = up(randv(size_t(nb + 1) * elems, 0.8));
+    float* d_bank_got = dev<float>(size_t(nb + 1) * elems);
+    // A shifted x_src selects the original fused scalar dot order even when x_dst is aligned.
+    // The unfused mix sees the current residual, so shift that input to reproduce the same lane ownership.
+    float* xref_storage = up(xsrc);
+    float* d_x_ref = xref_storage + int(tc.shift_xsrc);
+    float* d_x_got = dev<float>(elems);
+    float* d_mix_ref = dev<float>(nq * elems);
+    float* d_mix_got = dev<float>(nq * elems);
+    float* d_ny_ref = dev<float>(elems);
+    float* d_ny_got = dev<float>(elems);
 
-    // Reference: separate shortconv_pass + res_push + attn_res_mix + norm.
-    const int next_sel = tc.direct ? kSlotNext : -1;
-    int eff_nb = nb;
-    if (tc.res_push) {
-      CK(cudaMemcpy(d_bank_ref + size_t(nb) * R * H, d_x_ref, size_t(R) * H * sizeof(float), cudaMemcpyDeviceToDevice));
-      ++eff_nb;
-    }
+    if (tc.push)
+      CK(cudaMemcpy(d_bank_ref + nb * elems, d_x_ref, elems * sizeof(float), cudaMemcpyDeviceToDevice));
     shortconv_pass(d_raw, H, d_cw, nullptr, d_win_ref, w_stride, kSlotCur, next_sel, kSkipNever, d_rep_ref, r_stride,
-                   kSlotCur, ch_off, ch_total, H, conv, 0, P, R, d_x_ref, H, 0, !tc.res_push);
-    attn_res_mix(d_bank_ref, eff_nb, d_x_ref, d_q, nq, R, H, d_mix_ref, 0);
-
-    MoeScratch msc_ref{}, msc_got{};
-    const size_t q8_n = size_t(R) * H;
-    if (tc.norm == SublayerNorm::MoeQ8) {
-      msc_ref.q8_a = dev<int8_t>(q8_n);
-      msc_ref.q8_d = dev<float>(q8_n / 32);
-      msc_ref.q8_s = dev<float>(q8_n / 16);
-      msc_got.q8_a = dev<int8_t>(q8_n);
-      msc_got.q8_d = dev<float>(q8_n / 32);
-      msc_got.q8_s = dev<float>(q8_n / 16);
-      rmsnorm_moe_q8(d_mix_ref, H, d_nw, noff, neps, d_ny_ref, H, R, H, msc_ref, tc.moe_mins, 0);
-    } else if (tc.norm == SublayerNorm::F32) {
+                   kSlotCur, ch_off, ch_total, H, conv, 0, P, R, d_x_ref, H, 0, !tc.push);
+    attn_res_mix(d_bank_ref, tc.M - 1, d_x_ref, d_q, nq, R, H, d_mix_ref, 0);
+    if (tc.norm == Norm::F32)
       rmsnorm(d_mix_ref, H, d_nw, noff, neps, d_ny_ref, H, R, H, 0);
-    }
-
-    // Separate Scratch buffers for AttnQ8Split comparison.
-    std::vector<uint8_t> ref_q8, got_q8;
-    std::vector<float> ref_d, got_d, ref_s, got_s;
-    std::vector<uint16_t> ref_hi, got_hi, ref_mid, got_mid, ref_lo, got_lo;
-    if (tc.norm == SublayerNorm::AttnQ8Split) {
+    else if (tc.norm == Norm::MoeQ8)
+      rmsnorm_moe_q8(d_mix_ref, H, d_nw, noff, neps, d_ny_ref, H, R, H, msc_ref, tc.moe_mins, 0);
+    else if (tc.norm == Norm::AttnQ8Split)
       rmsnorm_q8_split(d_mix_ref, H, d_nw, noff, neps, R, H, TL);
-      CK(cudaDeviceSynchronize());
-      ref_q8.resize(q8_n);
-      ref_d.resize(q8_n / 32);
-      ref_s.resize(q8_n / 16);
-      ref_hi.resize(q8_n);
-      ref_mid.resize(q8_n);
-      ref_lo.resize(q8_n);
-      const size_t scap = TL.scratch->split_cap;
-      CK(cudaMemcpy(ref_q8.data(), TL.scratch->q8, q8_n, cudaMemcpyDeviceToHost));
-      CK(cudaMemcpy(ref_d.data(), TL.scratch->q8_scale, ref_d.size() * 4, cudaMemcpyDeviceToHost));
-      CK(cudaMemcpy(ref_s.data(), TL.scratch->q8_sums, ref_s.size() * 4, cudaMemcpyDeviceToHost));
-      CK(cudaMemcpy(ref_hi.data(), TL.scratch->split, q8_n * 2, cudaMemcpyDeviceToHost));
-      CK(cudaMemcpy(ref_mid.data(), TL.scratch->split + scap, q8_n * 2, cudaMemcpyDeviceToHost));
-      CK(cudaMemcpy(ref_lo.data(), TL.scratch->split + 2 * scap, q8_n * 2, cudaMemcpyDeviceToHost));
-      CK(cudaMemset(TL.scratch->q8, 0x55, q8_n));
-      CK(cudaMemset(TL.scratch->split, 0x55, q8_n * 2));
-      CK(cudaMemset(TL.scratch->split + scap, 0x55, q8_n * 2));
-      CK(cudaMemset(TL.scratch->split + 2 * scap, 0x55, q8_n * 2));
-    }
 
-    // Fused: shortconv_res_mix_norm.
-    SublayerPostConv spc{d_raw,    d_cw,  d_win_got, w_stride, kSlotCur, next_sel, kSkipNever,
-                         d_rep_got, r_stride, kSlotCur,  ch_off,   ch_total, conv,     tc.res_push};
-    shortconv_res_mix_norm(spc, d_xsrc, d_x_got, d_bank_got, nb, d_q, nq,
-                           (tc.norm == SublayerNorm::None || nq > 1) ? d_mix_got : nullptr, tc.norm, d_nw, noff, neps,
-                           d_ny_got, H, tc.norm == SublayerNorm::MoeQ8 ? &msc_got : nullptr, tc.moe_mins, P, R, H, TL);
+    // Every prefix has the same causal ShortConv inputs. Only the strides between bank states and
+    // between query outputs change. The separately launched operations at R give one oracle for all prefixes.
+    for (int rows = 1; rows <= R; ++rows) {
+      if (rows != 1 && rows != 4 && rows != 8 && rows != R) continue;
+      const size_t count = size_t(rows) * H, bytes = count * sizeof(float);
+      if (nb)
+        CK(cudaMemcpy2D(d_bank_got, bytes, d_bank_ref, elems * sizeof(float), bytes, nb, cudaMemcpyDeviceToDevice));
+      if (tc.push) CK(cudaMemset(d_bank_got + nb * count, 0x55, bytes));
+      CK(cudaMemset(d_x_got, 0x55, bytes));
+      CK(cudaMemset(d_mix_got, 0x55, nq * bytes));
+      CK(cudaMemset(d_ny_got, 0x55, bytes));
+      CK(cudaMemset2D(d_rep_got + ch_off, ch_total * sizeof(float), 0x55, H * sizeof(float), rows));
+      if (tc.direct)
+        CK(cudaMemset2D(d_win_got + w_stride + ch_off, ch_total * sizeof(float), 0x55, H * sizeof(float), hist));
+      if (tc.norm == Norm::MoeQ8 || tc.norm == Norm::AttnQ8Split) CK(cudaMemset(scratch_mem, 0x55, scratch_size));
 
-    const std::string tag = std::string("sublayer ") + tc.name;
-    expect_device_bits(tag + " x_dst", d_x_got, d_x_ref, size_t(R) * H);
-    expect_device_bits(tag + " replay", d_rep_got, d_rep_ref, r_stride);
-    if (tc.res_push) expect_device_bits(tag + " bank push", d_bank_got + size_t(nb) * R * H, d_bank_ref + size_t(nb) * R * H, size_t(R) * H);
-    if (tc.direct) expect_device_bits(tag + " win_out", d_win_got + w_stride, d_win_ref + w_stride, w_stride);
-    if (tc.norm == SublayerNorm::None) {
-      expect_device_bits(tag + " mix_out", d_mix_got, d_mix_ref, size_t(nq) * R * H);
-    } else if (tc.norm == SublayerNorm::F32) {
-      expect_device_bits(tag + " norm_y", d_ny_got, d_ny_ref, size_t(R) * H);
-    } else if (tc.norm == SublayerNorm::MoeQ8) {
-      expect_device_bits(tag + " moe norm_y", d_ny_got, d_ny_ref, size_t(R) * H);
-      expect_device_bits(tag + " moe q8_d", msc_got.q8_d, msc_ref.q8_d, q8_n / 32);
-      if (tc.moe_mins) expect_device_bits(tag + " moe q8_s", msc_got.q8_s, msc_ref.q8_s, q8_n / 16);
-      std::vector<int8_t> qa(q8_n), qb(q8_n);
-      CK(cudaMemcpy(qa.data(), msc_got.q8_a, q8_n, cudaMemcpyDeviceToHost));
-      CK(cudaMemcpy(qb.data(), msc_ref.q8_a, q8_n, cudaMemcpyDeviceToHost));
-      const bool q_ok = qa == qb;
-      std::printf("  %-4s %-48s %s\n", q_ok ? "ok" : "FAIL", (tag + " moe q8_a").c_str(),
-                  q_ok ? "bit-identical" : "BIT MISMATCH");
-      g_fail += !q_ok;
-    } else if (tc.norm == SublayerNorm::AttnQ8Split) {
-      CK(cudaDeviceSynchronize());
-      got_q8.resize(q8_n);
-      got_d.resize(q8_n / 32);
-      got_s.resize(q8_n / 16);
-      got_hi.resize(q8_n);
-      got_mid.resize(q8_n);
-      got_lo.resize(q8_n);
-      const size_t scap = TL.scratch->split_cap;
-      CK(cudaMemcpy(got_q8.data(), TL.scratch->q8, q8_n, cudaMemcpyDeviceToHost));
-      CK(cudaMemcpy(got_d.data(), TL.scratch->q8_scale, got_d.size() * 4, cudaMemcpyDeviceToHost));
-      CK(cudaMemcpy(got_s.data(), TL.scratch->q8_sums, got_s.size() * 4, cudaMemcpyDeviceToHost));
-      CK(cudaMemcpy(got_hi.data(), TL.scratch->split, q8_n * 2, cudaMemcpyDeviceToHost));
-      CK(cudaMemcpy(got_mid.data(), TL.scratch->split + scap, q8_n * 2, cudaMemcpyDeviceToHost));
-      CK(cudaMemcpy(got_lo.data(), TL.scratch->split + 2 * scap, q8_n * 2, cudaMemcpyDeviceToHost));
-      const bool ok_all = got_q8 == ref_q8 && got_d == ref_d && got_s == ref_s && got_hi == ref_hi &&
-                          got_mid == ref_mid && got_lo == ref_lo;
-      std::printf("  %-4s %-48s %s\n", ok_all ? "ok" : "FAIL", (tag + " q8+split").c_str(),
-                  ok_all ? "bit-identical" : "BIT MISMATCH");
-      g_fail += !ok_all;
-      if (nq > 1)
-        expect_device_bits(tag + " mix_out[1..nq-1]", d_mix_got + size_t(R) * H, d_mix_ref + size_t(R) * H,
-                           size_t(nq - 1) * R * H);
-    }
+      SublayerPostConv spc{d_raw, d_cw, d_win_got, w_stride, kSlotCur, next_sel, kSkipNever,
+                           d_rep_got, r_stride, kSlotCur, ch_off, ch_total, conv, tc.push};
+      shortconv_res_mix_norm(spc, d_xsrc, d_x_got, d_bank_got, nb, d_q, nq,
+                             tc.norm == Norm::None || nq > 1 ? d_mix_got : nullptr, tc.norm, d_nw, noff, neps,
+                             d_ny_got, H, tc.norm == Norm::MoeQ8 ? &msc_got : nullptr, tc.moe_mins, P, rows, H,
+                             fused_launch);
 
-    if (tc.norm == SublayerNorm::MoeQ8) {
-      cudaFree(msc_ref.q8_a);
-      cudaFree(msc_ref.q8_d);
-      cudaFree(msc_ref.q8_s);
-      cudaFree(msc_got.q8_a);
-      cudaFree(msc_got.q8_d);
-      cudaFree(msc_got.q8_s);
+      const std::string tag = "sublayer R=" + std::to_string(rows) + "/" + std::to_string(R) +
+                              " H=" + std::to_string(H) + " M=" + std::to_string(tc.M) + " nq=" + std::to_string(nq) +
+                              " norm=" + std::to_string(int(tc.norm)) + (tc.shift_xsrc ? " shifted x_src" : "");
+      bool ok = true;
+      auto check = [&](const std::string& name, const auto* got, const auto* ref, size_t n) {
+        const size_t nbytes = n * sizeof(*got);
+        std::vector<uint8_t> a(nbytes), b(nbytes);
+        CK(cudaMemcpy(a.data(), got, nbytes, cudaMemcpyDeviceToHost));
+        CK(cudaMemcpy(b.data(), ref, nbytes, cudaMemcpyDeviceToHost));
+        const auto diff = std::mismatch(a.begin(), a.end(), b.begin());
+        if (diff.first != a.end()) {
+          std::printf("  FAIL %s %s byte %zu: %02x != %02x\n", tag.c_str(), name.c_str(),
+                      size_t(diff.first - a.begin()), unsigned(*diff.first), unsigned(*diff.second));
+          ok = false;
+        }
+      };
+      check("x_dst", d_x_got, d_x_ref, count);
+      check("replay", d_rep_got, d_rep_ref, size_t(rows) * ch_total);
+      if (tc.push) check("bank push", d_bank_got + nb * count, d_bank_ref + nb * elems, count);
+      if (tc.direct && rows == R) {
+        check("next window", d_win_got + w_stride, d_win_ref + w_stride, w_stride);
+      } else if (tc.direct) {
+        // The saved window ends at the last row of this prefix.
+        for (int k = 0; k < hist; ++k) {
+          const int t = rows - hist + k;
+          const float* expected = t < 0 ? d_win_ref + size_t(hist + t) * ch_total + ch_off : d_raw + size_t(t) * H;
+          check("next window", d_win_got + w_stride + size_t(k) * ch_total + ch_off, expected, H);
+        }
+      }
+      for (int q = tc.norm == Norm::None ? 0 : 1; q < nq; ++q)
+        check("mix q=" + std::to_string(q), d_mix_got + q * count, d_mix_ref + q * elems, count);
+      if (tc.norm == Norm::F32 || tc.norm == Norm::MoeQ8) check("norm_y", d_ny_got, d_ny_ref, count);
+      if (tc.norm == Norm::MoeQ8 || tc.norm == Norm::AttnQ8Split) {
+        check("Q8 bytes", scratch.q8, TL.scratch->q8, count);
+        check("Q8 scales", scratch.q8_scale, TL.scratch->q8_scale, count / 32);
+        if (tc.moe_mins || tc.norm == Norm::AttnQ8Split)
+          check("Q8 sums", scratch.q8_sums, TL.scratch->q8_sums, count / 16);
+      }
+      if (tc.norm == Norm::AttnQ8Split)
+        for (int i = 0; i < 3; ++i)
+          check("BF16 part " + std::to_string(i), scratch.split + i * scratch.split_cap,
+                TL.scratch->split + i * TL.scratch->split_cap, count);
+      if (ok) std::printf("  ok   %-48s bit-identical\n", tag.c_str());
+      g_fail += !ok;
     }
     cudaFree(P);
     cudaFree(d_raw);
     cudaFree(d_cw);
-    cudaFree(d_xsrc);
+    cudaFree(xsrc_storage);
     cudaFree(d_q);
     cudaFree(d_nw);
     cudaFree(d_win_ref);
@@ -2258,13 +2737,14 @@ void test_inkling2_sublayer_fusion() {
     cudaFree(d_rep_got);
     cudaFree(d_bank_ref);
     cudaFree(d_bank_got);
-    cudaFree(d_x_ref);
+    cudaFree(xref_storage);
     cudaFree(d_x_got);
     cudaFree(d_mix_ref);
     cudaFree(d_mix_got);
     cudaFree(d_ny_ref);
     cudaFree(d_ny_got);
   }
+  cudaFree(scratch_mem);
 }
 
 void test_inkling2_rel_prep_kv_sc() {

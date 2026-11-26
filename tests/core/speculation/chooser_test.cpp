@@ -640,24 +640,69 @@ int main() {
   }
 
     // A run widened past the drafter's adaptive round (checkpoints up to 7, the run's next width 15) keeps the fixed
-    // width; without a run the adaptive round is the preferred one.
+    // width; both fixed and adaptive rounds reaching kRunWidth trigger widening, sustained 15-draft runs stay at 15,
+    // and shorter adaptive rounds or broken runs return to adaptive stopping.
   {
-    const std::vector<int> widths = {0, 3, 7, 15};
-    const std::vector<int> drafters = {-1, 0, 0, 0};
-    const std::vector<double> costs = {12.7, 14.4, 15.2, 19.1};
+    const std::vector<int> widths = {0, 1, 3, 5, 7, 15};
+    const std::vector<int> drafters = {-1, 0, 0, 0, 0, 0};
+    const std::vector<double> costs = {12.7, 13.5, 14.4, 14.8, 15.2, 19.1};
     const std::vector<int> lk_widths = {};
-    const std::vector<std::vector<int>> cps = {{3, 7}};
+    const std::vector<std::vector<int>> cps = {{1, 3, 5, 7}};
     RoundChooser rc;
     rc.configure(&widths, &drafters, &costs, &lk_widths, nullptr, nullptr, &cps);
     rc.begin(false, true, true);
     const RoundChoice first = rc.next({}, 0);
     check(first.adaptive, "no run: the adaptive round");
-    RoundChoice seven{false, 2, 7, 0, false};
-    rc.commit(seven, 0);
-    rc.result(seven, true, 6, {}, 0, true);
+    // Short adaptive checkpoint (actual_width=3 accepted whole) must not widen to 15.
+    rc.result(first, true, 3, {}, 0, true, 0, 3);
+    const RoundChoice still_adapt = rc.next({}, 0);
+    check(still_adapt.adaptive, "adaptive round stopping at width 3 stays adaptive (no premature widening)");
+    // Adaptive round reaching checkpoint 7 with accepted=6 widens next round to fixed 15.
+    rc.result(still_adapt, true, 6, {}, 0, true, 0, 7);
     const RoundChoice wide = rc.next({}, 0);
-    check(!wide.adaptive && wide.width == 15, "a run widened to 15 past adaptive checkpoints up to 7: fixed 15 (" +
+    check(!wide.adaptive && wide.width == 15, "adaptive run at width 7 widens past checkpoints up to 7 to fixed 15 (" +
                                                   std::to_string(wide.width) + (wide.adaptive ? ", adaptive)" : ")"));
+    // Sustained 15-draft run stays on fixed 15 instead of oscillating back to adaptive 7.
+    rc.result(wide, true, 14, {}, 0, true);
+    const RoundChoice hold = rc.next({}, 0);
+    check(!hold.adaptive && hold.width == 15, "sustained 15-draft run holds fixed 15 (" +
+                                                  std::to_string(hold.width) + (hold.adaptive ? ", adaptive)" : ")"));
+    // Once the 15-draft streak breaks, immediately return to adaptive stopping.
+    rc.result(hold, true, 4, {}, 0, true);
+    const RoundChoice back = rc.next({}, 0);
+    check(back.adaptive, "broken 15-draft streak returns immediately to adaptive round");
+  }
+
+    // Where the controller prefers a width past the adaptive round's widest checkpoint (wide rounds nearly free: 7
+    // drafts preferred, checkpoints up to 3), the adaptive round runs and is scored as the plan of its widest
+    // checkpoint; a fixed round's tokens train the stopper's throughput at that round's own cost, not the widest's.
+  {
+    const std::vector<int> widths = {0, 1, 3, 7};
+    const std::vector<int> drafters = {-1, 0, 0, 0};
+    const std::vector<double> costs = {10.0, 10.05, 10.1, 10.2};
+    const std::vector<int> lk_widths = {};
+    const std::vector<std::vector<int>> cps = {{1, 3}};
+    RoundChooser rc;
+    rc.configure(&widths, &drafters, &costs, &lk_widths, nullptr, nullptr, &cps);
+    rc.begin(false, true, true);
+    std::vector<RoundCandidate> cands;
+    rc.candidates({}, 0, &cands);
+    const bool adaptive_first = !cands.empty() && cands.front().preferred && cands.front().choice.adaptive;
+    const bool prefers_7 = cands.size() > 1 && !cands[1].choice.adaptive && cands[1].choice.width == 7;
+    const RoundCandidate* three = nullptr;  // the fixed candidate of 3, scored as its own plan
+    for (const RoundCandidate& c : cands)
+      if (!c.choice.adaptive && c.choice.width == 3) three = &c;
+    check(adaptive_first && prefers_7 && three && cands.front().choice.width == 3 &&
+              cands.front().expected_tokens == three->expected_tokens && cands.front().solo_ms == three->solo_ms,
+          "a preferred 7 past adaptive checkpoints up to 3: the adaptive round, scored as the plan of 3");
+    // A fixed round of 7 accepted whole, through the chooser: lambda moves toward 8 tokens over 7's own cost.
+    const float lam0 = rc.stop_policy(0)->lambda;
+    const RoundChoice seven{false, 3, 7, 0, false};
+    rc.commit(seven, 0);
+    rc.result(seven, true, 7, std::vector<int32_t>(8, 1), 0, true);
+    const double want = 0.9 * double(lam0) + 0.1 * 8.0 / 10.2;
+    check(std::fabs(double(rc.stop_policy(0)->lambda) - want) < 1e-6,
+          "a fixed round of 7 past checkpoints up to 3 trains the stopper at its own cost (10.2 ms), not 3's (10.1)");
   }
 
     // ConfidenceStopper online calibration + RoundChooser adaptive candidate selection (solo adaptive, batched fixed).

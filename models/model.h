@@ -120,6 +120,7 @@ class Model : public interfaces::Model {
   const char* drafter() const override { return drafter_names_.c_str(); }
   std::vector<int> draft_widths(int d) const override;
   std::vector<int> adaptive_checkpoints(int d) const override;
+  bool draft_steps_cheap(int d) const override;
   int block_drafts(int d) const override;
   int trained_ctx() const override { return trained_ctx_; }
   bool drafts_trees(int d) const override;

@@ -190,6 +190,16 @@ BlockTables build() {
   };
   t.iq3xxs_scaled = iq3_scaled(0, selectors(iq3xxs_grid, 256, 4, &s16));
   t.iq3xxs = upload(s16);
+  std::vector<uint32_t> iq3xxs_signed_rows(16 * 256);
+  for (unsigned i = 0; i < iq3xxs_signed_rows.size(); ++i) {
+    const uint32_t row = iq3xxs_grid[i & 255u];
+    for (int j = 0; j < 4; ++j) {
+      const int magnitude = int((row >> (8 * j)) & 255u);
+      const int value = (i & (1u << (8 + j))) ? -magnitude : magnitude;
+      iq3xxs_signed_rows[i] |= uint32_t(uint8_t(value)) << (8 * j);
+    }
+  }
+  t.iq3xxs_signed_rows = upload(iq3xxs_signed_rows);
   t.iq3s_scaled = iq3_scaled(1, selectors(iq3s_grid, 512, 4, &s16));
   t.iq3s = upload(s16);
 

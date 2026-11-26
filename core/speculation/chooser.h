@@ -174,7 +174,9 @@ class RoundChooser {
   // round of that drafter goes one width wider (a DFlash2 block of 8 drafting 15: basalt's wide block after a window
   // that kept most of a block).  Its drafts past the chain are accepted far more often after such a round than on
   // average, where the controller's per-width choice cannot see it (RTX PRO 6000, the 27B's 7 -> 15 drafts cost
-  // 15.2 -> 19.1 ms).
+  // 15.2 -> 19.1 ms).  An adaptive round counts by the drafts it verified (its checkpoint), so one that verified
+  // kRunWidth or more and kept all but one starts a run too; a run the drafter has no wider round for holds its width,
+  // and a width past the adaptive round's reach stays a fixed round while its runs last.
   // Only while it pays: every wider round of a drafter (past kRunWidth drafts) is held against the kRunWidth round it
   // replaced, as if that round had kept the same first drafts (its tokens min(accepted, kRunWidth) + 1, at its cost),
   // over the last ten or so such rounds of the reply; wider rounds that give fewer tokens a millisecond stop it (prose

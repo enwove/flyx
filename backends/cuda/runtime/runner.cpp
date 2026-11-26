@@ -17,10 +17,13 @@ namespace flyx::cuda {
 
 namespace {
 
+// The pass's result reaches the host through a kernel's stores into the ring's mapped mirror: in CUPTI traces of
+// Inkling-2 rounds (RTX 5070 Ti, Windows) a device-to-host copy node there started 50 to 150 us after the round's last
+// kernel, where a kernel follows it at once.
 void copy_ring(flyx_seq* s, cudaStream_t st, bool drain = true) {
   if (drain && !s->page_layers.empty())
     kv_drain_pageable(s->page_drain_dev, int(s->page_layers.size()), s->P, s->ring_dev, s->m->wide_rows, st);
-  CK(cudaMemcpyAsync(s->ring_host, s->ring_dev, sizeof(flyx_round_result) * kRing, cudaMemcpyDeviceToHost, st));
+  ring_publish(s->ring_dev, s->ring_host_dev, s->P, st);
 }
 
 void copy_ring(flyx_seq* s, bool drain = true) { copy_ring(s, s->st, drain); }
@@ -813,9 +816,9 @@ int encode_vision(flyx_plan* p, const flyx_vision_input* in, float* out_embeds, 
     int32_t* d_cu = d_gw + N;
     void* sc_mem = take(sc_bytes);
     Scratch sc = scratch_carve(sc_mem, sc_bytes, N, max_k, need_q8, need_a4, false, need_a4);
+    if (sc.round_count) CK(cudaMemsetAsync(sc.round_count, 0, sc.round_count_cap * sizeof(int), sg.st));
     if (need_q8) {
       if (sc.q8_count) CK(cudaMemsetAsync(sc.q8_count, 0, kQ8Tiles * sizeof(int), sg.st));
-      if (sc.round_count) CK(cudaMemsetAsync(sc.round_count, 0, sc.round_count_cap * sizeof(int), sg.st));
       if (sc.side_count) CK(cudaMemsetAsync(sc.side_count, 0, sc.side_count_cap * sizeof(int), sg.st));
     }
 
@@ -1315,8 +1318,9 @@ RoundPass round_pass(flyx_plan* p, flyx_seq* s, const flyx_gen_params* g, bool p
 
 #if CUDART_VERSION >= 12040
 // Flat GPU-resident conditional graph for an adaptive round plan:
-// - Sequential drafters (MTP, EAGLE-4): chunk 0 -> decide -> IF(draft chunk 1 -> decide) -> ... -> IF(verify w_j).
-// - Parallel block drafters (DFlash2, DSpark): full block draft -> decide -> IF(verify w_j).
+// - Step-wise drafters (MTP, EAGLE-4, DSpark Markov head): chunk 0 -> decide -> IF(draft chunk 1 -> decide) -> ... ->
+//   IF(verify w_j): the checkpoint the stop is at, or an earlier one where the program allows it (earlier_checkpoints).
+// - Parallel block drafters (DFlash2): full block draft -> decide -> IF(verify w_j).
 // Zero CPU sync; full FLYX_MAX_IN_FLIGHT=2 pipelining; handles reset to 0 on every launch.
 bool capture_adaptive_graph(flyx_plan* p, flyx_seq* s, const RoundPass& r, cudaGraph_t* out, GraphSize* size_out) {
   cudaGraph_t root = nullptr;
@@ -1385,21 +1389,20 @@ bool capture_adaptive_graph(flyx_plan* p, flyx_seq* s, const RoundPass& r, cudaG
     return ok;
   };
 
+  StopCondHandles ver_handles{};
+  for (int j = 0; j < M; ++j) ver_handles.h[j] = static_cast<unsigned long long>(h_ver[size_t(j)]);
   std::vector<cudaGraphNode_t> prev;
   if (seq_draft) {
     if (!capture_into(root, {}, [&] {
           draft_step_range(r.ps, 0, p->checkpoints[0]);
-          stop_decide_step(s->draft_prob, s->draft_margin, s->stop_dev, s->stop_state, 0, 0, p->checkpoints[0],
-                           static_cast<unsigned long long>(h_draft[1]), static_cast<unsigned long long>(h_ver[0]),
-                           s->st);
+          stop_decide_step(s->draft_prob, s->draft_margin, s->stop_dev, s->stop_state, 0, p->checkpoints[0],
+                           static_cast<unsigned long long>(h_draft[1]), ver_handles, p->earlier_checkpoints, s->st);
         }, &prev))
       return false;
   } else {
-    StopCondHandles handles{};
-    for (int j = 0; j < M; ++j) handles.h[j] = static_cast<unsigned long long>(h_ver[size_t(j)]);
     if (!capture_into(root, {}, [&] {
           draft_step_range(r.ps, 0, p->width);
-          stop_decide_block(s->draft_prob, s->draft_margin, s->stop_dev, s->stop_state, handles, s->st);
+          stop_decide_block(s->draft_prob, s->draft_margin, s->stop_dev, s->stop_state, ver_handles, s->st);
         }, &prev))
       return false;
   }
@@ -1422,10 +1425,10 @@ bool capture_adaptive_graph(flyx_plan* p, flyx_seq* s, const RoundPass& r, cudaG
       const int w0 = p->checkpoints[size_t(j - 1)];
       const int w1 = p->checkpoints[size_t(j)];
       const unsigned long long h_nxt = (j + 1 < M) ? static_cast<unsigned long long>(h_draft[size_t(j + 1)]) : 0ull;
-      const unsigned long long h_v = static_cast<unsigned long long>(h_ver[size_t(j)]);
       if (!capture_into(body, {}, [&] {
             draft_step_range(r.ps, w0, w1);
-            stop_decide_step(s->draft_prob, s->draft_margin, s->stop_dev, s->stop_state, j, w0, w1, h_nxt, h_v, s->st);
+            stop_decide_step(s->draft_prob, s->draft_margin, s->stop_dev, s->stop_state, j, w1, h_nxt, ver_handles,
+                             p->earlier_checkpoints, s->st);
           }, nullptr))
         return false;
       bodies.push_back(graph_size(body));

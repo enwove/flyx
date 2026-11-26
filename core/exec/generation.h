@@ -110,6 +110,7 @@ struct GenerateResult {
   int lookup_rounds = 0;                  // rounds whose drafts were looked up in the sequence
   int lookup_accepted = 0;                // their drafts accepted
   std::vector<int> drafter_rounds;        // rounds each drafter drafted (Model::drafter_name), by number
+  int adaptive_rounds = 0;                // rounds launched on a drafter's adaptive plan (its stop rule's rounds)
   // Rounds of each of the engine's rounds to choose from (Engine::widths(), round_name()), and the drafts they
   // accepted: what the speculation controller chose (lookup rounds apart).
   std::vector<int> round_choices, round_accepted;
@@ -170,7 +171,10 @@ class Generation {
   // Follow with commit_round() for the selected candidate before launching.
   bool round_candidates(std::vector<RoundCandidate>* out);
   void commit_round(const RoundChoice& choice, NextRound* out);
-  void launched(const NextRound& r) { launched_[in_flight_++] = r.round; }
+  void launched(const NextRound& r) {
+    launched_[in_flight_++] = r.round;
+    result_.adaptive_rounds += r.g.stop_policy != nullptr;  // prepare_round gives one with the adaptive plan only
+  }
   void launch_failed(const std::string& why) { fail("launch: " + why, true); }
 
  private:

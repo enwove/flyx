@@ -50,6 +50,10 @@ class Model {
   // Sorted verify checkpoints (subset of draft_widths(d)) for an intra-round
   // adaptive stopping plan on drafter d; empty disables adaptive plans for d.
   virtual std::vector<int> adaptive_checkpoints(int /*d*/) const { return {}; }
+  // Whether one more draft of drafter d costs little beside the verify row it adds (a block drafted at once and
+  // refined a draft at a time): an adaptive round that stops may then verify fewer drafts than it has
+  // (flyx_program::earlier_checkpoints).  Where a draft step is a pass of a layer, what is drafted is verified.
+  virtual bool draft_steps_cheap(int /*d*/) const { return false; }
   // The drafts one pass of drafter d's block makes as it was trained (DFlash2: its block less one; MTP: its widest
   // chain): a tree round's trunk.  draft_widths may go past it (a DFlash2 block drafted wider).
   virtual int block_drafts(int d) const = 0;

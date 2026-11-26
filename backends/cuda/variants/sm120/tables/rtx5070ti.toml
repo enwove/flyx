@@ -427,6 +427,21 @@ blocks_q8 = [
 # blocks_q8, passes of 32, 64 and 128 rows: 4234609 us with these rules, 4581724 with the defaults (-7.6%), 4207811 with the best for each
 # blocks_q8, passes of 512 rows: 6198861 us with these rules, 6372700 with the defaults (-2.7%), 6167043 with the best for each
 blocks_round = [
+  # Inkling-2-Mini's dense widths in rounds of 3 and 4 rows (`cuda_bench tune blocks_round Inkling-2-Mini-UD-IQ3_XXS.gguf`,
+  # 2026-11-25, driver 610.88): each shape's best at four rows where it beat the rules below by 3% or more, and the
+  # 201,024-token head's (read every round) at 2%.  None of these widths is the 27B's or 4B's; width 1024, which their
+  # K/V layers share, keeps the rules below.  us a call, rules below -> these: Q8_0 384 99.7 -> 85.9, 2304 288.6 -> 251.3,
+  # 3072 434.8 -> 399.1; Q4_K 3072 32.1 -> 30.8; Q5_K 384 17.0 -> 14.1, 3072 116.5 -> 98.6, 201024 428.0 -> 419.3; Q6_K
+  # 384 63.9 -> 61.0, 3072 89.1 -> 75.1.  Its one-row choices measured no better in whole rounds.
+  { types = ["Q8_0"], rows = [3, 4], n_min = 383, n_max = 384, columns = 4, ahead = 0 },
+  { types = ["Q8_0"], rows = [3, 4], n_min = 2303, n_max = 2304, columns = 2, ahead = 0 },
+  { types = ["Q8_0"], rows = [3, 4], n_min = 3071, n_max = 3072, columns = 4, ahead = 0, staged = 1 },
+  { types = ["Q4_K"], rows = [3, 4], n_min = 3071, n_max = 3072, tensor_cores = "warps" },
+  { types = ["Q5_K"], rows = [3, 4], n_min = 383, n_max = 384, columns = 1, ahead = 0 },
+  { types = ["Q5_K"], rows = [3, 4], n_min = 3071, n_max = 3072, tensor_cores = "warps" },
+  { types = ["Q5_K"], rows = [3, 4], n_min = 201023, n_max = 201024, tensor_cores = "columns" },
+  { types = ["Q6_K"], rows = [3, 4], n_min = 383, n_max = 384, columns = 2, ahead = 0 },
+  { types = ["Q6_K"], rows = [3, 4], n_min = 3071, n_max = 3072, tensor_cores = "warps" },
   { types = ["Q4_0", "Q4_K", "IQ2_S", "IQ1_S"], rows = [1, 1], n_max = 5120, columns = 1, ahead = 2 },
   { types = ["Q3_K"], rows = [1, 1], n_max = 64, kernel = 2, columns = 1, ahead = 0 },
   { types = ["Q4_0", "IQ1_M"], rows = [1, 1], n_min = 64, n_max = 2048, kernel = 2, columns = 4, ahead = 0 },
@@ -526,3 +541,17 @@ blocks_round = [
 # blocks_round, rounds of 6 rows: 468370 us with these rules, 535984 with the defaults (-12.6%), 460468 with the best for each
 # blocks_round, rounds of 8 rows: 490282 us with these rules, 583655 with the defaults (-16.0%), 480056 with the best for each
 # blocks_round, rounds of 16 rows: 616884 us with these rules, 882912 with the defaults (-30.1%), 614595 with the best for each
+# `cuda_bench moe` on Inkling-2-Mini's experts (E 128, top 8, H 2304, I 1152), RTX 5070 Ti, against the original tiles:
+# from 2 rows the 2-bit IQ types take two gate/up pairs a warp (9 to 25% faster at 2 to 16 rows) and IQ4_NL one pair up
+# to 4 rows, two above; IQ3_XXS one pair up to 6 rows, one row included, decoded from a global table of signed rows
+# (8 to 11% faster at 1 to 6 rows), two pairs above (12 to 13% at 8 and 16).  Q4_K and the other types keep original.
+moe_gate_up = [
+  { types = ["IQ2_XXS", "IQ2_XS", "IQ2_S"], rows = [1, 1], columns = 0, units = 0 },
+  { types = ["IQ2_XXS", "IQ2_XS", "IQ2_S"], columns = 2, units = 1 },
+  { types = ["IQ3_XXS"], rows = [1, 6], columns = 1, units = 1 },
+  { types = ["IQ3_XXS"], columns = 2, units = 1 },
+  { types = ["IQ4_NL"], rows = [1, 1], columns = 0, units = 0 },
+  { types = ["IQ4_NL"], rows = [2, 4], columns = 1, units = 1 },
+  { types = ["IQ4_NL"], columns = 2, units = 1 },
+  { columns = 0, units = 0 },
+]

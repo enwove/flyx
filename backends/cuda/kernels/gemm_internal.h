@@ -59,6 +59,9 @@ struct BlockTables {
   const uint16_t* pair_mxfp4_s8; // [256]  the same through MXFP4's 16 values, as int8
   // IQ4's 16 values as int8 (byte i: value i), in registers: k_round_blocks_warps looks a nibble up with byte_perm.
   uint32_t iq4_s8[4];
+  // IQ3_XXS rows with their signs applied: [16][256], entry (s << 8) | row the row's four int8 values with value j
+  // negated where bit j of s is set (one word of a unit, read through the read-only path; FIQ3_XXS::SignedRows).
+  const uint32_t* iq3xxs_signed_rows;
 };
 const BlockTables& block_tables();
 

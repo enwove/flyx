@@ -120,7 +120,7 @@ Defined in `core/os/env.h` (plus CUDA / Python standard variables). Explicit CLI
 | `FLYX_ACTIVATIONS` | `exact` \| `nvfp4` | Default activation mode when `--activations` is unset. |
 | `FLYX_LOOKUP` | `0` \| `1` | Enable/disable prompt lookup (`0` = `--no-lookup`). |
 | `FLYX_DRAFT_TREES` | `0` \| `1` | Enable/disable DFlash2 draft trees (`1` = `--draft-trees`). |
-| `FLYX_ADAPTIVE` | `0` \| `1` | Enable/disable intra-round confidence optimal stopping on adaptive drafter plans (`1`, default). Enabled for sequential drafters (MTP) and for block drafters on targets whose verify cost scales steeply with width; dense targets paired with block drafters (DFlash2) verify the chooser's fixed widths. |
+| `FLYX_ADAPTIVE` | `0` \| `1` | Enable/disable intra-round confidence optimal stopping on adaptive drafter plans (`1`, default). Enabled for sequential drafters (MTP) and for drafters (DSpark, with step-wise Markov early stopping and optimal prefix verification, and DFlash2) on targets whose verify cost scales steeply with width (such as sparse MoE `inkling2_loop`, across checkpoints up to the drafter's trained block `{1, 2, 3, 5, 7}`, with sustained high-acceptance runs widening past the trained block when supported); dense targets paired with block drafters (DFlash2) verify the chooser's fixed widths. |
 | `FLYX_CHAT_NATIVE` | `0` \| `1` | Force Jinja engine (`0`) instead of native chat renderer (`1`, default). |
 | `FLYX_API_KEY` / `FLYX_KEY` | string | Default server API key when `--api-key` is unset. |
 | `FLYX_MODELS_DIR` | paths (`:` Linux / `;` Win) | Additional local model directories appended to `--models-dir`. |
@@ -173,12 +173,13 @@ Passed verbatim to the backend (`backends/cuda/backend.cpp`). Unknown keys or in
 | `draft_kv` | `fp8` \| `16` | `fp8` | MTP drafter KV cache dtype when target KV is FP8. |
 | `act_group` | `32` \| `64` \| `128` \| `256` | `32` | Measurement only: 8-bit activation scale group size (use with `fusion=0,round_glu=0`). |
 | `act_fp4` | `0` \| `1` \| `2` | `0` | Measurement only: round staged activations as NVFP4 (`1`) or MXFP8 (`2`). |
+| `moe_dp4a` | `default` \| `original` \| `1x1` \| `1x2` \| `2x1` \| `2x2` \| `4x1` \| `4x2` | `default` | Measure packed expert dp4a GEMMs with staged 8-bit activations for IQ3_XXS, IQ2_S, IQ2_XXS, IQ2_XS, IQ4_NL and Q4_K in one configuration (`backends/cuda/variants/candidates.toml`, `moe_dp4a`). The two numbers select output columns per warp (gate/up pairs when fused) and K/32 units in flight per lane; these specialize grouped tiles containing one row. `default` takes the GPU's tuning table's rules for fused gate/up GEMMs (`moe_gate_up` under `variants/<arch>/tables/<sku>.toml`; `candidates.toml` defaults keep original tiles where a table has none) and the original tiles elsewhere; `original` keeps the original tiles everywhere. A release build (`FLYX_TUNE_CANDIDATES=OFF`) compiles non-original configurations only for fused gate/up in the row bands and architectures its tables reach, so forcing any non-original override requires `FLYX_TUNE_CANDIDATES=ON`. |
 
 ### Attention, Tiered KV, StrataFlux, and MTP Cache
 
 | Key | Allowed Values | Default | Effect |
 |---|---|---|---|
-| `attention` | `auto` \| `split` \| `head` | `auto` | Prefill attention kernel (`split` = FP32; `head` = ungrouped, disables FP8 KV). |
+| `attention` | `auto` \| `split` \| `head` | `auto` | Attention kernel selection (`split` = FP32 split prefill instead of FlashAttention; `head` = ungrouped per-head prefill and decode/verify attention, disabling FP8 KV). |
 | `rows_attention` | `mma` \| `cores` | `mma` | Decode/verify attention on tensor cores (`mma`) or FP32 CUDA cores (`cores`). |
 | `rows_attention_from` | `N` (≥ 0) | `8192` | Key count threshold for switching decode attention to tensor cores. |
 | `rows_attention_parts` | `1` \| `2` \| `3` | auto (`1` or `3`) | Binary16 split precision parts for `q` and `p` in tensor-core decode attention (`1` on GQA > 4 & HD ≥ 256, else `3`). |

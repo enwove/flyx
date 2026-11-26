@@ -5,9 +5,9 @@
 //   Every q8 path splits a column's K/32 groups into 32 fixed streams (stream s = groups s, s+32, s+64, ...),
 //   accumulating each group in ascending K order with exact integer products and identical float32 fmaf order,
 //   then combines the 32 streams via the fixed balanced binary tree (xor 1, 2, 4, 8, 16):
-//     * k_moe_blocks_q8_dp4a: 8 warps/block, C=2..4 cols/warp, U=1..2 prefetch, pre-staged q8 from L1 (R=1..8).
+//     * k_moe_blocks_q8_dp4a: 8 warps/block, C=1,2,4 columns/warp, U=1,2 prefetched units, pre-staged q8.
 //     * k_moe_blocks_q8_mma:  INT8 tensor cores (mma.m16n8k32), 16 rows x 8 cols per 4-warp tile, 2-buffer
-//       cp.async span pipeline, compacted per-expert 16-row work tiles (R>8 / prefill).
+//       cp.async span pipeline, compacted per-expert 16-row work tiles in sufficiently dense prefill.
 //     * k_moe_blocks_q8_nostage: fallback when sc==nullptr (unit tests), same 32-stream dp4a + xor tree.
 #pragma once
 
@@ -15,6 +15,8 @@
 #include <cmath>
 #include <cstdint>
 #include <stdexcept>
+#include <string>
+#include <type_traits>
 
 #include "backends/cuda/kernels/common/device.cuh"
 #include "backends/cuda/kernels/common/launch.h"
@@ -57,47 +59,15 @@ __device__ __forceinline__ float warp_tree_sum(float v) {
 }
 
 // ---- Fast pre-staged Q8 dp4a MoE kernel (R=1 direct or R>=2 compacted tasks, BT <= 4) ----------
-template <class F, bool FUSE_ACT, bool IS_DOWN, bool DIRECT_R1, int BT>
-__global__ void __launch_bounds__(32 * kMoeDp4aWarps)
-    k_moe_blocks_q8_dp4a(Tables T, const int8_t* __restrict__ q8_a, const float* __restrict__ q8_d,
-                         const float* __restrict__ q8_s, const uint8_t* __restrict__ W,
-                         const uint16_t* __restrict__ D, const float* __restrict__ RS, int N_exp, int I_or_H, int K,
-                         const int* __restrict__ eidx, const MoeTask* __restrict__ tasks,
-                         const int* __restrict__ n_tasks, const int* __restrict__ pairs, int top_k, float situ_beta,
-                         float situ_linear_beta, float* __restrict__ out, int ld_out, bf16* __restrict__ act_bf16) {
-  pdl_trigger();
+template <class F, bool FUSE_ACT, int C, int U, int BT, class Local>
+__device__ __forceinline__ void moe_dp4a_tile(
+    const Tables& T, const Local& local, const int8_t* __restrict__ q8_a, const float* __restrict__ q8_d,
+    const float* __restrict__ q8_s, const uint8_t* __restrict__ W, const uint16_t* __restrict__ D,
+    const float* __restrict__ RS, int N_exp, int I_or_H, int K, int e, int nb, const int* s_pids, const int* s_rids,
+    float situ_beta, float situ_linear_beta, float* __restrict__ out, int ld_out, bf16* __restrict__ act_bf16) {
   static constexpr int GROUPS = F::kValues / 32, SUB = F::kSub;
   static constexpr bool MINS = F::kFlatRun != 0;
-  static constexpr int C = FUSE_ACT ? 1 : 2;
   static constexpr int NC = FUSE_ACT ? 2 * C : C;
-  static constexpr int U = (DIRECT_R1 && sizeof(typename F::Unit) <= 32) ? 2 : 1;
-
-  int e, nb;
-  __shared__ typename F::Local local;
-  __shared__ int s_pids[BT];
-  __shared__ int s_rids[BT];
-
-  if constexpr (DIRECT_R1) {
-    e = eidx[blockIdx.y];
-    nb = 1;
-    if (threadIdx.x == 0) {
-      s_pids[0] = int(blockIdx.y);
-      s_rids[0] = IS_DOWN ? int(blockIdx.y) : 0;
-    }
-  } else {
-    const int tid_y = int(blockIdx.y);
-    if (tid_y >= *n_tasks) return;
-    const MoeTask tk = tasks[tid_y];
-    e = tk.expert;
-    nb = tk.nb;
-    if (int(threadIdx.x) < nb) {
-      const int pid = pairs[tk.p0 + int(threadIdx.x)];
-      s_pids[threadIdx.x] = pid;
-      s_rids[threadIdx.x] = IS_DOWN ? pid : (pid / top_k);
-    }
-  }
-  F::tables(T, local);
-  __syncthreads();
 
   const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
   const int N_work = FUSE_ACT ? I_or_H : N_exp;
@@ -144,6 +114,19 @@ __global__ void __launch_bounds__(32 * kMoeDp4aWarps)
   for (int i = 0; i < U; ++i)
     if (lane + 32 * i < units) load(i, lane + 32 * i);
 
+  struct Activation {
+    uint4 lo, hi;
+    float dx;
+    float2 ds;
+  };
+  auto activation = [&](int rid, int u) {
+    const size_t group = size_t(rid) * units + u;
+    const int8_t* ar = q8_a + size_t(rid) * K + size_t(u) * 32;
+    Activation x{*reinterpret_cast<const uint4*>(ar), *reinterpret_cast<const uint4*>(ar + 16), q8_d[group], {}};
+    if constexpr (MINS) x.ds = *reinterpret_cast<const float2*>(q8_s + group * 2);
+    return x;
+  };
+
   float acc[BT][NC];
 #pragma unroll
   for (int b = 0; b < BT; ++b)
@@ -155,80 +138,42 @@ __global__ void __launch_bounds__(32 * kMoeDp4aWarps)
     for (int i = 0; i < U; ++i) {
       const int u = u0 + 32 * i;
       if (u >= units) break;
-      if constexpr (DIRECT_R1) {
-        const int8_t* ar = q8_a + size_t(rids[0]) * K + size_t(u) * 32;
-        const uint4 x0 = *reinterpret_cast<const uint4*>(ar);
-        const uint4 x1 = *reinterpret_cast<const uint4*>(ar + 16);
-        const float dx = q8_d[size_t(rids[0]) * units + u];
-        float2 ds = make_float2(0.f, 0.f);
-        if constexpr (MINS) ds = *reinterpret_cast<const float2*>(q8_s + (size_t(rids[0]) * units + u) * 2);
+      // A one-row tile loads the two vectors and scale once for all NC dots. For longer tiles,
+      // hold one column's decoded weights across rows, bounding the live activation registers.
+      Activation single{};
+      if constexpr (BT == 1) single = activation(rids[0], u);
 #pragma unroll
-        for (int c = 0; c < NC; ++c) {
-          uint32_t w[8];
-          float f[2], m[2];
-          F::unit_codes(T, local, raw[i][c], G, w);
-          F::unit_factors(raw[i][c], G, scale_bits<F>(d0[i][c]),
-                          F::kScales > 1 ? scale_bits<F>(d1[i][c]) : 0.f, f, m);
+      for (int c = 0; c < NC; ++c) {
+        uint32_t w[8];
+        float f[2], m[2];
+        F::unit_codes(T, local, raw[i][c], G, w);
+        F::unit_factors(raw[i][c], G, scale_bits<F>(d0[i][c]),
+                        F::kScales > 1 ? scale_bits<F>(d1[i][c]) : 0.f, f, m);
+#pragma unroll
+        for (int b = 0; b < BT; ++b) {
+          if (b >= nb) break;
+          const Activation x = BT == 1 ? single : activation(rids[b], u);
           int s0 = 0;
-          s0 = __dp4a(int(w[0]), int(x0.x), s0);
-          s0 = __dp4a(int(w[1]), int(x0.y), s0);
-          s0 = __dp4a(int(w[2]), int(x0.z), s0);
-          s0 = __dp4a(int(w[3]), int(x0.w), s0);
+          s0 = __dp4a(int(w[0]), int(x.lo.x), s0);
+          s0 = __dp4a(int(w[1]), int(x.lo.y), s0);
+          s0 = __dp4a(int(w[2]), int(x.lo.z), s0);
+          s0 = __dp4a(int(w[3]), int(x.lo.w), s0);
           int s1 = (SUB == 32) ? s0 : 0;
-          s1 = __dp4a(int(w[4]), int(x1.x), s1);
-          s1 = __dp4a(int(w[5]), int(x1.y), s1);
-          s1 = __dp4a(int(w[6]), int(x1.z), s1);
-          s1 = __dp4a(int(w[7]), int(x1.w), s1);
+          s1 = __dp4a(int(w[4]), int(x.hi.x), s1);
+          s1 = __dp4a(int(w[5]), int(x.hi.y), s1);
+          s1 = __dp4a(int(w[6]), int(x.hi.z), s1);
+          s1 = __dp4a(int(w[7]), int(x.hi.w), s1);
           if constexpr (SUB == 32) s0 = s1;
-          float& ac = acc[0][c];
-          ac = fmaf(float(s0), dx * f[0], ac);
-          if constexpr (MINS) ac = fmaf(SUB == 16 ? ds.x : (ds.x + ds.y), m[0], ac);
+          float& ac = acc[b][c];
+          ac = fmaf(float(s0), x.dx * f[0], ac);
+          if constexpr (MINS) ac = fmaf(SUB == 16 ? x.ds.x : (x.ds.x + x.ds.y), m[0], ac);
           if constexpr (SUB == 16) {
-            ac = fmaf(float(s1), dx * f[1], ac);
-            if constexpr (MINS) ac = fmaf(ds.y, m[1], ac);
+            ac = fmaf(float(s1), x.dx * f[1], ac);
+            if constexpr (MINS) ac = fmaf(x.ds.y, m[1], ac);
           }
         }
-        if (u + 32 * U < units) load(i, u + 32 * U);
-      } else {
-        // Decode one column at a time and reuse across all nb rows (cuts register pressure by ~3x).
-#pragma unroll
-        for (int c = 0; c < NC; ++c) {
-          uint32_t w[8];
-          float f[2], m[2];
-          F::unit_codes(T, local, raw[i][c], G, w);
-          F::unit_factors(raw[i][c], G, scale_bits<F>(d0[i][c]),
-                          F::kScales > 1 ? scale_bits<F>(d1[i][c]) : 0.f, f, m);
-#pragma unroll
-          for (int b = 0; b < BT; ++b) {
-            if (b >= nb) break;
-            const int8_t* ar = q8_a + size_t(rids[b]) * K + size_t(u) * 32;
-            const uint4 x0 = *reinterpret_cast<const uint4*>(ar);
-            const uint4 x1 = *reinterpret_cast<const uint4*>(ar + 16);
-            const float dx = q8_d[size_t(rids[b]) * units + u];
-            float2 ds = make_float2(0.f, 0.f);
-            if constexpr (MINS) ds = *reinterpret_cast<const float2*>(q8_s + (size_t(rids[b]) * units + u) * 2);
-            int s0 = 0;
-            s0 = __dp4a(int(w[0]), int(x0.x), s0);
-            s0 = __dp4a(int(w[1]), int(x0.y), s0);
-            s0 = __dp4a(int(w[2]), int(x0.z), s0);
-            s0 = __dp4a(int(w[3]), int(x0.w), s0);
-            int s1 = (SUB == 32) ? s0 : 0;
-            s1 = __dp4a(int(w[4]), int(x1.x), s1);
-            s1 = __dp4a(int(w[5]), int(x1.y), s1);
-            s1 = __dp4a(int(w[6]), int(x1.z), s1);
-            s1 = __dp4a(int(w[7]), int(x1.w), s1);
-            if constexpr (SUB == 32) s0 = s1;
-            float& ac = acc[b][c];
-            ac = fmaf(float(s0), dx * f[0], ac);
-            if constexpr (MINS) ac = fmaf(SUB == 16 ? ds.x : (ds.x + ds.y), m[0], ac);
-            if constexpr (SUB == 16) {
-              ac = fmaf(float(s1), dx * f[1], ac);
-              if constexpr (MINS) ac = fmaf(ds.y, m[1], ac);
-            }
-          }
-        }
-        if (u + 32 * U < units) load(i, u + 32 * U);
       }
+      if (u + 32 * U < units) load(i, u + 32 * U);
     }
   }
 
@@ -251,6 +196,70 @@ __global__ void __launch_bounds__(32 * kMoeDp4aWarps)
       }
     }
   }
+}
+
+template <class F, bool FUSE_ACT, bool IS_DOWN, bool DIRECT_R1, int CFG, int C, int U, bool EXPLICIT_CONFIG>
+__global__ void __launch_bounds__(32 * kMoeDp4aWarps)
+    k_moe_blocks_q8_dp4a(Tables T, const int8_t* __restrict__ q8_a, const float* __restrict__ q8_d,
+                         const float* __restrict__ q8_s, const uint8_t* __restrict__ W,
+                         const uint16_t* __restrict__ D, const float* __restrict__ RS, int N_exp, int I_or_H, int K,
+                         const int* __restrict__ eidx, const MoeTask* __restrict__ tasks,
+                         const int* __restrict__ n_tasks, const int* __restrict__ pairs, int top_k, float situ_beta,
+                         float situ_linear_beta, float* __restrict__ out, int ld_out, bf16* __restrict__ act_bf16) {
+#if defined(__CUDA_ARCH__) && !FLYX_TUNE_CANDIDATES
+  if constexpr (!moe_dp4a_kernel_active<F, CFG, FUSE_ACT, DIRECT_R1>(__CUDA_ARCH__ / 10)) {
+    __trap();
+  } else {
+#endif
+  pdl_trigger();
+  constexpr int BT = DIRECT_R1 ? 1 : 4;
+  // IQ3_XXS at one column (gate/up pair) a warp decodes its units from the global table of signed rows instead of
+  // the block's shared tables: no table fill a block, a lookup a word (cuda_bench moe, RTX 5070 Ti: 1x1 7% faster at
+  // one row, 2 to 3% at 2 to 6; at two columns a warp it was 3 to 5% slower, so those keep the shared tables).  The
+  // same int8 values, so the same bits.
+  constexpr bool kSignedRows = std::is_same_v<F, FIQ3_XXS> && C == 1 && EXPLICIT_CONFIG;
+  int e, nb;
+  __shared__ std::conditional_t<kSignedRows, FIQ3_XXS::SignedRows, typename F::Local> local;
+  __shared__ int s_pids[BT];
+  __shared__ int s_rids[BT];
+
+  if constexpr (DIRECT_R1) {
+    e = eidx[blockIdx.y];
+    nb = 1;
+    if (threadIdx.x == 0) {
+      s_pids[0] = int(blockIdx.y);
+      s_rids[0] = IS_DOWN ? int(blockIdx.y) : 0;
+    }
+  } else {
+    const int tid_y = int(blockIdx.y);
+    if (tid_y >= *n_tasks) return;
+    const MoeTask tk = tasks[tid_y];
+    e = tk.expert;
+    nb = tk.nb;
+    if (int(threadIdx.x) < nb) {
+      const int pid = pairs[tk.p0 + int(threadIdx.x)];
+      s_pids[threadIdx.x] = pid;
+      s_rids[threadIdx.x] = IS_DOWN ? pid : (pid / top_k);
+    }
+  }
+  if constexpr (!kSignedRows) {
+    if constexpr (EXPLICIT_CONFIG) F::unit_tables(T, local);
+    else F::tables(T, local);
+  }
+  __syncthreads();  // the block's rows (s_pids, s_rids), and its tables where it has any
+
+  if constexpr (EXPLICIT_CONFIG && !DIRECT_R1) {
+    if (nb == 1) {
+      moe_dp4a_tile<F, FUSE_ACT, C, U, 1>(T, local, q8_a, q8_d, q8_s, W, D, RS, N_exp, I_or_H, K, e, 1,
+                                          s_pids, s_rids, situ_beta, situ_linear_beta, out, ld_out, act_bf16);
+      return;
+    }
+  }
+  moe_dp4a_tile<F, FUSE_ACT, C, U, BT>(T, local, q8_a, q8_d, q8_s, W, D, RS, N_exp, I_or_H, K, e, nb,
+                                       s_pids, s_rids, situ_beta, situ_linear_beta, out, ld_out, act_bf16);
+#if defined(__CUDA_ARCH__) && !FLYX_TUNE_CANDIDATES
+  }
+#endif
 }
 
 // ---- INT8 Tensor Core mma.m16n8k32 grouped MoE kernel (BM = 16 rows/task, CT = 2 -> 16 cols/block) ----
@@ -826,50 +835,80 @@ void launch_mma_q8(const ExpertMat& W, int I_or_H, int K, int top_k, float situ_
       sc->n_tasks, sc->pairs, top_k, situ_beta, situ_linear_beta, out, ld_out);
 }
 
+// A moe_dp4a configuration's tile: C output columns a warp (gate/up pairs fused), U units a lane has in flight; 0 and
+// 0, the original tiles: one pair a warp fused, two columns otherwise, the original prefetch depth and grouped loop.
+template <int CFG, int C, int U>
+struct MoeDp4aTile {
+  static constexpr int cfg = CFG;
+  static constexpr int columns = C;
+  static constexpr int units = U;
+};
+
+// The dp4a kernel in configuration `cfg` (moe.cu's moe_dp4a_cfg: the options', the rules' or the original tiles;
+// always one this build compiles for the type, op and row band, moe_dp4a_cfg_compiled).
+template <class F, bool FUSE_ACT, bool IS_DOWN>
+void launch_dp4a_q8(int cfg, const Tables& T, const ExpertMat& W, int I_or_H, int K, const int* eidx, int rows,
+                    int top_k, float situ_beta, float situ_linear_beta, float* out, int ld_out, const MoeScratch* sc,
+                    int max_tiles, cudaStream_t st, bf16* act_bf16) {
+  const int N_exp = IS_DOWN ? I_or_H : W.N;
+  const int N_work = FUSE_ACT ? I_or_H : N_exp;
+  auto run = [&](auto tile, auto direct) {
+    constexpr bool DIRECT_R1 = decltype(direct)::value;
+    constexpr int CFG = decltype(tile)::cfg;
+    if constexpr (moe_dp4a_cfg_compiled(F::kDtype, CFG, FUSE_ACT, DIRECT_R1 ? 1 : 2)) {
+      constexpr int requested_c = decltype(tile)::columns, requested_u = decltype(tile)::units;
+      constexpr int C = requested_c ? requested_c : FUSE_ACT ? 1 : 2;
+      constexpr int default_u = DIRECT_R1 && sizeof(typename F::Unit) <= 32 ? 2 : 1;
+      constexpr int U = requested_u ? requested_u : default_u;
+      constexpr bool EXPLICIT_CONFIG = requested_c != 0 || requested_u != 0;
+      const dim3 grid(ceil_div(N_work, kMoeDp4aWarps * C), DIRECT_R1 ? top_k : max_tiles);
+      k_moe_blocks_q8_dp4a<F, FUSE_ACT, IS_DOWN, DIRECT_R1, CFG, C, U, EXPLICIT_CONFIG>
+          <<<grid, 32 * kMoeDp4aWarps, 0, st>>>(T, sc->q8_a, sc->q8_d, sc->q8_s, W.blk.data, W.blk.scales, W.rs,
+                                                N_exp, I_or_H, K, eidx, sc->tasks, sc->n_tasks, sc->pairs, top_k,
+                                                situ_beta, situ_linear_beta, out, ld_out, act_bf16);
+      return true;
+    } else {
+      return false;
+    }
+  };
+  auto launch = [&](auto tile) { return rows == 1 ? run(tile, std::true_type{}) : run(tile, std::false_type{}); };
+  switch (cfg) {
+#define X(i, C, U)                                        \
+  case i:                                                 \
+    if (launch(MoeDp4aTile<i, C, U>{})) return;           \
+    break;
+    FLYX_MOE_DP4A(X)
+#undef X
+    default: break;
+  }
+  throw std::runtime_error("moe dp4a: configuration " + std::to_string(cfg) + " is not compiled for block type " +
+                           std::to_string(F::kDtype));
+}
+
 template <class F>
 void moe_blocks_gu(const float* x, int ldx, const ExpertMat& W, const int* eidx, int rows, int top_k, int I, int K,
                    float situ_beta, float situ_linear_beta, bool fuse_act, float* out, int ld_out,
-                   const MoeScratch* sc, int max_tiles, bool use_mma, cudaStream_t st, bf16* act_bf16) {
+                   const MoeScratch* sc, int max_tiles, bool use_mma, int dp4a, cudaStream_t st, bf16* act_bf16) {
   const Tables T = block_tables();
   const int N_work = fuse_act ? I : 2 * I;
   const bool has_q8 = W.blk.q8 && sc && sc->q8_a && sc->stage_elems >= size_t(rows) * size_t(K);
   // Only the dp4a kernels that apply the activation write it in bf16: a round's, which moe_round_q8 promises.
   if (act_bf16 && !(fuse_act && has_q8 && !use_mma && (rows == 1 || (sc->tasks && max_tiles > 0))))
     throw std::runtime_error("moe_gate_up: bf16 activations asked of a kernel that writes float32");
-  if (has_q8) {
-    if (rows == 1) {
-      constexpr int C_f = 1, C_u = 2;
+  if (has_q8 && (rows == 1 || (sc->tasks && max_tiles > 0))) {
+    if (rows > 1 && use_mma) {
       if (fuse_act)
-        k_moe_blocks_q8_dp4a<F, true, false, true, 1>
-            <<<dim3(ceil_div(N_work, kMoeDp4aWarps * C_f), top_k), 32 * kMoeDp4aWarps, 0, st>>>(
-                T, sc->q8_a, sc->q8_d, sc->q8_s, W.blk.data, W.blk.scales, W.rs, W.N, I, K, eidx, nullptr, nullptr,
-                nullptr, top_k, situ_beta, situ_linear_beta, out, ld_out, act_bf16);
+        launch_mma_q8<F, true, false>(W, I, K, top_k, situ_beta, situ_linear_beta, out, ld_out, sc, max_tiles, st);
       else
-        k_moe_blocks_q8_dp4a<F, false, false, true, 1>
-            <<<dim3(ceil_div(N_work, kMoeDp4aWarps * C_u), top_k), 32 * kMoeDp4aWarps, 0, st>>>(
-                T, sc->q8_a, sc->q8_d, sc->q8_s, W.blk.data, W.blk.scales, W.rs, W.N, I, K, eidx, nullptr, nullptr,
-                nullptr, top_k, situ_beta, situ_linear_beta, out, ld_out, nullptr);
-      return;
+        launch_mma_q8<F, false, false>(W, I, K, top_k, situ_beta, situ_linear_beta, out, ld_out, sc, max_tiles, st);
+    } else if (fuse_act) {
+      launch_dp4a_q8<F, true, false>(dp4a, T, W, I, K, eidx, rows, top_k, situ_beta, situ_linear_beta, out, ld_out,
+                                      sc, max_tiles, st, act_bf16);
+    } else {
+      launch_dp4a_q8<F, false, false>(dp4a, T, W, I, K, eidx, rows, top_k, situ_beta, situ_linear_beta, out, ld_out,
+                                       sc, max_tiles, st, nullptr);
     }
-    if (sc && sc->tasks && max_tiles > 0) {
-      if (use_mma) {
-        if (fuse_act) launch_mma_q8<F, true, false>(W, I, K, top_k, situ_beta, situ_linear_beta, out, ld_out, sc, max_tiles, st);
-        else launch_mma_q8<F, false, false>(W, I, K, top_k, situ_beta, situ_linear_beta, out, ld_out, sc, max_tiles, st);
-      } else {
-        constexpr int C_f = 1, C_u = 2;
-        if (fuse_act)
-          k_moe_blocks_q8_dp4a<F, true, false, false, 4>
-              <<<dim3(ceil_div(N_work, kMoeDp4aWarps * C_f), max_tiles), 32 * kMoeDp4aWarps, 0, st>>>(
-                  T, sc->q8_a, sc->q8_d, sc->q8_s, W.blk.data, W.blk.scales, W.rs, W.N, I, K, eidx, sc->tasks,
-                  sc->n_tasks, sc->pairs, top_k, situ_beta, situ_linear_beta, out, ld_out, act_bf16);
-        else
-          k_moe_blocks_q8_dp4a<F, false, false, false, 4>
-              <<<dim3(ceil_div(N_work, kMoeDp4aWarps * C_u), max_tiles), 32 * kMoeDp4aWarps, 0, st>>>(
-                  T, sc->q8_a, sc->q8_d, sc->q8_s, W.blk.data, W.blk.scales, W.rs, W.N, I, K, eidx, sc->tasks,
-                  sc->n_tasks, sc->pairs, top_k, situ_beta, situ_linear_beta, out, ld_out, nullptr);
-      }
-      return;
-    }
+    return;
   }
   if (!W.blk.q8 && rows > 1 && sc && sc->tasks && max_tiles > 0) {
     const dim3 grid(ceil_div(N_work, 4), max_tiles);
@@ -904,30 +943,18 @@ void moe_blocks_gu(const float* x, int ldx, const ExpertMat& W, const int* eidx,
 template <class F>
 bool moe_blocks_down(const float* act, int ld_act, const ExpertMat& W, const int* eidx, const float* ew, int rows,
                      int top_k, int H, int K, float* out, int ld_out, bool accumulate, const MoeScratch* sc,
-                     int max_tiles, bool use_mma, cudaStream_t st) {
+                     int max_tiles, bool use_mma, int dp4a, cudaStream_t st) {
   const Tables T = block_tables();
   const bool has_q8 =
       W.blk.q8 && sc && sc->q8_a && sc->down_buf && sc->stage_elems >= size_t(rows) * size_t(top_k) * size_t(K);
-  if (has_q8) {
-    constexpr int C_u = 2;
-    if (rows == 1) {
-      k_moe_blocks_q8_dp4a<F, false, true, true, 1>
-          <<<dim3(ceil_div(H, kMoeDp4aWarps * C_u), top_k), 32 * kMoeDp4aWarps, 0, st>>>(
-              T, sc->q8_a, sc->q8_d, sc->q8_s, W.blk.data, W.blk.scales, W.rs, H, H, K, eidx, nullptr, nullptr, nullptr,
-              top_k, 0.f, 0.f, sc->down_buf, H, nullptr);
-      return true;
+  if (has_q8 && (rows == 1 || (sc->tasks && max_tiles > 0))) {
+    if (rows > 1 && use_mma) {
+      launch_mma_q8<F, false, true>(W, H, K, top_k, 0.f, 0.f, sc->down_buf, H, sc, max_tiles, st);
+    } else {
+      launch_dp4a_q8<F, false, true>(dp4a, T, W, H, K, eidx, rows, top_k, 0.f, 0.f, sc->down_buf, H, sc, max_tiles,
+                                      st, nullptr);
     }
-    if (sc->tasks && max_tiles > 0) {
-      if (use_mma) {
-        launch_mma_q8<F, false, true>(W, H, K, top_k, 0.f, 0.f, sc->down_buf, H, sc, max_tiles, st);
-      } else {
-        k_moe_blocks_q8_dp4a<F, false, true, false, 4>
-            <<<dim3(ceil_div(H, kMoeDp4aWarps * C_u), max_tiles), 32 * kMoeDp4aWarps, 0, st>>>(
-                T, sc->q8_a, sc->q8_d, sc->q8_s, W.blk.data, W.blk.scales, W.rs, H, H, K, eidx, sc->tasks, sc->n_tasks,
-                sc->pairs, top_k, 0.f, 0.f, sc->down_buf, H, nullptr);
-      }
-      return true;
-    }
+    return true;
   }
   if (!W.blk.q8 && rows > 1 && sc && sc->tasks && sc->down_buf && max_tiles > 0) {
     k_moe_blocks_a16h_grouped<F, false, true><<<dim3(ceil_div(H, 4), max_tiles), 128, 0, st>>>(

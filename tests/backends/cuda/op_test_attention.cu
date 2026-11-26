@@ -1493,6 +1493,37 @@ void test_pageable_kv_ops() {
   }
 }
 
+// ring_publish: the pass's entry of the result ring (P->seq_no % kRing) reaches the mapped host mirror word for word,
+// past the ring's end too, and every other entry of the mirror keeps what it held (the host may be reading it).
+void test_ring_publish() {
+  constexpr size_t kEntry = sizeof(flyx_round_result), kBytes = kEntry * kRing;
+  std::vector<unsigned char> ring(kBytes);
+  for (size_t i = 0; i < kBytes; ++i) ring[i] = static_cast<unsigned char>(i * 131 + 7);
+  flyx_round_result* ring_dev = dev<flyx_round_result>(kRing);
+  CK(cudaMemcpy(ring_dev, ring.data(), kBytes, cudaMemcpyHostToDevice));
+  unsigned char* host = nullptr;
+  CK(cudaHostAlloc(reinterpret_cast<void**>(&host), kBytes, cudaHostAllocMapped));
+  flyx_round_result* host_dev = nullptr;
+  CK(cudaHostGetDevicePointer(reinterpret_cast<void**>(&host_dev), host, 0));
+  DevParams* P = params(0);
+  bool ok = true;
+  for (unsigned long long seq : {1ull, 2ull, static_cast<unsigned long long>(kRing), kRing + 5ull, 3ull * kRing - 1}) {
+    std::memset(host, 0xA5, kBytes);
+    CK(cudaMemcpy(&P->seq_no, &seq, sizeof(seq), cudaMemcpyHostToDevice));
+    ring_publish(ring_dev, host_dev, P, 0);
+    CK(cudaDeviceSynchronize());
+    const size_t slot = size_t(seq % kRing);
+    for (size_t i = 0; i < kBytes; ++i) {
+      const bool own = i / kEntry == slot;
+      ok = ok && host[i] == (own ? ring[i] : 0xA5);
+    }
+  }
+  std::printf("  %-4s ring_publish: the pass's entry, word for word, and no other\n", ok ? "ok" : "FAIL");
+  g_fail += !ok;
+  CK(cudaFreeHost(host));
+  for (void* p : std::initializer_list<void*>{ring_dev, P}) CK(cudaFree(p));
+}
+
 // A tree round of more than 16 rows (up to FLYX_MAX_WIDE_ROWS; docs/design/tree-verification.md): row r, its K/V in
 // the round's slot base + r, attends to the keys before the round and to its ancestors' in depth order with the bits
 // of decoding its path alone: one row at position base + depth[r] over a cache whose slots base .. base + depth[r]

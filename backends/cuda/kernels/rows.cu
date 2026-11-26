@@ -431,4 +431,21 @@ void kv_drain_pageable(const PageDrainLayer* layers, int n_layers, const DevPara
   k_kv_drain_pageable<<<dim3(max_rows, n_layers), 128, 0, st>>>(layers, n_layers, P, ring_dev, max_rows);
 }
 
+namespace {
+constexpr int kRingEntryWords = int(sizeof(flyx_round_result) / sizeof(uint32_t));
+static_assert(sizeof(flyx_round_result) % sizeof(uint32_t) == 0, "a ring entry is copied in 32-bit words");
+
+// The pass's own entry only (new_entry wrote it at P->seq_no): the one before it, which the host may be reading while
+// this pass runs (two in flight), is left alone.
+__global__ void k_ring_publish(const DevParams* P, const uint32_t* __restrict__ ring, uint32_t* host) {
+  const size_t at = size_t(P->seq_no % kRing) * kRingEntryWords;
+  for (int i = threadIdx.x; i < kRingEntryWords; i += blockDim.x) host[at + i] = ring[at + i];
+  __threadfence_system();  // the host reads the mirror once the pass's event has fired
+}
+}  // namespace
+
+void ring_publish(const flyx_round_result* ring, flyx_round_result* host, const DevParams* P, cudaStream_t st) {
+  k_ring_publish<<<1, 256, 0, st>>>(P, reinterpret_cast<const uint32_t*>(ring), reinterpret_cast<uint32_t*>(host));
+}
+
 }  // namespace flyx::cuda

@@ -455,6 +455,7 @@ bool Generation::launch(const RoundChoice& round, bool masked) {
     return false;
   }
   launched_[in_flight_++] = round;
+  result_.adaptive_rounds += params.stop_policy != nullptr;  // as launched(): the adaptive plan's rounds
   return true;
 }
 

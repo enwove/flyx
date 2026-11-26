@@ -118,6 +118,14 @@ inline void destroy_side(SideStream& s) {
 //   act_group=64|128|256  measurement: 8-bit inputs with one scale this many values (bench/quality/kld.cpp; with
 //                         fusion=0 and round_glu=0, whose producers round their own outputs per 32)
 //   act_fp4=1|2           measurement: inputs first rounded as NVFP4 (1) or MXFP8 (2) activations would be
+//   moe_dp4a=default|original|1x1|1x2|2x1|2x2|4x1|4x2  measurement: every staged IQ3_XXS, IQ2_S, IQ2_XXS,
+//                         IQ2_XS, IQ4_NL and Q4_K expert dp4a GEMM in one configuration (variants/candidates.toml,
+//                         moe_dp4a): columns per warp x K/32 units in flight per lane, a fused column a gate/up pair;
+//                         these specialize one-row grouped tiles.  default: the tables' rules (moe_gate_up) for fused
+//                         gate|up GEMMs, the original tiles elsewhere; original: those tiles everywhere.  A release
+//                         build compiles non-original configurations only for fused gate|up in the row bands and
+//                         architectures its tables reach, so forcing a non-original override requires
+//                         FLYX_TUNE_CANDIDATES=ON.
 enum class WaitMode { poll, spin, automatic };  // option wait=poll|spin|auto
 enum class PageableKvMode { off, on, automatic };  // option pageable_kv=off|on|auto
 struct BackendOptions {
@@ -536,6 +544,7 @@ struct flyx_plan {
   bool tree = false, drafted_tree = false, has_draft = false;
   std::vector<int> tree_kv;
   std::vector<int> checkpoints;  // sorted verify checkpoints for adaptive conditional round graph (empty: fixed width)
+  bool earlier_checkpoints = false;  // flyx_program's: a stop may verify a checkpoint before the one it drafted to
   bool adaptive() const { return checkpoints.size() > 1; }
 };
 
@@ -582,7 +591,8 @@ struct flyx_seq {
   int mask_words = 0;
   flyx::cuda::Reply reply{};                       // the reply's tokens as the penalties count them (set_reply, accept)
   flyx_round_result* ring_dev = nullptr;
-  flyx_round_result* ring_host = nullptr;  // pinned mirror
+  flyx_round_result* ring_host = nullptr;      // pinned mirror
+  flyx_round_result* ring_host_dev = nullptr;  // the mirror as kernels address it (mapped: ring_publish writes it)
   int* tok_host = nullptr;             // pinned staging for prefill tokens
   cudaEvent_t ev[flyx::cuda::kRing]{};
 
@@ -936,7 +946,8 @@ struct flyx_seq {
   void stage_text(const flyx::cuda::KvBuf& kb, cudaStream_t st);
   void create_stage_stream();
   std::vector<void*> host_allocs;
-  // Small pinned host staging (not counted in dry_host_bytes; freed with host_allocs).
+  // Small pinned host staging, mapped into the device's address space (a kernel writes the result ring there:
+  // ring_publish); not counted in dry_host_bytes; freed with host_allocs.
   template <class T>
   T* pinned_alloc(size_t n) {
     const size_t bytes = n * sizeof(T);
@@ -952,7 +963,7 @@ struct flyx_seq {
       return reinterpret_cast<T*>(p);  // zeroed once with the arena
     }
     void* p = nullptr;
-    CK(cudaMallocHost(&p, bytes));
+    CK(cudaHostAlloc(&p, bytes, cudaHostAllocMapped));
     host_allocs.push_back(p);
     return static_cast<T*>(p);
   }

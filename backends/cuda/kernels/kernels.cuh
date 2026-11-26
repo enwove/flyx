@@ -83,6 +83,25 @@ enum PosSel : int { kPosPosition = 0, kPosStart = 1 };
 // Choices the shapes do not settle: one set per loaded model (the backend's
 // options), the defaults in tests and benchmarks.
 enum AttnImpl : int { kAttnAuto = 0, kAttnSplit = 1, kAttnPerHead = 2 };
+// The block types the staged packed expert dp4a GEMMs compile every configuration for (variants/candidates.toml,
+// moe_dp4a; tools/codegen/gen_gemm_tables.py's MOE_DP4A_TYPES says the same): the other types the original tiles
+// alone.  Also those cuda_bench and cuda_op_test exercise.
+inline constexpr int kMoeDp4aTypes[] = {FLYX_DT_GGML_IQ3_XXS, FLYX_DT_GGML_IQ2_S, FLYX_DT_GGML_IQ2_XXS,
+                                        FLYX_DT_GGML_IQ2_XS, FLYX_DT_GGML_IQ4_NL, FLYX_DT_GGML_Q4_K};
+#ifdef __CUDACC__
+__host__ __device__
+#endif
+constexpr bool has_moe_dp4a_variants(int dtype) {
+  switch (dtype) {
+    case FLYX_DT_GGML_IQ3_XXS:
+    case FLYX_DT_GGML_IQ2_S:
+    case FLYX_DT_GGML_IQ2_XXS:
+    case FLYX_DT_GGML_IQ2_XS:
+    case FLYX_DT_GGML_IQ4_NL:
+    case FLYX_DT_GGML_Q4_K: return true;
+    default: return false;
+  }
+}
 // The selection's chunks: about this many pairs each, at most kStrataSelChunks; never more than
 // kStrataSelChunk pairs (a thread of the selection holds 16 of them in registers), so a session's context is at most
 // kStrataSelChunk kStrataSelChunks pairs (4M positions).
@@ -98,6 +117,8 @@ struct KernelOptions {
   bool stacks = true;         // a stack's run and the next of another block type in one round launch where compiled
                               // (gemm_blocks_staged_runs)
   bool round_glu = true;      // a round's SwiGLU in its dp4a gate|up GEMM (gemm_blocks_round_glu_takes)
+  int moe_dp4a = -1;          // measurement: every packed expert dp4a GEMM of a type that compiles it in this
+                              // configuration (moe_dp4a_name); -1: the tables' rules (moe_gate_up_dp4a)
   bool side_stream = true;    // a round's narrow GEMMs of a stack on the launch's side stream (gemm_blocks_staged_runs)
   bool log_shapes = false;    // the backend prints every GEMM shape once
   bool prefill_fp4 = false;   // NVFP4 weights in prefill GEMMs take NVFP4 activations (W4A4, sm_120a; gemm_w4a4):
@@ -173,7 +194,8 @@ struct Scratch {
   size_t q8_parts_cap = 0;
   int* q8_count = nullptr;
   // A round's GEMM in 8 bits whose streams are split among blocks of threads (k_round_blocks_split): each set's sums
-  // a tile of 8 columns (round_parts_cap floats), and a counter per tile (round_count_cap), zero between GEMMs.
+  // a tile of 8 columns (round_parts_cap floats), and a counter per tile (round_count_cap), zero between launches.
+  // k_rel_round_gqa also shares round_count as its zero-between-launch last-block combine counters.
   float* round_parts = nullptr;
   size_t round_parts_cap = 0;
   int* round_count = nullptr;
@@ -1394,6 +1416,11 @@ void kv_stage_ring(const void* k, void* vk, const void* v, void* vv, size_t row,
 // tail ring into its mapped pinned drain slot (P->seq_no % kRing).
 void kv_drain_pageable(const PageDrainLayer* layers, int n_layers, const DevParams* P, const flyx_round_result* ring_dev,
                        int max_rows, cudaStream_t st);
+// The pass's entry of the result ring [kRing] (P->seq_no % kRing, where new_entry wrote it) to its pinned host mirror
+// (`host`: the mirror's mapped device address), stored by a kernel and fenced for the host: the last node of a round,
+// which a copy node would start only some time after.  The other entries stay as they are: the host may be reading the
+// entry before (two passes in flight).
+void ring_publish(const flyx_round_result* ring, flyx_round_result* host, const DevParams* P, cudaStream_t st);
 
 // After a prefill chunk: advance the position; optionally set the anchor from
 // choice[0] and emit it (counted in `reply` when G has a penalty).
@@ -1477,13 +1504,14 @@ void gemm_w4a4(const uint8_t* Aq, const uint8_t* As, const float* Ar, const uint
 struct DevStopState {
   float survival;
   int32_t decision;
+  int32_t verify_bucket;
 };
 struct StopCondHandles {
   unsigned long long h[FLYX_MAX_STOP_BUCKETS];
 };
 void stop_decide_step(const float* prob, const float* margin, const flyx_stop_policy* pol, DevStopState* state,
-                      int bucket, int prev_w, int cur_w, unsigned long long h_next_draft, unsigned long long h_ver,
-                      cudaStream_t st);
+                      int bucket, int cur_w, unsigned long long h_next_draft, StopCondHandles h_ver,
+                      bool earlier_prefix, cudaStream_t st);
 void stop_decide_block(const float* prob, const float* margin, const flyx_stop_policy* pol, DevStopState* state,
                        StopCondHandles h_ver, cudaStream_t st);
 
@@ -1669,8 +1697,6 @@ struct MoeTask {
   int nb;      // count of pairs in this tile (1..BM)
 };
 struct MoeScratch {
-  int* counts = nullptr;       // [max_experts]
-  int* offsets = nullptr;      // [max_experts + 1]
   int* pairs = nullptr;        // [chunk_rows * max_top_k]
   MoeTask* tasks = nullptr;    // [chunk_rows * max_top_k] (compacted per-expert BM-row tiles)
   int* n_tasks = nullptr;      // [1]
@@ -1697,6 +1723,23 @@ void moe_route(const float* logits, const float* bias, int rows, int n_experts, 
                bool norm_weights, float norm_eps, float route_scale, int* idx_out, float* w_out, cudaStream_t st);
 void situ_rows(const float* gu, int ld_gu, int I, float beta, float linear_beta, float* out, int ld_out, int rows,
                cudaStream_t st);
+// The staged packed expert dp4a GEMMs' configurations (variants/candidates.toml, moe_dp4a), all with the same bits:
+// output columns a warp (gate/up pairs where the activation is fused) and K/32 units a lane has in flight; columns 0
+// and units 0, the original tiles, which every block type compiles (kMoeDp4aTypes compile the others).  _name:
+// "original" or "<columns>x<units>"; _compiled: whether this build compiles configuration `cfg` for block type
+// `dtype`, op kind (`fused_gate_up`) and row band (`rows == 1` vs `rows > 1`) on the loaded device architecture (with
+// FLYX_TUNE_CANDIDATES every one of kMoeDp4aTypes for all ops/rows, else the fused gate|up rules reached on this
+// architecture); moe_gate_up_dp4a: the configuration the rules (moe_gate_up) give a fused gate|up GEMM of `rows` rows
+// of block type `dtype` on a GPU of tuning table `tuning`.  Down GEMMs and unfused projections take the original
+// tiles, unless KernelOptions::moe_dp4a says otherwise.
+struct MoeDp4aConfig {
+  int columns, units;
+};
+extern const MoeDp4aConfig kMoeDp4aConfigs[];
+extern const int kMoeDp4aConfigCount;
+const char* moe_dp4a_name(int cfg);
+bool moe_dp4a_compiled(int dtype, int cfg, bool fused_gate_up = true, int rows = 2);
+int moe_gate_up_dp4a(int tuning, int dtype, int rows);
 // What one of a fused round's MoE kernels may leave for the next without a staging launch between them, the
 // round's 1..16 rows in one chunk of the scratch.  moe_round_q8: the gate|up GEMM on W reads rows staged in 8 bits
 // (q8_ready below: staged already, by rmsnorm_moe_q8); moe_round_bf16_down: the down GEMM on W (NVFP4) reads bf16
@@ -1708,14 +1751,18 @@ bool moe_round_bf16_down(const ExpertMat& W, int rows, int top_k, int K, const M
 // fuse_act=true applies SiTU/SwiGLU in registers and writes [rows*top_k, I] (bit-identical to unfused + situ_rows).
 // act_bf16 (with fuse_act and moe_round_q8): the activations there in bf16, each rounded to nearest as staging
 // rounds it, not in out; storage of its own, as sc->bf16_a lies over the 8-bit rows this GEMM is reading.
-void moe_gate_up(const float* x, int ldx, const ExpertMat& W, const int* eidx, int rows, int top_k, int I, int K,
-                 float situ_beta, float situ_linear_beta, bool fuse_act, float* out, int ld_out, const MoeScratch* sc,
-                 const Launch& L, bool q8_ready = false, bf16* act_bf16 = nullptr);
+// Returns the rows a work tile holds of the grouping by expert it leaves in sc for all `rows` at once (0: none),
+// what moe_down takes as `grouped` for the same eidx and rows.
+int moe_gate_up(const float* x, int ldx, const ExpertMat& W, const int* eidx, int rows, int top_k, int I, int K,
+                float situ_beta, float situ_linear_beta, bool fuse_act, float* out, int ld_out, const MoeScratch* sc,
+                const Launch& L, bool q8_ready = false, bf16* act_bf16 = nullptr);
 // Weighted down-projection: out[r, n] (=|+=) sum_{k=0..top_k-1} ew[r, k] * down_{eidx[r, k]}(act[r * top_k + k])[n].
 // act_bf16 (with moe_round_bf16_down): its input [rows*top_k, K] in bf16 already, read in place of act.
+// grouped: moe_gate_up's return for these eidx and rows, sc untouched since; its work tiles are taken where they are
+// the ones this GEMM would group (0: group them here).
 void moe_down(const float* act, int ld_act, const ExpertMat& W, const int* eidx, const float* ew, int rows, int top_k,
               int H, int K, float* out, int ld_out, bool accumulate, const MoeScratch* sc, const Launch& L,
-              const bf16* act_bf16 = nullptr);
+              const bf16* act_bf16 = nullptr, int grouped = 0);
 
 // ---- DSpark drafter kernels (dspark.cu) -----------------------------------------------------
 // Weighted sum of n_taps tapped features [rows, ld_feats] -> RMSNorm -> out [rows, H].
