@@ -72,8 +72,8 @@ bool supported(const flyx_bmodel* m, const Block& blk, std::string* why) {
       return no("the MTP gather takes one offset and eps for its two norms");
     if (m->states.ring_width != block<AttnBlock>(m, t->attn).hidden) return no("the MTP ring keeps one hidden vector per position");
   } else if (const auto* d = std::get_if<DFlashBlock>(&blk)) {
-    if (!attention_head_dim(d->hd) || d->sel_topk > 16 || d->block < 2 || d->block > FLYX_MAX_ROWS ||
-        d->conv_group < 1 || d->hidden % d->conv_group || d->nkv < 1 || d->nh % d->nkv)
+    if (!attention_head_dim(d->hd) || d->sel_topk > kWalkMax || d->block < 2 ||
+        d->block > FLYX_MAX_ROWS || d->conv_group < 1 || d->hidden % d->conv_group || d->nkv < 1 || d->nh % d->nkv)
       return no("drafter dimensions outside what the CUDA kernels support");
     if (d->hidden != m->hidden || d->target_hidden != m->hidden) return no("drafter hidden size differs from the target's");
   } else if (const auto* ds = std::get_if<DSparkBlock>(&blk)) {

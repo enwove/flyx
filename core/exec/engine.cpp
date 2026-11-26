@@ -136,7 +136,10 @@ void apply_environment(EngineOptions* o) {
   if (!o->lookup_given)
     if (const auto v = os::env_bool(env::kLookup)) o->lookup = *v;
   if (!o->draft_trees_given)
-    if (const auto v = os::env_bool(env::kDraftTrees)) o->draft_trees = *v;
+    if (const auto v = os::env_bool(env::kDraftTrees)) {
+      o->draft_trees = *v;
+      o->draft_trees_given = true;
+    }
   if (!o->adaptive_given)
     if (const auto v = os::env_bool(env::kAdaptive)) o->adaptive = *v;
 }
@@ -615,6 +618,11 @@ bool Engine::load(const std::string& path, const EngineOptions& opt, std::string
   mo.fp4_inputs = device_.fp4_inputs != 0;
   model_ = interfaces::open_model(file_, mo, err);
   if (!model_) return false;
+  // Draft trees where the model's drafter takes them by default (DSpark), unless the caller said (--draft-trees,
+  // FLYX_DRAFT_TREES) or asked for strata attention, which reads chains only.
+  if (!opt_.draft_trees_given && opt_.speculative && model_->draft_trees_by_default() &&
+      tiers.method != FLYX_KV_STRATA)
+    opt_.draft_trees = true;
   if (opt_.vision && !opt_.mmproj_file.empty() && !model_->vision())
     return *err = "--mmproj " + opt_.mmproj_file + ": file is not a supported vision projector (mmproj)", false;
   if (opt_.verbose && device_.fp4_inputs == 0 && opt_.activations.empty()) {

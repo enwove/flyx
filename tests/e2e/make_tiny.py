@@ -59,7 +59,7 @@ ROOT = os.path.join(HERE, "..", "..")
 STAMP = ".inputs-"  # + the group
 GROUPS = ("core", "dv")
 OUTPUTS = {
-    "core": ("tiny.flyx", "tiny_nvfp4.flyx", "tiny_qwen3.flyx", "tiny_gdn128.flyx", "tiny_w4a4.flyx",
+    "core": ("tiny_dspark.flyx", "golden_dspark.json", "tiny_dspark_qwen3.flyx", "tiny.flyx", "tiny_nvfp4.flyx", "tiny_qwen3.flyx", "tiny_gdn128.flyx", "tiny_w4a4.flyx",
              "golden.json", "golden_nvfp4.json", "golden_qwen3.json", "golden_gdn128.json", "tokenizer_cases.json",
              "chat_cases.json", "tiny_draft.flyx", "tiny_block8.flyx", "tiny_block7.flyx",
              "tiny_window.flyx", "golden_window.json", "tiny_draft_window.flyx", "tiny_draft_1layer.flyx",
@@ -388,6 +388,64 @@ def make_mtp(out_dir: str, cfg, gen):
     save_file({k: v.to(torch.bfloat16).contiguous() for k, v in W.items()}, os.path.join(out_dir, "mtp.safetensors"))
 
 
+def make_dspark(out_dir: str, vocab: int, mask_id: int, gen, target_layers: int, layer_ids, H=64, layers=2, heads=4,
+                kv=2, hd=32, inter=128, block=7, rank=16):
+    """A DSpark drafter as DeepSpec saves one (Qwen3DSparkModel): plain decoder layers over the target's tapped hidden
+    states, a vanilla Markov head and a confidence head (left out by the converter and the engine); its embedding and
+    head random here (the engine and the reference take the target's, as DeepSpec's frozen copies are)."""
+    from safetensors.torch import save_file
+    os.makedirs(out_dir, exist_ok=True)
+    r = lambda *s, scale=1.0: (torch.randn(*s, generator=gen) * scale)  # noqa: E731
+    n = len(layer_ids)
+    W = {"fc.weight": r(H, n * H, scale=1 / math.sqrt(n * H)),
+         "hidden_norm.weight": 1 + 0.2 * r(H), "norm.weight": 1 + 0.2 * r(H),
+         "embed_tokens.weight": r(vocab, H), "lm_head.weight": r(vocab, H),
+         "markov_head.markov_w1.weight": r(vocab, rank, scale=0.5),
+         "markov_head.markov_w2.weight": r(vocab, rank, scale=0.5),
+         "confidence_head.proj.weight": r(1, H + rank, scale=(H + rank) ** -0.5), "confidence_head.proj.bias": r(1)}
+    for j in range(layers):
+        p = f"layers.{j}."
+        W.update({
+            p + "input_layernorm.weight": 1 + 0.2 * r(H), p + "post_attention_layernorm.weight": 1 + 0.2 * r(H),
+            p + "self_attn.q_proj.weight": r(heads * hd, H, scale=H ** -0.5),
+            p + "self_attn.k_proj.weight": r(kv * hd, H, scale=H ** -0.5),
+            p + "self_attn.v_proj.weight": r(kv * hd, H, scale=H ** -0.5),
+            p + "self_attn.o_proj.weight": r(H, heads * hd, scale=(heads * hd) ** -0.5),
+            p + "self_attn.q_norm.weight": 1 + 0.2 * r(hd), p + "self_attn.k_norm.weight": 1 + 0.2 * r(hd),
+            p + "mlp.gate_proj.weight": r(inter, H, scale=H ** -0.5),
+            p + "mlp.up_proj.weight": r(inter, H, scale=H ** -0.5),
+            p + "mlp.down_proj.weight": r(H, inter, scale=inter ** -0.5)})
+    save_file({k: v.to(torch.bfloat16).contiguous() for k, v in W.items()}, os.path.join(out_dir, "model.safetensors"))
+    cfg = {"architectures": ["Qwen3DSparkModel"], "model_type": "qwen3", "vocab_size": vocab, "hidden_size": H,
+           "intermediate_size": inter, "num_hidden_layers": layers, "num_attention_heads": heads,
+           "num_key_value_heads": kv, "head_dim": hd, "rms_norm_eps": 1e-6, "rope_theta": 1000000.0,
+           "layer_types": ["full_attention"] * layers, "num_target_layers": target_layers, "block_size": block,
+           "mask_token_id": mask_id, "target_layer_ids": list(layer_ids), "num_anchors": 512,
+           "enable_confidence_head": True, "confidence_head_with_markov": True, "markov_rank": rank,
+           "markov_head_type": "vanilla", "tie_word_embeddings": False}
+    json.dump(cfg, open(os.path.join(out_dir, "config.json"), "w", encoding="utf-8"), indent=1)
+
+
+def write_golden_dspark(path, out_json, prompts, vocab):
+    """The engine's DSpark drafts against the reference's: plain tokens, the drafts of every round, and oracle drafts
+    (the true continuation, corrupted where pos % 5 == 2) for long accepted runs, rollback and commit."""
+    target, draft, header, _ = load(path)
+    golden = {"eos": header["generation"]["eos_ids"], "cases": []}
+    for pr in prompts:
+        plain, margins = greedy_plain(target, pr, 40, stop_ids=())
+        spec, rounds = greedy_spec(target, draft, pr, 40, stop_ids=())
+        assert plain == spec, (plain, spec)
+        arr = list(pr) + plain
+        arr = [t if (i < len(pr) or i % 5 != 2) else (t + 1) % vocab for i, t in enumerate(arr)]
+        oracle = lambda pos, d, arr=arr: arr[pos] if pos < len(arr) else 0  # noqa: E731
+        ospec, orounds = greedy_spec(target, draft, pr, 40, stop_ids=(), oracle=oracle)
+        assert ospec == plain
+        golden["cases"].append({"prompt": pr, "tokens": plain, "min_margin": min(margins),
+                                "rounds": [{k: rd[k] for k in ("pos", "anchor", "drafts", "n")} for rd in rounds],
+                                "oracle": arr, "oracle_n": [rd["n"] for rd in orounds]})
+    json.dump(golden, open(out_json, "w", encoding="utf-8"), indent=0)
+
+
 def make_draft(out_dir: str, vocab: int, mask_id: int, gen, H=64, layers=2, heads=4, kv=2, hd=32,
                inter=128, taps=(2, 5, 7), block=16, ktaps=2, group=16, rank=16, topk=16):
     from safetensors.torch import save_file
@@ -535,6 +593,13 @@ def make_core(out: str):
         bdir = os.path.join(out, f"hf_draft_block{block}")
         zlab_drafter(ddir, bdir, layers, block=block)
         convert(tdir, os.path.join(out, f"tiny_block{block}.flyx"), bdir, log=lambda *_: None)
+    # A DSpark drafter (DeepSpec's format, block 7, every row a draft) on the same target, and its golden drafts.  The
+    # DSpark drafters draw from generators of their own: the models after them keep the weights they had without them.
+    sdir = os.path.join(out, "hf_dspark")
+    make_dspark(sdir, vocab, tok.token_to_id("<|mask|>"), torch.Generator().manual_seed(71), layers, (1, 4, 6))
+    spath = os.path.join(out, "tiny_dspark.flyx")
+    convert(tdir, spath, sdir, log=lambda *_: None)
+    write_golden_dspark(spath, os.path.join(out, "golden_dspark.json"), prompts, vocab)
     # The same model with NVFP4 linears (as NVIDIA ModelOpt stores them).
     qdir = os.path.join(out, "hf_target_nvfp4")
     make_nvfp4_dir(tdir, qdir)
@@ -553,6 +618,10 @@ def make_core(out: str):
     q3path = os.path.join(out, "tiny_qwen3.flyx")
     convert(q3dir, q3path, None, log=lambda *_: None)
     n3 = write_golden_hf(q3dir, os.path.join(out, "golden_qwen3.json"), prompts + more)
+    # A DSpark drafter file for it (its 4 layers' outputs after layers 0 and 2): drafting must not change its tokens.
+    s3dir = os.path.join(out, "hf_dspark_qwen3")
+    make_dspark(s3dir, vocab, tok.token_to_id("<|mask|>"), torch.Generator().manual_seed(72), 4, (0, 2))
+    convert_draft(s3dir, os.path.join(out, "tiny_dspark_qwen3.flyx"), log=lambda *_: None)
     # GDN heads of 128 (Qwen3.5's): prefill takes the chunked recurrence on bf16
     # tensor cores, so these cases avoid near-ties as the NVFP4 ones do.
     gdir = os.path.join(out, "hf_gdn128")

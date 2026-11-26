@@ -534,7 +534,7 @@ void test_select() {
   hp.anchor = 1234;
   CK(cudaMemcpy(P, &hp, sizeof(hp), cudaMemcpyHostToDevice));
   int* dr = dev<int>(16);
-  selector_walk(P, ti, tv, k, up(hid), rank, up_bf16(pred), up_bf16(succ), width, nullptr, dr, 0);
+  selector_walk(P, ti, tv, k, up(hid), rank, up_bf16(pred), up_bf16(succ), width, nullptr, dr, 0, 0.f, FLYX_DFLASH2_SOFTCAP_BEFORE, nullptr);
   auto drafts = down_i(dr, width);
   int prev = 1234;
   std::vector<int> want;
@@ -563,7 +563,7 @@ void test_select() {
     bf16 *dpred = up_bf16(pred), *dsucc = up_bf16(succ);
     TreeRows* dt_sc = dev<TreeRows>(1);
     for (int mode : {0, 1}) {
-      selector_walk(P, ti, tv, k, dhid, rank, dpred, dsucc, width, nullptr, dr, 0, sc, mode);
+      selector_walk(P, ti, tv, k, dhid, rank, dpred, dsucc, width, nullptr, dr, 0, sc, mode, nullptr);
       const auto got_w = down_i(dr, width);
       int prev_sc = 1234;
       std::vector<int> want_w;
@@ -589,7 +589,7 @@ void test_select() {
       g_fail += !wok;
 
       const int tw = 9;
-      selector_tree(P, ti, tv, k, dhid, rank, dpred, dsucc, tw, rows, nullptr, dr, dt_sc, 0, sc, mode);
+      selector_tree(P, ti, tv, k, dhid, rank, dpred, dsucc, tw, rows, nullptr, dr, dt_sc, 0, sc, mode, nullptr);
       TreeRows t{};
       CK(cudaMemcpy(&t, dt_sc, sizeof(t), cudaMemcpyDeviceToHost));
       const auto got_t = down_i(dr, size_t(tw));
@@ -607,6 +607,105 @@ void test_select() {
       g_fail += !tok;
     }
   }
+  {  // past 16 candidates (DSpark's walk): the radix top-k, ties and a value shared past the k-th included, and the
+     // walk over them
+    for (const auto& [Vw, kw] : {std::pair{248320, 64}, std::pair{248320, 256}, std::pair{248320, 1024},
+                                 std::pair{300, 256}, std::pair{40, 17}}) {
+      Vec l = randv(size_t(rows) * Vw);
+      for (auto& x : l) x = double(float(x));
+      if (Vw > 1000) {
+        l[7] = l[Vw / 3] = l[Vw - 2] = 10.0;                                             // ties at the top
+        for (int i = 0; i < 400; ++i) l[size_t(Vw) + 11 + 517 * size_t(i)] = 5.0;  // row 1: 400 ties span the k-th
+      }
+      int* wi = dev<int>(rows * kw);
+      float *wv = dev<float>(rows * kw), *wp = dev<float>(rows), *wm = dev<float>(rows);
+      topk_rows(up(l), Vw, Vw, kw, wi, wv, rows, 0, nullptr, nullptr, 0, wp, wm);
+      std::vector<int> want_i(size_t(rows) * kw);
+      Vec want_v(size_t(rows) * kw), want_p(rows), want_m(rows);
+      for (int r = 0; r < rows; ++r) {
+        const double* row = &l[size_t(r) * Vw];
+        ops::topk(row, Vw, kw, &want_i[size_t(r) * kw], &want_v[size_t(r) * kw]);
+        double z = 0.0;
+        for (int v = 0; v < Vw; ++v) z += std::exp(row[v] - want_v[size_t(r) * kw]);
+        want_p[r] = 1.0 / z;
+        want_m[r] = want_v[size_t(r) * kw] - want_v[size_t(r) * kw + 1];
+      }
+      const bool same = down_i(wi, size_t(rows) * kw) == want_i && down(wv, size_t(rows) * kw) == want_v;
+      std::printf("  %-4s top-%d of %d (radix select)\n", same ? "ok" : "FAIL", kw, Vw);
+      g_fail += !same;
+      expect("radix top-k softmax p_max", down(wp, rows), want_p, 1e-5);
+      expect("radix top-k margin", down(wm, rows), want_m, 1e-6);
+      if (Vw > 1000 && kw >= 256) {  // the walk over 256 and 1024 candidates (DSpark's), rank 256
+        const int rk = 256, wd = 3;
+        Vec pr = randv(size_t(Vw) * rk, 0.1), sc = randv(size_t(Vw) * rk, 0.1), ones(size_t(rows) * rk, 1.0);
+        round_bf16(pr);
+        round_bf16(sc);
+        selector_walk(P, wi, wv, kw, up(ones), rk, up_bf16(pr), up_bf16(sc), wd, nullptr, dr, 0, 0.f, FLYX_DFLASH2_SOFTCAP_BEFORE, nullptr);
+        const auto got_w = down_i(dr, wd);
+        std::vector<int> want_w;
+        int pv = 1234;
+        for (int st = 0; st < wd; ++st) {
+          int best = 0;
+          double bs = -1e300;
+          for (int c = 0; c < kw; ++c) {
+            const int cid = want_i[size_t(st) * kw + c];
+            double e = 0;
+            for (int i = 0; i < rk; ++i) e += pr[size_t(pv) * rk + i] * sc[size_t(cid) * rk + i];
+            if (want_v[size_t(st) * kw + c] + e > bs) bs = want_v[size_t(st) * kw + c] + e, best = c;
+          }
+          pv = want_i[size_t(st) * kw + best];
+          want_w.push_back(pv);
+        }
+        std::printf("  %-4s candidate walk over %d candidates\n", got_w == want_w ? "ok" : "FAIL", kw);
+        g_fail += got_w != want_w;
+        // Sampling: each step the best score over T plus the target's Gumbel noise at the draft's position
+        // (P->position + 1 + step, ops::coupled_draft_score), so the drafts follow the target's own choice.
+        const float temp = 0.7f;
+        const uint64_t seed = 12345;
+        selector_walk(P, wi, wv, kw, up(ones), rk, up_bf16(pr), up_bf16(sc), wd, nullptr, dr, 0, 0.f,
+                      FLYX_DFLASH2_SOFTCAP_BEFORE, gen_params(temp, 1.f, 0, seed));
+        const auto got_c = down_i(dr, wd);
+        std::vector<int> want_c;
+        pv = 1234;
+        for (int st = 0; st < wd; ++st) {
+          int best = 0;
+          double bs = -1e300;
+          for (int c = 0; c < kw; ++c) {
+            const int cid = want_i[size_t(st) * kw + c];
+            double e = 0;
+            for (int i = 0; i < rk; ++i) e += pr[size_t(pv) * rk + i] * sc[size_t(cid) * rk + i];
+            const double v =
+                ops::coupled_draft_score(float(want_v[size_t(st) * kw + c] + e), temp, seed, 10 + 1 + st, cid);
+            if (v > bs) bs = v, best = c;
+          }
+          pv = want_i[size_t(st) * kw + best];
+          want_c.push_back(pv);
+        }
+        std::printf("  %-4s candidate walk coupled to the sampler's noise (T %.1f)\n", got_c == want_c ? "ok" : "FAIL",
+                    temp);
+        g_fail += got_c != want_c;
+        // The tree over 256 and 1024 candidates a position (DSpark's; 1024: past 48 KB of shared memory), against
+        // ops::best_first_tree.
+        auto wscore = [&](int32_t prev, int d, int c) {
+          const int cid = want_i[size_t(d) * kw + c];
+          double e = 0;
+          for (int i = 0; i < rk; ++i) e += pr[size_t(prev) * rk + i] * sc[size_t(cid) * rk + i];
+          return want_v[size_t(d) * kw + c] + e;
+        };
+        TreeRows* wt = dev<TreeRows>(1);
+        const int tw = 11;
+        selector_tree(P, wi, wv, kw, up(ones), rk, up_bf16(pr), up_bf16(sc), tw, rows, nullptr, dr, wt, 0, 0.f, FLYX_DFLASH2_SOFTCAP_BEFORE, nullptr);
+        const auto got_t = down_i(dr, size_t(tw));
+        std::vector<int32_t> wtd(static_cast<size_t>(tw)), wtp(static_cast<size_t>(tw));
+        ops::best_first_tree(tw, rows, kw, 1234, want_i.data(), wscore, wtd.data(), wtp.data());
+        const bool same_t = std::vector<int32_t>(got_t.begin(), got_t.end()) == wtd &&
+                            std::equal(want_w.begin(), want_w.end(), wtd.begin());  // its trunk: the walk's chain
+        std::printf("  %-4s candidate tree of %d drafts over %d candidates a position\n", same_t ? "ok" : "FAIL", tw,
+                    kw);
+        g_fail += !same_t;
+      }
+    }
+  }
   // The candidates as a tree (ops/draft/ref.h): drafts, parents, and the TreeRows the round reads; its trunk is the
   // walk's chain.  A tree wider than the positions (it must branch), one that fills a whole round, and one of 5 over
   // 2 positions.
@@ -618,7 +717,7 @@ void test_select() {
   };
   TreeRows* dt = dev<TreeRows>(1);
   for (const auto& [tw, depths] : {std::pair{11, rows}, std::pair{FLYX_MAX_ROWS - 1, rows}, std::pair{5, 2}}) {
-    selector_tree(P, ti, tv, k, up(hid), rank, up_bf16(pred), up_bf16(succ), tw, depths, nullptr, dr, dt, 0);
+    selector_tree(P, ti, tv, k, up(hid), rank, up_bf16(pred), up_bf16(succ), tw, depths, nullptr, dr, dt, 0, 0.f, FLYX_DFLASH2_SOFTCAP_BEFORE, nullptr);
     TreeRows t{};
     CK(cudaMemcpy(&t, dt, sizeof(t), cudaMemcpyDeviceToHost));
     const auto got_drafts = down_i(dr, size_t(tw));

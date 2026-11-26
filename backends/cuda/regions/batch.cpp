@@ -314,7 +314,7 @@ void draft_block_rows(const BatchPass& bp, const DFlashBlock& b, const std::vect
         const size_t row0 = static_cast<size_t>(batch_off[bi]);
         selector_walk(s->P, df.cand + row0 * b.sel_topk, df.unary + row0 * b.sel_topk, b.sel_topk,
                       df.hid + row0 * b.sel_rank, b.sel_rank, b.sel_pred, b.sel_succ, width, s->oracle, s->drafts, st,
-                      b.softcap, b.softcap_mode);
+                      b.softcap, b.softcap_mode, s->G);
       }
     }
     for (size_t g = 0; g < n; ++g) {
@@ -335,7 +335,7 @@ void draft_block_rows(const BatchPass& bp, const DFlashBlock& b, const std::vect
       draft_head_pick(head, s->dh, nr, b.sel_topk, s->cand, s->unary, s, L);
       gemm(s->dh, H, b.sel_hid, b.sel_rank, H, s->hid, b.sel_rank, nr, false, L);
       selector_walk(s->P, s->cand, s->unary, b.sel_topk, s->hid, b.sel_rank, b.sel_pred, b.sel_succ, width, s->oracle,
-                    s->drafts, st, b.softcap, b.softcap_mode);
+                    s->drafts, st, b.softcap, b.softcap_mode, s->G);
     }
     off += n;
   }
@@ -406,8 +406,7 @@ void run_batch(const BatchPass& bp) {
       }
       // A grouped chain must use the same block size it uses alone. Noncausal attention can see later rows.
       if (const auto* d = std::get_if<DFlashBlock>(ps.p->block[0]);
-          d && df.dx && ps.p->nodes[0].arg0 < d->block && d->block * 2 <= FLYX_MAX_ROWS &&
-          (!dflash_blk || dflash_blk == d)) {
+          d && d->groups() && df.dx && ps.p->nodes[0].arg0 < d->block && (!dflash_blk || dflash_blk == d)) {
         dflash_blk = d;
         dflash_members.push_back(idx);
         continue;

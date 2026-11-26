@@ -8,6 +8,8 @@
 #include <map>
 #include <string_view>
 
+#include "core/modelfile/modelfile.h"
+
 namespace flyx::hub {
 
 namespace detail {
@@ -478,7 +480,7 @@ bool select(const Repo& r, const Name& name, std::vector<RepoFile>* files, std::
   if (safetensors && config)
     return *err = r.id + " is a transformers checkpoint (" +
                   (r.architectures.empty() ? std::string("its config names no architecture") : r.architectures[0]) +
-                  "): flyx reads GGUF files (a GGUF repository of it, org/name-GGUF:QUANT) and DFlash2 drafters",
+                  "): flyx reads GGUF files (a GGUF repository of it, org/name-GGUF:QUANT) and DFlash2 or DSpark drafters",
            false;
   files->clear();
   if (flyx.size() == 1) {
@@ -489,8 +491,8 @@ bool select(const Repo& r, const Name& name, std::vector<RepoFile>* files, std::
          false;
 }
 
-bool is_drafter(const Repo& r) {
-  return std::find(r.architectures.begin(), r.architectures.end(), "DFlash2DraftModel") != r.architectures.end();
-}
+bool is_drafter(const Repo& r) { return !drafter_kind(r).empty(); }
+
+std::string drafter_kind(const Repo& r) { return drafter_kind_of(r.architectures); }
 
 }  // namespace flyx::hub

@@ -9,6 +9,7 @@
 #include <map>
 #include <memory>
 #include <string>
+#include <string_view>
 #include <vector>
 
 #include "core/interfaces/model.h"
@@ -31,23 +32,37 @@ using interfaces::ModelOptions;
 // (draft_widths).  DV (models/dv.h) drafts trees, and its canvas follows its
 // own rounds only (Model::restarts).
 enum class Drafter { kNone, kMtp, kDFlash2, kDv, kDSpark };
-const char* drafter_name(Drafter d);
+const char* drafter_name(Drafter d);   // --drafter's word for it ("none" for kNone)
+const char* drafter_title(Drafter d);  // its name in messages ("DFlash2", "DSpark")
+Drafter drafter_named(std::string_view name);  // kNone when no drafter is called so
+bool is_block_drafter(Drafter d);        // a parallel block drafter (models/drafters/registry.h builds it)
+// A block drafter whose trees beside its chains pay on attention-only targets (DSpark's): drafted by default there.
+bool drafts_trees_by_default(Drafter d);
+bool drafts_q8_beside_float(Drafter d);  // its projections Q8_0 beside a float target, measured as losing nothing
+
+// What a drafter drafts a round, as its blocks say: the most as trained, and whether its block stretches past them up
+// to a round's rows (DFlash2's block: one shared mask token every row) or drafts its block at most.
+struct DrafterReach {
+  int max_drafts = 0;
+  bool stretch = false;
+};
 
 // What a .flyx file says of its NVFP4 weights' inputs ("quant": {"activations": ...}; "" if nothing).
 std::string declared_activations(const ModelFile& file);
 
 // The drafters a model has: in its own file, or in drafter files beside it (ModelFile::add).
 struct DrafterSources {
-  bool mtp = false, dflash2 = false;                // the model has one
-  bool mtp_beside = false, dflash2_beside = false;  // ... from a drafter file
-  bool dv = false;                                  // the model file has a DV drafter
-  bool dspark = false, dspark_beside = false;       // DSpark drafter (Inkling-2 companion GGUF)
+  bool mtp = false, mtp_beside = false;   // the model has an MTP layer; ... from a drafter file
+  Drafter block = Drafter::kNone;          // its drafter of DFlash2's block (kDFlash2, kDSpark), kNone: none
+  bool block_beside = false;               // ... from a drafter file
+  bool dspark_gguf = false;                // llama.cpp's DSpark GGUF beside it (its own block): kDSpark beside `block`
+  bool dv = false;                         // the model file has a DV drafter
 };
 
 // The drafters a model holds, the MTP layer first: the one
 // named; "all": every one it has; none named: every drafter given in a file of
 // its own, and of the model file's own the MTP layer if it has one, else its
-// DFlash2 drafter (a file with both keeps the one measured faster on it, until
+// block drafter (a file with both keeps the one measured faster on it, until
 // choosing between them is measured there); its DV drafter only when named
 // ("dv", "all"); none when the options say so.  DV drafts alone:
 // beside another drafter it is refused.
@@ -125,6 +140,7 @@ class Model : public interfaces::Model {
   int trained_ctx() const override { return trained_ctx_; }
   bool drafts_trees(int d) const override;
   bool file_drafts_trees() const override { return file_drafts_trees_; }
+  bool draft_trees_by_default() const override { return draft_trees_by_default_; }
   bool restarts(int d) const override;
   bool kv_fp8_by_default() const override { return kv_fp8_by_default_; }
   const interfaces::VisionAdapter* vision() const override { return vision_adapter_.get(); }
@@ -135,7 +151,7 @@ class Model : public interfaces::Model {
   explicit Model(const ModelFile& file) : tables_(file) {}
   int trained_ctx_ = 0;  // set by the architecture from its file
   // A drafter the model holds: its block, the most drafts it proposes in a round.
-  void add_drafter(Drafter kind, int block, int max_drafts);
+  void add_drafter(Drafter kind, int block, DrafterReach reach);
   void set_vision(std::unique_ptr<interfaces::VisionAdapter> adapter, std::vector<flyx_node> nodes) {
     vision_adapter_ = std::move(adapter);
     vision_nodes_ = std::move(nodes);
@@ -145,15 +161,17 @@ class Model : public interfaces::Model {
 
   struct DrafterBlock {
     Drafter kind;
-    int block;       // its FLYX_BLOCK_MTP / FLYX_BLOCK_DFLASH2 / FLYX_BLOCK_DV block
-    int max_drafts;  // the most it proposes in a round
+    int block;       // its FLYX_BLOCK_MTP / FLYX_BLOCK_DFLASH2 / FLYX_BLOCK_DSPARK / FLYX_BLOCK_DV block
+    int max_drafts;  // the most it proposes in a round as trained
+    bool stretch;    // its block drafts past them, up to a round's rows (DrafterReach)
   };
   Tables tables_;
   std::vector<DrafterBlock> drafters_;
   std::shared_ptr<const interfaces::VisionAdapter> vision_adapter_;
   std::vector<flyx_node> vision_nodes_;
   bool kv_fp8_by_default_ = true;         // FP8 where a real model of the family showed no visible drop
-  bool file_drafts_trees_ = false;        // the file holds DV, asked for or not
+  bool file_drafts_trees_ = false;        // the file holds DV or a block drafter drafting trees by default
+  bool draft_trees_by_default_ = false;   // its block drafter drafts trees by default (drafts_trees_by_default)
   bool verify_scales_with_width_ = false; // sparse-MoE targets whose verify cost climbs steeply with verify width
 
  private:

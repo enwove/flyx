@@ -415,6 +415,58 @@ void test_draft_pick(int V, int K, bool plant, bool pick) {
     g_fail += !prob_ok;
   }
 
+  if (V >= 2 * 2048 + 1) {  // a wide pick (a DSpark walk's): 1024 candidates scored exactly, in order
+    const int kw = 1024;
+    int* wi = dev<int>(size_t(rows) * kw);
+    float* wv = dev<float>(size_t(rows) * kw);
+    draft_pick(dx, K, h, dw, V, K, rows, kw, wi, wv, rough, TL, false);
+    std::vector<int> gwi(size_t(rows) * kw);
+    CK(cudaMemcpy(gwi.data(), wi, gwi.size() * 4, cudaMemcpyDeviceToHost));
+    // The pick of kDraftCands from the same rough scores: its 256 best, every one among the wide pick's (the wide
+    // pick's pool is the same; it keeps more of it).
+    int* si = dev<int>(size_t(rows) * 256);
+    draft_pick(dx, K, h, dw, V, K, rows, 256, si, nullptr, rough, TL);
+    std::vector<int> small(size_t(rows) * 256);
+    CK(cudaMemcpy(small.data(), si, small.size() * 4, cudaMemcpyDeviceToHost));
+    CK(cudaFree(si));
+    const Vec gwv = down(wv, size_t(rows) * kw);
+    Vec exact(size_t(rows) * kw);
+    bool sorted = true, top = true;
+    int hit = 0;
+    for (int r = 0; r < rows; ++r) {
+      std::vector<std::pair<double, int>> ex(V);
+      for (int n = 0; n < V; ++n) {
+        double a = 0;
+        for (int q = 0; q < K; ++q) a += x[size_t(r) * K + q] * w[size_t(n) * K + q];
+        ex[n] = {-a, n};
+      }
+      std::vector<double> by_id(V);
+      for (const auto& [na, n] : ex) by_id[size_t(n)] = -na;
+      std::partial_sort(ex.begin(), ex.begin() + k, ex.end());
+      const int* g = gwi.data() + size_t(r) * kw;
+      for (int j = 0; j < kw; ++j) {
+        exact[size_t(r) * kw + j] = by_id[size_t(g[j])];
+        if (j > 0) {
+          const double a = gwv[size_t(r) * kw + j - 1], b = gwv[size_t(r) * kw + j];
+          sorted = sorted && (a > b || (a == b && g[j - 1] < g[j]));
+        }
+      }
+      for (int j = 0; j < k; ++j) top = top && g[j] == ex[size_t(j)].second;
+      std::vector<int> mine(g, g + kw);
+      std::sort(mine.begin(), mine.end());
+      for (int j = 0; j < 256; ++j) hit += std::binary_search(mine.begin(), mine.end(), small[size_t(r) * 256 + j]);
+    }
+    std::printf("  %-4s %-48s\n", sorted && top ? "ok" : "FAIL", "wide pick: 1024 in order, the exact top 16 first");
+    g_fail += !(sorted && top);
+    expect("wide pick: their exact logits", gwv, exact, 1e-5);
+    const bool superset = hit == 256 * rows;
+    std::printf("  %-4s wide pick: the 256 a kDraftCands pick keeps among them (%d of %d)\n", superset ? "ok" : "FAIL",
+                hit, 256 * rows);
+    g_fail += !superset;
+    CK(cudaFree(wi));
+    CK(cudaFree(wv));
+  }
+
   // Shared additive/softcap two-stage candidate-head primitives: gemm_sign_rough_add, draft_score_bf16 (accum),
   // draft_combine_cands, and draft_pick_topk (run once on the small test case).
   if (V <= kDraftCandCap) {

@@ -28,9 +28,9 @@ std::string mismatch_msg(const TargetSpec& target) {
          std::to_string(target.vocab) + ", " + std::to_string(target.layers) + " layers)";
 }
 
-// A canonical config ("draft"): a DFlash2 drafter, made for this target where it says what it was made for.
+// A canonical config ("draft"): a DFlash2 or DSpark drafter, made for this target where it says what it was made for.
 void check_json_target(const json& j, const TargetSpec& target) {
-  if (j.value("kind", "") != "dflash2") throw std::runtime_error(mismatch_msg(target));
+  if (block_drafter_kind(j) == Drafter::kNone) throw std::runtime_error(mismatch_msg(target));
   if (!j.contains("target") || !j["target"].is_object()) return;
   const json& t = j["target"];
   const int tv = t.value("vocab", target.vocab);
@@ -89,12 +89,16 @@ std::string gguf_draft_name(const std::string& name) {
 
 void validate_dflash2_spec(DFlash2Spec* spec, const TargetSpec& target) {
   flyx_dflash2_block& d = spec->block;
-  if (d.block < 2 || d.block > FLYX_MAX_ROWS)
-    throw std::runtime_error("DFlash2 block size outside 2.." + std::to_string(FLYX_MAX_ROWS));
-  if (d.hidden != target.hidden) throw std::runtime_error("DFlash2 hidden size does not match target");
+  // A round's rows: a block from the row after the anchor's (draft_from 1) has block - 1 drafts, one from the
+  // anchor's row (draft_from 0) a draft every row.
+  const int most = FLYX_MAX_ROWS - (1 - d.draft_from);
+  const char* what = drafter_title(spec->kind);
+  if (d.block < 2 || d.block > most)
+    throw std::runtime_error(std::string(what) + " block size outside 2.." + std::to_string(most));
+  if (d.hidden != target.hidden) throw std::runtime_error(std::string(what) + " hidden size does not match target");
   const int max_vocab = target.padded_vocab();
   if (d.hidden <= 0 || spec->layers <= 0 || d.n_heads <= 0 || d.n_kv <= 0 || d.head_dim <= 0 || d.head_dim % 2 != 0 ||
-      d.inter <= 0 || d.n_heads % d.n_kv != 0 || d.conv_taps <= 0 || d.sel_rank <= 0 || d.sel_rank > kMaxWidth ||
+      d.inter <= 0 || d.n_heads % d.n_kv != 0 || d.conv_taps < 0 || d.sel_rank <= 0 || d.sel_rank > kMaxWidth ||
       d.sel_topk <= 0 || d.sel_topk > target.vocab || d.mask_token < 0 || d.mask_token >= max_vocab ||
       !(spec->eps > 0) || !std::isfinite(spec->eps) || !(d.theta > 0) || !std::isfinite(d.theta) ||
       !std::isfinite(d.softcap) || d.softcap < 0.0f ||
@@ -116,6 +120,11 @@ void validate_dflash2_spec(DFlash2Spec* spec, const TargetSpec& target) {
 }
 
 }  // namespace
+
+Drafter block_drafter_kind(const json& draft) {
+  const Drafter k = draft.is_object() ? drafter_named(draft.value("kind", "")) : Drafter::kNone;
+  return is_block_drafter(k) ? k : Drafter::kNone;
+}
 
 bool is_dflash_companion(const json& header) {
   if (!header.is_object()) return false;
@@ -169,6 +178,12 @@ DFlash2Spec parse_dflash2_json(const ModelFile& file, const json& j, const Targe
   const std::string pred_name =
       companion >= 0 ? ModelFile::companion_name(companion, "draft.sel.pred") : std::string("draft.sel.pred");
   spec.sel_vocab = resolve_sel_vocab(file, pred_name, target);
+  spec.kind = block_drafter_kind(j);
+  const int64_t from = req_int(j, "draft_from");
+  if (from != 0 && from != 1) throw std::runtime_error("block drafter draft_from " + std::to_string(from));
+  d.draft_from = int32_t(from);
+  if (!j.contains("sel_gate") || !j["sel_gate"].is_boolean()) throw std::runtime_error("block drafter sel_gate missing");
+  spec.sel_gate = j["sel_gate"].get<bool>();
   validate_dflash2_spec(&spec, target);
   return spec;
 }
@@ -191,6 +206,7 @@ DFlash2Spec parse_dflash2_gguf(const ModelFile& file, const json& header, const 
   spec.gguf = true;
   spec.companion = companion;
   flyx_dflash2_block& d = spec.block;
+  d.draft_from = 1;
   d.hidden = cm.count("embedding_length");
   spec.layers = cm.count("block_count");
   d.inter = cm.count("feed_forward_length");
@@ -308,10 +324,11 @@ int build_dflash2(Tables& T, const DFlash2Spec& spec, const TargetSpec& target) 
     y.gate = T.weight(dn(p + "mlp.gate"), {I, H});
     y.up = T.weight(dn(p + "mlp.up"), {I, H});
     y.down = T.weight(dn(p + "mlp.down"), {H, I});
-    y.attn_conv_proj = T.weight(dn(p + "attn_conv.proj"), {TG2, H});
-    y.attn_conv_base = T.weight(dn(p + "attn_conv.base"), {2, d.conv_taps, H});
-    y.mlp_conv_proj = T.weight(dn(p + "mlp_conv.proj"), {TG2, H});
-    y.mlp_conv_base = T.weight(dn(p + "mlp_conv.base"), {2, d.conv_taps, H});
+    const bool conv = d.conv_taps > 0;  // none: -1
+    y.attn_conv_proj = conv ? T.weight(dn(p + "attn_conv.proj"), {TG2, H}) : -1;
+    y.attn_conv_base = conv ? T.weight(dn(p + "attn_conv.base"), {2, d.conv_taps, H}) : -1;
+    y.mlp_conv_proj = conv ? T.weight(dn(p + "mlp_conv.proj"), {TG2, H}) : -1;
+    y.mlp_conv_base = conv ? T.weight(dn(p + "mlp_conv.base"), {2, d.conv_taps, H}) : -1;
     T.block(b);
   }
   d.fc = T.weight(dn("draft.fc"), {H, int64_t(d.n_taps) * target.hidden});
@@ -319,7 +336,8 @@ int build_dflash2(Tables& T, const DFlash2Spec& spec, const TargetSpec& target) 
   d.norm = T.norm(dn("draft.norm"), H, 0.0, eps);
   d.sel_pred = T.weight(dn("draft.sel.pred"), {spec.sel_vocab, d.sel_rank});
   d.sel_succ = T.weight(dn("draft.sel.succ"), {spec.sel_vocab, d.sel_rank});
-  d.sel_hid = T.weight(dn("draft.sel.hid"), {d.sel_rank, H});
+  d.sel_hid = spec.sel_gate ? T.weight(dn("draft.sel.hid"), {d.sel_rank, H}) : -1;  // -1: a unit gate
+  d.q8_weights = drafts_q8_beside_float(spec.kind) ? 1 : 0;
 
   flyx_state st{};
   st.kind = FLYX_STATE_KV;

@@ -3,42 +3,47 @@
 #pragma once
 
 #include <charconv>
+#include <iterator>
 #include <string>
 #include <string_view>
+#include <utility>
 
 namespace flyx::interfaces {
 
 enum class DrafterMode { kAuto, kMtp, kDFlash2, kDv, kDSpark, kAll, kNone };
+
+// --drafter's words (FLYX_DRAFTER's, the server's "drafter"); "" is kAuto.
+inline constexpr std::pair<std::string_view, DrafterMode> kDrafterModes[] = {
+    {"mtp", DrafterMode::kMtp}, {"dflash2", DrafterMode::kDFlash2}, {"dspark", DrafterMode::kDSpark},
+    {"dv", DrafterMode::kDv},   {"all", DrafterMode::kAll},         {"none", DrafterMode::kNone},
+};
+
+// The word for a mode ("" for kAuto).
+inline const char* drafter_mode_word(DrafterMode m) {
+  for (const auto& [word, mode] : kDrafterModes)
+    if (mode == m) return word.data();  // literals: NUL-terminated
+  return "";
+}
+
+// The words as a message lists them: "mtp, dflash2, dspark, dv, all or none".
+inline std::string drafter_mode_words() {
+  std::string out;
+  const size_t n = std::size(kDrafterModes);
+  for (size_t i = 0; i < n; ++i)
+    out += (i == 0 ? "" : i + 1 == n ? " or " : ", ") + std::string(kDrafterModes[i].first);
+  return out;
+}
 
 inline bool parse_drafter_mode(std::string_view value, DrafterMode* out) {
   if (value.empty()) {
     *out = DrafterMode::kAuto;
     return true;
   }
-  if (value == "mtp") {
-    *out = DrafterMode::kMtp;
-    return true;
-  }
-  if (value == "dflash2") {
-    *out = DrafterMode::kDFlash2;
-    return true;
-  }
-  if (value == "dv") {
-    *out = DrafterMode::kDv;
-    return true;
-  }
-  if (value == "dspark") {
-    *out = DrafterMode::kDSpark;
-    return true;
-  }
-  if (value == "all") {
-    *out = DrafterMode::kAll;
-    return true;
-  }
-  if (value == "none") {
-    *out = DrafterMode::kNone;
-    return true;
-  }
+  for (const auto& [word, mode] : kDrafterModes)
+    if (value == word) {
+      *out = mode;
+      return true;
+    }
   return false;
 }
 

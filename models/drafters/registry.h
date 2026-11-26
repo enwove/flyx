@@ -1,7 +1,9 @@
 // Copyright 2026 The flyx Authors. SPDX-License-Identifier: Apache-2.0
 // Unified speculative drafter discovery, attachment, and program-node emission shared across
 // all target model architectures. Any architecture supplies a TargetSpec (and optional MtpHooks)
-// to automatically support DFlash2 (.flyx / HF safetensors / arch="dflash" GGUF) and MTP.
+// to automatically support its block drafter (DFlash2: .flyx / HF safetensors / arch="dflash" GGUF; DSpark: DeepSpec's
+// safetensors or .flyx as DFlash2's block, llama.cpp's DSpark GGUF as its own) and MTP.  A model holds one drafter of
+// DFlash2's block at most, and llama.cpp's DSpark GGUF beside it (one DSpark of either).
 #pragma once
 
 #include <optional>
@@ -30,9 +32,10 @@ class DrafterRegistry {
   // Validate specs of chosen drafters before target tensor binding (refuses bad configs early).
   void validate_selected(const ModelFile& file, const std::vector<Drafter>& selected, const TargetSpec& target);
 
-  // Build blocks for `kind` (kMtp, kDFlash2, or kDSpark) in `T`, returning the drafter block index and its max drafts.
+  // Build blocks for `kind` (kMtp, or the block drafter's) in `T`, returning the drafter block index and what it
+  // drafts a round (DrafterReach).
   int attach(Drafter kind, const ModelFile& file, Tables& T, const TargetSpec& target, const MtpHooks* mtp,
-             int* max_drafts_out);
+             DrafterReach* reach);
 
   // Emit FLYX_NODE_TAP nodes for drafters that tap the pre-layer input (0-based visit index, e.g., DSpark).
   void emit_pre_visit_taps(std::vector<flyx_node>* p, int visit_0based) const;
@@ -45,7 +48,7 @@ class DrafterRegistry {
   // Emit FLYX_NODE_TAP nodes (FLYX_TAP_NORMED: post output_norm) for taps equal to `n_layers` (DFlash2 and DSpark).
   void emit_post_norm_taps(std::vector<flyx_node>* p, int n_layers) const;
 
-  // Emit FLYX_NODE_CONTEXT nodes for all attached drafters managed by this registry (MTP, DFlash2, DSpark).
+  // Emit FLYX_NODE_CONTEXT nodes for all attached drafters managed by this registry (MTP, the block drafter).
   void emit_contexts(std::vector<flyx_node>* p) const;
 
  private:
@@ -54,9 +57,9 @@ class DrafterRegistry {
 
   DrafterSources sources_{};
   int mtp_companion_ = -1;
-  int dflash2_companion_ = -1;  // the companion holding the DFlash2 drafter, -1: the model file ("draft")
+  int block_companion_ = -1;   // the companion holding the drafter of DFlash2's block, -1: the model file ("draft")
+  int dspark_companion_ = -1;  // the companion holding llama.cpp's DSpark GGUF
   std::optional<DFlash2Spec> dflash2_spec_;
-  int dspark_companion_ = -1;
   std::optional<DSparkSpec> dspark_spec_;
 
   int target_layers_ = 0;
@@ -66,7 +69,7 @@ class DrafterRegistry {
     std::vector<int> taps;
     void emit(std::vector<flyx_node>* p, int position, int flags) const;
   };
-  BlockTaps dflash2_, dspark_;
+  BlockTaps dflash2_, dspark_;  // DFlash2's block (DFlash2's or DeepSpec's DSpark), llama.cpp's DSpark GGUF
   std::vector<int> context_blocks_;
 };
 

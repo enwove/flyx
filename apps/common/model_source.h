@@ -19,7 +19,8 @@ namespace flyx::apps {
 
 // A drafter that goes with a model, or one published for it.
 struct DrafterSource {
-  std::string kind;            // "mtp", "dflash2" or "dspark" (its header's or the Hub's word), "" if unknown
+  std::string kind;            // "mtp", or a block drafter's ("dflash2", "dspark"), as its header or the Hub says;
+                               // "" if unknown
   std::string from;            // "model file" (its own MTP layer), a Hub name or file of a repository, or a path
   std::optional<uint64_t> size;  // bytes on disk; none where only the Hub could tell (or inside the model's file)
 };

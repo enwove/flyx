@@ -8,6 +8,7 @@
 #include "backends/cuda/kernels/common/device.cuh"
 #include "backends/cuda/kernels/common/launch.h"
 #include "backends/cuda/kernels/kernels.cuh"
+#include "ops/sampling/sampling.h"
 
 namespace flyx::cuda {
 namespace {
@@ -34,14 +35,16 @@ __device__ __forceinline__ float dflash2_score(float u, float e, float softcap, 
   return u + e;
 }
 
-// One block of 32*k threads: warp c scores candidate c.
+// One block of 32 * min(k, 32) threads: warp w scores candidates w, w + 32, ...; thread 0 takes the best (the first
+// on ties).  Sampling (G's temperature > 0): the scores coupled to the target's noise (ops::coupled_draft_score).
 __global__ void k_selector_walk(const DevParams* P, const int* cand, const float* unary, int k, const float* hid,
                                 int rank, const bf16* pred, const bf16* succ, int width, const int* oracle,
-                                int* drafts, float softcap, int softcap_mode) {
+                                int* drafts, float softcap, int softcap_mode, const DevGen* G) {
   pdl_trigger();
-  __shared__ float score[kTopMax];
+  const float T = G ? G->temperature : 0.f;
+  __shared__ float score[kWalkMax];
   __shared__ int prev;
-  const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
+  const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31, warps = blockDim.x >> 5;
   if (P->oracle_len > 0) {
     if (threadIdx.x < width) {
       const int pos = P->position + 1 + threadIdx.x;
@@ -52,15 +55,18 @@ __global__ void k_selector_walk(const DevParams* P, const int* cand, const float
   if (threadIdx.x == 0) prev = P->anchor;
   __syncthreads();
   for (int s = 0; s < width; ++s) {
-    if (warp < k) {
-      const int cid = cand[s * k + warp];
-      const bf16* pr = pred + size_t(prev) * rank;
+    const bf16* pr = pred + size_t(prev) * rank;
+    const float* hs = hid + size_t(s) * rank;
+    for (int c = warp; c < k; c += warps) {
+      const int cid = cand[s * k + c];
       const bf16* sc = succ + size_t(cid) * rank;
-      const float* hs = hid + size_t(s) * rank;
       float e = 0.f;
       for (int i = lane; i < rank; i += 32) e += __bfloat162float(pr[i]) * hs[i] * __bfloat162float(sc[i]);
       e = warp_sum(e);
-      if (lane == 0) score[warp] = dflash2_score(unary[s * k + warp], e, softcap, softcap_mode);
+      if (lane == 0) {
+        const float sc = dflash2_score(unary[s * k + c], e, softcap, softcap_mode);
+        score[c] = T > 0.f ? ops::coupled_draft_score(sc, T, G->seed, int64_t(P->position) + 1 + s, cid) : sc;
+      }
     }
     __syncthreads();
     if (threadIdx.x == 0) {
@@ -75,20 +81,22 @@ __global__ void k_selector_walk(const DevParams* P, const int* cand, const float
 }
 
 // ops/draft/ref.h's best_first_tree on the selector's scores (the walk's chain, then branches best first), the tree
-// written as the round reads it (TreeRows).  One
-// block of 32*k threads: warp c scores candidate c of the node being expanded (as k_selector_walk does), warp 0
-// normalises them and picks the next node.  With the test's drafts (P->oracle_len), a chain of them.
+// written as the round reads it (TreeRows).  One block of 32 * min(k, 32) threads: warp w scores candidates w, w + 32,
+// ... of the node being expanded (as k_selector_walk does), the block normalises them, warp 0 picks the next node.
+// With the test's drafts (P->oracle_len), a chain of them.
 __global__ void k_selector_tree(const DevParams* P, const int* cand, const float* unary, int k, const float* hid,
                                 int rank, const bf16* pred, const bf16* succ, int width, int depths,
-                                const int* oracle, int* drafts, TreeRows* tree, float softcap, int softcap_mode) {
+                                const int* oracle, int* drafts, TreeRows* tree, float softcap, int softcap_mode,
+                                const DevGen* G) {
   pdl_trigger();
   constexpr int kRows = FLYX_MAX_ROWS;
-  __shared__ float val[kRows * kTopMax];  // node n's child c at n * k + c; -inf: none, or taken
-  __shared__ float score[kTopMax];
+  extern __shared__ float tree_smem[];
+  float* val = tree_smem;              // [kRows * k]: node n's child c at n * k + c; -inf: none, or taken
+  float* score = tree_smem + kRows * k;  // [k]: the node being expanded, its candidates' scores
   __shared__ int row_tok[kRows], row_parent[kRows], row_depth[kRows];
   __shared__ float row_val[kRows];
-  const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
-  for (int i = threadIdx.x; i < kRows * kTopMax; i += blockDim.x) val[i] = -INFINITY;
+  const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31, warps = blockDim.x >> 5;
+  for (int i = threadIdx.x; i < kRows * k; i += blockDim.x) val[i] = -INFINITY;
   for (int i = threadIdx.x; i < kRows * kRows; i += blockDim.x) tree->path[i / kRows][i % kRows] = 0;
   if (threadIdx.x == 0) {
     row_tok[0] = P->anchor;
@@ -106,29 +114,49 @@ __global__ void k_selector_tree(const DevParams* P, const int* cand, const float
         row_depth[i + 1] = i + 1;
       }
   } else {
+    const float T = G ? G->temperature : 0.f;
     for (int n = 0; n < width; ++n) {
       const int d = row_depth[n];
-      if (d < depths) {  // node n's children
-        if (warp < k) {
-          const int cid = cand[d * k + warp];
-          const bf16* pr = pred + size_t(row_tok[n]) * rank;
-          const bf16* sc = succ + size_t(cid) * rank;
-          const float* hs = hid + size_t(d) * rank;
+      if (d < depths) {  // node n's children: their log-probabilities over the node's k candidates
+        const bf16* pr = pred + size_t(row_tok[n]) * rank;
+        const float* hs = hid + size_t(d) * rank;
+        for (int c = warp; c < k; c += warps) {
+          const bf16* sc = succ + size_t(cand[d * k + c]) * rank;
           float e = 0.f;
           for (int i = lane; i < rank; i += 32) e += __bfloat162float(pr[i]) * hs[i] * __bfloat162float(sc[i]);
           e = warp_sum(e);
-          if (lane == 0) score[warp] = dflash2_score(unary[d * k + warp], e, softcap, softcap_mode);
+          if (lane == 0) score[c] = dflash2_score(unary[d * k + c], e, softcap, softcap_mode);
         }
         __syncthreads();
-        if (warp == 0) {
-          const float s = lane < k ? score[lane] : -INFINITY;
-          float m = s;
-          for (int o = 16; o > 0; o >>= 1) m = fmaxf(m, __shfl_xor_sync(0xffffffffu, m, o));
-          const float z = warp_sum(lane < k ? expf(s - m) : 0.f);
-          if (lane < k) val[n * k + lane] = row_val[n] + (s - m - logf(z));
-        }
+        float m = -INFINITY;
+        for (int c = threadIdx.x; c < k; c += blockDim.x) m = fmaxf(m, score[c]);
+        m = block_max(m);
+        float z = 0.f;
+        for (int c = threadIdx.x; c < k; c += blockDim.x) z += expf(score[c] - m);
+        z = block_sum(z);
+        for (int c = threadIdx.x; c < k; c += blockDim.x) val[n * k + c] = row_val[n] + (score[c] - m - logf(z));
       }
       __syncthreads();
+      if (T > 0.f && n < min(width, depths)) {  // the trunk, sampling: the walk's coupled choice (k_selector_walk)
+        if (threadIdx.x == 0) {
+          int best = 0;
+          float bs = -INFINITY;
+          for (int c = 0; c < k; ++c) {
+            const float v =
+                ops::coupled_draft_score(score[c], T, G->seed, int64_t(P->position) + 1 + d, cand[d * k + c]);
+            if (v > bs) bs = v, best = c;
+          }
+          const int r = n + 1, bi = n * k + best;
+          row_parent[r] = n;
+          row_tok[r] = cand[d * k + best];
+          row_val[r] = val[bi];
+          val[bi] = -INFINITY;
+          row_depth[r] = d + 1;
+          drafts[n] = row_tok[r];
+        }
+        __syncthreads();
+        continue;
+      }
       if (warp == 0) {  // the highest-valued child: ties to the lower index (the earlier node, the lower candidate)
         // The trunk (the walk's chain): node n's children only, node n being the trunk's last.
         const int from = n < min(width, depths) ? n * k : 0;
@@ -359,18 +387,34 @@ void grouped_conv(const float* x, int ldx, const float* delta, int ld_delta, con
 
 void selector_walk(const DevParams* P, const int* cand, const float* unary, int k, const float* hid, int rank,
                    const bf16* pred, const bf16* succ, int width, const int* oracle, int* drafts, cudaStream_t st,
-                   float softcap, int softcap_mode) {
-  k_selector_walk<<<1, 32 * (k > 1 ? k : 1), 0, st>>>(P, cand, unary, k, hid, rank, pred, succ, width, oracle, drafts,
-                                                      softcap, softcap_mode);
+                   float softcap, int softcap_mode, const DevGen* G) {
+  if (k < 1 || k > kWalkMax || width < 1 || width > FLYX_MAX_WIDE_ROWS)
+    throw std::runtime_error("selector_walk: candidates or width out of range");
+  k_selector_walk<<<1, 32 * std::min(k, 32), 0, st>>>(P, cand, unary, k, hid, rank, pred, succ, width, oracle,
+                                                      drafts, softcap, softcap_mode, G);
 }
+
+namespace {
+
+// The dynamic shared memory a tree of k candidates a position takes (kWalkMax: 69 KB), within what the device gives
+// the kernel beside its static shared memory (optin_dynamic_smem, opted in to once).
+size_t tree_shared_bytes(int k) {
+  static const int room = optin_dynamic_smem(k_selector_tree);
+  const size_t bytes = (size_t(FLYX_MAX_ROWS) + 1) * size_t(k) * sizeof(float);
+  if (bytes > size_t(room)) throw std::runtime_error("selector_tree: the device takes no tree this wide");
+  return bytes;
+}
+
+}  // namespace
 
 void selector_tree(const DevParams* P, const int* cand, const float* unary, int k, const float* hid, int rank,
                    const bf16* pred, const bf16* succ, int width, int depths, const int* oracle, int* drafts,
-                   TreeRows* tree, cudaStream_t st, float softcap, int softcap_mode) {
-  if (k < 1 || k > kTopMax || width < 1 || width >= FLYX_MAX_ROWS)
+                   TreeRows* tree, cudaStream_t st, float softcap, int softcap_mode, const DevGen* G) {
+  if (k < 1 || k > kWalkMax || width < 1 || width >= FLYX_MAX_ROWS)
     throw std::runtime_error("selector_tree: candidates or width out of range");
-  k_selector_tree<<<1, 32 * (k > 1 ? k : 1), 0, st>>>(P, cand, unary, k, hid, rank, pred, succ, width, depths, oracle,
-                                                      drafts, tree, softcap, softcap_mode);
+  k_selector_tree<<<1, 32 * std::min(k, 32), tree_shared_bytes(k), st>>>(P, cand, unary, k, hid, rank, pred, succ,
+                                                                         width, depths, oracle, drafts, tree, softcap,
+                                                                         softcap_mode, G);
 }
 
 void tap_copy(const float* x, int H, float* feats, int ld_feats, int slot, int rows, cudaStream_t st) {

@@ -613,6 +613,8 @@ void dots_blocks(const BlockMat& W, int K, const int* idx, const int* count, flo
 // max(N, kDraftPickFloats) floats.  For drafts only: the target verifies every one.
 // kDraftCandCap: the most candidates scored exactly (the kDraftCands best and their ties).
 constexpr int kDraftCands = 256, kDraftPickFloats = 1025, kDraftCandCap = 512;
+// The most candidates a row a selector walk takes (the draft head's exact candidates, a wide pick's, or topk_rows's).
+constexpr int kWalkMax = 1024;
 struct SignHead {
   uint32_t* bits = nullptr;  // word w of row n at sign_word_at: bit j set when weight 32 w + j >= +0
   bf16* scales = nullptr;    // scale g of row n at sign_scale_at: mean |w| of weights 64 g .. 64 g + 63
@@ -632,17 +634,22 @@ void gemm_sign_rough(const float* x, int ldx, const SignHead& h, int N, int K, f
 // y[n] += rough(x, h)[n] + (bias ? bias[n] : 0) for 1 row, L2-caching h for small tables reused across steps.
 void gemm_sign_rough_add(const float* x, int ldx, const SignHead& h, const float* bias, int N, int K, float* y,
                          int ldy, const Launch& L);
-// Shared two-stage candidate-set primitives over rough [rows][ld] (ld >= max(V, kDraftPickFloats)):
-// select ~kDraftCands survivors per row, score survivors against any bf16 matrix (overwrite or accumulate + bias +
-// softcap), combine a packed dots_blocks candidate vector + bias + softcap, and pick top-k with prob/margin.
-void draft_select_cands(float* rough, int ld, int V, int rows, const Launch& L);
+// Shared two-stage candidate-set primitives over rough [rows][ld] (ld >= max(V, kDraftPickFloats)), a row's
+// candidates laid out where its rough scores were ([cap] indices, [cap] exact scores, the count): select the `want`
+// best per row with their ties (kDraftCands in kDraftCandCap; more in a wider layout, as draft_pick takes them),
+// score survivors against any bf16 matrix (overwrite or accumulate + bias + softcap), combine a packed dots_blocks
+// candidate vector + bias + softcap, and pick top-k with prob/margin.
+void draft_select_cands(float* rough, int ld, int V, int rows, const Launch& L, int want = kDraftCands,
+                        int cap = kDraftCandCap);
 void draft_score_bf16(const float* x, int ldx, const bf16* W, const float* bias, int K, int rows, float* rough, int ld,
-                      bool accumulate, float softcap, cudaStream_t st);
+                      bool accumulate, float softcap, cudaStream_t st, int cap = kDraftCandCap);
 void draft_combine_cands(const float* add, int ld_add, const float* bias, float softcap, int rows, float* rough, int ld,
                          cudaStream_t st);
 void draft_pick_topk(float* rough, int ld, int rows, int k, int* idx, float* val, cudaStream_t st,
                      float* prob = nullptr, float* margin = nullptr, const DevParams* P = nullptr, int pos_add = 0,
-                     const DevGen* G = nullptr);
+                     const DevGen* G = nullptr, int cap = kDraftCandCap);
+// k past kDraftCands (a wide walk's, up to kWalkMax): that many candidates scored exactly, as far as the rows' room
+// allows.
 void draft_pick(const float* x, int ldx, const SignHead& h, const bf16* W, int V, int K, int rows, int k, int* idx,
                 float* val, float* rough, const Launch& L, bool exact_1row = false, float* prob = nullptr,
                 float* margin = nullptr);
@@ -1262,9 +1269,9 @@ void penalize_rows(float* logits, int ld, int V, int rows, const DevGen* G, Repl
                    cudaStream_t st, const TreeRows* tree = nullptr, int tree_from = 0);
 // tree: a row's drafts before it: its ancestors.  tree_from: logits row r is the round's row tree_from + r (a wide
 // round's 16 rows at a time).
-// Top-k per row, sorted high to low (lowest index on ties).  k <= 16.  With part buffers of kTopkParts * 16 entries a
-// row for up to part_rows rows: each row's slices in parallel, then their candidates merged (the same top-k: the
-// order is total); else one block a row.
+// Top-k per row, sorted high to low (lowest index on ties).  k <= kWalkMax.  k <= 16: with part buffers of
+// kTopkParts * 16 entries a row for up to part_rows rows, each row's slices in parallel, then their candidates merged
+// (the same top-k: the order is total); else one block a row.  k > 16: a radix select a block a row.
 constexpr int kTopkParts = 24;
 void topk_rows(const float* logits, int ld, int V, int k, int* idx, float* val, int rows, cudaStream_t st,
                float* part_v = nullptr, int* part_i = nullptr, int part_rows = 0, float* prob = nullptr,
@@ -1273,15 +1280,18 @@ void topk_rows(const float* logits, int ld, int V, int k, int* idx, float* val, 
 //   y (=|+=) conv(x) with coef[t][c] = base[t][c] + delta[r][t][c / group]
 void grouped_conv(const float* x, int ldx, const float* delta, int ld_delta, const float* base, int H, int taps,
                   int group, float* y, int ldy, int rows, bool accumulate, cudaStream_t st);
-// Greedy candidate walk; writes `width` drafts.  Uses oracle tokens when P->oracle_len > 0.
+// Candidate walk over k <= kWalkMax candidates a row; writes `width` drafts.  Uses oracle tokens when
+// P->oracle_len > 0.  With G sampling (temperature > 0), each step takes the best ops::coupled_draft_score: the draft
+// at position P->position + 1 + s coupled to the target's noise there; else the best score.
 void selector_walk(const DevParams* P, const int* cand, const float* unary, int k, const float* hid, int rank,
                    const bf16* pred, const bf16* succ, int width, const int* oracle, int* drafts, cudaStream_t st,
-                   float softcap = 0.f, int softcap_mode = FLYX_DFLASH2_SOFTCAP_BEFORE);
-// The candidates as a tree of `width` drafts, best first by the selector's scores (ops/draft/ref.h), candidates at
-// `depths` positions: drafts and the round's TreeRows.  The oracle tokens as a chain when P->oracle_len > 0.
+                   float softcap, int softcap_mode, const DevGen* G);
+// The candidates (k <= kWalkMax a position) as a tree of `width` drafts, best first by the selector's scores
+// (ops/draft/ref.h), candidates at `depths` positions: drafts and the round's TreeRows.  Its trunk is the walk's
+// chain (selector_walk; sampling, the coupled choices).  The oracle tokens as a chain when P->oracle_len > 0.
 void selector_tree(const DevParams* P, const int* cand, const float* unary, int k, const float* hid, int rank,
                    const bf16* pred, const bf16* succ, int width, int depths, const int* oracle, int* drafts,
-                   TreeRows* tree, cudaStream_t st, float softcap = 0.f, int softcap_mode = FLYX_DFLASH2_SOFTCAP_BEFORE);
+                   TreeRows* tree, cudaStream_t st, float softcap, int softcap_mode, const DevGen* G);
 // Copy rows of x into feats at column block `slot` (taps).
 void tap_copy(const float* x, int H, float* feats, int ld_feats, int slot, int rows, cudaStream_t st);
 void tap_copy(const bf16* x, int H, float* feats, int ld_feats, int slot, int rows, cudaStream_t st);
