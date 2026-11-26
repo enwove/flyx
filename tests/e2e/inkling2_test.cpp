@@ -770,12 +770,15 @@ void write_tiny_dflash2_dir(const std::filesystem::path& dir, const TinySpec& c,
   out.write(reinterpret_cast<const char*>(blob.data()), std::streamsize(blob.size()));
 }
 
+// LoadOpts::width: the rounds chosen every round as in real use (EngineOptions::width -1), adaptive rounds included.
+constexpr int kChosen = -2;
+
 struct LoadOpts {
   bool speculative = false;
   bool lookup = false;
   int max_ctx = 512;
   int prefill_chunk = 32;
-  int width = -1;  // -1: default pinned 7 when speculative; 0: adaptive / auto
+  int width = -1;  // -1: pinned 7 when speculative; 0: no drafter's rounds (plain decoding, lookup rounds); kChosen
   int kv = FLYX_KV_16;
   int kv_gpu = -1;
   int kv_copy_gpu = -1;
@@ -797,7 +800,7 @@ std::unique_ptr<Engine> load_engine(const std::string& path, const std::string& 
   eo.lookup_given = o.lookup;
   eo.speculative = o.speculative;
   eo.drafter = o.speculative ? o.drafter : "none";
-  eo.width = o.speculative ? (o.width >= 0 ? o.width : 7) : 0;
+  eo.width = !o.speculative ? 0 : o.width == kChosen ? -1 : o.width >= 0 ? o.width : 7;
   eo.drafter_files = o.drafter_files;
   eo.activations = o.activations;
   eo.kv = o.kv;
@@ -812,7 +815,8 @@ std::unique_ptr<Engine> load_engine(const std::string& path, const std::string& 
 }
 
 std::vector<int32_t> run_gen(Session& s, const std::vector<int32_t>& prompt, int n, bool sampled = false,
-                             const std::vector<int32_t>& ckps = {}, int32_t keep_ckpt = -1) {
+                             const std::vector<int32_t>& ckps = {}, int32_t keep_ckpt = -1,
+                             GenerateResult* result = nullptr) {
   GenerateRequest req;
   req.prompt = prompt;
   req.max_new_tokens = n;
@@ -830,6 +834,7 @@ std::vector<int32_t> run_gen(Session& s, const std::vector<int32_t>& prompt, int
                },
                &res, &err) != 0)
     throw std::runtime_error("generate: " + err);
+  if (result) *result = res;
   return out;
 }
 
@@ -1494,19 +1499,27 @@ int main(int argc, char** argv) {
             }
           }
 
-          // Adaptive DFlash2 (width=0, lookup=true) both free and with oracle forcing long accepted runs.
-          auto e_adapt = load_engine(tgt.string(), "cuda",
-                                     {.speculative = true,
-                                      .lookup = true,
-                                      .prefill_chunk = 32,
-                                      .width = 0,
-                                      .drafter = "dflash2",
-                                      .drafter_files = {df.string()}});
-          check(same_tokens(fresh_gen(*e_adapt, prompt, 48, false), want48),
-                tag + " Gate 4: adaptive DFlash2 + lookup greedy == plain");
-          check(same_tokens(fresh_gen(*e_adapt, prompt, 48, true), want48_s),
-                tag + " Gate 4: adaptive DFlash2 + lookup sampled+penalties == plain");
-          {
+          // Adaptive rounds (the rounds chosen every round, lookup rounds too): a block drafter's whole block and one
+          // decision (DFlash2, stop_decide_block); DSpark's backbone once and its Markov head a checkpoint at a time,
+          // each step's decision on the device (stop_decide_step: another step, or the verify body of the prefix that
+          // pays).  Free, and with the oracle, whose accepted runs make the drafter's rounds pay so that they run and
+          // reach the later checkpoints.  (Pinned at a width, 0 included, an engine has no adaptive plan.)
+          for (const std::string which : {"dflash2", "dspark"}) {
+            const auto& file = which == "dspark" ? (mixed ? dspark_q8 : dspark_bf16) : df;
+            const std::string name = which == "dspark" ? "DSpark" : "DFlash2";
+            auto e_adapt = load_engine(tgt.string(), "cuda",
+                                       {.speculative = true,
+                                        .lookup = true,
+                                        .prefill_chunk = 32,
+                                        .width = kChosen,
+                                        .drafter = which,
+                                        .drafter_files = {file.string()}});
+            check(e_adapt->model().drafters() == 1 && e_adapt->adaptive_plan(0) != nullptr,
+                  tag + " adaptive " + name + ": the drafter has an adaptive round plan");
+            check(same_tokens(fresh_gen(*e_adapt, prompt, 48, false), want48),
+                  tag + " Gate 4: adaptive " + name + " + lookup greedy == plain");
+            check(same_tokens(fresh_gen(*e_adapt, prompt, 48, true), want48_s),
+                  tag + " Gate 4: adaptive " + name + " + lookup sampled+penalties == plain");
             Session so(e_adapt.get());
             std::string serr;
             if (!so.init(&serr)) throw std::runtime_error(serr);
@@ -1514,8 +1527,13 @@ int main(int argc, char** argv) {
             oracle.insert(oracle.end(), want48.begin(), want48.end());
             if (e_adapt->api()->set_oracle(so.seq(), oracle.data(), int32_t(oracle.size())) != 0)
               throw std::runtime_error(e_adapt->api()->last_error());
-            check(same_tokens(run_gen(so, prompt, 48, false), want48),
-                  tag + " Gate 4: adaptive DFlash2 + oracle (forced accepted runs) greedy == plain");
+            GenerateResult res;
+            check(same_tokens(run_gen(so, prompt, 48, false, {}, -1, &res), want48),
+                  tag + " Gate 4: adaptive " + name + " + oracle (forced accepted runs) greedy == plain");
+            const int drafted = res.drafter_rounds.empty() ? 0 : res.drafter_rounds[0];
+            check(drafted > 0 && res.usage.accepted_drafts > 0,
+                  tag + " adaptive " + name + " + oracle: the drafter's rounds ran (" + std::to_string(drafted) +
+                      " rounds, " + std::to_string(res.usage.accepted_drafts) + " drafts accepted)");
           }
           // Fixed width=15 DFlash2 + oracle.
           auto e_w15 = load_engine(tgt.string(), "cuda",
