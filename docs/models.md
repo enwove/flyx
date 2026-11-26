@@ -57,7 +57,7 @@ Control flags:
 - `--drafter mtp|dflash2|dv|dspark|all|none`
 - `--drafter-file PATH_OR_HF` (repeatable)
 - `--width N` (pin model drafter width; lookup remains active unless `--no-lookup`)
-- `--draft-trees` (opt-in DFlash2 dynamic trees; off by default)
+- `--draft-trees` (opt-in DFlash2 dynamic trees; off by default; an `inkling2_loop` target verifies chains only: its relative-position attention and ShortConvs read a round's rows in order, so the CUDA backend refuses tree rounds there)
 - `--no-spec` (plain decoding, disables all drafters and lookup)
 - `--cycle I,J,...` (testing: a fixed cycle of round indices instead of the controller's choice; `-v` lists the rounds)
 

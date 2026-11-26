@@ -591,6 +591,18 @@ int lower(flyx_bmodel* m, const flyx_program* prog, flyx_plan** out) {
   }
   if (!p->tree) p->tree_kv.clear();
   if (p->tree && (p->phase != FLYX_PHASE_ROUND || p->width < 1)) return fail("lower: a tree is a round's drafts");
+  // A tree's row reads its ancestors' history, not its siblings': the tree masks of attention (tree_kv) and the gated
+  // delta net's tree recurrence give it that.  Relative-position attention scores row r at base + r against the rows
+  // before it, and a ShortConv (relative attention's K/V and output convolutions, the MoE's) folds the round's rows
+  // in order, with no replay of a fork: a draft after its sibling would read the sibling.  Such a target verifies
+  // plain rounds, chains (its drafters' and lookup's) only.
+  if (p->tree)
+    for (const Block* b : p->block) {
+      if (b && std::holds_alternative<RelAttnBlock>(*b))
+        return fail("lower: tree rounds on relative-position attention (its rows are consecutive, not a tree's)");
+      if (const auto* e = b ? std::get_if<MoeBlock>(b) : nullptr; e && e->sconv >= 0)
+        return fail("lower: tree rounds on a ShortConv state (it folds the rows in order, no fork replay)");
+    }
   if (wide && p->tree)  // a wide chain runs on a gated delta net (its replay holds the rows); a wide tree does not
     for (const Block* b : p->block)
       if (b && std::holds_alternative<GdnBlock>(*b))

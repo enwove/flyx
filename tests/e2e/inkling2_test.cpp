@@ -803,6 +803,7 @@ struct LoadOpts {
   std::vector<std::string> drafter_files{};
   std::string backend_opts{};
   std::string activations{};
+  bool draft_trees = false;  // EngineOptions::draft_trees: the drafters' trees beside their chains
 };
 
 std::unique_ptr<Engine> load_engine(const std::string& path, const std::string& backend, const LoadOpts& o = {}) {
@@ -823,6 +824,7 @@ std::unique_ptr<Engine> load_engine(const std::string& path, const std::string& 
   eo.kv_copy_gpu = o.kv_copy_gpu;
   eo.kv_ram = o.kv_ram;
   eo.kv_method = o.kv_method;
+  if (o.draft_trees) eo.draft_trees = eo.draft_trees_given = true;
   auto e = std::make_unique<Engine>();
   std::string err;
   if (!e->load(path, eo, &err)) throw std::runtime_error("load(" + backend + "): " + err);
@@ -1574,6 +1576,52 @@ int main(int argc, char** argv) {
                   tag + " Gate 4: width=15 DFlash2 + oracle (15 accepted/round) greedy == plain");
           }
         }
+      }
+
+      // ---- 2c. Tree rounds: an Inkling-2 target verifies chains only ----
+      // Relative-position attention scores a round's rows as consecutive positions and its ShortConvs (and the
+      // MoE's) fold them in order, with no replay of a fork: of two siblings, the second would read the first.  The
+      // backend refuses every tree round (given, and DFlash2's drafted), so that no tree reaches a launch; the engine
+      // keeps plain rounds, its drafters' chains and lookup's.
+      std::printf("Inkling-2 tree rounds refused (relative-position attention, ShortConv)\n");
+      {
+        auto e = load_engine(bf16_gguf.string(), "cuda",
+                             {.speculative = true,
+                              .lookup = true,
+                              .prefill_chunk = 32,
+                              .width = kChosen,
+                              .drafter = "dflash2",
+                              .drafter_files = {dflash2_bf16.string()},
+                              .draft_trees = true});
+        const auto& trees = e->round_trees();
+        check(e->tree_widths().empty() && !e->lookup_widths().empty() && e->widths().size() > 1 &&
+                  std::find(trees.begin(), trees.end(), true) == trees.end(),
+              "with draft trees asked for, the engine lowers DFlash2's chains, lookup's and plain rounds, no tree");
+        const auto* api = e->api();
+        auto lowers = [&](std::vector<flyx_node> rnd, int k, std::string* why) {
+          flyx_program rp{FLYX_PHASE_ROUND, k, k + 1, int32_t(rnd.size()), rnd.data()};
+          flyx_plan* plan = nullptr;
+          const int rc = api->lower(e->bmodel(), &rp, &plan);
+          if (plan) api->plan_free(plan);
+          *why = rc != 0 && api->last_error() ? api->last_error() : "";
+          return rc == 0;
+        };
+        // The tree of three given drafts the lookup would send with parents {-1, -1, 0}: drafts 0 and 1 siblings.
+        std::string why;
+        auto given_tree = e->model().round_program(3, -1, true);
+        for (auto& n : given_tree)
+          if (n.kind == FLYX_NODE_GIVEN) n.arg1 = FLYX_GIVEN_TREE;
+        check(!lowers(given_tree, 3, &why) && why.find("tree rounds on relative-position attention") != std::string::npos,
+              "a round verifying a tree of given drafts (siblings) is refused at lower (" + why + ")");
+        auto drafted_tree = e->model().round_program(9, 0, false);
+        for (auto& n : drafted_tree)
+          if (n.kind == FLYX_NODE_DRAFT) n.arg1 = FLYX_DRAFT_TREE;
+        check(!lowers(drafted_tree, 9, &why) && why.find("tree rounds on relative-position attention") != std::string::npos,
+              "a round verifying DFlash2's drafted tree is refused at lower (" + why + ")");
+        check(lowers(e->model().round_program(3, -1, true), 3, &why) && lowers(e->model().round_program(7, 0, false), 7, &why),
+              "the same rounds as chains (given drafts, DFlash2's) still lower");
+        check(same_tokens(fresh_gen(*e, prompt, 24, false), cu_greedy),
+              "Gate 4: DFlash2 + lookup with draft trees asked for (chains only) greedy == cuda plain");
       }
 
       // ---- 3. Rewind, edited prompt, and SWA ring wraparound checkpoint/restore & snapshot ----
