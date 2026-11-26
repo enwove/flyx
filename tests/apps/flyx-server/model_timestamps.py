@@ -11,7 +11,7 @@ import tempfile
 from urllib.request import Request, urlopen
 import time
 
-from remembered_model import serve
+from local_server import serve, server_env
 
 
 def gguf(layers, arch="test", markov=False):
@@ -204,8 +204,7 @@ if __name__ == "__main__":
         root = Path(tmp)
         model = root / "test model.flyx"
         shutil.copyfile(asset, model)
-        env = dict(os.environ, APPDATA=tmp, XDG_CONFIG_HOME=tmp, HF_HOME=tmp, HF_HUB_CACHE=str(root / "hub"),
-                   HF_HUB_OFFLINE="1", FLYX_MODELS_DIR=tmp, FLYX_BACKEND_DIR=str(exe.parent))
+        env = server_env(tmp, exe, HF_HOME=tmp, HF_HUB_CACHE=root / "hub", HF_HUB_OFFLINE="1", FLYX_MODELS_DIR=tmp)
 
         def checks(url):
             check_listing(url, root / "weights.gguf")

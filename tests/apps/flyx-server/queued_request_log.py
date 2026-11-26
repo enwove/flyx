@@ -3,13 +3,12 @@
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import closing
 import json
-import os
 from pathlib import Path
 import sys
 import tempfile
 
 from check_server import Client, wait_telemetry
-from remembered_model import serve
+from local_server import serve, server_env
 
 
 def check_log(url):
@@ -87,6 +86,6 @@ def check_log(url):
 if __name__ == "__main__":
     exe, asset = (Path(arg).resolve() for arg in sys.argv[1:])
     with tempfile.TemporaryDirectory() as tmp:
-        env = dict(os.environ, APPDATA=tmp, XDG_CONFIG_HOME=tmp, FLYX_BACKEND_DIR=str(exe.parent))
+        env = server_env(tmp, exe)
         serve(exe, tmp, env, [asset], check_log, ctx=32768,
               options=["--name", "test model", "--sessions", "1", "--no-spec"])
