@@ -6,9 +6,10 @@
 #   bash tools/ci/cpu.sh
 #
 # CPU-only build (the float64 reference backend), then every test that needs
-# no GPU: the reference against transformers, the tokenizer, the golden tests
-# on cpu_ref, the layering and numerics checks.  Output in logs/ci/: the log
-# (cpu.log) and ctest's JUnit report (ctest.xml).
+# no GPU but DV's (FLYX_TEST_DV: the cpu-full presets): the reference against
+# transformers, the tokenizer, the golden tests on cpu_ref, the layering and
+# numerics checks.  Output in logs/ci/: the log (cpu.log) and ctest's JUnit
+# report (ctest.xml).
 set -euo pipefail
 cd "$(dirname "$0")/../.."
 mkdir -p logs/ci

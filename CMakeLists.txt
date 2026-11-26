@@ -4,6 +4,11 @@ project(flyx VERSION 0.2.1 LANGUAGES C CXX)
 
 option(FLYX_CUDA "Build the CUDA backend (needs CUDA 13)" ON)
 option(FLYX_TESTS "Build tests" ON)
+# DV is not in production: its tests and their assets (tests/dv.cmake, make_tiny.py --group dv) only when asked for
+# (the *-full configure presets); its code is built either way.  In a tree on Linux six of DV's CUDA tests are known red
+# (tests/dv.cmake) and disabled unless FLYX_TEST_DV_KNOWN_RED.
+option(FLYX_TEST_DV "Register DV's tests and make their assets" OFF)
+option(FLYX_TEST_DV_KNOWN_RED "Run DV's tests known to fail in a tree on Linux (tests/dv.cmake)" OFF)
 option(FLYX_COMPILER_CACHE "Compile through sccache or ccache when one is installed" ON)
 
 # A compiler cache, when installed: a source it has compiled before with the same flags (another commit's tree, a

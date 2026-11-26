@@ -10,8 +10,9 @@ GPU tracing and end-to-end verification. Read [AGENTS.md](../AGENTS.md) before c
 ```sh
 pip install -r tests/requirements.txt    # test fixtures & HF reference (pinned, CPU torch; Python 3.12+)
 ctest --preset quick                     # while editing: unit and tiny tests, the smoke tests (section 2)
-ctest --preset dev --output-on-failure   # full GPU + CPU suite
+ctest --preset dev --output-on-failure   # GPU + CPU suite, every test but DV's
 ctest --preset cpu --output-on-failure   # CPU-only (no GPU required)
+cmake --preset dev-full && ctest --preset full --output-on-failure   # DV's tests too (the same build tree)
 ```
 
 End-to-end verification (http request to the qwen model server):
@@ -39,14 +40,15 @@ select by these labels (`ctest -L` / `-LE` select by them too: `ctest --preset d
 | `gpu` | aspect | needs a CUDA device | every test registered in the CUDA block of `tests/CMakeLists.txt`; `vision` and `residual_decision`, registered before it but taking the CUDA backend too, by hand at its end |
 | `gpu_serial` | aspect | measures the device's free memory, so runs alone (`RUN_SERIAL`) | `flyx_add_golden_test(... SERIAL)` |
 | `smoke` | aspect | a golden or GPU test the quick preset runs anyway | by hand, at the end of `tests/CMakeLists.txt` |
-| `dv` | aspect | DV's tests (DV is not in production) | by name (`dv`, `_dv`, `dv31_`, ...) |
+| `dv` | aspect | DV's tests (DV is not in production), registered with `FLYX_TEST_DV=ON` alone | every test of `tests/dv.cmake` |
 | `server` | aspect | starts a `flyx serve` | `flyx_add_py_test` for scripts under `tests/apps/flyx-server/` |
 | `quick` | derived | `unit` or `tiny`, neither `gpu` nor `dv`; or `smoke` | `flyx_finish_test_labels()` |
 
 `flyx_finish_test_labels()` runs at the end of `tests/CMakeLists.txt` and `bench/CMakeLists.txt`. It gives a test
 without a tier one, adds `quick`, gives every `gpu` test a slot of the GPU (`RESOURCE_GROUPS gpus:1`), and refuses the
 configure (`FATAL_ERROR`, naming the test) on a test with two tiers, an unknown label, `RUN_SERIAL` without
-`gpu_serial`, `gpu_serial` without `gpu`, or `smoke` on a DV test. Labels are only ever appended
+`gpu_serial`, `gpu_serial` without `gpu`, `smoke` on a DV test, or a DV test (named as one: `dv`, `_dv`, `dv31_`, ...;
+or needing DV's assets) outside `tests/dv.cmake`. Labels are only ever appended
 (`set_property(TEST ... APPEND PROPERTY LABELS ...)`), so a label given in one place is never lost in another.
 
 A new test usually needs nothing: its tier and aspects follow from where and how it is registered. Label it by hand
@@ -58,9 +60,22 @@ see how long a test takes: a slow test inferred `tiny` lands in `quick`, so look
 | Test preset (Windows: `-windows` suffix) | Runs | When |
 |---|---|---|
 | `quick` / `cpu-quick` | label `quick` | after each build while editing (a minute or two with the GPU's smoke tests) |
-| `gpu` | every test but DV's (`-LE ^dv$`) | before a pull request, on a GPU machine |
-| `dev` / `cpu` | every test | as before |
-| `full` / `cpu-full` | every test | before a release |
+| `dev` (= `gpu`) / `cpu` | every test but DV's (`-LE ^dv$`) | before a pull request; CI's `cpu` |
+| `full` / `cpu-full` | every test, DV's too | a change to DV's code (AGENTS.md gate 3), before a release |
+
+**DV's tests are opt-in.** DV is not in production, so its tests (`tests/dv.cmake`) and their fixtures (`make_tiny.py
+--group dv`, test `make_dv_assets`) are registered only in a tree configured with `FLYX_TEST_DV=ON`: the configure
+presets `dev-full`, `cpu-full`, `dev-windows-full` and `cpu-windows-full` turn it on in the same build tree as `dev`,
+`cpu`, `dev-windows` and `cpu-windows` (a configure of seconds, nothing to compile: DV's code is built either way),
+and configuring with the plain preset again turns it off. The test presets `full` and `cpu-full` name those configure
+presets. In a tree without DV's tests, `dv_not_configured` stands in for them: skipped by plain `ctest`, not selected by
+`dev`, `gpu` or `cpu`, and failed by `full` (which sets `FLYX_TEST_REQUIRE_DV`), so that a full run cannot pass short.
+Six of DV's CUDA tests are known red in a tree on Linux (draft agreement under its floor, no token wrong; the reason is
+in `tests/dv.cmake`) and disabled there: they show as Not Run (Disabled), and `-DFLYX_TEST_DV_KNOWN_RED=ON` runs them.
+
+The fixtures come in two groups, each with its own digest and stamp in the assets directory (`.inputs-core`,
+`.inputs-dv`): `make_assets` makes core's (`make_tiny.py --group core`), `make_dv_assets` DV's from them. DV's
+draw their random weights from generators of their own, so core's files are the same bytes with or without DV's.
 
 Every test preset runs 8 tests at once and hands the GPU tests out over `tests/gpu_resources.json`: one GPU of 8
 slots, a slot a test, the same as `-j 8` alone gave them. On a GPU with less memory, copy the file with fewer slots and
@@ -78,7 +93,7 @@ slots. Without a preset (and without `--resource-spec-file`) ctest ignores the s
 | `reference_vs_transformers` | Checks `python/reference` float64 reference against HuggingFace `transformers`. |
 | `cuda_ops` | Every CUDA kernel (`tests/backends/cuda/op_test_*.cu`) against `ops/<op>/ref.h` and `ops/sampling/sampling.h` (seeded; override via `FLYX_OPS_SEED`). |
 | `golden_cpu_ref*`, `golden_cuda*` | End-to-end token-for-token checks: plain, MTP, DFlash2, lookup drafts, forced long accepted runs, rollback, checkpoint restore, edited prompts, seeded sampling, stop strings, penalties, grammar enforcement, tree rounds, FP8 KV, tiered host KV, 2-bit StrataFlux & `auto` switch, fused vs unfused (`fusion=0`), PDL on/off, Qwen3 second architecture, sliding-window DFlash2, adaptive stopping on and off. |
-| `cuda_device_memory*` | Serial tests verifying engines and sessions release all allocated VRAM back to the device, and that sessions' CUDA round graphs (every round kind, drafted trees, MTP's window and batched rounds included) stay inside the room `seq_bytes` counts, measured by the device's free memory (`_tiers`: K/V and StrataFlux copies in host memory, across the `auto` switch), and that a session going between batched and lone rounds keeps its graphs (`_dv`, `_dv_lora`: the tiny Llama's DV files, every kind of DV round, its warm-ups batched too, beside a V-LoRA; `_dv_graphs`, `_dv_lora_graphs`: DV's round graphs within what they are counted at and under twice what they took, the canvas pass the body of a conditional node and inline (backend option `dv_conditional=0`), and the conditional nodes with their bodies on their own: the sessions as many as free memory holds for three engines, 32 to 64, or the test says why it checks nothing). |
+| `cuda_device_memory*` (`_dv*`: `FLYX_TEST_DV`) | Serial tests verifying engines and sessions release all allocated VRAM back to the device, and that sessions' CUDA round graphs (every round kind, drafted trees, MTP's window and batched rounds included) stay inside the room `seq_bytes` counts, measured by the device's free memory (`_tiers`: K/V and StrataFlux copies in host memory, across the `auto` switch), and that a session going between batched and lone rounds keeps its graphs (`_dv`, `_dv_lora`: the tiny Llama's DV files, every kind of DV round, its warm-ups batched too, beside a V-LoRA; `_dv_graphs`, `_dv_lora_graphs`: DV's round graphs within what they are counted at and under twice what they took, the canvas pass the body of a conditional node and inline (backend option `dv_conditional=0`), and the conditional nodes with their bodies on their own: the sessions as many as free memory holds for three engines, 32 to 64, or the test says why it checks nothing). |
 | `gguf_reader`, `ggml_blocks`, `gguf_models`, `gguf_cpu_ref`, `gguf_cuda*` | GGUF container validation, exact per-block float64 dequant vs `gguf` Python package, layout equivalence vs `.flyx`, packed GPU execution across all block types + GGML NVFP4 + sidecar MTP/DFlash2. |
 | `inkling2_cpu_ref`, `inkling2_cuda` | Tiny sparse MoE and Markov DSpark model execution, fused/generic rounds, mixed quantization and fixed-seed comparisons with plain decode. |
 | `model_source` | Target/companion classification and discovery, including the Markov header and adjacent DSpark files. |
@@ -93,11 +108,11 @@ slots. Without a preset (and without `--resource-spec-file`) ctest ignores the s
 | `server_hardening` | What a hostile or broken client sends a live `flyx serve`, and what a browser brings: none of it ends the process, fills its memory, holds its workers or reads what it should not (`tests/apps/flyx-server/hardening.py` lists the checks). |
 | `api_compat`, `streaming_tool_calls`, `queued_request_*`, `client_conversations`, `codex_threads`, `remembered_model`, `kv_method_flags`, `cli_utf8_paths` | Live `flyx serve` and CLI integration tests (OpenAI Chat/Responses, Anthropic Messages, cancellation, session isolation, remembered `serve.json`). |
 | `gemm_tables` | `tools/codegen/gen_gemm_tables.py` validation, table inheritance, and invalid-table rejection (`cuda_ops` additionally verifies compiled table reachability via `test_gemm_tables_compiled`, rows 1..64, MoE `moe_gate_up` rule reachability via `test_moe_gate_up_rules`, and a drafting pass's K partition by K alone in every table via `test_gemm_draft_tables`). |
-| `golden_cpu_ref_llama*`, `golden_cuda_llama*`, `tokenizer_minicpm5`, `llama_models`, `converter` | The tiny Llama (MiniCPM5-1B's layers: no q/k norms, 16 query heads on 2 KV heads of 128) against `transformers` in float64 (plain decoding, unfused, `rows_mma`, NVFP4, prompt passes of up to 64 rows, batched rounds), MiniCPM5's pre-tokenizer, Llama descriptions and refusals, the converter's Llama path. |
-| `golden_cuda_llama_dv*`, `golden_cpu_ref_llama_dv*`, `dv_models`, `dv_trees`, `dv_canvas`, `dv_convert*`, `reference_dv*`, `dv_counts` | DV: plain decoding's tokens in every mode (15 and 31 drafts, beam and pool, 8/16/32 slots, causal, two rounds in flight, graphs on and off, rewind, restore, stop strings, sampled and with penalties, FP8 and host K/V, rounds mixed with lookup rounds, wide ones too (`wide=1`), and `wide=0`'s trees of 15, rounds of several sequences, a chat's checkpoint at a message boundary inside a prefill pass restored, adaptive stopping on and off, none planned for DV); DV's drafts against `flyx_ref/dv.py` in float64; the description and its refusals; the float64 tree and canvas pieces; the converter byte for byte; the Python reference against bifill-dv's functions; `check_dv.py`'s counts. |
-| `golden_cuda_llama_lora*`, `golden_cuda_llama_dv31_lora*`, `lora_convert`, `dv_convert_lora`, `residual_decision` | The V-LoRA: the tiny Llama with a target LoRA against `transformers` with it merged (float64), on both backends, unfused and `rows_mma`, its NVFP4 linears, DV beside it; `.flyx` format 2 and the converter; each backend's bf16 prefill residual decision (`-v`), taken by the NVFP4 Llama with NVFP4 inputs and never with adapters (a device without FP4 tensor cores is held to its refusal of NVFP4 inputs instead). |
+| `golden_cpu_ref_llama*`, `golden_cuda_llama*`, `tokenizer_minicpm5`, `llama_models` (`llama_models_dv`: with DV's file too, `FLYX_TEST_DV`), `converter` | The tiny Llama (MiniCPM5-1B's layers: no q/k norms, 16 query heads on 2 KV heads of 128) against `transformers` in float64 (plain decoding, unfused, `rows_mma`, NVFP4, prompt passes of up to 64 rows, batched rounds), MiniCPM5's pre-tokenizer, Llama descriptions and refusals, the converter's Llama path. |
+| `golden_cuda_llama_dv*`, `golden_cpu_ref_llama_dv*`, `dv_models`, `dv_trees`, `dv_canvas`, `dv_convert*`, `reference_dv*`, `dv_counts` (`FLYX_TEST_DV`) | DV: plain decoding's tokens in every mode (15 and 31 drafts, beam and pool, 8/16/32 slots, causal, two rounds in flight, graphs on and off, rewind, restore, stop strings, sampled and with penalties, FP8 and host K/V, rounds mixed with lookup rounds, wide ones too (`wide=1`), and `wide=0`'s trees of 15, rounds of several sequences, a chat's checkpoint at a message boundary inside a prefill pass restored, adaptive stopping on and off, none planned for DV); DV's drafts against `flyx_ref/dv.py` in float64; the description and its refusals; the float64 tree and canvas pieces; the converter byte for byte; the Python reference against bifill-dv's functions; `check_dv.py`'s counts. |
+| `golden_cuda_llama_lora*`, `golden_cuda_llama_dv31_lora*` and `dv_convert_lora` (`FLYX_TEST_DV`), `lora_convert`, `residual_decision` | The V-LoRA: the tiny Llama with a target LoRA against `transformers` with it merged (float64), on both backends, unfused and `rows_mma`, its NVFP4 linears, DV beside it; `.flyx` format 2 and the converter; each backend's bf16 prefill residual decision (`-v`), taken by the NVFP4 Llama with NVFP4 inputs and never with adapters (a device without FP4 tensor cores is held to its refusal of NVFP4 inputs instead). |
 | `golden_cuda_quant_q4_k`, `golden_cuda_quant_q8_0`, `tree_bench_context` | Tree rounds of up to 64 rows on quantized Qwen3 GGUFs held to their own decoding; `tree_bench` timing every width from the same context. |
-| `round_plans`, `plans_test`, `calibrate_test`, `round_costs_plausible`, `scheduler_cuda_dv`, `dv_choice_replay` | DV's rounds chosen per round: the plans (widths, warm-up, refusals), costs at the context and their re-timing, a DV file's rounds in requests that run at once, and the chooser's replay on the traces in `bench/replay/dv_traces/`. |
+| `round_plans`, `plans_test`, `calibrate_test`, `round_costs_plausible`, `scheduler_cuda_dv` and `dv_choice_replay` (`FLYX_TEST_DV`) | DV's rounds chosen per round: the plans (widths, warm-up, refusals), costs at the context and their re-timing, a DV file's rounds in requests that run at once, and the chooser's replay on the traces in `bench/replay/dv_traces/`. |
 | `bench_prompts`, `same_runs` | `flyx bench --prompts` (a prompt set, its JSON record) and `bench/ab/same_runs.py` (two runs' answers and rounds compared). |
 
 ---
