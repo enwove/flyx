@@ -22,17 +22,11 @@
 #include "core/os/os.h"
 #include "core/render/chat_json.h"
 #include "core/session/session.h"
+#include "tests/common/check.h"
 
 using namespace flyx;
 
 namespace {
-
-int failures = 0;
-
-void check(bool ok, const std::string& what) {
-  std::printf("  %-4s %s\n", ok ? "ok" : "FAIL", what.c_str());
-  if (!ok) ++failures;
-}
 
 ChatMessage msg(const std::string& role, const std::string& content) {
   ChatMessage m;
@@ -264,6 +258,7 @@ void special_spelling_across_modes(Engine& e) {
 }  // namespace
 
 int main(int argc, char** argv) {
+  flyx::test::print_passes = true;
   if (argc < 3) {
     std::fprintf(stderr, "usage: request_test MODEL.flyx TEMPLATE.jinja [PREFIXED.flyx]\n");
     return 2;
@@ -503,6 +498,5 @@ int main(int argc, char** argv) {
   }
   fs::remove(dir);
 
-  std::printf("request: %s\n", failures ? "FAILED" : "ok");
-  return failures ? 1 : 0;
+  return flyx::test::finish("request_test");
 }

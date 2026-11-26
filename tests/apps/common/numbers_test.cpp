@@ -5,19 +5,11 @@
 #include <string>
 
 #include "apps/common/numbers.h"
+#include "tests/common/check.h"
 
 using namespace flyx::apps;
 
 namespace {
-
-int failures = 0;
-
-void check(bool ok, const std::string& what) {
-  if (!ok) {
-    ++failures;
-    std::printf("FAIL %s\n", what.c_str());
-  }
-}
 
 bool whole(const char* text, long long lo, long long hi, long long want) {
   long long v = -12345;
@@ -62,6 +54,5 @@ int main() {
             !parse_seed("12ab", &seed) && !parse_seed("1.0", &seed),
         "text that is not a seed");
 
-  std::printf(failures ? "%d checks failed\n" : "numbers on the command line: ok\n", failures);
-  return failures ? 1 : 0;
+  return flyx::test::finish("numbers_test");
 }

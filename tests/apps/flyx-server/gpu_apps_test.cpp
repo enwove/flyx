@@ -1,6 +1,7 @@
 // Copyright 2026 The flyx Authors. SPDX-License-Identifier: Apache-2.0
 // Unit tests for GPU process classification, display naming, group IDs, and live listing safety invariants.
 #include "apps/flyx-server/gpu_apps.h"
+#include "tests/common/check.h"
 
 #include <cstdio>
 #include <cstdlib>
@@ -8,16 +9,7 @@
 
 namespace {
 
-int g_fail = 0;
-
-void check(bool ok, const char* expr, int line) {
-  if (!ok) {
-    std::fprintf(stderr, "FAIL gpu_apps_test.cpp:%d: %s\n", line, expr);
-    ++g_fail;
-  }
-}
-
-#define CHECK(x) check(static_cast<bool>(x), #x, __LINE__)
+#define CHECK(x) check(static_cast<bool>(x), #x)
 
 void test_system_classification() {
   using flyx::server::is_system_gpu_process;
@@ -101,7 +93,5 @@ int main() {
   test_clean_app_names();
   test_group_ids();
   test_live_listing_safety();
-  if (g_fail) return 1;
-  std::printf("gpu_apps_test: ok\n");
-  return 0;
+  return flyx::test::finish("gpu_apps_test");
 }

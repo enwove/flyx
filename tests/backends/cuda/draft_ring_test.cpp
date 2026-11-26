@@ -3,17 +3,13 @@
 // cache and for the largest window a drafter file may give, and the positions it still holds for the drafter's window
 // through prefill passes, rounds, rewinds, checkpoints, restores and snapshots, as runtime/runner.cpp tells it.
 #include "backends/cuda/runtime/draft_ring.h"
+#include "tests/common/check.h"
 
 #include <climits>
 #include <cstdio>
 #include <string>
 
 namespace {
-int failures = 0;
-void check(bool ok, const std::string& what) {
-  std::printf("%s %s\n", ok ? "ok" : "FAIL", what.c_str());
-  failures += !ok;
-}
 
 using flyx::cuda::dflash_ring_slots;
 using flyx::cuda::DraftRing;
@@ -125,7 +121,8 @@ void history() {
 }  // namespace
 
 int main() {
+  flyx::test::print_passes = true;
   slots();
   history();
-  return failures ? 1 : 0;
+  return flyx::test::finish("draft_ring_test");
 }

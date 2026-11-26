@@ -14,19 +14,13 @@
 #include "core/exec/engine.h"
 #include "core/exec/generation.h"
 #include "core/session/session.h"
+#include "tests/common/check.h"
 
 using namespace flyx;
 
 extern "C" void flyx_test_delegate(const flyx_backend_api*);
 
 namespace {
-
-int g_failures = 0;
-
-void check(bool ok, const std::string& what) {
-  std::printf("  %-4s %s\n", ok ? "ok" : "FAIL", what.c_str());
-  if (!ok) ++g_failures;
-}
 
 const flyx_backend_api* g_backend = nullptr;
 std::string g_err;
@@ -229,6 +223,7 @@ std::vector<int32_t> tokens(Engine& e, int prompt_length = 0, bool sampled = fal
 }  // namespace
 
 int main(int argc, char** argv) {
+  flyx::test::print_passes = true;
   if (argc < 2) {
     std::fprintf(stderr, "usage: elastic_load_test TINY_MODEL.flyx\n");
     return 2;
@@ -361,7 +356,7 @@ int main(int argc, char** argv) {
     check(draft_bytes() == 3 * 272, "AUTO sees the packed down projection of a mixed target");
     std::swap(blocks[0].mlp.up, blocks[0].mlp.down);
     check(draft_bytes() == 3 * 512, "AUTO sees the BF16 resident format of the mixed gate/up stack");
-    return g_failures ? 1 : 0;
+    return flyx::test::finish("elastic_load_test");
   }
 
   // 1. Roomy VRAM: both MTP and DFlash2 load with zero adjustments and backend-reported draft_weights.
@@ -583,6 +578,5 @@ int main(int argc, char** argv) {
           "large (>=128 MiB & >=10%) NVFP4 savings triggers pre-flight auto -> nvfp4 in 1 open call");
   }
 
-  std::printf("%d failures\n", g_failures);
-  return g_failures ? 1 : 0;
+  return flyx::test::finish("elastic_load_test");
 }

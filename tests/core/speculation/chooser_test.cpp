@@ -19,18 +19,11 @@
 
 #include "core/speculation/batch_schedule.h"
 #include "core/speculation/chooser.h"
+#include "tests/common/check.h"
 
 using namespace flyx;
 
 namespace {
-
-int failures = 0;
-
-void check(bool ok, const std::string& what) {
-  if (ok) return;
-  ++failures;
-  std::printf("FAIL %s\n", what.c_str());
-}
 
 std::vector<int32_t> range(int32_t from, int n) {
   std::vector<int32_t> v;
@@ -1114,6 +1107,5 @@ int main() {
     }
   }
 
-  std::printf("round_chooser: %s\n", failures ? "FAILED" : "ok");
-  return failures ? 1 : 0;
+  return flyx::test::finish("chooser_test");
 }

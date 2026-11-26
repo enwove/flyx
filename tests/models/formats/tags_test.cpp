@@ -9,19 +9,11 @@
 #include "models/formats/calls.h"
 #include "models/formats/inkling2.h"
 #include "models/formats/tags.h"
+#include "tests/common/check.h"
 
 using namespace flyx::models::formats;
 
 namespace {
-
-int failures = 0;
-
-void check(bool ok, const std::string& what) {
-  if (!ok) {
-    ++failures;
-    std::printf("FAIL %s\n", what.c_str());
-  }
-}
 
 const std::vector<ojson> kTools = {ojson::parse(R"({"type": "function", "function": {"name": "get_weather",
   "parameters": {"type": "object", "properties": {"location": {"type": "string"}, "days": {"type": "integer"},
@@ -265,6 +257,5 @@ int main() {
           "inkling2 reply grammar produces valid structural_tag JSON");
   }
 
-  std::printf("tagged: %s\n", failures ? "FAILED" : "ok");
-  return failures ? 1 : 0;
+  return flyx::test::finish("tags_test");
 }

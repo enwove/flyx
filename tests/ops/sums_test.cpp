@@ -11,14 +11,9 @@
 
 #include "ops/gdn/ref.h"
 #include "ops/linear/ref.h"
+#include "tests/common/check.h"
 
 namespace {
-
-int failures = 0;
-void check(bool ok, const std::string& what) {
-  std::printf("%s %s\n", ok ? "ok" : "FAIL", what.c_str());
-  failures += !ok;
-}
 
 bool same_bits(const std::vector<double>& a, const std::vector<double>& b) {
   return a.size() == b.size() && std::memcmp(a.data(), b.data(), a.size() * sizeof(double)) == 0;
@@ -65,6 +60,7 @@ uint16_t bf16_bits(double v) {
 }  // namespace
 
 int main() {
+  flyx::test::print_passes = true;
   std::mt19937 rng(7);
   std::uniform_real_distribution<double> U(-1, 1);
   for (int K : {64, 96, 256})
@@ -104,6 +100,5 @@ int main() {
       check(same, "gdn_row " + std::to_string(dv) + "x" + std::to_string(dk) +
                       ", 5 steps: the state and outputs of one row at a time");
     }
-  std::printf(failures ? "FAILED (%d failures)\n" : "PASSED (0 failures)\n", failures);
-  return failures != 0;
+  return flyx::test::finish("sums_test");
 }

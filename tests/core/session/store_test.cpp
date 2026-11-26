@@ -12,6 +12,7 @@
 #include "core/os/os.h"
 #include "core/os/path.h"
 #include "core/session/store.h"
+#include "tests/common/check.h"
 
 struct flyx_seq {
   int pos = 0;
@@ -58,14 +59,7 @@ int load(flyx_seq* seq, const flyx_host_pieces* src, uint64_t bytes, int32_t) {
   return seq->pos = h.end;
 }
 
-int failures = 0;
 int host_allocations = 0, host_frees = 0;
-void check(bool ok, const char* label) {
-  if (!ok) {
-    std::printf("FAIL %s\n", label);
-    ++failures;
-  }
-}
 }  // namespace
 
 int main() {
@@ -292,5 +286,5 @@ int main() {
           "and restores its exact rows");
   }
   fs::remove(dir);
-  return failures != 0;
+  return flyx::test::finish("snapshot_store_test");
 }

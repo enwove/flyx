@@ -18,21 +18,13 @@
 
 #include "core/modelfile/modelfile.h"
 #include "core/tokenizer/tokenizer.h"
+#include "tests/common/check.h"
 #include "tests/core/modelfile/write_flyx.h"
 
 using namespace flyx;
 using namespace flyx::testing;
 
 namespace {
-
-int failures = 0;
-
-void check(bool ok, const std::string& what) {
-  if (!ok) {
-    ++failures;
-    std::printf("FAIL %s\n", what.c_str());
-  }
-}
 
 void put32(std::string* s, uint32_t v) { s->append(reinterpret_cast<const char*>(&v), 4); }
 
@@ -169,13 +161,13 @@ int main(int argc, char** argv) {
       std::printf("FAIL the vocabulary over \"%s\": %s\n", letters.c_str(), err.c_str());
       return 1;
     }
-    for (int i = 0; i < 400 && failures < 5; ++i, ++texts) {
+    for (int i = 0; i < 400 && flyx::test::failures < 5; ++i, ++texts) {
       // Lengths 0..: one piece (no spaces) or words; long ones too.
       const int length = i < 300 ? int(rng() % 60) : int(rng() % 3000);
       const std::string text = random_text(letters, length, i % 3 == 0 ? 0 : 7, &rng);
       const auto want = v.plain(text), got = tok.encode(text);
       if (got != want) {
-        ++failures;
+        ++flyx::test::failures;
         std::printf("FAIL \"%s\" over \"%s\"\n  want:%s\n  got: %s\n", text.substr(0, 80).c_str(), letters.c_str(),
                     show(want).c_str(), show(got).c_str());
       }
@@ -337,6 +329,6 @@ int main(int argc, char** argv) {
           "inkling2 pretokenizer: CJK (Lo) followed by uppercase backtracks U*L+ before Lu");
   }
 
-  std::printf(failures ? "%d checks failed\n" : "%d texts as the rule gives them\n", failures ? failures : texts);
-  return failures ? 1 : 0;
+  std::printf("merge: %d texts against the rule\n", texts);
+  return flyx::test::finish("merge_test");
 }

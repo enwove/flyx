@@ -13,19 +13,13 @@
 #include "apps/common/model_source.h"
 #include "core/os/os.h"
 #include "core/os/path.h"
+#include "tests/common/check.h"
 
 namespace fs = std::filesystem;
 using flyx::os::from_path;
 using flyx::os::to_path;
 
 namespace {
-
-int failures = 0;
-
-void check(bool ok, const std::string& what) {
-  std::printf("%s %s\n", ok ? "ok  " : "FAIL", what.c_str());
-  failures += !ok;
-}
 
 void set_env(const char* k, const std::string& v) {
 #if defined(_WIN32)
@@ -66,6 +60,7 @@ bool fetched(const std::string& model, const std::vector<std::string>& drafters,
 }  // namespace
 
 int main() {
+  flyx::test::print_passes = true;
   // When a DSpark drafter is taken without being named: the default (auto) with no drafter file, dspark, all.
   const std::vector<std::string> none, one = {"dflash2-drafter"};
   using flyx::apps::wants_dspark;
@@ -189,6 +184,5 @@ int main() {
   set_env("HF_HUB_OFFLINE", "");
   set_env("HF_HUB_CACHE", "");
   fs::remove_all(tmp, ec);
-  std::printf("model_source_test: %s (%d failures)\n", failures ? "FAILED" : "PASSED", failures);
-  return failures ? 1 : 0;
+  return flyx::test::finish("model_source_test");
 }

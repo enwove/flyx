@@ -12,6 +12,7 @@
 #include "apps/flyx-server/http_util.h"
 #include "apps/flyx-server/request_log.h"
 #include "apps/flyx-server/server.h"
+#include "tests/common/check.h"
 
 namespace flyx::server {
 
@@ -29,15 +30,6 @@ using flyx::server::RequestLog;
 using flyx::server::dump_json;
 
 namespace {
-
-int failures = 0;
-
-void check(bool ok, const char* what) {
-  if (!ok) {
-    std::printf("FAIL %s\n", what);
-    ++failures;
-  }
-}
 
 ojson record_one(const ojson& body) {
   RequestLog log(true);
@@ -171,6 +163,5 @@ int main() {
     check(bad.load() == 0, "concurrent RequestLog writers and readers produce valid JSON");
   }
 
-  std::printf("request_log: %s\n", failures ? "FAILED" : "ok");
-  return failures ? 1 : 0;
+  return flyx::test::finish("request_log_test");
 }

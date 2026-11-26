@@ -15,18 +15,11 @@
 #include "core/exec/reply_text.h"
 #include "core/modelfile/modelfile.h"
 #include "core/tokenizer/tokenizer.h"
+#include "tests/common/check.h"
 
 using namespace flyx;
 
 namespace {
-
-int failures = 0;
-
-void check(bool ok, const std::string& what) {
-  if (ok) return;
-  ++failures;
-  std::printf("FAIL %s\n", what.c_str());
-}
 
 // Whole UTF-8 characters only.
 bool whole_utf8(std::string_view s) {
@@ -275,6 +268,5 @@ int main(int argc, char** argv) {
           "without a sink the stop string still ends the reply");
   }
 
-  std::printf("reply_text: %s\n", failures ? "FAILED" : "ok");
-  return failures ? 1 : 0;
+  return flyx::test::finish("reply_text_test");
 }

@@ -21,19 +21,13 @@
 
 #include "core/exec/scheduler.h"
 #include "core/os/os.h"
+#include "tests/common/check.h"
 
 using namespace flyx;
 
 extern "C" void flyx_test_delegate(const flyx_backend_api*);
 
 namespace {
-
-int failures = 0;
-
-void check(bool ok, const std::string& what) {
-  std::printf("  %-4s %s\n", ok ? "ok" : "FAIL", what.c_str());
-  if (!ok) ++failures;
-}
 
 // A job's events, read on a thread of their own as an HTTP handler would.
 struct Reply {
@@ -451,13 +445,13 @@ int dv_main(const char* model, const char* backend) {
             std::string("DV, ") + kinds[s] + ", " + which + ": plain decoding's text alone and three at once");
     }
   }
-  std::printf("scheduler (DV): %s\n", failures ? "FAILED" : "ok");
-  return failures ? 1 : 0;
+  return flyx::test::finish("scheduler_test (DV)");
 }
 
 }  // namespace
 
 int main(int argc, char** argv) {
+  flyx::test::print_passes = true;
   if (argc < 3) {
     std::fprintf(stderr, "usage: scheduler_test MODEL.flyx BACKEND [dv]\n");
     return 2;
@@ -490,7 +484,7 @@ int main(int argc, char** argv) {
   if (mode == "raw-clients") so.max_sessions = 1;
   if (mode == "interrupted-prewarm" || mode == "reassigned-prewarm" || mode == "repeated-prewarm") {
     check_interrupted_prewarm(argv[1], eo, so, mode);
-    return failures != 0;
+    return flyx::test::finish("scheduler_test");
   }
   Scheduler sched(argv[1], eo, so);
   std::string err;
@@ -500,15 +494,15 @@ int main(int argc, char** argv) {
   }
   if (queue_test) {
     check_queue(sched);
-    return failures != 0;
+    return flyx::test::finish("scheduler_test");
   }
   if (argc > 3 && std::string(argv[3]) == "history") {
     check_prewarmed_history(sched);
-    return failures != 0;
+    return flyx::test::finish("scheduler_test");
   }
   if (mode == "raw-clients") {
     check_raw_clients(sched, kLong);
-    return failures != 0;
+    return flyx::test::finish("scheduler_test");
   }
   if (argc > 3 && std::string(argv[3]) == "marked-system") {
     Request main;
@@ -529,7 +523,7 @@ int main(int argc, char** argv) {
     check(concurrent && foreground->done && side->done && usage.reused_tokens >= 256,
           "the title reuses marked instructions while the first conversation is still generating (" +
           std::to_string(usage.reused_tokens) + " tokens)");
-    return failures != 0;
+    return flyx::test::finish("scheduler_test");
   }
   {  // A shared system prompt can be longer than both conversations' actual turns.
     Request main;
@@ -994,6 +988,5 @@ int main(int argc, char** argv) {
     }
   }
 
-  std::printf("scheduler: %s\n", failures ? "FAILED" : "ok");
-  return failures ? 1 : 0;
+  return flyx::test::finish("scheduler_test");
 }

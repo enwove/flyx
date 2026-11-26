@@ -27,18 +27,12 @@
 #include "core/render/chat.h"
 #include "core/session/store.h"
 #include "nlohmann/json.hpp"
+#include "tests/common/check.h"
 
 using namespace flyx;
 using json = nlohmann::json;
 
 namespace {
-
-int g_fail = 0;
-
-void check(bool ok, const std::string& msg) {
-  std::printf("  %-4s %s\n", ok ? "ok" : "FAIL", msg.c_str());
-  if (!ok) ++g_fail;
-}
 
 bool same_tokens(const std::vector<int32_t>& got, const std::vector<int32_t>& want) {
   if (got == want) return true;
@@ -1165,6 +1159,7 @@ void test_chat_and_format(const std::string& model_path) {
 }  // namespace
 
 int main(int argc, char** argv) {
+  flyx::test::print_passes = true;
   if (argc < 3) {
     std::fprintf(stderr, "usage: inkling2_test WORK_DIR cpu_ref|cuda\n");
     return 2;
@@ -2159,6 +2154,5 @@ int main(int argc, char** argv) {
     std::fprintf(stderr, "FAIL exception: %s\n", e.what());
     return 1;
   }
-  std::printf("inkling2_test (%s): %s (%d failures)\n", backend.c_str(), g_fail ? "FAILED" : "PASSED", g_fail);
-  return g_fail ? 1 : 0;
+  return flyx::test::finish("inkling2_test (" + backend + ")");
 }

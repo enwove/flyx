@@ -13,6 +13,7 @@
 #include <vector>
 
 #include "core/plan/plans.h"
+#include "tests/common/check.h"
 
 struct flyx_plan {
   int width, drafter_block, tree;  // what the fake backend lowered
@@ -21,12 +22,6 @@ struct flyx_plan {
 using namespace flyx;
 
 namespace {
-
-int failures = 0;
-void check(bool ok, const std::string& what) {
-  std::printf("%s %s\n", ok ? "ok" : "FAIL", what.c_str());
-  failures += !ok;
-}
 
 constexpr int kDrafterBlock = 7;
 bool g_takes_drafter = true;  // the backend lowers the drafter's DRAFT nodes
@@ -135,6 +130,7 @@ std::string str(const std::vector<int>& v) {
 }  // namespace
 
 int main() {
+  flyx::test::print_passes = true;
   const flyx_backend_api api = fake_backend();
   const FakeModel dv(true), chain(false);
   const std::vector<int> kWarm = {0, 15, 0}, kWho = {-1, 0, 0};
@@ -238,6 +234,5 @@ int main() {
     check(!b.ok, "  one the backend refuses: the load fails (" + b.err + ")");
     b.plans.free(&api);
   }
-  std::printf("%s (%d failures)\n", failures ? "FAILED" : "PASSED", failures);
-  return failures ? 1 : 0;
+  return flyx::test::finish("plans_test");
 }

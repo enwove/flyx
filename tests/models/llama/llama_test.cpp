@@ -21,18 +21,13 @@
 
 #include "core/interfaces/model.h"
 #include "core/modelfile/modelfile.h"
+#include "tests/common/check.h"
 #include "tests/core/modelfile/write_flyx.h"
 
 using namespace flyx;
 using nlohmann::json;
 
 namespace {
-
-int failures = 0;
-void check(bool ok, const std::string& what) {
-  std::printf("%s %s\n", ok ? "ok" : "FAIL", what.c_str());
-  failures += !ok;
-}
 
 std::unique_ptr<interfaces::Model> open(const ModelFile& f, const std::string& drafter, std::string* error) {
   interfaces::ModelOptions o;
@@ -147,6 +142,7 @@ std::string with_header(const std::string& path, const std::string& dir, const s
 }  // namespace
 
 int main(int argc, char** argv) {
+  flyx::test::print_passes = true;
   if (argc < 2) {
     std::fprintf(stderr, "usage: llama_models_test ASSET_DIR [nodv]\n");
     return 2;
@@ -256,6 +252,5 @@ int main(int argc, char** argv) {
     check(e.find("this build's qwen35 model does not read") != std::string::npos,
           "a Qwen3.5 file requiring adapters, which its model does not read: refused (" + e + ")");
   }
-  std::printf("%s (%d failures)\n", failures ? "FAILED" : "PASSED", failures);
-  return failures ? 1 : 0;
+  return flyx::test::finish("llama_models_test");
 }

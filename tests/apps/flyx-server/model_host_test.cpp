@@ -24,6 +24,7 @@
 #include "core/exec/engine.h"
 #include "core/os/os.h"
 #include "core/os/path.h"
+#include "tests/common/check.h"
 
 using namespace flyx;
 using flyx::server::ModelHost;
@@ -31,13 +32,6 @@ using flyx::server::ModelHost;
 extern "C" void flyx_test_delegate(const flyx_backend_api*);
 
 namespace {
-
-int failures = 0;
-
-void check(bool ok, const std::string& what) {
-  std::printf("  %-4s %s\n", ok ? "ok" : "FAIL", what.c_str());
-  if (!ok) ++failures;
-}
 
 void set_env(const char* name, const std::string& value) {
 #if defined(_WIN32)
@@ -103,6 +97,7 @@ bool wait_for(const std::function<bool()>& done, int ms) {
 }  // namespace
 
 int main(int argc, char** argv) {
+  flyx::test::print_passes = true;
   if (argc < 2) {
     std::fprintf(stderr, "usage: model_host_test MODEL.flyx\n");
     return 2;
@@ -213,6 +208,5 @@ int main(int argc, char** argv) {
     check(open_models == 0 && closes == opens, "every model the backend opened is closed with the host");
   }
   fs::remove_all(config, ec);
-  std::printf("model_host: %s\n", failures ? "FAILED" : "ok");
-  return failures ? 1 : 0;
+  return flyx::test::finish("model_host_test");
 }
