@@ -1732,6 +1732,8 @@ void test_moe_dp4a_variants() {
 }  // namespace
 
 void test_inkling2_moe() {
+  Launch TR = TL;  // a round's calls (a sequence's own buffers): NVFP4 experts on k_moe_nvfp4_vec
+  TR.round_rows = true;
   test_inkling2_moe_norm();
   test_moe_gate_up_rules();
   test_moe_dp4a_variants();
@@ -1881,8 +1883,8 @@ void test_inkling2_moe() {
       for (int rows : {1, 8, 16}) {
         const std::string tag = label + " R=" + std::to_string(rows);
         const size_t elems = size_t(rows) * top_k * I;
-        moe_gate_up(d_x, H, scaled_gu, d_eidx, rows, top_k, I, H, beta, lb, true, d_act_unfused, I, &msc, TL);
-        moe_down(d_act_unfused, I, nvfp4_down, d_eidx, d_ew, rows, top_k, H, I, d_y_direct, H, false, &msc, TL);
+        moe_gate_up(d_x, H, scaled_gu, d_eidx, rows, top_k, I, H, beta, lb, true, d_act_unfused, I, &msc, TR);
+        moe_down(d_act_unfused, I, nvfp4_down, d_eidx, d_ew, rows, top_k, H, I, d_y_direct, H, false, &msc, TR);
         // NVFP4 rounds take float32 SiTU outputs (k_moe_nvfp4_vec): the BF16 SiTU is those, rounded once.
         Vec staged = down(d_act_unfused, elems);
         round_bf16(staged);
@@ -1891,11 +1893,11 @@ void test_inkling2_moe() {
         moe_stage_q8(d_x, H, H, rows, msc, moe_q8_mins(scaled_gu), TL.st);
         CK(cudaMemset(d_y_direct, 0, size_t(rows) * H * sizeof(float)));  // an accidental restage sees zeros
         CK(cudaMemset(packed_act, 0xFF, elems * sizeof(bf16)));
-        moe_gate_up(d_y_direct, H, scaled_gu, d_eidx, rows, top_k, I, H, beta, lb, true, nullptr, I, &msc, TL, true,
+        moe_gate_up(d_y_direct, H, scaled_gu, d_eidx, rows, top_k, I, H, beta, lb, true, nullptr, I, &msc, TR, true,
                     packed_act);
         const Vec got = down_bf16(packed_act, elems);
         expect_bits("moe BF16 SiTU == float SiTU + NVFP4 stage " + tag, got, staged);
-        moe_down(nullptr, I, nvfp4_down, d_eidx, d_ew, rows, top_k, H, I, d_y_direct, H, false, &msc, TL, packed_act);
+        moe_down(nullptr, I, nvfp4_down, d_eidx, d_ew, rows, top_k, H, I, d_y_direct, H, false, &msc, TR, packed_act);
         // The BF16-input down keeps the tensor-core kernel: the float32-input round's result to within its rounding.
         expect("moe NVFP4 down consumes BF16 SiTU " + tag, down(d_y_direct, size_t(rows) * H), y, 1e-2);
         if (rows == 1) solo = got;
@@ -1944,17 +1946,17 @@ void test_inkling2_moe() {
     float* d_act_1 = dev<float>(size_t(top_k) * I);
     float* d_y_1 = dev<float>(size_t(H));
     moe_gate_up(d_x + size_t(rr) * H, H, w_gu, d_eidx + size_t(rr) * top_k, 1, top_k, I, H, beta, lb, true, d_act_1, I,
-                nullptr, TL);
+                nullptr, TR);
     moe_down(d_act_1, I, w_dn, d_eidx + size_t(rr) * top_k, d_ew + size_t(rr) * top_k, 1, top_k, H, I, d_y_1, H, false,
-             nullptr, TL);
+             nullptr, TR);
     Vec got_y1 = down(d_y_1, size_t(H));
     Vec got_ygrp_rr(got_y_grp.begin() + ptrdiff_t(rr) * H, got_y_grp.begin() + ptrdiff_t(rr + 1) * H);
     expect_round("moe R=1 direct == R=37 grouped " + label, got_y1, got_ygrp_rr);
 
     moe_gate_up(d_x + size_t(rr) * H, H, w_gu, d_eidx + size_t(rr) * top_k, 1, top_k, I, H, beta, lb, true, d_act_1, I,
-                &msc, TL);
+                &msc, TR);
     moe_down(d_act_1, I, w_dn, d_eidx + size_t(rr) * top_k, d_ew + size_t(rr) * top_k, 1, top_k, H, I, d_y_1, H, false,
-             &msc, TL);
+             &msc, TR);
     const Vec got_y1_staged = down(d_y_1, size_t(H));
     expect_round("moe R=1 staged == R=37 grouped " + label, got_y1_staged, got_ygrp_rr);
 
@@ -1962,9 +1964,9 @@ void test_inkling2_moe() {
     float* d_act_8 = dev<float>(size_t(16) * top_k * I);  // 16 rows: the grouping checks below
     float* d_y_8 = dev<float>(size_t(16) * H);
     moe_gate_up(d_x + size_t(r8_0) * H, H, w_gu, d_eidx + size_t(r8_0) * top_k, 8, top_k, I, H, beta, lb, true, d_act_8,
-                I, &msc, TL);
+                I, &msc, TR);
     moe_down(d_act_8, I, w_dn, d_eidx + size_t(r8_0) * top_k, d_ew + size_t(r8_0) * top_k, 8, top_k, H, I, d_y_8, H,
-             false, &msc, TL);
+             false, &msc, TR);
     Vec got_y8 = down(d_y_8, size_t(8) * H);
     if (round_bits_only) {
       // NVFP4 round kernels (k_moe_nvfp4_vec, float32 inputs) against float64 without input rounding: rows
@@ -1996,10 +1998,10 @@ void test_inkling2_moe() {
     // GEMMs' tiles are alike and where they are not.
     for (int rows : {2, 4, 8, 16}) {
       const std::string tag = label + " R=" + std::to_string(rows);
-      const int grouped = moe_gate_up(d_x, H, w_gu, d_eidx, rows, top_k, I, H, beta, lb, true, d_act_8, I, &msc, TL);
-      moe_down(d_act_8, I, w_dn, d_eidx, d_ew, rows, top_k, H, I, d_y_8, H, false, &msc, TL, nullptr, grouped);
+      const int grouped = moe_gate_up(d_x, H, w_gu, d_eidx, rows, top_k, I, H, beta, lb, true, d_act_8, I, &msc, TR);
+      moe_down(d_act_8, I, w_dn, d_eidx, d_ew, rows, top_k, H, I, d_y_8, H, false, &msc, TR, nullptr, grouped);
       const Vec taken = down(d_y_8, size_t(rows) * H);
-      moe_down(d_act_8, I, w_dn, d_eidx, d_ew, rows, top_k, H, I, d_y_8, H, false, &msc, TL);
+      moe_down(d_act_8, I, w_dn, d_eidx, d_ew, rows, top_k, H, I, d_y_8, H, false, &msc, TR);
       expect_bits("moe down on gate|up's grouping == its own " + tag, taken, down(d_y_8, size_t(rows) * H));
     }
     cudaFree(d_act_8);

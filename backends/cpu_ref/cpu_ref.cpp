@@ -116,8 +116,10 @@ void lin(const RefModel* M, int wi, const double* x, int rows, int K, int N, dou
   else flyx::ops::linear(x, rows, K, w, N, y);
 }
 
-// Single-row linear against expert `e` of a 3D weight [E, N, K] decoded to FLYX_DT_F64, with the same input rounding.
-void lin_expert(const RefModel* M, int wi, int e, const double* x, int K, int N, double* y, int gemm_rows) {
+// Single-row linear against expert `e` of a 3D weight [E, N, K] decoded to FLYX_DT_F64, with the same input rounding,
+// except NVFP4 experts in rounds: the engine's k_moe_nvfp4_vec reads their float32 inputs as they are.
+void lin_expert(const RefModel* M, int wi, int e, const double* x, int K, int N, double* y, int gemm_rows,
+                bool round) {
   const flyx_tensor_view* w = M->w(wi);
   flyx_tensor_view slice = *w;
   slice.ndim = 2;
@@ -128,7 +130,7 @@ void lin_expert(const RefModel* M, int wi, int e, const double* x, int K, int N,
   if (M->q8.count(w)) flyx::ops::linear_a8(x, 1, K, &slice, N, y);
   else if (gemm_rows > FLYX_MAX_ROWS && M->a4.count(w)) flyx::ops::linear_a4(x, 1, K, &slice, N, y);
   else if (M->a16h.count(w)) flyx::ops::linear_a16h(x, 1, K, &slice, N, y);
-  else if (M->a16.count(w)) flyx::ops::linear_a16(x, 1, K, &slice, N, y);
+  else if (M->a16.count(w) && !round) flyx::ops::linear_a16(x, 1, K, &slice, N, y);
   else flyx::ops::linear(x, 1, K, &slice, N, y);
 }
 
@@ -611,11 +613,11 @@ void moe_ffn(RefSeq* s, const flyx_moe_block& B, bool verify) {
     double* dst = &moe_raw[size_t(r) * size_t(H)];
     const double* hr = &h[size_t(r) * size_t(H)];
     for (int k = 0; k < K; ++k) {
-      lin_expert(M, B.gate_up, eidx[size_t(k)], hr, H, 2 * I, gu.data(), R);
+      lin_expert(M, B.gate_up, eidx[size_t(k)], hr, H, 2 * I, gu.data(), R, verify);
       for (int i = 0; i < I; ++i)
         act[size_t(i)] = B.situ_beta > 0.f ? situ(gu[size_t(i)], gu[size_t(I + i)], B.situ_beta, B.situ_linear_beta)
                                            : silu(gu[size_t(i)]) * gu[size_t(I + i)];
-      lin_expert(M, B.down, eidx[size_t(k)], act.data(), I, H, down_out.data(), R);
+      lin_expert(M, B.down, eidx[size_t(k)], act.data(), I, H, down_out.data(), R, verify);
       const double w = ew[size_t(k)];
       for (int c = 0; c < H; ++c) dst[c] += w * down_out[size_t(c)];
     }

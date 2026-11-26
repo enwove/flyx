@@ -1291,8 +1291,9 @@ void moe_layer(const Pass& ps, const MoeBlock& f, bool fused) {
   moe_route(rv.b.proj, f.router_bias, R, E, K, f.gating_sigmoid, f.norm_weights, f.norm_eps, f.route_scale,
             rv.b.moe_idx, rv.b.moe_w, st);
 
-  bf16* act_bf16 =
-      round_q8 && moe_round_bf16_down(f.down, R, K, I, msc) ? reinterpret_cast<bf16*>(rv.b.moe_act) : nullptr;
+  bf16* act_bf16 = round_q8 && !moe_round_vec(f.down, L) && moe_round_bf16_down(f.down, R, K, I, msc)
+                       ? reinterpret_cast<bf16*>(rv.b.moe_act)
+                       : nullptr;
   // The grouping of the rows by expert that the gate|up GEMM leaves in the scratch, which the down GEMM takes over.
   int grouped = 0;
   if (fused) {

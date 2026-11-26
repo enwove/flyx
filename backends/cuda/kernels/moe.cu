@@ -633,6 +633,14 @@ inline bool moe_vec_rounds() {
   return on;
 }
 
+}  // namespace
+
+bool moe_round_vec(const ExpertMat& W, const Launch& L) {
+  return L.round_rows && W.q && !W.packed() && moe_vec_rounds();
+}
+
+namespace {
+
 // No-scratch fallback for NVFP4 moe_down (sc == nullptr): identical mma_bf16 span order + ew FMA order.
 template <int SPAN, int NW, int NT>
 __global__ void __launch_bounds__(32 * NW)
@@ -739,7 +747,7 @@ __global__ void __launch_bounds__(32 * NW)
 template <int SPAN>
 int launch_nvfp4_gu(const float* x, int ldx, const ExpertMat& W, const int* eidx, int rows, int top_k, int I, int K,
                     float situ_beta, float situ_linear_beta, bool fuse_act, float* out, int ld_out,
-                    const MoeScratch* sc, cudaStream_t st) {
+                    const MoeScratch* sc, cudaStream_t st, bool vec) {
   const int N_work = fuse_act ? I : 2 * I;
   const bool has_sc = sc && sc->tasks && sc->pairs && W.n_experts <= sc->max_experts && top_k <= sc->max_top_k;
   const int chunk = has_sc ? std::max(1, sc->chunk_rows) : rows;
@@ -749,7 +757,7 @@ int launch_nvfp4_gu(const float* x, int ldx, const ExpertMat& W, const int* eidx
     const float* xc = x + size_t(r0) * ldx;
     const int* ec = eidx + size_t(r0) * top_k;
     float* oc = out + size_t(r0) * top_k * ld_out;
-    if (rc <= FLYX_MAX_ROWS && (rc == 1 || has_sc) && ldx % 4 == 0 && moe_vec_rounds()) {
+    if (vec && rc <= FLYX_MAX_ROWS && (rc == 1 || has_sc) && ldx % 4 == 0) {
       const int gx = ceil_div(N_work, kVecWarps * (fuse_act ? kVecRows / 2 : kVecRows));
       if (rc == 1) {
         if (fuse_act)
@@ -823,7 +831,7 @@ int launch_nvfp4_gu(const float* x, int ldx, const ExpertMat& W, const int* eidx
 template <int SPAN>
 void launch_nvfp4_down(const float* act, int ld_act, const ExpertMat& W, const int* eidx, const float* ew, int rows,
                        int top_k, int H, int K, float* out, int ld_out, bool accumulate, const MoeScratch* sc,
-                       cudaStream_t st, const bf16* act_bf16, int grouped) {
+                       cudaStream_t st, const bf16* act_bf16, int grouped, bool vec) {
   const bool has_down =
       sc && sc->down_buf && sc->tasks && sc->pairs && W.n_experts <= sc->max_experts && top_k <= sc->max_top_k;
   if (!has_down) {
@@ -837,7 +845,7 @@ void launch_nvfp4_down(const float* act, int ld_act, const ExpertMat& W, const i
     const float* ac = act_bf16 ? nullptr : act + size_t(r0) * top_k * ld_act;
     const int* ec = eidx + size_t(r0) * top_k;
     const int M = rc * top_k;
-    if (!act_bf16 && rc <= FLYX_MAX_ROWS && ld_act % 4 == 0 && moe_vec_rounds()) {
+    if (vec && !act_bf16 && rc <= FLYX_MAX_ROWS && ld_act % 4 == 0) {
       const int gx = ceil_div(H, kVecWarps * kVecRows);
       if (rc == 1) {
         launch_pdl(k_moe_nvfp4_vec<false, true, 1>, dim3(gx, top_k), dim3(32 * kVecWarps), 0, st, (const float*)
@@ -1338,10 +1346,10 @@ int moe_gate_up(const float* x, int ldx, const ExpertMat& W, const int* eidx, in
   if (W.q) {
     if (K % 128 == 0)
       return launch_nvfp4_gu<128>(x, ldx, W, eidx, rows, top_k, I, K, situ_beta, situ_linear_beta, fuse_act, out,
-                                  ld_out, sc, st);
+                                  ld_out, sc, st, moe_round_vec(W, L));
     if (K % 64 == 0)
       return launch_nvfp4_gu<64>(x, ldx, W, eidx, rows, top_k, I, K, situ_beta, situ_linear_beta, fuse_act, out,
-                                 ld_out, sc, st);
+                                 ld_out, sc, st, moe_round_vec(W, L));
     throw std::runtime_error("moe_gate_up: NVFP4 requires K multiple of 64 (got " + std::to_string(K) + ")");
   }
   const bool tiled = rows > 1 && sc && sc->tasks && sc->pairs && W.n_experts <= sc->max_experts &&
@@ -1417,10 +1425,10 @@ void moe_down(const float* act, int ld_act, const ExpertMat& W, const int* eidx,
   if (W.q) {
     if (K % 128 == 0)
       launch_nvfp4_down<128>(act, ld_act, W, eidx, ew, rows, top_k, H, K, out, ld_out, accumulate, sc, st, act_bf16,
-                             grouped);
+                             grouped, moe_round_vec(W, L));
     else if (K % 64 == 0)
       launch_nvfp4_down<64>(act, ld_act, W, eidx, ew, rows, top_k, H, K, out, ld_out, accumulate, sc, st, act_bf16,
-                            grouped);
+                            grouped, moe_round_vec(W, L));
     else
       throw std::runtime_error("moe_down: NVFP4 requires K multiple of 64 (got " + std::to_string(K) + ")");
     return;

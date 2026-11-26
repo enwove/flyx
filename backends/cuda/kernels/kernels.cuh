@@ -1770,6 +1770,9 @@ int moe_gate_up_dp4a(int tuning, int dtype, int rows);
 bool moe_q8_mins(const ExpertMat& W);
 bool moe_round_q8(const ExpertMat& W, int rows, int top_k, int K, const MoeScratch* sc);
 bool moe_round_bf16_down(const ExpertMat& W, int rows, int top_k, int K, const MoeScratch* sc);
+// Whether a round's (Launch::round_rows) NVFP4 expert GEMMs on W run k_moe_nvfp4_vec: float32 inputs, per-column
+// float32 sums, a column's bits whatever the round's width (FLYX_MOE_VEC=0: the tensor cores on bf16 inputs).
+bool moe_round_vec(const ExpertMat& W, const Launch& L);
 // gate_up over selected experts eidx [rows, top_k]: fuse_act=false writes [rows*top_k, 2*I];
 // fuse_act=true applies SiTU/SwiGLU in registers and writes [rows*top_k, I] (bit-identical to unfused + situ_rows).
 // act_bf16 (with fuse_act and moe_round_q8): the activations there in bf16, each rounded to nearest as staging
