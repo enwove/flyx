@@ -5,8 +5,7 @@ from pathlib import Path
 import sys
 import tempfile
 
-from check_server import Client
-from local_server import serve, server_env
+from local_server import Client, serve, server_env
 
 
 WEATHER_SCHEMA = {

@@ -10,8 +10,7 @@ from pathlib import Path
 import sys
 import tempfile
 
-from check_server import Client, wait_telemetry
-from local_server import serve, server_env
+from local_server import Client, serve, server_env, wait_telemetry
 
 
 def post(client, path, body, headers):

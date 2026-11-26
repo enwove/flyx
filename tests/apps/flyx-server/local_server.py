@@ -1,10 +1,15 @@
 # Copyright 2026 The flyx Authors. SPDX-License-Identifier: Apache-2.0
-"""A test's own `flyx serve` (cpu_ref, the tiny model): the environment it runs in, its start and its end.
+"""A test's own `flyx serve` (cpu_ref, the tiny model): the environment it runs in, its start and its end; and a
+client of a server's HTTP API (Client, wait_telemetry, wait_load), which check_server.py, the checks of a server on a
+real model run by hand, takes from here too.
 
 The server reads FLYX_* settings from its environment (FLYX_API_KEY, FLYX_BACKEND_OPTIONS, FLYX_BACKEND_DIR,
 FLYX_DRAFTER, ...: core/os/env.h), and its configuration, home and Hugging Face cache from the user's folders.  A
 test's server takes none of that from the shell that started the test: what is tested is what the test gives it.
 """
+from __future__ import annotations
+
+import http.client
 import json
 import os
 from pathlib import Path
@@ -13,6 +18,7 @@ import subprocess
 import sys
 import threading
 import time
+import urllib.parse
 from urllib.error import URLError
 from urllib.request import urlopen
 
@@ -101,3 +107,93 @@ def serve(exe, cwd, env, model=(), on_ready=None, *, ctx=128, options=(), expect
             server.wait()
         reader.join(timeout=10)
     return b"".join(said) if stderr else None
+
+
+class Client:
+    """Requests to a server at `url` (with `key` as its bearer token, when there is one)."""
+
+    def __init__(self, url: str, key: str | None):
+        u = urllib.parse.urlparse(url)
+        self.host, self.port = u.hostname, u.port or 80
+        self.key = key
+
+    def _conn(self):
+        return http.client.HTTPConnection(self.host, self.port, timeout=600)
+
+    def _headers(self):
+        h = {"Content-Type": "application/json"}
+        if self.key:
+            h["Authorization"] = "Bearer " + self.key
+        return h
+
+    def get_raw(self, path, headers=None):
+        c = self._conn()
+        try:
+            c.request("GET", path, headers={**self._headers(), **(headers or {})})
+            r = c.getresponse()
+            return r.status, r.headers, r.read()
+        finally:
+            c.close()
+
+    def get(self, path):
+        status, _, data = self.get_raw(path)
+        return status, json.loads(data or b"null")
+
+    def post(self, path, body, headers=None):
+        c = self._conn()
+        c.request("POST", path, body=json.dumps(body), headers={**self._headers(), **(headers or {})})
+        r = c.getresponse()
+        return r.status, json.loads(r.read() or b"null")
+
+    def delete(self, path):
+        c = self._conn()
+        c.request("DELETE", path, headers=self._headers())
+        r = c.getresponse()
+        return r.status, json.loads(r.read() or b"null")
+
+    def stream(self, path, body, stop_after=None):
+        """Yields (event_name, data) of an SSE response; stop_after closes the connection early."""
+        c = self._conn()
+        c.request("POST", path, body=json.dumps(body), headers=self._headers())
+        r = c.getresponse()
+        if r.status != 200:
+            yield "http_error", {"status": r.status, "body": r.read().decode()}
+            return
+        event, n = None, 0
+        while True:
+            line = r.readline()
+            if not line:
+                break
+            line = line.decode().rstrip("\r\n")
+            if line.startswith("event:"):
+                event = line[6:].strip()
+            elif line.startswith("data:"):
+                data = line[5:].strip()
+                yield event, (data if data == "[DONE]" else json.loads(data))
+                event = None
+                n += 1
+                if stop_after and n >= stop_after:
+                    c.close()
+                    return
+
+
+def wait_telemetry(cl, predicate, seconds):
+    """GET /v1/telemetry?recent=1 until predicate holds of it, at most `seconds`; the last one read."""
+    end = time.monotonic() + seconds
+    while True:
+        _, t = cl.get("/v1/telemetry?recent=1")
+        if predicate(t) or time.monotonic() >= end:
+            return t
+        time.sleep(0.02)
+
+
+def wait_load(cl: Client, timeout_s: float) -> dict:
+    """GET /v1/load until no fetch or load is under way, at most timeout_s."""
+    deadline = time.time() + timeout_s
+    s = {}
+    while time.time() < deadline:
+        st, s = cl.get("/v1/load")
+        if st == 200 and s.get("state") not in ("fetching", "loading"):
+            return s
+        time.sleep(1)
+    return s
