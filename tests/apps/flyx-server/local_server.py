@@ -58,8 +58,9 @@ _LISTENING = re.compile(rb"listening on http://[^\s,]+, the dashboard at (http:/
 
 def serve(exe, cwd, env, model=(), on_ready=None, *, ctx=128, options=(), expect_name="test model", stderr=False):
     """Starts `exe serve` on `model` (cpu_ref, on a port the OS chooses: --port 0, read back from where the server
-    says it listens), waits until it has loaded the model named `expect_name`, calls on_ready(origin), and ends it.
-    What the server writes to stderr goes on to this process's stderr, or is returned where `stderr` is true."""
+    says it listens), waits until it has loaded the model named `expect_name` (None: until it answers, a server that
+    starts without one), calls on_ready(origin), and ends it.  What the server writes to stderr goes on to this
+    process's stderr, or is returned where `stderr` is true."""
     command = [exe, "serve", *model, "--backend", "cpu_ref", "--ctx", str(ctx), "--port", "0",
                "--no-monitor", "--no-browser", *options]
     server = subprocess.Popen(command, cwd=cwd, env=_without_inherited(env), stderr=subprocess.PIPE)
@@ -87,6 +88,8 @@ def serve(exe, cwd, env, model=(), on_ready=None, *, ctx=128, options=(), expect
             try:
                 with urlopen(origin[0] + "/health", timeout=1) as reply:
                     health = json.load(reply)
+                if expect_name is None:
+                    break
                 if health.get("loaded"):
                     assert health["model"] == expect_name, health
                     break
