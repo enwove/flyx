@@ -135,9 +135,10 @@ uint16_t float_to_bf16(float f) {
 //   in bf16 for Qwen3.5's 248K x 2560: a 1-bit SignHead or NVFP4 copy (the
 //   target keeps its own).
 // * The MTP layer (projections and fc) runs only for drafts and their context.
-// * The DFlash2 drafter defaults to target-matched precision when VRAM allows
-//   (BF16 beside BF16, Q8_0 beside GGUF, NVFP4 beside NVFP4) and drops to NVFP4
-//   when VRAM is tight.
+// * A block drafter (DFlash2's block, DSpine's) defaults to target-matched
+//   precision when VRAM allows (NVFP4 beside NVFP4, Q8_0 beside GGUF, beside a
+//   float target as the model asks) and drops to NVFP4 when
+//   VRAM is tight.
 // Option draft_weights=auto|nvfp4|q8|exact selects the policy.
 void rows_to_bf16(const float* x, int ldx, int rows, int K, bf16* out, cudaStream_t st);
 

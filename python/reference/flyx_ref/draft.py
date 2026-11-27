@@ -91,6 +91,11 @@ class Draft:
     def w(self, name):
         return self.W["draft." + name]
 
+    @property
+    def block_drafts(self) -> int:
+        """The drafts one pass of its block makes (DFlash2: block - 1; DSpark: block, the anchor's row too)."""
+        return self.cfg.block - self.cfg.draft_from
+
     def new_state(self):
         c, st = self.cfg, DraftState()
         for j in range(c.layers):

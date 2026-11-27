@@ -517,6 +517,20 @@ void cache_snapshots(const fs::path& tmp) {
   }
 }
 
+// ---- a drafter's kind from a cached config ----------------------------------------------------------------------
+// Its config's architecture: Tencent's DSpineDraftModel is DSpine.
+void cached_drafter_kinds(const fs::path& tmp) {
+  const std::string commit = "3333333333333333333333333333333333333333";
+  const std::string dir = "models--acme--DSpine";
+  put(tmp / dir, commit, "config.json", R"({"architectures": ["DSpineDraftModel"], "dflash_config": {}})");
+  fs::create_directories(tmp / dir / "refs");
+  std::ofstream(tmp / dir / "refs" / "main", std::ios::binary) << commit;
+  set_env("HF_HUB_CACHE", from_path(tmp));
+  flyx::hub::Repo r;
+  check(flyx::hub::in_cache("acme/DSpine", "main", &r) && flyx::hub::drafter_kind(r) == "dspine",
+        "a DSpineDraftModel: DSpine");
+}
+
 // ---- a fake Hub ------------------------------------------------------------------------------------------------
 struct FakeHub {
   const std::string commit = "0123456789abcdef0123456789abcdef01234567";
@@ -819,6 +833,7 @@ int main(int argc, char** argv) {
   choices();
   const TestDirectory tmp;
   cache_snapshots(tmp.path / "snapshots");
+  cached_drafter_kinds(tmp.path / "kinds");
 #if !defined(_WIN32)
   void* curl = dlopen("libcurl.so.4", RTLD_NOW);
   if (!curl) curl = dlopen("libcurl.4.dylib", RTLD_NOW);

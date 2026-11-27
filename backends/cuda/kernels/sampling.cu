@@ -333,6 +333,16 @@ __global__ void __launch_bounds__(kTopkPartThreads) k_topk_part(const float* log
   }
 }
 
+// Slot `out` of a row's top-k when no score is left (the others NaN): the smallest id its first `out` slots do not
+// hold, from *fill up, so a row's ids stay distinct (a row without a score: 0..k-1, as argmax_rows gives 0).
+__device__ int unscored_id(const int* ids, int out, int* fill) {
+  for (;; ++*fill) {
+    bool taken = false;
+    for (int q = 0; q < out; ++q) taken |= ids[q] == *fill;
+    if (!taken) return (*fill)++;
+  }
+}
+
 // The slices' candidates of a row (block of kTopkParts * 16 threads, one each): k rounds of block argmax,
 // plus optional truncated softmax p_max and top-1/top-2 margin across all kTopkParts * 16 candidates.
 __global__ void __launch_bounds__(kTopkParts * kTopMax) k_topk_merge(const float* pv, const int* pi, int k, int* idx,
@@ -347,6 +357,7 @@ __global__ void __launch_bounds__(kTopkParts * kTopMax) k_topk_merge(const float
   const int i_orig = i;
   const int rounds = (prob || margin) ? max(k, 2) : k;
   float m1 = -INFINITY, m2 = -INFINITY;
+  int fill = 0;
   for (int out = 0; out < rounds; ++out) {
     float bv = v;
     int bi = i, who;
@@ -358,7 +369,7 @@ __global__ void __launch_bounds__(kTopkParts * kTopMax) k_topk_merge(const float
       m2 = bv;
     }
     if (t == 0 && out < k) {
-      idx[r * k + out] = bi;
+      idx[r * k + out] = bi == INT32_MAX ? unscored_id(idx + r * k, out, &fill) : bi;
       if (val) val[r * k + out] = bv;
     }
     if (t == who) v = -INFINITY, i = INT32_MAX;
@@ -400,7 +411,7 @@ __global__ void __launch_bounds__(512) k_topk(const float* logits, int ld, int V
     lv[p] = v;
     li[p] = i;
   }
-  int head = 0;
+  int head = 0, fill = 0;
   float m1 = -INFINITY, m2 = -INFINITY;
   for (int out = 0; out < need; ++out) {
     sv[tid] = head < need ? lv[head] : -INFINITY;
@@ -423,7 +434,7 @@ __global__ void __launch_bounds__(512) k_topk(const float* logits, int ld, int V
         m2 = sv[0];
       }
       if (out < k) {
-        idx[r * k + out] = si[0];
+        idx[r * k + out] = si[0] == INT32_MAX ? unscored_id(idx + r * k, out, &fill) : si[0];
         if (val) val[r * k + out] = sv[0];
       }
     }

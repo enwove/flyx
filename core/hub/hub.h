@@ -65,7 +65,7 @@ struct Found {
   std::string pipeline;
   std::string architecture;      // GGUF general.architecture from expand[]=gguf, empty when absent
   bool gated = false;
-  bool is_drafter = false;       // DFlash2 safetensors drafter or GGUF dflash drafter
+  bool is_drafter = false;       // a block drafter's safetensors (drafter_kind) or a GGUF dflash drafter
 };
 // The Hub's repositories holding GGUF files (when `gguf_only` is true) whose names match `query` (every one when it is
 // empty), at most `limit`, ordered by `sort`: "trending", "downloads", "likes", "updated" or "created", the most first.
@@ -145,8 +145,8 @@ std::string quant_in_name(const std::string& file_name);
 // baseModels relation), asked of the Hub; "" when it says none, or offline.
 std::string base_relation(const std::string& repo);
 
-// Whether the repository holds a block drafter (its config's architecture: DFlash2, or DeepSpec's DSpark), not a
-// transformers model; and which ("dflash2", "dspark").
+// Whether the repository holds a block drafter (its config's architecture: DFlash2, DeepSpec's DSpark or Tencent's
+// DSpine), not a transformers model; and which ("dflash2", "dspark", "dspine").
 bool is_drafter(const Repo& r);
 std::string drafter_kind(const Repo& r);
 // The files `name` asks for: the GGUF of its quant (or the repository's only one), else a block drafter's

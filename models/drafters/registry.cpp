@@ -104,12 +104,25 @@ const DSparkSpec& DrafterRegistry::ensure_dspark_spec(const ModelFile& file, con
   return *dspark_spec_;
 }
 
+const DSpineSpec& DrafterRegistry::ensure_dspine_spec(const ModelFile& file, const TargetSpec& target) {
+  if (dspine_spec_) return *dspine_spec_;
+  const int i = block_companion_;
+  if (i < 0) return dspine_spec_.emplace(parse_dspine_json(file.header().at("draft"), target, -1));
+  try {
+    dspine_spec_ = parse_dspine_json(file.header().at("companions").at(size_t(i)).at("draft"), target, i);
+  } catch (const std::exception& e) {
+    throw std::runtime_error(companion_label(i) + e.what());
+  }
+  return *dspine_spec_;
+}
+
 void DrafterRegistry::validate_selected(const ModelFile& file, const std::vector<Drafter>& selected,
                                         const TargetSpec& target) {
   int64_t stride = 0;
   for (Drafter kind : selected) {
     if (!is_block_drafter(kind)) continue;
     const int taps = kind == Drafter::kDSpark && sources_.dspark_gguf ? ensure_dspark_spec(file, target).block.n_taps
+                     : kind == Drafter::kDSpine                     ? ensure_dspine_spec(file, target).block.n_taps
                                                                      : ensure_dflash2_spec(file, target).block.n_taps;
     stride += int64_t(taps) * target.hidden;
     if (stride > INT_MAX) throw std::runtime_error("combined drafter feature stride exceeds int32");
@@ -157,9 +170,13 @@ int DrafterRegistry::attach(Drafter kind, const ModelFile& file, Tables& T, cons
     const DSparkSpec& spec = ensure_dspark_spec(file, target);
     return record(dspark_, build_dspark(T, file, spec, target), spec.taps, {spec.block.block - 1, false});
   }
+  if (kind == Drafter::kDSpine) {  // causal, its block at most
+    const DSpineSpec& spec = ensure_dspine_spec(file, target);
+    return record(block_, build_dspine(T, spec, target), spec.taps, {spec.block.block - 1, false});
+  }
   // DFlash2's block: one shared mask token every row, so its block stretches to a round's rows
   const DFlash2Spec& spec = ensure_dflash2_spec(file, target);
-  return record(dflash2_, build_dflash2(T, spec, target), spec.taps, {spec.block_drafts(), true});
+  return record(block_, build_dflash2(T, spec, target), spec.taps, {spec.block_drafts(), true});
 }
 
 void DrafterRegistry::BlockTaps::emit(std::vector<flyx_node>* p, int position, int flags) const {
@@ -174,12 +191,12 @@ void DrafterRegistry::emit_pre_visit_taps(std::vector<flyx_node>* p, int visit_0
 void DrafterRegistry::emit_taps(std::vector<flyx_node>* p, int layer_1based) const {
   const bool is_post_norm = layer_1based == target_layers_;
   if (is_post_norm && explicit_post_norm_) return;
-  dflash2_.emit(p, layer_1based, is_post_norm ? FLYX_TAP_NORMED : 0);
+  block_.emit(p, layer_1based, is_post_norm ? FLYX_TAP_NORMED : 0);
 }
 
 void DrafterRegistry::emit_post_norm_taps(std::vector<flyx_node>* p, int n_layers) const {
   dspark_.emit(p, n_layers, FLYX_TAP_NORMED);
-  dflash2_.emit(p, n_layers, FLYX_TAP_NORMED);
+  block_.emit(p, n_layers, FLYX_TAP_NORMED);
 }
 
 void DrafterRegistry::emit_contexts(std::vector<flyx_node>* p) const {

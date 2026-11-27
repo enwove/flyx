@@ -723,13 +723,6 @@ int open_model(const flyx_model_desc* desc, const flyx_open_options* opts, flyx_
     t[3] = load_clock();
     m->need = row_needs(m.get());
     for (int i = 0; i < desc->n_weights; ++i) m->need.q8 = m->need.q8 || desc->weights[i].activations == FLYX_ACT_Q8;
-    // A block drafter's projections bound as Q8_0 blocks (resolve_draft_quant: draft_weights=q8, or Q8_0 beside a float
-    // target where the model asks it) stage their inputs in 8 bits whatever the target's weights are.
-    if (m->dflash_block >= 0) {
-      const DFlashBlock& d = block<DFlashBlock>(m.get(), m->dflash_block);
-      for (int j = 0; j < d.layers(); ++j)
-        m->need.q8 = m->need.q8 || block<DFlashLayer>(m.get(), d.first_layer + j).w_qkv.q8_inputs();
-    }
     // Prefill passes must start at multiples of the chunk to reproduce a longer pass (numerics.md: K).
     bool chunked = !m->states.gdn.empty();
     for (const GdnDims& gd : m->states.gdn) chunked = chunked && gdn_chunk_takes(gd);
@@ -782,7 +775,7 @@ int open_model(const flyx_model_desc* desc, const flyx_open_options* opts, flyx_
     bool drafter = false;
     for (int i = 0; i < desc->n_blocks; ++i)
       for (int k : {FLYX_BLOCK_MTP, FLYX_BLOCK_DFLASH2, FLYX_BLOCK_DFLASH2_LAYER, FLYX_BLOCK_DV, FLYX_BLOCK_DV_LAYER,
-                    FLYX_BLOCK_DSPARK, FLYX_BLOCK_DSPARK_LAYER})
+                    FLYX_BLOCK_DSPARK, FLYX_BLOCK_DSPARK_LAYER, FLYX_BLOCK_DSPINE, FLYX_BLOCK_DSPINE_LAYER})
         drafter = drafter || desc->blocks[i].kind == k;
     char head[160] = "Not enough VRAM while loading weights.";
     if (has_others)

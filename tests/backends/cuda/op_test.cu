@@ -84,6 +84,7 @@ int main(int argc, char** argv) {
   test_blocks_round_side();
   test_rmsnorm();
   std::printf("attention\n");
+  test_kv16_saturation();
   test_attention(256, 64, 16, 4, 16, 300, true, 1e7);   // target layer shape, verify rows
   test_attention(256, 64, 16, 4, 1, 1000, true, 1e7);   // plain decode
   test_attention(256, 64, 16, 4, 37, 50, true, 1e7);    // prefill chunk
@@ -190,6 +191,7 @@ int main(int argc, char** argv) {
   test_select();
   test_stop_decide();
   test_dv();
+  test_dspine();
   test_sample();
   test_penalize();
   test_wide_rows_choice();

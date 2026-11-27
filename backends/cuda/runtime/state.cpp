@@ -86,7 +86,7 @@ RowNeeds row_needs(const flyx_bmodel* m) {
       n.cx = std::max(n.cx, d->hidden);
       n.ckv = std::max(n.ckv, d->ctx_width());
       if (d->fc.q8_inputs() || d->ctx.q8_inputs() || d->sel_hid.q8_inputs()) n.q8 = true;
-      ks({d->hidden, d->inter, d->nh * d->hd, df_feats});
+      ks({d->hidden, d->inter, d->nh * d->hd, df_feats, d->dspine.code, d->dspine.rank});
     } else if (const auto* dl = std::get_if<DFlashLayer>(&blk)) {
       if (dl->w_qkv.q8_inputs() || dl->w_o.q8_inputs() || dl->w_gu.q8_inputs() || dl->w_down.q8_inputs() ||
           dl->attn_proj.q8_inputs() || dl->mlp_proj.q8_inputs())
@@ -112,8 +112,9 @@ RowNeeds row_needs(const flyx_bmodel* m) {
 }
 
 int max_drafts(const Block& drafter) {
-  // DFlash2: its block, or a round's rows drafted at once (draft_block's wide block)
-  if (const auto* d = std::get_if<DFlashBlock>(&drafter)) return std::max(d->block, FLYX_MAX_ROWS) - 1;
+  // DFlash2: its block, or a round's rows drafted at once (draft_block's wide block); DSpine: the block it was made for
+  if (const auto* d = std::get_if<DFlashBlock>(&drafter))
+    return d->dspine ? d->block - 1 : std::max(d->block, FLYX_MAX_ROWS) - 1;
   if (const auto* ds = std::get_if<DSparkBlock>(&drafter)) return ds->block - 1;
   if (const auto* v = std::get_if<DvBlock>(&drafter)) return v->tree_width;
   return std::holds_alternative<MtpBlock>(drafter) ? FLYX_MAX_ROWS - 1 : 0;
@@ -1403,7 +1404,7 @@ void build_seq(flyx_bmodel* m, int32_t max_ctx, flyx_seq* s) {
     s->ci = s->alloc<int>(size_t(head_rows) * V);
   }
   if (d) {
-    const int B = std::max(d->block, FLYX_MAX_ROWS), DH = d->hidden, G = DH / d->conv_group;  // a wide block's rows
+    const int B = std::max(d->block, FLYX_MAX_ROWS), DH = d->hidden;  // a wide block's rows
     s->ld_feats = n.feats;
     s->dtok = s->alloc<int>(B);
     s->cand = s->alloc<int>(size_t(B) * d->sel_topk);
@@ -1417,9 +1418,24 @@ void build_seq(flyx_bmodel* m, int32_t max_ctx, flyx_seq* s) {
     s->ld_dact = std::max(d->nh * d->hd, d->inter);
     s->dproj = s->alloc<float>(size_t(B) * s->ld_dproj);
     s->dact = s->alloc<float>(size_t(B) * s->ld_dact);
-    s->ddelta = s->alloc<float>(size_t(B) * 2 * d->conv_taps * G);
+    s->ddelta = s->alloc<float>(size_t(B) * 2 * d->conv_cols());
     s->dq = s->alloc<float>(size_t(B) * d->nh * d->hd);
     s->ld_ckv = n.ckv;
+    if (const DSpineBridge& br = d->dspine) {
+      const size_t n_rows = size_t(d->block), c = size_t(br.topk), C = size_t(br.code), Rk = size_t(br.rank);
+      const size_t cands = (n_rows - 1) * c, senders = 1 + (n_rows - 2) * c;
+      auto& ds = s->ds;
+      ds.codes = s->alloc<float>(std::max(n_rows, senders) * C);
+      ds.gates = s->alloc<float>(std::max(n_rows * 3 * Rk, senders * 2 * Rk));
+      ds.msg = s->alloc<float>(n_rows * Rk);
+      ds.rms = s->alloc<float>(n_rows);
+      ds.before = s->alloc<float>(n_rows * size_t(DH));
+      ds.g = s->alloc<float>(n_rows * Rk);
+      ds.heads = s->alloc<float>(cands * size_t(DH));
+      ds.tg = s->alloc<float>(cands * Rk);
+      ds.base = s->alloc<float>(cands);
+      ds.pick = s->alloc<int>(senders);
+    }
   }
   if (ds) {
     const int B = ds->block, DH = ds->hidden, Rk = ds->markov_rank;
@@ -1512,8 +1528,8 @@ void alloc_batch(flyx_bmodel* m) {
       d = df;
       break;
     }
-  if (d && d->groups()) {
-    const int DH = d->hidden, G = DH / d->conv_group;
+  if (d && d->groups()) {  // DSpine's and a block without convolutions draft a sequence at a time
+    const int DH = d->hidden;
     auto af = [&](size_t count) { return static_cast<float*>(alloc(count * sizeof(float))); };
     B->dflash.dtok = static_cast<int*>(alloc(size_t(FLYX_MAX_ROWS) * sizeof(int)));
     B->dflash.dx = af(size_t(FLYX_MAX_ROWS) * DH);
@@ -1524,7 +1540,7 @@ void alloc_batch(flyx_bmodel* m) {
     B->dflash.ld_dact = std::max(d->nh * d->hd, d->inter);
     B->dflash.dproj = af(size_t(FLYX_MAX_ROWS) * B->dflash.ld_dproj);
     B->dflash.dact = af(size_t(FLYX_MAX_ROWS) * B->dflash.ld_dact);
-    B->dflash.ddelta = af(size_t(FLYX_MAX_ROWS) * 2 * d->conv_taps * G);
+    B->dflash.ddelta = af(size_t(FLYX_MAX_ROWS) * 2 * d->conv_cols());
     B->dflash.dq = af(size_t(FLYX_MAX_ROWS) * d->nh * d->hd);
     B->dflash.cand = static_cast<int*>(alloc(size_t(FLYX_MAX_ROWS) * d->sel_topk * sizeof(int)));
     B->dflash.unary = af(size_t(FLYX_MAX_ROWS) * d->sel_topk);

@@ -52,6 +52,39 @@ void residual_query_extent() {
   require(a.res_query_bytes() == 3 * 2304 * sizeof(float), "full attention warms three residual queries");
 }
 
+void drafter_dimensions() {
+  flyx_bmodel m;
+  DFlashBlock b;
+  m.hidden = b.hidden = b.target_hidden = b.hd = 64;
+  b.n_taps = b.nh = b.nkv = 1;
+  b.block = b.dspine.topk = 2;
+  b.dspine.code = 256;
+  b.dspine.rank = kDSpineMaxRank;
+  std::string why;
+  require(supported(&m, b, &why), "the widest portable DSpine rank opens");
+  b.dspine.rank += 8;
+  require(!supported(&m, b, &why), "a rank beyond portable shared memory is refused");
+  b.dspine.rank = 128;
+  DFlashLayer l;
+  l.attn_proj.blk = {BlockMat{nullptr, nullptr, FLYX_DT_GGML_Q8_0, 1, true}};
+  m.blocks = {b, l};
+  require(row_needs(&m).k_max == 256 && row_needs(&m).q8, "scratch covers the code and Q8 convolution");
+  std::swap(b.dspine.rank, b.dspine.code);
+  m.blocks[0] = b;
+  require(row_needs(&m).k_max == 256, "scratch covers the rank");
+
+  flyx_block block{};
+  block.kind = FLYX_BLOCK_DSPINE;
+  block.dspine.n_taps = 1;
+  flyx_model_desc desc{};
+  desc.blocks = &block;
+  desc.n_blocks = 1;
+  desc.hidden = INT32_MAX - 63;
+  require(kernel_limits(desc, &why), "largest padded DSpine tap row");
+  ++desc.hidden;
+  require(!kernel_limits(desc, &why), "DSpine tap padding would overflow");
+}
+
 void staging_width() {
   const size_t limit = kLoadSlotBytes / sizeof(uint16_t);
   require(quant_row_bytes(limit, "matrix") == kLoadSlotBytes, "a BF16 row fits at the limit");
@@ -168,6 +201,42 @@ void vision_estimates() {
   flyx_load_estimate e{};
   require(estimate_load(&desc, &opts, 0, 0, &e) == 0 && e.weights_bytes == 9 * 68,
           "mixed-format Q/K/V estimate uses the upload format of the stack");
+}
+
+// Three distinct floating projections: the target's MLP, DSpine's fc and a co-loaded DSpark layer's q.
+void companion_estimates() {
+  const flyx_tensor_view matrix{"matrix", FLYX_DT_BF16, 2, {3, 64}, nullptr, 3 * 128};
+  const flyx_weight weights[] = {{}, {&matrix}, {&matrix}, {&matrix}};
+  flyx_block blocks[4]{};
+  blocks[0].kind = FLYX_BLOCK_MLP;
+  blocks[0].mlp.gate = blocks[0].mlp.up = blocks[0].mlp.down = 1;
+  blocks[1].kind = FLYX_BLOCK_DSPINE;
+  auto& spine = blocks[1].dspine;
+  spine.float_weights = FLYX_DRAFT_WEIGHTS_NVFP4;
+  spine.fc = 2;
+  spine.hidden = 64;
+  spine.rank = 16;
+  spine.layers = 3;
+  spine.head_dim = 32;
+  blocks[2].kind = FLYX_BLOCK_DSPARK;
+  blocks[3].kind = FLYX_BLOCK_DSPARK_LAYER;
+  blocks[3].dspark_layer.q = 3;
+  flyx_model_desc desc{};
+  desc.blocks = blocks;
+  desc.n_blocks = 4;
+  desc.weights = weights;
+  desc.n_weights = 4;
+  flyx_open_options opts{};
+  flyx_load_estimate est{};
+  const size_t copies = 2 * spine.hidden * spine.rank + 4 * spine.layers * spine.head_dim;
+  const size_t bf16 = 3 * 128, nvfp4 = 3 * 40;
+  require(estimate_load(&desc, &opts, 0, 0, &est) == 0 && est.draft_weights_bytes == nvfp4 + bf16 + copies &&
+              est.weights_bytes == bf16 + est.draft_weights_bytes && est.draft_compact_savings == bf16 - nvfp4,
+          "AUTO beside a float target: DSpine in NVFP4 and DSpark in BF16, including DSpine's fixed copies");
+  opts.draft_weights = FLYX_DRAFT_WEIGHTS_NVFP4;
+  require(estimate_load(&desc, &opts, 0, 0, &est) == 0 && est.draft_weights_bytes == 2 * nvfp4 + copies &&
+              est.draft_compact_savings == 0,
+          "explicit NVFP4 applies to both companions");
 }
 
 void expert_estimates() {
@@ -356,8 +425,10 @@ int main() {
   using namespace flyx::cuda;
   try {
     vision_estimates();
+    companion_estimates();
     expert_estimates();
     residual_query_extent();
+    drafter_dimensions();
     staging_width();
     oom_paths();
     quantized_bytes(DraftQuant::kQ8);

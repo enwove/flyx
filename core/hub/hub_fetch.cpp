@@ -13,6 +13,7 @@
 #include <thread>
 
 #include "core/hub/sha256.h"
+#include "core/modelfile/modelfile.h"
 #include "core/modelfile/readers.h"
 #include "core/os/http.h"
 #include "core/os/os.h"
@@ -482,8 +483,10 @@ bool search(const std::string& query, const std::string& sort, int limit, std::v
     if (f.architecture == "dflash") f.is_drafter = true;
     if (const auto cfg = m.find("config"); cfg != m.end() && cfg->is_object()) {
       if (const auto archs = cfg->find("architectures"); archs != cfg->end() && archs->is_array()) {
+        std::vector<std::string> names;
         for (const auto& a : *archs)
-          if (a.is_string() && a.get<std::string>() == "DFlash2DraftModel") f.is_drafter = true;
+          if (a.is_string()) names.push_back(a.get<std::string>());
+        if (!drafter_kind_of(names).empty()) f.is_drafter = true;
       }
     }
     out->push_back(std::move(f));

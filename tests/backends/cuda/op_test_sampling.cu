@@ -489,6 +489,29 @@ void test_select() {
     const bool same = down_i(i1, rows * k2) == down_i(i2, rows * k2) && down(v1, rows * k2) == down(v2, rows * k2);
     std::printf("  %-4s top-k over slices: one block a row's result\n", same ? "ok" : "FAIL");
     g_fail += !same;
+    // Rows with NaN scores (a drafter's NaN rows), all or some: the scored ids best first, then the smallest ids not
+    // taken, so a row's ids stay distinct (a row of NaN: 0..k-1, as argmax_rows gives 0); both kernels.
+    Vec nan_rows(size_t(rows) * V2, std::nan(""));
+    const int scored[] = {5, 2, V2 - 1};  // the ids rows 1.. score, best first
+    for (int r = 1; r < rows; ++r)
+      for (int j = 0; j < 3; ++j) nan_rows[size_t(r) * V2 + scored[j]] = 3.0 - j;
+    std::vector<int> want_n;
+    for (int r = 0; r < rows; ++r) {
+      std::vector<int> ids(scored, scored + (r == 0 ? 0 : 3));
+      for (int id = 0; int(ids.size()) < k2; ++id)
+        if (std::find(ids.begin(), ids.end(), id) == ids.end()) ids.push_back(id);
+      want_n.insert(want_n.end(), ids.begin(), ids.end());
+    }
+    float* dn = up(nan_rows);
+    int *n1 = dev<int>(rows * k2), *n2 = dev<int>(rows * k2), *npi = dev<int>(rows * kTopkParts * 16);
+    float *nv1 = dev<float>(rows * k2), *nv2 = dev<float>(rows * k2), *npv = dev<float>(rows * kTopkParts * 16);
+    topk_rows(dn, V2, V2, k2, n1, nv1, rows, 0);
+    topk_rows(dn, V2, V2, k2, n2, nv2, rows, 0, npv, npi, rows);
+    const bool valid = down_i(n1, rows * k2) == want_n && down_i(n2, rows * k2) == want_n;
+    std::printf("  %-4s top-k of rows with NaN scores: the scored ids, then the smallest not taken, both kernels\n",
+                valid ? "ok" : "FAIL");
+    g_fail += !valid;
+    for (void* p : std::initializer_list<void*>{dn, n1, n2, npi, nv1, nv2, npv}) CK(cudaFree(p));
     // topk_rows confidence outputs (prob & margin) for full-head drafters (both k=1/val=null merge and small-V exact).
     int* i_one = dev<int>(rows);
     float *dp = dev<float>(rows), *dm = dev<float>(rows);
@@ -609,8 +632,9 @@ void test_select() {
   }
   {  // past 16 candidates (DSpark's walk): the radix top-k, ties and a value shared past the k-th included, and the
      // walk over them
-    for (const auto& [Vw, kw] : {std::pair{248320, 64}, std::pair{248320, 256}, std::pair{248320, 1024},
-                                 std::pair{300, 256}, std::pair{40, 17}}) {
+    for (const auto& shape : {std::pair{248320, 64}, std::pair{248320, 256}, std::pair{248320, 1024},
+                              std::pair{300, 256}, std::pair{40, 17}}) {
+      const int Vw = shape.first, kw = shape.second;
       Vec l = randv(size_t(rows) * Vw);
       for (auto& x : l) x = double(float(x));
       if (Vw > 1000) {

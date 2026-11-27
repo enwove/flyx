@@ -232,8 +232,8 @@ __global__ void k_draft_ctx_kv(const float* kv, int ld, const float* k_norms, fl
   const float out = d < half ? nv * c - sh[d + half] * s : nv * c + sh[d - half] * s;
   const int cell = ring > 0 ? pos % ring : pos;
   const size_t at = size_t(layer) * layer_stride + (size_t(cell) * nkv + kh) * hd + d;
-  dK[at] = __float2half_rn(out);
-  dV[at] = __float2half_rn(row[nkv * hd + kh * hd + d]);
+  dK[at] = kv16_of(out);
+  dV[at] = kv16_of(row[nkv * hd + kh * hd + d]);
 }
 
 constexpr int kMtpThreads = 512;

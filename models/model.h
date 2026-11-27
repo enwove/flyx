@@ -30,16 +30,18 @@ using interfaces::ModelOptions;
 
 // The drafters the architectures here can have.  Only models/ knows them by
 // name: the engine sees drafters by number and the round widths each offers
-// (draft_widths).  DV (models/dv.h) drafts trees, and its canvas follows its
-// own rounds only (Model::restarts).
-enum class Drafter { kNone, kMtp, kDFlash2, kDv, kDSpark };
+// (draft_widths).  DFlash2, DSpark and DSpine (models/drafters/) draft a block at once; DV (models/dv.h) drafts
+// trees, and its canvas follows its own rounds only (Model::restarts).
+enum class Drafter { kNone, kMtp, kDFlash2, kDv, kDSpark, kDSpine };
 const char* drafter_name(Drafter d);   // --drafter's word for it ("none" for kNone)
 const char* drafter_title(Drafter d);  // its name in messages ("DFlash2", "DSpark")
 Drafter drafter_named(std::string_view name);  // kNone when no drafter is called so
 bool is_block_drafter(Drafter d);        // a parallel block drafter (models/drafters/registry.h builds it)
 // A block drafter whose trees beside its chains pay on attention-only targets (DSpark's): drafted by default there.
 bool drafts_trees_by_default(Drafter d);
-bool drafts_q8_beside_float(Drafter d);  // its projections Q8_0 beside a float target, measured as losing nothing
+// What a block drafter's projections are under draft_weights=auto beside a target of float weights:
+// AUTO (the backend's own: as its file has them), Q8_0 or NVFP4, as measured to pay.
+flyx_draft_weights draft_weights_beside_float(Drafter d);
 
 // What a drafter drafts a round, as its blocks say: the most as trained, and whether its block stretches past them up
 // to a round's rows (DFlash2's block: one shared mask token every row) or drafts its block at most.
@@ -54,7 +56,8 @@ std::string declared_activations(const ModelFile& file);
 // The drafters a model has: in its own file, or in drafter files beside it (ModelFile::add).
 struct DrafterSources {
   bool mtp = false, mtp_beside = false;   // the model has an MTP layer; ... from a drafter file
-  Drafter block = Drafter::kNone;          // its drafter of DFlash2's block (kDFlash2, kDSpark), kNone: none
+  // its block drafter (kDFlash2 or kDSpark of DFlash2's block, kDSpine); kNone: none
+  Drafter block = Drafter::kNone;
   bool block_beside = false;               // ... from a drafter file
   bool dspark_gguf = false;                // llama.cpp's DSpark GGUF beside it (its own block): kDSpark beside `block`
   bool dv = false;                         // the model file has a DV drafter
@@ -181,7 +184,7 @@ class Model : public interfaces::Model {
 
   struct DrafterBlock {
     Drafter kind;
-    int block;       // its FLYX_BLOCK_MTP / FLYX_BLOCK_DFLASH2 / FLYX_BLOCK_DSPARK / FLYX_BLOCK_DV block
+    int block;       // its FLYX_BLOCK_MTP / FLYX_BLOCK_DFLASH2 / FLYX_BLOCK_DSPINE / FLYX_BLOCK_DSPARK / FLYX_BLOCK_DV block
     int max_drafts;  // the most it proposes in a round as trained
     bool stretch;    // its block drafts past them, up to a round's rows (DrafterReach)
   };

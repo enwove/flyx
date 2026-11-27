@@ -48,9 +48,9 @@ def _margin(row):
 
 
 def greedy_spec(target: Target, draft: Draft, prompt, max_new, stop_ids=(), width=None, oracle=None):
-    """width: drafts verified per round (<= block - draft_from). oracle(pos)->token|None overrides drafts (tests)."""
+    """width: drafts verified per round (<= draft.block_drafts). oracle(pos)->token|None overrides drafts (tests)."""
     c = draft.cfg
-    K = width or (c.block - c.draft_from)
+    K = width or draft.block_drafts
     st = target.new_state()
     ds = draft.new_state()
     logits, taps, _ = target.forward(prompt, st, taps=c.taps)

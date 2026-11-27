@@ -295,6 +295,7 @@ flyx_add_golden_test(golden_cpu_ref_qwen3_gguf_lora ARGS cpu_ref qwen3_lora ${AS
 set_tests_properties(gguf_reader ggml_blocks gguf_models dflash2_models gguf_qwen2_nfc gguf_qwen2_none gguf_cpu_ref
                      PROPERTIES FIXTURES_REQUIRED gguf_assets)
 
+flyx_add_py_test(dspine_reference ${CMAKE_SOURCE_DIR}/tests/python/reference/dspine_test.py ARGS ${ASSETS} FIXTURES assets)
 flyx_add_py_test(reference_vs_transformers ${CMAKE_SOURCE_DIR}/tests/python/reference/check_vs_hf.py
                  ARGS ${ASSETS}/hf_target ${ASSETS}/tiny.flyx FIXTURES assets)
 add_test(NAME tokenizer COMMAND tokenizer_test ${ASSETS}/tiny.flyx ${ASSETS}/tokenizer_cases.json)
@@ -500,6 +501,15 @@ flyx_add_golden_test(golden_cpu_ref_llama_lora ARGS cpu_ref llama_lora)
 flyx_add_golden_test(golden_cpu_ref_gdn128 ARGS cpu_ref gdn128)
 # A DFlash2 drafter whose layers attend a sliding window (z-lab's 27B drafter's), shorter than its block here.
 flyx_add_golden_test(golden_cpu_ref_window ARGS cpu_ref window)
+# A DSpine drafter in place of DFlash2's (the whole battery: its rounds, oracle runs, rollback, sampling, ...), and one
+# whose layers attend a causal sliding window of 8 (the 27B's drafter's), shorter than its block.
+flyx_add_golden_test(golden_cpu_ref_dspine ARGS cpu_ref dspine)
+flyx_add_golden_test(golden_cpu_ref_dspine1 ARGS cpu_ref dspine1)  # a drafter of one layer
+flyx_add_golden_test(golden_cpu_ref_dspine_window ARGS cpu_ref dspine_window)
+# The tiny Qwen3 with a DSpine drafter (taps and context in a second architecture's programs): transformers' tokens.
+flyx_add_golden_test(golden_cpu_ref_qwen3_dspine ARGS cpu_ref qwen3 ${ASSETS}/tiny_qwen3_dspine.flyx - dspine)
+flyx_add_golden_test(golden_cpu_ref_qwen3_dspine_lora ARGS cpu_ref qwen3_lora ${ASSETS}/tiny_qwen3_dspine.flyx
+                     ${ASSETS}/peft_qwen3 dspine)
 
 set_tests_properties(tokenizer tokenizer_minicpm5 chat chat_qwen35 reply_grammars request reply_text
                      scheduler_cpu_ref scheduler_queue scheduler_prewarmed_history scheduler_raw_clients
@@ -543,7 +553,11 @@ if(TARGET flyx-cuda)
                  backends/cuda/op_test_attention.cu backends/cuda/op_test_gdn.cu backends/cuda/op_test_nvfp4.cu
                  backends/cuda/op_test_head.cu backends/cuda/op_test_sampling.cu backends/cuda/op_test_layers.cu
                  backends/cuda/op_test_dv.cu backends/cuda/op_test_vision.cu
-                 backends/cuda/op_test_inkling2.cu)
+                 backends/cuda/op_test_inkling2.cu backends/cuda/op_test_dspine.cu)
+  if(MSVC)
+    # The MSVC INFINITY macro triggers nvcc's overflow warning at every use, as in flyx_cuda_kernels.
+    target_compile_options(cuda_op_test PRIVATE --diag-suppress=221)
+  endif()
   target_link_libraries(cuda_op_test PRIVATE flyx_cuda_kernels)
   add_dependencies(cuda_op_test flyx_gemm_tables)  # op_test_gemm.cu reads the generated tables
   set_target_properties(cuda_op_test PROPERTIES CUDA_ARCHITECTURES "${FLYX_CUDA_ARCHS}")
@@ -596,6 +610,13 @@ if(TARGET flyx-cuda)
   flyx_add_golden_test(golden_cuda_gdn128 ARGS cuda gdn128)
   flyx_add_golden_test(golden_cuda_gdn128_unfused ARGS cuda gdn128 ENV FLYX_BACKEND_OPTIONS=fusion=0)
   flyx_add_golden_test(golden_cuda_window ARGS cuda window)
+  flyx_add_golden_test(golden_cuda_dspine ARGS cuda dspine)
+  flyx_add_golden_test(golden_cuda_dspine_unfused ARGS cuda dspine ENV FLYX_BACKEND_OPTIONS=fusion=0)
+  flyx_add_golden_test(golden_cuda_dspine_window ARGS cuda dspine_window)
+  flyx_add_golden_test(golden_cuda_dspine1 ARGS cuda dspine1)  # one layer: its cache binary16 beside fp8 ones
+  flyx_add_golden_test(golden_cuda_qwen3_dspine ARGS cuda qwen3 ${ASSETS}/tiny_qwen3_dspine.flyx - dspine)
+  flyx_add_golden_test(golden_cuda_qwen3_dspine_lora ARGS cuda qwen3_lora ${ASSETS}/tiny_qwen3_dspine.flyx
+                       ${ASSETS}/peft_qwen3 dspine)
   # decode and verification attention on tensor cores for every row (by default only past rows_attention_from keys)
   flyx_add_golden_test(golden_cuda_rows_mma ARGS cuda nvfp4 ENV FLYX_BACKEND_OPTIONS=rows_attention_from=0)
   flyx_add_golden_test(golden_cuda_qwen3_rows_mma ARGS cuda qwen3 ENV FLYX_BACKEND_OPTIONS=rows_attention_from=0)
@@ -605,6 +626,7 @@ if(TARGET flyx-cuda)
   # GPU's, so these run alone (RUN_SERIAL).  Every other GPU test runs beside the others and the CPU tests (ctest
   # -j, as the presets ask): their outputs do not depend on what else runs.
   flyx_add_golden_test(cuda_device_memory ARGS cuda ENV FLYX_TEST_DEVICE_MEMORY=1 SERIAL)
+  flyx_add_golden_test(cuda_device_memory_dspine ARGS cuda dspine ENV FLYX_TEST_DEVICE_MEMORY=1 SERIAL)
   flyx_add_golden_test(cuda_device_memory_nvfp4 ARGS cuda nvfp4 ENV FLYX_TEST_DEVICE_MEMORY=1 SERIAL)
   # The sessions' round graphs inside what they lease with the K/V and the low-bit copies in host
   # memory, across auto's switch: a process of its own (the driver keeps the graphs' memory of the one before).

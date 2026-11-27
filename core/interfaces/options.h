@@ -10,12 +10,13 @@
 
 namespace flyx::interfaces {
 
-enum class DrafterMode { kAuto, kMtp, kDFlash2, kDv, kDSpark, kAll, kNone };
+enum class DrafterMode { kAuto, kMtp, kDFlash2, kDv, kDSpark, kDSpine, kAll, kNone };
 
 // --drafter's words (FLYX_DRAFTER's, the server's "drafter"); "" is kAuto.
 inline constexpr std::pair<std::string_view, DrafterMode> kDrafterModes[] = {
-    {"mtp", DrafterMode::kMtp}, {"dflash2", DrafterMode::kDFlash2}, {"dspark", DrafterMode::kDSpark},
-    {"dv", DrafterMode::kDv},   {"all", DrafterMode::kAll},         {"none", DrafterMode::kNone},
+    {"mtp", DrafterMode::kMtp},       {"dflash2", DrafterMode::kDFlash2}, {"dspark", DrafterMode::kDSpark},
+    {"dspine", DrafterMode::kDSpine}, {"dv", DrafterMode::kDv},           {"all", DrafterMode::kAll},
+    {"none", DrafterMode::kNone},
 };
 
 // The word for a mode ("" for kAuto).
@@ -25,7 +26,7 @@ inline const char* drafter_mode_word(DrafterMode m) {
   return "";
 }
 
-// The words as a message lists them: "mtp, dflash2, dspark, dv, all or none".
+// The words as a message lists them: "mtp, dflash2, dspark, dspine, dv, all or none".
 inline std::string drafter_mode_words() {
   std::string out;
   const size_t n = std::size(kDrafterModes);

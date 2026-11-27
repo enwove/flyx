@@ -3,7 +3,7 @@
 //
 //   GET /v1/load          the load's state (ModelHost::status; also telemetry's "load")
 //   POST /v1/load         {"model": PATH or HUB NAME, "drafters": [...], "lora": DIR or HUB NAME, "ctx": N,
-//                         "drafter": "mtp|dflash2|dspark|dv|all|none", "speculative": BOOL, "kv": "fp8|16", "name": ID}
+//                         "drafter": "mtp|dflash2|dspark|dspine|dv|all|none", "speculative": BOOL, "kv": "fp8|16", "name": ID}
 //                         -> 202 and the state; 409 while one loads
 //   DELETE /v1/load       stops a fetch under way (what came stays for the next try)
 //   GET /v1/hub/config    current Hugging Face Hub endpoint, default endpoint, source ("setting", "HF_ENDPOINT",
@@ -201,7 +201,7 @@ std::vector<Listed> listing(const Server& s) {
     if (drafter) {
       const std::string disk = from_path(to_path(c.dir).make_preferred());
       const auto modified = fs::last_write_time(to_path(disk), ec);
-      // its config's kind ("dflash2", "dspark")
+      // its config's kind ("dflash2", "dspark", "dspine")
       l = entry(c.repo, "drafter", "", c.repo.substr(c.repo.find('/') + 1), disk, size, modified, -1,
                 flyx::drafter_source_kind(c.dir));
     } else {
@@ -363,7 +363,7 @@ ojson repo_json(const hub::Repo& r) {
     if (&item == preferred_mtp || &item == preferred_mm)
       (&item == preferred_mtp ? mtp : mmproj) = {{"path", path}, {"size", c.total_size}, {"cached", item.cached}};
   }
-  // A DFlash2 drafter's directory: config.json naming the architecture, and safetensors; no GGUF.
+  // A block drafter's directory: config.json naming the architecture, and safetensors; no GGUF.
   uint64_t weights = 0;
   bool config = false;
   for (const hub::RepoFile& f : r.files) {
@@ -588,8 +588,10 @@ void add_manage_routes(httplib::Server& http, Server* s) {
         std::string low = asked;
         for (char& c : low) c = char(std::tolower(static_cast<unsigned char>(c)));
         const bool drafter_query = low.find("dflash") != std::string::npos || low.find("dspark") != std::string::npos ||
+                                   low.find("dspine") != std::string::npos ||
                                    low.find("drafter") != std::string::npos || low.find("mtp") != std::string::npos;
-        // Include safetensors DFlash2 drafter repos (which filter=gguf omits) when searching drafters or when no GGUF matches.
+        // Include block drafters' safetensors repos (which filter=gguf omits) when searching drafters or when no GGUF
+        // matches.
         if (found.empty() || drafter_query) {
           std::vector<hub::Found> extra;
           std::string e2;

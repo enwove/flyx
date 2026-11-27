@@ -27,11 +27,13 @@ std::string node_name(const flyx_node& n, const Block* b) {
     case FLYX_NODE_DRAFT:
       if (std::holds_alternative<DvBlock>(*b)) return "dv tree";
       if (std::holds_alternative<DSparkBlock>(*b)) return "dspark block";
-      return std::holds_alternative<MtpBlock>(*b) ? "mtp draft" : "dflash2 block";
+      if (const auto* d = std::get_if<DFlashBlock>(b)) return std::string(d->name()) + " block";
+      return "mtp draft";
     case FLYX_NODE_CONTEXT:
       if (std::holds_alternative<DvBlock>(*b)) return "dv canvas";
       if (std::holds_alternative<DSparkBlock>(*b)) return "dspark context";
-      return std::holds_alternative<MtpBlock>(*b) ? "mtp context" : "dflash2 context";
+      if (const auto* d = std::get_if<DFlashBlock>(b)) return std::string(d->name()) + " context";
+      return "mtp context";
     case FLYX_NODE_ACCEPT: return "accept";
     case FLYX_NODE_COMMIT: return "commit (fold)";
     case FLYX_NODE_GIVEN: return "given drafts";
@@ -72,9 +74,14 @@ bool supported(const flyx_bmodel* m, const Block& blk, std::string* why) {
       return no("the MTP gather takes one offset and eps for its two norms");
     if (m->states.ring_width != block<AttnBlock>(m, t->attn).hidden) return no("the MTP ring keeps one hidden vector per position");
   } else if (const auto* d = std::get_if<DFlashBlock>(&blk)) {
-    if (!attention_head_dim(d->hd) || d->sel_topk > kWalkMax || d->block < 2 ||
-        d->block > FLYX_MAX_ROWS || d->conv_group < 1 || d->hidden % d->conv_group || d->nkv < 1 || d->nh % d->nkv)
+    if (!attention_head_dim(d->hd) || d->sel_topk > kWalkMax || d->block < 2 || d->block > FLYX_MAX_ROWS ||
+        (d->conv() && (d->conv_group < 1 || d->hidden % d->conv_group)) || d->nkv < 1 || d->nh % d->nkv)
       return no("drafter dimensions outside what the CUDA kernels support");
+    // DSpine's GEMMs take K % 8 (gemm()); its walk's scores one warp a candidate, a sender's message in shared memory
+    if (d->dspine && (d->dspine.code % 8 || d->dspine.rank % 8 || d->dspine.rank > kDSpineMaxRank ||
+                      d->dspine.topk < 2 || d->dspine.topk > FLYX_DSPINE_MAX_TOPK || d->hidden % 8))
+      return no("DSpine dimensions outside what the CUDA kernels support (code and rank multiples of 8, rank up to " +
+                std::to_string(kDSpineMaxRank) + ")");
     if (d->hidden != m->hidden || d->target_hidden != m->hidden) return no("drafter hidden size differs from the target's");
   } else if (const auto* ds = std::get_if<DSparkBlock>(&blk)) {
     if (!attention_head_dim(ds->hd) || ds->block < 2 || ds->block > FLYX_MAX_ROWS || ds->nkv < 1 || ds->nh % ds->nkv ||
@@ -114,11 +121,13 @@ bool kernel_limits(const flyx_model_desc& d, std::string* why) {
   bool rel_attn = false;
   for (int i = 0; i < d.n_blocks; ++i) {
     const flyx_block& b = d.blocks[i];
-    if (b.kind == FLYX_BLOCK_DFLASH2 || b.kind == FLYX_BLOCK_DSPARK) {
-      const int taps = b.kind == FLYX_BLOCK_DFLASH2 ? b.dflash2.n_taps : b.dspark.n_taps;
+    if (b.kind == FLYX_BLOCK_DFLASH2 || b.kind == FLYX_BLOCK_DSPINE || b.kind == FLYX_BLOCK_DSPARK) {
+      const int taps = b.kind == FLYX_BLOCK_DFLASH2 ? b.dflash2.n_taps
+                       : b.kind == FLYX_BLOCK_DSPINE ? b.dspine.n_taps
+                                                     : b.dspark.n_taps;
       if (d.hidden <= 0 || taps <= 0) return no("invalid drafter feature dimensions");
       const int64_t width = int64_t(taps) * d.hidden;
-      if ((b.kind == FLYX_BLOCK_DFLASH2 && width > INT_MAX - 63) || width > INT_MAX - tap_stride)
+      if ((b.kind != FLYX_BLOCK_DSPARK && width > INT_MAX - 63) || width > INT_MAX - tap_stride)
         return no("drafter feature width exceeds CUDA row dimensions");
       tap_stride += width;
     }
@@ -614,7 +623,8 @@ int lower(flyx_bmodel* m, const flyx_program* prog, flyx_plan** out) {
       // The DFlash2 selector's candidates make a tree (ops/draft/ref.h), DV's selector its own (its tree's T at
       // most); MTP drafts one token a step.
       const auto* v = std::get_if<DvBlock>(b);
-      if (!v && !std::holds_alternative<DFlashBlock>(*b)) return fail("lower: only DFlash2 and DV draft trees");
+      const auto* f = std::get_if<DFlashBlock>(b);
+      if (!v && !(f && !f->dspine)) return fail("lower: only DFlash2 and DV draft trees");  // DSpine: chains
       p->tree = p->drafted_tree = p->has_draft = true;
       most = v ? max_drafts(*b) : FLYX_MAX_ROWS - 1;
     } else if (n.kind == FLYX_NODE_DRAFT) {

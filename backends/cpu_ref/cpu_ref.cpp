@@ -54,7 +54,7 @@ struct RefModel {
                                                          // 32 values (FLYX_ACT_Q8)
   std::unordered_set<const flyx_tensor_view*> a4;    // NVFP4 weights whose inputs are NVFP4 in those passes
   mutable std::unordered_map<int, Vec> cache;
-  int dflash = -1;  // the DFlash2 drafter block, -1: none
+  int dflash = -1;  // the block drafter's block (DFlash2's or DSpine's), -1: none
   int dspark = -1;  // the DSpark drafter block, -1: none
   int dflash_tap_off = 0, dspark_tap_off = 0, total_taps = 0;
   int ring_width = 0;
@@ -888,6 +888,40 @@ void dspark_context(RefSeq* s, const flyx_dspark_block& d, int n_rows) {
   }
 }
 
+// ---- DSpine drafter (python/reference/flyx_ref/dspine.py, ops/dspine/ref.h) ------
+
+const flyx_dspine_layer_block& slayer(const RefModel* M, const flyx_dspine_block& d, int j) {
+  return M->block(d.first_layer + j).dspine_layer;
+}
+
+// A weight's float64 elements, row-major (every weight is decoded to float64 at open).
+const double* f64(const RefModel* M, int w) { return static_cast<const double*>(M->w(w)->data); }
+
+// The context: DFlash2's (draft_context) with DSpine's layers.
+void dspine_context(RefSeq* s, const flyx_dspine_block& d, int n_rows) {
+  const auto* M = s->m;
+  const int H = d.hidden, F = d.n_taps * M->hidden, hd = d.head_dim;
+  const int F_row = M->total_taps * M->hidden, F_off = M->dflash_tap_off * M->hidden;
+  Vec h(H), hn(H), k(size_t(d.n_kv) * hd), v(k.size()), tmp(hd);
+  for (int r = 0; r < n_rows; ++r) {
+    int pos = s->start + r;
+    lin(M, d.fc, &s->feats[size_t(r) * size_t(F_row) + size_t(F_off)], 1, F, H, h.data(), n_rows);
+    norm(M, d.hidden_norm, h.data(), H, hn.data());
+    for (int j = 0; j < d.layers; ++j) {
+      const auto& l = slayer(M, d, j);
+      lin(M, l.k, hn.data(), 1, H, d.n_kv * hd, k.data(), n_rows);
+      lin(M, l.v, hn.data(), 1, H, d.n_kv * hd, v.data(), n_rows);
+      for (int kh = 0; kh < d.n_kv; ++kh) {
+        norm(M, l.k_norm, &k[size_t(kh) * hd], hd, tmp.data());
+        rope(tmp.data(), pos, d.theta, hd);
+        std::copy(tmp.begin(), tmp.end(), &s->K[size_t(d.kv)][size_t(j)][(size_t(pos) * d.n_kv + kh) * hd]);
+        std::copy(&v[size_t(kh) * hd], &v[size_t(kh) * hd] + hd,
+                  &s->V[size_t(d.kv)][size_t(j)][(size_t(pos) * d.n_kv + kh) * hd]);
+      }
+    }
+  }
+}
+
 void dspark_draft(RefSeq* s, const flyx_dspark_block& d, int width) {
   const auto* M = s->m;
   const int B = std::min(d.block, width + 1);
@@ -989,6 +1023,86 @@ void dspark_draft(RefSeq* s, const flyx_dspark_block& d, int width) {
   }
   if (forced_drafts(s))
     for (int i = 0; i < width; ++i) s->drafts[size_t(i)] = forced_draft(s, ctx + 1 + i);
+}
+
+// The block of the rows the round's drafts need (no row reads a row after it), its layers attending causally (within
+// the window), each layer's write, then the head's candidates and the walk.
+void dspine_block(RefSeq* s, const flyx_dspine_block& d, int width) {
+  const auto* M = s->m;
+  const int B = std::min(d.block, width + 1), H = d.hidden, nh = d.n_heads, nkv = d.n_kv, hd = d.head_dim;
+  const int I = d.inter, ctx = s->position, K = d.topk;
+  std::vector<int32_t> ids(B, d.mask_token);
+  ids[0] = s->anchor;
+  Vec x;
+  embed_rows(s, M->block(d.embed).embed, ids.data(), B, &x);
+  const flyx::ops::DSpineBridge br{H,           d.code,           d.rank,           d.bridge_eps, f64(M, d.codebook),
+                                    f64(M, d.gate), f64(M, d.pred), f64(M, d.prev), M->vec(d.gate_bias).data()};
+  Vec h(size_t(B) * H), q(size_t(B) * nh * hd), k(size_t(B) * nkv * hd), v(k.size()), tmp(hd);
+  Vec before(size_t(B) * H), rms(B), g(size_t(B) * d.rank);
+  for (int j = 0; j < d.layers; ++j) {
+    const auto& l = slayer(M, d, j);
+    const Vec& dK = s->K[size_t(d.kv)][size_t(j)];
+    const Vec& dV = s->V[size_t(d.kv)][size_t(j)];
+    for (int r = 0; r < B; ++r) norm(M, l.norm, &x[size_t(r) * H], H, &h[size_t(r) * H]);
+    lin(M, l.q, h.data(), B, H, nh * hd, q.data(), B);
+    lin(M, l.k, h.data(), B, H, nkv * hd, k.data(), B);
+    lin(M, l.v, h.data(), B, H, nkv * hd, v.data(), B);
+    Vec KA(size_t(ctx + B) * nkv * hd), VA(KA.size());
+    std::copy(dK.begin(), dK.begin() + size_t(ctx) * nkv * hd, KA.begin());
+    std::copy(dV.begin(), dV.begin() + size_t(ctx) * nkv * hd, VA.begin());
+    for (int r = 0; r < B; ++r) {
+      for (int kh = 0; kh < nkv; ++kh) {
+        norm(M, l.k_norm, &k[(size_t(r) * nkv + kh) * hd], hd, tmp.data());
+        rope(tmp.data(), ctx + r, d.theta, hd);
+        std::copy(tmp.begin(), tmp.end(), &KA[(size_t(ctx + r) * nkv + kh) * hd]);
+        std::copy(&v[(size_t(r) * nkv + kh) * hd], &v[(size_t(r) * nkv + kh) * hd] + hd,
+                  &VA[(size_t(ctx + r) * nkv + kh) * hd]);
+      }
+    }
+    Vec o(size_t(B) * nh * hd);
+    for (int r = 0; r < B; ++r) {
+      // the keys it sees: those up to its own position, within the window when it has one (a contiguous run)
+      const int qp = ctx + r, lo = d.window > 0 ? std::max(0, qp - d.window + 1) : 0;
+      for (int hh = 0; hh < nh; ++hh) {
+        norm(M, l.q_norm, &q[(size_t(r) * nh + hh) * hd], hd, tmp.data());
+        rope(tmp.data(), qp, d.theta, hd);
+        attend(tmp.data(), KA.data() + size_t(lo) * nkv * hd, VA.data() + size_t(lo) * nkv * hd, qp + 1 - lo, nkv, hd,
+               hh / (nh / nkv), 1.0 / std::sqrt(double(hd)), &o[(size_t(r) * nh + hh) * hd]);
+      }
+    }
+    Vec ao(size_t(B) * H);
+    lin(M, l.o, o.data(), B, nh * hd, H, ao.data(), B);
+    for (size_t i = 0; i < x.size(); ++i) x[i] += ao[i];
+    for (int r = 0; r < B; ++r) norm(M, l.post_norm, &x[size_t(r) * H], H, &h[size_t(r) * H]);
+    Vec gt(size_t(B) * I), u(size_t(B) * I), mo(size_t(B) * H);
+    lin(M, l.gate, h.data(), B, H, I, gt.data(), B);
+    lin(M, l.up, h.data(), B, H, I, u.data(), B);
+    for (size_t i = 0; i < gt.size(); ++i) gt[i] = silu(gt[i]) * u[i];
+    lin(M, l.down, gt.data(), B, I, H, mo.data(), B);
+    for (size_t i = 0; i < x.size(); ++i) x[i] += mo[i];
+    const bool last = j == d.layers - 1;  // the walk redoes the last write: what it started from
+    flyx::ops::dspine_write(br, f64(M, l.read), f64(M, l.write), s->anchor, B, x.data(), last ? rms.data() : nullptr,
+                            last ? g.data() : nullptr, last ? before.data() : nullptr);
+  }
+  const auto& head = M->block(d.head).head;
+  const int V = head.vocab;
+  Vec hn(H), logits(V), val(K);
+  std::vector<int> c(K);
+  std::vector<int32_t> cand(size_t(B - 1) * K), drafts(size_t(B - 1));
+  for (int st = 0; st < B - 1; ++st) {
+    norm(M, d.norm, &x[size_t(st + 1) * H], H, hn.data());
+    linear(hn.data(), 1, H, M->w(head.w), V, logits.data());
+    topk(logits.data(), V, K, c.data(), val.data());
+    std::copy(c.begin(), c.end(), cand.begin() + size_t(st) * K);
+  }
+  const double* hw = f64(M, head.w);
+  flyx::ops::dspine_walk(br, f64(M, slayer(M, d, d.layers - 1).write), M->vec(d.norm.w).data(), before.data(),
+                         rms.data(), g.data(), cand.data(), K, B - 1, s->anchor,
+                         [&](int32_t t) { return hw + size_t(t) * H; }, drafts.data());
+  s->drafts.assign(width, 0);
+  for (int i = 0; i < width && i < B - 1; ++i) s->drafts[i] = drafts[size_t(i)];
+  if (forced_drafts(s))
+    for (int i = 0; i < width; ++i) s->drafts[i] = forced_draft(s, ctx + 1 + i);
 }
 
 // ---- MTP drafter (python/reference/flyx_ref/mtp.py) ----------------------------
@@ -1223,11 +1337,13 @@ const char* node_label(const flyx_node& n, const flyx_block* b, int phase) {
       }
     case FLYX_NODE_DRAFT:
       if (b->kind == FLYX_BLOCK_MTP) return "draft mtp";
-      return b->kind == FLYX_BLOCK_DSPARK ? "draft dspark" : "draft dflash2";
+      return b->kind == FLYX_BLOCK_DSPARK ? "draft dspark" : b->kind == FLYX_BLOCK_DSPINE ? "draft dspine" : "draft dflash2";
     case FLYX_NODE_CONTEXT:
       if (b->kind == FLYX_BLOCK_DV) return "context dv";
       if (b->kind == FLYX_BLOCK_MTP) return "context mtp";
-      return b->kind == FLYX_BLOCK_DSPARK ? "context dspark" : "context dflash2";
+      return b->kind == FLYX_BLOCK_DSPARK   ? "context dspark"
+             : b->kind == FLYX_BLOCK_DSPINE ? "context dspine"
+                                            : "context dflash2";
     case FLYX_NODE_ACCEPT: return "accept";
     default: return "other nodes";
   }
@@ -1271,7 +1387,9 @@ void run_nodes(RefPlan* p, RefSeq* s) {
         break;
       case FLYX_NODE_TAP: {
         const int tap_off = b->kind == FLYX_BLOCK_DSPARK ? M->dspark_tap_off : M->dflash_tap_off;
-        const int head_idx = b->kind == FLYX_BLOCK_DSPARK ? b->dspark.head : b->dflash2.head;
+        const int head_idx = b->kind == FLYX_BLOCK_DSPARK   ? b->dspark.head
+                             : b->kind == FLYX_BLOCK_DSPINE ? b->dspine.head
+                                                            : b->dflash2.head;
         const int F = M->total_taps * H;
         const int col_off = (tap_off + n.arg0) * H;
         if (n.arg1 == FLYX_TAP_NORMED) {
@@ -1287,6 +1405,7 @@ void run_nodes(RefPlan* p, RefSeq* s) {
       case FLYX_NODE_DRAFT:
         if (b->kind == FLYX_BLOCK_MTP) mtp_draft(s, b->mtp, n.arg0);
         else if (b->kind == FLYX_BLOCK_DSPARK) dspark_draft(s, b->dspark, n.arg0);
+        else if (b->kind == FLYX_BLOCK_DSPINE) dspine_block(s, b->dspine, n.arg0);
         else draft_block(s, b->dflash2, n.arg0);
         break;
       case FLYX_NODE_CONTEXT: {
@@ -1295,6 +1414,7 @@ void run_nodes(RefPlan* p, RefSeq* s) {
         if (rows == 0) break;
         if (b->kind == FLYX_BLOCK_MTP) mtp_context(s, b->mtp, rows);
         else if (b->kind == FLYX_BLOCK_DSPARK) dspark_context(s, b->dspark, rows);
+        else if (b->kind == FLYX_BLOCK_DSPINE) dspine_context(s, b->dspine, rows);
         else draft_context(s, b->dflash2, rows);
         break;
       }
@@ -1482,14 +1602,15 @@ int open_model(const flyx_model_desc* desc, const flyx_open_options* opts, flyx_
       const flyx_block& b = desc->blocks[i];
       const int k = b.kind;
       // DV's blocks (ABI 42) are taken and never run: such a model decodes here as without DV (lower).
-      if (k < FLYX_BLOCK_EMBED || k > FLYX_BLOCK_DSPARK_LAYER)
+      if (k < FLYX_BLOCK_EMBED || k > FLYX_BLOCK_DSPINE_LAYER)
         throw std::runtime_error("block kind " + std::to_string(k) + ": not implemented by cpu_ref");
       if (k == FLYX_BLOCK_VISION_STEM && b.vision_stem.cls_token >= 0)
         throw std::runtime_error("vision_stem: cls_token is not yet implemented by cpu_ref");
-      if (k == FLYX_BLOCK_DFLASH2) {
+      if (k == FLYX_BLOCK_DFLASH2 || k == FLYX_BLOCK_DSPINE) {
+        if (m->dflash >= 0) throw std::runtime_error("more than one block drafter");
         m->dflash = i;
         m->dflash_tap_off = m->total_taps;
-        m->total_taps += b.dflash2.n_taps;
+        m->total_taps += k == FLYX_BLOCK_DSPINE ? b.dspine.n_taps : b.dflash2.n_taps;
       }
       if (k == FLYX_BLOCK_DSPARK) {
         m->dspark = i;
@@ -1661,10 +1782,11 @@ int lower(flyx_bmodel* bm, const flyx_program* prog, flyx_plan** out) {
       return fail("tree rounds: not in this backend");
     if (n.kind == FLYX_NODE_DRAFT) {
       const flyx_block& b = m->block(n.block);
-      most = b.kind == FLYX_BLOCK_DFLASH2 ? std::max(b.dflash2.block, FLYX_MAX_ROWS) - 1
+      most = b.kind == FLYX_BLOCK_DFLASH2  ? std::max(b.dflash2.block, FLYX_MAX_ROWS) - 1
              : b.kind == FLYX_BLOCK_DSPARK ? b.dspark.block - 1
-             : b.kind == FLYX_BLOCK_MTP  ? FLYX_MAX_ROWS - 1
-                                         : 0;
+             : b.kind == FLYX_BLOCK_DSPINE ? b.dspine.block - 1  // the rows it was made for: no wider block
+             : b.kind == FLYX_BLOCK_MTP    ? FLYX_MAX_ROWS - 1
+                                           : 0;
     }
   }
   if (prog->width > most) return fail("round width exceeds what the drafter can propose");
