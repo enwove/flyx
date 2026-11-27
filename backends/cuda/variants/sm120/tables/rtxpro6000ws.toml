@@ -1,0 +1,104 @@
+# Copyright 2026 The flyx Authors. SPDX-License-Identifier: Apache-2.0
+# Tuning table for NVIDIA RTX PRO 6000 Blackwell Workstation Edition, written by `cuda_bench tune gemm 34816x5120
+# 5120x17408 16480x5120 14336x5120 5120x6144 15360x10240 5120x5120 32768x5120 5120x16384 5120x15360` (GB/s of weights
+# streamed in brackets): Qwen3.8-27B's bf16 GEMMs as the engine runs them (mlp gate|up and down, the gated delta net's
+# in-projection, attention q|k|v|gate, both layers' out-projections) and its EAGLE-4 drafter's (q|k|v over the pair,
+# o, gate|up, down, fc over the taps); every other shape and family the Server Edition's.
+# 2026-11-27, RTX PRO 6000 Blackwell Workstation Edition 96 GB, 600 W, driver 615.71.09, CUDA 13.0.
+sku = "rtxpro6000ws"
+devices = ["NVIDIA RTX PRO 6000 Blackwell Workstation Edition"]
+inherit = "rtxpro6000"
+
+[[gemm]]  # bf16 34816x5120
+format = "bf16"
+n = 34816
+k = 5120
+rules = [
+  { rows = [1, 4], nt = 1, warps = 16, unroll = 4 },  # r1 1623 r4 1603
+  { rows = [5, 8], nt = 4, warps = 16, unroll = 4 },  # r8 1571
+  { rows = [9, 16], nt = 4, warps = 8, unroll = 4 },  # r16 1541
+]
+
+[[gemm]]  # bf16 5120x17408
+format = "bf16"
+n = 5120
+k = 17408
+rules = [
+  { rows = [1, 8], nt = 4, warps = 16, unroll = 4 },  # r1 1554 r4 1546 r8 1514
+  { rows = [9, 16], nt = 2, warps = 16, unroll = 8 },  # r16 1451
+]
+
+[[gemm]]  # bf16 16480x5120
+format = "bf16"
+n = 16480
+k = 5120
+rules = [
+  { rows = [1, 1], nt = 1, warps = 16, unroll = 8 },  # r1 1594
+  { rows = [2, 4], nt = 1, warps = 16, unroll = 4 },  # r4 1573
+  { rows = [5, 8], nt = 4, warps = 16, unroll = 4 },  # r8 1526
+  { rows = [9, 16], nt = 4, warps = 8, unroll = 4 },  # r16 1490
+]
+
+[[gemm]]  # bf16 14336x5120
+format = "bf16"
+n = 14336
+k = 5120
+rules = [
+  { rows = [1, 4], nt = 1, warps = 16, unroll = 4 },  # r1 1576 r4 1558
+  { rows = [5, 16], nt = 4, warps = 16, unroll = 4 },  # r8 1509 r16 1467
+]
+
+[[gemm]]  # bf16 5120x6144
+format = "bf16"
+n = 5120
+k = 6144
+rules = [
+  { rows = [1, 1], nt = 1, warps = 8, unroll = 8 },  # r1 1463
+  { rows = [2, 16], nt = 4, warps = 16, unroll = 4 },  # r4 1429 r8 1416 r16 1390
+]
+
+[[gemm]]  # bf16 15360x10240
+format = "bf16"
+n = 15360
+k = 10240
+rules = [
+  { rows = [1, 1], nt = 1, warps = 16, unroll = 8 },  # r1 1598
+  { rows = [2, 8], nt = 4, warps = 16, unroll = 4 },  # r4 1561 r8 1545
+  { rows = [9, 16], nt = 4, warps = 8, unroll = 4 },  # r16 1486
+]
+
+[[gemm]]  # bf16 5120x5120
+format = "bf16"
+n = 5120
+k = 5120
+rules = [
+  { rows = [1, 1], nt = 1, warps = 8, unroll = 8 },  # r1 1455
+  { rows = [2, 16], nt = 4, warps = 16, unroll = 4 },  # r4 1435 r8 1422 r16 1384
+]
+
+[[gemm]]  # bf16 32768x5120
+format = "bf16"
+n = 32768
+k = 5120
+rules = [
+  { rows = [1, 4], nt = 1, warps = 16, unroll = 8 },  # r1 1618 r4 1602
+  { rows = [5, 16], nt = 4, warps = 16, unroll = 4 },  # r8 1561 r16 1523
+]
+
+[[gemm]]  # bf16 5120x16384
+format = "bf16"
+n = 5120
+k = 16384
+rules = [
+  { rows = [1, 8], nt = 4, warps = 16, unroll = 4 },  # r1 1577 r4 1570 r8 1552
+  { rows = [9, 16], nt = 2, warps = 16, unroll = 8 },  # r16 1506
+]
+
+[[gemm]]  # bf16 5120x15360
+format = "bf16"
+n = 5120
+k = 15360
+rules = [
+  { rows = [1, 8], nt = 4, warps = 16, unroll = 4 },  # r1 1542 r4 1535 r8 1515
+  { rows = [9, 16], nt = 4, warps = 8, unroll = 4 },  # r16 1449
+]

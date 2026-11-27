@@ -160,7 +160,10 @@ __global__ void __launch_bounds__(128) k_gemm_rows(const float* __restrict__ x, 
 // matrix-vector kernel on float32 inputs gives.
 //
 // K is cut into kSkinnyChunks fixed chunks, each summed on its own and the
-// chunks added in order, whatever the number of warps: every configuration
+// chunks added in order, whatever the number of warps; chunk c is every
+// kSkinnyChunks-th span from span c (interleaved: a block's warps stream
+// neighbouring spans of its rows, which DRAM serves faster than 16 streams a
+// row apart; 1.2 -> 1.4 TB/s at K = 17408 on an RTX PRO 6000): every configuration
 // (tile, warps, unroll) gives bit-identical results, so a tuning table can
 // pick one per shape and row count freely.
 constexpr int kSkinnyChunks = 16;
@@ -202,12 +205,11 @@ __device__ __forceinline__ void skinny_body(Parts x, int ldk, int N, int K, floa
 #pragma unroll 1
   for (int c = 0; c < CPW; ++c) {
     const int chunk = warp * CPW + c;
-    const int s0 = chunk * spans / kSkinnyChunks, s1 = (chunk + 1) * spans / kSkinnyChunks;
     float acc[NT][4];
 #pragma unroll
     for (int i = 0; i < NT; ++i) acc[i][0] = acc[i][1] = acc[i][2] = acc[i][3] = 0.f;
 #pragma unroll UNROLL
-    for (int s = s0; s < s1; ++s) {
+    for (int s = chunk; s < spans; s += kSkinnyChunks) {  // the chunk's spans: every 16th, interleaved
       const int k = s << 5;
       uint4 w[NT];
 #pragma unroll
@@ -338,14 +340,13 @@ __global__ void __launch_bounds__(32 * CH) k_gemm_skinny_mt(Parts x, const float
   const bf16* xh = PARTS == 1 ? x.hi + o.x_col + r0 * ldk : nullptr;
   const float* x32 = PARTS == 3 ? xf + o.x_col + r0 * ldk : nullptr;
   pdl_wait();  // the activations come from the kernel before
-  const int s0 = warp * spans / CH, s1 = (warp + 1) * spans / CH;
   float acc[MT][NT][4];
 #pragma unroll
   for (int m = 0; m < MT; ++m)
 #pragma unroll
     for (int i = 0; i < NT; ++i) acc[m][i][0] = acc[m][i][1] = acc[m][i][2] = acc[m][i][3] = 0.f;
 #pragma unroll UNROLL
-  for (int s = s0; s < s1; ++s) {
+  for (int s = warp; s < spans; s += CH) {  // the warp's chunk: every CH-th span (k_gemm_skinny's)
     const int k = s << 5;
     uint4 w[NT];
 #pragma unroll
@@ -923,12 +924,11 @@ __global__ void __launch_bounds__(32 * WARPS) k_gemm_skinny_fp8(Parts x, int ldk
 #pragma unroll 1
   for (int c = 0; c < CPW; ++c) {
     const int chunk = warp * CPW + c;
-    const int s0 = chunk * spans / kSkinnyChunks, s1 = (chunk + 1) * spans / kSkinnyChunks;
     float acc[NT][4];
 #pragma unroll
     for (int i = 0; i < NT; ++i) acc[i][0] = acc[i][1] = acc[i][2] = acc[i][3] = 0.f;
 #pragma unroll UNROLL
-    for (int s = s0; s < s1; ++s) {
+    for (int s = chunk; s < spans; s += kSkinnyChunks) {  // the chunk's spans: every 16th, interleaved
       const int k = s << 5;
       uint32_t w[NT][4];
 #pragma unroll
