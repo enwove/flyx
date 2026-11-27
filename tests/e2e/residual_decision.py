@@ -17,15 +17,19 @@ may differ from the reference at no more than a quarter of the places where the 
 reference's token (measured on an RTX 5070 Ti: 6 of 135; an adapter left out or at half its scale: 123 or more).
 peft_qwen35's GDN tensors beside tiny_nvfp4.flyx (64 wide) are held on the float64 backend, which takes NVFP4 inputs
 at any K; the CUDA backend refuses NVFP4 inputs there (K a multiple of 128), and that refusal is held as its answer
-for that file alone.  A device without FP4 tensor cores computes no NVFP4 inputs and refuses every file at open
-(gguf_test's nvfp4_inputs holds it to that refusal): accepted only where that backend refuses them all, the GDN-only
-run then not held there.
+for that file alone.  The CUDA backend computes NVFP4 inputs on FP4 tensor cores, a device of compute capability 12.0
+(nvidia-smi's compute_cap of the GPU the tests take) in a build with their kernels (--fp4-kernels: FLYX_CUDA_ARCHS
+takes 120), and every other file must run there; on any other device or build it refuses them all at open, and that
+refusal is held as its answer (the GDN-only run then not held there).  Where nvidia-smi does not say which device it
+is, a refusal is accepted only of them all.
 
-    residual_decision.py FLYX ASSET_DIR BACKEND [BACKEND ...]
+    residual_decision.py FLYX ASSET_DIR [--fp4-kernels] BACKEND [BACKEND ...]
 """
 import json
 import math
+import os
 import random
+import shutil
 import struct
 import subprocess
 import sys
@@ -127,6 +131,28 @@ def gdn_only(src, dst):
     (dst / "adapter_config.json").write_text(json.dumps(cfg))
 
 
+def cuda_fp4_inputs(fp4_kernels):
+    """Whether the CUDA backend can compute NVFP4 inputs here, from the device and the build rather than from what the
+    backend says of itself: (True or False, the device), or (None, why) where nvidia-smi does not name the GPU the tests
+    take (the first of CUDA_VISIBLE_DEVICES, else GPU 0)."""
+    smi = shutil.which("nvidia-smi")
+    if not smi:
+        return None, "no nvidia-smi on PATH"
+    visible = os.environ.get("CUDA_VISIBLE_DEVICES")
+    pick = ["-i", visible.split(",")[0].strip()] if visible else []
+    try:
+        run = subprocess.run([smi, "--query-gpu=name,compute_cap", "--format=csv,noheader", *pick],
+                             capture_output=True, text=True, timeout=60)
+    except (OSError, subprocess.TimeoutExpired) as e:
+        return None, f"nvidia-smi: {e}"
+    fields = [f.strip() for f in run.stdout.strip().splitlines()[0].split(",")] if run.stdout.strip() else []
+    if run.returncode != 0 or len(fields) != 2:
+        return None, f"nvidia-smi names no GPU ({(run.stdout + run.stderr).strip() or 'no output'})"
+    name, cc = fields
+    device = f"{name}, compute capability {cc}, a build {'with' if fp4_kernels else 'without'} the FP4 kernels"
+    return cc == "12.0" and fp4_kernels, device
+
+
 class Held:
     def __init__(self):
         self.failed = 0
@@ -137,7 +163,9 @@ class Held:
 
 
 def main():
-    flyx, assets, backends = sys.argv[1], Path(sys.argv[2]), sys.argv[3:]
+    flyx, assets = sys.argv[1], Path(sys.argv[2])
+    fp4_kernels = "--fp4-kernels" in sys.argv[3:]
+    backends = [b for b in sys.argv[3:] if b != "--fp4-kernels"]
     held = Held()
     with tempfile.TemporaryDirectory() as tmp:
         tmp = Path(tmp)
@@ -197,10 +225,19 @@ def main():
                 held(effect >= places // 2 and 4 * apart <= effect,
                      f"{what}: teacher forced at {places} places, {REFERENCE}'s token at all but {apart}, a quarter "
                      f"at most of the {effect} the adapter changes")
-            if refused:  # a device without FP4 tensor cores: every case refused there, none run
-                held(len(refused) == len(cases),
-                     f"{backend}: NVFP4 inputs refused where the device cannot compute them, in {len(refused)} of "
-                     f"{len(cases)} cases (all of them, or none)")
+            # The cases whose widths take NVFP4 inputs (the others' refusal for K comes first, on any device).
+            wide = sum((backend, name) not in NARROW_FILES for name, _, _ in cases)
+            can, device = cuda_fp4_inputs(fp4_kernels) if backend == "cuda" else (None, "")
+            if can is True:
+                held(not refused, f"{backend}: NVFP4 inputs computed on FP4 tensor cores ({device}): refused in "
+                                  f"{len(refused)} of {len(cases)} cases" + "".join(f"\n    {w}" for w in refused))
+            elif can is False:
+                held(len(refused) == wide, f"{backend}: NVFP4 inputs refused where they cannot be computed "
+                                           f"({device}), in {len(refused)} of {wide} cases (all of them)")
+            elif refused:  # the device unknown: every case refused there (no FP4 tensor cores), or none
+                held(len(refused) == wide,
+                     f"{backend}: NVFP4 inputs refused in {len(refused)} of {wide} cases (all of them, or none; "
+                     f"the device's FP4 tensor cores not known: {device or 'not the CUDA backend'})")
     print("residual_decision:", "FAILED" if held.failed else "PASSED")
     return 1 if held.failed else 0
 
