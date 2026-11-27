@@ -2,6 +2,7 @@
 #pragma once
 
 #include "backends/cuda/backend.h"
+#include "backends/cuda/runtime/row_pool.h"
 
 #include <array>
 #include <utility>
@@ -50,7 +51,7 @@ class StagingRing {
       if (bytes > slot.capacity) throw std::logic_error("staging image exceeds slot");
       if (slot.bounce) {
         CK(cudaEventSynchronize(slot.uploaded));
-        std::memcpy(slot.bounce, src, bytes);
+        ring_.copy_to_bounce(slot.bounce, src, bytes);
         src = slot.bounce;
       }
       try {
@@ -86,7 +87,8 @@ class StagingRing {
     bool released_ = false;
   };
 
-  void allocate(flyx_bmodel* model, const std::array<size_t, N>& capacities, bool bounce) {
+  void allocate(flyx_bmodel* model, const std::array<size_t, N>& capacities, bool bounce, RowPool* pool = nullptr) {
+    pool_ = pool;
     copy_.create();
     for (size_t i = 0; i < N; ++i) {
       auto& slot = slots_[i];
@@ -113,6 +115,21 @@ class StagingRing {
     size_t capacity = 0;
     CudaEvent uploaded, consumed;
   };
+  void copy_to_bounce(uint8_t* dst, const uint8_t* src, size_t bytes) {
+    // Contiguous, disjoint host ranges amortize worker wakeups on multi-MiB expert images.
+    constexpr size_t kCopyGrain = 256 * 1024;
+    const size_t ranges = bytes / kCopyGrain;
+    if (!pool_ || ranges < 2) {
+      std::memcpy(dst, src, bytes);
+      return;
+    }
+    pool_->run(ranges, [&](size_t first, size_t end) {
+      const size_t offset = first * kCopyGrain;
+      const size_t limit = end == ranges ? bytes : end * kCopyGrain;
+      std::memcpy(dst + offset, src + offset, limit - offset);
+    });
+  }
+  RowPool* pool_ = nullptr;
   CudaStream copy_;
   std::array<Slot, N> slots_;
   std::mutex mutex_;

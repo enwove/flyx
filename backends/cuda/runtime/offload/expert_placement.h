@@ -19,13 +19,13 @@ struct ExpertResidency {
 struct ColdWorkspace {
   ColdWorkspace(size_t threads, OffloadStats& stats) : stats(stats), pool(threads, true) {}
   OffloadStats& stats;
+  RowPool pool;
   StagingRing<2> staging;
   size_t next_slot = 0;
   std::map<const ColdMatrix*, ExpertResidency> placements;
   std::map<int, std::vector<uint64_t>> global_scores;
   size_t sessions = 0;
   bool pending_counts = false, failed = false;
-  RowPool pool;
   std::mutex mutex;
   int *ids = nullptr, *resident_ids = nullptr, *mapped_ids = nullptr;
   float* mapped_input = nullptr;

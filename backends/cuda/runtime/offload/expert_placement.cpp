@@ -24,7 +24,7 @@ void OffloadRuntime::init_experts(flyx_bmodel* m, const OffloadPlan& plan) {
   w->stats.profile = m->opt.profile;
   if (w->stats.profile)
     for (auto& event : w->timer) event.create(cudaEventDefault);
-  if (shape.bank_bytes) w->staging.allocate(m, {shape.bank_bytes, shape.bank_bytes}, true);
+  if (shape.bank_bytes) w->staging.allocate(m, {shape.bank_bytes, shape.bank_bytes}, true, &w->pool);
   w->resident_ids = m->alloc<int>(shape.pairs);
   if (shape.bank_bytes && m->opt.expert_adapt) {
     for (int i : plan.placement_blocks) {

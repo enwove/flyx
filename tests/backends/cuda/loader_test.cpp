@@ -510,11 +510,12 @@ void expert_estimates() {
 }
 
 void staging_rollover() {
-  constexpr int passes = 5, width = 64;
+  constexpr int passes = 5, width = (1 << 20) + 17;
   for (bool bounce : {false, true}) {
     flyx_bmodel m;
+    RowPool pool(3);
     StagingRing<2> ring;
-    ring.allocate(&m, {width, width}, bounce);
+    ring.allocate(&m, {width, width}, bounce, &pool);
     std::array<CudaStream, 2> readers;
     for (auto& stream : readers) stream.create();
     auto* output = m.alloc<uint8_t>(passes * width);
