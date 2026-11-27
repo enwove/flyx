@@ -2,7 +2,6 @@
 #include "backends/cuda/runtime/cold_experts.h"
 
 #include "backends/cuda/backend.h"
-#include "backends/cuda/kernels/moe_bank.h"
 #include "backends/cuda/runtime/row_pool.h"
 #include "backends/cuda/runtime/expert_order.h"
 #include "ops/activation/ref.h"

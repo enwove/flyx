@@ -21,7 +21,6 @@
 #include "backends/cuda/kernels/gemm_internal.h"
 #include "backends/cuda/kernels/kernels.cuh"
 #include "backends/cuda/kernels/moe_blocks_ops.h"
-#include "backends/cuda/kernels/moe_bank.h"
 
 namespace flyx::cuda {
 namespace {

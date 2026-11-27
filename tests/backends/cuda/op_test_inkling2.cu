@@ -3,7 +3,6 @@
 // relative-position-bias attention, sparse MoE) and DSpark drafter kernels against float64 refs.
 #include <cstdlib>
 
-#include "backends/cuda/kernels/moe_bank.h"
 #include "backends/cuda/loader/exact_bf16.h"
 #include "tests/backends/cuda/op_test.cuh"
 
