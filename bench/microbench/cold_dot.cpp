@@ -53,8 +53,10 @@ int cold_dot_bench(int argc, char** argv) {
     // Rotate a deterministic bank through a footprint larger than the test machine's last-level cache.
     for (size_t j = 0; j < expert; ++j) weights[j] = uint8_t(rng());
     for (size_t j = 0; j < expert; j += block) {
-      // Bound half scale exponents in all six layouts.
+      // Keep per-block scales finite in each quantization layout.
       weights[j + 1] = weights[j + 3] = weights[j + block - 1] = weights[j + block - 3] = 0x30;
+      if (type.dtype == FLYX_DT_GGML_MXFP4) weights[j] = 126;
+      if (type.dtype == FLYX_DT_GGML_NVFP4) std::fill_n(weights.data() + j, 4, uint8_t(0x38));
     }
     for (size_t n = 1; n < banks; ++n) std::copy_n(weights.data(), expert, weights.data() + n * expert);
     ExpertKernel shared = nullptr;
