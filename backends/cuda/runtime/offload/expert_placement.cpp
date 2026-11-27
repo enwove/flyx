@@ -55,17 +55,19 @@ void OffloadRuntime::init_experts(flyx_bmodel* m, const OffloadPlan& plan) {
   m->host_bytes += shape.quant_bytes();
   w->cold.reserve(shape.pairs);
   m->host_bytes += shape.activations * sizeof(float) + shape.pairs * sizeof(int);
+  w->handoff.create();
   w->ready.create();
   CK(cudaEventRecord(w->ready, nullptr));
   cold_ = std::move(w);
 }
 
-void OffloadRuntime::on_session_open(flyx_bmodel* m) {
+void OffloadRuntime::on_session_open(flyx_bmodel* m, cudaStream_t stream) {
   if (!cold_) return;
   auto& ws = *cold_;
   std::lock_guard lock(ws.mutex);
   if (ws.failed) throw std::runtime_error("expert exchange failed on this model");
   maintain_locked(m, ws);
+  CK(cudaStreamWaitEvent(stream, ws.ready));
   ++ws.sessions;
 }
 
@@ -113,10 +115,18 @@ void OffloadRuntime::maintain_locked(flyx_bmodel* m, ColdWorkspace& ws) {
   ws.pending_counts = false;
 }
 
-void OffloadRuntime::on_session_close(flyx_bmodel*) {
+void OffloadRuntime::on_session_close(flyx_bmodel*, const flyx_seq* sequence) {
   if (!cold_) return;
   auto& ws = *cold_;
   std::lock_guard lock(ws.mutex);
+  if (sequence && ws.owner_sequence == sequence) {
+    if (cudaEventRecord(ws.ready, ws.owner) != cudaSuccess) {
+      cudaStreamSynchronize(ws.owner);
+      ws.failed = true;
+    }
+    ws.owner = nullptr;
+    ws.owner_sequence = nullptr;
+  }
   if (--ws.sessions == 0 && ws.stats.verbose && ws.stats.decode_slots > ws.stats.last_decode_slots) {
     const auto slots = ws.stats.decode_slots - ws.stats.last_decode_slots;
     const auto cold = ws.stats.decode_cold - ws.stats.last_decode_cold;

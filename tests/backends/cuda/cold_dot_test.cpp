@@ -117,6 +117,17 @@ int main() {
     }
     std::vector<cuda::ColdQ8> quant(cols / 32);
     cuda::prepare_cold_q8(x.data(), quant.data(), cols);
+    std::vector<cuda::ColdQ8> scalar(cols / 32);
+    cuda::prepare_cold_q8(x.data(), scalar.data(), cols, cuda::CpuIsa::scalar);
+    auto rounded = x;
+    cuda::round_cold_q8(rounded.data(), cols, cuda::CpuIsa::avx2);
+    bool same = true;
+    for (int i = 0; i < cols; ++i) {
+      const auto& q = scalar[i / 32];
+      same =
+          same && q.d == quant[i / 32].d && q.q[i % 32] == quant[i / 32].q[i % 32] && rounded[i] == q.d * q.q[i % 32];
+    }
+    test::check(same, "CPU SIMD and scalar Q8 scales, codes and rounded values agree");
     double expected_q8 = 0, norm_q8 = 0;
     for (int k = 0; k < cols; ++k) {
       const auto& group = quant[k / 32];

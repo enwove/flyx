@@ -8,6 +8,7 @@
 
 struct flyx_bmodel;
 namespace flyx::cuda {
+class RowPool;
 struct Pass;
 struct MoeBlock;
 struct MoeScratch;
@@ -50,7 +51,8 @@ inline CpuIsa cpu_isa_limit(int bits) {
 
 using QuantDot = float (*)(const uint8_t*, const ColdQ8*, int);
 QuantDot cold_q8_kernel(int dtype, CpuIsa max_isa = CpuIsa::avx512);
-void prepare_cold_q8(const float* input, ColdQ8* out, int cols);
+void prepare_cold_q8(const float* input, ColdQ8* out, int cols, CpuIsa limit = CpuIsa::avx512);
+void round_cold_q8(float* input, int cols, CpuIsa limit);
 
 using FloatDot = float (*)(const uint8_t*, const float*, int);
 FloatDot cold_float_kernel(int dtype, int cols, CpuIsa limit);
@@ -91,6 +93,14 @@ struct ColdMatrix {
   ColdMatrix(const flyx_weight& w, int hot, const ExpertLayout& layout);
   size_t bytes() const { return data.size() + scales.size() * sizeof(float) + archive.size(); }
   void prepare(float* input, bool vector_nvfp4) const;
+  struct Groups {
+    const int* ids;      // physical expert for each routed slot
+    const int* slots;    // cold slots grouped by expert
+    const int* offsets;  // group count plus one entries
+    int count, top_k;
+  };
+  void project(RowPool& pool, const Groups& groups, bool gate_up, float beta, float linear_beta, const float* values,
+               const ColdQ8* quant, float* output) const;
 };
 
 float cold_dot_limited(int dtype, const uint8_t* row, const float* input, int cols, CpuIsa max_isa);

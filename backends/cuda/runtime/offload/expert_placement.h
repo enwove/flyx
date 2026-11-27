@@ -32,7 +32,9 @@ struct ColdWorkspace {
   std::vector<float> act;
   std::vector<ColdQ8> gu_q8, down_q8;
   std::vector<int> cold;
-  CudaEvent ready, timer[5];
+  CudaEvent ready, handoff, timer[5];
+  const flyx_seq* owner_sequence = nullptr;
+  cudaStream_t owner = nullptr;  // live sequence stream, protected by mutex; cleared before sequence destruction
   ~ColdWorkspace() {
     if (ready) cudaEventSynchronize(ready);
   }

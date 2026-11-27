@@ -1,5 +1,7 @@
 // Copyright 2026 The flyx Authors. SPDX-License-Identifier: Apache-2.0
 #include "backends/cuda/runtime/offload/expert_store.h"
+#include "backends/cuda/runtime/row_pool.h"
+#include "ops/activation/ref.h"
 #include "ops/dtype/ref.h"
 #include <cstring>
 #include <cmath>
@@ -50,12 +52,7 @@ ColdMatrix::ColdMatrix(const flyx_weight& w, int hot, const ExpertLayout& layout
 
 void ColdMatrix::prepare(float* x, bool vector_nvfp4) const {
   if (q8) {
-    for (int i = 0; i < cols; i += 32) {
-      ColdQ8 group;
-      const int count = std::min(32, cols - i);
-      ops::round_q8_group(x + i, count, group.q, group.d);
-      for (int j = 0; j < count; ++j) x[i + j] = group.q[j] * group.d;
-    }
+    round_cold_q8(x, cols, max_isa);
   } else if (a16h) {
     ops::round_a16h(x, cols);
   } else if (nvfp4 && !vector_nvfp4) {
@@ -91,5 +88,56 @@ void ColdMatrix::resolve(int simd, bool integer) {
   quant_dot = q8 && integer ? cold_q8_kernel(dtype, max_isa) : nullptr;
   float_dot = cold_float_kernel(dtype, cols, max_isa);
   kernel = quant_dot ? project_rows<true, false> : float_dot ? project_rows<false, false> : project_rows<false, true>;
+}
+void ColdMatrix::project(RowPool& pool, const Groups& groups, bool gate, float beta, float linear_beta,
+                         const float* values, const ColdQ8* quant, float* output) const {
+  const int width = gate ? rows / 2 : rows;
+  constexpr int tile = 32;
+  pool.run(size_t(groups.count) * width, [&](size_t begin, size_t end) {
+    float lo[ColdShape::chunk * tile], hi[ColdShape::chunk * tile];
+    // Each worker owns a contiguous range of projection rows. Bind its activations once per expert.
+    while (begin < end) {
+      const size_t group = begin / width;
+      const int j0 = int(begin % width);
+      const int j1 = j0 + int(std::min(end - begin, size_t(width - j0)));
+      const int expert = groups.ids[groups.slots[groups.offsets[group]]] - first;
+      const auto* w = data.data() + size_t(expert) * rows * stride;
+      for (int offset = groups.offsets[group]; offset < groups.offsets[group + 1];) {
+        const int count = std::min(ColdShape::chunk, groups.offsets[group + 1] - offset);
+        ActRows x{groups.slots + offset,
+                  count,
+                  gate ? groups.top_k : 1,
+                  cols,
+                  dtype,
+                  values,
+                  quant,
+                  scales.empty() ? 1.f : scales[expert],
+                  float_dot,
+                  quant_dot};
+        if (!gate && count == 1) {
+          kernel(w, stride, j0, j1, x, output + size_t(*x.slots) * width + j0, width);
+        } else {
+          for (int j = j0; j < j1; j += tile) {
+            const int stop = std::min(j + tile, j1);
+            kernel(w, stride, j, stop, x, lo, tile);
+            if (gate) kernel(w, stride, width + j, width + stop, x, hi, tile);
+            for (int r = 0; r < count; ++r) {
+              const size_t at = size_t(x.slots[r]) * width + j;
+              if (gate) {
+                for (int c = 0; c < stop - j; ++c) {
+                  const float a = lo[r * tile + c], b = hi[r * tile + c];
+                  output[at + c] = float(beta > 0 ? ops::situ(a, b, beta, linear_beta) : ops::silu(a) * b);
+                }
+              } else {
+                std::copy_n(lo + r * tile, stop - j, output + at);
+              }
+            }
+          }
+        }
+        offset += count;
+      }
+      begin += j1 - j0;
+    }
+  });
 }
 }  // namespace flyx::cuda

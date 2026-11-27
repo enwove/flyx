@@ -1,7 +1,6 @@
 // Copyright 2026 The flyx Authors. SPDX-License-Identifier: Apache-2.0
 #include "backends/cuda/runtime/offload/expert_placement.h"
 #include "backends/cuda/runtime/offload/host_handoff.h"
-#include "ops/activation/ref.h"
 
 namespace flyx::cuda {
 namespace {
@@ -76,8 +75,13 @@ void hybrid_experts(const Pass& ps, const MoeBlock& f, const MoeScratch* sc, flo
   int H = f.hidden, I = f.inter, K = f.top_k;
   if (ps.rows > INT_MAX / K) throw std::runtime_error("MoE pass exceeds routed pair index range");
   const bool vec = opts(L).moe_vec;
-  // A different session can own the previous visit. Order reuse of both DMA buffers and device slots on its event.
-  CK(cudaStreamWaitEvent(L.st, ws.ready));
+  // One sequence orders successive visits on its own stream. Fence the former owner when ownership changes.
+  if (ws.owner_sequence != ps.s || ws.owner != L.st) {
+    if (ws.owner_sequence) CK(cudaEventRecord(ws.ready, ws.owner));
+    CK(cudaStreamWaitEvent(L.st, ws.ready));
+    ws.owner = L.st;
+    ws.owner_sequence = ps.s;
+  }
   auto* t = ws.stats.profile ? &ws.stats.times[{&f, ps.round}] : nullptr;
   try {
     const int configured = ps.s->m->opt.expert_prefill_min;
@@ -95,7 +99,6 @@ void hybrid_experts(const Pass& ps, const MoeBlock& f, const MoeScratch* sc, flo
     }
     if (stage) {
       streamed_prefill(ws, ps, f, *sc, out, accumulate, fused);
-      CK(cudaEventRecord(ws.ready, L.st));
       return;
     }
     if (t) {
@@ -109,7 +112,7 @@ void hybrid_experts(const Pass& ps, const MoeBlock& f, const MoeScratch* sc, flo
       auto* ids = b.moe_idx + size_t(base) * K;
       float* input = b.h + size_t(base) * H;
       auto start = ws.stats.verbose || t ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
-      HostHandoff handoff(L.st, ws.ready, ids, ws.ids, size_t(rows) * K, input, ws.input, size_t(rows) * H);
+      HostHandoff handoff(L.st, ws.handoff, ids, ws.ids, size_t(rows) * K, input, ws.input, size_t(rows) * H);
       if (t) CK(cudaEventRecord(ws.timer[0], L.st));
       if (f.gate_up.n_experts) {
         if (!mapped_chunk) moe_resident_ids(ids, ws.resident_ids, rows * K, f.gate_up.n_experts, L.st);
@@ -161,7 +164,8 @@ void hybrid_experts(const Pass& ps, const MoeBlock& f, const MoeScratch* sc, flo
           const int row = slot / K;
           if (row != last_row) {
             if (f.cold_gu->quant_dot)
-              prepare_cold_q8(ws.input + size_t(row) * H, ws.gu_q8.data() + size_t(row) * (H / 32), H);
+              prepare_cold_q8(ws.input + size_t(row) * H, ws.gu_q8.data() + size_t(row) * (H / 32), H,
+                              f.cold_gu->max_isa);
             else
               f.cold_gu->prepare(ws.input + size_t(row) * H, vec);
           }
@@ -174,63 +178,17 @@ void hybrid_experts(const Pass& ps, const MoeBlock& f, const MoeScratch* sc, flo
         for (int i = 0; i < int(ws.cold.size()); ++i)
           if (!i || ws.ids[ws.cold[i]] != ws.ids[ws.cold[i - 1]]) starts[groups++] = i;
         starts[groups] = int(ws.cold.size());
-        auto project = [&](const ColdMatrix& mat, const float* values, const ColdQ8* quant, bool gate) {
-          const int width = gate ? I : H;
-          constexpr int tile = 16;
-          const size_t tiles = (size_t(width) + tile - 1) / tile;
-          ws.pool.run(groups * tiles, [&](size_t begin, size_t end) {
-            float lo[ColdShape::chunk * tile], hi[ColdShape::chunk * tile];
-            for (size_t i = begin; i < end; ++i) {
-              const size_t g = i / tiles;
-              const int j = int(i % tiles) * tile, stop = std::min(j + tile, width);
-              const int* slots = ws.cold.data() + starts[g];
-              const int expert = ws.ids[*slots] - mat.first;
-              const auto* w = mat.data.data() + size_t(expert) * mat.rows * mat.stride;
-              // Each expert occurs at most once per routed row. Chunk even malformed duplicate routes safely.
-              for (int offset = starts[g]; offset < starts[g + 1];) {
-                const int count = std::min(ColdShape::chunk, starts[g + 1] - offset);
-                ActRows x{ws.cold.data() + offset,
-                          count,
-                          gate ? K : 1,
-                          mat.cols,
-                          mat.dtype,
-                          values,
-                          quant,
-                          mat.scales.empty() ? 1.f : mat.scales[expert],
-                          mat.float_dot,
-                          mat.quant_dot};
-                if (!gate && count == 1) {
-                  mat.kernel(w, mat.stride, j, stop, x, ws.cpu_slots + size_t(*x.slots) * width + j, tile);
-                  offset += count;
-                  continue;
-                }
-                mat.kernel(w, mat.stride, j, stop, x, lo, tile);
-                if (gate) mat.kernel(w, mat.stride, I + j, I + stop, x, hi, tile);
-                for (int r = 0; r < count; ++r) {
-                  const size_t at = size_t(x.slots[r]) * width + j;
-                  if (gate) {
-                    for (int c = 0; c < stop - j; ++c) {
-                      const float a = lo[r * tile + c], b = hi[r * tile + c];
-                      ws.act[at + c] =
-                          float(f.situ_beta > 0 ? ops::situ(a, b, f.situ_beta, f.situ_linear_beta) : ops::silu(a) * b);
-                    }
-                  } else
-                    std::copy_n(lo + r * tile, stop - j, ws.cpu_slots + at);
-                }
-                offset += count;
-              }
-            }
-          });
-        };
-        project(*f.cold_gu, ws.input, ws.gu_q8.data(), true);
+        const ColdMatrix::Groups group{ws.ids, ws.cold.data(), starts.data(), groups, K};
+        f.cold_gu->project(ws.pool, group, true, f.situ_beta, f.situ_linear_beta, ws.input, ws.gu_q8.data(),
+                           ws.act.data());
         for (int slot : ws.cold) {
           float* x = ws.act.data() + size_t(slot) * I;
           if (f.cold_down->quant_dot)
-            prepare_cold_q8(x, ws.down_q8.data() + size_t(slot) * (I / 32), I);
+            prepare_cold_q8(x, ws.down_q8.data() + size_t(slot) * (I / 32), I, f.cold_down->max_isa);
           else
             f.cold_down->prepare(x, vec);
         }
-        project(*f.cold_down, ws.act.data(), ws.down_q8.data(), false);
+        f.cold_down->project(ws.pool, group, false, 0.f, 0.f, ws.act.data(), ws.down_q8.data(), ws.cpu_slots);
         if (rows > 1) std::sort(ws.cold.begin(), ws.cold.end());
         if (ws.stats.verbose || t) {
           const double dt = std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count();
@@ -270,7 +228,6 @@ void hybrid_experts(const Pass& ps, const MoeBlock& f, const MoeScratch* sc, flo
         t->reduce += us(3, 4);
       }
     }
-    CK(cudaEventRecord(ws.ready, L.st));
   } catch (...) {
     if (ws.staging.stream()) cudaStreamSynchronize(ws.staging.stream());
     cudaStreamSynchronize(L.st);  // any queued DMA must end before a second session can own the staging buffers

@@ -9,6 +9,7 @@
 #include "backends/cuda/runtime/offload/offload_stats.h"
 
 struct flyx_bmodel;
+struct flyx_seq;
 namespace flyx::cuda {
 struct LayerRing;
 struct ColdWorkspace;
@@ -19,8 +20,8 @@ class OffloadRuntime {
   ~OffloadRuntime();
   bool allows_graphs() const { return !layers_ && !cold_; }
   bool allows_batched_rounds() const { return allows_graphs(); }
-  void on_session_open(flyx_bmodel* m);
-  void on_session_close(flyx_bmodel* m);
+  void on_session_open(flyx_bmodel* m, cudaStream_t stream = nullptr);
+  void on_session_close(flyx_bmodel* m, const flyx_seq* sequence = nullptr);
   void maintain(flyx_bmodel* m);
   void report(FILE* file);
   bool wraps_node(size_t block) const;

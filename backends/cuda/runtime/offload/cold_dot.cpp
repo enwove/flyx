@@ -26,12 +26,6 @@
 namespace flyx::cuda {
 using namespace ops::ggml;
 
-void prepare_cold_q8(const float* input, ColdQ8* out, int cols) {
-  for (int i = 0; i < cols; i += 32, ++out) {
-    ops::round_q8_group(input + i, std::min(32, cols - i), out->q, out->d);
-  }
-}
-
 float cold_dot_scalar(int dtype, const uint8_t* row, const float* x, int cols) {
   flyx_tensor_view v{};
   v.dtype = dtype;
@@ -89,6 +83,45 @@ bool has_avx2() {
 #else
   return __builtin_cpu_supports("avx2") && __builtin_cpu_supports("fma");
 #endif
+}
+
+// The same group quantization as ops::round_q8_group. Keep floats for a float dot or pack signed bytes for IQ.
+template <bool Bytes>
+FLYX_AVX2 void round_groups_avx2(const float* input, ColdQ8* bytes, float* floats, int cols) {
+  for (int i = 0; i < cols; i += 32) {
+    __m256 x[4];
+    __m256 maxima = _mm256_setzero_ps();
+    for (int j = 0; j < 4; ++j) {
+      x[j] = _mm256_loadu_ps(input + i + 8 * j);
+      const auto mag = _mm256_andnot_ps(_mm256_set1_ps(-0.f), x[j]);
+      maxima = _mm256_max_ps(mag, maxima);  // NaN selects the previous finite maximum
+    }
+    __m128 peak = _mm_max_ps(_mm256_castps256_ps128(maxima), _mm256_extractf128_ps(maxima, 1));
+    peak = _mm_max_ps(peak, _mm_movehl_ps(peak, peak));
+    peak = _mm_max_ss(peak, _mm_shuffle_ps(peak, peak, 1));
+    float scale = _mm_cvtss_f32(peak) / 127.f;
+    if (!(scale > 0.f) || !std::isfinite(scale)) {
+      if constexpr (Bytes)
+        bytes[i / 32] = {};
+      else
+        std::fill_n(floats + i, 32, 0.f);
+      continue;
+    }
+    if constexpr (Bytes) bytes[i / 32].d = scale;
+    const __m256 d = _mm256_set1_ps(scale);
+    for (int j = 0; j < 4; ++j) {
+      auto finite = _mm256_and_ps(x[j], _mm256_cmp_ps(x[j], x[j], _CMP_ORD_Q));
+      auto q = _mm256_round_ps(_mm256_div_ps(finite, d), _MM_FROUND_CUR_DIRECTION | _MM_FROUND_NO_EXC);
+      q = _mm256_min_ps(_mm256_set1_ps(127.f), _mm256_max_ps(_mm256_set1_ps(-127.f), q));
+      if constexpr (Bytes) {
+        const auto ints = _mm256_cvttps_epi32(q);
+        const auto shorts = _mm_packs_epi32(_mm256_castsi256_si128(ints), _mm256_extracti128_si256(ints, 1));
+        _mm_storel_epi64(reinterpret_cast<__m128i*>(bytes[i / 32].q + 8 * j), _mm_packs_epi16(shorts, shorts));
+      } else {
+        _mm256_storeu_ps(floats + i + 8 * j, _mm256_mul_ps(d, _mm256_add_ps(q, _mm256_setzero_ps())));
+      }
+    }
+  }
 }
 
 const float* half_scales() {
@@ -454,6 +487,30 @@ FLYX_AVX512 float vector_dot_512(const uint8_t* row, const float* x, int cols) {
 }
 }  // namespace
 #endif
+
+namespace {
+template <bool Bytes>
+void round_groups(const float* input, ColdQ8* bytes, float* floats, int cols, CpuIsa limit) {
+#ifdef FLYX_AVX2
+  static const bool avx2 = has_avx2();
+  if (avx2 && limit >= CpuIsa::avx2 && cols % 32 == 0) return round_groups_avx2<Bytes>(input, bytes, floats, cols);
+#endif
+  for (int i = 0; i < cols; i += 32) {
+    ColdQ8 packed{};
+    const int count = std::min(32, cols - i);
+    ops::round_q8_group(input + i, count, packed.q, packed.d);
+    if constexpr (Bytes)
+      bytes[i / 32] = packed;
+    else
+      for (int j = 0; j < count; ++j) floats[i + j] = packed.q[j] * packed.d;
+  }
+}
+}  // namespace
+
+void prepare_cold_q8(const float* input, ColdQ8* out, int cols, CpuIsa limit) {
+  round_groups<true>(input, out, nullptr, cols, limit);
+}
+void round_cold_q8(float* input, int cols, CpuIsa limit) { round_groups<false>(input, nullptr, input, cols, limit); }
 
 QuantDot cold_q8_kernel(int dtype, CpuIsa max_isa) {
 #ifdef FLYX_AVX2

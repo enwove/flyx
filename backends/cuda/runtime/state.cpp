@@ -537,7 +537,7 @@ int new_seq(flyx_bmodel* m, const flyx_seq_layout* layout, bool capture_only, fl
   s->arena_host_bytes = probe.arena_host_bytes;
   try {
     build_seq(m, layout->max_ctx, s.get());
-    if (m->offload && !capture_only) m->offload->on_session_open(m);
+    if (m->offload && !capture_only) m->offload->on_session_open(m, s->st);
   } catch (const OutOfDeviceMemory& e) {
     return fail_oom(std::string("seq_new: ") + e.what());
   } catch (const std::exception& e) {
@@ -1600,8 +1600,8 @@ void seq_free(flyx_seq* s) {
     }
   }
   auto* m = s && !s->capture_only ? s->m : nullptr;
+  if (m && m->offload) m->offload->on_session_close(m, s);
   delete s;
-  if (m && m->offload) m->offload->on_session_close(m);
 }
 
 void alloc_batch(flyx_bmodel* m) {
