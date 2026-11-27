@@ -11,7 +11,7 @@
 //   committing the accepted rows and rolling back inside the last rounds are
 //   both folds of a saved state, never a recompute of the prompt.
 #include "backends/cuda/backend.h"
-#include "backends/cuda/runtime/cold_experts.h"
+#include "backends/cuda/runtime/offload/expert_store.h"
 #include "backends/cuda/regions/layers.h"
 #include "core/interfaces/memory_policy.h"
 
@@ -681,6 +681,11 @@ int probe(flyx_device_info* out) {
 }
 
 int open_model(const flyx_model_desc* desc, const flyx_open_options* opts, flyx_bmodel** out) {
+  if (!out) return fail("missing model output");
+  *out = nullptr;
+  if (!desc || desc->n_weights < 0 || (desc->n_weights && !desc->weights) || desc->n_blocks < 0 ||
+      (desc->n_blocks && !desc->blocks))
+    return fail("invalid model tables");
   auto m = std::make_unique<flyx_bmodel>();
   m->verbose = opts ? opts->verbose : 0;
   m->kv_fp8 = opts && opts->kv_fp8;
@@ -747,6 +752,7 @@ int open_model(const flyx_model_desc* desc, const flyx_open_options* opts, flyx_
     } else {
       m->opt.kernels.tuning = gemm_tuning_auto(prop.name, dev_cc, code_cc, &arch_cc);
     }
+    m->opt.keep_expert_archive = m->opt.expert_prefill_min != 0;
     if (m->opt.expert_prefill_min < 0) m->opt.expert_prefill_min = gemm_tuning_expert_prefill(m->opt.kernels.tuning);
     if (!m->opt.pdl_given) m->opt.kernels.pdl = gemm_tuning_pdl(m->opt.kernels.tuning);
     if (m->verbose) {
@@ -772,7 +778,6 @@ int open_model(const flyx_model_desc* desc, const flyx_open_options* opts, flyx_
     CK(cudaFree(nullptr));  // the context, here rather than in the first upload
     t[1] = load_clock();
     bind(m.get(), *desc, &load_times);
-    init_cold_experts(m.get());
     t[2] = load_clock();
     if (m->verbose)  // the bf16 residual (residual16): a stack of W4A4 residual adds and no adapters
       std::fprintf(stderr, "flyx-cuda: prefill passes of more than 16 rows keep the residual in %s\n",
@@ -819,7 +824,7 @@ int open_model(const flyx_model_desc* desc, const flyx_open_options* opts, flyx_
                               std::min(FLYX_MAX_WIDE_ROWS, block<DvBlock>(m.get(), m->dv_block).tree_width + 1));
     // The buffers rounds need, before the copies of the head kept only for speed: those take what room is left
     // (device_malloc) and go without where none is.
-    if (!m->cold && !m->layer_ring) alloc_batch(m.get());  // rounds of several sequences
+    if (!m->offload || m->offload->allows_batched_rounds()) alloc_batch(m.get());  // rounds of several sequences
     CK(cudaEventCreateWithFlags(&m->prefill_ev, cudaEventDisableTiming));
     t[4] = load_clock();
     make_head_fp8(m.get());
@@ -866,8 +871,10 @@ int open_model(const flyx_model_desc* desc, const flyx_open_options* opts, flyx_
     if (m->vision_dev_bytes) std::fprintf(stderr, " (vision %.2f GB)", m->vision_dev_bytes / 1e9);
     if (m->host_bytes) {
       std::fprintf(stderr, ", %.2f GB in host memory", m->host_bytes / 1e9);
-      if (m->layer_ring) std::fprintf(stderr, " (includes streamed layers)");
-      else if (m->cold) std::fprintf(stderr, " (includes cold experts, GPU cap %d per layer)", m->opt.gpu_experts);
+      if (m->offload && m->offload->layers())
+        std::fprintf(stderr, " (includes streamed layers)");
+      else if (m->offload && m->offload->experts())
+        std::fprintf(stderr, " (includes cold experts, GPU cap %d per layer)", m->opt.gpu_experts);
       else if (m->vision_host_bytes && m->host_bytes > m->vision_host_bytes)
         std::fprintf(stderr, " (embedding + vision %.2f GB)", m->vision_host_bytes / 1e9);
       else if (m->vision_host_bytes)
@@ -889,8 +896,18 @@ int open_model(const flyx_model_desc* desc, const flyx_open_options* opts, flyx_
   return 0;
 }
 
-void close_model(flyx_bmodel* m) { delete m; }
-
+void close_model(flyx_bmodel* m) {
+  if (!m) return;
+  const auto& batch = m->batch;
+  if (batch && m->verbose && batch->launched)
+    std::fprintf(stderr,
+                 "flyx-cuda: %ld rounds of several sequences (%.2f sequences, %.1f rows each), %ld graphs "
+                 "captured\n",
+                 batch->launched, double(batch->sequences) / batch->launched, double(batch->rows) / batch->launched,
+                 batch->captured);
+  if (m->offload) m->offload->report(stderr);
+  delete m;
+}
 
 const char* last_error() { return g_error.c_str(); }
 

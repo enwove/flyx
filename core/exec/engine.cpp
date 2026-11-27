@@ -972,17 +972,17 @@ bool Engine::load(const std::string& path, const EngineOptions& opt, std::string
       };
       int cap = plan::fit_residency(before - 1, estimate);
       if (cap < 0 || !estimate(cap)) return false;
-      if (trial.offload_host_bytes > host_room) {
+      if ((trial.offload_pinned_bytes > host_room || trial.offload_pageable_bytes > host_room - trial.offload_pinned_bytes)) {
         // A partial upload can leave the read-only source in this process's working set. Give those pages back and
         // measure actual available RAM again before refusing the independent pageable offload allocation.
         ahead.stop();
         file_.release_pages();
         host_room = available_for_weights();
-        if (trial.offload_host_bytes > host_room) return false;
+        if ((trial.offload_pinned_bytes > host_room || trial.offload_pageable_bytes > host_room - trial.offload_pinned_bytes)) return false;
       }
       if (unmeasured) {
         const int lower = before - std::min(before, backoff);
-        if (lower < cap && estimate(lower) && trial.offload_host_bytes <= host_room) cap = lower;
+        if (lower < cap && estimate(lower) && trial.offload_pinned_bytes <= host_room && trial.offload_pageable_bytes <= host_room - trial.offload_pinned_bytes) cap = lower;
         backoff += std::min(backoff, count - backoff);
       }
       resident = cap;

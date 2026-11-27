@@ -220,7 +220,7 @@ void count_round_graphs(flyx_bmodel* m) {
 
 size_t graph_keep(const flyx_seq& s, bool count) {
   auto* m = const_cast<flyx_bmodel*>(s.m);
-  if (!m->opt.graphs) return 0;
+  if (!m->allows_graphs()) return 0;
   // What a round takes past its plan's count: other heads, the K/V in tiers, rounds that read low-bit copies.
   size_t kernels = kGraphHeadNodes, copies = 0, others = 0;
   bool window = false;

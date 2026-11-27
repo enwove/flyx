@@ -487,6 +487,12 @@ int prefill_ex(flyx_plan* p, flyx_seq* s, const flyx_prefill_input* in, const fl
     s->staged(s->position + n);
     ring_wrote(s, s->position, s->position + n);  // its context rows, counted first: a pass that fails wrote some
     forward(ps);
+    if (s->route_error) {
+      int invalid = 0;
+      CK(cudaMemcpyAsync(&invalid, s->route_error, sizeof(invalid), cudaMemcpyDeviceToHost, s->st));
+      sync_stream(s);
+      if (invalid) throw std::runtime_error("invalid MoE router expert ID");
+    }
     s->flush_page_prefill(s->position, n);
     s->snap_pos = s->pass_snap;
     s->pass_snap = -1;
@@ -1705,29 +1711,33 @@ RowView slice(const RowView& v, const flyx_bmodel* m, int first) {
 
 int launch_batch(flyx_plan* const* plans, flyx_seq* const* seqs, const flyx_gen_params* const* gens,
                  int32_t n) {
-  if (n < 1) return fail("launch_batch: no sequences");
-  for (int i = 0; i < n; ++i)
+  if (!plans || !seqs || !gens || n < 1 || n > FLYX_MAX_ROWS) return fail("launch_batch: invalid batch");
+  for (int i = 0; i < n; ++i) {
     if (!seqs[i]) return no_sequence("launch_batch");
+    if (!plans[i] || seqs[i]->m != plans[i]->m) return fail("launch_batch: invalid plan");
+  }
   if (n == 1) return launch(plans[0], seqs[0], gens[0]);
   flyx_bmodel* m = seqs[0]->m;
-  // Offloaded models submit on each sequence's stream so every round uses its host or copy dependencies.
-  if (!m->batch || m->need.max_bank > 0 || m->dspark_block >= 0) {
-    for (int i = 0; i < n; ++i)
-      if (const int r = launch(plans[i], seqs[i], gens[i]); r != 0) return r;
-    return 0;
-  }
+  const bool separate = !m->batch || m->need.max_bank > 0 || m->dspark_block >= 0;
   int rows = 0;
   for (int i = 0; i < n; ++i) {
     if (plans[i]->phase != FLYX_PHASE_ROUND || plans[i]->m != m || seqs[i]->m != m)
       return fail("launch_batch: round plans of the sequences' model");
-    if (!same_target(plans[0], plans[i])) return fail("launch_batch: plans that run different target nodes");
-    if (plans[i]->tree || plans[i]->adaptive() || relaxed(gens[i]))
+    if (!separate && !same_target(plans[0], plans[i]))
+      return fail("launch_batch: plans that run different target nodes");
+    if (!separate && (plans[i]->tree || plans[i]->adaptive() || relaxed(gens[i])))
       return fail("launch_batch: tree, adaptive, and relaxed rounds run alone");
     for (int j = 0; j < i; ++j)
       if (seqs[j] == seqs[i]) return fail("launch_batch: a sequence twice");
     rows += plans[i]->width + 1;
   }
   if (rows > FLYX_MAX_ROWS) return fail("launch_batch: more than FLYX_MAX_ROWS rows");
+  // Offloaded models submit on each sequence's stream so every round uses its host or copy dependencies.
+  if (separate) {
+    for (int i = 0; i < n; ++i)
+      if (const int r = launch(plans[i], seqs[i], gens[i]); r != 0) return r;
+    return 0;
+  }
   // Canonicalize sequence order by pointer so equivalent batches share one cached graph regardless of caller order.
   int ord[FLYX_MAX_ROWS];
   for (int i = 0; i < n; ++i) ord[i] = i;
@@ -1790,7 +1800,7 @@ int launch_batch(flyx_plan* const* plans, flyx_seq* const* seqs, const flyx_gen_
       for (int i = 0; i < n; ++i) copy_ring(seqs[ord[i]], B.st);
     };
     auto it = any_page_exact ? B.graphs.end() : B.graphs.find(key);
-    if (it == B.graphs.end() && !any_page_exact && B.graphs_ok && m->opt.graphs) {
+    if (it == B.graphs.end() && !any_page_exact && B.graphs_ok && m->allows_graphs()) {
       // Only capture once a batch key repeats enough to amortize graph instantiation cost.
       if (B.hits.size() >= BatchRounds::kMaxHitEntries && B.hits.find(key) == B.hits.end()) B.hits.clear();
       const uint32_t seen = ++B.hits[key];

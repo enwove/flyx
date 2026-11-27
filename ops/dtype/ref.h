@@ -104,14 +104,12 @@ inline std::vector<double> to_vec(const flyx_tensor_view* t) {
 }
 
 // Round to bfloat16, nearest even (NVFP4 linears' inputs in rounds, and in every pass with exact activations).
-inline double round_bf16(double v) {
-  float f = static_cast<float>(v);
+inline uint16_t bf16_bits(float f) {
   uint32_t u;
   std::memcpy(&u, &f, 4);
-  u = (u + 0x7FFF + ((u >> 16) & 1)) & 0xFFFF0000u;
-  std::memcpy(&f, &u, 4);
-  return f;
+  return uint16_t((u + 0x7FFF + ((u >> 16) & 1)) >> 16);
 }
+inline double round_bf16(double v) { return bf16_to_double(bf16_bits(float(v))); }
 
 // Round to binary16, nearest even: 11 significant bits down to 2^-14, multiples of 2^-24 below.
 inline double round_f16(double v) {
@@ -199,18 +197,22 @@ inline void round_nvfp4(double* row, int K) {
 // values d = m / 127 (m their largest magnitude) and p = the nearest integer of value / d (ties to even), both in
 // float32 as the kernels compute them; the value is d p.  p: K integers, d: K / 32 scales; a group with nothing finite
 // to scale is all zeros.
-inline void round_q8(const double* x, int K, int8_t* p, float* d) {
-  for (int g = 0; g < K / 32; ++g) {
-    float a[32], m = 0.f;
-    for (int i = 0; i < 32; ++i) {
-      a[i] = static_cast<float>(x[32 * g + i]);
-      m = std::max(m, std::fabs(a[i]));
-    }
-    const float dg = m / 127.f;
-    d[g] = dg;
-    const bool scaled = dg > 0.f && std::isfinite(dg);
-    for (int i = 0; i < 32; ++i) p[32 * g + i] = scaled ? static_cast<int8_t>(std::nearbyint(a[i] / dg)) : int8_t(0);
+template <class T>
+inline void round_q8_group(const T* x, int count, int8_t* p, float& scale) {
+  float maximum = 0;
+  for (int i = 0; i < count; ++i) maximum = std::max(maximum, std::fabs(float(x[i])));
+  const float d = maximum / 127.f;
+  scale = std::isfinite(d) ? d : 0.f;
+  for (int i = 0; i < count; ++i) {
+    const float value = float(x[i]);
+    const float rounded = scale > 0 && std::isfinite(value) ? std::nearbyint(value / scale) : 0.f;
+    p[i] = static_cast<int8_t>(std::clamp(rounded, -127.f, 127.f));
   }
+}
+
+template <class T>
+inline void round_q8(const T* x, int K, int8_t* p, float* d) {
+  for (int i = 0; i < K; i += 32) round_q8_group(x + i, std::min(32, K - i), p + i, d[i / 32]);
 }
 
 // IEEE-754 binary16 bit encoding of a float32 (round to nearest even, matching CUDA __float2half_rn).

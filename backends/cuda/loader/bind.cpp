@@ -6,8 +6,8 @@
 // context k|v, DV's adapters on one input), norms as float.  Knows block
 // kinds, not models.
 #include "backends/cuda/loader/loader.h"
-#include "backends/cuda/runtime/layer_ring.h"
-#include "backends/cuda/runtime/cold_experts.h"
+#include "backends/cuda/runtime/offload/offload_plan.h"
+#include "backends/cuda/runtime/offload/expert_store.h"
 
 #include <algorithm>
 #include <cstring>
@@ -1176,12 +1176,14 @@ void bind(flyx_bmodel* m, const flyx_model_desc& d, LoadTimes* times) {
   for (int i = 0; i < d.n_blocks; ++i)
     is_draft[size_t(i)] = is_mtp[size_t(i)] || is_dflash[size_t(i)] || is_dspark[size_t(i)];
 
-  const auto streamed = streamed_blocks(d, is_draft, m->opt.gpu_layers);
+  auto offload = plan_offload(d, m->opt);
+  if (offload.pinned_bytes) offload.fit_pinned(query_pinned_budget(m->opt));
+  const auto& streamed = offload.stream.blocks;
+  if (!streamed.empty() || offload.cold.pairs) m->offload = std::make_unique<OffloadRuntime>();
   std::unique_ptr<WeightLoader> streaming;
   if (!streamed.empty()) {
-    m->layer_ring = std::make_shared<LayerRing>(size_t(d.n_blocks));
+    m->offload->init_layers(size_t(d.n_blocks), offload.bounce_layers);
     streaming = std::make_unique<WeightLoader>(m,d);
-    m->opt.graphs = false;
   }
   AdapterCarve carve;
   for (int i = 0; i < d.n_blocks; ++i) {
@@ -1266,12 +1268,12 @@ void bind(flyx_bmodel* m, const flyx_model_desc& d, LoadTimes* times) {
     }
     if (archive) {
       streaming->finish_stream_block();
-      m->layer_ring->archive(m,i);
+      m->offload->layers()->archive(m, i);
     }
   }
   if (streaming) {
     streaming->finish();
-    m->layer_ring->allocate(m);
+    m->offload->layers()->allocate(m);
   }
 
   // Decide drafter quantization for Pass 2 from draft_weights policy, target precision, and remaining VRAM.
@@ -1405,6 +1407,7 @@ void bind(flyx_bmodel* m, const flyx_model_desc& d, LoadTimes* times) {
   }
   m->vision_disk.flush_clean();
   L.finish();
+  if (offload.cold.pairs) m->offload->init_experts(m, offload);
   if (times) {
     *times = L.times();
     if (streaming) {
@@ -1524,6 +1527,9 @@ int estimate_load(const flyx_model_desc* desc, const flyx_open_options* opts, ui
   if (!resolve_options(opts ? opts->options : nullptr, &bo, &err)) return -1;
   if (!apply_weight_caps(opts, &bo)) return fail("GPU residency cap exceeds INT_MAX");
 
+  if (desc->n_weights < 0 || (desc->n_weights && !desc->weights) || desc->n_blocks < 0 ||
+      (desc->n_blocks && !desc->blocks))
+    return fail("invalid model tables");
   const int nw = desc->n_weights;
   std::vector<char> is_vis, is_drafter(size_t(nw), 0), is_dv_w(size_t(nw), 0), is_host_embed(size_t(nw), 0);
   std::vector<std::optional<DraftQuant>> linear_quant(static_cast<size_t>(nw));
@@ -1549,11 +1555,10 @@ int estimate_load(const flyx_model_desc* desc, const flyx_open_options* opts, ui
     }
   }
 
-  const auto streamed = estimate_stream(*desc, is_draft_blk, bo);
-  ColdShape cold;
-  std::set<std::pair<int, int>> adaptive_pairs;
-  std::set<int> global_sizes;
-  size_t placement_device = 0, placement_host = 0;
+  bo.keep_expert_archive = bo.expert_prefill_min != 0;
+  auto offload = plan_offload(*desc, bo);
+  if (offload.pinned_bytes) offload.fit_pinned(query_pinned_budget(bo));
+  const auto& streamed = offload.stream;
   const TargetQuant tq = target_quant(*desc, is_draft_blk, bo.packed_blocks);
   const DraftQuants q = resolve_draft_quant(*desc, bo.draft_weights, tq);
   auto mark_linear = [&](int w, DraftQuant quant) {
@@ -1574,7 +1579,7 @@ int estimate_load(const flyx_model_desc* desc, const flyx_open_options* opts, ui
   uint64_t vision_gpu_bytes = 0;
   out->vision_device = resolve_vision_device(*desc, bo, free_vram, &vision_gpu_bytes, &is_vis);
 
-  std::vector<char> is_expert(size_t(nw), 0);
+  const auto& is_expert = offload.experts;
   uint64_t dv_extra = 0, block_extra = 0;
   std::vector<int> dflash_ctx_ws;  // stacked second copy of each DFlash2 or DSpine layer's k|v (f.ctx)
   for (int i = 0; i < desc->n_blocks; ++i) {
@@ -1597,17 +1602,6 @@ int estimate_load(const flyx_model_desc* desc, const flyx_open_options* opts, ui
       }
     } else if (b.kind == FLYX_BLOCK_MOE) {
       out->experts_per_layer = std::max(out->experts_per_layer,b.moe.n_experts);
-      if (bo.gpu_experts < b.moe.n_experts) cold.include(b.moe.hidden,b.moe.inter,b.moe.top_k);
-      if (bo.expert_adapt && bo.expert_prefill_min && bo.gpu_experts > 0 && bo.gpu_experts < b.moe.n_experts &&
-          b.moe.gate_up != b.moe.down && adaptive_pairs.emplace(b.moe.gate_up, b.moe.down).second) {
-        const size_t n = b.moe.n_experts;
-        placement_device = size_add(placement_device, n * (sizeof(int) + sizeof(uint32_t)));
-        placement_host = size_add(placement_host, n * (2 * sizeof(int) + sizeof(uint64_t) + sizeof(uint32_t)));
-        if (bo.expert_global && global_sizes.insert(int(n)).second)
-          placement_host = size_add(placement_host, n * sizeof(uint64_t));
-      }
-      mark(is_expert, b.moe.gate_up);
-      mark(is_expert, b.moe.down);
     } else if (b.kind == FLYX_BLOCK_DSPARK) {
       // Its block's norms, vectors, Markov head and joint projection stay as stored (dspark(): not quantized).
       mark_norm(is_drafter, b.dspark.tok_norm), mark_norm(is_drafter, b.dspark.norm),
@@ -1718,19 +1712,7 @@ int estimate_load(const flyx_model_desc* desc, const flyx_open_options* opts, ui
     if (!streamed.host_weight.empty() && streamed.host_weight[size_t(i)] && !is_drafter[size_t(i)] &&
         !is_dv_w[size_t(i)] && !is_expert[size_t(i)]) continue;
     if (is_expert[size_t(i)]) {
-      const auto layout = expert_layout(desc->weights[i],bo.packed_blocks);
-      const size_t e = size_t(v->shape[0]), hot = std::min(e,size_t(bo.gpu_experts));
-      target_bytes = size_add(target_bytes,size_mul(layout.bytes()/e,hot));
-      if (hot < e) {
-        if (bo.expert_prefill_min) {
-          const auto bank = ExpertBankLayout::from(layout, e, e - hot);
-          cold.bank_bytes = std::max(cold.bank_bytes, bank.bytes(bank.count));
-          out->offload_host_bytes = size_add(out->offload_host_bytes, bank.archive_bytes(e - hot));
-        }
-        const size_t raw = layout.format == ExpertLayout::bf16_rows ? layout.payload_bytes() : v->nbytes;
-        const size_t per = size_add(raw/e,desc->weights[i].scale2 ? sizeof(float) : 0);
-        out->offload_host_bytes = size_add(out->offload_host_bytes,size_mul(e-hot,per));
-      }
+      continue;
     } else if (is_drafter[size_t(i)]) {
       const auto quant = linear_quant[size_t(i)];
       cur_draft_bytes += tensor_dev_bytes(v, quant.has_value(), quant.value_or(DraftQuant::kNone), compact);
@@ -1755,9 +1737,11 @@ int estimate_load(const flyx_model_desc* desc, const flyx_open_options* opts, ui
   }
   out->draft_weights_bytes = cur_draft_bytes + dv_bytes + block_extra;
   out->draft_compact_savings = cur_draft_bytes > nvfp4_draft_bytes ? cur_draft_bytes - nvfp4_draft_bytes : 0;
-  out->offload_host_bytes = size_add(out->offload_host_bytes,size_add(placement_host, size_add(cold.host_bytes(),streamed.host_bytes)));
-  out->weights_bytes = size_add(size_add(target_bytes,vision_gpu_bytes),size_add(out->draft_weights_bytes,
-                                 size_add(placement_device, size_add(streamed.ring_bytes,cold.device_bytes()))));
+  out->offload_pinned_bytes = offload.pinned_bytes;
+  out->offload_pageable_bytes = offload.pageable_bytes;
+  out->weights_bytes =
+      size_add(size_add(target_bytes, vision_gpu_bytes),
+               size_add(out->draft_weights_bytes, size_add(offload.resident_expert_bytes, offload.workspace_bytes)));
   // Minimum non-weight device headroom: CUDA context + kernel modules + workspace + minimal KV/graphs.
   out->min_runtime_bytes = std::clamp<uint64_t>(out->weights_bytes / 20, 384ull << 20, 1ull << 30);
   // Extra headroom above hard_need to keep drafter weights at full auto precision (vs compacting to NVFP4).

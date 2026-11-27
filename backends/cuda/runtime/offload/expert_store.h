@@ -4,7 +4,7 @@
 #include <algorithm>
 #include <vector>
 
-#include "backends/cuda/loader/layout.h"
+#include "backends/cuda/runtime/offload/expert_archive.h"
 
 struct flyx_bmodel;
 namespace flyx::cuda {
@@ -13,20 +13,6 @@ struct MoeBlock;
 struct MoeScratch;
 struct ExpertMat;
 
-// Contiguous CUDA planes for a batch of experts. The largest single expert also fits when it exceeds the DMA target.
-struct ExpertBankLayout {
-  size_t payload, scale, gains, count;
-  static ExpertBankLayout from(const ExpertLayout& layout, size_t experts, size_t cold) {
-    const size_t bytes = layout.bytes() / experts;
-    return {layout.payload_bytes() / experts, layout.scale_bytes() / experts, layout.expert_scales ? sizeof(float) : 0,
-            std::min(cold, std::max<size_t>(1, (16u << 20) / bytes))};
-  }
-  size_t scale_offset(size_t n) const { return checkpoint_align(size_mul(payload, n)); }
-  size_t gain_offset(size_t n) const { return checkpoint_align(size_add(scale_offset(n), size_mul(scale, n))); }
-  size_t bytes(size_t n) const { return size_add(gain_offset(n), size_mul(gains, n)); }
-  size_t archive_bytes(size_t n) const { return size_add(size_mul(n / count, bytes(count)), bytes(n % count)); }
-};
-
 struct ColdQ8 {
   int8_t q[32];
   float d;
@@ -34,7 +20,7 @@ struct ColdQ8 {
 
 // Bound the pinned buffers and scratch by chunk size, independently of prompt length.
 struct ColdShape {
-  static constexpr int chunk = 8;
+  static constexpr int chunk = FLYX_MAX_ROWS;
   size_t bank_bytes = 0;
   size_t inputs = 0, pairs = 0, outputs = 0, activations = 0;
   void include(int hidden, int inter, int top_k) {
@@ -44,44 +30,72 @@ struct ColdShape {
     outputs = std::max(outputs, size_mul(count, size_t(hidden)));
     activations = std::max(activations, size_mul(count, size_t(inter)));
   }
-  size_t device_bytes() const { return size_add(size_mul(size_add(outputs, size_mul(2, pairs)), sizeof(float)), size_mul(2, bank_bytes)); }
+  size_t device_bytes() const {
+    return size_add(size_mul(size_add(outputs, size_mul(2, pairs)), sizeof(float)), size_mul(2, bank_bytes));
+  }
   size_t quant_bytes() const { return size_mul((inputs + 31) / 32 + (activations + 31) / 32, sizeof(ColdQ8)); }
-  size_t host_bytes() const {
-    return size_add(size_mul(size_add(size_add(inputs, outputs), activations), sizeof(float)),
-                    size_add(quant_bytes(), size_add(size_mul(2 * sizeof(int), pairs), size_mul(2, bank_bytes))));
+  size_t pinned_bytes() const {
+    return size_add(size_mul(size_add(inputs, outputs), sizeof(float)),
+                    size_add(size_mul(pairs, sizeof(int)), size_mul(2, bank_bytes)));
+  }
+  size_t pageable_bytes() const {
+    return size_add(quant_bytes(), size_add(size_mul(activations, sizeof(float)), size_mul(pairs, sizeof(int))));
   }
 };
 
+enum class CpuIsa { scalar, avx2, avx512 };
+inline CpuIsa cpu_isa_limit(int bits) {
+  return bits >= 512 ? CpuIsa::avx512 : bits >= 256 ? CpuIsa::avx2 : CpuIsa::scalar;
+}
+
 using QuantDot = float (*)(const uint8_t*, const ColdQ8*, int);
-QuantDot cold_q8_kernel(int dtype, int max_isa = 512);
+QuantDot cold_q8_kernel(int dtype, CpuIsa max_isa = CpuIsa::avx512);
 void prepare_cold_q8(const float* input, ColdQ8* out, int cols);
+
+using FloatDot = float (*)(const uint8_t*, const float*, int);
+FloatDot cold_float_kernel(int dtype, int cols, CpuIsa limit);
+
+struct ActRows {
+  const int* slots;
+  int n_rows, divisor, cols, dtype;
+  const float* values;
+  const ColdQ8* quant;
+  float gain;
+  FloatDot float_dot;
+  QuantDot quant_dot;
+};
+using ExpertKernel = void (*)(const uint8_t* weights, size_t stride, int begin, int end, const ActRows& x, float* out,
+                              size_t ld_out);
 
 // Pageable, model-owned copy. The ABI caller may unmap the source immediately after open.
 struct ColdMatrix {
   int first, rows, cols, dtype;
   size_t stride;
   bool q8, a16h, nvfp4;
-  int max_isa = 512;
+  CpuIsa max_isa = CpuIsa::avx512;
   QuantDot quant_dot = nullptr;
+  FloatDot float_dot = nullptr;
+  ExpertKernel kernel = nullptr;
+  void resolve(int simd, bool integer);
   std::vector<uint8_t> data;
   std::vector<float> scales;
   ExpertBankLayout bank{};
   std::vector<uint8_t> archive;
-  void exchange(const ExpertMat& resident, int hot_slot, int cold_slot, int total, uint8_t* bounce);
+  struct DevicePlanes {
+    void* payload = nullptr;
+    void* scale = nullptr;
+    float* gains = nullptr;
+  } resident;
+  void exchange(int hot_slot, int cold_slot, int total, uint8_t* bounce);
   void pack_banks(const ExpertLayout& layout, size_t all);
   ColdMatrix(const flyx_weight& w, int hot, const ExpertLayout& layout);
   size_t bytes() const { return data.size() + scales.size() * sizeof(float) + archive.size(); }
-  float product(int expert, int row, const float* input, const ColdQ8* quant) const;
   void prepare(float* input, bool vector_nvfp4) const;
 };
 
-void pack_expert_nvfp4(const uint8_t* in, size_t blocks, uint8_t* qo, uint8_t* so);
-float cold_dot_limited(int dtype, const uint8_t* row, const float* input, int cols, int max_isa);
+float cold_dot_limited(int dtype, const uint8_t* row, const float* input, int cols, CpuIsa max_isa);
 float cold_dot(int dtype, const uint8_t* row, const float* input, int cols);
 float cold_dot_scalar(int dtype, const uint8_t* row, const float* input, int cols);
-void cold_sequence_open(flyx_bmodel* m);
-void cold_sequence_close(flyx_bmodel* m);
-void init_cold_experts(flyx_bmodel* m);
 void hybrid_experts(const Pass& ps, const MoeBlock& f, const MoeScratch* sc, float* out, bool accumulate, bool fused);
 
 }  // namespace flyx::cuda

@@ -1,5 +1,5 @@
 // Copyright 2026 The flyx Authors. SPDX-License-Identifier: Apache-2.0
-#include "backends/cuda/runtime/layer_ring.h"
+#include "backends/cuda/runtime/offload/layer_ring.h"
 
 #include "backends/cuda/loader/layout.h"
 
@@ -17,7 +17,13 @@ std::vector<char> streamed_blocks(const flyx_model_desc& d, const std::vector<ch
       continue;
     result[size_t(i)] = layer >= resident;
   }
-  if (layer < resident) result.clear();
+  // DV's CONTEXT nodes execute the target projections directly.
+  for (int i = 0; i < d.n_blocks; ++i) {
+    const auto& b = d.blocks[i];
+    if (b.kind != FLYX_BLOCK_DV_LAYER) continue;
+    for (int base : {b.dv_layer.attn, b.dv_layer.mlp}) result.at(size_t(base)) = 0;
+  }
+  if (std::none_of(result.begin(), result.end(), [](char streamed) { return streamed; })) result.clear();
   return result;
 }
 
@@ -25,7 +31,7 @@ std::vector<char> streamed_blocks(const flyx_model_desc& d, const std::vector<ch
 StreamEstimate estimate_stream(const flyx_model_desc& d, const std::vector<char>& draft,
                                const BackendOptions& options) {
   StreamEstimate out;
-  const auto stream = streamed_blocks(d, draft, options.gpu_layers);
+  const auto& stream = out.blocks = streamed_blocks(d, draft, options.gpu_layers);
   if (stream.empty()) return out;
   out.host_weight.resize(size_t(d.n_weights));
   std::vector<char> resident(size_t(d.n_weights), 0);
@@ -36,24 +42,31 @@ StreamEstimate estimate_stream(const flyx_model_desc& d, const std::vector<char>
     auto plane = [&](size_t bytes) {
       if (bytes) image = size_add(checkpoint_align(image), bytes);
     };
-    auto stack = [&](std::initializer_list<int> weights) {
+    auto stack = [&](std::initializer_list<int> weights, size_t expected_rows, size_t expected_cols) {
       bool packed = options.packed_blocks;
       size_t nrows = 0, cols = 0;
       for (int w : weights) {
         if (w < 0 || w >= d.n_weights || !d.weights[w].t) throw std::runtime_error("invalid streamed linear weight");
+        check_linear_payload(d.weights[w]);
         const auto& t = *d.weights[w].t;
         if (t.ndim != 2 || t.shape[0] <= 0 || t.shape[1] <= 0 || (cols && cols != size_t(t.shape[1])))
           throw std::runtime_error("invalid streamed linear dimensions");
         (stream[size_t(i)] ? out.host_weight : resident)[size_t(w)] = 1;
         cols = size_t(t.shape[1]);
         nrows = size_add(nrows, size_t(t.shape[0]));
+        if (nrows > INT_MAX) throw std::runtime_error("streamed stack exceeds row limit");
         packed = packed && blocks_supported(t.dtype, int(cols));
       }
+      if (nrows != expected_rows || cols != expected_cols || expected_rows > INT_MAX || expected_cols > INT_MAX)
+        throw std::runtime_error("streamed projection does not match block");
       if (!stream[size_t(i)]) return;
       if (!packed) {
         const auto dtype = d.weights[*weights.begin()].t->dtype;
         const size_t values = size_mul(nrows, cols);
-        if (dtype == FLYX_DT_NVFP4 || dtype == FLYX_DT_GGML_NVFP4) {
+        auto fp4 = [](int type) { return type == FLYX_DT_NVFP4 || type == FLYX_DT_GGML_NVFP4; };
+        for (int w : weights)
+          if (fp4(d.weights[w].t->dtype) != fp4(dtype)) throw std::runtime_error("mixed FP4 formats in layer stack");
+        if (fp4(dtype)) {
           plane(values / 2);
           plane(values / 16);
           plane(nrows * sizeof(float));
@@ -74,14 +87,19 @@ StreamEstimate estimate_stream(const flyx_model_desc& d, const std::vector<char>
       }
     };
     if (b.kind == FLYX_BLOCK_ATTN) {
-      stack({b.attn.q, b.attn.k, b.attn.v});
-      stack({b.attn.o});
+      const auto& a = b.attn;
+      const size_t q = size_mul(size_t(a.n_heads), size_t(a.head_dim));
+      const size_t kv = size_mul(size_t(a.n_kv), size_t(a.head_dim));
+      stack({a.q, a.k, a.v}, size_add(size_mul(a.gate == FLYX_GATE_NONE ? 1 : 2, q), size_mul(2, kv)), a.hidden);
+      stack({a.o}, a.hidden, q);
     } else if (b.kind == FLYX_BLOCK_GDN) {
-      stack({b.gdn.qkv, b.gdn.z, b.gdn.b, b.gdn.a});
-      stack({b.gdn.out});
+      const auto& g = b.gdn;
+      const size_t k = size_mul(size_t(g.nk), size_t(g.dk)), v = size_mul(size_t(g.nv), size_t(g.dv));
+      stack({g.qkv, g.z, g.b, g.a}, size_mul(2, size_add(k, size_add(v, size_t(g.nv)))), g.hidden);
+      stack({g.out}, g.hidden, v);
     } else if (b.kind == FLYX_BLOCK_MLP) {
-      stack({b.mlp.gate, b.mlp.up});
-      stack({b.mlp.down});
+      stack({b.mlp.gate, b.mlp.up}, size_mul(2, size_t(b.mlp.inter)), b.mlp.hidden);
+      stack({b.mlp.down}, b.mlp.hidden, b.mlp.inter);
     } else if (b.kind == FLYX_BLOCK_EMBED)
       resident.at(size_t(b.embed.table)) = 1;
     else if (b.kind == FLYX_BLOCK_HEAD)
@@ -98,26 +116,9 @@ StreamEstimate estimate_stream(const flyx_model_desc& d, const std::vector<char>
   return out;
 }
 
-LayerRing::~LayerRing() {
-  if (copy) cudaStreamSynchronize(copy);
-  for (auto& slot : slots) {
-    if (slot.consumed) cudaEventSynchronize(slot.consumed);
-    if (slot.consumed) cudaEventDestroy(slot.consumed);
-    if (slot.ready) cudaEventDestroy(slot.ready);
-  }
-  for (auto& image : images) {
-    collect(image);
-    if (image.sample_start) cudaEventDestroy(image.sample_start);
-    if (image.sample_end) cudaEventDestroy(image.sample_end);
-  }
-  for (int round = 0; round < 2; ++round) {
-    const CopyStats& phase = stats[round];
-    if (phase.milliseconds > 0)
-      std::fprintf(stderr, "flyx-cuda: %s pinned layer H2D %.2f GB/s (%llu sampled transfers, %llu bytes)\n",
-                   round ? "round" : "prefill", phase.bytes / (phase.milliseconds * 1e6),
-                   static_cast<unsigned long long>(phase.samples), static_cast<unsigned long long>(phase.bytes));
-  }
-  if (copy) cudaStreamDestroy(copy);
+void LayerRing::finish_samples() {
+  if (ring_.stream() && cudaStreamSynchronize(ring_.stream()) != cudaSuccess) return;
+  for (auto& image : images) collect(image);
 }
 
 void LayerRing::archive(flyx_bmodel* m, int index) {
@@ -130,6 +131,9 @@ void LayerRing::archive(flyx_bmodel* m, int index) {
   std::vector<Plane> planes;
   auto plane = [&](auto& ptr, size_t bytes) {
     if (!ptr) return;
+    auto it = m->allocs.find(const_cast<void*>(static_cast<const void*>(ptr)));
+    if (it == m->allocs.end() || it->second != bytes)
+      throw std::runtime_error("streamed layer plane differs from its allocation");
     size_t offset = 0;
     const auto same = std::find_if(planes.begin(), planes.end(), [&](const Plane& p) { return p.src == ptr; });
     if (same == planes.end()) {
@@ -170,31 +174,30 @@ void LayerRing::archive(flyx_bmodel* m, int index) {
     linear(f.w_gu, 2 * f.inter, f.hidden);
     linear(f.w_down, f.hidden, f.inter);
   }
-  image.host = m->host_pinned<uint8_t>(image.bytes);
+  if (bounce_) {
+    image.pageable.resize(image.bytes);
+    image.host = image.pageable.data();
+    m->host_bytes = size_add(m->host_bytes, image.bytes);
+  } else {
+    image.host = m->host_pinned<uint8_t>(image.bytes);
+  }
   for (const auto& p : planes) {
     CK(cudaMemcpy(image.host + p.offset, p.src, p.bytes, cudaMemcpyDeviceToHost));
     m->release(const_cast<void*>(p.src), p.bytes);
   }
-  slots[image.slot].capacity = std::max(slots[image.slot].capacity, image.bytes);
+  capacities[image.slot] = std::max(capacities[image.slot], image.bytes);
   total = size_add(total, image.bytes);
 }
 
 void LayerRing::allocate(flyx_bmodel* m) {
-  CK(cudaStreamCreateWithFlags(&copy, cudaStreamNonBlocking));
-  size_t ring_bytes = 0;
-  for (auto& slot : slots) {
-    if (!slot.capacity) continue;
-    slot.device = m->alloc<uint8_t>(slot.capacity);
-    CK(cudaEventCreateWithFlags(&slot.ready, cudaEventDisableTiming));
-    CK(cudaEventCreateWithFlags(&slot.consumed, cudaEventDisableTiming));
-    ring_bytes += slot.capacity;
-  }
+  ring_.allocate(m, capacities, bounce_);
+  const size_t ring_bytes = size_add(capacities[0], capacities[1]);
   for (auto& image : images) {
-    for (auto& fix : image.fixups) fix(slots[image.slot].device);
+    for (auto& fix : image.fixups) fix(ring_.device(image.slot));
     image.fixups.clear();
     if (image.host && m->verbose) {
-      CK(cudaEventCreate(&image.sample_start));
-      CK(cudaEventCreate(&image.sample_end));
+      image.sample_start.create(cudaEventDefault);
+      image.sample_end.create(cudaEventDefault);
     }
   }
   if (m->verbose)
@@ -207,7 +210,7 @@ bool LayerRing::collect(Image& image) {
   if (!image.sample_pending) return true;
   float elapsed = 0;
   if (cudaEventElapsedTime(&elapsed, image.sample_start, image.sample_end) != cudaSuccess) return false;
-  auto& phase = stats[image.sample_round];
+  auto& phase = stats_.copies[image.sample_round];
   phase.milliseconds += elapsed;
   phase.bytes += image.bytes;
   ++phase.samples;
@@ -215,23 +218,20 @@ bool LayerRing::collect(Image& image) {
   return true;
 }
 
-// Both waits are device dependencies. The caller holds the ring mutex only while submitting a block.
-void LayerRing::begin(int block, bool round, cudaStream_t compute) {
-  auto& image = images[size_t(block)];
-  auto& slot = slots[image.slot];
-  CK(cudaStreamWaitEvent(copy, slot.consumed));
+StagingRing<2>::Lease LayerRing::lease_node(int block, bool round, cudaStream_t compute) {
+  std::lock_guard lock(stats_mutex_);
+  auto& image = images.at(size_t(block));
   const bool sample = image.sample_start && collect(image);
-  if (sample) CK(cudaEventRecord(image.sample_start, copy));
-  CK(cudaMemcpyAsync(slot.device, image.host, image.bytes, cudaMemcpyHostToDevice, copy));
   if (sample) {
-    CK(cudaEventRecord(image.sample_end, copy));
-    image.sample_pending = true;
     image.sample_round = round;
+    image.sample_pending = true;
   }
-  CK(cudaEventRecord(slot.ready, copy));
-  CK(cudaStreamWaitEvent(compute, slot.ready));
-}
-void LayerRing::end(int block, cudaStream_t compute) {
-  CK(cudaEventRecord(slots[images[size_t(block)].slot].consumed, compute));
+  return {ring_,
+          size_t(image.slot),
+          image.host,
+          image.bytes,
+          compute,
+          sample ? cudaEvent_t(image.sample_start) : nullptr,
+          sample ? cudaEvent_t(image.sample_end) : nullptr};
 }
 }  // namespace flyx::cuda

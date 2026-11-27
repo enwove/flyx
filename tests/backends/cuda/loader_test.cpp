@@ -11,7 +11,7 @@
 #include <vector>
 
 #include "backends/cuda/loader/loader.h"
-#include "backends/cuda/runtime/cold_experts.h"
+#include "backends/cuda/runtime/offload/expert_placement.h"
 
 namespace flyx::cuda {
 namespace {
@@ -349,52 +349,189 @@ void companion_estimates() {
 }
 
 void expert_estimates() {
-  constexpr int e = 2, n = 3, k = 256;
+  constexpr int e = 2, k = 256;
   struct Case { int dtype, file_row, device_row; bool packed, scale; };
   for (const auto& c : {
            Case{FLYX_DT_GGML_Q4_K, 144, 148, true, false}, Case{FLYX_DT_GGML_Q4_K, 144, 148, true, true},
            Case{FLYX_DT_GGML_Q4_K, 144, 512, false, true}, Case{FLYX_DT_GGML_Q8_0, 272, 272, true, false},
            Case{FLYX_DT_GGML_NVFP4, 144, 144, true, false}, Case{FLYX_DT_GGML_NVFP4, 144, 144, false, true},
            Case{FLYX_DT_F32, 1024, 512, true, true}, Case{FLYX_DT_BF16, 512, 512, true, false}}) {
-    std::vector<uint8_t> data(e * n * c.file_row);
+    std::vector<uint8_t> data(e * 2 * k * c.file_row);
+    for (size_t i = 0; i < data.size(); ++i) data[i] = uint8_t(i % 31);
     float scales[e] = {1.f, 2.f};
-    flyx_tensor_view v{"experts", c.dtype, 3, {e, n, k}, data.data(), data.size()};
+    flyx_tensor_view gu{"gate_up", c.dtype, 3, {e, 2 * k, k}, data.data(), data.size()};
+    flyx_tensor_view down{"down", c.dtype, 3, {e, k, k}, data.data(), data.size() / 2};
+    flyx_tensor_view router{"router", FLYX_DT_BF16, 2, {e, k}, data.data(), e * k * 2};
     flyx_tensor_view s{"scales", FLYX_DT_F32, 1, {e}, scales, sizeof(scales)};
-    flyx_weight w{&v, nullptr, c.scale ? &s : nullptr};
+    flyx_weight weights[] = {
+        {&gu, nullptr, c.scale ? &s : nullptr}, {&down, nullptr, c.scale ? &s : nullptr}, {&router}};
     flyx_block b{};
     b.kind = FLYX_BLOCK_MOE;
-    b.moe.gate_up = b.moe.down = 0;
+    b.moe.hidden = b.moe.inter = k;
     b.moe.n_experts = e;
-    b.moe.router = -1;
+    b.moe.top_k = 2;
+    b.moe.router = 2;
+    b.moe.router_bias = -1;
+    b.moe.down = 1;
     flyx_model_desc d{};
-    d.weights = &w;
-    d.n_weights = 1;
+    d.weights = weights;
+    d.n_weights = 3;
     d.blocks = &b;
     d.n_blocks = 1;
     flyx_open_options opts{};
     opts.options = c.packed ? "blocks=packed" : "blocks=bf16";
-    flyx_load_estimate est{};
-    const size_t expected = e * n * c.device_row + (c.scale || c.dtype == FLYX_DT_GGML_NVFP4 ? e * sizeof(float) : 0);
-    require(estimate_load(&d, &opts, 0, 0, &est) == 0 && est.weights_bytes == expected, "exact expert estimate");
+    opts.gpu_experts_plus_one = flyx_encode_cap(0);
+    auto rejected = [&](auto& field, auto bad) {
+      auto original = field;
+      field = bad;
+      flyx_load_estimate invalid{};
+      require(estimate_load(&d, &opts, 0, 0, &invalid) != 0, "malformed all-cold descriptor must fail estimation");
+      field = original;
+    };
+    rejected(b.moe.top_k, e + 1);
+    rejected(b.moe.down, -1);
+    rejected(gu.shape[1], int64_t(k));
+    rejected(down.shape[2], int64_t(k - 1));
+    rejected(router.shape[0], int64_t(e + 1));
+    rejected(gu.dtype, -123);
+    rejected(gu.nbytes, gu.nbytes - 1);
+    rejected(gu.data, nullptr);
+    if (c.scale) rejected(s.ndim, 5);
     for (int hot : {e, 1, 0}) {
-      opts.gpu_experts_plus_one = hot + 1;
-      require(estimate_load(&d, &opts, 0, 0, &est) == 0, "estimate a partial expert upload");
+      opts.gpu_experts_plus_one = flyx_encode_cap(hot);
+      flyx_load_estimate est{};
+      require(estimate_load(&d, &opts, 0, 0, &est) == 0, "estimate complete expert pair");
       flyx_bmodel m;
       m.opt.packed_blocks = c.packed;
       m.opt.gpu_experts = hot;
+      auto plan = plan_offload(d, m.opt);
       WeightLoader loader(&m, d);
-      std::shared_ptr<ColdMatrix> cold, shared;
-      const auto resident = loader.expert_mat(0, cold);
+      MoeBlock f{};
+      f.hidden = f.inter = k;
+      f.n_experts = e;
+      f.top_k = 2;
+      f.gate_up = loader.expert_mat(0, f.cold_gu);
+      f.down = loader.expert_mat(1, f.cold_down);
+      std::shared_ptr<ColdMatrix> shared;
       loader.expert_mat(0, shared);
+      require(shared == f.cold_gu, "same weight has a single archive");
+      loader.lin(2);
       loader.finish();
-      const size_t ring = cold ? 2 * cold->bank.bytes(cold->bank.count) : 0;
-      require(resident.n_experts == hot && m.bytes == expected / e * hot && m.bytes + ring == est.weights_bytes,
-              "actual resident expert upload matches estimate");
-      require(cold == shared && bool(cold) == (hot < e) && m.host_bytes + ring == est.offload_host_bytes &&
-                  (!cold || (cold->first == hot && cold->bytes() == m.host_bytes)),
-              "repeated blocks share a single correctly budgeted cold matrix");
+      m.blocks.emplace_back(f);
+      if (plan.cold.pairs) {
+        m.offload = std::make_unique<OffloadRuntime>();
+        m.offload->init_experts(&m, plan);
+      }
+      require(m.bytes == est.weights_bytes && m.pinned_bytes == est.offload_pinned_bytes &&
+                  m.host_bytes - m.pinned_bytes == est.offload_pageable_bytes,
+              "resident planes, adaptive placement and split host scratch match estimate");
+      if (hot == 1) {
+        const auto raw = shared->data, packed = shared->archive;
+        const auto gains = shared->scales;
+        std::vector<uint8_t> bounce(shared->bank.bytes(1));
+        shared->exchange(0, 1, e, bounce.data());
+        shared->exchange(0, 1, e, bounce.data());
+        require(raw == shared->data && packed == shared->archive && gains == shared->scales,
+                "exchanging the same expert twice restores every byte");
+        auto& ws = *m.offload->experts();
+        auto& place = ws.placements.at(shared.get());
+        m.offload->on_session_open(&m);
+        m.offload->on_session_open(&m);
+        const uint32_t hits[e] = {0, 256};
+        CK(cudaMemcpy(place.counts, hits, sizeof(hits), cudaMemcpyHostToDevice));
+        ws.pending_counts = true;
+        m.offload->maintain(&m);
+        m.offload->on_session_close(&m);
+        m.offload->maintain(&m);
+        require(place.order.slot[1] == 1 && ws.pending_counts, "active session defers promotion");
+        m.offload->on_session_close(&m);
+        m.offload->on_session_open(&m);
+        int slots[e];
+        uint32_t counts[e];
+        CudaStream consumer;
+        consumer.create();
+        CK(cudaStreamWaitEvent(consumer, ws.ready, 0));
+        CK(cudaMemcpyAsync(slots, place.slots, sizeof(slots), cudaMemcpyDeviceToHost, consumer));
+        CK(cudaMemcpyAsync(counts, place.counts, sizeof(counts), cudaMemcpyDeviceToHost, consumer));
+        CK(cudaStreamSynchronize(consumer));
+        require(slots[1] == 0 && !counts[0] && !counts[1] && !ws.pending_counts,
+                "independent stream observes published slots and cleared histogram");
+        m.offload->on_session_close(&m);
+      }
     }
   }
+}
+
+void layer_estimates() {
+  constexpr int h = 64;
+  std::vector<uint16_t> values(h * h, 0x3f80);
+  const flyx_tensor_view view{"dense", FLYX_DT_BF16, 2, {h, h}, values.data(), values.size() * 2};
+  std::vector<flyx_weight> weights(14, flyx_weight{&view});
+  std::vector<flyx_block> blocks(4);
+  for (int i = 0; i < 2; ++i) {
+    const int w = 7 * i;
+    auto& a = blocks[2 * i];
+    a.kind = FLYX_BLOCK_ATTN;
+    a.attn.q = w;
+    a.attn.k = w + 1;
+    a.attn.v = w + 2;
+    a.attn.o = w + 3;
+    a.attn.hidden = a.attn.head_dim = h;
+    a.attn.n_heads = a.attn.n_kv = 1;
+    auto& f = blocks[2 * i + 1];
+    f.kind = FLYX_BLOCK_MLP;
+    f.mlp.gate = w + 4;
+    f.mlp.up = w + 5;
+    f.mlp.down = w + 6;
+    f.mlp.hidden = f.mlp.inter = h;
+  }
+  flyx_model_desc d{};
+  d.blocks = blocks.data();
+  d.n_blocks = int(blocks.size());
+  d.weights = weights.data();
+  d.n_weights = int(weights.size());
+  for (bool bounce : {false, true}) {
+    flyx_bmodel m;
+    m.opt.gpu_layers = 0;
+    auto plan = plan_offload(d, m.opt);
+    plan.fit_pinned(bounce ? plan.stream.ring_bytes : UINT64_MAX);
+    require(plan.bounce_layers == bounce && plan.stream.ring_bytes > 0, "dense archive pinned budget fallback");
+    m.offload = std::make_unique<OffloadRuntime>();
+    auto& ring = m.offload->init_layers(blocks.size(), bounce);
+    m.blocks.reserve(blocks.size());
+    for (size_t i = 0; i < blocks.size(); ++i) {
+      if (i % 2 == 0) {
+        AttnBlock a;
+        a.hidden = a.hd = h;
+        a.nh = a.nkv = 1;
+        a.w_in.w = m.alloc<bf16>(3 * h * h);
+        a.w_out.w = m.alloc<bf16>(h * h);
+        m.blocks.emplace_back(a);
+      } else {
+        MlpBlock f;
+        f.hidden = f.inter = h;
+        f.w_gu.w = m.alloc<bf16>(2 * h * h);
+        f.w_down.w = m.alloc<bf16>(h * h);
+        m.blocks.emplace_back(f);
+      }
+      ring.archive(&m, int(i));
+    }
+    ring.allocate(&m);
+    require(m.bytes == plan.workspace_bytes && m.pinned_bytes == plan.pinned_bytes &&
+                m.host_bytes - m.pinned_bytes == plan.pageable_bytes,
+            "dense device and host allocation parity");
+  }
+  flyx_block dv{};
+  dv.kind = FLYX_BLOCK_DV_LAYER;
+  dv.dv_layer.attn = 2;
+  dv.dv_layer.mlp = 3;
+  blocks.push_back(dv);
+  d.blocks = blocks.data();
+  ++d.n_blocks;
+  BackendOptions options;
+  options.gpu_layers = 0;
+  auto plan = plan_offload(d, options);
+  require(plan.stream.blocks == std::vector<char>({1, 1, 0, 0, 0}), "DV context projections stay resident");
 }
 
 void packed_drafter(bool compact) {
@@ -550,6 +687,7 @@ int main() {
     vision_estimates();
     companion_estimates();
     expert_estimates();
+    layer_estimates();
     residual_query_extent();
     drafter_dimensions();
     staging_width();

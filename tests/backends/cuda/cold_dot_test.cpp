@@ -1,9 +1,12 @@
 // Copyright 2026 The flyx Authors. SPDX-License-Identifier: Apache-2.0
+#include <limits>
 #include <random>
+#include <stdexcept>
+#include "backends/cuda/runtime/row_pool.h"
 #include <vector>
 
-#include "backends/cuda/runtime/cold_experts.h"
-#include "backends/cuda/runtime/expert_order.h"
+#include "backends/cuda/runtime/offload/expert_store.h"
+#include "backends/cuda/runtime/offload/expert_order.h"
 #include "ops/dtype/ref.h"
 #include "tests/common/check.h"
 
@@ -25,11 +28,61 @@ int main() {
     test::check(o.update(0, o.scores.data(), exchange) == 0 && o.update(8, o.scores.data(), exchange) == 0,
                 "empty and full resident sets have no swaps");
   }
+  for (bool spin : {false, true}) {
+    cuda::RowPool pool(4, spin);
+    for (int repeat = 0; repeat < 12; ++repeat) {
+      std::vector<int> rows(3 + repeat);
+      pool.run(rows.size(), [&](size_t a, size_t b) {
+        for (; a < b; ++a) ++rows[a];
+      });
+      test::check(std::all_of(rows.begin(), rows.end(), [](int n) { return n == 1; }), "row pool reuse");
+      bool caught = false;
+      try {
+        pool.run(12, [&](size_t a, size_t) {
+          if (a == size_t(repeat % 4) * 3) throw std::runtime_error("row");
+        });
+      } catch (const std::runtime_error&) {
+        caught = true;
+      }
+      test::check(caught, "caller and worker exceptions reach the submitter");
+    }
+  }
+  {
+    float values[65]{};
+    values[1] = INFINITY;
+    values[32] = -INFINITY;
+    values[64] = std::numeric_limits<float>::quiet_NaN();
+    cuda::ColdQ8 groups[3]{};
+    cuda::prepare_cold_q8(values, groups, 65);
+    for (const auto& g : groups) test::check(g.d == 0.f && g.q[0] == 0, "non-finite group has a finite zero scale");
+    values[1] = std::numeric_limits<float>::quiet_NaN();
+    values[2] = -3.f;
+    cuda::prepare_cold_q8(values, groups, 32);
+    test::check(groups[0].q[1] == 0 && groups[0].q[2] == -127, "NaN and finite values in one Q8 group");
+    for (auto dtype : {FLYX_DT_GGML_NVFP4, FLYX_DT_GGML_MXFP4}) {
+      uint8_t w[36]{};
+      float x[64]{};
+      x[0] = 1.f;
+      if (dtype == FLYX_DT_GGML_MXFP4) {
+        w[0] = w[17] = 255;
+        w[1] = 1;  // half of 2^128 is representable
+      } else {
+        w[0] = 127;
+        w[1] = 255;
+        w[4] = w[12] = 0x77;
+        x[16] = 1.f;
+      }
+      const float expected = dtype == FLYX_DT_GGML_MXFP4 ? std::ldexp(1.f, 127) : 0.f;
+      for (int bits : {0, 256, 512})
+        test::check(cuda::cold_dot_limited(dtype, w, x, 64, cuda::cpu_isa_limit(bits)) == expected,
+                    "FP4 extreme scale");
+    }
+  }
   std::mt19937 rng(91211);
-  for (int dtype :
-       {FLYX_DT_BF16, FLYX_DT_GGML_NVFP4, FLYX_DT_GGML_MXFP4, FLYX_DT_GGML_Q2_0, FLYX_DT_GGML_IQ1_S, FLYX_DT_GGML_IQ2_S,
-        FLYX_DT_GGML_IQ2_XS, FLYX_DT_GGML_IQ2_XXS, FLYX_DT_GGML_IQ3_XXS, FLYX_DT_GGML_IQ4_NL, FLYX_DT_GGML_Q2_K,
-        FLYX_DT_GGML_Q3_K, FLYX_DT_GGML_Q4_K, FLYX_DT_GGML_Q5_K, FLYX_DT_GGML_Q6_K, FLYX_DT_GGML_Q8_0}) {
+  for (int dtype : {FLYX_DT_BF16, FLYX_DT_GGML_NVFP4, FLYX_DT_GGML_MXFP4, FLYX_DT_GGML_Q2_0, FLYX_DT_GGML_IQ1_S,
+                    FLYX_DT_GGML_IQ2_S, FLYX_DT_GGML_IQ2_XS, FLYX_DT_GGML_IQ2_XXS, FLYX_DT_GGML_IQ3_XXS,
+                    FLYX_DT_GGML_IQ4_NL, FLYX_DT_GGML_Q2_K, FLYX_DT_GGML_Q4_0, FLYX_DT_GGML_Q5_0, FLYX_DT_GGML_Q3_K,
+                    FLYX_DT_GGML_Q4_K, FLYX_DT_GGML_Q5_K, FLYX_DT_GGML_Q6_K, FLYX_DT_GGML_Q8_0}) {
     int per = dtype == FLYX_DT_BF16 ? 1 : flyx_block_values(dtype);
     int bytes = dtype == FLYX_DT_BF16 ? 2 : flyx_block_bytes(dtype);
     constexpr int cols = 512;
@@ -41,7 +94,8 @@ int main() {
       } else if (dtype == FLYX_DT_GGML_MXFP4)
         data[i] = uint8_t(120 + rng() % 12);
       else {
-        data[i + 1] = dtype == FLYX_DT_BF16 ? 62 : 52;
+        const uint8_t sign = uint8_t((i / bytes) % 2) << 7;
+        data[i + 1] = uint8_t((dtype == FLYX_DT_BF16 ? 62 : 52) | sign);
         if (dtype == FLYX_DT_GGML_Q4_K || dtype == FLYX_DT_GGML_Q5_K) data[i + 3] = 48;
         if (dtype == FLYX_DT_GGML_Q3_K || dtype == FLYX_DT_GGML_Q6_K) data[i + bytes - 1] = 52;
         if (dtype == FLYX_DT_GGML_Q2_K) {
@@ -71,11 +125,25 @@ int main() {
       norm_q8 += std::fabs(term);
     }
     for (int isa : {256, 512})
-      if (auto dot = cuda::cold_q8_kernel(dtype, isa))
+      if (auto dot = cuda::cold_q8_kernel(dtype, cuda::cpu_isa_limit(isa)))
         test::check(std::fabs(dot(data.data(), quant.data(), cols) - expected_q8) <= 2e-6 * norm_q8,
                     "integer cold dot vs float64 for dtype " + std::to_string(dtype) + " ISA " + std::to_string(isa));
+    for (int n : {64, 96, 288}) {
+      double sum = 0, abs_sum = 0;
+      for (int i = 0; i < n; ++i) {
+        const auto& q = quant[i / 32];
+        const double term = ops::load(&view, i) * (double(q.d) * q.q[i % 32]);
+        sum += term;
+        abs_sum += std::fabs(term);
+      }
+      for (int bits : {256, 512}) {
+        if (auto dot = cuda::cold_q8_kernel(dtype, cuda::cpu_isa_limit(bits)))
+          test::check(std::fabs(dot(data.data(), quant.data(), n) - sum) <= 2e-6 * abs_sum, "partial integer dot");
+      }
+    }
     for (int isa : {0, 256, 512}) {
-      test::check(std::fabs(cuda::cold_dot_limited(dtype, data.data(), x.data(), cols, isa) - expected) <= 2e-6 * norm,
+      test::check(std::fabs(cuda::cold_dot_limited(dtype, data.data(), x.data(), cols, cuda::cpu_isa_limit(isa)) -
+                            expected) <= 2e-6 * norm,
                   "compressed CPU GEMV vs float64 for dtype " + std::to_string(dtype));
     }
   }

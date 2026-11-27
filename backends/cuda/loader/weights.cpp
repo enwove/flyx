@@ -3,19 +3,14 @@
 #include "backends/cuda/loader/loader.h"
 
 #include "backends/cuda/runtime/row_pool.h"
-#include "backends/cuda/runtime/cold_experts.h"
+#include "backends/cuda/runtime/offload/expert_store.h"
 #include <exception>
 
 #include "backends/cuda/loader/exact_bf16.h"
 
 namespace flyx::cuda {
 
-uint16_t float_to_bf16(float f) {
-  uint32_t u;
-  std::memcpy(&u, &f, 4);
-  u += 0x7FFF + ((u >> 16) & 1);  // round to nearest even
-  return uint16_t(u >> 16);
-}
+uint16_t float_to_bf16(float f) { return ops::bf16_bits(f); }
 
 // ---- weights -------------------------------------------------------------------------------
 // Drafts never reach the output (the target verifies each one), so the
@@ -354,19 +349,7 @@ void ggml_nvfp4_planes_with(
   dispatch(N, [&](size_t r_begin, size_t r_end) {
     for (size_t r = r_begin; r < r_end; ++r) {
       const uint8_t* in = data + (order ? order(r) : r) * per_row * 36;
-      for (size_t k = 0; k < per_row; ++k, in += 36) {
-        const size_t b = r * per_row + k;  // the block's place in the planes
-        const uint8_t* d = in;
-        const uint8_t* qs = in + 4;
-        for (int g = 0; g < 4; ++g) {
-          if (d[g] == 0xFF)
-            throw std::runtime_error(std::string(v->name) + ": an NVFP4 scale of 0xFF (no e4m3 holds it)");
-          s[4 * b + size_t(g)] = d[g] == 0x7F ? 0 : uint8_t(d[g] & 0x7F);
-          auto code = [&](int l) { return l < 8 ? qs[8 * g + l] & 15 : qs[8 * g + l - 8] >> 4; };
-          for (int i = 0; i < 8; ++i)
-            q[32 * b + 8 * size_t(g) + size_t(i)] = uint8_t(code(2 * i) | code(2 * i + 1) << 4);
-        }
-      }
+      pack_expert_nvfp4(in, per_row, q + r * per_row * 32, s + r * per_row * 4);
     }
   });
 }
@@ -680,9 +663,8 @@ ExpertMat WeightLoader::expert_mat(int w, std::shared_ptr<ColdMatrix>& cold) {
   const size_t E = std::min(all, size_t(m_->opt.gpu_experts)), N = size_t(v->shape[1]), K = size_t(v->shape[2]);
   if (E < all) {
     auto matrix = std::make_shared<ColdMatrix>(weights_[w], int(E), layout);
-    matrix->max_isa = m_->opt.expert_simd;
-    if (matrix->q8 && m_->opt.expert_integer) matrix->quant_dot = cold_q8_kernel(matrix->dtype, matrix->max_isa);
-    if (m_->opt.expert_prefill_min) matrix->pack_banks(layout, all);
+    matrix->resolve(m_->opt.expert_simd, m_->opt.expert_integer);
+    if (m_->opt.keep_expert_archive) matrix->pack_banks(layout, all);
     cold = cold_experts_[w] = std::move(matrix);
     m_->host_bytes += cold->bytes();
     layout.rows = E * N;
@@ -748,7 +730,9 @@ ExpertMat WeightLoader::expert_mat(int w, std::shared_ptr<ColdMatrix>& cold) {
     }
     em.q = q_dev;
     em.s = s_dev;
-    em.rs = upload_expert_scales();
+    auto* gains = upload_expert_scales();
+    em.rs = gains;
+    if (cold) cold->resident = {q_dev, s_dev, gains};
     return experts_[w] = em;
   }
 
@@ -786,7 +770,9 @@ ExpertMat WeightLoader::expert_mat(int w, std::shared_ptr<ColdMatrix>& cold) {
       times_.pack_s += load_clock() - t1;
     }
     em.blk = BlockMat{data, scales, v->dtype, int(total_rows), weights_[w].activations == FLYX_ACT_Q8};
-    em.rs = upload_expert_scales();
+    auto* gains = upload_expert_scales();
+    em.rs = gains;
+    if (cold) cold->resident = {data, scales, gains};
     return experts_[w] = em;
   }
 
@@ -826,7 +812,9 @@ ExpertMat WeightLoader::expert_mat(int w, std::shared_ptr<ColdMatrix>& cold) {
     }
   }
   em.w = dst;
-  em.rs = upload_expert_scales();
+  auto* gains = upload_expert_scales();
+  em.rs = gains;
+  if (cold) cold->resident = {dst, nullptr, gains};
   return experts_[w] = em;
 }
 

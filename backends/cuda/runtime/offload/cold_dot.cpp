@@ -1,5 +1,5 @@
 // Copyright 2026 The flyx Authors. SPDX-License-Identifier: Apache-2.0
-#include "backends/cuda/runtime/cold_experts.h"
+#include "backends/cuda/runtime/offload/expert_store.h"
 #include "ops/dtype/ref.h"
 
 #include <array>
@@ -7,13 +7,15 @@
 
 #if defined(__x86_64__) || defined(_M_X64)
 #include <immintrin.h>
-#ifdef _MSC_VER
+#if defined(_MSC_VER) && !defined(__clang__)
 #include <intrin.h>
 #define FLYX_AVX512 __declspec(noinline)
+#define FLYX_VNNI __declspec(noinline)
 #define FLYX_AVX2 __declspec(noinline)
 #define FLYX_AVX_INLINE __forceinline
 #else
-#define FLYX_AVX512 __attribute__((target("avx512f,avx512bw,avx512dq,avx512vnni,fma")))
+#define FLYX_AVX512 __attribute__((target("avx512f,avx512bw,avx512dq,fma")))
+#define FLYX_VNNI __attribute__((target("avx512f,avx512bw,avx512dq,avx512vnni,fma")))
 #define FLYX_AVX2 __attribute__((target("avx2,fma")))
 #define FLYX_AVX_INLINE inline __attribute__((target("avx2,fma"), always_inline))
 #endif
@@ -24,11 +26,7 @@ using namespace ops::ggml;
 
 void prepare_cold_q8(const float* input, ColdQ8* out, int cols) {
   for (int i = 0; i < cols; i += 32, ++out) {
-    float maximum = 0;
-    for (int j = 0; j < 32; ++j) maximum = std::max(maximum, std::fabs(input[i + j]));
-    out->d = maximum / 127.f;
-    const bool finite = out->d > 0 && std::isfinite(out->d);
-    for (int j = 0; j < 32; ++j) out->q[j] = finite ? int8_t(std::nearbyint(input[i + j] / out->d)) : 0;
+    ops::round_q8_group(input + i, std::min(32, cols - i), out->q, out->d);
   }
 }
 
@@ -44,8 +42,30 @@ float cold_dot_scalar(int dtype, const uint8_t* row, const float* x, int cols) {
 #ifdef FLYX_AVX2
 namespace {
 
+const auto kFp4Codes = [] {
+  std::array<float, 16> codes{};
+  for (size_t i = 0; i < codes.size(); ++i) codes[i] = .5f * kvalues_mxfp4[i];
+  return codes;
+}();
+
+template <bool Nv>
+const float* fp4_scales() {
+  static const auto scales = [] {
+    std::array<float, 256> table{};
+    for (int i = 0; i < 256; ++i) {
+      const int v = i & 127;
+      if constexpr (Nv)
+        table[i] = v == 127 ? 0.f : v < 8 ? std::ldexp(float(v), -9) : std::ldexp(float(8 + (v & 7)), (v >> 3) - 10);
+      else
+        table[i] = std::ldexp(1.f, i - 128);  // half scale keeps exponent 255 representable
+    }
+    return table;
+  }();
+  return scales.data();
+}
+
 bool has_avx2() {
-#ifdef _MSC_VER
+#if defined(_MSC_VER) && !defined(__clang__)
   int r[4];
   __cpuid(r, 0);
   if (r[0] < 7) return false;
@@ -68,16 +88,26 @@ const float* half_scales() {
   return table.data();
 }
 
-bool has_vnni() {
-#ifdef _MSC_VER
+bool has_avx512() {
+#if defined(_MSC_VER) && !defined(__clang__)
   if (!has_avx2() || (_xgetbv(0) & 0xe6) != 0xe6) return false;
   int r[4];
   __cpuidex(r, 7, 0);
   constexpr unsigned needed = (1u << 16) | (1u << 17) | (1u << 30);
-  return (unsigned(r[1]) & needed) == needed && (r[2] & (1 << 11));
+  return (unsigned(r[1]) & needed) == needed;
 #else
   return has_avx2() && __builtin_cpu_supports("avx512f") && __builtin_cpu_supports("avx512bw") &&
-         __builtin_cpu_supports("avx512dq") && __builtin_cpu_supports("avx512vnni");
+         __builtin_cpu_supports("avx512dq");
+#endif
+}
+
+bool has_vnni() {
+#if defined(_MSC_VER) && !defined(__clang__)
+  int r[4];
+  __cpuidex(r, 7, 0);
+  return has_avx512() && (r[2] & (1 << 11));
+#else
+  return has_avx512() && __builtin_cpu_supports("avx512vnni");
 #endif
 }
 
@@ -85,7 +115,8 @@ uint64_t signed_grid(uint64_t grid, uint8_t signs) {
   static const auto masks = [] {
     std::array<uint64_t, 256> m{};
     for (int s = 0; s < 256; ++s)
-      for (int i = 0; i < 8; ++i) if (s & (1 << i)) m[s] |= uint64_t(255) << (8 * i);
+      for (int i = 0; i < 8; ++i)
+        if (s & (1 << i)) m[s] |= uint64_t(255) << (8 * i);
     return m;
   }();
   // All IQ2 and IQ3 grid magnitudes are positive, so the bytewise negations cannot carry.
@@ -125,8 +156,7 @@ inline Q8Weights q8_weights(const B& b, int group, const float* half) {
   if constexpr (Type == FLYX_DT_GGML_IQ1_S) {
     const unsigned h = b.qh[group];
     w.scale[0] = w.scale[1] = (.125f * d) * (2 * ((h >> 12) & 7) + 1);
-    for (int j = 0; j < 4; ++j)
-      w.codes[j] = ternary_grid(b.qs[group * 4 + j] | (((h >> (3 * j)) & 7) << 8), h >> 15);
+    for (int j = 0; j < 4; ++j) w.codes[j] = ternary_grid(b.qs[group * 4 + j] | (((h >> (3 * j)) & 7) << 8), h >> 15);
   } else if constexpr (Type == FLYX_DT_GGML_IQ2_S || Type == FLYX_DT_GGML_IQ2_XS) {
     for (int j = 0; j < 4; ++j) {
       int g = 4 * group + j;
@@ -145,15 +175,27 @@ inline Q8Weights q8_weights(const B& b, int group, const float* half) {
       if constexpr (iq3) {
         const uint8_t* ij = p + 8 * group + 2 * j;
         grid = uint64_t(iq3xxs_grid[ij[0]]) | (uint64_t(iq3xxs_grid[ij[1]]) << 32);
-      } else grid = iq2xxs_grid[p[8 * group + j]];
+      } else
+        grid = iq2xxs_grid[p[8 * group + j]];
       w.codes[j] = signed_grid(grid, ksigns_iq2xs[(aux >> (7 * j)) & 127]);
     }
   }
   return w;
 }
 
+template <int Type>
+float iq_tail_dot(const uint8_t* row, const ColdQ8* x, int cols) {
+  flyx_tensor_view v{};
+  v.dtype = Type;
+  v.data = row;
+  float sum = 0;
+  for (int i = 0; i < cols; ++i) sum = std::fma(float(ops::load(&v, i)), x[i / 32].d * x[i / 32].q[i % 32], sum);
+  return sum;
+}
+
 template <int Type, class B>
 FLYX_AVX2 float iq_dot_avx2(const uint8_t* row, const ColdQ8* x, int cols) {
+  if (cols % 256) return iq_tail_dot<Type>(row, x, cols);
   const float* half = half_scales();
   __m256 acc = _mm256_setzero_ps();
   for (int k = 0; k < cols; k += 256) {
@@ -176,7 +218,8 @@ FLYX_AVX2 float iq_dot_avx2(const uint8_t* row, const ColdQ8* x, int cols) {
 }
 
 template <int Type, class B>
-FLYX_AVX512 float iq_dot_vnni(const uint8_t* row, const ColdQ8* x, int cols) {
+FLYX_VNNI float iq_dot_vnni(const uint8_t* row, const ColdQ8* x, int cols) {
+  if (cols % 256) return iq_tail_dot<Type>(row, x, cols);
   const float* half = half_scales();
   __m512 acc = _mm512_setzero_ps();
   for (int k = 0; k < cols; k += 256) {
@@ -184,14 +227,15 @@ FLYX_AVX512 float iq_dot_vnni(const uint8_t* row, const ColdQ8* x, int cols) {
     for (int g = 0; g < 8; g += 2, x += 2) {
       const auto lo = q8_weights<Type>(b, g, half);
       const auto hi = q8_weights<Type>(b, g + 1, half);
-      const auto v = _mm512_set_epi64(hi.codes[3], hi.codes[2], hi.codes[1], hi.codes[0],
-                                      lo.codes[3], lo.codes[2], lo.codes[1], lo.codes[0]);
-      const auto a = _mm512_inserti64x4(_mm512_castsi256_si512(_mm256_loadu_si256(reinterpret_cast<const __m256i*>(x->q))),
-                                        _mm256_loadu_si256(reinterpret_cast<const __m256i*>(x[1].q)), 1);
+      const auto v = _mm512_set_epi64(hi.codes[3], hi.codes[2], hi.codes[1], hi.codes[0], lo.codes[3], lo.codes[2],
+                                      lo.codes[1], lo.codes[0]);
+      const auto a =
+          _mm512_inserti64x4(_mm512_castsi256_si512(_mm256_loadu_si256(reinterpret_cast<const __m256i*>(x->q))),
+                             _mm256_loadu_si256(reinterpret_cast<const __m256i*>(x[1].q)), 1);
       auto signed_a = _mm512_mask_sub_epi8(a, _mm512_movepi8_mask(v), _mm512_setzero_si512(), a);
       auto sum = _mm512_dpbusd_epi32(_mm512_setzero_si512(), _mm512_abs_epi8(v), signed_a);
       const float scales[] = {lo.scale[0] * x->d, lo.scale[1] * x->d, hi.scale[0] * x[1].d, hi.scale[1] * x[1].d};
-      const auto scale = _mm512_permutexvar_ps(_mm512_setr_epi32(0,0,0,0,1,1,1,1,2,2,2,2,3,3,3,3),
+      const auto scale = _mm512_permutexvar_ps(_mm512_setr_epi32(0, 0, 0, 0, 1, 1, 1, 1, 2, 2, 2, 2, 3, 3, 3, 3),
                                                _mm512_castps128_ps512(_mm_loadu_ps(scales)));
       acc = _mm512_fmadd_ps(_mm512_cvtepi32_ps(sum), scale, acc);
     }
@@ -274,25 +318,15 @@ FLYX_AVX2 float vector_dot(const uint8_t* row, const float* x, int cols) {
         __m256i codes = _mm256_cvtepu8_epi32(_mm_cvtsi64_si128(bytes));
         if (k & (nv ? 8 : 16)) codes = _mm256_srli_epi32(codes, 4);
         codes = _mm256_and_si256(codes, _mm256_set1_epi32(15));
-        static constexpr float values[] = {0, .5f, 1, 1.5f, 2, 3, 4, 6, 0, -.5f, -1, -1.5f, -2, -3, -4, -6};
-        // MXFP4 stores an E8M0 scale; NVFP4 stores one E4M3 scale per 16.
-        static const auto scales = [] {
-          std::array<float, 256> table{};
-          for (int i = 0; i < 256; ++i) {
-            int v = i & 127;
-            table[i] = nv ? (v == 127 ? 0.f
-                             : v < 8  ? std::ldexp(float(v), -9)
-                                      : std::ldexp(float(8 + (v & 7)), (v >> 3) - 10))
-                          : std::ldexp(1.f, i - 127);
-          }
-          return table;
-        }();
+        auto* scales = fp4_scales<nv>();
         float scale;
         if constexpr (nv)
           scale = scales[b.d[group]];
         else
           scale = scales[b.e];
-        w = _mm256_mul_ps(_mm256_i32gather_ps(values, codes, 4), _mm256_set1_ps(scale));
+        auto magnitudes = _mm256_i32gather_ps(kFp4Codes.data(), codes, 4);
+        if constexpr (!nv) magnitudes = _mm256_add_ps(magnitudes, magnitudes);
+        w = _mm256_mul_ps(magnitudes, _mm256_set1_ps(scale));
       } else if constexpr (Type == FLYX_DT_GGML_IQ4_NL) {
         uint64_t bytes;
         std::memcpy(&bytes, b.qs + (k & 8), 8);
@@ -367,17 +401,7 @@ FLYX_AVX512 float vector_dot_512(const uint8_t* row, const float* x, int cols) {
   if constexpr (Type == FLYX_DT_GGML_IQ4_NL)
     lookup = _mm512_cvtepi32_ps(_mm512_cvtepi8_epi32(_mm_loadu_si128(reinterpret_cast<const __m128i*>(kvalues_iq4nl))));
   else
-    lookup = _mm512_setr_ps(0,.5f,1,1.5f,2,3,4,6,0,-.5f,-1,-1.5f,-2,-3,-4,-6);
-  static const auto scales = [] {
-    std::array<float, 256> table{};
-    for (int i = 0; i < 256; ++i) {
-      const int v = i & 127;
-      table[i] = Type == FLYX_DT_GGML_NVFP4
-                     ? (v == 127 ? 0.f : v < 8 ? std::ldexp(float(v), -9) : std::ldexp(float(8 + (v & 7)), (v >> 3) - 10))
-                     : std::ldexp(1.f, i - 127);
-    }
-    return table;
-  }();
+    lookup = _mm512_loadu_ps(kFp4Codes.data());
   const float* half = half_scales();
   __m512 acc = _mm512_setzero_ps();
   for (int k = 0; k < cols; k += Span) {
@@ -388,23 +412,27 @@ FLYX_AVX512 float vector_dot_512(const uint8_t* row, const float* x, int cols) {
       if constexpr (Type == FLYX_DT_GGML_Q2_0) {
         uint32_t bits;
         std::memcpy(&bits, b.qs + j / 4, 4);
-        const auto codes = _mm512_srlv_epi32(_mm512_set1_epi32(bits),
-            _mm512_setr_epi32(0,2,4,6,8,10,12,14,16,18,20,22,24,26,28,30));
-        weights = _mm512_cvtepi32_ps(_mm512_sub_epi32(_mm512_and_si512(codes, _mm512_set1_epi32(3)), _mm512_set1_epi32(1)));
+        const auto codes = _mm512_srlv_epi32(
+            _mm512_set1_epi32(bits), _mm512_setr_epi32(0, 2, 4, 6, 8, 10, 12, 14, 16, 18, 20, 22, 24, 26, 28, 30));
+        weights =
+            _mm512_cvtepi32_ps(_mm512_sub_epi32(_mm512_and_si512(codes, _mm512_set1_epi32(3)), _mm512_set1_epi32(1)));
         scale = half[b.d];
       } else {
         __m512i codes;
         if constexpr (Type == FLYX_DT_GGML_NVFP4) {
           const __m128i bytes = _mm_loadl_epi64(reinterpret_cast<const __m128i*>(b.qs + j / 2));
           codes = _mm512_cvtepu8_epi32(_mm_unpacklo_epi64(bytes, _mm_srli_epi16(bytes, 4)));
-          scale = scales[b.d[j / 16]];
+          scale = fp4_scales<true>()[b.d[j / 16]];
         } else {
           codes = _mm512_cvtepu8_epi32(_mm_loadu_si128(reinterpret_cast<const __m128i*>(b.qs)));
           if (j) codes = _mm512_srli_epi32(codes, 4);
-          if constexpr (Type == FLYX_DT_GGML_MXFP4) scale = scales[b.e];
-          else scale = half[b.d];
+          if constexpr (Type == FLYX_DT_GGML_MXFP4)
+            scale = fp4_scales<false>()[b.e];
+          else
+            scale = half[b.d];
         }
         weights = _mm512_permutexvar_ps(codes, lookup);
+        if constexpr (Type == FLYX_DT_GGML_MXFP4) weights = _mm512_add_ps(weights, weights);
       }
       acc = _mm512_fmadd_ps(_mm512_mul_ps(weights, _mm512_set1_ps(scale)), _mm512_loadu_ps(x + k + j), acc);
     }
@@ -414,11 +442,13 @@ FLYX_AVX512 float vector_dot_512(const uint8_t* row, const float* x, int cols) {
 }  // namespace
 #endif
 
-QuantDot cold_q8_kernel(int dtype, int max_isa) {
+QuantDot cold_q8_kernel(int dtype, CpuIsa max_isa) {
 #ifdef FLYX_AVX2
   static const bool avx2 = has_avx2(), vnni = has_vnni();
-  if (avx2 && max_isa >= 256) {
-#define FLYX_IQ_DOT(T, B) case T: return vnni && max_isa >= 512 ? iq_dot_vnni<T, B> : iq_dot_avx2<T, B>
+  if (avx2 && max_isa >= CpuIsa::avx2) {
+#define FLYX_IQ_DOT(T, B) \
+  case T:                 \
+    return vnni && max_isa >= CpuIsa::avx512 ? iq_dot_vnni<T, B> : iq_dot_avx2<T, B>
     switch (dtype) {
       FLYX_IQ_DOT(FLYX_DT_GGML_IQ1_S, block_iq1_s);
       FLYX_IQ_DOT(FLYX_DT_GGML_IQ2_XXS, block_iq2_xxs);
@@ -432,23 +462,27 @@ QuantDot cold_q8_kernel(int dtype, int max_isa) {
   return nullptr;
 }
 
-float cold_dot_limited(int dtype, const uint8_t* row, const float* input, int cols, int max_isa) {
+FloatDot cold_float_kernel(int dtype, int cols, CpuIsa max_isa) {
 #ifdef FLYX_AVX2
   static const bool simd = has_avx2();
-  static const bool wide = has_vnni();
-  if (wide && max_isa >= 512 && cols % 64 == 0) {
+  static const bool wide = has_avx512();
+  if (wide && max_isa >= CpuIsa::avx512 && cols % 64 == 0) {
     switch (dtype) {
-      case FLYX_DT_GGML_NVFP4: return vector_dot_512<FLYX_DT_GGML_NVFP4, block_nvfp4, 64>(row, input, cols);
-      case FLYX_DT_GGML_Q2_0: return vector_dot_512<FLYX_DT_GGML_Q2_0, block_q2_0, 64>(row, input, cols);
-      case FLYX_DT_GGML_MXFP4: return vector_dot_512<FLYX_DT_GGML_MXFP4, block_mxfp4, 32>(row, input, cols);
-      case FLYX_DT_GGML_IQ4_NL: return vector_dot_512<FLYX_DT_GGML_IQ4_NL, block_iq4_nl, 32>(row, input, cols);
+      case FLYX_DT_GGML_NVFP4:
+        return vector_dot_512<FLYX_DT_GGML_NVFP4, block_nvfp4, 64>;
+      case FLYX_DT_GGML_Q2_0:
+        return vector_dot_512<FLYX_DT_GGML_Q2_0, block_q2_0, 64>;
+      case FLYX_DT_GGML_MXFP4:
+        return vector_dot_512<FLYX_DT_GGML_MXFP4, block_mxfp4, 32>;
+      case FLYX_DT_GGML_IQ4_NL:
+        return vector_dot_512<FLYX_DT_GGML_IQ4_NL, block_iq4_nl, 32>;
     }
   }
-  if (simd && max_isa >= 256 && cols % 8 == 0) {
+  if (simd && max_isa >= CpuIsa::avx2 && cols % 8 == 0) {
     switch (dtype) {
 #define FLYX_DOT(T, B, N) \
   case T:                 \
-    return vector_dot<T, B, N>(row, input, cols)
+    return vector_dot<T, B, N>
       using Bf16Eight = std::array<uint16_t, 8>;
       FLYX_DOT(FLYX_DT_BF16, Bf16Eight, 8);
       FLYX_DOT(FLYX_DT_GGML_Q2_K, block_q2_K, 256);
@@ -470,9 +504,13 @@ float cold_dot_limited(int dtype, const uint8_t* row, const float* input, int co
     }
   }
 #endif
-  return cold_dot_scalar(dtype, row, input, cols);
+  return nullptr;
+}
+float cold_dot_limited(int dtype, const uint8_t* row, const float* input, int cols, CpuIsa limit) {
+  const auto dot = cold_float_kernel(dtype, cols, limit);
+  return dot ? dot(row, input, cols) : cold_dot_scalar(dtype, row, input, cols);
 }
 float cold_dot(int dtype, const uint8_t* row, const float* input, int cols) {
-  return cold_dot_limited(dtype, row, input, cols, 512);
+  return cold_dot_limited(dtype, row, input, cols, CpuIsa::avx512);
 }
 }  // namespace flyx::cuda

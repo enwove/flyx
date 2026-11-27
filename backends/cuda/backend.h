@@ -34,6 +34,8 @@
 #include "backends/cuda/errors.h"
 #include "backends/cuda/kernels/kernels.cuh"
 #include "backends/cuda/runtime/draft_ring.h"
+#include "backends/cuda/runtime/checked_size.h"
+#include "backends/cuda/runtime/offload/offload_runtime.h"
 #include "backends/cuda/runtime/vision_disk.h"
 #include "core/interfaces/options.h"
 #include "flyx/backend_abi.h"
@@ -157,6 +159,7 @@ struct BackendOptions {
   int gpu_layers = INT_MAX;  // dense layers retained before the streamed suffix
   bool expert_adapt = true, expert_global = false, expert_integer = true;
   int expert_simd = 512;  // upper bound on vector width for cold CPU dots
+  bool keep_expert_archive = true;
   int expert_prefill_min = -1;  // minimum prompt rows for streamed GPU experts, zero uses the CPU path
   int expert_threads = 0;  // maximum CPU workers including the submitting thread, zero uses the default
   int gpu_experts = INT_MAX;  // resident expert IDs [0, gpu_experts) at each MoE layer
@@ -180,8 +183,8 @@ inline bool apply_weight_caps(const flyx_open_options* options, BackendOptions* 
   if (!options) return true;
   const uint32_t maximum = uint32_t(INT_MAX) + 1;
   if (options->gpu_experts_plus_one > maximum || options->gpu_layers_plus_one > maximum) return false;
-  if (options->gpu_experts_plus_one) out->gpu_experts = int(options->gpu_experts_plus_one - 1);
-  if (options->gpu_layers_plus_one) out->gpu_layers = int(options->gpu_layers_plus_one - 1);
+  if (options->gpu_experts_plus_one) out->gpu_experts = flyx_decode_cap(options->gpu_experts_plus_one);
+  if (options->gpu_layers_plus_one) out->gpu_layers = flyx_decode_cap(options->gpu_layers_plus_one);
   return true;
 }
 
@@ -507,13 +510,20 @@ uint64_t device_reserve_floor();
 
 namespace flyx::cuda { struct ColdWorkspace; struct LayerRing; }
 
-struct flyx_bmodel {
-  std::shared_ptr<flyx::cuda::ColdWorkspace> cold;
-  std::shared_ptr<flyx::cuda::LayerRing> layer_ring;
-  std::vector<void*> allocs;
-  size_t bytes = 0;
-  std::vector<void*> host_allocs;  // pinned host memory (host_alloc / host_pinned)
-  size_t host_bytes = 0;
+// Device and pinned allocations outlive all model-owned DMA streams and graph handles.
+struct ModelAllocations {
+  std::unordered_map<void*, size_t> allocs;
+  std::vector<void*> host_allocs;
+  size_t bytes = 0, host_bytes = 0, pinned_bytes = 0;
+  ~ModelAllocations() {
+    for (const auto& entry : allocs) cudaFree(entry.first);
+    for (void* p : host_allocs) cudaFreeHost(p);
+  }
+};
+
+struct flyx_bmodel : ModelAllocations {
+  std::unique_ptr<flyx::cuda::OffloadRuntime> offload;
+  bool allows_graphs() const { return opt.graphs && (!offload || offload->allows_graphs()); }
   size_t vision_dev_bytes = 0, vision_host_bytes = 0, vision_disk_bytes = 0;
   flyx::cuda::VisionDiskStore vision_disk;  // auto-deleted temp file when vision=disk (0 VRAM, 0 locked host RAM)
   // Tiny 2-slot pinned host ring (<= 16 MiB total) allocated lazily on first disk encode_vision() under prefill_mu.
@@ -572,12 +582,6 @@ struct flyx_bmodel {
   std::map<const flyx_plan*, flyx::cuda::PlanGraph> round_graphs;
 
   ~flyx_bmodel() {
-    if (batch && verbose && batch->launched)
-      std::fprintf(stderr, "flyx-cuda: %ld rounds of several sequences (%.2f sequences, %.1f rows each), %ld graphs "
-                   "captured\n", batch->launched, double(batch->sequences) / batch->launched,
-                   double(batch->rows) / batch->launched, batch->captured);
-    cold.reset();
-    layer_ring.reset();  // finish copies before freeing their host and device buffers
     batch.reset();  // its graphs and stream before the memory they use
     if (prefill_ev) cudaEventDestroy(prefill_ev);
     if (prefill_embeds) cudaFree(prefill_embeds);
@@ -585,15 +589,20 @@ struct flyx_bmodel {
     if (prefill_pos3d) cudaFree(prefill_pos3d);
     flyx::cuda::prefill_vmm_free(this);
     for (void* p : prefill_allocs) cudaFree(p);
-    for (void* p : allocs) cudaFree(p);
-    for (void* p : host_allocs) cudaFreeHost(p);
     if (vision_disk_stage) cudaFreeHost(vision_disk_stage);
   }
   template <class T>
   T* alloc(size_t n) {
-    void* p = flyx::cuda::device_malloc(n * sizeof(T));
-    allocs.push_back(p);
-    bytes += n * sizeof(T);
+    const size_t amount = flyx::cuda::size_mul(n, sizeof(T));
+    const size_t total = flyx::cuda::size_add(bytes, amount);
+    void* p = flyx::cuda::device_malloc(amount);
+    try {
+      allocs.emplace(p, amount);
+    } catch (...) {
+      cudaFree(p);
+      throw;
+    }
+    bytes = total;
     return static_cast<T*>(p);
   }
   // Host memory the kernels read in place over the bus (pinned, mapped), for a table the kernels only gather rows
@@ -601,10 +610,14 @@ struct flyx_bmodel {
   // under WSL, which reads no faster here); uploads to it go through cudaMemcpyDefault.
   template <class T>
   T* host_alloc(size_t n) {
+    const size_t amount = flyx::cuda::size_mul(n, sizeof(T));
+    const size_t total = flyx::cuda::size_add(host_bytes, amount);
+    host_allocs.reserve(host_allocs.size() + 1);
     void* p = nullptr;
-    CK(cudaHostAlloc(&p, n * sizeof(T), cudaHostAllocMapped));
+    CK(cudaHostAlloc(&p, amount, cudaHostAllocMapped));
     host_allocs.push_back(p);
-    host_bytes += n * sizeof(T);
+    host_bytes = total;
+    pinned_bytes += amount;
     void* d = nullptr;
     CK(cudaHostGetDevicePointer(&d, p, 0));
     return static_cast<T*>(d);
@@ -614,19 +627,23 @@ struct flyx_bmodel {
   template <class T>
   T* host_pinned(size_t n) {
     if (n == 0) return nullptr;
+    const size_t amount = flyx::cuda::size_mul(n, sizeof(T));
+    const size_t total = flyx::cuda::size_add(host_bytes, amount);
+    host_allocs.reserve(host_allocs.size() + 1);
     void* p = nullptr;
-    CK(cudaHostAlloc(&p, n * sizeof(T), cudaHostAllocDefault));
+    CK(cudaHostAlloc(&p, amount, cudaHostAllocDefault));
     host_allocs.push_back(p);
-    host_bytes += n * sizeof(T);
+    host_bytes = total;
+    pinned_bytes += amount;
     return static_cast<T*>(p);
   }
   // Gives back an allocation of n bytes made by alloc().
   void release(void* p, size_t n) {
-    auto it = std::find(allocs.begin(), allocs.end(), p);
-    if (it == allocs.end()) return;
-    allocs.erase(it);
-    bytes -= n;
+    auto it = allocs.find(p);
+    if (it == allocs.end() || it->second != n) throw std::logic_error("invalid model allocation release");
     CK(cudaFree(p));
+    bytes -= n;
+    allocs.erase(it);
   }
 };
 
@@ -656,7 +673,6 @@ struct flyx_plan {
   std::vector<flyx_node> nodes;
   std::vector<const flyx::cuda::Block*> block;      // per node: the block it runs (null: none)
   std::vector<const flyx::cuda::RegionImpl*> impl;  // per node
-  std::vector<flyx::cuda::RegionFn> streamed_body;   // only on plans that read streamed weights
   // A round of a tree of given drafts (FLYX_GIVEN_TREE) or of its drafter's (FLYX_DRAFT_TREE): its rows by the
   // session's TreeRows, the accepted path compacted after the accept; tree_kv: the K/V caches its attention layers
   // write (flyx_seq::kv indices).  drafted: the drafter writes the TreeRows in the round, the launch does not.
@@ -693,6 +709,7 @@ constexpr int kPrefillSplits = 8;
 }  // namespace flyx::cuda
 
 struct flyx_seq {
+  int* route_error = nullptr;  // sticky invalid-ID flag for a streamed prefill
   flyx_bmodel* m;
   int max_ctx = 0, cap = 0, rows_cap = 0;
   cudaStream_t st = nullptr;

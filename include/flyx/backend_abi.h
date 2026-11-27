@@ -142,6 +142,10 @@ static inline int32_t flyx_block_bytes(int32_t dtype) {
   }
 }
 
+/* Residency caps use zero for automatic, one for all-cold. */
+FLYX_ABI_INLINE uint32_t flyx_encode_cap(int32_t cap) { return cap < 0 ? 0u : (uint32_t)cap + 1u; }
+FLYX_ABI_INLINE int32_t flyx_decode_cap(uint32_t value) { return value ? (int32_t)(value - 1u) : -1; }
+
 /* A tensor of the model file (host memory, read-only). */
 typedef struct {
   const char* name;            /* the file's name for it, e.g. "target.L3.attn.q" */
@@ -1033,7 +1037,7 @@ typedef struct {
   /* ABI 56: supported placement axes and additional host storage required for the requested split.
    * Zero for both counts means that this backend/model cannot offload weights. */
   int32_t experts_per_layer, dense_layers;
-  uint64_t offload_host_bytes;
+  uint64_t offload_pinned_bytes, offload_pageable_bytes;
 } flyx_load_estimate;
 
 /* Device memory as the backend sees it (0 = unknown, e.g. a CPU backend). */

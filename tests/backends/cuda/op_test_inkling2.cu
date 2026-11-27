@@ -2,6 +2,8 @@
 // CUDA kernel tests for Inkling-2 target ops (softcap, AttnRes, loop control, ShortConv,
 // relative-position-bias attention, sparse MoE) and DSpark drafter kernels against float64 refs.
 #include <cstdlib>
+#include <limits>
+#include "backends/cuda/kernels/block_layout.h"
 
 #include "backends/cuda/loader/exact_bf16.h"
 #include "tests/backends/cuda/op_test.cuh"
@@ -1796,12 +1798,25 @@ void test_inkling2_moe() {
     const std::vector<int> permutation = {4, 1, 2, 0, 5, 3};
     CK(cudaMemcpy(d, ids.data(), ids.size() * sizeof(int), cudaMemcpyHostToDevice));
     CK(cudaMemcpy(slots, permutation.data(), ids.size() * sizeof(int), cudaMemcpyHostToDevice));
-    moe_place_ids(d, int(ids.size()), slots, histogram, 0);
+    moe_place_ids(d, int(ids.size()), int(permutation.size()), slots, histogram, nullptr, 0);
     CK(cudaMemcpy(actual.data(), d, ids.size() * sizeof(int), cudaMemcpyDeviceToHost));
     if (actual != std::vector<int>({2, 3, 4, 0, 5, 1})) throw std::runtime_error("expert permutation");
     std::vector<uint32_t> counts(ids.size());
     CK(cudaMemcpy(counts.data(), histogram, counts.size() * sizeof(uint32_t), cudaMemcpyDeviceToHost));
     if (counts != std::vector<uint32_t>(ids.size(), 1)) throw std::runtime_error("expert histogram");
+    const std::vector<int> invalid_ids = {-1, 6, 5, 2, 2, 0};
+    int* invalid = dev<int>(1);
+    counts.assign(ids.size(), UINT32_MAX);
+    CK(cudaMemcpy(d, invalid_ids.data(), invalid_ids.size() * sizeof(int), cudaMemcpyHostToDevice));
+    CK(cudaMemcpy(histogram, counts.data(), counts.size() * sizeof(uint32_t), cudaMemcpyHostToDevice));
+    moe_place_ids(d, int(ids.size()), int(permutation.size()), slots, histogram, invalid, 0);
+    int flag = 0;
+    CK(cudaMemcpy(&flag, invalid, sizeof(flag), cudaMemcpyDeviceToHost));
+    CK(cudaMemcpy(actual.data(), d, ids.size() * sizeof(int), cudaMemcpyDeviceToHost));
+    CK(cudaMemcpy(counts.data(), histogram, counts.size() * sizeof(uint32_t), cudaMemcpyDeviceToHost));
+    if (!flag || actual != std::vector<int>({0, 0, 3, 2, 2, 4}) || counts != std::vector<uint32_t>(6, UINT32_MAX))
+      throw std::runtime_error("invalid expert ID or histogram saturation");
+    cudaFree(invalid);
     cudaFree(slots);
     cudaFree(histogram);
     cudaFree(d);
@@ -1864,6 +1879,27 @@ void test_inkling2_moe() {
     cudaFree(dw);
   }
 
+  {
+    const Vec logits(9, std::numeric_limits<double>::quiet_NaN());
+    float* scores = up(logits);
+    int* ids = dev<int>(4);
+    float* weights = dev<float>(4);
+    moe_route(scores, nullptr, 1, 9, 4, false, true, 1e-20f, 1.f, ids, weights, TL);
+    if (down_i(ids, 4) != std::vector<int>({0, 1, 2, 3})) throw std::runtime_error("NaN softmax route ranks");
+    cudaFree(scores);
+    cudaFree(ids);
+    cudaFree(weights);
+  }
+
+  {
+    constexpr int pairs = 65537;
+    float* input = up(Vec(size_t(pairs) * 2, 1.));
+    float* output = dev<float>(pairs);
+    situ_rows(input, 2, 1, 0.f, 0.f, output, 1, pairs, 0);
+    expect("streamed pair activation beyond CUDA grid.y", down(output, pairs), Vec(pairs, ops::silu(1.)), 1e-6);
+    cudaFree(output);
+    cudaFree(input);
+  }
   // 2. situ_rows: SiTU and SwiGLU fallback.
   {
     const int R = 13, I = 192;
@@ -2048,6 +2084,44 @@ void test_inkling2_moe() {
     // Gate 4 includes prefill, verify and scratch-free calls.
     moe_down(d_act_fused, I, w_dn, d_eidx, d_ew, R, top_k, H, I, d_y_grouped, H, false, &msc, TL);
     Vec got_y_grp = down(d_y_grouped, size_t(R) * H);
+    // Three banks with a singleton final expert. Each slice sees the original logical route IDs.
+    auto slice_bank = [&](ExpertMat m, int first, int count, int cols) {
+      const size_t values = size_t(first) * m.N * cols;
+      if (m.w) m.w += values;
+      if (m.q) m.q += values / 2;
+      if (m.s) m.s += values / 16;
+      if (m.rs) m.rs += first;
+      if (m.packed()) {
+        const auto format = blocks_layout(m.blk.dtype);
+        const size_t blocks = values / format.values;
+        m.blk.data += blocks * format.stride;
+        m.blk.scales += blocks * format.scales;
+        m.blk.rows = count * m.N;
+      }
+      m.n_experts = count;
+      return m;
+    };
+    for (int base = 0; base < R;) {
+      const int rows = std::min(8, R - base);
+      const size_t pair = size_t(base) * top_k;
+      auto scratch = msc;
+      scratch.down_buf += pair * H;
+      for (int first = 0; first < E; first += 7) {
+        for (int at = first; at < std::min(first + 7, E); at += 4) {
+          const int count = std::min({4, E - at, first + 7 - at});
+          auto gu = slice_bank(w_gu, at, count, H);
+          moe_bank_gate_up(d_x + size_t(base) * H, H, gu, d_eidx + pair, rows, top_k, I, H, beta, lb, true,
+                           d_act_unfused + pair * I, I, &scratch, TL, false, nullptr, {at, count});
+          auto dn = slice_bank(w_dn, at, count, I);
+          moe_bank_down(d_act_fused + pair * I, I, dn, d_eidx + pair, d_ew + pair, rows, top_k, H, I,
+                        d_y_direct + size_t(base) * H, H, false, &scratch, TL, nullptr, 0, {{at, count}, true});
+        }
+      }
+      base += rows;
+    }
+    moe_sum_slots(msc.down_buf, d_ew, R, top_k, H, d_y_direct, false, TL.st);
+    expect_bits("expert bank gate/up " + label, down(d_act_unfused, size_t(R) * top_k * I), got_act_f);
+    expect_bits("expert bank down " + label, down(d_y_direct, size_t(R) * H), got_y_grp);
     const int rr = 19;
     float* d_act_1 = dev<float>(size_t(top_k) * I);
     float* d_y_1 = dev<float>(size_t(H));

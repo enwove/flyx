@@ -111,7 +111,7 @@ int hook_estimate_load(const flyx_model_desc* desc, const flyx_open_options* opt
     out->experts_per_layer = g_expert_caps ? 8 : 0;
     out->dense_layers = g_layer_caps ? 8 : 0;
     out->weights_bytes = g_target_bytes + uint64_t(kept) * (64ull << 20);
-    out->offload_host_bytes = uint64_t(8 - kept) * (64ull << 20);
+    out->offload_pageable_bytes = uint64_t(8 - kept) * (64ull << 20);
   }
   out->target_kv_bytes_per_position = g_kv_row_bytes;
   out->draft_weights_bytes = draft_b;

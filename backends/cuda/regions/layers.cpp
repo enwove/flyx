@@ -3,7 +3,7 @@
 // region; fused=true is the override regions/plan.cpp may pick.
 #include <bit>
 
-#include "backends/cuda/runtime/cold_experts.h"
+#include "backends/cuda/runtime/offload/expert_store.h"
 
 #include "backends/cuda/regions/layers.h"
 

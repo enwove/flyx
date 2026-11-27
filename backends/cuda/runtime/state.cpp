@@ -1,6 +1,6 @@
 // Copyright 2026 The flyx Authors. SPDX-License-Identifier: Apache-2.0
 // Sequence state and row buffers, sized from the blocks and the state table.
-#include "backends/cuda/runtime/cold_experts.h"
+#include "backends/cuda/runtime/offload/expert_store.h"
 #include "backends/cuda/runtime/checked_size.h"
 #include "backends/cuda/runtime/window_ring.h"
 #include "backends/cuda/backend.h"
@@ -496,18 +496,21 @@ bool take_method(const flyx_bmodel* m, const flyx_seq_layout* layout, flyx_seq* 
   return true;
 }
 
-uint64_t query_pinned_budget(const flyx_bmodel* m) {
-  if (m->opt.pageable_kv == PageableKvMode::off) return UINT64_MAX;
-  if (m->opt.pageable_kv == PageableKvMode::on) return 0;
-  if (m->opt.pinned_host_mb >= 0) return uint64_t(m->opt.pinned_host_mb) << 20;
+uint64_t query_pinned_budget(const BackendOptions& options) {
+  if (options.pinned_host_mb >= 0) return uint64_t(options.pinned_host_mb) << 20;
   return host_pinned_budget();
 }
 
 namespace {
+uint64_t kv_pinned_budget(const BackendOptions& options) {
+  if (options.pageable_kv == PageableKvMode::off) return UINT64_MAX;
+  if (options.pageable_kv == PageableKvMode::on) return 0;
+  return query_pinned_budget(options);
+}
 
 int new_seq(flyx_bmodel* m, const flyx_seq_layout* layout, bool capture_only, flyx_seq** out) {
   // Sample the WDDM pinned budget once so dry-run sizing and real allocation choose the identical hybrid split.
-  const uint64_t pinned_budget = query_pinned_budget(m);
+  const uint64_t pinned_budget = kv_pinned_budget(m->opt);
   // Dry-run first to measure the exact arena sizes so the real build performs one device and one host allocation
   // instead of hundreds of per-layer cudaMalloc/cudaHostAlloc calls.
   flyx_seq probe;
@@ -534,7 +537,7 @@ int new_seq(flyx_bmodel* m, const flyx_seq_layout* layout, bool capture_only, fl
   s->arena_host_bytes = probe.arena_host_bytes;
   try {
     build_seq(m, layout->max_ctx, s.get());
-    if (m->cold && !capture_only) cold_sequence_open(m);
+    if (m->offload && !capture_only) m->offload->on_session_open(m);
   } catch (const OutOfDeviceMemory& e) {
     return fail_oom(std::string("seq_new: ") + e.what());
   } catch (const std::exception& e) {
@@ -564,7 +567,7 @@ int seq_size(flyx_bmodel* m, const flyx_seq_layout* layout, flyx_seq_size* out) 
   flyx_seq s;
   if (!take_method(m, layout, &s)) return fail("a K/V layout this backend does not read");
   s.dry = true;
-  s.pinned_budget = query_pinned_budget(m);
+  s.pinned_budget = kv_pinned_budget(m->opt);
   s.device_positions = std::max(0, layout->device_positions);
   s.copy_host = std::max(0, layout->copy_host);
   size_t room = 0;  // for its round graphs: the device memory the driver takes for them
@@ -1379,7 +1382,7 @@ void build_seq(flyx_bmodel* m, int32_t max_ctx, flyx_seq* s) {
   }
   s->rows_cap = prefill_rows;
   s->profile = m->opt.profile;
-  s->graphs = m->opt.graphs;
+  s->graphs = m->allows_graphs();
   if (!s->dry) {
     CK(cudaStreamCreateWithFlags(&s->st, cudaStreamNonBlocking));
     create_side(&s->side);
@@ -1426,6 +1429,7 @@ void build_seq(flyx_bmodel* m, int32_t max_ctx, flyx_seq* s) {
   if (!s->dry) CK(cudaHostGetDevicePointer(reinterpret_cast<void**>(&s->ring_host_dev), s->ring_host, 0));
   s->tok_host = s->pinned_alloc<int>(size_t(prefill_rows));
   s->P = s->alloc<DevParams>(1);
+  if (m->offload && m->offload->experts()) s->route_error = s->alloc<int>(1);
   s->G = s->alloc<DevGen>(1);
   s->mask_words = (m->vocab + 31) / 32;
   s->mask = s->alloc<uint32_t>(size_t(s->mask_words));
@@ -1565,7 +1569,8 @@ void build_seq(flyx_bmodel* m, int32_t max_ctx, flyx_seq* s) {
 
 void seq_free(flyx_seq* s) {
   // -v: what its rounds ran from (a run's rounds without a graph: the sum of these lines).
-  if (s && s->m && s->m->verbose && s->m->opt.graphs && (s->graph_stats.from_graph || s->graph_stats.without_graph))
+  if (s && s->m && s->m->verbose && s->m->allows_graphs() &&
+      (s->graph_stats.from_graph || s->graph_stats.without_graph))
     std::fprintf(stderr, "flyx-cuda: a session's rounds: %llu from a graph, %llu without; %llu graphs made, %.2f MiB "
                          "held of its room's %.2f\n", (unsigned long long)s->graph_stats.from_graph,
                  (unsigned long long)s->graph_stats.without_graph, (unsigned long long)s->graph_stats.captured,
@@ -1596,7 +1601,7 @@ void seq_free(flyx_seq* s) {
   }
   auto* m = s && !s->capture_only ? s->m : nullptr;
   delete s;
-  if (m && m->cold) cold_sequence_close(m);
+  if (m && m->offload) m->offload->on_session_close(m);
 }
 
 void alloc_batch(flyx_bmodel* m) {
