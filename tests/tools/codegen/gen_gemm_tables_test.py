@@ -5,6 +5,7 @@ table that inherits another takes the families it lacks from it, and tables that
     python tests/tools/codegen/gen_gemm_tables_test.py SOURCE_DIR
 """
 import contextlib
+import glob
 import importlib.util
 import io
 import os
@@ -383,5 +384,37 @@ _, err = generate({"a": 'sku = "a"\n', "b": 'sku = "a"\n'})
 check(err is not None and "two tables" in err, "refused: two tables of one sku", err)
 _, err = generate({"a": 'sku = "a"\narchitectures = ["8.9"]\n', "b": 'sku = "b"\narchitectures = ["8.9"]\n'})
 check(err is not None and "already serves" in err, "refused: two tables of one architecture", err)
+_, err = generate({"a": 'sku = "a"\ndevices = ["GPU A"]\n', "b": 'sku = "b"\ndevices = ["GPU B", "GPU A"]\n'})
+check(err is not None and "already named" in err, "refused: two tables of one device name", err)
+
+# The committed tables: they generate, each is variants/sm<cc>/tables/<sku>.toml, and each CUDA device name it gives
+# picks it (kSkus, in the generator's order of the paths) and no other table.
+committed = sorted(glob.glob(os.path.join(ROOT, "backends/cuda/variants/*/tables/*.toml")))
+with tempfile.TemporaryDirectory() as d:
+    out = os.path.join(d, "gemm_tables.inc")
+    try:
+        with contextlib.redirect_stderr(io.StringIO()):
+            gen.main(["--candidates", CANDIDATES, "--out", out] + committed)
+        text, err = open(out, encoding="utf-8").read(), None
+    except SystemExit as e:
+        text, err = None, str(e)
+check(text is not None, f"the {len(committed)} committed tables generate", err)
+if text is not None:
+    skus = [re.match(r'\{"([^"]+)", kDevices(\d+), (\d+),', e) for e in entries(text, "kSkus")]
+    names = {}
+    for path in committed:
+        t = gen._load_toml(path)
+        stem = os.path.splitext(os.path.basename(path))[0]
+        arch_dir = os.path.basename(os.path.dirname(os.path.dirname(path)))
+        check(t["sku"] == stem, f"{arch_dir}/tables/{stem}.toml: its sku is its name", t["sku"])
+        check(re.fullmatch(r"sm\d+", arch_dir) is not None, f"{stem}: under an sm<cc> directory", arch_dir)
+        check(bool(t.get("devices")) and all(n.startswith("NVIDIA ") for n in t["devices"]),
+              f"{stem}: names a CUDA device", t.get("devices"))
+        for n in t.get("devices", []):
+            names.setdefault(n, []).append(t["sku"])
+    for n, owners in sorted(names.items()):
+        i = next((m for m in skus if m and m.group(1) == owners[0]), None)
+        listed = i is not None and re.search(r"kDevices%s\[\] = \{[^}]*\"%s\"" % (i.group(2), re.escape(n)), text)
+        check(len(owners) == 1 and bool(listed), f"{n!r} picks {owners[0]} alone", owners)
 
 sys.exit(finish("gen_gemm_tables_test"))

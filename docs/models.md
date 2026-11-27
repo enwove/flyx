@@ -150,4 +150,4 @@ A target's own adapters (a **V-LoRA**: LoRA beside the target's linears, e.g. bi
 
 > **8–10 GB GPUs (e.g., RTX 3080 10 GB, RTX 4060 / 5060 8 GB):** Cannot fit 27B weights alongside session recurrent state; use smaller models such as `Qwen/Qwen3.5-4B` (BF16/NVFP4/GGUF). On tight 8 GB desktop GPUs (where Windows WDDM reserves VRAM for desktop composition), `flyx` queries NVML free memory and automatically trims speed-only auxiliary copies (e.g., duplicate W12/FP8 head copies) when needed to fit prefill workspace and sessions.
 >
-> **GPU tuning tables:** Pre-tuned dispatch tables ship under `backends/cuda/variants/` for RTX 3080, RTX 4080 SUPER, RTX 4090, L4, L40S, RTX 5060 Ti, RTX 5070 Ti, RTX 5080, RTX 5090, A100 PCIe 40 GB, and H100 80GB HBM3 (other GPUs inherit their architecture table or defaults).
+> **GPU tuning tables:** Pre-tuned dispatch tables ship under `backends/cuda/variants/` for RTX 3060, RTX 3080, RTX 3090, RTX 4060 Ti, RTX 4070 Ti SUPER, RTX 4080 SUPER, RTX 4090, L4, L40S, RTX 5060 Ti, RTX 5070, RTX 5070 Ti, RTX 5080, RTX 5090, A100 PCIe 40 GB, and H100 80GB HBM3 (other GPUs inherit their architecture table or defaults).
