@@ -3832,38 +3832,39 @@ void graph_count_capture(const std::string& model, const std::string& backend, c
 
 }  // namespace
 
-// Sessions and engines give their device memory back: the device's free memory before and after 20 sessions, and
-// after an engine, come and go.  That memory is the whole GPU's, so this runs as a test of its own that runs alone
+// Sessions and engines give their device memory back: what this process holds of the device (device_held: its own
+// share where the system tells it, else the whole device's use) before and after 20 sessions, and after an engine,
+// come and go.  The whole device's use is every program's, so this runs as a test of its own that runs alone
 // (--device-memory; cuda_device_memory in tests/CMakeLists.txt), and the golden tests beside each other.
 int device_memory(const std::string& model, const std::string& backend, const std::vector<int32_t>& prompt) {
   auto spec = make(model, backend, true);
   auto plain = make(model, backend, false, "none");
-  auto free_now = [&](Engine* e) {
-    flyx_memory_info mi{};
-    e->api()->memory(e->bmodel(), &mi);
-    return static_cast<int64_t>(mi.free);
-  };
-  const int64_t slack = 64ll << 20;  // other users of the GPU (on WSL, the desktop)
+  // The whole device's use moves with other programs too (on WSL, the desktop): 64 MiB.  The process's own share came
+  // back to the KiB in every run (RTX 5070 Ti, driver 610.88, also beside another program taking and freeing up to
+  // 1 GiB every few seconds): 8 MiB, four of the driver's 2 MiB pages, and a leak of 1 MiB a session shows.
+  flyx_memory_info mi{};
+  plain->api()->memory(plain->bmodel(), &mi);
+  const int64_t slack = mi.process ? 8ll << 20 : 64ll << 20;
   std::string err;
-  const int64_t before = free_now(plain.get());
+  const int64_t before = device_held(plain.get());
   for (int i = 0; i < 20; ++i) {
     Session t(spec.get());
     if (!init_checked(t)) break;
     gen(t, prompt, 8);
   }
-  const int64_t after = free_now(plain.get());
-  check(after >= before - slack,
-        "20 sessions made and freed: device memory back (" + std::to_string((before - after) >> 20) + " MB apart)");
-  const int64_t e0 = free_now(plain.get());
+  const int64_t after = device_held(plain.get());
+  check(after <= before + slack,
+        "20 sessions made and freed: device memory back (" + std::to_string((after - before) >> 20) + " MB apart)");
+  const int64_t e0 = device_held(plain.get());
   {
     auto extra = make(model, backend, true);
     Session t(extra.get());
     init_checked(t);
     gen(t, prompt, 8);
   }
-  const int64_t e1 = free_now(plain.get());
-  check(e1 >= e0 - slack,
-        "an engine loaded and unloaded: device memory back (" + std::to_string((e0 - e1) >> 20) + " MB apart)");
+  const int64_t e1 = device_held(plain.get());
+  check(e1 <= e0 + slack,
+        "an engine loaded and unloaded: device memory back (" + std::to_string((e1 - e0) >> 20) + " MB apart)");
   graph_memory(model, backend, prompt, "all", 0);
   graph_after_batch(model, backend, prompt);
   graph_switching(model, backend, prompt);
