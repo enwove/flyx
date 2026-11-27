@@ -25,10 +25,29 @@ void require(bool ok, const char* what) {
   if (!ok) throw std::runtime_error(std::string(what) + ": " + g_error);
 }
 
+void certified_head_capability() {
+  flyx_bmodel m;
+  HeadBlock h{};
+  h.hidden = 32;
+  h.vocab = 64;
+  auto* w = m.alloc<bf16>(size_t(h.hidden) * h.vocab);
+  CK(cudaMemset(w, 0, size_t(h.hidden) * h.vocab * sizeof(bf16)));
+  h.w = w;
+  h.softcap = 1.f;
+  m.blocks.emplace_back(h);
+  make_head_fp8(&m);
+  require(m.opt.kernels.head_cert && !m.has_certified_head, "softcapped head preserves its requested option");
+  std::get<HeadBlock>(m.blocks.front()).softcap = 0.f;
+  const size_t base = m.bytes;
+  make_head_fp8(&m);
+  require(m.has_certified_head && m.bytes > base, "certified head is available after binding its planes");
+  require(trim(&m, 1) > 0 && m.bytes == base && !m.has_certified_head && m.opt.kernels.head_cert,
+          "trimming the certificate preserves the requested option");
+}
+
 void oom_paths() {
   flyx_bmodel m;
   m.hidden = m.vocab = m.need.k_max = 64;
-  m.opt.graphs = true;
   flyx_node node{FLYX_NODE_COMMIT, 0, 0};
   flyx_program prefill{FLYX_PHASE_PREFILL, 0, 32, 1, &node};
   flyx_plan* plan = nullptr;
@@ -404,9 +423,10 @@ void expert_estimates() {
       opts.gpu_experts_plus_one = flyx_encode_cap(hot);
       flyx_load_estimate est{};
       require(estimate_load(&d, &opts, 0, 0, &est) == 0, "estimate complete expert pair");
-      flyx_bmodel m;
-      m.opt.packed_blocks = c.packed;
-      m.opt.gpu_experts = hot;
+      BackendOptions options;
+      options.packed_blocks = c.packed;
+      options.gpu_experts = hot;
+      flyx_bmodel m(options);
       auto plan = plan_offload(d, m.opt);
       WeightLoader loader(&m, d);
       MoeBlock f{};
@@ -554,8 +574,9 @@ void layer_estimates() {
   d.weights = weights.data();
   d.n_weights = int(weights.size());
   for (bool bounce : {false, true}) {
-    flyx_bmodel m;
-    m.opt.gpu_layers = 0;
+    BackendOptions options;
+    options.gpu_layers = 0;
+    flyx_bmodel m(options);
     auto plan = plan_offload(d, m.opt);
     plan.fit_pinned(bounce ? plan.stream.ring_bytes : UINT64_MAX);
     require(plan.bounce_layers == bounce && plan.stream.ring_bytes > 0, "dense archive pinned budget fallback");
@@ -609,8 +630,9 @@ void packed_drafter(bool compact) {
   flyx_model_desc desc{};
   desc.n_weights = 1;
   desc.weights = &weight;
-  flyx_bmodel m;
-  m.opt.draft_weights = compact ? interfaces::DraftWeightsMode::kNvfp4 : interfaces::DraftWeightsMode::kAuto;
+  BackendOptions options;
+  options.draft_weights = compact ? interfaces::DraftWeightsMode::kNvfp4 : interfaces::DraftWeightsMode::kAuto;
+  flyx_bmodel m(options);
   WeightLoader loader(&m, desc);
   const Lin lin = loader.lin_quant(0, DraftQuant::kNvfp4);  // DFlash2 beside an NVFP4 target
   loader.finish();
@@ -759,6 +781,7 @@ int main() {
     residual_query_extent();
     drafter_dimensions();
     staging_width();
+    certified_head_capability();
     oom_paths();
     memory_figures();
     pieces_and_alias();

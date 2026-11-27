@@ -98,25 +98,19 @@ void make_head_fp8(flyx_bmodel* m) {
       } catch (const OutOfDeviceMemory& e) {
         if (ko.head_fp8) throw;
         release_cert(m, h);
-        ko.head_cert = false;
         if (m->verbose)
           std::fprintf(stderr, "flyx-cuda: no room for the certified head (%s); the whole head\n", e.what());
-        continue;
+        break;
       }
       quantize_fp8_rows(h->w, h->vocab, h->hidden, h->w8, h->rs8, 0);
       if (h->cert) {
+        m->has_certified_head = true;
         head_cert_coef(h->w, h->w8, h->rs8, h->vocab, h->hidden, h->cert, 0);
         if (m->verbose)
           std::fprintf(stderr, "flyx-cuda: certified head: an e4m3 copy of %.0f MB screens the %d x %d head\n",
                        double(h->vocab) * h->hidden / 1e6, h->vocab, h->hidden);
       }
     }
-  if (ko.head_cert && !ko.head_fp8) {
-    bool any = false;
-    for (const Block& b : m->blocks)
-      if (const auto* h = std::get_if<HeadBlock>(&b); h && h->cert) any = true;
-    ko.head_cert = any;
-  }
   CK(cudaDeviceSynchronize());
 }
 
@@ -191,10 +185,10 @@ uint64_t trim(flyx_bmodel* m, uint64_t bytes) {
     if (w12 && m->verbose)
       std::fprintf(stderr, "flyx-cuda: the W12 head given back (%.2f GB): the bf16 head, the same bits\n", w12 / 1e9);
     if (w12 >= bytes) return w12;
-    auto& ko = m->opt.kernels;
-    if (ko.head_cert && !ko.head_fp8) {
+    if (m->has_certified_head) {
       heads([&](HeadBlock& h) { release_cert(m, &h); });
-      ko.head_cert = false;  // and no session takes head_certify's scratch (rounds of several borrow a session's)
+      m->has_certified_head =
+          false;  // and no session takes head_certify's scratch (rounds of several borrow a session's)
       if (m->verbose)
         std::fprintf(stderr, "flyx-cuda: the certified head given back (%.2f GB): the whole head chooses, the same "
                      "tokens\n", (before - m->bytes - w12) / 1e9);

@@ -686,30 +686,29 @@ int open_model(const flyx_model_desc* desc, const flyx_open_options* opts, flyx_
   if (!desc || desc->n_weights < 0 || (desc->n_weights && !desc->weights) || desc->n_blocks < 0 ||
       (desc->n_blocks && !desc->blocks))
     return fail("invalid model tables");
-  auto m = std::make_unique<flyx_bmodel>();
-  m->verbose = opts ? opts->verbose : 0;
-  m->kv_fp8 = opts && opts->kv_fp8;
+  std::unique_ptr<flyx_bmodel> m;
   {
+    BackendOptions resolved;
     cudaDeviceProp prop{};
     cudaGetDeviceProperties(&prop, 0);
     std::string err;
     if (opts) {
-      if (opts->lock_auto_from) m->opt.kernels.strata_from = opts->auto_from;
-      m->opt.vision = opts->vision_device;
-      m->opt.vision_quant = opts->vision_quant;
+      if (opts->lock_auto_from) resolved.kernels.strata_from = opts->auto_from;
+      resolved.vision = opts->vision_device;
+      resolved.vision_quant = opts->vision_quant;
       if (opts->draft_weights == FLYX_DRAFT_WEIGHTS_NVFP4)
-        m->opt.draft_weights = interfaces::DraftWeightsMode::kNvfp4;
+        resolved.draft_weights = interfaces::DraftWeightsMode::kNvfp4;
       else if (opts->draft_weights == FLYX_DRAFT_WEIGHTS_Q8)
-        m->opt.draft_weights = interfaces::DraftWeightsMode::kQ8;
+        resolved.draft_weights = interfaces::DraftWeightsMode::kQ8;
       else if (opts->draft_weights == FLYX_DRAFT_WEIGHTS_EXACT)
-        m->opt.draft_weights = interfaces::DraftWeightsMode::kExact;
+        resolved.draft_weights = interfaces::DraftWeightsMode::kExact;
       else
-        m->opt.draft_weights = interfaces::DraftWeightsMode::kAuto;
+        resolved.draft_weights = interfaces::DraftWeightsMode::kAuto;
     }
-    if (!resolve_options(opts ? opts->options : nullptr, &m->opt, &err)) return fail("options: " + err);
-    if (!apply_weight_caps(opts, &m->opt)) return fail("GPU residency cap exceeds INT_MAX");
-    if (!nvfp4_inputs(*desc, &m->opt.kernels.prefill_fp4, &err)) return fail(err);
-    if (m->opt.embed == 0) {
+    if (!resolve_options(opts ? opts->options : nullptr, &resolved, &err)) return fail("options: " + err);
+    if (!apply_weight_caps(opts, &resolved)) return fail("GPU residency cap exceeds INT_MAX");
+    if (!nvfp4_inputs(*desc, &resolved.kernels.prefill_fp4, &err)) return fail(err);
+    if (resolved.embed == 0) {
       // embed=auto: host memory frees the table's GPU memory for a few kilobytes of reads a token; where 32 GB stay
       // free after the weights the memory is not missed, and a prefill pass reads its rows faster on the GPU (the
       // 27B's 4096 rows: 2.6 ms over PCIe on the RTX PRO 6000).
@@ -720,15 +719,15 @@ int open_model(const flyx_model_desc* desc, const flyx_open_options* opts, flyx_
       const bool roomy = gpu_memory(&free_b, &total_b) && free_b > weights &&
                          free_b - weights >= size_t(32) * 1000000000;
       cudaGetLastError();
-      m->opt.embed = roomy ? 2 : 1;
+      resolved.embed = roomy ? 2 : 1;
     }
-    if (m->opt.vision == FLYX_VISION_DEV_AUTO) {
+    if (resolved.vision == FLYX_VISION_DEV_AUTO) {
       size_t free_b = 0, total_b = 0;
       if (!gpu_memory(&free_b, &total_b) && cudaMemGetInfo(&free_b, &total_b) != cudaSuccess) {
         cudaGetLastError();
         free_b = 0;
       }
-      m->opt.vision = resolve_vision_device(*desc, m->opt, free_b, nullptr);
+      resolved.vision = resolve_vision_device(*desc, resolved, free_b, nullptr);
     }
     // FP8 tensor cores whose e4m3 sums are float32's: sm_90 and later.  Ada's (sm_89: L4, L40S) sum in fewer bits:
     // attention with q in e4m3 came out about 50 times past the op test's tolerance (relative error up to 1.5e-3
@@ -736,25 +735,29 @@ int open_model(const flyx_model_desc* desc, const flyx_open_options* opts, flyx_
     // vector on the binary16 tensor cores (attention_rows.cu). And the loaded code must have them.
     const int dev_cc = prop.major * 10 + prop.minor;
     const int code_cc = compiled_arch();
-    m->graph_prices = graph_prices(dev_cc);
-    m->opt.kernels.fp8_mma = dev_cc >= 90 && code_cc >= 89;
+    resolved.kernels.fp8_mma = dev_cc >= 90 && code_cc >= 89;
     // The GPU's own table, else its architecture's, unless the options name one or none.
     int arch_cc = 0;
-    if (m->opt.tuning_defaults) {
-      m->opt.kernels.tuning = -1;
-    } else if (!m->opt.tuning_table.empty()) {
-      m->opt.kernels.tuning = gemm_tuning_named(m->opt.tuning_table.c_str());
-      if (m->opt.kernels.tuning < 0)
-        return fail("options: no tuning table named \"" + m->opt.tuning_table + "\" (" + gemm_tuning_names() + ")");
-      if (!gemm_tuning_compiled_for(m->opt.kernels.tuning, code_cc))
-        return fail("options: tuning table \"" + m->opt.tuning_table + "\" is not compiled for loaded sm_" +
+    if (resolved.tuning_defaults) {
+      resolved.kernels.tuning = -1;
+    } else if (!resolved.tuning_table.empty()) {
+      resolved.kernels.tuning = gemm_tuning_named(resolved.tuning_table.c_str());
+      if (resolved.kernels.tuning < 0)
+        return fail("options: no tuning table named \"" + resolved.tuning_table + "\" (" + gemm_tuning_names() + ")");
+      if (!gemm_tuning_compiled_for(resolved.kernels.tuning, code_cc))
+        return fail("options: tuning table \"" + resolved.tuning_table + "\" is not compiled for loaded sm_" +
                     std::to_string(code_cc) + " code in this release build");
     } else {
-      m->opt.kernels.tuning = gemm_tuning_auto(prop.name, dev_cc, code_cc, &arch_cc);
+      resolved.kernels.tuning = gemm_tuning_auto(prop.name, dev_cc, code_cc, &arch_cc);
     }
-    m->opt.keep_expert_archive = m->opt.expert_prefill_min != 0;
-    if (m->opt.expert_prefill_min < 0) m->opt.expert_prefill_min = gemm_tuning_expert_prefill(m->opt.kernels.tuning);
-    if (!m->opt.pdl_given) m->opt.kernels.pdl = gemm_tuning_pdl(m->opt.kernels.tuning);
+    resolved.keep_expert_archive = resolved.expert_prefill_min != 0;
+    if (resolved.expert_prefill_min < 0)
+      resolved.expert_prefill_min = gemm_tuning_expert_prefill(resolved.kernels.tuning);
+    if (!resolved.pdl_given) resolved.kernels.pdl = gemm_tuning_pdl(resolved.kernels.tuning);
+    m = std::make_unique<flyx_bmodel>(std::move(resolved));
+    m->verbose = opts ? opts->verbose : 0;
+    m->kv_fp8 = opts && opts->kv_fp8;
+    m->graph_prices = graph_prices(dev_cc);
     if (m->verbose) {
       const std::string table = gemm_tuning_label(m->opt.kernels.tuning, arch_cc, dev_cc);
       int q8 = 0, a4 = 0;  // the weights' inputs, as their file says

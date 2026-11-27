@@ -28,6 +28,7 @@
 #include <string>
 #include <thread>
 #include <unordered_map>
+#include <utility>
 #include <vector>
 
 #include "backends/cuda/blocks.h"
@@ -522,6 +523,7 @@ struct ModelAllocations {
 };
 
 struct flyx_bmodel : ModelAllocations {
+  explicit flyx_bmodel(flyx::cuda::BackendOptions options = {}) : opt(std::move(options)) {}
   std::unique_ptr<flyx::cuda::OffloadRuntime> offload;
   bool allows_graphs() const { return opt.graphs && (!offload || offload->allows_graphs()); }
   size_t vision_dev_bytes = 0, vision_host_bytes = 0, vision_disk_bytes = 0;
@@ -572,7 +574,8 @@ struct flyx_bmodel : ModelAllocations {
   // threads take them one pass after the other.
   std::mutex prefill_mu;                // lock order: prefill_mu before batch->mu
   bool kv_fp8 = false;   // the target's K/V caches in e4m3 (open option)
-  flyx::cuda::BackendOptions opt;    // open()'s options; opt.kernels is what every launch for this model consults
+  bool has_certified_head = false;       // an optional head copy survived bind and trim
+  const flyx::cuda::BackendOptions opt;  // open()'s options; opt.kernels is what every launch for this model consults
   std::string active_draft_weights;  // effective drafter precision ("nvfp4", "q8", "exact", or "" when none)
   std::unique_ptr<flyx::cuda::BatchRounds> batch;  // rounds of several sequences
   // Round graphs: every round plan lowered (plan_free forgets it) and its graph's size, counted when a

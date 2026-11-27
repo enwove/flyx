@@ -1916,7 +1916,7 @@ int read_result(flyx_seq* s, flyx_round_result* out) {
 int read_logits(flyx_seq* s, int32_t row, float* out) {
   if (!s) return no_sequence("logits");
   if (row < 0 || row >= FLYX_MAX_ROWS) return fail("logits: row out of range");
-  if (s->m->opt.kernels.head_cert && !s->m->opt.kernels.head_fp8)
+  if (s->m->has_certified_head)
     return fail("logits: the certified head scores only the rows it must (backend option head_cert=0)");
   return guarded([&] {
     sync_stream(s);
