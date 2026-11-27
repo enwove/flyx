@@ -1398,12 +1398,20 @@ void bind(flyx_bmodel* m, const flyx_model_desc& d, LoadTimes* times) {
   // in the layout its kernels read), so a model without such a node holds nothing more for it.
   for (int w = 0; w < d.n_weights; ++w) {
     const flyx_tensor_view* v = d.weights[w].t;
-    if (v && v->ndim == 1 && v->shape[0] == d.hidden && WeightLoader::numbers(v) && !L.asked(w) && (!streaming || !streaming->asked(w)))
+    if (v && v->ndim == 1 && v->shape[0] == d.hidden && WeightLoader::numbers(v) && !L.asked(w) &&
+        (!streaming || !streaming->asked(w)))
       m->vec_weights[w] = L.vec(w);
   }
   m->vision_disk.flush_clean();
   L.finish();
-  if (times) *times = L.times();
+  if (times) {
+    *times = L.times();
+    if (streaming) {
+      times->pack_s += streaming->times().pack_s;
+      times->copy_s += streaming->times().copy_s;
+      times->file_bytes += streaming->times().file_bytes;
+    }
+  }
 }
 
 int resolve_vision_device(const flyx_model_desc& desc, const BackendOptions& opt, uint64_t free_vram,
@@ -1513,7 +1521,7 @@ int estimate_load(const flyx_model_desc* desc, const flyx_open_options* opts, ui
   }
   std::string err;
   if (!resolve_options(opts ? opts->options : nullptr, &bo, &err)) return -1;
-  apply_weight_caps(opts, &bo);
+  if (!apply_weight_caps(opts, &bo)) return fail("GPU residency cap exceeds INT_MAX");
 
   const int nw = desc->n_weights;
   std::vector<char> is_vis, is_drafter(size_t(nw), 0), is_dv_w(size_t(nw), 0), is_host_embed(size_t(nw), 0);
@@ -1695,7 +1703,8 @@ int estimate_load(const flyx_model_desc* desc, const flyx_open_options* opts, ui
   for (int i = 0; i < nw; ++i) {
     const flyx_tensor_view* v = desc->weights[i].t;
     if (!v || is_vis[size_t(i)]) continue;
-    if (!streamed.host_weight.empty() && streamed.host_weight[size_t(i)]) continue;
+    if (!streamed.host_weight.empty() && streamed.host_weight[size_t(i)] && !is_drafter[size_t(i)] &&
+        !is_dv_w[size_t(i)] && !is_expert[size_t(i)]) continue;
     if (is_expert[size_t(i)]) {
       const auto layout = expert_layout(desc->weights[i],bo.packed_blocks);
       const size_t e = size_t(v->shape[0]), hot = std::min(e,size_t(bo.gpu_experts));

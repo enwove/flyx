@@ -15,6 +15,7 @@ int fit_residency(int maximum, const std::function<bool(int)>& fits) {
     const int mid = lo + (hi - lo) / 2;
     if (fits(mid)) {
       best = mid;
+      if (mid == hi) break;
       lo = mid + 1;
     } else {
       hi = mid - 1;

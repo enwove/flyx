@@ -155,6 +155,7 @@ struct BackendOptions {
   int eagle4_beam = 4, eagle4_steps = 0;
   bool draft_kv16 = false;       // draft_kv=16: the MTP layer's cache in binary16 beside the target's FP8
   int gpu_layers = INT_MAX;  // dense layers retained before the streamed suffix
+  int expert_threads = 0;  // maximum CPU workers including the submitting thread, zero uses the default
   int gpu_experts = INT_MAX;  // resident expert IDs [0, gpu_experts) at each MoE layer
   bool packed_blocks = true;     // blocks=bf16 clears it
   int embed = 0;                 // embed=auto (0: host memory unless the GPU has room, open_model), host (1), gpu (2)
@@ -172,14 +173,13 @@ struct BackendOptions {
   int pinned_host_mb = -1;  // override pinned host budget in MiB (-1: query DXGI NON_LOCAL on Windows, unlimited else)
 };
 // The core's placement trial is authoritative over a backend default.
-inline void apply_weight_caps(const flyx_open_options* options, BackendOptions* out) {
-  if (!options) return;
-  auto set = [](uint32_t value, int* cap) {
-    if (value > uint32_t(INT_MAX) + 1u) throw std::runtime_error("GPU residency cap exceeds INT_MAX");
-    if (value) *cap = int(value - 1);
-  };
-  set(options->gpu_experts_plus_one, &out->gpu_experts);
-  set(options->gpu_layers_plus_one, &out->gpu_layers);
+inline bool apply_weight_caps(const flyx_open_options* options, BackendOptions* out) {
+  if (!options) return true;
+  const uint32_t maximum = uint32_t(INT_MAX) + 1;
+  if (options->gpu_experts_plus_one > maximum || options->gpu_layers_plus_one > maximum) return false;
+  if (options->gpu_experts_plus_one) out->gpu_experts = int(options->gpu_experts_plus_one - 1);
+  if (options->gpu_layers_plus_one) out->gpu_layers = int(options->gpu_layers_plus_one - 1);
+  return true;
 }
 
 bool parse_options(const char* text, BackendOptions* o, std::string* err);
@@ -573,6 +573,7 @@ struct flyx_bmodel {
       std::fprintf(stderr, "flyx-cuda: %ld rounds of several sequences (%.2f sequences, %.1f rows each), %ld graphs "
                    "captured\n", batch->launched, double(batch->sequences) / batch->launched,
                    double(batch->rows) / batch->launched, batch->captured);
+    cold.reset();
     layer_ring.reset();  // finish copies before freeing their host and device buffers
     batch.reset();  // its graphs and stream before the memory they use
     if (prefill_ev) cudaEventDestroy(prefill_ev);
@@ -652,6 +653,7 @@ struct flyx_plan {
   std::vector<flyx_node> nodes;
   std::vector<const flyx::cuda::Block*> block;      // per node: the block it runs (null: none)
   std::vector<const flyx::cuda::RegionImpl*> impl;  // per node
+  std::vector<flyx::cuda::RegionFn> streamed_body;   // only on plans that read streamed weights
   // A round of a tree of given drafts (FLYX_GIVEN_TREE) or of its drafter's (FLYX_DRAFT_TREE): its rows by the
   // session's TreeRows, the accepted path compacted after the accept; tree_kv: the K/V caches its attention layers
   // write (flyx_seq::kv indices).  drafted: the drafter writes the TreeRows in the round, the launch does not.

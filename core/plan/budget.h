@@ -12,7 +12,7 @@
 
 namespace flyx::plan {
 
-// Largest per-layer expert cap whose backend footprint fits. A negative result means no placement fits.
+// Largest residency cap whose backend footprint fits. A negative result means no placement fits.
 int fit_residency(int maximum, const std::function<bool(int)>& fits);
 
 // What holds the GPU besides the model's weights and workspace, as the budget found it: other programs with the

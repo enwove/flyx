@@ -109,7 +109,7 @@ bool parse_flag_val(const std::string& key, const std::string& val, bool* f, std
 
 bool parse_whole_val(const std::string& key, const std::string& val, int* v, std::string* err) {
   char* end = nullptr;
-  const long n = std::strtol(val.c_str(), &end, 10);
+  const long long n = std::strtoll(val.c_str(), &end, 10);
   if (val.empty() || *end || n < 0 || n > INT_MAX)
     return *err = key + " takes a whole number, not \"" + val + "\"", false;
   *v = int(n);
@@ -223,22 +223,21 @@ OptionSpec kernel_int_choice_opt(const char* name, int KernelOptions::*ptr, std:
   };
 }
 
+OptionSpec whole_opt(const char* name, int BackendOptions::*field) {
+  return {name,
+          [field](const std::string& key, const std::string& value, BackendOptions* options, std::string* error) {
+            return parse_whole_val(key, value, &(options->*field), error);
+          },
+          [name, field](const BackendOptions& options, const BackendOptions& defaults) {
+            return options.*field == defaults.*field ? std::string{} : std::string(name) + "=" + std::to_string(options.*field);
+          }};
+}
+
 const std::vector<OptionSpec>& option_specs() {
   static const std::vector<OptionSpec> specs = {
-      {"gpu_layers",
-       [](const std::string& key, const std::string& val, BackendOptions* o, std::string* err) {
-         return parse_whole_val(key, val, &o->gpu_layers, err);
-       },
-       [](const BackendOptions& o, const BackendOptions& def) -> std::string {
-         return o.gpu_layers == def.gpu_layers ? "" : "gpu_layers=" + std::to_string(o.gpu_layers);
-       }},
-      {"gpu_experts",
-       [](const std::string& key, const std::string& val, BackendOptions* o, std::string* err) {
-         return parse_whole_val(key, val, &o->gpu_experts, err);
-       },
-       [](const BackendOptions& o, const BackendOptions& def) -> std::string {
-         return o.gpu_experts == def.gpu_experts ? "" : "gpu_experts=" + std::to_string(o.gpu_experts);
-       }},
+      whole_opt("gpu_layers", &BackendOptions::gpu_layers),
+      whole_opt("gpu_experts", &BackendOptions::gpu_experts),
+      whole_opt("expert_threads", &BackendOptions::expert_threads),
       flag_opt("profile", &BackendOptions::profile),
       flag_opt("graphs", &BackendOptions::graphs),
       flag_opt("dv_conditional", &BackendOptions::dv_conditional),
@@ -698,7 +697,7 @@ int open_model(const flyx_model_desc* desc, const flyx_open_options* opts, flyx_
         m->opt.draft_weights = interfaces::DraftWeightsMode::kAuto;
     }
     if (!resolve_options(opts ? opts->options : nullptr, &m->opt, &err)) return fail("options: " + err);
-    apply_weight_caps(opts, &m->opt);
+    if (!apply_weight_caps(opts, &m->opt)) return fail("GPU residency cap exceeds INT_MAX");
     if (!nvfp4_inputs(*desc, &m->opt.kernels.prefill_fp4, &err)) return fail(err);
     if (m->opt.embed == 0) {
       // embed=auto: host memory frees the table's GPU memory for a few kilobytes of reads a token; where 32 GB stay

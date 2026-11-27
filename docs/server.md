@@ -182,6 +182,7 @@ Passed verbatim to the backend (`backends/cuda/backend.cpp`). Unknown keys or in
 | Key | Allowed Values | Default | Effect |
 |---|---|---|---|
 | `profile` | `0` \| `1` | `0` | Print per-node GPU time (disables CUDA graphs). Also supported by `cpu_ref`. |
+| `expert_threads` | nonnegative integer | 0 | Maximum CPU threads for cold experts, including the submitting thread. Zero uses up to 16 logical CPUs. An explicit maximum is bounded by the reported logical CPU count. |
 | `gpu_experts` | nonnegative integer | all | CUDA expert residency limit, also set by `--gpu-experts`. |
 | `gpu_layers` | nonnegative integer | all | CUDA dense-layer residency limit, also set by `--gpu-layers`. |
 | `graphs` | `0` \| `1` | `1` | Capture and replay decode rounds as CUDA graphs (each session's memory budget includes room for its graphs; `0`: none counted). |

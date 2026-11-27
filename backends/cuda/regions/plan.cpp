@@ -275,8 +275,24 @@ bool fused_dspark_draft(const flyx_bmodel*, const Block& blk) {
 
 void run_node(const Pass& ps, const flyx_node& n, const Block* b);
 
+// Lower only wraps nodes whose weights occupy a ring slot. Resident plans keep their original dispatch.
+void run_streamed_node(const Pass& ps, const flyx_node& node, const Block* block) {
+  auto& ring = *ps.s->m->layer_ring;
+  std::lock_guard lock(ring.mutex);
+  try {
+    ring.begin(node.block, ps.round, ps.v.L.st);
+    ps.p->streamed_body[size_t(&node - ps.p->nodes.data())](ps, node, block);
+    ring.end(node.block, ps.v.L.st);
+  } catch (...) {
+    cudaStreamSynchronize(ps.v.L.st);
+    cudaStreamSynchronize(ring.copy);
+    throw;
+  }
+}
+
 // RegionImpl (backend.h) lists an implementation; the table below is what resolve() picks from.
 const RegionImpl kGeneric = {0, "generic", 1 << 30, nullptr, run_node};
+const RegionImpl kStreamed = {FLYX_NODE_RUN, "streamed weights", 1 << 30, nullptr, run_streamed_node};
 const RegionImpl kOverrides[] = {
     {FLYX_NODE_RUN, "fused producers", 1 << 30, fused_gdn,
      [](const Pass& ps, const flyx_node&, const Block* b) { gdn_layer(ps, std::get<GdnBlock>(*b), true); }},
@@ -384,20 +400,7 @@ void forward_nodes(const Pass& ps, size_t begin, size_t end, int copy_prefix) {
                      std::holds_alternative<RelAttnBlock>(*ps.p->block[i + 1]))
                         ? &std::get<RelAttnBlock>(*ps.p->block[i + 1])
                         : nullptr;
-    LayerRing* ring = s->m->layer_ring.get();
-    if (ring && nd.kind == FLYX_NODE_RUN && ring->images[size_t(nd.block)].host) {
-      std::lock_guard lock(ring->mutex);
-      ring->begin(nd.block, ps.v.L.st);
-      try {
-        ps.p->impl[i]->fn(cur, nd, blk);
-      } catch (...) {
-        cudaStreamSynchronize(ps.v.L.st);
-        throw;
-      }
-      ring->end(nd.block, ps.v.L.st);
-    } else {
-      ps.p->impl[i]->fn(cur, nd, blk);
-    }
+    ps.p->impl[i]->fn(cur, nd, blk);
     if (prof) CK(cudaEventRecord(s->prof_ev[i - begin + 1], s->st));
   }
   if (res_state.expert_work) CK(cudaStreamWaitEvent(ps.v.L.st, s->expert_side.join, 0));
@@ -700,6 +703,11 @@ int lower(flyx_bmodel* m, const flyx_program* prog, flyx_plan** out) {
     p->block.push_back(b);
     p->impl.push_back(wide ? &kGeneric : resolve(m, n, b, p->max_rows));
     if (p->impl.back() != &kGeneric) ++used[node_name(n, b) + ": " + p->impl.back()->name];
+    if (m->layer_ring && n.kind == FLYX_NODE_RUN && m->layer_ring->images[size_t(n.block)].host) {
+      if (p->streamed_body.empty()) p->streamed_body.resize(p->nodes.size());
+      p->streamed_body[p->impl.size() - 1] = p->impl.back()->fn;
+      p->impl.back() = &kStreamed;
+    }
   }
   if (prog->phase == FLYX_PHASE_ROUND && prog->width > most)
     return fail("round width exceeds what the drafter can propose");

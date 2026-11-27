@@ -17,9 +17,11 @@ ColdMatrix::ColdMatrix(const flyx_weight& w, int hot, const ExpertLayout& layout
       nvfp4(layout.format == ExpertLayout::nvfp4) {
   const size_t count = size_t(w.t->shape[0] - hot), nrows = size_mul(count, size_t(rows));
   if (w.scale2) {
+    if (!w.scale2->data) throw std::runtime_error("missing cold expert scales");
     size_t n = 1;
     for (int i = 0; i < w.scale2->ndim; ++i) n = size_mul(n, size_t(w.scale2->shape[i]));
     if (n != 1 && n != size_t(w.t->shape[0])) throw std::runtime_error("invalid cold expert scale count");
+    scales.reserve(count);
     for (size_t i = 0; i < count; ++i) scales.push_back(float(ops::load(w.scale2, n == 1 ? 0 : hot + i)));
   }
   if (layout.format == ExpertLayout::bf16_rows && dtype != FLYX_DT_BF16) {
@@ -54,7 +56,8 @@ void ColdMatrix::prepare(float* x, bool vector_nvfp4) const {
       float max_abs = 0;
       for (int j = 0; j < 32; ++j) max_abs = std::max(max_abs, std::fabs(x[i + j]));
       const float d = max_abs / 127.f;
-      for (int j = 0; j < 32; ++j) x[i + j] = d > 0 ? std::nearbyint(x[i + j] / d) * d : 0;
+      const bool scaled = d > 0 && std::isfinite(d);
+      for (int j = 0; j < 32; ++j) x[i + j] = (scaled ? std::nearbyint(x[i + j] / d) : 0.f) * d;
     }
   } else if (a16h) {
     ops::round_a16h(x, cols);
@@ -69,7 +72,8 @@ float ColdMatrix::product(int expert, int row, const float* x) const {
 }
 
 struct ColdWorkspace {
-  RowPool pool{RowPool::default_threads()};
+  explicit ColdWorkspace(size_t threads) : pool(threads) {}
+  RowPool pool;
   std::mutex mutex;
   int* ids;
   float *input, *cpu_slots, *gpu_slots, *ones;
@@ -77,13 +81,20 @@ struct ColdWorkspace {
   std::vector<int> cold;
   cudaEvent_t ready = nullptr;
   bool verbose = false;
-  uint64_t visits = 0;
-  double route_seconds = 0;
+  uint64_t visits = 0, chunks = 0, slots = 0, cpu_pairs = 0;
+  double route_seconds = 0, cpu_seconds = 0;
   ~ColdWorkspace() {
-    if (ready) cudaEventDestroy(ready);
+    if (ready) {
+      cudaEventSynchronize(ready);
+      cudaEventDestroy(ready);
+    }
     if (verbose && visits)
-      std::fprintf(stderr, "flyx-cuda: hybrid expert route/activation wait %.1f us per visit (%llu visits)\n",
-                   route_seconds * 1e6 / visits, static_cast<unsigned long long>(visits));
+      std::fprintf(stderr,
+                   "flyx-cuda: hybrid expert route/activation wait %.1f us per visit, CPU work %.1f us per visit "
+                   "(%llu visits, %llu chunks, %llu of %llu routed pairs on CPU, %zu pool threads)\n",
+                   route_seconds * 1e6 / visits, cpu_seconds * 1e6 / visits, static_cast<unsigned long long>(visits),
+                   static_cast<unsigned long long>(chunks), static_cast<unsigned long long>(cpu_pairs),
+                   static_cast<unsigned long long>(slots), pool.threads());
   }
 };
 
@@ -95,7 +106,10 @@ void init_cold_experts(flyx_bmodel* m) {
     if (f && f->cold_gu) shape.include(f->hidden, f->inter, f->top_k);
   }
   if (!shape.pairs) return;
-  auto w = std::make_shared<ColdWorkspace>();
+  const size_t threads = m->opt.expert_threads ? std::min<size_t>(size_t(m->opt.expert_threads),
+                                                                  std::max(1u, std::thread::hardware_concurrency()))
+                                               : RowPool::default_threads();
+  auto w = std::make_shared<ColdWorkspace>(threads);
   w->verbose = m->verbose;
   w->ids = m->host_pinned<int>(shape.pairs);
   w->input = m->host_pinned<float>(shape.inputs);
@@ -156,8 +170,19 @@ void hybrid_experts(const Pass& ps, const MoeBlock& f, const MoeScratch* sc, flo
           k += count;
         }
       }
+      if (ws.verbose) {
+        ++ws.chunks;
+        ws.slots += size_t(rows) * K;
+        ws.cpu_pairs += ws.cold.size();
+      }
       if (!ws.cold.empty()) {
-        for (int r = 0; r < rows; ++r) f.cold_gu->prepare(ws.input + size_t(r) * H, vec);
+        if (ws.verbose) start = std::chrono::steady_clock::now();
+        int last_row = -1;
+        for (int slot : ws.cold) {
+          const int row = slot / K;
+          if (row != last_row) f.cold_gu->prepare(ws.input + size_t(row) * H, vec);
+          last_row = row;
+        }
         ws.pool.run(ws.cold.size() * I, [&](size_t a, size_t end) {
           for (size_t i = a; i < end; ++i) {
             int slot = ws.cold[i / I], j = int(i % I), e = ws.ids[slot];
@@ -175,6 +200,8 @@ void hybrid_experts(const Pass& ps, const MoeBlock& f, const MoeScratch* sc, flo
                 f.cold_down->product(ws.ids[slot], j, ws.act.data() + size_t(slot) * I);
           }
         });
+        if (ws.verbose)
+          ws.cpu_seconds += std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count();
         for (size_t i = 0; i < ws.cold.size();) {
           int slot = ws.cold[i++];
           size_t count = 1;

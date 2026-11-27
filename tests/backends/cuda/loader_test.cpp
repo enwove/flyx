@@ -11,6 +11,7 @@
 #include <vector>
 
 #include "backends/cuda/loader/loader.h"
+#include "backends/cuda/runtime/cold_experts.h"
 
 namespace flyx::cuda {
 namespace {
@@ -363,6 +364,7 @@ void expert_estimates() {
     flyx_block b{};
     b.kind = FLYX_BLOCK_MOE;
     b.moe.gate_up = b.moe.down = 0;
+    b.moe.n_experts = e;
     b.moe.router = -1;
     flyx_model_desc d{};
     d.weights = &w;
@@ -374,13 +376,23 @@ void expert_estimates() {
     flyx_load_estimate est{};
     const size_t expected = e * n * c.device_row + (c.scale || c.dtype == FLYX_DT_GGML_NVFP4 ? e * sizeof(float) : 0);
     require(estimate_load(&d, &opts, 0, 0, &est) == 0 && est.weights_bytes == expected, "exact expert estimate");
-    flyx_bmodel m;
-    m.opt.packed_blocks = c.packed;
-    WeightLoader loader(&m, d);
-    std::shared_ptr<const ColdMatrix> cold;
-    loader.expert_mat(0, cold);
-    loader.finish();
-    require(m.bytes == expected, "actual expert upload matches estimate");
+    for (int hot : {e, 1, 0}) {
+      opts.gpu_experts_plus_one = hot + 1;
+      require(estimate_load(&d, &opts, 0, 0, &est) == 0, "estimate a partial expert upload");
+      flyx_bmodel m;
+      m.opt.packed_blocks = c.packed;
+      m.opt.gpu_experts = hot;
+      WeightLoader loader(&m, d);
+      std::shared_ptr<const ColdMatrix> cold, shared;
+      const auto resident = loader.expert_mat(0, cold);
+      loader.expert_mat(0, shared);
+      loader.finish();
+      require(resident.n_experts == hot && m.bytes == expected / e * hot && m.bytes == est.weights_bytes,
+              "actual resident expert upload matches estimate");
+      require(cold == shared && bool(cold) == (hot < e) && m.host_bytes == est.offload_host_bytes &&
+                  (!cold || (cold->first == hot && cold->bytes() == m.host_bytes)),
+              "repeated blocks share a single correctly budgeted cold matrix");
+    }
   }
 }
 

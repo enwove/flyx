@@ -11,6 +11,7 @@
 #include <vector>
 
 namespace flyx::cuda {
+// One caller submits contiguous, disjoint row ranges and computes the first range itself.
 class RowPool {
  public:
   static size_t default_threads() {
@@ -29,6 +30,7 @@ class RowPool {
   }
 
   ~RowPool() { shutdown(); }
+  size_t threads() const { return max_threads_; }
   RowPool(const RowPool&) = delete;
   RowPool& operator=(const RowPool&) = delete;
 

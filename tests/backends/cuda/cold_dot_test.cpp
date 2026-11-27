@@ -11,7 +11,8 @@ int main() {
   std::mt19937 rng(91211);
   for (int dtype :
        {FLYX_DT_BF16, FLYX_DT_GGML_NVFP4, FLYX_DT_GGML_MXFP4, FLYX_DT_GGML_Q2_0, FLYX_DT_GGML_IQ1_S, FLYX_DT_GGML_IQ2_S,
-        FLYX_DT_GGML_IQ2_XS, FLYX_DT_GGML_IQ2_XXS, FLYX_DT_GGML_IQ3_XXS, FLYX_DT_GGML_IQ4_NL, FLYX_DT_GGML_Q4_K}) {
+        FLYX_DT_GGML_IQ2_XS, FLYX_DT_GGML_IQ2_XXS, FLYX_DT_GGML_IQ3_XXS, FLYX_DT_GGML_IQ4_NL, FLYX_DT_GGML_Q2_K,
+        FLYX_DT_GGML_Q3_K, FLYX_DT_GGML_Q4_K, FLYX_DT_GGML_Q5_K, FLYX_DT_GGML_Q6_K, FLYX_DT_GGML_Q8_0}) {
     int per = dtype == FLYX_DT_BF16 ? 1 : flyx_block_values(dtype);
     int bytes = dtype == FLYX_DT_BF16 ? 2 : flyx_block_bytes(dtype);
     constexpr int cols = 512;
@@ -24,7 +25,12 @@ int main() {
         data[i] = uint8_t(120 + rng() % 12);
       else {
         data[i + 1] = dtype == FLYX_DT_BF16 ? 62 : 52;
-        if (dtype == FLYX_DT_GGML_Q4_K) data[i + 3] = 48;
+        if (dtype == FLYX_DT_GGML_Q4_K || dtype == FLYX_DT_GGML_Q5_K) data[i + 3] = 48;
+        if (dtype == FLYX_DT_GGML_Q3_K || dtype == FLYX_DT_GGML_Q6_K) data[i + bytes - 1] = 52;
+        if (dtype == FLYX_DT_GGML_Q2_K) {
+          data[i + bytes - 3] = 52;
+          data[i + bytes - 1] = 48;
+        }
       }
     }
     flyx_tensor_view view{};

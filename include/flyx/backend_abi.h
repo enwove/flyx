@@ -1021,7 +1021,7 @@ typedef struct {
 } flyx_open_options;
 
 /* Pre-flight device memory estimate before open() allocates (ABI 48).
- * All figures are in device bytes for the backend's current device and the given model + open options. */
+ * Storage estimates are in bytes for the current device, model and open options. */
 typedef struct {
   uint64_t weights_bytes;         /* total target + active drafter + resident vision weights on device */
   uint64_t draft_weights_bytes;   /* portion of weights_bytes belonging to neural drafter blocks */

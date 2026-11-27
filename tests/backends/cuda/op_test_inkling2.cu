@@ -1787,6 +1787,31 @@ void test_inkling2_moe() {
   test_moe_gate_up_rules();
   test_moe_dp4a_variants();
   std::printf("inkling2 moe (route, situ, gate_up, down)\n");
+  {
+    const int rows = 3, top_k = 5, hidden = 37;
+    seed("moe_sum_slots", rows, top_k, hidden);
+    const Vec slots = randv(rows * top_k * hidden), weights = randv(rows * top_k), residual = randv(rows * hidden);
+    float* ds = up(slots);
+    float* dw = up(weights);
+    for (bool accumulate : {false, true}) {
+      Vec expected(rows * hidden);
+      float* out = up(residual);
+      for (int r = 0; r < rows; ++r)
+        for (int col = 0; col < hidden; ++col) {
+          double sum = 0;
+          for (int k = 0; k < top_k; ++k) {
+            const int slot = r * top_k + k;
+            sum += double(float(weights[slot])) * float(slots[slot * hidden + col]);
+          }
+          expected[r * hidden + col] = sum + (accumulate ? float(residual[r * hidden + col]) : 0.f);
+        }
+      moe_sum_slots(ds, dw, rows, top_k, hidden, out, accumulate, 0);
+      expect("moe_sum_slots vs float64", down(out, rows * hidden), expected, 4e-7);
+      cudaFree(out);
+    }
+    cudaFree(dw);
+    cudaFree(ds);
+  }
   // 1. moe_route: sigmoid+bias and softmax.
   for (int sig : {1, 0}) {
     const int R = 11, E = 64, top_k = 4;

@@ -33,7 +33,9 @@ StreamEstimate estimate_stream(const flyx_model_desc& d, const std::vector<char>
   for (int i = 0; i < d.n_blocks; ++i) {
     const auto& b = d.blocks[i];
     size_t image = 0;
-    auto plane = [&](size_t bytes) { image = size_add(checkpoint_align(image), bytes); };
+    auto plane = [&](size_t bytes) {
+      if (bytes) image = size_add(checkpoint_align(image), bytes);
+    };
     auto stack = [&](std::initializer_list<int> weights) {
       bool packed = options.packed_blocks;
       size_t nrows = 0, cols = 0;
@@ -102,6 +104,18 @@ LayerRing::~LayerRing() {
     if (slot.consumed) cudaEventSynchronize(slot.consumed);
     if (slot.consumed) cudaEventDestroy(slot.consumed);
     if (slot.ready) cudaEventDestroy(slot.ready);
+  }
+  for (auto& image : images) {
+    collect(image);
+    if (image.sample_start) cudaEventDestroy(image.sample_start);
+    if (image.sample_end) cudaEventDestroy(image.sample_end);
+  }
+  for (int round = 0; round < 2; ++round) {
+    const CopyStats& phase = stats[round];
+    if (phase.milliseconds > 0)
+      std::fprintf(stderr, "flyx-cuda: %s pinned layer H2D %.2f GB/s (%llu sampled transfers, %llu bytes)\n",
+                   round ? "round" : "prefill", phase.bytes / (phase.milliseconds * 1e6),
+                   static_cast<unsigned long long>(phase.samples), static_cast<unsigned long long>(phase.bytes));
   }
   if (copy) cudaStreamDestroy(copy);
 }
@@ -178,18 +192,42 @@ void LayerRing::allocate(flyx_bmodel* m) {
   for (auto& image : images) {
     for (auto& fix : image.fixups) fix(slots[image.slot].device);
     image.fixups.clear();
+    if (image.host && m->verbose) {
+      CK(cudaEventCreate(&image.sample_start));
+      CK(cudaEventCreate(&image.sample_end));
+    }
   }
   if (m->verbose)
     std::fprintf(stderr, "flyx-cuda: layer streaming: %zu host bytes per full pass, %zu device slot bytes\n", total,
                  ring_bytes);
 }
 
+// Time only completed samples. Overlapping submissions may skip a sample without making the host wait.
+bool LayerRing::collect(Image& image) {
+  if (!image.sample_pending) return true;
+  float elapsed = 0;
+  if (cudaEventElapsedTime(&elapsed, image.sample_start, image.sample_end) != cudaSuccess) return false;
+  auto& phase = stats[image.sample_round];
+  phase.milliseconds += elapsed;
+  phase.bytes += image.bytes;
+  ++phase.samples;
+  image.sample_pending = false;
+  return true;
+}
+
 // Both waits are device dependencies. The caller holds the ring mutex only while submitting a block.
-void LayerRing::begin(int block, cudaStream_t compute) {
-  const auto& image = images[size_t(block)];
+void LayerRing::begin(int block, bool round, cudaStream_t compute) {
+  auto& image = images[size_t(block)];
   auto& slot = slots[image.slot];
   CK(cudaStreamWaitEvent(copy, slot.consumed));
+  const bool sample = image.sample_start && collect(image);
+  if (sample) CK(cudaEventRecord(image.sample_start, copy));
   CK(cudaMemcpyAsync(slot.device, image.host, image.bytes, cudaMemcpyHostToDevice, copy));
+  if (sample) {
+    CK(cudaEventRecord(image.sample_end, copy));
+    image.sample_pending = true;
+    image.sample_round = round;
+  }
   CK(cudaEventRecord(slot.ready, copy));
   CK(cudaStreamWaitEvent(compute, slot.ready));
 }

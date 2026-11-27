@@ -3,14 +3,17 @@
 #include "ops/dtype/ref.h"
 
 #include <array>
+#include <type_traits>
 
 #if defined(__x86_64__) || defined(_M_X64)
 #include <immintrin.h>
 #ifdef _MSC_VER
 #include <intrin.h>
 #define FLYX_AVX2 __declspec(noinline)
+#define FLYX_AVX_INLINE __forceinline
 #else
 #define FLYX_AVX2 __attribute__((target("avx2,fma")))
+#define FLYX_AVX_INLINE inline __attribute__((target("avx2,fma"), always_inline))
 #endif
 #endif
 
@@ -53,6 +56,55 @@ float half_scale(uint16_t h) {
   return table[h];
 }
 
+// The eight codes share a scale. Byte loads use memcpy because GGUF rows need only block alignment.
+FLYX_AVX_INLINE __m256i bytes8(const void* src) {
+  uint64_t bytes;
+  std::memcpy(&bytes, src, sizeof(bytes));
+  return _mm256_cvtepu8_epi32(_mm_cvtsi64_si128(bytes));
+}
+
+FLYX_AVX_INLINE __m256i bits8(const uint8_t* src, int shift, int mask) {
+  return _mm256_and_si256(_mm256_srl_epi32(bytes8(src), _mm_cvtsi32_si128(shift)), _mm256_set1_epi32(mask));
+}
+
+template <int Type>
+FLYX_AVX_INLINE __m256 k_weights(const uint8_t* row, int k) {
+  const int j = k % 256, group = j / 32, lane = j % 32, part = j / 128;
+  __m256i code;
+  float scale, minimum = 0;
+  if constexpr (Type == FLYX_DT_GGML_Q2_K) {
+    const auto b = block_at<block_q2_K>(row, k / 256);
+    code = bits8(b.qs + part * 32 + lane, 2 * (group % 4), 3);
+    scale = half_scale(b.data.data.d) * (b.scales[j / 16] & 15);
+    minimum = half_scale(b.data.data.dmin) * (b.scales[j / 16] >> 4);
+  } else if constexpr (Type == FLYX_DT_GGML_Q3_K) {
+    const auto b = block_at<block_q3_K>(row, k / 256);
+    const int g = j / 16;
+    const int s = ((b.scales[g % 8] >> (4 * (g / 8))) & 15) | (((b.scales[8 + g % 4] >> (2 * (g / 4))) & 3) << 4);
+    const auto low = bits8(b.qs + part * 32 + lane, 2 * (group % 4), 3);
+    const auto high = _mm256_slli_epi32(bits8(b.hmask + lane, group, 1), 2);
+    code = _mm256_sub_epi32(_mm256_add_epi32(low, high), _mm256_set1_epi32(4));
+    scale = half_scale(b.d) * (s - 32);
+  } else if constexpr (Type == FLYX_DT_GGML_Q4_K || Type == FLYX_DT_GGML_Q5_K) {
+    using Block = std::conditional_t<Type == FLYX_DT_GGML_Q4_K, block_q4_K, block_q5_K>;
+    const auto b = block_at<Block>(row, k / 256);
+    int s, m;
+    k_scale_min(b.scales, group, &s, &m);
+    code = bits8(b.qs + group / 2 * 32 + lane, 4 * (group % 2), 15);
+    if constexpr (Type == FLYX_DT_GGML_Q5_K)
+      code = _mm256_or_si256(code, _mm256_slli_epi32(bits8(b.qh + lane, group, 1), 4));
+    scale = half_scale(b.data.data.d) * s;
+    minimum = half_scale(b.data.data.dmin) * m;
+  } else {
+    const auto b = block_at<block_q6_K>(row, k / 256);
+    const auto low = bits8(b.ql + part * 64 + group % 2 * 32 + lane, (group % 4) / 2 * 4, 15);
+    const auto high = _mm256_slli_epi32(bits8(b.qh + part * 32 + lane, (group % 4) * 2, 3), 4);
+    code = _mm256_sub_epi32(_mm256_or_si256(low, high), _mm256_set1_epi32(32));
+    scale = half_scale(b.d) * b.scales[j / 16];
+  }
+  return _mm256_sub_ps(_mm256_mul_ps(_mm256_cvtepi32_ps(code), _mm256_set1_ps(scale)), _mm256_set1_ps(minimum));
+}
+
 // Unpack eight neighboring weights into registers. A codebook lookup serves eight products at once.
 template <int Type>
 FLYX_AVX2 float vector_dot(const uint8_t* row, const float* x, int cols) {
@@ -63,6 +115,15 @@ FLYX_AVX2 float vector_dot(const uint8_t* row, const float* x, int cols) {
     if constexpr (Type == FLYX_DT_BF16) {
       __m128i b = _mm_loadu_si128(reinterpret_cast<const __m128i*>(row + 2 * size_t(k)));
       w = _mm256_castsi256_ps(_mm256_slli_epi32(_mm256_cvtepu16_epi32(b), 16));
+    } else if constexpr (Type == FLYX_DT_GGML_Q8_0) {
+      const auto b = block_at<block_q8_0>(row, k / 32);
+      uint64_t bytes;
+      std::memcpy(&bytes, b.qs + k % 32, 8);
+      const auto codes = _mm256_cvtepi8_epi32(_mm_cvtsi64_si128(bytes));
+      w = _mm256_mul_ps(_mm256_cvtepi32_ps(codes), _mm256_set1_ps(half_scale(b.d)));
+    } else if constexpr (Type == FLYX_DT_GGML_Q2_K || Type == FLYX_DT_GGML_Q3_K || Type == FLYX_DT_GGML_Q4_K ||
+                         Type == FLYX_DT_GGML_Q5_K || Type == FLYX_DT_GGML_Q6_K) {
+      w = k_weights<Type>(row, k);
     } else if constexpr (Type == FLYX_DT_GGML_NVFP4 || Type == FLYX_DT_GGML_MXFP4) {
       constexpr bool nv = Type == FLYX_DT_GGML_NVFP4;
       const uint8_t* b = row + size_t(k / (nv ? 64 : 32)) * (nv ? 36 : 17);
@@ -172,6 +233,12 @@ float cold_dot(int dtype, const uint8_t* row, const float* input, int cols) {
   case T:           \
     return vector_dot<T>(row, input, cols)
       FLYX_DOT(FLYX_DT_BF16);
+      FLYX_DOT(FLYX_DT_GGML_Q2_K);
+      FLYX_DOT(FLYX_DT_GGML_Q3_K);
+      FLYX_DOT(FLYX_DT_GGML_Q4_K);
+      FLYX_DOT(FLYX_DT_GGML_Q5_K);
+      FLYX_DOT(FLYX_DT_GGML_Q6_K);
+      FLYX_DOT(FLYX_DT_GGML_Q8_0);
       FLYX_DOT(FLYX_DT_GGML_NVFP4);
       FLYX_DOT(FLYX_DT_GGML_MXFP4);
       FLYX_DOT(FLYX_DT_GGML_Q2_0);

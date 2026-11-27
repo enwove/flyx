@@ -20,6 +20,8 @@ struct LayerRing {
     uint8_t* host = nullptr;
     size_t bytes = 0;
     int slot = 0;
+    cudaEvent_t sample_start = nullptr, sample_end = nullptr;
+    bool sample_pending = false, sample_round = false;
     std::vector<std::function<void(uint8_t*)>> fixups;  // released once both slot addresses are known
   };
   struct Slot {
@@ -31,13 +33,20 @@ struct LayerRing {
   ~LayerRing();
   void archive(flyx_bmodel* m, int block);
   void allocate(flyx_bmodel* m);
-  void begin(int block, cudaStream_t compute);
+  void begin(int block, bool round, cudaStream_t compute);
   void end(int block, cudaStream_t compute);
   std::mutex mutex;
   std::vector<Image> images;
   Slot slots[2];
   cudaStream_t copy = nullptr;
   size_t next = 0, total = 0;
+
+ private:
+  struct CopyStats {
+    uint64_t bytes = 0, samples = 0;
+    double milliseconds = 0;
+  } stats[2];  // prefill, round
+  bool collect(Image& image);
 };
 
 }  // namespace flyx::cuda
