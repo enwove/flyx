@@ -1710,7 +1710,8 @@ int launch_batch(flyx_plan* const* plans, flyx_seq* const* seqs, const flyx_gen_
     if (!seqs[i]) return no_sequence("launch_batch");
   if (n == 1) return launch(plans[0], seqs[0], gens[0]);
   flyx_bmodel* m = seqs[0]->m;
-  if (m->need.max_bank > 0 || m->dspark_block >= 0) {
+  // Offloaded models submit on each sequence's stream so every round uses its host or copy dependencies.
+  if (!m->batch || m->need.max_bank > 0 || m->dspark_block >= 0) {
     for (int i = 0; i < n; ++i)
       if (const int r = launch(plans[i], seqs[i], gens[i]); r != 0) return r;
     return 0;

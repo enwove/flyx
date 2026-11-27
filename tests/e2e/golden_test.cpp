@@ -3271,6 +3271,9 @@ int plain_only(const json& g, const std::string& model, const std::string& backe
       Session session(streamed.get());
       init_checked(session);
       check(gen(session, prompt, 12).tokens == expected, std::string(cap) + " preserves greedy tokens");
+      const auto other = g["cases"][1]["prompt"].get<std::vector<int32_t>>();
+      batch_rounds(streamed.get(), {prompt, other}, {0, 0},
+                   std::string(cap) + " interleaves streamed rounds from two sessions");
     }
   }
   prefill_only_checks(plain.get(), g["cases"][0]["prompt"].get<std::vector<int32_t>>());
