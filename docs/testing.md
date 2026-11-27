@@ -114,10 +114,11 @@ before the GPU tests start: tests beside another program's memory fail for its r
 enough VRAM ... used by other apps"; a `cuda_device_memory*` test reading the other program's allocations as its own).
 `FLYX_TEST_GPU_MAX_USED_MIB` in the environment changes the limit (`FLYX_TEST_GPU_MAX_USED_MIB=4096 ctest --preset
 gpu`; in PowerShell `$env:FLYX_TEST_GPU_MAX_USED_MIB = 4096` first). The GPU checked is the first of
-`CUDA_VISIBLE_DEVICES`, else `nvidia-smi`'s GPU 0. Without `nvidia-smi` on `PATH` (or a GPU it can read) it is skipped
-and the GPU tests run. When it fails, the CPU tests still run, every GPU test is Not Run, and the output says who holds
-the GPU (`nvidia-smi`'s processes; on Windows, where `nvidia-smi` gives no process's memory, Windows' GPU Process Memory
-counter):
+`CUDA_VISIBLE_DEVICES`, else `nvidia-smi`'s GPU 0. It fails too on a GPU of compute capability below 8.0 (a T4, a V100),
+which no kernel of the CUDA backend runs on, naming it once instead of every GPU test aborting. Without `nvidia-smi` on
+`PATH` (or a GPU it can read) it is skipped and the GPU tests run. When it fails, the CPU tests still run, every GPU
+test is Not Run, and the output says who holds the GPU (`nvidia-smi`'s processes; on Windows, where `nvidia-smi` gives
+no process's memory, Windows' GPU Process Memory counter):
 
 ```text
  4/93 Test  #93: gpu_preflight ....................***Failed    1.34 sec

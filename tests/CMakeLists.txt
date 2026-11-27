@@ -572,7 +572,8 @@ set_tests_properties(tokenizer tokenizer_minicpm5 chat chat_qwen35 reply_grammar
 get_property(flyx_cpu_tests DIRECTORY PROPERTY TESTS)
 if(TARGET flyx-cuda)
   # Before every GPU test (flyx_finish_test_labels: FIXTURES_REQUIRED gpu_preflight): fails, naming who holds it, when
-  # another program has more than FLYX_TEST_GPU_MAX_USED_MIB (2560) of the GPU; skipped without nvidia-smi.
+  # another program has more than FLYX_TEST_GPU_MAX_USED_MIB (2560) of the GPU, and on a GPU older than sm_80 (no
+  # kernel of the backend runs there); skipped without nvidia-smi.
   add_test(NAME gpu_preflight COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/gpu_preflight.py)
   set_tests_properties(gpu_preflight PROPERTIES FIXTURES_SETUP gpu_preflight SKIP_RETURN_CODE 77)
   add_executable(cuda_loader_test backends/cuda/loader_test.cpp ${CMAKE_SOURCE_DIR}/backends/cuda/backend.cpp)

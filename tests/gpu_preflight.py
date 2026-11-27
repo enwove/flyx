@@ -5,8 +5,10 @@ Tests beside another program's GPU memory fail for its reasons, not theirs: an e
 VRAM ... used by other apps") and the tests measuring the device's free memory (cuda_device_memory*) read the other
 program's allocations as theirs.  So this fails at once, naming who holds the memory, when more than
 FLYX_TEST_GPU_MAX_USED_MIB (2560 by default) is in use.  The GPU checked is the one the tests take: the first of
-CUDA_VISIBLE_DEVICES, else nvidia-smi's GPU 0.  Without nvidia-smi (or without a GPU it can read) nothing is checked
-and the test is skipped (exit 77): the GPU tests then say for themselves what they find.
+CUDA_VISIBLE_DEVICES, else nvidia-smi's GPU 0.  It fails too on a GPU the CUDA backend cannot run (compute capability
+below 8.0: a T4, a V100), one failure that says why instead of every GPU test's.  Without nvidia-smi (or without a GPU
+it can read) nothing is checked and the test is skipped (exit 77): the GPU tests then say for themselves what they
+find.
 """
 import csv
 import os
@@ -104,11 +106,18 @@ def main():
         if not first or first.startswith("-"):
             skip(f"CUDA_VISIBLE_DEVICES={visible!r} names no GPU")
         pick = ["-i", first]
-    out, said = run([smi, "--query-gpu=index,uuid,name,memory.used,memory.total", "--format=csv,noheader,nounits",
-                     *pick])
+    out, said = run([smi, "--query-gpu=index,uuid,name,memory.used,memory.total,compute_cap",
+                     "--format=csv,noheader,nounits", *pick])
     if not out or not out.strip():
         skip(f"nvidia-smi found no GPU ({said or 'no output'})")
-    index, uuid, name, used, total = [f.strip() for f in out.strip().splitlines()[0].split(",")]
+    index, uuid, name, used, total, cap = [f.strip() for f in out.strip().splitlines()[0].split(",")]
+    # The CUDA backend needs compute capability 8.0 or newer (CMakeLists.txt, the backend's probe): on an older GPU
+    # every GPU test would fail one by one, the kernel tests aborting with no kernel image for the device.
+    major = cap.split(".")[0]
+    if major.isdigit() and int(major) < 8:
+        print(f"gpu_preflight: GPU {index} ({name}) has compute capability {cap}; flyx's CUDA backend needs 8.0 or "
+              "newer, so the GPU tests cannot run here")
+        return 1
     if not used.isdigit():
         skip(f"nvidia-smi reports no memory in use for GPU {index} ({used})")
     used, gpu = int(used), f"GPU {index} ({name})"
