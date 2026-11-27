@@ -35,17 +35,11 @@ import torch
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, os.path.join(HERE, "..", "..", "..", "python", "convert"))
 sys.path.insert(0, os.path.join(HERE, "..", "..", "..", "python", "reference"))
+sys.path.insert(0, os.path.join(HERE, "..", "..", "common"))
 from flyx_convert.dv import parse_tree, read_meta  # noqa: E402
 from flyx_convert.fileformat import Reader  # noqa: E402
 from flyx_ref import dv  # noqa: E402
-
-failures = 0
-
-
-def check(ok, what):
-    global failures
-    print(("ok " if ok else "FAIL ") + what, flush=True)
-    failures += not ok
+from check import check, finish  # noqa: E402
 
 
 def same_bytes(a, b):
@@ -87,8 +81,7 @@ def main(argv=None):
               f"{os.path.basename(a.model)}: a V-LoRA alone (no DV section, no dv.* tensor)")
         cfg, W = dv.llama_from_flyx(a.model)
         target_config(a, cfg, W, lora)
-        print("lora conversion: " + ("ok" if not failures else f"{failures} failures"))
-        return 1 if failures else 0
+        return finish("check_dv_convert")
     mine = {n: r.torch(n) for n in h["tensors"] if n.startswith("dv.")}
     export = {"dv." + k: v for k, v in load_file(os.path.join(a.export, "canvas.safetensors")).items()}
     export.update({"dv.sel." + k: v for k, v in load_file(os.path.join(a.export, "selector.safetensors")).items()})
@@ -122,8 +115,7 @@ def main(argv=None):
         compare("from_flyx against selector_from_pt", {k: v for k, v in W.items() if k.startswith("dv.sel.")},
                 dv.selector_from_pt(a.selector))
     target_config(a, cfg, W, lora)
-    print("dv conversion: " + ("ok" if not failures else f"{failures} failures"))
-    return 1 if failures else 0
+    return finish("check_dv_convert")
 
 
 def vlora(a, r, h, load_file):

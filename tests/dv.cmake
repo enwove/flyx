@@ -124,13 +124,13 @@ if(TARGET flyx-cuda)
   # inline (dv_conditional=0): within what they are counted at and under twice what they took, the conditional nodes
   # and their bodies on their own too.
   flyx_add_golden_test(cuda_device_memory_dv ARGS cuda llama ${ASSETS}/tiny_llama_dv31.flyx
-                       ENV FLYX_TEST_DEVICE_MEMORY=rooms SERIAL FIXTURES assets dv_assets)
+                       --device-memory=rooms SERIAL FIXTURES assets dv_assets)
   flyx_add_golden_test(cuda_device_memory_dv_lora ARGS cuda llama_dv_lora ${ASSETS}/tiny_llama_dv31_lora.flyx
-                       ENV FLYX_TEST_DEVICE_MEMORY=rooms SERIAL FIXTURES assets dv_assets)
+                       --device-memory=rooms SERIAL FIXTURES assets dv_assets)
   flyx_add_golden_test(cuda_device_memory_dv_graphs ARGS cuda llama ${ASSETS}/tiny_llama_dv31.flyx
-                       ENV FLYX_TEST_DEVICE_MEMORY=dvgraphs SERIAL FIXTURES assets dv_assets)
+                       --device-memory=dvgraphs SERIAL FIXTURES assets dv_assets)
   flyx_add_golden_test(cuda_device_memory_dv_lora_graphs ARGS cuda llama_dv_lora ${ASSETS}/tiny_llama_dv31_lora.flyx
-                       ENV FLYX_TEST_DEVICE_MEMORY=dvgraphs SERIAL FIXTURES assets dv_assets)
+                       --device-memory=dvgraphs SERIAL FIXTURES assets dv_assets)
   get_property(flyx_gpu_dv_tests DIRECTORY PROPERTY TESTS)
   list(REMOVE_ITEM flyx_gpu_dv_tests ${flyx_cpu_dv_tests})
   set_property(TEST ${flyx_gpu_dv_tests} APPEND PROPERTY LABELS gpu)

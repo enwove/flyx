@@ -10,6 +10,7 @@ none of the shell's FLYX_* settings).
     lora_load.py FLYX MODEL.gguf PEFT_DIR
 """
 import json
+import os
 from pathlib import Path
 import shutil
 import struct
@@ -22,13 +23,8 @@ from urllib.request import Request, urlopen
 
 from local_server import serve, server_env
 
-FAILS = 0
-
-
-def check(ok, what, detail=""):
-    global FAILS
-    print(f"  {'ok  ' if ok else 'FAIL'} {what}" + (f"  [{detail}]" if detail and not ok else ""))
-    FAILS += 0 if ok else 1
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", "common"))
+from check import check, finish  # noqa: E402
 
 
 def call(origin, path, body=None):
@@ -200,8 +196,7 @@ def main():
         serve(exe, tmp, env, on_ready=again, expect_name=served["name"])
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
-    print("lora_load: " + ("ok" if FAILS == 0 else f"{FAILS} FAILED"))
-    return 1 if FAILS else 0
+    return finish("lora_load")
 
 
 if __name__ == "__main__":

@@ -21,11 +21,12 @@ import sys
 import tempfile
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "common"))
 
 import check_dv as cd  # noqa: E402
 import dv_ref_json  # noqa: E402
+from check import check, finish  # noqa: E402
 
-failures = []
 BS = chr(92)  # a backslash
 
 
@@ -36,12 +37,6 @@ def main_quietly(argv):
             return cd.main(argv)
         except SystemExit as ex:
             return ex.code
-
-
-def check(ok, what, got=None):
-    print(f"  {'ok' if ok else 'FAIL':4s} {what}" + ("" if ok or got is None else f": got {got!r}"))
-    if not ok:
-        failures.append(what)
 
 
 # ---- an answer's length --------------------------------------------------------------------------------------------
@@ -490,5 +485,4 @@ with tempfile.TemporaryDirectory() as tmp:
           "check_dv --ref: DV's rounds chosen among plain decoding's refused, DV pinned to one width compared",
           out.getvalue()[-400:])
 
-print(f"{len(failures)} failed" if failures else "all passed")
-sys.exit(1 if failures else 0)
+sys.exit(finish("check_dv_test"))

@@ -15,16 +15,10 @@ import tempfile
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, os.path.join(HERE, "..", "..", "..", "bench", "replay"))
+sys.path.insert(0, os.path.join(HERE, "..", "..", "common"))
 
 import dv_choice  # noqa: E402
-
-failures = []
-
-
-def check(ok, what):
-    print(("ok   " if ok else "FAIL ") + what)
-    if not ok:
-        failures.append(what)
+from check import check, finish  # noqa: E402
 
 
 def main() -> int:
@@ -54,8 +48,7 @@ def main() -> int:
               "an unknown name refused: " + out.stderr.strip())
         out = run(os.path.join(d, "no_such_set.txt"))
         check(out.returncode == 1 and "cannot read" in out.stderr, "a missing set refused: " + out.stderr.strip())
-    print("PASSED" if not failures else f"FAILED ({len(failures)})")
-    return 1 if failures else 0
+    return finish("dv_choice_test")
 
 
 if __name__ == "__main__":

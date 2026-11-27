@@ -33,18 +33,13 @@ import torch
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, os.path.join(HERE, "..", "..", "..", "python", "reference"))
+sys.path.insert(0, os.path.join(HERE, "..", "..", "common"))
 import dv_forced as forced  # noqa: E402
 import dv_gsm8k as runner  # noqa: E402
 from flyx_ref.dv import DvConfig, flyx_rounds, hf_llama, rounds_needed  # noqa: E402
+from check import check, finish  # noqa: E402
 
-failures = 0
 EOS = (2, 7)
-
-
-def check(ok, what):
-    global failures
-    print(("ok " if ok else "FAIL ") + what, flush=True)
-    failures += not ok
 
 
 class Stand:
@@ -377,8 +372,7 @@ def main(assets):
     with tempfile.TemporaryDirectory() as d:
         synthetic(d)
         whole_runs(d, assets)
-    print("dv_forced: " + ("ok" if not failures else f"{failures} failures"))
-    return 1 if failures else 0
+    return finish("dv_forced_test")
 
 
 if __name__ == "__main__":

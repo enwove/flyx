@@ -25,17 +25,13 @@
 
 #include "core/exec/generation.h"
 #include "nlohmann/json.hpp"
+#include "tests/common/check.h"
 
 using namespace flyx;
 using json = nlohmann::json;
 
 namespace {
-int failures = 0;
 std::string tested, tested_options;  // the backend under test and its options (the float64 backend takes none)
-void check(bool ok, const std::string& message) {
-  std::printf("%s %s\n", ok ? "ok" : "FAIL", message.c_str());
-  failures += !ok;
-}
 // The same tokens; else where the two part, said.
 bool same_tokens(const std::vector<int32_t>& got, const std::vector<int32_t>& want) {
   if (got == want) return true;
@@ -1006,6 +1002,7 @@ void packed_lora(const std::string& dir, const std::string& backend) {
 }  // namespace
 
 int main(int argc, char** argv) {
+  flyx::test::print_passes = true;
   if (argc != 3 && argc != 4) return 2;
   const std::string dir = argv[1], backend = argv[2];
   tested = backend;
@@ -1024,5 +1021,5 @@ int main(int argc, char** argv) {
     std::fprintf(stderr, "%s\n", e.what());
     return 1;
   }
-  return failures ? 1 : 0;
+  return flyx::test::finish("gguf_e2e_test");
 }
