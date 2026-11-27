@@ -239,15 +239,22 @@ __global__ void __launch_bounds__(128) k_quant_rows_nvfp4(const float* __restric
   }
 }
 
-// The same rounding from bf16 rows (the SwiGLU rows of the gate|up GEMM) whose largest |value| per row is given:
-// one read of the row, and its codes are k_quant_rows_nvfp4's on the rows as float32.
+// The same rounding from bf16 rows (the SwiGLU rows of the gate|up GEMM) whose largest |value| per row is given
+// (one read of the row) or not (a bf16 gate|up GEMM's: found first); its codes are k_quant_rows_nvfp4's on the rows
+// as float32.
 __global__ void __launch_bounds__(128) k_quant_rows_nvfp4_bf16(const bf16* __restrict__ x, int ldx, int K,
                                                                const float* __restrict__ amax_in,
                                                                uint8_t* __restrict__ q, uint8_t* __restrict__ s,
                                                                float* __restrict__ inv) {
   const int r = blockIdx.x;
   const bf16* xr = x + size_t(r) * ldx;
-  const float amax = amax_in[r];
+  float amax = 0.f;
+  if (amax_in) {
+    amax = amax_in[r];
+  } else {
+    for (int i = threadIdx.x; i < K; i += 128) amax = fmaxf(amax, fabsf(__bfloat162float(xr[i])));
+    amax = block_max(amax);
+  }
   const float gs = amax > 0.f ? __fdiv_rn(kNvfp4RowRange, amax) : 1.f;
   if (threadIdx.x == 0) inv[r] = __fdiv_rn(1.f, gs);
   const bool vec = (reinterpret_cast<uintptr_t>(xr) & 15) == 0;  // a block's 16 values as two 16-byte loads

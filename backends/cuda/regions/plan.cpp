@@ -420,7 +420,11 @@ void run_node(const Pass& ps, const flyx_node& n, const Block* b) {
           if (ps.n_embeds > 0) embed_scatter(rv.b.x, nullptr, e->hidden, ps.embeds, ps.embed_rows, ps.n_embeds, st);
         } else {
           embed_tokens(*e, rv.b.tokens, rv.b.x, ps.rows, st);
-          if (ps.n_embeds > 0) embed_scatter(rv.b.x, nullptr, e->hidden, ps.embeds, ps.embed_rows, ps.n_embeds, st);
+          if (ps.n_embeds > 0) {
+            embed_scatter(rv.b.x, nullptr, e->hidden, ps.embeds, ps.embed_rows, ps.n_embeds, st);
+            // fusion=0 beside a bf16 residual: the injected rows as the fused path stores them (the table's are bf16)
+            if (residual16_pass(ps)) round_rows_bf16(rv.b.x, e->hidden, e->hidden, ps.rows, st);
+          }
         }
       } else if (const auto* g = std::get_if<GdnBlock>(b)) {
         gdn_layer(ps, *g);

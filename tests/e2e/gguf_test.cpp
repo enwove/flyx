@@ -19,12 +19,14 @@
 //   (the rounding depends on a pass's rows); asked for by name
 //   (--activations nvfp4) in a file that says bf16 inputs, the same tokens.
 #include <algorithm>
+#include <cmath>
 #include <cstdio>
 #include <fstream>
 #include <stdexcept>
 
 #include "core/exec/generation.h"
 #include "nlohmann/json.hpp"
+#include "ops/dtype/ref.h"
 #include "tests/common/check.h"
 
 using namespace flyx;
@@ -136,6 +138,32 @@ std::vector<flyx_round_result> traced(Engine& e, const std::vector<int32_t>& pro
   *tokens = generate_tokens(s, prompt, n, sampling);
   s.trace = nullptr;
   return trace;
+}
+
+// The state one prefill pass of the prompt leaves (snapshot bytes: every K/V position and the recurrent state), the
+// rows `at` taking `embeds` in place of their tokens' embeddings (an image's rows).
+std::vector<uint8_t> pass_state(Engine& e, const std::vector<int32_t>& prompt, const std::vector<int32_t>& at = {},
+                                const std::vector<float>& embeds = {}) {
+  Session s(&e);
+  std::string error;
+  if (!s.init(&error)) throw std::runtime_error(error);
+  const auto* api = e.api();
+  flyx_prefill_input in{};
+  in.tokens = prompt.data();
+  in.n = int32_t(prompt.size());
+  in.embeds = embeds.empty() ? nullptr : embeds.data();
+  in.embed_rows = at.empty() ? nullptr : at.data();
+  in.n_embeds = int32_t(at.size());
+  uint64_t bytes = 0;
+  if (api->prefill_ex(e.prefill_plan(), s.seq(), &in, nullptr) != 0 || api->checkpoint(s.seq(), 0) != in.n ||
+      api->snapshot_bytes(s.seq(), 0, 0, &bytes) != 0)
+    throw std::runtime_error(std::string("a prefill pass's state: ") + api->last_error());
+  std::vector<uint8_t> out(static_cast<size_t>(bytes));
+  void* p = out.data();
+  const flyx_host_pieces pieces{&p, 1, 0, std::max<uint64_t>(4096, bytes)};
+  if (api->snapshot_save(s.seq(), 0, 0, &pieces, bytes) != in.n)
+    throw std::runtime_error(std::string("a prefill pass's state: ") + api->last_error());
+  return out;
 }
 
 // Teacher forced: at how many of the reference's tokens the engine, given the reference's tokens before it, picks
@@ -961,6 +989,25 @@ void nvfp4_inputs(const std::string& dir, const std::string& backend) {
                            " of 32 places, prefill in passes of up to " + std::to_string(chunk) + " rows");
   }
   auto plain = engine(path, backend, {.prefill_chunk = 64});
+  {  // the generic regions (fusion=0, gate 2) keep the fused path's bf16 rows: the same state, bit for bit, also
+     // with rows of float32 embeddings injected (prefill_ex), which the fused path stores in bf16
+    auto generic = engine(path, backend, {.prefill_chunk = 64, .options = "fusion=0"});
+    const std::vector<int32_t> pass(prompt.begin(), prompt.begin() + 64), at = {3, 4, 5, 6};
+    std::vector<float> embeds(at.size() * size_t(plain->model().desc().hidden));
+    for (size_t i = 0; i < embeds.size(); ++i) embeds[i] = float(0.3 * std::sin(0.7 * double(i) + 0.1));
+    check(pass_state(*generic, pass) == pass_state(*plain, pass),
+          "NVFP4 inputs, a pass of 64 rows: fusion=0 leaves the fused path's state, bit for bit");
+    check(pass_state(*generic, pass, at, embeds) == pass_state(*plain, pass, at, embeds),
+          "  with 4 rows of float32 embeddings injected: the fused path's state");
+    // Injected rows are stored as the residual is, in bf16: their bf16 values leave the same state, here and on the
+    // float64 backend, which keeps the residual so in such a pass.
+    std::vector<float> rounded(embeds.size());
+    for (size_t i = 0; i < embeds.size(); ++i) rounded[i] = float(ops::round_bf16(embeds[i]));
+    auto reference = engine(path, "cpu_ref", {.prefill_chunk = 64});
+    for (Engine* e : {plain.get(), reference.get()})
+      check(pass_state(*e, pass, at, embeds) == pass_state(*e, pass, at, rounded),
+            "  " + e->backend_name() + ": the embeddings' bf16 values leave the same state (bf16 residual rows)");
+  }
   auto spec = engine(path, backend, {.speculative = true, .prefill_chunk = 64});
   check(tokens_of(*plain, prompt, 32) == tokens_of(*spec, prompt, 32), "NVFP4 inputs: the MTP drafter changes nothing");
   // Asked for by name (--activations nvfp4) in a file of the same weights that says bf16 inputs: the tokens of the

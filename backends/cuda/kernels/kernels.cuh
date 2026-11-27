@@ -1113,6 +1113,11 @@ int strata_words(int hd, int bits);  // 32-bit words of codes a position and hea
 
 // out = silu(a) * b, a and b are column blocks of the same rows.
 void swiglu(const float* gu, int ld, int I, float* out, int ld_out, int rows, cudaStream_t st);
+// Each of n values of `rows` rows x [rows][ld] rounded to bf16 in place (the generic regions' rows where a fused
+// producer keeps bf16 ones: prefill_rows_bf16, layers.cpp); add_rows_bf16: x + y first, the float32 sum rounded
+// once (a bf16 residual's add, as gemm_staged_bf16's accumulate makes it).
+void round_rows_bf16(float* x, int ld, int n, int rows, cudaStream_t st);
+void add_rows_bf16(float* x, int ld, const float* y, int ldy, int n, int rows, cudaStream_t st);
 
 // ---- gated delta net ------------------------------------------------------------
 struct GdnDims {
@@ -1603,7 +1608,8 @@ void gemm_fp4_presplit(const uint8_t* Q, const uint8_t* S, const float* RS, int 
 // bf16 W, or NVFP4 Q/S/RS) -> scratch glu [rows][I] = bf16(silu(g) u).  Same bits as the
 // GEMM into float32 followed by swiglu_split; W4A4 under KernelOptions::prefill_fp4 as
 // gemm_fp4_presplit.  cfg: a k_gemm_tc configuration (tests), -1 the default.  Then
-// gemm_on_glu: the next GEMM (the down projection) on those rows.
+// gemm_on_glu: the next GEMM (the down projection) on those rows, NVFP4 inputs rounded from them where its own
+// weights take them (whatever the gate|up weights are), as gemm_fp4_tc on the rows in float32.
 void gemm_glu_staged(const bf16* W, const uint8_t* Q, const uint8_t* S, const float* RS, int I, int K, int rows,
                      const Launch& L, int cfg = -1);
 void gemm_on_glu(const bf16* W, const uint8_t* Q, const uint8_t* S, const float* RS, int N, int K, float* y, int ldy,
@@ -1612,11 +1618,14 @@ void gemm_on_glu(const bf16* W, const uint8_t* Q, const uint8_t* S, const float*
 // ---- W4A4 prefill GEMM (sm_120a block-scaled FP4 tensor cores; KernelOptions::prefill_fp4) ----
 // Whether this build has it and the device runs it (compute capability 12.0).
 bool gemm_w4a4_supported();
+// Whether a prefill pass's GEMM of K on NVFP4 weights Q takes NVFP4 inputs from rows a fused producer left in the
+// scratch, and so writes bf16 rows where it can (gemm_staged_bf16, gemm_glu_staged's SwiGLU rows).
+bool prefill_rows_bf16(const Launch& L, const uint8_t* Q, int K);
 // float32 rows x [M][ldx] (K % 128 == 0) -> NVFP4, one rounding: q [M][K/2], block scales s [M][K/16], inv [M] =
 // 1 / g (device.cuh: kNvfp4RowRange, nvfp4_block_scale, e2m1_nearest).
 void quantize_rows_nvfp4(const float* x, int ldx, int M, int K, uint8_t* q, uint8_t* s, float* inv, cudaStream_t st);
-// The same from bf16 rows whose largest |value| per row is amax [M] (the SwiGLU rows gemm_w4a4 leaves): one read,
-// the codes quantize_rows_nvfp4 gives on the rows as float32.
+// The same from bf16 rows whose largest |value| per row is amax [M] (the SwiGLU rows gemm_w4a4 leaves: one read), or
+// found where amax is null: the codes quantize_rows_nvfp4 gives on the rows as float32.
 void quantize_rows_nvfp4_bf16(const bf16* x, int ldx, int M, int K, const float* amax, uint8_t* q, uint8_t* s,
                               float* inv, cudaStream_t st);
 // y [M, N] (=|+=) dequant(A) dequant(W)^T on NVFP4 rows A and NVFP4 weights (Q, S, RS).
