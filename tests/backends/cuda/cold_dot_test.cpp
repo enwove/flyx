@@ -128,7 +128,7 @@ int main() {
       if (auto dot = cuda::cold_q8_kernel(dtype, cuda::cpu_isa_limit(isa)))
         test::check(std::fabs(dot(data.data(), quant.data(), cols) - expected_q8) <= 2e-6 * norm_q8,
                     "integer cold dot vs float64 for dtype " + std::to_string(dtype) + " ISA " + std::to_string(isa));
-    for (int n : {64, 96, 288}) {
+    for (int n : {31, 47, 64, 96, 288}) {
       double sum = 0, abs_sum = 0;
       for (int i = 0; i < n; ++i) {
         const auto& q = quant[i / 32];

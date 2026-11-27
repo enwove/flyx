@@ -7,8 +7,10 @@
 
 #if defined(__x86_64__) || defined(_M_X64)
 #include <immintrin.h>
-#if defined(_MSC_VER) && !defined(__clang__)
+#ifdef _MSC_VER
 #include <intrin.h>
+#endif
+#if defined(_MSC_VER) && !defined(__clang__)
 #define FLYX_AVX512 __declspec(noinline)
 #define FLYX_VNNI __declspec(noinline)
 #define FLYX_AVX2 __declspec(noinline)
@@ -64,14 +66,24 @@ const float* fp4_scales() {
   return scales.data();
 }
 
+#ifdef _MSC_VER
+#if defined(__clang__)
+__attribute__((target("xsave")))
+#endif
+uint64_t
+enabled_xstate() {
+  return _xgetbv(0);
+}
+#endif
+
 bool has_avx2() {
-#if defined(_MSC_VER) && !defined(__clang__)
+#if defined(_MSC_VER)
   int r[4];
   __cpuid(r, 0);
   if (r[0] < 7) return false;
   __cpuidex(r, 1, 0);
   constexpr int flags = (1 << 12) | (1 << 27) | (1 << 28);
-  if ((r[2] & flags) != flags || (_xgetbv(0) & 6) != 6) return false;
+  if ((r[2] & flags) != flags || (enabled_xstate() & 6) != 6) return false;
   __cpuidex(r, 7, 0);
   return (r[1] & (1 << 5)) != 0;
 #else
@@ -89,8 +101,8 @@ const float* half_scales() {
 }
 
 bool has_avx512() {
-#if defined(_MSC_VER) && !defined(__clang__)
-  if (!has_avx2() || (_xgetbv(0) & 0xe6) != 0xe6) return false;
+#if defined(_MSC_VER)
+  if (!has_avx2() || (enabled_xstate() & 0xe6) != 0xe6) return false;
   int r[4];
   __cpuidex(r, 7, 0);
   constexpr unsigned needed = (1u << 16) | (1u << 17) | (1u << 30);
@@ -102,7 +114,7 @@ bool has_avx512() {
 }
 
 bool has_vnni() {
-#if defined(_MSC_VER) && !defined(__clang__)
+#if defined(_MSC_VER)
   int r[4];
   __cpuidex(r, 7, 0);
   return has_avx512() && (r[2] & (1 << 11));
@@ -397,6 +409,7 @@ FLYX_AVX2 float vector_dot(const uint8_t* row, const float* x, int cols) {
 // Sixteen adjacent FP4 weights share the activation load and fit the register lookup table.
 template <int Type, class B, int Span>
 FLYX_AVX512 float vector_dot_512(const uint8_t* row, const float* x, int cols) {
+  if (cols % Span) return cold_dot_scalar(Type, row, x, cols);
   __m512 lookup;
   if constexpr (Type == FLYX_DT_GGML_IQ4_NL)
     lookup = _mm512_cvtepi32_ps(_mm512_cvtepi8_epi32(_mm_loadu_si128(reinterpret_cast<const __m128i*>(kvalues_iq4nl))));
