@@ -42,6 +42,7 @@ bool g_non_vram_error = false;
 bool g_generic_rc_with_vram_text = false;
 int g_open_calls = 0;
 bool g_expert_caps = false, g_layer_caps = false;
+uint64_t g_session_bytes = 0;
 uint32_t g_used_experts = 0, g_used_layers = 0;
 std::vector<int32_t> g_seen_dw;
 std::string g_active_dw;
@@ -204,11 +205,21 @@ int hook_size(flyx_bmodel* m, const flyx_seq_layout* layout, flyx_seq_size* out)
     out->device = uint64_t(std::max(dev_pos, 0)) * g_seq_per_ctx_bytes + (64ull << 20);
     out->host = uint64_t(std::max(layout->max_ctx - std::max(dev_pos, 0), 0)) * g_seq_per_ctx_bytes;
   }
+  if (!rc && g_session_bytes) out->device = g_session_bytes;
   if (!rc && g_auto_switch >= 0 && layout->method == FLYX_KV_AUTO) out->strata_from = g_auto_switch;
   return rc;
 }
 
 int hook_memory(flyx_bmodel* m, flyx_memory_info* out) {
+  if (g_session_bytes) {
+    const unsigned kept = g_used_experts ? g_used_experts - 1 : 8;
+    *out = {};
+    out->total = g_total_vram;
+    out->weights = g_target_bytes + uint64_t(kept) * (64ull << 20);
+    out->workspace = 512ull << 20;
+    out->free = g_free_vram - out->weights - out->workspace;
+    return 0;
+  }
   if (!g_custom_memory) return g_backend->memory(m, out);
   *out = {};
   out->total = g_total_vram;
@@ -261,6 +272,7 @@ void reset_hooks() {
   g_generic_rc_with_vram_text = false;
   g_open_calls = 0;
   g_expert_caps = g_layer_caps = false;
+  g_session_bytes = 0;
   g_target_options.clear();
   g_kv_row_bytes = 0;
   g_refusal = Refusal::none;
@@ -369,6 +381,24 @@ int main(int argc, char** argv) {
     Engine explicit_cap;
     if (!explicit_cap.load(model, eo, &err)) { check(false, err); return 1; }
     check((experts ? g_used_experts : g_used_layers) == 3, "explicit residency cap reaches backend open");
+  }
+
+  {
+    reset_hooks();
+    g_expert_caps = true;
+    g_session_bytes = 48ull << 20;
+    g_total_vram = 12ull << 30;
+    g_free_vram = g_target_bytes + (512ull << 20) + 7 * (64ull << 20) +
+                  plan::device_reserve(g_total_vram, os::gpu_memory_paged());
+    EngineOptions eo;
+    eo.backend = "test-host-kv";
+    eo.max_ctx = 128;
+    eo.speculative = false;
+    eo.drafter = "none";
+    Engine fitted;
+    if (!fitted.load(model, eo, &err)) { check(false, err); return 1; }
+    check(g_used_experts == 7 && g_open_calls == 2,
+          "after measuring a 48 MiB shortfall the retry releases one 64 MiB expert and retains six");
   }
 
   // Exactly 32 decimal GB after the plain target. Adding any drafter crosses the old precision threshold.
@@ -648,7 +678,7 @@ int main(int argc, char** argv) {
           "elastic_load=false refuses OOM immediately without retrying or degrading");
   }
 
-  // 7. Non-OOM error never triggers elastic retries (even if the message mentions VRAM â€” ABI 48 checks FLYX_ERR_OOM).
+  // 7. Non-OOM error never triggers elastic retries (even if the message mentions VRAM — ABI 48 checks FLYX_ERR_OOM).
   {
     reset_hooks();
     g_total_vram = 24ull << 30;

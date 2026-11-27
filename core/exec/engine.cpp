@@ -52,7 +52,7 @@ int32_t to_abi_draft_weights(interfaces::DraftWeightsMode m) {
 }
 
 // Require meaningful VRAM savings (>= 128 MiB and >= 10% of drafter weights) before elastic loading steps
-// draft_weights down to NVFP4 â€” avoids spurious downgrades on already-4-bit GGUF drafters like Q4_K_M.
+// draft_weights down to NVFP4 — avoids spurious downgrades on already-4-bit GGUF drafters like Q4_K_M.
 bool meaningful_draft_savings(const flyx_load_estimate& est) {
   constexpr uint64_t kMinSavingsBytes = 128ull << 20;
   return est.draft_compact_savings >= kMinSavingsBytes &&
@@ -937,7 +937,8 @@ bool Engine::load(const std::string& path, const EngineOptions& opt, std::string
 
   // Query the backend for physical sizes. A host-memory limit is checked after choosing the largest
   // feasible GPU partition, which also minimizes the amount we need to keep in RAM.
-  auto fit_weights = [&](const flyx_load_estimate& current, uint64_t free, uint64_t total, bool retry) {
+  auto fit_weights = [&](const flyx_load_estimate& current, uint64_t free, uint64_t total, bool retry,
+                         uint64_t shortfall) {
     const auto ram = os::system_memory();
     uint64_t host_room = ram.available;
     const uint64_t keep = opt_.ram_reserve >= 0 ? uint64_t(opt_.ram_reserve) : plan::host_keep(ram.total);
@@ -948,16 +949,17 @@ bool Engine::load(const std::string& path, const EngineOptions& opt, std::string
       if (count <= 0 || !interfaces::backend_opt_get(clean_backend_opts, key).empty()) return false;
       const int before = resident < 0 ? count : resident;
       if (before == 0) return false;
-      // A real allocation refused the previous placement. Leave progressively more space even if
-      // the estimate thinks it fits, and bound the number of complete reuploads.
-      const int upper = retry ? before / 2 : before - 1;
+      // The post-load session budget knows how many additional bytes it needs. For an allocator
+      // refusal without a measured shortfall, halve residency to bound complete reuploads.
+      const int upper = retry && !shortfall ? before / 2 : before - 1;
       flyx_load_estimate trial{};
       auto estimate = [&](int cap) {
         auto options = make_open_options();
         options.*field = cap + 1;
         trial = {};
         return api_->estimate_load(&model_->desc(), &options, free, total, &trial) == 0 &&
-               trial.weights_bytes < current.weights_bytes && trial.min_runtime_bytes <= room &&
+               trial.weights_bytes < current.weights_bytes && current.weights_bytes - trial.weights_bytes >= shortfall &&
+               trial.min_runtime_bytes <= room &&
                trial.weights_bytes <= room - trial.min_runtime_bytes;
       };
       const int cap = plan::fit_residency(upper, estimate);
@@ -987,7 +989,7 @@ bool Engine::load(const std::string& path, const EngineOptions& opt, std::string
         uint64_t room = free_vram - std::min(reserve, free_vram);
         if (est.min_runtime_bytes > room || est.weights_bytes > room - est.min_runtime_bytes) {
           if (!step_down(/*comfort_only=*/false, &est, free_vram, total_vram) &&
-              !fit_weights(est, free_vram, total_vram, false))
+              !fit_weights(est, free_vram, total_vram, false, 0))
             break;
           continue;
         }
@@ -1052,6 +1054,9 @@ bool Engine::load(const std::string& path, const EngineOptions& opt, std::string
       *err = attempt_err;
       return false;
     }
+    const uint64_t shortfall = budget_.oom && budget_.session_bytes > budget_.sessions_room
+                                   ? budget_.session_bytes - budget_.sessions_room
+                                   : 0;
     // Tear down partial GPU allocations before stepping down a tier and retrying.
     plans_.free(api_);
     if (bm_) {
@@ -1066,7 +1071,8 @@ bool Engine::load(const std::string& path, const EngineOptions& opt, std::string
     flyx_load_estimate est{};
     const bool have_est = query_estimate(free_vram, total_vram, &est);
     if (!step_down(/*comfort_only=*/false, have_est ? &est : nullptr, free_vram, total_vram) &&
-        !(opened && smaller_prefill()) && !(have_est && total_vram && fit_weights(est, free_vram, total_vram, true))) {
+        !(opened && smaller_prefill()) &&
+        !(have_est && total_vram && fit_weights(est, free_vram, total_vram, true, shortfall))) {
       *err = attempt_err;
       if (kept_for_drafter)
         *err += " Beside --drafter " + opt_.drafter + ", prefill passes stay " + std::to_string(prefill_chunk_) +
