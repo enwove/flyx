@@ -14,6 +14,7 @@
 #include "backends/cuda/backend.h"
 #include "backends/cuda/runtime/strata_snapshot.h"
 #include "backends/cuda/runtime/window_ring.h"
+#include "backends/cuda/runtime/offload/split_round.h"
 
 namespace flyx::cuda {
 
@@ -1532,6 +1533,10 @@ bool capture_adaptive_graph(flyx_plan* p, flyx_seq* s, const RoundPass& r, cudaG
 GraphSize round_graph_size(flyx_plan* p, flyx_seq* s) {
   const flyx_gen_params greedy{};
   const RoundPass r = round_pass(p, s, &greedy);
+  if (!s->m->allows_graphs()) {
+    SplitRound split;
+    return split.capture(r.ps, r.prefix) ? split.size() : GraphSize{};
+  }
 #if CUDART_VERSION >= 12040
   if (p->adaptive()) {
     Captured c;
@@ -1584,7 +1589,7 @@ int launch(flyx_plan* p, flyx_seq* s, const flyx_gen_params* g) {
     // destroyed in flight, what it holds would stay the driver's beside the new one's until they end.
     if (it != s->graph.end() && (prefix < it->second.copy_prefix || prefix - it->second.copy_prefix >= 4096)) {
       if (it->second.used > s->read_no) sync_stream(s);
-      CK(cudaGraphExecDestroy(it->second.exec));
+      if (it->second.exec) CK(cudaGraphExecDestroy(it->second.exec));
       s->graph_held -= it->second.bytes;
       s->graph.erase(it);
       it = s->graph.end();
@@ -1595,7 +1600,26 @@ int launch(flyx_plan* p, flyx_seq* s, const flyx_gen_params* g) {
     };
     // A capture that found no room waits kGraphRecent rounds before the next: the graphs it would take
     // the place of are by then ones the session ran lately, or not.
-    if (it == s->graph.end() && !page_exact && s->graphs && s->seq_no >= s->graph_retry) {
+    if (it == s->graph.end() && s->graphs && s->seq_no >= s->graph_retry && !s->m->allows_graphs() && !page_exact) {
+      auto split = std::make_shared<SplitRound>();
+      if (split->capture(ps, prefix)) {
+        const GraphSize size = split->size();
+        plan_counted(p->m, p, size.bytes);
+        if (!make_graph_room(s, size.bytes)) {
+          s->graph_retry = s->seq_no + kGraphRecent;
+        } else if (split->instantiate()) {
+          it = s->graph.emplace(key, flyx_seq::RoundGraph{nullptr, prefix, size.bytes, 0, std::move(split)}).first;
+          s->graph_held += size.bytes;
+          note_graph(s, size);
+          say_graph(s->m, "split round", ps.rows, key.second, size);
+        } else {
+          s->graphs = false;
+        }
+      } else {
+        s->graphs = false;
+      }
+    }
+    if (it == s->graph.end() && !page_exact && s->graphs && s->m->allows_graphs() && s->seq_no >= s->graph_retry) {
       cudaGraphExec_t exec = nullptr;
       // A driver that refuses DV's conditional canvas pass (dv_context_unless_noop), in the capture or the
       // instantiation, or does not give its body to count (graph_size), gets the round with the pass inline.
@@ -1649,7 +1673,12 @@ int launch(flyx_plan* p, flyx_seq* s, const flyx_gen_params* g) {
       }
     }
     if (it != s->graph.end()) {
-      CK(cudaGraphLaunch(it->second.exec, s->st));
+      if (it->second.split) {
+        it->second.split->launch(ps);
+        copy_ring(s);
+      } else {
+        CK(cudaGraphLaunch(it->second.exec, s->st));
+      }
       it->second.used = s->seq_no + 1;
       ++s->graph_stats.from_graph;
     } else {

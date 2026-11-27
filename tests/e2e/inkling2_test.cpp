@@ -1492,6 +1492,12 @@ int main(int argc, char** argv) {
             if (!second.done()) second.advance(true);
           }
           check(result[0] == cu_greedy && result[1] == cu_greedy, "interleaved hybrid sessions match resident tokens");
+          for (auto* session : {&a, &b}) {
+            flyx_graph_stats stats{};
+            check(e->api()->graph_stats(session->seq(), &stats) == 0 && stats.from_graph > 0 &&
+                      stats.held > 0 && stats.held <= stats.room,
+                  "hybrid rounds replay split graphs within each session's reservation");
+          }
         }
         check(same_tokens(fresh_gen(*e, prompt, 24), cu_greedy), "fresh session after promotion");
       }

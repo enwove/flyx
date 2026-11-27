@@ -657,6 +657,7 @@ struct flyx_bmodel : ModelAllocations {
 
 namespace flyx::cuda {
 struct Pass;
+class SplitRound;
 
 // ---- regions: the generic implementation of every node, and overrides --------------------
 // lower() resolves each node to the most specific implementation that fits
@@ -912,6 +913,7 @@ struct flyx_seq {
     int copy_prefix;              // positions transferred by fixed-size H2D nodes captured in this graph
     size_t bytes = 0;             // what it takes at most (graph_size), in graph_held
     unsigned long long used = 0;  // its last launch's seq_no
+    std::shared_ptr<flyx::cuda::SplitRound> split;
   };
   std::map<std::pair<const flyx_plan*, int>, RoundGraph> graph;
   // Its graphs' bytes and its shares of batch graphs, within its room.  Atomic: a batch graph dropped
@@ -941,7 +943,9 @@ struct flyx_seq {
     release_prefill_pool();
     if (profile) print_profile();
     for (auto e : prof_ev) cudaEventDestroy(e);
-    for (auto& g : graph) cudaGraphExecDestroy(g.second.exec);
+    for (auto& g : graph)
+      if (g.second.exec) cudaGraphExecDestroy(g.second.exec);
+    graph.clear();  // release split executions before freeing the buffers they reference
     for (auto& e : ev)
       if (e) cudaEventDestroy(e);
     if (idle_ev) cudaEventDestroy(idle_ev);
@@ -1272,6 +1276,7 @@ struct Pass {
   ResState* res = nullptr;  // pass-local AttnRes / loop bank counters (stack-owned by forward_nodes)
   const MoeBlock* next_moe = nullptr;       // the MoE right after this node (forward_nodes): its L2 warm-up
   const RelAttnBlock* next_attn = nullptr;  // the attention right after this node: its L2 warm-up
+  SplitRound* split = nullptr;  // records host boundaries during split capture
   int width() const { return accept_width >= 0 ? accept_width : p->width; }
   bool reads_copy(const KvBuf& kb) const { return round && kb.kq && strata != kStrataNone; }
   bool reads_cache(const KvBuf& kb) const { return !reads_copy(kb) || strata == kStrataBoth; }

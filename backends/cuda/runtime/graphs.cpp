@@ -220,7 +220,7 @@ void count_round_graphs(flyx_bmodel* m) {
 
 size_t graph_keep(const flyx_seq& s, bool count) {
   auto* m = const_cast<flyx_bmodel*>(s.m);
-  if (!m->allows_graphs()) return 0;
+  if (!m->opt.graphs) return 0;
   // What a round takes past its plan's count: other heads, the K/V in tiers, rounds that read low-bit copies.
   size_t kernels = kGraphHeadNodes, copies = 0, others = 0;
   bool window = false;
@@ -303,7 +303,7 @@ bool make_room(flyx_seq* s, size_t bytes, BatchRounds* B) {
     if (shared) {
       drop_batch_graph(*B, batch, &synced);
     } else if (own != s->graph.end()) {
-      CK(cudaGraphExecDestroy(own->second.exec));
+      if (own->second.exec) CK(cudaGraphExecDestroy(own->second.exec));
       s->graph_held -= own->second.bytes;
       s->graph.erase(own);
     } else {

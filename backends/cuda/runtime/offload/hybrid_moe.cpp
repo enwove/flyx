@@ -1,6 +1,7 @@
 // Copyright 2026 The flyx Authors. SPDX-License-Identifier: Apache-2.0
 #include "backends/cuda/runtime/offload/expert_placement.h"
 #include "backends/cuda/runtime/offload/host_handoff.h"
+#include "backends/cuda/runtime/offload/split_round.h"
 
 namespace flyx::cuda {
 namespace {
@@ -68,6 +69,10 @@ void streamed_prefill(ColdWorkspace& ws, const Pass& ps, const MoeBlock& f, cons
 }  // namespace
 
 void hybrid_experts(const Pass& ps, const MoeBlock& f, const MoeScratch* sc, float* out, bool accumulate, bool fused) {
+  if (ps.split) {
+    ps.split->defer_experts(ps, f, out, accumulate, fused);
+    return;
+  }
   auto& ws = *ps.s->m->offload->experts();
   std::lock_guard lock(ws.mutex);
   const Launch& L = ps.v.L;

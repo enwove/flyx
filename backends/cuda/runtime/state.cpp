@@ -1382,7 +1382,7 @@ void build_seq(flyx_bmodel* m, int32_t max_ctx, flyx_seq* s) {
   }
   s->rows_cap = prefill_rows;
   s->profile = m->opt.profile;
-  s->graphs = m->allows_graphs();
+  s->graphs = m->opt.graphs;
   if (!s->dry) {
     CK(cudaStreamCreateWithFlags(&s->st, cudaStreamNonBlocking));
     create_side(&s->side);

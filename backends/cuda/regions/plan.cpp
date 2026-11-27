@@ -4,6 +4,7 @@
 // lower() resolves a program into a plan, forward() executes its nodes on a sequence (a prefill pass or a round).
 #include "backends/cuda/regions/layers.h"
 #include "backends/cuda/runtime/offload/layer_ring.h"
+#include "backends/cuda/runtime/offload/split_round.h"
 
 #include <algorithm>
 #include <climits>
@@ -385,10 +386,16 @@ void forward_nodes(const Pass& ps, size_t begin, size_t end, int copy_prefix) {
                         ? &std::get<RelAttnBlock>(*ps.p->block[i + 1])
                         : nullptr;
     if (s->m->offload && nd.kind == FLYX_NODE_RUN && s->m->offload->wraps_node(size_t(nd.block))) {
-      auto lease = s->m->offload->lease_node(nd.block, ps.round, cur.v.L.st);
-      lease.wait();
-      ps.p->impl[i]->fn(cur, nd, blk);
-      lease.release();
+      if (cur.split) {
+        cur.split->begin_layer(cur, nd.block);
+        ps.p->impl[i]->fn(cur, nd, blk);
+        cur.split->end_layer(cur);
+      } else {
+        auto lease = s->m->offload->lease_node(nd.block, ps.round, cur.v.L.st);
+        lease.wait();
+        ps.p->impl[i]->fn(cur, nd, blk);
+        lease.release();
+      }
     } else {
       ps.p->impl[i]->fn(cur, nd, blk);
     }
