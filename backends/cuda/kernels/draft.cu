@@ -55,11 +55,12 @@ __global__ void k_selector_walk(const DevParams* P, const int* cand, const float
   if (threadIdx.x == 0) prev = P->anchor;
   __syncthreads();
   for (int s = 0; s < width; ++s) {
-    const bf16* pr = pred + size_t(prev) * rank;
-    const float* hs = hid + size_t(s) * rank;
+    // rank 0 (no selector): the candidates' logits alone, no selector weights read
+    const bf16* pr = rank ? pred + size_t(prev) * rank : nullptr;
+    const float* hs = rank ? hid + size_t(s) * rank : nullptr;
     for (int c = warp; c < k; c += warps) {
       const int cid = cand[s * k + c];
-      const bf16* sc = succ + size_t(cid) * rank;
+      const bf16* sc = rank ? succ + size_t(cid) * rank : nullptr;
       float e = 0.f;
       for (int i = lane; i < rank; i += 32) e += __bfloat162float(pr[i]) * hs[i] * __bfloat162float(sc[i]);
       e = warp_sum(e);
@@ -118,10 +119,10 @@ __global__ void k_selector_tree(const DevParams* P, const int* cand, const float
     for (int n = 0; n < width; ++n) {
       const int d = row_depth[n];
       if (d < depths) {  // node n's children: their log-probabilities over the node's k candidates
-        const bf16* pr = pred + size_t(row_tok[n]) * rank;
-        const float* hs = hid + size_t(d) * rank;
+        const bf16* pr = rank ? pred + size_t(row_tok[n]) * rank : nullptr;
+        const float* hs = rank ? hid + size_t(d) * rank : nullptr;
         for (int c = warp; c < k; c += warps) {
-          const bf16* sc = succ + size_t(cand[d * k + c]) * rank;
+          const bf16* sc = rank ? succ + size_t(cand[d * k + c]) * rank : nullptr;
           float e = 0.f;
           for (int i = lane; i < rank; i += 32) e += __bfloat162float(pr[i]) * hs[i] * __bfloat162float(sc[i]);
           e = warp_sum(e);

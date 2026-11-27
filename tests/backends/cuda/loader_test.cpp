@@ -57,7 +57,7 @@ void drafter_dimensions() {
   DFlashBlock b;
   m.hidden = b.hidden = b.target_hidden = b.hd = 64;
   b.n_taps = b.nh = b.nkv = 1;
-  b.block = b.dspine.topk = 2;
+  b.block = b.sel_topk = 2;
   b.dspine.code = 256;
   b.dspine.rank = kDSpineMaxRank;
   std::string why;

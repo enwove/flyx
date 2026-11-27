@@ -1,5 +1,5 @@
 # Copyright 2026 The flyx Authors. SPDX-License-Identifier: Apache-2.0
-"""DFlash2 and DSpark block drafters (reference).
+"""DFlash2, DFlash and DSpark block drafters (reference).
 
 Behaviour follows the published DFlash / DFlash2 description (z-lab DFlash,
 vllm-project/speculators ``dflash2``): a few attention layers whose
@@ -21,6 +21,10 @@ a Markov head in place of the selector: ``logits + W2 W1[previous token]``,
 the selector's score with a unit hidden gate (``sel.pred`` = W1, ``sel.succ`` =
 W2, no ``sel.hid``).  Like DFlash2's here, the walk takes the unary top-k (DSpark's
 converted config: the top 1024; DeepSpec's walk is over the whole vocabulary).
+
+DFlash (z-lab's ``DFlashDraftModel``, what DFlash2 grew from) is the block
+without the convolutions or the selector (sel_rank 0, sel_topk 1): each row's
+draft is the head's best.
 """
 from __future__ import annotations
 
@@ -51,12 +55,12 @@ class DraftConfig:
     sel_topk: int
     draft_from: int                 # the block's first row that drafts: 1, or 0 (DSpark: the anchor's)
     sel_gate: bool                  # the selector's hidden gate (sel.hid); DSpark's Markov head has none (a unit gate)
-    window: int = 0                 # positions attend to positions less than this far from them (0: all)
+    window: int                     # positions attend to positions less than this far from them (0: all)
 
 
 def draft_config_from_canonical(c: dict) -> DraftConfig:
     keys = DraftConfig.__dataclass_fields__.keys()
-    return DraftConfig(**{k: c[k] for k in keys if k in c})  # files from before windows have none
+    return DraftConfig(**{k: c[k] for k in keys})
 
 
 @dataclass
@@ -159,8 +163,12 @@ class Draft:
             x = r + (grouped_conv(m, ker, base, B, c.conv_group) if conv else m)
         hn = rms_norm(x, self.w("norm"), c.eps)[c.draft_from:]  # rows that predict tokens
         logits = hn @ self.head.T
-        unary, cand = torch.topk(logits, c.sel_topk, dim=-1)  # sorted, ties -> lower id first
-        pred, succ = self.w("sel.pred"), self.w("sel.succ")
+        cand = logits.argsort(dim=-1, descending=True, stable=True)[:, :c.sel_topk]  # ties toward lower token ids
+        unary = logits.gather(-1, cand)
+        if not c.sel_rank:                                     # DFlash: no selector, each candidate its logit
+            pred = succ = torch.zeros(self.head.shape[0], 0, dtype=self.dtype)
+        else:
+            pred, succ = self.w("sel.pred"), self.w("sel.succ")
         if c.sel_gate:
             hid = hn @ self.w("sel.hid").T                     # [rows, rank]
         else:                                                  # DSpark's Markov head: no hidden gate

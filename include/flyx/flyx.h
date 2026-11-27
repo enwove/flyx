@@ -51,14 +51,14 @@ typedef struct {
   const char* backend_dir;  /* where backend libraries live; NULL = next to the executable */
   int32_t speculative;      /* use the model's drafters (default 1) */
   int32_t verbose;
-  const char* drafter;      /* "mtp" | "dflash2" | "dspark" | "dspine" | "dv" | "all" (chosen every round) | "none" |
-                               NULL = the drafter files' drafters and the model file's MTP layer, else its block
-                               drafter (DFlash2, DSpark or DSpine); its DV drafter only when named ("dv", "all").  DV (a
-                               Llama file converted with python/convert --dv; docs/design/dv.md) drafts trees, its
-                               rounds chosen every round beside plain decoding's and lookup's; with a width, its rounds
-                               alone.  Where the backend cannot run its rounds, the model decodes as without it
-                               (plain decoding and lookup rounds) and says why; named here ("dv"), the load fails
-                               instead */
+  const char* drafter;      /* "mtp" | "dflash2" | "dflash" | "dspark" | "dspine" | "dv" | "all" (chosen every round) |
+                               "none" | NULL = the drafter files' drafters and the model file's MTP layer, else its
+                               block drafter (DFlash2, DFlash, DSpark or DSpine); its DV drafter only when named
+                               ("dv", "all").  DV (a Llama file converted with python/convert --dv;
+                               docs/design/dv.md) drafts trees, its rounds chosen every round beside plain decoding's
+                               and lookup's; with a width, its rounds alone.  Where the backend cannot run its
+                               rounds, the model decodes as without it (plain decoding and lookup rounds) and says
+                               why; named here ("dv"), the load fails instead */
   int32_t width;            /* drafts per round; 0 = choose each round (default) */
   int32_t prefill_chunk;    /* prompt rows per prefill pass; 0 = by the device memory the weights leave (1024 to 4096) */
   int32_t kv;               /* the K/V cache: FLYX_KV_DEFAULT (0: binary16 where 32 GB of GPU memory are left after

@@ -10,14 +10,22 @@
 //    read when it drafts, and a GGUF drafter saying what the block here does not run is refused then
 //    (tiny_draft_refused_*.gguf), with the file named; a soft cap on the selector's logits and a tap after the
 //    last layer are run (tiny_draft_softcap.gguf, tiny_draft_last_layer.gguf).
+//  * a DSpine drafter file is taken beside the model it was made for and refused beside another, beside a block
+//    drafter already there, and when its config says what its block does not run.
 #include <cstdio>
+#include <cstring>
+#include <filesystem>
+#include <fstream>
+#include <functional>
 #include <initializer_list>
+#include <iterator>
 #include <memory>
 #include <string>
 #include <vector>
 
 #include "core/interfaces/model.h"
 #include "core/modelfile/modelfile.h"
+#include "core/os/os.h"
 #include "tests/common/check.h"
 #include "tests/core/modelfile/write_flyx.h"
 
@@ -71,8 +79,10 @@ void dflash2_validation(const std::string& dir) {
       add("draft.fc", {H, nt * th});
       add("draft.hidden_norm", {H});
       add("draft.norm", {H});
-      add("draft.sel.pred", {vocab, sr});
-      add("draft.sel.succ", {vocab, sr});
+      if (sr > 0) {  // a selector where the config has a rank of it
+        add("draft.sel.pred", {vocab, sr});
+        add("draft.sel.succ", {vocab, sr});
+      }
       if (d.at("sel_gate").get<bool>()) add("draft.sel.hid", {sr, H});  // else a unit gate
     }
     json hdr = {{"format", "flyx"}, {"version", 1}, {"kind", "drafter"}, {"draft", d}, {"tensors", tensors}};
@@ -162,6 +172,48 @@ void dflash2_validation(const std::string& dir) {
     json d = dspark;
     d["block"] = 16;
     check_refused("dspark block of 16 (a round's rows less the anchor's)", d, true, "block size outside 2..15");
+  }
+  // z-lab's DFlash (kind "dflash"): the same block without convolutions or selector (sel_rank 0, no gate); taken as
+  // such, and a gate without a selector refused, or convolutions without one (the batch groups only a selector's).
+  json dflash = base;
+  dflash["kind"] = "dflash";
+  dflash["conv_taps"] = 0;
+  dflash["conv_group"] = 1;
+  dflash["sel_rank"] = 0;
+  dflash["sel_gate"] = false;
+  {
+    const std::string path = dir + "/dflash.flyx";
+    make_drafter(path, dflash, true);
+    std::string error;
+    bool taken = false;
+    {
+      ModelFile f;
+      interfaces::ModelOptions o;
+      o.drafter = "dflash";
+      const auto m = f.open(dir + "/tiny_gguf.gguf", &error) && f.add(path, &error)
+                         ? interfaces::open_model(f, o, &error)
+                         : nullptr;
+      taken = m && m->drafters() == 1 && std::string(m->drafter_name(0)) == "dflash" && m->block_drafts(0) == 7;
+    }
+    std::remove(path.c_str());
+    check(taken, "dflash beside the tiny Qwen3.5: its block's 7 drafts a round (" + error + ")");
+  }
+  {
+    json d = dflash;
+    d["sel_gate"] = true;
+    check_refused("dflash with a gate but no selector", d, false, "gate without a selector");
+  }
+  {
+    json d = base;
+    d.erase("window");
+    check_refused("dflash2 without a window (every key read, none defaulted)", d, false, "window");
+  }
+  {
+    json d = dflash;
+    d["kind"] = "dflash2";
+    d["conv_taps"] = base["conv_taps"];
+    d["conv_group"] = base["conv_group"];
+    check_refused("convolutions without a selector", d, false, "without a selector has no convolutions");
   }
   {  // HIGH: TG2 and n_taps * hidden int32 overflows on a large-hidden synthetic model
     auto check_synth = [&](const std::string& what, json d) {
@@ -364,6 +416,68 @@ void refusals(const std::string& dir) {
   }
 }
 
+// A DSpine drafter file (tiny_draft_dspine.flyx, made for the tiny Qwen3.5) beside a model: taken beside the tiny
+// Qwen3.5 as GGUF; refused beside a model of another width, beside a model with a block drafter already, and when its
+// config says what the block does not run (a block past a round's rows, more candidates than the walk keeps, a
+// window below zero or none written), the file named.
+void dspine_drafters(const std::string& dir) {
+  using json = nlohmann::json;
+  const std::string model = dir + "/tiny_gguf.gguf", file = dir + "/tiny_draft_dspine.flyx";
+  {
+    ModelFile f;
+    std::string err;
+    const auto m = open_beside(&f, model, file, "dspine", &err);
+    check(m && m->drafters() == 1, "a DSpine drafter file beside the tiny Qwen3.5 (GGUF): taken (" + err + ")");
+  }
+  {
+    ModelFile f;
+    std::string err;
+    const auto m = open_beside(&f, dir + "/tiny_w4a4.flyx", file, "dspine", &err);
+    check(!m && err.find("another model") != std::string::npos,
+          "a DSpine drafter file beside a model twice as wide: refused (" + err + ")");
+  }
+  {
+    ModelFile f;
+    std::string err;
+    const auto m = open_beside(&f, dir + "/tiny_dspine.flyx", dir + "/tiny_draft.flyx", "all", &err);
+    check(!m && err.find("a block drafter already") != std::string::npos,
+          "a DFlash2 drafter file beside a model with a DSpine drafter: refused (" + err + ")");
+  }
+  // The drafter file with its "draft" config edited (the .flyx layout: 24 bytes, the header, its data from 4096).
+  std::ifstream in(file, std::ios::binary);
+  const std::string bytes((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+  uint32_t version = 0;
+  uint64_t length = 0;
+  std::memcpy(&version, bytes.data() + 8, 4);
+  std::memcpy(&length, bytes.data() + 16, 8);
+  const json header = json::parse(bytes.substr(24, length));
+  const std::string data = bytes.substr((24 + length + 4095) / 4096 * 4096);
+  const auto tmp = std::filesystem::temp_directory_path() /
+                   ("flyx_dflash2_test_dspine_" + std::to_string(flyx::os::process_id()) + ".flyx");
+  struct Edit {
+    const char* what;
+    std::function<void(json&)> edit;
+    const char* says;
+  };
+  for (const Edit& c : {Edit{"a block of 17", [](json& d) { d["block"] = 17; }, "block size outside 2..16"},
+                        Edit{"17 candidates", [](json& d) { d["topk"] = 17; }, "the walk's candidates outside"},
+                        Edit{"a window below zero", [](json& d) { d["window"] = -1; }, "invalid dimensions"},
+                        Edit{"no window", [](json& d) { d.erase("window"); }, "window"}}) {
+    json h = header;
+    c.edit(h["draft"]);
+    const std::string text = h.dump();
+    check(flyx::testing::write_file(tmp.string(), flyx::testing::flyx_file(text, data, text.size(), version)),
+          "write the edited drafter file");
+    ModelFile f;
+    std::string err;
+    const auto m = open_beside(&f, model, tmp.string(), "dspine", &err);
+    check(!m && err.find(c.says) != std::string::npos && err.find("companion file 1: ") != std::string::npos,
+          std::string("a DSpine drafter config with ") + c.what + ": refused, the file named (" + err + ")");
+  }
+  std::error_code ec;
+  std::filesystem::remove(tmp, ec);
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -374,5 +488,6 @@ int main(int argc, char** argv) {
   dense_targets(dir);
   said_and_run(dir);
   refusals(dir);
+  dspine_drafters(dir);
   return flyx::test::finish("dflash2_models_test");
 }

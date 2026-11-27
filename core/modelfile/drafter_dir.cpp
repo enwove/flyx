@@ -1,5 +1,5 @@
 // Copyright 2026 The flyx Authors. SPDX-License-Identifier: Apache-2.0
-// A block drafter (DFlash2, DeepSpec's DSpark or Tencent's DSpine) as its authors publish it: config.json and
+// A block drafter (DFlash2, z-lab's DFlash, DeepSpec's DSpark or Tencent's DSpine) as its authors publish it: config.json and
 // *.safetensors in a directory.  Read into what python/convert/flyx_convert makes of it as a drafter file (--draft
 // alone): the same "draft" description (canonical_draft_config with no target) and the same tensors under the same
 // names, their bytes read in place (a DSpine drafter's stacked bridge tensors as views of each layer's part,
@@ -105,9 +105,10 @@ json dspine_config(const json& sc) {
   const json& dc = sc["dflash_config"];
   const int64_t layers = sc.at("num_hidden_layers").get<int64_t>();
   dspine_require(layers > 0 && layers <= 1024, "num_hidden_layers out of range");
-  dspine_require(sc.value("model_type", "qwen3") == "qwen3", "model_type (qwen3 layers)");
-  dspine_require(sc.value("hidden_act", "silu") == "silu", "hidden_act (silu)");
-  dspine_require(!sc.value("attention_bias", false), "attention biases");
+  // Each key read where Tencent's two released configs give it, and nowhere else.
+  dspine_require(sc.value("model_type", json()) == "qwen3", "model_type (qwen3 layers)");
+  dspine_require(sc.value("hidden_act", json()) == "silu", "hidden_act (silu)");
+  dspine_require(sc.value("attention_bias", json()) == json(false), "attention biases");
   dspine_require(dc.value("draft_block_causal", json()) == json(true), "draft_block_causal must be true");
   dspine_require(dc.value("selected_prefix_terminal", json()) == json(false), "a terminal write");
   dspine_require(dc.value("selected_prefix_decode_mode", "") == "serial", "decode mode (serial)");
@@ -158,25 +159,23 @@ json dspine_config(const json& sc) {
                                           (e.key() == "kappa" && (e.value().is_null() || e.value().is_number()));
                                  }),
                  "selected_prefix_code_bridge (code_size, rank, eps; kappa: training's)");
-  json rp = sc.value("rope_parameters", json::object());  // null: none, as python's `or {}`
-  if (rp.is_null()) rp = json::object();
-  dspine_require((rp.is_object() && rp.value("rope_type", rp.value("type", "default")) == "default") &&
-                     sc.value("rope_scaling", json()).is_null(),
-                 "rope scaling (default rotary only)");
-  dspine_require(rp.value("rope_theta", sc.value("rope_theta", json())).is_number(), "no rope_theta");
-  std::vector<std::string> types(size_t(layers), "full_attention");
-  if (sc.contains("layer_types") && sc["layer_types"].is_array() && !sc["layer_types"].empty())
-    types = sc["layer_types"].get<std::vector<std::string>>();
+  const json rp = sc.value("rope_parameters", json());
+  dspine_require(rp.is_object() && rp.value("rope_type", json()) == "default" &&
+                     rp.value("rope_theta", json()).is_number() && sc.value("rope_scaling", json()).is_null(),
+                 "rope_parameters (default rotary, its theta)");
+  const json lt = sc.value("layer_types", json());
+  dspine_require(lt.is_array() && lt.size() == size_t(layers), "layer_types (one a layer)");
+  const std::vector<std::string> types = lt.get<std::vector<std::string>>();
   auto all = [&](const char* t) {
     return std::all_of(types.begin(), types.end(), [&](const std::string& x) { return x == t; });
   };
   int64_t window = 0;
   if (all("full_attention")) {
-    dspine_require(!sc.value("use_sliding_window", false), "use_sliding_window without sliding layers");
+    dspine_require(sc.value("use_sliding_window", json()) == json(false), "use_sliding_window without sliding layers");
   } else {
     const json w = sc.value("sliding_window", json());
-    dspine_require(all("sliding_attention") && sc.value("use_sliding_window", false) &&
-                       sc.value("max_window_layers", layers) == layers && w.is_number_integer() &&
+    dspine_require(all("sliding_attention") && sc.value("use_sliding_window", json()) == json(true) &&
+                       sc.value("max_window_layers", json()) == json(layers) && w.is_number_integer() &&
                        w.get<int64_t>() > 0,
                    "layer types: all full, or all sliding with one window");
     window = w.get<int64_t>();
@@ -184,12 +183,11 @@ json dspine_config(const json& sc) {
   std::vector<int64_t> taps;
   for (const auto& i : dc.at("target_layer_ids")) taps.push_back(i.get<int64_t>() + 1);
   const int64_t vocab = sc.at("vocab_size").get<int64_t>();
-  const json dvocab = sc.value("draft_vocab_size", json());
-  dspine_require(falsy(dvocab) || dvocab.get<int64_t>() == vocab, "a draft vocabulary of its own");
-  dspine_require(!sc.value("tie_word_embeddings", false), "tied embeddings (it reads the target's head)");
+  dspine_require(sc.value("draft_vocab_size", json()) == json(vocab), "a draft vocabulary of its own");
+  dspine_require(sc.value("tie_word_embeddings", json()) == json(false), "tied embeddings (it reads the target's head)");
   json d = layer_fields(sc);
   d["kind"] = "dspine";
-  d["block"] = dc.contains("block_size") ? dc["block_size"] : sc.at("block_size");
+  d["block"] = sc.at("block_size");
   d["mask_token"] = dc.at("mask_token_id");
   d["taps"] = taps;
   d["window"] = window;
@@ -221,6 +219,7 @@ int dspine_stacked(const std::string& inner) {
 // The block drafters a config.json names by its architecture, and the kind each reads as (draft_config).
 constexpr std::pair<std::string_view, std::string_view> kDrafterArchitectures[] = {
     {"DFlash2DraftModel", "dflash2"},
+    {"DFlashDraftModel", "dflash"},
     {"Qwen3DSparkModel", "dspark"},
     {"DSpineDraftModel", "dspine"},
 };
@@ -241,7 +240,9 @@ std::string drafter_config_kind(const json& sc) {
   return !kind.empty() ? kind : sc.value("speculators_model_type", "") == "dflash2" ? "dflash2" : "";
 }
 
-// python/convert's canonical_draft_config(config, target=None).
+// python/convert's canonical_draft_config(config, target=None).  DFlash (z-lab's DFlashDraftModel, what DFlash2 grew
+// from): DFlash2's block without convolutions (conv_taps 0) or selector (sel_rank 0, sel_topk 1: each row's draft the
+// head's best), block_size beside its dflash_config.
 json draft_config(const json& sc) {
   const std::string kind = drafter_config_kind(sc);
   if (kind == "dspark") return dspark_config(sc);
@@ -250,11 +251,14 @@ json draft_config(const json& sc) {
   std::vector<int64_t> taps;
   int64_t vocab, target_hidden;
   json causal;  // null: causal where the layers slide (z-lab's code)
+  const bool dflash = kind == "dflash";
   if (sc.contains("dflash_config")) {
-    const auto archs = sc.value("architectures", json::array());
-    if (std::find(archs.begin(), archs.end(), "DFlash2DraftModel") == archs.end())
-      throw std::runtime_error("drafter architectures " + archs.dump() + ": DFlash2DraftModel is supported");
+    if (kind != "dflash2" && !dflash)
+      throw std::runtime_error("drafter architectures " + sc.value("architectures", json::array()).dump() +
+                               ": no block drafter flyx reads");
     dc = sc.at("dflash_config"), tl = sc;
+    for (const char* k : {"conv_kernel_size", "conv_group_size", "selector_rank", "selector_top_k"})
+      if (dflash && dc.contains(k)) throw std::runtime_error(std::string("DFlash drafter: DFlash2's ") + k);
     // target_layer_ids name the layers whose outputs the drafter reads (hidden_states[id + 1] in z-lab's code), so
     // every id is below the target's layer count.  A list that reaches num_target_layers counts the hidden states
     // themselves instead (0 the embedding, the last the final norm's output): Inco's drafter for Inkling-2, whose
@@ -281,7 +285,7 @@ json draft_config(const json& sc) {
     causal = false;
   }
   json d = layer_fields(tl);
-  d["kind"] = "dflash2";
+  d["kind"] = kind;
   const int64_t layers = d["layers"].get<int64_t>();
   std::vector<std::string> types;
   if (tl.contains("layer_types") && tl["layer_types"].is_array() && !tl["layer_types"].empty())
@@ -299,16 +303,16 @@ json draft_config(const json& sc) {
   }
   const bool is_causal = causal.is_null() ? window > 0 : causal.get<bool>();
   if (is_causal) throw std::runtime_error("causal DFlash2 layers are not supported (the block attends both ways)");
-  d["block"] = dc.at("block_size");
+  d["block"] = dflash ? sc.at("block_size") : dc.at("block_size");
   d["mask_token"] = dc.at("mask_token_id");
   d["taps"] = taps;
-  d["conv_taps"] = dc.value("conv_kernel_size", json(2));
-  d["conv_group"] = dc.value("conv_group_size", json(16));
-  d["sel_rank"] = dc.value("selector_rank", json(256));
-  d["sel_topk"] = dc.value("selector_top_k", json(16));
+  d["conv_taps"] = dflash ? json(0) : dc.value("conv_kernel_size", json(2));
+  d["conv_group"] = dflash ? json(1) : dc.value("conv_group_size", json(16));
+  d["sel_rank"] = dflash ? json(0) : dc.value("selector_rank", json(256));
+  d["sel_topk"] = dflash ? json(1) : dc.value("selector_top_k", json(16));
   d["window"] = window;
   d["draft_from"] = 1;
-  d["sel_gate"] = true;
+  d["sel_gate"] = !dflash;
   if (dc.contains("final_logit_softcapping") && dc["final_logit_softcapping"].is_number()) {
     const double sc_val = dc["final_logit_softcapping"].get<double>();
     if (!std::isfinite(sc_val) || sc_val < 0.0) throw std::runtime_error("draft final_logit_softcapping out of range");
@@ -328,7 +332,7 @@ json draft_config(const json& sc) {
 std::string inner_name(const std::string& name) { return name.rfind("model.", 0) == 0 ? name.substr(6) : name; }
 
 // python/convert's _D_SKIP and _D_RULES: the drafter's tensor names as the engine knows them, or "" to leave out.
-// layers_only: a drafter without the convolutions and selector (DSpine's layers), whose names they are not.
+// layers_only: a drafter without the convolutions and selector (DFlash's, DSpine's layers), whose names they are not.
 bool canonical(const std::string& name, std::string* out, bool layers_only = false) {
   static const std::regex skip(R"(^(embed_tokens\.|lm_head\.|verifier_norm\.|verifier_lm_head\.|t2d|d2t|mask_embedding|)"
                                R"(confidence_head\.).*)");
@@ -426,7 +430,7 @@ bool read_drafter_dir(const std::string& dir, std::vector<std::unique_ptr<os::Ma
     json sc;
     if (!read_config_json(root, dir, &sc, err)) return false;
     const json draft = draft_config(sc);
-    const bool dspine = draft.at("kind") == "dspine";
+    const bool dspine = draft.at("kind") == "dspine", dflash = draft.at("kind") == "dflash";
     *out = {};
     out->arch = "drafter";
     out->header = {{"arch", "drafter"}, {"kind", "drafter"}, {"draft", draft},
@@ -455,7 +459,7 @@ bool read_drafter_dir(const std::string& dir, std::vector<std::unique_ptr<os::Ma
         const int stacked = dspine ? dspine_stacked(inner) : 0;
         std::string canon;
         if (!version && !terminal && !stacked &&
-            !(dspine ? canonical_dspine(it.key(), &canon) : canonical(it.key(), &canon)))
+            !(dspine ? canonical_dspine(it.key(), &canon) : canonical(it.key(), &canon, dflash)))
           return *err = "unknown draft tensor " + it.key(), false;
         if (!version && !terminal && !stacked && canon.empty()) continue;  // the target's embedding and head
         const json& r = it.value();
@@ -525,13 +529,13 @@ bool read_drafter_dir(const std::string& dir, std::vector<std::unique_ptr<os::Ma
     }
     for (size_t i = 0; i < out->tensors.size(); ++i) out->tensors[i].name = out->names[i].c_str();
     // python/convert's _check_draft (flyx_convert/dspine.py's check_dspine): the tensors its config says it has.
-    // DFlash2's block: convolutions where it has taps of them, the selector's hidden gate where it has one (sel_gate);
-    // DSpine: its bridge, its read and write after every layer.
+    // DFlash2's block: convolutions where it has taps of them, the selector where it has a rank, its hidden gate
+    // where it has one (sel_gate); DSpine: its bridge, its read and write after every layer.
     const bool conv = !dspine && draft.at("conv_taps").get<int64_t>() > 0;
     std::vector<std::string> need = {"fc", "hidden_norm", "norm"};
     if (dspine)
       need.insert(need.end(), {"bridge.codebook", "bridge.gate", "bridge.gate_bias", "bridge.pred", "bridge.prev"});
-    else
+    else if (draft.at("sel_rank").get<int64_t>() > 0)
       need.insert(need.end(), {"sel.pred", "sel.succ"});
     if (!dspine && draft.at("sel_gate").get<bool>()) need.push_back("sel.hid");
     for (int64_t j = 0; j < draft.at("layers").get<int64_t>(); ++j) {

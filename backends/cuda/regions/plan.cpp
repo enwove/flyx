@@ -79,7 +79,7 @@ bool supported(const flyx_bmodel* m, const Block& blk, std::string* why) {
       return no("drafter dimensions outside what the CUDA kernels support");
     // DSpine's GEMMs take K % 8 (gemm()); its walk's scores one warp a candidate, a sender's message in shared memory
     if (d->dspine && (d->dspine.code % 8 || d->dspine.rank % 8 || d->dspine.rank > kDSpineMaxRank ||
-                      d->dspine.topk < 2 || d->dspine.topk > FLYX_DSPINE_MAX_TOPK || d->hidden % 8))
+                      d->sel_topk < 2 || d->sel_topk > FLYX_DSPINE_MAX_TOPK || d->hidden % 8))
       return no("DSpine dimensions outside what the CUDA kernels support (code and rank multiples of 8, rank up to " +
                 std::to_string(kDSpineMaxRank) + ")");
     if (d->hidden != m->hidden || d->target_hidden != m->hidden) return no("drafter hidden size differs from the target's");
@@ -620,11 +620,12 @@ int lower(flyx_bmodel* m, const flyx_program* prog, flyx_plan** out) {
       }
     }
     if (n.kind == FLYX_NODE_DRAFT && n.arg1 == FLYX_DRAFT_TREE) {
-      // The DFlash2 selector's candidates make a tree (ops/draft/ref.h), DV's selector its own (its tree's T at
-      // most); MTP drafts one token a step.
+      // The DFlash2 block's candidates make a tree (ops/draft/ref.h), DV's selector its own (its tree's T at
+      // most); MTP drafts one token a step, DSpine and DFlash (one candidate a row) chains.
       const auto* v = std::get_if<DvBlock>(b);
       const auto* f = std::get_if<DFlashBlock>(b);
-      if (!v && !(f && !f->dspine)) return fail("lower: only DFlash2 and DV draft trees");  // DSpine: chains
+      if (!v && !(f && !f->dspine && f->sel_topk > 1))
+        return fail("lower: only DFlash2's block (of more than one candidate a row) and DV draft trees");
       p->tree = p->drafted_tree = p->has_draft = true;
       most = v ? max_drafts(*b) : FLYX_MAX_ROWS - 1;
     } else if (n.kind == FLYX_NODE_DRAFT) {

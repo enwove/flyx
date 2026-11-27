@@ -172,6 +172,65 @@ void head_logits(const HeadBlock& h, const RowView& v, int r0, int n, bool cert,
   }
 }
 
+// A block drafter's rows (tok) embedded from the target's table, then its norm where it has one: out (tmp: scratch).
+void embed_block_rows(const EmbedBlock& E, const int* tok, float* tmp, float* out, int H, int B, cudaStream_t st) {
+  if (E.has_norm) {
+    embed_tokens(E, tok, tmp, B, st);
+    rmsnorm(tmp, H, E.norm.w, E.norm.offset, E.norm.eps, out, H, B, H, st);
+  } else {
+    embed_tokens(E, tok, out, B, st);  // packed tables stay in host memory
+  }
+}
+
+namespace {
+
+// One layer of a block drafter (DFlash2's, DSpine's) over the block's B rows in s->dx: attention to its context
+// and the block (both ways; causal: each row its own and those before it) and the MLP, the token-conditioned
+// convolutions around both where the block has them.
+void block_layer(flyx_seq* s, const DFlashBlock& b, const DFlashLayer& l, const KvRef& kvr, int B, bool causal,
+                 const Launch& L, bool fused) {
+  const int H = b.hidden, nh = b.nh, nkv = b.nkv, hd = b.hd, I = b.inter;
+  const int Tp = b.conv_taps, TG = b.conv() ? Tp * (H / b.conv_group) : 0, nqkv = (nh + 2 * nkv) * hd;
+  cudaStream_t st = L.st;
+  // Token-conditioned convolutions around attention and MLP where the block has them; plain layers add straight back.
+  const bool conv = b.conv();
+  rmsnorm(s->dx, H, l.norm.w, l.norm.offset, l.norm.eps, s->dh, H, B, H, st);
+  if (conv) {
+    gemm(s->dh, H, l.attn_proj, 2 * TG, H, s->ddelta, 2 * TG, B, false, L);
+    grouped_conv(s->dh, H, s->ddelta, 2 * TG, l.attn_base, H, Tp, b.conv_group, s->dhc, H, B, false, st);
+  }
+  gemm(conv ? s->dhc : s->dh, H, l.w_qkv, nqkv, H, s->dproj, s->ld_dproj, B, false, L);
+  attn_prep(s->dproj, s->ld_dproj, 0, nh * hd, (nh + nkv) * hd, l.q_norm.w, l.k_norm.w, l.q_norm.offset,
+            l.q_norm.eps, b.theta, hd, nh, nkv, hd, B, s->P, kPosPosition, false, s->dq, kvr, st);
+  const bool split_o = fused && !l.w_o.q8_inputs() && (nh * hd) % 64 == 0;
+  attention(s->dq, kvr, nh, nkv, hd, B, causal, causal ? 0 : B, 1.f / std::sqrt(float(hd)), s->P, nullptr, 0,
+            split_o ? nullptr : s->dact, s->ld_dact, s->own.part, kRoundSplits, L, 0, b.window);
+  float* const o_out = conv ? s->dtmp : s->dx;  // without convolutions the projection adds into the residual
+  if (split_o) gemm_presplit(l.w_o, H, nh * hd, o_out, H, B, !conv, L);
+  else gemm(s->dact, s->ld_dact, l.w_o, H, nh * hd, o_out, H, B, !conv, L);
+  if (conv)
+    grouped_conv(s->dtmp, H, s->ddelta + TG, 2 * TG, l.attn_base + size_t(Tp) * H, H, Tp, b.conv_group, s->dx, H,
+                 B, true, st);
+  rmsnorm(s->dx, H, l.post_norm.w, l.post_norm.offset, l.post_norm.eps, s->dh, H, B, H, st);
+  if (conv) {
+    gemm(s->dh, H, l.mlp_proj, 2 * TG, H, s->ddelta, 2 * TG, B, false, L);
+    grouped_conv(s->dh, H, s->ddelta, 2 * TG, l.mlp_base, H, Tp, b.conv_group, s->dhc, H, B, false, st);
+  }
+  gemm(conv ? s->dhc : s->dh, H, l.w_gu, 2 * I, H, s->dproj, s->ld_dproj, B, false, L);
+  if (fused) {
+    swiglu_split(s->dproj, s->ld_dproj, I, B, L, l.w_down.q8_inputs());
+    gemm_presplit(l.w_down, H, I, o_out, H, B, !conv, L);
+  } else {
+    swiglu(s->dproj, s->ld_dproj, I, s->dact, s->ld_dact, B, st);
+    gemm(s->dact, s->ld_dact, l.w_down, H, I, o_out, H, B, !conv, L);
+  }
+  if (conv)
+    grouped_conv(s->dtmp, H, s->ddelta + TG, 2 * TG, l.mlp_base + size_t(Tp) * H, H, Tp, b.conv_group, s->dx, H,
+                 B, true, st);
+}
+
+}  // namespace
+
 // DSpine (backend_abi.h flyx_dspine_block, ops/dspine/ref.h): the rows the round's drafts need (no row reads a row
 // after it: a block of fewer rows drafts the same first drafts), each layer a Qwen3 layer attending causally (within
 // the window) then the bridge's write; the head's candidates for the rows after the anchor; and the walk, which redoes
@@ -183,34 +242,15 @@ void dspine_block(flyx_seq* s, const DFlashBlock& b, int width, const Launch& L,
   const auto& head = block<HeadBlock>(m, b.head);
   const KvBuf& kv = s->kv[size_t(b.kv)];
   const DSpineBridge& br = b.dspine;
-  auto& d = s->ds;
+  auto& d = s->dsp;
   const int B = std::min(b.block, width + 1), nr = B - 1;
-  const int H = b.hidden, nh = b.nh, nkv = b.nkv, hd = b.hd, I = b.inter, C = br.code, R = br.rank, K = br.topk;
-  const int nqkv = (nh + 2 * nkv) * hd, senders = 1 + (nr - 1) * K;
+  const int H = b.hidden, C = br.code, R = br.rank, K = b.sel_topk, senders = 1 + (nr - 1) * K;
   cudaStream_t st = L.st;
   build_rows(s->P, nullptr, b.mask_token, s->dtok, B, st);
-  embed_tokens(E, s->dtok, s->dx, B, st);  // packed tables stay in host memory
+  embed_block_rows(E, s->dtok, s->dh, s->dx, H, B, st);
   for (int j = 0; j < b.layers(); ++j) {
     const auto& l = block<DFlashLayer>(m, b.first_layer + j);
-    const KvRef kvr = kv.draft_ref(j);  // a sliding window's ring of slots too (pos % ring)
-    rmsnorm(s->dx, H, l.norm.w, l.norm.offset, l.norm.eps, s->dh, H, B, H, st);
-    gemm(s->dh, H, l.w_qkv, nqkv, H, s->dproj, s->ld_dproj, B, false, L);
-    attn_prep(s->dproj, s->ld_dproj, 0, nh * hd, (nh + nkv) * hd, l.q_norm.w, l.k_norm.w, l.q_norm.offset,
-              l.q_norm.eps, b.theta, hd, nh, nkv, hd, B, s->P, kPosPosition, false, s->dq, kvr, st);
-    const bool split_o = fused && !l.w_o.q8_inputs() && (nh * hd) % 64 == 0;
-    attention(s->dq, kvr, nh, nkv, hd, B, true, 0, 1.f / std::sqrt(float(hd)), s->P, nullptr, 0,
-              split_o ? nullptr : s->dact, s->ld_dact, s->own.part, kRoundSplits, L, 0, b.window);
-    if (split_o) gemm_presplit(l.w_o, H, nh * hd, s->dx, H, B, true, L);
-    else gemm(s->dact, s->ld_dact, l.w_o, H, nh * hd, s->dx, H, B, true, L);
-    rmsnorm(s->dx, H, l.post_norm.w, l.post_norm.offset, l.post_norm.eps, s->dh, H, B, H, st);
-    gemm(s->dh, H, l.w_gu, 2 * I, H, s->dproj, s->ld_dproj, B, false, L);
-    if (fused) {
-      swiglu_split(s->dproj, s->ld_dproj, I, B, L, l.w_down.q8_inputs());
-      gemm_presplit(l.w_down, H, I, s->dx, H, B, true, L);
-    } else {
-      swiglu(s->dproj, s->ld_dproj, I, s->dact, s->ld_dact, B, st);
-      gemm(s->dact, s->ld_dact, l.w_down, H, I, s->dx, H, B, true, L);
-    }
+    block_layer(s, b, l, kv.draft_ref(j), B, true, L, fused);  // causal within the block
     // The bridge's write; the last one's rows before it, their rms and gate projections are what the walk redoes.
     const bool last = j == b.layers() - 1;
     dspine_normalize(s->dx, H, br.eps, B, s->dh, d.rms, st);
@@ -252,64 +292,21 @@ void draft_block(flyx_seq* s, const DFlashBlock& b, int width, const Launch& L, 
   // drafts, so width rows.  Trees keep the block they were made for.
   const int off = b.draft_from;
   const int B = tree ? b.block : std::min(FLYX_MAX_ROWS, std::max(b.block, width + off));
-  const int H = b.hidden, nh = b.nh, nkv = b.nkv, hd = b.hd, I = b.inter;
-  const int Tp = b.conv_taps, G = H / b.conv_group, TG = Tp * G, nqkv = (nh + 2 * nkv) * hd;
+  const int H = b.hidden;
   cudaStream_t st = L.st;
   build_rows(s->P, nullptr, b.mask_token, s->dtok, B, st);
-  if (E.has_norm) {
-    embed_tokens(E, s->dtok, s->dh, B, st);
-    rmsnorm(s->dh, H, E.norm.w, E.norm.offset, E.norm.eps, s->dx, H, B, H, st);
-  } else {
-    embed_tokens(E, s->dtok, s->dx, B, st);  // packed tables stay in host memory
-  }
-  for (int j = 0; j < b.layers(); ++j) {
-    const auto& l = block<DFlashLayer>(m, b.first_layer + j);
-    const KvRef kvr = kv.draft_ref(j);
-    // Token-conditioned convolutions around attention and MLP where the block has them; plain layers add straight back.
-    const bool conv = b.conv();
-    rmsnorm(s->dx, H, l.norm.w, l.norm.offset, l.norm.eps, s->dh, H, B, H, st);
-    if (conv) {
-      gemm(s->dh, H, l.attn_proj, 2 * TG, H, s->ddelta, 2 * TG, B, false, L);
-      grouped_conv(s->dh, H, s->ddelta, 2 * TG, l.attn_base, H, Tp, b.conv_group, s->dhc, H, B, false, st);
-    }
-    gemm(conv ? s->dhc : s->dh, H, l.w_qkv, nqkv, H, s->dproj, s->ld_dproj, B, false, L);
-    attn_prep(s->dproj, s->ld_dproj, 0, nh * hd, (nh + nkv) * hd, l.q_norm.w, l.k_norm.w, l.q_norm.offset,
-              l.q_norm.eps, b.theta, hd, nh, nkv, hd, B, s->P, kPosPosition, false, s->dq, kvr, st);
-    const bool split_o = fused && !l.w_o.q8_inputs() && (nh * hd) % 64 == 0;
-    attention(s->dq, kvr, nh, nkv, hd, B, false, B, 1.f / std::sqrt(float(hd)), s->P, nullptr, 0,
-              split_o ? nullptr : s->dact, s->ld_dact, s->own.part, kRoundSplits, L, 0, b.window);
-    float* const o_out = conv ? s->dtmp : s->dx;  // without convolutions the projection adds into the residual
-    if (split_o) gemm_presplit(l.w_o, H, nh * hd, o_out, H, B, !conv, L);
-    else gemm(s->dact, s->ld_dact, l.w_o, H, nh * hd, o_out, H, B, !conv, L);
-    if (conv)
-      grouped_conv(s->dtmp, H, s->ddelta + TG, 2 * TG, l.attn_base + size_t(Tp) * H, H, Tp, b.conv_group, s->dx, H,
-                   B, true, st);
-    rmsnorm(s->dx, H, l.post_norm.w, l.post_norm.offset, l.post_norm.eps, s->dh, H, B, H, st);
-    if (conv) {
-      gemm(s->dh, H, l.mlp_proj, 2 * TG, H, s->ddelta, 2 * TG, B, false, L);
-      grouped_conv(s->dh, H, s->ddelta, 2 * TG, l.mlp_base, H, Tp, b.conv_group, s->dhc, H, B, false, st);
-    }
-    gemm(conv ? s->dhc : s->dh, H, l.w_gu, 2 * I, H, s->dproj, s->ld_dproj, B, false, L);
-    if (fused) {
-      swiglu_split(s->dproj, s->ld_dproj, I, B, L, l.w_down.q8_inputs());
-      gemm_presplit(l.w_down, H, I, o_out, H, B, !conv, L);
-    } else {
-      swiglu(s->dproj, s->ld_dproj, I, s->dact, s->ld_dact, B, st);
-      gemm(s->dact, s->ld_dact, l.w_down, H, I, o_out, H, B, !conv, L);
-    }
-    if (conv)
-      grouped_conv(s->dtmp, H, s->ddelta + TG, 2 * TG, l.mlp_base + size_t(Tp) * H, H, Tp, b.conv_group, s->dx, H,
-                   B, true, st);
-  }
+  embed_block_rows(E, s->dtok, s->dh, s->dx, H, B, st);
+  for (int j = 0; j < b.layers(); ++j)
+    block_layer(s, b, block<DFlashLayer>(m, b.first_layer + j), kv.draft_ref(j), B, false, L, fused);
   // Rows draft_from.. predict tokens (width of them): unary top-k from the target head, then the
   // selector walk (or tree).  The block's layers above need all B rows (attention inside
   // the block is not causal), the head only the rows whose drafts are used.
   const int nr = std::min(width, B - off);
   rmsnorm(s->dx + size_t(off) * H, H, b.norm.w, b.norm.offset, b.norm.eps, s->dh, H, nr, H, st);
   draft_head_pick(head, s->dh, nr, b.sel_topk, s->cand, s->unary, s, L, s->draft_prob, s->draft_margin);
-  // no sel_hid: the selector's score with a unit gate
+  // no sel_hid: the selector's score with a unit gate; no selector (rank 0): the head's logits alone
   const float* hid = b.unit_hid ? b.unit_hid : s->hid;
-  if (!b.unit_hid) gemm(s->dh, H, b.sel_hid, b.sel_rank, H, s->hid, b.sel_rank, nr, false, L);
+  if (b.selector() && !b.unit_hid) gemm(s->dh, H, b.sel_hid, b.sel_rank, H, s->hid, b.sel_rank, nr, false, L);
   if (tree)
     selector_tree(s->P, s->cand, s->unary, b.sel_topk, hid, b.sel_rank, b.sel_pred, b.sel_succ, width, nr,
                   s->oracle, s->drafts, s->tree, st, b.softcap, b.softcap_mode, s->G);

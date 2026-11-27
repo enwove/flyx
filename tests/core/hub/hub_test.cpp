@@ -512,17 +512,23 @@ void cache_snapshots(const fs::path& tmp) {
 }
 
 // ---- a drafter's kind from a cached config ----------------------------------------------------------------------
-// Its config's architecture: Tencent's DSpineDraftModel is DSpine.
+// Its config's architecture: Tencent's DSpineDraftModel is DSpine, z-lab's DFlashDraftModel DFlash.
 void cached_drafter_kinds(const fs::path& tmp) {
   const std::string commit = "3333333333333333333333333333333333333333";
-  const std::string dir = "models--acme--DSpine";
-  put(tmp / dir, commit, "config.json", R"({"architectures": ["DSpineDraftModel"], "dflash_config": {}})");
-  fs::create_directories(tmp / dir / "refs");
-  std::ofstream(tmp / dir / "refs" / "main", std::ios::binary) << commit;
+  const std::pair<const char*, const char*> cases[] = {{"DSpine", "DSpineDraftModel"}, {"DFlash", "DFlashDraftModel"}};
+  for (const auto& [name, arch] : cases) {
+    const std::string dir = std::string("models--acme--") + name;
+    const std::string config = std::string(R"({"architectures": [")") + arch + R"("], "dflash_config": {}})";
+    put(tmp / dir, commit, "config.json", config);
+    fs::create_directories(tmp / dir / "refs");
+    std::ofstream(tmp / dir / "refs" / "main", std::ios::binary) << commit;
+  }
   set_env("HF_HUB_CACHE", from_path(tmp));
-  flyx::hub::Repo r;
-  check(flyx::hub::in_cache("acme/DSpine", "main", &r) && flyx::hub::drafter_kind(r) == "dspine",
+  flyx::hub::Repo spine, flash;
+  check(flyx::hub::in_cache("acme/DSpine", "main", &spine) && flyx::hub::drafter_kind(spine) == "dspine",
         "a DSpineDraftModel: DSpine");
+  check(flyx::hub::in_cache("acme/DFlash", "main", &flash) && flyx::hub::drafter_kind(flash) == "dflash",
+        "a DFlashDraftModel: DFlash");
 }
 
 // ---- a fake Hub ------------------------------------------------------------------------------------------------

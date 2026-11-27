@@ -38,7 +38,13 @@ canvas steps from the Python reference, for the float64 references in ops/
 tiny Qwen3.5 with a tiny DSpine drafter (hf_dspine/, as tencent publishes them) in place of DFlash2's;
 tiny_dspine_window.flyx and golden_dspine_window.json the same with a sliding window of 8; tiny_draft_dspine.flyx the
 DSpine drafter alone; tiny_qwen3_dspine.flyx the tiny Qwen3 with a DSpine drafter (its tokens golden_qwen3.json's);
-tiny_dspine1.flyx, golden_dspine1.json and tiny_draft_dspine1.flyx (hf_dspine1/) with a DSpine drafter of one layer.
+tiny_dspine1.flyx, golden_dspine1.json and tiny_draft_dspine1.flyx (hf_dspine1/) with a DSpine drafter of one layer;
+tiny_dspine_nvfp4.flyx and golden_dspine_nvfp4.json the DSpine drafter beside the NVFP4 copy; tiny_dspine8.flyx and
+golden_dspine8.json one of a block of 8 (hf_dspine8/); golden_qwen3_dspine.json tiny_qwen3_dspine.flyx's rounds, its
+drafter's drafts from transformers' own hidden states (write_hf_drafts).
+tiny_dflash.flyx, golden_dflash.json, tiny_draft_dflash.flyx (hf_dflash/) and tiny_qwen3_dflash.flyx with a DFlash
+drafter (z-lab's DFlashDraftModel, DFlash2's block without convolutions or selector) in place of DFlash2's;
+tiny_dflash8.flyx and golden_dflash8.json one of a block of 8 (hf_dflash8/).
 
 Two groups, each with its outputs (OUTPUTS), digest and stamp: dv (DV's: dv_cases.json, the tiny Llama's DV files,
 golden_llama_dv.json, the DV files beside a V-LoRA and golden_llama_dv_lora.json; FLYX_TEST_DV's tests/dv.cmake makes
@@ -72,9 +78,12 @@ OUTPUTS = {
              "tiny_llama_nvfp4.flyx", "golden_llama_nvfp4.json", "tiny_llama_lora.flyx", "golden_llama_lora.json",
              "tiny_llama_nvfp4_lora.flyx", "golden_llama_nvfp4_lora.json", "tiny_dspine.flyx", "golden_dspine.json",
              "tiny_dspine_window.flyx", "golden_dspine_window.json", "tiny_draft_dspine.flyx", "tiny_qwen3_dspine.flyx",
-             "tiny_dspine1.flyx", "golden_dspine1.json", "tiny_draft_dspine1.flyx",
+             "tiny_dspine1.flyx", "golden_dspine1.json", "tiny_draft_dspine1.flyx", "tiny_dspine_nvfp4.flyx",
+             "golden_dspine_nvfp4.json", "tiny_dspine8.flyx", "golden_dspine8.json", "golden_qwen3_dspine.json",
              "peft_qwen3/adapter_config.json", "peft_qwen3/adapter_model.safetensors", "golden_qwen3_lora.json",
-             "peft_qwen35/adapter_config.json", "peft_qwen35/adapter_model.safetensors", "golden_qwen35_lora.json"),
+             "peft_qwen35/adapter_config.json", "peft_qwen35/adapter_model.safetensors", "golden_qwen35_lora.json",
+             "tiny_dflash.flyx", "golden_dflash.json", "tiny_draft_dflash.flyx", "tiny_qwen3_dflash.flyx",
+             "tiny_dflash8.flyx", "golden_dflash8.json"),
     "dv": ("dv_cases.json", "tiny_llama_dv.flyx", "tiny_llama_dv_pool.flyx", "tiny_llama_dv32.flyx",
            "tiny_llama_dv31.flyx", "tiny_llama_dv31_pool.flyx", "tiny_llama_dv31_wide.flyx",
            "tiny_llama_dv31_wide_pool.flyx", "golden_llama_dv.json", "tiny_llama_dv_lora.flyx",
@@ -152,7 +161,7 @@ from flyx_convert.fileformat import Reader  # noqa: E402
 from flyx_convert.tokenizer_export import MINICPM5_NUMBERS, MINICPM5_SPLIT, QWEN35_SPLIT  # noqa: E402
 from flyx_ref import dv  # noqa: E402
 from flyx_ref import greedy_plain, greedy_spec, greedy_spec_mtp  # noqa: E402
-from flyx_ref.load import load  # noqa: E402
+from flyx_ref.load import load, make_draft as reference_draft  # noqa: E402
 
 SPECIALS = ["<|endoftext|>", "<|im_start|>", "<|im_end|>", "<|mask|>"]
 ADDED = ["<think>", "</think>"]
@@ -283,6 +292,55 @@ _HF_LINEARS = {"q": ("self_attn", "q_proj"), "k": ("self_attn", "k_proj"), "v": 
                "down": ("mlp", "down_proj"), "gdn.qkv": ("linear_attn", "in_proj_qkv"),
                "gdn.z": ("linear_attn", "in_proj_z"), "gdn.b": ("linear_attn", "in_proj_b"),
                "gdn.a": ("linear_attn", "in_proj_a"), "gdn.out": ("linear_attn", "out_proj")}
+
+
+class _HFState:
+    def __init__(self, ids):
+        self.ids = ids
+
+    @property
+    def pos(self):
+        return len(self.ids)
+
+    def clone(self):
+        return _HFState(list(self.ids))
+
+
+class _HFTarget:
+    """transformers' model (float64) as the reference's Target for greedy_spec: its logits, and its hidden states after
+    the layers a drafter taps (hidden_states[t]: after t layers, the last after the final norm), recomputed over the
+    whole sequence at every call (a tiny model)."""
+
+    def __init__(self, model):
+        self.m = model
+
+    def new_state(self):
+        return _HFState([])
+
+    def forward(self, tokens, st, taps=()):
+        n0 = len(st.ids)
+        st.ids += [int(t) for t in tokens]
+        with torch.no_grad():
+            out = self.m(torch.tensor([st.ids]), output_hidden_states=True)
+        return out.logits[0, n0:], {t: out.hidden_states[t][0, n0:] for t in taps}, None
+
+
+def write_hf_drafts(hf_dir: str, flyx_path: str, golden_json: str, out_json: str):
+    """A model file's block drafter on a target the reference has no model of (the tiny Qwen3): greedy rounds of its
+    drafts (the reference's drafter) from transformers' own hidden states at its taps, on golden_json's prompts, whose
+    tokens they must give."""
+    from transformers import AutoModelForCausalLM
+    target = _HFTarget(AutoModelForCausalLM.from_pretrained(hf_dir, dtype=torch.float64).eval())
+    with Reader(flyx_path) as r:
+        draft = reference_draft(r.header["draft"], r.all_torch())
+    golden = json.load(open(golden_json, encoding="utf-8"))
+    cases = []
+    for c in golden["cases"]:
+        out, rounds = greedy_spec(target, draft, c["prompt"], len(c["tokens"]))
+        assert out == c["tokens"], (out, c["tokens"])
+        cases.append({"prompt": c["prompt"], "tokens": out,
+                      "rounds": [{k: rd[k] for k in ("pos", "anchor", "drafts", "n")} for rd in rounds]})
+    json.dump({"eos": golden["eos"], "cases": cases}, open(out_json, "w", encoding="utf-8"), indent=0)
 
 
 def write_golden_hf(hf_dir: str, out_json: str, prompts, n=48, min_margin=0.02, lora=None):
@@ -563,6 +621,39 @@ def make_dspine(out_dir: str, vocab: int, mask_id: int, target_layers: int, gen,
     json.dump(cfg, open(os.path.join(out_dir, "config.json"), "w", encoding="utf-8"), indent=1)
 
 
+def make_dflash(out_dir: str, vocab: int, mask_id: int, target_layers: int, gen, H=64, layers=2, heads=4, kv=2,
+                hd=32, inter=128, taps=(2, 5, 7), block=16):
+    """A random DFlash drafter as z-lab publishes them (DFlashDraftModel: Qwen3 layers, fc and its norm, no
+    convolutions or selector; block_size beside dflash_config, target_layer_ids the target layers whose outputs it
+    reads).  Its own generator, so the assets made before it stay what they were."""
+    from safetensors.torch import save_file
+    os.makedirs(out_dir, exist_ok=True)
+    r = lambda *s, scale=1.0: (torch.randn(*s, generator=gen) * scale)  # noqa: E731
+    W = {"fc.weight": r(H, len(taps) * H, scale=1 / math.sqrt(len(taps) * H)),
+         "hidden_norm.weight": 1 + 0.2 * r(H), "norm.weight": 1 + 0.2 * r(H)}
+    for j in range(layers):
+        p = f"layers.{j}."
+        W.update({
+            p + "input_layernorm.weight": 1 + 0.2 * r(H), p + "post_attention_layernorm.weight": 1 + 0.2 * r(H),
+            p + "self_attn.q_proj.weight": r(heads * hd, H, scale=H ** -0.5),
+            p + "self_attn.k_proj.weight": r(kv * hd, H, scale=H ** -0.5),
+            p + "self_attn.v_proj.weight": r(kv * hd, H, scale=H ** -0.5),
+            p + "self_attn.o_proj.weight": r(H, heads * hd, scale=(heads * hd) ** -0.5),
+            p + "self_attn.q_norm.weight": 1 + 0.2 * r(hd), p + "self_attn.k_norm.weight": 1 + 0.2 * r(hd),
+            p + "mlp.gate_proj.weight": r(inter, H, scale=H ** -0.5),
+            p + "mlp.up_proj.weight": r(inter, H, scale=H ** -0.5),
+            p + "mlp.down_proj.weight": r(H, inter, scale=inter ** -0.5)})
+    save_file({k: v.to(torch.bfloat16).contiguous() for k, v in W.items()}, os.path.join(out_dir, "model.safetensors"))
+    cfg = {"architectures": ["DFlashDraftModel"], "model_type": "qwen3", "attention_bias": False, "block_size": block,
+           "dflash_config": {"mask_token_id": mask_id, "target_layer_ids": [t - 1 for t in taps]},
+           "hidden_act": "silu", "hidden_size": H, "intermediate_size": inter, "num_hidden_layers": layers,
+           "num_attention_heads": heads, "num_key_value_heads": kv, "head_dim": hd, "rms_norm_eps": 1e-6,
+           "vocab_size": vocab, "num_target_layers": target_layers, "max_position_embeddings": 4096,
+           "layer_types": ["full_attention"] * layers, "rope_scaling": None, "rope_theta": 1000000,
+           "sliding_window": None, "use_sliding_window": False, "tie_word_embeddings": False}
+    json.dump(cfg, open(os.path.join(out_dir, "config.json"), "w", encoding="utf-8"), indent=1)
+
+
 def zlab_drafter(src: str, dst: str, target_layers: int, window: int = 0, block: int = 0):
     """The drafter in src (speculators' layout) as z-lab publishes DFlash2 drafters: the same tensors, its settings
     in dflash_config, target_layer_ids the layers whose outputs it reads (speculators' indices - 1), with a
@@ -762,6 +853,36 @@ def make_core(out: str):
     convert(tdir, s1path, s1dir, log=lambda *_: None)
     write_golden(s1path, os.path.join(out, "golden_dspine1.json"), prompts + more, vocab, keep=4)
     convert_draft(s1dir, os.path.join(out, "tiny_draft_dspine1.flyx"), log=lambda *_: None)
+    # The DSpine drafter beside the tiny Qwen3.5's NVFP4 copy (its layers' copies made beside an NVFP4 target); one of
+    # a block of 8; and the tiny Qwen3's DSpine rounds against transformers' own hidden states (its taps).
+    snpath = os.path.join(out, "tiny_dspine_nvfp4.flyx")
+    convert(qdir, snpath, sdir, log=lambda *_: None, activations="bf16")  # as tiny_nvfp4.flyx: bf16 inputs
+    write_golden(snpath, os.path.join(out, "golden_dspine_nvfp4.json"), prompts + more, vocab, min_margin=0.05, keep=4)
+    s8dir, s8path = os.path.join(out, "hf_dspine8"), os.path.join(out, "tiny_dspine8.flyx")
+    make_dspine(s8dir, vocab, mask, layers, sgen, block=8)
+    convert(tdir, s8path, s8dir, log=lambda *_: None)
+    write_golden(s8path, os.path.join(out, "golden_dspine8.json"), prompts + more, vocab, keep=4)
+    write_hf_drafts(q3dir, os.path.join(out, "tiny_qwen3_dspine.flyx"), os.path.join(out, "golden_qwen3.json"),
+                    os.path.join(out, "golden_qwen3_dspine.json"))
+    # The tiny Qwen3.5 with a DFlash drafter (z-lab's DFlashDraftModel, what DFlash2 grew from) in place of DFlash2's,
+    # and alone as a drafter file; the tiny Qwen3 with one of its own (taps after its layers 1, 2 and 3 of 4), held
+    # to transformers' tokens (golden_qwen3.json).  Its own generator: the files above stay what they were.
+    fgen = torch.Generator().manual_seed(8765)
+    fdir, fpath = os.path.join(out, "hf_dflash"), os.path.join(out, "tiny_dflash.flyx")
+    make_dflash(fdir, vocab, mask, layers, fgen)
+    convert(tdir, fpath, fdir, log=lambda *_: None)
+    write_golden(fpath, os.path.join(out, "golden_dflash.json"), prompts + more, vocab, keep=4)
+    convert_draft(fdir, os.path.join(out, "tiny_draft_dflash.flyx"), log=lambda *_: None)
+    same_drafter(fpath, os.path.join(out, "tiny_draft_dflash.flyx"))
+    q3f = os.path.join(out, "hf_qwen3_dflash")
+    make_dflash(q3f, vocab, mask, 4, fgen, taps=(1, 2, 3))
+    convert(q3dir, os.path.join(out, "tiny_qwen3_dflash.flyx"), q3f, log=lambda *_: None)
+    # A DFlash of a block of 8: two fit in a round's 16 rows, but without convolutions it drafts a sequence at a time
+    # (DFlashBlock::groups), its batched rounds each sequence's solo ones.
+    f8dir, f8path = os.path.join(out, "hf_dflash8"), os.path.join(out, "tiny_dflash8.flyx")
+    make_dflash(f8dir, vocab, mask, layers, torch.Generator().manual_seed(8766), block=8)
+    convert(tdir, f8path, f8dir, log=lambda *_: None)
+    write_golden(f8path, os.path.join(out, "golden_dflash8.json"), prompts + more, vocab, keep=4)
     # The tiny Llama's linears in NVFP4 (ModelOpt's layout, bf16 inputs): rounds of more than 16 rows on its NVFP4
     # GEMMs (gemm_fp4_rows).  The reference has no Llama of NVFP4 weights: golden_llama_nvfp4.json gives the prompts
     # alone, and golden_test holds the file to its own plain decoding.  No random numbers: the files above stay.
@@ -792,7 +913,10 @@ def make_core(out: str):
           f"tiny_llama_nvfp4.flyx, golden_llama_nvfp4.json, tiny_llama_lora.flyx, golden_llama_lora.json "
           f"({nlora} prompts), tiny_llama_nvfp4_lora.flyx, golden_llama_nvfp4_lora.json, tiny_dspine.flyx, "
           f"golden_dspine.json, tiny_dspine_window.flyx, golden_dspine_window.json, tiny_draft_dspine.flyx, "
-          f"tiny_qwen3_dspine.flyx, tiny_dspine1.flyx, golden_dspine1.json, tiny_draft_dspine1.flyx")
+          f"tiny_qwen3_dspine.flyx, tiny_dspine1.flyx, golden_dspine1.json, tiny_draft_dspine1.flyx, "
+          f"tiny_dspine_nvfp4.flyx, golden_dspine_nvfp4.json, tiny_dspine8.flyx, golden_dspine8.json, "
+          f"golden_qwen3_dspine.json, tiny_dflash.flyx, golden_dflash.json, tiny_draft_dflash.flyx, "
+          f"tiny_qwen3_dflash.flyx, tiny_dflash8.flyx, golden_dflash8.json")
 
 
 def make_dv(out: str):
@@ -1333,6 +1457,8 @@ PENALTY = (1.5, 0.25)  # presence, frequency: the golden cases with penalties
 def write_golden(path, out_json, prompts, vocab, min_margin=0.0, keep=None):
     target, draft, mtp, header, _ = load(path, with_mtp=True)
     golden = {"eos": header["generation"]["eos_ids"], "cases": []}
+    if draft is not None:
+        golden["width"] = draft.block_drafts  # the block drafter's drafts a round below (its block's rows but the anchor)
     for pr in prompts:
         if keep is not None and len(golden["cases"]) >= keep:
             break

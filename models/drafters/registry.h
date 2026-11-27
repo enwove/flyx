@@ -54,10 +54,11 @@ class DrafterRegistry {
   void emit_contexts(std::vector<flyx_node>* p) const;
 
  private:
-  // The block drafter's spec, read once: DSpine's own, or DFlash2's block (DFlash2, DSpark).
+  // Each drafter's spec, read once: the block slot's (DFlash2's block: DFlash2, DSpark; or DSpine's) and llama.cpp's
+  // DSpark GGUF beside it.
   const DFlash2Spec& ensure_dflash2_spec(const ModelFile& file, const TargetSpec& target);
-  const DSparkSpec& ensure_dspark_spec(const ModelFile& file, const TargetSpec& target);
   const DSpineSpec& ensure_dspine_spec(const ModelFile& file, const TargetSpec& target);
+  const DSparkSpec& ensure_dspark_spec(const ModelFile& file, const TargetSpec& target);
 
   DrafterSources sources_{};
   int mtp_companion_ = -1;
