@@ -182,6 +182,8 @@ Passed verbatim to the backend (`backends/cuda/backend.cpp`). Unknown keys or in
 | Key | Allowed Values | Default | Effect |
 |---|---|---|---|
 | `profile` | `0` \| `1` | `0` | Print per-node GPU time (disables CUDA graphs). Also supported by `cpu_ref`. |
+| `expert_simd` | nonnegative integer | 512 | Maximum cold-dot SIMD width in bits. Zero forces scalar. Values below the next implementation width use the narrower available path. |
+| `expert_integer` | `0` or `1` | 1 | Use integer products for supported IQ weights with Q8 inputs. |
 | `expert_adapt` | `0` or `1` | 1 | Rank experts by decaying prompt route counts and exchange slots between sessions when streamed banks are enabled. |
 | `expert_global` | `0` or `1` | 0 | Pool expert counts across physical layers with the same expert count. |
 | `expert_prefill_min` | nonnegative integer | 16 | Minimum prompt rows for streamed expert banks. Zero uses CPU experts for every prompt size. |

@@ -61,6 +61,7 @@ struct ColdMatrix {
   int first, rows, cols, dtype;
   size_t stride;
   bool q8, a16h, nvfp4;
+  int max_isa = 512;
   QuantDot quant_dot = nullptr;
   std::vector<uint8_t> data;
   std::vector<float> scales;

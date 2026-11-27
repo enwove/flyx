@@ -680,6 +680,8 @@ ExpertMat WeightLoader::expert_mat(int w, std::shared_ptr<ColdMatrix>& cold) {
   const size_t E = std::min(all, size_t(m_->opt.gpu_experts)), N = size_t(v->shape[1]), K = size_t(v->shape[2]);
   if (E < all) {
     auto matrix = std::make_shared<ColdMatrix>(weights_[w], int(E), layout);
+    matrix->max_isa = m_->opt.expert_simd;
+    if (matrix->q8 && m_->opt.expert_integer) matrix->quant_dot = cold_q8_kernel(matrix->dtype, matrix->max_isa);
     if (m_->opt.expert_prefill_min) matrix->pack_banks(layout, all);
     cold = cold_experts_[w] = std::move(matrix);
     m_->host_bytes += cold->bytes();

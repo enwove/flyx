@@ -16,7 +16,6 @@ ColdMatrix::ColdMatrix(const flyx_weight& w, int hot, const ExpertLayout& layout
       q8(layout.format == ExpertLayout::ggml_blocks && w.activations == FLYX_ACT_Q8),
       a16h(layout.format == ExpertLayout::ggml_blocks && !q8),
       nvfp4(layout.format == ExpertLayout::nvfp4) {
-  if (q8) quant_dot = cold_q8_kernel(dtype);
   const size_t count = size_t(w.t->shape[0] - hot), nrows = size_mul(count, size_t(rows));
   if (w.scale2) {
     if (!w.scale2->data) throw std::runtime_error("missing cold expert scales");
@@ -152,7 +151,7 @@ void ColdMatrix::prepare(float* x, bool vector_nvfp4) const {
 float ColdMatrix::product(int expert, int row, const float* x, const ColdQ8* quant) const {
   size_t e = size_t(expert - first);
   const uint8_t* weights = data.data() + (e * rows + row) * stride;
-  const float dot = quant_dot ? quant_dot(weights, quant, cols) : cold_dot(dtype, weights, x, cols);
+  const float dot = quant_dot ? quant_dot(weights, quant, cols) : cold_dot_limited(dtype, weights, x, cols, max_isa);
   return dot * (scales.empty() ? 1.f : scales[e]);
 }
 
@@ -196,7 +195,8 @@ struct ColdWorkspace {
   std::map<std::pair<const MoeBlock*, bool>, ExpertTimes> times;
   uint64_t decode_slots = 0, decode_cold = 0, last_decode_slots = 0, last_decode_cold = 0;
   uint64_t visits = 0, chunks = 0, slots = 0, cpu_pairs = 0;
-  double route_seconds = 0, cpu_seconds = 0;
+  double route_seconds = 0, cpu_seconds = 0, decode_handoff = 0, decode_cpu = 0;
+  uint64_t decode_visits = 0, decode_bytes = 0;
   ~ColdWorkspace() {
     if (copy) cudaStreamSynchronize(copy);
     for (auto& slot : staging) {
@@ -222,6 +222,10 @@ struct ColdWorkspace {
                    t.reduce / t.visits, t.cpu ? t.bytes / (t.cpu * 1e3) : 0.,
                    100. * (t.pairs - t.cold) / t.pairs);
     }
+    if (verbose && decode_visits)
+      std::fprintf(stderr, "flyx-cuda: decode %.2f us/visit route handoff, %.2f us/visit CPU, %.2f GB/s cold reads\n",
+                   decode_handoff * 1e6 / decode_visits, decode_cpu * 1e6 / decode_visits,
+                   decode_cpu > 0 ? decode_bytes / decode_cpu / 1e9 : 0.);
     if (verbose && decode_slots)
       std::fprintf(stderr, "flyx-cuda: decode expert cache hit rate %.2f%% (%llu/%llu routed slots)\n",
                    100. * (decode_slots - decode_cold) / decode_slots,
@@ -465,6 +469,7 @@ void hybrid_experts(const Pass& ps, const MoeBlock& f, const MoeScratch* sc, flo
       t->rows += ps.rows;
     }
     ++ws.visits;
+    if (ws.verbose && ps.round) ++ws.decode_visits;
     for (int base = 0; base < ps.rows; base += ColdShape::chunk) {
       int rows = std::min(ColdShape::chunk, ps.rows - base);
       auto* ids = b.moe_idx + size_t(base) * K;
@@ -499,6 +504,7 @@ void hybrid_experts(const Pass& ps, const MoeBlock& f, const MoeScratch* sc, flo
       if (ws.verbose || t) {
         const double dt = std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count();
         ws.route_seconds += dt;
+        if (ps.round) ws.decode_handoff += dt;
         if (t) t->handoff += dt * 1e6;
       }
       ws.cold.clear();
@@ -560,6 +566,10 @@ void hybrid_experts(const Pass& ps, const MoeBlock& f, const MoeScratch* sc, flo
         if (ws.verbose || t) {
           const double dt = std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count();
           ws.cpu_seconds += dt;
+          if (ps.round) {
+            ws.decode_cpu += dt;
+            ws.decode_bytes += ws.cold.size() * (f.cold_gu->stride * f.cold_gu->rows + f.cold_down->stride * f.cold_down->rows);
+          }
           if (t) t->cpu += dt * 1e6;
         }
         if (t) CK(cudaEventRecord(ws.timer[2], L.st));
