@@ -3601,8 +3601,12 @@ void graph_memory(const std::string& model, const std::string& backend, const st
       // RTX 5070 Ti: 140,794 to 152,642 KiB counted, 102,400 to 112,640 taken, of 215,680 KiB of rooms).  Against the
       // rooms themselves "under twice what they took" was 1.91 to 2.11: it failed four runs of the ten.  Each half
       // of it holds every run: the count against what was taken, the rooms against the count.
-      check(on.held < 2 * std::max<int64_t>(graphs, kPiece), at + "their graphs counted under twice what they took");
-      check(on.room < 2 * on.held, at + "the rooms under twice what their graphs are counted at");
+      const std::string counts = " (" + std::to_string(on.room >> 10) + " KiB of rooms, " +
+                                 std::to_string(on.held >> 10) + " counted, " + std::to_string(graphs >> 10) +
+                                 " taken)";
+      check(on.held < 2 * std::max<int64_t>(graphs, kPiece),
+            at + "their graphs counted under twice what they took" + counts);
+      check(on.room < 2 * on.held, at + "the rooms under twice what their graphs are counted at" + counts);
     }
     check(on.params <= kGraphParamBound && on.unknown == 0,
           at + "no round graph's kernel takes more than " + std::to_string(kGraphParamBound) +
