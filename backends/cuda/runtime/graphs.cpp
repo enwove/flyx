@@ -13,6 +13,7 @@
 #include <vector>
 
 #include "backends/cuda/backend.h"
+#include "backends/cuda/runtime/offload/mapped_experts.h"
 
 namespace flyx::cuda {
 
@@ -175,6 +176,7 @@ void plan_lowered(flyx_bmodel* m, const flyx_plan* p) {
       g.mtp_steps += std::max(0, p->nodes[i].arg0);
   std::lock_guard<std::mutex> lock(m->graph_mu);
   m->round_graphs[p] = g;
+  if (m->offload && m->offload->maps_experts()) m->offload->mapped_experts().note_rows(p->width + 1);
 }
 
 void plan_counted(flyx_bmodel* m, const flyx_plan* p, size_t bytes) {

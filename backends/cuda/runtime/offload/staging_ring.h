@@ -65,6 +65,20 @@ class StagingRing {
         throw;
       }
     }
+    // A device-addressed projection can have separate code and scale planes. Fill both under one lease.
+    template <class Upload>
+    Lease(StagingRing& ring, size_t index, cudaStream_t consumer, Upload upload)
+        : ring_(ring), lock_(ring.mutex_), index_(index), consumer_(consumer) {
+      auto& slot = ring_.slots_.at(index);
+      CK(cudaStreamWaitEvent(ring_.copy_, slot.consumed));
+      try {
+        upload(slot.device, slot.capacity, cudaStream_t(ring_.copy_));
+        CK(cudaEventRecord(slot.uploaded, ring_.copy_));
+      } catch (...) {
+        cudaStreamSynchronize(ring_.copy_);
+        throw;
+      }
+    }
     Lease(const Lease&) = delete;
     ~Lease() {
       if (!released_) {

@@ -757,6 +757,11 @@ int lower(flyx_bmodel* m, const flyx_program* prog, flyx_plan** out) {
   }
   // Its graphs' size, in every session's room (graph_room): a round plan's, but for a tree of given drafts, which the
   // engine lowers and never runs (tests and tree_bench do: a session keeps those in the room the others leave).
+  if (m->offload && (m->offload->experts() || m->offload->maps_experts()) && m->verbose && p->phase == FLYX_PHASE_ROUND)
+    for (size_t i = 0; i < p->nodes.size(); ++i)
+      if (p->nodes[i].kind == FLYX_NODE_RUN && p->block[i])
+        if (const auto* f = std::get_if<MoeBlock>(p->block[i]); f && !f->cold_gu && !f->route_histogram)
+          p->resident_routes += f->top_k;
   if (p->phase == FLYX_PHASE_ROUND && !(p->tree && !p->drafted_tree)) plan_lowered(m, p.get());
   *out = p.release();
   return 0;

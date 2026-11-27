@@ -4,6 +4,7 @@
 
 #include "backends/cuda/runtime/row_pool.h"
 #include "backends/cuda/runtime/offload/expert_store.h"
+#include "backends/cuda/runtime/offload/mapped_experts.h"
 #include <exception>
 
 #include "backends/cuda/loader/exact_bf16.h"
@@ -646,7 +647,7 @@ Lin WeightLoader::lin_stack(const std::vector<int>& ws, int* rows_out, const std
   return L;
 }
 
-ExpertMat WeightLoader::expert_mat(int w, std::shared_ptr<ColdMatrix>& cold) {
+ExpertMat WeightLoader::expert_mat(int w, int hot, bool mapped, std::shared_ptr<ColdMatrix>& cold) {
   if (auto it = experts_.find(w); it != experts_.end()) {
     if (auto c = cold_experts_.find(w); c != cold_experts_.end()) cold = c->second;
     return it->second;
@@ -654,7 +655,13 @@ ExpertMat WeightLoader::expert_mat(int w, std::shared_ptr<ColdMatrix>& cold) {
   const auto* v = t(w);
   auto layout = expert_layout(weights_[w], m_->opt.packed_blocks);
   const size_t all = size_t(v->shape[0]);
-  const size_t E = std::min(all, size_t(m_->opt.gpu_experts)), N = size_t(v->shape[1]), K = size_t(v->shape[2]);
+  const bool direct = size_t(hot) < all && mapped;
+  const size_t E = direct ? all : std::min(all, size_t(hot)), N = size_t(v->shape[1]), K = size_t(v->shape[2]);
+  auto plane = [&]<class T>(size_t count) -> T* {
+    if (!direct) return m_->alloc<T>(count);
+    const size_t bytes = size_mul(count, sizeof(T));
+    return static_cast<T*>(m_->offload->mapped_experts().allocate(m_, w, bytes, all, size_t(hot)));
+  };
   if (E < all) {
     auto matrix = std::make_shared<ColdMatrix>(weights_[w], int(E), layout);
     matrix->resolve(m_->opt.expert_simd, m_->opt.expert_integer);
@@ -674,7 +681,7 @@ ExpertMat WeightLoader::expert_mat(int w, std::shared_ptr<ColdMatrix>& cold) {
   auto upload_expert_scales = [&]() -> float* {
     const auto* s2 = weights_[w].scale2;
     if (!layout.expert_scales) return nullptr;
-    float* rs_dev = m_->alloc<float>(layout.expert_scales);
+    float* rs_dev = plane.operator()<float>(layout.expert_scales);
     std::vector<float> rs_host(E, 1.f);
     if (s2) {
       const size_t sn = numel(s2);
@@ -692,8 +699,8 @@ ExpertMat WeightLoader::expert_mat(int w, std::shared_ptr<ColdMatrix>& cold) {
   if (layout.format == ExpertLayout::nvfp4) {
     const size_t per_row = K / 64;
     const size_t q_row = layout.payload_row, s_row = layout.scales_row, file_row = per_row * 36;
-    uint8_t* q_dev = m_->alloc<uint8_t>(layout.payload_bytes());
-    uint8_t* s_dev = m_->alloc<uint8_t>(layout.scale_bytes());
+    uint8_t* q_dev = plane.operator()<uint8_t>(layout.payload_bytes());
+    uint8_t* s_dev = plane.operator()<uint8_t>(layout.scale_bytes());
     const auto* file = static_cast<const uint8_t*>(v->data);
     times_.file_bytes += total_rows * file_row;
     if (!staging_) staging_ = std::make_unique<LoadStaging>();
@@ -736,8 +743,8 @@ ExpertMat WeightLoader::expert_mat(int w, std::shared_ptr<ColdMatrix>& cold) {
     const size_t per_row = K / size_t(l.values);
     const size_t row_bytes = layout.payload_row, row_scales = layout.scales_row / sizeof(uint16_t);
     const size_t file_row = per_row * size_t(l.bytes);
-    uint8_t* data = m_->alloc<uint8_t>(layout.payload_bytes());
-    uint16_t* scales = m_->alloc<uint16_t>(layout.scale_bytes() / sizeof(uint16_t));
+    uint8_t* data = plane.operator()<uint8_t>(layout.payload_bytes());
+    uint16_t* scales = plane.operator()<uint16_t>(layout.scale_bytes() / sizeof(uint16_t));
     const auto* file = static_cast<const uint8_t*>(v->data);
     times_.file_bytes += total_rows * file_row;
     if (!staging_) staging_ = std::make_unique<LoadStaging>();
@@ -773,7 +780,7 @@ ExpertMat WeightLoader::expert_mat(int w, std::shared_ptr<ColdMatrix>& cold) {
   // Fallback: BF16 on device (handles BF16, F16, F32, or blocks=bf16).
   if (!numbers(v)) throw std::runtime_error(std::string(v->name) + ": unsupported expert dtype");
   const size_t bytes = layout.payload_bytes();
-  bf16* dst = m_->alloc<bf16>(bytes / sizeof(bf16));
+  bf16* dst = plane.operator()<bf16>(bytes / sizeof(bf16));
   if (v->dtype == FLYX_DT_BF16) {
     upload_staged(dst, v->data, bytes);
   } else {

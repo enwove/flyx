@@ -4,6 +4,7 @@
 #include <bit>
 
 #include "backends/cuda/runtime/offload/expert_store.h"
+#include "backends/cuda/runtime/offload/mapped_experts.h"
 
 #include "backends/cuda/regions/layers.h"
 
@@ -1651,24 +1652,38 @@ void moe_layer(const Pass& ps, const MoeBlock& f, bool fused) {
   moe_route(rv.b.proj, f.router_bias, R, E, K, f.gating_sigmoid, f.norm_weights, f.norm_eps, f.route_scale,
             rv.b.moe_idx, rv.b.moe_w, L);
 
+  if (f.route_histogram)
+    moe_place_ids(rv.b.moe_idx, R * K, E, f.route_slots, f.route_histogram + (ps.round ? E : 0), nullptr, st);
   float* residual = ps.res && ps.res->x_cur ? ps.res->x_cur : rv.b.x;
   float* down_out = f.post_conv ? rv.b.post_raw : residual;
-  if (f.cold_gu) {
+  if (f.mapped && !ps.round && R >= f.mapped->stage_min_rows) {
+    f.mapped->owner->prefill(ps, f, msc, down_out, !f.post_conv, fused);
+  } else if (f.cold_gu) {
     hybrid_experts(ps, f, msc, down_out, !f.post_conv, fused);
   } else {
+    const bool gather = ps.round && R > 1 && R <= rv.b.gather_rows && f.mapped && *f.mapped->gather && R * K <= E;
+    ExpertMat staged;
+    auto projection = [&](const ExpertMat& original, bool down) -> const ExpertMat& {
+      if (!gather) return original;
+      const auto& src = down ? f.mapped->down : f.mapped->gate;
+      staged = src.gather(rv.b.gathered, rv.b.moe_idx, rv.b.gather_ids, R * K, st);
+      return staged;
+    };
+    const auto& gate = projection(f.gate_up, false);
+    const int* ids = gather ? rv.b.gather_ids : rv.b.moe_idx;
     bf16* act_bf16 =
         round_q8 && moe_round_bf16_down(f.down, R, K, I, msc, L) ? reinterpret_cast<bf16*>(rv.b.moe_act) : nullptr;
     int grouped = 0;
     if (fused) {
-      grouped = moe_gate_up(rv.b.h, H, f.gate_up, rv.b.moe_idx, R, K, I, H, f.situ_beta, f.situ_linear_beta, true,
-                            rv.b.moe_act, I, msc, L, round_q8, act_bf16);
+      grouped = moe_gate_up(rv.b.h, H, gate, ids, R, K, I, H, f.situ_beta, f.situ_linear_beta, true, rv.b.moe_act, I,
+                            msc, L, round_q8, act_bf16);
     } else {
-      grouped = moe_gate_up(rv.b.h, H, f.gate_up, rv.b.moe_idx, R, K, I, H, f.situ_beta, f.situ_linear_beta, false,
-                            rv.b.moe_gu, 2 * I, msc, L);
+      grouped = moe_gate_up(rv.b.h, H, gate, ids, R, K, I, H, f.situ_beta, f.situ_linear_beta, false, rv.b.moe_gu,
+                            2 * I, msc, L);
       situ_rows(rv.b.moe_gu, 2 * I, I, f.situ_beta, f.situ_linear_beta, rv.b.moe_act, I, R * K, st);
     }
-    moe_down(rv.b.moe_act, I, f.down, rv.b.moe_idx, rv.b.moe_w, R, K, H, I, down_out, H, !f.post_conv, msc, L,
-             act_bf16, grouped);
+    const auto& down = projection(f.down, true);
+    moe_down(rv.b.moe_act, I, down, ids, rv.b.moe_w, R, K, H, I, down_out, H, !f.post_conv, msc, L, act_bf16, grouped);
   }
   if (f.post_conv) {
     if (fused && ps.round && R <= FLYX_MAX_ROWS && ps.res && rv.b.post_out && H <= 5120) {

@@ -7,6 +7,7 @@
 // kinds, not models.
 #include "backends/cuda/loader/loader.h"
 #include "backends/cuda/runtime/offload/offload_plan.h"
+#include "backends/cuda/runtime/offload/mapped_experts.h"
 #include "backends/cuda/runtime/offload/expert_store.h"
 
 #include <algorithm>
@@ -754,7 +755,7 @@ RelAttnBlock rel_attn(WeightLoader& L, const flyx_rel_attn_block& b, const State
   return a;
 }
 
-MoeBlock moe(WeightLoader& L, const flyx_moe_block& b, const StateMap& sm) {
+MoeBlock moe(WeightLoader& L, const flyx_moe_block& b, const StateMap& sm, const OffloadPlan& plan) {
   MoeBlock f;
   f.hidden = b.hidden;
   f.inter = b.inter;
@@ -770,8 +771,10 @@ MoeBlock moe(WeightLoader& L, const flyx_moe_block& b, const StateMap& sm) {
   f.norm = norm(L, b.norm);
   f.router = L.lin_f32(b.router);
   if (b.router_bias >= 0) f.router_bias = L.vec(b.router_bias);
-  f.gate_up = L.expert_mat(b.gate_up, f.cold_gu);
-  f.down = L.expert_mat(b.down, f.cold_down);
+  f.gate_up = L.expert_mat(b.gate_up, plan.hot[b.gate_up], plan.direct, f.cold_gu);
+  f.down = L.expert_mat(b.down, plan.hot[b.down], plan.direct, f.cold_down);
+  if (plan.direct && plan.hot[b.gate_up] < b.n_experts)
+    L.model()->offload->mapped_experts().attach(L.model(), f, b.gate_up, b.down);
   if (b.post_conv >= 0) f.post_conv = L.vec(b.post_conv);
   if (b.res_query >= 0) f.res_query = L.vec(b.res_query);
   f.loop_rank = b.loop_rank;
@@ -1177,9 +1180,8 @@ void bind(flyx_bmodel* m, const flyx_model_desc& d, LoadTimes* times) {
     is_draft[size_t(i)] = is_mtp[size_t(i)] || is_dflash[size_t(i)] || is_dspark[size_t(i)];
 
   auto offload = plan_offload(d, m->opt);
-  if (offload.pinned_bytes) offload.fit_pinned(query_pinned_budget(m->opt));
   const auto& streamed = offload.stream.blocks;
-  if (!streamed.empty() || offload.cold.pairs) m->offload = std::make_unique<OffloadRuntime>();
+  if (!streamed.empty() || offload.cold.pairs || offload.direct) m->offload = std::make_unique<OffloadRuntime>();
   std::unique_ptr<WeightLoader> streaming;
   if (!streamed.empty()) {
     m->offload->init_layers(size_t(d.n_blocks), offload.bounce_layers);
@@ -1246,7 +1248,9 @@ void bind(flyx_bmodel* m, const flyx_model_desc& d, LoadTimes* times) {
       case FLYX_BLOCK_GDN: put_block(m, i, gdn(layers, b.gdn, sm, carve)); break;
       case FLYX_BLOCK_MLP: put_block(m, i, mlp(layers, b.mlp, carve)); break;
       case FLYX_BLOCK_REL_ATTN: put_block(m, i, rel_attn(L, b.rel_attn, sm)); break;
-      case FLYX_BLOCK_MOE: put_block(m, i, moe(L, b.moe, sm)); break;
+      case FLYX_BLOCK_MOE:
+        put_block(m, i, moe(L, b.moe, sm, offload));
+        break;
       case FLYX_BLOCK_DV: {
         const int e = ref(i, b.dv.embed, FLYX_BLOCK_EMBED, "embedding");
         const int head = ref(i, b.dv.head, FLYX_BLOCK_HEAD, "head");
@@ -1408,6 +1412,7 @@ void bind(flyx_bmodel* m, const flyx_model_desc& d, LoadTimes* times) {
   m->vision_disk.flush_clean();
   L.finish();
   if (offload.cold.pairs) m->offload->init_experts(m, offload);
+  if (offload.prefill_slots[0]) m->offload->mapped_experts().init_prefill(m, offload.prefill_slots);
   if (times) {
     *times = L.times();
     if (streaming) {
@@ -1557,7 +1562,6 @@ int estimate_load(const flyx_model_desc* desc, const flyx_open_options* opts, ui
 
   bo.keep_expert_archive = bo.expert_prefill_min != 0;
   auto offload = plan_offload(*desc, bo);
-  if (offload.pinned_bytes) offload.fit_pinned(query_pinned_budget(bo));
   const auto& streamed = offload.stream;
   const TargetQuant tq = target_quant(*desc, is_draft_blk, bo.packed_blocks);
   const DraftQuants q = resolve_draft_quant(*desc, bo.draft_weights, tq);

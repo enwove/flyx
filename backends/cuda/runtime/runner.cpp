@@ -519,6 +519,7 @@ int prefill_ex(flyx_plan* p, flyx_seq* s, const flyx_prefill_input* in, const fl
       ++s->seq_no;
       CK(cudaEventRecord(s->ev[s->seq_no % kRing], s->st));
       s->pending.push_back({'P', 0});
+      if (m->offload) m->offload->finish_prompt(s->st);
     }
     s->update_write_hi();
     // A pass moves the position on and not the round: the rounds before it stay rollback sources, their recurrent
@@ -1688,6 +1689,7 @@ int launch(flyx_plan* p, flyx_seq* s, const flyx_gen_params* g) {
     ++s->seq_no;
     CK(cudaEventRecord(s->ev[s->seq_no % kRing], s->st));
     s->pending.push_back({'R', ps.rows});
+    if (p->resident_routes) s->m->offload->count_fully_resident(p->resident_routes * ps.rows);
     s->update_write_hi();
     CK(cudaGetLastError());
     return 0;
@@ -1896,7 +1898,9 @@ int launch_batch(flyx_plan* const* plans, flyx_seq* const* seqs, const flyx_gen_
       flyx_seq* s = seqs[ord[i]];
       ++s->seq_no;
       CK(cudaEventRecord(s->ev[s->seq_no % kRing], B.st));
-      s->pending.push_back({'R', bp.seq[size_t(i)].rows});
+      const auto& phase = bp.seq[size_t(i)];
+      s->pending.push_back({'R', phase.rows});
+      if (phase.p->resident_routes) m->offload->count_fully_resident(phase.p->resident_routes * phase.rows);
       s->update_write_hi();
       CK(cudaStreamWaitEvent(s->st, B.done, 0));  // what the sequence does next, after this round
     }

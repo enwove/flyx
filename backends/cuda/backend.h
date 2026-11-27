@@ -159,8 +159,9 @@ struct BackendOptions {
   bool draft_kv16 = false;       // draft_kv=16: the MTP layer's cache in binary16 beside the target's FP8
   int gpu_layers = INT_MAX;  // dense layers retained before the streamed suffix
   bool expert_adapt = true, expert_global = false, expert_integer = true;
+  bool expert_gather = true;
+  bool expert_ticket = true, expert_mapped_output = true, expert_direct = true;
   int expert_simd = 512;  // upper bound on vector width for cold CPU dots
-  bool expert_ticket = true, expert_mapped_output = true;
   bool keep_expert_archive = true;
   int expert_prefill_min = -1;  // minimum prompt rows for streamed GPU experts, zero uses the CPU path
   int expert_threads = 0;  // maximum CPU workers including the submitting thread, zero uses the default
@@ -272,6 +273,9 @@ struct RowBufs {
   float *rel_q = nullptr, *rel_btab = nullptr, *sink = nullptr, *kv_conv = nullptr, *kv_dyn = nullptr;
   float *post_raw = nullptr, *post_out = nullptr;
   int* moe_idx = nullptr;
+  int gather_rows = -1;
+  uint8_t* gathered = nullptr;
+  int* gather_ids = nullptr;
   float* moe_guess = nullptr;  // rounds: the experts' scores moe_prefetch guesses from (n_experts floats), then
                               // the mixed row moe_guess_scores reads (hidden floats)
   // moe_act: the activations in float32, or in bf16 where a fused round's gate|up GEMM writes the down GEMM's input
@@ -487,7 +491,7 @@ struct DevicePieces {
   size_t bytes = 0;   // the range's, a multiple of the granularity
   size_t mapped = 0;  // of it mapped so far (what release unmaps)
   std::vector<unsigned long long> handles;
-  bool alias = false;
+  bool granule_mappings = false;
   DevicePieces() = default;
   DevicePieces(const DevicePieces&) = delete;
   DevicePieces& operator=(const DevicePieces&) = delete;
@@ -500,10 +504,14 @@ struct DevicePieces {
 // memory.
 void* device_pieces(size_t bytes, DevicePieces* out);
 void* device_alias(size_t bytes, DevicePieces* out);
+void* expert_pages(size_t total, size_t resident, DevicePieces* out);
+void copy_expert_pages(const DevicePieces& a, size_t ai, const DevicePieces& b, size_t bi, uint8_t* scratch);
+void exchange_expert_backing(DevicePieces& a, size_t ai, DevicePieces& b, size_t bi);
 // Whether the device maps memory in pieces (VMM: its capability and the driver's functions), and the floor
 // device_room keeps below memory made of them: kPiecesFloor for pieces of kPieceBytes at most, kPagedFloor where the
 // granularity is larger or there is no VMM (one allocation instead).
 bool vmm_supported();
+bool expert_pages_supported();
 size_t pieces_floor();
 // Minimum VRAM reserve floor the backend requires for its device allocations (Windows WDDM: pieces_floor(); 0 elsewhere).
 uint64_t device_reserve_floor();
@@ -687,6 +695,7 @@ struct flyx_plan {
   // session's TreeRows, the accepted path compacted after the accept; tree_kv: the K/V caches its attention layers
   // write (flyx_seq::kv indices).  drafted: the drafter writes the TreeRows in the round, the launch does not.
   bool tree = false, drafted_tree = false, has_draft = false;
+  size_t resident_routes = 0; // per row, in fully resident MoE visits of a hybrid round
   std::vector<int> tree_kv;
   std::vector<int> checkpoints;  // sorted verify checkpoints for adaptive conditional round graph (empty: fixed width)
   bool earlier_checkpoints = false;  // flyx_program's: a stop may verify a checkpoint before the one it drafted to

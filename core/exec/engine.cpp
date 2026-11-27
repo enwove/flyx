@@ -984,7 +984,8 @@ bool Engine::load(const std::string& path, const EngineOptions& opt, std::string
     if ((*cap)[0] != before[0]) {
       resident_experts = (*cap)[0];
       const auto n = std::to_string(resident_experts);
-      upsert_adj("gpu_experts", "all", n, n + " experts per layer on GPU, remaining experts on CPU");
+      upsert_adj("gpu_experts", "all", n,
+                 n + " resident experts per layer on average, remaining weights in host memory");
     }
     if ((*cap)[1] != before[1]) {
       resident_layers = (*cap)[1];

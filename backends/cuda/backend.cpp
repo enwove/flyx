@@ -240,6 +240,8 @@ const std::vector<OptionSpec>& option_specs() {
       whole_opt("expert_prefill_min", &BackendOptions::expert_prefill_min),
       whole_opt("expert_threads", &BackendOptions::expert_threads),
       whole_opt("expert_simd", &BackendOptions::expert_simd),
+      flag_opt("expert_gather", &BackendOptions::expert_gather),
+      flag_opt("expert_direct", &BackendOptions::expert_direct),
       flag_opt("expert_ticket", &BackendOptions::expert_ticket),
       flag_opt("expert_mapped_output", &BackendOptions::expert_mapped_output),
       flag_opt("expert_integer", &BackendOptions::expert_integer),
@@ -428,7 +430,7 @@ const std::vector<OptionSpec>& option_specs() {
          return "";
        }},
       kernel_flag_opt("log_shapes", &KernelOptions::log_shapes),
-      kernel_whole_opt("strata_denom", &KernelOptions::strata_denom),  // 0: no pairs refined (the copy alone)
+      kernel_whole_opt("strata_denom", &KernelOptions::strata_denom), // 0: no pairs refined (the copy alone)
       kernel_whole_opt("strata_least", &KernelOptions::strata_least, 1),
       kernel_whole_opt("strata_recent", &KernelOptions::strata_recent),
       kernel_whole_opt("strata_most", &KernelOptions::strata_most),
@@ -878,8 +880,8 @@ int open_model(const flyx_model_desc* desc, const flyx_open_options* opts, flyx_
       std::fprintf(stderr, ", %.2f GB in host memory", m->host_bytes / 1e9);
       if (m->offload && m->offload->layers())
         std::fprintf(stderr, " (includes streamed layers)");
-      else if (m->offload && m->offload->experts())
-        std::fprintf(stderr, " (includes cold experts, GPU cap %d per layer)", m->opt.gpu_experts);
+      else if (m->offload && (m->offload->experts() || m->offload->maps_experts()))
+        std::fprintf(stderr, " (includes cold experts, GPU expert budget %d per layer on average)", m->opt.gpu_experts);
       else if (m->vision_host_bytes && m->host_bytes > m->vision_host_bytes)
         std::fprintf(stderr, " (embedding + vision %.2f GB)", m->vision_host_bytes / 1e9);
       else if (m->vision_host_bytes)

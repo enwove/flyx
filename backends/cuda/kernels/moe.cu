@@ -1417,6 +1417,30 @@ __global__ void k_moe_sum_mapped(const float* slots, const float* cold, const in
   result = accumulate ? result + total : total;
 }
 
+__global__ void k_gather_expert_planes(GatherPlanes planes, const int* ids, int* compact) {
+  const int pair = blockIdx.y, id = ids[pair];
+  int slot = 0;
+  while (ids[slot] != id) ++slot;
+  if (!blockIdx.x && !threadIdx.x) compact[pair] = slot;
+  if (slot != pair) return;
+  int block = blockIdx.x, which = 0;
+  while (block >= planes.plane[which].blocks) block -= planes.plane[which++].blocks;
+  const auto plane = planes.plane[which];
+  const auto* src = plane.source + size_t(id) * plane.stride;
+  auto* dst = plane.target + size_t(pair) * plane.stride;
+  size_t i = size_t(block) * blockDim.x + threadIdx.x;
+  const size_t step = size_t(plane.blocks) * blockDim.x;
+  if (!(plane.stride % 16)) {
+    for (; i < plane.stride / 16; i += step) reinterpret_cast<uint4*>(dst)[i] = reinterpret_cast<const uint4*>(src)[i];
+  } else {
+    for (; i < plane.stride; i += step) dst[i] = src[i];
+  }
+}
+
+void gather_expert_planes(GatherPlanes planes, const int* ids, int* compact, int pairs, cudaStream_t st) {
+  k_gather_expert_planes<<<dim3(planes.blocks, pairs), 128, 0, st>>>(planes, ids, compact);
+}
+
 void moe_sum_mapped(const float* slots, const float* cold, const int* ids, int resident, const float* weights,
                     int rows, int top_k, int hidden, float* out, bool accumulate, cudaStream_t st) {
   for (int at = 0; at < rows;) {

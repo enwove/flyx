@@ -4,6 +4,7 @@
 #include "backends/cuda/runtime/checked_size.h"
 #include "backends/cuda/runtime/window_ring.h"
 #include "backends/cuda/backend.h"
+#include "backends/cuda/runtime/offload/mapped_experts.h"
 #include "flyx/gemm_tables.inc"
 #include "ops/sampling/sampling.h"
 
@@ -202,6 +203,11 @@ void alloc_rows(const flyx_bmodel* m, int R, bool prefill, RowBufs* b, Alloc&& a
   if (n.moe_experts > 0) {
     b->moe_idx = static_cast<int*>(alloc(size_t(R) * n.moe_topk * sizeof(int)));
     b->moe_w = f(size_t(R) * n.moe_topk);
+    if (!prefill && b->gather_rows > 1) {
+      const int pairs = b->gather_rows * n.moe_topk;
+      b->gathered = static_cast<uint8_t*>(alloc(m->offload->mapped_experts().gather_bytes(pairs)));
+      b->gather_ids = static_cast<int*>(alloc(size_t(pairs) * sizeof(int)));
+    }
     if (!prefill) b->moe_guess = f(size_t(n.moe_experts) + size_t(H));  // scores, then a mixed row (R == 1)
     // moe_gu is dead during moe_down (and unused when fused), so down_buf safely aliases it.
     const size_t gu_or_down = std::max(size_t(2) * size_t(n.moe_inter), size_t(H));
@@ -533,6 +539,7 @@ int new_seq(flyx_bmodel* m, const flyx_seq_layout* layout, bool capture_only, fl
   s->pinned_budget = pinned_budget;
   s->device_positions = std::max(0, layout->device_positions);
   s->copy_host = std::max(0, layout->copy_host);
+  s->own.gather_rows = probe.own.gather_rows;
   s->arena_dev_bytes = probe.arena_dev_bytes;
   s->arena_host_bytes = probe.arena_host_bytes;
   try {
@@ -1442,6 +1449,10 @@ void build_seq(flyx_bmodel* m, int32_t max_ctx, flyx_seq* s) {
   s->ld_proj = n.proj;
   s->ld_act = n.act;
   auto seq_bytes_alloc = [&](size_t bytes) { return static_cast<void*>(s->alloc<unsigned char>(bytes)); };
+  if (s->own.gather_rows < 0)
+    s->own.gather_rows = m->offload && m->offload->maps_experts() && m->opt.expert_gather
+                             ? m->offload->mapped_experts().planned_rows()
+                             : 0;
   alloc_rows(m, R, false, &s->own, seq_bytes_alloc);
   s->drafts = s->alloc<int>(size_t(m->wide_rows));
   if (m->wide_rows > FLYX_MAX_ROWS) s->P_shift = s->alloc<DevParams>(1);

@@ -14,6 +14,7 @@
 
 #include "backends/cuda/loader/loader.h"
 #include "backends/cuda/runtime/offload/expert_placement.h"
+#include "backends/cuda/runtime/offload/host_handoff.h"
 
 namespace flyx::cuda {
 namespace {
@@ -161,7 +162,8 @@ void pieces_and_alias() {
   {
     DevicePieces alias;
     unsigned char* p = static_cast<unsigned char*>(device_alias(kBytes, &alias));
-    require(p && alias.alias && alias.handles.size() == 1 && alias.bytes >= kBytes && alias.mapped == alias.bytes,
+    require(p && alias.granule_mappings && alias.handles.size() == 1 && alias.bytes >= kBytes &&
+                alias.mapped == alias.bytes,
             "device_alias: one piece");
     const int64_t took = held_now() - before;
     require(!counted || took <= int64_t(gran + 2 * kMiB), "device_alias: one piece of memory under the range");
@@ -172,6 +174,29 @@ void pieces_and_alias() {
     require(at[0] == 0x5a && at[1] == 0x5a, "device_alias: every piece the same memory");
   }
   require(!counted || held_now() <= before + int64_t(2 * kMiB), "device_alias: the memory back when released");
+  {
+    DevicePieces first, second;
+    auto* a = static_cast<uint8_t*>(expert_pages(2 * gran, gran, &first));
+    auto* b = static_cast<uint8_t*>(expert_pages(2 * gran, gran, &second));
+    if (!a || !b) return;
+    uint8_t* scratch = nullptr;
+    CK(cudaMalloc(&scratch, gran));
+    CK(cudaMemset(a, 0x45, gran));
+    CK(cudaMemset(b + gran, 0x98, gran));
+    const auto resident = first.handles[0], host = second.handles[1];
+    copy_expert_pages(first, 0, second, 1, scratch);
+    CK(cudaStreamSynchronize(nullptr));
+    exchange_expert_backing(first, 0, second, 1);
+    require(first.handles[0] == host && second.handles[1] == resident, "global page exchange preserves device quota");
+    std::vector<uint8_t> bytes(gran);
+    for (const auto [src, expected] : {std::pair{a, 0x45}, std::pair{b + gran, 0x98}}) {
+      CK(cudaMemcpy(bytes.data(), src, gran, cudaMemcpyDeviceToHost));
+      require(std::all_of(bytes.begin(), bytes.end(), [&](uint8_t v) { return v == expected; }),
+              "each projection keeps its bytes and device address after promotion");
+    }
+    CK(cudaFree(scratch));
+  }
+  require(!counted || held_now() <= before + int64_t(2 * kMiB), "expert pages released after cross-layer exchange");
 }
 
 void residual_query_extent() {
@@ -382,6 +407,73 @@ void companion_estimates() {
   }
 }
 
+void route_budget_and_ticket() {
+  constexpr int experts = 32, layers = 4, h = 32;
+  std::vector<uint16_t> data(experts * 2 * h * h);
+  flyx_tensor_view gate{"gate", FLYX_DT_BF16, 3, {experts, 2 * h, h}, data.data(), data.size() * 2};
+  flyx_tensor_view down{"down", FLYX_DT_BF16, 3, {experts, h, h}, data.data(), data.size()};
+  flyx_tensor_view router{"router", FLYX_DT_BF16, 2, {experts, h}, data.data(), experts * h * 2};
+  std::vector<flyx_weight> weights{{&router}};
+  std::array<flyx_block, layers> blocks{};
+  for (auto& blk : blocks) {
+    blk.kind = FLYX_BLOCK_MOE;
+    auto& b = blk.moe;
+    b.hidden = b.inter = h;
+    b.n_experts = experts;
+    b.top_k = 4;
+    b.router_bias = -1;
+    b.gate_up = int(weights.size());
+    weights.push_back({&gate});
+    b.down = int(weights.size());
+    weights.push_back({&down});
+  }
+  flyx_model_desc desc{};
+  desc.blocks = blocks.data();
+  desc.n_blocks = layers;
+  desc.weights = weights.data();
+  desc.n_weights = int(weights.size());
+  BackendOptions options;
+  options.expert_direct = false;
+  for (int cap : {0, experts / 2, experts - 1, experts}) {
+    options.gpu_experts = cap;
+    const auto plan = plan_offload(desc, options);
+    int slots = 0, full = 0;
+    for (const auto& blk : blocks) {
+      const int hot = plan.hot[blk.moe.gate_up];
+      require(hot == plan.hot[blk.moe.down], "both projections must share residency");
+      slots += hot;
+      full += hot == experts;
+    }
+    require(slots == layers * cap && (cap != experts - 1 || full == layers - 1),
+            "concentrating rare misses conserves the requested expert count");
+  }
+
+  CudaStream stream;
+  CudaEvent fallback;
+  stream.create();
+  fallback.create();
+  flyx_bmodel model(options);
+  uint32_t* published = nullptr;
+  auto* ticket = model.host_pinned<uint32_t>(1, &published);
+  *ticket = 7;
+  // A stale generation that never arrives must take a checked event wait and return.
+  HostHandoff missing(stream, fallback, nullptr, nullptr, 0, nullptr, nullptr, 0, true, ticket, 8);
+  missing.wait();
+  constexpr int count = 257;
+  std::vector<int> routes(count);
+  for (int k = 0; k < count; ++k) routes[k] = k % 3;
+  int* host_ids = nullptr;
+  auto* host = model.host_pinned<int>(count, &host_ids);
+  auto* ids = model.alloc<int>(count);
+  CK(cudaMemcpy(ids, routes.data(), count * sizeof(int), cudaMemcpyHostToDevice));
+  moe_place_ids(ids, count, 3, nullptr, nullptr, nullptr, stream,
+                {nullptr, 3, host_ids, nullptr, nullptr, 0, published, 0});
+  HostHandoff packet(stream, fallback, nullptr, nullptr, 0, nullptr, nullptr, 0, true, ticket, 0);
+  packet.wait();
+  require(*ticket == 0 && std::equal(routes.begin(), routes.end(), host),
+          "wrapped route ticket publishes every resident slot including a second CTA-sized group");
+}
+
 void expert_estimates() {
   constexpr int e = 2, k = 256;
   struct Case { int dtype, file_row, device_row; bool packed, scale; };
@@ -446,10 +538,10 @@ void expert_estimates() {
       f.hidden = f.inter = k;
       f.n_experts = e;
       f.top_k = 2;
-      f.gate_up = loader.expert_mat(0, f.cold_gu);
-      f.down = loader.expert_mat(1, f.cold_down);
+      f.gate_up = loader.expert_mat(0, plan.hot[0], plan.direct, f.cold_gu);
+      f.down = loader.expert_mat(1, plan.hot[1], plan.direct, f.cold_down);
       std::shared_ptr<ColdMatrix> shared;
-      loader.expert_mat(0, shared);
+      loader.expert_mat(0, plan.hot[0], plan.direct, shared);
       require(shared == f.cold_gu, "same weight has a single archive");
       loader.lin(2);
       loader.finish();
@@ -789,6 +881,7 @@ int main() {
   try {
     vision_estimates();
     companion_estimates();
+    route_budget_and_ticket();
     expert_estimates();
     layer_estimates();
     staging_rollover();

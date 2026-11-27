@@ -1984,6 +1984,18 @@ struct ResidentRoutes {
   uint32_t* ticket = nullptr;
   uint32_t generation = 0;
 };
+struct GatherPlane {
+  const uint8_t* source;
+  uint8_t* target;
+  size_t stride;
+  int blocks;
+};
+struct GatherPlanes {
+  GatherPlane plane[3]{};
+  int count = 0, blocks = 0;
+};
+void gather_expert_planes(GatherPlanes planes, const int* ids, int* compact, int pairs, cudaStream_t stream);
+
 void moe_sum_mapped(const float* slots, const float* cold, const int* ids, int resident, const float* weights,
                     int rows, int top_k, int hidden, float* out, bool accumulate, cudaStream_t st);
 void moe_place_ids(int* ids, int pairs, int experts, const int* slots, uint32_t* counts, int* invalid, cudaStream_t st,

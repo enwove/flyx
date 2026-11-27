@@ -1839,6 +1839,44 @@ void test_inkling2_moe() {
     cudaFree(histogram);
     cudaFree(d);
   }
+  {
+    const std::vector<int> ids{4, 1, 4, 2, 1, 0};
+    const std::vector<int> first{0, 1, 0, 3, 1, 5};
+    auto* routes = dev<int>(ids.size());
+    auto* compact = dev<int>(ids.size());
+    CK(cudaMemcpy(routes, ids.data(), ids.size() * sizeof(int), cudaMemcpyHostToDevice));
+    GatherPlanes planes;
+    const size_t strides[] = {4096, 33, 4};
+    std::vector<uint8_t> sources[3], expected[3];
+    uint8_t* inputs[3];
+    for (int j = 0; j < 3; ++j) {
+      const size_t stride = strides[j];
+      sources[j].resize(5 * stride);
+      for (size_t k = 0; k < sources[j].size(); ++k) sources[j][k] = uint8_t(k + 31 * (k / stride));
+      expected[j].assign(ids.size() * stride, 0xee);
+      for (size_t i = 0; i < ids.size(); ++i)
+        if (first[i] == int(i))
+          std::copy_n(sources[j].data() + ids[i] * stride, stride, expected[j].data() + i * stride);
+      auto* input = inputs[j] = dev<uint8_t>(sources[j].size());
+      auto* output = dev<uint8_t>(expected[j].size());
+      CK(cudaMemcpy(input, sources[j].data(), sources[j].size(), cudaMemcpyHostToDevice));
+      CK(cudaMemset(output, 0xee, expected[j].size()));
+      const int blocks = j ? 1 : 2;
+      planes.plane[planes.count++] = {input, output, stride, blocks};
+      planes.blocks += blocks;
+    }
+    gather_expert_planes(planes, routes, compact, int(ids.size()), 0);
+    if (down_i(compact, ids.size()) != first) throw std::runtime_error("first occurrence of each gathered expert");
+    for (int j = 0; j < 3; ++j) {
+      std::vector<uint8_t> got(expected[j].size());
+      CK(cudaMemcpy(got.data(), planes.plane[j].target, got.size(), cudaMemcpyDeviceToHost));
+      if (got != expected[j]) throw std::runtime_error("gathered expert plane bytes or duplicate slot");
+      cudaFree(inputs[j]);
+      cudaFree(planes.plane[j].target);
+    }
+    cudaFree(routes);
+    cudaFree(compact);
+  }
   test_inkling2_moe_norm();
   test_moe_gate_up_rules();
   test_moe_dp4a_variants();

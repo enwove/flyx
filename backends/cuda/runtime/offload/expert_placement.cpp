@@ -1,7 +1,12 @@
 // Copyright 2026 The flyx Authors. SPDX-License-Identifier: Apache-2.0
 #include "backends/cuda/runtime/offload/expert_placement.h"
+#include "backends/cuda/runtime/offload/mapped_experts.h"
 
 namespace flyx::cuda {
+ExpertAddressSpace& OffloadRuntime::mapped_experts() {
+  if (!mapped_) mapped_ = std::make_unique<ExpertAddressSpace>();
+  return *mapped_;
+}
 OffloadRuntime::OffloadRuntime() = default;
 OffloadRuntime::~OffloadRuntime() = default;
 LayerRing& OffloadRuntime::init_layers(size_t blocks, bool bounce) {
@@ -9,7 +14,13 @@ LayerRing& OffloadRuntime::init_layers(size_t blocks, bool bounce) {
   return *layers_;
 }
 bool OffloadRuntime::wraps_node(size_t block) const { return layers_ && layers_->wraps_node(block); }
+void OffloadRuntime::count_fully_resident(size_t routes) {
+  if (mapped_) return mapped_->count_resident(routes);
+  std::lock_guard lock(cold_->mutex);
+  stats_.decode_slots += routes;
+}
 void OffloadRuntime::report(FILE* file) {
+  if (mapped_) mapped_->report(file);
   if (layers_) layers_->finish_samples();
   stats_.report(file, cold_ ? cold_->pool.threads() : 0);
 }
@@ -66,7 +77,12 @@ void OffloadRuntime::init_experts(flyx_bmodel* m, const OffloadPlan& plan) {
   cold_ = std::move(w);
 }
 
+void OffloadRuntime::finish_prompt(cudaStream_t stream) {
+  if (mapped_) mapped_->finish_prompt(stream);
+}
+
 void OffloadRuntime::on_session_open(flyx_bmodel* m, cudaStream_t stream) {
+  if (mapped_) mapped_->open();
   if (!cold_) return;
   auto& ws = *cold_;
   std::lock_guard lock(ws.mutex);
@@ -121,6 +137,7 @@ void OffloadRuntime::maintain_locked(flyx_bmodel* m, ColdWorkspace& ws) {
 }
 
 void OffloadRuntime::on_session_close(flyx_bmodel*, const flyx_seq* sequence) {
+  if (mapped_) mapped_->close(sequence);
   if (!cold_) return;
   auto& ws = *cold_;
   std::lock_guard lock(ws.mutex);
