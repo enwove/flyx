@@ -69,17 +69,13 @@ RowNeeds row_needs(const flyx_bmodel* m) {
       n.mtp = true;
       if (t->fc.q8_inputs()) n.q8 = true;
       ks({2 * m->hidden});
-    } else if (const auto* l = std::get_if<DFlashLayer>(&blk)) {
-      // a block drafter's layers copied to Q8_0 (weights.cpp: beside a float target, draft_weights=q8), whose file has
-      // no 8-bit inputs
-      n.q8 = n.q8 || l->w_qkv.q8_inputs() || l->w_o.q8_inputs() || l->w_gu.q8_inputs() || l->w_down.q8_inputs();
     } else if (const auto* d = std::get_if<DFlashBlock>(&blk)) {
       const int df_feats = d->n_taps * d->target_hidden;
       n.feats += df_feats;
       n.cx = std::max(n.cx, d->hidden);
       n.ckv = std::max(n.ckv, d->ctx_width());
       if (d->fc.q8_inputs() || d->ctx.q8_inputs() || d->sel_hid.q8_inputs()) n.q8 = true;
-      ks({d->hidden, d->inter, d->nh * d->hd, df_feats});
+      ks({d->hidden, d->inter, d->nh * d->hd, df_feats, d->dspine.code, d->dspine.rank});
     } else if (const auto* dl = std::get_if<DFlashLayer>(&blk)) {
       if (dl->w_qkv.q8_inputs() || dl->w_o.q8_inputs() || dl->w_gu.q8_inputs() || dl->w_down.q8_inputs() ||
           dl->attn_proj.q8_inputs() || dl->mlp_proj.q8_inputs())

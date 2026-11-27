@@ -545,8 +545,9 @@ struct KvBuf {
   }
   kv16* k16(int layer = 0) const { return static_cast<kv16*>(k) + size_t(layer) * layer_stride; }
   kv16* v16(int layer = 0) const { return static_cast<kv16*>(v) + size_t(layer) * layer_stride; }
-  KvRef layer_ref(int layer) const {
+  KvRef draft_ref(int layer) const {
     KvRef r;
+    r.saturate = true;  // a block drafter's binary16 cache, including a sliding-window ring
     r.k = k16(layer);
     r.v = v16(layer);
     r.ring = ring;

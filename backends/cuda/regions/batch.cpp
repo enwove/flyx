@@ -254,7 +254,7 @@ void draft_block_rows(const BatchPass& bp, const DFlashBlock& b, const std::vect
       for (size_t g = 0; g < n; ++g) {
         flyx_seq* s = bp.seq[members[off + g]].s;
         const KvBuf& kv = s->kv[size_t(b.kv)];
-        const KvRef kvr = kv.layer_ref(j);
+        const KvRef kvr = kv.draft_ref(j);
         float* q_g = df.dq + g * B * nh * hd;
         attn_prep(df.dproj + g * B * df.ld_dproj, df.ld_dproj, 0, nh * hd, (nh + nkv) * hd, l.q_norm.w, l.k_norm.w,
                   l.q_norm.offset, l.q_norm.eps, b.theta, hd, nh, nkv, hd, B, s->P, kPosPosition, false, q_g, kvr, st);

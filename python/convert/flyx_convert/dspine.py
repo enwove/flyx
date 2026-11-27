@@ -30,13 +30,18 @@ def _require(ok: bool, what: str) -> None:
         raise ValueError(f"DSpine drafter: {what}")
 
 
+def _number(x) -> bool:
+    return type(x) in (int, float)  # JSON booleans are a distinct type
+
+
 def canonical_dspine_config(sc: dict, target: dict | None) -> dict:
     """The drafter's config as the engine reads it ("kind": "dspine"), after checking it is the supported variant.
     taps: the residual stream after that many target layers (target_layer_ids + 1).  window: each position attends
     to the positions less than that far before it (0: all).  topk: the candidates a row's walk chooses among."""
     dc = sc.get("dflash_config")
     _require(isinstance(dc, dict), "no dflash_config")
-    layers = int(sc["num_hidden_layers"])
+    layers = sc["num_hidden_layers"]
+    _require(type(layers) is int and 0 < layers <= 1024, "num_hidden_layers out of range")
     _require(sc.get("model_type", "qwen3") == "qwen3", f"model_type {sc.get('model_type')!r} (qwen3 layers)")
     _require(sc.get("hidden_act", "silu") == "silu", f"hidden_act {sc.get('hidden_act')!r}")
     _require(not sc.get("attention_bias", False), "attention biases")
@@ -46,7 +51,8 @@ def canonical_dspine_config(sc: dict, target: dict | None) -> dict:
              f"decode mode {dc.get('selected_prefix_decode_mode')!r} (serial)")
     _require(dc.get("selected_prefix_feature_writes") is True and
              dc.get("selected_prefix_feature_write_mode") == "independent", "independent writes after the layers")
-    _require(dc.get("selected_prefix_feature_layers") == list(range(1, layers + 1)),
+    writes = dc.get("selected_prefix_feature_layers")
+    _require(writes == list(range(1, layers + 1)) and all(type(i) is int for i in writes),
              "a write after every layer (selected_prefix_feature_layers 1..layers)")
     _require(not dc.get("selected_prefix_terminal_residual_rank"), "a terminal residual")
     _require(not dc.get("selected_prefix_feature_next_token_rows", False), "next-token rows (DSpark's layout)")
@@ -62,23 +68,25 @@ def canonical_dspine_config(sc: dict, target: dict | None) -> dict:
     refine = dc.get("selected_prefix_last_write_refine")
     if refine is not None:
         _require(isinstance(refine, dict) and set(refine) == {"kind", "version", "head_topk", "weight"} and
-                 refine["kind"] == "exact_sender" and refine["version"] == 1 and isinstance(refine["head_topk"], int)
-                 and isinstance(refine["weight"], (int, float)) and refine["weight"] >= 0,
+                 refine["kind"] == "exact_sender" and _number(refine["version"]) and refine["version"] == 1 and
+                 type(refine["head_topk"]) is int and _number(refine["weight"]) and refine["weight"] >= 0,
                  f"last-write refinement {refine!r} (exact_sender, version 1, head_topk, a weight >= 0)")
-        widths.append(int(refine["head_topk"]))
+        widths.append(refine["head_topk"])
     second = sc.get("code_bridge_second_pass")
     if second is not None:
-        _require(second.get("mode") == "serial_table" and int(second.get("first_exact", -1)) == layers - 1,
+        _require(isinstance(second, dict) and second.get("mode") == "serial_table" and
+                 type(second.get("first_exact")) is int and second["first_exact"] == layers - 1 and
+                 type(second.get("head_topk")) is int,
                  f"second pass {second!r} (serial_table, the last layer's write)")
-        widths.append(int(second["head_topk"]))
+        widths.append(second["head_topk"])
     _require(len(set(widths)) == 1, f"refinement widths {widths} (one, given at least once)")
     topk = widths[0]
     _require(2 <= topk <= 16, f"refinement width {topk} (2..16)")
     bridge = dc.get("selected_prefix_code_bridge")
     _require(isinstance(bridge, dict) and set(bridge) <= {"code_size", "rank", "eps", "kappa"} and
-             isinstance(bridge.get("code_size"), int) and isinstance(bridge.get("rank"), int) and
-             isinstance(bridge.get("eps"), (int, float)) and
-             (bridge.get("kappa") is None or isinstance(bridge["kappa"], (int, float))),
+             type(bridge.get("code_size")) is int and type(bridge.get("rank")) is int and
+             _number(bridge.get("eps")) and
+             (bridge.get("kappa") is None or _number(bridge["kappa"])),
              f"selected_prefix_code_bridge {bridge!r} (code_size, rank, eps; kappa: training's)")
     rp = sc.get("rope_parameters") or {}
     _require(rp.get("rope_type", rp.get("type", "default")) == "default" and sc.get("rope_scaling") is None,
@@ -100,7 +108,7 @@ def canonical_dspine_config(sc: dict, target: dict | None) -> dict:
         _require(vocab == target["vocab"], "its vocabulary differs from the target's")
         _require(hidden == target["hidden"], "its width differs from the target's")
         _require(all(1 <= t <= target["layers"] for t in taps), f"taps {taps} outside the target's layers")
-    _require(rp.get("rope_theta", sc.get("rope_theta")) is not None, "no rope_theta")
+    _require(_number(rp.get("rope_theta", sc.get("rope_theta"))), "no rope_theta")
     return {
         "kind": "dspine", **layer_fields(sc), "block": dc.get("block_size", sc.get("block_size")),
         "mask_token": dc["mask_token_id"], "taps": taps, "window": window,

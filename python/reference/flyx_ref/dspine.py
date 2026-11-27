@@ -115,7 +115,8 @@ class DSpine(Draft):
             x, last = self._bridge_write(j, x, anchor)
         hn = rms_norm(x, self.w("norm"), c.eps)[1:]                  # rows that predict tokens
         logits = hn @ self.head.T
-        unary, cand = torch.topk(logits, c.topk, dim=-1)              # sorted, ties -> lower id first
+        cand = logits.argsort(dim=-1, descending=True, stable=True)[:, :c.topk]  # ties toward lower token ids
+        unary = logits.gather(-1, cand)
         raw, rms, gq = last
         sq = math.sqrt(c.code)
         nw = self.w("norm")

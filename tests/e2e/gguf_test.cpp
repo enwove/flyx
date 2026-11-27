@@ -129,13 +129,13 @@ std::vector<int32_t> tokens_of(Engine& e, const std::vector<int32_t>& prompt, in
 
 // The same, greedy, with every result the device gave (the prefill's, then a round's each).
 std::vector<flyx_round_result> traced(Engine& e, const std::vector<int32_t>& prompt, int n,
-                                      std::vector<int32_t>* tokens) {
+                                      std::vector<int32_t>* tokens, bool sampling = false) {
   Session s(&e);
   std::string error;
   if (!s.init(&error)) throw std::runtime_error(error);
   std::vector<flyx_round_result> trace;
   s.trace = &trace;
-  *tokens = generate_tokens(s, prompt, n);
+  *tokens = generate_tokens(s, prompt, n, sampling);
   s.trace = nullptr;
   return trace;
 }
@@ -699,6 +699,24 @@ void mtp_ring(const std::string& dir, const std::string& backend, const std::vec
   }
 }
 
+// Both companion formats run the DSpine walk on rows gathered from the packed target head.
+void dspine_file(const std::string& dir, const std::string& backend) {
+  const std::string target = dir + "/tiny_q8_target.gguf";
+  const std::vector<int32_t> prompt = {5, 17, 33, 9};
+  auto plain = engine(target, backend);
+  const auto greedy = tokens_of(*plain, prompt, 32), sampled = tokens_of(*plain, prompt, 32, true);
+  for (const char* file : {"hf_dspine", "tiny_draft_dspine.flyx"}) {
+    auto spec = engine(target, backend, {.speculative = true, .drafter = "dspine", .drafter_files = {dir + "/" + file}});
+    for (bool sampling : {false, true}) {
+      std::vector<int32_t> got;
+      const auto rounds = traced(*spec, prompt, 32, &got, sampling);
+      const bool drafted = std::any_of(rounds.begin(), rounds.end(), [](const auto& r) { return r.n_drafts > 0; });
+      check(drafted && same_tokens(got, sampling ? sampled : greedy),
+            std::string(file) + " drafts on the Q8_0 target and matches plain " + (sampling ? "sampling" : "greedy"));
+    }
+  }
+}
+
 // A DFlash2 drafter in a file of its own (z-lab publishes them so), beside a model of either format.
 // * tiny.flyx's drafter alone (tiny_draft.flyx, converted from z-lab's layout) beside the tiny Qwen3.5 as GGUF
 //   (float32, no drafter): the golden tokens, and on the float64 backend the reference's drafts, round by round;
@@ -973,6 +991,7 @@ int main(int argc, char** argv) {
     explicit_head_dim(dir, backend);
     split_mtp(dir, backend);
     dflash_file(dir, backend);
+    dspine_file(dir, backend);
     if (backend != "cpu_ref") packed(dir, backend);
     if (backend != "cpu_ref") nvfp4_inputs(dir, backend);
   } catch (const std::exception& e) {

@@ -2,6 +2,7 @@
 // Kernel tests: attention: attn_prep, the split kernel, the tensor-core kernel, the FP8 cache, strata attention.
 #include <cuda.h>
 #include "tests/backends/cuda/op_test.cuh"
+#include "backends/cuda/blocks.h"
 #include "backends/cuda/runtime/strata_snapshot.h"
 
 namespace flyx::optest {
@@ -95,7 +96,8 @@ void expect_windows(const std::string& what, const float* dq, const T* dK, const
     }
     ++windows;
   }
-  std::vector<float> actual(whole.size()), expected(whole.begin(), whole.end());
+  std::vector<float> actual(whole.size());
+  const auto expected = as_f32(whole);
   CK(cudaMemcpy(actual.data(), dw, actual.size() * sizeof(float), cudaMemcpyDeviceToHost));
   const bool same = std::memcmp(actual.data(), expected.data(), actual.size() * sizeof(float)) == 0;
   std::printf("  %-4s %s in %d windows of keys: same bits\n", same ? "ok" : "FAIL", what.c_str(), windows);
@@ -103,11 +105,12 @@ void expect_windows(const std::string& what, const float* dq, const T* dK, const
   for (void* x : std::initializer_list<void*>{state, dw, sk, sv, scale_buf}) CK(cudaFree(x));
 }
 
-// A binary16 K/V cache holds 65504 for what is past it, an infinity included (kv16_of, ops/dtype/ref.h round_kv16):
-// attn_prep's k and v (no q/k norms: k rotated as projected) and draft_ctx_kv's v, each entry the reference's, and
-// attention over such a cache stays finite (with an infinity in it, every row attending to it was NaN).
+// A block drafter's binary16 K/V cache holds 65504 for what is past it, an infinity included (kv16_of,
+// ops/dtype/ref.h round_kv16): attn_prep's k and v (no q/k norms: k rotated as projected) and draft_ctx_kv's v, each
+// entry the reference's, and attention over such a cache stays finite (with an infinity in it, every row attending to
+// it was NaN).  The target's cache (attn_prep of a KvRef) keeps binary16's rounding.
 void test_kv16_saturation() {
-  std::printf("binary16 K/V caches saturate\n");
+  std::printf("a block drafter's binary16 K/V caches saturate\n");
   seed("kv16 saturation");
   const int hd = 64, rot = 64, nh = 2, nkv = 1, rows = 4, ctx = 3, cap = ctx + rows + 16;
   const double theta = 1e4;
@@ -155,20 +158,44 @@ void test_kv16_saturation() {
   for (double x : down(dout, size_t(rows) * nh * hd)) out_finite &= std::isfinite(x);
   std::printf("  %-4s attention over the saturated cache: finite\n", out_finite ? "ok" : "FAIL");
   g_fail += !out_finite;
+  kv16 *tK = up_f16(zeros), *tV = up_f16(zeros);
+  attn_prep(dqkv, ld, 0, k_off, v_off, nullptr, nullptr, 1.0f, 1e-6f, theta, rot, nh, nkv, hd, rows, P, kPosPosition,
+            false, dq, KvRef{tK, tV, nullptr, nullptr}, 0);
+  const Vec tKg = down_f16(tK, zeros.size()), tVg = down_f16(tV, zeros.size());
+  bool target_ok = tVg[size_t(ctx + 1) * hd + 3] == INFINITY && tVg[size_t(ctx + 3) * hd + 2] == -INFINITY;
+  for (size_t i = 0; i < Kr.size(); ++i)
+    if (std::fabs(Kr[i]) == 65504.0) target_ok &= tKg[i] == std::copysign(double(INFINITY), Kr[i]);
+  std::printf("  %-4s attn_prep of the target's cache: binary16's infinities\n", target_ok ? "ok" : "FAIL");
+  g_fail += !target_ok;
+  // A drafter layer view, as used in solo and batched rounds. Positions wrap at four slots.
+  KvBuf ring;
+  ring.k = dK;
+  ring.v = dV;
+  ring.ring = rows;
+  const float nan = std::numeric_limits<float>::quiet_NaN();
+  CK(cudaMemcpy(dqkv + v_off, &nan, sizeof(nan), cudaMemcpyHostToDevice));
+  attn_prep(dqkv, ld, 0, k_off, v_off, nullptr, nullptr, 1.0f, 1e-6f, theta, rot, nh, nkv, hd, rows, P, kPosPosition,
+            false, dq, ring.draft_ref(0), 0);
+  const Vec ring_v = down_f16(dV, zeros.size());
+  const bool ring_ok = std::isnan(ring_v[size_t(ctx % rows) * hd]) &&
+                       ring_v[size_t((ctx + 1) % rows) * hd + 3] == 65504.0 &&
+                       ring_v[size_t((ctx + 3) % rows) * hd + 2] == -65504.0;
+  std::printf("  %-4s drafter ring: finite overflow and infinity saturate, NaN stays NaN\n", ring_ok ? "ok" : "FAIL");
+  g_fail += !ring_ok;
   // draft_ctx_kv: a drafter's context row [layer][k | v], its v past the range
   Vec ckv = randv(size_t(2) * nkv * hd), kn = randv(hd, 0.2);
   ckv[size_t(nkv) * hd + 11] = -7e4;
+  ckv[size_t(nkv) * hd + 12] = NAN;
   float *dckv = up(ckv), *dkn = up(kn);
   kv16 *cK = up_f16(zeros), *cV = up_f16(zeros);
   draft_ctx_kv(dckv, 2 * nkv * hd, dkn, 1e-6f, theta, 1, nkv, hd, 1, P, kPosPosition, false, cK, cV,
                size_t(cap) * nkv * hd, 0);
   const Vec cVg = down_f16(cV, zeros.size());
-  bool ctx_ok = true;
-  for (double x : cVg) ctx_ok &= std::isfinite(x);
+  bool ctx_ok = std::isnan(cVg[size_t(ctx) * hd + 12]);
   ctx_ok &= cVg[size_t(ctx) * hd + 11] == -65504.0;
-  std::printf("  %-4s draft_ctx_kv: v past -65504 at -65504\n", ctx_ok ? "ok" : "FAIL");
+  std::printf("  %-4s draft_ctx_kv: finite overflow saturates and NaN stays NaN\n", ctx_ok ? "ok" : "FAIL");
   g_fail += !ctx_ok;
-  for (void* p : std::initializer_list<void*>{dqkv, dq, dout, dK, dV, part, dckv, dkn, cK, cV}) CK(cudaFree(p));
+  for (void* p : std::initializer_list<void*>{dqkv, dq, dout, dK, dV, tK, tV, part, dckv, dkn, cK, cV}) CK(cudaFree(p));
 }
 
 void test_attention(int hd, int rot, int nh, int nkv, int rows, int ctx, bool causal, double theta, int window,

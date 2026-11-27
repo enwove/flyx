@@ -123,8 +123,8 @@ inline double round_f16(double v) {
   return std::fabs(r) >= 65520.0 ? std::copysign(INFINITY, v) : r;
 }
 
-// A binary16 K/V cache's value: round_f16, but the largest finite value (65504) past it instead of an infinity, an
-// infinity included; NaN stays NaN.
+// A block drafter's binary16 K/V cache value: round_f16, but the largest finite value (65504) past it instead of an
+// infinity, an infinity included; NaN stays NaN.
 inline double round_kv16(double v) {
   const double r = round_f16(v);
   return std::isinf(r) ? std::copysign(65504.0, v) : r;

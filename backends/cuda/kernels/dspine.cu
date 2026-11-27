@@ -103,8 +103,8 @@ __global__ void k_dspine_senders(const DevParams* P, const int* cand, const bf16
 __global__ void k_dspine_scores(const float* g, const float* sv, const float* bias, const float* tg, const float* base,
                                 const float* rms, int R, int k, int* pick) {
   pdl_trigger();
-  extern __shared__ float m[];  // [R]
-  __shared__ float score[kTopMax];
+  extern __shared__ float m[];  // [R], R up to kDSpineMaxRank
+  __shared__ float score[FLYX_DSPINE_MAX_TOPK];
   const int i = blockIdx.x, t = i == 0 ? 0 : 1 + (i - 1) / k;
   const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
   const float* gr = g + size_t(t + 1) * R;

@@ -78,10 +78,10 @@ bool supported(const flyx_bmodel* m, const Block& blk, std::string* why) {
         (d->conv() && (d->conv_group < 1 || d->hidden % d->conv_group)) || d->nkv < 1 || d->nh % d->nkv)
       return no("drafter dimensions outside what the CUDA kernels support");
     // DSpine's GEMMs take K % 8 (gemm()); its walk's scores one warp a candidate, a sender's message in shared memory
-    if (d->dspine && (d->dspine.code % 8 || d->dspine.rank % 8 || d->dspine.rank > 12288 || d->dspine.topk < 2 ||
-                      d->dspine.topk > FLYX_DSPINE_MAX_TOPK || d->hidden % 8))
-      return no("DSpine dimensions outside what the CUDA kernels support (code and rank multiples of 8, rank up to "
-                "12288)");
+    if (d->dspine && (d->dspine.code % 8 || d->dspine.rank % 8 || d->dspine.rank > kDSpineMaxRank ||
+                      d->dspine.topk < 2 || d->dspine.topk > FLYX_DSPINE_MAX_TOPK || d->hidden % 8))
+      return no("DSpine dimensions outside what the CUDA kernels support (code and rank multiples of 8, rank up to " +
+                std::to_string(kDSpineMaxRank) + ")");
     if (d->hidden != m->hidden || d->target_hidden != m->hidden) return no("drafter hidden size differs from the target's");
   } else if (const auto* ds = std::get_if<DSparkBlock>(&blk)) {
     if (!attention_head_dim(ds->hd) || ds->block < 2 || ds->block > FLYX_MAX_ROWS || ds->nkv < 1 || ds->nh % ds->nkv ||
@@ -121,11 +121,13 @@ bool kernel_limits(const flyx_model_desc& d, std::string* why) {
   bool rel_attn = false;
   for (int i = 0; i < d.n_blocks; ++i) {
     const flyx_block& b = d.blocks[i];
-    if (b.kind == FLYX_BLOCK_DFLASH2 || b.kind == FLYX_BLOCK_DSPARK) {
-      const int taps = b.kind == FLYX_BLOCK_DFLASH2 ? b.dflash2.n_taps : b.dspark.n_taps;
+    if (b.kind == FLYX_BLOCK_DFLASH2 || b.kind == FLYX_BLOCK_DSPINE || b.kind == FLYX_BLOCK_DSPARK) {
+      const int taps = b.kind == FLYX_BLOCK_DFLASH2 ? b.dflash2.n_taps
+                       : b.kind == FLYX_BLOCK_DSPINE ? b.dspine.n_taps
+                                                     : b.dspark.n_taps;
       if (d.hidden <= 0 || taps <= 0) return no("invalid drafter feature dimensions");
       const int64_t width = int64_t(taps) * d.hidden;
-      if ((b.kind == FLYX_BLOCK_DFLASH2 && width > INT_MAX - 63) || width > INT_MAX - tap_stride)
+      if ((b.kind != FLYX_BLOCK_DSPARK && width > INT_MAX - 63) || width > INT_MAX - tap_stride)
         return no("drafter feature width exceeds CUDA row dimensions");
       tap_stride += width;
     }

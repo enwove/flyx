@@ -90,8 +90,13 @@ T* dev(size_t n) {
   CK(cudaMemset(p, 0, n * sizeof(T) + 16));
   return p;
 }
+inline std::vector<float> as_f32(const Vec& v) {
+  std::vector<float> f(v.size());
+  std::transform(v.begin(), v.end(), f.begin(), [](double x) { return float(x); });
+  return f;
+}
 inline float* up(const Vec& v) {
-  std::vector<float> f(v.begin(), v.end());
+  const auto f = as_f32(v);
   float* p = dev<float>(f.size());
   CK(cudaMemcpy(p, f.data(), f.size() * 4, cudaMemcpyHostToDevice));
   return p;

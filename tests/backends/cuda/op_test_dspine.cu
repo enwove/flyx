@@ -220,6 +220,7 @@ void test_dspine() {
   test_dspine_walk(64, 32, 16, 16, 15);
   test_dspine_walk(5120, 1024, 512, 16, 15);
   test_dspine_walk(4096, 1024, 512, 8, 6);
+  test_dspine_walk(64, 32, kDSpineMaxRank, FLYX_DSPINE_MAX_TOPK, 2);  // the widest rank open takes: shared memory full
 }
 
 }  // namespace flyx::optest

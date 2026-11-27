@@ -105,8 +105,8 @@ __global__ void k_attn_prep(const float* qkv, int ld, int q_off, int k_off, int 
           kv.vscales(cell)[size_t(cell) * nkv + head] = vsc;
         }
       } else {
-        static_cast<kv16*>(kv.k)[at] = kv16_of(out);
-        static_cast<kv16*>(kv.v)[at] = kv16_of(vv);
+        static_cast<kv16*>(kv.k)[at] = kv.saturate ? kv16_of(out) : __float2half_rn(out);
+        static_cast<kv16*>(kv.v)[at] = kv.saturate ? kv16_of(vv) : __float2half_rn(vv);
       }
       if (kv.kq) {  // the low-bit copy strata attention reads: rotated, quantized, packed
         // xk and xv reuse the 2*hd scratch floats (after the grid reduction they hold byte-packed codes_k/codes_v).
@@ -912,8 +912,10 @@ void attn_prep(const float* qkv, int ld, int q_off, int k_off, int v_off, const 
                float norm_offset, float eps, double theta, int rot_dim, int nh, int nkv, int hd, int rows,
                const DevParams* P, int pos_sel, bool skip_if_noop, float* q_out, kv16* Kc, kv16* Vc,
                cudaStream_t st, int pos_add) {
+  KvRef kv{Kc, Vc, nullptr, nullptr};
+  kv.saturate = true;  // a block drafter's cache
   attn_prep(qkv, ld, q_off, k_off, v_off, q_norm, k_norm, norm_offset, eps, theta, rot_dim, nh, nkv, hd, rows, P,
-            pos_sel, skip_if_noop, q_out, KvRef{Kc, Vc, nullptr, nullptr}, st, pos_add);
+            pos_sel, skip_if_noop, q_out, kv, st, pos_add);
 }
 
 // ---- the rotary factors (rope_table) ---------------------------------------------------------------------

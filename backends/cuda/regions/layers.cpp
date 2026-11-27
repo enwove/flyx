@@ -192,7 +192,7 @@ void dspine_block(flyx_seq* s, const DFlashBlock& b, int width, const Launch& L,
   embed_tokens(E, s->dtok, s->dx, B, st);  // packed tables stay in host memory
   for (int j = 0; j < b.layers(); ++j) {
     const auto& l = block<DFlashLayer>(m, b.first_layer + j);
-    const KvRef kvr = kv.layer_ref(j);  // a sliding window's ring of slots too (pos % ring)
+    const KvRef kvr = kv.draft_ref(j);  // a sliding window's ring of slots too (pos % ring)
     rmsnorm(s->dx, H, l.norm.w, l.norm.offset, l.norm.eps, s->dh, H, B, H, st);
     gemm(s->dh, H, l.w_qkv, nqkv, H, s->dproj, s->ld_dproj, B, false, L);
     attn_prep(s->dproj, s->ld_dproj, 0, nh * hd, (nh + nkv) * hd, l.q_norm.w, l.k_norm.w, l.q_norm.offset,
@@ -264,7 +264,7 @@ void draft_block(flyx_seq* s, const DFlashBlock& b, int width, const Launch& L, 
   }
   for (int j = 0; j < b.layers(); ++j) {
     const auto& l = block<DFlashLayer>(m, b.first_layer + j);
-    const KvRef kvr = kv.layer_ref(j);
+    const KvRef kvr = kv.draft_ref(j);
     // Token-conditioned convolutions around attention and MLP where the block has them; plain layers add straight back.
     const bool conv = b.conv();
     rmsnorm(s->dx, H, l.norm.w, l.norm.offset, l.norm.eps, s->dh, H, B, H, st);
@@ -1483,7 +1483,7 @@ void dspark_draft(flyx_seq* s, const DSparkBlock& b, int width, const Launch& L,
         gemm(s->ds_h, H, l.w_v, nkv * hd, H, s->ds_proj + (nh + nkv) * hd, s->ld_ds_proj, B, false, L);
       }
       attn_prep(s->ds_proj, s->ld_ds_proj, 0, nh * hd, (nh + nkv) * hd, l.q_norm.w, l.k_norm.w, l.q_norm.offset,
-                l.q_norm.eps, b.theta, hd, nh, nkv, hd, B, s->P, kPosPosition, false, s->ds_q, kv.ref(), st);
+                l.q_norm.eps, b.theta, hd, nh, nkv, hd, B, s->P, kPosPosition, false, s->ds_q, kv.draft_ref(0), st);
       dspark_block_attention(s->ds_q, kv.k16(0), kv.v16(0), nh, nkv, hd, B, eff_win, scale, s->P, s->ds_act, nh * hd,
                              s->own.part, kRoundSplits, L, kv.ring);
       gemm(s->ds_act, nh * hd, l.w_o, H, nh * hd, s->ds_x, H, B, true, L);

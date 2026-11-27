@@ -3143,7 +3143,7 @@ void dv_rounds(const json& g, const std::string& model, const std::string& backe
   }
 }
 
-int plain_only(const json& g, const std::string& model, const std::string& backend) {
+int plain_only(const json& g, const std::string& model, const std::string& backend, const std::string& required) {
   auto plain = make(model, backend, false);
   auto plain8 = make(model, backend, false, "", true);
   prefill_only_checks(plain.get(), g["cases"][0]["prompt"].get<std::vector<int32_t>>());
@@ -3160,7 +3160,10 @@ int plain_only(const json& g, const std::string& model, const std::string& backe
   std::vector<std::unique_ptr<Engine>> drafting;
   bool dv_drafts = false;  // the file's DV, whose rounds this backend runs (dv_rounds below)
   bool dv_file = false;    // the file has DV, run or not (dv_chat_checkpoint below)
-  if (auto d = make(model, backend, true, "all", false, "", true, 512, -1); d->model().drafters() > 0) {
+  auto d = make(model, backend, true, "all", false, "", required.empty(), 512, required.empty() ? -1 : kReferenceWidth);
+  if (!required.empty())
+    check(d->drafter() == required && d->refused().empty(), "the backend runs the fixture's " + required + " drafter");
+  if (d->model().drafters() > 0) {
     std::string rounds;
     for (size_t i = 0; i < d->widths().size(); ++i) rounds += (i ? ", " : "") + d->round_name(i);
     const std::string mine = d->model().drafter();
@@ -3247,7 +3250,9 @@ int plain_only(const json& g, const std::string& model, const std::string& backe
     for (size_t i = 0; i < drafting.size(); ++i) {
       Session sd(drafting[i].get());
       init_checked(sd);
-      check(gen(sd, prompt, N).tokens == want,
+      const Out result = gen(sd, prompt, N);
+      if (i == 0 && !required.empty()) check(result.usage.drafted > 0, required + " drafted tokens in this run");
+      check(result.tokens == want,
             std::string(i == 0 ? "--drafter all (in use: " : "--drafter none (in use: ") +
                 drafting[i]->drafter() + "): the same");
     }
@@ -3704,7 +3709,18 @@ void graph_dv_rounds(const std::string& model, const std::string& backend, const
 // (FLYX_TEST_DEVICE_MEMORY=1; cuda_device_memory in tests/CMakeLists.txt), and the golden tests beside each other.
 int device_memory(const std::string& model, const std::string& backend, const std::vector<int32_t>& prompt) {
   auto spec = make(model, backend, true);
-  auto plain = make(model, backend, false);
+  auto plain = make(model, backend, false, "none");
+  if (g_block == "dspine") {
+    flyx_memory_info with{}, without{};
+    flyx_load_estimate estimate{};
+    flyx_open_options opts{};
+    const auto* api = spec->api();
+    const bool measured = api->estimate_load(&spec->model().desc(), &opts, 0, 0, &estimate) == 0 &&
+                          api->memory(spec->bmodel(), &with) == 0 && api->memory(plain->bmodel(), &without) == 0;
+    check(measured && estimate.draft_weights_bytes > 0 && with.weights == without.weights + estimate.draft_weights_bytes,
+          "DSpine weights: " + std::to_string(with.weights - without.weights) + " bytes resident, " +
+              std::to_string(estimate.draft_weights_bytes) + " estimated");
+  }
   auto free_now = [&](Engine* e) {
     flyx_memory_info mi{};
     e->api()->memory(e->bmodel(), &mi);
@@ -3741,7 +3757,7 @@ int device_memory(const std::string& model, const std::string& backend, const st
 int main(int argc, char** argv) {
   const auto args = os::utf8_arguments(argc, argv);
   if (args.size() < 3) {
-    std::fprintf(stderr, "usage: golden_test ASSET_DIR BACKEND [VARIANT [MODEL]]  (FLYX_TEST_DEVICE_MEMORY=1: "
+    std::fprintf(stderr, "usage: golden_test ASSET_DIR BACKEND [VARIANT [MODEL [REQUIRED_DRAFTER]]]  (FLYX_TEST_DEVICE_MEMORY=1: "
                          "the device memory checks alone)\n");
     return 2;
   }
@@ -3780,7 +3796,7 @@ int main(int argc, char** argv) {
     std::printf("%s (%d failures)\n", g_fail ? "FAILED" : "PASSED", g_fail);
     return g_fail ? 1 : 0;
   }
-  if (g.value("plain_only", false)) return plain_only(g, model, backend);
+  if (g.value("plain_only", false)) return plain_only(g, model, backend, args.size() > 5 ? args[5] : "");
   auto spec = make(model, backend, true);
   auto plain = make(model, backend, false);
   prefill_only_checks(plain.get(), g["cases"][0]["prompt"].get<std::vector<int32_t>>());
