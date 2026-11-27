@@ -86,7 +86,7 @@ RowNeeds row_needs(const flyx_bmodel* m) {
       n.cx = std::max(n.cx, d->hidden);
       n.ckv = std::max(n.ckv, d->ctx_width());
       if (d->fc.q8_inputs() || d->ctx.q8_inputs() || d->sel_hid.q8_inputs()) n.q8 = true;
-      ks({d->hidden, d->inter, d->nh * d->hd, df_feats, d->dspine.code, d->dspine.rank});
+      ks({d->hidden, d->inter, d->nh * d->hd, df_feats, d->dspine.code, d->dspine.rank});  // the bridge's GEMMs too
     } else if (const auto* dl = std::get_if<DFlashLayer>(&blk)) {
       if (dl->w_qkv.q8_inputs() || dl->w_o.q8_inputs() || dl->w_gu.q8_inputs() || dl->w_down.q8_inputs() ||
           dl->attn_proj.q8_inputs() || dl->mlp_proj.q8_inputs())
@@ -1422,19 +1422,19 @@ void build_seq(flyx_bmodel* m, int32_t max_ctx, flyx_seq* s) {
     s->dq = s->alloc<float>(size_t(B) * d->nh * d->hd);
     s->ld_ckv = n.ckv;
     if (const DSpineBridge& br = d->dspine) {
-      const size_t n_rows = size_t(d->block), c = size_t(br.topk), C = size_t(br.code), Rk = size_t(br.rank);
+      const size_t n_rows = size_t(d->block), c = size_t(d->sel_topk), C = size_t(br.code), Rk = size_t(br.rank);
       const size_t cands = (n_rows - 1) * c, senders = 1 + (n_rows - 2) * c;
-      auto& ds = s->ds;
-      ds.codes = s->alloc<float>(std::max(n_rows, senders) * C);
-      ds.gates = s->alloc<float>(std::max(n_rows * 3 * Rk, senders * 2 * Rk));
-      ds.msg = s->alloc<float>(n_rows * Rk);
-      ds.rms = s->alloc<float>(n_rows);
-      ds.before = s->alloc<float>(n_rows * size_t(DH));
-      ds.g = s->alloc<float>(n_rows * Rk);
-      ds.heads = s->alloc<float>(cands * size_t(DH));
-      ds.tg = s->alloc<float>(cands * Rk);
-      ds.base = s->alloc<float>(cands);
-      ds.pick = s->alloc<int>(senders);
+      auto& dsp = s->dsp;
+      dsp.codes = s->alloc<float>(std::max(n_rows, senders) * C);
+      dsp.gates = s->alloc<float>(std::max(n_rows * 3 * Rk, senders * 2 * Rk));
+      dsp.msg = s->alloc<float>(n_rows * Rk);
+      dsp.rms = s->alloc<float>(n_rows);
+      dsp.before = s->alloc<float>(n_rows * size_t(DH));
+      dsp.g = s->alloc<float>(n_rows * Rk);
+      dsp.heads = s->alloc<float>(cands * size_t(DH));
+      dsp.tg = s->alloc<float>(cands * Rk);
+      dsp.base = s->alloc<float>(cands);
+      dsp.pick = s->alloc<int>(senders);
     }
   }
   if (ds) {

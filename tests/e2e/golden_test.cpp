@@ -1104,6 +1104,34 @@ void dv_chat_checkpoint(const std::string& model, const std::string& backend, co
             ": plain decoding's tokens, the fresh prefill's first token first");
 }
 
+// The tiny Qwen3 (models/llama) with its DSpine drafter from its exact weights, drafting 15 a round: transformers'
+// tokens, and its drafts round for round the reference drafter's from transformers' own hidden states at its taps
+// (golden_qwen3_dspine.json): its taps and context on an architecture the reference has no model of.
+void dspine_qwen3_checks(const std::string& dir, const std::string& backend) {
+  std::ifstream f(os::to_path(dir + "/golden_qwen3_dspine.json"), std::ios::binary);
+  if (!f) {
+    check(false, "dspine on Qwen3: golden_qwen3_dspine.json is missing (make_tiny.py)");
+    return;
+  }
+  const json g = json::parse(f);
+  auto e = make(dir + "/tiny_qwen3_dspine.flyx", backend, true, "dspine", false, "draft_weights=exact", false, 512, 15);
+  bool tokens = true;
+  int same = 0, total = 0;
+  for (const auto& c : g["cases"]) {
+    const auto prompt = c["prompt"].get<std::vector<int32_t>>(), want = c["tokens"].get<std::vector<int32_t>>();
+    Session s(e.get());
+    if (!init_checked(s)) return;
+    std::vector<flyx_round_result> trace;
+    tokens = tokens && gen(s, prompt, int(want.size()), &trace).tokens == want;
+    int sm = 0, tt = 0;
+    drafts_equal(trace, c["rounds"], &sm, &tt);
+    same += sm, total += tt;
+  }
+  check(tokens, "dspine on Qwen3: transformers' tokens");
+  check(total > 0 && same * 10 >= total * 9, "  its drafts the reference's from transformers' hidden states (" +
+                                                 std::to_string(same) + " / " + std::to_string(total) + ")");
+}
+
 // DSpark (DeepSeek's block drafter, models/drafters/dflash2.h: plain layers, every row of its block a draft, a Markov
 // head as the selector without a gate).  On the tiny Qwen3.5 with one in its file: at its block (7 drafts) its drafts
 // are the reference's and its tokens plain decoding's, with the reference's oracle drafts its rounds accept as many,
@@ -4634,7 +4662,10 @@ int main(int argc, char** argv) {
   if (backend == "cuda") wide_rounds(model, backend, g["cases"][0]["prompt"].get<std::vector<int32_t>>());
   if (backend == "cuda") mid_pass_checkpoint(model, backend, g["cases"][0]["prompt"].get<std::vector<int32_t>>());
   rewind_prefill_rewind(model, backend, g["cases"][0]["prompt"].get<std::vector<int32_t>>());
-  if (variant.empty()) dspark_checks(dir, backend);
+  if (variant.empty()) {
+    dspark_checks(dir, backend);
+    dspine_qwen3_checks(dir, backend);
+  }
   if (variant.empty()) {
     std::vector<std::vector<int32_t>> prompts;
     for (const auto& c : g["cases"]) prompts.push_back(c["prompt"].get<std::vector<int32_t>>());

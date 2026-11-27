@@ -79,7 +79,7 @@ bool supported(const flyx_bmodel* m, const Block& blk, std::string* why) {
       return no("drafter dimensions outside what the CUDA kernels support");
     // DSpine's GEMMs take K % 8 (gemm()); its walk's scores one warp a candidate, a sender's message in shared memory
     if (d->dspine && (d->dspine.code % 8 || d->dspine.rank % 8 || d->dspine.rank > kDSpineMaxRank ||
-                      d->dspine.topk < 2 || d->dspine.topk > FLYX_DSPINE_MAX_TOPK || d->hidden % 8))
+                      d->sel_topk < 2 || d->sel_topk > FLYX_DSPINE_MAX_TOPK || d->hidden % 8))
       return no("DSpine dimensions outside what the CUDA kernels support (code and rank multiples of 8, rank up to " +
                 std::to_string(kDSpineMaxRank) + ")");
     if (d->hidden != m->hidden || d->target_hidden != m->hidden) return no("drafter hidden size differs from the target's");

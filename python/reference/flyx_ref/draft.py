@@ -51,12 +51,12 @@ class DraftConfig:
     sel_topk: int
     draft_from: int                 # the block's first row that drafts: 1, or 0 (DSpark: the anchor's)
     sel_gate: bool                  # the selector's hidden gate (sel.hid); DSpark's Markov head has none (a unit gate)
-    window: int = 0                 # positions attend to positions less than this far from them (0: all)
+    window: int                     # positions attend to positions less than this far from them (0: all)
 
 
 def draft_config_from_canonical(c: dict) -> DraftConfig:
     keys = DraftConfig.__dataclass_fields__.keys()
-    return DraftConfig(**{k: c[k] for k in keys if k in c})  # files from before windows have none
+    return DraftConfig(**{k: c[k] for k in keys})
 
 
 @dataclass

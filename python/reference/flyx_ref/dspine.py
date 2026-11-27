@@ -55,12 +55,12 @@ class DSpineConfig:
     rank: int                       # its message rank R
     bridge_eps: float
     topk: int                       # the head's candidates a row's walk chooses among
-    window: int = 0                 # a position attends to the positions less than this far before it (0: all)
+    window: int                     # a position attends to the positions less than this far before it (0: all)
 
 
 def dspine_config_from_canonical(c: dict) -> DSpineConfig:
     keys = DSpineConfig.__dataclass_fields__.keys()
-    return DSpineConfig(**{k: c[k] for k in keys if k in c})
+    return DSpineConfig(**{k: c[k] for k in keys})
 
 
 class DSpine(Draft):

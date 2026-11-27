@@ -23,7 +23,7 @@ def make_draft(d: dict | None, W: dict, dtype=torch.float64):
     """The block drafter a file's "draft" config describes (DFlash2 or DSpine), or None."""
     if not d:
         return None
-    if d.get("kind") == "dspine":
+    if d["kind"] == "dspine":
         return DSpine(dspine_config_from_canonical(d), W, dtype)
     return Draft(draft_config_from_canonical(d), W, dtype)
 

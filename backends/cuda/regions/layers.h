@@ -66,6 +66,8 @@ void draft_head_pick_additive_step(const HeadBlock& head, const float* x_base, c
 // Drafting works on the sequence's own buffers and scratch, on the stream of L (the sequence's, or a batch round's).
 // DFlash2: one block of drafts; tree: `width` of its candidates as a tree (FLYX_DRAFT_TREE), the TreeRows with them
 void draft_block(flyx_seq* s, const DFlashBlock& b, int width, const Launch& L, bool tree = false, bool fused = false);
+// A block drafter's rows (tok) embedded from the target's table, then its norm where it has one: out (tmp: scratch).
+void embed_block_rows(const EmbedBlock& E, const int* tok, float* tmp, float* out, int H, int B, cudaStream_t st);
 void mtp_draft(flyx_seq* s, const MtpBlock& b, int width, const Launch& L, bool fused = false, int start = 0);  // MTP: draft steps [start, width)
 void mtp_context(const Pass& ps, const MtpBlock& b, bool fused = false);  // MTP K/V for the rows of a pass
 void gdn_layer(const Pass& ps, const GdnBlock& g, bool fused = false);

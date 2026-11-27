@@ -402,8 +402,13 @@ DFlashLayer dflash_layer(WeightLoader& L, const flyx_dflash2_layer_block& b, Dra
   return l;
 }
 
-DFlashBlock dflash(WeightLoader& L, const flyx_model_desc& d, const flyx_dflash2_block& b, const StateMap& sm,
-                   DraftQuant dq) {
+// What DFlash2's block and DSpine's bind alike (`title` names the drafter in refusals; layer(j): its layer block j,
+// checked against the block): its dimensions, rotary, window, taps, embedding, head and layers, fc and norms, and its
+// context: every layer's k|v in one GEMM, their k norms side by side, its binary16 cache.
+template <class Block, class LayerOf>
+DFlashBlock block_common(WeightLoader& L, const flyx_model_desc& d, const Block& b, const StateMap& sm, DraftQuant dq,
+                         int layer_kind, const char* title, LayerOf layer) {
+  const std::string t = title;
   DFlashBlock f;
   f.hidden = b.hidden;
   f.nh = b.n_heads;
@@ -414,19 +419,10 @@ DFlashBlock dflash(WeightLoader& L, const flyx_model_desc& d, const flyx_dflash2
   rope_register(f.theta, f.hd);  // its layers' and its context keys' rotary factors, once
   f.block = b.block;
   f.mask_token = b.mask_token;
-  expect(b.window >= 0, "a DFlash2 window below zero");
+  expect(b.window >= 0, "a " + t + " window below zero");
   f.window = b.window;
-  expect(std::isfinite(b.softcap) && b.softcap >= 0.f, "a DFlash2 softcap out of range");
-  expect(b.softcap_mode == FLYX_DFLASH2_SOFTCAP_BEFORE || b.softcap_mode == FLYX_DFLASH2_SOFTCAP_AFTER,
-         "unsupported DFlash2 softcap mode");
-  f.softcap = b.softcap;
-  f.softcap_mode = b.softcap_mode;
   f.n_taps = b.n_taps;
   f.target_hidden = d.hidden;
-  f.conv_taps = b.conv_taps;
-  f.conv_group = b.conv_group;
-  f.sel_rank = b.sel_rank;
-  f.sel_topk = b.sel_topk;
   f.embed = b.embed;
   f.head = b.head;
   f.first_layer = b.first_layer;
@@ -434,35 +430,51 @@ DFlashBlock dflash(WeightLoader& L, const flyx_model_desc& d, const flyx_dflash2
   f.fc = L.lin_quant(b.fc, dq);
   f.hidden_norm = norm(L, b.hidden_norm);
   f.norm = norm(L, b.norm);
+  std::vector<int> ctx, kn;
+  double eps = 0;
+  for (int j = 0; j < b.layers; ++j) {
+    expect(b.first_layer >= 0 && b.first_layer + j < d.n_blocks && d.blocks[b.first_layer + j].kind == layer_kind,
+           t + " layers are not its layer blocks");
+    const auto& l = layer(j);
+    ctx.push_back(l.k);
+    ctx.push_back(l.v);
+    kn.push_back(l.k_norm.w);
+    expect(l.k_norm.offset == 0.0 && (j == 0 || l.k_norm.eps == eps), t + " context k norms: plain weights, one eps");
+    eps = l.k_norm.eps;
+  }
+  int rows = 0;
+  f.ctx = L.lin_stack_quant(ctx, dq, &rows);
+  expect(rows == f.ctx_width(), t + " context k|v rows do not match its dimensions");
+  f.k_norms = {L.vecs(kn), 0.f, float(eps)};
+  f.kv = state_of(sm.kv, b.kv, "K/V");
+  const KvSpec& k = L.model()->states.kv[size_t(f.kv)];
+  expect(k.layers == f.layers() && k.nkv == f.nkv && k.hd == f.hd, t + " context cache differs from its layers");
+  expect(!k.fp8, t + " context cache is not binary16");  // what draft_ctx_kv and the draft block write and read
+  return f;
+}
+
+DFlashBlock dflash(WeightLoader& L, const flyx_model_desc& d, const flyx_dflash2_block& b, const StateMap& sm,
+                   DraftQuant dq) {
+  DFlashBlock f = block_common(L, d, b, sm, dq, FLYX_BLOCK_DFLASH2_LAYER, "DFlash2", [&](int j) -> const auto& {
+    const auto& l = d.blocks[b.first_layer + j].dflash2_layer;
+    expect((l.attn_conv_proj >= 0) == (b.conv_taps > 0), "DFlash2 layer convolutions differ from its conv_taps");
+    return l;
+  });
+  expect(std::isfinite(b.softcap) && b.softcap >= 0.f, "a DFlash2 softcap out of range");
+  expect(b.softcap_mode == FLYX_DFLASH2_SOFTCAP_BEFORE || b.softcap_mode == FLYX_DFLASH2_SOFTCAP_AFTER,
+         "unsupported DFlash2 softcap mode");
+  f.softcap = b.softcap;
+  f.softcap_mode = b.softcap_mode;
+  f.conv_taps = b.conv_taps;
+  f.conv_group = b.conv_group;
+  f.sel_rank = b.sel_rank;
+  f.sel_topk = b.sel_topk;
   f.sel_pred = L.mat(b.sel_pred);
   f.sel_succ = L.mat(b.sel_succ);
   expect(b.draft_from == 0 || b.draft_from == 1, "a block drafter's first drafting row is the anchor's or the next");
   f.draft_from = b.draft_from;
   if (b.sel_hid >= 0) f.sel_hid = L.lin_quant(b.sel_hid, dq);
   else f.unit_hid = L.put(std::vector<float>(size_t(FLYX_MAX_ROWS) * b.sel_rank, 1.f));  // a unit gate
-  // Context K/V projections of every layer in one GEMM, their k norms side by side.
-  std::vector<int> ctx, kn;
-  double eps = 0;
-  for (int j = 0; j < b.layers; ++j) {
-    expect(b.first_layer >= 0 && b.first_layer + j < d.n_blocks &&
-               d.blocks[b.first_layer + j].kind == FLYX_BLOCK_DFLASH2_LAYER,
-           "DFlash2 layers are not its layer blocks");
-    const auto& l = d.blocks[b.first_layer + j].dflash2_layer;
-    expect((l.attn_conv_proj >= 0) == (b.conv_taps > 0), "DFlash2 layer convolutions differ from its conv_taps");
-    ctx.push_back(l.k);
-    ctx.push_back(l.v);
-    kn.push_back(l.k_norm.w);
-    expect(l.k_norm.offset == 0.0 && (j == 0 || l.k_norm.eps == eps), "DFlash2 context k norms: plain weights, one eps");
-    eps = l.k_norm.eps;
-  }
-  int rows = 0;
-  f.ctx = L.lin_stack_quant(ctx, dq, &rows);
-  expect(rows == f.ctx_width(), "DFlash2 context k|v rows do not match its dimensions");
-  f.k_norms = {L.vecs(kn), 0.f, float(eps)};
-  f.kv = state_of(sm.kv, b.kv, "K/V");
-  const KvSpec& k = L.model()->states.kv[size_t(f.kv)];
-  expect(k.layers == f.layers() && k.nkv == f.nkv && k.hd == f.hd, "DFlash2 context cache differs from its layers");
-  expect(!k.fp8, "DFlash2 context cache is not binary16");  // what draft_ctx_kv and the draft block write and read
   return f;
 }
 
@@ -488,12 +500,7 @@ bf16* transposed(WeightLoader& L, int w, int rows, int cols) {
   expect(f.size() == size_t(rows) * size_t(cols), "a matrix to transpose of another size");
   std::vector<uint16_t> t(f.size());
   for (int r = 0; r < rows; ++r)
-    for (int c = 0; c < cols; ++c) {
-      uint32_t u;
-      std::memcpy(&u, &f[size_t(r) * cols + c], 4);
-      u += 0x7FFF + ((u >> 16) & 1);  // round to nearest even (exact for a bf16 value)
-      t[size_t(c) * rows + r] = uint16_t(u >> 16);
-    }
+    for (int c = 0; c < cols; ++c) t[size_t(c) * rows + r] = float_to_bf16(f[size_t(r) * cols + c]);  // exact
   bf16* out = L.model()->alloc<bf16>(t.size());
   CK(cudaMemcpy(out, t.data(), t.size() * sizeof(uint16_t), cudaMemcpyHostToDevice));
   return out;
@@ -502,54 +509,15 @@ bf16* transposed(WeightLoader& L, int w, int rows, int cols) {
 // DSpine: DFlash2's block (its context the same), sel_topk its walk's candidates, and its bridge.
 DFlashBlock dspine(WeightLoader& L, const flyx_model_desc& d, const flyx_dspine_block& b, const StateMap& sm,
                    DraftQuant dq) {
-  DFlashBlock f;
-  f.hidden = b.hidden;
-  f.nh = b.n_heads;
-  f.nkv = b.n_kv;
-  f.hd = b.head_dim;
-  f.inter = b.inter;
-  f.theta = b.theta;
-  rope_register(f.theta, f.hd);
-  f.block = b.block;
-  f.mask_token = b.mask_token;
-  expect(b.window >= 0, "a DSpine window below zero");
-  f.window = b.window;
-  f.n_taps = b.n_taps;
-  f.target_hidden = d.hidden;
+  DFlashBlock f = block_common(L, d, b, sm, dq, FLYX_BLOCK_DSPINE_LAYER, "DSpine",
+                               [&](int j) -> const auto& { return d.blocks[b.first_layer + j].dspine_layer; });
   f.sel_topk = b.topk;
-  f.embed = b.embed;
-  f.head = b.head;
-  f.first_layer = b.first_layer;
-  f.n_layers = b.layers;
-  f.fc = L.lin_quant(b.fc, dq);
-  f.hidden_norm = norm(L, b.hidden_norm);
-  f.norm = norm(L, b.norm);
   // the walk scales the candidates' head rows by the final norm's weight alone (k_dspine_heads)
   expect(f.norm.offset == 0.f, "a DSpine final norm with an offset");
-  std::vector<int> ctx, kn;
-  double eps = 0;
-  for (int j = 0; j < b.layers; ++j) {
-    expect(b.first_layer >= 0 && b.first_layer + j < d.n_blocks &&
-               d.blocks[b.first_layer + j].kind == FLYX_BLOCK_DSPINE_LAYER,
-           "DSpine layers are not its layer blocks");
-    const auto& l = d.blocks[b.first_layer + j].dspine_layer;
-    ctx.push_back(l.k);
-    ctx.push_back(l.v);
-    kn.push_back(l.k_norm.w);
-    expect(l.k_norm.offset == 0.0 && (j == 0 || l.k_norm.eps == eps), "DSpine context k norms: plain weights, one eps");
-    eps = l.k_norm.eps;
-  }
   int rows = 0;
-  f.ctx = L.lin_stack_quant(ctx, dq, &rows);
-  expect(rows == f.ctx_width(), "DSpine context k|v rows do not match its dimensions");
-  f.k_norms = {L.vecs(kn), 0.f, float(eps)};
-  f.kv = state_of(sm.kv, b.kv, "K/V");
-  const KvSpec& k = L.model()->states.kv[size_t(f.kv)];
-  expect(k.layers == f.layers() && k.nkv == f.nkv && k.hd == f.hd, "DSpine context cache differs from its layers");
   DSpineBridge& g = f.dspine;
   g.code = b.code;
   g.rank = b.rank;
-  g.topk = b.topk;
   g.eps = float(b.bridge_eps);
   g.codebook = L.mat(b.codebook);
   g.packed = Lin{L.stack({b.gate, b.pred, b.prev}, &rows)};
@@ -559,7 +527,7 @@ DFlashBlock dspine(WeightLoader& L, const flyx_model_desc& d, const flyx_dspine_
   g.write_t = Lin{transposed(L, d.blocks[b.first_layer + b.layers - 1].dspine_layer.write, b.hidden, b.rank)};
   expect(b.float_weights == FLYX_DRAFT_WEIGHTS_AUTO || b.float_weights == FLYX_DRAFT_WEIGHTS_Q8 ||
              b.float_weights == FLYX_DRAFT_WEIGHTS_NVFP4,
-         "a block drafter's weights beside a float target: the backend's own, Q8_0 or NVFP4");
+         "a DSpine drafter's weights beside a float target: the backend's own, Q8_0 or NVFP4");
   return f;
 }
 
@@ -1254,18 +1222,21 @@ void bind(flyx_bmodel* m, const flyx_model_desc& d, LoadTimes* times) {
         put_block(m, i, std::move(t));
         break;
       }
-      case FLYX_BLOCK_DFLASH2: {
-        const int e = ref(i, b.dflash2.embed, FLYX_BLOCK_EMBED, "embedding");
-        const int head = ref(i, b.dflash2.head, FLYX_BLOCK_HEAD, "head");
+      case FLYX_BLOCK_DFLASH2:
+      case FLYX_BLOCK_DSPINE: {  // the block drafter (m->dflash_block): DFlash2's block, or DSpine's with its bridge
+        const bool spine = b.kind == FLYX_BLOCK_DSPINE;
+        const int e = ref(i, spine ? b.dspine.embed : b.dflash2.embed, FLYX_BLOCK_EMBED, "embedding");
+        const int head = ref(i, spine ? b.dspine.head : b.dflash2.head, FLYX_BLOCK_HEAD, "head");
         const auto& E = block<EmbedBlock>(m, e);
         const auto& Hd = block<HeadBlock>(m, head);
         expect((E.table || E.blk.data) && (Hd.w || Hd.wb.data),
-               "the DFlash2 drafter reads an embedding and a head of bf16 or packed GGML blocks");
-        expect(m->dflash_block < 0, "more than one DFlash2 drafter");
+               std::string("the ") + (spine ? "DSpine" : "DFlash2") +
+                   " drafter reads an embedding and a head of bf16 or packed GGML blocks");
+        expect(m->dflash_block < 0, "more than one block drafter");
         expect(m->head_block < 0 || m->head_block == head, "drafters that read different heads");
         m->dflash_block = i;
         m->head_block = head;
-        put_block(m, i, dflash(L, d, b.dflash2, sm, q.dflash));
+        put_block(m, i, spine ? dspine(L, d, b.dspine, sm, q.dspine) : dflash(L, d, b.dflash2, sm, q.dflash));
         break;
       }
       case FLYX_BLOCK_DFLASH2_LAYER: put_block(m, i, dflash_layer(L, b.dflash2_layer, q.dflash)); break;
@@ -1284,20 +1255,6 @@ void bind(flyx_bmodel* m, const flyx_model_desc& d, LoadTimes* times) {
         break;
       }
       case FLYX_BLOCK_DSPARK_LAYER: put_block(m, i, dspark_layer(L, b.dspark_layer, sm, q.dspark)); break;
-      case FLYX_BLOCK_DSPINE: {  // as DFlash2's: the block drafter (m->dflash_block), with its bridge
-        const int e = ref(i, b.dspine.embed, FLYX_BLOCK_EMBED, "embedding");
-        const int head = ref(i, b.dspine.head, FLYX_BLOCK_HEAD, "head");
-        const auto& E = block<EmbedBlock>(m, e);
-        const auto& Hd = block<HeadBlock>(m, head);
-        expect((E.table || E.blk.data) && (Hd.w || Hd.wb.data),
-               "the DSpine drafter reads an embedding and a head of bf16 or packed GGML blocks");
-        expect(m->dflash_block < 0, "more than one block drafter");
-        expect(m->head_block < 0 || m->head_block == head, "drafters that read different heads");
-        m->dflash_block = i;
-        m->head_block = head;
-        put_block(m, i, dspine(L, d, b.dspine, sm, q.dspine));
-        break;
-      }
       case FLYX_BLOCK_DSPINE_LAYER: put_block(m, i, dspine_layer(L, b.dspine_layer, q.dspine)); break;
       default: throw std::runtime_error("unexpected draft block kind " + std::to_string(b.kind));
     }

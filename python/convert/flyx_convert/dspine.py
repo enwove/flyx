@@ -42,9 +42,10 @@ def canonical_dspine_config(sc: dict, target: dict | None) -> dict:
     _require(isinstance(dc, dict), "no dflash_config")
     layers = sc["num_hidden_layers"]
     _require(type(layers) is int and 0 < layers <= 1024, "num_hidden_layers out of range")
-    _require(sc.get("model_type", "qwen3") == "qwen3", f"model_type {sc.get('model_type')!r} (qwen3 layers)")
-    _require(sc.get("hidden_act", "silu") == "silu", f"hidden_act {sc.get('hidden_act')!r}")
-    _require(not sc.get("attention_bias", False), "attention biases")
+    # Each key read where Tencent's two released configs give it, and nowhere else.
+    _require(sc.get("model_type") == "qwen3", f"model_type {sc.get('model_type')!r} (qwen3 layers)")
+    _require(sc.get("hidden_act") == "silu", f"hidden_act {sc.get('hidden_act')!r}")
+    _require(sc.get("attention_bias") is False, "attention biases")
     _require(dc.get("draft_block_causal") is True, "draft_block_causal must be true (the block attends causally)")
     _require(dc.get("selected_prefix_terminal") is False, "a terminal write (selected_prefix_terminal)")
     _require(dc.get("selected_prefix_decode_mode") == "serial",
@@ -88,29 +89,31 @@ def canonical_dspine_config(sc: dict, target: dict | None) -> dict:
              _number(bridge.get("eps")) and
              (bridge.get("kappa") is None or _number(bridge["kappa"])),
              f"selected_prefix_code_bridge {bridge!r} (code_size, rank, eps; kappa: training's)")
-    rp = sc.get("rope_parameters") or {}
-    _require(rp.get("rope_type", rp.get("type", "default")) == "default" and sc.get("rope_scaling") is None,
-             "rope scaling (default rotary only)")
-    types = sc.get("layer_types") or ["full_attention"] * layers
+    rp = sc.get("rope_parameters")
+    _require(isinstance(rp, dict) and rp.get("rope_type") == "default" and
+             _number(rp.get("rope_theta")) and sc.get("rope_scaling") is None,
+             f"rope_parameters {rp!r} (default rotary, its theta)")
+    types = sc.get("layer_types")
+    _require(isinstance(types, list) and len(types) == layers, f"layer_types {types!r} (one a layer)")
     if all(t == "full_attention" for t in types):
-        _require(not sc.get("use_sliding_window", False), "use_sliding_window without sliding layers")
+        _require(sc.get("use_sliding_window") is False, "use_sliding_window without sliding layers")
         window = 0
     else:
-        _require(all(t == "sliding_attention" for t in types) and sc.get("use_sliding_window") and
-                 int(sc.get("max_window_layers", layers)) == layers and int(sc.get("sliding_window") or 0) > 0,
+        _require(all(t == "sliding_attention" for t in types) and sc.get("use_sliding_window") is True and
+                 sc.get("max_window_layers") == layers and isinstance(sc.get("sliding_window"), int) and
+                 sc["sliding_window"] > 0,
                  f"layer types {sorted(set(types))}: all full, or all sliding with one window")
         window = int(sc["sliding_window"])
     taps = [int(i) + 1 for i in dc["target_layer_ids"]]
     vocab, hidden = int(sc["vocab_size"]), int(sc["hidden_size"])
-    _require(int(sc.get("draft_vocab_size") or vocab) == vocab, "a draft vocabulary of its own")
-    _require(not sc.get("tie_word_embeddings", False), "tied embeddings (it reads the target's head)")
+    _require(sc.get("draft_vocab_size") == vocab, "a draft vocabulary of its own")
+    _require(sc.get("tie_word_embeddings") is False, "tied embeddings (it reads the target's head)")
     if target is not None:
         _require(vocab == target["vocab"], "its vocabulary differs from the target's")
         _require(hidden == target["hidden"], "its width differs from the target's")
         _require(all(1 <= t <= target["layers"] for t in taps), f"taps {taps} outside the target's layers")
-    _require(_number(rp.get("rope_theta", sc.get("rope_theta"))), "no rope_theta")
     return {
-        "kind": "dspine", **layer_fields(sc), "block": dc.get("block_size", sc.get("block_size")),
+        "kind": "dspine", **layer_fields(sc), "block": sc["block_size"],
         "mask_token": dc["mask_token_id"], "taps": taps, "window": window,
         "code": int(bridge["code_size"]), "rank": int(bridge["rank"]), "bridge_eps": float(bridge["eps"]),
         "topk": topk,

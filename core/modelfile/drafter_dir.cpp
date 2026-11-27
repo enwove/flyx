@@ -105,9 +105,10 @@ json dspine_config(const json& sc) {
   const json& dc = sc["dflash_config"];
   const int64_t layers = sc.at("num_hidden_layers").get<int64_t>();
   dspine_require(layers > 0 && layers <= 1024, "num_hidden_layers out of range");
-  dspine_require(sc.value("model_type", "qwen3") == "qwen3", "model_type (qwen3 layers)");
-  dspine_require(sc.value("hidden_act", "silu") == "silu", "hidden_act (silu)");
-  dspine_require(!sc.value("attention_bias", false), "attention biases");
+  // Each key read where Tencent's two released configs give it, and nowhere else.
+  dspine_require(sc.value("model_type", json()) == "qwen3", "model_type (qwen3 layers)");
+  dspine_require(sc.value("hidden_act", json()) == "silu", "hidden_act (silu)");
+  dspine_require(sc.value("attention_bias", json()) == json(false), "attention biases");
   dspine_require(dc.value("draft_block_causal", json()) == json(true), "draft_block_causal must be true");
   dspine_require(dc.value("selected_prefix_terminal", json()) == json(false), "a terminal write");
   dspine_require(dc.value("selected_prefix_decode_mode", "") == "serial", "decode mode (serial)");
@@ -158,25 +159,23 @@ json dspine_config(const json& sc) {
                                           (e.key() == "kappa" && (e.value().is_null() || e.value().is_number()));
                                  }),
                  "selected_prefix_code_bridge (code_size, rank, eps; kappa: training's)");
-  json rp = sc.value("rope_parameters", json::object());  // null: none, as python's `or {}`
-  if (rp.is_null()) rp = json::object();
-  dspine_require((rp.is_object() && rp.value("rope_type", rp.value("type", "default")) == "default") &&
-                     sc.value("rope_scaling", json()).is_null(),
-                 "rope scaling (default rotary only)");
-  dspine_require(rp.value("rope_theta", sc.value("rope_theta", json())).is_number(), "no rope_theta");
-  std::vector<std::string> types(size_t(layers), "full_attention");
-  if (sc.contains("layer_types") && sc["layer_types"].is_array() && !sc["layer_types"].empty())
-    types = sc["layer_types"].get<std::vector<std::string>>();
+  const json rp = sc.value("rope_parameters", json());
+  dspine_require(rp.is_object() && rp.value("rope_type", json()) == "default" &&
+                     rp.value("rope_theta", json()).is_number() && sc.value("rope_scaling", json()).is_null(),
+                 "rope_parameters (default rotary, its theta)");
+  const json lt = sc.value("layer_types", json());
+  dspine_require(lt.is_array() && lt.size() == size_t(layers), "layer_types (one a layer)");
+  const std::vector<std::string> types = lt.get<std::vector<std::string>>();
   auto all = [&](const char* t) {
     return std::all_of(types.begin(), types.end(), [&](const std::string& x) { return x == t; });
   };
   int64_t window = 0;
   if (all("full_attention")) {
-    dspine_require(!sc.value("use_sliding_window", false), "use_sliding_window without sliding layers");
+    dspine_require(sc.value("use_sliding_window", json()) == json(false), "use_sliding_window without sliding layers");
   } else {
     const json w = sc.value("sliding_window", json());
-    dspine_require(all("sliding_attention") && sc.value("use_sliding_window", false) &&
-                       sc.value("max_window_layers", layers) == layers && w.is_number_integer() &&
+    dspine_require(all("sliding_attention") && sc.value("use_sliding_window", json()) == json(true) &&
+                       sc.value("max_window_layers", json()) == json(layers) && w.is_number_integer() &&
                        w.get<int64_t>() > 0,
                    "layer types: all full, or all sliding with one window");
     window = w.get<int64_t>();
@@ -184,12 +183,11 @@ json dspine_config(const json& sc) {
   std::vector<int64_t> taps;
   for (const auto& i : dc.at("target_layer_ids")) taps.push_back(i.get<int64_t>() + 1);
   const int64_t vocab = sc.at("vocab_size").get<int64_t>();
-  const json dvocab = sc.value("draft_vocab_size", json());
-  dspine_require(falsy(dvocab) || dvocab.get<int64_t>() == vocab, "a draft vocabulary of its own");
-  dspine_require(!sc.value("tie_word_embeddings", false), "tied embeddings (it reads the target's head)");
+  dspine_require(sc.value("draft_vocab_size", json()) == json(vocab), "a draft vocabulary of its own");
+  dspine_require(sc.value("tie_word_embeddings", json()) == json(false), "tied embeddings (it reads the target's head)");
   json d = layer_fields(sc);
   d["kind"] = "dspine";
-  d["block"] = dc.contains("block_size") ? dc["block_size"] : sc.at("block_size");
+  d["block"] = sc.at("block_size");
   d["mask_token"] = dc.at("mask_token_id");
   d["taps"] = taps;
   d["window"] = window;

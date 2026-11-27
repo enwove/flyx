@@ -174,7 +174,7 @@ struct DFlashLayer {
 // write transposed ([rank, hidden]: a candidate's head row through it, the walk's).  All bf16: the walk's scores are
 // differences of the rows' messages, which coarser copies would move.  code 0: not DSpine.
 struct DSpineBridge {
-  int code = 0, rank = 0, topk = 0;
+  int code = 0, rank = 0;  // its walk's candidates: the block's sel_topk
   float eps = 0.f;
   const bf16* codebook = nullptr;             // [vocab, code]
   Lin packed, pv;

@@ -697,20 +697,48 @@ void mtp_ring(const std::string& dir, const std::string& backend, const std::vec
   }
 }
 
-// Both companion formats run the DSpine walk on rows gathered from the packed target head.
+// A DSpine drafter in a file of its own (tencent publishes them so), and the directory tencent publishes it as
+// (hf_dspine), beside a GGUF model:
+// * beside the tiny Qwen3.5 as GGUF (float32): the golden tokens (golden_dspine.json's), and its drafts the
+//   reference's, round by round (on the float64 backend all of them);
+// * beside the quantized GGUF (a packed embedding and head, the rows its walk gathers; its layers' copies Q8_0 beside
+//   GGML block weights): it drafts, and the tokens are plain decoding's, greedy and seeded sampling's.
 void dspine_file(const std::string& dir, const std::string& backend) {
-  const std::string target = dir + "/tiny_q8_target.gguf";
-  const std::vector<int32_t> prompt = {5, 17, 33, 9};
-  auto plain = engine(target, backend);
-  const auto greedy = tokens_of(*plain, prompt, 32), sampled = tokens_of(*plain, prompt, 32, true);
-  for (const char* file : {"hf_dspine", "tiny_draft_dspine.flyx"}) {
-    auto spec = engine(target, backend, {.speculative = true, .drafter = "dspine", .drafter_files = {dir + "/" + file}});
-    for (bool sampling : {false, true}) {
+  std::ifstream f(dir + "/golden_dspine.json");
+  const json golden = json::parse(f);
+  const std::string q8 = dir + "/tiny_q8_target.gguf";
+  auto plain = engine(q8, backend);
+  for (const char* file : {"tiny_draft_dspine.flyx", "hf_dspine"}) {
+    std::printf("  the DSpine drafter from %s\n", file);
+    // Its drafts from its exact weights (beside a float target CUDA's default is NVFP4 copies), as the reference's.
+    auto spec = engine(dir + "/tiny_gguf.gguf", backend,
+                       {.speculative = true, .drafter = "dspine", .drafter_files = {dir + "/" + file},
+                        .options = "draft_weights=exact"});
+    for (const auto& item : golden.at("cases")) {
+      const auto p = item.at("prompt").get<std::vector<int32_t>>(), want = item.at("tokens").get<std::vector<int32_t>>();
       std::vector<int32_t> got;
-      const auto rounds = traced(*spec, prompt, 32, &got, sampling);
-      const bool drafted = std::any_of(rounds.begin(), rounds.end(), [](const auto& r) { return r.n_drafts > 0; });
-      check(drafted && same_tokens(got, sampling ? sampled : greedy),
-            std::string(file) + " drafts on the Q8_0 target and matches plain " + (sampling ? "sampling" : "greedy"));
+      const auto trace = traced(*spec, p, 48, &got);
+      int same = 0, total = 0;
+      const json& rounds = item.at("rounds");
+      for (size_t i = 1; i < trace.size() && i - 1 < rounds.size(); ++i) {
+        const auto d = rounds[i - 1].at("drafts").get<std::vector<int32_t>>();
+        for (int j = 0; j < trace[i].n_drafts && j < int(d.size()); ++j, ++total) same += trace[i].drafts[j] == d[size_t(j)];
+      }
+      check(same_tokens(got, want) && total > 0 && (backend == "cpu_ref" ? same == total : same * 10 >= total * 9),
+            std::string(file) + " beside a GGUF model: the golden tokens; drafts equal to the reference's " +
+                std::to_string(same) + " / " + std::to_string(total));
+    }
+    auto packed = engine(q8, backend, {.speculative = true, .drafter = "dspine", .drafter_files = {dir + "/" + file}});
+    for (const auto& item : golden.at("cases")) {
+      const auto p = item.at("prompt").get<std::vector<int32_t>>();
+      for (bool sampling : {false, true}) {
+        std::vector<int32_t> got;
+        const auto rounds = traced(*packed, p, 32, &got, sampling);
+        const bool drafted = std::any_of(rounds.begin(), rounds.end(), [](const auto& r) { return r.n_drafts > 0; });
+        check(drafted && same_tokens(got, tokens_of(*plain, p, 32, sampling)),
+              std::string(file) + " beside the quantized GGUF: it drafts, and plain decoding's tokens (" +
+                  (sampling ? "seeded sampling" : "greedy") + ")");
+      }
     }
   }
 }

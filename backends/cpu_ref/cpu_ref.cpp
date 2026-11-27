@@ -689,7 +689,10 @@ int32_t forced_draft(const RefSeq* s, int pos) {
   return pos < static_cast<int>(s->oracle.size()) ? s->oracle[pos] : 0;
 }
 
-void draft_context(RefSeq* s, const flyx_dflash2_block& d, int n_rows) {
+// A block drafter's context (DFlash2's, DSpine's; layer: its layer j): fc(the taps) -> hidden_norm -> each layer's k
+// (k_norm, rope) and v into its cache at the pass's positions.
+template <class Block, class Layer>
+void block_context(RefSeq* s, const Block& d, int n_rows, Layer layer) {
   const auto* M = s->m;
   const int H = d.hidden, F = d.n_taps * M->hidden, hd = d.head_dim;
   const int F_row = M->total_taps * M->hidden, F_off = M->dflash_tap_off * M->hidden;
@@ -699,7 +702,7 @@ void draft_context(RefSeq* s, const flyx_dflash2_block& d, int n_rows) {
     lin(M, d.fc, &s->feats[size_t(r) * size_t(F_row) + size_t(F_off)], 1, F, H, h.data(), n_rows);
     norm(M, d.hidden_norm, h.data(), H, hn.data());
     for (int j = 0; j < d.layers; ++j) {
-      const auto& l = dlayer(M, d, j);
+      const auto& l = layer(M, d, j);
       lin(M, l.k, hn.data(), 1, H, d.n_kv * hd, k.data(), n_rows);
       lin(M, l.v, hn.data(), 1, H, d.n_kv * hd, v.data(), n_rows);
       for (int kh = 0; kh < d.n_kv; ++kh) {
@@ -730,78 +733,93 @@ void draft_conv(const RefModel* M, int proj, int base_w, const Vec& h, int B, in
   grouped_conv(h.data(), d0.data(), base.data(), B, H, T, d.conv_group, B, out->data());  // the B rows: one block
 }
 
+// One layer of a block drafter (DFlash2's, DSpine's) over the block's B rows x, after `ctx` positions of context in
+// its cache (dK, dV): attention to them and the block (both ways, within its window; causal: each row its own and
+// those before it) and the MLP, DFlash2's token-conditioned convolutions around both where the block has them.
+template <class Block, class Layer>
+void block_layer(const RefModel* M, const Block& d, const Layer& l, const Vec& dK, const Vec& dV, int ctx, int B,
+                 bool causal, Vec& x) {
+  const int H = d.hidden, nh = d.n_heads, nkv = d.n_kv, hd = d.head_dim, I = d.inter;
+  bool conv = false;
+  if constexpr (std::is_same_v<Block, flyx_dflash2_block>) conv = d.conv_taps > 0;
+  Vec h(size_t(B) * H), hc, delta, q(size_t(B) * nh * hd), k(size_t(B) * nkv * hd), v(k.size()), tmp(hd);
+  // `out` added into x, through the convolution `base` (its second half) where the block has them
+  auto add = [&](Vec& out, int base) {
+    if constexpr (std::is_same_v<Block, flyx_dflash2_block>) {
+      if (conv) {
+        Vec fin(size_t(B) * H);
+        grouped_conv(out.data(), delta.data(), M->vec(base).data() + size_t(d.conv_taps) * H, B, H, d.conv_taps,
+                     d.conv_group, B, fin.data());
+        out.swap(fin);
+      }
+    }
+    for (size_t i = 0; i < x.size(); ++i) x[i] += out[i];
+  };
+  // the rows' inputs to a projection: normed, through the convolution `proj`/`base` where the block has them
+  auto inputs = [&](const flyx_norm& n, int proj, int base) {
+    for (int r = 0; r < B; ++r) norm(M, n, &x[size_t(r) * H], H, &h[size_t(r) * H]);
+    if constexpr (std::is_same_v<Block, flyx_dflash2_block>) {
+      if (conv) return draft_conv(M, proj, base, h, B, H, d, &hc, &delta);
+    }
+    hc = h;
+  };
+  int attn_proj = -1, attn_base = -1, mlp_proj = -1, mlp_base = -1;
+  if constexpr (std::is_same_v<Block, flyx_dflash2_block>)
+    attn_proj = l.attn_conv_proj, attn_base = l.attn_conv_base, mlp_proj = l.mlp_conv_proj, mlp_base = l.mlp_conv_base;
+  inputs(l.norm, attn_proj, attn_base);
+  lin(M, l.q, hc.data(), B, H, nh * hd, q.data(), B);
+  lin(M, l.k, hc.data(), B, H, nkv * hd, k.data(), B);
+  lin(M, l.v, hc.data(), B, H, nkv * hd, v.data(), B);
+  Vec KA(size_t(ctx + B) * nkv * hd), VA(KA.size());
+  std::copy(dK.begin(), dK.begin() + size_t(ctx) * nkv * hd, KA.begin());
+  std::copy(dV.begin(), dV.begin() + size_t(ctx) * nkv * hd, VA.begin());
+  for (int r = 0; r < B; ++r) {
+    for (int kh = 0; kh < nkv; ++kh) {
+      norm(M, l.k_norm, &k[(size_t(r) * nkv + kh) * hd], hd, tmp.data());
+      rope(tmp.data(), ctx + r, d.theta, hd);
+      std::copy(tmp.begin(), tmp.end(), &KA[(size_t(ctx + r) * nkv + kh) * hd]);
+      std::copy(&v[(size_t(r) * nkv + kh) * hd], &v[(size_t(r) * nkv + kh) * hd] + hd,
+                &VA[(size_t(ctx + r) * nkv + kh) * hd]);
+    }
+  }
+  Vec o(size_t(B) * nh * hd);
+  for (int r = 0; r < B; ++r) {
+    // the keys it sees, a contiguous run: those less than `window` from its position (all without one), both ways
+    // or, causal, up to its own
+    const int qp = ctx + r, lo = d.window > 0 ? std::max(0, qp - d.window + 1) : 0;
+    const int hi = causal ? qp + 1 : d.window > 0 ? std::min(ctx + B, qp + d.window) : ctx + B;
+    for (int hh = 0; hh < nh; ++hh) {
+      norm(M, l.q_norm, &q[(size_t(r) * nh + hh) * hd], hd, tmp.data());
+      rope(tmp.data(), qp, d.theta, hd);
+      attend(tmp.data(), KA.data() + size_t(lo) * nkv * hd, VA.data() + size_t(lo) * nkv * hd, hi - lo, nkv, hd,
+             hh / (nh / nkv), 1.0 / std::sqrt(double(hd)), &o[(size_t(r) * nh + hh) * hd]);
+    }
+  }
+  Vec ao(size_t(B) * H);
+  lin(M, l.o, o.data(), B, nh * hd, H, ao.data(), B);
+  add(ao, attn_base);
+  inputs(l.post_norm, mlp_proj, mlp_base);
+  Vec g(size_t(B) * I), u(size_t(B) * I), mo(size_t(B) * H);
+  lin(M, l.gate, hc.data(), B, H, I, g.data(), B);
+  lin(M, l.up, hc.data(), B, H, I, u.data(), B);
+  for (size_t i = 0; i < g.size(); ++i) g[i] = silu(g[i]) * u[i];
+  lin(M, l.down, g.data(), B, I, H, mo.data(), B);
+  add(mo, mlp_base);
+}
+
 void draft_block(RefSeq* s, const flyx_dflash2_block& d, int width) {
   const auto* M = s->m;
   // a chain wider than the block: width + 1 mask rows in one block (the CUDA backend's wide block)
   // ABI 49: from the anchor's row (draft_from 0) or the next; convolutions and the selector's gate optional.
   const int off = d.draft_from;
-  const bool conv = d.conv_taps > 0;
   const int B = std::min(FLYX_MAX_ROWS, std::max(d.block, width + off));
-  const int H = d.hidden, nh = d.n_heads, nkv = d.n_kv, hd = d.head_dim, I = d.inter;
-  const int ctx = s->position, T = d.conv_taps;
+  const int H = d.hidden, ctx = s->position;
   std::vector<int32_t> ids(B, d.mask_token);
   ids[0] = s->anchor;
   Vec x;
   embed_rows(s, M->block(d.embed).embed, ids.data(), B, &x);
-  Vec h(size_t(B) * H), hc, delta, q(size_t(B) * nh * hd), k(size_t(B) * nkv * hd), v(k.size()), tmp(hd);
-  for (int j = 0; j < d.layers; ++j) {
-    const auto& l = dlayer(M, d, j);
-    const Vec& dK = s->K[size_t(d.kv)][size_t(j)];
-    const Vec& dV = s->V[size_t(d.kv)][size_t(j)];
-    for (int r = 0; r < B; ++r) norm(M, l.norm, &x[size_t(r) * H], H, &h[size_t(r) * H]);
-    if (conv) draft_conv(M, l.attn_conv_proj, l.attn_conv_base, h, B, H, d, &hc, &delta);
-    else hc = h;
-    lin(M, l.q, hc.data(), B, H, nh * hd, q.data(), B);
-    lin(M, l.k, hc.data(), B, H, nkv * hd, k.data(), B);
-    lin(M, l.v, hc.data(), B, H, nkv * hd, v.data(), B);
-    Vec KA(size_t(ctx + B) * nkv * hd), VA(KA.size());
-    std::copy(dK.begin(), dK.begin() + size_t(ctx) * nkv * hd, KA.begin());
-    std::copy(dV.begin(), dV.begin() + size_t(ctx) * nkv * hd, VA.begin());
-    for (int r = 0; r < B; ++r) {
-      for (int kh = 0; kh < nkv; ++kh) {
-        norm(M, l.k_norm, &k[(size_t(r) * nkv + kh) * hd], hd, tmp.data());
-        rope(tmp.data(), ctx + r, d.theta, hd);
-        std::copy(tmp.begin(), tmp.end(), &KA[(size_t(ctx + r) * nkv + kh) * hd]);
-        std::copy(&v[(size_t(r) * nkv + kh) * hd], &v[(size_t(r) * nkv + kh) * hd] + hd, &VA[(size_t(ctx + r) * nkv + kh) * hd]);
-      }
-    }
-    Vec o(size_t(B) * nh * hd);
-    for (int r = 0; r < B; ++r) {
-      // the keys it sees: all, or those less than `window` from its position, both ways (a contiguous run)
-      const int qp = ctx + r, lo = d.window > 0 ? std::max(0, qp - d.window + 1) : 0;
-      const int hi = d.window > 0 ? std::min(ctx + B, qp + d.window) : ctx + B;
-      for (int hh = 0; hh < nh; ++hh) {
-        norm(M, l.q_norm, &q[(size_t(r) * nh + hh) * hd], hd, tmp.data());
-        rope(tmp.data(), qp, d.theta, hd);
-        attend(tmp.data(), KA.data() + size_t(lo) * nkv * hd, VA.data() + size_t(lo) * nkv * hd, hi - lo, nkv, hd,
-               hh / (nh / nkv), 1.0 / std::sqrt(double(hd)), &o[(size_t(r) * nh + hh) * hd]);
-      }
-    }
-    Vec ao(size_t(B) * H), fin(size_t(B) * H);
-    lin(M, l.o, o.data(), B, nh * hd, H, ao.data(), B);
-    if (conv) {
-      const Vec& base = M->vec(l.attn_conv_base);
-      grouped_conv(ao.data(), delta.data(), base.data() + size_t(T) * H, B, H, T, d.conv_group, B, fin.data());
-    } else {
-      fin = ao;
-    }
-    for (size_t i = 0; i < x.size(); ++i) x[i] += fin[i];
-    for (int r = 0; r < B; ++r) norm(M, l.post_norm, &x[size_t(r) * H], H, &h[size_t(r) * H]);
-    if (conv) draft_conv(M, l.mlp_conv_proj, l.mlp_conv_base, h, B, H, d, &hc, &delta);
-    else hc = h;
-    Vec g(size_t(B) * I), u(size_t(B) * I), mo(size_t(B) * H);
-    lin(M, l.gate, hc.data(), B, H, I, g.data(), B);
-    lin(M, l.up, hc.data(), B, H, I, u.data(), B);
-    for (size_t i = 0; i < g.size(); ++i) g[i] = silu(g[i]) * u[i];
-    lin(M, l.down, g.data(), B, I, H, mo.data(), B);
-    if (conv) {
-      const Vec& base2 = M->vec(l.mlp_conv_base);
-      grouped_conv(mo.data(), delta.data(), base2.data() + size_t(T) * H, B, H, T, d.conv_group, B, fin.data());
-    } else {
-      fin = mo;
-    }
-    for (size_t i = 0; i < x.size(); ++i) x[i] += fin[i];
-  }
+  for (int j = 0; j < d.layers; ++j)
+    block_layer(M, d, dlayer(M, d, j), s->K[size_t(d.kv)][size_t(j)], s->V[size_t(d.kv)][size_t(j)], ctx, B, false, x);
   const auto& head = M->block(d.head).head;
   const int V = head.vocab_out > 0 ? head.vocab_out : head.vocab;  // the candidates: no padding row
   const int K = d.sel_topk, Rk = d.sel_rank;
@@ -896,31 +914,6 @@ const flyx_dspine_layer_block& slayer(const RefModel* M, const flyx_dspine_block
 
 // A weight's float64 elements, row-major (every weight is decoded to float64 at open).
 const double* f64(const RefModel* M, int w) { return static_cast<const double*>(M->w(w)->data); }
-
-// The context: DFlash2's (draft_context) with DSpine's layers.
-void dspine_context(RefSeq* s, const flyx_dspine_block& d, int n_rows) {
-  const auto* M = s->m;
-  const int H = d.hidden, F = d.n_taps * M->hidden, hd = d.head_dim;
-  const int F_row = M->total_taps * M->hidden, F_off = M->dflash_tap_off * M->hidden;
-  Vec h(H), hn(H), k(size_t(d.n_kv) * hd), v(k.size()), tmp(hd);
-  for (int r = 0; r < n_rows; ++r) {
-    int pos = s->start + r;
-    lin(M, d.fc, &s->feats[size_t(r) * size_t(F_row) + size_t(F_off)], 1, F, H, h.data(), n_rows);
-    norm(M, d.hidden_norm, h.data(), H, hn.data());
-    for (int j = 0; j < d.layers; ++j) {
-      const auto& l = slayer(M, d, j);
-      lin(M, l.k, hn.data(), 1, H, d.n_kv * hd, k.data(), n_rows);
-      lin(M, l.v, hn.data(), 1, H, d.n_kv * hd, v.data(), n_rows);
-      for (int kh = 0; kh < d.n_kv; ++kh) {
-        norm(M, l.k_norm, &k[size_t(kh) * hd], hd, tmp.data());
-        rope(tmp.data(), pos, d.theta, hd);
-        std::copy(tmp.begin(), tmp.end(), &s->K[size_t(d.kv)][size_t(j)][(size_t(pos) * d.n_kv + kh) * hd]);
-        std::copy(&v[size_t(kh) * hd], &v[size_t(kh) * hd] + hd,
-                  &s->V[size_t(d.kv)][size_t(j)][(size_t(pos) * d.n_kv + kh) * hd]);
-      }
-    }
-  }
-}
 
 void dspark_draft(RefSeq* s, const flyx_dspark_block& d, int width) {
   const auto* M = s->m;
@@ -1029,63 +1022,23 @@ void dspark_draft(RefSeq* s, const flyx_dspark_block& d, int width) {
 // the window), each layer's write, then the head's candidates and the walk.
 void dspine_block(RefSeq* s, const flyx_dspine_block& d, int width) {
   const auto* M = s->m;
-  const int B = std::min(d.block, width + 1), H = d.hidden, nh = d.n_heads, nkv = d.n_kv, hd = d.head_dim;
-  const int I = d.inter, ctx = s->position, K = d.topk;
+  const int B = std::min(d.block, width + 1), H = d.hidden, ctx = s->position, K = d.topk;
   std::vector<int32_t> ids(B, d.mask_token);
   ids[0] = s->anchor;
   Vec x;
   embed_rows(s, M->block(d.embed).embed, ids.data(), B, &x);
   const flyx::ops::DSpineBridge br{H,           d.code,           d.rank,           d.bridge_eps, f64(M, d.codebook),
                                     f64(M, d.gate), f64(M, d.pred), f64(M, d.prev), M->vec(d.gate_bias).data()};
-  Vec h(size_t(B) * H), q(size_t(B) * nh * hd), k(size_t(B) * nkv * hd), v(k.size()), tmp(hd);
   Vec before(size_t(B) * H), rms(B), g(size_t(B) * d.rank);
   for (int j = 0; j < d.layers; ++j) {
     const auto& l = slayer(M, d, j);
-    const Vec& dK = s->K[size_t(d.kv)][size_t(j)];
-    const Vec& dV = s->V[size_t(d.kv)][size_t(j)];
-    for (int r = 0; r < B; ++r) norm(M, l.norm, &x[size_t(r) * H], H, &h[size_t(r) * H]);
-    lin(M, l.q, h.data(), B, H, nh * hd, q.data(), B);
-    lin(M, l.k, h.data(), B, H, nkv * hd, k.data(), B);
-    lin(M, l.v, h.data(), B, H, nkv * hd, v.data(), B);
-    Vec KA(size_t(ctx + B) * nkv * hd), VA(KA.size());
-    std::copy(dK.begin(), dK.begin() + size_t(ctx) * nkv * hd, KA.begin());
-    std::copy(dV.begin(), dV.begin() + size_t(ctx) * nkv * hd, VA.begin());
-    for (int r = 0; r < B; ++r) {
-      for (int kh = 0; kh < nkv; ++kh) {
-        norm(M, l.k_norm, &k[(size_t(r) * nkv + kh) * hd], hd, tmp.data());
-        rope(tmp.data(), ctx + r, d.theta, hd);
-        std::copy(tmp.begin(), tmp.end(), &KA[(size_t(ctx + r) * nkv + kh) * hd]);
-        std::copy(&v[(size_t(r) * nkv + kh) * hd], &v[(size_t(r) * nkv + kh) * hd] + hd,
-                  &VA[(size_t(ctx + r) * nkv + kh) * hd]);
-      }
-    }
-    Vec o(size_t(B) * nh * hd);
-    for (int r = 0; r < B; ++r) {
-      // the keys it sees: those up to its own position, within the window when it has one (a contiguous run)
-      const int qp = ctx + r, lo = d.window > 0 ? std::max(0, qp - d.window + 1) : 0;
-      for (int hh = 0; hh < nh; ++hh) {
-        norm(M, l.q_norm, &q[(size_t(r) * nh + hh) * hd], hd, tmp.data());
-        rope(tmp.data(), qp, d.theta, hd);
-        attend(tmp.data(), KA.data() + size_t(lo) * nkv * hd, VA.data() + size_t(lo) * nkv * hd, qp + 1 - lo, nkv, hd,
-               hh / (nh / nkv), 1.0 / std::sqrt(double(hd)), &o[(size_t(r) * nh + hh) * hd]);
-      }
-    }
-    Vec ao(size_t(B) * H);
-    lin(M, l.o, o.data(), B, nh * hd, H, ao.data(), B);
-    for (size_t i = 0; i < x.size(); ++i) x[i] += ao[i];
-    for (int r = 0; r < B; ++r) norm(M, l.post_norm, &x[size_t(r) * H], H, &h[size_t(r) * H]);
-    Vec gt(size_t(B) * I), u(size_t(B) * I), mo(size_t(B) * H);
-    lin(M, l.gate, h.data(), B, H, I, gt.data(), B);
-    lin(M, l.up, h.data(), B, H, I, u.data(), B);
-    for (size_t i = 0; i < gt.size(); ++i) gt[i] = silu(gt[i]) * u[i];
-    lin(M, l.down, gt.data(), B, I, H, mo.data(), B);
-    for (size_t i = 0; i < x.size(); ++i) x[i] += mo[i];
+    block_layer(M, d, l, s->K[size_t(d.kv)][size_t(j)], s->V[size_t(d.kv)][size_t(j)], ctx, B, true, x);
     const bool last = j == d.layers - 1;  // the walk redoes the last write: what it started from
     flyx::ops::dspine_write(br, f64(M, l.read), f64(M, l.write), s->anchor, B, x.data(), last ? rms.data() : nullptr,
                             last ? g.data() : nullptr, last ? before.data() : nullptr);
   }
   const auto& head = M->block(d.head).head;
-  const int V = head.vocab;
+  const int V = head.vocab_out > 0 ? head.vocab_out : head.vocab;  // the candidates: no padding row
   Vec hn(H), logits(V), val(K);
   std::vector<int> c(K);
   std::vector<int32_t> cand(size_t(B - 1) * K), drafts(size_t(B - 1));
@@ -1414,8 +1367,8 @@ void run_nodes(RefPlan* p, RefSeq* s) {
         if (rows == 0) break;
         if (b->kind == FLYX_BLOCK_MTP) mtp_context(s, b->mtp, rows);
         else if (b->kind == FLYX_BLOCK_DSPARK) dspark_context(s, b->dspark, rows);
-        else if (b->kind == FLYX_BLOCK_DSPINE) dspine_context(s, b->dspine, rows);
-        else draft_context(s, b->dflash2, rows);
+        else if (b->kind == FLYX_BLOCK_DSPINE) block_context(s, b->dspine, rows, slayer);
+        else block_context(s, b->dflash2, rows, dlayer);
         break;
       }
       case FLYX_NODE_ACCEPT: accept(s, p->width); break;

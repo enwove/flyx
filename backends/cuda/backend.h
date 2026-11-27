@@ -752,7 +752,7 @@ struct flyx_seq {
     float* tg = nullptr;      // those through the last write [(n - 1) c][rank]
     float* base = nullptr;    // each candidate's score from its row alone [(n - 1) c]
     int* pick = nullptr;      // each sender's best candidate of the row after it [senders]
-  } ds;
+  } dsp;
 
   // host mirror (valid whenever nothing is in flight)
   int position = 0, round = 0;

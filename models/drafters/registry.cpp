@@ -15,6 +15,16 @@ namespace {
 
 std::string companion_label(int i) { return "companion file " + std::to_string(i + 1) + ": "; }
 
+// What fn() reads of companion i, its refusals naming the companion.
+template <class F>
+auto in_companion(int i, F fn) {
+  try {
+    return fn();
+  } catch (const std::exception& e) {
+    throw std::runtime_error(companion_label(i) + e.what());
+  }
+}
+
 }  // namespace
 
 void DrafterRegistry::scan(const ModelFile& file, const TargetSpec& target, const MtpHooks* mtp, bool has_dv,
@@ -49,7 +59,7 @@ void DrafterRegistry::scan(const ModelFile& file, const TargetSpec& target, cons
       }
       sources_.dspark_gguf = true;
       dspark_companion_ = i;
-    } else if (is_dflash_companion(h)) {
+    } else if (is_block_companion(h)) {
       if (sources_.block != Drafter::kNone) throw std::runtime_error(what + "the model has a block drafter already");
       try {
         check_made_for(h, target);
@@ -83,37 +93,26 @@ const DFlash2Spec& DrafterRegistry::ensure_dflash2_spec(const ModelFile& file, c
   const int i = block_companion_;
   if (i < 0) return dflash2_spec_.emplace(parse_dflash2_json(file, file.header().at("draft"), target, -1));
   const json& h = file.header().at("companions").at(size_t(i));
-  try {
-    dflash2_spec_ = GgufMeta::is_header(h) ? parse_dflash2_gguf(file, h, target, i)
-                                           : parse_dflash2_json(file, h.at("draft"), target, i);
-  } catch (const std::exception& e) {
-    throw std::runtime_error(companion_label(i) + e.what());
-  }
-  return *dflash2_spec_;
+  return dflash2_spec_.emplace(in_companion(i, [&] {
+    return GgufMeta::is_header(h) ? parse_dflash2_gguf(file, h, target, i)
+                                  : parse_dflash2_json(file, h.at("draft"), target, i);
+  }));
 }
 
 const DSparkSpec& DrafterRegistry::ensure_dspark_spec(const ModelFile& file, const TargetSpec& target) {
   if (dspark_spec_) return *dspark_spec_;
   const int i = dspark_companion_;
   const json& h = file.header().at("companions").at(size_t(i));
-  try {
-    dspark_spec_ = parse_dspark_gguf(file, h, target, i);
-  } catch (const std::exception& e) {
-    throw std::runtime_error(companion_label(i) + e.what());
-  }
-  return *dspark_spec_;
+  return dspark_spec_.emplace(in_companion(i, [&] { return parse_dspark_gguf(file, h, target, i); }));
 }
 
 const DSpineSpec& DrafterRegistry::ensure_dspine_spec(const ModelFile& file, const TargetSpec& target) {
   if (dspine_spec_) return *dspine_spec_;
   const int i = block_companion_;
   if (i < 0) return dspine_spec_.emplace(parse_dspine_json(file.header().at("draft"), target, -1));
-  try {
-    dspine_spec_ = parse_dspine_json(file.header().at("companions").at(size_t(i)).at("draft"), target, i);
-  } catch (const std::exception& e) {
-    throw std::runtime_error(companion_label(i) + e.what());
-  }
-  return *dspine_spec_;
+  return dspine_spec_.emplace(in_companion(i, [&] {
+    return parse_dspine_json(file.header().at("companions").at(size_t(i)).at("draft"), target, i);
+  }));
 }
 
 void DrafterRegistry::validate_selected(const ModelFile& file, const std::vector<Drafter>& selected,
