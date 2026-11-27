@@ -25,6 +25,8 @@ class MappedFile {
   // Asks the system to read bytes offset .. offset + len - 1 from disk now, in large reads, rather than a page at a
   // time when they are first touched.  It may return before they are read (Linux) or after (Windows).
   void read_ahead(size_t offset, size_t len) const;
+  // Reclaim clean resident pages of this read-only mapping. Its address and file contents stay valid.
+  void release_pages() const;
 
  private:
   const uint8_t* data_ = nullptr;

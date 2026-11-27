@@ -125,6 +125,12 @@ uint64_t ModelFile::bytes() const {
   return n;
 }
 
+void ModelFile::release_pages() const {
+  for (const auto& m : maps_) m->release_pages();
+  for (const auto& c : companions_)
+    for (const auto& m : c->maps) m->release_pages();
+}
+
 void ModelFile::read_ahead(const std::atomic<bool>& stop) const {
   constexpr size_t kPiece = size_t(64) << 20;
   auto ahead = [&](const os::MappedFile& m) {

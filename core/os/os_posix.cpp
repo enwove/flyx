@@ -60,6 +60,10 @@ bool MappedFile::open(const std::string& path, std::string* err) {
   return true;
 }
 
+void MappedFile::release_pages() const {
+  if (data_ && size_) madvise(const_cast<uint8_t*>(data_), size_, MADV_DONTNEED);
+}
+
 void MappedFile::read_ahead(size_t offset, size_t len) const {
   if (!data_ || offset >= size_) return;
   const size_t page = size_t(sysconf(_SC_PAGESIZE));

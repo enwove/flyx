@@ -81,13 +81,16 @@ class ReadAhead {
   explicit ReadAhead(const ModelFile& file) : available_(os::system_memory().available) {
     if (available_ && file.bytes() < available_) thread_ = std::thread([this, &file] { file.read_ahead(stop_); });
   }
-  ~ReadAhead() {
-    stop_ = true;
-    if (thread_.joinable()) thread_.join();
+  ~ReadAhead() { stop(); }
+  void stop() {
+    if (thread_.joinable()) {
+      stop_ = true;
+      thread_.join();
+    }
   }
   // For the load's report.
   std::string what() const {
-    return thread_.joinable() ? "read ahead" : "not read ahead: " + gb(available_) + " of memory available";
+    return (thread_.joinable() || stop_) ? "read ahead" : "not read ahead: " + gb(available_) + " of memory available";
   }
 
  private:
@@ -940,11 +943,14 @@ bool Engine::load(const std::string& path, const EngineOptions& opt, std::string
   int expert_backoff = 1, layer_backoff = 1;
   auto fit_weights = [&](const flyx_load_estimate& current, uint64_t free, uint64_t total, bool retry,
                          uint64_t shortfall) {
-    const auto ram = os::system_memory();
-    uint64_t host_room = ram.available;
-    const uint64_t keep = opt_.ram_reserve >= 0 ? uint64_t(opt_.ram_reserve) : plan::host_keep(ram.total);
-    host_room -= std::min(host_room, keep);
-    host_room -= std::min(host_room, opt_.host_reserved);
+    auto available_for_weights = [&] {
+      const auto ram = os::system_memory();
+      if (!ram.total) return UINT64_MAX;
+      const uint64_t keep = opt_.ram_reserve >= 0 ? uint64_t(opt_.ram_reserve) : plan::host_keep(ram.total);
+      uint64_t available = ram.available - std::min(ram.available, keep);
+      return available - std::min(available, opt_.host_reserved);
+    };
+    uint64_t host_room = available_for_weights();
     uint64_t room = free - std::min(free, device_reserve(total));
     auto fit_axis = [&](const char* key, int count, int& resident, uint32_t flyx_open_options::*field) {
       if (count <= 0 || !interfaces::backend_opt_get(clean_backend_opts, key).empty()) return false;
@@ -965,10 +971,18 @@ bool Engine::load(const std::string& path, const EngineOptions& opt, std::string
                trial.weights_bytes <= room - trial.min_runtime_bytes;
       };
       int cap = plan::fit_residency(before - 1, estimate);
-      if (cap < 0 || !estimate(cap) || (ram.total && trial.offload_host_bytes > host_room)) return false;
+      if (cap < 0 || !estimate(cap)) return false;
+      if (trial.offload_host_bytes > host_room) {
+        // A partial upload can leave the read-only source in this process's working set. Give those pages back and
+        // measure actual available RAM again before refusing the independent pageable offload allocation.
+        ahead.stop();
+        file_.release_pages();
+        host_room = available_for_weights();
+        if (trial.offload_host_bytes > host_room) return false;
+      }
       if (unmeasured) {
         const int lower = before - std::min(before, backoff);
-        if (lower < cap && estimate(lower) && (!ram.total || trial.offload_host_bytes <= host_room)) cap = lower;
+        if (lower < cap && estimate(lower) && trial.offload_host_bytes <= host_room) cap = lower;
         backoff += std::min(backoff, count - backoff);
       }
       resident = cap;
