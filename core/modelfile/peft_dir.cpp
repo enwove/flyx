@@ -52,10 +52,11 @@ int dtype_of(const std::string& s) {
 }
 
 json read_json(const fs::path& p, const std::string& what) {
-  constexpr size_t kMaxBytes = 16u << 20;
   std::ifstream f(p, std::ios::binary | std::ios::ate);
   const std::streamoff size = f.tellg();
-  if (!f || size < 0 || size_t(size) > kMaxBytes) throw std::runtime_error("cannot read " + what + " (or larger than 16 MiB)");
+  if (!f || size < 0) throw std::runtime_error("cannot read " + what);
+  if (uint64_t(size) > kPeftConfigMaxBytes)
+    throw std::runtime_error(what + ": " + std::to_string(size) + " bytes, more than an adapter's config holds (16 MiB)");
   f.seekg(0);
   std::string text(size_t(size), '\0');
   if (size > 0 && !f.read(text.data(), size)) throw std::runtime_error("cannot read " + what);
@@ -173,6 +174,37 @@ bool check_tensor(const std::string& key, const json& r, int64_t rank, Tensor* t
   return true;
 }
 
+// A safetensors header's tensors as the adapter's: each one checked (check_tensor), and every decoder layer's linear
+// with one lora_A and one lora_B, never a second of either (two spellings of one name) nor one alone.  The listing of
+// a repository's adapters (peft_header_ok) and the load (read_peft_dir) both take this, so that one a listing calls
+// loadable loads.  false with `why`.
+struct Paired {
+  std::vector<std::pair<std::string, Tensor>> tensors;  // the header's key and its tensor, in the header's order
+  std::set<std::string> linears;                         // those it sits beside ("attn.q", "gdn.qkv", ...)
+  int layers = 0;                                        // one past its last layer
+};
+bool pair_tensors(const json& h, int64_t rank, Paired* out, std::string* why) {
+  if (!h.is_object()) return *why = "not a JSON object", false;
+  std::map<std::string, std::pair<bool, bool>> sides;  // "L3.attn.q" -> whether its lora_A and its lora_B were seen
+  for (auto it = h.begin(); it != h.end(); ++it) {
+    if (it.key() == "__metadata__") continue;
+    Tensor t;
+    if (!check_tensor(it.key(), it.value(), rank, &t, why)) return false;
+    const std::string key = "L" + std::to_string(t.layer) + "." + t.linear;
+    auto& [a, b] = sides.try_emplace(key, false, false).first->second;
+    bool& seen = t.side == 'A' ? a : b;
+    if (seen) return *why = shown(it.key()) + ": a second lora_" + t.side + " on " + key, false;
+    seen = true;
+    out->linears.insert(t.linear);
+    out->layers = std::max(out->layers, t.layer + 1);
+    out->tensors.emplace_back(it.key(), std::move(t));
+  }
+  if (sides.empty()) return *why = std::string("no LoRA tensors in ") + kWeights, false;
+  for (const auto& [key, s] : sides)
+    if (!s.first || !s.second) return *why = key + " has lora_" + (s.first ? "A" : "B") + " alone", false;
+  return true;
+}
+
 }  // namespace
 
 bool peft_config_ok(const std::string& text, PeftConfig* out, std::string* why) {
@@ -200,21 +232,12 @@ bool peft_config_ok(const std::string& text, PeftConfig* out, std::string* why) 
 bool peft_header_ok(const std::string& header, int rank, std::string* why, std::vector<std::string>* linears,
                     int* layers) {
   try {
+    if (header.size() > kSafetensorsHeaderMaxBytes) throw std::runtime_error("a header of more than 16 MiB");
     if (!interfaces::json_depth_within(header)) throw std::runtime_error("nested too deeply");
-    const json h = json::parse(header);
-    if (!h.is_object()) throw std::runtime_error("not a JSON object");
-    std::set<std::string> seen;
-    int last = 0;
-    for (auto it = h.begin(); it != h.end(); ++it) {
-      if (it.key() == "__metadata__") continue;
-      Tensor t;
-      if (!check_tensor(it.key(), it.value(), rank, &t, why)) return false;
-      seen.insert(t.linear);
-      last = std::max(last, t.layer + 1);
-    }
-    if (seen.empty()) return *why = std::string("no LoRA tensors in ") + kWeights, false;
-    if (linears) linears->assign(seen.begin(), seen.end());
-    if (layers) *layers = last;
+    Paired p;
+    if (!pair_tensors(json::parse(header), rank, &p, why)) return false;
+    if (linears) linears->assign(p.linears.begin(), p.linears.end());
+    if (layers) *layers = p.layers;
     return true;
   } catch (const std::exception& e) {
     *why = e.what();
@@ -249,56 +272,42 @@ bool read_peft_dir(const std::string& dir, std::vector<std::unique_ptr<os::Mappe
     uint64_t hlen = 0;
     if (size < 8) return *err = file + ": not a safetensors file", false;
     std::memcpy(&hlen, p, 8);
+    // Bounded before it is parsed, as the Hub's read of it is (hub::safetensors_header).
+    if (hlen > kSafetensorsHeaderMaxBytes)
+      return *err = file + ": a header of " + std::to_string(hlen) + " bytes, more than a safetensors header holds (16 MiB)",
+             false;
     if (hlen > size - 8) return *err = file + ": truncated header", false;
     const std::string_view hdr(reinterpret_cast<const char*>(p + 8), size_t(hlen));
     if (!interfaces::json_depth_within(hdr)) return *err = file + ": header JSON nested too deeply", false;
     const json h = json::parse(hdr);
+    Paired paired;
+    std::string why;
+    if (!pair_tensors(h, rank, &paired, &why)) return *err = dir + ": " + why, false;
     const size_t data_start = 8 + size_t(hlen), data_size = size - data_start;
 
     *out = {};
-    std::map<std::string, std::pair<int, int>> sides;  // "L3.attn.q" -> the indices of its a and b in out->tensors
-    int layers = 0;
-    for (auto it = h.begin(); it != h.end(); ++it) {
-      if (it.key() == "__metadata__") continue;
-      Tensor t;
-      std::string why;
-      if (!check_tensor(it.key(), it.value(), rank, &t, &why)) return *err = dir + ": " + why, false;
-      const int layer = t.layer;
-      const std::string& linear = t.linear;
-      const char side = t.side;
-      const std::vector<int64_t>& shape = t.shape;
-      const auto offsets = it.value().at("data_offsets").get<std::vector<uint64_t>>();
+    for (const auto& [key, t] : paired.tensors) {
+      const auto offsets = h.at(key).at("data_offsets").get<std::vector<uint64_t>>();
       flyx_tensor_view v{};
       v.dtype = t.dtype;
       if (offsets.size() != 2 || offsets[0] > offsets[1] || offsets[1] > data_size)
-        return *err = dir + ": " + it.key() + ": outside the file (truncated download?)", false;
+        return *err = dir + ": " + shown(key) + ": outside the file (truncated download?)", false;
       uint64_t want = 0;
-      if (!plain_tensor_nbytes(v.dtype, shape, &want) || offsets[1] - offsets[0] != want)
-        return *err = dir + ": " + it.key() + ": byte size does not match shape and dtype", false;
+      if (!plain_tensor_nbytes(v.dtype, t.shape, &want) || offsets[1] - offsets[0] != want)
+        return *err = dir + ": " + shown(key) + ": byte size does not match shape and dtype", false;
       v.ndim = 2;
-      v.shape[0] = shape[0];
-      v.shape[1] = shape[1];
+      v.shape[0] = t.shape[0];
+      v.shape[1] = t.shape[1];
       v.data = p + data_start + offsets[0];
       v.nbytes = offsets[1] - offsets[0];
-      const std::string key = "L" + std::to_string(layer) + "." + linear;
-      const std::string name = "target." + key + (side == 'A' ? ".lora_a" : ".lora_b");
-      if (out->index.count(name)) return *err = dir + ": " + it.key() + ": a second adapter on " + key, false;
-      auto& s = sides.try_emplace(key, -1, -1).first->second;
-      (side == 'A' ? s.first : s.second) = int(out->tensors.size());
+      const std::string name = "target.L" + std::to_string(t.layer) + "." + t.linear + (t.side == 'A' ? ".lora_a" : ".lora_b");
       out->index[name] = out->tensors.size();
       out->names.push_back(name);
       out->tensors.push_back(v);
-      layers = std::max(layers, layer + 1);
-    }
-    if (sides.empty()) return *err = dir + ": no LoRA tensors in " + kWeights, false;
-    std::set<std::string> linears;
-    for (const auto& [key, s] : sides) {
-      if (s.first < 0 || s.second < 0) return *err = dir + ": " + key + " has lora_" + (s.first < 0 ? "B" : "A") + " alone", false;
-      linears.insert(key.substr(key.find('.') + 1));
     }
     for (size_t i = 0; i < out->tensors.size(); ++i) out->tensors[i].name = out->names[i].c_str();
-    lora["layers"] = layers;
-    lora["linears"] = std::vector<std::string>(linears.begin(), linears.end());
+    lora["layers"] = paired.layers;
+    lora["linears"] = std::vector<std::string>(paired.linears.begin(), paired.linears.end());
     out->arch = "lora";
     json source = {{"lora", from_path(root.filename().empty() ? root.parent_path().filename() : root.filename())}};
     if (cfg.contains("base_model_name_or_path") && cfg["base_model_name_or_path"].is_string())

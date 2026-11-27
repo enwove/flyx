@@ -68,6 +68,12 @@ bool fetch_model(const std::string& model, const std::vector<std::string>& draft
 // (a repository of several: the folder's path or its last part), "@REV" for a revision.  `path`: the directory.
 bool fetch_lora(const std::string& spec, const hub::ProgressFn& progress, const std::atomic<bool>* stop,
                 std::string* path, std::string* err);
+// fetch_lora's part after the repository is described: the adapter `folder` names in `repo` (spec's FOLDER; spec
+// for messages), its config refused past what a load reads (modelfile::kPeftConfigMaxBytes) before either file is
+// fetched.
+bool fetch_lora_in(const hub::Repo& repo, const std::string& spec, const std::string& folder,
+                   const hub::ProgressFn& progress, const std::atomic<bool>* stop, std::string* path,
+                   std::string* err);
 
 // The drafter a file or directory holds, as its own fields say ("mtp", "dflash2", "dspark"; "" when they say none): a
 // GGUF's header (general.architecture "dflash", or MTP layers), a drafter directory's config.json, a .flyx file's

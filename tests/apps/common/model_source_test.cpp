@@ -11,6 +11,7 @@
 #include <vector>
 
 #include "apps/common/model_source.h"
+#include "core/modelfile/readers.h"
 #include "core/os/os.h"
 #include "core/os/path.h"
 #include "tests/common/check.h"
@@ -181,6 +182,37 @@ int main() {
   listing = flyx::apps::hub_ggufs(generic);
   check(listing.size() == 1 && listing[0].cached && listing[0].cls.drafter_kind == "dspark",
         "cached selection uses the same file's Markov header");
+  // A LoRA adapter of a repository listed as the Hub lists it (fetch_lora_in), its files' blobs standing in for the
+  // transfers as above: a config longer than a load reads (modelfile::kPeftConfigMaxBytes) is refused by its listed
+  // size before either file is fetched, the weights' blob there to be taken; one within it comes with its weights.
+  {
+    flyx::hub::Repo lora;
+    lora.id = "acme/Tiny-LoRA";
+    lora.revision = "main";
+    lora.commit = std::string(40, 'e');
+    const fs::path lsnap = to_path(flyx::hub::snapshot_dir(lora));
+    const fs::path lblobs = lsnap.parent_path().parent_path() / "blobs";
+    const std::string cfg_id(40, '1'), weights_id(40, '2'), config = R"({"peft_type": "LORA", "r": 8})";
+    fs::create_directories(lblobs);
+    std::ofstream(lblobs / cfg_id, std::ios::binary) << config;
+    std::ofstream(lblobs / weights_id, std::ios::binary) << std::string(64, 'w');
+    lora.files = {{"adapters/big/adapter_config.json", flyx::modelfile::kPeftConfigMaxBytes + 1, "", cfg_id},
+                  {"adapters/big/adapter_model.safetensors", 64, "", weights_id},
+                  {"adapters/small/adapter_config.json", config.size(), "", cfg_id},
+                  {"adapters/small/adapter_model.safetensors", 64, "", weights_id}};
+    int progressed = 0;
+    std::string path;
+    const auto counted = [&](const flyx::hub::Progress&) { ++progressed; };
+    ok = flyx::apps::fetch_lora_in(lora, lora.id + ":big", "big", counted, nullptr, &path, &err);
+    check(!ok && err.find("more than an adapter's config holds (16 MiB)") != std::string::npos && progressed == 0 &&
+              !fs::exists(lsnap / "adapters" / "big"),
+          "an adapter's config listed past 16 MiB is refused before either file is fetched: " + err);
+    ok = flyx::apps::fetch_lora_in(lora, lora.id + ":small", "small", counted, nullptr, &path, &err);
+    check(ok && to_path(path) == lsnap / "adapters" / "small" &&
+              fs::file_size(lsnap / "adapters" / "small" / "adapter_config.json") == config.size() &&
+              fs::file_size(lsnap / "adapters" / "small" / "adapter_model.safetensors") == 64,
+          "one within it is fetched with its weights" + (ok ? std::string() : ": " + err));
+  }
   set_env("HF_HUB_OFFLINE", "");
   set_env("HF_HUB_CACHE", "");
   fs::remove_all(tmp, ec);

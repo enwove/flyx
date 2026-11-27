@@ -13,6 +13,7 @@
 #include <thread>
 
 #include "core/hub/sha256.h"
+#include "core/modelfile/readers.h"
 #include "core/os/http.h"
 #include "core/os/os.h"
 #include "core/os/path.h"
@@ -527,7 +528,7 @@ bool safetensors_header(const Repo& r, const RepoFile& f, std::string* header, s
   fs::path local;
   os::HttpGet file;
   if (!file_of(r, f, &local, &file, err)) return false;
-  constexpr uint64_t kMax = 16u << 20;
+  constexpr uint64_t kMax = modelfile::kSafetensorsHeaderMaxBytes;  // what a load of the file reads
   if (detail::has_size(local, f.size)) {
     std::ifstream in(local, std::ios::binary);
     uint64_t n = 0;

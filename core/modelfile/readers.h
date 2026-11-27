@@ -88,6 +88,12 @@ bool read_drafter_dir(const std::string& dir, std::vector<std::unique_ptr<os::Ma
 bool is_peft_dir(const std::string& path);
 bool read_peft_dir(const std::string& dir, std::vector<std::unique_ptr<os::MappedFile>>* maps,
                    ModelFile::Contents* out, std::string* err);
+// The most an adapter_config.json, and a safetensors file's header (its JSON), may hold: 16 MiB each, where PEFT
+// writes a few hundred bytes and a few KiB.  read_peft_dir refuses past them before it reads or parses either, a
+// fetch of an adapter from the Hub before it downloads either file, the Hub's read of a header
+// (hub::safetensors_header) before it allocates it.
+constexpr uint64_t kPeftConfigMaxBytes = uint64_t(16) << 20;
+constexpr uint64_t kSafetensorsHeaderMaxBytes = uint64_t(16) << 20;
 // What an adapter_config.json says of its adapter, for a list of them: rank, scale (alpha / r, or / sqrt(r)), the
 // model it was trained on and the modules it targets ("" and none when not strings; a regex is one).
 struct PeftConfig {

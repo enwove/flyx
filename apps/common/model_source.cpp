@@ -17,6 +17,7 @@
 #include "core/interfaces/model.h"
 #include "core/interfaces/options.h"
 #include "core/modelfile/modelfile.h"
+#include "core/modelfile/readers.h"
 #include "core/os/env.h"
 #include "core/os/os.h"
 #include "core/os/path.h"
@@ -646,6 +647,12 @@ bool fetch_lora(const std::string& spec, const hub::ProgressFn& progress, const 
     return *err = spec + ": no such directory, and not a Hugging Face name (org/name, org/name:FOLDER)", false;
   hub::Repo repo;
   if (!hub::describe(name.repo, name.revision, &repo, err)) return false;
+  return fetch_lora_in(repo, spec, name.quant, progress, stop, path, err);
+}
+
+bool fetch_lora_in(const hub::Repo& repo, const std::string& spec, const std::string& folder,
+                   const hub::ProgressFn& progress, const std::atomic<bool>* stop, std::string* path,
+                   std::string* err) {
   // The adapter named: the folder of that path, else the one folder whose last part it is.
   const std::vector<hub::AdapterFolder> all = hub::adapter_folders(repo.id, repo.files);
   auto listing = [&] {
@@ -655,17 +662,17 @@ bool fetch_lora(const std::string& spec, const hub::ProgressFn& progress, const 
   };
   const hub::AdapterFolder* found = nullptr;
   for (const hub::AdapterFolder& a : all)
-    if (a.folder == name.quant) found = &a;
-  if (!found && !name.quant.empty())
+    if (a.folder == folder) found = &a;
+  if (!found && !folder.empty())
     for (const hub::AdapterFolder& a : all)
-      if (a.folder.ends_with("/" + name.quant)) {
+      if (a.folder.ends_with("/" + folder)) {
         if (found) return *err = spec + ": more than one folder of that name holds an adapter:" + listing(), false;
         found = &a;
       }
   if (!found) {
     if (all.empty())
       return *err = repo.id + ": no LoRA adapter there (adapter_config.json and adapter_model.safetensors)", false;
-    return *err = spec + ": no LoRA adapter " + (name.quant.empty() ? "at the repository's top" : "in that folder") +
+    return *err = spec + ": no LoRA adapter " + (folder.empty() ? "at the repository's top" : "in that folder") +
                   "; it has:" + listing(),
            false;
   }
@@ -673,6 +680,12 @@ bool fetch_lora(const std::string& spec, const hub::ProgressFn& progress, const 
     return *err = found->name + (found->pickle ? ": adapter_model.bin (a pickle) is not read; save the adapter as "
                                                  "safetensors"
                                                : ": no adapter_model.safetensors beside its adapter_config.json"),
+           false;
+  // The config is read whole by the load (modelfile::read_peft_dir): one past what it reads is refused before either
+  // file is fetched.  The transfers keep to the sizes listed (hub::fetch).
+  if (found->config->size > modelfile::kPeftConfigMaxBytes)
+    return *err = found->name + ": adapter_config.json of " + std::to_string(found->config->size) +
+                  " bytes, more than an adapter's config holds (16 MiB): not fetched",
            false;
   const std::vector<hub::RepoFile> files = {*found->config, *found->weights};
   std::vector<std::string> paths;

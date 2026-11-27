@@ -13,6 +13,7 @@
 #include <vector>
 
 #include "core/modelfile/modelfile.h"
+#include "core/modelfile/readers.h"
 #include "nlohmann/json.hpp"
 
 namespace {
@@ -34,24 +35,31 @@ struct Tensor {
 
 size_t elem_bytes(const std::string& dtype) { return dtype == "F32" ? 4 : 2; }
 
-// Writes an adapter directory; each tensor's bytes are its index repeated, so a view can be checked against them.
+// A safetensors header of `tensors` (their bytes one after the other) and those bytes: each tensor's its index
+// repeated, so a view can be checked against them.
+std::string header_of(const std::vector<Tensor>& tensors, std::vector<uint8_t>* data = nullptr) {
+  json h = json::object();
+  size_t at = 0;
+  for (size_t i = 0; i < tensors.size(); ++i) {
+    size_t n = elem_bytes(tensors[i].dtype);
+    for (int64_t d : tensors[i].shape) n *= size_t(d);
+    h[tensors[i].name] = {{"dtype", tensors[i].dtype}, {"shape", tensors[i].shape}, {"data_offsets", {at, at + n}}};
+    if (data) data->insert(data->end(), n, uint8_t(i + 1));
+    at += n;
+  }
+  h["__metadata__"] = {{"format", "pt"}};
+  return h.dump();
+}
+
+// Writes an adapter directory (header_of's tensors); `pad`: that many spaces after the header's JSON (in its length).
 fs::path write_adapter(const fs::path& root, const std::string& name, const json& config,
-                       const std::vector<Tensor>& tensors, bool weights = true) {
+                       const std::vector<Tensor>& tensors, bool weights = true, size_t pad = 0) {
   const fs::path dir = root / name;
   fs::create_directories(dir);
   std::ofstream(dir / "adapter_config.json") << config.dump();
   if (!weights) return dir;
-  json h = json::object();
   std::vector<uint8_t> data;
-  for (size_t i = 0; i < tensors.size(); ++i) {
-    size_t n = elem_bytes(tensors[i].dtype);
-    for (int64_t d : tensors[i].shape) n *= size_t(d);
-    h[tensors[i].name] = {{"dtype", tensors[i].dtype}, {"shape", tensors[i].shape},
-                          {"data_offsets", {data.size(), data.size() + n}}};
-    data.insert(data.end(), n, uint8_t(i + 1));
-  }
-  h["__metadata__"] = {{"format", "pt"}};
-  const std::string hs = h.dump();
+  const std::string hs = header_of(tensors, &data) + std::string(pad, ' ');
   const uint64_t hlen = hs.size();
   std::ofstream f(dir / "adapter_model.safetensors", std::ios::binary);
   f.write(reinterpret_cast<const char*>(&hlen), 8);
@@ -79,6 +87,16 @@ void refused(const fs::path& root, const std::string& name, const json& cfg, con
   std::string err;
   const bool ok = add(write_adapter(root, name, cfg, t, weights), &f, &err);
   check(!ok && err.find(says) != std::string::npos, name + " refused: " + (ok ? "(read)" : err));
+}
+
+// The same tensors as a listing of a repository's adapters reads them (their safetensors header alone,
+// peft_header_ok), refused for the same reason, and as the load refuses them (refused).
+void refused_both(const fs::path& root, const std::string& name, int rank, const std::vector<Tensor>& t,
+                  const std::string& says) {
+  std::string why;
+  const bool ok = flyx::modelfile::peft_header_ok(header_of(t), rank, &why);
+  check(!ok && why.find(says) != std::string::npos, name + " refused by the listing: " + (ok ? "(listed)" : why));
+  refused(root, name, config(rank, 16), t, says);
 }
 
 }  // namespace
@@ -182,7 +200,53 @@ int main() {
           "vision tower");
   refused(root, "unknown_linear", config(8, 16), pair(L0 + "linear_attn.in_proj_q", 8, 16, 16), "does not adapt");
   refused(root, "wrong_rank", config(8, 16), pair(L0 + "self_attn.q_proj", 4, 16, 16), "is not of rank r = 8");
-  refused(root, "a_alone", config(8, 16), {{L0 + "self_attn.q_proj.lora_A.weight", "F32", {8, 16}}}, "lora_A alone");
+  // One side of a linear's pair alone, or a second of one side (two spellings of one tensor's name): the listing of a
+  // repository's adapters and the load refuse them alike, layer by layer and linear by linear.
+  refused_both(root, "a_alone", 8, {{L0 + "self_attn.q_proj.lora_A.weight", "F32", {8, 16}}}, "L0.attn.q has lora_A alone");
+  {
+    auto t = pair(L0 + "self_attn.q_proj", 8, 16, 16);
+    t.push_back({"base_model.model.model.layers.1.self_attn.q_proj.lora_B.weight", "F32", {16, 8}});
+    refused_both(root, "b_alone_other_layer", 8, t, "L1.attn.q has lora_B alone");
+    t = pair(L0 + "self_attn.q_proj", 8, 16, 16);
+    t.push_back({L0 + "self_attn.v_proj.lora_A.weight", "F32", {8, 16}});
+    refused_both(root, "a_alone_other_linear", 8, t, "L0.attn.v has lora_A alone");
+    t = pair(L0 + "self_attn.q_proj", 8, 16, 16);
+    t.push_back({"model.layers.0.self_attn.q_proj.weight.lora_A.default", "F32", {8, 16}});
+    refused_both(root, "second_a", 8, t, "a second lora_A on L0.attn.q");
+  }
+  {  // What the listing says of an adapter it calls loadable is what the load reads.
+    std::vector<Tensor> t = pair(L0 + "self_attn.q_proj", 8, 16, 16);
+    for (const Tensor& x : pair("base_model.model.model.layers.2.mlp.down_proj", 8, 32, 16)) t.push_back(x);
+    std::string why;
+    std::vector<std::string> linears;
+    int layers = 0;
+    const bool listed = flyx::modelfile::peft_header_ok(header_of(t), 8, &why, &linears, &layers);
+    flyx::ModelFile f;
+    std::string err;
+    const bool ok = add(write_adapter(root, "listed", config(8, 16), t), &f, &err);
+    check(listed && ok && layers == 3 && f.header()["companions"][0]["lora"]["layers"] == layers &&
+              f.header()["companions"][0]["lora"]["linears"] == json(linears),
+          "an adapter the listing takes loads, with the linears and layers it listed" + (ok ? std::string() : ": " + err) + why);
+  }
+  // Past what a load reads, refused before it is read: a header of more than 16 MiB (core/hub/hub_fetch.cpp reads no
+  // more of the Hub's), and a config of more.
+  {
+    flyx::ModelFile f;
+    std::string err;
+    const bool ok = add(write_adapter(root, "big_header", config(8, 16), q, true, size_t(16) << 20), &f, &err);
+    check(!ok && err.find("more than a safetensors header holds (16 MiB)") != std::string::npos &&
+              err.find("truncated") == std::string::npos,
+          "a safetensors header of more than 16 MiB refused before it is parsed: " + err);
+    std::string why;
+    const bool listed = flyx::modelfile::peft_header_ok(header_of(q) + std::string(size_t(16) << 20, ' '), 8, &why);
+    check(!listed && why.find("16 MiB") != std::string::npos, "and by the listing: " + why);
+    const fs::path dir = write_adapter(root, "big_config", config(8, 16), q);
+    std::ofstream(dir / "adapter_config.json") << config(8, 16).dump() << std::string((size_t(16) << 20) + 1, ' ');
+    flyx::ModelFile g;
+    const bool read = add(dir, &g, &err);
+    check(!read && err.find("more than an adapter's config holds (16 MiB)") != std::string::npos,
+          "an adapter_config.json of more than 16 MiB refused before it is read: " + err);
+  }
   refused(root, "dtype", config(8, 16), pair(L0 + "self_attn.q_proj", 8, 16, 16, "F64"), "F32, BF16 or F16");
   refused(root, "no_weights", config(8, 16), q, "no adapter_model.safetensors", /*weights=*/false);
   // Plain LoRA tensors whose config says they mean something else: never run as plain LoRA.
