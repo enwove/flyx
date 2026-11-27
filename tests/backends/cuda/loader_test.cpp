@@ -387,9 +387,10 @@ void expert_estimates() {
       const auto resident = loader.expert_mat(0, cold);
       loader.expert_mat(0, shared);
       loader.finish();
-      require(resident.n_experts == hot && m.bytes == expected / e * hot && m.bytes == est.weights_bytes,
+      const size_t ring = cold ? 2 * cold->bank.bytes(cold->bank.count) : 0;
+      require(resident.n_experts == hot && m.bytes == expected / e * hot && m.bytes + ring == est.weights_bytes,
               "actual resident expert upload matches estimate");
-      require(cold == shared && bool(cold) == (hot < e) && m.host_bytes == est.offload_host_bytes &&
+      require(cold == shared && bool(cold) == (hot < e) && m.host_bytes + ring == est.offload_host_bytes &&
                   (!cold || (cold->first == hot && cold->bytes() == m.host_bytes)),
               "repeated blocks share a single correctly budgeted cold matrix");
     }

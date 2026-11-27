@@ -1710,6 +1710,11 @@ int estimate_load(const flyx_model_desc* desc, const flyx_open_options* opts, ui
       const size_t e = size_t(v->shape[0]), hot = std::min(e,size_t(bo.gpu_experts));
       target_bytes = size_add(target_bytes,size_mul(layout.bytes()/e,hot));
       if (hot < e) {
+        if (bo.expert_prefill_min) {
+          const auto bank = ExpertBankLayout::from(layout, e, e - hot);
+          cold.bank_bytes = std::max(cold.bank_bytes, bank.bytes(bank.count));
+          out->offload_host_bytes = size_add(out->offload_host_bytes, bank.archive_bytes(e - hot));
+        }
         const size_t raw = layout.format == ExpertLayout::bf16_rows ? layout.payload_bytes() : v->nbytes;
         const size_t per = size_add(raw/e,desc->weights[i].scale2 ? sizeof(float) : 0);
         out->offload_host_bytes = size_add(out->offload_host_bytes,size_mul(e-hot,per));

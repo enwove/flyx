@@ -865,7 +865,9 @@ void test_fused_rounds(const std::filesystem::path& path, const std::string& mod
   std::vector<int32_t> want;
   std::vector<float> resident_logits, generic_logits;
   for (const std::string fusion : {"fusion=0", "fusion=1", "fusion=0,gpu_experts=2", "fusion=1,gpu_experts=2",
-                                   "fusion=0,gpu_experts=0", "fusion=1,gpu_experts=0"}) {
+                                   "fusion=0,gpu_experts=0", "fusion=1,gpu_experts=0",
+                                   "fusion=0,gpu_experts=2,expert_prefill_min=2",
+                                   "fusion=1,gpu_experts=2,expert_prefill_min=2"}) {
     const std::string opts = "head_cert=0,blocks=packed," + fusion;
     auto e = load_engine(path.string(), "cuda", {.speculative = true, .lookup = true, .backend_opts = opts});
     if (e->lookup_widths().empty() || e->lookup_widths().front() != 3 || e->widths().front() != 0)

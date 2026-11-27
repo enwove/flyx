@@ -679,7 +679,9 @@ ExpertMat WeightLoader::expert_mat(int w, std::shared_ptr<const ColdMatrix>& col
   const size_t all = size_t(v->shape[0]);
   const size_t E = std::min(all, size_t(m_->opt.gpu_experts)), N = size_t(v->shape[1]), K = size_t(v->shape[2]);
   if (E < all) {
-    cold = cold_experts_[w] = std::make_shared<ColdMatrix>(weights_[w], int(E), layout);
+    auto matrix = std::make_shared<ColdMatrix>(weights_[w], int(E), layout);
+    if (m_->opt.expert_prefill_min) matrix->pack_banks(layout, all);
+    cold = cold_experts_[w] = std::move(matrix);
     m_->host_bytes += cold->bytes();
     layout.rows = E * N;
     if (layout.expert_scales) layout.expert_scales = E;
@@ -733,18 +735,7 @@ ExpertMat WeightLoader::expert_mat(int w, std::shared_ptr<const ColdMatrix>& col
           const uint8_t* in = file + (r0 + r) * file_row;
           uint8_t* qo = hq + r * q_row;
           uint8_t* so = hs + r * s_row;
-          for (size_t k = 0; k < per_row; ++k, in += 36) {
-            const uint8_t* d = in;
-            const uint8_t* qs = in + 4;
-            for (int g = 0; g < 4; ++g) {
-              if (d[g] == 0xFF)
-                throw std::runtime_error(std::string(v->name) + ": an NVFP4 scale of 0xFF (no e4m3 holds it)");
-              so[4 * k + size_t(g)] = d[g] == 0x7F ? 0 : uint8_t(d[g] & 0x7F);
-              auto code = [&](int l) { return l < 8 ? qs[8 * g + l] & 15 : qs[8 * g + l - 8] >> 4; };
-              for (int i = 0; i < 8; ++i)
-                qo[32 * k + 8 * size_t(g) + size_t(i)] = uint8_t(code(2 * i) | code(2 * i + 1) << 4);
-            }
-          }
+          pack_expert_nvfp4(in, per_row, qo, so);
         }
       });
       CK(cudaMemcpyAsync(q_dev + r0 * q_row, hq, nr * q_row, cudaMemcpyHostToDevice, S.st));

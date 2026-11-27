@@ -237,6 +237,7 @@ const std::vector<OptionSpec>& option_specs() {
   static const std::vector<OptionSpec> specs = {
       whole_opt("gpu_layers", &BackendOptions::gpu_layers),
       whole_opt("gpu_experts", &BackendOptions::gpu_experts),
+      whole_opt("expert_prefill_min", &BackendOptions::expert_prefill_min),
       whole_opt("expert_threads", &BackendOptions::expert_threads),
       flag_opt("profile", &BackendOptions::profile),
       flag_opt("graphs", &BackendOptions::graphs),

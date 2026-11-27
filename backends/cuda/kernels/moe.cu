@@ -21,6 +21,7 @@
 #include "backends/cuda/kernels/gemm_internal.h"
 #include "backends/cuda/kernels/kernels.cuh"
 #include "backends/cuda/kernels/moe_blocks_ops.h"
+#include "backends/cuda/kernels/moe_bank.h"
 
 namespace flyx::cuda {
 namespace {
@@ -148,8 +149,9 @@ __global__ void k_situ_rows(const float* __restrict__ gu, int ld_gu, int I, floa
 // pair's row is its own.
 constexpr int kGroupThreads = 256;
 
+template <bool Filter>
 __global__ void __launch_bounds__(kGroupThreads)
-    k_moe_group_tasks(const int* __restrict__ eidx, int M, int E, int bm, int* __restrict__ pairs,
+    k_moe_group_tasks(const int* __restrict__ eidx, int M, int E, int bm, int first, int* __restrict__ pairs,
                       MoeTask* __restrict__ tasks, int* __restrict__ n_tasks) {
   pdl_trigger();
   extern __shared__ int s_group[];  // [E] pairs an expert has, then [E] where its next pair goes
@@ -159,7 +161,10 @@ __global__ void __launch_bounds__(kGroupThreads)
   const int tid = threadIdx.x, lane = tid & 31, warp = tid >> 5;
   for (int e = tid; e < E; e += kGroupThreads) cnt[e] = 0;
   __syncthreads();
-  for (int i = tid; i < M; i += kGroupThreads) atomicAdd(&cnt[eidx[i]], 1);
+  for (int i = tid; i < M; i += kGroupThreads) {
+    int e = eidx[i] - (Filter ? first : 0);
+    if (!Filter || unsigned(e) < unsigned(E)) atomicAdd(&cnt[e], 1);
+  }
   __syncthreads();
   const int per = (E + kGroupThreads - 1) / kGroupThreads;
   const int e0 = min(E, tid * per), e1 = min(E, e0 + per);
@@ -195,12 +200,18 @@ __global__ void __launch_bounds__(kGroupThreads)
   }
   if (tid == kGroupThreads - 1) *n_tasks = t;  // its run is the last: its end is the total
   __syncthreads();
-  for (int i = tid; i < M; i += kGroupThreads) pairs[atomicAdd(&cur[eidx[i]], 1)] = i;
+  for (int i = tid; i < M; i += kGroupThreads) {
+    int e = eidx[i] - (Filter ? first : 0);
+    if (!Filter || unsigned(e) < unsigned(E)) pairs[atomicAdd(&cur[e], 1)] = i;
+  }
 }
 
-void group_tasks(const int* eidx, int M, int E, int bm, const MoeScratch* sc, cudaStream_t st) {
-  k_moe_group_tasks<<<1, kGroupThreads, size_t(2) * E * sizeof(int), st>>>(eidx, M, E, bm, sc->pairs, sc->tasks,
-                                                                           sc->n_tasks);
+void group_tasks(const int* eidx, int M, int E, int bm, const MoeScratch* sc, cudaStream_t st, int first) {
+  const size_t bytes = size_t(2) * E * sizeof(int);
+  if (first < 0)
+    k_moe_group_tasks<false><<<1, kGroupThreads, bytes, st>>>(eidx, M, E, bm, 0, sc->pairs, sc->tasks, sc->n_tasks);
+  else
+    k_moe_group_tasks<true><<<1, kGroupThreads, bytes, st>>>(eidx, M, E, bm, first, sc->pairs, sc->tasks, sc->n_tasks);
 }
 
 // Whether the tiles moe_gate_up left (`grouped` rows a tile, every one of `rows` rows in one chunk) serve a kernel
@@ -785,7 +796,7 @@ __global__ void __launch_bounds__(32 * NW)
 template <int SPAN>
 int launch_nvfp4_gu(const float* x, int ldx, const ExpertMat& W, const int* eidx, int rows, int top_k, int I, int K,
                     float situ_beta, float situ_linear_beta, bool fuse_act, float* out, int ld_out,
-                    const MoeScratch* sc, const Launch& L) {
+                    const MoeScratch* sc, const Launch& L, int first) {
   cudaStream_t st = L.st;
   const int N_work = fuse_act ? I : 2 * I;
   const bool has_sc = sc && sc->tasks && sc->n_tasks && sc->pairs && W.n_experts <= sc->max_experts &&
@@ -813,7 +824,7 @@ int launch_nvfp4_gu(const float* x, int ldx, const ExpertMat& W, const int* eidx
       } else {
         const int M = rc * top_k;
         const int mt = max_work_tiles(M, W.n_experts, 4);
-        group_tasks(ec, M, W.n_experts, 4, sc, st);
+        group_tasks(ec, M, W.n_experts, 4, sc, st, first);
         grouped = rc == rows ? 4 : 0;
         if (fuse_act)
           launch_dependent(k_moe_nvfp4_vec<true, false, 4>, dim3(gx, mt), dim3(32 * kVecWarps), L,
@@ -843,7 +854,7 @@ int launch_nvfp4_gu(const float* x, int ldx, const ExpertMat& W, const int* eidx
     } else if (has_sc) {
       const int M = rc * top_k;
       const int mt = max_work_tiles(M, W.n_experts, 16);
-      group_tasks(ec, M, W.n_experts, 16, sc, st);
+      group_tasks(ec, M, W.n_experts, 16, sc, st, first);
       grouped = rc == rows ? 16 : 0;
       if (fuse_act)
         launch_dependent(k_moe_nvfp4_mma<SPAN, true, false, false, 4, 1>, dim3(ceil_div(N_work, 32), mt), dim3(128), L,
@@ -875,7 +886,7 @@ int launch_nvfp4_gu(const float* x, int ldx, const ExpertMat& W, const int* eidx
 template <int SPAN>
 void launch_nvfp4_down(const float* act, int ld_act, const ExpertMat& W, const int* eidx, const float* ew, int rows,
                        int top_k, int H, int K, float* out, int ld_out, bool accumulate, const MoeScratch* sc,
-                       const Launch& L, const bf16* act_bf16, int grouped) {
+                       const Launch& L, const bf16* act_bf16, int grouped, int first) {
   cudaStream_t st = L.st;
   const bool has_down = sc && sc->down_buf && sc->tasks && sc->n_tasks && sc->pairs &&
                         W.n_experts <= sc->max_experts && top_k <= sc->max_top_k;
@@ -905,12 +916,12 @@ void launch_nvfp4_down(const float* act, int ld_act, const ExpertMat& W, const i
                          sc->down_buf, H);
       } else {
         const int mt = max_work_tiles(M, W.n_experts, 4);
-        if (rc != rows || !tiles_serve(grouped, 4, rc)) group_tasks(ec, M, W.n_experts, 4, sc, st);
+        if (rc != rows || !tiles_serve(grouped, 4, rc)) group_tasks(ec, M, W.n_experts, 4, sc, st, first);
         launch_dependent(k_moe_nvfp4_vec<false, true, 4>, dim3(gx, mt), dim3(32 * kVecWarps), L,
                          ac, ld_act, W.q, W.s, W.rs, H, H, K, ec, sc->tasks, sc->n_tasks, sc->pairs, top_k,
                          0.f, 0.f, sc->down_buf, H);
       }
-      launch_dependent(k_moe_weighted_sum, dim3(ceil_div(H, 256), rc), dim3(256), L, sc->down_buf,
+      if (first < 0) launch_dependent(k_moe_weighted_sum, dim3(ceil_div(H, 256), rc), dim3(256), L, sc->down_buf,
                        ew + size_t(r0) * top_k, top_k, H, out + size_t(r0) * ld_out, ld_out, int(accumulate));
       continue;
     }
@@ -925,12 +936,12 @@ void launch_nvfp4_down(const float* act, int ld_act, const ExpertMat& W, const i
                        sc->down_buf, H);
     } else {
       const int mt = max_work_tiles(M, W.n_experts, 16);
-      if (rc != rows || !tiles_serve(grouped, 16, rc)) group_tasks(ec, M, W.n_experts, 16, sc, st);
+      if (rc != rows || !tiles_serve(grouped, 16, rc)) group_tasks(ec, M, W.n_experts, 16, sc, st, first);
       launch_dependent(k_moe_nvfp4_mma<SPAN, false, true, false, 4, 2>, dim3(ceil_div(H, 64), mt), dim3(128), L,
                        ac, ld_act, bf_a, W.q, W.s, W.rs, H, H, K, ec, sc->tasks, sc->n_tasks, sc->pairs, top_k, 0.f,
                        0.f, sc->down_buf, H);
     }
-    launch_dependent(k_moe_weighted_sum, dim3(ceil_div(H, 256), rc), dim3(256), L, sc->down_buf,
+    if (first < 0) launch_dependent(k_moe_weighted_sum, dim3(ceil_div(H, 256), rc), dim3(256), L, sc->down_buf,
                      ew + size_t(r0) * top_k, top_k, H, out + size_t(r0) * ld_out, ld_out, int(accumulate));
   }
 }
@@ -1352,9 +1363,9 @@ bool moe_round_bf16_down(const ExpertMat& W, int rows, int top_k, int K, const M
          sc->down_buf && sc->bf16_a && sc->stage_elems >= size_t(rows) * top_k * K;
 }
 
-int moe_gate_up(const float* x, int ldx, const ExpertMat& W, const int* eidx, int rows, int top_k, int I, int K,
+int moe_bank_gate_up(const float* x, int ldx, const ExpertMat& W, const int* eidx, int rows, int top_k, int I, int K,
                 float situ_beta, float situ_linear_beta, bool fuse_act, float* out, int ld_out, const MoeScratch* sc,
-                const Launch& L, bool q8_ready, bf16* act_bf16) {
+                const Launch& L, bool q8_ready, bf16* act_bf16, int first) {
   cudaStream_t st = L.st;
   const int N_work = fuse_act ? I : 2 * I;
   if ((q8_ready || act_bf16) && !moe_round_q8(W, rows, top_k, K, sc))
@@ -1381,7 +1392,7 @@ int moe_gate_up(const float* x, int ldx, const ExpertMat& W, const int* eidx, in
       if (rc > 1 && has_sc) {
         const int bm = use_mma ? 16 : 4;
         mt = max_work_tiles(M, W.n_experts, bm);
-        group_tasks(ec, M, W.n_experts, bm, sc, st);
+        group_tasks(ec, M, W.n_experts, bm, sc, st, first);
         grouped = rc == rows ? bm : 0;
       }
       ops->gu(xc, ldx, W, ec, rc, top_k, I, K, situ_beta, situ_linear_beta, fuse_act, oc, ld_out, sc, mt, use_mma,
@@ -1392,10 +1403,10 @@ int moe_gate_up(const float* x, int ldx, const ExpertMat& W, const int* eidx, in
   if (W.q) {
     if (K % 128 == 0)
       return launch_nvfp4_gu<128>(x, ldx, W, eidx, rows, top_k, I, K, situ_beta, situ_linear_beta, fuse_act, out,
-                                  ld_out, sc, L);
+                                  ld_out, sc, L, first);
     if (K % 64 == 0)
       return launch_nvfp4_gu<64>(x, ldx, W, eidx, rows, top_k, I, K, situ_beta, situ_linear_beta, fuse_act, out,
-                                 ld_out, sc, L);
+                                 ld_out, sc, L, first);
     throw std::runtime_error("moe_gate_up: NVFP4 requires K multiple of 64 (got " + std::to_string(K) + ")");
   }
   const bool tiled = rows > 1 && sc && sc->tasks && sc->pairs && W.n_experts <= sc->max_experts &&
@@ -1415,7 +1426,7 @@ int moe_gate_up(const float* x, int ldx, const ExpertMat& W, const int* eidx, in
     const int rc = std::min(chunk, rows - r0);
     const int M = rc * top_k;
     const int mt = max_work_tiles(M, W.n_experts, 8);
-    group_tasks(eidx + size_t(r0) * top_k, M, W.n_experts, 8, sc, st);
+    group_tasks(eidx + size_t(r0) * top_k, M, W.n_experts, 8, sc, st, first);
     const dim3 grid(ceil_div(N_work, kMoeWarps), mt);
     const float* xc = x + size_t(r0) * ldx;
     float* oc = out + size_t(r0) * top_k * ld_out;
@@ -1431,9 +1442,9 @@ int moe_gate_up(const float* x, int ldx, const ExpertMat& W, const int* eidx, in
   return rows <= chunk ? 8 : 0;
 }
 
-void moe_down(const float* act, int ld_act, const ExpertMat& W, const int* eidx, const float* ew, int rows, int top_k,
+void moe_bank_down(const float* act, int ld_act, const ExpertMat& W, const int* eidx, const float* ew, int rows, int top_k,
               int H, int K, float* out, int ld_out, bool accumulate, const MoeScratch* sc, const Launch& L,
-              const bf16* act_bf16, int grouped) {
+              const bf16* act_bf16, int grouped, int first) {
   cudaStream_t st = L.st;
   if (act_bf16 && !moe_round_bf16_down(W, rows, top_k, K, sc, L))
     throw std::runtime_error("moe_down: pre-staged BF16 input requires an NVFP4 round");
@@ -1458,11 +1469,11 @@ void moe_down(const float* act, int ld_act, const ExpertMat& W, const int* eidx,
       if (rc > 1 && has_sc) {
         const int bm = use_mma ? 16 : 4;
         mt = max_work_tiles(M, W.n_experts, bm);
-        if (rc != rows || !tiles_serve(grouped, bm, rc)) group_tasks(ec, M, W.n_experts, bm, sc, st);
+        if (rc != rows || !tiles_serve(grouped, bm, rc)) group_tasks(ec, M, W.n_experts, bm, sc, st, first);
       }
       const bool wrote_buf = ops->down(ac, ld_act, W, ec, ewc, rc, top_k, H, K, oc, ld_out, accumulate, sc, mt,
                                        use_mma, moe_dp4a_cfg(opts(L), W.blk.dtype, rc, false), st);
-      if (wrote_buf)
+      if (wrote_buf && first < 0)
         k_moe_weighted_sum<<<dim3(ceil_div(H, 256), rc), 256, 0, st>>>(sc->down_buf, ewc, top_k, H, oc, ld_out,
                                                                        int(accumulate));
     }
@@ -1471,10 +1482,10 @@ void moe_down(const float* act, int ld_act, const ExpertMat& W, const int* eidx,
   if (W.q) {
     if (K % 128 == 0)
       launch_nvfp4_down<128>(act, ld_act, W, eidx, ew, rows, top_k, H, K, out, ld_out, accumulate, sc, L, act_bf16,
-                             grouped);
+                             grouped, first);
     else if (K % 64 == 0)
       launch_nvfp4_down<64>(act, ld_act, W, eidx, ew, rows, top_k, H, K, out, ld_out, accumulate, sc, L, act_bf16,
-                            grouped);
+                            grouped, first);
     else
       throw std::runtime_error("moe_down: NVFP4 requires K multiple of 64 (got " + std::to_string(K) + ")");
     return;
@@ -1491,14 +1502,27 @@ void moe_down(const float* act, int ld_act, const ExpertMat& W, const int* eidx,
     const int rc = std::min(chunk, rows - r0);
     const int M = rc * top_k;
     const int mt = max_work_tiles(M, W.n_experts, 8);
-    if (rc != rows || !tiles_serve(grouped, 8, rc)) group_tasks(eidx + size_t(r0) * top_k, M, W.n_experts, 8, sc, st);
+    if (rc != rows || !tiles_serve(grouped, 8, rc)) group_tasks(eidx + size_t(r0) * top_k, M, W.n_experts, 8, sc, st, first);
     const dim3 grid(ceil_div(H, kMoeWarps), mt);
     k_moe_bf16_grouped<false, true><<<grid, 32 * kMoeWarps, 0, st>>>(
         act + size_t(r0) * top_k * ld_act, ld_act, W.w, W.rs, H, H, K, sc->tasks, sc->n_tasks, sc->pairs, top_k, 0.f,
         0.f, sc->down_buf, H);
-    k_moe_weighted_sum<<<dim3(ceil_div(H, 256), rc), 256, 0, st>>>(sc->down_buf, ew + size_t(r0) * top_k, top_k, H,
+    if (first < 0) k_moe_weighted_sum<<<dim3(ceil_div(H, 256), rc), 256, 0, st>>>(sc->down_buf, ew + size_t(r0) * top_k, top_k, H,
                                                                    out + size_t(r0) * ld_out, ld_out, int(accumulate));
   }
+}
+
+int moe_gate_up(const float* x, int ldx, const ExpertMat& W, const int* eidx, int rows, int top_k, int I, int K,
+                float situ_beta, float situ_linear_beta, bool fuse_act, float* out, int ld_out, const MoeScratch* sc,
+                const Launch& L, bool q8_ready, bf16* act_bf16) {
+  return moe_bank_gate_up(x, ldx, W, eidx, rows, top_k, I, K, situ_beta, situ_linear_beta, fuse_act, out, ld_out, sc,
+                          L, q8_ready, act_bf16, -1);
+}
+
+void moe_down(const float* act, int ld_act, const ExpertMat& W, const int* eidx, const float* ew, int rows, int top_k,
+              int H, int K, float* out, int ld_out, bool accumulate, const MoeScratch* sc, const Launch& L,
+              const bf16* act_bf16, int grouped) {
+  moe_bank_down(act, ld_act, W, eidx, ew, rows, top_k, H, K, out, ld_out, accumulate, sc, L, act_bf16, grouped, -1);
 }
 
 }  // namespace flyx::cuda

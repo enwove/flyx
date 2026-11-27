@@ -2,6 +2,7 @@
 #include "backends/cuda/runtime/cold_experts.h"
 
 #include "backends/cuda/backend.h"
+#include "backends/cuda/kernels/moe_bank.h"
 #include "backends/cuda/runtime/row_pool.h"
 #include "ops/activation/ref.h"
 
@@ -50,6 +51,47 @@ ColdMatrix::ColdMatrix(const flyx_weight& w, int hot, const ExpertLayout& layout
   }
 }
 
+void pack_expert_nvfp4(const uint8_t* in, size_t blocks, uint8_t* qo, uint8_t* so) {
+  for (size_t k = 0; k < blocks; ++k, in += 36) {
+    const uint8_t* d = in;
+    const uint8_t* qs = in + 4;
+    for (int g = 0; g < 4; ++g) {
+      if (d[g] == 0xFF)
+        throw std::runtime_error("an NVFP4 scale of 0xFF (no e4m3 holds it)");
+      so[4 * k + size_t(g)] = d[g] == 0x7F ? 0 : uint8_t(d[g] & 0x7F);
+      auto code = [&](int l) { return l < 8 ? qs[8 * g + l] & 15 : qs[8 * g + l - 8] >> 4; };
+      for (int i = 0; i < 8; ++i)
+        qo[32 * k + 8 * size_t(g) + size_t(i)] = uint8_t(code(2 * i) | code(2 * i + 1) << 4);
+    }
+  }
+}
+
+void ColdMatrix::pack_banks(const ExpertLayout& layout, size_t all) {
+  const size_t cold = all - first;
+  bank = ExpertBankLayout::from(layout, all, cold);
+  archive.resize(bank.archive_bytes(cold));
+  size_t offset = 0;
+  for (size_t e = 0; e < cold; e += bank.count) {
+    const size_t n = std::min(bank.count, cold - e);
+    uint8_t* dst = archive.data() + offset;
+    const uint8_t* src = data.data() + e * size_t(rows) * stride;
+    auto* scale = dst + bank.scale_offset(n);
+    if (nvfp4)
+      pack_expert_nvfp4(src, n * size_t(rows) * (cols / 64), dst, scale);
+    else if (layout.format == ExpertLayout::ggml_blocks)
+      blocks_pack(dtype, src, n * size_t(rows) * (cols / blocks_layout(dtype).values),
+                  dst, reinterpret_cast<uint16_t*>(scale));
+    else
+      std::memcpy(dst, src, n * bank.payload);
+    if (bank.gains) {
+      auto* g = reinterpret_cast<float*>(dst + bank.gain_offset(n));
+      if (scales.empty()) std::fill_n(g, n, 1.f);
+      else std::copy_n(scales.data() + e, n, g);
+    }
+    offset += bank.bytes(n);
+  }
+}
+
 void ColdMatrix::prepare(float* x, bool vector_nvfp4) const {
   if (q8) {
     for (int i = 0; i < cols; i += 32) {
@@ -78,6 +120,13 @@ struct ExpertTimes {
 
 struct ColdWorkspace {
   explicit ColdWorkspace(size_t threads) : pool(threads) {}
+  struct Slot {
+    uint8_t *host = nullptr, *device = nullptr;
+    cudaEvent_t uploaded = nullptr, consumed = nullptr;
+  };
+  Slot staging[2];
+  cudaStream_t copy = nullptr;
+  size_t next_slot = 0;
   RowPool pool;
   std::mutex mutex;
   int* ids;
@@ -93,6 +142,13 @@ struct ColdWorkspace {
   uint64_t visits = 0, chunks = 0, slots = 0, cpu_pairs = 0;
   double route_seconds = 0, cpu_seconds = 0;
   ~ColdWorkspace() {
+    if (copy) cudaStreamSynchronize(copy);
+    for (auto& slot : staging) {
+      if (slot.consumed) cudaEventSynchronize(slot.consumed);
+      if (slot.uploaded) cudaEventDestroy(slot.uploaded);
+      if (slot.consumed) cudaEventDestroy(slot.consumed);
+    }
+    if (copy) cudaStreamDestroy(copy);
     if (ready) {
       cudaEventSynchronize(ready);
       cudaEventDestroy(ready);
@@ -100,6 +156,7 @@ struct ColdWorkspace {
     for (auto event : timer)
       if (event) cudaEventDestroy(event);
     for (const auto& [key, t] : times) {
+      if (!t.visits) continue;
       std::fprintf(stderr, "flyx-cuda: expert profile block=%p phase=%s visits=%llu rows=%llu "
                    "handoff=%.2f cpu=%.2f hot_gpu=%.2f h2d=%.2f reduce=%.2f us/visit "
                    "cold_reads=%.2f GB/s resident=%.2f%%\n",
@@ -129,7 +186,10 @@ void init_cold_experts(flyx_bmodel* m) {
   ColdShape shape;
   for (const Block& b : m->blocks) {
     auto f = std::get_if<MoeBlock>(&b);
-    if (f && f->cold_gu) shape.include(f->hidden, f->inter, f->top_k);
+    if (!f || !f->cold_gu) continue;
+    shape.include(f->hidden, f->inter, f->top_k);
+    for (const auto* mat : {f->cold_gu.get(), f->cold_down.get()})
+      shape.bank_bytes = std::max(shape.bank_bytes, mat->bank.bytes(mat->bank.count));
   }
   if (!shape.pairs) return;
   const size_t threads = m->opt.expert_threads ? std::min<size_t>(size_t(m->opt.expert_threads),
@@ -140,6 +200,15 @@ void init_cold_experts(flyx_bmodel* m) {
   w->profile = m->opt.profile;
   if (w->profile)
     for (auto& event : w->timer) CK(cudaEventCreate(&event));
+  if (shape.bank_bytes) {
+    CK(cudaStreamCreateWithFlags(&w->copy, cudaStreamNonBlocking));
+    for (auto& slot : w->staging) {
+      slot.device = m->alloc<uint8_t>(shape.bank_bytes);
+      slot.host = m->host_pinned<uint8_t>(shape.bank_bytes);
+      CK(cudaEventCreateWithFlags(&slot.uploaded, cudaEventDisableTiming));
+      CK(cudaEventCreateWithFlags(&slot.consumed, cudaEventDisableTiming));
+    }
+  }
   w->ids = m->host_pinned<int>(shape.pairs);
   w->input = m->host_pinned<float>(shape.inputs);
   w->cpu_slots = m->host_pinned<float>(shape.outputs);
@@ -155,6 +224,75 @@ void init_cold_experts(flyx_bmodel* m) {
   m->opt.graphs = false;
 }
 
+namespace {
+void streamed_prefill(ColdWorkspace& ws, const Pass& ps, const MoeBlock& f, const MoeScratch& scratch, float* out,
+                      bool accumulate, bool fused) {
+  const auto& b = ps.v.b;
+  const auto& L = ps.v.L;
+  const int H = f.hidden, K = f.top_k, I = f.inter;
+  // Produce all gate/up rows before touching down_buf. Generic gate/up and down_buf share the same allocation.
+  for (bool down : {false, true}) {
+    const auto& resident = down ? f.down : f.gate_up;
+    const ColdMatrix& cold = down ? *f.cold_down : *f.cold_gu;
+    auto launch = [&](const ExpertMat& mat, int first) {
+      const int capacity = opts(L).moe_vec && mat.q ? std::min(scratch.chunk_rows, FLYX_MAX_ROWS) : scratch.chunk_rows;
+      for (int base = 0; base < ps.rows;) {
+        int rows = std::min(ps.rows - base, capacity);
+        // Filtered grouping needs at least two rows. Give the final tile two when the tail would be a singleton.
+        if (ps.rows - base - rows == 1) --rows;
+        auto sc = scratch;
+        sc.down_buf += size_t(base) * K * H;
+        const int* ids = b.moe_idx + size_t(base) * K;
+        float* act = b.moe_act + size_t(base) * K * I;
+        if (down) {
+          moe_bank_down(act, I, mat, ids, b.moe_w + size_t(base) * K, rows, K, H, I, out + size_t(base) * H, H,
+                        accumulate, &sc, L, nullptr, 0, first);
+        } else {
+          float* gu = b.moe_gu + size_t(base) * K * 2 * I;
+          moe_bank_gate_up(b.h + size_t(base) * H, H, mat, ids, rows, K, I, H, f.situ_beta, f.situ_linear_beta,
+                           fused, fused ? act : gu, fused ? I : 2 * I, &sc, L, false, nullptr, first);
+        }
+        base += rows;
+      }
+    };
+    size_t offset = 0;
+    const auto& bank = cold.bank;
+    for (int first = cold.first; first < f.n_experts;) {
+      const int n = std::min<int>(int(bank.count), f.n_experts - first);
+      auto& slot = ws.staging[ws.next_slot++ % 2];
+      const size_t bytes = bank.bytes(n);
+      CK(cudaEventSynchronize(slot.uploaded));
+      std::memcpy(slot.host, cold.archive.data() + offset, bytes);
+      CK(cudaStreamWaitEvent(ws.copy, slot.consumed));
+      CK(cudaMemcpyAsync(slot.device, slot.host, bytes, cudaMemcpyHostToDevice, ws.copy));
+      CK(cudaEventRecord(slot.uploaded, ws.copy));
+      if (first == cold.first && resident.n_experts) launch(resident, 0);
+      ExpertMat mat{};
+      mat.N = cold.rows;
+      mat.n_experts = n;
+      auto* scales = slot.device + bank.scale_offset(n);
+      if (cold.nvfp4) {
+        mat.q = slot.device;
+        mat.s = scales;
+      } else if (cold.q8 || cold.a16h) {
+        mat.blk = {slot.device, reinterpret_cast<uint16_t*>(scales), cold.dtype, n * cold.rows, cold.q8};
+      } else {
+        mat.w = reinterpret_cast<bf16*>(slot.device);
+      }
+      if (bank.gains) mat.rs = reinterpret_cast<float*>(slot.device + bank.gain_offset(n));
+      CK(cudaStreamWaitEvent(L.st, slot.uploaded));
+      launch(mat, first);
+      CK(cudaEventRecord(slot.consumed, L.st));
+      offset += bytes;
+      first += n;
+    }
+    if (!down && !fused)
+      situ_rows(b.moe_gu, 2 * I, I, f.situ_beta, f.situ_linear_beta, b.moe_act, I, ps.rows * K, L.st);
+  }
+  moe_sum_slots(scratch.down_buf, b.moe_w, ps.rows, K, H, out, accumulate, L.st);
+}
+}  // namespace
+
 void hybrid_experts(const Pass& ps, const MoeBlock& f, const MoeScratch* sc, float* out, bool accumulate, bool fused) {
   auto& ws = *ps.s->m->cold;
   std::lock_guard lock(ws.mutex);
@@ -165,12 +303,17 @@ void hybrid_experts(const Pass& ps, const MoeBlock& f, const MoeScratch* sc, flo
   // A different session can own the previous visit. Order reuse of both DMA buffers and device slots on its event.
   CK(cudaStreamWaitEvent(L.st, ws.ready));
   auto* t = ws.profile ? &ws.times[{&f, ps.round}] : nullptr;
-  if (t) {
-    ++t->visits;
-    t->rows += ps.rows;
-  }
-  ++ws.visits;
   try {
+    if (!ps.round && ws.copy && sc && ps.rows >= std::max(2, ps.s->m->opt.expert_prefill_min)) {
+      streamed_prefill(ws, ps, f, *sc, out, accumulate, fused);
+      CK(cudaEventRecord(ws.ready, L.st));
+      return;
+    }
+    if (t) {
+      ++t->visits;
+      t->rows += ps.rows;
+    }
+    ++ws.visits;
     for (int base = 0; base < ps.rows; base += ColdShape::chunk) {
       int rows = std::min(ColdShape::chunk, ps.rows - base);
       auto* ids = b.moe_idx + size_t(base) * K;
@@ -283,6 +426,7 @@ void hybrid_experts(const Pass& ps, const MoeBlock& f, const MoeScratch* sc, flo
     }
     CK(cudaEventRecord(ws.ready, L.st));
   } catch (...) {
+    if (ws.copy) cudaStreamSynchronize(ws.copy);
     cudaStreamSynchronize(L.st);  // any queued DMA must end before a second session can own the staging buffers
     throw;
   }
