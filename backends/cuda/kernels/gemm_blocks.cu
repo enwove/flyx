@@ -407,16 +407,22 @@ bool blocks_supported(int dtype, int K) {
   return l.values != 0 && K > 0 && K % l.values == 0;
 }
 
-void blocks_pack(int dtype, const uint8_t* file, size_t n, uint8_t* payload, uint16_t* scales) {
-  int skip = 0, s0 = -1, s1 = -1;
-  bool head = false;
+namespace {
+struct FilePlanes { int skip, s0, s1; bool head; };
+FilePlanes file_planes(int dtype) {
   switch (dtype) {
 #define X(F) \
-  case F::kDtype: skip = F::kSkip, s0 = F::kS0, s1 = F::kS1, head = kHeadInScales<F>; break;
+  case F::kDtype: return {F::kSkip, F::kS0, F::kS1, kHeadInScales<F>};
     FLYX_BLOCK_TYPES(X)
 #undef X
     default: unsupported("blocks_pack", dtype);
   }
+  return {};
+}
+}  // namespace
+
+void blocks_pack(int dtype, const uint8_t* file, size_t n, uint8_t* payload, uint16_t* scales) {
+  const auto [skip, s0, s1, head] = file_planes(dtype);
   const BlockLayout l = blocks_layout(dtype);
   for (size_t i = 0; i < n; ++i) {
     const uint8_t* b = file + i * size_t(l.bytes);
@@ -452,6 +458,33 @@ void blocks_pack(int dtype, const uint8_t* file, size_t n, uint8_t* payload, uin
     }
     std::memcpy(s, b + s0, 2);
     if (s1 >= 0) std::memcpy(s + 1, b + s1, 2);
+  }
+}
+
+// Restore the scalar CPU decoder's file blocks when a resident expert gives its slot to another.
+void blocks_unpack(int dtype, const uint8_t* payload, const uint16_t* scales, size_t n, uint8_t* file) {
+  const auto [skip, s0, s1, head] = file_planes(dtype);
+  const auto l = blocks_layout(dtype);
+  for (size_t i = 0; i < n; ++i) {
+    auto* b = file + i * l.bytes;
+    const auto* p = payload + i * l.stride;
+    const auto* s = scales + i * l.scales;
+    if (dtype == FLYX_DT_GGML_IQ4_XS) {
+      for (int g = 0; g < 8; ++g)
+        for (int j = 0; j < 16; ++j) b[skip + 16 * g + j] = p[FIQ4_XS::lane_major(g, j)];
+    } else if (dtype == FLYX_DT_GGML_Q6_K) {
+      std::memcpy(b, p, size_t(l.stride));
+      for (int c = 0; c < 4; ++c)
+        for (int j = 0; j < 32; ++j) b[offsetof(block_q6_K, ql) + 32 * c + j] = p[k_pair_major(c, j)];
+    } else {
+      std::memcpy(b + skip, p, size_t(std::min(l.stride, l.bytes - skip)));
+    }
+    if (head) std::memcpy(b + s0, s, size_t(l.scales) * 2);
+    else if (dtype == FLYX_DT_GGML_MXFP4) b[0] = s[0] < 128 ? uint8_t(s[0] == 64) : uint8_t((s[0] >> 7) + 1);
+    else if (dtype != FLYX_DT_GGML_IQ1_M) {
+      std::memcpy(b + s0, s, 2);
+      if (s1 >= 0) std::memcpy(b + s1, s + 1, 2);
+    }
   }
 }
 

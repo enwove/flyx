@@ -404,7 +404,7 @@ struct RelAttnBlock {
 // Inkling-2 sparse MoE block with AttnRes, optional cross-pass loop control, SiTU activation, and post ShortConv.
 struct ColdMatrix;
 struct MoeBlock {
-  std::shared_ptr<const ColdMatrix> cold_gu, cold_down;
+  std::shared_ptr<ColdMatrix> cold_gu, cold_down;
   int hidden = 0, inter = 0, n_experts = 0, top_k = 0, conv = 0;
   bool gating_sigmoid = true, norm_weights = true;
   float route_scale = 1.f, norm_eps = 1e-20f, situ_beta = 0.f, situ_linear_beta = 0.f;

@@ -12,6 +12,7 @@
 #include <algorithm>
 #include <cstring>
 #include <optional>
+#include <set>
 
 namespace flyx::cuda {
 namespace {
@@ -1550,6 +1551,9 @@ int estimate_load(const flyx_model_desc* desc, const flyx_open_options* opts, ui
 
   const auto streamed = estimate_stream(*desc, is_draft_blk, bo);
   ColdShape cold;
+  std::set<std::pair<int, int>> adaptive_pairs;
+  std::set<int> global_sizes;
+  size_t placement_device = 0, placement_host = 0;
   const TargetQuant tq = target_quant(*desc, is_draft_blk, bo.packed_blocks);
   const DraftQuants q = resolve_draft_quant(*desc, bo.draft_weights, tq);
   auto mark_linear = [&](int w, DraftQuant quant) {
@@ -1594,6 +1598,14 @@ int estimate_load(const flyx_model_desc* desc, const flyx_open_options* opts, ui
     } else if (b.kind == FLYX_BLOCK_MOE) {
       out->experts_per_layer = std::max(out->experts_per_layer,b.moe.n_experts);
       if (bo.gpu_experts < b.moe.n_experts) cold.include(b.moe.hidden,b.moe.inter,b.moe.top_k);
+      if (bo.expert_adapt && bo.expert_prefill_min && bo.gpu_experts > 0 && bo.gpu_experts < b.moe.n_experts &&
+          b.moe.gate_up != b.moe.down && adaptive_pairs.emplace(b.moe.gate_up, b.moe.down).second) {
+        const size_t n = b.moe.n_experts;
+        placement_device = size_add(placement_device, n * (sizeof(int) + sizeof(uint32_t)));
+        placement_host = size_add(placement_host, n * (2 * sizeof(int) + sizeof(uint64_t) + sizeof(uint32_t)));
+        if (bo.expert_global && global_sizes.insert(int(n)).second)
+          placement_host = size_add(placement_host, n * sizeof(uint64_t));
+      }
       mark(is_expert, b.moe.gate_up);
       mark(is_expert, b.moe.down);
     } else if (b.kind == FLYX_BLOCK_DSPARK) {
@@ -1743,9 +1755,9 @@ int estimate_load(const flyx_model_desc* desc, const flyx_open_options* opts, ui
   }
   out->draft_weights_bytes = cur_draft_bytes + dv_bytes + block_extra;
   out->draft_compact_savings = cur_draft_bytes > nvfp4_draft_bytes ? cur_draft_bytes - nvfp4_draft_bytes : 0;
-  out->offload_host_bytes = size_add(out->offload_host_bytes,size_add(cold.host_bytes(),streamed.host_bytes));
+  out->offload_host_bytes = size_add(out->offload_host_bytes,size_add(placement_host, size_add(cold.host_bytes(),streamed.host_bytes)));
   out->weights_bytes = size_add(size_add(target_bytes,vision_gpu_bytes),size_add(out->draft_weights_bytes,
-                                 size_add(streamed.ring_bytes,cold.device_bytes())));
+                                 size_add(placement_device, size_add(streamed.ring_bytes,cold.device_bytes()))));
   // Minimum non-weight device headroom: CUDA context + kernel modules + workspace + minimal KV/graphs.
   out->min_runtime_bytes = std::clamp<uint64_t>(out->weights_bytes / 20, 384ull << 20, 1ull << 30);
   // Extra headroom above hard_need to keep drafter weights at full auto precision (vs compacting to NVFP4).

@@ -383,7 +383,7 @@ void expert_estimates() {
       m.opt.packed_blocks = c.packed;
       m.opt.gpu_experts = hot;
       WeightLoader loader(&m, d);
-      std::shared_ptr<const ColdMatrix> cold, shared;
+      std::shared_ptr<ColdMatrix> cold, shared;
       const auto resident = loader.expert_mat(0, cold);
       loader.expert_mat(0, shared);
       loader.finish();

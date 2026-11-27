@@ -1792,6 +1792,19 @@ void test_inkling2_moe() {
     std::vector<int> actual(ids.size());
     CK(cudaMemcpy(actual.data(), d, ids.size() * sizeof(int), cudaMemcpyDeviceToHost));
     if (actual != std::vector<int>({2, 0, 0, 0, 0, 1})) throw std::runtime_error("resident MoE slot mapping");
+    int* slots = dev<int>(ids.size());
+    auto* histogram = dev<uint32_t>(ids.size());
+    const std::vector<int> permutation = {4, 1, 2, 0, 5, 3};
+    CK(cudaMemcpy(d, ids.data(), ids.size() * sizeof(int), cudaMemcpyHostToDevice));
+    CK(cudaMemcpy(slots, permutation.data(), ids.size() * sizeof(int), cudaMemcpyHostToDevice));
+    moe_place_ids(d, int(ids.size()), slots, histogram, 0);
+    CK(cudaMemcpy(actual.data(), d, ids.size() * sizeof(int), cudaMemcpyDeviceToHost));
+    if (actual != std::vector<int>({2, 3, 4, 0, 5, 1})) throw std::runtime_error("expert permutation");
+    std::vector<uint32_t> counts(ids.size());
+    CK(cudaMemcpy(counts.data(), histogram, counts.size() * sizeof(uint32_t), cudaMemcpyDeviceToHost));
+    if (counts != std::vector<uint32_t>(ids.size(), 1)) throw std::runtime_error("expert histogram");
+    cudaFree(slots);
+    cudaFree(histogram);
     cudaFree(d);
   }
   test_inkling2_moe_norm();

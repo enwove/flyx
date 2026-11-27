@@ -56,6 +56,9 @@ BlockMat up_blocks(int dtype, const std::vector<uint8_t>& file, int rows, bool h
   std::vector<uint8_t> payload(n * size_t(l.stride));
   std::vector<uint16_t> scales(n * size_t(l.scales));
   blocks_pack(dtype, file.data(), n, payload.data(), scales.data());
+  std::vector<uint8_t> restored(file.size());
+  blocks_unpack(dtype, payload.data(), scales.data(), n, restored.data());
+  if (restored != file) throw std::runtime_error("expert eviction changed file blocks of dtype " + std::to_string(dtype));
   uint8_t* dp = nullptr;
   uint16_t* ds = nullptr;
   if (host) {  // the device's pointers (the host's are the same here: mapped, not write-combined)

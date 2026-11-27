@@ -11,6 +11,7 @@ namespace flyx::cuda {
 struct Pass;
 struct MoeBlock;
 struct MoeScratch;
+struct ExpertMat;
 
 // Contiguous CUDA planes for a batch of experts. The largest single expert also fits when it exceeds the DMA target.
 struct ExpertBankLayout {
@@ -65,6 +66,7 @@ struct ColdMatrix {
   std::vector<float> scales;
   ExpertBankLayout bank{};
   std::vector<uint8_t> archive;
+  void exchange(const ExpertMat& resident, int hot_slot, int cold_slot, int total, uint8_t* bounce);
   void pack_banks(const ExpertLayout& layout, size_t all);
   ColdMatrix(const flyx_weight& w, int hot, const ExpertLayout& layout);
   size_t bytes() const { return data.size() + scales.size() * sizeof(float) + archive.size(); }
@@ -75,6 +77,8 @@ struct ColdMatrix {
 void pack_expert_nvfp4(const uint8_t* in, size_t blocks, uint8_t* qo, uint8_t* so);
 float cold_dot(int dtype, const uint8_t* row, const float* input, int cols);
 float cold_dot_scalar(int dtype, const uint8_t* row, const float* input, int cols);
+void cold_sequence_open(flyx_bmodel* m);
+void cold_sequence_close(flyx_bmodel* m);
 void init_cold_experts(flyx_bmodel* m);
 void hybrid_experts(const Pass& ps, const MoeBlock& f, const MoeScratch* sc, float* out, bool accumulate, bool fused);
 

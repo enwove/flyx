@@ -669,7 +669,7 @@ Lin WeightLoader::lin_stack(const std::vector<int>& ws, int* rows_out, const std
   return L;
 }
 
-ExpertMat WeightLoader::expert_mat(int w, std::shared_ptr<const ColdMatrix>& cold) {
+ExpertMat WeightLoader::expert_mat(int w, std::shared_ptr<ColdMatrix>& cold) {
   if (auto it = experts_.find(w); it != experts_.end()) {
     if (auto c = cold_experts_.find(w); c != cold_experts_.end()) cold = c->second;
     return it->second;

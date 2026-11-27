@@ -3,11 +3,28 @@
 #include <vector>
 
 #include "backends/cuda/runtime/cold_experts.h"
+#include "backends/cuda/runtime/expert_order.h"
 #include "ops/dtype/ref.h"
 #include "tests/common/check.h"
 
 int main() {
   using namespace flyx;
+  {
+    cuda::ExpertOrder o(8);
+    o.counts = {1, 1, 1, 1, 8, 7, 0, 0};
+    o.observe();
+    std::vector<std::pair<int, int>> swaps;
+    auto exchange = [&](int resident, int cold) { swaps.emplace_back(resident, cold); };
+    test::check(o.update(4, o.scores.data(), exchange) == 1 && swaps.front() == std::pair{3, 4},
+                "bounded promotion chooses the most frequent challenger and breaks ties by logical ID");
+    test::check(o.slot[4] == 3 && o.id[3] == 4 && o.slot[3] == 4, "both sides of an expert exchange");
+    o.counts.assign(8, 0);
+    o.observe();
+    test::check(o.scores[4] == 4 && o.update(4, o.scores.data(), exchange) == 1 && o.slot[5] < 4,
+                "decayed counts retain a frequent expert for the next epoch");
+    test::check(o.update(0, o.scores.data(), exchange) == 0 && o.update(8, o.scores.data(), exchange) == 0,
+                "empty and full resident sets have no swaps");
+  }
   std::mt19937 rng(91211);
   for (int dtype :
        {FLYX_DT_BF16, FLYX_DT_GGML_NVFP4, FLYX_DT_GGML_MXFP4, FLYX_DT_GGML_Q2_0, FLYX_DT_GGML_IQ1_S, FLYX_DT_GGML_IQ2_S,

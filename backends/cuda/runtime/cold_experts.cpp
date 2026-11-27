@@ -4,6 +4,7 @@
 #include "backends/cuda/backend.h"
 #include "backends/cuda/kernels/moe_bank.h"
 #include "backends/cuda/runtime/row_pool.h"
+#include "backends/cuda/runtime/expert_order.h"
 #include "ops/activation/ref.h"
 
 namespace flyx::cuda {
@@ -93,6 +94,46 @@ void ColdMatrix::pack_banks(const ExpertLayout& layout, size_t all) {
   }
 }
 
+void ColdMatrix::exchange(const ExpertMat& resident, int hot_slot, int cold_slot, int total, uint8_t* bounce) {
+  const int cold = cold_slot - first;
+  const size_t group = size_t(cold) / bank.count;
+  const size_t lane = size_t(cold) % bank.count;
+  const size_t n = std::min(bank.count, size_t(total - first) - group * bank.count);
+  uint8_t* image = archive.data() + group * bank.bytes(bank.count);
+  auto plane = [&](const void* gpu, size_t bytes, size_t image_offset, size_t bounce_offset) {
+    if (!bytes) return;
+    auto* device = const_cast<uint8_t*>(static_cast<const uint8_t*>(gpu)) + size_t(hot_slot) * bytes;
+    auto* host = image + image_offset + lane * bytes;
+    CK(cudaMemcpy(bounce + bounce_offset, device, bytes, cudaMemcpyDeviceToHost));
+    CK(cudaMemcpy(device, host, bytes, cudaMemcpyHostToDevice));
+    std::memcpy(host, bounce + bounce_offset, bytes);
+  };
+  const void* payload = resident.packed() ? static_cast<const void*>(resident.blk.data)
+                                          : resident.q ? static_cast<const void*>(resident.q) : resident.w;
+  plane(payload, bank.payload, 0, 0);
+  plane(resident.packed() ? static_cast<const void*>(resident.blk.scales) : resident.s,
+        bank.scale, bank.scale_offset(n), bank.scale_offset(1));
+  plane(resident.rs, bank.gains, bank.gain_offset(n), bank.gain_offset(1));
+  auto* raw = data.data() + size_t(cold) * rows * stride;
+  auto* scale = bounce + bank.scale_offset(1);
+  if (resident.packed()) {
+    blocks_unpack(dtype, bounce, reinterpret_cast<uint16_t*>(scale), size_t(rows) * (cols / blocks_layout(dtype).values), raw);
+  } else if (nvfp4) {
+    for (size_t i = 0; i < size_t(rows) * (cols / 64); ++i) {
+      std::memcpy(raw, scale + i * 4, 4);
+      for (int g = 0; g < 4; ++g) {
+        const auto* q = bounce + 32 * i + 8 * g;
+        for (int j = 0; j < 8; ++j) {
+          const int shift = (j & 1) * 4;
+          raw[4 + 8 * g + j] = uint8_t(((q[j / 2] >> shift) & 15) | ((q[4 + j / 2] >> shift) << 4));
+        }
+      }
+      raw += 36;
+    }
+  } else std::memcpy(raw, bounce, bank.payload);
+  if (!scales.empty()) std::memcpy(&scales[cold], bounce + bank.gain_offset(1), sizeof(float));
+}
+
 void ColdMatrix::prepare(float* x, bool vector_nvfp4) const {
   if (q8) {
     for (int i = 0; i < cols; i += 32) {
@@ -121,6 +162,14 @@ struct ExpertTimes {
   double handoff = 0, cpu = 0, hot_gpu = 0, upload = 0, reduce = 0;
 };
 
+struct ExpertPlacement {
+  explicit ExpertPlacement(const MoeBlock* f) : layer(f), order(f->n_experts) {}
+  const MoeBlock* layer;
+  ExpertOrder order;
+  int* slots = nullptr;
+  uint32_t* counts = nullptr;
+};
+
 struct ColdWorkspace {
   explicit ColdWorkspace(size_t threads) : pool(threads, true) {}
   struct Slot {
@@ -130,6 +179,10 @@ struct ColdWorkspace {
   Slot staging[2];
   cudaStream_t copy = nullptr;
   size_t next_slot = 0;
+  std::map<const ColdMatrix*, ExpertPlacement> placements;
+  std::map<int, std::vector<uint64_t>> global_scores;
+  size_t sessions = 0;
+  bool pending_counts = false, failed = false;
   RowPool pool;
   std::mutex mutex;
   int *ids, *resident_ids;
@@ -142,7 +195,7 @@ struct ColdWorkspace {
   bool profile = false;
   cudaEvent_t timer[5]{};
   std::map<std::pair<const MoeBlock*, bool>, ExpertTimes> times;
-  uint64_t decode_slots = 0, decode_cold = 0;
+  uint64_t decode_slots = 0, decode_cold = 0, last_decode_slots = 0, last_decode_cold = 0;
   uint64_t visits = 0, chunks = 0, slots = 0, cpu_pairs = 0;
   double route_seconds = 0, cpu_seconds = 0;
   ~ColdWorkspace() {
@@ -214,6 +267,36 @@ void init_cold_experts(flyx_bmodel* m) {
     }
   }
   w->resident_ids = m->alloc<int>(shape.pairs);
+  if (shape.bank_bytes && m->opt.expert_adapt) {
+    // A matrix shared between different projection pairs cannot be permuted by just one pair.
+    std::map<const ColdMatrix*, const ColdMatrix*> partners;
+    for (const auto& block : m->blocks) {
+      auto f = std::get_if<MoeBlock>(&block);
+      if (!f || !f->cold_gu) continue;
+      auto link = [&](const ColdMatrix* a, const ColdMatrix* b) {
+        auto [it, added] = partners.emplace(a, b);
+        if (!added && it->second != b) it->second = nullptr;
+      };
+      link(f->cold_gu.get(), f->cold_down.get());
+      link(f->cold_down.get(), f->cold_gu.get());
+    }
+    for (const auto& block : m->blocks) {
+      auto f = std::get_if<MoeBlock>(&block);
+      if (!f || !f->cold_gu || !f->cold_gu->first || f->cold_gu == f->cold_down ||
+          partners[f->cold_gu.get()] != f->cold_down.get() || partners[f->cold_down.get()] != f->cold_gu.get()) continue;
+      auto [it, added] = w->placements.try_emplace(f->cold_gu.get(), f);
+      if (!added) continue;
+      auto& placement = it->second;
+      const size_t n = f->n_experts;
+      placement.slots = m->alloc<int>(n);
+      placement.counts = m->alloc<uint32_t>(n);
+      CK(cudaMemset(placement.counts, 0, n * sizeof(uint32_t)));
+      CK(cudaMemcpy(placement.slots, placement.order.slot.data(), n * sizeof(int), cudaMemcpyHostToDevice));
+      m->host_bytes += n * (2 * sizeof(int) + sizeof(uint64_t) + sizeof(uint32_t));
+      if (m->opt.expert_global && w->global_scores.try_emplace(int(n), n, 0).second)
+        m->host_bytes += n * sizeof(uint64_t);
+    }
+  }
   w->ids = m->host_pinned<int>(shape.pairs);
   w->input = m->host_pinned<float>(shape.inputs);
   w->cpu_slots = m->host_pinned<float>(shape.outputs);
@@ -230,6 +313,63 @@ void init_cold_experts(flyx_bmodel* m) {
   CK(cudaEventCreateWithFlags(&w->ready, cudaEventDisableTiming));
   m->cold = std::move(w);
   m->opt.graphs = false;
+}
+
+void cold_sequence_open(flyx_bmodel* m) {
+  auto& ws = *m->cold;
+  std::lock_guard lock(ws.mutex);
+  if (ws.failed) throw std::runtime_error("expert exchange failed on this model");
+  if (ws.sessions || !ws.pending_counts) {
+    ++ws.sessions;
+    return;
+  }
+  CK(cudaEventSynchronize(ws.ready));
+  size_t swaps = 0;
+  try {
+    for (auto& [_, scores] : ws.global_scores) std::fill(scores.begin(), scores.end(), 0);
+    for (auto& [_, p] : ws.placements) {
+      auto& o = p.order;
+      CK(cudaMemcpy(o.counts.data(), p.counts, o.counts.size() * sizeof(uint32_t), cudaMemcpyDeviceToHost));
+      CK(cudaMemset(p.counts, 0, o.counts.size() * sizeof(uint32_t)));
+      o.observe();
+      if (m->opt.expert_global) {
+        auto& scores = ws.global_scores.at(p.layer->n_experts);
+        for (size_t e = 0; e < scores.size(); ++e) scores[e] += o.scores[e];
+      }
+    }
+    for (auto& [_, p] : ws.placements) {
+      const auto& f = *p.layer;
+      const auto& scores = m->opt.expert_global ? ws.global_scores.at(f.n_experts) : p.order.scores;
+      const size_t changed = p.order.update(f.cold_gu->first, scores.data(), [&](int hot, int cold) {
+        f.cold_gu->exchange(f.gate_up, hot, cold, f.n_experts, ws.staging[0].host);
+        f.cold_down->exchange(f.down, hot, cold, f.n_experts, ws.staging[0].host);
+      });
+      if (changed)
+        CK(cudaMemcpy(p.slots, p.order.slot.data(), p.order.slot.size() * sizeof(int), cudaMemcpyHostToDevice));
+      swaps += changed;
+    }
+  } catch (...) {
+    // An interrupted pair exchange must never expose the old logical map to a new session.
+    ws.failed = true;
+    throw;
+  }
+  if (ws.verbose) std::fprintf(stderr, "flyx-cuda: promoted %zu experts between sessions\n", swaps);
+  ws.pending_counts = false;
+  ++ws.sessions;
+}
+
+void cold_sequence_close(flyx_bmodel* m) {
+  auto& ws = *m->cold;
+  std::lock_guard lock(ws.mutex);
+  if (--ws.sessions == 0 && ws.verbose && ws.decode_slots > ws.last_decode_slots) {
+    const auto slots = ws.decode_slots - ws.last_decode_slots;
+    const auto cold = ws.decode_cold - ws.last_decode_cold;
+    std::fprintf(stderr, "flyx-cuda: session decode expert cache hit rate %.2f%% (%llu/%llu routed slots)\n",
+                 100. * (slots - cold) / slots, static_cast<unsigned long long>(slots - cold),
+                 static_cast<unsigned long long>(slots));
+    ws.last_decode_slots = ws.decode_slots;
+    ws.last_decode_cold = ws.decode_cold;
+  }
 }
 
 namespace {
@@ -312,6 +452,10 @@ void hybrid_experts(const Pass& ps, const MoeBlock& f, const MoeScratch* sc, flo
   CK(cudaStreamWaitEvent(L.st, ws.ready));
   auto* t = ws.profile ? &ws.times[{&f, ps.round}] : nullptr;
   try {
+    if (auto it = ws.placements.find(f.cold_gu.get()); it != ws.placements.end()) {
+      moe_place_ids(b.moe_idx, ps.rows * K, it->second.slots, ps.round ? nullptr : it->second.counts, L.st);
+      if (!ps.round) ws.pending_counts = true;
+    }
     if (!ps.round && ws.copy && sc && ps.rows >= std::max(2, ps.s->m->opt.expert_prefill_min)) {
       streamed_prefill(ws, ps, f, *sc, out, accumulate, fused);
       CK(cudaEventRecord(ws.ready, L.st));

@@ -1,5 +1,6 @@
 // Copyright 2026 The flyx Authors. SPDX-License-Identifier: Apache-2.0
 // Sequence state and row buffers, sized from the blocks and the state table.
+#include "backends/cuda/runtime/cold_experts.h"
 #include "backends/cuda/runtime/checked_size.h"
 #include "backends/cuda/runtime/window_ring.h"
 #include "backends/cuda/backend.h"
@@ -533,6 +534,7 @@ int new_seq(flyx_bmodel* m, const flyx_seq_layout* layout, bool capture_only, fl
   s->arena_host_bytes = probe.arena_host_bytes;
   try {
     build_seq(m, layout->max_ctx, s.get());
+    if (m->cold && !capture_only) cold_sequence_open(m);
   } catch (const OutOfDeviceMemory& e) {
     return fail_oom(std::string("seq_new: ") + e.what());
   } catch (const std::exception& e) {
@@ -1592,7 +1594,9 @@ void seq_free(flyx_seq* s) {
       it = uses ? B.hits.erase(it) : std::next(it);
     }
   }
+  auto* m = s && !s->capture_only ? s->m : nullptr;
   delete s;
+  if (m && m->cold) cold_sequence_close(m);
 }
 
 void alloc_batch(flyx_bmodel* m) {
