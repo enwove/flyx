@@ -26,6 +26,7 @@ const flyx_backend_api* g_backend = nullptr;
 std::string g_err;
 uint64_t g_total_vram = 0;
 uint64_t g_free_vram = 0;
+uint64_t g_reserve_floor = 0;
 uint64_t g_target_bytes = 8ull << 30;
 uint64_t g_dflash_bytes = 3800ull << 20;
 uint64_t g_dflash_savings = 2700ull << 20;  // savings from compacting DFlash2 -> NVFP4
@@ -61,6 +62,7 @@ int hook_probe(flyx_device_info* out) {
   if (rc != 0) return rc;
   out->mem_total = g_total_vram;
   out->mem_free = g_free_vram;
+  out->reserve_floor = g_reserve_floor;
   return 0;
 }
 
@@ -187,6 +189,7 @@ void reset_hooks() {
   g_size_max_rows = g_prefill_rows = g_align = 0;
   g_total_vram = 0;
   g_free_vram = 0;
+  g_reserve_floor = 0;
   g_target_bytes = 8ull << 30;
   g_dflash_bytes = 3800ull << 20;
   g_dflash_savings = 2700ull << 20;
@@ -203,6 +206,12 @@ void reset_hooks() {
   g_refusal = Refusal::none;
   g_seen_dw.clear();
   g_active_dw.clear();
+}
+
+void set_vram(uint64_t total, uint64_t free, uint64_t reserve_floor = 0) {
+  g_total_vram = total;
+  g_free_vram = free;
+  g_reserve_floor = reserve_floor;
 }
 
 std::vector<int32_t> tokens(Engine& e, int prompt_length = 0, bool sampled = false) {
@@ -679,11 +688,11 @@ int main(int argc, char** argv) {
           "--drafter mtp: no shorter prefill passes, the load refused with the reason: " + err);
   }
 
-  // 11. Explicit --vram-reserve applies to both AUTO exact/Strata boundary (auto_from) and elastic pre-flight checks.
+  // 11. Explicit --vram-reserve and backend reserve_floor apply to both AUTO exact/Strata boundary (auto_from) and
+  // elastic pre-flight checks.
   {
     reset_hooks();
-    g_total_vram = 16ull << 30;
-    g_free_vram = 12ull << 30;
+    set_vram(16ull << 30, 12ull << 30);
     g_target_bytes = 8ull << 30;
     g_kv_row_bytes = 1ull << 20;  // 1 MiB per token
     EngineOptions eo;
@@ -691,17 +700,16 @@ int main(int argc, char** argv) {
     eo.max_ctx = 4096;
     eo.drafter = "none";
     eo.kv_method = "auto";
-    eo.vram_reserve = int64_t(1ull << 30);  // 1 GiB reserve -> 2.5 GiB left -> ~2560 tokens
+    eo.vram_reserve = int64_t(1ull << 30);  // 1 GiB reserve -> 2.5 GiB left -> 2560 tokens
     Engine e_lo;
     check(e_lo.load(model, eo, &err), "auto_from with 1 GiB vram_reserve loads: " + err);
     const int auto_from_1g = g_target_options.empty() ? -1 : g_target_options.back().second;
 
     reset_hooks();
-    g_total_vram = 16ull << 30;
-    g_free_vram = 12ull << 30;
+    set_vram(16ull << 30, 12ull << 30);
     g_target_bytes = 8ull << 30;
     g_kv_row_bytes = 1ull << 20;
-    eo.vram_reserve = int64_t(2ull << 30);  // 2 GiB reserve -> 1.5 GiB left -> ~1536 tokens (1024 fewer)
+    eo.vram_reserve = int64_t(2ull << 30);  // 2 GiB reserve -> 1.5 GiB left -> 1536 tokens (1024 fewer)
     Engine e_hi;
     check(e_hi.load(model, eo, &err), "auto_from with 2 GiB vram_reserve loads: " + err);
     const int auto_from_2g = g_target_options.empty() ? -1 : g_target_options.back().second;
@@ -709,12 +717,22 @@ int main(int argc, char** argv) {
           "vram_reserve shifts AUTO exact/Strata auto_from boundary (" + std::to_string(auto_from_1g) + " -> " +
               std::to_string(auto_from_2g) + ")");
 
-    // Elastic pre-flight: target 8.5 GiB + dflash 3.8 GiB + min_runtime 0.5 GiB = 12.8 GiB.
-    // With 13.5 GiB free + comfort 1.5 GiB: a 2 GiB vram_reserve makes hard_need = 14.8 GiB > 13.5 GiB -> steps down;
-    // with 15.0 GiB free and vram_reserve = 256 MiB (above Windows floor): comfort_need = 14.55 GiB <= 15.0 GiB -> stays!
+    // Backend-reported reserve_floor clamps --vram-reserve 0 on auto_from.
     reset_hooks();
-    g_total_vram = 16ull << 30;
-    g_free_vram = 15000ull << 20;
+    set_vram(16ull << 30, 12ull << 30, 1ull << 30);
+    g_target_bytes = 8ull << 30;
+    g_kv_row_bytes = 1ull << 20;
+    eo.vram_reserve = 0;
+    Engine e_floor;
+    check(e_floor.load(model, eo, &err), "auto_from with 0 vram_reserve and 1 GiB reserve_floor loads: " + err);
+    const int auto_from_floor = g_target_options.empty() ? -1 : g_target_options.back().second;
+    check(auto_from_floor == 2560,
+          "backend reserve_floor clamps vram_reserve=0 on auto_from (got " + std::to_string(auto_from_floor) + ")");
+
+    // Elastic pre-flight: target 8.5 GiB + dflash 3.8 GiB + min_runtime 0.5 GiB = 12.8 GiB.
+    // With 15.0 GiB free and vram_reserve = 256 MiB: comfort_need = 14.55 GiB <= 15.0 GiB -> stays.
+    reset_hooks();
+    set_vram(16ull << 30, 15000ull << 20, 256ull << 20);
     g_target_bytes = 8500ull << 20;
     g_dflash_bytes = 3800ull << 20;
     g_dflash_savings = 2700ull << 20;
@@ -723,20 +741,31 @@ int main(int argc, char** argv) {
     eo_pf.backend = "test-host-kv";
     eo_pf.max_ctx = 128;
     eo_pf.drafter = "dflash2";
-    eo_pf.vram_reserve = int64_t(256ull << 20);  // hard=13068 MiB, comfort=14604 MiB <= 15000 MiB -> keeps auto
+    eo_pf.vram_reserve = 0;  // clamped to 256 MiB floor: hard=13068 MiB, comfort=14604 MiB <= 15000 MiB -> keeps auto
     Engine e_keep;
-    check(e_keep.load(model, eo_pf, &err), "low vram_reserve keeps dflash2 in elastic pre-flight: " + err);
+    check(e_keep.load(model, eo_pf, &err), "low reserve_floor keeps dflash2 in elastic pre-flight: " + err);
     check(g_open_calls == 1 && g_seen_dw.back() == FLYX_DRAFT_WEIGHTS_AUTO && e_keep.load_adjustments().empty(),
-          "low vram_reserve avoids unnecessary pre-flight step-down");
+          "low reserve_floor avoids unnecessary pre-flight step-down");
 
     reset_hooks();
-    g_total_vram = 16ull << 30;
-    g_free_vram = 15000ull << 20;
+    set_vram(16ull << 30, 15000ull << 20, 2048ull << 20);
     g_target_bytes = 8500ull << 20;
     g_dflash_bytes = 3800ull << 20;
     g_dflash_savings = 2700ull << 20;
     g_mtp_bytes = 0;
-    eo_pf.vram_reserve = int64_t(2048ull << 20);  // hard=14860 MiB, comfort=16396 MiB > 15000 MiB -> steps to nvfp4
+    eo_pf.vram_reserve = 0;  // clamped to 2048 MiB floor: hard=14860 MiB, comfort=16396 MiB > 15000 MiB -> steps to nvfp4
+    Engine e_floor_step;
+    check(e_floor_step.load(model, eo_pf, &err), "high reserve_floor steps down in elastic pre-flight: " + err);
+    check(g_open_calls == 1 && g_seen_dw.back() == FLYX_DRAFT_WEIGHTS_NVFP4 && !e_floor_step.load_adjustments().empty(),
+          "backend reserve_floor clamps vram_reserve=0 in elastic pre-flight");
+
+    reset_hooks();
+    set_vram(16ull << 30, 15000ull << 20);
+    g_target_bytes = 8500ull << 20;
+    g_dflash_bytes = 3800ull << 20;
+    g_dflash_savings = 2700ull << 20;
+    g_mtp_bytes = 0;
+    eo_pf.vram_reserve = int64_t(2048ull << 20);  // explicit 2 GiB reserve -> steps to nvfp4
     Engine e_step;
     check(e_step.load(model, eo_pf, &err), "high vram_reserve steps down in elastic pre-flight: " + err);
     check(g_open_calls == 1 && g_seen_dw.back() == FLYX_DRAFT_WEIGHTS_NVFP4 && !e_step.load_adjustments().empty(),

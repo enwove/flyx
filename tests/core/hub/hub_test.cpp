@@ -598,6 +598,11 @@ struct FakeHub {
                       "application/json");
     });
     http.Get(R"(/api/models/acme/none/revision/main)", [](const httplib::Request&, httplib::Response& res) { res.status = 404; });
+    http.Get(R"(/api/models/acme/gated/revision/main)", [](const httplib::Request&, httplib::Response& res) { res.status = 403; });
+    http.Get(R"(/api/models/acme/throttled/revision/main)", [](const httplib::Request&, httplib::Response& res) {
+      res.status = 429;
+      res.set_header("Retry-After", "42");
+    });
     http.Get("/api/models", [this](const httplib::Request& q, httplib::Response& res) {
       if (q.has_header("Authorization")) saw_auth = true;
       const std::string cursor = q.get_param_value("cursor");
@@ -834,6 +839,25 @@ void fetching(const fs::path& tmp) {
           "describe does not leak HF_TOKEN to runtime setting mirror");
     flyx::hub::set_endpoint("", &ep_err);
     set_env("HF_TOKEN", "");
+  }
+  {
+    // Typed HubOutcome error classification (400/403/404/429 + Retry-After) without brittle string parsing.
+    flyx::hub::Repo out_repo;
+    flyx::hub::HubOutcome out;
+    check(!flyx::hub::describe("acme/none", "main", &out_repo, &err, &out) && out.error == flyx::hub::HubError::kNotFound,
+          "describe classifies 404 as kNotFound");
+    out = {};
+    check(!flyx::hub::describe("acme/gated", "main", &out_repo, &err, &out) &&
+              out.error == flyx::hub::HubError::kUnauthorized,
+          "describe classifies 403 as kUnauthorized");
+    out = {};
+    check(!flyx::hub::describe("acme/throttled", "main", &out_repo, &err, &out) &&
+              out.error == flyx::hub::HubError::kRateLimited && out.retry_after_sec == 42,
+          "describe classifies 429 as kRateLimited and preserves Retry-After: " + std::to_string(out.retry_after_sec));
+    out = {};
+    check(!flyx::hub::describe("acme/tiny-GGUF", "../../bad", &out_repo, &err, &out) &&
+              out.error == flyx::hub::HubError::kInvalidName,
+          "describe classifies invalid revision as kInvalidName");
   }
 }
 

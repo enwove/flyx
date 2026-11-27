@@ -4,6 +4,7 @@
 #include <algorithm>
 #include <cstdio>
 
+#include "core/interfaces/memory_policy.h"
 #include "core/os/os.h"
 
 namespace flyx::plan {
@@ -29,6 +30,9 @@ uint64_t effective_device_reserve(uint64_t total_vram, bool gpu_paged, int64_t o
   return std::max(wanted, min_floor);
 }
 
+// What holds the GPU besides the model (weights + workspace): where the system reports this process's share
+// (Windows DXGI/NVML, mi.process >= model), subtract mi.process from used so flyx's own CUDA context and driver
+// modules (~0.3-0.7 GB) are separated from other apps; elsewhere the runtime stays folded into `others`.
 GpuHeld held_of(const flyx_memory_info& mi) {
   GpuHeld h;
   h.total = mi.total;
@@ -218,8 +222,10 @@ bool init_device_budget(const flyx_backend_api* api, flyx_bmodel* bm, const KvTi
     return false;
   };
   if (reported) {
-    reserve = effective_device_reserve(mi->total, tiers.gpu_paged, tiers.vram_reserve, tiers.min_vram_reserve);
+    const uint64_t floor = std::max(tiers.min_vram_reserve, mi->reserve_floor);
+    reserve = effective_device_reserve(mi->total, tiers.gpu_paged, tiers.vram_reserve, floor);
     *reserve_out = reserve;
+    out->device_reserve = reserve;
     const uint64_t have = mi->free + mi->weights + mi->workspace;
     // Zero is the ledger's sentinel for a backend that does not report a budget.
     if (have <= reserve) return fail_vram();
@@ -426,7 +432,7 @@ std::string held_note(const GpuHeld& h) {
          (h.runtime ? ", flyx's own runtime " + gb(h.runtime) : "");
 }
 
-bool closable(const GpuHeld& h) { return h.others >= (h.runtime_known ? 256ull << 20 : 1ull << 30); }
+bool closable(const GpuHeld& h) { return interfaces::closable_others(h.others, h.runtime_known); }
 
 std::string ctx_limit_note(const Budget& b) {
   if (b.ctx_limit == CtxLimit::kHost)

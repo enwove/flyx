@@ -12,6 +12,7 @@
 //   both folds of a saved state, never a recompute of the prompt.
 #include "backends/cuda/backend.h"
 #include "backends/cuda/regions/layers.h"
+#include "core/interfaces/memory_policy.h"
 
 #include <charconv>
 #include <climits>
@@ -620,6 +621,7 @@ int probe(flyx_device_info* out) {
   cudaMemGetInfo(&fr, &tot);
   out->mem_free = fr;
   out->mem_total = tot;
+  out->reserve_floor = device_reserve_floor();
   return 0;
 }
 
@@ -776,9 +778,7 @@ int open_model(const flyx_model_desc* desc, const flyx_open_options* opts, flyx_
     const bool runtime_known = process > 0 && process >= m->bytes;
     const size_t own = runtime_known ? process : m->bytes;
     const size_t others = mem_ok && total > free && total - free > own ? total - free - own : 0;
-    // Match plan::closable(): when this process's CUDA runtime (~0.3-0.7 GB) cannot be separated from other apps,
-    // require at least 1 GiB before blaming other apps.
-    const bool has_others = others >= (runtime_known ? (256ull << 20) : (1ull << 30));
+    const bool has_others = interfaces::closable_others(others, runtime_known);
     // From the description: a drafter's layers may come before its block, and run out of memory before it is bound.
     bool drafter = false;
     for (int i = 0; i < desc->n_blocks; ++i)
@@ -791,12 +791,7 @@ int open_model(const flyx_model_desc* desc, const flyx_open_options* opts, flyx_
                     others / 1e9, total / 1e9);
     else if (mem_ok)
       std::snprintf(head, sizeof(head), "Not enough VRAM while loading weights (%.2f GB GPU).", total / 1e9);
-    const std::string fix =
-        has_others ? std::string(" Close other apps") + (drafter ? ", disable speculative decoding" : "") +
-                         ", or use a smaller quantization."
-                   : (drafter ? " Disable speculative decoding or use a smaller quantization."
-                              : " Use a smaller quantization.");
-    return fail_oom(std::string(head) + fix);
+    return fail_oom(std::string(head) + " " + interfaces::oom_fix_advice(has_others, drafter));
   } catch (const std::exception& e) {
     return fail(std::string("uploading weights: ") + e.what());
   }

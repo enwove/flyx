@@ -18,15 +18,18 @@ What flyx assumes, so you can judge what is in scope:
   non-loopback address) opts direct, unforwarded LAN clients into management, logs and requests; `POST /v1/hub/config`
   still requires this machine or `--api-key`, and `POST /v1/hub/dir`, `POST /v1/device/close` and
   `POST /v1/agents/launch` always require loopback. A request a proxy passed on (it carries `Forwarded`,
-  `X-Forwarded-*`, `X-Real-IP` or `Via`) never counts as loopback or unforwarded LAN, and always requires `--api-key`
-  for management.
-- Without a key, a request a browser sends from another site is refused (`Sec-Fetch-Site`, `Origin` and `Host` are
-  checked, which also stops DNS rebinding — on a LAN listener `Host` must match the socket's local address/port or a
-  known listener address or hostname); only a link to the dashboard page itself may be followed from elsewhere. A page
-  may call the inference API from a browser when its origin is this machine's (`localhost`, any port: the default) or
-  one `--cors` names; `--cors '*'` without a key lets any page a browser opens use the model
-  (Chrome and Edge still ask the user before a public page may reach a loopback address).
-  The model panel, the request log, the logs and the telemetry are never another origin's.
+  any `X-Forwarded-*` header, `X-Real-IP`, `Via`, `CF-Connecting-IP` or `True-Client-IP`) never counts as loopback or
+  unforwarded LAN, and always requires `--api-key` for management. An opaque TCP tunnel (such as SSH port forwarding)
+  or a reverse proxy that strips forwarding headers cannot be distinguished from a direct client by HTTP headers alone:
+  always set `--api-key` when exposing `flyx serve` through a proxy or tunnel.
+- Without a key, a request a browser sends from another site is refused (`Sec-Fetch-Site` and `Origin` are checked; on
+  loopback listeners `Host` must also be a loopback address to stop DNS rebinding, and on keyless LAN management routes
+  `Host` must match the socket's local address/port, a known listener address, or the configured `--host` / system
+  hostname; non-browser LAN inference clients behind Docker port mappings or custom hostnames remain unaffected). Only
+  a link to the dashboard page itself may be followed from elsewhere. A page may call the inference API from a browser
+  when its origin is this machine's (`localhost`, any port: the default) or one `--cors` names; `--cors '*'` without a
+  key lets any page a browser opens use the model (Chrome and Edge still ask the user before a public page may reach a
+  loopback address). The model panel, the request log, the logs and the telemetry are never another origin's.
 - A request is held to 64 MiB, 64 levels of JSON nesting and an 8 KiB target before a handler sees it
   (`server_hardening` tests these).
 - A model file is data, never code: the `.flyx` and GGUF readers check the offsets and sizes a header gives
@@ -35,4 +38,5 @@ What flyx assumes, so you can judge what is in scope:
 - Models fetched by name come from Hugging Face (or a configured mirror) and are checked against the SHA-256 the Hub
   gives. A configured `HF_TOKEN` is sent only over `https://` to the default Hugging Face endpoint or an `HF_ENDPOINT`
   environment override, never over `http://` or to a runtime-saved mirror. Remote management requests cannot probe
-  Windows UNC or device paths (`\\server\share`, `\\?\`, `\\.\`) outside an operator-configured `--models-dir`.
+  Windows UNC or device paths (`\\server\share`, `\\?\`, `\\.\`), mapped network drives (`DRIVE_REMOTE`), or reparse
+  points / symlinks targeting them outside an operator-configured `--models-dir`.

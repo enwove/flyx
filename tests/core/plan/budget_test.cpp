@@ -723,14 +723,30 @@ int main() {
     t_above.vram_reserve = int64_t(512 * kMiB);
     t_above.min_vram_reserve = floor;
     check(plan::account(&api, nullptr, false, false, &c0, 4096, t_zero, &l_zero, &b_zero, &err) &&
-              l_zero.budget() == 16 * kGiB - floor,
+              l_zero.budget() == 16 * kGiB - floor && b_zero.device_reserve == floor,
           "min_vram_reserve=256 MiB clamps vram_reserve=0 in account()");
     check(plan::account(&api, nullptr, false, false, &c1, 4096, t_small, &l_small, &b_small, &err) &&
-              l_small.budget() == 16 * kGiB - floor,
+              l_small.budget() == 16 * kGiB - floor && b_small.device_reserve == floor,
           "min_vram_reserve=256 MiB clamps vram_reserve=100 MiB in account()");
     check(plan::account(&api, nullptr, false, false, &c2, 4096, t_above, &l_above, &b_above, &err) &&
-              l_above.budget() == 16 * kGiB - 512 * kMiB,
+              l_above.budget() == 16 * kGiB - 512 * kMiB && b_above.device_reserve == 512 * kMiB,
           "min_vram_reserve=256 MiB preserves vram_reserve=512 MiB in account()");
+
+    // Backend-reported flyx_memory_info::reserve_floor enforces the floor even when KvTiers::min_vram_reserve is 0.
+    flyx_backend_api api_floor = fake();
+    api_floor.memory = [](flyx_bmodel* bm, flyx_memory_info* out) -> int {
+      const int rc = memory(bm, out);
+      out->reserve_floor = 256 * kMiB;
+      return rc;
+    };
+    ResourceLedger l_be;
+    plan::Budget b_be;
+    int c_be = 8192;
+    plan::KvTiers t_be = kGpuOnly;
+    t_be.vram_reserve = 0;
+    check(plan::account(&api_floor, nullptr, false, false, &c_be, 4096, t_be, &l_be, &b_be, &err) &&
+              l_be.budget() == 16 * kGiB - floor && b_be.device_reserve == floor,
+          "backend flyx_memory_info::reserve_floor clamps vram_reserve=0 and reports b.device_reserve");
   }
   {
     // Auto host RAM budget (--kv-ram auto) honors --ram-reserve: 0 >= auto > large explicit reserve.

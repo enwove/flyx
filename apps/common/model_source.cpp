@@ -224,12 +224,27 @@ std::string expand_user_path(const std::string& path) {
   return from_path((to_path(home) / suffix).lexically_normal());
 }
 
+std::string canonical_model_dir(std::string_view raw) {
+  if (raw.empty()) return {};
+  const std::string expanded = expand_user_path(std::string(raw));
+  std::error_code ec;
+  fs::path p = fs::absolute(to_path(expanded), ec);
+  if (ec) p = to_path(expanded);
+  p = p.lexically_normal();
+  std::string s = from_path(p);
+  while (s.size() > 1 && (s.back() == '/' || s.back() == '\\')) {
+    if (s.size() == 3 && s[1] == ':') break;
+    s.pop_back();
+  }
+  return s;
+}
+
 std::vector<LocalModel> scan_model_dirs(const std::vector<std::string>& dirs, int deepest) {
   constexpr int kMostEntries = 200000;     // a directory named by mistake (a whole disk) ends the scan early
   std::vector<LocalModel> out;
   std::set<fs::path> seen;  // a file reached from two of the directories (one inside the other) once
   struct LocalShard {
-    std::string path, file, rel;
+    std::string path, root, file, rel;
     uint64_t size = 0;
     fs::file_time_type modified{};
   };
@@ -240,10 +255,11 @@ std::vector<LocalModel> scan_model_dirs(const std::vector<std::string>& dirs, in
   std::map<std::pair<std::string, int>, SplitAcc> splits;
   const auto opts = fs::directory_options::skip_permission_denied | fs::directory_options::follow_directory_symlink;
   for (const std::string& dir : dirs) {
+    const std::string root_str = canonical_model_dir(dir);
+    if (root_str.empty()) continue;
     std::error_code ec;
-    const std::string expanded = expand_user_path(dir);
-    const fs::path root = fs::absolute(to_path(expanded), ec);
-    if (ec || !fs::is_directory(root, ec)) continue;
+    const fs::path root = to_path(root_str);
+    if (!fs::is_directory(root, ec)) continue;
     std::map<fs::path, int> visited_depth;
     const fs::path root_canon = fs::weakly_canonical(root, ec);
     if (!ec) visited_depth[root_canon] = -1;
@@ -279,6 +295,7 @@ std::vector<LocalModel> scan_model_dirs(const std::vector<std::string>& dirs, in
         if (e2 || !fs::is_regular_file(weights, e2) || !seen.insert(canon).second) continue;
         LocalModel m;
         m.path = from_path(dir);
+        m.root = root_str;
         m.file = from_path(dir.filename());
         m.kind = "lora";
         m.size = uint64_t(fs::file_size(weights, e2));
@@ -304,11 +321,12 @@ std::vector<LocalModel> scan_model_dirs(const std::vector<std::string>& dirs, in
       if (gguf && hub::parse_split_gguf_name(from_path(it->path()), &sp)) {
         auto& acc = splits[{sp.prefix, sp.count}];
         acc.count = sp.count;
-        acc.parts[sp.part] = {from_path(it->path()), name, rel, uint64_t(sz), modified};
+        acc.parts[sp.part] = {from_path(it->path()), root_str, name, rel, uint64_t(sz), modified};
         continue;
       }
       LocalModel m;
       m.path = from_path(it->path());
+      m.root = root_str;
       m.file = name;
       if (gguf) {
         const GgufClassification cls = classify_gguf(m.path, rel, uint64_t(sz), modified);
@@ -345,6 +363,7 @@ std::vector<LocalModel> scan_model_dirs(const std::vector<std::string>& dirs, in
     if (cls.kind.empty()) continue;
     LocalModel m;
     m.path = first.path;
+    m.root = first.root;
     m.file = first.file;
     m.kind = cls.kind;
     m.drafter_kind = cls.drafter_kind;

@@ -96,13 +96,15 @@ FOUND_PAGE2 = {"query": "", "family": True, "architectures": ["qwen35", "qwen3",
 DRAFTER_KINDS = {"./another.gguf": "mtp", "./new-mtp.gguf": "mtp", "./drafts/Speedy": "dspark"}
 
 
-def repository(repo, helper_cached=False):
+def repository(repo_spec, helper_cached=False):
     """GET /v1/hub/files: REPO as this build runs it, a dflash GGUF drafter repo, a safetensors drafter repo, or unsupported."""
+    repo, _, rev = repo_spec.partition("@")
+    rev_sfx = f"@{rev}" if rev and rev != "main" else ""
     if repo == "acme/Model-DFlash2-GGUF":
-        return {"repo": repo, "from_cache": False, "drafter": None, "drafter_repo": True, "base_models": ["acme/Tiny-27B"],
-                "runs": True, "known_drafters": [], "build_architectures": ["qwen35", "qwen3"],
-                "mtp": None, "mmproj": None, "ggufs": [],
-                "companions": [{"name": repo + ":helper.gguf", "path": "helper.gguf",
+        return {"repo": repo, "revision": rev or "main", "from_cache": False, "drafter": None, "drafter_repo": True,
+                "base_models": ["acme/Tiny-27B"], "runs": True, "known_drafters": [],
+                "build_architectures": ["qwen35", "qwen3"], "mtp": None, "mmproj": None, "ggufs": [],
+                "companions": [{"name": repo + ":helper.gguf" + rev_sfx, "path": "helper.gguf",
                                 "file": "helper.gguf", "kind": "dspark" if helper_cached else "drafter",
                                 "drafter_kind": "dspark" if helper_cached else "",
                                 "size": int(0.5 * GB), "cached": helper_cached, "disk": None, "default": True}],
@@ -110,36 +112,36 @@ def repository(repo, helper_cached=False):
                          "pipeline": "text-generation", "gated": False, "architecture": "dflash",
                          "context": 1048576, "parameters": 495000000}}
     if repo == "acme/Model-DFlash2":
-        return {"repo": repo, "from_cache": False, "drafter": {"size": int(0.9 * GB), "kind": "dflash2"}, "drafter_repo": False,
-                "base_models": ["acme/Tiny-27B"], "runs": None, "known_drafters": [],
+        return {"repo": repo, "revision": rev or "main", "from_cache": False, "drafter": {"size": int(0.9 * GB), "kind": "dflash2"},
+                "drafter_repo": False, "base_models": ["acme/Tiny-27B"], "runs": None, "known_drafters": [],
                 "build_architectures": ["qwen35", "qwen3"], "mtp": None, "mmproj": None, "ggufs": [], "companions": [],
                 "info": {"downloads": 500, "likes": 25, "updated": "2026-11-24T02:15:52.000Z", "license": "apache-2.0",
                          "pipeline": None, "gated": False, "architecture": None, "context": None, "parameters": None}}
     if repo == "acme/Speedy-Drafter":  # a DSpark drafter whose name does not say so: the server says its kind
-        return {"repo": repo, "from_cache": False, "drafter": {"size": int(0.8 * GB), "kind": "dspark"},
+        return {"repo": repo, "revision": rev or "main", "from_cache": False, "drafter": {"size": int(0.8 * GB), "kind": "dspark"},
                 "drafter_repo": False, "base_models": ["acme/Tiny-27B"], "runs": None, "known_drafters": [],
                 "build_architectures": ["qwen35", "qwen3"], "mtp": None, "mmproj": None, "ggufs": [], "companions": [],
                 "info": {"downloads": 50, "likes": 2, "updated": "2026-11-24T02:15:52.000Z", "license": "mit",
                          "pipeline": None, "gated": False, "architecture": None, "context": None, "parameters": None}}
     runs = repo == REPO
     quants = [("IQ3_XXS", 11.8, True), ("Q4_K_M", 17.6, True), ("Q5_K_M", 19.4, False), ("Q6_K", 22.3, False), ("BF16", 54.7, False)]
-    return {"repo": repo, "from_cache": False, "drafter": None, "base_models": ["acme/Tiny-27B"], "runs": runs,
+    return {"repo": repo, "revision": rev or "main", "from_cache": False, "drafter": None, "base_models": ["acme/Tiny-27B"], "runs": runs,
             "known_drafters": [{"repo": "acme/Tiny-27B-DFlash2", "kind": "dflash2", "base": "acme/Tiny-27B", "exact": False,
                                 "relation": "quantized", "tok_s": None}]
             if runs else [], "build_architectures": ["qwen35", "qwen3"],
             "mtp": {"path": "MTP/mtp.gguf", "size": int(0.6 * GB), "cached": True} if runs else None,
             "mmproj": {"path": "mmproj-BF16.gguf", "size": int(0.9 * GB), "cached": True} if runs else None,
             "companions": [
-                {"name": repo + ":mtp.gguf", "path": "MTP/mtp.gguf", "file": "mtp.gguf", "kind": "mtp",
+                {"name": repo + ":mtp.gguf" + rev_sfx, "path": "MTP/mtp.gguf", "file": "mtp.gguf", "kind": "mtp",
                  "size": int(0.6 * GB), "cached": True, "disk": None, "default": True},
-                {"name": repo + ":mmproj-BF16.gguf", "path": "mmproj-BF16.gguf", "file": "mmproj-BF16.gguf", "kind": "mmproj",
+                {"name": repo + ":mmproj-BF16.gguf" + rev_sfx, "path": "mmproj-BF16.gguf", "file": "mmproj-BF16.gguf", "kind": "mmproj",
                  "size": int(0.9 * GB), "cached": True, "disk": None, "default": True},
-                {"name": repo + ":mmproj-F16.gguf", "path": "mmproj-F16.gguf", "file": "mmproj-F16.gguf", "kind": "mmproj",
+                {"name": repo + ":mmproj-F16.gguf" + rev_sfx, "path": "mmproj-F16.gguf", "file": "mmproj-F16.gguf", "kind": "mmproj",
                  "size": int(0.9 * GB), "cached": False, "disk": None, "default": False},
             ] if runs else [],
             "info": {"downloads": 7383193, "likes": 6300, "updated": "2026-11-12T02:15:52.000Z", "license": "apache-2.0", "pipeline": None,
                      "gated": False, "architecture": "qwen35" if runs else "gemma4", "context": 262144, "parameters": 27320697856},
-            "ggufs": [{"name": repo + ":" + q, "quant": q, "size": int(s * GB), "split": False, "parts": 1, "complete": True, "cached": c and runs}
+            "ggufs": [{"name": repo + ":" + q + rev_sfx, "quant": q, "size": int(s * GB), "split": False, "parts": 1, "complete": True, "cached": c and runs}
                       for q, s, c in quants]}
 
 
@@ -185,6 +187,8 @@ class Server:
         self.hub_endpoint = "https://huggingface.co"
         self.hub_source = "default"
         self.hub_fail = False
+        self.files_fail = None
+        self.files_asked = []
         self.hub_configs = []
         self.lora_asked = []
         page.route("**/dashboard/**", lambda r: serve(r, ROOT / "apps/flyx-server/dashboard"))
@@ -273,6 +277,8 @@ class Server:
                 res["query"], res["family"], res["next_cursor"] = q_text, False, None
                 if q_text == "no-such-model-xyz":
                     res["models"] = []
+                elif q_text == "inkling":
+                    res["models"] = [m for m in res["models"] if "Inkling" in m["id"]]
             elif arch:
                 res["arch"], res["next_cursor"] = arch, None
                 res["models"] = [m for m in res["models"] if m.get("architecture") == arch]
@@ -281,7 +287,8 @@ class Server:
             name = query.get("name", [""])[0]
             return route.fulfill(json={"name": name, "kind": DRAFTER_KINDS.get(name)})
         if "/v1/hub/files" in url:
-            if getattr(self, "files_fail", None):
+            self.files_asked.append(query["repo"][0])
+            if self.files_fail:
                 status, msg = self.files_fail
                 return route.fulfill(status=status, json={"error": {"message": msg}})
             res = repository(query["repo"][0], getattr(self, "helper_cached", False))
@@ -816,6 +823,46 @@ def check_hub(page, server, want):
     expect(page.locator("#hf-detail")).to_have_count(0)
     expect(page.locator(".hub-detail")).to_contain_text("Pick a repository on the left")
     expect(page.locator("#mf-load")).to_be_disabled()
+    # A subsequent non-empty text search selects from the fresh results rather than staying empty.
+    page.locator("#hf-q").fill("inkling")
+    page.keyboard.press("Enter")
+    expect(page.locator("#hf-list .prow")).to_have_count(1)
+    expect(page.locator("#hf-name")).to_have_text("Inkling-2-Mini-GGUF")
+    # Search failure clears stale repository detail and disables Load.
+    server.hub_fail = True
+    page.locator("#hf-q").fill("broken-search")
+    page.keyboard.press("Enter")
+    expect(page.locator("#hf-detail")).to_have_count(0)
+    expect(page.locator("#mf-load")).to_be_disabled()
+    server.hub_fail = False
+    page.locator("#hf-q").fill("")
+    expect(page.locator("#hf-list .prow")).to_have_count(3)
+    expect(page.locator("#hf-detail")).to_have_count(1)
+    # A zero-result architecture filter clears stale repository detail and disables Load.
+    page.locator('#hf-archs [data-arch="qwen3"]').click()
+    expect(page.locator("#hf-list .prow")).to_have_count(0)
+    expect(page.locator("#hf-detail")).to_have_count(0)
+    expect(page.locator("#mf-load")).to_be_disabled()
+    page.locator('#hf-archs [data-arch=""]').click()
+    expect(page.locator("#hf-list .prow")).to_have_count(3)
+    # Pinned @revision is preserved across direct lookup, Retry after failure, and Hub endpoint change.
+    server.files_fail = (502, "cannot reach the Hub (timed out)")
+    page.locator("#hf-q").fill(REPO + ":Q5_K_M@v2")
+    page.keyboard.press("Enter")
+    expect(page.locator("#mf-hubmsg.banner.bad")).to_contain_text("cannot reach the Hub")
+    assert server.files_asked[-1] == REPO + "@v2", server.files_asked
+    server.files_fail = None
+    page.locator("#hf-retry").click()
+    expect(page.locator("#mf-files .mrow.sel")).to_have_attribute("data-name", REPO + ":Q5_K_M@v2")
+    assert server.files_asked[-1] == REPO + "@v2", server.files_asked
+    page.locator("#hf-ep-toggle").click()
+    page.locator('#hf-epbar .chip[data-ep="https://hf-mirror.com"]').click()
+    expect(page.locator("#hf-ep-toggle")).to_contain_text("hf-mirror.com")
+    expect(page.locator("#mf-files .mrow.sel")).to_have_attribute("data-name", REPO + ":Q5_K_M@v2")
+    assert server.files_asked[-1] == REPO + "@v2", server.files_asked
+    page.locator("#hf-ep-reset").click()
+    expect(page.locator("#hf-ep-toggle")).to_contain_text("huggingface.co")
+    page.locator("#hf-ep-toggle").click()
     page.locator("#hf-q").fill("")
     expect(page.locator("#hf-list .prow")).to_have_count(3)
 
@@ -1304,22 +1351,23 @@ def check_local_posix(open_page, want):
     posix_catalog = {
         "cache": posix_cache,
         "cache_from": "default",
+        "win_paths": False,
         "dirs": [posix_cache, "/Models", "/models", "/"],
         "models": [
             {"name": REPO + ":Q4_K_M", "kind": "gguf", "source": "hub", "repo": REPO, "quant": "Q4_K_M",
              "file": "Tiny-27B-Q4_K_M.gguf", "path": posix_cache + "/models--acme--Tiny-27B-GGUF/snapshots/abc/Tiny-27B-Q4_K_M.gguf",
              "size": int(17.6 * GB), "modified": 1.7e9, "revision": "abc", "current": True, "mtp": None, "mmproj": None},
             {"name": posix_cache + "/loose.gguf", "kind": "gguf", "source": "dir", "repo": None, "quant": "Q8_0",
-             "file": "loose.gguf", "path": posix_cache + "/loose.gguf",
+             "file": "loose.gguf", "path": posix_cache + "/loose.gguf", "root": posix_cache,
              "size": int(2.1 * GB), "modified": 1.7e9, "revision": None, "current": True, "mtp": None},
             {"name": "/Models/Upper-7B.gguf", "kind": "gguf", "source": "dir", "repo": None, "quant": "Q4_K_M",
-             "file": "Upper-7B.gguf", "path": "/Models/Upper-7B.gguf",
+             "file": "Upper-7B.gguf", "path": "/Models/Upper-7B.gguf", "root": "/Models",
              "size": int(4.1 * GB), "modified": 1.7e9, "revision": None, "current": True, "mtp": None},
             {"name": "/models/lower-7B.gguf", "kind": "gguf", "source": "dir", "repo": None, "quant": "Q4_K_M",
-             "file": "lower-7B.gguf", "path": "/models/lower-7B.gguf",
+             "file": "lower-7B.gguf", "path": "/models/lower-7B.gguf", "root": "/models",
              "size": int(4.2 * GB), "modified": 1.7e9, "revision": None, "current": True, "mtp": None},
             {"name": "/root-model.gguf", "kind": "gguf", "source": "dir", "repo": None, "quant": "Q4_K_M",
-             "file": "root-model.gguf", "path": "/root-model.gguf",
+             "file": "root-model.gguf", "path": "/root-model.gguf", "root": "/",
              "size": int(3.0 * GB), "modified": 1.7e9, "revision": None, "current": True, "mtp": None},
         ],
     }

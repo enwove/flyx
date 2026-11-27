@@ -493,13 +493,17 @@ int run(int argc, char** argv) {
   start_from.mmproj_file.clear();    // likewise: a model named on the page names its own vision projector
   start_from.lora_file.clear();     // and the command line's LoRA adapter is its model's, not another's
   Server srv{&models, cfg, start_from, os::unix_seconds(), {}};
-  init_listener_identity(&srv, bound_host, port);
+  srv.listener = make_listen_config(bound_host, port, args.host ? std::string_view(*args.host) : std::string_view{});
   RequestLog requests(args.request_log);
   srv.requests = &requests;
   srv.logs = args.system_log ? &system_log : nullptr;
-  srv.models_dirs = args.models_dirs;
-  srv.remote_manage.store(args.no_auth || (cfg.api_key.empty() && ModelHost::remote_manage()),
-                          std::memory_order_release);
+  for (const std::string& d : args.models_dirs) {
+    const std::string canon = apps::canonical_model_dir(d);
+    if (!canon.empty() && std::find(srv.models_dirs.begin(), srv.models_dirs.end(), canon) == srv.models_dirs.end())
+      srv.models_dirs.push_back(canon);
+  }
+  srv.lan_manage.from_cli = args.no_auth;
+  srv.lan_manage.saved.store(ModelHost::remote_manage(), std::memory_order_release);
   // The model named here loads now, before the server listens; without one, the last one served loads once it
   // listens (the page shows it coming), or the server waits for the page to name one.
   ModelHost::Want later;
@@ -534,6 +538,7 @@ int run(int argc, char** argv) {
       srv.device_probe = {{"name", info.name}, {"mem_total", info.mem_total ? ojson(info.mem_total) : ojson(nullptr)},
                           {"mem_used", info.mem_total ? ojson(info.mem_total - info.mem_free) : ojson(nullptr)},
                           {"backend", backend}};
+      srv.device_reserve_floor = info.reserve_floor;
       if (info.mem_total) srv.probe_mem_used.store(info.mem_total - info.mem_free, std::memory_order_relaxed);
       if (!remembered)
         std::fprintf(stderr, "flyx-server: %s (%s), %.1f GB free\n", info.name, backend.c_str(), info.mem_free / 1e9);
@@ -554,7 +559,7 @@ int run(int argc, char** argv) {
   add_openai_responses_routes(http, &srv);
   add_telemetry_routes(http, &srv);
   add_manage_routes(http, &srv);
-  add_network_routes(http, &srv, bound_host, port, args.host.has_value(), args.no_auth);
+  add_network_routes(http, &srv, args.host.has_value());
   add_request_log_routes(http, &srv);
   add_system_log_routes(http, &srv);
 
@@ -562,7 +567,7 @@ int run(int argc, char** argv) {
   std::signal(SIGTERM, on_signal);
   std::fprintf(stderr, "flyx-server: listening on http://%s:%d, the dashboard at %s\n", host.c_str(), port,
                view.page.c_str());
-  if (srv.serving_lan && srv.remote_manage.load(std::memory_order_acquire) && cfg.api_key.empty())
+  if (srv.lan_manage.effective(srv.listener, !cfg.api_key.empty()))
     std::fprintf(stderr,
                  "flyx-server: warning: LAN management without an API key is enabled (%s): anyone on this network can "
                  "load or delete cached models, browse folders, and view logs or requests\n",

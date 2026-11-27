@@ -56,14 +56,11 @@ bool engine_flag(const std::string& a, const std::function<std::string()>& value
   } else if (a == "--kv-copy-gpu") {
     eo->kv_copy_gpu = whole_flag("--kv-copy-gpu", value(), 0, INT_MAX);
   } else if (a == "--kv-ram") {
-    const std::string v = value();
-    eo->kv_ram = v == "auto" ? -1 : int64_t(number_flag("--kv-ram", v, 0, kMaxKvRamGb) * 1e9);
+    eo->kv_ram = gb_or_auto_flag("--kv-ram", value());
   } else if (a == "--vram-reserve") {
-    const std::string v = value();
-    eo->vram_reserve = v == "auto" ? -1 : int64_t(number_flag("--vram-reserve", v, 0, kMaxKvRamGb) * 1e9);
+    eo->vram_reserve = gb_or_auto_flag("--vram-reserve", value());
   } else if (a == "--ram-reserve") {
-    const std::string v = value();
-    eo->ram_reserve = v == "auto" ? -1 : int64_t(number_flag("--ram-reserve", v, 0, kMaxKvRamGb) * 1e9);
+    eo->ram_reserve = gb_or_auto_flag("--ram-reserve", value());
   } else if (a == "--kv-method") {
     const std::string v = value();
     interfaces::KvMethodSpec spec;

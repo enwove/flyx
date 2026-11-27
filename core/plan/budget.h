@@ -29,6 +29,7 @@ struct Budget {
   Lease weights, workspace;
   uint64_t session_bytes = 0;  // one session's device memory at the engine's context
   uint64_t sessions_room = 0;  // of the budget after the weights and the workspace: what the sessions share
+  uint64_t device_reserve = 0;  // effective device VRAM reserve held back outside the ledger
   GpuHeld held;
   CtxLimit ctx_limit = CtxLimit::kNone;
   uint64_t ctx_need_more = 0;  // extra bytes on ctx_limit's side needed to reach the wanted context (0: unknown/none)
@@ -56,7 +57,7 @@ struct KvTiers {
   int copy_gpu = -1;
   uint64_t reserved = 0;
   int64_t vram_reserve = -1;
-  uint64_t min_vram_reserve = 0;  // platform floor enforced even when vram_reserve >= 0 (os::gpu_memory_floor)
+  uint64_t min_vram_reserve = 0;  // floor enforced even when vram_reserve >= 0 (backend reserve_floor)
   int64_t ram_reserve = -1;
   int method = FLYX_KV_READ_ALL, method_arg = 0;  // how rounds read the K/V (flyx_seq_layout)
   bool gpu_paged = false;  // Windows pages the GPU's memory unseen (os::gpu_memory_paged, WSL2): reserve 832 MiB

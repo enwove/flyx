@@ -29,157 +29,233 @@ httplib::Request make_req(const std::string& remote_addr, const std::string& loc
 
 void test_dns_rebinding_and_lan_hosts() {
   Server s{};
-  s.serving_lan = true;
-  s.listen_host = "0.0.0.0";
-  s.listen_port = 8080;
-  s.allowed_hosts = {"192.168.1.50", "myhost", "myhost.local"};
-  s.remote_manage.store(true);
+  s.listener.lan = true;
+  s.listener.host = "0.0.0.0";
+  s.listener.port = 8080;
+  s.listener.accepted_hosts = {"192.168.1.50", "myhost", "myhost.local", "workstation.lan"};
+  s.lan_manage.saved.store(true);
 
   // Legitimate LAN client hitting the socket's local address or a known hostname: allowed.
   {
     auto req = make_req("192.168.1.99", "192.168.1.50", 8080, "192.168.1.50:8080", "http://192.168.1.50:8080",
                         "same-origin");
     check(browser_request_safe(s, req), "same-origin LAN IP:port passes browser_request_safe");
+    check(has_access(s, req, Access::kManage), "same-origin LAN IP:port passes kManage");
   }
   {
     auto req = make_req("192.168.1.99", "192.168.1.50", 8080, "MyHost.local:8080", "http://myhost.local:8080",
                         "same-origin");
     check(browser_request_safe(s, req), "same-origin LAN hostname.local:port passes browser_request_safe");
+    check(has_access(s, req, Access::kManage), "same-origin LAN hostname.local:port passes kManage");
+  }
+  {
+    // Explicit --host hostname alias (accepted_hosts) works for keyless LAN management.
+    auto req = make_req("192.168.1.99", "192.168.1.50", 8080, "workstation.lan:8080", "http://workstation.lan:8080",
+                        "same-origin");
+    check(has_access(s, req, Access::kManage), "configured --host alias passes keyless LAN kManage");
   }
   {
     // Dynamic VPN/Tailscale IP not present at startup still matches req.local_addr from getsockname().
     auto req = make_req("100.64.0.2", "100.64.0.1", 8080, "100.64.0.1:8080", "http://100.64.0.1:8080", "same-origin");
     check(browser_request_safe(s, req), "dynamic socket local_addr passes browser_request_safe");
+    check(has_access(s, req, Access::kManage), "dynamic socket local_addr passes kManage");
   }
   {
     // IPv4-mapped IPv6 socket address (::ffff:192.168.1.50) matches IPv4 Host literal.
     auto req = make_req("::ffff:192.168.1.99", "::ffff:192.168.1.50", 8080, "192.168.1.50:8080");
     check(browser_request_safe(s, req), "IPv4-mapped IPv6 local_addr matches IPv4 Host");
+    check(has_access(s, req, Access::kManage), "IPv4-mapped IPv6 local_addr passes kManage");
   }
   {
-    // DNS rebinding: attacker domain resolves to LAN IP, sends matching Host + Origin + Sec-Fetch-Site: same-origin.
+    // Non-browser LAN inference clients (Docker port mapping, custom DNS, HTTP/1.0 missing Host) are NOT blocked by
+    // browser_request_safe(), while keyless LAN management still refuses unrecognized/missing Host headers!
+    auto docker_infer = make_req("192.168.1.99", "192.168.1.50", 8080, "llm.tailnet.ts.net:18080");
+    docker_infer.path = "/v1/chat/completions";
+    check(browser_request_safe(s, docker_infer),
+          "non-browser LAN inference with Docker/Tailscale Host passes browser_request_safe");
+    check(!has_access(s, docker_infer, Access::kManage),
+          "unrecognized Host is refused by keyless LAN kManage");
+
+    auto http10 = make_req("192.168.1.99", "192.168.1.50", 8080, "");
+    http10.path = "/v1/models";
+    check(browser_request_safe(s, http10), "non-browser HTTP/1.0 LAN inference without Host passes browser_request_safe");
+    check(!has_access(s, http10, Access::kManage), "missing Host header is refused by keyless LAN kManage");
+  }
+  {
+    // DNS rebinding on keyless LAN management: attacker domain resolves to LAN IP with matching Origin/Sec-Fetch-Site.
     auto req = make_req("192.168.1.99", "192.168.1.50", 8080, "evil.example:8080", "http://evil.example:8080",
                         "same-origin");
-    check(!browser_request_safe(s, req), "DNS rebinding attacker Host is refused on keyless LAN");
+    check(!has_access(s, req, Access::kManage), "DNS rebinding attacker Host is refused on keyless LAN kManage");
   }
   {
-    // Wrong port in Host is refused.
+    // Wrong port in Host is refused on keyless LAN management.
     auto req = make_req("192.168.1.99", "192.168.1.50", 8080, "192.168.1.50:9999");
-    check(!browser_request_safe(s, req), "mismatched port in Host is refused on keyless LAN");
+    check(!has_access(s, req, Access::kManage), "mismatched port in Host is refused on keyless LAN kManage");
   }
   {
-    // Missing Host header on non-loopback keyless request is refused.
-    auto req = make_req("192.168.1.99", "192.168.1.50", 8080, "");
-    check(!browser_request_safe(s, req), "missing Host header is refused on keyless LAN");
+    // Loopback listener DNS rebinding: browser_request_safe rejects non-loopback Host on loopback listeners.
+    Server loop_s{};
+    loop_s.listener.lan = false;
+    loop_s.listener.host = "127.0.0.1";
+    loop_s.listener.port = 8080;
+    auto rebind = make_req("127.0.0.1", "127.0.0.1", 8080, "evil.example:8080", "http://evil.example:8080",
+                           "same-origin");
+    check(!browser_request_safe(loop_s, rebind), "loopback DNS rebinding Host is refused by browser_request_safe");
+    auto good = make_req("127.0.0.1", "127.0.0.1", 8080, "localhost:8080", "http://localhost:8080", "same-origin");
+    check(browser_request_safe(loop_s, good), "loopback localhost Host passes browser_request_safe");
   }
   {
     // With API key configured, custom reverse-proxy Host domain is permitted (key protects the endpoint).
     Server keyed{};
     keyed.cfg.api_key = "secret";
-    keyed.serving_lan = true;
-    keyed.listen_port = 8080;
+    keyed.listener.lan = true;
+    keyed.listener.port = 8080;
     auto req = make_req("192.168.1.99", "192.168.1.50", 8080, "llm.corp.example:8080");
     check(browser_request_safe(keyed, req), "custom domain Host is allowed when --api-key is set");
   }
 }
 
 void test_forwarded_and_management_policy() {
-  // Saved remote_manage=true on a loopback-only server (serving_lan=false) must NOT unlock forwarded or remote calls.
+  // Saved remote_manage=true on a loopback-only server (listener.lan=false) must NOT unlock forwarded or remote calls.
   {
     Server s{};
-    s.serving_lan = false;
-    s.listen_host = "127.0.0.1";
-    s.listen_port = 8080;
-    s.remote_manage.store(true);
+    s.listener.lan = false;
+    s.listener.host = "127.0.0.1";
+    s.listener.port = 8080;
+    s.lan_manage.saved.store(true);
 
     auto direct_loop = make_req("127.0.0.1", "127.0.0.1", 8080, "127.0.0.1:8080");
-    check(may_manage(s, direct_loop), "direct loopback may manage");
-    check(may_manage_local_or_keyed(s, direct_loop), "direct loopback may call local-or-keyed endpoints");
+    check(has_access(s, direct_loop, Access::kManage), "direct loopback has kManage");
+    check(has_access(s, direct_loop, Access::kLocalOrKeyed), "direct loopback has kLocalOrKeyed");
+    check(has_access(s, direct_loop, Access::kLocalOnly), "direct loopback has kLocalOnly");
 
     for (const auto& [hdr, val] : std::vector<std::pair<std::string, std::string>>{
-             {"X-Forwarded-For", "192.0.2.2"}, {"Forwarded", "for=192.0.2.2"}, {"Via", "1.1 proxy"},
-             {"X-Real-IP", "192.0.2.2"}}) {
+             {"X-Forwarded-For", "192.0.2.2"}, {"X-Forwarded-Port", "443"}, {"X-Forwarded-Custom", "1"},
+             {"Forwarded", "for=192.0.2.2"}, {"Via", "1.1 proxy"}, {"X-Real-IP", "192.0.2.2"},
+             {"CF-Connecting-IP", "198.51.100.1"}, {"True-Client-IP", "198.51.100.2"}}) {
       auto fwd = make_req("127.0.0.1", "127.0.0.1", 8080, "127.0.0.1:8080");
       fwd.set_header(hdr, val);
-      check(!may_manage(s, fwd), "loopback + " + hdr + " is denied even with saved remote_manage=true");
-      check(!may_manage_local_or_keyed(s, fwd), "local-or-keyed denies " + hdr + " without API key");
+      check(!has_access(s, fwd, Access::kManage), "loopback + " + hdr + " denied kManage even with saved remote_manage");
+      check(!has_access(s, fwd, Access::kLocalOrKeyed), "loopback + " + hdr + " denied kLocalOrKeyed without API key");
+      check(!has_access(s, fwd, Access::kLocalOnly), "loopback + " + hdr + " denied kLocalOnly");
     }
 
     auto non_loop = make_req("192.168.1.99", "192.168.1.50", 8080, "192.168.1.50:8080");
-    check(!may_manage(s, non_loop), "non-loopback peer is denied when serving_lan=false");
+    check(!has_access(s, non_loop, Access::kManage), "non-loopback peer is denied when listener.lan=false");
   }
 
-  // On a LAN server with remote_manage=true (or --no-auth): direct LAN may manage, forwarded LAN is denied,
-  // and local-or-keyed (POST /v1/hub/config) still denies keyless LAN!
+  // On a LAN server with remote_manage=true (or --no-auth): direct LAN gets kManage, forwarded LAN is denied,
+  // kLocalOrKeyed (POST /v1/hub/config) and kLocalOnly deny keyless LAN.
   {
     Server s{};
-    s.serving_lan = true;
-    s.listen_host = "0.0.0.0";
-    s.listen_port = 8080;
-    s.remote_manage.store(true);
+    s.listener.lan = true;
+    s.listener.host = "0.0.0.0";
+    s.listener.port = 8080;
+    s.lan_manage.saved.store(true);
 
     auto lan = make_req("192.168.1.99", "192.168.1.50", 8080, "192.168.1.50:8080");
-    check(may_manage(s, lan), "direct LAN client may manage when serving_lan && remote_manage");
-    check(!may_manage_local_or_keyed(s, lan), "keyless LAN client is denied local-or-keyed POST /v1/hub/config");
+    check(has_access(s, lan, Access::kManage), "direct LAN client has kManage when lan && remote_manage");
+    check(!has_access(s, lan, Access::kLocalOrKeyed), "keyless LAN client denied kLocalOrKeyed (POST /v1/hub/config)");
+    check(!has_access(s, lan, Access::kLocalOnly), "keyless LAN client denied kLocalOnly");
 
-    auto lan_fwd = make_req("192.168.1.99", "192.168.1.50", 8080, "192.168.1.50:8080");
-    lan_fwd.set_header("X-Forwarded-For", "198.51.100.7");
-    check(!may_manage(s, lan_fwd), "forwarded LAN request is denied without --api-key even when remote_manage=true");
+    for (const auto& [hdr, val] : std::vector<std::pair<std::string, std::string>>{
+             {"X-Forwarded-For", "198.51.100.7"}, {"X-Forwarded-Custom", "yes"},
+             {"CF-Connecting-IP", "198.51.100.9"}}) {
+      auto lan_fwd = make_req("192.168.1.99", "192.168.1.50", 8080, "192.168.1.50:8080");
+      lan_fwd.set_header(hdr, val);
+      check(!has_access(s, lan_fwd, Access::kManage),
+            "forwarded LAN request (" + hdr + ") denied without --api-key even when remote_manage=true");
+    }
 
     auto loop_fwd = make_req("127.0.0.1", "127.0.0.1", 8080, "127.0.0.1:8080");
     loop_fwd.set_header("Forwarded", "for=198.51.100.7");
-    check(!may_manage(s, loop_fwd), "forwarded loopback request is denied without --api-key even on LAN listener");
+    check(!has_access(s, loop_fwd, Access::kManage), "forwarded loopback request denied without --api-key on LAN");
   }
 
-  // With --api-key, valid Bearer key unlocks both may_manage and may_manage_local_or_keyed (including behind a proxy).
+  // With --api-key, valid Bearer key unlocks kManage and kLocalOrKeyed (even behind a proxy), but NOT kLocalOnly.
   {
     Server s{};
     s.cfg.api_key = "topsecret";
-    s.serving_lan = true;
-    s.listen_port = 8080;
+    s.listener.lan = true;
+    s.listener.port = 8080;
     auto proxied = make_req("127.0.0.1", "127.0.0.1", 8080, "llm.example.com");
     proxied.set_header("X-Forwarded-For", "198.51.100.7");
-    check(!may_manage(s, proxied), "proxied request without key is denied");
+    check(!has_access(s, proxied, Access::kManage), "proxied request without key is denied");
     proxied.set_header("Authorization", "Bearer topsecret");
-    check(may_manage(s, proxied), "proxied request with valid API key may manage");
-    check(may_manage_local_or_keyed(s, proxied), "proxied request with valid API key may call POST /v1/hub/config");
+    check(has_access(s, proxied, Access::kManage), "proxied request with valid API key has kManage");
+    check(has_access(s, proxied, Access::kLocalOrKeyed), "proxied request with valid API key has kLocalOrKeyed");
+    check(!has_access(s, proxied, Access::kLocalOnly), "proxied request even with API key is denied kLocalOnly");
   }
 }
 
 void test_remote_unc_and_device_paths() {
   Server s{};
-  s.serving_lan = true;
-  s.listen_port = 8080;
-  s.models_dirs = {R"(\\nas\models)", R"(/mnt/local)"};
+  s.listener.lan = true;
+  s.listener.port = 8080;
+  s.models_dirs = {R"(\\nas\models)", R"(Z:\approved)", R"(/mnt/local)"};
 
   auto loop = make_req("127.0.0.1", "127.0.0.1", 8080, "127.0.0.1:8080");
   auto lan = make_req("192.168.1.99", "192.168.1.50", 8080, "192.168.1.50:8080");
   auto fwd = make_req("127.0.0.1", "127.0.0.1", 8080, "127.0.0.1:8080");
   fwd.set_header("X-Forwarded-For", "192.0.2.2");
 
+  // POSIX mode (windows_paths = false): repeated leading slashes are ordinary local POSIX paths, not Windows UNC.
+  check(!is_unc_or_device_path("///mnt/models", /*windows_paths=*/false),
+        "POSIX mode does not classify ///mnt/models as Windows UNC");
+  check(!is_unc_or_device_path("//mnt/models", /*windows_paths=*/false),
+        "POSIX mode does not classify //mnt/models as Windows UNC");
+  check(remote_path_allowed(s, lan, "///mnt/models", /*windows_paths=*/false),
+        "POSIX mode allows ///mnt/models for remote requests");
+
+  // Windows mode (windows_paths = true): UNC and Win32 device prefixes are detected and blocked for remote callers.
   for (const char* p : {R"(\\attacker\share\x.gguf)", "//attacker/share/x.gguf", R"(\/attacker/share)",
                         R"(/\attacker\share)", R"(\\?\C:\Windows\System32)", R"(\\.\pipe\test)",
                         R"(\\?\UNC\nas\models\a.gguf)"}) {
-    check(is_unc_or_device_path(p), std::string("is_unc_or_device_path detects ") + p);
-    check(remote_path_allowed(s, loop, p), std::string("direct loopback allows ") + p);
-    check(!remote_path_allowed(s, lan, p), std::string("remote LAN blocks ") + p);
-    check(!remote_path_allowed(s, fwd, p), std::string("forwarded request blocks ") + p);
+    check(is_unc_or_device_path(p, /*windows_paths=*/true), std::string("is_unc_or_device_path detects ") + p);
+    check(remote_path_allowed(s, loop, p, /*windows_paths=*/true), std::string("direct loopback allows ") + p);
+    check(!remote_path_allowed(s, lan, p, /*windows_paths=*/true), std::string("remote LAN blocks ") + p);
+    check(!remote_path_allowed(s, fwd, p, /*windows_paths=*/true), std::string("forwarded request blocks ") + p);
   }
 
   // Operator-configured UNC root in models_dirs allows strictly contained paths, blocks traversal out of it.
-  check(remote_path_allowed(s, lan, R"(\\NAS\Models\sub\tiny.gguf)"),
+  check(remote_path_allowed(s, lan, R"(\\NAS\Models\sub\tiny.gguf)", /*windows_paths=*/true),
         "remote LAN allows UNC path lexically inside configured --models-dir UNC root");
-  check(remote_path_allowed(s, lan, "//nas/models/sub/tiny.gguf"),
+  check(remote_path_allowed(s, lan, "//nas/models/sub/tiny.gguf", /*windows_paths=*/true),
         "remote LAN allows forward-slash UNC path inside configured --models-dir UNC root");
-  check(!remote_path_allowed(s, lan, R"(\\nas\models\..\secret\a.gguf)"),
+  check(!remote_path_allowed(s, lan, R"(\\nas\models\..\secret\a.gguf)", /*windows_paths=*/true),
         "remote LAN blocks UNC path traversing above configured --models-dir UNC root");
-  check(!remote_path_allowed(s, lan, R"(\\nas\models2\a.gguf)"),
+  check(!remote_path_allowed(s, lan, R"(\\nas\models2\a.gguf)", /*windows_paths=*/true),
         "remote LAN blocks sibling UNC share sharing prefix with configured root");
+
+  // Windows mapped network drive (DRIVE_REMOTE) and reparse points pointing to UNC / remote drives (tested via probe).
+  PathSafetyProbe probe;
+  probe.is_remote_drive = [](char drive) { return drive == 'Z' || drive == 'z' || drive == 'Y' || drive == 'y'; };
+  probe.reparse_target = [](std::string_view p) -> std::optional<std::string> {
+    if (p == R"(C:\links\to_unc)" || p == "C:/links/to_unc") return R"(\\attacker\share)";
+    if (p == R"(C:\links\to_mapped)") return R"(Y:\models)";
+    if (p == R"(C:\links\to_local)") return R"(D:\local\models)";
+    return std::nullopt;
+  };
+  check(!remote_path_allowed(s, lan, R"(Y:\secret\a.gguf)", true, &probe),
+        "remote LAN blocks unconfigured mapped network drive (DRIVE_REMOTE)");
+  check(remote_path_allowed(s, loop, R"(Y:\secret\a.gguf)", true, &probe),
+        "direct loopback allows mapped network drive");
+  check(remote_path_allowed(s, lan, R"(Z:\approved\sub\m.gguf)", true, &probe),
+        "remote LAN allows mapped network drive explicitly configured in --models-dir");
+  check(!remote_path_allowed(s, lan, R"(Z:\other\m.gguf)", true, &probe),
+        "remote LAN blocks sibling path on mapped drive outside --models-dir");
+  check(!remote_path_allowed(s, lan, R"(C:\links\to_unc\a.gguf)", true, &probe),
+        "remote LAN blocks local path traversing reparse point targeting UNC share");
+  check(!remote_path_allowed(s, lan, R"(C:\links\to_mapped\a.gguf)", true, &probe),
+        "remote LAN blocks local path traversing reparse point targeting mapped remote drive");
+  check(remote_path_allowed(s, lan, R"(C:\links\to_local\a.gguf)", true, &probe),
+        "remote LAN allows local reparse point targeting local drive");
 
   // Regular local paths and Hub names are unaffected.
   for (const char* ok_path : {"", "org/model-GGUF:Q4_K_M", "/mnt/local/a.gguf", R"(C:\models\a.gguf)"}) {
-    check(!is_unc_or_device_path(ok_path), std::string("not UNC/device: ") + ok_path);
-    check(remote_path_allowed(s, lan, ok_path), std::string("remote LAN allows non-UNC path: ") + ok_path);
+    check(!is_unc_or_device_path(ok_path, /*windows_paths=*/true), std::string("not UNC/device: ") + ok_path);
+    check(remote_path_allowed(s, lan, ok_path, /*windows_paths=*/true, &probe),
+          std::string("remote LAN allows non-UNC local path: ") + ok_path);
   }
 }
 

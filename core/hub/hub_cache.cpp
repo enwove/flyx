@@ -105,8 +105,6 @@ std::vector<std::string> auth_headers(const ResolvedSetting& ep) {
   return t.empty() ? std::vector<std::string>{} : std::vector<std::string>{"Authorization: Bearer " + t};
 }
 
-std::vector<std::string> auth_headers() { return auth_headers(resolve_endpoint()); }
-
 fs::path repo_dir(const std::string& repo) {
   const size_t slash = repo.find('/');
   return to_path(cache_dir()) / to_path("models--" + repo.substr(0, slash) + "--" + repo.substr(slash + 1));

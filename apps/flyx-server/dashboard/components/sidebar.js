@@ -5,7 +5,7 @@ import { t } from "../lib/i18n.js";
 import { fmt, gib, ktok, secs, level, shortDevice, short } from "../lib/format.js";
 import { Icon, Meter, MemBar, Val } from "../lib/ui.js";
 import { Spark } from "../lib/charts.js";
-import { live, phaseOf, phaseNames, ttftSeconds, prefillRate, memoryOf } from "../lib/telemetry.js";
+import { live, phaseOf, phaseNames, ttftSeconds, speeds, memoryOf } from "../lib/telemetry.js";
 
 export const PAGES = [
   ["overview", "Overview", "overview"], ["model", "Model", "model"], ["requests", "Requests", "requests"],
@@ -16,10 +16,9 @@ export const PAGES = [
 // The figures both views show, from the last telemetry.
 function figures(tm) {
   const model = tm.model || {}, state = tm.state || {}, d = tm.device, recent = tm.recent || [];
-  const phase = phaseOf(tm), busy = phase === "decode" || phase === "prefill", decoding = phase === "decode", prefilling = phase === "prefill";
+  const phase = phaseOf(tm), busy = phase === "decode" || phase === "prefill", decoding = phase === "decode";
   const lastReq = recent[0] || {};
-  const decode = decoding ? tm.rates.decode_tok_s : lastReq.decode_tok_s;
-  const prefill = busy ? state.prefill_tok_s : prefillRate(lastReq);
+  const sp = speeds(tm, phase, recent);
   const tpr = decoding ? (Number.isFinite(tm.rates && tm.rates.tokens_per_round) && tm.rates.tokens_per_round > 0
                           ? tm.rates.tokens_per_round : state.tokens_per_round)
                        : lastReq.tokens_per_round;
@@ -36,18 +35,19 @@ function figures(tm) {
   // part (both of all the processors).
   const sys = tm.system || {}, { vram, ram } = memoryOf(tm);
   const cpu = { all: tm._sys_cpu === undefined ? null : tm._sys_cpu, own: tm._cpu === undefined || !sys.cpus ? null : tm._cpu / sys.cpus };
-  return { model, state, d, recent, phase, busy, decoding, prefilling, lastReq, decode, prefill, tpr, ttft, used, vram, ram, cpu,
+  return { model, state, d, recent, phase, busy, lastReq, decode: sp.decode, prefill: sp.prefill,
+           decodeWhen: sp.decodeWhen, prefillWhen: sp.prefillWhen, tpr, ttft, used, vram, ram, cpu,
            ops: (tm.rates && tm.rates.output_per_second) || [] };
 }
 
 function LiveCard({ f, tm, onOpenMem }) {
-  const { model, state, d, recent, decoding, prefilling, lastReq, decode, prefill, tpr, ttft, used, vram, ram, cpu } = f;
+  const { model, state, d, recent, lastReq, decode, prefill, decodeWhen, prefillWhen, tpr, ttft, used, vram, ram, cpu } = f;
   const fresh = (lastReq.prompt_tokens || 0) - (lastReq.reused_tokens || 0);
   const pct = (v) => fmt(v, v < 10 ? 1 : 0) + "%";
   const vramAct = !!(vram && onOpenMem), ramAct = !!(ram && onOpenMem);
   const keyFor = (kind) => (e) => { if (e.key === "Enter" || e.key === " ") { e.preventDefault(); onOpenMem(kind); } };
-  const decodeSub = decoding ? t("now") : recent.length ? t("last request") : "";
-  const prefillSub = prefilling ? t("now") : decoding ? t("this request") : recent.length ? t("last request") : "";
+  const decodeSub = decodeWhen ? t(decodeWhen) : "";
+  const prefillSub = prefillWhen ? t(prefillWhen) : "";
   return html`
     <div class="live" id="live" aria-live="off">
       <div class="live-head"><span class="caps">${t("Live")}</span></div>

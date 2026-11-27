@@ -14,6 +14,17 @@ export function prefillRate(r) {
 export const cacheHit = (r) => r.prompt_tokens > 0 ? Math.min(1, (r.reused_tokens || 0) / r.prompt_tokens) * 100 : null;
 // Of the drafts rounds verified, the share accepted, in percent; null where none were drafted.
 export const acceptance = (accepted, drafted) => drafted > 0 ? Math.min(1, (accepted || 0) / drafted) * 100 : null;
+// Decode and prefill throughput figures: of now, of the running request, or of the last finished request.
+export function speeds(tm, phase, recent) {
+  const state = tm.state || {}, rates = tm.rates || {}, last = recent[0] || {};
+  const decoding = phase === "decode", prefilling = phase === "prefill", running = decoding || prefilling;
+  return {
+    decode: decoding ? rates.decode_tok_s : last.decode_tok_s,
+    prefill: running ? state.prefill_tok_s : prefillRate(last),
+    decodeWhen: decoding ? "now" : recent.length ? "last request" : "",
+    prefillWhen: prefilling ? "now" : decoding ? "this request" : recent.length ? "last request" : "",
+  };
+}
 
 // The GPU's and the host's memory: all in use, flyx's part of it, the rest (other programs, the system), and the
 // whole; null without figures.  flyx's GPU part is its engine's ledger and, where the system counts a process's

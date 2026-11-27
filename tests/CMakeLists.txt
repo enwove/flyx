@@ -300,6 +300,7 @@ flyx_add_unit_test(scheduler_test core/exec/scheduler_test.cpp flyx-test-host-kv
 flyx_add_unit_test(model_host_test apps/flyx-server/model_host_test.cpp flyx-test-host-kv)
 target_sources(model_host_test PRIVATE ${CMAKE_SOURCE_DIR}/apps/flyx-server/model_host.cpp
                                        ${CMAKE_SOURCE_DIR}/apps/common/model_source.cpp
+                                       ${CMAKE_SOURCE_DIR}/apps/common/numbers.cpp
                                        ${CMAKE_SOURCE_DIR}/apps/flyx-server/drafter_speeds.cpp)
 add_dependencies(model_host_test flyx-cpu_ref)
 

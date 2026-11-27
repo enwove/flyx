@@ -119,10 +119,6 @@ double system_cpu_seconds();
 // backend reads NVML's free memory there and refuses an allocation that would leave less than Windows keeps free for
 // one of its size (backends/cuda: device_room), so the budget keeps its usual reserve.
 bool gpu_memory_paged();
-// Minimum VRAM reserve the OS/backend enforces even when the caller asks for less (e.g. --vram-reserve 0): 0 on POSIX
-// (Linux and WSL2), 256 MiB on native Windows where backends/cuda's device_room() keeps a WDDM pieces floor so sessions
-// planned by the budget do not immediately fail allocation.
-uint64_t gpu_memory_floor();
 // Gives back the pages the process holds without needing them locked: on Windows its working set, so that the file
 // pages a load read count as available again (they stay cached; page-locked memory stays); elsewhere nothing (the
 // kernel counts clean file pages as available already).

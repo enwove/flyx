@@ -31,7 +31,7 @@ bool http_get(const HttpGet& req, const HttpBody& body, int* status, std::string
 // A client that keeps its connections from one request to the next: one for each thread that makes many requests
 // (a download's connections: a new TLS connection a request was most of a small piece's time).  http_get uses one
 // once.  *final_url, when asked for: where the redirects led.  *link_header, when asked for: the final response's
-// Link header (RFC 8288), empty when absent.
+// Link header (RFC 8288), empty when absent.  *retry_after, when asked for: the final response's Retry-After header.
 class HttpClient {
  public:
   HttpClient() = default;
@@ -39,7 +39,7 @@ class HttpClient {
   HttpClient(const HttpClient&) = delete;
   HttpClient& operator=(const HttpClient&) = delete;
   bool get(const HttpGet& req, const HttpBody& body, int* status, std::string* err, std::string* final_url = nullptr,
-           std::string* link_header = nullptr);
+           std::string* link_header = nullptr, std::string* retry_after = nullptr);
 
  private:
   void* handle_ = nullptr;  // libcurl's easy handle; WinHTTP's session
@@ -47,7 +47,7 @@ class HttpClient {
 
 // The whole body as text (API answers), at most `limit` bytes.
 bool http_get_text(const HttpGet& req, std::string* out, int* status, std::string* err, size_t limit = 64u << 20,
-                   std::string* link_header = nullptr);
+                   std::string* link_header = nullptr, std::string* retry_after = nullptr);
 
 // The User-Agent requests carry: the program and its version, nothing about the user or the machine.
 const char* http_user_agent();

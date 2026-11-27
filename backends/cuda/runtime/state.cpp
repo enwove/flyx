@@ -560,14 +560,13 @@ int seq_size(flyx_bmodel* m, const flyx_seq_layout* layout, flyx_seq_size* out) 
     return fail(e.what());
   }
   *out = {};
-  // The arena's bytes as it carves them: the rest of its last piece of the granularity, which its pieces map whole (as
-  // one cudaMalloc takes its pages), is left to the reserve, at most one piece a session.
-  out->device = s.dry_bytes + s.page_spill_vram + room;
-#if defined(_WIN32)
-  // Without pieces the arena is one cudaMalloc, which leaves kPagedFloor free (device_malloc), not the floor of pieces
-  // the budget's reserve is past (plan/budget.cpp): the session holds the difference.
-  if (!vmm_supported() && s.arena_dev_bytes) out->device += kPagedFloor - kPiecesFloor;
-#endif
+  // Include the VMM granularity rounding of the device arena so --vram-reserve 0 does not undercount the last piece.
+  size_t arena_pad = 0;
+  if (vmm_supported() && s.arena_dev_bytes > 0) {
+    const size_t gran = vmm_granularity();
+    arena_pad = ((s.arena_dev_bytes + gran - 1) / gran) * gran - s.arena_dev_bytes;
+  }
+  out->device = s.dry_bytes + arena_pad + s.page_spill_vram + room;
   out->host = s.dry_host_bytes + s.page_spill_host;
   out->host_mapped = s.dry_mapped_bytes;
   out->device_positions = std::min(s.device_positions, layout->max_ctx);
@@ -595,6 +594,7 @@ int memory(flyx_bmodel* m, flyx_memory_info* out) {
   out->free = fr;
   out->total = tot;
   out->process = gpu_process_memory();
+  out->reserve_floor = device_reserve_floor();
   return 0;
 }
 

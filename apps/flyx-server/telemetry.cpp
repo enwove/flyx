@@ -180,6 +180,13 @@ ojson snapshot_json(const Server& s, int recent) {
     records.push_back(std::move(j));
   }
   const auto& tt = t.totals;
+  ojson device_reserve = nullptr;
+  if (t.loaded) {
+    device_reserve = m.device_reserve;
+  } else if (device.is_object() && device.contains("mem_total") && device["mem_total"].is_number()) {
+    device_reserve = plan::effective_device_reserve(device["mem_total"].get<uint64_t>(), os::gpu_memory_paged(),
+                                                    s.base.vram_reserve, s.device_reserve_floor);
+  }
   return {{"schema_version", 1},
           {"sampled_at", now},
           {"server", {{"name", "flyx-server"}, {"version", apps::kVersion}, {"pid", os::process_id()}, {"started_at", t.started_at},
@@ -195,6 +202,7 @@ ojson snapshot_json(const Server& s, int recent) {
                      {"prefill_per_second", t.prefill_per_second}, {"rounds_per_second", t.rounds_per_second},
                      {"drafted_per_second", t.drafted_per_second}, {"accepted_per_second", t.accepted_per_second}}},
           {"memory", {{"ledger_used", t.ledger_used}, {"ledger_budget", t.loaded ? ojson(m.ledger_budget) : ojson(nullptr)},
+                      {"device_reserve", device_reserve},
                       {"runtime", t.loaded && m.held.runtime_known ? ojson(m.held.runtime) : ojson(nullptr)},
                       {"host_mapped", t.host_mapped},
                       {"sessions", sessions}}},

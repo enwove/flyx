@@ -296,8 +296,6 @@ ProcessUsage process_usage() {
 
 bool gpu_memory_paged() { return false; }  // the CUDA backend keeps Windows' floors itself (os.h)
 
-uint64_t gpu_memory_floor() { return 256ull << 20; }  // matches backends/cuda WDDM kPiecesFloor
-
 SystemMemory system_memory() {
   SystemMemory m;
   MEMORYSTATUSEX s{};

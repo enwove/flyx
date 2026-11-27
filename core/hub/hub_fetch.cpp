@@ -311,6 +311,41 @@ bool gated_field(const nlohmann::json& o) {
   return it != o.end() && (it->is_string() || (it->is_boolean() && it->get<bool>()));
 }
 
+int parse_retry_after_sec(std::string_view raw) {
+  size_t s = 0;
+  while (s < raw.size() && (raw[s] == ' ' || raw[s] == '\t')) ++s;
+  size_t e = raw.size();
+  while (e > s && (raw[e - 1] == ' ' || raw[e - 1] == '\t' || raw[e - 1] == '\r' || raw[e - 1] == '\n')) --e;
+  if (s >= e) return 0;
+  int64_t val = 0;
+  const char* p = raw.data() + s;
+  const char* end = raw.data() + e;
+  for (const char* q = p; q < end; ++q) {
+    if (*q < '0' || *q > '9') return 0;
+    if (val > 86400) {
+      val = 86400;
+      break;
+    }
+    val = val * 10 + (*q - '0');
+  }
+  return val > 0 ? int(std::min<int64_t>(val, 86400)) : 0;
+}
+
+bool set_outcome(HubOutcome* outcome, HubError err, int retry_after_sec = 0) {
+  if (outcome) {
+    outcome->error = err;
+    outcome->retry_after_sec = err == HubError::kRateLimited ? retry_after_sec : 0;
+  }
+  return false;
+}
+
+HubError error_for_status(int status) {
+  if (status == 404) return HubError::kNotFound;
+  if (status == 401 || status == 403) return HubError::kUnauthorized;
+  if (status == 429) return HubError::kRateLimited;
+  return HubError::kUnreachable;
+}
+
 }  // namespace
 
 std::string base_relation(const std::string& repo) {
@@ -327,12 +362,20 @@ std::string base_relation(const std::string& repo) {
   return str_field(j["baseModels"], "relation");
 }
 
-bool describe(const std::string& repo, const std::string& revision, Repo* out, std::string* err) {
-  if (!detail::valid_repo(repo)) return *err = "not a Hub repository name: " + repo, false;
+bool describe(const std::string& repo, const std::string& revision, Repo* out, std::string* err, HubOutcome* outcome) {
+  if (outcome) *outcome = {};
+  if (!detail::valid_repo(repo)) {
+    *err = "not a Hub repository name: " + repo;
+    return set_outcome(outcome, HubError::kInvalidName);
+  }
   Repo r;
   r.id = repo, r.revision = revision.empty() ? "main" : revision;
-  if (!detail::valid_word(r.revision)) return *err = "not a Hub revision name: " + r.revision, false;
-  std::string net;
+  if (!detail::valid_word(r.revision)) {
+    *err = "not a Hub revision name: " + r.revision;
+    return set_outcome(outcome, HubError::kInvalidName);
+  }
+  std::string net, retry_after;
+  int last_status = 0;
   if (!offline()) {
     const auto ep = resolve_endpoint();
     os::HttpGet g;
@@ -340,23 +383,31 @@ bool describe(const std::string& repo, const std::string& revision, Repo* out, s
     g.headers = detail::auth_headers(ep);
     std::string body;
     int status = 0;
-    if (os::http_get_text(g, &body, &status, &net)) {
+    if (os::http_get_text(g, &body, &status, &net, 64u << 20, nullptr, &retry_after)) {
+      last_status = status;
       // A repository the Hub no longer shows this machine (gone, made private, a token expired) is still served
       // from the cache when it has the revision.
       if ((status == 401 || status == 403 || status == 404) && detail::from_cache(repo, r.revision, &r)) {
         *out = std::move(r);
         return true;
       }
-      if (status == 401 || status == 403)  // the Hub answers a name it does not show anyone this way too
-        return *err = repo + ": not on the Hub, or gated or private: check the name; for a gated model accept its "
-                             "terms on huggingface.co, then set HF_TOKEN or run `hf auth login`", false;
-      if (status == 404)
-        return *err = repo + (r.revision == "main" ? "" : "@" + r.revision) +
-                      ": not on the Hub (a typo, or a private repository: set HF_TOKEN)", false;
+      if (status == 401 || status == 403) {  // the Hub answers a name it does not show anyone this way too
+        *err = repo + ": not on the Hub, or gated or private: check the name; for a gated model accept its "
+                      "terms on huggingface.co, then set HF_TOKEN or run `hf auth login`";
+        return set_outcome(outcome, HubError::kUnauthorized);
+      }
+      if (status == 404) {
+        *err = repo + (r.revision == "main" ? "" : "@" + r.revision) +
+               ": not on the Hub (a typo, or a private repository: set HF_TOKEN)";
+        return set_outcome(outcome, HubError::kNotFound);
+      }
       if (status == 200) {
         try {
           const auto j = nlohmann::json::parse(body);
-          if (!j.is_object()) return *err = repo + ": the Hub's answer is not a JSON object", false;
+          if (!j.is_object()) {
+            *err = repo + ": the Hub's answer is not a JSON object";
+            return set_outcome(outcome, HubError::kBadAnswer);
+          }
           r.commit = str_field(j, "sha");
           r.info.downloads = u64_field(j, "downloads"), r.info.likes = u64_field(j, "likes");
           r.info.updated = str_field(j, "lastModified"), r.info.pipeline = str_field(j, "pipeline_tag");
@@ -395,9 +446,13 @@ bool describe(const std::string& repo, const std::string& revision, Repo* out, s
             }
           }
         } catch (const std::exception& e) {
-          return *err = repo + ": the Hub's answer: " + e.what(), false;
+          *err = repo + ": the Hub's answer: " + e.what();
+          return set_outcome(outcome, HubError::kBadAnswer);
         }
-        if (!detail::is_commit(r.commit)) return *err = repo + ": the Hub named no commit", false;
+        if (!detail::is_commit(r.commit)) {
+          *err = repo + ": the Hub named no commit";
+          return set_outcome(outcome, HubError::kBadAnswer);
+        }
         *out = std::move(r);
         return true;
       }
@@ -410,7 +465,8 @@ bool describe(const std::string& repo, const std::string& revision, Repo* out, s
   }
   *err = repo + ": " + (offline() ? std::string("not in the cache (") + cache_dir() + ") and HF_HUB_OFFLINE is set"
                                   : "cannot reach the Hub (" + net + ") and not in the cache (" + cache_dir() + ")");
-  return false;
+  if (last_status == 429) return set_outcome(outcome, HubError::kRateLimited, parse_retry_after_sec(retry_after));
+  return set_outcome(outcome, HubError::kUnreachable);
 }
 
 // Pulls the `cursor` parameter from a Link header entry with rel="next" (RFC 8288), or empty when absent.
@@ -455,10 +511,14 @@ bool found_of(const nlohmann::json& m, Found* f) {
 }  // namespace
 
 bool search(const std::string& query, const std::string& sort, int limit, std::vector<Found>* out, std::string* err,
-            const std::string& cursor, std::string* next_cursor, bool gguf_only) {
+            const std::string& cursor, std::string* next_cursor, bool gguf_only, HubOutcome* outcome) {
   out->clear();
   if (next_cursor) next_cursor->clear();
-  if (offline()) return *err = "HF_HUB_OFFLINE is set: the Hub is not asked", false;
+  if (outcome) *outcome = {};
+  if (offline()) {
+    *err = "HF_HUB_OFFLINE is set: the Hub is not asked";
+    return set_outcome(outcome, HubError::kUnreachable);
+  }
   const char* by = sort == "downloads" ? "downloads" : sort == "likes" ? "likes" : sort == "updated" ? "lastModified"
                  : sort == "created" ? "createdAt" : "trendingScore";
   const auto ep = resolve_endpoint();
@@ -473,13 +533,21 @@ bool search(const std::string& query, const std::string& sort, int limit, std::v
           (cursor.empty() ? "" : "&cursor=" + detail::url_query(cursor));
   g.headers = detail::auth_headers(ep);
   g.connect_timeout_s = 10, g.stall_timeout_s = 20;
-  std::string body, link, net;
+  std::string body, link, net, retry_after;
   int status = 0;
-  if (!os::http_get_text(g, &body, &status, &net, 64u << 20, next_cursor ? &link : nullptr))
-    return *err = "cannot reach the Hub (" + net + ")", false;
-  if (status != 200) return *err = "the Hub answered " + std::to_string(status), false;
+  if (!os::http_get_text(g, &body, &status, &net, 64u << 20, next_cursor ? &link : nullptr, &retry_after)) {
+    *err = "cannot reach the Hub (" + net + ")";
+    return set_outcome(outcome, HubError::kUnreachable);
+  }
+  if (status != 200) {
+    *err = "the Hub answered " + std::to_string(status);
+    return set_outcome(outcome, error_for_status(status), parse_retry_after_sec(retry_after));
+  }
   const auto j = nlohmann::json::parse(body, nullptr, false);
-  if (!j.is_array()) return *err = "the Hub's answer is not a list of repositories", false;
+  if (!j.is_array()) {
+    *err = "the Hub's answer is not a list of repositories";
+    return set_outcome(outcome, HubError::kBadAnswer);
+  }
   for (const auto& m : j) {
     Found f;
     if (!found_of(m, &f)) continue;
@@ -567,11 +635,18 @@ bool safetensors_header(const Repo& r, const RepoFile& f, std::string* header, s
 }
 
 bool adapters_of(const std::string& base, int limit, std::vector<Found>* out, std::string* err,
-                 const std::string& cursor, std::string* next_cursor) {
+                 const std::string& cursor, std::string* next_cursor, HubOutcome* outcome) {
   out->clear();
   if (next_cursor) next_cursor->clear();
-  if (!detail::valid_repo(base)) return *err = "not a Hub repository name: " + base, false;
-  if (offline()) return *err = "HF_HUB_OFFLINE is set: the Hub is not asked", false;
+  if (outcome) *outcome = {};
+  if (!detail::valid_repo(base)) {
+    *err = "not a Hub repository name: " + base;
+    return set_outcome(outcome, HubError::kInvalidName);
+  }
+  if (offline()) {
+    *err = "HF_HUB_OFFLINE is set: the Hub is not asked";
+    return set_outcome(outcome, HubError::kUnreachable);
+  }
   const auto ep = resolve_endpoint();
   os::HttpGet g;
   g.url = ep.value + "/api/models?filter=" + detail::url_query("base_model:adapter:" + base) +
@@ -580,13 +655,21 @@ bool adapters_of(const std::string& base, int limit, std::vector<Found>* out, st
           (cursor.empty() ? "" : "&cursor=" + detail::url_query(cursor));
   g.headers = detail::auth_headers(ep);
   g.connect_timeout_s = 10, g.stall_timeout_s = 20;
-  std::string body, link, net;
+  std::string body, link, net, retry_after;
   int status = 0;
-  if (!os::http_get_text(g, &body, &status, &net, 16u << 20, next_cursor ? &link : nullptr))
-    return *err = "cannot reach the Hub (" + net + ")", false;
-  if (status != 200) return *err = "the Hub answered " + std::to_string(status), false;
+  if (!os::http_get_text(g, &body, &status, &net, 16u << 20, next_cursor ? &link : nullptr, &retry_after)) {
+    *err = "cannot reach the Hub (" + net + ")";
+    return set_outcome(outcome, HubError::kUnreachable);
+  }
+  if (status != 200) {
+    *err = "the Hub answered " + std::to_string(status);
+    return set_outcome(outcome, error_for_status(status), parse_retry_after_sec(retry_after));
+  }
   const auto j = nlohmann::json::parse(body, nullptr, false);
-  if (!j.is_array()) return *err = "the Hub's answer is not a list of repositories", false;
+  if (!j.is_array()) {
+    *err = "the Hub's answer is not a list of repositories";
+    return set_outcome(outcome, HubError::kBadAnswer);
+  }
   for (const auto& m : j) {
     Found f;
     if (found_of(m, &f)) out->push_back(std::move(f));

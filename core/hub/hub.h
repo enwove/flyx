@@ -51,9 +51,26 @@ struct Repo {
   bool from_cache = false;               // the Hub was not asked (offline) or not reached
 };
 
+// Structured failure category from a Hub API query so callers map HTTP statuses without matching prose.
+enum class HubError {
+  kNone,
+  kInvalidName,
+  kNotFound,
+  kUnauthorized,
+  kRateLimited,
+  kUnreachable,
+  kBadAnswer,
+};
+
+struct HubOutcome {
+  HubError error = HubError::kNone;
+  int retry_after_sec = 0;  // parsed Retry-After delta-seconds when rate-limited (0 if absent/non-numeric)
+};
+
 // A repository's files at a revision, from the Hub; from the cache when offline, or when the Hub cannot be reached
 // or no longer shows the repository and the cache has the revision.
-bool describe(const std::string& repo, const std::string& revision, Repo* out, std::string* err);
+bool describe(const std::string& repo, const std::string& revision, Repo* out, std::string* err,
+              HubOutcome* outcome = nullptr);
 // The cache's snapshot of a revision (a branch its refs/ names, or a commit), without the Hub.
 bool in_cache(const std::string& repo, const std::string& revision, Repo* out);
 
@@ -72,7 +89,8 @@ struct Found {
 // `cursor` resumes from a previous call's *next_cursor (from the Hub's Link rel="next" header).  Only the Hub knows:
 // false, with *err saying why, offline or when it cannot be reached.
 bool search(const std::string& query, const std::string& sort, int limit, std::vector<Found>* out, std::string* err,
-            const std::string& cursor = "", std::string* next_cursor = nullptr, bool gguf_only = true);
+            const std::string& cursor = "", std::string* next_cursor = nullptr, bool gguf_only = true,
+            HubOutcome* outcome = nullptr);
 
 // A LoRA adapter as Hugging Face PEFT saves it, in a repository: a folder with an adapter_config.json ("" the top,
 // else its path, "a/b"), that file, and its adapter_model.safetensors (null: none beside it; `pickle`: an
@@ -93,7 +111,8 @@ bool parse_adapter_name(const std::string& s, Name* out);
 // filter=base_model:adapter:BASE), the most downloaded first, at most `limit`; `cursor` as search's.  false, with *err,
 // offline or when the Hub cannot be reached.
 bool adapters_of(const std::string& base, int limit, std::vector<Found>* out, std::string* err,
-                 const std::string& cursor = "", std::string* next_cursor = nullptr);
+                 const std::string& cursor = "", std::string* next_cursor = nullptr,
+                 HubOutcome* outcome = nullptr);
 
 // The GGUF files of a repository a model can be read from, each with the quantization its name carries ("UD-IQ3_XXS"
 // for Qwen3.8-27B-UD-IQ3_XXS.gguf).  Left out: projectors, importance matrices, files under MTP/; split models are

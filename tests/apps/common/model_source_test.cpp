@@ -271,6 +271,11 @@ int main() {
     }
     check(saw_nested && saw_unsupported,
           "scan_model_dirs finds nested GGUFs and does not break on unsupported architectures or non-GGUF files");
+    const std::string want_root = flyx::apps::canonical_model_dir(from_path(scan_root));
+    check(!found.empty(), "scan_model_dirs found at least one entry");
+    for (const auto& m : found) {
+      check(m.root == want_root, "scan_model_dirs stamps LocalModel::root with canonical root: " + m.root);
+    }
     if (symlinks_ok) {
       check(saw_linked, "scan_model_dirs follows directory symlinks and survives symlink cycles");
       check(saw_hidden_real, "excluded hidden symlink does not prevent scanning its real target directory");

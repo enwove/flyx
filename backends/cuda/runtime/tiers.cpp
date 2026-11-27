@@ -19,6 +19,7 @@
 #endif
 
 #include <algorithm>
+#include <atomic>
 #include <cstring>
 #include <mutex>
 #include <stdexcept>
@@ -181,11 +182,25 @@ void DevicePieces::release() {
   alias = false;
 }
 
-bool vmm_supported() { return vmm().missing.empty(); }
+namespace {
+
+std::atomic<bool> g_vmm_fallback{false};
+
+}  // namespace
+
+bool vmm_supported() { return vmm().missing.empty() && !g_vmm_fallback.load(std::memory_order_relaxed); }
 
 size_t pieces_floor() {
   const Vmm& v = vmm();
-  return v.missing.empty() ? floor_of(v) : kPagedFloor;
+  return v.missing.empty() && !g_vmm_fallback.load(std::memory_order_relaxed) ? floor_of(v) : kPagedFloor;
+}
+
+uint64_t device_reserve_floor() {
+#if defined(_WIN32)
+  return pieces_floor();
+#else
+  return 0;
+#endif
 }
 
 namespace {
@@ -197,7 +212,7 @@ template <class Map>
 void* map_range(size_t bytes, DevicePieces* out, Map&& map) {
   const Vmm& v = vmm();
   out->release();
-  if (!v.missing.empty() || bytes == 0) return nullptr;
+  if (!v.missing.empty() || g_vmm_fallback.load(std::memory_order_relaxed) || bytes == 0) return nullptr;
   const size_t total = round_up(bytes, v.gran);
   try {
     CUdeviceptr va = 0;
@@ -210,6 +225,7 @@ void* map_range(size_t bytes, DevicePieces* out, Map&& map) {
     access.flags = CU_MEM_ACCESS_FLAGS_PROT_READWRITE;
     piece_check(v.set_access(va, total, &access, 1), "granting the device access", total);
   } catch (const VmmUnsupported&) {
+    g_vmm_fallback.store(true, std::memory_order_relaxed);
     out->release();
     return nullptr;
   } catch (...) {
@@ -223,7 +239,7 @@ void* map_range(size_t bytes, DevicePieces* out, Map&& map) {
 
 void* device_pieces(size_t bytes, DevicePieces* out) {
   const Vmm& v = vmm();
-  if (!v.missing.empty() || bytes == 0) return nullptr;
+  if (!vmm_supported() || bytes == 0) return nullptr;
   device_room(round_up(bytes, v.gran), floor_of(v));
   return map_range(bytes, out, [&](const Vmm& v, CUdeviceptr va, size_t total) {
     create_pieces(v, total, &out->handles, "allocating device memory in pieces");
@@ -239,7 +255,7 @@ void* device_pieces(size_t bytes, DevicePieces* out) {
 
 void* device_alias(size_t bytes, DevicePieces* out) {
   const Vmm& v = vmm();
-  if (!v.missing.empty() || bytes == 0) return nullptr;
+  if (!vmm_supported() || bytes == 0) return nullptr;
   device_room(v.gran, floor_of(v));
   return map_range(bytes, out, [&](const Vmm& v, CUdeviceptr va, size_t total) {
     out->alias = true;

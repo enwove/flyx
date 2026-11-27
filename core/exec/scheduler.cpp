@@ -246,6 +246,7 @@ void Scheduler::publish_model() {
   m.max_ctx = max_ctx();
   m.max_sessions = max_sessions_;
   m.ledger_budget = engine_->ledger().budget();
+  m.device_reserve = engine_->budget().device_reserve;
   m.load_s = load_s_;
   m.load_adjustments = engine_->load_adjustments();
   m.ctx_limit = engine_->budget().ctx_limit;

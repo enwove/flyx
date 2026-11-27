@@ -437,7 +437,7 @@ void Recording::finish() {
 
 void add_request_log_routes(httplib::Server& http, Server* s) {
   http.Get("/v1/requests", [s, instance = new_id("log-")](const httplib::Request& q, httplib::Response& r) {
-    if (!require_manage(*s, q, r, "the request log")) return;
+    if (!require_access(*s, q, r, Access::kManage, "the request log")) return;
     const size_t limit = size_t(query_int(q, "limit", int(RequestLog::kKept), 0, int(RequestLog::kKept)));
     const bool on = s->requests && s->requests->enabled();
     r.set_header("Cache-Control", "no-store");

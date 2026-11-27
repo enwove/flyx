@@ -108,7 +108,7 @@ def main(exe, asset, root):
     start(keyed, "--api-key", "lan-test-key")
 
     # Toggle remote_manage dynamically via POST /v1/settings/network on loopback:
-    # forwarded headers stay denied (403) even when remote_manage is saved, and atomic two-field writes persist both.
+    # remote_manage_effective stays False on loopback, forwarded headers stay denied (403) even when remote_manage is saved.
     def toggle_remote_manage_loopback(origin):
         cl = Client(origin, None)
         fwd = {"X-Forwarded-For": "192.0.2.2"}
@@ -117,11 +117,12 @@ def main(exe, asset, root):
         for bad in ({"remote_manage": 1}, {"remote_manage": "true"}):
             assert cl.post(NETWORK, bad)[0] == 400
         status, net = cl.post(NETWORK, {"remote_manage": True})
-        assert status == 200 and net["remote_manage"] is True, net
+        assert status == 200 and net["remote_manage"] is True and net["remote_manage_effective"] is False, net
         # Even with remote_manage saved, forwarded headers and loopback-only binding never unlock keyless management.
-        assert cl.get_raw("/v1/logs", fwd)[0] == 403
-        assert cl.get_raw("/v1/requests", fwd)[0] == 403
-        assert cl.get_raw("/v1/hub/cached", fwd)[0] == 403
+        for extra in (fwd, {"X-Forwarded-Custom": "1"}, {"CF-Connecting-IP": "198.51.100.1"}):
+            assert cl.get_raw("/v1/logs", extra)[0] == 403, extra
+            assert cl.get_raw("/v1/requests", extra)[0] == 403, extra
+            assert cl.get_raw("/v1/hub/cached", extra)[0] == 403, extra
         assert cl.get_raw("/v1/logs", {"Origin": "https://example.org"})[0] == 403
 
     start(toggle_remote_manage_loopback, "--host", "127.0.0.1")
@@ -132,18 +133,22 @@ def main(exe, asset, root):
         fwd = {"X-Forwarded-For": "192.0.2.2"}
         status, net = cl.get(NETWORK)
         assert status == 200 and net["remote_manage"] is True and net["serving_lan"] is True, net
+        assert net["remote_manage_effective"] is True, net
         # Forwarded headers remain denied even on 0.0.0.0 with remote_manage=true.
-        assert cl.get_raw("/v1/logs", fwd)[0] == 403
-        assert cl.get_raw("/v1/requests", fwd)[0] == 403
-        assert cl.get_raw("/v1/hub/cached", fwd)[0] == 403
+        for extra in (fwd, {"X-Forwarded-Custom": "1"}, {"CF-Connecting-IP": "198.51.100.1"}):
+            assert cl.get_raw("/v1/logs", extra)[0] == 403, extra
+            assert cl.get_raw("/v1/requests", extra)[0] == 403, extra
+            assert cl.get_raw("/v1/hub/cached", extra)[0] == 403, extra
         for url in net["api_urls"][:1]:
             lan_cl = Client(url, None)
             assert lan_cl.get_raw("/v1/logs")[0] == 200
             assert lan_cl.get_raw("/v1/requests")[0] == 200
             assert lan_cl.get_raw("/v1/hub/cached")[0] == 200
+            # Non-browser LAN inference clients behind Docker port mapping or custom DNS Host are NOT blocked!
+            assert lan_cl.get_raw("/v1/models", {"Host": "docker.custom.host:19000"})[0] == 200
             # Keyless LAN clients may never mutate the Hub mirror endpoint.
             assert lan_cl.post("/v1/hub/config", {"endpoint": "https://hf-mirror.com"})[0] == 403
-            # DNS-rebinding Host header is rejected even with matching same-origin headers.
+            # DNS-rebinding Host header is rejected on management even with matching same-origin headers.
             rebind_host = f"evil.example:{lan_cl.port}"
             assert lan_cl.get_raw("/v1/logs", {
                 "Host": rebind_host,
@@ -153,9 +158,11 @@ def main(exe, asset, root):
             # Remote UNC/SMB path probing is rejected before touching the filesystem/network.
             assert lan_cl.get_raw("/v1/hub/dir?path=%5C%5Cattacker%5Cshare")[0] == 403
             # Disabling remote_manage takes effect immediately on the LAN client.
-            assert cl.post(NETWORK, {"remote_manage": False})[0] == 200
+            st_off, net_off = cl.post(NETWORK, {"remote_manage": False})
+            assert st_off == 200 and net_off["remote_manage_effective"] is False, net_off
             assert lan_cl.get_raw("/v1/logs")[0] == 403
-            assert cl.post(NETWORK, {"remote_manage": True})[0] == 200
+            st_on, net_on = cl.post(NETWORK, {"remote_manage": True})
+            assert st_on == 200 and net_on["remote_manage_effective"] is True, net_on
             assert lan_cl.get_raw("/v1/logs")[0] == 200
         assert cl.post(NETWORK, {"remote_manage": False})[0] == 200
         assert cl.get(NETWORK)[1]["remote_manage"] is False

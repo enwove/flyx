@@ -97,12 +97,18 @@ void error(httplib::Response& res, int status, const std::string& message, const
   send_json(res, status, {{"error", {{"message", message}, {"type", type}}}});
 }
 
-void describe_error(httplib::Response& res, const std::string& err) {
-  const bool upstream = err.find("cannot reach the Hub") != std::string::npos ||
-                        err.find("the Hub answered") != std::string::npos ||
-                        err.find("the Hub's answer") != std::string::npos ||
-                        err.find("the Hub named no commit") != std::string::npos;
-  error(res, upstream ? 502 : 404, err, upstream ? "hub_error" : "not_found");
+void hub_error(httplib::Response& res, const hub::HubOutcome& out, const std::string& err) {
+  switch (out.error) {
+    case hub::HubError::kInvalidName: return error(res, 400, err, "invalid_request_error");
+    case hub::HubError::kNotFound: return error(res, 404, err, "not_found");
+    case hub::HubError::kUnauthorized: return error(res, 403, err, "permission_error");
+    case hub::HubError::kRateLimited:
+      if (out.retry_after_sec > 0) res.set_header("Retry-After", std::to_string(out.retry_after_sec));
+      return error(res, 429, err, "rate_limit_error");
+    case hub::HubError::kUnreachable:
+    case hub::HubError::kBadAnswer:
+    case hub::HubError::kNone: return error(res, 502, err, "hub_error");
+  }
 }
 
 // One model of GET /v1/hub/cached, and what deleting it takes.
@@ -121,8 +127,8 @@ Listed dir_entry(const apps::LocalModel& m) {
   Listed l;
   const bool gguf = m.kind == "gguf";
   l.json = {{"name", m.path}, {"kind", m.kind}, {"source", "dir"}, {"repo", nullptr}, {"quant", or_null(m.quant)},
-            {"file", m.file}, {"path", m.path}, {"size", m.size}, {"modified", apps::modified_unix(m.modified)},
-            {"revision", nullptr}, {"current", true},
+            {"file", m.file}, {"path", m.path}, {"root", or_null(m.root)}, {"size", m.size},
+            {"modified", apps::modified_unix(m.modified)}, {"revision", nullptr}, {"current", true},
             {"mtp", gguf && m.mtp_layers > 0 ? ojson("in-file") : ojson(nullptr)}};
   if (m.kind == "gguf" || m.kind == "flyx") {  // what its file says it is and comes from
     const flyx::ModelOrigin o =
@@ -233,14 +239,17 @@ std::vector<Listed> listing(const Server& s) {
 }
 
 // What GET /v1/hub/dir answers for a folder (or a model file) of this machine; "" asks where to start from.
-bool dir_json(const Server& s, const std::string& asked, ojson* out, std::string* err) {
+bool dir_json(const Server& s, const httplib::Request& req, const std::string& asked, ojson* out, std::string* err) {
   constexpr int kLevels = 3;          // a model is listed from its folder, or from one or two folders above it
   constexpr size_t kMostFolders = 2000;
   ojson dirs = ojson::array(), models = ojson::array();
+  const bool local = from_this_machine(req);
   std::error_code ec;
   if (asked.empty()) {
     std::set<fs::path> seen;
     auto start = [&](const std::string& dir) {
+      if (dir.empty()) return;
+      if (!local && !remote_path_allowed(s, req, dir)) return;
       std::error_code e2;
       const fs::path p = fs::weakly_canonical(to_path(apps::expand_user_path(dir)), e2);
       if (!e2 && fs::is_directory(p, e2) && seen.insert(p).second)
@@ -273,14 +282,20 @@ bool dir_json(const Server& s, const std::string& asked, ojson* out, std::string
   for (fs::directory_iterator it(p, fs::directory_options::skip_permission_denied, ec), end; !ec && it != end;
        it.increment(ec)) {
     const std::string name = from_path(it->path().filename());
+    if (name.empty() || name[0] == '.' || name[0] == '$') continue;
+    const std::string child = from_path(it->path());
+    if (!local && !remote_path_allowed(s, req, child)) continue;
     std::error_code e2;
-    if (name.empty() || name[0] == '.' || name[0] == '$' || !it->is_directory(e2)) continue;
+    if (!it->is_directory(e2)) continue;
     subs.push_back(it->path());
     if (subs.size() >= kMostFolders) break;
   }
   std::sort(subs.begin(), subs.end());
   for (const fs::path& sub : subs) dirs.push_back({{"name", from_path(sub.filename())}, {"path", from_path(sub)}});
-  for (const apps::LocalModel& m : apps::scan_model_dirs({from_path(p)}, kLevels)) models.push_back(dir_entry(m).json);
+  for (const apps::LocalModel& m : apps::scan_model_dirs({from_path(p)}, kLevels)) {
+    if (!local && !remote_path_allowed(s, req, m.path)) continue;
+    models.push_back(dir_entry(m).json);
+  }
   const fs::path up = p.parent_path();
   *out = {{"path", from_path(p)}, {"parent", up.empty() || up == p ? ojson(nullptr) : ojson(from_path(up))},
           {"kind", "dir"}, {"dirs", dirs}, {"models", models}};
@@ -337,6 +352,7 @@ ojson repo_json(const hub::Repo& r) {
   ojson ggufs = ojson::array();
   ojson companions = ojson::array();
   const auto choices = apps::hub_ggufs(r);
+  const std::string rev_suffix = (!r.revision.empty() && r.revision != "main") ? "@" + r.revision : "";
   // The GGUFs' architecture: what the Hub says, else the first cached model's header.  No projector is offered for
   // one this build reads none for (Inkling-2).
   std::string repo_arch = r.info.gguf_architecture;
@@ -352,8 +368,9 @@ ojson repo_json(const hub::Repo& r) {
     const auto& c = item.choice;
     if (item.cls.kind.empty() || (item.cls.kind == "mmproj" && !repo_vision)) continue;
     if (item.cls.kind == "gguf") {
-      ggufs.push_back({{"name", r.id + ":" + item.selector}, {"quant", c.quant}, {"size", c.total_size}, {"split", c.split},
-                       {"parts", int(c.parts.size())}, {"complete", c.complete}, {"cached", item.cached}});
+      ggufs.push_back({{"name", r.id + ":" + item.selector + rev_suffix}, {"quant", c.quant}, {"size", c.total_size},
+                       {"split", c.split}, {"parts", int(c.parts.size())}, {"complete", c.complete},
+                       {"cached", item.cached}});
       continue;
     }
     if (!c.complete) continue;
@@ -364,7 +381,7 @@ ojson repo_json(const hub::Repo& r) {
     if (item.cls.kind == "drafter" && item.cls.drafter_kind != "mtp") has_dflash_arch = true;
     const auto& path = c.file.path;
     const auto base = path.substr(path.rfind('/') + 1);
-    companions.push_back({{"name", r.id + ":" + base}, {"path", path}, {"file", base},
+    companions.push_back({{"name", r.id + ":" + base + rev_suffix}, {"path", path}, {"file", base},
                           {"kind", item.cls.drafter_kind.empty() ? item.cls.kind : item.cls.drafter_kind},
                           {"drafter_kind", item.cls.drafter_kind},
                           {"size", c.total_size}, {"cached", item.cached}, {"disk", item.cached ? ojson(item.disk) : ojson(nullptr)},
@@ -396,6 +413,7 @@ ojson repo_json(const hub::Repo& r) {
                       {"context", i.gguf_context ? ojson(i.gguf_context) : ojson(nullptr)},
                       {"parameters", i.gguf_parameters ? ojson(i.gguf_parameters) : ojson(nullptr)}};
   return {{"repo", r.id},
+          {"revision", r.revision},
           {"commit", r.commit},
           {"from_cache", r.from_cache},
           {"base_models", r.base_models},
@@ -423,23 +441,22 @@ void add_manage_routes(httplib::Server& http, Server* s) {
     send_json(r, 200, s->host->status());
   });
   http.Post("/v1/load", [s](const httplib::Request& q, httplib::Response& r) {
-    if (!require_manage(*s, q, r, "loading models")) return;
+    if (!require_access(*s, q, r, Access::kManage, "loading models")) return;
     const ojson body = interfaces::parse_json(q.body);
     ModelHost::Want w;
     std::string err;
     if (body.is_discarded() || !want_from_json(body, s->base, &w, &err))
       return error(r, 400, err.empty() ? "request body is not a JSON object" : err, "invalid_request_error");
-    auto check_path = [&](const std::string& p) { return remote_path_allowed(*s, q, p); };
-    bool path_ok = check_path(w.model) && check_path(w.eo.mmproj_file) && check_path(w.eo.lora_file);
-    for (const std::string& d : w.drafters) path_ok = path_ok && check_path(d);
-    if (!path_ok)
-      return error(r, 403, "network or device paths are not allowed from remote clients unless configured in --models-dir",
-                   "permission_error");
+    if (!require_local_path(*s, q, r, w.model) || !require_local_path(*s, q, r, w.eo.mmproj_file) ||
+        !require_local_path(*s, q, r, w.eo.lora_file))
+      return;
+    for (const std::string& d : w.drafters)
+      if (!require_local_path(*s, q, r, d)) return;
     if (!s->host->start(w, &err)) return error(r, 409, err, "conflict");
     send_json(r, 202, s->host->status());
   });
   http.Delete("/v1/load", [s](const httplib::Request& q, httplib::Response& r) {
-    if (!require_manage(*s, q, r, "loading models")) return;
+    if (!require_access(*s, q, r, Access::kManage, "loading models")) return;
     s->host->cancel();
     send_json(r, 200, s->host->status());
   });
@@ -451,11 +468,11 @@ void add_manage_routes(httplib::Server& http, Server* s) {
             {"offline", hub::offline()}};
   };
   http.Get("/v1/hub/config", [s, hub_config_json](const httplib::Request& q, httplib::Response& r) {
-    if (!require_manage(*s, q, r, "configuring Hugging Face")) return;
+    if (!require_access(*s, q, r, Access::kManage, "configuring Hugging Face")) return;
     send_json(r, 200, hub_config_json());
   });
   http.Post("/v1/hub/config", [s, hub_config_json](const httplib::Request& q, httplib::Response& r) {
-    if (!require_local_or_keyed_manage(*s, q, r, "configuring Hugging Face")) return;
+    if (!require_access(*s, q, r, Access::kLocalOrKeyed, "configuring Hugging Face")) return;
     const ojson body = interfaces::parse_json(q.body);
     if (!body.is_object()) return error(r, 400, "request body is not a JSON object", "invalid_request_error");
     std::string raw;
@@ -477,23 +494,22 @@ void add_manage_routes(httplib::Server& http, Server* s) {
     send_json(r, 200, hub_config_json());
   });
   http.Get("/v1/hub/files", [s](const httplib::Request& q, httplib::Response& r) {
-    if (!require_manage(*s, q, r, "loading models")) return;
+    if (!require_access(*s, q, r, Access::kManage, "loading models")) return;
     hub::Name name;
     if (!q.has_param("repo") || !hub::parse_name(q.get_param_value("repo"), &name))
       return error(r, 400, "repo: a Hugging Face repository, org/name", "invalid_request_error");
     hub::Repo repo;
+    hub::HubOutcome out;
     std::string err;
-    if (!hub::describe(name.repo, name.revision, &repo, &err)) return describe_error(r, err);
+    if (!hub::describe(name.repo, name.revision, &repo, &err, &out)) return hub_error(r, out, err);
     send_json(r, 200, repo_json(repo));
   });
   http.Get("/v1/hub/loras", [s](const httplib::Request& q, httplib::Response& r) {
-    if (!require_manage(*s, q, r, "loading models")) return;
+    if (!require_access(*s, q, r, Access::kManage, "loading models")) return;
     std::string base = q.get_param_value("base"), from = "asked";
     if (base.empty() && q.has_param("model")) {
       const std::string model = q.get_param_value("model");
-      if (!remote_path_allowed(*s, q, model))
-        return error(r, 403, "network or device paths are not allowed from remote clients unless configured in --models-dir",
-                     "permission_error");
+      if (!require_local_path(*s, q, r, model)) return;
       base = base_of(model, &from);
     }
     if (base.empty()) return send_json(r, 200, {{"base", nullptr}, {"from", nullptr}, {"models", ojson::array()},
@@ -501,9 +517,11 @@ void add_manage_routes(httplib::Server& http, Server* s) {
     hub::Name b;
     if (!hub::parse_name(base, &b)) return error(r, 400, "base: a Hugging Face repository, org/name", "invalid_request_error");
     std::vector<hub::Found> found;
+    hub::HubOutcome out;
     std::string next, err;
-    if (!hub::adapters_of(b.repo, query_int(q, "limit", 30, 1, 100), &found, &err, q.get_param_value("cursor"), &next))
-      return error(r, 502, err, "hub_error");
+    if (!hub::adapters_of(b.repo, query_int(q, "limit", 30, 1, 100), &found, &err, q.get_param_value("cursor"), &next,
+                          &out))
+      return hub_error(r, out, err);
     std::set<std::string> here;  // repositories with an adapter's weights in the cache
     for (const hub::Cached& c : hub::cached())
       for (const hub::RepoFile& f : c.files)
@@ -516,13 +534,14 @@ void add_manage_routes(httplib::Server& http, Server* s) {
                        {"endpoint", hub::endpoint()}});
   });
   http.Get("/v1/hub/lora", [s](const httplib::Request& q, httplib::Response& r) {
-    if (!require_manage(*s, q, r, "loading models")) return;
+    if (!require_access(*s, q, r, Access::kManage, "loading models")) return;
     hub::Name name;
     if (!q.has_param("repo") || !hub::parse_name(q.get_param_value("repo"), &name) || !name.quant.empty())
       return error(r, 400, "repo: a Hugging Face repository, org/name[@REV]", "invalid_request_error");
     hub::Repo repo;
+    hub::HubOutcome out;
     std::string err;
-    if (!hub::describe(name.repo, name.revision, &repo, &err)) return describe_error(r, err);
+    if (!hub::describe(name.repo, name.revision, &repo, &err, &out)) return hub_error(r, out, err);
     // Each adapter (at most 32), read where it is: its config (at most 64 KiB; a few hundred bytes as PEFT writes it)
     // and its weights' header, into memory alone, kReadsAtOnce adapters at a time (a request's threads and the Hub's
     // connections bounded).  The Hub's files are anyone's: every string of them is checked before it is shown
@@ -573,11 +592,9 @@ void add_manage_routes(httplib::Server& http, Server* s) {
     send_json(r, 200, {{"repo", repo.id}, {"revision", repo.revision}, {"adapters", adapters}});
   });
   http.Get("/v1/hub/drafter", [s](const httplib::Request& q, httplib::Response& r) {
-    if (!require_manage(*s, q, r, "loading models")) return;
+    if (!require_access(*s, q, r, Access::kManage, "loading models")) return;
     const std::string name = q.get_param_value("name");
-    if (!remote_path_allowed(*s, q, name))
-      return error(r, 403, "network or device paths are not allowed from remote clients unless configured in --models-dir",
-                   "permission_error");
+    if (!require_local_path(*s, q, r, name)) return;
     std::error_code ec;
     hub::Name hn;
     std::string kind;
@@ -585,8 +602,9 @@ void add_manage_routes(httplib::Server& http, Server* s) {
       kind = apps::drafter_kind(name);
     } else if (hub::parse_name(name, &hn)) {
       hub::Repo repo;
+      hub::HubOutcome out;
       std::string err;
-      if (!hub::describe(hn.repo, hn.revision, &repo, &err)) return describe_error(r, err);
+      if (!hub::describe(hn.repo, hn.revision, &repo, &err, &out)) return hub_error(r, out, err);
       kind = apps::drafter_kind(repo);
     } else {
       return error(r, 400, "name: a drafter's path or Hugging Face name", "invalid_request_error");
@@ -594,7 +612,7 @@ void add_manage_routes(httplib::Server& http, Server* s) {
     send_json(r, 200, {{"name", name}, {"kind", or_null(kind)}});
   });
   http.Get("/v1/hub/search", [s](const httplib::Request& q, httplib::Response& r) {
-    if (!require_manage(*s, q, r, "loading models")) return;
+    if (!require_access(*s, q, r, Access::kManage, "loading models")) return;
     const std::string asked = q.get_param_value("q");
     const std::string sort = q.get_param_value("sort");
     const std::string cursor = q.get_param_value("cursor");
@@ -602,15 +620,15 @@ void add_manage_routes(httplib::Server& http, Server* s) {
     const int limit = query_int(q, "limit", 20, 1, 100);
     const std::vector<std::string> known = interfaces::model_architectures();
     std::vector<hub::Found> found;
+    hub::HubOutcome out;
     std::string next_cursor, err;
     if (!asked.empty()) {
-      if (!hub::search(asked, sort, limit, &found, &err, cursor, &next_cursor, /*gguf_only=*/true))
-        return error(r, 502, err, "hub_error");
+      if (!hub::search(asked, sort, limit, &found, &err, cursor, &next_cursor, /*gguf_only=*/true, &out))
+        return hub_error(r, out, err);
       if (cursor.empty()) {
         std::set<std::string> seen_ids;
         for (const auto& f : found) seen_ids.insert(f.id);
-        std::string low = asked;
-        for (char& c : low) c = char(std::tolower(static_cast<unsigned char>(c)));
+        const std::string low = ascii_lower(asked);
         const bool drafter_query = low.find("dflash") != std::string::npos || low.find("dspark") != std::string::npos ||
                                    low.find("dspine") != std::string::npos ||
                                    low.find("drafter") != std::string::npos || low.find("mtp") != std::string::npos;
@@ -673,8 +691,8 @@ void add_manage_routes(httplib::Server& http, Server* s) {
         const std::string batch_start = hf_cursor;
         std::vector<hub::Found> batch;
         std::string batch_next;
-        if (!hub::search("", sort, 100, &batch, &err, batch_start, &batch_next)) {
-          if (found.empty()) return error(r, 502, err, "hub_error");
+        if (!hub::search("", sort, 100, &batch, &err, batch_start, &batch_next, /*gguf_only=*/true, &out)) {
+          if (found.empty()) return hub_error(r, out, err);
           break;
         }
         std::vector<hub::Found> matched;
@@ -716,21 +734,17 @@ void add_manage_routes(httplib::Server& http, Server* s) {
                {"models", models}});
   });
   http.Get("/v1/hub/dir", [s](const httplib::Request& q, httplib::Response& r) {
-    if (!require_manage(*s, q, r, "loading models")) return;
+    if (!require_access(*s, q, r, Access::kManage, "loading models")) return;
     const std::string path = q.get_param_value("path");
-    if (!remote_path_allowed(*s, q, path))
-      return error(r, 403, "network or device paths are not allowed from remote clients unless configured in --models-dir",
-                   "permission_error");
+    if (!require_local_path(*s, q, r, path)) return;
     ojson out;
     std::string err;
-    if (!dir_json(*s, path, &out, &err)) return error(r, 404, err, "not_found");
+    if (!dir_json(*s, q, path, &out, &err)) return error(r, 404, err, "not_found");
     send_json(r, 200, out);
   });
   http.Post("/v1/hub/dir", [s](const httplib::Request& q, httplib::Response& r) {
-    if (!require_manage(*s, q, r, "loading models")) return;
     // The dialog opens on this machine's desktop: of use, and polite, only to someone sitting at it.
-    if (!from_this_machine(q))
-      return error(r, 403, "the folder dialog opens on the server's machine: give the folder's path instead", "permission_error");
+    if (!require_access(*s, q, r, Access::kLocalOnly, "opening a folder dialog")) return;
     DialogGuard dialog;
     if (!dialog.acquire()) return error(r, 409, "a folder dialog is already open on the server's machine", "conflict");
     const ojson body = interfaces::parse_json(q.body);
@@ -743,26 +757,25 @@ void add_manage_routes(httplib::Server& http, Server* s) {
     if (picked == os::Picked::kUnavailable) return error(r, 501, err, "not_supported");
     if (picked == os::Picked::kCancelled) return send_json(r, 200, {{"path", nullptr}});
     ojson out;
-    if (!dir_json(*s, path, &out, &err)) return error(r, 404, err, "not_found");
+    if (!dir_json(*s, q, path, &out, &err)) return error(r, 404, err, "not_found");
     send_json(r, 200, out);
   });
   http.Get("/v1/hub/cached", [s](const httplib::Request& q, httplib::Response& r) {
-    if (!require_manage(*s, q, r, "loading models")) return;
+    if (!require_access(*s, q, r, Access::kManage, "loading models")) return;
     ojson models = ojson::array();
     for (Listed& l : listing(*s)) models.push_back(std::move(l.json));
     ojson dirs = ojson::array();
-    std::set<std::string> seen_dirs;
-    for (const std::string& d : s->models_dirs) {
-      std::error_code ec;
-      const fs::path abs = fs::absolute(to_path(apps::expand_user_path(d)), ec);
-      const std::string sdir = ec ? apps::expand_user_path(d) : from_path(abs.lexically_normal());
-      if (!sdir.empty() && seen_dirs.insert(sdir).second) dirs.push_back(sdir);
-    }
+    for (const std::string& d : s->models_dirs) dirs.push_back(d);
     const auto cache = hub::resolve_cache_dir();
-    send_json(r, 200, {{"cache", cache.value}, {"cache_from", cache.source}, {"dirs", dirs}, {"models", models}});
+    send_json(r, 200,
+              {{"cache", cache.value},
+               {"cache_from", cache.source},
+               {"dirs", dirs},
+               {"win_paths", kDefaultWindowsPaths},
+               {"models", models}});
   });
   http.Delete("/v1/hub/cached", [s](const httplib::Request& q, httplib::Response& r) {
-    if (!require_manage(*s, q, r, "loading models")) return;
+    if (!require_access(*s, q, r, Access::kManage, "loading models")) return;
     const std::string name = q.get_param_value("name");
     if (name.empty()) return error(r, 400, "name: a model as GET /v1/hub/cached lists it", "invalid_request_error");
     std::vector<Listed> all = listing(*s);
@@ -809,17 +822,14 @@ void add_manage_routes(httplib::Server& http, Server* s) {
     send_json(r, 200, {{"deleted", name}, {"freed", freed}});
   });
   http.Post("/v1/unload", [s](const httplib::Request& q, httplib::Response& r) {
-    if (!require_manage(*s, q, r, "loading models")) return;
+    if (!require_access(*s, q, r, Access::kManage, "loading models")) return;
     std::string err;
     if (!s->host->unload(&err)) return error(r, 409, err, "conflict");
     send_json(r, 200, s->host->status());
   });
   http.Post("/v1/agents/launch", [s](const httplib::Request& q, httplib::Response& r) {
-    if (!require_manage(*s, q, r, "starting coding agents")) return;
     // The window opens on this machine's desktop, as the folder dialog does: for someone sitting at it.
-    if (!from_this_machine(q))
-      return error(r, 403, "the agent starts in a window on the server's machine: run its command where you are",
-                   "permission_error");
+    if (!require_access(*s, q, r, Access::kLocalOnly, "starting coding agents")) return;
     const ojson body = interfaces::parse_json(q.body);
     if (!body.is_object()) return error(r, 400, "request body is not a JSON object", "invalid_request_error");
     auto text = [&](const char* key) {
@@ -903,7 +913,7 @@ void add_manage_routes(httplib::Server& http, Server* s) {
                  {"apps", std::move(apps)}};
   };
   http.Get("/v1/device/processes", [s, device_hint, gpu_snapshot_json](const httplib::Request& q, httplib::Response& r) {
-    if (!require_manage(*s, q, r, "inspecting memory usage")) return;
+    if (!require_access(*s, q, r, Access::kManage, "inspecting memory usage")) return;
     const std::string kind = q.has_param("kind") ? q.get_param_value("kind") : "vram";
     if (kind != "vram" && kind != "ram") return error(r, 400, "kind must be vram or ram", "invalid_request_error");
     r.set_header("Cache-Control", "no-store");
@@ -913,9 +923,7 @@ void add_manage_routes(httplib::Server& http, Server* s) {
     send_json(r, 200, gpu_snapshot_json(snap, ram ? "ram" : "vram", from_this_machine(q)));
   });
   http.Post("/v1/device/close", [s, device_hint, gpu_snapshot_json](const httplib::Request& q, httplib::Response& r) {
-    if (!require_manage(*s, q, r, "closing applications")) return;
-    if (!from_this_machine(q))
-      return error(r, 403, "closing applications is only allowed from this machine", "permission_error");
+    if (!require_access(*s, q, r, Access::kLocalOnly, "closing applications")) return;
     const ojson body = interfaces::parse_json(q.body);
     if (!body.is_object()) return error(r, 400, "request body is not a JSON object", "invalid_request_error");
     if (!body.contains("id") || !body["id"].is_string() || body["id"].get<std::string>().empty())
