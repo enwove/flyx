@@ -493,12 +493,13 @@ int run(int argc, char** argv) {
   start_from.mmproj_file.clear();    // likewise: a model named on the page names its own vision projector
   start_from.lora_file.clear();     // and the command line's LoRA adapter is its model's, not another's
   Server srv{&models, cfg, start_from, os::unix_seconds(), {}};
+  init_listener_identity(&srv, bound_host, port);
   RequestLog requests(args.request_log);
   srv.requests = &requests;
   srv.logs = args.system_log ? &system_log : nullptr;
   srv.models_dirs = args.models_dirs;
   srv.remote_manage.store(args.no_auth || (cfg.api_key.empty() && ModelHost::remote_manage()),
-                          std::memory_order_relaxed);
+                          std::memory_order_release);
   // The model named here loads now, before the server listens; without one, the last one served loads once it
   // listens (the page shows it coming), or the server waits for the page to name one.
   ModelHost::Want later;
@@ -561,10 +562,10 @@ int run(int argc, char** argv) {
   std::signal(SIGTERM, on_signal);
   std::fprintf(stderr, "flyx-server: listening on http://%s:%d, the dashboard at %s\n", host.c_str(), port,
                view.page.c_str());
-  if (!is_loopback_ip(bound_host) && srv.remote_manage.load(std::memory_order_relaxed) && cfg.api_key.empty())
+  if (srv.serving_lan && srv.remote_manage.load(std::memory_order_acquire) && cfg.api_key.empty())
     std::fprintf(stderr,
                  "flyx-server: warning: LAN management without an API key is enabled (%s): anyone on this network can "
-                 "load models and view logs/requests\n",
+                 "load or delete cached models, browse folders, and view logs or requests\n",
                  args.no_auth ? "--no-auth" : "saved setting");
   if (cfg.cors_any && cfg.api_key.empty())
     std::fprintf(stderr, "flyx-server: --cors '*' without --api-key: any web page opened in a browser that reaches this "

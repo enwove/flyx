@@ -216,8 +216,12 @@ std::string expand_user_path(const std::string& path) {
   if (path.size() > 1 && path[1] != '/' && path[1] != '\\') return path;
   const std::string home = os::home_dir();
   if (home.empty()) return path;
-  if (path.size() == 1) return home;
-  return from_path((to_path(home) / to_path(path.substr(2))).lexically_normal());
+  size_t pos = 1;
+  while (pos < path.size() && (path[pos] == '/' || path[pos] == '\\')) ++pos;
+  if (pos >= path.size()) return home;
+  const fs::path suffix = to_path(path.substr(pos));
+  if (suffix.is_absolute() || suffix.has_root_name()) return path;
+  return from_path((to_path(home) / suffix).lexically_normal());
 }
 
 std::vector<LocalModel> scan_model_dirs(const std::vector<std::string>& dirs, int deepest) {
@@ -240,9 +244,9 @@ std::vector<LocalModel> scan_model_dirs(const std::vector<std::string>& dirs, in
     const std::string expanded = expand_user_path(dir);
     const fs::path root = fs::absolute(to_path(expanded), ec);
     if (ec || !fs::is_directory(root, ec)) continue;
-    std::set<fs::path> visited_dirs;
+    std::map<fs::path, int> visited_depth;
     const fs::path root_canon = fs::weakly_canonical(root, ec);
-    if (!ec) visited_dirs.insert(root_canon);
+    if (!ec) visited_depth[root_canon] = -1;
     ec.clear();
     int entries = 0;
     for (fs::recursive_directory_iterator it(root, opts, ec), end;
@@ -250,10 +254,21 @@ std::vector<LocalModel> scan_model_dirs(const std::vector<std::string>& dirs, in
       const std::string name = from_path(it->path().filename());
       std::error_code e2;
       if (it->is_directory(e2)) {
-        const fs::path dcanon = fs::weakly_canonical(it->path(), e2);
-        if (e2 || !visited_dirs.insert(dcanon).second || name.empty() || name[0] == '.' || name[0] == '$' ||
-            name == "node_modules" || name == "System Volume Information" || it.depth() + 1 >= deepest)
+        if (e2 || name.empty() || name[0] == '.' || name[0] == '$' ||
+            name == "node_modules" || name == "System Volume Information" || it.depth() + 1 >= deepest) {
           it.disable_recursion_pending();
+          continue;
+        }
+        const fs::path dcanon = fs::weakly_canonical(it->path(), e2);
+        if (e2) {
+          it.disable_recursion_pending();
+          continue;
+        }
+        auto [vit, inserted] = visited_depth.emplace(dcanon, it.depth());
+        if (!inserted && vit->second <= it.depth())
+          it.disable_recursion_pending();
+        else
+          vit->second = it.depth();
         continue;
       }
       const std::string low = lower(name);

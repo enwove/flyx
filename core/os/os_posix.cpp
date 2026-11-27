@@ -389,6 +389,8 @@ void write_all(int fd, const char* p, size_t n) {
 
 bool gpu_memory_paged() { return is_wsl(); }
 
+uint64_t gpu_memory_floor() { return 0; }
+
 bool open_url(const std::string& url) {
   if (env_exists(env::kSshConnection) || env_exists(env::kSshTty)) return false;  // the browser would be the server's
 #if defined(__APPLE__)

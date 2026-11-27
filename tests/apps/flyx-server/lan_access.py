@@ -107,8 +107,9 @@ def main(exe, asset, root):
 
     start(keyed, "--api-key", "lan-test-key")
 
-    # Toggle remote_manage dynamically via POST /v1/settings/network and verify persistence + immediate effect.
-    def toggle_remote_manage(origin):
+    # Toggle remote_manage dynamically via POST /v1/settings/network on loopback:
+    # forwarded headers stay denied (403) even when remote_manage is saved, and atomic two-field writes persist both.
+    def toggle_remote_manage_loopback(origin):
         cl = Client(origin, None)
         fwd = {"X-Forwarded-For": "192.0.2.2"}
         assert cl.get_raw("/v1/logs", fwd)[0] == 403
@@ -117,26 +118,67 @@ def main(exe, asset, root):
             assert cl.post(NETWORK, bad)[0] == 400
         status, net = cl.post(NETWORK, {"remote_manage": True})
         assert status == 200 and net["remote_manage"] is True, net
-        # Immediately unlocks forwarded/LAN management without restart, while cross-site Origin stays blocked.
-        assert cl.get_raw("/v1/logs", fwd)[0] == 200
-        assert cl.get_raw("/v1/requests", fwd)[0] == 200
-        assert cl.get_raw("/v1/hub/cached", fwd)[0] == 200
+        # Even with remote_manage saved, forwarded headers and loopback-only binding never unlock keyless management.
+        assert cl.get_raw("/v1/logs", fwd)[0] == 403
+        assert cl.get_raw("/v1/requests", fwd)[0] == 403
+        assert cl.get_raw("/v1/hub/cached", fwd)[0] == 403
         assert cl.get_raw("/v1/logs", {"Origin": "https://example.org"})[0] == 403
 
-    start(toggle_remote_manage, "--host", "127.0.0.1")
-    # Persisted remote_manage survives restart, and disabling takes effect immediately.
-    def persisted_remote_manage(origin):
+    start(toggle_remote_manage_loopback, "--host", "127.0.0.1")
+
+    # Persisted remote_manage survives restart; on 0.0.0.0 direct LAN requests work while forwarded/rebinding/hub-config/UNC stay blocked.
+    def persisted_remote_manage_lan(origin):
         cl = Client(origin, None)
         fwd = {"X-Forwarded-For": "192.0.2.2"}
-        assert cl.get(NETWORK)[1]["remote_manage"] is True
-        assert cl.get_raw("/v1/logs", fwd)[0] == 200
-        assert cl.post(NETWORK, {"remote_manage": False})[0] == 200
+        status, net = cl.get(NETWORK)
+        assert status == 200 and net["remote_manage"] is True and net["serving_lan"] is True, net
+        # Forwarded headers remain denied even on 0.0.0.0 with remote_manage=true.
         assert cl.get_raw("/v1/logs", fwd)[0] == 403
+        assert cl.get_raw("/v1/requests", fwd)[0] == 403
+        assert cl.get_raw("/v1/hub/cached", fwd)[0] == 403
+        for url in net["api_urls"][:1]:
+            lan_cl = Client(url, None)
+            assert lan_cl.get_raw("/v1/logs")[0] == 200
+            assert lan_cl.get_raw("/v1/requests")[0] == 200
+            assert lan_cl.get_raw("/v1/hub/cached")[0] == 200
+            # Keyless LAN clients may never mutate the Hub mirror endpoint.
+            assert lan_cl.post("/v1/hub/config", {"endpoint": "https://hf-mirror.com"})[0] == 403
+            # DNS-rebinding Host header is rejected even with matching same-origin headers.
+            rebind_host = f"evil.example:{lan_cl.port}"
+            assert lan_cl.get_raw("/v1/logs", {
+                "Host": rebind_host,
+                "Origin": f"http://{rebind_host}",
+                "Sec-Fetch-Site": "same-origin",
+            })[0] == 403
+            # Remote UNC/SMB path probing is rejected before touching the filesystem/network.
+            assert lan_cl.get_raw("/v1/hub/dir?path=%5C%5Cattacker%5Cshare")[0] == 403
+            # Disabling remote_manage takes effect immediately on the LAN client.
+            assert cl.post(NETWORK, {"remote_manage": False})[0] == 200
+            assert lan_cl.get_raw("/v1/logs")[0] == 403
+            assert cl.post(NETWORK, {"remote_manage": True})[0] == 200
+            assert lan_cl.get_raw("/v1/logs")[0] == 200
+        assert cl.post(NETWORK, {"remote_manage": False})[0] == 200
+        assert cl.get(NETWORK)[1]["remote_manage"] is False
 
-    start(persisted_remote_manage, "--host", "127.0.0.1")
+    start(persisted_remote_manage_lan, "--host", "0.0.0.0")
 
-    # --no-auth unlocks LAN management (including logs, /v1/messages request log, and --models-dir passed before MODEL),
-    # ignores FLYX_API_KEY in the environment, locks remote_manage (409), and still blocks cross-site Origin (403).
+    # Atomic two-field POST /v1/settings/network persists both lan_access and remote_manage together.
+    def atomic_network_save(origin):
+        cl = Client(origin, None)
+        status, net = cl.post(NETWORK, {"lan_access": True, "remote_manage": True})
+        assert status == 200 and net["lan_access"] is True and net["remote_manage"] is True, net
+        saved = json.loads(settings.read_bytes())
+        assert saved["lan_access"] is True and saved["remote_manage"] is True, saved
+        status, net = cl.post(NETWORK, {"lan_access": False, "remote_manage": False})
+        assert status == 200 and net["lan_access"] is False and net["remote_manage"] is False, net
+        saved = json.loads(settings.read_bytes())
+        assert saved["lan_access"] is False and saved["remote_manage"] is False, saved
+
+    start(atomic_network_save)
+
+    # --no-auth unlocks direct LAN management (including logs, /v1/messages request log, and --models-dir passed before MODEL),
+    # ignores FLYX_API_KEY in the environment, locks remote_manage (409), and still blocks forwarded headers, cross-site Origin,
+    # DNS rebinding, keyless hub/config mutation, and remote UNC paths (403).
     models_dir = root / "custom-models"
     nested = models_dir / "Author" / "Repo" / "fake.gguf"
     nested.parent.mkdir(parents=True, exist_ok=True)
@@ -151,22 +193,35 @@ def main(exe, asset, root):
         assert net["api_key_set"] is False, net
         assert cl.post(NETWORK, {"remote_manage": False})[0] == 409
         assert cl.get_raw(NETWORK, {"Origin": "https://example.org"})[0] == 403
-        assert cl.get_raw("/v1/logs", fwd)[0] == 200
-        status, _, raw_cached = cl.get_raw("/v1/hub/cached", fwd)
+        # Forwarded headers are always denied without --api-key, even under --no-auth.
+        assert cl.get_raw("/v1/logs", fwd)[0] == 403
+        assert cl.get_raw("/v1/requests", fwd)[0] == 403
+        assert cl.get_raw("/v1/hub/cached", fwd)[0] == 403
+        # Direct client (real LAN interface when available, else loopback) accesses management + --models-dir + /v1/messages log.
+        direct_cl = Client(net["api_urls"][0], None) if net["api_urls"] else cl
+        assert direct_cl.get_raw("/v1/logs")[0] == 200
+        status, _, raw_cached = direct_cl.get_raw("/v1/hub/cached")
         cached = json.loads(raw_cached or b"null")
         assert status == 200, cached
         assert any(Path(d).resolve() == models_dir.resolve() for d in cached["dirs"]), cached["dirs"]
         assert any(Path(m["path"]).resolve() == nested.resolve() for m in cached["models"] if m.get("path")), cached["models"]
-        # Send an Anthropic /v1/messages request and verify it is visible in /v1/requests over LAN.
-        msg_status, _ = cl.post("/v1/messages", {
+        msg_status, _ = direct_cl.post("/v1/messages", {
             "model": "test model", "max_tokens": 4,
             "messages": [{"role": "user", "content": "hi"}],
-        }, fwd)
+        })
         assert msg_status == 200, msg_status
-        req_status, _, raw_reqs = cl.get_raw("/v1/requests", fwd)
+        req_status, _, raw_reqs = direct_cl.get_raw("/v1/requests")
         reqs = json.loads(raw_reqs or b"null")
         assert req_status == 200 and reqs["enabled"] is True, reqs
         assert any(r["api"] == "messages" for r in reqs["requests"]), reqs["requests"]
+        if net["api_urls"]:
+            assert direct_cl.post("/v1/hub/config", {"endpoint": "https://hf-mirror.com"})[0] == 403
+            rebind_host = f"evil.example:{direct_cl.port}"
+            assert direct_cl.get_raw("/v1/logs", {
+                "Host": rebind_host,
+                "Origin": f"http://{rebind_host}",
+            })[0] == 403
+            assert direct_cl.get_raw("/v1/hub/dir?path=%5C%5Cattacker%5Cshare")[0] == 403
 
     # Pass options BEFORE the positional model path to verify positional MODEL is accepted anywhere.
     serve(exe, root, no_auth_env, ["--host", "0.0.0.0", "--no-auth", "--models-dir", str(models_dir), asset],

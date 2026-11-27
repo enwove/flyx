@@ -24,6 +24,11 @@ uint64_t device_reserve(uint64_t total_vram, bool gpu_paged) {
   return gpu_paged ? std::max(base, kPagedReserve) : base;
 }
 
+uint64_t effective_device_reserve(uint64_t total_vram, bool gpu_paged, int64_t override_bytes, uint64_t min_floor) {
+  const uint64_t wanted = override_bytes >= 0 ? uint64_t(override_bytes) : device_reserve(total_vram, gpu_paged);
+  return std::max(wanted, min_floor);
+}
+
 GpuHeld held_of(const flyx_memory_info& mi) {
   GpuHeld h;
   h.total = mi.total;
@@ -213,7 +218,7 @@ bool init_device_budget(const flyx_backend_api* api, flyx_bmodel* bm, const KvTi
     return false;
   };
   if (reported) {
-    reserve = tiers.vram_reserve >= 0 ? uint64_t(tiers.vram_reserve) : device_reserve(mi->total, tiers.gpu_paged);
+    reserve = effective_device_reserve(mi->total, tiers.gpu_paged, tiers.vram_reserve, tiers.min_vram_reserve);
     *reserve_out = reserve;
     const uint64_t have = mi->free + mi->weights + mi->workspace;
     // Zero is the ledger's sentinel for a backend that does not report a budget.

@@ -22,6 +22,7 @@
 #endif
 
 #include "core/hub/hub.h"
+#include "core/hub/hub_internal.h"
 #include "core/hub/sha256.h"
 #include "core/os/env.h"
 #include "core/os/os.h"
@@ -218,6 +219,25 @@ void hub_settings() {
   check_cache("cache/xdg/huggingface/hub", "XDG_CACHE_HOME");
   set_env("XDG_CACHE_HOME", "");
   check_cache(flyx::os::home_dir() + "/.cache/huggingface/hub", "default");
+
+  // HF_TOKEN is only sent over HTTPS to the default Hub or an explicit HF_ENDPOINT override, never to http:// or a runtime mirror.
+  set_env("HF_TOKEN", "hf_secret_unit_token");
+  const auto has_bearer = [](const std::vector<std::string>& hdrs) {
+    for (const auto& h : hdrs)
+      if (h == "Authorization: Bearer hf_secret_unit_token") return true;
+    return false;
+  };
+  check(has_bearer(detail::auth_headers({kDefaultEndpoint, "default"})),
+        "auth_headers attaches Bearer token for default HTTPS Hub");
+  check(has_bearer(detail::auth_headers({"https://env.mirror.test", "HF_ENDPOINT"})),
+        "auth_headers attaches Bearer token for HTTPS HF_ENDPOINT");
+  check(detail::auth_headers({"http://127.0.0.1:8080", "HF_ENDPOINT"}).empty(),
+        "auth_headers omits Bearer token for plaintext http:// HF_ENDPOINT");
+  check(detail::auth_headers({"https://evil.mirror.test", "setting"}).empty(),
+        "auth_headers omits Bearer token for runtime setting mirror");
+  check(has_bearer(detail::auth_headers({kDefaultEndpoint, "setting"})),
+        "auth_headers attaches Bearer token if runtime setting equals default HTTPS Hub");
+  set_env("HF_TOKEN", "");
 }
 
 flyx::hub::RepoFile file(const std::string& path, uint64_t size, const std::string& sha256 = "ab") {
@@ -543,6 +563,7 @@ struct FakeHub {
   std::atomic<bool> corrupt{false};    // one byte of the second piece flipped
   std::atomic<int> sig{0};             // the signature the last redirect carried
   std::atomic<bool> expire_first{false};  // signature 1 stops working after the first request
+  std::atomic<bool> saw_auth{false};      // whether any request carried an Authorization header
 
   FakeHub() {
     std::mt19937 rng(11);
@@ -551,7 +572,8 @@ struct FakeHub {
     files["tiny-Q4_K_M.gguf"] = big;
     files["MTP/mtp-tiny-Q4_0.gguf"] = std::string(1000, 'm');
     files["config.json"] = "{}";
-    http.Get("/api/models/acme/tiny-GGUF/revision/main", [this](const httplib::Request&, httplib::Response& res) {
+    http.Get("/api/models/acme/tiny-GGUF/revision/main", [this](const httplib::Request& q, httplib::Response& res) {
+      if (q.has_header("Authorization")) saw_auth = true;
       nlohmann::json sib = nlohmann::json::array();
       for (const auto& [path, content] : files) {
         nlohmann::json f = {{"rfilename", path}, {"size", content.size()}, {"blobId", "00112233445566778899aabbccddeeff00112233"}};
@@ -577,6 +599,7 @@ struct FakeHub {
     });
     http.Get(R"(/api/models/acme/none/revision/main)", [](const httplib::Request&, httplib::Response& res) { res.status = 404; });
     http.Get("/api/models", [this](const httplib::Request& q, httplib::Response& res) {
+      if (q.has_header("Authorization")) saw_auth = true;
       const std::string cursor = q.get_param_value("cursor");
       if (cursor.empty()) {
         res.set_header("Link", "<http://127.0.0.1:" + std::to_string(port) +
@@ -794,6 +817,23 @@ void fetching(const fs::path& tmp) {
     check(!flyx::hub::fetch(huge, {f1, f2}, &paths, nullptr, nullptr, &err) &&
               err.find("free") != std::string::npos && hub.storage == before,
           "has_room saturates uint64_t sum instead of wrapping around: " + err);
+  }
+  {
+    // Live fetch/search with HF_TOKEN set must never leak Authorization to plaintext http:// or runtime setting mirror.
+    hub.saw_auth = false;
+    set_env("HF_TOKEN", "hf_must_not_leak");
+    std::vector<flyx::hub::Found> found;
+    std::string next;
+    check(flyx::hub::search("", "trending", 10, &found, &err, "", &next) && !hub.saw_auth,
+          "search does not leak HF_TOKEN to plaintext http:// HF_ENDPOINT");
+    std::string ep_err;
+    check(flyx::hub::set_endpoint("http://127.0.0.1:" + std::to_string(hub.port), &ep_err),
+          "set_endpoint to local FakeHub");
+    flyx::hub::Repo described;
+    check(flyx::hub::describe("acme/tiny-GGUF", "main", &described, &err) && !hub.saw_auth,
+          "describe does not leak HF_TOKEN to runtime setting mirror");
+    flyx::hub::set_endpoint("", &ep_err);
+    set_env("HF_TOKEN", "");
   }
 }
 

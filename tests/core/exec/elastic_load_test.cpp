@@ -679,5 +679,69 @@ int main(int argc, char** argv) {
           "--drafter mtp: no shorter prefill passes, the load refused with the reason: " + err);
   }
 
+  // 11. Explicit --vram-reserve applies to both AUTO exact/Strata boundary (auto_from) and elastic pre-flight checks.
+  {
+    reset_hooks();
+    g_total_vram = 16ull << 30;
+    g_free_vram = 12ull << 30;
+    g_target_bytes = 8ull << 30;
+    g_kv_row_bytes = 1ull << 20;  // 1 MiB per token
+    EngineOptions eo;
+    eo.backend = "test-host-kv";
+    eo.max_ctx = 4096;
+    eo.drafter = "none";
+    eo.kv_method = "auto";
+    eo.vram_reserve = int64_t(1ull << 30);  // 1 GiB reserve -> 2.5 GiB left -> ~2560 tokens
+    Engine e_lo;
+    check(e_lo.load(model, eo, &err), "auto_from with 1 GiB vram_reserve loads: " + err);
+    const int auto_from_1g = g_target_options.empty() ? -1 : g_target_options.back().second;
+
+    reset_hooks();
+    g_total_vram = 16ull << 30;
+    g_free_vram = 12ull << 30;
+    g_target_bytes = 8ull << 30;
+    g_kv_row_bytes = 1ull << 20;
+    eo.vram_reserve = int64_t(2ull << 30);  // 2 GiB reserve -> 1.5 GiB left -> ~1536 tokens (1024 fewer)
+    Engine e_hi;
+    check(e_hi.load(model, eo, &err), "auto_from with 2 GiB vram_reserve loads: " + err);
+    const int auto_from_2g = g_target_options.empty() ? -1 : g_target_options.back().second;
+    check(auto_from_1g == 2560 && auto_from_2g == 1536,
+          "vram_reserve shifts AUTO exact/Strata auto_from boundary (" + std::to_string(auto_from_1g) + " -> " +
+              std::to_string(auto_from_2g) + ")");
+
+    // Elastic pre-flight: target 8.5 GiB + dflash 3.8 GiB + min_runtime 0.5 GiB = 12.8 GiB.
+    // With 13.5 GiB free + comfort 1.5 GiB: a 2 GiB vram_reserve makes hard_need = 14.8 GiB > 13.5 GiB -> steps down;
+    // with 15.0 GiB free and vram_reserve = 256 MiB (above Windows floor): comfort_need = 14.55 GiB <= 15.0 GiB -> stays!
+    reset_hooks();
+    g_total_vram = 16ull << 30;
+    g_free_vram = 15000ull << 20;
+    g_target_bytes = 8500ull << 20;
+    g_dflash_bytes = 3800ull << 20;
+    g_dflash_savings = 2700ull << 20;
+    g_mtp_bytes = 0;
+    EngineOptions eo_pf;
+    eo_pf.backend = "test-host-kv";
+    eo_pf.max_ctx = 128;
+    eo_pf.drafter = "dflash2";
+    eo_pf.vram_reserve = int64_t(256ull << 20);  // hard=13068 MiB, comfort=14604 MiB <= 15000 MiB -> keeps auto
+    Engine e_keep;
+    check(e_keep.load(model, eo_pf, &err), "low vram_reserve keeps dflash2 in elastic pre-flight: " + err);
+    check(g_open_calls == 1 && g_seen_dw.back() == FLYX_DRAFT_WEIGHTS_AUTO && e_keep.load_adjustments().empty(),
+          "low vram_reserve avoids unnecessary pre-flight step-down");
+
+    reset_hooks();
+    g_total_vram = 16ull << 30;
+    g_free_vram = 15000ull << 20;
+    g_target_bytes = 8500ull << 20;
+    g_dflash_bytes = 3800ull << 20;
+    g_dflash_savings = 2700ull << 20;
+    g_mtp_bytes = 0;
+    eo_pf.vram_reserve = int64_t(2048ull << 20);  // hard=14860 MiB, comfort=16396 MiB > 15000 MiB -> steps to nvfp4
+    Engine e_step;
+    check(e_step.load(model, eo_pf, &err), "high vram_reserve steps down in elastic pre-flight: " + err);
+    check(g_open_calls == 1 && g_seen_dw.back() == FLYX_DRAFT_WEIGHTS_NVFP4 && !e_step.load_adjustments().empty(),
+          "high vram_reserve triggers pre-flight auto -> nvfp4 step-down");
+  }
+
   return flyx::test::finish("elastic_load_test");
 }

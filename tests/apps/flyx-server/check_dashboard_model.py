@@ -176,9 +176,11 @@ HUB_LORA = {"repo": "acme/Tiny-27B-coder-lora", "revision": "main", "adapters": 
 class Server:
     """The stubbed server of one page: what it was asked to load, to delete and to show a folder dialog for."""
 
-    def __init__(self, page, tm, dialog=(200, LISTING), gpu_apps=None):
+    def __init__(self, page, tm, dialog=(200, LISTING), gpu_apps=None, catalog=None, folders=None):
         self.tm, self.dialog, self.posted, self.deleted, self.dialogs = tm, dialog, [], [], []
         self.gpu_apps = copy.deepcopy(gpu_apps) if gpu_apps is not None else None
+        self.catalog = catalog if catalog is not None else CATALOG
+        self.folders = folders if folders is not None else FOLDERS
         self.closed = []
         self.hub_endpoint = "https://huggingface.co"
         self.hub_source = "default"
@@ -229,7 +231,7 @@ class Server:
         if "/v1/telemetry" in url:
             return route.fulfill(json=self.tm)
         if "/v1/hub/cached" in url:
-            return route.fulfill(json=CATALOG)
+            return route.fulfill(json=self.catalog)
         if "/v1/hub/loras" in url:
             self.lora_asked.append({k: v[0] for k, v in query.items()})
             base = query.get("base", [""])[0]
@@ -269,6 +271,8 @@ class Server:
             res["endpoint"] = self.hub_endpoint
             if q_text:
                 res["query"], res["family"], res["next_cursor"] = q_text, False, None
+                if q_text == "no-such-model-xyz":
+                    res["models"] = []
             elif arch:
                 res["arch"], res["next_cursor"] = arch, None
                 res["models"] = [m for m in res["models"] if m.get("architecture") == arch]
@@ -285,7 +289,7 @@ class Server:
             return route.fulfill(json=res)
         if "/v1/hub/dir" in url:
             path = query.get("path", [""])[0]
-            return route.fulfill(json=FOLDERS[path]) if path in FOLDERS else route.fulfill(
+            return route.fulfill(json=self.folders[path]) if path in self.folders else route.fulfill(
                 status=404, json={"error": {"message": path + ": no such folder or file on this machine"}})
         route.fulfill(json={})
 
@@ -784,21 +788,36 @@ def check_hub(page, server, want):
     verified.click()
     expect(page.locator("#mf-cmd")).to_contain_text(re.compile(r"--drafter-file '?acme/Tiny-27B-DFlash2"))
     page.locator("#mf-reset").click()
-    # A 404 JSON or 502 error from /v1/hub/files surfaces the real error with a Retry button (not "update FLYX").
+    # A 404 JSON or 502 error from /v1/hub/files surfaces the real error with a Retry button (not "update FLYX"),
+    # clears any stale selected target, and Retry preserves the originally requested quantization.
     view(page, "library")
     server.files_fail = (404, "acme/Missing: repository not found")
     page.locator("#hf-q").fill("acme/Missing")
     page.keyboard.press("Enter")
     expect(page.locator("#mf-hubmsg.banner.bad")).to_contain_text("acme/Missing: repository not found")
     expect(page.locator("#mf-hubmsg")).not_to_contain_text("update FLYX")
+    expect(page.locator("#mf-load")).to_be_disabled()
     server.files_fail = (502, "cannot reach the Hub (timed out)")
     page.locator("#hf-retry").click()
     expect(page.locator("#mf-hubmsg.banner.bad")).to_contain_text("cannot reach the Hub (timed out)")
-    server.files_fail = None
-    page.locator("#hf-q").fill(REPO)
+    # Searching org/repo:Q5_K_M when /v1/hub/files fails once still selects Q5_K_M when Retry succeeds.
+    page.locator("#hf-q").fill(REPO + ":Q5_K_M")
     page.keyboard.press("Enter")
+    expect(page.locator("#mf-hubmsg.banner.bad")).to_contain_text("cannot reach the Hub")
+    expect(page.locator("#mf-load")).to_be_disabled()
+    server.files_fail = None
+    page.locator("#hf-retry").click()
     expect(page.locator("#mf-files .mrow")).to_have_count(5)
+    expect(page.locator("#mf-files .mrow.sel")).to_have_attribute("data-name", REPO + ":Q5_K_M")
+    # An ordinary text search that returns 0 results clears the previously shown repository detail and target.
+    page.locator("#hf-q").fill("no-such-model-xyz")
+    page.keyboard.press("Enter")
+    expect(page.locator("#hf-list .prow")).to_have_count(0)
+    expect(page.locator("#hf-detail")).to_have_count(0)
+    expect(page.locator(".hub-detail")).to_contain_text("Pick a repository on the left")
+    expect(page.locator("#mf-load")).to_be_disabled()
     page.locator("#hf-q").fill("")
+    expect(page.locator("#hf-list .prow")).to_have_count(3)
 
 
 def check_local(page, server):
@@ -1039,9 +1058,11 @@ def check_nothing_served(page, server, remembered):
         page.locator("#mf-load").click()
     expect(page.locator("#mv-current")).to_be_visible()
     body = server.posted[-1]
-    # kv "auto": the engine's default, not the server's --kv (null would keep that)
+    # kv "auto": the engine's default, not the server's --kv (null would keep that);
+    # vram_reserve/ram_reserve stay null so CLI --vram-reserve / --ram-reserve are preserved on first load.
     assert (body["model"], body["ctx"], body["kv"], body["kv_ram"], body["kv_gpu"], body["speculative"], body["drafter"], body["drafters"]) == \
         (REPO + ":Q5_K_M", None, "auto", "auto", None, True, "", []), body
+    assert body["vram_reserve"] is None and body["ram_reserve"] is None, body
     expect(page.locator("#mf-settings")).to_have_count(0)
     expect(page.locator("#ld-reload")).to_be_hidden()
     expect(page.locator("#ld-unload")).to_be_hidden()
@@ -1277,6 +1298,69 @@ def check_lora(open_page, want):
         FOLDERS[FOLDER]["models"].remove(adapter)
 
 
+def check_local_posix(open_page, want):
+    """POSIX Local tab: case-sensitive folders (/Models vs /models), root '/', and --models-dir == cacheDir merging."""
+    posix_cache = "/home/user/.cache/huggingface/hub"
+    posix_catalog = {
+        "cache": posix_cache,
+        "cache_from": "default",
+        "dirs": [posix_cache, "/Models", "/models", "/"],
+        "models": [
+            {"name": REPO + ":Q4_K_M", "kind": "gguf", "source": "hub", "repo": REPO, "quant": "Q4_K_M",
+             "file": "Tiny-27B-Q4_K_M.gguf", "path": posix_cache + "/models--acme--Tiny-27B-GGUF/snapshots/abc/Tiny-27B-Q4_K_M.gguf",
+             "size": int(17.6 * GB), "modified": 1.7e9, "revision": "abc", "current": True, "mtp": None, "mmproj": None},
+            {"name": posix_cache + "/loose.gguf", "kind": "gguf", "source": "dir", "repo": None, "quant": "Q8_0",
+             "file": "loose.gguf", "path": posix_cache + "/loose.gguf",
+             "size": int(2.1 * GB), "modified": 1.7e9, "revision": None, "current": True, "mtp": None},
+            {"name": "/Models/Upper-7B.gguf", "kind": "gguf", "source": "dir", "repo": None, "quant": "Q4_K_M",
+             "file": "Upper-7B.gguf", "path": "/Models/Upper-7B.gguf",
+             "size": int(4.1 * GB), "modified": 1.7e9, "revision": None, "current": True, "mtp": None},
+            {"name": "/models/lower-7B.gguf", "kind": "gguf", "source": "dir", "repo": None, "quant": "Q4_K_M",
+             "file": "lower-7B.gguf", "path": "/models/lower-7B.gguf",
+             "size": int(4.2 * GB), "modified": 1.7e9, "revision": None, "current": True, "mtp": None},
+            {"name": "/root-model.gguf", "kind": "gguf", "source": "dir", "repo": None, "quant": "Q4_K_M",
+             "file": "root-model.gguf", "path": "/root-model.gguf",
+             "size": int(3.0 * GB), "modified": 1.7e9, "revision": None, "current": True, "mtp": None},
+        ],
+    }
+    posix_folders = {
+        posix_cache: {"path": posix_cache, "parent": "/home/user/.cache/huggingface", "kind": "dir", "dirs": [],
+                      "models": [posix_catalog["models"][1]]},
+        "/Models": {"path": "/Models", "parent": "/", "kind": "dir", "dirs": [],
+                    "models": [posix_catalog["models"][2]]},
+        "/models": {"path": "/models", "parent": "/", "kind": "dir", "dirs": [],
+                    "models": [posix_catalog["models"][3]]},
+        "/": {"path": "/", "parent": None, "kind": "dir", "dirs": [],
+              "models": [posix_catalog["models"][4]]},
+    }
+    served = dict(want, model="/models/lower-7B.gguf")
+    page, _ = open_page(telemetry(served), catalog=posix_catalog, folders=posix_folders)
+    view(page, "library")
+    page.locator('#src-seg [data-src="local"]').click()
+    # All 4 POSIX folders stay distinct: cache (merged Hub + --models-dir), /Models, /models, and root '/'.
+    folders = page.locator("#lc-list .prow.folder")
+    expect(folders).to_have_count(4)
+    expect(page.locator('#lc-list .prow.folder[data-place="dir:' + posix_cache + '"]')).to_have_count(1)
+    expect(page.locator('#lc-list .prow.folder[data-place="dir:/Models"]')).to_have_count(1)
+    expect(page.locator('#lc-list .prow.folder[data-place="dir:/models"]')).to_have_count(1)
+    expect(page.locator('#lc-list .prow.folder[data-place="dir:/"]')).to_have_count(1)
+    # Every model is visible (both Hub cache entry and loose local file inside cacheDir, plus /Models, /models, and /).
+    expect(page.locator("#lc-list .prow.model")).to_have_count(5)
+    expect(page.locator('#lc-list .prow.model[data-model="' + REPO + ':Q4_K_M"]')).to_have_count(1)
+    expect(page.locator('#lc-list .prow.model[data-model="' + posix_cache + '/loose.gguf"]')).to_have_count(1)
+    expect(page.locator('#lc-list .prow.model[data-model="/Models/Upper-7B.gguf"]')).to_have_count(1)
+    expect(page.locator('#lc-list .prow.model[data-model="/models/lower-7B.gguf"]')).to_have_count(1)
+    expect(page.locator('#lc-list .prow.model[data-model="/root-model.gguf"]')).to_have_count(1)
+    # Clicking the root-level model shows folder '/' cleanly without mangling it to empty string.
+    page.locator('#lc-list .prow.model[data-model="/root-model.gguf"]').click()
+    expect(page.locator("#lc-path")).to_contain_text("/root-model.gguf")
+    # Clicking the cache folder lists both the Hub repo group and the loose local file in cacheDir.
+    page.locator('#lc-list .prow.folder[data-place="dir:' + posix_cache + '"]').click()
+    expect(page.locator("#mf-cached")).to_contain_text("Tiny-27B-GGUF")
+    expect(page.locator("#mf-cached")).to_contain_text("loose.gguf")
+    page.close()
+
+
 def check(browser):
     want = {"model": "./models/Local [27B] & O'Brien.gguf", "ctx": 8192, "kv": "fp8", "kv_gpu": 0, "kv_ram": 4}
     errors = []
@@ -1300,6 +1384,7 @@ def check(browser):
     check_vram_apps(open_page, want)
     check_switch_companions(open_page, want)
     check_lora(open_page, want)
+    check_local_posix(open_page, want)
     plain = dict(want, model="models/local.gguf")
     page, server = open_page(telemetry(plain))
     check_hub(page, server, plain)

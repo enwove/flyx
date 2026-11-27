@@ -429,15 +429,25 @@ bool ModelHost::remote_manage() {
 }
 
 bool ModelHost::save_remote_manage(bool enabled, std::string* err) {
+  return save_network_settings(std::nullopt, enabled, nullptr, nullptr, err);
+}
+
+bool ModelHost::save_network_settings(std::optional<bool> lan_access, std::optional<bool> remote_manage,
+                                      const std::function<void(bool)>& on_remote_manage_committed,
+                                      bool* out_lan_access, std::string* err) {
   if (settings_path().empty()) {
-    *err = "no configuration directory available to save LAN management setting";
+    *err = "no configuration directory available to save network settings";
     return false;
   }
   std::lock_guard<std::mutex> lock(settings_mutex());
   ojson root = read_settings_locked();
   if (!root.is_object()) root = ojson::object();
-  root["remote_manage"] = enabled;
-  return write_settings_locked(root, err);
+  if (lan_access.has_value()) root["lan_access"] = *lan_access;
+  if (remote_manage.has_value()) root["remote_manage"] = *remote_manage;
+  if (!write_settings_locked(root, err)) return false;
+  if (remote_manage.has_value() && on_remote_manage_committed) on_remote_manage_committed(*remote_manage);
+  if (out_lan_access) *out_lan_access = root.contains("lan_access") && root["lan_access"] == true;
+  return true;
 }
 
 ModelHost::~ModelHost() {

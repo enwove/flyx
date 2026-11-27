@@ -699,6 +699,40 @@ int main() {
           "explicit vram_reserve=2 GiB reserves exactly 2 GiB (" + std::to_string(ledger_big.budget()) + ")");
   }
   {
+    // Platform VRAM floor (min_vram_reserve, e.g. native Windows 256 MiB WDDM pieces floor) clamps lower overrides.
+    const uint64_t floor = 256 * kMiB;
+    check(plan::effective_device_reserve(16 * kGiB, false, 0, 0) == 0,
+          "effective_device_reserve honors 0 when min_floor=0 (Linux)");
+    check(plan::effective_device_reserve(16 * kGiB, false, 0, floor) == floor,
+          "effective_device_reserve clamps 0 to 256 MiB floor");
+    check(plan::effective_device_reserve(16 * kGiB, false, int64_t(100 * kMiB), floor) == floor,
+          "effective_device_reserve clamps 100 MiB to 256 MiB floor");
+    check(plan::effective_device_reserve(16 * kGiB, false, int64_t(512 * kMiB), floor) == 512 * kMiB,
+          "effective_device_reserve preserves 512 MiB above 256 MiB floor");
+    ResourceLedger l_zero, l_small, l_above;
+    plan::Budget b_zero, b_small, b_above;
+    std::string err;
+    int c0 = 8192, c1 = 8192, c2 = 8192;
+    plan::KvTiers t_zero = kGpuOnly;
+    t_zero.vram_reserve = 0;
+    t_zero.min_vram_reserve = floor;
+    plan::KvTiers t_small = kGpuOnly;
+    t_small.vram_reserve = int64_t(100 * kMiB);
+    t_small.min_vram_reserve = floor;
+    plan::KvTiers t_above = kGpuOnly;
+    t_above.vram_reserve = int64_t(512 * kMiB);
+    t_above.min_vram_reserve = floor;
+    check(plan::account(&api, nullptr, false, false, &c0, 4096, t_zero, &l_zero, &b_zero, &err) &&
+              l_zero.budget() == 16 * kGiB - floor,
+          "min_vram_reserve=256 MiB clamps vram_reserve=0 in account()");
+    check(plan::account(&api, nullptr, false, false, &c1, 4096, t_small, &l_small, &b_small, &err) &&
+              l_small.budget() == 16 * kGiB - floor,
+          "min_vram_reserve=256 MiB clamps vram_reserve=100 MiB in account()");
+    check(plan::account(&api, nullptr, false, false, &c2, 4096, t_above, &l_above, &b_above, &err) &&
+              l_above.budget() == 16 * kGiB - 512 * kMiB,
+          "min_vram_reserve=256 MiB preserves vram_reserve=512 MiB in account()");
+  }
+  {
     // Auto host RAM budget (--kv-ram auto) honors --ram-reserve: 0 >= auto > large explicit reserve.
     ResourceLedger l0, l1, l2;
     plan::Budget b0, b1, b2;

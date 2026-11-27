@@ -244,8 +244,9 @@ bool fetch_blob(const Repo& r, const RepoFile& f, const fs::path& blob, Meter* m
   std::error_code ec;
   if (!partial.can_resume()) fs::remove(partial.data, ec), fs::remove(partial.map, ec);  // unknown state: start over
 
-  BlobTransfer tx(f, endpoint() + "/" + r.id + "/resolve/" + r.commit + "/" + detail::url_path(f.path),
-                  detail::auth_headers(), partial.pieces, meter, stop);
+  const auto ep = resolve_endpoint();
+  BlobTransfer tx(f, ep.value + "/" + r.id + "/resolve/" + r.commit + "/" + detail::url_path(f.path),
+                  detail::auth_headers(ep), partial.pieces, meter, stop);
   if (!tx.out.open(from_path(partial.data), f.size, err) ||
       !tx.map.open(from_path(partial.map), partial.pieces, err) ||
       !tx.map.read_at(0, tx.done.data(), partial.pieces, err))
@@ -314,9 +315,10 @@ bool gated_field(const nlohmann::json& o) {
 
 std::string base_relation(const std::string& repo) {
   if (offline()) return "";
+  const auto ep = resolve_endpoint();
   os::HttpGet g;
-  g.url = endpoint() + "/api/models/" + repo + "?expand[]=baseModels";
-  g.headers = detail::auth_headers();
+  g.url = ep.value + "/api/models/" + repo + "?expand[]=baseModels";
+  g.headers = detail::auth_headers(ep);
   std::string body, net;
   int status = 0;
   if (!os::http_get_text(g, &body, &status, &net) || status != 200) return "";
@@ -332,9 +334,10 @@ bool describe(const std::string& repo, const std::string& revision, Repo* out, s
   if (!detail::valid_word(r.revision)) return *err = "not a Hub revision name: " + r.revision, false;
   std::string net;
   if (!offline()) {
+    const auto ep = resolve_endpoint();
     os::HttpGet g;
-    g.url = endpoint() + "/api/models/" + repo + "/revision/" + detail::url_path(r.revision) + "?blobs=true";
-    g.headers = detail::auth_headers();
+    g.url = ep.value + "/api/models/" + repo + "/revision/" + detail::url_path(r.revision) + "?blobs=true";
+    g.headers = detail::auth_headers(ep);
     std::string body;
     int status = 0;
     if (os::http_get_text(g, &body, &status, &net)) {
@@ -458,16 +461,17 @@ bool search(const std::string& query, const std::string& sort, int limit, std::v
   if (offline()) return *err = "HF_HUB_OFFLINE is set: the Hub is not asked", false;
   const char* by = sort == "downloads" ? "downloads" : sort == "likes" ? "likes" : sort == "updated" ? "lastModified"
                  : sort == "created" ? "createdAt" : "trendingScore";
+  const auto ep = resolve_endpoint();
   os::HttpGet g;
   // expand[]: returns GGUF architecture, timestamps, counts and gated status without full sibling file lists.
-  g.url = endpoint() + "/api/models?" + (gguf_only ? "filter=gguf&" : "") + "direction=-1&sort=" + by + "&limit=" +
+  g.url = ep.value + "/api/models?" + (gguf_only ? "filter=gguf&" : "") + "direction=-1&sort=" + by + "&limit=" +
           std::to_string(std::clamp(limit, 1, 100)) +
           "&expand[]=gguf&expand[]=downloads&expand[]=likes&expand[]=lastModified&expand[]=createdAt"
           "&expand[]=pipeline_tag&expand[]=gated" +
           (gguf_only ? "" : "&expand[]=config") +
           (query.empty() ? "" : "&search=" + detail::url_query(query)) +
           (cursor.empty() ? "" : "&cursor=" + detail::url_query(cursor));
-  g.headers = detail::auth_headers();
+  g.headers = detail::auth_headers(ep);
   g.connect_timeout_s = 10, g.stall_timeout_s = 20;
   std::string body, link, net;
   int status = 0;
@@ -500,9 +504,10 @@ namespace {
 bool file_of(const Repo& r, const RepoFile& f, fs::path* local, os::HttpGet* g, std::string* err) {
   if (!detail::valid_repo(r.id) || !detail::is_commit(r.commit) || !detail::safe_path(f.path))
     return *err = "not a file of a Hub repository: " + r.id + "/" + f.path, false;
+  const auto ep = resolve_endpoint();
   *local = to_path(snapshot_dir(r)) / to_path(f.path);
-  g->url = endpoint() + "/" + r.id + "/resolve/" + r.commit + "/" + detail::url_path(f.path);
-  g->headers = detail::auth_headers();
+  g->url = ep.value + "/" + r.id + "/resolve/" + r.commit + "/" + detail::url_path(f.path);
+  g->headers = detail::auth_headers(ep);
   g->connect_timeout_s = 10, g->stall_timeout_s = 20;
   return true;
 }
@@ -567,12 +572,13 @@ bool adapters_of(const std::string& base, int limit, std::vector<Found>* out, st
   if (next_cursor) next_cursor->clear();
   if (!detail::valid_repo(base)) return *err = "not a Hub repository name: " + base, false;
   if (offline()) return *err = "HF_HUB_OFFLINE is set: the Hub is not asked", false;
+  const auto ep = resolve_endpoint();
   os::HttpGet g;
-  g.url = endpoint() + "/api/models?filter=" + detail::url_query("base_model:adapter:" + base) +
+  g.url = ep.value + "/api/models?filter=" + detail::url_query("base_model:adapter:" + base) +
           "&sort=downloads&direction=-1&limit=" + std::to_string(std::clamp(limit, 1, 100)) +
           "&expand[]=downloads&expand[]=likes&expand[]=lastModified&expand[]=createdAt&expand[]=gated" +
           (cursor.empty() ? "" : "&cursor=" + detail::url_query(cursor));
-  g.headers = detail::auth_headers();
+  g.headers = detail::auth_headers(ep);
   g.connect_timeout_s = 10, g.stall_timeout_s = 20;
   std::string body, link, net;
   int status = 0;

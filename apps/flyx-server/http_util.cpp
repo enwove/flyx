@@ -8,6 +8,7 @@
 #include <climits>
 #include <cmath>
 #include <cstdio>
+#include <cstring>
 #include <mutex>
 #include <random>
 
@@ -340,6 +341,121 @@ bool admit_browser_request(const Server& s, const httplib::Request& req, httplib
   return true;
 }
 
+namespace {
+
+bool parse_host_authority(std::string_view authority, std::string* host_out, int* port_out) {
+  if (authority.empty()) return false;
+  auto parse_port = [](std::string_view s, int* out) {
+    if (s.empty() || s.size() > 5) return false;
+    int val = 0;
+    for (char c : s) {
+      if (!std::isdigit(static_cast<unsigned char>(c))) return false;
+      val = val * 10 + (c - '0');
+    }
+    if (val <= 0 || val > 65535) return false;
+    *out = val;
+    return true;
+  };
+  int port = 80;
+  std::string_view host = authority;
+  if (host.front() == '[') {
+    const size_t close = host.find(']');
+    if (close == std::string_view::npos || close <= 1) return false;
+    if (close + 1 != host.size()) {
+      if (host[close + 1] != ':' || !parse_port(host.substr(close + 2), &port)) return false;
+    }
+    host = host.substr(1, close - 1);
+  } else {
+    const size_t colon = host.rfind(':');
+    if (colon != std::string_view::npos) {
+      if (host.find(':') != colon) return false;  // unbracketed IPv6 is invalid in Host
+      if (!parse_port(host.substr(colon + 1), &port)) return false;
+      host = host.substr(0, colon);
+    }
+  }
+  if (host.empty()) return false;
+  *host_out = std::string(host);
+  *port_out = port;
+  return true;
+}
+
+std::string_view strip_v4_mapped(std::string_view ip) {
+  if (ip.size() > 7 && iequals(ip.substr(0, 7), "::ffff:")) return ip.substr(7);
+  return ip;
+}
+
+bool same_host_literal(std::string_view a, std::string_view b) {
+  if (iequals(a, b)) return true;
+  if (a.find(':') != std::string_view::npos && b.find(':') != std::string_view::npos) {
+    in6_addr ia{}, ib{};
+    const std::string sa(a), sb(b);
+    if (inet_pton(AF_INET6, sa.c_str(), &ia) == 1 && inet_pton(AF_INET6, sb.c_str(), &ib) == 1)
+      return std::memcmp(&ia, &ib, sizeof(ia)) == 0;
+  }
+  return false;
+}
+
+// Validate Host header for non-loopback keyless requests against this listener's local socket address, configured
+// interface addresses, and machine hostname (stopping DNS rebinding where evil.example resolves to a LAN IP).
+bool is_allowed_lan_host(const Server& s, const httplib::Request& req, std::string_view authority) {
+  std::string host;
+  int port = 0;
+  if (!parse_host_authority(authority, &host, &port)) return false;
+  const int expected_port = req.local_port > 0 ? req.local_port : s.listen_port;
+  if (expected_port > 0 && port != expected_port) return false;
+  if (host == "0.0.0.0" || host == "::") return false;
+  if (!req.local_addr.empty() && same_host_literal(host, strip_v4_mapped(req.local_addr))) return true;
+  for (const std::string& allowed : s.allowed_hosts)
+    if (same_host_literal(host, allowed)) return true;
+  return false;
+}
+
+bool is_sep(char c) { return c == '\\' || c == '/'; }
+
+// Lexically normalize a Windows UNC path (\\server\share\...) into lowercased components without touching the
+// filesystem or network. Returns false for Win32 device namespaces (\\?\, \\.\) or traversal escaping the share.
+bool normalize_unc_components(std::string_view raw, std::vector<std::string>* out) {
+  out->clear();
+  if (!is_unc_or_device_path(raw)) return false;
+  size_t i = 0;
+  while (i < raw.size() && is_sep(raw[i])) ++i;
+  while (i < raw.size()) {
+    size_t j = i;
+    while (j < raw.size() && !is_sep(raw[j])) ++j;
+    const std::string seg = lower(raw.substr(i, j - i));
+    if (out->empty() && (seg == "?" || seg == ".")) return false;  // \\?\ or \\.\ device namespace
+    if (seg == ".") {
+      // ignore current-dir segment after server/share
+      if (out->size() < 2) return false;
+    } else if (seg == "..") {
+      if (out->size() <= 2) return false;  // cannot climb above \\server\share
+      out->pop_back();
+    } else if (!seg.empty()) {
+      out->push_back(seg);
+    }
+    i = j;
+    while (i < raw.size() && is_sep(raw[i])) ++i;
+  }
+  return out->size() >= 2;
+}
+
+}  // namespace
+
+bool is_unc_or_device_path(std::string_view path) { return path.size() >= 2 && is_sep(path[0]) && is_sep(path[1]); }
+
+bool remote_path_allowed(const Server& s, const httplib::Request& req, std::string_view path) {
+  if (path.empty() || from_this_machine(req)) return true;
+  if (!is_unc_or_device_path(path)) return true;
+  std::vector<std::string> target;
+  if (!normalize_unc_components(path, &target)) return false;
+  for (const std::string& root : s.models_dirs) {
+    std::vector<std::string> base;
+    if (!normalize_unc_components(root, &base)) continue;
+    if (target.size() >= base.size() && std::equal(base.begin(), base.end(), target.begin())) return true;
+  }
+  return false;
+}
+
 bool browser_request_safe(const Server& s, const httplib::Request& req) {
   if (!s.cfg.api_key.empty()) return true;
   const bool local = is_loopback_ip(req.remote_addr);
@@ -352,7 +468,11 @@ bool browser_request_safe(const Server& s, const httplib::Request& req) {
   const std::string sfs = req.get_header_value("Sec-Fetch-Site");
   if (!sfs.empty() && iequals(sfs, "cross-site") && !page_visit && !cors) return false;
   const std::string host = req.get_header_value("Host");
-  if (local && !host.empty() && !is_loopback_host(host)) return false;
+  if (local) {
+    if (!host.empty() && !is_loopback_host(host)) return false;
+  } else {
+    if (!is_allowed_lan_host(s, req, host)) return false;
+  }
   const std::string origin = req.get_header_value("Origin");
   if (!origin.empty() && !cors) {
     if (iequals(origin, "null")) return false;
@@ -393,7 +513,16 @@ bool authorized(const Server& s, const httplib::Request& req) {
 bool may_manage(const Server& s, const httplib::Request& req) {
   if (!authorized(s, req)) return false;
   if (!s.cfg.api_key.empty()) return true;
-  return (from_this_machine(req) || s.remote_manage.load(std::memory_order_relaxed)) && browser_request_safe(s, req);
+  if (forwarded(req)) return false;
+  const bool peer_ok =
+      is_loopback_ip(req.remote_addr) || (s.serving_lan && s.remote_manage.load(std::memory_order_acquire));
+  return peer_ok && browser_request_safe(s, req);
+}
+
+bool may_manage_local_or_keyed(const Server& s, const httplib::Request& req) {
+  if (!authorized(s, req)) return false;
+  if (!s.cfg.api_key.empty()) return true;
+  return from_this_machine(req) && browser_request_safe(s, req);
 }
 
 bool from_this_machine(const httplib::Request& req) { return is_loopback_ip(req.remote_addr) && !forwarded(req); }
@@ -410,6 +539,16 @@ bool require_manage(const Server& s, const httplib::Request& req, httplib::Respo
   send_json(res, 403,
             {{"error",
               {{"message", std::string(what) + " is for this machine (use --api-key KEY, or --no-auth on a trusted LAN)"},
+               {"type", "permission_error"}}}});
+  return false;
+}
+
+bool require_local_or_keyed_manage(const Server& s, const httplib::Request& req, httplib::Response& res,
+                                   const char* what) {
+  if (may_manage_local_or_keyed(s, req)) return true;
+  send_json(res, 403,
+            {{"error",
+              {{"message", std::string(what) + " is for this machine or an --api-key holder"},
                {"type", "permission_error"}}}});
   return false;
 }

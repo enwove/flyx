@@ -202,7 +202,7 @@ export function Integration({ active }) {
         <details class="ep"><summary><span class="method delete">DELETE</span><span class="path">/v1/load</span><span class="what">${t("Stop a fetch")}</span><svg class="i"><use href="#i-chev"/></svg></summary>
           <div class="body"><ul>${Li(String.raw`What came stays in the cache; loading the same name again goes on from there.`)}</ul></div></details>
         <details class="ep"><summary><span class="method get">GET / POST</span><span class="path">/v1/settings/network</span><span class="what">${t("Serve on local network")}</span><svg class="i"><use href="#i-chev"/></svg></summary>
-          <div class="body"><code>{"lan_access": true, "remote_manage": false}</code><p>${t("Restart flyx to apply changes.")}</p></div></details>
+          <div class="body"><code>{"lan_access": true, "remote_manage": false}</code><p>${t("lan_access applies on restart; remote_manage applies immediately.")}</p></div></details>
         <details class="ep"><summary><span class="method get">GET</span><span class="path">/v1/hub/config</span><span class="what">${t("Hub mirror setting")}</span><svg class="i"><use href="#i-chev"/></svg></summary>
           <div class="body"><ul>${Li(String.raw`Active Hugging Face endpoint (<code>endpoint</code>), default endpoint, <code>source</code> (<code>setting</code>, <code>HF_ENDPOINT</code>, or <code>default</code>), and <code>offline</code> flag.`)}</ul></div></details>
         <details class="ep"><summary><span class="method post">POST</span><span class="path">/v1/hub/config</span><span class="what">${t("Set the Hub mirror")}</span><svg class="i"><use href="#i-chev"/></svg></summary>
@@ -236,12 +236,12 @@ export function Integration({ active }) {
         <details class="ep"><summary><span class="method get">GET</span><span class="path">/v1/requests</span><span class="what">${t("Recent prompts and answers")}</span><svg class="i"><use href="#i-chev"/></svg></summary>
           <div class="body"><ul>
             ${Li(String.raw`The last 50 finished requests, newest first (<code>?limit=N</code>): the request body as sent, the thinking, the answer, tool calls, usage and time to first token.`)}
-            ${Li(String.raw`Kept in the server's memory only; readable from this machine or with the API key. <code>--no-request-log</code> keeps none (<code>"enabled": false</code>).`)}
+            ${Li(String.raw`Kept in the server's memory only; readable from this machine, with the API key, or over direct LAN when <code>--no-auth</code> or <code>remote_manage</code> is enabled. <code>--no-request-log</code> keeps none (<code>"enabled": false</code>).`)}
           </ul></div></details>
         <details class="ep"><summary><span class="method get">GET</span><span class="path">/v1/logs</span><span class="what">${t("The server's log lines")}</span><svg class="i"><use href="#i-chev"/></svg></summary>
           <div class="body"><ul>
             ${Li(String.raw`What the server process wrote to standard error, numbered: <code>?after=SEQ</code> gives the lines after one already seen, oldest first (<code>?limit=N</code>, default 500). Answers <code>lines</code> (<code>seq</code>, <code>t</code>, <code>text</code>), <code>next</code> and <code>missed</code>.`)}
-            ${Li(String.raw`The last 2,000 lines, in memory only; readable from this machine or with the API key. <code>--no-system-log</code> keeps none.`)}
+            ${Li(String.raw`The last 2,000 lines, in memory only; readable from this machine, with the API key, or over direct LAN when <code>--no-auth</code> or <code>remote_manage</code> is enabled. <code>--no-system-log</code> keeps none.`)}
           </ul></div></details>
         <details class="ep"><summary><span class="method get">GET</span><span class="path">/health</span><span class="what">${t("Status, model, queue length")}</span><svg class="i"><use href="#i-chev"/></svg></summary>
           <div class="body"><ul>${Li(String.raw`<code>{"status": "ok", "model": ..., "queued": 0, "loaded": true}</code>`)}</ul></div></details>

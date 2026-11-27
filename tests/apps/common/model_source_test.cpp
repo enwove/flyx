@@ -219,9 +219,14 @@ int main() {
     const std::string home = flyx::os::home_dir();
     if (!home.empty()) {
       check(flyx::apps::expand_user_path("~") == home, "expand_user_path(\"~\") returns home_dir");
+      check(flyx::apps::expand_user_path("~/") == home && flyx::apps::expand_user_path("~///") == home,
+            "expand_user_path(\"~/\") and \"~///\" return home_dir");
       const fs::path expected = to_path(home) / "models";
       check(to_path(flyx::apps::expand_user_path("~/models")) == expected,
             "expand_user_path(\"~/models\") expands tilde");
+      check(to_path(flyx::apps::expand_user_path("~//models")) == expected &&
+                to_path(flyx::apps::expand_user_path("~\\\\models")) == expected,
+            "expand_user_path strips repeated slashes after ~ instead of escaping home");
       check(flyx::apps::expand_user_path("/abs/models") == "/abs/models",
             "expand_user_path leaves non-tilde paths untouched");
     }
@@ -230,32 +235,47 @@ int main() {
     const fs::path unsupported = scan_root / "Other" / "Unsupported-Q4.gguf";
     const fs::path ext_dir = tmp / "external_models";
     const fs::path linked_model = ext_dir / "Linked-Q4_K_M.gguf";
+    const fs::path hidden_target = scan_root / "z-real";
+    const fs::path hidden_target_model = hidden_target / "Real-Q4_K_M.gguf";
+    const fs::path deep_target = scan_root / "z-deep-real";
+    const fs::path deep_target_model = deep_target / "sub" / "Deep-Q4_K_M.gguf";
     write_gguf(nested, "qwen35");
     write_gguf(unsupported, "some_future_arch");
     write_gguf(linked_model, "qwen3");
+    write_gguf(hidden_target_model, "qwen3");
+    write_gguf(deep_target_model, "qwen3");
     std::ofstream(scan_root / "README.txt", std::ios::binary) << "ignore me";
 
-    // Create a directory symlink to external_models and a symlink loop back to scan_root (skip if OS disallows).
+    // Create directory symlinks: external target, cycle, hidden alias to z-real, and deep alias to z-deep-real.
     std::error_code sym_ec;
     fs::create_directory_symlink(ext_dir, scan_root / "linked", sym_ec);
     const bool symlinks_ok = !sym_ec;
     if (symlinks_ok) {
-      std::error_code loop_ec;
-      fs::create_directory_symlink(scan_root, scan_root / "Author" / "loop", loop_ec);
+      std::error_code e1, e2, e3;
+      fs::create_directory_symlink(scan_root, scan_root / "Author" / "loop", e1);
+      fs::create_directory_symlink(hidden_target, scan_root / ".alias-hidden", e2);
+      fs::create_directories(scan_root / "a" / "b" / "c", e3);
+      fs::create_directory_symlink(deep_target, scan_root / "a" / "b" / "c" / "deep-link", e3);
     }
 
-    const auto found = flyx::apps::scan_model_dirs({from_path(scan_root), from_path(tmp / "does_not_exist")});
-    bool saw_nested = false, saw_unsupported = false, saw_linked = false;
+    const auto found = flyx::apps::scan_model_dirs({from_path(scan_root), from_path(tmp / "does_not_exist")}, 4);
+    bool saw_nested = false, saw_unsupported = false, saw_linked = false, saw_hidden_real = false,
+         saw_deep_real = false;
     for (const auto& m : found) {
       const fs::path p = to_path(m.path);
       if (p.filename() == "Nested-Q4_K_M.gguf") saw_nested = true;
       if (p.filename() == "Unsupported-Q4.gguf") saw_unsupported = true;
       if (p.filename() == "Linked-Q4_K_M.gguf") saw_linked = true;
+      if (p.filename() == "Real-Q4_K_M.gguf") saw_hidden_real = true;
+      if (p.filename() == "Deep-Q4_K_M.gguf") saw_deep_real = true;
     }
     check(saw_nested && saw_unsupported,
           "scan_model_dirs finds nested GGUFs and does not break on unsupported architectures or non-GGUF files");
-    if (symlinks_ok)
+    if (symlinks_ok) {
       check(saw_linked, "scan_model_dirs follows directory symlinks and survives symlink cycles");
+      check(saw_hidden_real, "excluded hidden symlink does not prevent scanning its real target directory");
+      check(saw_deep_real, "deep symlink visit does not prevent shallower scan of its real target directory");
+    }
   }
   set_env("HF_HUB_OFFLINE", "");
   set_env("HF_HUB_CACHE", "");

@@ -235,11 +235,12 @@ function formOf(w) {
 const EMPTY_FORM = formOf({});
 
 // What the panel asks of POST /v1/load.
-function loadBody(chosen, f) {
+function loadBody(chosen, f, hasLoaded = false) {
   const ctxText = String(f.ctx).trim().toLowerCase(), ctxTokens = parseInt(ctxText, 10);
   const ctx = ctxText === "max" ? "max" : ctxTokens > 0 ? ctxTokens : null;  // "max": the model's own, or the longest that fits
   const kvRam = parseFloat(f.kvram), kvGpu = parseInt(f.kvgpu, 10), name = f.name.trim(), lora = f.lora.trim();
   const vramRes = parseFloat(f.vramres), ramRes = parseFloat(f.ramres);
+  const blankReserve = hasLoaded ? "auto" : null;
   const own = f.draftSource === "custom" && f.spec ? f.drafter.trim() : "";
   const adv = { width: f.width ? parseInt(f.width, 10) : null, draft_trees: f.trees === "on" ? true : f.trees === "off" ? false : null, lookup: f.lookup,
                 draft_head: f.head || null, draft_weights: f.weights || null };
@@ -255,7 +256,7 @@ function loadBody(chosen, f) {
   // kv "auto": the engine's default, not the server's --kv (null would keep that)
   return Object.assign({ model: chosen, ctx, kv: f.kv || "auto", kv_ram: kvRam >= 0 ? kvRam : "auto",
                          kv_gpu: kvGpu >= 0 ? kvGpu : null,
-                         vram_reserve: vramRes >= 0 ? vramRes : "auto", ram_reserve: ramRes >= 0 ? ramRes : "auto",
+                         vram_reserve: vramRes >= 0 ? vramRes : blankReserve, ram_reserve: ramRes >= 0 ? ramRes : blankReserve,
                          name: name || null, lora: lora || null, speculative: f.spec },
                        draft, adv, vis);
 }
@@ -274,8 +275,8 @@ function commandOf(b, shell) {
   if (b.kv !== "auto") parts.push("--kv " + b.kv);
   if (b.kv_ram !== "auto") parts.push("--kv-ram " + b.kv_ram);
   if (b.kv_gpu !== null) parts.push("--kv-gpu " + b.kv_gpu);
-  if (b.vram_reserve !== undefined && b.vram_reserve !== "auto") parts.push("--vram-reserve " + b.vram_reserve);
-  if (b.ram_reserve !== undefined && b.ram_reserve !== "auto") parts.push("--ram-reserve " + b.ram_reserve);
+  if (b.vram_reserve !== undefined && b.vram_reserve !== null && b.vram_reserve !== "auto") parts.push("--vram-reserve " + b.vram_reserve);
+  if (b.ram_reserve !== undefined && b.ram_reserve !== null && b.ram_reserve !== "auto") parts.push("--ram-reserve " + b.ram_reserve);
   if (!b.speculative) parts.push("--no-spec");
   if (b.drafter) parts.push("--drafter " + b.drafter);
   for (const d of b.drafters) parts.push("--drafter-file " + q(d));
@@ -315,12 +316,40 @@ function savedFolders() {
   try { const v = JSON.parse(saved.get("folders") || "[]"); return Array.isArray(v) ? v.filter((x) => typeof x === "string") : []; }
   catch (e) { return []; }
 }
-const folderOf = (m) => (m.path || m.name).replace(/[\\/][^\\/]*$/, "");
-const normPath = (p) => String(p || "").replace(/[\\/]+$/, "").replace(/\\/g, "/").toLowerCase();
+const isWinPath = (p) => /^[a-zA-Z]:(?:[\\/]|$)|^\\\\|\\/.test(String(p || ""));
+const folderOf = (m) => {
+  const raw = String(m.path || m.name || "");
+  const i = Math.max(raw.lastIndexOf("/"), raw.lastIndexOf("\\"));
+  if (i < 0) return "";
+  if (i === 0) return "/";
+  if (i === 2 && /^[a-zA-Z]:/.test(raw)) return raw.slice(0, 3);
+  return raw.slice(0, i);
+};
+const normPath = (p) => {
+  const s = String(p || "");
+  if (!s) return "";
+  if (isWinPath(s)) {
+    const fwd = s.replace(/\\/g, "/");
+    if (/^[a-zA-Z]:\/+$/.test(fwd)) return fwd.slice(0, 2).toLowerCase() + "/";
+    return fwd.replace(/\/+$/, "").toLowerCase();
+  }
+  if (/^\/+$/.test(s)) return "/";
+  return s.replace(/\/+$/, "");
+};
 const samePath = (a, b) => normPath(a) === normPath(b);
 const pathUnder = (p, dir) => {
   const a = normPath(p), b = normPath(dir);
-  return !!b && (a === b || a.startsWith(b + "/"));
+  if (!b) return false;
+  if (a === b) return true;
+  return b.endsWith("/") ? a.startsWith(b) : a.startsWith(b + "/");
+};
+const relUnder = (mf, base) => {
+  if (!pathUnder(mf, base)) return "";
+  const a = normPath(mf), b = normPath(base);
+  if (a === b) return "";
+  const raw = String(mf || "").replace(/\\/g, "/").replace(/\/+$/, "");
+  const baseLen = b.endsWith("/") ? b.length : b.length + 1;
+  return raw.slice(baseLen).replace(/^\/+/, "");
 };
 const whole = (g) => !(g.split && g.complete === false);
 const sized = (b) => b >= 1e8 ? gb(b) + " GB" : Math.max(1, Math.round(b / 1e6)) + " MB";
@@ -344,6 +373,7 @@ export function ModelPage({ active, libraryAsked, currentAsked }) {
   const [found, setFound] = useState(null);
   const [foundMsg, setFoundMsg] = useState("");
   const [repoSel, setRepoSel] = useState("");
+  const [repoQuant, setRepoQuant] = useState("");
   const [hub, setHub] = useState(null);  // {repo, j}: GET /v1/hub/files of the repository shown
   const [hubMsg, setHubMsg] = useState("");
   const [hubCfg, setHubCfg] = useState(null);  // GET /v1/hub/config: {endpoint, default_endpoint, source, offline}
@@ -441,7 +471,7 @@ export function ModelPage({ active, libraryAsked, currentAsked }) {
       setEpText(r.json.endpoint || "");
     }
     search(q, sort, arch, 0, "");
-    if (repoSel) showRepo(repoSel, "");
+    if (repoSel) showRepo(repoSel, repoQuant);
   }
   async function findLoras(base, modelName) {
     const n = ++loraSeq.current;
@@ -501,8 +531,11 @@ export function ModelPage({ active, libraryAsked, currentAsked }) {
   // A repository's files and what the Hub says of it.  `quant`: the file to choose once they are known.
   async function showRepo(id, quant) {
     const n = ++repoSeq.current;
-    if (id !== repoSel) { setHubDraft(""); setHubMmproj(""); }
+    const wantQuant = quant || "";
+    if (id !== repoSel) { setHub(null); setHubDraft(""); setHubMmproj(""); }
     setRepoSel(id);
+    setRepoQuant(wantQuant);
+    setTarget("");
     setHubMsg("Asking Hugging Face about " + id + " ...");
     setMsg("");
     const a = await ask("/v1/hub/files?repo=" + encodeURIComponent(id), "list a repository");
@@ -511,7 +544,7 @@ export function ModelPage({ active, libraryAsked, currentAsked }) {
     setHub({ repo: id, j: a.j });
     setHubMsg(a.j.from_cache ? "From the local cache: Hugging Face was not reached." : "");
     const files = (a.j.ggufs || []).filter(whole);
-    const hit = quant ? files.find((g) => String(g.quant).toLowerCase() === quant.toLowerCase()) : (a.j.ggufs || []).length === 1 ? files[0] : null;
+    const hit = wantQuant ? files.find((g) => String(g.quant).toLowerCase() === wantQuant.toLowerCase()) : (a.j.ggufs || []).length === 1 ? files[0] : null;
     if (hit) setTarget(hit.name);
   }
   // The search box also takes a repository's whole name (org/name, org/name:QUANT, its address): shown at once.
@@ -533,16 +566,30 @@ export function ModelPage({ active, libraryAsked, currentAsked }) {
   // The repository shown: the served model's or first found on initial load, and the top match when a search updates.
   useEffect(() => {
     if (view !== "library" || tab !== "hub" || !found) return;
+    const qText = (found.query || "").trim();
+    const direct = qText && hubName(qText, hubEndpoint) ? repoOf(qText, hubEndpoint) : "";
+    if (!found.models.length) {
+      if (qText && (!direct || direct !== repoSel)) {
+        repoSeq.current++;
+        setRepoSel("");
+        setRepoQuant("");
+        setHub(null);
+        setHubMsg("");
+        setHubDraft("");
+        setHubMmproj("");
+        setTarget("");
+      }
+      return;
+    }
     if (!repoSel) {
       const served = loadedWant && isHub(loadedWant.model) ? repoNameOf(loadedWant.model) : "";
       const first = served || (found.models[0] && found.models[0].id);
       if (first) showRepo(first, "");
       return;
     }
-    const qText = (found.query || "").trim();
-    if (!qText || !found.models.length) return;
+    if (!qText) return;
     if (found.models.some((m) => m.id === repoSel)) return;
-    if (hubName(qText, hubEndpoint) && repoOf(qText, hubEndpoint) === repoSel) return;
+    if (direct && direct === repoSel) return;
     showRepo(found.models[0].id, "");
   }, [found, tab, view]);
 
@@ -669,7 +716,7 @@ export function ModelPage({ active, libraryAsked, currentAsked }) {
   const use = model.id ? f : EMPTY_FORM;
   const diffShown = (a, b) => Object.keys(b).filter((k) => k === "drafter"
     ? a[k].length !== b[k].length || a[k].some((value, i) => value !== b[k][i]) : a[k] !== b[k]);
-  const before = loadedWant ? shown(loadedWant) : null, now = shown(loadBody(loadedWant ? loadedWant.model : "", use));
+  const before = loadedWant ? shown(loadedWant) : null, now = shown(loadBody(loadedWant ? loadedWant.model : "", use, Boolean(loadedWant)));
   const changed = before ? diffShown(before, now) : [];
   const was = (k) => changed.includes(k) ? (k === "drafter" ? before[k].join(" · ") : before[k]) : null;
   const advChanged = ["width", "head", "weights", "lookup", "trees"].filter((k) => was(k) !== null);
@@ -697,7 +744,7 @@ export function ModelPage({ active, libraryAsked, currentAsked }) {
     }
     return next;
   }
-  const body = (name, overrides) => loadBody(name, settingsFor(name, overrides));
+  const body = (name, overrides) => loadBody(name, settingsFor(name, overrides), Boolean(loadedWant));
 
   // Loads `name` with the settings; or `want`, a load the server remembers, as it was.
   async function loadModel(name, want, overrides) {
@@ -1203,7 +1250,7 @@ export function ModelPage({ active, libraryAsked, currentAsked }) {
     }
     const row = rows.find((r) => r.name === target && !r.off), name = row ? row.name : "";
     const same = !!loadedWant && name === loadedWant.model, m = entryOf(name);
-    const eff = settingsFor(name, overrides), effNow = shown(loadBody(name, eff));
+    const eff = settingsFor(name, overrides), effNow = shown(loadBody(name, eff, Boolean(loadedWant)));
     const effChanged = before ? diffShown(before, effNow) : [];
     let label = "Load model", disabled = !name || busy || !!note;
     if (busy) label = L.state === "fetching" ? "Fetching…" : "Loading…";
@@ -1333,7 +1380,7 @@ export function ModelPage({ active, libraryAsked, currentAsked }) {
         ${hubMsg ? (/^Asking |^From the local cache/.test(hubMsg)
           ? html`<p class="lead" id="mf-hubmsg">${t(hubMsg)}</p>`
           : html`<div class="banner bad" id="mf-hubmsg"><div class="grow2">${tErr(hubMsg)}</div>
-              <button class="btn sm" id="hf-retry" onClick=${() => showRepo(repoSel, "")}>${t("Retry")}</button></div>`) : ""}
+              <button class="btn sm" id="hf-retry" onClick=${() => showRepo(repoSel, repoQuant)}>${t("Retry")}</button></div>`) : ""}
         ${unsupported ? html`<div class="banner warn" id="hf-unsupported">${t("These files are of the " + info.architecture + " architecture, which this build does not run. It runs: " +
                                                                        (j.build_architectures || []).join(", ") + ".")}</div>` : ""}
         ${rows.length ? html`
@@ -1371,6 +1418,11 @@ export function ModelPage({ active, libraryAsked, currentAsked }) {
     if (!into.has(key)) into.set(key, []);
     into.get(key).push(m);
   }
+  const knownFor = (p) => {
+    const out = [];
+    for (const [k, list] of known.entries()) if (samePath(k, p)) out.push(...list);
+    return out;
+  };
   // The folders: the one Hugging Face downloads to, configured --models-dir roots, those with the server's other
   // models, those of the model served and the one remembered, those added here.
   const cacheDir = catalog ? catalog.cache : "", atCache = !!cacheDir && !!loc && samePath(loc, cacheDir);
@@ -1379,13 +1431,26 @@ export function ModelPage({ active, libraryAsked, currentAsked }) {
   for (const x of [...configDirs, ...known.keys(), ...wanted, ...folders]) if (!places.some((k) => samePath(k, x))) places.push(x);
   const sum = (list) => list.reduce((n, m) => n + (m.size || 0), 0);
   const ql = localQ.trim().toLowerCase(), hit = (text) => !ql || text.toLowerCase().includes(ql);
-  // A folder's models: the server's own list for the download folder and its model directories, else what it found
-  // there when asked.
-  const modelsOf = (p) => samePath(p, cacheDir) ? local.filter((m) => m.source === "hub") : known.get(p) || (listings[p] && listings[p].models) || [];
+  // A folder's models: the server's own list for the download folder (merged with any --models-dir entries when the
+  // cache itself is configured as a models dir) and its model directories, else what it found there when asked.
+  const modelsOf = (p) => {
+    if (samePath(p, cacheDir)) {
+      const merged = [], seen = new Set();
+      for (const m of [...local.filter((x) => x.source === "hub"), ...knownFor(p)]) {
+        const k = normPath(m.path || m.name);
+        if (k && seen.has(k)) continue;
+        if (k) seen.add(k);
+        merged.push(m);
+      }
+      return merged;
+    }
+    const byDir = knownFor(p);
+    return byDir.length ? byDir : (listings[p] && listings[p].models) || [];
+  };
   useEffect(() => {
     if (!active || view !== "library" || tab !== "local" || !catalog) return;
     for (const folder of places) {
-      if (samePath(folder, cacheDir) || known.has(folder) || configDirs.some((d) => samePath(d, folder)) || listings[folder]) continue;
+      if (samePath(folder, cacheDir) || knownFor(folder).length || configDirs.some((d) => samePath(d, folder)) || listings[folder]) continue;
       setListings((old) => Object.assign({}, old, { [folder]: { models: [], looking: true } }));
       ask("/v1/hub/dir?path=" + encodeURIComponent(folder), "browse folders").then((a) =>
         setListings((old) => Object.assign({}, old, { [folder]: a.error ? { models: [], error: a.error } : { models: a.j.models } })));
@@ -1412,7 +1477,7 @@ export function ModelPage({ active, libraryAsked, currentAsked }) {
         const list = all.filter((m) => hit(titleOf(m) + " " + m.name)).sort((x, y) => titleOf(x).localeCompare(titleOf(y)));
         const mine = !samePath(p, cacheDir) && !configDirs.some((d) => samePath(d, p)) && folders.some((x) => samePath(x, p));
         const open = () => { setPicked(""); openPath(p); };
-        const pTrim = p.replace(/[\\/]+$/, "");
+        const pTrim = p === "/" ? "/" : /^[a-zA-Z]:[\\/]+$/.test(p) ? p.slice(0, 3) : p.replace(/[\\/]+$/, "");
         return html`
           <div class=${"prow act folder" + (!picked && samePath(loc, p) ? " sel" : "")} role="button" tabindex="0" data-place=${"dir:" + p}
                onClick=${open} onKeyDown=${onEnter(open)}>
@@ -1426,7 +1491,7 @@ export function ModelPage({ active, libraryAsked, currentAsked }) {
           </div>
           ${list.map((m) => {
             const d = describe(m), hubModel = m.source === "hub", mf = folderOf(m);
-            const under = hubModel ? (d.repo || "").split("/")[0] : pathUnder(mf, pTrim) && mf.length > pTrim.length ? mf.slice(pTrim.length).replace(/^[\\/]+/, "") : "";
+            const under = hubModel ? (d.repo || "").split("/")[0] : relUnder(mf, p);
             const go = () => pickModel(m);
             return html`
               <div class=${"prow act model" + (picked === m.name ? " sel" : "")} role="button" tabindex="0" data-model=${m.name} onClick=${go} onKeyDown=${onEnter(go)}>
@@ -1491,7 +1556,10 @@ export function ModelPage({ active, libraryAsked, currentAsked }) {
   function localDetail() {
     const j = atCache ? null : dir, start = !!j && j.kind === "start";
     const go = () => openPath(pathText.trim());
-    const above = atCache ? loc.replace(/[\\/]+$/, "").replace(/[\\/][^\\/]*$/, "") : j ? j.parent : null;
+    const locNorm = normPath(loc);
+    const above = atCache
+      ? (locNorm === "/" || /^[a-z]:\/$/i.test(locNorm) ? null : folderOf({ path: loc.replace(/[\\/]+$/, "") }) || null)
+      : j ? j.parent : null;
     const bar = html`
       <div class="pathbar">
         <button class="iconbtn" id="mf-up" title=${t("The folder above")} aria-label=${t("The folder above")} disabled=${!above}
@@ -1523,11 +1591,20 @@ export function ModelPage({ active, libraryAsked, currentAsked }) {
               ${model.id ? html`<button class="btn sm" onClick=${() => draftWith(dr.path || dr.name, dr.drafter_kind)}>${t("Draft with it")}</button>` : ""}</div>`)}
           </div>`;
       });
+      const hubPaths = new Set(local.filter((m) => m.source === "hub").map((m) => normPath(m.path || m.name)).filter(Boolean));
+      const extraDir = knownFor(cacheDir).filter((m) => !hubPaths.has(normPath(m.path || m.name)) && hit(titleOf(m) + " " + m.name));
+      const extraRows = extraDir.filter(standalone).map(localRow);
+      rows.push(...extraRows);
+      const extraBody = extraRows.length ? html`
+        <div class="rgroup" data-repo="local">
+          <div class="rgroup-h"><b>${cacheDir}</b><span>${sized(sum(extraDir))}</span><span class="grow"></span></div>
+          <div class="mrows" role="listbox">${rowsView(extraRows)}</div>
+        </div>` : null;
       return html`
         <div class="hub-scroll" id="lc-detail">
           ${bar}
           <p class="lead dnote" id="mf-cachenote">${t("What is downloaded from Hugging Face is kept here, a repository each.")}</p>
-          <div id="mf-cached">${groups.length ? body : html`<div class="empty" style="margin-top: 16px">${t(repos.size ? "Nothing matches." : "Nothing downloaded yet.")}</div>`}</div>
+          <div id="mf-cached">${groups.length || extraBody ? html`${body}${extraBody}` : html`<div class="empty" style="margin-top: 16px">${t(repos.size || knownFor(cacheDir).length ? "Nothing matches." : "Nothing downloaded yet.")}</div>`}</div>
         </div>
         ${loadBox(rows, rows.length ? "" : "Nothing here to load.")}`;
     }

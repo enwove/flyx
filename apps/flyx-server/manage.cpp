@@ -429,6 +429,12 @@ void add_manage_routes(httplib::Server& http, Server* s) {
     std::string err;
     if (body.is_discarded() || !want_from_json(body, s->base, &w, &err))
       return error(r, 400, err.empty() ? "request body is not a JSON object" : err, "invalid_request_error");
+    auto check_path = [&](const std::string& p) { return remote_path_allowed(*s, q, p); };
+    bool path_ok = check_path(w.model) && check_path(w.eo.mmproj_file) && check_path(w.eo.lora_file);
+    for (const std::string& d : w.drafters) path_ok = path_ok && check_path(d);
+    if (!path_ok)
+      return error(r, 403, "network or device paths are not allowed from remote clients unless configured in --models-dir",
+                   "permission_error");
     if (!s->host->start(w, &err)) return error(r, 409, err, "conflict");
     send_json(r, 202, s->host->status());
   });
@@ -449,7 +455,7 @@ void add_manage_routes(httplib::Server& http, Server* s) {
     send_json(r, 200, hub_config_json());
   });
   http.Post("/v1/hub/config", [s, hub_config_json](const httplib::Request& q, httplib::Response& r) {
-    if (!require_manage(*s, q, r, "configuring Hugging Face")) return;
+    if (!require_local_or_keyed_manage(*s, q, r, "configuring Hugging Face")) return;
     const ojson body = interfaces::parse_json(q.body);
     if (!body.is_object()) return error(r, 400, "request body is not a JSON object", "invalid_request_error");
     std::string raw;
@@ -483,7 +489,13 @@ void add_manage_routes(httplib::Server& http, Server* s) {
   http.Get("/v1/hub/loras", [s](const httplib::Request& q, httplib::Response& r) {
     if (!require_manage(*s, q, r, "loading models")) return;
     std::string base = q.get_param_value("base"), from = "asked";
-    if (base.empty() && q.has_param("model")) base = base_of(q.get_param_value("model"), &from);
+    if (base.empty() && q.has_param("model")) {
+      const std::string model = q.get_param_value("model");
+      if (!remote_path_allowed(*s, q, model))
+        return error(r, 403, "network or device paths are not allowed from remote clients unless configured in --models-dir",
+                     "permission_error");
+      base = base_of(model, &from);
+    }
     if (base.empty()) return send_json(r, 200, {{"base", nullptr}, {"from", nullptr}, {"models", ojson::array()},
                                                 {"next_cursor", nullptr}, {"endpoint", hub::endpoint()}});
     hub::Name b;
@@ -563,6 +575,9 @@ void add_manage_routes(httplib::Server& http, Server* s) {
   http.Get("/v1/hub/drafter", [s](const httplib::Request& q, httplib::Response& r) {
     if (!require_manage(*s, q, r, "loading models")) return;
     const std::string name = q.get_param_value("name");
+    if (!remote_path_allowed(*s, q, name))
+      return error(r, 403, "network or device paths are not allowed from remote clients unless configured in --models-dir",
+                   "permission_error");
     std::error_code ec;
     hub::Name hn;
     std::string kind;
@@ -702,9 +717,13 @@ void add_manage_routes(httplib::Server& http, Server* s) {
   });
   http.Get("/v1/hub/dir", [s](const httplib::Request& q, httplib::Response& r) {
     if (!require_manage(*s, q, r, "loading models")) return;
+    const std::string path = q.get_param_value("path");
+    if (!remote_path_allowed(*s, q, path))
+      return error(r, 403, "network or device paths are not allowed from remote clients unless configured in --models-dir",
+                   "permission_error");
     ojson out;
     std::string err;
-    if (!dir_json(*s, q.get_param_value("path"), &out, &err)) return error(r, 404, err, "not_found");
+    if (!dir_json(*s, path, &out, &err)) return error(r, 404, err, "not_found");
     send_json(r, 200, out);
   });
   http.Post("/v1/hub/dir", [s](const httplib::Request& q, httplib::Response& r) {

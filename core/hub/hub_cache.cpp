@@ -96,10 +96,16 @@ namespace detail {
 
 std::string hf_home() { return resolve_hf_home().value; }
 
-std::vector<std::string> auth_headers() {
+std::vector<std::string> auth_headers(const ResolvedSetting& ep) {
+  // Send the host's Hugging Face token only over HTTPS and only to the official Hub origin or an operator-configured
+  // HF_ENDPOINT environment mirror—never over cleartext HTTP or to an arbitrary runtime-configured mirror.
+  if (ep.value.rfind("https://", 0) != 0) return {};
+  if (ep.value != kDefaultEndpoint && ep.source != env::kHfEndpoint) return {};
   const std::string t = token();
   return t.empty() ? std::vector<std::string>{} : std::vector<std::string>{"Authorization: Bearer " + t};
 }
+
+std::vector<std::string> auth_headers() { return auth_headers(resolve_endpoint()); }
 
 fs::path repo_dir(const std::string& repo) {
   const size_t slash = repo.find('/');

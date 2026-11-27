@@ -1,12 +1,14 @@
 // Copyright 2026 The flyx Authors. SPDX-License-Identifier: Apache-2.0
 #include "apps/flyx-server/server.h"
 
+#include <cctype>
 #include <set>
 #ifdef _WIN32
 #include <iphlpapi.h>
 #else
 #include <ifaddrs.h>
 #include <net/if.h>
+#include <unistd.h>
 #endif
 
 namespace flyx::server {
@@ -56,6 +58,18 @@ std::set<std::string> interface_addresses(int family) {
   return addresses;
 }
 
+std::string lower_copy(std::string s) {
+  for (char& c : s) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+  return s;
+}
+
+std::string local_hostname() {
+  char buf[256] = {};
+  if (gethostname(buf, sizeof(buf) - 1) != 0) return "";
+  buf[sizeof(buf) - 1] = '\0';
+  return lower_copy(buf);
+}
+
 ojson api_urls(const std::string& host, int port) {
   const bool wildcard = host == "0.0.0.0" || host == "::";
   const auto addresses = wildcard ? interface_addresses(host == "::" ? AF_INET6 : AF_INET)
@@ -70,6 +84,28 @@ ojson api_urls(const std::string& host, int port) {
 
 }  // namespace
 
+void init_listener_identity(Server* s, const std::string& bound_host, int port) {
+  s->listen_host = bound_host;
+  s->listen_port = port;
+  s->serving_lan = !is_loopback_ip(bound_host);
+  s->allowed_hosts.clear();
+  if (!s->serving_lan) return;
+  std::set<std::string> hosts;
+  if (bound_host == "0.0.0.0") {
+    for (const auto& ip : interface_addresses(AF_INET)) hosts.insert(lower_copy(ip));
+  } else if (bound_host == "::") {
+    for (const auto& ip : interface_addresses(AF_INET)) hosts.insert(lower_copy(ip));
+    for (const auto& ip : interface_addresses(AF_INET6)) hosts.insert(lower_copy(ip));
+  } else if (!bound_host.empty()) {
+    hosts.insert(lower_copy(bound_host));
+  }
+  if (const std::string hn = local_hostname(); !hn.empty()) {
+    hosts.insert(hn);
+    if (hn.find('.') == std::string::npos) hosts.insert(hn + ".local");
+  }
+  s->allowed_hosts.assign(hosts.begin(), hosts.end());
+}
+
 void add_network_routes(httplib::Server& http, Server* s, const std::string& host, int port, bool host_from_cli,
                         bool no_auth_from_cli) {
   auto status = [s, host, port, host_from_cli, no_auth_from_cli](bool saved_lan) -> ojson {
@@ -81,7 +117,7 @@ void add_network_routes(httplib::Server& http, Server* s, const std::string& hos
             {"host_from_cli", host_from_cli},
             {"serving_lan", serving_lan},
             {"restart_required", !host_from_cli && serving_lan != saved_lan},
-            {"remote_manage", s->remote_manage.load(std::memory_order_relaxed)},
+            {"remote_manage", s->remote_manage.load(std::memory_order_acquire)},
             {"no_auth_from_cli", no_auth_from_cli},
             {"api_key_set", api_key_set},
             {"api_urls", api_urls(host, port)}};
@@ -111,20 +147,17 @@ void add_network_routes(httplib::Server& http, Server* s, const std::string& hos
                 if (!s->cfg.api_key.empty())
                   return send_openai_error(res, 409, "an API key is configured (--api-key or FLYX_API_KEY)");
               }
+              std::optional<bool> lan_opt;
+              std::optional<bool> remote_opt;
+              if (body.contains("lan_access")) lan_opt = body["lan_access"].get<bool>();
+              if (body.contains("remote_manage")) remote_opt = body["remote_manage"].get<bool>();
               std::string err;
-              bool saved_lan = ModelHost::lan_access();
-              if (body.contains("lan_access")) {
-                const bool enabled = body["lan_access"].get<bool>();
-                if (!ModelHost::save_lan_access(enabled, &err))
-                  return send_openai_error(res, 500, err, "server_error");
-                saved_lan = enabled;
-              }
-              if (body.contains("remote_manage")) {
-                const bool enabled = body["remote_manage"].get<bool>();
-                if (!ModelHost::save_remote_manage(enabled, &err))
-                  return send_openai_error(res, 500, err, "server_error");
-                s->remote_manage.store(enabled, std::memory_order_relaxed);
-              }
+              bool saved_lan = false;
+              if (!ModelHost::save_network_settings(
+                      lan_opt, remote_opt,
+                      [s](bool enabled) { s->remote_manage.store(enabled, std::memory_order_release); },
+                      &saved_lan, &err))
+                return send_openai_error(res, 500, err, "server_error");
               send_json(res, 200, status(saved_lan));
             });
 }

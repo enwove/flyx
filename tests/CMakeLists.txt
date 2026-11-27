@@ -273,6 +273,15 @@ target_include_directories(agent_launch_test PRIVATE ${CMAKE_SOURCE_DIR} ${CMAKE
 add_executable(gpu_apps_test apps/flyx-server/gpu_apps_test.cpp ${CMAKE_SOURCE_DIR}/apps/flyx-server/gpu_apps.cpp)
 target_include_directories(gpu_apps_test PRIVATE ${CMAKE_SOURCE_DIR} ${CMAKE_SOURCE_DIR}/include ${CMAKE_SOURCE_DIR}/third_party)
 target_link_libraries(gpu_apps_test PRIVATE flyx_core)
+add_executable(http_util_test apps/flyx-server/http_util_test.cpp
+                              ${CMAKE_SOURCE_DIR}/apps/flyx-server/http_util.cpp
+                              ${CMAKE_SOURCE_DIR}/apps/flyx-server/model_host.cpp
+                              ${CMAKE_SOURCE_DIR}/apps/flyx-server/request_log.cpp
+                              ${CMAKE_SOURCE_DIR}/apps/flyx-server/drafter_speeds.cpp
+                              ${CMAKE_SOURCE_DIR}/apps/common/model_source.cpp
+                              ${CMAKE_SOURCE_DIR}/apps/common/numbers.cpp)
+target_include_directories(http_util_test PRIVATE ${CMAKE_SOURCE_DIR} ${CMAKE_SOURCE_DIR}/include ${CMAKE_SOURCE_DIR}/third_party)
+target_link_libraries(http_util_test PRIVATE flyx_core Threads::Threads)
 
 add_library(flyx-test-host-kv SHARED core/session/backend_adapter.cpp)
 target_include_directories(flyx-test-host-kv PRIVATE ${CMAKE_SOURCE_DIR}/include)
@@ -419,6 +428,7 @@ add_test(NAME response_store COMMAND response_store_test)
 add_test(NAME request_log COMMAND request_log_test)
 add_test(NAME agent_launch COMMAND agent_launch_test)
 add_test(NAME gpu_apps COMMAND gpu_apps_test)
+add_test(NAME http_util COMMAND http_util_test)
 # Which round next: the drafter's widths by acceptance, lookup rounds, the rest after a poor one (no model).
 add_test(NAME round_chooser COMMAND chooser_test)
 # Round costs timed at load at two contexts: what a device takes, not what another program's work made them (no model).

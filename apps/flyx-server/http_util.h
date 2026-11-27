@@ -40,11 +40,20 @@ bool sse_event(httplib::DataSink& sink, std::string_view event, const ojson& pay
 // Bearer token or x-api-key, when the server has a key.
 bool authorized(const Server& s, const httplib::Request& req);
 // Whether `req` may change what the server serves (load a model, fetch one from the Hub): with an API key, a request
-// carrying it; without one, a request from this machine.
+// carrying it; without one, a direct unforwarded request from this machine, or from the LAN when serving_lan and
+// remote_manage are enabled.
 bool may_manage(const Server& s, const httplib::Request& req);
+// Stricter management gate for sensitive host-level config (such as Hub mirror mutation): requires --api-key or a
+// direct unforwarded request from this machine, never keyless LAN.
+bool may_manage_local_or_keyed(const Server& s, const httplib::Request& req);
 // Whether `req` came from this machine itself (the loopback address): its sender sees this machine's desktop.
 bool from_this_machine(const httplib::Request& req);
 bool is_loopback_ip(const std::string& address);
+// True for Windows UNC shares (\\server\share, //server/share) and Win32 device namespaces (\\?\..., \\.\...).
+bool is_unc_or_device_path(std::string_view path);
+// Whether `req` may pass `path` to local filesystem inspection: direct loopback always may; remote callers may not
+// trigger UNC/device lookups unless `path` stays lexically under an operator-configured --models-dir UNC root.
+bool remote_path_allowed(const Server& s, const httplib::Request& req, std::string_view path);
 // Reject browser CSRF and DNS rebinding when no --api-key guards the server.
 bool browser_request_safe(const Server& s, const httplib::Request& req);
 // Whether `req` is a page of another origin calling the inference API with leave to (Config's cors_*): a browser
@@ -60,6 +69,8 @@ bool admit_browser_request(const Server& s, const httplib::Request& req, httplib
 
 bool require_auth(const Server& s, const httplib::Request& req, httplib::Response& res, bool anthropic = false);
 bool require_manage(const Server& s, const httplib::Request& req, httplib::Response& res, const char* what);
+bool require_local_or_keyed_manage(const Server& s, const httplib::Request& req, httplib::Response& res,
+                                   const char* what);
 bool parse_json_object(const httplib::Request& req, httplib::Response& res, ojson* out, bool anthropic = false);
 
 // Query parameter parsers backed by apps::parse_whole / apps::parse_seed (falling back to dflt if absent/non-numeric).

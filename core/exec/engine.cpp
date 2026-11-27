@@ -484,6 +484,7 @@ bool Engine::plan_memory(plan::KvTiers* tiers, int session_limit, int* asked_ctx
   tiers->copy_gpu = opt_.kv_copy_gpu;
   tiers->reserved = opt_.host_reserved;
   tiers->vram_reserve = opt_.vram_reserve;
+  tiers->min_vram_reserve = os::gpu_memory_floor();
   tiers->ram_reserve = opt_.ram_reserve;
   tiers->gpu_paged = os::gpu_memory_paged();
   // --ctx max: the longest the GPU and host memory hold, or with no host memory for K/V the longest the GPU holds.
@@ -660,6 +661,11 @@ bool Engine::load(const std::string& path, const EngineOptions& opt, std::string
   const bool orig_has_vision = model_->vision() != nullptr;
   const std::string orig_drafters_str = model_drafters_str(*model_);
   const bool gpu_paged = os::gpu_memory_paged();
+  const uint64_t vram_floor = os::gpu_memory_floor();
+  if (opt_.vram_reserve >= 0 && uint64_t(opt_.vram_reserve) < vram_floor) {
+    log::info("flyx: --vram-reserve %s clamped to platform floor %s",
+              gb(uint64_t(opt_.vram_reserve)).c_str(), gb(vram_floor).c_str());
+  }
 
   auto upsert_adj = [&](const std::string& kind, const std::string& from, const std::string& to,
                         const std::string& detail) {
@@ -735,7 +741,8 @@ bool Engine::load(const std::string& path, const EngineOptions& opt, std::string
             base.target_kv_bytes_per_position) {
           uint64_t room = device_.mem_free;
           for (uint64_t held : {base.weights_bytes, base.min_runtime_bytes,
-                                plan::device_reserve(device_.mem_total, gpu_paged)})
+                                plan::effective_device_reserve(device_.mem_total, gpu_paged,
+                                                               opt_.vram_reserve, vram_floor)})
             room -= std::min(room, held);
           auto_from = int(std::min<uint64_t>(INT32_MAX, room / base.target_kv_bytes_per_position));
         }
@@ -880,7 +887,7 @@ bool Engine::load(const std::string& path, const EngineOptions& opt, std::string
     uint64_t free_vram = 0, total_vram = 0;
     query_vram(&free_vram, &total_vram);
     if (total_vram > 0 && free_vram > 0) {
-      const uint64_t reserve = plan::device_reserve(total_vram, gpu_paged);
+      const uint64_t reserve = plan::effective_device_reserve(total_vram, gpu_paged, opt_.vram_reserve, vram_floor);
       for (;;) {
         flyx_load_estimate est{};
         if (!query_estimate(free_vram, total_vram, &est)) break;

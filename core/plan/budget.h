@@ -56,6 +56,7 @@ struct KvTiers {
   int copy_gpu = -1;
   uint64_t reserved = 0;
   int64_t vram_reserve = -1;
+  uint64_t min_vram_reserve = 0;  // platform floor enforced even when vram_reserve >= 0 (os::gpu_memory_floor)
   int64_t ram_reserve = -1;
   int method = FLYX_KV_READ_ALL, method_arg = 0;  // how rounds read the K/V (flyx_seq_layout)
   bool gpu_paged = false;  // Windows pages the GPU's memory unseen (os::gpu_memory_paged, WSL2): reserve 832 MiB
@@ -70,6 +71,10 @@ uint64_t host_keep(uint64_t total_ram);
 // Device VRAM held back for the CUDA context, fragmentation, and desktop stability: max(384 MiB, total / 40), at least
 // 832 MiB where Windows pages the GPU's memory out of the backend's sight (WSL2).
 uint64_t device_reserve(uint64_t total_vram, bool gpu_paged);
+
+// Effective device VRAM reserve after applying an opt-in override (>= 0) and platform floor (min_floor).
+uint64_t effective_device_reserve(uint64_t total_vram, bool gpu_paged, int64_t override_bytes,
+                                  uint64_t min_floor = 0);
 
 // What holds the GPU besides the model (weights + workspace) from a backend memory reading.
 GpuHeld held_of(const flyx_memory_info& mi);
