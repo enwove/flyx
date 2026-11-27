@@ -55,7 +55,7 @@ struct KvTiers {
   int copy_gpu = -1;
   uint64_t reserved = 0;
   int method = FLYX_KV_READ_ALL, method_arg = 0;  // how rounds read the K/V (flyx_seq_layout)
-  bool gpu_paged = false;  // the GPU's memory is Windows' to page (os::gpu_memory_paged): reserve at least 832 MiB
+  bool gpu_paged = false;  // Windows pages the GPU's memory unseen (os::gpu_memory_paged, WSL2): reserve 832 MiB
   bool allow_auto_exact = true;  // a locked AUTO switch must survive placement and retries
 };
 
@@ -64,7 +64,8 @@ struct KvTiers {
 // nothing else can have it back while the model is served.
 uint64_t host_keep(uint64_t total_ram);
 
-// Device VRAM held back for the CUDA context, fragmentation, and desktop stability (at least 832 MiB on paged WDDM).
+// Device VRAM held back for the CUDA context, fragmentation, and desktop stability: max(384 MiB, total / 40), at least
+// 832 MiB where Windows pages the GPU's memory out of the backend's sight (WSL2).
 uint64_t device_reserve(uint64_t total_vram, bool gpu_paged);
 
 // Sets the ledger's budget (what the device has now plus what the model already

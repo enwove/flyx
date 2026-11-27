@@ -33,6 +33,8 @@
 //   cuda_bench stream      reading memory: GB/s against the bytes an SM has on their way (in registers, in a
 //                          cp.async ring), all SMs reading or 60% of them
 //   cuda_bench graphs [K]  what an instantiated graph takes of the device's memory, by the nodes it holds (graphs.cu)
+//   cuda_bench paging KIND STEP [PIECE [FILL_TO]]  where the driver stops keeping allocations of a size on the GPU
+//                          (Windows pages them to host memory), one cudaMalloc or VMM pieces a step (paging.cu)
 //   cuda_bench mt [ROWS]   bf16 GEMMs of 17..64 rows on MiniCPM5-1B's layers, DV's adapters and head: the prefill
 //                          kernel, the 1..16-row kernel a tile of 16 rows at a time, and every k_gemm_skinny_mt
 //                          configuration (bf16_mt), us and GB/s of weights
@@ -2443,6 +2445,7 @@ int main(int argc, char** argv) {
     bench_moe();
     return 0;
   }
+  if (what == "paging") return bench_paging(argc, argv);  // the device's memory as it is, no scratch beside it
   {
     void* mem = nullptr;
     // K up to the 27B's MLP down projection (17408).
@@ -2483,7 +2486,7 @@ int main(int argc, char** argv) {
   else if (what == "mt") bench_mt(argc, argv);
   else {
     std::printf("usage: cuda_bench gemm|skinny|fp4|fp4cfgs|fp4rows|tune|gdn|decode|tc|attn|flash|strata|mlp|w4a4|w12|pick|dots|blocks|q8runs|rounds|"
-                "round|moe|glu|pass|stack|mma|host_read|stream|graphs|mt\n");
+                "round|moe|glu|pass|stack|mma|host_read|stream|graphs|paging|mt\n");
     return 2;
   }
   return 0;

@@ -253,12 +253,7 @@ void draft_block_rows(const BatchPass& bp, const DFlashBlock& b, const std::vect
       flyx_seq* s = bp.seq[members[off + g]].s;
       build_rows(s->P, nullptr, b.mask_token, df.dtok + g * B, B, st);
     }
-    if (E.has_norm) {
-      embed_tokens(E, df.dtok, df.dh, R, st);
-      rmsnorm(df.dh, H, E.norm.w, E.norm.offset, E.norm.eps, df.dx, H, R, H, st);
-    } else {
-      embed_tokens(E, df.dtok, df.dx, R, st);
-    }
+    embed_block_rows(E, df.dtok, df.dh, df.dx, H, R, st);
     for (int j = 0; j < b.layers(); ++j) {
       const auto& l = block<DFlashLayer>(m, b.first_layer + j);
       rmsnorm(df.dx, H, l.norm.w, l.norm.offset, l.norm.eps, df.dh, H, R, H, st);

@@ -502,6 +502,10 @@ void tc_rows(int cfg, const bf16* a, const bf16* W, const uint8_t* Q, const uint
 }
 }  // namespace
 
+bool prefill_rows_bf16(const Launch& L, const uint8_t* Q, int K) {
+  return L.scratch && L.scratch->af32 && Q && w4a4(L, K);
+}
+
 template <bool FP4>
 void launch_tc(const float* x, int ldx, const bf16* W, const uint8_t* Q, const uint8_t* S, const float* RS, int N,
                int K, float* y, int ldy, int M, bool accumulate, const Launch& L, int cfg) {
@@ -531,7 +535,7 @@ void gemm_tc_staged(const bf16* W, const uint8_t* Q, const uint8_t* S, const flo
 bool gemm_staged_bf16(const uint8_t* Q, const uint8_t* S, const float* RS, int N, int K, bf16* y16, int ldy, int M,
                       const Launch& L, bool accumulate) {
   const Scratch& sc = scratch(L);
-  if (!sc.af32 || !Q || !w4a4(L, K)) return false;
+  if (!prefill_rows_bf16(L, Q, K)) return false;
   quantize_rows_nvfp4(sc.af32, K, M, K, sc.q4, sc.q4_scale, sc.q4_inv, L.st);
   gemm_w4a4(sc.q4, sc.q4_scale, sc.q4_inv, Q, S, RS, N, K, nullptr, ldy, M, accumulate, L.st, -1, nullptr, nullptr,
             y16);
@@ -558,7 +562,7 @@ void gemm_glu_staged(const bf16* W, const uint8_t* Q, const uint8_t* S, const fl
   }
   check_fits(size_t(M) * I, sc.glu_cap, "a SwiGLU GEMM");
   // NVFP4 inputs: the SwiGLU rows in bf16 with each row's largest |value|, which the down projection rounds from.
-  sc.glu_w4a4 = sc.af32 && Q && w4a4(L, K);
+  sc.glu_w4a4 = prefill_rows_bf16(L, Q, K);
   if (sc.glu_w4a4) return w4a4_rows(sc.af32, K, Q, S, RS, 2 * I, K, nullptr, 0, M, false, L, true);
   tc_rows(cfg, sc.af32 ? to_abuf(sc.af32, K, K, M, L) : sc.abuf, W, Q, S, RS, 2 * I, K, nullptr, 0, M, false, L,
           sc.glu);
@@ -567,8 +571,9 @@ void gemm_glu_staged(const bf16* W, const uint8_t* Q, const uint8_t* S, const fl
 void gemm_on_glu(const bf16* W, const uint8_t* Q, const uint8_t* S, const float* RS, int N, int K, float* y, int ldy,
                  int M, bool accumulate, const Launch& L) {
   const Scratch& sc = scratch(L);
-  if (sc.glu_w4a4 && Q && w4a4(L, K)) {
-    quantize_rows_nvfp4_bf16(sc.glu, K, M, K, sc.glu_amax, sc.q4, sc.q4_scale, sc.q4_inv, L.st);
+  if (Q && w4a4(L, K)) {  // the down weights' inputs: the rows' maxima where the W4A4 gate|up GEMM left them
+    quantize_rows_nvfp4_bf16(sc.glu, K, M, K, sc.glu_w4a4 ? sc.glu_amax : nullptr, sc.q4, sc.q4_scale, sc.q4_inv,
+                             L.st);
     return gemm_w4a4(sc.q4, sc.q4_scale, sc.q4_inv, Q, S, RS, N, K, y, ldy, M, accumulate, L.st);
   }
   tc_rows(-1, sc.glu, W, Q, S, RS, N, K, y, ldy, M, accumulate, L);

@@ -19,12 +19,14 @@
 //   (the rounding depends on a pass's rows); asked for by name
 //   (--activations nvfp4) in a file that says bf16 inputs, the same tokens.
 #include <algorithm>
+#include <cmath>
 #include <cstdio>
 #include <fstream>
 #include <stdexcept>
 
 #include "core/exec/generation.h"
 #include "nlohmann/json.hpp"
+#include "ops/dtype/ref.h"
 #include "tests/common/check.h"
 
 using namespace flyx;
@@ -136,6 +138,32 @@ std::vector<flyx_round_result> traced(Engine& e, const std::vector<int32_t>& pro
   *tokens = generate_tokens(s, prompt, n, sampling);
   s.trace = nullptr;
   return trace;
+}
+
+// The state one prefill pass of the prompt leaves (snapshot bytes: every K/V position and the recurrent state), the
+// rows `at` taking `embeds` in place of their tokens' embeddings (an image's rows).
+std::vector<uint8_t> pass_state(Engine& e, const std::vector<int32_t>& prompt, const std::vector<int32_t>& at = {},
+                                const std::vector<float>& embeds = {}) {
+  Session s(&e);
+  std::string error;
+  if (!s.init(&error)) throw std::runtime_error(error);
+  const auto* api = e.api();
+  flyx_prefill_input in{};
+  in.tokens = prompt.data();
+  in.n = int32_t(prompt.size());
+  in.embeds = embeds.empty() ? nullptr : embeds.data();
+  in.embed_rows = at.empty() ? nullptr : at.data();
+  in.n_embeds = int32_t(at.size());
+  uint64_t bytes = 0;
+  if (api->prefill_ex(e.prefill_plan(), s.seq(), &in, nullptr) != 0 || api->checkpoint(s.seq(), 0) != in.n ||
+      api->snapshot_bytes(s.seq(), 0, 0, &bytes) != 0)
+    throw std::runtime_error(std::string("a prefill pass's state: ") + api->last_error());
+  std::vector<uint8_t> out(static_cast<size_t>(bytes));
+  void* p = out.data();
+  const flyx_host_pieces pieces{&p, 1, 0, std::max<uint64_t>(4096, bytes)};
+  if (api->snapshot_save(s.seq(), 0, 0, &pieces, bytes) != in.n)
+    throw std::runtime_error(std::string("a prefill pass's state: ") + api->last_error());
+  return out;
 }
 
 // Teacher forced: at how many of the reference's tokens the engine, given the reference's tokens before it, picks
@@ -697,20 +725,48 @@ void mtp_ring(const std::string& dir, const std::string& backend, const std::vec
   }
 }
 
-// Both companion formats run the DSpine walk on rows gathered from the packed target head.
+// A DSpine drafter in a file of its own (tencent publishes them so), and the directory tencent publishes it as
+// (hf_dspine), beside a GGUF model:
+// * beside the tiny Qwen3.5 as GGUF (float32): the golden tokens (golden_dspine.json's), and its drafts the
+//   reference's, round by round (on the float64 backend all of them);
+// * beside the quantized GGUF (a packed embedding and head, the rows its walk gathers; its layers' copies Q8_0 beside
+//   GGML block weights): it drafts, and the tokens are plain decoding's, greedy and seeded sampling's.
 void dspine_file(const std::string& dir, const std::string& backend) {
-  const std::string target = dir + "/tiny_q8_target.gguf";
-  const std::vector<int32_t> prompt = {5, 17, 33, 9};
-  auto plain = engine(target, backend);
-  const auto greedy = tokens_of(*plain, prompt, 32), sampled = tokens_of(*plain, prompt, 32, true);
-  for (const char* file : {"hf_dspine", "tiny_draft_dspine.flyx"}) {
-    auto spec = engine(target, backend, {.speculative = true, .drafter = "dspine", .drafter_files = {dir + "/" + file}});
-    for (bool sampling : {false, true}) {
+  std::ifstream f(dir + "/golden_dspine.json");
+  const json golden = json::parse(f);
+  const std::string q8 = dir + "/tiny_q8_target.gguf";
+  auto plain = engine(q8, backend);
+  for (const char* file : {"tiny_draft_dspine.flyx", "hf_dspine"}) {
+    std::printf("  the DSpine drafter from %s\n", file);
+    // Its drafts from its exact weights (beside a float target CUDA's default is NVFP4 copies), as the reference's.
+    auto spec = engine(dir + "/tiny_gguf.gguf", backend,
+                       {.speculative = true, .drafter = "dspine", .drafter_files = {dir + "/" + file},
+                        .options = "draft_weights=exact"});
+    for (const auto& item : golden.at("cases")) {
+      const auto p = item.at("prompt").get<std::vector<int32_t>>(), want = item.at("tokens").get<std::vector<int32_t>>();
       std::vector<int32_t> got;
-      const auto rounds = traced(*spec, prompt, 32, &got, sampling);
-      const bool drafted = std::any_of(rounds.begin(), rounds.end(), [](const auto& r) { return r.n_drafts > 0; });
-      check(drafted && same_tokens(got, sampling ? sampled : greedy),
-            std::string(file) + " drafts on the Q8_0 target and matches plain " + (sampling ? "sampling" : "greedy"));
+      const auto trace = traced(*spec, p, 48, &got);
+      int same = 0, total = 0;
+      const json& rounds = item.at("rounds");
+      for (size_t i = 1; i < trace.size() && i - 1 < rounds.size(); ++i) {
+        const auto d = rounds[i - 1].at("drafts").get<std::vector<int32_t>>();
+        for (int j = 0; j < trace[i].n_drafts && j < int(d.size()); ++j, ++total) same += trace[i].drafts[j] == d[size_t(j)];
+      }
+      check(same_tokens(got, want) && total > 0 && (backend == "cpu_ref" ? same == total : same * 10 >= total * 9),
+            std::string(file) + " beside a GGUF model: the golden tokens; drafts equal to the reference's " +
+                std::to_string(same) + " / " + std::to_string(total));
+    }
+    auto packed = engine(q8, backend, {.speculative = true, .drafter = "dspine", .drafter_files = {dir + "/" + file}});
+    for (const auto& item : golden.at("cases")) {
+      const auto p = item.at("prompt").get<std::vector<int32_t>>();
+      for (bool sampling : {false, true}) {
+        std::vector<int32_t> got;
+        const auto rounds = traced(*packed, p, 32, &got, sampling);
+        const bool drafted = std::any_of(rounds.begin(), rounds.end(), [](const auto& r) { return r.n_drafts > 0; });
+        check(drafted && same_tokens(got, tokens_of(*plain, p, 32, sampling)),
+              std::string(file) + " beside the quantized GGUF: it drafts, and plain decoding's tokens (" +
+                  (sampling ? "seeded sampling" : "greedy") + ")");
+      }
     }
   }
 }
@@ -933,6 +989,25 @@ void nvfp4_inputs(const std::string& dir, const std::string& backend) {
                            " of 32 places, prefill in passes of up to " + std::to_string(chunk) + " rows");
   }
   auto plain = engine(path, backend, {.prefill_chunk = 64});
+  {  // the generic regions (fusion=0, gate 2) keep the fused path's bf16 rows: the same state, bit for bit, also
+     // with rows of float32 embeddings injected (prefill_ex), which the fused path stores in bf16
+    auto generic = engine(path, backend, {.prefill_chunk = 64, .options = "fusion=0"});
+    const std::vector<int32_t> pass(prompt.begin(), prompt.begin() + 64), at = {3, 4, 5, 6};
+    std::vector<float> embeds(at.size() * size_t(plain->model().desc().hidden));
+    for (size_t i = 0; i < embeds.size(); ++i) embeds[i] = float(0.3 * std::sin(0.7 * double(i) + 0.1));
+    check(pass_state(*generic, pass) == pass_state(*plain, pass),
+          "NVFP4 inputs, a pass of 64 rows: fusion=0 leaves the fused path's state, bit for bit");
+    check(pass_state(*generic, pass, at, embeds) == pass_state(*plain, pass, at, embeds),
+          "  with 4 rows of float32 embeddings injected: the fused path's state");
+    // Injected rows are stored as the residual is, in bf16: their bf16 values leave the same state, here and on the
+    // float64 backend, which keeps the residual so in such a pass.
+    std::vector<float> rounded(embeds.size());
+    for (size_t i = 0; i < embeds.size(); ++i) rounded[i] = float(ops::round_bf16(embeds[i]));
+    auto reference = engine(path, "cpu_ref", {.prefill_chunk = 64});
+    for (Engine* e : {plain.get(), reference.get()})
+      check(pass_state(*e, pass, at, embeds) == pass_state(*e, pass, at, rounded),
+            "  " + e->backend_name() + ": the embeddings' bf16 values leave the same state (bf16 residual rows)");
+  }
   auto spec = engine(path, backend, {.speculative = true, .prefill_chunk = 64});
   check(tokens_of(*plain, prompt, 32) == tokens_of(*spec, prompt, 32), "NVFP4 inputs: the MTP drafter changes nothing");
   // Asked for by name (--activations nvfp4) in a file of the same weights that says bf16 inputs: the tokens of the

@@ -83,6 +83,7 @@ int main(int argc, char** argv) {
   test_blocks_round_glu();
   test_blocks_round_side();
   test_rmsnorm();
+  test_round_rows_bf16();
   std::printf("attention\n");
   test_kv16_saturation();
   test_attention(256, 64, 16, 4, 16, 300, true, 1e7);   // target layer shape, verify rows

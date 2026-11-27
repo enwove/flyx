@@ -32,6 +32,9 @@ namespace flyx {
 inline constexpr int kMinFittedCtx = 4096;
 // --ctx max for a model whose file names no context of its own.
 inline constexpr int kCtxMaxUnnamed = 262144;
+// The fewest rows of a prefill pass of an automatic size the elastic load goes down to before it gives up (a
+// shorter pass reads every weight once for fewer rows).
+inline constexpr int kElasticMinPrefill = 256;
 // A context memory cut to under this is called short where the load reports it (its log, the server's telemetry): a
 // coding agent's own instructions and tools take half of it or more before the first question.
 inline constexpr int kShortCtx = 32768;
@@ -47,10 +50,11 @@ struct EngineOptions {
   std::string backend;       // empty = auto
   std::string backend_dir;   // empty = next to the executable
   bool speculative = true;
-  // interfaces::kDrafterModes ("mtp" | "dflash2" | "dspark" | "dspine" | "dv" | "all" | "none") | empty = the drafter
-  // files' drafters and the model file's MTP layer, else its block drafter (models/model.h: choose_drafters); its DV
-  // drafter only when named ("dv", "all").  With several, the drafter is chosen every round; DV is never beside another
-  // drafter, its rounds chosen against plain decoding's and lookup's every round (docs/design/dv.md).
+  // interfaces::kDrafterModes ("mtp" | "dflash2" | "dflash" | "dspark" | "dspine" | "dv" | "all" | "none") | empty =
+  // the drafter files' drafters and the model file's MTP layer, else its block drafter (models/model.h:
+  // choose_drafters); its DV drafter only when named ("dv", "all").  With several, the drafter is chosen every round;
+  // DV is never beside another drafter, its rounds chosen against plain decoding's and lookup's every round
+  // (docs/design/dv.md).
   std::string drafter;
   // Files with drafters' weights beside the model file: a GGUF holding only the MTP
   // layer (unsloth ships Qwen3.8-27B's so: MTP/mtp-*.gguf), a block drafter's file (python/convert --draft
@@ -288,6 +292,7 @@ class Engine {
   std::unique_ptr<interfaces::Model> model_;          // the file as blocks, with the drafters in use
   flyx_bmodel* bm_ = nullptr;
   int prefill_align_ = 1, prefill_chunk_ = 1024;
+  int prefill_cap_ = 0;  // the elastic load's cap on prefill passes of an automatic size (0: none)
   plan::Plans plans_;
   std::string drafter_ = "none";            // drafter(): the model's drafters whose rounds the plans have
   std::string active_draft_weights_;        // effective drafter weights precision (nvfp4/q8/exact, or empty)

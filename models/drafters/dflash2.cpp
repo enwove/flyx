@@ -79,7 +79,7 @@ void validate_dflash2_spec(DFlash2Spec* spec, const TargetSpec& target) {
   if (d.hidden != target.hidden) throw std::runtime_error(std::string(what) + " hidden size does not match target");
   const int max_vocab = target.padded_vocab();
   if (d.hidden <= 0 || spec->layers <= 0 || d.n_heads <= 0 || d.n_kv <= 0 || d.head_dim <= 0 || d.head_dim % 2 != 0 ||
-      d.inter <= 0 || d.n_heads % d.n_kv != 0 || d.conv_taps < 0 || d.sel_rank <= 0 || d.sel_rank > kMaxWidth ||
+      d.inter <= 0 || d.n_heads % d.n_kv != 0 || d.conv_taps < 0 || d.sel_rank < 0 || d.sel_rank > kMaxWidth ||
       d.sel_topk <= 0 || d.sel_topk > target.vocab || d.mask_token < 0 || d.mask_token >= max_vocab ||
       !(spec->eps > 0) || !std::isfinite(spec->eps) || !(d.theta > 0) || !std::isfinite(d.theta) ||
       !std::isfinite(d.softcap) || d.softcap < 0.0f ||
@@ -87,9 +87,13 @@ void validate_dflash2_spec(DFlash2Spec* spec, const TargetSpec& target) {
       d.head_dim > kMaxHeadDim || d.conv_taps > kMaxHeadDim || spec->taps.empty() ||
       spec->taps.size() > size_t(INT_MAX) || d.window < 0)
     throw std::runtime_error("invalid DFlash2 drafter config");
+  if (d.sel_rank == 0 && d.conv_taps > 0)  // a block without a selector is DFlash's: plain layers
+    throw std::runtime_error(std::string(what) + " without a selector has no convolutions");
   if (spec->sel_vocab != target.vocab && spec->sel_vocab != max_vocab)
     throw std::runtime_error(mismatch_msg(target));
   d.n_taps = int32_t(spec->taps.size());
+  // No selector (sel_rank 0: the walk takes the head's candidates by their logits) has no hidden gate either.
+  if (d.sel_rank == 0 && spec->sel_gate) throw std::runtime_error(std::string(what) + " gate without a selector");
   if (d.conv_group < 1 || d.hidden % d.conv_group)
     throw std::runtime_error("DFlash2 conv group does not divide hidden");
   const int64_t tg2 = int64_t(2) * d.conv_taps * (d.hidden / d.conv_group);
@@ -115,6 +119,37 @@ int config_int(const json& j, const char* key, const std::string& drafter) {
   return int(n);
 }
 
+Qwen3BlockConfig parse_qwen3_block(const json& j, const TargetSpec& target, const std::string& title) {
+  Qwen3BlockConfig c;
+  c.hidden = config_int(j, "hidden", title);
+  c.layers = config_int(j, "layers", title);
+  c.n_heads = config_int(j, "n_heads", title);
+  c.n_kv = config_int(j, "n_kv", title);
+  c.head_dim = config_int(j, "head_dim", title);
+  c.inter = config_int(j, "inter", title);
+  c.block = config_int(j, "block", title);
+  c.mask_token = config_int(j, "mask_token", title);
+  for (int64_t t : j.at("taps").get<std::vector<int64_t>>()) {
+    if (t < 1 || t > target.layers)
+      throw std::runtime_error(title + " tap after layer " + std::to_string(t) + " of " +
+                               std::to_string(target.layers));
+    c.taps.push_back(int(t));
+  }
+  c.theta = j.at("rope_theta").get<double>();
+  c.eps = j.at("eps").get<double>();
+  if (c.hidden <= 0 || c.hidden > kMaxWidth || c.layers <= 0 || c.layers > kMaxLayers || c.n_heads <= 0 ||
+      c.n_heads > kMaxHeads || c.n_kv <= 0 || c.n_heads % c.n_kv != 0 || c.head_dim <= 0 || c.head_dim % 2 != 0 ||
+      c.head_dim > kMaxHeadDim || c.inter <= 0 || c.inter > kMaxWidth || c.mask_token < 0 ||
+      c.mask_token >= target.padded_vocab() || !(c.eps > 0) || !std::isfinite(c.eps) || !(c.theta > 0) ||
+      !std::isfinite(c.theta) || c.taps.empty() || int64_t(c.taps.size()) * target.hidden > INT_MAX ||
+      int64_t(2) * c.layers * c.n_kv * c.head_dim > INT_MAX || int64_t(c.n_heads + 2 * c.n_kv) * c.head_dim > INT_MAX)
+    throw std::runtime_error("invalid " + title + " drafter config");
+  if (c.hidden != target.hidden)
+    throw std::runtime_error(title + " hidden size " + std::to_string(c.hidden) + " does not match the target's " +
+                             std::to_string(target.hidden));
+  return c;
+}
+
 void check_config_target(const json& j, const TargetSpec& target) {
   if (block_drafter_kind(j) == Drafter::kNone) throw std::runtime_error(mismatch_msg(target));
   if (!j.contains("target") || !j["target"].is_object()) return;
@@ -126,7 +161,7 @@ void check_config_target(const json& j, const TargetSpec& target) {
     throw std::runtime_error(mismatch_msg(target));
 }
 
-bool is_dflash_companion(const json& header) {
+bool is_block_companion(const json& header) {
   if (!header.is_object()) return false;
   if (header.value("kind", "") == "drafter" && header.contains("draft") && header["draft"].is_object()) return true;
   if (!GgufMeta::is_header(header) || header.value("arch", "") != "dflash") return false;
@@ -146,44 +181,34 @@ DFlash2Spec parse_dflash2_json(const ModelFile& file, const json& j, const Targe
   spec.gguf = false;
   spec.companion = companion;
   flyx_dflash2_block& d = spec.block;
-  d.hidden = config_int(j, "hidden", "DFlash2");
-  spec.layers = config_int(j, "layers", "DFlash2");
-  d.n_heads = config_int(j, "n_heads", "DFlash2");
-  d.n_kv = config_int(j, "n_kv", "DFlash2");
-  d.head_dim = config_int(j, "head_dim", "DFlash2");
-  d.inter = config_int(j, "inter", "DFlash2");
-  d.block = config_int(j, "block", "DFlash2");
-  d.mask_token = config_int(j, "mask_token", "DFlash2");
-  const auto raw_taps = j.at("taps").get<std::vector<int64_t>>();
-  spec.taps.reserve(raw_taps.size());
-  for (int64_t t : raw_taps) {
-    if (t < 1 || t > target.layers) throw std::runtime_error("DFlash2 tap after layer " + std::to_string(t));
-    spec.taps.push_back(int(t));
-  }
+  Qwen3BlockConfig c = parse_qwen3_block(j, target, drafter_title(block_drafter_kind(j)));
+  d.hidden = c.hidden, spec.layers = c.layers, d.n_heads = c.n_heads, d.n_kv = c.n_kv, d.head_dim = c.head_dim;
+  d.inter = c.inter, d.block = c.block, d.mask_token = c.mask_token, d.theta = c.theta, spec.eps = c.eps;
+  spec.taps = std::move(c.taps);
   d.conv_taps = config_int(j, "conv_taps", "DFlash2");
   d.conv_group = config_int(j, "conv_group", "DFlash2");
   d.sel_rank = config_int(j, "sel_rank", "DFlash2");
   d.sel_topk = config_int(j, "sel_topk", "DFlash2");
-  d.theta = j.at("rope_theta").get<double>();
-  const int64_t win = j.value("window", int64_t(0));
-  if (win < 0 || win > INT_MAX) throw std::runtime_error("DFlash2 window out of range");
-  d.window = int32_t(win);
+  d.window = config_int(j, "window", "DFlash2");  // below zero: validate_dflash2_spec refuses it
   const double sc = j.contains("softcap") && j["softcap"].is_number() ? j["softcap"].get<double>() : 0.0;
   if (!std::isfinite(sc) || sc < 0.0) throw std::runtime_error("DFlash2 softcap out of range");
   d.softcap = float(sc);
   d.softcap_mode = j.contains("softcap_mode") && j["softcap_mode"].is_string()
                        ? parse_softcap_mode(j["softcap_mode"].get<std::string>())
                        : FLYX_DFLASH2_SOFTCAP_BEFORE;
-  spec.eps = j.at("eps").get<double>();
   const std::string pred_name =
       companion >= 0 ? ModelFile::companion_name(companion, "draft.sel.pred") : std::string("draft.sel.pred");
   spec.sel_vocab = resolve_sel_vocab(file, pred_name, target);
   spec.kind = block_drafter_kind(j);
-  const int64_t from = config_int(j, "draft_from", "DFlash2");
+  // A DFlash2 file written before the two keys holds the block the converter still writes for DFlash2: drafts from
+  // the row after the anchor's, a gated selector.  A DSpark file states both.
+  const bool before_keys = spec.kind == Drafter::kDFlash2 && !j.contains("draft_from") && !j.contains("sel_gate");
+  const int64_t from = before_keys ? 1 : config_int(j, "draft_from", "DFlash2");
   if (from != 0 && from != 1) throw std::runtime_error("block drafter draft_from " + std::to_string(from));
   d.draft_from = int32_t(from);
-  if (!j.contains("sel_gate") || !j["sel_gate"].is_boolean()) throw std::runtime_error("block drafter sel_gate missing");
-  spec.sel_gate = j["sel_gate"].get<bool>();
+  if (!before_keys && (!j.contains("sel_gate") || !j["sel_gate"].is_boolean()))
+    throw std::runtime_error("block drafter sel_gate missing");
+  spec.sel_gate = before_keys || j["sel_gate"].get<bool>();
   validate_dflash2_spec(&spec, target);
   return spec;
 }
@@ -323,8 +348,9 @@ int build_dflash2(Tables& T, const DFlash2Spec& spec, const TargetSpec& target) 
   d.fc = T.weight(dn("draft.fc"), {H, int64_t(d.n_taps) * target.hidden});
   d.hidden_norm = T.norm(dn("draft.hidden_norm"), H, 0.0, eps);
   d.norm = T.norm(dn("draft.norm"), H, 0.0, eps);
-  d.sel_pred = T.weight(dn("draft.sel.pred"), {spec.sel_vocab, d.sel_rank});
-  d.sel_succ = T.weight(dn("draft.sel.succ"), {spec.sel_vocab, d.sel_rank});
+  const bool selector = d.sel_rank > 0;  // none: -1, the head's candidates by their logits
+  d.sel_pred = selector ? T.weight(dn("draft.sel.pred"), {spec.sel_vocab, d.sel_rank}) : -1;
+  d.sel_succ = selector ? T.weight(dn("draft.sel.succ"), {spec.sel_vocab, d.sel_rank}) : -1;
   d.sel_hid = spec.sel_gate ? T.weight(dn("draft.sel.hid"), {d.sel_rank, H}) : -1;  // -1: a unit gate
   d.q8_weights = draft_weights_beside_float(spec.kind) == FLYX_DRAFT_WEIGHTS_Q8;
   d.kv = draft_kv_state(T, layers, d.n_kv, d.head_dim);

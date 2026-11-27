@@ -73,7 +73,7 @@ void norm_and_project(const RowView& v, int R, const Norm& n, const Lin& w, int 
 
 bool residual16_model(flyx_bmodel* m) {
   if (m->res16 < 0) {  // every block of the stack: the embedding a bf16 table, each residual add a W4A4 GEMM
-    bool ok = m->opt.fusion && m->opt.kernels.prefill_fp4 && gemm_w4a4_supported();
+    bool ok = m->opt.kernels.prefill_fp4 && gemm_w4a4_supported();
     std::vector<bool> drafter_parts(m->blocks.size(), false);  // the MTP layer's blocks add to no residual here
     for (const Block& b : m->blocks)
       if (const auto* t = std::get_if<MtpBlock>(&b)) {
@@ -98,13 +98,15 @@ bool residual16_model(flyx_bmodel* m) {
   return m->res16 == 1;
 }
 
-bool residual16(const Pass& ps) {
+bool residual16_pass(const Pass& ps) {
   if (ps.round || ps.rows <= 16) return false;
   return residual16_model(ps.s->m) && ps.v.L.scratch && ps.v.L.scratch->af32;
 }
 
+bool residual16(const Pass& ps) { return ps.s->m->opt.fusion && residual16_pass(ps); }
+
 void mlp_body(float* x, const MlpBlock& f, int R, float* h, float* proj, int ld_proj, float* act, int ld_act,
-              const Launch& L, bool fused) {
+              const Launch& L, bool fused, bool add16) {
   const int H = f.hidden, I = f.inter;
   const Norm& n = f.norm;
   if (fused) {
@@ -137,10 +139,19 @@ void mlp_body(float* x, const MlpBlock& f, int R, float* h, float* proj, int ld_
   rmsnorm(x, H, n.w, n.offset, n.eps, h, H, R, H, L.st);
   gemm(h, H, f.w_gu, 2 * I, H, proj, ld_proj, R, false, L);
   swiglu(proj, ld_proj, I, act, ld_act, R, L.st);
-  gemm(act, ld_act, f.w_down, H, I, x, H, R, true, L);
+  // The fused gate|up GEMM keeps the SwiGLU rows in bf16 (gemm_glu_staged); a down projection of NVFP4 inputs rounds
+  // them from those rows (gemm_on_glu), whatever the gate|up weights are.
+  if (R > 16 && I % 8 == 0 && !f.w_gu.packed() && !f.w_down.packed() && prefill_rows_bf16(L, f.w_down.q, I))
+    round_rows_bf16(act, ld_act, I, R, L.st);
+  if (add16) {  // h, H wide, is free past the gate|up GEMM
+    gemm(act, ld_act, f.w_down, H, I, h, H, R, false, L);
+    add_rows_bf16(x, H, h, H, H, R, L.st);
+  } else {
+    gemm(act, ld_act, f.w_down, H, I, x, H, R, true, L);
+  }
 }
 
-void gdn_out_project(const RowView& v, const GdnBlock& g, int R, bool fused) {
+void gdn_out_project(const RowView& v, const GdnBlock& g, int R, bool fused, bool add16) {
   const GdnDims gd = g.gd;
   const int H = g.hidden, C = gd.C(), vd = g.v_width();
   const float* z = v.b.proj + C;
@@ -149,7 +160,12 @@ void gdn_out_project(const RowView& v, const GdnBlock& g, int R, bool fused) {
     gemm_presplit(g.w_out, H, vd, v.b.x, H, R, true, v.L);
   } else {
     gdn_gated_norm(v.b.gdn_o, z, v.ld_proj, g.gated.w, g.gated.eps, v.b.act, R, gd, v.L.st);
-    gemm(v.b.act, vd, g.w_out, H, vd, v.b.x, H, R, true, v.L);
+    if (add16) {  // h (H wide; gdn_o in a pass's buffers) is free past the gated norm
+      gemm(v.b.act, vd, g.w_out, H, vd, v.b.h, H, R, false, v.L);
+      add_rows_bf16(v.b.x, H, v.b.h, H, H, R, v.L.st);
+    } else {
+      gemm(v.b.act, vd, g.w_out, H, vd, v.b.x, H, R, true, v.L);
+    }
   }
 }
 
@@ -172,6 +188,65 @@ void head_logits(const HeadBlock& h, const RowView& v, int r0, int n, bool cert,
   }
 }
 
+// A block drafter's rows (tok) embedded from the target's table, then its norm where it has one: out (tmp: scratch).
+void embed_block_rows(const EmbedBlock& E, const int* tok, float* tmp, float* out, int H, int B, cudaStream_t st) {
+  if (E.has_norm) {
+    embed_tokens(E, tok, tmp, B, st);
+    rmsnorm(tmp, H, E.norm.w, E.norm.offset, E.norm.eps, out, H, B, H, st);
+  } else {
+    embed_tokens(E, tok, out, B, st);  // packed tables stay in host memory
+  }
+}
+
+namespace {
+
+// One layer of a block drafter (DFlash2's, DSpine's) over the block's B rows in s->dx: attention to its context
+// and the block (both ways; causal: each row its own and those before it) and the MLP, the token-conditioned
+// convolutions around both where the block has them.
+void block_layer(flyx_seq* s, const DFlashBlock& b, const DFlashLayer& l, const KvRef& kvr, int B, bool causal,
+                 const Launch& L, bool fused) {
+  const int H = b.hidden, nh = b.nh, nkv = b.nkv, hd = b.hd, I = b.inter;
+  const int Tp = b.conv_taps, TG = b.conv() ? Tp * (H / b.conv_group) : 0, nqkv = (nh + 2 * nkv) * hd;
+  cudaStream_t st = L.st;
+  // Token-conditioned convolutions around attention and MLP where the block has them; plain layers add straight back.
+  const bool conv = b.conv();
+  rmsnorm(s->dx, H, l.norm.w, l.norm.offset, l.norm.eps, s->dh, H, B, H, st);
+  if (conv) {
+    gemm(s->dh, H, l.attn_proj, 2 * TG, H, s->ddelta, 2 * TG, B, false, L);
+    grouped_conv(s->dh, H, s->ddelta, 2 * TG, l.attn_base, H, Tp, b.conv_group, s->dhc, H, B, false, st);
+  }
+  gemm(conv ? s->dhc : s->dh, H, l.w_qkv, nqkv, H, s->dproj, s->ld_dproj, B, false, L);
+  attn_prep(s->dproj, s->ld_dproj, 0, nh * hd, (nh + nkv) * hd, l.q_norm.w, l.k_norm.w, l.q_norm.offset,
+            l.q_norm.eps, b.theta, hd, nh, nkv, hd, B, s->P, kPosPosition, false, s->dq, kvr, st);
+  const bool split_o = fused && !l.w_o.q8_inputs() && (nh * hd) % 64 == 0;
+  attention(s->dq, kvr, nh, nkv, hd, B, causal, causal ? 0 : B, 1.f / std::sqrt(float(hd)), s->P, nullptr, 0,
+            split_o ? nullptr : s->dact, s->ld_dact, s->own.part, kRoundSplits, L, 0, b.window);
+  float* const o_out = conv ? s->dtmp : s->dx;  // without convolutions the projection adds into the residual
+  if (split_o) gemm_presplit(l.w_o, H, nh * hd, o_out, H, B, !conv, L);
+  else gemm(s->dact, s->ld_dact, l.w_o, H, nh * hd, o_out, H, B, !conv, L);
+  if (conv)
+    grouped_conv(s->dtmp, H, s->ddelta + TG, 2 * TG, l.attn_base + size_t(Tp) * H, H, Tp, b.conv_group, s->dx, H,
+                 B, true, st);
+  rmsnorm(s->dx, H, l.post_norm.w, l.post_norm.offset, l.post_norm.eps, s->dh, H, B, H, st);
+  if (conv) {
+    gemm(s->dh, H, l.mlp_proj, 2 * TG, H, s->ddelta, 2 * TG, B, false, L);
+    grouped_conv(s->dh, H, s->ddelta, 2 * TG, l.mlp_base, H, Tp, b.conv_group, s->dhc, H, B, false, st);
+  }
+  gemm(conv ? s->dhc : s->dh, H, l.w_gu, 2 * I, H, s->dproj, s->ld_dproj, B, false, L);
+  if (fused) {
+    swiglu_split(s->dproj, s->ld_dproj, I, B, L, l.w_down.q8_inputs());
+    gemm_presplit(l.w_down, H, I, o_out, H, B, !conv, L);
+  } else {
+    swiglu(s->dproj, s->ld_dproj, I, s->dact, s->ld_dact, B, st);
+    gemm(s->dact, s->ld_dact, l.w_down, H, I, o_out, H, B, !conv, L);
+  }
+  if (conv)
+    grouped_conv(s->dtmp, H, s->ddelta + TG, 2 * TG, l.mlp_base + size_t(Tp) * H, H, Tp, b.conv_group, s->dx, H,
+                 B, true, st);
+}
+
+}  // namespace
+
 // DSpine (backend_abi.h flyx_dspine_block, ops/dspine/ref.h): the rows the round's drafts need (no row reads a row
 // after it: a block of fewer rows drafts the same first drafts), each layer a Qwen3 layer attending causally (within
 // the window) then the bridge's write; the head's candidates for the rows after the anchor; and the walk, which redoes
@@ -183,34 +258,15 @@ void dspine_block(flyx_seq* s, const DFlashBlock& b, int width, const Launch& L,
   const auto& head = block<HeadBlock>(m, b.head);
   const KvBuf& kv = s->kv[size_t(b.kv)];
   const DSpineBridge& br = b.dspine;
-  auto& d = s->ds;
+  auto& d = s->dsp;
   const int B = std::min(b.block, width + 1), nr = B - 1;
-  const int H = b.hidden, nh = b.nh, nkv = b.nkv, hd = b.hd, I = b.inter, C = br.code, R = br.rank, K = br.topk;
-  const int nqkv = (nh + 2 * nkv) * hd, senders = 1 + (nr - 1) * K;
+  const int H = b.hidden, C = br.code, R = br.rank, K = b.sel_topk, senders = 1 + (nr - 1) * K;
   cudaStream_t st = L.st;
   build_rows(s->P, nullptr, b.mask_token, s->dtok, B, st);
-  embed_tokens(E, s->dtok, s->dx, B, st);  // packed tables stay in host memory
+  embed_block_rows(E, s->dtok, s->dh, s->dx, H, B, st);
   for (int j = 0; j < b.layers(); ++j) {
     const auto& l = block<DFlashLayer>(m, b.first_layer + j);
-    const KvRef kvr = kv.draft_ref(j);  // a sliding window's ring of slots too (pos % ring)
-    rmsnorm(s->dx, H, l.norm.w, l.norm.offset, l.norm.eps, s->dh, H, B, H, st);
-    gemm(s->dh, H, l.w_qkv, nqkv, H, s->dproj, s->ld_dproj, B, false, L);
-    attn_prep(s->dproj, s->ld_dproj, 0, nh * hd, (nh + nkv) * hd, l.q_norm.w, l.k_norm.w, l.q_norm.offset,
-              l.q_norm.eps, b.theta, hd, nh, nkv, hd, B, s->P, kPosPosition, false, s->dq, kvr, st);
-    const bool split_o = fused && !l.w_o.q8_inputs() && (nh * hd) % 64 == 0;
-    attention(s->dq, kvr, nh, nkv, hd, B, true, 0, 1.f / std::sqrt(float(hd)), s->P, nullptr, 0,
-              split_o ? nullptr : s->dact, s->ld_dact, s->own.part, kRoundSplits, L, 0, b.window);
-    if (split_o) gemm_presplit(l.w_o, H, nh * hd, s->dx, H, B, true, L);
-    else gemm(s->dact, s->ld_dact, l.w_o, H, nh * hd, s->dx, H, B, true, L);
-    rmsnorm(s->dx, H, l.post_norm.w, l.post_norm.offset, l.post_norm.eps, s->dh, H, B, H, st);
-    gemm(s->dh, H, l.w_gu, 2 * I, H, s->dproj, s->ld_dproj, B, false, L);
-    if (fused) {
-      swiglu_split(s->dproj, s->ld_dproj, I, B, L, l.w_down.q8_inputs());
-      gemm_presplit(l.w_down, H, I, s->dx, H, B, true, L);
-    } else {
-      swiglu(s->dproj, s->ld_dproj, I, s->dact, s->ld_dact, B, st);
-      gemm(s->dact, s->ld_dact, l.w_down, H, I, s->dx, H, B, true, L);
-    }
+    block_layer(s, b, l, kv.draft_ref(j), B, true, L, fused);  // causal within the block
     // The bridge's write; the last one's rows before it, their rms and gate projections are what the walk redoes.
     const bool last = j == b.layers() - 1;
     dspine_normalize(s->dx, H, br.eps, B, s->dh, d.rms, st);
@@ -252,64 +308,21 @@ void draft_block(flyx_seq* s, const DFlashBlock& b, int width, const Launch& L, 
   // drafts, so width rows.  Trees keep the block they were made for.
   const int off = b.draft_from;
   const int B = tree ? b.block : std::min(FLYX_MAX_ROWS, std::max(b.block, width + off));
-  const int H = b.hidden, nh = b.nh, nkv = b.nkv, hd = b.hd, I = b.inter;
-  const int Tp = b.conv_taps, G = H / b.conv_group, TG = Tp * G, nqkv = (nh + 2 * nkv) * hd;
+  const int H = b.hidden;
   cudaStream_t st = L.st;
   build_rows(s->P, nullptr, b.mask_token, s->dtok, B, st);
-  if (E.has_norm) {
-    embed_tokens(E, s->dtok, s->dh, B, st);
-    rmsnorm(s->dh, H, E.norm.w, E.norm.offset, E.norm.eps, s->dx, H, B, H, st);
-  } else {
-    embed_tokens(E, s->dtok, s->dx, B, st);  // packed tables stay in host memory
-  }
-  for (int j = 0; j < b.layers(); ++j) {
-    const auto& l = block<DFlashLayer>(m, b.first_layer + j);
-    const KvRef kvr = kv.draft_ref(j);
-    // Token-conditioned convolutions around attention and MLP where the block has them; plain layers add straight back.
-    const bool conv = b.conv();
-    rmsnorm(s->dx, H, l.norm.w, l.norm.offset, l.norm.eps, s->dh, H, B, H, st);
-    if (conv) {
-      gemm(s->dh, H, l.attn_proj, 2 * TG, H, s->ddelta, 2 * TG, B, false, L);
-      grouped_conv(s->dh, H, s->ddelta, 2 * TG, l.attn_base, H, Tp, b.conv_group, s->dhc, H, B, false, st);
-    }
-    gemm(conv ? s->dhc : s->dh, H, l.w_qkv, nqkv, H, s->dproj, s->ld_dproj, B, false, L);
-    attn_prep(s->dproj, s->ld_dproj, 0, nh * hd, (nh + nkv) * hd, l.q_norm.w, l.k_norm.w, l.q_norm.offset,
-              l.q_norm.eps, b.theta, hd, nh, nkv, hd, B, s->P, kPosPosition, false, s->dq, kvr, st);
-    const bool split_o = fused && !l.w_o.q8_inputs() && (nh * hd) % 64 == 0;
-    attention(s->dq, kvr, nh, nkv, hd, B, false, B, 1.f / std::sqrt(float(hd)), s->P, nullptr, 0,
-              split_o ? nullptr : s->dact, s->ld_dact, s->own.part, kRoundSplits, L, 0, b.window);
-    float* const o_out = conv ? s->dtmp : s->dx;  // without convolutions the projection adds into the residual
-    if (split_o) gemm_presplit(l.w_o, H, nh * hd, o_out, H, B, !conv, L);
-    else gemm(s->dact, s->ld_dact, l.w_o, H, nh * hd, o_out, H, B, !conv, L);
-    if (conv)
-      grouped_conv(s->dtmp, H, s->ddelta + TG, 2 * TG, l.attn_base + size_t(Tp) * H, H, Tp, b.conv_group, s->dx, H,
-                   B, true, st);
-    rmsnorm(s->dx, H, l.post_norm.w, l.post_norm.offset, l.post_norm.eps, s->dh, H, B, H, st);
-    if (conv) {
-      gemm(s->dh, H, l.mlp_proj, 2 * TG, H, s->ddelta, 2 * TG, B, false, L);
-      grouped_conv(s->dh, H, s->ddelta, 2 * TG, l.mlp_base, H, Tp, b.conv_group, s->dhc, H, B, false, st);
-    }
-    gemm(conv ? s->dhc : s->dh, H, l.w_gu, 2 * I, H, s->dproj, s->ld_dproj, B, false, L);
-    if (fused) {
-      swiglu_split(s->dproj, s->ld_dproj, I, B, L, l.w_down.q8_inputs());
-      gemm_presplit(l.w_down, H, I, o_out, H, B, !conv, L);
-    } else {
-      swiglu(s->dproj, s->ld_dproj, I, s->dact, s->ld_dact, B, st);
-      gemm(s->dact, s->ld_dact, l.w_down, H, I, o_out, H, B, !conv, L);
-    }
-    if (conv)
-      grouped_conv(s->dtmp, H, s->ddelta + TG, 2 * TG, l.mlp_base + size_t(Tp) * H, H, Tp, b.conv_group, s->dx, H,
-                   B, true, st);
-  }
+  embed_block_rows(E, s->dtok, s->dh, s->dx, H, B, st);
+  for (int j = 0; j < b.layers(); ++j)
+    block_layer(s, b, block<DFlashLayer>(m, b.first_layer + j), kv.draft_ref(j), B, false, L, fused);
   // Rows draft_from.. predict tokens (width of them): unary top-k from the target head, then the
   // selector walk (or tree).  The block's layers above need all B rows (attention inside
   // the block is not causal), the head only the rows whose drafts are used.
   const int nr = std::min(width, B - off);
   rmsnorm(s->dx + size_t(off) * H, H, b.norm.w, b.norm.offset, b.norm.eps, s->dh, H, nr, H, st);
   draft_head_pick(head, s->dh, nr, b.sel_topk, s->cand, s->unary, s, L, s->draft_prob, s->draft_margin);
-  // no sel_hid: the selector's score with a unit gate
+  // no sel_hid: the selector's score with a unit gate; no selector (rank 0): the head's logits alone
   const float* hid = b.unit_hid ? b.unit_hid : s->hid;
-  if (!b.unit_hid) gemm(s->dh, H, b.sel_hid, b.sel_rank, H, s->hid, b.sel_rank, nr, false, L);
+  if (b.selector() && !b.unit_hid) gemm(s->dh, H, b.sel_hid, b.sel_rank, H, s->hid, b.sel_rank, nr, false, L);
   if (tree)
     selector_tree(s->P, s->cand, s->unary, b.sel_topk, hid, b.sel_rank, b.sel_pred, b.sel_succ, width, nr,
                   s->oracle, s->drafts, s->tree, st, b.softcap, b.softcap_mode, s->G);
@@ -474,6 +487,8 @@ void gdn_layer(const Pass& ps, const GdnBlock& g, bool fused) {
     lora_in_end(rv, g.lora, 4, out, rv.b.h, H, H, R, s->m->need.lora, L);
   } else {
     norm_and_project(rv, R, g.norm, g.w_in, g.n_in(), H, fused);
+    if (!ps.round && R > 16 && !g.w_in.packed() && prefill_rows_bf16(L, g.w_in.q, H))  // the fused path's bf16 rows
+      round_rows_bf16(rv.b.proj, rv.ld_proj, g.n_in(), R, st);
   }
   const float* b = rv.b.proj + C + vd;
   const float* a = b + gd.nv;
@@ -516,7 +531,7 @@ void gdn_layer(const Pass& ps, const GdnBlock& g, bool fused) {
     if (!gdn_chunk(sb.S, sb.s_stride, kSlotCur, bf, s->P, s->position, rv.b.gdn_o, R, st, snap_sel, snap_row))
       gdn_recur(sb.S, sb.s_stride, kSlotCur, kSlotCur, bf, kSlotCur, s->P, rv.b.gdn_o, R, nullptr, false, st);
   }
-  gdn_out_project(rv, g, R, fused);
+  gdn_out_project(rv, g, R, fused, residual16_pass(ps));
   if (g.lora) lora_out(rv, g.lora, 4, rv.b.act, vd, vd, H, R, s->m->need.lora, L);  // the gated norm's rows
 }
 
@@ -786,6 +801,9 @@ void attn_layer(const Pass& ps, const AttnBlock& a, bool fused) {
       throw std::logic_error("cuda: a bf16 residual's out projection is a W4A4 GEMM");
   } else if (split) {
     gemm_presplit(a.w_out, H, nh * hd, rv.b.x, H, R, true, L);
+  } else if (residual16_pass(ps)) {  // fusion=0: as gemm_staged_bf16 adds it; h (H wide; qbuf in a pass) is free here
+    gemm(rv.b.act, nh * hd, a.w_out, H, nh * hd, rv.b.h, H, R, false, L);
+    add_rows_bf16(rv.b.x, H, rv.b.h, H, H, R, st);
   } else {
     gemm(rv.b.act, nh * hd, a.w_out, H, nh * hd, rv.b.x, H, R, true, L);
   }
@@ -804,7 +822,8 @@ void mlp_layer(const Pass& ps, const MlpBlock& f, bool fused) {
     return;
   }
   if (!f.lora) {
-    mlp_body(rv.b.x, f, ps.rows, rv.b.h, rv.b.proj, rv.ld_proj, rv.b.act, rv.ld_act, rv.L, fused);
+    mlp_body(rv.b.x, f, ps.rows, rv.b.h, rv.b.proj, rv.ld_proj, rv.b.act, rv.ld_act, rv.L, fused,
+             residual16_pass(ps));
     return;
   }
   // The block's own adapters (ABI 43): the gate and up rows take their products before the SwiGLU, so the gate|up GEMM

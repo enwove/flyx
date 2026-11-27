@@ -178,6 +178,14 @@ void test_gemm_w4a4(int M, int N, int K) {
     const bool same_bf16 = qa == qb && sa == sb && std::memcmp(ia.data(), ib.data(), M * 4) == 0;
     std::printf("  %-4s %-48s\n", same_bf16 ? "ok" : "FAIL", "bf16 rows, maxima given: the float32 path's codes");
     if (!same_bf16) ++g_fail;
+    quantize_rows_nvfp4_bf16(dxb, K, M, K, nullptr, dq2, ds2, dinv2, 0);  // a bf16 gate|up GEMM's rows: no maxima
+    CK(cudaDeviceSynchronize());
+    CK(cudaMemcpy(qb.data(), dq2, qb.size(), cudaMemcpyDeviceToHost));
+    CK(cudaMemcpy(sb.data(), ds2, sb.size(), cudaMemcpyDeviceToHost));
+    CK(cudaMemcpy(ib.data(), dinv2, M * 4, cudaMemcpyDeviceToHost));
+    const bool same_found = qa == qb && sa == sb && std::memcmp(ia.data(), ib.data(), M * 4) == 0;
+    std::printf("  %-4s %-48s\n", same_found ? "ok" : "FAIL", "bf16 rows, maxima found: the float32 path's codes");
+    if (!same_found) ++g_fail;
     quantize_rows_nvfp4(dx, K, M, K, dq, ds, dinv, 0);  // the rows below
   }
   // references: the quantized operands, and the activations as they were

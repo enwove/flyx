@@ -359,69 +359,102 @@ done
 
 ---
 
-## 6. Block Drafters on Qwen3.8-27B and Qwen3-8B: DSpine, DFlash2, MTP (RTX PRO 6000)
+## 6. Block Drafters on Qwen3.8-27B and Qwen3-8B: DSpine, DFlash2, DFlash, MTP (RTX PRO 6000)
 
-One RTX PRO 6000 Blackwell Server Edition (96 GB, driver `620.70.06`; flyx at the DSpine change for the 27B, with
-this GPU's table and DSpine's NVFP4 layer copies below for the 8B, all of the 8B's columns in one run; Release, CUDA
-13.4, `FLYX_CUDA_ARCHS=120-real`), greedy, thinking off unless said, up to 1024 new tokens a prompt, each prompt in a
-fresh session:
+One RTX PRO 6000 Blackwell Server Edition (96 GB, driver `595.112.07`; flyx at #9's two commits, Release,
+`cmake --preset dev -DFLYX_CUDA_ARCHS=120-real` with CUDA 13.0's `nvcc`), greedy, thinking off unless said, up to 1024
+new tokens a prompt, each prompt in a fresh session, every row of both tables from one run of this build:
 
-- **Qwen3.8-27B**: `QUASAR-QAT/Qwen3.8-27B-QUASAR-NVFP4` (`4a22293a`, its MTP layer kept), converted once with
-  `z-lab/Qwen3.8-27B-DFlash2` (`50307d4c`, block 8) and once with `tencent/Qwen3.8-27B-DSpine-b16` (`260a6c23`).
-- **Qwen3-8B**: `Qwen/Qwen3-8B` (`b968826d`, BF16), converted with `tencent/Qwen3-8B-DSpine-b16` (`3b1e69d0`).
+- **Qwen3.8-27B**: `QUASAR-QAT/Qwen3.8-27B-QUASAR-NVFP4` (`4a22293a`, its MTP layer kept; `a07bf63e` changes its README
+  alone), converted once with `z-lab/Qwen3.8-27B-DFlash2` (`50307d4c`, block 8) and once with
+  `tencent/Qwen3.8-27B-DSpine-b16` (`260a6c23`).
+- **Qwen3-8B**: `Qwen/Qwen3-8B` (`b968826d`, BF16), converted once with `tencent/Qwen3-8B-DSpine-b16` (`3b1e69d0`) and
+  once with `z-lab/Qwen3-8B-DFlash-b16` (`9b41424b`; DFlash, DFlash2's block without its convolutions or selector, the
+  baseline the DSpine authors compare against).
 - **Prompts**: `bench/prompts/eval_sets.py` (the first 30 of GSM8K, MATH-500, HumanEval, MBPP and MT-Bench's first
   turns; the datasets at `740312ad`, `6e4ed1a2`, `7dce6050`, `4bb6404f`, `e3a795c5`) and
   `bench/prompts/chat_short.jsonl` (24). With thinking on, GSM8K and MBPP as token ids (`--think`): on the 27B the
-  first 20 of each, on Qwen3-8B the first 30 (no opener: Qwen3's template writes none).
+  first 20 of each, on Qwen3-8B the first 30 (no opener: Qwen3's template writes none). The files' md5:
+
+| set | md5 | set | md5 |
+|---|---|---|---|
+| `sets/gsm8k.jsonl` | `7c0efd4094ef6297d20e53756b54cfb9` | `sets/mtbench.jsonl` | `d6bf690974020dd78ebcf3f8c9dcc743` |
+| `sets/math500.jsonl` | `0b6b13d8ec07f297d3e816121ea91f84` | `sets/chat_short.jsonl` | `abd29de8b71aa54b54b3f3a6f611d768` |
+| `sets/humaneval.jsonl` | `ca05864a11736e1b4c9a1ad70faa674a` | `think27/gsm8k_think.jsonl` | `118b57a6ab4d61aeedcd9cc0cef67608` |
+| `sets/mbpp.jsonl` | `eb6c14653c0ad6ed0c70c12f0190085b` | `think27/mbpp_think.jsonl` | `dfceded8edf146478b3bdf97b2fb81a5` |
+| `think8/gsm8k_think.jsonl` | `8f5a581f7847fa9a2f46784c86302719` | `think8/mbpp_think.jsonl` | `7bf491c7c25897f9fb0883b9fa35368c` |
 
 ```sh
-python -I bench/prompts/eval_sets.py hf/ sets/
-python -I bench/prompts/eval_sets.py hf/ think/ --n 20 --think Qwen3.8-27B-QUASAR-NVFP4/tokenizer.json --opener $'<think>\n'
+for d in openai/gsm8k HuggingFaceH4/MATH-500 openai/openai_humaneval google-research-datasets/mbpp \
+         HuggingFaceH4/mt_bench_prompts; do hf download --repo-type dataset $d --local-dir hf/${d#*/}; done
+python -I bench/prompts/eval_sets.py hf/ sets/ && cp bench/prompts/chat_short.jsonl sets/
+python -I bench/prompts/eval_sets.py hf/ think27/ --n 20 --think Qwen3.8-27B-QUASAR-NVFP4/tokenizer.json --opener $'<think>\n'
+python -I bench/prompts/eval_sets.py hf/ think8/ --think Qwen3-8B/tokenizer.json
+PYTHONPATH=python/convert python -m flyx_convert --model Qwen3.8-27B-QUASAR-NVFP4 --draft Qwen3.8-27B-DFlash2 -o q27-dflash2.flyx
 PYTHONPATH=python/convert python -m flyx_convert --model Qwen3.8-27B-QUASAR-NVFP4 --draft Qwen3.8-27B-DSpine-b16 -o q27-dspine.flyx
-flyx bench q27-dspine.flyx --prompts sets/gsm8k.jsonl -n 1024 --json q27_gsm8k.json --drafter dspine --width 15 --no-lookup
-# likewise every set, without --width (chosen widths), and --no-spec, --drafter mtp, --drafter dflash2 [--width 7
-# --no-lookup] on the DFlash2 file; Qwen3-8B the same way (think8/: --think Qwen3-8B/tokenizer.json, no --opener)
-flyx bench q8-dspine.flyx --prompts sets/gsm8k.jsonl -n 1024 --json plain_gsm8k.json --no-spec
+PYTHONPATH=python/convert python -m flyx_convert --model Qwen3-8B --draft Qwen3-8B-DSpine-b16 -o q8-dspine.flyx
+PYTHONPATH=python/convert python -m flyx_convert --model Qwen3-8B --draft Qwen3-8B-DFlash-b16 -o q8-dflash.flyx
+# S: each set of sets/ (and of think27/ or think8/ for the thinking rows); R.json: each run's record
+flyx bench q27-dflash2.flyx --prompts S -n 1024 --json R.json --no-spec                 # plain (q27-dspine.flyx too)
+flyx bench q27-dflash2.flyx --prompts S -n 1024 --json R.json --drafter mtp
+flyx bench q27-dflash2.flyx --prompts S -n 1024 --json R.json --drafter dflash2         # chosen widths
+flyx bench q27-dflash2.flyx --prompts S -n 1024 --json R.json --drafter dflash2 --width 7 --no-lookup   # and 15
+flyx bench q27-dspine.flyx --prompts S -n 1024 --json R.json --drafter dspine           # and --width 15 --no-lookup
+flyx bench q8-dspine.flyx --prompts S -n 1024 --json R.json --no-spec                   # plain
+flyx bench q8-dspine.flyx --prompts S -n 1024 --json R.json --drafter dspine            # and --width 15 --no-lookup
+flyx bench q8-dflash.flyx --prompts S -n 1024 --json R.json --no-spec                   # plain (DFlash's file)
+flyx bench q8-dflash.flyx --prompts S -n 1024 --json R.json --drafter dflash            # and --width 15 --no-lookup
+# DSpine from its exact weights (both models, GSM8K):
+flyx bench q27-dspine.flyx --prompts sets/gsm8k.jsonl -n 1024 --json R.json --drafter dspine --width 15 \
+  --no-lookup --backend-opt draft_weights=exact
+# every drafted record against the plain record of its file: the same answers, token for token
+python -I bench/ab/same_runs.py R.json PLAIN.json --answers-only
 ```
 
 Decode `tok/s` (tokens a round). Every drafted answer is plain decoding's, token for token, in every configuration
-(the 27B: 174 prompts and 40 with thinking on; the 8B: 234).
+(`same_runs.py --answers-only`; the 27B: 174 prompts and 40 with thinking on; the 8B: 234).
 
-| Qwen3.8-27B | plain | MTP | DFlash2 | DSpine | DFlash2, 7 drafts | DSpine, 15 drafts |
-|---|---:|---:|---:|---:|---:|---:|
-| GSM8K | 81.4 | 310.4 (5.84) | **431.1** (6.83) | 387.1 (6.08) | 417.7 (6.20) | 412.7 (7.51) |
-| MATH-500 | 81.7 | 301.2 (5.44) | **422.8** (6.67) | 376.6 (5.90) | 411.6 (6.08) | 382.5 (6.91) |
-| HumanEval | 80.7 | 426.1 (10.67) | 593.6 (11.82) | 590.6 (11.82) | 474.4 (7.35) | **635.6** (12.48) |
-| MBPP | 80.8 | 278.8 (5.41) | 390.5 (6.22) | 387.7 (6.42) | 392.5 (6.00) | **396.4** (7.47) |
-| MT-Bench | 81.5 | 196.8 (3.14) | 228.2 (3.40) | 202.7 (3.02) | **228.5** (3.37) | 175.3 (3.15) |
-| chat | 81.6 | 218.1 (3.53) | **263.4** (3.94) | 237.0 (3.57) | 258.4 (3.81) | 205.6 (3.69) |
+| Qwen3.8-27B | plain | MTP | DFlash2 | DSpine | DFlash2, 7 drafts | DFlash2, 15 drafts | DSpine, 15 drafts |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| GSM8K | 81.5 | 308.3 (5.79) | 426.3 (6.75) | 388.4 (6.08) | 419.4 (6.20) | **445.8** (8.26) | 408.7 (7.51) |
+| MATH-500 | 81.7 | 297.5 (5.40) | 421.6 (6.69) | 375.9 (5.86) | 413.0 (6.08) | **427.6** (7.87) | 378.3 (6.91) |
+| HumanEval | 81.0 | 444.9 (10.55) | 610.6 (11.88) | 618.4 (12.09) | 478.5 (7.35) | 591.1 (11.65) | **634.2** (12.48) |
+| MBPP | 80.8 | 285.6 (5.57) | 391.9 (6.26) | 389.9 (6.30) | 395.2 (6.00) | **401.4** (7.67) | 394.1 (7.47) |
+| MT-Bench | 81.5 | 196.3 (3.13) | 227.4 (3.35) | 203.7 (3.03) | **229.3** (3.37) | 191.8 (3.51) | 173.4 (3.15) |
+| chat | 81.6 | 217.7 (3.54) | **263.4** (3.94) | 238.0 (3.57) | 259.4 (3.81) | 219.4 (4.01) | 203.4 (3.69) |
+| GSM8K, thinking | 81.5 | | | | **378.6** (5.60) | 363.7 (6.72) | 376.9 (6.93) |
+| MBPP, thinking | 82.0 | | | | 423.0 (6.23) | **437.3** (8.05) | 429.2 (7.85) |
 
-- A round costs DSpine what it costs DFlash2 at each width (the engine's load-time timings: 14.02 / 14.87 / 18.01 ms
-  for 3 / 7 / 15 drafts against 14.14 / 14.90 / 17.73), and DSpine's NVFP4 layer copies beside the NVFP4 target
-  accept as its exact weights do (`--backend-opt draft_weights=exact`; GSM8K at 15 drafts: 7.51 against 7.49 tokens
-  a round).
-- DSpine at its block of 16 accepts more than DFlash2 at its block of 8, as its authors report (GSM8K: 7.51 against
-  6.20 tokens a round; with thinking on, `think/gsm8k_think.jsonl`: 6.93 against 5.60, 378.5 against 376.6 tok/s).
-  Its first drafts are accepted less often than DFlash2's (the first: 0.912 against 0.948; seven deep: 0.419 against
-  0.567), and flyx's DFlash2 also drafts 15 from a wider block (GSM8K, `--width 15 --no-lookup`: 8.26 tokens a round,
-  455.2 tok/s): the faster of the two depends on the text, DSpine on code (HumanEval, MBPP), DFlash2 on math and chat.
-- Chosen every round, DSpine's widths stay mostly at 7 drafts where 15 give more (GSM8K: 387.1 against 412.7 tok/s):
+- A round costs DSpine what it costs DFlash2 at each width (the engine's load-time timings: 13.98 / 14.64 / 17.99 ms
+  for 3 / 7 / 15 drafts against 13.88 / 14.57 / 18.01; plain decoding's 12.25), and DSpine's NVFP4 layer copies beside
+  the NVFP4 target accept as its exact weights do (`draft_weights=exact`; GSM8K at 15 drafts: 7.51 against 7.49
+  tokens a round, 408.7 against 354.2 tok/s).
+- At 15 drafts, flyx's DFlash2 (its block of 8 stretched to 16 rows) accepts more than DSpine (its block of 16) on
+  GSM8K (8.26 against 7.51 tokens a round) and fewer on HumanEval (11.65 against 12.48); at its own 7 drafts DFlash2
+  accepts less (6.20 against 7.51; with thinking on 5.60 against 6.93). Its first drafts are accepted less often than
+  DFlash2's (GSM8K, the first: 0.912 against 0.948; seven deep: 0.419 against 0.567, DFlash2 at 7 drafts). The faster
+  of the two depends on the text: DSpine on HumanEval, DFlash2 on math, MBPP and chat.
+- Chosen every round, DSpine's widths stay mostly at 7 drafts where 15 give more (GSM8K: 388.4 against 408.7 tok/s):
   a fresh session's acceptance per position starts from the controller's prior (0.8 - 0.02 i), and a reply of a few
   hundred tokens seldom reaches positions past 7 to learn them.
 
-| Qwen3-8B | plain | DSpine | DSpine, 15 drafts | Tencent's plugin (SGLang), 15 drafts |
-|---|---:|---:|---:|---:|
-| GSM8K | 87.5 | 664.7 (9.28) | **692.1** (9.92) | 659.2 (10.00) |
-| MATH-500 | 87.4 | 594.7 (8.32) | **614.5** (8.63) | 592.3 (8.81) |
-| HumanEval | 87.5 | 524.9 (7.26) | **555.0** (7.81) | 531.3 (7.85) |
-| MBPP | 87.4 | 517.2 (7.28) | **531.9** (7.50) | 513.5 (7.58) |
-| MT-Bench | 87.3 | **265.8** (3.51) | 258.5 (3.61) | 242.1 (3.58) |
-| chat | 87.4 | 331.3 (4.47) | **331.8** (4.62) | 306.1 (4.57) |
-| GSM8K, thinking | 87.3 | 307.6 (4.12) | **312.4** (4.34) | 294.5 (4.39) |
-| MBPP, thinking | 87.3 | **272.2** (3.58) | 269.1 (3.73) | 248.5 (3.76) |
+| Qwen3-8B | plain | DFlash | DSpine | DFlash, 15 drafts | DSpine, 15 drafts | Tencent's plugin (SGLang), 15 drafts |
+|---|---:|---:|---:|---:|---:|---:|
+| GSM8K | 87.7 | 417.5 (5.86) | 649.5 (9.16) | 428.8 (6.12) | **684.4** (9.92) | 659.2 (10.00) |
+| MATH-500 | 87.9 | 483.5 (6.87) | 581.3 (8.25) | 494.7 (7.06) | **601.1** (8.63) | 592.3 (8.81) |
+| HumanEval | 87.9 | 424.8 (5.98) | 514.0 (7.19) | 434.9 (6.18) | **543.8** (7.81) | 531.3 (7.85) |
+| MBPP | 87.8 | 418.5 (5.89) | 487.1 (6.79) | 431.4 (6.15) | **520.9** (7.50) | 513.5 (7.58) |
+| MT-Bench | 87.6 | 195.8 (2.67) | **262.2** (3.51) | 190.7 (2.71) | 253.1 (3.61) | 242.1 (3.58) |
+| chat | 87.8 | 233.9 (3.20) | 322.9 (4.37) | 230.5 (3.26) | **324.7** (4.62) | 306.1 (4.57) |
+| GSM8K, thinking | 88.2 | 234.4 (3.18) | 301.5 (4.03) | 232.8 (3.28) | **305.0** (4.34) | 294.5 (4.39) |
+| MBPP, thinking | 87.7 | 225.1 (3.06) | **270.2** (3.56) | 221.5 (3.13) | 262.6 (3.73) | 248.5 (3.76) |
 
-On GSM8K DSpine accepts about what its authors report (at 15 drafts 9.92 tokens a round from its NVFP4 layer copies,
-10.03 from its exact weights; theirs 10.55), on MT-Bench less (3.61 against 5.63).
+- DFlash's round costs what DSpine's does (the load-time timings: 13.65 / 13.91 / 14.75 ms for 3 / 7 / 15 drafts
+  against 13.06 / 13.30 / 14.55; plain decoding's 11.54), and DSpine accepts 1.2 to 1.6 times as many tokens a round
+  and is that much faster: GSM8K at 15 drafts 9.92 against 6.12 tokens a round, 684.4 against 428.8 tok/s.
+- On GSM8K DSpine accepts about what its authors report (at 15 drafts 9.92 tokens a round from its NVFP4 layer copies,
+  10.03 from its exact weights; theirs 10.55), DFlash too (6.12; theirs 6.32); on MT-Bench both less (3.61 and 2.71
+  against 5.63 and 4.26), in the same ratio.
 
 **Against Tencent's own implementation.** Their SGLang plugin (`Tencent/DSpine` at `d037a9b`; Python 3.12, CUDA 13.0)
 on the same GPU, model and drafter snapshots, the same prompts token for token (each flyx plain record's
@@ -438,8 +471,12 @@ python -m sglang.launch_server --model-path Qwen3-8B --speculative-algorithm DSP
 python -I bench/ab/sglang_bench.py plain_gsm8k.json --json sglang_gsm8k.json
 ```
 
-At 15 drafts flyx is 3.6-8.4% faster on every set (9.8% on MT-Bench with widths chosen every round), at about the
-same tokens a round: its round is shorter. Every flyx answer is plain decoding's; SGLang's speculative answers were
+Its column was measured at #6 on another RTX PRO 6000 Blackwell Server Edition (driver `620.70.06`). flyx on that host,
+DSpine at 15 drafts: at #6 (`c97fd62f`) GSM8K 692.1, MATH-500 614.5, HumanEval 555.0, MBPP 531.9, MT-Bench 258.5,
+chat 331.8 tok/s, 1.1-2.2% above this table's at the same tokens a round; the DSpine change rebased onto `main` at
+`527f0ba6` 682.5, 604.2, 545.8, 523.5, 254.4 and 326.2, within 0.5% of this table's (the 1-2% came with `main`). Against the plugin at 15 drafts flyx is 1.4-6.1% faster on every set with this table's
+numbers (8.3% on MT-Bench with widths chosen every round) and 3.6-8.4% with #6's from the plugin's own host, at about
+the same tokens a round: its round is shorter. Every flyx answer is plain decoding's; SGLang's speculative answers were
 its own plain decoding's in 8 of the 30 GSM8K prompts (`--same-as` a run of the server without `--speculative-*`).
 What made the difference on this GPU, measured on GSM8K and HumanEval at 15 drafts (617.6 / 490.8 tok/s before):
 
@@ -448,6 +485,7 @@ What made the difference on this GPU, measured on GSM8K and HumanEval at 15 draf
   RTX 5090's rules, 1255 and 1008 on their own (+2-4%; bit-identical configurations).
 - **DSpine's layer copies**: beside a BF16 target the drafter was bf16, its five layers 1.9 GB a round, each layer
   the size of a target layer; Q8_0 copies +6% at the same tokens a round, NVFP4 copies 2-3% more at most 1% fewer.
+  DFlash's go to Q8_0 (GSM8K at 15 drafts: 398.0 -> 431.2 tok/s at the same tokens a round).
 - **The walk's GEMMs** in one launch of up to 240 rows (+0.5%).
 
 The trace that found them (`CUDA_INJECTION64_PATH=.../libflyx-trace.so FLYX_TRACE=round.tsv flyx bench ...`, then

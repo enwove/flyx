@@ -30,7 +30,7 @@
 extern "C" {
 #endif
 
-#define FLYX_BACKEND_ABI_VERSION 51u
+#define FLYX_BACKEND_ABI_VERSION 52u
 #define FLYX_BACKEND_ENTRY "flyx_backend_get_api"
 /* How a backend library exports its entry. */
 #if defined(_WIN32)
@@ -424,7 +424,10 @@ typedef enum {
  * -1), the block's first drafting row draft_from (1: rows 1.., 0: the anchor's
  * too, predicting the token after it: up to `block` drafts), sel_hid optional
  * (-1: the selector's score with a unit gate), and q8_weights (1: the model
- * asks its projections in Q8_0 beside a target of float weights). */
+ * asks its projections in Q8_0 beside a target of float weights).  ABI 52: the
+ * selector optional (sel_rank 0: sel_pred, sel_succ and sel_hid are -1, the
+ * walk takes the head's top sel_topk by their logits alone; DFlash: one, each
+ * row's best). */
 typedef struct {
   int32_t hidden, n_heads, n_kv, head_dim, inter;
   int32_t block, mask_token, n_taps, conv_taps, conv_group, sel_rank, sel_topk;

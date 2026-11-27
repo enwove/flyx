@@ -15,9 +15,11 @@ inline void embed_tokens(const EmbedBlock& e, const int* tokens, float* x, int r
   if (e.blk.data) embed_blocks(tokens, e.blk, e.hidden, x, rows, st);
   else embed(tokens, e.table, e.hidden, x, rows, st);
 }
-// A prefill pass whose residual rows are bf16 (as vLLM, SGLang and basalt keep them): more than 16 rows, the fused
-// producers, NVFP4 inputs in the scratch, and a model whose every residual add is a W4A4 GEMM (layers.cpp).  The
-// rows sit in RowBufs::x's memory (x16_of).
+// A prefill pass whose residual rows are bf16 (as vLLM, SGLang and basalt keep them): more than 16 rows, NVFP4
+// inputs in the scratch, and a model whose every residual add is a W4A4 GEMM (layers.cpp).  The fused producers
+// keep the rows in bf16 in RowBufs::x's memory (residual16, x16_of); the generic ops (fusion=0) keep them as float32
+// rows of bf16 values, each add's sum rounded once (add_rows_bf16): the same bits (AGENTS.md rule 2).
+bool residual16_pass(const Pass& ps);
 bool residual16(const Pass& ps);
 // The model's part of it, decided once (flyx_bmodel::res16): open_model reports it (-v).
 bool residual16_model(flyx_bmodel* m);
@@ -27,9 +29,11 @@ void norm_project(const float* x, float* h, float* out, int ld_out, int R, const
 void norm_and_project(const RowView& v, int R, const Norm& n, const Lin& w, int N, int H, bool fused);
 void mtp_draft_attention(flyx_seq* s, const AttnBlock& a, const KvBuf& kv, int pos_offset, const float* proj,
                          int ld_proj, float* q, float* out, float* part, const Launch& L);
+// add16 (the generic ops of a pass with a bf16 residual, residual16_pass): the down or out projection into h (H
+// wide), then added to x with the sum rounded once to bf16 (add_rows_bf16), as the fused producers add it.
 void mlp_body(float* x, const MlpBlock& f, int R, float* h, float* proj, int ld_proj, float* act, int ld_act,
-              const Launch& L, bool fused);
-void gdn_out_project(const RowView& v, const GdnBlock& g, int R, bool fused);
+              const Launch& L, bool fused, bool add16 = false);
+void gdn_out_project(const RowView& v, const GdnBlock& g, int R, bool fused, bool add16 = false);
 void head_logits(const HeadBlock& h, const RowView& v, int r0, int n, bool cert, const CertScratch& cs,
                  const KernelOptions& ko, bool x16 = false);
 // Where a draft head's pick keeps its scores and its choice's scratch: a sequence's own, or (logits given) a batch's
@@ -66,6 +70,8 @@ void draft_head_pick_additive_step(const HeadBlock& head, const float* x_base, c
 // Drafting works on the sequence's own buffers and scratch, on the stream of L (the sequence's, or a batch round's).
 // DFlash2: one block of drafts; tree: `width` of its candidates as a tree (FLYX_DRAFT_TREE), the TreeRows with them
 void draft_block(flyx_seq* s, const DFlashBlock& b, int width, const Launch& L, bool tree = false, bool fused = false);
+// A block drafter's rows (tok) embedded from the target's table, then its norm where it has one: out (tmp: scratch).
+void embed_block_rows(const EmbedBlock& E, const int* tok, float* tmp, float* out, int H, int B, cudaStream_t st);
 void mtp_draft(flyx_seq* s, const MtpBlock& b, int width, const Launch& L, bool fused = false, int start = 0);  // MTP: draft steps [start, width)
 void mtp_context(const Pass& ps, const MtpBlock& b, bool fused = false);  // MTP K/V for the rows of a pass
 void gdn_layer(const Pass& ps, const GdnBlock& g, bool fused = false);

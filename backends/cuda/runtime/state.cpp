@@ -86,7 +86,7 @@ RowNeeds row_needs(const flyx_bmodel* m) {
       n.cx = std::max(n.cx, d->hidden);
       n.ckv = std::max(n.ckv, d->ctx_width());
       if (d->fc.q8_inputs() || d->ctx.q8_inputs() || d->sel_hid.q8_inputs()) n.q8 = true;
-      ks({d->hidden, d->inter, d->nh * d->hd, df_feats, d->dspine.code, d->dspine.rank});
+      ks({d->hidden, d->inter, d->nh * d->hd, df_feats, d->dspine.code, d->dspine.rank});  // the bridge's GEMMs too
     } else if (const auto* dl = std::get_if<DFlashLayer>(&blk)) {
       if (dl->w_qkv.q8_inputs() || dl->w_o.q8_inputs() || dl->w_gu.q8_inputs() || dl->w_down.q8_inputs() ||
           dl->attn_proj.q8_inputs() || dl->mlp_proj.q8_inputs())
@@ -374,8 +374,11 @@ int ensure_prefill_rows(flyx_bmodel* m, int rows) {
       return reinterpret_cast<void*>(uintptr_t(256) + off);
     });
     // Never in host memory (device_room, device_malloc): a pass reads them a layer at a time.  Where the copies of the
-    // head kept for speed left no room, lowering fails and the engine has the backend give those back (trim).
-    device_room(total);
+    // head kept for speed left no room, lowering fails and the engine has the backend give those back (trim).  In
+    // pieces of the granularity (prefill_vmm_alloc, the whole last one) the floor of pieces; without them,
+    // device_malloc's, which it checks again.
+    const size_t gran = vmm_granularity();
+    device_room((total + gran - 1) / gran * gran, pieces_floor());
     size_t actual = 0;
     void* base = prefill_vmm_alloc(m, total, &actual);
     if (!base) {
@@ -424,24 +427,57 @@ int ensure_prefill_rows(flyx_bmodel* m, int rows) {
 
 void build_seq(flyx_bmodel* m, int32_t max_ctx, flyx_seq* s);
 
+namespace {
+
+size_t kv_row_bytes(const KvSpec& k) { return size_t(k.nkv) * k.hd * (k.fp8 ? 1 : sizeof(kv16)); }
+
+// Caches in tiers: the target's, one layer's each, of a size two or more share, since the caches of a size share
+// stagings on the device (as large as one's host part): a cache alone of its size would save no device memory.  A
+// drafter's stays on the device: its draft steps read it a row at a time.
+bool tiered_cache(const flyx_bmodel* m, const KvSpec& k) {
+  if (k.layers != 1 || k.draft || k.window > 0) return false;
+  int n = 0;
+  for (const KvSpec& o : m->states.kv)
+    n += o.layers == 1 && !o.draft && o.window == 0 && kv_row_bytes(o) == kv_row_bytes(k);
+  return n >= 2;
+}
+
+// Whether strata attention's kernels take every attention block that reads a cache in tiers, at `bits` bits.
+bool strata_takes(const flyx_bmodel* m, int bits) {
+  for (const Block& blk : m->blocks) {
+    if (const auto* a = std::get_if<AttnBlock>(&blk)) {
+      if (tiered_cache(m, m->states.kv[size_t(a->kv)]) && !strata_supported(a->nh, a->nkv, a->hd, bits)) return false;
+    } else if (const auto* r = std::get_if<RelAttnBlock>(&blk)) {
+      if (tiered_cache(m, m->states.kv[size_t(r->kv)]) && !strata_supported(r->nh, r->nkv, r->hd, bits)) return false;
+    }
+  }
+  return true;
+}
+
+}  // namespace
+
 // The layout's method for the sequence: exact, strata with a low-bit copy of 2 to 4 bits, or exact
 // below a switch and strata past it. The engine sets the switch before preflight. Direct ABI callers
-// can leave it at the layout default. A session whose every position is exact keeps no copy.
+// can leave it at the layout default. A session whose every position is exact keeps no copy, and so does one of
+// a model whose attention strata's kernels do not take (MiniCPM5-1B's 8 query heads a KV head): exact is the
+// method auto has left.
 bool take_method(const flyx_bmodel* m, const flyx_seq_layout* layout, flyx_seq* s) {
   if (!layout) return false;
   if (layout->method == FLYX_KV_READ_ALL) return true;
+  const int bits = layout->method_arg ? layout->method_arg : 2;
+  if (bits < 2 || bits > 4) return false;  // the copy's bits, asked for whether auto then keeps a copy or not
   if (layout->method == FLYX_KV_AUTO) {
     const int asked = m->opt.kernels.strata_from;
     const long long past = (long long)std::max(0, layout->device_positions) + kStrataHostExact;
     const int from = asked >= 0 ? asked : int(std::min<long long>(INT32_MAX, past));
-    if (from >= layout->max_ctx) return true;
+    if (from >= layout->max_ctx || !strata_takes(m, bits)) return true;
     s->strata_from = from;
   } else if (layout->method != FLYX_KV_STRATA) {
     return false;
   }
   s->kv_method = FLYX_KV_STRATA;
-  s->kv_bits = layout->method_arg ? layout->method_arg : 2;
-  return s->kv_bits >= 2 && s->kv_bits <= 4;
+  s->kv_bits = bits;
+  return true;
 }
 
 uint64_t query_pinned_budget(const flyx_bmodel* m) {
@@ -451,7 +487,9 @@ uint64_t query_pinned_budget(const flyx_bmodel* m) {
   return host_pinned_budget();
 }
 
-int seq_new_in(flyx_bmodel* m, const flyx_seq_layout* layout, flyx_seq** out) {
+namespace {
+
+int new_seq(flyx_bmodel* m, const flyx_seq_layout* layout, bool capture_only, flyx_seq** out) {
   // Sample the WDDM pinned budget once so dry-run sizing and real allocation choose the identical hybrid split.
   const uint64_t pinned_budget = query_pinned_budget(m);
   // Dry-run first to measure the exact arena sizes so the real build performs one device and one host allocation
@@ -472,6 +510,7 @@ int seq_new_in(flyx_bmodel* m, const flyx_seq_layout* layout, flyx_seq** out) {
 
   auto s = std::make_unique<flyx_seq>();
   if (!take_method(m, layout, s.get())) return fail("seq_new: a K/V layout this backend does not read");
+  s->capture_only = capture_only;
   s->pinned_budget = pinned_budget;
   s->device_positions = std::max(0, layout->device_positions);
   s->copy_host = std::max(0, layout->copy_host);
@@ -488,9 +527,20 @@ int seq_new_in(flyx_bmodel* m, const flyx_seq_layout* layout, flyx_seq** out) {
   return 0;
 }
 
+}  // namespace
+
+int seq_new_in(flyx_bmodel* m, const flyx_seq_layout* layout, flyx_seq** out) {
+  return new_seq(m, layout, false, out);
+}
+
 int seq_new(flyx_bmodel* m, int32_t max_ctx, flyx_seq** out) {
   const flyx_seq_layout all{max_ctx, INT32_MAX, FLYX_KV_READ_ALL, 0, 0};
   return seq_new_in(m, &all, out);
+}
+
+int seq_new_capture(flyx_bmodel* m, int32_t max_ctx, flyx_seq** out) {
+  const flyx_seq_layout all{max_ctx, INT32_MAX, FLYX_KV_READ_ALL, 0, 0};
+  return new_seq(m, &all, true, out);
 }
 
 int seq_size(flyx_bmodel* m, const flyx_seq_layout* layout, flyx_seq_size* out) {
@@ -510,7 +560,14 @@ int seq_size(flyx_bmodel* m, const flyx_seq_layout* layout, flyx_seq_size* out) 
     return fail(e.what());
   }
   *out = {};
+  // The arena's bytes as it carves them: the rest of its last piece of the granularity, which its pieces map whole (as
+  // one cudaMalloc takes its pages), is left to the reserve, at most one piece a session.
   out->device = s.dry_bytes + s.page_spill_vram + room;
+#if defined(_WIN32)
+  // Without pieces the arena is one cudaMalloc, which leaves kPagedFloor free (device_malloc), not the floor of pieces
+  // the budget's reserve is past (plan/budget.cpp): the session holds the difference.
+  if (!vmm_supported() && s.arena_dev_bytes) out->device += kPagedFloor - kPiecesFloor;
+#endif
   out->host = s.dry_host_bytes + s.page_spill_host;
   out->host_mapped = s.dry_mapped_bytes;
   out->device_positions = std::min(s.device_positions, layout->max_ctx);
@@ -654,23 +711,13 @@ size_t checkpoint_slot_bytes(const flyx_bmodel* m, const flyx_seq* s) {
 
 // The state the table declares, for positions [0, s->cap).
 void alloc_state(const flyx_bmodel* m, flyx_seq* s) {
-  // Caches in tiers: the target's, one layer's each, of a size two or more share, since the caches
-  // of a size share stagings on the device (as large as one's host part): a cache alone of its size would save no
-  // device memory.  A drafter's stays on the device: its draft steps read it a row at a time.
-  auto row_of = [](const KvSpec& k) { return size_t(k.nkv) * k.hd * (k.fp8 ? 1 : sizeof(kv16)); };
-  auto tiered = [&](const KvSpec& k) {
-    if (k.layers != 1 || k.draft || k.window > 0) return false;
-    int n = 0;
-    for (const KvSpec& o : m->states.kv) n += o.layers == 1 && !o.draft && o.window == 0 && row_of(o) == row_of(k);
-    return n >= 2;
-  };
   // Strata attention reads those caches through a low-bit copy; the query heads each one's attention
   // blocks have, for the shapes its kernels take and the scratch.
   const bool strata = s->kv_method == FLYX_KV_STRATA;
   int nh_most = 0, nkv_most = 0, hd_most = 0, g_hd_most = 0;  // the most of each, and of query heads times head dim
   auto check_strata = [&](int kv_idx, int nh, int nkv, int hd) {
     const KvSpec& k = m->states.kv[size_t(kv_idx)];
-    if (!strata || !tiered(k)) return;
+    if (!strata || !tiered_cache(m, k)) return;
     if (!strata_supported(nh, nkv, hd, s->kv_bits))
       throw std::runtime_error("strata attention: not compiled for " + std::to_string(nh) + " query heads of " +
                                std::to_string(hd) + " over " + std::to_string(nkv) + " KV heads at " +
@@ -697,7 +744,7 @@ void alloc_state(const flyx_bmodel* m, flyx_seq* s) {
   // staging fills while the layers since the one before run; their stagings alternate too.
   s->copies = 0;
   if (strata && nh_most > 0)
-    for (const KvSpec& k : m->states.kv) s->copies += tiered(k);
+    for (const KvSpec& k : m->states.kv) s->copies += tiered_cache(m, k);
   const int in_host = std::min(s->copy_host, s->copies);
   // Two host copies can stage during the draft. With enough consecutive host layers, placing the resident
   // copies further inside the pass reduces waits for the next transfer.
@@ -707,7 +754,7 @@ void alloc_state(const flyx_bmodel* m, flyx_seq* s) {
       if (rule.sku != m->opt.kernels.tuning || rule.copies != s->copies || rule.host != in_host ||
           rule.bits != s->kv_bits || s->max_ctx < rule.min_capacity) continue;
       if (!std::all_of(m->states.kv.begin(), m->states.kv.end(), [&](const KvSpec& k) {
-            return !tiered(k) || (k.fp8 && k.nkv == rule.nkv && k.hd == rule.hd);
+            return !tiered_cache(m, k) || (k.fp8 && k.nkv == rule.nkv && k.hd == rule.hd);
           })) continue;
       edge = rule.edge_host;
       if (rule.scan_halves && m->opt.kernels.strata_mma && s->cap >= kRoundSplits * kAttnMinSplitKeys) {
@@ -731,7 +778,7 @@ void alloc_state(const flyx_bmodel* m, flyx_seq* s) {
   // (0 bytes WDDM non-local) while keeping a rolling GPU tail ring and hot-pair cache.
   int elem_most = 1;
   for (const KvSpec& k : m->states.kv)
-    if (tiered(k)) elem_most = std::max(elem_most, k.fp8 ? 1 : int(sizeof(kv16)));
+    if (tiered_cache(m, k)) elem_most = std::max(elem_most, k.fp8 ? 1 : int(sizeof(kv16)));
   StrataSel page_how{};
   page_how.denom = m->opt.kernels.strata_denom >= 0 ? m->opt.kernels.strata_denom : s->kv_bits == 2 ? 16 : 64;
   page_how.least = m->opt.kernels.strata_least;
@@ -750,7 +797,7 @@ void alloc_state(const flyx_bmodel* m, flyx_seq* s) {
   if (s->device_positions >= 0 && s->device_positions < s->cap) {
     std::vector<size_t> tier_rows;
     for (const KvSpec& k : m->states.kv)
-      if (tiered(k)) tier_rows.push_back(row_of(k));
+      if (tiered_cache(m, k)) tier_rows.push_back(kv_row_bytes(k));
     if (!tier_rows.empty())
       s->device_positions = tiered_device_positions(s->device_positions, tier_rows.data(), int(tier_rows.size()),
                                                     vmm_granularity(), page_eligible);
@@ -778,7 +825,7 @@ void alloc_state(const flyx_bmodel* m, flyx_seq* s) {
       layer_drain.reserve(size_t(s->copies));
       uint64_t all_kv_pinned = 0;
       for (const KvSpec& k : m->states.kv) {
-        if (!tiered(k)) continue;
+        if (!tiered_cache(m, k)) continue;
         const int idx = ci++;
         int words = strata_words(k.hd, s->kv_bits);
         if (m->opt.strata_compact && hosted(idx) && m->opt.kernels.strata_mma && k.hd == 256 && s->kv_bits == 3)
@@ -792,7 +839,7 @@ void alloc_state(const flyx_bmodel* m, flyx_seq* s) {
           // counted: the split then never pins more than the budget, at worst a layer more than needed is pageable.
           prio1_base += 2 * q_bytes;
         }
-        const size_t row = row_of(k);
+        const size_t row = kv_row_bytes(k);
         const size_t tot_v = round_up_g(size_t(s->cap) * row);
         const size_t dev_v = tiered_device_bytes(s->device_positions, row, gran, true);
         const uint64_t host_kv = tot_v > dev_v ? uint64_t(tot_v - dev_v) : 0;
@@ -887,7 +934,7 @@ void alloc_state(const flyx_bmodel* m, flyx_seq* s) {
     b.layer_stride = size_t(positions) * k.nkv * k.hd;
     const size_t n = size_t(k.layers) * b.layer_stride;
     const size_t elem = k.fp8 ? 1 : sizeof(kv16);
-    if (tiered(k)) {  // in tiers when the layout says
+    if (tiered_cache(m, k)) {  // in tiers when the layout says
       b.row = size_t(k.nkv) * k.hd * elem;
       const int parity = m->opt.kernels.stage_ahead ? tiered_of_row[b.row]++ % 2 : 0;
       const int scale_floats = k.fp8 ? k.nkv : 0;  // the scales go where the positions go
@@ -1140,7 +1187,7 @@ void alloc_state(const flyx_bmodel* m, flyx_seq* s) {
     for (size_t i = 0; i < s->kv.size(); ++i) {
       const KvBuf& b = s->kv[i];
       const KvSpec& k = m->states.kv[i];
-      if (!b.vk || !tiered(k)) continue;
+      if (!b.vk || !tiered_cache(m, k)) continue;
       const size_t tot_v = round_up_g(size_t(s->cap) * b.row);
       const size_t dev_v = round_up_g(size_t(b.device_positions) * b.row);
       const int ring_pad = (dev_v > 0 && (dev_v % b.row) != 0) ? 1 : 0;
@@ -1330,10 +1377,16 @@ void build_seq(flyx_bmodel* m, int32_t max_ctx, flyx_seq* s) {
     CK(cudaEventCreateWithFlags(&s->idle_ev, cudaEventDisableTiming));
     CK(cudaEventCreateWithFlags(&s->ready_ev, cudaEventDisableTiming));
     if (s->arena_dev_bytes > 0) {
-      s->allocs.reserve(s->allocs.size() + 1);
-      void* p = device_malloc(s->arena_dev_bytes);
-      s->allocs.push_back(p);
-      CK(cudaMemsetAsync(p, 0, s->arena_dev_bytes, s->st));
+      // In pieces where the driver maps memory (Windows places them as allocations that small: kPiecesFloor); a
+      // sequence only captured, never run, over one piece; else one allocation.
+      void* p = s->capture_only ? device_alias(s->arena_dev_bytes, &s->arena_pieces)
+                                : device_pieces(s->arena_dev_bytes, &s->arena_pieces);
+      if (!p) {
+        s->allocs.reserve(s->allocs.size() + 1);
+        p = device_malloc(s->arena_dev_bytes);
+        s->allocs.push_back(p);
+      }
+      if (!s->capture_only) CK(cudaMemsetAsync(p, 0, s->arena_dev_bytes, s->st));
       s->dev_arena = static_cast<unsigned char*>(p);
       s->dev_arena_cap = s->arena_dev_bytes;
     }
@@ -1422,19 +1475,19 @@ void build_seq(flyx_bmodel* m, int32_t max_ctx, flyx_seq* s) {
     s->dq = s->alloc<float>(size_t(B) * d->nh * d->hd);
     s->ld_ckv = n.ckv;
     if (const DSpineBridge& br = d->dspine) {
-      const size_t n_rows = size_t(d->block), c = size_t(br.topk), C = size_t(br.code), Rk = size_t(br.rank);
+      const size_t n_rows = size_t(d->block), c = size_t(d->sel_topk), C = size_t(br.code), Rk = size_t(br.rank);
       const size_t cands = (n_rows - 1) * c, senders = 1 + (n_rows - 2) * c;
-      auto& ds = s->ds;
-      ds.codes = s->alloc<float>(std::max(n_rows, senders) * C);
-      ds.gates = s->alloc<float>(std::max(n_rows * 3 * Rk, senders * 2 * Rk));
-      ds.msg = s->alloc<float>(n_rows * Rk);
-      ds.rms = s->alloc<float>(n_rows);
-      ds.before = s->alloc<float>(n_rows * size_t(DH));
-      ds.g = s->alloc<float>(n_rows * Rk);
-      ds.heads = s->alloc<float>(cands * size_t(DH));
-      ds.tg = s->alloc<float>(cands * Rk);
-      ds.base = s->alloc<float>(cands);
-      ds.pick = s->alloc<int>(senders);
+      auto& dsp = s->dsp;
+      dsp.codes = s->alloc<float>(std::max(n_rows, senders) * C);
+      dsp.gates = s->alloc<float>(std::max(n_rows * 3 * Rk, senders * 2 * Rk));
+      dsp.msg = s->alloc<float>(n_rows * Rk);
+      dsp.rms = s->alloc<float>(n_rows);
+      dsp.before = s->alloc<float>(n_rows * size_t(DH));
+      dsp.g = s->alloc<float>(n_rows * Rk);
+      dsp.heads = s->alloc<float>(cands * size_t(DH));
+      dsp.tg = s->alloc<float>(cands * Rk);
+      dsp.base = s->alloc<float>(cands);
+      dsp.pick = s->alloc<int>(senders);
     }
   }
   if (ds) {

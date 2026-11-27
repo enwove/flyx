@@ -195,13 +195,15 @@ namespace {
 // The round plans no session captured yet, sized: a greedy round of each captured on a session of its own (every
 // position on the GPU and read exactly), not instantiated, nothing run.  graph_mu held.  Only seq_size asks for it
 // (the load's rounds count every plan the engine runs; a plan lowered past them, or a load that ran none, comes
-// here); the session runs no batch, so it goes without seq_free's look at the batch graphs.
+// here); the session runs no batch, so it goes without seq_free's look at the batch graphs.  Its device arena is one
+// piece of physical memory under all its addresses (seq_new_capture): a capture reads no memory, and its nodes are
+// those of a session laid out the same, so the count needs no room the planner has not given yet.
 void count_round_graphs(flyx_bmodel* m) {
   bool all = true;
   for (const auto& [plan, g] : m->round_graphs) all = all && g.counted;
   if (all) return;
   flyx_seq* s = nullptr;
-  if (const int rc = seq_new(m, kGraphCountCtx, &s); rc != 0) {
+  if (const int rc = seq_new_capture(m, kGraphCountCtx, &s); rc != 0) {
     const auto why = "sizing the round graphs: " + g_error;
     if (rc == FLYX_ERR_OOM) throw OutOfDeviceMemory(why);
     throw std::runtime_error(why);

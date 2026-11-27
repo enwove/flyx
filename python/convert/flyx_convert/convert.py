@@ -201,7 +201,7 @@ DSPARK_CANDIDATES = 1024
 
 # The block drafters a config.json names by its architecture, and the kind each converts to (core/modelfile/
 # drafter_dir.cpp's kDrafterArchitectures).
-_DRAFTER_ARCHITECTURES = {"DFlash2DraftModel": "dflash2", "Qwen3DSparkModel": "dspark",
+_DRAFTER_ARCHITECTURES = {"DFlash2DraftModel": "dflash2", "DFlashDraftModel": "dflash", "Qwen3DSparkModel": "dspark",
                           "DSpineDraftModel": "dspine"}
 
 
@@ -252,7 +252,10 @@ def canonical_draft_config(sc: dict, target: dict | None) -> dict:
       z-lab's and Inco's ("architectures": ["DFlash2DraftModel"], "dflash_config"; target_layer_ids: the target
         layers whose outputs it reads, hidden_states[id + 1] in their code; a list that reaches num_target_layers
         counts the hidden states themselves instead, the last the final norm's output, as Inco's drafter for
-        Inkling-2 does: its reference hands the ids to the capture DSpark's go to, as they are).
+        Inkling-2 does: its reference hands the ids to the capture DSpark's go to, as they are);
+    or a DFlash drafter's (z-lab's "DFlashDraftModel", what DFlash2 grew from; block_size beside its dflash_config):
+    DFlash2's block without convolutions (conv_taps 0) or selector (sel_rank 0, sel_topk 1: each row's draft the
+    head's best).
     taps: the target's hidden state after that many layers; after all of them, the final norm's output.  softcap,
     softcap_mode: the selector's soft cap on a candidate's logit (final_logit_softcapping), before it adds the
     pair's correction or after (selector_softcap_mode).  window: each position attends to the positions less than
@@ -263,10 +266,14 @@ def canonical_draft_config(sc: dict, target: dict | None) -> dict:
         return canonical_dspark_config(sc, target)
     if kind == "dspine":
         return canonical_dspine_config(sc, target)
+    dflash = kind == "dflash"
     if "dflash_config" in sc:
-        if "DFlash2DraftModel" not in sc.get("architectures", []):
-            raise ValueError(f"drafter architectures {sc.get('architectures')!r}: DFlash2DraftModel is supported")
+        if kind not in ("dflash2", "dflash"):
+            raise ValueError(f"drafter architectures {sc.get('architectures')!r}: no block drafter flyx reads")
         dc, tl = sc["dflash_config"], sc
+        for key in ("conv_kernel_size", "conv_group_size", "selector_rank", "selector_top_k"):
+            if dflash and key in dc:
+                raise ValueError(f"DFlash drafter: DFlash2's {key}")
         ids = [int(i) for i in dc["target_layer_ids"]]
         n_target = sc.get("num_target_layers")
         hidden_states = isinstance(n_target, int) and not isinstance(n_target, bool) and n_target in ids
@@ -302,11 +309,13 @@ def canonical_draft_config(sc: dict, target: dict | None) -> dict:
         if any(not 1 <= t <= target["layers"] for t in taps):
             raise ValueError(f"drafter taps {taps} outside the target's {target['layers']} layers")
     draft = {
-        "kind": "dflash2", **layer_fields(tl),
-        "block": dc["block_size"], "mask_token": dc["mask_token_id"], "taps": taps,
-        "conv_taps": dc.get("conv_kernel_size", 2), "conv_group": dc.get("conv_group_size", 16),
-        "sel_rank": dc.get("selector_rank", 256), "sel_topk": dc.get("selector_top_k", 16),
-        "window": window, "draft_from": 1, "sel_gate": True,
+        "kind": kind, **layer_fields(tl),
+        "block": sc["block_size"] if dflash else dc["block_size"], "mask_token": dc["mask_token_id"], "taps": taps,
+        "conv_taps": 0 if dflash else dc.get("conv_kernel_size", 2),
+        "conv_group": 1 if dflash else dc.get("conv_group_size", 16),
+        "sel_rank": 0 if dflash else dc.get("selector_rank", 256),
+        "sel_topk": 1 if dflash else dc.get("selector_top_k", 16),
+        "window": window, "draft_from": 1, "sel_gate": not dflash,
         "target": {"hidden": target_hidden, "vocab": vocab,
                    "layers": target["layers"] if target else sc.get("num_target_layers")},
     }
@@ -566,7 +575,8 @@ def _add_draft(w: Writer, draft_dir: str, target: dict | None, log) -> dict:
             if DRAFT_SKIP.match(inner):
                 log(f"draft: ignoring {name} (the engine uses the target's embedding and head)")
                 continue
-            canon = map_name(inner, _D_RULES)
+            # DFlash: its layers, fc and norms alone (no tensor of DFlash2's convolutions or selector is read)
+            canon = map_name(inner, DRAFT_LAYER_RULES if draft["kind"] == "dflash" else _D_RULES)
             if canon is None:
                 raise ValueError(f"unknown draft tensor {name!r}")
             arr, dt = dst.read(name)
@@ -680,9 +690,10 @@ def _check_mtp(layers, seen):
 
 def _check_draft(d, seen):
     # The tensors its config says it has (drafter_dir.cpp's check): convolutions where it has taps of them, the
-    # selector's hidden gate where it has one (sel_gate).
+    # selector where it has a rank, its hidden gate where it has one (sel_gate).
     conv, gate = d["conv_taps"] > 0, d["sel_gate"]
-    need = {"fc", "hidden_norm", "norm", "sel.pred", "sel.succ"} | ({"sel.hid"} if gate else set())
+    need = {"fc", "hidden_norm", "norm"} | ({"sel.pred", "sel.succ"} if d["sel_rank"] > 0 else set())
+    need |= {"sel.hid"} if gate else set()
     for j in range(d["layers"]):
         need |= {f"L{j}.{n}" for n in ((*ATTN_LAYER_KEYS, *_DRAFT_CONV_KEYS) if conv else ATTN_LAYER_KEYS)}
     check_tensors("draft", need, seen)

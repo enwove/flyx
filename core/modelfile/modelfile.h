@@ -101,11 +101,11 @@ struct ModelOrigin {
 ModelOrigin model_origin(const std::string& path);
 
 // The block drafter a config.json's architectures name, by one table (core/modelfile/drafter_dir.cpp): "dflash2",
-// "dspark", "dspine"; "" for none.
+// "dflash", "dspark", "dspine"; "" for none.
 std::string drafter_kind_of(const std::vector<std::string>& architectures);
 // The block drafter a drafter directory (its config.json) or a .flyx file (its header's "draft") holds, read without
-// mapping it: "dflash2", "dspark", "dspine"; "" when it holds none (a GGUF drafter's kind is its header's:
-// gguf_peek).
+// mapping it: "dflash2", "dflash", "dspark", "dspine"; "" when it holds none (a GGUF drafter's kind is its
+// header's: gguf_peek).
 std::string drafter_source_kind(const std::string& path);
 
 }  // namespace flyx

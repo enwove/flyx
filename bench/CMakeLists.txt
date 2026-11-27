@@ -34,7 +34,7 @@ target_include_directories(dv_choice PRIVATE ${PROJECT_SOURCE_DIR}/include)
 
 if(TARGET flyx_cuda_kernels)
   add_executable(cuda_bench microbench/cuda_bench.cu microbench/mlp_persistent.cu microbench/tune.cu
-                            microbench/tune_files.cpp microbench/graphs.cu)
+                            microbench/tune_files.cpp microbench/graphs.cu microbench/paging.cu)
   # flyx_core: the model file reader, for the matrices `cuda_bench tune FILE...` weighs its rules by
   target_link_libraries(cuda_bench PRIVATE flyx_cuda_kernels flyx_core)
   set_target_properties(cuda_bench PROPERTIES CUDA_ARCHITECTURES "${FLYX_CUDA_ARCHS}")

@@ -26,53 +26,26 @@ void expect(bool ok, const std::string& what) {
 }  // namespace
 
 DSpineSpec parse_dspine_json(const json& d, const TargetSpec& t, int companion) {
-  expect(d.value("kind", "") == "dspine", "a config of another kind");
   check_config_target(d, t);
   DSpineSpec spec{};
   spec.companion = companion;
   flyx_dspine_block& b = spec.block;
-  b.hidden = config_int(d, "hidden", "DSpine");
-  spec.layers = config_int(d, "layers", "DSpine");
-  b.n_heads = config_int(d, "n_heads", "DSpine");
-  b.n_kv = config_int(d, "n_kv", "DSpine");
-  b.head_dim = config_int(d, "head_dim", "DSpine");
-  b.inter = config_int(d, "inter", "DSpine");
-  b.block = config_int(d, "block", "DSpine");
-  b.mask_token = config_int(d, "mask_token", "DSpine");
+  Qwen3BlockConfig c = parse_qwen3_block(d, t, "DSpine");
+  b.hidden = c.hidden, spec.layers = c.layers, b.n_heads = c.n_heads, b.n_kv = c.n_kv, b.head_dim = c.head_dim;
+  b.inter = c.inter, b.block = c.block, b.mask_token = c.mask_token, b.theta = c.theta, spec.eps = c.eps;
+  spec.taps = std::move(c.taps);
+  b.n_taps = int32_t(spec.taps.size());
   b.code = config_int(d, "code", "DSpine");
   b.rank = config_int(d, "rank", "DSpine");
   b.topk = config_int(d, "topk", "DSpine");
-  const int64_t win = d.value("window", int64_t(0));
-  expect(win >= 0 && win <= INT_MAX, "window out of range");
-  b.window = int32_t(win);
-  b.theta = d.at("rope_theta").get<double>();
+  b.window = config_int(d, "window", "DSpine");
   b.bridge_eps = d.at("bridge_eps").get<double>();
-  spec.eps = d.at("eps").get<double>();
-  const int layers = spec.layers;
-  const double eps = spec.eps;
-  // The block's dimensions; the products the backends take of them fit an int.
-  expect(b.hidden == t.hidden, "made for a target of width " + std::to_string(b.hidden) + ", not " +
-                                   std::to_string(t.hidden));
   expect(b.block >= 2 && b.block <= FLYX_MAX_ROWS, "block size outside 2.." + std::to_string(FLYX_MAX_ROWS));
-  expect(b.topk >= 2 && b.topk <= FLYX_DSPINE_MAX_TOPK,
+  expect(b.topk >= 2 && b.topk <= FLYX_DSPINE_MAX_TOPK && b.topk <= t.vocab,
          "the walk's candidates outside 2.." + std::to_string(FLYX_DSPINE_MAX_TOPK));
-  expect(b.hidden > 0 && b.hidden <= kMaxWidth && layers > 0 && layers <= kMaxLayers && b.n_heads > 0 &&
-             b.n_heads <= kMaxHeads && b.n_kv > 0 && b.n_heads % b.n_kv == 0 && b.head_dim > 0 &&
-             b.head_dim % 2 == 0 && b.head_dim <= kMaxHeadDim && b.inter > 0 && b.inter <= kMaxWidth &&
-             b.code > 0 && b.code <= kMaxWidth && b.rank > 0 && b.rank <= kMaxWidth && b.mask_token >= 0 &&
-             b.mask_token < t.vocab && b.topk <= t.vocab && eps > 0 && std::isfinite(eps) && b.bridge_eps > 0 &&
-             std::isfinite(b.bridge_eps) && b.theta > 0 && std::isfinite(b.theta),
+  expect(b.window >= 0 && b.code > 0 && b.code <= kMaxWidth && b.rank > 0 && b.rank <= kMaxWidth &&
+             int64_t(3) * b.rank <= INT_MAX && b.bridge_eps > 0 && std::isfinite(b.bridge_eps),
          "invalid dimensions");
-  const int64_t ctx = int64_t(2) * layers * b.n_kv * b.head_dim, qkv = int64_t(b.n_heads + 2 * b.n_kv) * b.head_dim;
-  expect(ctx <= INT_MAX && qkv <= INT_MAX && int64_t(3) * b.rank <= INT_MAX, "dimensions too large");
-  for (const auto& v : d.at("taps")) {
-    const int64_t x = v.get<int64_t>();
-    expect(x >= 1 && x <= t.layers, "a tap after layer " + std::to_string(x) + " of " + std::to_string(t.layers));
-    spec.taps.push_back(int(x));
-  }
-  expect(!spec.taps.empty(), "no taps");
-  expect(int64_t(spec.taps.size()) * t.hidden <= INT_MAX, "too many taps");
-  b.n_taps = int32_t(spec.taps.size());
   return spec;
 }
 

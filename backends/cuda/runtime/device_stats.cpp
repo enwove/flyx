@@ -43,6 +43,13 @@ struct NvmlUtilization {
 struct NvmlMemory {
   unsigned long long total, free, used;
 };
+// nvmlMemory_v2_t (driver 510 on), with what the driver reserves of the device for itself (its firmware, the
+// display): in neither the used memory nvidia-smi shows nor the free memory.
+struct NvmlMemory2 {
+  unsigned int version;
+  unsigned long long total, reserved, free, used;
+};
+constexpr unsigned int kNvmlMemory2 = unsigned(sizeof(NvmlMemory2)) | (2u << 24);  // NVML_STRUCT_VERSION(Memory, 2)
 constexpr int kTemperatureGpu = 0;  // NVML_TEMPERATURE_GPU
 constexpr int kClockSm = 1;         // NVML_CLOCK_SM
 
@@ -59,6 +66,7 @@ struct Nvml {
   int (*pcie_width)(NvmlDevice*, unsigned int*);
   int (*fan)(NvmlDevice*, unsigned int*);          // percent
   int (*reasons)(NvmlDevice*, unsigned long long*) = nullptr;  // clock event reasons (optional)
+  int (*memory2)(NvmlDevice*, NvmlMemory2*) = nullptr;         // nvmlDeviceGetMemoryInfo_v2 (optional)
   NvmlDevice* dev = nullptr;
 };
 
@@ -142,6 +150,7 @@ void open_nvml() {
                    bind(lib, "nvmlDeviceGetFanSpeed", &n.fan);
   if (!bind(lib, "nvmlDeviceGetCurrentClocksEventReasons", &n.reasons))
     bind(lib, "nvmlDeviceGetCurrentClocksThrottleReasons", &n.reasons);  // its name before driver 535
+  bind(lib, "nvmlDeviceGetMemoryInfo_v2", &n.memory2);
   g_ready = all && n.init() == 0 && n.by_bus_id(g_bus_id.c_str(), &n.dev) == 0;
 }
 
@@ -231,9 +240,36 @@ uint64_t host_pinned_budget() {
 // memory is NVML's to 5.1 GB held, 650 MB below it at 5.4, 0 at 6.7 GB held with 645 MiB free by NVML.  Buffers of
 // 32 MiB stayed on the GPU until NVML's free memory was 239 and 247 MiB (two runs); of 256 MiB to 1 GiB, one that
 // would leave 560 MiB or less went partly to host memory (NVML's used memory grew by a half to nine tenths of it, the
-// buffers read at 19 to 168 GB/s, not 435), one asked with 690 MiB or less free wholly.  So the budget reads NVML's
-// figure there and keeps flyx's reserves from it (budget.cpp: 384 MB, and 512 MB where Windows pages), and
-// device_malloc keeps kPagedFloor (768 MiB) free.
+// buffers read at 19 to 168 GB/s, not 435), one asked with 690 MiB or less free wholly.
+//
+// On an RTX 5070 Ti 16 GB (Windows 11 26300, driver 610.88), the same with buffers of each size until the driver
+// refused one, beside the process's own 64 MiB buffers or another process's: the NVML free memory a buffer still went
+// wholly to the GPU at (each run twice, or in both cases), and past it the buffers read at 51 to 54 GB/s, not 820 to
+// 1,000 (DXGI counts such a buffer as the process's local memory, not its shared memory):
+//   one cudaMalloc or cuMemCreate of 256 MiB  417 to 633 MiB (none whole past 452)
+//   one cudaMalloc of 32 MiB                  212 to 270 MiB
+//   one cudaMalloc of 8 MiB                   129 to 137 MiB
+//   pieces of 8 MiB (cuMemCreate, one range)  121 to 137 MiB
+//   pieces of 2 MiB (cuMemCreate, one range)   61 to  73 MiB
+// So Windows places an allocation by its own size, and memory mapped from small pieces (device_pieces) as it does
+// small allocations; past the floor, beside another process, it moved that process's memory out instead.  The budget
+// reads NVML's free memory there and keeps flyx's reserves from it (plan/budget.cpp: 384 MB, total / 40 on GPUs of
+// more than 15 GB); device_malloc keeps kPagedFloor (768 MiB) free, memory in pieces kPiecesFloor (256 MiB).
+//
+// The total is what programs share there: NVML's total less what the driver reserves of the device for itself (308
+// MiB of the 5070 Ti's 16,303), which no program holds and none can allocate: counted in, the budget took it for
+// another program's (flyx_memory_info: total = free + what processes hold).
+void memory_of(const NvmlFigures& n, size_t* free, size_t* total) {
+  if (n.v2) {
+    if (n.total > n.reserved && n.total - n.reserved >= n.free) {
+      *free = size_t(n.free);
+      *total = size_t(n.total - n.reserved);
+    }
+  } else if (n.v1 && n.free <= *total) {
+    *free = size_t(n.free);
+  }
+}
+
 bool gpu_memory(size_t* free, size_t* total) {
   size_t fr = 0, tot = 0;
   if (cudaMemGetInfo(&fr, &tot) != cudaSuccess) return false;
@@ -247,8 +283,18 @@ bool gpu_memory(size_t* free, size_t* total) {
     }
     ready = g_ready;
   }
+  NvmlFigures n;
+  NvmlMemory2 m2{};
+  m2.version = kNvmlMemory2;
   NvmlMemory m{};
-  if (ready && g_nvml.memory(g_nvml.dev, &m) == 0) fr = size_t(m.free);
+  if (ready && g_nvml.memory2 && g_nvml.memory2(g_nvml.dev, &m2) == 0) {
+    n.v2 = true;
+    n.total = m2.total, n.reserved = m2.reserved, n.free = m2.free;
+  } else if (ready && g_nvml.memory(g_nvml.dev, &m) == 0) {
+    n.v1 = true;
+    n.total = m.total, n.free = m.free;
+  }
+  memory_of(n, &fr, &tot);
 #endif
   *free = fr;
   *total = tot;

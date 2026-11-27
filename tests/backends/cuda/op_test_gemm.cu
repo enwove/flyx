@@ -441,6 +441,29 @@ void test_gemm_glu(int M, int I, int K) {
       gemm_presplit(dw2, H, I, dz2, H, M, false, TL);                           // abuf rows, the same values
       expect(what + ", next GEMM: same bits", down(dz1, size_t(M) * H), down(dz2, size_t(M) * H), 0);
     }
+    if (I % 128 == 0) {
+      // bf16 gate|up weights beside NVFP4 down weights that take NVFP4 inputs: the gate|up GEMM leaves bf16 SwiGLU
+      // rows without their maxima, and the down GEMM rounds them as the generic path does from the same rows in
+      // float32 (gemm_fp4_tc)
+      std::vector<uint8_t> Qd(size_t(H) * I / 2), Sd(size_t(H) * I / 16);
+      for (auto& b : Qd) b = uint8_t(rng());
+      for (auto& b : Sd) b = uint8_t(0x28 + rng() % 0x18);
+      Vec rsd(H);
+      for (auto& v : rsd) v = 0.01 + 0.01 * double(rng() % 1000) / 1000.0;
+      uint8_t *dqd = dev<uint8_t>(Qd.size()), *dsd = dev<uint8_t>(Sd.size());
+      CK(cudaMemcpy(dqd, Qd.data(), Qd.size(), cudaMemcpyHostToDevice));
+      CK(cudaMemcpy(dsd, Sd.data(), Sd.size(), cudaMemcpyHostToDevice));
+      float* drsd = up(rsd);
+      gemm_glu_staged(dw, nullptr, nullptr, nullptr, I, K, M, L4);
+      gemm_on_glu(nullptr, dqd, dsd, drsd, H, I, dz1, H, M, false, L4);
+      const Vec glu = down_bf16(s4.glu, n);
+      const std::vector<float> glu32(glu.begin(), glu.end());
+      float* dg = dev<float>(glu32.size());
+      CK(cudaMemcpy(dg, glu32.data(), glu32.size() * 4, cudaMemcpyHostToDevice));
+      gemm_fp4_tc(dg, I, dqd, dsd, drsd, H, I, dz2, H, M, false, L4);
+      expect("bf16 gate|up weights, W4A4 down weights: the generic path's bits", down(dz1, size_t(M) * H),
+             down(dz2, size_t(M) * H), 0);
+    }
   }
 }
 

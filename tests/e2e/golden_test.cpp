@@ -42,10 +42,10 @@ using json = nlohmann::json;
 
 namespace {
 
-// The block drafter the tiny model holds, as its file says (flyx::drafter_source_kind): DFlash2, or DSpine in place of
-// it; "" for none.
+// The block drafter the tiny model holds, as its file says (flyx::drafter_source_kind): DFlash2, or DFlash or DSpine in
+// its place; "" for none.
 std::string g_block;
-std::string block_label() { return g_block == "dspine" ? "DSpine" : "DFlash2"; }
+std::string block_label() { return g_block == "dspine" ? "DSpine" : g_block == "dflash" ? "DFlash" : "DFlash2"; }
 
 // Session::init, checked.  A session the engine refuses (no room left for it, as on a GPU other programs hold, or
 // seq_new failed) has no sequence: a FAIL naming this file's line and why, and false.  generate refuses such a
@@ -553,6 +553,10 @@ std::vector<flyx_round_result> tree_rounds(Engine* e, const std::vector<int32_t>
 }
 
 constexpr int kReferenceWidth = -2;
+// The block drafter's drafts a round in the reference's rounds (the golden file's "width": its block's rows but the
+// anchor; 15 for a block of 16), which a fixed-width engine drafts too: a DFlash block of 8 drafts 7, not 15 from
+// its block stretched (its rows attend both ways, so the stretched rows change the first seven's drafts).
+int g_reference_width = 15;
 
 // A PEFT adapter given beside the model (the sixth argument, --lora): every engine of the run loads it.
 std::string g_lora_file;
@@ -582,8 +586,9 @@ std::unique_ptr<Engine> make(const std::string& path, const std::string& backend
   o.speculative = spec;
   o.drafter = drafter;
   o.prefill_chunk = prefill_chunk;  // several chunks per prompt
-  // fixed widths, as in the reference rounds (MTP 3, DFlash2 15), unless given (-1: chosen every round)
-  o.width = width != kReferenceWidth ? width : !spec ? 0 : drafter == "mtp" ? 3 : 15;
+  // fixed widths, as in the reference rounds (MTP 3, a block drafter its golden file's width), unless given (-1:
+  // chosen every round)
+  o.width = width != kReferenceWidth ? width : !spec ? 0 : drafter == "mtp" ? 3 : g_reference_width;
   auto e = std::make_unique<Engine>();
   std::string err;
   if (!e->load(path, o, &err)) {
@@ -718,8 +723,7 @@ void tree_round_before_strata(const std::string& model, const std::string& backe
                               const std::vector<int32_t>& prompt) {
   const int p = static_cast<int>(prompt.size()), W = FLYX_MAX_WIDE_ROWS - 1, after = 3 * FLYX_MAX_ROWS + 8;
   const int from = p + FLYX_MAX_WIDE_ROWS + 3 * FLYX_MAX_ROWS;
-  // As make() would (plain decoding, binary16 K/V), loaded here: a model whose attention shape has no strata kernels
-  // is refused at load (its session is sized there), which make() would end the test on.
+  // As make() would (plain decoding, binary16 K/V), loaded here.
   EngineOptions o;
   o.kv_gpu = o.kv_copy_gpu = -1;
   o.kv_ram = 0;
@@ -734,10 +738,6 @@ void tree_round_before_strata(const std::string& model, const std::string& backe
   auto e = std::make_unique<Engine>();
   std::string err;
   if (!e->load(model, o, &err)) {
-    if (err.find("not compiled for") != std::string::npos) {  // the model's attention shape has no strata kernels
-      std::printf("  --   a tree round before strata's switch: %s\n", err.c_str());
-      return;
-    }
     check(false, "a tree round before strata's switch: load: " + err);
     return;
   }
@@ -745,6 +745,49 @@ void tree_round_before_strata(const std::string& model, const std::string& backe
     std::printf("  --   a tree round before strata's switch: the file reads every position (it holds DV)\n");
     return;
   }
+  // Auto takes no switch only where strata's kernels do not take the model's attention (the tiny Llama's 8 query
+  // heads a KV head), where an explicit strata is refused; there auto reads every position exactly.
+  flyx_seq_size size{};
+  const bool no_switch =
+      e->api()->seq_size(e->bmodel(), &e->kv_layout(), &size) == 0 && size.strata_from >= o.max_ctx;
+  flyx_seq_layout seven = e->kv_layout();
+  seven.method_arg = 7;
+  check(e->api()->seq_size(e->bmodel(), &seven, &size) != 0, "auto with a copy of 7 bits: refused, switch or not");
+  // What to expect apart from the backend's own say (strata_supported, which auto and an explicit strata both read):
+  // of the models this runs on, only the tiny Llama's attention (MiniCPM5-1B's: 8 query heads a KV head of 128) has
+  // no strata kernels.
+  bool kernels = true;
+  const flyx_model_desc& d = e->model().desc();
+  for (int i = 0; i < d.n_blocks; ++i)
+    if (const flyx_block& b = d.blocks[i];
+        b.kind == FLYX_BLOCK_ATTN && b.attn.head_dim == 128 && b.attn.n_heads == 8 * b.attn.n_kv)
+      kernels = false;
+  check(no_switch != kernels, kernels ? "a model strata has kernels for: auto switches"
+                                     : "the tiny Llama (no strata kernels): auto takes no switch");
+  EngineOptions strata = o;
+  strata.kv_method = "strata";
+  std::string why;
+  const bool strata_loads = std::make_unique<Engine>()->load(model, strata, &why);
+  if (no_switch) {
+    check(!strata_loads && why.find("strata") != std::string::npos,
+          "auto takes no switch to strata: an explicit strata is refused too (" + why + ")");
+    EngineOptions exact = o;
+    exact.kv_method = "exact";
+    auto x = std::make_unique<Engine>();
+    Session a(e.get());
+    if (!x->load(model, exact, &err) || !a.init(&err)) {
+      check(false, "  auto and exact past the switch's place: the engines and sessions (" + err + ")");
+      return;
+    }
+    Session xs(x.get());
+    const int n = from - p + FLYX_MAX_ROWS;
+    const std::vector<int32_t> got = gen(a, prompt, n).tokens, want = xs.init(&err) ? gen(xs, prompt, n).tokens
+                                                                                   : std::vector<int32_t>{};
+    check(got.size() == size_t(n) && got == want,
+          "  past the switch's place, auto gives exact's tokens (" + first_difference(got, want) + ")");
+    return;
+  }
+  check(strata_loads, "auto switches to strata where an explicit strata loads (" + why + ")");
   const GivenTrees chain(e.get(), {W}, false);
   Session ref(e.get()), s(e.get());
   if (!chain.lowered() || !ref.init(&err) || !s.init(&err)) {
@@ -1102,6 +1145,34 @@ void dv_chat_checkpoint(const std::string& model, const std::string& backend, co
             (dv_runs ? "DV's rounds (" + std::to_string(drafted) + " drafted, a fresh session's drafts)"
                      : std::string("plain rounds")) +
             ": plain decoding's tokens, the fresh prefill's first token first");
+}
+
+// The tiny Qwen3 (models/llama) with its DSpine drafter from its exact weights, drafting 15 a round: transformers'
+// tokens, and its drafts round for round the reference drafter's from transformers' own hidden states at its taps
+// (golden_qwen3_dspine.json): its taps and context on an architecture the reference has no model of.
+void dspine_qwen3_checks(const std::string& dir, const std::string& backend) {
+  std::ifstream f(os::to_path(dir + "/golden_qwen3_dspine.json"), std::ios::binary);
+  if (!f) {
+    check(false, "dspine on Qwen3: golden_qwen3_dspine.json is missing (make_tiny.py)");
+    return;
+  }
+  const json g = json::parse(f);
+  auto e = make(dir + "/tiny_qwen3_dspine.flyx", backend, true, "dspine", false, "draft_weights=exact", false, 512, 15);
+  bool tokens = true;
+  int same = 0, total = 0;
+  for (const auto& c : g["cases"]) {
+    const auto prompt = c["prompt"].get<std::vector<int32_t>>(), want = c["tokens"].get<std::vector<int32_t>>();
+    Session s(e.get());
+    if (!init_checked(s)) return;
+    std::vector<flyx_round_result> trace;
+    tokens = tokens && gen(s, prompt, int(want.size()), &trace).tokens == want;
+    int sm = 0, tt = 0;
+    drafts_equal(trace, c["rounds"], &sm, &tt);
+    same += sm, total += tt;
+  }
+  check(tokens, "dspine on Qwen3: transformers' tokens");
+  check(total > 0 && same * 10 >= total * 9, "  its drafts the reference's from transformers' hidden states (" +
+                                                 std::to_string(same) + " / " + std::to_string(total) + ")");
 }
 
 // DSpark (DeepSeek's block drafter, models/drafters/dflash2.h: plain layers, every row of its block a draft, a Markov
@@ -2086,8 +2157,8 @@ void drafted_trees(const std::string& model, const std::string& backend, const s
   };
   int accepted = 0, oracle_accepted = 0;
   const bool same = turn_rounds(nullptr, &accepted) == want;
-  check(same, "DFlash2 trees taking turns with its chains: the reference's tokens (" + std::to_string(accepted) +
-                  " drafts accepted in tree rounds)");
+  check(same, "DFlash2 trees taking turns with its chains: the reference's tokens (" +
+                  std::to_string(accepted) + " drafts accepted in tree rounds)");
   const bool same_oracle = turn_rounds(&oracle, &oracle_accepted) == want;
   check(same_oracle && oracle_accepted > N / 2,
         "  with oracle drafts: long accepted runs (" + std::to_string(oracle_accepted) + " in tree rounds, " +
@@ -3708,6 +3779,57 @@ void graph_dv_rounds(const std::string& model, const std::string& backend, const
             kib(counted) + " they are counted at past them");
 }
 
+// What seq_size counts for round plans no session ran yet: a greedy round of each captured on a sequence of its own
+// whose device arena is one piece of memory under all its addresses (the backend's counting sequence), against each
+// plan's first graph on a session of the same layout that runs it.  Two engines alike, the same rounds lowered on each
+// past the load's (plain decoding and each of the drafter's widths, chains): on one seq_size counts them, on the other
+// a session of 64 tokens runs them first.  Every plan then counted the same way on both, seq_size gives the same.
+void graph_count_capture(const std::string& model, const std::string& backend, const std::vector<int32_t>& prompt,
+                         bool spec) {
+  auto a = make(model, backend, spec), b = make(model, backend, spec);
+  if (!b->api()->graph_stats) return;
+  struct Lowered {
+    Engine* e;
+    std::vector<flyx_plan*> plans;
+    ~Lowered() {
+      for (flyx_plan* p : plans) e->api()->plan_free(p);
+    }
+  } on_a{a.get(), {}}, on_b{b.get(), {}};
+  std::vector<std::pair<int, int>> rounds = {{0, -1}};  // (width, drafter)
+  for (size_t i = 0; i < a->widths().size(); ++i)
+    if (a->widths()[i] > 0 && a->round_drafters()[i] >= 0 && !a->round_trees()[i])
+      rounds.emplace_back(a->widths()[i], a->round_drafters()[i]);
+  for (const auto& [w, d] : rounds)
+    for (Lowered* on : {&on_a, &on_b}) {
+      auto program = on->e->model().round_program(w, d, false);
+      const flyx_program rp{FLYX_PHASE_ROUND, w, w + 1, static_cast<int32_t>(program.size()), program.data()};
+      flyx_plan* p = nullptr;
+      if (on->e->api()->lower(on->e->bmodel(), &rp, &p) == 0) on->plans.push_back(p);
+    }
+  const auto* api = b->api();
+  const flyx_seq_layout layout{64, INT32_MAX, FLYX_KV_READ_ALL, 0, 0};
+  flyx_seq* s = nullptr;
+  bool ran = on_a.plans.size() == rounds.size() && on_b.plans.size() == rounds.size() &&
+             api->seq_new_in(b->bmodel(), &layout, &s) == 0;
+  flyx_gen_params g{};
+  g.limit = 0;
+  flyx_round_result r{};
+  const int n = std::min<int>(8, int(prompt.size()));
+  ran = ran && api->prefill(b->prefill_plan(), s, prompt.data(), n, &g) == 0 && api->read(s, &r) == 0;
+  for (flyx_plan* p : on_b.plans) ran = ran && api->launch(p, s, &g) == 0 && api->read(s, &r) == 0;
+  flyx_graph_stats st{};
+  ran = ran && api->graph_stats(s, &st) == 0;
+  if (s) api->seq_free(s);
+  flyx_seq_size counted{}, run{};
+  const bool sized = a->api()->seq_size(a->bmodel(), &layout, &counted) == 0 &&
+                     api->seq_size(b->bmodel(), &layout, &run) == 0;
+  check(ran && st.captured == rounds.size() && sized && counted.device == run.device,
+        "round graphs counted on the counting sequence as on a session that runs them (" +
+            std::to_string(rounds.size()) + " plans lowered past the load's, " + std::to_string(st.captured) +
+            " graphs captured on the session): " + std::to_string(counted.device) + " and " +
+            std::to_string(run.device) + " bytes a session of 64 tokens");
+}
+
 }  // namespace
 
 // Sessions and engines give their device memory back: what this process holds of the device (device_held: its own
@@ -3746,6 +3868,8 @@ int device_memory(const std::string& model, const std::string& backend, const st
   graph_memory(model, backend, prompt, "all", 0);
   graph_after_batch(model, backend, prompt);
   graph_switching(model, backend, prompt);
+  graph_count_capture(model, backend, prompt, false);
+  graph_count_capture(model, backend, prompt, true);
   if (g_block == "dspine") {
     flyx_memory_info with{}, without{};
     flyx_load_estimate estimate{};
@@ -3805,6 +3929,7 @@ int main(int argc, char** argv) {
     return 1;
   }
   const std::string model = args.size() > 4 ? args[4] : dir + "/tiny" + variant + ".flyx";
+  g_reference_width = g.value("width", 15);
   g_block = flyx::drafter_source_kind(model);
   if (args.size() > 5 && args[5] != "-") g_lora_file = args[5];
   if (!memory_checks.empty()) {
@@ -4046,7 +4171,8 @@ int main(int argc, char** argv) {
             "relaxed acceptance, min-p 1e-37: more drafts accepted (MTP " + std::to_string(loose_m) + " against " +
                 std::to_string(exact_m) + ", DFlash2 " + std::to_string(loose_d) + " against " +
                 std::to_string(exact_d) + ")");
-      if (g_block == "dflash2") drafted_trees(model, backend, prompt, want, oracle);  // DSpine drafts chains only
+      // DFlash (one candidate a row) and DSpine draft chains only
+      if (g_block == "dflash2") drafted_trees(model, backend, prompt, want, oracle);
     }
 
     // MTP drafter: same tokens; drafts equal to the reference's; state kept
@@ -4635,7 +4761,10 @@ int main(int argc, char** argv) {
   if (backend == "cuda") wide_rounds(model, backend, g["cases"][0]["prompt"].get<std::vector<int32_t>>());
   if (backend == "cuda") mid_pass_checkpoint(model, backend, g["cases"][0]["prompt"].get<std::vector<int32_t>>());
   rewind_prefill_rewind(model, backend, g["cases"][0]["prompt"].get<std::vector<int32_t>>());
-  if (variant.empty()) dspark_checks(dir, backend);
+  if (variant.empty()) {
+    dspark_checks(dir, backend);
+    dspine_qwen3_checks(dir, backend);
+  }
   if (variant.empty()) {
     std::vector<std::vector<int32_t>> prompts;
     for (const auto& c : g["cases"]) prompts.push_back(c["prompt"].get<std::vector<int32_t>>());

@@ -73,9 +73,11 @@ bool read_gguf(std::vector<std::unique_ptr<os::MappedFile>>* maps, const std::st
 std::string drafter_dir_kind(const std::string& path);
 std::string flyx_draft_kind(const std::string& path);
 bool is_drafter_dir(const std::string& path);
-// Its config.json's block drafter (its architecture, or speculators' type: "dflash2", "dspark", "dspine"); "" for none.
+// Its config.json's block drafter (its architecture, or speculators' type: "dflash2", "dflash", "dspark",
+// "dspine"); "" for none.
 std::string drafter_dir_kind(const std::string& dir);
-// A .flyx file's "draft" section's kind, from its header alone ("dflash2", "dspark", "dspine"); "" when it holds none.
+// A .flyx file's "draft" section's kind, from its header alone ("dflash2", "dflash", "dspark", "dspine"); "" when it
+// holds none.
 std::string flyx_draft_kind(const std::string& path);
 // A .flyx file's header alone, read from its first bytes (the file not mapped); false when it is none.
 bool peek_flyx_header(const std::string& path, nlohmann::json* h);
