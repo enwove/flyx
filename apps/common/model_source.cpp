@@ -6,6 +6,8 @@
 #include <chrono>
 #include <cstdio>
 #include <filesystem>
+#include <fstream>
+#include <iterator>
 #include <map>
 #include <memory>
 #include <mutex>
@@ -18,6 +20,7 @@
 #include "core/os/env.h"
 #include "core/os/os.h"
 #include "core/os/path.h"
+#include "nlohmann/json.hpp"
 
 namespace flyx::apps {
 
@@ -176,9 +179,8 @@ const HubGguf* preferred_companion(const std::vector<HubGguf>& ggufs, const std:
   return first;
 }
 
-int gguf_mtp_layers(const std::string& path) {
-  const flyx::GgufPeek p = gguf_peek_cached(path, 0, fs::file_time_type::min());
-  return p.valid ? p.mtp_layers : -1;
+flyx::GgufPeek gguf_header(const std::string& path) {
+  return gguf_peek_cached(path, 0, fs::file_time_type::min());
 }
 
 double modified_unix(fs::file_time_type modified) {
@@ -335,20 +337,18 @@ bool one(const std::string& spec, const hub::ProgressFn& progress, const std::at
   return true;
 }
 
-// What kind of drafter a file or directory given beside a model holds, via classify_gguf().
-std::string drafter_kind(const std::string& path, const hub::Repo& repo) {
-  const std::string lp = lower(path);
-  if (lp.ends_with(".gguf")) {
-    const GgufClassification cls = classify_gguf(path);
-    if (!cls.drafter_kind.empty()) return cls.drafter_kind;
-    if (cls.kind == "gguf" && cls.mtp_layers > 0) return "mtp";
-    return "";
-  }
-  const auto kind = flyx::drafter_source_kind(path);
-  return kind.empty() && hub::is_drafter(repo) ? "dflash2" : kind;
+}  // namespace
+
+std::string drafter_kind(const std::string& path) {
+  if (const flyx::GgufPeek p = gguf_header(path); p.valid)
+    return p.arch == "dflash" ? (p.has_markov_context ? "dspark" : "dflash2") : p.mtp_layers > 0 ? "mtp" : "";
+  return flyx::drafter_source_kind(path);
 }
 
-}  // namespace
+std::string drafter_kind(const hub::Repo& r) {
+  if (hub::is_drafter(r)) return hub::drafter_kind(r);
+  return r.info.gguf_architecture == "dflash" ? "dflash2" : "";
+}
 
 bool reads_vision(const std::string& arch) {
   if (arch.empty()) return true;
@@ -365,18 +365,83 @@ std::string model_name_of(const std::string& path, bool local) {
   return from_path(extension == ".gguf" || extension == ".flyx" ? file.stem() : file);
 }
 
-std::vector<std::string> known_drafters(const std::vector<std::string>& base_models) {
-  // DFlash2 drafters trained for a model, by the model they were trained on (docs/models.md).
-  static const std::pair<const char*, const char*> kKnown[] = {
-      {"Qwen/Qwen3.8-27B", "z-lab/Qwen3.8-27B-DFlash2"},
-      {"Qwen/Qwen3.5-4B", "vllm-project/Qwen3.5-4B-DFlash2"},
-      {"thinkingmachines/Inkling-2-Mini", "incoai/Inkling-2-Mini-DFlash2"},
-  };
-  std::vector<std::string> out;
-  for (const std::string& b : base_models)
-    for (const auto& [model, drafter] : kKnown)
-      if (b == model) out.push_back(drafter);
-  return out;
+namespace {
+
+// The Hub's list of verified drafters (docs/models.md).
+constexpr const char* kDraftersRepo = "Enwove/flyx-drafters";
+constexpr const char* kDraftersFile = "drafters.json";
+
+// drafters.json: the copy in the Hugging Face cache, read without the network; and, `ask_hub` (a call that talks to the
+// Hub anyway), the Hub's main once a process (asked again after 10 minutes when it could not be had), no lock held
+// while it is asked.  "" when neither has it.
+std::string hub_drafters(bool ask_hub) {
+  static std::mutex mu;
+  static std::string fetched;  // the Hub's, once had
+  static std::chrono::steady_clock::time_point tried;
+  static bool ever = false;
+  {
+    std::lock_guard<std::mutex> lock(mu);
+    if (!fetched.empty()) return fetched;
+    const auto now = std::chrono::steady_clock::now();
+    ask_hub = ask_hub && !(ever && now - tried < std::chrono::minutes(10));
+    if (ask_hub) ever = true, tried = now;
+  }
+  hub::Repo r;
+  std::string err, path;
+  if (ask_hub ? hub::describe(kDraftersRepo, "main", &r, &err) : hub::in_cache(kDraftersRepo, "main", &r))
+    for (const hub::RepoFile& f : r.files) {
+      std::vector<std::string> paths;
+      if (f.path != kDraftersFile || f.size > (1u << 20)) continue;
+      if (ask_hub ? hub::fetch(r, {f}, &paths, {}, nullptr, &err) : (paths.push_back(hub::snapshot_dir(r) + "/" + f.path), true))
+        path = paths[0];
+    }
+  std::ifstream in(to_path(path), std::ios::binary);
+  std::string got = path.empty() ? "" : std::string((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+  if (!nlohmann::json::accept(got)) return "";
+  if (ask_hub) {
+    std::lock_guard<std::mutex> lock(mu);
+    fetched = got;
+  }
+  return got;
+}
+
+}  // namespace
+
+std::vector<KnownDrafter> known_drafters_in(const std::string& list, const std::string& repo,
+                                            const std::vector<std::string>& base_models, const std::string& relation) {
+  const nlohmann::json j = nlohmann::json::parse(list, nullptr, false);
+  if (!j.is_object() || !j.contains("version") || j["version"] != 1 || !j.contains("drafters") ||
+      !j["drafters"].is_array())
+    return {};
+  std::vector<KnownDrafter> exact, inferred;
+  std::set<std::string> names;
+  for (const auto& e : j["drafters"]) {
+    const auto text = [&](const char* k) { return e.contains(k) && e[k].is_string(); };
+    if (!e.is_object() || !text("base") || !text("repo") || !text("kind")) return {};
+    const std::string base = e["base"], name = e["repo"], kind = e["kind"];
+    interfaces::DrafterMode mode;
+    const bool runs = interfaces::parse_drafter_mode(kind, &mode);  // a kind this build does not run: left out
+    if ((runs && (mode == interfaces::DrafterMode::kAuto || mode == interfaces::DrafterMode::kAll ||
+                  mode == interfaces::DrafterMode::kNone)) ||
+        !names.insert(name).second)
+      return {};
+    if (!runs) continue;
+    if (!repo.empty() && base == repo) exact.push_back({name, kind, base, true, ""});
+    else if (std::find(base_models.begin(), base_models.end(), base) != base_models.end())
+      inferred.push_back({name, kind, base, false, relation});
+  }
+  exact.insert(exact.end(), inferred.begin(), inferred.end());
+  return exact;
+}
+
+std::vector<KnownDrafter> known_drafters(const std::string& repo, const std::vector<std::string>& base_models,
+                                         bool hub) {
+  if (repo.empty() && base_models.empty()) return {};
+  const std::string list = hub_drafters(hub);
+  std::vector<KnownDrafter> known = known_drafters_in(list, repo, base_models, "");
+  if (hub && std::any_of(known.begin(), known.end(), [](const KnownDrafter& k) { return !k.exact; }))
+    known = known_drafters_in(list, repo, base_models, hub::base_relation(repo));
+  return known;
 }
 
 bool wants_mtp(const EngineOptions& eo) {
@@ -400,6 +465,35 @@ namespace {
 bool is_dspark_file(const std::string& path) {
   const flyx::GgufPeek h = flyx::gguf_peek(path);
   return h.valid && h.arch == "dflash" && h.has_markov_context;
+}
+
+// The verified drafters for a model (a Hub repository's, and a path's) that it was not given: made for the repository it
+// is, or inferred, for the base models it names (its model card's, its file's).
+void suggest_drafters(const hub::Repo& repo, const std::vector<std::string>& drafters, Fetched* out) {
+  const flyx::ModelOrigin origin = flyx::model_origin(out->model);
+  std::vector<std::string> bases = repo.base_models;
+  bases.insert(bases.end(), origin.base_models.begin(), origin.base_models.end());
+  // A Hub model's load talks to the Hub anyway; a path's reads the cache's copy alone.
+  const bool hub_model = !repo.id.empty();
+  for (const KnownDrafter& known : known_drafters(hub_model ? repo.id : origin.repo, bases, hub_model)) {
+    const auto named = [&](const std::string& d) { return d.rfind(known.repo, 0) == 0; };
+    if (std::any_of(drafters.begin(), drafters.end(), named)) continue;
+    out->notes.push_back("a " + known.kind + " drafter verified for " +
+                         (known.exact ? std::string("this model")
+                                      : "its base model " + known.base +
+                                            (known.relation.empty() ? "" : " (" + known.relation + ")")) +
+                         " is published: --drafter-file " + known.repo);
+    // Its size where the cache has it; the Hub is not asked for a suggestion.
+    KnownDrafter k = known;
+    hub::Repo cached;
+    std::vector<hub::RepoFile> files;
+    std::string ignored;
+    if (hub::in_cache(known.repo, "main", &cached) && hub::select(cached, {known.repo}, &files, &ignored)) {
+      k.size = 0;
+      for (const hub::RepoFile& f : files) *k.size += f.size;
+    }
+    out->suggested.push_back(std::move(k));
+  }
 }
 
 }  // namespace
@@ -438,14 +532,18 @@ bool fetch_model(const std::string& model, const std::vector<std::string>& draft
   hub::Repo repo;
   if (!one(model, progress, stop, &out->model, &repo, err)) return false;
   out->name = model_name_of(out->model, repo.id.empty());
-  const int own_mtp = want_mtp ? gguf_mtp_layers(out->model) : -1;  // -1: not a GGUF, or not asked
+  const flyx::GgufPeek own = want_mtp ? gguf_header(out->model) : flyx::GgufPeek{};
+  const int own_mtp = own.valid ? own.mtp_layers : -1;  // -1: not a GGUF, or not asked
   if (own_mtp > 0) out->drafter_sources.push_back({"mtp", "model file", std::nullopt});
   for (const std::string& d : drafters) {
     hub::Repo drepo;
     std::string path;
     if (!one(d, progress, stop, &path, &drepo, err)) return false;
     out->drafters.push_back(path);
-    out->drafter_sources.push_back({drafter_kind(path, drepo), drepo.id.empty() ? path : d, bytes_on_disk(path)});
+    out->drafter_sources.push_back(
+        {drepo.id.empty() || !hub::is_drafter(drepo) ? drafter_kind(path) : hub::drafter_kind(drepo),
+         drepo.id.empty() ? path : d,
+         bytes_on_disk(path)});
   }
   if (want_vision && !mmproj.empty()) {
     hub::Repo mrepo;
@@ -464,6 +562,7 @@ bool fetch_model(const std::string& model, const std::vector<std::string>& draft
         out->drafter_sources.push_back({"dspark", d, bytes_on_disk(d)});
         out->notes.push_back("the DSpark drafter beside the model: " + d);
       }
+    suggest_drafters(repo, drafters, out);
     return true;
   }
   const bool need_mmproj = want_vision && out->mmproj.empty();
@@ -514,22 +613,7 @@ bool fetch_model(const std::string& model, const std::vector<std::string>& draft
         }
     }
   }
-  for (const std::string& k : known_drafters(repo.base_models)) {
-    bool given = false;
-    for (const std::string& d : drafters) given = given || d.rfind(k, 0) == 0;
-    if (given) continue;
-    out->notes.push_back("a DFlash2 drafter is published for this model: --drafter-file " + k);
-    // Its size where the cache has it; the Hub is not asked for a suggestion.
-    std::optional<uint64_t> size;
-    hub::Repo cached;
-    std::vector<hub::RepoFile> files;
-    std::string ignored;
-    if (hub::in_cache(k, "main", &cached) && hub::select(cached, {k}, &files, &ignored)) {
-      size = 0;
-      for (const hub::RepoFile& f : files) *size += f.size;
-    }
-    out->suggested.push_back({"dflash2", k, size});
-  }
+  suggest_drafters(repo, drafters, out);
   return true;
 }
 

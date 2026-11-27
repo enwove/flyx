@@ -213,6 +213,10 @@ add_executable(numbers_test apps/common/numbers_test.cpp ${CMAKE_SOURCE_DIR}/app
 target_include_directories(numbers_test PRIVATE ${CMAKE_SOURCE_DIR})
 add_executable(model_source_test apps/common/model_source_test.cpp ${CMAKE_SOURCE_DIR}/apps/common/model_source.cpp)
 target_link_libraries(model_source_test PRIVATE flyx_core)
+add_executable(known_drafters_test apps/common/known_drafters_test.cpp ${CMAKE_SOURCE_DIR}/apps/common/model_source.cpp)
+target_link_libraries(known_drafters_test PRIVATE flyx_core)
+add_executable(drafter_speeds_test apps/flyx-server/drafter_speeds_test.cpp ${CMAKE_SOURCE_DIR}/apps/flyx-server/drafter_speeds.cpp)
+target_link_libraries(drafter_speeds_test PRIVATE flyx_core)
 add_executable(strata_snapshot_test backends/cuda/strata_snapshot_test.cpp)
 target_include_directories(strata_snapshot_test PRIVATE ${CMAKE_SOURCE_DIR})
 add_executable(draft_ring_test backends/cuda/draft_ring_test.cpp)
@@ -247,7 +251,8 @@ flyx_add_unit_test(scheduler_test core/exec/scheduler_test.cpp flyx-test-host-kv
 # A model switch in flyx serve's host: the server's model host and model sources over the tiny model.
 flyx_add_unit_test(model_host_test apps/flyx-server/model_host_test.cpp flyx-test-host-kv)
 target_sources(model_host_test PRIVATE ${CMAKE_SOURCE_DIR}/apps/flyx-server/model_host.cpp
-                                       ${CMAKE_SOURCE_DIR}/apps/common/model_source.cpp)
+                                       ${CMAKE_SOURCE_DIR}/apps/common/model_source.cpp
+                                       ${CMAKE_SOURCE_DIR}/apps/flyx-server/drafter_speeds.cpp)
 add_dependencies(model_host_test flyx-cpu_ref)
 
 add_executable(capi_test core/exec/capi_test.cpp ${CMAKE_SOURCE_DIR}/core/exec/capi.cpp)
@@ -341,6 +346,9 @@ add_test(NAME flag_numbers COMMAND numbers_test)
 # The DSpark drafter published beside a model, taken by default: beside a GGUF on disk, and in its repository (a
 # Hugging Face cache read offline).
 flyx_register_test(model_source model_source_test)
+add_test(NAME known_drafters COMMAND known_drafters_test)
+set_tests_properties(known_drafters PROPERTIES ENVIRONMENT "HF_HUB_OFFLINE=1")  # no network
+add_test(NAME drafter_speeds COMMAND drafter_speeds_test)
 add_test(NAME chat_replies COMMAND tags_test)
 # Qwen3.5's own renderer against the Jinja engine on generated conversations, and its calls read back.
 add_test(NAME chat_qwen35 COMMAND qwen35_format_test ${ASSETS}/tiny.flyx

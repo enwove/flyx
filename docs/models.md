@@ -57,6 +57,8 @@ flyx serve unsloth/Qwen3.8-27B-GGUF:UD-IQ2_S --drafter-file z-lab/Qwen3.8-27B-DF
 | **DV** (bifill-dv's canvas drafter) | A DV `.flyx` file: a Llama with bifill-dv's canvas and selector written in (`flyx_convert --dv`) | Only when named (`--drafter dv` or `all`). A canvas pass of the target's weights with its own adapter over 32 slots after the anchor, then a selector that grows a tree of the file's width (31) or of 15, verified exactly (rounds of up to 64 rows). Its warm-up, its trees of 15 and of 31, plain decoding and lookup rounds are chosen every round by tokens per ms at the context; `--width N` pins it. CUDA backend only; see [DV](design/dv.md). |
 | **Prompt Lookup** | Built-in (enabled by default) | Verifies 15 drafts copied from matching 6-token n-grams in the current sequence with zero drafter forward pass. Big speedup on agent code edits/repeats; backs off for 32 tokens after poor rounds (`--no-lookup` disables). |
 
+Verified drafters: `drafters.json` in the Hub's [`Enwove/flyx-drafters`](https://huggingface.co/Enwove/flyx-drafters) lists the drafters checked with flyx (every output plain decoding's, and faster), by the base model they were made for: `{"version": 1, "drafters": [{"base": "Qwen/Qwen3-8B", "repo": "deepseek-ai/dspark_qwen3_8b_block7", "kind": "dspark"}, ...]}` (`kind`: `--drafter`'s word). The server reads it once a process (from the Hugging Face cache when offline) and keeps the kinds the build runs. A drafter made for the model itself (the Hub repository it is, or a `.flyx` file's `source.repo`, which `flyx_convert --repo` writes) is offered as such; one made for a base model the model names (its model card's `base_model`, a GGUF's `general.source.repo_url` and `general.base_model.<i>.repo_url`, a `.flyx` file's `source.base_models`) is offered as inferred, with how the Hub says the model was made from it (`quantized`, `finetune`, ...). The dashboard lists them beside the default drafter, each the fastest on this machine's own runs first (every request that ran to its end drafting with it, by model: its output tokens over its decode time, kept in `<config>/flyx/drafter_speeds.json`, written every 30 seconds and at exit added to what the file has; N/A for one not run here yet, flyx gives no figures of its own), and a load notes them. A path's load and a listing of local files read the list's copy in the Hugging Face cache only; a Hub model's load and a repository's page ask the Hub for it (once a process; offline, the cache's copy). The list is `main` of that repository, which the enwove maintainers keep: a drafter goes in once checked with flyx. Today: DFlash2 for Qwen3.8-27B and Qwen3.5-4B, DSpark for Qwen3-8B, and DSpine for Qwen3-8B and Qwen3.8-27B (offered once a build runs DSpine).
+
 Control flags:
 - `--drafter mtp|dflash2|dspark|dv|all|none`
 - `--drafter-file PATH_OR_HF` (repeatable)
@@ -80,7 +82,7 @@ hf download Qwen/Qwen3.5-4B --local-dir ~/models/Qwen3.5-4B
 hf download vllm-project/Qwen3.5-4B-DFlash2 --local-dir ~/models/Qwen3.5-4B-DFlash2
 PYTHONPATH=python/convert python -m flyx_convert \
     --model ~/models/Qwen3.5-4B --draft ~/models/Qwen3.5-4B-DFlash2 \
-    -o ~/models/qwen35-4b.flyx
+    --repo Qwen/Qwen3.5-4B -o ~/models/qwen35-4b.flyx
 
 # ModelOpt NVFP4 checkpoint
 hf download AxionML/Qwen3.5-4B-NVFP4 --local-dir ~/models/Qwen3.5-4B-NVFP4

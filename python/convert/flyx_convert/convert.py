@@ -453,11 +453,33 @@ def _reorder_q(w: np.ndarray, n_heads: int, head_dim: int) -> np.ndarray:
     return np.ascontiguousarray(w.transpose(1, 0, 2, 3)).reshape(2 * n_heads * head_dim, -1)
 
 
+def _base_models(model_dir: str) -> list[str]:
+    """The base models a model directory's card names ("org/name": README.md's front matter, base_model).  flyx offers
+    the drafters made for a model's own repository and, inferred, those of its base models (docs/models.md)."""
+    out = []
+    card = os.path.join(model_dir, "README.md")
+    text = open(card, encoding="utf-8", errors="replace").read() if os.path.exists(card) else ""
+    end = text.find("\n---", 3) if text.startswith("---\n") else -1
+    lines = text[4:end].split("\n") if end > 0 else []
+    for i, line in enumerate(lines):
+        if not line.startswith("base_model:"):
+            continue
+        value = line[len("base_model:"):].strip()
+        names = [value] if value else []
+        for item in lines[i + 1:] if not value else []:  # a list: its items, up to the next key
+            if not item.strip().startswith("- "):
+                break
+            names.append(item.strip()[2:].strip())
+        out += [n.strip("'\"") for n in names if re.fullmatch(r"['\"]?[\w.-]+/[\w.-]+['\"]?", n)]
+    return list(dict.fromkeys(out))
+
+
 def convert(model_dir: str, out: str, draft_dir: str | None = None, log=print, activations: str | None = None,
-            dv_dir: str | None = None, lora_dir: str | None = None) -> None:
+            dv_dir: str | None = None, lora_dir: str | None = None, repo: str | None = None) -> None:
     """activations: what the file says its NVFP4 weights' inputs are in prefill passes ("nvfp4", "bf16"); None: what
     the checkpoint is calibrated for (ModelOpt's NVFP4: nvfp4).  dv_dir: a DV drafter (export_dv.py's directory),
-    with the V-LoRA it holds; lora_dir: a V-LoRA alone (export_dv.py --vlora's)."""
+    with the V-LoRA it holds; lora_dir: a V-LoRA alone (export_dv.py --vlora's).  repo: the Hub repository the model
+    is ("org/name"), the file's source.repo; None: not said."""
     hf_cfg = _read_config(os.path.join(model_dir, "config.json"))
     tc = _text_config(hf_cfg)
     arch = arch_of(hf_cfg)
@@ -539,7 +561,8 @@ def convert(model_dir: str, out: str, draft_dir: str | None = None, log=print, a
         # The engine reads the template (blob above) and recognises its output
         # format itself (models/formats); these are the variables it may print.
         "chat": _template_tokens(tok_cfg),
-        "source": {"model": os.path.basename(os.path.normpath(model_dir)),
+        "source": {"model": os.path.basename(os.path.normpath(model_dir)), "repo": repo,
+                   "base_models": _base_models(model_dir),
                    "draft": os.path.basename(os.path.normpath(draft_dir)) if draft_dir else None,
                    "dv": os.path.basename(os.path.normpath(dv_dir)) if dv_dir else None,
                    "lora": os.path.basename(os.path.normpath(lora_dir)) if lora_dir else None},
@@ -699,10 +722,14 @@ def main(argv=None):
     ap.add_argument("--dv", help="DV drafter directory, as python/convert/export_dv.py writes it (optional; Llama), "
                                  "with the V-LoRA it holds")
     ap.add_argument("--lora", help="a V-LoRA alone: the directory export_dv.py --vlora writes (optional; Llama, Qwen3)")
+    ap.add_argument("--repo", help="the Hub repository --model is (org/name), kept as the file's source.repo: the "
+                                   "drafters made for it are offered as such (optional)")
     ap.add_argument("-o", "--out", required=True)
     ap.add_argument("--activations", choices=("nvfp4", "bf16"),
                     help="NVFP4 weights' inputs in prefill passes (default: what the checkpoint is calibrated for)")
     a = ap.parse_args(argv)
+    if a.repo and not re.fullmatch(r"[\w.-]+/[\w.-]+", a.repo):
+        ap.error("--repo: org/name")
 
     def log(message):
         # A redirected console may use a code page that cannot print a model's path.
@@ -710,8 +737,9 @@ def main(argv=None):
         print(message.encode(encoding, errors="backslashreplace").decode(encoding))
 
     if a.model:
-        convert(a.model, a.out, a.draft, log=log, activations=a.activations, dv_dir=a.dv, lora_dir=a.lora)
-    elif a.draft and not a.activations and not a.dv and not a.lora:
+        convert(a.model, a.out, a.draft, log=log, activations=a.activations, dv_dir=a.dv, lora_dir=a.lora,
+                repo=a.repo)
+    elif a.draft and not a.activations and not a.dv and not a.lora and not a.repo:
         convert_draft(a.draft, a.out, log=log)
     else:
         ap.error("--model, or --draft alone")

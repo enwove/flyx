@@ -231,9 +231,9 @@ void split_gguf(const std::string& dir) {
   check(s1.bytes() == expected_bytes && s2.bytes() == expected_bytes, "split GGUF bytes() sums all shards");
   std::atomic<bool> stop{false};
   s1.read_ahead(stop);  // exercises multi-shard read_ahead without crashing
-  check(gguf_peek_mtp_layers(shard1) == gguf_peek_mtp_layers(single) &&
-            gguf_peek_mtp_layers(shard2) == gguf_peek_mtp_layers(single),
-        "gguf_peek_mtp_layers works on shard 1 and shard 2");
+  check(gguf_peek(shard1).valid && gguf_peek(shard1).mtp_layers == gguf_peek(single).mtp_layers &&
+            gguf_peek(shard2).valid && gguf_peek(shard2).mtp_layers == gguf_peek(single).mtp_layers,
+        "gguf_peek's MTP layers on shard 1 and shard 2");
 
   // Quantized split GGUF
   ModelFile qref, qs1;

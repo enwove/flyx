@@ -77,7 +77,8 @@ function FitTag({ size }) {
   return html`<span class=${"tag2 " + (fits ? "ok" : "bad")} title=${t(title)}>${t(fits ? "fits" : "too big")}</span>`;
 }
 
-const drafterLabel = (k) => k === "mtp" ? "MTP" : k === "dflash2" ? "DFlash2" : k === "dspark" ? "DSpark" : k;
+const kDrafterLabels = { mtp: "MTP", dflash2: "DFlash2", dspark: "DSpark", dv: "DV" };
+const drafterLabel = (k) => kDrafterLabels[k] || k;
 
 // What is served and its state, its facts, a fetch's or a load's progress, an error.  With nothing
 // served it is the view's whole content: `again` loads the model the server remembers, `browse` shows the library.
@@ -175,10 +176,11 @@ function Serving({ tm, again, retry, browse }) {
     </div>`;
 }
 
-// File-specific drafter identities. Unknown companions still go to the loader.
-const fileDrafterKinds = ["dflash2", "mtp", "dspark"];
+// The drafter kinds one drafter file can be (--drafter's words for them).  A drafter's kind is the server's word for
+// it (its file's own fields, GET /v1/hub/drafter), never its name's; unknown, the loader reads it.
+const kFileDrafterKinds = ["mtp", "dflash2", "dspark"];
 const pickedDrafter = (path, kind) => ({
-  spec: true, draftSource: "custom", savedDraft: null, drafter: path, drafterKind: fileDrafterKinds.includes(kind) ? kind : "", draftPicked: true,
+  spec: true, draftSource: "custom", savedDraft: null, drafter: path, drafterKind: kFileDrafterKinds.includes(kind) ? kind : "", draftPicked: true,
 });
 const normVisionDev = (v) => (v === "host" || v === "cpu") ? "host" : v === "gpu" ? "gpu" : v === "auto" ? "auto" : "disk";
 const normVisionQuant = (v) => (v === "exact" || v === "bf16") ? "exact" : (v === "nvfp4" || v === "fp4") ? "nvfp4" : "q8";
@@ -195,7 +197,7 @@ function shown(w) {
            width: w.width === null || w.width === undefined ? "auto" : String(w.width),
            head: w.draft_head === "full" ? "full head" : "1-bit pick",
            weights: dw === "nvfp4" ? "NVFP4" : dw === "q8" ? "Q8_0" : dw === "exact" ? "exact" : "auto",
-           lookup: w.lookup !== false ? "on" : "off", trees: w.draft_trees ? "on" : "off",
+           lookup: w.lookup !== false ? "on" : "off", trees: w.draft_trees === true ? "on" : w.draft_trees === false ? "off" : "default",
            vision: vOn ? "on" : "off", mmproj: vOn ? (w.mmproj || "auto") : "auto",
            vision_device: normVisionDev(w.vision_device), vision_quant: normVisionQuant(w.vision_quant),
            vision_max_tokens: w.vision_max_tokens > 0 ? String(w.vision_max_tokens) : "auto" };
@@ -204,7 +206,7 @@ function shown(w) {
 function draftingOf(w) {
   const files = w.drafters || [], mode = w.drafter || "", own = files.length === 1 ? files[0] : "";
   // The single custom-file control also selects its kind. Keep configurations it cannot express as a separate choice.
-  const custom = w.speculative !== false && files.length === 1 && own === own.trim() && (!mode || fileDrafterKinds.includes(mode));
+  const custom = w.speculative !== false && files.length === 1 && own === own.trim() && (!mode || kFileDrafterKinds.includes(mode));
   const savedDraft = !custom && (mode || files.length) ? { drafter: mode, drafters: files } : null;
   return { draftSource: savedDraft ? "saved" : custom ? "custom" : "default", savedDraft, drafter: own, drafterKind: custom ? mode : "" };
 }
@@ -215,7 +217,7 @@ function formOf(w) {
   return { ctx: w.ctx || "", kv: w.kv === "16" || w.kv === "fp8" ? w.kv : "", kvram: typeof w.kv_ram === "number" ? String(w.kv_ram) : "",
            kvgpu: typeof w.kv_gpu === "number" ? String(w.kv_gpu) : "", name: w.name || "",
            spec: w.speculative !== false, ...draftingOf(w), draftPicked: false,
-           width: w.width === null || w.width === undefined ? "" : String(w.width), trees: !!w.draft_trees, lookup: w.lookup !== false,
+           width: w.width === null || w.width === undefined ? "" : String(w.width), trees: w.draft_trees === true ? "on" : w.draft_trees === false ? "off" : "", lookup: w.lookup !== false,
            head: w.draft_head === "full" ? "full" : "", weights: normDraftWeights(w.draft_weights),
            vision: vOn, visionSource: vOn && w.mmproj ? "custom" : "default", mmproj: vOn ? (w.mmproj || "") : "", mmprojPicked: false,
            vision_device: normVisionDev(w.vision_device), vision_quant: normVisionQuant(w.vision_quant),
@@ -229,7 +231,7 @@ function loadBody(chosen, f) {
   const ctx = ctxText === "max" ? "max" : ctxTokens > 0 ? ctxTokens : null;  // "max": the model's own, or the longest that fits
   const kvRam = parseFloat(f.kvram), kvGpu = parseInt(f.kvgpu, 10), name = f.name.trim();
   const own = f.draftSource === "custom" && f.spec ? f.drafter.trim() : "";
-  const adv = { width: f.width ? parseInt(f.width, 10) : null, draft_trees: f.trees, lookup: f.lookup,
+  const adv = { width: f.width ? parseInt(f.width, 10) : null, draft_trees: f.trees === "on" ? true : f.trees === "off" ? false : null, lookup: f.lookup,
                 draft_head: f.head || null, draft_weights: f.weights || null };
   const draft = f.draftSource === "saved" ? f.savedDraft : {
     drafter: own ? f.drafterKind : "", drafters: own ? [own] : [],
@@ -263,7 +265,8 @@ function commandOf(b, shell) {
   if (b.drafter) parts.push("--drafter " + b.drafter);
   for (const d of b.drafters) parts.push("--drafter-file " + q(d));
   if (b.width !== null) parts.push("--width " + b.width);
-  if (b.draft_trees) parts.push("--draft-trees");
+  if (b.draft_trees === true) parts.push("--draft-trees");
+  if (b.draft_trees === false) parts.push("--no-draft-trees");
   if (!b.lookup) parts.push("--no-lookup");
   if (b.draft_head) parts.push("--backend-opt draft_head=" + b.draft_head);
   if (b.draft_weights) parts.push("--backend-opt draft_weights=" + b.draft_weights);
@@ -328,6 +331,9 @@ export function ModelPage({ active, libraryAsked, currentAsked }) {
   const [epMsg, setEpMsg] = useState("");
   const [epSaving, setEpSaving] = useState(false);
   const [hubDraft, setHubDraft] = useState("");
+  const [verifiedOf, setVerifiedOf] = useState({});  // a repository's drafters for its base models (GET /v1/hub/files)
+  const [baseOpen, setBaseOpen] = useState(false);  // the drafters for the model's base model, shown
+  const [madeOpen, setMadeOpen] = useState(false);  // the drafters made for the model, shown
   const [hubMmproj, setHubMmproj] = useState("");
   // this machine: the models the server lists, the folders kept here, the folder shown (`loc`; "" for where to start)
   const [catalog, setCatalog] = useState(null);
@@ -345,6 +351,18 @@ export function ModelPage({ active, libraryAsked, currentAsked }) {
   // the model to load, and how
   const [target, setTarget] = useState("");
   const [f, setF] = useState(EMPTY_FORM);
+  // A drafter typed in: its kind as its file's fields say it (GET /v1/hub/drafter), asked once typing stops.
+  useEffect(() => {
+    const name = f.drafter.trim();
+    if (f.draftSource !== "custom" || !name || f.drafterKind) return;
+    let live = true;
+    const timer = setTimeout(async () => {
+      const a = await ask("/v1/hub/drafter?name=" + encodeURIComponent(name), "read a drafter");
+      if (live && !a.error && a.j.kind)
+        setF((cur) => cur.drafter.trim() === name && !cur.drafterKind ? Object.assign({}, cur, { drafterKind: a.j.kind }) : cur);
+    }, 400);
+    return () => { live = false; clearTimeout(timer); };
+  }, [f.draftSource, f.drafter, f.drafterKind]);
   // The view shown: "current" (the model served, the load settings) or "library".  The page opens on the model while
   // one is served or coming or its load failed, else on the library; a load started from the library shows the model
   // again.
@@ -648,7 +666,8 @@ export function ModelPage({ active, libraryAsked, currentAsked }) {
     if (loadedWant && loadedWant.speculative !== false && !loadedWant.drafter && !loadedWant.drafters?.length) {
       const list = draftersOf(L).map((d) => drafterLabel(d.kind) + " · " +
         (d.from === "model file" ? t("the model file's own layer") : t("from " + d.from + (d.size ? " (" + gb(d.size) + " GB)" : ""))));
-      if (!list.length && activeDraft) list.push(activeDraft.toUpperCase() + " · " + t("the model file's own layer"));
+      if (!list.length && activeDraft)
+        list.push(activeDraft.split("+").map(drafterLabel).join(" + ") + " · " + t("the model file's own layer"));
       return list.length ? { tag: "in use", tone: "ok", lines: list } : { tag: "none", tone: "", lines: [t("This model loaded no drafter: plain decoding.")] };
     }
     return { tag: "", tone: "", lines: [t("The model's own MTP layer, if it has one.")] };
@@ -697,6 +716,32 @@ export function ModelPage({ active, libraryAsked, currentAsked }) {
   function settingsView(cmdModel) {
     const activeDraft = model.drafter && model.drafter !== "none" ? model.drafter : "";
     const specLoaded = !!activeDraft, visLoaded = !!model.vision;
+    // The drafters verified for the model the settings are for: a Hub repository's (GET /v1/hub/files), the served
+    // model's (what its load found), a file of this machine's (the library's entry for it).
+    const servedLocal = !cmdRepo && loadedWant && cmdModel === loadedWant.model;
+    const entry = !cmdRepo && !servedLocal
+      ? [...(catalog ? catalog.models : []), ...(dir ? dir.models : [])].find((m) => m.name === cmdModel) : null;
+    const verified = cmdRepo ? verifiedOf[cmdRepo] || []
+      : servedLocal ? L.suggested || []
+      : (entry && entry.known_drafters) || [];
+    const ownVerified = custom && verified.some((k) => k.repo === own);
+    const madeFor = verified.filter((k) => k.exact), inferred = verified.filter((k) => !k.exact);
+    const ownInferred = custom && inferred.some((k) => k.repo === own), ownMade = custom && madeFor.some((k) => k.repo === own);
+    // A verified drafter (made for the model, or for its base model) as a choice: its kind, its speed here, its page.
+    const drafterRow = (k, radio) => {
+      const sel = custom && own === k.repo;
+      return html`<div class=${"sdrow pick" + (sel ? " sel" : "")} data-verified=${k.repo}
+                       onClick=${(e) => { e.stopPropagation(); if (!specOff) setF(Object.assign({}, f, { draftSource: "custom", savedDraft: null,
+                                          drafter: k.repo, drafterKind: k.kind, draftPicked: true })); }}>
+        <input type="radio" name=${radio} aria-label=${k.repo} checked=${sel} disabled=${specOff}/>
+        <div class="grow">
+          <div class="dhead"><b>${drafterLabel(k.kind)}</b><span class="tag2 ok">${t("verified")}</span>
+            <span class="tag2" title=${t("Your own runs with it on this machine, on average (N/A: none yet).")}>${t("speed")}: ${k.tok_s ? Math.round(k.tok_s) + " tok/s" : "N/A"}</span></div>
+          <a class="ddesc" href=${safeOrigin(hubEndpoint) + "/" + k.repo} target="_blank" rel="noopener noreferrer"
+             onClick=${(e) => e.stopPropagation()}>${k.repo}</a>
+        </div>
+      </div>`;
+    };
     const activeDrafters = model.loaded && !busy ? draftersOf(L).slice() : [];
     if (model.loaded && !busy && activeDraft && /mtp/.test(activeDraft) && !activeDrafters.some((d) => d.kind === "mtp"))
       activeDrafters.unshift({ kind: "mtp", from: "model file" });
@@ -772,8 +817,23 @@ export function ModelPage({ active, libraryAsked, currentAsked }) {
                 ${dflt.lines.map((l) => html`<em class="sd-what">${l}</em>`)}
               </div>
             </div>
-            <div class=${"sdrow pick" + (custom ? " sel" : "")} id="sd-custom" onClick=${() => pickDraft("custom")}>
-              <input type="radio" name="sd-src" aria-label=${t("Custom drafter")} checked=${custom} disabled=${specOff}/>
+            ${[[madeFor, "sd-made", ownMade, madeOpen, setMadeOpen, t("Drafters made for this model"), [],
+                [...new Set(madeFor.map((k) => k.base))].join(", ")],
+               [inferred, "sd-base", ownInferred, baseOpen, setBaseOpen, t("Inferred from the base model the model names"),
+                [...new Set(inferred.map((k) => k.relation).filter(Boolean))], [...new Set(inferred.map((k) => k.base))].join(", ")]]
+              .map(([list, id, picked, open, setOpen, title, tags, hint]) => list.length ? html`
+              <div class=${"sdrow pick" + (picked ? " sel" : "")} id=${id} onClick=${() => setOpen(!open)}>
+                <input type="radio" name="sd-src" aria-label=${title} checked=${picked} disabled=${specOff}/>
+                <div class="grow">
+                  <div class="dhead"><b>${title}</b>${tags.map((r) => html`<span class="tag2">${t(r)}</span>`)}
+                    ${picked ? html`<span class="tag2 ok">${drafterLabel(f.drafterKind)}</span>` : ""}
+                    <span class=${"sd-chev" + (open ? " open" : "")}><${Icon} name="chev"/></span></div>
+                  <em class="sd-what">${hint}</em>
+                  ${open ? html`<div class="sd-base-list">${list.map((k) => drafterRow(k, id + "-list"))}</div>` : ""}
+                </div>
+              </div>` : "")}
+            <div class=${"sdrow pick" + (custom && !ownVerified ? " sel" : "")} id="sd-custom" onClick=${() => pickDraft("custom")}>
+              <input type="radio" name="sd-src" aria-label=${t("Custom drafter")} checked=${custom && !ownVerified} disabled=${specOff}/>
               <div class="grow">
                 <div class="dhead"><b>${t("Custom drafter")}</b>
                   ${custom && own ? html`<span class=${"tag2 " + (ownCached ? "ok" : "")}>${t(ownCached ? "downloaded" : isHub(own) ? "Hugging Face" : "file")}</span>` : ""}
@@ -809,7 +869,8 @@ export function ModelPage({ active, libraryAsked, currentAsked }) {
               <${Field} k="lookup" label="Drafts from repeated text" was=${was("lookup")} hint="Where the reply repeats earlier text, that text is proposed too.">
                 <label class="switch"><input type="checkbox" id="sd-lookup" checked=${f.lookup} onChange=${set("lookup")} disabled=${specOff}/><i></i>${t(f.lookup ? "on" : "off")}</label><//>
               <${Field} k="trees" label="Draft trees" was=${was("trees")} hint="The drafter proposes several branches at once, not one line.">
-                <label class="switch"><input type="checkbox" id="sd-trees" checked=${f.trees} onChange=${set("trees")} disabled=${specOff}/><i></i>${t(f.trees ? "on" : "off")}</label><//>
+                <select id="sd-trees" value=${f.trees} onChange=${set("trees")} disabled=${specOff}>
+                  <option value="">${t("default")}</option><option value="on">${t("on")}</option><option value="off">${t("off")}</option></select><//>
             </div>
           </details>
         </div>
@@ -1133,10 +1194,13 @@ export function ModelPage({ active, libraryAsked, currentAsked }) {
           ${companionsView("hf-companions", comps, hubDraft, setHubDraft, hubMmproj, setHubMmproj)}` : ""}
         ${j && j.drafter ? html`<div class="banner hint" id="hf-drafter-only"><div class="grow2">${t(repoSel + " is a drafter (" + gb(j.drafter.size) + " GB), not a model: it drafts for one, and is not loaded on its own.")}</div></div>` : ""}
         ${j && !j.drafter && !j.drafter_repo && !rows.length ? html`<p class="lead">${t("No GGUF files in " + repoSel + ".")}</p>` : ""}
-        ${j && (j.known_drafters || []).length ? html`
-          <div class="banner hint" id="hf-drafters"><div class="grow2">${t("A DFlash2 drafter is published for this model.")} ${t("It often adds speed on top of MTP:")}
-            ${" "}<code>${j.known_drafters[0]}</code></div>
-            ${model.id ? html`<button class="btn sm" onClick=${() => draftWith(j.known_drafters[0], "dflash2")}>${t("Add to settings")}</button>` : ""}</div>` : ""}
+        ${j ? (j.known_drafters || []).map((k, i) => html`
+          <div class="banner hint" id=${i ? null : "hf-drafters"}><div class="grow2">${t(k.exact ? "A drafter made for this model is published:" : "A drafter for its base model is published:")}
+            ${" "}<a href=${safeOrigin((j && j.endpoint) || hubEndpoint) + "/" + k.repo} target="_blank" rel="noopener noreferrer"><code>${k.repo}</code></a>
+            <span class="tag2 ok">${drafterLabel(k.kind)}</span> <span class="tag2 ok">${t("verified")}</span>
+            ${k.exact ? "" : html`<span class="tag2">${k.base}${k.relation ? " · " + t(k.relation) : ""}</span>`}
+            <span class="tag2" title=${t("Your own runs with it on this machine, on average (N/A: none yet).")}>${t("speed")}: ${k.tok_s ? Math.round(k.tok_s) + " tok/s" : "N/A"}</span></div>
+            ${model.id ? html`<button class="btn sm" onClick=${() => draftWith(k.repo, k.kind)}>${t("Add to settings")}</button>` : ""}</div>`) : ""}
       </div>
       ${loadBox(rows, note, compAction, compOverrides)}`;
   }
@@ -1366,6 +1430,17 @@ export function ModelPage({ active, libraryAsked, currentAsked }) {
                   : atCache ? local.filter((m) => m.source === "hub" && m.kind !== "drafter" && m.kind !== "mmproj").map((m) => m.name)
                   : dir ? dir.models.filter((m) => m.kind !== "mmproj" && m.kind !== "drafter").map((m) => m.name) : [];
   const cmdModel = shownRows.includes(target) ? target : loadedWant ? loadedWant.model : L.remembered ? L.remembered.model : "";
+  // The drafters verified for the model the settings are for, when it is a Hub repository's: offered beside the default.
+  const cmdRepo = cmdModel && isHub(cmdModel) ? repoNameOf(cmdModel) : "";
+  useEffect(() => {
+    if (!cmdRepo || verifiedOf[cmdRepo]) return;
+    if (hub && hub.repo === cmdRepo) { setVerifiedOf((v) => Object.assign({}, v, { [cmdRepo]: hub.j.known_drafters || [] })); return; }
+    let live = true;
+    ask("/v1/hub/files?repo=" + encodeURIComponent(cmdRepo), "list a repository").then((a) => {
+      if (live && !a.error) setVerifiedOf((v) => Object.assign({}, v, { [cmdRepo]: a.j.known_drafters || [] }));
+    });
+    return () => { live = false; };
+  }, [cmdRepo, hub]);
   const again = L.remembered ? { model: L.remembered.model, load: () => loadModel(L.remembered.model, L.remembered) } : null;
   const retryWant = L.target
     ? (lastAttempt.current && lastAttempt.current.model === L.target ? lastAttempt.current

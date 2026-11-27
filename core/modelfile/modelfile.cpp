@@ -109,4 +109,17 @@ std::vector<int32_t> ModelFile::eos_ids() const {
   return out;
 }
 
+ModelOrigin model_origin(const std::string& path) {
+  ModelOrigin out;
+  if (const GgufPeek p = gguf_peek(path); p.valid) return out.base_models = p.base_models, out;
+  nlohmann::json h;
+  if (!modelfile::peek_flyx_header(path, &h) || !h.contains("source") || !h["source"].is_object()) return out;
+  const nlohmann::json& src = h["source"];
+  if (src.contains("repo") && src["repo"].is_string()) out.repo = src["repo"].get<std::string>();
+  if (src.contains("base_models") && src["base_models"].is_array())
+    for (const auto& r : src["base_models"])
+      if (r.is_string()) out.base_models.push_back(r.get<std::string>());
+  return out;
+}
+
 }  // namespace flyx
