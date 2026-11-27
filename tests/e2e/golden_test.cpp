@@ -3475,9 +3475,26 @@ int64_t device_held(Engine* e) {
   return mi.process ? int64_t(mi.process) : int64_t(mi.total) - int64_t(mi.free);
 }
 
+// Every lookup round of e on s once (launch and read, greedy), after a round of plan 0, its drafts that round's last
+// token.
+bool looked_up(Engine* e, Session& s) {
+  flyx_gen_params g{};
+  g.top_p = 1.f;
+  flyx_round_result r{};
+  if (e->api()->launch(e->round_plan(0), s.seq(), &g) != 0 || e->api()->read(s.seq(), &r) != 0) return false;
+  for (size_t k = 0; k < e->lookup_widths().size(); ++k) {
+    const std::vector<int32_t> drafts(size_t(e->lookup_widths()[k]), r.n_tokens > 0 ? r.tokens[r.n_tokens - 1] : 0);
+    g.drafts = drafts.data();
+    g.n_drafts = int32_t(drafts.size());
+    g.drafts_at = r.position;
+    if (e->api()->launch(e->lookup_plan(k), s.seq(), &g) != 0 || e->api()->read(s.seq(), &r) != 0) return false;
+  }
+  return true;
+}
+
 // The sessions' round graphs inside what they lease.  Sessions kept alive, each having run every kind of round its
-// engine has (every round plan in turn, drafted trees among them where the K/V are read exactly, the rounds the engine
-// chooses on a text that repeats, lookup rounds among them; sampled, with a penalty, with relaxed acceptance: graphs
+// engine has (every round plan in turn, drafted trees among them where the K/V are read exactly, every lookup round,
+// the rounds the engine chooses on a text that repeats; sampled, with a penalty, with relaxed acceptance: graphs
 // of other heads, for which a session gives up the ones it ran least lately; rounds of two sessions batched, past the
 // hits that capture their graph, a DV file's warm-ups among them; a DV file's rounds hold its canvas pass as the body
 // of a conditional node, counted by the body's nodes), with the K/V on the GPU and MTP's window (mtp_window=32: its
@@ -3548,6 +3565,9 @@ void graph_memory(const std::string& model, const std::string& backend, const st
         if (!init_checked(s)) break;
         s.rounds().cycle(every);
         gen(s, prompt, int(2 * every.size()) + 8);  // every round plan twice
+        // and every lookup round (its drafts given), which the chooser takes by the clock on a text that repeats:
+        // the rooms count their graphs, so each is launched here, its graph captured on its first launch
+        check(looked_up(e.get(), s), std::string("graph memory, ") + c.what + ": every lookup round launched");
         s.rounds().cycle({});
         gen(s, twice, 32);
         gen(s, twice, 24, nullptr, sampled);
@@ -3600,7 +3620,10 @@ void graph_memory(const std::string& model, const std::string& backend, const st
       // the width chooser times its rounds, so the graphs a session ends with differ from run to run (ten runs on an
       // RTX 5070 Ti: 140,794 to 152,642 KiB counted, 102,400 to 112,640 taken, of 215,680 KiB of rooms).  Against the
       // rooms themselves "under twice what they took" was 1.91 to 2.11: it failed four runs of the ten.  Each half
-      // of it holds every run: the count against what was taken, the rooms against the count.
+      // of it holds every run: the count against what was taken, the rooms against the count.  That second half held
+      // only with every lookup round launched (looked_up): left to the chooser, a session ran some of them or none,
+      // and NVFP4's rooms were 1.68 to 2.13 times the count on an RTX PRO 6000 Workstation, 1.25 on the Server
+      // edition, where it ran them all.
       const std::string counts = " (" + std::to_string(on.room >> 10) + " KiB of rooms, " +
                                  std::to_string(on.held >> 10) + " counted, " + std::to_string(graphs >> 10) +
                                  " taken)";
