@@ -295,7 +295,7 @@ python bench/prompts/make_coding_prompt.py --flyx ./bin/flyx --model MODEL.gguf 
 | `tree_bench` | Speculative tree verification latency and acceptance: `tree_bench MODEL [--ctx-at P] [--widths 1,15,31,63] [--drafted T]` (every width timed from the same context; trees of up to 63 drafts where the backend lowers them). |
 | `flyx bench --prompts` | A prompt set (`{"question"}`, `{"messages"}` or `{"ids"}` a line), every prompt's tokens and rounds in the `--json` record: `flyx bench MODEL --prompts FILE.jsonl [--suffix S] [--limit N] --json OUT.json`; `tests/e2e/check_dv.py` scores and compares such records. |
 | `bench/ab/paired_records.sh`, `bench/ab/summarize_records.py`, `bench/ab/same_runs.py` | Two builds' `flyx bench --prompts` runs in turns (waiting for a quiet GPU), their medians, and whether two runs give the same answers and rounds. |
-| `bench/ab/sglang_bench.py` | A `flyx bench --prompts` record's prompts, token for token, through an SGLang server: its decode tok/s as flyx counts it, its tokens a round, and how many answers are the record's (section 6). |
+| `bench/ab/server_bench.py` | A `flyx bench --prompts` record's prompts, token for token, through an SGLang, vLLM or llama.cpp server: its decode tok/s as flyx counts it, its time to the first token, its tokens a round (SGLang's), and how many answers are the record's (sections 6 to 8). |
 | `bench/replay/dv_choice` | DV's per-round choice replayed on recorded rounds (`bench/replay/dv_traces/`), each constant set otherwise: `python -I bench/replay/dv_choice.py table BUILD/bin/dv_choice`. |
 | `bench/trace/dv_round_kernels.py` | Where a DV round's time goes, from an `nsys` trace of DV's rounds with graphs off. |
 | `bench/trace/` | CUPTI kernel timeline analysis (`gaps.py`, `layer_times.py`, `per_matrix.py`, `prefill_kinds.py`). |
@@ -468,7 +468,7 @@ python -m sglang.launch_server --model-path Qwen3-8B --speculative-algorithm DSP
   --attention-backend flashinfer --speculative-draft-attention-backend triton --page-size 1 \
   --mem-fraction-static 0.65 --context-length 8192 --max-running-requests 8 --cuda-graph-bs-decode 1 2 4 8 \
   --trust-remote-code
-python -I bench/ab/sglang_bench.py plain_gsm8k.json --json sglang_gsm8k.json
+python -I bench/ab/server_bench.py plain_gsm8k.json --api sglang --json sglang_gsm8k.json
 ```
 
 Its column was measured at #6 on another RTX PRO 6000 Blackwell Server Edition (driver `620.70.06`). flyx on that host,
@@ -504,8 +504,8 @@ session; the six sets of section 6 (the same md5s; 174 prompts).
 - **SGLang**: the EAGLE-4 release's SGLang (`0.5.23.dev252+eagle`, its `EAGLE_HARNESS` worker) on the same GPU and
   checkpoints, `--speculative-num-steps 12 --speculative-eagle-topk 4 --speculative-num-draft-tokens 16` (its
   configuration for this drafter), `--disable-overlap-schedule --mem-fraction-static 0.92 --context-length 16384`, fed
-  flyx's own prompt token ids one request at a time (`bench/ab/sglang_bench.py`, which counts decode speed as flyx
-  bench does).
+  flyx's own prompt token ids one request at a time (`bench/ab/server_bench.py --api sglang`, which counts decode
+  speed as flyx bench does).
 
 ```sh
 PYTHONPATH=python/convert python -m flyx_convert --model Qwen3.8-27B --draft Qwen3.8-27B-EAGLE4 -o q38-e4.flyx
@@ -515,7 +515,7 @@ flyx bench q38-e4.flyx --prompts S -n 256 --json R.json --drafter eagle4        
 flyx bench q38-e4.flyx --prompts S -n 256 --json R.json --drafter eagle4 --no-draft-trees
 sglang serve --model-path Qwen3.8-27B --speculative-algorithm EAGLE_HARNESS --speculative-draft-model-path \
   Qwen3.8-27B-EAGLE4 --speculative-num-steps 12 --speculative-eagle-topk 4 --speculative-num-draft-tokens 16 ...
-python -I bench/ab/sglang_bench.py PLAIN.json --json SGL.json [--same-as SGL_PLAIN.json]
+python -I bench/ab/server_bench.py PLAIN.json --api sglang --json SGL.json [--same-as SGL_PLAIN.json]
 ```
 
 Decode `tok/s` (tokens a round). Every flyx answer is its plain decoding's, token for token, in every configuration
@@ -540,3 +540,84 @@ first), chosen every round with its chains of 1 to 15 and lookup rounds by cost 
 nothing to learn the chain's acceptance from. flyx's plain decoding is SGLang's +6% from the bf16 skinny GEMMs' interleaved
 spans (`kernels/gemm_decode.cu`): a block's warps read neighbouring 32-value spans of its rows instead of 16 streams a
 chunk apart, 24.6 -> 30.6 tok/s on this GPU (the 27B's decode GEMMs 1.1-1.35 -> 1.4-1.6 TB/s of 1.65 its copies reach).
+
+## 8. gpt-oss-20b against llama.cpp, vLLM and SGLang (RTX PRO 6000)
+
+One RTX PRO 6000 Blackwell Server Edition (96 GB, driver `595.112.07`; flyx at this section's commit, `cmake --preset
+dev -DFLYX_CUDA_ARCHS=120-real` with CUDA 13.0's `nvcc`), greedy, up to 1024 new tokens a prompt, each prompt alone
+and in a fresh session, section 6's prompt sets (the same files and md5), the chat template as flyx renders it
+(harmony, its default reasoning), every engine fed the same token ids:
+
+- **flyx** and **llama.cpp** (`7b74cb9`; `llama-server -ngl 999 -c 8192 -np 1 -fa on`, no prompt cache):
+  `ggml-org/gpt-oss-20b-GGUF` at `41e8a94d`, `gpt-oss-20b-MXFP4.gguf` (sha256 `27cd6c43...6ae35901`: MXFP4 experts,
+  Q8_0 attention, embedding and head).
+- **vLLM** 0.34.0 (FlashInfer attention, its Marlin MXFP4 MoE) and **SGLang** 0.5.23: `openai/gpt-oss-20b` at
+  `6cee5e81` (the same MXFP4 experts, bf16 elsewhere), each with its prefix cache (the defaults) and without
+  (`--no-enable-prefix-caching`, `--disable-radix-cache`): the harmony system message every prompt starts with is
+  about half of a prompt's tokens.
+
+Decode, tok/s (flyx bench's `decode_tok_s`: the tokens after the first over the time from the first to the last;
+the others through `bench/ab/server_bench.py`, streamed; with prompt lookup, tokens a round in brackets; every lookup
+answer is plain decoding's, token for token; the other engines' answers are their own, 0 or 1 of a set flyx's):
+
+| set | flyx plain | flyx lookup | llama.cpp | vLLM | SGLang |
+|---|---|---|---|---|---|
+| GSM8K | 374.6 | **394.2 (1.08)** | 321.3 | 259.4 | 248.5 |
+| MATH-500 | 380.3 | **385.6 (1.06)** | 319.8 | 260.7 | 248.8 |
+| HumanEval | 380.4 | **393.2 (1.06)** | 319.9 | 260.8 | 248.8 |
+| MBPP | 380.2 | **389.2 (1.06)** | 320.9 | 260.8 | 249.1 |
+| MT-Bench | 380.4 | **444.7 (1.24)** | 318.6 | 260.5 | 248.9 |
+| chat | 380.5 | **409.0 (1.11)** | 303.3 | 260.8 | 249.1 |
+
+Prefill, ms a prompt: flyx's `prefill_ms` (in the process: the pass and the first token, no HTTP); the others' time
+to the first streamed token over HTTP on the same machine, which also holds their request handling (a millisecond
+or two):
+
+| set (prompts, tokens a prompt) | flyx plain | llama.cpp | vLLM | vLLM, no prefix cache | SGLang | SGLang, no radix cache |
+|---|---|---|---|---|---|---|
+| GSM8K (30, 138) | **17.9** | 43.4 | 20.9 | 21.8 | 24.9 | 18.5 |
+| MATH-500 (30, 165) | 19.5 | 57.8 | 23.2 | 25.9 | 24.4 | **18.0** |
+| HumanEval (30, 178) | 19.6 | 43.3 | 23.8 | 24.5 | **18.2** | 18.5 |
+| MBPP (30, 150) | 18.1 | 39.4 | 21.4 | 22.9 | **18.0** | 18.3 |
+| MT-Bench (30, 121) | **16.2** | 38.1 | 19.5 | 21.0 | 16.8 | 16.8 |
+| chat (24, 82) | **13.8** | 38.3 | 20.2 | 19.8 | 16.0 | 16.8 |
+
+flyx decodes 17-25% faster than llama.cpp, 44-46% faster than vLLM and 51-53% faster than SGLang (plain decoding;
+prompt lookup adds 1-17%). Its prefill is the fastest on GSM8K, MT-Bench and chat, even with SGLang's on MBPP, and
+7-8% behind SGLang's on MATH-500 and HumanEval, the longest prompts, although SGLang's time holds its HTTP round trip
+and flyx's does not: there flyx's MoE tiles of 16 rows pad an expert's 20-odd rows to 32 (a follow-up).
+
+What made the difference, measured with `CUDA_INJECTION64_PATH=.../libflyx-trace.so FLYX_TRACE=t.tsv flyx bench ...`
+(a round: `python -I bench/trace/gaps.py t.tsv`; 341.5 -> 374.6 tok/s on GSM8K, a round 2914 -> 2700 us against a
+1625 us read of its 2.6 GB; a 145-token prompt's pass 28.8 -> 18.2 ms):
+
+- **The experts' activation and biases in the GEMMs** (`MoeAct`): the clamped SwiGLU and each expert's gate and up
+  biases in the gate and up GEMM's epilogue (the same bits as `moe_act_rows` after it), its rows staged in 8 bits by
+  the norm before it; the down biases in the weighted sum: 4 launches a layer fewer, 2914 -> 2801 us a round.
+- **The router**: `linear_f32` with 8 warps an output where a matrix has 128 outputs or fewer (5.2 -> 2.0 us a
+  round's layer), and in prefill passes too for matrices of 64 or fewer (48 + 50 -> 15 + 8 us a layer at 145 rows,
+  the routing after it no longer waiting on a GEMM of 3 blocks).
+- **MXFP4 among the dp4a types**, `cuda_bench tune moe_gate_up` on the file (`rtxpro6000.toml`): one pair a warp, one
+  unit in flight, at 1-4 rows (one-row passes of the file's 24 gate and up GEMMs 681 against 716 us).
+- **The MMA expert kernel 64 columns a block for MXFP4** (`kMoeMmaCT`): a tile's rows staged once for 64 columns
+  instead of 16, 437 -> 291 us an expert GEMM at 145 rows (the other types keep 16: their units spill at the 64
+  registers 1024 threads leave).
+- **Q8_0 passes of 129-512 rows in tiles of 64 rows** (`rtxpro6000.toml`): q|k|v and out 63 -> 45 and 69 -> 40 us.
+- **Sliding-window prefill on tensor cores** (`k_flash_prefill` with the window and its ring): the even layers'
+  attention 58 -> 10 us at 145 rows.
+
+```sh
+# flyx (S: each set of section 6's sets/)
+flyx bench gpt-oss-20b-MXFP4.gguf --prompts S -n 1024 --no-spec --json flyx_S.json
+flyx bench gpt-oss-20b-MXFP4.gguf --prompts S -n 1024 --json flyx_lookup_S.json
+# the others, each server up alone on the GPU, the flyx record's prompts token for token
+llama-server -m gpt-oss-20b-MXFP4.gguf -ngl 999 -c 8192 -np 1 -fa on --port 8080
+python -I bench/ab/server_bench.py flyx_S.json --api llamacpp --json llamacpp_S.json
+vllm serve gpt-oss-20b --served-model-name gpt-oss-20b --max-model-len 8192 --gpu-memory-utilization 0.85 \
+  [--no-enable-prefix-caching]
+python -I bench/ab/server_bench.py flyx_S.json --api vllm --model gpt-oss-20b --json vllm_S.json
+python -m sglang.launch_server --model-path gpt-oss-20b --context-length 8192 --mem-fraction-static 0.8 \
+  [--disable-radix-cache]
+python -I bench/ab/server_bench.py flyx_S.json --api sglang --json sglang_S.json
+```
+

@@ -99,13 +99,15 @@ __global__ void __launch_bounds__(128) k_flash_prefill(const float* __restrict__
   const int last_row = min(rows, r0 + 64) - 1;
   const int kend = base + last_row + 1;       // keys this block needs: [0, kend)
   const int kwin = min(kend, win.k_hi);       // of them, the window's: [win.k_lo, kwin)
+  // a sliding window: the block's first row's first key on (later rows start later)
+  const int kfirst = win.sliding ? max(win.k_lo, base + r0 + 1 - win.sliding) : win.k_lo;
   const float sl2 = scale * 1.4426950408889634f;
   float o[NT][4];
 #pragma unroll
   for (int n = 0; n < NT; ++n) o[n][0] = o[n][1] = o[n][2] = o[n][3] = 0.f;
   float m[2] = {-INFINITY, -INFINITY}, l[2] = {0.f, 0.f};
   if (!win.first) flash_state<NT>(false, win.state, nh, h, wrow0, rows, g, t, o, m, l);
-  for (int k0 = win.k_lo; k0 < kwin; k0 += KT) {
+  for (int k0 = kfirst; k0 < kwin; k0 += KT) {
     __syncthreads();  // the previous tiles are no longer read (and Q is written, first time)
     if constexpr (FP8) {  // e4m3 * row scale -> binary16 tiles
       for (int i = tid; i < KT * HD / 8; i += 128) {
@@ -135,7 +137,8 @@ __global__ void __launch_bounds__(128) k_flash_prefill(const float* __restrict__
       for (int i = tid; i < KT * HD / 8; i += 128) {
         const int r = i / (HD / 8), c = 8 * (i % (HD / 8)), pos = k0 + r;
         const bool ok = pos < kwin;
-        const size_t at = (size_t(ok ? pos : win.k_lo) * nkv + kvh) * HD + c;
+        const int slot = ok ? (win.ring ? pos % win.ring : pos) : kfirst;
+        const size_t at = (size_t(slot) * nkv + kvh) * HD + c;
         cp_async16(&Ks[r][c], Kc + at, ok);
         cp_async16(&Vs[r][c], Vc + at, ok);
       }
@@ -144,6 +147,7 @@ __global__ void __launch_bounds__(128) k_flash_prefill(const float* __restrict__
     }
     __syncthreads();
     if (wrow0 >= rows || base + wrow0 + 15 < k0) continue;  // all of this warp's rows precede the tile
+    if (win.sliding && k0 + KT <= base + wrow0 + 1 - win.sliding) continue;  // or are all past it
     float s[ST][4];
 #pragma unroll
     for (int j = 0; j < ST; ++j) s[j][0] = s[j][1] = s[j][2] = s[j][3] = 0.f;
@@ -169,7 +173,7 @@ __global__ void __launch_bounds__(128) k_flash_prefill(const float* __restrict__
         for (int e = 0; e < 2; ++e) {
           const int key = k0 + j * 8 + 2 * t + e;
           float& v = s[j][2 * half + e];
-          v = (row < rows && key <= qpos) ? v * sl2 : -INFINITY;
+          v = (row < rows && key <= qpos && (!win.sliding || key > qpos - win.sliding)) ? v * sl2 : -INFINITY;
           mx = fmaxf(mx, v);
         }
       mx = fmaxf(mx, __shfl_xor_sync(0xffffffffu, mx, 1));
@@ -216,6 +220,8 @@ __global__ void __launch_bounds__(128) k_flash_prefill(const float* __restrict__
     sum += __shfl_xor_sync(0xffffffffu, sum, 2);
     const int row = wrow0 + g + 8 * half;
     if (row >= rows) continue;
+    // a sink joins the denominator, in the scores' log2 units (exp2 of its excess over the row's maximum)
+    if (win.sinks) sum += exp2f(fminf(win.sinks[h] * 1.4426950408889634f - m[half], 126.f));
     const float inv = sum > 0.f ? 1.f / sum : 0.f;
 #pragma unroll
     for (int n = 0; n < NT; ++n)
@@ -590,6 +596,7 @@ __global__ void __launch_bounds__(32 * HB) k_flash_gqa(const float* __restrict__
     sum += __shfl_xor_sync(0xffffffffu, sum, 2);
     const int row = wrow0 + g + 8 * half;
     if (row >= rows) continue;
+    if (win.sinks) sum += exp2f(fminf(win.sinks[h] * 1.4426950408889634f - m[half], 126.f));  // as k_flash_prefill
     const int ve = ve_get(ve_pack, half);
     const float vback = FP8 && ve != kGqaVeUnset ? pow2_f32(ve - kGqaPTop) : 1.f;
     const float inv = (sum > 0.f ? 1.f / sum : 0.f) * vback;
@@ -625,6 +632,11 @@ void launch_flash(const float* q, KvRef kv, int nh, int nkv, int rows, float sca
   static const bool attr = set_dynamic_smem(k_flash_prefill<HD, FP8>, flash_smem<HD>());
   (void)attr;
   if constexpr (HD == 256 || HD == 128) {
+    if (win.sliding) {  // the grouped kernels take no sliding window
+      k_flash_prefill<HD, FP8><<<dim3(nh, ceil_div(rows, 64)), 128, flash_smem<HD>(), st>>>(
+          q, kv, nh, nkv, rows, scale, P, pos_add, gate, ld_gate, out, ld_out, win);
+      return;
+    }
     // The query heads of a KV head together: Qwen3.5's 16 over 4 and Qwen3's 32 over 8 (G 4), Qwen3's 64 over 8
     // (G 8: two blocks of 4), the 27B's 24 over 4 (G 6: two blocks of 3, two blocks an SM; 21K tokens of its shape
     // took 49.3 ms a layer against 51.9 with one block of 6 and 54.8 with a block a head: cuda_bench flash 24 4).
@@ -703,6 +715,7 @@ bool attention_flash_gqa_cfg(int hb, const float* q, KvRef kv, int nh, int nkv, 
 bool attention_flash(const float* q, KvRef kv, int nh, int nkv, int hd, int rows, float scale, const DevParams* P,
                      const float* gate, int ld_gate, float* out_f, int ld_out, const Launch& L, int pos_add,
                      const FlashWindow& win) {
+  if (kv.fp8() && win.sliding) return false;  // a sliding window's caches are binary16
   if (kv.fp8()) {
     const int sku = opts(L).tuning, keys = win.k_hi - win.k_lo;
     if (win.state) {

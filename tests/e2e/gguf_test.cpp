@@ -55,6 +55,7 @@ struct Load {
   std::string activations{};  // EngineOptions::activations ("": as the file has it)
   std::string lora_file{};  // EngineOptions::lora_file
   int kv = FLYX_KV_16;  // the golden tokens and drafts are binary16 K/V's
+  bool lookup = false;  // prompt lookup's rounds (speculative, drafter "none")
 };
 
 // The engine; a load that fails throws, or with `failed` says why there.
@@ -66,7 +67,7 @@ std::unique_ptr<Engine> engine(const std::string& path, const std::string& backe
   if (!how.options.empty()) options.backend_options += (options.backend_options.empty() ? "" : ",") + how.options;
   options.max_ctx = how.max_ctx;
   options.prefill_chunk = how.prefill_chunk;
-  options.lookup = false;
+  options.lookup = how.lookup;
   options.width = !how.speculative ? 0 : how.drafter == "mtp" ? 3 : 15;  // the reference's rounds
   options.speculative = how.speculative;
   options.drafter = how.speculative ? how.drafter : "none";
@@ -281,6 +282,58 @@ void packed(const std::string& dir, const std::string& backend) {
     for (int i = 0; i < 70; ++i) longer.push_back(want[size_t(i) % want.size()]);
     check(tokens_of(*nplain_long, longer, 24) == tokens_of(*nref_long, longer, 24),
           "GGML NVFP4 Qwen3.5: a long prompt, prefill in passes of up to 64 rows");
+  }
+}
+
+// gpt-oss (tests/core/modelfile/tiny_gpt_oss.py): the tiny model as llama.cpp lays it out, with its experts in MXFP4
+// and its attention in Q8_0, and the same in float32.  With exact inputs (every linear's input rounded as its format
+// does, binary16 pairs for GGML blocks) both give transformers' tokens on every golden case (cases far from a tie in
+// the next token and in every router's k-th expert): its biases, sinks, sliding windows (8 positions, a ring past
+// them), YaRN rotary, routing and clamped expert activation, through prefill passes of up to 16 and 64 rows.  The file
+// as the real model ships it, with the default 8-bit inputs (a coarser rounding than the golden cases' margins
+// absorb): prompt lookup's rounds give plain decoding's tokens, greedy and seeded, and on CUDA the unfused kernels
+// the fused ones' and, teacher forced, the float64 backend's next token at all but at most four of 24 places.
+void gpt_oss(const std::string& dir, const std::string& backend) {
+  for (const std::string stem : {"gpt_oss", "gpt_oss_f32"}) {
+    std::ifstream f(dir + "/golden_" + stem + ".json");
+    const json golden = json::parse(f);
+    const std::string path = dir + "/tiny_" + stem + ".gguf";
+    auto exact = engine(path, backend, {.activations = "exact"});
+    auto exact_long = engine(path, backend, {.prefill_chunk = 64, .activations = "exact"});
+    for (const auto& item : golden.at("cases")) {
+      const auto p = item.at("prompt").get<std::vector<int32_t>>();
+      const auto want = item.at("tokens").get<std::vector<int32_t>>();
+      check(same_tokens(tokens_of(*exact, p, int(want.size())), want), "tiny " + stem + ": transformers' tokens");
+      check(same_tokens(tokens_of(*exact_long, p, int(want.size())), want),
+            "tiny " + stem + ": transformers' tokens, prefill in passes of up to 64 rows");
+    }
+  }
+  const std::string path = dir + "/tiny_gpt_oss.gguf";
+  std::ifstream f(dir + "/golden_gpt_oss.json");
+  const json golden = json::parse(f);
+  auto plain = engine(path, backend), lookup = engine(path, backend, {.speculative = true, .drafter = "none",
+                                                                      .lookup = true});
+  std::unique_ptr<Engine> unfused, ref;
+  if (backend != "cpu_ref") {
+    unfused = engine(path, backend, {.options = "fusion=0"});
+    ref = engine(path, "cpu_ref");
+  }
+  for (const auto& item : golden.at("cases")) {
+    auto p = item.at("prompt").get<std::vector<int32_t>>();
+    const size_t n = p.size();
+    for (size_t i = 0; i < 2 * n; ++i) p.push_back(p[i % n]);  // the prompt three times over: lookup drafts
+    const auto want = tokens_of(*plain, p, 24);
+    check(tokens_of(*lookup, p, 24) == want, "tiny gpt_oss: prompt lookup's rounds give plain decoding's tokens");
+    check(tokens_of(*lookup, p, 24, true) == tokens_of(*plain, p, 24, true),
+          "tiny gpt_oss: prompt lookup preserves seeded sampling");
+    if (unfused) {
+      check(tokens_of(*unfused, p, 24) == want, "tiny gpt_oss: fusion=0 gives the fused kernels' tokens");
+      const auto ref_tokens = tokens_of(*ref, p, 24);
+      const int agree = forced_agreement(*plain, p, ref_tokens);
+      // these prompts are not the golden cases' (no margin kept): where the reference's two best nearly tie
+      check(agree >= 20, "tiny gpt_oss: teacher forced, the float64 backend's tokens at " + std::to_string(agree) +
+                             " of 24 places (8-bit inputs)");
+    }
   }
 }
 
@@ -751,7 +804,8 @@ void dspine_file(const std::string& dir, const std::string& backend) {
                        {.speculative = true, .drafter = "dspine", .drafter_files = {dir + "/" + file},
                         .options = "draft_weights=exact"});
     for (const auto& item : golden.at("cases")) {
-      const auto p = item.at("prompt").get<std::vector<int32_t>>(), want = item.at("tokens").get<std::vector<int32_t>>();
+      const auto p = item.at("prompt").get<std::vector<int32_t>>();
+      const auto want = item.at("tokens").get<std::vector<int32_t>>();
       std::vector<int32_t> got;
       const auto trace = traced(*spec, p, 48, &got);
       int same = 0, total = 0;
@@ -805,7 +859,8 @@ void dflash_file(const std::string& dir, const std::string& backend) {
                          {.speculative = true, .drafter = "dflash2", .drafter_files = {source}});
     auto mtp = engine(dir + "/tiny_gguf.gguf", backend, {.speculative = true, .drafter_files = {drafter}});
     for (const auto& item : golden.at("cases")) {
-      const auto p = item.at("prompt").get<std::vector<int32_t>>(), want = item.at("tokens").get<std::vector<int32_t>>();
+      const auto p = item.at("prompt").get<std::vector<int32_t>>();
+      const auto want = item.at("tokens").get<std::vector<int32_t>>();
       std::vector<int32_t> got;
       const auto trace = traced(*dflash, p, 48, &got);
       int same = 0, total = 0;
@@ -1097,6 +1152,7 @@ int main(int argc, char** argv) {
     split_mtp(dir, backend);
     dflash_file(dir, backend);
     dspine_file(dir, backend);
+    gpt_oss(dir, backend);
     if (backend != "cpu_ref") packed(dir, backend);
     if (backend != "cpu_ref") packed_lora(dir, backend);
     if (backend != "cpu_ref") nvfp4_inputs(dir, backend);

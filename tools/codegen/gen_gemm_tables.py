@@ -113,7 +113,7 @@ MOE_KEYS = ("columns", "units")
 MOE_ORIGINAL = (0, 0)  # the original tiles, which every block type compiles
 # The types every moe_dp4a configuration is compiled for, the others the original tiles alone (kernels.cuh:
 # kMoeDp4aTypes).
-MOE_DP4A_TYPES = frozenset({"IQ3_XXS", "IQ2_S", "IQ2_XXS", "IQ2_XS", "IQ4_NL", "Q4_K"})
+MOE_DP4A_TYPES = frozenset({"IQ3_XXS", "IQ2_S", "IQ2_XXS", "IQ2_XS", "IQ4_NL", "Q4_K", "MXFP4"})
 # bf16 GEMMs of 17..64 rows on k_gemm_skinny_mt (bf16_mt): a round's in three parts, a drafting pass's in one.
 MT_PARTS = {"bf16_rows": 3, "bf16_draft": 1}
 MT_ROWS = (17, 64)

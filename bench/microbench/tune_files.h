@@ -18,8 +18,9 @@ struct FileExperts {
   int dtype, n_experts, N, K, top_k;  // flyx_dtype, experts, an expert's rows (gate and up: 2 x intermediate), K, and
                                       // the experts a token takes
 };
-// The fused gate|up expert matrices of a GGUF file's MoE layers (blk.*.ffn_gate_up_exps.weight: experts x 2
-// intermediate x hidden, as models/inkling2 reads them), the experts a token takes from <arch>.expert_used_count.
+// The gate|up expert matrices of a GGUF file's MoE layers (blk.*.ffn_gate_up_exps.weight: experts x 2 intermediate x
+// hidden, as models/inkling2 reads them; or ffn_gate_exps and ffn_up_exps apart, gpt-oss's, as the pair the engine
+// stacks), the experts a token takes from <arch>.expert_used_count.
 // False and *err: the file could not be read, or it has such matrices and not that key.
 bool file_experts(const std::string& path, std::vector<FileExperts>* out, std::string* err);
 

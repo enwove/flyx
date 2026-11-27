@@ -6,6 +6,7 @@
 // context k|v, DV's adapters on one input), norms as float.  Knows block
 // kinds, not models.
 #include "backends/cuda/loader/loader.h"
+#include "ops/rope/ref.h"
 
 #include <algorithm>
 #include <cstring>
@@ -285,7 +286,22 @@ AttnBlock attention(WeightLoader& L, const flyx_attn_block& b, const StateMap& s
   a.mrope_section[1] = b.mrope_section[1];
   a.mrope_section[2] = b.mrope_section[2];
   a.mrope_interleaved = b.mrope_interleaved;
-  rope_register(a.theta, a.rot);  // attn_prep's rotary factors, once
+  a.scale = 1.f / std::sqrt(float(b.head_dim));
+  if (b.rope.kind == FLYX_ROPE_YARN) {  // its factors from the float64 reference's formula, q and k's mscale in scale
+    expect(b.rot_dim == b.head_dim && b.mrope_section[0] == 0 && b.mrope_section[1] == 0 && b.mrope_section[2] == 0,
+           "YaRN rotary on part of a head or with 3D sections");
+    std::vector<double> inv(size_t(b.rot_dim / 2));
+    flyx::ops::yarn_inv_freq(b.theta, b.rot_dim, b.rope.factor, b.rope.orig_ctx, b.rope.beta_fast, b.rope.beta_slow,
+                             b.rope.truncate != 0, inv.data());
+    double* tab = L.model()->alloc<double>(inv.size());
+    CK(cudaMemcpy(tab, inv.data(), inv.size() * sizeof(double), cudaMemcpyHostToDevice));
+    a.rope = tab;
+    const double ms = flyx::ops::yarn_mscale(b.rope.factor);
+    a.scale = float(ms * ms / std::sqrt(double(b.head_dim)));
+  } else {
+    expect(b.rope.kind == FLYX_ROPE_PLAIN, "unknown rotary scaling");
+    rope_register(a.theta, a.rot);  // attn_prep's rotary factors, once
+  }
   a.gate = b.gate != FLYX_GATE_NONE;
   a.norm = norm(L, b.norm);
   // The kernels read every head's q, then every head's gate: a file that keeps
@@ -306,6 +322,28 @@ AttnBlock attention(WeightLoader& L, const flyx_attn_block& b, const StateMap& s
   a.q_norm = head_norm(L, b.q_norm);
   a.k_norm = head_norm(L, b.k_norm);
   a.kv = state_of(sm.kv, b.kv, "K/V");
+  expect((b.q_b >= 0) == (b.k_b >= 0) && (b.k_b >= 0) == (b.v_b >= 0) && (b.q_b < 0 || !a.gate),
+         "an attention block's q, k and v biases: all three or none, never with an output gate");
+  if (b.q_b >= 0) {  // stacked as w_in's rows
+    std::vector<float> qkv;
+    for (int w : {b.q_b, b.k_b, b.v_b}) {
+      const std::vector<float> v = L.host_f32(w);
+      qkv.insert(qkv.end(), v.begin(), v.end());
+    }
+    expect(int(qkv.size()) == a.n_in(), "an attention block's q|k|v biases do not match its rows");
+    a.qkv_b = L.model()->alloc<float>(qkv.size());
+    CK(cudaMemcpy(a.qkv_b, qkv.data(), qkv.size() * sizeof(float), cudaMemcpyHostToDevice));
+  }
+  if (b.o_b >= 0) a.o_b = L.vec(b.o_b);
+  if (b.sinks >= 0) {
+    expect(L.t(b.sinks)->ndim == 1 && L.t(b.sinks)->shape[0] == b.n_heads, "an attention block's sinks are not [nh]");
+    a.sinks = L.vec(b.sinks);
+  }
+  expect(b.window >= 0 && b.window == L.model()->states.kv[size_t(a.kv)].window,
+         "an attention block's window is not its cache's");
+  a.window = b.window;
+  // a window's attention takes the per-head kernel, which reads binary16 caches
+  if (b.window > 0) L.model()->states.kv[size_t(a.kv)].fp8 = false;
   int in[4], out[4];
   attn_dims(b, in, out);
   expect(!a.gate || b.lora[FLYX_LIN_Q].rank <= 0 || b.lora_gate == FLYX_GATE_AFTER_Q ||
@@ -762,13 +800,39 @@ MoeBlock moe(WeightLoader& L, const flyx_moe_block& b, const StateMap& sm) {
   f.norm_weights = b.norm_weights != 0;
   f.route_scale = b.route_scale;
   f.norm_eps = b.norm_eps;
-  f.situ_beta = b.situ_beta;
-  f.situ_linear_beta = b.situ_linear_beta;
+  expect(b.act == FLYX_MOE_SWIGLU || (b.act == FLYX_MOE_SITU && b.situ_beta > 0.f) ||
+             (b.act == FLYX_MOE_SWIGLU_OAI && b.act_limit > 0.f),
+         "an MoE block's activation out of range");
+  const bool oai = b.act == FLYX_MOE_SWIGLU_OAI;
+  f.act = MoeAct{b.act, oai ? b.act_alpha : b.situ_beta, oai ? b.act_limit : b.situ_linear_beta, nullptr};
   f.norm = norm(L, b.norm);
   f.router = L.lin_f32(b.router);
   if (b.router_bias >= 0) f.router_bias = L.vec(b.router_bias);
-  f.gate_up = L.expert_mat(b.gate_up);
+  if (b.router_logit_b >= 0) f.router_logit_b = L.vec(b.router_logit_b);
+  expect((b.gate_up >= 0) != (b.gate >= 0) && (b.gate >= 0) == (b.up >= 0),
+         "an MoE block names its gate and up fused or apart, one way");
+  f.gate_up = b.gate_up >= 0 ? L.expert_mat(b.gate_up) : L.expert_mat(std::vector<int>{b.gate, b.up});
   f.down = L.expert_mat(b.down);
+  const size_t E = size_t(b.n_experts), I = size_t(b.inter), H = size_t(b.hidden);
+  if (b.gate_b >= 0 || b.up_b >= 0) {  // an expert's gate then up biases, as its fused rows
+    expect(b.gate_up < 0, "biases on an MoE block's fused gate|up");
+    std::vector<float> gu(E * 2 * I, 0.f);
+    for (auto [w, off] : {std::pair{b.gate_b, size_t(0)}, {b.up_b, I}}) {
+      if (w < 0) continue;
+      const std::vector<float> v = L.host_f32(w);
+      expect(v.size() == E * I, "an MoE block's gate or up biases are not [E, I]");
+      for (size_t e = 0; e < E; ++e) std::copy_n(v.data() + e * I, I, gu.data() + e * 2 * I + off);
+    }
+    float* bias = L.model()->alloc<float>(gu.size());
+    CK(cudaMemcpy(bias, gu.data(), gu.size() * sizeof(float), cudaMemcpyHostToDevice));
+    f.act.bias = bias;
+  }
+  if (b.down_b >= 0) {
+    expect(b.post_conv < 0, "down biases on an MoE block with a post-FFN ShortConv");
+    expect(L.t(b.down_b)->ndim == 2 && size_t(L.t(b.down_b)->shape[0]) == E && size_t(L.t(b.down_b)->shape[1]) == H,
+           "an MoE block's down biases are not [E, H]");
+    f.down_b = L.vec(b.down_b);
+  }
   if (b.post_conv >= 0) f.post_conv = L.vec(b.post_conv);
   if (b.res_query >= 0) f.res_query = L.vec(b.res_query);
   f.loop_rank = b.loop_rank;
@@ -1561,8 +1625,7 @@ int estimate_load(const flyx_model_desc* desc, const flyx_open_options* opts, ui
         for (int w : {b.mlp.gate, b.mlp.up, b.mlp.down}) mark_linear(w, q.mtp);
       }
     } else if (b.kind == FLYX_BLOCK_MOE) {
-      mark(is_expert, b.moe.gate_up);
-      mark(is_expert, b.moe.down);
+      for (int w : {b.moe.gate_up, b.moe.gate, b.moe.up, b.moe.down}) mark(is_expert, w);
     } else if (b.kind == FLYX_BLOCK_DSPARK) {
       // Its block's norms, vectors, Markov head and joint projection stay as stored (dspark(): not quantized).
       mark_norm(is_drafter, b.dspark.tok_norm), mark_norm(is_drafter, b.dspark.norm),

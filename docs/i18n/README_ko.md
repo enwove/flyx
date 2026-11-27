@@ -158,7 +158,7 @@ print(reply["content"])
 
 | 항목 | 지원 범위 | 참고 |
 |---|---|---|
-| 아키텍처 | Qwen3.5 / Qwen3.8 (`qwen35`), Qwen3 (`qwen3`), Inkling-2-Mini (`inkling2_loop`, 희소 MoE), Llama (MiniCPM5-1B) | Llama는 `.flyx`만 지원 |
+| 아키텍처 | Qwen3.5 / Qwen3.8 (`qwen35`), Qwen3 (`qwen3`), Inkling-2-Mini (`inkling2_loop`, 희소 MoE), gpt-oss-20b / 120b (`gpt-oss`, 희소 MoE, GGUF), Llama (MiniCPM5-1B) | Llama는 `.flyx`만 지원 |
 | 추측 드래프터 | MTP, DFlash2, DSpark, 프롬프트 룩업 | MTP와 DSpark는 자동으로 연결됩니다. DFlash2는 별도 파일입니다(`--drafter-file` 또는 대시보드의 **Draft with it**). DSpark는 Inkling-2-Mini 전용입니다 |
 | 비전 | `mmproj` 프로젝터를 통한 이미지 입력(모델의 Hub 저장소에서 자동으로 가져옴) | 현재 Qwen3.5 / Qwen3.8 지원. Inkling-2-Mini는 텍스트 전용 |
 | 모델 형식 | GGUF (`F32`, `F16`, `BF16`, `Q4_0–Q8_0`, `Q2_K–Q6_K`, `IQ1–IQ4`, `MXFP4`, `Q2_0`, GGML NVFP4); `.flyx` (BF16, NVFP4; 포맷 2는 타깃 모델의 LoRA 어댑터인 V-LoRA를 병합 없이 실행 가능하며, DV 드래프터는 `--drafter dv` 지정 시에만 사용, [설계](../design/dv.md)) | 분할 GGUF 파일은 모두 같은 폴더에 둡니다. |

@@ -46,9 +46,11 @@ void gemm_on_glu(const Lin& W, int N, int K, float* y, int ldy, int rows, bool a
 
 void gemm(const float* x, int ldx, const Lin& W, int N, int K, float* y, int ldy, int rows, bool accumulate,
           const Launch& L) {
-  // Control projections read exact weights and float32 inputs in rounds of any width and in short prefill passes.
-  // Larger prefill passes use the usual bf16 GEMM below.
-  if ((W.round.f32 || W.round.b16) && (rows <= 16 || L.round_rows)) {
+  // Control projections read exact weights and float32 inputs in rounds of any width, in short prefill passes, and
+  // at any length where they have 64 outputs or fewer (gpt-oss-20b's router of 32 experts: the tensor-core GEMM's
+  // tiles of 64 rows leave the GPU all but idle there: at 145 rows 48 -> 15 us a layer, and its routing after it
+  // 50 -> 8 us, RTX PRO 6000).  Larger prefill passes of the others use the usual bf16 GEMM below.
+  if ((W.round.f32 || W.round.b16) && (rows <= 16 || L.round_rows || N <= 64)) {
     log_shape(L.opt, "f32", N, K, rows);
     return linear_f32(x, ldx, W.round, N, K, y, ldy, rows, accumulate, L.st);
   }

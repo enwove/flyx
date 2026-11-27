@@ -30,18 +30,8 @@ namespace {
 constexpr int kMoeBlkKT = 1024;
 constexpr int kMoeDp4aWarps = 8;
 constexpr int kMoeMmaTileWarps = 4;
-constexpr int kMoeMmaCT = 2;
 constexpr int kMoeMmaSpanRow = 32 * 32 + 32;  // 1056 bytes: 8-row bank-conflict-free uint2 loads
 constexpr int kMoeMmaRowBufs = 2;
-
-__device__ __forceinline__ float moe_situ(float g, float u, float beta, float linear_beta) {
-  if (beta > 0.f) {
-    const float act = beta * tanhf(g / beta) * sigm(g);
-    const float lin = linear_beta > 0.f ? (linear_beta * tanhf(u / linear_beta)) : u;
-    return act * lin;
-  }
-  return silu(g) * u;
-}
 
 __device__ __forceinline__ float moe_a16h_scale(float m) {
   if (!(m > 0.f) || !isfinite(m)) return 1.f;
@@ -64,7 +54,7 @@ __device__ __forceinline__ void moe_dp4a_tile(
     const Tables& T, const Local& local, const int8_t* __restrict__ q8_a, const float* __restrict__ q8_d,
     const float* __restrict__ q8_s, const uint8_t* __restrict__ W, const uint16_t* __restrict__ D,
     const float* __restrict__ RS, int N_exp, int I_or_H, int K, int e, int nb, const int* s_pids, const int* s_rids,
-    float situ_beta, float situ_linear_beta, float* __restrict__ out, int ld_out, bf16* __restrict__ act_bf16) {
+    MoeAct mact, float* __restrict__ out, int ld_out, bf16* __restrict__ act_bf16) {
   static constexpr int GROUPS = F::kValues / 32, SUB = F::kSub;
   static constexpr bool MINS = F::kFlatRun != 0;
   static constexpr int NC = FUSE_ACT ? 2 * C : C;
@@ -187,7 +177,7 @@ __device__ __forceinline__ void moe_dp4a_tile(
       if constexpr (FUSE_ACT) {
         const float u = warp_tree_sum(acc[b][C + c]) * rs;
         if (lane == 0 && col0 + c < N_work) {
-          const float v = moe_situ(g, u, situ_beta, situ_linear_beta);
+          const float v = moe_act_val(mact, g, u, e, col0 + c, I_or_H);
           if (act_bf16) act_bf16[out_row + col0 + c] = __float2bfloat16_rn(v);
           else out[out_row + col0 + c] = v;
         }
@@ -204,8 +194,8 @@ __global__ void __launch_bounds__(32 * kMoeDp4aWarps)
                          const float* __restrict__ q8_s, const uint8_t* __restrict__ W,
                          const uint16_t* __restrict__ D, const float* __restrict__ RS, int N_exp, int I_or_H, int K,
                          const int* __restrict__ eidx, const MoeTask* __restrict__ tasks,
-                         const int* __restrict__ n_tasks, const int* __restrict__ pairs, int top_k, float situ_beta,
-                         float situ_linear_beta, float* __restrict__ out, int ld_out, bf16* __restrict__ act_bf16) {
+                         const int* __restrict__ n_tasks, const int* __restrict__ pairs, int top_k, MoeAct mact,
+                             float* __restrict__ out, int ld_out, bf16* __restrict__ act_bf16) {
 #if defined(__CUDA_ARCH__) && !FLYX_TUNE_CANDIDATES
   if constexpr (!moe_dp4a_kernel_active<F, CFG, FUSE_ACT, DIRECT_R1>(__CUDA_ARCH__ / 10)) {
     __trap();
@@ -251,18 +241,18 @@ __global__ void __launch_bounds__(32 * kMoeDp4aWarps)
   if constexpr (EXPLICIT_CONFIG && !DIRECT_R1) {
     if (nb == 1) {
       moe_dp4a_tile<F, FUSE_ACT, C, U, 1>(T, local, q8_a, q8_d, q8_s, W, D, RS, N_exp, I_or_H, K, e, 1,
-                                          s_pids, s_rids, situ_beta, situ_linear_beta, out, ld_out, act_bf16);
+                                          s_pids, s_rids, mact, out, ld_out, act_bf16);
       return;
     }
   }
   moe_dp4a_tile<F, FUSE_ACT, C, U, BT>(T, local, q8_a, q8_d, q8_s, W, D, RS, N_exp, I_or_H, K, e, nb,
-                                       s_pids, s_rids, situ_beta, situ_linear_beta, out, ld_out, act_bf16);
+                                       s_pids, s_rids, mact, out, ld_out, act_bf16);
 #if defined(__CUDA_ARCH__) && !FLYX_TUNE_CANDIDATES
   }
 #endif
 }
 
-// ---- INT8 Tensor Core mma.m16n8k32 grouped MoE kernel (BM = 16 rows/task, CT = 2 -> 16 cols/block) ----
+// ---- INT8 Tensor Core mma.m16n8k32 grouped MoE kernel (BM = 16 rows/task, CT sets of 8 cols/block: kMoeMmaCT) ----
 template <class F, int CT>
 struct MoeMmaSmem {
   static constexpr bool MINS = F::kFlatRun != 0;
@@ -281,7 +271,7 @@ __global__ void __launch_bounds__(32 * kMoeMmaTileWarps * CT)
                         const float* __restrict__ q8_s, const uint8_t* __restrict__ W,
                         const uint16_t* __restrict__ D, const float* __restrict__ RS, int N_exp, int I_or_H, int K,
                         const MoeTask* __restrict__ tasks, const int* __restrict__ n_tasks,
-                        const int* __restrict__ pairs, int top_k, float situ_beta, float situ_linear_beta,
+                        const int* __restrict__ pairs, int top_k, MoeAct mact,
                         float* __restrict__ out, int ld_out) {
   pdl_trigger();
   using S = MoeMmaSmem<F, CT>;
@@ -490,7 +480,7 @@ __global__ void __launch_bounds__(32 * kMoeMmaTileWarps * CT)
           const float vu = ((sm.tree[ct][0][lane][e4] + sm.tree[ct][1][lane][e4]) +
                             (sm.tree[ct][2][lane][e4] + sm.tree[ct][3][lane][e4])) *
                            rs;
-          out[size_t(sm.pids[r]) * ld_out + col] = moe_situ(vg[e4], vu, situ_beta, situ_linear_beta);
+          out[size_t(sm.pids[r]) * ld_out + col] = moe_act_val(mact, vg[e4], vu, e, col, I_or_H);
         }
       }
     }
@@ -632,7 +622,7 @@ template <class F, bool FUSE_ACT, bool Q8>
 __global__ void __launch_bounds__(128)
     k_moe_blocks_gu_nostage(Tables T, const float* __restrict__ x, int ldx, const uint8_t* __restrict__ W,
                             const uint16_t* __restrict__ D, const float* __restrict__ RS, int N_exp, int I, int K,
-                            const int* __restrict__ eidx, int top_k, float situ_beta, float situ_linear_beta,
+                            const int* __restrict__ eidx, int top_k, MoeAct mact,
                             float* __restrict__ out, int ld_out) {
   pdl_trigger();
   __shared__ typename F::Local local;
@@ -686,7 +676,7 @@ __global__ void __launch_bounds__(128)
     const float g = warp_tree_sum(ag[0]) * rs;
     if constexpr (FUSE_ACT) {
       const float u = warp_tree_sum(au[0]) * rs;
-      if (lane == 0) out[size_t(r * top_k + k_slot) * ld_out + col] = moe_situ(g, u, situ_beta, situ_linear_beta);
+      if (lane == 0) out[size_t(r * top_k + k_slot) * ld_out + col] = moe_act_val(mact, g, u, e, col, I);
     } else if (lane == 0) {
       out[size_t(r * top_k + k_slot) * ld_out + col] = g;
     }
@@ -755,7 +745,7 @@ __global__ void __launch_bounds__(128)
     k_moe_blocks_a16h_grouped(Tables T, const float* __restrict__ x, int ldx, const uint8_t* __restrict__ W,
                               const uint16_t* __restrict__ D, const float* __restrict__ RS, int N_exp, int I_or_H,
                               int K, const MoeTask* __restrict__ tasks, const int* __restrict__ n_tasks,
-                              const int* __restrict__ pairs, int top_k, float situ_beta, float situ_linear_beta,
+                              const int* __restrict__ pairs, int top_k, MoeAct mact,
                               float* __restrict__ out, int ld_out) {
   constexpr int BT = 4;
   const int tid_y = int(blockIdx.y);
@@ -813,7 +803,7 @@ __global__ void __launch_bounds__(128)
         const float g = warp_tree_sum(ag[b]) * rs;
         if constexpr (FUSE_ACT) {
           const float u = warp_tree_sum(au[b]) * rs;
-          if (lane == 0) out[size_t(pids[b]) * ld_out + col] = moe_situ(g, u, situ_beta, situ_linear_beta);
+          if (lane == 0) out[size_t(pids[b]) * ld_out + col] = moe_act_val(mact, g, u, e, col, I_or_H);
         } else if (lane == 0) {
           out[size_t(pids[b]) * ld_out + col] = g;
         }
@@ -822,17 +812,24 @@ __global__ void __launch_bounds__(128)
   }
 }
 
+// The column sets of 8 a block of the MMA kernel takes: a wider block stages its tile's rows once for more columns.
+// MXFP4: 8 (1024 threads; its units decode within the 64 registers that leaves; gpt-oss-20b's 145-token prefill pass
+// on an RTX PRO 6000, 28 -> 21 ms, 2 -> 4 -> 8 sets 437 -> 381 -> 291 us an expert GEMM); the other types 2, whose
+// units spill at 64 registers.
+template <class F>
+constexpr int kMoeMmaCT = std::is_same_v<F, FMXFP4> ? 8 : 2;
+
 template <class F, bool FUSE_ACT, bool IS_DOWN>
-void launch_mma_q8(const ExpertMat& W, int I_or_H, int K, int top_k, float situ_beta, float situ_linear_beta,
+void launch_mma_q8(const ExpertMat& W, int I_or_H, int K, int top_k, MoeAct mact,
                    float* out, int ld_out, const MoeScratch* sc, int max_tiles, cudaStream_t st) {
-  constexpr size_t smem = sizeof(MoeMmaSmem<F, kMoeMmaCT>);
-  static const bool ready = set_dynamic_smem(k_moe_blocks_q8_mma<F, FUSE_ACT, IS_DOWN, kMoeMmaCT>, smem);
+  constexpr size_t smem = sizeof(MoeMmaSmem<F, kMoeMmaCT<F>>);
+  static const bool ready = set_dynamic_smem(k_moe_blocks_q8_mma<F, FUSE_ACT, IS_DOWN, kMoeMmaCT<F>>, smem);
   (void)ready;
   const int N_work = FUSE_ACT ? I_or_H : W.N;
-  const dim3 grid(ceil_div(N_work, 8 * kMoeMmaCT), max_tiles);
-  k_moe_blocks_q8_mma<F, FUSE_ACT, IS_DOWN, kMoeMmaCT><<<grid, 32 * kMoeMmaTileWarps * kMoeMmaCT, smem, st>>>(
+  const dim3 grid(ceil_div(N_work, 8 * kMoeMmaCT<F>), max_tiles);
+  k_moe_blocks_q8_mma<F, FUSE_ACT, IS_DOWN, kMoeMmaCT<F>><<<grid, 32 * kMoeMmaTileWarps * kMoeMmaCT<F>, smem, st>>>(
       block_tables(), sc->q8_a, sc->q8_d, sc->q8_s, W.blk.data, W.blk.scales, W.rs, W.N, I_or_H, K, sc->tasks,
-      sc->n_tasks, sc->pairs, top_k, situ_beta, situ_linear_beta, out, ld_out);
+      sc->n_tasks, sc->pairs, top_k, mact, out, ld_out);
 }
 
 // A moe_dp4a configuration's tile: C output columns a warp (gate/up pairs fused), U units a lane has in flight; 0 and
@@ -848,7 +845,7 @@ struct MoeDp4aTile {
 // always one this build compiles for the type, op and row band, moe_dp4a_cfg_compiled).
 template <class F, bool FUSE_ACT, bool IS_DOWN>
 void launch_dp4a_q8(int cfg, const Tables& T, const ExpertMat& W, int I_or_H, int K, const int* eidx, int rows,
-                    int top_k, float situ_beta, float situ_linear_beta, float* out, int ld_out, const MoeScratch* sc,
+                    int top_k, MoeAct mact, float* out, int ld_out, const MoeScratch* sc,
                     int max_tiles, cudaStream_t st, bf16* act_bf16) {
   const int N_exp = IS_DOWN ? I_or_H : W.N;
   const int N_work = FUSE_ACT ? I_or_H : N_exp;
@@ -865,7 +862,7 @@ void launch_dp4a_q8(int cfg, const Tables& T, const ExpertMat& W, int I_or_H, in
       k_moe_blocks_q8_dp4a<F, FUSE_ACT, IS_DOWN, DIRECT_R1, CFG, C, U, EXPLICIT_CONFIG>
           <<<grid, 32 * kMoeDp4aWarps, 0, st>>>(T, sc->q8_a, sc->q8_d, sc->q8_s, W.blk.data, W.blk.scales, W.rs,
                                                 N_exp, I_or_H, K, eidx, sc->tasks, sc->n_tasks, sc->pairs, top_k,
-                                                situ_beta, situ_linear_beta, out, ld_out, act_bf16);
+                                                mact, out, ld_out, act_bf16);
       return true;
     } else {
       return false;
@@ -887,7 +884,7 @@ void launch_dp4a_q8(int cfg, const Tables& T, const ExpertMat& W, int I_or_H, in
 
 template <class F>
 void moe_blocks_gu(const float* x, int ldx, const ExpertMat& W, const int* eidx, int rows, int top_k, int I, int K,
-                   float situ_beta, float situ_linear_beta, bool fuse_act, float* out, int ld_out,
+                   MoeAct mact, bool fuse_act, float* out, int ld_out,
                    const MoeScratch* sc, int max_tiles, bool use_mma, int dp4a, cudaStream_t st, bf16* act_bf16) {
   const Tables T = block_tables();
   const int N_work = fuse_act ? I : 2 * I;
@@ -898,14 +895,14 @@ void moe_blocks_gu(const float* x, int ldx, const ExpertMat& W, const int* eidx,
   if (has_q8 && (rows == 1 || (sc->tasks && max_tiles > 0))) {
     if (rows > 1 && use_mma) {
       if (fuse_act)
-        launch_mma_q8<F, true, false>(W, I, K, top_k, situ_beta, situ_linear_beta, out, ld_out, sc, max_tiles, st);
+        launch_mma_q8<F, true, false>(W, I, K, top_k, mact, out, ld_out, sc, max_tiles, st);
       else
-        launch_mma_q8<F, false, false>(W, I, K, top_k, situ_beta, situ_linear_beta, out, ld_out, sc, max_tiles, st);
+        launch_mma_q8<F, false, false>(W, I, K, top_k, mact, out, ld_out, sc, max_tiles, st);
     } else if (fuse_act) {
-      launch_dp4a_q8<F, true, false>(dp4a, T, W, I, K, eidx, rows, top_k, situ_beta, situ_linear_beta, out, ld_out,
+      launch_dp4a_q8<F, true, false>(dp4a, T, W, I, K, eidx, rows, top_k, mact, out, ld_out,
                                       sc, max_tiles, st, act_bf16);
     } else {
-      launch_dp4a_q8<F, false, false>(dp4a, T, W, I, K, eidx, rows, top_k, situ_beta, situ_linear_beta, out, ld_out,
+      launch_dp4a_q8<F, false, false>(dp4a, T, W, I, K, eidx, rows, top_k, mact, out, ld_out,
                                        sc, max_tiles, st, nullptr);
     }
     return;
@@ -914,29 +911,29 @@ void moe_blocks_gu(const float* x, int ldx, const ExpertMat& W, const int* eidx,
     const dim3 grid(ceil_div(N_work, 4), max_tiles);
     if (fuse_act)
       k_moe_blocks_a16h_grouped<F, true, false><<<grid, 128, 0, st>>>(
-          T, x, ldx, W.blk.data, W.blk.scales, W.rs, W.N, I, K, sc->tasks, sc->n_tasks, sc->pairs, top_k, situ_beta,
-          situ_linear_beta, out, ld_out);
+          T, x, ldx, W.blk.data, W.blk.scales, W.rs, W.N, I, K, sc->tasks, sc->n_tasks, sc->pairs, top_k, mact, out,
+              ld_out);
     else
       k_moe_blocks_a16h_grouped<F, false, false><<<grid, 128, 0, st>>>(
-          T, x, ldx, W.blk.data, W.blk.scales, W.rs, W.N, I, K, sc->tasks, sc->n_tasks, sc->pairs, top_k, situ_beta,
-          situ_linear_beta, out, ld_out);
+          T, x, ldx, W.blk.data, W.blk.scales, W.rs, W.N, I, K, sc->tasks, sc->n_tasks, sc->pairs, top_k, mact, out,
+              ld_out);
     return;
   }
   const dim3 grid(ceil_div(N_work, 4), top_k, rows);
   if (W.blk.q8) {
     if (fuse_act)
       k_moe_blocks_gu_nostage<F, true, true><<<grid, 128, 0, st>>>(
-          T, x, ldx, W.blk.data, W.blk.scales, W.rs, W.N, I, K, eidx, top_k, situ_beta, situ_linear_beta, out, ld_out);
+          T, x, ldx, W.blk.data, W.blk.scales, W.rs, W.N, I, K, eidx, top_k, mact, out, ld_out);
     else
       k_moe_blocks_gu_nostage<F, false, true><<<grid, 128, 0, st>>>(
-          T, x, ldx, W.blk.data, W.blk.scales, W.rs, W.N, I, K, eidx, top_k, situ_beta, situ_linear_beta, out, ld_out);
+          T, x, ldx, W.blk.data, W.blk.scales, W.rs, W.N, I, K, eidx, top_k, mact, out, ld_out);
   } else {
     if (fuse_act)
       k_moe_blocks_gu_nostage<F, true, false><<<grid, 128, 0, st>>>(
-          T, x, ldx, W.blk.data, W.blk.scales, W.rs, W.N, I, K, eidx, top_k, situ_beta, situ_linear_beta, out, ld_out);
+          T, x, ldx, W.blk.data, W.blk.scales, W.rs, W.N, I, K, eidx, top_k, mact, out, ld_out);
     else
       k_moe_blocks_gu_nostage<F, false, false><<<grid, 128, 0, st>>>(
-          T, x, ldx, W.blk.data, W.blk.scales, W.rs, W.N, I, K, eidx, top_k, situ_beta, situ_linear_beta, out, ld_out);
+          T, x, ldx, W.blk.data, W.blk.scales, W.rs, W.N, I, K, eidx, top_k, mact, out, ld_out);
   }
 }
 
@@ -949,16 +946,16 @@ bool moe_blocks_down(const float* act, int ld_act, const ExpertMat& W, const int
       W.blk.q8 && sc && sc->q8_a && sc->down_buf && sc->stage_elems >= size_t(rows) * size_t(top_k) * size_t(K);
   if (has_q8 && (rows == 1 || (sc->tasks && max_tiles > 0))) {
     if (rows > 1 && use_mma) {
-      launch_mma_q8<F, false, true>(W, H, K, top_k, 0.f, 0.f, sc->down_buf, H, sc, max_tiles, st);
+      launch_mma_q8<F, false, true>(W, H, K, top_k, MoeAct{}, sc->down_buf, H, sc, max_tiles, st);
     } else {
-      launch_dp4a_q8<F, false, true>(dp4a, T, W, H, K, eidx, rows, top_k, 0.f, 0.f, sc->down_buf, H, sc, max_tiles,
+      launch_dp4a_q8<F, false, true>(dp4a, T, W, H, K, eidx, rows, top_k, MoeAct{}, sc->down_buf, H, sc, max_tiles,
                                       st, nullptr);
     }
     return true;
   }
   if (!W.blk.q8 && rows > 1 && sc && sc->tasks && sc->down_buf && max_tiles > 0) {
     k_moe_blocks_a16h_grouped<F, false, true><<<dim3(ceil_div(H, 4), max_tiles), 128, 0, st>>>(
-        T, act, ld_act, W.blk.data, W.blk.scales, W.rs, H, H, K, sc->tasks, sc->n_tasks, sc->pairs, top_k, 0.f, 0.f,
+        T, act, ld_act, W.blk.data, W.blk.scales, W.rs, H, H, K, sc->tasks, sc->n_tasks, sc->pairs, top_k, MoeAct{},
         sc->down_buf, H);
     return true;
   }

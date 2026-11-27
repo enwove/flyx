@@ -456,9 +456,12 @@ struct FMXFP4 {
   static constexpr int kFlatRun = 0;
   static constexpr bool kScaleBf16 = true;
   using Local = Iq4Table;
+  static __device__ __forceinline__ void unit_tables(const Tables& T, Local& L) {
+    fetch(L.pairs8, T.pair_mxfp4_s8, 256);
+  }
   static __device__ __forceinline__ void tables(const Tables& T, Local& L) {
     fetch(L.pairs, T.pair_mxfp4, 256);
-    fetch(L.pairs8, T.pair_mxfp4_s8, 256);
+    unit_tables(T, L);
   }
   FLYX_NIBBLES32
   static __device__ __forceinline__ void words(const Local& L, const Lane& n, int, uint32_t* w0, uint32_t*) {

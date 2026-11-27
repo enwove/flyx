@@ -158,7 +158,7 @@ print(reply["content"])
 
 | Dimensión | Compatible | Notas |
 |---|---|---|
-| Arquitecturas | Qwen3.5 / Qwen3.8 (`qwen35`), Qwen3 (`qwen3`), Inkling-2-Mini (`inkling2_loop`, MoE disperso), Llama (MiniCPM5-1B) | Llama solo desde `.flyx` |
+| Arquitecturas | Qwen3.5 / Qwen3.8 (`qwen35`), Qwen3 (`qwen3`), Inkling-2-Mini (`inkling2_loop`, MoE disperso), gpt-oss-20b / 120b (`gpt-oss`, MoE disperso, GGUF), Llama (MiniCPM5-1B) | Llama solo desde `.flyx` |
 | Drafters especulativos | MTP, DFlash2, DSpark, búsqueda en el prompt | MTP y DSpark se acoplan automáticamente; DFlash2 es un archivo complementario (`--drafter-file`, o **Draft with it** en el panel); DSpark acompaña a Inkling-2-Mini |
 | Visión | Entrada de imágenes con un proyector `mmproj`, descargado automáticamente del repositorio del modelo en el Hub | Hoy Qwen3.5 / Qwen3.8; Inkling-2-Mini es solo texto |
 | Formatos de modelo | GGUF (`F32`, `F16`, `BF16`, `Q4_0–Q8_0`, `Q2_K–Q6_K`, `IQ1–IQ4`, `MXFP4`, `Q2_0`, GGML NVFP4); `.flyx` (BF16, NVFP4; formato 2 con adaptadores LoRA propios del objetivo, V-LoRA, sin fusionar; drafter DV solo al indicarlo explícitamente con `--drafter dv`, [diseño](../design/dv.md)) | Guarda todas las partes de un GGUF dividido en la misma carpeta. |

@@ -82,6 +82,10 @@ struct AttnBlockSpec {
   bool qk_norm = true;  // false: no RMSNorm of each head's q and k (the block names none, weight -1)
   int mrope_section[3] = {0, 0, 0};  // 3D MRoPE sections (T, H, W); all 0 = standard 1D RoPE
   bool mrope_interleaved = false;
+  bool bias = false;   // biases on q, k, v and o ("attn.q.bias" ...; gpt-oss)
+  bool sinks = false;  // a learned sink logit per head ("attn.sinks"; gpt-oss)
+  int window = 0;      // > 0: each query reads the window positions up to its own (its K/V state a ring of that size)
+  flyx_rope_scaling rope{FLYX_ROPE_PLAIN, 0, 1.f, 0.f, 0.f, 0};
 };
 
 // A LoRA adapter given beside the model (--lora; core/modelfile/peft_dir.cpp): one rank and scale on the linears its

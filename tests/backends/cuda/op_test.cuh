@@ -329,5 +329,6 @@ void test_inkling2_rel_attn();
 void test_inkling2_rel_strata();
 void test_inkling2_moe();
 void test_dspark();
+void test_gpt_oss();
 
 }  // namespace flyx::optest

@@ -694,7 +694,7 @@ void attn_windows(const Pass& ps, const AttnBlock& a, const KvBuf& kb, int windo
   auto* s = ps.s;
   const int R = ps.rows, nh = a.nh, nkv = a.nkv, hd = a.hd;
   cudaStream_t st = rv.L.st;
-  const float scale = 1.f / std::sqrt(float(hd));
+  const float scale = a.scale;
   const float* gate = a.gate ? rv.b.proj + nh * hd : nullptr;
   const int from = s->window_from(kb), len = s->window_len(kb), end = s->position + R;
   // A pass of a round's rows or fewer (pageable caches only: windows() gives the others none) takes a round's
@@ -713,7 +713,7 @@ void attn_windows(const Pass& ps, const AttnBlock& a, const KvBuf& kb, int windo
       sw.state = planes[launches & 1];
       sw.carry = planes[(launches + 1) & 1];
       attention_split(rv.b.qbuf, kv, nh, nkv, hd, R, true, 0, scale, s->P, gate, rv.ld_proj, out, ld_out, rv.b.part,
-                      kPrefillSplits, rv.L, 0, 0, nullptr, {}, sw);
+                      kPrefillSplits, rv.L, 0, 0, nullptr, {}, sw, a.sinks);
       sw.first = false;
       ++launches;
     };
@@ -728,6 +728,7 @@ void attn_windows(const Pass& ps, const AttnBlock& a, const KvBuf& kb, int windo
   if (!rv.b.attn_state) throw std::logic_error("cuda: prefill window state buffer missing");
   FlashWindow w;
   w.state = rv.b.attn_state;
+  w.sinks = a.sinks;
   auto run = [&](const KvRef& kv, int k_lo, int k_hi, bool last) {
     w.k_lo = k_lo;
     w.k_hi = k_hi;
@@ -894,7 +895,7 @@ void attn_layer(const Pass& ps, const AttnBlock& a, bool fused) {
   }
   attn_prep(rv.b.proj, rv.ld_proj, 0, a.q_width(), a.q_width() + nkv * hd, a.q_norm.w, a.k_norm.w, a.q_norm.offset,
             a.q_norm.eps, a.theta, a.rot, nh, nkv, hd, R, s->P, kPosPosition, false, rv.b.qbuf, kv, st, 0, tree,
-            use_stage ? s->position : 0, CanvasKeys{}, a.mrope(ps.pos_3d));
+            use_stage ? s->position : 0, CanvasKeys{}, a.mrope(ps.pos_3d), a.rope, a.qkv_b);
   if (use_stage) {
     const size_t woff = strata_words_at(s->position, 0, nkv, kb.words);
     CK(cudaMemcpyAsync(kb.kq + woff, stg_kq, q_words * sizeof(uint32_t), cudaMemcpyDefault, st));
@@ -914,18 +915,21 @@ void attn_layer(const Pass& ps, const AttnBlock& a, bool fused) {
       // pass past them, where they are (0074).
       const bool direct = s->reads_direct(kb, R, ps.round);
       if (!direct) s->stage_before(kb, 0, R, st);
-      attention(rv.b.qbuf, direct ? kb.ref() : kb.staged(), nh, nkv, hd, R, true, 0, 1.f / std::sqrt(float(hd)), s->P,
+      attention(rv.b.qbuf, direct ? kb.ref() : kb.staged(), nh, nkv, hd, R, true, 0, a.scale, s->P,
                 a.gate ? rv.b.proj + nh * hd : nullptr, rv.ld_proj, split ? nullptr : rv.b.act, nh * hd, rv.b.part,
-                ps.round ? kRoundSplits : kPrefillSplits, L, 0, 0, tree);
+                ps.round ? kRoundSplits : kPrefillSplits, L, 0, a.window, tree, CanvasKeys{}, a.sinks);
       if (!direct) s->stage_after(kb, st);
     }
   }
   // A round reads the low-bit copy, a few positions the cache; about the switch, its rows replace
   // exact attention's at the switch and past it.
   if (ps.reads_copy(kb)) {
+    // the copy's attention takes none of these (alloc_state keeps such caches exact)
+    if (a.sinks || a.window || a.rope)
+      throw std::logic_error("cuda: the low-bit copy of an attention with sinks, a window or YaRN");
     const bool only = ps.reads_copy_only(kb);
     const cudaEvent_t full = only ? s->copy_before(kb, R, st, true) : nullptr;
-    const float scale = 1.f / std::sqrt(float(hd));
+    const float scale = a.scale;
     const int from = ps.strata == kStrataBoth ? s->strata_from : 0;
     if (R <= FLYX_MAX_ROWS) {
       attention_strata(rv.b.qbuf, kb.copy_read(only), s->strata, nh, nkv, hd, R, scale, s->P,
@@ -946,6 +950,7 @@ void attn_layer(const Pass& ps, const AttnBlock& a, bool fused) {
   }
   if (a.lora) lora_begin(rv, a.lora.a_out, a.lora.rank, rv.b.act, nh * hd, nh * hd, R, ldu, L);
   if (x16) {
+    if (a.o_b) throw std::logic_error("cuda: a bf16 residual's out projection with a bias");
     if (!split || !gemm_staged_bf16(a.w_out.q, a.w_out.s, a.w_out.rs, H, nh * hd, x16_of(rv), H, R, L, true))
       throw std::logic_error("cuda: a bf16 residual's out projection is a W4A4 GEMM");
   } else if (split) {
@@ -956,6 +961,7 @@ void attn_layer(const Pass& ps, const AttnBlock& a, bool fused) {
   } else {
     gemm(rv.b.act, nh * hd, a.w_out, H, nh * hd, rv.b.x, H, R, true, L);
   }
+  if (a.o_b) add_bias(rv.b.x, H, a.o_b, R, H, st);
   if (a.lora) lora_out_end(rv, a.lora, FLYX_LIN_O, rv.b.act, nh * hd, nh * hd, H, R, ldu, L);
 }
 
@@ -1647,19 +1653,18 @@ void moe_layer(const Pass& ps, const MoeBlock& f, bool fused) {
   }
   gemm(rv.b.h, H, f.router, E, H, rv.b.proj, E, R, false, L);
   moe_route(rv.b.proj, f.router_bias, R, E, K, f.gating_sigmoid, f.norm_weights, f.norm_eps, f.route_scale,
-            rv.b.moe_idx, rv.b.moe_w, L);
+            rv.b.moe_idx, rv.b.moe_w, L, f.router_logit_b);
 
   bf16* act_bf16 =
       round_q8 && moe_round_bf16_down(f.down, R, K, I, msc, L) ? reinterpret_cast<bf16*>(rv.b.moe_act) : nullptr;
   // The grouping of the rows by expert that the gate|up GEMM leaves in the scratch, which the down GEMM takes over.
   int grouped = 0;
   if (fused) {
-    grouped = moe_gate_up(rv.b.h, H, f.gate_up, rv.b.moe_idx, R, K, I, H, f.situ_beta, f.situ_linear_beta, true,
-                          rv.b.moe_act, I, msc, L, round_q8, act_bf16);
+    grouped = moe_gate_up(rv.b.h, H, f.gate_up, rv.b.moe_idx, R, K, I, H, f.act, true, rv.b.moe_act, I, msc, L,
+                          round_q8, act_bf16);
   } else {
-    grouped = moe_gate_up(rv.b.h, H, f.gate_up, rv.b.moe_idx, R, K, I, H, f.situ_beta, f.situ_linear_beta, false,
-                          rv.b.moe_gu, 2 * I, msc, L);
-    situ_rows(rv.b.moe_gu, 2 * I, I, f.situ_beta, f.situ_linear_beta, rv.b.moe_act, I, R * K, st);
+    grouped = moe_gate_up(rv.b.h, H, f.gate_up, rv.b.moe_idx, R, K, I, H, f.act, false, rv.b.moe_gu, 2 * I, msc, L);
+    moe_act_rows(rv.b.moe_gu, 2 * I, I, f.act, rv.b.moe_idx, rv.b.moe_act, I, R * K, st);
   }
   if (f.post_conv) {
     moe_down(rv.b.moe_act, I, f.down, rv.b.moe_idx, rv.b.moe_w, R, K, H, I, rv.b.post_raw, H, false, msc, L, act_bf16,
@@ -1680,7 +1685,7 @@ void moe_layer(const Pass& ps, const MoeBlock& f, bool fused) {
   } else {
     float* x_cur = (ps.res && ps.res->x_cur) ? ps.res->x_cur : rv.b.x;
     moe_down(rv.b.moe_act, I, f.down, rv.b.moe_idx, rv.b.moe_w, R, K, H, I, x_cur, H, true, msc, L, act_bf16,
-             grouped);
+             grouped, f.down_b);
   }
 }
 

@@ -6,6 +6,7 @@
 //   cuda_op_test --filter shortconv_res_mix_norm    fused sublayer boundaries
 //   cuda_op_test --filter inkling2_rel_attn         relative attention and its K/V preparation
 //   cuda_op_test --filter inkling2_moe              MoE routing, expert GEMMs and their dp4a configurations
+//   cuda_op_test --filter gpt_oss                   gpt-oss's experts, attention sinks and windows, YaRN
 //
 // Inputs are random; weights and caches go through bf16 on both sides, so
 // the remaining difference is float32 arithmetic (and bf16 activations in the
@@ -35,10 +36,12 @@ int main(int argc, char** argv) {
     if (std::strcmp(argv[2], "shortconv_res_mix_norm") == 0) filtered_test = test_inkling2_sublayer_fusion;
     if (std::strcmp(argv[2], "inkling2_rel_attn") == 0) filtered_test = test_rel_attention;
     if (std::strcmp(argv[2], "inkling2_moe") == 0) filtered_test = test_inkling2_moe;
+    if (std::strcmp(argv[2], "gpt_oss") == 0) filtered_test = test_gpt_oss;
   }
   if (argc != 1 && !filtered_test) {
     std::fprintf(stderr,
-                 "usage: cuda_op_test [--filter attn_res_mix|shortconv_res_mix_norm|inkling2_rel_attn|inkling2_moe]\n");
+                 "usage: cuda_op_test [--filter attn_res_mix|shortconv_res_mix_norm|inkling2_rel_attn|inkling2_moe|"
+                 "gpt_oss]\n");
     return 2;
   }
   // A nonfinite element between two matching ones must not disappear in the max-error reduction.
@@ -219,5 +222,6 @@ int main(int argc, char** argv) {
   test_inkling2_rel_strata();
   test_inkling2_moe();
   test_dspark();
+  test_gpt_oss();
   return report_result();
 }

@@ -88,7 +88,8 @@ enum AttnImpl : int { kAttnAuto = 0, kAttnSplit = 1, kAttnPerHead = 2 };
 // moe_dp4a; tools/codegen/gen_gemm_tables.py's MOE_DP4A_TYPES says the same): the other types the original tiles
 // alone.  Also those cuda_bench and cuda_op_test exercise.
 inline constexpr int kMoeDp4aTypes[] = {FLYX_DT_GGML_IQ3_XXS, FLYX_DT_GGML_IQ2_S, FLYX_DT_GGML_IQ2_XXS,
-                                        FLYX_DT_GGML_IQ2_XS, FLYX_DT_GGML_IQ4_NL, FLYX_DT_GGML_Q4_K};
+                                        FLYX_DT_GGML_IQ2_XS, FLYX_DT_GGML_IQ4_NL, FLYX_DT_GGML_Q4_K,
+                                        FLYX_DT_GGML_MXFP4};
 #ifdef __CUDACC__
 __host__ __device__
 #endif
@@ -99,7 +100,8 @@ constexpr bool has_moe_dp4a_variants(int dtype) {
     case FLYX_DT_GGML_IQ2_XXS:
     case FLYX_DT_GGML_IQ2_XS:
     case FLYX_DT_GGML_IQ4_NL:
-    case FLYX_DT_GGML_Q4_K: return true;
+    case FLYX_DT_GGML_Q4_K:
+    case FLYX_DT_GGML_MXFP4: return true;
     default: return false;
   }
 }
@@ -1043,7 +1045,8 @@ void attn_prep(const float* qkv, int ld, int q_off, int k_off, int v_off, const 
                float norm_offset, float eps, double theta, int rot_dim, int nh, int nkv, int hd, int rows,
                const DevParams* P, int pos_sel, bool skip_if_noop, float* q_out, KvRef kv, cudaStream_t st,
                int pos_add = 0, const TreeRows* tree = nullptr, int strata_base = 0, CanvasKeys canvas = {},
-               MRoPE mrope = {});
+               MRoPE mrope = {}, const double* rope = nullptr,  // rope: the pairs' factors (null: rope_table's)
+               const float* bias = nullptr);  // bias: added to the qkv row as read (at q_off, k_off, v_off: its layout)
 // The MTP layer's positions a draft step reads: its first src.sink positions and its last `window`,
 // [max(0, q - window + 1), q] (q = P->position + pos_add), of src (where src.slot_of says), K, V and their scales,
 // copied in order to dst's first rows; *P_out = *P but for the position at which an attention at pos_add reads
@@ -1065,10 +1068,11 @@ void attention(const float* q, const kv16* Kc, const kv16* Vc, int nh, int nkv, 
 // (TreeRows); never the prefill kernels.
 // canvas (no tree, no window): a canvas pass's rows (CanvasKeys; base = P->start + 1 + pos_add), on the float32 kernels
 // at every length (attention_split's, never the tensor-core ones).
+// sinks [nh] (null: none): a logit per head in the denominator of each of its rows' softmax (gpt-oss).
 void attention(const float* q, KvRef kv, int nh, int nkv, int hd, int rows, bool causal, int extra, float scale,
                const DevParams* P, const float* gate, int ld_gate, float* out, int ld_out, float* partial, int splits,
                const Launch& L, int pos_add = 0, int window = 0, const TreeRows* tree = nullptr,
-               CanvasKeys canvas = {});
+               CanvasKeys canvas = {}, const float* sinks = nullptr);
 size_t attention_partial_floats(int rows, int nh, int hd, int splits);
 // The rotary factors theta^(-2 i / rot_dim), i < rot_dim / 2, of a (theta, rot_dim) pair in device memory, made once
 // (rope_register, at load: it waits for the device) by the kernels' own pow, so attn_prep and draft_ctx_kv take them
@@ -1100,7 +1104,7 @@ void attention_split(const float* q, const kv16* Kc, const kv16* Vc, int nh, int
 void attention_split(const float* q, KvRef kv, int nh, int nkv, int hd, int rows, bool causal, int extra, float scale,
                      const DevParams* P, const float* gate, int ld_gate, float* out, int ld_out, float* partial,
                      int splits, const Launch& L, int pos_add = 0, int window = 0, const TreeRows* tree = nullptr,
-                     CanvasKeys canvas = {}, const SplitWindow& sw = SplitWindow{});
+                     CanvasKeys canvas = {}, const SplitWindow& sw = SplitWindow{}, const float* sinks = nullptr);
 bool attention_flash(const float* q, const kv16* Kc, const kv16* Vc, int nh, int nkv, int hd, int rows, float scale,
                      const DevParams* P, const float* gate, int ld_gate, float* out, int ld_out, const Launch& L,
                      int pos_add = 0);
@@ -1123,6 +1127,10 @@ struct FlashWindow {
   float* state = nullptr;  // [rows][nh][kFlashStateFloats(hd)]
   bool first = true, last = true;
   bool history = false;  // Every key in the window precedes the first query.
+  const float* sinks = nullptr;  // [nh]: attention()'s sinks, joining the last window's denominators
+  // A sliding window (attention()'s window, binary16 caches): a query at p attends to keys (p - sliding, p], held in
+  // a ring of `ring` slots (key p at p % ring; 0: at p); k_flash_prefill alone takes it.
+  int sliding = 0, ring = 0;
 };
 bool attention_flash(const float* q, KvRef kv, int nh, int nkv, int hd, int rows, float scale, const DevParams* P,
                      const float* gate, int ld_gate, float* out, int ld_out, const Launch& L, int pos_add = 0,
@@ -1784,7 +1792,8 @@ __host__ __device__ constexpr size_t loop_row_floats(int rank) { return 2 * size
 void loop_control(const LoopGate* g, int n, int rows, int H, int rank, float* scratch, cudaStream_t st);
 // y[r][n] (+)= sum_k W[n][k] x[r][k] with the exact float32 values of W [N][K] (a sparse MoE's router, an
 // attention sink, a dynamic-tap projection, as rounds run them): an output a warp, its lanes 32 values of K apart in
-// order, then their tree.  A row has the same bits whatever rows run with it.
+// order, then their tree; where N <= 128 an output 8 warps, each every 8th run of K, their trees summed in order.  A
+// row has the same bits whatever rows run with it.
 void linear_f32(const float* x, int ldx, RoundWeight W, int N, int K, float* y, int ldy, int rows, bool accumulate,
                 cudaStream_t st);
 
@@ -1924,10 +1933,22 @@ struct L2Ranges {
   }
 };
 void l2_warm(const L2Ranges& r, cudaStream_t st);
+// logit_bias [E] (null: none): added to each row's logits before the gating (gpt-oss's router bias); bias shifts the
+// selection alone.
 void moe_route(const float* logits, const float* bias, int rows, int n_experts, int top_k, bool gating_sigmoid,
-               bool norm_weights, float norm_eps, float route_scale, int* idx_out, float* w_out, const Launch& L);
-void situ_rows(const float* gu, int ld_gu, int I, float beta, float linear_beta, float* out, int ld_out, int rows,
-               cudaStream_t st);
+               bool norm_weights, float norm_eps, float route_scale, int* idx_out, float* w_out, const Launch& L,
+               const float* logit_bias = nullptr);
+// The activation an expert's gate value g and up value u go through (kind a flyx_moe_act): SWIGLU silu(g) u; SITU
+// with a, b its betas; SWIGLU_OAI with a its alpha and b its limit.  bias (null: none): the experts' gate | up biases
+// [E, 2 I], gate's I then up's, added to g and u first.
+struct MoeAct {
+  int kind = FLYX_MOE_SWIGLU;
+  float a = 0.f, b = 0.f;
+  const float* bias = nullptr;
+};
+// rows (r: a row and one of its experts, eidx[r]) of gate | up [2 I] -> act's activation [I].
+void moe_act_rows(const float* gu, int ld_gu, int I, const MoeAct& act, const int* eidx, float* out, int ld_out,
+                  int rows, cudaStream_t st);
 // The staged packed expert dp4a GEMMs' configurations (variants/candidates.toml, moe_dp4a), all with the same bits:
 // output columns a warp (gate/up pairs where the activation is fused) and K/32 units a lane has in flight; columns 0
 // and units 0, the original tiles, which every block type compiles (kMoeDp4aTypes compile the others).  _name:
@@ -1953,21 +1974,22 @@ bool moe_q8_mins(const ExpertMat& W);
 bool moe_round_q8(const ExpertMat& W, int rows, int top_k, int K, const MoeScratch* sc);
 bool moe_round_bf16_down(const ExpertMat& W, int rows, int top_k, int K, const MoeScratch* sc, const Launch& L);
 // gate_up over selected experts eidx [rows, top_k]: fuse_act=false writes [rows*top_k, 2*I];
-// fuse_act=true applies SiTU/SwiGLU in registers and writes [rows*top_k, I] (bit-identical to unfused + situ_rows).
+// fuse_act=true applies act in registers and writes [rows*top_k, I] (bit-identical to unfused + moe_act_rows).
 // act_bf16 (with fuse_act and moe_round_q8): the activations there in bf16, each rounded to nearest as staging
 // rounds it, not in out; storage of its own, as sc->bf16_a lies over the 8-bit rows this GEMM is reading.
 // Returns the rows a work tile holds of the grouping by expert it leaves in sc for all `rows` at once (0: none),
 // what moe_down takes as `grouped` for the same eidx and rows.
 int moe_gate_up(const float* x, int ldx, const ExpertMat& W, const int* eidx, int rows, int top_k, int I, int K,
-                float situ_beta, float situ_linear_beta, bool fuse_act, float* out, int ld_out, const MoeScratch* sc,
-                const Launch& L, bool q8_ready = false, bf16* act_bf16 = nullptr);
-// Weighted down-projection: out[r, n] (=|+=) sum_{k=0..top_k-1} ew[r, k] * down_{eidx[r, k]}(act[r * top_k + k])[n].
+                const MoeAct& act, bool fuse_act, float* out, int ld_out, const MoeScratch* sc, const Launch& L,
+                bool q8_ready = false, bf16* act_bf16 = nullptr);
+// Weighted down-projection: out[r, n] (=|+=) sum_{k=0..top_k-1} ew[r, k] * (down_{eidx[r, k]}(act[r * top_k + k])[n]
+// + bias[eidx[r, k], n]) (bias [E, H], null: none).
 // act_bf16 (with moe_round_bf16_down): its input [rows*top_k, K] in bf16 already, read in place of act.
 // grouped: moe_gate_up's return for these eidx and rows, sc untouched since; its work tiles are taken where they are
 // the ones this GEMM would group (0: group them here).
 void moe_down(const float* act, int ld_act, const ExpertMat& W, const int* eidx, const float* ew, int rows, int top_k,
               int H, int K, float* out, int ld_out, bool accumulate, const MoeScratch* sc, const Launch& L,
-              const bf16* act_bf16 = nullptr, int grouped = 0);
+              const bf16* act_bf16 = nullptr, int grouped = 0, const float* bias = nullptr);
 
 // ---- DSpark drafter kernels (dspark.cu) -----------------------------------------------------
 // Weighted sum of n_taps tapped features [rows, ld_feats] -> RMSNorm -> out [rows, H].

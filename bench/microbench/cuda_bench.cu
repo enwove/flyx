@@ -254,7 +254,8 @@ void bench_moe_projection(int dtype, bool down) {
         if (down)
           moe_down(x, K, W, eidx, ew, rows, top, H, K, y, H, false, &sc, launch, nvfp4 ? act : nullptr);
         else
-          moe_gate_up(x, K, W, eidx, rows, top, I, K, 6.f, 8.f, true, nullptr, I, &sc, launch, true, act);
+          moe_gate_up(x, K, W, eidx, rows, top, I, K, MoeAct{FLYX_MOE_SITU, 6.f, 8.f}, true, nullptr, I, &sc, launch,
+                      true, act);
       }
       CK(cudaStreamEndCapture(st, &graph));
       CK(cudaGraphInstantiate(&exec, graph, 0));

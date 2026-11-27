@@ -6,6 +6,7 @@
 #include <stdexcept>
 
 #include "core/interfaces/options.h"
+#include "models/gpt_oss/gpt_oss.h"
 #include "models/inkling2/inkling2.h"
 #include "models/llama/llama.h"
 #include "models/qwen35/qwen35.h"
@@ -406,6 +407,7 @@ int Tables::attn_block(const std::string& prefix, const AttnBlockSpec& s, const 
   st.layers = 1;
   st.n_kv = s.n_kv;
   st.head_dim = s.head_dim;
+  st.window = s.window;
   flyx_block b{};
   b.kind = FLYX_BLOCK_ATTN;
   auto& a = b.attn;
@@ -430,6 +432,13 @@ int Tables::attn_block(const std::string& prefix, const AttnBlockSpec& s, const 
   a.kv = state(st);
   for (int i = 0; i < 3; ++i) a.mrope_section[i] = s.mrope_section[i];
   a.mrope_interleaved = s.mrope_interleaved ? 1 : 0;
+  a.q_b = s.bias ? weight(n(prefix + "attn.q.bias"), {q}) : -1;
+  a.k_b = s.bias ? weight(n(prefix + "attn.k.bias"), {kv}) : -1;
+  a.v_b = s.bias ? weight(n(prefix + "attn.v.bias"), {kv}) : -1;
+  a.o_b = s.bias ? weight(n(prefix + "attn.o.bias"), {H}) : -1;
+  a.sinks = s.sinks ? weight(n(prefix + "attn.sinks"), {s.n_heads}) : -1;
+  a.window = s.window;
+  a.rope = s.rope;
   return block(b);
 }
 
@@ -493,6 +502,7 @@ constexpr ArchEntry kArchitectures[] = {
     {"qwen3", llama::open, true, false, "lora"},  // Llama's layer with q/k norms; their own adapters (a V-LoRA)
     {"llama", llama::open, false, false, "lora"},
     {"inkling2_loop", inkling2::open, true, false, nullptr},
+    {"gpt-oss", gpt_oss::open, true, false, nullptr},
 };
 
 }  // namespace

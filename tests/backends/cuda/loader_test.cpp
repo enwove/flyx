@@ -364,6 +364,7 @@ void expert_estimates() {
     b.kind = FLYX_BLOCK_MOE;
     b.moe.gate_up = b.moe.down = 0;
     b.moe.router = -1;
+    b.moe.gate = b.moe.up = b.moe.gate_b = b.moe.up_b = b.moe.down_b = b.moe.router_logit_b = -1;
     flyx_model_desc d{};
     d.weights = &w;
     d.n_weights = 1;

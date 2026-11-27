@@ -770,12 +770,36 @@ Lin WeightLoader::lin_stack(const std::vector<int>& ws, int* rows_out, const std
   return L;
 }
 
-ExpertMat WeightLoader::expert_mat(int w) {
-  if (auto it = experts_.find(w); it != experts_.end()) return it->second;
+ExpertMat WeightLoader::expert_mat(int w) { return expert_mat(std::vector<int>{w}); }
+
+// Weights [E, N_i, K] of one dtype stacked expert by expert: expert e's rows of the first, then its rows of the
+// next (gpt-oss's gate and up, stored apart, as the fused [E, 2 I, K] the kernels read).
+ExpertMat WeightLoader::expert_mat(const std::vector<int>& ws) {
+  if (auto it = experts_.find(ws); it != experts_.end()) return it->second;
+  const int w = ws.front();
   const auto* v = t(w);
-  const auto layout = expert_layout(weights_[w], m_->opt.packed_blocks);
-  const size_t E = size_t(v->shape[0]), N = size_t(v->shape[1]), K = size_t(v->shape[2]);
+  auto layout = expert_layout(weights_[w], m_->opt.packed_blocks);
+  const size_t E = size_t(v->shape[0]), K = size_t(v->shape[2]);
+  std::vector<size_t> part_rows;  // N_i
+  size_t N = 0;
+  for (int x : ws) {
+    const auto* u = t(x);
+    if (u->ndim != 3 || u->dtype != v->dtype || size_t(u->shape[0]) != E || size_t(u->shape[2]) != K ||
+        bool(weights_[x].scale2) != bool(weights_[w].scale2) || (ws.size() > 1 && weights_[x].scale2))
+      throw std::runtime_error(std::string(u->name) + ": experts stacked with another dtype, shape or scale");
+    part_rows.push_back(size_t(u->shape[1]));
+    N += part_rows.back();
+  }
+  layout.rows = E * N;
   const size_t total_rows = layout.rows;
+  // The stack's row r: expert r / N, its row r % N of the part that holds it.
+  auto source = [&](size_t r, size_t* row) {
+    const size_t e = r / N;
+    size_t j = r % N, i = 0;
+    while (j >= part_rows[i]) j -= part_rows[i++];
+    *row = e * part_rows[i] + j;
+    return t(ws[i]);
+  };
   ExpertMat em{};
   em.n_experts = int(E);
   em.N = int(N);
@@ -804,7 +828,10 @@ ExpertMat WeightLoader::expert_mat(int w) {
     const size_t q_row = layout.payload_row, s_row = layout.scales_row, file_row = per_row * 36;
     uint8_t* q_dev = m_->alloc<uint8_t>(layout.payload_bytes());
     uint8_t* s_dev = m_->alloc<uint8_t>(layout.scale_bytes());
-    const auto* file = static_cast<const uint8_t*>(v->data);
+    auto file_at = [&](size_t r) {
+      size_t row = 0;
+      return static_cast<const uint8_t*>(source(r, &row)->data) + row * file_row;
+    };
     times_.file_bytes += total_rows * file_row;
     if (!staging_) staging_ = std::make_unique<LoadStaging>();
     LoadStaging& S = *staging_;
@@ -820,7 +847,7 @@ ExpertMat WeightLoader::expert_mat(int w) {
       uint8_t* hs = hq + (nr * q_row + 15) / 16 * 16;
       parallel_rows(nr, [&](size_t a, size_t e) {
         for (size_t r = a; r < e; ++r) {
-          const uint8_t* in = file + (r0 + r) * file_row;
+          const uint8_t* in = file_at(r0 + r);
           uint8_t* qo = hq + r * q_row;
           uint8_t* so = hs + r * s_row;
           for (size_t k = 0; k < per_row; ++k, in += 36) {
@@ -846,7 +873,7 @@ ExpertMat WeightLoader::expert_mat(int w) {
     em.q = q_dev;
     em.s = s_dev;
     em.rs = upload_expert_scales();
-    return experts_[w] = em;
+    return experts_[ws] = em;
   }
 
   if (layout.format == ExpertLayout::ggml_blocks) {
@@ -857,7 +884,10 @@ ExpertMat WeightLoader::expert_mat(int w) {
     const size_t file_row = per_row * size_t(l.bytes);
     uint8_t* data = m_->alloc<uint8_t>(layout.payload_bytes());
     uint16_t* scales = m_->alloc<uint16_t>(layout.scale_bytes() / sizeof(uint16_t));
-    const auto* file = static_cast<const uint8_t*>(v->data);
+    auto file_at = [&](size_t r) {
+      size_t row = 0;
+      return static_cast<const uint8_t*>(source(r, &row)->data) + row * file_row;
+    };
     times_.file_bytes += total_rows * file_row;
     if (!staging_) staging_ = std::make_unique<LoadStaging>();
     LoadStaging& S = *staging_;
@@ -874,7 +904,12 @@ ExpertMat WeightLoader::expert_mat(int w) {
       uint8_t* hp = S.slots[b].buf;
       auto* hs = reinterpret_cast<uint16_t*>(hp + (nr * row_bytes + 15) / 16 * 16);
       parallel_rows(nr, [&](size_t a, size_t e) {
-        blocks_pack(dtype, file + (r0 + a) * file_row, (e - a) * per_row, hp + a * row_bytes, hs + a * row_scales);
+        if (ws.size() == 1) {  // the rows as stored, one run
+          blocks_pack(dtype, file_at(r0 + a), (e - a) * per_row, hp + a * row_bytes, hs + a * row_scales);
+          return;
+        }
+        for (size_t r = a; r < e; ++r)
+          blocks_pack(dtype, file_at(r0 + r), per_row, hp + r * row_bytes, hs + r * row_scales);
       });
       CK(cudaMemcpyAsync(data + r0 * row_bytes, hp, nr * row_bytes, cudaMemcpyHostToDevice, S.st));
       CK(cudaMemcpyAsync(scales + r0 * row_scales, hs, nr * scale_bytes, cudaMemcpyHostToDevice, S.st));
@@ -884,22 +919,24 @@ ExpertMat WeightLoader::expert_mat(int w) {
     }
     em.blk = BlockMat{data, scales, v->dtype, int(total_rows), weights_[w].activations == FLYX_ACT_Q8};
     em.rs = upload_expert_scales();
-    return experts_[w] = em;
+    return experts_[ws] = em;
   }
 
   // Fallback: BF16 on device (handles BF16, F16, F32, or blocks=bf16).
   if (!numbers(v)) throw std::runtime_error(std::string(v->name) + ": unsupported expert dtype");
   const size_t bytes = layout.payload_bytes();
   bf16* dst = m_->alloc<bf16>(bytes / sizeof(bf16));
-  if (v->dtype == FLYX_DT_BF16) {
+  if (v->dtype == FLYX_DT_BF16 && ws.size() == 1) {
     upload_staged(dst, v->data, bytes);
   } else {
     const size_t row_bytes = K * sizeof(uint16_t);
     auto conv_rows = [&](size_t r0, size_t count, uint16_t* out) {
       for (size_t i = 0; i < count; ++i) {
-        const size_t from = (r0 + i) * K;
+        size_t row = 0;
+        const auto* u = source(r0 + i, &row);
+        const size_t from = row * K;
         for (size_t k = 0; k < K; ++k)
-          out[i * K + k] = float_to_bf16(static_cast<float>(flyx::ops::load(v, from + k)));
+          out[i * K + k] = float_to_bf16(static_cast<float>(flyx::ops::load(u, from + k)));
       }
     };
     if (bytes < (size_t(1) << 20)) {
@@ -924,7 +961,7 @@ ExpertMat WeightLoader::expert_mat(int w) {
   }
   em.w = dst;
   em.rs = upload_expert_scales();
-  return experts_[w] = em;
+  return experts_[ws] = em;
 }
 
 PackedQuantScratch::~PackedQuantScratch() {

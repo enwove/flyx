@@ -216,6 +216,7 @@ flyx_add_unit_test(hub_test core/hub/hub_test.cpp Threads::Threads)
 flyx_add_unit_test(chat_test core/render/chat_test.cpp)
 flyx_add_unit_test(tags_test models/formats/tags_test.cpp)
 flyx_add_unit_test(qwen35_format_test models/formats/qwen35_test.cpp)
+flyx_add_unit_test(harmony_format_test models/formats/harmony_test.cpp)
 flyx_add_unit_test(grammar_test models/formats/grammar_test.cpp)
 flyx_add_unit_test(xgrammar_local_changes_test third_party/xgrammar/local_changes_test.cpp flyx_xgrammar)
 flyx_add_unit_test(telemetry_test core/exec/telemetry_test.cpp)
@@ -421,6 +422,7 @@ add_test(NAME drafter_speeds COMMAND drafter_speeds_test)
 # GET /v1/hub/search's pages for a query: GGUF repositories and safetensors drafters paged together (a stand-in Hub).
 add_test(NAME hub_search COMMAND hub_search_test)
 add_test(NAME chat_replies COMMAND tags_test)
+add_test(NAME chat_harmony COMMAND harmony_format_test)
 # Qwen3.5's own renderer against the Jinja engine on generated conversations, and its calls read back.
 add_test(NAME chat_qwen35 COMMAND qwen35_format_test ${ASSETS}/tiny.flyx
                                   ${CMAKE_SOURCE_DIR}/tests/core/render/templates/qwen3.5.jinja)
@@ -632,7 +634,8 @@ if(TARGET flyx-cuda)
                  backends/cuda/op_test_attention.cu backends/cuda/op_test_gdn.cu backends/cuda/op_test_nvfp4.cu
                  backends/cuda/op_test_head.cu backends/cuda/op_test_sampling.cu backends/cuda/op_test_layers.cu
                  backends/cuda/op_test_dv.cu backends/cuda/op_test_vision.cu
-                 backends/cuda/op_test_inkling2.cu backends/cuda/op_test_dspine.cu)
+                 backends/cuda/op_test_inkling2.cu backends/cuda/op_test_dspine.cu
+                 backends/cuda/op_test_gpt_oss.cu)
   if(MSVC)
     # The MSVC INFINITY macro triggers nvcc's overflow warning at every use, as in flyx_cuda_kernels.
     target_compile_options(cuda_op_test PRIVATE --diag-suppress=221)
