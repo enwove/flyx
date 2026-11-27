@@ -892,6 +892,13 @@ def main(argv=None) -> int:
     names = [t["sku"] for _, t in tables]
     if len(set(names)) != len(names):
         raise SystemExit(f"two tables name one sku: {names}")
+    # A GPU takes the table that names its CUDA device name (gemm_tuning_for): one table a name, or the last would win.
+    owner = {}
+    for path, t in tables:
+        for dev in t.get("devices", []):
+            if dev in owner:
+                raise SystemExit(f"{path}: device {dev!r} is already named by the table of sku {owner[dev]!r}")
+            owner[dev] = t["sku"]
     for path, t in tables:
         if t.get("inherit") and t["inherit"] not in names:
             raise SystemExit(f"{path}: inherits unknown sku {t['inherit']!r}")
