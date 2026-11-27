@@ -2452,9 +2452,14 @@ void bench_mt(int argc, char** argv) {
 
 }  // namespace
 
+namespace flyx::bench {
+int cold_dot_bench(int argc, char** argv);
+}
+
 int main(int argc, char** argv) {
   std::string what = argc > 1 ? argv[1] : "gemm";
   // This tuning family uses the recorded decode timings from real model runs.
+  if (what == "cold_dot") return flyx::bench::cold_dot_bench(argc - 2, argv + 2);
   if (what == "tune" && argc > 2 && std::string(argv[2]) == "strata_placement") return tune(argc - 2, argv + 2);
 #if !FLYX_TUNE_CANDIDATES
   if (what == "skinny" || what == "fp4" || what == "fp4cfgs" || what == "fp4rows" || what == "tune" ||
@@ -2521,8 +2526,10 @@ int main(int argc, char** argv) {
   else if (what == "graphs") bench_graphs(argc, argv);
   else if (what == "mt") bench_mt(argc, argv);
   else {
-    std::printf("usage: cuda_bench gemm|skinny|fp4|fp4cfgs|fp4rows|tune|gdn|decode|tc|attn|flash|strata|mlp|w4a4|w12|pick|dots|blocks|q8runs|rounds|"
-                "round|moe|glu|pass|stack|mma|host_read|stream|graphs|paging|mt\n");
+    std::printf("usage: cuda_bench "
+                "gemm|skinny|fp4|fp4cfgs|fp4rows|tune|gdn|decode|tc|attn|flash|strata|mlp|w4a4|w12|pick|dots|blocks|"
+                "q8runs|rounds|"
+                "round|moe|cold_dot|glu|pass|stack|mma|host_read|stream|graphs|paging|mt\n");
     return 2;
   }
   return 0;

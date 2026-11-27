@@ -238,54 +238,80 @@ float iq_tail_dot(const uint8_t* row, const ColdQ8* x, int cols) {
   return sum;
 }
 
-template <int Type, class B>
-FLYX_AVX2 float iq_dot_avx2(const uint8_t* row, const ColdQ8* x, int cols) {
-  if (cols % 256) return iq_tail_dot<Type>(row, x, cols);
+template <int Type, class B, int M>
+FLYX_AVX2 void iq_dot_avx2_rows(const uint8_t* row, const ColdQ8* const* inputs, int cols, float* result) {
+  if (cols % 256) {
+    for (int r = 0; r < M; ++r) result[r] = iq_tail_dot<Type>(row, inputs[r], cols);
+    return;
+  }
   const float* half = half_scales();
-  __m256 acc = _mm256_setzero_ps();
+  __m256 acc[M]{};
   for (int k = 0; k < cols; k += 256) {
     const B b = block_at<B>(row, size_t(k / 256));
-    for (int g = 0; g < 8; ++g, ++x) {
+    for (int g = 0; g < 8; ++g) {
       const auto w = q8_weights<Type>(b, g, half);
       const auto v = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(w.codes));
-      const auto a = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(x->q));
-      const auto p = _mm256_maddubs_epi16(_mm256_abs_epi8(v), _mm256_sign_epi8(a, v));
-      const auto sum = _mm256_madd_epi16(p, _mm256_set1_epi16(1));
-      const auto scale = _mm256_set_m128(_mm_set1_ps(x->d * w.scale[1]), _mm_set1_ps(x->d * w.scale[0]));
-      acc = _mm256_fmadd_ps(_mm256_cvtepi32_ps(sum), scale, acc);
+      for (int r = 0; r < M; ++r) {
+        const auto* x = inputs[r] + k / 32 + g;
+        const auto a = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(x->q));
+        const auto p = _mm256_maddubs_epi16(_mm256_abs_epi8(v), _mm256_sign_epi8(a, v));
+        const auto sum = _mm256_madd_epi16(p, _mm256_set1_epi16(1));
+        const auto scale = _mm256_set_m128(_mm_set1_ps(x->d * w.scale[1]), _mm_set1_ps(x->d * w.scale[0]));
+        acc[r] = _mm256_fmadd_ps(_mm256_cvtepi32_ps(sum), scale, acc[r]);
+      }
     }
   }
-  alignas(32) float lanes[8];
-  _mm256_store_ps(lanes, acc);
-  float sum = 0;
-  for (float v : lanes) sum += v;
+  for (int r = 0; r < M; ++r) {
+    alignas(32) float lanes[8];
+    _mm256_store_ps(lanes, acc[r]);
+    float sum = 0;
+    for (float v : lanes) sum += v;
+    result[r] = sum;
+  }
+}
+
+template <int Type, class B> FLYX_AVX2 float iq_dot_avx2(const uint8_t* row, const ColdQ8* x, int cols) {
+  float sum;
+  iq_dot_avx2_rows<Type, B, 1>(row, &x, cols, &sum);
   return sum;
 }
 
-template <int Type, class B>
-FLYX_VNNI float iq_dot_vnni(const uint8_t* row, const ColdQ8* x, int cols) {
-  if (cols % 256) return iq_tail_dot<Type>(row, x, cols);
+template <int Type, class B, int M>
+FLYX_VNNI void iq_dot_vnni_rows(const uint8_t* row, const ColdQ8* const* inputs, int cols, float* result) {
+  if (cols % 256) {
+    for (int r = 0; r < M; ++r) result[r] = iq_tail_dot<Type>(row, inputs[r], cols);
+    return;
+  }
   const float* half = half_scales();
-  __m512 acc = _mm512_setzero_ps();
+  __m512 acc[M]{};
   for (int k = 0; k < cols; k += 256) {
     const B b = block_at<B>(row, size_t(k / 256));
-    for (int g = 0; g < 8; g += 2, x += 2) {
+    for (int g = 0; g < 8; g += 2) {
       const auto lo = q8_weights<Type>(b, g, half);
       const auto hi = q8_weights<Type>(b, g + 1, half);
       const auto v = _mm512_set_epi64(hi.codes[3], hi.codes[2], hi.codes[1], hi.codes[0], lo.codes[3], lo.codes[2],
                                       lo.codes[1], lo.codes[0]);
-      const auto a =
-          _mm512_inserti64x4(_mm512_castsi256_si512(_mm256_loadu_si256(reinterpret_cast<const __m256i*>(x->q))),
-                             _mm256_loadu_si256(reinterpret_cast<const __m256i*>(x[1].q)), 1);
-      auto signed_a = _mm512_mask_sub_epi8(a, _mm512_movepi8_mask(v), _mm512_setzero_si512(), a);
-      auto sum = _mm512_dpbusd_epi32(_mm512_setzero_si512(), _mm512_abs_epi8(v), signed_a);
-      const float scales[] = {lo.scale[0] * x->d, lo.scale[1] * x->d, hi.scale[0] * x[1].d, hi.scale[1] * x[1].d};
-      const auto scale = _mm512_permutexvar_ps(_mm512_setr_epi32(0, 0, 0, 0, 1, 1, 1, 1, 2, 2, 2, 2, 3, 3, 3, 3),
-                                               _mm512_castps128_ps512(_mm_loadu_ps(scales)));
-      acc = _mm512_fmadd_ps(_mm512_cvtepi32_ps(sum), scale, acc);
+      for (int r = 0; r < M; ++r) {
+        const auto* x = inputs[r] + k / 32 + g;
+        const auto a =
+            _mm512_inserti64x4(_mm512_castsi256_si512(_mm256_loadu_si256(reinterpret_cast<const __m256i*>(x->q))),
+                               _mm256_loadu_si256(reinterpret_cast<const __m256i*>(x[1].q)), 1);
+        auto signed_a = _mm512_mask_sub_epi8(a, _mm512_movepi8_mask(v), _mm512_setzero_si512(), a);
+        auto sum = _mm512_dpbusd_epi32(_mm512_setzero_si512(), _mm512_abs_epi8(v), signed_a);
+        const float scales[] = {lo.scale[0] * x->d, lo.scale[1] * x->d, hi.scale[0] * x[1].d, hi.scale[1] * x[1].d};
+        const auto scale = _mm512_permutexvar_ps(_mm512_setr_epi32(0, 0, 0, 0, 1, 1, 1, 1, 2, 2, 2, 2, 3, 3, 3, 3),
+                                                 _mm512_castps128_ps512(_mm_loadu_ps(scales)));
+        acc[r] = _mm512_fmadd_ps(_mm512_cvtepi32_ps(sum), scale, acc[r]);
+      }
     }
   }
-  return _mm512_reduce_add_ps(acc);
+  for (int r = 0; r < M; ++r) result[r] = _mm512_reduce_add_ps(acc[r]);
+}
+
+template <int Type, class B> FLYX_VNNI float iq_dot_vnni(const uint8_t* row, const ColdQ8* x, int cols) {
+  float sum;
+  iq_dot_vnni_rows<Type, B, 1>(row, &x, cols, &sum);
+  return sum;
 }
 // The eight codes share a scale. Byte loads use memcpy because GGUF rows need only block alignment.
 FLYX_AVX_INLINE __m256i bytes8(const void* src) {
@@ -332,10 +358,13 @@ FLYX_AVX_INLINE __m256 k_weights(const Block& b, int k, const float* half) {
 }
 
 // Load each GGUF block once, then unpack eight neighboring weights per vector.
-template <int Type, class Block, int Span>
-FLYX_AVX2 float vector_dot(const uint8_t* row, const float* x, int cols) {
-  if (cols % Span) return cold_dot_scalar(Type, row, x, cols);
-  __m256 acc = _mm256_setzero_ps();
+template <int Type, class Block, int Span, int M>
+FLYX_AVX2 void vector_dot_rows(const uint8_t* row, const float* const* inputs, int cols, float* result) {
+  if (cols % Span) {
+    for (int r = 0; r < M; ++r) result[r] = cold_dot_scalar(Type, row, inputs[r], cols);
+    return;
+  }
+  __m256 acc[M]{};
   const __m256i lanes = _mm256_setr_epi32(1, 2, 4, 8, 16, 32, 64, 128);
   const float* half = nullptr;
   if constexpr (Type != FLYX_DT_BF16 && Type != FLYX_DT_GGML_NVFP4 && Type != FLYX_DT_GGML_MXFP4) half = half_scales();
@@ -430,26 +459,37 @@ FLYX_AVX2 float vector_dot(const uint8_t* row, const float* x, int cols) {
         }
         w = _mm256_mul_ps(w, _mm256_set1_ps(scale));
       }
-      acc = _mm256_fmadd_ps(w, _mm256_loadu_ps(x + base + k), acc);
+      for (int r = 0; r < M; ++r) acc[r] = _mm256_fmadd_ps(w, _mm256_loadu_ps(inputs[r] + base + k), acc[r]);
     }
   }
-  alignas(32) float sums[8];
-  _mm256_store_ps(sums, acc);
-  float sum = 0;
-  for (float v : sums) sum += v;
+  for (int r = 0; r < M; ++r) {
+    alignas(32) float sums[8];
+    _mm256_store_ps(sums, acc[r]);
+    float sum = 0;
+    for (float v : sums) sum += v;
+    result[r] = sum;
+  }
+}
+
+template <int Type, class Block, int Span> FLYX_AVX2 float vector_dot(const uint8_t* row, const float* x, int cols) {
+  float sum;
+  vector_dot_rows<Type, Block, Span, 1>(row, &x, cols, &sum);
   return sum;
 }
 // Sixteen adjacent FP4 weights share the activation load and fit the register lookup table.
-template <int Type, class B, int Span>
-FLYX_AVX512 float vector_dot_512(const uint8_t* row, const float* x, int cols) {
-  if (cols % Span) return cold_dot_scalar(Type, row, x, cols);
+template <int Type, class B, int Span, int M>
+FLYX_AVX512 void vector_dot_512_rows(const uint8_t* row, const float* const* inputs, int cols, float* result) {
+  if (cols % Span) {
+    for (int r = 0; r < M; ++r) result[r] = cold_dot_scalar(Type, row, inputs[r], cols);
+    return;
+  }
   __m512 lookup;
   if constexpr (Type == FLYX_DT_GGML_IQ4_NL)
     lookup = _mm512_cvtepi32_ps(_mm512_cvtepi8_epi32(_mm_loadu_si128(reinterpret_cast<const __m128i*>(kvalues_iq4nl))));
   else
     lookup = _mm512_loadu_ps(kFp4Codes.data());
   const float* half = half_scales();
-  __m512 acc = _mm512_setzero_ps();
+  __m512 acc[M]{};
   for (int k = 0; k < cols; k += Span) {
     const B b = block_at<B>(row, size_t(k / Span));
     for (int j = 0; j < Span; j += 16) {
@@ -480,10 +520,48 @@ FLYX_AVX512 float vector_dot_512(const uint8_t* row, const float* x, int cols) {
         weights = _mm512_permutexvar_ps(codes, lookup);
         if constexpr (Type == FLYX_DT_GGML_MXFP4) weights = _mm512_add_ps(weights, weights);
       }
-      acc = _mm512_fmadd_ps(_mm512_mul_ps(weights, _mm512_set1_ps(scale)), _mm512_loadu_ps(x + k + j), acc);
+      for (int r = 0; r < M; ++r)
+        acc[r] =
+            _mm512_fmadd_ps(_mm512_mul_ps(weights, _mm512_set1_ps(scale)), _mm512_loadu_ps(inputs[r] + k + j), acc[r]);
     }
   }
-  return _mm512_reduce_add_ps(acc);
+  for (int r = 0; r < M; ++r) result[r] = _mm512_reduce_add_ps(acc[r]);
+}
+
+template <int Type, class B, int Span> FLYX_AVX512 float vector_dot_512(const uint8_t* row, const float* x, int cols) {
+  float sum;
+  vector_dot_512_rows<Type, B, Span, 1>(row, &x, cols, &sum);
+  return sum;
+}
+
+template <class Input, auto Two, auto Four, auto Eight>
+void project_shared(const uint8_t* weights, size_t stride, int begin, int end, const ActRows& x, float* out,
+                    size_t ld_out) {
+  const Input* inputs[8];
+  for (int r = 0; r < x.n_rows;) {
+    const int left = x.n_rows - r;
+    const int n = left >= 8 ? 8 : left >= 4 ? 4 : left >= 2 ? 2 : 1;
+    for (int i = 0; i < n; ++i) {
+      const size_t offset = size_t(x.slots[r + i] / x.divisor) * x.cols;
+      if constexpr (std::is_same_v<Input, ColdQ8>)
+        inputs[i] = x.quant + offset / 32;
+      else
+        inputs[i] = x.values + offset;
+    }
+    const auto dot = n == 8 ? Eight : n == 4 ? Four : Two;
+    for (int j = begin; j < end; ++j) {
+      float sums[8];
+      const uint8_t* row = weights + size_t(j) * stride;
+      if (n > 1)
+        dot(row, inputs, x.cols, sums);
+      else if constexpr (std::is_same_v<Input, ColdQ8>)
+        sums[0] = x.quant_dot(row, inputs[0], x.cols);
+      else
+        sums[0] = x.float_dot(row, inputs[0], x.cols);
+      for (int i = 0; i < n; ++i) out[size_t(r + i) * ld_out + j - begin] = x.gain * sums[i];
+    }
+    r += n;
+  }
 }
 }  // namespace
 #endif
@@ -512,13 +590,22 @@ void prepare_cold_q8(const float* input, ColdQ8* out, int cols, CpuIsa limit) {
 }
 void round_cold_q8(float* input, int cols, CpuIsa limit) { round_groups<false>(input, nullptr, input, cols, limit); }
 
-QuantDot cold_q8_kernel(int dtype, CpuIsa max_isa) {
+QuantDot cold_q8_kernel(int dtype, CpuIsa max_isa, ExpertKernel* shared) {
 #ifdef FLYX_AVX2
   static const bool avx2 = has_avx2(), vnni = has_vnni();
   if (avx2 && max_isa >= CpuIsa::avx2) {
-#define FLYX_IQ_DOT(T, B) \
-  case T:                 \
-    return vnni && max_isa >= CpuIsa::avx512 ? iq_dot_vnni<T, B> : iq_dot_avx2<T, B>
+#define FLYX_IQ_DOT(T, B)                                                                                              \
+  case T:                                                                                                              \
+    if (vnni && max_isa >= CpuIsa::avx512) {                                                                           \
+      if (shared)                                                                                                      \
+        *shared =                                                                                                      \
+            project_shared<ColdQ8, iq_dot_vnni_rows<T, B, 2>, iq_dot_vnni_rows<T, B, 4>, iq_dot_vnni_rows<T, B, 8>>;   \
+      return iq_dot_vnni<T, B>;                                                                                        \
+    }                                                                                                                  \
+    if (shared)                                                                                                        \
+      *shared =                                                                                                        \
+          project_shared<ColdQ8, iq_dot_avx2_rows<T, B, 2>, iq_dot_avx2_rows<T, B, 4>, iq_dot_avx2_rows<T, B, 8>>;     \
+    return iq_dot_avx2<T, B>
     switch (dtype) {
       FLYX_IQ_DOT(FLYX_DT_GGML_IQ1_S, block_iq1_s);
       FLYX_IQ_DOT(FLYX_DT_GGML_IQ2_XXS, block_iq2_xxs);
@@ -532,26 +619,33 @@ QuantDot cold_q8_kernel(int dtype, CpuIsa max_isa) {
   return nullptr;
 }
 
-FloatDot cold_float_kernel(int dtype, int cols, CpuIsa max_isa) {
+FloatDot cold_float_kernel(int dtype, int cols, CpuIsa max_isa, ExpertKernel* shared) {
 #ifdef FLYX_AVX2
   static const bool simd = has_avx2();
   static const bool wide = has_avx512();
+#define FLYX_SHARED(DOT, T, B, N)                                                                                      \
+  project_shared<float, DOT##_rows<T, B, N, 2>, DOT##_rows<T, B, N, 4>, DOT##_rows<T, B, N, 8>>
   if (wide && max_isa >= CpuIsa::avx512 && cols % 64 == 0) {
     switch (dtype) {
       case FLYX_DT_GGML_NVFP4:
+        if (shared) *shared = FLYX_SHARED(vector_dot_512, FLYX_DT_GGML_NVFP4, block_nvfp4, 64);
         return vector_dot_512<FLYX_DT_GGML_NVFP4, block_nvfp4, 64>;
       case FLYX_DT_GGML_Q2_0:
+        if (shared) *shared = FLYX_SHARED(vector_dot_512, FLYX_DT_GGML_Q2_0, block_q2_0, 64);
         return vector_dot_512<FLYX_DT_GGML_Q2_0, block_q2_0, 64>;
       case FLYX_DT_GGML_MXFP4:
+        if (shared) *shared = FLYX_SHARED(vector_dot_512, FLYX_DT_GGML_MXFP4, block_mxfp4, 32);
         return vector_dot_512<FLYX_DT_GGML_MXFP4, block_mxfp4, 32>;
       case FLYX_DT_GGML_IQ4_NL:
+        if (shared) *shared = FLYX_SHARED(vector_dot_512, FLYX_DT_GGML_IQ4_NL, block_iq4_nl, 32);
         return vector_dot_512<FLYX_DT_GGML_IQ4_NL, block_iq4_nl, 32>;
     }
   }
   if (simd && max_isa >= CpuIsa::avx2 && cols % 8 == 0) {
     switch (dtype) {
-#define FLYX_DOT(T, B, N) \
-  case T:                 \
+#define FLYX_DOT(T, B, N)                                                                                              \
+  case T:                                                                                                              \
+    if (shared) *shared = FLYX_SHARED(vector_dot, T, B, N);                                                            \
     return vector_dot<T, B, N>
       using Bf16Eight = std::array<uint16_t, 8>;
       FLYX_DOT(FLYX_DT_BF16, Bf16Eight, 8);
@@ -571,6 +665,7 @@ FloatDot cold_float_kernel(int dtype, int cols, CpuIsa max_isa) {
       FLYX_DOT(FLYX_DT_GGML_IQ2_XXS, block_iq2_xxs, 256);
       FLYX_DOT(FLYX_DT_GGML_IQ3_XXS, block_iq3_xxs, 256);
 #undef FLYX_DOT
+#undef FLYX_SHARED
     }
   }
 #endif

@@ -139,6 +139,34 @@ int main() {
       if (auto dot = cuda::cold_q8_kernel(dtype, cuda::cpu_isa_limit(isa)))
         test::check(std::fabs(dot(data.data(), quant.data(), cols) - expected_q8) <= 2e-6 * norm_q8,
                     "integer cold dot vs float64 for dtype " + std::to_string(dtype) + " ISA " + std::to_string(isa));
+    for (int bits : {256, 512}) {
+      const auto isa = cuda::cpu_isa_limit(bits);
+      for (bool packed : {false, true}) {
+        cuda::ExpertKernel shared = nullptr;
+        auto qdot = packed ? cuda::cold_q8_kernel(dtype, isa, &shared) : nullptr;
+        auto fdot = cuda::cold_float_kernel(dtype, cols, isa, packed ? nullptr : &shared);
+        if (!shared) continue;
+        std::vector<float> values(8 * cols);
+        std::vector<cuda::ColdQ8> qs(8 * cols / 32);
+        int slots[8] = {7, 0, 5, 2, 1, 6, 3, 4};
+        for (int i = 0; i < 8; ++i) {
+          auto* row = values.data() + i * cols;
+          std::rotate_copy(x.begin(), x.begin() + i, x.end(), row);
+          cuda::prepare_cold_q8(row, qs.data() + i * (cols / 32), cols, isa);
+        }
+        for (int n = 1; n <= 8; ++n) {
+          cuda::ActRows activations{slots, n, 1, cols, dtype, values.data(), qs.data(), 0.5f, fdot, qdot};
+          float result[16]{};
+          shared(data.data(), data.size(), 0, 1, activations, result, 2);
+          for (int r = 0; r < n; ++r) {
+            const float want = packed ? qdot(data.data(), qs.data() + slots[r] * (cols / 32), cols)
+                                      : fdot(data.data(), values.data() + slots[r] * cols, cols);
+            test::check(result[2 * r] == 0.5f * want && result[2 * r + 1] == 0,
+                        "shared expert dot preserves single-row bits");
+          }
+        }
+      }
+    }
     for (int n : {31, 47, 64, 96, 288}) {
       double sum = 0, abs_sum = 0;
       for (int i = 0; i < n; ++i) {

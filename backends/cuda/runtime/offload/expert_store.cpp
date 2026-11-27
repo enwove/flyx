@@ -85,21 +85,25 @@ void project_rows(const uint8_t* weights, size_t stride, int begin, int end, con
 
 void ColdMatrix::resolve(int simd, bool integer) {
   max_isa = cpu_isa_limit(simd);
-  quant_dot = q8 && integer ? cold_q8_kernel(dtype, max_isa) : nullptr;
-  float_dot = cold_float_kernel(dtype, cols, max_isa);
+  shared_kernel = nullptr;
+  quant_dot = q8 && integer ? cold_q8_kernel(dtype, max_isa, &shared_kernel) : nullptr;
+  float_dot = cold_float_kernel(dtype, cols, max_isa, quant_dot ? nullptr : &shared_kernel);
   kernel = quant_dot ? project_rows<true, false> : float_dot ? project_rows<false, false> : project_rows<false, true>;
 }
 void ColdMatrix::project(RowPool& pool, const Groups& groups, bool gate, float beta, float linear_beta,
                          const float* values, const ColdQ8* quant, float* output) const {
   const int width = gate ? rows / 2 : rows;
   constexpr int tile = 32;
-  pool.run(size_t(groups.count) * width, [&](size_t begin, size_t end) {
+  constexpr size_t rows_per_line = 64 / sizeof(float);
+  const size_t lines = (size_t(width) + rows_per_line - 1) / rows_per_line;
+  pool.run(size_mul(size_t(groups.count), lines), [&](size_t begin, size_t end) {
     float lo[ColdShape::chunk * tile], hi[ColdShape::chunk * tile];
     // Each worker owns a contiguous range of projection rows. Bind its activations once per expert.
     while (begin < end) {
-      const size_t group = begin / width;
-      const int j0 = int(begin % width);
-      const int j1 = j0 + int(std::min(end - begin, size_t(width - j0)));
+      const size_t group = begin / lines;
+      const size_t stop_line = std::min(end, (group + 1) * lines);
+      const int j0 = int((begin % lines) * rows_per_line);
+      const int j1 = int(std::min(size_t(width), (stop_line - group * lines) * rows_per_line));
       const int expert = groups.ids[groups.slots[groups.offsets[group]]] - first;
       const auto* w = data.data() + size_t(expert) * rows * stride;
       for (int offset = groups.offsets[group]; offset < groups.offsets[group + 1];) {
@@ -114,13 +118,14 @@ void ColdMatrix::project(RowPool& pool, const Groups& groups, bool gate, float b
                   scales.empty() ? 1.f : scales[expert],
                   float_dot,
                   quant_dot};
+        const auto project_tile = count > 1 && shared_kernel ? shared_kernel : kernel;
         if (!gate && count == 1) {
           kernel(w, stride, j0, j1, x, output + size_t(*x.slots) * width + j0, width);
         } else {
           for (int j = j0; j < j1; j += tile) {
             const int stop = std::min(j + tile, j1);
-            kernel(w, stride, j, stop, x, lo, tile);
-            if (gate) kernel(w, stride, width + j, width + stop, x, hi, tile);
+            project_tile(w, stride, j, stop, x, lo, tile);
+            if (gate) project_tile(w, stride, width + j, width + stop, x, hi, tile);
             for (int r = 0; r < count; ++r) {
               const size_t at = size_t(x.slots[r]) * width + j;
               if (gate) {
@@ -136,7 +141,7 @@ void ColdMatrix::project(RowPool& pool, const Groups& groups, bool gate, float b
         }
         offset += count;
       }
-      begin += j1 - j0;
+      begin = stop_line;
     }
   });
 }

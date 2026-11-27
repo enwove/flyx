@@ -50,12 +50,10 @@ inline CpuIsa cpu_isa_limit(int bits) {
 }
 
 using QuantDot = float (*)(const uint8_t*, const ColdQ8*, int);
-QuantDot cold_q8_kernel(int dtype, CpuIsa max_isa = CpuIsa::avx512);
 void prepare_cold_q8(const float* input, ColdQ8* out, int cols, CpuIsa limit = CpuIsa::avx512);
 void round_cold_q8(float* input, int cols, CpuIsa limit);
 
 using FloatDot = float (*)(const uint8_t*, const float*, int);
-FloatDot cold_float_kernel(int dtype, int cols, CpuIsa limit);
 
 struct ActRows {
   const int* slots;
@@ -69,6 +67,9 @@ struct ActRows {
 using ExpertKernel = void (*)(const uint8_t* weights, size_t stride, int begin, int end, const ActRows& x, float* out,
                               size_t ld_out);
 
+QuantDot cold_q8_kernel(int dtype, CpuIsa max_isa = CpuIsa::avx512, ExpertKernel* shared = nullptr);
+FloatDot cold_float_kernel(int dtype, int cols, CpuIsa limit, ExpertKernel* shared = nullptr);
+
 // Pageable, model-owned copy. The ABI caller may unmap the source immediately after open.
 struct ColdMatrix {
   int first, rows, cols, dtype;
@@ -77,7 +78,7 @@ struct ColdMatrix {
   CpuIsa max_isa = CpuIsa::avx512;
   QuantDot quant_dot = nullptr;
   FloatDot float_dot = nullptr;
-  ExpertKernel kernel = nullptr;
+  ExpertKernel kernel = nullptr, shared_kernel = nullptr;
   void resolve(int simd, bool integer);
   std::vector<uint8_t> data;
   std::vector<float> scales;
