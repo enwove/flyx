@@ -231,7 +231,8 @@ def main(exe, asset, root):
                 "Host": rebind_host,
                 "Origin": f"http://{rebind_host}",
             })[0] == 403
-            assert direct_cl.get_raw("/v1/hub/dir?path=%5C%5Cattacker%5Cshare")[0] == 403
+            expected_unc_status = 403 if os.name == "nt" else 404
+            assert direct_cl.get_raw("/v1/hub/dir?path=%5C%5Cattacker%5Cshare")[0] == expected_unc_status
 
     # Pass options BEFORE the positional model path to verify positional MODEL is accepted anywhere.
     serve(exe, root, no_auth_env, ["--host", "0.0.0.0", "--no-auth", "--models-dir", str(models_dir), asset],
