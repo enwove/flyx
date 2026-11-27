@@ -11,10 +11,14 @@ namespace flyx::plan {
 uint64_t host_keep(uint64_t total_ram) { return std::max<uint64_t>(2ull << 30, total_ram / 16); }
 
 uint64_t device_reserve(uint64_t total_vram, bool gpu_paged) {
-  // Windows pages a process's GPU memory out rather than refuse it, and does so before the GPU is full: a 27B
-  // session filling the budget on a 16 GB card under WSL2 (15.8 of 16.3 GB in use) prefilled 12 times slower, one
-  // with 0.15 GB less ran as fast as ever; large allocations start paging around 560-690 MiB free (kPagedFloor is
-  // 768 MiB). Hold at least 768 MiB + 64 MiB desktop cushion where Windows pages, without stacking on top of base.
+  // Windows pages a process's GPU memory out rather than refuse it, and does so before the GPU is full, the earlier
+  // the larger the allocation (backends/cuda/runtime/device_stats.cpp): a 27B session filling the budget on a 16 GB
+  // card under WSL2 (15.8 of 16.3 GB in use) prefilled 12 times slower, one with 0.15 GB less ran as fast as ever;
+  // allocations of 256 MiB to 1 GiB start paging around 420-690 MiB free.  Under WSL2 (gpu_paged) the backend sees
+  // none of it: hold at least 768 MiB + a 64 MiB desktop cushion there, without stacking on top of base.  Natively the
+  // CUDA backend refuses an allocation past Windows' floor for its size, and makes what it allocates once the weights
+  // are in (a session's arena and K/V, the prefill and staging pools) of pieces of 8 MiB at most, which stay on the
+  // GPU to 120-140 MiB free: base keeps 250 MiB past that, as the 832 MiB did past the large allocations' floor.
   const uint64_t base = std::max<uint64_t>(384ull << 20, total_vram / 40);
   constexpr uint64_t kPagedReserve = (768ull + 64ull) << 20;
   return gpu_paged ? std::max(base, kPagedReserve) : base;

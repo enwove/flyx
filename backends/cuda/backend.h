@@ -50,8 +50,9 @@ void ck(cudaError_t e, const char* what);
 // GPU has free.  Windows' driver lets an allocation past the free memory succeed in host memory, read over the bus
 // every round (Qwen3.5-4B NVFP4 beside other programs holding 4.7 of 8 GB: 12.5 tok/s plain against 132.4); this
 // throws OutOfDeviceMemory instead (and so does a refusal by the driver).  device_room: the same check alone, for
-// memory the driver maps (a VMM slab), throwing where device_malloc would.
-void device_room(size_t bytes);
+// memory the driver maps (a VMM slab), throwing where device_malloc would; `floor` what it keeps free (kPagedFloor
+// for one allocation of `bytes`, kPiecesFloor for memory made of pieces of kPieceBytes at most).
+void device_room(size_t bytes, size_t floor);
 void* device_malloc(size_t bytes);
 // Records m for last_error(); returns -1 (or FLYX_ERR_OOM for device memory exhaustion).
 int fail(const std::string& m);
@@ -182,6 +183,16 @@ int device_stats(flyx_device_stats* out);
 // memory (nvidia-smi's): cudaMemGetInfo's there is the video memory manager's budget for the process, 0.65 GB or more
 // below it once 5 of 8 GB are held, and 0 while 0.65 GB are free (device_stats.cpp).  false: no figure.
 bool gpu_memory(size_t* free, size_t* total);
+// NVML's figures of the device's memory, as gpu_memory reads them on Windows (v2: nvmlDeviceGetMemoryInfo_v2, with
+// what the driver reserves of the device; v1: nvmlDeviceGetMemoryInfo), and what gpu_memory makes of them from
+// cudaMemGetInfo's *free and *total: NVML's free memory, and with v2 the total programs share, NVML's total less the
+// reserved memory, which is in neither the used memory nvidia-smi shows nor the free and which no program can
+// allocate.  Figures that do not add up leave cudaMemGetInfo's.
+struct NvmlFigures {
+  bool v1 = false, v2 = false;
+  uint64_t total = 0, reserved = 0, free = 0;
+};
+void memory_of(const NvmlFigures& n, size_t* free, size_t* total);
 // What this process holds of that device as the system counts it (flyx_memory_info.process): the models, their
 // sequences, and the CUDA context with its kernels' modules.  0 where the system does not tell a process's share.
 size_t gpu_process_memory();
@@ -189,9 +200,14 @@ size_t gpu_process_memory();
 uint64_t host_pinned_budget();
 // CUDA VMM allocation granularity (typically 2 MiB; fallback 2 MiB if VMM is unavailable).
 size_t vmm_granularity();
-// Windows: device memory device_malloc keeps free.  Past what its video memory manager keeps free (250 MiB for 32 MiB
-// allocations, up to 560 MiB for 256 MiB to 1 GiB ones: device_stats.cpp), allocations land in host memory.
+// Windows: device memory device_malloc keeps free.  Past what its video memory manager keeps free, which grows with
+// the allocation's size (device_stats.cpp: 70 MiB for pieces of 2 MiB, 130 for 8 MiB, 250 for 32 MiB, up to 630 MiB for
+// 256 MiB to 1 GiB), allocations land in host memory.  kPagedFloor for one allocation of any size; kPiecesFloor for
+// memory mapped from pieces of kPieceBytes at most (device_pieces: a session's arena, the K/V's device parts, the
+// prefill and staging pools), which the driver places as it does allocations that small.
 constexpr size_t kPagedFloor = 768ull << 20;
+constexpr size_t kPieceBytes = 8ull << 20;
+constexpr size_t kPiecesFloor = 256ull << 20;
 std::string describe(const BackendOptions& o);
 
 // ---- weights ---------------------------------------------------------------------------------
@@ -434,6 +450,33 @@ struct VmmSlab {
 void* prefill_vmm_alloc(flyx_bmodel* m, size_t bytes, size_t* actual_bytes);
 void prefill_vmm_free(flyx_bmodel* m);
 
+// Device memory as one address range mapped from pieces of kPieceBytes (the last one shorter), so Windows places it
+// as it does allocations that small (kPiecesFloor); freed with the object.  alias: one piece of the granularity
+// mapped at every offset, for a sequence that is only captured, never run (graphs.cpp count_round_graphs).
+struct DevicePieces {
+  unsigned long long va = 0;
+  size_t bytes = 0;   // the range's, a multiple of the granularity
+  size_t mapped = 0;  // of it mapped so far (what release unmaps)
+  std::vector<unsigned long long> handles;
+  bool alias = false;
+  DevicePieces() = default;
+  DevicePieces(const DevicePieces&) = delete;
+  DevicePieces& operator=(const DevicePieces&) = delete;
+  ~DevicePieces() { release(); }
+  void release();  // runtime/tiers.cpp
+};
+// `bytes` of device memory in pieces (not zeroed), *out holding them; null where the driver maps no memory (VMM) or
+// takes none of its operations, for the caller's device_malloc.  Throws OutOfDeviceMemory where they do not fit
+// (device_room, pieces_floor) or the driver refuses a piece.  device_alias: the same range over one piece of physical
+// memory.
+void* device_pieces(size_t bytes, DevicePieces* out);
+void* device_alias(size_t bytes, DevicePieces* out);
+// Whether the device maps memory in pieces (VMM: its capability and the driver's functions), and the floor
+// device_room keeps below memory made of them: kPiecesFloor for pieces of kPieceBytes at most, kPagedFloor where the
+// granularity is larger or there is no VMM (one allocation instead).
+bool vmm_supported();
+size_t pieces_floor();
+
 }  // namespace flyx::cuda
 
 struct flyx_bmodel {
@@ -624,6 +667,7 @@ struct flyx_seq {
   flyx::cuda::SideStream expert_side{};
   cudaEvent_t expert_read = nullptr;  // last read of mutable residuals, before the immutable weight prefetch
   std::vector<void*> allocs;
+  flyx::cuda::DevicePieces arena_pieces;  // the device arena (dev_arena), where the driver maps memory
 
   flyx::cuda::DevParams* P = nullptr;
   flyx::cuda::DevParams* params_host = nullptr;    // pinned staging for set_params
@@ -852,6 +896,9 @@ struct flyx_seq {
   }
   // dry: count the bytes the allocations would take, allocate nothing (seq_bytes).
   bool dry = false;
+  // capture_only: a sequence whose rounds are captured, never run (graphs.cpp count_round_graphs): its device arena
+  // one piece of physical memory under all its addresses (device_alias), not zeroed.
+  bool capture_only = false;
   size_t dry_bytes = 0, dry_host_bytes = 0;
   size_t dry_mapped_bytes = 0;  // of dry_host_bytes: the K/V's host parts, mapped for the device only (tiered_alloc)
   // Per-session slab arenas: sized in a dry pass so seq_new() does 1 cudaMalloc + 1 cudaHostAlloc instead of
@@ -885,7 +932,9 @@ struct flyx_seq {
   struct Mapped {
     unsigned long long va = 0, view = 0;
     size_t dev = 0, bytes = 0, va_bytes = 0, stage = 0;  // stage: the view's bytes past dev, its staging's
-    unsigned long long handles[2] = {0, 0};              // device part, host/ring part
+    std::vector<unsigned long long> dev_handles;         // the device part in pieces (tiers.cpp), at va and at view
+    std::vector<unsigned long long> ring_handles;        // a pageable cache's device tail ring, in pieces, past it
+    unsigned long long rest = 0;                         // the host part's handle
     int slot = -1;                                       // the staging the view maps past its device part
   };
   // A staging's size. 0: as large as a cache's host part. Else, with strata attention (FLYX_KV_STRATA
@@ -1221,6 +1270,9 @@ int seq_new(flyx_bmodel* m, int32_t max_ctx, flyx_seq** out);
 void seq_free(flyx_seq* s);
 int seq_bytes(flyx_bmodel* m, int32_t max_ctx, uint64_t* out);
 int seq_new_in(flyx_bmodel* m, const flyx_seq_layout* layout, flyx_seq** out);
+// A sequence of max_ctx tokens, every position on the device, whose rounds are only captured, never run
+// (flyx_seq::capture_only): its device arena takes one piece of physical memory where the driver maps memory.
+int seq_new_capture(flyx_bmodel* m, int32_t max_ctx, flyx_seq** out);
 int seq_size(flyx_bmodel* m, const flyx_seq_layout* layout, flyx_seq_size* out);
 int memory(flyx_bmodel* m, flyx_memory_info* out);
 void alloc_batch(flyx_bmodel* m);  // the batch rounds' buffers, at open
