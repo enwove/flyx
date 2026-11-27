@@ -1,11 +1,15 @@
 // Copyright 2026 The flyx Authors. SPDX-License-Identifier: Apache-2.0
 // Unit tests for flyx-server HTTP security guards: DNS rebinding Host validation, proxy forwarding isolation,
 // keyless LAN management scoping, local-or-keyed restriction (POST /v1/hub/config), and Windows UNC/device path guards.
+#include <algorithm>
+#include <filesystem>
 #include <string>
 #include <vector>
 
 #include "apps/flyx-server/http_util.h"
 #include "apps/flyx-server/server.h"
+#include "core/hub/hub.h"
+#include "core/os/path.h"
 #include "tests/common/check.h"
 
 namespace {
@@ -313,6 +317,98 @@ void test_remote_unc_and_device_paths() {
     check(remote_path_allowed(s, lan, ok_path, /*windows_paths=*/true, &probe),
           std::string("remote LAN allows non-UNC local path: ") + ok_path);
   }
+
+  // remote_path_policy returns empty for loopback or POSIX mode, and captures models_dirs + probe by value for remote Windows.
+  check(!remote_path_policy(s, loop, /*windows_paths=*/true, &probe),
+        "remote_path_policy returns empty predicate for direct loopback");
+  check(!remote_path_policy(s, lan, /*windows_paths=*/false, &probe),
+        "remote_path_policy returns empty predicate in POSIX mode");
+
+  flyx::PathAllowFn detached_policy;
+  {
+    Server tmp_s{};
+    tmp_s.listener.lan = true;
+    tmp_s.listener.port = 8080;
+    tmp_s.models_dirs = {R"(\\nas\models)"};
+    auto tmp_req = make_req("192.168.1.99", "192.168.1.50", 8080, "192.168.1.50:8080");
+    PathSafetyProbe tmp_probe;
+    tmp_probe.is_remote_drive = [](char d) { return d == 'Y' || d == 'y'; };
+    tmp_probe.reparse_info = [](std::string_view p) -> ReparseResult {
+      std::string s(p);
+      std::replace(s.begin(), s.end(), '\\', '/');
+      if (s == "C:/cache/models--acme--ok/snapshots/1111111111111111111111111111111111111111/ok.gguf")
+        return {ReparseState::kTarget, R"(..\..\blobs\abc)"};
+      if (s == "C:/cache/models--acme--ok/snapshots/1111111111111111111111111111111111111111/evil.gguf")
+        return {ReparseState::kTarget, R"(\\attacker\share\evil.gguf)"};
+      return {ReparseState::kNone, ""};
+    };
+    detached_policy = remote_path_policy(tmp_s, tmp_req, /*windows_paths=*/true, &tmp_probe);
+  }
+  check(bool(detached_policy), "remote_path_policy returns active predicate for remote Windows caller");
+  check(detached_policy(R"(\\nas\models\sub\ok.gguf)"),
+        "detached remote_path_policy still allows configured UNC models_dirs after Server/Request destroy");
+  check(!detached_policy(R"(Y:\secret\a.gguf)"),
+        "detached remote_path_policy still blocks unconfigured remote drive after Server/Request destroy");
+
+  // Combine detached remote_path_policy with hub::cached: normal local blob symlink is allowed, UNC symlink is skipped
+  // with zero target-following filesystem calls.
+  auto norm = [](const std::filesystem::path& p) {
+    std::string s = flyx::os::from_path(p);
+    std::replace(s.begin(), s.end(), '\\', '/');
+    return s;
+  };
+  const std::string cache_root = "C:/cache";
+  const std::string repo_dir = "C:/cache/models--acme--ok";
+  const std::string snaps_dir = "C:/cache/models--acme--ok/snapshots";
+  const std::string commit = "1111111111111111111111111111111111111111";
+  const std::string snap_dir = snaps_dir + "/" + commit;
+  const std::string ok_file = snap_dir + "/ok.gguf";
+  std::vector<std::string> touched_evil;
+  auto track_evil = [&](const std::filesystem::path& p, const char* op) {
+    const std::string s_path = norm(p);
+    if (s_path.find("evil.gguf") != std::string::npos) touched_evil.push_back(std::string(op) + ":" + s_path);
+  };
+  flyx::hub::CacheFs fake_cache;
+  fake_cache.root_override = cache_root;
+  fake_cache.is_directory = [&](const std::filesystem::path& p, std::error_code&) {
+    track_evil(p, "is_directory");
+    const std::string sp = norm(p);
+    return sp == cache_root || sp == repo_dir || sp == snaps_dir || sp == snap_dir;
+  };
+  fake_cache.is_regular_file = [&](const std::filesystem::path& p, std::error_code&) {
+    track_evil(p, "is_regular_file");
+    return norm(p) == ok_file;
+  };
+  fake_cache.file_size = [&](const std::filesystem::path& p, std::error_code&) -> uint64_t {
+    track_evil(p, "file_size");
+    return 2048;
+  };
+  fake_cache.last_write_time = [&](const std::filesystem::path& p, std::error_code&) {
+    track_evil(p, "last_write_time");
+    return std::filesystem::file_time_type::clock::now();
+  };
+  fake_cache.for_each_dir_entry = [&](const std::filesystem::path& p,
+                                      const std::function<bool(const std::filesystem::path&)>& visit,
+                                      std::error_code&) {
+    track_evil(p, "for_each_dir_entry");
+    const std::string sp = norm(p);
+    std::vector<std::filesystem::path> entries;
+    if (sp == cache_root) entries = {p / "models--acme--ok"};
+    else if (sp == snaps_dir) entries = {p / commit};
+    else if (sp == snap_dir) entries = {p / "evil.gguf", p / "ok.gguf"};
+    for (const auto& e : entries)
+      if (!visit(e)) break;
+  };
+  fake_cache.read_text = [&](const std::filesystem::path& p) -> std::string {
+    track_evil(p, "read_text");
+    if (norm(p) == repo_dir + "/refs/main") return commit;
+    return {};
+  };
+  const auto cached = flyx::hub::cached(detached_policy, &fake_cache);
+  check(touched_evil.empty(),
+        "hub::cached + remote_path_policy never performs target-following ops on UNC symlink entry");
+  check(cached.size() == 1 && cached[0].files.size() == 1 && cached[0].files[0].path == "ok.gguf",
+        "hub::cached + remote_path_policy keeps local relative blob symlink while skipping UNC symlink");
 }
 
 }  // namespace

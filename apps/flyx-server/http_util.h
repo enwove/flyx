@@ -87,6 +87,10 @@ bool is_unc_or_device_path(std::string_view path, bool windows_paths = kDefaultW
 // target points to a UNC/device path or remote drive, unless lexically under an operator-configured --models-dir.
 bool remote_path_allowed(const Server& s, const httplib::Request& req, std::string_view path,
                          bool windows_paths = kDefaultWindowsPaths, const PathSafetyProbe* probe = nullptr);
+// Returns a lifetime-independent path predicate for async/deep filesystem operations (Hub cache reads, split shards,
+// LoRA/drafter dir files, companion scans). Returns an empty predicate when loopback or !windows_paths.
+PathAllowFn remote_path_policy(const Server& s, const httplib::Request& req,
+                               bool windows_paths = kDefaultWindowsPaths, const PathSafetyProbe* probe = nullptr);
 // Guard handler helper: returns true if remote_path_allowed; otherwise answers 403 and returns false.
 bool require_local_path(const Server& s, const httplib::Request& req, httplib::Response& res, std::string_view path);
 // Reject browser CSRF (all keyless requests) and loopback DNS rebinding when no --api-key guards the server.

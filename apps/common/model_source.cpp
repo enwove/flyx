@@ -44,7 +44,8 @@ std::string lower(std::string s) {
 }
 
 // The bytes of a file, or of a drafter's directory (its own files, not those below it).
-uint64_t bytes_on_disk(const std::string& path) {
+uint64_t bytes_on_disk(const std::string& path, const PathAllowFn& allow_path = {}) {
+  if (allow_path && !allow_path(path)) return 0;
   std::error_code ec;
   const fs::path p = to_path(path);
   if (!fs::is_directory(p, ec)) {
@@ -53,6 +54,7 @@ uint64_t bytes_on_disk(const std::string& path) {
   }
   uint64_t n = 0;
   for (fs::directory_iterator it(p, ec), end; !ec && it != end; it.increment(ec)) {
+    if (allow_path && !allow_path(from_path(it->path()))) continue;
     std::error_code e2;
     if (!it->is_regular_file(e2) || e2) continue;
     const auto sz = it->file_size(e2);
@@ -62,15 +64,17 @@ uint64_t bytes_on_disk(const std::string& path) {
 }
 
 // The cache key describes the same shard gguf_peek actually reads.
-flyx::GgufPeek gguf_peek_cached(const std::string& requested, uint64_t size, fs::file_time_type modified) {
+flyx::GgufPeek gguf_peek_cached(const std::string& requested, uint64_t size, fs::file_time_type modified,
+                                const PathAllowFn& allow_path = {}) {
   const std::string path = flyx::gguf_header_path(requested);
+  if (allow_path && !allow_path(path)) return {};
   if (path != requested || modified == fs::file_time_type::min()) {
     std::error_code ec;
     const fs::path p = to_path(path);
     size = fs::file_size(p, ec);
-    if (ec) return flyx::gguf_peek(path);
+    if (ec) return flyx::gguf_peek(path, allow_path);
     modified = fs::last_write_time(p, ec);
-    if (ec) return flyx::gguf_peek(path);
+    if (ec) return flyx::gguf_peek(path, allow_path);
   }
   constexpr size_t kMaxCachedEntries = 2048;
   static std::mutex mu;
@@ -81,7 +85,7 @@ flyx::GgufPeek gguf_peek_cached(const std::string& requested, uint64_t size, fs:
     if (it != cache.end() && std::get<0>(it->second) == size && std::get<1>(it->second) == modified)
       return std::get<2>(it->second);
   }
-  const flyx::GgufPeek peek = flyx::gguf_peek(path);
+  const flyx::GgufPeek peek = flyx::gguf_peek(path, allow_path);
   std::lock_guard<std::mutex> lock(mu);
   if (cache.size() >= kMaxCachedEntries && cache.find(path) == cache.end()) cache.clear();
   cache[path] = {size, modified, peek};
@@ -114,15 +118,15 @@ GgufClassification gguf_identity(const flyx::GgufPeek& peek, const std::string& 
 }  // namespace
 
 GgufClassification classify_gguf(const std::string& path, const std::string& rel_name, uint64_t size,
-                                 fs::file_time_type modified) {
+                                 fs::file_time_type modified, const PathAllowFn& allow_path) {
   std::string name = rel_name.empty() ? path : rel_name;
   std::replace(name.begin(), name.end(), '\\', '/');
   const std::string base = lower(name.substr(name.rfind('/') + 1));
   if (!base.ends_with(".gguf") || base.find("imatrix") != std::string::npos) return {};
-  return gguf_identity(gguf_peek_cached(path, size, modified), name);
+  return gguf_identity(gguf_peek_cached(path, size, modified, allow_path), name);
 }
 
-std::vector<HubGguf> hub_ggufs(const hub::Repo& repo) {
+std::vector<HubGguf> hub_ggufs(const hub::Repo& repo, const PathAllowFn& allow_path) {
   const fs::path root = to_path(hub::snapshot_dir(repo));
   auto choices = hub::gguf_choices(repo, /*include_companions=*/true);
   std::map<std::string, int> labels;
@@ -136,15 +140,20 @@ std::vector<HubGguf> hub_ggufs(const hub::Repo& repo) {
     flyx::GgufPeek peek;
     item.cached = g.complete;
     for (const auto& part : g.parts) {
+      const fs::path part_path = (root / to_path(part.path)).make_preferred();
+      if (allow_path && !allow_path(from_path(part_path))) {
+        item.cached = false;
+        continue;
+      }
       std::error_code ec;
-      const auto size = fs::file_size(root / to_path(part.path), ec);
+      const auto size = fs::file_size(part_path, ec);
       if (ec || (part.size && size != part.size)) {
         item.cached = false;
         continue;
       }
       if (g.complete && part.path == path) {
         item.modified = fs::last_write_time(to_path(item.disk), ec);
-        peek = gguf_peek_cached(item.disk, size, item.modified);
+        peek = gguf_peek_cached(item.disk, size, item.modified, allow_path);
       }
     }
     item.cls = gguf_identity(peek, path, repo.info.gguf_architecture);
@@ -181,8 +190,8 @@ const HubGguf* preferred_companion(const std::vector<HubGguf>& ggufs, const std:
   return first;
 }
 
-flyx::GgufPeek gguf_header(const std::string& path) {
-  return gguf_peek_cached(path, 0, fs::file_time_type::min());
+flyx::GgufPeek gguf_header(const std::string& path, const PathAllowFn& allow_path) {
+  return gguf_peek_cached(path, 0, fs::file_time_type::min(), allow_path);
 }
 
 double modified_unix(fs::file_time_type modified) {
@@ -258,36 +267,42 @@ std::string canonical_model_dir(std::string_view raw) {
   return s;
 }
 
-std::vector<LocalModel> scan_model_dirs(const std::vector<std::string>& dirs, int deepest,
-                                        const PathAllowFn& allow_path, const ScanFs* fs_ops) {
-  constexpr int kMostEntries = 200000;     // a directory named by mistake (a whole disk) ends the scan early
-  auto do_is_dir = [&](const fs::path& p, std::error_code& ec) {
-    return fs_ops && fs_ops->is_directory ? fs_ops->is_directory(p, ec) : fs::is_directory(p, ec);
-  };
-  auto do_is_file = [&](const fs::path& p, std::error_code& ec) {
-    return fs_ops && fs_ops->is_regular_file ? fs_ops->is_regular_file(p, ec) : fs::is_regular_file(p, ec);
-  };
-  auto do_file_size = [&](const fs::path& p, std::error_code& ec) -> uint64_t {
-    return fs_ops && fs_ops->file_size ? fs_ops->file_size(p, ec) : uint64_t(fs::file_size(p, ec));
-  };
-  auto do_mtime = [&](const fs::path& p, std::error_code& ec) {
-    return fs_ops && fs_ops->last_write_time ? fs_ops->last_write_time(p, ec) : fs::last_write_time(p, ec);
-  };
-  auto do_canon = [&](const fs::path& p, std::error_code& ec) {
-    return fs_ops && fs_ops->weakly_canonical ? fs_ops->weakly_canonical(p, ec) : fs::weakly_canonical(p, ec);
-  };
-  auto do_list_dir = [&](const fs::path& p, std::error_code& ec) -> std::vector<fs::path> {
-    if (fs_ops && fs_ops->list_dir) return fs_ops->list_dir(p, ec);
-    std::vector<fs::path> children;
-    for (fs::directory_iterator it(p, fs::directory_options::skip_permission_denied, ec), end;
-         !ec && it != end; it.increment(ec)) {
-      children.push_back(it->path());
+namespace {
+
+ScanFs resolve_scan_fs(const ScanFs* fs_ops) {
+  ScanFs ops;
+  ops.is_directory = [](const fs::path& p, std::error_code& ec) { return fs::is_directory(p, ec); };
+  ops.is_regular_file = [](const fs::path& p, std::error_code& ec) { return fs::is_regular_file(p, ec); };
+  ops.file_size = [](const fs::path& p, std::error_code& ec) { return uint64_t(fs::file_size(p, ec)); };
+  ops.last_write_time = [](const fs::path& p, std::error_code& ec) { return fs::last_write_time(p, ec); };
+  ops.weakly_canonical = [](const fs::path& p, std::error_code& ec) { return fs::weakly_canonical(p, ec); };
+  ops.for_each_dir_entry = [](const fs::path& p, const std::function<bool(const fs::path&)>& visit,
+                              std::error_code& ec) {
+    for (fs::directory_iterator it(p, fs::directory_options::skip_permission_denied, ec), end; !ec && it != end;
+         it.increment(ec)) {
+      if (!visit(it->path())) break;
     }
-    return children;
   };
-  auto do_classify = [&](const std::string& p, const std::string& rel, uint64_t sz, fs::file_time_type mt) {
-    return fs_ops && fs_ops->classify_gguf ? fs_ops->classify_gguf(p, rel, sz, mt) : classify_gguf(p, rel, sz, mt);
+  ops.classify_gguf = [](const std::string& p, const std::string& rel, uint64_t sz, fs::file_time_type mt) {
+    return classify_gguf(p, rel, sz, mt);
   };
+  if (!fs_ops) return ops;
+  if (fs_ops->is_directory) ops.is_directory = fs_ops->is_directory;
+  if (fs_ops->is_regular_file) ops.is_regular_file = fs_ops->is_regular_file;
+  if (fs_ops->file_size) ops.file_size = fs_ops->file_size;
+  if (fs_ops->last_write_time) ops.last_write_time = fs_ops->last_write_time;
+  if (fs_ops->weakly_canonical) ops.weakly_canonical = fs_ops->weakly_canonical;
+  if (fs_ops->for_each_dir_entry) ops.for_each_dir_entry = fs_ops->for_each_dir_entry;
+  if (fs_ops->classify_gguf) ops.classify_gguf = fs_ops->classify_gguf;
+  return ops;
+}
+
+}  // namespace
+
+std::vector<LocalModel> scan_model_dirs(const std::vector<std::string>& dirs, int deepest,
+                                        const PathAllowFn& allow_path, const ScanFs* fs_ops, int max_entries) {
+  const ScanFs ops = resolve_scan_fs(fs_ops);
+  const int entry_cap = std::max(0, max_entries);
 
   std::vector<LocalModel> out;
   std::set<fs::path> seen;  // a file reached from two of the directories (one inside the other) once
@@ -307,99 +322,104 @@ std::vector<LocalModel> scan_model_dirs(const std::vector<std::string>& dirs, in
     if (allow_path && !allow_path(root_str)) continue;
     std::error_code ec;
     const fs::path root = to_path(root_str);
-    if (!do_is_dir(root, ec)) continue;
+    if (!ops.is_directory(root, ec)) continue;
     std::map<fs::path, int> visited_depth;
-    const fs::path root_canon = do_canon(root, ec);
+    const fs::path root_canon = ops.weakly_canonical(root, ec);
     if (!ec) visited_depth[root_canon] = -1;
     ec.clear();
     int entries = 0;
     // Breadth-first non-recursive walk so every entry is authorized via allow_path BEFORE any target-following
-    // stat, canonicalization, open, or descent, and shallower paths are visited before deeper symlink aliases.
+    // stat, canonicalization, open, or descent, shallower paths win over deeper symlink aliases, and directory
+    // iteration halts immediately at entry_cap without buffering remaining entries.
     std::deque<std::pair<fs::path, int>> queue;
     queue.emplace_back(root, 0);
-    while (!queue.empty() && entries < kMostEntries) {
+    while (!queue.empty() && entries < entry_cap) {
       auto [cur_dir, cur_depth] = std::move(queue.front());
       queue.pop_front();
       std::error_code list_ec;
-      const std::vector<fs::path> children = do_list_dir(cur_dir, list_ec);
-      if (list_ec) continue;
-      for (const fs::path& child : children) {
-        if (++entries >= kMostEntries) break;
-        const std::string child_str = from_path(child);
-        if (allow_path && !allow_path(child_str)) continue;
-        const std::string name = from_path(child.filename());
-        std::error_code e2;
-        if (do_is_dir(child, e2)) {
-          if (e2 || name.empty() || name[0] == '.' || name[0] == '$' ||
-              name == "node_modules" || name == "System Volume Information" || cur_depth + 1 >= deepest) {
-            continue;
-          }
-          const fs::path dcanon = do_canon(child, e2);
-          if (e2) continue;
-          auto [vit, inserted] = visited_depth.emplace(dcanon, cur_depth);
-          if (!inserted && vit->second <= cur_depth) continue;
-          vit->second = cur_depth;
-          queue.emplace_back(child, cur_depth + 1);
-          continue;
-        }
-        const std::string low = lower(name);
-        const bool gguf = low.ends_with(".gguf"), flyx = low.ends_with(".flyx");
-        if (name == "adapter_config.json") {  // a LoRA adapter as PEFT saves it: listed by its folder
-          const fs::path adir = child.parent_path(), weights = adir / "adapter_model.safetensors";
-          if (allow_path && !allow_path(from_path(weights))) continue;
-          const fs::path canon = do_canon(adir, e2);
-          if (e2 || !do_is_file(weights, e2) || !seen.insert(canon).second) continue;
-          LocalModel m;
-          m.path = from_path(adir);
-          m.root = root_str;
-          m.file = from_path(adir.filename());
-          m.kind = "lora";
-          m.size = do_file_size(weights, e2);
-          if (e2) continue;
-          std::error_code e3;
-          const auto mt = do_mtime(weights, e3);
-          m.modified = e3 ? fs::file_time_type::min() : mt;
-          out.push_back(std::move(m));
-          continue;
-        }
-        if (!gguf && !flyx) continue;
-        std::string rel = from_path(child.lexically_relative(root));
+      ops.for_each_dir_entry(
+          cur_dir,
+          [&](const fs::path& child) -> bool {
+            if (entries >= entry_cap) return false;
+            ++entries;
+            const bool more = entries < entry_cap;
+            const std::string child_str = from_path(child);
+            if (allow_path && !allow_path(child_str)) return more;
+            const std::string name = from_path(child.filename());
+            std::error_code e2;
+            if (ops.is_directory(child, e2)) {
+              if (e2 || name.empty() || name[0] == '.' || name[0] == '$' ||
+                  name == "node_modules" || name == "System Volume Information" || cur_depth + 1 >= deepest) {
+                return more;
+              }
+              const fs::path dcanon = ops.weakly_canonical(child, e2);
+              if (e2) return more;
+              auto [vit, inserted] = visited_depth.emplace(dcanon, cur_depth);
+              if (!inserted && vit->second <= cur_depth) return more;
+              vit->second = cur_depth;
+              queue.emplace_back(child, cur_depth + 1);
+              return more;
+            }
+            const std::string low = lower(name);
+            const bool gguf = low.ends_with(".gguf"), flyx = low.ends_with(".flyx");
+            if (name == "adapter_config.json") {  // a LoRA adapter as PEFT saves it: listed by its folder
+              const fs::path adir = child.parent_path(), weights = adir / "adapter_model.safetensors";
+              if (allow_path && !allow_path(from_path(weights))) return more;
+              const fs::path canon = ops.weakly_canonical(adir, e2);
+              if (e2 || !ops.is_regular_file(weights, e2) || !seen.insert(canon).second) return more;
+              LocalModel m;
+              m.path = from_path(adir);
+              m.root = root_str;
+              m.file = from_path(adir.filename());
+              m.kind = "lora";
+              m.size = ops.file_size(weights, e2);
+              if (e2) return more;
+              std::error_code e3;
+              const auto mt = ops.last_write_time(weights, e3);
+              m.modified = e3 ? fs::file_time_type::min() : mt;
+              out.push_back(std::move(m));
+              return more;
+            }
+            if (!gguf && !flyx) return more;
+            std::string rel = from_path(child.lexically_relative(root));
 #if defined(_WIN32)
-        std::replace(rel.begin(), rel.end(), '\\', '/');
+            std::replace(rel.begin(), rel.end(), '\\', '/');
 #endif
-        if (gguf && low.find("imatrix") != std::string::npos) continue;
-        const fs::path canon = do_canon(child, e2);
-        if (e2 || !do_is_file(child, e2) || e2 || !seen.insert(canon).second) continue;
-        const uint64_t sz = do_file_size(child, e2);
-        if (e2) continue;
-        std::error_code e3;
-        const auto mt = do_mtime(child, e3);
-        const fs::file_time_type modified = e3 ? fs::file_time_type::min() : mt;
-        hub::SplitGguf sp;
-        if (gguf && hub::parse_split_gguf_name(child_str, &sp)) {
-          auto& acc = splits[{sp.prefix, sp.count}];
-          acc.count = sp.count;
-          acc.parts[sp.part] = {child_str, root_str, name, rel, sz, modified};
-          continue;
-        }
-        LocalModel m;
-        m.path = child_str;
-        m.root = root_str;
-        m.file = name;
-        if (gguf) {
-          const GgufClassification cls = do_classify(m.path, rel, sz, modified);
-          if (cls.kind.empty()) continue;
-          m.kind = cls.kind;
-          m.drafter_kind = cls.drafter_kind;
-          m.mtp_layers = cls.mtp_layers;
-        } else {
-          m.kind = "flyx";
-        }
-        m.quant = hub::quant_in_name(name);
-        m.size = sz;
-        m.modified = modified;
-        out.push_back(std::move(m));
-      }
+            if (gguf && low.find("imatrix") != std::string::npos) return more;
+            const fs::path canon = ops.weakly_canonical(child, e2);
+            if (e2 || !ops.is_regular_file(child, e2) || e2 || !seen.insert(canon).second) return more;
+            const uint64_t sz = ops.file_size(child, e2);
+            if (e2) return more;
+            std::error_code e3;
+            const auto mt = ops.last_write_time(child, e3);
+            const fs::file_time_type modified = e3 ? fs::file_time_type::min() : mt;
+            hub::SplitGguf sp;
+            if (gguf && hub::parse_split_gguf_name(child_str, &sp)) {
+              auto& acc = splits[{sp.prefix, sp.count}];
+              acc.count = sp.count;
+              acc.parts[sp.part] = {child_str, root_str, name, rel, sz, modified};
+              return more;
+            }
+            LocalModel m;
+            m.path = child_str;
+            m.root = root_str;
+            m.file = name;
+            if (gguf) {
+              const GgufClassification cls = ops.classify_gguf(m.path, rel, sz, modified);
+              if (cls.kind.empty()) return more;
+              m.kind = cls.kind;
+              m.drafter_kind = cls.drafter_kind;
+              m.mtp_layers = cls.mtp_layers;
+            } else {
+              m.kind = "flyx";
+            }
+            m.quant = hub::quant_in_name(name);
+            m.size = sz;
+            m.modified = modified;
+            out.push_back(std::move(m));
+            return more;
+          },
+          list_ec);
     }
   }
   for (const auto& [_, acc] : splits) {
@@ -418,7 +438,7 @@ std::vector<LocalModel> scan_model_dirs(const std::vector<std::string>& dirs, in
     }
     if (!complete) continue;
     const LocalShard& first = acc.parts.begin()->second;
-    const GgufClassification cls = do_classify(first.path, first.rel, first.size, first.modified);
+    const GgufClassification cls = ops.classify_gguf(first.path, first.rel, first.size, first.modified);
     if (cls.kind.empty()) continue;
     LocalModel m;
     m.path = first.path;
@@ -448,7 +468,9 @@ std::string gigabytes(uint64_t n) {
 // One thing named: a path as it is, else the Hub's files for the name.  A drafter's config and safetensors
 // return its directory; a single or split GGUF returns its (first) model file.
 bool one(const std::string& spec, const hub::ProgressFn& progress, const std::atomic<bool>* stop, std::string* path,
-         hub::Repo* repo, std::string* err) {
+         hub::Repo* repo, std::string* err, const PathAllowFn& allow_path = {}) {
+  if (allow_path && !allow_path(spec))
+    return *err = spec + ": path is not allowed by remote path policy", false;
   if (exists_on_disk(spec)) return *path = spec, true;
   hub::Name name;
   if (!hub::parse_name(spec, &name))
@@ -459,16 +481,23 @@ bool one(const std::string& spec, const hub::ProgressFn& progress, const std::at
       !hub::fetch(*repo, files, &paths, progress, stop, err))
     return false;
   // A drafter's config and safetensors: its directory; else the (first) model file.
-  *path = files[0].path == "config.json" ? hub::snapshot_dir(*repo) : paths[0];
+  const std::string resolved = files[0].path == "config.json" ? hub::snapshot_dir(*repo) : paths[0];
+  if (allow_path) {
+    if (!allow_path(resolved)) return *err = resolved + ": path is not allowed by remote path policy", false;
+    for (const std::string& p : paths)
+      if (!allow_path(p)) return *err = p + ": path is not allowed by remote path policy", false;
+  }
+  *path = resolved;
   return true;
 }
 
 }  // namespace
 
-std::string drafter_kind(const std::string& path) {
-  if (const flyx::GgufPeek p = gguf_header(path); p.valid)
+std::string drafter_kind(const std::string& path, const PathAllowFn& allow_path) {
+  if (allow_path && !allow_path(path)) return "";
+  if (const flyx::GgufPeek p = gguf_header(path, allow_path); p.valid)
     return p.arch == "dflash" ? (p.has_markov_context ? "dspark" : "dflash2") : p.mtp_layers > 0 ? "mtp" : "";
-  return flyx::drafter_source_kind(path);
+  return flyx::drafter_source_kind(path, allow_path);
 }
 
 std::string drafter_kind(const hub::Repo& r) {
@@ -588,15 +617,17 @@ bool wants_dspark(const EngineOptions& eo, const std::vector<std::string>& draft
 
 namespace {
 
-bool is_dspark_file(const std::string& path) {
-  const flyx::GgufPeek h = flyx::gguf_peek(path);
+bool is_dspark_file(const std::string& path, const PathAllowFn& allow_path = {}) {
+  if (allow_path && !allow_path(path)) return false;
+  const flyx::GgufPeek h = flyx::gguf_peek(path, allow_path);
   return h.valid && h.arch == "dflash" && h.has_markov_context;
 }
 
 // The verified drafters for a model (a Hub repository's, and a path's) that it was not given: made for the repository it
 // is, or inferred, for the base models it names (its model card's, its file's).
-void suggest_drafters(const hub::Repo& repo, const std::vector<std::string>& drafters, Fetched* out) {
-  const flyx::ModelOrigin origin = flyx::model_origin(out->model);
+void suggest_drafters(const hub::Repo& repo, const std::vector<std::string>& drafters, Fetched* out,
+                      const PathAllowFn& allow_path = {}) {
+  const flyx::ModelOrigin origin = flyx::model_origin(out->model, allow_path);
   std::vector<std::string> bases = repo.base_models;
   bases.insert(bases.end(), origin.base_models.begin(), origin.base_models.end());
   // A Hub model's load talks to the Hub anyway; a path's reads the cache's copy alone.
@@ -624,7 +655,8 @@ void suggest_drafters(const hub::Repo& repo, const std::vector<std::string>& dra
 
 }  // namespace
 
-std::string dspark_beside(const std::string& model_path) {
+std::string dspark_beside(const std::string& model_path, const PathAllowFn& allow_path) {
+  if (allow_path && !allow_path(model_path)) return "";
   std::error_code ec;
   const fs::path p = to_path(model_path);
   if (lower(from_path(p.extension())) != ".gguf" || !fs::is_regular_file(p, ec)) return "";
@@ -639,13 +671,16 @@ std::string dspark_beside(const std::string& model_path) {
   const std::string want = "dspark-" + lower(name);
   std::vector<std::string> found;
   const fs::path dir = p.has_parent_path() ? p.parent_path() : fs::path(".");
+  if (allow_path && !allow_path(from_path(dir))) return "";
   for (fs::directory_iterator it(dir, ec), end; !ec && it != end; it.increment(ec)) {
     const std::string low = lower(from_path(it->path().filename()));
     if (!low.ends_with(".gguf") || !low.starts_with(want) || low.size() <= want.size()) continue;
     if (const char next = low[want.size()]; next != '-' && next != '_' && next != '.') continue;  // another name
+    const std::string cand = from_path(it->path());
+    if (allow_path && !allow_path(cand)) continue;
     std::error_code e2;
-    if (!it->is_regular_file(e2) || e2 || !is_dspark_file(from_path(it->path()))) continue;
-    found.push_back(from_path(it->path()));
+    if (!it->is_regular_file(e2) || e2 || !is_dspark_file(cand, allow_path)) continue;
+    found.push_back(cand);
   }
   std::sort(found.begin(), found.end());
   return found.empty() ? "" : found.front();
@@ -653,57 +688,64 @@ std::string dspark_beside(const std::string& model_path) {
 
 bool fetch_model(const std::string& model, const std::vector<std::string>& drafters, bool want_mtp,
                  const hub::ProgressFn& progress, const std::atomic<bool>* stop, Fetched* out, std::string* err,
-                 const std::string& mmproj, bool want_vision, bool want_dspark, const std::string& lora) {
+                 const std::string& mmproj, bool want_vision, bool want_dspark, const std::string& lora,
+                 const PathAllowFn& allow_path) {
   *out = {};
   hub::Repo repo;
-  if (!one(model, progress, stop, &out->model, &repo, err)) return false;
+  if (!one(model, progress, stop, &out->model, &repo, err, allow_path)) return false;
   out->name = model_name_of(out->model, repo.id.empty());
-  const flyx::GgufPeek own = want_mtp ? gguf_header(out->model) : flyx::GgufPeek{};
+  const flyx::GgufPeek own = want_mtp ? gguf_header(out->model, allow_path) : flyx::GgufPeek{};
   const int own_mtp = own.valid ? own.mtp_layers : -1;  // -1: not a GGUF, or not asked
   if (own_mtp > 0) out->drafter_sources.push_back({"mtp", "model file", std::nullopt});
   for (const std::string& d : drafters) {
     hub::Repo drepo;
     std::string path;
-    if (!one(d, progress, stop, &path, &drepo, err)) return false;
+    if (!one(d, progress, stop, &path, &drepo, err, allow_path)) return false;
     out->drafters.push_back(path);
     out->drafter_sources.push_back(
-        {drepo.id.empty() || !hub::is_drafter(drepo) ? drafter_kind(path) : hub::drafter_kind(drepo),
+        {drepo.id.empty() || !hub::is_drafter(drepo) ? drafter_kind(path, allow_path) : hub::drafter_kind(drepo),
          drepo.id.empty() ? path : d,
-         bytes_on_disk(path)});
+         bytes_on_disk(path, allow_path)});
   }
   if (want_vision && !mmproj.empty()) {
     hub::Repo mrepo;
     std::string mpath;
-    if (!one(mmproj, progress, stop, &mpath, &mrepo, err)) return false;
+    if (!one(mmproj, progress, stop, &mpath, &mrepo, err, allow_path)) return false;
     out->mmproj = mpath;
     out->mmproj_source = mrepo.id.empty() ? mpath : mmproj;
-    out->mmproj_size = bytes_on_disk(mpath);
+    out->mmproj_size = bytes_on_disk(mpath, allow_path);
   }
-  if (!lora.empty() && !fetch_lora(lora, progress, stop, &out->lora, err)) return false;
+  if (!lora.empty() && !fetch_lora(lora, progress, stop, &out->lora, err, allow_path)) return false;
   bool has_dspark = false;  // named: none other is taken
   for (const auto& ds : out->drafter_sources) has_dspark = has_dspark || ds.kind == "dspark";
   if (repo.id.empty()) {  // a path: only a DSpark drafter beside it to know of
     if (want_dspark && !has_dspark)
-      if (const std::string d = dspark_beside(out->model); !d.empty()) {
+      if (const std::string d = dspark_beside(out->model, allow_path); !d.empty()) {
         out->drafters.push_back(d);
-        out->drafter_sources.push_back({"dspark", d, bytes_on_disk(d)});
+        out->drafter_sources.push_back({"dspark", d, bytes_on_disk(d, allow_path)});
         out->notes.push_back("the DSpark drafter beside the model: " + d);
       }
-    suggest_drafters(repo, drafters, out);
+    suggest_drafters(repo, drafters, out, allow_path);
     return true;
   }
   const bool need_mmproj = want_vision && out->mmproj.empty();
   const bool need_mtp = want_mtp && own_mtp == 0 &&
       std::none_of(out->drafter_sources.begin(), out->drafter_sources.end(), [](const auto& ds) { return ds.kind == "mtp"; });
   const bool need_dspark = want_dspark && !has_dspark;
-  const auto ggufs = need_mmproj || need_mtp || need_dspark ? hub_ggufs(repo) : std::vector<HubGguf>{};
+  const auto ggufs = need_mmproj || need_mtp || need_dspark ? hub_ggufs(repo, allow_path) : std::vector<HubGguf>{};
+  auto check_paths = [&](const std::vector<std::string>& paths) -> bool {
+    if (!allow_path) return true;
+    for (const std::string& p : paths)
+      if (!allow_path(p)) return *err = p + ": path is not allowed by remote path policy", false;
+    return true;
+  };
   if (need_mmproj) {
-    const std::string own_arch = classify_gguf(out->model).arch;
+    const std::string own_arch = classify_gguf(out->model, "", 0, fs::file_time_type::min(), allow_path).arch;
     const auto* mm = reads_vision(own_arch.empty() ? repo.info.gguf_architecture : own_arch)
                          ? preferred_companion(ggufs, "mmproj") : nullptr;
     if (mm) {
       std::vector<std::string> paths;
-      if (!hub::fetch(repo, mm->choice.parts, &paths, progress, stop, err)) return false;
+      if (!hub::fetch(repo, mm->choice.parts, &paths, progress, stop, err) || !check_paths(paths)) return false;
       out->mmproj = paths[0];
       out->mmproj_source = repo.id + "/" + mm->choice.file.path;
       out->mmproj_size = mm->choice.total_size;
@@ -714,7 +756,7 @@ bool fetch_model(const std::string& model, const std::vector<std::string>& draft
   const auto* mtp = need_mtp ? preferred_companion(ggufs, "mtp") : nullptr;
   if (mtp) {
     std::vector<std::string> paths;
-    if (!hub::fetch(repo, mtp->choice.parts, &paths, progress, stop, err)) return false;
+    if (!hub::fetch(repo, mtp->choice.parts, &paths, progress, stop, err) || !check_paths(paths)) return false;
     out->drafters.push_back(paths[0]);
     out->drafter_sources.push_back({"mtp", repo.id + "/" + mtp->choice.file.path, mtp->choice.total_size});
     out->notes.push_back("the MTP layer from " + repo.id + "/" + mtp->choice.file.path + " (the model's file has none)");
@@ -723,9 +765,9 @@ bool fetch_model(const std::string& model, const std::vector<std::string>& draft
     if (const auto* ds = preferred_companion(ggufs, "dspark")) {
       const auto& choice = ds->choice;
       std::vector<std::string> paths;
-      if (!hub::fetch(repo, choice.parts, &paths, progress, stop, err)) return false;
+      if (!hub::fetch(repo, choice.parts, &paths, progress, stop, err) || !check_paths(paths)) return false;
       const std::string source = repo.id + "/" + choice.file.path;
-      if (is_dspark_file(paths.front())) {
+      if (is_dspark_file(paths.front(), allow_path)) {
         out->drafters.push_back(paths.front());
         out->drafter_sources.push_back({"dspark", source, choice.total_size});
         out->notes.push_back("the DSpark drafter from " + source);
@@ -740,15 +782,20 @@ bool fetch_model(const std::string& model, const std::vector<std::string>& draft
         }
     }
   }
-  suggest_drafters(repo, drafters, out);
+  suggest_drafters(repo, drafters, out, allow_path);
   return true;
 }
 
 bool fetch_lora(const std::string& spec, const hub::ProgressFn& progress, const std::atomic<bool>* stop,
-                std::string* path, std::string* err) {
+                std::string* path, std::string* err, const PathAllowFn& allow_path) {
+  if (allow_path && !allow_path(spec))
+    return *err = spec + ": path is not allowed by remote path policy", false;
   if (exists_on_disk(spec)) {  // the directory, or a file of it (its adapter_config.json, adapter_model.safetensors)
     std::error_code ec;
-    *path = fs::is_directory(to_path(spec), ec) ? spec : from_path(to_path(spec).parent_path());
+    const std::string resolved = fs::is_directory(to_path(spec), ec) ? spec : from_path(to_path(spec).parent_path());
+    if (allow_path && !allow_path(resolved))
+      return *err = resolved + ": path is not allowed by remote path policy", false;
+    *path = resolved;
     return true;
   }
   hub::Name name;
@@ -756,12 +803,12 @@ bool fetch_lora(const std::string& spec, const hub::ProgressFn& progress, const 
     return *err = spec + ": no such directory, and not a Hugging Face name (org/name, org/name:FOLDER)", false;
   hub::Repo repo;
   if (!hub::describe(name.repo, name.revision, &repo, err)) return false;
-  return fetch_lora_in(repo, spec, name.quant, progress, stop, path, err);
+  return fetch_lora_in(repo, spec, name.quant, progress, stop, path, err, allow_path);
 }
 
 bool fetch_lora_in(const hub::Repo& repo, const std::string& spec, const std::string& folder,
                    const hub::ProgressFn& progress, const std::atomic<bool>* stop, std::string* path,
-                   std::string* err) {
+                   std::string* err, const PathAllowFn& allow_path) {
   // The adapter named: the folder of that path, else the one folder whose last part it is.
   const std::vector<hub::AdapterFolder> all = hub::adapter_folders(repo.id, repo.files);
   auto listing = [&] {
@@ -799,7 +846,13 @@ bool fetch_lora_in(const hub::Repo& repo, const std::string& spec, const std::st
   const std::vector<hub::RepoFile> files = {*found->config, *found->weights};
   std::vector<std::string> paths;
   if (!hub::fetch(repo, files, &paths, progress, stop, err)) return false;
-  *path = from_path(to_path(paths[0]).parent_path());
+  const std::string dir = from_path(to_path(paths[0]).parent_path());
+  if (allow_path) {
+    if (!allow_path(dir)) return *err = dir + ": path is not allowed by remote path policy", false;
+    for (const std::string& p : paths)
+      if (!allow_path(p)) return *err = p + ": path is not allowed by remote path policy", false;
+  }
+  *path = dir;
   return true;
 }
 

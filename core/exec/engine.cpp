@@ -519,45 +519,6 @@ bool Engine::plan_memory(plan::KvTiers* tiers, int session_limit, int* asked_ctx
   if (given_back_)
     log::info("flyx: %s of GPU memory the backend kept only for speed given back so that a session fits (the same "
               "output, a little slower; -v says what)", gb(given_back_).c_str());
-  planned_tiers_ = *tiers;
-  planned_session_limit_ = session_limit;
-  planned_reserve_floor_ = tiers->min_vram_reserve;
-  return true;
-}
-
-bool Engine::replan_for_floor_increase(std::string* err) {
-  std::lock_guard<std::mutex> lock(replan_mu_);
-  if (!api_ || !api_->memory || !bm_ || !model_) return false;
-  flyx_memory_info mi{};
-  if (api_->memory(bm_, &mi) != 0 || mi.reserve_floor <= planned_reserve_floor_) return false;
-  // Replanning updates engine-wide opt_.max_ctx and budget_; only safe while no sessions hold active leases.
-  const uint64_t fixed = budget_.weights.bytes() + budget_.workspace.bytes();
-  if (ledger_.used() > fixed || host_sessions_.load() > 0) return false;
-  device_.reserve_floor = std::max(device_.reserve_floor, mi.reserve_floor);
-  plan::KvTiers tiers = planned_tiers_;
-  tiers.min_vram_reserve = device_.reserve_floor;
-  double bf16 = 0, all = 0;
-  for (int i = 0; i < model_->desc().n_weights; ++i) {
-    const flyx_tensor_view* t = model_->desc().weights[i].t;
-    if (!t || t->ndim != 2) continue;
-    const double n = double(t->shape[0]) * double(t->shape[1]);
-    all += n;
-    if (t->dtype == FLYX_DT_BF16) bf16 += n;
-  }
-  const int min_ctx = opt_.ctx_max ? 1024 : opt_.ctx_given ? 0 : kMinFittedCtx;
-  int ctx = opt_.max_ctx;
-  std::string plan_err;
-  if (!plan::account(api_, bm_, model_->drafters() > 0, 2 * bf16 > all, &ctx, min_ctx, tiers, &ledger_, &budget_,
-                     &plan_err, opt_.ctx_max)) {
-    if (err) *err = plan_err;
-    return false;
-  }
-  opt_.max_ctx = ctx;
-  if (planned_session_limit_ > 1) plan::fit_second_session(api_, bm_, tiers, ledger_, &budget_);
-  planned_tiers_ = tiers;
-  planned_reserve_floor_ = tiers.min_vram_reserve;
-  log::info("flyx: backend reserve floor rose to %s; replanned context to %d tokens",
-            gb(planned_reserve_floor_).c_str(), opt_.max_ctx);
   return true;
 }
 
@@ -628,19 +589,19 @@ bool Engine::load(const std::string& path, const EngineOptions& opt, std::string
   if (!set_kv_method(opt_, &tiers, err)) return false;
   // The load's steps, for its report (verbose): file, tokenizer and chat, backend, model, open, plans, rounds, memory.
   double t[7] = {os::now_ms()};
-  if (!file_.open(path, err)) return false;
+  if (!file_.open(path, err, opt_.allow_path)) return false;
   for (const std::string& f : opt_.drafter_files)
-    if (!file_.add(f, err)) return false;
+    if (!file_.add(f, err, opt_.allow_path)) return false;
   if (!opt_.lora_file.empty()) {
     const int before = file_.companions();
-    if (!file_.add(opt_.lora_file, err)) return false;
+    if (!file_.add(opt_.lora_file, err, opt_.allow_path)) return false;
     if (file_.header()["companions"][size_t(before)].value("kind", "") != "lora")
       return *err = opt_.lora_file + ": not a LoRA adapter (a directory of adapter_config.json and "
                                      "adapter_model.safetensors)",
              false;
   }
   if (opt_.vision && !opt_.mmproj_file.empty())
-    if (!file_.add(opt_.mmproj_file, err)) return false;
+    if (!file_.add(opt_.mmproj_file, err, opt_.allow_path)) return false;
   ReadAhead ahead(file_);  // until the load returns
   t[1] = os::now_ms();
   if (!tok_.load(file_, err)) return false;

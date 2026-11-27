@@ -403,21 +403,28 @@ bool ModelHost::lan_access() { return read_network_settings().lan_access; }
 bool ModelHost::remote_manage() { return read_network_settings().remote_manage; }
 
 namespace {
-ModelHost::NetworkSettingsSnapshot snapshot_of(const ojson& root) {
-  if (!root.is_object()) return {};
-  return {root.contains("lan_access") && root["lan_access"] == true,
-          root.contains("remote_manage") && root["remote_manage"] == true};
+ModelHost::NetworkSettingsSnapshot snapshot_of(const ojson& root,
+                                               const std::function<bool()>& read_live_remote_manage) {
+  ModelHost::NetworkSettingsSnapshot snap;
+  if (root.is_object()) {
+    snap.lan_access = root.contains("lan_access") && root["lan_access"] == true;
+    snap.remote_manage = root.contains("remote_manage") && root["remote_manage"] == true;
+  }
+  snap.live_remote_manage = read_live_remote_manage ? read_live_remote_manage() : snap.remote_manage;
+  return snap;
 }
 }  // namespace
 
-ModelHost::NetworkSettingsSnapshot ModelHost::read_network_settings() {
+ModelHost::NetworkSettingsSnapshot ModelHost::read_network_settings(
+    const std::function<bool()>& read_live_remote_manage) {
   std::lock_guard<std::mutex> lock(settings_mutex());
-  return snapshot_of(read_settings_locked());
+  return snapshot_of(read_settings_locked(), read_live_remote_manage);
 }
 
 bool ModelHost::save_network_settings(std::optional<bool> lan_access, std::optional<bool> remote_manage,
                                       const std::function<void(bool)>& on_remote_manage_committed,
-                                      NetworkSettingsSnapshot* out_snapshot, std::string* err) {
+                                      NetworkSettingsSnapshot* out_snapshot, std::string* err,
+                                      const std::function<bool()>& read_live_remote_manage) {
   if (settings_path().empty()) {
     *err = "no configuration directory available to save network settings";
     return false;
@@ -429,7 +436,7 @@ bool ModelHost::save_network_settings(std::optional<bool> lan_access, std::optio
   if (remote_manage.has_value()) root["remote_manage"] = *remote_manage;
   if (!write_settings_locked(root, err)) return false;
   if (remote_manage.has_value() && on_remote_manage_committed) on_remote_manage_committed(*remote_manage);
-  if (out_snapshot) *out_snapshot = snapshot_of(root);
+  if (out_snapshot) *out_snapshot = snapshot_of(root, read_live_remote_manage);
   return true;
 }
 
@@ -583,7 +590,7 @@ bool ModelHost::work(const Want& w, std::string* err) {
     progress_ = p;
   });
   if (!apps::fetch_model(w.model, w.drafters, apps::wants_mtp(w.eo), logged, &stop_, &f, err, w.eo.mmproj_file,
-                         w.eo.vision, apps::wants_dspark(w.eo, w.drafters), w.eo.lora_file)) {
+                         w.eo.vision, apps::wants_dspark(w.eo, w.drafters), w.eo.lora_file, w.eo.allow_path)) {
     std::fprintf(stderr, "flyx-server: %s: %s\n", w.model.c_str(), err->c_str());
     std::lock_guard<std::mutex> lock(mu_);
     error_ = *err, state_ = served_.sched ? "ready" : "failed";
@@ -616,6 +623,7 @@ bool ModelHost::work(const Want& w, std::string* err) {
     std::lock_guard<std::mutex> lock(mu_);
     served_ = {sched, name}, fetched_ = std::move(f);
     state_ = "ready", last_ = w;
+    last_.eo.allow_path = {};
   }
   save_settings(w);
   return true;

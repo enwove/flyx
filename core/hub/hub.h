@@ -9,8 +9,10 @@
 
 #include <atomic>
 #include <cstdint>
+#include <filesystem>
 #include <functional>
 #include <string>
+#include <string_view>
 #include <vector>
 
 namespace flyx::hub {
@@ -209,7 +211,21 @@ struct Cached {
   std::vector<RepoFile> files;  // sizes only
   std::vector<std::string> architectures;  // its config.json's, when it has one
 };
-std::vector<Cached> cached();
+// Authorization predicate evaluated BEFORE any target-following stat, open, or descent (true if allowed).
+using PathAllowFn = std::function<bool(std::string_view)>;
+// Injectable filesystem operations for deterministic tests verifying hub::cached checks allow_path first.
+struct CacheFs {
+  std::function<bool(const std::filesystem::path&, std::error_code&)> is_directory;
+  std::function<bool(const std::filesystem::path&, std::error_code&)> is_regular_file;
+  std::function<uint64_t(const std::filesystem::path&, std::error_code&)> file_size;
+  std::function<std::filesystem::file_time_type(const std::filesystem::path&, std::error_code&)> last_write_time;
+  std::function<void(const std::filesystem::path&, const std::function<bool(const std::filesystem::path&)>&,
+                     std::error_code&)>
+      for_each_dir_entry;
+  std::function<std::string(const std::filesystem::path&)> read_text;
+  std::string root_override;  // optional cache directory override for deterministic tests
+};
+std::vector<Cached> cached(const PathAllowFn& allow_path = {}, const CacheFs* fs_ops = nullptr);
 
 // Deletes files of a snapshot (paths in the repository): the snapshot's entries, and the blobs behind them that no
 // other entry of the repository's snapshots still refers to, by a link, a hard link or as the blob a copy was made

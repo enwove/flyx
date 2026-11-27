@@ -193,6 +193,7 @@ class Server:
         self.hub_fail = False
         self.files_fail = None
         self.files_asked = []
+        self.dir_asked = []
         self.hub_configs = []
         self.lora_asked = []
         page.route("**/dashboard/**", lambda r: serve(r, ROOT / "apps/flyx-server/dashboard"))
@@ -300,6 +301,7 @@ class Server:
             return route.fulfill(json=res)
         if "/v1/hub/dir" in url:
             path = query.get("path", [""])[0]
+            self.dir_asked.append(path)
             return route.fulfill(json=self.folders[path]) if path in self.folders else route.fulfill(
                 status=404, json={"error": {"message": path + ": no such folder or file on this machine"}})
         route.fulfill(json={})
@@ -1443,11 +1445,24 @@ def check_local_posix(open_page, want):
     page.locator('#lc-list .prow.folder[data-place="dir:' + posix_cache + '"]').click()
     expect(page.locator("#mf-cached")).to_contain_text("Tiny-27B-GGUF")
     expect(page.locator("#mf-cached")).to_contain_text("loose.gguf")
-    # Clicking "All its quantizations" on an older cached revision preserves @oldrev123 and uses its distinct
-    # quantizations and verified drafters instead of main's.
+    # Searching a named drafter repo in Hub, switching to Local, and clicking "All its quantizations" on an older
+    # cached revision clears the stale search query, preserves @oldrev123 across the 350ms search debounce, and uses
+    # its distinct quantizations and verified drafters instead of main's.
+    page.locator('#src-seg [data-src="hub"]').click()
+    page.locator("#hf-q").fill("acme/Model-DFlash2")
+    page.keyboard.press("Enter")
+    expect(page.locator("#hf-name")).to_have_text("Model-DFlash2")
+    page.locator('#src-seg [data-src="local"]').click()
     page.locator('#lc-list .prow.model[data-model="' + REPO + ':Q4_K_M@oldrev123"]').click()
     page.locator("#lc-quants").click()
     expect(page.locator('#src-seg [data-src="hub"]')).to_have_attribute("aria-selected", "true")
+    expect(page.locator("#hf-q")).to_have_value("")
+    expect(page.locator("#hf-name")).to_have_text("Tiny-27B-GGUF")
+    expect(page.locator('#mf-files .mrow[data-name="' + REPO + ':Q2_K@oldrev123"]')).to_have_count(1)
+    expect(page.locator("#hf-drafters")).to_contain_text("acme/OldRev-DFlash2")
+    expect(page.locator("#hf-drafters")).not_to_contain_text("acme/Tiny-27B-DFlash2")
+    page.wait_for_timeout(600)  # survive past the 350ms Hub search debounce without reverting to main or list[0]
+    expect(page.locator("#hf-name")).to_have_text("Tiny-27B-GGUF")
     expect(page.locator('#mf-files .mrow[data-name="' + REPO + ':Q2_K@oldrev123"]')).to_have_count(1)
     expect(page.locator("#hf-drafters")).to_contain_text("acme/OldRev-DFlash2")
     expect(page.locator("#hf-drafters")).not_to_contain_text("acme/Tiny-27B-DFlash2")
@@ -1459,6 +1474,18 @@ def check_local_posix(open_page, want):
     page.locator("#sd-made").click()
     expect(page.locator('[data-verified="acme/OldRev-DFlash2"]')).to_have_count(1)
     page.close()
+
+    # POSIX served model and LoRA with literal backslashes: Serving card LoRA label stays "a\b" and initial Local
+    # directory fetch requests "/models" (never "/models/a").
+    served_bs = dict(want, model="/models/a\\b.gguf", lora="/loras/a\\b")
+    page2, srv2 = open_page(telemetry(served_bs), catalog=posix_catalog, folders=posix_folders)
+    lora_fact = page2.locator("#ld-facts div", has=page2.locator("dt", has_text="LoRA")).locator("dd")
+    expect(lora_fact).to_have_text("a\\b")
+    view(page2, "library")
+    page2.locator('#src-seg [data-src="local"]').click()
+    expect(page2.locator("#lc-list .prow.folder")).to_have_count(5)
+    assert "/models" in srv2.dir_asked and "/models/a" not in srv2.dir_asked, srv2.dir_asked
+    page2.close()
 
 
 def check(browser):

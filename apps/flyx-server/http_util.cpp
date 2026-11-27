@@ -475,11 +475,11 @@ bool normalize_drive_components(std::string_view raw, char* drive_out, std::vect
   return true;
 }
 
-bool under_configured_models_dir(const Server& s, std::string_view raw) {
+bool under_configured_models_dir(const std::vector<std::string>& models_dirs, std::string_view raw) {
   if (is_unc_or_device_path(raw, /*windows_paths=*/true)) {
     std::vector<std::string> target;
     if (!normalize_unc_components(raw, &target)) return false;
-    for (const std::string& root : s.models_dirs) {
+    for (const std::string& root : models_dirs) {
       std::vector<std::string> base;
       if (!normalize_unc_components(root, &base)) continue;
       if (target.size() >= base.size() && std::equal(base.begin(), base.end(), target.begin())) return true;
@@ -489,7 +489,7 @@ bool under_configured_models_dir(const Server& s, std::string_view raw) {
   char drive = 0;
   std::vector<std::string> target;
   if (!normalize_drive_components(raw, &drive, &target)) return false;
-  for (const std::string& root : s.models_dirs) {
+  for (const std::string& root : models_dirs) {
     char base_drive = 0;
     std::vector<std::string> base;
     if (!normalize_drive_components(root, &base_drive, &base) || base_drive != drive) continue;
@@ -659,10 +659,12 @@ bool resolve_windows_reparse_target(std::string_view link_prefix, std::string_vi
   return true;
 }
 
-bool windows_path_safe(const Server& s, std::string_view raw, const PathSafetyProbe* probe, int depth = 0) {
+bool windows_path_safe(const std::vector<std::string>& models_dirs, std::string_view raw, const PathSafetyProbe* probe,
+                       int depth = 0) {
   if (depth > 4) return false;
-  if (is_unc_or_device_path(raw, /*windows_paths=*/true)) return under_configured_models_dir(s, raw);
-  if (has_drive_letter(raw) && probe_is_remote_drive(raw[0], probe)) return under_configured_models_dir(s, raw);
+  if (is_unc_or_device_path(raw, /*windows_paths=*/true)) return under_configured_models_dir(models_dirs, raw);
+  if (has_drive_letter(raw) && probe_is_remote_drive(raw[0], probe))
+    return under_configured_models_dir(models_dirs, raw);
   // Inspect lexical prefixes locally for symlinks/junctions whose target redirects to UNC/device/remote drives.
   size_t pos = has_drive_letter(raw) ? 2 : 0;
   while (pos < raw.size() && is_sep(raw[pos])) ++pos;
@@ -685,12 +687,26 @@ bool windows_path_safe(const Server& s, std::string_view raw, const PathSafetyPr
         if (!full.empty() && !is_sep(full.back())) full.push_back('\\');
         full.append(tail);
       }
-      if (!windows_path_safe(s, full, probe, depth + 1)) return false;
+      if (!windows_path_safe(models_dirs, full, probe, depth + 1)) return false;
     }
     pos = next;
     while (pos < raw.size() && is_sep(raw[pos])) ++pos;
   }
   return true;
+}
+
+bool path_allowed_for_windows(const std::vector<std::string>& models_dirs, std::string_view path,
+                              const PathSafetyProbe* probe) {
+  if (path.empty()) return true;
+  std::string expanded = path[0] == '~' ? apps::expand_user_path(std::string(path)) : std::string(path);
+  if (!probe && !expanded.empty() && !has_drive_letter(expanded) &&
+      !is_unc_or_device_path(expanded, /*windows_paths=*/true)) {
+    std::error_code ec;
+    const auto abs = std::filesystem::absolute(os::to_path(expanded), ec);
+    if (ec) return false;
+    expanded = os::from_path(abs);
+  }
+  return windows_path_safe(models_dirs, expanded, probe);
 }
 
 }  // namespace
@@ -702,15 +718,18 @@ bool is_unc_or_device_path(std::string_view path, bool windows_paths) {
 bool remote_path_allowed(const Server& s, const httplib::Request& req, std::string_view path, bool windows_paths,
                          const PathSafetyProbe* probe) {
   if (path.empty() || from_this_machine(req) || !windows_paths) return true;
-  std::string expanded = path[0] == '~' ? apps::expand_user_path(std::string(path)) : std::string(path);
-  if (!probe && !expanded.empty() && !has_drive_letter(expanded) &&
-      !is_unc_or_device_path(expanded, /*windows_paths=*/true)) {
-    std::error_code ec;
-    const auto abs = std::filesystem::absolute(os::to_path(expanded), ec);
-    if (ec) return false;
-    expanded = os::from_path(abs);
-  }
-  return windows_path_safe(s, expanded, probe);
+  return path_allowed_for_windows(s.models_dirs, path, probe);
+}
+
+PathAllowFn remote_path_policy(const Server& s, const httplib::Request& req, bool windows_paths,
+                               const PathSafetyProbe* probe) {
+  if (from_this_machine(req) || !windows_paths) return {};
+  std::vector<std::string> models_dirs = s.models_dirs;
+  std::optional<PathSafetyProbe> probe_copy;
+  if (probe) probe_copy = *probe;
+  return [dirs = std::move(models_dirs), p = std::move(probe_copy)](std::string_view path) {
+    return path_allowed_for_windows(dirs, path, p ? &*p : nullptr);
+  };
 }
 
 bool require_local_path(const Server& s, const httplib::Request& req, httplib::Response& res, std::string_view path) {

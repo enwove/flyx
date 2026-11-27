@@ -4,6 +4,7 @@
 // name@commit offline, files deleted with their blobs only where no other snapshot reads them); and fetching from a
 // fake Hub on this machine (HF_ENDPOINT): the files in huggingface_hub's cache layout, found again without a request and offline, a fetch cut short going on with the pieces it lacks, a
 // corrupted piece refused by the hash, a storage address that stops working.  Skipped (77) where libcurl is missing.
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <cstdio>
@@ -551,6 +552,97 @@ void cached_drafter_kinds(const fs::path& tmp) {
         "a DFlashDraftModel: DFlash");
 }
 
+void cached_allow_path_guard() {
+  auto norm = [](const fs::path& p) {
+    std::string s = from_path(p);
+    std::replace(s.begin(), s.end(), '\\', '/');
+    return s;
+  };
+  std::vector<std::string> touched_blocked;
+  auto record_if_blocked = [&](const fs::path& p, const char* op) {
+    const std::string s = norm(p);
+    if (s.find("blocked") != std::string::npos || s.find("evil") != std::string::npos)
+      touched_blocked.push_back(std::string(op) + ":" + s);
+  };
+  const std::string root = "/hf_cache";
+  const std::string commit_ok = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+  const std::string commit_blocked = "blocked000000000000000000000000000000000";
+  const std::string repo_ok = root + "/models--acme--good";
+  const std::string snaps_ok = repo_ok + "/snapshots";
+  const std::string snap_ok = snaps_ok + "/" + commit_ok;
+
+  flyx::hub::CacheFs fake_fs;
+  fake_fs.root_override = root;
+  fake_fs.is_directory = [&](const fs::path& p, std::error_code&) {
+    record_if_blocked(p, "is_directory");
+    const std::string s = norm(p);
+    return s == root || s == repo_ok || s == snaps_ok || s == snap_ok || s == snap_ok + "/sub";
+  };
+  fake_fs.is_regular_file = [&](const fs::path& p, std::error_code&) {
+    record_if_blocked(p, "is_regular_file");
+    const std::string s = norm(p);
+    return s == snap_ok + "/good-Q4_K_M.gguf" || s == snap_ok + "/sub/extra.gguf";
+  };
+  fake_fs.file_size = [&](const fs::path& p, std::error_code&) -> uint64_t {
+    record_if_blocked(p, "file_size");
+    return 4096;
+  };
+  fake_fs.last_write_time = [&](const fs::path& p, std::error_code&) {
+    record_if_blocked(p, "last_write_time");
+    return fs::file_time_type::clock::now();
+  };
+  fake_fs.for_each_dir_entry = [&](const fs::path& p, const std::function<bool(const fs::path&)>& visit,
+                                   std::error_code&) {
+    record_if_blocked(p, "for_each_dir_entry");
+    const std::string s = norm(p);
+    std::vector<fs::path> entries;
+    if (s == root) {
+      entries = {p / "models--acme--blocked", p / "models--acme--good"};
+    } else if (s == snaps_ok) {
+      entries = {p / commit_blocked, p / commit_ok};
+    } else if (s == snap_ok) {
+      entries = {p / "evil_link.gguf", p / "evil_dir", p / "good-Q4_K_M.gguf", p / "sub"};
+    } else if (s == snap_ok + "/sub") {
+      entries = {p / "extra.gguf"};
+    }
+    for (const auto& e : entries)
+      if (!visit(e)) break;
+  };
+  fake_fs.read_text = [&](const fs::path& p) -> std::string {
+    record_if_blocked(p, "read_text");
+    const std::string s = norm(p);
+    if (s == repo_ok + "/refs/main") return commit_ok;
+    if (s == snap_ok + "/config.json") return R"({"architectures":["DFlash2DraftModel"]})";
+    return {};
+  };
+
+  auto allow = [](std::string_view p) {
+    return p.find("blocked") == std::string_view::npos && p.find("evil") == std::string_view::npos;
+  };
+  const auto snaps = flyx::hub::cached(allow, &fake_fs);
+  check(touched_blocked.empty(),
+        "hub::cached never invokes target-following fs ops on blocked repos/commits/entries (touched=" +
+            std::to_string(touched_blocked.size()) + ")");
+  check(snaps.size() == 1 && snaps[0].repo == "acme/good" && snaps[0].commit == commit_ok && snaps[0].current &&
+            snaps[0].files.size() == 2 && snaps[0].architectures == std::vector<std::string>{"DFlash2DraftModel"},
+        "hub::cached still enumerates allowed snapshot files and config.json when blocked entries are skipped");
+  // Also verify blocked refs/main and config.json are never read.
+  touched_blocked.clear();
+  std::vector<std::string> reads;
+  fake_fs.read_text = [&](const fs::path& p) -> std::string {
+    reads.push_back(norm(p));
+    return {};
+  };
+  auto deny_meta = [&](std::string_view p) {
+    std::string s(p);
+    std::replace(s.begin(), s.end(), '\\', '/');
+    return allow(p) && s.find("refs/main") == std::string::npos && s.find("config.json") == std::string::npos;
+  };
+  const auto snaps2 = flyx::hub::cached(deny_meta, &fake_fs);
+  check(reads.empty() && snaps2.size() == 1 && !snaps2[0].current && snaps2[0].architectures.empty(),
+        "hub::cached skips reading refs/main and config.json when blocked by allow_path");
+}
+
 // ---- a fake Hub ------------------------------------------------------------------------------------------------
 struct FakeHub {
   const std::string commit = "0123456789abcdef0123456789abcdef01234567";
@@ -914,6 +1006,7 @@ int main(int argc, char** argv) {
   const TestDirectory tmp;
   cache_snapshots(tmp.path / "snapshots");
   cached_drafter_kinds(tmp.path / "kinds");
+  cached_allow_path_guard();
 #if !defined(_WIN32)
   void* curl = dlopen("libcurl.so.4", RTLD_NOW);
   if (!curl) curl = dlopen("libcurl.4.dylib", RTLD_NOW);

@@ -336,12 +336,15 @@ int main() {
         record_if_blocked(p, "weakly_canonical");
         return p;
       };
-      fake_fs.list_dir = [&](const fs::path& p, std::error_code&) -> std::vector<fs::path> {
-        record_if_blocked(p, "list_dir");
+      fake_fs.for_each_dir_entry = [&](const fs::path& p, const std::function<bool(const fs::path&)>& visit,
+                                       std::error_code&) {
+        record_if_blocked(p, "for_each_dir_entry");
         const std::string s = from_path(p);
-        if (s == "/safe") return {fs::path("/safe/to_unc_dir"), fs::path("/safe/to_unc_file.gguf"), fs::path("/safe/sub")};
-        if (s == "/safe/sub") return {fs::path("/safe/sub/good-Q4_K_M.gguf")};
-        return {};
+        std::vector<fs::path> entries;
+        if (s == "/safe") entries = {fs::path("/safe/to_unc_dir"), fs::path("/safe/to_unc_file.gguf"), fs::path("/safe/sub")};
+        else if (s == "/safe/sub") entries = {fs::path("/safe/sub/good-Q4_K_M.gguf")};
+        for (const auto& e : entries)
+          if (!visit(e)) break;
       };
       fake_fs.is_regular_file = [&](const fs::path& p, std::error_code&) {
         record_if_blocked(p, "is_regular_file");
@@ -369,6 +372,94 @@ int main() {
                 std::to_string(touched_blocked.size()) + ")");
       check(gated.size() == 1 && gated[0].file == "good-Q4_K_M.gguf",
             "scan_model_dirs still discovers allowed siblings when blocked links are skipped");
+    }
+
+    // Streamed entry cap: scan_model_dirs stops iterating huge directories immediately at max_entries.
+    {
+      int yielded = 0;
+      flyx::apps::ScanFs cap_fs;
+      cap_fs.is_directory = [](const fs::path& p, std::error_code&) { return from_path(p) == "/big"; };
+      cap_fs.weakly_canonical = [](const fs::path& p, std::error_code&) { return p; };
+      cap_fs.for_each_dir_entry = [&](const fs::path& p, const std::function<bool(const fs::path&)>& visit,
+                                      std::error_code&) {
+        if (from_path(p) != "/big") return;
+        for (int i = 0; i < 200; ++i) {
+          ++yielded;
+          if (!visit(fs::path("/big/file_" + std::to_string(i) + ".txt"))) break;
+        }
+      };
+      cap_fs.is_regular_file = [](const fs::path&, std::error_code&) { return true; };
+      cap_fs.file_size = [](const fs::path&, std::error_code&) -> uint64_t { return 1; };
+      cap_fs.last_write_time = [](const fs::path&, std::error_code&) { return fs::file_time_type::clock::now(); };
+      (void)flyx::apps::scan_model_dirs({"/big"}, 4, {}, &cap_fs, /*max_entries=*/10);
+      check(yielded == 10,
+            "scan_model_dirs streams directory entries and halts at max_entries (yielded=" + std::to_string(yielded) + ")");
+    }
+
+    // Dependent-path allow_path enforcement across dspark_beside, split GGUF shards, LoRA PEFT dirs, and drafter dirs.
+    {
+      // 1. dspark_beside skips sibling DSpark files blocked by allow_path.
+      auto deny_dspark = [](std::string_view p) { return p.find("dspark-") == std::string_view::npos; };
+      check(flyx::apps::dspark_beside(from_path(model), deny_dspark).empty(),
+            "dspark_beside refuses sibling drafter blocked by allow_path");
+
+      // 2. Split GGUF shard 2 blocked by allow_path fails ModelFile::open before mapping shard 2.
+      const fs::path split_dir = tmp / "split_guard";
+      const fs::path shard1 = split_dir / "demo-00001-of-00002.gguf";
+      const fs::path shard2 = split_dir / "demo-00002-of-00002.gguf";
+      auto write_split_gguf = [](const fs::path& p, uint32_t split_no, uint32_t split_count) {
+        std::string b = "GGUF";
+        auto u32 = [&](uint32_t v) { b.append(reinterpret_cast<const char*>(&v), 4); };
+        auto u64 = [&](uint64_t v) { b.append(reinterpret_cast<const char*>(&v), 8); };
+        auto str = [&](const std::string& s) { u64(s.size()), b += s; };
+        u32(3);
+        u64(0);  // tensors
+        u64(3);  // metadata keys
+        str("general.architecture"), u32(8), str("qwen3");
+        str("split.no"), u32(4), u32(split_no);
+        str("split.count"), u32(4), u32(split_count);
+        fs::create_directories(p.parent_path());
+        std::ofstream(p, std::ios::binary) << b;
+      };
+      write_split_gguf(shard1, 0, 2);
+      write_split_gguf(shard2, 1, 2);
+      flyx::ModelFile mf;
+      std::string open_err;
+      auto deny_shard2 = [](std::string_view p) { return p.find("00002-of-00002") == std::string_view::npos; };
+      check(!mf.open(from_path(shard1), &open_err, deny_shard2) &&
+                open_err.find("remote path policy") != std::string::npos,
+            "ModelFile::open blocks split GGUF shard 2 rejected by allow_path: " + open_err);
+
+      // 3. LoRA PEFT directory: ModelFile::add blocks adapter_model.safetensors rejected by allow_path.
+      const fs::path lora_dir = tmp / "lora_guard";
+      fs::create_directories(lora_dir);
+      std::ofstream(lora_dir / "adapter_config.json", std::ios::binary)
+          << R"({"peft_type":"LORA","r":4,"lora_alpha":8})";
+      std::ofstream(lora_dir / "adapter_model.safetensors", std::ios::binary) << "stub";
+      std::string add_err;
+      auto deny_adapter_weights = [](std::string_view p) {
+        return p.find("adapter_model.safetensors") == std::string_view::npos;
+      };
+      check(!mf.add(from_path(lora_dir), &add_err, deny_adapter_weights) &&
+                add_err.find("remote path policy") != std::string::npos,
+            "ModelFile::add blocks LoRA adapter weights rejected by allow_path: " + add_err);
+
+      // 4. Drafter directory: drafter_source_kind and ModelFile::add respect allow_path for config.json and shards.
+      const fs::path drafter_dir = tmp / "drafter_guard";
+      fs::create_directories(drafter_dir);
+      std::ofstream(drafter_dir / "config.json", std::ios::binary)
+          << R"({"architectures":["DFlash2DraftModel"],"dflash_config":{}})";
+      std::ofstream(drafter_dir / "model.safetensors", std::ios::binary) << "stub";
+      auto deny_config = [](std::string_view p) { return p.find("config.json") == std::string_view::npos; };
+      auto deny_shard = [](std::string_view p) { return p.find("model.safetensors") == std::string_view::npos; };
+      check(flyx::drafter_source_kind(from_path(drafter_dir)) == "dflash2",
+            "drafter_source_kind reads allowed drafter directory");
+      check(flyx::drafter_source_kind(from_path(drafter_dir), deny_config).empty(),
+            "drafter_source_kind skips config.json rejected by allow_path");
+      add_err.clear();
+      check(!mf.add(from_path(drafter_dir), &add_err, deny_shard) &&
+                add_err.find("remote path policy") != std::string::npos,
+            "ModelFile::add blocks drafter safetensors shard rejected by allow_path: " + add_err);
     }
   }
   set_env("HF_HUB_OFFLINE", "");

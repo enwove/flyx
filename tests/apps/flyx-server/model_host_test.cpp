@@ -207,6 +207,63 @@ int main(int argc, char** argv) {
     std::lock_guard<std::mutex> lock(mu);
     check(open_models == 0 && closes == opens, "every model the backend opened is closed with the host");
   }
+  {
+    // ModelHost::run enforces Want::eo.allow_path before opening the model file.
+    ModelHost host(so);
+    ModelHost::Want blocked;
+    blocked.model = argv[1];
+    blocked.eo = eo;
+    blocked.eo.allow_path = [](std::string_view) { return false; };
+    std::string policy_err;
+    const int opens_now = opens;
+    check(!host.run(blocked, &policy_err) && policy_err.find("remote path policy") != std::string::npos &&
+              opens == opens_now,
+          "ModelHost::run rejects model path blocked by eo.allow_path before backend open: " + policy_err);
+  }
+  {
+    // Single-lock NetworkSettingsSnapshot coherence: save_network_settings commits on_remote_manage_committed and
+    // samples live_remote_manage under settings_mutex(), matching read_network_settings under concurrent toggles.
+    std::atomic<bool> live_rm{false};
+    auto commit_rm = [&](bool v) { live_rm.store(v, std::memory_order_relaxed); };
+    auto read_live = [&]() { return live_rm.load(std::memory_order_relaxed); };
+    ModelHost::NetworkSettingsSnapshot snap;
+    std::string net_err;
+    check(ModelHost::save_network_settings(true, true, commit_rm, &snap, &net_err, read_live) &&
+              snap.lan_access && snap.remote_manage && snap.live_remote_manage,
+          "save_network_settings samples committed live_remote_manage in the same critical section: " + net_err);
+    const auto read_snap = ModelHost::read_network_settings(read_live);
+    check(read_snap.lan_access && read_snap.remote_manage && read_snap.live_remote_manage,
+          "read_network_settings returns coherent lan_access, remote_manage, and live_remote_manage");
+
+    std::atomic<bool> stop{false};
+    std::atomic<bool> torn{false};
+    std::thread writer([&] {
+      bool v = false;
+      for (int i = 0; i < 40; ++i) {
+        v = !v;
+        ModelHost::NetworkSettingsSnapshot s;
+        std::string e;
+        if (!ModelHost::save_network_settings(v, v, commit_rm, &s, &e, read_live) ||
+            s.lan_access != v || s.remote_manage != v || s.live_remote_manage != v) {
+          torn.store(true, std::memory_order_relaxed);
+          break;
+        }
+      }
+      stop.store(true, std::memory_order_relaxed);
+    });
+    std::thread reader([&] {
+      while (!stop.load(std::memory_order_relaxed)) {
+        const auto s = ModelHost::read_network_settings(read_live);
+        if (s.lan_access != s.remote_manage || s.remote_manage != s.live_remote_manage) {
+          torn.store(true, std::memory_order_relaxed);
+          break;
+        }
+      }
+    });
+    writer.join();
+    reader.join();
+    check(!torn.load(), "concurrent save_network_settings / read_network_settings never tear disk vs live_remote_manage");
+  }
   fs::remove_all(config, ec);
   return flyx::test::finish("model_host_test");
 }

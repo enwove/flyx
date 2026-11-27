@@ -124,7 +124,7 @@ struct Listed {
 ojson or_null(const std::string& s) { return s.empty() ? ojson(nullptr) : ojson(s); }
 
 // A model file of a directory, as the panel lists it: its path is the name that loads it.
-Listed dir_entry(const apps::LocalModel& m) {
+Listed dir_entry(const apps::LocalModel& m, const apps::PathAllowFn& allow = {}) {
   Listed l;
   const bool gguf = m.kind == "gguf";
   l.json = {{"name", m.path}, {"kind", m.kind}, {"source", "dir"}, {"repo", nullptr}, {"quant", or_null(m.quant)},
@@ -132,8 +132,8 @@ Listed dir_entry(const apps::LocalModel& m) {
             {"modified", apps::modified_unix(m.modified)}, {"revision", nullptr}, {"current", true},
             {"mtp", gguf && m.mtp_layers > 0 ? ojson("in-file") : ojson(nullptr)}};
   if (m.kind == "gguf" || m.kind == "flyx") {  // what its file says it is and comes from
-    const flyx::ModelOrigin o =
-        gguf ? flyx::ModelOrigin{"", apps::gguf_header(m.path).base_models} : flyx::model_origin(m.path);
+    const flyx::ModelOrigin o = gguf ? flyx::ModelOrigin{"", apps::gguf_header(m.path, allow).base_models}
+                                     : flyx::model_origin(m.path, allow);
     l.json["known_drafters"] = known_drafters_json(m.path, apps::known_drafters(o.repo, o.base_models, false));
   }
   if (m.kind == "drafter" && !m.drafter_kind.empty()) l.json["drafter_kind"] = m.drafter_kind;
@@ -145,7 +145,8 @@ Listed dir_entry(const apps::LocalModel& m) {
 // What GET /v1/hub/cached lists: the cache's snapshots, refs/main's first, a file under one path once (refs/main's
 // copy, else the newest snapshot's); then the model directories' files.
 std::vector<Listed> listing(const Server& s, const httplib::Request* req = nullptr) {
-  const std::vector<hub::Cached> snapshots = hub::cached();
+  const apps::PathAllowFn allow = req ? remote_path_policy(s, *req) : apps::PathAllowFn{};
+  const std::vector<hub::Cached> snapshots = hub::cached(allow);
   std::set<std::string> repos_with_mtp;  // the repository's MTP layer is in the cache, in any snapshot
   std::set<std::pair<std::string, std::string>> snaps_with_mmproj;  // (repo, commit) holding a vision projector
   std::set<std::pair<std::string, std::string>> snaps_with_dflash2;
@@ -170,8 +171,8 @@ std::vector<Listed> listing(const Server& s, const httplib::Request* req = nullp
       if (kind == "gguf" || kind == "flyx")  // what its file says it comes from
         l.json["known_drafters"] = known_drafters_json(
             name + suffix,
-            apps::known_drafters(c.repo, kind == "gguf" ? apps::gguf_header(disk).base_models
-                                                        : flyx::model_origin(disk).base_models,
+            apps::known_drafters(c.repo, kind == "gguf" ? apps::gguf_header(disk, allow).base_models
+                                                        : flyx::model_origin(disk, allow).base_models,
                                  false));
       return l;
     };
@@ -187,7 +188,7 @@ std::vector<Listed> listing(const Server& s, const httplib::Request* req = nullp
       for (const hub::RepoFile* g : {a.config, a.weights}) l.files.push_back(g->path), l.on_disk.push_back(disk_of(g->path));
       out.push_back(std::move(l));
     }
-    const auto ggufs = apps::hub_ggufs(r);
+    const auto ggufs = apps::hub_ggufs(r, allow);
     for (const auto& item : ggufs) {
       if (!item.cached || item.cls.kind.empty()) continue;
       const auto& g = item.choice;
@@ -219,7 +220,7 @@ std::vector<Listed> listing(const Server& s, const httplib::Request* req = nullp
       const auto modified = fs::last_write_time(to_path(disk), ec);
       // its config's kind ("dflash2", "dflash", "dspark", "dspine")
       l = entry(c.repo, "drafter", "", c.repo.substr(c.repo.find('/') + 1), disk, size, modified, -1,
-                flyx::drafter_source_kind(c.dir));
+                flyx::drafter_source_kind(c.dir, allow));
     } else {
       const std::string base = files[0].path.substr(files[0].path.rfind('/') + 1);
       const std::string disk = disk_of(files[0].path);
@@ -235,9 +236,7 @@ std::vector<Listed> listing(const Server& s, const httplib::Request* req = nullp
     if (l.vision && snaps_with_mmproj.count({l.repo, l.commit})) l.json["mmproj"] = "in-repo";
     if (snaps_with_dflash2.count({l.repo, l.commit})) l.json["dflash2"] = "in-repo";
   }
-  apps::PathAllowFn allow;
-  if (req) allow = [&](std::string_view p) { return remote_path_allowed(s, *req, p); };
-  for (const apps::LocalModel& m : apps::scan_model_dirs(s.models_dirs, 6, allow)) out.push_back(dir_entry(m));
+  for (const apps::LocalModel& m : apps::scan_model_dirs(s.models_dirs, 6, allow)) out.push_back(dir_entry(m, allow));
   return out;
 }
 
@@ -246,12 +245,12 @@ bool dir_json(const Server& s, const httplib::Request& req, const std::string& a
   constexpr int kLevels = 3;          // a model is listed from its folder, or from one or two folders above it
   constexpr size_t kMostFolders = 2000;
   ojson dirs = ojson::array(), models = ojson::array();
-  const apps::PathAllowFn allow = [&](std::string_view path) { return remote_path_allowed(s, req, path); };
+  const apps::PathAllowFn allow = remote_path_policy(s, req);
   std::error_code ec;
   if (asked.empty()) {
     std::set<fs::path> seen;
     auto start = [&](const std::string& dir) {
-      if (dir.empty() || !allow(dir)) return;
+      if (dir.empty() || (allow && !allow(dir))) return;
       std::error_code e2;
       const fs::path p = fs::weakly_canonical(to_path(apps::expand_user_path(dir)), e2);
       if (!e2 && fs::is_directory(p, e2) && seen.insert(p).second)
@@ -275,7 +274,7 @@ bool dir_json(const Server& s, const httplib::Request& req, const std::string& a
     // Pre-authorize every sibling before inspection so remote callers cannot trigger SMB lookups via sibling links.
     for (const apps::LocalModel& m : apps::scan_model_dirs({from_path(base)}, 1, allow)) {
       std::error_code e2;
-      if (fs::equivalent(to_path(m.path), p, e2)) models.push_back(dir_entry(m).json);
+      if (fs::equivalent(to_path(m.path), p, e2)) models.push_back(dir_entry(m, allow).json);
     }
     if (models.empty()) return *err = asked + ": not a model file (.gguf, .flyx)", false;
     *out = {{"path", from_path(p)}, {"parent", from_path(base)}, {"kind", "file"}, {"dirs", dirs}, {"models", models}};
@@ -287,7 +286,7 @@ bool dir_json(const Server& s, const httplib::Request& req, const std::string& a
     const std::string name = from_path(it->path().filename());
     if (name.empty() || name[0] == '.' || name[0] == '$') continue;
     const std::string child = from_path(it->path());
-    if (!allow(child)) continue;
+    if (allow && !allow(child)) continue;
     std::error_code e2;
     if (!it->is_directory(e2)) continue;
     subs.push_back(it->path());
@@ -296,7 +295,7 @@ bool dir_json(const Server& s, const httplib::Request& req, const std::string& a
   std::sort(subs.begin(), subs.end());
   for (const fs::path& sub : subs) dirs.push_back({{"name", from_path(sub.filename())}, {"path", from_path(sub)}});
   for (const apps::LocalModel& m : apps::scan_model_dirs({from_path(p)}, kLevels, allow))
-    models.push_back(dir_entry(m).json);
+    models.push_back(dir_entry(m, allow).json);
   const fs::path up = p.parent_path();
   *out = {{"path", from_path(p)}, {"parent", up.empty() || up == p ? ojson(nullptr) : ojson(from_path(up))},
           {"kind", "dir"}, {"dirs", dirs}, {"models", models}};
@@ -352,10 +351,10 @@ std::string base_of(const std::string& model, std::string* from) {
   return *from = "model", repo;
 }
 
-ojson repo_json(const hub::Repo& r) {
+ojson repo_json(const hub::Repo& r, const apps::PathAllowFn& allow = {}) {
   ojson ggufs = ojson::array();
   ojson companions = ojson::array();
-  const auto choices = apps::hub_ggufs(r);
+  const auto choices = apps::hub_ggufs(r, allow);
   const std::string rev_suffix = (!r.revision.empty() && r.revision != "main") ? "@" + r.revision : "";
   // The GGUFs' architecture: what the Hub says, else the first cached model's header.  No projector is offered for
   // one this build reads none for (Inkling-2).
@@ -457,6 +456,7 @@ void add_manage_routes(httplib::Server& http, Server* s) {
       return;
     for (const std::string& d : w.drafters)
       if (!require_local_path(*s, q, r, d)) return;
+    w.eo.allow_path = remote_path_policy(*s, q);
     if (!s->host->start(w, &err)) return error(r, 409, err, "conflict");
     send_json(r, 202, s->host->status());
   });
@@ -507,7 +507,7 @@ void add_manage_routes(httplib::Server& http, Server* s) {
     hub::HubOutcome out;
     std::string err;
     if (!hub::describe(name.repo, name.revision, &repo, &err, &out)) return hub_error(r, out, err);
-    send_json(r, 200, repo_json(repo));
+    send_json(r, 200, repo_json(repo, remote_path_policy(*s, q)));
   });
   http.Get("/v1/hub/loras", [s](const httplib::Request& q, httplib::Response& r) {
     if (!require_access(*s, q, r, Access::kManage, "loading models")) return;
@@ -528,7 +528,7 @@ void add_manage_routes(httplib::Server& http, Server* s) {
                           &out))
       return hub_error(r, out, err);
     std::set<std::string> here;  // repositories with an adapter's weights in the cache
-    for (const hub::Cached& c : hub::cached())
+    for (const hub::Cached& c : hub::cached(remote_path_policy(*s, q)))
       for (const hub::RepoFile& f : c.files)
         if (f.path.size() >= 25 && f.path.compare(f.path.size() - 25, 25, "adapter_model.safetensors") == 0) here.insert(c.repo);
     ojson models = ojson::array();
@@ -604,7 +604,7 @@ void add_manage_routes(httplib::Server& http, Server* s) {
     hub::Name hn;
     std::string kind;
     if (!name.empty() && fs::exists(to_path(name), ec)) {
-      kind = apps::drafter_kind(name);
+      kind = apps::drafter_kind(name, remote_path_policy(*s, q));
     } else if (hub::parse_name(name, &hn)) {
       hub::Repo repo;
       hub::HubOutcome out;
@@ -717,7 +717,7 @@ void add_manage_routes(httplib::Server& http, Server* s) {
       }
     }
     std::set<std::string> here;  // repositories with a snapshot in the cache
-    for (const hub::Cached& c : hub::cached()) here.insert(c.repo);
+    for (const hub::Cached& c : hub::cached(remote_path_policy(*s, q))) here.insert(c.repo);
     const std::set<std::string> known_set(known.begin(), known.end());
     ojson models = ojson::array();
     for (const hub::Found& f : found) {
@@ -796,7 +796,7 @@ void add_manage_routes(httplib::Server& http, Server* s) {
       if (l.json["source"] == "hub" && l.repo == it->repo && l.commit == it->commit) ++models_in_snap;
     std::vector<std::pair<std::string, std::string>> orphan_mmproj;  // (repo-relative path, disk path)
     if (models_in_snap == 1) {
-      for (const hub::Cached& c : hub::cached()) {
+      for (const hub::Cached& c : hub::cached(remote_path_policy(*s, q))) {
         if (c.repo != it->repo || c.commit != it->commit) continue;
         for (const hub::RepoFile& f : c.files) {
           if (hub::mmproj_gguf_name(f.path)) {

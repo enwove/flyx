@@ -816,16 +816,15 @@ int main(int argc, char** argv) {
           "high vram_reserve triggers pre-flight auto -> nvfp4 step-down");
   }
 
-  // 12. Late reserve_floor increase (e.g., backend VMM fallback on first session allocation): Session::init catches
-  // FLYX_ERR_OOM, triggers Engine::replan_for_floor_increase to adopt the raised floor and shrink context, and retries
-  // seq_new_in cleanly with identical greedy output.
+  // 12. Backend reserve_floor is honored upfront at load time, and any late FLYX_ERR_OOM during Session::init fails
+  // cleanly with actionable advice while leaving the loaded Engine plan and ResourceLedger weight lease untouched.
   {
     reset_hooks();
     g_custom_memory = true;
     g_total_vram = 4ull << 30;
     g_mem_weights = 2ull << 30;
     g_mem_workspace = 0;
-    g_free_vram = 1536ull << 20;      // have = 3.5 GiB; with 256 MiB floor -> 1280 MiB session room
+    g_free_vram = 1536ull << 20;        // have = 3.5 GiB; with 256 MiB floor -> 1280 MiB session room
     g_reserve_floor = 256ull << 20;
     g_seq_per_ctx_bytes = 128ull << 10;  // 8192 ctx -> 1088 MiB (fits 1280), 4096 ctx -> 576 MiB (fits 768)
     EngineOptions eo;
@@ -838,12 +837,43 @@ int main(int argc, char** argv) {
     check(e.load(model, eo, &err), "initial load with low reserve_floor succeeds: " + err);
     check(e.options().max_ctx == 8192 && e.budget().device_reserve == (256ull << 20),
           "initial plan keeps 8192 ctx at 256 MiB floor");
+    const uint64_t expected_fixed = 2ull << 30;
+    const uint64_t expected_session = e.session_bytes();
+    check(e.ledger().used() == expected_fixed && expected_session > 0,
+          "loaded engine holds fixed weight lease and positive session_bytes");
+
+    // Late OOM on seq_new_in fails cleanly without mutating engine options, budget, or fixed weight lease.
     g_oom_raise_floor = 768ull << 20;
-    const std::vector<int32_t> out = tokens(e);
-    check(out == ref_tokens, "late reserve_floor replan succeeds and reproduces plain greedy tokens");
-    check(g_seq_new_calls == 2 && e.budget().device_reserve == (768ull << 20) && e.options().max_ctx < 8192,
-          "Session::init retried seq_new_in after replan_for_floor_increase raised reserve to 768 MiB and shrank ctx (" +
-              std::to_string(e.options().max_ctx) + ")");
+    Session failed(&e);
+    std::string init_err;
+    const bool init_ok = failed.init(&init_err);
+    check(!init_ok && init_err.find("seq_new:") != std::string::npos &&
+              init_err.find("simulated late VMM fallback OOM") != std::string::npos &&
+              init_err.find("smaller quantization") != std::string::npos,
+          "late seq_new_in OOM refuses cleanly with actionable advice: " + init_err);
+    check(g_seq_new_calls == 1 && e.options().max_ctx == 8192 && e.budget().device_reserve == (256ull << 20) &&
+              e.session_bytes() == expected_session && e.ledger().used() == expected_fixed,
+          "late OOM leaves engine context, budget, session_bytes, and fixed weight lease intact");
+
+    // Once transient OOM clears, a subsequent session still succeeds cleanly on the untouched engine.
+    g_oom_raise_floor = 0;
+    check(tokens(e) == ref_tokens, "subsequent session after clean OOM refusal reproduces plain greedy tokens");
+    check(e.ledger().used() == expected_fixed, "ledger returns to fixed weight lease after session closes");
+
+    // When the higher reserve_floor is reported upfront during load, plan_memory fits the context at load time.
+    reset_hooks();
+    g_custom_memory = true;
+    g_total_vram = 4ull << 30;
+    g_mem_weights = 2ull << 30;
+    g_mem_workspace = 0;
+    g_free_vram = 1536ull << 20;
+    g_reserve_floor = 768ull << 20;
+    g_seq_per_ctx_bytes = 128ull << 10;
+    Engine e_high;
+    check(e_high.load(model, eo, &err), "load with upfront 768 MiB reserve_floor succeeds: " + err);
+    check(e_high.budget().device_reserve == (768ull << 20) && e_high.options().max_ctx < 8192,
+          "upfront 768 MiB floor shrinks context at load time (" + std::to_string(e_high.options().max_ctx) + ")");
+    check(tokens(e_high) == ref_tokens, "upfront floor-fitted engine reproduces plain greedy tokens");
   }
 
   return flyx::test::finish("elastic_load_test");

@@ -4,6 +4,7 @@
 
 #include <algorithm>
 #include <cctype>
+#include <deque>
 #include <fstream>
 #include <mutex>
 
@@ -38,29 +39,78 @@ std::string token() {
   return t;
 }
 
-// The files of a snapshot on disk (links followed), sizes only.
-std::vector<RepoFile> snapshot_files(const fs::path& snap) {
+CacheFs resolve_cache_fs(const CacheFs* fs_ops) {
+  CacheFs ops;
+  ops.is_directory = [](const fs::path& p, std::error_code& ec) { return fs::is_directory(p, ec); };
+  ops.is_regular_file = [](const fs::path& p, std::error_code& ec) { return fs::is_regular_file(p, ec); };
+  ops.file_size = [](const fs::path& p, std::error_code& ec) { return uint64_t(fs::file_size(p, ec)); };
+  ops.last_write_time = [](const fs::path& p, std::error_code& ec) { return fs::last_write_time(p, ec); };
+  ops.for_each_dir_entry = [](const fs::path& p, const std::function<bool(const fs::path&)>& visit,
+                              std::error_code& ec) {
+    for (fs::directory_iterator it(p, fs::directory_options::skip_permission_denied, ec), end; !ec && it != end;
+         it.increment(ec)) {
+      if (!visit(it->path())) break;
+    }
+  };
+  ops.read_text = [](const fs::path& p) { return detail::read_text(p); };
+  if (!fs_ops) return ops;
+  if (fs_ops->is_directory) ops.is_directory = fs_ops->is_directory;
+  if (fs_ops->is_regular_file) ops.is_regular_file = fs_ops->is_regular_file;
+  if (fs_ops->file_size) ops.file_size = fs_ops->file_size;
+  if (fs_ops->last_write_time) ops.last_write_time = fs_ops->last_write_time;
+  if (fs_ops->for_each_dir_entry) ops.for_each_dir_entry = fs_ops->for_each_dir_entry;
+  if (fs_ops->read_text) ops.read_text = fs_ops->read_text;
+  ops.root_override = fs_ops->root_override;
+  return ops;
+}
+
+// The files of a snapshot on disk (links followed), sizes only. Every child is authorized via allow_path
+// BEFORE any target-following stat, size lookup, or directory descent.
+std::vector<RepoFile> snapshot_files(const fs::path& snap, const PathAllowFn& allow_path, const CacheFs& ops) {
+  constexpr int kMaxDepth = 16;
+  constexpr int kMaxEntries = 50000;
   std::vector<RepoFile> files;
-  std::error_code ec;
-  for (fs::recursive_directory_iterator it(snap, ec), end; !ec && it != end; it.increment(ec)) {
-    std::error_code e2;
-    if (!fs::is_regular_file(it->path(), e2)) continue;  // follows the link; a broken one is no file
-    RepoFile f;
-    f.path = from_path(it->path().lexically_relative(snap));  // fs::relative would follow the link to the blob
-    std::replace(f.path.begin(), f.path.end(), '\\', '/');
-    f.size = fs::file_size(it->path(), e2);
-    if (!e2) files.push_back(std::move(f));
+  std::deque<std::pair<fs::path, int>> queue;
+  queue.emplace_back(snap, 0);
+  int seen = 0;
+  while (!queue.empty() && seen < kMaxEntries) {
+    auto [cur, depth] = std::move(queue.front());
+    queue.pop_front();
+    std::error_code ec;
+    ops.for_each_dir_entry(
+        cur,
+        [&](const fs::path& child) {
+          if (++seen > kMaxEntries) return false;
+          const std::string child_str = from_path(child);
+          if (allow_path && !allow_path(child_str)) return true;
+          std::error_code e2;
+          if (ops.is_directory(child, e2)) {
+            if (!e2 && depth + 1 < kMaxDepth) queue.emplace_back(child, depth + 1);
+            return true;
+          }
+          e2.clear();
+          if (!ops.is_regular_file(child, e2) || e2) return true;  // follows the link; a broken one is no file
+          RepoFile f;
+          f.path = from_path(child.lexically_relative(snap));  // fs::relative would follow the link to the blob
+          std::replace(f.path.begin(), f.path.end(), '\\', '/');
+          f.size = ops.file_size(child, e2);
+          if (!e2) files.push_back(std::move(f));
+          return true;
+        },
+        ec);
   }
   std::sort(files.begin(), files.end(), [](const RepoFile& a, const RepoFile& b) { return a.path < b.path; });
   return files;
 }
 
 // A snapshot's config.json's architectures, if it has one.
-std::vector<std::string> architectures_of(const fs::path& snap) {
+std::vector<std::string> architectures_of(const fs::path& snap, const PathAllowFn& allow_path, const CacheFs& ops) {
   std::vector<std::string> out;
-  std::ifstream f(snap / "config.json", std::ios::binary);
-  if (!f) return out;
-  const auto j = nlohmann::json::parse(f, nullptr, false);
+  const fs::path cfg = snap / "config.json";
+  if (allow_path && !allow_path(from_path(cfg))) return out;
+  const std::string text = ops.read_text(cfg);
+  if (text.empty()) return out;
+  const auto j = nlohmann::json::parse(text, nullptr, false);
   if (j.is_object() && j.contains("architectures") && j["architectures"].is_array())
     for (const auto& a : j["architectures"])
       if (a.is_string()) out.push_back(a.get<std::string>());
@@ -131,8 +181,9 @@ bool from_cache(const std::string& repo, const std::string& revision, Repo* out)
                            : read_text(dir / "refs" / to_path(revision));
   if (!is_commit(commit) || !fs::is_directory(dir / "snapshots" / commit, ec)) return false;
   out->commit = commit;
-  out->files = snapshot_files(dir / "snapshots" / commit);
-  out->architectures = architectures_of(dir / "snapshots" / commit);
+  const CacheFs ops = resolve_cache_fs(nullptr);
+  out->files = snapshot_files(dir / "snapshots" / commit, {}, ops);
+  out->architectures = architectures_of(dir / "snapshots" / commit, {}, ops);
   out->from_cache = true;
   return true;
 }
@@ -279,43 +330,60 @@ bool in_cache(const std::string& repo, const std::string& revision, Repo* out) {
   return true;
 }
 
-std::vector<Cached> cached() {
+std::vector<Cached> cached(const PathAllowFn& allow_path, const CacheFs* fs_ops) {
+  const CacheFs ops = resolve_cache_fs(fs_ops);
+  const std::string root_str = ops.root_override.empty() ? cache_dir() : ops.root_override;
+  if (root_str.empty() || (allow_path && !allow_path(root_str))) return {};
   std::vector<Cached> out;
   std::error_code ec;
-  for (fs::directory_iterator it(to_path(cache_dir()), ec), end; !ec && it != end; it.increment(ec)) {
-    const std::string dir = from_path(it->path().filename());
-    if (!dir.starts_with("models--")) continue;
-    const std::string rest = dir.substr(8);
-    const size_t sep = rest.find("--");
-    if (sep == std::string::npos) continue;
-    const std::string repo = rest.substr(0, sep) + "/" + rest.substr(sep + 2);
-    if (!detail::valid_repo(repo)) continue;
-    const fs::path snaps = it->path() / "snapshots";
-    const std::string main = detail::read_text(it->path() / "refs" / "main");
-    struct Snapshot {
-      std::string commit;
-      fs::file_time_type made;
-    };
-    std::vector<Snapshot> found;
-    std::error_code e2;
-    for (fs::directory_iterator s(snaps, e2), send; !e2 && s != send; s.increment(e2)) {
-      std::error_code e3;
-      const std::string commit = from_path(s->path().filename());
-      if (detail::is_commit(commit) && s->is_directory(e3)) found.push_back({commit, s->last_write_time(e3)});
-    }
-    std::sort(found.begin(), found.end(), [&](const Snapshot& a, const Snapshot& b) {
-      if ((a.commit == main) != (b.commit == main)) return a.commit == main;
-      return a.made > b.made;
-    });
-    for (const Snapshot& s : found) {
-      Cached c;
-      c.repo = repo, c.commit = s.commit, c.current = s.commit == main;
-      c.dir = from_path(snaps / to_path(s.commit));
-      c.files = snapshot_files(snaps / to_path(s.commit));
-      c.architectures = architectures_of(snaps / to_path(s.commit));
-      if (!c.files.empty()) out.push_back(std::move(c));
-    }
-  }
+  ops.for_each_dir_entry(
+      to_path(root_str),
+      [&](const fs::path& repo_entry) {
+        const std::string dir = from_path(repo_entry.filename());
+        if (!dir.starts_with("models--")) return true;
+        const std::string rest = dir.substr(8);
+        const size_t sep = rest.find("--");
+        if (sep == std::string::npos) return true;
+        const std::string repo = rest.substr(0, sep) + "/" + rest.substr(sep + 2);
+        if (!detail::valid_repo(repo)) return true;
+        if (allow_path && !allow_path(from_path(repo_entry))) return true;
+        const fs::path snaps = repo_entry / "snapshots";
+        if (allow_path && !allow_path(from_path(snaps))) return true;
+        const fs::path ref_main = repo_entry / "refs" / "main";
+        const std::string main = (!allow_path || allow_path(from_path(ref_main))) ? ops.read_text(ref_main) : "";
+        struct Snapshot {
+          std::string commit;
+          fs::file_time_type made;
+        };
+        std::vector<Snapshot> found;
+        std::error_code e2;
+        ops.for_each_dir_entry(
+            snaps,
+            [&](const fs::path& s_path) {
+              const std::string commit = from_path(s_path.filename());
+              if (!detail::is_commit(commit)) return true;
+              if (allow_path && !allow_path(from_path(s_path))) return true;
+              std::error_code e3;
+              if (ops.is_directory(s_path, e3) && !e3) found.push_back({commit, ops.last_write_time(s_path, e3)});
+              return true;
+            },
+            e2);
+        std::sort(found.begin(), found.end(), [&](const Snapshot& a, const Snapshot& b) {
+          if ((a.commit == main) != (b.commit == main)) return a.commit == main;
+          return a.made > b.made;
+        });
+        for (const Snapshot& s : found) {
+          const fs::path snap_dir = snaps / to_path(s.commit);
+          Cached c;
+          c.repo = repo, c.commit = s.commit, c.current = s.commit == main;
+          c.dir = from_path(snap_dir);
+          c.files = snapshot_files(snap_dir, allow_path, ops);
+          c.architectures = architectures_of(snap_dir, allow_path, ops);
+          if (!c.files.empty()) out.push_back(std::move(c));
+        }
+        return true;
+      },
+      ec);
   std::stable_sort(out.begin(), out.end(), [](const Cached& a, const Cached& b) { return a.repo < b.repo; });
   return out;
 }
