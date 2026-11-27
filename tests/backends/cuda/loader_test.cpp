@@ -365,6 +365,7 @@ void expert_estimates() {
     flyx_tensor_view s{"scales", FLYX_DT_F32, 1, {e}, scales, sizeof(scales)};
     flyx_weight weights[] = {
         {&gu, nullptr, c.scale ? &s : nullptr}, {&down, nullptr, c.scale ? &s : nullptr}, {&router}};
+    if (c.dtype == FLYX_DT_GGML_Q8_0) weights[0].activations = weights[1].activations = FLYX_ACT_Q8;
     flyx_block b{};
     b.kind = FLYX_BLOCK_MOE;
     b.moe.hidden = b.moe.inter = k;
@@ -426,6 +427,16 @@ void expert_estimates() {
                   m.host_bytes - m.pinned_bytes == est.offload_pageable_bytes,
               "resident planes, adaptive placement and split host scratch match estimate");
       if (hot == 1) {
+        if (shared->q8) {
+          std::vector<float> row(k, -1.f);
+          row[0] = INFINITY;
+          row[32] = -INFINITY;
+          row[64] = std::nanf("");
+          shared->prepare(row.data(), false);
+          require(std::all_of(row.begin(), row.begin() + 65, [](float x) { return x == 0.f; }) &&
+                      std::isfinite(row[65]) && row[65] < 0.f,
+                  "prepared nonfinite Q8 groups and elements");
+        }
         const auto raw = shared->data, packed = shared->archive;
         const auto gains = shared->scales;
         std::vector<uint8_t> bounce(shared->bank.bytes(1));
@@ -466,7 +477,11 @@ void layer_estimates() {
   constexpr int h = 64;
   std::vector<uint16_t> values(h * h, 0x3f80);
   const flyx_tensor_view view{"dense", FLYX_DT_BF16, 2, {h, h}, values.data(), values.size() * 2};
+  std::vector<uint8_t> quant(h * (h / 32) * 34);
+  flyx_tensor_view q8{"packed", FLYX_DT_GGML_Q8_0, 2, {h, h}, quant.data(), quant.size()};
   std::vector<flyx_weight> weights(14, flyx_weight{&view});
+  weights[0].t = &q8;   // mixed linear stack expands all rows to BF16
+  weights[10].t = &q8;  // homogeneous single projection retains its packed planes
   std::vector<flyx_block> blocks(4);
   for (int i = 0; i < 2; ++i) {
     const int w = 7 * i;
@@ -499,21 +514,25 @@ void layer_estimates() {
     m.offload = std::make_unique<OffloadRuntime>();
     auto& ring = m.offload->init_layers(blocks.size(), bounce);
     m.blocks.reserve(blocks.size());
+    WeightLoader loader(&m, d);
     for (size_t i = 0; i < blocks.size(); ++i) {
       if (i % 2 == 0) {
         AttnBlock a;
         a.hidden = a.hd = h;
         a.nh = a.nkv = 1;
-        a.w_in.w = m.alloc<bf16>(3 * h * h);
-        a.w_out.w = m.alloc<bf16>(h * h);
+        const auto& b = blocks[i].attn;
+        a.w_in = loader.lin_stack({b.q, b.k, b.v});
+        a.w_out = loader.lin(b.o);
         m.blocks.emplace_back(a);
       } else {
         MlpBlock f;
         f.hidden = f.inter = h;
-        f.w_gu.w = m.alloc<bf16>(2 * h * h);
-        f.w_down.w = m.alloc<bf16>(h * h);
+        const auto& b = blocks[i].mlp;
+        f.w_gu = loader.lin_stack({b.gate, b.up});
+        f.w_down = loader.lin(b.down);
         m.blocks.emplace_back(f);
       }
+      loader.finish_stream_block();
       ring.archive(&m, int(i));
     }
     ring.allocate(&m);

@@ -1,5 +1,13 @@
 # Host-resident weights
 
+The CUDA binder and estimator share `plan_offload`. Its result describes each expert plane, staged blocks, two device
+slots and the pinned and pageable host requirements. The bound model owns one `OffloadRuntime`. Its per-block query
+controls dense leases in `forward_nodes`, and its capability queries control whole-round graph capture and batched
+rounds. `ExpertResidency` holds the mutable projection pair and slot map. Session admission runs pending exchanges
+at quiescence before the new sequence can consume the map. Both expert banks and dense blocks use `StagingRing`
+leases to fence transfers and reuse across compute streams.
+
+
 Flyx has two independent limits on CUDA weight residency. `--gpu-experts N` retains up to N experts per routed layer. `--gpu-layers N` retains the first N target attention or GDN layers and their MLPs. Both accept zero. With elastic loading, the engine asks the backend for byte estimates and chooses the largest resident partition that leaves room for runtime and the device reserve. The fitter probes both axes when a single cap cannot cover the deficit. It measures pinned staging and pageable archives separately and checks their sum against spare physical memory. An explicit cap takes precedence. The public backend ABI carries these fields in version 53.
 
 ## Routed experts

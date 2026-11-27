@@ -385,6 +385,15 @@ int main(int argc, char** argv) {
     Engine explicit_cap;
     if (!explicit_cap.load(model, eo, &err)) { check(false, err); return 1; }
     check((experts ? g_used_experts : g_used_layers) == 3, "explicit residency cap reaches backend open");
+    eo.gpu_experts = eo.gpu_layers = -1;
+    eo.backend_options = experts ? "gpu_experts=1" : "gpu_layers=1";
+    Engine legacy_cap;
+    if (!legacy_cap.load(model, eo, &err)) {
+      check(false, err);
+      return 1;
+    }
+    check((experts ? g_used_experts : g_used_layers) == 2 && g_opaque_options.empty(),
+          "legacy cap reaches the backend through the typed ABI field");
   }
 
   for (bool allocator_refusal : {false, true}) {
