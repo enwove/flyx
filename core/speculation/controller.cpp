@@ -32,6 +32,8 @@ void SpecController::reset(const std::vector<int>* widths, const std::vector<int
   const size_t rounds = widths->size();
   bonus_sum_.assign(rounds, 0.0);
   bonus_n_.assign(rounds, 0.0);
+  bonus_at_sum_.assign(rounds, {});
+  bonus_at_n_.assign(rounds, {});
   tok_guess_.assign(rounds, 1.0);
   tree_idle_.assign(rounds, 0);
   for (size_t i = 0; i < rounds; ++i) tok_guess_[i] = prior_tokens((*widths)[i]);
@@ -81,16 +83,17 @@ double SpecController::cost(size_t i, int context) const {
   return (*cost_)[i] + more;
 }
 
+double SpecController::accept_at(int drafter, int i, bool drafter_estimate) const {
+  const size_t d = size_t(drafter), k = size_t(i);
+  if (!drafter_estimate) return accept_[d][k];
+  const double n = kPrior + rounds_[d][k], m = (kPrior * prior(i) + hits_[d][k]) / n;
+  return std::min(1.0, m + kUcb * std::sqrt(m * (1 - m) / n));
+}
+
 double SpecController::expected_tokens(int drafter, int width, bool drafter_estimate) const {
   double e = 1, p = 1;
   for (int i = 0; drafter >= 0 && i < width && i < kPositions; ++i) {
-    const size_t d = size_t(drafter), k = size_t(i);
-    if (drafter_estimate) {
-      const double n = kPrior + rounds_[d][k], m = (kPrior * prior(i) + hits_[d][k]) / n;
-      p *= std::min(1.0, m + kUcb * std::sqrt(m * (1 - m) / n));
-    } else {
-      p *= accept_[d][k];
-    }
+    p *= accept_at(drafter, i, drafter_estimate);
     e += p;
   }
   return e;
@@ -100,8 +103,18 @@ double SpecController::round_tokens(size_t i, bool drafter_estimate) const {
   const int d = (*drafters_)[i];
   if (bare(i)) return level(d) * mean_tokens(i);
   if (!tree(i)) return expected_tokens(d, (*widths_)[i], drafter_estimate);
-  const double bonus = (kBonusPrior + bonus_sum_[i]) / (1 + bonus_n_[i]);
-  return expected_tokens(d, (*trunks_)[i], drafter_estimate) + bonus;
+  // the prior: what the engine's sessions' rounds of this tree added (SharedTokens), kBonusPrior before any
+  const double bonus = (shared_->mean(i, kBonusPrior, kGuessRounds) + bonus_sum_[i]) / (1 + bonus_n_[i]);
+  // over where the trunk stops: k of its drafts accepted (P: the chain's), the branches' tokens after that k
+  const int trunk = std::min((*trunks_)[i], kPositions);
+  double e = 0, p = 1;  // p: the trunk's first k accepted
+  for (int k = 0; k <= trunk; ++k) {
+    const double next = k < trunk && d >= 0 ? accept_at(d, k, drafter_estimate) : 0.0;
+    const double b = (bonus + bonus_at_sum_[i][size_t(k)]) / (1 + bonus_at_n_[i][size_t(k)]);
+    e += p * (1 - next) * (1 + k + b);
+    p *= next;
+  }
+  return e;
 }
 
 int SpecController::best_round(int drafter, bool with_plain, bool drafter_estimate, int context, int max_width,
@@ -319,6 +332,10 @@ void SpecController::observe(size_t round, int accepted, int trunk_accepted) {
     const double more = accepted - trunk_accepted;
     bonus_sum_[round] = kBonusKeep * bonus_sum_[round] + more;
     bonus_n_[round] = kBonusKeep * bonus_n_[round] + 1;
+    shared_->add(round, more);  // a tree with a trunk: what its branches added, for the sessions after
+    const size_t k = size_t(std::clamp(trunk_accepted, 0, kPositions));
+    bonus_at_sum_[round][k] = kBonusKeep * bonus_at_sum_[round][k] + more;
+    bonus_at_n_[round][k] = kBonusKeep * bonus_at_n_[round][k] + 1;
     width = (*trunks_)[round];
     accepted = trunk_accepted;
   }
