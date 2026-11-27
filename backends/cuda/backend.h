@@ -1142,19 +1142,20 @@ struct flyx_seq {
   // ring_publish); not counted in dry_host_bytes; freed with host_allocs.
   template <class T>
   T* pinned_alloc(size_t n) {
-    const size_t bytes = n * sizeof(T);
-    const size_t aligned = (bytes + 255) / 256 * 256;
+    const size_t bytes = flyx::cuda::size_mul(n, sizeof(T));
+    const size_t aligned = flyx::cuda::checkpoint_align(bytes);
     if (dry) {
-      arena_host_bytes += aligned;
+      arena_host_bytes = flyx::cuda::size_add(arena_host_bytes, aligned);
       return reinterpret_cast<T*>(uintptr_t(256));
     }
     if (bytes == 0) return nullptr;
-    if (host_arena && host_arena_off + aligned <= host_arena_cap) {
+    if (host_arena && aligned <= host_arena_cap - host_arena_off) {
       unsigned char* p = host_arena + host_arena_off;
       host_arena_off += aligned;
       return reinterpret_cast<T*>(p);  // zeroed once with the arena
     }
     void* p = nullptr;
+    host_allocs.reserve(host_allocs.size() + 1);
     CK(cudaHostAlloc(&p, bytes, cudaHostAllocMapped));
     host_allocs.push_back(p);
     return static_cast<T*>(p);
@@ -1163,20 +1164,21 @@ struct flyx_seq {
   // reads in a round (the checkpoints). Not in dry_bytes (the device's budget).
   template <class T>
   T* host_alloc(size_t n) {
-    const size_t bytes = n * sizeof(T);
-    const size_t aligned = (bytes + 255) / 256 * 256;
+    const size_t bytes = flyx::cuda::size_mul(n, sizeof(T));
+    const size_t aligned = flyx::cuda::checkpoint_align(bytes);
     if (dry) {
-      dry_host_bytes += aligned;
-      arena_host_bytes += aligned;
+      dry_host_bytes = flyx::cuda::size_add(dry_host_bytes, aligned);
+      arena_host_bytes = flyx::cuda::size_add(arena_host_bytes, aligned);
       return reinterpret_cast<T*>(uintptr_t(256));
     }
     if (bytes == 0) return nullptr;
-    if (host_arena && host_arena_off + aligned <= host_arena_cap) {
+    if (host_arena && aligned <= host_arena_cap - host_arena_off) {
       unsigned char* p = host_arena + host_arena_off;
       host_arena_off += aligned;
       return reinterpret_cast<T*>(p);  // zeroed once with the arena
     }
     void* p = nullptr;
+    host_allocs.reserve(host_allocs.size() + 1);
     CK(cudaHostAlloc(&p, bytes, cudaHostAllocDefault));
     std::memset(p, 0, bytes);
     host_allocs.push_back(p);
@@ -1184,23 +1186,24 @@ struct flyx_seq {
   }
   template <class T>
   T* alloc(size_t n) {
-    const size_t bytes = n * sizeof(T);
-    const size_t aligned = (bytes + 255) / 256 * 256;
+    const size_t bytes = flyx::cuda::size_mul(n, sizeof(T));
+    const size_t aligned = flyx::cuda::checkpoint_align(bytes);
     if (dry) {
-      dry_bytes += aligned;
-      arena_dev_bytes += aligned;
+      dry_bytes = flyx::cuda::size_add(dry_bytes, aligned);
+      arena_dev_bytes = flyx::cuda::size_add(arena_dev_bytes, aligned);
       return reinterpret_cast<T*>(uintptr_t(256));
     }
     if (bytes == 0) return nullptr;
-    if (dev_arena && dev_arena_off + aligned <= dev_arena_cap) {
+    if (dev_arena && aligned <= dev_arena_cap - dev_arena_off) {
       unsigned char* p = dev_arena + dev_arena_off;
       dev_arena_off += aligned;
       return reinterpret_cast<T*>(p);  // zeroed once with the arena on st
     }
     void* p = nullptr;
+    allocs.reserve(allocs.size() + 1);
     CK(cudaMalloc(&p, bytes));
-    CK(cudaMemsetAsync(p, 0, bytes, st));  // through the session's stream (runner.cpp: set_params)
     allocs.push_back(p);
+    CK(cudaMemsetAsync(p, 0, bytes, st));  // through the session's stream (runner.cpp: set_params)
     return static_cast<T*>(p);
   }
 };

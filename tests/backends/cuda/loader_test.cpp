@@ -46,6 +46,19 @@ void certified_head_capability() {
 }
 
 void oom_paths() {
+  flyx_seq dry;
+  dry.dry = true;
+  for (int which = 0; which < 3; ++which) {
+    bool rejected = false;
+    try {
+      if (which == 0) dry.alloc<float>(SIZE_MAX);
+      if (which == 1) dry.host_alloc<float>(SIZE_MAX);
+      if (which == 2) dry.pinned_alloc<float>(SIZE_MAX);
+    } catch (const std::overflow_error&) {
+      rejected = true;
+    }
+    require(rejected && !dry.arena_dev_bytes && !dry.arena_host_bytes, "overflow leaves sequence arenas empty");
+  }
   flyx_bmodel m;
   m.hidden = m.vocab = m.need.k_max = 64;
   flyx_node node{FLYX_NODE_COMMIT, 0, 0};
