@@ -12,9 +12,6 @@
 
 namespace flyx::plan {
 
-// Largest residency cap whose backend footprint fits. A negative result means no placement fits.
-int fit_residency(int maximum, const std::function<bool(int)>& fits);
-
 // What holds the GPU besides the model's weights and workspace, as the budget found it: other programs with the
 // driver, and the process's own runtime (its CUDA context, its kernels' modules; a second model's memory, did the
 // process hold two).  Where the system counts a process's share (flyx_memory_info::process) the two are told apart;

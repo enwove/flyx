@@ -9,21 +9,6 @@
 
 namespace flyx::plan {
 
-int fit_residency(int maximum, const std::function<bool(int)>& fits) {
-  int lo = 0, hi = maximum, best = -1;
-  while (lo <= hi) {
-    const int mid = lo + (hi - lo) / 2;
-    if (fits(mid)) {
-      best = mid;
-      if (mid == hi) break;
-      lo = mid + 1;
-    } else {
-      hi = mid - 1;
-    }
-  }
-  return best;
-}
-
 uint64_t host_keep(uint64_t total_ram) { return std::max<uint64_t>(2ull << 30, total_ram / 16); }
 
 uint64_t device_reserve(uint64_t total_vram, bool gpu_paged) {
@@ -540,6 +525,8 @@ bool account(const flyx_backend_api* api, flyx_bmodel* bm, bool has_drafter, boo
       return true;
     }
     out->oom = true;
+    out->ctx_need_more =
+        tiers_on ? placer.need_more_for(max_ctx, CtxLimit::kGpu, tiers.allow_auto_exact) : sb - placer.room;
     *err = format_oom_error(placer, mi, reserve, max_ctx, has_drafter, mostly_bf16, tiers_on);
     if (tiers.method == FLYX_KV_AUTO && !tiers.allow_auto_exact)
       *err += " The requested context must keep the target model's AUTO attention switch.";

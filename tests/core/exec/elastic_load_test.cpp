@@ -13,6 +13,7 @@
 #include <vector>
 
 #include "core/exec/engine.h"
+#include "core/plan/residency_fitter.h"
 #include "core/exec/generation.h"
 #include "core/session/session.h"
 #include "tests/common/check.h"
@@ -995,5 +996,25 @@ int main(int argc, char** argv) {
     check(tokens(e_high) == ref_tokens, "upfront floor-fitted engine reproduces plain greedy tokens");
   }
 
+  {
+    using Fitter = plan::ResidencyFitter;
+    check(Fitter::host_room(16ull << 30, 0, 0) == UINT64_MAX, "unreported available host RAM leaves the cap open");
+    for (bool pages_reclaimed : {false, true}) {
+      Fitter fitter;
+      int releases = 0;
+      auto result = fitter.fit_weights(
+          {4, 4}, {4, 4}, false,
+          [](Fitter::Caps c) -> std::optional<flyx_load_estimate> {
+            if (c != Fitter::Caps{2, 3}) return std::nullopt;
+            flyx_load_estimate e{};
+            e.offload_pinned_bytes = 4;
+            e.offload_pageable_bytes = 8;
+            return e;
+          },
+          [&] { return releases && pages_reclaimed ? 12u : 11u; }, [&] { ++releases; });
+      check(releases == 1 && bool(result) == pages_reclaimed,
+            "joint estimate retries host room once after page release");
+    }
+  }
   return flyx::test::finish("elastic_load_test");
 }
