@@ -24,14 +24,29 @@ uint64_t device_reserve(uint64_t total_vram, bool gpu_paged) {
   return gpu_paged ? std::max(base, kPagedReserve) : base;
 }
 
+GpuHeld held_of(const flyx_memory_info& mi) {
+  GpuHeld h;
+  h.total = mi.total;
+  const uint64_t model = mi.weights + mi.workspace;
+  if (mi.process > 0 && mi.process >= model && mi.total >= mi.free + mi.process) {
+    h.runtime_known = true;
+    h.runtime = mi.process - model;
+    h.others = mi.total - mi.free - mi.process;
+  } else if (mi.total > mi.free + model) {
+    h.others = mi.total - mi.free - model;
+  }
+  return h;
+}
+
 namespace {
 
-// The host memory K/V may take: as asked, or what the machine can spare (its available memory less host_keep(), and
-// less what the process takes besides).
+// The host memory K/V may take: as asked, or what the machine can spare (its available memory less host_keep() or
+// tiers.ram_reserve, and less what the process takes besides).
 uint64_t host_budget(const KvTiers& tiers) {
   if (tiers.ram >= 0) return uint64_t(tiers.ram);
   const os::SystemMemory m = os::system_memory();
-  const uint64_t keep = host_keep(m.total) + tiers.reserved;
+  const uint64_t base_keep = tiers.ram_reserve >= 0 ? uint64_t(tiers.ram_reserve) : host_keep(m.total);
+  const uint64_t keep = base_keep + tiers.reserved;
   return m.available > keep ? m.available - keep : 0;
 }
 
@@ -140,22 +155,6 @@ bool device_bytes(const flyx_backend_api* api, flyx_bmodel* bm, int ctx, const K
   return true;
 }
 
-// What holds the GPU besides the model (budget.h).  A process's share the system counts below the model's own (its
-// memory partly paged out) tells nothing: then as where it counts none.
-GpuHeld held_of(const flyx_memory_info& mi) {
-  GpuHeld h;
-  h.total = mi.total;
-  const uint64_t model = mi.weights + mi.workspace;
-  if (mi.process >= model && mi.total >= mi.free + mi.process) {
-    h.runtime_known = true;
-    h.runtime = mi.process - model;
-    h.others = mi.total - mi.free - mi.process;
-  } else if (mi.total > mi.free + model) {
-    h.others = mi.total - mi.free - model;
-  }
-  return h;
-}
-
 // "3.88" for 3.88e9 bytes (matching gb()'s decimal GB without the unit, for "3.88 / 17.09 GB").
 std::string gb_num(uint64_t bytes) {
   char buf[32];
@@ -214,7 +213,7 @@ bool init_device_budget(const flyx_backend_api* api, flyx_bmodel* bm, const KvTi
     return false;
   };
   if (reported) {
-    reserve = device_reserve(mi->total, tiers.gpu_paged);
+    reserve = tiers.vram_reserve >= 0 ? uint64_t(tiers.vram_reserve) : device_reserve(mi->total, tiers.gpu_paged);
     *reserve_out = reserve;
     const uint64_t have = mi->free + mi->weights + mi->workspace;
     // Zero is the ledger's sentinel for a backend that does not report a budget.

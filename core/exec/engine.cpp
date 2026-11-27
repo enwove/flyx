@@ -416,9 +416,17 @@ bool Engine::lower_and_time(std::string* err) {
     lower_ms_ += os::now_ms() - t0;
     if (!plans_.oom) return false;
     if (!give_back()) {  // out of GPU memory with nothing left to give back: what would make room (as the budget's)
-      *err += std::string(". Close other apps") +
-              (model_->drafters() > 0 ? ", disable speculative decoding" : "") +
-              ", or use a smaller quantization.";
+      flyx_memory_info mi{};
+      const bool has_others =
+          api_->memory && api_->memory(bm_, &mi) == 0 && mi.total > 0 && plan::closable(plan::held_of(mi));
+      const bool has_drafter = model_->drafters() > 0;
+      if (has_others)
+        *err += std::string(". Close other apps") + (has_drafter ? ", disable speculative decoding" : "") +
+                ", or use a smaller quantization.";
+      else if (has_drafter)
+        *err += ". Disable speculative decoding or use a smaller quantization.";
+      else
+        *err += ". Use a smaller quantization.";
       return false;
     }
   }
@@ -475,6 +483,8 @@ bool Engine::plan_memory(plan::KvTiers* tiers, int session_limit, int* asked_ctx
   tiers->ram = opt_.kv_ram;
   tiers->copy_gpu = opt_.kv_copy_gpu;
   tiers->reserved = opt_.host_reserved;
+  tiers->vram_reserve = opt_.vram_reserve;
+  tiers->ram_reserve = opt_.ram_reserve;
   tiers->gpu_paged = os::gpu_memory_paged();
   // --ctx max: the longest the GPU and host memory hold, or with no host memory for K/V the longest the GPU holds.
   const int min_ctx = opt_.ctx_max ? 1024 : opt_.ctx_given ? 0 : kMinFittedCtx;

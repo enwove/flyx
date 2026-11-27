@@ -34,6 +34,8 @@ ojson want_json(const ModelHost::Want& w) {
           {"kv", w.eo.kv == FLYX_KV_FP8 ? ojson("fp8") : w.eo.kv == FLYX_KV_16 ? ojson("16") : ojson(nullptr)},
           {"kv_ram", w.eo.kv_ram < 0 ? ojson("auto") : ojson(double(w.eo.kv_ram) / 1e9)},
           {"kv_gpu", w.eo.kv_gpu < 0 ? ojson(nullptr) : ojson(w.eo.kv_gpu)},
+          {"vram_reserve", w.eo.vram_reserve < 0 ? ojson("auto") : ojson(double(w.eo.vram_reserve) / 1e9)},
+          {"ram_reserve", w.eo.ram_reserve < 0 ? ojson("auto") : ojson(double(w.eo.ram_reserve) / 1e9)},
           {"width", w.eo.width < 0 ? ojson(nullptr) : ojson(w.eo.width)},
           {"draft_trees", w.eo.draft_trees_given ? ojson(w.eo.draft_trees) : ojson(nullptr)},  // null: the drafter's default
           {"lookup", w.eo.lookup},
@@ -252,6 +254,19 @@ bool want_from_json(const ojson& j, const EngineOptions& base, ModelHost::Want* 
       return *err = "\"kv_gpu\": positions, a whole number", false;
     out.eo.kv_gpu = j["kv_gpu"].get<int>();
   }
+  auto parse_reserve = [&](const char* key, int64_t* dst) {
+    if (!j.contains(key) || j[key].is_null()) return true;
+    if (j[key].is_string() && j[key].get<std::string>() == "auto") {
+      *dst = -1;
+      return true;
+    }
+    if (!j[key].is_number() || j[key].get<double>() < 0 || j[key].get<double>() > apps::kMaxKvRamGb)
+      return *err = std::string("\"") + key + "\": GB to keep free, or \"auto\"", false;
+    *dst = int64_t(j[key].get<double>() * 1e9);
+    return true;
+  };
+  if (!parse_reserve("vram_reserve", &out.eo.vram_reserve)) return false;
+  if (!parse_reserve("ram_reserve", &out.eo.ram_reserve)) return false;
   if (j.contains("name") && !j["name"].is_null()) {
     if (!j["name"].is_string()) return *err = "\"name\": model id string", false;
     out.name = j["name"].get<std::string>();
@@ -405,6 +420,23 @@ bool ModelHost::save_lan_access(bool enabled, std::string* err) {
   ojson root = read_settings_locked();
   if (!root.is_object()) root = ojson::object();
   root["lan_access"] = enabled;
+  return write_settings_locked(root, err);
+}
+
+bool ModelHost::remote_manage() {
+  const ojson root = read_settings();
+  return root.is_object() && root.contains("remote_manage") && root["remote_manage"] == true;
+}
+
+bool ModelHost::save_remote_manage(bool enabled, std::string* err) {
+  if (settings_path().empty()) {
+    *err = "no configuration directory available to save LAN management setting";
+    return false;
+  }
+  std::lock_guard<std::mutex> lock(settings_mutex());
+  ojson root = read_settings_locked();
+  if (!root.is_object()) root = ojson::object();
+  root["remote_manage"] = enabled;
   return write_settings_locked(root, err);
 }
 

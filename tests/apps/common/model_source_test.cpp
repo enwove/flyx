@@ -12,6 +12,7 @@
 
 #include "apps/common/model_source.h"
 #include "core/modelfile/readers.h"
+#include "core/os/env.h"
 #include "core/os/os.h"
 #include "core/os/path.h"
 #include "tests/common/check.h"
@@ -212,6 +213,49 @@ int main() {
               fs::file_size(lsnap / "adapters" / "small" / "adapter_config.json") == config.size() &&
               fs::file_size(lsnap / "adapters" / "small" / "adapter_model.safetensors") == 64,
           "one within it is fetched with its weights" + (ok ? std::string() : ": " + err));
+  }
+  // expand_user_path and scan_model_dirs: nested non-HF layouts, mixed/unsupported files, tilde, symlinks + cycles.
+  {
+    const std::string home = flyx::os::home_dir();
+    if (!home.empty()) {
+      check(flyx::apps::expand_user_path("~") == home, "expand_user_path(\"~\") returns home_dir");
+      const fs::path expected = to_path(home) / "models";
+      check(to_path(flyx::apps::expand_user_path("~/models")) == expected,
+            "expand_user_path(\"~/models\") expands tilde");
+      check(flyx::apps::expand_user_path("/abs/models") == "/abs/models",
+            "expand_user_path leaves non-tilde paths untouched");
+    }
+    const fs::path scan_root = tmp / "scan_root";
+    const fs::path nested = scan_root / "Author" / "Model" / "Nested-Q4_K_M.gguf";
+    const fs::path unsupported = scan_root / "Other" / "Unsupported-Q4.gguf";
+    const fs::path ext_dir = tmp / "external_models";
+    const fs::path linked_model = ext_dir / "Linked-Q4_K_M.gguf";
+    write_gguf(nested, "qwen35");
+    write_gguf(unsupported, "some_future_arch");
+    write_gguf(linked_model, "qwen3");
+    std::ofstream(scan_root / "README.txt", std::ios::binary) << "ignore me";
+
+    // Create a directory symlink to external_models and a symlink loop back to scan_root (skip if OS disallows).
+    std::error_code sym_ec;
+    fs::create_directory_symlink(ext_dir, scan_root / "linked", sym_ec);
+    const bool symlinks_ok = !sym_ec;
+    if (symlinks_ok) {
+      std::error_code loop_ec;
+      fs::create_directory_symlink(scan_root, scan_root / "Author" / "loop", loop_ec);
+    }
+
+    const auto found = flyx::apps::scan_model_dirs({from_path(scan_root), from_path(tmp / "does_not_exist")});
+    bool saw_nested = false, saw_unsupported = false, saw_linked = false;
+    for (const auto& m : found) {
+      const fs::path p = to_path(m.path);
+      if (p.filename() == "Nested-Q4_K_M.gguf") saw_nested = true;
+      if (p.filename() == "Unsupported-Q4.gguf") saw_unsupported = true;
+      if (p.filename() == "Linked-Q4_K_M.gguf") saw_linked = true;
+    }
+    check(saw_nested && saw_unsupported,
+          "scan_model_dirs finds nested GGUFs and does not break on unsupported architectures or non-GGUF files");
+    if (symlinks_ok)
+      check(saw_linked, "scan_model_dirs follows directory symlinks and survives symlink cycles");
   }
   set_env("HF_HUB_OFFLINE", "");
   set_env("HF_HUB_CACHE", "");

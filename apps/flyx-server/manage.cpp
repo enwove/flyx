@@ -97,6 +97,14 @@ void error(httplib::Response& res, int status, const std::string& message, const
   send_json(res, status, {{"error", {{"message", message}, {"type", type}}}});
 }
 
+void describe_error(httplib::Response& res, const std::string& err) {
+  const bool upstream = err.find("cannot reach the Hub") != std::string::npos ||
+                        err.find("the Hub answered") != std::string::npos ||
+                        err.find("the Hub's answer") != std::string::npos ||
+                        err.find("the Hub named no commit") != std::string::npos;
+  error(res, upstream ? 502 : 404, err, upstream ? "hub_error" : "not_found");
+}
+
 // One model of GET /v1/hub/cached, and what deleting it takes.
 struct Listed {
   ojson json;
@@ -234,7 +242,7 @@ bool dir_json(const Server& s, const std::string& asked, ojson* out, std::string
     std::set<fs::path> seen;
     auto start = [&](const std::string& dir) {
       std::error_code e2;
-      const fs::path p = fs::weakly_canonical(to_path(dir), e2);
+      const fs::path p = fs::weakly_canonical(to_path(apps::expand_user_path(dir)), e2);
       if (!e2 && fs::is_directory(p, e2) && seen.insert(p).second)
         dirs.push_back({{"name", from_path(p)}, {"path", from_path(p)}});
     };
@@ -246,7 +254,7 @@ bool dir_json(const Server& s, const std::string& asked, ojson* out, std::string
     *out = {{"path", ""}, {"parent", nullptr}, {"kind", "start"}, {"dirs", dirs}, {"models", models}};
     return true;
   }
-  const fs::path given = fs::absolute(to_path(asked), ec);
+  const fs::path given = fs::absolute(to_path(apps::expand_user_path(asked)), ec);
   const fs::path p = ec ? fs::path{} : fs::weakly_canonical(given, ec);
   if (ec || p.empty() || !fs::exists(p, ec)) return *err = asked + ": no such folder or file on this machine", false;
   const bool is_dir = fs::is_directory(p, ec);
@@ -469,7 +477,7 @@ void add_manage_routes(httplib::Server& http, Server* s) {
       return error(r, 400, "repo: a Hugging Face repository, org/name", "invalid_request_error");
     hub::Repo repo;
     std::string err;
-    if (!hub::describe(name.repo, name.revision, &repo, &err)) return error(r, 404, err, "not_found");
+    if (!hub::describe(name.repo, name.revision, &repo, &err)) return describe_error(r, err);
     send_json(r, 200, repo_json(repo));
   });
   http.Get("/v1/hub/loras", [s](const httplib::Request& q, httplib::Response& r) {
@@ -502,7 +510,7 @@ void add_manage_routes(httplib::Server& http, Server* s) {
       return error(r, 400, "repo: a Hugging Face repository, org/name[@REV]", "invalid_request_error");
     hub::Repo repo;
     std::string err;
-    if (!hub::describe(name.repo, name.revision, &repo, &err)) return error(r, 404, err, "not_found");
+    if (!hub::describe(name.repo, name.revision, &repo, &err)) return describe_error(r, err);
     // Each adapter (at most 32), read where it is: its config (at most 64 KiB; a few hundred bytes as PEFT writes it)
     // and its weights' header, into memory alone, kReadsAtOnce adapters at a time (a request's threads and the Hub's
     // connections bounded).  The Hub's files are anyone's: every string of them is checked before it is shown
@@ -563,7 +571,7 @@ void add_manage_routes(httplib::Server& http, Server* s) {
     } else if (hub::parse_name(name, &hn)) {
       hub::Repo repo;
       std::string err;
-      if (!hub::describe(hn.repo, hn.revision, &repo, &err)) return error(r, 404, err, "not_found");
+      if (!hub::describe(hn.repo, hn.revision, &repo, &err)) return describe_error(r, err);
       kind = apps::drafter_kind(repo);
     } else {
       return error(r, 400, "name: a drafter's path or Hugging Face name", "invalid_request_error");
@@ -723,9 +731,16 @@ void add_manage_routes(httplib::Server& http, Server* s) {
     if (!require_manage(*s, q, r, "loading models")) return;
     ojson models = ojson::array();
     for (Listed& l : listing(*s)) models.push_back(std::move(l.json));
+    ojson dirs = ojson::array();
+    std::set<std::string> seen_dirs;
+    for (const std::string& d : s->models_dirs) {
+      std::error_code ec;
+      const fs::path abs = fs::absolute(to_path(apps::expand_user_path(d)), ec);
+      const std::string sdir = ec ? apps::expand_user_path(d) : from_path(abs.lexically_normal());
+      if (!sdir.empty() && seen_dirs.insert(sdir).second) dirs.push_back(sdir);
+    }
     const auto cache = hub::resolve_cache_dir();
-    send_json(r, 200, {{"cache", cache.value}, {"cache_from", cache.source}, {"dirs", s->models_dirs},
-                       {"models", models}});
+    send_json(r, 200, {{"cache", cache.value}, {"cache_from", cache.source}, {"dirs", dirs}, {"models", models}});
   });
   http.Delete("/v1/hub/cached", [s](const httplib::Request& q, httplib::Response& r) {
     if (!require_manage(*s, q, r, "loading models")) return;

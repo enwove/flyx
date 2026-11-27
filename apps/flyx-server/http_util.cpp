@@ -393,7 +393,7 @@ bool authorized(const Server& s, const httplib::Request& req) {
 bool may_manage(const Server& s, const httplib::Request& req) {
   if (!authorized(s, req)) return false;
   if (!s.cfg.api_key.empty()) return true;
-  return from_this_machine(req) && browser_request_safe(s, req);
+  return (from_this_machine(req) || s.remote_manage.load(std::memory_order_relaxed)) && browser_request_safe(s, req);
 }
 
 bool from_this_machine(const httplib::Request& req) { return is_loopback_ip(req.remote_addr) && !forwarded(req); }
@@ -407,8 +407,10 @@ bool require_auth(const Server& s, const httplib::Request& req, httplib::Respons
 
 bool require_manage(const Server& s, const httplib::Request& req, httplib::Response& res, const char* what) {
   if (may_manage(s, req)) return true;
-  send_json(res, 403, {{"error", {{"message", std::string(what) + " is for this machine (or with --api-key, the key's holder)"},
-                                  {"type", "permission_error"}}}});
+  send_json(res, 403,
+            {{"error",
+              {{"message", std::string(what) + " is for this machine (use --api-key KEY, or --no-auth on a trusted LAN)"},
+               {"type", "permission_error"}}}});
   return false;
 }
 

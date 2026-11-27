@@ -48,6 +48,7 @@ struct Server {
   RequestLog* requests = nullptr;  // the last finished requests, for GET /v1/requests
   SystemLog* logs = nullptr;       // the last lines on standard error, for GET /v1/logs
   std::vector<std::string> models_dirs{};  // --models-dir, then FLYX_MODELS_DIR: model files beside the cache (0079)
+  std::atomic<bool> remote_manage{false};  // opt-in (--no-auth or saved setting): allow LAN management without API key
 };
 
 // How long a request waits for its job to start before it answers.  A job refused at the start (its prompt longer than
@@ -117,7 +118,8 @@ void add_anthropic_messages_routes(httplib::Server& http, Server* s);
 void add_openai_responses_routes(httplib::Server& http, Server* s);
 void add_telemetry_routes(httplib::Server& http, Server* s);
 void add_manage_routes(httplib::Server& http, Server* s);  // manage.cpp: the dashboard's model panel
-void add_network_routes(httplib::Server& http, Server* s, const std::string& host, int port, bool host_from_cli);
+void add_network_routes(httplib::Server& http, Server* s, const std::string& host, int port, bool host_from_cli,
+                        bool no_auth_from_cli = false);
 void add_request_log_routes(httplib::Server& http, Server* s);  // request_log.cpp: GET /v1/requests
 void add_system_log_routes(httplib::Server& http, Server* s);   // system_log.cpp: GET /v1/logs
 

@@ -211,6 +211,15 @@ std::vector<std::string> models_dirs_from_env() {
   return out;
 }
 
+std::string expand_user_path(const std::string& path) {
+  if (path.empty() || path[0] != '~') return path;
+  if (path.size() > 1 && path[1] != '/' && path[1] != '\\') return path;
+  const std::string home = os::home_dir();
+  if (home.empty()) return path;
+  if (path.size() == 1) return home;
+  return from_path((to_path(home) / to_path(path.substr(2))).lexically_normal());
+}
+
 std::vector<LocalModel> scan_model_dirs(const std::vector<std::string>& dirs, int deepest) {
   constexpr int kMostEntries = 200000;     // a directory named by mistake (a whole disk) ends the scan early
   std::vector<LocalModel> out;
@@ -225,18 +234,25 @@ std::vector<LocalModel> scan_model_dirs(const std::vector<std::string>& dirs, in
     std::map<int, LocalShard> parts;
   };
   std::map<std::pair<std::string, int>, SplitAcc> splits;
+  const auto opts = fs::directory_options::skip_permission_denied | fs::directory_options::follow_directory_symlink;
   for (const std::string& dir : dirs) {
     std::error_code ec;
-    const fs::path root = fs::absolute(to_path(dir), ec);
-    if (ec) continue;
+    const std::string expanded = expand_user_path(dir);
+    const fs::path root = fs::absolute(to_path(expanded), ec);
+    if (ec || !fs::is_directory(root, ec)) continue;
+    std::set<fs::path> visited_dirs;
+    const fs::path root_canon = fs::weakly_canonical(root, ec);
+    if (!ec) visited_dirs.insert(root_canon);
+    ec.clear();
     int entries = 0;
-    for (fs::recursive_directory_iterator it(root, fs::directory_options::skip_permission_denied, ec), end;
+    for (fs::recursive_directory_iterator it(root, opts, ec), end;
          !ec && it != end && ++entries < kMostEntries; it.increment(ec)) {
       const std::string name = from_path(it->path().filename());
       std::error_code e2;
       if (it->is_directory(e2)) {
-        if (name.empty() || name[0] == '.' || name[0] == '$' || name == "node_modules" ||
-            name == "System Volume Information" || it.depth() + 1 >= deepest)
+        const fs::path dcanon = fs::weakly_canonical(it->path(), e2);
+        if (e2 || !visited_dirs.insert(dcanon).second || name.empty() || name[0] == '.' || name[0] == '$' ||
+            name == "node_modules" || name == "System Volume Information" || it.depth() + 1 >= deepest)
           it.disable_recursion_pending();
         continue;
       }

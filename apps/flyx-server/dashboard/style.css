@@ -148,6 +148,11 @@ main { overflow-y: auto; background: var(--surface); border-top: 1px solid var(-
 .lk .v small, .lbig small { color: var(--faint); font-size: 11px; margin-left: 4px; letter-spacing: 0; }
 .lbig { font-family: var(--mono); font-size: 28px; font-weight: 500; letter-spacing: -0.03em; line-height: 1.1; margin-top: 4px; font-variant-numeric: tabular-nums; }
 .lsub { color: var(--faint); font-size: 11px; font-family: var(--mono); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.lspeeds { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 10px; align-items: start; }
+.lspeeds > div { min-width: 0; }
+.lspeeds .lbig { font-size: 17px; letter-spacing: -0.02em; margin-top: 2px; white-space: nowrap; }
+.lspeeds .lbig small { font-size: 10px; margin-left: 2px; }
+.lspeeds .lsub { margin-top: 1px; }
 .lpair { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; padding: 6px 0 10px; }
 .lpair .lbig { font-size: 16px; letter-spacing: -0.01em; margin-top: 2px; }
 .lpair .lsub { margin-top: 1px; }

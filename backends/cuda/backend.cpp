@@ -773,9 +773,12 @@ int open_model(const flyx_model_desc* desc, const flyx_open_options* opts, flyx_
     size_t free = 0, total = 0;
     const bool mem_ok = gpu_memory(&free, &total) && total > 0;
     const size_t process = gpu_process_memory();
-    const size_t own = process >= m->bytes ? process : m->bytes;
+    const bool runtime_known = process > 0 && process >= m->bytes;
+    const size_t own = runtime_known ? process : m->bytes;
     const size_t others = mem_ok && total > free && total - free > own ? total - free - own : 0;
-    const bool has_others = others >= (256ull << 20);
+    // Match plan::closable(): when this process's CUDA runtime (~0.3-0.7 GB) cannot be separated from other apps,
+    // require at least 1 GiB before blaming other apps.
+    const bool has_others = others >= (runtime_known ? (256ull << 20) : (1ull << 30));
     // From the description: a drafter's layers may come before its block, and run out of memory before it is bound.
     bool drafter = false;
     for (int i = 0; i < desc->n_blocks; ++i)

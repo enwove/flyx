@@ -65,6 +65,8 @@ class ModelHost {
   static bool save_hub_endpoint(const std::string& endpoint, std::string* err = nullptr);
   static bool lan_access();
   static bool save_lan_access(bool enabled, std::string* err);
+  static bool remote_manage();
+  static bool save_remote_manage(bool enabled, std::string* err);
 
  private:
   struct BusyGuard {

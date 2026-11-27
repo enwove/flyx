@@ -70,29 +70,63 @@ ojson api_urls(const std::string& host, int port) {
 
 }  // namespace
 
-void add_network_routes(httplib::Server& http, Server* s, const std::string& host, int port, bool host_from_cli) {
-  auto status = [host, port, host_from_cli](bool saved) -> ojson {
+void add_network_routes(httplib::Server& http, Server* s, const std::string& host, int port, bool host_from_cli,
+                        bool no_auth_from_cli) {
+  auto status = [s, host, port, host_from_cli, no_auth_from_cli](bool saved_lan) -> ojson {
     const bool serving_lan = !is_loopback_ip(host);
-    return {{"lan_access", saved}, {"listen_host", host}, {"port", port}, {"host_from_cli", host_from_cli},
-            {"serving_lan", serving_lan}, {"restart_required", !host_from_cli && serving_lan != saved},
+    const bool api_key_set = !s->cfg.api_key.empty();
+    return {{"lan_access", saved_lan},
+            {"listen_host", host},
+            {"port", port},
+            {"host_from_cli", host_from_cli},
+            {"serving_lan", serving_lan},
+            {"restart_required", !host_from_cli && serving_lan != saved_lan},
+            {"remote_manage", s->remote_manage.load(std::memory_order_relaxed)},
+            {"no_auth_from_cli", no_auth_from_cli},
+            {"api_key_set", api_key_set},
             {"api_urls", api_urls(host, port)}};
   };
   http.Get("/v1/settings/network", [s, status](const httplib::Request& req, httplib::Response& res) {
     if (!require_manage(*s, req, res, "network settings")) return;
     send_json(res, 200, status(ModelHost::lan_access()));
   });
-  http.Post("/v1/settings/network", [s, status, host_from_cli](const httplib::Request& req, httplib::Response& res) {
-    if (!require_manage(*s, req, res, "network settings")) return;
-    if (host_from_cli) return send_openai_error(res, 409, "the listen address is set by --host");
-    ojson body;
-    if (!parse_json_object(req, res, &body)) return;
-    if (body.size() != 1 || !body.contains("lan_access") || !body["lan_access"].is_boolean())
-      return send_openai_error(res, 400, "expected a boolean lan_access setting");
-    const bool enabled = body["lan_access"].get<bool>();
-    std::string err;
-    if (!ModelHost::save_lan_access(enabled, &err)) return send_openai_error(res, 500, err, "server_error");
-    send_json(res, 200, status(enabled));
-  });
+  http.Post("/v1/settings/network",
+            [s, status, host_from_cli, no_auth_from_cli](const httplib::Request& req, httplib::Response& res) {
+              if (!require_manage(*s, req, res, "network settings")) return;
+              ojson body;
+              if (!parse_json_object(req, res, &body)) return;
+              if (body.empty())
+                return send_openai_error(res, 400, "expected a boolean lan_access or remote_manage setting");
+              for (auto it = body.begin(); it != body.end(); ++it) {
+                if (it.key() != "lan_access" && it.key() != "remote_manage")
+                  return send_openai_error(res, 400, "unknown network setting: " + it.key());
+                if (!it.value().is_boolean())
+                  return send_openai_error(res, 400, "expected a boolean " + it.key() + " setting");
+              }
+              if (body.contains("lan_access") && host_from_cli)
+                return send_openai_error(res, 409, "the listen address is set by --host");
+              if (body.contains("remote_manage")) {
+                if (no_auth_from_cli)
+                  return send_openai_error(res, 409, "LAN management auth is disabled by --no-auth");
+                if (!s->cfg.api_key.empty())
+                  return send_openai_error(res, 409, "an API key is configured (--api-key or FLYX_API_KEY)");
+              }
+              std::string err;
+              bool saved_lan = ModelHost::lan_access();
+              if (body.contains("lan_access")) {
+                const bool enabled = body["lan_access"].get<bool>();
+                if (!ModelHost::save_lan_access(enabled, &err))
+                  return send_openai_error(res, 500, err, "server_error");
+                saved_lan = enabled;
+              }
+              if (body.contains("remote_manage")) {
+                const bool enabled = body["remote_manage"].get<bool>();
+                if (!ModelHost::save_remote_manage(enabled, &err))
+                  return send_openai_error(res, 500, err, "server_error");
+                s->remote_manage.store(enabled, std::memory_order_relaxed);
+              }
+              send_json(res, 200, status(saved_lan));
+            });
 }
 
 }  // namespace flyx::server

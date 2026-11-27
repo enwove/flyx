@@ -168,6 +168,8 @@ struct LocalModel {
   int mtp_layers = -1;       // cached <arch>.nextn_predict_layers for kind == "gguf"
   std::filesystem::file_time_type modified = std::filesystem::file_time_type::min();
 };
+// Expands a leading "~" ("~", "~/...", "~\...") to the user's home directory; other paths stay unchanged.
+std::string expand_user_path(const std::string& path);
 // `deepest`: how many directories down a file may be (1: only in the directory named).
 std::vector<LocalModel> scan_model_dirs(const std::vector<std::string>& dirs, int deepest = 6);
 // FLYX_MODELS_DIR's directories: separated by ';' on Windows, ':' elsewhere (as PATH is).

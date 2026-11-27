@@ -58,6 +58,12 @@ bool engine_flag(const std::string& a, const std::function<std::string()>& value
   } else if (a == "--kv-ram") {
     const std::string v = value();
     eo->kv_ram = v == "auto" ? -1 : int64_t(number_flag("--kv-ram", v, 0, kMaxKvRamGb) * 1e9);
+  } else if (a == "--vram-reserve") {
+    const std::string v = value();
+    eo->vram_reserve = v == "auto" ? -1 : int64_t(number_flag("--vram-reserve", v, 0, kMaxKvRamGb) * 1e9);
+  } else if (a == "--ram-reserve") {
+    const std::string v = value();
+    eo->ram_reserve = v == "auto" ? -1 : int64_t(number_flag("--ram-reserve", v, 0, kMaxKvRamGb) * 1e9);
   } else if (a == "--kv-method") {
     const std::string v = value();
     interfaces::KvMethodSpec spec;
@@ -147,6 +153,12 @@ std::string engine_flags_help(int ctx) {
          "                       the bus, the same bits, slower past that part (default auto: what the machine can\n"
          "                       spare, serve's --host-cache getting what it leaves; 0: none, the context shrinks\n"
          "                       to fit the GPU)\n"
+         "  --vram-reserve GB|auto\n"
+         "                       VRAM kept free for the driver and desktop (default auto: max 384 MiB or 2.5% of\n"
+         "                       VRAM, 832 MiB on WSL2; 0 lets a dedicated/headless machine use all free VRAM)\n"
+         "  --ram-reserve GB|auto\n"
+         "                       host RAM kept free when --kv-ram is auto (default auto: max 2 GiB or 1/16 of RAM;\n"
+         "                       0 lets a dedicated/headless machine use all available RAM)\n"
          "  --kv-gpu N           keep at most N tokens' K/V on the GPU, the rest in host memory (default: as many\n"
          "                       as fit)\n"
          "  --kv-copy-gpu N      with K/V in host memory: keep the strata copy of at most N layers on the GPU, the\n"

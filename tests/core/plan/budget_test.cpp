@@ -675,5 +675,64 @@ int main() {
               std::to_string(b.layout.copy_host) + ", dev=" + std::to_string(b.layout.device_positions));
   }
 
+  // Explicit --vram-reserve and --ram-reserve overrides: 0 lets a dedicated host use all available VRAM/RAM.
+  {
+    ResourceLedger ledger_auto, ledger_zero, ledger_big;
+    plan::Budget b_auto, b_zero, b_big;
+    std::string err;
+    int ctx_auto = 8192, ctx_zero = 8192, ctx_big = 8192;
+    plan::KvTiers t_auto = kGpuOnly;
+    plan::KvTiers t_zero = kGpuOnly;
+    t_zero.vram_reserve = 0;
+    plan::KvTiers t_big = kGpuOnly;
+    t_big.vram_reserve = int64_t(2 * kGiB);
+    check(plan::account(&api, nullptr, false, false, &ctx_auto, 4096, t_auto, &ledger_auto, &b_auto, &err),
+          "auto vram_reserve accounts: " + err);
+    check(plan::account(&api, nullptr, false, false, &ctx_zero, 4096, t_zero, &ledger_zero, &b_zero, &err),
+          "zero vram_reserve accounts: " + err);
+    check(plan::account(&api, nullptr, false, false, &ctx_big, 4096, t_big, &ledger_big, &b_big, &err),
+          "explicit 2 GiB vram_reserve accounts: " + err);
+    check(ledger_zero.budget() == 16 * kGiB && ledger_zero.budget() > ledger_auto.budget(),
+          "vram_reserve=0 unlocks full device VRAM (" + std::to_string(ledger_zero.budget()) + " > " +
+              std::to_string(ledger_auto.budget()) + ")");
+    check(ledger_big.budget() == 14 * kGiB && ledger_big.budget() < ledger_auto.budget(),
+          "explicit vram_reserve=2 GiB reserves exactly 2 GiB (" + std::to_string(ledger_big.budget()) + ")");
+  }
+  {
+    // Auto host RAM budget (--kv-ram auto) honors --ram-reserve: 0 >= auto > large explicit reserve.
+    ResourceLedger l0, l1, l2;
+    plan::Budget b0, b1, b2;
+    std::string err;
+    int c0 = 65536, c1 = 65536, c2 = 65536;
+    plan::KvTiers t_zero{-1, -1};
+    t_zero.ram_reserve = 0;
+    plan::KvTiers t_auto{-1, -1};
+    plan::KvTiers t_large{-1, -1};
+    t_large.ram_reserve = int64_t(4 * kGiB);
+    check(plan::account(&api, nullptr, false, false, &c0, 0, t_zero, &l0, &b0, &err), "ram_reserve=0: " + err);
+    check(plan::account(&api, nullptr, false, false, &c1, 0, t_auto, &l1, &b1, &err), "ram_reserve=auto: " + err);
+    check(plan::account(&api, nullptr, false, false, &c2, 0, t_large, &l2, &b2, &err), "ram_reserve=4GiB: " + err);
+    if (b0.host_budget > 0) {
+      check(b0.host_budget > b1.host_budget,
+            "ram_reserve=0 grants more host KV budget than auto (" + std::to_string(b0.host_budget) + " > " +
+                std::to_string(b1.host_budget) + ")");
+      check(b0.host_budget >= b2.host_budget + 3 * kGiB || b2.host_budget == 0,
+            "explicit ram_reserve reduces host KV budget");
+    }
+  }
+  {
+    // Without per-process accounting (Linux), ~0.65 GiB of CUDA context is not misreported as closable other apps.
+    const flyx_memory_info linux_ctx{0, 0, 16 * kGiB - 650 * kMiB, 16 * kGiB, 0};
+    const flyx_memory_info linux_other{0, 0, 16 * kGiB - 1500 * kMiB, 16 * kGiB, 0};
+    const flyx_memory_info win_other{10 * kGiB, 0, 16 * kGiB - 10 * kGiB - 500 * kMiB - 512 * kMiB, 16 * kGiB,
+                                     10 * kGiB + 500 * kMiB};
+    check(!plan::closable(plan::held_of(linux_ctx)),
+          "0.65 GiB without process accounting is not blamed on other apps");
+    check(plan::closable(plan::held_of(linux_other)),
+          "1.5 GiB without process accounting is reported as other apps");
+    check(plan::closable(plan::held_of(win_other)),
+          "0.5 GiB with process accounting is reported as other apps");
+  }
+
   return flyx::test::finish("budget_test");
 }

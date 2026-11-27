@@ -277,6 +277,9 @@ class Server:
             name = query.get("name", [""])[0]
             return route.fulfill(json={"name": name, "kind": DRAFTER_KINDS.get(name)})
         if "/v1/hub/files" in url:
+            if getattr(self, "files_fail", None):
+                status, msg = self.files_fail
+                return route.fulfill(status=status, json={"error": {"message": msg}})
             res = repository(query["repo"][0], getattr(self, "helper_cached", False))
             res["endpoint"] = self.hub_endpoint
             return route.fulfill(json=res)
@@ -341,6 +344,16 @@ def check_settings(page, server, want):
             expect(page.locator('[data-k="kv_gpu"] .was')).to_contain_text("0")
         confirm(page, "#mf-reload", "Reload")
         assert server.posted[-1]["kv_gpu"] == (int(value) if value else None) and server.posted[-1]["model"] == want["model"], server.posted[-1]
+    page.locator("#mf-vramres").fill("0")
+    page.locator("#mf-ramres").fill("0")
+    expect(cmd).to_contain_text("--vram-reserve 0")
+    expect(cmd).to_contain_text("--ram-reserve 0")
+    confirm(page, "#mf-reload", "Reload")
+    assert server.posted[-1]["vram_reserve"] == 0 and server.posted[-1]["ram_reserve"] == 0, server.posted[-1]
+    page.locator("#mf-vramres").fill("")
+    page.locator("#mf-ramres").fill("")
+    expect(cmd).not_to_contain_text("--vram-reserve")
+    expect(cmd).not_to_contain_text("--ram-reserve")
     page.locator("#mf-reset").click()
     expect(page.locator("#mf-name")).to_have_value("")
     expect(page.locator("#mf-reload")).to_have_count(0)
@@ -771,6 +784,21 @@ def check_hub(page, server, want):
     verified.click()
     expect(page.locator("#mf-cmd")).to_contain_text(re.compile(r"--drafter-file '?acme/Tiny-27B-DFlash2"))
     page.locator("#mf-reset").click()
+    # A 404 JSON or 502 error from /v1/hub/files surfaces the real error with a Retry button (not "update FLYX").
+    view(page, "library")
+    server.files_fail = (404, "acme/Missing: repository not found")
+    page.locator("#hf-q").fill("acme/Missing")
+    page.keyboard.press("Enter")
+    expect(page.locator("#mf-hubmsg.banner.bad")).to_contain_text("acme/Missing: repository not found")
+    expect(page.locator("#mf-hubmsg")).not_to_contain_text("update FLYX")
+    server.files_fail = (502, "cannot reach the Hub (timed out)")
+    page.locator("#hf-retry").click()
+    expect(page.locator("#mf-hubmsg.banner.bad")).to_contain_text("cannot reach the Hub (timed out)")
+    server.files_fail = None
+    page.locator("#hf-q").fill(REPO)
+    page.keyboard.press("Enter")
+    expect(page.locator("#mf-files .mrow")).to_have_count(5)
+    page.locator("#hf-q").fill("")
 
 
 def check_local(page, server):
