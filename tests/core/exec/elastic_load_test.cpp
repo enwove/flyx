@@ -44,6 +44,7 @@ int g_open_calls = 0;
 bool g_expert_caps = false, g_layer_caps = false;
 uint64_t g_session_bytes = 0;
 uint32_t g_used_experts = 0, g_used_layers = 0;
+int g_allocator_experts = -1;
 std::vector<int32_t> g_seen_dw;
 std::string g_active_dw;
 std::string g_opaque_options;
@@ -144,7 +145,8 @@ int hook_open(const flyx_model_desc* desc, const flyx_open_options* opts, flyx_b
     g_err = "Not enough VRAM (simulated non-OOM status -1)";
     return -1;
   }
-  if (g_oom_always || (g_oom_eagle4 && has_block(desc, FLYX_BLOCK_EAGLE4))) {
+  if (g_oom_always || (g_oom_eagle4 && has_block(desc, FLYX_BLOCK_EAGLE4)) ||
+      (g_allocator_experts >= 0 && (!g_used_experts || int(g_used_experts - 1) > g_allocator_experts))) {
     g_err = "Not enough VRAM while loading weights (16.00 GB GPU). Use a smaller quantization.";
     return FLYX_ERR_OOM;
   }
@@ -272,6 +274,7 @@ void reset_hooks() {
   g_generic_rc_with_vram_text = false;
   g_open_calls = 0;
   g_expert_caps = g_layer_caps = false;
+  g_allocator_experts = -1;
   g_session_bytes = 0;
   g_target_options.clear();
   g_kv_row_bytes = 0;
@@ -383,10 +386,11 @@ int main(int argc, char** argv) {
     check((experts ? g_used_experts : g_used_layers) == 3, "explicit residency cap reaches backend open");
   }
 
-  {
+  for (bool allocator_refusal : {false, true}) {
     reset_hooks();
     g_expert_caps = true;
-    g_session_bytes = 48ull << 20;
+    g_session_bytes = allocator_refusal ? 0 : 48ull << 20;
+    g_allocator_experts = allocator_refusal ? 6 : -1;
     g_total_vram = 12ull << 30;
     g_free_vram = g_target_bytes + (512ull << 20) + 7 * (64ull << 20) +
                   plan::device_reserve(g_total_vram, os::gpu_memory_paged());
@@ -399,7 +403,8 @@ int main(int argc, char** argv) {
     Engine fitted;
     if (!fitted.load(model, eo, &err)) { check(false, err); return 1; }
     check(g_used_experts == 7 && g_open_calls == 2,
-          "after measuring a 48 MiB shortfall the retry releases one 64 MiB expert and retains six");
+          allocator_refusal ? "an allocator refusal at seven experts retries at six" :
+                              "after measuring a 48 MiB shortfall the retry releases one 64 MiB expert and retains six");
   }
 
   // Exactly 32 decimal GB after the plain target. Adding any drafter crosses the old precision threshold.

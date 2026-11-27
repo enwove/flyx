@@ -937,6 +937,7 @@ bool Engine::load(const std::string& path, const EngineOptions& opt, std::string
 
   // Query the backend for physical sizes. A host-memory limit is checked after choosing the largest
   // feasible GPU partition, which also minimizes the amount we need to keep in RAM.
+  int expert_backoff = 1, layer_backoff = 1;
   auto fit_weights = [&](const flyx_load_estimate& current, uint64_t free, uint64_t total, bool retry,
                          uint64_t shortfall) {
     const auto ram = os::system_memory();
@@ -949,9 +950,10 @@ bool Engine::load(const std::string& path, const EngineOptions& opt, std::string
       if (count <= 0 || !interfaces::backend_opt_get(clean_backend_opts, key).empty()) return false;
       const int before = resident < 0 ? count : resident;
       if (before == 0) return false;
-      // The post-load session budget knows how many additional bytes it needs. For an allocator
-      // refusal without a measured shortfall, halve residency to bound complete reuploads.
-      const int upper = retry && !shortfall ? before / 2 : before - 1;
+      // An allocator refusal may miss by just one unit. Increase the step on repeated refusals, limiting reuploads
+      // without sending half a fitting model to RAM on the first retry.
+      int& backoff = field == &flyx_open_options::gpu_experts_plus_one ? expert_backoff : layer_backoff;
+      const bool unmeasured = retry && !shortfall;
       flyx_load_estimate trial{};
       auto estimate = [&](int cap) {
         auto options = make_open_options();
@@ -962,8 +964,13 @@ bool Engine::load(const std::string& path, const EngineOptions& opt, std::string
                trial.min_runtime_bytes <= room &&
                trial.weights_bytes <= room - trial.min_runtime_bytes;
       };
-      const int cap = plan::fit_residency(upper, estimate);
+      int cap = plan::fit_residency(before - 1, estimate);
       if (cap < 0 || !estimate(cap) || (ram.total && trial.offload_host_bytes > host_room)) return false;
+      if (unmeasured) {
+        const int lower = before - std::min(before, backoff);
+        if (lower < cap && estimate(lower) && (!ram.total || trial.offload_host_bytes <= host_room)) cap = lower;
+        backoff += std::min(backoff, count - backoff);
+      }
       resident = cap;
       const std::string detail = field == &flyx_open_options::gpu_experts_plus_one
           ? " experts per layer on GPU, remaining experts on CPU"
