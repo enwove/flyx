@@ -80,6 +80,20 @@ RowNeeds row_needs(const flyx_bmodel* m) {
       n.mtp = true;
       if (t->fc.q8_inputs()) n.q8 = true;
       ks({2 * m->hidden});
+    } else if (const auto* e = std::get_if<Eagle4Block>(&blk)) {
+      // MTP's row buffers (mcat, mx, mhn), its taps; its context's q|k|v of a prefill pass go to act (mcat and mhn
+      // are in proj's slot there: eagle4_context)
+      const AttnBlock& a = e->attn;
+      n.mtp = true;
+      n.feats += e->n_taps * e->target_hidden;
+      n.proj = std::max({n.proj, a.n_in(), 2 * e->mlp.inter});
+      n.act = std::max({n.act, a.n_in(), a.nh * a.hd, e->mlp.inter});
+      n.q = std::max(n.q, a.nh * a.hd);
+      n.attn_state = std::max(n.attn_state, a.nh * kFlashStateFloats(a.hd));
+      n.split_state = std::max(n.split_state, a.nh * kSplitStateFloats(a.hd));
+      for (const Lin* l : {&e->fc, &a.w_in, &a.w_out, &e->mlp.w_gu, &e->mlp.w_down})
+        if (l->q8_inputs()) n.q8 = true;
+      ks({2 * e->hidden, a.nh * a.hd, e->mlp.inter, e->n_taps * e->target_hidden, e->cand_rank});
     } else if (const auto* d = std::get_if<DFlashBlock>(&blk)) {
       const int df_feats = d->n_taps * d->target_hidden;
       n.feats += df_feats;
@@ -117,7 +131,8 @@ int max_drafts(const Block& drafter) {
     return d->dspine ? d->block - 1 : std::max(d->block, FLYX_MAX_ROWS) - 1;
   if (const auto* ds = std::get_if<DSparkBlock>(&drafter)) return ds->block - 1;
   if (const auto* v = std::get_if<DvBlock>(&drafter)) return v->tree_width;
-  return std::holds_alternative<MtpBlock>(drafter) ? FLYX_MAX_ROWS - 1 : 0;
+  return std::holds_alternative<MtpBlock>(drafter) || std::holds_alternative<Eagle4Block>(drafter) ? FLYX_MAX_ROWS - 1
+                                                                                                  : 0;
 }
 
 // Row buffers for R rows; `prefill`: the prefill set (attention partials for
@@ -1355,7 +1370,8 @@ void build_seq(flyx_bmodel* m, int32_t max_ctx, flyx_seq* s) {
   const DvBlock* dv = m->dv_block >= 0 ? &block<DvBlock>(m, m->dv_block) : nullptr;
   s->m = m;
   s->max_ctx = max_ctx;
-  s->cap = max_ctx + std::max(2 * FLYX_MAX_ROWS, m->wide_rows);
+  // past the context: a round's rows, and EAGLE-4's tree nodes (P->position - 1 + node, eagle4_draft_tree)
+  s->cap = max_ctx + std::max({2 * FLYX_MAX_ROWS, m->wide_rows, m->eagle4_block >= 0 ? kEagleSlots : 0});
   if (dv) {  // DV's canvas K/V: scratch slots past every position a round writes
     s->dv.s0 = s->cap;
     s->cap += dv->slots;
@@ -1425,7 +1441,7 @@ void build_seq(flyx_bmodel* m, int32_t max_ctx, flyx_seq* s) {
   s->drafts = s->alloc<int>(size_t(m->wide_rows));
   if (m->wide_rows > FLYX_MAX_ROWS) s->P_shift = s->alloc<DevParams>(1);
   const int head_rows = std::max({FLYX_MAX_ROWS, d ? d->block : 1, ds ? ds->block : 1});
-  const int logit_cols = std::max(V, (d || ds || m->mtp_block >= 0) ? kDraftPickFloats : 0);
+  const int logit_cols = std::max(V, (d || ds || m->mtp_block >= 0 || m->eagle4_block >= 0) ? kDraftPickFloats : 0);
   const int chunks = (V + 4095) / 4096;
   s->argv = s->alloc<float>(size_t(head_rows) * chunks);
   s->argi = s->alloc<int>(size_t(head_rows) * chunks);
@@ -1515,7 +1531,18 @@ void build_seq(flyx_bmodel* m, int32_t max_ctx, flyx_seq* s) {
   // (gen.drafts), which a model with no drafter takes too.
   s->oracle_cap = s->cap;
   s->oracle = s->alloc<int>(s->cap);
-  if (m->mtp_block >= 0) {
+  if (m->eagle4_block >= 0) {
+    s->ld_feats = n.feats;
+    const auto& e = block<Eagle4Block>(m, m->eagle4_block);
+    s->ez = s->alloc<float>(size_t(kEagleBeamMax) * e.cand_rank);
+    s->etree = s->alloc<EagleTree>(1);
+    s->egnode = s->alloc<float>(size_t(kEagleSlots) * H);
+    s->ehbuf = s->alloc<float>(size_t(kEagleBeamMax) * H);
+    s->ecand = s->alloc<int>(size_t(kEagleBeamMax) * kEagleBeamMax);
+    s->eval = s->alloc<float>(size_t(kEagleBeamMax) * kEagleBeamMax);
+    s->eprob = s->alloc<float>(size_t(kEagleBeamMax));
+  }
+  if (m->mtp_block >= 0 || m->eagle4_block >= 0) {
     s->mg = s->alloc<float>(H);
     s->mtok = s->alloc<int>(FLYX_MAX_ROWS + 1);
     s->mcand = s->alloc<int>(ops::kMtpCands);

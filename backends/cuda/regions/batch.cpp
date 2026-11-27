@@ -485,6 +485,8 @@ void run_batch(const BatchPass& bp) {
       if (const auto* df = std::get_if<DFlashBlock>(b)) {
         head_idx = df->head;
         feats_off = df->feats_offset;
+      } else if (const auto* e = std::get_if<Eagle4Block>(b)) {
+        feats_off = e->feats_offset;  // residual rows only
       } else {
         const auto& ds = std::get<DSparkBlock>(*b);
         head_idx = ds.head;
@@ -501,10 +503,10 @@ void run_batch(const BatchPass& bp) {
       }
       continue;
     }
-    // Share drafter context GEMMs across all batch rows; DV's canvas pass (a warm-up's: its trees run alone) and
-    // DSpark's per-layer K/V + Markov context update run a sequence at a time below.
+    // Share drafter context GEMMs across all batch rows; DV's canvas pass (a warm-up's: its trees run alone),
+    // DSpark's per-layer K/V + Markov context update and EAGLE-4's context run a sequence at a time below.
     if (n.kind == FLYX_NODE_CONTEXT && !std::holds_alternative<DvBlock>(*b) &&
-        !std::holds_alternative<DSparkBlock>(*b)) {
+        !std::holds_alternative<DSparkBlock>(*b) && !std::holds_alternative<Eagle4Block>(*b)) {
       if (const auto* t = std::get_if<MtpBlock>(b)) mtp_context_rows(bp, *t, fused);
       else draft_context_rows(bp, std::get<DFlashBlock>(*b), fused);
       continue;

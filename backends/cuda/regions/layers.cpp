@@ -397,6 +397,152 @@ void mtp_draft(flyx_seq* s, const MtpBlock& b, int width, const Launch& L, bool 
   copy_ints(s->mtok + 1 + start, s->drafts + start, width - start, st);
 }
 
+// EAGLE-4: one layer a draft step from (h, the token before), see python/reference/flyx_ref/eagle4.py.  Draft step i
+// runs at position P->position - 1 + i: h is the ring's at P->position - 1 for the first step, the step before's
+// normed output s->mg after it.
+void eagle4_draft(flyx_seq* s, const Eagle4Block& b, int width, const Launch& L, bool fused, int start) {
+  const auto* m = s->m;
+  const auto& E = block<EmbedBlock>(m, b.embed);
+  const AttnBlock& a = b.attn;
+  const KvBuf& kv = s->kv[size_t(a.kv)];
+  const RowBufs& own = s->own;
+  const int H = b.hidden, nh = a.nh, nkv = a.nkv, hd = a.hd, V = b.vocab;
+  const int ld = std::max(V, kDraftPickFloats);
+  const int K = std::min(ops::kMtpCands, V);
+  cudaStream_t st = L.st;
+  if (start == 0) build_rows(s->P, nullptr, 0, s->mtok, 1, st);  // mtok[0] = anchor
+  for (int i = start; i < width; ++i) {
+    if (E.blk.data) embed_blocks(s->mtok + i, E.blk, H, own.h, 1, st);  // own.h is free until the step's norm
+    // [in_norm(embed[token]) | hidden_norm(h)], and h itself: the residual the attention and MLP add to
+    mtp_gather(s->P, kPosPosition, false, i == 0 ? nullptr : s->mg, s->ring, nullptr, 0, s->mtok + i, E.table, own.h,
+               b.in_norm.w, b.hidden_norm.w, b.in_norm.offset, b.in_norm.eps, H, 1, own.mcat, st);
+    pair_hidden(s->P, kPosPosition, i == 0 ? nullptr : s->mg, s->ring, H, own.mx, st);
+    gemm(own.mcat, 2 * H, a.w_in, a.n_in(), 2 * H, own.proj, s->ld_proj, 1, false, L);
+    attn_prep(own.proj, s->ld_proj, 0, a.q_width(), a.q_width() + nkv * hd, nullptr, nullptr, 0.f, 0.f, a.theta,
+              a.rot, nh, nkv, hd, 1, s->P, kPosPosition, false, own.qbuf, kv.ref(), st, i - 1, nullptr, 0,
+              CanvasKeys{}, a.mrope());
+    s->stage_before(kv, i - 1, 1, st);
+    attention(own.qbuf, kv.staged(), nh, nkv, hd, 1, true, 0, 1.f / std::sqrt(float(hd)), s->P, nullptr, 0, own.act,
+              nh * hd, own.part, kRoundSplits, L, i - 1, b.window);
+    gemm(own.act, nh * hd, a.w_out, H, nh * hd, own.mx, H, 1, true, L);
+    mlp_body(own.mx, b.mlp, 1, own.h, own.proj, s->ld_proj, own.act, s->ld_act, L, fused);
+    rmsnorm(own.mx, H, b.norm.w, b.norm.offset, b.norm.eps, s->mg, H, 1, H, st);
+    // The candidate head: its low-rank scores over the vocabulary, their n_cands best scored exactly by the head, the
+    // best kMtpCands of those; then the draft as MTP's (mtp_choose).
+    gemm(s->mg, H, b.cand_down, b.cand_rank, H, s->ez, b.cand_rank, 1, false, L);
+    gemm(s->ez, b.cand_rank, b.cand_up, V, b.cand_rank, s->logits, ld, 1, false, L);
+    draft_pick_rough(s->mg, H, b.head, V, H, 1, b.n_cands, K, s->mcand, s->mval, s->logits, L,
+                     s->draft_prob + i, s->draft_margin + i);
+    mtp_choose(s->P, s->G, s->reply.count, s->mcand, s->mval, K, V, i, s->mtok, st);
+    mtp_oracle(s->P, s->oracle, i, s->mtok, st);
+  }
+  copy_ints(s->mtok + 1 + start, s->drafts + start, width - start, st);
+}
+
+int eagle4_tree_steps(const flyx_bmodel* m, int width) {
+  const int beam = m->opt.eagle4_beam;
+  // by default two steps for every three drafts (15: 10 steps, deeper than its trunk of kEagleTrunk; Qwen3.8-27B's
+  // EAGLE-4 at beam 4 verified as many tokens a round as at 12 steps, the steps cheaper)
+  const int steps = m->opt.eagle4_steps > 0 ? m->opt.eagle4_steps : 2 * width / 3;
+  // the nodes: the root and beam a step; enough of them for the width
+  return std::max(std::min(steps, (kEagleSlots - 1) / beam), (width + beam - 1) / beam);
+}
+
+// One step of the layer on `rows` rows (tokens tok, hidden inputs h [rows][H]) at depth d: their K/V to the slots of
+// their nodes f0 .. f0 + rows - 1 (P->position - 1 + node), their attention by the tree (nullptr: the root's row, a
+// chain's), their normed outputs to g [rows][H], their `beam` best candidates to cand / val, the best's probability to
+// prob.
+static void eagle4_tree_step(flyx_seq* s, const Eagle4Block& b, const int* tok, const float* h, int rows, int f0,
+                             const TreeRows* prep, const TreeRows* att, float* g, int beam, const Launch& L,
+                             bool fused) {
+  const auto* m = s->m;
+  const auto& E = block<EmbedBlock>(m, b.embed);
+  const AttnBlock& a = b.attn;
+  const KvBuf& kv = s->kv[size_t(a.kv)];
+  const RowBufs& own = s->own;
+  const int H = b.hidden, nh = a.nh, nkv = a.nkv, hd = a.hd, V = b.vocab;
+  const int ld = std::max(V, kDraftPickFloats);
+  cudaStream_t st = L.st;
+  if (E.blk.data) embed_blocks(tok, E.blk, H, own.h, rows, st);
+  mtp_gather(s->P, kPosPosition, false, h, s->ring, h + H, H, tok, E.table, own.h, b.in_norm.w, b.hidden_norm.w,
+             b.in_norm.offset, b.in_norm.eps, H, rows, own.mcat, st);
+  CK(cudaMemcpyAsync(own.mx, h, size_t(rows) * H * sizeof(float), cudaMemcpyDeviceToDevice, st));
+  gemm(own.mcat, 2 * H, a.w_in, a.n_in(), 2 * H, own.proj, s->ld_proj, rows, false, L);
+  attn_prep(own.proj, s->ld_proj, 0, a.q_width(), a.q_width() + nkv * hd, nullptr, nullptr, 0.f, 0.f, a.theta, a.rot,
+            nh, nkv, hd, rows, s->P, kPosPosition, false, own.qbuf, kv.ref(), st, f0 - 1, prep, 0, CanvasKeys{},
+            a.mrope());
+  attention(own.qbuf, kv.ref(), nh, nkv, hd, rows, true, 0, 1.f / std::sqrt(float(hd)), s->P, nullptr, 0, own.act,
+            nh * hd, own.part, kRoundSplits, L, att ? -1 : f0 - 1, b.window, att);
+  gemm(own.act, nh * hd, a.w_out, H, nh * hd, own.mx, H, rows, true, L);
+  mlp_body(own.mx, b.mlp, rows, own.h, own.proj, s->ld_proj, own.act, s->ld_act, L, fused);
+  rmsnorm(own.mx, H, b.norm.w, b.norm.offset, b.norm.eps, g, H, rows, H, st);
+  gemm(g, H, b.cand_down, b.cand_rank, H, s->ez, b.cand_rank, rows, false, L);
+  gemm(s->ez, b.cand_rank, b.cand_up, V, b.cand_rank, s->logits, ld, rows, false, L);
+  draft_pick_rough(g, H, b.head, V, H, rows, b.n_cands, beam, s->ecand, s->eval, s->logits, L, s->eprob);
+}
+
+void eagle4_draft_tree(flyx_seq* s, const Eagle4Block& b, int width, const Launch& L, bool fused) {
+  const auto* m = s->m;
+  const int H = b.hidden, beam = m->opt.eagle4_beam, steps = eagle4_tree_steps(m, width);
+  cudaStream_t st = L.st;
+  build_rows(s->P, nullptr, 0, s->mtok, 1, st);  // mtok[0] = anchor
+  // the root: (the ring's h at P->position - 1, the anchor) at P->position - 1, its K/V at that slot (node 0's)
+  pair_hidden(s->P, kPosPosition, nullptr, s->ring, H, s->ehbuf, st);
+  eagle4_tree_step(s, b, s->mtok, s->ehbuf, 1, 0, nullptr, nullptr, s->egnode, beam, L, fused);
+  eagle_tree_start(s->etree, s->P, s->oracle, s->mtok, s->ecand, s->eval, s->eprob, beam, s->egnode, s->ehbuf, H, st);
+  for (int d = 1; d < steps; ++d) {  // the frontier: nodes 1 + beam (d - 1) .. at depth d
+    const int f0 = 1 + beam * (d - 1);
+    eagle4_tree_step(s, b, s->etree->tokbuf, s->ehbuf, beam, f0, &s->etree->prep, &s->etree->att,
+                     s->egnode + size_t(f0) * H, beam, L, fused);
+    eagle_tree_grow(s->etree, s->P, s->oracle, s->ecand, s->eval, s->eprob, beam, s->egnode, s->ehbuf, H, st);
+  }
+  eagle_tree_finish(s->etree, width, kEagleTrunk, s->drafts, s->tree, st);
+}
+
+// After a pass: each row's h = fc([fc_norm_i(tap_i)]) into the ring, and the K/V of the positions base-1 ..
+// base+rows-2 from (h at j, token at j+1), as mtp_context.  In a round the entries past the accepted rows hold
+// rejected rows; they are rewritten (by the next draft steps or context pass) before anything attends to them.
+void eagle4_context(const Pass& ps, const Eagle4Block& b, bool) {
+  const RowView& rv = ps.v;
+  auto* s = ps.s;
+  const auto* m = s->m;
+  const auto& E = block<EmbedBlock>(m, b.embed);
+  const AttnBlock& a = b.attn;
+  const KvBuf& kv = s->kv[size_t(a.kv)];
+  const int H = b.hidden, Ht = b.target_hidden, R = ps.rows, nh = a.nh, nkv = a.nkv, hd = a.hd;
+  const int sel = ps.round ? kPosStart : kPosPosition;
+  cudaStream_t st = rv.L.st;
+  const Launch& L = rv.L;
+  float* taps = rv.b.feats + b.feats_offset;
+  for (int t = 0; t < b.n_taps; ++t)  // each tap normed in place: nothing reads the taps after this pass's context
+    rmsnorm(taps + size_t(t) * Ht, rv.ld_feats, b.fc_norm[t].w, b.fc_norm[t].offset, b.fc_norm[t].eps,
+            taps + size_t(t) * Ht, rv.ld_feats, R, Ht, st);
+  gemm(taps, rv.ld_feats, b.fc, H, b.n_taps * Ht, rv.b.mhn, H, R, false, L);
+  if (E.blk.data) {
+    embed_blocks(rv.b.tokens, E.blk, H, rv.b.h, R, st);  // rv.b.h is free here
+    if (ps.n_embeds > 0) embed_scatter(rv.b.h, nullptr, H, ps.embeds, ps.embed_rows, ps.n_embeds, st);
+  } else if (ps.n_embeds > 0) {
+    embed(rv.b.tokens, E.table, H, rv.b.h, R, st);
+    embed_scatter(rv.b.h, nullptr, H, ps.embeds, ps.embed_rows, ps.n_embeds, st);
+  }
+  const bf16* table = (E.blk.data || ps.n_embeds > 0) ? nullptr : E.table;
+  mtp_gather(s->P, sel, ps.round, nullptr, s->ring, rv.b.mhn, H, rv.b.tokens, table, rv.b.h, b.in_norm.w,
+             b.hidden_norm.w, b.in_norm.offset, b.in_norm.eps, H, R, rv.b.mcat, st);
+  if (!ps.round && s->pass_snap > 0 && s->ring_snap) {
+    // Capture h[pass_snap - 1] before hring_put overwrites the kHring-slot ring when end - pass_snap >= kHring.
+    const int snap_row = s->pass_snap - s->position;
+    const float* src = snap_row == 0 ? s->ring + size_t((s->pass_snap - 1) % kHring) * size_t(H)
+                                     : rv.b.mhn + size_t(snap_row - 1) * size_t(H);
+    CK(cudaMemcpyAsync(s->ring_snap, src, size_t(H) * sizeof(float), cudaMemcpyDeviceToDevice, st));
+  }
+  hring_put(s->P, sel, ps.round, rv.b.mhn, H, R, s->ring, H, st);
+  // q|k|v into act: in a prefill pass mcat and mhn sit in proj's slot (alloc_rows)
+  const int n_in = a.n_in();
+  gemm(rv.b.mcat, 2 * H, a.w_in, n_in, 2 * H, rv.b.act, n_in, R, false, L);
+  attn_prep(rv.b.act, n_in, 0, a.q_width(), a.q_width() + nkv * hd, nullptr, nullptr, 0.f, 0.f, a.theta, a.rot, nh,
+            nkv, hd, R, s->P, sel, ps.round, rv.b.qbuf, kv.ref(), st, -1, nullptr, 0, CanvasKeys{}, a.mrope());
+}
+
 // After a pass: keep the rows' normalised target hidden and write the MTP K/V
 // entries base-1 .. base+rows-2 from (hidden at j, token at j+1).  In a round
 // the entries past the accepted rows hold rejected rows; they are rewritten

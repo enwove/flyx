@@ -773,10 +773,11 @@ bool Engine::load(const std::string& path, const EngineOptions& opt, std::string
     const bool has_mtp = model_has_drafter(*model_, "mtp");
     const bool has_dspark = model_has_drafter(*model_, "dspark");
     const bool has_dv = model_has_drafter(*model_, "dv");
-    // The block drafter in the registry's block slot (DFlash2's block, DFlash's or DSpine's): the heaviest, its
-    // context cache growing with the context.
+    // The block drafter in the registry's block slot (DFlash2's block, DFlash's, DSpine's or EAGLE-4's): the
+    // heaviest, its context cache growing with the context.
     const char* block_title = nullptr;
-    for (const auto& [name, title] : {std::pair{"dflash2", "DFlash2"}, {"dflash", "DFlash"}, {"dspine", "DSpine"}})
+    for (const auto& [name, title] :
+         {std::pair{"dflash2", "DFlash2"}, {"dflash", "DFlash"}, {"dspine", "DSpine"}, {"eagle4", "EAGLE-4"}})
       if (!block_title && model_has_drafter(*model_, name)) block_title = title;
     const bool has_block = block_title != nullptr;
 

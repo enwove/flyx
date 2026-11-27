@@ -37,7 +37,8 @@ struct DFlash2Spec {
   int block_drafts() const { return block.block - block.draft_from; }
 };
 
-// The block drafter a canonical config ("draft") says it is (its "kind"), kNone when it is no block drafter.
+// The drafter of the target's taps a canonical config ("draft") says it is (its "kind": a block drafter or EAGLE-4),
+// kNone when it is none.
 Drafter block_drafter_kind(const nlohmann::json& draft);
 
 // True if a companion header describes a block drafter of DFlash2's block or DSpine's (a drafter file's "draft"), or

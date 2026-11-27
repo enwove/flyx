@@ -525,6 +525,10 @@ bool Qwen35::build(const ModelFile& file, const ModelOptions& o, std::string* er
   std::vector<Drafter> drafters;
   if (!choose_drafters(o, drafters_reg_.sources(), &drafters, err)) return false;
   drafters_reg_.validate_selected(file, drafters, target);
+  // Gated delta nets: a tree's rows run their tree recurrence, so only a drafter whose trees pay there too drafts them
+  // by default; the file then reads every position (exact attention under --kv-method auto), as Llama's does.
+  draft_trees_by_default_ = drafts_trees_by_default(drafters_reg_.sources().block, true);
+  file_drafts_trees_ = draft_trees_by_default_;
   if (!tables_.set_activations(o.activations, declared_activations(file), o.fp4_inputs, err)) return false;
   Tables& T = tables_;
   const auto nf = name_fn();

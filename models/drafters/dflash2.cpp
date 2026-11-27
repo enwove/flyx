@@ -108,7 +108,7 @@ void validate_dflash2_spec(DFlash2Spec* spec, const TargetSpec& target) {
 
 Drafter block_drafter_kind(const json& draft) {
   const Drafter k = draft.is_object() ? drafter_named(draft.value("kind", "")) : Drafter::kNone;
-  return is_block_drafter(k) ? k : Drafter::kNone;
+  return is_tapped_drafter(k) ? k : Drafter::kNone;
 }
 
 int config_int(const json& j, const char* key, const std::string& drafter) {

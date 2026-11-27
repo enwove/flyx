@@ -3,7 +3,7 @@
 //
 //   GET /v1/load          the load's state (ModelHost::status; also telemetry's "load")
 //   POST /v1/load         {"model": PATH or HUB NAME, "drafters": [...], "lora": DIR or HUB NAME, "ctx": N,
-//                         "drafter": "mtp|dflash2|dflash|dspark|dspine|dv|all|none", "speculative": BOOL,
+//                         "drafter": "mtp|dflash2|dflash|dspark|dspine|eagle4|dv|all|none", "speculative": BOOL,
 //                         "kv": "fp8|16", "name": ID}
 //                         -> 202 and the state; 409 while one loads
 //   DELETE /v1/load       stops a fetch under way (what came stays for the next try)
@@ -202,7 +202,7 @@ std::vector<Listed> listing(const Server& s) {
     if (drafter) {
       const std::string disk = from_path(to_path(c.dir).make_preferred());
       const auto modified = fs::last_write_time(to_path(disk), ec);
-      // its config's kind ("dflash2", "dflash", "dspark", "dspine")
+      // its config's kind ("dflash2", "dflash", "dspark", "dspine", "eagle4")
       l = entry(c.repo, "drafter", "", c.repo.substr(c.repo.find('/') + 1), disk, size, modified, -1,
                 flyx::drafter_source_kind(c.dir));
     } else {
@@ -589,7 +589,7 @@ void add_manage_routes(httplib::Server& http, Server* s) {
         std::string low = asked;
         for (char& c : low) c = char(std::tolower(static_cast<unsigned char>(c)));
         const bool drafter_query = low.find("dflash") != std::string::npos || low.find("dspark") != std::string::npos ||
-                                   low.find("dspine") != std::string::npos ||
+                                   low.find("dspine") != std::string::npos || low.find("eagle") != std::string::npos ||
                                    low.find("drafter") != std::string::npos || low.find("mtp") != std::string::npos;
         // Include block drafters' safetensors repos (which filter=gguf omits) when searching drafters or when no GGUF
         // matches.

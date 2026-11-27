@@ -326,6 +326,14 @@ __global__ void k_hring_put(const DevParams* P, int pos_sel, int skip_if_noop, c
   for (int c = threadIdx.x; c < H; c += blockDim.x) dst[c] = hn[size_t(r) * ldh + c];
 }
 
+// The hidden row 0 of mtp_gather reads (h0, else the ring's at base - 1) copied to out.
+__global__ void k_pair_hidden(const DevParams* P, int pos_sel, const float* h0, const float* hring, int H, float* out) {
+  pdl_trigger();
+  const int base = pos_sel == kPosStart ? P->start : P->position;
+  const float* h = h0 ? h0 : hring + size_t(((base - 1) % kHring + kHring) % kHring) * H;
+  for (int c = threadIdx.x; c < H; c += blockDim.x) out[c] = h[c];
+}
+
 __global__ void k_mtp_oracle(const DevParams* P, const int* oracle, int step, int* mtok) {
   pdl_trigger();
   if (P->oracle_len <= 0) return;
@@ -374,6 +382,11 @@ void mtp_gather(const DevParams* P, int pos_sel, bool skip_if_noop, const float*
 void hring_put(const DevParams* P, int pos_sel, bool skip_if_noop, const float* hn, int ldh, int rows, float* hring,
                int H, cudaStream_t st) {
   k_hring_put<<<rows, 256, 0, st>>>(P, pos_sel, skip_if_noop, hn, ldh, rows, hring, H);
+}
+
+void pair_hidden(const DevParams* P, int pos_sel, const float* h0, const float* hring, int H, float* out,
+                 cudaStream_t st) {
+  k_pair_hidden<<<1, 512, 0, st>>>(P, pos_sel, h0, hring, H, out);
 }
 
 void mtp_oracle(const DevParams* P, const int* oracle, int step, int* mtok, cudaStream_t st) {

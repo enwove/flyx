@@ -192,7 +192,8 @@ bool build(const flyx_backend_api* api, flyx_bmodel* bm, const interfaces::Model
     for (int d = 0; d < model.drafters(); ++d)
       for (int k : draft_tree_widths()) {
         if (model.drafts_trees(d)) break;  // its rounds are trees already
-        if (probe_round(k, d, false, &out->rounds, true)) break;  // a drafter (or backend) that drafts no trees
+        // a drafter (or backend) that drafts no trees, or not of this width (EAGLE-4's: 15 drafts only)
+        if (probe_round(k, d, false, &out->rounds, true)) continue;
         add(k, d);
         out->drafter_trees.back() = true;
       }

@@ -157,6 +157,22 @@ struct MtpBlock {
   Lin fc;                                          // [hidden, 2 * hidden]
 };
 
+// EAGLE-4 (flyx_eagle4_block): MTP's step loop (regions/layers.cpp eagle4_draft) over its own layer.  A step's input
+// [in_norm(embed[token]) | hidden_norm(h)] (mtp_gather's pair) goes through attn's q|k|v [n_in, 2 hidden] with no
+// norm of attn's own and no q/k norms, h is the residual, mlp's norm is its post_norm; norm's output the next step's h
+// and the candidate head's input: the n_cands best of cand_up (cand_down g), scored exactly by head.  Its context
+// keeps h = fc([fc_norm_i(tap_i)]) of every position in the ring and writes the K/V of (h, the next token) pairs.
+struct Eagle4Block {
+  int hidden = 0, n_taps = 0, target_hidden = 0, window = 0, vocab = 0, cand_rank = 0, n_cands = 0;
+  int feats_offset = 0;                            // float offset within RowBufs::feats row
+  int embed = -1;                                  // the target's embedding (EmbedBlock)
+  AttnBlock attn;                                  // attn.w_in reads 2 hidden; attn.norm unused
+  MlpBlock mlp;                                    // mlp.norm: its post_norm
+  Norm fc_norm[FLYX_EAGLE4_MAX_TAPS], in_norm, hidden_norm, norm;
+  Lin fc, cand_down, cand_up;                      // [hidden, n_taps target_hidden], [rank, hidden], [rows, rank]
+  const bf16* head = nullptr;                      // [rows, hidden], bf16
+};
+
 // DFlash2: a block of `block` rows (the anchor, then mask tokens) through its
 // layers attending to the context K/V, then unary top-k from the head and the
 // selector walk.  Its layers wrap attention and MLP in grouped dynamic convs.
@@ -433,7 +449,7 @@ struct DSparkBlock {
 
 using Block = std::variant<EmbedBlock, AttnBlock, GdnBlock, MlpBlock, HeadBlock, MtpBlock, DFlashBlock, DFlashLayer,
                            DvBlock, DvLayer, VisionStemBlock, VitAttnBlock, VitMlpBlock, VisionMergeBlock,
-                           RelAttnBlock, MoeBlock, DSparkBlock, DSparkLayer>;
+                           RelAttnBlock, MoeBlock, DSparkBlock, DSparkLayer, Eagle4Block>;
 
 // ---- a sequence's state, as the table declares it -------------------------------------------
 struct KvBuf {

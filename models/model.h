@@ -30,15 +30,20 @@ using interfaces::ModelOptions;
 
 // The drafters the architectures here can have.  Only models/ knows them by
 // name: the engine sees drafters by number and the round widths each offers
-// (draft_widths).  DFlash2, DFlash, DSpark and DSpine (models/drafters/) draft a block at once; DV (models/dv.h)
+// (draft_widths).  DFlash2, DFlash, DSpark and DSpine (models/drafters/) draft a block at once, EAGLE-4 (there too) a
+// step a draft from the target's taps; DV (models/dv.h)
 // drafts trees, and its canvas follows its own rounds only (Model::restarts).
-enum class Drafter { kNone, kMtp, kDFlash2, kDv, kDSpark, kDSpine, kDFlash };
+enum class Drafter { kNone, kMtp, kDFlash2, kDv, kDSpark, kDSpine, kDFlash, kEagle4 };
 const char* drafter_name(Drafter d);   // --drafter's word for it ("none" for kNone)
 const char* drafter_title(Drafter d);  // its name in messages ("DFlash2", "DSpark")
 Drafter drafter_named(std::string_view name);  // kNone when no drafter is called so
 bool is_block_drafter(Drafter d);        // a parallel block drafter (models/drafters/registry.h builds it)
-// A block drafter whose trees beside its chains pay on attention-only targets (DSpark's): drafted by default there.
-bool drafts_trees_by_default(Drafter d);
+// A drafter of the target's taps the registry's one slot holds (models/drafters/registry.h): a block drafter or
+// EAGLE-4.
+bool is_tapped_drafter(Drafter d);
+// A drafter whose trees beside its chains pay on attention-only targets (DSpark's, EAGLE-4's), and on a target of
+// gated delta nets too where `recurrent` (EAGLE-4's): drafted by default there.
+bool drafts_trees_by_default(Drafter d, bool recurrent);
 // What a block drafter's projections are under draft_weights=auto beside a target of float weights:
 // AUTO (the backend's own: as its file has them), Q8_0 or NVFP4, as measured to pay.
 flyx_draft_weights draft_weights_beside_float(Drafter d);
@@ -56,7 +61,7 @@ std::string declared_activations(const ModelFile& file);
 // The drafters a model has: in its own file, or in drafter files beside it (ModelFile::add).
 struct DrafterSources {
   bool mtp = false, mtp_beside = false;   // the model has an MTP layer; ... from a drafter file
-  // its block drafter (kDFlash2, kDFlash or kDSpark of DFlash2's block, kDSpine); kNone: none
+  // its drafter of the target's taps (kDFlash2, kDFlash or kDSpark of DFlash2's block, kDSpine, kEagle4); kNone: none
   Drafter block = Drafter::kNone;
   bool block_beside = false;               // ... from a drafter file
   bool dspark_gguf = false;                // llama.cpp's DSpark GGUF beside it (its own block): kDSpark beside `block`
@@ -193,8 +198,8 @@ class Model : public interfaces::Model {
   std::shared_ptr<const interfaces::VisionAdapter> vision_adapter_;
   std::vector<flyx_node> vision_nodes_;
   bool kv_fp8_by_default_ = true;         // FP8 where a real model of the family showed no visible drop
-  bool file_drafts_trees_ = false;        // the file holds DV or a block drafter drafting trees by default
-  bool draft_trees_by_default_ = false;   // its block drafter drafts trees by default (drafts_trees_by_default)
+  bool file_drafts_trees_ = false;        // the file holds DV or a tapped drafter drafting trees by default
+  bool draft_trees_by_default_ = false;   // its tapped drafter drafts trees by default (drafts_trees_by_default)
   bool verify_scales_with_width_ = false; // sparse-MoE targets whose verify cost climbs steeply with verify width
 
  private:

@@ -46,6 +46,9 @@ namespace {
 // its place; "" for none.
 std::string g_block;
 std::string block_label() { return g_block == "dspine" ? "DSpine" : g_block == "dflash" ? "DFlash" : "DFlash2"; }
+// A file whose drafter drafts trees by default (EAGLE-4's, Model::file_drafts_trees) reads every position: --kv-method
+// auto is exact attention's, never strata's, past any switch.
+bool file_reads_all() { return g_block == "eagle4"; }
 
 // Session::init, checked.  A session the engine refuses (no room left for it, as on a GPU other programs hold, or
 // seq_new failed) has no sequence: a FAIL naming this file's line and why, and false.  generate refuses such a
@@ -1649,8 +1652,9 @@ void strata_rounds(const std::string& model, const std::string& backend, const s
       auto strata3 = make(model, backend, false, "", fp8, narrow, false, 512, kReferenceWidth, false, -1, "strata:3");
       auto never = make(model, backend, false, "", fp8, narrow + ",strata_from=100000", false, 512, kReferenceWidth,
                         false, -1, "auto");
-      check(tokens(first.get()) == tokens(strata2.get()) && tokens(first3.get()) == tokens(strata3.get()) &&
-                tokens(never.get()) == te,
+      check(file_reads_all() ? tokens(first.get()) == te && tokens(first3.get()) == te && tokens(never.get()) == te
+                             : tokens(first.get()) == tokens(strata2.get()) &&
+                                   tokens(first3.get()) == tokens(strata3.get()) && tokens(never.get()) == te,
             std::string("auto") + (fp8 ? ", fp8" : ", binary16") +
                 ": switched at the start, strata's tokens (2-bit default and explicit 3-bit); never, exact attention's");
     }
@@ -1846,7 +1850,7 @@ void strata_rounds(const std::string& model, const std::string& backend, const s
         const flyx_seq_layout lp = pinned->kv_layout(), lq = paged->kv_layout();
         const bool ok_sz = pinned->api()->seq_size(pinned->bmodel(), &lp, &sz_pin) == 0 &&
                            paged->api()->seq_size(paged->bmodel(), &lq, &sz_pg) == 0;
-        check(ok_sz && sz_pg.host_mapped < sz_pin.host_mapped,
+        check(ok_sz && (sz_pg.host_mapped < sz_pin.host_mapped || (file_reads_all() && std::string(method) == "auto")),
               std::string("pageable_kv=on, ") + method + (fp8 ? ", fp8" : ", binary16") +
                   ": reduces host_mapped (" + std::to_string(sz_pg.host_mapped) + " < " +
                   std::to_string(sz_pin.host_mapped) + ")");
@@ -2069,7 +2073,10 @@ void strata_rounds(const std::string& model, const std::string& backend, const s
       const flyx_seq_layout lup = u_pin->kv_layout(), lug = u_pg->kv_layout();
       const bool ok_u = u_pin->api()->seq_size(u_pin->bmodel(), &lup, &sz_up) == 0 &&
                         u_pg->api()->seq_size(u_pg->bmodel(), &lug, &sz_ug) == 0;
-      check(ok_u && sz_ug.device_positions == 16384 && sz_ug.host_mapped == 0 && sz_ug.host <= sz_up.host + (1ull << 20),
+      // (a file that reads every position keeps its K/V where auto puts exact attention's: no strata switch to round
+      // to)
+      check(ok_u && (file_reads_all() || (sz_ug.device_positions == 16384 && sz_ug.host_mapped == 0 &&
+                                          sz_ug.host <= sz_up.host + (1ull << 20))),
             "pageable_kv=on unaligned kv_gpu=17000: rounded to 16384 and host size excludes device prefix (" +
                 std::to_string(sz_ug.host) + " vs pinned " + std::to_string(sz_up.host) + ")");
       std::vector<int32_t> p16k(16390);
@@ -2134,14 +2141,18 @@ void rows_on_tensor_cores(const std::string& model, const std::string& backend, 
 void drafted_trees(const std::string& model, const std::string& backend, const std::vector<int32_t>& prompt,
                    const std::vector<int32_t>& want, const std::vector<int32_t>& oracle) {
   const int N = static_cast<int>(want.size());
+  const std::string who = g_block == "eagle4" ? "EAGLE-4" : "DFlash2";
   auto trees = make(model, backend, true, g_block, false, "", false, 512, -1, true);
   std::vector<size_t> turns;
   for (size_t i = 0; i < trees->widths().size(); ++i)
     if (trees->round_trees()[i]) turns.push_back(i);
-  check(turns.size() == plan::draft_tree_widths().size(), "DFlash2 drafts trees of every size");
+  // EAGLE-4's trees are of 15 drafts (its chain of 7 and branches; narrower ones its chains price better)
+  check(turns.size() == (g_block == "eagle4" ? 1 : plan::draft_tree_widths().size()),
+        who + " drafts trees of every size it has");
   for (size_t i = 0; i < trees->widths().size(); ++i)  // and its chains
     if (!trees->round_trees()[i] && trees->widths()[i] > 0) turns.push_back(i);
   std::string err;
+  int tree_rounds = 0;
   auto turn_rounds = [&](const std::vector<int32_t>* with_oracle, int* tree_accepted) {
     Session s(trees.get());
     init_checked(s);
@@ -2149,20 +2160,24 @@ void drafted_trees(const std::string& model, const std::string& backend, const s
     s.rounds().cycle(turns);
     std::vector<flyx_round_result> trace;
     const auto out = gen(s, prompt, N, &trace).tokens;
-    *tree_accepted = 0;
+    *tree_accepted = tree_rounds = 0;
     for (size_t r = 1; r < trace.size(); ++r)
-      if (trees->round_trees()[turns[(r - 1) % turns.size()]]) *tree_accepted += trace[r].n_accepted;
+      if (trees->round_trees()[turns[(r - 1) % turns.size()]]) *tree_accepted += trace[r].n_accepted, ++tree_rounds;
     if (with_oracle) trees->api()->set_oracle(s.seq(), nullptr, 0);
     return out;
   };
   int accepted = 0, oracle_accepted = 0;
   const bool same = turn_rounds(nullptr, &accepted) == want;
-  check(same, "DFlash2 trees taking turns with its chains: the reference's tokens (" +
+  check(same, who + " trees taking turns with its chains: the reference's tokens (" +
                   std::to_string(accepted) + " drafts accepted in tree rounds)");
   const bool same_oracle = turn_rounds(&oracle, &oracle_accepted) == want;
-  check(same_oracle && oracle_accepted > N / 2,
-        "  with oracle drafts: long accepted runs (" + std::to_string(oracle_accepted) + " in tree rounds, " +
-            std::to_string(N) + " tokens)");
+  // EAGLE-4's trees of 15 are 10 steps deep: the oracle's path whole (but in the last round, which the token limit
+  // cuts)
+  const bool long_runs = g_block == "eagle4" ? tree_rounds > 1 && oracle_accepted >= 10 * (tree_rounds - 1)
+                                             : oracle_accepted > N / 2;
+  check(same_oracle && long_runs,
+        "  with oracle drafts: long accepted runs (" + std::to_string(oracle_accepted) + " in " +
+            std::to_string(tree_rounds) + " tree rounds, " + std::to_string(N) + " tokens)");
   {
     Session s(trees.get());
     init_checked(s);
@@ -4171,8 +4186,9 @@ int main(int argc, char** argv) {
             "relaxed acceptance, min-p 1e-37: more drafts accepted (MTP " + std::to_string(loose_m) + " against " +
                 std::to_string(exact_m) + ", DFlash2 " + std::to_string(loose_d) + " against " +
                 std::to_string(exact_d) + ")");
-      // DFlash (one candidate a row) and DSpine draft chains only
-      if (g_block == "dflash2") drafted_trees(model, backend, prompt, want, oracle);
+      // DFlash (one candidate a row) and DSpine draft chains only; EAGLE-4 trees on CUDA (cpu_ref drafts its chains)
+      if (g_block == "dflash2" || (g_block == "eagle4" && backend == "cuda"))
+        drafted_trees(model, backend, prompt, want, oracle);
     }
 
     // MTP drafter: same tokens; drafts equal to the reference's; state kept
@@ -4230,7 +4246,13 @@ int main(int argc, char** argv) {
     // fresh session with that drafter alone drafts from the same point (on the float64 backend exactly; on the GPU
     // the fresh session's prefill passes may round otherwise).  Chosen every round, they give the reference's
     // tokens, greedy, and plain decoding's, sampled.
-    {
+    // EAGLE-4 keeps its h in the ring MTP keeps the target's in: "all" gives it alone (models/model.cpp:
+    // choose_drafters), and the rounds above are its.
+    if (g_block == "eagle4") {
+      bool alone = !both->round_drafters().empty();
+      for (int d : both->round_drafters()) alone = alone && (d < 0 || both->model().drafter_name(d) == g_block);
+      check(alone, "all: EAGLE-4 alone (it and MTP share the ring)");
+    } else {
       std::vector<size_t> turns;  // the MTP layer's round, then DFlash2's
       for (const std::string name : {std::string("mtp"), g_block})
         for (size_t i = 0; i < both->widths().size(); ++i)

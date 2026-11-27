@@ -35,7 +35,11 @@ StateMap bind_states(flyx_bmodel* m, const flyx_model_desc& d) {
   std::vector<bool> dflash_kv(size_t(std::max(d.n_states, 0)), false);
   for (int b = 0; b < d.n_blocks; ++b) {
     const flyx_block& blk = d.blocks[b];
-    const int kv = blk.kind == FLYX_BLOCK_DFLASH2 ? blk.dflash2.kv : blk.kind == FLYX_BLOCK_DSPINE ? blk.dspine.kv : -1;
+    // EAGLE-4's too: its draft steps attend over a window (attention's per-head kernel reads binary16)
+    const int kv = blk.kind == FLYX_BLOCK_DFLASH2  ? blk.dflash2.kv
+                   : blk.kind == FLYX_BLOCK_DSPINE ? blk.dspine.kv
+                   : blk.kind == FLYX_BLOCK_EAGLE4 ? blk.eagle4.kv
+                                                   : -1;
     if (kv >= 0 && kv < d.n_states) dflash_kv[size_t(kv)] = true;
   }
   for (int i = 0; i < d.n_states; ++i) {
@@ -400,6 +404,56 @@ DFlashLayer dflash_layer(WeightLoader& L, const flyx_dflash2_layer_block& b, Dra
     l.mlp_base = L.vec(b.mlp_conv_base);
   }
   return l;
+}
+
+// EAGLE-4's layer as Eagle4Block runs it: its q|k|v stacked over the 2 hidden of a step's input (no norm of the
+// attention's own, no q/k norms, rotary on every dim), gate|up, its norms, fc, its own head (bf16: the candidates are
+// scored on its rows) and the candidate head's two factors (bf16: the rough scores' order is all they are for).
+Eagle4Block eagle4(WeightLoader& L, const flyx_model_desc& d, const flyx_eagle4_block& b, const StateMap& sm,
+                   DraftQuant dq) {
+  Eagle4Block e;
+  expect(b.n_taps >= 1 && b.n_taps <= FLYX_EAGLE4_MAX_TAPS && b.target_hidden == d.hidden && b.hidden == d.hidden &&
+             b.window >= 0 && b.vocab > 0 && b.vocab <= d.vocab && b.cand_rank > 0 && b.n_cands > 0 &&
+             b.n_cands <= b.vocab,
+         "EAGLE-4 dimensions");
+  e.hidden = b.hidden;
+  e.n_taps = b.n_taps;
+  e.target_hidden = b.target_hidden;
+  e.window = b.window;
+  e.vocab = b.vocab;
+  e.cand_rank = b.cand_rank;
+  e.n_cands = b.n_cands;
+  e.embed = b.embed;
+  AttnBlock& a = e.attn;
+  a.hidden = b.hidden;
+  a.nh = b.n_heads;
+  a.nkv = b.n_kv;
+  a.hd = b.head_dim;
+  a.rot = b.head_dim;
+  a.theta = b.theta;
+  rope_register(a.theta, a.rot);
+  int rows = 0;
+  a.w_in = L.lin_stack_quant({b.q, b.k, b.v}, dq, &rows);
+  expect(rows == a.n_in(), "EAGLE-4 q|k|v rows do not match its dimensions");
+  a.w_out = L.lin_quant(b.o, dq);
+  a.kv = state_of(sm.kv, b.kv, "K/V");
+  MlpBlock& f = e.mlp;
+  f.hidden = b.hidden;
+  f.inter = b.inter;
+  f.norm = norm(L, b.post_norm);
+  f.w_gu = L.lin_stack_quant({b.gate, b.up}, dq, &rows);
+  expect(rows == 2 * f.inter, "EAGLE-4 gate|up rows do not match its dimensions");
+  f.w_down = L.lin_quant(b.down, dq);
+  for (int i = 0; i < b.n_taps; ++i) e.fc_norm[i] = norm(L, b.fc_norm[i]);
+  e.in_norm = norm(L, b.in_norm);
+  e.hidden_norm = norm(L, b.hidden_norm);
+  e.norm = norm(L, b.norm);
+  e.fc = L.lin_quant(b.fc, dq);
+  e.cand_down = L.lin_quant(b.cand_down, DraftQuant::kNone);
+  e.cand_up = L.lin_quant(b.cand_up, DraftQuant::kNone);
+  e.head = L.lin_quant(b.head, DraftQuant::kNone).w;
+  expect(e.head && e.cand_down.w && e.cand_up.w, "EAGLE-4's head and candidate head in bf16");
+  return e;
 }
 
 // What DFlash2's block and DSpine's bind alike (`title` names the drafter in refusals; layer(j): its layer block j,
@@ -1006,7 +1060,7 @@ TargetQuant target_quant(const flyx_model_desc& d, const std::vector<char>& is_d
 // Each block family chooses its own precision beside a floating target. A packed target sets the precision
 // for all block drafters; an explicit draft_weights option overrides AUTO for every drafter, including MTP.
 struct DraftQuants {
-  DraftQuant mtp, dflash, dspine, dspark;
+  DraftQuant mtp, dflash, dspine, dspark, eagle4;
 };
 
 DraftQuants resolve_draft_quant(const flyx_model_desc& d, interfaces::DraftWeightsMode mode, TargetQuant tq) {
@@ -1015,12 +1069,12 @@ DraftQuants resolve_draft_quant(const flyx_model_desc& d, interfaces::DraftWeigh
     const DraftQuant q = mode == Mode::kNvfp4 ? DraftQuant::kNvfp4
                          : mode == Mode::kQ8    ? DraftQuant::kQ8
                                                 : DraftQuant::kNone;
-    return {q, q, q, q};
+    return {q, q, q, q, q};
   }
   const DraftQuant block = tq == TargetQuant::kNvfp4 ? DraftQuant::kNvfp4
                            : tq == TargetQuant::kPacked ? DraftQuant::kQ8
                                                         : DraftQuant::kNone;
-  DraftQuants q{DraftQuant::kNvfp4, block, block, block};
+  DraftQuants q{DraftQuant::kNvfp4, block, block, block, block};
   if (block == DraftQuant::kNone) {
     auto beside_float = [](int w) {
       return w == FLYX_DRAFT_WEIGHTS_NVFP4 ? DraftQuant::kNvfp4
@@ -1030,6 +1084,7 @@ DraftQuants resolve_draft_quant(const flyx_model_desc& d, interfaces::DraftWeigh
       const flyx_block& b = d.blocks[i];
       if (b.kind == FLYX_BLOCK_DFLASH2 && b.dflash2.q8_weights) q.dflash = DraftQuant::kQ8;
       if (b.kind == FLYX_BLOCK_DSPINE) q.dspine = beside_float(b.dspine.float_weights);
+      if (b.kind == FLYX_BLOCK_EAGLE4) q.eagle4 = beside_float(b.eagle4.float_weights);
     }
   }
   return q;
@@ -1050,6 +1105,8 @@ std::vector<const Lin*> drafter_lins(const flyx_bmodel* m, int block) {
       const auto& l = std::get<DFlashLayer>(m->blocks[size_t(d->first_layer + j)]);
       for (const Lin* x : {&l.w_qkv, &l.w_o, &l.w_gu, &l.w_down, &l.attn_proj, &l.mlp_proj}) out.push_back(x);
     }
+  } else if (const auto* e = std::get_if<Eagle4Block>(&m->blocks[size_t(block)])) {
+    out = {&e->fc, &e->attn.w_in, &e->attn.w_out, &e->mlp.w_gu, &e->mlp.w_down};
   } else if (const auto* d = std::get_if<DSparkBlock>(&m->blocks[size_t(block)])) {
     for (int j = 0; j < d->layers(); ++j) {
       const auto& l = std::get<DSparkLayer>(m->blocks[size_t(d->first_layer + j)]);
@@ -1107,6 +1164,8 @@ void bind(flyx_bmodel* m, const flyx_model_desc& d, LoadTimes* times) {
       is_dflash[size_t(i)] = 1;
     } else if (b.kind == FLYX_BLOCK_DSPARK || b.kind == FLYX_BLOCK_DSPARK_LAYER) {
       is_dspark[size_t(i)] = 1;
+    } else if (b.kind == FLYX_BLOCK_EAGLE4) {
+      is_dflash[size_t(i)] = 1;  // bound beside the block drafters, after the target
     }
   }
   std::vector<char> is_draft(size_t(d.n_blocks), 0);
@@ -1261,6 +1320,15 @@ void bind(flyx_bmodel* m, const flyx_model_desc& d, LoadTimes* times) {
       }
       case FLYX_BLOCK_DSPARK_LAYER: put_block(m, i, dspark_layer(L, b.dspark_layer, sm, q.dspark)); break;
       case FLYX_BLOCK_DSPINE_LAYER: put_block(m, i, dspine_layer(L, b.dspine_layer, q.dspine)); break;
+      case FLYX_BLOCK_EAGLE4: {
+        ref(i, b.eagle4.embed, FLYX_BLOCK_EMBED, "embedding");
+        expect(m->eagle4_block < 0 && m->dflash_block < 0, "more than one drafter of the target's taps");
+        expect(b.eagle4.ring >= 0 && b.eagle4.ring < d.n_states && sm.ring[size_t(b.eagle4.ring)],
+               "EAGLE-4 block names no ring");
+        m->eagle4_block = i;
+        put_block(m, i, eagle4(L, d, b.eagle4, sm, q.eagle4));
+        break;
+      }
       default: throw std::runtime_error("unexpected draft block kind " + std::to_string(b.kind));
     }
   }
@@ -1269,11 +1337,13 @@ void bind(flyx_bmodel* m, const flyx_model_desc& d, LoadTimes* times) {
   const std::string mtp_held = held_precision(drafter_lins(m, m->mtp_block));
   const std::string dflash_held = held_precision(drafter_lins(m, m->dflash_block));
   const std::string dspark_held = held_precision(drafter_lins(m, m->dspark_block));
-  if (m->dflash_block >= 0) m->active_draft_weights = dflash_held;
+  const std::string eagle4_held = held_precision(drafter_lins(m, m->eagle4_block));
+  if (m->eagle4_block >= 0) m->active_draft_weights = eagle4_held;
+  else if (m->dflash_block >= 0) m->active_draft_weights = dflash_held;
   else if (m->dspark_block >= 0) m->active_draft_weights = dspark_held;
   else if (m->mtp_block >= 0) m->active_draft_weights = mtp_held;
   else if (m->dv_block >= 0) m->active_draft_weights = "exact";
-  if (m->verbose && (m->mtp_block >= 0 || m->dflash_block >= 0 || m->dspark_block >= 0)) {
+  if (m->verbose && (m->mtp_block >= 0 || m->dflash_block >= 0 || m->dspark_block >= 0 || m->eagle4_block >= 0)) {
     std::string what;
     auto say = [&](const char* name, const std::string& held) {
       what += (what.empty() ? "" : ", ") + std::string(name) + "=" + held;
@@ -1281,6 +1351,7 @@ void bind(flyx_bmodel* m, const flyx_model_desc& d, LoadTimes* times) {
     if (m->mtp_block >= 0) say("mtp", mtp_held);
     if (m->dflash_block >= 0) say(block<DFlashBlock>(m, m->dflash_block).name(), dflash_held);
     if (m->dspark_block >= 0) say("dspark", dspark_held);
+    if (m->eagle4_block >= 0) say("eagle4", eagle4_held);
     std::fprintf(stderr, "flyx-cuda: drafter weights %s (%.2f GB on GPU)\n", what.c_str(),
                  double(m->bytes - pre_draft_bytes) / 1e9);
   }
@@ -1293,6 +1364,9 @@ void bind(flyx_bmodel* m, const flyx_model_desc& d, LoadTimes* times) {
     } else if (auto* ds = std::get_if<DSparkBlock>(&blk)) {
       ds->feats_offset = int(tap_off);
       tap_off += int64_t(ds->n_taps) * m->hidden;
+    } else if (auto* e = std::get_if<Eagle4Block>(&blk)) {
+      e->feats_offset = int(tap_off);
+      tap_off += int64_t(e->n_taps) * e->target_hidden;
     }
   }
   // FLYX_NODE_RES_MIX names a [hidden] vector by its weight index (Inkling-2's output_res_query), and no block
@@ -1436,7 +1510,8 @@ int estimate_load(const flyx_model_desc* desc, const flyx_open_options* opts, ui
       if (b.mtp.mlp >= 0 && b.mtp.mlp < desc->n_blocks)
         is_draft_blk[size_t(b.mtp.mlp)] = is_mtp_blk[size_t(b.mtp.mlp)] = 1;
     } else if (b.kind == FLYX_BLOCK_DFLASH2 || b.kind == FLYX_BLOCK_DFLASH2_LAYER || b.kind == FLYX_BLOCK_DSPARK ||
-               b.kind == FLYX_BLOCK_DSPARK_LAYER || b.kind == FLYX_BLOCK_DSPINE || b.kind == FLYX_BLOCK_DSPINE_LAYER) {
+               b.kind == FLYX_BLOCK_DSPARK_LAYER || b.kind == FLYX_BLOCK_DSPINE || b.kind == FLYX_BLOCK_DSPINE_LAYER ||
+               b.kind == FLYX_BLOCK_EAGLE4) {
       is_draft_blk[size_t(i)] = 1;
     }
   }
@@ -1529,6 +1604,13 @@ int estimate_load(const flyx_model_desc* desc, const flyx_open_options* opts, ui
       mark(is_drafter, l.read), mark(is_drafter, l.write);
       dflash_ctx_ws.push_back(l.k);
       dflash_ctx_ws.push_back(l.v);
+    } else if (b.kind == FLYX_BLOCK_EAGLE4) {
+      // Its layer's linears and fc quantized as asked (eagle4()); its head and candidate head stay bf16.
+      const flyx_eagle4_block& e = b.eagle4;
+      for (int t = 0; t < e.n_taps && t < FLYX_EAGLE4_MAX_TAPS; ++t) mark_norm(is_drafter, e.fc_norm[t]);
+      for (const flyx_norm& n : {e.in_norm, e.hidden_norm, e.post_norm, e.norm}) mark_norm(is_drafter, n);
+      for (int w : {e.fc, e.q, e.k, e.v, e.o, e.gate, e.up, e.down}) mark_linear(w, q.eagle4);
+      for (int w : {e.head, e.cand_down, e.cand_up}) mark_linear(w, DraftQuant::kNone);
     } else if (b.kind == FLYX_BLOCK_DV) {
       mark_norm(is_dv_w, b.dv.norm);
       for (int w : {b.dv.mask_emb, b.dv.res_in, b.dv.res_out, b.dv.sel_a, b.dv.sel_h, b.dv.sel_b, b.dv.sel_alpha})

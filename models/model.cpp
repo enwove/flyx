@@ -19,7 +19,9 @@ struct DrafterTraits {
   bool sequential;        // drafts one token per step; stopping early saves both draft and verify work
   bool tree_only;         // drafts trees over a persistent canvas (DV)
   bool block;             // a parallel block drafter (models/drafters/registry.h)
+  bool tapped;            // drafts from the target's taps in the registry's slot without being a block (EAGLE-4)
   bool trees_by_default;  // its trees beside its chains pay on attention-only targets (drafts_trees_by_default)
+  bool trees_beside_recurrence;  // ... on a gated delta net's too, whose tree recurrence a tree's rows run
   flyx_draft_weights beside_float;  // its projections beside a float target (draft_weights_beside_float)
   // A block drafted at once whose drafts a small head then refines one at a time: a step costs little beside the
   // verify row its draft adds, so a round that stops may verify fewer drafts than it has (draft_steps_cheap).  Not a
@@ -44,7 +46,10 @@ struct DrafterInfo {
 // round (its walk re-scores the head's top 16 through its bf16 bridge); DFlash2's lost 9% of their acceptance in NVFP4
 // there.  DFlash's Q8_0 projections: Qwen3-8B bf16 with z-lab's Qwen3-8B-DFlash-b16, DeepSpec's 9 datasets (512
 // tokens), 356.0 against 340.3 tok/s in bf16 at 5.00 tokens a round both.  DSpine drafts its block at most
-// (DrafterReach).
+// (DrafterReach).  EAGLE-4's trees and NVFP4 layers beside a BF16 target: Qwen3.8-27B (a gated delta net) with
+// EAGLE-Corp's Qwen3.8-27B-EAGLE4 on an RTX PRO 6000, docs/benchmarks.md section 7: its trees of 15 chosen beside its
+// chains 134.7 tok/s over the 174 prompts against 126.2 for its chains alone; NVFP4 layers 1% fewer tokens a round
+// than bf16, rounds 7% cheaper.
 constexpr DrafterInfo kDrafters[] = {
     {Drafter::kMtp, interfaces::DrafterMode::kMtp, "MTP", {.sequential = true}},
     {Drafter::kDFlash2, interfaces::DrafterMode::kDFlash2, "DFlash2", {.block = true}},
@@ -54,6 +59,12 @@ constexpr DrafterInfo kDrafters[] = {
      {.block = true, .trees_by_default = true, .beside_float = FLYX_DRAFT_WEIGHTS_Q8, .refines_by_step = true}},
     {Drafter::kDSpine, interfaces::DrafterMode::kDSpine, "DSpine",
      {.block = true, .beside_float = FLYX_DRAFT_WEIGHTS_NVFP4}},
+    {Drafter::kEagle4, interfaces::DrafterMode::kEagle4, "EAGLE-4",
+     {.sequential = true,
+      .tapped = true,
+      .trees_by_default = true,
+      .trees_beside_recurrence = true,
+      .beside_float = FLYX_DRAFT_WEIGHTS_NVFP4}},
     {Drafter::kDv, interfaces::DrafterMode::kDv, "DV", {.tree_only = true}},
 };
 
@@ -92,11 +103,15 @@ Drafter drafter_named(std::string_view name) {
 }
 
 bool is_block_drafter(Drafter d) { return drafter_traits(d).block; }
-bool drafts_trees_by_default(Drafter d) { return drafter_traits(d).trees_by_default; }
+bool is_tapped_drafter(Drafter d) { return drafter_traits(d).block || drafter_traits(d).tapped; }
+bool drafts_trees_by_default(Drafter d, bool recurrent) {
+  const DrafterTraits& t = drafter_traits(d);
+  return t.trees_by_default && (!recurrent || t.trees_beside_recurrence);
+}
 flyx_draft_weights draft_weights_beside_float(Drafter d) { return drafter_traits(d).beside_float; }
 
 // Width ladder and intra-round adaptive stopping, driven by drafter traits + target structure:
-// - Sequential drafters (MTP, future EAGLE-4): tensor-core aligned 1, 3, 5, 7, ..., max_drafts (<= 15).
+// - Sequential drafters (MTP, EAGLE-4): tensor-core aligned 1, 3, 5, 7, ..., max_drafts (<= 15).
 // - Parallel block drafters: {1, 2, 3, 5, 7} when target verify cost scales steeply with width (e.g. sparse MoE, where
 //   each draft row reads its own experts: one or two drafts often pay where three do not), {3, 7} on dense targets,
 //   plus FLYX_MAX_ROWS - 1 when its block stretches past max_drafts (DrafterReach::stretch).
@@ -194,7 +209,8 @@ bool choose_drafters(const ModelOptions& o, const DrafterSources& has, std::vect
       break;
     }
     case interfaces::DrafterMode::kNone: break;
-    default: {  // a block drafter, of the kind named: of DFlash2's block, or llama.cpp's DSpark GGUF
+    default: {  // a drafter of the target's taps of the kind named (DFlash2's block, DSpine's, EAGLE-4), or
+                // llama.cpp's DSpark GGUF
       const Drafter want = drafter_of(mode);
       block = has.block == want;
       dspark_gguf = want == Drafter::kDSpark && has.dspark_gguf;
@@ -203,11 +219,14 @@ bool choose_drafters(const ModelOptions& o, const DrafterSources& has, std::vect
       break;
     }
   }
+  // EAGLE-4 keeps its h per position in the one ring a sequence has, where an MTP layer keeps the target's hidden: a
+  // model drafts with one of them, EAGLE-4 when both are there (auto, all).
+  if (block && has.block == Drafter::kEagle4) mtp = false;
   // DV's canvas follows its own rounds only, and the controller weighs its warm-up against plain decoding's and
   // lookup's rounds alone: no drafter beside it.
   if (dv && (mtp || block || dspark_gguf)) return *err = "DV drafts alone: not beside another drafter", false;
   if (mtp) out->push_back(Drafter::kMtp);
-  if (block) out->push_back(has.block);  // its drafter of DFlash2's block
+  if (block) out->push_back(has.block);  // its drafter of the target's taps
   if (dspark_gguf) out->push_back(Drafter::kDSpark);
   if (dv) out->push_back(Drafter::kDv);
   return true;

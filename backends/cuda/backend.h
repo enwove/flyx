@@ -150,6 +150,9 @@ struct BackendOptions {
   std::string tuning_table;      // tuning=NAME
   bool pdl_given = false;        // option pdl was given: the GPU table's default does not apply
   bool full_draft_head = false;  // draft_head=full: draft logits from the whole (NVFP4) head, not draft_pick
+  // eagle4_tree=BEAMxSTEPS: EAGLE-4's draft trees, the nodes a step keeps and the steps a tree takes (0: as its width
+  // asks, eagle4_tree_steps(): 2 width / 3)
+  int eagle4_beam = 4, eagle4_steps = 0;
   bool draft_kv16 = false;       // draft_kv=16: the MTP layer's cache in binary16 beside the target's FP8
   bool packed_blocks = true;     // blocks=bf16 clears it
   int embed = 0;                 // embed=auto (0: host memory unless the GPU has room, open_model), host (1), gpu (2)
@@ -499,6 +502,7 @@ struct flyx_bmodel {
   int hidden = 0, vocab = 0;  // the residual stream's width, the vocabulary
   int mtp_block = -1, dflash_block = -1;  // the drafters (at most one of each), -1: none
   int dv_block = -1, dspark_block = -1;   // DV and DSpark drafters, -1: none
+  int eagle4_block = -1;                  // the EAGLE-4 drafter (it drafts a step a draft, as MTP), -1: none
   int head_block = -1;                    // the head they read
   std::unordered_map<int, float*> vec_weights;  // 1D device vectors referenced by FLYX_NODE_RES_MIX (weight index -> GPU)
   flyx::cuda::RowNeeds need;
@@ -714,6 +718,12 @@ struct flyx_seq {
   int* mtok = nullptr;                 // MTP: [anchor, d1, ..., dK]
   int* mcand = nullptr;                // MTP: a draft step's kMtpCands candidates and their logits (mtp_choose)
   float* mval = nullptr;
+  float* ez = nullptr;                 // EAGLE-4: cand_down g, its candidate head's low-rank code (kEagleBeamMax rows)
+  // EAGLE-4's draft trees: the tree, every frontier node's normed output by K/V slot [kEagleSlots][hidden], a step's
+  // rows' hidden inputs [kEagleBeamMax][hidden], and their candidates (kEagleBeamMax each) and best's probability
+  flyx::cuda::EagleTree* etree = nullptr;
+  float *egnode = nullptr, *ehbuf = nullptr, *eval = nullptr, *eprob = nullptr;
+  int* ecand = nullptr;
   int* oracle = nullptr;
   int oracle_cap = 0;
   // gen.drafts: written where the oracle is read, through a ring of pinned

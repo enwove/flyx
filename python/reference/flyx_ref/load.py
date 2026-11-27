@@ -12,6 +12,7 @@ from flyx_convert.fileformat import Reader  # noqa: E402
 
 from .draft import Draft, draft_config_from_canonical  # noqa: E402
 from .dspine import DSpine, dspine_config_from_canonical  # noqa: E402
+from .eagle4 import Eagle4, eagle4_config_from_canonical  # noqa: E402
 from .mtp import Mtp  # noqa: E402
 from .target import Target, TargetConfig  # noqa: E402
 
@@ -20,9 +21,11 @@ READS = ("lora",)  # the parts a file may require (fileformat.py: format 2) that
 
 
 def make_draft(d: dict | None, W: dict, dtype=torch.float64):
-    """The block drafter a file's "draft" config describes (DFlash2 or DSpine), or None."""
+    """The drafter a file's "draft" config describes (DFlash2, DSpine or EAGLE-4), or None."""
     if not d:
         return None
+    if d["kind"] == "eagle4":
+        return Eagle4(eagle4_config_from_canonical(d), W, dtype)
     if d["kind"] == "dspine":
         return DSpine(dspine_config_from_canonical(d), W, dtype)
     return Draft(draft_config_from_canonical(d), W, dtype)

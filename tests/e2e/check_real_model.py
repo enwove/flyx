@@ -7,6 +7,8 @@
         --lib build/bin/flyx.dll --drafters --hf-dtype float32          # no drafter; Windows
     python -I tests/e2e/check_real_model.py --hf models/MiniCPM5-1B --model minicpm5-1b-vlora-b2h.flyx \
         --lib build/bin/flyx.dll --drafters --hf-dtype float32 --lora lora_g_b2h.pt   # the file's V-LoRA
+    python tests/e2e/check_real_model.py --hf models/Qwen3.8-27B --model qwen38-27b.flyx --lib build/bin/libflyx.so \
+        --drafters mtp eagle4 --drafter-file models/Qwen3.8-27B-EAGLE4      # a drafter beside the model
 
 1. tokenizer: our C++ tokenizer vs the HuggingFace tokenizer on mixed text,
    alone and as a raw prompt (with the special tokens HF's post-processor
@@ -108,11 +110,15 @@ def main():
                     help="exact: bf16 inputs for every matrix; nvfp4: NVFP4 weights take NVFP4 inputs in prefill "
                          "passes whatever the file says (default: as the file has it; NVFP4 weights take bf16 ones "
                          "by themselves on a GPU without FP4 tensor cores)")
-    ap.add_argument("--drafters", nargs="*", choices=("mtp", "dflash2", "dflash", "dspark", "dspine"),
+    ap.add_argument("--drafters", nargs="*", choices=("mtp", "dflash2", "dflash", "dspark", "dspine", "eagle4"),
                     default=["mtp", "dflash2"],
                     help="drafters held to plain decoding, each one the file must have (GGUF typically has only "
                          "mtp; none named: plain alone, for a model without drafters such as MiniCPM5-1B); plain "
                          "always runs")
+    ap.add_argument("--drafter-file", action="append", default=[],
+                    help="a drafter in a file or directory of its own beside --model (repeatable), as the engine's "
+                         "--drafter-file takes it: e.g. EAGLE-Corp/Qwen3.8-27B-EAGLE4's directory for "
+                         "--drafters eagle4")
     ap.add_argument("--hf-dtype", choices=("bfloat16", "float32"), default="bfloat16",
                     help="transformers' weights and activations")
     ap.add_argument("--lora", help="bifill-dv's V-LoRA checkpoint (raft.py's) the model file holds: on transformers' "
@@ -185,7 +191,8 @@ def main():
 
     def open_engine(spec):
         return flyx.Engine(a.model, lib=a.lib, speculative=bool(spec), max_ctx=4096, drafter=spec or None,
-                           kv="fp8" if a.kv_fp8 else "16", activations=activations)
+                           kv="fp8" if a.kv_fp8 else "16", activations=activations,
+                           drafter_file=(a.drafter_file or None) if spec else None)
 
     for spec in (False, *a.drafters):
         eng = open_engine(spec)

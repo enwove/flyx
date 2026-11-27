@@ -15,6 +15,7 @@
 
 #include <charconv>
 #include <climits>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 
@@ -308,6 +309,25 @@ const std::vector<OptionSpec>& option_specs() {
       kernel_int_choice_opt("act_group", &KernelOptions::act_group, {"32", "64", "128", "256"}),
       kernel_int_choice_opt("act_fp4", &KernelOptions::act_fp4, {"0", "1", "2"}),
       bool_choice_opt("draft_head", &BackendOptions::full_draft_head, "full", "pick"),
+      {"eagle4_tree",
+       [](const std::string& key, const std::string& val, BackendOptions* o, std::string* err) {
+         int beam = 0, steps = 0;
+         char tail = 0;
+         if (std::sscanf(val.c_str(), "%dx%d%c", &beam, &steps, &tail) != 2 || beam < 1 ||
+             beam > flyx::cuda::kEagleBeamMax || steps < 0 || 1 + beam * steps > flyx::cuda::kEagleSlots) {
+           *err = "bad value \"" + val + "\" for " + key + " (BEAMxSTEPS: BEAM 1.." +
+                  std::to_string(flyx::cuda::kEagleBeamMax) + ", 1 + BEAM * STEPS <= " +
+                  std::to_string(flyx::cuda::kEagleSlots) + ")";
+           return false;
+         }
+         o->eagle4_beam = beam;
+         o->eagle4_steps = steps;
+         return true;
+       },
+       [](const BackendOptions& o, const BackendOptions& def) -> std::string {
+         if (o.eagle4_beam == def.eagle4_beam && o.eagle4_steps == def.eagle4_steps) return "";
+         return "eagle4_tree=" + std::to_string(o.eagle4_beam) + "x" + std::to_string(o.eagle4_steps);
+       }},
       bool_choice_opt("draft_kv", &BackendOptions::draft_kv16, "16", "fp8"),
       bool_choice_opt("blocks", &BackendOptions::packed_blocks, "packed", "bf16"),
       {"embed",
@@ -780,7 +800,8 @@ int open_model(const flyx_model_desc* desc, const flyx_open_options* opts, flyx_
     bool drafter = false;
     for (int i = 0; i < desc->n_blocks; ++i)
       for (int k : {FLYX_BLOCK_MTP, FLYX_BLOCK_DFLASH2, FLYX_BLOCK_DFLASH2_LAYER, FLYX_BLOCK_DV, FLYX_BLOCK_DV_LAYER,
-                    FLYX_BLOCK_DSPARK, FLYX_BLOCK_DSPARK_LAYER, FLYX_BLOCK_DSPINE, FLYX_BLOCK_DSPINE_LAYER})
+                    FLYX_BLOCK_DSPARK, FLYX_BLOCK_DSPARK_LAYER, FLYX_BLOCK_DSPINE, FLYX_BLOCK_DSPINE_LAYER,
+                    FLYX_BLOCK_EAGLE4})
         drafter = drafter || desc->blocks[i].kind == k;
     char head[160] = "Not enough VRAM while loading weights.";
     if (has_others)

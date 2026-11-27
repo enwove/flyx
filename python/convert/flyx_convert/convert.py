@@ -4,11 +4,12 @@
     python -m flyx_convert --model Qwen3.5-4B/ --draft Qwen3.5-4B-DFlash2/ -o qwen35-4b.flyx
     python -m flyx_convert --draft Qwen3.8-27B-DFlash2/ -o qwen38-27b-dflash2.flyx   # a drafter file
     python -m flyx_convert --draft Qwen3.8-27B-DSpine-b16/ -o qwen38-27b-dspine.flyx  # a DSpine drafter file
+    python -m flyx_convert --draft Qwen3.8-27B-EAGLE4/ -o qwen38-27b-eagle4.flyx       # an EAGLE-4 drafter file
     python -m flyx_convert --model MiniCPM5-1B/ -o minicpm5-1b.flyx                     # Llama, no drafter
     python -m flyx_convert --model MiniCPM5-1B/ --dv minicpm5-dv/ -o minicpm5-1b-dv-res2.flyx  # Llama with DV
     python -m flyx_convert --model MiniCPM5-1B/ --lora minicpm5-vlora/ -o minicpm5-1b-vlora.flyx  # its V-LoRA
 
-A drafter file holds a block drafter (DFlash2 or DSpine, dspine.py) alone: the engine takes
+A drafter file holds a drafter (DFlash2, DSpine: dspine.py, or EAGLE-4: eagle4.py) alone: the engine takes
 it beside a model of any format, a GGUF included (--drafter-file).
 
 A DV drafter (bifill-dv's canvas and selector, docs/design/dv.md) comes from
@@ -45,6 +46,7 @@ import numpy as np
 
 from .dspine import canonical_dspine_config, check_dspine, dspine_tensors
 from .dv import add_dv
+from .eagle4 import canonical_eagle4_config, check_eagle4, eagle4_tensors
 from .fileformat import NUMPY, Writer
 from .lora import add_lora, has_lora
 from .rules import ATTN_LAYER_KEYS, DRAFT_LAYER_RULES, DRAFT_SKIP, check_tensors, layer_fields, map_name
@@ -202,7 +204,7 @@ DSPARK_CANDIDATES = 1024
 # The block drafters a config.json names by its architecture, and the kind each converts to (core/modelfile/
 # drafter_dir.cpp's kDrafterArchitectures).
 _DRAFTER_ARCHITECTURES = {"DFlash2DraftModel": "dflash2", "DFlashDraftModel": "dflash", "Qwen3DSparkModel": "dspark",
-                          "DSpineDraftModel": "dspine"}
+                          "DSpineDraftModel": "dspine", "LlamaForCausalLMEagle4": "eagle4"}
 
 
 def _drafter_config_kind(sc: dict) -> str:
@@ -266,6 +268,8 @@ def canonical_draft_config(sc: dict, target: dict | None) -> dict:
         return canonical_dspark_config(sc, target)
     if kind == "dspine":
         return canonical_dspine_config(sc, target)
+    if kind == "eagle4":
+        return canonical_eagle4_config(sc, target)
     dflash = kind == "dflash"
     if "dflash_config" in sc:
         if kind not in ("dflash2", "dflash"):
@@ -569,6 +573,13 @@ def _add_draft(w: Writer, draft_dir: str, target: dict | None, log) -> dict:
                 dseen.add(canon)
         check_dspine(draft, dseen)
         return draft
+    if draft["kind"] == "eagle4":
+        with SafeTensors(draft_dir) as dst:
+            for canon, dt, arr in eagle4_tensors(dst.names(), dst.read, draft, log):
+                w.add_tensor("draft." + canon, dt, arr.shape, np.ascontiguousarray(arr))
+                dseen.add(canon)
+        check_eagle4(draft, dseen)
+        return draft
     with SafeTensors(draft_dir) as dst:
         for name in dst.names():
             inner = name[len("model."):] if name.startswith("model.") else name
@@ -587,14 +598,15 @@ def _add_draft(w: Writer, draft_dir: str, target: dict | None, log) -> dict:
 
 
 def convert_draft(draft_dir: str, out: str, log=print) -> None:
-    """A block drafter (DFlash2, DSpine) on its own -> a drafter file: the engine takes it beside a model of any
+    """A drafter (DFlash2, DSpine, EAGLE-4) on its own -> a drafter file: the engine takes it beside a model of any
     format (--drafter-file), and checks it against that model (the "target" its config names)."""
     w = Writer()
     draft = _add_draft(w, draft_dir, None, log)
     w.meta = {"arch": "drafter", "kind": "drafter", "draft": draft,
               "source": {"draft": os.path.basename(os.path.normpath(draft_dir))}}
     w.write(out)
-    log(f"wrote {out}: {len(w.entries)} entries, a {draft['kind']} drafter of {draft['layers']} layer(s), block {draft['block']}, "
+    block = f", block {draft['block']}" if "block" in draft else ""
+    log(f"wrote {out}: {len(w.entries)} entries, a {draft['kind']} drafter of {draft['layers']} layer(s){block}, "
         f"taps {draft['taps']}, window {draft['window'] or 'none'}")
 
 
@@ -703,7 +715,8 @@ def main(argv=None):
     ap = argparse.ArgumentParser(prog="flyx_convert", description=__doc__.splitlines()[0])
     ap.add_argument("--model", help="HuggingFace Qwen3.5, Qwen3 or Llama (MiniCPM5) directory (without it: --draft "
                                     "alone, a drafter file for --drafter-file)")
-    ap.add_argument("--draft", help="block drafter directory: DFlash2 (speculators' or z-lab's) or DSpine (optional)")
+    ap.add_argument("--draft", help="drafter directory: DFlash2 (speculators' or z-lab's), DFlash, DSpark, DSpine or "
+                                    "EAGLE-4 (optional)")
     ap.add_argument("--dv", help="DV drafter directory, as python/convert/export_dv.py writes it (optional; Llama), "
                                  "with the V-LoRA it holds")
     ap.add_argument("--lora", help="a V-LoRA alone: the directory export_dv.py --vlora writes (optional; Llama, Qwen3)")

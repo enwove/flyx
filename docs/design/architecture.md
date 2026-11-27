@@ -9,7 +9,7 @@ System architecture, repository layout, execution pipeline, memory hierarchy, an
 Directory boundaries are architecture boundaries enforced by `tools/check_layering.py` (ctest `layering`). Dependencies point strictly inward: `core/` depends only on itself and `include/`; `ops/` only on `core/interfaces/` and `include/`; `models/` on `core/interfaces/` and `core/modelfile/`; `backends/` on `core/interfaces/`, `ops/`, and `include/`; `apps/` wire layers together.
 
 ```text
-include/flyx/         Public C API (flyx.h, version 3) and engine <-> backend ABI (backend_abi.h, version 50)
+include/flyx/         Public C API (flyx.h, version 3) and engine <-> backend ABI (backend_abi.h, version 53)
 core/                 Plain C++20 engine, zero CUDA headers
   interfaces/         Shared headers: model.h (open_model), chat.h (open_chat), options.h, vision.h
   modelfile/          Format-agnostic mmap container: .flyx (flyx_format.cpp) & GGUF container (gguf_format.cpp)
@@ -122,7 +122,7 @@ All device and host memory is accounted for by `ResourceLedger` before allocatio
 
 ---
 
-External backends must rebuild against ABI `52u` (ABI 50: attention and gated delta net blocks carry a PEFT adapter on any of their linears, `lora_gate` and `lora_head_order` its layout). ABI 51 adds the DSpine blocks and their float-target weight preference. ABI 52 makes a DFlash2 block's selector optional (`sel_rank` 0: DFlash). During elastic loading the planner fixes target KV precision and the automatic Strata cutoff from the target-only estimate. Retrying a projector or a drafter therefore preserves target arithmetic. CUDA counts stored bytes for all three dimensions of a packed MoE expert tensor, including its expert axis and separate scale storage where present. It budgets wide-row workspace and releases partial allocations before another attempt.
+External backends must rebuild against ABI `53u` (ABI 50: attention and gated delta net blocks carry a PEFT adapter on any of their linears, `lora_gate` and `lora_head_order` its layout). ABI 51 adds the DSpine blocks and their float-target weight preference. ABI 52 makes a DFlash2 block's selector optional (`sel_rank` 0: DFlash). ABI 53 adds the EAGLE-4 block (`FLYX_BLOCK_EAGLE4`: one Llama layer over the taps' `fc`, its candidate head and its own head). During elastic loading the planner fixes target KV precision and the automatic Strata cutoff from the target-only estimate. Retrying a projector or a drafter therefore preserves target arithmetic. CUDA counts stored bytes for all three dimensions of a packed MoE expert tensor, including its expert axis and separate scale storage where present. It budgets wide-row workspace and releases partial allocations before another attempt.
 
 ## 6. Core Invariants
 

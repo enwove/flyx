@@ -490,3 +490,53 @@ What made the difference on this GPU, measured on GSM8K and HumanEval at 15 draf
 
 The trace that found them (`CUDA_INJECTION64_PATH=.../libflyx-trace.so FLYX_TRACE=round.tsv flyx bench ...`, then
 `python -I bench/trace/gaps.py round.tsv`), before them: a round 15.35 ms, its graph busy 15.2 ms of it, the GEMMs 13.3.
+
+## 7. EAGLE-4 on Qwen3.8-27B BF16 against SGLang's EAGLE-4 (RTX PRO 6000 Workstation)
+
+One RTX PRO 6000 Blackwell Workstation Edition (96 GB, 600 W, driver `615.71.09`, a rented instance; flyx at this
+change, `cmake --preset dev` (this GPU's `sm_120`) with CUDA 13.0's `nvcc`, its GEMMs from
+`variants/sm120/tables/rtxpro6000ws.toml`), greedy, thinking off, up to 256 new tokens a prompt, each prompt in a fresh
+session; the six sets of section 6 (the same md5s; 174 prompts).
+
+- **Model**: `Qwen/Qwen3.8-27B` (`37561816`, BF16, its MTP layer kept), converted with
+  `EAGLE-Corp/Qwen3.8-27B-EAGLE4` (`f58a5985`, `LlamaForCausalLMEagle4`: one layer over the taps 4, 32 and 60, a
+  rank-128 candidate head).
+- **SGLang**: the EAGLE-4 release's SGLang (`0.5.23.dev252+eagle`, its `EAGLE_HARNESS` worker) on the same GPU and
+  checkpoints, `--speculative-num-steps 12 --speculative-eagle-topk 4 --speculative-num-draft-tokens 16` (its
+  configuration for this drafter), `--disable-overlap-schedule --mem-fraction-static 0.92 --context-length 16384`, fed
+  flyx's own prompt token ids one request at a time (`bench/ab/sglang_bench.py`, which counts decode speed as flyx
+  bench does).
+
+```sh
+PYTHONPATH=python/convert python -m flyx_convert --model Qwen3.8-27B --draft Qwen3.8-27B-EAGLE4 -o q38-e4.flyx
+flyx bench q38-e4.flyx --prompts S -n 256 --json R.json --no-spec                     # plain
+flyx bench q38-e4.flyx --prompts S -n 256 --json R.json --drafter mtp
+flyx bench q38-e4.flyx --prompts S -n 256 --json R.json --drafter eagle4              # its trees and chains
+flyx bench q38-e4.flyx --prompts S -n 256 --json R.json --drafter eagle4 --no-draft-trees
+sglang serve --model-path Qwen3.8-27B --speculative-algorithm EAGLE_HARNESS --speculative-draft-model-path \
+  Qwen3.8-27B-EAGLE4 --speculative-num-steps 12 --speculative-eagle-topk 4 --speculative-num-draft-tokens 16 ...
+python -I bench/ab/sglang_bench.py PLAIN.json --json SGL.json [--same-as SGL_PLAIN.json]
+```
+
+Decode `tok/s` (tokens a round). Every flyx answer is its plain decoding's, token for token, in every configuration
+(174 of 174); SGLang's EAGLE-4 answers are its own plain decoding's on 123 of 174 (chat 13 of 24, GSM8K 23 of 30,
+HumanEval 30, MATH-500 22, MBPP 26, MT-Bench 9 of 30).
+
+| Qwen3.8-27B BF16 | flyx plain | flyx MTP | flyx EAGLE-4, chains | flyx EAGLE-4 | SGLang plain | SGLang EAGLE-4 |
+|---|---:|---:|---:|---:|---:|---:|
+| chat (24) | 30.7 | 90.9 (3.48) | 86.8 (3.15) | 97.5 (3.79) | 28.8 | **98.5** (4.09) |
+| GSM8K | 30.7 | 149.0 (6.31) | 163.5 (6.42) | **168.3** (6.70) | 28.8 | 161.2 (7.08) |
+| HumanEval | 30.5 | 225.7 (9.85) | 254.1 (10.35) | **257.7** (10.45) | 28.8 | 225.4 (9.97) |
+| MATH-500 | 30.7 | 137.1 (5.67) | 147.9 (5.72) | **156.5** (6.21) | 28.7 | 147.2 (6.43) |
+| MBPP | 30.4 | 138.1 (5.95) | 161.8 (6.54) | **168.3** (6.88) | 28.8 | 160.0 (7.01) |
+| MT-Bench | 30.7 | 83.2 (3.15) | 81.8 (2.94) | **88.2** (3.38) | 28.8 | 87.2 (3.60) |
+| all 174 | 30.6 | 121.5 | 126.2 | **134.7** | 28.8 | 130.4 |
+
+flyx's tokens a round include its prompt-lookup rounds; SGLang's are its EAGLE-4 rounds'. flyx's EAGLE-4 drafts are
+NVFP4 (`draft_weights=auto` beside a BF16 target), its trees of 15 drafts (a beam of 4 for 10 steps, the chain of 7
+first), chosen every round with its chains of 1 to 15 and lookup rounds by cost and acceptance; a round of 15 costs
+38.7 ms against plain decoding's 32.5 (SGLang: 34.7 ms a token plain). Pinned to its trees (`--cycle`), chat gives
+99.4 tok/s (3.93); without the chain first in the tree (pure best-first), 100.7 (4.00), which leaves the controller
+nothing to learn the chain's acceptance from. flyx's plain decoding is SGLang's +6% from the bf16 skinny GEMMs' interleaved
+spans (`kernels/gemm_decode.cu`): a block's warps read neighbouring 32-value spans of its rows instead of 16 streams a
+chunk apart, 24.6 -> 30.6 tok/s on this GPU (the 27B's decode GEMMs 1.1-1.35 -> 1.4-1.6 TB/s of 1.65 its copies reach).

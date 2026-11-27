@@ -935,6 +935,15 @@ void draft_pick(const float* x, int ldx, const SignHead& h, const bf16* W, int V
   draft_pick_topk(rough, ld, rows, k, idx, val, L.st, prob, margin, nullptr, 0, nullptr, cap);
 }
 
+void draft_pick_rough(const float* x, int ldx, const bf16* W, int V, int K, int rows, int want, int k, int* idx,
+                      float* val, float* rough, const Launch& L, float* prob, float* margin) {
+  const int ld = std::max(V, kDraftPickFloats);
+  if (want > kDraftCands || k > want) throw std::runtime_error("draft pick: more candidates than the rough pick takes");
+  draft_select_cands(rough, ld, V, rows, L, want, kCandCap);
+  draft_score_bf16(x, ldx, W, nullptr, K, rows, rough, ld, false, 0.f, L.st, kCandCap);
+  draft_pick_topk(rough, ld, rows, k, idx, val, L.st, prob, margin, nullptr, 0, nullptr, kCandCap);
+}
+
 void draft_pick_blocks(const float* x, int ldx, const SignHead& h, const BlockMat& W, int V, int K, int rows, int k,
                        int* idx, float* val, float* rough, const Launch& L, bool exact_1row, float* prob,
                        float* margin) {

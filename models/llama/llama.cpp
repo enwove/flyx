@@ -179,7 +179,7 @@ bool Llama::build(const ModelFile& file, const ModelOptions& o, std::string* err
 
   // Attention-only layers: a tree's wider verify costs about a chain's, so a block drafter whose trees pay (DSpark's)
   // drafts them by default, and the file then reads every position as DV's does.
-  draft_trees_by_default_ = drafts_trees_by_default(drafters_reg_.sources().block);
+  draft_trees_by_default_ = drafts_trees_by_default(drafters_reg_.sources().block, false);
   file_drafts_trees_ = has_dv || draft_trees_by_default_;
 
   std::vector<Drafter> drafters;
