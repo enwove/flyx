@@ -81,6 +81,6 @@ Refused, with the file named: a width or vocabulary other than the target's (whe
 | `gguf_models` | GGUF model description matches `.flyx` description weight-for-weight via layout flags; a drafter GGUF matches its `.flyx` drafter file block-for-block |
 | `dflash2_models` | Drafter GGUFs beside the tiny Qwen3 and Llama (block, taps, context nodes); drafter files refused for what they say or for the model they were made for |
 | `gguf_qwen2_nfc`, `gguf_qwen2_none` | Qwen2 pre-tokenizer regex splits vs HuggingFace `tokenizers` |
-| `gguf_cpu_ref`, `gguf_cuda`, `gguf_cuda_unfused`, `gguf_cuda_pdl`, `gguf_cuda_no_pdl` | End-to-end golden outputs, MTP/DFlash2 sidecars (drafter GGUFs in BF16, Q8_0 and mixed block types; beside Qwen3.5, Qwen3 and Llama), packed CUDA vs `cpu_ref` across all block types + GGML NVFP4 |
+| `gguf_cpu_ref`, `gguf_cuda_unfused`, `gguf_cuda_pdl`, `gguf_cuda_no_pdl` | End-to-end golden outputs, MTP/DFlash2 sidecars (drafter GGUFs in BF16, Q8_0 and mixed block types; beside Qwen3.5, Qwen3 and Llama), packed CUDA vs `cpu_ref` across all block types + GGML NVFP4 |
 | `cuda_ops` (`test_blocks`) | Per-type bit-exact block decode, GEMMs vs float64, row-count bit invariance |
 | `golden_*_qwen3_gguf` | Tiny Qwen3 GGUF against `transformers` |
