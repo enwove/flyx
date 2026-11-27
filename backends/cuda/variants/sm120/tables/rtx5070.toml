@@ -1,0 +1,485 @@
+# Copyright 2026 The flyx Authors. SPDX-License-Identifier: Apache-2.0
+# Tuning table for NVIDIA GeForce RTX 5070, written by `cuda_bench tune` (GB/s of weights streamed in brackets).
+# 2026-11-26, RTX 5070 12 GB (vast.ai, power limit 250 W), driver 615.71.09, CUDA 13.0.88, flyx 5fae786,
+# `cuda_bench tune` (every family, no file), on the RTX 5090's table (the sm_120 table it ran before): this GPU's
+# own 8-bit passes (blocks_q8) and the families the A/B below does not reach; the 5090's rounds and runs of K
+# stay (this GPU's own rounds were 3% slower in decoding, its runs slowed short prompts' prefill 1.6%).
+# Against the RTX 5090 table (`flyx bench --prompts`, --ctx 4096 --kv-method exact, --backend-opt tuning=rtx5090
+# and this table in turns; the same tokens in every run), Qwen3.5-4B-Q4_K_M: plain decoding +0.0%, prefill of
+# short prompts 0.2% and of a 6K prompt 8.1% faster (larger models do not fit 12 GB).
+sku = "rtx5070"
+devices = ["NVIDIA GeForce RTX 5070"]
+inherit = "rtx5090"
+
+# FP8 GQA, one full middle window; six orders, five timed launches per sample (ms).
+# HB2 3.8955 3.9004 3.9049 3.9209 3.9062 3.9229 median 3.9055
+# HB3 6.8201 6.8258 6.8446 6.8418 6.8372 6.8434 median 6.8395
+# HB6 8.0013 8.0218 8.0349 8.0377 8.0337 8.0501 median 8.0343
+[[flash_gqa]]
+fp8 = true
+nh = 24
+nkv = 4
+hd = 256
+rows = 256
+keys = 32832
+hb = 2
+
+# FP8 GQA, one full middle window; six orders, five timed launches per sample (ms).
+# HB2 15.7626 15.7616 15.7622 15.7579 15.7655 15.7272 median 15.7619
+# HB3 22.1481 22.1473 22.1432 22.1436 22.1481 22.1415 median 22.1454
+# HB6 24.0769 24.0777 24.0761 24.0708 24.0654 24.0740 median 24.0751
+[[flash_gqa]]
+fp8 = true
+nh = 24
+nkv = 4
+hd = 256
+rows = 1024
+keys = 32832
+hb = 2
+
+[[gemm]]  # attention q|k|v
+format = "nvfp4"
+n = 10240
+k = 2560
+rules = [
+  { rows = [1, 8], span = 128, chunks = 4, nt = 1, warps = 4, unroll = 4 },  # r1 558 r4 562 r8 554
+  { rows = [9, 16], span = 128, chunks = 4, nt = 2, warps = 4, unroll = 4 },  # r16 507
+]
+
+[[gemm]]  # gdn in (qkv|z|b|a)
+format = "nvfp4"
+n = 12352
+k = 2560
+rules = [
+  { rows = [1, 8], span = 128, chunks = 4, nt = 1, warps = 4, unroll = 4 },  # r1 564 r4 571 r8 568
+  { rows = [9, 16], span = 128, chunks = 4, nt = 2, warps = 4, unroll = 4 },  # r16 523
+]
+
+[[gemm]]  # mlp gate|up
+format = "nvfp4"
+n = 18432
+k = 2560
+rules = [
+  { rows = [1, 8], span = 128, chunks = 4, nt = 1, warps = 4, unroll = 4 },  # r1 586 r4 589 r8 589
+  { rows = [9, 16], span = 128, chunks = 4, nt = 2, warps = 4, unroll = 4 },  # r16 549
+]
+
+[[gemm]]  # mlp down
+format = "nvfp4"
+n = 2560
+k = 9216
+rules = [
+  { rows = [1, 4], span = 128, chunks = 8, nt = 1, warps = 8, unroll = 4 },  # r1 536 r4 531
+  { rows = [5, 16], span = 128, chunks = 8, nt = 2, warps = 8, unroll = 4 },  # r8 498 r16 390
+]
+
+[[gemm]]  # attention / gdn out
+format = "nvfp4"
+n = 2560
+k = 4096
+rules = [
+  { rows = [1, 1], span = 128, chunks = 4, nt = 1, warps = 4, unroll = 8 },  # r1 488
+  { rows = [2, 8], span = 128, chunks = 4, nt = 1, warps = 4, unroll = 4 },  # r4 457 r8 457
+  { rows = [9, 16], span = 128, chunks = 4, nt = 2, warps = 4, unroll = 4 },  # r16 436
+]
+
+[[gemm]]  # lm head
+format = "bf16"
+n = 248320
+k = 2560
+rules = [
+  { rows = [1, 8], nt = 1, warps = 16, unroll = 8 },  # r1 641 r4 641 r8 641
+  { rows = [9, 16], nt = 4, warps = 16, unroll = 4 },  # r16 627
+]
+
+[[gemm]]  # mtp q|k|v, dflash2 context k|v
+format = "bf16"
+n = 10240
+k = 2560
+rules = [
+  { rows = [1, 4], nt = 1, warps = 16, unroll = 8 },  # r1 617 r4 615
+  { rows = [5, 8], nt = 1, warps = 16, unroll = 4 },  # r8 610
+  { rows = [9, 16], nt = 4, warps = 16, unroll = 4 },  # r16 575
+]
+
+[[gemm]]  # mtp / dflash2 mlp gate|up
+format = "bf16"
+n = 18432
+k = 2560
+rules = [
+  { rows = [1, 1], nt = 1, warps = 16, unroll = 4 },  # r1 627
+  { rows = [2, 8], nt = 1, warps = 16, unroll = 16 },  # r4 624 r8 620
+  { rows = [9, 16], nt = 4, warps = 16, unroll = 4 },  # r16 594
+]
+
+[[gemm]]  # mtp / dflash2 mlp down
+format = "bf16"
+n = 2560
+k = 9216
+rules = [
+  { rows = [1, 4], nt = 1, warps = 16, unroll = 4 },  # r1 465 r4 484
+  { rows = [5, 8], nt = 1, warps = 16, unroll = 8 },  # r8 489
+  { rows = [9, 16], nt = 4, warps = 16, unroll = 4 },  # r16 472
+]
+
+[[gemm]]  # mtp / dflash2 attention out
+format = "bf16"
+n = 2560
+k = 4096
+rules = [
+  { rows = [1, 1], nt = 1, warps = 16, unroll = 4 },  # r1 575
+  { rows = [2, 4], nt = 1, warps = 16, unroll = 16 },  # r4 572
+  { rows = [5, 8], nt = 1, warps = 16, unroll = 8 },  # r8 579
+  { rows = [9, 16], nt = 4, warps = 16, unroll = 4 },  # r16 525
+]
+
+[[gemm]]  # mtp fc
+format = "bf16"
+n = 2560
+k = 5120
+rules = [
+  { rows = [1, 8], nt = 1, warps = 16, unroll = 8 },  # r1 527 r4 557 r8 559
+  { rows = [9, 16], nt = 2, warps = 16, unroll = 8 },  # r16 510
+]
+
+[[gemm]]  # dflash2 q|k|v
+format = "bf16"
+n = 6144
+k = 2560
+rules = [
+  { rows = [1, 4], nt = 1, warps = 16, unroll = 8 },  # r1 599 r4 603
+  { rows = [5, 8], nt = 1, warps = 16, unroll = 4 },  # r8 602
+  { rows = [9, 16], nt = 4, warps = 16, unroll = 4 },  # r16 563
+]
+
+[[gemm]]  # dflash2 conv proj
+format = "bf16"
+n = 640
+k = 2560
+rules = [
+  { rows = [1, 1], nt = 1, warps = 16, unroll = 16 },  # r1 438
+  { rows = [2, 8], nt = 1, warps = 16, unroll = 4 },  # r4 395 r8 352
+  { rows = [9, 16], nt = 2, warps = 16, unroll = 8 },  # r16 390
+]
+
+[[gemm]]  # dflash2 fc
+format = "bf16"
+n = 2560
+k = 12800
+rules = [
+  { rows = [1, 1], nt = 2, warps = 16, unroll = 8 },  # r1 446
+  { rows = [2, 8], nt = 1, warps = 16, unroll = 4 },  # r4 460 r8 460
+  { rows = [9, 16], nt = 4, warps = 16, unroll = 4 },  # r16 451
+]
+
+[[gemm]]  # dflash2 selector
+format = "bf16"
+n = 256
+k = 2560
+rules = [
+  { rows = [1, 8], nt = 1, warps = 16, unroll = 8 },  # r1 261 r4 225 r8 160
+  { rows = [9, 16], nt = 2, warps = 16, unroll = 4 },  # r16 188
+]
+
+[[gemm]]  # lm head in W12 (the same bits as bf16)
+format = "w12"
+n = 248320
+k = 2560
+rules = [
+  { rows = [1, 1], nt = 1, warps = 16, unroll = 8 },  # r1 580
+  { rows = [2, 16], nt = 4, warps = 16, unroll = 4 },  # r4 567 r8 559 r16 504
+]
+
+[[gemm]]  # 27B attention q|k|v
+format = "nvfp4"
+n = 14336
+k = 5120
+rules = [
+  { rows = [1, 4], span = 128, chunks = 8, nt = 1, warps = 8, unroll = 4 },  # r1 604 r4 604
+  { rows = [5, 16], span = 128, chunks = 8, nt = 2, warps = 8, unroll = 4 },  # r8 585 r16 444
+]
+
+[[gemm]]  # 27B gdn in (qkv|z|b|a)
+format = "nvfp4"
+n = 16480
+k = 5120
+rules = [
+  { rows = [1, 1], span = 128, chunks = 4, nt = 1, warps = 4, unroll = 8 },  # r1 584
+  { rows = [2, 8], span = 128, chunks = 4, nt = 1, warps = 4, unroll = 4 },  # r4 579 r8 575
+  { rows = [9, 16], span = 128, chunks = 4, nt = 4, warps = 4, unroll = 2 },  # r16 530
+]
+
+[[gemm]]  # 27B mlp gate|up
+format = "nvfp4"
+n = 34816
+k = 5120
+rules = [
+  { rows = [1, 1], span = 128, chunks = 4, nt = 1, warps = 4, unroll = 4 },  # r1 591
+  { rows = [2, 4], span = 128, chunks = 4, nt = 1, warps = 4, unroll = 8 },  # r4 592
+  { rows = [5, 8], span = 128, chunks = 4, nt = 1, warps = 4, unroll = 4 },  # r8 578
+  { rows = [9, 16], span = 128, chunks = 4, nt = 4, warps = 4, unroll = 2 },  # r16 554
+]
+
+[[gemm]]  # 27B mlp down
+format = "nvfp4"
+n = 5120
+k = 17408
+rules = [
+  { rows = [1, 4], span = 128, chunks = 16, nt = 1, warps = 16, unroll = 2 },  # r1 579 r4 572
+  { rows = [5, 16], span = 128, chunks = 16, nt = 2, warps = 16, unroll = 2 },  # r8 539 r16 484
+]
+
+[[gemm]]  # 27B attention / gdn out
+format = "nvfp4"
+n = 5120
+k = 6144
+rules = [
+  { rows = [1, 8], span = 128, chunks = 4, nt = 1, warps = 4, unroll = 8 },  # r1 506 r4 514 r8 520
+  { rows = [9, 16], span = 128, chunks = 4, nt = 2, warps = 4, unroll = 4 },  # r16 477
+]
+
+[[gemm]]  # MiniCPM5-1B q|k|v
+format = "bf16_rows"
+n = 2560
+k = 1536
+rules = [
+  { rows = [17, 64], nt = 4, chunks = 16, unroll = 4, parts = 3 },  # r32 334 (23.6 us) r48 259 (30.4 us) r64 195 (40.3 us)
+]
+
+[[gemm]]  # MiniCPM5-1B out
+format = "bf16_rows"
+n = 1536
+k = 2048
+rules = [
+  { rows = [17, 32], nt = 4, chunks = 16, unroll = 4, parts = 3 },  # r32 394 (16.0 us)
+  { rows = [33, 64], nt = 4, chunks = 16, unroll = 2, parts = 3 },  # r48 310 (20.3 us) r64 233 (27.0 us)
+]
+
+[[gemm]]  # MiniCPM5-1B gate|up
+format = "bf16_rows"
+n = 9216
+k = 1536
+rules = [
+  { rows = [17, 64], nt = 4, chunks = 16, unroll = 4, parts = 3 },  # r32 421 (67.2 us) r48 323 (87.7 us) r64 243 (116.7 us)
+]
+
+[[gemm]]  # MiniCPM5-1B down
+format = "bf16_rows"
+n = 1536
+k = 4608
+rules = [
+  { rows = [17, 32], nt = 4, chunks = 16, unroll = 4, parts = 3 },  # r32 443 (31.9 us)
+  { rows = [33, 64], nt = 4, chunks = 16, unroll = 2, parts = 3 },  # r48 349 (40.6 us) r64 264 (53.7 us)
+]
+
+[[gemm]]  # MiniCPM5-1B head
+format = "bf16_rows"
+n = 130560
+k = 1536
+rules = [
+  { rows = [17, 64], nt = 4, chunks = 16, unroll = 4, parts = 3 },  # r32 476 (843.0 us) r48 342 (1171.3 us) r64 253 (1585.5 us)
+]
+
+[[gemm]]  # DV canvas q|k|v (and a)
+format = "bf16_draft"
+n = 2560
+k = 1536
+rules = [
+  { rows = [17, 32], nt = 1, unroll = 4 },  # r32 492 (16.0 us)
+  { rows = [33, 64], nt = 2, unroll = 8 },  # r48 463 (17.0 us) r64 413 (19.0 us)
+]
+
+[[gemm]]  # DV canvas b of q, k, v
+format = "bf16_draft"
+n = 2048
+k = 256
+rules = [
+  { rows = [17, 32], nt = 2, unroll = 4 },  # r32 238 (4.4 us)
+  { rows = [33, 48], nt = 1, unroll = 4 },  # r48 197 (5.3 us)
+  { rows = [49, 64], nt = 2, unroll = 4 },  # r64 168 (6.2 us)
+]
+
+[[gemm]]  # DV canvas out (and a)
+format = "bf16_draft"
+n = 1536
+k = 2048
+rules = [
+  { rows = [17, 32], nt = 1, unroll = 4 },  # r32 495 (12.7 us)
+  { rows = [33, 48], nt = 2, unroll = 4 },  # r48 459 (13.7 us)
+  { rows = [49, 64], nt = 2, unroll = 8 },  # r64 399 (15.8 us)
+]
+
+[[gemm]]  # DV canvas b of out, down
+format = "bf16_draft"
+n = 1536
+k = 256
+rules = [
+  { rows = [17, 32], nt = 1, unroll = 4 },  # r32 197 (4.0 us)
+  { rows = [33, 64], nt = 2, unroll = 4 },  # r48 192 (4.1 us) r64 164 (4.8 us)
+]
+
+[[gemm]]  # DV canvas gate|up (and a)
+format = "bf16_draft"
+n = 9216
+k = 1536
+rules = [
+  { rows = [17, 32], nt = 2, unroll = 4 },  # r32 590 (48.0 us)
+  { rows = [33, 64], nt = 2, unroll = 8 },  # r48 561 (50.5 us) r64 529 (53.6 us)
+]
+
+[[gemm]]  # DV canvas b of gate, up
+format = "bf16_draft"
+n = 4608
+k = 256
+rules = [
+  { rows = [17, 48], nt = 2, unroll = 4 },  # r32 366 (6.4 us) r48 299 (7.9 us)
+  { rows = [49, 64], nt = 2, unroll = 8 },  # r64 253 (9.3 us)
+]
+
+[[gemm]]  # DV canvas down (and a)
+format = "bf16_draft"
+n = 1536
+k = 4608
+rules = [
+  { rows = [17, 32], nt = 1, unroll = 4 },  # r32 532 (26.6 us)
+  { rows = [33, 48], nt = 2, unroll = 4 },  # r48 461 (30.7 us)
+  { rows = [49, 64], nt = 4, unroll = 4 },  # r64 437 (32.4 us)
+]
+
+[[gemm]]  # DV canvas head
+format = "bf16_draft"
+n = 130560
+k = 1536
+rules = [
+  { rows = [17, 32], nt = 2, unroll = 4 },  # r32 638 (628.6 us)
+  { rows = [33, 64], nt = 2, unroll = 8 },  # r48 559 (717.5 us) r64 521 (769.5 us)
+]
+
+# This GPU's rules: for shapes no [[gemm]] lists, and the GGML block kernels' on Qwen3.8-27B's and Qwen3.5-4B's layers, every block type.
+[rules]
+bf16 = [
+  { rows = [1, 1], nt = 1, warps = 16, unroll = 8 },
+  { rows = [2, 8], nt = 1, warps = 16, unroll = 4 },
+  { rows = [9, 16], nt = 2, warps = 16, unroll = 4 },
+]
+nvfp4_k128 = { span = 128, chunks = 8, nt = 2, warps = 8, unroll = 4 }
+nvfp4_k64 = { span = 64, chunks = 16, nt = 1, warps = 16, unroll = 4 }
+bf16_rows = [
+  { rows = [17, 32], nt = 4, chunks = 16, unroll = 4, parts = 3 },
+  { rows = [33, 64], nt = 4, chunks = 16, unroll = 2, parts = 3 },
+]
+bf16_draft = [
+  { rows = [17, 32], nt = 1, unroll = 4 },
+  { rows = [33, 64], nt = 2, unroll = 4 },
+]
+# MoE layers' fused gate|up GEMMs on Inkling-2-Mini's experts, every type that compiles moe_dp4a configurations
+moe_gate_up = [
+  { types = ["Q4_K"], rows = [1, 1], columns = 0, units = 0 },
+  { types = ["Q4_K"], rows = [2, 2], columns = 2, units = 1 },
+  { types = ["Q4_K"], rows = [3, 4], columns = 0, units = 0 },
+  { types = ["Q4_K"], columns = 2, units = 1 },
+  { types = ["IQ2_XXS"], rows = [1, 1], columns = 1, units = 1 },
+  { types = ["IQ2_XXS"], columns = 2, units = 1 },
+  { types = ["IQ2_XS", "IQ2_S", "IQ3_XXS"], rows = [1, 1], columns = 0, units = 0 },
+  { types = ["IQ2_XS", "IQ2_S", "IQ3_XXS"], columns = 2, units = 1 },
+  { types = ["IQ4_NL"], rows = [1, 1], columns = 1, units = 1 },
+  { types = ["IQ4_NL"], rows = [2, 2], columns = 1, units = 2 },
+  { types = ["IQ4_NL"], rows = [3, 4], columns = 0, units = 0 },
+  { types = ["IQ4_NL"], rows = [5, 8], columns = 1, units = 1 },
+  { types = ["IQ4_NL"], columns = 2, units = 1 },
+  { columns = 0, units = 0 },
+]
+# moe_gate_up, passes of 1 rows: 4858 us with these rules, 4942 with the defaults (-1.7%), 4837 with the best for each
+# moe_gate_up, passes of 2 rows: 8073 us with these rules, 9013 with the defaults (-10.4%), 8073 with the best for each
+# moe_gate_up, passes of 4 rows: 13813 us with these rules, 15360 with the defaults (-10.1%), 13659 with the best for each
+# moe_gate_up, passes of 6 rows: 19912 us with these rules, 22902 with the defaults (-13.1%), 19912 with the best for each
+# moe_gate_up, passes of 8 rows: 25606 us with these rules, 29700 with the defaults (-13.8%), 25606 with the best for each
+# moe_gate_up, passes of 16 rows: 49133 us with these rules, 57684 with the defaults (-14.8%), 49133 with the best for each
+blocks = [
+  { n_max = 64, rows = [1, 16], nt = 1, nw = 2, kw = 4 },
+  { n_max = 2048, rows = [1, 16], nt = 1, nw = 4, kw = 4 },
+  { n_max = 5120, rows = [1, 2], nt = 1, nw = 2, kw = 4 },
+  { n_max = 5120, rows = [3, 16], nt = 1, nw = 4, kw = 2 },
+  { n_max = 6144, rows = [1, 4], nt = 1, nw = 8, kw = 1 },
+  { n_max = 6144, rows = [5, 16], nt = 2, nw = 8, kw = 1 },
+  { n_max = 12288, rows = [1, 1], nt = 1, nw = 4, kw = 2 },
+  { n_max = 12288, rows = [2, 16], nt = 1, nw = 8, kw = 1 },
+  { n_max = 65536, rows = [1, 2], nt = 2, nw = 4, kw = 1 },
+  { n_max = 65536, rows = [3, 4], nt = 1, nw = 8, kw = 1 },
+  { n_max = 65536, rows = [5, 16], nt = 2, nw = 4, kw = 1 },
+  { rows = [1, 1], nt = 2, nw = 4, kw = 1 },
+  { rows = [2, 4], nt = 1, nw = 8, kw = 1 },
+  { rows = [5, 16], nt = 2, nw = 4, kw = 1 },
+]
+# blocks, 1 rows: 758801 us with these rules, 775286 with the defaults (-2.1%), 732903 with the best for each
+# blocks, 2 rows: 799188 us with these rules, 813514 with the defaults (-1.8%), 752258 with the best for each
+# blocks, 4 rows: 875098 us with these rules, 882755 with the defaults (-0.9%), 830037 with the best for each
+# blocks, 8 rows: 998002 us with these rules, 1037473 with the defaults (-3.8%), 956992 with the best for each
+# blocks, 16 rows: 1003038 us with these rules, 1043231 with the defaults (-3.9%), 961924 with the best for each
+blocks_q8 = [
+  { types = ["Q4_0", "IQ3_XXS"], rows = [17, 128], n_max = 2048, bn = 64, qk = 128, bm = 64 },
+  { types = ["Q4_0", "IQ3_XXS"], rows = [17, 128], bn = 128, qk = 256, bm = 64 },
+  { types = ["Q4_0", "IQ3_XXS"], rows = [129, 2147483647], n_max = 64, bn = 64, qk = 128, bm = 64 },
+  { types = ["Q4_0", "IQ3_XXS"], rows = [129, 2147483647], n_max = 2048, bn = 128, qk = 256, bm = 128 },
+  { types = ["Q4_0", "IQ3_XXS"], rows = [129, 2147483647], n_max = 5120, bn = 64, qk = 128, bm = 128 },
+  { types = ["Q4_0", "IQ3_XXS"], rows = [129, 2147483647], n_max = 12288, bn = 128, qk = 256, bm = 128 },
+  { types = ["Q4_0", "IQ3_XXS"], bn = 64, qk = 128, bm = 128 },
+  { types = ["Q4_1", "Q5_1"], rows = [17, 128], n_max = 65536, bn = 64, qk = 128, bm = 64 },
+  { types = ["Q4_1", "Q5_1"], rows = [17, 128], bn = 128, qk = 256, bm = 64 },
+  { types = ["Q4_1", "Q5_1"], rows = [129, 2147483647], n_max = 64, bn = 64, qk = 128, bm = 64 },
+  { types = ["Q4_1", "Q5_1"], bn = 64, qk = 128, bm = 128 },
+  { types = ["Q8_0"], rows = [17, 128], n_max = 64, bn = 64, qk = 128, bm = 64 },
+  { types = ["Q8_0"], rows = [17, 128], bn = 128, qk = 256, bm = 64 },
+  { types = ["Q8_0"], rows = [129, 2147483647], n_max = 64, bn = 64, qk = 128, bm = 64 },
+  { types = ["Q8_0"], bn = 64, qk = 128, bm = 128 },
+  { types = ["Q5_K"], rows = [17, 128], n_max = 2048, bn = 64, qk = 128, bm = 64 },
+  { types = ["Q5_K"], rows = [17, 128], n_max = 6144, bn = 128, qk = 256, bm = 64 },
+  { types = ["Q5_K"], rows = [17, 128], n_max = 12288, bn = 64, qk = 128, bm = 64 },
+  { types = ["Q5_K"], rows = [17, 128], bn = 128, qk = 256, bm = 64 },
+  { types = ["Q5_K"], rows = [129, 2147483647], n_max = 64, bn = 64, qk = 128, bm = 64 },
+  { types = ["Q5_K"], rows = [129, 2147483647], n_max = 2048, bn = 128, qk = 256, bm = 128 },
+  { types = ["Q5_K"], rows = [129, 2147483647], n_max = 5120, bn = 64, qk = 128, bm = 128 },
+  { types = ["Q5_K"], rows = [129, 2147483647], n_max = 65536, bn = 128, qk = 256, bm = 128 },
+  { types = ["Q5_K"], bn = 64, qk = 128, bm = 128 },
+  { types = ["Q6_K"], rows = [17, 128], n_max = 2048, bn = 64, qk = 128, bm = 64 },
+  { types = ["Q6_K"], rows = [17, 128], n_max = 6144, bn = 128, qk = 256, bm = 64 },
+  { types = ["Q6_K"], rows = [17, 128], n_max = 12288, bn = 64, qk = 128, bm = 64 },
+  { types = ["Q6_K"], rows = [17, 128], bn = 128, qk = 256, bm = 64 },
+  { types = ["Q6_K"], rows = [129, 2147483647], n_max = 2048, bn = 64, qk = 128, bm = 64 },
+  { types = ["Q6_K"], rows = [129, 2147483647], n_max = 5120, bn = 64, qk = 128, bm = 128 },
+  { types = ["Q6_K"], rows = [129, 2147483647], n_max = 6144, bn = 128, qk = 256, bm = 128 },
+  { types = ["Q6_K"], bn = 64, qk = 128, bm = 128 },
+  { types = ["IQ2_XXS", "IQ3_S"], rows = [17, 128], n_max = 2048, bn = 64, qk = 128, bm = 64 },
+  { types = ["IQ2_XXS", "IQ3_S"], rows = [17, 128], bn = 128, qk = 256, bm = 64 },
+  { types = ["IQ2_XXS", "IQ3_S"], rows = [129, 2147483647], n_max = 64, bn = 64, qk = 128, bm = 64 },
+  { types = ["IQ2_XXS", "IQ3_S"], rows = [129, 2147483647], n_max = 2048, bn = 128, qk = 256, bm = 128 },
+  { types = ["IQ2_XXS", "IQ3_S"], rows = [129, 2147483647], n_max = 5120, bn = 64, qk = 128, bm = 128 },
+  { types = ["IQ2_XXS", "IQ3_S"], rows = [129, 2147483647], n_max = 65536, bn = 128, qk = 256, bm = 128 },
+  { types = ["IQ2_XXS", "IQ3_S"], bn = 64, qk = 128, bm = 128 },
+  { types = ["IQ2_XS"], rows = [17, 128], n_max = 2048, bn = 64, qk = 128, bm = 64 },
+  { types = ["IQ2_XS"], rows = [17, 128], bn = 128, qk = 256, bm = 64 },
+  { types = ["IQ2_XS"], rows = [129, 2147483647], n_max = 64, bn = 64, qk = 128, bm = 64 },
+  { types = ["IQ2_XS"], bn = 64, qk = 128, bm = 128 },
+  { types = ["IQ1_S"], rows = [17, 128], n_max = 64, bn = 64, qk = 128, bm = 64 },
+  { types = ["IQ1_S"], rows = [17, 128], bn = 128, qk = 256, bm = 64 },
+  { types = ["IQ1_S"], rows = [129, 2147483647], n_max = 64, bn = 64, qk = 128, bm = 64 },
+  { types = ["IQ1_S"], rows = [129, 2147483647], n_max = 2048, bn = 128, qk = 256, bm = 128 },
+  { types = ["IQ1_S"], rows = [129, 2147483647], n_max = 5120, bn = 128, qk = 256, bm = 64 },
+  { types = ["IQ1_S"], rows = [129, 2147483647], n_max = 65536, bn = 128, qk = 256, bm = 128 },
+  { types = ["IQ1_S"], bn = 64, qk = 128, bm = 128 },
+  { types = ["IQ4_XS"], rows = [17, 128], n_max = 64, bn = 64, qk = 128, bm = 64 },
+  { types = ["IQ4_XS"], rows = [17, 128], bn = 128, qk = 256, bm = 64 },
+  { types = ["IQ4_XS"], rows = [129, 2147483647], n_max = 64, bn = 64, qk = 128, bm = 64 },
+  { types = ["IQ4_XS"], rows = [129, 2147483647], n_max = 2048, bn = 128, qk = 256, bm = 128 },
+  { types = ["IQ4_XS"], rows = [129, 2147483647], n_max = 5120, bn = 64, qk = 128, bm = 128 },
+  { types = ["IQ4_XS"], rows = [129, 2147483647], n_max = 12288, bn = 128, qk = 256, bm = 128 },
+  { types = ["IQ4_XS"], bn = 64, qk = 128, bm = 128 },
+  { rows = [17, 128], n_max = 2048, bn = 64, qk = 128, bm = 64 },
+  { rows = [17, 128], n_max = 6144, bn = 128, qk = 256, bm = 64 },
+  { rows = [17, 128], n_max = 12288, bn = 64, qk = 128, bm = 64 },
+  { rows = [17, 128], bn = 128, qk = 256, bm = 64 },
+  { rows = [129, 2147483647], n_max = 64, bn = 64, qk = 128, bm = 64 },
+  { bn = 64, qk = 128, bm = 128 },
+]
+# blocks_q8, passes of 32, 64 and 128 rows: 5230265 us with these rules, 5397498 with the defaults (-3.1%), 5207811 with the best for each
+# blocks_q8, passes of 512 rows: 7880866 us with these rules, 8140612 with the defaults (-3.2%), 7865439 with the best for each
