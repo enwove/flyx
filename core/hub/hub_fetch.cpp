@@ -7,11 +7,13 @@
 #include <algorithm>
 #include <chrono>
 #include <condition_variable>
+#include <cstring>
 #include <fstream>
 #include <mutex>
 #include <thread>
 
 #include "core/hub/sha256.h"
+#include "core/modelfile/readers.h"
 #include "core/os/http.h"
 #include "core/os/os.h"
 #include "core/os/path.h"
@@ -435,6 +437,19 @@ std::string extract_next_cursor(const std::string& link) {
   return "";
 }
 
+namespace {
+// A repository of the Hub's /api/models list: what every listing reads of it (false: not a repository's name).
+bool found_of(const nlohmann::json& m, Found* f) {
+  if (!m.is_object()) return false;
+  f->id = str_field(m, "id");
+  if (!detail::valid_repo(f->id)) return false;
+  f->downloads = u64_field(m, "downloads"), f->likes = u64_field(m, "likes");
+  f->updated = str_field(m, "lastModified"), f->created = str_field(m, "createdAt");
+  f->pipeline = str_field(m, "pipeline_tag"), f->gated = gated_field(m);
+  return true;
+}
+}  // namespace
+
 bool search(const std::string& query, const std::string& sort, int limit, std::vector<Found>* out, std::string* err,
             const std::string& cursor, std::string* next_cursor, bool gguf_only) {
   out->clear();
@@ -461,13 +476,8 @@ bool search(const std::string& query, const std::string& sort, int limit, std::v
   const auto j = nlohmann::json::parse(body, nullptr, false);
   if (!j.is_array()) return *err = "the Hub's answer is not a list of repositories", false;
   for (const auto& m : j) {
-    if (!m.is_object()) continue;
     Found f;
-    f.id = str_field(m, "id");
-    if (!detail::valid_repo(f.id)) continue;
-    f.downloads = u64_field(m, "downloads"), f.likes = u64_field(m, "likes");
-    f.updated = str_field(m, "lastModified"), f.created = str_field(m, "createdAt");
-    f.pipeline = str_field(m, "pipeline_tag"), f.gated = gated_field(m);
+    if (!found_of(m, &f)) continue;
     if (const auto gg = m.find("gguf"); gg != m.end() && gg->is_object()) f.architecture = str_field(*gg, "architecture");
     if (f.architecture == "dflash") f.is_drafter = true;
     if (const auto cfg = m.find("config"); cfg != m.end() && cfg->is_object()) {
@@ -477,6 +487,100 @@ bool search(const std::string& query, const std::string& sort, int limit, std::v
       }
     }
     out->push_back(std::move(f));
+  }
+  if (next_cursor) *next_cursor = extract_next_cursor(link);
+  return true;
+}
+
+namespace {
+// A file of r at its commit: whether r names one (false with *err), its place in the cache and its Hub address.
+bool file_of(const Repo& r, const RepoFile& f, fs::path* local, os::HttpGet* g, std::string* err) {
+  if (!detail::valid_repo(r.id) || !detail::is_commit(r.commit) || !detail::safe_path(f.path))
+    return *err = "not a file of a Hub repository: " + r.id + "/" + f.path, false;
+  *local = to_path(snapshot_dir(r)) / to_path(f.path);
+  g->url = endpoint() + "/" + r.id + "/resolve/" + r.commit + "/" + detail::url_path(f.path);
+  g->headers = detail::auth_headers();
+  g->connect_timeout_s = 10, g->stall_timeout_s = 20;
+  return true;
+}
+}  // namespace
+
+bool read_text(const Repo& r, const RepoFile& f, uint64_t max, std::string* text, std::string* err) {
+  fs::path local;
+  os::HttpGet g;
+  if (!file_of(r, f, &local, &g, err)) return false;
+  if (f.size > max) return *err = f.path + ": " + std::to_string(f.size) + " bytes, more than " + std::to_string(max), false;
+  if (detail::has_size(local, f.size)) {
+    std::ifstream in(local, std::ios::binary);
+    text->assign(size_t(f.size), '\0');
+    if (!in.read(text->data(), std::streamsize(f.size))) return *err = f.path + ": cannot read it", false;
+    return true;
+  }
+  if (r.from_cache || offline()) return *err = f.path + " is not in the cache, and the Hub is not reached", false;
+  int status = 0;
+  std::string net;
+  if (!os::http_get_text(g, text, &status, &net, size_t(max))) return *err = "cannot reach the Hub (" + net + ")", false;
+  if (status != 200) return *err = f.path + ": the Hub answered " + std::to_string(status), false;
+  return true;
+}
+
+bool safetensors_header(const Repo& r, const RepoFile& f, std::string* header, std::string* err) {
+  fs::path local;
+  os::HttpGet file;
+  if (!file_of(r, f, &local, &file, err)) return false;
+  constexpr uint64_t kMax = modelfile::kSafetensorsHeaderMaxBytes;  // what a load of the file reads
+  if (detail::has_size(local, f.size)) {
+    std::ifstream in(local, std::ios::binary);
+    uint64_t n = 0;
+    if (!in.read(reinterpret_cast<char*>(&n), 8) || n > kMax || n + 8 > f.size)
+      return *err = f.path + ": not a safetensors file", false;
+    header->assign(size_t(n), '\0');
+    if (!in.read(header->data(), std::streamsize(n))) return *err = f.path + ": cannot read its header", false;
+    return true;
+  }
+  if (r.from_cache || offline()) return *err = f.path + " is not in the cache, and the Hub is not reached", false;
+  auto range = [&](uint64_t first, uint64_t last, std::string* out) {
+    os::HttpGet g = file;
+    g.ranged = true, g.first = first, g.last = last;
+    int status = 0;
+    std::string net;
+    if (!os::http_get_text(g, out, &status, &net, size_t(last - first + 1)))
+      return *err = "cannot reach the Hub (" + net + ")", false;
+    if (status != 206 || out->size() != last - first + 1)
+      return *err = f.path + ": the Hub answered " + std::to_string(status) + " to a range", false;
+    return true;
+  };
+  std::string len;
+  if (!range(0, 7, &len)) return false;
+  uint64_t n = 0;
+  std::memcpy(&n, len.data(), 8);
+  if (n == 0 || n > kMax || n + 8 > f.size) return *err = f.path + ": not a safetensors file", false;
+  return range(8, 8 + n - 1, header);
+}
+
+bool adapters_of(const std::string& base, int limit, std::vector<Found>* out, std::string* err,
+                 const std::string& cursor, std::string* next_cursor) {
+  out->clear();
+  if (next_cursor) next_cursor->clear();
+  if (!detail::valid_repo(base)) return *err = "not a Hub repository name: " + base, false;
+  if (offline()) return *err = "HF_HUB_OFFLINE is set: the Hub is not asked", false;
+  os::HttpGet g;
+  g.url = endpoint() + "/api/models?filter=" + detail::url_query("base_model:adapter:" + base) +
+          "&sort=downloads&direction=-1&limit=" + std::to_string(std::clamp(limit, 1, 100)) +
+          "&expand[]=downloads&expand[]=likes&expand[]=lastModified&expand[]=createdAt&expand[]=gated" +
+          (cursor.empty() ? "" : "&cursor=" + detail::url_query(cursor));
+  g.headers = detail::auth_headers();
+  g.connect_timeout_s = 10, g.stall_timeout_s = 20;
+  std::string body, link, net;
+  int status = 0;
+  if (!os::http_get_text(g, &body, &status, &net, 16u << 20, next_cursor ? &link : nullptr))
+    return *err = "cannot reach the Hub (" + net + ")", false;
+  if (status != 200) return *err = "the Hub answered " + std::to_string(status), false;
+  const auto j = nlohmann::json::parse(body, nullptr, false);
+  if (!j.is_array()) return *err = "the Hub's answer is not a list of repositories", false;
+  for (const auto& m : j) {
+    Found f;
+    if (found_of(m, &f)) out->push_back(std::move(f));
   }
   if (next_cursor) *next_cursor = extract_next_cursor(link);
   return true;

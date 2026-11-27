@@ -8,6 +8,7 @@
 #include <functional>
 #include <map>
 #include <memory>
+#include <set>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -79,6 +80,23 @@ struct AttnBlockSpec {
   bool mrope_interleaved = false;
 };
 
+// A LoRA adapter given beside the model (--lora; core/modelfile/peft_dir.cpp): one rank and scale on the linears its
+// description names ("attn.q", "mlp.down", "gdn.qkv": the target's, layer by layer), its tensors under the
+// companion's names (ModelFile::companion_name), "target.L<i>.<linear>.lora_a" [rank, in] and ".lora_b" [out, rank],
+// stored bf16, f16 or f32, their rows in Hugging Face's order.
+struct CompanionLora {
+  int companion = -1;  // -1: none
+  int rank = 0;
+  float scale = 1.f;
+  int layers = 0;  // the layers it adapts: the last one's index + 1
+  explicit operator bool() const { return companion >= 0; }
+};
+// The file's LoRA companion (none: companion -1).  Throws for more than one, an adapter on a linear not in `linears`
+// (the architecture's that take one) or past `layers`, or a rank or scale out of range.
+CompanionLora find_lora(const ModelFile& file, const std::set<std::string>& linears, int layers);
+// Whether companion i is a LoRA adapter, which the architectures' own companion readers pass by.
+bool is_lora_companion(const ModelFile& file, int i);
+
 // The tables of a description, built from a file's tensors by name.
 class Tables {
  public:
@@ -100,6 +118,8 @@ class Tables {
     const int bi = b_name.empty() ? -1 : weight(b_name, {n});
     return {kind, wi, bi, 0, offset, eps};
   }
+  // Linear `name`'s adapter from `l` ("target.L3.attn.q": [out, in]), rank 0 where it has none (CompanionLora).
+  flyx_lora lora(const CompanionLora& l, const std::string& name, int64_t out, int64_t in);
   int state(const flyx_state& s);
   int block(const flyx_block& b);
   flyx_block& at(int i) { return blocks[size_t(i)]; }

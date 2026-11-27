@@ -40,6 +40,7 @@ ojson want_json(const ModelHost::Want& w) {
           {"draft_head", w.draft_head.empty() ? ojson(nullptr) : ojson(w.draft_head)},
           {"draft_weights", w.draft_weights.empty() ? ojson(nullptr) : ojson(w.draft_weights)},
           {"mmproj", w.eo.mmproj_file.empty() ? ojson(nullptr) : ojson(w.eo.mmproj_file)},
+          {"lora", w.eo.lora_file.empty() ? ojson(nullptr) : ojson(w.eo.lora_file)},
           {"vision", w.eo.vision},
           {"vision_device", w.eo.vision_device.empty() ? ojson("disk") : ojson(w.eo.vision_device)},
           {"vision_quant", w.eo.vision_quant.empty() ? ojson("q8") : ojson(w.eo.vision_quant)},
@@ -172,6 +173,7 @@ void save_settings(const ModelHost::Want& w) {
   last["model"] = remember_path(w.model);
   for (size_t i = 0; i < w.drafters.size(); ++i) last["drafters"][i] = remember_path(w.drafters[i]);
   if (!w.eo.mmproj_file.empty()) last["mmproj"] = remember_path(w.eo.mmproj_file);
+  if (!w.eo.lora_file.empty()) last["lora"] = remember_path(w.eo.lora_file);
   std::lock_guard<std::mutex> lock(settings_mutex());
   ojson root = read_settings_locked();
   if (!root.is_object()) root = ojson::object();
@@ -191,6 +193,7 @@ bool want_from_json(const ojson& j, const EngineOptions& base, ModelHost::Want* 
   out.eo = base;
   out.eo.drafter_files.clear();
   out.eo.mmproj_file.clear();
+  out.eo.lora_file.clear();
   if (j.contains("drafters") && !j["drafters"].is_null()) {
     if (!j["drafters"].is_array()) return *err = "\"drafters\": a list of paths or Hub names", false;
     for (const auto& d : j["drafters"]) {
@@ -252,6 +255,11 @@ bool want_from_json(const ojson& j, const EngineOptions& base, ModelHost::Want* 
   if (j.contains("name") && !j["name"].is_null()) {
     if (!j["name"].is_string()) return *err = "\"name\": model id string", false;
     out.name = j["name"].get<std::string>();
+  }
+  // A LoRA adapter (--lora): a PEFT directory on the server's machine or a Hub name; absent or null: none.
+  if (j.contains("lora") && !j["lora"].is_null()) {
+    if (!j["lora"].is_string()) return *err = "\"lora\": a LoRA adapter's directory or Hugging Face name, or null", false;
+    out.eo.lora_file = j["lora"].get<std::string>();
   }
   bool mmproj_given = false;
   if (j.contains("mmproj")) {
@@ -453,6 +461,7 @@ bool ModelHost::with_files_in_use(const std::function<void(const std::vector<std
       in_use.push_back(fetched_.model);
       in_use.insert(in_use.end(), fetched_.drafters.begin(), fetched_.drafters.end());
       if (!fetched_.mmproj.empty()) in_use.push_back(fetched_.mmproj);
+      if (!fetched_.lora.empty()) in_use.push_back(fetched_.lora);
     }
   }
   BusyGuard guard(this);
@@ -465,6 +474,7 @@ std::shared_ptr<Scheduler> ModelHost::open(const std::string& model, const apps:
   EngineOptions eo = options;
   eo.drafter_files = f.drafters;
   eo.mmproj_file = f.mmproj;
+  eo.lora_file = f.lora;
   std::fprintf(stderr, "flyx-server: loading %s\n", f.model.c_str());
   const double t0 = os::now_ms();
   // Each request that runs to its end and drafts counts for the speed of the Hub drafters the model drafts with
@@ -548,7 +558,7 @@ bool ModelHost::work(const Want& w, std::string* err) {
     progress_ = p;
   });
   if (!apps::fetch_model(w.model, w.drafters, apps::wants_mtp(w.eo), logged, &stop_, &f, err, w.eo.mmproj_file,
-                         w.eo.vision, apps::wants_dspark(w.eo, w.drafters))) {
+                         w.eo.vision, apps::wants_dspark(w.eo, w.drafters), w.eo.lora_file)) {
     std::fprintf(stderr, "flyx-server: %s: %s\n", w.model.c_str(), err->c_str());
     std::lock_guard<std::mutex> lock(mu_);
     error_ = *err, state_ = served_.sched ? "ready" : "failed";

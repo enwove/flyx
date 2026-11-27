@@ -171,6 +171,7 @@ add_library(flyx_core STATIC
   core/modelfile/flyx_format.cpp
   core/modelfile/gguf_format.cpp
   core/modelfile/drafter_dir.cpp
+  core/modelfile/peft_dir.cpp
   core/tokenizer/tokenizer.cpp
   core/grammar/grammar.cpp
   core/render/chat.cpp

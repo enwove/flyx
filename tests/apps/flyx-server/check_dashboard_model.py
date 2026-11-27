@@ -162,6 +162,17 @@ def telemetry(want, remembered=None):
             "device": {"name": "GPU", "mem_total": 32 * 2**30, "mem_used": 2**30}, "memory": {"sessions": []}}
 
 
+# The Hub's adapters for a base (GET /v1/hub/loras) and one repository's (GET /v1/hub/lora): one it runs, one it does not.
+HUB_LORAS = [{"id": "acme/Tiny-27B-coder-lora", "downloads": 12000, "likes": 30, "updated": None, "gated": False, "cached": False},
+             {"id": "acme/Tiny-27B-chat-lora", "downloads": 900, "likes": 2, "updated": None, "gated": True, "cached": True}]
+HUB_LORA = {"repo": "acme/Tiny-27B-coder-lora", "revision": "main", "adapters": [
+    {"folder": "", "name": "acme/Tiny-27B-coder-lora", "rank": 16, "scale": 2.0, "base": "acme/Tiny-27B", "targets": None,
+     "linears": ["attn.q", "mlp.down"], "layers": 64, "size": int(0.23 * GB), "why": None},
+    {"folder": "fp8", "name": "acme/Tiny-27B-coder-lora:fp8", "rank": 16, "scale": 2.0, "base": "acme/Tiny-27B",
+     "targets": None, "linears": [], "layers": 0, "size": int(0.12 * GB),
+     "why": "L0.q.lora_A.weight: dtype F8_E4M3 (F32, BF16 or F16)"}]}
+
+
 class Server:
     """The stubbed server of one page: what it was asked to load, to delete and to show a folder dialog for."""
 
@@ -173,6 +184,7 @@ class Server:
         self.hub_source = "default"
         self.hub_fail = False
         self.hub_configs = []
+        self.lora_asked = []
         page.route("**/dashboard/**", lambda r: serve(r, ROOT / "apps/flyx-server/dashboard"))
         page.route("**/v1/**", self.answer)
 
@@ -218,6 +230,17 @@ class Server:
             return route.fulfill(json=self.tm)
         if "/v1/hub/cached" in url:
             return route.fulfill(json=CATALOG)
+        if "/v1/hub/loras" in url:
+            self.lora_asked.append({k: v[0] for k, v in query.items()})
+            base = query.get("base", [""])[0]
+            if not base and query.get("model", [""])[0].startswith(FOLDER):  # a file of a folder: its base not known
+                return route.fulfill(json={"base": None, "from": None, "models": [], "next_cursor": None,
+                                           "endpoint": self.hub_endpoint})
+            return route.fulfill(json={"base": base or "acme/Tiny-27B", "from": "asked" if base else "model card",
+                                       "models": [] if base == "acme/Other" else HUB_LORAS, "next_cursor": None,
+                                       "endpoint": self.hub_endpoint})
+        if "/v1/hub/lora" in url:
+            return route.fulfill(json=HUB_LORA)
         if "/v1/hub/config" in url:
             if method == "POST":
                 body = route.request.post_data_json or {}
@@ -1123,6 +1146,109 @@ def check_vram_apps(open_page, want):
     page.close()
 
 
+def check_lora(open_page, want):
+    """A LoRA adapter: listed with its folder's models (kind LoRA, never loaded alone), used with the model served (the
+    setting filled in), what a reload posts and the command line says, and shown with the model once loaded."""
+    adapter = dir_model(FOLDER, "my-lora", int(0.23 * GB), kind="lora")
+    CATALOG["models"].append(adapter)
+    FOLDERS[FOLDER]["models"].append(adapter)
+    try:
+        page, server = open_page(telemetry(want))
+        view(page, "library")
+        page.locator('#src-seg [data-src="local"]').click()
+        row = page.locator('#lc-list .prow.model[data-model$="my-lora"]')
+        expect(row.locator(".pt")).to_have_text("LoRA")
+        expect(row.locator(".pn svg use")).to_have_attribute("href", "#i-plus")
+        row.click()
+        expect(page.locator("#lc-detail")).to_contain_text("my-lora is a LoRA adapter (0.2 GB), not a model")
+        expect(page.locator("#lc-detail .banner button")).to_have_count(0)
+        expect(page.locator("#mf-load")).to_have_text("Use with the model")
+        page.locator("#mf-load").click()
+        expect(page.locator("#mv-current")).to_be_visible()
+        expect(page.locator("#lset-lora")).to_be_visible()  # its own tab, beside the vision encoder's
+        lora_tab = page.locator('#lset-tabs [data-stab="lora"]')
+        expect(lora_tab.locator(".sum")).to_have_text("my-lora")
+        expect(lora_tab.locator(".chg")).to_have_text("+1")
+        expect(lora_tab.locator(".dot")).not_to_have_class(re.compile(r"\bon\b"))
+        expect(page.locator("#mf-lora")).to_have_value(adapter["path"])
+        expect(page.locator('[data-k="lora"] .was')).to_contain_text("none")
+        # The library's adapters are listed to pick from, and None.
+        rows = page.locator("#lora-list .sdrow")
+        expect(rows).to_have_count(2)
+        expect(page.locator('#lora-list .sdrow.sel')).to_have_attribute("data-lora", adapter["path"])
+        rows.nth(0).click()
+        expect(page.locator("#mf-lora")).to_have_value("")
+        expect(lora_tab.locator(".sum")).to_have_text("none")
+        rows.nth(1).click()
+        expect(page.locator("#mf-lora")).to_have_value(adapter["path"])
+        args = command(page)
+        assert args[args.index("--lora") + 1] == adapter["path"], args
+        confirm(page, "#mf-reload", "Reload")
+        assert server.posted[-1]["lora"] == adapter["path"] and server.posted[-1]["model"] == want["model"], server.posted[-1]
+        # The Hub's adapters for the model's base (its model card's), a repository opened: the one it runs taken, the
+        # one it does not with its reason and nothing to take it with.
+        page.locator('#lset-tabs [data-stab="lora"]').click()
+        expect(page.locator("#lora-base")).to_have_value("acme/Tiny-27B")
+        assert server.lora_asked[-1].get("model") == want["model"], server.lora_asked
+        repos = page.locator("#lora-hub .lora-repo")
+        expect(repos).to_have_count(2)
+        expect(repos.nth(1)).to_contain_text("gated")
+        repos.nth(0).locator(".lora-repo-h").click()
+        ads = page.locator(".lora-repo.open .lora-ad")
+        expect(ads).to_have_count(2)
+        expect(ads.nth(1)).to_have_class(re.compile(r"\bno\b"))
+        expect(ads.nth(1)).to_contain_text("Cannot load: L0.q.lora_A.weight: dtype F8_E4M3")
+        expect(ads.nth(1).locator("button")).to_have_count(0)
+        expect(ads.nth(0)).to_contain_text("64 layers")
+        ads.nth(0).get_by_role("button", name="Use").click()
+        expect(page.locator("#mf-lora")).to_have_value("acme/Tiny-27B-coder-lora")
+        expect(ads.nth(0).get_by_role("button")).to_have_text("Chosen")
+        args = command(page)
+        assert args[args.index("--lora") + 1] == "acme/Tiny-27B-coder-lora", args
+        confirm(page, "#mf-reload", "Reload")
+        assert server.posted[-1]["lora"] == "acme/Tiny-27B-coder-lora", server.posted[-1]
+        # Another base asked for: the Hub's answer for it (none here).
+        page.locator('#lset-tabs [data-stab="lora"]').click()
+        page.locator("#lora-base").fill("acme/Other")
+        page.locator("#lora-find").click()
+        expect(page.locator("#lora-hub-msg")).to_have_text("Hugging Face lists no LoRA adapter for this model.")
+        assert server.lora_asked[-1].get("base") == "acme/Other", server.lora_asked
+        # Another model picked, a file whose base is not known: the base typed for the first is not kept, and the field
+        # does not show it.
+        view(page, "library")
+        page.locator('#lc-list .prow.model[data-model$="Other-12B-Q5_K_M.gguf"]').click()
+        view(page, "current")
+        page.locator('#lset-tabs [data-stab="lora"]').click()
+        expect(page.locator("#lora-hub-msg")).to_contain_text("The model's base is not known")
+        expect(page.locator("#lora-base")).to_have_value("")
+        assert "base" not in server.lora_asked[-1] and server.lora_asked[-1]["model"].endswith("Other-12B-Q5_K_M.gguf"), \
+            server.lora_asked
+        page.close()
+        # Loaded with it: the model's facts name it, and a reload keeps it; emptied, a reload goes without.
+        page, server = open_page(telemetry(dict(want, lora=adapter["path"])))
+        expect(page.locator("#ld-facts")).to_contain_text("my-lora")
+        page.locator('#lset-tabs [data-stab="lora"]').click()
+        expect(page.locator('#lset-tabs [data-stab="lora"] .dot')).to_have_class(re.compile(r"\bon\b"))
+        expect(page.locator("#ld-lora-src")).to_contain_text(adapter["path"])
+        expect(page.locator("#mf-lora")).to_have_value(adapter["path"])
+        assert "--lora" in command(page)
+        page.locator("#mf-lora").fill("")
+        expect(page.locator('[data-k="lora"] .was')).to_contain_text("my-lora")
+        confirm(page, "#mf-reload", "Reload")
+        assert server.posted[-1]["lora"] is None, server.posted[-1]
+        # Another model of the library does not take the served model's adapter along.
+        page.locator("#mf-reset").click()
+        view(page, "library")
+        page.locator('#src-seg [data-src="local"]').click()
+        page.locator('#lc-list .prow.model[data-model$="Other-12B-Q5_K_M.gguf"]').click()
+        confirm(page, "#mf-load", "Switch")
+        assert server.posted[-1]["lora"] is None, server.posted[-1]
+        page.close()
+    finally:
+        CATALOG["models"].remove(adapter)
+        FOLDERS[FOLDER]["models"].remove(adapter)
+
+
 def check(browser):
     want = {"model": "./models/Local [27B] & O'Brien.gguf", "ctx": 8192, "kv": "fp8", "kv_gpu": 0, "kv_ram": 4}
     errors = []
@@ -1145,6 +1271,7 @@ def check(browser):
     check_degraded_and_draft_weights(open_page, want)
     check_vram_apps(open_page, want)
     check_switch_companions(open_page, want)
+    check_lora(open_page, want)
     plain = dict(want, model="models/local.gguf")
     page, server = open_page(telemetry(plain))
     check_hub(page, server, plain)
@@ -1169,4 +1296,5 @@ if __name__ == "__main__":
             check(browser)
         finally:
             browser.close()
-    print("The Model page kept its load settings and shell arguments, and loaded from Hugging Face and from this machine's folders.")
+    print("The Model page kept its load settings and shell arguments, loaded from Hugging Face and from this machine's folders, "
+          "and took a LoRA adapter.")

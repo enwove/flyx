@@ -45,6 +45,7 @@ struct Fetched {
   std::string mmproj;                 // path to multimodal vision projector GGUF (empty: none)
   std::string mmproj_source;          // display label: repo/path (Hub) or local path
   std::optional<uint64_t> mmproj_size;  // bytes on disk
+  std::string lora;                   // the LoRA adapter's directory (fetch_lora; empty: none)
   std::string name;                   // the model's name for the API: its file's, without the extension
   std::vector<std::string> notes;     // for the log: a drafter published for this model, the MTP file taken
   std::vector<DrafterSource> drafter_sources;  // what the model drafts with: its own MTP layer, the files above
@@ -56,9 +57,23 @@ struct Fetched {
 // want_dspark: with no DSpark drafter among `drafters`, take the one published beside the model: its repository's
 // preferred complete DSpark GGUF, or for a model file on disk dspark_beside's; either only where its
 // header says it is a DSpark drafter.
+// lora: an adapter (fetch_lora; empty: none).
 bool fetch_model(const std::string& model, const std::vector<std::string>& drafters, bool want_mtp,
                  const hub::ProgressFn& progress, const std::atomic<bool>* stop, Fetched* out, std::string* err,
-                 const std::string& mmproj = "", bool want_vision = true, bool want_dspark = false);
+                 const std::string& mmproj = "", bool want_vision = true, bool want_dspark = false,
+                 const std::string& lora = "");
+
+// A LoRA adapter as Hugging Face PEFT saves it: a directory as it is, else a Hub repository's adapter_config.json
+// and adapter_model.safetensors fetched into the cache, "org/name" at its top, "org/name:FOLDER" in a folder of it
+// (a repository of several: the folder's path or its last part), "@REV" for a revision.  `path`: the directory.
+bool fetch_lora(const std::string& spec, const hub::ProgressFn& progress, const std::atomic<bool>* stop,
+                std::string* path, std::string* err);
+// fetch_lora's part after the repository is described: the adapter `folder` names in `repo` (spec's FOLDER; spec
+// for messages), its config refused past what a load reads (modelfile::kPeftConfigMaxBytes) before either file is
+// fetched.
+bool fetch_lora_in(const hub::Repo& repo, const std::string& spec, const std::string& folder,
+                   const hub::ProgressFn& progress, const std::atomic<bool>* stop, std::string* path,
+                   std::string* err);
 
 // The drafter a file or directory holds, as its own fields say ("mtp", "dflash2", "dspark"; "" when they say none): a
 // GGUF's header (general.architecture "dflash", or MTP layers), a drafter directory's config.json, a .flyx file's
@@ -95,7 +110,8 @@ std::vector<KnownDrafter> known_drafters_in(const std::string& list, const std::
 // Throttled Hub fetch progress logger writing to stderr, optionally forwarding every tick to `hook`.
 hub::ProgressFn make_progress_logger(const char* prefix, double interval_ms, hub::ProgressFn hook = {});
 
-// The command line's way: the model and --drafter-file arguments made paths in place, progress on standard error.
+// The command line's way: the model, --drafter-file and --lora arguments made paths in place, progress on standard
+// error.
 bool fetch_named(std::string* model, EngineOptions* eo, std::string* err);
 
 // A model's name for the API from its path: the file's name without .gguf / .flyx.
@@ -139,11 +155,12 @@ flyx::GgufPeek gguf_header(const std::string& path);
 
 // Model, drafter, and vision projector files in directories of the user's own (flyx serve --models-dir,
 // FLYX_MODELS_DIR): *.gguf (classified via classify_gguf; complete split GGUFs grouped as one entry pointing to
-// shard 1 with their summed size) and *.flyx, at most 6 directories down, hidden directories and node_modules left out.
+// shard 1 with their summed size), *.flyx, and LoRA adapters' folders (adapter_config.json beside
+// adapter_model.safetensors), at most 6 directories down, hidden directories and node_modules left out.
 struct LocalModel {
   std::string path;          // absolute
   std::string file;          // its name
-  std::string kind;          // "gguf", "flyx", "drafter", or "mmproj"
+  std::string kind;          // "gguf", "flyx", "drafter", "mmproj", or "lora" (a PEFT adapter: path its folder)
   std::string drafter_kind;  // "dflash2", "dspark" or "mtp" when kind == "drafter", else ""
   std::string quant;         // from the name, "" when it names none
   uint64_t size = 0;

@@ -4,6 +4,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <stdexcept>
 #include "backends/cuda/kernels/common/device.cuh"
 #include "backends/cuda/kernels/common/launch.h"
 #include "backends/cuda/kernels/kernels.cuh"
@@ -255,10 +256,302 @@ __global__ void k_scale_rows(float* u, int ldu, int n, float scale) {
 
 void lora_down(const float* x, int ldx, const bf16* a, int n, int K, float scale, float* u, int ldu, int rows,
                const Launch& L) {
-  if (x) gemm(x, ldx, a, n, K, u, ldu, rows, false, L);
-  else gemm_presplit(a, n, K, u, ldu, rows, false, L);
+  gemm(x, ldx, a, n, K, u, ldu, rows, false, L);
   if (scale != 1.f)
     launch_dependent(k_scale_rows, dim3(rows, ceil_div(n, 256)), dim3(256), L, u, ldu, n, scale);
+}
+
+namespace {
+// grid ceil(outputs G / 128); block 128: G lanes an output column of one linear, lane l its b values 8 (l + G c), up
+// to kUpRows rows at once (b read once for them); each row's G partial sums (k's order) added in a fixed tree.
+constexpr int kUpRows = 8;
+template <int G>
+__global__ void __launch_bounds__(128) k_lora_up(const float* u, int ldu, int rank, float scale, LoraUp up, float* y,
+                                                 int ldy, int rows) {
+  pdl_trigger();
+  const int t = int(blockIdx.x) * blockDim.x + int(threadIdx.x), l = t % G;
+  int n = t / G, i = 0;
+  while (i < up.linears && n >= up.n[i]) n -= up.n[i++];
+  pdl_wait();
+  const bool live = i < up.linears;  // every lane of a group alike (the shuffles want the whole warp)
+  const int seg = live ? i : 0;
+  const uint4* b = reinterpret_cast<const uint4*>(up.b[seg] + size_t(live ? n : 0) * rank);
+  const int chunks = rank / (8 * G);
+  for (int r0 = 0; r0 < rows; r0 += kUpRows) {
+    const int nr = min(kUpRows, rows - r0);
+    float acc[kUpRows];
+#pragma unroll
+    for (int r = 0; r < kUpRows; ++r) acc[r] = 0.f;
+    if (live) {
+      for (int c = 0; c < chunks; ++c) {
+        const int k8 = l + G * c;
+        const uint4 w = b[k8];
+        const uint32_t p[4] = {w.x, w.y, w.z, w.w};
+        float bv[8];
+#pragma unroll
+        for (int e = 0; e < 4; ++e) bv[2 * e] = __uint_as_float(p[e] << 16), bv[2 * e + 1] = __uint_as_float(p[e] & 0xffff0000u);
+#pragma unroll
+        for (int r = 0; r < kUpRows; ++r) {
+          if (r >= nr) break;
+          const float4* ur = reinterpret_cast<const float4*>(u + size_t(r0 + r) * ldu + up.u_col[seg] + 8 * k8);
+          const float4 ua = ur[0], ub = ur[1];
+          const float uv[8] = {ua.x, ua.y, ua.z, ua.w, ub.x, ub.y, ub.z, ub.w};
+#pragma unroll
+          for (int e = 0; e < 8; ++e) acc[r] = __fmaf_rn(__fmul_rn(uv[e], scale), bv[e], acc[r]);
+        }
+      }
+    }
+#pragma unroll
+    for (int r = 0; r < kUpRows; ++r) {
+#pragma unroll
+      for (int o = G / 2; o > 0; o >>= 1) acc[r] += __shfl_xor_sync(0xffffffffu, acc[r], o);
+    }
+    if (live && l == 0) {
+#pragma unroll
+      for (int r = 0; r < kUpRows; ++r) {
+        if (r >= nr) break;
+        float* yr = y + size_t(r0 + r) * ldy + up.y_col[seg] + n;
+        *yr = *yr + acc[r];
+      }
+    }
+  }
+}
+}  // namespace
+
+namespace {
+// grid (n, ceil(rows / 64)); block 256: output j of 64 rows, up to 16 rows a pass over a's row (8 values a thread a step,
+// k = 8 (t + 256 s)), then each row's 256 sums added warp by warp in a fixed order.
+constexpr int kLoraDownRows = 16, kLoraDownBlockRows = 64;
+__global__ void __launch_bounds__(256) k_lora_down(const float* x, int ldx, const bf16* a, int K, float* u, int ldu,
+                                                   int rows) {
+  pdl_trigger();
+  __shared__ float part[8][kLoraDownRows];
+  const int j = blockIdx.x, warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
+  const uint4* ar = reinterpret_cast<const uint4*>(a + size_t(j) * K);
+  const int r_end = min(rows, int(blockIdx.y + 1) * kLoraDownBlockRows);
+  for (int r0 = int(blockIdx.y) * kLoraDownBlockRows; r0 < r_end; r0 += kLoraDownRows) {
+    const int nr = min(kLoraDownRows, r_end - r0);
+    float acc[kLoraDownRows];
+#pragma unroll
+    for (int r = 0; r < kLoraDownRows; ++r) acc[r] = 0.f;
+    for (int k8 = threadIdx.x; k8 < K / 8; k8 += 256) {
+      const uint4 w = ar[k8];
+      const uint32_t p[4] = {w.x, w.y, w.z, w.w};
+      float av[8];
+#pragma unroll
+      for (int e = 0; e < 4; ++e) av[2 * e] = __uint_as_float(p[e] << 16), av[2 * e + 1] = __uint_as_float(p[e] & 0xffff0000u);
+#pragma unroll
+      for (int r = 0; r < kLoraDownRows; ++r) {
+        if (r >= nr) break;
+        const float* xr = x + size_t(r0 + r) * ldx + 8 * k8;
+#pragma unroll
+        for (int e = 0; e < 8; ++e) acc[r] = __fmaf_rn(xr[e], av[e], acc[r]);
+      }
+    }
+#pragma unroll
+    for (int r = 0; r < kLoraDownRows; ++r) {
+      if (r >= nr) break;
+      const float v = warp_sum(acc[r]);
+      if (!lane) part[warp][r] = v;
+    }
+    __syncthreads();
+    if (threadIdx.x < nr) {
+      float t = 0.f;
+#pragma unroll
+      for (int w = 0; w < 8; ++w) t += part[w][threadIdx.x];
+      u[size_t(r0 + threadIdx.x) * ldu + j] = t;
+    }
+    __syncthreads();
+  }
+}
+}  // namespace
+
+void lora_down_round(const float* x, int ldx, const bf16* a, int n, int K, float* u, int ldu, int rows,
+                     cudaStream_t st) {
+  if (K % 8) throw std::logic_error("lora_down_round: K is no multiple of 8");
+  k_lora_down<<<dim3(n, ceil_div(rows, kLoraDownBlockRows)), 256, 0, st>>>(x, ldx, a, K, u, ldu, rows);
+}
+
+namespace {
+// Split over K (kLoraSliceK of it a slice, the slices K alone sets): grid (slices, ceil(rows / 16), ceil(n / 32));
+// block 256 (8 warps): x's 16 rows of the slice in shared memory, a warp an output at a time (32 of them a block), a
+// lane its 8 values of the slice (k = k0 + 8 lane + e, in order), each row's 32 lane sums added by warp_sum; the
+// slice's sum to part[slice][row][j].  Then k_lora_down_sum adds a row's slices in order: a row's bits whatever the
+// rows, the tiles or the outputs a block.
+constexpr int kLoraSliceK = 256, kLoraTileRows = 16, kLoraBlockOut = 32;
+// Split: a block a slice (grid.x), its sums to part.  Else a block every slice in order, each row's slice sums added
+// up as k_lora_down_sum adds them (0 + the first, + each next: the same bits), to u.
+template <bool Split>
+__global__ void __launch_bounds__(256) k_lora_down_split(const float* x, int ldx, const bf16* a, int n, int K,
+                                                         float* out, int ldu, int rows) {
+  pdl_trigger();
+  __shared__ __align__(16) float xs[kLoraTileRows][kLoraSliceK];
+  const int r0 = int(blockIdx.y) * kLoraTileRows, j0 = int(blockIdx.z) * kLoraBlockOut;
+  const int nr = min(kLoraTileRows, rows - r0), slices = (K + kLoraSliceK - 1) / kLoraSliceK;
+  const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
+  float tot[kLoraBlockOut / 8][kLoraTileRows];
+#pragma unroll
+  for (int q = 0; q < kLoraBlockOut / 8; ++q)
+#pragma unroll
+    for (int r = 0; r < kLoraTileRows; ++r) tot[q][r] = 0.f;
+  pdl_wait();
+  for (int sl = Split ? int(blockIdx.x) : 0; sl < (Split ? int(blockIdx.x) + 1 : slices); ++sl) {
+    const int k0 = sl * kLoraSliceK, kc = min(kLoraSliceK, K - k0);
+    if (!Split) __syncthreads();  // the last slice's reads of xs
+    for (int i = threadIdx.x; i < kLoraTileRows * kLoraSliceK; i += 256) {
+      const int r = i / kLoraSliceK, k = i % kLoraSliceK;
+      xs[r][k] = r < nr && k < kc ? x[size_t(r0 + r) * ldx + k0 + k] : 0.f;
+    }
+    __syncthreads();
+    const bool live = 8 * lane < kc;
+#pragma unroll
+    for (int q = 0; q < kLoraBlockOut / 8; ++q) {
+      const int j = j0 + warp + 8 * q;
+      if (j >= n) break;
+      float av[8] = {};
+      if (live) {
+        const uint4 w = *reinterpret_cast<const uint4*>(a + size_t(j) * K + k0 + 8 * lane);
+        const uint32_t p[4] = {w.x, w.y, w.z, w.w};
+#pragma unroll
+        for (int e = 0; e < 4; ++e)
+          av[2 * e] = __uint_as_float(p[e] << 16), av[2 * e + 1] = __uint_as_float(p[e] & 0xffff0000u);
+      }
+#pragma unroll
+      for (int r = 0; r < kLoraTileRows; ++r) {
+        if (r >= nr) break;
+        const float4 xa = *reinterpret_cast<const float4*>(&xs[r][8 * lane]);
+        const float4 xb = *reinterpret_cast<const float4*>(&xs[r][8 * lane + 4]);
+        const float xv[8] = {xa.x, xa.y, xa.z, xa.w, xb.x, xb.y, xb.z, xb.w};
+        float acc = 0.f;
+#pragma unroll
+        for (int e = 0; e < 8; ++e) acc = __fmaf_rn(xv[e], av[e], acc);
+        acc = warp_sum(acc);
+        if (Split) {
+          if (!lane) out[(size_t(sl) * rows + r0 + r) * n + j] = acc;
+        } else {
+          tot[q][r] += acc;
+        }
+      }
+    }
+  }
+  if (!Split && !lane) {
+#pragma unroll
+    for (int q = 0; q < kLoraBlockOut / 8; ++q) {
+      const int j = j0 + warp + 8 * q;
+      if (j >= n) break;
+#pragma unroll
+      for (int r = 0; r < kLoraTileRows; ++r)
+        if (r < nr) out[size_t(r0 + r) * ldu + j] = tot[q][r];
+    }
+  }
+}
+// grid ceil(rows n / 256): u[r][j] = the slices' sums in order.
+__global__ void k_lora_down_sum(const float* part, int slices, int n, float* u, int ldu, int rows) {
+  pdl_trigger();
+  const int i = int(blockIdx.x) * blockDim.x + threadIdx.x;
+  pdl_wait();
+  if (i >= rows * n) return;
+  const int r = i / n, j = i % n;
+  float t = 0.f;
+  for (int sl = 0; sl < slices; ++sl) t += part[(size_t(sl) * rows + r) * n + j];
+  u[size_t(r) * ldu + j] = t;
+}
+}  // namespace
+
+int lora_down_part_floats(int n, int K, int rows) { return ceil_div(K, kLoraSliceK) * n * rows; }
+
+void lora_down_rows(const float* x, int ldx, const bf16* a, int n, int K, float* u, int ldu, int rows, float* part,
+                    int part_rows, cudaStream_t st) {
+  if (K % 8) throw std::logic_error("lora_down_rows: K is no multiple of 8");
+  const int slices = ceil_div(K, kLoraSliceK), tiles = ceil_div(rows, kLoraTileRows), groups = ceil_div(n, kLoraBlockOut);
+  // Split over K while the tiles are too few to fill the GPU (the same bits either way).
+  if (part && rows <= part_rows && tiles * groups < 128) {
+    k_lora_down_split<true><<<dim3(slices, tiles, groups), 256, 0, st>>>(x, ldx, a, n, K, part, 0, rows);
+    k_lora_down_sum<<<ceil_div(rows * n, 256), 256, 0, st>>>(part, slices, n, u, ldu, rows);
+  } else {
+    k_lora_down_split<false><<<dim3(1, tiles, groups), 256, 0, st>>>(x, ldx, a, n, K, u, ldu, rows);
+  }
+}
+
+namespace {
+// A prefill pass's second product, one linear: grid (ceil(n / 64), ceil(rows / 64)); block 256 (16 x 16 threads, each 4
+// rows by 4 outputs), u (scaled, as lora_up rounds it) and b through shared memory 32 of k at a time; each output's sum
+// in k's order.
+constexpr int kUpTile = 64, kUpChunk = 32;
+__global__ void __launch_bounds__(256) k_lora_up_tile(const float* u, int ldu, int u_col, int rank, float scale,
+                                                      const bf16* b, int n, float* y, int ldy, int y_col, int rows) {
+  pdl_trigger();
+  __shared__ float us[kUpChunk][kUpTile + 1];
+  __shared__ float bs[kUpChunk][kUpTile + 1];
+  const int r0 = int(blockIdx.y) * kUpTile, n0 = int(blockIdx.x) * kUpTile;
+  const int tr = threadIdx.x / 16, tn = threadIdx.x % 16;
+  float acc[4][4] = {};
+  pdl_wait();
+  for (int k0 = 0; k0 < rank; k0 += kUpChunk) {
+    const int kc = min(kUpChunk, rank - k0);
+    for (int i = threadIdx.x; i < kUpTile * kUpChunk; i += 256) {
+      const int rr = i / kUpChunk, kk = i % kUpChunk;
+      us[kk][rr] = r0 + rr < rows && kk < kc ? __fmul_rn(u[size_t(r0 + rr) * ldu + u_col + k0 + kk], scale) : 0.f;
+      bs[kk][rr] = n0 + rr < n && kk < kc ? __bfloat162float(b[size_t(n0 + rr) * rank + k0 + kk]) : 0.f;
+    }
+    __syncthreads();
+    for (int kk = 0; kk < kc; ++kk) {
+      float a[4], w[4];
+#pragma unroll
+      for (int i = 0; i < 4; ++i) a[i] = us[kk][tr * 4 + i], w[i] = bs[kk][tn + 16 * i];
+#pragma unroll
+      for (int i = 0; i < 4; ++i)
+#pragma unroll
+        for (int j = 0; j < 4; ++j) acc[i][j] = __fmaf_rn(a[i], w[j], acc[i][j]);
+    }
+    __syncthreads();
+  }
+#pragma unroll
+  for (int i = 0; i < 4; ++i) {
+    const int r = r0 + tr * 4 + i;
+    if (r >= rows) break;
+#pragma unroll
+    for (int j = 0; j < 4; ++j) {
+      const int c = n0 + tn + 16 * j;
+      if (c < n) {
+        float* yr = y + size_t(r) * ldy + y_col + c;
+        *yr = *yr + acc[i][j];
+      }
+    }
+  }
+}
+}  // namespace
+
+void lora_up_rows(const float* u, int ldu, int rank, float scale, const LoraUp& up, float* y, int ldy, int rows,
+                  const Launch& L) {
+  if (rank % 8 || up.linears < 1 || up.linears > 5)
+    throw std::logic_error("lora_up_rows: a rank that is no multiple of 8, or 1 to 5 linears");
+  for (int i = 0; i < up.linears; ++i)
+    launch_dependent(k_lora_up_tile, dim3(ceil_div(up.n[i], kUpTile), ceil_div(rows, kUpTile)), dim3(256), L, u, ldu,
+                     up.u_col[i], rank, scale, up.b[i], up.n[i], y, ldy, up.y_col[i], rows);
+}
+
+void lora_up(const float* u, int ldu, int rank, float scale, const LoraUp& up, float* y, int ldy, int rows,
+             const Launch& L) {
+  if (rank % 8 || up.linears < 1 || up.linears > 5 || ldu % 4 || reinterpret_cast<uintptr_t>(u) % 16)
+    throw std::logic_error("lora_up: a rank that is no multiple of 8, 1 to 5 linears, or u rows not on 16 bytes");
+  int total = 0;
+  for (int i = 0; i < up.linears; ++i) total += up.n[i];
+  // G lanes an output, each 16 bytes of its b row a step, two steps at least; G the rank's alone, so a row's bits are
+  // too.  Measured (flyx bench --prompts, -n 256, Qwen3.8-27B UD-Q4_K_M, RTX 5090 at 450 W, option lora_lanes; plain
+  // decoding tok/s, MTP rounds/s): rank 16 one lane 85.7 / 57.5, two 84.4 / 55.9; rank 64 on every linear four 80.1 /
+  // 50.5, one 79.0 / 48.0, two 80.2 / 49.7, eight 78.3 / 49.1.
+  auto go = [&](auto g) {
+    constexpr int G = decltype(g)::value;
+    launch_dependent(k_lora_up<G>, dim3(ceil_div(total * G, 128)), dim3(128), L, u, ldu, rank, scale, up, y, ldy,
+                     rows);
+  };
+  switch (lora_lanes(rank, opts(L).lora_lanes)) {
+    case 8: go(std::integral_constant<int, 8>{}); break;
+    case 4: go(std::integral_constant<int, 4>{}); break;
+    case 2: go(std::integral_constant<int, 2>{}); break;
+    default: go(std::integral_constant<int, 1>{});
+  }
 }
 
 void gemm_fp4_presplit(const uint8_t* Q, const uint8_t* S, const float* RS, int N, int K, float* y, int ldy, int rows,

@@ -9,6 +9,7 @@
 //       [--ctx N]               context length (default: auto)
 //       [--prefill-chunk N]     prefill chunk size (default: auto)
 //       [--mmproj FILE]         multimodal vision projector GGUF
+//       [--lora DIR]            a LoRA adapter as Hugging Face PEFT saves it (EngineOptions::lora_file)
 //       [--image FILE ...]      pair each --text (assistant reply) 1:1 with an image prompt
 //       [--prompt TEXT]         user prompt sent with each --image (default: "Describe this image in detail.")
 //       [--no-think]            disable thinking in multimodal chat template
@@ -88,7 +89,7 @@ int main(int argc, char** argv) {
   const std::string model = argv[1];
   std::vector<std::string> texts, images;
   std::string save, ref, activations, backend_options, kv, kv_method;
-  std::string mmproj, vision_device, vision_quant, prompt_text = "Describe this image in detail.";
+  std::string mmproj, lora, vision_device, vision_quant, prompt_text = "Describe this image in detail.";
   double kv_ram = -1;
   int tokens = 1024, start = 32, ctx = 0, prefill_chunk = 0;
   bool enable_thinking = true;
@@ -107,6 +108,7 @@ int main(int argc, char** argv) {
     else if (k == "--image") images.push_back(v);
     else if (k == "--prompt") prompt_text = v;
     else if (k == "--mmproj") mmproj = v;
+    else if (k == "--lora") lora = v;
     else if (k == "--vision-device") vision_device = v;
     else if (k == "--vision-quant") vision_quant = v;
     else if (k == "--tokens") tokens = std::atoi(v.c_str());
@@ -144,6 +146,7 @@ int main(int argc, char** argv) {
   if (!kv_method.empty()) o.kv_method = kv_method;
   if (kv_ram >= 0) o.kv_ram = int64_t(kv_ram * 1e9);
   if (!mmproj.empty()) o.mmproj_file = mmproj;
+  o.lora_file = lora;
   if (!vision_device.empty()) o.vision_device = vision_device;
   if (!vision_quant.empty()) o.vision_quant = vision_quant;
   if (images.empty() && mmproj.empty()) o.vision = false;

@@ -74,6 +74,26 @@ void test_gdn(const GdnDims d, const int rows, const double tol) {
         std::printf("  %-4s %-48s\n", same8 ? "ok" : "FAIL", "one kernel in 8 bits: blocks_stage's rows");
         g_fail += !same8;
       }
+      // Into the split (y null), `also` takes the output in float32 beside it, the rows a GDN block's out adapter
+      // reads: the bits of y, whether the split holds bf16 parts or 8 bits; for a batch's slice (row_offset) at the
+      // slice's rows, those before it untouched.
+      const int off = 3, total = rows + off;
+      float* dalso = dev<float>(size_t(total) * vd);
+      for (const bool q8 : {false, true}) {
+        if (q8 && d.dv % 32 != 0) continue;
+        for (const int at : {0, off}) {
+          CK(cudaMemset(dalso, 0xff, size_t(total) * vd * 4));  // NaN: what is not written stays so
+          gdn_round(dproj, ld, dcw, dW, w_stride, dS, s_stride, -1, dal, ddt, dgw, 1e-6f, bf, P, rows, nullptr, TL, q8,
+                    rows + at, at, dalso + size_t(at) * vd);
+          const std::string how = std::string(q8 ? "8 bits" : "bf16 parts") + (at ? ", a slice" : "");
+          expect("one kernel, also beside the split (" + how + "): the output's bits",
+                 down(dalso + size_t(at) * vd, y.size()), y4, 0);
+          const Vec before = down(dalso, size_t(at) * vd);
+          const bool untouched = std::all_of(before.begin(), before.end(), [](double v) { return std::isnan(v); });
+          std::printf("  %-4s %-48s\n", untouched ? "ok" : "FAIL", ("also (" + how + "): no row outside it").c_str());
+          g_fail += !untouched;
+        }
+      }
       float *dSa = up(S4), *dWa = up(W4), *dSb = up(S4), *dWb = up(W4);
       float *dya = dev<float>(vd), *dyb = dev<float>(vd);
       gdn_round(dproj, ld, dcw, dWa, w_stride, dSa, s_stride, kSlotNext, dal, ddt, dgw, 1e-6f, bf, P, 1, dya, TL);

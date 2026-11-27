@@ -96,6 +96,8 @@ bool engine_flag(const std::string& a, const std::function<std::string()>& value
     eo->drafter = v;
   } else if (a == "--drafter-file") {
     eo->drafter_files.push_back(value());
+  } else if (a == "--lora") {
+    eo->lora_file = value();
   } else if (a == "--mmproj") {
     eo->mmproj_file = value();
   } else if (a == "--no-vision") {
@@ -172,6 +174,9 @@ std::string engine_flags_help(int ctx) {
          "                       without it (unsloth's MTP/mtp-*.gguf), or a block drafter: DFlash2 (its .flyx\n"
          "                       file from python/convert --draft alone, its authors' directory, or its GGUF file)\n"
          "                       or DeepSpec's DSpark (its directory or .flyx file), for a model of either format\n"
+         "  --lora DIR|HF        a LoRA adapter as Hugging Face PEFT saves it (adapter_config.json and\n"
+         "                       adapter_model.safetensors): its folder, or org/name[:FOLDER] on the Hub; run\n"
+         "                       unmerged beside the model's linears\n"
          "  --mmproj F           multimodal vision projector GGUF (mmproj-*.gguf) beside the model file\n"
          "  --no-vision          do not load a vision encoder even if a projector is available\n"
          "  --vision-offload     offload vision weights to an auto-deleted temp file on disk (0 VRAM, 0 locked RAM)\n"

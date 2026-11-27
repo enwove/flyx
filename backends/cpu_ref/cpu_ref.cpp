@@ -14,6 +14,7 @@
 #include <cstdio>
 #include <cstring>
 #include <deque>
+#include <functional>
 #include <memory>
 #include <mutex>
 #include <stdexcept>
@@ -307,8 +308,16 @@ void gdn_mixer(RefSeq* s, const flyx_gdn_block& B, bool verify) {
     lin(M, B.z, h.data(), 1, H, nv * dv, z.data(), s->rows);
     lin(M, B.b, h.data(), 1, H, nv, b.data(), s->rows);
     lin(M, B.a, h.data(), 1, H, nv, a.data(), s->rows);
-    // NVFP4 inputs in a pass: the engine holds the in-projection's rows in bf16 (as vLLM and SGLang do)
-    if (s->rows > FLYX_MAX_ROWS && M->a4.count(M->w(B.qkv)))
+    // ABI 50: the block's own adapters, in the weights' head order (open reorders them)
+    lora(M, B.lora[FLYX_GDN_LIN_QKV], h.data(), 1, H, cdim, mixed.data());
+    lora(M, B.lora[FLYX_GDN_LIN_Z], h.data(), 1, H, nv * dv, z.data());
+    lora(M, B.lora[FLYX_GDN_LIN_B], h.data(), 1, H, nv, b.data());
+    lora(M, B.lora[FLYX_GDN_LIN_A], h.data(), 1, H, nv, a.data());
+    bool adapted = false;
+    for (const flyx_lora& l : B.lora) adapted = adapted || l.rank > 0;
+    // NVFP4 inputs in a pass: the engine holds the in-projection's rows in bf16 (as vLLM and SGLang do); beside
+    // adapters, whose products it adds in float32, in float32
+    if (s->rows > FLYX_MAX_ROWS && M->a4.count(M->w(B.qkv)) && !adapted)
       for (Vec* v : {&mixed, &z, &b, &a})
         for (double& e : *v) e = flyx::ops::round_bf16(e);
     conv_row(win.data(), mixed.data(), cw.data(), cdim, ck, conv.data());
@@ -339,6 +348,7 @@ void gdn_mixer(RefSeq* s, const flyx_gdn_block& B, bool verify) {
     }
     if (verify) std::copy(mixed.begin(), mixed.end(), &sl.mixed[L][size_t(r) * cdim]);
     lin(M, B.out, o.data(), 1, nv * dv, H, y.data(), s->rows);
+    lora(M, B.lora[FLYX_GDN_LIN_OUT], o.data(), 1, nv * dv, H, y.data());
     for (int c = 0; c < H; ++c) xr[c] = residual_add(M, s->rows, xr[c], y[c]);
   }
   if (!verify) {
@@ -362,7 +372,7 @@ void attn_mixer(RefSeq* s, const flyx_attn_block& B) {
   lin(M, B.q, h.data(), R, H, qw, qg.data(), R);
   lin(M, B.k, h.data(), R, H, nkv * hd, k.data(), R);
   lin(M, B.v, h.data(), R, H, nkv * hd, v.data(), R);
-  lora(M, B.lora[FLYX_LIN_Q], h.data(), R, H, qw, qg.data());  // never with an output gate (open)
+  lora(M, B.lora[FLYX_LIN_Q], h.data(), R, H, qw, qg.data());  // q's and the gate's rows, the weight's layout (open)
   lora(M, B.lora[FLYX_LIN_K], h.data(), R, H, nkv * hd, k.data());
   lora(M, B.lora[FLYX_LIN_V], h.data(), R, H, nkv * hd, v.data());
   Vec& KC = s->K[size_t(B.kv)][0];
@@ -1486,21 +1496,82 @@ int open_model(const flyx_model_desc* desc, const flyx_open_options* opts, flyx_
         m->dspark_tap_off = m->total_taps;
         m->total_taps += b.dspark.n_taps;
       }
-      if (k == FLYX_BLOCK_ATTN || k == FLYX_BLOCK_MLP) {  // a target's own adapters (ABI 43)
-        const flyx_lora* l = k == FLYX_BLOCK_ATTN ? b.attn.lora : b.mlp.lora;
-        const int n = k == FLYX_BLOCK_ATTN ? 4 : 3;
-        for (int j = 0; j < n; ++j)
-          if (l[j].rank != l[0].rank || l[j].rank < 0)
-            throw std::runtime_error("block " + std::to_string(i) + ": adapters on some of its linears, or of ranks "
-                                     "apart (all or none, one rank)");
-        if (l[0].rank && k == FLYX_BLOCK_ATTN && b.attn.gate != FLYX_GATE_NONE)
-          throw std::runtime_error("block " + std::to_string(i) + ": adapters on attention with an output gate");
+      if (k == FLYX_BLOCK_ATTN || k == FLYX_BLOCK_MLP || k == FLYX_BLOCK_GDN) {  // a target's own adapters (ABI 43, 50)
+        const flyx_lora* l = k == FLYX_BLOCK_ATTN ? b.attn.lora : k == FLYX_BLOCK_MLP ? b.mlp.lora : b.gdn.lora;
+        const int n = k == FLYX_BLOCK_ATTN ? 4 : k == FLYX_BLOCK_MLP ? 3 : 5;
+        const std::string blk = "block " + std::to_string(i);
+        auto data = [&](int w) { return static_cast<double*>(const_cast<void*>(m->W[size_t(w)]->data)); };
+        auto numel = [&](int w) { return m->W[size_t(w)]->nbytes / sizeof(double); };
+        // An adapter's rows (or columns) in another layout than its weight's: reordered to the weight's, as the CUDA
+        // backend uploads them (loader/bind.cpp); src(i) the adapter's row (column) that is the weight's i-th.
+        auto rows = [&](int w, const std::function<size_t(size_t)>& src) {
+          const size_t R = size_t(m->W[size_t(w)]->shape[0]), K = size_t(m->W[size_t(w)]->shape[1]);
+          std::vector<double> old(data(w), data(w) + R * K);
+          for (size_t r = 0; r < R; ++r) std::copy_n(&old[src(r) * K], K, data(w) + r * K);
+        };
+        auto cols = [&](int w, const std::function<size_t(size_t)>& src) {
+          const size_t R = size_t(m->W[size_t(w)]->shape[0]), K = size_t(m->W[size_t(w)]->shape[1]);
+          std::vector<double> old(data(w), data(w) + R * K);
+          for (size_t r = 0; r < R; ++r)
+            for (size_t c = 0; c < K; ++c) data(w)[r * K + c] = old[r * K + src(c)];
+        };
+        int rank = 0;
+        float scale = 0.f;
+        for (int j = 0; j < n; ++j) {
+          if (l[j].rank < 0) throw std::runtime_error(blk + ": an adapter of a negative rank");
+          if (!l[j].rank) continue;  // none on this linear
+          if (!rank) rank = l[j].rank, scale = l[j].scale;
+          if (l[j].rank != rank || l[j].scale != scale)
+            throw std::runtime_error(blk + ": adapters of ranks or scales apart (one rank and scale on the linears "
+                                     "that have one)");
+          // The CUDA backend uploads an f16 or f32 adapter as bf16 (loader/bind.cpp block_lora): the same rounding.
+          for (int w : {l[j].a, l[j].b})
+            if (desc->weights[w].t->dtype != FLYX_DT_BF16)
+              for (size_t e = 0; e < numel(w); ++e) data(w)[e] = flyx::ops::round_bf16(data(w)[e]);
+        }
+        if (k == FLYX_BLOCK_ATTN && b.attn.gate != FLYX_GATE_NONE && l[FLYX_LIN_Q].rank) {
+          const flyx_attn_block& A = b.attn;
+          if (A.lora_gate != FLYX_GATE_AFTER_Q && A.lora_gate != FLYX_GATE_PER_HEAD)
+            throw std::runtime_error(blk + ": an adapter on a gated attention's q whose gate rows' layout it does "
+                                     "not say");
+          if (A.lora_gate != A.gate) {  // the weight's row r: head hh's q or gate row e -> the adapter's
+            const size_t hd = size_t(A.head_dim), q = size_t(A.n_heads) * hd;
+            const bool per_head = A.gate == FLYX_GATE_PER_HEAD;
+            rows(l[FLYX_LIN_Q].b, [=](size_t r) {
+              const size_t hh = per_head ? r / (2 * hd) : r % q / hd, gate = per_head ? r / hd % 2 : r / q;
+              return (per_head ? gate * q + hh * hd : (2 * hh + gate) * hd) + r % hd;
+            });
+          }
+        }
+        if (k == FLYX_BLOCK_GDN && rank) {
+          const flyx_gdn_block& G = b.gdn;
+          if (G.lora_head_order != FLYX_GDN_HEADS_GROUPED && G.lora_head_order != FLYX_GDN_HEADS_TILED)
+            throw std::runtime_error(blk + ": GDN adapters in an unknown head order");
+          if (G.lora_head_order != G.head_order) {  // the weights' value head v -> the adapter's
+            const size_t nk = size_t(G.nk), rep = size_t(G.nv / G.nk), dv = size_t(G.dv), keys = 2 * nk * size_t(G.dk);
+            const bool tiled = G.head_order == FLYX_GDN_HEADS_TILED;
+            const std::function<size_t(size_t)> head = [=](size_t v) {
+              const size_t kh = tiled ? v % nk : v / rep, i = tiled ? v / nk : v % rep;
+              return tiled ? kh * rep + i : i * nk + kh;
+            };
+            const std::function<size_t(size_t)> vrows = [=](size_t r) { return head(r / dv) * dv + r % dv; };
+            if (l[FLYX_GDN_LIN_QKV].rank)
+              rows(l[FLYX_GDN_LIN_QKV].b, [=](size_t r) { return r < keys ? r : keys + vrows(r - keys); });
+            if (l[FLYX_GDN_LIN_Z].rank) rows(l[FLYX_GDN_LIN_Z].b, vrows);
+            if (l[FLYX_GDN_LIN_B].rank) rows(l[FLYX_GDN_LIN_B].b, head);
+            if (l[FLYX_GDN_LIN_A].rank) rows(l[FLYX_GDN_LIN_A].b, head);
+            if (l[FLYX_GDN_LIN_OUT].rank) cols(l[FLYX_GDN_LIN_OUT].a, vrows);
+          }
+        }
       }
     }
     for (int i = 0; i < desc->n_blocks; ++i) {  // an MTP layer's draft steps run its blocks without adapters
       if (desc->blocks[i].kind != FLYX_BLOCK_MTP) continue;
       const flyx_mtp_block& t = desc->blocks[i].mtp;
-      if (desc->blocks[t.attn].attn.lora[0].rank || desc->blocks[t.mlp].mlp.lora[0].rank)
+      bool any = false;
+      for (int j = 0; j < 4; ++j) any = any || desc->blocks[t.attn].attn.lora[j].rank;
+      for (int j = 0; j < 3; ++j) any = any || desc->blocks[t.mlp].mlp.lora[j].rank;
+      if (any)
         throw std::runtime_error("an MTP layer with adapters");
     }
     {
@@ -1523,7 +1594,7 @@ int open_model(const flyx_model_desc* desc, const flyx_open_options* opts, flyx_
         if (b.kind == FLYX_BLOCK_EMBED)  // the file's table (W holds float64 copies)
           ok = !b.embed.has_norm && desc->weights[b.embed.table].t &&
                desc->weights[b.embed.table].t->dtype == FLYX_DT_BF16;
-        else if (b.kind == FLYX_BLOCK_GDN) ok = m->a4.count(m->w(b.gdn.out)) > 0;
+        else if (b.kind == FLYX_BLOCK_GDN) ok = m->a4.count(m->w(b.gdn.out)) > 0 && !adapters(b.gdn.lora, FLYX_GDN_LINS);
         else if (b.kind == FLYX_BLOCK_ATTN) ok = m->a4.count(m->w(b.attn.o)) > 0 && !adapters(b.attn.lora, 4);
         else if (b.kind == FLYX_BLOCK_MLP) ok = m->a4.count(m->w(b.mlp.down)) > 0 && !adapters(b.mlp.lora, 3);
         else if (b.kind == FLYX_BLOCK_REL_ATTN || b.kind == FLYX_BLOCK_MOE) ok = false;
