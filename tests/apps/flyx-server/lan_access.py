@@ -2,6 +2,7 @@
 """Exercise the saved preference, real listener, dashboard and management policy across launches."""
 import ipaddress
 import json
+import os
 from pathlib import Path
 import socket
 import sys
@@ -155,8 +156,10 @@ def main(exe, asset, root):
                 "Origin": f"http://{rebind_host}",
                 "Sec-Fetch-Site": "same-origin",
             })[0] == 403
-            # Remote UNC/SMB path probing is rejected before touching the filesystem/network.
-            assert lan_cl.get_raw("/v1/hub/dir?path=%5C%5Cattacker%5Cshare")[0] == 403
+            # On Windows, remote UNC/SMB path probing is rejected with 403 before touching the filesystem/network;
+            # on POSIX, backslashes are ordinary path characters so the nonexistent path returns 404.
+            expected_unc_status = 403 if os.name == "nt" else 404
+            assert lan_cl.get_raw("/v1/hub/dir?path=%5C%5Cattacker%5Cshare")[0] == expected_unc_status
             # Disabling remote_manage takes effect immediately on the LAN client.
             st_off, net_off = cl.post(NETWORK, {"remote_manage": False})
             assert st_off == 200 and net_off["remote_manage_effective"] is False, net_off
