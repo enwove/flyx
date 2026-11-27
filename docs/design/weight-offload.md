@@ -45,6 +45,8 @@ Strata's Inkling hybrid dispatcher uses host-visible doorbells, CPU SIMD kernels
 
 Windows 11 build 26300, driver 610.88, RTX 5070 Ti (16,303 MiB), Ryzen 7 9800X3D (8C/16T), 32 GB DDR5-6000. The six prompts, exact K/V, 4,096-token context and reproduction command below match the v2 comparison. Prefill uses 1,024-token chunks. Decode pools prompts two through six, excluding the first generated token. Each timing process starts with idle GPU utilization. The complete placement, DSpark width, accuracy and CPU fallback tables are in [PR #70](https://github.com/enwove/flyx/pull/70).
 
+![Plain decode throughput at measured GPU residency levels for two Inkling quantizations and dense Qwen](../media/weight-offload-scaling.png)
+
 | Inkling Q2_K_XL resident budget | Plain tok/s | 2,897-token prefill tok/s | Decode expert hit rate |
 | --- | ---: | ---: | ---: |
 | 128/128 | 124.91 | 2,250 | 100% |
