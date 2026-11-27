@@ -1809,7 +1809,10 @@ __global__ void __launch_bounds__(256)
     k_strata_page_claim(KvRef kv, int nkv, const int* __restrict__ sel, int sel_stride, const int* __restrict__ sel_n,
                         const DevParams* P, int32_t* miss_count) {
   pdl_trigger();
-  if (blockIdx.x == 0 && blockIdx.y == 0 && threadIdx.x == 0) *miss_count = 0;
+  if (blockIdx.x == 0 && blockIdx.y == 0 && threadIdx.x == 0) {
+    *miss_count = 0;  // page-locked host memory k_strata_page_list counts in next
+    host_writes_done();
+  }
   if (!kv.hot) return;
   const int r = blockIdx.x, kvh = blockIdx.y, n = sel_n[size_t(r) * nkv + kvh];
   const int ring_lo = page_ring_lo(kv, P->position);
@@ -1852,7 +1855,7 @@ __global__ void __launch_bounds__(256)
       const int win = claim[sl];
       if (win >= 0) {
         if (win == q * rows + r) {
-          const int m = atomicAdd(miss_count, 1);
+          const int m = atomicAdd_system(miss_count, 1);
           req_dev[m] = PageGatherReq{kvh, q, sl, 0};
           map_row[i] = -1;
           continue;
@@ -1863,10 +1866,11 @@ __global__ void __launch_bounds__(256)
         }
       }
     }
-    const int m = atomicAdd(miss_count, 1);
+    const int m = atomicAdd_system(miss_count, 1);
     req_dev[m] = PageGatherReq{kvh, q, -1, 0};
     map_row[i] = m;
   }
+  host_writes_done();  // the requests are page-locked host memory strata_page_gather_host reads next
 }
 
 void CUDART_CB strata_page_gather_host(void* ud) {

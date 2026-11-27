@@ -400,6 +400,14 @@ __device__ __forceinline__ void pdl_wait() {
 #endif
 }
 
+// A thread's writes to page-locked host memory, done before its kernel ends: a kernel that writes host memory a later
+// one reads calls this after its writes.  Without it, on some B300 hosts (Modal, driver 620.70) the kernel after it in
+// a CUDA graph read the old values: of 200,000 kernel pairs, each writing 4-byte words of host memory and the next
+// reading them back, 32 to 799,760 words stale in 12 containers of 24, none with this fence (and none outside a
+// graph, nor on a B200); strata's rounds there read a stale word of the low-bit copy a pass had just written to host
+// memory, and their logits changed from run to run.
+__device__ __forceinline__ void host_writes_done() { __threadfence_system(); }
+
 // D (+)= A B on mma.m16n8k16: bf16 inputs, fp32 accumulators.
 __device__ __forceinline__ void mma_bf16(float* c, const uint32_t* a, const uint32_t* b) {
   asm volatile(
