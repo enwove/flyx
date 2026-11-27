@@ -100,19 +100,21 @@ __global__ void __launch_bounds__(512, 2) k_rmsnorm(const TIn* x, int ldx, const
 #pragma unroll
     for (int u = 0; u < kNormCache; ++u) {
       const int i = threadIdx.x + u * 512;
-      if (i < n) put_q8(o, blockIdx.x, i >> 5, rms_value(xv[u], inv, offset, wv[u]));
+      if (i < n) put_q8<false, true>(o, blockIdx.x, i >> 5, rms_value(xv[u], inv, offset, wv[u]));
     }
     for (int i = threadIdx.x + kNormCache * 512; i < n; i += 512)
-      put_q8(o, blockIdx.x, i >> 5, rms_value(in_value(xr + i), inv, offset, w[i]));
+      put_q8<false, true>(o, blockIdx.x, i >> 5, rms_value(in_value(xr + i), inv, offset, w[i]));
     return;
   }
 #pragma unroll
   for (int u = 0; u < kNormCache; ++u) {
     const int i = threadIdx.x + u * 512;
-    if (i < n) put(o, size_t(blockIdx.x) * ldy + i, size_t(blockIdx.x) * n + i, rms_value(xv[u], inv, offset, wv[u]));
+    if (i < n)
+      put<true>(o, size_t(blockIdx.x) * ldy + i, size_t(blockIdx.x) * n + i, rms_value(xv[u], inv, offset, wv[u]));
   }
   for (int i = threadIdx.x + kNormCache * 512; i < n; i += 512)
-    put(o, size_t(blockIdx.x) * ldy + i, size_t(blockIdx.x) * n + i, rms_value(in_value(xr + i), inv, offset, w[i]));
+    put<true>(o, size_t(blockIdx.x) * ldy + i, size_t(blockIdx.x) * n + i,
+              rms_value(in_value(xr + i), inv, offset, w[i]));
 }
 
 // The same rows in 8 bits (n % 32 == 0) for a round's few rows: grid (rows, ceil(n / 512)).  Every block finds the
@@ -137,10 +139,10 @@ __global__ void __launch_bounds__(512) k_rmsnorm_q8(const float* x, int ldx, con
   if (i < n) {
     const float v = rms_value<ALSO == Q8Also::Split>(xi, inv, offset, wi);
     if constexpr (ALSO == Q8Also::Float) o.y[size_t(blockIdx.x) * ldy + i] = v;
-    put_q8<ALSO == Q8Also::Float>(o, blockIdx.x, grp, v);
+    put_q8<ALSO == Q8Also::Float, true>(o, blockIdx.x, grp, v);
     if constexpr (ALSO == Q8Also::Split) {
       const size_t at = size_t(blockIdx.x) * n + i;
-      put(o, at, at, v);
+      put<true>(o, at, at, v);
     }
   }
 }
@@ -156,7 +158,7 @@ __global__ void __launch_bounds__(512) k_rmsnorm_spread(const float* x, int ldx,
   const float wi = i < n ? w[i] : 0.f;
   float xi = 0.f;
   const float inv = rms_inv_spread(xr, n, eps, int(blockIdx.y), i, &xi);
-  if (i < n) put(o, size_t(blockIdx.x) * ldy + i, size_t(blockIdx.x) * n + i, rms_value(xi, inv, offset, wi));
+  if (i < n) put<true>(o, size_t(blockIdx.x) * ldy + i, size_t(blockIdx.x) * n + i, rms_value(xi, inv, offset, wi));
 }
 
 __global__ void k_embed(const int* tokens, const bf16* E, int H, float* x) {
@@ -247,7 +249,7 @@ __device__ __forceinline__ void swiglu_row(const float* gu, int ld, int I, const
   if (i + 1 >= I) {
     float g = r[i], u = r[I + i];
     adapt(g, u, i);
-    put(o, size_t(row) * ld_out + i, size_t(row) * I + i, silu(g) * u);
+    put<true>(o, size_t(row) * ld_out + i, size_t(row) * I + i, silu(g) * u);
     return;
   }
   float g0, g1, u0, u1;
@@ -267,7 +269,7 @@ __device__ __forceinline__ void swiglu_row(const float* gu, int ld, int I, const
     o.also[size_t(row) * I + i + 1] = b;
   }
   if (o.q8) {  // 8-bit rows (I % 64 == 0): a warp holds 64 consecutive values, two groups
-    put_q8_pairs(o, row, i >> 6, a, b);
+    put_q8_pairs<true>(o, row, i >> 6, a, b);
   } else if (o.mid) {  // the three parts of the skinny GEMMs' input, as put() makes them
     uint32_t h, m, l;
     split3(a, b, &h, &m, &l);
