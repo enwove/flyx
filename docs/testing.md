@@ -61,7 +61,7 @@ or needing DV's assets) outside `tests/dv.cmake`. Labels are only ever appended
 A new test usually needs nothing: its tier and aspects follow from where and how it is registered. Label it by hand
 when that is not enough: a test registered outside the CUDA block that takes the CUDA backend (`gpu`), a golden run
 not made by `flyx_add_golden_test` (`golden`), a new smoke test (keep them a few seconds each: `quick` takes as long
-as its longest tests, `cuda_ops` and `golden_cuda_pdl`, about 35 s each on an RTX 5070 Ti). The inference cannot
+as its longest tests, `cuda_ops`, about 35 s on an RTX 5070 Ti, and `golden_cuda_pdl`, 24 to 30 s). The inference cannot
 see how long a test takes: a slow test inferred `tiny` lands in `quick`, so look at its time in the JUnit report
 (`ctest --output-junit`): `python tools/check_test_tiers.py REPORT.xml` names every quick test over 20 s (the nightly
 CI runs warn of them).
