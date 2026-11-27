@@ -1,5 +1,5 @@
 # Copyright 2026 The flyx Authors. SPDX-License-Identifier: Apache-2.0
-"""DFlash2 block drafter (reference).
+"""DFlash2 and DSpark block drafters (reference).
 
 Behaviour follows the published DFlash / DFlash2 description (z-lab DFlash,
 vllm-project/speculators ``dflash2``): a few attention layers whose
@@ -12,6 +12,15 @@ token-conditioned grouped causal convolutions around attention and MLP, and a
 low-rank candidate selector that re-ranks the unary top-k with a
 predecessor/hidden/successor bilinear score while walking the block left to
 right.
+
+DSpark (DeepSeek's DSpark paper; DeepSpec's ``Qwen3DSparkModel``) is the same
+block drafter without the convolutions (plain decoder layers around the shared
+context keys/values), every row of the block a draft (row ``k`` predicts the
+token after the anchor's ``k``-th successor, the anchor's own row included), and
+a Markov head in place of the selector: ``logits + W2 W1[previous token]``,
+the selector's score with a unit hidden gate (``sel.pred`` = W1, ``sel.succ`` =
+W2, no ``sel.hid``).  Like DFlash2's here, the walk takes the unary top-k (DSpark's
+converted config: the top 1024; DeepSpec's walk is over the whole vocabulary).
 """
 from __future__ import annotations
 
@@ -40,6 +49,8 @@ class DraftConfig:
     conv_group: int
     sel_rank: int
     sel_topk: int
+    draft_from: int                 # the block's first row that drafts: 1, or 0 (DSpark: the anchor's)
+    sel_gate: bool                  # the selector's hidden gate (sel.hid); DSpark's Markov head has none (a unit gate)
     window: int = 0                 # positions attend to positions less than this far from them (0: all)
 
 
@@ -109,7 +120,7 @@ class Draft:
         return grouped_conv(x, ker[:, 0], base[0], c.block, c.conv_group), ker[:, 1], base[1]
 
     def block(self, st: DraftState, anchor: int):
-        """Run one block at positions ctx..ctx+B-1. Returns (drafts [B-1], debug dict)."""
+        """Run one block at positions ctx..ctx+B-1. Returns (drafts [B - draft_from], debug dict)."""
         c = self.cfg
         B = c.block
         ids = torch.tensor([anchor] + [c.mask_token] * (B - 1))
@@ -122,7 +133,9 @@ class Draft:
             p = f"L{j}."
             r = x
             h = rms_norm(x, self.w(p + "in_norm"), c.eps)
-            h, ker, base = self._conv(p + "attn_conv", h)
+            conv = c.conv_taps > 0  # DSpark: plain decoder layers
+            if conv:
+                h, ker, base = self._conv(p + "attn_conv", h)
             q = rms_norm((h @ self.w(p + "attn.q").T).view(B, c.n_heads, c.head_dim), self.w(p + "attn.q_norm"), c.eps)
             k = rms_norm((h @ self.w(p + "attn.k").T).view(B, c.n_kv, c.head_dim), self.w(p + "attn.k_norm"), c.eps)
             v = (h @ self.w(p + "attn.v").T).view(B, c.n_kv, c.head_dim)
@@ -130,20 +143,25 @@ class Draft:
             k = rope(k, pos, c.rope_theta, c.head_dim)
             K = torch.cat([st.k[j], k]); V = torch.cat([st.v[j], v])   # bidirectional (within the window)
             o = attention(q, K, V, scale, mask).reshape(B, -1) @ self.w(p + "attn.o").T
-            o = grouped_conv(o, ker, base, B, c.conv_group)
+            if conv:
+                o = grouped_conv(o, ker, base, B, c.conv_group)
             x = r + o
             r = x
             h = rms_norm(x, self.w(p + "post_norm"), c.eps)
-            h, ker, base = self._conv(p + "mlp_conv", h)
+            if conv:
+                h, ker, base = self._conv(p + "mlp_conv", h)
             m = (torch.nn.functional.silu(h @ self.w(p + "mlp.gate").T) * (h @ self.w(p + "mlp.up").T)) @ self.w(p + "mlp.down").T
-            x = r + grouped_conv(m, ker, base, B, c.conv_group)
-        hn = rms_norm(x, self.w("norm"), c.eps)[1:]          # rows that predict tokens
+            x = r + (grouped_conv(m, ker, base, B, c.conv_group) if conv else m)
+        hn = rms_norm(x, self.w("norm"), c.eps)[c.draft_from:]  # rows that predict tokens
         logits = hn @ self.head.T
         unary, cand = torch.topk(logits, c.sel_topk, dim=-1)  # sorted, ties -> lower id first
-        hid = hn @ self.w("sel.hid").T                         # [B-1, rank]
         pred, succ = self.w("sel.pred"), self.w("sel.succ")
+        if c.sel_gate:
+            hid = hn @ self.w("sel.hid").T                     # [rows, rank]
+        else:                                                  # DSpark's Markov head: no hidden gate
+            hid = torch.ones(hn.shape[0], pred.shape[1], dtype=self.dtype)
         prev, drafts, scores = anchor, [], []
-        for s in range(B - 1):
+        for s in range(hn.shape[0]):
             sc = unary[s] + (succ[cand[s]] * (pred[prev] * hid[s])[None, :]).sum(-1)
             idx = int(torch.argmax(sc))
             prev = int(cand[s, idx])

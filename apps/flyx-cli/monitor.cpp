@@ -22,6 +22,7 @@
 #include <string>
 #include <vector>
 
+#include "apps/common/api_key.h"
 #include "apps/common/defaults.h"
 #include "apps/common/numbers.h"
 #include "apps/flyx-cli/monitor.h"
@@ -321,10 +322,16 @@ struct TermStyle {
     out->push_back(where + std::string(size_t(std::max(1, cols - width(where) - width(right))), ' ') + right);
 
     std::string info;
+    bool degraded = false;
     if (loaded) {
-      info = str(model, "device") + " · " + str(model, "backend") + " · " + str(model, "drafter") + " up to " +
-             num(get(model, "max_width")) + " drafts · " + str(model, "chat_format") + " chat · context " +
-             grouped(static_cast<long long>(get(model, "context")));
+      const std::string dr = str(model, "drafter"), dw = str(model, "draft_weights");
+      const std::string dr_str = dr.empty() || dr == "none"
+                                     ? "no drafter"
+                                     : dr + (dw.empty() ? "" : " (" + dw + ")") + " up to " +
+                                           num(get(model, "max_width")) + " drafts";
+      degraded = model.contains("degraded") && model["degraded"].is_array() && !model["degraded"].empty();
+      info = str(model, "device") + " · " + str(model, "backend") + " · " + dr_str + " · " +
+             str(model, "chat_format") + " chat · context " + grouped(static_cast<long long>(get(model, "context")));
     } else if (model_id.empty()) {
       info = load_state == "failed" ? "the last model did not load: " + str(load, "error")
                                     : "no model loaded: name one on the dashboard's page (" + url + "/)";
@@ -332,7 +339,12 @@ struct TermStyle {
       info = "model not loaded (it loads on the next request)";
     }
     info += " · up " + seconds(get(t["server"], "uptime_s"));
-    out->push_back(paint(kDim, fit(info, cols)));
+    if (degraded) {
+      const std::string tag = " [VRAM-adjusted]";
+      out->push_back(paint(kDim, fit(info, std::max(0, cols - int(tag.size())))) + paint(kWarm, tag));
+    } else {
+      out->push_back(paint(kDim, fit(info, cols)));
+    }
     out->push_back(paint(kDim, repeat("─", cols)));
   }
 
@@ -383,9 +395,13 @@ struct TermStyle {
     const double tpr_now = decoding ? (has(rates, "tokens_per_round") ? get(rates, "tokens_per_round")
                                                                       : get(state, "tokens_per_round"))
                                     : get(last, "tokens_per_round");
+    const std::string dr_tile = str(model, "drafter"), dw_tile = str(model, "draft_weights");
+    const std::string dr_sub = dr_tile.empty() || dr_tile == "none"
+                                   ? "no drafter"
+                                   : dr_tile + (dw_tile.empty() ? "" : " · " + dw_tile) + " up to " +
+                                         num(get(model, "max_width"));
     tiles.push_back({"Speculation", paint(kBold, num(tpr_now, 2) + " tokens/round"),
-                     paint(kDim, (decoding ? "now · " : "last reply · ") + str(model, "drafter") + " up to " +
-                                     num(get(model, "max_width"))),
+                     paint(kDim, (decoding ? "now · " : "last reply · ") + dr_sub),
                      spark(tpr, cw, get(model, "max_width") + 1, kAccent)});
     const double fresh = get(last, "prompt_tokens") - get(last, "reused_tokens");
     const double prefill_ms = get(last, "prefill_ms");
@@ -658,10 +674,7 @@ int run(int argc, char** argv) {
                          "through a tunnel to its port)\n", o.url.c_str());
     return 1;
   }
-  if (o.key.empty()) {
-    o.key = os::getenv_str(env::kApiKey);
-    if (o.key.empty()) o.key = os::getenv_str(env::kKeyAlias);
-  }
+  if (o.key.empty()) o.key = apps::api_key_from_env();
   while (!o.url.empty() && o.url.back() == '/') o.url.pop_back();
   g_stop = false;
   TermStyle style{!os::env_exists(env::kNoColor)};

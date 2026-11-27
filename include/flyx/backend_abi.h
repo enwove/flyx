@@ -30,7 +30,7 @@
 extern "C" {
 #endif
 
-#define FLYX_BACKEND_ABI_VERSION 45u
+#define FLYX_BACKEND_ABI_VERSION 50u
 #define FLYX_BACKEND_ENTRY "flyx_backend_get_api"
 /* How a backend library exports its entry. */
 #if defined(_WIN32)
@@ -96,15 +96,20 @@ typedef enum {
   FLYX_DT_GGML_IQ4_NL = 27, FLYX_DT_GGML_IQ4_XS = 28,
   /* GGML's NVFP4 (ABI 22): blocks of 64 e2m1 values with an unsigned e4m3
    * scale per 16 and no scale per tensor; not ModelOpt's FLYX_DT_NVFP4
-   * above, whose values a backend may take it as. */
-  FLYX_DT_GGML_NVFP4 = 29
+   * above, whose values a backend may take it as.  Since ABI 45 an optional
+   * per-tensor or per-expert float32 scale may accompany it in scale2. */
+  FLYX_DT_GGML_NVFP4 = 29,
+  /* GGML's MXFP4 (ABI 45, GGML type 39): 32 e2m1 values with one E8M0 scale. */
+  FLYX_DT_GGML_MXFP4 = 30,
+  /* GGML's Q2_0 (ABI 45, GGML type 42): 64 2-bit values (q - 1) with one binary16 scale. */
+  FLYX_DT_GGML_Q2_0 = 31
 } flyx_dtype;
 
 /* A GGML block type's weights per block and bytes per block; 0 for any other dtype. */
 static inline int32_t flyx_block_values(int32_t dtype) {
   if (dtype >= FLYX_DT_GGML_Q4_0 && dtype <= FLYX_DT_GGML_Q8_0) return 32;
-  if (dtype == FLYX_DT_GGML_IQ4_NL) return 32;
-  if (dtype == FLYX_DT_GGML_NVFP4) return 64;
+  if (dtype == FLYX_DT_GGML_IQ4_NL || dtype == FLYX_DT_GGML_MXFP4) return 32;
+  if (dtype == FLYX_DT_GGML_NVFP4 || dtype == FLYX_DT_GGML_Q2_0) return 64;
   return dtype >= FLYX_DT_GGML_Q2_K && dtype <= FLYX_DT_GGML_IQ4_XS ? 256 : 0;
 }
 static inline int32_t flyx_block_bytes(int32_t dtype) {
@@ -129,6 +134,8 @@ static inline int32_t flyx_block_bytes(int32_t dtype) {
     case FLYX_DT_GGML_IQ4_NL: return 18;
     case FLYX_DT_GGML_IQ4_XS: return 136;
     case FLYX_DT_GGML_NVFP4: return 36;
+    case FLYX_DT_GGML_MXFP4: return 17;
+    case FLYX_DT_GGML_Q2_0: return 18;
     default: return 0;
   }
 }
@@ -211,8 +218,8 @@ typedef struct {
 } flyx_vnorm;
 
 /* A low-rank adapter on a linear y = W x (ABI 42): y = W x + scale b (a x), a [rank, in], b [out, rank], both bf16
- * (ABI 43: the scale; DV's canvas adapters have none, scale 1); a target's own may also be f16 or f32 (a PEFT adapter
- * given beside the model), which the backends run as bf16.  rank 0: none, as a block built zeroed has. */
+ * (ABI 43: the scale; DV's canvas adapters have none, scale 1); a target's own may also be f16 or f32 (ABI 50: a PEFT
+ * adapter given beside the model), which the backends run as bf16.  rank 0: none, as a block built zeroed has. */
 typedef struct {
   int32_t a, b, rank;
   float scale;
@@ -225,7 +232,7 @@ typedef enum {
   FLYX_LINS = 7
 } flyx_linear;
 
-/* A gated delta net's linears, in the order its array of adapters lists them (ABI 45). */
+/* A gated delta net's linears, in the order its array of adapters lists them (ABI 50). */
 typedef enum {
   FLYX_GDN_LIN_QKV = 0, FLYX_GDN_LIN_Z = 1, FLYX_GDN_LIN_B = 2, FLYX_GDN_LIN_A = 3, FLYX_GDN_LIN_OUT = 4,
   FLYX_GDN_LINS = 5
@@ -239,20 +246,25 @@ typedef enum {
    * floats), its top `topk` candidates with their log-probabilities and its selector projection (`rank` floats); and
    * the position the canvas follows.  Not positional and not kept in checkpoints: a prefill, rewind or restore leaves
    * it unknown, and the drafter starts it over (only drafting reads it). */
-  FLYX_STATE_CANVAS = 4
+  FLYX_STATE_CANVAS = 4,
+  /* Causal short-convolution recurrent history (ABI 45): `conv - 1` rows of `channels` float32 values per logical
+   * layer; folded to accepted rows at commit, rewound inside FLYX_ROUND_SLOTS, and saved in checkpoints/snapshots. */
+  FLYX_STATE_SHORTCONV = 5
 } flyx_state_kind;
 
 /* Per-sequence state.  Positional state (KV, RING) is rewritten after a
- * rollback; recurrent state (GDN) is folded to the accepted rows at commit,
- * rewound inside the last rounds and kept in checkpoints. */
+ * rollback; recurrent state (GDN, SHORTCONV) is folded to the accepted rows at
+ * commit, rewound inside the last rounds and kept in checkpoints. */
 typedef struct {
   int32_t kind;                        /* flyx_state_kind */
   int32_t draft;                       /* only drafting reads it, so it never changes the output */
   int32_t layers, n_kv, head_dim;      /* KV */
-  int32_t nk, nv, dk, dv, conv;        /* GDN */
+  int32_t nk, nv, dk, dv, conv;        /* GDN; SHORTCONV uses conv */
   int32_t width;                       /* RING; CANVAS: the hidden size */
   int32_t head_order;                  /* GDN: flyx_gdn_head_order */
   int32_t slots, topk, rank;           /* CANVAS (ABI 42): slots, candidates a slot keeps, the selector's rank */
+  int32_t window;                      /* KV (ABI 45): sliding window size (> 0: fixed ring); 0 = full context */
+  int32_t channels;                    /* SHORTCONV (ABI 45): channel count per logical layer */
   int32_t pad0;
 } flyx_state;
 
@@ -294,13 +306,19 @@ typedef enum {
   FLYX_BLOCK_VISION_STEM = 11, /* ABI 44: patch embed + optional bias + optional pos embed / cls */
   FLYX_BLOCK_VIT_ATTN = 12,    /* ABI 44: bidirectional ViT self-attention */
   FLYX_BLOCK_VIT_MLP = 13,     /* ABI 44: ViT FFN (2-layer standard or 3-layer gated) */
-  FLYX_BLOCK_VISION_MERGE = 14 /* ABI 44: spatial merge/pool + optional norm + 1/2-layer projector */
+  FLYX_BLOCK_VISION_MERGE = 14, /* ABI 44: spatial merge/pool + optional norm + 1/2-layer projector */
+  FLYX_BLOCK_REL_ATTN = 15,    /* ABI 45: relative-bias + sink + shortconv + optional SWA attention */
+  FLYX_BLOCK_MOE = 16,         /* ABI 45: sparse MoE with SiTU/SwiGLU + optional shortconv & attn-res/loop */
+  FLYX_BLOCK_DSPARK = 17,      /* ABI 45: DSpark parallel block drafter with Markov RNN head */
+  FLYX_BLOCK_DSPARK_LAYER = 18 /* ABI 45: one layer of DSpark */
 } flyx_block_kind;
 
-/* Token rows -> residual rows: x = table[token]. */
+/* Token rows -> residual rows: x = table[token], optionally followed by RMSNorm (has_norm != 0, ABI 45). */
 typedef struct {
   int32_t hidden, vocab;
   int32_t table;                       /* [vocab, hidden] */
+  int32_t has_norm;                    /* ABI 45: 1 = apply norm after lookup; 0 = none */
+  flyx_norm norm;
 } flyx_embed_block;
 
 /* x += o(attention(rope(q_norm(q)), rope(k_norm(k)), v) [* sigmoid(gate)]) with
@@ -320,8 +338,8 @@ typedef struct {
   int32_t q, k, v, o;
   int32_t kv;                          /* state: its K/V cache (layers 1) */
   /* ABI 43: the block's own adapters on q, k, v and o (flyx_linear order), in every pass that runs it (a V-LoRA,
-   * python/convert --lora, or a PEFT adapter: --lora), one rank and scale on the linears that have one (rank 0 on the
-   * others: none there).  With an output gate (ABI 45) q's covers the gate's rows too, its b's rows in lora_gate's
+   * python/convert --lora, or a PEFT adapter: --lora), one rank and scale on the linears that have one (ABI 50: rank 0
+   * on the others, none there).  With an output gate (ABI 50) q's covers the gate's rows too, its b's rows in lora_gate's
    * layout, which may be another than the weight's (a PEFT adapter's are Hugging Face's, FLYX_GATE_PER_HEAD): the
    * backend reads them as it reads the weight's. */
   flyx_lora lora[4];
@@ -329,7 +347,7 @@ typedef struct {
    * rot_dim / 2 (all 0 = standard 1D RoPE). mrope_interleaved: 1 = interleaved T,H,W; 0 = contiguous chunks. */
   int32_t mrope_section[3];
   int32_t mrope_interleaved;
-  int32_t lora_gate;                   /* ABI 45: flyx_gate_layout of lora[FLYX_LIN_Q]'s b rows (gate only) */
+  int32_t lora_gate;                   /* ABI 50: flyx_gate_layout of lora[FLYX_LIN_Q]'s b rows (gate only) */
 } flyx_attn_block;
 
 /* Gated delta net, as ops/ops.h: from h = norm(x), mixed = qkv(h) through
@@ -346,7 +364,7 @@ typedef struct {
   int32_t state;                       /* its GDN state */
   int32_t head_order;                  /* flyx_gdn_head_order, the state's too */
   int32_t decay;                       /* flyx_gdn_decay */
-  /* ABI 45: the block's own adapters on qkv, z, b, a and out (flyx_gdn_linear order), as an attention block's (one
+  /* ABI 50: the block's own adapters on qkv, z, b, a and out (flyx_gdn_linear order), as an attention block's (one
    * rank and scale on those that have one), their per-value-head rows (qkv's value rows, z's, b's, a's) and out's a's
    * columns in lora_head_order, which may be another than the weights' (a PEFT adapter's are Hugging Face's,
    * FLYX_GDN_HEADS_GROUPED): the backend reads them as it reads the weights. */
@@ -362,11 +380,15 @@ typedef struct {
   flyx_lora lora[3];                   /* ABI 43: on gate, up and down, as an attention block's */
 } flyx_mlp_block;
 
-/* logits = w(norm(x)), then the token choice per row (ops/sampling/sampling.h). */
+/* logits = w(norm(x)), optional softcapping (cap * tanh(logit / cap) when softcap > 0, ABI 45),
+ * optional truncation to vocab_out unpadded tokens (0 = vocab, ABI 45), then token choice per row. */
 typedef struct {
   int32_t hidden, vocab;
   flyx_norm norm;
   int32_t w;                           /* [vocab, hidden]; the embedding's table when tied */
+  int32_t vocab_out;                   /* ABI 45: unpadded vocab exposed to sampling (0 = vocab) */
+  float softcap;                       /* ABI 45: final logit softcap (0 = none) */
+  int32_t pad0;
 } flyx_head_block;
 
 /* Multi-token prediction (python/reference/flyx_ref/mtp.py): from the
@@ -381,6 +403,12 @@ typedef struct {
   int32_t ring;                        /* state (width hidden) */
 } flyx_mtp_block;
 
+/* Where a DFlash2 selector applies logit softcapping when softcap > 0 (ABI 46). */
+typedef enum {
+  FLYX_DFLASH2_SOFTCAP_BEFORE = 0,  /* cap * tanh(unary / cap) + edge */
+  FLYX_DFLASH2_SOFTCAP_AFTER = 1    /* cap * tanh((unary + edge) / cap) */
+} flyx_dflash2_softcap_mode;
+
 /* DFlash2 block drafter (python/reference/flyx_ref/draft.py): `block`
  * rows (the anchor, then mask_token) through its layers, attending to the
  * context K/V and to each other (not causal; with a window, only to the
@@ -388,7 +416,12 @@ typedef struct {
  * top sel_topk, and the selector walk (sel_hid, sel_pred, sel_succ).  Its
  * context: fc(the residual rows tapped at n_taps points, side by side) ->
  * hidden_norm -> each layer's k (k_norm, rope) and v into its cache.  The
- * embedding and head blocks may hold packed GGML blocks. */
+ * embedding and head blocks may hold packed GGML blocks.
+ * ABI 49: convolutions optional (conv_taps 0: attn_conv_* and mlp_conv_* are
+ * -1), the block's first drafting row draft_from (1: rows 1.., 0: the anchor's
+ * too, predicting the token after it: up to `block` drafts), sel_hid optional
+ * (-1: the selector's score with a unit gate), and q8_weights (1: the model
+ * asks its projections in Q8_0 beside a target of float weights). */
 typedef struct {
   int32_t hidden, n_heads, n_kv, head_dim, inter;
   int32_t block, mask_token, n_taps, conv_taps, conv_group, sel_rank, sel_topk;
@@ -399,11 +432,16 @@ typedef struct {
   int32_t fc, sel_pred, sel_succ, sel_hid;
   int32_t kv;                          /* state: one cache per layer */
   int32_t window;                      /* sliding window of every layer; 0: none */
+  float softcap;                       /* ABI 46: selector logit softcap (0 = none) */
+  int32_t softcap_mode;                /* ABI 46: flyx_dflash2_softcap_mode */
+  int32_t draft_from;                  /* ABI 49: the block's first row that drafts: 1, or 0 (the anchor's) */
+  int32_t q8_weights;                  /* ABI 49: 1: its projections Q8_0 beside a target of float weights */
 } flyx_dflash2_block;
 
 /* A DFlash2 layer: attention (q, k, v, o; q/k norms; rotary on all dims) and
  * MLP, each wrapped in a grouped dynamic conv whose coefficients are
- * base [2][conv_taps][hidden] plus proj(h). */
+ * base [2][conv_taps][hidden] plus proj(h) when the block has convolutions
+ * (conv_taps > 0; else attn_conv_* and mlp_conv_* are -1). */
 typedef struct {
   flyx_norm norm, post_norm, q_norm, k_norm;
   int32_t q, k, v, o, gate, up, down;
@@ -570,6 +608,71 @@ typedef struct {
   int32_t fc2, fc2_b;        /* [out_hidden, fc1_out or merged_dim] & [out_hidden] (-1 = none) */
 } flyx_vision_merge_block;
 
+/* Relative-position-bias attention with per-query sink, Q/K/R L2 clipping, no-gamma V RMSNorm,
+ * K/V/output causal short convolutions (optional per-head dynamic taps on global layers),
+ * optional block attention-residual mixing, and optional cross-pass loop control (ABI 45). */
+typedef struct {
+  int32_t hidden, n_heads, n_kv, head_dim;
+  int32_t d_rel, rel_extent, window, conv, log_scale_floor;
+  float qk_clip, rel_clip, log_scale_alpha, eps;
+  flyx_norm q_norm_in, k_norm_in, v_norm_in;
+  int32_t q, k, v, o, gate;
+  int32_t rel, rel_bias, q_clip_w, rel_clip_w, sink_proj;
+  int32_t k_conv, v_conv, post_conv;
+  int32_t k_conv_proj, v_conv_proj;    /* -1 on SWA layers; [conv * n_kv, hidden] on global layers */
+  int32_t res_query;                   /* -1 on layer 0; [hidden] (SWA) or [3, hidden] (global) */
+  int32_t res_push;                    /* 1: push inpSA to res_bank & replace cur; 0: cur = inpSA + out */
+  int32_t loop_msg_query;              /* -1 on pass 0; [4, hidden] on looped passes */
+  int32_t loop_rank;                   /* 0 on pass 0; rank of low-rank loop controllers */
+  int32_t loop_ctrl_down[3], loop_ctrl_gain[3], loop_ctrl_forget[3]; /* Q, K, V controllers */
+  int32_t kv, sconv;                   /* state indices: FLYX_STATE_KV and FLYX_STATE_SHORTCONV */
+} flyx_rel_attn_block;
+
+/* Sparse Mixture-of-Experts block (ABI 45): optional depth-residual mix and cross-pass FFN controller,
+ * RMSNorm, F32 router (softmax or sigmoid + optional bias), top-k routing with optional normalization & scale,
+ * 3D fused gate_up [E, 2*I, H] + SiTU (situ_beta > 0) or SwiGLU + 3D down [E, H, I], optional post-FFN shortconv. */
+typedef struct {
+  int32_t hidden, inter, n_experts, top_k, conv;
+  int32_t gating;                      /* 0 = softmax, 1 = sigmoid */
+  int32_t norm_weights;                /* 1 = normalize selected weights by sum + norm_eps */
+  float route_scale, norm_eps, situ_beta, situ_linear_beta;
+  flyx_norm norm;
+  int32_t router, router_bias;         /* [E, H], [E] or -1 */
+  int32_t gate_up, down;               /* 3D [E, 2*I, H] (gate half then up half), [E, H, I] */
+  int32_t post_conv;                   /* [H, conv] or -1 */
+  int32_t res_query;                   /* [H] or -1 */
+  int32_t loop_rank;                   /* 0 on pass 0 */
+  int32_t loop_ctrl_down, loop_ctrl_gain, loop_ctrl_forget;
+  int32_t sconv, sconv_offset;         /* FLYX_STATE_SHORTCONV index and channel offset */
+} flyx_moe_block;
+
+/* One layer of a DSpark parallel block drafter (ABI 45): per-layer context tap mix + K/V projection,
+ * non-causal block attention over context K/V (optional sliding window) and block rows, SwiGLU MLP. */
+typedef struct {
+  int32_t window;                      /* 0 = full context; > 0 = sliding window (e.g. 1025) */
+  int32_t kv;                          /* state: FLYX_STATE_KV (draft = 1, layers = 1, window = window) */
+  flyx_norm norm, post_norm, q_norm, k_norm, k_ctx_norm, ctx_norm;
+  int32_t q, k, v, o, k_ctx, v_ctx, ctx_mix;
+  int32_t gate, up, down;
+} flyx_dspark_layer_block;
+
+/* DSpark parallel block drafter with Markov RNN head (ABI 45). */
+typedef struct {
+  int32_t hidden, n_heads, n_kv, head_dim, inter;
+  int32_t block, n_taps, markov_rank, vocab_out;
+  double theta;
+  float softcap;
+  int32_t embed, head;                 /* target embed & head blocks */
+  int32_t first_layer, layers;         /* FLYX_BLOCK_DSPARK_LAYER blocks */
+  flyx_norm tok_norm, norm, markov_ctx_norm;
+  int32_t mask_embd;                   /* [block - 1, hidden] */
+  int32_t markov_ctx_mix;              /* [n_taps] */
+  int32_t markov_w1;                   /* [vocab_out, markov_rank] */
+  int32_t markov_w2, markov_w2_b;      /* [vocab_out, markov_rank], [vocab_out] or -1 */
+  int32_t joint_proj, joint_proj_b;    /* [3*markov_rank, 2*hidden + 2*markov_rank], [3*markov_rank] */
+  int32_t ring;                        /* state: FLYX_STATE_RING (width = hidden, f_rnn per pos) */
+} flyx_dspark_block;
+
 typedef struct {
   int32_t kind;                        /* flyx_block_kind */
   int32_t pad0;
@@ -588,6 +691,10 @@ typedef struct {
     flyx_vit_attn_block vit_attn;         /* ABI 44 */
     flyx_vit_mlp_block vit_mlp;           /* ABI 44 */
     flyx_vision_merge_block vision_merge; /* ABI 44 */
+    flyx_rel_attn_block rel_attn;      /* ABI 45 */
+    flyx_moe_block moe;                /* ABI 45 */
+    flyx_dspark_block dspark;          /* ABI 45 */
+    flyx_dspark_layer_block dspark_layer; /* ABI 45 */
   };
 } flyx_block;
 
@@ -603,17 +710,31 @@ typedef struct {
 
 typedef enum {
   FLYX_NODE_RUN = 1,     /* run `block` on the pass's rows: embedding, mixer, MLP; head (arg0 = 1: last row only) */
-  FLYX_NODE_TAP,         /* residual rows -> feature slot arg0 of drafter `block` */
+  FLYX_NODE_TAP,         /* residual rows -> feature slot arg0 of drafter `block`; arg1 = FLYX_TAP_NORMED: through
+                             * the norm of the drafter's head block first (DSpark: ABI 45, DFlash2: ABI 46) */
   FLYX_NODE_DRAFT,       /* drafter `block` proposes arg0 tokens after the anchor; arg1 = FLYX_DRAFT_TREE: a
                              * tree of them, which the round verifies as a tree (ABI 24) */
   FLYX_NODE_CONTEXT,     /* drafter `block` takes the pass's rows (a round's: the accepted ones) as context; DV's
                              * (ABI 42): its canvas pass in a round, starting its canvas over in a prefill */
   FLYX_NODE_ACCEPT,      /* compare drafts with the target's choices, advance, emit */
   FLYX_NODE_COMMIT,      /* fold recurrent state to the accepted rows */
-  FLYX_NODE_GIVEN        /* the launch's drafts (gen.drafts) are the round's arg0 drafts; no drafter runs (block -1);
+  FLYX_NODE_GIVEN,       /* the launch's drafts (gen.drafts) are the round's arg0 drafts; no drafter runs (block -1);
                              * arg1 = FLYX_GIVEN_TREE: they form a tree (gen.parents) */
+  /* Depth-residual bank and looped-pass control nodes (ABI 45, pass-local scratch):
+   *   RES_RESET    clear res_bank (arg0 = capacity in blocks)
+   *   LOOP_PRELUDE snapshot prelude = cur and prelude_blocks = res_bank
+   *   LOOP_NEXT    loop_bank = res_bank[prelude_size + 1 .. end], loop_bank_out = cur,
+   *                cur = prelude, res_bank = prelude_blocks
+   *   RES_MIX      cur = attn_res_mix(res_bank, cur, weight arg0) */
+  FLYX_NODE_RES_RESET = 8,
+  FLYX_NODE_LOOP_PRELUDE = 9,
+  FLYX_NODE_LOOP_NEXT = 10,
+  FLYX_NODE_RES_MIX = 11
 } flyx_node_kind;
 
+/* FLYX_NODE_TAP's arg1: the rows are copied after the norm of the drafter's head block (the target's output norm):
+ * the target's final hidden state, which a drafter made on transformers' last hidden state reads. */
+#define FLYX_TAP_NORMED 1
 /* FLYX_NODE_GIVEN's arg1: the round verifies a tree of drafts (docs/design/tree-verification.md). */
 #define FLYX_GIVEN_TREE 1
 /* FLYX_NODE_DRAFT's arg1: the drafter proposes its arg0 drafts as a tree, best first by its own scores (each node
@@ -637,6 +758,11 @@ typedef struct {
    * w_0 < ... < w_{n-1} == width.  Backends that do not lower adaptive plans may refuse n_checkpoints > 0. */
   int32_t n_checkpoints;
   const int32_t* checkpoints;
+  /* With checkpoints (ABI 47): nonzero where a round that stops drafting may verify any checkpoint up to the one it
+   * drafted to, the one that pays by the stop policy.  The policy's costs are whole rounds', draft steps and verify
+   * rows, and a stop has paid its steps: an earlier checkpoint is priced right only where a step costs little beside
+   * a verify row, which is the model's to say (interfaces/model.h: draft_steps_cheap).  0: the checkpoint it is at. */
+  int32_t earlier_checkpoints;
 } flyx_program;
 
 /* Drafter-agnostic online confidence stopping parameters (ABI 41): computed by core/speculation/ from observed
@@ -775,18 +901,43 @@ typedef enum {
   FLYX_VISION_QUANT_NVFP4 = 2   /* quantize float vision linears to NVFP4 (4.5 bpw, ~70% smaller) */
 } flyx_vision_quant;
 
+/* Drafter linear weight precision policy (ABI 48). */
+typedef enum {
+  FLYX_DRAFT_WEIGHTS_AUTO  = 0, /* default: target-matched precision (e.g. Q8_0 beside packed targets, BF16 beside BF16) */
+  FLYX_DRAFT_WEIGHTS_NVFP4 = 1, /* quantize float/wider drafter linears to NVFP4 (~4.5 bpw) when it shrinks VRAM */
+  FLYX_DRAFT_WEIGHTS_Q8    = 2, /* quantize float drafter linears to Q8_0 (~8.5 bpw); pre-quantized stay packed */
+  FLYX_DRAFT_WEIGHTS_EXACT = 3  /* keep drafter weights in file format (and uncompacted draft head) */
+} flyx_draft_weights;
+
 typedef struct {
   int32_t max_ctx;              /* tokens per sequence */
   int32_t verbose;
   int32_t kv_fp8;               /* K/V caches the target reads (state.draft == 0) in FP8 (e4m3, a scale per position and
-                                   head); a drafter's as the backend chooses (CUDA: a one-layer one too) */
+                                   head); a drafter's as the backend chooses (CUDA: the MTP layer's too, a
+                                   DFlash2 drafter's never) */
   /* Backend options, "key=value,key=value" (NULL or "" = none).  Each backend
    * documents its keys and fails open() on one it does not know; a key given
    * twice takes the later value.  The engine passes them through unread. */
   const char* options;
   int32_t vision_device;        /* flyx_vision_device (ABI 44; 0 = disk) */
   int32_t vision_quant;         /* flyx_vision_quant (ABI 44; 0 = q8) */
+  int32_t draft_weights;        /* flyx_draft_weights (ABI 48; 0 = auto) */
+  /* ABI 48: use this target-only position as AUTO's default switch on every layout. An explicit backend
+   * switch still wins. A zero-initialized direct caller retains layout-dependent AUTO. */
+  int32_t lock_auto_from, auto_from;
 } flyx_open_options;
+
+/* Pre-flight device memory estimate before open() allocates (ABI 48).
+ * All figures are in device bytes for the backend's current device and the given model + open options. */
+typedef struct {
+  uint64_t weights_bytes;         /* total target + active drafter + resident vision weights on device */
+  uint64_t draft_weights_bytes;   /* portion of weights_bytes belonging to neural drafter blocks */
+  uint64_t draft_compact_savings; /* device bytes saved by stepping draft_weights to NVFP4 (0 if none) */
+  uint64_t min_runtime_bytes;     /* minimum non-weight device overhead (context, workspace, tiny KV/graphs) */
+  uint64_t comfort_margin_bytes;  /* headroom above weights + min_runtime to keep full auto drafter precision */
+  uint64_t target_kv_bytes_per_position; /* resident exact target K/V, including scales, before placement (ABI 48) */
+  int32_t vision_device;                 /* resolved flyx_vision_device for this estimate (ABI 48) */
+} flyx_load_estimate;
 
 /* Device memory as the backend sees it (0 = unknown, e.g. a CPU backend). */
 typedef struct {
@@ -883,7 +1034,9 @@ typedef struct {
 } flyx_prefill_input;
 
 /* All functions return 0 on success unless stated otherwise; on failure
- * last_error() describes what happened. */
+ * last_error() describes what happened.  FLYX_ERR_OOM (-2, ABI 48) signals
+ * device memory exhaustion (open, lower, seq_new, seq_new_in, seq_size). */
+#define FLYX_ERR_OOM (-2)
 typedef struct flyx_backend_api {
   uint32_t abi_version;
   uint32_t struct_size;
@@ -915,7 +1068,8 @@ typedef struct flyx_backend_api {
    * pass crossed and kept (the last one it crossed, or prefill_snapshot's).
    * Returns that position, negative on error. */
   int (*checkpoint)(flyx_seq* s, int32_t slot);
-  /* Restore a checkpoint; returns its position, or negative if the slot is empty. */
+  /* Restore a checkpoint; returns its position, or negative if the slot is empty or what it needs is gone (the CUDA
+   * backend: a drafter's window a later position overwrote in its ring), the state then left as it was. */
   int (*restore)(flyx_seq* s, int32_t slot, int32_t anchor);
   /* Testing: replace drafts with tokens[pos] (0 past the end). n = 0 turns it off. */
   int (*set_oracle)(flyx_seq* s, const int32_t* tokens, int32_t n);
@@ -1016,6 +1170,15 @@ typedef struct flyx_backend_api {
   /* Extended prefill pass (ABI 44) supporting external embeddings (vision/audio) and 3D MRoPE positions.
    * NULL: text-only backend (engine falls back to prefill() when inputs are text-only). */
   int (*prefill_ex)(flyx_plan* p, flyx_seq* s, const flyx_prefill_input* in, const flyx_gen_params* sample);
+  /* Pre-flight device memory estimate (ABI 48): estimates device bytes for `model` + `opts` before open() allocates,
+   * given `free_vram` and `total_vram` (0 = unknown).  Returns 0 on success, non-zero if unavailable.
+   * NULL when the backend has no device memory budget (e.g. a CPU backend). */
+  int (*estimate_load)(const flyx_model_desc* model, const flyx_open_options* opts, uint64_t free_vram,
+                       uint64_t total_vram, flyx_load_estimate* out);
+  /* Effective drafter linear weight precision active on `m` (ABI 48), as the drafter's linears are held (not the
+   * policy asked): "nvfp4", "q8" (Q8_0 blocks), "exact" (the file's own precision: bf16, or GGML blocks of another
+   * type kept as stored), or "" when no neural drafter is active.  NULL: backend does not report it. */
+  const char* (*draft_weights)(flyx_bmodel* m);
 } flyx_backend_api;
 
 typedef const flyx_backend_api* (*flyx_backend_entry_fn)(void);

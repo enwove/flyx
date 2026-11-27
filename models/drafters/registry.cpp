@@ -1,6 +1,7 @@
 // Copyright 2026 The flyx Authors. SPDX-License-Identifier: Apache-2.0
 #include "models/drafters/registry.h"
 
+#include <climits>
 #include <stdexcept>
 #include <string>
 
@@ -24,21 +25,42 @@ void DrafterRegistry::scan(const ModelFile& file, const TargetSpec& target, cons
   const json& hdr = file.header();
   sources_.dv = has_dv;
   if (mtp && mtp->embedded) sources_.mtp = true;
-  if (hdr.is_object() && hdr.contains("draft") && hdr["draft"].is_object()) sources_.dflash2 = true;
+  if (hdr.is_object() && hdr.contains("draft") && hdr["draft"].is_object()) {
+    sources_.block = block_drafter_kind(hdr["draft"]);
+    if (sources_.block == Drafter::kNone)
+      throw std::runtime_error("the file's drafter (\"draft\": kind '" + hdr["draft"].value("kind", "") +
+                               "') is no block drafter this build runs");
+  }
 
   for (int i = 0; i < file.companions(); ++i) {
     const json& h = hdr.at("companions").at(size_t(i));
     const std::string what = companion_label(i);
-    if (is_dflash_companion(h)) {
-      if (sources_.dflash2) throw std::runtime_error(what + "the model has a DFlash2 drafter already");
+    // llama.cpp's DSpark GGUF (its own block, beside a drafter of DFlash2's block), or a drafter of DFlash2's block
+    // (a drafter file's "draft", or an arch "dflash" GGUF).  One DSpark a model, of either.
+    if (is_dspark_companion(h)) {
+      if (!target.dspark_taps)
+        throw std::runtime_error(what + "a DSpark drafter, which a " + target.arch + " model does not run");
+      if (sources_.dspark_gguf || sources_.block == Drafter::kDSpark)
+        throw std::runtime_error(what + "the model has a DSpark drafter already");
       try {
         check_made_for(h, target);
       } catch (const std::exception& e) {
         throw std::runtime_error(what + e.what());
       }
-      sources_.dflash2 = true;
-      sources_.dflash2_beside = true;
-      dflash2_companion_ = i;
+      sources_.dspark_gguf = true;
+      dspark_companion_ = i;
+    } else if (is_dflash_companion(h)) {
+      if (sources_.block != Drafter::kNone) throw std::runtime_error(what + "the model has a block drafter already");
+      try {
+        check_made_for(h, target);
+      } catch (const std::exception& e) {
+        throw std::runtime_error(what + e.what());
+      }
+      sources_.block = GgufMeta::is_header(h) ? Drafter::kDFlash2 : block_drafter_kind(h.at("draft"));
+      if (sources_.block == Drafter::kDSpark && sources_.dspark_gguf)
+        throw std::runtime_error(what + "the model has a DSpark drafter already");
+      sources_.block_beside = true;
+      block_companion_ = i;
     } else if (mtp && GgufMeta::is_header(h) && h.value("arch", "") == target.arch) {
       if (!target.gguf) throw std::runtime_error(what + "an MTP layer from a GGUF file goes with a GGUF model");
       if (sources_.mtp) throw std::runtime_error(what + "the model has its MTP layer already");
@@ -58,26 +80,46 @@ void DrafterRegistry::scan(const ModelFile& file, const TargetSpec& target, cons
 
 const DFlash2Spec& DrafterRegistry::ensure_dflash2_spec(const ModelFile& file, const TargetSpec& target) {
   if (dflash2_spec_) return *dflash2_spec_;
-  const int i = dflash2_companion_;
-  if (i < 0) return dflash2_spec_.emplace(parse_dflash2_json(file.header().at("draft"), target, -1));
+  const int i = block_companion_;
+  if (i < 0) return dflash2_spec_.emplace(parse_dflash2_json(file, file.header().at("draft"), target, -1));
   const json& h = file.header().at("companions").at(size_t(i));
   try {
     dflash2_spec_ = GgufMeta::is_header(h) ? parse_dflash2_gguf(file, h, target, i)
-                                           : parse_dflash2_json(h.at("draft"), target, i);
+                                           : parse_dflash2_json(file, h.at("draft"), target, i);
   } catch (const std::exception& e) {
     throw std::runtime_error(companion_label(i) + e.what());
   }
   return *dflash2_spec_;
 }
 
+const DSparkSpec& DrafterRegistry::ensure_dspark_spec(const ModelFile& file, const TargetSpec& target) {
+  if (dspark_spec_) return *dspark_spec_;
+  const int i = dspark_companion_;
+  const json& h = file.header().at("companions").at(size_t(i));
+  try {
+    dspark_spec_ = parse_dspark_gguf(file, h, target, i);
+  } catch (const std::exception& e) {
+    throw std::runtime_error(companion_label(i) + e.what());
+  }
+  return *dspark_spec_;
+}
+
 void DrafterRegistry::validate_selected(const ModelFile& file, const std::vector<Drafter>& selected,
                                         const TargetSpec& target) {
-  for (Drafter kind : selected)
-    if (kind == Drafter::kDFlash2) (void)ensure_dflash2_spec(file, target);
+  int64_t stride = 0;
+  for (Drafter kind : selected) {
+    if (!is_block_drafter(kind)) continue;
+    const int taps = kind == Drafter::kDSpark && sources_.dspark_gguf ? ensure_dspark_spec(file, target).block.n_taps
+                                                                     : ensure_dflash2_spec(file, target).block.n_taps;
+    stride += int64_t(taps) * target.hidden;
+    if (stride > INT_MAX) throw std::runtime_error("combined drafter feature stride exceeds int32");
+  }
 }
 
 int DrafterRegistry::attach(Drafter kind, const ModelFile& file, Tables& T, const TargetSpec& target,
-                            const MtpHooks* mtp, int* max_drafts_out) {
+                            const MtpHooks* mtp, DrafterReach* reach) {
+  target_layers_ = target.layers;
+  explicit_post_norm_ = target.has_post_norm_tap;
   if (kind == Drafter::kMtp) {
     if (!mtp || !mtp->build_layer || !mtp->tensor_name)
       throw std::runtime_error("MTP drafter is not supported by this model architecture");
@@ -101,24 +143,43 @@ int DrafterRegistry::attach(Drafter kind, const ModelFile& file, Tables& T, cons
     m.ring = T.state(ring);
     const int blk = T.block(b);
     context_blocks_.push_back(blk);
-    if (max_drafts_out) *max_drafts_out = FLYX_MAX_ROWS - 1;
+    *reach = {FLYX_MAX_ROWS - 1, false};
     return blk;
   }
-  if (kind == Drafter::kDFlash2) {
-    const DFlash2Spec& spec = ensure_dflash2_spec(file, target);
-    dflash2_block_ = build_dflash2(T, spec, target);
-    dflash2_taps_ = spec.taps;
-    context_blocks_.push_back(dflash2_block_);
-    if (max_drafts_out) *max_drafts_out = spec.block.block - 1;
-    return dflash2_block_;
+  if (!is_block_drafter(kind)) throw std::runtime_error("unsupported drafter kind in DrafterRegistry::attach");
+  auto record = [&](BlockTaps& attached, int block, const std::vector<int>& taps, DrafterReach r) {
+    attached = {block, taps};
+    context_blocks_.push_back(block);
+    *reach = r;
+    return block;
+  };
+  if (kind == Drafter::kDSpark && sources_.dspark_gguf) {  // its own block, per-row mask embeddings: its block at most
+    const DSparkSpec& spec = ensure_dspark_spec(file, target);
+    return record(dspark_, build_dspark(T, file, spec, target), spec.taps, {spec.block.block - 1, false});
   }
-  throw std::runtime_error("unsupported drafter kind in DrafterRegistry::attach");
+  // DFlash2's block: one shared mask token every row, so its block stretches to a round's rows
+  const DFlash2Spec& spec = ensure_dflash2_spec(file, target);
+  return record(dflash2_, build_dflash2(T, spec, target), spec.taps, {spec.block_drafts(), true});
+}
+
+void DrafterRegistry::BlockTaps::emit(std::vector<flyx_node>* p, int position, int flags) const {
+  for (size_t slot = 0; slot < taps.size(); ++slot)
+    if (taps[slot] == position) p->push_back({FLYX_NODE_TAP, block, int32_t(slot), flags});
+}
+
+void DrafterRegistry::emit_pre_visit_taps(std::vector<flyx_node>* p, int visit_0based) const {
+  dspark_.emit(p, visit_0based, 0);
 }
 
 void DrafterRegistry::emit_taps(std::vector<flyx_node>* p, int layer_1based) const {
-  if (dflash2_block_ < 0) return;
-  for (size_t s = 0; s < dflash2_taps_.size(); ++s)
-    if (dflash2_taps_[s] == layer_1based) p->push_back({FLYX_NODE_TAP, dflash2_block_, int32_t(s), 0});
+  const bool is_post_norm = layer_1based == target_layers_;
+  if (is_post_norm && explicit_post_norm_) return;
+  dflash2_.emit(p, layer_1based, is_post_norm ? FLYX_TAP_NORMED : 0);
+}
+
+void DrafterRegistry::emit_post_norm_taps(std::vector<flyx_node>* p, int n_layers) const {
+  dspark_.emit(p, n_layers, FLYX_TAP_NORMED);
+  dflash2_.emit(p, n_layers, FLYX_TAP_NORMED);
 }
 
 void DrafterRegistry::emit_contexts(std::vector<flyx_node>* p) const {

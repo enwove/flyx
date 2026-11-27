@@ -6,7 +6,6 @@ servers --cors makes, each with its own.
     hardening.py FLYX_EXE TINY_MODEL
 """
 import json
-import os
 from pathlib import Path
 import re
 import socket
@@ -15,8 +14,7 @@ import sys
 import tempfile
 import time
 
-from check_server import Client
-from remembered_model import serve
+from local_server import Client, serve, server_env
 
 DEEP = "[" * 200000 + "]" * 200000
 ME = [{"role": "user", "content": "x"}]
@@ -297,24 +295,7 @@ def check_cors_flag():
     bad = subprocess.run([EXE, "serve", MODEL, "--backend", "cpu_ref", "--cors", "https://chat.example.com/app"],
                          cwd=TMP, env=ENV, capture_output=True, timeout=60)
     assert bad.returncode == 2 and b"--cors https://chat.example.com/app: an origin" in bad.stderr, (bad.returncode, bad.stderr[-300:])
-    with socket.socket() as sock:
-        sock.bind(("127.0.0.1", 0))
-        port = sock.getsockname()[1]
-    server = subprocess.Popen([EXE, "serve", MODEL, "--backend", "cpu_ref", "--ctx", "128", "--port", str(port), "--no-monitor", "--no-browser",
-                               "--cors", "*"], cwd=TMP, env=ENV, stderr=subprocess.PIPE)
-    try:
-        deadline = time.monotonic() + 30
-        while time.monotonic() < deadline and server.poll() is None:
-            try:
-                st, h = Client(f"http://127.0.0.1:{port}", None).get("/health")
-                if st == 200 and h["loaded"]:
-                    break
-            except OSError:
-                pass
-            time.sleep(0.1)
-    finally:
-        server.terminate()
-        said = server.communicate(timeout=20)[1]
+    said = serve(EXE, TMP, ENV, [MODEL], ctx=128, options=["--cors", "*"], expect_name="tiny", stderr=True)
     assert b"--cors '*' without --api-key" in said, said[-400:]
 
 
@@ -329,7 +310,7 @@ def check_all(url):
 if __name__ == "__main__":
     EXE, MODEL = (Path(arg).resolve() for arg in sys.argv[1:])
     with tempfile.TemporaryDirectory() as TMP:
-        ENV = dict(os.environ, APPDATA=TMP, XDG_CONFIG_HOME=TMP, FLYX_BACKEND_DIR=str(EXE.parent))
+        ENV = server_env(TMP, EXE)
         serve(EXE, TMP, ENV, [MODEL], check_all, ctx=128, options=["--no-spec"], expect_name="tiny")
         named = ["--cors", "https://chat.example.com", "--cors", "chrome-extension://abcdefghijklmnop", "--cors", "null", "--cors", "none"]
         for options, check in [(named, check_cors_named), (["--cors", "*"], check_cors_any),

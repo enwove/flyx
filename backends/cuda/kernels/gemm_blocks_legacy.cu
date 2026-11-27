@@ -5,6 +5,8 @@
 
 namespace flyx::cuda {
 
-const BlockOps* block_ops_legacy(int dtype) { return block_ops_of<FQ4_0, FQ4_1, FQ5_0, FQ5_1, FQ8_0>(dtype); }
+const BlockOps* block_ops_legacy(int dtype) {
+  return block_ops_of<FQ4_0, FQ4_1, FQ5_0, FQ5_1, FQ8_0, FMXFP4, FQ2_0>(dtype);
+}
 
 }  // namespace flyx::cuda

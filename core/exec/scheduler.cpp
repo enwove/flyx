@@ -231,6 +231,7 @@ void Scheduler::publish_model() {
   m.device = engine_->device().name;
   m.backend = engine_->backend_name();
   m.drafter = engine_->drafter();
+  m.draft_weights = engine_->draft_weights();
   m.chat_format = chat_.format();
   m.chat_ok = chat_.ok();
   m.chat_native = chat_.native();
@@ -246,12 +247,14 @@ void Scheduler::publish_model() {
   m.max_sessions = max_sessions_;
   m.ledger_budget = engine_->ledger().budget();
   m.load_s = load_s_;
+  m.load_adjustments = engine_->load_adjustments();
   m.ctx_limit = engine_->budget().ctx_limit;
   m.wanted_ctx = engine_->wanted_ctx();
   m.kv_gpu_tokens = std::max(0, std::min(engine_->budget().layout.device_positions, m.max_ctx));
   m.ctx_short = engine_->ctx_short();
   m.sessions_room = engine_->budget().sessions_room;
   m.host_budget = engine_->host_budget();
+  m.ctx_need_more = engine_->budget().ctx_need_more;
   m.held = engine_->budget().held;
   telemetry_.loaded(m, engine_->ledger().used());
 }
@@ -385,12 +388,14 @@ std::shared_ptr<Job> Scheduler::submit(Request in, std::string* err, int* status
   }
   job->in_ = std::move(in);
   const bool prewarm = job->in_.gen.prefill_only;
-  const bool needs_grammar = job->in_.chat && (!job->in_.tools.empty() || job->in_.rules.json);
-  auto warm = [&] {  // Compile on the caller, outside the thread serving other requests' rounds.
+  // The reply's grammar, compiled on the caller, outside the thread serving other requests' rounds.  Whether a reply
+  // has one is its format's to say (tools, a JSON answer, thinking switched off where only a grammar keeps it out):
+  // warm_request asks it, and compiles nothing for a reply that has none.
+  auto warm = [&] {
     std::shared_lock<std::shared_mutex> lock(engine_mu_);
     if (engine_) warm_request(*engine_, job->in_, job->prompt_);
   };
-  if (!prewarm && needs_grammar) warm();
+  if (!prewarm) warm();
   job->queued_at_ = os::now_ms();
   {
     std::lock_guard<std::mutex> lock(mu_);
@@ -411,9 +416,14 @@ std::shared_ptr<Job> Scheduler::submit(Request in, std::string* err, int* status
     auto same = [&](const std::shared_ptr<Job>& other) {
       const Request& a = other->in_;
       const Request& b = job->in_;
-      if (!a.conversation_id.empty() && !b.conversation_id.empty() && a.conversation_id != b.conversation_id)
-        return false;
+      const bool identified = !a.conversation_id.empty() && !b.conversation_id.empty();
+      if (identified && a.conversation_id != b.conversation_id) return false;
       if (b.gen.prefill_only && !a.gen.prefill_only) return false;
+      // A raw prompt is the caller's own text: its bytes say nothing of who sent it, so two clients whose prompts
+      // are the same, or one of which extends the other's, sent two requests.  Without a shared conversation id a
+      // raw prompt replaces only a raw prewarm (no reply anyone waits for; it takes over the prewarm's work), and
+      // neither replaces nor is replaced by a chat request.
+      if ((!a.chat || !b.chat) && !identified && (a.chat != b.chat || !a.gen.prefill_only)) return false;
       if (const size_t end = other->prompt_.conversation_end)
         return job->prompt_.text.compare(0, end, other->prompt_.text, 0, end) == 0 &&
                same_rendered_images_prefix(other->prompt_, job->prompt_, end);
@@ -443,7 +453,7 @@ std::shared_ptr<Job> Scheduler::submit(Request in, std::string* err, int* status
   }
   cv_.notify_all();
   // A prompt prewarm needs no reply grammar itself. Compile for its next turn while its prompt is running.
-  if (prewarm && needs_grammar) warm();
+  if (prewarm) warm();
   return job;
 }
 
@@ -768,6 +778,7 @@ void Scheduler::finish(Running& r) {
   rec.grammar_fixes = res.grammar_fixes;
   rec.superseded = u.finish_reason == FLYX_FINISH_CANCEL && r.job->superseded_.load();
   telemetry_.finish(r.telemetry_id, rec);
+  if (opt_.on_finished) opt_.on_finished(rec);
   telemetry_.memory(engine_->ledger().used(), engine_->host_mapped_in_use(), session_slots(*prefix_cache_));
   JobEvent done{};
   done.kind = JobEvent::kDone;

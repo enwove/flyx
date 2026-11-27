@@ -6,13 +6,11 @@ See https://code.claude.com/docs/en/llm-gateway-protocol#request-headers
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import closing
 import json
-import os
 from pathlib import Path
 import sys
 import tempfile
 
-from check_server import Client, wait_telemetry
-from remembered_model import serve
+from local_server import Client, serve, server_env, wait_telemetry
 
 
 def post(client, path, body, headers):
@@ -118,7 +116,7 @@ def check(url):
 def serve_cases(check):
     exe, asset = (Path(arg).resolve() for arg in sys.argv[1:])
     with tempfile.TemporaryDirectory() as tmp:
-        env = dict(os.environ, APPDATA=tmp, XDG_CONFIG_HOME=tmp, FLYX_BACKEND_DIR=str(exe.parent))
+        env = server_env(tmp, exe)
         template = Path(tmp) / "chat.jinja"
         template.write_text("{% for m in messages %}{{ m.content }}{% endfor %}", encoding="utf-8")
         serve(exe, tmp, env, [asset], check, ctx=8192,

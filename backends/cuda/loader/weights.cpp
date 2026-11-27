@@ -5,6 +5,8 @@
 #include <condition_variable>
 #include <exception>
 
+#include "backends/cuda/loader/exact_bf16.h"
+
 namespace flyx::cuda {
 
 // Persistent worker pool scoped to a single model load so WeightLoader::parallel_rows avoids spawning and joining
@@ -126,107 +128,18 @@ uint16_t float_to_bf16(float f) {
 
 // ---- weights -------------------------------------------------------------------------------
 // Drafts never reach the output (the target verifies each one), so the
-// weights only drafting reads are NVFP4, made at load: a quarter of the bytes;
-// only the acceptance can change.
+// weights only drafting reads are quantized on the fly during bind() via
+// WeightLoader::lin_stack_quant (streaming through a 32 MiB device staging
+// pair so load peak VRAM stays flat):
 // * Draft logits (each MTP step, the DFlash2 block) read the whole head, ~2 ms
-//   in bf16 for Qwen3.5's 248K x 2560: an NVFP4 copy (the target keeps its own).
-// * The MTP layer (projections and fc, bf16 in the checkpoints) runs only for
-//   drafts and their context: quantized in place, the bf16 freed; the DFlash2
-//   drafter too, in NVFP4 beside an NVFP4 target and in Q8_0 (8-bit inputs,
-//   the block kernels) beside GGML block weights.
-// Option draft_weights=exact keeps them exact.
+//   in bf16 for Qwen3.5's 248K x 2560: a 1-bit SignHead or NVFP4 copy (the
+//   target keeps its own).
+// * The MTP layer (projections and fc) runs only for drafts and their context.
+// * The DFlash2 drafter defaults to target-matched precision when VRAM allows
+//   (BF16 beside BF16, Q8_0 beside GGUF, NVFP4 beside NVFP4) and drops to NVFP4
+//   when VRAM is tight.
+// Option draft_weights=auto|nvfp4|q8|exact selects the policy.
 void rows_to_bf16(const float* x, int ldx, int rows, int K, bf16* out, cudaStream_t st);
-
-void quantize_in_place(flyx_bmodel* m, Lin& l, int N, int K) {
-  if (l.q || !l.w || K % 64 != 0) return;  // already NVFP4, or not a shape the NVFP4 GEMMs take
-  l.q = m->alloc<uint8_t>(size_t(N) * K / 2);
-  l.s = m->alloc<uint8_t>(size_t(N) * K / 16);
-  l.rs = m->alloc<float>(N);
-  quantize_nvfp4(l.w, N, K, l.q, l.s, l.rs, 0);
-  CK(cudaDeviceSynchronize());
-  m->release(l.w, size_t(N) * K * sizeof(bf16));
-  l.w = nullptr;
-}
-
-void quantize_packed_in_place(flyx_bmodel* m, Lin& l, int N, int K) {
-  if (!l.packed() || l.q || K % 64 != 0) return;
-  int total_rows = 0;
-  size_t old_bytes = 0;
-  for (const BlockMat& bm : l.blk) {
-    if (!bm.data || bm.rows <= 0) return;
-    total_rows += bm.rows;
-    const BlockLayout lo = blocks_layout(bm.dtype);
-    const size_t per_row = size_t(K) / size_t(lo.values);
-    old_bytes += size_t(bm.rows) * per_row * (size_t(lo.stride) + size_t(lo.scales) * sizeof(uint16_t));
-  }
-  if (total_rows != N) return;
-  // Never inflate ultra-low-bit (2-3 bpw) GGUF drafter weights into 4.5-bpw NVFP4.
-  const size_t new_bytes = size_t(N) * K / 2 + size_t(N) * K / 16 + size_t(N) * sizeof(float);
-  if (old_bytes * 10 < new_bytes * 9) return;
-  uint8_t *q = nullptr, *s = nullptr;
-  float* rs = nullptr;
-  try {
-    q = m->alloc<uint8_t>(size_t(N) * K / 2);
-    s = m->alloc<uint8_t>(size_t(N) * K / 16);
-    rs = m->alloc<float>(N);
-  } catch (const OutOfDeviceMemory&) {
-    if (q) m->release(q, size_t(N) * K / 2);
-    if (s) m->release(s, size_t(N) * K / 16);
-    if (rs) m->release(rs, size_t(N) * sizeof(float));
-    return;
-  }
-  constexpr int kRun = 1024;
-  std::vector<int> ids(kRun);
-  struct DeviceGuard {
-    void* p = nullptr;
-    ~DeviceGuard() {
-      if (p) cudaFree(p);
-    }
-  } dids_g, f32_g, bf16_g;
-  CK(cudaMalloc(&dids_g.p, sizeof(int) * kRun));
-  CK(cudaMalloc(&f32_g.p, sizeof(float) * size_t(kRun) * K));
-  CK(cudaMalloc(&bf16_g.p, sizeof(bf16) * size_t(kRun) * K));
-  int* dids = static_cast<int*>(dids_g.p);
-  float* f32 = static_cast<float*>(f32_g.p);
-  bf16* b16 = static_cast<bf16*>(bf16_g.p);
-  int dst_row = 0;
-  for (const BlockMat& bm : l.blk) {
-    for (int r0 = 0; r0 < bm.rows; r0 += kRun) {
-      const int n = std::min(kRun, bm.rows - r0);
-      for (int i = 0; i < n; ++i) ids[size_t(i)] = r0 + i;
-      CK(cudaMemcpy(dids, ids.data(), sizeof(int) * size_t(n), cudaMemcpyHostToDevice));
-      embed_blocks(dids, bm, K, f32, n, 0);
-      rows_to_bf16(f32, K, n, K, b16, 0);
-      quantize_nvfp4(b16, n, K, q + size_t(dst_row) * K / 2, s + size_t(dst_row) * K / 16, rs + dst_row, 0);
-      dst_row += n;
-    }
-  }
-  CK(cudaDeviceSynchronize());
-  for (const BlockMat& bm : l.blk) {
-    const BlockLayout lo = blocks_layout(bm.dtype);
-    const size_t per_row = size_t(K) / size_t(lo.values);
-    m->release(const_cast<uint8_t*>(bm.data), size_t(bm.rows) * per_row * size_t(lo.stride));
-    m->release(const_cast<uint16_t*>(bm.scales), size_t(bm.rows) * per_row * size_t(lo.scales) * sizeof(uint16_t));
-  }
-  l.blk.clear();
-  l.q = q;
-  l.s = s;
-  l.rs = rs;
-}
-
-// A bf16 matrix as Q8_0 blocks whose inputs are 8 bits (FLYX_ACT_Q8), the bf16 freed: the DFlash2 drafter's
-// projections beside a target of GGML block weights (half their bytes a round).
-void q8_in_place(flyx_bmodel* m, Lin& l, int N, int K) {
-  if (l.packed() || l.q || !l.w || K % 32 != 0) return;
-  const size_t blocks = size_t(N) * (K / 32);
-  uint8_t* payload = m->alloc<uint8_t>(blocks * 32);
-  uint16_t* scales = m->alloc<uint16_t>(blocks);
-  quantize_q8_0(l.w, N, K, payload, scales, 0);
-  CK(cudaDeviceSynchronize());
-  m->release(l.w, size_t(N) * K * sizeof(bf16));
-  l.w = nullptr;
-  l.blk = {BlockMat{payload, scales, FLYX_DT_GGML_Q8_0, N, true}};
-}
 
 namespace {
 
@@ -264,11 +177,21 @@ void release_sign_head(flyx_bmodel* m, SignHead* sh, int N, int K) {
 // the bytes of bf16; the bf16 stays, it may be the embedding table).  The
 // certified head's copy (head_cert) is for speed only: where the GPU has no room
 // for it (device_malloc) the whole head chooses, the same tokens.
+// A softcapped head (softcap > 0) chooses from cap * tanh(z / cap), and the certificate bounds z: two scores it
+// bounds apart can round or saturate to one capped score, where the choice is the lower token id, a column the screen
+// may have cut.  Such a head chooses from the whole head (no copy for it); with no head to certify, no session takes
+// head_certify's scratch.
 void make_head_fp8(flyx_bmodel* m) {
   auto& ko = m->opt.kernels;
   if (!ko.head_fp8 && !ko.head_cert) return;
   for (Block& b : m->blocks)  // the head blocks (m->head_block is only the one drafts read)
     if (auto* h = std::get_if<HeadBlock>(&b); h && h->w && h->hidden % 32 == 0 && !h->w8) {
+      if (!ko.head_fp8 && h->softcap > 0.f) {
+        if (m->verbose)
+          std::fprintf(stderr, "flyx-cuda: no certified head for a softcapped head (softcap %g); the whole head\n",
+                       double(h->softcap));
+        continue;
+      }
       try {
         h->w8 = m->alloc<uint8_t>(size_t(h->vocab) * h->hidden);
         h->rs8 = m->alloc<float>(h->vocab);
@@ -289,6 +212,12 @@ void make_head_fp8(flyx_bmodel* m) {
                        double(h->vocab) * h->hidden / 1e6, h->vocab, h->hidden);
       }
     }
+  if (ko.head_cert && !ko.head_fp8) {
+    bool any = false;
+    for (const Block& b : m->blocks)
+      if (const auto* h = std::get_if<HeadBlock>(&b); h && h->cert) any = true;
+    ko.head_cert = any;
+  }
   CK(cudaDeviceSynchronize());
 }
 
@@ -386,6 +315,11 @@ uint64_t trim(flyx_bmodel* m, uint64_t bytes) {
     heads([&](HeadBlock& h) {
       if (h.coarse.bits || h.coarse.scales) release_sign_head(m, &h.coarse, h.vocab, h.hidden);
     });
+    if (m->dspark_block >= 0) {  // read only beside the head's, and made only of a Markov head of the head's rows
+      auto& d = block<DSparkBlock>(m, m->dspark_block);
+      if (d.markov_coarse.bits || d.markov_coarse.scales)
+        release_sign_head(m, &d.markov_coarse, block<HeadBlock>(m, d.head).vocab, d.markov_rank);
+    }
     if (m->verbose && pre_coarse != m->bytes)
       std::fprintf(stderr, "flyx-cuda: 1-bit draft head given back (%.2f GB): drafts read the full head\n",
                    double(pre_coarse - m->bytes) / 1e9);
@@ -396,20 +330,6 @@ uint64_t trim(flyx_bmodel* m, uint64_t bytes) {
 }
 
 namespace {
-
-enum class TargetQuant { kFloat, kNvfp4, kPacked };
-
-// Target precision from its own MLP layers (excluding MTP's own MLP, which is quantized separately).
-TargetQuant target_quant_kind(const flyx_bmodel* m) {
-  bool fp4 = false, packed = false;
-  const int mtp_mlp = m->mtp_block >= 0 ? block<MtpBlock>(m, m->mtp_block).mlp : -1;
-  for (size_t i = 0; i < m->blocks.size(); ++i)
-    if (const auto* f = std::get_if<MlpBlock>(&m->blocks[i]); f && int(i) != mtp_mlp) {
-      fp4 = fp4 || f->w_gu.q;
-      packed = packed || f->w_gu.packed();
-    }
-  return fp4 ? TargetQuant::kNvfp4 : packed ? TargetQuant::kPacked : TargetQuant::kFloat;
-}
 
 // Unified 1-bit SignHead builder for either a bf16 matrix (w) or a packed GGML BlockMat (wb).
 // Returns false without throwing if the GPU lacks room (caller falls back cleanly to the full matrix).
@@ -461,62 +381,15 @@ bool make_sign_head_for(flyx_bmodel* m, const bf16* w, const BlockMat* wb, int N
   return true;
 }
 
-// Quantize MTP's single sequential layer to NVFP4 (both BF16 and Q8_0/packed checkpoints).
-void quantize_mtp_weights(flyx_bmodel* m) {
-  if (m->mtp_block < 0) return;
-  auto& b = block<MtpBlock>(m, m->mtp_block);
-  auto& a = block<AttnBlock>(m, b.attn);
-  auto& f = block<MlpBlock>(m, b.mlp);
-  const size_t before = m->bytes;
-  auto q_mtp = [&](Lin& l, int N, int K) {
-    if (l.packed()) quantize_packed_in_place(m, l, N, K);
-    else quantize_in_place(m, l, N, K);
-  };
-  q_mtp(b.fc, a.hidden, 2 * a.hidden);
-  q_mtp(a.w_in, a.n_in(), a.hidden);
-  q_mtp(a.w_out, a.hidden, a.nh * a.hd);
-  q_mtp(f.w_gu, 2 * f.inter, f.hidden);
-  q_mtp(f.w_down, f.hidden, f.inter);
-  if (m->verbose && m->bytes != before)
-    std::fprintf(stderr, "flyx-cuda: MTP layer -> NVFP4 (VRAM delta %+.2f GB)\n",
-                 double(int64_t(m->bytes) - int64_t(before)) / 1e9);
-}
-
-// Shared block-drafter weight policy (DFlash2 and future parallel block drafters): quantize BF16 projections to
-// NVFP4 beside an NVFP4 target (drafted against a BF16 target NVFP4 lost 9% acceptance, -2.6% overall; NVFP4 target
-// +9.6%) or Q8_0 beside GGML block weights (the 27B's drafter reads 3.3 GB of bf16 a round), leaving already-quantized
-// block drafters intact.
-void quantize_block_drafter_weights(flyx_bmodel* m, TargetQuant tq) {
-  if (tq == TargetQuant::kFloat) return;
-  auto copy = [&](Lin& l, int N, int K) {
-    if (tq == TargetQuant::kNvfp4) quantize_in_place(m, l, N, K);
-    else q8_in_place(m, l, N, K);
-  };
-  if (m->dflash_block >= 0) {
-    auto& d = block<DFlashBlock>(m, m->dflash_block);
-    const int H = d.hidden, TG = d.conv_taps * (H / d.conv_group), nqkv = (d.nh + 2 * d.nkv) * d.hd;
-    for (int j = 0; j < d.layers(); ++j) {
-      auto& l = block<DFlashLayer>(m, d.first_layer + j);
-      copy(l.attn_proj, 2 * TG, H);
-      copy(l.w_qkv, nqkv, H);
-      copy(l.w_o, H, d.nh * d.hd);
-      copy(l.mlp_proj, 2 * TG, H);
-      copy(l.w_gu, 2 * d.inter, H);
-      copy(l.w_down, H, d.inter);
-    }
-    copy(d.fc, H, d.n_taps * d.target_hidden);
-    copy(d.ctx, d.ctx_width(), H);
-    copy(d.sel_hid, d.sel_rank, H);
-  }
-}
-
 }  // namespace
 
+// Drafter linears were stream-quantized as Pass 2 of bind() uploaded them (WeightLoader::lin_stack_quant); what is
+// left here are the head copies drafts pick candidates from, for every drafter that reads the target's head (MTP,
+// DFlash2, DSpark).
 void make_draft_weights(flyx_bmodel* m) {
-  if (m->opt.exact_drafts || (m->mtp_block < 0 && m->dflash_block < 0)) return;
-  // Quantize drafter layers first so freed VRAM is available for optional 1-bit SignHead copies.
-  quantize_mtp_weights(m);
-  quantize_block_drafter_weights(m, target_quant_kind(m));
+  if (m->opt.draft_weights == interfaces::DraftWeightsMode::kExact ||
+      (m->mtp_block < 0 && m->dflash_block < 0 && m->dspark_block < 0))
+    return;
 
   auto& h = block<HeadBlock>(m, m->head_block);
   const bool want_sign =
@@ -525,10 +398,33 @@ void make_draft_weights(flyx_bmodel* m) {
     make_sign_head_for(m, h.wb.data ? nullptr : h.w, h.wb.data ? &h.wb : nullptr, h.vocab, h.hidden, &h.coarse,
                        "draft head");
   } else if (!h.wb.data && h.w && h.hidden % 32 == 0) {
-    h.draft.q = m->alloc<uint8_t>(size_t(h.vocab) * h.hidden / 2);
-    h.draft.s = m->alloc<uint8_t>(size_t(h.vocab) * h.hidden / 16);
-    h.draft.rs = m->alloc<float>(h.vocab);
+    const size_t VH = size_t(h.vocab) * size_t(h.hidden);
+    try {
+      h.draft.q = m->alloc<uint8_t>(VH / 2);
+      h.draft.s = m->alloc<uint8_t>(VH / 16);
+      h.draft.rs = m->alloc<float>(h.vocab);
+    } catch (const OutOfDeviceMemory& e) {
+      if (h.draft.q) m->release(h.draft.q, VH / 2);
+      if (h.draft.s) m->release(h.draft.s, VH / 16);
+      if (h.draft.rs) m->release(h.draft.rs, size_t(h.vocab) * sizeof(float));
+      h.draft = Lin{};
+      if (m->verbose)
+        std::fprintf(stderr, "flyx-cuda: no room for NVFP4 draft head (%s); reading bf16 head\n", e.what());
+      return;
+    }
     quantize_nvfp4(h.w, h.vocab, h.hidden, h.draft.q, h.draft.s, h.draft.rs, 0);
+  }
+  // DSpark's drafts add its Markov head's logits to the target head's: the candidates are picked from both heads'
+  // 1-bit copies together (draft_head_pick_additive_step), so the Markov head gets a copy when the target head has
+  // one.  Without it DSpark reads both heads whole, and a copy of the target head no other drafter reads goes back.
+  if (m->dspark_block >= 0) {
+    auto& d = block<DSparkBlock>(m, m->dspark_block);
+    const BlockMat* packed = d.markov_w2.packed() && d.markov_w2.blk.size() == 1 ? &d.markov_w2.blk[0] : nullptr;
+    const bool same_rows = (d.vocab_out > 0 ? d.vocab_out : h.vocab) == h.vocab && d.head == m->head_block;
+    const bool made = h.coarse.bits && same_rows &&
+                      make_sign_head_for(m, d.markov_w2.w, packed, h.vocab, d.markov_rank, &d.markov_coarse,
+                                         "DSpark Markov head");
+    if (!made && m->mtp_block < 0 && m->dflash_block < 0) release_sign_head(m, &h.coarse, h.vocab, h.hidden);
   }
 }
 
@@ -572,7 +468,10 @@ void ggml_nvfp4_planes(const flyx_tensor_view* v, const std::function<size_t(siz
 
 // ---- WeightLoader --------------------------------------------------------------------------
 WeightLoader::WeightLoader(flyx_bmodel* model, const flyx_model_desc& desc)
-    : m_(model), weights_(desc.weights), n_weights_(desc.n_weights) {}
+    : m_(model),
+      weights_(desc.weights),
+      n_weights_(desc.n_weights),
+      asked_(size_t(std::max(desc.n_weights, 0))) {}
 
 WeightLoader::~WeightLoader() = default;
 
@@ -592,10 +491,12 @@ void WeightLoader::finish() {
     CK(cudaStreamSynchronize(staging_->st));
     staging_.reset();
   }
+  packed_scratch_.reset();
 }
 
 const flyx_tensor_view* WeightLoader::t(int w) const {
   if (w < 0 || w >= n_weights_ || !weights_[w].t) throw std::runtime_error("weight " + std::to_string(w) + " missing");
+  asked_[size_t(w)] = true;
   return weights_[w].t;
 }
 
@@ -625,15 +526,15 @@ void WeightLoader::upload_staged(void* dst, const void* src, size_t bytes) {
     const size_t n = std::min(LoadStaging::kBytes, bytes - off);
     const int b = S.next;
     S.next ^= 1;
-    CK(cudaEventSynchronize(S.done[b]));
+    CK(cudaEventSynchronize(S.slots[b].done));
     const size_t stripes = (n + kStripe - 1) / kStripe;
     parallel_rows(stripes, [&](size_t a, size_t e) {
       const size_t p0 = a * kStripe;
       const size_t p1 = std::min(n, e * kStripe);
-      std::memcpy(S.buf[b] + p0, in + off + p0, p1 - p0);
+      std::memcpy(S.slots[b].buf + p0, in + off + p0, p1 - p0);
     });
-    CK(cudaMemcpyAsync(out + off, S.buf[b], n, cudaMemcpyHostToDevice, S.st));
-    CK(cudaEventRecord(S.done[b], S.st));
+    CK(cudaMemcpyAsync(out + off, S.slots[b].buf, n, cudaMemcpyHostToDevice, S.st));
+    CK(cudaEventRecord(S.slots[b].done, S.st));
   }
 }
 
@@ -694,11 +595,11 @@ void WeightLoader::put_bf16(bf16* dst, int w, const RowOrder& order, bool host) 
     const size_t nr = std::min(chunk, rows - r0);
     const int b = S.next;
     S.next ^= 1;
-    CK(cudaEventSynchronize(S.done[b]));
-    auto* hp = reinterpret_cast<uint16_t*>(S.buf[b]);
+    CK(cudaEventSynchronize(S.slots[b].done));
+    auto* hp = reinterpret_cast<uint16_t*>(S.slots[b].buf);
     parallel_rows(nr, [&](size_t a, size_t e) { convert_rows(r0 + a, e - a, hp + a * K); });
     CK(cudaMemcpyAsync(dst + r0 * K, hp, nr * row_bytes, cudaMemcpyHostToDevice, S.st));
-    CK(cudaEventRecord(S.done[b], S.st));
+    CK(cudaEventRecord(S.slots[b].done, S.st));
   }
 }
 
@@ -737,7 +638,35 @@ bool WeightLoader::packable(int w) const {
   return m_->opt.packed_blocks && v->ndim == 2 && blocks_supported(v->dtype, int(v->shape[1]));
 }
 
+bool WeightLoader::can_stack(const std::vector<int>& ws) const {
+  if (ws.empty()) return false;
+  const int w0 = ws[0];
+  const bool p0 = packable(w0);
+  const auto is_fp4 = [&](int w) { return t(w)->dtype == FLYX_DT_NVFP4 || t(w)->dtype == FLYX_DT_GGML_NVFP4; };
+  const bool f0 = is_fp4(w0);
+  const int64_t K0 = t(w0)->shape[1];
+  for (int w : ws) {
+    if (t(w)->ndim != 2 || t(w)->shape[1] != K0) return false;
+    if (packable(w) != p0 || is_fp4(w) != f0) return false;
+    if (p0 && weights_[w].activations != weights_[w0].activations) return false;
+  }
+  return true;
+}
+
 Lin WeightLoader::lin_stack(const std::vector<int>& ws, int* rows_out, const std::vector<RowOrder>& orders) {
+  bool any_order = false;
+  for (const auto& o : orders)
+    if (o) any_order = true;
+  if (!any_order) {
+    if (auto it = lins_.find(ws); it != lins_.end()) {
+      if (rows_out) {
+        int r = 0;
+        for (int w : ws) r += int(t(w)->shape[0]);
+        *rows_out = r;
+      }
+      return it->second;
+    }
+  }
   Lin L;
   bool all_packable = true;
   for (int w : ws) all_packable = all_packable && packable(w) && t(w)->shape[1] == t(ws[0])->shape[1];
@@ -757,6 +686,7 @@ Lin WeightLoader::lin_stack(const std::vector<int>& ws, int* rows_out, const std
       i = end;
     }
     if (rows_out) *rows_out = rows;
+    if (!any_order) lins_[ws] = L;
     return L;
   }
   // NVFP4, ModelOpt's or GGML's (repacked: ggml_nvfp4_planes).
@@ -765,7 +695,9 @@ Lin WeightLoader::lin_stack(const std::vector<int>& ws, int* rows_out, const std
   for (int w : ws)
     if (is_fp4(w) != fp4) throw std::runtime_error(std::string(t(w)->name) + ": mixed weight formats in one stack");
   if (!fp4) {
-    L.w = stack(ws, rows_out, orders);
+    L.w = (!any_order && ws.size() == 1) ? mat(ws[0]) : stack(ws, rows_out, orders);
+    if (rows_out && !any_order && ws.size() == 1) *rows_out = int(t(ws[0])->shape[0]);
+    if (!any_order) lins_[ws] = L;
     return L;
   }
   size_t rows = 0;
@@ -790,7 +722,9 @@ Lin WeightLoader::lin_stack(const std::vector<int>& ws, int* rows_out, const std
                              [&](size_t n, const auto& fn) { parallel_rows(n, fn); });
       upload_staged(L.q + r0 * K / 2, q.data(), q.size());
       upload_staged(L.s + r0 * K / 16, sc.data(), sc.size());
-      std::vector<float> one(nr, 1.f);
+      float g_scale = 1.f;
+      if (weights_[w].scale2) g_scale = static_cast<float>(flyx::ops::load(weights_[w].scale2, 0));
+      std::vector<float> one(nr, g_scale);
       CK(cudaMemcpy(L.rs + r0, one.data(), nr * 4, cudaMemcpyHostToDevice));
       r0 += nr;
       continue;
@@ -807,6 +741,405 @@ Lin WeightLoader::lin_stack(const std::vector<int>& ws, int* rows_out, const std
     r0 += nr;
   }
   if (rows_out) *rows_out = int(rows);
+  if (!any_order) lins_[ws] = L;
+  return L;
+}
+
+ExpertMat WeightLoader::expert_mat(int w) {
+  if (auto it = experts_.find(w); it != experts_.end()) return it->second;
+  const auto* v = t(w);
+  const auto layout = expert_layout(weights_[w], m_->opt.packed_blocks);
+  const size_t E = size_t(v->shape[0]), N = size_t(v->shape[1]), K = size_t(v->shape[2]);
+  const size_t total_rows = layout.rows;
+  ExpertMat em{};
+  em.n_experts = int(E);
+  em.N = int(N);
+
+  // Optional per-expert F32 scale tensor (present on GGML NVFP4 and on requantized MoE experts in Unsloth GGUFs).
+  auto upload_expert_scales = [&]() -> float* {
+    const auto* s2 = weights_[w].scale2;
+    if (!layout.expert_scales) return nullptr;
+    float* rs_dev = m_->alloc<float>(layout.expert_scales);
+    std::vector<float> rs_host(E, 1.f);
+    if (s2) {
+      const size_t sn = numel(s2);
+      if (sn == E)
+        for (size_t i = 0; i < E; ++i) rs_host[i] = static_cast<float>(flyx::ops::load(s2, i));
+      else if (sn == 1)
+        std::fill(rs_host.begin(), rs_host.end(), static_cast<float>(flyx::ops::load(s2, 0)));
+      else
+        throw std::runtime_error(std::string(v->name) + ": unexpected per-expert scale length");
+    }
+    CK(cudaMemcpy(rs_dev, rs_host.data(), E * sizeof(float), cudaMemcpyHostToDevice));
+    return rs_dev;
+  };
+
+  if (layout.format == ExpertLayout::nvfp4) {
+    const size_t per_row = K / 64;
+    const size_t q_row = layout.payload_row, s_row = layout.scales_row, file_row = per_row * 36;
+    uint8_t* q_dev = m_->alloc<uint8_t>(layout.payload_bytes());
+    uint8_t* s_dev = m_->alloc<uint8_t>(layout.scale_bytes());
+    const auto* file = static_cast<const uint8_t*>(v->data);
+    times_.file_bytes += total_rows * file_row;
+    if (!staging_) staging_ = std::make_unique<LoadStaging>();
+    LoadStaging& S = *staging_;
+    const size_t chunk = std::max<size_t>(1, (LoadStaging::kBytes - 16) / (q_row + s_row));
+    for (size_t r0 = 0; r0 < total_rows; r0 += chunk) {
+      const size_t nr = std::min(chunk, total_rows - r0);
+      const int b = S.next;
+      S.next ^= 1;
+      const double t0 = load_clock();
+      CK(cudaEventSynchronize(S.slots[b].done));
+      const double t1 = load_clock();
+      uint8_t* hq = S.slots[b].buf;
+      uint8_t* hs = hq + (nr * q_row + 15) / 16 * 16;
+      parallel_rows(nr, [&](size_t a, size_t e) {
+        for (size_t r = a; r < e; ++r) {
+          const uint8_t* in = file + (r0 + r) * file_row;
+          uint8_t* qo = hq + r * q_row;
+          uint8_t* so = hs + r * s_row;
+          for (size_t k = 0; k < per_row; ++k, in += 36) {
+            const uint8_t* d = in;
+            const uint8_t* qs = in + 4;
+            for (int g = 0; g < 4; ++g) {
+              if (d[g] == 0xFF)
+                throw std::runtime_error(std::string(v->name) + ": an NVFP4 scale of 0xFF (no e4m3 holds it)");
+              so[4 * k + size_t(g)] = d[g] == 0x7F ? 0 : uint8_t(d[g] & 0x7F);
+              auto code = [&](int l) { return l < 8 ? qs[8 * g + l] & 15 : qs[8 * g + l - 8] >> 4; };
+              for (int i = 0; i < 8; ++i)
+                qo[32 * k + 8 * size_t(g) + size_t(i)] = uint8_t(code(2 * i) | code(2 * i + 1) << 4);
+            }
+          }
+        }
+      });
+      CK(cudaMemcpyAsync(q_dev + r0 * q_row, hq, nr * q_row, cudaMemcpyHostToDevice, S.st));
+      CK(cudaMemcpyAsync(s_dev + r0 * s_row, hs, nr * s_row, cudaMemcpyHostToDevice, S.st));
+      CK(cudaEventRecord(S.slots[b].done, S.st));
+      times_.copy_s += t1 - t0;
+      times_.pack_s += load_clock() - t1;
+    }
+    em.q = q_dev;
+    em.s = s_dev;
+    em.rs = upload_expert_scales();
+    return experts_[w] = em;
+  }
+
+  if (layout.format == ExpertLayout::ggml_blocks) {
+    blocks_init();
+    const BlockLayout l = blocks_layout(v->dtype);
+    const size_t per_row = K / size_t(l.values);
+    const size_t row_bytes = layout.payload_row, row_scales = layout.scales_row / sizeof(uint16_t);
+    const size_t file_row = per_row * size_t(l.bytes);
+    uint8_t* data = m_->alloc<uint8_t>(layout.payload_bytes());
+    uint16_t* scales = m_->alloc<uint16_t>(layout.scale_bytes() / sizeof(uint16_t));
+    const auto* file = static_cast<const uint8_t*>(v->data);
+    times_.file_bytes += total_rows * file_row;
+    if (!staging_) staging_ = std::make_unique<LoadStaging>();
+    LoadStaging& S = *staging_;
+    const size_t scale_bytes = row_scales * sizeof(uint16_t);
+    const size_t chunk = std::max<size_t>(1, (LoadStaging::kBytes - 16) / (row_bytes + scale_bytes));
+    const int dtype = v->dtype;
+    for (size_t r0 = 0; r0 < total_rows; r0 += chunk) {
+      const size_t nr = std::min(chunk, total_rows - r0);
+      const int b = S.next;
+      S.next ^= 1;
+      const double t0 = load_clock();
+      CK(cudaEventSynchronize(S.slots[b].done));
+      const double t1 = load_clock();
+      uint8_t* hp = S.slots[b].buf;
+      auto* hs = reinterpret_cast<uint16_t*>(hp + (nr * row_bytes + 15) / 16 * 16);
+      parallel_rows(nr, [&](size_t a, size_t e) {
+        blocks_pack(dtype, file + (r0 + a) * file_row, (e - a) * per_row, hp + a * row_bytes, hs + a * row_scales);
+      });
+      CK(cudaMemcpyAsync(data + r0 * row_bytes, hp, nr * row_bytes, cudaMemcpyHostToDevice, S.st));
+      CK(cudaMemcpyAsync(scales + r0 * row_scales, hs, nr * scale_bytes, cudaMemcpyHostToDevice, S.st));
+      CK(cudaEventRecord(S.slots[b].done, S.st));
+      times_.copy_s += t1 - t0;
+      times_.pack_s += load_clock() - t1;
+    }
+    em.blk = BlockMat{data, scales, v->dtype, int(total_rows), weights_[w].activations == FLYX_ACT_Q8};
+    em.rs = upload_expert_scales();
+    return experts_[w] = em;
+  }
+
+  // Fallback: BF16 on device (handles BF16, F16, F32, or blocks=bf16).
+  if (!numbers(v)) throw std::runtime_error(std::string(v->name) + ": unsupported expert dtype");
+  const size_t bytes = layout.payload_bytes();
+  bf16* dst = m_->alloc<bf16>(bytes / sizeof(bf16));
+  if (v->dtype == FLYX_DT_BF16) {
+    upload_staged(dst, v->data, bytes);
+  } else {
+    const size_t row_bytes = K * sizeof(uint16_t);
+    auto conv_rows = [&](size_t r0, size_t count, uint16_t* out) {
+      for (size_t i = 0; i < count; ++i) {
+        const size_t from = (r0 + i) * K;
+        for (size_t k = 0; k < K; ++k)
+          out[i * K + k] = float_to_bf16(static_cast<float>(flyx::ops::load(v, from + k)));
+      }
+    };
+    if (bytes < (size_t(1) << 20)) {
+      std::vector<uint16_t> h(total_rows * K);
+      parallel_rows(total_rows, [&](size_t a, size_t e) { conv_rows(a, e - a, h.data() + a * K); });
+      CK(cudaMemcpy(dst, h.data(), bytes, cudaMemcpyHostToDevice));
+    } else {
+      if (!staging_) staging_ = std::make_unique<LoadStaging>();
+      LoadStaging& S = *staging_;
+      const size_t chunk = std::max<size_t>(1, LoadStaging::kBytes / row_bytes);
+      for (size_t r0 = 0; r0 < total_rows; r0 += chunk) {
+        const size_t nr = std::min(chunk, total_rows - r0);
+        const int b = S.next;
+        S.next ^= 1;
+        CK(cudaEventSynchronize(S.slots[b].done));
+        auto* hp = reinterpret_cast<uint16_t*>(S.slots[b].buf);
+        parallel_rows(nr, [&](size_t a, size_t e) { conv_rows(r0 + a, e - a, hp + a * K); });
+        CK(cudaMemcpyAsync(dst + r0 * K, hp, nr * row_bytes, cudaMemcpyHostToDevice, S.st));
+        CK(cudaEventRecord(S.slots[b].done, S.st));
+      }
+    }
+  }
+  em.w = dst;
+  em.rs = upload_expert_scales();
+  return experts_[w] = em;
+}
+
+PackedQuantScratch::~PackedQuantScratch() {
+  if (dids) cudaFree(dids);
+  if (d_data) cudaFree(d_data);
+  if (d_scales) cudaFree(d_scales);
+  if (f32) cudaFree(f32);
+  if (b16) cudaFree(b16);
+}
+
+void PackedQuantScratch::ensure(size_t run, size_t max_row_bytes, size_t max_row_scales, size_t K, cudaStream_t st) {
+  auto grow = [&](auto*& ptr, size_t& cap, size_t need) {
+    if (need <= cap) return false;
+    if (ptr) {
+      CK(cudaStreamSynchronize(st));
+      cudaFree(ptr);
+      ptr = nullptr;
+      cap = 0;
+    }
+    ptr = static_cast<std::remove_reference_t<decltype(ptr)>>(device_malloc(need * sizeof(*ptr)));
+    cap = need;
+    return true;
+  };
+  if (grow(dids, cap_ids, run)) {
+    std::vector<int> ids(run);
+    for (size_t i = 0; i < run; ++i) ids[i] = int(i);
+    CK(cudaMemcpyAsync(dids, ids.data(), sizeof(int) * run, cudaMemcpyHostToDevice, st));
+    CK(cudaStreamSynchronize(st));
+  }
+  grow(d_data, cap_data, run * max_row_bytes);
+  grow(d_scales, cap_scales, run * max_row_scales);
+  grow(f32, cap_f32, run * K);
+  grow(b16, cap_b16, run * K);
+}
+
+Lin WeightLoader::pack_quantize_nvfp4(const std::vector<int>& ws, int* rows_out, const std::vector<RowOrder>& orders) {
+  blocks_init();
+  const size_t K = size_t(t(ws[0])->shape[1]);
+  size_t rows = 0, max_row_bytes = 0, max_row_scales = 0;
+  for (int w : ws) {
+    const auto* v = t(w);
+    const BlockLayout lo = blocks_layout(v->dtype);
+    const size_t per_row = K / size_t(lo.values);
+    rows += size_t(v->shape[0]);
+    max_row_bytes = std::max(max_row_bytes, per_row * size_t(lo.stride));
+    max_row_scales = std::max(max_row_scales, per_row * size_t(lo.scales));
+  }
+  if (rows_out) *rows_out = int(rows);
+  Lin L;
+  if (rows == 0) return L;
+  L.q = m_->alloc<uint8_t>(rows * K / 2);
+  L.s = m_->alloc<uint8_t>(rows * K / 16);
+  L.rs = m_->alloc<float>(rows);
+
+  // Stream each tensor in bounded row chunks (~16 MiB float32 staging) directly into NVFP4 without
+  // touching WeightLoader::packs_ or allocating full-matrix packed buffers alongside the output.
+  if (!staging_) staging_ = std::make_unique<LoadStaging>();
+  if (!packed_scratch_) packed_scratch_ = std::make_unique<PackedQuantScratch>();
+  cudaStream_t st = staging_->st;
+  const size_t kRun = std::max<size_t>(1, std::min<size_t>(1024, (size_t(16) << 20) / (K * sizeof(float))));
+  packed_scratch_->ensure(kRun, max_row_bytes, max_row_scales, K, st);
+  int* dids = packed_scratch_->dids;
+  uint8_t* d_data = packed_scratch_->d_data;
+  uint16_t* d_scales = packed_scratch_->d_scales;
+  float* f32 = packed_scratch_->f32;
+  bf16* b16 = packed_scratch_->b16;
+
+  std::vector<uint8_t> h_data(kRun * max_row_bytes);
+  std::vector<uint16_t> h_scales(kRun * max_row_scales);
+
+  size_t dst_row = 0;
+  for (size_t i = 0; i < ws.size(); ++i) {
+    const int w = ws[i];
+    const auto* v = t(w);
+    const BlockLayout lo = blocks_layout(v->dtype);
+    const size_t nrows = size_t(v->shape[0]);
+    const size_t per_row = K / size_t(lo.values);
+    const size_t row_bytes = per_row * size_t(lo.stride);
+    const size_t row_scales = per_row * size_t(lo.scales);
+    const size_t file_row = per_row * size_t(lo.bytes);
+    const auto* file = static_cast<const uint8_t*>(v->data);
+    const int dtype = v->dtype;
+    const RowOrder none, &order = i < orders.size() ? orders[i] : none;
+    times_.file_bytes += nrows * file_row;
+    for (size_t r0 = 0; r0 < nrows; r0 += kRun) {
+      const size_t n = std::min(kRun, nrows - r0);
+      const double t0 = load_clock();
+      parallel_rows(n, [&](size_t a, size_t e) {
+        if (!order) {
+          blocks_pack(dtype, file + (r0 + a) * file_row, (e - a) * per_row, h_data.data() + a * row_bytes,
+                      h_scales.data() + a * row_scales);
+        } else {
+          for (size_t r = a; r < e; ++r)
+            blocks_pack(dtype, file + order(r0 + r) * file_row, per_row, h_data.data() + r * row_bytes,
+                        h_scales.data() + r * row_scales);
+        }
+      });
+      times_.pack_s += load_clock() - t0;
+      CK(cudaMemcpyAsync(d_data, h_data.data(), n * row_bytes, cudaMemcpyHostToDevice, st));
+      CK(cudaMemcpyAsync(d_scales, h_scales.data(), n * row_scales * sizeof(uint16_t), cudaMemcpyHostToDevice, st));
+      const BlockMat chunk_bm{d_data, d_scales, dtype, int(n), false};
+      embed_blocks(dids, chunk_bm, int(K), f32, int(n), st);
+      rows_to_bf16(f32, int(K), int(n), int(K), b16, st);
+      quantize_nvfp4(b16, int(n), int(K), L.q + dst_row * K / 2, L.s + dst_row * K / 16, L.rs + dst_row, st);
+      CK(cudaStreamSynchronize(st));
+      dst_row += n;
+    }
+  }
+  return L;
+}
+
+Lin WeightLoader::lin_stack_quant(const std::vector<int>& ws, DraftQuant q, int* rows_out,
+                                  const std::vector<RowOrder>& orders) {
+  if (ws.empty() || q == DraftQuant::kNone) return lin_stack(ws, rows_out, orders);
+
+  // Pre-quantized GGML block weights: keep packed unless NVFP4 was requested AND streaming into NVFP4
+  // meaningfully shrinks the additional GPU bytes needed (never inflating 2-3 bpw or ~4.5-5 bpw Q4_K_M,
+  // and never releasing shared WeightLoader::packs_ entries).
+  bool all_packable = true;
+  for (int w : ws) all_packable = all_packable && packable(w) && t(w)->shape[1] == t(ws[0])->shape[1];
+  if (all_packable) {
+    if (q != DraftQuant::kNvfp4 || m_->opt.draft_weights != interfaces::DraftWeightsMode::kNvfp4)
+      return lin_stack(ws, rows_out, orders);
+    const size_t K = size_t(t(ws[0])->shape[1]);
+    size_t rows = 0, added_packed_bytes = 0;
+    for (size_t i = 0; i < ws.size();) {
+      size_t end = i + 1;
+      while (end < ws.size() && t(ws[end])->dtype == t(ws[i])->dtype) ++end;
+      const BlockLayout lo = blocks_layout(t(ws[i])->dtype);
+      const size_t per_row = K / size_t(lo.values);
+      size_t run_rows = 0;
+      for (size_t j = i; j < end; ++j) run_rows += size_t(t(ws[j])->shape[0]);
+      rows += run_rows;
+      const bool has_order = i < orders.size() && bool(orders[i]);
+      // A single-tensor run already cached in packs_ costs 0 extra GPU bytes if kept packed.
+      const bool cached = (end - i == 1) && !has_order && packs_.find(ws[i]) != packs_.end();
+      if (!cached)
+        added_packed_bytes += run_rows * per_row * (size_t(lo.stride) + size_t(lo.scales) * sizeof(uint16_t));
+      i = end;
+    }
+    const size_t new_bytes = rows * K / 2 + rows * K / 16 + rows * sizeof(float);
+    if (K % 64 == 0 && added_packed_bytes * 10 >= new_bytes * 11)
+      return pack_quantize_nvfp4(ws, rows_out, orders);
+    return lin_stack(ws, rows_out, orders);
+  }
+
+  // Already NVFP4: upload planes directly.
+  auto is_fp4 = [&](int w) { return t(w)->dtype == FLYX_DT_NVFP4 || t(w)->dtype == FLYX_DT_GGML_NVFP4; };
+  const bool fp4 = is_fp4(ws[0]);
+  for (int w : ws)
+    if (is_fp4(w) != fp4) throw std::runtime_error(std::string(t(w)->name) + ": mixed weight formats in one stack");
+  if (fp4) return lin_stack(ws, rows_out, orders);
+
+  const size_t K = size_t(t(ws[0])->shape[1]);
+  size_t rows = 0;
+  for (int w : ws) {
+    const auto* v = t(w);
+    if (!numbers(v)) throw std::runtime_error(std::string(v->name) + ": a bf16 matrix from this dtype");
+    if (v->ndim != 2 || size_t(v->shape[1]) != K)
+      throw std::runtime_error(std::string(v->name) + ": stacked linear width mismatch");
+    rows += size_t(v->shape[0]);
+  }
+  const size_t row_bytes = quant_row_bytes(K, t(ws[0])->name);
+  if ((q == DraftQuant::kNvfp4 && K % 64 != 0) || (q == DraftQuant::kQ8 && K % 32 != 0))
+    return lin_stack(ws, rows_out, orders);
+
+  // Allocate ONLY the final quantized output buffers and stream row chunks through a 2 x 16 MiB
+  // double-buffered device BF16 staging pair on staging_->st (zero BF16 VRAM spike, no per-matrix sync).
+  Lin L;
+  uint8_t* q8_payload = nullptr;
+  uint16_t* q8_scales = nullptr;
+  if (q == DraftQuant::kNvfp4) {
+    L.q = m_->alloc<uint8_t>(rows * K / 2);
+    L.s = m_->alloc<uint8_t>(rows * K / 16);
+    L.rs = m_->alloc<float>(rows);
+  } else {
+    blocks_init();
+    const size_t blocks = rows * (K / 32);
+    q8_payload = m_->alloc<uint8_t>(blocks * 32);
+    q8_scales = m_->alloc<uint16_t>(blocks);
+    L.blk = {BlockMat{q8_payload, q8_scales, FLYX_DT_GGML_Q8_0, int(rows), true}};
+  }
+
+  if (!staging_) staging_ = std::make_unique<LoadStaging>();
+  LoadStaging& S = *staging_;
+  S.ensure_quant_staging(row_bytes);
+  const size_t stage_cap = std::min(LoadStaging::kBytes, S.d_quant_bytes);
+  const size_t chunk = stage_cap / row_bytes;
+  constexpr size_t kStripe = size_t(1) << 20;
+
+  size_t r_out = 0;
+  for (size_t i = 0; i < ws.size(); ++i) {
+    const auto* v = t(ws[i]);
+    const size_t nr_all = size_t(v->shape[0]);
+    const RowOrder none, &order = i < orders.size() ? orders[i] : none;
+    for (size_t r0 = 0; r0 < nr_all; r0 += chunk) {
+      const size_t nr = std::min(chunk, nr_all - r0);
+      const int b = S.next;
+      S.next ^= 1;
+      CK(cudaEventSynchronize(S.slots[b].done));
+      auto* hp = reinterpret_cast<uint16_t*>(S.slots[b].buf);
+      if (v->dtype == FLYX_DT_BF16 && !order) {
+        const auto* in = static_cast<const uint8_t*>(v->data) + r0 * row_bytes;
+        const size_t nbytes = nr * row_bytes;
+        const size_t stripes = (nbytes + kStripe - 1) / kStripe;
+        parallel_rows(stripes, [&](size_t a, size_t e) {
+          const size_t p0 = a * kStripe;
+          const size_t p1 = std::min(nbytes, e * kStripe);
+          std::memcpy(S.slots[b].buf + p0, in + p0, p1 - p0);
+        });
+      } else {
+        parallel_rows(nr, [&](size_t a, size_t e) {
+          if (v->dtype == FLYX_DT_BF16) {
+            const auto* in = static_cast<const uint16_t*>(v->data);
+            for (size_t r = a; r < e; ++r) {
+              const size_t src_r = order ? order(r0 + r) : (r0 + r);
+              std::memcpy(hp + r * K, in + src_r * K, row_bytes);
+            }
+          } else {
+            for (size_t r = a; r < e; ++r) {
+              const size_t from = (order ? order(r0 + r) : (r0 + r)) * K;
+              for (size_t k = 0; k < K; ++k)
+                hp[r * K + k] = float_to_bf16(static_cast<float>(flyx::ops::load(v, from + k)));
+            }
+          }
+        });
+      }
+      CK(cudaMemcpyAsync(S.d_quant[b], hp, nr * row_bytes, cudaMemcpyHostToDevice, S.st));
+      if (q == DraftQuant::kNvfp4) {
+        quantize_nvfp4(S.d_quant[b], int(nr), int(K), L.q + (r_out + r0) * K / 2, L.s + (r_out + r0) * K / 16,
+                       L.rs + (r_out + r0), S.st);
+      } else {
+        quantize_q8_0(S.d_quant[b], int(nr), int(K), q8_payload + (r_out + r0) * K,
+                      q8_scales + (r_out + r0) * (K / 32), S.st);
+      }
+      CK(cudaEventRecord(S.slots[b].done, S.st));
+    }
+    r_out += nr_all;
+  }
+  if (rows_out) *rows_out = int(rows);
   return L;
 }
 
@@ -814,8 +1147,55 @@ std::vector<float> WeightLoader::host_f32(int w) const {
   const auto* v = t(w);
   if (!numbers(v)) throw std::runtime_error(std::string(v->name) + ": unsupported dtype");
   std::vector<float> out(numel(v));
+  if (v->dtype == FLYX_DT_F32) {  // as they are
+    std::memcpy(out.data(), v->data, out.size() * sizeof(float));
+    return out;
+  }
   for (size_t i = 0; i < out.size(); ++i) out[i] = static_cast<float>(flyx::ops::load(v, i));
   return out;
+}
+
+RoundWeight WeightLoader::round_weight(int w, const bf16* prefill) {
+  if (auto it = round_weights_.find(w); it != round_weights_.end()) return it->second;
+  const auto* v = t(w);
+  if (v->ndim != 2) throw std::runtime_error(std::string(v->name) + ": not a matrix");
+  const size_t n = numel(v);
+  std::vector<float> decoded;
+  const void* values = v->data;
+  if (v->dtype != FLYX_DT_F32) {
+    decoded = host_f32(w);
+    values = decoded.data();
+  }
+  RoundWeight weight;
+  bool has_nan = false;
+  if (!all_exact_bf16(values, n, &has_nan)) {
+    float* p = m_->alloc<float>(n);
+    CK(cudaMemcpy(p, values, n * sizeof(float), cudaMemcpyHostToDevice));
+    weight.f32 = p;
+  } else if (prefill && !has_nan) {
+    weight.b16 = prefill;
+  } else {
+    // Packed prefill has no bf16 slice. For NaNs, its normal conversion can change the payload or quiet bit.
+    std::vector<uint16_t> high(n);
+    for (size_t i = 0; i < n; ++i) high[i] = uint16_t(f32_word(values, i) >> 16);
+    bf16* p = m_->alloc<bf16>(n);
+    upload_staged(p, high.data(), n * sizeof(bf16));
+    weight.b16 = p;
+  }
+  return round_weights_[w] = weight;
+}
+
+Lin WeightLoader::lin_f32(int w) {
+  Lin l = lin(w);
+  const auto* v = t(w);
+  if (v->ndim == 2 && (v->dtype == FLYX_DT_F32 || v->dtype == FLYX_DT_F16 || v->dtype == FLYX_DT_F64))
+    l.round = round_weight(w, l.w);
+  return l;
+}
+
+float* WeightLoader::vec(int w) {
+  if (auto it = vecs_.find(w); it != vecs_.end()) return it->second;
+  return vecs_[w] = put(host_f32(w));
 }
 
 float* WeightLoader::vecs(const std::vector<int>& ws) {
@@ -1027,11 +1407,12 @@ VisionLin WeightLoader::vision_lin_stack(const std::vector<int>& ws, int* rows_o
   // 3. On-the-fly Q8_0 quantization (8.5 bpw, ~46% smaller, zero-padded to K % 32 == 0).
   if (vq == FLYX_VISION_QUANT_Q8) {
     blocks_init();
-    const size_t K_pad = (K + 31) / 32 * 32;
+    const auto layout = VisionQuantLayout::q8(total_rows, K);
+    const size_t K_pad = layout.width;
     const size_t blocks_per_row = K_pad / 32;
     vl.K_pad = int(K_pad);
-    const size_t pay_bytes = total_rows * K_pad;
-    const size_t sc_elems = total_rows * blocks_per_row;
+    const size_t pay_bytes = layout.payload;
+    const size_t sc_elems = layout.scales / sizeof(uint16_t);
     uint8_t* pay_host = nullptr;
     uint16_t* sc_host = nullptr;
     std::vector<uint8_t> pay_tmp;
@@ -1080,10 +1461,11 @@ VisionLin WeightLoader::vision_lin_stack(const std::vector<int>& ws, int* rows_o
 
   // 4. On-the-fly NVFP4 quantization (4.5 bpw, ~70% smaller, zero-padded to K % 64 == 0).
   if (vq == FLYX_VISION_QUANT_NVFP4) {
-    const size_t K_pad = (K + 63) / 64 * 64;
+    const auto layout = VisionQuantLayout::nvfp4(total_rows, K);
+    const size_t K_pad = layout.width;
     vl.K_pad = int(K_pad);
-    const size_t q_bytes = total_rows * K_pad / 2;
-    const size_t s_bytes = total_rows * K_pad / 16;
+    const size_t q_bytes = layout.payload;
+    const size_t s_bytes = layout.scales;
     uint8_t *q_host = nullptr, *s_host = nullptr;
     float* rs_host = nullptr;
     std::vector<uint8_t> q_tmp, s_tmp;
@@ -1211,9 +1593,9 @@ void parallel_rows(size_t n, const std::function<void(size_t, size_t)>& fn) {
 }
 
 LoadStaging::LoadStaging() {
-  for (int i = 0; i < 2; ++i) {
-    CK(cudaHostAlloc(&buf[i], kBytes, cudaHostAllocDefault));
-    CK(cudaEventCreateWithFlags(&done[i], cudaEventDisableTiming));
+  for (Slot& slot : slots) {
+    CK(cudaHostAlloc(&slot.buf, kBytes, cudaHostAllocDefault));
+    CK(cudaEventCreateWithFlags(&slot.done, cudaEventDisableTiming));
   }
   CK(cudaStreamCreate(&st));  // a blocking stream: work on the legacy stream after waits for its copies
 }
@@ -1221,10 +1603,40 @@ LoadStaging::LoadStaging() {
 LoadStaging::~LoadStaging() {
   if (st) cudaStreamSynchronize(st);
   for (int i = 0; i < 2; ++i) {
-    if (done[i]) cudaEventDestroy(done[i]);
-    if (buf[i]) cudaFreeHost(buf[i]);
+    if (d_quant[i]) cudaFree(d_quant[i]);
   }
   if (st) cudaStreamDestroy(st);
+}
+
+void LoadStaging::ensure_quant_staging(size_t min_bytes) {
+  min_bytes = (min_bytes + 255) / 256 * 256;
+  if (d_quant[0] && d_quant_bytes >= min_bytes) return;
+  if (d_quant[0] || d_quant[1]) {
+    if (st) CK(cudaStreamSynchronize(st));
+    for (int i = 0; i < 2; ++i) {
+      if (d_quant[i]) cudaFree(d_quant[i]);
+      d_quant[i] = nullptr;
+    }
+    d_quant_bytes = 0;
+  }
+  const size_t tries[] = {std::max(kQuantBytes, min_bytes), std::max(size_t(4) << 20, min_bytes),
+                          std::max(size_t(1) << 20, min_bytes), min_bytes};
+  for (size_t idx = 0; idx < 4; ++idx) {
+    const size_t sz = tries[idx];
+    if (idx > 0 && sz == tries[idx - 1]) continue;
+    try {
+      d_quant[0] = static_cast<bf16*>(device_malloc(sz));
+      d_quant[1] = static_cast<bf16*>(device_malloc(sz));
+      d_quant_bytes = sz;
+      return;
+    } catch (const OutOfDeviceMemory&) {
+      for (int i = 0; i < 2; ++i) {
+        if (d_quant[i]) cudaFree(d_quant[i]);
+        d_quant[i] = nullptr;
+      }
+      if (idx == 3 || sz == min_bytes) throw;
+    }
+  }
 }
 
 // One tensor's rows packed at data and scales: laid out by parallel_rows, into host memory directly (host) or into a
@@ -1264,14 +1676,14 @@ void WeightLoader::pack_rows(int w, const RowOrder& order, uint8_t* data, uint16
     const int b = S.next;
     S.next ^= 1;
     const double t0 = load_clock();
-    CK(cudaEventSynchronize(S.done[b]));  // the buffer's last copy is done
+    CK(cudaEventSynchronize(S.slots[b].done));  // the buffer's last copy is done
     const double t1 = load_clock();
-    uint8_t* hp = S.buf[b];
+    uint8_t* hp = S.slots[b].buf;
     auto* hs = reinterpret_cast<uint16_t*>(hp + (n * row_bytes + 15) / 16 * 16);
     parallel_rows(n, [&](size_t a, size_t e) { lay_out(r0 + a, e - a, hp + a * row_bytes, hs + a * row_scales); });
     CK(cudaMemcpyAsync(data + r0 * row_bytes, hp, n * row_bytes, cudaMemcpyHostToDevice, S.st));
     CK(cudaMemcpyAsync(scales + r0 * row_scales, hs, n * scale_bytes, cudaMemcpyHostToDevice, S.st));
-    CK(cudaEventRecord(S.done[b], S.st));
+    CK(cudaEventRecord(S.slots[b].done, S.st));
     times_.copy_s += t1 - t0;
     times_.pack_s += load_clock() - t1;
   }

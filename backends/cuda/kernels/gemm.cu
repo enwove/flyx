@@ -190,6 +190,31 @@ bool gemm_tuning_compiled_for(int tuning, int cc) {
 
 bool gemm_tuning_pdl(int tuning) { return tuning >= 0 && tables::kSkus[tuning].pdl; }
 
+int gemm_tuning_auto(const char* device_name, int device_cc, int code_cc, int* arch_cc,
+                     bool (*compiled)(int tuning, int cc)) {
+  if (!compiled) compiled = gemm_tuning_compiled_for;
+  bool by_arch = false;
+  int tuning = gemm_tuning_for(device_name, device_cc, &by_arch);
+  int cc = by_arch ? device_cc : 0;
+  // A table whose kernels the loaded code was not compiled for (a release build, an architecture list without the
+  // device's) gives way to the loaded code's architecture's table, and that one to the defaults.
+  if (tuning >= 0 && !compiled(tuning, code_cc)) {
+    tuning = gemm_tuning_for("", code_cc, &by_arch);
+    cc = code_cc;
+    if (tuning >= 0 && !compiled(tuning, code_cc)) tuning = -1;
+  }
+  if (arch_cc) *arch_cc = tuning >= 0 ? cc : 0;
+  return tuning;
+}
+
+std::string gemm_tuning_label(int tuning, int arch_cc, int device_cc) {
+  const char* name = gemm_tuning_name(tuning);
+  if (!name) return "none (defaults)";
+  if (!arch_cc) return name;
+  const char* whose = arch_cc == device_cc ? "this architecture's" : "the loaded code's architecture's";
+  return std::string(name) + " (" + whose + ": sm_" + std::to_string(arch_cc) + ")";
+}
+
 int gemm_config(int tuning, int fmt, int N, int K, int rows) { return pick_config(tuning, fmt, N, K, rows); }
 
 int gemm_draft_chunks(int K) { return tables::draft_chunks(K); }
@@ -549,14 +574,18 @@ void gemm_fp4(const float* x, int ldx, const uint8_t* Q, const uint8_t* S, const
     gemm_fp4_mma(x, ldx, Q, S, RS, N, K, y, ldy, rows, accumulate, L.st);
 }
 
+bool gemm_skinny_takes(const float* x, int ldx, const bf16* W, int K, const Launch& L) {
+  return !opts(L).row_gemms && skinny_fits(x, ldx, W, K);
+}
+
 void gemm(const float* x, int ldx, const bf16* W, int N, int K, float* y, int ldy, int rows, bool accumulate,
           const Launch& L) {
-  const bool row_path = opts(L).row_gemms;
+  const bool row_path = opts(L).row_gemms, skinny = gemm_skinny_takes(x, ldx, W, K, L);
   if (rows > 16 && (L.round_rows || L.draft)) {
     // Every tile of 16 rows the 1..16-row kernel's arithmetic, the weights read once (a round's: a linear's bf16
     // weights, regions/linear.cpp, and an adapter's; numerics.md R, C), or bf16 inputs (a drafting pass's:
     // deterministic).
-    if (rows <= 64 && !row_path && skinny_fits(x, ldx, W, K)) {
+    if (rows <= 64 && skinny) {
       const int fmt = L.round_rows ? kFmtBf16Rows : kFmtBf16Draft;
       gemm_skinny_mt_cfg(pick_config(opts(L).tuning, fmt, N, K, rows), x, ldx, W, N, K, y, ldy, rows, accumulate, L);
       return;
@@ -567,8 +596,7 @@ void gemm(const float* x, int ldx, const bf16* W, int N, int K, float* y, int ld
       return;
     }
   }
-  if (rows <= 16 && !row_path && skinny_fits(x, ldx, W, K))
-    gemm_skinny(x, ldx, W, N, K, y, ldy, rows, accumulate, L);
+  if (rows <= 16 && skinny) gemm_skinny(x, ldx, W, N, K, y, ldy, rows, accumulate, L);
   else if (rows <= 16 || row_path || (ldx % 4) != 0) gemm_rows(x, ldx, W, N, K, y, ldy, rows, accumulate, L.st);
   else if (tc_fits(x, ldx, K)) gemm_tc(x, ldx, W, N, K, y, ldy, rows, accumulate, L);
   else gemm_mma(x, ldx, W, N, K, y, ldy, rows, accumulate, L.st);

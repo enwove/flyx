@@ -8,6 +8,8 @@
 #include <map>
 #include <string_view>
 
+#include "core/modelfile/modelfile.h"
+
 namespace flyx::hub {
 
 namespace detail {
@@ -253,11 +255,18 @@ bool mtp_gguf_name(const std::string& path) {
   return base.starts_with("mtp-") || p.starts_with("mtp/") || p.find("/mtp/") != std::string::npos;
 }
 
+bool dspark_gguf_name(const std::string& path) {
+  const std::string p = detail::lower(path), base = detail::base_name(p);
+  if (!base.ends_with(".gguf") || base.find("imatrix") != std::string::npos) return false;
+  return base.starts_with("dspark-") || p.starts_with("dspark/") || p.find("/dspark/") != std::string::npos;
+}
+
 bool model_gguf_name(const std::string& path) {
   const std::string p = detail::lower(path), base = detail::base_name(p);
-  if (!base.ends_with(".gguf") || mmproj_gguf_name(path) || mtp_gguf_name(path) ||
+  if (!base.ends_with(".gguf") || mmproj_gguf_name(path) || mtp_gguf_name(path) || dspark_gguf_name(path) ||
       base.find("imatrix") != std::string::npos)
     return false;
+  if (p.starts_with("old_support/") || p.find("/old_support/") != std::string::npos) return false;
   return true;
 }
 
@@ -267,7 +276,7 @@ bool split_gguf_name(const std::string& file_name) { return parse_split(file_nam
 
 std::string quant_in_name(const std::string& file_name) { return find_quant_in_stem(strip_model_stem(file_name)); }
 
-std::vector<GgufChoice> gguf_choices(const Repo& r) {
+std::vector<GgufChoice> gguf_choices(const Repo& r, bool include_companions) {
   std::vector<const RepoFile*> ggufs;
   for (const RepoFile& f : r.files)
     if (model_gguf_name(f.path)) ggufs.push_back(&f);
@@ -283,6 +292,10 @@ std::vector<GgufChoice> gguf_choices(const Repo& r) {
     }
     while (!shared.empty() && kSep.find(shared.back()) == std::string_view::npos) shared.pop_back();
   }
+  // Keep the model quantization labels stable when listing sidecars as well.
+  if (include_companions)
+    for (const RepoFile& f : r.files)
+      if (mmproj_gguf_name(f.path) || mtp_gguf_name(f.path) || dspark_gguf_name(f.path)) ggufs.push_back(&f);
   struct SplitGroup {
     int count = 0;
     std::string quant;
@@ -323,7 +336,9 @@ std::vector<GgufChoice> gguf_choices(const Repo& r) {
     c.file = c.parts.front();
     out.push_back(std::move(c));
   }
-  std::sort(out.begin(), out.end(), [](const GgufChoice& a, const GgufChoice& b) { return a.total_size < b.total_size; });
+  std::sort(out.begin(), out.end(), [](const GgufChoice& a, const GgufChoice& b) {
+    return a.total_size != b.total_size ? a.total_size < b.total_size : a.file.path < b.file.path;
+  });
   return out;
 }
 
@@ -361,12 +376,19 @@ const RepoFile* mmproj_file(const Repo& r) {
 std::vector<CompanionFile> companion_files(const Repo& r) {
   const RepoFile* def_mtp = mtp_file(r);
   const RepoFile* def_mm = mmproj_file(r);
+  bool dspark_default_set = false;
   std::vector<CompanionFile> out;
   for (const RepoFile& f : r.files) {
-    if (mtp_gguf_name(f.path))
+    if (mtp_gguf_name(f.path)) {
       out.push_back({f, "mtp", def_mtp && def_mtp->path == f.path});
-    else if (mmproj_gguf_name(f.path))
+    } else if (dspark_gguf_name(f.path)) {
+      SplitGguf sp;
+      if (parse_split(f.path, &sp) && sp.part != 1) continue;
+      out.push_back({f, "dspark", !dspark_default_set});
+      dspark_default_set = true;
+    } else if (mmproj_gguf_name(f.path)) {
       out.push_back({f, "mmproj", def_mm && def_mm->path == f.path});
+    }
   }
   auto order = [](const std::string& k) { return k == "mmproj" ? 1 : 0; };
   std::sort(out.begin(), out.end(), [&](const CompanionFile& a, const CompanionFile& b) {
@@ -403,35 +425,24 @@ bool select(const Repo& r, const Name& name, std::vector<RepoFile>* files, std::
           pick = &c;
       }
     if (!pick) {
-      // Also allow naming a companion file in the repository directly (e.g. org/repo:mmproj-BF16.gguf).
-      const std::vector<CompanionFile> comps = companion_files(r);
-      const CompanionFile* comp = nullptr;
-      for (const CompanionFile& c : comps)
-        if (detail::lower(c.file.path) == want) comp = &c;
-      if (!comp)
-        for (const CompanionFile& c : comps)
-          if (detail::lower(detail::base_name(c.file.path)) == want) {
-            comp = &c;
+      if (want.ends_with(".gguf")) {
+        // An explicit filename selects the same complete group as a quantization, including a split companion.
+        const RepoFile* named = nullptr;
+        for (const auto& file : r.files) {
+          if (detail::lower(file.path) == want) {
+            named = &file;
             break;
           }
-      if (comp) {
-        *files = {comp->file};
-        return true;
-      }
-      if (want.ends_with(".gguf")) {
-        const RepoFile* direct = nullptr;
-        for (const RepoFile& f : r.files)
-          if (detail::lower(f.path) == want) direct = &f;
-        if (!direct)
-          for (const RepoFile& f : r.files)
-            if (detail::lower(detail::base_name(f.path)) == want) {
-              direct = &f;
-              break;
-            }
-        if (direct) {
-          *files = {*direct};
-          return true;
+          if (!named && detail::lower(detail::base_name(file.path)) == want) named = &file;
         }
+        if (named)
+          for (const auto& g : gguf_choices(r, /*include_companions=*/true))
+            for (const auto& part : g.parts)
+              if (part.path == named->path) {
+                if (!g.complete) return *err = r.id + ":" + name.quant + " is an incomplete split GGUF", false;
+                *files = g.parts;
+                return true;
+              }
       }
       return *err = r.id + " has no GGUF file for \"" + name.quant + "\"; it has:" + listing(), false;
     }
@@ -469,7 +480,7 @@ bool select(const Repo& r, const Name& name, std::vector<RepoFile>* files, std::
   if (safetensors && config)
     return *err = r.id + " is a transformers checkpoint (" +
                   (r.architectures.empty() ? std::string("its config names no architecture") : r.architectures[0]) +
-                  "): flyx reads GGUF files (a GGUF repository of it, org/name-GGUF:QUANT) and DFlash2 drafters",
+                  "): flyx reads GGUF files (a GGUF repository of it, org/name-GGUF:QUANT) and DFlash2 or DSpark drafters",
            false;
   files->clear();
   if (flyx.size() == 1) {
@@ -480,9 +491,9 @@ bool select(const Repo& r, const Name& name, std::vector<RepoFile>* files, std::
          false;
 }
 
-bool is_drafter(const Repo& r) {
-  return std::find(r.architectures.begin(), r.architectures.end(), "DFlash2DraftModel") != r.architectures.end();
-}
+bool is_drafter(const Repo& r) { return !drafter_kind(r).empty(); }
+
+std::string drafter_kind(const Repo& r) { return drafter_kind_of(r.architectures); }
 
 bool parse_adapter_name(const std::string& s, Name* out) {
   // The folder between ':' and '@' (a path, which parse_name would refuse), the rest a name without one.

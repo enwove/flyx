@@ -214,6 +214,154 @@ rules = [
   { rows = [5, 16], span = 128, chunks = 8, nt = 2, warps = 8, unroll = 4 },  # r8 1319 r16 1094
 ]
 
+# 2026-11-26, RTX 5090 32 GB (vast.ai, power limit 575 W), driver 595.99.02, CUDA 13.0.88, flyx 5fae786,
+# `cuda_bench tune` (every family, no file): the FP8 GQA heads per block and the bf16 GEMMs of 17..64 rows
+# (bf16_rows, bf16_draft) this table lacked; its other rules are kept (the tuner's rounds and 8-bit passes
+# were 1.3% slower in plain decoding and 2.5% in a 6K prefill of Qwen3.8-27B-UD-IQ3_XXS, its moe_gate_up
+# no faster on Inkling-2-Mini).  Against the table before: the same tokens, every rate within 0.4%
+# (Qwen3.8-27B-UD-IQ3_XXS, Qwen3.5-4B-Q4_K_M) or 0.8% (Inkling-2-Mini, plain and DSpark).
+
+# FP8 GQA, one full middle window; six orders, five timed launches per sample (ms).
+# HB2 2.8307 2.8475 2.8455 2.8451 2.8492 2.8471 median 2.8463
+# HB3 2.8044 2.8160 2.8152 2.8156 2.8197 2.8213 median 2.8158
+# HB6 3.9707 3.9723 3.9719 3.9686 3.9752 3.9801 median 3.9721
+[[flash_gqa]]
+fp8 = true
+nh = 24
+nkv = 4
+hd = 256
+rows = 256
+keys = 32832
+hb = 3
+
+# FP8 GQA, one full middle window; six orders, five timed launches per sample (ms).
+# HB2 6.6609 6.6822 6.7211 6.6814 6.6855 6.6843 median 6.6832
+# HB3 8.1078 8.1250 8.1263 8.1209 8.1234 8.1258 median 8.1242
+# HB6 7.9780 7.9927 7.9882 7.9948 7.9927 7.9903 median 7.9915
+[[flash_gqa]]
+fp8 = true
+nh = 24
+nkv = 4
+hd = 256
+rows = 1024
+keys = 32832
+hb = 2
+
+[[gemm]]  # MiniCPM5-1B q|k|v
+format = "bf16_rows"
+n = 2560
+k = 1536
+rules = [
+  { rows = [17, 48], nt = 2, chunks = 16, unroll = 4, parts = 3 },  # r32 760 (10.3 us) r48 561 (14.0 us)
+  { rows = [49, 64], nt = 2, chunks = 16, unroll = 8, parts = 3 },  # r64 477 (16.5 us)
+]
+
+[[gemm]]  # MiniCPM5-1B out
+format = "bf16_rows"
+n = 1536
+k = 2048
+rules = [
+  { rows = [17, 64], nt = 2, chunks = 16, unroll = 4, parts = 3 },  # r32 597 (10.5 us) r48 448 (14.0 us) r64 364 (17.3 us)
+]
+
+[[gemm]]  # MiniCPM5-1B gate|up
+format = "bf16_rows"
+n = 9216
+k = 1536
+rules = [
+  { rows = [17, 32], nt = 4, chunks = 16, unroll = 4, parts = 3 },  # r32 988 (28.7 us)
+  { rows = [33, 64], nt = 4, chunks = 16, unroll = 2, parts = 3 },  # r48 813 (34.8 us) r64 644 (43.9 us)
+]
+
+[[gemm]]  # MiniCPM5-1B down
+format = "bf16_rows"
+n = 1536
+k = 4608
+rules = [
+  { rows = [17, 48], nt = 2, chunks = 16, unroll = 4, parts = 3 },  # r32 709 (20.0 us) r48 514 (27.5 us)
+  { rows = [49, 64], nt = 2, chunks = 16, unroll = 8, parts = 3 },  # r64 410 (34.5 us)
+]
+
+[[gemm]]  # MiniCPM5-1B head
+format = "bf16_rows"
+n = 130560
+k = 1536
+rules = [
+  { rows = [17, 64], nt = 4, chunks = 16, unroll = 2, parts = 3 },  # r32 1353 (296.4 us) r48 1055 (380.3 us) r64 794 (504.8 us)
+]
+
+[[gemm]]  # DV canvas q|k|v (and a)
+format = "bf16_draft"
+n = 2560
+k = 1536
+rules = [
+  { rows = [17, 64], nt = 1, unroll = 4 },  # r32 985 (8.0 us) r48 853 (9.2 us) r64 711 (11.1 us)
+]
+
+[[gemm]]  # DV canvas b of q, k, v
+format = "bf16_draft"
+n = 2048
+k = 256
+rules = [
+  { rows = [17, 64], nt = 2, unroll = 8 },  # r32 223 (4.7 us) r48 223 (4.7 us) r64 218 (4.8 us)
+]
+
+[[gemm]]  # DV canvas out (and a)
+format = "bf16_draft"
+n = 1536
+k = 2048
+rules = [
+  { rows = [17, 32], nt = 1, unroll = 4 },  # r32 808 (7.8 us)
+  { rows = [33, 48], nt = 2, unroll = 4 },  # r48 608 (10.3 us)
+  { rows = [49, 64], nt = 1, unroll = 4 },  # r64 492 (12.8 us)
+]
+
+[[gemm]]  # DV canvas b of out, down
+format = "bf16_draft"
+n = 1536
+k = 256
+rules = [
+  { rows = [17, 32], nt = 1, unroll = 4 },  # r32 160 (4.9 us)
+  { rows = [33, 48], nt = 4, unroll = 4 },  # r48 163 (4.8 us)
+  { rows = [49, 64], nt = 2, unroll = 4 },  # r64 163 (4.8 us)
+]
+
+[[gemm]]  # DV canvas gate|up (and a)
+format = "bf16_draft"
+n = 9216
+k = 1536
+rules = [
+  { rows = [17, 32], nt = 1, unroll = 4 },  # r32 1376 (20.6 us)
+  { rows = [33, 64], nt = 2, unroll = 8 },  # r48 1274 (22.2 us) r64 1115 (25.4 us)
+]
+
+[[gemm]]  # DV canvas b of gate, up
+format = "bf16_draft"
+n = 4608
+k = 256
+rules = [
+  { rows = [17, 48], nt = 2, unroll = 4 },  # r32 480 (4.9 us) r48 480 (4.9 us)
+  { rows = [49, 64], nt = 2, unroll = 8 },  # r64 435 (5.4 us)
+]
+
+[[gemm]]  # DV canvas down (and a)
+format = "bf16_draft"
+n = 1536
+k = 4608
+rules = [
+  { rows = [17, 64], nt = 2, unroll = 4 },  # r32 1071 (13.2 us) r48 881 (16.1 us) r64 713 (19.9 us)
+]
+
+[[gemm]]  # DV canvas head
+format = "bf16_draft"
+n = 130560
+k = 1536
+rules = [
+  { rows = [17, 32], nt = 4, unroll = 4 },  # r32 1658 (241.9 us)
+  { rows = [33, 48], nt = 1, unroll = 4 },  # r48 1548 (259.1 us)
+  { rows = [49, 64], nt = 4, unroll = 4 },  # r64 1296 (309.5 us)
+]
+
 # This GPU's rules: for shapes no [[gemm]] lists, and the GGML block kernels' on Qwen3.8-27B's and Qwen3.5-4B's layers, every block type.
 [rules]
 bf16 = [
@@ -224,6 +372,14 @@ bf16 = [
 ]
 nvfp4_k128 = { span = 128, chunks = 8, nt = 1, warps = 8, unroll = 4 }
 nvfp4_k64 = { span = 64, chunks = 16, nt = 1, warps = 16, unroll = 4 }
+bf16_rows = [
+  { rows = [17, 48], nt = 2, chunks = 16, unroll = 4, parts = 3 },
+  { rows = [49, 64], nt = 2, chunks = 16, unroll = 8, parts = 3 },
+]
+bf16_draft = [
+  { rows = [17, 32], nt = 1, unroll = 4 },
+  { rows = [33, 64], nt = 2, unroll = 4 },
+]
 blocks = [
   { n_max = 2048, rows = [1, 16], nt = 1, nw = 2, kw = 4 },
   { n_max = 6144, rows = [1, 2], nt = 1, nw = 2, kw = 4 },
@@ -378,3 +534,21 @@ blocks_round = [
 # blocks_round, rounds of 6 rows: 264133 us with these rules, 300249 with the defaults (-12.0%), 262268 with the best for each
 # blocks_round, rounds of 8 rows: 288393 us with these rules, 330452 with the defaults (-12.7%), 286626 with the best for each
 # blocks_round, rounds of 16 rows: 536350 us with these rules, 538542 with the defaults (-0.4%), 530505 with the best for each
+# MoE layers' fused gate|up GEMMs: `cuda_bench tune moe_gate_up Inkling-2-Mini-UD-IQ3_XXS.gguf` on this GPU (driver 580.178.04,
+# Linux), against the original tiles (the defaults).  As this table's other rules they also serve the sm_120 GPUs
+# without a table of their own, on this GPU's measurement alone (an RTX 5080's and an RTX 5070 Ti's own rules differ
+# in the rows where they change configuration, not in the configurations):
+# moe_gate_up, passes of 1 rows: 334 us with these rules, 357 with the defaults (-6.4%), 334 with the best for each
+# moe_gate_up, passes of 2 rows: 547 us with these rules, 584 with the defaults (-6.2%), 547 with the best for each
+# moe_gate_up, passes of 4 rows: 864 us with these rules, 935 with the defaults (-7.6%), 864 with the best for each
+# moe_gate_up, passes of 6 rows: 1240 us with these rules, 1367 with the defaults (-9.3%), 1240 with the best for each
+# moe_gate_up, passes of 8 rows: 1574 us with these rules, 1752 with the defaults (-10.2%), 1574 with the best for each
+# moe_gate_up, passes of 16 rows: 2917 us with these rules, 3301 with the defaults (-11.6%), 2917 with the best for each
+moe_gate_up = [
+  { types = ["IQ2_XXS", "IQ2_S"], rows = [1, 2], columns = 1, units = 1 },
+  { types = ["IQ2_XXS", "IQ2_S"], columns = 2, units = 1 },
+  { types = ["IQ2_XS"], rows = [1, 4], columns = 1, units = 1 },
+  { types = ["IQ2_XS"], columns = 2, units = 1 },
+  { types = ["IQ3_XXS"], columns = 1, units = 1 },
+  { columns = 0, units = 0 },
+]

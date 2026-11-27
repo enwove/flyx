@@ -4,6 +4,135 @@
 
 namespace flyx::optest {
 
+namespace {
+// Raw bits of the three planes that k_split or the RMS producer left in the skinny GEMM scratch.
+std::vector<uint16_t> split_bits(size_t count) {
+  const Scratch& sc = *TL.scratch;
+  std::vector<uint16_t> parts(3 * count);
+  for (size_t p = 0; p < 3; ++p)
+    CK(cudaMemcpy(parts.data() + p * count, sc.split + p * sc.split_cap, count * sizeof(uint16_t),
+                  cudaMemcpyDeviceToHost));
+  return parts;
+}
+
+// What rmsnorm_q8_split wrote of rows x n, and the float32 rows of the generic layer.
+struct DualRows {
+  Q8Rows q8;
+  std::vector<uint16_t> parts;
+  Vec generic;
+};
+
+// The producer's two layouts against the generic layer's: rmsnorm a row at a time, then the staging each of the two
+// GEMMs runs on those float32 rows (blocks_stage; gemm_skinny's split), byte for byte.
+DualRows dual_rows_as_staged(const Vec& x, int ldx, const Vec& w, float offset, float eps, int rows, int n,
+                             const std::string& tag) {
+  const int cols = 8;
+  const size_t count = size_t(rows) * n;
+  float *dx = up(x), *dw = up(w), *h = dev<float>(count), *y = dev<float>(size_t(rows) * cols);
+  bf16* weight = up_bf16(randv(size_t(cols) * n));
+  const Scratch& sc = *TL.scratch;
+  CK(cudaMemset(sc.q8, 0x80, count));
+  CK(cudaMemset(sc.q8_scale, 0xff, count / 32 * sizeof(float)));
+  CK(cudaMemset(sc.q8_sums, 0xff, count / 16 * sizeof(float)));
+  for (size_t p = 0; p < 3; ++p) CK(cudaMemset(sc.split + p * sc.split_cap, 0xff, count * sizeof(bf16)));
+  rmsnorm_q8_split(dx, ldx, dw, offset, eps, rows, n, TL);
+  DualRows got{q8_rows(rows, n), split_bits(count), {}};
+
+  for (int r = 0; r < rows; ++r)
+    rmsnorm(dx + size_t(r) * ldx, ldx, dw, offset, eps, h + size_t(r) * n, n, 1, n, TL.st);
+  got.generic = down(h, count);
+  blocks_stage(h, n, n, rows, TL, true);
+  const bool same_q8 = got.q8 == q8_rows(rows, n);
+  gemm_skinny(h, n, weight, cols, n, y, cols, rows, false, TL);
+  const bool same_parts = got.parts == split_bits(count);
+  std::printf("  %-4s dual-layout RMSNorm: Q8 codes, scales and half sums vs blocks_stage%s\n",
+              same_q8 ? "ok" : "FAIL", tag.c_str());
+  std::printf("  %-4s dual-layout RMSNorm: all three BF16 planes vs k_split%s\n", same_parts ? "ok" : "FAIL",
+              tag.c_str());
+  g_fail += !same_q8 + !same_parts;
+  for (void* p : std::initializer_list<void*>{dx, dw, h, y, weight}) CK(cudaFree(p));
+  return got;
+}
+
+void test_rmsnorm_q8_split() {
+  for (const int rows : {1, 5, 16}) {
+    // 2304 ends in a short span of Q8 groups.  The larger width also exercises rms_inv_spread's uncached tail.
+    const int n = rows == 5 ? 5408 : 2304, ldx = n + 7;
+    const float offset = rows == 5 ? 1.f : 0.f, eps = rows == 1 ? 3.f : 1e-6f;
+    const size_t count = size_t(rows) * n;
+    const std::string tag = " (" + std::to_string(rows) + " rows of " + std::to_string(n) + ")";
+    seed("rmsnorm_q8_split", rows, n);
+    Vec x = randv(size_t(rows) * ldx), w = randv(n, 0.3), want(count);
+    for (double& v : x) v = float(v);
+    for (double& v : w) v = float(v);
+    if (rows == 1) {
+      // inv = 1/2 exactly.  The second group has d = 1 and both even and odd half-integer ties.
+      for (double& v : x) v = std::copysign(1.0, v);
+      w[32] = 254.0;
+      w[33] = 1.0;
+      w[34] = 3.0;
+    }
+    std::fill_n(w.begin(), 32, -double(offset));  // zero scale with both signs of zero in the normalized row
+    for (int r = 0; r < rows; ++r) {
+      const double* row = x.data() + size_t(r) * ldx;
+      ops::rmsnorm(row, w.data(), n, eps, offset, want.data() + size_t(r) * n);
+    }
+    const DualRows got = dual_rows_as_staged(x, ldx, w, offset, eps, rows, n, tag);
+    Vec norm(count);
+    for (size_t i = 0; i < count; ++i)
+      norm[i] = from_bf16(got.parts[i]) + from_bf16(got.parts[count + i]) + from_bf16(got.parts[2 * count + i]);
+    expect("dual-layout RMSNorm against float64" + tag, norm, want, 1e-5);
+    // A different RMS sum order can land on opposite sides of a Q8 tie.  Check Q8 on the represented normalized
+    // floats in that case; the exact-inverse row checks the entire producer directly against the float64 reference.
+    const bool ref_q8 = got.q8 == reference_round_q8(rows == 1 ? want : norm, n);
+    std::printf("  %-4s dual-layout RMSNorm: round_q8 reference%s\n", ref_q8 ? "ok" : "FAIL", tag.c_str());
+    g_fail += !ref_q8;
+  }
+
+  // Groups the float64 reference says nothing of, held to the staging kernels' bytes alone.  inv = 1/2 exactly, so
+  // a gain g gives the value g / 2 with the sign of x.
+  {
+    const int rows = 3, n = 2304;
+    seed("rmsnorm_q8_split odd groups");
+    Vec x = randv(size_t(rows) * n), w = randv(n, 0.3);
+    for (double& v : x) v = std::copysign(1.0, v);
+    for (double& v : w) v = float(v);
+    const double least = std::ldexp(1.0, -149), nan = std::numeric_limits<double>::quiet_NaN();
+    // 160 times the least subnormal alone in its group: the scale rounds to the least subnormal and the integer,
+    // 160, is past 8 bits, which the kernels sum before they narrow it.
+    std::fill_n(w.begin(), 32, 0.0);
+    w[3] = 320 * least;
+    for (int i = 32; i < 64; ++i) w[i] = (2 * i + 1) * least;  // every value subnormal
+    w[64 + 5] = std::numeric_limits<double>::infinity();       // an infinite scale: no integers
+    w[96 + 7] = nan;                                           // one NaN among finite values
+    std::fill_n(w.begin() + 128, 32, nan);                     // nothing but NaN
+    dual_rows_as_staged(x, n, w, 0.f, 3.f, rows, n, " (subnormal, infinite and NaN groups)");
+  }
+
+  // The product x inv (offset + w) is rounded to float32 before its three parts are taken, as the generic layer
+  // stores it before it splits it.  Here inv = 1 and the product is 1 + 3 2^-23 + 2^-45: float32 drops the last
+  // term, so the parts are 1, 3 2^-23 and +0; a first subtraction fused with the product would keep the term and
+  // leave 2^-45 in the low part.
+  {
+    const int n = 32;
+    seed("rmsnorm_q8_split rounded product");
+    Vec x(n, 0.0), w = randv(n, 0.3);
+    for (double& v : w) v = float(v);
+    x[0] = 1.0 + std::ldexp(1.0, -23);
+    w[0] = 1.0 + std::ldexp(1.0, -22);
+    const DualRows got = dual_rows_as_staged(x, n, w, 0.f, 31.f / 32.f, 1, n, " (a product float32 rounds)");
+    const double three = 3 * std::ldexp(1.0, -23);
+    if (got.generic[0] == 1.0 + three) {
+      const bool rounded = from_bf16(got.parts[0]) == 1.0 && from_bf16(got.parts[n]) == three && got.parts[2 * n] == 0;
+      std::printf("  %-4s dual-layout RMSNorm: the parts of the rounded product\n", rounded ? "ok" : "FAIL");
+      g_fail += !rounded;
+    } else {
+      std::printf("  ok   dual-layout RMSNorm: this GPU's 1 / sqrt(1) is not 1, the product no witness\n");
+    }
+  }
+}
+}  // namespace
+
 void test_rmsnorm() {
   std::printf("rmsnorm\n");
   seed("rmsnorm");
@@ -28,6 +157,7 @@ void test_rmsnorm() {
              down(y1, size_t(r) * n), 0);
     }
   }
+  test_rmsnorm_q8_split();
 }
 
 // Rule 2 at the kernel level: a fused producer (writing the next GEMM's input

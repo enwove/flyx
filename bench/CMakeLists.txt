@@ -39,6 +39,7 @@ if(TARGET flyx_cuda_kernels)
   target_link_libraries(cuda_bench PRIVATE flyx_cuda_kernels flyx_core)
   set_target_properties(cuda_bench PROPERTIES CUDA_ARCHITECTURES "${FLYX_CUDA_ARCHS}")
   add_test(NAME cuda_bench_round_finite COMMAND cuda_bench round IQ3_XXS 1024x5120 4)
+  set_property(TEST cuda_bench_round_finite APPEND PROPERTY LABELS tools gpu)
 
   # CUPTI ships in extras/CUPTI of a toolkit install, next to the toolkit's own
   # headers and libraries in the PyPI one (and only as libcupti.so.13 there).
@@ -69,6 +70,8 @@ if(TARGET flyx_cuda_kernels)
     set_target_properties(flyx-trace PROPERTIES PREFIX "lib")
   endif()
 endif()
+
+flyx_finish_test_labels()  # tests/CMakeLists.txt: the tiers, quick, the GPU's resource group
 
 # On Windows these programs read their files by UTF-8 paths as flyx does (a build tree under a user folder named in
 # Chinese): the same manifest (flyx_program).

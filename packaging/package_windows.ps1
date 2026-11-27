@@ -12,7 +12,7 @@
 #   dist\flyx-<version>-windows-x86_64-cuda13.exe  (with -Exe)
 #       single-file standalone executable with both backends linked in; double-clicking opens the dashboard
 #
-# Needs the Visual Studio 2022 Build Tools (C++), CMake >= 3.24, Ninja and Python 3.11+.  The CUDA 13.0 compiler is
+# Needs Visual Studio 2022 or newer Build Tools (C++), CMake >= 3.24, Ninja and Python 3.11+.  The CUDA 13.0 compiler is
 # taken from a virtual environment ($env:FLYX_WIN_VENV, default ~\.venvs\flyx-win) and installed into it from PyPI's
 # wheels when it is not there.  The smoke test unpacks the zip into an empty directory, checks the DLLs it needs
 # (Windows' own), and with -Assets (a directory holding tiny.flyx, from a test build: <build>/assets) runs the CLI on
@@ -66,7 +66,7 @@ try {
 
   Write-Host "== zip"
   $Zip = Join-Path $Work "$Name.zip"
-  Compress-Archive -LiteralPath $Pkg -DestinationPath $Zip
+  & "$PSScriptRoot/create_release_zip.ps1" -Package $Pkg -Destination $Zip
   $Test = Join-Path $Work "unpacked"
   Expand-Archive -LiteralPath $Zip -DestinationPath $Test
   $P = Join-Path $Test $Name

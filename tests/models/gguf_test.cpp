@@ -19,16 +19,11 @@
 #include "core/interfaces/model.h"
 #include "core/modelfile/modelfile.h"
 #include "ops/dtype/ref.h"
+#include "tests/common/check.h"
 
 using namespace flyx;
 
 namespace {
-
-int failures = 0;
-void check(bool ok, const std::string& what) {
-  std::printf("%s %s\n", ok ? "ok" : "FAIL", what.c_str());
-  failures += !ok;
-}
 
 struct Side {
   const flyx_model_desc* d;
@@ -382,6 +377,7 @@ void same_drafter(const std::string& dir) {
 }  // namespace
 
 int main(int argc, char** argv) {
+  flyx::test::print_passes = true;
   if (argc != 2) return 2;
   const std::string dir = argv[1];
   fp4_inputs_by_device(dir + "/tiny_w4a4.flyx");
@@ -406,6 +402,5 @@ int main(int argc, char** argv) {
   check(lists("qwen35") && lists("qwen3") && !lists("llama"), "the architectures whose GGUFs open: qwen35, qwen3");
   refused(q3, dir, "a zero hidden size", "qwen3.embedding_length", [](char* p) { std::memset(p + 4, 0, 4); });
   refused(q3, dir, "a missing tensor", "blk.0.attn_k", [](char* p) { p[-1] = 'x'; });
-  std::printf("%d failures\n", failures);
-  return failures ? 1 : 0;
+  return flyx::test::finish("gguf_models_test");
 }

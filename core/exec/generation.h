@@ -59,6 +59,7 @@ struct SamplingParams {
 
 struct GenerateRequest {
   std::vector<int32_t> prompt;            // the whole conversation, as tokens
+  PromptEncoding prompt_encoding;         // how its text was read (prepare_request); unknown for given tokens
   std::vector<int32_t> checkpoints;       // prompt positions worth a checkpoint (message boundaries)
   std::vector<int32_t> cache_prefixes;    // explicit client cache breakpoints in ascending order
   int32_t system_end = 0;                 // system instructions and tools precede the first user
@@ -110,6 +111,7 @@ struct GenerateResult {
   int lookup_rounds = 0;                  // rounds whose drafts were looked up in the sequence
   int lookup_accepted = 0;                // their drafts accepted
   std::vector<int> drafter_rounds;        // rounds each drafter drafted (Model::drafter_name), by number
+  int adaptive_rounds = 0;                // rounds launched on a drafter's adaptive plan (its stop rule's rounds)
   // Rounds of each of the engine's rounds to choose from (Engine::widths(), round_name()), and the drafts they
   // accepted: what the speculation controller chose (lookup rounds apart).
   std::vector<int> round_choices, round_accepted;
@@ -170,7 +172,10 @@ class Generation {
   // Follow with commit_round() for the selected candidate before launching.
   bool round_candidates(std::vector<RoundCandidate>* out);
   void commit_round(const RoundChoice& choice, NextRound* out);
-  void launched(const NextRound& r) { launched_[in_flight_++] = r.round; }
+  void launched(const NextRound& r) {
+    launched_[in_flight_++] = r.round;
+    result_.adaptive_rounds += r.g.stop_policy != nullptr;  // prepare_round gives one with the adaptive plan only
+  }
   void launch_failed(const std::string& why) { fail("launch: " + why, true); }
 
  private:
@@ -218,15 +223,18 @@ class Generation {
   size_t cut_ = 0;
   int pos_ = 0;                    // prompt tokens given to the device
   int keep_ = -1;                  // the cut whose checkpoint is kept
+  bool ends_at_boundary_ = false;  // a requested checkpoint is the prompt's end: the last pass's start is kept for it
   bool checkpoint_due_ = false;    // the pass in flight ends at a cut, or crosses one: its checkpoint, once it has run
   int crossed_cut_ = -1;           // when >= 0, the intra-pass cut that checkpoint_due_ will capture
   bool due_keep_ = false;          // that checkpoint is the kept one (keep_)
-  bool end_keep_ = false;          // the last pass crossed keep_: the checkpoint after the first token is the kept one
+  bool end_keep_ = false;          // the last pass crossed keep_, or keep_ is the prompt's end: the checkpoint after
+                                   // the first token is the kept one
   // reply
   int emitted_ = 0;                // tokens counted against max_new
   int finish_ = 0;                 // flyx_finish_reason once the reply has ended
   // rounds
   bool every_ = false;             // GenerateRequest::grammar_reference
+  bool grammar_over_ = false;      // the grammar took a stop token the request goes on past (ignore_eos)
   bool launching_ = false;
   int64_t next_disk_stage_ = 0;    // next accepted position at which to stage generated KV (0: no disk tier)
   bool stage_due_ = false;         // drain outstanding rounds before reading their state

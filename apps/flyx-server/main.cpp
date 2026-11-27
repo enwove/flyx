@@ -29,16 +29,19 @@
 #include <filesystem>
 #include <fstream>
 #include <memory>
+#include <optional>
 #include <string>
 #include <string_view>
 #include <thread>
 
+#include "apps/common/api_key.h"
 #include "apps/common/defaults.h"
 #include "apps/common/engine_flags.h"
 #include "apps/common/model_source.h"
 #include "apps/common/numbers.h"
 #include "apps/flyx-cli/monitor.h"
 #include "apps/flyx-server/server.h"
+#include "core/interfaces/options.h"
 #include "core/os/env.h"
 #include "core/os/os.h"
 #include "core/os/path.h"
@@ -47,11 +50,23 @@ namespace {
 
 volatile std::sig_atomic_t g_stop_signal = 0;
 
+class Listener : public httplib::Server {
+ public:
+  std::string bound_host(const std::string& requested) const {
+    std::string address;
+    int port = 0;
+    httplib::detail::get_local_ip_and_port(svr_sock_, address, port);
+    return address.empty() ? requested : address;
+  }
+};
+
 void on_signal(int) { g_stop_signal = 1; }
 
 // The address a browser on this machine reaches a server listening on `host` at.
 std::string local_url(const std::string& host, int port) {
-  std::string h = host == "0.0.0.0" || host == "::" || host.empty() ? "127.0.0.1" : host;
+  std::string h = host;
+  if (h == "::") h = "::1";
+  else if (h == "0.0.0.0" || h.empty()) h = "127.0.0.1";
   if (h.find(':') != std::string::npos && h.front() != '[') h = "[" + h + "]";
   return "http://" + h + ":" + std::to_string(port);
 }
@@ -79,8 +94,8 @@ void pause_owned_console() {
                "  MODEL                a .gguf or .flyx file, or a Hugging Face name (org/name:QUANT), fetched into\n"
                "                       the Hugging Face cache; without it the last model served, or none until the\n"
                "                       dashboard's model panel loads one\n"
-               "  --host H             address to listen on (default 127.0.0.1)\n"
-               "  --port P             port (default 8080)\n"
+               "  --host H             listen address, overriding the dashboard LAN setting (default 127.0.0.1)\n"
+               "  --port P             port (default 8080, 0 lets the OS choose)\n"
                "  --name NAME          model name reported by the API (default: the file's name)\n"
                "  --models-dir DIR     a directory of model files (.gguf, .flyx) the dashboard lists beside the\n"
                "                       Hugging Face cache's, searched 6 directories deep (repeatable; FLYX_MODELS_DIR:\n"
@@ -164,7 +179,8 @@ namespace {
 
 // What the command line asks for.
 struct ServeArgs {
-  std::string model, name, host = flyx::apps::kDefaultHost;
+  std::string model, name;
+  std::optional<std::string> host;
   std::vector<std::string> models_dirs;
   std::string dashboard_dir;  // --dashboard-dir: the page's files read from here first
   int port = flyx::apps::kDefaultPort, threads = flyx::apps::kDefaultHttpThreads;
@@ -191,7 +207,7 @@ ServeArgs parse_args(int argc, char** argv) {
     };
     if (f == "--host") a.host = next();
     else if (f == "--port") {
-      a.port = apps::whole_flag("--port", next(), 1, 65535);
+      a.port = apps::whole_flag("--port", next(), 0, 65535);
       a.port_given = true;
     }
     else if (f == "--name") a.name = next();
@@ -228,10 +244,7 @@ ServeArgs parse_args(int argc, char** argv) {
   }
   sampling_overrides.apply(&a.cfg.think_defaults);
   sampling_overrides.apply(&a.cfg.plain_defaults);
-  if (a.cfg.api_key.empty()) {
-    a.cfg.api_key = os::getenv_str(env::kApiKey);
-    if (a.cfg.api_key.empty()) a.cfg.api_key = os::getenv_str(env::kKeyAlias);
-  }
+  if (a.cfg.api_key.empty()) a.cfg.api_key = apps::api_key_from_env();
   for (const std::string& d : apps::models_dirs_from_env()) a.models_dirs.push_back(d);
   return a;
 }
@@ -316,7 +329,7 @@ void add_base_routes(httplib::Server& http, ModelHost& models, const std::string
                                         "/v1/messages", "/v1/messages/count_tokens", "/v1/telemetry", "/v1/load",
                                         "/v1/unload", "/v1/hub/config", "/v1/hub/search", "/v1/hub/files",
                                         "/v1/hub/cached", "/v1/hub/dir", "/v1/requests",
-                                        "/v1/logs", "/health",
+                                        "/v1/logs", "/v1/settings/network", "/health",
                                         "/dashboard"}}});
   });
   http.Get("/favicon.ico", [file](const httplib::Request&, httplib::Response& res) { file("brand/favicon.ico", res); });
@@ -342,7 +355,8 @@ void add_base_routes(httplib::Server& http, ModelHost& models, const std::string
 
 int run(int argc, char** argv) {
   const ServeArgs args = parse_args(argc, argv);
-  const std::string &model = args.model, &host = args.host;
+  const std::string& model = args.model;
+  const std::string host = args.host ? *args.host : ModelHost::lan_access() ? "0.0.0.0" : apps::kDefaultHost;
   int port = args.port;
   const EngineOptions& eo = args.eo;
   const Config& cfg = args.cfg;
@@ -354,7 +368,7 @@ int run(int argc, char** argv) {
   // kernel then deals connections between the two; SO_REUSEADDR on Windows, where which of them answers is not
   // defined), so a second `flyx serve` started by mistake would take half the requests with another model.
   auto make_http = [] {
-    auto s = std::make_unique<httplib::Server>();
+    auto s = std::make_unique<Listener>();
     s->set_socket_options([](socket_t sock) {
       const int on = 1;
 #ifdef _WIN32
@@ -365,13 +379,12 @@ int run(int argc, char** argv) {
     });
     return s;
   };
-  std::unique_ptr<httplib::Server> http_ptr = make_http();
-  bool bound = false;
-  for (int p = port; p <= std::min(65535, port + 32); ++p) {
-    if (p > port) http_ptr = make_http();
-    if (http_ptr->bind_to_port(host, p)) {
+  std::unique_ptr<Listener> http_ptr;
+  for (int p = port; p > 0 && p <= std::min(65535, port + 32); ++p) {
+    auto cand = make_http();
+    if (cand->bind_to_port(host, p)) {
+      http_ptr = std::move(cand);
       port = p;
-      bound = true;
       break;
     }
     if (args.port_given) break;
@@ -389,22 +402,22 @@ int run(int argc, char** argv) {
       return 1;
     }
   }
-  if (!bound && !args.port_given) {
+  if (!http_ptr && (port == 0 || !args.port_given)) {
     auto cand = make_http();
     const int any = cand->bind_to_any_port(host);
     if (any > 0) {
       http_ptr = std::move(cand);
       port = any;
-      bound = true;
     }
   }
-  if (!bound) {
+  if (!http_ptr) {
     os::write_original_stderr("error: cannot listen on " + host + ":" + std::to_string(port) +
                               " (in use by another flyx serve or another program? --port N takes another)\n");
     pause_owned_console();
     return 1;
   }
   httplib::Server& http = *http_ptr;
+  const std::string bound_host = http_ptr->bound_host(host);
 
   // On a terminal: the dashboard from now on (what the process writes to standard error goes into its log), and the
   // page in the browser once the server answers.
@@ -457,7 +470,7 @@ int run(int argc, char** argv) {
     for (const auto& l : system_log.last(12)) tail += l + "\n";
     os::write_original_stderr(tail);
   };
-  if (port != args.port)
+  if (!args.port_given && port != args.port)
     std::fprintf(stderr, "flyx-server: port %d is in use; listening on %s instead\n", args.port, base.c_str());
 
   std::string err;
@@ -487,7 +500,15 @@ int run(int argc, char** argv) {
     EngineOptions init_eo = start_from;
     init_eo.mmproj_file = eo.vision ? eo.mmproj_file : "";
     init_eo.lora_file = eo.lora_file;  // the command line's adapter is this model's
-    if (!models.run(ModelHost::Want{model, eo.drafter_files, init_eo, args.name}, &err)) {
+    std::string init_dh = flyx::interfaces::backend_opt_get(init_eo.backend_options, "draft_head");
+    if (init_dh != "full") init_dh.clear();
+    std::string init_dw;
+    if (const std::string raw_dw = flyx::interfaces::backend_opt_get(init_eo.backend_options, "draft_weights");
+        !raw_dw.empty()) {
+      std::string canon;
+      if (flyx::interfaces::parse_draft_weights(raw_dw, nullptr, &canon, nullptr) && canon != "auto") init_dw = canon;
+    }
+    if (!models.run(ModelHost::Want{model, eo.drafter_files, init_eo, args.name, init_dh, init_dw}, &err)) {
       end_dashboard(true);
       os::write_original_stderr("error: " + err + "\n");
       pause_owned_console();
@@ -525,6 +546,7 @@ int run(int argc, char** argv) {
   add_openai_responses_routes(http, &srv);
   add_telemetry_routes(http, &srv);
   add_manage_routes(http, &srv);
+  add_network_routes(http, &srv, bound_host, port, args.host.has_value());
   add_request_log_routes(http, &srv);
   add_system_log_routes(http, &srv);
 

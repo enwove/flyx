@@ -21,7 +21,7 @@ class ModelFile;
 namespace flyx::interfaces {
 
 struct ModelOptions {
-  std::string drafter;      // "mtp", "dflash2", "dv", "all", "none", or "" for the model's default set
+  std::string drafter;      // kDrafterModes' words (options.h), or "" for the model's default set
   bool speculative = true;  // false: no drafter
   // "" = as each weight's file has it; "exact" = the formats' own rounding everywhere; "nvfp4" = NVFP4 weights take
   // NVFP4 inputs in passes of more rows whatever the file says, other weights as the file has it.
@@ -50,6 +50,10 @@ class Model {
   // Sorted verify checkpoints (subset of draft_widths(d)) for an intra-round
   // adaptive stopping plan on drafter d; empty disables adaptive plans for d.
   virtual std::vector<int> adaptive_checkpoints(int /*d*/) const { return {}; }
+  // Whether one more draft of drafter d costs little beside the verify row it adds (a block drafted at once and
+  // refined a draft at a time): an adaptive round that stops may then verify fewer drafts than it has
+  // (flyx_program::earlier_checkpoints).  Where a draft step is a pass of a layer, what is drafted is verified.
+  virtual bool draft_steps_cheap(int /*d*/) const { return false; }
   // The drafts one pass of drafter d's block makes as it was trained (DFlash2: its block less one; MTP: its widest
   // chain): a tree round's trunk.  draft_widths may go past it (a DFlash2 block drafted wider).
   virtual int block_drafts(int d) const = 0;
@@ -59,9 +63,13 @@ class Model {
   // Drafter d's rounds are always a tree of its drafts: its round programs say so themselves (FLYX_DRAFT_TREE), and
   // no chain of its drafts is a trunk the tree grows from (DV's).
   virtual bool drafts_trees(int) const { return false; }
-  // The file holds a drafter whose rounds are always trees (DV), whether or not it was asked for: the engine's default
-  // K/V method then reads every position with it or without, so that naming it changes no token (AGENTS.md gate 4).
+  // The file holds a drafter whose rounds are trees (DV's always, DSpark's by default), whether or not it was asked
+  // for: the engine's default K/V method then reads every position with it or without, so that naming it changes no
+  // token (AGENTS.md gate 4).
   virtual bool file_drafts_trees() const { return false; }
+  // Draft trees (FLYX_DRAFT_TREE rounds beside the chains, the chooser taking them where they pay) unless the caller
+  // says otherwise: DSpark's, whose trees verify more tokens a round than its chains on the targets it is made for.
+  virtual bool draft_trees_by_default() const { return false; }
   // Drafter d keeps a state that follows its own rounds only (DV's canvas): a round of another kind, a prefill, a
   // rewind or a restore leaves it behind, and its next round drafts from a state that starts over (DV's first tree,
   // its star of MASKs, which commits one token).  round_program(0, d, false) is then its warm-up: plain decoding that
@@ -95,5 +103,8 @@ std::unique_ptr<Model> open_model(const ModelFile& file, const ModelOptions& o, 
 // The architectures open_model knows, as model files name theirs, whose GGUF files it reads (a Llama: .flyx only):
 // for saying before a file is fetched whether this build runs it.
 std::vector<std::string> model_architectures();
+// The architectures open_model opens with a vision projector (--mmproj): for deciding before fetching a
+// repository's mmproj companion whether this build reads vision for the model.
+std::vector<std::string> vision_architectures();
 
 }  // namespace flyx::interfaces

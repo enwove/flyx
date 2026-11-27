@@ -1,6 +1,7 @@
 // Copyright 2026 The flyx Authors. SPDX-License-Identifier: Apache-2.0
 // Prefill passes and rounds (graphs, the token ring), waiting for the device, rollback, checkpoints and their
 // snapshots in host memory.
+#include "backends/cuda/runtime/checked_size.h"
 #include <algorithm>
 #include <condition_variable>
 #include <cstddef>
@@ -12,15 +13,19 @@
 #include "backends/common/snapshot_format.h"
 #include "backends/cuda/backend.h"
 #include "backends/cuda/runtime/strata_snapshot.h"
+#include "backends/cuda/runtime/window_ring.h"
 
 namespace flyx::cuda {
 
 namespace {
 
+// The pass's result reaches the host through a kernel's stores into the ring's mapped mirror: in CUPTI traces of
+// Inkling-2 rounds (RTX 5070 Ti, Windows) a device-to-host copy node there started 50 to 150 us after the round's last
+// kernel, where a kernel follows it at once.
 void copy_ring(flyx_seq* s, cudaStream_t st, bool drain = true) {
   if (drain && !s->page_layers.empty())
     kv_drain_pageable(s->page_drain_dev, int(s->page_layers.size()), s->P, s->ring_dev, s->m->wide_rows, st);
-  CK(cudaMemcpyAsync(s->ring_host, s->ring_dev, sizeof(flyx_round_result) * kRing, cudaMemcpyDeviceToHost, st));
+  ring_publish(s->ring_dev, s->ring_host_dev, s->P, st);
 }
 
 void copy_ring(flyx_seq* s, bool drain = true) { copy_ring(s, s->st, drain); }
@@ -29,6 +34,8 @@ template <class Fn>
 int guarded(Fn&& fn) {
   try {
     return fn();
+  } catch (const OutOfDeviceMemory& e) {
+    return fail_oom(e.what());
   } catch (const std::exception& e) {
     return fail(e.what());
   }
@@ -100,31 +107,68 @@ void ensure_checkpoint_slot(flyx_seq* s, int c) {
   CK(cudaHostAlloc(&p, s->ckp_slot_bytes, cudaHostAllocDefault));
   s->host_allocs.push_back(p);
   auto* base = static_cast<unsigned char*>(p);
-  s->ckp_arena[c] = base;
   size_t off = 0;
-  auto take = [&](size_t bytes) -> float* {
-    const size_t aligned = (bytes + 255) / 256 * 256;
-    auto* ptr = reinterpret_cast<float*>(base + off);
+  auto take_raw = [&](size_t bytes) -> void* {
+    const size_t aligned = checkpoint_align(bytes);
+    // checkpoint_slot_bytes counts what is taken here (the pinned budget's split and the dry sizing count it too)
+    if (off > s->ckp_slot_bytes || aligned > s->ckp_slot_bytes - off)
+      throw std::logic_error("a checkpoint's state past checkpoint_slot_bytes");
+    void* ptr = base + off;
     off += aligned;
     return ptr;
   };
+  auto take = [&](size_t bytes) -> float* { return static_cast<float*>(take_raw(bytes)); };
   for (auto& g : s->gdn) {
-    g.ckp_S[c] = take(g.s_stride * sizeof(float));
-    g.ckp_win[c] = take(g.w_stride * sizeof(float));
+    g.ckp_S[c] = take(size_mul(g.s_stride, sizeof(float)));
+    g.ckp_win[c] = take(size_mul(g.w_stride, sizeof(float)));
+  }
+  for (auto& sc : s->sconv) sc.ckp_win[c] = take(size_mul(sc.w_stride, sizeof(float)));
+  for (size_t i = 0; i < s->kv.size(); ++i) {
+    auto& kb = s->kv[i];
+    if (!kb.swa_ring) continue;
+    const KvSpec& ks = s->m->states.kv[i];
+    const size_t elem = ks.fp8 ? 1 : sizeof(kv16);
+    const size_t bytes = size_mul(size_mul(size_mul(kb.ring, ks.nkv), ks.hd), elem);
+    kb.ckp_k[c] = take_raw(bytes);
+    kb.ckp_v[c] = take_raw(bytes);
+    if (ks.fp8) {
+      const size_t sbytes = size_mul(size_mul(kb.ring, ks.nkv), sizeof(float));
+      kb.ckp_ks[c] = take(sbytes);
+      kb.ckp_vs[c] = take(sbytes);
+    }
   }
   if (const int w = s->m->states.ring_width) {
     s->ring_ckp[c] = take(size_t(w) * sizeof(float));
     std::memset(s->ring_ckp[c], 0, size_t(w) * sizeof(float));
   }
+  s->ckp_arena[c] = base;
 }
 
 void copy_checkpoint_state(flyx_seq* s, int c, int sl, int pos, bool save, bool snap = false) {
   auto move = [&](void* host, void* dev, size_t bytes) {
+    if (bytes == 0) return;
     CK(cudaMemcpyAsync(save ? host : dev, save ? dev : host, bytes, cudaMemcpyDefault, s->st));
   };
   for (auto& g : s->gdn) {
     move(g.ckp_S[c], g.S + sl * g.s_stride, g.s_stride * sizeof(float));
     move(g.ckp_win[c], g.win + sl * g.w_stride, g.w_stride * sizeof(float));
+  }
+  for (auto& sc : s->sconv) move(sc.ckp_win[c], sc.win + sl * sc.w_stride, sc.w_stride * sizeof(float));
+  for (size_t i = 0; i < s->kv.size(); ++i) {
+    auto& kb = s->kv[i];
+    if (!kb.swa_ring) continue;
+    const int n_slots = std::min(pos, kb.ring);
+    if (n_slots <= 0) continue;
+    const KvSpec& ks = s->m->states.kv[i];
+    const size_t elem = ks.fp8 ? 1 : sizeof(kv16);
+    const size_t bytes = size_t(n_slots) * size_t(ks.nkv) * size_t(ks.hd) * elem;
+    move(kb.ckp_k[c], kb.k, bytes);
+    move(kb.ckp_v[c], kb.v, bytes);
+    if (ks.fp8) {
+      const size_t sbytes = size_t(n_slots) * size_t(ks.nkv) * sizeof(float);
+      move(kb.ckp_ks[c], kb.ks, sbytes);
+      move(kb.ckp_vs[c], kb.vs, sbytes);
+    }
   }
   const size_t w = size_t(s->m->states.ring_width);
   if (s->ring && pos > 0) {  // snap: saved before hring_put overwrote kHring slots; else the ring holds pos - 1
@@ -233,11 +277,27 @@ void reset_state(flyx_seq* s, int anchor) {
     CK(cudaMemsetAsync(g.S, 0, FLYX_ROUND_SLOTS * g.s_stride * sizeof(float), s->st));
     CK(cudaMemsetAsync(g.win, 0, FLYX_ROUND_SLOTS * g.w_stride * sizeof(float), s->st));
   }
+  for (auto& sc : s->sconv)
+    CK(cudaMemsetAsync(sc.win, 0, FLYX_ROUND_SLOTS * sc.w_stride * sizeof(float), s->st));
   for (auto& mt : s->meta) mt = {};
   s->rope_delta = 0;
   s->prev_pos3d_at = -1;
+  s->ring_hi = 0;  // the rings are written again from position 0, in order
+  s->dring.reset();
   set_params(s, 0, anchor, 0);
 }
+
+namespace {
+// Positions [from, to) of a sliding-window DFlash2 context ring written (s->dring): what they overwrote is gone.  A
+// round whose every rewind target lost the drafter's window is no longer a rollback source; rewind() checks the
+// position it is given as well.
+void ring_wrote(flyx_seq* s, int from, int to) {
+  if (!s->dring.slots()) return;
+  s->dring.wrote(from, to);
+  for (auto& mt : s->meta)
+    if (mt.valid && !s->dring.holds(mt.start + mt.rows)) mt.valid = false;
+}
+}  // namespace
 
 // Upload generation parameters when they changed (rounds read them on the device).
 void set_gen(flyx_seq* s, const flyx_gen_params* g) {
@@ -425,6 +485,7 @@ int prefill_ex(flyx_plan* p, flyx_seq* s, const flyx_prefill_input* in, const fl
     s->copy_home(false);
     s->copy_written(s->position);
     s->staged(s->position + n);
+    ring_wrote(s, s->position, s->position + n);  // its context rows, counted first: a pass that fails wrote some
     forward(ps);
     s->flush_page_prefill(s->position, n);
     s->snap_pos = s->pass_snap;
@@ -445,6 +506,7 @@ int prefill_ex(flyx_plan* p, flyx_seq* s, const flyx_prefill_input* in, const fl
     prefill_done(s->P, n, m->prefill_bufs.choice, sample_last, s->ring_dev, s->G, s->reply, s->st);
     CK(cudaEventRecord(m->prefill_ev, s->st));
     s->position += n;
+    s->ring_hi = std::max(s->ring_hi, s->position);
     if (sample_last) {
       copy_ring(s, false);
       ++s->seq_no;
@@ -452,6 +514,13 @@ int prefill_ex(flyx_plan* p, flyx_seq* s, const flyx_prefill_input* in, const fl
       s->pending.push_back({'P', 0});
     }
     s->update_write_hi();
+    // A pass moves the position on and not the round: the rounds before it stay rollback sources, their recurrent
+    // state (gated delta nets, ShortConvs) in their own slots and replay rows, which a pass leaves as they are.  The
+    // rings it writes do not keep the positions of those rounds once the passes have gone round (rewind_floor): a
+    // round all of whose positions are before the floor is no source any more.
+    const int rewind_from = s->rewind_floor();
+    for (auto& mt : s->meta)
+      if (mt.valid && mt.start + mt.rows < rewind_from) mt.valid = false;
     if (in->n_embeds > 0 || in->pos_3d || in->set_rope_delta) sync_stream(s);
     CK(cudaGetLastError());
     return 0;
@@ -778,9 +847,9 @@ int encode_vision(flyx_plan* p, const flyx_vision_input* in, float* out_embeds, 
     int32_t* d_cu = d_gw + N;
     void* sc_mem = take(sc_bytes);
     Scratch sc = scratch_carve(sc_mem, sc_bytes, N, max_k, need_q8, need_a4, false, need_a4);
+    if (sc.round_count) CK(cudaMemsetAsync(sc.round_count, 0, sc.round_count_cap * sizeof(int), sg.st));
     if (need_q8) {
       if (sc.q8_count) CK(cudaMemsetAsync(sc.q8_count, 0, kQ8Tiles * sizeof(int), sg.st));
-      if (sc.round_count) CK(cudaMemsetAsync(sc.round_count, 0, sc.round_count_cap * sizeof(int), sg.st));
       if (sc.side_count) CK(cudaMemsetAsync(sc.side_count, 0, sc.side_count_cap * sizeof(int), sg.st));
     }
 
@@ -1175,6 +1244,20 @@ void flyx_seq::forget_hot() {
     }
 }
 
+// The highest floor of the rings of slots checkpointed on host (KvBuf::swa_ring, the MTP layer's too:
+// window_ring_floor).  One keeps its first `sink` positions for good and the others in turn (KvRef::slot_of), of those
+// the ring_hi - (ring - sink) latest.
+int flyx_seq::rewind_floor() const {
+  int64_t first = 0;
+  for (size_t i = 0; i < kv.size(); ++i) {
+    const flyx::cuda::KvBuf& b = kv[i];
+    if (!b.swa_ring) continue;
+    const int64_t window = b.window > 0 ? b.window : m->states.kv[i].window;
+    first = std::max(first, flyx::cuda::window_ring_floor(ring_hi, b.ring, b.sink, window));
+  }
+  return int(std::min<int64_t>(first, INT32_MAX));
+}
+
 // The rows of a round launched now: the first at the position the host last read or past it (the
 // rounds in flight move it on by at most their rows), the last at most their rows plus this round's further.
 int flyx_seq::strata_phase(int rows) const {
@@ -1280,8 +1363,9 @@ RoundPass round_pass(flyx_plan* p, flyx_seq* s, const flyx_gen_params* g, bool p
 
 #if CUDART_VERSION >= 12040
 // Flat GPU-resident conditional graph for an adaptive round plan:
-// - Sequential drafters (MTP, EAGLE-4): chunk 0 -> decide -> IF(draft chunk 1 -> decide) -> ... -> IF(verify w_j).
-// - Parallel block drafters (DFlash2, DSpark): full block draft -> decide -> IF(verify w_j).
+// - Step-wise drafters (MTP, EAGLE-4, DSpark Markov head): chunk 0 -> decide -> IF(draft chunk 1 -> decide) -> ... ->
+//   IF(verify w_j): the checkpoint the stop is at, or an earlier one where the program allows it (earlier_checkpoints).
+// - Parallel block drafters (DFlash2): full block draft -> decide -> IF(verify w_j).
 // Zero CPU sync; full FLYX_MAX_IN_FLIGHT=2 pipelining; handles reset to 0 on every launch.
 bool capture_adaptive_graph(flyx_plan* p, flyx_seq* s, const RoundPass& r, cudaGraph_t* out, GraphSize* size_out) {
   cudaGraph_t root = nullptr;
@@ -1350,21 +1434,20 @@ bool capture_adaptive_graph(flyx_plan* p, flyx_seq* s, const RoundPass& r, cudaG
     return ok;
   };
 
+  StopCondHandles ver_handles{};
+  for (int j = 0; j < M; ++j) ver_handles.h[j] = static_cast<unsigned long long>(h_ver[size_t(j)]);
   std::vector<cudaGraphNode_t> prev;
   if (seq_draft) {
     if (!capture_into(root, {}, [&] {
           draft_step_range(r.ps, 0, p->checkpoints[0]);
-          stop_decide_step(s->draft_prob, s->draft_margin, s->stop_dev, s->stop_state, 0, 0, p->checkpoints[0],
-                           static_cast<unsigned long long>(h_draft[1]), static_cast<unsigned long long>(h_ver[0]),
-                           s->st);
+          stop_decide_step(s->draft_prob, s->draft_margin, s->stop_dev, s->stop_state, 0, p->checkpoints[0],
+                           static_cast<unsigned long long>(h_draft[1]), ver_handles, p->earlier_checkpoints, s->st);
         }, &prev))
       return false;
   } else {
-    StopCondHandles handles{};
-    for (int j = 0; j < M; ++j) handles.h[j] = static_cast<unsigned long long>(h_ver[size_t(j)]);
     if (!capture_into(root, {}, [&] {
           draft_step_range(r.ps, 0, p->width);
-          stop_decide_block(s->draft_prob, s->draft_margin, s->stop_dev, s->stop_state, handles, s->st);
+          stop_decide_block(s->draft_prob, s->draft_margin, s->stop_dev, s->stop_state, ver_handles, s->st);
         }, &prev))
       return false;
   }
@@ -1387,10 +1470,10 @@ bool capture_adaptive_graph(flyx_plan* p, flyx_seq* s, const RoundPass& r, cudaG
       const int w0 = p->checkpoints[size_t(j - 1)];
       const int w1 = p->checkpoints[size_t(j)];
       const unsigned long long h_nxt = (j + 1 < M) ? static_cast<unsigned long long>(h_draft[size_t(j + 1)]) : 0ull;
-      const unsigned long long h_v = static_cast<unsigned long long>(h_ver[size_t(j)]);
       if (!capture_into(body, {}, [&] {
             draft_step_range(r.ps, w0, w1);
-            stop_decide_step(s->draft_prob, s->draft_margin, s->stop_dev, s->stop_state, j, w0, w1, h_nxt, h_v, s->st);
+            stop_decide_step(s->draft_prob, s->draft_margin, s->stop_dev, s->stop_state, j, w1, h_nxt, ver_handles,
+                             p->earlier_checkpoints, s->st);
           }, nullptr))
         return false;
       bodies.push_back(graph_size(body, s->m->graph_prices));
@@ -1627,6 +1710,11 @@ int launch_batch(flyx_plan* const* plans, flyx_seq* const* seqs, const flyx_gen_
     if (!seqs[i]) return no_sequence("launch_batch");
   if (n == 1) return launch(plans[0], seqs[0], gens[0]);
   flyx_bmodel* m = seqs[0]->m;
+  if (m->need.max_bank > 0 || m->dspark_block >= 0) {
+    for (int i = 0; i < n; ++i)
+      if (const int r = launch(plans[i], seqs[i], gens[i]); r != 0) return r;
+    return 0;
+  }
   int rows = 0;
   for (int i = 0; i < n; ++i) {
     if (plans[i]->phase != FLYX_PHASE_ROUND || plans[i]->m != m || seqs[i]->m != m)
@@ -1791,7 +1879,10 @@ int read_result(flyx_seq* s, flyx_round_result* out) {
     *out = s->ring_host[seq % kRing];
     if (out->seq_no != seq) return fail("ring entry out of order (" + std::to_string(out->seq_no) + ")");
     s->read_no = seq;
-    char kind = s->pending.front().kind;
+    const char kind = s->pending.front().kind;
+    const int rows = s->pending.front().rows;
+    // A round writes its rows from the position it started at (its accepted ones, then the rest), stopped or not.
+    if (kind == 'R') s->ring_hi = std::max(s->ring_hi, out->position - out->n_tokens + rows);
     s->pending.pop_front();
     if (kind == 'R' && out->n_tokens > 0) {
       s->drain_page_host(seq, out->position, out->n_tokens);
@@ -1800,6 +1891,11 @@ int read_result(flyx_seq* s, flyx_round_result* out) {
       s->meta[flyx_round_slot(s->round)].valid = false;
     }
     s->position = out->position;
+    // A round wrote its rows from its start, and its draft block its own rows there: rejected ones too.
+    if (kind == 'R') {
+      const int start = out->position - out->n_tokens;
+      ring_wrote(s, start, start + std::max(rows, FLYX_MAX_ROWS));
+    }
     s->update_write_hi();
     return 0;
   });
@@ -1877,17 +1973,38 @@ int rewind(flyx_seq* s, int32_t pos, int32_t anchor) {
       set_params(s, pos, anchor, s->round);
       return 1;
     }
+    if (!s->dring.holds(pos)) {  // the drafter's window at pos: overwritten in its ring since (prefill, rounds)
+      reset_state(s, anchor);
+      return 0;
+    }
     for (int back = 1; back < FLYX_ROUND_SLOTS && s->round - back >= 0; ++back) {
       const int r = s->round - back, sl = flyx_round_slot(r), to = flyx_round_slot(r + 1);
       const int rsl = r % kGdnReplaySlots;
       const auto& mt = s->meta[sl];
       if (!mt.valid || pos < mt.start || pos > mt.start + mt.rows) continue;
+      // The round's recurrent state is there, but a ring no longer holds the window the row at pos reads (prefill
+      // passes since have gone round it): outside the rollback window, a checkpoint or a new prefill instead.
+      if (pos < s->rewind_floor()) break;
       const int rows = pos - mt.start;
       for (auto& g : s->gdn) {
         gdn_recur(g.S, g.s_stride, kSlotExplicit + sl, kSlotExplicit + to, g.replay, kSlotExplicit + rsl, s->P, nullptr,
                   rows, nullptr, false, s->st);
         gdn_conv_fold(g.win, g.w_stride, kSlotExplicit + sl, kSlotExplicit + to, g.replay, kSlotExplicit + rsl, s->P,
                       rows, nullptr, false, s->st);
+      }
+      if (!s->sconv.empty()) {
+        if (s->sconv_alike) {
+          const ShortConvBuf& f = s->sconv[0];
+          shortconv_fold(s->sconv_layers, int(s->sconv.size()), f.w_stride, f.r_stride, kSlotExplicit + sl,
+                         kSlotExplicit + to, kSlotExplicit + rsl, f.channels, f.conv, s->P, rows, nullptr, false,
+                         s->st);
+        } else {
+          for (size_t i = 0; i < s->sconv.size(); ++i) {
+            const ShortConvBuf& sc = s->sconv[i];
+            shortconv_fold(s->sconv_layers + i, 1, sc.w_stride, sc.r_stride, kSlotExplicit + sl, kSlotExplicit + to,
+                           kSlotExplicit + rsl, sc.channels, sc.conv, s->P, rows, nullptr, false, s->st);
+          }
+        }
       }
       s->meta[sl].rows = rows;  // tokens past pos are discarded; later rewinds must not replay stale rows
       for (int k = 1; k <= back; ++k) s->meta[flyx_round_slot(r + k)].valid = false;
@@ -1914,7 +2031,12 @@ int checkpoint(flyx_seq* s, int32_t c) {
     const bool snap = s->snap_pos >= 0;
     const int pos = snap ? s->snap_pos : s->position;
     const int sl = snap ? s->snap_slot : flyx_round_slot(s->round);
+    if (!s->dring.holds(pos)) {
+      s->ckp[c].valid = false;
+      return fail("checkpoint: the drafter's window at " + std::to_string(pos) + " is no longer in its ring");
+    }
     copy_checkpoint_state(s, c, sl, pos, true, snap);
+    s->dring.keep(c, pos);
     s->ckp[c].valid = true;
     s->ckp[c].pos = pos;
     s->ckp[c].rope_delta = snap ? s->snap_rope_delta : s->rope_delta;
@@ -1931,13 +2053,19 @@ int prefill_snapshot(flyx_seq* s, int32_t pos) {
 int restore(flyx_seq* s, int32_t c, int32_t anchor) {
   if (!s) return no_sequence("restore");
   if (c < 0 || c >= FLYX_CHECKPOINTS || !s->ckp[c].valid) return -1;
+  // The checkpoint keeps no drafter window of its own: what the ring held of it, a later position overwrote.
+  if (!s->dring.kept(c)) return fail("restore: the drafter's window of that checkpoint is no longer in its ring");
   return guarded([&] {
     check_idle(s);
     copy_checkpoint_state(s, c, flyx_round_slot(s->round), s->ckp[c].pos, false);
     for (auto& mt : s->meta) mt = {};
     s->rope_delta = s->ckp[c].rope_delta;
     s->prev_pos3d_at = -1;
+    // The rings as the checkpoint saved them, at most a pass past its position (which their headroom covers); the
+    // rounds rewinds go back to are those after it.
+    s->ring_hi = s->ckp[c].pos;
     set_params(s, s->ckp[c].pos, anchor, s->round);
+    s->dring.restored(c);
     s->reload_page_ring(s->position);
     return s->position;
   });
@@ -1967,6 +2095,7 @@ uint64_t layout_hash(const flyx_seq* s) {
     mix(uint64_t(k.hd));
     mix(k.fp8);
     const KvBuf& b = s->kv[i];
+    if (k.window) mix(uint64_t(k.window) << 32 | 79);
     if (b.ring) mix(uint64_t(b.ring) << 32 | 75);  // a ring of slots: saved as its slots are
     if (b.kq) {  // the strata copy, saved with the cache: its format too
       mix(uint64_t(b.bits));
@@ -1982,6 +2111,13 @@ uint64_t layout_hash(const flyx_seq* s) {
     mix(uint64_t(g.dk));
     mix(uint64_t(g.ck));
     mix(uint64_t(g.C()));
+  }
+  if (!m->states.sconv.empty()) {
+    mix(0x53434f4e56ull);
+    for (const ShortConvSpec& sc : m->states.sconv) {
+      mix(uint64_t(sc.conv));
+      mix(uint64_t(sc.channels));
+    }
   }
   mix(uint64_t(m->states.ring_width));
   return h;
@@ -2000,6 +2136,7 @@ uint64_t snapshot_size(const flyx_seq* s, int begin, int pos) {
     }
   }
   for (const GdnBuf& g : s->gdn) n += (g.s_stride + g.w_stride) * sizeof(float);
+  for (const ShortConvBuf& sc : s->sconv) n += sc.w_stride * sizeof(float);
   return n + uint64_t(s->m->states.ring_width) * sizeof(float);
 }
 
@@ -2033,44 +2170,56 @@ void snapshot_parts(flyx_seq* s, int c, int begin, int pos, HostCursor& host, bo
                     save ? static_cast<const void*>(p) : static_cast<const void*>(h), len);
       });
     };
-    for (int l = 0; l < k.layers; ++l) {
-      if (b.pageable) {
-        const int split = std::clamp(b.device_positions, first, end);
-        auto split_kv = [&](void* dev, uint8_t* page) {
-          if (first < split)
-            copy(static_cast<uint8_t*>(dev) + size_t(first) * width * elem, size_t(split - first) * width * elem);
-          if (split < end)
-            copy_page(page + size_t(split - b.device_positions) * width * elem, size_t(end - split) * width * elem);
-        };
-        split_kv(b.k, b.k_page);
-        split_kv(b.v, b.v_page);
-        if (k.fp8) {
-          auto split_sc = [&](float* dev, float* page) {
-            if (first < split) copy(dev + size_t(first) * k.nkv, size_t(split - first) * k.nkv * sizeof(float));
-            if (split < end)
-              copy_page(page + size_t(split - b.device_positions) * k.nkv, size_t(end - split) * k.nkv * sizeof(float));
-          };
-          split_sc(b.ks, b.ks_page);
-          split_sc(b.vs, b.vs_page);
-        }
-        continue;
-      }
-      const size_t offset = (size_t(l) * b.layer_stride + size_t(first) * width) * elem;
+    if (b.swa_ring && save) {
       const size_t bytes = size_t(end - first) * width * elem;
-      copy(static_cast<uint8_t*>(b.k) + offset, bytes);
-      copy(static_cast<uint8_t*>(b.v) + offset, bytes);
-      if (k.fp8 && b.ks_host) {  // the device part's scales, then the others' from host memory
-        const int split = std::clamp(b.device_positions, first, end);
-        auto scales = [&](float* device, float* far) {
-          if (first < split) copy(device + size_t(first) * k.nkv, size_t(split - first) * k.nkv * sizeof(float));
-          if (split < end) copy(far + size_t(split) * k.nkv, size_t(end - split) * k.nkv * sizeof(float));
-        };
-        scales(b.ks, b.ks_host);
-        scales(b.vs, b.vs_host);
-      } else if (k.fp8) {
-        const size_t offset_scales = (size_t(l) * slots + first) * k.nkv;
-        copy(b.ks + offset_scales, size_t(end - first) * k.nkv * sizeof(float));
-        copy(b.vs + offset_scales, size_t(end - first) * k.nkv * sizeof(float));
+      copy(b.ckp_k[c], bytes);
+      copy(b.ckp_v[c], bytes);
+      if (k.fp8) {
+        const size_t sbytes = size_t(end - first) * k.nkv * sizeof(float);
+        copy(b.ckp_ks[c], sbytes);
+        copy(b.ckp_vs[c], sbytes);
+      }
+    } else {
+      for (int l = 0; l < k.layers; ++l) {
+        if (b.pageable) {
+          const int split = std::clamp(b.device_positions, first, end);
+          auto split_kv = [&](void* dev, uint8_t* page) {
+            if (first < split)
+              copy(static_cast<uint8_t*>(dev) + size_t(first) * width * elem, size_t(split - first) * width * elem);
+            if (split < end)
+              copy_page(page + size_t(split - b.device_positions) * width * elem, size_t(end - split) * width * elem);
+          };
+          split_kv(b.k, b.k_page);
+          split_kv(b.v, b.v_page);
+          if (k.fp8) {
+            auto split_sc = [&](float* dev, float* page) {
+              if (first < split) copy(dev + size_t(first) * k.nkv, size_t(split - first) * k.nkv * sizeof(float));
+              if (split < end)
+                copy_page(page + size_t(split - b.device_positions) * k.nkv,
+                          size_t(end - split) * k.nkv * sizeof(float));
+            };
+            split_sc(b.ks, b.ks_page);
+            split_sc(b.vs, b.vs_page);
+          }
+          continue;
+        }
+        const size_t offset = (size_t(l) * b.layer_stride + size_t(first) * width) * elem;
+        const size_t bytes = size_t(end - first) * width * elem;
+        copy(static_cast<uint8_t*>(b.k) + offset, bytes);
+        copy(static_cast<uint8_t*>(b.v) + offset, bytes);
+        if (k.fp8 && b.ks_host) {  // the device part's scales, then the others' from host memory
+          const int split = std::clamp(b.device_positions, first, end);
+          auto scales = [&](float* device, float* far) {
+            if (first < split) copy(device + size_t(first) * k.nkv, size_t(split - first) * k.nkv * sizeof(float));
+            if (split < end) copy(far + size_t(split) * k.nkv, size_t(end - split) * k.nkv * sizeof(float));
+          };
+          scales(b.ks, b.ks_host);
+          scales(b.vs, b.vs_host);
+        } else if (k.fp8) {
+          const size_t offset_scales = (size_t(l) * slots + first) * k.nkv;
+          copy(b.ks + offset_scales, size_t(end - first) * k.nkv * sizeof(float));
+          copy(b.vs + offset_scales, size_t(end - first) * k.nkv * sizeof(float));
+        }
       }
     }
     if (b.kq) {  // one layer's (strata attention): its codes 16 positions at a time, its scales
@@ -2104,6 +2253,8 @@ void snapshot_parts(flyx_seq* s, int c, int begin, int pos, HostCursor& host, bo
     copy(save ? g.ckp_S[c] : g.S + sl * g.s_stride, g.s_stride * sizeof(float));
     copy(save ? g.ckp_win[c] : g.win + sl * g.w_stride, g.w_stride * sizeof(float));
   }
+  for (ShortConvBuf& sc : s->sconv)
+    copy(save ? sc.ckp_win[c] : sc.win + sl * sc.w_stride, sc.w_stride * sizeof(float));
   const size_t w = size_t(s->m->states.ring_width) * sizeof(float);
   if (w && pos > 0) copy(save ? s->ring_ckp[c] : s->ring + size_t((pos - 1) % kHring) * (w / sizeof(float)), w);
   else if (w && save)  // no row before position 0
@@ -2116,6 +2267,8 @@ int snapshot_bytes(flyx_seq* s, int32_t c, int32_t begin, uint64_t* out) {
   if (!s) return no_sequence("snapshot_bytes");
   if (c < 0 || c >= FLYX_CHECKPOINTS || !s->ckp[c].valid) return fail("no checkpoint in that slot");
   if (begin < 0 || begin > s->ckp[c].pos) return fail("snapshot starts outside the checkpoint");
+  // A ring is saved as its slots are now: the checkpoint's window must still be there.
+  if (!s->dring.kept(c)) return fail("snapshot: the drafter's window of that checkpoint is no longer in its ring");
   *out = snapshot_size(s, begin, s->ckp[c].pos);
   return 0;
 }
@@ -2151,13 +2304,16 @@ int snapshot_load(flyx_seq* s, const flyx_host_pieces* src, uint64_t bytes, int3
     check_idle(s);
     HostCursor host{src, sizeof h};
     s->copy_home(false);  // the copy loaded to its host home, every position changed
+    s->dring.replacing();  // a ring's every slot
     snapshot_parts(s, -1, h.begin, h.pos, host, false);
     s->reload_page_ring(h.pos);
     s->copy_written(h.begin);
     for (auto& mt : s->meta) mt = {};
     s->rope_delta = h.rope_delta;
     s->prev_pos3d_at = -1;
+    s->ring_hi = h.pos;  // as restore: the rings the snapshot's checkpoint saved
     set_params(s, h.pos, anchor, s->round);
+    s->dring.loaded(h.pos);
     sync_stream(s);  // the bytes are the caller's
     return s->position;
   });

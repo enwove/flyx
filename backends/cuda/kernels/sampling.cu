@@ -4,6 +4,8 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <stdexcept>
+
 #include "backends/cuda/kernels/common/device.cuh"
 #include "backends/cuda/kernels/common/launch.h"
 #include "backends/cuda/kernels/kernels.cuh"
@@ -437,6 +439,67 @@ __global__ void __launch_bounds__(512) k_topk(const float* logits, int ld, int V
   if (margin && tid == 0) margin[r] = (isfinite(m1) && isfinite(m2)) ? (m1 - m2) : 0.f;
 }
 
+// topk_rows past kTopMax: one block of 1024 threads a row.  A radix select (block_radix_kth, on float_order_u32
+// keys) finds the k-th largest value's key T and how many of the values equal to it the top k takes (the lowest
+// indices: each thread takes a contiguous slice, so a scan of their counts orders them); the k are then sorted best
+// first (block_sort_best_first).
+constexpr int kTopWideThreads = 1024;
+__global__ void __launch_bounds__(kTopWideThreads) k_topk_wide(const float* logits, int ld, int V, int k, int* idx,
+                                                                float* val, float* prob, float* margin) {
+  pdl_trigger();
+  constexpr int kSort = kWalkMax;  // a power of two
+  __shared__ int scan[kTopWideThreads];
+  __shared__ float sv[kSort];
+  __shared__ int si[kSort];
+  __shared__ int n_gt;
+  const int r = blockIdx.x, tid = threadIdx.x;
+  const float* L = logits + size_t(r) * ld;
+  if (tid == 0) n_gt = 0;
+  int eq_take;
+  const auto key = [&](int i, uint32_t* k) {
+    *k = float_order_u32(L[i]);
+    return true;
+  };
+  const uint32_t T = block_radix_kth(V, k, key, &eq_take);
+  const int gt = k - eq_take;
+  const int span = (V + blockDim.x - 1) / blockDim.x, lo = min(V, tid * span), hi = min(V, lo + span);
+  int eq = 0;
+  for (int i = lo; i < hi; ++i) eq += float_order_u32(L[i]) == T;
+  scan[tid] = eq;
+  __syncthreads();
+  for (int off = 1; off < int(blockDim.x); off <<= 1) {
+    const int add = tid >= off ? scan[tid - off] : 0;
+    __syncthreads();
+    scan[tid] += add;
+    __syncthreads();
+  }
+  int rank = scan[tid] - eq;
+  for (int i = lo; i < hi; ++i) {
+    const uint32_t key = float_order_u32(L[i]);
+    if (key > T) {
+      const int slot = atomicAdd(&n_gt, 1);
+      sv[slot] = L[i], si[slot] = i;
+    } else if (key == T) {
+      if (rank < eq_take) sv[gt + rank] = L[i], si[gt + rank] = i;
+      ++rank;
+    }
+  }
+  for (int i = k + tid; i < kSort; i += blockDim.x) sv[i] = -INFINITY, si[i] = INT32_MAX;  // after every value
+  __syncthreads();
+  block_sort_best_first(sv, si, kSort);
+  for (int o = tid; o < k; o += blockDim.x) {
+    idx[size_t(r) * k + o] = si[o];
+    if (val) val[size_t(r) * k + o] = sv[o];
+  }
+  if (prob) {
+    float ez = 0.f;
+    for (int i = tid; i < V; i += blockDim.x) ez += expf(L[i] - sv[0]);
+    const float z = block_sum(ez);
+    if (tid == 0) prob[r] = z > 0.f ? 1.f / z : 0.f;
+  }
+  if (margin && tid == 0) margin[r] = sv[0] - sv[1];
+}
+
 // ---- penalties (ops/sampling/sampling.h) -------------------------------------------------------
 // grid: rows; block 256.  The tokens the reply has are spread over the
 // threads; the drafts before the row that the reply does not have are few
@@ -663,6 +726,13 @@ void choose_rows(const float* logits, int ld, int V, int rows, const DevParams* 
   k_sample<<<rows, kSampleThreads, 0, st>>>(logits, ld, V, P, base_add, G, mask, cz, ci, out, tree, tree_from);
 }
 
+void sample_rows(const float* logits, int ld, int V, int rows, const DevParams* P, int base_add, const DevGen* G,
+                 const uint32_t* mask, float* cz, int* ci, int* out, cudaStream_t st, const TreeRows* tree,
+                 int tree_from) {
+  if (rows <= 0 || !G || !P) return;
+  k_sample<<<rows, kSampleThreads, 0, st>>>(logits, ld, V, P, base_add, G, mask, cz, ci, out, tree, tree_from);
+}
+
 void penalize_rows(float* logits, int ld, int V, int rows, const DevGen* G, Reply reply, const int* drafts,
                    cudaStream_t st, const TreeRows* tree, int tree_from) {
   k_penalize<<<rows, 256, 0, st>>>(logits, ld, V, G, reply.count, reply.seen, reply.n_seen, drafts, tree, tree_from);
@@ -679,6 +749,11 @@ void child_logits(const float* logits, int ld, int from, int rows, const int* dr
 
 void topk_rows(const float* logits, int ld, int V, int k, int* idx, float* val, int rows, cudaStream_t st,
                float* part_v, int* part_i, int part_rows, float* prob, float* margin) {
+  if (k > kTopMax) {
+    if (k > kWalkMax || k > V) throw std::runtime_error("topk_rows: k out of range");
+    k_topk_wide<<<rows, kTopWideThreads, 0, st>>>(logits, ld, V, k, idx, val, prob, margin);
+    return;
+  }
   if (part_v && part_i && rows <= part_rows && k <= kTopMax && V >= kTopkParts * kTopMax) {
     k_topk_part<<<dim3(kTopkParts, rows), kTopkPartThreads, 0, st>>>(logits, ld, V, part_v, part_i);
     k_topk_merge<<<rows, kTopkParts * kTopMax, 0, st>>>(part_v, part_i, k, idx, val, prob, margin);

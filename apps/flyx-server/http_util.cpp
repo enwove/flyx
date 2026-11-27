@@ -84,8 +84,8 @@ bool read_reasoning_effort(const ojson& v, const char* field, ojson* effort, boo
                            std::string* err) {
   if (!v.is_string()) return *err = std::string(field) + " must be a string", false;
   const std::string s = v.get<std::string>();
-  if (s != "none" && s != "minimal" && s != "low" && s != "medium" && s != "high" && s != "xhigh")
-    return *err = std::string(field) + " must be none, minimal, low, medium, high, or xhigh", false;
+  if (s != "none" && s != "minimal" && s != "low" && s != "medium" && s != "high" && s != "xhigh" && s != "max")
+    return *err = std::string(field) + " must be none, minimal, low, medium, high, xhigh, or max", false;
   if (effort) *effort = s;
   if (thinking) *thinking = s != "none";
   if (kwargs) (*kwargs)["reasoning_effort"] = s;
@@ -192,6 +192,10 @@ bool read_stop(const ojson& v, std::vector<std::string>* out, std::string* err) 
   return true;
 }
 
+bool is_loopback_ip(const std::string& a) {
+  return a.rfind("127.", 0) == 0 || a == "::1" || a.rfind("::ffff:127.", 0) == 0;
+}
+
 namespace {
 
 bool iequals(std::string_view a, std::string_view b) {
@@ -199,10 +203,6 @@ bool iequals(std::string_view a, std::string_view b) {
   for (size_t i = 0; i < a.size(); ++i)
     if (std::tolower(static_cast<unsigned char>(a[i])) != std::tolower(static_cast<unsigned char>(b[i]))) return false;
   return true;
-}
-
-bool is_loopback_ip(const std::string& a) {
-  return a.rfind("127.", 0) == 0 || a == "::1" || a.rfind("::ffff:127.", 0) == 0;
 }
 
 bool is_loopback_host(std::string_view authority) {

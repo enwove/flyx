@@ -24,12 +24,18 @@ export function contextLimit(model) {
   if (!l || !model.context) return null;
   const gb2 = (b) => (b / 1e9).toFixed(2);
   const head = "Limited context window " + fmt(model.context) + " / " + fmt(l.wanted) + ".";
+  const need = l.need_more > 0
+    ? (l.by === "host"
+        ? "Needs " + gb2(l.need_more) + " GB more RAM for max context."
+        : "Needs " + gb2(l.need_more) + " GB more VRAM for max context.")
+    : "";
   const cause = l.by === "host"
     ? "Not enough free RAM (" + gb2(l.left) + " GB available for KV). Free RAM or raise \"KV in host RAM\" for a longer context."
     : l.closable
       ? "Not enough VRAM left (" + gb2(l.others) + " GB used by other apps). Close other apps and reload for a longer context."
       : "Not enough VRAM left. Disable speculative decoding or use a smaller quantization for a longer context.";
-  return { parts: [head, cause], text: head + " " + cause, short: !!l.short };
+  const parts = need ? [head, cause, need] : [head, cause];
+  return { parts, text: parts.join(" "), short: !!l.short };
 }
 // A meter's colour: near full, then full.
 export const level = (f) => f > 0.95 ? "hot" : f > 0.85 ? "warn" : "";

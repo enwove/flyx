@@ -26,6 +26,8 @@ struct Lin {
   bf16* w = nullptr;
   uint8_t *q = nullptr, *s = nullptr;
   float* rs = nullptr;
+  // Control projections use these exact values with float32 inputs in rounds. Larger prefill passes use w.
+  RoundWeight round{};
   std::vector<BlockMat> blk{};
   bool packed() const { return !blk.empty(); }
   // Block weights whose inputs are 8 bits in every pass (FLYX_ACT_Q8): a fused producer writes them so.
@@ -57,6 +59,12 @@ struct KvSpec {
   int layers = 1, nkv = 0, hd = 0;
   bool fp8 = false;    // e4m3 with a scale per position and KV head (one cache only)
   bool draft = false;  // only drafting reads it (the MTP layer's): on the device, never in tiers
+  int window = 0;      // >0: sliding-window ring cache kept on device (never tiered)
+};
+// Recurrent state of a depthwise ShortConv layer (Inkling-2): (conv - 1) x channels window
+// in FLYX_ROUND_SLOTS slots, round replay inputs, and checkpoint copies.
+struct ShortConvSpec {
+  int conv = 0, channels = 0;
 };
 // Recurrent state of a gated delta net (GdnDims): state and conv window in
 // FLYX_ROUND_SLOTS slots, the round's per-row inputs kept for the commit
@@ -66,6 +74,7 @@ struct KvSpec {
 struct StateTable {
   std::vector<KvSpec> kv;
   std::vector<GdnDims> gdn;
+  std::vector<ShortConvSpec> sconv;
   int ring_width = 0;  // 0: none
 };
 
@@ -75,6 +84,8 @@ struct EmbedBlock {
   int hidden = 0, vocab = 0;
   bf16* table = nullptr;  // [vocab, hidden]; null when packed
   BlockMat blk;           // the table as packed GGML blocks (data null: bf16)
+  bool has_norm = false;
+  Norm norm{};            // optional post-embedding RMSNorm (Inkling-2)
 };
 
 // norm -> q (| output gate) | k | v -> q/k norms, rotary on the first `rot`
@@ -106,7 +117,7 @@ struct GdnBlock {
   Lin w_in, w_out;
   float *conv_w = nullptr, *A_log = nullptr, *dt_bias = nullptr;
   int state = -1;              // StateTable::gdn
-  Adapters lora;               // its own adapters on qkv, z, b, a and out (ABI 45)
+  Adapters lora;               // its own adapters on qkv, z, b, a and out (ABI 50)
   int v_width() const { return gd.nv * gd.dv; }
   int n_in() const { return gd.C() + v_width() + 2 * gd.nv; }
 };
@@ -121,7 +132,8 @@ struct MlpBlock {
 
 // Final norm -> logits -> the token choice per row.
 struct HeadBlock {
-  int hidden = 0, vocab = 0;
+  int hidden = 0, vocab = 0;   // vocab is vocab_out (unpadded) when vocab_out > 0
+  float softcap = 0.f;         // >0: z = softcap * tanh(z / softcap)
   Norm norm;
   bf16* w = nullptr;           // [vocab, hidden]; the embedding table when tied; null when packed
   BlockMat wb;                 // the head as packed GGML blocks (data null: bf16); no copies below then
@@ -151,7 +163,7 @@ struct MtpBlock {
 struct DFlashLayer {
   Norm norm, post_norm, q_norm, k_norm;
   Lin w_qkv, w_o, w_gu, w_down;
-  Lin attn_proj, mlp_proj;                    // the convs' coefficient deltas
+  Lin attn_proj, mlp_proj;                    // the convs' coefficient deltas (none: conv_taps 0)
   float *attn_base = nullptr, *mlp_base = nullptr;  // and bases, [2][taps][hidden]
 };
 struct DFlashBlock {
@@ -159,7 +171,10 @@ struct DFlashBlock {
   double theta = 0;
   int block = 0, mask_token = 0;
   int window = 0;                             // sliding window of every layer (0: none)
+  float softcap = 0.f;                        // selector logit softcap (0: none)
+  int softcap_mode = FLYX_DFLASH2_SOFTCAP_BEFORE;  // flyx_dflash2_softcap_mode
   int n_taps = 0, target_hidden = 0;          // context features: n_taps target hidden rows
+  int feats_offset = 0;                       // float offset within RowBufs::feats row
   int conv_taps = 0, conv_group = 0, sel_rank = 0, sel_topk = 0;
   int embed = -1, head = -1;
   int first_layer = -1, n_layers = 0;         // blocks (DFlashLayer)
@@ -167,8 +182,16 @@ struct DFlashBlock {
   bf16 *sel_pred = nullptr, *sel_succ = nullptr;
   Norm hidden_norm, norm, k_norms;            // k_norms: every layer's, stacked
   int kv = -1;                                // context K/V, one cache per layer
+  // ABI 49: the block's first row that drafts (1, or 0: the anchor's too); without a selector gate (sel_hid none),
+  // unit_hid (FLYX_MAX_ROWS rows of ones) in its place.
+  int draft_from = 1;
+  float* unit_hid = nullptr;
   int layers() const { return n_layers; }
   int ctx_width() const { return layers() * 2 * nkv * hd; }
+  bool conv() const { return conv_taps > 0; }
+  // Its chains drafted with other sequences' in one pass (BatchDFlash, batch.cpp): convolutions, rows from 1, a
+  // selector gate, two blocks within a pass's rows; the batch's grouped buffers exist only for such a block.
+  bool groups() const { return conv() && draft_from == 1 && !unit_hid && block > 0 && block * 2 <= FLYX_MAX_ROWS; }
 };
 
 // DV (backend_abi.h flyx_dv_block, docs/design/dv.md): `slots` canvas rows run the target's attention and MLP blocks
@@ -310,8 +333,84 @@ struct VisionMergeBlock {
   VisionVec fc1_b, fc2_b;
 };
 
+// down [rank][2 hidden], gain and forget [hidden][rank]. Rounds read each linear's round weight.
+// Large prefill passes use the three linears or one down linear and a stacked gain/forget linear.
+struct LoopWeights {
+  Lin down, gain, forget, gain_forget;
+  bool stacked = false;
+};
+
+// Inkling-2 relative-position-bias attention (SWA or Global) with AttnRes, optional cross-pass loop control,
+// Q/K/R L2 clipping, no-gamma V RMSNorm, per-query sink, and depthwise ShortConv on K/V/output.
+struct RelAttnBlock {
+  int hidden = 0, nh = 0, nkv = 0, hd = 0;
+  int d_rel = 0, rel_extent = 0, window = 0, conv = 0, log_scale_floor = 0;
+  float qk_clip = 0.f, rel_clip = 0.f, log_scale_alpha = 0.f, eps = 0.f;
+  Norm q_norm_in, k_norm_in, v_norm_in;
+  Lin w_qgr, w_q, w_gate, w_rel;  // stacked {q, gate, rel} when compatible, else separate
+  bool stacked_qgr = false;
+  Lin w_k, w_v, w_o, w_sink, w_k_conv_proj, w_v_conv_proj;
+  float *rel_bias = nullptr, *q_clip_w = nullptr, *rel_clip_w = nullptr;
+  float *k_conv = nullptr, *v_conv = nullptr, *post_conv = nullptr;
+  float *res_query = nullptr, *loop_msg_query = nullptr;
+  int res_push = 0, loop_rank = 0;
+  constexpr int res_queries() const { return window > 0 ? 1 : 3; }
+  constexpr size_t res_query_bytes() const { return size_t(res_queries()) * size_t(hidden) * sizeof(float); }
+  LoopWeights loop_ctrl[3];
+  int kv = -1, sconv = -1;
+};
+
+// Inkling-2 sparse MoE block with AttnRes, optional cross-pass loop control, SiTU activation, and post ShortConv.
+struct MoeBlock {
+  int hidden = 0, inter = 0, n_experts = 0, top_k = 0, conv = 0;
+  bool gating_sigmoid = true, norm_weights = true;
+  float route_scale = 1.f, norm_eps = 1e-20f, situ_beta = 0.f, situ_linear_beta = 0.f;
+  Norm norm;
+  Lin router;
+  float* router_bias = nullptr;
+  ExpertMat gate_up, down;
+  float *post_conv = nullptr, *res_query = nullptr;
+  int loop_rank = 0;
+  LoopWeights loop_ctrl;
+  int sconv = -1, sconv_offset = 0;
+};
+
+// DSpark companion drafter (Inkling-2): 3-layer DFlash with block-uniform SWA/Full + Markov RNN head.
+struct DSparkLayer {
+  int window = 0;
+  int kv = -1;  // per-layer StateTable::kv (layers == 1)
+  Norm norm, post_norm, q_norm, k_norm, k_ctx_norm, ctx_norm;
+  Lin w_qkv, w_q, w_k, w_v, w_o;
+  bool stacked_qkv = false;
+  Lin w_ctx_kv, w_k_ctx, w_v_ctx;
+  bool stacked_ctx_kv = false;
+  Lin w_gu, w_gate, w_up, w_down;
+  bool stacked_gu = false;
+  float* ctx_mix = nullptr;  // [n_taps]
+};
+struct DSparkBlock {
+  int hidden = 0, nh = 0, nkv = 0, hd = 0, inter = 0;
+  int block = 0, n_taps = 0, markov_rank = 0, vocab_out = 0;
+  int feats_offset = 0;  // float offset within RowBufs::feats row
+  double theta = 0;
+  float softcap = 0.f;
+  int embed = -1, head = -1, first_layer = -1, n_layers = 0;
+  Norm tok_norm, norm, markov_ctx_norm;
+  float* mask_embd = nullptr;       // [block - 1, hidden]
+  float* markov_ctx_mix = nullptr;  // [n_taps]
+  bf16* markov_w1 = nullptr;        // [vocab_out, markov_rank] (null when packed)
+  BlockMat markov_w1_blk{};         // packed GGML blocks for markov_w1 (data null: bf16)
+  Lin markov_w2;                    // [vocab_out, markov_rank]
+  SignHead markov_coarse;           // its 1-bit copy, read beside the head's (HeadBlock::coarse); bits null: none
+  float* markov_w2_b = nullptr;     // [vocab_out] (nullable)
+  Lin joint_proj;                   // [3 * markov_rank, 2 * hidden + 2 * markov_rank]
+  float* joint_proj_b = nullptr;    // [3 * markov_rank]
+  int layers() const { return n_layers; }
+};
+
 using Block = std::variant<EmbedBlock, AttnBlock, GdnBlock, MlpBlock, HeadBlock, MtpBlock, DFlashBlock, DFlashLayer,
-                           DvBlock, DvLayer, VisionStemBlock, VitAttnBlock, VitMlpBlock, VisionMergeBlock>;
+                           DvBlock, DvLayer, VisionStemBlock, VitAttnBlock, VitMlpBlock, VisionMergeBlock,
+                           RelAttnBlock, MoeBlock, DSparkBlock, DSparkLayer>;
 
 // ---- a sequence's state, as the table declares it -------------------------------------------
 struct KvBuf {
@@ -364,9 +463,17 @@ struct KvBuf {
   uint8_t* hot = nullptr;
   int hot_bits = 0;
   size_t hot_tags = 0;  // slots, all heads
-  // The MTP layer's: its draft steps attend to its first `sink` positions and its last `window` (0:
-  // all), which a ring of `ring` slots holds (0: a slot a position).
+  // Sliding-window caches kept as a ring of `ring` physical slots holding positions via KvRef::slot_of (0: a slot a
+  // position): a sliding-window DFlash2 drafter's context (s->dring says what it still holds), and, with `swa_ring`
+  // (copied to host with every checkpoint, rewinds bounded by flyx_seq::rewind_floor), the SWA target layers and
+  // DSpark's (KvSpec::window > 0, or DSpark's Full layer at long contexts) and the MTP layer's at long contexts (its
+  // draft steps attend to its first `sink` positions and its last `window`).
   int ring = 0, sink = 0, window = 0;
+  bool swa_ring = false;
+  void* ckp_k[FLYX_CHECKPOINTS]{};
+  void* ckp_v[FLYX_CHECKPOINTS]{};
+  float* ckp_ks[FLYX_CHECKPOINTS]{};
+  float* ckp_vs[FLYX_CHECKPOINTS]{};
   // Pageable host K/V backing (Windows WDDM overflow): full [0, cap) cold K/V in pageable RAM while GPU k/v holds
   // [0, device_positions) plus a rolling tail ring (`page_ring` total slots, `page_safe` guaranteed valid in ring).
   // `ring` stays 0 so snapshots/layout hashes match pinned host-KV sessions bit-for-bit.
@@ -419,6 +526,14 @@ struct KvBuf {
   }
   kv16* k16(int layer = 0) const { return static_cast<kv16*>(k) + size_t(layer) * layer_stride; }
   kv16* v16(int layer = 0) const { return static_cast<kv16*>(v) + size_t(layer) * layer_stride; }
+  KvRef layer_ref(int layer) const {
+    KvRef r;
+    r.k = k16(layer);
+    r.v = v16(layer);
+    r.ring = ring;
+    r.sink = sink;
+    return r;
+  }
 };
 struct GdnBuf {
   float *S = nullptr, *win = nullptr;  // FLYX_ROUND_SLOTS slots each
@@ -426,6 +541,12 @@ struct GdnBuf {
   GdnBufs replay{};                    // the round's rows, a slot each
   float* ckp_S[FLYX_CHECKPOINTS]{};  // the checkpoints' state and window, in host memory
   float* ckp_win[FLYX_CHECKPOINTS]{};
+};
+struct ShortConvBuf {
+  int conv = 0, channels = 0;
+  float *win = nullptr, *replay = nullptr;  // FLYX_ROUND_SLOTS and kGdnReplaySlots slots each
+  size_t w_stride = 0, r_stride = 0;        // floats per slot
+  float* ckp_win[FLYX_CHECKPOINTS]{};       // host checkpoints
 };
 
 }  // namespace flyx::cuda

@@ -1,13 +1,19 @@
 #!/usr/bin/env bash
 # Copyright 2026 The flyx Authors. SPDX-License-Identifier: Apache-2.0
 #
-# CI, gpu tier: the machine with the GPU and the converted models.
+# The GPU suite, by hand on a machine with an NVIDIA GPU and the converted
+# models (tools/quickstart.sh provisions both): no CI workflow runs it, there is
+# no GPU runner.
 #
 #   bash tools/ci/gpu.sh            # MODELS=~/models by default
+#   FULL=1 bash tools/ci/gpu.sh     # DV's tests too (AGENTS.md gate 3)
 #
-# CUDA build (dev preset) and every suite (kernel tests; golden tests on
-# CUDA, fused and unfused), the real-model check against transformers, the
-# HTTP API check, then the benchmark.  Output in logs/ci/.
+# The dev preset's CUDA build and ctest's gpu preset: every test but DV's
+# (kernel tests, golden tests on CUDA fused and unfused, the CPU tests), after
+# gpu_preflight (the GPU not already in use); FULL=1 configures dev-full and
+# runs the full preset instead.  Then the real-model check against
+# transformers, the HTTP API check and the benchmark.  Output in logs/ci/:
+# gpu.log, ctest.xml (JUnit), bench.txt.
 set -euo pipefail
 cd "$(dirname "$0")/../.."
 mkdir -p logs/ci
@@ -16,11 +22,16 @@ MODELS=${MODELS:-$HOME/models}
 BUILD=${BUILD:-$HOME/flyx-build}
 MODEL=${MODEL:-$MODELS/qwen35-4b-nvfp4.flyx}
 MODEL_BF16=${MODEL_BF16:-$MODELS/qwen35-4b.flyx}
+CONFIGURE=dev TESTS=gpu
+if [[ -n "${FULL:-}" ]]; then CONFIGURE=dev-full TESTS=full; fi
 echo "== flyx CI, gpu tier, $(git rev-parse --short HEAD), $(date -u +%Y-%m-%dT%H:%MZ)"
-nvidia-smi --query-gpu=name,driver_version,memory.total --format=csv,noheader
-cmake --preset dev -B "$BUILD"
+nvidia-smi --query-gpu=name,driver_version,memory.used,memory.total --format=csv,noheader
+cmake --preset "$CONFIGURE" -B "$BUILD"
 cmake --build "$BUILD"
-ctest --preset dev --test-dir "$BUILD"
+SECONDS=0
+# ctest reads a relative --output-junit against the build directory: name it from here.
+ctest --preset "$TESTS" --test-dir "$BUILD" --output-junit "$PWD/logs/ci/ctest.xml"
+echo "== gpu tier: ctest --preset $TESTS ${SECONDS}s"
 export BUILD MODELS MODEL MODEL_BF16
 STEP=check bash tools/quickstart.sh
 STEP=serve bash tools/quickstart.sh

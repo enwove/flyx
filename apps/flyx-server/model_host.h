@@ -30,8 +30,8 @@ class ModelHost {
     std::vector<std::string> drafters;  // likewise
     EngineOptions eo;                   // the server's engine options, with what the panel changed
     std::string name;                   // the API's model id; empty: the file's name
-    // The drafters' backend options the panel chose ("full" / "exact"; empty: the backend's defaults), also folded
-    // into eo.backend_options; kept apart so GET /v1/load can say what was asked.
+    // The drafters' backend options the panel chose ("full", "nvfp4" / "q8" / "exact"; empty: the backend's defaults),
+    // also folded into eo.backend_options; kept apart so GET /v1/load can say what was asked.
     std::string draft_head{}, draft_weights{};
   };
 
@@ -58,11 +58,13 @@ class ModelHost {
   // last error, notes, the served model's drafters and those published for it, and what the settings file remembers.
   ojson status() const;
 
-  // The settings file: the last model loaded, as it was named, and optional Hub endpoint override.
+  // The settings file holds the last model, Hub endpoint and dashboard network preference.
   static std::string settings_path();
   static bool remembered(Want* w, const EngineOptions& base);
   static std::string remembered_hub_endpoint();
   static bool save_hub_endpoint(const std::string& endpoint, std::string* err = nullptr);
+  static bool lan_access();
+  static bool save_lan_access(bool enabled, std::string* err);
 
  private:
   struct BusyGuard {
@@ -84,8 +86,8 @@ class ModelHost {
   void reset_load_state_locked(const std::string& state, const std::string& target);
   bool work(const Want& w, std::string* err);
   // A scheduler of `f`'s files, or nullptr (*err); *load_s: the seconds it took.
-  std::shared_ptr<Scheduler> open(const apps::Fetched& f, const EngineOptions& options, double* load_s,
-                                  std::string* err) const;
+  std::shared_ptr<Scheduler> open(const std::string& model, const apps::Fetched& f, const EngineOptions& options,
+                                  double* load_s, std::string* err) const;
 
   SchedulerOptions so_;
   mutable std::mutex mu_;

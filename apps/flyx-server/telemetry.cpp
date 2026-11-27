@@ -80,6 +80,7 @@ ojson snapshot_json(const Server& s, int recent) {
     model["device"] = m.device;
     model["backend"] = m.backend;
     model["drafter"] = m.drafter;
+    model["draft_weights"] = m.draft_weights.empty() ? ojson(nullptr) : ojson(m.draft_weights);
     model["max_width"] = m.width;
     model["chat_format"] = m.chat_format;
     model["vision"] = m.vision;
@@ -91,12 +92,17 @@ ojson snapshot_json(const Server& s, int recent) {
     model["max_sessions"] = m.max_sessions;
     model["memory"] = m.memory;
     model["load_s"] = m.load_s;
+    ojson deg = ojson::array();
+    for (const LoadAdjustment& a : m.load_adjustments)
+      deg.push_back({{"kind", a.kind}, {"from", a.from}, {"to", a.to}, {"detail", a.detail}});
+    model["degraded"] = std::move(deg);
     if (m.ctx_limit != plan::CtxLimit::kNone) {  // memory cut the context under the one wanted
       const bool gpu = m.ctx_limit == plan::CtxLimit::kGpu;
       model["context_limit"] = {{"by", gpu ? "gpu" : "host"},
                                 {"wanted", m.wanted_ctx},
                                 {"short", m.ctx_short},
                                 {"left", gpu ? m.sessions_room : m.host_budget},
+                                {"need_more", m.ctx_need_more > 0 ? ojson(m.ctx_need_more) : ojson(nullptr)},
                                 {"gpu_tokens", m.kv_gpu_tokens},
                                 {"others", gpu ? ojson(m.held.others) : ojson(nullptr)},
                                 {"closable", gpu && plan::closable(m.held)},

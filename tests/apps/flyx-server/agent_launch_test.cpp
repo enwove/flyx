@@ -9,6 +9,7 @@
 
 #include "apps/flyx-server/agent_launch.h"
 #include "nlohmann/json.hpp"
+#include "tests/common/check.h"
 
 #ifdef _WIN32
 #include <windows.h>
@@ -19,15 +20,6 @@ using flyx::server::agent_powershell;
 using flyx::server::ps_quote;
 
 namespace {
-
-int failures = 0;
-
-void check(bool ok, const std::string& what) {
-  if (!ok) {
-    std::fprintf(stderr, "FAIL: %s\n", what.c_str());
-    ++failures;
-  }
-}
 
 #ifdef _WIN32
 // What `script` prints between the markers, run by Windows PowerShell from a file (UTF-8 with a BOM, as 5.1 reads it),
@@ -141,7 +133,5 @@ int main() {
 #endif
     }
   }
-  if (failures) return 1;
-  std::printf("PASS: agent launch commands\n");
-  return 0;
+  return flyx::test::finish("agent_launch_test");
 }

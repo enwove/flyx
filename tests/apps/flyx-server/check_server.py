@@ -9,7 +9,6 @@ Needs a real model (tool calls must be meaningful); every check prints ok / FAIL
 from __future__ import annotations
 
 import argparse
-import http.client
 import json
 import os
 import sys
@@ -17,6 +16,8 @@ import tempfile
 import threading
 import time
 import urllib.parse
+
+from local_server import Client, wait_load, wait_telemetry  # also this module's, for api_compat.py
 
 FAILS = 0
 # Room for a reply with thinking on (the question of the streamed checks); one that still runs out is checked as cut.
@@ -27,72 +28,6 @@ def check(ok: bool, what: str, detail: str = ""):
     global FAILS
     print(f"  {'ok  ' if ok else 'FAIL'} {what}" + (f"  [{detail}]" if detail and not ok else ""))
     FAILS += 0 if ok else 1
-
-
-class Client:
-    def __init__(self, url: str, key: str | None):
-        u = urllib.parse.urlparse(url)
-        self.host, self.port = u.hostname, u.port or 80
-        self.key = key
-
-    def _conn(self):
-        return http.client.HTTPConnection(self.host, self.port, timeout=600)
-
-    def _headers(self):
-        h = {"Content-Type": "application/json"}
-        if self.key:
-            h["Authorization"] = "Bearer " + self.key
-        return h
-
-    def get_raw(self, path, headers=None):
-        c = self._conn()
-        try:
-            c.request("GET", path, headers={**self._headers(), **(headers or {})})
-            r = c.getresponse()
-            return r.status, r.headers, r.read()
-        finally:
-            c.close()
-
-    def get(self, path):
-        status, _, data = self.get_raw(path)
-        return status, json.loads(data or b"null")
-
-    def post(self, path, body, headers=None):
-        c = self._conn()
-        c.request("POST", path, body=json.dumps(body), headers={**self._headers(), **(headers or {})})
-        r = c.getresponse()
-        return r.status, json.loads(r.read() or b"null")
-
-    def delete(self, path):
-        c = self._conn()
-        c.request("DELETE", path, headers=self._headers())
-        r = c.getresponse()
-        return r.status, json.loads(r.read() or b"null")
-
-    def stream(self, path, body, stop_after=None):
-        """Yields (event_name, data) of an SSE response; stop_after closes the connection early."""
-        c = self._conn()
-        c.request("POST", path, body=json.dumps(body), headers=self._headers())
-        r = c.getresponse()
-        if r.status != 200:
-            yield "http_error", {"status": r.status, "body": r.read().decode()}
-            return
-        event, n = None, 0
-        while True:
-            line = r.readline()
-            if not line:
-                break
-            line = line.decode().rstrip("\r\n")
-            if line.startswith("event:"):
-                event = line[6:].strip()
-            elif line.startswith("data:"):
-                data = line[5:].strip()
-                yield event, (data if data == "[DONE]" else json.loads(data))
-                event = None
-                n += 1
-                if stop_after and n >= stop_after:
-                    c.close()
-                    return
 
 
 WEATHER = {"type": "function", "function": {
@@ -240,7 +175,7 @@ def openai_checks(cl: Client, model: str):
         return r["choices"][0]["message"]["content"] if st == 200 else None
     a, b, c = sample(7), sample(7), sample(8)
     check(a is not None and a == b, "same seed gives the same sample")
-    check(a != c, "another seed gives another sample")
+    check(c is not None and a != c, "another seed gives another sample")
 
     # Penalties. A reply that would repeat itself changes under a frequency
     # penalty; requests without thinking get Qwen3.5's presence penalty of 1.5 unless they say
@@ -257,13 +192,20 @@ def openai_checks(cl: Client, model: str):
           pushed.lower().count("echo") < plain.lower().count("echo"),
           "frequency_penalty: fewer repeats of a repeated word",
           f"{plain and plain.lower().count('echo')} then {pushed and pushed.lower().count('echo')}")
-    # Give the model a choice of words: even a penalized token can win every time if the prompt requires it.
+    # Give the model a choice of words: even a penalized token can win every time if the prompt requires it.  A seed
+    # whose list the penalty leaves as it is says nothing either way (Inkling-2-Mini's with seed 7), so the next is
+    # tried; one whose default is not the list with 1.5 spelled out ends the search, and fails, as does a request
+    # that fails or answers nothing (no reply is not a reply that differs).
     names = "List twenty possible names for a pet cat, one per line."
-    by_default = with_penalty(names, seed=7)
-    spelled = with_penalty(names, seed=7, presence_penalty=1.5)
-    without = with_penalty(names, seed=7, presence_penalty=0)
-    check(by_default is not None and by_default == spelled and by_default != without,
-          "without thinking the default presence penalty is 1.5", f"{by_default!r} / {spelled!r} / {without!r}")
+    for seed in (7, 8, 9, 10):
+        by_default = with_penalty(names, seed=seed)
+        spelled = with_penalty(names, seed=seed, presence_penalty=1.5)
+        without = with_penalty(names, seed=seed, presence_penalty=0)
+        if not all((by_default, spelled, without)) or by_default != spelled or by_default != without:
+            break
+    check(all((by_default, spelled, without)) and by_default == spelled and by_default != without,
+          "without thinking the default presence penalty is 1.5",
+          f"seed {seed}: {by_default!r} / {spelled!r} / {without!r}")
     st, r = cl.post("/v1/chat/completions", {"model": model, "max_tokens": 4, "presence_penalty": 3,
                                              "messages": [{"role": "user", "content": "hi"}]})
     check(st == 400 and "error" in r, "presence_penalty out of range -> 400", json.dumps(r)[:200])
@@ -602,15 +544,6 @@ def concurrent_checks(cl: Client, model: str):
           f"short {short.get('text')!r} / {alone_short.get('text')!r}, long {len(long.get('text', ''))} chars")
 
 
-def wait_telemetry(cl, predicate, seconds):
-    end = time.monotonic() + seconds
-    while True:
-        _, t = cl.get("/v1/telemetry?recent=1")
-        if predicate(t) or time.monotonic() >= end:
-            return t
-        time.sleep(0.02)
-
-
 def superseded_response_checks(cl: Client, model: str):
     path = "/v1/responses"
     body = {"model": model, "input": "Spell out the numbers from 1 to 2000, one per line.",
@@ -776,14 +709,16 @@ def model_panel_checks(cl: Client, model: str):
           "GET /v1/load: serving the model", json.dumps(s)[:200])
     for body in ({}, {"model": ""}, {"model": 7}, {"model": "x/y", "ctx": -1}, {"model": "x/y", "drafter": "nope"},
                  {"model": "x/y", "drafters": "z-lab/a"},
-                 {"model": "x/y", "width": -1}, {"model": "x/y", "draft_head": "nope"}, {"model": "x/y", "draft_weights": 7}):
+                 {"model": "x/y", "width": -1}, {"model": "x/y", "draft_head": "nope"}, {"model": "x/y", "draft_weights": 7},
+                 {"model": "x/y", "draft_weights": "nope"}):
         st, j = cl.post("/v1/load", body)
         check(st == 400 and "error" in j, f"POST /v1/load {json.dumps(body)}: 400", f"{st} {json.dumps(j)[:120]}")
     st, t = cl.get("/v1/telemetry")
     check(st == 200 and t["load"]["state"] == "ready" and t["model"]["id"] == model, "telemetry's load: the same")
     check(st == 200 and isinstance(s.get("drafters"), list) and isinstance(s.get("suggested"), list) and
+          isinstance(s.get("degraded"), list) and
           "fallback" in s and all({"kind", "from", "size"} <= set(d) for d in s.get("drafters", [])),
-          "GET /v1/load: drafters, suggested, fallback", json.dumps({k: s.get(k) for k in ("drafters", "suggested")}))
+          "GET /v1/load: drafters, suggested, degraded, fallback", json.dumps({k: s.get(k) for k in ("drafters", "suggested", "degraded")}))
     st, c = cl.get("/v1/hub/cached")
     check(st == 200 and isinstance(c.get("models"), list) and c.get("cache"), "GET /v1/hub/cached: a list",
           json.dumps(c)[:200])
@@ -791,7 +726,7 @@ def model_panel_checks(cl: Client, model: str):
         return
     fields = {"name", "kind", "source", "repo", "quant", "file", "path", "size", "modified", "revision", "current", "mtp"}
     check(c.get("cache_from") in ("HF_HUB_CACHE", "HF_HOME", "default") and isinstance(c.get("dirs"), list) and
-          all(fields <= set(m) and m["kind"] in ("gguf", "flyx", "drafter") and m["source"] in ("hub", "dir") and
+          all(fields <= set(m) and m["kind"] in ("gguf", "flyx", "drafter", "mmproj") and m["source"] in ("hub", "dir") and
               m["mtp"] in ("in-file", "in-repo", None) for m in c["models"]),
           "GET /v1/hub/cached: every field of every model", json.dumps(c["models"][:2])[:300])
     names = [m["name"] for m in c["models"]]
@@ -840,18 +775,6 @@ def served_entry(cached: dict, status: dict):
         if m["name"].lower() == want.lower() or (path and os.path.normcase(m["path"]) == path):
             return m
     return None
-
-
-def wait_load(cl: Client, timeout_s: float) -> dict:
-    """GET /v1/load until no fetch or load is under way, at most timeout_s."""
-    deadline = time.time() + timeout_s
-    s = {}
-    while time.time() < deadline:
-        st, s = cl.get("/v1/load")
-        if st == 200 and s.get("state") not in ("fetching", "loading"):
-            return s
-        time.sleep(1)
-    return s
 
 
 def chat_status(cl: Client, model: str) -> int:

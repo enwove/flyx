@@ -26,12 +26,18 @@ void ReplyText::add(const std::string& text) {
     held_.clear();
     return;
   }
-  size_t first = std::string::npos;
+  // The stop string that ends first, as if the text came a byte at a time (so however the tokens are grouped: a
+  // speculative round's width changes nothing); of those ending at the same byte, the one that starts first.  A
+  // stop string's first occurrence is the one that ends first.
+  size_t first = std::string::npos, first_end = std::string::npos;
   for (const auto& s : stop_) {
     if (s.empty()) continue;
     const size_t at = held_.find(s);
-    if (at < first) {
+    if (at == std::string::npos) continue;
+    const size_t end = at + s.size();
+    if (end < first_end || (end == first_end && at < first)) {
       first = at;
+      first_end = end;
       stop_string_ = s;
     }
   }

@@ -233,6 +233,13 @@ bool prepare_multimodal_prompt(Engine& e, const Session& s, const RenderedChat& 
   return true;
 }
 
+// A chat request's reply rules as its format gets them: the API's, and whether the request thinks.
+ReplyRules reply_rules(const Request& rq) {
+  ReplyRules rules = rq.rules;
+  rules.thinking = rq.chat_options.enable_thinking;
+  return rules;
+}
+
 }  // namespace
 
 bool render_request(const ChatTemplate& chat, const Tokenizer& tok, const Request& rq, RenderedChat* out,
@@ -298,6 +305,7 @@ bool prepare_request(Engine& e, const Session& s, const Request& rq, const Rende
     if (!prepare_multimodal_prompt(e, s, rc, out, err)) return false;
   } else {
     gen.prompt = s.tokenize(rc.text, &rc.literal, &out->tokenized);
+    gen.prompt_encoding = {true, rc.literal};
     gen.checkpoints = token_positions(e.tokenizer(), gen.prompt, rc.boundaries);
     gen.cache_prefixes = token_positions(e.tokenizer(), gen.prompt, rc.cache_prefixes);
     if (rc.system_end) gen.system_end = token_positions(e.tokenizer(), gen.prompt, {rc.system_end}).front();
@@ -309,7 +317,7 @@ bool prepare_request(Engine& e, const Session& s, const Request& rq, const Rende
 
   // The grammar the reply must match: tool calls in the format's syntax with
   // arguments that fit their schemas, tool_choice, a JSON answer (core/grammar).
-  const std::string tag = e.chat().reply_grammar(rq.tools, rq.rules, rc);
+  const std::string tag = e.chat().reply_grammar(rq.tools, reply_rules(rq), rc);
   if (!tag.empty()) {
     const double t0 = os::now_ms();
     std::string why;
@@ -333,7 +341,7 @@ bool prepare_request(Engine& e, const Session& s, const Request& rq, const Rende
 
 void warm_request(Engine& e, const Request& rq, const RenderedChat& rc) {
   if (!rq.chat) return;
-  const std::string tag = e.chat().reply_grammar(rq.tools, rq.rules, rc);
+  const std::string tag = e.chat().reply_grammar(rq.tools, reply_rules(rq), rc);
   std::string why;
   if (!tag.empty()) (void)e.grammar().matcher(tag, &why);
 }

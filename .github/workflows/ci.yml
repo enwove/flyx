@@ -6,19 +6,40 @@ on:
     branches: [main]
   pull_request:
 
+# A pull request's newer push cancels its older run.  main's runs are never cancelled mid-way, so each merge leaves
+# its caches (compiles, fixtures) for the pull requests after it.
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: true
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
   cpu:
     name: CPU build & tests (Ubuntu)
     runs-on: ubuntu-latest
+    env:
+      # CMakeLists.txt compiles through ccache when it is installed.  The precompiled headers need the pch and time
+      # sloppiness (ccache cannot see into them otherwise and compiles every file using one), and a header just made
+      # by the build is fine to cache here: nothing edits the tree while it compiles.
+      CCACHE_MAXSIZE: 500M
+      CCACHE_SLOPPINESS: pch_defines,time_macros,include_file_mtime,include_file_ctime
     steps:
       - uses: actions/checkout@v4
 
       - name: Install build tools
-        run: sudo apt-get update && sudo apt-get install -y ninja-build
+        run: |
+          sudo apt-get update && sudo apt-get install -y ninja-build ccache
+          echo "CCACHE_DIR=$HOME/.cache/ccache" >> "$GITHUB_ENV"
+
+      # A commit's compiles are kept under its own key; a new commit starts from the latest one saved (its pull
+      # request's last push, else main's last merge), and ccache compiles only the files that differ.
+      - name: Restore compiler cache
+        id: ccache
+        uses: actions/cache/restore@v4
+        with:
+          path: ~/.cache/ccache
+          key: ccache-${{ runner.os }}-${{ github.sha }}
+          restore-keys: |
+            ccache-${{ runner.os }}-
 
       - name: Set up Python 3.12
         uses: actions/setup-python@v5
@@ -29,15 +50,16 @@ jobs:
         uses: actions/cache@v4
         with:
           path: ~/.cache/pip
-          key: pip-${{ runner.os }}-py312-${{ hashFiles('.github/workflows/ci.yml') }}
+          key: pip-${{ runner.os }}-py312-${{ hashFiles('tests/requirements.txt') }}
           restore-keys: |
             pip-${{ runner.os }}-py312-
 
+      # Pinned (CPU torch from PyTorch's index among them), so a package's new release can move neither the tests'
+      # numbers nor the fixtures' digest below.
       - name: Install Python test dependencies
         run: |
           python -m pip install -U pip
-          python -m pip install --index-url https://download.pytorch.org/whl/cpu torch
-          python -m pip install transformers tokenizers safetensors gguf
+          python -m pip install -r tests/requirements.txt
 
       - name: Check layering, numerics tables, and docs
         run: |
@@ -48,19 +70,45 @@ jobs:
       # The tests' fixtures take most of this job to make (make_assets) and change only with what make_tiny.py makes
       # them from: the Python reference, the converter, the chat templates and the packages installed above.  Its own
       # digest of those names the cache, and its stamp in the directory still decides on every run whether anything
-      # is made again, so a cache it does not match is made over, never trusted.
+      # is made again, so a cache it does not match is made over, never trusted.  A group's own digest and stamp: the
+      # cpu preset makes core's alone (DV's tests are FLYX_TEST_DV's), so a change to DV's inputs keeps this cache.
       - name: Digest of what the test fixtures are made from
         id: fixtures
-        run: echo "digest=$(python tests/e2e/make_tiny.py --digest)" >> "$GITHUB_OUTPUT"
+        run: echo "core=$(python tests/e2e/make_tiny.py --digest --group core)" >> "$GITHUB_OUTPUT"
 
+      # cpu-full.yml's caches hold core's fixtures too (and DV's, which this job's stamps leave alone).
       - name: Cache test fixtures
         uses: actions/cache@v4
         with:
           path: ~/flyx-build-cpu/assets
-          key: fixtures-${{ runner.os }}-${{ steps.fixtures.outputs.digest }}
+          key: fixtures-core-${{ runner.os }}-${{ steps.fixtures.outputs.core }}
+          restore-keys: |
+            fixtures-all-${{ runner.os }}-${{ steps.fixtures.outputs.core }}-
 
       - name: Build and test (cpu preset)
-        run: bash tools/ci/cpu.sh
+        run: |
+          ccache --zero-stats
+          bash tools/ci/cpu.sh
+
+      - name: Compiler cache statistics
+        if: always()
+        run: ccache --show-stats --verbose
+
+      # Saved whether or not the tests passed: the compiles are as good either way, and a pull request's next push
+      # starts from them.
+      - name: Save compiler cache
+        if: ${{ !cancelled() && steps.ccache.outputs.cache-hit != 'true' }}
+        uses: actions/cache/save@v4
+        with:
+          path: ~/.cache/ccache
+          key: ${{ steps.ccache.outputs.cache-primary-key }}
+
+      - name: Upload test results (JUnit)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ctest-junit-attempt-${{ github.run_attempt }}
+          path: logs/ci/ctest.xml
 
       - name: Upload CI log on failure
         if: failure()

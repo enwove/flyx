@@ -12,6 +12,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <filesystem>
 #include <memory>
 #include <random>
 #include <string>
@@ -20,6 +21,8 @@
 #include "core/exec/engine.h"
 #include "core/interfaces/chat.h"
 #include "core/interfaces/vision.h"
+#include "core/os/os.h"
+#include "core/os/path.h"
 #include "core/render/chat_json.h"
 #include "core/session/store.h"
 #include "core/vision/image.h"
@@ -778,6 +781,7 @@ struct TinyVlm {
 };
 
 struct BackendRun {
+  uint64_t estimated_vision = 0;
   uint64_t weights_bytes = 0;
   std::vector<float> vision_embeds;
   std::vector<int32_t> plain_tokens;
@@ -871,6 +875,20 @@ BackendRun run_backend_vlm(const char* name, const TinyVlm& vlm, const std::vect
 
   BackendRun res;
   res.weights_bytes = mem.weights;
+  if (api->estimate_load && vision_dev == FLYX_VISION_DEV_GPU) {
+    auto estimate = [&](int placement, uint64_t free) {
+      auto opts = oo;
+      opts.vision_device = placement;
+      flyx_load_estimate e{};
+      CHECK(api->estimate_load(&vlm.desc, &opts, free, info.mem_total, &e) == 0, "vision estimate");
+      return e;
+    };
+    res.estimated_vision = estimate(FLYX_VISION_DEV_GPU, info.mem_free).weights_bytes -
+                           estimate(FLYX_VISION_DEV_DISK, info.mem_free).weights_bytes;
+    CHECK(estimate(FLYX_VISION_DEV_AUTO, 0).vision_device == FLYX_VISION_DEV_DISK &&
+              estimate(FLYX_VISION_DEV_AUTO, 16000000000ull).vision_device == FLYX_VISION_DEV_GPU,
+          "AUTO placement reflects room after the model and vision weights");
+  }
   // 1. Vision encoding: 4x4 patch grid -> 2x2 = 4 output embeddings of dim kH.
   const int32_t grid_thw[3] = {1, 4, 4};
   const int32_t cu[2] = {0, 16};
@@ -1170,13 +1188,18 @@ void test_tiny_vlm_backends() {
       "  ok   cpu_ref tiny VLM (exact/q8/nvfp4 + pre-quantized Q8_0, padded kVInter=%d, MTP == plain, ckpt+snapshot)\n",
       TinyVlm::kVInter);
 
-  // Run CUDA if a CUDA backend and device are available in this build.
+  // The CUDA half where this build has a CUDA backend (its module beside this program, where the probe looks first):
+  // there this test is a GPU test (label gpu), and a backend that does not load or finds no device fails it instead
+  // of leaving it to pass on cpu_ref alone.  A build without one runs the cpu_ref half only.
   EngineOptions probe_opt;
   probe_opt.backend = "cuda";
   std::string bname, perr;
   flyx_device_info dinfo{};
+  const std::string cuda_module = os::executable_dir() + "/libflyx-cuda" + os::kDynLibSuffix;
+  const bool cuda_built = std::filesystem::exists(os::to_path(cuda_module));
   if (!probe_device(probe_opt, &bname, &dinfo, &perr)) {
-    std::printf("  skip cuda tiny VLM (%s)\n", perr.c_str());
+    CHECK(!cuda_built, "this build has a CUDA backend (" + cuda_module + "), and it is not usable here: " + perr);
+    std::printf("  skip cuda tiny VLM: no CUDA backend in this build (%s)\n", perr.c_str());
     return;
   }
 
@@ -1243,6 +1266,10 @@ void test_tiny_vlm_backends() {
   CHECK(host_preq8.vision_embeds == gpu_preq8.vision_embeds, "pre-quantized Q8_0 host != gpu");
   CHECK(disk_preq8.vision_embeds == gpu_preq8.vision_embeds, "pre-quantized Q8_0 disk != gpu");
   CHECK(gpu_preq8.plain_tokens == ref_preq8.plain_tokens, "pre-quantized Q8_0 greedy tokens differ");
+
+  for (const BackendRun* run : {&gpu, &gpu_q8, &gpu_fp4, &gpu_preq8})
+    CHECK(run->estimated_vision == run->weights_bytes - text_vram,
+          "resident vision estimate matches uploaded planes, scales, norms and stem");
 
   // Hybrid GDN + MRoPE Attn + Vision (exercises prefill_align=64, intra-pass snap_rope_delta, FLYX_PREFILL_SNAP_NONE)
   TinyVlm hybrid(false, true, /*include_gdn=*/true);

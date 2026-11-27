@@ -4,10 +4,11 @@ and write golden outputs from the reference.  Used by the C++ tests.  Also a
 tiny Qwen3 (a second architecture) with golden outputs
 from transformers itself.
 
-    python tests/e2e/make_tiny.py OUT_DIR
+    python tests/e2e/make_tiny.py OUT_DIR [--group core|dv|all]      (all, the default: core, then dv)
+    python tests/e2e/make_tiny.py --digest [--group core|dv|all]
 
-Outputs in OUT_DIR: hf_target/, hf_draft/, tiny.flyx, golden.json,
-tokenizer_cases.json, chat_cases.json, hf_qwen3/, tiny_qwen3.flyx,
+Outputs in OUT_DIR: hf_target/, hf_draft/, tiny.flyx, golden.json, peft_qwen35/ and golden_qwen35_lora.json (a LoRA
+adapter for it as Hugging Face PEFT saves one: make_qwen35_peft), tokenizer_cases.json, chat_cases.json, hf_qwen3/, tiny_qwen3.flyx,
 golden_qwen3.json, peft_qwen3/ and golden_qwen3_lora.json (a LoRA adapter for it as Hugging Face PEFT
 saves one, on some of its linears and layers: make_qwen3_peft), hf_llama/, tiny_llama.flyx, golden_llama.json (a Llama
 without q/k norms, MiniCPM5's layers, with golden outputs from
@@ -21,7 +22,7 @@ float64 reference's DV rounds on those files, for the CUDA backend's),
 tiny_llama_nvfp4.flyx and golden_llama_nvfp4.json (its linears in NVFP4: prompts alone, the file held to its own
 plain decoding), tiny_llama_lora.flyx, golden_llama_lora.json, tiny_llama_dv_lora.flyx, tiny_llama_dv31_lora.flyx,
 golden_llama_dv_lora.json, tiny_llama_nvfp4_lora.flyx and golden_llama_nvfp4_lora.json (the tiny Llama with a V-LoRA
-of its own, beside DV's trees of 15 and of 31 drafts in the second and third: make_llama_lora),
+of its own, beside DV's trees of 15 and of 31 drafts in the second and third: make_llama_lora, make_llama_dv_lora),
 tokenizer_cases_minicpm5.json (its tokenizer: MiniCPM5's
 pre-tokenizer, and the <s> its post-processor puts before a text),
 tiny_gdn128.flyx, golden_gdn128.json, tiny_w4a4.flyx
@@ -30,13 +31,20 @@ drafter alone as z-lab publishes DFlash2 drafters (hf_draft_zlab/) converted
 to a drafter file (tiny_draft.flyx), with blocks of 8 and 7 (tiny_block8.flyx and tiny_block7.flyx),
 and with a sliding window of 8
 (hf_draft_window/: tiny_window.flyx with the target, golden_window.json,
-and alone, tiny_draft_window.flyx).  dv_cases.json: DV's trees, selector tables and
+and alone, tiny_draft_window.flyx; cut to its first layer, hf_draft_1layer/ and
+tiny_draft_1layer.flyx).  dv_cases.json: DV's trees, selector tables and
 canvas steps from the Python reference, for the float64 references in ops/
 (tests/ops/draft/dv_tree_test.cpp, tests/ops/canvas/canvas_test.cpp).
 
-The assets are made again only when what they are made from changed (the
-digest in OUT_DIR/.inputs): this script, the reference and the converter, the
-chat cases and their templates, the versions of the packages that build them.
+Two groups, each with its outputs (OUTPUTS), digest and stamp: dv (DV's: dv_cases.json, the tiny Llama's DV files,
+golden_llama_dv.json, the DV files beside a V-LoRA and golden_llama_dv_lora.json; FLYX_TEST_DV's tests/dv.cmake makes
+them, make_dv_assets) and core (every other one, make_assets).  dv is made from core's files, after them.  Every random
+weight of core's is drawn from the generator its models share, and dv's from generators of their own, so core's files
+are the bytes they are whether dv's are made after them, later, or never.
+
+A group is made again only when what it is made from changed (its digest in OUT_DIR/.inputs-<group>): core's, this
+script, the reference and the converter, the chat cases and their templates, the versions of the packages that build
+them; dv's, core's digest and tests/python/reference/dv_test.py (whose random_dv draws the tiny DV).
 """
 from __future__ import annotations
 
@@ -49,57 +57,84 @@ import sys
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.join(HERE, "..", "..")
-STAMP = ".inputs"
-OUTPUTS = ("tiny.flyx", "tiny_nvfp4.flyx", "tiny_qwen3.flyx", "tiny_gdn128.flyx", "tiny_w4a4.flyx",
-           "golden.json", "golden_nvfp4.json", "golden_qwen3.json", "golden_gdn128.json", "tokenizer_cases.json",
-           "chat_cases.json", "tiny_draft.flyx", "tiny_block8.flyx", "tiny_block7.flyx",
-           "tiny_window.flyx", "golden_window.json", "tiny_draft_window.flyx", "tiny_w4a4_a16.flyx",
-           "tiny_llama.flyx", "golden_llama.json",
-           "tokenizer_cases_minicpm5.json", "dv_cases.json", "tiny_llama_dv.flyx", "tiny_llama_dv_pool.flyx",
-           "tiny_llama_dv32.flyx", "tiny_llama_dv31.flyx", "tiny_llama_dv31_pool.flyx", "tiny_llama_dv31_wide.flyx",
-           "tiny_llama_dv31_wide_pool.flyx", "golden_llama_dv.json", "tiny_llama_nvfp4.flyx", "golden_llama_nvfp4.json",
-           "tiny_llama_lora.flyx", "golden_llama_lora.json", "tiny_llama_dv_lora.flyx", "golden_llama_dv_lora.json",
-           "tiny_llama_dv31_lora.flyx", "tiny_llama_nvfp4_lora.flyx", "golden_llama_nvfp4_lora.json",
-           "peft_qwen3/adapter_model.safetensors", "golden_qwen3_lora.json",
-           "peft_qwen35/adapter_model.safetensors", "golden_qwen35_lora.json")
+STAMP = ".inputs-"  # + the group
+GROUPS = ("core", "dv")
+OUTPUTS = {
+    "core": ("tiny_dspark.flyx", "golden_dspark.json", "tiny_dspark_qwen3.flyx", "tiny.flyx", "tiny_nvfp4.flyx", "tiny_qwen3.flyx", "tiny_gdn128.flyx", "tiny_w4a4.flyx",
+             "golden.json", "golden_nvfp4.json", "golden_qwen3.json", "golden_gdn128.json", "tokenizer_cases.json",
+             "chat_cases.json", "tiny_draft.flyx", "tiny_block8.flyx", "tiny_block7.flyx",
+             "tiny_window.flyx", "golden_window.json", "tiny_draft_window.flyx", "tiny_draft_1layer.flyx",
+             "tiny_w4a4_a16.flyx", "tiny_llama.flyx", "golden_llama.json", "tokenizer_cases_minicpm5.json",
+             "tiny_llama_nvfp4.flyx", "golden_llama_nvfp4.json", "tiny_llama_lora.flyx", "golden_llama_lora.json",
+             "tiny_llama_nvfp4_lora.flyx", "golden_llama_nvfp4_lora.json",
+             "peft_qwen3/adapter_config.json", "peft_qwen3/adapter_model.safetensors", "golden_qwen3_lora.json",
+             "peft_qwen35/adapter_config.json", "peft_qwen35/adapter_model.safetensors", "golden_qwen35_lora.json"),
+    "dv": ("dv_cases.json", "tiny_llama_dv.flyx", "tiny_llama_dv_pool.flyx", "tiny_llama_dv32.flyx",
+           "tiny_llama_dv31.flyx", "tiny_llama_dv31_pool.flyx", "tiny_llama_dv31_wide.flyx",
+           "tiny_llama_dv31_wide_pool.flyx", "golden_llama_dv.json", "tiny_llama_dv_lora.flyx",
+           "golden_llama_dv_lora.json", "tiny_llama_dv31_lora.flyx"),
+}
 
 
-def inputs_digest() -> str:
+def inputs_digest(group: str) -> str:
+    """What a group's assets are made from (the module docstring)."""
     from importlib import metadata
-    files = [os.path.abspath(__file__), os.path.join(ROOT, "tests", "core", "render", "chat_cases.py"),
-             os.path.join(ROOT, "tests", "python", "reference", "dv_test.py")]  # its random_dv makes the tiny DV
-    for sub in (("python", "reference"), ("python", "convert"), ("tests", "core", "render", "templates")):
-        for d, dirs, names in os.walk(os.path.join(ROOT, *sub)):
-            dirs[:] = sorted(x for x in dirs if x != "__pycache__")
-            files += [os.path.join(d, n) for n in sorted(names)]
     h = hashlib.sha256()
+    if group == "dv":
+        h.update(inputs_digest("core").encode() + b"\0")
+        files = [os.path.join(ROOT, "tests", "python", "reference", "dv_test.py")]  # its random_dv makes the tiny DV
+    else:
+        files = [os.path.abspath(__file__), os.path.join(ROOT, "tests", "core", "render", "chat_cases.py")]
+        for sub in (("python", "reference"), ("python", "convert"), ("tests", "core", "render", "templates")):
+            for d, dirs, names in os.walk(os.path.join(ROOT, *sub)):
+                dirs[:] = sorted(x for x in dirs if x != "__pycache__")
+                files += [os.path.join(d, n) for n in sorted(names)]
     for f in files:
         h.update(os.path.relpath(f, ROOT).replace(os.sep, "/").encode() + b"\0")
         with open(f, "rb") as fh:
             h.update(fh.read())
-    for pkg in ("torch", "transformers", "tokenizers", "safetensors", "jinja2"):
-        h.update(f"{pkg} {metadata.version(pkg)}\0".encode())
+    if group == "core":
+        for pkg in ("torch", "transformers", "tokenizers", "safetensors", "jinja2"):
+            h.update(f"{pkg} {metadata.version(pkg)}\0".encode())
     return h.hexdigest()
 
 
-def up_to_date(out: str) -> bool:
+def up_to_date(out: str, group: str) -> bool:
     try:
-        with open(os.path.join(out, STAMP), encoding="utf-8") as f:
+        with open(os.path.join(out, STAMP + group), encoding="utf-8") as f:
             made_from = f.read().strip()
     except OSError:
         return False
-    return made_from == inputs_digest() and all(os.path.exists(os.path.join(out, o)) for o in OUTPUTS)
+    return made_from == inputs_digest(group) and all(os.path.exists(os.path.join(out, o)) for o in OUTPUTS[group])
 
 
-# --digest: what the assets are made from, for a cache of OUT_DIR to be kept under (.github/workflows/ci.yml).
-if __name__ == "__main__" and sys.argv[1:] == ["--digest"]:
-    print(inputs_digest())
-    sys.exit(0)
+def arguments(argv: list) -> tuple:
+    """OUT_DIR (or --digest) and the groups --group names: all (the default) is core, then dv."""
+    group = "all"
+    if "--group" in argv:
+        i = argv.index("--group")
+        group = argv[i + 1] if i + 1 < len(argv) else ""
+        argv = argv[:i] + argv[i + 2:]
+    if group not in GROUPS + ("all",) or len(argv) > 1:
+        sys.exit(f"usage: make_tiny.py OUT_DIR|--digest [--group {'|'.join(GROUPS)}|all] (--group {group!r})")
+    return (argv[0] if argv else "tiny_assets"), (GROUPS if group == "all" else (group,))
 
-# Before the imports below (torch alone takes seconds): most test runs find the assets up to date.
-if __name__ == "__main__" and up_to_date(sys.argv[1] if len(sys.argv) > 1 else "tiny_assets"):
-    print("assets up to date: nothing they are made from changed")
-    sys.exit(0)
+
+if __name__ == "__main__":
+    ARG_OUT, ARG_GROUPS = arguments(sys.argv[1:])
+    # --digest: what the assets are made from, for a cache of OUT_DIR to be kept under (.github/workflows/ci.yml): a
+    # group's, or each group's joined by '-'.
+    if ARG_OUT == "--digest":
+        print("-".join(inputs_digest(g) for g in ARG_GROUPS))
+        sys.exit(0)
+    # Before the imports below (torch alone takes seconds): most test runs find the assets up to date.
+    ARG_GROUPS = tuple(g for g in ARG_GROUPS if not up_to_date(ARG_OUT, g))
+    if not ARG_GROUPS:
+        print("assets up to date: nothing they are made from changed")
+        sys.exit(0)
+    if ARG_GROUPS == ("dv",) and not up_to_date(ARG_OUT, "core"):
+        sys.exit(f"{ARG_OUT}: DV's assets are made from core's, which are not up to date there: make them first "
+                 "(--group core)")
 
 import torch  # noqa: E402
 
@@ -366,6 +401,64 @@ def make_mtp(out_dir: str, cfg, gen):
     save_file({k: v.to(torch.bfloat16).contiguous() for k, v in W.items()}, os.path.join(out_dir, "mtp.safetensors"))
 
 
+def make_dspark(out_dir: str, vocab: int, mask_id: int, gen, target_layers: int, layer_ids, H=64, layers=2, heads=4,
+                kv=2, hd=32, inter=128, block=7, rank=16):
+    """A DSpark drafter as DeepSpec saves one (Qwen3DSparkModel): plain decoder layers over the target's tapped hidden
+    states, a vanilla Markov head and a confidence head (left out by the converter and the engine); its embedding and
+    head random here (the engine and the reference take the target's, as DeepSpec's frozen copies are)."""
+    from safetensors.torch import save_file
+    os.makedirs(out_dir, exist_ok=True)
+    r = lambda *s, scale=1.0: (torch.randn(*s, generator=gen) * scale)  # noqa: E731
+    n = len(layer_ids)
+    W = {"fc.weight": r(H, n * H, scale=1 / math.sqrt(n * H)),
+         "hidden_norm.weight": 1 + 0.2 * r(H), "norm.weight": 1 + 0.2 * r(H),
+         "embed_tokens.weight": r(vocab, H), "lm_head.weight": r(vocab, H),
+         "markov_head.markov_w1.weight": r(vocab, rank, scale=0.5),
+         "markov_head.markov_w2.weight": r(vocab, rank, scale=0.5),
+         "confidence_head.proj.weight": r(1, H + rank, scale=(H + rank) ** -0.5), "confidence_head.proj.bias": r(1)}
+    for j in range(layers):
+        p = f"layers.{j}."
+        W.update({
+            p + "input_layernorm.weight": 1 + 0.2 * r(H), p + "post_attention_layernorm.weight": 1 + 0.2 * r(H),
+            p + "self_attn.q_proj.weight": r(heads * hd, H, scale=H ** -0.5),
+            p + "self_attn.k_proj.weight": r(kv * hd, H, scale=H ** -0.5),
+            p + "self_attn.v_proj.weight": r(kv * hd, H, scale=H ** -0.5),
+            p + "self_attn.o_proj.weight": r(H, heads * hd, scale=(heads * hd) ** -0.5),
+            p + "self_attn.q_norm.weight": 1 + 0.2 * r(hd), p + "self_attn.k_norm.weight": 1 + 0.2 * r(hd),
+            p + "mlp.gate_proj.weight": r(inter, H, scale=H ** -0.5),
+            p + "mlp.up_proj.weight": r(inter, H, scale=H ** -0.5),
+            p + "mlp.down_proj.weight": r(H, inter, scale=inter ** -0.5)})
+    save_file({k: v.to(torch.bfloat16).contiguous() for k, v in W.items()}, os.path.join(out_dir, "model.safetensors"))
+    cfg = {"architectures": ["Qwen3DSparkModel"], "model_type": "qwen3", "vocab_size": vocab, "hidden_size": H,
+           "intermediate_size": inter, "num_hidden_layers": layers, "num_attention_heads": heads,
+           "num_key_value_heads": kv, "head_dim": hd, "rms_norm_eps": 1e-6, "rope_theta": 1000000.0,
+           "layer_types": ["full_attention"] * layers, "num_target_layers": target_layers, "block_size": block,
+           "mask_token_id": mask_id, "target_layer_ids": list(layer_ids), "num_anchors": 512,
+           "enable_confidence_head": True, "confidence_head_with_markov": True, "markov_rank": rank,
+           "markov_head_type": "vanilla", "tie_word_embeddings": False}
+    json.dump(cfg, open(os.path.join(out_dir, "config.json"), "w", encoding="utf-8"), indent=1)
+
+
+def write_golden_dspark(path, out_json, prompts, vocab):
+    """The engine's DSpark drafts against the reference's: plain tokens, the drafts of every round, and oracle drafts
+    (the true continuation, corrupted where pos % 5 == 2) for long accepted runs, rollback and commit."""
+    target, draft, header, _ = load(path)
+    golden = {"eos": header["generation"]["eos_ids"], "cases": []}
+    for pr in prompts:
+        plain, margins = greedy_plain(target, pr, 40, stop_ids=())
+        spec, rounds = greedy_spec(target, draft, pr, 40, stop_ids=())
+        assert plain == spec, (plain, spec)
+        arr = list(pr) + plain
+        arr = [t if (i < len(pr) or i % 5 != 2) else (t + 1) % vocab for i, t in enumerate(arr)]
+        oracle = lambda pos, d, arr=arr: arr[pos] if pos < len(arr) else 0  # noqa: E731
+        ospec, orounds = greedy_spec(target, draft, pr, 40, stop_ids=(), oracle=oracle)
+        assert ospec == plain
+        golden["cases"].append({"prompt": pr, "tokens": plain, "min_margin": min(margins),
+                                "rounds": [{k: rd[k] for k in ("pos", "anchor", "drafts", "n")} for rd in rounds],
+                                "oracle": arr, "oracle_n": [rd["n"] for rd in orounds]})
+    json.dump(golden, open(out_json, "w", encoding="utf-8"), indent=0)
+
+
 def make_draft(out_dir: str, vocab: int, mask_id: int, gen, H=64, layers=2, heads=4, kv=2, hd=32,
                inter=128, taps=(2, 5, 7), block=16, ktaps=2, group=16, rank=16, topk=16):
     from safetensors.torch import save_file
@@ -427,6 +520,20 @@ def zlab_drafter(src: str, dst: str, target_layers: int, window: int = 0, block:
     json.dump(cfg, open(os.path.join(dst, "config.json"), "w", encoding="utf-8"), indent=1)
 
 
+def one_layer_drafter(src: str, dst: str):
+    """The drafter in src (z-lab's layout) cut to its first layer: its context cache then has one layer, as the MTP
+    layer's has, and a target whose caches are FP8 must still keep it in binary16 for DFlash2's kernels."""
+    from safetensors.torch import load_file, save_file
+    os.makedirs(dst, exist_ok=True)
+    w = load_file(os.path.join(src, "model.safetensors"))
+    save_file({k: v.contiguous() for k, v in w.items() if not k.startswith("layers.") or k.startswith("layers.0.")},
+              os.path.join(dst, "model.safetensors"))
+    cfg = json.load(open(os.path.join(src, "config.json"), encoding="utf-8"))
+    cfg["num_hidden_layers"] = 1
+    cfg["layer_types"] = cfg["layer_types"][:1]
+    json.dump(cfg, open(os.path.join(dst, "config.json"), "w", encoding="utf-8"), indent=1)
+
+
 def same_drafter(model_path: str, drafter_path: str):
     """A drafter file holds what the model file holds of its drafter: the same config and tensors."""
     with Reader(model_path) as a, Reader(drafter_path) as b:
@@ -437,11 +544,25 @@ def same_drafter(model_path: str, drafter_path: str):
             assert bytes(a.raw(a.header["tensors"][n])) == bytes(b.raw(b.header["tensors"][n])), n
 
 
-def main(out):
+# The golden files' prompts past the first four (golden.json's: write_golden keeps them all at its defaults).
+MORE = ((7, 3, 99, 12), (1, 2, 3), (300, 301, 302, 303, 304), (42,), (11, 500, 7), (64, 65, 66, 67, 68, 69))
+
+
+def main(out: str, groups: tuple):
     os.makedirs(out, exist_ok=True)
-    made_from = inputs_digest()  # before anything is made: an input edited meanwhile makes them again next time
-    if os.path.exists(os.path.join(out, STAMP)):
-        os.remove(os.path.join(out, STAMP))  # a run that fails leaves no stamp
+    # Each group's digest before anything is made: an input edited meanwhile makes them again next time.
+    made_from = {g: inputs_digest(g) for g in groups}
+    for g in groups:
+        if os.path.exists(os.path.join(out, STAMP + g)):
+            os.remove(os.path.join(out, STAMP + g))  # a run that fails leaves no stamp
+    for g in groups:
+        {"core": make_core, "dv": make_dv}[g](out)
+        with open(os.path.join(out, STAMP + g), "w", encoding="utf-8") as f:
+            f.write(made_from[g] + "\n")
+
+
+def make_core(out: str):
+    """Every asset but DV's (OUTPUTS["core"])."""
     gen = torch.Generator().manual_seed(1234)
     tdir, ddir = os.path.join(out, "hf_target"), os.path.join(out, "hf_draft")
     os.makedirs(tdir, exist_ok=True); os.makedirs(ddir, exist_ok=True)
@@ -460,8 +581,9 @@ def main(out):
 
     prompts = [tok.encode(t).ids for t in ("The quick brown fox", "def add(a, b):\n", "推理引擎需要")]
     prompts.append([5, 17, 33, 9])
-    write_golden(path, os.path.join(out, "golden.json"), prompts, vocab)
-    n35 = make_qwen35_peft(out, tdir, prompts)
+    # The reference's golden files (write_golden) are made at the end, each a process's own job (in_processes):
+    # nothing below reads them.
+    goldens = [(write_golden, (path, os.path.join(out, "golden.json"), prompts, vocab))]
     # The drafter as z-lab publishes DFlash2 drafters, converted alone: what tiny.flyx holds of
     # its drafter.  Then with a sliding window of 8, shorter than the prompts and their 48 tokens: with the target
     # (golden drafts from the reference's window) and alone.
@@ -474,13 +596,23 @@ def main(out):
     zlab_drafter(ddir, wdir, layers, window=8)
     wpath = os.path.join(out, "tiny_window.flyx")
     convert(tdir, wpath, wdir, log=lambda *_: None)
-    write_golden(wpath, os.path.join(out, "golden_window.json"), prompts, vocab)
+    goldens.append((write_golden, (wpath, os.path.join(out, "golden_window.json"), prompts, vocab)))
     convert_draft(wdir, os.path.join(out, "tiny_draft_window.flyx"), log=lambda *_: None)
+    odir = os.path.join(out, "hf_draft_1layer")  # no random draws: what is made after it stays as it was
+    one_layer_drafter(wdir, odir)
+    convert_draft(odir, os.path.join(out, "tiny_draft_1layer.flyx"), log=lambda *_: None)
     # Chains of 15 widen the 8-row block. With 7 native rows, two widened chains of 7 fit in one batch.
     for block in (8, 7):
         bdir = os.path.join(out, f"hf_draft_block{block}")
         zlab_drafter(ddir, bdir, layers, block=block)
         convert(tdir, os.path.join(out, f"tiny_block{block}.flyx"), bdir, log=lambda *_: None)
+    # A DSpark drafter (DeepSpec's format, block 7, every row a draft) on the same target, and its golden drafts.  The
+    # DSpark drafters draw from generators of their own: the models after them keep the weights they had without them.
+    sdir = os.path.join(out, "hf_dspark")
+    make_dspark(sdir, vocab, tok.token_to_id("<|mask|>"), torch.Generator().manual_seed(71), layers, (1, 4, 6))
+    spath = os.path.join(out, "tiny_dspark.flyx")
+    convert(tdir, spath, sdir, log=lambda *_: None)
+    write_golden_dspark(spath, os.path.join(out, "golden_dspark.json"), prompts, vocab)
     # The same model with NVFP4 linears (as NVIDIA ModelOpt stores them).
     qdir = os.path.join(out, "hf_target_nvfp4")
     make_nvfp4_dir(tdir, qdir)
@@ -491,8 +623,8 @@ def main(out):
     # NVFP4 linears take bf16-rounded inputs (the engine's activation policy, which
     # the reference reproduces); float32 vs float64 activations can still round
     # differently, moving logits by ~1e-3, so these cases avoid near-ties.
-    more = [[7, 3, 99, 12], [1, 2, 3], [300, 301, 302, 303, 304], [42], [11, 500, 7], [64, 65, 66, 67, 68, 69]]
-    write_golden(qpath, os.path.join(out, "golden_nvfp4.json"), prompts + more, vocab, min_margin=0.05, keep=4)
+    more = [list(p) for p in MORE]
+    goldens.append((write_golden, (qpath, os.path.join(out, "golden_nvfp4.json"), prompts + more, vocab, 0.05, 4)))
     # A second architecture through models/ (Qwen3): no drafter, golden from transformers.
     q3dir = os.path.join(out, "hf_qwen3")
     make_qwen3(q3dir, tdir, vocab, gen)
@@ -500,6 +632,10 @@ def main(out):
     convert(q3dir, q3path, None, log=lambda *_: None)
     n3 = write_golden_hf(q3dir, os.path.join(out, "golden_qwen3.json"), prompts + more)
     n3l = make_qwen3_peft(out, q3dir, prompts + more)
+    # A DSpark drafter file for it (its 4 layers' outputs after layers 0 and 2): drafting must not change its tokens.
+    s3dir = os.path.join(out, "hf_dspark_qwen3")
+    make_dspark(s3dir, vocab, tok.token_to_id("<|mask|>"), torch.Generator().manual_seed(72), 4, (0, 2))
+    convert_draft(s3dir, os.path.join(out, "tiny_dspark_qwen3.flyx"), log=lambda *_: None)
     # GDN heads of 128 (Qwen3.5's): prefill takes the chunked recurrence on bf16
     # tensor cores, so these cases avoid near-ties as the NVFP4 ones do.
     gdir = os.path.join(out, "hf_gdn128")
@@ -510,7 +646,7 @@ def main(out):
     make_target(gdir, vocab, gen, gdn_heads=(1, 2), gdn_dims=(128, 128))
     gpath = os.path.join(out, "tiny_gdn128.flyx")
     convert(gdir, gpath, ddir, log=lambda *_: None)
-    write_golden(gpath, os.path.join(out, "golden_gdn128.json"), prompts + more, vocab, min_margin=0.05, keep=4)
+    goldens.append((write_golden, (gpath, os.path.join(out, "golden_gdn128.json"), prompts + more, vocab, 0.05, 4)))
     # NVFP4 linears that take NVFP4 inputs in passes of more than 16 rows (the W4A4 kernels): 128
     # wide, with a value head of 32 and an MLP of 256, so every linear's K is a whole number of the kernels' tiles
     # of 128.  No golden outputs: gguf_e2e_test holds the CUDA backend to the float64 one on this file.
@@ -535,13 +671,7 @@ def main(out):
     make_llama(ldir, vocab, gen)
     convert(ldir, os.path.join(out, "tiny_llama.flyx"), None, log=lambda *_: None)
     nl = write_golden_hf(ldir, os.path.join(out, "golden_llama.json"), prompts + more)
-    write_dv_cases(os.path.join(out, "dv_cases.json"))
-    make_llama_dv(out, ldir)
     nlora = make_llama_lora(out, ldir, prompts + more)
-    cases = {name: json.load(open(os.path.join(out, golden), encoding="utf-8"))["cases"]
-             for name, golden in (("", "golden_llama.json"), ("tiny_llama_dv_lora.flyx", "golden_llama_dv_lora.json"),
-                                  ("tiny_llama_dv31_lora.flyx", "golden_llama_dv_lora.json"))}
-    nd = write_dv_rounds(out, cases)
     # The tiny Llama's linears in NVFP4 (ModelOpt's layout, bf16 inputs): rounds of more than 16 rows on its NVFP4
     # GEMMs (gemm_fp4_rows).  The reference has no Llama of NVFP4 weights: golden_llama_nvfp4.json gives the prompts
     # alone, and golden_test holds the file to its own plain decoding.  No random numbers: the files above stay.
@@ -558,8 +688,9 @@ def main(out):
             lora_dir=os.path.join(out, "dv_tiny", "export_vlora"))
     with open(os.path.join(out, "golden_llama_nvfp4_lora.json"), "w", encoding="utf-8") as f:
         json.dump({"eos": [2], "plain_only": True, "cases": [{"prompt": p} for p in lprompts]}, f, indent=0)
-    with open(os.path.join(out, STAMP), "w", encoding="utf-8") as f:
-        f.write(made_from + "\n")
+    in_processes(goldens)
+    # Held against golden.json (the adapter changes every case's tokens): after the goldens above.  Its own generator.
+    n35 = make_qwen35_peft(out, tdir, prompts)
     print(f"wrote {out}: tiny.flyx, tiny_nvfp4.flyx, golden.json, golden_nvfp4.json ({len(prompts)} prompts), "
           f"tokenizer_cases.json ({len(cases)}), chat_cases.json ({n_chat}), tiny_qwen3.flyx, "
           f"peft_qwen35/, golden_qwen35_lora.json ({n35} prompts), "
@@ -567,13 +698,31 @@ def main(out):
           f"tokenizer_cases_minicpm5.json ({len(lcases)}), "
           f"tiny_gdn128.flyx, golden_gdn128.json, tiny_draft.flyx, tiny_block8.flyx, tiny_block7.flyx, "
           f"tiny_window.flyx, golden_window.json, "
-          f"tiny_draft_window.flyx, tiny_w4a4.flyx, tiny_w4a4_a16.flyx, dv_cases.json, tiny_llama_dv.flyx, "
-          f"tiny_llama_dv_pool.flyx, tiny_llama_dv32.flyx, tiny_llama_dv31.flyx, tiny_llama_dv31_pool.flyx, "
-          f"tiny_llama_dv31_wide.flyx, tiny_llama_dv31_wide_pool.flyx, golden_llama_dv.json ({nd} rounds), "
-          f"tiny_llama_nvfp4.flyx, golden_llama_nvfp4.json, tiny_llama_lora.flyx, golden_llama_lora.json and "
-          f"golden_llama_dv_lora.json ({nlora[0]} and {nlora[1]} prompts), tiny_llama_dv_lora.flyx, "
+          f"tiny_draft_window.flyx, tiny_draft_1layer.flyx, tiny_w4a4.flyx, tiny_w4a4_a16.flyx, "
+          f"tiny_llama_nvfp4.flyx, golden_llama_nvfp4.json, tiny_llama_lora.flyx, golden_llama_lora.json "
+          f"({nlora} prompts), tiny_llama_nvfp4_lora.flyx, golden_llama_nvfp4_lora.json")
+
+
+def make_dv(out: str):
+    """DV's assets (OUTPUTS["dv"]) from core's files: the tiny Llama (hf_llama/, golden_llama.json) and the golden
+    files' prompts (golden.json's, then MORE).  Every random number here is a generator's of its own (seeds 77, 32,
+    33): core's files stay the bytes they are."""
+    ldir = os.path.join(out, "hf_llama")
+    with open(os.path.join(out, "golden.json"), encoding="utf-8") as f:
+        prompts = [c["prompt"] for c in json.load(f)["cases"]]
+    assert len(prompts) == 4 and prompts[3] == [5, 17, 33, 9], "golden.json: not make_core's four prompts"
+    write_dv_cases(os.path.join(out, "dv_cases.json"))
+    make_llama_dv(out, ldir)
+    ndl = make_llama_dv_lora(out, ldir, prompts + [list(p) for p in MORE])
+    cases = {name: json.load(open(os.path.join(out, golden), encoding="utf-8"))["cases"]
+             for name, golden in (("", "golden_llama.json"), ("tiny_llama_dv_lora.flyx", "golden_llama_dv_lora.json"),
+                                  ("tiny_llama_dv31_lora.flyx", "golden_llama_dv_lora.json"))}
+    nd = write_dv_rounds(out, cases)
+    print(f"wrote {out}: dv_cases.json, tiny_llama_dv.flyx, tiny_llama_dv_pool.flyx, tiny_llama_dv32.flyx, "
+          f"tiny_llama_dv31.flyx, tiny_llama_dv31_pool.flyx, tiny_llama_dv31_wide.flyx, "
+          f"tiny_llama_dv31_wide_pool.flyx, golden_llama_dv.json ({nd} rounds), tiny_llama_dv_lora.flyx, "
           f"tiny_llama_dv31_lora.flyx, "
-          f"tiny_llama_nvfp4_lora.flyx, golden_llama_nvfp4_lora.json")
+          f"golden_llama_dv_lora.json ({ndl} prompts)")
 
 
 def make_llama_dv(out: str, ldir: str):
@@ -664,27 +813,50 @@ def random_vlora(cfg, rank: int, seed: int) -> dict:
     return {"lora": lora, "cfg": {"r": rank, "name": f"tiny_r{rank}"}, "step": 0}
 
 
-def make_llama_lora(out: str, ldir: str, prompts) -> tuple[int, int]:
-    """The tiny Llama with a V-LoRA (the target's own adapters, unmerged, on every linear of every pass: ABI 43)
-    through the converter's whole path: bifill-dv's checkpoint format (dv_tiny/vlora16.pt, vlora32.pt; random_vlora),
-    python/convert/export_dv.py --vlora (dv_tiny/export_vlora/: rank 16 with --vlora-scale 0.5, so that the scale's
-    path is held too; dv_tiny/export_dv_lora/: tiny_llama_dv.flyx's canvas and selector, 8 slots, beam:15:4:cov, beside
-    a V-LoRA of rank 32 and bifill-dv's scale 1; dv_tiny/export_dv31_lora/: tiny_llama_dv31.flyx's DV, 32 slots and
-    trees of 31 drafts, beam:31:8:cov, beside the same V-LoRA: rounds of 32 verify rows whose adapter GEMMs run beside
-    the canvas's grouped ones, MiniCPM5-1B's g_b2h line), flyx_convert --lora and --dv: tiny_llama_lora.flyx,
-    tiny_llama_dv_lora.flyx and tiny_llama_dv31_lora.flyx; and their golden tokens from transformers in float64 with
-    the adapters merged (golden_llama_lora.json, golden_llama_dv_lora.json, which both DV files with the V-LoRA of rank
-    32 share; write_golden_hf).  The V-LoRAs change the plain tokens.  Returns the prompts each golden file kept.  Its
-    own generators: nothing above changes."""
-    import export_dv
+def vlora_golden(out: str, ldir: str, prompts, export: str, scale: float, golden: str) -> int:
+    """golden: transformers' tokens in float64 with export's V-LoRA merged (write_golden_hf), which must change every
+    case's tokens from the plain model's (golden_llama.json's).  Returns the prompts it kept."""
     from safetensors.torch import load_file
+    base = [c["tokens"] for c in json.load(open(os.path.join(out, "golden_llama.json"), encoding="utf-8"))["cases"]]
+    tensors = load_file(os.path.join(out, "dv_tiny", export, "vlora.safetensors"))
+    kept = write_golden_hf(ldir, os.path.join(out, golden), prompts, lora=(tensors, scale))
+    tokens = [c["tokens"] for c in json.load(open(os.path.join(out, golden), encoding="utf-8"))["cases"]]
+    if not set(map(tuple, tokens)).isdisjoint(set(map(tuple, base))):
+        raise RuntimeError(f"{golden}: the V-LoRA leaves some case's tokens the plain model's")
+    return kept
+
+
+def make_llama_lora(out: str, ldir: str, prompts) -> int:
+    """The tiny Llama with a V-LoRA (the target's own adapters, unmerged, on every linear of every pass: ABI 43)
+    through the converter's whole path: bifill-dv's checkpoint format (dv_tiny/vlora16.pt; random_vlora),
+    python/convert/export_dv.py --vlora (dv_tiny/export_vlora/: rank 16 with --vlora-scale 0.5, so that the scale's
+    path is held too), flyx_convert --lora: tiny_llama_lora.flyx; and its golden tokens from transformers in float64
+    with the adapters merged (golden_llama_lora.json; vlora_golden), which the V-LoRA changes.  Returns the prompts it
+    kept.  Its own generator: nothing above changes.  DV beside a V-LoRA is make_llama_dv_lora's."""
+    import export_dv
     cfg, _ = dv.hf_llama(ldir)
     ddir = os.path.join(out, "dv_tiny")
     os.makedirs(ddir, exist_ok=True)
-    for rank, seed in ((16, 16), (32, 33)):
-        torch.save(random_vlora(cfg, rank, seed), os.path.join(ddir, f"vlora{rank}.pt"))
+    torch.save(random_vlora(cfg, 16, 16), os.path.join(ddir, "vlora16.pt"))
     export_dv.main(["--vlora", os.path.join(ddir, "vlora16.pt"), "--vlora-scale", "0.5",
                     "-o", os.path.join(ddir, "export_vlora")])
+    convert(ldir, os.path.join(out, "tiny_llama_lora.flyx"), None, log=lambda *_: None,
+            lora_dir=os.path.join(ddir, "export_vlora"))
+    return vlora_golden(out, ldir, prompts, "export_vlora", 0.5, "golden_llama_lora.json")
+
+
+def make_llama_dv_lora(out: str, ldir: str, prompts) -> int:
+    """DV beside a V-LoRA (make_dv, after make_llama_dv): a V-LoRA of rank 32 and bifill-dv's scale 1
+    (dv_tiny/vlora32.pt; random_vlora) through export_dv.py: dv_tiny/export_dv_lora/ (tiny_llama_dv.flyx's canvas and
+    selector, 8 slots, beam:15:4:cov) and dv_tiny/export_dv31_lora/ (tiny_llama_dv31.flyx's DV, 32 slots and trees of
+    31 drafts, beam:31:8:cov: rounds of 32 verify rows whose adapter GEMMs run beside the canvas's grouped ones,
+    MiniCPM5-1B's g_b2h line), flyx_convert --dv: tiny_llama_dv_lora.flyx and tiny_llama_dv31_lora.flyx; and their
+    golden tokens (golden_llama_dv_lora.json, which both files share; vlora_golden).  Returns the prompts it kept.
+    Its own generator."""
+    import export_dv
+    cfg, _ = dv.hf_llama(ldir)
+    ddir = os.path.join(out, "dv_tiny")
+    torch.save(random_vlora(cfg, 32, 33), os.path.join(ddir, "vlora32.pt"))
     export_dv.main(["--canvas", os.path.join(ddir, "canvas.pt"), "--selector", os.path.join(ddir, "selector.pt"),
                     "--slots", "8", "--tree", "beam:15:4:cov", "--fill", "0.9", "--mask-token", "<|mask|>",
                     "--vlora", os.path.join(ddir, "vlora32.pt"), "-o", os.path.join(ddir, "export_dv_lora")])
@@ -696,21 +868,10 @@ def make_llama_lora(out: str, ldir: str, prompts) -> tuple[int, int]:
             open(os.path.join(ddir, "export_dv31_lora", "vlora.safetensors"), "rb") as b:
         if a.read() != b.read():
             raise RuntimeError("export_dv31_lora: its V-LoRA is not export_dv_lora's, whose golden tokens it takes")
-    convert(ldir, os.path.join(out, "tiny_llama_lora.flyx"), None, log=lambda *_: None,
-            lora_dir=os.path.join(ddir, "export_vlora"))
     for export, name in (("export_dv_lora", "tiny_llama_dv_lora.flyx"),
                          ("export_dv31_lora", "tiny_llama_dv31_lora.flyx")):
         convert(ldir, os.path.join(out, name), None, log=lambda *_: None, dv_dir=os.path.join(ddir, export))
-    base = [c["tokens"] for c in json.load(open(os.path.join(out, "golden_llama.json"), encoding="utf-8"))["cases"]]
-    kept = []
-    for export, scale, golden in (("export_vlora", 0.5, "golden_llama_lora.json"),
-                                  ("export_dv_lora", 1.0, "golden_llama_dv_lora.json")):
-        tensors = load_file(os.path.join(ddir, export, "vlora.safetensors"))
-        kept.append(write_golden_hf(ldir, os.path.join(out, golden), prompts, lora=(tensors, scale)))
-        tokens = [c["tokens"] for c in json.load(open(os.path.join(out, golden), encoding="utf-8"))["cases"]]
-        if not set(map(tuple, tokens)).isdisjoint(set(map(tuple, base))):
-            raise RuntimeError(f"{golden}: the V-LoRA leaves some case's tokens the plain model's")
-    return kept[0], kept[1]
+    return vlora_golden(out, ldir, prompts, "export_dv_lora", 1.0, "golden_llama_dv_lora.json")
 
 
 def make_qwen3_peft(out: str, q3dir: str, prompts) -> int:
@@ -850,7 +1011,7 @@ def dv_fresh(model, prompt: list, tokens: list) -> list:
     its drafts and parents."""
     out = []
     for k in range(len(tokens) - 2):
-        rounds = model.generate(prompt + tokens[:k], model.dv.width + 3)["rounds"]
+        rounds = model.generate(prompt + tokens[:k], model.dv.width + 3, rounds=3)["rounds"]
         out.append({w: {"start": r["pos"], "drafts": r["drafts"], "parents": r["parents"]}
                     for w, r in (("first", rounds[1]), ("second", rounds[2]))})
     return out
@@ -867,22 +1028,15 @@ def write_dv_rounds(out: str, cases: dict) -> int:
     transformers tokens: tiny_llama_dv_lora.flyx's and tiny_llama_dv31_lora.flyx's with their V-LoRA), the others'
     under "".
 
-    A file's cases are independent of each other and of the other files', and nearly all of this script's time (a
-    fresh start at every point of every case, twice over; the script took the hosted CPU runner 41 minutes with them
-    one after another), so each case is a process's own job (dv_case_rounds), as many at once as there are processors,
-    and their rows are put together in the files' and the cases' order: the bytes one process writes."""
+    A file's cases are independent of each other and of the other files', and nearly all of this group's time (a fresh
+    start at every point of every case, twice over: three forwards each; the script took the hosted CPU runner 41
+    minutes with them one after another, each fresh start then running on to width + 3 tokens), so each case is a
+    process's own job (dv_case_rounds, in_processes), and their rows are put together in the files' and the cases'
+    order: the bytes one process writes."""
     rows = {"chains": list(DV_CHAINS), "every": DV_CHAIN_EVERY, "first": DV_CHAIN_FIRST,
             "file_chains": {k: list(v) for k, v in DV_CHAINS_BY_FILE.items()}, "files": {}, "fresh": {}, "fp8": {}}
     jobs = [(out, name, c) for name in DV_ROUND_FILES for c in cases.get(name, cases[""])]
-    workers = min(len(jobs), os.cpu_count() or 1)
-    if workers > 1:
-        import multiprocessing
-        # spawn everywhere: a fork of a process whose torch has started its threads may wait on them forever
-        with multiprocessing.get_context("spawn").Pool(workers, initializer=torch.set_num_threads,
-                                                      initargs=(1,)) as pool:
-            done = pool.map(dv_case_rounds, jobs, chunksize=1)
-    else:
-        done = [dv_case_rounds(job) for job in jobs]
+    done = in_processes([(dv_case_rounds, (job,)) for job in jobs])
     for name in DV_ROUND_FILES:
         rows["files"][name], rows["fresh"][name], rows["fp8"][name] = [], [], []
     n = 0
@@ -894,6 +1048,24 @@ def write_dv_rounds(out: str, cases: dict) -> int:
     with open(os.path.join(out, "golden_llama_dv.json"), "w", encoding="utf-8") as f:
         json.dump(rows, f, indent=0)
     return n
+
+
+def in_processes(calls: list) -> list:
+    """calls: (a function of this script, its arguments), independent of each other: each a process's own job, as many
+    at once as there are processors (one torch thread each), their results in calls' order."""
+    workers = min(len(calls), os.cpu_count() or 1)
+    if workers <= 1:
+        return [call(c) for c in calls]
+    import multiprocessing
+    # spawn everywhere: a fork of a process whose torch has started its threads may wait on them forever
+    with multiprocessing.get_context("spawn").Pool(workers, initializer=torch.set_num_threads, initargs=(1,)) as pool:
+        return pool.map(call, calls, chunksize=1)
+
+
+def call(job: tuple):
+    """job: (a function of this script, its arguments), for a process of in_processes' pool."""
+    fn, args = job
+    return fn(*args)
 
 
 DV_ROUND_FILES = ("tiny_llama_dv.flyx", "tiny_llama_dv_pool.flyx", "tiny_llama_dv32.flyx", "tiny_llama_dv31.flyx",
@@ -1105,4 +1277,4 @@ def write_golden(path, out_json, prompts, vocab, min_margin=0.0, keep=None):
 
 
 if __name__ == "__main__":
-    main(sys.argv[1] if len(sys.argv) > 1 else "tiny_assets")
+    main(ARG_OUT, ARG_GROUPS)

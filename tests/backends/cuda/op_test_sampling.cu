@@ -534,7 +534,7 @@ void test_select() {
   hp.anchor = 1234;
   CK(cudaMemcpy(P, &hp, sizeof(hp), cudaMemcpyHostToDevice));
   int* dr = dev<int>(16);
-  selector_walk(P, ti, tv, k, up(hid), rank, up_bf16(pred), up_bf16(succ), width, nullptr, dr, 0);
+  selector_walk(P, ti, tv, k, up(hid), rank, up_bf16(pred), up_bf16(succ), width, nullptr, dr, 0, 0.f, FLYX_DFLASH2_SOFTCAP_BEFORE, nullptr);
   auto drafts = down_i(dr, width);
   int prev = 1234;
   std::vector<int> want;
@@ -556,6 +556,298 @@ void test_select() {
   }
   std::printf("  %-4s candidate walk\n", drafts == want ? "ok" : "FAIL");
   g_fail += drafts != want;
+  // Softcapped selector walk and tree (before_correction = 0 and after_correction = 1; ops/draft/ref.h).
+  {
+    const float sc = 3.0f;
+    float* dhid = up(hid);
+    bf16 *dpred = up_bf16(pred), *dsucc = up_bf16(succ);
+    TreeRows* dt_sc = dev<TreeRows>(1);
+    for (int mode : {0, 1}) {
+      selector_walk(P, ti, tv, k, dhid, rank, dpred, dsucc, width, nullptr, dr, 0, sc, mode, nullptr);
+      const auto got_w = down_i(dr, width);
+      int prev_sc = 1234;
+      std::vector<int> want_w;
+      for (int s = 0; s < width; ++s) {
+        int best = 0;
+        double bs = -1e300;
+        for (int c = 0; c < k; ++c) {
+          double e = 0;
+          for (int i = 0; i < rank; ++i)
+            e += pred[size_t(prev_sc) * rank + i] * hid[size_t(s) * rank + i] *
+                 succ[size_t(want_idx[s * k + c]) * rank + i];
+          const double score = ops::dflash2_selector_score(want_val[s * k + c], e, double(sc), mode);
+          if (score > bs) {
+            bs = score;
+            best = c;
+          }
+        }
+        prev_sc = want_idx[s * k + best];
+        want_w.push_back(prev_sc);
+      }
+      const bool wok = got_w == want_w;
+      std::printf("  %-4s candidate walk (softcap=%.1f mode=%d)\n", wok ? "ok" : "FAIL", sc, mode);
+      g_fail += !wok;
+
+      const int tw = 9;
+      selector_tree(P, ti, tv, k, dhid, rank, dpred, dsucc, tw, rows, nullptr, dr, dt_sc, 0, sc, mode, nullptr);
+      TreeRows t{};
+      CK(cudaMemcpy(&t, dt_sc, sizeof(t), cudaMemcpyDeviceToHost));
+      const auto got_t = down_i(dr, size_t(tw));
+      std::vector<int32_t> wd(static_cast<size_t>(tw)), wp(static_cast<size_t>(tw));
+      auto score_sc = [&](int32_t p, int d, int c) {
+        double e = 0;
+        for (int i = 0; i < rank; ++i)
+          e += pred[size_t(p) * rank + i] * hid[size_t(d) * rank + i] * succ[size_t(want_idx[d * k + c]) * rank + i];
+        return ops::dflash2_selector_score(want_val[d * k + c], e, double(sc), mode);
+      };
+      ops::best_first_tree(tw, rows, k, 1234, want_idx.data(), score_sc, wd.data(), wp.data());
+      bool tok = t.n == tw + 1 && std::vector<int32_t>(got_t.begin(), got_t.end()) == wd;
+      for (int i = 0; i < width; ++i) tok = tok && wd[size_t(i)] == want_w[size_t(i)] && wp[size_t(i)] == i - 1;
+      std::printf("  %-4s candidate tree (softcap=%.1f mode=%d)\n", tok ? "ok" : "FAIL", sc, mode);
+      g_fail += !tok;
+    }
+  }
+  {  // past 16 candidates (DSpark's walk): the radix top-k, ties and a value shared past the k-th included, and the
+     // walk over them
+    for (const auto& [Vw, kw] : {std::pair{248320, 64}, std::pair{248320, 256}, std::pair{248320, 1024},
+                                 std::pair{300, 256}, std::pair{40, 17}}) {
+      Vec l = randv(size_t(rows) * Vw);
+      for (auto& x : l) x = double(float(x));
+      if (Vw > 1000) {
+        l[7] = l[Vw / 3] = l[Vw - 2] = 10.0;                                             // ties at the top
+        for (int i = 0; i < 400; ++i) l[size_t(Vw) + 11 + 517 * size_t(i)] = 5.0;  // row 1: 400 ties span the k-th
+      }
+      int* wi = dev<int>(rows * kw);
+      float *wv = dev<float>(rows * kw), *wp = dev<float>(rows), *wm = dev<float>(rows);
+      topk_rows(up(l), Vw, Vw, kw, wi, wv, rows, 0, nullptr, nullptr, 0, wp, wm);
+      std::vector<int> want_i(size_t(rows) * kw);
+      Vec want_v(size_t(rows) * kw), want_p(rows), want_m(rows);
+      for (int r = 0; r < rows; ++r) {
+        const double* row = &l[size_t(r) * Vw];
+        ops::topk(row, Vw, kw, &want_i[size_t(r) * kw], &want_v[size_t(r) * kw]);
+        double z = 0.0;
+        for (int v = 0; v < Vw; ++v) z += std::exp(row[v] - want_v[size_t(r) * kw]);
+        want_p[r] = 1.0 / z;
+        want_m[r] = want_v[size_t(r) * kw] - want_v[size_t(r) * kw + 1];
+      }
+      const bool same = down_i(wi, size_t(rows) * kw) == want_i && down(wv, size_t(rows) * kw) == want_v;
+      std::printf("  %-4s top-%d of %d (radix select)\n", same ? "ok" : "FAIL", kw, Vw);
+      g_fail += !same;
+      expect("radix top-k softmax p_max", down(wp, rows), want_p, 1e-5);
+      expect("radix top-k margin", down(wm, rows), want_m, 1e-6);
+      if (Vw > 1000 && kw >= 256) {  // the walk over 256 and 1024 candidates (DSpark's), rank 256
+        const int rk = 256, wd = 3;
+        Vec pr = randv(size_t(Vw) * rk, 0.1), sc = randv(size_t(Vw) * rk, 0.1), ones(size_t(rows) * rk, 1.0);
+        round_bf16(pr);
+        round_bf16(sc);
+        selector_walk(P, wi, wv, kw, up(ones), rk, up_bf16(pr), up_bf16(sc), wd, nullptr, dr, 0, 0.f, FLYX_DFLASH2_SOFTCAP_BEFORE, nullptr);
+        const auto got_w = down_i(dr, wd);
+        std::vector<int> want_w;
+        int pv = 1234;
+        for (int st = 0; st < wd; ++st) {
+          int best = 0;
+          double bs = -1e300;
+          for (int c = 0; c < kw; ++c) {
+            const int cid = want_i[size_t(st) * kw + c];
+            double e = 0;
+            for (int i = 0; i < rk; ++i) e += pr[size_t(pv) * rk + i] * sc[size_t(cid) * rk + i];
+            if (want_v[size_t(st) * kw + c] + e > bs) bs = want_v[size_t(st) * kw + c] + e, best = c;
+          }
+          pv = want_i[size_t(st) * kw + best];
+          want_w.push_back(pv);
+        }
+        std::printf("  %-4s candidate walk over %d candidates\n", got_w == want_w ? "ok" : "FAIL", kw);
+        g_fail += got_w != want_w;
+        // Sampling: each step the best score over T plus the target's Gumbel noise at the draft's position
+        // (P->position + 1 + step, ops::coupled_draft_score), so the drafts follow the target's own choice.
+        const float temp = 0.7f;
+        const uint64_t seed = 12345;
+        selector_walk(P, wi, wv, kw, up(ones), rk, up_bf16(pr), up_bf16(sc), wd, nullptr, dr, 0, 0.f,
+                      FLYX_DFLASH2_SOFTCAP_BEFORE, gen_params(temp, 1.f, 0, seed));
+        const auto got_c = down_i(dr, wd);
+        std::vector<int> want_c;
+        pv = 1234;
+        for (int st = 0; st < wd; ++st) {
+          int best = 0;
+          double bs = -1e300;
+          for (int c = 0; c < kw; ++c) {
+            const int cid = want_i[size_t(st) * kw + c];
+            double e = 0;
+            for (int i = 0; i < rk; ++i) e += pr[size_t(pv) * rk + i] * sc[size_t(cid) * rk + i];
+            const double v =
+                ops::coupled_draft_score(float(want_v[size_t(st) * kw + c] + e), temp, seed, 10 + 1 + st, cid);
+            if (v > bs) bs = v, best = c;
+          }
+          pv = want_i[size_t(st) * kw + best];
+          want_c.push_back(pv);
+        }
+        std::printf("  %-4s candidate walk coupled to the sampler's noise (T %.1f)\n", got_c == want_c ? "ok" : "FAIL",
+                    temp);
+        g_fail += got_c != want_c;
+        // The tree over 256 and 1024 candidates a position (DSpark's; 1024: past 48 KB of shared memory), against
+        // ops::best_first_tree.
+        auto wscore = [&](int32_t prev, int d, int c) {
+          const int cid = want_i[size_t(d) * kw + c];
+          double e = 0;
+          for (int i = 0; i < rk; ++i) e += pr[size_t(prev) * rk + i] * sc[size_t(cid) * rk + i];
+          return want_v[size_t(d) * kw + c] + e;
+        };
+        TreeRows* wt = dev<TreeRows>(1);
+        const int tw = 11;
+        selector_tree(P, wi, wv, kw, up(ones), rk, up_bf16(pr), up_bf16(sc), tw, rows, nullptr, dr, wt, 0, 0.f, FLYX_DFLASH2_SOFTCAP_BEFORE, nullptr);
+        const auto got_t = down_i(dr, size_t(tw));
+        std::vector<int32_t> wtd(static_cast<size_t>(tw)), wtp(static_cast<size_t>(tw));
+        ops::best_first_tree(tw, rows, kw, 1234, want_i.data(), wscore, wtd.data(), wtp.data());
+        const bool same_t = std::vector<int32_t>(got_t.begin(), got_t.end()) == wtd &&
+                            std::equal(want_w.begin(), want_w.end(), wtd.begin());  // its trunk: the walk's chain
+        std::printf("  %-4s candidate tree of %d drafts over %d candidates a position\n", same_t ? "ok" : "FAIL", tw,
+                    kw);
+        g_fail += !same_t;
+      }
+    }
+  }
+  {  // MTP's draft at step 2 from row 0's 16 candidates (ops::draft_choice): greedy, with penalties on the reply's
+     // counts and the round's drafts before it, and sampled through the target's filters and noise at its position
+    int* mtok = dev<int>(8);
+    std::vector<int> counts(size_t(V), 0), host_mtok = {1234, want_idx[3], want_idx[0], 0};
+    counts[size_t(want_idx[0])] = 2;  // the best candidate already twice in the reply
+    counts[size_t(want_idx[1])] = 1;
+    int* dcount = dev<int>(size_t(V));
+    CK(cudaMemcpy(dcount, counts.data(), counts.size() * sizeof(int), cudaMemcpyHostToDevice));
+    struct Case {
+      float temp, top_p;
+      int top_k;
+      float presence, frequency;
+    };
+    bool same = true;
+    for (const Case& c : {Case{0.f, 1.f, 0, 0.f, 0.f}, Case{0.f, 1.f, 0, 1.5f, 0.25f}, Case{0.7f, 0.8f, 20, 1.5f, 0.f},
+                          Case{1.3f, 1.f, 0, 0.f, 0.f}, Case{0.7f, 0.5f, 3, 0.f, 0.f}}) {
+      const uint64_t seed = 99;
+      DevGen g{};
+      g.temperature = c.temp, g.top_p = c.top_p, g.top_k = c.top_k, g.seed = seed;
+      g.presence = c.presence, g.frequency = c.frequency;
+      DevGen* dg = dev<DevGen>(1);
+      CK(cudaMemcpy(dg, &g, sizeof(g), cudaMemcpyHostToDevice));
+      CK(cudaMemcpy(mtok, host_mtok.data(), 4 * sizeof(int), cudaMemcpyHostToDevice));
+      mtp_choose(P, dg, dcount, ti, tv, k, V, 2, mtok, 0);
+      std::vector<int32_t> cand(want_idx.begin(), want_idx.begin() + k);
+      std::vector<float> val(k);
+      std::vector<int> cnt(k);
+      for (int x = 0; x < k; ++x) {
+        val[size_t(x)] = float(want_val[size_t(x)]);
+        const int t = cand[size_t(x)];  // the reply's count, and the drafts of steps 0 and 1 before it
+        cnt[size_t(x)] = counts[size_t(t)] + (host_mtok[1] == t) + (host_mtok[2] == t);
+      }
+      const bool pen = c.presence != 0.f || c.frequency != 0.f;
+      const int want_t = ops::draft_choice(cand.data(), val.data(), pen ? cnt.data() : nullptr, k, V, c.temp,
+                                           c.top_p, c.top_k, c.presence, c.frequency, seed, 10 + 1 + 2);
+      same = same && down_i(mtok, 4)[3] == want_t;
+    }
+    std::printf("  %-4s MTP draft from its candidates: greedy, penalties, the target's filters and noise\n",
+                same ? "ok" : "FAIL");
+    g_fail += !same;
+  }
+  {  // MTP's draft against a float64 oracle of the target's rule over the candidates, written apart from
+     // ops::draft_choice: small vocabularies, slots outside the vocabulary (unfilled: INT32_MAX) or of NaN logit, ties
+     // at top_k's and top_p's cut and at the best logit, penalties; the kernel and the host function, 40 seeds each.
+    struct Case {
+      const char* what;
+      int vocab;
+      std::vector<int32_t> cand;
+      std::vector<float> logit;
+      std::vector<int> count;  // empty: no penalties
+      float temp, top_p;
+      int top_k;
+      float presence, frequency;
+    };
+    const float nan = std::numeric_limits<float>::quiet_NaN();
+    const std::vector<Case> cases = {
+        {"a vocabulary of 5", 5, {3, 1, 4, 0, 2}, {2.f, 1.5f, 1.f, 0.5f, 0.f}, {}, 1.f, 1.f, 0, 0.f, 0.f},
+        {"unfilled and out-of-vocabulary slots", 6, {2, 5, INT32_MAX, -1, 7, 0}, {1.f, 0.9f, 3.f, 3.f, 3.f, 0.2f}, {},
+         0.8f, 1.f, 0, 0.f, 0.f},
+        {"a NaN logit", 6, {1, 2, 3}, {nan, 0.5f, 0.4f}, {}, 1.f, 1.f, 0, 0.f, 0.f},
+        {"no usable candidate", 4, {INT32_MAX, -1, 9}, {1.f, 1.f, 1.f}, {}, 1.f, 1.f, 0, 0.f, 0.f},
+        {"ties at top_k's cut", 50, {10, 11, 12, 13, 14}, {3.f, 2.f, 2.f, 2.f, 1.f}, {}, 1.f, 1.f, 2, 0.f, 0.f},
+        {"ties at top_p's cut", 50, {20, 21, 22, 23}, {1.f, 1.f, 1.f, 0.f}, {}, 1.f, 0.3f, 0, 0.f, 0.f},
+        {"greedy, a tie at the best", 50, {31, 30, 32}, {2.f, 2.f, 1.f}, {}, 0.f, 1.f, 0, 0.f, 0.f},
+        {"penalties", 50, {40, 41, 42, 43}, {2.f, 1.8f, 1.f, 0.9f}, {3, 0, 1, 0}, 0.7f, 0.9f, 0, 0.4f, 0.3f},
+        {"greedy with penalties", 50, {40, 41, 42}, {2.f, 1.8f, 1.f}, {2, 0, 0}, 0.f, 1.f, 0, 0.5f, 0.f},
+    };
+    // the oracle: float64, every candidate kept or not by value (no running order)
+    auto oracle = [](const Case& c, uint64_t seed, int64_t pos) -> int32_t {
+      std::vector<std::pair<int32_t, double>> u;  // usable: (token, penalized logit)
+      for (size_t i = 0; i < c.cand.size(); ++i) {
+        if (c.cand[i] < 0 || c.cand[i] >= c.vocab || std::isnan(c.logit[i])) continue;
+        const int n = c.count.empty() ? 0 : c.count[i];
+        u.push_back({c.cand[i], double(c.logit[i]) - (c.presence * (n > 0) + c.frequency * n)});
+      }
+      if (u.empty()) return 0;
+      auto better = [](const std::pair<int32_t, double>& a, const std::pair<int32_t, double>& b) {
+        return a.second > b.second || (a.second == b.second && a.first < b.first);
+      };
+      if (!(c.temp > 0.f)) return std::min_element(u.begin(), u.end(), better)->first;
+      double top = -INFINITY;
+      for (auto& [t, l] : u) top = std::max(top, l);
+      std::vector<std::pair<int32_t, double>> z;  // (token, z) with z above the cut
+      for (auto& [t, l] : u)
+        if ((l - top) / c.temp > ops::kSampleZMin) z.push_back({t, (l - top) / c.temp});
+      if (c.top_k > 0 && c.top_k < int(z.size())) {
+        std::vector<double> v;
+        for (auto& [t, x] : z) v.push_back(x);
+        std::sort(v.rbegin(), v.rend());
+        const double cut = v[size_t(c.top_k - 1)];
+        z.erase(std::remove_if(z.begin(), z.end(), [&](auto& e) { return e.second < cut; }), z.end());
+      }
+      if (c.top_p < 1.f) {
+        double mass = 0;
+        for (auto& [t, x] : z) mass += std::exp(x);
+        double cut = -INFINITY;  // the largest value whose candidates at or above it hold top_p of the mass
+        for (auto& [t, x] : z) {
+          double m = 0;
+          for (auto& [t2, x2] : z) m += x2 >= x ? std::exp(x2) : 0;
+          if (m >= c.top_p * mass) cut = std::max(cut, x);
+        }
+        z.erase(std::remove_if(z.begin(), z.end(), [&](auto& e) { return e.second < cut; }), z.end());
+      }
+      int32_t best = INT32_MAX;
+      double bs = -INFINITY;
+      for (auto& [t, x] : z) {
+        const double g = x - std::log(-std::log(double(ops::sample_uniform(seed, pos, t))));
+        if (g > bs || (g == bs && t < best)) bs = g, best = t;
+      }
+      return best;
+    };
+    int* mtok = dev<int>(2);
+    int* dcount = dev<int>(64);
+    int* dcand = dev<int>(ops::kMtpCands);
+    float* dval = dev<float>(ops::kMtpCands);
+    DevGen* dg = dev<DevGen>(1);
+    for (const Case& c : cases) {
+      const int k = int(c.cand.size());
+      std::vector<int> counts(64, 0);
+      for (int i = 0; i < k; ++i)
+        if (!c.count.empty() && c.cand[size_t(i)] >= 0 && c.cand[size_t(i)] < c.vocab)
+          counts[size_t(c.cand[size_t(i)])] = c.count[size_t(i)];
+      CK(cudaMemcpy(dcount, counts.data(), counts.size() * sizeof(int), cudaMemcpyHostToDevice));
+      CK(cudaMemcpy(dcand, c.cand.data(), size_t(k) * sizeof(int), cudaMemcpyHostToDevice));
+      CK(cudaMemcpy(dval, c.logit.data(), size_t(k) * sizeof(float), cudaMemcpyHostToDevice));
+      bool same = true;
+      for (uint64_t seed = 1; seed <= 40; ++seed) {
+        DevGen g{};
+        g.temperature = c.temp, g.top_p = c.top_p, g.top_k = c.top_k, g.seed = seed;
+        g.presence = c.presence, g.frequency = c.frequency;
+        CK(cudaMemcpy(dg, &g, sizeof(g), cudaMemcpyHostToDevice));
+        mtp_choose(P, dg, dcount, dcand, dval, k, c.vocab, 0, mtok, 0);
+        const int64_t pos = 10 + 1;  // P->position + 1 + step 0
+        const int32_t want = oracle(c, seed, pos);
+        const int32_t host = ops::draft_choice(c.cand.data(), c.logit.data(), c.count.empty() ? nullptr : c.count.data(),
+                                               k, c.vocab, c.temp, c.top_p, c.top_k, c.presence, c.frequency, seed, pos);
+        same = same && down_i(mtok, 2)[1] == want && host == want;
+      }
+      std::printf("  %-4s MTP draft against the float64 oracle: %s\n", same ? "ok" : "FAIL", c.what);
+      g_fail += !same;
+    }
+  }
   // The candidates as a tree (ops/draft/ref.h): drafts, parents, and the TreeRows the round reads; its trunk is the
   // walk's chain.  A tree wider than the positions (it must branch), one that fills a whole round, and one of 5 over
   // 2 positions.
@@ -567,7 +859,7 @@ void test_select() {
   };
   TreeRows* dt = dev<TreeRows>(1);
   for (const auto& [tw, depths] : {std::pair{11, rows}, std::pair{FLYX_MAX_ROWS - 1, rows}, std::pair{5, 2}}) {
-    selector_tree(P, ti, tv, k, up(hid), rank, up_bf16(pred), up_bf16(succ), tw, depths, nullptr, dr, dt, 0);
+    selector_tree(P, ti, tv, k, up(hid), rank, up_bf16(pred), up_bf16(succ), tw, depths, nullptr, dr, dt, 0, 0.f, FLYX_DFLASH2_SOFTCAP_BEFORE, nullptr);
     TreeRows t{};
     CK(cudaMemcpy(&t, dt, sizeof(t), cudaMemcpyDeviceToHost));
     const auto got_drafts = down_i(dr, size_t(tw));
@@ -601,8 +893,8 @@ void test_stop_decide() {
     pol.widths[i] = ws[i];
     pol.costs[i] = cs[i];
   }
-  for (int k = 0; k < FLYX_MAX_ROWS; ++k) pol.p_pos[k] = k < 7 ? 0.80f : 0.72f;
-  pol.w_bias = -0.35f;
+  for (int k = 0; k < FLYX_MAX_ROWS; ++k) pol.p_pos[k] = std::max(0.20f, 0.90f - 0.045f * float(k));
+  pol.w_bias = -0.60f;
   pol.w_margin = 0.27f;
   pol.w_logit_p = 0.20f;
   pol.lambda = 0.165f;
@@ -637,21 +929,23 @@ void test_stop_decide() {
     CK(cudaMemcpy(dprob, hp.data(), sizeof(float) * FLYX_MAX_ROWS, cudaMemcpyHostToDevice));
     CK(cudaMemcpy(dmargin, hm.data(), sizeof(float) * FLYX_MAX_ROWS, cudaMemcpyHostToDevice));
 
-    double ref_s = 1.0;
-    for (int b = 0; b < cur.n_buckets; ++b) {
-      const int w0 = b == 0 ? 0 : cur.widths[b - 1];
-      const int w1 = cur.widths[b];
-      const int want_c = ops::stop_decide_step_ref(dp.data(), dm.data(), cur, b, w0, w1, &ref_s);
-      stop_decide_step(dprob, dmargin, dpol, dst, b, w0, w1, 0, 0, 0);
-      DevStopState got{};
-      CK(cudaMemcpy(&got, dst, sizeof(got), cudaMemcpyDeviceToHost));
-      got_s.push_back(double(got.survival));
-      want_s.push_back(ref_s);
-      step_ok = step_ok && (got.decision == want_c);
+    StopCondHandles zero_h{};
+    for (const bool earlier : {false, true}) {  // a stop verifies its own checkpoint, or the prefix that pays
+      double ref_s = 1.0;
+      for (int b = 0; b < cur.n_buckets; ++b) {
+        const int w1 = cur.widths[b];
+        int want_v = -1;
+        const int want_c = ops::stop_decide_step_ref(dp.data(), dm.data(), cur, b, w1, earlier, &ref_s, &want_v);
+        stop_decide_step(dprob, dmargin, dpol, dst, b, w1, 0, zero_h, earlier, 0);
+        DevStopState got{};
+        CK(cudaMemcpy(&got, dst, sizeof(got), cudaMemcpyDeviceToHost));
+        got_s.push_back(double(got.survival));
+        want_s.push_back(ref_s);
+        step_ok = step_ok && (got.decision == want_c) && (got.verify_bucket == want_v) && (earlier || want_v == b);
+      }
     }
 
     const int want_b = ops::stop_decide_block_ref(dp.data(), dm.data(), cur);
-    StopCondHandles zero_h{};
     stop_decide_block(dprob, dmargin, dpol, dst, zero_h, 0);
     DevStopState got_b{};
     CK(cudaMemcpy(&got_b, dst, sizeof(got_b), cudaMemcpyDeviceToHost));
@@ -669,16 +963,132 @@ void test_stop_decide() {
   for (int i = 0; i < FLYX_MAX_STOP_BUCKETS; ++i) oob.widths[i] = FLYX_MAX_ROWS + 32;
   CK(cudaMemcpy(dpol, &oob, sizeof(oob), cudaMemcpyHostToDevice));
   StopCondHandles zero_h{};
-  stop_decide_step(dprob, dmargin, dpol, dst, 0, 0, FLYX_MAX_ROWS + 5, 0, 0, 0);
+  stop_decide_step(dprob, dmargin, dpol, dst, 0, FLYX_MAX_ROWS + 5, 0, zero_h, true, 0);
   DevStopState got_oob_s{};
   CK(cudaMemcpy(&got_oob_s, dst, sizeof(got_oob_s), cudaMemcpyDeviceToHost));
   stop_decide_block(dprob, dmargin, dpol, dst, zero_h, 0);
   DevStopState got_oob_b{};
   CK(cudaMemcpy(&got_oob_b, dst, sizeof(got_oob_b), cudaMemcpyDeviceToHost));
   const bool oob_ok = std::isfinite(got_oob_s.survival) && std::isfinite(got_oob_b.survival) &&
+                      got_oob_s.verify_bucket >= 0 && got_oob_s.verify_bucket < FLYX_MAX_STOP_BUCKETS &&
                       got_oob_b.decision >= 0 && got_oob_b.decision < FLYX_MAX_STOP_BUCKETS;
   std::printf("  %-4s stop_decide clamps out-of-bounds n_buckets and widths\n", oob_ok ? "ok" : "FAIL");
   g_fail += !oob_ok;
+
+#if CUDART_VERSION >= 12040
+  // The step decisions inside a conditional graph, as an adaptive round captures them (runtime/runner.cpp): each
+  // step's kernel sets the next draft body's handle or one verify body's, and here the bodies leave marks.  Against
+  // the same kernel's decisions a step at a time (checked against float64 above): the draft bodies up to the stop ran
+  // and no other, and of the verify bodies only one: the stop's own checkpoint's, or with earlier_prefix the one of
+  // the prefix the stop chose.
+  for (const bool earlier : {false, true}) {
+    constexpr int M = 5;  // pol.n_buckets
+    cudaStream_t st;
+    CK(cudaStreamCreate(&st));
+    int* marks = dev<int>(2 * M);  // [1, M): the draft bodies; [M, 2 M): the verify bodies
+    cudaGraph_t graph;
+    CK(cudaGraphCreate(&graph, 0));
+    cudaGraphConditionalHandle h_ver[M] = {}, h_draft[M] = {};
+    StopCondHandles ver{};
+    for (int j = 0; j < M; ++j) {
+      CK(cudaGraphConditionalHandleCreate(&h_ver[j], graph, 0, cudaGraphCondAssignDefault));
+      ver.h[j] = static_cast<unsigned long long>(h_ver[j]);
+      if (j > 0) CK(cudaGraphConditionalHandleCreate(&h_draft[j], graph, 0, cudaGraphCondAssignDefault));
+    }
+    auto capture = [&](cudaGraph_t into, const std::vector<cudaGraphNode_t>& deps, auto&& fn,
+                       std::vector<cudaGraphNode_t>* leaves) {
+      CK(cudaStreamBeginCaptureToGraph(st, into, deps.empty() ? nullptr : deps.data(), nullptr, deps.size(),
+                                       cudaStreamCaptureModeThreadLocal));
+      fn();
+      if (leaves) {
+        cudaStreamCaptureStatus status{};
+        const cudaGraphNode_t* last = nullptr;
+        size_t n_last = 0;
+        CK(cudaStreamGetCaptureInfo(st, &status, nullptr, nullptr, &last, nullptr, &n_last));
+        leaves->assign(last, last + n_last);
+      }
+      cudaGraph_t ended = nullptr;
+      CK(cudaStreamEndCapture(st, &ended));
+    };
+    auto body_of = [&](cudaGraphConditionalHandle h, const std::vector<cudaGraphNode_t>& deps, cudaGraphNode_t* node) {
+      cudaGraphNodeParams np{};
+      np.type = cudaGraphNodeTypeConditional;
+      np.conditional.handle = h;
+      np.conditional.type = cudaGraphCondTypeIf;
+      np.conditional.size = 1;
+      CK(cudaGraphAddNode(node, graph, deps.empty() ? nullptr : deps.data(), nullptr, deps.size(), &np));
+      return np.conditional.phGraph_out[0];
+    };
+    std::vector<cudaGraphNode_t> prev;
+    capture(graph, {}, [&] {
+      stop_decide_step(dprob, dmargin, dpol, dst, 0, ws[0], static_cast<unsigned long long>(h_draft[1]), ver, earlier,
+                       st);
+    }, &prev);
+    for (int j = 1; j < M; ++j) {
+      cudaGraphNode_t node = nullptr;
+      const cudaGraph_t body = body_of(h_draft[j], prev, &node);
+      const unsigned long long next = j + 1 < M ? static_cast<unsigned long long>(h_draft[j + 1]) : 0ull;
+      capture(body, {}, [&] {
+        CK(cudaMemsetAsync(marks + j, 1, sizeof(int), st));
+        stop_decide_step(dprob, dmargin, dpol, dst, j, ws[j], next, ver, earlier, st);
+      }, nullptr);
+      prev = {node};
+    }
+    for (int j = 0; j < M; ++j) {
+      cudaGraphNode_t node = nullptr;
+      const cudaGraph_t body = body_of(h_ver[j], prev, &node);
+      capture(body, {}, [&] { CK(cudaMemsetAsync(marks + M + j, 1, sizeof(int), st)); }, nullptr);
+    }
+    cudaGraphExec_t exec;
+    CK(cudaGraphInstantiate(&exec, graph, 0));
+
+    bool graph_ok = true;
+    int before = 0, widest = 0;  // stops that verify an earlier prefix; walks through the last checkpoint
+    for (int trial = 0; trial < 24; ++trial) {
+      flyx_stop_policy cur = pol;
+      if (trial == 0) cur.enabled = 0;  // every draft body, the last verify body
+      CK(cudaMemcpy(dpol, &cur, sizeof(cur), cudaMemcpyHostToDevice));
+      std::vector<float> hp(FLYX_MAX_ROWS), hm(FLYX_MAX_ROWS);
+      for (int k = 0; k < FLYX_MAX_ROWS; ++k) {
+        hp[size_t(k)] = float(u_prob(rng));
+        hm[size_t(k)] = float(u_margin(rng));
+        // A sure first draft and unsure ones after it: steps are taken on the positions' rates, and with the drafts'
+        // confidences in hand a prefix shorter than what was drafted is the one that pays.
+        if (trial == 1) {
+          hp[size_t(k)] = k == 0 ? 0.995f : 0.16f;
+          hm[size_t(k)] = k == 0 ? 10.f : 0.05f;
+        }
+      }
+      CK(cudaMemcpy(dprob, hp.data(), sizeof(float) * FLYX_MAX_ROWS, cudaMemcpyHostToDevice));
+      CK(cudaMemcpy(dmargin, hm.data(), sizeof(float) * FLYX_MAX_ROWS, cudaMemcpyHostToDevice));
+      int stop = 0, verify = 0;  // the bucket whose step stops, the bucket it verifies
+      for (;; ++stop) {
+        stop_decide_step(dprob, dmargin, dpol, dst, stop, ws[stop], 0, StopCondHandles{}, earlier, 0);
+        DevStopState got{};
+        CK(cudaMemcpy(&got, dst, sizeof(got), cudaMemcpyDeviceToHost));
+        verify = got.verify_bucket;
+        if (!got.decision || stop + 1 == M) break;
+      }
+      before += verify < stop;
+      widest += stop == M - 1;
+      if (trial == 1) graph_ok = graph_ok && stop > 0 && (earlier ? verify < stop : verify == stop);
+      CK(cudaMemset(marks, 0, 2 * M * sizeof(int)));
+      CK(cudaGraphLaunch(exec, st));
+      CK(cudaStreamSynchronize(st));
+      const auto ran = down_i(marks, 2 * M);
+      for (int j = 1; j < M; ++j) graph_ok = graph_ok && (ran[size_t(j)] != 0) == (j <= stop);
+      for (int j = 0; j < M; ++j) graph_ok = graph_ok && (ran[size_t(M + j)] != 0) == (j == verify);
+    }
+    graph_ok = graph_ok && widest > 0 && (earlier ? before > 0 : before == 0);
+    std::printf("  %-4s stop_decide_step in a conditional graph (%s): the draft bodies up to the stop, one verify "
+                "body (%d of 24 an earlier prefix, %d through the last checkpoint)\n",
+                graph_ok ? "ok" : "FAIL", earlier ? "earlier prefixes" : "its own checkpoint", before, widest);
+    g_fail += !graph_ok;
+    CK(cudaGraphExecDestroy(exec));
+    CK(cudaGraphDestroy(graph));
+    CK(cudaStreamDestroy(st));
+  }
+#endif
 }
 
 }  // namespace flyx::optest

@@ -1,12 +1,17 @@
 // Copyright 2026 The flyx Authors. SPDX-License-Identifier: Apache-2.0
 #include "apps/flyx-server/model_host.h"
 
+#include <algorithm>
+#include <chrono>
+#include <condition_variable>
 #include <cstdint>
 #include <cstdio>
 #include <filesystem>
 #include <fstream>
+#include <initializer_list>
 
 #include "apps/common/defaults.h"
+#include "apps/flyx-server/drafter_speeds.h"
 #include "core/interfaces/options.h"
 #include "core/os/env.h"
 #include "core/os/os.h"
@@ -30,7 +35,7 @@ ojson want_json(const ModelHost::Want& w) {
           {"kv_ram", w.eo.kv_ram < 0 ? ojson("auto") : ojson(double(w.eo.kv_ram) / 1e9)},
           {"kv_gpu", w.eo.kv_gpu < 0 ? ojson(nullptr) : ojson(w.eo.kv_gpu)},
           {"width", w.eo.width < 0 ? ojson(nullptr) : ojson(w.eo.width)},
-          {"draft_trees", w.eo.draft_trees},
+          {"draft_trees", w.eo.draft_trees_given ? ojson(w.eo.draft_trees) : ojson(nullptr)},  // null: the drafter's default
           {"lookup", w.eo.lookup},
           {"draft_head", w.draft_head.empty() ? ojson(nullptr) : ojson(w.draft_head)},
           {"draft_weights", w.draft_weights.empty() ? ojson(nullptr) : ojson(w.draft_weights)},
@@ -82,16 +87,42 @@ bool write_settings_locked(const ojson& root, std::string* err) {
   return true;
 }
 
-// A model's requests end, and its memory comes back once the last of them lets go of it.
+// A served scheduler's end: set once it is destroyed (its worker joined, its engine and the backend's model closed),
+// on whichever thread let go of it last.  A weak pointer expires as that owner starts the destructor, before any of
+// the memory comes back.
+struct Teardown {
+  std::mutex mu;
+  std::condition_variable cv;
+  bool done = false;
+};
+
+struct SignalTeardown {
+  std::shared_ptr<Teardown> teardown;
+  void operator()(Scheduler* s) const {
+    delete s;
+    {
+      std::lock_guard<std::mutex> lock(teardown->mu);
+      teardown->done = true;
+    }
+    teardown->cv.notify_all();
+  }
+};
+
+// A model's requests end, and its memory comes back once the last of them lets go of it: returns when it has.
 void retire(std::shared_ptr<Scheduler> old) {
   if (!old) return;
   old->close();
+  const SignalTeardown* signal = std::get_deleter<SignalTeardown>(old);
+  const std::shared_ptr<Teardown> teardown = signal ? signal->teardown : nullptr;
   std::weak_ptr<Scheduler> gone = old;
   old.reset();
-  for (int i = 0; !gone.expired(); ++i) {
-    if (i == 100) std::fprintf(stderr, "flyx-server: waiting for the last model's requests to end\n");
-    os::sleep_ms(50);
+  if (!teardown) {  // not one ModelHost::open made: only its last owner is known to have let go
+    while (!gone.expired()) os::sleep_ms(50);
+    return;
   }
+  std::unique_lock<std::mutex> lock(teardown->mu);
+  for (int i = 0; !teardown->cv.wait_for(lock, std::chrono::milliseconds(50), [&] { return teardown->done; }); ++i)
+    if (i == 100) std::fprintf(stderr, "flyx-server: waiting for the last model's requests to end\n");
 }
 
 ojson drafters_json(const std::vector<apps::DrafterSource>& ds, const char* where) {
@@ -99,6 +130,33 @@ ojson drafters_json(const std::vector<apps::DrafterSource>& ds, const char* wher
   for (const apps::DrafterSource& d : ds)
     out.push_back({{"kind", d.kind}, {where, d.from}, {"size", d.size ? ojson(*d.size) : ojson(nullptr)}});
   return out;
+}
+
+bool drafter_active(std::string_view active, std::string_view kind) {
+  if (active.empty() || active == "none") return false;
+  size_t i = 0;
+  while (i < active.size()) {
+    size_t j = active.find('+', i);
+    if (j == std::string_view::npos) j = active.size();
+    if (active.substr(i, j - i) == kind) return true;
+    i = j + 1;
+  }
+  return false;
+}
+
+ojson degraded_json(const std::vector<LoadAdjustment>& list) {
+  ojson out = ojson::array();
+  for (const LoadAdjustment& a : list)
+    out.push_back({{"kind", a.kind}, {"from", a.from}, {"to", a.to}, {"detail", a.detail}});
+  return out;
+}
+
+// The model a drafter's speeds are kept under (drafter_speeds.h): a Hub name as named, else its file's absolute path.
+std::string speed_model(const std::string& named, const std::string& path) {
+  std::error_code ec;
+  hub::Name n;
+  return !fs::exists(to_path(named), ec) && hub::parse_name(named, &n) ? named
+                                                                         : os::from_path(fs::absolute(to_path(path), ec));
 }
 
 void save_settings(const ModelHost::Want& w) {
@@ -162,12 +220,10 @@ bool want_from_json(const ojson& j, const EngineOptions& base, ModelHost::Want* 
     }
   }
   if (j.contains("drafter") && !j["drafter"].is_null()) {
-    if (!j["drafter"].is_string()) return *err = "\"drafter\": mtp, dflash2, dv, all or none", false;
-    const std::string d = j["drafter"].get<std::string>();
     interfaces::DrafterMode mode = interfaces::DrafterMode::kAuto;
-    if (!interfaces::parse_drafter_mode(d, &mode))
-      return *err = "\"drafter\": mtp, dflash2, dv, all or none", false;
-    out.eo.drafter = d;
+    if (!j["drafter"].is_string() || !interfaces::parse_drafter_mode(j["drafter"].get<std::string>(), &mode))
+      return *err = "\"drafter\": " + interfaces::drafter_mode_words(), false;
+    out.eo.drafter = j["drafter"].get<std::string>();
   }
   if (j.contains("speculative") && !j["speculative"].is_null()) {
     if (!j["speculative"].is_boolean()) return *err = "\"speculative\": true or false", false;
@@ -268,19 +324,42 @@ bool want_from_json(const ojson& j, const EngineOptions& base, ModelHost::Want* 
     out.eo.lookup = j["lookup"].get<bool>();
     out.eo.lookup_given = true;
   }
-  // The drafters' CUDA backend options (--backend-opt draft_head=..., draft_weights=...), after the command line's.
+  // The drafters' CUDA backend options (--backend-opt draft_head=..., draft_weights=...), overriding any value from
+  // the server's command line. Explicit null/default resets to the default so the dashboard can clear CLI overrides.
   // Skip appending CUDA-only options when running on cpu_ref, which rejects unknown backend options.
   auto drafting_option = [&](const char* key, const char* a, const char* b, std::string* to) {
-    if (!j.contains(key) || j[key].is_null()) return true;
+    if (!j.contains(key)) return true;
+    if (j[key].is_null()) {
+      out.eo.backend_options = interfaces::backend_opt_strip(out.eo.backend_options, key);
+      to->clear();
+      return true;
+    }
     const std::string v = j[key].is_string() ? j[key].get<std::string>() : "";
     if (v != a && v != b) return *err = std::string("\"") + key + "\": " + a + " or " + b, false;
-    *to = v;
+    *to = v == a ? "" : v;
     if (out.eo.backend != "cpu_ref")
-      out.eo.backend_options += (out.eo.backend_options.empty() ? "" : ",") + std::string(key) + "=" + v;
+      out.eo.backend_options = interfaces::backend_opt_set(out.eo.backend_options, key, v);
+    else
+      out.eo.backend_options = interfaces::backend_opt_strip(out.eo.backend_options, key);
     return true;
   };
   if (!drafting_option("draft_head", "pick", "full", &out.draft_head)) return false;
-  if (!drafting_option("draft_weights", "nvfp4", "exact", &out.draft_weights)) return false;
+  if (j.contains("draft_weights")) {
+    if (j["draft_weights"].is_null()) {
+      out.draft_weights.clear();
+      out.eo.backend_options = interfaces::backend_opt_strip(out.eo.backend_options, "draft_weights");
+    } else {
+      if (!j["draft_weights"].is_string()) return *err = "\"draft_weights\": auto, nvfp4, q8 or exact", false;
+      std::string canon;
+      if (!interfaces::parse_draft_weights(j["draft_weights"].get<std::string>(), nullptr, &canon, nullptr))
+        return *err = "\"draft_weights\": auto, nvfp4, q8 or exact", false;
+      out.draft_weights = canon == "auto" ? "" : canon;
+      if (canon != "auto")
+        out.eo.backend_options = interfaces::backend_opt_set(out.eo.backend_options, "draft_weights", canon);
+      else
+        out.eo.backend_options = interfaces::backend_opt_strip(out.eo.backend_options, "draft_weights");
+    }
+  }
   *w = std::move(out);
   return true;
 }
@@ -309,6 +388,23 @@ bool ModelHost::save_hub_endpoint(const std::string& endpoint, std::string* err)
   if (!root.is_object()) root = ojson::object();
   if (endpoint.empty()) root.erase("hub_endpoint");
   else root["hub_endpoint"] = endpoint;
+  return write_settings_locked(root, err);
+}
+
+bool ModelHost::lan_access() {
+  const ojson root = read_settings();
+  return root.is_object() && root.contains("lan_access") && root["lan_access"] == true;
+}
+
+bool ModelHost::save_lan_access(bool enabled, std::string* err) {
+  if (settings_path().empty()) {
+    *err = "no configuration directory available to save LAN access";
+    return false;
+  }
+  std::lock_guard<std::mutex> lock(settings_mutex());
+  ojson root = read_settings_locked();
+  if (!root.is_object()) root = ojson::object();
+  root["lan_access"] = enabled;
   return write_settings_locked(root, err);
 }
 
@@ -373,17 +469,37 @@ bool ModelHost::with_files_in_use(const std::function<void(const std::vector<std
   return true;
 }
 
-std::shared_ptr<Scheduler> ModelHost::open(const apps::Fetched& f, const EngineOptions& options, double* load_s,
-                                           std::string* err) const {
+std::shared_ptr<Scheduler> ModelHost::open(const std::string& model, const apps::Fetched& f,
+                                           const EngineOptions& options, double* load_s, std::string* err) const {
   EngineOptions eo = options;
   eo.drafter_files = f.drafters;
   eo.mmproj_file = f.mmproj;
   eo.lora_file = f.lora;
   std::fprintf(stderr, "flyx-server: loading %s\n", f.model.c_str());
   const double t0 = os::now_ms();
+  // Each request that runs to its end and drafts counts for the speed of the Hub drafters the model drafts with
+  // (drafting: once loaded, the kinds the engine drafts with), by model: a Hub name as named, a path made absolute.
+  SchedulerOptions so = so_;
+  std::vector<std::pair<std::string, std::string>> hub_drafters;  // repository, kind
+  std::error_code ec;
+  for (const apps::DrafterSource& d : f.drafter_sources) {
+    hub::Name n;
+    if (d.kind != "mtp" && !fs::exists(to_path(d.from), ec) && hub::parse_name(d.from, &n))
+      hub_drafters.push_back({n.repo, d.kind});
+  }
+  const std::string model_key = speed_model(model, f.model);
+  auto drafting = std::make_shared<std::vector<std::string>>();  // filled once the engine says what it drafts with
+  auto drafting_mu = std::make_shared<std::mutex>();
+  if (eo.speculative && !hub_drafters.empty())
+    so.on_finished = [model_key, drafting, drafting_mu](const RequestRecord& r) {
+      if (r.status == "cancelled" || r.status == "error" || r.drafted <= 0) return;
+      std::lock_guard<std::mutex> lock(*drafting_mu);
+      add_drafter_speed(model_key, *drafting, r.output_tokens, r.decode_ms);
+    };
   std::shared_ptr<Scheduler> sched;
   try {
-    sched = std::make_shared<Scheduler>(f.model, eo, so_);
+    // A deleter that says when it is gone, for retire() to wait on before the next model loads.
+    sched = std::shared_ptr<Scheduler>(new Scheduler(f.model, eo, so), SignalTeardown{std::make_shared<Teardown>()});
   } catch (const std::exception& e) {
     // A model file no check foresaw: a load that failed with its reason, not the end of the server.
     *err = e.what();
@@ -393,6 +509,12 @@ std::shared_ptr<Scheduler> ModelHost::open(const apps::Fetched& f, const EngineO
   if (!sched->ok(err)) {
     std::fprintf(stderr, "flyx-server: %s: %s\n", f.model.c_str(), err->c_str());
     return nullptr;
+  }
+  if (so.on_finished && sched->engine()) {  // the Hub drafters among those the engine drafts with ("mtp+dspark")
+    const std::string with = std::string("+") + sched->engine()->drafter() + "+";
+    std::lock_guard<std::mutex> lock(*drafting_mu);
+    for (const auto& [repo, kind] : hub_drafters)
+      if (with.find("+" + kind + "+") != std::string::npos) drafting->push_back(repo);
   }
   *load_s = (os::now_ms() - t0) / 1000;
   return sched;
@@ -436,7 +558,7 @@ bool ModelHost::work(const Want& w, std::string* err) {
     progress_ = p;
   });
   if (!apps::fetch_model(w.model, w.drafters, apps::wants_mtp(w.eo), logged, &stop_, &f, err, w.eo.mmproj_file,
-                         w.eo.vision, w.eo.lora_file)) {
+                         w.eo.vision, apps::wants_dspark(w.eo, w.drafters), w.eo.lora_file)) {
     std::fprintf(stderr, "flyx-server: %s: %s\n", w.model.c_str(), err->c_str());
     std::lock_guard<std::mutex> lock(mu_);
     error_ = *err, state_ = served_.sched ? "ready" : "failed";
@@ -455,7 +577,7 @@ bool ModelHost::work(const Want& w, std::string* err) {
   retire(std::move(old));
   std::string why;
   double load_s = 0;
-  auto sched = open(f, w.eo, &load_s, &why);
+  auto sched = open(w.model, f, w.eo, &load_s, &why);
   if (!sched) {
     std::fprintf(stderr, "flyx-server: %s did not load: none served\n", w.model.c_str());
     std::lock_guard<std::mutex> lock(mu_);
@@ -477,15 +599,37 @@ bool ModelHost::work(const Want& w, std::string* err) {
 ojson ModelHost::status() const {
   // A slow settings drive must not hold up requests for the model already in memory.
   const ojson s = read_settings();
+  std::shared_ptr<Scheduler> active_sched;
+  {
+    std::lock_guard<std::mutex> lock(mu_);
+    active_sched = served_.sched;
+  }
+  ModelInfo active_model;
+  bool has_active = false;
+  if (active_sched) {
+    TelemetrySnapshot snap;
+    flyx_device_stats dev{};
+    bool dev_ok = false;
+    active_sched->telemetry(&snap, &dev, &dev_ok);
+    if (snap.loaded) active_model = std::move(snap.model), has_active = true;
+  }
   std::lock_guard<std::mutex> lock(mu_);
+  std::vector<apps::DrafterSource> active_drafters;
+  if (served_.sched) {
+    for (const apps::DrafterSource& d : fetched_.drafter_sources)
+      if (!has_active || drafter_active(active_model.drafter, d.kind)) active_drafters.push_back(d);
+  }
   ojson j = {{"state", state_},
              {"model", served_.sched ? ojson(served_.name) : ojson(nullptr)},
              {"target", target_.empty() ? ojson(nullptr) : ojson(target_)},
              {"error", error_.empty() ? ojson(nullptr) : ojson(error_)},
              {"notes", notes_},
              {"fallback", ojson(nullptr)},
-             {"drafters", drafters_json(served_.sched ? fetched_.drafter_sources : std::vector<apps::DrafterSource>{}, "from")},
-             {"suggested", drafters_json(served_.sched ? fetched_.suggested : std::vector<apps::DrafterSource>{}, "name")},
+             {"degraded", served_.sched && has_active ? degraded_json(active_model.load_adjustments) : ojson::array()},
+             {"drafters", drafters_json(active_drafters, "from")},
+             {"suggested", served_.sched
+                               ? known_drafters_json(speed_model(last_.model, fetched_.model), fetched_.suggested)
+                               : ojson::array()},
              {"vision_projector",
               served_.sched && served_.sched->has_vision() && !fetched_.mmproj_source.empty()
                   ? ojson({{"from", fetched_.mmproj_source},
@@ -506,14 +650,18 @@ void log_loaded(const Scheduler& sched, const std::string& name, double load_s) 
   bool dev_ok = false;
   sched.telemetry(&snap, &dev, &dev_ok);
   const ModelInfo& m = snap.model;
-  std::fprintf(stderr, "flyx-server: %s on %s (%s), context %d, drafter %s (up to %d per round), loaded in %.1f s\n",
-               name.c_str(), m.device.c_str(), m.backend.c_str(), m.max_ctx, m.drafter.c_str(), m.width, load_s);
+  const std::string dw = m.draft_weights.empty() ? "" : (m.draft_weights + ", ");
+  std::fprintf(stderr, "flyx-server: %s on %s (%s), context %d, drafter %s (%sup to %d per round), loaded in %.1f s\n",
+               name.c_str(), m.device.c_str(), m.backend.c_str(), m.max_ctx, m.drafter.c_str(), dw.c_str(), m.width,
+               load_s);
   std::fprintf(stderr, "flyx-server: memory: %s; up to %d session%s\n", m.memory.c_str(),
                m.max_sessions, m.max_sessions == 1 ? "" : "s");
   if (m.vision) {
     std::fprintf(stderr, "flyx-server: vision: %s (%s)%s\n", m.vision_device.c_str(), m.vision_quant.c_str(),
                  m.vision_max_tokens > 0 ? (" max " + std::to_string(m.vision_max_tokens) + " tok/img").c_str() : "");
   }
+  for (const LoadAdjustment& a : m.load_adjustments)
+    std::fprintf(stderr, "flyx-server: VRAM adjustment: %s\n", a.detail.c_str());
   std::fprintf(stderr, "flyx-server: chat template: %s\n",
                !m.chat_ok ? "none (chat endpoints answer 400)"
                : m.chat_native

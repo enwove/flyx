@@ -14,7 +14,7 @@
 
 namespace flyx::cuda {
 
-// Most candidates a row has (topk_rows, the DFlash2 selector).
+// Most candidates a row has in topk_rows' per-thread lists (DV's slots; topk_rows past it: k_topk_wide).
 constexpr int kTopMax = 16;
 
 __device__ __forceinline__ float warp_sum(float v) {
@@ -230,12 +230,15 @@ struct Out {
 // A group of 32 values in 8 bits, as the staging kernels round them (gemm_blocks.cu): d = (their largest
 // magnitude) / 127 and p = the nearest integer of value / d, both in float32, written where the GEMM reads them.
 // p: this lane's integer, `at` (0..31) its place in the group; s16: the sum of its half's 16 integers (the half
-// at / 16); first: the lane that writes the group's d and its halves' sums.
+// at / 16); first: the lane that writes the group's d and its halves' sums.  CONTIGUOUS: the integers in place beside
+// the sums too, as the expert GEMMs read them (moe_stage_q8), not where round_q8_at puts the two halves.
+template <bool CONTIGUOUS = false>
 __device__ __forceinline__ void q8_store(const Out& o, int row, int grp, int at, int p, float dg, int s16, bool first16,
                                          bool first) {
   const int units = o.q8_k / 32;
   if (o.q8_sums) {
-    o.q8[size_t(row) * o.q8_k + round_q8_at(grp, units, at >> 4) + (at & 15)] = int8_t(p);
+    const int i = CONTIGUOUS ? 32 * grp + at : round_q8_at(grp, units, at >> 4) + (at & 15);
+    o.q8[size_t(row) * o.q8_k + i] = int8_t(p);
     if (first16) o.q8_sums[(size_t(row) * units + grp) * 2 + (at >> 4)] = dg * float(s16);
   } else {
     o.q8[size_t(row) * o.q8_k + 32 * grp + at] = int8_t(p);
@@ -246,6 +249,7 @@ __device__ __forceinline__ int q8_of(float v, float dg) {
   return dg > 0.f && dg <= 3.402823466e38f ? __float2int_rn(v / dg) : 0;
 }
 // A warp's 32 values, lane l value 32 grp + l of the row (every lane of the warp calls it).
+template <bool CONTIGUOUS = false>
 __device__ __forceinline__ void put_q8(const Out& o, int row, int grp, float v) {
   const int lane = threadIdx.x & 31;
   if (o.also) o.also[size_t(row) * o.q8_k + 32 * grp + lane] = v;
@@ -262,15 +266,16 @@ __device__ __forceinline__ void put_q8(const Out& o, int row, int grp, float v) 
   int s16 = p;
 #pragma unroll
   for (int s = 8; s; s >>= 1) s16 += __shfl_xor_sync(0xffffffffu, s16, s);
-  q8_store(o, row, grp, lane, p, dg, s16, !(lane & 15), !lane);
+  q8_store<CONTIGUOUS>(o, row, grp, lane, p, dg, s16, !(lane & 15), !lane);
 }
-// A warp's 64 values in pairs, lane l values 2 l and 2 l + 1 from 64 grp2 of the row: lanes 0..15 the group
-// 2 grp2, lanes 16..31 the next (every lane of the warp calls it).
-__device__ __forceinline__ void put_q8_pairs(const Out& o, int row, int grp2, float a, float b) {
-  const int lane = threadIdx.x & 31, l = lane & 15, grp = 2 * grp2 + (lane >> 4);
+// A warp's 64 values in pairs, lane l values 2 l and 2 l + 1 from 64 pair_group of the row: lanes 0..15 the group
+// 2 pair_group, lanes 16..31 the next (every lane of the warp calls it).  Not named grp2: <windows.h> (dlgs.h), which
+// <cooperative_groups.h> brings in on Windows before this header, defines that name as a macro.
+__device__ __forceinline__ void put_q8_pairs(const Out& o, int row, int pair_group, float a, float b) {
+  const int lane = threadIdx.x & 31, l = lane & 15, grp = 2 * pair_group + (lane >> 4);
   if (o.also) {
-    o.also[size_t(row) * o.q8_k + 64 * grp2 + 2 * lane] = a;
-    o.also[size_t(row) * o.q8_k + 64 * grp2 + 2 * lane + 1] = b;
+    o.also[size_t(row) * o.q8_k + 64 * pair_group + 2 * lane] = a;
+    o.also[size_t(row) * o.q8_k + 64 * pair_group + 2 * lane + 1] = b;
   }
   float m = fmaxf(fabsf(a), fabsf(b));
 #pragma unroll
@@ -576,6 +581,75 @@ __device__ __forceinline__ uint32_t float_order_u32(float v) {
 // Tie-breaking score comparison: higher score wins; on equal scores, lower index wins.
 __device__ __forceinline__ bool score_better(float va, int ia, float vb, int ib) {
   return va > vb || (va == vb && ia < ib);
+}
+
+// The block's radix select (8 bits a pass, from the top): the key of the want-th largest of the keys key(i, &k) gives
+// for i < n (true: a key; false: none), and in *ties how many of the keys equal to it the want largest take.  There
+// must be at least want keys.  Every thread of the block calls it (blockDim.x a multiple of 32, at least 256).
+template <class Key>
+__device__ uint32_t block_radix_kth(int n, int want, Key key, int* ties) {
+  __shared__ int hist[256];
+  __shared__ int s_digit, s_need;
+  const int tid = threadIdx.x, lane = tid & 31, warp = tid >> 5;
+  uint32_t prefix = 0, mask = 0;
+  if (tid == 0) s_need = want;
+  for (int shift = 24; shift >= 0; shift -= 8) {
+    if (tid < 256) hist[tid] = 0;
+    __syncthreads();
+    for (int i = tid; i < n; i += blockDim.x) {
+      uint32_t k;
+      if (key(i, &k) && (k & mask) == prefix) atomicAdd(&hist[(k >> shift) & 255], 1);
+    }
+    __syncthreads();
+    if (warp == 0) {  // the digit of the need-th largest among the keys matching the prefix
+      // lane l holds bins 255 - 8 l .. 248 - 8 l; counts from the top, then the lane and bin it lands in
+      int c[8], sum = 0;
+#pragma unroll
+      for (int j = 0; j < 8; ++j) sum += (c[j] = hist[255 - 8 * lane - j]);
+      int incl = sum;
+#pragma unroll
+      for (int o = 1; o < 32; o <<= 1) {
+        const int u = __shfl_up_sync(0xffffffffu, incl, o);
+        if (lane >= o) incl += u;
+      }
+      const int need = s_need, excl = incl - sum;
+      const unsigned hit = __ballot_sync(0xffffffffu, excl < need && incl >= need);
+      if (hit && lane == __ffs(hit) - 1) {
+        int left = need - excl, d = 0;
+#pragma unroll
+        for (int j = 0; j < 8; ++j)
+          if (left > 0 && d == j) {
+            if (c[j] < left) left -= c[j], d = j + 1;
+          }
+        s_digit = 255 - 8 * lane - d;
+        s_need = left;
+      }
+    }
+    __syncthreads();
+    prefix |= uint32_t(s_digit) << shift;
+    mask |= 255u << shift;
+  }
+  *ties = s_need;
+  return prefix;
+}
+
+// The block sorts n (a power of two) (score, index) pairs in shared memory best first (score_better), bitonic; every
+// thread of the block calls it, and it returns after the block's last barrier.
+__device__ inline void block_sort_best_first(float* v, int* idx, int n) {
+  for (int size = 2; size <= n; size <<= 1)
+    for (int stride = size / 2; stride > 0; stride >>= 1) {
+      for (int a = threadIdx.x; a < n; a += blockDim.x) {
+        const int b = a ^ stride;
+        if (b <= a) continue;
+        const bool b_first = score_better(v[b], idx[b], v[a], idx[a]);
+        if ((a & size) == 0 ? b_first : !b_first) {
+          const float tv = v[a];
+          const int ti = idx[a];
+          v[a] = v[b], idx[a] = idx[b], v[b] = tv, idx[b] = ti;
+        }
+      }
+      __syncthreads();
+    }
 }
 
 }  // namespace flyx::cuda

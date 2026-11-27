@@ -34,7 +34,7 @@ void decode_utf8(std::string_view s, std::vector<int32_t>* cps, std::vector<size
   offs->push_back(s.size());
 }
 
-enum Cls : uint8_t { kOther = 0, kL = 1, kM = 2, kN = 4, kWS = 8, kCRLF = 16 };
+enum Cls : uint8_t { kOther = 0, kL = 1, kM = 2, kN = 4, kWS = 8, kCRLF = 16, kLu = 32, kLl = 64, kLo = 128 };
 
 bool is_white_space(int32_t c) {
   // Unicode White_Space property.
@@ -46,7 +46,8 @@ constexpr std::array<uint8_t, 128> make_ascii_cls() {
   std::array<uint8_t, 128> t{};
   for (int c = 0; c < 128; ++c) {
     uint8_t r = 0;
-    if ((c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z')) r |= kL;
+    if (c >= 'A' && c <= 'Z') r |= kL | kLu;
+    if (c >= 'a' && c <= 'z') r |= kL | kLl;
     if (c >= '0' && c <= '9') r |= kN;
     if ((c >= 0x09 && c <= 0x0D) || c == 0x20) r |= kWS;
     if (c == '\r' || c == '\n') r |= kCRLF;
@@ -68,9 +69,12 @@ uint8_t classify(int32_t c) {
   if (c < 128) return kAsciiCls[static_cast<size_t>(c)];
   uint8_t r = 0;
   switch (utf8proc_category(c)) {
-    case UTF8PROC_CATEGORY_LU: case UTF8PROC_CATEGORY_LL: case UTF8PROC_CATEGORY_LT:
+    case UTF8PROC_CATEGORY_LU: case UTF8PROC_CATEGORY_LT:
+      r |= kL | kLu; break;
+    case UTF8PROC_CATEGORY_LL:
+      r |= kL | kLl; break;
     case UTF8PROC_CATEGORY_LM: case UTF8PROC_CATEGORY_LO:
-      r |= kL; break;
+      r |= kL | kLo; break;
     case UTF8PROC_CATEGORY_MN: case UTF8PROC_CATEGORY_MC: case UTF8PROC_CATEGORY_ME:
       r |= kM; break;
     case UTF8PROC_CATEGORY_ND: case UTF8PROC_CATEGORY_NL: case UTF8PROC_CATEGORY_NO:
@@ -167,11 +171,107 @@ void pretokenize_impl(std::string_view s, size_t begin, size_t end, SplitRules r
   }
 }
 
+// Hand-written equivalent of the GPT-4o / o200k split regex used by Inkling-2:
+//   [^\r\n\p{L}\p{N}]?[\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}]*[\p{Ll}\p{Lm}\p{Lo}\p{M}]+(?i:'s|'t|'re|'ve|'m|'ll|'d)?
+// | [^\r\n\p{L}\p{N}]?[\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}]+[\p{Ll}\p{Lm}\p{Lo}\p{M}]*(?i:'s|'t|'re|'ve|'m|'ll|'d)?
+// | \p{N}{1,3} | ' '?[^\s\p{L}\p{N}]+[\r\n/]* | \s*[\r\n]+ | \s+(?!\S) | \s+
+template <class CpAt, class ClsAt, class OffAt, class Emit>
+void pretokenize_gpt4o(std::string_view s, size_t n, CpAt&& cp, ClsAt&& k, OffAt&& off, Emit&& emit) {
+  constexpr uint8_t kUpper = kLu | kLo | kM;
+  constexpr uint8_t kLower = kLl | kLo | kM;
+  auto is_U = [&](size_t i) { return i < n && (k(i) & kUpper); };
+  auto is_L = [&](size_t i) { return i < n && (k(i) & kLower); };
+  auto WS = [&](size_t i) { return i < n && (k(i) & kWS); };
+  auto P = [&](size_t i) { return i < n && !(k(i) & (kWS | kL | kN)); };
+  auto contraction = [&](size_t p) -> size_t {
+    if (p < n && cp(p) == '\'' && p + 1 < n) {
+      const int32_t a = ascii_lower(cp(p + 1));
+      if (a == 's' || a == 't' || a == 'm' || a == 'd') return p + 2;
+      if (p + 2 < n) {
+        const int32_t b = ascii_lower(cp(p + 2));
+        if ((a == 'r' && b == 'e') || (a == 'v' && b == 'e') || (a == 'l' && b == 'l')) return p + 3;
+      }
+    }
+    return p;
+  };
+  auto match_alt1 = [&](size_t st) -> size_t {
+    size_t u = st;
+    while (is_U(u)) ++u;
+    if (is_L(u)) {
+      size_t e = u;
+      while (is_L(e)) ++e;
+      return contraction(e);
+    }
+    for (size_t t = u; t-- > st;)
+      if (is_L(t)) return contraction(t + 1);
+    return 0;
+  };
+  auto match_alt2 = [&](size_t st) -> size_t {
+    if (!is_U(st)) return 0;
+    size_t e = st;
+    while (is_U(e)) ++e;
+    while (is_L(e)) ++e;
+    return contraction(e);
+  };
+
+  size_t i = 0;
+  while (i < n) {
+    size_t e = 0;
+    const bool lead = !(k(i) & (kL | kN | kCRLF));
+    // 1. [^\r\n\p{L}\p{N}]? U* L+ contraction?
+    if (lead && i + 1 < n) e = match_alt1(i + 1);
+    if (!e) e = match_alt1(i);
+    // 2. [^\r\n\p{L}\p{N}]? U+ L* contraction?
+    if (!e) {
+      if (lead && i + 1 < n) e = match_alt2(i + 1);
+      if (!e) e = match_alt2(i);
+    }
+    // 3. \p{N}{1,3}
+    if (!e && (k(i) & kN)) {
+      e = i + 1;
+      while (e < n && e - i < 3 && (k(e) & kN)) ++e;
+    }
+    // 4. ' '?[^\s\p{L}\p{N}]+[\r\n/]*
+    if (!e) {
+      const size_t j = (cp(i) == ' ') ? i + 1 : i;
+      if (P(j)) {
+        e = j;
+        while (P(e)) ++e;
+        while (e < n && ((k(e) & kCRLF) || cp(e) == '/')) ++e;
+      }
+    }
+    // 5-7. whitespace
+    if (!e && WS(i)) {
+      size_t r = i;
+      while (WS(r)) ++r;
+      size_t last_nl = SIZE_MAX;
+      for (size_t j = i; j < r; ++j)
+        if (k(j) & kCRLF) last_nl = j;
+      if (last_nl != SIZE_MAX) {
+        e = last_nl + 1;
+      } else if (r == n) {
+        e = r;
+      } else if (r - i >= 2) {
+        e = r - 1;
+      } else {
+        e = r;
+      }
+    }
+    if (!e) e = i + 1;
+    emit(s.substr(off(i), off(e) - off(i)));
+    i = e;
+  }
+}
+
 // The pieces of the n code points of s by the pre-tokenizer `kind`.  MiniCPM5: \p{N}{1,3} isolated first (a run of
 // numbers cut into threes from the left), then the word split on each piece by itself, the groups of numbers included.
 template <class CpAt, class ClsAt, class OffAt, class Emit>
 void pretokenize_kind(std::string_view s, size_t n, Pretokenizer kind, CpAt&& cp, ClsAt&& k, OffAt&& off,
                       Emit&& emit) {
+  if (kind == Pretokenizer::kInkling2) {
+    pretokenize_gpt4o(s, n, cp, k, off, emit);
+    return;
+  }
   if (kind != Pretokenizer::kMiniCPM5) {
     pretokenize_impl(s, 0, n, {kind == Pretokenizer::kQwen35, false}, cp, k, off, emit);
     return;
@@ -245,14 +345,16 @@ bool Tokenizer::load(const ModelFile& file, std::string* err) {
   const auto& t = h["tokenizer"];
   const std::string pre = t.contains("pretokenizer") && t["pretokenizer"].is_string() ? t["pretokenizer"].get<std::string>() : "";
   const std::string normalizer = t.contains("normalizer") && t["normalizer"].is_string() ? t["normalizer"].get<std::string>() : "";
-  if ((pre != "qwen35" && pre != "qwen2" && pre != "minicpm5") || (normalizer != "nfc" && normalizer != "none")) {
+  if ((pre != "qwen35" && pre != "qwen2" && pre != "minicpm5" && pre != "inkling2" && pre != "gpt-4o") ||
+      (normalizer != "nfc" && normalizer != "none")) {
     *err = "unsupported tokenizer pipeline (pre-tokenizer '" + pre + "', normalizer '" + normalizer + "')";
     return false;
   }
   ignore_merges_ = t.contains("ignore_merges") && t["ignore_merges"].is_boolean() && t["ignore_merges"].get<bool>();
-  pretokenizer_ = pre == "qwen2"      ? Pretokenizer::kQwen2
-                  : pre == "minicpm5" ? Pretokenizer::kMiniCPM5
-                                      : Pretokenizer::kQwen35;
+  pretokenizer_ = pre == "qwen2"                           ? Pretokenizer::kQwen2
+                  : pre == "minicpm5"                      ? Pretokenizer::kMiniCPM5
+                  : (pre == "inkling2" || pre == "gpt-4o") ? Pretokenizer::kInkling2
+                                                           : Pretokenizer::kQwen35;
   normalize_nfc_ = normalizer == "nfc";
   by_bytes_.clear(); merges_.clear(); added_.clear(); cache_.clear();
   const int64_t n64 = t.contains("n_tokens") && t["n_tokens"].is_number_integer() ? t["n_tokens"].get<int64_t>() : 0;

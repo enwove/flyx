@@ -209,7 +209,9 @@ int dtype_of(uint32_t ggml_type) {
     case 28: return FLYX_DT_F64;
     case 29: return FLYX_DT_GGML_IQ1_M;
     case 30: return FLYX_DT_BF16;
+    case 39: return FLYX_DT_GGML_MXFP4;
     case 40: return FLYX_DT_GGML_NVFP4;
+    case 42: return FLYX_DT_GGML_Q2_0;
     default: return -1;
   }
 }
@@ -394,9 +396,12 @@ void tokenizer(const json& meta, const RawTokenizer& raw, ModelFile::Contents* o
   }
   out->blobs["tokenizer.merges"] =
       std::string_view(reinterpret_cast<const char*>(merges_buf.data()), merges_buf.size());
-  out->header["tokenizer"] = {{"pretokenizer", meta.value("tokenizer.ggml.pre", "")},
-                              {"normalizer", meta.value("tokenizer.ggml.normalizer.nfc", true) ? "nfc" : "none"},
-                              {"ignore_merges", false},
+  const std::string pre = meta.value("tokenizer.ggml.pre", "");
+  const bool is_inkling2 = pre == "inkling2";
+  const bool is_gpt4o = pre == "gpt-4o";
+  out->header["tokenizer"] = {{"pretokenizer", pre},
+                              {"normalizer", meta.value("tokenizer.ggml.normalizer.nfc", !(is_inkling2 || is_gpt4o)) ? "nfc" : "none"},
+                              {"ignore_merges", meta.value("tokenizer.ggml.ignore_merges", is_inkling2)},
                               {"n_tokens", n},
                               {"n_merges", n_merges}};
   add_blob(out, "tokenizer.added", added.dump());
@@ -649,6 +654,19 @@ void finalize_contents(json&& meta, const RawTokenizer& raw_tok, uint32_t versio
   result->header["gguf"] = std::move(meta);
 }
 
+// What a file opened on its own is (general.type; "model" where it says nothing), refused where it cannot be that:
+// a model, and beside one (a companion: need_tokenizer false) a multimodal projector too; a DFlash2 drafter is never
+// a model.  The same for a single file and a split one (its first shard's word; the other shards may only agree).
+std::string file_type(const json& meta, bool need_tokenizer) {
+  if (need_tokenizer && meta.value("general.architecture", "") == "dflash")
+    invalid("GGUF holds a drafter alone, not a model: give it beside the model (--drafter-file)");
+  const std::string type = meta.value("general.type", "model");
+  if (type != "model" && (need_tokenizer || type != "mmproj"))
+    invalid(type == "mmproj" ? "GGUF is a multimodal projector (pass beside a model with --mmproj)"
+                             : "GGUF is not a complete model");
+  return type;
+}
+
 }  // namespace
 
 bool is_gguf(const uint8_t* data, size_t size) { return size >= 4 && std::memcmp(data, "GGUF", 4) == 0; }
@@ -657,10 +675,7 @@ bool read_gguf(const uint8_t* data, size_t size, const std::string& path, ModelF
                std::string* err, bool need_tokenizer) {
   try {
     ShardHeader h = parse_shard_header(data, size, false, need_tokenizer);
-    const std::string gtype = h.meta.value("general.type", "model");
-    if (gtype != "model" && (need_tokenizer || gtype != "mmproj"))
-      invalid(gtype == "mmproj" ? "GGUF is a multimodal projector (pass beside a model with --mmproj)"
-                                : "GGUF is not a complete model");
+    file_type(h.meta, need_tokenizer);
     if (h.meta.contains("split.count") && integer(h.meta.at("split.count"), "split.count", 0, INT_MAX) > 1)
       invalid("split GGUF requires opening its files from disk");
     ModelFile::Contents result;
@@ -685,12 +700,7 @@ bool read_gguf(std::vector<std::unique_ptr<os::MappedFile>>* maps, const std::st
         initial.meta.contains("split.count") ? int(integer(initial.meta.at("split.count"), "split.count", 0, 99999)) : 1;
     if (split_count <= 1) {
       if (initial.n_tensors == 0) invalid("invalid GGUF tensor/metadata counts");
-      if (need_tokenizer && initial.meta.value("general.architecture", "") == "dflash")
-        invalid("GGUF holds a drafter alone, not a model: give it beside the model (--drafter-file)");
-      const std::string gtype = initial.meta.value("general.type", "model");
-      if (gtype != "model" && (need_tokenizer || gtype != "mmproj"))
-        invalid(gtype == "mmproj" ? "GGUF is a multimodal projector (pass beside a model with --mmproj)"
-                                  : "GGUF is not a complete model");
+      file_type(initial.meta, need_tokenizer);
       ModelFile::Contents result;
       bool quantized = false;
       append_shard_tensors((*maps)[0]->data(), (*maps)[0]->size(), initial, &result, &quantized);
@@ -726,7 +736,7 @@ bool read_gguf(std::vector<std::unique_ptr<os::MappedFile>>* maps, const std::st
 
     ShardHeader h0 = initial_no == 0 ? std::move(initial)
                                      : parse_shard_header(shards[0]->data(), shards[0]->size(), true, need_tokenizer);
-    if (h0.meta.value("general.type", "model") != "model") invalid("GGUF is not a complete model");
+    const std::string type = file_type(h0.meta, need_tokenizer);
     if (!h0.meta.contains("split.count") || int(integer(h0.meta.at("split.count"), "split.count", 0, 99999)) != split_count)
       invalid("shard 1 split.count does not match");
     if (h0.meta.contains("split.no") && integer(h0.meta.at("split.no"), "split.no", 0, split_count - 1) != 0)
@@ -742,8 +752,9 @@ bool read_gguf(std::vector<std::unique_ptr<os::MappedFile>>* maps, const std::st
       ShardHeader hi =
           i == initial_no ? std::move(initial)
                           : parse_shard_header(shards[size_t(i)]->data(), shards[size_t(i)]->size(), true, false);
-      if (hi.meta.contains("general.type") && hi.meta.value("general.type", "model") != "model")
-        invalid("shard " + std::to_string(i + 1) + " is not a model shard");
+      if (hi.meta.contains("general.type") && hi.meta.value("general.type", "model") != type)
+        invalid("shard " + std::to_string(i + 1) + " general.type " + hi.meta.value("general.type", "model") +
+                " does not match shard 1's " + type);
       if (!hi.meta.contains("split.count") ||
           int(integer(hi.meta.at("split.count"), "split.count", 0, 99999)) != split_count)
         invalid("shard " + std::to_string(i + 1) + " split.count does not match");
@@ -815,12 +826,29 @@ class HeaderReader {
 
 namespace flyx {
 
+std::string gguf_header_path(const std::string& path) {
+  modelfile::SplitPath sp;
+  return modelfile::parse_split_suffix(path, &sp) && sp.part != 1 ? modelfile::shard_path(sp, 0) : path;
+}
+
+namespace {
+
+// "org/name" of a Hub repository's URL as llama.cpp writes it (https://huggingface.co/org/name); "" for other text.
+std::string hub_repo_of_url(const std::string& url) {
+  static const std::string kHub = "https://huggingface.co/";
+  if (!url.starts_with(kHub)) return "";
+  const std::string id = url.substr(kHub.size());
+  const size_t slash = id.find('/');
+  return slash == std::string::npos || slash == 0 || slash + 1 == id.size() || id.find('/', slash + 1) != std::string::npos
+             ? ""
+             : id;
+}
+
+}  // namespace
+
 GgufPeek gguf_peek(const std::string& path) {
   GgufPeek out;
-  std::string target = path;
-  modelfile::SplitPath sp;
-  if (modelfile::parse_split_suffix(path, &sp) && sp.part != 1) target = modelfile::shard_path(sp, 0);
-  modelfile::HeaderReader r(target);
+  modelfile::HeaderReader r(gguf_header_path(path));
   char magic[4];
   uint32_t version = 0;
   if (!r.read(magic, 4) || std::memcmp(magic, "GGUF", 4) != 0 || !r.get(&version) || version < 1 || version > 3)
@@ -845,6 +873,7 @@ GgufPeek gguf_peek(const std::string& path) {
   if (!count(&tensors) || !count(&entries) || entries > (uint64_t(1) << 24)) return out;
   std::string arch;
   std::map<std::string, int64_t> layers;  // keyed by architecture: the key may come before general.architecture
+  bool has_markov = false;
   for (uint64_t i = 0; i < entries; ++i) {
     std::string key;
     uint32_t type = 0;
@@ -863,7 +892,13 @@ GgufPeek gguf_peek(const std::string& path) {
       continue;
     }
     if (type == 8) {
-      if (!text(key == "general.architecture" ? &arch : nullptr)) return out;
+      const bool repo = key == "general.source.repo_url" ||
+                        (key.starts_with("general.base_model.") && key.ends_with(".repo_url"));
+      std::string value;
+      if (!text(key == "general.architecture" ? &arch : repo ? &value : nullptr)) return out;
+      if (const std::string id = hub_repo_of_url(value);
+          !id.empty() && std::find(out.base_models.begin(), out.base_models.end(), id) == out.base_models.end())
+        out.base_models.push_back(id);
       continue;
     }
     int64_t v = 0;
@@ -876,17 +911,15 @@ GgufPeek gguf_peek(const std::string& path) {
     static const std::string kKey = ".nextn_predict_layers";
     if (type != 6 && type != 12 && key.size() > kKey.size() && key.ends_with(kKey))
       layers[key.substr(0, key.size() - kKey.size())] = v;
+    else if (type == 7 && key == "dflash.has_markov_context")
+      has_markov = v != 0;
   }
   out.valid = true;
   out.arch = arch;
   const auto it = layers.find(arch);
   out.mtp_layers = it == layers.end() || it->second < 0 ? 0 : int(std::min<int64_t>(it->second, 1 << 20));
+  out.has_markov_context = arch == "dflash" && has_markov;
   return out;
-}
-
-int gguf_peek_mtp_layers(const std::string& path) {
-  const GgufPeek p = gguf_peek(path);
-  return p.valid ? p.mtp_layers : -1;
 }
 
 }  // namespace flyx

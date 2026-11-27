@@ -8,7 +8,8 @@
 //    and in a plain round;
 //  * a drafter made for another model is refused whether or not it is chosen; what a drafter's own config says is
 //    read when it drafts, and a GGUF drafter saying what the block here does not run is refused then
-//    (tiny_draft_refused_*.gguf), with the file named.
+//    (tiny_draft_refused_*.gguf), with the file named; a soft cap on the selector's logits and a tap after the
+//    last layer are run (tiny_draft_softcap.gguf, tiny_draft_last_layer.gguf).
 #include <cstdio>
 #include <initializer_list>
 #include <memory>
@@ -65,17 +66,19 @@ void dflash2_validation(const std::string& dir) {
         add(p + "mlp.gate", {I, H});
         add(p + "mlp.up", {I, H});
         add(p + "mlp.down", {H, I});
-        add(p + "attn_conv.proj", {tg2, H});
-        add(p + "attn_conv.base", {2, ct, H});
-        add(p + "mlp_conv.proj", {tg2, H});
-        add(p + "mlp_conv.base", {2, ct, H});
+        if (ct > 0) {  // convolutions where the config has taps of them
+          add(p + "attn_conv.proj", {tg2, H});
+          add(p + "attn_conv.base", {2, ct, H});
+          add(p + "mlp_conv.proj", {tg2, H});
+          add(p + "mlp_conv.base", {2, ct, H});
+        }
       }
       add("draft.fc", {H, nt * th});
       add("draft.hidden_norm", {H});
       add("draft.norm", {H});
       add("draft.sel.pred", {vocab, sr});
       add("draft.sel.succ", {vocab, sr});
-      add("draft.sel.hid", {sr, H});
+      if (d.at("sel_gate").get<bool>()) add("draft.sel.hid", {sr, H});  // else a unit gate
     }
     json hdr = {{"format", "flyx"}, {"version", 1}, {"kind", "drafter"}, {"draft", d}, {"tensors", tensors}};
     std::string data(off, '\0');
@@ -86,7 +89,8 @@ void dflash2_validation(const std::string& dir) {
       {"kind", "dflash2"},  {"hidden", 64},     {"layers", 1},      {"n_heads", 4},     {"n_kv", 2},
       {"head_dim", 16},     {"inter", 128},     {"eps", 1e-6},      {"rope_theta", 1e4},{"block", 8},
       {"mask_token", 3},    {"taps", {2, 5}},   {"conv_taps", 2},   {"conv_group", 16}, {"sel_rank", 16},
-      {"sel_topk", 16},     {"window", 0},      {"target", {{"hidden", 64}, {"layers", 8}, {"vocab", 768}}},
+      {"sel_topk", 16},     {"window", 0},      {"draft_from", 1},  {"sel_gate", true},
+      {"target", {{"hidden", 64}, {"layers", 8}, {"vocab", 768}}},
   };
   auto check_refused = [&](const std::string& what, const json& d, bool with_tensors, const char* expect_sub) {
     const std::string path = dir + "/bad_dflash2.flyx";
@@ -131,6 +135,38 @@ void dflash2_validation(const std::string& dir) {
     d["n_kv"] = 1024;
     d["head_dim"] = 2048;
     check_refused("ctx_width int32 overflow", d, false, "invalid DFlash2");
+  }
+  // DeepSpec's DSpark (kind "dspark"): the same block without convolutions, every row a draft (draft_from 0), no
+  // selector gate (sel_gate false); taken as such, and refused past a round's rows.
+  json dspark = base;
+  dspark["kind"] = "dspark";
+  dspark["conv_taps"] = 0;
+  dspark["conv_group"] = 1;
+  dspark["draft_from"] = 0;
+  dspark["block"] = 7;
+  dspark["sel_gate"] = false;
+  {
+    const std::string path = dir + "/dspark.flyx";
+    make_drafter(path, dspark, true);
+    std::string error;
+    bool taken = false;
+    {
+      ModelFile f;
+      interfaces::ModelOptions o;
+      o.drafter = "dspark";
+      const auto m = f.open(dir + "/tiny_gguf.gguf", &error) && f.add(path, &error)
+                         ? interfaces::open_model(f, o, &error)
+                         : nullptr;
+      taken = m && m->drafters() == 1 && std::string(m->drafter_name(0)) == "dspark" && m->block_drafts(0) == 7 &&
+              !m->draft_trees_by_default();  // a Qwen3.5 target: chains by default
+    }
+    std::remove(path.c_str());
+    check(taken, "dspark beside the tiny Qwen3.5: its 7 drafts a round, chains by default (" + error + ")");
+  }
+  {
+    json d = dspark;
+    d["block"] = 16;
+    check_refused("dspark block of 16 (a round's rows less the anchor's)", d, true, "block size outside 2..15");
   }
   {  // HIGH: TG2 and n_taps * hidden int32 overflows on a large-hidden synthetic model
     auto check_synth = [&](const std::string& what, json d) {
@@ -239,6 +275,38 @@ void dense_targets(const std::string& dir) {
   }
 }
 
+// What a GGUF drafter may say beyond the plain block, and the block then runs (tiny_draft_softcap.gguf,
+// tiny_draft_last_layer.gguf).
+void said_and_run(const std::string& dir) {
+  const std::string model = dir + "/tiny_gguf.gguf";
+  {  // The selector's soft cap, and where it applies when the file does not say: before the correction.
+    ModelFile f;
+    std::string err;
+    const auto m = open_beside(&f, model, dir + "/tiny_draft_softcap.gguf", "dflash2", &err);
+    bool ok = false;
+    if (m) {
+      const flyx_model_desc d = m->desc();
+      for (int i = 0; i < d.n_blocks; ++i)
+        if (d.blocks[i].kind == FLYX_BLOCK_DFLASH2)
+          ok = d.blocks[i].dflash2.softcap == 30.0f && d.blocks[i].dflash2.softcap_mode == FLYX_DFLASH2_SOFTCAP_BEFORE;
+    }
+    check(ok, "a DFlash2 GGUF with final_logit_softcapping opens with softcap=30 and before_correction mode (" + err +
+                  ")");
+  }
+  {  // A tap after the model's last layer reads its final hidden state: after the output norm (FLYX_TAP_NORMED).
+    ModelFile f;
+    std::string err;
+    const auto m = open_beside(&f, model, dir + "/tiny_draft_last_layer.gguf", "dflash2", &err);
+    bool has_post_norm = false;
+    if (m) {
+      for (const flyx_node& n : m->prefill_program())
+        if (n.kind == FLYX_NODE_TAP && n.arg1 == FLYX_TAP_NORMED) has_post_norm = true;
+    }
+    check(m && has_post_norm,
+          "a DFlash2 GGUF tapping the model's last layer: a tap after the output norm (" + err + ")");
+  }
+}
+
 void refusals(const std::string& dir) {
   const std::string model = dir + "/tiny_gguf.gguf";
   struct Case {
@@ -247,18 +315,26 @@ void refusals(const std::string& dir) {
     const char* what;
   };
   for (const Case& c : {Case{"tiny_draft_refused_causal.gguf", "causal", "causal layers"},
-                        Case{"tiny_draft_refused_dspark.gguf", "DSpark", "a Markov context (DSpark)"},
                         Case{"tiny_draft_refused_anchor.gguf", "sample_from_anchor", "sampling from the anchor"},
                         Case{"tiny_draft_refused_confidence.gguf", "confidence head", "a confidence head"},
-                        Case{"tiny_draft_refused_softcap.gguf", "soft-capping", "soft-capped logits"},
-                        Case{"tiny_draft_refused_last_layer.gguf", "final hidden state",
-                             "a tap on the target's final hidden state"},
                         Case{"tiny_draft_refused_pattern.gguf", "must be uniform", "layers that do not all slide"}}) {
     ModelFile f;
     std::string err;
     const auto m = open_beside(&f, model, dir + "/" + c.file, "dflash2", &err);
     check(!m && err.find(c.says) != std::string::npos && err.find("companion file 1: ") != std::string::npos,
           std::string("a DFlash2 GGUF with ") + c.what + ": refused, the file named (" + err + ")");
+  }
+  // A GGUF with a Markov context is a DSpark drafter, never the plain block: a dense model's programs give it no
+  // taps, so the file is refused beside one whatever drafter is asked for (tests/e2e/inkling2_test.cpp runs it
+  // beside the model it is made for).
+  for (const char* drafter : {"dflash2", "dspark", "none"}) {
+    ModelFile f;
+    std::string err;
+    const auto m = open_beside(&f, model, dir + "/tiny_draft_refused_dspark.gguf", drafter, &err);
+    check(!m && err.find("companion file 1: a DSpark drafter") != std::string::npos &&
+              err.find("does not run") != std::string::npos,
+          std::string("a DSpark GGUF beside a model whose programs do not tap for it, --drafter ") + drafter +
+              ": refused, the file named (" + err + ")");
   }
   {  // What a drafter's config says is read when it drafts: not chosen, the model opens without it.
     ModelFile f;
@@ -300,6 +376,7 @@ int main(int argc, char** argv) {
   const std::string dir = argv[1];
   dflash2_validation(dir);
   dense_targets(dir);
+  said_and_run(dir);
   refusals(dir);
   std::printf("%s (%d failures)\n", failures ? "FAILED" : "PASSED", failures);
   return failures ? 1 : 0;

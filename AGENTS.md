@@ -6,14 +6,14 @@ Mandatory rules for anyone modifying this repository (humans and coding agents a
 
 | Layer | Decides | Never |
 |---|---|---|
-| `core/` (plain C++, no vendor headers) | Sessions, prompt reuse, GPU thread scheduling, prefill chunks and checkpoints, round launch timing, displayed tokens, stop strings, sampling parameters, memory budget, Jinja prompt rendering, post-round grammar enforcement | Includes CUDA; knows which kernels exist; knows a model family's chat format |
+| `core/` (plain C++, no vendor headers) | Sessions, prompt reuse, GPU thread scheduling, prefill chunks and checkpoints, round launch timing, displayed tokens, stop strings, sampling parameters, memory budget, Jinja prompt rendering, post-round grammar enforcement | Includes CUDA; knows which kernels exist; knows a model family's chat format; hardcodes single-GPU, single-model, or single-prompt tuning caps |
 | `core/interfaces/` | Shared interfaces between core, models, and backends | Holds an implementation |
 | `ops/<op>/` | Op semantics: contract and float64 reference | Depends on anything outside `core/interfaces/` and `include/` |
-| `models/<arch>/` | Model description (weights, per-sequence state, typed blocks with dimensions/flags), execution program (block order), and `.flyx`/GGUF tensor names and layout flags | Binds to a GPU; emits tokens; rewrites tensors |
-| `models/drafters/` | Drafters the architectures share (DFlash2; MTP's block from an architecture's hooks): which drafter a file or a companion holds, its config checked against the target, its blocks and state, its tap and context nodes | Knows an architecture's layers or its tensor names; reads a drafter's config before it is chosen, beyond what says which model it was made for |
+| `models/<arch>/` | Model description (weights, per-sequence state, typed blocks with dimensions/flags), execution program (block order), and `.flyx`/GGUF tensor names and layout flags | Binds to a GPU; emits tokens; rewrites tensors; hardcodes GPU- or prompt-tuned speculation caps |
+| `models/drafters/` | Drafters the architectures share (DFlash2's block: DFlash2 and DeepSpec's DSpark; llama.cpp's DSpark GGUF; MTP's block from an architecture's hooks): which drafter a file or a companion holds, its config checked against the target, its blocks and state, its tap and context nodes | Knows an architecture's layers or its tensor names; reads a drafter's config before it is chosen, beyond what says which model it was made for |
 | `models/formats/` | Bidirectional chat formats: reply parsing (thinking, tool calls), format detection from template text, reply grammars (`tool_choice`, JSON schemas), and exact native renderers verified against Jinja | Renders a template it was not written for byte-for-byte |
 | `backends/<name>/` | Block execution: kernels, fusion, weight layouts, CUDA graphs, rollback mechanics | Knows which model it is; alters token acceptance beyond program rules; allocates outside `seq_bytes` / reported memory |
-| `backends/cuda/variants/` | Kernel configuration selection per shape, row count, and GPU | Changes math (tables only pick bit-identical configs or fix one K partition per shape) |
+| `backends/cuda/variants/` | Kernel configuration selection per shape, row count, and GPU | Changes math (tables only pick bit-identical configs or fix one K partition per shape); adds a rule measured on one GPU to `candidates.toml` `[defaults]` (it goes in that GPU's `<arch>/tables/<sku>.toml`; the defaults take a new rule only where it holds on every GPU measured) |
 | `apps/` | Wire formats (CLI, OpenAI / Anthropic HTTP, dashboard) | Touches device state directly |
 | `python/` | Weight conversion, float64 reference, `ctypes` binding | Runs inside the C++ engine |
 
@@ -23,15 +23,20 @@ Mandatory rules for anyone modifying this repository (humans and coding agents a
 
 1. **Every op against float64.** Each CUDA kernel is tested against its `ops/<op>/ref.h` (or `ops/sampling/sampling.h`) in `tests/backends/cuda/op_test_<family>.cu` on seeded inputs (`FLYX_OPS_SEED` varies seeds). If a kernel rounds inputs (e.g., bf16 activations for NVFP4 weights), the reference applies the identical rounding first; tolerances cover accumulation order only. Add or update its row in `docs/design/numerics.md` in the same change (`tools/check_numerics.py` enforces coverage).
 2. **Fused == generic.** Every fused region override must match the generic implementation; golden tests verify both (`fusion=0`).
-3. **Whole-model verification.** `golden_test` covers tiny BF16 and NVFP4 models on both backends (plain, MTP, DFlash2, forced long accepted runs, rollback, checkpoint restore, edited prompts, sampling, stop strings) plus tiny Qwen3 against `transformers` (adding a model must not require backend changes). `tests/e2e/check_real_model.py` validates real checkpoints against `transformers` and confirms all drafters reproduce plain decoding; DV's runs against plain decoding are `tests/e2e/check_dv.py`'s.
+3. **Whole-model verification.** `golden_test` covers tiny BF16 and NVFP4 models on both backends (plain, MTP, DFlash2, DSpark, forced long accepted runs, rollback, checkpoint restore, edited prompts, sampling, stop strings) plus tiny Qwen3 against `transformers` (adding a model must not require backend changes). `tests/e2e/check_real_model.py` validates real checkpoints against `transformers` and confirms all drafters reproduce plain decoding. DV is not in production: its tests (gates 3 and 4 for DV, `tests/dv.cmake`) are registered only with `FLYX_TEST_DV=ON` and run in `ctest --preset full` (`cpu-full` without a GPU). A change to DV's code (`models/dv.*`, `ops/draft/`, `ops/canvas/`, `backends/cuda/kernels/dv.cu`, `python/reference/flyx_ref/dv.py`, `python/reference/dv_*.py`, `python/convert/flyx_convert/dv.py`, `python/convert/export_dv.py`, `bench/replay/dv_choice*`, `tests/**/*dv*`) must pass them, and `tests/e2e/check_dv.py` against plain decoding, before landing.
 4. **Speculation never changes output.** Greedy decoding produces identical tokens with and without drafters. Sampled decoding produces identical tokens for a fixed seed. Any optimization making a row depend on concurrent row count (e.g., variable K split or reduction order) violates this gate and is forbidden.
 5. **No obvious quality drop.** On the same model file, default rounding (inputs, caches, state, sums) must be as fine as `llama.cpp`'s default CUDA path on the same GPU, unless real-model measurements (KL divergence and top-1 agreement against the finer rounding) show no visible drop. Opt-in user flags are exempt. `docs/design/numerics.md` tracks the comparison place by place.
 
 ## Verification Commands
 
 ```sh
-cmake --build --preset dev && ctest --preset dev --output-on-failure
+cmake --build --preset dev && ctest --preset dev --output-on-failure    # every test but DV's (= ctest --preset gpu)
 ```
+
+While editing, `ctest --preset quick` runs the unit and tiny tests and the smoke tests (on a CUDA build the GPU's
+too) in a minute or two. A change to DV's code (gate 3) also needs `cmake --preset dev-full && ctest --preset full`:
+the same build tree with DV's tests registered (`dv_not_configured` fails a full run in a tree configured without
+them); `cmake --preset dev` takes them out again. `docs/testing.md` lists the tiers, labels and presets.
 
 Individual static checks (also run by `ctest`):
 
@@ -47,6 +52,7 @@ For kernel or model-path changes, also run the real-model and HTTP checks (`tool
 
 - Base every speed claim on reproducible measurements stating model, quantization, GPU, driver, prompt set, and exact command (`flyx bench` / `cuda_bench`).
 - Generate per-GPU tuning tables with `cuda_bench tune`, verify end-to-end equivalence and speedups, and commit them under `backends/cuda/variants/`.
+- Never hardcode single-GPU, single-model, or single-prompt tuning caps or dispatch rules in `core/` or `models/`, and add no rule measured on one GPU to `backends/cuda/variants/candidates.toml` `[defaults]` (the defaults there name the GPUs they were measured on; a new one needs more than one GPU). Fix adaptive scheduling or stopping weaknesses in the general online algorithm (or execution granularity), and put a rule measured on one GPU in `backends/cuda/variants/<arch>/tables/<sku>.toml`.
 
 ## Code and Licensing Standards
 

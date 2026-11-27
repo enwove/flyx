@@ -23,6 +23,7 @@
 
 #include "core/hub/hub.h"
 #include "core/hub/sha256.h"
+#include "core/os/env.h"
 #include "core/os/os.h"
 #include "core/os/path.h"
 #include "httplib/httplib.h"
@@ -168,6 +169,63 @@ void names() {
         "set_endpoint(\"\") clears custom override");
 }
 
+void hub_settings() {
+  using namespace flyx::hub;
+  auto check_endpoint = [](const std::string& url, const std::string& source) {
+    const auto setting = resolve_endpoint();
+    check(setting.value == url && setting.source == source, "endpoint from " + source + ": " + url);
+  };
+  set_env("HF_ENDPOINT", "");
+  check_endpoint(kDefaultEndpoint, "default");
+  set_env("HF_ENDPOINT", "///");
+  check_endpoint(kDefaultEndpoint, "default");
+  set_env("HF_ENDPOINT", "https://env.test/hub///");
+  check_endpoint("https://env.test/hub", "HF_ENDPOINT");
+  check(set_endpoint("mirror.test/"), "set runtime mirror over HF_ENDPOINT");
+  check_endpoint("https://mirror.test", "setting");
+  const auto before_reset = resolve_endpoint();
+  check(set_endpoint("  "), "blank runtime mirror resets to HF_ENDPOINT");
+  check_endpoint("https://env.test/hub", "HF_ENDPOINT");
+  check(before_reset.value == "https://mirror.test" && before_reset.source == "setting",
+        "a snapshot retains its value and source after reset");
+
+  std::atomic<bool> started{false}, stop{false};
+  std::thread writer([&] {
+    do {
+      set_endpoint("mirror.test");
+      started = true;
+      set_endpoint("");
+    } while (!stop);
+  });
+  while (!started) std::this_thread::yield();
+  bool consistent = true;
+  for (int i = 0; i < 2000; ++i) {
+    const auto setting = resolve_endpoint();
+    consistent &= (setting.source == "setting" && setting.value == "https://mirror.test") ||
+                  (setting.source == "HF_ENDPOINT" && setting.value == "https://env.test/hub");
+  }
+  stop = true;
+  writer.join();
+  check(consistent, "concurrent overrides and resets always report a matching endpoint and source");
+  set_env("HF_ENDPOINT", "");
+
+  auto check_cache = [](const std::string& dir, const std::string& source) {
+    const auto cache = resolve_cache_dir();
+    check(cache.value == from_path(to_path(dir).make_preferred()) && cache.source == source,
+          "cache directory from " + source + ": " + dir);
+  };
+  set_env("HF_HUB_CACHE", "cache/direct");
+  set_env("HF_HOME", "cache/hf");
+  set_env("XDG_CACHE_HOME", "cache/xdg");
+  check_cache("cache/direct", "HF_HUB_CACHE");
+  set_env("HF_HUB_CACHE", "");
+  check_cache("cache/hf/hub", "HF_HOME");
+  set_env("HF_HOME", "");
+  check_cache("cache/xdg/huggingface/hub", "XDG_CACHE_HOME");
+  set_env("XDG_CACHE_HOME", "");
+  check_cache(flyx::os::home_dir() + "/.cache/huggingface/hub", "default");
+}
+
 flyx::hub::RepoFile file(const std::string& path, uint64_t size, const std::string& sha256 = "ab") {
   return {path, size, sha256, "cd"};
 }
@@ -207,6 +265,15 @@ void choices() {
         "incomplete split GGUF is marked incomplete");
   check(!flyx::hub::select(inc, {inc.id, "Q8_0"}, &files, &err) && err.find("incomplete") != std::string::npos,
         "incomplete split model is refused");
+  flyx::hub::Repo companion_split;
+  companion_split.id = "org/companion";
+  companion_split.files = {file("MTP/layer-00002-of-00002.gguf", 4), file("MTP/layer-00001-of-00002.gguf", 7)};
+  check(flyx::hub::select(companion_split, {companion_split.id, "layer-00001-of-00002.gguf"}, &files, &err) &&
+            files.size() == 2 && files[0].path == companion_split.files[1].path,
+        "an explicit split companion selects all shards starting at shard 1");
+  companion_split.files.pop_back();
+  check(!flyx::hub::select(companion_split, {companion_split.id, "layer-00002-of-00002.gguf"}, &files, &err) &&
+            err.find("incomplete") != std::string::npos, "an explicit incomplete companion is refused");
   // Single complete split model in a repo can be selected without :QUANT.
   flyx::hub::Repo lone_split;
   lone_split.id = "org/split-only";
@@ -306,6 +373,28 @@ void cache_snapshots(const fs::path& tmp) {
             !flyx::hub::model_gguf_name("a/mtp/x.gguf") && !flyx::hub::model_gguf_name("mtp-x.gguf") &&
             !flyx::hub::model_gguf_name("mmproj-F16.gguf") && flyx::hub::split_gguf_name("x-00001-of-00002.gguf"),
         "model GGUFs by name: no MTP layers, projectors; split parts told");
+  // A DSpark drafter's GGUF by its name or directory: no model, and a companion of the models beside it, the first
+  // one the default.
+  check(flyx::hub::dspark_gguf_name("dspark-Inkling-2-Mini-Q8_0.gguf") && flyx::hub::dspark_gguf_name("DSpark/x.gguf") &&
+            flyx::hub::dspark_gguf_name("a/dspark/x-BF16.gguf") && !flyx::hub::dspark_gguf_name("dspark-imatrix.gguf") &&
+            !flyx::hub::dspark_gguf_name("Inkling-2-Mini-Q4_K_M.gguf") && !flyx::hub::dspark_gguf_name("dspark-x.bin") &&
+            !flyx::hub::model_gguf_name("dspark-Inkling-2-Mini-Q8_0.gguf") && !flyx::hub::model_gguf_name("dspark/x.gguf") &&
+            !flyx::hub::model_gguf_name("old_support/x-Q4_0.gguf"),
+        "DSpark GGUFs by name: no models; nor what a repository keeps under old_support/");
+  {
+    flyx::hub::Repo ir;
+    ir.id = "acme/Inkling-GGUF";
+    ir.files = {file("Inkling-Q4_K_M.gguf", 9), file("dspark-Inkling-Q8_0.gguf", 2), file("dspark-Inkling-BF16.gguf", 3)};
+    const auto comps = flyx::hub::companion_files(ir);
+    check(comps.size() == 2 && comps[0].kind == "dspark" && comps[0].is_default && comps[1].kind == "dspark" &&
+              !comps[1].is_default && flyx::hub::gguf_choices(ir).size() == 1,
+          "companion_files lists a repository's DSpark drafters, one the default; they are no quantizations of it");
+    std::vector<flyx::hub::RepoFile> picked;
+    std::string why;
+    check(flyx::hub::select(ir, {ir.id, "dspark-Inkling-Q8_0.gguf"}, &picked, &why) && picked.size() == 1 &&
+              picked[0].path == "dspark-Inkling-Q8_0.gguf",
+          "select resolves repo:dspark-*.gguf companion directly (--drafter-file ORG/NAME:dspark-*.gguf)");
+  }
   const std::string old_c = "1111111111111111111111111111111111111111", new_c = "2222222222222222222222222222222222222222";
   const fs::path repo = tmp / "models--acme--two-GGUF";
   const std::string q4(5000, 'q'), iq2(3000, 'i'), q8(9000, '8');
@@ -726,6 +815,7 @@ int main(int argc, char** argv) {
   }
   hashes();
   names();
+  hub_settings();
   choices();
   const TestDirectory tmp;
   cache_snapshots(tmp.path / "snapshots");

@@ -23,6 +23,7 @@
 //                          with `table`, each configuration with the table's runs only (behind blocks_q8)
 //   cuda_bench rounds [T]  rounds of 1, 2, 4 and 8 rows in 8 bits on dp4a on those layers: every compiled
 //                          configuration (columns a warp, groups ahead; the numbers behind blocks_round)
+//   cuda_bench moe         Inkling-2-Mini's fused gate|up and weighted down projections, per dp4a variant and rows
 //   cuda_bench round T LAYER ROWS [KERNEL [CFG]]  one round on one layer, 43 launches (for a profiler)
 //   cuda_bench pass T LAYER ROWS  one prefill pass's GEMM (inputs in 8 bits) on one layer (for a profiler)
 //   cuda_bench stack ROWS K T:N [T:N ...]  a stack of projections of one input, one launch per run of a block type,
@@ -170,6 +171,119 @@ void bench_skinny() {
     CK(cudaFree(x));
     CK(cudaFree(y));
   }
+}
+
+// Inkling-2-Mini's MoE layers: a bank of 128 experts, 8 a token (make_moe_routes).
+constexpr int kMoeExperts = 128, kMoeTopK = 8;
+
+void bench_moe_projection(int dtype, bool down) {
+  constexpr int H = 2304, I = 1152, E = kMoeExperts, top = kMoeTopK, max_pairs = kMaxBenchRows * top;
+  const bool nvfp4 = dtype == FLYX_DT_GGML_NVFP4;
+  const int N = down ? H : 2 * I;
+  const int K = down ? (nvfp4 ? I : 1280) : H;  // Q4_K down needs whole 256-value blocks
+  const size_t input_elems = size_t(down ? max_pairs : kMaxBenchRows) * K;
+  MoeBenchBuffers mem;
+  ExpertMat W{};
+  W.n_experts = E;
+  W.N = N;
+  float* rs = mem.alloc<float>(E);
+  k_fill_f<<<1, 256>>>(rs, E, 7u, 0.5f, 0.5f);
+  W.rs = rs;
+  size_t expert_bytes = sizeof(float);  // include the per-expert scale
+  std::vector<BlockMat> packed;
+  if (nvfp4) {
+    const size_t values = size_t(E) * N * K;
+    uint8_t* q = mem.alloc<uint8_t>(values / 2);
+    uint8_t* s = mem.alloc<uint8_t>(values / 16);
+    k_fill<<<1024, 256>>>(q, values / 2, 101u, 0, 0);
+    k_fill<<<1024, 256>>>(s, values / 16, 103u, 16, 32);
+    W.q = q;
+    W.s = s;
+    expert_bytes += size_t(N) * (K / 2 + K / 16);
+  } else {
+    packed = block_copies(dtype, E * N, K);
+    W.blk = packed.front();
+    W.blk.q8 = true;
+    const BlockLayout l = blocks_layout(dtype);
+    expert_bytes += size_t(N) * (K / l.values) * (l.stride + sizeof(uint16_t) * l.scales);
+  }
+
+  MoeScratch sc{};
+  sc.chunk_rows = kMaxBenchRows;
+  sc.max_experts = E;
+  sc.max_top_k = top;
+  sc.pairs = mem.alloc<int>(max_pairs);
+  sc.tasks = mem.alloc<MoeTask>(max_pairs);
+  sc.n_tasks = mem.alloc<int>(1);
+  sc.stage_elems = input_elems;
+  sc.q8_a = mem.alloc<int8_t>(input_elems);
+  sc.q8_d = mem.alloc<float>(input_elems / 32);
+  sc.q8_s = mem.alloc<float>(input_elems / 16);
+  sc.down_buf = mem.alloc<float>(size_t(max_pairs) * H);
+  float* x = mem.alloc<float>(input_elems);
+  k_fill_f<<<64, 256>>>(x, input_elems, 31u, -1.f, 2.f);
+  bf16* act = mem.alloc<bf16>(std::max(size_t(max_pairs) * I, nvfp4 ? input_elems : size_t(0)));
+  if (nvfp4) {
+    k_fill_bf16<<<64, 256>>>(act, input_elems, 31u, -1.f, 2.f);
+    sc.bf16_a = act;
+  } else if (!down) {
+    moe_stage_q8(x, K, K, kMaxBenchRows, sc, moe_q8_mins(W), 0);
+  }
+  float* y = mem.alloc<float>(size_t(kMaxBenchRows) * H);
+  int* indices = mem.alloc<int>(kMoeRouteSets * max_pairs);
+  float* ew = mem.alloc<float>(max_pairs);
+  k_fill_f<<<1, 256>>>(ew, max_pairs, 23u, 0.1f, 0.05f);
+  cudaStream_t st;
+  CK(cudaStreamCreateWithFlags(&st, cudaStreamNonBlocking));
+  KernelOptions options = g_bench_opts;
+  const Launch launch{st, nullptr, &options};
+  for (int rows : {1, 2, 4, 6, 8, 16}) {
+    const int distinct = make_moe_routes(indices, rows, E, top);
+    const size_t bytes = distinct * expert_bytes;
+    // -1: the rules (default); then every configuration this build compiles for the type, op and row band
+    for (int v = -1; v < (nvfp4 ? 0 : kMoeDp4aConfigCount); ++v) {
+      if (v >= 0 && !moe_dp4a_compiled(dtype, v, !down, rows)) continue;
+      options.moe_dp4a = v;
+      cudaGraph_t graph;
+      cudaGraphExec_t exec;
+      CK(cudaStreamBeginCapture(st, cudaStreamCaptureModeGlobal));
+      for (int i = 0; i < kMoeRouteSets; ++i) {
+        const int* eidx = indices + i * rows * top;
+        if (down)
+          moe_down(x, K, W, eidx, ew, rows, top, H, K, y, H, false, &sc, launch, nvfp4 ? act : nullptr);
+        else
+          moe_gate_up(x, K, W, eidx, rows, top, I, K, 6.f, 8.f, true, nullptr, I, &sc, launch, true, act);
+      }
+      CK(cudaStreamEndCapture(st, &graph));
+      CK(cudaGraphInstantiate(&exec, graph, 0));
+      const double ms = time_ms([&] { CK(cudaGraphLaunch(exec, 0)); }, 5) / kMoeRouteSets;
+      CK(cudaGraphExecDestroy(exec));
+      CK(cudaGraphDestroy(graph));
+      std::printf("%-7s %-8s %4d %4d %4d %7d %12.3f %-8s %10.2f %9.1f\n", down ? "down" : "gate|up",
+                  nvfp4 ? "NVFP4" : block_type_name(dtype), N, K, rows, distinct, bytes / 1e6,
+                  nvfp4 ? "control" : moe_dp4a_name(options.moe_dp4a), ms * 1e3, bytes / (ms * 1e6));
+    }
+    std::fflush(stdout);
+  }
+  CK(cudaStreamDestroy(st));
+  free_copies(packed);
+}
+
+void bench_moe() {
+  header();
+  int driver;
+  CK(cudaDriverGetVersion(&driver));
+  std::printf("Inkling-2-Mini, E=128 top=8 H=2304 I=1152, CUDA driver API %d\n"
+              "32 calls per graph, rotating expert sets, 3 warmup replays and 5 timed replays. "
+              "Effective GB/s uses the distinct packed expert bytes per call.\n"
+              "Gate|up reads pre-staged Q8 and writes fused SiTU in BF16. Down includes the weighted sum and reads "
+              "staged BF16 (NVFP4) or stages Q8 (Q4_K). Each call builds its grouping when rows > 1.\n"
+              "Q4_K down uses K=1280, the next whole 256-value block above 1152. NVFP4 down uses K=1152.\n"
+              "op      format      N    K rows experts  distinct_MB variant     us/call  eff_GB/s\n", driver);
+  blocks_init();
+  for (int dtype : kMoeDp4aTypes) bench_moe_projection(dtype, false);
+  bench_moe_projection(FLYX_DT_GGML_NVFP4, true);
+  bench_moe_projection(FLYX_DT_GGML_Q4_K, true);
 }
 
 // NVFP4 weights: bytes streamed are K/2 + K/16 (+4) per output column.
@@ -855,8 +969,9 @@ void bench_mlp() {
   cudaDeviceProp prop{};
   CK(cudaGetDeviceProperties(&prop, 0));
   KernelOptions opt;
-  opt.tuning = gemm_tuning_for(prop.name, prop.major * 10 + prop.minor);
-  std::printf("tuning table: %s\n", opt.tuning >= 0 ? gemm_tuning_name(opt.tuning) : "none (defaults)");
+  int arch_cc = 0;
+  opt.tuning = gemm_tuning_auto(prop.name, prop.major * 10 + prop.minor, compiled_arch(), &arch_cc);
+  std::printf("tuning table: %s\n", gemm_tuning_label(opt.tuning, arch_cc, prop.major * 10 + prop.minor).c_str());
   cudaStream_t st;
   CK(cudaStreamCreateWithFlags(&st, cudaStreamNonBlocking));
   const Launch L{st, &g_bench_scratch, &opt};
@@ -2316,17 +2431,24 @@ int main(int argc, char** argv) {
   }
 #endif
   {
+    cudaDeviceProp prop{};
+    CK(cudaGetDeviceProperties(&prop, 0));
+    // The table the engine takes for this device (backend.cpp, option tuning=table).
+    g_bench_opts.tuning = gemm_tuning_auto(prop.name, prop.major * 10 + prop.minor, compiled_arch());
+    // Kernels launch as the engine launches them on this GPU; FLYX_BENCH_PDL=0|1 says otherwise.
+    g_bench_opts.pdl = gemm_tuning_pdl(g_bench_opts.tuning);
+    if (const char* e = std::getenv("FLYX_BENCH_PDL")) g_bench_opts.pdl = std::string(e) == "1";
+  }
+  if (what == "moe") {  // uses its own routing and staging scratch
+    bench_moe();
+    return 0;
+  }
+  {
     void* mem = nullptr;
     // K up to the 27B's MLP down projection (17408).
     const size_t bytes = scratch_bytes(2048, 17408);
     CK(cudaMalloc(&mem, bytes));
     g_bench_scratch = scratch_in(mem, bytes, 2048, 17408);
-    cudaDeviceProp prop{};
-    CK(cudaGetDeviceProperties(&prop, 0));
-    g_bench_opts.tuning = gemm_tuning_for(prop.name, prop.major * 10 + prop.minor);
-    // Kernels launch as the engine launches them on this GPU; FLYX_BENCH_PDL=0|1 says otherwise.
-    g_bench_opts.pdl = gemm_tuning_pdl(g_bench_opts.tuning);
-    if (const char* e = std::getenv("FLYX_BENCH_PDL")) g_bench_opts.pdl = std::string(e) == "1";
   }
   if (what == "gemm") bench_gemm();
   else if (what == "skinny") bench_skinny();
@@ -2361,7 +2483,7 @@ int main(int argc, char** argv) {
   else if (what == "mt") bench_mt(argc, argv);
   else {
     std::printf("usage: cuda_bench gemm|skinny|fp4|fp4cfgs|fp4rows|tune|gdn|decode|tc|attn|flash|strata|mlp|w4a4|w12|pick|dots|blocks|q8runs|rounds|"
-                "round|glu|pass|stack|mma|host_read|stream|graphs|mt\n");
+                "round|moe|glu|pass|stack|mma|host_read|stream|graphs|mt\n");
     return 2;
   }
   return 0;

@@ -46,7 +46,7 @@ struct Repo {
   std::string id, revision, commit;
   std::vector<RepoFile> files;
   std::vector<std::string> base_models;  // what its model card says it was made from
-  std::vector<std::string> architectures;  // its config.json's (a transformers checkpoint, a DFlash2 drafter)
+  std::vector<std::string> architectures;  // its config.json's (a transformers checkpoint, a block drafter)
   RepoInfo info;
   bool from_cache = false;               // the Hub was not asked (offline) or not reached
 };
@@ -106,18 +106,23 @@ struct GgufChoice {
   bool split = false;
   bool complete = true;          // false if split and any shard 1..N is missing
 };
-std::vector<GgufChoice> gguf_choices(const Repo& r);
+// The model GGUFs of a repository as quantizations to choose from; `include_companions`: its projector, MTP and DSpark
+// GGUFs as well (by name), with the models' labels as they are without them.
+std::vector<GgufChoice> gguf_choices(const Repo& r, bool include_companions = false);
 // Whether a GGUF at `path` ('/' between directories) can hold a model by its name: not a projector, an importance
-// matrix or an MTP layer of its own (mtp-*.gguf, anything under an MTP directory).  Split parts count.
+// matrix, an MTP layer of its own (mtp-*.gguf, anything under an MTP directory), a DSpark drafter (dspark-*.gguf,
+// anything under a dspark directory) or a file under old_support/.  Split parts count.
 bool model_gguf_name(const std::string& path);
 // Whether a GGUF at `path` ('/' between directories) is a vision projector (mmproj) file by name/directory.
 bool mmproj_gguf_name(const std::string& path);
 // Whether a GGUF at `path` ('/' between directories) is an MTP drafter file by name/directory.
 bool mtp_gguf_name(const std::string& path);
+// Whether a GGUF at `path` ('/' between directories) is a DSpark drafter file by name/directory.
+bool dspark_gguf_name(const std::string& path);
 // A companion GGUF in a repository (vision projector or drafter) listed alongside its main models.
 struct CompanionFile {
   RepoFile file;
-  std::string kind;      // "mmproj" or "mtp"
+  std::string kind;      // "mmproj", "mtp" or "dspark"
   bool is_default = false;
 };
 std::vector<CompanionFile> companion_files(const Repo& r);
@@ -136,9 +141,15 @@ bool split_gguf_name(const std::string& file_name);
 // names one.
 std::string quant_in_name(const std::string& file_name);
 
-// Whether the repository holds a DFlash2 drafter (its config's architecture), not a transformers model.
+// How the Hub says a repository was made from its base models ("quantized", "finetune", "adapter", "merge"; its
+// baseModels relation), asked of the Hub; "" when it says none, or offline.
+std::string base_relation(const std::string& repo);
+
+// Whether the repository holds a block drafter (its config's architecture: DFlash2, or DeepSpec's DSpark), not a
+// transformers model; and which ("dflash2", "dspark").
 bool is_drafter(const Repo& r);
-// The files `name` asks for: the GGUF of its quant (or the repository's only one), else a DFlash2 drafter's
+std::string drafter_kind(const Repo& r);
+// The files `name` asks for: the GGUF of its quant (or the repository's only one), else a block drafter's
 // config.json and safetensors, else the repository's only .flyx file.
 bool select(const Repo& r, const Name& name, std::vector<RepoFile>* files, std::string* err);
 // The MTP layer in a GGUF of its own beside the models (unsloth: MTP/mtp-*.gguf), or nullptr.
@@ -184,15 +195,22 @@ std::vector<Cached> cached();
 bool remove_cached(const std::string& repo, const std::string& commit, const std::vector<std::string>& paths,
                    uint64_t* freed, std::string* err);
 
+struct ResolvedSetting {
+  std::string value, source;
+};
+
+ResolvedSetting resolve_cache_dir();  // source: "HF_HUB_CACHE" | "HF_HOME" | "XDG_CACHE_HOME" | "default"
 std::string cache_dir();
-std::string cache_source();  // "HF_HUB_CACHE" | "HF_HOME" | "XDG_CACHE_HOME" | "default"
+std::string cache_source();
+inline constexpr char kDefaultEndpoint[] = "https://huggingface.co";
 // Normalizes and validates a Hub endpoint URL (e.g. "hf-mirror.com" -> "https://hf-mirror.com", trimming trailing
 // slashes). Empty input clears any override (falling back to HF_ENDPOINT or https://huggingface.co).
 bool normalize_endpoint(const std::string& raw, std::string* normalized, std::string* err);
 // Sets or clears a process-wide Hub endpoint override; empty restores HF_ENDPOINT / https://huggingface.co.
 bool set_endpoint(const std::string& url, std::string* err = nullptr);
+ResolvedSetting resolve_endpoint();  // source: "setting" | "HF_ENDPOINT" | "default"
 std::string endpoint();
-std::string endpoint_source();  // "setting" | "HF_ENDPOINT" | "default"
+std::string endpoint_source();
 bool offline();
 
 }  // namespace flyx::hub

@@ -1,5 +1,5 @@
 // Copyright 2026 The flyx Authors. SPDX-License-Identifier: Apache-2.0
-// A GEMM on a weight of any format (bf16, NVFP4, packed GGML blocks), and the draft logits.
+// A GEMM on a weight of any format (bf16, NVFP4, packed GGML blocks, exact control projections), and the draft logits.
 #include <mutex>
 
 #include "backends/cuda/backend.h"
@@ -42,6 +42,12 @@ void log_shape(const KernelOptions* opt, const char* fmt, int N, int K, int rows
 
 void gemm(const float* x, int ldx, const Lin& W, int N, int K, float* y, int ldy, int rows, bool accumulate,
           const Launch& L) {
+  // Control projections read exact weights and float32 inputs in rounds of any width and in short prefill passes.
+  // Larger prefill passes use the usual bf16 GEMM below.
+  if ((W.round.f32 || W.round.b16) && (rows <= 16 || L.round_rows)) {
+    log_shape(L.opt, "f32", N, K, rows);
+    return linear_f32(x, ldx, W.round, N, K, y, ldy, rows, accumulate, L.st);
+  }
   log_shape(L.opt, W.packed() ? "blocks" : W.q ? "nvfp4" : "bf16", N, K, rows);
   if (L.round_rows && rows > 16) {  // a wide round: the 1..16-row bits for every row
     if (W.q && !W.packed()) return gemm_fp4_rows(x, ldx, W.q, W.s, W.rs, N, K, y, ldy, rows, accumulate, L);
@@ -56,6 +62,13 @@ void gemm(const float* x, int ldx, const Lin& W, int N, int K, float* y, int ldy
     gemm_packed(W, K, y, ldy, rows, accumulate, L);
   } else if (W.q) gemm_fp4(x, ldx, W.q, W.s, W.rs, N, K, y, ldy, rows, accumulate, L);
   else flyx::cuda::gemm(x, ldx, W.w, N, K, y, ldy, rows, accumulate, L);
+}
+
+// Whether gemm above reads these 1..16 rows of a round as three bf16 parts on the skinny kernel: a dense bf16 weight
+// that no exact control projection stands in for.  Then a producer that writes the parts itself, and gemm_presplit
+// after it, give the same bits.
+bool gemm_reads_split(const float* x, int ldx, const Lin& W, int K, const Launch& L) {
+  return !W.round.f32 && !W.round.b16 && !W.packed() && !W.q && W.w && gemm_skinny_takes(x, ldx, W.w, K, L);
 }
 
 // Draft logits for `rows` rows of x.

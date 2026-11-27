@@ -208,7 +208,7 @@ __global__ void __launch_bounds__(32 * NW * KW) k_gemm_blocks(Tables T, const ui
       for (int bw = 0; bw < PER; ++bw) {
         ln[i][bw] = F::share(raw[i][bw], t, lane);
         const size_t at = size_t(min(w * PER + bw, blocks - 1)) * F::kScales;
-        const float d0 = scale_at(dp[i], at), d1 = F::kScales > 1 ? scale_at(dp[i], at + 1) : 0.f;
+        const float d0 = scale_of<F>(dp[i], at), d1 = F::kScales > 1 ? scale_of<F>(dp[i], at + 1) : 0.f;
 #pragma unroll
         for (int p = 0; p < P; ++p) cf[i][bw][p] = wv[i] ? F::coef(p, d0, d1) : 0.f;  // a column past N: nothing
       }
@@ -413,8 +413,8 @@ k_gemm_blocks_rows(Tables T, const uint16_t* A, int lda, const float* row_scale,
       const int bw = t + 4 * i;
       if (bw >= PER) continue;
       const size_t at = block_at(k0 + bw * UNIT) * F::kScales;
-      scales[i][0] = scale_at(D, at);
-      scales[i][1] = F::kScales > 1 ? scale_at(D, at + 1) : 0.f;
+      scales[i][0] = scale_of<F>(D, at);
+      scales[i][1] = F::kScales > 1 ? scale_of<F>(D, at + 1) : 0.f;
     }
   };
   // A run's value of the flat plane, for the MMA step of its eight runs.
@@ -534,7 +534,8 @@ k_gemm_blocks_rows(Tables T, const uint16_t* A, int lda, const float* row_scale,
             for (int mi = 0; mi < 2; ++mi)
 #pragma unroll
               for (int ni = 0; ni < 4; ++ni) mma_f16(part[p][mi][ni], af[mi], bf[p][ni]);
-          if (PER > 1 && (step & 1)) close(step >> 1);
+          constexpr int STEPS_PER_BLOCK = UNIT / 16;
+          if (PER > 1 && (step % STEPS_PER_BLOCK == STEPS_PER_BLOCK - 1)) close(step / STEPS_PER_BLOCK);
         }
         const bool last = q == TILES - 1 || kq + kRowsK >= K;  // of the window
         if (PER == 1 && last) close(0);
@@ -747,7 +748,7 @@ k_gemm_blocks_q8(Tables T, const uint8_t* A, const float* d_a, const uint8_t* __
     for (int bw = 0; bw < PER; ++bw) {
       const bool in = n < N && k0 + bw * UNIT < K;
       const typename F::Lane ln = F::share(raw[bw], t, lane);
-      const float d0 = half_of(uint16_t(ds[bw] & 0xFFFFu)), d1 = F::kScales > 1 ? half_of(uint16_t(ds[bw] >> 16)) : 0.f;
+      const float d0 = scale_bits<F>(ds[bw] & 0xFFFFu), d1 = F::kScales > 1 ? scale_bits<F>(ds[bw] >> 16) : 0.f;
 #pragma unroll
       for (int G = 0; G < GROUPS; ++G) {
         uint32_t w[2];
@@ -930,7 +931,7 @@ __device__ __forceinline__ void row_values8(const typename F::Local& local, cons
   const typename F::Lane ln = block_lane<F>(W, D, at, (kb >> 3) & 3);
   uint32_t w[2][4];
   words_at<F>(local, ln, kb / 32, w[0], w[P - 1]);
-  const float d0 = scale_at(D, at * F::kScales), d1 = F::kScales > 1 ? scale_at(D, at * F::kScales + 1) : 0.f;
+  const float d0 = scale_of<F>(D, at * F::kScales), d1 = F::kScales > 1 ? scale_of<F>(D, at * F::kScales + 1) : 0.f;
   const float c0 = F::coef(0, d0, d1), c1 = P > 1 ? F::coef(P - 1, d0, d1) : 0.f;
 #pragma unroll
   for (int e = 0; e < 4; ++e) {

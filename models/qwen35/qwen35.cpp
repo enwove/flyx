@@ -573,9 +573,9 @@ bool Qwen35::build(const ModelFile& file, const ModelOptions& o, std::string* er
     f.lora[2] = T.lora(peft, p + "mlp.down", H, c.inter);
   }
   for (Drafter kind : drafters) {
-    int max_drafts = 0;
-    const int blk = drafters_reg_.attach(kind, file, T, target, &mtp_hooks, &max_drafts);
-    add_drafter(kind, blk, max_drafts);
+    DrafterReach reach;
+    const int blk = drafters_reg_.attach(kind, file, T, target, &mtp_hooks, &reach);
+    add_drafter(kind, blk, reach);
   }
   build_vision(file, c);
   finish(c.hidden, c.vocab);

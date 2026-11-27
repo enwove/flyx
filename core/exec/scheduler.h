@@ -14,7 +14,9 @@
 //   max_sessions run at once, and one whose session is running another
 //   request waits for it without holding up the jobs behind it.
 // * A new request for a conversation that is generating right now (a retry,
-//   or a follow-up sent without waiting) cancels the running one.
+//   or a follow-up sent without waiting) cancels the running one.  Chat
+//   messages say which conversation they continue; a raw prompt does not, so a
+//   raw generation is replaced only by a request with its conversation_id.
 // * Cancelling a job stops it at the next round, or between prefill passes.
 // * Idle tiers: after idle_unload_ms without requests the sessions are
 //   freed (weights stay; the next request recomputes its prompt); after
@@ -25,6 +27,7 @@
 #include <atomic>
 #include <condition_variable>
 #include <deque>
+#include <functional>
 #include <memory>
 #include <mutex>
 #include <shared_mutex>
@@ -119,6 +122,8 @@ struct SchedulerOptions {
   bool batch_rounds = true;
   int queue_limit = 16;
   int queue_timeout_ms = 600000;
+  // Every request decoded, with its record (status: stop, length, tool_calls or cancelled), on the scheduler thread.
+  std::function<void(const RequestRecord&)> on_finished;
   int idle_unload_ms = 0;            // free the sessions after this long idle; 0 = never
   int keep_alive_ms = 0;             // unload the model after this long idle; 0 = never
   int verbose = 0;

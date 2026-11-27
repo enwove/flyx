@@ -139,7 +139,6 @@ bool Llama::build(const ModelFile& file, const ModelOptions& o, std::string* err
   // DV: in a Llama .flyx file of its own (python/convert --dv).
   const bool has_dv = dv::in_file(file);
   if (has_dv && (qwen3 || GgufMeta::is(file))) return *err = "a DV drafter in a file that is not a Llama .flyx", false;
-  file_drafts_trees_ = has_dv;
   // MiniCPM5-1B's next tokens move visibly with an FP8 cache (KL 0.0064, top-1 97.2%): binary16 unless
   // the caller asks for FP8.
   kv_fp8_by_default_ = qwen3;
@@ -177,6 +176,11 @@ bool Llama::build(const ModelFile& file, const ModelOptions& o, std::string* err
       return *err = std::string("a ") + family + " model does not support a vision projector (--mmproj)", false;
     return *err = "companion file " + std::to_string(i + 1) + ": holds no drafter a " + family + " model takes", false;
   }
+
+  // Attention-only layers: a tree's wider verify costs about a chain's, so a block drafter whose trees pay (DSpark's)
+  // drafts them by default, and the file then reads every position as DV's does.
+  draft_trees_by_default_ = drafts_trees_by_default(drafters_reg_.sources().block);
+  file_drafts_trees_ = has_dv || draft_trees_by_default_;
 
   std::vector<Drafter> drafters;
   if (!choose_drafters(o, drafters_reg_.sources(), &drafters, err)) return false;
@@ -248,11 +252,11 @@ bool Llama::build(const ModelFile& file, const ModelOptions& o, std::string* err
         t.mlp.push_back(layers_[i + 1]);
       }
       dv_block_ = dv::describe(T, file, t);
-      add_drafter(Drafter::kDv, dv_block_, T.at(dv_block_).dv.tree_width);
+      add_drafter(Drafter::kDv, dv_block_, {T.at(dv_block_).dv.tree_width, false});
     } else {
-      int max_drafts = 0;
-      const int blk = drafters_reg_.attach(kind, file, T, target, /*mtp=*/nullptr, &max_drafts);
-      add_drafter(kind, blk, max_drafts);
+      DrafterReach reach;
+      const int blk = drafters_reg_.attach(kind, file, T, target, /*mtp=*/nullptr, &reach);
+      add_drafter(kind, blk, reach);
     }
   }
   finish(H, V);

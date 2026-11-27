@@ -1,0 +1,118 @@
+# Copyright 2026 The flyx Authors. SPDX-License-Identifier: Apache-2.0
+name: CUDA compile
+
+# No hosted runner has a GPU, so nothing of the CUDA backend runs here: this compiles it (the kernels, their op tests,
+# the microbenchmarks), so that a change that breaks its build shows on the pull request and not later on a
+# maintainer's machine.  On a pull request only when it changes what that build compiles or how it is configured:
+# the backend, the ops and microbenchmarks, the op tests, the interfaces and headers the backend includes
+# (AGENTS.md's layering), the tables generated into it, the CMake files.  Every night from nightly.yml, with DV's
+# tests registered too (preset dev-full).
+on:
+  pull_request:
+    paths:
+      - "backends/cuda/**"
+      - "ops/**"
+      - "bench/microbench/**"
+      - "tests/backends/cuda/**"
+      - "core/interfaces/**"
+      - "include/**"
+      - "tools/codegen/**"
+      - "**/CMakeLists.txt"
+      - "**/*.cmake"
+      - "CMakePresets.json"
+      - ".github/workflows/cuda-compile.yml"
+      - "tools/ci/cuda-compile.sh"
+  workflow_call:
+    inputs:
+      full:
+        description: "configure preset dev-full (DV's tests registered too) instead of dev"
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+jobs:
+  cuda-compile:
+    name: CUDA compile, sm_120, nothing run (Ubuntu 24.04)
+    # The release package's build machine (docs/benchmarks.md: CUDA 13.0.88 on Ubuntu 24.04).  Not ubuntu-latest:
+    # CUDA 13.0's crt/math_functions.h declares rsqrt and rsqrtf, which glibc 2.41 and later declare too with another
+    # exception specification, and nvcc then fails on every file (ubuntu-latest is 26.04, glibc 2.43).
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    # github.workflow is the caller's name when nightly.yml calls this: a group of its own beside the caller's (a job
+    # in its caller's group would wait for itself) and beside this workflow's run on the same pull request.
+    concurrency:
+      group: ${{ github.workflow }}-cuda-compile-${{ github.ref }}
+      cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+    env:
+      # As ci.yml's cpu job (CMakeLists.txt compiles through ccache, nvcc's compiles too); room for the device code.
+      CCACHE_MAXSIZE: 2G
+      CCACHE_SLOPPINESS: pch_defines,time_macros,include_file_mtime,include_file_ctime
+      # ccache names a compiler by its file's size and time (compiler_check=mtime): pip installs nvcc anew each run, so
+      # its time changes and no CUDA compile would ever hit.  By its bytes instead.
+      CCACHE_COMPILERCHECK: content
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install build tools
+        run: |
+          sudo apt-get update && sudo apt-get install -y ninja-build ccache
+          echo "CCACHE_DIR=$HOME/.cache/ccache" >> "$GITHUB_ENV"
+
+      # A cache of its own (the device code, the CUDA build's host flags): its name does not start with ci.yml's
+      # ccache-<os>-, so neither job restores the other's.  The nightly run saves on main, where every pull request
+      # can restore from.
+      - name: Restore compiler cache
+        id: ccache
+        uses: actions/cache/restore@v4
+        with:
+          path: ~/.cache/ccache
+          key: ccache-cuda-${{ runner.os }}-${{ github.sha }}
+          restore-keys: |
+            ccache-cuda-${{ runner.os }}-
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Cache pip downloads
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/pip
+          key: pip-cuda-${{ runner.os }}-py312-${{ hashFiles('.github/workflows/cuda-compile.yml') }}
+
+      # CUDA 13.0's compiler from PyPI, the versions tools/quickstart.sh and packaging/package_windows.ps1 install:
+      # no toolkit to download, and the release package is built with the same nvcc.
+      - name: Install CUDA 13.0's compiler (PyPI)
+        run: |
+          python -m pip install -q "nvidia-cuda-nvcc==13.0.88" "nvidia-nvvm==13.0.88" \
+              "nvidia-cuda-runtime==13.0.96" "nvidia-cuda-cccl==13.0.85" "nvidia-cuda-crt==13.0.88"
+          CU=$(python -c "import sysconfig; print(sysconfig.get_paths()['purelib'])")/nvidia/cu13
+          ln -sfn lib "$CU/lib64"                          # nvcc looks for lib64
+          ln -sfn libcudart.so.13 "$CU/lib/libcudart.so"   # CMake looks for the unversioned name
+          echo "CUDACXX=$CU/bin/nvcc" >> "$GITHUB_ENV"
+
+      - name: Compile (${{ inputs.full && 'dev-full' || 'dev' }} preset, FLYX_CUDA_ARCHS=120-real)
+        run: |
+          ccache --zero-stats
+          bash tools/ci/cuda-compile.sh ${{ inputs.full && 'dev-full' || 'dev' }}
+
+      - name: Compiler cache statistics
+        if: always()
+        run: ccache --show-stats --verbose
+
+      - name: Save compiler cache
+        if: ${{ !cancelled() && steps.ccache.outputs.cache-hit != 'true' }}
+        uses: actions/cache/save@v4
+        with:
+          path: ~/.cache/ccache
+          key: ${{ steps.ccache.outputs.cache-primary-key }}
+
+      - name: Upload the log on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: cuda-compile-log
+          path: logs/ci/cuda-compile.log

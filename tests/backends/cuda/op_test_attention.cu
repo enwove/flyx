@@ -189,6 +189,29 @@ void test_attention(int hd, int rot, int nh, int nkv, int rows, int ctx, bool ca
       }
   }
   expect("attention " + tag, down(dout, out.size()), out, ctx > 1000 ? 1e-4 : 2e-5);  // float32 sums over the keys
+  if (window > 0) {  // sliding-window ring buffer (KvRef::ring > 0): bit-identical to flat cache across ring wraps
+    const int ring = window + rows + 7;
+    const size_t stride = size_t(nkv) * hd;
+    Vec Kring(size_t(ring) * stride, 0.0), Vring(size_t(ring) * stride, 0.0);
+    const int keep_from = std::max(0, ctx - ring);
+    for (int p = keep_from; p < ctx; ++p) {
+      const int cell = p % ring;
+      std::copy_n(&Kc[size_t(p) * stride], stride, &Kring[size_t(cell) * stride]);
+      std::copy_n(&Vc[size_t(p) * stride], stride, &Vring[size_t(cell) * stride]);
+    }
+    kv16 *dKr = up_f16(Kring), *dVr = up_f16(Vring);
+    float *dqr = dev<float>(q.size()), *doutr = dev<float>(out.size());
+    KvRef kvr;
+    kvr.k = dKr;
+    kvr.v = dVr;
+    kvr.ring = ring;
+    attn_prep(dqkv, ld, 0, 2 * nh * hd, 2 * nh * hd + nkv * hd, dqn, dkn, offset, 1e-6f, theta, rot, nh, nkv, hd, rows,
+              P, kPosPosition, false, dqr, kvr, 0);
+    attention_split(dqr, kvr, nh, nkv, hd, rows, causal, rows, float(1.0 / std::sqrt(hd)), P, dqkv + nh * hd, ld, doutr,
+                    nh * hd, part, splits, TL, 0, window);
+    expect("attention, sliding-window ring: same bits " + tag, down(doutr, out.size()), down(dout, out.size()), 0);
+    for (void* p : std::initializer_list<void*>{dKr, dVr, dqr, doutr}) CK(cudaFree(p));
+  }
   if (causal) {  // each row alone (decoding) gives the bits of all rows together (verification)
     const Vec all = down(dout, out.size());
     float* dout1 = dev<float>(out.size());
@@ -1491,6 +1514,37 @@ void test_pageable_kv_ops() {
     }
     for (void* p : std::initializer_list<void*>{dq, dgate, part, split_st, dref, dgot, P}) CK(cudaFree(p));
   }
+}
+
+// ring_publish: the pass's entry of the result ring (P->seq_no % kRing) reaches the mapped host mirror word for word,
+// past the ring's end too, and every other entry of the mirror keeps what it held (the host may be reading it).
+void test_ring_publish() {
+  constexpr size_t kEntry = sizeof(flyx_round_result), kBytes = kEntry * kRing;
+  std::vector<unsigned char> ring(kBytes);
+  for (size_t i = 0; i < kBytes; ++i) ring[i] = static_cast<unsigned char>(i * 131 + 7);
+  flyx_round_result* ring_dev = dev<flyx_round_result>(kRing);
+  CK(cudaMemcpy(ring_dev, ring.data(), kBytes, cudaMemcpyHostToDevice));
+  unsigned char* host = nullptr;
+  CK(cudaHostAlloc(reinterpret_cast<void**>(&host), kBytes, cudaHostAllocMapped));
+  flyx_round_result* host_dev = nullptr;
+  CK(cudaHostGetDevicePointer(reinterpret_cast<void**>(&host_dev), host, 0));
+  DevParams* P = params(0);
+  bool ok = true;
+  for (unsigned long long seq : {1ull, 2ull, static_cast<unsigned long long>(kRing), kRing + 5ull, 3ull * kRing - 1}) {
+    std::memset(host, 0xA5, kBytes);
+    CK(cudaMemcpy(&P->seq_no, &seq, sizeof(seq), cudaMemcpyHostToDevice));
+    ring_publish(ring_dev, host_dev, P, 0);
+    CK(cudaDeviceSynchronize());
+    const size_t slot = size_t(seq % kRing);
+    for (size_t i = 0; i < kBytes; ++i) {
+      const bool own = i / kEntry == slot;
+      ok = ok && host[i] == (own ? ring[i] : 0xA5);
+    }
+  }
+  std::printf("  %-4s ring_publish: the pass's entry, word for word, and no other\n", ok ? "ok" : "FAIL");
+  g_fail += !ok;
+  CK(cudaFreeHost(host));
+  for (void* p : std::initializer_list<void*>{ring_dev, P}) CK(cudaFree(p));
 }
 
 // A tree round of more than 16 rows (up to FLYX_MAX_WIDE_ROWS; docs/design/tree-verification.md): row r, its K/V in

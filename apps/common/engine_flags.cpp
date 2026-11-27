@@ -74,8 +74,8 @@ bool engine_flag(const std::string& a, const std::function<std::string()>& value
   } else if (a == "--no-lookup") {
     eo->lookup = false;
     eo->lookup_given = true;
-  } else if (a == "--draft-trees") {
-    eo->draft_trees = true;
+  } else if (a == "--draft-trees" || a == "--no-draft-trees") {
+    eo->draft_trees = a == "--draft-trees";
     eo->draft_trees_given = true;
   } else if (a == "--width") {
     eo->width = whole_flag("--width", value(), 0, kMaxDraftWidth);
@@ -91,7 +91,8 @@ bool engine_flag(const std::string& a, const std::function<std::string()>& value
     const std::string v = value();
     interfaces::DrafterMode mode;
     if (!interfaces::parse_drafter_mode(v, &mode))
-      std::fprintf(stderr, "error: unknown drafter '%s' (mtp, dflash2, dv, all or none)\n", v.c_str()), std::exit(2);
+      std::fprintf(stderr, "error: unknown drafter '%s' (%s)\n", v.c_str(), interfaces::drafter_mode_words().c_str()),
+          std::exit(2);
     eo->drafter = v;
   } else if (a == "--drafter-file") {
     eo->drafter_files.push_back(value());
@@ -161,16 +162,18 @@ std::string engine_flags_help(int ctx) {
          "  --backend-opt K=V    a backend option (repeatable; also FLYX_BACKEND_OPTIONS=K=V,...)\n"
          "  --no-spec            plain decoding, ignore the drafter\n"
          "  --no-lookup          no rounds drafted from the text itself where it repeats\n"
-         "  --draft-trees        the drafter also drafts trees (DFlash2: its candidates, best first), chosen per\n"
-         "                       round by cost and acceptance like its chains (also FLYX_DRAFT_TREES=1)\n"
-         "  --drafter D          mtp | dflash2 | dv | all | none; with several, the drafter is chosen every round\n"
-         "                       (default: every drafter given in a file of its own, and the model file's MTP layer\n"
-         "                       if it has one, else its DFlash2 drafter; its DV drafter, which drafts alone, only\n"
-         "                       when named)\n"
+         "  --draft-trees        the drafter also drafts trees (DFlash2, DSpark: its candidates, best first), chosen\n"
+         "                       per round by cost and acceptance like its chains (also FLYX_DRAFT_TREES=1); on by\n"
+         "                       default with a DSpark drafter on a Qwen3 or Llama target\n"
+         "  --no-draft-trees     chains only (also FLYX_DRAFT_TREES=0)\n"
+         "  --drafter D          mtp | dflash2 | dspark | dv | all | none; with several, the drafter is chosen every\n"
+         "                       round (default: every drafter given in a file of its own, and the model file's MTP\n"
+         "                       layer if it has one, else its block drafter (DFlash2 or DSpark); its DV drafter,\n"
+         "                       which drafts alone, only when named)\n"
          "  --drafter-file F     a drafter in a file of its own (repeatable): the MTP layer from a GGUF, for a GGUF\n"
-         "                       without it (unsloth's MTP/mtp-*.gguf), or a DFlash2 drafter: its .flyx file\n"
-         "                       (python/convert --draft alone), its authors' directory, or its GGUF file, for a\n"
-         "                       model of either format\n"
+         "                       without it (unsloth's MTP/mtp-*.gguf), or a block drafter: DFlash2 (its .flyx\n"
+         "                       file from python/convert --draft alone, its authors' directory, or its GGUF file)\n"
+         "                       or DeepSpec's DSpark (its directory or .flyx file), for a model of either format\n"
          "  --lora DIR|HF        a LoRA adapter as Hugging Face PEFT saves it (adapter_config.json and\n"
          "                       adapter_model.safetensors): its folder, or org/name[:FOLDER] on the Hub; run\n"
          "                       unmerged beside the model's linears\n"

@@ -22,19 +22,11 @@
 #include "core/render/chat.h"
 #include "core/render/chat_json.h"
 #include "core/tokenizer/tokenizer.h"
+#include "tests/common/check.h"
 
 using namespace flyx;
 
 namespace {
-
-int failures = 0;
-
-void check(bool ok, const std::string& what) {
-  if (!ok) {
-    ++failures;
-    std::printf("FAIL %s\n", what.c_str());
-  }
-}
 
 std::string read_file(const std::string& path) {
   std::ifstream f(path, std::ios::binary);
@@ -192,14 +184,18 @@ int main(int argc, char** argv) {
       check(reasoning && call && parser->tool_calls() == 1, label + ": reply parser reads thinking and the call");
     }
   }
+  // A cases file that holds none (or none this build renders) compares nothing: that is no pass.
+  check(n > 0, std::string(argv[2]) + ": no case rendered, nothing compared with transformers");
 
   // A request that continues an earlier one branches where the earlier conversation ended:
   // an agent loop, one call and its result, then the next.
+  int loops = 0;
   for (const auto& c : cases) {
     if (c["case"] != "agent loop" || !c["thinking"].get<bool>()) continue;
     ChatTemplate ct;
     ct.load(file, read_file(dir + "/" + c["template"].get<std::string>()), &err);
     if (std::string(ct.format()) == "plain") continue;  // no agent loops: tools refused above
+    ++loops;
     std::vector<ChatMessage> msgs;
     std::vector<ojson> tools;
     messages_from_openai(c["messages"], &msgs, &err);
@@ -218,6 +214,8 @@ int main(int argc, char** argv) {
               r1.text.compare(r1.first_user_end - 11, 11, "<|im_end|>\n") == 0,
           c["template"].get<std::string>() + ": the first user message ends at " + std::to_string(r1.first_user_end));
   }
+  check(loops > 0, std::string(argv[2]) + ": no agent loop with thinking in a template with calls (the branch "
+                                          "checks above ran on none)");
 
   // A Responses conversation (core/render/chat_json) is the chat that chat completions sends for
   // it: instructions, thinking, parallel calls and their outputs, text, a thinking block sent
@@ -490,6 +488,6 @@ int main(int argc, char** argv) {
           "Anthropic user message with single empty text block is preserved");
   }
 
-  std::printf("chat: %d renders, %s\n", n, failures ? "FAILED" : "all match transformers");
-  return failures ? 1 : 0;
+  std::printf("chat: %d renders compared with transformers\n", n);
+  return flyx::test::finish("chat_test");
 }

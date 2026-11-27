@@ -37,6 +37,36 @@ bool Session::init(std::string* err) {
   return true;
 }
 
+namespace {
+
+// `literal` (null: everywhere) within the first `bytes` of a text: where an encoding of those bytes reads special
+// tokens.
+std::vector<TextSpan> spans_within(const std::vector<TextSpan>* literal, size_t bytes) {
+  std::vector<TextSpan> out;
+  if (!literal) {
+    if (bytes) out.push_back({0, bytes});
+    return out;
+  }
+  for (const TextSpan& s : *literal)
+    if (s.begin < std::min(s.end, bytes)) out.push_back({s.begin, std::min(s.end, bytes)});
+  return out;
+}
+
+// Whether `tokens` (a history's) begin with what `text` read with `literal` gives for the history's prompt: that
+// prompt was read under the same rules, or under rules that differ only where no special token is spelled (encoding
+// it again says so; also where how it was read is not known).
+bool read_alike(const Tokenizer& tok, const std::vector<int32_t>& tokens, const PromptEncoding& was,
+                std::string_view text, const std::vector<TextSpan>* literal) {
+  if (was.bytes > text.size() || was.tokens > tokens.size()) return false;
+  const std::vector<TextSpan> now = spans_within(literal, was.bytes);
+  auto same = [](const TextSpan& a, const TextSpan& b) { return a.begin == b.begin && a.end == b.end; };
+  if (was.known && std::equal(was.literal.begin(), was.literal.end(), now.begin(), now.end(), same)) return true;
+  const std::vector<int32_t> again = tok.encode(text.substr(0, was.bytes), &now);
+  return again.size() == was.tokens && std::equal(again.begin(), again.end(), tokens.begin());
+}
+
+}  // namespace
+
 size_t Session::common_prefix(const std::vector<int32_t>& prompt,
                               const std::vector<interfaces::MediaSpan>* media) const {
   static const std::vector<interfaces::MediaSpan> kEmptyMedia;
@@ -48,18 +78,27 @@ std::vector<int32_t> Session::tokenize(const std::string& text, const std::vecto
   const auto& tok = e_->tokenizer();
   // A history whose text this one continues keeps its tokens: this session's, else that of a conversation whose
   // checkpoints are in the store (so they still match). Text-only histories only; multimodal requests use
-  // prepare_request()'s media-aware path.
+  // prepare_request()'s media-aware path.  And only where this text's rules read the history's prompt alike: a chat
+  // template reads no special token in what a user wrote and a raw prompt reads them everywhere, so after a chat
+  // prewarm a raw prompt of the same bytes is encoded as it would be in a fresh session.
   const std::vector<int32_t>* kept = nullptr;
   size_t h = 0;
+  bool other_rules = false;
+  auto keep = [&](const std::vector<int32_t>& tokens, const std::string& history_text, const PromptEncoding& was,
+                  const char* said) {
+    if (!read_alike(tok, tokens, was, text, literal)) {
+      other_rules = true;
+      return;
+    }
+    kept = &tokens;
+    h = history_text.size();
+    if (how) *how = said;
+  };
   if (history_media_.empty() && !history_text_.empty() && text.size() >= history_text_.size() &&
       text.compare(0, history_text_.size(), history_text_) == 0) {
-    kept = &history_;
-    h = history_text_.size();
-    if (how) *how = "history kept its tokens";
+    keep(history_, history_text_, history_encoding_, "history kept its tokens");
   } else if (const SnapshotStore::History* st = store_ ? store_->continued_by(text) : nullptr) {
-    kept = &st->tokens;
-    h = st->text.size();
-    if (how) *how = "a stored conversation's history kept its tokens";
+    keep(st->tokens, st->text, st->encoding, "a stored conversation's history kept its tokens");
   }
   if (kept) {
     std::vector<int32_t> ids = *kept;
@@ -71,7 +110,10 @@ std::vector<int32_t> Session::tokenize(const std::string& text, const std::vecto
     ids.insert(ids.end(), tail.begin(), tail.end());
     return ids;
   }
-  if (how) *how = history_text_.empty() ? "" : "history text changed: re-encoded";
+  if (how)
+    *how = other_rules            ? "the history's prompt was read under other special-token rules: re-encoded"
+           : history_text_.empty() ? ""
+                                   : "history text changed: re-encoded";
   return tok.encode(text, literal);
 }
 
@@ -84,6 +126,7 @@ void Session::reset_after_error() {
   rounds_.forget();
   history_.clear();
   history_text_.clear();
+  history_encoding_ = {};
   history_media_.clear();
   history_images_.clear();
   cut_checkpoints(0);
@@ -121,8 +164,14 @@ void Session::rolled_back(int pos) {
 void Session::publish(const std::vector<int32_t>& prompt, const std::vector<int32_t>& reply, size_t published,
                       int32_t stop_token, const std::vector<interfaces::MediaSpan>* media,
                       const std::string* rendered_text,
-                      const std::vector<interfaces::RenderedImage>* rendered_images) {
+                      const std::vector<interfaces::RenderedImage>* rendered_images, const PromptEncoding* encoding) {
   history_ = prompt;
+  size_t prompt_bytes = 0;
+  for (int32_t id : prompt) prompt_bytes += e_->tokenizer().token_bytes(id).size();
+  history_encoding_ = {};
+  if (encoding && encoding->known) history_encoding_ = {true, spans_within(&encoding->literal, prompt_bytes)};
+  history_encoding_.bytes = prompt_bytes;
+  history_encoding_.tokens = prompt.size();
   history_.insert(history_.end(), reply.begin(), reply.begin() + static_cast<std::ptrdiff_t>(published));
   if (stop_token >= 0 && published == reply.size()) history_.push_back(stop_token);
   if (media && !media->empty()) {
@@ -230,7 +279,8 @@ int Session::save_to(SnapshotStore& store, std::string* why, const SnapshotStore
   auto history = history_text_.empty()
                      ? nullptr
                      : std::make_shared<const SnapshotStore::History>(
-                           SnapshotStore::History{history_, history_text_, history_media_, history_images_});
+                           SnapshotStore::History{history_, history_text_, history_media_, history_images_,
+                                                  history_encoding_});
   // Disk ranges build from the earlier checkpoint. In RAM the last insertion survives eviction,
   // so give the protected question priority when the budget can hold only one of the two.
   const bool disk = store.disk_enabled();

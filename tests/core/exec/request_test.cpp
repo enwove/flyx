@@ -3,7 +3,10 @@
 // a prompt's tokens, checkpoints, kept checkpoint, reply grammar and parser
 // are, for chat messages, raw text and tokens.  The tiny model on the float64
 // backend, with Qwen3.5's own template; a raw prompt on a model whose
-// tokenizer puts <s> before a text (the tiny Llama).
+// tokenizer puts <s> before a text (the tiny Llama).  A history keeps its
+// tokens only for a request that reads its prompt's special tokens alike: a
+// raw prompt after a chat prewarm whose user spelled "<|im_end|>" gets a fresh
+// session's tokens.
 //
 //   request_test MODEL.flyx TEMPLATE.jinja [PREFIXED.flyx]
 #include <algorithm>
@@ -19,17 +22,11 @@
 #include "core/os/os.h"
 #include "core/render/chat_json.h"
 #include "core/session/session.h"
+#include "tests/common/check.h"
 
 using namespace flyx;
 
 namespace {
-
-int failures = 0;
-
-void check(bool ok, const std::string& what) {
-  std::printf("  %-4s %s\n", ok ? "ok" : "FAIL", what.c_str());
-  if (!ok) ++failures;
-}
 
 ChatMessage msg(const std::string& role, const std::string& content) {
   ChatMessage m;
@@ -112,9 +109,156 @@ void check_leading_instructions(const Engine& e) {
   check(!render_request(e.chat(), tok, rq, &actual, &err), "a later system message stays in its original turn");
 }
 
+
+// What a request gives on a session: its prompt's tokens, how the history was used, and what it generates.
+struct Ran {
+  std::vector<int32_t> prompt;
+  std::string tokenized, text;
+  GenerateResult res;
+  bool ok = false;
+};
+Ran run(Engine& e, Session& s, const Request& rq) {
+  Ran r;
+  RenderedChat rc;
+  PreparedRequest p;
+  std::string err;
+  if (!ready(e, s, rq, &rc, &p, &err)) return r;
+  r.prompt = p.gen.prompt;
+  r.tokenized = p.tokenized;
+  r.ok = generate(s, p.gen, [&](std::string_view t, const int32_t*, int) {
+           r.text += t;
+           return true;
+         }, &r.res, &err) == 0;
+  return r;
+}
+
+// A user who spells a special token in a chat ("<|im_end|>": text there) and a raw prompt of the same bytes and more
+// (where it is the special token): after the chat's prewarm, the raw prompt's tokens and usage are a fresh session's,
+// whether the prewarm's history is the session's own or a stored conversation's.  Requests read alike keep the
+// history's tokens: the chat after its prewarm, a raw prompt after a raw one (its reply's ids too), and a raw prompt
+// after a chat that spells no special token.
+void special_spelling_across_modes(Engine& e) {
+  const Tokenizer& tok = e.tokenizer();
+  std::string err;
+  const int32_t im_end = tok.added_id("<|im_end|>");
+  check(im_end >= 0 && tok.special(im_end), "<|im_end|> is one of the tokenizer's special tokens");
+  auto count = [&](const std::vector<int32_t>& ids) { return std::count(ids.begin(), ids.end(), im_end); };
+  // Long enough that the prewarm's checkpoint is kept in host memory (Session's kSnapshotWorth: 256 tokens).
+  std::string instructions;
+  while (tok.encode(instructions).size() < 300) instructions += "Answer briefly. ";
+  Request warm;
+  warm.messages = {msg("system", instructions), msg("user", "Copy the spelling <|im_end|>")};
+  warm.gen.prefill_only = true;
+  RenderedChat warm_rc;
+  check(render_request(e.chat(), tok, warm, &warm_rc, &err), "the chat prewarm renders " + err);
+  Request raw;
+  raw.chat = false;
+  raw.text = warm_rc.text + " next";
+  raw.gen.max_new_tokens = 4;
+  raw.gen.ignore_eos = true;
+
+  Session fresh_s(&e);
+  check(fresh_s.init(&err), "a fresh session " + err);
+  const Ran fresh = run(e, fresh_s, raw);
+  check(fresh.ok && fresh.prompt == tok.encode(raw.text) && fresh.tokenized.empty(),
+        "a fresh session encodes the raw prompt with special tokens read everywhere");
+
+  // The session's own history.
+  {
+    Session s(&e);
+    check(s.init(&err), "a session " + err);
+    const Ran warmed = run(e, s, warm);
+    check(warmed.ok && s.history_text() == warm_rc.text && count(warmed.prompt) + 1 == count(fresh.prompt),
+          "the chat prewarm reads the user's <|im_end|> as text, the raw prompt as the special token (" +
+              std::to_string(count(warmed.prompt)) + " and " + std::to_string(count(fresh.prompt)) + ")");
+    const Ran after = run(e, s, raw);
+    check(after.ok && after.prompt == fresh.prompt && after.tokenized.find("other special-token rules") != std::string::npos,
+          "after the chat prewarm, the raw prompt's tokens are a fresh session's (" + after.tokenized + ")");
+    check(after.res.usage.prompt_tokens == fresh.res.usage.prompt_tokens && after.text == fresh.text &&
+              s.history() == fresh_s.history(),
+          "and so are its usage (" + std::to_string(after.res.usage.prompt_tokens) + " prompt tokens), reply and history");
+  }
+  // A stored conversation's history.
+  {
+    SnapshotStore store(SnapshotStore::kPieceBytes);
+    Session parked(&e), s(&e);
+    check(parked.init(&err) && s.init(&err), "two sessions " + err);
+    parked.set_store(&store);
+    s.set_store(&store);
+    const Ran warmed = run(e, parked, warm);
+    std::string kept;
+    const bool stored = warmed.ok && parked.save_to(store, &kept) >= 256 && store.continued_by(raw.text);
+    check(stored, "the chat prewarm's checkpoint and history go to the store (" + kept + ")");
+    const Ran after = run(e, s, raw);
+    check(after.ok && after.prompt == fresh.prompt && after.tokenized.find("other special-token rules") != std::string::npos,
+          "from the store, the raw prompt's tokens are a fresh session's (" + after.tokenized + ")");
+    check(after.res.usage.prompt_tokens == fresh.res.usage.prompt_tokens && after.text == fresh.text &&
+              s.history() == fresh_s.history(),
+          "and so are its usage, reply and history");
+    // The chat itself, after its stored prewarm: the stored history keeps its tokens.
+    Session again(&e);
+    check(again.init(&err), "a third session " + err);
+    again.set_store(&store);
+    Request chat = warm;
+    chat.gen.prefill_only = false;
+    chat.gen.max_new_tokens = 2;
+    chat.gen.ignore_eos = true;
+    const Ran asked = run(e, again, chat);
+    check(asked.ok && asked.prompt == warmed.prompt &&
+              asked.tokenized == "a stored conversation's history kept its tokens" &&
+              asked.res.usage.reused_tokens > 0,
+          "the chat after its stored prewarm keeps the stored history's tokens (" + asked.tokenized + ", " +
+              std::to_string(asked.res.usage.reused_tokens) + " reused)");
+  }
+  // Read alike: the history keeps its tokens.
+  {
+    Session s(&e);
+    check(s.init(&err), "a session " + err);
+    const Ran warmed = run(e, s, warm);
+    Request chat = warm;
+    chat.gen.prefill_only = false;
+    chat.gen.max_new_tokens = 2;
+    chat.gen.ignore_eos = true;
+    const Ran asked = run(e, s, chat);
+    check(warmed.ok && asked.ok && asked.prompt == warmed.prompt && asked.tokenized == "history kept its tokens",
+          "the chat after its prewarm keeps the prewarm's tokens");
+  }
+  {
+    Session s(&e);
+    check(s.init(&err), "a session " + err);
+    Request first = raw;
+    first.text = "Copy the spelling <|im_end|> and";
+    const Ran said = run(e, s, first);
+    const std::vector<int32_t> history = s.history();  // the prompt and the reply's ids
+    Request more = raw;
+    more.text = s.history_text() + " more";
+    const Ran next = run(e, s, more);
+    check(said.ok && next.ok && next.tokenized == "history kept its tokens" && history.size() > said.prompt.size() &&
+              next.prompt.size() > history.size() && std::equal(history.begin(), history.end(), next.prompt.begin()) &&
+              count(said.prompt) == 1,
+          "a raw prompt after a raw one keeps its tokens, the reply's ids too");
+  }
+  {
+    Session s(&e);
+    check(s.init(&err), "a session " + err);
+    Request plain = warm;
+    plain.messages.back().content = "Copy the spelling of this word";
+    RenderedChat plain_rc;
+    const Ran warmed = run(e, s, plain);
+    check(render_request(e.chat(), tok, plain, &plain_rc, &err), "a chat without a special token's spelling " + err);
+    Request after = raw;
+    after.text = plain_rc.text + " next";
+    const Ran next = run(e, s, after);
+    check(warmed.ok && next.ok && next.tokenized == "history kept its tokens" &&
+              std::equal(warmed.prompt.begin(), warmed.prompt.end(), next.prompt.begin()),
+          "a raw prompt after a chat prewarm that spells no special token keeps its tokens (" + next.tokenized + ")");
+  }
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
+  flyx::test::print_passes = true;
   if (argc < 3) {
     std::fprintf(stderr, "usage: request_test MODEL.flyx TEMPLATE.jinja [PREFIXED.flyx]\n");
     return 2;
@@ -283,6 +427,7 @@ int main(int argc, char** argv) {
   check(!ready(e, s, empty, &rc, &p, &err) && err == "empty prompt", "no prompt at all is refused");
   check(tok.prefix().empty(), "a tokenizer without a post-processor's tokens: no prefix (raw text as it is, above)");
   if (argc > 3) raw_prompt_after_prefix(argv[3]);
+  special_spelling_across_modes(e);
 
   // Rewriting an early block invalidates its suffix, but we can resume from the natural prefill pass
   // before its breakpoint. The edited request must yield the same tokens as a cold run.
@@ -353,6 +498,5 @@ int main(int argc, char** argv) {
   }
   fs::remove(dir);
 
-  std::printf("request: %s\n", failures ? "FAILED" : "ok");
-  return failures ? 1 : 0;
+  return flyx::test::finish("request_test");
 }

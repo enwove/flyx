@@ -67,6 +67,13 @@ block type, the round's rows and the layer's columns, which may name one of the
 three tensor-core kernels instead (``tensor_cores``); every one gives the same
 bits too.
 
+MoE layers' packed expert GEMMs on dp4a (``moe_dp4a``: output columns a warp,
+units a lane has in flight; 0 and 0, the original tiles) have rules for their
+fused gate|up GEMM (``moe_gate_up``) by block type and the pass's rows; the
+original tiles are the one configuration every block type compiles, the others
+are compiled for MOE_DP4A_TYPES alone, so only the rules naming those types may
+pick another.  Every one gives the same bits.
+
 Output: X-macros listing the configurations (template instances), the sku
 list with parents and the families each table has, and the rules.
 """
@@ -96,11 +103,17 @@ def round_key(d: dict) -> tuple:
     return key({**ROUND_DEFAULTS, **d}, ROUND_KEYS)
 # GGML block types by name: FLYX_DT_GGML_<name> in include/flyx/backend_abi.h
 GGML_TYPES = ("Q4_0", "Q4_1", "Q5_0", "Q5_1", "Q8_0", "Q2_K", "Q3_K", "Q4_K", "Q5_K", "Q6_K", "IQ2_XXS", "IQ2_XS",
-              "IQ2_S", "IQ3_XXS", "IQ3_S", "IQ1_S", "IQ1_M", "IQ4_NL", "IQ4_XS")
+              "IQ2_S", "IQ3_XXS", "IQ3_S", "IQ1_S", "IQ1_M", "IQ4_NL", "IQ4_XS", "MXFP4", "Q2_0")
 # The families of rules: bit i of a sku's `families` is FAMILIES[i]; the keys each takes in [defaults] or [rules].
 FAMILIES = {"bf16": ("bf16",), "nvfp4": ("nvfp4_k128", "nvfp4_k64"), "blocks": ("blocks",),
             "blocks_q8": ("blocks_q8",), "blocks_q8_runs": ("blocks_q8_runs",), "blocks_round": ("blocks_round",),
-            "bf16_rows": ("bf16_rows",), "bf16_draft": ("bf16_draft",)}
+            "bf16_rows": ("bf16_rows",), "bf16_draft": ("bf16_draft",), "moe_gate_up": ("moe_gate_up",)}
+# MoE layers' packed expert dp4a GEMMs (moe_dp4a): output columns a warp, units a lane has in flight.
+MOE_KEYS = ("columns", "units")
+MOE_ORIGINAL = (0, 0)  # the original tiles, which every block type compiles
+# The types every moe_dp4a configuration is compiled for, the others the original tiles alone (kernels.cuh:
+# kMoeDp4aTypes).
+MOE_DP4A_TYPES = frozenset({"IQ3_XXS", "IQ2_S", "IQ2_XXS", "IQ2_XS", "IQ4_NL", "Q4_K"})
 # bf16 GEMMs of 17..64 rows on k_gemm_skinny_mt (bf16_mt): a round's in three parts, a drafting pass's in one.
 MT_PARTS = {"bf16_rows": 3, "bf16_draft": 1}
 MT_ROWS = (17, 64)
@@ -164,8 +177,13 @@ class Compiled:
             raise SystemExit(f"{where}: blocks_round takes rows 1, 2, 4, 8 or 16, columns 0, 1, 2 or 4, ahead "
                              f"0, 1, 2 or 4, warps 8 or 16, staged 0, 1 or 2 (windows) and parts 1, 2 or 4 dividing rows and "
                              f"warps, each configuration once; got {self.rounds}")
+        self.moe = [key(c, MOE_KEYS) for c in cand["moe_dp4a"]]
+        if (len(set(self.moe)) != len(self.moe) or MOE_ORIGINAL not in self.moe
+                or any(m != MOE_ORIGINAL and (m[0] not in (1, 2, 4) or m[1] not in (1, 2)) for m in self.moe)):
+            raise SystemExit(f"{where}: moe_dp4a takes the original tiles (columns 0, units 0) and columns 1, 2 or 4 "
+                             f"with units 1 or 2, each configuration once; got {self.moe}")
         for fam, items in (("bf16", self.bf16), ("fp4", self.fp4), ("blocks", self.blocks),
-                           ("blocks_q8", self.q8), ("rounds", self.rounds)):
+                           ("blocks_q8", self.q8), ("rounds", self.rounds), ("moe_dp4a", self.moe)):
             if len(items) >= 32:
                 raise SystemExit(f"{where}: {fam}: {len(items)} candidates exceeds 32-bit reachability mask")
 
@@ -355,6 +373,42 @@ def round_rules(rules, where, c: Compiled, default_rounds=None):
     return out
 
 
+def moe_rules(rules, where, c: Compiled):
+    """MoE layers' fused gate|up GEMMs on dp4a: the first rule that matches the block types it names (none: every
+    other type) and the pass's rows (1 and more).  Rules naming types come first, and each list of types, like the
+    rules for every other type, ends with a rule for the rest, so a type is served by its own rules alone.  A rule
+    that serves a type outside MOE_DP4A_TYPES (each rule for every other type among them) takes the original tiles,
+    the one configuration those types compile.  (types, lo, hi, cfg)."""
+    out, groups, generic = [], [], False
+    for r in rules:
+        types = tuple(r.get("types", ()))
+        if (any(t not in GGML_TYPES for t in types) or not set(MOE_KEYS) <= set(r)
+                or set(r) - {"types", "rows", *MOE_KEYS}):
+            raise SystemExit(f"{where}: a moe_gate_up rule names known block types, maybe rows, and columns and units: "
+                             f"{r}")
+        lo, hi = r.get("rows", [1, INF])
+        k = key(r, MOE_KEYS)
+        if not 1 <= lo <= hi or k not in c.moe:
+            raise SystemExit(f"{where}: a moe_gate_up rule takes rows from 1 on and a compiled moe_dp4a "
+                             f"configuration: {r}")
+        if k != MOE_ORIGINAL and (not types or any(t not in MOE_DP4A_TYPES for t in types)):
+            raise SystemExit(f"{where}: moe_gate_up rule {r}: only {', '.join(sorted(MOE_DP4A_TYPES))} compile "
+                             "configurations beside the original tiles (columns 0, units 0)")
+        if types and generic:
+            raise SystemExit(f"{where}: moe_gate_up rules that name types come before the others")
+        generic = generic or not types
+        if not groups or groups[-1][0] != types:
+            groups.append((types, []))
+        groups[-1][1].append((lo, hi))
+        out.append((types, lo, hi, c.moe.index(k)))
+    named = [t for types, _ in groups for t in types]
+    if (not generic or len(named) != len(set(named)) or len(groups) != len({types for types, _ in groups})
+            or any(rs[-1] != (1, INF) for _, rs in groups)):
+        raise SystemExit(f"{where}: each list of types in the moe_gate_up rules, and the rules for every other type, "
+                         "are consecutive and end with a rule for the rest (no rows); a type is named once")
+    return out
+
+
 def family_rules(d: dict, where: str, c: Compiled, every: bool, default_rounds=None) -> dict:
     """The families of rules in `d` (candidates.toml's [defaults]: every one; a table's [rules]: any), checked."""
     known = {k for keys in FAMILIES.values() for k in keys}
@@ -379,6 +433,8 @@ def family_rules(d: dict, where: str, c: Compiled, every: bool, default_rounds=N
             out[family] = q8_runs_rules(d["blocks_q8_runs"], where)
         elif family in MT_PARTS:
             out[family] = mt_rules(d[family], where, c, family)
+        elif family == "moe_gate_up":
+            out[family] = moe_rules(d["moe_gate_up"], where, c)
         else:
             out[family] = round_rules(d["blocks_round"], where, c, default_rounds)
     return out
@@ -514,6 +570,10 @@ def compute_reachability(c: Compiled, skus, sku_archs, rules, families):
     w12_mask = [[0, 0] for _ in range(n_b)]
     fp4_mask = [[0, 0] for _ in range(n_b)]
     mt_mask = [0] * n_b  # bf16_mt configurations (k_gemm_skinny_mt, 17..64 rows)
+    # moe_dp4a configurations for fused gate|up by rows band (0: rows == 1, 1: rows >= 2);
+    # the original tiles stay compiled for every type in both bands (and for down / unfused projections).
+    orig_bit = 1 << c.moe.index(MOE_ORIGINAL)
+    moe = [[[orig_bit] * n_dt for _ in range(2)] for _ in range(n_b)]
 
     # Per-SKU shape rules; bf16_rows and bf16_draft (fmt 3, 4) name bf16_mt configurations, not a 1..16-row kernel's
     rules_by_sku = {}
@@ -601,10 +661,21 @@ def compute_reachability(c: Compiled, skus, sku_archs, rules, families):
                                 elif eng == 5:
                                     round_tc[bi][di] |= 1 << (6 if rows <= 8 else 7)
                                 break
+        # moe_gate_up (exact first-match by type and rows; band 0: rows == 1, band 1: rows >= 2)
+        for sid in bskus:
+            mr = resolve(sid, "moe_gate_up")
+            probes = sorted({1, 2, INF} | {v for _, lo, hi, _ in mr for v in (lo, hi, hi + 1) if v <= INF})
+            for dt in GGML_TYPES:
+                di = dt_idx[dt]
+                for rows in probes:
+                    for types, lo, hi, cfg in mr:
+                        if (not types or dt in types) and lo <= rows <= hi:
+                            moe[bi][0 if rows == 1 else 1][di] |= 1 << cfg
+                            break
     return {
         "round_dp4a": round_dp4a, "round_stack": round_stack, "round_glu": round_glu,
         "round_tc": round_tc, "blocks_q8": blocks_q8, "blocks_skinny": blocks_skinny,
-        "bf16": bf16_mask, "w12": w12_mask, "fp4": fp4_mask, "mt": mt_mask,
+        "bf16": bf16_mask, "w12": w12_mask, "fp4": fp4_mask, "mt": mt_mask, "moe": moe,
     }
 
 
@@ -626,6 +697,7 @@ def emit(c: Compiled, skus, rules, families, archs=(), flash_gqa=(), strata_plac
     emit_xmacro("FLYX_BLOCKS_SKINNY", "X(index, nt, nw, kw)", c.blocks)
     emit_xmacro("FLYX_BLOCKS_Q8", "X(index, bn, qk, bm)", c.q8)
     emit_xmacro("FLYX_BLOCKS_ROUND", "X(index, rows, columns, ahead, warps, staged, parts)", c.rounds)
+    emit_xmacro("FLYX_MOE_DP4A", "X(index, columns, units): 0 and 0, the original tiles", c.moe)
     out.append("")
     out.append("namespace flyx::cuda::tables {")
     out.append("// The families of rules a table may have beside its shapes (bit i: the i-th), as the defaults have them.")
@@ -735,6 +807,16 @@ def emit(c: Compiled, skus, rules, families, archs=(), flash_gqa=(), strata_plac
         out += ([f"    {{{sku}, FLYX_DT_GGML_{t}, {lo}, {hi}, {n_min}, {n_max}, {cfg}, {e}}}," for t in types]
                 or [f"    {{{sku}, -1, {lo}, {hi}, {n_min}, {n_max}, {cfg}, {e}}},"])
     out.append("};")
+    out.append("// MoE layers' packed expert dp4a GEMMs: the original tiles' configuration (FLYX_MOE_DP4A), every type's;")
+    out.append("// the fused gate|up GEMM's rules: block type (-1: every type no rule names), passes of lo..hi rows, the")
+    out.append("// first rule that matches.")
+    out.append(f"inline constexpr int kMoeDp4aOriginal = {c.moe.index(MOE_ORIGINAL)};")
+    out.append("struct MoeGateUpRule { int sku, dtype, lo, hi, cfg; };")
+    out.append("inline constexpr MoeGateUpRule kMoeGateUp[] = {")
+    for sku, (types, lo, hi, cfg) in rows_of("moe_gate_up"):
+        out += ([f"    {{{sku}, FLYX_DT_GGML_{t}, {lo}, {hi}, {cfg}}}," for t in types]
+                or [f"    {{{sku}, -1, {lo}, {hi}, {cfg}}},"])
+    out.append("};")
     if sku_archs is None:
         sku_archs = [0] * len(skus)
     reach = compute_reachability(c, skus, sku_archs, rules, families)
@@ -772,6 +854,14 @@ def emit(c: Compiled, skus, rules, families, archs=(), flash_gqa=(), strata_plac
     emit_mat("kReachRoundGlu", reach["round_glu"])
     emit_mat("kReachRoundTc", reach["round_tc"])  # bits: 0:mma8 1:mma16 2:cols8 3:split8 4:split16 5:split_cols8 6:warps8 7:warps16
     emit_mat("kReachBlocksQ8", reach["blocks_q8"])
+    # bit i: moe_dp4a configuration i for fused gate|up ([arch_bucket][rows > 1][ggml_type])
+    out.append(f"inline constexpr unsigned kReachMoeDp4a[{n_buckets}][2][{len(GGML_TYPES)}] = {{")
+    for bmat in reach["moe"]:
+        out.append("    {")
+        for row in bmat:
+            out.append("        {" + ", ".join(f"{v:#x}u" for v in row) + "},")
+        out.append("    },")
+    out.append("};")
     out.append(f"inline constexpr unsigned kReachBlocksSkinny[{n_buckets}] = {{" +
                ", ".join(f"{v:#x}u" for v in reach["blocks_skinny"]) + "};")
     out.append("inline constexpr unsigned kReachBf16Mt[7] = {" + ", ".join(f"{v:#x}u" for v in reach["mt"]) + "};")
@@ -802,6 +892,13 @@ def main(argv=None) -> int:
     names = [t["sku"] for _, t in tables]
     if len(set(names)) != len(names):
         raise SystemExit(f"two tables name one sku: {names}")
+    # A GPU takes the table that names its CUDA device name (gemm_tuning_for): one table a name, or the last would win.
+    owner = {}
+    for path, t in tables:
+        for dev in t.get("devices", []):
+            if dev in owner:
+                raise SystemExit(f"{path}: device {dev!r} is already named by the table of sku {owner[dev]!r}")
+            owner[dev] = t["sku"]
     for path, t in tables:
         if t.get("inherit") and t["inherit"] not in names:
             raise SystemExit(f"{path}: inherits unknown sku {t['inherit']!r}")

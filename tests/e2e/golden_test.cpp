@@ -1103,6 +1103,155 @@ void dv_chat_checkpoint(const std::string& model, const std::string& backend, co
             ": plain decoding's tokens, the fresh prefill's first token first");
 }
 
+// DSpark (DeepSeek's block drafter, models/drafters/dflash2.h: plain layers, every row of its block a draft, a Markov
+// head as the selector without a gate).  On the tiny Qwen3.5 with one in its file: at its block (7 drafts) its drafts
+// are the reference's and its tokens plain decoding's, with the reference's oracle drafts its rounds accept as many,
+// and chosen every round the tokens again.  On the tiny Qwen3 with one in a drafter file of its own: plain decoding's
+// tokens.
+void dspark_checks(const std::string& dir, const std::string& backend) {
+  const std::string model = dir + "/tiny_dspark.flyx";
+  std::ifstream f(os::to_path(dir + "/golden_dspark.json"), std::ios::binary);
+  if (!f || !std::filesystem::exists(os::to_path(model))) {
+    check(false, "dspark: tiny_dspark.flyx and golden_dspark.json are missing (make_tiny.py)");
+    return;
+  }
+  const json g = json::parse(f);
+  auto fixed = make(model, backend, true, "dspark", false, "", false, 512, 7);
+  auto chosen = make(model, backend, true, "dspark", false, "", false, 512, -1);
+  bool tokens = true, oracle_n = true, chosen_tokens = true;
+  int same = 0, total = 0;
+  for (const auto& c : g["cases"]) {
+    const auto prompt = c["prompt"].get<std::vector<int32_t>>();
+    const auto want = c["tokens"].get<std::vector<int32_t>>();
+    const int n = int(want.size());
+    Session s(fixed.get()), so(fixed.get()), sc(chosen.get());
+    if (!init_checked(s) || !init_checked(so) || !init_checked(sc)) return;
+    std::vector<flyx_round_result> trace;
+    tokens = tokens && gen(s, prompt, n, &trace).tokens == want;
+    int sm = 0, tt = 0;
+    drafts_equal(trace, c["rounds"], &sm, &tt);
+    same += sm, total += tt;
+    const auto oracle = c["oracle"].get<std::vector<int32_t>>();
+    fixed->api()->set_oracle(so.seq(), oracle.data(), static_cast<int32_t>(oracle.size()));
+    std::vector<flyx_round_result> otrace;
+    tokens = tokens && gen(so, prompt, n, &otrace).tokens == want;
+    fixed->api()->set_oracle(so.seq(), nullptr, 0);
+    const auto want_n = c["oracle_n"].get<std::vector<int>>();
+    for (size_t i = 1; i < otrace.size() && i - 1 < want_n.size(); ++i)
+      oracle_n = oracle_n && otrace[i].n_accepted == want_n[i - 1];
+    chosen_tokens = chosen_tokens && gen(sc, prompt, n).tokens == want;
+  }
+  check(tokens, "dspark: drafting 7 a round (its block, the anchor's row too) gives the reference's tokens");
+  check(total > 0 && same * 10 >= total * 9,
+        "  its drafts are the reference's (" + std::to_string(same) + " / " + std::to_string(total) + ")");
+  check(oracle_n, "  with oracle drafts its rounds accept as many as the reference's (long runs, rollback)");
+  check(chosen_tokens, "  chosen every round: the reference's tokens");
+  if (backend == "cuda" && g["cases"].size() >= 2) {
+    // Two sessions' rounds batched: a block without convolutions drafts each chain alone (DFlashBlock::groups), so
+    // each gets what it gets alone, and the batch holds no grouped buffers for it.
+    batch_rounds(fixed.get(), {g["cases"][0]["prompt"].get<std::vector<int32_t>>(),
+                               g["cases"][1]["prompt"].get<std::vector<int32_t>>()},
+                 {0, 0}, "  rounds of two sessions batched, each chain alone", 7);
+  }
+  {  // Seeded sampling: drafts coupled to the target's noise (ops::coupled_draft_score) change only how many are
+     // accepted, never the tokens; and with draft trees (the walk's chain as their trunk) the tokens are the same.
+    auto none = make(model, backend, false);
+    auto trees = make(model, backend, true, "dspark", false, "", false, 512, -1, true);
+    SamplingParams sampled;
+    sampled.temperature = 0.8f;
+    sampled.seed = 7;
+    bool same_sampled = true, same_trees = true;
+    int accepted = 0, drafts = 0;
+    for (const auto& c : g["cases"]) {
+      const auto prompt = c["prompt"].get<std::vector<int32_t>>();
+      const auto want = c["tokens"].get<std::vector<int32_t>>();
+      Session a(none.get()), b(fixed.get()), t(trees.get()), ts(trees.get());
+      if (!init_checked(a) || !init_checked(b) || !init_checked(t) || !init_checked(ts)) return;
+      const auto want_sampled = gen(a, prompt, 40, nullptr, sampled).tokens;
+      std::vector<flyx_round_result> trace;
+      same_sampled = same_sampled && gen(b, prompt, 40, &trace, sampled).tokens == want_sampled;
+      for (size_t i = 1; i < trace.size(); ++i) accepted += trace[i].n_accepted, drafts += trace[i].n_drafts;
+      same_trees = same_trees && gen(t, prompt, int(want.size())).tokens == want &&
+                   gen(ts, prompt, 40, nullptr, sampled).tokens == want_sampled;
+    }
+    check(same_sampled, "  sampled (T 0.8, seeded), drafts coupled to its noise: plain decoding's tokens (" +
+                            std::to_string(accepted) + " of " + std::to_string(drafts) + " drafts accepted)");
+    check(same_trees, "  with draft trees, greedy and sampled: the same tokens");
+  }
+  if (backend == "cuda") {  // the generic regions (gate 2): fusion=0 drafts what the fused rounds draft, round for round
+    auto generic = make(model, backend, true, "dspark", false, "fusion=0", false, 512, 7);
+    bool same_generic = true;
+    int rounds = 0;
+    for (const auto& c : g["cases"]) {
+      const auto prompt = c["prompt"].get<std::vector<int32_t>>();
+      const auto want = c["tokens"].get<std::vector<int32_t>>();
+      Session s(fixed.get()), u(generic.get());
+      if (!init_checked(s) || !init_checked(u)) return;
+      std::vector<flyx_round_result> fused_trace, generic_trace;
+      same_generic = same_generic && gen(s, prompt, int(want.size()), &fused_trace).tokens == want &&
+                     gen(u, prompt, int(want.size()), &generic_trace).tokens == want &&
+                     fused_trace.size() == generic_trace.size();
+      for (size_t i = 1; same_generic && i < fused_trace.size(); ++i, ++rounds) {
+        const flyx_round_result &x = fused_trace[i], &y = generic_trace[i];
+        same_generic = x.n_drafts == y.n_drafts && std::equal(x.drafts, x.drafts + x.n_drafts, y.drafts);
+      }
+    }
+    check(same_generic && rounds > 0, "  fusion=0: the fused rounds' drafts, round for round (" +
+                                          std::to_string(rounds) + " rounds), and the reference's tokens");
+  }
+  if (backend == "cuda") {  // its projections Q8_0 beside the bf16 target by default; draft_weights=exact: bf16
+    auto exact = make(model, backend, true, "dspark", false, "draft_weights=exact", false, 512, 7);
+    bool same_exact = true;
+    int accepted = 0;
+    for (const auto& c : g["cases"]) {
+      const auto prompt = c["prompt"].get<std::vector<int32_t>>();
+      const auto want = c["tokens"].get<std::vector<int32_t>>();
+      Session s(exact.get());
+      if (!init_checked(s)) return;
+      std::vector<flyx_round_result> trace;
+      same_exact = same_exact && gen(s, prompt, int(want.size()), &trace).tokens == want;
+      for (size_t i = 1; i < trace.size(); ++i) accepted += trace[i].n_accepted;
+    }
+    check(same_exact && accepted > 0,
+          "  draft_weights=exact (a bf16 drafter, not its default Q8_0): the reference's tokens (" +
+              std::to_string(accepted) + " drafts accepted)");
+  }
+
+  // The tiny Qwen3 (models/llama) with a DSpark drafter file beside it: its taps, context and rounds.
+  const std::string qwen3 = dir + "/tiny_qwen3.flyx", drafter = dir + "/tiny_dspark_qwen3.flyx";
+  auto plain = make(qwen3, backend, false);
+  EngineOptions o;
+  o.backend = backend;
+  o.speculative = true;
+  o.drafter = "dspark";
+  o.drafter_files = {drafter};
+  o.lookup = false;
+  o.kv = FLYX_KV_16;
+  o.max_ctx = 512;
+  o.prefill_chunk = 16;
+  o.width = -1;
+  Engine e;
+  std::string err;
+  if (!e.load(qwen3, o, &err)) {
+    check(false, "dspark on Qwen3: load: " + err);
+    return;
+  }
+  bool q3 = true;
+  int drafted = 0;
+  std::ifstream fq(os::to_path(dir + "/golden_qwen3.json"), std::ios::binary);
+  const json gq = json::parse(fq);
+  for (const auto& c : gq["cases"]) {
+    const auto prompt = c["prompt"].get<std::vector<int32_t>>();
+    Session a(plain.get()), b(&e);
+    if (!init_checked(a) || !init_checked(b)) return;
+    std::vector<flyx_round_result> trace;
+    q3 = q3 && gen(a, prompt, 32).tokens == gen(b, prompt, 32, &trace).tokens;
+    for (const auto& r : trace) drafted += r.n_drafts > 0;
+  }
+  check(q3 && drafted > 0, "dspark on Qwen3 from a drafter file: plain decoding's tokens (" + std::to_string(drafted) +
+                               " drafted rounds)");
+}
+
 // A DFlash2 drafter whose block (8) is less than a round's rows: its chains of 15 drafts come from a wider block (the
 // backends' wide block, width + 1 mask rows in one pass), at a fixed width and chosen every round; either way the
 // tokens are plain decoding's.
@@ -1269,7 +1418,7 @@ void kv_in_host_memory(const std::string& model, const std::string& backend, con
 
 // The MTP layer's draft steps over its first and last positions, a 400-token prompt, FP8 caches: a
 // window as long as the context gives the drafts of none (its positions gathered in order); its first 16 and last 64
-// positions in a ring of 128 slots give the drafts of the same positions over a slot a position (the ring across its
+// positions in a ring of 192 slots give the drafts of the same positions over a slot a position (the ring across its
 // wraps), and plain decoding's tokens; a snapshot of the ring, loaded, the drafts of the session it was taken from.
 void mtp_window_checks(const std::string& model, const std::string& backend, const std::vector<int32_t>& prompt,
                        const std::vector<int32_t>& want) {
@@ -1302,12 +1451,12 @@ void mtp_window_checks(const std::string& model, const std::string& backend, con
   check(!d_none.empty() && d_all == d_none && t_all == t_none,
         "MTP over a window as long as the context: the drafts of none (" + std::to_string(d_none.size()) + ")");
   check(!d_ring.empty() && d_ring == d_flat && t_ring == t_flat,
-        "MTP over its first 16 and last 64 positions: a ring of 128 slots gives the drafts of a slot a position");
+        "MTP over its first 16 and last 64 positions: a ring of 192 slots gives the drafts of a slot a position");
   check(t_plain.size() == 48 && t_none == t_plain && t_ring == t_plain,
         "MTP over its first 16 and last 64 positions decodes plain decoding's tokens");
   auto ring = make(model, backend, true, "mtp", true, "mtp_window=64,mtp_sink=16,mtp_copy=0", false, 512);
   auto exact = make(model, backend, true, "mtp", true, "mtp_window=0", false, 512);
-  snapshot_through_host(ring.get(), exact.get(), prompt, "snapshot, MTP over a ring of 128 slots", false);
+  snapshot_through_host(ring.get(), exact.get(), prompt, "snapshot, MTP over a ring of 192 slots", false);
   // Over a 2- or 3-bit copy of every position, its last 64 exact from the ring (strata attention, the correction
   // reading the ring's slots): the drafts of the same over a slot a position, plain decoding's tokens.
   for (int bits : {2, 3}) {
@@ -1769,9 +1918,21 @@ void strata_rounds(const std::string& model, const std::string& backend, const s
       check(h_pin->api()->seq_size(h_pin->bmodel(), &lpin, &sz_pin) == 0 &&
                 h_pg->api()->seq_size(h_pg->bmodel(), &lpg, &sz_pg) == 0,
             "hybrid pageable_kv: query pinned and pageable sizes");
-      // Full-pinned needs ~(32 MiB + sz_pin.host); backing off by kv_delta/4 lands cleanly between 1 and 2 pinned layers.
+      // Full-pinned needs ~(32 MiB + host); backing off by kv_delta/4 lands cleanly between 1 and 2 pinned layers.  The
+      // host part the MTP session below needs, whose checkpoints copy the MTP layer's ring too (past 8 of mtp_window's
+      // windows: KvBuf::swa_ring).
       const uint64_t kv_delta = sz_pin.host_mapped > sz_pg.host_mapped ? sz_pin.host_mapped - sz_pg.host_mapped : 0;
-      const int mid_mb = int(((32ull << 20) + sz_pin.host - kv_delta / 4) / (1ull << 20));
+      flyx_seq_size sz_pin_mtp{};
+      {
+        auto h_pin_mtp = make(model, backend, true, "mtp", false, hbase + ",pageable_kv=off", false, hctx,
+                              kReferenceWidth, false, 0, "strata", 0);
+        const flyx_seq_layout l = h_pin_mtp->kv_layout();
+        const bool sized = h_pin_mtp->api()->seq_size(h_pin_mtp->bmodel(), &l, &sz_pin_mtp) == 0;
+        check(sized && sz_pin_mtp.host_mapped == sz_pin.host_mapped && sz_pin_mtp.host >= sz_pin.host,
+              "hybrid pageable_kv: the MTP session's pinned size (" + std::to_string(sz_pin_mtp.host) + " >= " +
+                  std::to_string(sz_pin.host) + " host bytes, the same K/V)");
+      }
+      const int mid_mb = int(((32ull << 20) + sz_pin_mtp.host - kv_delta / 4) / (1ull << 20));
       auto h_mix_plain = make(model, backend, false, "", false,
                               hbase + ",pageable_kv=auto,pinned_host_mb=" + std::to_string(mid_mb), false, hctx,
                               kReferenceWidth, false, 0, "strata", 0);
@@ -2802,25 +2963,32 @@ void dv_rounds(const json& g, const std::string& model, const std::string& backe
         fp8_tokens += t8 == t8_ref;
         const json& ref8 = (*fp8_ref)[size_t(k)]["fresh"];
         const DvFresh f8 = dv_fresh(dv8.get(), prompt, t8_ref, width);
-        const DvFresh fh8 = dv_fresh(dv8_host.get(), prompt, t8_ref, width);
         fresh8.add(f8.first, FreshSame::of(ref8, "first"));
-        fresh8_host.add(fh8.first, f8.first);
-        fresh8_host.add(fh8.second, f8.second);
         fresh8_second.add(f8.second, FreshSame::of(ref8, "second"));
+        if (k == 0) {  // the K/V's home: every tree the device's, on the first case (as below)
+          const DvFresh fh8 = dv_fresh(dv8_host.get(), prompt, t8_ref, width);
+          fresh8_host.add(fh8.first, f8.first);
+          fresh8_host.add(fh8.second, f8.second);
+        }
       }
     }
     // DV's first tree after a fresh start at each point: the reference's; with the K/V in host memory (the canvas
-    // reads the text through the stagings), the tokens and every tree this GPU drafts with them on the device.
+    // reads the text through the stagings), the tokens and every tree this GPU drafts with them on the device.  Those,
+    // and the generic regions' trees, are held to the device's own exactly: on the first case (its 46 fresh starts),
+    // the reference's on every case.
     if (fresh_ref && k < static_cast<int>(fresh_ref->size())) {
-      const DvFresh f = dv_fresh(dv.get(), prompt, want, width), fh = dv_fresh(dv_host.get(), prompt, want, width);
+      const DvFresh f = dv_fresh(dv.get(), prompt, want, width);
       fresh16.add(f.first, FreshSame::of((*fresh_ref)[size_t(k)], "first"));
       fresh16_second.add(f.second, FreshSame::of((*fresh_ref)[size_t(k)], "second"));
-      fresh_host.add(fh.first, f.first);
-      fresh_host.add(fh.second, f.second);
-      if (dv_generic) {
-        const DvFresh fg = dv_fresh(dv_generic.get(), prompt, want, width);
-        fresh_generic.add(fg.first, f.first);
-        fresh_generic.add(fg.second, f.second);
+      if (k == 0) {
+        const DvFresh fh = dv_fresh(dv_host.get(), prompt, want, width);
+        fresh_host.add(fh.first, f.first);
+        fresh_host.add(fh.second, f.second);
+        if (dv_generic) {
+          const DvFresh fg = dv_fresh(dv_generic.get(), prompt, want, width);
+          fresh_generic.add(fg.first, f.first);
+          fresh_generic.add(fg.second, f.second);
+        }
       }
       Session sh(dv_host.get());
       init_checked(sh);
@@ -3625,6 +3793,8 @@ int main(int argc, char** argv) {
   // exact weights; the others draft from NVFP4 copies (the output must not
   // change, only the drafts may).
   auto spec_exact = backend == "cpu_ref" ? nullptr : make(model, backend, true, "dflash2", false, "draft_weights=exact");
+  auto spec_nvfp4 = backend == "cpu_ref" ? nullptr : make(model, backend, true, "dflash2", false, "draft_weights=nvfp4");
+  auto spec_q8 = backend == "cpu_ref" ? nullptr : make(model, backend, true, "dflash2", false, "draft_weights=q8");
   auto mtp = make(model, backend, true, "mtp", false, backend == "cuda" ? "draft_weights=exact" : "");
   auto mtp_q = make(model, backend, true, "mtp");
   // Every drafter the model has: rounds of each at a fixed width (MTP 7, DFlash2 15), and the
@@ -3648,6 +3818,15 @@ int main(int argc, char** argv) {
                     "at a context of 2048");
   }
 
+  // The engine's own behaviour (sampling, penalties, grammars, lookup drafts, kept checkpoints, requests taking turns,
+  // stop strings) is the same code whatever the prompt: held on one case of the file, the first whose penalties change
+  // its tokens (make_tiny.py makes one), so that they are held to the reference's too.  Every case holds the drafters.
+  size_t behaviour_case = 0;
+  for (size_t i = 0; i < g["cases"].size(); ++i)
+    if (const json& pen = g["cases"][i]["penalty"]; !pen.is_null() && pen["differs"].get<bool>()) {
+      behaviour_case = i;
+      break;
+    }
   int k = 0;
   for (const auto& c : g["cases"]) {
     auto prompt = c["prompt"].get<std::vector<int32_t>>();
@@ -3690,6 +3869,11 @@ int main(int argc, char** argv) {
       check(same_tokens && total > 0 && same * 10 >= total * 9,
             "DFlash2 from exact weights: the reference's tokens, its drafts " + std::to_string(same) + " / " +
                 std::to_string(total));
+      Session s4(spec_nvfp4.get()), s8(spec_q8.get());
+      init_checked(s4);
+      init_checked(s8);
+      check(gen(s4, prompt, N).tokens == want && gen(s8, prompt, N).tokens == want,
+            "DFlash2 streaming nvfp4 and q8 draft_weights: exact target tokens");
     }
 
     Session so(spec.get());
@@ -3919,6 +4103,7 @@ int main(int argc, char** argv) {
       init_checked(sc);
       check(gen(sc, prompt, N).tokens == want, "both drafters, chosen every round: the reference's tokens");
     }
+    if (static_cast<size_t>(k - 1) != behaviour_case) continue;
 
     // Sampling: for one seed the output does not depend on speculation.
     for (auto sp_cfg : {SamplingParams{0.8f, 1.f, 0, 11}, SamplingParams{1.0f, 0.9f, 40, 12345}}) {
@@ -3950,6 +4135,22 @@ int main(int argc, char** argv) {
       check(a == b && static_cast<int>(a.size()) == N,
             "sampled (T=" + std::to_string(sp_cfg.temperature).substr(0, 3) + "): DFlash2 == plain for one seed");
       check(c2 == a, "  both drafters, chosen every round == plain for one seed");
+      {  // MTP alone: its drafts chosen as the sampler chooses (ops::draft_choice) change only how many are accepted
+        Session sm(mtp_q.get());
+        init_checked(sm);
+        std::vector<flyx_round_result> trace;
+        sm.trace = &trace;
+        std::vector<int32_t> toks;
+        GenerateResult res;
+        generate(sm, rq, [&](std::string_view, const int32_t* t, int nt) {
+          toks.insert(toks.end(), t, t + nt);
+          return true;
+        }, &res, &err);
+        int accepted = 0, drafts = 0;
+        for (size_t i = 1; i < trace.size(); ++i) accepted += trace[i].n_accepted, drafts += trace[i].n_drafts;
+        check(toks == a, "  MTP, its drafts chosen as the sampler chooses == plain for one seed (" +
+                             std::to_string(accepted) + " of " + std::to_string(drafts) + " drafts accepted)");
+      }
     }
 
     // Penalties on the tokens a reply already has: plain
@@ -4062,6 +4263,44 @@ int main(int argc, char** argv) {
                   std::to_string(fix_plain) + ", " + std::to_string(fix_spec) + ", " + std::to_string(fix_mtp) +
                   " tokens corrected)");
       }
+    }
+
+    // A request that goes on past the end of its reply (ignore_eos: a measurement's fixed number of tokens) under a
+    // grammar.  The grammar holds the reply to its end, the stop token it ends with included, and nothing after
+    // it: the matcher has ended there and is not asked about the tokens that follow, nor for a mask where every
+    // round's first token is masked (the reference).  With and without drafts.
+    {
+      const std::string tag = R"({"type": "structural_tag", "format": {"type": "const_string", "value": "a"}})";
+      auto run = [&](Engine* e, bool reference = false) {
+        std::string gerr;
+        auto m = e->grammar().matcher(tag, &gerr);
+        std::vector<int32_t> toks;
+        if (!m) {
+          check(false, "grammar compiles: " + gerr);
+          return toks;
+        }
+        GenerateRequest rq;
+        rq.prompt = prompt;
+        rq.max_new_tokens = 24;
+        rq.ignore_eos = true;
+        rq.grammar = m.get();
+        rq.grammar_reference = reference;
+        Session s(e);
+        init_checked(s);
+        GenerateResult res;
+        if (generate(s, rq, [&](std::string_view, const int32_t* t, int nt) {
+              toks.insert(toks.end(), t, t + nt);
+              return true;
+            }, &res, &err) != 0)
+          check(false, "generate past a grammar's end: " + err);
+        return toks;
+      };
+      const auto a = run(plain.get()), b = run(spec.get()), m = run(mtp.get()), ref = run(plain.get(), true);
+      const auto& eos = plain->eos();
+      check(a.size() == 24 && plain->tokenizer().token_bytes(a[0]) == "a" &&
+                std::find(eos.begin(), eos.end(), a[1]) != eos.end() && b == a && m == a && ref == a,
+            "grammar, past the reply's end (ignore_eos): the reply, its stop token, then tokens nothing holds; "
+            "plain, DFlash2, MTP and every round masked: " + str(a, 6));
     }
 
     // Drafts looked up in the sequence itself: text that
@@ -4363,6 +4602,7 @@ int main(int argc, char** argv) {
   if (backend == "cuda") wide_rounds(model, backend, g["cases"][0]["prompt"].get<std::vector<int32_t>>());
   if (backend == "cuda") mid_pass_checkpoint(model, backend, g["cases"][0]["prompt"].get<std::vector<int32_t>>());
   rewind_prefill_rewind(model, backend, g["cases"][0]["prompt"].get<std::vector<int32_t>>());
+  if (variant.empty()) dspark_checks(dir, backend);
   if (variant.empty()) {
     std::vector<std::vector<int32_t>> prompts;
     for (const auto& c : g["cases"]) prompts.push_back(c["prompt"].get<std::vector<int32_t>>());

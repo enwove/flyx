@@ -4,7 +4,7 @@
 #   . tools\windows\vsenv.ps1        # the leading dot matters: it changes this session
 #   cmake --preset dev-windows; cmake --build --preset dev-windows; ctest --preset dev-windows
 #
-# Imports the x64 MSVC environment of Visual Studio 2022, finds a CUDA 13 compiler (an installed toolkit, else the one
+# Imports the x64 MSVC environment of Visual Studio 2022 or newer, finds a CUDA 13 compiler (an installed toolkit, else the one
 # packaging\package_windows.ps1 installs from PyPI into ~\.venvs\flyx-win), puts the project's Python ahead of the
 # Microsoft Store alias, and says what is still missing.  The tests' assets need torch, transformers, tokenizers,
 # safetensors and gguf in that Python (docs/testing.md).
@@ -13,13 +13,13 @@
 
 $vswhere = Join-Path ${env:ProgramFiles(x86)} 'Microsoft Visual Studio\Installer\vswhere.exe'
 if (-not (Test-Path $vswhere)) {
-  throw ('Visual Studio 2022 Build Tools not found: https://aka.ms/vs/17/release/vs_buildtools.exe ' +
+  throw ('Install Visual Studio 2022 or newer Build Tools: https://visualstudio.microsoft.com/downloads/ ' +
          '("Desktop development with C++")')
 }
-$vs = & $vswhere -latest -products * -version '[17.0,18.0)' `
+$vs = & $vswhere -latest -products * -version '[17.0,)' `
   -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath
 if (-not $vs) {
-  throw 'Visual Studio 2022 has no C++ x64 tools: add the "Desktop development with C++" workload'
+  throw 'Install the "Desktop development with C++" workload for Visual Studio 2022 or newer'
 }
 $vcvars = Join-Path $vs 'VC\Auxiliary\Build\vcvars64.bat'
 cmd /s /c "`"$vcvars`" >nul 2>&1 && set" | ForEach-Object {

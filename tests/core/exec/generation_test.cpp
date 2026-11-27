@@ -14,19 +14,13 @@
 #include "core/grammar/grammar.h"
 #include "core/session/session.h"
 #include "nlohmann/json.hpp"
+#include "tests/common/check.h"
 
 using namespace flyx;
 
 extern "C" void flyx_test_delegate(const flyx_backend_api*);
 
 namespace {
-
-int g_failures = 0;
-
-void check(bool ok, const std::string& what) {
-  std::printf("  %-4s %s\n", ok ? "ok" : "FAIL", what.c_str());
-  if (!ok) ++g_failures;
-}
 
 const flyx_backend_api* g_cpu = nullptr;
 int32_t g_tracked_pos = 0;
@@ -293,8 +287,8 @@ void test_empty_history_text_tokenize(const char* model, const flyx_backend_api*
       break;
     }
   }
-  if (empty_id < 0) {
-    std::printf("  skip no empty-decoding token in tiny model\n");
+  if (empty_id < 0) {  // the tiny model has one: without it the history text below would be tested on nothing
+    check(false, "the tiny model has a token whose decode() is empty (a padding id or an empty piece)");
     return;
   }
 
@@ -315,6 +309,7 @@ void test_empty_history_text_tokenize(const char* model, const flyx_backend_api*
 }  // namespace
 
 int main(int argc, char** argv) {
+  flyx::test::print_passes = true;
   if (argc != 2) {
     std::fprintf(stderr, "usage: generation_test TINY.flyx\n");
     return 2;
@@ -332,6 +327,5 @@ int main(int argc, char** argv) {
   test_grammar_rollback_near_max_ctx(argv[1], cpu);
   test_prepare_failure_resets_session(argv[1], cpu);
   test_empty_history_text_tokenize(argv[1], cpu);
-  std::printf("generation_test: %s\n", g_failures ? "FAILED" : "ok");
-  return g_failures ? 1 : 0;
+  return flyx::test::finish("generation_test");
 }

@@ -8,10 +8,12 @@ Build prerequisites, CMake presets, CMake options, and release packaging for Lin
 
 | Target | Required Tools |
 |---|---|
-| **Linux / WSL2 (CUDA)** | CUDA 13 (`nvcc` on `PATH`), CMake ≥ 3.24, Ninja, `g++` ≥ 11, Python 3.11+ (tuning table codegen & tests), `libcurl` (not linked: loaded at run time for HF Hub fetch, which the hub tests exercise) |
-| **Windows (native MSVC + CUDA)** | Visual Studio 2022 C++ Build Tools, CMake ≥ 3.24, Ninja, Python 3.11+, CUDA 13 (`nvcc`, or auto-installed from PyPI wheels by `packaging\package_windows.ps1`) |
+| **Linux / WSL2 (CUDA)** | CUDA 13 (`nvcc` on `PATH`), CMake ≥ 3.24, Ninja, `g++` ≥ 11, Python 3.11+ for table generation, Python 3.12+ for the pinned test requirements, `libcurl` (not linked: loaded at run time for HF Hub fetch, which the hub tests exercise) |
+| **Windows (native MSVC + CUDA)** | Visual Studio 2022 or newer with C++ Build Tools, CMake ≥ 3.24, Ninja, Python 3.11+ (Python 3.12+ for tests), CUDA 13 (`nvcc`, or auto-installed from PyPI wheels by `packaging\package_windows.ps1`) |
 | **CPU-only CLI (`-DFLYX_CUDA=OFF -DFLYX_TESTS=OFF`)** | CMake ≥ 3.24, Ninja, C++20 compiler (no Python required) |
-| **Runtime (release packages)** | Linux: `libc` + NVIDIA driver ≥ 580, and the system's `libcurl` to fetch models by name; Windows: NVIDIA driver ≥ 580 (CUDA and C++ runtimes linked statically). Python wheel: Python ≥ 3.9, no PyTorch required. |
+| **Runtime (release packages)** | Linux x86-64 requires glibc ≥ 2.35, the NVIDIA driver ≥ 580 for CUDA, and the system's `libcurl` to fetch models by name. Windows requires the NVIDIA driver ≥ 580 for CUDA (CUDA and C++ runtimes linked statically). The wheel requires Python ≥ 3.9. |
+
+**CUDA 13.0.88 on Linux.** On glibc 2.41 or newer (Ubuntu 26.04 and recent Fedora and Arch releases), `nvcc` fails because the declarations of `rsqrt` and `rsqrtf` in `crt/math_functions.h` have different exception specifications from glibc's. Use Ubuntu 24.04, build in the Ubuntu 22.04 CUDA 13 container with [packaging/package_linux_docker.sh](../packaging/package_linux_docker.sh), or use a newer CUDA toolkit that supports your host distribution.
 
 ---
 
@@ -27,7 +29,7 @@ Defined in [CMakePresets.json](../CMakePresets.json).
 | `dev-windows` | Windows (MSVC) | `%USERPROFILE%\flyx-build` | Release + tests, local GPU arch |
 | `cpu-windows` | Windows (MSVC) | `%USERPROFILE%\flyx-build-cpu` | CPU-only + tests |
 | `release-linux` | Linux / WSL2 | `~/flyx-build-release` | Static runtime, multi-arch (`sm_80,89,90,100,120` + `compute_120` PTX), compressed fatbins, pruned candidates |
-| `release-windows` | Windows (MSVC) | `%USERPROFILE%\flyx-build-release` | Windows desktop/workstation multi-arch (`sm_80,89,120` + `compute_120` PTX; omits datacenter-only `sm_90,100`), `FLYX_TESTS=OFF` |
+| `release-windows` | Windows (MSVC) | `%USERPROFILE%\flyx-build-release` | Windows desktop/workstation multi-arch (`sm_80,89,120` plus the specialized `120a-real` W4A4 target, zero PTX; omits datacenter-only `sm_90,100`), `FLYX_TESTS=OFF` |
 
 ```sh
 # Linux / WSL2 development build + tests
@@ -44,7 +46,7 @@ Build outputs in `<build-dir>/bin`: `flyx` (CLI + `flyx serve`; `flyx-server` sy
 | Option | Default (`dev` / `release`) | Effect |
 |---|---|---|
 | `FLYX_CUDA` | `ON` | Build CUDA backend (`OFF` for CPU-only). |
-| `FLYX_CUDA_ARCHS` | local GPU / Linux: `80;89;90;100;120;120-virtual`, Win: `80;89;120;120-virtual` | Semicolon-separated SM architectures (≥ 8.0). |
+| `FLYX_CUDA_ARCHS` | local GPU / Linux: `80-real;89-real;90-real;100-real;120-real;120-virtual`, Win: `80-real;89-real;120-real` (no PTX: a GPU of a later architecture than sm_120 needs the Linux package or a build of its own) | Semicolon-separated SM architectures (≥ 8.0). |
 | `FLYX_TESTS` | `ON` (`dev`) / `OFF` (`release-windows`) | Build unit, op, golden, and server tests (plus `flyx-trace` when CUPTI is present). |
 | `FLYX_STATIC_RUNTIME` | `OFF` / `ON` | Statically link C++/CUDA runtimes for portable release binaries. |
 | `FLYX_STANDALONE_EXE` | `OFF` | Also build a single-file `flyx-standalone` executable with `cuda` and `cpu_ref` backends linked in. |
@@ -61,13 +63,28 @@ Version comes from `project(flyx VERSION ...)` in [CMakeLists.txt](../CMakeLists
 
 ### Linux Tarball and Python Wheel
 
+Build releases against **Ubuntu 22.04 (glibc 2.35)**. The same x86-64 packages target Debian 12 (glibc 2.36), Ubuntu 24.04, and Fedora and Arch systems with glibc 2.35 or newer.
+
+On a Linux release host with Docker, NVIDIA Container Toolkit and a supported GPU, run
+
 ```sh
-. "${VENV:-$HOME/.venvs/flyx}/bin/activate"
-python -m pip install 'setuptools>=77' wheel auditwheel patchelf
-JOBS=6 bash packaging/package.sh    # limit JOBS on low-RAM WSL2 hosts
+JOBS=6 bash packaging/package_linux_docker.sh
 ```
 
-Produces `dist/flyx-<version>-linux-x86_64-cuda13.tar.gz` and a `manylinux` Python wheel in `dist/` after installing and smoke-testing both (`packaging/smoke.sh`).
+The helper uses the pinned CUDA 13.0.2 development image for Ubuntu 22.04. An optional positional argument selects another CUDA development image. `JOBS` limits parallel compiles. The container runs the release tests, then smoke-tests the unpacked tarball and installed wheel before placing both in `dist/`.
+
+For a native build on the same baseline, activate a Python 3.12+ environment, install the Linux build prerequisites above and GNU binutils, then run
+
+```sh
+python -m pip install -r tests/requirements.txt wheel auditwheel patchelf
+JOBS=6 bash packaging/package.sh
+```
+
+`packaging/smoke.sh` checks the dynamic symbols of every packaged ELF before starting the CLI. After auditwheel repair, `packaging/package.sh` checks both the wheel's manylinux platform tags and its bundled ELF files. Both scripts pass `MAX_GLIBC` (default `2.35`) to the checker. To inspect an extracted tarball and a wheel independently, run
+
+```sh
+python3 packaging/check_glibc.py --max-glibc 2.35 /path/to/extracted-package dist/*.whl
+```
 
 ### Windows ZIP, Standalone EXE, and Python Wheel
 
@@ -83,7 +100,7 @@ powershell -ExecutionPolicy Bypass -File packaging\package_windows.ps1 -Assets D
 - Pass `-BuildDir DIR` for a custom build directory; `-Assets DIR` points to `tiny.flyx` from a test build to smoke-test both the unpacked ZIP (`cpu_ref`, `cuda`, HTTP server) and the wheel in an isolated virtual environment.
 - Windows executables embed `core/os/utf8.manifest` (UTF-8 active code page); CUDA 13.1+ MSVC `/Zc:preprocessor` flags are handled automatically by `CMakeLists.txt`.
 
-Native Windows development build (in PowerShell, dot-source `tools\windows\vsenv.ps1` to configure VS 2022, Ninja, CMake, `nvcc`, and `~\.venvs\flyx` / `~\.venvs\flyx-win`):
+Native Windows development build (in PowerShell, dot-source `tools\windows\vsenv.ps1` to configure Visual Studio 2022 or newer, Ninja, CMake, `nvcc`, and `~\.venvs\flyx` / `~\.venvs\flyx-win`):
 
 ```powershell
 . .\tools\windows\vsenv.ps1

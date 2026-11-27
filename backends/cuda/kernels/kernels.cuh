@@ -17,6 +17,7 @@
 #include <cstdint>
 #include <string>
 
+#include "backends/cuda/kernels/block_layout.h"
 #include "flyx/backend_abi.h"
 
 namespace flyx::cuda {
@@ -83,10 +84,31 @@ enum PosSel : int { kPosPosition = 0, kPosStart = 1 };
 // Choices the shapes do not settle: one set per loaded model (the backend's
 // options), the defaults in tests and benchmarks.
 enum AttnImpl : int { kAttnAuto = 0, kAttnSplit = 1, kAttnPerHead = 2 };
+// The block types the staged packed expert dp4a GEMMs compile every configuration for (variants/candidates.toml,
+// moe_dp4a; tools/codegen/gen_gemm_tables.py's MOE_DP4A_TYPES says the same): the other types the original tiles
+// alone.  Also those cuda_bench and cuda_op_test exercise.
+inline constexpr int kMoeDp4aTypes[] = {FLYX_DT_GGML_IQ3_XXS, FLYX_DT_GGML_IQ2_S, FLYX_DT_GGML_IQ2_XXS,
+                                        FLYX_DT_GGML_IQ2_XS, FLYX_DT_GGML_IQ4_NL, FLYX_DT_GGML_Q4_K};
+#ifdef __CUDACC__
+__host__ __device__
+#endif
+constexpr bool has_moe_dp4a_variants(int dtype) {
+  switch (dtype) {
+    case FLYX_DT_GGML_IQ3_XXS:
+    case FLYX_DT_GGML_IQ2_S:
+    case FLYX_DT_GGML_IQ2_XXS:
+    case FLYX_DT_GGML_IQ2_XS:
+    case FLYX_DT_GGML_IQ4_NL:
+    case FLYX_DT_GGML_Q4_K: return true;
+    default: return false;
+  }
+}
 // The selection's chunks: about this many pairs each, at most kStrataSelChunks; never more than
 // kStrataSelChunk pairs (a thread of the selection holds 16 of them in registers), so a session's context is at most
 // kStrataSelChunk kStrataSelChunks pairs (4M positions).
 constexpr int kStrataSelChunk = 16384, kStrataSelChunks = 128;
+// Every weight KernelOptions::warm can warm: its bits.
+inline constexpr int kWarmAll = 1 | 2 | 4 | 16;
 struct KernelOptions {
   int tuning = -1;            // GEMM tuning table (gemm_tuning_for), -1 = the defaults
   bool row_gemms = false;     // every GEMM on the CUDA-core row path (debugging)
@@ -98,6 +120,8 @@ struct KernelOptions {
   bool stacks = true;         // a stack's run and the next of another block type in one round launch where compiled
                               // (gemm_blocks_staged_runs)
   bool round_glu = true;      // a round's SwiGLU in its dp4a gate|up GEMM (gemm_blocks_round_glu_takes)
+  int moe_dp4a = -1;          // measurement: every packed expert dp4a GEMM of a type that compiles it in this
+                              // configuration (moe_dp4a_name); -1: the tables' rules (moe_gate_up_dp4a)
   bool side_stream = true;    // a round's narrow GEMMs of a stack on the launch's side stream (gemm_blocks_staged_runs)
   int lora_lanes = 0;         // measurement: an adapter's second product with this many lanes an output (lora_lanes)
   bool lora_glu = true;       // the SwiGLU takes gate's and up's adapter products, for ranks of one lane (LoraGlu)
@@ -141,8 +165,25 @@ struct KernelOptions {
   int mtp_copy = 2;           // ... and every position through a copy of this many bits (2 to 4; strata attention over
                               // the MTP layer's cache; 0: none, only the positions above)
   bool mtp_ring = true;       // ... which a ring of slots holds (false: a slot a position, for tests)
+  bool dflash_ring = true;    // a sliding-window DFlash2 context cache as a ring of slots (false: flat, for tests)
   int stage_window = 16384;   // FLYX_KV_STRATA / AUTO: a staging's positions, a multiple of kFlashWindowAlign; a
                               // prefill whose keys go past them reads them a window at a time
+  // Inkling-2 (the options' legacy environment spellings: backend.cpp's kEnvAliases).
+  int sc_cluster = 8;         // a fused sublayer's float4 row over a cluster of this many blocks, 4 or 8 (sm_90 and
+                              // later, where the device fits it); 1: one block a row.  Same bits
+  bool moe_vec = false;       // NVFP4 experts: float32 inputs and column-at-a-time vector kernels at every width,
+                              // instead of bf16 inputs on tensor cores (another arithmetic contract, not a tuning)
+  int warm = kWarmAll;        // rounds: L2 warming on the expert stream, a mask: the next MoE's router (1), loop
+                              // controller (2), residual query and norm (4); the next attention's small weights
+                              // (16).  0: none.  Same bits
+  int expert_prefetch = 2;    // the next MoE's experts guessed from the residual and prefetched on the expert stream:
+                              // 0 never, 2 rounds of 2 or more rows, any other value every round.  Same bits
+  int guess = 5;              // ... a one-row round's guess from the mixed residual: the planes it prefetches (low 4
+                              // bits: gate|up codes 1, scales 2, down codes 4, scales 8); 0: none.  Same bits
+  int guess_k = 4;            // ... of the best-scored this many experts (0: all top_k).  Same bits
+  bool side_loop_msg = true;  // side stream (with side_stream): the loop messages beside the sublayer's mix
+  bool side_companion = true; // ... a sink or tap projection beside the wide GEMM that shares its input
+  bool side_kv = true;        // ... a sliding-window round's K and V projections beside the q path
 };
 // Device scratch for GEMM inputs: the split activations of the 1..16-row
 // GEMMs (three bf16 parts, split_cap elements each) and the bf16 rows of the
@@ -175,7 +216,8 @@ struct Scratch {
   size_t q8_parts_cap = 0;
   int* q8_count = nullptr;
   // A round's GEMM in 8 bits whose streams are split among blocks of threads (k_round_blocks_split): each set's sums
-  // a tile of 8 columns (round_parts_cap floats), and a counter per tile (round_count_cap), zero between GEMMs.
+  // a tile of 8 columns (round_parts_cap floats), and a counter per tile (round_count_cap), zero between launches.
+  // k_rel_round_gqa also shares round_count as its zero-between-launch last-block combine counters.
   float* round_parts = nullptr;
   size_t round_parts_cap = 0;
   int* round_count = nullptr;
@@ -248,10 +290,16 @@ struct Launch {
   // deterministic, not a row's bits alone.
   bool draft = false;
 };
+// The launch's options (the defaults when it has none).
+const KernelOptions& opts(const Launch& L);
 // The scratch whose 8-bit rows are the SwiGLU a gate|up GEMM left (Launch::glu): the down GEMM's input.
 Scratch glu_inputs(const Scratch& s);
 // The scratch of a launch on the side stream: the same rows, the split kernel's sums and counters of its own.
 Scratch side_scratch(const Scratch& s);
+// Both the current device and its kernel image support sm_90 instructions.
+bool sm90_or_newer();
+// Cache per-kernel cluster feasibility for KernelOptions::sc_cluster before a sequence captures its first round.
+void prepare_sublayer_clusters(int cluster);
 
 // y[r, n] (=|+=) sum_k x[r, k] * W[n, k].  K % 8 == 0.  Chooses CUDA-core or tensor-core path by rows: 1..16 the
 // skinny kernel (gemm_rows where it does not fit, or with option row_gemms); more, the prefill kernels, or a round's
@@ -260,6 +308,10 @@ Scratch side_scratch(const Scratch& s);
 // k_gemm_skinny_mt in one part (up to 64 rows).
 void gemm(const float* x, int ldx, const bf16* W, int N, int K, float* y, int ldy, int rows, bool accumulate,
           const Launch& L);
+// Whether gemm gives 1..16 of these rows to the skinny kernel, which reads each value as three bf16 parts (the
+// rows' and the weight's alignment, K % 32; never with option gemm=rows): a producer that writes those parts itself
+// then gives gemm_presplit gemm's bits.
+bool gemm_skinny_takes(const float* x, int ldx, const bf16* W, int K, const Launch& L);
 // Explicit paths (for tests).
 void gemm_rows(const float* x, int ldx, const bf16* W, int N, int K, float* y, int ldy, int rows, bool accumulate,
                cudaStream_t st);
@@ -377,6 +429,18 @@ const char* gemm_tuning_name(int tuning);
 bool gemm_tuning_compiled_for(int tuning, int cc);
 // Whether kernels launch as programmatic dependents on the GPU of this table unless the options say.
 bool gemm_tuning_pdl(int tuning);
+// The table a device runs unless the options name one or none (option tuning=table; the engine and cuda_bench alike):
+// the device's own (gemm_tuning_for, by its name, else by its compute capability device_cc), where the loaded code
+// (compute capability code_cc, compiled_arch) has its kernels; else the loaded code's architecture's table, where it
+// has them; else -1 (the defaults).  *arch_cc (optional): the compute capability whose table it is when it is one by
+// architecture, device_cc or code_cc; 0 for a table by name, or none.  compiled: whether a table's kernels are
+// compiled for a compute capability (null: gemm_tuning_compiled_for; tests pass their own).
+int gemm_tuning_auto(const char* device_name, int device_cc, int code_cc, int* arch_cc = nullptr,
+                     bool (*compiled)(int tuning, int cc) = nullptr);
+// What gemm_tuning_auto's answer is, for a log: "none (defaults)", the table's name, and where arch_cc says it is a
+// table by architecture which one: "(this architecture's: sm_120)" on a device of that architecture, "(the loaded
+// code's architecture's: sm_80)" on another.
+std::string gemm_tuning_label(int tuning, int arch_cc, int device_cc);
 // The configuration index a GEMM gets (fmt 0 = bf16, 1 = nvfp4, 2 = w12; 17..64 rows on k_gemm_skinny_mt, a
 // kMtConfigs index: 3 = a round's, 4 = a drafting pass's) with a tuning table.
 int gemm_config(int tuning, int fmt, int N, int K, int rows);
@@ -438,10 +502,6 @@ struct BlockMat {
   int rows = 0;
   bool q8 = false;                  // every pass takes its inputs in 8 bits (FLYX_ACT_Q8)
 };
-struct BlockLayout {
-  int values, bytes, stride, scales;  // per block: weights, bytes in the file, payload bytes and scales on the device
-};
-BlockLayout blocks_layout(int dtype);  // values 0: not a type the kernels take
 // Builds the device tables the decoders read (ggml's codebooks as selectors
 // of their rows' magnitudes, bit fields and scales as binary16), once per
 // process.  The launchers below build them on first use; a backend calls
@@ -555,6 +615,8 @@ void dots_blocks(const BlockMat& W, int K, const int* idx, const int* count, flo
 // max(N, kDraftPickFloats) floats.  For drafts only: the target verifies every one.
 // kDraftCandCap: the most candidates scored exactly (the kDraftCands best and their ties).
 constexpr int kDraftCands = 256, kDraftPickFloats = 1025, kDraftCandCap = 512;
+// The most candidates a row a selector walk takes (the draft head's exact candidates, a wide pick's, or topk_rows's).
+constexpr int kWalkMax = 1024;
 struct SignHead {
   uint32_t* bits = nullptr;  // word w of row n at sign_word_at: bit j set when weight 32 w + j >= +0
   bf16* scales = nullptr;    // scale g of row n at sign_scale_at: mean |w| of weights 64 g .. 64 g + 63
@@ -574,16 +636,22 @@ void gemm_sign_rough(const float* x, int ldx, const SignHead& h, int N, int K, f
 // y[n] += rough(x, h)[n] + (bias ? bias[n] : 0) for 1 row, L2-caching h for small tables reused across steps.
 void gemm_sign_rough_add(const float* x, int ldx, const SignHead& h, const float* bias, int N, int K, float* y,
                          int ldy, const Launch& L);
-// Shared two-stage candidate-set primitives over rough [rows][ld] (ld >= max(V, kDraftPickFloats)):
-// select ~kDraftCands survivors per row, score survivors against any bf16 matrix (overwrite or accumulate + bias +
-// softcap), combine a packed dots_blocks candidate vector + bias + softcap, and pick top-k with prob/margin.
-void draft_select_cands(float* rough, int ld, int V, int rows, const Launch& L);
+// Shared two-stage candidate-set primitives over rough [rows][ld] (ld >= max(V, kDraftPickFloats)), a row's
+// candidates laid out where its rough scores were ([cap] indices, [cap] exact scores, the count): select the `want`
+// best per row with their ties (kDraftCands in kDraftCandCap; more in a wider layout, as draft_pick takes them),
+// score survivors against any bf16 matrix (overwrite or accumulate + bias + softcap), combine a packed dots_blocks
+// candidate vector + bias + softcap, and pick top-k with prob/margin.
+void draft_select_cands(float* rough, int ld, int V, int rows, const Launch& L, int want = kDraftCands,
+                        int cap = kDraftCandCap);
 void draft_score_bf16(const float* x, int ldx, const bf16* W, const float* bias, int K, int rows, float* rough, int ld,
-                      bool accumulate, float softcap, cudaStream_t st);
+                      bool accumulate, float softcap, cudaStream_t st, int cap = kDraftCandCap);
 void draft_combine_cands(const float* add, int ld_add, const float* bias, float softcap, int rows, float* rough, int ld,
                          cudaStream_t st);
 void draft_pick_topk(float* rough, int ld, int rows, int k, int* idx, float* val, cudaStream_t st,
-                     float* prob = nullptr, float* margin = nullptr);
+                     float* prob = nullptr, float* margin = nullptr, const DevParams* P = nullptr, int pos_add = 0,
+                     const DevGen* G = nullptr, int cap = kDraftCandCap);
+// k past kDraftCands (a wide walk's, up to kWalkMax): that many candidates scored exactly, as far as the rows' room
+// allows.
 void draft_pick(const float* x, int ldx, const SignHead& h, const bf16* W, int V, int K, int rows, int k, int* idx,
                 float* val, float* rough, const Launch& L, bool exact_1row = false, float* prob = nullptr,
                 float* margin = nullptr);
@@ -1024,10 +1092,17 @@ bool attention_flash_gqa_cfg(int hb, const float* q, KvRef kv, int nh, int nkv, 
 // every position, each row's StrataScratch::how pairs most attended to replaced by the cache's own values (kv.k / kv.v,
 // FP8 or binary16, in device or host memory).  The shapes strata_supported names; `partial` as attention_split's.
 // Only the rows at position `from` or past it are written (the others are exact attention's).
+// Optional relative-position bias table and per-query virtual sink for Strata attention (Inkling-2 Global layers).
+struct RelStrata {
+  const float* btab = nullptr;  // [rows, nh, extent] precomputed rel_bias @ r_q
+  int extent = 0;               // bias table extent (dist >= extent adds 0)
+  const float* sink = nullptr;  // [rows, ld_sink] per-query virtual sink logit
+  int ld_sink = 0;
+};
 void attention_strata(const float* q, KvRef kv, const StrataScratch& scratch, int nh, int nkv, int hd, int rows,
                       float scale, const DevParams* P, const float* gate, int ld_gate, float* out, int ld_out,
                       float* partial, int slots, const Launch& L, int from = 0, cudaEvent_t second_ready = nullptr,
-                      const DevParams* P_hot = nullptr);
+                      const DevParams* P_hot = nullptr, RelStrata rel = {});
 bool strata_supported(int nh, int nkv, int hd, int bits);
 int strata_words(int hd, int bits);  // 32-bit words of codes a position and head (StrataLayout)
 
@@ -1181,6 +1256,10 @@ void argmax_rows(const float* logits, int ld, int V, int* out, int rows, float* 
 void choose_rows(const float* logits, int ld, int V, int rows, const DevParams* P, int base_add, const DevGen* G,
                  const uint32_t* mask, float* cz, int* ci, float* scratch, int* iscratch, int* out, cudaStream_t st,
                  const TreeRows* tree = nullptr, int tree_from = 0);
+// Sampling-only half of choose_rows (no-op when G->temperature <= 0; used by DSpark's full-vocab fallback path).
+void sample_rows(const float* logits, int ld, int V, int rows, const DevParams* P, int base_add, const DevGen* G,
+                 const uint32_t* mask, float* cz, int* ci, int* out, cudaStream_t st,
+                 const TreeRows* tree = nullptr, int tree_from = 0);
 // tree: row r samples position P->position + base_add + depth - tree_from, its depth the tree's row tree_from + r's
 // (a wide round's 16 rows at a time from row tree_from, base_add = tree_from + 1).
 // The penalties of ops/sampling/sampling.h, in place and before choose_rows:
@@ -1192,9 +1271,9 @@ void penalize_rows(float* logits, int ld, int V, int rows, const DevGen* G, Repl
                    cudaStream_t st, const TreeRows* tree = nullptr, int tree_from = 0);
 // tree: a row's drafts before it: its ancestors.  tree_from: logits row r is the round's row tree_from + r (a wide
 // round's 16 rows at a time).
-// Top-k per row, sorted high to low (lowest index on ties).  k <= 16.  With part buffers of kTopkParts * 16 entries a
-// row for up to part_rows rows: each row's slices in parallel, then their candidates merged (the same top-k: the
-// order is total); else one block a row.
+// Top-k per row, sorted high to low (lowest index on ties).  k <= kWalkMax.  k <= 16: with part buffers of
+// kTopkParts * 16 entries a row for up to part_rows rows, each row's slices in parallel, then their candidates merged
+// (the same top-k: the order is total); else one block a row.  k > 16: a radix select a block a row.
 constexpr int kTopkParts = 24;
 void topk_rows(const float* logits, int ld, int V, int k, int* idx, float* val, int rows, cudaStream_t st,
                float* part_v = nullptr, int* part_i = nullptr, int part_rows = 0, float* prob = nullptr,
@@ -1203,21 +1282,26 @@ void topk_rows(const float* logits, int ld, int V, int k, int* idx, float* val, 
 //   y (=|+=) conv(x) with coef[t][c] = base[t][c] + delta[r][t][c / group]
 void grouped_conv(const float* x, int ldx, const float* delta, int ld_delta, const float* base, int H, int taps,
                   int group, float* y, int ldy, int rows, bool accumulate, cudaStream_t st);
-// Greedy candidate walk; writes `width` drafts.  Uses oracle tokens when P->oracle_len > 0.
+// Candidate walk over k <= kWalkMax candidates a row; writes `width` drafts.  Uses oracle tokens when
+// P->oracle_len > 0.  With G sampling (temperature > 0), each step takes the best ops::coupled_draft_score: the draft
+// at position P->position + 1 + s coupled to the target's noise there; else the best score.
 void selector_walk(const DevParams* P, const int* cand, const float* unary, int k, const float* hid, int rank,
-                   const bf16* pred, const bf16* succ, int width, const int* oracle, int* drafts, cudaStream_t st);
-// The candidates as a tree of `width` drafts, best first by the selector's scores (ops/draft/ref.h), candidates at
-// `depths` positions: drafts and the round's TreeRows.  The oracle tokens as a chain when P->oracle_len > 0.
+                   const bf16* pred, const bf16* succ, int width, const int* oracle, int* drafts, cudaStream_t st,
+                   float softcap, int softcap_mode, const DevGen* G);
+// The candidates (k <= kWalkMax a position) as a tree of `width` drafts, best first by the selector's scores
+// (ops/draft/ref.h), candidates at `depths` positions: drafts and the round's TreeRows.  Its trunk is the walk's
+// chain (selector_walk; sampling, the coupled choices).  The oracle tokens as a chain when P->oracle_len > 0.
 void selector_tree(const DevParams* P, const int* cand, const float* unary, int k, const float* hid, int rank,
                    const bf16* pred, const bf16* succ, int width, int depths, const int* oracle, int* drafts,
-                   TreeRows* tree, cudaStream_t st);
+                   TreeRows* tree, cudaStream_t st, float softcap, int softcap_mode, const DevGen* G);
 // Copy rows of x into feats at column block `slot` (taps).
 void tap_copy(const float* x, int H, float* feats, int ld_feats, int slot, int rows, cudaStream_t st);
 void tap_copy(const bf16* x, int H, float* feats, int ld_feats, int slot, int rows, cudaStream_t st);
-// Draft context K/V: kv rows [rows, layers * 2 * nkv * hd] = per layer [k | v]; k -> rmsnorm -> rope -> dK[layer][pos].
+// Draft context K/V: kv rows [rows, layers * 2 * nkv * hd] = per layer [k | v]; k -> rmsnorm -> rope -> dK[layer][slot].
+// ring > 0: slot = pos % ring (sliding-window DFlash2 context ring; rotary still uses logical pos).
 void draft_ctx_kv(const float* kv, int ld, const float* k_norms, float eps, double theta, int layers, int nkv, int hd,
                   int rows, const DevParams* P, int pos_sel, bool skip_if_noop, kv16* dK, kv16* dV,
-                  size_t layer_stride, cudaStream_t st);
+                  size_t layer_stride, cudaStream_t st, int ring = 0);
 // Compare drafts with choices, advance P, write the ring entry.  With a
 // penalty in G the tokens emitted are counted in `reply`.
 void accept(DevParams* P, const DevGen* G, const int* drafts, const int* choice, int width,
@@ -1347,6 +1431,11 @@ void hring_put(const DevParams* P, int pos_sel, bool skip_if_noop, const float* 
                int H, cudaStream_t st);
 // Test hook: mtok[step + 1] = oracle[P->position + 1 + step] when P->oracle_len > 0.
 void mtp_oracle(const DevParams* P, const int* oracle, int step, int* mtok, cudaStream_t st);
+// Draft step `step`'s token, mtok[step + 1], from the head's k best (k <= min(ops::kMtpCands, vocab); cand, val: best
+// first): ops::draft_choice with the reply's penalties (reply_count and the drafts before it), G's sampling and the
+// noise at the draft's position P->position + 1 + step; a candidate outside [0, vocab) is read as none.
+void mtp_choose(const DevParams* P, const DevGen* G, const int* reply_count, const int* cand, const float* val, int k,
+                int vocab, int step, int* mtok, cudaStream_t st);
 // A round's given drafts: drafts[i] = oracle[P->position + 1 + i] (0 past P->oracle_len), i < width.
 // dst = *P with its position add further on: a wide round's rows a..a+15 run as the round's rows 0..15 of a pass
 // at P->position + a (attention_strata takes up to FLYX_MAX_ROWS rows).
@@ -1379,6 +1468,11 @@ void kv_stage_ring(const void* k, void* vk, const void* v, void* vv, size_t row,
 // tail ring into its mapped pinned drain slot (P->seq_no % kRing).
 void kv_drain_pageable(const PageDrainLayer* layers, int n_layers, const DevParams* P, const flyx_round_result* ring_dev,
                        int max_rows, cudaStream_t st);
+// The pass's entry of the result ring [kRing] (P->seq_no % kRing, where new_entry wrote it) to its pinned host mirror
+// (`host`: the mirror's mapped device address), stored by a kernel and fenced for the host: the last node of a round,
+// which a copy node would start only some time after.  The other entries stay as they are: the host may be reading the
+// entry before (two passes in flight).
+void ring_publish(const flyx_round_result* ring, flyx_round_result* host, const DevParams* P, cudaStream_t st);
 
 // After a prefill chunk: advance the position; optionally set the anchor from
 // choice[0] and emit it (counted in `reply` when G has a penalty).
@@ -1407,6 +1501,10 @@ void rmsnorm_split(const float* x, int ldx, const float* w, float offset, float 
 // The same of bf16 rows (a prefill pass's bf16 residual), more than 16 rows.
 void rmsnorm_split(const bf16* x, int ldx, const float* w, float offset, float eps, int rows, int n, const Launch& L,
                    bool q8 = false);
+// A round's 1..16 rows (n % 32 == 0) for two GEMMs that read them in different forms, in one launch: in 8 bits
+// (rmsnorm_split's q8 rows) and as the skinny GEMM's three bf16 parts, which lie apart in the scratch.
+void rmsnorm_q8_split(const float* x, int ldx, const float* w, float offset, float eps, int rows, int n,
+                      const Launch& L);
 // An MLP's adapters' second products on gate and up (lora_up's, the same bits) taken by the SwiGLU as it reads them:
 // u [rows][ldu] (gate's at 0, up's at rank, unscaled), gate and up their b's [I, rank].  rank 0: none.
 struct LoraGlu {
@@ -1507,13 +1605,14 @@ void gemm_w4a4(const uint8_t* Aq, const uint8_t* As, const float* Ar, const uint
 struct DevStopState {
   float survival;
   int32_t decision;
+  int32_t verify_bucket;
 };
 struct StopCondHandles {
   unsigned long long h[FLYX_MAX_STOP_BUCKETS];
 };
 void stop_decide_step(const float* prob, const float* margin, const flyx_stop_policy* pol, DevStopState* state,
-                      int bucket, int prev_w, int cur_w, unsigned long long h_next_draft, unsigned long long h_ver,
-                      cudaStream_t st);
+                      int bucket, int cur_w, unsigned long long h_next_draft, StopCondHandles h_ver,
+                      bool earlier_prefix, cudaStream_t st);
 void stop_decide_block(const float* prob, const float* margin, const flyx_stop_policy* pol, DevStopState* state,
                        StopCondHandles h_ver, cudaStream_t st);
 
@@ -1552,5 +1651,266 @@ void vision_avg_pool_blocks(const float* x, int n_blocks, int group, int hidden,
 // Overwrite selected rows embed_rows[i] of x (float32) or x16 (bf16) with embeds[i * H .. (i + 1) * H).
 void embed_scatter(float* x, bf16* x16, int H, const float* embeds, const int32_t* embed_rows, int n_embeds,
                    cudaStream_t st);
+
+// ---- Inkling-2 target ops (inkling2.cu, moe.cu) ---------------------------------------------
+// The kernels' hard limits, which a load checks before it allocates (kernel_limits): the experts a MoE row routes to
+// (moe_route's top list) and those it chooses among (their scores in its shared memory), and the states an AttnRes
+// mix reads, the bank's blocks and the current one (attn_res_mix, shortconv_res_mix_norm).
+constexpr int kMoeRouteMaxTopK = 64, kMoeRouteMaxExperts = 4096, kAttnResMaxStates = 64;
+// In-place logit softcapping: z = cap * tanh(z / cap) for finite z (leaves -inf untouched for head_cert).
+void softcap_rows(float* logits, int ld, int V, int rows, float cap, cudaStream_t st);
+
+// Block Attention Residuals depth-wise mixing (ops/attnres/ref.h):
+//   bank [n_blocks, rows, H] (may be null when n_blocks == 0), cur [rows, H], queries [n_queries, H]
+//   -> out [n_queries, rows, H] (query-major so each query's output is contiguous [rows, H]).
+void attn_res_mix(const float* bank, int n_blocks, const float* cur, const float* queries, int n_queries, int rows,
+                  int H, float* out, cudaStream_t st);
+
+// Cross-pass loop gate controller prep and apply (ops/attnres/ref.h):
+//   prep:  cat_out [rows, 2*H] = [rmsnorm(cur, 1e-6) | rmsnorm(msg, 1e-6)]
+//   apply: out [rows, H] = cur - tanh(forget) * cur + tanh(gain) * msg  (out may alias cur)
+//   apply_norm: fused prefill apply + downstream rmsnorm -> y (exact k_rmsnorm 512-thread sum order)
+void loop_ctrl_prep(const float* cur, const float* msg, int rows, int H, float* cat_out, cudaStream_t st);
+void loop_ctrl_apply(const float* cur, const float* msg, const float* gain, int ld_gain, const float* forget,
+                     int ld_forget, int rows, int H, float* out, cudaStream_t st);
+void loop_ctrl_apply_norm(const float* cur, const float* msg, const float* gain, int ld_gain, const float* forget,
+                          int ld_forget, const float* norm_w, float norm_offset, float norm_eps, int rows, int H,
+                          float* y, int ldy, cudaStream_t st);
+// A row-major matrix for a float32 dot product. Exactly one pointer is set on a bound weight.
+// b16 holds the high words when every float32 value in the matrix has a zero low word.
+struct RoundWeight {
+  const float* f32 = nullptr;
+  const bf16* b16 = nullptr;
+};
+// The same controllers as rounds run them (ops/attnres/ref.h loop_control): up to kLoopGates of them over the same
+// rows in two launches (an attention block's q, k and v at once), with float32 inputs, weights and sums:
+//   gate = down . [rmsnorm(cur, 1e-6) | rmsnorm(msg, 1e-6)]            [rank]
+//   out  = cur - tanh(forget . gate) * cur + tanh(gain . gate) * msg   [H]
+// A gate output is a block of 256 threads, each its inputs 256 apart in order, then the block's tree (cur's half and
+// msg's half apart, each times its norm's scale); an output a warp, its lanes 32 of the rank apart, then their tree.
+// A row has the same bits whatever rows and controllers run with it.  out may be its own controller's cur; no
+// controller's out may be another's cur or msg.
+constexpr int kLoopGates = 3;
+struct LoopGate {
+  const float *cur = nullptr, *msg = nullptr;  // [rows][H]
+  RoundWeight down, gain, forget;              // [rank][2 H], [H][rank], [H][rank]
+  float* out = nullptr;                        // [rows][H]
+};
+// Floats of scratch a row of one controller takes: the down projection's two half sums an output, the two norms'
+// sums of squares.
+__host__ __device__ constexpr size_t loop_row_floats(int rank) { return 2 * size_t(rank) + 2; }
+// scratch: n * rows * loop_row_floats(rank) floats.
+void loop_control(const LoopGate* g, int n, int rows, int H, int rank, float* scratch, cudaStream_t st);
+// y[r][n] (+)= sum_k W[n][k] x[r][k] with the exact float32 values of W [N][K] (a sparse MoE's router, an
+// attention sink, a dynamic-tap projection, as rounds run them): an output a warp, its lanes 32 values of K apart in
+// order, then their tree.  A row has the same bits whatever rows run with it.
+void linear_f32(const float* x, int ldx, RoundWeight W, int N, int K, float* y, int ldy, int rows, bool accumulate,
+                cudaStream_t st);
+
+// Causal depthwise short convolution with residual scaling and optional per-head dynamic taps (ops/shortconv/ref.h).
+// win: [FLYX_ROUND_SLOTS][conv - 1][ch_total]; replay (rounds): [kGdnReplaySlots][replay_rows][ch_total].
+// res_src (optional, when accumulate=true): read the residual to add from res_src instead of out (for ping-pong flush).
+struct ShortConvLayer {
+  float* win;
+  float* replay;
+};
+void shortconv_pass(const float* x, int ldx, const float* w, const float* dyn, float* win, size_t win_stride,
+                    int in_sel, int next_sel, int skip, float* replay, size_t replay_stride, int replay_sel,
+                    int ch_off, int ch_total, int C, int conv, int n_heads, const DevParams* P, int rows, float* out,
+                    int ldo, cudaStream_t st, bool accumulate = false, const float* res_src = nullptr);
+void shortconv_fold(const ShortConvLayer* layers, int n, size_t win_stride, size_t replay_stride, int in_sel,
+                    int out_sel, int replay_sel, int channels, int conv, const DevParams* P, int rows,
+                    const int* rows_dev, bool skip_if_noop, cudaStream_t st);
+
+// Optional fused K/V ShortConv parameters for rel_attn_prep in rounds (replaces 2 separate shortconv_pass launches).
+struct KvShortConv {
+  const float *k_w = nullptr, *v_w = nullptr;      // [kv_dim][conv]
+  const float *k_dyn = nullptr, *v_dyn = nullptr;  // [rows][nkv][conv] (null for SWA)
+  float* win = nullptr;
+  size_t win_stride = 0;
+  int in_sel = 0, next_sel = -1, skip = 0;
+  float* replay = nullptr;
+  size_t replay_stride = 0;
+  int replay_sel = 0;
+  int ch_total = 0, conv = 0;
+};
+
+// Fused Inkling-2 sublayer boundary for rounds (1..16 rows, H <= 5120):
+// shortconv_pass(post_raw) + residual update (+ optional res_push to bank) + attn_res_mix (+ optional rmsnorm).
+// Runs 1 block (512 threads) per row (zero redundant ShortConv/bank reads), bit-identical to
+// separate shortconv_pass + res_push + attn_res_mix + rmsnorm(_q8_split / _moe_q8).
+struct SublayerPostConv {
+  const float* post_raw = nullptr;
+  const float* conv_w = nullptr;
+  float* win = nullptr;
+  size_t win_stride = 0;
+  int in_sel = 0, next_sel = -1, skip = 0;
+  float* replay = nullptr;
+  size_t replay_stride = 0;
+  int replay_sel = 0;
+  int ch_off = 0, ch_total = 0, conv = 0;
+  bool res_push = false;
+};
+enum class SublayerNorm { None, F32, MoeQ8, AttnQ8Split };
+struct MoeScratch;
+void shortconv_res_mix_norm(const SublayerPostConv& sc, const float* x_src, float* x_dst, float* bank, int n_blocks,
+                            const float* queries, int n_queries, float* mix_out, SublayerNorm norm_mode,
+                            const float* norm_w, float norm_offset, float norm_eps, float* norm_y, int ldy,
+                            const MoeScratch* msc, bool moe_mins, const DevParams* P, int rows, int H,
+                            const Launch& L);
+
+// Relative-position-bias attention prep & attention (ops/attention/ref.h: l2_clip, log_pos_scale, attend_rel).
+// prep: clips Q (with q_clip_w) and R (with r_clip_w), applies global log_pos_scale tau to Q & R, clips K,
+// no-gamma RMSNorms V, and writes K/V to kv.slot_of(pos) (supports ring KV, binary16/FP8, and Strata low-bit copy).
+void rel_attn_prep(const float* q_in, int ldq, const float* k_in, int ldk, const float* v_in, int ldv,
+                   const float* r_in, int ldr, const float* q_clip_w, const float* r_clip_w, float qk_clip,
+                   float rel_clip, float v_eps, int log_floor, float log_alpha, int nh, int nkv, int hd, int d_rel,
+                   int rows, const DevParams* P, int pos_sel, bool is_swa, float* q_out, float* r_out, KvRef kv,
+                   cudaStream_t st, int pos_add = 0, int strata_base = 0, const KvShortConv* kv_sc = nullptr);
+// Precompute relative-position bias table out[r, h, dist] = dot(rel_bias[dist], r_q[r, h]) for Strata attention.
+void rel_bias_table(const float* r_q, const float* rel_bias, int nh, int d_rel, int rel_extent, int rows, float* out,
+                    cudaStream_t st);
+// Prefill window state for windowed host-RAM staged rel_attention (mirrors FlashWindow).
+struct RelWindow {
+  int k_lo = 0, k_hi = INT_MAX;
+  float* state = nullptr;  // [rows][nh][kFlashStateFloats(hd)]: M, L, A[hd] carried across windows
+  bool first = true, last = true;
+};
+// Causal relative-position-bias attention with per-query sink, virtual 0 sink, optional sliding window & ring KV,
+// optional prefill key windowing, and optional sigmoid(gate) multiply. out == nullptr writes fused split_out.
+// q8 (a round's 1..16 rows, out == nullptr, no window state): the outputs in 8 bits where the output projection
+// reads them, a warp a group of 32 within a head, not as bf16 parts.
+void rel_attention(const float* q, const float* r, KvRef kv, const float* rel_bias, const float* sink, int ld_sink,
+                   const float* gate, int ld_gate, int nh, int nkv, int hd, int d_rel, int rel_extent, int window,
+                   int rows, const DevParams* P, float* out, int ld_out, float* partial, int splits, const Launch& L,
+                   int pos_add = 0, const RelWindow& win = {}, bool q8 = false);
+
+// Sparse MoE routing, SiTU activation, and row-independent expert GEMMs (ops/moe/ref.h, ops/activation/ref.h).
+struct ExpertMat {
+  int n_experts = 0;
+  int N = 0;
+  const bf16* w = nullptr;
+  const uint8_t* q = nullptr;
+  const uint8_t* s = nullptr;
+  const float* rs = nullptr;  // [n_experts] per-expert F32 scale
+  BlockMat blk{};             // packed GGML blocks, rows = n_experts * N
+  bool packed() const { return blk.data != nullptr; }
+};
+struct MoeTask {
+  int expert;  // expert index in [0, n_experts)
+  int p0;      // starting index in pairs[]
+  int nb;      // count of pairs in this tile (1..BM)
+};
+struct MoeScratch {
+  int* pairs = nullptr;        // [chunk_rows * max_top_k]
+  MoeTask* tasks = nullptr;    // [chunk_rows * max_top_k] (compacted per-expert BM-row tiles)
+  int* n_tasks = nullptr;      // [1]
+  float* down_buf = nullptr;   // [chunk_rows * max_top_k * H]
+  // Pre-staged activations (q8_* and bf16_a alias one buffer sized for stage_elems).
+  int8_t* q8_a = nullptr;      // [stage_elems]
+  float* q8_d = nullptr;       // [stage_elems / 32]
+  float* q8_s = nullptr;       // [stage_elems / 16]
+  bf16* bf16_a = nullptr;      // [stage_elems]
+  size_t stage_elems = 0;
+  int chunk_rows = 0;
+  int max_experts = 0;
+  int max_top_k = 0;
+};
+// The rows of x in 8 bits where the expert GEMMs on packed blocks read them (sc.q8_a): a scale per 32 values and
+// the integers in place, not in round_q8_at's order; mins: also the scale times the sum of each 16 integers, which
+// a format with minima takes (moe_q8_mins).
+void moe_stage_q8(const float* x, int ldx, int K, int rows, const MoeScratch& sc, bool mins, cudaStream_t st);
+// A round's norm before a sparse MoE for both its readers at once (1..16 rows, n % 32 == 0): the float32 rows the
+// router reads (y), rmsnorm's bits, and what moe_stage_q8 makes of them for the gate|up GEMM.
+void rmsnorm_moe_q8(const float* x, int ldx, const float* w, float offset, float eps, float* y, int ldy, int rows,
+                    int n, const MoeScratch& sc, bool mins, cudaStream_t st);
+// Scores of the experts for the first row of x. The caller orders the input lifetime independently of the L2 reads.
+void moe_guess_scores(const float* x, const float* norm_w, float norm_offset, const bf16* router_b16,
+                      const float* router_f32, const float* bias, bool sigmoid, int E, int H, float* scores,
+                      cudaStream_t st);
+// Prefetch only immutable expert planes from private scores. Negative planes selects all top_k;
+// otherwise the bits choose gate/up codes/scales and down codes/scales for the guess_k best-scored experts
+// (KernelOptions::guess_k; 0 or less: all top_k).
+void moe_prefetch(const float* scores, int E, int top_k, int H, int I, const ExpertMat& gu, const ExpertMat& down,
+                  int planes, int guess_k, cudaStream_t st);
+// Byte ranges for L2 (l2_warm): asks L2 for them on st and returns; changes no result.
+struct L2Ranges {
+  const void* p[8] = {};
+  size_t n[8] = {};
+  int count = 0;
+  void add(const void* ptr, size_t bytes) {
+    if (ptr && bytes && count < 8) p[count] = ptr, n[count++] = bytes;
+  }
+};
+void l2_warm(const L2Ranges& r, cudaStream_t st);
+void moe_route(const float* logits, const float* bias, int rows, int n_experts, int top_k, bool gating_sigmoid,
+               bool norm_weights, float norm_eps, float route_scale, int* idx_out, float* w_out, const Launch& L);
+void situ_rows(const float* gu, int ld_gu, int I, float beta, float linear_beta, float* out, int ld_out, int rows,
+               cudaStream_t st);
+// The staged packed expert dp4a GEMMs' configurations (variants/candidates.toml, moe_dp4a), all with the same bits:
+// output columns a warp (gate/up pairs where the activation is fused) and K/32 units a lane has in flight; columns 0
+// and units 0, the original tiles, which every block type compiles (kMoeDp4aTypes compile the others).  _name:
+// "original" or "<columns>x<units>"; _compiled: whether this build compiles configuration `cfg` for block type
+// `dtype`, op kind (`fused_gate_up`) and row band (`rows == 1` vs `rows > 1`) on the loaded device architecture (with
+// FLYX_TUNE_CANDIDATES every one of kMoeDp4aTypes for all ops/rows, else the fused gate|up rules reached on this
+// architecture); moe_gate_up_dp4a: the configuration the rules (moe_gate_up) give a fused gate|up GEMM of `rows` rows
+// of block type `dtype` on a GPU of tuning table `tuning`.  Down GEMMs and unfused projections take the original
+// tiles, unless KernelOptions::moe_dp4a says otherwise.
+struct MoeDp4aConfig {
+  int columns, units;
+};
+extern const MoeDp4aConfig kMoeDp4aConfigs[];
+extern const int kMoeDp4aConfigCount;
+const char* moe_dp4a_name(int cfg);
+bool moe_dp4a_compiled(int dtype, int cfg, bool fused_gate_up = true, int rows = 2);
+int moe_gate_up_dp4a(int tuning, int dtype, int rows);
+// What one of a fused round's MoE kernels may leave for the next without a staging launch between them, the
+// round's 1..16 rows in one chunk of the scratch.  moe_round_q8: the gate|up GEMM on W reads rows staged in 8 bits
+// (q8_ready below: staged already, by rmsnorm_moe_q8); moe_round_bf16_down: the NVFP4 down GEMM in MMA mode (L's
+// options without moe_vec) reads bf16 rows (act_bf16 below: where the gate|up GEMM wrote them).
+bool moe_q8_mins(const ExpertMat& W);
+bool moe_round_q8(const ExpertMat& W, int rows, int top_k, int K, const MoeScratch* sc);
+bool moe_round_bf16_down(const ExpertMat& W, int rows, int top_k, int K, const MoeScratch* sc, const Launch& L);
+// gate_up over selected experts eidx [rows, top_k]: fuse_act=false writes [rows*top_k, 2*I];
+// fuse_act=true applies SiTU/SwiGLU in registers and writes [rows*top_k, I] (bit-identical to unfused + situ_rows).
+// act_bf16 (with fuse_act and moe_round_q8): the activations there in bf16, each rounded to nearest as staging
+// rounds it, not in out; storage of its own, as sc->bf16_a lies over the 8-bit rows this GEMM is reading.
+// Returns the rows a work tile holds of the grouping by expert it leaves in sc for all `rows` at once (0: none),
+// what moe_down takes as `grouped` for the same eidx and rows.
+int moe_gate_up(const float* x, int ldx, const ExpertMat& W, const int* eidx, int rows, int top_k, int I, int K,
+                float situ_beta, float situ_linear_beta, bool fuse_act, float* out, int ld_out, const MoeScratch* sc,
+                const Launch& L, bool q8_ready = false, bf16* act_bf16 = nullptr);
+// Weighted down-projection: out[r, n] (=|+=) sum_{k=0..top_k-1} ew[r, k] * down_{eidx[r, k]}(act[r * top_k + k])[n].
+// act_bf16 (with moe_round_bf16_down): its input [rows*top_k, K] in bf16 already, read in place of act.
+// grouped: moe_gate_up's return for these eidx and rows, sc untouched since; its work tiles are taken where they are
+// the ones this GEMM would group (0: group them here).
+void moe_down(const float* act, int ld_act, const ExpertMat& W, const int* eidx, const float* ew, int rows, int top_k,
+              int H, int K, float* out, int ld_out, bool accumulate, const MoeScratch* sc, const Launch& L,
+              const bf16* act_bf16 = nullptr, int grouped = 0);
+
+// ---- DSpark drafter kernels (dspark.cu) -----------------------------------------------------
+// Weighted sum of n_taps tapped features [rows, ld_feats] -> RMSNorm -> out [rows, H].
+void dspark_ctx_mix_norm(const float* feats, int ld_feats, const float* mix, const float* norm_w, float eps, int n_taps,
+                         int rows, int H, float* out, cudaStream_t st);
+// Initialize DSpark draft block: row 0 = rmsnorm(anchor_emb, tok_norm), rows 1..B-1 = mask_embd[0..B-2],
+// *prev_out = P->anchor, state_out[0..markov_rank) = 0.
+void dspark_prep_block(const DevParams* P, const float* anchor_emb, const float* tok_norm_w, float eps,
+                       const float* mask_embd, int B, int H, float* dx, int* prev_out, float* state_out,
+                       int markov_rank, cudaStream_t st);
+// Non-causal block-uniform attention over context [max(0, P->position - window + 1), P->position) plus B block rows.
+void dspark_block_attention(const float* q, const kv16* Kc, const kv16* Vc, int nh, int nkv, int hd, int B, int window,
+                            float scale, const DevParams* P, float* out, int ld_out, float* partial, int splits,
+                            const Launch& L, int ring = 0);
+// Pack Markov RNN input [state (Rk) | w1_row (Rk, untouched if null) | hidden_i (H) | f_rnn (H)] into joint_out.
+void dspark_markov_pack(const DevParams* P, const float* state, const float* w1_row, const float* hidden_i,
+                        const float* hring, int Rk, int H, float* joint_out, cudaStream_t st);
+// Markov RNN gate update: joint = joint_out + joint_bias -> update state [Rk] in place and write markov_out [Rk].
+void dspark_markov_gate(const float* joint_out, const float* joint_bias, int Rk, float* state, float* markov_out,
+                        cudaStream_t st);
+// Combine base + bias + w2_b (nullable), apply optional softcap, write to out (may alias base).
+void dspark_combine_logits(const float* base, const float* bias, const float* w2_b, int V, float softcap, float* out,
+                           cudaStream_t st);
+// Commit step's picked token (or oracle when P->oracle_len > 0) to drafts[step] and prev_tok.
+void dspark_pick_step(const DevParams* P, const int* oracle, int step, int* prev_tok, int* drafts, cudaStream_t st);
 
 }  // namespace flyx::cuda

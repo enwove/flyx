@@ -68,6 +68,7 @@ struct ChatMessage {
   std::optional<std::string> reasoning;  // assistant thinking given separately (reasoning_content)
   std::vector<ToolCall> tool_calls;      // assistant
   std::string tool_call_id;              // tool
+  std::string name;                      // optional tool / assistant name
   // Multimodal content parts (non-empty when a message carries images alongside text).
   // Kept last so existing aggregate initializers for text-only messages remain valid.
   std::vector<ContentPart> parts;
@@ -122,6 +123,10 @@ struct ReplyRules {
   bool parallel = true;   // more than one call in a reply
   bool json = false;      // the answer is JSON matching `schema` (OpenAI response_format)
   ojson schema = true;    // json: true = any JSON value
+  // Whether the request left thinking on (ChatOptions::enable_thinking; the engine sets it for every chat request).
+  // Off, a format whose template cannot keep its model from thinking leaves the thinking out of the reply here
+  // (Inkling-2: its template writes an effort, and the model opens a thinking section at effort none too).
+  bool thinking = true;
 };
 
 // A piece of a reply, as the client sees it.
@@ -167,11 +172,24 @@ class Chat {
   // text): an optional thinking block, then text and tool calls in this
   // format's syntax, each call's arguments fitting its tool's schema, as
   // `rules` allow.  "" when nothing constrains the reply (no tools and no
-  // JSON answer, tool_choice none, or a format without tool calls).
+  // JSON answer, tool_choice none, or a format without tool calls); a format
+  // that can only keep thinking out of a reply with a grammar gives one for
+  // rules.thinking false whatever else is asked (Inkling-2's).
   virtual std::string reply_grammar(const std::vector<ojson>& tools, const ReplyRules& rules,
                                     bool in_reasoning) const {
     return "";
   }
+  // The special tokens a reply in this format is written with, by their text: a format whose section and call
+  // markers are control tokens (Inkling-2's <|message_model|>, <|content_text|>, <|end_message|>).  Where a reply
+  // grammar's delimiter, separator or constant holds that text it takes the token and nothing else, and the token
+  // nowhere else: the same characters in ordinary tokens are text, which a section may quote where its grammar
+  // allows that text, and never a delimiter.  Any other special token a grammar never takes; the model's stop tokens
+  // end a reply and are not named here.  None where the markers are ordinary tokens (<think>, <tool_call>).
+  virtual std::vector<std::string> reply_tokens() const { return {}; }
+  // Template variables that say what the engine's own options say, for a template that has other names for them:
+  // one with a thinking effort and no enable_thinking is given the effort of thinking switched off.  The request's
+  // own variables (ChatOptions::kwargs) come before these.
+  virtual ojson option_variables(const ChatOptions& opt) const { return ojson::object(); }
 
   // A renderer written for exactly this template (selected by its full
   // text): the bytes and literal spans the Jinja engine gives, hundreds of

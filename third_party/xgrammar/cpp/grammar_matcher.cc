@@ -16,6 +16,7 @@
 #include <limits>
 #include <optional>
 #include <string>
+#include <string_view>
 #include <thread>
 #include <unordered_map>
 #include <unordered_set>
@@ -588,6 +589,9 @@ class GrammarMatcher::Impl : public EarleyParser {
    * grammar. The parser state is left unchanged.
    */
   bool CanAcceptStopTokenAsTerminal(int32_t token_id);
+  // flyx: whether an atomic token advances an explicit token edge from here; the parser state is left
+  // unchanged (README.flyx.md).
+  bool CanAcceptExplicitToken(int32_t token_id, bool require_completion = false);
 
   bool IsStopTokenAccepted() const;
 
@@ -643,7 +647,8 @@ class GrammarMatcher::Impl : public EarleyParser {
   bool AdvanceWithCharacterBudget(uint8_t byte, bool debug_print = false);
 
   bool AdvanceAtomicTokenWithCharacterBudget(
-      int32_t token_id, int32_t token_char_count, bool debug_print = false
+      int32_t token_id, int32_t token_char_count, bool debug_print = false,
+      bool explicit_only = false
   );
 
   /*! \brief Whether byte offsets are needed for captures or budgeted suffix/stop rules. */
@@ -827,6 +832,9 @@ bool GrammarMatcher::Impl::AcceptStopToken() {
 }
 
 bool GrammarMatcher::Impl::CanAcceptStopTokenAsTerminal(int32_t token_id) {
+  if (tokenizer_info_->IsAtomicToken(token_id)) {
+    return CanAcceptExplicitToken(token_id, /*require_completion=*/true);
+  }
   const auto& decoded_vocab = tokenizer_info_.GetDecodedVocab();
   if (token_id >= static_cast<int32_t>(decoded_vocab.size())) {
     return false;
@@ -858,6 +866,31 @@ bool GrammarMatcher::Impl::CanAcceptStopTokenAsTerminal(int32_t token_id) {
   bool accepted =
       num_advanced > 0 && num_advanced == static_cast<int>(token.size()) && is_completed_.back();
   PopLastStates(num_advanced);
+  return accepted;
+}
+
+bool GrammarMatcher::Impl::CanAcceptExplicitToken(int32_t token_id, bool require_completion) {
+  if (!grammar_->has_token_edges) return false;
+  if (!has_char_budget_rules_) {
+    if (!AdvanceAtomicToken(token_id, false, 0, /*explicit_only=*/true)) return false;
+    bool accepted = !require_completion || IsCompleted();
+    PopLastStates(1);
+    return accepted;
+  }
+  // Budget enforcement can replace the current row even on a trial. Give it a scratch row,
+  // as in FillBitmaskForCharBudgetBoundary, so querying a marker cannot commit that change.
+  PushStatesToCheck(GetLatestScanableStates(), IsCompleted());
+  auto saved_start = temporary_input_start_row_;
+  auto saved_bytes = std::move(temporary_input_bytes_);
+  temporary_input_start_row_ = scanable_state_history_.size() - 1;
+  temporary_input_bytes_.clear();
+  int32_t chars = 0;
+  for (uint8_t byte : tokenizer_info_.GetDecodedVocab()[token_id]) chars += StartsUTF8Codepoint(byte);
+  bool advanced = AdvanceAtomicTokenWithCharacterBudget(token_id, chars, false, true);
+  bool accepted = advanced && (!require_completion || IsCompleted());
+  PopLastStates(1 + static_cast<int>(advanced));
+  temporary_input_start_row_ = saved_start;
+  temporary_input_bytes_ = std::move(saved_bytes);
   return accepted;
 }
 
@@ -1179,7 +1212,7 @@ bool GrammarMatcher::Impl::AdvanceWithCharacterBudget(uint8_t byte, bool debug_p
 }
 
 bool GrammarMatcher::Impl::AdvanceAtomicTokenWithCharacterBudget(
-    int32_t token_id, int32_t token_char_count, bool debug_print
+    int32_t token_id, int32_t token_char_count, bool debug_print, bool explicit_only
 ) {
   bool has_expired_state = false;
   bool crosses_budget = false;
@@ -1214,7 +1247,7 @@ bool GrammarMatcher::Impl::AdvanceAtomicTokenWithCharacterBudget(
     }
   }
 
-  bool accepted = AdvanceAtomicToken(token_id, debug_print, token_char_count);
+  bool accepted = AdvanceAtomicToken(token_id, debug_print, token_char_count, explicit_only);
   if (!accepted && enforced) {
     scanable_state_history_.PopBack(1);
     scanable_state_history_.PushBack(previous_states);
@@ -1274,8 +1307,11 @@ bool GrammarMatcher::Impl::AcceptToken(int32_t token_id, bool debug_print) {
   bool is_stop_token =
       std::find(stop_token_ids_.begin(), stop_token_ids_.end(), token_id) != stop_token_ids_.end();
   const auto& special_token_ids = tokenizer_info_.GetSpecialTokenIds();
-  if (!is_stop_token && std::find(special_token_ids.begin(), special_token_ids.end(), token_id) !=
-                            special_token_ids.end()) {
+  // flyx: an atomic token advances explicit token edges only, never its bytes (README.flyx.md).
+  const bool explicit_only = tokenizer_info_->IsAtomicToken(token_id);
+  if (!is_stop_token && !explicit_only &&
+      std::find(special_token_ids.begin(), special_token_ids.end(), token_id) !=
+          special_token_ids.end()) {
     // Padding ids, i.e. ids in [decoded_vocab.size(), vocab_size), are registered as special ids
     // too, but they have no entry in decoded_vocab, so only decode ids backed by a real token.
     const auto& decoded_vocab = tokenizer_info_.GetDecodedVocab();
@@ -1402,8 +1438,8 @@ bool GrammarMatcher::Impl::AcceptToken(int32_t token_id, bool debug_print) {
   bool atomic_completed = false;
   bool atomic_success =
       has_char_budget_rules_
-          ? AdvanceAtomicTokenWithCharacterBudget(token_id, token_char_count, debug_print)
-          : AdvanceAtomicToken(token_id, debug_print);
+          ? AdvanceAtomicTokenWithCharacterBudget(token_id, token_char_count, debug_print, explicit_only)
+          : AdvanceAtomicToken(token_id, debug_print, 0, explicit_only);
   if (atomic_success) {
     atomic_states = GetLatestScanableStates();
     auto row = rule_id_to_completable_states_.Back();
@@ -1422,8 +1458,8 @@ bool GrammarMatcher::Impl::AcceptToken(int32_t token_id, bool debug_print) {
     temporary_input_bytes_.clear();
   }
   int pos = 0;
-  bool byte_path_success = true;
-  for (auto char_value : token) {
+  bool byte_path_success = !explicit_only;
+  for (auto char_value : explicit_only ? std::string_view{} : std::string_view(token)) {
     bool accepted = has_char_budget_rules_
                         ? AdvanceWithCharacterBudget(static_cast<uint8_t>(char_value), debug_print)
                         : Advance(static_cast<uint8_t>(char_value), debug_print);
@@ -1476,8 +1512,8 @@ bool GrammarMatcher::Impl::AcceptToken(int32_t token_id, bool debug_print) {
     char_budget_relaxed_ = false;
     bool accepted =
         has_char_budget_rules_
-            ? AdvanceAtomicTokenWithCharacterBudget(token_id, token_char_count, debug_print)
-            : AdvanceAtomicToken(token_id, debug_print);
+            ? AdvanceAtomicTokenWithCharacterBudget(token_id, token_char_count, debug_print, explicit_only)
+            : AdvanceAtomicToken(token_id, debug_print, 0, explicit_only);
     XGRAMMAR_DCHECK(accepted);
     token_length_history.push_back(1);
     if (ShouldTrackAcceptedBytes()) {
@@ -2719,6 +2755,10 @@ void GrammarMatcher::Impl::SetTokenBitmask(
         next_token_bitset.Set(id, false);
       }
     }
+  }
+  // flyx: atomic tokens are absent from the byte vocabulary and all its cached masks.
+  for (int32_t id : tokenizer_info_->GetAtomicTokenIds()) {
+    next_token_bitset.Set(id, CanAcceptExplicitToken(id));
   }
   // Overridden stop tokens can occur in the compiler's accepted token set.
   // Apply their policy after constructing either mask representation: a stop signal is allowed

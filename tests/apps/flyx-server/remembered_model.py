@@ -6,47 +6,12 @@ import json
 import os
 from pathlib import Path
 import shutil
-import socket
-import subprocess
 import sys
 import tempfile
 import time
-from urllib.error import URLError
 from urllib.request import Request, urlopen
 
-
-def serve(exe, cwd, env, model=(), on_ready=None, *, ctx=128, options=(), expect_name="test model"):
-    with socket.socket() as sock:
-        sock.bind(("127.0.0.1", 0))
-        port = sock.getsockname()[1]
-    command = [exe, "serve", *model, "--backend", "cpu_ref", "--ctx", str(ctx), "--port", str(port),
-               "--no-monitor", "--no-browser", *options]
-    server = subprocess.Popen(command, cwd=cwd, env=env)
-    try:
-        deadline = time.monotonic() + 30
-        while server.poll() is None and time.monotonic() < deadline:
-            try:
-                with urlopen(f"http://127.0.0.1:{port}/health", timeout=1) as reply:
-                    health = json.load(reply)
-                if health.get("loaded"):
-                    assert health["model"] == expect_name, health
-                    break
-                if health.get("load") == "failed":
-                    raise RuntimeError(f"model not restored: {health}")
-            except (URLError, TimeoutError):
-                pass
-            time.sleep(0.1)
-        else:
-            raise RuntimeError(f"server did not load the model (exit {server.poll()})")
-        if on_ready:
-            on_ready(f"http://127.0.0.1:{port}")
-    finally:
-        server.terminate()
-        try:
-            server.wait(timeout=10)
-        except subprocess.TimeoutExpired:
-            server.kill()
-            server.wait()
+from local_server import serve, server_env  # serve: also this module's, for the tests that import it from here
 
 
 def slow_settings(origin, settings):
@@ -90,8 +55,7 @@ if __name__ == "__main__":
     with tempfile.TemporaryDirectory() as tmp:
         root = Path(tmp)
         config = root / "settings"
-        env = dict(os.environ, APPDATA=str(config), XDG_CONFIG_HOME=str(config),
-                   FLYX_BACKEND_DIR=str(exe.parent))
+        env = server_env(config, exe)
         model = root / "models with spaces" / "test model.FLYX"
         model.parent.mkdir()
         shutil.copyfile(asset, model)

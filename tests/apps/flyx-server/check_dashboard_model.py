@@ -64,14 +64,20 @@ def dir_model(folder, file, size, kind="gguf", quant=None):
             "path": folder + "\\" + file, "size": size, "modified": 1.7e9, "revision": None, "current": True, "mtp": None}
 
 
+LOCAL_DRAFTER = dict(dir_model(FOLDER, "helper.gguf", int(0.3 * GB), kind="drafter"), drafter_kind="dflash2")
 CATALOG = {"cache": CACHE, "cache_from": "default", "dirs": [FOLDER], "models": [
     hub_model(REPO, "Q4_K_M", int(17.6 * GB), "in-file", mmproj="in-repo"),
     hub_model(REPO, "IQ3_XXS", int(11.8 * GB), "in-repo", mmproj="in-repo"),
     hub_model("acme/Tiny-4B-GGUF", "Q8_0", int(4.5 * GB), None, False),
     dir_model(FOLDER, "tiny-bf16.flyx", int(0.4 * GB), "flyx"),
     dir_model(FOLDER, "Other-12B-Q5_K_M.gguf", int(8.9 * GB), quant="Q5_K_M"),
+    LOCAL_DRAFTER,
     dir_model(FOLDER, "mmproj-BF16.gguf", int(0.9 * GB), kind="mmproj"),
-    {"name": "acme/Tiny-27B-DFlash2", "kind": "drafter", "source": "hub", "repo": "acme/Tiny-27B-DFlash2", "size": int(1.9 * GB)}]}
+    {"name": "acme/Tiny-27B-DFlash2", "kind": "drafter", "drafter_kind": "dflash2", "source": "hub", "repo": "acme/Tiny-27B-DFlash2", "size": int(1.9 * GB)},
+    {"name": "acme/Model-DFlash2-GGUF:BF16", "kind": "drafter", "drafter_kind": "dflash2", "source": "hub",
+     "repo": "acme/Model-DFlash2-GGUF", "quant": "BF16", "file": "Model-DFlash2-Draft-BF16.gguf",
+     "path": CACHE + "\\Model-DFlash2-Draft-BF16.gguf", "size": int(1.0 * GB), "modified": 1.7e9,
+     "revision": "def456", "current": True, "mtp": None, "mmproj": None}]}
 FOUND = {"query": "", "family": True, "architectures": ["qwen35", "qwen3", "inkling2_loop"], "arch": None,
          "endpoint": "https://huggingface.co", "next_cursor": "page2-tok", "models": [
     {"id": REPO, "downloads": 7383193, "likes": 6300, "updated": "2026-11-12T02:15:52.000Z", "created": None, "pipeline": None,
@@ -86,28 +92,41 @@ FOUND_PAGE2 = {"query": "", "family": True, "architectures": ["qwen35", "qwen3",
      "pipeline": "text-generation", "gated": False, "cached": False, "architecture": "qwen3", "runs": True}]}
 
 
-def repository(repo):
+# What GET /v1/hub/drafter says of the drafters the checks type in.
+DRAFTER_KINDS = {"./another.gguf": "mtp", "./new-mtp.gguf": "mtp", "./drafts/Speedy": "dspark"}
+
+
+def repository(repo, helper_cached=False):
     """GET /v1/hub/files: REPO as this build runs it, a dflash GGUF drafter repo, a safetensors drafter repo, or unsupported."""
     if repo == "acme/Model-DFlash2-GGUF":
         return {"repo": repo, "from_cache": False, "drafter": None, "drafter_repo": True, "base_models": ["acme/Tiny-27B"],
                 "runs": True, "known_drafters": [], "build_architectures": ["qwen35", "qwen3"],
                 "mtp": None, "mmproj": None, "ggufs": [],
-                "companions": [{"name": repo + ":Model-DFlash2-Draft-BF16.gguf", "path": "Model-DFlash2-Draft-BF16.gguf",
-                                "file": "Model-DFlash2-Draft-BF16.gguf", "kind": "dflash2",
-                                "size": int(0.5 * GB), "cached": False, "disk": None, "default": True}],
+                "companions": [{"name": repo + ":helper.gguf", "path": "helper.gguf",
+                                "file": "helper.gguf", "kind": "dspark" if helper_cached else "drafter",
+                                "drafter_kind": "dspark" if helper_cached else "",
+                                "size": int(0.5 * GB), "cached": helper_cached, "disk": None, "default": True}],
                 "info": {"downloads": 12, "likes": 1, "updated": "2026-11-24T02:15:52.000Z", "license": "apache-2.0",
                          "pipeline": "text-generation", "gated": False, "architecture": "dflash",
                          "context": 1048576, "parameters": 495000000}}
     if repo == "acme/Model-DFlash2":
-        return {"repo": repo, "from_cache": False, "drafter": {"size": int(0.9 * GB)}, "drafter_repo": False,
+        return {"repo": repo, "from_cache": False, "drafter": {"size": int(0.9 * GB), "kind": "dflash2"}, "drafter_repo": False,
                 "base_models": ["acme/Tiny-27B"], "runs": None, "known_drafters": [],
                 "build_architectures": ["qwen35", "qwen3"], "mtp": None, "mmproj": None, "ggufs": [], "companions": [],
                 "info": {"downloads": 500, "likes": 25, "updated": "2026-11-24T02:15:52.000Z", "license": "apache-2.0",
                          "pipeline": None, "gated": False, "architecture": None, "context": None, "parameters": None}}
+    if repo == "acme/Speedy-Drafter":  # a DSpark drafter whose name does not say so: the server says its kind
+        return {"repo": repo, "from_cache": False, "drafter": {"size": int(0.8 * GB), "kind": "dspark"},
+                "drafter_repo": False, "base_models": ["acme/Tiny-27B"], "runs": None, "known_drafters": [],
+                "build_architectures": ["qwen35", "qwen3"], "mtp": None, "mmproj": None, "ggufs": [], "companions": [],
+                "info": {"downloads": 50, "likes": 2, "updated": "2026-11-24T02:15:52.000Z", "license": "mit",
+                         "pipeline": None, "gated": False, "architecture": None, "context": None, "parameters": None}}
     runs = repo == REPO
     quants = [("IQ3_XXS", 11.8, True), ("Q4_K_M", 17.6, True), ("Q5_K_M", 19.4, False), ("Q6_K", 22.3, False), ("BF16", 54.7, False)]
     return {"repo": repo, "from_cache": False, "drafter": None, "base_models": ["acme/Tiny-27B"], "runs": runs,
-            "known_drafters": ["acme/Tiny-27B-DFlash2"] if runs else [], "build_architectures": ["qwen35", "qwen3"],
+            "known_drafters": [{"repo": "acme/Tiny-27B-DFlash2", "kind": "dflash2", "base": "acme/Tiny-27B", "exact": False,
+                                "relation": "quantized", "tok_s": None}]
+            if runs else [], "build_architectures": ["qwen35", "qwen3"],
             "mtp": {"path": "MTP/mtp.gguf", "size": int(0.6 * GB), "cached": True} if runs else None,
             "mmproj": {"path": "mmproj-BF16.gguf", "size": int(0.9 * GB), "cached": True} if runs else None,
             "companions": [
@@ -129,6 +148,7 @@ LISTING = {"path": PICKED, "parent": "E:\\", "kind": "dir", "dirs": [],
 FOLDERS = {"": {"path": "", "parent": None, "kind": "start", "dirs": [{"name": "D:\\", "path": "D:\\"}], "models": []},
            "D:\\": {"path": "D:\\", "parent": None, "kind": "dir", "dirs": [{"name": "models", "path": FOLDER}], "models": []},
            FOLDER: {"path": FOLDER, "parent": "D:\\", "kind": "dir", "dirs": [], "models": [m for m in CATALOG["models"] if m["source"] == "dir"]},
+           LOCAL_DRAFTER["path"]: {"path": LOCAL_DRAFTER["path"], "parent": FOLDER, "kind": "file", "dirs": [], "models": [LOCAL_DRAFTER]},
            PICKED: LISTING}
 
 
@@ -253,8 +273,11 @@ class Server:
                 res["arch"], res["next_cursor"] = arch, None
                 res["models"] = [m for m in res["models"] if m.get("architecture") == arch]
             return route.fulfill(json=res)
+        if "/v1/hub/drafter" in url:  # a drafter's kind, as its fields say (none read from its name)
+            name = query.get("name", [""])[0]
+            return route.fulfill(json={"name": name, "kind": DRAFTER_KINDS.get(name)})
         if "/v1/hub/files" in url:
-            res = repository(query["repo"][0])
+            res = repository(query["repo"][0], getattr(self, "helper_cached", False))
             res["endpoint"] = self.hub_endpoint
             return route.fulfill(json=res)
         if "/v1/hub/dir" in url:
@@ -326,17 +349,19 @@ def check_settings(page, server, want):
 def check_context_limit(open_page, want):
     """A context memory cut under the model's own: the status card says where K/V lives, which memory cut it and what
     would give more; a short one as a warning, on the Overview too."""
-    gpu = {"by": "gpu", "wanted": 262144, "short": True, "left": 820_000_000, "gpu_tokens": 8192,
-           "others": 3_600_000_000, "closable": True, "runtime": 540_000_000}
+    gpu = {"by": "gpu", "wanted": 262144, "short": True, "left": 820_000_000, "need_more": 5_120_000_000,
+           "gpu_tokens": 8192, "others": 3_600_000_000, "closable": True, "runtime": 540_000_000}
     cases = [
         (gpu, "warn", "Limited context window 8,192 / 262,144. Not enough VRAM left "
-                      "(3.60 GB used by other apps). Close other apps and reload for a longer context."),
-        (dict(gpu, others=100_000_000, closable=False), "warn",
+                      "(3.60 GB used by other apps). Close other apps and reload for a longer context. "
+                      "Needs 5.12 GB more VRAM for max context."),
+        (dict(gpu, others=100_000_000, closable=False, need_more=None), "warn",
          "Limited context window 8,192 / 262,144. Not enough VRAM left. "
          "Disable speculative decoding or use a smaller quantization for a longer context."),
-        ({"by": "host", "wanted": 262144, "short": False, "left": 7_300_000_000, "gpu_tokens": 4096,
-          "others": None, "closable": False, "runtime": None}, "hint",
-         "Limited context window 8,192 / 262,144. Not enough free RAM (7.30 GB available for KV)."),
+        ({"by": "host", "wanted": 262144, "short": False, "left": 7_300_000_000, "need_more": 4_500_000_000,
+          "gpu_tokens": 4096, "others": None, "closable": False, "runtime": None}, "hint",
+         "Limited context window 8,192 / 262,144. Not enough free RAM (7.30 GB available for KV). "
+         "Free RAM or raise \"KV in host RAM\" for a longer context. Needs 4.50 GB more RAM for max context."),
         ({"by": "host", "wanted": 262144, "short": False, "left": 7_300_000_000, "gpu_tokens": 0,
           "others": None, "closable": False, "runtime": None}, "hint",
          "Limited context window 8,192 / 262,144. Not enough free RAM (7.30 GB available for KV)."),
@@ -403,9 +428,97 @@ def check_drafters(page, server, want):
     page.locator("#sd-default").click()
     check_choice(True, "", [])
     page.locator("#sd-file").fill("./another.gguf")
+    expect(page.locator("#mf-cmd")).to_contain_text("--drafter mtp")  # the kind the server read
     check_choice(True, "mtp", ["./another.gguf"])
+    # A drafter whose name says nothing of its kind: the server's word for it, DSpark's here.
+    page.locator("#sd-file").fill("./drafts/Speedy")
+    expect(page.locator("#mf-cmd")).to_contain_text("--drafter dspark")
+    page.locator("#sd-file").fill("./unknown.flyx")  # nothing says what it is: no --drafter
+    page.wait_for_timeout(800)
+    assert "--drafter" not in command(page) and "./unknown.flyx" in command(page), command(page)
     page.locator("#mf-reset").click()
     expect(page.locator("#sd-saved input")).to_be_checked()
+    # Draft trees: the drafter's default, on, or off (--no-draft-trees: a DSpark drafter's default trees off).
+    page.locator('#lset-tabs [data-stab="spec"]').click()
+    if not page.locator("#sd-adv").evaluate("e => e.open"):
+        page.locator("#sd-adv > summary").click()
+    expect(page.locator("#sd-trees")).to_be_visible()
+    expect(page.locator("#sd-trees")).to_have_value("on")  # as loaded
+    page.locator("#sd-trees").select_option("off")
+    assert "--no-draft-trees" in command(page) and "--draft-trees" not in command(page), command(page)
+    confirm(page, "#mf-reload", "Reload")
+    assert server.posted[-1]["draft_trees"] is False, server.posted[-1]
+    page.locator("#sd-trees").select_option("")
+    assert "--draft-trees" not in command(page) and "--no-draft-trees" not in command(page), command(page)
+    confirm(page, "#mf-reload", "Reload")
+    assert server.posted[-1]["draft_trees"] is None, server.posted[-1]
+    page.locator("#mf-reset").click()
+
+    # A saved selection carries its header identity across restore. Editing the path drops that identity.
+    want.update(drafter="dflash2", drafters=["./helper.gguf"])
+    page.reload()
+    page.locator('#lset-tabs [data-stab="spec"]').click()
+    expect(page.locator("#sd-custom input[type=radio]")).to_be_checked()
+    expect(page.locator("#sd-file")).to_have_value("./helper.gguf")
+    page.locator("#sd-file").fill("./renamed.gguf")
+    check_choice(True, "", ["./renamed.gguf"])
+    page.locator("#mf-reset").click()
+    expect(page.locator("#mf-cmd")).to_contain_text("--drafter dflash2")
+    want.update(drafter="all", drafters=files)
+    page.reload()
+
+
+def check_degraded_and_draft_weights(open_page, want):
+    """Drafter weight precision choices (auto/nvfp4/q8/exact) and VRAM adjustment banner + restore action."""
+    base = dict(want, drafter="dflash2", drafters=["acme/Tiny-27B-DFlash2"])
+    tm = telemetry(base)
+    tm["model"]["drafter"] = "mtp"
+    tm["model"]["draft_weights"] = "nvfp4"
+    tm["model"]["max_width"] = 7
+    tm["load"]["degraded"] = [
+        {"kind": "drafter", "from": "dflash2", "to": "mtp",
+         "detail": "DFlash2 drafter skipped due to tight VRAM; falling back to MTP"}
+    ]
+    tm["model"]["degraded"] = tm["load"]["degraded"]
+    snap = {
+        "supported": True, "can_close": True, "device": "NVIDIA GeForce RTX 5070 Ti",
+        "mem_total": int(17.09 * GB), "mem_used": int(14.5 * GB), "mem_free": int(2.59 * GB),
+        "own_bytes": int(10.8 * GB), "others_bytes": int(3.7 * GB), "system_bytes": int(0.8 * GB),
+        "idle_igpu": None,
+        "apps": [{"id": "slack", "name": "Slack", "process": "Slack", "bytes": int(0.4 * GB),
+                  "local_bytes": int(0.4 * GB), "processes": 1, "closable": True, "reason": None}],
+    }
+    page, server = open_page(tm, gpu_apps=snap)
+    # Degraded banner clearly explains what was degraded and what is actively running.
+    deg = page.locator("#ld-degraded")
+    expect(deg).to_be_visible()
+    expect(deg).to_contain_text("Loaded with VRAM adjustments")
+    expect(deg).to_contain_text("DFlash2 drafter skipped due to tight VRAM; falling back to MTP")
+    expect(deg).to_contain_text("Active now:")
+    expect(deg).to_contain_text("mtp (nvfp4)")
+    # Manage VRAM opens the VRAM manager inline; Restore full settings reloads the preserved requested config.
+    page.locator("#ld-deg-vram").click()
+    expect(page.locator("#ld-vram-apps")).to_be_visible()
+    confirm(page, "#ld-deg-restore", "Reload")
+    assert server.posted[-1]["drafter"] == "dflash2" and server.posted[-1]["drafters"] == ["acme/Tiny-27B-DFlash2"], server.posted[-1]
+    # Overview also shows the global degraded hint banner with Manage VRAM.
+    page.locator('.side nav .navi[data-tab="overview"]').click()
+    hint = page.locator('#hint[data-hint="degraded"]')
+    expect(hint).to_be_visible()
+    expect(hint).to_contain_text("Loaded with VRAM adjustments")
+    hint.get_by_role("button", name="View details").click()
+    expect(page.locator("#tab-model")).to_be_visible()
+    # Advanced drafter weights dropdown supports auto (default), nvfp4, q8, and exact.
+    page.locator('#lset-tabs [data-stab="spec"]').click()
+    if page.locator("#sd-adv").get_attribute("open") is None:
+        page.locator("#sd-adv summary").click()
+    expect(page.locator("#sd-weights")).to_have_value("")
+    for val in ("nvfp4", "q8", "exact"):
+        page.locator("#sd-weights").select_option(val)
+        assert "--backend-opt" in command(page) and f"draft_weights={val}" in command(page), command(page)
+        confirm(page, "#mf-reload", "Reload")
+        assert server.posted[-1]["draft_weights"] == val, server.posted[-1]
+    page.close()
 
 
 def check_vision(page, server, open_page, want):
@@ -532,6 +645,7 @@ def check_hub(page, server, want):
     page.locator("#mf-load").click()
     expect(page.locator("#mv-current")).to_be_visible()
     expect(page.locator("#sd-file")).to_have_value(REPO + ":mtp.gguf")
+    expect(page.locator("#mf-cmd")).to_contain_text("--drafter mtp")
     page.locator('#lset-tabs [data-stab="vision"]').click()
     expect(page.locator("#vs-file")).to_have_value(REPO + ":mmproj-BF16.gguf")
     page.locator("#mf-reset").click()
@@ -570,7 +684,8 @@ def check_hub(page, server, want):
     page.locator("#hf-ep-save").click()
     expect(page.locator("#hf-ep-toggle")).to_contain_text("hf-mirror.com")
     expect(page.locator("#hf-ep-toggle")).to_have_class(re.compile(r"\bon\b"))
-    expect(page.locator('#hf-detail a[href^="https://hf-mirror.com/"]')).to_have_count(1)
+    expect(page.locator('#hf-detail .dh a[href^="https://hf-mirror.com/"]')).to_have_count(1)
+    expect(page.locator('#hf-detail a[href^="https://huggingface.co/"]')).to_have_count(0)  # every link: the mirror
     page.locator("#hf-ep-reset").click()
     expect(page.locator("#hf-ep-toggle")).to_contain_text("huggingface.co")
     expect(page.locator("#hf-ep-toggle")).not_to_have_class(re.compile(r"\bon\b"))
@@ -597,32 +712,64 @@ def check_hub(page, server, want):
     page.locator('#mf-files .mrow[data-name$=":Q5_K_M"]').click()
     expect(page.locator("#mf-load")).to_be_disabled()
     # A dflash GGUF drafter repo is never marked unsupported and lets the user draft with its GGUF directly.
-    page.locator("#hf-q").fill("acme/Model-DFlash2-GGUF")
-    expect(page.locator("#hf-name")).to_have_text("Model-DFlash2-GGUF")
-    expect(page.locator("#hf-unsupported")).to_have_count(0)
-    expect(page.locator("#hf-drafter-repo")).to_be_visible()
-    page.locator('#hf-companions .mrow[data-kind="dflash2"]').click()
-    expect(page.locator("#mf-load")).to_have_text("Draft with it")
-    page.locator("#mf-load").click()
-    expect(page.locator("#mv-current")).to_be_visible()
-    expect(page.locator("#sd-file")).to_have_value("acme/Model-DFlash2-GGUF:Model-DFlash2-Draft-BF16.gguf")
-    expect(page.locator("#mf-cmd")).to_contain_text("--drafter dflash2")
-    page.locator("#mf-reset").click()
+    for mode in ("", "dspark"):
+        server.helper_cached = bool(mode)
+        view(page, "library")
+        page.locator("#hf-q").fill("")
+        page.locator("#hf-q").fill("acme/Model-DFlash2-GGUF")
+        expect(page.locator("#hf-name")).to_have_text("Model-DFlash2-GGUF")
+        expect(page.locator("#hf-drafter-repo")).to_be_visible()
+        page.locator(f'#hf-companions .mrow[data-kind="{mode}"]').click()
+        expect(page.locator("#mf-load")).to_have_text("Draft with it")
+        page.locator("#mf-load").click()
+        expect(page.locator("#sd-file")).to_have_value("acme/Model-DFlash2-GGUF:helper.gguf")
+        confirm(page, "#mf-reload", "Reload")
+        body = server.posted[-1]
+        assert (body["drafter"], body["drafters"]) == (mode, ["acme/Model-DFlash2-GGUF:helper.gguf"]), body
+        page.locator("#mf-reset").click()
     # Typing a safetensors DFlash2 repo org/name auto-opens it without Enter and offers Draft with it.
     view(page, "library")
     page.locator("#hf-q").fill("acme/Model-DFlash2")
     expect(page.locator("#hf-name")).to_have_text("Model-DFlash2")
     expect(page.locator("#hf-drafter-only")).to_be_visible()
     expect(page.locator("#mf-load")).to_have_text("Draft with it")
+    # A DSpark drafter repo: drafted with as the kind the server says (--drafter dspark), whatever its name.
+    page.locator("#hf-q").fill("acme/Speedy-Drafter")
+    expect(page.locator("#hf-name")).to_have_text("Speedy-Drafter")
+    expect(page.locator("#hf-drafter-only")).to_be_visible()
+    page.locator("#mf-load").click()
+    expect(page.locator("#sd-file")).to_have_value("acme/Speedy-Drafter")
+    expect(page.locator("#mf-cmd")).to_contain_text("--drafter dspark")
+    page.locator("#mf-reset").click()
+    view(page, "library")
     page.locator("#hf-q").fill("")
     # A name with its quantization, in the search box: that file of that repository.
     page.locator("#hf-q").fill(REPO + ":q6_k")
     page.keyboard.press("Enter")
     expect(page.locator("#mf-files .mrow.sel")).to_have_attribute("data-name", REPO + ":Q6_K")
     expect(page.locator("#hf-drafters")).to_contain_text("acme/Tiny-27B-DFlash2")
+    expect(page.locator("#hf-drafters")).to_contain_text("DFlash2")
+    expect(page.locator("#hf-drafters")).to_contain_text("N/A")  # not run on this machine yet
     page.locator("#hf-drafters .btn").click()  # the drafter published for it goes to the settings
     expect(page.locator("#mv-current")).to_be_visible()
     expect(page.locator("#sd-file")).to_have_value("acme/Tiny-27B-DFlash2")
+    # The settings offer it beside the default, under the drafters for its base model, chosen now, as its kind; the
+    # custom drafter is not.
+    page.locator('#lset-tabs [data-stab="spec"]').click()
+    base = page.locator("#sd-base")
+    expect(base).to_contain_text("acme/Tiny-27B")
+    expect(base).to_contain_text("quantized")
+    expect(base).to_have_class(re.compile(r"\bsel\b"))
+    base.click()  # its drafters, shown
+    verified = page.locator('.sdrow[data-verified="acme/Tiny-27B-DFlash2"]')
+    expect(verified).to_have_class(re.compile(r"\bsel\b"))
+    expect(verified).to_contain_text("N/A")
+    expect(page.locator("#sd-custom")).not_to_have_class(re.compile(r"\bsel\b"))
+    expect(page.locator("#mf-cmd")).to_contain_text("--drafter dflash2")
+    page.locator("#sd-default").click()
+    expect(verified).to_be_visible()
+    verified.click()
+    expect(page.locator("#mf-cmd")).to_contain_text(re.compile(r"--drafter-file '?acme/Tiny-27B-DFlash2"))
     page.locator("#mf-reset").click()
 
 
@@ -635,7 +782,7 @@ def check_local(page, server):
     expect(folders).to_have_count(3)  # where Hugging Face downloads to, the model directory, the served model's folder
     expect(folders.nth(0).locator(".ps")).to_have_text(CACHE)
     expect(folders.nth(1).locator(".ps")).to_have_text(FOLDER)
-    expect(models).to_have_count(7)
+    expect(models).to_have_count(9)  # #4 added a cached Hub GGUF drafter, #31 a local one
     one = page.locator('#lc-list .prow.model[data-model="' + REPO + ':IQ3_XXS"]')
     expect(one.locator(".pn")).to_have_text("Tiny-27B-GGUF · IQ3_XXS")
     expect(one.locator(".pm")).to_have_text("11.8 GB")
@@ -643,10 +790,12 @@ def check_local(page, server):
     expect(page.locator('#lc-list .prow.model[data-model$="tiny-bf16.flyx"] .pt')).to_have_text(".flyx")
     expect(page.locator('#lc-list .prow.model[data-model$="mmproj-BF16.gguf"] .pt')).to_have_text("mmproj")
     expect(page.locator('#lc-list .prow.model[data-model="acme/Tiny-27B-DFlash2"] .pt')).to_have_text("drafter")
+    expect(page.locator('#lc-list .prow.model[data-model="acme/Model-DFlash2-GGUF:BF16"] .pt')).to_have_text("drafter")
     # Every file under a folder carries a kind-specific icon (model, vision projector, drafter).
     expect(page.locator('#lc-list .prow.model[data-model$="tiny-bf16.flyx"] .pn svg use')).to_have_attribute("href", "#i-model")
     expect(page.locator('#lc-list .prow.model[data-model$="mmproj-BF16.gguf"] .pn svg use')).to_have_attribute("href", "#i-image")
     expect(page.locator('#lc-list .prow.model[data-model="acme/Tiny-27B-DFlash2"] .pn svg use')).to_have_attribute("href", "#i-bolt")
+    expect(page.locator('#lc-list .prow.model[data-model="acme/Model-DFlash2-GGUF:BF16"] .pn svg use')).to_have_attribute("href", "#i-bolt")
     one.click()
     expect(page.locator("#lc-name")).to_have_text("Tiny-27B-GGUF · IQ3_XXS")
     expect(page.locator("#lc-detail .dchips")).to_contain_text("+ Vision")
@@ -664,6 +813,14 @@ def check_local(page, server):
     # Drafters and vision projectors use the bottom-right primary button instead of a duplicate banner button.
     page.locator('#lc-list .prow.model[data-model="acme/Tiny-27B-DFlash2"]').click()
     expect(page.locator("#lc-detail .banner button")).to_have_count(0)
+    expect(page.locator("#lc-detail .dsec")).to_have_text("Folder")
+    expect(page.locator("#mf-load")).to_have_text("Draft with it")
+    expect(page.locator("#mf-load")).to_be_enabled()
+    # A cached Hub GGUF drafter shows File (not Folder), a DFlash2 chip, and Draft with it (never Load model).
+    page.locator('#lc-list .prow.model[data-model="acme/Model-DFlash2-GGUF:BF16"]').click()
+    expect(page.locator("#lc-detail .dchips")).to_contain_text("DFlash2")
+    expect(page.locator("#lc-detail .dsec")).to_have_text("File")
+    expect(page.locator("#lc-quants")).to_be_visible()
     expect(page.locator("#mf-load")).to_have_text("Draft with it")
     expect(page.locator("#mf-load")).to_be_enabled()
     page.locator('#lc-list .prow.model[data-model$="mmproj-BF16.gguf"]').click()
@@ -678,17 +835,29 @@ def check_local(page, server):
     view(page, "library")
     page.locator('#src-seg [data-src="local"]').click()
     folders.nth(1).click()
-    expect(page.locator("#lc-companions .mrow")).to_have_count(1)
+    page.locator("#mf-path").fill(LOCAL_DRAFTER["path"])
+    page.locator("#mf-path").press("Enter")
+    expect(page.locator("#mf-load")).to_have_text("Draft with it")
+    page.locator("#mf-load").click()
+    confirm(page, "#mf-reload", "Reload")
+    body = server.posted[-1]
+    assert (body["drafter"], body["drafters"]) == ("dflash2", [LOCAL_DRAFTER["path"]]), body
+    page.locator("#mf-reset").click()
+    view(page, "library")
+    folders.nth(1).click()
+    expect(page.locator("#lc-companions .mrow")).to_have_count(2)
+    page.locator('#lc-companions .mrow[data-comp$="helper.gguf"]').click()
     page.locator('#mf-cached .mrow[data-name$="Other-12B-Q5_K_M.gguf"]').click()
     page.locator('#lc-companions .mrow[data-comp$="mmproj-BF16.gguf"]').click()
     confirm(page, "#mf-load", "Switch")
+    assert (server.posted[-1]["drafter"], server.posted[-1]["drafters"]) == ("dflash2", [FOLDER + "\\helper.gguf"])
     assert (server.posted[-1]["model"], server.posted[-1]["mmproj"]) == (
         FOLDER + "\\Other-12B-Q5_K_M.gguf", FOLDER + "\\mmproj-BF16.gguf"), server.posted[-1]
     view(page, "library")
     page.locator('#src-seg [data-src="local"]').click()
     folders.nth(0).click()
     expect(page.locator("#mf-path")).to_have_value(CACHE)
-    expect(page.locator("#mf-cached .rgroup")).to_have_count(3)
+    expect(page.locator("#mf-cached .rgroup")).to_have_count(4)
     # A folder added through the system's dialog (the server shows it), kept by the browser, then removed.
     page.locator("#mf-add").click()
     added = page.locator('#lc-list .prow.folder[data-place="dir:' + selector(PICKED) + '"]')
@@ -786,12 +955,13 @@ def check_switch_companions(open_page, want):
     page.locator("#mf-name").fill("custom-alias")
     page.locator('#lset-tabs [data-stab="spec"]').click()
     page.locator("#sd-file").fill("./new-mtp.gguf")
+    expect(page.locator("#mf-cmd")).to_contain_text("--drafter mtp")
     view(page, "library")
     page.locator('#lc-list .prow.model[data-model$="Other-12B-Q5_K_M.gguf"]').click()
     confirm(page, "#mf-load", "Switch")
     body = server.posted[-1]
     assert (body["mmproj"], body["drafter"], body["drafters"], body["name"]) == (
-        None, "mtp", ["./new-mtp.gguf"], "custom-alias"), body
+        None, "mtp", ["./new-mtp.gguf"], "custom-alias"), body  # its kind as its fields say (DRAFTER_KINDS)
     # Reloading the same model still preserves all of its own companions and API id.
     page.locator("#mf-reset").click()
     page.locator('#lset-tabs [data-stab="general"]').click()
@@ -1098,6 +1268,7 @@ def check(browser):
     check_vision(page, server, open_page, want)
     page.close()
     check_context_limit(open_page, want)
+    check_degraded_and_draft_weights(open_page, want)
     check_vram_apps(open_page, want)
     check_switch_companions(open_page, want)
     check_lora(open_page, want)

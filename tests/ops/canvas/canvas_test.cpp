@@ -14,14 +14,9 @@
 
 #include "nlohmann/json.hpp"
 #include "ops/canvas/ref.h"
+#include "tests/common/check.h"
 
 namespace {
-
-int failures = 0;
-void check(bool ok, const std::string& what) {
-  std::printf("%s %s\n", ok ? "ok" : "FAIL", what.c_str());
-  failures += !ok;
-}
 
 using Vec = std::vector<double>;
 
@@ -40,6 +35,7 @@ double worst(const Vec& got, const Vec& want) {
 }  // namespace
 
 int main(int argc, char** argv) {
+  flyx::test::print_passes = true;
   if (argc < 2) return std::fprintf(stderr, "usage: canvas_test ASSETS\n"), 2;
   std::ifstream f(std::string(argv[1]) + "/dv_cases.json");
   if (!f) return std::fprintf(stderr, "no %s/dv_cases.json (tests/e2e/make_tiny.py writes it)\n", argv[1]), 1;
@@ -99,6 +95,5 @@ int main(int argc, char** argv) {
   std::snprintf(line, sizeof line, "slide: inputs, candidates and live slots the reference's in %d/%d canvases (%d "
                 "guesses kept), largest relative difference %.2e", slid_same, n, kept, slide_err);
   check(slid_same == n && kept > 0 && slide_err <= 1e-12, line);
-  std::printf("canvas: %s\n", failures ? "FAILED" : "ok");
-  return failures ? 1 : 0;
+  return flyx::test::finish("canvas_test");
 }

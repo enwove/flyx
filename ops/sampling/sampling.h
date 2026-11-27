@@ -95,6 +95,83 @@ FLYX_HD float sample_uniform(uint64_t seed, int64_t pos, int32_t v) {
   return fminf(u, 0x1.fffffep-1f);
 }
 
+// A drafter's score for token v at position pos when the reply samples (temperature T > 0): its own score s over T
+// plus the Gumbel noise the target's choice at pos adds to v (above).  A drafter that takes the argmax of these drafts
+// the token the target would sample from the drafter's distribution with the target's noise: where the two
+// distributions agree the draft is the target's choice (accepted with probability near 1 - TV between them, against
+// p(draft) for the drafter's argmax), and the output, the target's choice, is unchanged.  T <= 0: s.
+FLYX_HD float coupled_draft_score(float s, float T, uint64_t seed, int64_t pos, int32_t v) {
+  if (!(T > 0.f)) return s;
+  const float u = sample_uniform(seed, pos, v);
+  return s / T - logf(-logf(u));
+}
+
+// How many of its best logits a sequential drafter (MTP) drafts from (fewer with a smaller vocabulary).
+constexpr int kMtpCands = 16;
+
+// A sequential drafter's draft from its k <= kMtpCands best logits (cand, logit: best first; count: each candidate's
+// count in the reply as the row verifying the draft counts it, or null), by the target's rule (sample_rows) applied to
+// the candidates alone: their penalties, then greedy the largest logit (the lower token on a tie); sampling, z = the
+// logit less the best over T, those with z > kSampleZMin, top_k keeping every candidate tied with the k-th, top_p the
+// fewest best whose mass (ties at the cut kept) reaches top_p of the kept candidates' (not the vocabulary's), and of
+// those the largest z plus the target's noise at the draft's position pos, the lower token on a tie.  Where the
+// drafter's logits are the target's within the candidates the draft is the target's choice; the output is the
+// target's either way.  A candidate outside [0, vocab) or of NaN logit is not one; with none, token 0 (a draft only
+// proposes: the round verifies it).
+FLYX_HD int32_t draft_choice(const int32_t* cand, const float* logit, const int* count, int k, int vocab, float T,
+                             float top_p, int top_k, float presence, float frequency, uint64_t seed, int64_t pos) {
+  float l[kMtpCands];
+  int o[kMtpCands];  // the usable candidates, larger logit first, then lower token
+  int n = 0;
+  for (int c = 0; c < k && c < kMtpCands; ++c) {
+    if (cand[c] < 0 || cand[c] >= vocab || logit[c] != logit[c]) continue;
+    l[c] = logit[c] - (count ? penalty(presence, frequency, count[c]) : 0.f);
+    int at = n++;
+    while (at > 0 && (l[c] > l[o[at - 1]] || (l[c] == l[o[at - 1]] && cand[c] < cand[o[at - 1]]))) {
+      o[at] = o[at - 1];
+      --at;
+    }
+    o[at] = c;
+  }
+  if (n == 0) return 0;
+  if (!(T > 0.f)) return cand[o[0]];
+  const float top = l[o[0]], inv = 1.f / T;
+  float z[kMtpCands];
+  int keep = 0;
+  for (; keep < n; ++keep) {
+    const float d = l[o[keep]] - top;
+    z[keep] = inv == INFINITY ? d / T : d * inv;  // as the target scales a logit (scaled_logit)
+    if (!(z[keep] > kSampleZMin)) break;
+  }
+  if (top_k > 0 && top_k < keep) {
+    int m = top_k;
+    while (m < keep && z[m] >= z[top_k - 1]) ++m;
+    keep = m;
+  }
+  if (top_p < 1.f) {
+    float mass = 0.f;
+    for (int c = 0; c < keep; ++c) mass += expf(z[c]);
+    float acc = 0.f;
+    for (int c = 0; c < keep; ++c) {
+      acc += expf(z[c]);
+      if (acc >= top_p * mass) {
+        int m = c + 1;
+        while (m < keep && z[m] == z[c]) ++m;
+        keep = m;
+        break;
+      }
+    }
+  }
+  float best = -INFINITY;
+  int32_t bi = INT32_MAX;
+  for (int c = 0; c < keep; ++c) {
+    const int32_t v = cand[o[c]];
+    const float g = z[c] - logf(-logf(sample_uniform(seed, pos, v)));
+    if (g > best || (g == best && v < bi)) best = g, bi = v;
+  }
+  return bi;
+}
+
 // Reflect negative encodings around the key of zero so equal values, including both zeros, share a key.
 FLYX_HD uint32_t float_key(uint32_t bits) { return (bits & 0x80000000u) ? -bits : (bits | 0x80000000u); }
 

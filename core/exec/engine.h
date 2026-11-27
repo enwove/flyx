@@ -10,6 +10,7 @@
 #include <string>
 #include <vector>
 
+#include "core/exec/telemetry.h"
 #include "core/grammar/grammar.h"
 #include "core/interfaces/model.h"
 #include "core/modelfile/modelfile.h"
@@ -46,10 +47,10 @@ struct EngineOptions {
   std::string backend;       // empty = auto
   std::string backend_dir;   // empty = next to the executable
   bool speculative = true;
-  // "mtp" | "dflash2" | "dv" | "all" | "none" | empty = the drafter files' drafters and the model file's MTP layer,
-  // else its DFlash2 drafter (models/model.h: choose_drafters); its DV drafter only when named ("dv", "all").  With
-  // several, the drafter is chosen every round; DV is never beside another drafter, its rounds chosen
-  // against plain decoding's and lookup's every round (docs/design/dv.md).
+  // interfaces::kDrafterModes ("mtp" | "dflash2" | "dspark" | "dv" | "all" | "none") | empty = the drafter files'
+  // drafters and the model file's MTP layer, else its block drafter (models/model.h: choose_drafters); its DV drafter
+  // only when named ("dv", "all").  With several, the drafter is chosen every round; DV is never beside another
+  // drafter, its rounds chosen against plain decoding's and lookup's every round (docs/design/dv.md).
   std::string drafter;
   // Files with drafters' weights beside the model file: a GGUF holding only the MTP
   // layer (unsloth ships Qwen3.8-27B's so: MTP/mtp-*.gguf), a DFlash2 drafter file (python/convert --draft
@@ -122,20 +123,25 @@ struct EngineOptions {
   // FLYX_LOOKUP=0 turns it off.  The output is the same either way.
   bool lookup = true;
   bool lookup_given = false;
-  // Rounds whose drafter drafts a tree of drafts (FLYX_DRAFT_TREE; DFlash2's candidates, best first) besides its
-  // chains, the controller choosing among all of them by measured cost and acceptance; FLYX_DRAFT_TREES=1 turns
-  // it on.  The output is the same either way.
+  // Rounds whose drafter drafts a tree of drafts (FLYX_DRAFT_TREE; DFlash2's and DSpark's candidates, best first)
+  // besides its chains, the controller choosing among all of them by measured cost and acceptance; FLYX_DRAFT_TREES
+  // says too.  Not given: on where the model's drafter takes them by default (Model::draft_trees_by_default: DSpark).
+  // The output is the same either way.
   bool draft_trees = false;
   bool draft_trees_given = false;
   // Intra-round confidence optimal stopping on drafters that support adaptive plans; FLYX_ADAPTIVE=0 turns it off.
   bool adaptive = true;
   bool adaptive_given = false;
+  // Automatically step down VRAM-heavy optional features on tight GPUs (vision gpu->disk, draft_weights->nvfp4,
+  // drop DFlash2 keeping MTP, drop drafters keeping prompt lookup). Never changes target output tokens.
+  // Benchmarks set this to false so measurements never silently alter configuration.
+  bool elastic_load = true;
 };
 
 // Fills the options the caller left unset from the environment: FLYX_BACKEND,
 // FLYX_BACKEND_DIR, FLYX_DRAFTER, FLYX_ACTIVATIONS; FLYX_BACKEND_OPTIONS goes before the
 // caller's backend options (a key given twice takes the later value);
-// FLYX_CHAT_NATIVE=0 turns chat_native off, FLYX_LOOKUP=0 lookup, FLYX_DRAFT_TREES=1 turns draft_trees on.
+// FLYX_CHAT_NATIVE=0 turns chat_native off, FLYX_LOOKUP=0 lookup, FLYX_DRAFT_TREES=1 / 0 turns draft_trees on / off.
 // The only place the engine reads the environment.
 void apply_environment(EngineOptions* o);
 
@@ -168,6 +174,10 @@ class Engine {
   // The drafters in use ("mtp+dflash2", "none"): the model's, but one whose rounds the backend runs at no width (DV on
   // a backend without its kernels: refused() says why).
   const char* drafter() const { return drafter_.c_str(); }
+  // Effective drafter weight precision ("nvfp4", "q8", "exact"; empty when no neural drafter is active).
+  const std::string& draft_weights() const { return active_draft_weights_; }
+  // Automatic VRAM-saving adjustments applied during load() (empty when requested settings fit as-is).
+  const std::vector<LoadAdjustment>& load_adjustments() const { return load_adjustments_; }
   // Widths of a drafter the backend did not lower, each with why ("dv 31: ..."); empty: none.
   const std::string& refused() const { return plans_.refused; }
   const EngineOptions& options() const { return opt_; }
@@ -222,8 +232,8 @@ class Engine {
   int prefill_align() const { return prefill_align_; }
   // Rows per prefill pass: the option, as a multiple of prefill_align().
   int prefill_chunk() const { return prefill_chunk_; }
+  bool roomy() const { return roomy_; }  // at least 32 GB free after the text target weights
   int auto_prefill_chunk() const;  // opt_.prefill_chunk == 0: by the device memory left
-  bool roomy() const;  // 32 GB of GPU memory free after the weights: binary16 K/V, GPU embeddings by default
   const std::vector<int32_t>& eos() const { return eos_; }
   // The model's vocabulary as grammars see it (core/grammar), built on first use.
   Grammar& grammar();
@@ -274,11 +284,14 @@ class Engine {
   const flyx_backend_api* api_ = nullptr;
   std::string backend_name_;
   flyx_device_info device_{};
+  bool roomy_ = false;
   std::unique_ptr<interfaces::Model> model_;          // the file as blocks, with the drafters in use
   flyx_bmodel* bm_ = nullptr;
   int prefill_align_ = 1, prefill_chunk_ = 1024;
   plan::Plans plans_;
   std::string drafter_ = "none";            // drafter(): the model's drafters whose rounds the plans have
+  std::string active_draft_weights_;        // effective drafter weights precision (nvfp4/q8/exact, or empty)
+  std::vector<LoadAdjustment> load_adjustments_;  // automatic VRAM adjustments applied during load()
   std::vector<double> round_ms_;            // measured cost of each round plan (core/speculation)
   std::vector<double> lookup_ms_;           // measured cost of each lookup plan (core/speculation)
   std::vector<double> round_ms_per_token_;  // ... more for every token of context past round_ms_at_

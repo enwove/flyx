@@ -31,13 +31,13 @@ All commands that load a model share the parser in `apps/common/engine_flags.cpp
 | `--kv-ram` | `GB` \| `auto` | `auto` | Pinned host RAM budget for KV positions beyond GPU capacity. `auto` takes available RAM minus `max(1/16 of total RAM, 2 GiB)` (32 GB machines keep 2 GiB, 64 GB 4 GiB; the remainder goes to `--host-cache`). `0` disables host KV offload. |
 | `--kv-gpu` | `N` (≥ 0) | auto (max that fits) | Cap on KV positions kept on GPU; overflow goes to host RAM. |
 | `--kv-copy-gpu` | `N` (≥ 0) | auto (max that fits) | With host KV, max layers keeping their StrataFlux low-bit summary copy on GPU; remaining layers keep copies in host RAM and stage ahead. |
-| `--kv-method` | `auto[:BITS]` \| `exact` \| `strata[:BITS]` | `auto` (`BITS=2`) | Decode KV read mode. `BITS` in `2..4` (default `2`). `auto`: exact attention up to `kv_gpu`, then StrataFlux once KV spills to host RAM; `exact`: exact attention everywhere; `strata`: StrataFlux everywhere. A file with a DV drafter reads exactly under `auto`, with `--drafter dv` or without (its trees read every position, and naming it changes no token); `strata` with DV drafting is refused. |
+| `--kv-method` | `auto[:BITS]` \| `exact` \| `strata[:BITS]` | `auto` (`BITS=2`) | Decode KV read mode. `BITS` in `2..4` (default `2`). `auto`: exact attention up to `kv_gpu`, then StrataFlux once KV spills to host RAM; `exact`: exact attention everywhere; `strata`: StrataFlux everywhere. A file with a DV drafter, or a Qwen3 or Llama model with a DSpark drafter (in its file or `--drafter-file`), reads exactly under `auto`, drafting or not (their trees read every position, and naming the drafter changes no token); `strata` with DV drafting or draft trees is refused, and keeps a DSpark drafter to chains. |
 | `--backend` | `cuda` \| `cpu_ref` | first available (`cuda`) | Backend shared library to load. Select GPU with `CUDA_VISIBLE_DEVICES`. |
 | `--backend-opt` | `K=V` (repeatable) | none | Backend-specific option (also `FLYX_BACKEND_OPTIONS=K=V,...`). Unknown keys fail load. |
-| `--drafter` | `mtp` \| `dflash2` \| `dv` \| `all` \| `none` | auto | Active drafters. Default enables all `--drafter-file` drafters plus the model's embedded MTP (or embedded DFlash2). Multiple active drafters are selected dynamically per round. A DV drafter (in a DV `.flyx` file, [DV](design/dv.md)) drafts only when named (`dv` or `all`): its warm-up, its trees of 15 and of the file's width, plain decoding and lookup rounds are then chosen every round. |
-| `--drafter-file` | `PATH` \| `HF_REPO` (repeatable) | none | Sidecar MTP GGUF (`MTP/mtp-*.gguf`) or DFlash2 drafter (`.flyx`, HF repo directory, or a `general.architecture=dflash` GGUF). |
+| `--drafter` | `mtp` \| `dflash2` \| `dspark` \| `dv` \| `all` \| `none` | auto | Active drafters. Default enables all `--drafter-file` drafters plus the model's embedded MTP (or embedded block drafter, DFlash2 or DSpark). Multiple active drafters are selected dynamically per round. A DV drafter (in a DV `.flyx` file, [DV](design/dv.md)) drafts only when named (`dv` or `all`): its warm-up, its trees of 15 and of the file's width, plain decoding and lookup rounds are then chosen every round. |
+| `--drafter-file` | `PATH` \| `HF_REPO` (repeatable) | none | Sidecar MTP GGUF (`MTP/mtp-*.gguf`), or a block drafter: DFlash2 (`.flyx`, HF repo directory, or a `general.architecture=dflash` GGUF) or DSpark (DeepSpec's `.flyx` or HF repo directory, e.g. `deepseek-ai/dspark_qwen3_8b_block7` beside Qwen3-8B; llama.cpp's DSpark GGUF, `dspark-*.gguf`, beside an Inkling-2 model): one of DFlash2's block a model, and llama.cpp's DSpark beside it. |
 | `--lora` | `DIR` \| `HF` | none | A LoRA adapter as Hugging Face PEFT saves it (`adapter_config.json` and `adapter_model.safetensors`): its folder, or a Hub repository (`org/name`, `org/name:FOLDER` for one in a folder of it, `@REV`), run unmerged beside the model's linears in every pass (any rank; Llama, Qwen3 and Qwen3.5/3.8: attention, MLP and gated delta net linears; GGUF block weights included). The command line's model takes it; a model loaded from the page takes the page's (`"lora"` of `POST /v1/load`). |
-| `--mmproj` | `PATH` | auto (HF Hub) / none (local) | Multimodal vision projector GGUF (`mmproj-*.gguf`, e.g., `mmproj-BF16.gguf`) paired with the model file. Auto-fetched from Hugging Face Hub repos when available unless `--no-vision` is set. |
+| `--mmproj` | `PATH` | auto (HF Hub) / none (local) | Multimodal vision projector GGUF (`mmproj-*.gguf`, e.g., `mmproj-BF16.gguf`) paired with the model file. Auto-fetched from Hugging Face Hub repos when available, for the architectures this build reads vision for (`qwen35`), unless `--no-vision` is set. |
 | `--no-vision` | flag | off | Disable loading any vision encoder / `mmproj` projector even if available. |
 | `--vision-offload` | flag | on (`disk`) | Shorthand for `--vision-device disk`: offload vision weights to an auto-deleted temp file on disk (0 VRAM, 0 locked host RAM) and stream via OS page cache into GPU staging. |
 | `--vision-device` | `disk` \| `host` \| `gpu` \| `auto` | `disk` | Where vision encoder weights live (`disk`: auto-deleted temp file, 0 VRAM & 0 locked host RAM so host KV budget is untouched, 3-stage streamed with bit-identical outputs; `host`: pinned host RAM, 0 VRAM; `gpu`: resident on GPU; `auto`: GPU when >= 8 GB VRAM remain free after weights, else `disk`). |
@@ -47,7 +47,8 @@ All commands that load a model share the parser in `apps/common/engine_flags.cpp
 | `--cycle` | `I,J,...` | off | Measurements and tests: launch these rounds in turn (indices into the rounds `-v` lists), no lookup round, instead of the controller's choice. An index past the rounds fails the load. |
 | `--no-spec` | flag | off | Disable all speculative decoding (drafters + lookup). |
 | `--no-lookup` | flag | off | Disable prompt-lookup rounds (15 drafts, wider with the `wide` backend option) on repeated text. |
-| `--draft-trees` | flag | off | Enable DFlash2 best-first draft trees alongside chains (also `FLYX_DRAFT_TREES=1`). |
+| `--draft-trees` | flag | off (on with a DSpark drafter on a Qwen3 or Llama target) | Enable best-first draft trees (DFlash2, DSpark) alongside chains, chosen per round by measured cost and acceptance (also `FLYX_DRAFT_TREES=1`). |
+| `--no-draft-trees` | flag | off | Chains only, even with a DSpark drafter (also `FLYX_DRAFT_TREES=0`). |
 | `--activations` | `exact` \| `nvfp4` | format default | `exact` forces per-format exact activation rounding (`bf16`/`fp16`) everywhere; `nvfp4` forces NVFP4 prefill inputs on NVFP4 weights even if the file declares bf16 (requires `sm_120a` and `K % 128 == 0`). |
 | `--chat-template` | `FILE` | model's template | Override model Jinja chat template from file. |
 | `-v` | flag | off | Verbose logging (memory budget bill, load timings, per-request metrics, each CUDA round graph a session keeps and the size it is counted at, and as a session ends its rounds from a graph and without one). |
@@ -67,7 +68,7 @@ All commands that load a model share the parser in `apps/common/engine_flags.cpp
 | `-p TEXT` / `-f FILE` | `run` | string / path | — | Prompt text or file path. |
 | `--image FILE` | `run` | path (repeatable) | none | Attach one or more local image files (PNG, JPEG, BMP, GIF, TGA) to the prompt (implies `--chat`; requires a loaded vision encoder via `--mmproj` or Hub auto-fetch). |
 | `--chat` | `run` | flag | off | Wrap prompt as a single user message through the chat template. |
-| `--no-think` | `run`, `chat`, `template`, `serve` | flag | off | Disable thinking block by default (`enable_thinking=false`); `bench` always runs without it. |
+| `--no-think` | `run`, `chat`, `template`, `serve` | flag | off | Disable thinking block by default (`enable_thinking=false`; a template that reads a thinking effort instead, Inkling-2's, is given its `reasoning_effort` `none`, and the reply is held to no thinking section); `bench` always runs without it. |
 | `-n N` | `run`, `chat`, `bench` | `≥ 0` | `256` | Maximum new tokens to generate. |
 | `--ignore-eos` | `run` | flag | off | Continue past EOS tokens until `-n` or context limit (`bench` always does). |
 | `--json [FILE]` | `bench` | flag, or path | off | Emit structured JSON benchmark output on stdout, or into `FILE` when the next argument is not an option. |
@@ -80,10 +81,14 @@ All commands that load a model share the parser in `apps/common/engine_flags.cpp
 
 ## 3. Server Flags (`flyx serve`)
 
+To connect from another device, open **Server settings → Serve on local network** in the dashboard. Close flyx and launch it again, then copy an **Active API address** into the other device's client. Choose the address on the network the devices share. If the PC's firewall prompts, allow access on the intended network.
+
+The switch saves `lan_access` in `serve.json`. It takes effect on the next launch of `flyx.exe` or `flyx serve`. Turning it off and restarting restores loopback-only access. Until restart, the dashboard shows the current listener and any pending change. An explicit `--host` overrides the preference and locks the switch for that launch. Devices that can reach the port can use inference. Set `FLYX_API_KEY` or pass `--api-key KEY` to require authentication.
+
 | Flag | Values | Default | Behavior |
 |---|---|---|---|
-| `--host` | IP / hostname | `127.0.0.1` | Listen address. Use `--api-key` when binding outside loopback. |
-| `--port` | `1..65535` | `8080` | Listen port. If omitted and 8080 is held by another program, picks the next free port automatically (if held by an existing `flyx serve`, Explorer launches open its dashboard). |
+| `--host` | IP / hostname | saved LAN setting, initially `127.0.0.1` | Sets the listen address for this launch. `flyx serve --host 0.0.0.0` listens on every IPv4 interface. |
+| `--port` | `0..65535` | `8080` | With `--port 0`, the OS assigns a free port and the server prints the dashboard URL at startup. If omitted and 8080 is held by another program, picks the next free port automatically (if held by an existing `flyx serve`, Explorer launches open its dashboard). |
 | `--name` | string | filename / HF name | Model ID reported in `/v1/models` and responses. |
 | `--models-dir` | `DIR` (repeatable) | none | Extra local directories scanned (depth 6) for `.gguf`/`.flyx` in `/v1/hub/cached` and dashboard (never deleted by `flyx`). |
 | `--sessions` | `N` (≥ 1) | `8` (capped by memory) | Target concurrent GPU sessions (allocated on demand). Planner sizes full context for 1 session first, then attempts 2 within memory budgets when tight, admitting up to `N` sessions that fit (reported as `model.max_sessions`). |
@@ -110,18 +115,18 @@ All commands that load a model share the parser in `apps/common/engine_flags.cpp
 
 ## 4. Environment Variables
 
-Defined in `core/os/env.h` (plus CUDA / Python standard variables). Explicit CLI flags take precedence over environment variables.
+The engine and server register their environment variables in `core/os/env.h`. Explicit CLI flags take precedence where available.
 
 | Variable | Values | Effect |
 |---|---|---|
 | `FLYX_BACKEND` | `cuda` \| `cpu_ref` | Default backend when `--backend` is unset. |
 | `FLYX_BACKEND_DIR` | path | Directory searched for `libflyx-*.so` / `libflyx-*.dll`. |
 | `FLYX_BACKEND_OPTIONS` | `K=V,K2=V2` | Prepended before `--backend-opt` flags. |
-| `FLYX_DRAFTER` | `mtp` \| `dflash2` \| `dv` \| `all` \| `none` | Default drafter mode when `--drafter` is unset. |
+| `FLYX_DRAFTER` | `mtp` \| `dflash2` \| `dspark` \| `dv` \| `all` \| `none` | Default drafter mode when `--drafter` is unset. |
 | `FLYX_ACTIVATIONS` | `exact` \| `nvfp4` | Default activation mode when `--activations` is unset. |
 | `FLYX_LOOKUP` | `0` \| `1` | Enable/disable prompt lookup (`0` = `--no-lookup`). |
-| `FLYX_DRAFT_TREES` | `0` \| `1` | Enable/disable DFlash2 draft trees (`1` = `--draft-trees`). |
-| `FLYX_ADAPTIVE` | `0` \| `1` | Enable/disable intra-round confidence optimal stopping on adaptive drafter plans (`1`, default). Enabled for sequential drafters (MTP) and for block drafters on targets whose verify cost scales steeply with width; dense targets paired with block drafters (DFlash2) verify the chooser's fixed widths. |
+| `FLYX_DRAFT_TREES` | `0` \| `1` | Enable/disable draft trees (`1` = `--draft-trees`, `0` = `--no-draft-trees`; unset: on with a DSpark drafter on a Qwen3 or Llama target). |
+| `FLYX_ADAPTIVE` | `0` \| `1` | Enable/disable intra-round confidence optimal stopping on adaptive drafter plans (`1`, default). Enabled for sequential drafters (MTP) and for drafters (DSpark, with step-wise Markov early stopping and optimal prefix verification, and DFlash2) on targets whose verify cost scales steeply with width (such as sparse MoE `inkling2_loop`, across checkpoints up to the drafter's trained block `{1, 2, 3, 5, 7}`, with sustained high-acceptance runs widening past the trained block when supported); dense targets paired with block drafters (DFlash2) verify the chooser's fixed widths. |
 | `FLYX_CHAT_NATIVE` | `0` \| `1` | Force Jinja engine (`0`) instead of native chat renderer (`1`, default). |
 | `FLYX_API_KEY` / `FLYX_KEY` | string | Default server API key when `--api-key` is unset. |
 | `FLYX_MODELS_DIR` | paths (`:` Linux / `;` Win) | Additional local model directories appended to `--models-dir`. |
@@ -132,6 +137,20 @@ Defined in `core/os/env.h` (plus CUDA / Python standard variables). Explicit CLI
 | `HF_ENDPOINT` | URL | Hugging Face Hub mirror URL (takes precedence over a saved `hub_endpoint` in `serve.json` at startup; can still be overridden at runtime via `POST /v1/hub/config`). |
 | `HF_HUB_OFFLINE` | `1` | Use local HF cache only; make no network requests. |
 | `NO_COLOR` / `COLUMNS` | any / int | Terminal monitor formatting overrides. |
+
+The CUDA backend also reads, at each model load, the environment spellings nine of its [Inkling-2 round options](#inkling-2-rounds) had before they were options: `FLYX_<NAME>=V` sets option `<name>`, and `FLYX_BACKEND_OPTIONS` and `--backend-opt` override it. A variable that is unset, empty, or not an integer (the whole value, no spaces) leaves the option's default; one that is not an integer also prints a warning. An integer keeps the meaning it had for the variable:
+
+| Variable | Option | An integer `V` sets |
+|---|---|---|
+| `FLYX_SC_CLUSTER` | `sc_cluster` | `4` or `8`; any other `V`: `1` |
+| `FLYX_MOE_VEC` | `moe_vec` | `1` for nonzero `V`, else `0` |
+| `FLYX_WARM` | `warm` | the bits of `V` among `1`, `2`, `4` and `16` |
+| `FLYX_EXPERT_PREFETCH` | `expert_prefetch` | `0` or `2`; any other `V`: `1` |
+| `FLYX_GUESS` | `guess` | the low four bits of a positive `V`; zero or negative: `0` |
+| `FLYX_GUESS_K` | `guess_k` | `V`; zero or negative: `0` |
+| `FLYX_SIDE_LOOP_MSG` | `side_loop_msg` | `1` for nonzero `V`, else `0` |
+| `FLYX_SIDE_COMPANION` | `side_companion` | `1` for nonzero `V`, else `0` |
+| `FLYX_SIDE_KV` | `side_kv` | `1` for nonzero `V`, else `0` |
 
 ---
 
@@ -169,19 +188,20 @@ Passed verbatim to the backend (`backends/cuda/backend.cpp`). Unknown keys or in
 | `vision` | `disk` \| `host` \| `gpu` \| `auto` | `disk` | Vision encoder weight placement (`disk`: auto-deleted flushed temp file, 0 VRAM & 0 locked host RAM, 3-stage streamed via OS page cache + 16 MiB lazy pinned ring; `host`: pinned host RAM, 0 VRAM; `gpu`: GPU resident; `auto`: `gpu` when >= 8 GB free after weights, else `disk`). |
 | `vision_quant` | `q8` \| `exact` \| `nvfp4` | `q8` | On-the-fly quantization of floating-point vision linears (`q8`: Q8_0, `exact`: file precision, `nvfp4`: NVFP4; pre-quantized GGML blocks stay packed). |
 | `head_w12` | `0` \| `1` | `1` | Lossless 12-bit packed bf16 output head for 1..16 rows (`0` saves ~0.95 GB on 4B, ~5% slower plain). |
-| `head_cert` | `0` \| `1` | `1` | Certified FP8-filtered exact greedy head (bit-identical greedy tokens; `0` saves ~0.64 GB on 4B). |
+| `head_cert` | `0` \| `1` | `1` | Certified FP8-filtered exact greedy head (bit-identical greedy tokens; `0` saves ~0.64 GB on 4B). A softcapped head (Inkling-2) is never certified: capped scores can tie where the raw ones do not, so greedy decoding reads the whole head. |
 | `head_fp8` | `0` \| `1` | `0` | Lossy FP8 output head (trades accuracy for decode speed). |
-| `draft_head` | `pick` \| `full` | `pick` | Draft candidate scoring: 1-bit top-256 prefilter + exact score (`pick`) vs full NVFP4 head (`full`). |
-| `draft_weights` | `nvfp4` \| `exact` | `nvfp4` | Quantized (`nvfp4`/Q8_0) vs exact bf16 drafter weights. |
+| `draft_head` | `pick` \| `full` | `pick` | Draft candidate scoring: 1-bit prefilter of the top 256 (a DSpark walk's top 1024) + exact score (`pick`) vs full NVFP4 head (`full`). |
+| `draft_weights` | `auto` \| `nvfp4` \| `q8` \| `exact` | `auto` | Drafter weight precision. `auto` selects target-matched precision when VRAM allows (BF16 beside BF16 except where the model asks Q8_0 for its block drafter, a DeepSpec DSpark's; Q8_0 beside GGUF, NVFP4 beside NVFP4; MTP uses NVFP4) and drops to `nvfp4` when VRAM is tight; `nvfp4` forces 4-bit streaming quantization; `q8` uses Q8_0; `exact` keeps file precision and uncompacted draft head. |
 | `draft_kv` | `fp8` \| `16` | `fp8` | MTP drafter KV cache dtype when target KV is FP8. |
 | `act_group` | `32` \| `64` \| `128` \| `256` | `32` | Measurement only: 8-bit activation scale group size (use with `fusion=0,round_glu=0`). |
 | `act_fp4` | `0` \| `1` \| `2` | `0` | Measurement only: round staged activations as NVFP4 (`1`) or MXFP8 (`2`). |
+| `moe_dp4a` | `default` \| `original` \| `1x1` \| `1x2` \| `2x1` \| `2x2` \| `4x1` \| `4x2` | `default` | Measure packed expert dp4a GEMMs with staged 8-bit activations for IQ3_XXS, IQ2_S, IQ2_XXS, IQ2_XS, IQ4_NL and Q4_K in one configuration (`backends/cuda/variants/candidates.toml`, `moe_dp4a`). The two numbers select output columns per warp (gate/up pairs when fused) and K/32 units in flight per lane; these specialize grouped tiles containing one row. `default` takes the GPU's tuning table's rules for fused gate/up GEMMs (`moe_gate_up` under `variants/<arch>/tables/<sku>.toml`; `candidates.toml` defaults keep original tiles where a table has none) and the original tiles elsewhere; `original` keeps the original tiles everywhere. A release build (`FLYX_TUNE_CANDIDATES=OFF`) compiles non-original configurations only for fused gate/up in the row bands and architectures its tables reach, so forcing any non-original override requires `FLYX_TUNE_CANDIDATES=ON`. |
 
 ### Attention, Tiered KV, StrataFlux, and MTP Cache
 
 | Key | Allowed Values | Default | Effect |
 |---|---|---|---|
-| `attention` | `auto` \| `split` \| `head` | `auto` | Prefill attention kernel (`split` = FP32; `head` = ungrouped, disables FP8 KV). |
+| `attention` | `auto` \| `split` \| `head` | `auto` | Attention kernel selection (`split` = FP32 split prefill instead of FlashAttention; `head` = ungrouped per-head prefill and decode/verify attention, disabling FP8 KV). |
 | `rows_attention` | `mma` \| `cores` | `mma` | Decode/verify attention on tensor cores (`mma`) or FP32 CUDA cores (`cores`). |
 | `rows_attention_from` | `N` (≥ 0) | `8192` | Key count threshold for switching decode attention to tensor cores. |
 | `rows_attention_parts` | `1` \| `2` \| `3` | auto (`1` or `3`) | Binary16 split precision parts for `q` and `p` in tensor-core decode attention (`1` on GQA > 4 & HD ≥ 256, else `3`). |
@@ -190,7 +210,7 @@ Passed verbatim to the backend (`backends/cuda/backend.cpp`). Unknown keys or in
 | `stage_dma` | `0` \| `1` | `1` | Use async H2D DMA transfers for committed StrataFlux prefixes (single-session decode) and aligned historical FP8 prefill windows. |
 | `stage_blocks` | `N` (≥ 1) | `4` | CUDA blocks allocated to kernel-based `kv_stage` copy. |
 | `stage_window` | multiple of 64 | `16384` | Device staging window positions for prefill over host KV. |
-| `strata_from` | `N` (≥ 0) | `kv_gpu` | Position threshold where `--kv-method auto` switches from exact attention to StrataFlux. |
+| `strata_from` | `N` (≥ 0) | Requested GPU position cap or estimated capacity of the text target alone | Position threshold where `--kv-method auto` switches from exact attention to StrataFlux. |
 | `strata_denom` | `N` (≥ 0) | `16` (2-bit) / `64` (3–4-bit) | Refine 1 key pair in `N` per row (`0` = no refinement, scan copy only). |
 | `strata_least` | `N` (≥ 1) | `32` | Minimum refined key pairs per row. |
 | `strata_most` | `N` (≥ 0) | `256` | Maximum refined key pairs per row (`0` = unbounded). |
@@ -206,7 +226,24 @@ Passed verbatim to the backend (`backends/cuda/backend.cpp`). Unknown keys or in
 | `mtp_window` | `N` (≥ 0) | `4096` | Above `8 * N` context, MTP reads last `N` positions exact (`0` = full exact device cache). |
 | `mtp_copy` | `0` \| `2..4` | `2` | StrataFlux bit-width for MTP layer beyond `mtp_window` (`0` = disabled). |
 | `mtp_sink` | `N` (≥ 0) | `64` | Initial sink positions kept exact for MTP when `mtp_copy=0`. |
-| `mtp_ring` | `0` \| `1` | `1` | Ring buffer storage for MTP exact window (`0` = linear slots, tests). |
+| `mtp_ring` | `0` \| `1` | `1` | Ring buffer storage for MTP exact window: the window, one prefill pass and the sink, copied to host memory with every checkpoint as a sliding-window layer's ring is (`0` = linear slots, tests). A rewind whose window later positions overwrote in the ring is refused, and the session recomputes instead. |
+| `dflash_ring` | `0` \| `1` | `1` | Ring buffer storage for sliding-window DFlash2 context K/V (`0` = linear slots, tests). A checkpoint, snapshot or rewind whose drafter window later positions overwrote in the ring is refused, and the session recomputes instead. |
+
+### Inkling-2 Rounds
+
+Every option here but `moe_vec` changes only where and when kernels run, never a result bit. Each also has a legacy environment spelling ([Environment Variables](#4-environment-variables)).
+
+| Key | Allowed Values | Default | Effect |
+|---|---|---|---|
+| `moe_vec` | `0` \| `1` | `0` | NVFP4 experts with float32 inputs on column-at-a-time vector kernels at every width (`1`) instead of bf16 inputs on tensor cores: another arithmetic contract (both are tested against float64, [Numerics](design/numerics.md)), kept for measurement. |
+| `sc_cluster` | `1` \| `4` \| `8` | `8` | A fused sublayer's row over a cluster of this many blocks (sm_90 and later, where the device fits the cluster; otherwise, and with `1`, one block). |
+| `warm` | sum of `1`, `2`, `4`, `16` | `23` | L2 warming on the expert stream during rounds: the next MoE's router (`1`), loop controller (`2`), residual query and norm (`4`), and the next attention's small weights (`16`). `0`: none. |
+| `expert_prefetch` | `0` \| `1` \| `2` | `2` | Guess the next MoE's experts from the residual and prefetch their weights: in rounds of 2 or more rows (`2`), in every round (`1`) or never (`0`). |
+| `guess` | `0` to `15` | `5` | One-row rounds: a second guess from the mixed residual, prefetching these planes (bits: gate and up codes `1`, their scales `2`, down codes `4`, their scales `8`). `0`: none. |
+| `guess_k` | `N` (≥ 0) | `4` | Prefetch the `N` best-scored guessed experts (`0`: all `top_k`). |
+| `side_loop_msg` | `0` \| `1` | `1` | Loop messages on the side stream beside the sublayer's mix (needs `side_stream=1`). |
+| `side_companion` | `0` \| `1` | `1` | A sink or tap projection on the side stream beside the wide GEMM that shares its input (needs `side_stream=1`). |
+| `side_kv` | `0` \| `1` | `1` | A sliding-window round's K and V projections on the side stream beside the query path (needs `side_stream=1`). |
 
 ---
 
@@ -227,6 +264,14 @@ Base URLs: OpenAI clients use `http://127.0.0.1:8080/v1`; Anthropic clients use 
 | `POST /v1/messages` | Anthropic Messages | `system`, content blocks (`text`, base64 `image`, `tool_use`, `tool_result`, `thinking`), `tools`, `tool_choice` (`auto`, `any`, `tool`, `none`; `disable_parallel_tool_use`), `thinking` (`enabled`/`disabled`), `output_config.format` (`json_schema`; incompatible with assistant prefill), `stop_sequences`, `stream`, `max_tokens`. Reused tokens reported in `usage.cache_read_input_tokens`. **Prewarm mode:** `max_tokens: 0` with `stream: false` prefills and caches the prompt (rejects enabled thinking, `output_config.format`, or required tool use with HTTP 400). |
 | `POST /v1/messages/count_tokens` | Anthropic Messages | Returns prompt token count for a Messages payload without generating (including expanded vision tokens when a vision encoder is loaded). |
 
+For image input, load a supported `qwen35` target and its matching `qwen3vl_merger` projector. The Hub can fetch it automatically, or select a local companion with **Use as projector**. The dashboard accepts pasted or dropped images. In a user message, send one of these content blocks alongside a text instruction (replace `BASE64` with the encoded PNG bytes).
+
+| Endpoint | Image content block |
+|---|---|
+| `/v1/chat/completions` | `{"type":"image_url","image_url":{"url":"data:image/png;base64,BASE64"}}` |
+| `/v1/responses` | `{"type":"input_image","image_url":"data:image/png;base64,BASE64"}` |
+| `/v1/messages` | `{"type":"image","source":{"type":"base64","media_type":"image/png","data":"BASE64"}}` |
+
 ### Management, Telemetry, and Hub Endpoints
 
 `GET /health` answers anyone who reaches the port. `GET /v1/telemetry` and `GET /v1/load` take the API key when one is set (HTTP 401 without it). The others (`/v1/requests`, `/v1/logs`, `POST`/`DELETE /v1/load`, `/v1/unload`, `/v1/hub/*`) are for this machine, or with `--api-key` for the key's holder (HTTP 403 otherwise). This machine means a connection from the loopback address that no proxy passed on: a request carrying `Forwarded`, `X-Forwarded-*`, `X-Real-IP` or `Via` is taken as coming from elsewhere, so behind a reverse proxy or an HTTP tunnel set `--api-key`.
@@ -237,23 +282,28 @@ Base URLs: OpenAI clients use `http://127.0.0.1:8080/v1`; Anthropic clients use 
 | `GET /v1/telemetry?recent=N` | Schema version 1 live metrics snapshot (`recent` default `20`, max `100`). See [docs/monitor.md](monitor.md). |
 | `GET /v1/requests?limit=N` | Last ≤ 50 finished requests (in-memory only; supports `ETag` / `If-None-Match` → 304). Fields: `enabled`, `requests[]` (`id`, `api`, `model`, `started_at`, `finished_at`, `stream`, `status`, `error`, `usage`, `ttft_ms`, `request`, `reasoning`, `content`, `tool_calls`, optional `timing`, `cancel_reason`, `client_hints`). Clips large request/reply strings (64 KiB cap; down to 1 KiB if body > 256 KiB); of a reply's tool calls the first 64 are kept, each argument string clipped at 64 KiB. |
 | `GET /v1/logs?after=SEQ&limit=N` | Last ≤ 2000 stderr lines (8 KiB/line, in-memory; default `limit=500`). Returns `enabled`, `lines[{seq, t, text}]`, `next`, `missed`. |
-| `GET /v1/load` | Current load/served status: `state` (`none`, `fetching`, `loading`, `ready`, `failed`), `progress`, `error`, `fallback` (always `null`: a model that fails to load is not replaced by the one served before; kept for clients that read the field), `notes`, `drafters`, `suggested`, `vision_projector` (`{from, size}` or `null`), active options, and `remembered` saved settings. |
-| `POST /v1/load` | Async model load/switch (HTTP 202; HTTP 409 if another load is active). Body: `{"model", "drafters", "ctx" (N\|"max"), "drafter", "speculative", "kv" ("fp8"\|"16"\|"auto"), "kv_ram", "kv_gpu", "width", "draft_trees", "lookup", "draft_head", "draft_weights", "lora" (a PEFT adapter's folder or Hub name; null: none), "vision", "mmproj", "vision_device" ("disk"\|"host"\|"gpu"\|"auto"), "vision_quant" ("q8"\|"exact"\|"nvfp4"), "vision_max_tokens", "name"}` (`"kv": "auto"`: the engine's default cache type, whatever the server's `--kv`; the dashboard's auto choice sends it). Fetches while current model serves; on load failure after unloading, stays in `state: "failed"` with no model served. `DELETE /v1/load` aborts an in-progress fetch. |
+| `GET /v1/load` | Current load/served status: `state` (`none`, `fetching`, `loading`, `ready`, `failed`), `progress`, `error`, `fallback` (always `null`: a model that fails to load is not replaced by the one served before; kept for clients that read the field), `degraded` (list of `{kind, from, to, detail}` VRAM adjustments made during elastic load; empty when full settings fit), `notes`, `drafters` (actively loaded drafters), `suggested` (the verified drafters for the served model it was not given, as `/v1/hub/files` gives `known_drafters`: `[{repo, kind, base, exact, relation, size, tok_s}]`, `tok_s` for the model served), `vision_projector` (`{from, size}` or `null`), active options, and `remembered` saved settings. |
+| `POST /v1/load` | Async model load/switch (HTTP 202; HTTP 409 if another load is active). Body: `{"model", "drafters", "ctx" (N\|"max"), "drafter", "speculative", "kv" ("fp8"\|"16"\|"auto"), "kv_ram", "kv_gpu", "width", "draft_trees" (`true`, `false`, or `null`/absent: the drafter's default, as saved), "lookup", "draft_head", "draft_weights" ("auto"\|"nvfp4"\|"q8"\|"exact"), "lora" (a PEFT adapter's folder or Hub name; null: none), "vision", "mmproj", "vision_device" ("disk"\|"host"\|"gpu"\|"auto"), "vision_quant" ("q8"\|"exact"\|"nvfp4"), "vision_max_tokens", "name"}` (`"kv": "auto"`: the engine's default cache type, whatever the server's `--kv`; the dashboard's auto choice sends it). Fetches while current model serves; on load failure after unloading, stays in `state: "failed"` with no model served. Saved settings in `serve.json` always keep the requested configuration even if tight VRAM caused elastic load adjustments. `DELETE /v1/load` aborts an in-progress fetch. |
 | `POST /v1/unload` | Stops active requests and unloads model (`state: "none"`, inference returns 503). Preserves `serve.json`. HTTP 409 if loading. |
 | `GET /v1/device/processes?kind=vram\|ram` | On-demand list of other applications occupying GPU VRAM (`kind=vram`, default) or host RAM (`kind=ram`): `kind`, `supported`, `can_close`, `device`, `mem_total`, `mem_used`, `mem_free`, `own_bytes`, `others_bytes`, `system_bytes`, `idle_igpu`, `apps[]` (`id`, `name`, `process`, `bytes`, `local_bytes`, `processes`, `closable`, `reason`). |
 | `POST /v1/device/close` | Closes (`{"id", "force": false, "kind": "vram"\|"ram"}`, default graceful `WM_CLOSE`/`SIGTERM`) or force-quits (`"force": true`) an application currently listed by `GET /v1/device/processes`. Loopback requests only (HTTP 403 otherwise); refuses system processes, ancestor processes running FLYX, and other users' processes (HTTP 403). Answers `{"status": "closed" \| "still_running" \| "no_window", "windows_signaled", "name", "snapshot"}`. |
 | `POST /v1/agents/launch` | Starts a coding agent against the served model in a new Windows PowerShell window on the server's machine (body `{"agent": "claude" \| "codex", "dir"}`). For Claude Code, the optional `permission_mode` accepts `default`, `acceptEdits`, `auto`, or `bypassPermissions`. Omitting it uses Claude Code's settings. Without `dir`, the desktop's folder dialog asks for the project folder. The server writes the command itself (the Integration page's, Codex's profile as `-c` overrides, no file of the user's written); an API key reaches the window as `FLYX_KEY` in its environment, never on a command line. Answers `{"launched": true, "dir"}`, or `{"launched": false}` when the dialog is cancelled. Loopback requests only (HTTP 403 otherwise); HTTP 409 with no model served, a dialog already open, or (Codex) a model id with one of `" & \| < > ^ %`, which PowerShell or `codex.cmd`'s cmd.exe cannot pass on; Codex is run as `codex.cmd` or `codex.exe`, so a system that runs no PowerShell scripts still starts it; HTTP 501 where no window can be opened (not Windows, SSH, a service). `telemetry.server.agent_launch` lists the agents it can start. |
+| `GET /v1/settings/network` | Returns the saved `lan_access`, effective `listen_host` and `port`, `serving_lan`, `host_from_cli`, `restart_required`, and client `api_urls`. Both network settings operations require management access. |
+| `POST /v1/settings/network` | Saves `{"lan_access": true}` or `{"lan_access": false}` for the next launch and returns the updated network settings. An explicit `--host` returns HTTP 409. |
 | `GET /v1/hub/config` | Returns the active Hugging Face Hub endpoint configuration: `{"endpoint", "default_endpoint", "source" ("setting"\|"HF_ENDPOINT"\|"default"), "offline"}`. |
 | `POST /v1/hub/config` | Updates the active Hugging Face Hub endpoint (`{"endpoint": URL}` or `""` to reset), normalizes/validates the URL, persists it as `hub_endpoint` in `serve.json`, and returns the updated config JSON. HTTP 400 on invalid URLs. |
 | `GET /v1/hub/search?q=TEXT&sort=S&limit=N&cursor=C&arch=A` | Lists HF repos holding GGUF files whose names match `q`, plus matching DFlash2 drafters and exact `org/name` lookups (`sort`: `trending` (default), `downloads`, `likes`, `updated`, `created`; `limit` 1-100, default 20; `cursor` from previous `next_cursor`): `{"query", "family", "architectures", "arch", "endpoint", "next_cursor", "models": [{"id", "downloads", "likes", "updated", "created", "pipeline", "gated", "cached", "architecture", "runs", "drafter"}]}`. Without `q`, browses supported architectures (`"family": true`), optionally narrowed to `arch`. HTTP 502 when the Hub cannot be reached or `HF_HUB_OFFLINE` is set. |
-| `GET /v1/hub/files?repo=ORG/NAME` | Lists a HF repo's GGUF quants, sizes, cache status, `mtp` and `mmproj` defaults, full `companions` list (`[{name, path, file, kind, size, cached, disk, default}]` covering drafters and `mmproj` projectors), known DFlash2 drafters, `drafter_repo` (`true` for `general.architecture=dflash` GGUF drafter repos), `endpoint`, `info` (`downloads`, `likes`, `updated`, `license`, `pipeline`, `gated`, the GGUFs' `architecture`, `context`, `parameters`; `null` when answered from the cache), `runs` (whether this build opens that architecture; `null` if unknown) and `build_architectures`. |
-| `GET /v1/hub/cached` | Lists all cached HF snapshots (`org/name:QUANT` or `org/name:QUANT@COMMIT`, with `"mmproj": "in-repo"` when the snapshot includes a vision projector) and local `--models-dir` files (including `mmproj-*.gguf` with `"kind": "mmproj"` and `mtp-*.gguf` with `"kind": "drafter"`), and LoRA adapters (`"kind": "lora"`: a PEFT folder, or a cached repository's `org/name[:FOLDER]`), which `"lora"` of `POST /v1/load` takes. |
+| `GET /v1/hub/files?repo=ORG/NAME` | Lists a HF repo's GGUF quants, sizes, cache status, `mtp` and `mmproj` defaults, full `companions` list (`[{name, path, file, kind, size, cached, disk, default}]` covering drafters, `kind` `mtp`, `dflash2` or `dspark` (from a cached file's header, else its name), and `mmproj` projectors; no projector is listed, and `mmproj` is `null`, for a repository whose architecture this build reads no vision for; the default DSpark drafter is the one a load takes by default), `known_drafters` (the verified drafters for its base models, `[{repo, kind, base, exact, relation, size, tok_s}]`: `exact` for one made for this repository, else inferred from a base model it names, `relation` how the Hub says it was made from it; each tier the fastest first, `tok_s` this machine's own mean decode speed drafting with it for this repository's models, `null` before a run: [models.md](models.md)), `drafter` (a drafter repository's `size` and `kind`), `drafter_repo` (`true` for `general.architecture=dflash` GGUF drafter repos), `endpoint`, `info` (`downloads`, `likes`, `updated`, `license`, `pipeline`, `gated`, the GGUFs' `architecture`, `context`, `parameters`; `null` when answered from the cache), `runs` (whether this build opens that architecture; `null` if unknown) and `build_architectures`. |
+| `GET /v1/hub/cached` | Lists all cached HF snapshots (`org/name:QUANT` or `org/name:QUANT@COMMIT`, with `"mmproj": "in-repo"` (only for a model of an architecture this build reads vision for) or `"dflash2": "in-repo"` for companions in the same snapshot, and `"mtp": "in-repo"` for a separate MTP layer in any cached snapshot of the repository) and local `--models-dir` files; a vision projector, cached or local, is listed with `"kind": "mmproj"`. Every GGUF is classified by its header (read once and cached), its name deciding only where the header cannot be read: a drafter is listed with `"kind": "drafter"` and its `"drafter_kind"` (`mtp`, `dflash2` or `dspark`): a drafter's directory, an `mtp-*.gguf`, and any GGUF whose header says `general.architecture=dflash` (`dspark` with `dflash.has_markov_context`), cached or local; a model's entry its `known_drafters`, as `/v1/hub/files` gives them, for the repositories its file says it comes from. LoRA adapters are listed with `"kind": "lora"` (a PEFT folder, or a cached repository's `org/name[:FOLDER]`), which `"lora"` of `POST /v1/load` takes. |
+| `GET /v1/hub/drafter?name=NAME` | The drafter a path or a Hugging Face name holds, as its own fields say: `{"name", "kind"}` (`mtp`, `dflash2`, `dspark`; `null` when they say none). A path is read from its header (a GGUF's `general.architecture`, a drafter directory's `config.json`, a `.flyx` file's `draft`), a Hub name from what the Hub says of the repository; nothing is fetched, and no name is read for a kind. `400` for a `name` that is neither, `404` for a Hub name the Hub does not have. |
 | `GET /v1/hub/loras?base=ORG/NAME` or `?model=NAME` | The LoRA adapters Hugging Face lists as made for a base model (`filter=base_model:adapter:BASE`), most downloaded first: `{"base", "from", "models": [{"id", "downloads", "likes", "updated", "gated", "cached"}], "next_cursor"}`. With `model` (a Hub name or a file of the HF cache) the base is that repository's model card's first `base_model` (`"from": "model card"`), or the repository itself; for another file `"base": null`. `limit` (1–100, default 30), `cursor`. HTTP 502 when the Hub cannot be asked (offline, unreachable). |
 | `GET /v1/hub/lora?repo=ORG/NAME[@REV]` | A repository's adapters, one per folder with an `adapter_config.json` (at most 32): `{"repo", "revision", "adapters": [{"folder", "name", "rank", "scale", "base", "targets", "linears", "layers", "size", "why"}]}`. `name` is what `--lora` and `"lora"` take; `why` is `null` when `--lora` reads it, else the reason a load would give: the config (at most 64 KiB) checked as a load checks it, and the tensors' names, dtypes and rank from the safetensors header alone (two ranged requests). Both are read into memory: nothing is downloaded to the cache. `base` and `targets` are the config's strings (a regex `target_modules` is one), cut at 120 bytes. |
 | `GET /v1/hub/dir?path=PATH` | Browses a folder of the server's machine: `{"path", "parent", "kind": "dir", "dirs": [{"name", "path"}], "models"}` with its subfolders and the `.gguf`/`.flyx` model files in it and two folders down (entries as in `/v1/hub/cached`, loadable by `name`). A model file's path answers `"kind": "file"` with that file. Without `path`: `"kind": "start"` with where to begin (`--models-dir` folders, the home directory, on Windows the disks). HTTP 404 for a path that is neither. |
 | `POST /v1/hub/dir` | Opens the desktop's own folder dialog on the server's machine (body `{"title", "start"}`, both optional) and waits: answers as `GET /v1/hub/dir` for the folder chosen, `{"path": null}` when cancelled. Loopback requests only (HTTP 403 otherwise); HTTP 501 where no dialog can be shown (SSH session, no display, a service; Linux needs `zenity` or `kdialog`); HTTP 409 while one is open. |
 | `DELETE /v1/hub/cached?name=NAME` | Deletes a cached HF snapshot + unreferenced blobs (`{"deleted", "freed"}`). Refuses active models (409) and `--models-dir` files (400). |
 | `GET /`, `GET /dashboard` | Browser dashboard UI (non-browser clients at `/` get JSON endpoint index). |
+
+To load Inkling and discover its DSpark companion, post `{"model":"unsloth/Inkling-2-Mini-GGUF:UD-IQ3_XXS"}` to `/v1/load`. To choose files explicitly, pass their paths in the `drafters` array and the mode in `drafter`. A 202 starts the operation. Poll `GET /v1/load` until `ready` or `failed`. **Draft with it** applies a companion to the chosen target. Local and cached GGUF classification uses header metadata, including the Markov discriminator. Remote listings can use repository metadata and filenames until the file is available locally.
 
 ### Semantics & Error Codes Agents Should Expect
 
@@ -263,7 +313,7 @@ Base URLs: OpenAI clients use `http://127.0.0.1:8080/v1`; Anthropic clients use 
 | Context length exceeded | `400` before stream starts: OpenAI `context_length_exceeded` (`"This model's maximum context length is ..."`), Anthropic `"prompt is too long: N tokens > M maximum"`. If queued > 10 s on a streamed request, delivered as an in-stream error event. |
 | Unsupported modality / tool format | `400` for remote image URLs, images sent when no vision encoder (`--mmproj`) is loaded, audio/video/document inputs, or `tools` on a model whose template has no supported tool-call format. Request fields not listed above (`logprobs`, `logit_bias`, `repetition_penalty`, `min_p`, the legacy `functions`, ...) are ignored. |
 | Auth failure | `401` (invalid/missing API key); `403` (remote client accessing local-only management endpoint without API key). |
-| Request superseded (same conversation retry) | Running request cancelled (`cancel_reason: "superseded"`). Anthropic queued/non-streaming returns `409` (`conflict_error`, `x-should-retry: false`); OpenAI Responses returns `status: "incomplete"` / `response.incomplete`. |
+| Request superseded (same conversation retry) | Running request cancelled (`cancel_reason: "superseded"`). A legacy `/v1/completions` prompt never supersedes another request, nor is it superseded: raw text carries no conversation, so two clients sending the same or overlapping prompts each get their own reply. Anthropic queued/non-streaming returns `409` (`conflict_error`, `x-should-retry: false`); OpenAI Responses returns `status: "incomplete"` / `response.incomplete`. |
 | Client isolation headers | Claude Code session/subagent headers and Codex `thread-id` headers isolate independent threads even with identical prompt histories. |
 | Default sampling (when request omits params) | Qwen3.5 model card defaults: thinking ON → `temperature=0.6, top_p=0.95, top_k=20, presence_penalty=0`; thinking OFF → `temperature=0.7, top_p=0.8, top_k=20, presence_penalty=1.5`. For tool/code use without thinking, pass `presence_penalty: 0` (or `--presence-penalty 0`). |
 | Grammar enforcement | Enabled automatically when `tools` or `response_format` / `output_config.format` is set. Compiled once per tool/schema set and cached; checked after each speculative round with rollback on rejected tokens. |

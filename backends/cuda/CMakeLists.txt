@@ -34,17 +34,23 @@ set(FLYX_CUDA_COMPAT_BLOCK_SOURCES
     kernels/gemm_blocks_iq_low.cu kernels/gemm_blocks_iq_high.cu
     kernels/gemm_blocks_round_legacy.cu kernels/gemm_blocks_round_k.cu
     kernels/gemm_blocks_round_iq_low.cu kernels/gemm_blocks_round_iq_high.cu kernels/gemm_blocks_round_glu.cu)
-set(FLYX_CUDA_COMPAT_SOURCES ${FLYX_CUDA_COMPAT_BLOCK_SOURCES} kernels/attention_strata.cu kernels/gdn.cu)
+set(FLYX_CUDA_COMPAT_SOURCES ${FLYX_CUDA_COMPAT_BLOCK_SOURCES}
+    kernels/moe_blocks_legacy.cu kernels/moe_blocks_k.cu
+    kernels/moe_blocks_iq_low.cu kernels/moe_blocks_iq_high.cu
+    kernels/attention_strata.cu kernels/gdn.cu)
 set(FLYX_CUDA_TABLE_SOURCES
     kernels/gemm.cu kernels/gemm_decode.cu kernels/attention_flash.cu
-    kernels/gemm_blocks.cu kernels/gemm_blocks_round.cu ${FLYX_CUDA_COMPAT_BLOCK_SOURCES})
+    kernels/gemm_blocks.cu kernels/gemm_blocks_round.cu ${FLYX_CUDA_COMPAT_BLOCK_SOURCES}
+    kernels/moe.cu kernels/moe_blocks_legacy.cu kernels/moe_blocks_k.cu
+    kernels/moe_blocks_iq_low.cu kernels/moe_blocks_iq_high.cu)
 set(FLYX_CUDA_KERNEL_SOURCES
     kernels/common/launch.cu
     kernels/gemm.cu kernels/gemm_decode.cu kernels/gemm_prefill.cu
     kernels/gemm_blocks.cu kernels/gemm_blocks_round.cu kernels/gemm_blocks_tables.cu
     kernels/attention.cu kernels/attention_flash.cu kernels/attention_rows.cu kernels/tree.cu
     kernels/gdn_chunk.cu kernels/rows.cu kernels/sampling.cu kernels/draft.cu kernels/draft_head.cu
-    kernels/dv.cu kernels/head_cert.cu kernels/stop_decide.cu kernels/vision.cu)
+    kernels/dv.cu kernels/head_cert.cu kernels/stop_decide.cu kernels/vision.cu kernels/inkling2.cu
+    kernels/moe.cu kernels/dspark.cu)
 
 # The device code's flags: line tables unless left out, the fatbinary's compression (top-level CMakeLists.txt).
 set(FLYX_CUDA_DEVICE_FLAGS "")
@@ -74,11 +80,13 @@ function(flyx_configure_cuda_lib target archs)
   cmake_parse_arguments(ARG "USES_TABLES" "" "" ${ARGN})
   set_target_properties(${target} PROPERTIES CUDA_ARCHITECTURES "${archs}")
   target_compile_options(${target} PRIVATE "$<$<COMPILE_LANGUAGE:CUDA>:${FLYX_CUDA_DEVICE_FLAGS}>")
+  # Define uniformly across all CUDA libraries so shared inline helpers (e.g. moe_dp4a_cfg_compiled) see the same value
+  # in every translation unit.
+  target_compile_definitions(${target} PUBLIC FLYX_TUNE_CANDIDATES=$<IF:$<BOOL:${FLYX_TUNE_CANDIDATES}>,1,0>)
   if(ARG_USES_TABLES)
     add_dependencies(${target} flyx_gemm_tables)
     target_include_directories(${target} PUBLIC ${CMAKE_SOURCE_DIR} ${CMAKE_SOURCE_DIR}/include
                                ${CMAKE_SOURCE_DIR}/third_party ${FLYX_GEN_DIR})
-    target_compile_definitions(${target} PUBLIC FLYX_TUNE_CANDIDATES=$<IF:$<BOOL:${FLYX_TUNE_CANDIDATES}>,1,0>)
   else()
     target_include_directories(${target} PUBLIC ${CMAKE_SOURCE_DIR} ${CMAKE_SOURCE_DIR}/include)
   endif()
@@ -112,19 +120,21 @@ set_source_files_properties(${FLYX_CUDA_TABLE_SOURCES} runtime/state.cpp
 
 # Host code only: built by the C++ compiler, kernels come from the static library.
 set(FLYX_CUDA_HOST_SOURCES
-  backend.cpp
   loader/bind.cpp loader/weights.cpp
   runtime/state.cpp runtime/runner.cpp runtime/graphs.cpp runtime/sleep.cpp runtime/device_stats.cpp runtime/tiers.cpp
   runtime/vision_disk.cpp
   regions/batch.cpp regions/layers.cpp regions/linear.cpp regions/plan.cpp)
-add_library(flyx-cuda MODULE ${FLYX_CUDA_HOST_SOURCES})
-target_link_libraries(flyx-cuda PRIVATE flyx_cuda_kernels CUDA::cudart_static ${CMAKE_DL_LIBS})
+# Reuse the same loader, plan and sequence objects in the allocation-failure integration test.
+add_library(flyx_cuda_host STATIC ${FLYX_CUDA_HOST_SOURCES})
+target_link_libraries(flyx_cuda_host PUBLIC flyx_cuda_kernels CUDA::cudart_static ${CMAKE_DL_LIBS})
+add_library(flyx-cuda MODULE backend.cpp)
+target_link_libraries(flyx-cuda PRIVATE flyx_cuda_host)
 set_target_properties(flyx-cuda PROPERTIES PREFIX "lib" CUDA_ARCHITECTURES "${FLYX_CUDA_ARCHS}")
 
 if(FLYX_STANDALONE_EXE)
-  add_library(flyx_cuda_static STATIC ${FLYX_CUDA_HOST_SOURCES})
+  add_library(flyx_cuda_static STATIC backend.cpp)
   target_compile_definitions(flyx_cuda_static PRIVATE FLYX_STATIC_BACKEND)
-  target_link_libraries(flyx_cuda_static PUBLIC flyx_cuda_kernels CUDA::cudart_static ${CMAKE_DL_LIBS})
+  target_link_libraries(flyx_cuda_static PUBLIC flyx_cuda_host)
   set_target_properties(flyx_cuda_static PROPERTIES CUDA_ARCHITECTURES "${FLYX_CUDA_ARCHS}")
 endif()
 

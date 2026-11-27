@@ -14,6 +14,7 @@ import { Requests } from "./pages/requests.js";
 import { Chat } from "./pages/chat.js";
 import { Logs } from "./pages/logs.js";
 import { Integration } from "./pages/integration.js";
+import { NetworkSettings } from "./pages/settings.js";
 import { Hint, markVisited } from "./components/hints.js";
 import { VramModal, isVramError, parseVramNeeded } from "./components/vram_apps.js";
 import { reloadServed, loadWant } from "./lib/actions.js";
@@ -104,7 +105,7 @@ function App() {
     setTimeout(() => redraw((x) => x + 1), 200);  // the charts take the panel's new width once the sidebar has moved
   };
 
-  // The keys: 1 to 6 a page, [ the sidebar.
+  // Number keys select a page, [ toggles the sidebar.
   useEffect(() => {
     const key = (e) => {
       if (e.ctrlKey || e.metaKey || e.altKey || typing(e)) return;
@@ -139,7 +140,9 @@ function App() {
     : t("No model loaded") + " · FLYX";
 
   const page = (id, body) => html`<section id=${"tab-" + id} hidden=${tab !== id}>${body}</section>`;
-  const modalNeed = memKind === "vram" && L && !busyLoad(L) && isVramError(L.error) ? parseVramNeeded(L.error) : 0;
+  const ctxLim = tm && tm.model && tm.model.context_limit;
+  const ctxNeed = ctxLim && ctxLim.need_more > 0 && memKind === (ctxLim.by === "host" ? "ram" : "vram") ? ctxLim.need_more : 0;
+  const modalNeed = memKind === "vram" && L && !busyLoad(L) && isVramError(L.error) ? parseVramNeeded(L.error) : ctxNeed;
   const modalRetry = tm && tm.model && tm.model.id && L && L.loaded
     ? () => { setMemKind(""); reloadServed(); }
     : L && L.state === "failed" && L.target
@@ -160,6 +163,7 @@ function App() {
           ${page("chat", html`<${Chat} active=${tab === "chat"} showModel=${showModel}/>`)}
           ${page("logs", html`<${Logs} active=${tab === "logs"}/>`)}
           ${page("integration", html`<${Integration} active=${tab === "integration"}/>`)}
+          ${page("settings", tab === "settings" && html`<${NetworkSettings} key=${JSON.stringify([apiKey(), tm?.server?.started_at, live.offline])}/>`)}
         </div>
       </main>
       <${VramModal} open=${!!memKind} kind=${memKind || "vram"} onClose=${() => setMemKind("")} needBytes=${modalNeed}

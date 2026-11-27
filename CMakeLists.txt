@@ -1,9 +1,14 @@
 # Copyright 2026 The flyx Authors. SPDX-License-Identifier: Apache-2.0
 cmake_minimum_required(VERSION 3.24)
-project(flyx VERSION 0.2.0 LANGUAGES C CXX)
+project(flyx VERSION 0.2.1 LANGUAGES C CXX)
 
 option(FLYX_CUDA "Build the CUDA backend (needs CUDA 13)" ON)
 option(FLYX_TESTS "Build tests" ON)
+# DV is not in production: its tests and their assets (tests/dv.cmake, make_tiny.py --group dv) only when asked for
+# (the *-full configure presets); its code is built either way.  In a tree on Linux six of DV's CUDA tests are known red
+# (tests/dv.cmake) and disabled unless FLYX_TEST_DV_KNOWN_RED.
+option(FLYX_TEST_DV "Register DV's tests and make their assets" OFF)
+option(FLYX_TEST_DV_KNOWN_RED "Run DV's tests known to fail in a tree on Linux (tests/dv.cmake)" OFF)
 option(FLYX_COMPILER_CACHE "Compile through sccache or ccache when one is installed" ON)
 
 # A compiler cache, when installed: a source it has compiled before with the same flags (another commit's tree, a
@@ -199,11 +204,11 @@ target_link_libraries(flyx_core PRIVATE flyx_jinja flyx_xgrammar)
 # (interfaces::open_model, interfaces::open_chat); their objects go into the core library, so whatever links
 # core has them.
 add_library(flyx_models OBJECT models/model.cpp models/dv.cpp
-            models/drafters/dflash2.cpp models/drafters/registry.cpp
-            models/llama/llama.cpp models/qwen35/qwen35.cpp
+            models/drafters/dflash2.cpp models/drafters/dspark.cpp models/drafters/registry.cpp
+            models/llama/llama.cpp models/qwen35/qwen35.cpp models/inkling2/inkling2.cpp
             models/vision/preprocess.cpp
             models/formats/formats.cpp models/formats/pytext.cpp models/formats/calls.cpp
-            models/formats/tags.cpp models/formats/grammar.cpp models/formats/qwen35.cpp)
+            models/formats/tags.cpp models/formats/grammar.cpp models/formats/qwen35.cpp models/formats/inkling2.cpp)
 target_include_directories(flyx_models PRIVATE ${CMAKE_SOURCE_DIR} ${CMAKE_SOURCE_DIR}/include
                            ${CMAKE_SOURCE_DIR}/third_party)
 target_sources(flyx_core PRIVATE $<TARGET_OBJECTS:flyx_models>)
@@ -249,11 +254,13 @@ set(FLYX_CLI_SOURCES
     apps/flyx-server/openai_responses.cpp apps/flyx-server/anthropic_messages.cpp
     apps/flyx-server/telemetry.cpp apps/flyx-server/model_host.cpp apps/flyx-server/manage.cpp
     apps/flyx-server/request_log.cpp apps/flyx-server/system_log.cpp apps/flyx-server/agent_launch.cpp
-    apps/flyx-server/gpu_apps.cpp
+    apps/flyx-server/gpu_apps.cpp apps/flyx-server/network.cpp apps/flyx-server/drafter_speeds.cpp
     ${FLYX_DASHBOARD_CPP}
     apps/common/engine_flags.cpp apps/common/numbers.cpp apps/common/model_source.cpp)
+set(FLYX_CLI_LIBRARIES flyx_core Threads::Threads)
 if(WIN32)
   list(APPEND FLYX_CLI_SOURCES apps/flyx-cli/flyx.rc)
+  list(APPEND FLYX_CLI_LIBRARIES iphlpapi)
 endif()
 add_executable(flyx-cli ${FLYX_CLI_SOURCES})
 target_compile_definitions(flyx-cli PRIVATE FLYX_VERSION="${PROJECT_VERSION}"
@@ -261,7 +268,7 @@ target_compile_definitions(flyx-cli PRIVATE FLYX_VERSION="${PROJECT_VERSION}"
                            FLYX_VERSION_MINOR=${PROJECT_VERSION_MINOR}
                            FLYX_VERSION_PATCH=${PROJECT_VERSION_PATCH})
 set_source_files_properties(${FLYX_DASHBOARD_CPP} PROPERTIES SKIP_PRECOMPILE_HEADERS ON)
-target_link_libraries(flyx-cli PRIVATE flyx_core Threads::Threads)
+target_link_libraries(flyx-cli PRIVATE ${FLYX_CLI_LIBRARIES})
 set_target_properties(flyx-cli PROPERTIES OUTPUT_NAME flyx)
 flyx_program(flyx-cli)
 if(NOT WIN32)  # Windows: flyx serve (a link there needs the right to make one)
@@ -318,7 +325,7 @@ if(FLYX_STANDALONE_EXE)
                              FLYX_VERSION_MAJOR=${PROJECT_VERSION_MAJOR}
                              FLYX_VERSION_MINOR=${PROJECT_VERSION_MINOR}
                              FLYX_VERSION_PATCH=${PROJECT_VERSION_PATCH})
-  target_link_libraries(flyx-standalone PRIVATE flyx_core flyx_cpu_ref_static Threads::Threads)
+  target_link_libraries(flyx-standalone PRIVATE ${FLYX_CLI_LIBRARIES} flyx_cpu_ref_static)
   if(TARGET flyx_cuda_static)
     target_compile_definitions(flyx-standalone PRIVATE FLYX_HAVE_BUILTIN_CUDA=1)
     target_link_libraries(flyx-standalone PRIVATE flyx_cuda_static)

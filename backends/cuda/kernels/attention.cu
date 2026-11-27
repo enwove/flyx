@@ -268,7 +268,8 @@ template <int HD, int RT, bool CANVAS = false>
 __global__ void __launch_bounds__(128) k_attention(const float* q, const kv16* Kc, const kv16* Vc, int nh, int nkv,
                                                    int rows, int causal, int extra, float scale, const DevParams* P,
                                                    float* part, int pos_add, int window, int slots,
-                                                   const TreeRows* tree, int canvas_s0, SplitWindow sw = {}) {
+                                                   const TreeRows* tree, int canvas_s0, SplitWindow sw = {},
+                                                   int ring = 0) {
   pdl_trigger();
   constexpr int DPL = HD / 32;
   __shared__ float s_m[4][RT], s_l[4][RT];
@@ -335,7 +336,8 @@ __global__ void __launch_bounds__(128) k_attention(const float* q, const kv16* K
     float kf[DPL], vf[DPL];
     const int key = CANVAS ? (j < canvas_from ? j : canvas_s0 + (j - canvas_from))
                            : RT == 1 ? tree_slot(tree, r0, base, j) : j;
-    const size_t at = (size_t(key) * nkv + kvh) * HD + lane * DPL;
+    const int cell = ring > 0 ? key % ring : key;
+    const size_t at = (size_t(cell) * nkv + kvh) * HD + lane * DPL;
 #pragma unroll
     for (int e = 0; e < DPL; ++e) {
       kf[e] = __half2float(Kc[at + e]);
@@ -1088,13 +1090,17 @@ void attention_split(const float* q, KvRef kv, int nh, int nkv, int hd, int rows
                                                 st, pos_add, opts(L), from, tree, canvas, sw))) {
     if (kv.fp8())  // the backend refuses FP8 caches of other shapes at load
       throw std::runtime_error("flyx-cuda: FP8 KV cache with an unsupported attention shape");
+    const int ring = window > 0 ? kv.ring : 0;
+    if (ring > 0 && kv.sink > 0)
+      throw std::logic_error("flyx-cuda: sliding-window ring attention expects sink == 0");
     auto per_head = [&](auto kernel1, auto kernel4, auto kernel_canvas) {
       if (on_canvas) kernel_canvas<<<grid, 128, 0, st>>>(q, Kc, Vc, nh, nkv, rows, causal, extra, scale, P, partial,
-                                                         pos_add, window, splits, nullptr, canvas.s0, SplitWindow{});
+                                                         pos_add, window, splits, nullptr, canvas.s0, SplitWindow{},
+                                                         ring);
       else if (tree || sw.state) kernel1<<<grid, 128, 0, st>>>(q, Kc, Vc, nh, nkv, rows, causal, extra, scale, P,
-                                                               partial, pos_add, window, splits, tree, -1, sw);
+                                                               partial, pos_add, window, splits, tree, -1, sw, ring);
       else kernel4<<<grid, 128, 0, st>>>(q, Kc, Vc, nh, nkv, rows, causal, extra, scale, P, partial, pos_add, window,
-                                          splits, nullptr, -1, SplitWindow{});
+                                          splits, nullptr, -1, SplitWindow{}, ring);
     };
     switch (hd) {
     case 32: per_head(k_attention<32, 1>, k_attention<32, 4>, k_attention<32, 4, true>); break;

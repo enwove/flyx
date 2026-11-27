@@ -23,17 +23,17 @@ Produces the same internal representation exposed for `.flyx` files:
 - `header["tokenizer"]` + blobs (`tokenizer.vocab`, `tokenizer.merges`, `tokenizer.added`): `gpt2` byte-level BPE tables (`qwen35` and `qwen2` pre-tokenizers, NFC or no normalization).
 - `header["generation"]["eos_ids"]`: file EOS tokens plus `<|im_end|>` and `<|endoftext|>` when present in the vocabulary.
 - `chat_template.jinja`: embedded chat template.
-- **Tensors:** exposed under GGUF names with row-major shapes (reversing GGUF's fastest-dimension-first order) and types mapped to `backend_abi.h`: `F32`, `F16`, `BF16`, `F64`, `Q4_0`, `Q4_1`, `Q5_0`, `Q5_1`, `Q8_0`, `Q2_K`–`Q6_K`, `IQ1_S`, `IQ1_M`, `IQ2_XXS`, `IQ2_XS`, `IQ2_S`, `IQ3_XXS`, `IQ3_S`, `IQ4_NL`, `IQ4_XS`, and GGML `NVFP4` (type 40). Every block tensor row must be a whole number of blocks.
+- **Tensors:** exposed under GGUF names with row-major shapes (reversing GGUF's fastest-dimension-first order) and types mapped to `backend_abi.h`: `F32`, `F16`, `BF16`, `F64`, `Q2_0`, `Q4_0`, `Q4_1`, `Q5_0`, `Q5_1`, `Q8_0`, `Q2_K`–`Q6_K`, `IQ1_S`, `IQ1_M`, `IQ2_XXS`, `IQ2_XS`, `IQ2_S`, `IQ3_XXS`, `IQ3_S`, `IQ4_NL`, `IQ4_XS`, `MXFP4` (type 39), and GGML `NVFP4` (type 40). Every block tensor row must be a whole number of blocks.
 
-Refused cleanly at open time: unsupported GGUF version/endianness, a split file with a part missing or its split metadata inconsistent, incomplete models, unsupported tensor types (e.g., `MXFP4`), quantization version ≠ 2, or any length/offset overflow, truncation, overlap, or duplicate name.
+Refused cleanly at open time: unsupported GGUF version/endianness, a split file with a part missing or its split metadata inconsistent, incomplete models, unsupported tensor types, quantization version ≠ 2, or any length/offset overflow, truncation, overlap, or duplicate name.
 
 ---
 
-## Architecture Mapping (`models/qwen35/`, `models/llama/`)
+## Architecture Mapping (`models/qwen35/`, `models/llama/`, `models/inkling2/`)
 
-Both architectures read standard `llama.cpp` keys (`<arch>.block_count`, `embedding_length`, `feed_forward_length`, `attention.head_count`, `attention.head_count_kv`, `attention.key_length`, `rope.dimension_count`, `rope.freq_base`, `attention.layer_norm_rms_epsilon`; for Qwen3.5 also `ssm.group_count`, `ssm.time_step_rank`, `ssm.state_size`, `ssm.inner_size`, `ssm.conv_kernel`, `full_attention_interval` or `attention.recurrent_layers`, and `nextn_predict_layers`). A missing `output.weight` ties the output head to `token_embd.weight`. Scaled RoPE, sliding-window target attention, MoE experts, and scaled embeddings are refused.
+All architectures read standard `llama.cpp` keys (`<arch>.block_count`, `embedding_length`, `feed_forward_length`, `attention.head_count`, `attention.head_count_kv`, `attention.key_length`, `rope.dimension_count`, `rope.freq_base`, `attention.layer_norm_rms_epsilon`; for Qwen3.5 also `ssm.group_count`, `ssm.time_step_rank`, `ssm.state_size`, `ssm.inner_size`, `ssm.conv_kernel`, `full_attention_interval` or `attention.recurrent_layers`, and `nextn_predict_layers`; for Inkling-2 `inkling2_loop` also loop prelude/core/epilogue counts, AttnRes / loop-control metadata, ShortConv, relative-position-bias attention, sliding-window SWA layers, and sparse MoE expert routing / SiTU parameters). A missing `output.weight` ties the output head to `token_embd.weight`. Scaled RoPE is refused. A supported `qwen35` target reads its vision tower from a separate `qwen3vl_merger` projector GGUF. Inkling-2-Mini is text-only.
 
-Sidecar drafters attach via `--drafter-file`: standalone MTP GGUFs (`MTP/mtp-*.gguf`) or DFlash2 checkpoints (HF directory, `.flyx`, or a drafter GGUF, below), sharing the target GGUF's packed embedding and output head.
+The app can discover a matching Markov DSpark beside the target. Use `--drafter-file` to select a companion explicitly: standalone MTP GGUFs (`MTP/mtp-*.gguf`), DFlash2 checkpoints (HF directory, `.flyx`, or a drafter GGUF, below), or DSpark GGUFs (`dspark-*.gguf`), sharing the target GGUF's packed embedding and output head.
 
 ### DFlash2 Drafter GGUF (`models/drafters/`, `general.architecture=dflash`)
 
@@ -42,13 +42,13 @@ A file `llama.cpp` reads as a DFlash2 drafter (e.g. `z-lab/Qwen3.8-27B-DFlash2-G
 | Read | Keys / Tensors |
 |---|---|
 | Dimensions | `dflash.block_count`, `embedding_length` (the target's width), `feed_forward_length`, `attention.head_count`, `attention.head_count_kv`, `attention.key_length`, `rope.freq_base`, `attention.layer_norm_rms_epsilon` |
-| Drafting | `dflash.block_size`, `conv_kernel_size`, `conv_group_size`, `selector_rank`, `selector_top_k`, `target_layers` (the target's hidden states the drafter reads: after that many layers), `attention.sliding_window` with `attention.sliding_window_pattern`, and `tokenizer.ggml.mask_token_id` (or `dflash.mask_token_id`) |
+| Drafting | `dflash.block_size`, `conv_kernel_size`, `conv_group_size`, `selector_rank`, `selector_top_k`, `target_layers` (the target's hidden states the drafter reads: `1..layers-1` tap the residual stream after that layer, `layers` taps post-`output_norm`), optional `final_logit_softcapping` (the selector's soft cap on a candidate's logit) and `selector_softcap_mode` (`before_correction`, the default, or `after_correction`: before the pair's correction is added, or on their sum), `attention.sliding_window` with `attention.sliding_window_pattern`, and `tokenizer.ggml.mask_token_id` (or `dflash.mask_token_id`) |
 | Top-level tensors | `fc.weight`, `enc.output_norm.weight`, `output_norm.weight`, `selector_hidden.weight`, `selector_predecessor.weight`, `selector_successor.weight` |
 | Per layer (`blk.<i>.`) | The dense layer's names (`attn_norm`, `attn_q`/`k`/`v`/`output`, `attn_q_norm`, `attn_k_norm`, `ffn_norm`, `ffn_gate`/`up`/`down`) plus `attn_conv_base`, `attn_conv_proj.weight`, `ffn_conv_base`, `ffn_conv_proj.weight` |
 
-Its matrices stay as stored: GGML block types packed (mixed types in one stacked projection run as one GEMM per run of a type), BF16 as BF16 (quantized at load beside a quantized target, as a `.flyx` drafter's are). The file's own tokenizer is not read.
+Its matrices stay as stored: GGML block types packed (mixed types in one stacked projection run as one GEMM per run of a type), BF16 as BF16 (quantized at load beside a quantized target, as a `.flyx` drafter's are). The file's own tokenizer is not read. A file with `dflash.has_markov_context = true` is a DSpark drafter (`models/drafters/dspark.cpp`), never the plain block: it drafts beside a model whose programs tap for it (`inkling2_loop`) and is refused beside any other.
 
-Refused, with the file named: a width or vocabulary other than the target's (whether or not the drafter is chosen); and, when it is chosen to draft, causal layers, a sliding-window pattern that is not uniform, `dflash.sample_from_anchor`, `dflash.has_confidence_head`, `dflash.final_logit_softcapping`, `dflash.has_markov_context` (DSpark), and a `target_layers` entry equal to the target's layer count (its final hidden state, taken after the output norm, which a tap of the residual stream is not).
+Refused, with the file named: a width or vocabulary other than the target's (whether or not the drafter is chosen); and, when it is chosen to draft, causal layers, a sliding-window pattern that is not uniform, `dflash.sample_from_anchor`, and `dflash.has_confidence_head`.
 
 ### Qwen3.5 Layout Flags (Zero Weight Rewriting in `models/`)
 
@@ -81,6 +81,6 @@ Refused, with the file named: a width or vocabulary other than the target's (whe
 | `gguf_models` | GGUF model description matches `.flyx` description weight-for-weight via layout flags; a drafter GGUF matches its `.flyx` drafter file block-for-block |
 | `dflash2_models` | Drafter GGUFs beside the tiny Qwen3 and Llama (block, taps, context nodes); drafter files refused for what they say or for the model they were made for |
 | `gguf_qwen2_nfc`, `gguf_qwen2_none` | Qwen2 pre-tokenizer regex splits vs HuggingFace `tokenizers` |
-| `gguf_cpu_ref`, `gguf_cuda`, `gguf_cuda_unfused`, `gguf_cuda_pdl`, `gguf_cuda_no_pdl` | End-to-end golden outputs, MTP/DFlash2 sidecars (drafter GGUFs in BF16, Q8_0 and mixed block types; beside Qwen3.5, Qwen3 and Llama), packed CUDA vs `cpu_ref` across all block types + GGML NVFP4 |
+| `gguf_cpu_ref`, `gguf_cuda_unfused`, `gguf_cuda_pdl`, `gguf_cuda_no_pdl` | End-to-end golden outputs, MTP/DFlash2 sidecars (drafter GGUFs in BF16, Q8_0 and mixed block types; beside Qwen3.5, Qwen3 and Llama), packed CUDA vs `cpu_ref` across all block types + GGML NVFP4 |
 | `cuda_ops` (`test_blocks`) | Per-type bit-exact block decode, GEMMs vs float64, row-count bit invariance |
 | `golden_*_qwen3_gguf` | Tiny Qwen3 GGUF against `transformers` |

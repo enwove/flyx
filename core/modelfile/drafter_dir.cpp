@@ -1,8 +1,10 @@
 // Copyright 2026 The flyx Authors. SPDX-License-Identifier: Apache-2.0
-// A DFlash2 drafter as its authors publish it: config.json and *.safetensors in a directory. Read
+// A block drafter (DFlash2, or DeepSpec's DSpark) as its authors publish it: config.json and *.safetensors in a directory. Read
 // into what python/convert/flyx_convert makes of it as a drafter file (--draft alone): the same "draft" description
 // (canonical_draft_config with no target) and the same tensors under the same names, their bytes read in place.
 #include <algorithm>
+#include <cctype>
+#include <cmath>
 #include <cstring>
 #include <filesystem>
 #include <fstream>
@@ -32,8 +34,83 @@ int dtype_of(const std::string& s) {
   return it == m.end() ? -1 : it->second;
 }
 
+// A transformers layer config's fields every block drafter's canonical config has (python/convert's
+// _layer_fields): width, layers, heads, head width, MLP width, norm epsilon, rope theta.
+json layer_fields(const json& tl) {
+  const int64_t layers = tl.at("num_hidden_layers").get<int64_t>();
+  if (layers <= 0 || layers > 1024) throw std::runtime_error("draft num_hidden_layers out of range");
+  const int64_t hidden = tl.at("hidden_size").get<int64_t>(), n_heads = tl.at("num_attention_heads").get<int64_t>();
+  if (hidden <= 0 || n_heads <= 0) throw std::runtime_error("draft hidden_size and num_attention_heads must be positive");
+  const json hd_given = tl.value("head_dim", json());
+  const int64_t hd = hd_given.is_number() && hd_given.get<int64_t>() != 0 ? hd_given.get<int64_t>() : hidden / n_heads;
+  if (hd <= 0) throw std::runtime_error("draft head_dim must be positive");
+  json rp = tl.value("rope_parameters", json());
+  if (rp.is_null() || rp.empty()) rp = tl.value("rope_scaling", json());
+  double theta = 10000.0;
+  if (rp.is_object() && rp.contains("rope_theta") && rp["rope_theta"].is_number()) theta = rp["rope_theta"].get<double>();
+  else if (tl.contains("rope_theta") && tl["rope_theta"].is_number()) theta = tl["rope_theta"].get<double>();
+  return {{"hidden", hidden},      {"layers", layers},     {"n_heads", n_heads},
+          {"n_kv", tl.at("num_key_value_heads")},          {"head_dim", hd},
+          {"inter", tl.at("intermediate_size")},           {"eps", tl.at("rms_norm_eps")},
+          {"rope_theta", theta}};
+}
+
+// python/convert's canonical_dspark_config(config, target=None): DeepSpec's Qwen3DSparkModel.
+json dspark_config(const json& sc) {
+  const int64_t rank = sc.at("markov_rank").get<int64_t>();
+  std::string head = sc.at("markov_head_type").get<std::string>();
+  std::transform(head.begin(), head.end(), head.begin(), [](unsigned char c) { return char(std::tolower(c)); });
+  if (rank <= 0 || head != "vanilla") throw std::runtime_error("DSpark: a vanilla Markov head (markov_rank > 0) is supported");
+  std::vector<int64_t> taps;
+  for (const auto& i : sc.at("target_layer_ids")) {
+    if (i.get<int64_t>() < 0) throw std::runtime_error("DSpark: a tap of the embedding (target layer -1) is not supported");
+    taps.push_back(i.get<int64_t>() + 1);
+  }
+  if (sc.contains("layer_types") && sc["layer_types"].is_array())
+    for (const auto& t : sc["layer_types"])
+      if (t != "full_attention") throw std::runtime_error("DSpark layer types: full attention is supported");
+  json d = layer_fields(sc);
+  d["kind"] = "dspark";
+  d["block"] = sc.at("block_size");
+  d["mask_token"] = sc.at("mask_token_id");
+  d["taps"] = taps;
+  d["conv_taps"] = 0;
+  d["conv_group"] = 1;
+  d["sel_rank"] = rank;
+  d["sel_topk"] = std::min<int64_t>(1024, sc.at("vocab_size").get<int64_t>());  // python/convert's DSPARK_CANDIDATES
+  d["window"] = 0;
+  d["draft_from"] = 0;
+  d["sel_gate"] = false;
+  d["target"] = {{"hidden", d["hidden"]}, {"vocab", sc.at("vocab_size")},
+                 {"layers", sc.value("num_target_layers", json())}};
+  return d;
+}
+
+// The block drafters a config.json names by its architecture, and the kind each reads as (draft_config).
+constexpr std::pair<std::string_view, std::string_view> kDrafterArchitectures[] = {
+    {"DFlash2DraftModel", "dflash2"},
+    {"Qwen3DSparkModel", "dspark"},
+};
+
+std::string architectures_kind(const std::vector<std::string>& architectures) {
+  for (const std::string& a : architectures)
+    for (const auto& [architecture, kind] : kDrafterArchitectures)
+      if (a == architecture) return std::string(kind);
+  return "";
+}
+
+// The block drafter a config.json is: by its architecture, else speculators' type ("dflash2"); "" for none.
+std::string drafter_config_kind(const json& sc) {
+  std::vector<std::string> archs;
+  for (const auto& a : sc.value("architectures", json::array()))
+    if (a.is_string()) archs.push_back(a.get<std::string>());
+  const std::string kind = architectures_kind(archs);
+  return !kind.empty() ? kind : sc.value("speculators_model_type", "") == "dflash2" ? "dflash2" : "";
+}
+
 // python/convert's canonical_draft_config(config, target=None).
 json draft_config(const json& sc) {
+  if (drafter_config_kind(sc) == "dspark") return dspark_config(sc);
   json dc, tl;
   std::vector<int64_t> taps;
   int64_t vocab, target_hidden;
@@ -43,7 +120,16 @@ json draft_config(const json& sc) {
     if (std::find(archs.begin(), archs.end(), "DFlash2DraftModel") == archs.end())
       throw std::runtime_error("drafter architectures " + archs.dump() + ": DFlash2DraftModel is supported");
     dc = sc.at("dflash_config"), tl = sc;
-    for (const auto& i : dc.at("target_layer_ids")) taps.push_back(i.get<int64_t>() + 1);
+    // target_layer_ids name the layers whose outputs the drafter reads (hidden_states[id + 1] in z-lab's code), so
+    // every id is below the target's layer count.  A list that reaches num_target_layers counts the hidden states
+    // themselves instead (0 the embedding, the last the final norm's output): Inco's drafter for Inkling-2, whose
+    // ids [5, 23, 41, 48] of 48 visits its reference hands, as they are, to the capture DSpark's ids go to.
+    std::vector<int64_t> ids;
+    for (const auto& i : dc.at("target_layer_ids")) ids.push_back(i.get<int64_t>());
+    const json n_target = sc.value("num_target_layers", json());
+    const bool hidden_states =
+        n_target.is_number_integer() && std::find(ids.begin(), ids.end(), n_target.get<int64_t>()) != ids.end();
+    for (int64_t id : ids) taps.push_back(hidden_states ? id : id + 1);
     vocab = tl.at("vocab_size").get<int64_t>(), target_hidden = tl.at("hidden_size").get<int64_t>();
     causal = sc.value("is_causal", json());
   } else {
@@ -59,11 +145,9 @@ json draft_config(const json& sc) {
     target_hidden = th.is_number() && th.get<int64_t>() != 0 ? th.get<int64_t>() : tl.at("hidden_size").get<int64_t>();
     causal = false;
   }
-  json rp = tl.value("rope_parameters", json());
-  if (rp.is_null() || rp.empty()) rp = tl.value("rope_scaling", json());
-  if (rp.is_null()) rp = json::object();
-  const int64_t layers = tl.at("num_hidden_layers").get<int64_t>();
-  if (layers <= 0 || layers > 1024) throw std::runtime_error("draft num_hidden_layers out of range");
+  json d = layer_fields(tl);
+  d["kind"] = "dflash2";
+  const int64_t layers = d["layers"].get<int64_t>();
   std::vector<std::string> types;
   if (tl.contains("layer_types") && tl["layer_types"].is_array() && !tl["layer_types"].empty())
     types = tl["layer_types"].get<std::vector<std::string>>();
@@ -80,25 +164,6 @@ json draft_config(const json& sc) {
   }
   const bool is_causal = causal.is_null() ? window > 0 : causal.get<bool>();
   if (is_causal) throw std::runtime_error("causal DFlash2 layers are not supported (the block attends both ways)");
-  const int64_t hidden = tl.at("hidden_size").get<int64_t>();
-  const int64_t n_heads = tl.at("num_attention_heads").get<int64_t>();
-  if (hidden <= 0 || n_heads <= 0) throw std::runtime_error("draft hidden_size and num_attention_heads must be positive");
-  const json hd_given = tl.value("head_dim", json());
-  const int64_t hd = hd_given.is_number() && hd_given.get<int64_t>() != 0 ? hd_given.get<int64_t>() : hidden / n_heads;
-  if (hd <= 0) throw std::runtime_error("draft head_dim must be positive");
-  double theta = 10000.0;
-  if (rp.contains("rope_theta") && rp["rope_theta"].is_number()) theta = rp["rope_theta"].get<double>();
-  else if (tl.contains("rope_theta") && tl["rope_theta"].is_number()) theta = tl["rope_theta"].get<double>();
-  json d = json::object();
-  d["kind"] = "dflash2";
-  d["hidden"] = tl.at("hidden_size");
-  d["layers"] = tl.at("num_hidden_layers");
-  d["n_heads"] = tl.at("num_attention_heads");
-  d["n_kv"] = tl.at("num_key_value_heads");
-  d["head_dim"] = hd;
-  d["inter"] = tl.at("intermediate_size");
-  d["eps"] = tl.at("rms_norm_eps");
-  d["rope_theta"] = theta;
   d["block"] = dc.at("block_size");
   d["mask_token"] = dc.at("mask_token_id");
   d["taps"] = taps;
@@ -107,13 +172,27 @@ json draft_config(const json& sc) {
   d["sel_rank"] = dc.value("selector_rank", json(256));
   d["sel_topk"] = dc.value("selector_top_k", json(16));
   d["window"] = window;
+  d["draft_from"] = 1;
+  d["sel_gate"] = true;
+  if (dc.contains("final_logit_softcapping") && dc["final_logit_softcapping"].is_number()) {
+    const double sc_val = dc["final_logit_softcapping"].get<double>();
+    if (!std::isfinite(sc_val) || sc_val < 0.0) throw std::runtime_error("draft final_logit_softcapping out of range");
+    if (sc_val > 0.0) d["softcap"] = sc_val;
+  }
+  if (dc.contains("selector_softcap_mode") && dc["selector_softcap_mode"].is_string()) {
+    const std::string sm = dc["selector_softcap_mode"].get<std::string>();
+    if (sm != "before_correction" && sm != "after_correction")
+      throw std::runtime_error("unsupported draft selector_softcap_mode: " + sm);
+    d["softcap_mode"] = sm;
+  }
   d["target"] = {{"hidden", target_hidden}, {"vocab", vocab}, {"layers", sc.value("num_target_layers", json())}};
   return d;
 }
 
 // python/convert's _D_SKIP and _D_RULES: the drafter's tensor names as the engine knows them, or "" to leave out.
 bool canonical(const std::string& name, std::string* out) {
-  static const std::regex skip(R"(^(embed_tokens\.|lm_head\.|verifier_norm\.|verifier_lm_head\.|t2d|d2t|mask_embedding).*)");
+  static const std::regex skip(R"(^(embed_tokens\.|lm_head\.|verifier_norm\.|verifier_lm_head\.|t2d|d2t|mask_embedding|)"
+                               R"(confidence_head\.).*)");
   static const std::vector<std::pair<std::regex, std::string>> rules = {
       {std::regex(R"(fc\.weight)"), "fc"},
       {std::regex(R"(hidden_norm\.weight)"), "hidden_norm"},
@@ -128,6 +207,8 @@ bool canonical(const std::string& name, std::string* out) {
       {std::regex(R"(candidate_selector\.predecessor_codebook)"), "sel.pred"},
       {std::regex(R"(candidate_selector\.successor_codebook)"), "sel.succ"},
       {std::regex(R"(candidate_selector\.hidden_projection\.weight)"), "sel.hid"},
+      {std::regex(R"(markov_head\.markov_w1\.weight)"), "sel.pred"},  // DSpark: W1[previous token]
+      {std::regex(R"(markov_head\.markov_w2\.weight)"), "sel.succ"},  // W2: [vocab, rank]
   };
   const std::string inner = name.rfind("model.", 0) == 0 ? name.substr(6) : name;
   if (std::regex_match(inner, skip)) return out->clear(), true;
@@ -145,6 +226,35 @@ bool canonical(const std::string& name, std::string* out) {
 
 }  // namespace
 
+namespace {
+
+// A drafter directory's config.json (at most 16 MiB, nested within json_depth_within).
+bool read_config_json(const fs::path& root, const std::string& dir, json* sc, std::string* err) {
+  constexpr size_t kMaxConfigBytes = 16u << 20;
+  std::ifstream f(root / "config.json", std::ios::binary | std::ios::ate);
+  const std::streamoff fsz = f.tellg();
+  if (!f || fsz < 0 || size_t(fsz) > kMaxConfigBytes)
+    return *err = dir + ": cannot read config.json (or larger than 16 MiB)", false;
+  f.seekg(0);
+  std::string cfg_text(size_t(fsz), '\0');
+  if (fsz > 0 && !f.read(cfg_text.data(), fsz)) return *err = dir + ": cannot read config.json", false;
+  if (!interfaces::json_depth_within(cfg_text)) return *err = dir + ": config.json nested too deeply", false;
+  *sc = json::parse(cfg_text);
+  return true;
+}
+
+}  // namespace
+
+std::string drafter_dir_kind(const std::string& dir) {
+  try {
+    json sc;
+    std::string err;
+    return read_config_json(to_path(dir), dir, &sc, &err) ? drafter_config_kind(sc) : "";
+  } catch (const std::exception&) {  // a config.json that is no JSON
+    return "";
+  }
+}
+
 bool is_drafter_dir(const std::string& path) {
   std::error_code ec;
   return fs::is_directory(to_path(path), ec) && fs::is_regular_file(to_path(path) / "config.json", ec);
@@ -161,19 +271,7 @@ bool read_drafter_dir(const std::string& dir, std::vector<std::unique_ptr<os::Ma
   if (shards.empty()) return *err = dir + ": no *.safetensors beside its config.json", false;
   try {
     json sc;
-    {
-      constexpr size_t kMaxConfigBytes = 16u << 20;
-      std::ifstream f(root / "config.json", std::ios::binary | std::ios::ate);
-      const std::streamoff fsz = f.tellg();
-      if (!f || fsz < 0 || size_t(fsz) > kMaxConfigBytes)
-        return *err = dir + ": cannot read config.json (or larger than 16 MiB)", false;
-      f.seekg(0);
-      std::string cfg_text(size_t(fsz), '\0');
-      if (fsz > 0 && !f.read(cfg_text.data(), fsz)) return *err = dir + ": cannot read config.json", false;
-      if (!interfaces::json_depth_within(cfg_text))
-        return *err = dir + ": config.json nested too deeply", false;
-      sc = json::parse(cfg_text);
-    }
+    if (!read_config_json(root, dir, &sc, err)) return false;
     const json draft = draft_config(sc);
     *out = {};
     out->arch = "drafter";
@@ -227,12 +325,19 @@ bool read_drafter_dir(const std::string& dir, std::vector<std::unique_ptr<os::Ma
     }
     for (size_t i = 0; i < out->tensors.size(); ++i) out->tensors[i].name = out->names[i].c_str();
     // python/convert's _check_draft
-    std::vector<std::string> need = {"fc", "hidden_norm", "norm", "sel.pred", "sel.succ", "sel.hid"};
-    for (int64_t j = 0; j < draft.at("layers").get<int64_t>(); ++j)
+    // The tensors its config says it has: convolutions where it has taps of them, the selector's hidden gate where
+    // it has one (sel_gate).
+    const bool conv = draft.at("conv_taps").get<int64_t>() > 0, gate = draft.at("sel_gate").get<bool>();
+    std::vector<std::string> need = {"fc", "hidden_norm", "norm", "sel.pred", "sel.succ"};
+    if (gate) need.push_back("sel.hid");
+    for (int64_t j = 0; j < draft.at("layers").get<int64_t>(); ++j) {
       for (const char* n : {"in_norm", "post_norm", "attn.q", "attn.k", "attn.v", "attn.o", "attn.q_norm",
-                            "attn.k_norm", "mlp.gate", "mlp.up", "mlp.down", "attn_conv.base", "attn_conv.proj",
-                            "mlp_conv.base", "mlp_conv.proj"})
+                            "attn.k_norm", "mlp.gate", "mlp.up", "mlp.down"})
         need.push_back("L" + std::to_string(j) + "." + n);
+      if (conv)
+        for (const char* n : {"attn_conv.base", "attn_conv.proj", "mlp_conv.base", "mlp_conv.proj"})
+          need.push_back("L" + std::to_string(j) + "." + n);
+    }
     std::sort(seen.begin(), seen.end());
     for (const std::string& n : need)
       if (!std::binary_search(seen.begin(), seen.end(), n)) return *err = dir + ": missing draft tensor " + n, false;
@@ -244,3 +349,11 @@ bool read_drafter_dir(const std::string& dir, std::vector<std::unique_ptr<os::Ma
 }
 
 }  // namespace flyx::modelfile
+
+namespace flyx {
+
+std::string drafter_kind_of(const std::vector<std::string>& architectures) {
+  return modelfile::architectures_kind(architectures);
+}
+
+}  // namespace flyx

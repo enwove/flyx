@@ -2,11 +2,12 @@
 // The Scheduler (core/exec/scheduler.h) on the tiny model: requests that run at
 // once take turns on the GPU thread and each gives what it gives alone; a
 // request whose session is busy waits without holding up the ones behind it;
-// the same conversation again cancels the running one; a queued job can be
-// cancelled; a prompt longer than the context is refused when it starts.  With
-// `dv`, a DV file's rounds in requests at once (dv_main).
+// the same conversation again cancels the running one, while raw prompts of
+// different clients that are the same or extend one another all run (raw-clients);
+// a queued job can be cancelled; a prompt longer than the context is refused
+// when it starts.  With `dv`, a DV file's rounds in requests at once (dv_main).
 //
-//   scheduler_test MODEL.flyx BACKEND [dv]
+//   scheduler_test MODEL.flyx BACKEND [dv | queue | history | raw-clients | ...]
 #include <algorithm>
 #include <atomic>
 #include <chrono>
@@ -20,19 +21,13 @@
 
 #include "core/exec/scheduler.h"
 #include "core/os/os.h"
+#include "tests/common/check.h"
 
 using namespace flyx;
 
 extern "C" void flyx_test_delegate(const flyx_backend_api*);
 
 namespace {
-
-int failures = 0;
-
-void check(bool ok, const std::string& what) {
-  std::printf("  %-4s %s\n", ok ? "ok" : "FAIL", what.c_str());
-  if (!ok) ++failures;
-}
 
 // A job's events, read on a thread of their own as an HTTP handler would.
 struct Reply {
@@ -44,6 +39,7 @@ struct Reply {
   bool superseded = false;
   bool unavailable = false;
   int finish = 0;
+  int new_tokens = 0;
   double first_ms = 0, last_ms = 0;  // the first piece of text, the last event
   std::atomic<bool> started{false};  // text has arrived: the request is running
   std::thread reader;
@@ -60,6 +56,7 @@ struct Reply {
         done = true;
         superseded = ev.superseded;
         finish = ev.result.usage.finish_reason;
+        new_tokens = ev.result.usage.new_tokens;
         reuse = ev.result.reuse;
         reused = ev.result.usage.reused_tokens;
         return;
@@ -142,8 +139,11 @@ Finished finished_as(const Scheduler& sched, const std::string& label) {
 void check_queue(Scheduler& sched) {
   auto busy = send(sched, raw(sched, "busy", "Keep generating.", 1500));
   busy->wait_started();
-  auto replaced = send(sched, raw(sched, "replaced", "Wait here.", 1));
-  auto head = send(sched, raw(sched, "front", "Wait here.", 1));
+  Request again = raw(sched, "replaced", "Wait here.", 1);
+  again.conversation_id = "queued client";  // a raw prompt is replaced only by its own conversation
+  auto replaced = send(sched, again);
+  again.label = "front";
+  auto head = send(sched, again);
   auto cancelled = send(sched, raw(sched, "cancelled", "Cancel this.", 1));
   cancelled->job->cancel();
   cancelled->wait();
@@ -168,6 +168,96 @@ void check_queue(Scheduler& sched) {
   }
   check(saw_replaced && saw_cancel && saw_timeout && t.totals.requests == 4 && t.totals.cancelled == 2 && t.totals.errors == 1,
         "recent requests and totals include a queue cancellation and timeout without a session");
+}
+
+// Raw prompts of different clients: the same text, or a text that extends another client's, is another request, and
+// each reaches its own token limit; only a shared conversation id makes the later one replace the earlier.  One
+// session (main sets max_sessions 1), so a later request waits in the queue while the earlier one runs.
+void check_raw_clients(Scheduler& sched, int long_reply) {
+  auto own_end = [](const Reply& r, const Request& rq) {
+    return r.done && !r.superseded && r.finish == FLYX_FINISH_LENGTH && r.new_tokens == rq.gen.max_new_tokens;
+  };
+  auto superseded = [](const Reply& r) { return r.done && r.superseded && r.finish == FLYX_FINISH_CANCEL; };
+  // Both queued behind a third client's request.
+  {
+    const Request busy_rq = raw(sched, "busy", "Keep generating.", long_reply);
+    const Request cat = raw(sched, "cat", "cat", 6), catalog = raw(sched, "catalog", "catalog", 6);
+    auto busy = send(sched, busy_rq);
+    busy->wait_started();
+    auto first = send(sched, cat);
+    auto second = send(sched, catalog);
+    const bool queued = !busy->job->finished();
+    busy->wait();
+    first->wait();
+    second->wait();
+    check(queued && own_end(*busy, busy_rq) && own_end(*first, cat) && own_end(*second, catalog),
+          "two queued raw prompts, one extending the other's: both reach their own limits (" + first->error +
+              second->error + ")");
+  }
+  // The first running when the second arrives.
+  {
+    const Request cat = raw(sched, "cat", "cat", long_reply), catalog = raw(sched, "catalog", "catalog", 6);
+    auto first = send(sched, cat);
+    first->wait_started();
+    auto second = send(sched, catalog);
+    const bool running = !first->job->finished();
+    first->wait();
+    second->wait();
+    check(running && own_end(*first, cat) && own_end(*second, catalog),
+          "a raw prompt extending another client's running one leaves it running: both reach their own limits (" +
+              first->error + second->error + ")");
+  }
+  // The same anonymous prompt, sampled with another seed: queued, and while the first runs.
+  {
+    Request one = raw(sched, "seed 1", "Pick a number:", long_reply);
+    one.gen.sampling = SamplingParams{0.9f, 0.9f, 40, 1};
+    Request two = one;
+    two.label = "seed 2";
+    two.gen.sampling.seed = 2;
+    two.gen.max_new_tokens = 6;
+    Request three = two;
+    three.label = "seed 3";
+    three.gen.sampling.seed = 3;
+    auto first = send(sched, one);
+    first->wait_started();
+    auto second = send(sched, two);
+    auto third = send(sched, three);
+    const bool running = !first->job->finished();
+    first->wait();
+    second->wait();
+    third->wait();
+    check(running && own_end(*first, one) && own_end(*second, two) && own_end(*third, three),
+          "the same anonymous raw prompt with other seeds, running and queued: each reaches its own limit (" +
+              first->error + second->error + third->error + ")");
+  }
+  // Another client's id: the same prompt is still another request.
+  {
+    Request mine = raw(sched, "mine", "Tell the story.", long_reply);
+    mine.conversation_id = "client 1";
+    Request theirs = raw(sched, "theirs", "Tell the story.", 6);
+    theirs.conversation_id = "client 2";
+    auto first = send(sched, mine);
+    first->wait_started();
+    auto second = send(sched, theirs);
+    first->wait();
+    second->wait();
+    check(own_end(*first, mine) && own_end(*second, theirs),
+          "the same raw prompt under two conversation ids: both reach their own limits");
+  }
+  // The documented replacement: the same conversation id, the same prompt or one that extends it.
+  for (const char* next : {"Tell the story.", "Tell the story. Then another."}) {
+    Request told = raw(sched, "told", "Tell the story.", long_reply);
+    told.conversation_id = "client 1";
+    Request retold = raw(sched, "retold", next, 6);
+    retold.conversation_id = told.conversation_id;
+    auto first = send(sched, told);
+    first->wait_started();
+    auto second = send(sched, retold);
+    first->wait();
+    second->wait();
+    check(superseded(*first) && own_end(*second, retold),
+          std::string("a raw prompt with the running one's conversation id replaces it (") + next + ")");
+  }
 }
 
 void check_prewarmed_history(Scheduler& sched) {
@@ -231,6 +321,9 @@ void check_interrupted_prewarm(const char* model, EngineOptions eo, const Schedu
   }
   prompt.gen.prefill_only = mode == "repeated-prewarm";
   prompt.label = "replaced";
+  // The anonymous prewarm hands its work to the prompt that extends it; the retry below replaces a raw
+  // generation, which takes the conversation id they share.
+  prompt.conversation_id = "prewarmed client";
   auto replaced = send(sched, prompt);
   prompt.label = "retry";
   auto reply = send(sched, prompt);  // a retry before the interrupted pass completes
@@ -352,13 +445,13 @@ int dv_main(const char* model, const char* backend) {
             std::string("DV, ") + kinds[s] + ", " + which + ": plain decoding's text alone and three at once");
     }
   }
-  std::printf("scheduler (DV): %s\n", failures ? "FAILED" : "ok");
-  return failures ? 1 : 0;
+  return flyx::test::finish("scheduler_test (DV)");
 }
 
 }  // namespace
 
 int main(int argc, char** argv) {
+  flyx::test::print_passes = true;
   if (argc < 3) {
     std::fprintf(stderr, "usage: scheduler_test MODEL.flyx BACKEND [dv]\n");
     return 2;
@@ -372,9 +465,12 @@ int main(int argc, char** argv) {
   eo.chat_template = "{% for m in messages %}{{ m.role }}:{{ m.content }}|{% endfor %}"
                      "{% if add_generation_prompt %}{{ messages[-1].content }}?{% endif %}";
   // A request that must still be running when the next one arrives: the tiny
-  // model writes hundreds of tokens in the time a thread may be held up (the
-  // float64 backend is slower, and gets fewer).
-  const int kLong = eo.backend == "cpu_ref" ? 300 : 1500;
+  // model writes hundreds of tokens in the time a thread may be held up.  The
+  // float64 backend is slower a round, but its lookup rounds take 8 to 11 of
+  // these repeating prompts' tokens each (some 4000 tokens a second): 300 of
+  // them were over in 44 to 74 ms, which a loaded machine outlasted (2 failed
+  // runs in at most 21 beside other tests at -j 6): 1200, some 300 ms.
+  const int kLong = eo.backend == "cpu_ref" ? 1200 : 1500;
   SchedulerOptions so;
   so.max_sessions = 2;
   so.host_cache_bytes = SnapshotStore::kPieceBytes;  // enough for one tiny checkpoint
@@ -385,9 +481,10 @@ int main(int argc, char** argv) {
   }
   so.verbose = std::getenv("FLYX_TEST_VERBOSE") ? 1 : 0;  // the scheduler's request log
   const std::string mode = argc > 3 ? argv[3] : "";
+  if (mode == "raw-clients") so.max_sessions = 1;
   if (mode == "interrupted-prewarm" || mode == "reassigned-prewarm" || mode == "repeated-prewarm") {
     check_interrupted_prewarm(argv[1], eo, so, mode);
-    return failures != 0;
+    return flyx::test::finish("scheduler_test");
   }
   Scheduler sched(argv[1], eo, so);
   std::string err;
@@ -397,11 +494,15 @@ int main(int argc, char** argv) {
   }
   if (queue_test) {
     check_queue(sched);
-    return failures != 0;
+    return flyx::test::finish("scheduler_test");
   }
   if (argc > 3 && std::string(argv[3]) == "history") {
     check_prewarmed_history(sched);
-    return failures != 0;
+    return flyx::test::finish("scheduler_test");
+  }
+  if (mode == "raw-clients") {
+    check_raw_clients(sched, kLong);
+    return flyx::test::finish("scheduler_test");
   }
   if (argc > 3 && std::string(argv[3]) == "marked-system") {
     Request main;
@@ -422,7 +523,7 @@ int main(int argc, char** argv) {
     check(concurrent && foreground->done && side->done && usage.reused_tokens >= 256,
           "the title reuses marked instructions while the first conversation is still generating (" +
           std::to_string(usage.reused_tokens) + " tokens)");
-    return failures != 0;
+    return flyx::test::finish("scheduler_test");
   }
   {  // A shared system prompt can be longer than both conversations' actual turns.
     Request main;
@@ -477,7 +578,9 @@ int main(int argc, char** argv) {
     check(concurrent && another->done && working->done,
           "a title matching both resident conversations equally uses the idle slot while the main one runs");
   }
-  const int N = 40;
+  // Long enough that two requests sent one after the other run at once (they overlap in time, below): 40 tokens were
+  // 10 ms on cpu_ref, less than the test's thread may wait between the two sends on a loaded machine.
+  const int N = 200;
   const std::string a = "alpha beta gamma delta " + words("one two three", 4);
   const std::string b = "The quick brown fox " + words("jumps over", 6);
   std::printf("prompts of %d and %d tokens, context %d\n", sched.count_text_tokens(a), sched.count_text_tokens(b),
@@ -536,12 +639,17 @@ int main(int argc, char** argv) {
           "the one whose session was busy ran after it; the one behind it waited for neither (" + order[0] + ", " +
               order[1] + ", " + order[2] + ")");
   }
-  // The same conversation again: the request that was running is cancelled.
+  // The same conversation again (a raw prompt says so with its conversation id): the request that was running is
+  // cancelled.
   {
     const std::string story = "Once upon a time " + words("there was", 8);
-    auto first = send(sched, raw(sched, "story", story, kLong));
+    Request told = raw(sched, "story", story, kLong);
+    told.conversation_id = "storyteller";
+    auto first = send(sched, told);
     first->wait_started();
-    auto again = send(sched, raw(sched, "story again", story, 8));
+    Request retold = raw(sched, "story again", story, 8);
+    retold.conversation_id = told.conversation_id;
+    auto again = send(sched, retold);
     first->wait();
     again->wait();
     check(first->done && first->finish == FLYX_FINISH_CANCEL && first->superseded && !again->superseded,
@@ -880,6 +988,5 @@ int main(int argc, char** argv) {
     }
   }
 
-  std::printf("scheduler: %s\n", failures ? "FAILED" : "ok");
-  return failures ? 1 : 0;
+  return flyx::test::finish("scheduler_test");
 }

@@ -310,6 +310,19 @@ bool gated_field(const nlohmann::json& o) {
 
 }  // namespace
 
+std::string base_relation(const std::string& repo) {
+  if (offline()) return "";
+  os::HttpGet g;
+  g.url = endpoint() + "/api/models/" + repo + "?expand[]=baseModels";
+  g.headers = detail::auth_headers();
+  std::string body, net;
+  int status = 0;
+  if (!os::http_get_text(g, &body, &status, &net) || status != 200) return "";
+  const auto j = nlohmann::json::parse(body, nullptr, false);
+  if (!j.is_object() || !j.contains("baseModels") || !j["baseModels"].is_object()) return "";
+  return str_field(j["baseModels"], "relation");
+}
+
 bool describe(const std::string& repo, const std::string& revision, Repo* out, std::string* err) {
   if (!detail::valid_repo(repo)) return *err = "not a Hub repository name: " + repo, false;
   Repo r;

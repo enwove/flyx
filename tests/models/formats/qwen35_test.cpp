@@ -19,16 +19,11 @@
 #include "core/modelfile/modelfile.h"
 #include "core/render/chat.h"
 #include "models/formats/pytext.h"
+#include "tests/common/check.h"
 
 using namespace flyx;
 
 namespace {
-
-int failures = 0;
-
-void check(bool ok, const std::string& what) {
-  if (!ok && ++failures <= 10) std::printf("FAIL %s\n", what.c_str());
-}
 
 std::string read_file(const std::string& path) {
   std::ifstream f(path, std::ios::binary);
@@ -380,8 +375,7 @@ int main(int argc, char** argv) {
     check(mm_checked >= 28, "multimodal cases covered (" + std::to_string(mm_checked) + ")");
   }
 
-  std::printf("qwen35 format: %d conversations rendered (%d rejected) alike by the engine and the renderer, %d round "
-              "trips: %s\n",
-              rendered, rejected, trips, failures ? "FAILED" : "ok");
-  return failures ? 1 : 0;
+  std::printf("qwen35 format: %d conversations rendered (%d rejected) by the engine and the renderer, %d round trips\n",
+              rendered, rejected, trips);
+  return flyx::test::finish("qwen35_format_test");
 }

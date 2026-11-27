@@ -18,14 +18,16 @@
 #                        alone (DV)
 #   models/formats/      chat formats: reading replies back; renderers written for a template vs the Jinja engine;
 #                        reply grammars
-#   backends/cuda/       every CUDA kernel vs the float64 ops (ops/)
+#   backends/cuda/       every CUDA kernel vs the float64 ops (ops/); a DFlash2 drafter's context ring (its slots,
+#                        the positions it still holds for rewinds, restores and snapshots); the rings checkpoints
+#                        copy (sliding-window layers', the MTP layer's: their slots, what they hold for rewinds)
 #   e2e/                 the whole engine vs the Python reference (golden; make_tiny.py builds the tiny
 #                        models and their golden outputs), and a real model vs transformers; a drafter on a
 #                        prompt set vs plain decoding and bifill-dv's references (check_dv.py: its counting and
 #                        scoring, and its rounds against the teacher-forced reference's, tested in check_dv_test.py)
 #   apps/flyx-server/    the stored responses and the HTTP API (run against a live server)
 #   apps/flyx-cli/       the command line's file paths and flags, flyx bench on a prompt set (the tiny model)
-#   apps/common/         numbers given on the command line
+#   apps/common/         numbers given on the command line, the drafters fetched beside a model
 #   bench/ab/            two builds' records of one prompt set compared answer for answer, round for round
 #                        (same_runs.py)
 #   python/reference/    the Python reference vs transformers; its DV drafting emits plain decoding's tokens, its
@@ -33,6 +35,88 @@
 #                        teacher-forced)
 #   python/convert/      the converter: configs and tokenizer pipelines it refuses, a post-processor's prefix; DV's
 #                        export and what is refused of it; a DV file's tensors are its sources' (check_dv_convert.py)
+#
+# Labels (docs/testing.md; the test presets in CMakePresets.json select by them).  Every test has one tier, what it
+# needs and so about what it costs:
+#   unit    no fixture, no model file: seconds        tiny    the tiny models (make_assets): seconds
+#   golden  a whole golden_test or gguf_e2e_test run  tools   a bench or tools script's own test (not the engine's)
+# and any of these aspects: gpu (a CUDA device: every test of the CUDA block below, and the ones above it that take
+# the CUDA backend too), gpu_serial (the device's free memory measured: runs alone), smoke (a golden or GPU test the
+# quick preset runs anyway), dv (DV's, not in production: tests/dv.cmake's, registered with FLYX_TEST_DV alone), server
+# (starts flyx serve).  The registering functions below label what they know; flyx_finish_test_labels() (each
+# directory's end) gives a test without a tier one (tiny with a fixture, else unit), adds quick (unit and tiny tests
+# that need neither the GPU nor DV, and the smoke ones), and refuses the configure where a test breaks these rules.
+# The labels it cannot infer are at this file's end.
+# Labels are only ever appended (set_property(TEST ... APPEND PROPERTY LABELS ...)): one set elsewhere stays.
+
+# After a directory's last test: the tier where none was given, quick, the GPU tests' slot and preflight, the rules.
+function(flyx_finish_test_labels)
+  set(tier_labels unit tiny golden tools)
+  set(aspect_labels gpu gpu_serial smoke dv server)
+  get_property(tests DIRECTORY PROPERTY TESTS)
+  set(errors "")
+  foreach(t IN LISTS tests)
+    get_test_property(${t} LABELS labels)
+    if(NOT labels)
+      set(labels "")
+    endif()
+    list(REMOVE_DUPLICATES labels)
+    get_test_property(${t} FIXTURES_REQUIRED fixtures)
+    get_test_property(${t} FIXTURES_SETUP setups)
+    get_test_property(${t} RUN_SERIAL serial)
+    # DV's tests are tests/dv.cmake's (labelled dv there): one named as DV's (dv, _dv, dv31_, ...) or needing DV's
+    # assets elsewhere would run without FLYX_TEST_DV and in every preset.
+    if(NOT "dv" IN_LIST labels AND (t MATCHES "(^|_)dv([0-9_]|$)" OR "dv_assets" IN_LIST fixtures))
+      string(APPEND errors "  ${t}: a DV test (by its name or DV's assets) outside tests/dv.cmake\n")
+    endif()
+    set(tier ${labels})
+    list(FILTER tier INCLUDE REGEX "^(unit|tiny|golden|tools)$")
+    list(LENGTH tier n)
+    if(n EQUAL 0)
+      if(fixtures)
+        set(tier tiny)
+      else()
+        set(tier unit)
+      endif()
+      set_property(TEST ${t} APPEND PROPERTY LABELS ${tier})
+      list(APPEND labels ${tier})
+    elseif(n GREATER 1)
+      string(APPEND errors "  ${t}: tiers ${tier} (one only)\n")
+    endif()
+    foreach(l IN LISTS labels)
+      if(NOT l IN_LIST tier_labels AND NOT l IN_LIST aspect_labels)
+        string(APPEND errors "  ${t}: unknown label ${l} (the tiers: ${tier_labels}; the aspects: ${aspect_labels})\n")
+      endif()
+    endforeach()
+    if(serial AND NOT "gpu_serial" IN_LIST labels)
+      string(APPEND errors "  ${t}: RUN_SERIAL is for the tests measuring the device (flyx_add_golden_test SERIAL)\n")
+    endif()
+    if("gpu_serial" IN_LIST labels AND NOT "gpu" IN_LIST labels)
+      string(APPEND errors "  ${t}: gpu_serial outside a GPU test\n")
+    endif()
+    if("smoke" IN_LIST labels AND "dv" IN_LIST labels)
+      string(APPEND errors "  ${t}: smoke on a DV test (quick runs no DV)\n")
+    endif()
+    # A slot of the GPU (tests/gpu_resources.json, the presets' resourceSpecFile): CPU tests run beside the GPU's at
+    # any -j, the GPU's bounded on their own.  Without a resource spec (no preset) ctest ignores it.  And
+    # gpu_preflight before it (the GPU not already in use by another program), which takes no slot itself.
+    if("gpu" IN_LIST labels AND NOT "gpu_preflight" IN_LIST setups)
+      set_property(TEST ${t} PROPERTY RESOURCE_GROUPS "gpus:1")
+      set_property(TEST ${t} APPEND PROPERTY FIXTURES_REQUIRED gpu_preflight)
+    endif()
+    if("smoke" IN_LIST labels OR (tier MATCHES "^(unit|tiny)$" AND NOT "gpu" IN_LIST labels
+                                  AND NOT "dv" IN_LIST labels))
+      set_property(TEST ${t} APPEND PROPERTY LABELS quick)
+    endif()
+  endforeach()
+  if(errors)
+    message(FATAL_ERROR "test labels (tests/CMakeLists.txt, flyx_finish_test_labels):\n${errors}")
+  endif()
+endfunction()
+
+function(flyx_register_test name target)
+  add_test(NAME ${name} COMMAND ${target} ${ARGN})
+endfunction()
 
 function(flyx_add_unit_test target source)
   add_executable(${target} ${source})
@@ -40,7 +124,7 @@ function(flyx_add_unit_test target source)
 endfunction()
 
 function(flyx_add_py_test name script)
-  cmake_parse_arguments(ARG "" "TIMEOUT;SKIP_RETURN_CODE" "ARGS;FIXTURES;ENVIRONMENT;PY_FLAGS" ${ARGN})
+  cmake_parse_arguments(ARG "" "TIMEOUT;SKIP_RETURN_CODE" "ARGS;FIXTURES;ENVIRONMENT;PY_FLAGS;LABELS" ${ARGN})
   add_test(NAME ${name} COMMAND ${Python3_EXECUTABLE} ${ARG_PY_FLAGS} ${script} ${ARG_ARGS})
   if(ARG_FIXTURES)
     set_tests_properties(${name} PROPERTIES FIXTURES_REQUIRED "${ARG_FIXTURES}")
@@ -54,10 +138,20 @@ function(flyx_add_py_test name script)
   if(ARG_ENVIRONMENT)
     set_tests_properties(${name} PROPERTIES ENVIRONMENT "${ARG_ENVIRONMENT}")
   endif()
+  set(labels ${ARG_LABELS})
+  if(script MATCHES "/bench/")
+    list(APPEND labels tools)  # a bench script's own test
+  endif()
+  if(script MATCHES "/apps/flyx-server/")
+    list(APPEND labels server)
+  endif()
+  if(labels)
+    set_property(TEST ${name} APPEND PROPERTY LABELS ${labels})
+  endif()
 endfunction()
 
 function(flyx_add_golden_test name)
-  cmake_parse_arguments(ARG "SERIAL" "ENV" "ARGS;FIXTURES" ${ARGN})
+  cmake_parse_arguments(ARG "SERIAL" "ENV" "ARGS;FIXTURES;LABELS" ${ARGN})
   add_test(NAME ${name} COMMAND golden_test ${ASSETS} ${ARG_ARGS})
   set(fixtures ${ARG_FIXTURES})
   if(NOT fixtures)
@@ -67,9 +161,12 @@ function(flyx_add_golden_test name)
   if(ARG_ENV)
     set_tests_properties(${name} PROPERTIES ENVIRONMENT "${ARG_ENV}")
   endif()
+  set(labels golden ${ARG_LABELS})
   if(ARG_SERIAL)
     set_tests_properties(${name} PROPERTIES RUN_SERIAL TRUE)
+    list(APPEND labels gpu_serial)
   endif()
+  set_property(TEST ${name} APPEND PROPERTY LABELS ${labels})
 endfunction()
 
 flyx_add_unit_test(tokenizer_test core/tokenizer/tokenizer_test.cpp)
@@ -82,6 +179,7 @@ flyx_add_unit_test(chat_test core/render/chat_test.cpp)
 flyx_add_unit_test(tags_test models/formats/tags_test.cpp)
 flyx_add_unit_test(qwen35_format_test models/formats/qwen35_test.cpp)
 flyx_add_unit_test(grammar_test models/formats/grammar_test.cpp)
+flyx_add_unit_test(xgrammar_local_changes_test third_party/xgrammar/local_changes_test.cpp flyx_xgrammar)
 flyx_add_unit_test(telemetry_test core/exec/telemetry_test.cpp)
 flyx_add_unit_test(snapshot_store_test core/session/store_test.cpp)
 flyx_add_unit_test(parked_edit_test core/session/parked_edit_test.cpp)
@@ -106,11 +204,26 @@ add_dependencies(vision_test flyx-cpu_ref)
 if(TARGET flyx-cuda)
   add_dependencies(vision_test flyx-cuda)
 endif()
+flyx_add_unit_test(inkling2_test e2e/inkling2_test.cpp)
+add_dependencies(inkling2_test flyx-cpu_ref)
+# Each run writes the models it reads: a directory of its own, so the two can run at once (ctest -j).
+flyx_register_test(inkling2_cpu_ref inkling2_test ${CMAKE_BINARY_DIR}/inkling2_assets/cpu_ref cpu_ref)
+set_tests_properties(inkling2_cpu_ref PROPERTIES FIXTURES_SETUP inkling2_models)
 
 add_executable(numbers_test apps/common/numbers_test.cpp ${CMAKE_SOURCE_DIR}/apps/common/numbers.cpp)
 target_include_directories(numbers_test PRIVATE ${CMAKE_SOURCE_DIR})
+add_executable(model_source_test apps/common/model_source_test.cpp ${CMAKE_SOURCE_DIR}/apps/common/model_source.cpp)
+target_link_libraries(model_source_test PRIVATE flyx_core)
+add_executable(known_drafters_test apps/common/known_drafters_test.cpp ${CMAKE_SOURCE_DIR}/apps/common/model_source.cpp)
+target_link_libraries(known_drafters_test PRIVATE flyx_core)
+add_executable(drafter_speeds_test apps/flyx-server/drafter_speeds_test.cpp ${CMAKE_SOURCE_DIR}/apps/flyx-server/drafter_speeds.cpp)
+target_link_libraries(drafter_speeds_test PRIVATE flyx_core)
 add_executable(strata_snapshot_test backends/cuda/strata_snapshot_test.cpp)
 target_include_directories(strata_snapshot_test PRIVATE ${CMAKE_SOURCE_DIR})
+add_executable(draft_ring_test backends/cuda/draft_ring_test.cpp)
+target_include_directories(draft_ring_test PRIVATE ${CMAKE_SOURCE_DIR} ${CMAKE_SOURCE_DIR}/include)
+add_executable(window_ring_test backends/cuda/window_ring_test.cpp)
+target_include_directories(window_ring_test PRIVATE ${CMAKE_SOURCE_DIR} ${CMAKE_SOURCE_DIR}/include)
 add_executable(response_store_test apps/flyx-server/response_store_test.cpp)
 target_include_directories(response_store_test PRIVATE ${CMAKE_SOURCE_DIR} ${CMAKE_SOURCE_DIR}/third_party)
 target_link_libraries(response_store_test PRIVATE Threads::Threads)
@@ -126,12 +239,22 @@ target_link_libraries(gpu_apps_test PRIVATE flyx_core)
 add_library(flyx-test-host-kv SHARED core/session/backend_adapter.cpp)
 target_include_directories(flyx-test-host-kv PRIVATE ${CMAKE_SOURCE_DIR}/include)
 set_target_properties(flyx-test-host-kv PROPERTIES PREFIX "lib")
+flyx_add_unit_test(backend_errors_test core/exec/backend_errors_test.cpp flyx-test-host-kv)
+flyx_register_test(backend_errors backend_errors_test)
 flyx_add_unit_test(session_budget_test core/session/budget_test.cpp flyx-test-host-kv)
 add_dependencies(session_budget_test flyx-cpu_ref)
 flyx_add_unit_test(generation_test core/exec/generation_test.cpp flyx-test-host-kv)
 add_dependencies(generation_test flyx-cpu_ref)
+flyx_add_unit_test(elastic_load_test core/exec/elastic_load_test.cpp flyx-test-host-kv)
+add_dependencies(elastic_load_test flyx-cpu_ref)
 flyx_add_unit_test(plans_test core/plan/plans_test.cpp)
 flyx_add_unit_test(scheduler_test core/exec/scheduler_test.cpp flyx-test-host-kv)
+# A model switch in flyx serve's host: the server's model host and model sources over the tiny model.
+flyx_add_unit_test(model_host_test apps/flyx-server/model_host_test.cpp flyx-test-host-kv)
+target_sources(model_host_test PRIVATE ${CMAKE_SOURCE_DIR}/apps/flyx-server/model_host.cpp
+                                       ${CMAKE_SOURCE_DIR}/apps/common/model_source.cpp
+                                       ${CMAKE_SOURCE_DIR}/apps/flyx-server/drafter_speeds.cpp)
+add_dependencies(model_host_test flyx-cpu_ref)
 
 add_executable(capi_test core/exec/capi_test.cpp ${CMAKE_SOURCE_DIR}/core/exec/capi.cpp)
 target_compile_definitions(capi_test PRIVATE FLYX_BUILDING)
@@ -139,10 +262,10 @@ target_link_libraries(capi_test PRIVATE flyx_core)
 
 # Tiny random model (BF16 and an NVFP4 copy) + golden outputs from the Python
 # reference (needs torch, transformers, tokenizers, safetensors).  Generated
-# once per build tree.
+# once per build tree.  DV's (make_tiny.py --group dv) are tests/dv.cmake's.
 set(ASSETS ${CMAKE_BINARY_DIR}/assets)
 add_test(NAME make_assets
-         COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/tests/e2e/make_tiny.py ${ASSETS})
+         COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/tests/e2e/make_tiny.py ${ASSETS} --group core)
 set_tests_properties(make_assets PROPERTIES FIXTURES_SETUP assets)
 # The tiny models again as GGUF files, and random blocks of every GGML block
 # type with what the gguf package (a test dependency) decodes them to.
@@ -188,7 +311,11 @@ flyx_add_py_test(kv_method_flags ${CMAKE_CURRENT_SOURCE_DIR}/apps/flyx-cli/kv_me
                  ARGS $<TARGET_FILE:flyx-cli> ${ASSETS}/tiny.flyx FIXTURES assets)
 flyx_add_py_test(cli_usage ${CMAKE_CURRENT_SOURCE_DIR}/apps/flyx-cli/usage.py
                  ARGS $<TARGET_FILE:flyx-cli> ${ASSETS}/tiny.flyx FIXTURES assets)
+flyx_add_py_test(server_ephemeral_port ${CMAKE_CURRENT_SOURCE_DIR}/apps/flyx-server/ephemeral_port.py
+                 ARGS $<TARGET_FILE:flyx-cli> TIMEOUT 45)
 flyx_add_py_test(remembered_model ${CMAKE_CURRENT_SOURCE_DIR}/apps/flyx-server/remembered_model.py
+                 ARGS $<TARGET_FILE:flyx-cli> ${ASSETS}/tiny.flyx FIXTURES assets)
+flyx_add_py_test(server_lan_access ${CMAKE_CURRENT_SOURCE_DIR}/apps/flyx-server/lan_access.py
                  ARGS $<TARGET_FILE:flyx-cli> ${ASSETS}/tiny.flyx FIXTURES assets)
 flyx_add_py_test(lora_load ${CMAKE_CURRENT_SOURCE_DIR}/apps/flyx-server/lora_load.py
                  ARGS $<TARGET_FILE:flyx-cli> ${ASSETS}/tiny_qwen3_gguf.gguf ${ASSETS}/peft_qwen3 FIXTURES gguf_assets
@@ -228,15 +355,24 @@ add_test(NAME peft_dir COMMAND peft_dir_test)
 
 # Numbers on the command line: all of the text a number, inside what the option takes.
 add_test(NAME flag_numbers COMMAND numbers_test)
+# The DSpark drafter published beside a model, taken by default: beside a GGUF on disk, and in its repository (a
+# Hugging Face cache read offline).
+flyx_register_test(model_source model_source_test)
+add_test(NAME known_drafters COMMAND known_drafters_test)
+set_tests_properties(known_drafters PROPERTIES ENVIRONMENT "HF_HUB_OFFLINE=1")  # no network
+add_test(NAME drafter_speeds COMMAND drafter_speeds_test)
 add_test(NAME chat_replies COMMAND tags_test)
 # Qwen3.5's own renderer against the Jinja engine on generated conversations, and its calls read back.
 add_test(NAME chat_qwen35 COMMAND qwen35_format_test ${ASSETS}/tiny.flyx
                                   ${CMAKE_SOURCE_DIR}/tests/core/render/templates/qwen3.5.jinja)
 # Reply grammars (tool_choice, response_format) in both call languages, on the tiny model's tokenizer.
 add_test(NAME reply_grammars COMMAND grammar_test ${ASSETS}/tiny.flyx)
+flyx_register_test(xgrammar_local_changes xgrammar_local_changes_test)
 add_test(NAME telemetry COMMAND telemetry_test)
 add_test(NAME snapshot_store COMMAND snapshot_store_test)
 add_test(NAME strata_snapshot COMMAND strata_snapshot_test)
+flyx_register_test(draft_ring draft_ring_test)
+flyx_register_test(window_ring window_ring_test)
 add_test(NAME parked_edit COMMAND parked_edit_test ${ASSETS}/tiny.flyx)
 set_tests_properties(parked_edit PROPERTIES FIXTURES_REQUIRED assets)
 add_test(NAME response_store COMMAND response_store_test)
@@ -262,42 +398,12 @@ add_test(NAME request COMMAND request_test ${ASSETS}/tiny.flyx
 add_test(NAME ref_sums COMMAND sums_test)
 add_test(NAME vision COMMAND vision_test)
 set_tests_properties(vision PROPERTIES WORKING_DIRECTORY "$<TARGET_FILE_DIR:vision_test>")
-# DV's float64 references against the Python reference's cases (make_tiny.py's dv_cases.json): trees on 1000 random
-# tables of each kind and edge cases, cov's term, selector tables, the canvas's input, statistics and slide.
-add_test(NAME dv_trees COMMAND dv_tree_test ${ASSETS})
-add_test(NAME dv_canvas COMMAND canvas_test ${ASSETS})
-# The Python reference's DV drafting on the tiny Llama emits its plain decoding's tokens (both trees, a V-LoRA); its
-# canvas rows are transformers' Llama with the canvas adapter merged in, and its trees grow again from those canvases,
-# also when it commits another run's counts.
-flyx_add_py_test(reference_dv ${CMAKE_SOURCE_DIR}/tests/python/reference/dv_test.py ARGS ${ASSETS} FIXTURES assets)
-# DV's description from the tiny Llama's DV file (models/dv.h): its blocks, canvas and programs, the drafter the
-# options choose, sections that cannot be drafted refused.
-add_test(NAME dv_models COMMAND dv_models_test ${ASSETS})
 # The target's own adapters (a V-LoRA, ABI 43) from the tiny Llama's V-LoRA files (models/llama): on every linear of
-# every layer, their rank and scale; headers and tensors that do not fit refused.
-add_test(NAME llama_models COMMAND llama_models_test ${ASSETS})
-# The tiny DV files' tensors are export_dv.py's, and the reference loads them to their checkpoints' and transformers'
-# weights: the beam tree, the pool tree (a causal canvas) and the canvas of 32 slots.
-flyx_add_py_test(dv_convert ${CMAKE_SOURCE_DIR}/tests/python/convert/check_dv_convert.py PY_FLAGS -I
-                 ARGS ${ASSETS}/tiny_llama_dv.flyx ${ASSETS}/dv_tiny/export --canvas ${ASSETS}/dv_tiny/canvas.pt
-                      --selector ${ASSETS}/dv_tiny/selector.pt --hf ${ASSETS}/hf_llama
-                 FIXTURES assets)
-flyx_add_py_test(dv_convert_pool ${CMAKE_SOURCE_DIR}/tests/python/convert/check_dv_convert.py PY_FLAGS -I
-                 ARGS ${ASSETS}/tiny_llama_dv_pool.flyx ${ASSETS}/dv_tiny/export_pool
-                      --canvas ${ASSETS}/dv_tiny/canvas_causal.pt --selector ${ASSETS}/dv_tiny/selector.pt
-                      --hf ${ASSETS}/hf_llama
-                 FIXTURES assets)
-flyx_add_py_test(dv_convert_32 ${CMAKE_SOURCE_DIR}/tests/python/convert/check_dv_convert.py PY_FLAGS -I
-                 ARGS ${ASSETS}/tiny_llama_dv32.flyx ${ASSETS}/dv_tiny/export_32 --canvas ${ASSETS}/dv_tiny/canvas.pt
-                      --selector ${ASSETS}/dv_tiny/selector.pt --hf ${ASSETS}/hf_llama
-                 FIXTURES assets)
-# The same with a V-LoRA beside the DV (its adapters are bifill-dv's checkpoint's, byte for byte, as the reference
-# loads them), and a V-LoRA alone (another scale).
-flyx_add_py_test(dv_convert_lora ${CMAKE_SOURCE_DIR}/tests/python/convert/check_dv_convert.py PY_FLAGS -I
-                 ARGS ${ASSETS}/tiny_llama_dv_lora.flyx ${ASSETS}/dv_tiny/export_dv_lora
-                      --canvas ${ASSETS}/dv_tiny/canvas.pt --selector ${ASSETS}/dv_tiny/selector.pt
-                      --vlora ${ASSETS}/dv_tiny/vlora32.pt --hf ${ASSETS}/hf_llama
-                 FIXTURES assets)
+# every layer, their rank and scale; headers and tensors that do not fit refused.  nodv: without tiny_llama_dv_lora.flyx
+# (DV's assets: llama_models_dv in tests/dv.cmake runs the rest).
+add_test(NAME llama_models COMMAND llama_models_test ${ASSETS} nodv)
+# A V-LoRA alone (scale 0.5): its tensors are export_dv.py --vlora's (bifill-dv's checkpoint's, byte for byte), as the
+# reference loads them.
 flyx_add_py_test(lora_convert ${CMAKE_SOURCE_DIR}/tests/python/convert/check_dv_convert.py PY_FLAGS -I
                  ARGS ${ASSETS}/tiny_llama_lora.flyx ${ASSETS}/dv_tiny/export_vlora --vlora ${ASSETS}/dv_tiny/vlora16.pt
                       --hf ${ASSETS}/hf_llama
@@ -310,37 +416,29 @@ else()
 endif()
 flyx_add_py_test(residual_decision ${CMAKE_SOURCE_DIR}/tests/e2e/residual_decision.py PY_FLAGS -I
                  ARGS $<TARGET_FILE:flyx-cli> ${ASSETS} ${FLYX_RESIDUAL_BACKENDS} FIXTURES assets)
-# The DV runner's results file goes on only with the settings and thread count that made it, past a row a stopped run
-# cut off (no model is loaded).
-flyx_add_py_test(reference_dv_gsm8k ${CMAKE_SOURCE_DIR}/tests/python/reference/dv_gsm8k_test.py)
-# The DV reference forced to a bench record's answers (and replaying its rounds): what it is forced to, the rows and
-# settings it keeps, its rounds against a free run's where the answers agree (a stand-in for the model); whole runs on
-# the tiny Llama's DV: a .flyx file and its checkpoints run the same rounds, the options that choose questions,
-# threads, a V-LoRA, a stopped run going on.
-flyx_add_py_test(reference_dv_forced ${CMAKE_SOURCE_DIR}/tests/python/reference/dv_forced_test.py ARGS ${ASSETS}
-                 FIXTURES assets)
 # What the converter refuses (a scaled rotary in either key's form) and the tokens a post-processor puts before a text.
 flyx_add_py_test(converter ${CMAKE_SOURCE_DIR}/tests/python/convert/convert_test.py)
-# A drafter's answers and tokens per forward counted as bifill-dv counts them, GSM8K scored as it scores them, its
-# rounds against the teacher-forced reference's, and what the checks refuse (tests/e2e/check_dv.py, dv_ref_json.py;
-# no model).
-flyx_add_py_test(dv_counts ${CMAKE_SOURCE_DIR}/tests/e2e/check_dv_test.py)
 # flyx bench --prompts: each line's prompt, the generated tokens and rounds in the record (an end token accepted as a
 # draft marked), drafted answers plain's, bad prompts and output paths refused before anything runs.
 flyx_add_py_test(bench_prompts ${CMAKE_SOURCE_DIR}/tests/apps/flyx-cli/bench_prompts_test.py
                  ARGS $<TARGET_FILE:flyx-cli> ${ASSETS} ${CMAKE_SOURCE_DIR}/tests/core/render/templates/qwen3.5.jinja
                  FIXTURES assets)
+# The same where a chat without thinking carries a reply grammar (the tiny Inkling-2 model inkling2_cpu_ref writes):
+# every prompt of the set keeps its grammar until it runs, and its reply is held to it.
+flyx_add_py_test(bench_prompts_grammar ${CMAKE_SOURCE_DIR}/tests/apps/flyx-cli/bench_prompts_grammar_test.py
+                 ARGS $<TARGET_FILE:flyx-cli> ${CMAKE_BINARY_DIR}/inkling2_assets/cpu_ref/tiny_inkling2_bf16.gguf
+                 FIXTURES inkling2_models)
 # Two builds' flyx bench --prompts records of one command: the same answers and rounds over the prompts both hold, and
 # what fails (bench/ab/same_runs.py; records made up, no model).
 flyx_add_py_test(same_runs ${CMAKE_SOURCE_DIR}/tests/bench/ab/same_runs_test.py)
-# DV's rounds chosen, replayed on the kept traces (bench/replay/dv_choice): the sets made from them,
-# DV pinned and plain decoding at the traces' speeds, a constant set on the command line taking effect, and what is
-# refused.
-flyx_add_py_test(dv_choice_replay ${CMAKE_SOURCE_DIR}/tests/bench/replay/dv_choice_test.py
-                 ARGS $<TARGET_FILE:dv_choice>)
 flyx_add_py_test(layering ${CMAKE_SOURCE_DIR}/tools/check_layering.py ARGS ${CMAKE_SOURCE_DIR})
 flyx_add_py_test(numerics ${CMAKE_SOURCE_DIR}/tools/check_numerics.py ARGS ${CMAKE_SOURCE_DIR})
 flyx_add_py_test(docs ${CMAKE_SOURCE_DIR}/tools/check_docs.py ARGS ${CMAKE_SOURCE_DIR})
+flyx_add_py_test(check_glibc ${CMAKE_CURRENT_SOURCE_DIR}/tools/check_glibc_test.py LABELS tools smoke)
+find_program(FLYX_POWERSHELL NAMES powershell pwsh)
+if(FLYX_POWERSHELL)
+  flyx_add_py_test(release_zip ${CMAKE_CURRENT_SOURCE_DIR}/tools/release_zip_test.py ARGS ${FLYX_POWERSHELL} LABELS tools)
+endif()
 flyx_add_py_test(agent_replay ${CMAKE_CURRENT_SOURCE_DIR}/bench/replay/agent_replay_test.py)
 flyx_add_py_test(trace_layer_roles ${CMAKE_CURRENT_SOURCE_DIR}/bench/trace/layer_roles_test.py)
 flyx_add_py_test(two_at_once ${CMAKE_CURRENT_SOURCE_DIR}/bench/replay/two_at_once_test.py TIMEOUT 15)
@@ -360,12 +458,19 @@ flyx_add_py_test(gemm_tables ${CMAKE_SOURCE_DIR}/tests/tools/codegen/gen_gemm_ta
 add_test(NAME scheduler_cpu_ref COMMAND scheduler_test ${ASSETS}/tiny.flyx cpu_ref)
 add_test(NAME scheduler_queue COMMAND scheduler_test ${ASSETS}/tiny.flyx cpu_ref queue)
 add_test(NAME scheduler_prewarmed_history COMMAND scheduler_test ${ASSETS}/tiny.flyx cpu_ref history)
+# Raw prompts of different clients (the same text, or one extending another's) each run to their own end; a shared
+# conversation id replaces.
+flyx_register_test(scheduler_raw_clients scheduler_test ${ASSETS}/tiny.flyx cpu_ref raw-clients)
 add_test(NAME scheduler_interrupted_prewarm COMMAND scheduler_test ${ASSETS}/tiny.flyx cpu_ref interrupted-prewarm)
 add_test(NAME scheduler_reassigned_prewarm COMMAND scheduler_test ${ASSETS}/tiny.flyx cpu_ref reassigned-prewarm)
 add_test(NAME scheduler_repeated_prewarm COMMAND scheduler_test ${ASSETS}/tiny.flyx cpu_ref repeated-prewarm)
 add_test(NAME scheduler_marked_system COMMAND scheduler_test ${ASSETS}/tiny.flyx cpu_ref marked-system)
 add_test(NAME session_host_budget COMMAND session_budget_test ${ASSETS}/tiny.flyx)
+# A model switch loads the new model once the old one is closed, not once nobody holds it: the last request lets go
+# of it on its own thread while the backend's close is held up there, and the backend holds one model at a time.
+flyx_register_test(model_host model_host_test ${ASSETS}/tiny.flyx)
 add_test(NAME generation_edges COMMAND generation_test ${ASSETS}/tiny.flyx)
+flyx_register_test(elastic_load elastic_load_test ${ASSETS}/tiny.flyx)
 # The C API: a chat request with the file's template, and with the one the load options give.
 add_test(NAME capi COMMAND capi_test ${ASSETS}/tiny.flyx cpu_ref)
 flyx_add_py_test(python_binding ${CMAKE_CURRENT_SOURCE_DIR}/python/flyx/binding_test.py
@@ -389,30 +494,38 @@ flyx_add_golden_test(golden_cpu_ref_qwen3_lora ARGS cpu_ref qwen3_lora ${ASSETS}
 flyx_add_golden_test(golden_cpu_ref_qwen35_lora ARGS cpu_ref qwen35_lora ${ASSETS}/tiny.flyx ${ASSETS}/peft_qwen35)
 # Llama's attention without q/k norms (MiniCPM5's layers), against transformers.
 flyx_add_golden_test(golden_cpu_ref_llama ARGS cpu_ref llama)
-# The same with its DV drafter in the file: as loaded by default (cpu_ref has no DV rounds) and with --drafter none;
-# with its beam tree and with a pool tree (whose tree fields are not zeros).
-flyx_add_golden_test(golden_cpu_ref_llama_dv ARGS cpu_ref llama ${ASSETS}/tiny_llama_dv.flyx)
-flyx_add_golden_test(golden_cpu_ref_llama_dv_pool ARGS cpu_ref llama ${ASSETS}/tiny_llama_dv_pool.flyx)
-# The tiny Llama with a V-LoRA of its own (the target's adapters, ABI 43) against transformers with it merged; and
-# beside its DV drafter (decoded as without DV here).
+# The tiny Llama with a V-LoRA of its own (the target's adapters, ABI 43) against transformers with it merged.
 flyx_add_golden_test(golden_cpu_ref_llama_lora ARGS cpu_ref llama_lora)
-flyx_add_golden_test(golden_cpu_ref_llama_dv_lora ARGS cpu_ref llama_dv_lora)
 # GDN heads of 128: the CUDA prefill takes the chunked recurrence.
 flyx_add_golden_test(golden_cpu_ref_gdn128 ARGS cpu_ref gdn128)
 # A DFlash2 drafter whose layers attend a sliding window (z-lab's 27B drafter's), shorter than its block here.
 flyx_add_golden_test(golden_cpu_ref_window ARGS cpu_ref window)
 
 set_tests_properties(tokenizer tokenizer_minicpm5 chat chat_qwen35 reply_grammars request reply_text
-                     scheduler_cpu_ref scheduler_queue scheduler_prewarmed_history scheduler_interrupted_prewarm
-                     scheduler_reassigned_prewarm scheduler_repeated_prewarm scheduler_marked_system session_host_budget generation_edges capi
-                     dv_trees dv_canvas dv_models llama_models PROPERTIES FIXTURES_REQUIRED assets)
+                     scheduler_cpu_ref scheduler_queue scheduler_prewarmed_history scheduler_raw_clients
+                     scheduler_interrupted_prewarm
+                     scheduler_reassigned_prewarm scheduler_repeated_prewarm scheduler_marked_system session_host_budget generation_edges elastic_load capi
+                     model_host
+                     llama_models PROPERTIES FIXTURES_REQUIRED assets)
 
+# The tests that need the GPU (label gpu): the ones below, and those above that take the CUDA backend too.
+get_property(flyx_cpu_tests DIRECTORY PROPERTY TESTS)
 if(TARGET flyx-cuda)
-  # Packed block weights against the float64 backend on the same files; the generic regions too.
-  add_test(NAME gguf_cuda COMMAND gguf_e2e_test ${ASSETS} cuda)
+  # Before every GPU test (flyx_finish_test_labels: FIXTURES_REQUIRED gpu_preflight): fails, naming who holds it, when
+  # another program has more than FLYX_TEST_GPU_MAX_USED_MIB (2560) of the GPU; skipped without nvidia-smi.
+  add_test(NAME gpu_preflight COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/gpu_preflight.py)
+  set_tests_properties(gpu_preflight PROPERTIES FIXTURES_SETUP gpu_preflight SKIP_RETURN_CODE 77)
+  add_executable(cuda_loader_test backends/cuda/loader_test.cpp ${CMAKE_SOURCE_DIR}/backends/cuda/backend.cpp)
+  target_compile_definitions(cuda_loader_test PRIVATE FLYX_TEST_DEVICE_ALLOC)
+  target_link_libraries(cuda_loader_test PRIVATE flyx_cuda_host)
+  flyx_register_test(cuda_loader cuda_loader_test)
+  flyx_register_test(elastic_load_cuda elastic_load_test ${ASSETS}/tiny.flyx cuda)
+  set_tests_properties(elastic_load_cuda PROPERTIES FIXTURES_REQUIRED assets)
+
+  # Packed block weights against the float64 backend on the same files; the generic regions too.  Programmatic
+  # dependent launch (each kernel starts while the one before finishes) on and off: the same tokens.  Whatever the
+  # GPU's table makes the default is one of the two, so neither these nor the golden tests below run it a third time.
   add_test(NAME gguf_cuda_unfused COMMAND gguf_e2e_test ${ASSETS} cuda fusion=0)
-  # Programmatic dependent launch (each kernel starts while the one before finishes) on and off, whatever the GPU's
-  # table makes the default: the same tokens.
   add_test(NAME gguf_cuda_pdl COMMAND gguf_e2e_test ${ASSETS} cuda pdl=1)
   add_test(NAME gguf_cuda_no_pdl COMMAND gguf_e2e_test ${ASSETS} cuda pdl=0)
   flyx_add_golden_test(golden_cuda_qwen3_gguf ARGS cuda qwen3 ${ASSETS}/tiny_qwen3_gguf.gguf FIXTURES gguf_assets)
@@ -423,27 +536,24 @@ if(TARGET flyx-cuda)
   # head 16 rows at a time; Q8_0, and Q4_K for the K types' round kernels.
   flyx_add_golden_test(golden_cuda_quant_q8_0 ARGS cuda quant ${ASSETS}/quant_Q8_0.gguf FIXTURES gguf_assets)
   flyx_add_golden_test(golden_cuda_quant_q4_k ARGS cuda quant ${ASSETS}/quant_Q4_K.gguf FIXTURES gguf_assets)
-  set_tests_properties(gguf_cuda gguf_cuda_unfused gguf_cuda_pdl gguf_cuda_no_pdl
-                       PROPERTIES FIXTURES_REQUIRED gguf_assets)
+  set_tests_properties(gguf_cuda_unfused gguf_cuda_pdl gguf_cuda_no_pdl PROPERTIES FIXTURES_REQUIRED gguf_assets)
 
   # A family of kernels a file (op_test_*.cu), helpers in op_test.cuh, main() in op_test.cu.
   add_executable(cuda_op_test backends/cuda/op_test.cu backends/cuda/op_test_gemm.cu backends/cuda/op_test_blocks.cu
                  backends/cuda/op_test_attention.cu backends/cuda/op_test_gdn.cu backends/cuda/op_test_nvfp4.cu
                  backends/cuda/op_test_head.cu backends/cuda/op_test_sampling.cu backends/cuda/op_test_layers.cu
-                 backends/cuda/op_test_dv.cu backends/cuda/op_test_vision.cu)
+                 backends/cuda/op_test_dv.cu backends/cuda/op_test_vision.cu
+                 backends/cuda/op_test_inkling2.cu)
   target_link_libraries(cuda_op_test PRIVATE flyx_cuda_kernels)
   add_dependencies(cuda_op_test flyx_gemm_tables)  # op_test_gemm.cu reads the generated tables
   set_target_properties(cuda_op_test PROPERTIES CUDA_ARCHITECTURES "${FLYX_CUDA_ARCHS}")
   add_test(NAME cuda_ops COMMAND cuda_op_test)
+  add_dependencies(inkling2_test flyx-cuda)
+  flyx_register_test(inkling2_cuda inkling2_test ${CMAKE_BINARY_DIR}/inkling2_assets/cuda cuda)
 
   add_test(NAME scheduler_cuda COMMAND scheduler_test ${ASSETS}/tiny.flyx cuda)
   set_tests_properties(scheduler_cuda PROPERTIES FIXTURES_REQUIRED assets)
-  # DV's rounds in three requests at once: every round its warm-up (rounds of several sessions all warm-ups), a cycle
-  # of warm-ups, trees and plain rounds, and its rounds chosen: plain decoding's text, greedy, sampled, penalized.
-  add_test(NAME scheduler_cuda_dv COMMAND scheduler_test ${ASSETS}/tiny_llama_dv31.flyx cuda dv)
-  set_tests_properties(scheduler_cuda_dv PROPERTIES FIXTURES_REQUIRED assets)
 
-  flyx_add_golden_test(golden_cuda ARGS cuda)
   flyx_add_golden_test(golden_cuda_nvfp4 ARGS cuda nvfp4)
   # the generic implementation of every region (no fused overrides) must pass as well
   flyx_add_golden_test(golden_cuda_unfused ARGS cuda nvfp4 ENV FLYX_BACKEND_OPTIONS=fusion=0)
@@ -483,41 +593,6 @@ if(TARGET flyx-cuda)
   flyx_add_golden_test(golden_cuda_llama_nvfp4_lora ARGS cuda llama_nvfp4_lora)
   flyx_add_golden_test(golden_cuda_llama_nvfp4_lora_unfused ARGS cuda llama_nvfp4_lora
                        ENV FLYX_BACKEND_OPTIONS=fusion=0)
-  flyx_add_golden_test(golden_cuda_llama_dv ARGS cuda llama ${ASSETS}/tiny_llama_dv.flyx)
-  flyx_add_golden_test(golden_cuda_llama_dv_pool ARGS cuda llama ${ASSETS}/tiny_llama_dv_pool.flyx)
-  flyx_add_golden_test(golden_cuda_llama_dv32 ARGS cuda llama ${ASSETS}/tiny_llama_dv32.flyx)
-  # DV beside a V-LoRA: the verify rows with the target's adapters, the canvas with the base weights and its own.
-  flyx_add_golden_test(golden_cuda_llama_dv_lora ARGS cuda llama_dv_lora)
-  # DV's rounds (gate 4, its drafts against the reference) with the generic regions and with the verify rows'
-  # attention on tensor cores
-  foreach(dv dv dv_pool dv_lora)
-    set(dv_file ${ASSETS}/tiny_llama_${dv}.flyx)
-    set(dv_golden llama)
-    if(dv STREQUAL "dv_lora")
-      set(dv_golden llama_dv_lora)
-    endif()
-    flyx_add_golden_test(golden_cuda_llama_${dv}_unfused ARGS cuda ${dv_golden} ${dv_file}
-                         ENV FLYX_BACKEND_OPTIONS=fusion=0)
-    flyx_add_golden_test(golden_cuda_llama_${dv}_rows_mma ARGS cuda ${dv_golden} ${dv_file}
-                         ENV FLYX_BACKEND_OPTIONS=rows_attention_from=0)
-  endforeach()
-  # DV's rounds of 31 drafts (32 verify rows: the wide rows of a file that holds DV) on 32 slots, MiniCPM5-1B's DV
-  # files' trees: a beam of 8 with coverage, a pool of 7 ranks; the beam's also with the verify rows' attention on
-  # tensor cores.
-  flyx_add_golden_test(golden_cuda_llama_dv31 ARGS cuda llama ${ASSETS}/tiny_llama_dv31.flyx)
-  flyx_add_golden_test(golden_cuda_llama_dv31_pool ARGS cuda llama ${ASSETS}/tiny_llama_dv31_pool.flyx)
-  flyx_add_golden_test(golden_cuda_llama_dv31_rows_mma ARGS cuda llama ${ASSETS}/tiny_llama_dv31.flyx
-                       ENV FLYX_BACKEND_OPTIONS=rows_attention_from=0)
-  # The beam's rounds of 31 drafts beside a V-LoRA of rank 32 (MiniCPM5-1B's g_b2h line): the target's adapters on
-  # 32 verify rows (their GEMMs one k_gemm_skinny_mt launch each) next to the canvas's grouped GEMMs and its pass the
-  # round's graph leaves out after a no-op round; also with the generic regions (the canvas's GEMMs one by one).
-  flyx_add_golden_test(golden_cuda_llama_dv31_lora ARGS cuda llama_dv_lora ${ASSETS}/tiny_llama_dv31_lora.flyx)
-  flyx_add_golden_test(golden_cuda_llama_dv31_lora_unfused ARGS cuda llama_dv_lora ${ASSETS}/tiny_llama_dv31_lora.flyx
-                       ENV FLYX_BACKEND_OPTIONS=fusion=0)
-  # The same two trees on 16 slots from a flatter selector: trees that take the beam's 8 nodes a depth and the
-  # pool's 7th rank, held whole (the canvas keeps float32's sums up to 16 rows).
-  flyx_add_golden_test(golden_cuda_llama_dv31_wide ARGS cuda llama ${ASSETS}/tiny_llama_dv31_wide.flyx)
-  flyx_add_golden_test(golden_cuda_llama_dv31_wide_pool ARGS cuda llama ${ASSETS}/tiny_llama_dv31_wide_pool.flyx)
   flyx_add_golden_test(golden_cuda_gdn128 ARGS cuda gdn128)
   flyx_add_golden_test(golden_cuda_gdn128_unfused ARGS cuda gdn128 ENV FLYX_BACKEND_OPTIONS=fusion=0)
   flyx_add_golden_test(golden_cuda_window ARGS cuda window)
@@ -534,23 +609,13 @@ if(TARGET flyx-cuda)
   # The sessions' round graphs inside what they lease with the K/V and the low-bit copies in host
   # memory, across auto's switch: a process of its own (the driver keeps the graphs' memory of the one before).
   flyx_add_golden_test(cuda_device_memory_tiers ARGS cuda ENV FLYX_TEST_DEVICE_MEMORY=tiers SERIAL)
-  # The same for DV's rounds (its trees of 15 and 31, its warm-ups, batched too) and beside a V-LoRA (the adapters'
-  # GEMMs in every round's graph), the tiny Llama's DV files (rooms: its graphs are smaller than the prices are tight
-  # for); and DV's round graphs (dvgraphs) with the canvas pass the body of a conditional node and inline
-  # (dv_conditional=0): within what they are counted at and under twice what they took, the conditional nodes and their
-  # bodies on their own too.
-  flyx_add_golden_test(cuda_device_memory_dv ARGS cuda llama ${ASSETS}/tiny_llama_dv31.flyx
-                       ENV FLYX_TEST_DEVICE_MEMORY=rooms SERIAL)
-  flyx_add_golden_test(cuda_device_memory_dv_lora ARGS cuda llama_dv_lora ${ASSETS}/tiny_llama_dv31_lora.flyx
-                       ENV FLYX_TEST_DEVICE_MEMORY=rooms SERIAL)
-  flyx_add_golden_test(cuda_device_memory_dv_graphs ARGS cuda llama ${ASSETS}/tiny_llama_dv31.flyx
-                       ENV FLYX_TEST_DEVICE_MEMORY=dvgraphs SERIAL)
-  flyx_add_golden_test(cuda_device_memory_dv_lora_graphs ARGS cuda llama_dv_lora ${ASSETS}/tiny_llama_dv31_lora.flyx
-                       ENV FLYX_TEST_DEVICE_MEMORY=dvgraphs SERIAL)
   # tree_bench times every width and shape from the same context, the prompt prefilled again before each timing: it
   # exits 1 when a timing's first round starts elsewhere (every one after the first did, each where the last ended).
   add_test(NAME tree_bench_context COMMAND tree_bench ${ASSETS}/tiny_llama.flyx --ctx-at 40 --widths 1,3,7 --rounds 4)
   set_tests_properties(tree_bench_context PROPERTIES FIXTURES_REQUIRED assets)
+  get_property(flyx_gpu_tests DIRECTORY PROPERTY TESTS)
+  list(REMOVE_ITEM flyx_gpu_tests ${flyx_cpu_tests})
+  set_property(TEST ${flyx_gpu_tests} residual_decision vision APPEND PROPERTY LABELS gpu)
 endif()
 
 # On Windows these programs read their files by UTF-8 paths as flyx does (a build tree under a user folder named in
@@ -562,3 +627,40 @@ foreach(t IN LISTS flyx_dir_targets)
     flyx_program(${t})
   endif()
 endforeach()
+
+# DV (not in production): its tests and assets only with FLYX_TEST_DV (the *-full configure presets).  Without it,
+# dv_not_configured stands in for them: skipped, but failed where a test preset asks for DV (FLYX_TEST_REQUIRE_DV: the
+# full presets), so that a full run in a tree configured without DV fails instead of passing short.
+if(FLYX_TEST_DV)
+  include(${CMAKE_CURRENT_SOURCE_DIR}/dv.cmake)
+else()
+  string(CONCAT flyx_dv_off "import os, sys; print('DV tests are not registered in this tree: configure it with "
+                "-DFLYX_TEST_DV=ON (cmake --preset dev-full, cpu-full, ...-windows-full)'); "
+                "sys.exit(1 if os.environ.get('FLYX_TEST_REQUIRE_DV') else 77)")
+  add_test(NAME dv_not_configured COMMAND ${Python3_EXECUTABLE} -c "${flyx_dv_off}")
+  set_tests_properties(dv_not_configured PROPERTIES SKIP_RETURN_CODE 77)
+  set_property(TEST dv_not_configured APPEND PROPERTY LABELS unit dv)
+endif()
+
+# Labels flyx_finish_test_labels cannot infer (the registering functions give golden, gpu_serial, server and tools;
+# the CUDA block gpu).  smoke: the golden and GPU tests quick runs too.  quick takes as long as its longest tests,
+# cuda_ops and golden_cuda_pdl (about 35 s each alone on an RTX 5070 Ti): the others a few seconds each, so that
+# they run beside those two (the gguf_cuda runs, as long as them or longer, would set quick's time instead).  The
+# second architecture against transformers (gate 3, from its .flyx and its GGUF file), and on the GPU every kernel
+# against float64 (gate 1), the tiny Qwen3.5 (MTP, DFlash2, sampling: gates 3 and 4), Qwen3 against transformers
+# fused and generic (gates 2 and 3), Llama against transformers and its NVFP4 copy (NVFP4 on CUDA: gate 3), packed
+# GGML blocks in tree rounds, Inkling-2 (fused == generic, DSpark == plain: gates 2 and 4) and the loader.
+set_property(TEST make_assets APPEND PROPERTY LABELS tiny)          # makes the tiny models (no fixture before it)
+set_property(TEST gguf_cpu_ref APPEND PROPERTY LABELS golden)       # gguf_e2e_test: the golden outputs from GGUF
+set_property(TEST golden_cpu_ref_qwen3 golden_cpu_ref_qwen3_gguf APPEND PROPERTY LABELS smoke)
+if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+  set_property(TEST quickstart_venv APPEND PROPERTY LABELS tools)   # tools/quickstart.sh's environment
+endif()
+if(TARGET flyx-cuda)
+  set_property(TEST gguf_cuda_unfused gguf_cuda_pdl gguf_cuda_no_pdl APPEND PROPERTY LABELS golden)
+  set_property(TEST tree_bench_context APPEND PROPERTY LABELS tools)
+  set_property(TEST cuda_ops golden_cuda_pdl golden_cuda_qwen3 golden_cuda_qwen3_unfused golden_cuda_llama
+                    golden_cuda_llama_nvfp4 golden_cuda_quant_q4_k inkling2_cuda cuda_loader elastic_load_cuda vision
+                    residual_decision APPEND PROPERTY LABELS smoke)
+endif()
+flyx_finish_test_labels()
