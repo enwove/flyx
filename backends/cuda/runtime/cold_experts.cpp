@@ -71,6 +71,11 @@ float ColdMatrix::product(int expert, int row, const float* x) const {
   return cold_dot(dtype, data.data() + (e * rows + row) * stride, x, cols) * (scales.empty() ? 1.f : scales[e]);
 }
 
+struct ExpertTimes {
+  uint64_t rows = 0, visits = 0, cold = 0, pairs = 0, bytes = 0;
+  double handoff = 0, cpu = 0, hot_gpu = 0, upload = 0, reduce = 0;
+};
+
 struct ColdWorkspace {
   explicit ColdWorkspace(size_t threads) : pool(threads) {}
   RowPool pool;
@@ -81,6 +86,10 @@ struct ColdWorkspace {
   std::vector<int> cold;
   cudaEvent_t ready = nullptr;
   bool verbose = false;
+  bool profile = false;
+  cudaEvent_t timer[5]{};
+  std::map<std::pair<const MoeBlock*, bool>, ExpertTimes> times;
+  uint64_t decode_slots = 0, decode_cold = 0;
   uint64_t visits = 0, chunks = 0, slots = 0, cpu_pairs = 0;
   double route_seconds = 0, cpu_seconds = 0;
   ~ColdWorkspace() {
@@ -88,6 +97,23 @@ struct ColdWorkspace {
       cudaEventSynchronize(ready);
       cudaEventDestroy(ready);
     }
+    for (auto event : timer)
+      if (event) cudaEventDestroy(event);
+    for (const auto& [key, t] : times) {
+      std::fprintf(stderr, "flyx-cuda: expert profile block=%p phase=%s visits=%llu rows=%llu "
+                   "handoff=%.2f cpu=%.2f hot_gpu=%.2f h2d=%.2f reduce=%.2f us/visit "
+                   "cold_reads=%.2f GB/s resident=%.2f%%\n",
+                   static_cast<const void*>(key.first), key.second ? "round" : "prefill",
+                   static_cast<unsigned long long>(t.visits), static_cast<unsigned long long>(t.rows),
+                   t.handoff / t.visits, t.cpu / t.visits, t.hot_gpu / t.visits, t.upload / t.visits,
+                   t.reduce / t.visits, t.cpu ? t.bytes / (t.cpu * 1e3) : 0.,
+                   100. * (t.pairs - t.cold) / t.pairs);
+    }
+    if (verbose && decode_slots)
+      std::fprintf(stderr, "flyx-cuda: decode expert cache hit rate %.2f%% (%llu/%llu routed slots)\n",
+                   100. * (decode_slots - decode_cold) / decode_slots,
+                   static_cast<unsigned long long>(decode_slots - decode_cold),
+                   static_cast<unsigned long long>(decode_slots));
     if (verbose && visits)
       std::fprintf(stderr,
                    "flyx-cuda: hybrid expert route/activation wait %.1f us per visit, CPU work %.1f us per visit "
@@ -111,6 +137,9 @@ void init_cold_experts(flyx_bmodel* m) {
                                                : RowPool::default_threads();
   auto w = std::make_shared<ColdWorkspace>(threads);
   w->verbose = m->verbose;
+  w->profile = m->opt.profile;
+  if (w->profile)
+    for (auto& event : w->timer) CK(cudaEventCreate(&event));
   w->ids = m->host_pinned<int>(shape.pairs);
   w->input = m->host_pinned<float>(shape.inputs);
   w->cpu_slots = m->host_pinned<float>(shape.outputs);
@@ -135,19 +164,28 @@ void hybrid_experts(const Pass& ps, const MoeBlock& f, const MoeScratch* sc, flo
   const bool vec = opts(L).moe_vec;
   // A different session can own the previous visit. Order reuse of both DMA buffers and device slots on its event.
   CK(cudaStreamWaitEvent(L.st, ws.ready));
+  auto* t = ws.profile ? &ws.times[{&f, ps.round}] : nullptr;
+  if (t) {
+    ++t->visits;
+    t->rows += ps.rows;
+  }
   ++ws.visits;
   try {
     for (int base = 0; base < ps.rows; base += ColdShape::chunk) {
       int rows = std::min(ColdShape::chunk, ps.rows - base);
       auto* ids = b.moe_idx + size_t(base) * K;
       float* input = b.h + size_t(base) * H;
-      auto start = ws.verbose ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+      auto start = ws.verbose || t ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
       CK(cudaMemcpyAsync(ws.ids, ids, rows * K * sizeof(int), cudaMemcpyDeviceToHost, L.st));
       CK(cudaMemcpyAsync(ws.input, input, size_t(rows) * H * sizeof(float), cudaMemcpyDeviceToHost, L.st));
       CK(cudaEventRecord(ws.ready, L.st));
       CK(cudaEventSynchronize(ws.ready));
-      if (ws.verbose)
-        ws.route_seconds += std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count();
+      if (ws.verbose || t) {
+        const double dt = std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count();
+        ws.route_seconds += dt;
+        if (t) t->handoff += dt * 1e6;
+      }
+      if (t) CK(cudaEventRecord(ws.timer[0], L.st));
       ws.cold.clear();
       for (int r = 0; r < rows; ++r) {
         for (int k = 0; k < K;) {
@@ -170,13 +208,23 @@ void hybrid_experts(const Pass& ps, const MoeBlock& f, const MoeScratch* sc, flo
           k += count;
         }
       }
+      if (t) {
+        CK(cudaEventRecord(ws.timer[1], L.st));
+        t->pairs += rows * K;
+        t->cold += ws.cold.size();
+        t->bytes += ws.cold.size() * (f.cold_gu->stride * f.cold_gu->rows + f.cold_down->stride * f.cold_down->rows);
+      }
       if (ws.verbose) {
+        if (ps.round) {
+          ws.decode_slots += rows * K;
+          ws.decode_cold += ws.cold.size();
+        }
         ++ws.chunks;
         ws.slots += size_t(rows) * K;
         ws.cpu_pairs += ws.cold.size();
       }
       if (!ws.cold.empty()) {
-        if (ws.verbose) start = std::chrono::steady_clock::now();
+        if (ws.verbose || t) start = std::chrono::steady_clock::now();
         int last_row = -1;
         for (int slot : ws.cold) {
           const int row = slot / K;
@@ -200,8 +248,12 @@ void hybrid_experts(const Pass& ps, const MoeBlock& f, const MoeScratch* sc, flo
                 f.cold_down->product(ws.ids[slot], j, ws.act.data() + size_t(slot) * I);
           }
         });
-        if (ws.verbose)
-          ws.cpu_seconds += std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count();
+        if (ws.verbose || t) {
+          const double dt = std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count();
+          ws.cpu_seconds += dt;
+          if (t) t->cpu += dt * 1e6;
+        }
+        if (t) CK(cudaEventRecord(ws.timer[2], L.st));
         for (size_t i = 0; i < ws.cold.size();) {
           int slot = ws.cold[i++];
           size_t count = 1;
@@ -214,7 +266,20 @@ void hybrid_experts(const Pass& ps, const MoeBlock& f, const MoeScratch* sc, flo
                              cudaMemcpyHostToDevice, L.st));
         }
       }
+      if (t) CK(cudaEventRecord(ws.timer[3], L.st));
       moe_sum_slots(ws.gpu_slots, b.moe_w + size_t(base) * K, rows, K, H, out + size_t(base) * H, accumulate, L.st);
+      if (t) {
+        CK(cudaEventRecord(ws.timer[4], L.st));
+        CK(cudaEventSynchronize(ws.timer[4]));
+        auto us = [&](int a, int b) {
+          float ms = 0;
+          CK(cudaEventElapsedTime(&ms, ws.timer[a], ws.timer[b]));
+          return double(ms) * 1000;
+        };
+        t->hot_gpu += us(0, 1);
+        if (!ws.cold.empty()) t->upload += us(2, 3);
+        t->reduce += us(3, 4);
+      }
     }
     CK(cudaEventRecord(ws.ready, L.st));
   } catch (...) {
