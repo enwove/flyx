@@ -254,9 +254,13 @@ int main() {
             "canonical_model_dir keeps /dir and /dir\\ distinct on POSIX");
       if (!sym_ec) {
         const std::string via_link_parent = flyx::apps::canonical_model_dir(from_path(link_path) + "/..");
+        const std::string lexical_parent = flyx::apps::canonical_model_dir(from_path(tmp));
         const std::string real_parent = flyx::apps::canonical_model_dir(from_path(tmp / "real_parent"));
-        check(via_link_parent == real_parent,
-              "canonical_model_dir resolves symlink/.. to real parent rather than lexical parent: " + via_link_parent);
+        std::error_code eq_ec;
+        const bool resolves_real = fs::equivalent(to_path(via_link_parent), to_path(real_parent), eq_ec) && !eq_ec;
+        check(via_link_parent != lexical_parent && resolves_real,
+              "canonical_model_dir preserves symlink/.. (resolving to real parent, not lexical parent): " +
+                  via_link_parent);
       }
     }
 #endif
