@@ -62,7 +62,7 @@ Every listed placement matched 96/96 full-resident generated IDs and gave zero m
 
 On Q2_K_XL with DSpark Q8_0, using the prefill route scores alone to select verification gathers gave 57.58 tok/s at 69/128 and 54.05 at 64/128 with width 3. Using the recent decode observations gave 63.94 and 61.59 tok/s respectively. At 69/128, width 5 gave 51.79 tok/s and width 7 gave 43.50. Every width matched the 96 plain IDs at its placement. Basalt v0.5.7 reported 102.8?109.1 tok/s with its NVFP4-MX8 pack and spec 8 on this machine.
 
-The CPU fallback microbenchmark rotates through roughly 256 MiB of compressed weights and reports compressed weight bytes divided by elapsed time. Replace `THREADS` with 1, 8, 12 or 16 and `ROWS` with 1, 4 or 8. A physical-core affinity mask provides a separate eight-core control. Use the mapped strategy and `--backend-opt expert_direct=0` on the same prompt file to compare end-to-end execution.
+The CPU fallback microbenchmark rotates through roughly 256 MiB of compressed weights and reports compressed weight bytes divided by elapsed time. Replace `THREADS` with 1, 8, 12 or 16 and `ROWS` with 1, 4 or 8. The single-row run includes a raw 64-bit read using the same pool, projection-row sharding and expert-sized dispatches. A physical-core affinity mask provides a separate eight-core control. Use the mapped strategy and `--backend-opt expert_direct=0` on the same prompt file to compare end-to-end execution.
 
 ```sh
 cuda_bench cold_dot 2304 2304 THREADS ROWS

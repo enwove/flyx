@@ -6,6 +6,7 @@
 #include <charconv>
 #include <chrono>
 #include <cstdio>
+#include <numeric>
 #include <random>
 #include <string_view>
 
@@ -43,6 +44,27 @@ int cold_dot_bench(int argc, char** argv) {
                         {FLYX_DT_GGML_Q4_K, "Q4_K"},   {FLYX_DT_GGML_Q6_K, "Q6_K"},   {FLYX_DT_GGML_IQ2_S, "IQ2_S"},
                         {FLYX_DT_GGML_NVFP4, "NVFP4"}, {FLYX_DT_GGML_MXFP4, "MXFP4"}, {FLYX_DT_GGML_Q2_0, "Q2_0"}};
   std::puts("dtype,threads,activation_rows,columns,projection_rows,compressed_GB_per_s,checksum");
+  if (count == 1) {
+    // Match the dot pass's expert-sized dispatches and disjoint row shards, but read unencoded words.
+    const size_t words = size_t(cols) / 16, expert = size_t(rows) * words;
+    const size_t banks = std::max<size_t>(1, (256u << 20) / (expert * sizeof(uint64_t)));
+    std::vector<uint64_t> bank(banks * expert), checksums(rows);
+    std::iota(bank.begin(), bank.end(), uint64_t{1});
+    auto read = [&](size_t i) {
+      pool.run(rows, [&](size_t first, size_t last) {
+        for (size_t j = first; j < last; ++j) {
+          const uint64_t* row = bank.data() + i * expert + j * words;
+          checksums[j] = std::accumulate(row, row + words, uint64_t{0});
+        }
+      });
+    };
+    read(0);
+    const auto start = std::chrono::steady_clock::now();
+    for (size_t i = 0; i < banks; ++i) read(i);
+    const double seconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count();
+    std::printf("raw64,%d,1,%d,%d,%.3f,%llu\n", threads, cols, rows, bank.size() * sizeof(uint64_t) / seconds / 1e9,
+                static_cast<unsigned long long>(checksums.back()));
+  }
   for (const auto& type : types) {
     const size_t block = flyx_block_bytes(type.dtype);
     if (cols % flyx_block_values(type.dtype)) continue;
