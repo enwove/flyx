@@ -34,9 +34,10 @@ target_include_directories(dv_choice PRIVATE ${PROJECT_SOURCE_DIR}/include)
 
 if(TARGET flyx_cuda_kernels)
   add_executable(cuda_bench microbench/cuda_bench.cu microbench/mlp_persistent.cu microbench/tune.cu
-                            microbench/tune_files.cpp microbench/cold_dot.cpp microbench/graphs.cu microbench/paging.cu)
+                            microbench/tune_files.cpp microbench/cold_dot.cpp microbench/graphs.cu microbench/paging.cu
+                            ${PROJECT_SOURCE_DIR}/backends/cuda/runtime/offload/cold_dot.cpp)
   # flyx_core: the model file reader, for the matrices `cuda_bench tune FILE...` weighs its rules by
-  target_link_libraries(cuda_bench PRIVATE flyx_cuda_host flyx_cuda_kernels flyx_core)
+  target_link_libraries(cuda_bench PRIVATE flyx_cuda_kernels flyx_core)
   set_target_properties(cuda_bench PROPERTIES CUDA_ARCHITECTURES "${FLYX_CUDA_ARCHS}")
   add_test(NAME cuda_bench_round_finite COMMAND cuda_bench round IQ3_XXS 1024x5120 4)
   set_property(TEST cuda_bench_round_finite APPEND PROPERTY LABELS tools gpu)
