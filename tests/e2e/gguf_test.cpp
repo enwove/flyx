@@ -28,6 +28,7 @@
 #include "nlohmann/json.hpp"
 #include "ops/dtype/ref.h"
 #include "tests/common/check.h"
+#include "tests/common/gpu.h"
 
 using namespace flyx;
 using json = nlohmann::json;
@@ -628,9 +629,13 @@ void mtp_ring(const std::string& dir, const std::string& backend, const std::vec
             "  a checkpoint restored before the rows past it went round the ring: a fresh prefill's tokens and drafts");
       // From it again, a pass of 128 rows keeping the state at 192 inside it (prefill_snapshot), then 384 rows: the
       // ring gone round since either checkpoint.
+      // Where the device's GDN prefill is chunked (gdn_chunked_device) a pass keeps a state inside it; elsewhere
+      // (prefill_align 1) the checkpoint is the pass's end.
       const int align = ring_eng->prefill_align();
       const bool inside = align > 1 && 192 % align == 0 && api->prefill_snapshot;
-      check(inside, "  passes that keep a state inside them (prefill_align " + std::to_string(align) + ")");
+      check(inside == flyx::test::gdn_chunked_device(api),
+            "  passes that keep a state inside them where the device's GDN prefill is chunked (prefill_align " +
+                std::to_string(align) + ")");
       ok = ok && api->restore(src.seq(), 0, prompt[128]) == 128 &&
            (!inside || api->prefill_snapshot(src.seq(), 192) == 0) &&
            prefill_span(*ring_eng, src, prompt, 128, 256, 128);
