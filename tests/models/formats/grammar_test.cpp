@@ -137,6 +137,13 @@ int main(int argc, char** argv) {
   expect(g, tok, "closed thinking: a block, then a call", closed, "<think>\nhm\n</think>\n\n" + paris, true);
   expect(g, tok, "closed thinking: a call alone", closed, paris, true);
 
+  // Thinking off (the request's; the prompt closed an empty block): no block, the call or the answer alone.
+  Rules off = rules(Rules::kRequired);
+  off.thinking = false;
+  std::string no_think = reply_grammar(kXml, kTools, off, false);
+  expect(g, tok, "thinking off: a call alone", no_think, paris, true);
+  expect(g, tok, "thinking off: a block, then a call", no_think, "<think>\nhm\n</think>\n\n" + paris, false);
+
   // JSON calls (hermes, Qwen3).
   std::string hermes = reply_grammar(kJson, kTools, rules(Rules::kRequired), true);
   expect(g, tok, "hermes: a call", hermes, think + json_call("get_weather", R"({"city": "Paris"})"), true);
@@ -152,6 +159,12 @@ int main(int argc, char** argv) {
   expect(g, tok, "json: fits", person, think + R"({"name": "Ada", "age": 36})", true);
   expect(g, tok, "json: a field missing", person, think + R"({"name": "Ada"})", false);
   expect(g, tok, "json: text", person, think + "Ada, 36", false);
+  json.thinking = false;  // thinking off: the answer at once, no block before it
+  std::string person_off = reply_grammar(kJson, {}, json, false);
+  expect(g, tok, "json, thinking off: fits", person_off, R"({"name": "Ada", "age": 36})", true);
+  expect(g, tok, "json, thinking off: a block first", person_off,
+         "<think>\nhm\n</think>\n\n" + std::string(R"({"name": "Ada", "age": 36})"), false);
+  json.thinking = true;
 
   for (bool xml : {true, false}) {
     const TagSyntax& syntax = xml ? kXml : kJson;
