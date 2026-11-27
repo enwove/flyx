@@ -21,7 +21,7 @@ class ModelFile;
 namespace flyx::interfaces {
 
 struct ModelOptions {
-  std::string drafter;      // "mtp", "dflash2", "dv", "all", "none", or "" for the model's default set
+  std::string drafter;      // kDrafterModes' words (options.h), or "" for the model's default set
   bool speculative = true;  // false: no drafter
   // "" = as each weight's file has it; "exact" = the formats' own rounding everywhere; "nvfp4" = NVFP4 weights take
   // NVFP4 inputs in passes of more rows whatever the file says, other weights as the file has it.
@@ -63,9 +63,13 @@ class Model {
   // Drafter d's rounds are always a tree of its drafts: its round programs say so themselves (FLYX_DRAFT_TREE), and
   // no chain of its drafts is a trunk the tree grows from (DV's).
   virtual bool drafts_trees(int) const { return false; }
-  // The file holds a drafter whose rounds are always trees (DV), whether or not it was asked for: the engine's default
-  // K/V method then reads every position with it or without, so that naming it changes no token (AGENTS.md gate 4).
+  // The file holds a drafter whose rounds are trees (DV's always, DSpark's by default), whether or not it was asked
+  // for: the engine's default K/V method then reads every position with it or without, so that naming it changes no
+  // token (AGENTS.md gate 4).
   virtual bool file_drafts_trees() const { return false; }
+  // Draft trees (FLYX_DRAFT_TREE rounds beside the chains, the chooser taking them where they pay) unless the caller
+  // says otherwise: DSpark's, whose trees verify more tokens a round than its chains on the targets it is made for.
+  virtual bool draft_trees_by_default() const { return false; }
   // Drafter d keeps a state that follows its own rounds only (DV's canvas): a round of another kind, a prefill, a
   // rewind or a restore leaves it behind, and its next round drafts from a state that starts over (DV's first tree,
   // its star of MASKs, which commits one token).  round_program(0, d, false) is then its warm-up: plain decoding that

@@ -7,13 +7,16 @@
 
 namespace flyx::cuda {
 
-// Draft head top-k / argmax dispatch (1-bit rough pick on packed or bf16 head, else full draft logits).
+// Draft head top-k / argmax dispatch (1-bit rough pick on packed or bf16 head, else full draft logits).  k > the
+// pick's kDraftCands (a wide walk's): that many candidates scored exactly, laid out in a row's room (2 k + 1 floats of
+// max(V, kDraftPickFloats)); a vocabulary with less room reads the full draft logits.
 void draft_head_pick(const HeadBlock& head, const float* x, int nr, int k, int* idx, float* val,
                      const DraftPickScratch& sc, const Launch& L, bool exact_1row, float* prob, float* margin) {
   const int H = head.hidden, V = head.vocab;
-  if (head.coarse.bits && head.wb.data) {
+  const bool pick = head.coarse.bits && (k <= kDraftCands || 2 * k + 1 <= std::max(V, kDraftPickFloats));
+  if (pick && head.wb.data) {
     draft_pick_blocks(x, H, head.coarse, head.wb, V, H, nr, k, idx, val, sc.logits, L, exact_1row, prob, margin);
-  } else if (head.coarse.bits) {
+  } else if (pick) {
     draft_pick(x, H, head.coarse, head.w, V, H, nr, k, idx, val, sc.logits, L, exact_1row, prob, margin);
   } else {
     draft_logits(head, x, H, sc.logits, nr, L);
@@ -175,8 +178,10 @@ void draft_block(flyx_seq* s, const DFlashBlock& b, int width, const Launch& L, 
   const auto& head = block<HeadBlock>(m, b.head);
   const KvBuf& kv = s->kv[size_t(b.kv)];
   // A chain wider than the block drafts from a wider block: width + 1 mask rows in one pass (basalt's wide block;
-  // the drafter attends within its block both ways, at any count).  Trees keep the block they were made for.
-  const int B = tree ? b.block : std::min(FLYX_MAX_ROWS, std::max(b.block, width + 1));
+  // the drafter attends within its block both ways, at any count); from the anchor's row (draft_from 0) every row
+  // drafts, so width rows.  Trees keep the block they were made for.
+  const int off = b.draft_from;
+  const int B = tree ? b.block : std::min(FLYX_MAX_ROWS, std::max(b.block, width + off));
   const int H = b.hidden, nh = b.nh, nkv = b.nkv, hd = b.hd, I = b.inter;
   const int Tp = b.conv_taps, G = H / b.conv_group, TG = Tp * G, nqkv = (nh + 2 * nkv) * hd;
   cudaStream_t st = L.st;
@@ -190,46 +195,57 @@ void draft_block(flyx_seq* s, const DFlashBlock& b, int width, const Launch& L, 
   for (int j = 0; j < b.layers(); ++j) {
     const auto& l = block<DFlashLayer>(m, b.first_layer + j);
     const KvRef kvr = kv.layer_ref(j);
+    // Token-conditioned convolutions around attention and MLP where the block has them; plain layers add straight back.
+    const bool conv = b.conv();
     rmsnorm(s->dx, H, l.norm.w, l.norm.offset, l.norm.eps, s->dh, H, B, H, st);
-    gemm(s->dh, H, l.attn_proj, 2 * TG, H, s->ddelta, 2 * TG, B, false, L);
-    grouped_conv(s->dh, H, s->ddelta, 2 * TG, l.attn_base, H, Tp, b.conv_group, s->dhc, H, B, false, st);
-    gemm(s->dhc, H, l.w_qkv, nqkv, H, s->dproj, s->ld_dproj, B, false, L);
+    if (conv) {
+      gemm(s->dh, H, l.attn_proj, 2 * TG, H, s->ddelta, 2 * TG, B, false, L);
+      grouped_conv(s->dh, H, s->ddelta, 2 * TG, l.attn_base, H, Tp, b.conv_group, s->dhc, H, B, false, st);
+    }
+    gemm(conv ? s->dhc : s->dh, H, l.w_qkv, nqkv, H, s->dproj, s->ld_dproj, B, false, L);
     attn_prep(s->dproj, s->ld_dproj, 0, nh * hd, (nh + nkv) * hd, l.q_norm.w, l.k_norm.w, l.q_norm.offset,
               l.q_norm.eps, b.theta, hd, nh, nkv, hd, B, s->P, kPosPosition, false, s->dq, kvr, st);
     const bool split_o = fused && !l.w_o.q8_inputs() && (nh * hd) % 64 == 0;
     attention(s->dq, kvr, nh, nkv, hd, B, false, B, 1.f / std::sqrt(float(hd)), s->P, nullptr, 0,
               split_o ? nullptr : s->dact, s->ld_dact, s->own.part, kRoundSplits, L, 0, b.window);
-    if (split_o) gemm_presplit(l.w_o, H, nh * hd, s->dtmp, H, B, false, L);
-    else gemm(s->dact, s->ld_dact, l.w_o, H, nh * hd, s->dtmp, H, B, false, L);
-    grouped_conv(s->dtmp, H, s->ddelta + TG, 2 * TG, l.attn_base + size_t(Tp) * H, H, Tp, b.conv_group, s->dx, H, B,
-                 true, st);
+    float* const o_out = conv ? s->dtmp : s->dx;  // without convolutions the projection adds into the residual
+    if (split_o) gemm_presplit(l.w_o, H, nh * hd, o_out, H, B, !conv, L);
+    else gemm(s->dact, s->ld_dact, l.w_o, H, nh * hd, o_out, H, B, !conv, L);
+    if (conv)
+      grouped_conv(s->dtmp, H, s->ddelta + TG, 2 * TG, l.attn_base + size_t(Tp) * H, H, Tp, b.conv_group, s->dx, H,
+                   B, true, st);
     rmsnorm(s->dx, H, l.post_norm.w, l.post_norm.offset, l.post_norm.eps, s->dh, H, B, H, st);
-    gemm(s->dh, H, l.mlp_proj, 2 * TG, H, s->ddelta, 2 * TG, B, false, L);
-    grouped_conv(s->dh, H, s->ddelta, 2 * TG, l.mlp_base, H, Tp, b.conv_group, s->dhc, H, B, false, st);
-    gemm(s->dhc, H, l.w_gu, 2 * I, H, s->dproj, s->ld_dproj, B, false, L);
+    if (conv) {
+      gemm(s->dh, H, l.mlp_proj, 2 * TG, H, s->ddelta, 2 * TG, B, false, L);
+      grouped_conv(s->dh, H, s->ddelta, 2 * TG, l.mlp_base, H, Tp, b.conv_group, s->dhc, H, B, false, st);
+    }
+    gemm(conv ? s->dhc : s->dh, H, l.w_gu, 2 * I, H, s->dproj, s->ld_dproj, B, false, L);
     if (fused) {
       swiglu_split(s->dproj, s->ld_dproj, I, B, L, l.w_down.q8_inputs());
-      gemm_presplit(l.w_down, H, I, s->dtmp, H, B, false, L);
+      gemm_presplit(l.w_down, H, I, o_out, H, B, !conv, L);
     } else {
       swiglu(s->dproj, s->ld_dproj, I, s->dact, s->ld_dact, B, st);
-      gemm(s->dact, s->ld_dact, l.w_down, H, I, s->dtmp, H, B, false, L);
+      gemm(s->dact, s->ld_dact, l.w_down, H, I, o_out, H, B, !conv, L);
     }
-    grouped_conv(s->dtmp, H, s->ddelta + TG, 2 * TG, l.mlp_base + size_t(Tp) * H, H, Tp, b.conv_group, s->dx, H, B,
-                 true, st);
+    if (conv)
+      grouped_conv(s->dtmp, H, s->ddelta + TG, 2 * TG, l.mlp_base + size_t(Tp) * H, H, Tp, b.conv_group, s->dx, H,
+                   B, true, st);
   }
-  // Rows 1..width predict tokens: unary top-k from the target head, then the
+  // Rows draft_from.. predict tokens (width of them): unary top-k from the target head, then the
   // selector walk (or tree).  The block's layers above need all B rows (attention inside
   // the block is not causal), the head only the rows whose drafts are used.
-  const int nr = std::min(width, B - 1);
-  rmsnorm(s->dx + H, H, b.norm.w, b.norm.offset, b.norm.eps, s->dh, H, nr, H, st);
+  const int nr = std::min(width, B - off);
+  rmsnorm(s->dx + size_t(off) * H, H, b.norm.w, b.norm.offset, b.norm.eps, s->dh, H, nr, H, st);
   draft_head_pick(head, s->dh, nr, b.sel_topk, s->cand, s->unary, s, L, s->draft_prob, s->draft_margin);
-  gemm(s->dh, H, b.sel_hid, b.sel_rank, H, s->hid, b.sel_rank, nr, false, L);
+  // no sel_hid: the selector's score with a unit gate
+  const float* hid = b.unit_hid ? b.unit_hid : s->hid;
+  if (!b.unit_hid) gemm(s->dh, H, b.sel_hid, b.sel_rank, H, s->hid, b.sel_rank, nr, false, L);
   if (tree)
-    selector_tree(s->P, s->cand, s->unary, b.sel_topk, s->hid, b.sel_rank, b.sel_pred, b.sel_succ, width, nr,
-                  s->oracle, s->drafts, s->tree, st, b.softcap, b.softcap_mode);
+    selector_tree(s->P, s->cand, s->unary, b.sel_topk, hid, b.sel_rank, b.sel_pred, b.sel_succ, width, nr,
+                  s->oracle, s->drafts, s->tree, st, b.softcap, b.softcap_mode, s->G);
   else
-    selector_walk(s->P, s->cand, s->unary, b.sel_topk, s->hid, b.sel_rank, b.sel_pred, b.sel_succ, width, s->oracle,
-                  s->drafts, st, b.softcap, b.softcap_mode);
+    selector_walk(s->P, s->cand, s->unary, b.sel_topk, hid, b.sel_rank, b.sel_pred, b.sel_succ, width, s->oracle,
+                  s->drafts, st, b.softcap, b.softcap_mode, s->G);
 }
 
 // One MTP draft step's attention for one sequence, the step's row at P->position + pos_offset: its key and value

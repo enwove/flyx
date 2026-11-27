@@ -68,11 +68,15 @@ bool read_gguf(const uint8_t* data, size_t size, const std::string& path, ModelF
 bool read_gguf(std::vector<std::unique_ptr<os::MappedFile>>* maps, const std::string& path,
                ModelFile::Contents* out, std::string* err, bool need_tokenizer = true);
 
-// A DFlash2 drafter as published (drafter_dir.cpp): a directory with its config.json and *.safetensors,
+// A block drafter as published (drafter_dir.cpp): a directory with its config.json and *.safetensors,
 // read as python/convert would write it into a drafter file.  The shards stay mapped in `maps`.
 std::string drafter_dir_kind(const std::string& path);
 std::string flyx_draft_kind(const std::string& path);
 bool is_drafter_dir(const std::string& path);
+// Its config.json's block drafter (its architecture, or speculators' type: "dflash2", "dspark"); "" for none.
+std::string drafter_dir_kind(const std::string& dir);
+// A .flyx file's "draft" section's kind, from its header alone ("dflash2", "dspark"); "" when it holds none.
+std::string flyx_draft_kind(const std::string& path);
 bool read_drafter_dir(const std::string& dir, std::vector<std::unique_ptr<os::MappedFile>>* maps,
                       ModelFile::Contents* out, std::string* err);
 

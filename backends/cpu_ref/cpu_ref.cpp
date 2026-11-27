@@ -723,7 +723,11 @@ void draft_conv(const RefModel* M, int proj, int base_w, const Vec& h, int B, in
 void draft_block(RefSeq* s, const flyx_dflash2_block& d, int width) {
   const auto* M = s->m;
   // a chain wider than the block: width + 1 mask rows in one block (the CUDA backend's wide block)
-  const int B = std::min(FLYX_MAX_ROWS, std::max(d.block, width + 1)), H = d.hidden, nh = d.n_heads, nkv = d.n_kv, hd = d.head_dim, I = d.inter;
+  // ABI 49: from the anchor's row (draft_from 0) or the next; convolutions and the selector's gate optional.
+  const int off = d.draft_from;
+  const bool conv = d.conv_taps > 0;
+  const int B = std::min(FLYX_MAX_ROWS, std::max(d.block, width + off));
+  const int H = d.hidden, nh = d.n_heads, nkv = d.n_kv, hd = d.head_dim, I = d.inter;
   const int ctx = s->position, T = d.conv_taps;
   std::vector<int32_t> ids(B, d.mask_token);
   ids[0] = s->anchor;
@@ -735,7 +739,8 @@ void draft_block(RefSeq* s, const flyx_dflash2_block& d, int width) {
     const Vec& dK = s->K[size_t(d.kv)][size_t(j)];
     const Vec& dV = s->V[size_t(d.kv)][size_t(j)];
     for (int r = 0; r < B; ++r) norm(M, l.norm, &x[size_t(r) * H], H, &h[size_t(r) * H]);
-    draft_conv(M, l.attn_conv_proj, l.attn_conv_base, h, B, H, d, &hc, &delta);
+    if (conv) draft_conv(M, l.attn_conv_proj, l.attn_conv_base, h, B, H, d, &hc, &delta);
+    else hc = h;
     lin(M, l.q, hc.data(), B, H, nh * hd, q.data(), B);
     lin(M, l.k, hc.data(), B, H, nkv * hd, k.data(), B);
     lin(M, l.v, hc.data(), B, H, nkv * hd, v.data(), B);
@@ -764,18 +769,27 @@ void draft_block(RefSeq* s, const flyx_dflash2_block& d, int width) {
     }
     Vec ao(size_t(B) * H), fin(size_t(B) * H);
     lin(M, l.o, o.data(), B, nh * hd, H, ao.data(), B);
-    const Vec& base = M->vec(l.attn_conv_base);
-    grouped_conv(ao.data(), delta.data(), base.data() + size_t(T) * H, B, H, T, d.conv_group, B, fin.data());
+    if (conv) {
+      const Vec& base = M->vec(l.attn_conv_base);
+      grouped_conv(ao.data(), delta.data(), base.data() + size_t(T) * H, B, H, T, d.conv_group, B, fin.data());
+    } else {
+      fin = ao;
+    }
     for (size_t i = 0; i < x.size(); ++i) x[i] += fin[i];
     for (int r = 0; r < B; ++r) norm(M, l.post_norm, &x[size_t(r) * H], H, &h[size_t(r) * H]);
-    draft_conv(M, l.mlp_conv_proj, l.mlp_conv_base, h, B, H, d, &hc, &delta);
+    if (conv) draft_conv(M, l.mlp_conv_proj, l.mlp_conv_base, h, B, H, d, &hc, &delta);
+    else hc = h;
     Vec g(size_t(B) * I), u(size_t(B) * I), mo(size_t(B) * H);
     lin(M, l.gate, hc.data(), B, H, I, g.data(), B);
     lin(M, l.up, hc.data(), B, H, I, u.data(), B);
     for (size_t i = 0; i < g.size(); ++i) g[i] = silu(g[i]) * u[i];
     lin(M, l.down, g.data(), B, I, H, mo.data(), B);
-    const Vec& base2 = M->vec(l.mlp_conv_base);
-    grouped_conv(mo.data(), delta.data(), base2.data() + size_t(T) * H, B, H, T, d.conv_group, B, fin.data());
+    if (conv) {
+      const Vec& base2 = M->vec(l.mlp_conv_base);
+      grouped_conv(mo.data(), delta.data(), base2.data() + size_t(T) * H, B, H, T, d.conv_group, B, fin.data());
+    } else {
+      fin = mo;
+    }
     for (size_t i = 0; i < x.size(); ++i) x[i] += fin[i];
   }
   const auto& head = M->block(d.head).head;
@@ -787,11 +801,12 @@ void draft_block(RefSeq* s, const flyx_dflash2_block& d, int width) {
   const auto* succ = M->w(d.sel_succ);
   int prev = s->anchor;
   s->drafts.assign(width, 0);
-  for (int st = 0; st < B - 1 && st < width; ++st) {
-    norm(M, d.norm, &x[size_t(st + 1) * H], H, hn.data());
+  for (int st = 0; st < B - off && st < width; ++st) {
+    norm(M, d.norm, &x[size_t(st + off) * H], H, hn.data());
     linear(hn.data(), 1, H, M->w(head.w), V, logits.data());
     topk(logits.data(), V, K, cand.data(), val.data());
-    lin(M, d.sel_hid, hn.data(), 1, H, Rk, hid.data(), 1);
+    if (d.sel_hid >= 0) lin(M, d.sel_hid, hn.data(), 1, H, Rk, hid.data(), 1);
+    else std::fill(hid.begin(), hid.end(), 1.0);  // no sel_hid: a unit gate
     int best = 0;
     double best_score = -INFINITY;
     for (int c = 0; c < K; ++c) {
@@ -799,6 +814,8 @@ void draft_block(RefSeq* s, const flyx_dflash2_block& d, int width) {
       for (int i = 0; i < Rk; ++i)
         e += load(pred, size_t(prev) * Rk + i) * hid[i] * load(succ, size_t(cand[c]) * Rk + i);
       double sc = flyx::ops::dflash2_selector_score(val[c], e, double(d.softcap), d.softcap_mode);
+      if (s->gen.temperature > 0.f)  // sampling: coupled to the target's noise at the draft's position
+        sc = flyx::ops::coupled_draft_score(float(sc), s->gen.temperature, s->gen.seed, int64_t(ctx) + 1 + st, cand[c]);
       if (sc > best_score) {
         best_score = sc;
         best = c;

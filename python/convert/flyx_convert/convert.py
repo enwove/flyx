@@ -188,6 +188,74 @@ def arch_of(hf_cfg: dict) -> str:
     raise ValueError(f"model type {t!r} is not supported (qwen3_5, qwen3, llama)")
 
 
+# The head's candidates DSpark's Markov walk takes a step (its greedy walk is over the whole vocabulary): a wide pick
+# of the 1-bit draft head's (kWalkMax).  Over 12 prompts each of gsm8k, humaneval, mt-bench and alpaca, Qwen3-8B with
+# DeepSpec's dspark_qwen3_8b_block7 in its own evaluator accepted 6.58 / 5.89 / 3.70 / 3.82 tokens a round over the
+# whole vocabulary, 6.58 / 5.86 / 3.68 / 3.78 over the head's top 1024, 6.57 / 5.82 / 3.62 / 3.73 over its top 256,
+# 6.39 / 5.70 / 3.53 / 3.65 over its top 64 and 6.10 / 5.29 / 3.32 / 3.45 over its top 16.
+DSPARK_CANDIDATES = 1024
+
+
+# The block drafters a config.json names by its architecture, and the kind each converts to (core/modelfile/
+# drafter_dir.cpp's kDrafterArchitectures).
+_DRAFTER_ARCHITECTURES = {"DFlash2DraftModel": "dflash2", "Qwen3DSparkModel": "dspark"}
+
+
+def _drafter_config_kind(sc: dict) -> str:
+    """The block drafter a config.json is: by its architecture, else speculators' type ("dflash2"); "" for none."""
+    for a in sc.get("architectures", []):
+        if a in _DRAFTER_ARCHITECTURES:
+            return _DRAFTER_ARCHITECTURES[a]
+    return "dflash2" if sc.get("speculators_model_type") == "dflash2" else ""
+
+
+def _layer_fields(tl: dict) -> dict:
+    """A transformers layer config's fields every block drafter's canonical config has (drafter_dir.cpp's
+    layer_fields): width, layers, heads, head width, MLP width, norm epsilon, rope theta."""
+    if not 0 < int(tl["num_hidden_layers"]) <= 1024:
+        raise ValueError("draft num_hidden_layers out of range")
+    if tl["hidden_size"] <= 0 or tl["num_attention_heads"] <= 0:
+        raise ValueError("draft hidden_size and num_attention_heads must be positive")
+    hd = tl.get("head_dim") or tl["hidden_size"] // tl["num_attention_heads"]
+    if hd <= 0:
+        raise ValueError("draft head_dim must be positive")
+    rp = tl.get("rope_parameters") or tl.get("rope_scaling") or {}
+    return {"hidden": tl["hidden_size"], "layers": tl["num_hidden_layers"], "n_heads": tl["num_attention_heads"],
+            "n_kv": tl["num_key_value_heads"], "head_dim": hd, "inter": tl["intermediate_size"],
+            "eps": tl["rms_norm_eps"], "rope_theta": float(rp.get("rope_theta", tl.get("rope_theta", 10000.0)))}
+
+
+def canonical_dspark_config(sc: dict, target: dict | None) -> dict:
+    """A DSpark drafter's config (DeepSpec's "Qwen3DSparkModel"): DFlash2's block drafter without the convolutions
+    (conv_taps 0), every row of the block a draft (draft_from 0: row k predicts the token after the anchor's k-th
+    successor), and a Markov head (markov_w1, markov_w2) in the selector's place with no hidden gate (sel_gate false).
+    Its embedding and head are frozen copies of the target's (the engine uses the target's); its confidence head is
+    left out (the rounds do not use it)."""
+    rank = int(sc["markov_rank"])
+    if rank <= 0 or str(sc["markov_head_type"]).lower() != "vanilla":
+        raise ValueError("DSpark: a vanilla Markov head (markov_rank > 0) is supported")
+    ids = [int(i) for i in sc["target_layer_ids"]]
+    if any(i < 0 for i in ids):
+        raise ValueError("DSpark: a tap of the embedding (target layer -1) is not supported")
+    taps = [i + 1 for i in ids]
+    types = sc.get("layer_types") or ["full_attention"] * sc["num_hidden_layers"]
+    if any(t != "full_attention" for t in types):
+        raise ValueError(f"DSpark layer types {sorted(set(types))}: full attention is supported")
+    if target is not None:
+        if sc["vocab_size"] != target["vocab"] or sc["hidden_size"] != target["hidden"]:
+            raise ValueError("drafter vocabulary or width differs from the target's")
+        if any(not 1 <= t <= target["layers"] for t in taps):
+            raise ValueError(f"drafter taps {taps} outside the target's {target['layers']} layers")
+    return {
+        "kind": "dspark", **_layer_fields(sc),
+        "block": sc["block_size"], "mask_token": sc["mask_token_id"], "taps": taps,
+        "conv_taps": 0, "conv_group": 1, "sel_rank": rank, "sel_topk": min(DSPARK_CANDIDATES, sc["vocab_size"]),
+        "window": 0, "draft_from": 0, "sel_gate": False,
+        "target": {"hidden": sc["hidden_size"], "vocab": sc["vocab_size"],
+                   "layers": target["layers"] if target else sc.get("num_target_layers")},
+    }
+
+
 def canonical_draft_config(sc: dict, target: dict | None) -> dict:
     """A DFlash2 drafter's config, from either way it is published:
       speculators' ("speculators_model_type": "dflash2"; the layers under "transformer_layer_config";
@@ -201,6 +269,8 @@ def canonical_draft_config(sc: dict, target: dict | None) -> dict:
     pair's correction or after (selector_softcap_mode).  window: each position attends to the positions less than
     that far from it, both ways (0: all).  target: the model's canonical config, or None for a drafter file of its
     own (the engine checks it against the model it is given with; "target" below names what it was made for)."""
+    if _drafter_config_kind(sc) == "dspark":
+        return canonical_dspark_config(sc, target)
     if "dflash_config" in sc:
         if "DFlash2DraftModel" not in sc.get("architectures", []):
             raise ValueError(f"drafter architectures {sc.get('architectures')!r}: DFlash2DraftModel is supported")
@@ -221,7 +291,6 @@ def canonical_draft_config(sc: dict, target: dict | None) -> dict:
         vocab = sc.get("draft_vocab_size", tl["vocab_size"])
         target_hidden = sc.get("target_hidden_size") or tl["hidden_size"]
         causal = False
-    rp = tl.get("rope_parameters") or tl.get("rope_scaling") or {}
     types = tl.get("layer_types") or ["full_attention"] * tl["num_hidden_layers"]
     if all(t == "full_attention" for t in types):
         window = 0
@@ -240,16 +309,12 @@ def canonical_draft_config(sc: dict, target: dict | None) -> dict:
             raise ValueError("drafter target_hidden_size does not match the model")
         if any(not 1 <= t <= target["layers"] for t in taps):
             raise ValueError(f"drafter taps {taps} outside the target's {target['layers']} layers")
-    hd = tl.get("head_dim") or tl["hidden_size"] // tl["num_attention_heads"]
     draft = {
-        "kind": "dflash2", "hidden": tl["hidden_size"], "layers": tl["num_hidden_layers"],
-        "n_heads": tl["num_attention_heads"], "n_kv": tl["num_key_value_heads"], "head_dim": hd,
-        "inter": tl["intermediate_size"], "eps": tl["rms_norm_eps"],
-        "rope_theta": float(rp.get("rope_theta", tl.get("rope_theta", 10000.0))),
+        "kind": "dflash2", **_layer_fields(tl),
         "block": dc["block_size"], "mask_token": dc["mask_token_id"], "taps": taps,
         "conv_taps": dc.get("conv_kernel_size", 2), "conv_group": dc.get("conv_group_size", 16),
         "sel_rank": dc.get("selector_rank", 256), "sel_topk": dc.get("selector_top_k", 16),
-        "window": window,
+        "window": window, "draft_from": 1, "sel_gate": True,
         "target": {"hidden": target_hidden, "vocab": vocab,
                    "layers": target["layers"] if target else sc.get("num_target_layers")},
     }
@@ -307,6 +372,8 @@ _D_RULES = [
     (r"candidate_selector\.predecessor_codebook", "sel.pred"),
     (r"candidate_selector\.successor_codebook", "sel.succ"),
     (r"candidate_selector\.hidden_projection\.weight", "sel.hid"),
+    (r"markov_head\.markov_w1\.weight", "sel.pred"),    # DSpark: W1[previous token]
+    (r"markov_head\.markov_w2\.weight", "sel.succ"),    # W2: [vocab, rank]
 ]
 _MTP_RULES = [
     (r"fc\.weight", "fc"),
@@ -317,7 +384,8 @@ _MTP_RULES = [
 # Present in some checkpoints, intentionally not used by the engine.
 _T_SKIP = re.compile(r"^(model\.visual\.|visual\.)")
 _MTP_PREFIX = re.compile(r"^(model\.)?mtp\.")
-_D_SKIP = re.compile(r"^(embed_tokens\.|lm_head\.|verifier_norm\.|verifier_lm_head\.|t2d|d2t|mask_embedding)")
+_D_SKIP = re.compile(r"^(embed_tokens\.|lm_head\.|verifier_norm\.|verifier_lm_head\.|t2d|d2t|mask_embedding"
+                     r"|confidence_head\.)")
 
 
 def _map(name: str, rules) -> str | None:
@@ -479,7 +547,7 @@ def convert(model_dir: str, out: str, draft_dir: str | None = None, log=print, a
     if lora:  # a reader that dropped the adapters would decode the plain model: format 2, which earlier builds refuse
         w.meta["requires"] = ["lora"]
     w.write(out)
-    log(f"wrote {out}: {len(w.entries)} entries, draft={'dflash2' if draft else 'dv' if dv else 'none'}, "
+    log(f"wrote {out}: {len(w.entries)} entries, draft={draft['kind'] if draft else 'dv' if dv else 'none'}, "
         f"mtp={mtp['layers'] if mtp else 0} layer(s), lora={lora['rank'] if lora else 'none'}, "
         f"weights={quant['format'] if quant else 'as stored'}, eos={eos}")
 
@@ -512,7 +580,7 @@ def convert_draft(draft_dir: str, out: str, log=print) -> None:
     w.meta = {"arch": "drafter", "kind": "drafter", "draft": draft,
               "source": {"draft": os.path.basename(os.path.normpath(draft_dir))}}
     w.write(out)
-    log(f"wrote {out}: {len(w.entries)} entries, a DFlash2 drafter of {draft['layers']} layer(s), block {draft['block']}, "
+    log(f"wrote {out}: {len(w.entries)} entries, a {draft['kind']} drafter of {draft['layers']} layer(s), block {draft['block']}, "
         f"taps {draft['taps']}, window {draft['window'] or 'none'}")
 
 
@@ -614,9 +682,12 @@ def _check_mtp(layers, seen):
 
 
 def _check_draft(d, seen):
-    need = {"fc", "hidden_norm", "norm", "sel.pred", "sel.succ", "sel.hid"}
+    # The tensors its config says it has (drafter_dir.cpp's check): convolutions where it has taps of them, the
+    # selector's hidden gate where it has one (sel_gate).
+    conv, gate = d["conv_taps"] > 0, d["sel_gate"]
+    need = {"fc", "hidden_norm", "norm", "sel.pred", "sel.succ"} | ({"sel.hid"} if gate else set())
     for j in range(d["layers"]):
-        need |= {f"L{j}.{n}" for n in (*_ATTN_LAYER_KEYS, *_DRAFT_CONV_KEYS)}
+        need |= {f"L{j}.{n}" for n in ((*_ATTN_LAYER_KEYS, *_DRAFT_CONV_KEYS) if conv else _ATTN_LAYER_KEYS)}
     _check_tensors("draft", need, seen)
 
 

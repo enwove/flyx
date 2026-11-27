@@ -343,9 +343,9 @@ bool Inkling2::build(const ModelFile& file, const ModelOptions& o, std::string* 
   target.embed = embed_;
   target.head = head_;
   for (Drafter kind : drafters) {
-    int max_drafts = 0;
-    const int blk = drafters_reg_.attach(kind, file, T, target, nullptr, &max_drafts);
-    add_drafter(kind, blk, max_drafts);
+    DrafterReach reach;
+    const int blk = drafters_reg_.attach(kind, file, T, target, nullptr, &reach);
+    add_drafter(kind, blk, reach);
   }
   finish(c.hidden, c.vocab_unpadded);
   return true;

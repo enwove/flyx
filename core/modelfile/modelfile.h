@@ -78,9 +78,6 @@ class ModelFile {
   std::vector<std::unique_ptr<Companion>> companions_;
 };
 
-// An explicit non-GGUF companion, identified by its directory config or .flyx draft header.
-std::string drafter_source_kind(const std::string& path);
-
 // Lightweight header metadata peeked from a GGUF file without mapping the whole file.
 struct GgufPeek {
   bool valid = false;
@@ -94,5 +91,12 @@ GgufPeek gguf_peek(const std::string& path);
 // Peeks a GGUF file's header (without mapping the whole file) and returns its
 // <arch>.nextn_predict_layers count, 0 if absent, or -1 if the file is not a valid GGUF.
 int gguf_peek_mtp_layers(const std::string& path);
+
+// The block drafter a config.json's architectures name, by one table (core/modelfile/drafter_dir.cpp): "dflash2",
+// "dspark"; "" for none.
+std::string drafter_kind_of(const std::vector<std::string>& architectures);
+// The block drafter a drafter directory (its config.json) or a .flyx file (its header's "draft") holds, read without
+// mapping it: "dflash2", "dspark"; "" when it holds none (a GGUF drafter's kind is its header's: gguf_peek).
+std::string drafter_source_kind(const std::string& path);
 
 }  // namespace flyx

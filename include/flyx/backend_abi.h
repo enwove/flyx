@@ -30,7 +30,7 @@
 extern "C" {
 #endif
 
-#define FLYX_BACKEND_ABI_VERSION 48u
+#define FLYX_BACKEND_ABI_VERSION 49u
 #define FLYX_BACKEND_ENTRY "flyx_backend_get_api"
 /* How a backend library exports its entry. */
 #if defined(_WIN32)
@@ -399,7 +399,12 @@ typedef enum {
  * top sel_topk, and the selector walk (sel_hid, sel_pred, sel_succ).  Its
  * context: fc(the residual rows tapped at n_taps points, side by side) ->
  * hidden_norm -> each layer's k (k_norm, rope) and v into its cache.  The
- * embedding and head blocks may hold packed GGML blocks. */
+ * embedding and head blocks may hold packed GGML blocks.
+ * ABI 49: convolutions optional (conv_taps 0: attn_conv_* and mlp_conv_* are
+ * -1), the block's first drafting row draft_from (1: rows 1.., 0: the anchor's
+ * too, predicting the token after it: up to `block` drafts), sel_hid optional
+ * (-1: the selector's score with a unit gate), and q8_weights (1: the model
+ * asks its projections in Q8_0 beside a target of float weights). */
 typedef struct {
   int32_t hidden, n_heads, n_kv, head_dim, inter;
   int32_t block, mask_token, n_taps, conv_taps, conv_group, sel_rank, sel_topk;
@@ -412,11 +417,14 @@ typedef struct {
   int32_t window;                      /* sliding window of every layer; 0: none */
   float softcap;                       /* ABI 46: selector logit softcap (0 = none) */
   int32_t softcap_mode;                /* ABI 46: flyx_dflash2_softcap_mode */
+  int32_t draft_from;                  /* ABI 49: the block's first row that drafts: 1, or 0 (the anchor's) */
+  int32_t q8_weights;                  /* ABI 49: 1: its projections Q8_0 beside a target of float weights */
 } flyx_dflash2_block;
 
 /* A DFlash2 layer: attention (q, k, v, o; q/k norms; rotary on all dims) and
  * MLP, each wrapped in a grouped dynamic conv whose coefficients are
- * base [2][conv_taps][hidden] plus proj(h). */
+ * base [2][conv_taps][hidden] plus proj(h) when the block has convolutions
+ * (conv_taps > 0; else attn_conv_* and mlp_conv_* are -1). */
 typedef struct {
   flyx_norm norm, post_norm, q_norm, k_norm;
   int32_t q, k, v, o, gate, up, down;

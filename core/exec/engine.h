@@ -47,10 +47,10 @@ struct EngineOptions {
   std::string backend;       // empty = auto
   std::string backend_dir;   // empty = next to the executable
   bool speculative = true;
-  // "mtp" | "dflash2" | "dv" | "all" | "none" | empty = the drafter files' drafters and the model file's MTP layer,
-  // else its DFlash2 drafter (models/model.h: choose_drafters); its DV drafter only when named ("dv", "all").  With
-  // several, the drafter is chosen every round; DV is never beside another drafter, its rounds chosen
-  // against plain decoding's and lookup's every round (docs/design/dv.md).
+  // interfaces::kDrafterModes ("mtp" | "dflash2" | "dspark" | "dv" | "all" | "none") | empty = the drafter files'
+  // drafters and the model file's MTP layer, else its block drafter (models/model.h: choose_drafters); its DV drafter
+  // only when named ("dv", "all").  With several, the drafter is chosen every round; DV is never beside another
+  // drafter, its rounds chosen against plain decoding's and lookup's every round (docs/design/dv.md).
   std::string drafter;
   // Files with drafters' weights beside the model file: a GGUF holding only the MTP
   // layer (unsloth ships Qwen3.8-27B's so: MTP/mtp-*.gguf), a DFlash2 drafter file (python/convert --draft
@@ -120,9 +120,10 @@ struct EngineOptions {
   // FLYX_LOOKUP=0 turns it off.  The output is the same either way.
   bool lookup = true;
   bool lookup_given = false;
-  // Rounds whose drafter drafts a tree of drafts (FLYX_DRAFT_TREE; DFlash2's candidates, best first) besides its
-  // chains, the controller choosing among all of them by measured cost and acceptance; FLYX_DRAFT_TREES=1 turns
-  // it on.  The output is the same either way.
+  // Rounds whose drafter drafts a tree of drafts (FLYX_DRAFT_TREE; DFlash2's and DSpark's candidates, best first)
+  // besides its chains, the controller choosing among all of them by measured cost and acceptance; FLYX_DRAFT_TREES
+  // says too.  Not given: on where the model's drafter takes them by default (Model::draft_trees_by_default: DSpark).
+  // The output is the same either way.
   bool draft_trees = false;
   bool draft_trees_given = false;
   // Intra-round confidence optimal stopping on drafters that support adaptive plans; FLYX_ADAPTIVE=0 turns it off.
@@ -137,7 +138,7 @@ struct EngineOptions {
 // Fills the options the caller left unset from the environment: FLYX_BACKEND,
 // FLYX_BACKEND_DIR, FLYX_DRAFTER, FLYX_ACTIVATIONS; FLYX_BACKEND_OPTIONS goes before the
 // caller's backend options (a key given twice takes the later value);
-// FLYX_CHAT_NATIVE=0 turns chat_native off, FLYX_LOOKUP=0 lookup, FLYX_DRAFT_TREES=1 turns draft_trees on.
+// FLYX_CHAT_NATIVE=0 turns chat_native off, FLYX_LOOKUP=0 lookup, FLYX_DRAFT_TREES=1 / 0 turns draft_trees on / off.
 // The only place the engine reads the environment.
 void apply_environment(EngineOptions* o);
 

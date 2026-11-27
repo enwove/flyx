@@ -162,7 +162,7 @@ struct MtpBlock {
 struct DFlashLayer {
   Norm norm, post_norm, q_norm, k_norm;
   Lin w_qkv, w_o, w_gu, w_down;
-  Lin attn_proj, mlp_proj;                    // the convs' coefficient deltas
+  Lin attn_proj, mlp_proj;                    // the convs' coefficient deltas (none: conv_taps 0)
   float *attn_base = nullptr, *mlp_base = nullptr;  // and bases, [2][taps][hidden]
 };
 struct DFlashBlock {
@@ -181,8 +181,16 @@ struct DFlashBlock {
   bf16 *sel_pred = nullptr, *sel_succ = nullptr;
   Norm hidden_norm, norm, k_norms;            // k_norms: every layer's, stacked
   int kv = -1;                                // context K/V, one cache per layer
+  // ABI 49: the block's first row that drafts (1, or 0: the anchor's too); without a selector gate (sel_hid none),
+  // unit_hid (FLYX_MAX_ROWS rows of ones) in its place.
+  int draft_from = 1;
+  float* unit_hid = nullptr;
   int layers() const { return n_layers; }
   int ctx_width() const { return layers() * 2 * nkv * hd; }
+  bool conv() const { return conv_taps > 0; }
+  // Its chains drafted with other sequences' in one pass (BatchDFlash, batch.cpp): convolutions, rows from 1, a
+  // selector gate, two blocks within a pass's rows; the batch's grouped buffers exist only for such a block.
+  bool groups() const { return conv() && draft_from == 1 && !unit_hid && block > 0 && block * 2 <= FLYX_MAX_ROWS; }
 };
 
 // DV (backend_abi.h flyx_dv_block, docs/design/dv.md): `slots` canvas rows run the target's attention and MLP blocks

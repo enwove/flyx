@@ -353,8 +353,9 @@ k_sign_rough_lut(const float* __restrict__ x, int ldx, const uint32_t* __restric
 }
 
 // Picking, in three kernels per call (rows in parallel).  Row r's rough
-// scores, once read, give way to its candidates: [kCandCap] indices, then
-// [kCandCap] exact logits, then the count, at the start of its rough row.
+// scores, once read, give way to its candidates: [cap] indices, then [cap]
+// exact logits, then the count, at the start of its rough row (cap: kCandCap,
+// or a wider pick's, draft_pick_cap).
 //
 // Each of the kPickThreads logical scanners keeps its kPerThread best rough
 // scores (indices rising: an equal score keeps the lower index).  For small
@@ -405,10 +406,12 @@ __device__ __forceinline__ int draft_select_scan_thread(const float* __restrict_
   return valid;
 }
 
-__device__ __forceinline__ void draft_select_radix(uint32_t* keys, int* pool_i, int valid_local, float* __restrict__ row) {
-  __shared__ int hist[256];
-  __shared__ int s_digit, s_need, s_count;
-  const int tid = threadIdx.x, lane = tid & 31, warp = tid >> 5;
+// The `want` best of the pool and their ties, at most `cap` (the row's layout: [cap] indices, [cap] exact logits, the
+// count).
+__device__ __forceinline__ void draft_select_radix(uint32_t* keys, int* pool_i, int valid_local, float* __restrict__ row,
+                                                   int want, int cap) {
+  __shared__ int s_count;
+  const int tid = threadIdx.x, lane = tid & 31;
   if (tid == 0) s_count = 0;
   __syncthreads();
   int wcnt = valid_local;
@@ -416,43 +419,15 @@ __device__ __forceinline__ void draft_select_radix(uint32_t* keys, int* pool_i, 
   for (int o = 16; o > 0; o >>= 1) wcnt += __shfl_xor_sync(0xffffffffu, wcnt, o);
   if (lane == 0 && wcnt > 0) atomicAdd(&s_count, wcnt);
   __syncthreads();
-  // radix select: the key of the kDraftCands-th largest (0: every one, when there are no more)
-  uint32_t prefix = 0, mask = 0;
-  const bool few = s_count <= kDraftCands;
-  if (tid == 0) s_need = kDraftCands;
-  for (int shift = 24; shift >= 0 && !few; shift -= 8) {
-    if (tid < 256) hist[tid] = 0;
-    __syncthreads();
-    for (int i = tid; i < kPool; i += kPickThreads)
-      if ((keys[i] & mask) == prefix && pool_i[i] != INT_MAX) atomicAdd(&hist[(keys[i] >> shift) & 255], 1);
-    __syncthreads();
-    if (warp == 0) {  // the digit of the need-th largest among the keys matching the prefix
-      // lane l holds bins 255 - 8 l .. 248 - 8 l; counts from the top, then the lane and bin it lands in
-      int c[8], sum = 0;
-#pragma unroll
-      for (int j = 0; j < 8; ++j) sum += (c[j] = hist[255 - 8 * lane - j]);
-      int incl = sum;
-#pragma unroll
-      for (int o = 1; o < 32; o <<= 1) {
-        const int u = __shfl_up_sync(0xffffffffu, incl, o);
-        if (lane >= o) incl += u;
-      }
-      const int need = s_need, excl = incl - sum;
-      const unsigned hit = __ballot_sync(0xffffffffu, excl < need && incl >= need);
-      if (hit && lane == __ffs(hit) - 1) {
-        int left = need - excl, d = 0;
-#pragma unroll
-        for (int j = 0; j < 8; ++j)
-          if (left > 0 && d == j) {
-            if (c[j] < left) left -= c[j], d = j + 1;
-          }
-        s_digit = 255 - 8 * lane - d;
-        s_need = left;
-      }
-    }
-    __syncthreads();
-    prefix |= uint32_t(s_digit) << shift;
-    mask |= 255u << shift;
+  // radix select: the key of the want-th largest (0: every one, when there are no more)
+  uint32_t prefix = 0;
+  if (s_count > want) {
+    int ties;
+    const auto key = [&](int i, uint32_t* k) {
+      *k = keys[i];
+      return pool_i[i] != INT_MAX;
+    };
+    prefix = block_radix_kth(kPool, want, key, &ties);
   }
   __syncthreads();
   if (tid == 0) s_count = 0;
@@ -461,15 +436,16 @@ __device__ __forceinline__ void draft_select_radix(uint32_t* keys, int* pool_i, 
   for (int i = tid; i < kPool; i += kPickThreads)
     if (pool_i[i] != INT_MAX && keys[i] >= prefix) {
       const int at = atomicAdd(&s_count, 1);
-      if (at < kCandCap) cand_i[at] = pool_i[i];
+      if (at < cap) cand_i[at] = pool_i[i];
     }
   __syncthreads();
-  const int count = min(s_count, kCandCap);
-  if (tid == 0) cand_i[2 * kCandCap] = count;
-  for (int i = count + tid; i < kCandCap; i += kPickThreads) cand_i[i] = 0;  // a row of the head: decodable
+  const int count = min(s_count, cap);
+  if (tid == 0) cand_i[2 * cap] = count;
+  for (int i = count + tid; i < cap; i += kPickThreads) cand_i[i] = 0;  // a row of the head: decodable
 }
 
-__global__ void __launch_bounds__(kPickThreads) k_draft_select(float* __restrict__ rough, int ld_rough, int V) {
+__global__ void __launch_bounds__(kPickThreads) k_draft_select(float* __restrict__ rough, int ld_rough, int V, int want,
+                                                               int cap) {
   __shared__ uint32_t keys[kPool];
   __shared__ int pool_i[kPool];
   const int r = blockIdx.x, tid = threadIdx.x;
@@ -482,7 +458,7 @@ __global__ void __launch_bounds__(kPickThreads) k_draft_select(float* __restrict
     keys[i * kPickThreads + tid] = lk[i];
     pool_i[i * kPickThreads + tid] = li[i];
   }
-  draft_select_radix(keys, pool_i, valid, row);
+  draft_select_radix(keys, pool_i, valid, row, want, cap);
 }
 
 __global__ void __launch_bounds__(kSelPartBlockThreads)
@@ -505,7 +481,7 @@ k_draft_select_part(const float* __restrict__ rough, int ld_rough, int V, uint32
 
 __global__ void __launch_bounds__(kPickThreads)
 k_draft_select_finish(float* __restrict__ rough, int ld_rough, const uint32_t* __restrict__ part_keys,
-                      const int* __restrict__ part_idx) {
+                      const int* __restrict__ part_idx, int want, int cap) {
   __shared__ uint32_t keys[kPool];
   __shared__ int pool_i[kPool];
   const int r = blockIdx.x, tid = threadIdx.x;
@@ -521,10 +497,10 @@ k_draft_select_finish(float* __restrict__ rough, int ld_rough, const uint32_t* _
     pool_i[at] = idx;
     valid += idx != INT_MAX;
   }
-  draft_select_radix(keys, pool_i, valid, rough + size_t(r) * ld_rough);
+  draft_select_radix(keys, pool_i, valid, rough + size_t(r) * ld_rough, want, cap);
 }
 
-void launch_draft_select(float* rough, int ld, int V, int rows, const Launch& L) {
+void launch_draft_select(float* rough, int ld, int V, int rows, const Launch& L, int want, int cap) {
   constexpr size_t kRowBytes = size_t(kPool) * (sizeof(uint32_t) + sizeof(int));
   // Only partition when all rows fit in one Scratch::q8 buffer so CUDA round graphs add at most 1 node and
   // k_draft_select_part + k_draft_select_finish produces the exact same candidate pool as k_draft_select.
@@ -533,22 +509,22 @@ void launch_draft_select(float* rough, int ld, int V, int rows, const Launch& L)
     int* part_idx = reinterpret_cast<int*>(part_keys + size_t(rows) * kPool);
     k_draft_select_part<<<dim3(kSelPartBlocks, rows), kSelPartBlockThreads, 0, L.st>>>(rough, ld, V, part_keys,
                                                                                        part_idx);
-    k_draft_select_finish<<<rows, kPickThreads, 0, L.st>>>(rough, ld, part_keys, part_idx);
+    k_draft_select_finish<<<rows, kPickThreads, 0, L.st>>>(rough, ld, part_keys, part_idx, want, cap);
     return;
   }
-  k_draft_select<<<rows, kPickThreads, 0, L.st>>>(rough, ld, V);
+  k_draft_select<<<rows, kPickThreads, 0, L.st>>>(rough, ld, V, want, cap);
 }
 
-// grid (rows, kCandCap / 8); block 256: warp w scores candidate 8 blockIdx.y + w, the bf16 head row
+// grid (rows, cap / 8); block 256: warp w scores candidate 8 blockIdx.y + w, the bf16 head row
 // against x with lanes over K (lane l the 8-value chunks l, l + 32, ..; all its loads in flight), a
 // fixed tree across the warp.
 __global__ void __launch_bounds__(256) k_draft_score(float* __restrict__ rough, int ld_rough,
                                                      const bf16* __restrict__ W, int K, const float* __restrict__ x,
-                                                     int ldx) {
+                                                     int ldx, int cap) {
   const int r = blockIdx.x, lane = threadIdx.x & 31, c = blockIdx.y * 8 + (threadIdx.x >> 5);
   float* row = rough + size_t(r) * ld_rough;
   const int* cand_i = reinterpret_cast<const int*>(row);
-  if (c >= reinterpret_cast<const int*>(row)[2 * kCandCap]) return;
+  if (c >= reinterpret_cast<const int*>(row)[2 * cap]) return;
   const uint4* wr = reinterpret_cast<const uint4*>(W + size_t(cand_i[c]) * K);
   const float* xr = x + size_t(r) * ldx;
   uint4 a[kPickChunks];
@@ -574,18 +550,18 @@ __global__ void __launch_bounds__(256) k_draft_score(float* __restrict__ rough, 
   }
 #pragma unroll
   for (int o = 16; o > 0; o >>= 1) s += __shfl_xor_sync(0xffffffffu, s, o);
-  if (lane == 0) row[kCandCap + c] = s;
+  if (lane == 0) row[cap + c] = s;
 }
 
 // General bf16 candidate-scoring kernel for arbitrary K, optional accumulate into existing candidate scores,
 // optional per-token bias, and optional logit softcap (shared by additive / softcapped draft heads).
 __global__ void __launch_bounds__(256)
 k_draft_score_gen(float* __restrict__ rough, int ld_rough, const bf16* __restrict__ W, const float* __restrict__ bias,
-                  int K, const float* __restrict__ x, int ldx, bool accumulate, float softcap) {
+                  int K, const float* __restrict__ x, int ldx, bool accumulate, float softcap, int cap) {
   const int r = blockIdx.x, lane = threadIdx.x & 31, c = blockIdx.y * 8 + (threadIdx.x >> 5);
   float* row = rough + size_t(r) * ld_rough;
   const int* cand_i = reinterpret_cast<const int*>(row);
-  if (c >= cand_i[2 * kCandCap]) return;
+  if (c >= cand_i[2 * cap]) return;
   const int vid = cand_i[c];
   const float* xr = x + size_t(r) * ldx;
   float s = 0.f;
@@ -614,9 +590,9 @@ k_draft_score_gen(float* __restrict__ rough, int ld_rough, const bf16* __restric
 #pragma unroll
   for (int o = 16; o > 0; o >>= 1) s += __shfl_xor_sync(0xffffffffu, s, o);
   if (lane == 0) {
-    float z = (accumulate ? row[kCandCap + c] : 0.f) + s + (bias ? bias[vid] : 0.f);
+    float z = (accumulate ? row[cap + c] : 0.f) + s + (bias ? bias[vid] : 0.f);
     if (softcap > 0.f) z = softcap * tanhf(z / softcap);
-    row[kCandCap + c] = z;
+    row[cap + c] = z;
   }
 }
 
@@ -644,13 +620,13 @@ k_draft_combine_cands(const float* __restrict__ add, int ld_add, const float* __
 // candidates and its logit margin above the runner-up (in Gumbel-perturbed logit space when sampling).
 __global__ void k_draft_topk(float* __restrict__ rough, int ld_rough, int k_out, int* __restrict__ idx_out,
                              float* __restrict__ val_out, float* __restrict__ prob_out,
-                             float* __restrict__ margin_out, const DevParams* P, int pos_add, const DevGen* G) {
+                             float* __restrict__ margin_out, const DevParams* P, int pos_add, const DevGen* G, int cap) {
   const int r = blockIdx.x, lane = threadIdx.x;
   float* row = rough + size_t(r) * ld_rough;
   int* cand_i = reinterpret_cast<int*>(row);
-  const float* cand_v = row + kCandCap;
-  const int count = cand_i[2 * kCandCap];
-  if (G && P && G->temperature > 0.f && k_out == 1) {
+  const float* cand_v = row + cap;
+  const int count = cand_i[2 * cap];
+  if (G && P && G->temperature > 0.f && k_out == 1 && cap == kCandCap) {  // MTP's sampled draft: the narrow layout
     __shared__ float s_z[kCandCap];
     const float T = G->temperature, invT = 1.f / T;
     float m1 = -INFINITY;
@@ -798,6 +774,44 @@ __global__ void k_draft_topk(float* __restrict__ rough, int ld_rough, int k_out,
   }
 }
 
+// The most candidates one warp's k_draft_topk takes (k passes over the candidates); past it k_draft_sort_topk.
+constexpr int kWarpTopkMax = 64;
+
+// k_draft_topk for many candidates (a wide walk's): one block of kPickThreads a row sorts its candidates (at most
+// kSortMax) best first (block_sort_best_first) and writes the first k_out; prob_out and margin_out as k_draft_topk
+// gives them.
+constexpr int kSortMax = 2 * kPickThreads;
+__global__ void __launch_bounds__(kPickThreads) k_draft_sort_topk(float* __restrict__ rough, int ld_rough, int k_out,
+                                                                  int* __restrict__ idx_out, float* __restrict__ val_out,
+                                                                  float* __restrict__ prob_out,
+                                                                  float* __restrict__ margin_out, int cap) {
+  __shared__ float sv[kSortMax];
+  __shared__ int si[kSortMax];
+  const int r = blockIdx.x, tid = threadIdx.x;
+  float* row = rough + size_t(r) * ld_rough;
+  const int* cand_i = reinterpret_cast<const int*>(row);
+  const float* cand_v = row + cap;
+  const int count = min(cand_i[2 * cap], kSortMax);
+  int n = 1;
+  while (n < count) n <<= 1;
+  for (int i = tid; i < n; i += blockDim.x) {
+    sv[i] = i < count ? cand_v[i] : -INFINITY;
+    si[i] = i < count ? cand_i[i] : INT_MAX;
+  }
+  __syncthreads();
+  block_sort_best_first(sv, si, n);
+  for (int o = tid; o < k_out; o += blockDim.x) {
+    idx_out[size_t(r) * k_out + o] = o < count ? si[o] : 0;
+    if (val_out) val_out[size_t(r) * k_out + o] = o < count ? sv[o] : -INFINITY;
+  }
+  if (prob_out) {
+    float z = 0.f;
+    for (int i = tid; i < count; i += blockDim.x) z += expf(sv[i] - sv[0]);
+    z = block_sum(z);
+    if (tid == 0) prob_out[r] = (count > 0 && z > 0.f) ? 1.f / z : 0.f;
+  }
+  if (margin_out && tid == 0) margin_out[r] = count > 1 && isfinite(sv[1]) ? sv[0] - sv[1] : 0.f;
+}
 }  // namespace
 
 size_t sign_head_bytes(int N, int K) {
@@ -867,22 +881,23 @@ void gemm_sign_rough_add(const float* x, int ldx, const SignHead& h, const float
                                                                               ldy);
 }
 
-void draft_select_cands(float* rough, int ld, int V, int rows, const Launch& L) {
+void draft_select_cands(float* rough, int ld, int V, int rows, const Launch& L, int want, int cap) {
   static_assert(2 * kCandCap + 1 <= kDraftPickFloats, "a row's candidates fit where its rough scores were");
   if (rows <= 0 || V <= 0) return;
-  launch_draft_select(rough, ld, V, rows, L);
+  if (2 * cap + 1 > ld || cap > kSortMax) throw std::runtime_error("draft_select_cands: candidates past the rows' room");
+  launch_draft_select(rough, ld, V, rows, L, want, cap);
 }
 
 void draft_score_bf16(const float* x, int ldx, const bf16* W, const float* bias, int K, int rows, float* rough, int ld,
-                      bool accumulate, float softcap, cudaStream_t st) {
+                      bool accumulate, float softcap, cudaStream_t st, int cap) {
   if (rows <= 0) return;
-  const dim3 grid(rows, kCandCap / 8);
+  const dim3 grid(rows, cap / 8);
   const bool fast_aligned = (K & 7) == 0 && (ldx & 3) == 0 && (reinterpret_cast<uintptr_t>(W) & 15u) == 0 &&
                             (reinterpret_cast<uintptr_t>(x) & 15u) == 0;
   if (!accumulate && !bias && softcap <= 0.f && K <= 4096 && fast_aligned) {
-    k_draft_score<<<grid, 256, 0, st>>>(rough, ld, W, K, x, ldx);
+    k_draft_score<<<grid, 256, 0, st>>>(rough, ld, W, K, x, ldx, cap);
   } else {
-    k_draft_score_gen<<<grid, 256, 0, st>>>(rough, ld, W, bias, K, x, ldx, accumulate, softcap);
+    k_draft_score_gen<<<grid, 256, 0, st>>>(rough, ld, W, bias, K, x, ldx, accumulate, softcap, cap);
   }
 }
 
@@ -893,31 +908,44 @@ void draft_combine_cands(const float* add, int ld_add, const float* bias, float 
 }
 
 void draft_pick_topk(float* rough, int ld, int rows, int k, int* idx, float* val, cudaStream_t st, float* prob,
-                     float* margin, const DevParams* P, int pos_add, const DevGen* G) {
+                     float* margin, const DevParams* P, int pos_add, const DevGen* G, int cap) {
   if (rows <= 0 || k <= 0) return;
-  k_draft_topk<<<rows, 32, 0, st>>>(rough, ld, k, idx, val, prob, margin, P, pos_add, G);
+  if (k <= kWarpTopkMax) k_draft_topk<<<rows, 32, 0, st>>>(rough, ld, k, idx, val, prob, margin, P, pos_add, G, cap);
+  else k_draft_sort_topk<<<rows, kPickThreads, 0, st>>>(rough, ld, k, idx, val, prob, margin, cap);
 }
+
+namespace {
+
+// The layout of a pick of k candidates: kCandCap up to kDraftCands, else 2 k as far as the rows' room allows.
+int draft_pick_cap(int k, int ld) {
+  if (k <= kDraftCands) return kCandCap;
+  const int cap = std::min({2 * k, (ld - 1) / 2, kSortMax});
+  if (k > cap) throw std::runtime_error("draft pick: more candidates than the rows hold");
+  return cap;
+}
+
+}  // namespace
 
 void draft_pick(const float* x, int ldx, const SignHead& h, const bf16* W, int V, int K, int rows, int k, int* idx,
                 float* val, float* rough, const Launch& L, bool exact_1row, float* prob, float* margin) {
-  const int ld = std::max(V, kDraftPickFloats);
+  const int ld = std::max(V, kDraftPickFloats), cap = draft_pick_cap(k, ld);
   gemm_sign_rough(x, ldx, h, V, K, rough, ld, rows, L, exact_1row);
-  draft_select_cands(rough, ld, V, rows, L);
-  draft_score_bf16(x, ldx, W, nullptr, K, rows, rough, ld, false, 0.f, L.st);
-  draft_pick_topk(rough, ld, rows, k, idx, val, L.st, prob, margin);
+  draft_select_cands(rough, ld, V, rows, L, std::max(k, kDraftCands), cap);
+  draft_score_bf16(x, ldx, W, nullptr, K, rows, rough, ld, false, 0.f, L.st, cap);
+  draft_pick_topk(rough, ld, rows, k, idx, val, L.st, prob, margin, nullptr, 0, nullptr, cap);
 }
 
 void draft_pick_blocks(const float* x, int ldx, const SignHead& h, const BlockMat& W, int V, int K, int rows, int k,
                        int* idx, float* val, float* rough, const Launch& L, bool exact_1row, float* prob,
                        float* margin) {
-  const int ld = std::max(V, kDraftPickFloats);
+  const int ld = std::max(V, kDraftPickFloats), cap = draft_pick_cap(k, ld);
   gemm_sign_rough(x, ldx, h, V, K, rough, ld, rows, L, exact_1row);
-  draft_select_cands(rough, ld, V, rows, L);
+  draft_select_cands(rough, ld, V, rows, L, std::max(k, kDraftCands), cap);
   // Every row's candidates from the packed rows at once (a row's candidates decoded to float32 first, a row at a
   // time, were 7 launch pairs and 141 us a DFlash2 round on the 27B; the same values, in the same order).
   int* cand = reinterpret_cast<int*>(rough);
-  dots_blocks(W, K, cand, cand + 2 * kCandCap, rough + kCandCap, size_t(ld), kCandCap, x, ldx, rows, L.st);
-  draft_pick_topk(rough, ld, rows, k, idx, val, L.st, prob, margin);
+  dots_blocks(W, K, cand, cand + 2 * cap, rough + cap, size_t(ld), cap, x, ldx, rows, L.st);
+  draft_pick_topk(rough, ld, rows, k, idx, val, L.st, prob, margin, nullptr, 0, nullptr, cap);
 }
 
 }  // namespace flyx::cuda

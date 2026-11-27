@@ -66,17 +66,19 @@ void dflash2_validation(const std::string& dir) {
         add(p + "mlp.gate", {I, H});
         add(p + "mlp.up", {I, H});
         add(p + "mlp.down", {H, I});
-        add(p + "attn_conv.proj", {tg2, H});
-        add(p + "attn_conv.base", {2, ct, H});
-        add(p + "mlp_conv.proj", {tg2, H});
-        add(p + "mlp_conv.base", {2, ct, H});
+        if (ct > 0) {  // convolutions where the config has taps of them
+          add(p + "attn_conv.proj", {tg2, H});
+          add(p + "attn_conv.base", {2, ct, H});
+          add(p + "mlp_conv.proj", {tg2, H});
+          add(p + "mlp_conv.base", {2, ct, H});
+        }
       }
       add("draft.fc", {H, nt * th});
       add("draft.hidden_norm", {H});
       add("draft.norm", {H});
       add("draft.sel.pred", {vocab, sr});
       add("draft.sel.succ", {vocab, sr});
-      add("draft.sel.hid", {sr, H});
+      if (d.at("sel_gate").get<bool>()) add("draft.sel.hid", {sr, H});  // else a unit gate
     }
     json hdr = {{"format", "flyx"}, {"version", 1}, {"kind", "drafter"}, {"draft", d}, {"tensors", tensors}};
     std::string data(off, '\0');
@@ -87,7 +89,8 @@ void dflash2_validation(const std::string& dir) {
       {"kind", "dflash2"},  {"hidden", 64},     {"layers", 1},      {"n_heads", 4},     {"n_kv", 2},
       {"head_dim", 16},     {"inter", 128},     {"eps", 1e-6},      {"rope_theta", 1e4},{"block", 8},
       {"mask_token", 3},    {"taps", {2, 5}},   {"conv_taps", 2},   {"conv_group", 16}, {"sel_rank", 16},
-      {"sel_topk", 16},     {"window", 0},      {"target", {{"hidden", 64}, {"layers", 8}, {"vocab", 768}}},
+      {"sel_topk", 16},     {"window", 0},      {"draft_from", 1},  {"sel_gate", true},
+      {"target", {{"hidden", 64}, {"layers", 8}, {"vocab", 768}}},
   };
   auto check_refused = [&](const std::string& what, const json& d, bool with_tensors, const char* expect_sub) {
     const std::string path = dir + "/bad_dflash2.flyx";
@@ -132,6 +135,38 @@ void dflash2_validation(const std::string& dir) {
     d["n_kv"] = 1024;
     d["head_dim"] = 2048;
     check_refused("ctx_width int32 overflow", d, false, "invalid DFlash2");
+  }
+  // DeepSpec's DSpark (kind "dspark"): the same block without convolutions, every row a draft (draft_from 0), no
+  // selector gate (sel_gate false); taken as such, and refused past a round's rows.
+  json dspark = base;
+  dspark["kind"] = "dspark";
+  dspark["conv_taps"] = 0;
+  dspark["conv_group"] = 1;
+  dspark["draft_from"] = 0;
+  dspark["block"] = 7;
+  dspark["sel_gate"] = false;
+  {
+    const std::string path = dir + "/dspark.flyx";
+    make_drafter(path, dspark, true);
+    std::string error;
+    bool taken = false;
+    {
+      ModelFile f;
+      interfaces::ModelOptions o;
+      o.drafter = "dspark";
+      const auto m = f.open(dir + "/tiny_gguf.gguf", &error) && f.add(path, &error)
+                         ? interfaces::open_model(f, o, &error)
+                         : nullptr;
+      taken = m && m->drafters() == 1 && std::string(m->drafter_name(0)) == "dspark" && m->block_drafts(0) == 7 &&
+              !m->draft_trees_by_default();  // a Qwen3.5 target: chains by default
+    }
+    std::remove(path.c_str());
+    check(taken, "dspark beside the tiny Qwen3.5: its 7 drafts a round, chains by default (" + error + ")");
+  }
+  {
+    json d = dspark;
+    d["block"] = 16;
+    check_refused("dspark block of 16 (a round's rows less the anchor's)", d, true, "block size outside 2..15");
   }
   {  // HIGH: TG2 and n_taps * hidden int32 overflows on a large-hidden synthetic model
     auto check_synth = [&](const std::string& what, json d) {

@@ -35,6 +35,7 @@ DFlash2 scores 16 candidates per slot across 7 draft positions. With `FLYX_DRAFT
   - **Trunk first:** Preserves the greedy chain walk so a tree never accepts fewer tokens than its chain.
   - **Best-first branches:** Expands highest log-probability path children (EAGLE-2 style) over the remaining draft budget.
 - `SpecController` times each tree width at load alongside chains and runs trees only when learned branch yield per round cost beats every chain. Off by default because on current 27B hardware, extra rows beyond width 8 cost more than the +0.15–0.23 extra tokens yielded by branches.
+- **DSpark** grows the same trees from its Markov walk: a position's candidates are its row's (the block is not causal, so every branch shares them), each child scored by the head's logit plus the Markov bias from its parent's token, over up to 1024 candidates a position (`selector_tree`'s dynamic shared memory). Sampling, the trunk is the walk's coupled chain. On by default with a DSpark drafter on a Qwen3 or Llama target (`--no-draft-trees` turns them off), where a tree of 15 drafts costs about a chain of 7: Qwen3-8B bf16 on an RTX PRO 6000 (DeepSpec's 9 datasets, 20 prompts each, greedy) verified 5.51 tokens a round against 5.01 for chains of 7 (360 against 334 tok/s), above DeepSpec's own evaluator (chains) on every dataset.
 
 ---
 

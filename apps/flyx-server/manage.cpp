@@ -3,7 +3,7 @@
 //
 //   GET /v1/load          the load's state (ModelHost::status; also telemetry's "load")
 //   POST /v1/load         {"model": PATH or HUB NAME, "drafters": [...], "ctx": N,
-//                         "drafter": "mtp|dflash2|dv|all|none", "speculative": BOOL, "kv": "fp8|16", "name": ID}
+//                         "drafter": "mtp|dflash2|dspark|dv|all|none", "speculative": BOOL, "kv": "fp8|16", "name": ID}
 //                         -> 202 and the state; 409 while one loads
 //   DELETE /v1/load       stops a fetch under way (what came stays for the next try)
 //   GET /v1/hub/config    current Hugging Face Hub endpoint, default endpoint, source ("setting", "HF_ENDPOINT",

@@ -1,12 +1,14 @@
 // Copyright 2026 The flyx Authors. SPDX-License-Identifier: Apache-2.0
 #include "apps/flyx-server/model_host.h"
 
+#include <algorithm>
 #include <chrono>
 #include <condition_variable>
 #include <cstdint>
 #include <cstdio>
 #include <filesystem>
 #include <fstream>
+#include <initializer_list>
 
 #include "apps/common/defaults.h"
 #include "core/interfaces/options.h"
@@ -32,7 +34,7 @@ ojson want_json(const ModelHost::Want& w) {
           {"kv_ram", w.eo.kv_ram < 0 ? ojson("auto") : ojson(double(w.eo.kv_ram) / 1e9)},
           {"kv_gpu", w.eo.kv_gpu < 0 ? ojson(nullptr) : ojson(w.eo.kv_gpu)},
           {"width", w.eo.width < 0 ? ojson(nullptr) : ojson(w.eo.width)},
-          {"draft_trees", w.eo.draft_trees},
+          {"draft_trees", w.eo.draft_trees_given ? ojson(w.eo.draft_trees) : ojson(nullptr)},  // null: the drafter's default
           {"lookup", w.eo.lookup},
           {"draft_head", w.draft_head.empty() ? ojson(nullptr) : ojson(w.draft_head)},
           {"draft_weights", w.draft_weights.empty() ? ojson(nullptr) : ojson(w.draft_weights)},
@@ -206,12 +208,10 @@ bool want_from_json(const ojson& j, const EngineOptions& base, ModelHost::Want* 
     }
   }
   if (j.contains("drafter") && !j["drafter"].is_null()) {
-    if (!j["drafter"].is_string()) return *err = "\"drafter\": mtp, dflash2, dspark, dv, all or none", false;
-    const std::string d = j["drafter"].get<std::string>();
     interfaces::DrafterMode mode = interfaces::DrafterMode::kAuto;
-    if (!interfaces::parse_drafter_mode(d, &mode))
-      return *err = "\"drafter\": mtp, dflash2, dspark, dv, all or none", false;
-    out.eo.drafter = d;
+    if (!j["drafter"].is_string() || !interfaces::parse_drafter_mode(j["drafter"].get<std::string>(), &mode))
+      return *err = "\"drafter\": " + interfaces::drafter_mode_words(), false;
+    out.eo.drafter = j["drafter"].get<std::string>();
   }
   if (j.contains("speculative") && !j["speculative"].is_null()) {
     if (!j["speculative"].is_boolean()) return *err = "\"speculative\": true or false", false;

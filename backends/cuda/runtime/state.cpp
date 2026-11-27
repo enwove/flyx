@@ -1493,7 +1493,7 @@ void alloc_batch(flyx_bmodel* m) {
       d = df;
       break;
     }
-  if (d && d->block > 0 && d->block * 2 <= FLYX_MAX_ROWS) {
+  if (d && d->groups()) {
     const int DH = d->hidden, G = DH / d->conv_group;
     auto af = [&](size_t count) { return static_cast<float*>(alloc(count * sizeof(float))); };
     B->dflash.dtok = static_cast<int*>(alloc(size_t(FLYX_MAX_ROWS) * sizeof(int)));

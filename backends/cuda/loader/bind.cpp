@@ -248,10 +248,14 @@ DFlashLayer dflash_layer(WeightLoader& L, const flyx_dflash2_layer_block& b, Dra
   l.w_o = L.lin_quant(b.o, dq);
   l.w_gu = L.lin_stack_quant({b.gate, b.up}, dq);
   l.w_down = L.lin_quant(b.down, dq);
-  l.attn_proj = L.lin_quant(b.attn_conv_proj, dq);
-  l.mlp_proj = L.lin_quant(b.mlp_conv_proj, dq);
-  l.attn_base = L.vec(b.attn_conv_base);
-  l.mlp_base = L.vec(b.mlp_conv_base);
+  if (b.attn_conv_proj >= 0 || b.mlp_conv_proj >= 0 || b.attn_conv_base >= 0 || b.mlp_conv_base >= 0) {
+    expect(b.attn_conv_proj >= 0 && b.mlp_conv_proj >= 0 && b.attn_conv_base >= 0 && b.mlp_conv_base >= 0,
+           "a DFlash2 layer with some of its convolutions");
+    l.attn_proj = L.lin_quant(b.attn_conv_proj, dq);
+    l.mlp_proj = L.lin_quant(b.mlp_conv_proj, dq);
+    l.attn_base = L.vec(b.attn_conv_base);
+    l.mlp_base = L.vec(b.mlp_conv_base);
+  }
   return l;
 }
 
@@ -289,7 +293,10 @@ DFlashBlock dflash(WeightLoader& L, const flyx_model_desc& d, const flyx_dflash2
   f.norm = norm(L, b.norm);
   f.sel_pred = L.mat(b.sel_pred);
   f.sel_succ = L.mat(b.sel_succ);
-  f.sel_hid = L.lin_quant(b.sel_hid, dq);
+  expect(b.draft_from == 0 || b.draft_from == 1, "a block drafter's first drafting row is the anchor's or the next");
+  f.draft_from = b.draft_from;
+  if (b.sel_hid >= 0) f.sel_hid = L.lin_quant(b.sel_hid, dq);
+  else f.unit_hid = L.put(std::vector<float>(size_t(FLYX_MAX_ROWS) * b.sel_rank, 1.f));  // a unit gate
   // Context K/V projections of every layer in one GEMM, their k norms side by side.
   std::vector<int> ctx, kn;
   double eps = 0;
@@ -298,6 +305,7 @@ DFlashBlock dflash(WeightLoader& L, const flyx_model_desc& d, const flyx_dflash2
                d.blocks[b.first_layer + j].kind == FLYX_BLOCK_DFLASH2_LAYER,
            "DFlash2 layers are not its layer blocks");
     const auto& l = d.blocks[b.first_layer + j].dflash2_layer;
+    expect((l.attn_conv_proj >= 0) == (b.conv_taps > 0), "DFlash2 layer convolutions differ from its conv_taps");
     ctx.push_back(l.k);
     ctx.push_back(l.v);
     kn.push_back(l.k_norm.w);
@@ -782,10 +790,19 @@ TargetQuant target_quant(const flyx_model_desc& d, const std::vector<char>& is_d
   return result;
 }
 
+// Whether the model asks its block drafter's projections in Q8_0 beside a float target (flyx_dflash2_block q8_weights).
+bool q8_beside_float(const flyx_model_desc& d) {
+  for (int i = 0; i < d.n_blocks; ++i)
+    if (d.blocks[i].kind == FLYX_BLOCK_DFLASH2 && d.blocks[i].dflash2.q8_weights) return true;
+  return false;
+}
+
 // What the drafters' linears are uploaded as: the option's precision, or under auto MTP's in NVFP4 and the block
-// drafters' (DFlash2's, DSpark's) matched to the target's (NVFP4 beside NVFP4, Q8_0 beside GGML blocks, the file's
-// beside floating point).  Engine::load asks for nvfp4 when VRAM is tight.
-void resolve_draft_quant(interfaces::DraftWeightsMode mode, TargetQuant tq, DraftQuant* mtp_q, DraftQuant* block_q) {
+// drafters' (DFlash2's, DSpark's) matched to the target's (NVFP4 beside NVFP4, Q8_0 beside GGML blocks; beside floating
+// point the file's, or Q8_0 where the model asks it: asks_q8, a DFlash2 block's q8_weights).  Engine::load asks
+// for nvfp4 when VRAM is tight.
+void resolve_draft_quant(interfaces::DraftWeightsMode mode, TargetQuant tq, bool asks_q8, DraftQuant* mtp_q,
+                         DraftQuant* block_q) {
   switch (mode) {
     case interfaces::DraftWeightsMode::kExact: *mtp_q = *block_q = DraftQuant::kNone; return;
     case interfaces::DraftWeightsMode::kQ8: *mtp_q = *block_q = DraftQuant::kQ8; return;
@@ -793,8 +810,8 @@ void resolve_draft_quant(interfaces::DraftWeightsMode mode, TargetQuant tq, Draf
     case interfaces::DraftWeightsMode::kAuto:
       *mtp_q = DraftQuant::kNvfp4;
       *block_q = tq == TargetQuant::kNvfp4   ? DraftQuant::kNvfp4
-                 : tq == TargetQuant::kPacked ? DraftQuant::kQ8
-                                              : DraftQuant::kNone;
+                 : tq == TargetQuant::kPacked || asks_q8 ? DraftQuant::kQ8
+                                                                 : DraftQuant::kNone;
       return;
   }
 }
@@ -958,7 +975,7 @@ void bind(flyx_bmodel* m, const flyx_model_desc& d, LoadTimes* times) {
   // Decide drafter quantization for Pass 2 from draft_weights policy, target precision, and remaining VRAM.
   const TargetQuant tq = target_quant(d, is_draft, m->opt.packed_blocks);
   DraftQuant mtp_q = DraftQuant::kNvfp4, block_q = DraftQuant::kNone;  // block_q: DFlash2's and DSpark's
-  resolve_draft_quant(m->opt.draft_weights, tq, &mtp_q, &block_q);
+  resolve_draft_quant(m->opt.draft_weights, tq, q8_beside_float(d), &mtp_q, &block_q);
 
   // Pass 2: MTP, DFlash2 and DSpark drafter blocks, stream-quantized directly into final VRAM allocations.  The
   // embedding and head they read were bound in Pass 1.
@@ -1276,7 +1293,7 @@ int estimate_load(const flyx_model_desc* desc, const flyx_open_options* opts, ui
 
   const TargetQuant tq = target_quant(*desc, is_draft_blk, bo.packed_blocks);
   DraftQuant cur_mtp_q = DraftQuant::kNvfp4, cur_df_q = DraftQuant::kNone;
-  resolve_draft_quant(bo.draft_weights, tq, &cur_mtp_q, &cur_df_q);
+  resolve_draft_quant(bo.draft_weights, tq, q8_beside_float(*desc), &cur_mtp_q, &cur_df_q);
 
   // Exact device byte formula mirroring WeightLoader::lin_stack / lin_stack_quant / mat / vec.
   auto tensor_dev_bytes = [&](const flyx_tensor_view* v, bool is_lin, DraftQuant q, bool compact = false) -> uint64_t {

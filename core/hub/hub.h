@@ -46,7 +46,7 @@ struct Repo {
   std::string id, revision, commit;
   std::vector<RepoFile> files;
   std::vector<std::string> base_models;  // what its model card says it was made from
-  std::vector<std::string> architectures;  // its config.json's (a transformers checkpoint, a DFlash2 drafter)
+  std::vector<std::string> architectures;  // its config.json's (a transformers checkpoint, a block drafter)
   RepoInfo info;
   bool from_cache = false;               // the Hub was not asked (offline) or not reached
 };
@@ -120,9 +120,11 @@ bool split_gguf_name(const std::string& file_name);
 // names one.
 std::string quant_in_name(const std::string& file_name);
 
-// Whether the repository holds a DFlash2 drafter (its config's architecture), not a transformers model.
+// Whether the repository holds a block drafter (its config's architecture: DFlash2, or DeepSpec's DSpark), not a
+// transformers model; and which ("dflash2", "dspark").
 bool is_drafter(const Repo& r);
-// The files `name` asks for: the GGUF of its quant (or the repository's only one), else a DFlash2 drafter's
+std::string drafter_kind(const Repo& r);
+// The files `name` asks for: the GGUF of its quant (or the repository's only one), else a block drafter's
 // config.json and safetensors, else the repository's only .flyx file.
 bool select(const Repo& r, const Name& name, std::vector<RepoFile>* files, std::string* err);
 // The MTP layer in a GGUF of its own beside the models (unsloth: MTP/mtp-*.gguf), or nullptr.

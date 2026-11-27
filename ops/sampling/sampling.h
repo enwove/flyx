@@ -95,6 +95,17 @@ FLYX_HD float sample_uniform(uint64_t seed, int64_t pos, int32_t v) {
   return fminf(u, 0x1.fffffep-1f);
 }
 
+// A drafter's score for token v at position pos when the reply samples (temperature T > 0): its own score s over T
+// plus the Gumbel noise the target's choice at pos adds to v (above).  A drafter that takes the argmax of these drafts
+// the token the target would sample from the drafter's distribution with the target's noise: where the two
+// distributions agree the draft is the target's choice (accepted with probability near 1 - TV between them, against
+// p(draft) for the drafter's argmax), and the output, the target's choice, is unchanged.  T <= 0: s.
+FLYX_HD float coupled_draft_score(float s, float T, uint64_t seed, int64_t pos, int32_t v) {
+  if (!(T > 0.f)) return s;
+  const float u = sample_uniform(seed, pos, v);
+  return s / T - logf(-logf(u));
+}
+
 // Reflect negative encodings around the key of zero so equal values, including both zeros, share a key.
 FLYX_HD uint32_t float_key(uint32_t bits) { return (bits & 0x80000000u) ? -bits : (bits | 0x80000000u); }
 

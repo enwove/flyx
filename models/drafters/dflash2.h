@@ -1,5 +1,7 @@
 // Copyright 2026 The flyx Authors. SPDX-License-Identifier: Apache-2.0
-// Architecture-agnostic DFlash2 speculative drafter parser and block builder.
+// Architecture-agnostic DFlash2 speculative drafter parser and block builder, and DeepSpec's DSpark (kind "dspark":
+// the same block drafter without its convolutions, every row of the block a draft, the anchor's too, and a Markov
+// head as the selector without a hidden gate; from a .flyx or an authors' directory).
 // Supports three sources uniformly:
 //   * embedded in a .flyx target model header ("draft"),
 //   * a standalone .flyx drafter file or Hugging Face safetensors directory ("kind": "drafter"),
@@ -26,9 +28,17 @@ struct DFlash2Spec {
   std::vector<int> taps;   // 1-based layer indices (1..target.layers; target.layers = post output_norm tap)
   bool gguf = false;       // the file's tensor names are llama.cpp's (arch "dflash")
   int companion = -1;      // -1: embedded in target file; >= 0: companion index
+  Drafter kind = Drafter::kDFlash2;  // its config's kind (DFlash2, DSpark): the name messages give it
+  bool sel_gate = true;              // the selector's hidden gate (draft.sel.hid), else a unit gate (sel_gate false)
+  // The drafts one pass of its block makes as trained (DFlash2: block - 1; DSpark: block, the anchor's row too).
+  int block_drafts() const { return block.block - block.draft_from; }
 };
 
-// True if a companion header describes a non-Markov DFlash2 drafter container (.flyx, HF dir, or arch="dflash" GGUF).
+// The block drafter a canonical config ("draft") says it is (its "kind"), kNone when it is no block drafter.
+Drafter block_drafter_kind(const nlohmann::json& draft);
+
+// True if a companion header describes a block drafter of DFlash2's block (a drafter file's "draft", or a non-Markov
+// arch="dflash" GGUF).
 bool is_dflash_companion(const nlohmann::json& header);
 
 // Throws unless the drafter such a companion holds (or a DSpark one's: the same GGUF layout) was made for this

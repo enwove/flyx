@@ -14,7 +14,7 @@
 
 namespace flyx::cuda {
 
-// Most candidates a row has (topk_rows, the DFlash2 selector).
+// Most candidates a row has in topk_rows' per-thread lists (DV's slots; topk_rows past it: k_topk_wide).
 constexpr int kTopMax = 16;
 
 __device__ __forceinline__ float warp_sum(float v) {
@@ -572,6 +572,75 @@ __device__ __forceinline__ uint32_t float_order_u32(float v) {
 // Tie-breaking score comparison: higher score wins; on equal scores, lower index wins.
 __device__ __forceinline__ bool score_better(float va, int ia, float vb, int ib) {
   return va > vb || (va == vb && ia < ib);
+}
+
+// The block's radix select (8 bits a pass, from the top): the key of the want-th largest of the keys key(i, &k) gives
+// for i < n (true: a key; false: none), and in *ties how many of the keys equal to it the want largest take.  There
+// must be at least want keys.  Every thread of the block calls it (blockDim.x a multiple of 32, at least 256).
+template <class Key>
+__device__ uint32_t block_radix_kth(int n, int want, Key key, int* ties) {
+  __shared__ int hist[256];
+  __shared__ int s_digit, s_need;
+  const int tid = threadIdx.x, lane = tid & 31, warp = tid >> 5;
+  uint32_t prefix = 0, mask = 0;
+  if (tid == 0) s_need = want;
+  for (int shift = 24; shift >= 0; shift -= 8) {
+    if (tid < 256) hist[tid] = 0;
+    __syncthreads();
+    for (int i = tid; i < n; i += blockDim.x) {
+      uint32_t k;
+      if (key(i, &k) && (k & mask) == prefix) atomicAdd(&hist[(k >> shift) & 255], 1);
+    }
+    __syncthreads();
+    if (warp == 0) {  // the digit of the need-th largest among the keys matching the prefix
+      // lane l holds bins 255 - 8 l .. 248 - 8 l; counts from the top, then the lane and bin it lands in
+      int c[8], sum = 0;
+#pragma unroll
+      for (int j = 0; j < 8; ++j) sum += (c[j] = hist[255 - 8 * lane - j]);
+      int incl = sum;
+#pragma unroll
+      for (int o = 1; o < 32; o <<= 1) {
+        const int u = __shfl_up_sync(0xffffffffu, incl, o);
+        if (lane >= o) incl += u;
+      }
+      const int need = s_need, excl = incl - sum;
+      const unsigned hit = __ballot_sync(0xffffffffu, excl < need && incl >= need);
+      if (hit && lane == __ffs(hit) - 1) {
+        int left = need - excl, d = 0;
+#pragma unroll
+        for (int j = 0; j < 8; ++j)
+          if (left > 0 && d == j) {
+            if (c[j] < left) left -= c[j], d = j + 1;
+          }
+        s_digit = 255 - 8 * lane - d;
+        s_need = left;
+      }
+    }
+    __syncthreads();
+    prefix |= uint32_t(s_digit) << shift;
+    mask |= 255u << shift;
+  }
+  *ties = s_need;
+  return prefix;
+}
+
+// The block sorts n (a power of two) (score, index) pairs in shared memory best first (score_better), bitonic; every
+// thread of the block calls it, and it returns after the block's last barrier.
+__device__ inline void block_sort_best_first(float* v, int* idx, int n) {
+  for (int size = 2; size <= n; size <<= 1)
+    for (int stride = size / 2; stride > 0; stride >>= 1) {
+      for (int a = threadIdx.x; a < n; a += blockDim.x) {
+        const int b = a ^ stride;
+        if (b <= a) continue;
+        const bool b_first = score_better(v[b], idx[b], v[a], idx[a]);
+        if ((a & size) == 0 ? b_first : !b_first) {
+          const float tv = v[a];
+          const int ti = idx[a];
+          v[a] = v[b], idx[a] = idx[b], v[b] = tv, idx[b] = ti;
+        }
+      }
+      __syncthreads();
+    }
 }
 
 }  // namespace flyx::cuda
