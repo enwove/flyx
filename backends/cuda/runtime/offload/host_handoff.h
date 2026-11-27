@@ -8,10 +8,12 @@ namespace flyx::cuda {
 class HostHandoff {
  public:
   HostHandoff(cudaStream_t stream, cudaEvent_t ready, const int* ids, int* host_ids, size_t pairs, const float* input,
-              float* host_input, size_t values)
+              float* host_input, size_t values, bool direct)
       : stream_(stream), ready_(ready) {
-    CK(cudaMemcpyAsync(host_ids, ids, pairs * sizeof(int), cudaMemcpyDeviceToHost, stream_));
-    CK(cudaMemcpyAsync(host_input, input, values * sizeof(float), cudaMemcpyDeviceToHost, stream_));
+    if (!direct) {
+      CK(cudaMemcpyAsync(host_ids, ids, pairs * sizeof(int), cudaMemcpyDeviceToHost, stream_));
+      CK(cudaMemcpyAsync(host_input, input, values * sizeof(float), cudaMemcpyDeviceToHost, stream_));
+    }
     CK(cudaEventRecord(ready_, stream_));
     submit();
   }

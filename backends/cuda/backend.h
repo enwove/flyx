@@ -625,16 +625,21 @@ struct flyx_bmodel : ModelAllocations {
   // Page-locked host memory for async H2D DMA streaming (e.g. offloaded vision weights): raw host pointer,
   // 0 bytes of GPU VRAM, freed with host_allocs on model close.
   template <class T>
-  T* host_pinned(size_t n) {
+  T* host_pinned(size_t n, T** device_alias = nullptr) {
     if (n == 0) return nullptr;
     const size_t amount = flyx::cuda::size_mul(n, sizeof(T));
     const size_t total = flyx::cuda::size_add(host_bytes, amount);
     host_allocs.reserve(host_allocs.size() + 1);
     void* p = nullptr;
-    CK(cudaHostAlloc(&p, amount, cudaHostAllocDefault));
+    CK(cudaHostAlloc(&p, amount, device_alias ? cudaHostAllocMapped : cudaHostAllocDefault));
     host_allocs.push_back(p);
     host_bytes = total;
     pinned_bytes += amount;
+    if (device_alias) {
+      void* mapped = nullptr;
+      CK(cudaHostGetDevicePointer(&mapped, p, 0));
+      *device_alias = static_cast<T*>(mapped);
+    }
     return static_cast<T*>(p);
   }
   // Gives back an allocation of n bytes made by alloc().

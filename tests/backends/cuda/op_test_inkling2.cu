@@ -1810,7 +1810,21 @@ void test_inkling2_moe() {
     CK(cudaMemcpy(d, invalid_ids.data(), invalid_ids.size() * sizeof(int), cudaMemcpyHostToDevice));
     CK(cudaMemcpy(histogram, counts.data(), counts.size() * sizeof(uint32_t), cudaMemcpyHostToDevice));
     int* resident = dev<int>(ids.size());
-    moe_place_ids(d, int(ids.size()), int(permutation.size()), slots, histogram, invalid, 0, {resident, 3});
+    // The handoff uses mapped host pointers in production. Exercise both output planes and the grid-stride tail.
+    const std::vector<float> input(257, -3.25f);
+    float* source = dev<float>(input.size());
+    float* copy = dev<float>(input.size());
+    int* physical = dev<int>(ids.size());
+    CK(cudaMemcpy(source, input.data(), input.size() * sizeof(float), cudaMemcpyHostToDevice));
+    moe_place_ids(d, int(ids.size()), int(permutation.size()), slots, histogram, invalid, 0,
+                  {resident, 3, physical, source, copy, int(input.size())});
+    std::vector<float> downloaded(input.size());
+    CK(cudaMemcpy(downloaded.data(), copy, downloaded.size() * sizeof(float), cudaMemcpyDeviceToHost));
+    if (downloaded != input || down_i(physical, ids.size()) != std::vector<int>({-1, -1, 3, 2, 2, 4}))
+      throw std::runtime_error("expert handoff activation or physical ID");
+    cudaFree(source);
+    cudaFree(copy);
+    cudaFree(physical);
     if (down_i(resident, ids.size()) != std::vector<int>({0, 0, 0, 2, 2, 0}))
       throw std::runtime_error("bounded resident routes");
     cudaFree(resident);

@@ -42,8 +42,11 @@ void OffloadRuntime::init_experts(flyx_bmodel* m, const OffloadPlan& plan) {
         m->host_bytes += n * sizeof(uint64_t);
     }
   }
-  w->ids = m->host_pinned<int>(shape.pairs);
-  w->input = m->host_pinned<float>(shape.inputs);
+  int device = 0, can_map = 0;
+  CK(cudaGetDevice(&device));
+  CK(cudaDeviceGetAttribute(&can_map, cudaDevAttrCanMapHostMemory, device));
+  w->ids = m->host_pinned<int>(shape.pairs, can_map ? &w->mapped_ids : nullptr);
+  w->input = m->host_pinned<float>(shape.inputs, can_map ? &w->mapped_input : nullptr);
   w->cpu_slots = m->host_pinned<float>(shape.outputs);
   w->gpu_slots = m->alloc<float>(shape.outputs);
   w->ones = m->alloc<float>(shape.pairs);

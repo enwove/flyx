@@ -27,7 +27,8 @@ struct ColdWorkspace {
   bool pending_counts = false, failed = false;
   RowPool pool;
   std::mutex mutex;
-  int *ids = nullptr, *resident_ids = nullptr;
+  int *ids = nullptr, *resident_ids = nullptr, *mapped_ids = nullptr;
+  float* mapped_input = nullptr;
   float *input = nullptr, *cpu_slots = nullptr, *gpu_slots = nullptr, *ones = nullptr;
   std::vector<float> act;
   std::vector<ColdQ8> gu_q8, down_q8;

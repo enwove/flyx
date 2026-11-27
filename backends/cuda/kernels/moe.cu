@@ -1351,6 +1351,9 @@ void situ_rows(const float* gu, int ld_gu, int I, float beta, float linear_beta,
 __global__ void k_moe_place_ids(int* ids, int pairs, int experts, const int* slots, uint32_t* counts, int* invalid,
                                 ResidentRoutes resident) {
   const int i = blockIdx.x * blockDim.x + threadIdx.x;
+  // One decode row fits the mapped handoff. Event completion makes these writes visible to the host.
+  for (size_t j = size_t(i); j < size_t(resident.width); j += size_t(blockDim.x) * gridDim.x)
+    resident.host_input[j] = resident.input[j];
   if (i < pairs) {
     const int id = ids[i];
     if (unsigned(id) >= unsigned(experts)) {
@@ -1358,6 +1361,7 @@ __global__ void k_moe_place_ids(int* ids, int pairs, int experts, const int* slo
       if (invalid) atomicExch(invalid, 1);
       ids[i] = invalid ? 0 : -1;
       if (resident.ids) resident.ids[i] = 0;
+      if (resident.host_ids) resident.host_ids[i] = -1;
       return;
     }
     if (counts) {
@@ -1370,6 +1374,7 @@ __global__ void k_moe_place_ids(int* ids, int pairs, int experts, const int* slo
     }
     const int physical = slots ? slots[id] : id;
     ids[i] = physical;
+    if (resident.host_ids) resident.host_ids[i] = physical;
     if (resident.ids) resident.ids[i] = unsigned(physical) < unsigned(resident.experts) ? physical : 0;
   }
 }

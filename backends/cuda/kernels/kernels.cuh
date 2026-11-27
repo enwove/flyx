@@ -1977,6 +1977,10 @@ void moe_down(const float* act, int ld_act, const ExpertMat& W, const int* eidx,
 struct ResidentRoutes {
   int* ids = nullptr;
   int experts = 0;
+  int* host_ids = nullptr;
+  const float* input = nullptr;
+  float* host_input = nullptr;
+  int width = 0;
 };
 void moe_place_ids(int* ids, int pairs, int experts, const int* slots, uint32_t* counts, int* invalid, cudaStream_t st,
                    ResidentRoutes resident = {});
