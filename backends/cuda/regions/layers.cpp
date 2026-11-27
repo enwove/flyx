@@ -1661,7 +1661,8 @@ void moe_layer(const Pass& ps, const MoeBlock& f, bool fused) {
   } else if (f.cold_gu) {
     hybrid_experts(ps, f, msc, down_out, !f.post_conv, fused);
   } else {
-    const bool gather = ps.round && R > 1 && R <= rv.b.gather_rows && f.mapped && *f.mapped->gather && R * K <= E;
+    const bool gather = ps.round && R > 1 && R <= rv.b.gather_rows && f.mapped &&
+                        f.mapped->gather->load(std::memory_order_relaxed) && R * K <= E;
     ExpertMat staged;
     auto projection = [&](const ExpertMat& original, bool down) -> const ExpertMat& {
       if (!gather) return original;

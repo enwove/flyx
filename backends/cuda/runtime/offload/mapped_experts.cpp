@@ -3,6 +3,8 @@
 
 #include "backends/cuda/regions/layers.h"
 
+#include <cmath>
+
 namespace flyx::cuda {
 
 size_t MappedExpertPair::Projection::gather_bytes(int pairs) const {
@@ -173,6 +175,10 @@ bool ExpertAddressSpace::resident(std::pair<int, int> pair, size_t slot) const {
 
 void ExpertAddressSpace::select_gather() {
   for (auto& [pair, h] : histograms_) {
+    if (observed_rows_) {
+      h.gather = 2 * observed_remote_rows_ >= observed_rows_;
+      continue;
+    }
     uint64_t total = 0, cold = 0;
     for (size_t i = 0; i < h.order.scores.size(); ++i) {
       total += h.order.scores[i];
@@ -190,19 +196,35 @@ void ExpertAddressSpace::count_resident(size_t routes) {
 void ExpertAddressSpace::observe() {
   uint64_t visited = full_routes_, resident = full_routes_;
   full_routes_ = 0;
+  double sampled_rows = 0, remote_rows = 0;
   for (auto& [pair, h] : histograms_) {
     const size_t n = h.order.scores.size();
     CK(cudaMemcpy(h.order.counts.data(), h.device, n * sizeof(uint32_t), cudaMemcpyDeviceToHost));
     CK(cudaMemcpy(h.decode.data(), h.device + n, n * sizeof(uint32_t), cudaMemcpyDeviceToHost));
     CK(cudaMemset(h.device, 0, 2 * n * sizeof(uint32_t)));
+    uint64_t count = 0, cold = 0;
     for (size_t i = 0; i < n; ++i) {
       const uint32_t decode = h.decode[i];
       h.order.scores[i] = h.order.scores[i] / 2 + uint64_t(h.order.counts[i]) + decode;
       pending_ |= h.order.counts[i] != 0 || decode != 0;
-      if (!verbose_ || !decode) continue;
-      visited += decode;
-      if (this->resident(pair, h.order.slot[i])) resident += decode;
+      if (!decode) continue;
+      count += decode;
+      const bool hot = this->resident(pair, h.order.slot[i]);
+      if (!hot) cold += decode;
     }
+    if (count) {
+      visited += count;
+      resident += count - cold;
+      // The histogram contains marginal slot frequencies. Estimate the chance that at least
+      // one of the row's K slots is remote, using the placement that actually served the round.
+      const double rows = double(count) / h.top_k;
+      sampled_rows += rows;
+      remote_rows += rows * (1 - std::pow(double(count - cold) / count, h.top_k));
+    }
+  }
+  if (sampled_rows) {
+    observed_rows_ = 0.5 * observed_rows_ + sampled_rows;
+    observed_remote_rows_ = 0.5 * observed_remote_rows_ + remote_rows;
   }
   hits_ += resident;
   slots_ += visited;
@@ -356,7 +378,7 @@ void ExpertAddressSpace::close(const flyx_seq* seq) noexcept {
 }
 
 void ExpertAddressSpace::report(FILE* out) const {
-  if (slots_)
+  if (verbose_ && slots_)
     std::fprintf(out, "flyx-cuda: decode expert cache hit rate %.2f%% (%llu/%llu routed slots)\n",
                  100. * hits_ / slots_, static_cast<unsigned long long>(hits_),
                  static_cast<unsigned long long>(slots_));

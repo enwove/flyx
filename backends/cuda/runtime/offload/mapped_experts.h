@@ -21,7 +21,7 @@ struct MappedExpertPair {
     ExpertMat stage(uint8_t* buffer, cudaStream_t stream) const;
   };
   Projection gate, down;
-  const bool* gather = nullptr;
+  const std::atomic<bool>* gather = nullptr;
   int stage_min_rows = INT_MAX;
   class ExpertAddressSpace* owner = nullptr;
 };
@@ -56,7 +56,7 @@ private:
     int* slots = nullptr;
     std::vector<uint32_t> decode;
     size_t desired = 0;
-    bool gather = false;
+    std::atomic<bool> gather{false};
     int top_k = 0;
   };
   bool resident(std::pair<int, int> pair, size_t slot) const;
@@ -72,6 +72,7 @@ private:
   size_t granule_ = 0, sessions_ = 0;
   uint64_t hits_ = 0, slots_ = 0, full_routes_ = 0;
   bool failed_ = false, pending_ = false, verbose_ = false;
+  double observed_rows_ = 0, observed_remote_rows_ = 0;
   std::mutex mutex_;
   std::atomic<int> max_rows_{0};
 };
