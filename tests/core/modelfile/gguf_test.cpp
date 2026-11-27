@@ -23,16 +23,11 @@
 #include "core/os/os.h"
 #include "core/os/path.h"
 #include "core/tokenizer/tokenizer.h"
+#include "tests/common/check.h"
 
 using namespace flyx;
 
 namespace {
-
-int failures = 0;
-void check(bool ok, const std::string& what) {
-  std::printf("%s %s\n", ok ? "ok" : "FAIL", what.c_str());
-  failures += !ok;
-}
 
 std::vector<uint8_t> read(const std::string& path) {
   std::ifstream f(path, std::ios::binary);
@@ -536,6 +531,7 @@ void dflash_gguf_peek_and_open(const std::string& dir) {
 }  // namespace
 
 int main(int argc, char** argv) {
+  flyx::test::print_passes = true;
   if (argc != 2) return 2;
   const std::string dir = argv[1];
   same_file(dir + "/tiny.flyx", dir + "/tiny_gguf.gguf", "qwen35");
@@ -548,6 +544,5 @@ int main(int argc, char** argv) {
   projector_split(dir);
   array_stride_bounds();
   dflash_gguf_peek_and_open(dir);
-  std::printf("%d failures\n", failures);
-  return failures ? 1 : 0;
+  return flyx::test::finish("gguf_test");
 }

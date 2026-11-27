@@ -21,15 +21,9 @@ import tempfile
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, os.path.join(HERE, "..", "..", "..", "python", "reference"))
+sys.path.insert(0, os.path.join(HERE, "..", "..", "common"))
 import dv_gsm8k as runner  # noqa: E402
-
-failures = 0
-
-
-def check(ok, what):
-    global failures
-    print(("ok " if ok else "FAIL ") + what, flush=True)
-    failures += not ok
+from check import check, finish  # noqa: E402
 
 
 def refused(path, settings):
@@ -128,8 +122,7 @@ def main():
               and "other thread counts (20)" in runner.threads_refused(out, held, 8)
               and "unrecorded" in runner.threads_refused(out, {0: {"q": 0}}, 20),
               "rows made at another thread count, or an unrecorded one, refuse a run at this one")
-    print("dv_gsm8k results: " + ("ok" if not failures else f"{failures} failures"))
-    return 1 if failures else 0
+    return finish("dv_gsm8k_test")
 
 
 if __name__ == "__main__":

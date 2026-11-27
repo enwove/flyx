@@ -8,10 +8,11 @@
 // rewind inside the round window, restore a checkpoint, edit the prompt).
 // Every path must produce the reference's greedy tokens.  A model without a
 // drafter (golden "plain_only": the tiny Qwen3, the tiny Llama) runs the plain paths.
-// FLYX_TEST_DEVICE_MEMORY=1: only that sessions and engines give their
-// device memory back, and that sessions' round graphs stay inside what they
-// lease (device_memory, graph_memory below); =graphs, =tiers: the latter
-// alone, on any model (golden_test ASSET_DIR cuda VARIANT MODEL).
+// --device-memory: only that sessions and engines give their device memory
+// back, and that sessions' round graphs stay inside what they lease
+// (device_memory, graph_memory below); --device-memory=graphs, =rooms, =tiers,
+// =dvgraphs: the latter alone, on any model (golden_test ASSET_DIR cuda VARIANT
+// MODEL --device-memory=graphs).
 #include <algorithm>
 #include <atomic>
 #include <cstdio>
@@ -34,22 +35,17 @@
 #include "core/os/path.h"
 #include "core/session/session.h"
 #include "nlohmann/json.hpp"
+#include "tests/common/check.h"
 
 using namespace flyx;
 using json = nlohmann::json;
 
 namespace {
 
-int g_fail = 0;
 // The block drafter the tiny model holds, as its file says (flyx::drafter_source_kind): DFlash2, or DSpine in place of
 // it; "" for none.
 std::string g_block;
 std::string block_label() { return g_block == "dspine" ? "DSpine" : "DFlash2"; }
-
-void check(bool ok, const std::string& what) {
-  std::printf("  %-4s %s\n", ok ? "ok" : "FAIL", what.c_str());
-  if (!ok) ++g_fail;
-}
 
 // Session::init, checked.  A session the engine refuses (no room left for it, as on a GPU other programs hold, or
 // seq_new failed) has no sequence: a FAIL naming this file's line and why, and false.  generate refuses such a
@@ -111,7 +107,7 @@ Out gen(Session& s, const std::vector<int32_t>& prompt, int n, std::vector<flyx_
   };
   if (generate(s, rq, collect, &res, &err) != 0) {
     std::printf("  generate failed: %s\n", err.c_str());
-    ++g_fail;
+    ++flyx::test::failures;
   }
   s.trace = nullptr;
   o.usage = res.usage;
@@ -3368,8 +3364,7 @@ int plain_only(const json& g, const std::string& model, const std::string& backe
   context_end(model, backend, g["cases"][0]["prompt"].get<std::vector<int32_t>>());
   adaptive_stopping(model, backend, g["cases"][0]["prompt"].get<std::vector<int32_t>>());
   if (backend == "cuda") wide_rounds(model, backend, g["cases"][0]["prompt"].get<std::vector<int32_t>>());
-  std::printf("%s (%d failures)\n", g_fail ? "FAILED" : "PASSED", g_fail);
-  return g_fail ? 1 : 0;
+  return flyx::test::finish("golden_test");
 }
 
 // A session's round graphs and its shares of batch graphs (the backend's graph_stats), and its
@@ -3717,7 +3712,7 @@ void graph_dv_rounds(const std::string& model, const std::string& backend, const
 
 // Sessions and engines give their device memory back: the device's free memory before and after 20 sessions, and
 // after an engine, come and go.  That memory is the whole GPU's, so this runs as a test of its own that runs alone
-// (FLYX_TEST_DEVICE_MEMORY=1; cuda_device_memory in tests/CMakeLists.txt), and the golden tests beside each other.
+// (--device-memory; cuda_device_memory in tests/CMakeLists.txt), and the golden tests beside each other.
 int device_memory(const std::string& model, const std::string& backend, const std::vector<int32_t>& prompt) {
   auto spec = make(model, backend, true);
   auto plain = make(model, backend, false, "none");
@@ -3765,16 +3760,29 @@ int device_memory(const std::string& model, const std::string& backend, const st
           "DSpine weights: " + std::to_string(with.weights - without.weights) + " bytes resident, " +
               std::to_string(estimate.draft_weights_bytes) + " estimated");
   }
-  std::printf("%s (%d failures)\n", g_fail ? "FAILED" : "PASSED", g_fail);
-  return g_fail ? 1 : 0;
+  return flyx::test::finish("golden_test");
 }
 
 int main(int argc, char** argv) {
-  const auto args = os::utf8_arguments(argc, argv);
-  if (args.size() < 3) {
-    std::fprintf(stderr, "usage: golden_test ASSET_DIR BACKEND [VARIANT [MODEL [LORA_DIR|- [REQUIRED_DRAFTER]]]]  "
-                         "(FLYX_TEST_DEVICE_MEMORY=1: "
-                         "the device memory checks alone)\n");
+  flyx::test::print_passes = true;
+  auto args = os::utf8_arguments(argc, argv);
+  // --device-memory[=MODE], anywhere: the device memory checks alone (cuda_device_memory*), MODE the round graphs'
+  // alone (below); "sessions" for the flag without one.
+  std::string memory_checks;
+  for (size_t i = 1; i < args.size();) {
+    if (args[i] != "--device-memory" && args[i].rfind("--device-memory=", 0) != 0) {
+      ++i;
+      continue;
+    }
+    memory_checks = args[i] == "--device-memory" ? "sessions" : args[i].substr(16);
+    args.erase(args.begin() + ptrdiff_t(i));
+  }
+  const bool memory_mode = memory_checks.empty() || memory_checks == "sessions" || memory_checks == "graphs" ||
+                           memory_checks == "rooms" || memory_checks == "tiers" || memory_checks == "dvgraphs";
+  if (args.size() < 3 || !memory_mode) {
+    std::fprintf(stderr, "usage: golden_test ASSET_DIR BACKEND [VARIANT [MODEL [LORA_DIR|- [REQUIRED_DRAFTER]]]] "
+                         "[--device-memory[=graphs|rooms|tiers|dvgraphs]]  (--device-memory: the device memory "
+                         "checks alone)\n");
     return 2;
   }
   const std::string& dir = args[1];
@@ -3798,20 +3806,15 @@ int main(int argc, char** argv) {
   const std::string model = args.size() > 4 ? args[4] : dir + "/tiny" + variant + ".flyx";
   g_block = flyx::drafter_source_kind(model);
   if (args.size() > 5 && args[5] != "-") g_lora_file = args[5];
-  if (const char* which = std::getenv("FLYX_TEST_DEVICE_MEMORY")) {
+  if (!memory_checks.empty()) {
     const auto prompt = g["cases"][0]["prompt"].get<std::vector<int32_t>>();
-    const std::string mode = which;
-    if (mode != "graphs" && mode != "tiers" && mode != "rooms" && mode != "dvgraphs")
-      return device_memory(model, backend, prompt);
-    // The round graphs alone, on any model given, its drafters as FLYX_TEST_DRAFTER names them: the K/V on the GPU
-    // (graphs; rooms: without the rooms' bound from above, for a model of smaller graphs), or the K/V and the copies
-    // in host memory across auto's switch (tiers); dvgraphs: a DV file's round graphs, its canvas pass conditional and
-    // inline.
-    const char* drafter = std::getenv("FLYX_TEST_DRAFTER");
-    if (mode == "dvgraphs") graph_dv_rounds(model, backend, prompt);
-    else graph_memory(model, backend, prompt, drafter ? drafter : "all", mode == "tiers" ? 1 : 0, mode != "rooms");
-    std::printf("%s (%d failures)\n", g_fail ? "FAILED" : "PASSED", g_fail);
-    return g_fail ? 1 : 0;
+    if (memory_checks == "sessions") return device_memory(model, backend, prompt);
+    // The round graphs alone, on any model given, every drafter it has: the K/V on the GPU (graphs; rooms: without
+    // the rooms' bound from above, for a model of smaller graphs), or the K/V and the copies in host memory across
+    // auto's switch (tiers); dvgraphs: a DV file's round graphs, its canvas pass conditional and inline.
+    if (memory_checks == "dvgraphs") graph_dv_rounds(model, backend, prompt);
+    else graph_memory(model, backend, prompt, "all", memory_checks == "tiers" ? 1 : 0, memory_checks != "rooms");
+    return flyx::test::finish("golden_test");
   }
   if (g.value("plain_only", false)) return plain_only(g, model, backend, args.size() > 6 ? args[6] : "");
   auto spec = make(model, backend, true);
@@ -4643,6 +4646,5 @@ int main(int argc, char** argv) {
                    kWidth);
     }
   }
-  std::printf("%s (%d failures)\n", g_fail ? "FAILED" : "PASSED", g_fail);
-  return g_fail ? 1 : 0;
+  return flyx::test::finish("golden_test");
 }

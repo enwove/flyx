@@ -15,18 +15,12 @@
 #include "core/modelfile/modelfile.h"
 #include "core/modelfile/readers.h"
 #include "nlohmann/json.hpp"
+#include "tests/common/check.h"
 
 namespace {
 
 namespace fs = std::filesystem;
 using json = nlohmann::json;
-
-int failures = 0;
-
-void check(bool ok, const std::string& what) {
-  std::printf("%s %s\n", ok ? "ok  " : "FAIL", what.c_str());
-  failures += !ok;
-}
 
 struct Tensor {
   std::string name, dtype;
@@ -102,6 +96,7 @@ void refused_both(const fs::path& root, const std::string& name, int rank, const
 }  // namespace
 
 int main() {
+  flyx::test::print_passes = true;
   const auto stamp = std::chrono::steady_clock::now().time_since_epoch().count();
   const fs::path root = fs::temp_directory_path() / ("flyx_peft_dir_test_" + std::to_string(stamp));
   fs::remove_all(root);
@@ -279,6 +274,5 @@ int main() {
   }
 
   fs::remove_all(root);
-  std::printf("%s\n", failures ? "FAILED" : "all passed");
-  return failures ? 1 : 0;
+  return flyx::test::finish("peft_dir_test");
 }

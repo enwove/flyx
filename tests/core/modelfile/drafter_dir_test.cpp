@@ -13,22 +13,16 @@
 #include "core/modelfile/modelfile.h"
 #include "core/os/os.h"
 #include "nlohmann/json.hpp"
+#include "tests/common/check.h"
 
 namespace {
-
-int failures = 0;
-
-void check(bool ok, const std::string& what) {
-  std::printf("%s %s\n", ok ? "ok  " : "FAIL", what.c_str());
-  failures += !ok;
-}
 
 // The model with one companion added from `path`.
 bool with(const std::string& model, const std::string& path, flyx::ModelFile* f) {
   std::string err;
   if (!f->open(model, &err) || !f->add(path, &err)) {
     std::printf("FAIL %s: %s\n", path.c_str(), err.c_str());
-    ++failures;
+    ++flyx::test::failures;
     return false;
   }
   return true;
@@ -60,6 +54,7 @@ void same(const std::string& dir, const std::string& model, const std::string& p
 }  // namespace
 
 int main(int argc, char** argv) {
+  flyx::test::print_passes = true;
   if (argc < 2) return std::fprintf(stderr, "usage: drafter_dir_test ASSETS\n"), 2;
   const std::string dir = argv[1], model = dir + "/tiny_gguf.gguf";
   same(dir, model, "hf_draft_zlab", "tiny_draft.flyx");
@@ -165,6 +160,5 @@ int main(int argc, char** argv) {
     refused("a kappa that is no number", [](nlohmann::json& dc) { dc["selected_prefix_code_bridge"]["kappa"] = "10"; });
     fs::remove_all(tmp, ec);
   }
-  std::printf("%s\n", failures ? "FAILED" : "all passed");
-  return failures ? 1 : 0;
+  return flyx::test::finish("drafter_dir_test");
 }

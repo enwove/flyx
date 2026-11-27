@@ -21,14 +21,9 @@
 #include "nlohmann/json.hpp"
 #include "ops/draft/ref.h"
 #include "ops/linear/ref.h"
+#include "tests/common/check.h"
 
 namespace {
-
-int failures = 0;
-void check(bool ok, const std::string& what) {
-  std::printf("%s %s\n", ok ? "ok" : "FAIL", what.c_str());
-  failures += !ok;
-}
 
 // make_tiny.py splitmix_uniform: (splitmix64(seed * 2^32 + i) >> 11) * 2^-53.
 double uniform(uint64_t seed, uint64_t i) {
@@ -97,7 +92,8 @@ void trees(const nlohmann::json& cases) {
                     parents == c["parents"].get<std::vector<int32_t>>();
     bool first = true;
     for (int i = 0; i < width; ++i) first &= parents[size_t(i)] < i;
-    if (!ok && failures < 20) std::printf("  %s case seed %d differs\n", beam ? "beam" : "pool", int(c["seed"]));
+    if (!ok && flyx::test::failures < 20)
+      std::printf("  %s case seed %d differs\n", beam ? "beam" : "pool", int(c["seed"]));
     const int b = beam ? 0 : 1;
     ++n[b];
     same[b] += ok;
@@ -155,12 +151,12 @@ void tables(const nlohmann::json& cases) {
 }  // namespace
 
 int main(int argc, char** argv) {
+  flyx::test::print_passes = true;
   if (argc < 2) return std::fprintf(stderr, "usage: dv_tree_test ASSETS\n"), 2;
   std::ifstream f(std::string(argv[1]) + "/dv_cases.json");
   if (!f) return std::fprintf(stderr, "no %s/dv_cases.json (tests/e2e/make_tiny.py writes it)\n", argv[1]), 1;
   const nlohmann::json cases = nlohmann::json::parse(f);
   trees(cases["trees"]);
   tables(cases["tables"]);
-  std::printf("dv trees: %s\n", failures ? "FAILED" : "ok");
-  return failures ? 1 : 0;
+  return flyx::test::finish("dv_tree_test");
 }

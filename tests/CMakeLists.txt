@@ -668,12 +668,12 @@ if(TARGET flyx-cuda)
   # Sessions and engines give their device memory back, measured as the device's free memory: that is the whole
   # GPU's, so these run alone (RUN_SERIAL).  Every other GPU test runs beside the others and the CPU tests (ctest
   # -j, as the presets ask): their outputs do not depend on what else runs.
-  flyx_add_golden_test(cuda_device_memory ARGS cuda ENV FLYX_TEST_DEVICE_MEMORY=1 SERIAL)
-  flyx_add_golden_test(cuda_device_memory_dspine ARGS cuda dspine ENV FLYX_TEST_DEVICE_MEMORY=1 SERIAL)
-  flyx_add_golden_test(cuda_device_memory_nvfp4 ARGS cuda nvfp4 ENV FLYX_TEST_DEVICE_MEMORY=1 SERIAL)
+  flyx_add_golden_test(cuda_device_memory ARGS cuda --device-memory SERIAL)
+  flyx_add_golden_test(cuda_device_memory_dspine ARGS cuda dspine --device-memory SERIAL)
+  flyx_add_golden_test(cuda_device_memory_nvfp4 ARGS cuda nvfp4 --device-memory SERIAL)
   # The sessions' round graphs inside what they lease with the K/V and the low-bit copies in host
   # memory, across auto's switch: a process of its own (the driver keeps the graphs' memory of the one before).
-  flyx_add_golden_test(cuda_device_memory_tiers ARGS cuda ENV FLYX_TEST_DEVICE_MEMORY=tiers SERIAL)
+  flyx_add_golden_test(cuda_device_memory_tiers ARGS cuda --device-memory=tiers SERIAL)
   # tree_bench times every width and shape from the same context, the prompt prefilled again before each timing: it
   # exits 1 when a timing's first round starts elsewhere (every one after the first did, each where the last ended).
   add_test(NAME tree_bench_context COMMAND tree_bench ${ASSETS}/tiny_llama.flyx --ctx-at 40 --widths 1,3,7 --rounds 4)

@@ -18,17 +18,12 @@
 
 #include "core/interfaces/model.h"
 #include "core/modelfile/modelfile.h"
+#include "tests/common/check.h"
 #include "tests/core/modelfile/write_flyx.h"
 
 using namespace flyx;
 
 namespace {
-
-int failures = 0;
-void check(bool ok, const std::string& what) {
-  std::printf("%s %s\n", ok ? "ok" : "FAIL", what.c_str());
-  failures += !ok;
-}
 
 // DFlash2 drafter config validation: mismatched hidden size (would OOB target embed/head), odd head_dim,
 // oversized sel_rank, and 32-bit signed dimension-product overflows (TG2, n_taps*hidden, ctx_width) must all be
@@ -372,12 +367,12 @@ void refusals(const std::string& dir) {
 }  // namespace
 
 int main(int argc, char** argv) {
+  flyx::test::print_passes = true;
   if (argc != 2) return 2;
   const std::string dir = argv[1];
   dflash2_validation(dir);
   dense_targets(dir);
   said_and_run(dir);
   refusals(dir);
-  std::printf("%s (%d failures)\n", failures ? "FAILED" : "PASSED", failures);
-  return failures ? 1 : 0;
+  return flyx::test::finish("dflash2_models_test");
 }

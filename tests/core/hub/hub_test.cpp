@@ -28,6 +28,7 @@
 #include "core/os/path.h"
 #include "httplib/httplib.h"
 #include "nlohmann/json.hpp"
+#include "tests/common/check.h"
 
 namespace fs = std::filesystem;
 using flyx::hub::Sha256;
@@ -35,13 +36,6 @@ using flyx::os::from_path;
 using flyx::os::to_path;
 
 namespace {
-
-int failures = 0;
-
-void check(bool ok, const std::string& what) {
-  std::printf("%s %s\n", ok ? "ok  " : "FAIL", what.c_str());
-  failures += !ok;
-}
 
 struct TestDirectory {
   fs::path path;
@@ -800,6 +794,7 @@ void fetching(const fs::path& tmp) {
 }  // namespace
 
 int main(int argc, char** argv) {
+  flyx::test::print_passes = true;
   if (argc == 7 && std::string(argv[1]) == "--fetch") {  // child of check_concurrent_fetch.py
     flyx::hub::Repo r;
     r.id = "acme/parallel";
@@ -839,10 +834,9 @@ int main(int argc, char** argv) {
   if (!curl) curl = dlopen("libcurl.4.dylib", RTLD_NOW);
   if (!curl) {
     std::printf("skip: no libcurl here, fetching not tested\n");
-    return failures ? 1 : 77;
+    return flyx::test::failures ? flyx::test::finish("hub_test") : 77;
   }
 #endif
   fetching(tmp.path / "fetch");
-  std::printf("%s\n", failures ? "FAILED" : "all passed");
-  return failures ? 1 : 0;
+  return flyx::test::finish("hub_test");
 }

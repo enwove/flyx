@@ -6,7 +6,7 @@ import re
 import sys
 import tempfile
 
-from check_server import Client, wait_load
+from local_server import Client, wait_load
 from remembered_model import serve
 
 MODEL_NAME = "org/test-model"

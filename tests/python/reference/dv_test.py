@@ -37,16 +37,10 @@ import torch.nn.functional as F
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, os.path.join(HERE, "..", "..", "..", "python", "reference"))
+sys.path.insert(0, os.path.join(HERE, "..", "..", "common"))
 from flyx_ref import dv as ref  # noqa: E402
 from flyx_ref.dv import Dv, DvConfig, hf_llama, _LINEARS  # noqa: E402
-
-failures = 0
-
-
-def check(ok, what):
-    global failures
-    print(("ok " if ok else "FAIL ") + what, flush=True)
-    failures += not ok
+from check import check, finish  # noqa: E402
 
 
 def random_dv(cfg, rank, sel_rank, gen, vlora_rank=0):
@@ -369,8 +363,7 @@ def main(assets):
     check(len(r16["ids"]) == n, f"bfloat16: DV runs ({len(r16['ids'])} tokens in {len(r16['accepted'])} forwards, "
           f"{'the' if same16 else 'not the'} plain bfloat16 tokens)")
     canvas_checkpoints(os.path.join(assets, "dv_tiny", "canvas.pt"), cfg.layers)
-    print("dv reference: " + ("ok" if not failures else f"{failures} failures"))
-    return 1 if failures else 0
+    return finish("dv_test")
 
 
 if __name__ == "__main__":
