@@ -113,6 +113,34 @@ void names() {
   for (const char* path : {"/home/me/model.gguf", "C:\\models\\x.gguf", "D:/models/x.gguf", "model.gguf", "a/b/c",
                            "../x", "org/..", "./x", "", "org/name:", "org/na me"})
     check(!flyx::hub::parse_name(path, &n), std::string("not a Hub name: \"") + path + "\"");
+  // An adapter's name: a folder of the repository after ':', a path of names.
+  check(flyx::hub::parse_adapter_name("org/name:adapters/tools@v2", &n) && n.repo == "org/name" &&
+            n.quant == "adapters/tools" && n.revision == "v2",
+        "org/name:FOLDER/FOLDER@revision, an adapter's");
+  check(flyx::hub::parse_adapter_name("https://hf.co/org/name", &n) && n.repo == "org/name" && n.quant.empty(),
+        "an adapter at a repository's top");
+  for (const char* bad : {"org/name:a/../b", "org/name:/a", "org/name:a//b", "org/name:a/", "org/name:", "org/name:.x",
+                          "/home/me/lora", "org/name:a b"})
+    check(!flyx::hub::parse_adapter_name(bad, &n), std::string("not an adapter's name: \"") + bad + "\"");
+  // A repository's adapters: each folder with an adapter_config.json, named by its whole path (two folders of one
+  // last name apart), its weights beside it or a pickle.
+  const std::vector<flyx::hub::RepoFile> files = {
+      {"adapter_config.json", 1}, {"adapter_model.safetensors", 2}, {"r6/fp8/adapter_config.json", 1},
+      {"r6/fp8/adapter_model.safetensors", 2}, {"r7/fp8/adapter_config.json", 1}, {"r7/fp8/adapter_model.bin", 2},
+      {"other_adapter_config.json", 1}, {"README.md", 1}};
+  const auto folders = flyx::hub::adapter_folders("org/name", files);
+  check(folders.size() == 3 && folders[0].name == "org/name" && folders[0].weights &&
+            folders[1].name == "org/name:r6/fp8" && folders[1].weights && folders[2].folder == "r7/fp8" &&
+            !folders[2].weights && folders[2].pickle,
+        "a repository's adapter folders");
+  {  // a file too large for read_text is refused by its listed size, before the cache or the Hub is asked
+    flyx::hub::Repo r;
+    r.id = "org/name", r.commit = std::string(40, 'a');
+    std::string text, err;
+    check(!flyx::hub::read_text(r, {"adapter_config.json", 3u << 30}, 64u << 10, &text, &err) &&
+              err.find("more than 65536") != std::string::npos && text.empty(),
+          "read_text refuses a 3 GB adapter_config.json: " + err);
+  }
   // Endpoint normalization, override, source reporting, and mirror URL parsing.
   std::string norm, ep_err;
   check(flyx::hub::normalize_endpoint("hf-mirror.com/", &norm, &ep_err) && norm == "https://hf-mirror.com",

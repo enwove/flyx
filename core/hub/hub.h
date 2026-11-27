@@ -74,6 +74,27 @@ struct Found {
 bool search(const std::string& query, const std::string& sort, int limit, std::vector<Found>* out, std::string* err,
             const std::string& cursor = "", std::string* next_cursor = nullptr, bool gguf_only = true);
 
+// A LoRA adapter as Hugging Face PEFT saves it, in a repository: a folder with an adapter_config.json ("" the top,
+// else its path, "a/b"), that file, and its adapter_model.safetensors (null: none beside it; `pickle`: an
+// adapter_model.bin there, which is not read).  `name`: what --lora fetches it by, org/name or org/name:FOLDER.
+struct AdapterFolder {
+  std::string folder, name;
+  const RepoFile* config = nullptr;
+  const RepoFile* weights = nullptr;
+  bool pickle = false;
+};
+// The adapters among `files` (a Repo's or a Cached snapshot's, which they point into), in the files' order.
+std::vector<AdapterFolder> adapter_folders(const std::string& repo, const std::vector<RepoFile>& files);
+// An adapter's name as parse_name reads a model's, but what follows ':' is a folder of the repository: a path,
+// "adapters/tools" (out->quant holds it; each part a name, no "." or "..").  false: not one.
+bool parse_adapter_name(const std::string& s, Name* out);
+
+// The adapters the Hub files as made for `base` (its model cards' base_model, with base_model_relation adapter:
+// filter=base_model:adapter:BASE), the most downloaded first, at most `limit`; `cursor` as search's.  false, with *err,
+// offline or when the Hub cannot be reached.
+bool adapters_of(const std::string& base, int limit, std::vector<Found>* out, std::string* err,
+                 const std::string& cursor = "", std::string* next_cursor = nullptr);
+
 // The GGUF files of a repository a model can be read from, each with the quantization its name carries ("UD-IQ3_XXS"
 // for Qwen3.8-27B-UD-IQ3_XXS.gguf).  Left out: projectors, importance matrices, files under MTP/; split models are
 // grouped into one choice whose `parts` hold all shards in order (1..N) and `total_size` sums their bytes.
@@ -148,6 +169,12 @@ using ProgressFn = std::function<void(const Progress&)>;
 // order).  `stop`, when set, ends a fetch early; what came stays for the next try.  progress: about four times a second.
 bool fetch(const Repo& r, const std::vector<RepoFile>& files, std::vector<std::string>* paths,
            const ProgressFn& progress, const std::atomic<bool>* stop, std::string* err);
+// A safetensors file's header (its JSON) at r.commit without the file: two ranged requests (its length, then the
+// header, at most 16 MiB); from the cache when the file is there.  false, with *err, when neither has it.
+bool safetensors_header(const Repo& r, const RepoFile& f, std::string* header, std::string* err);
+// A small file's text at r.commit, from the cache when it is there, else from the Hub into memory alone (the cache is
+// left as it was).  false, with *err, for a file of more than `max` bytes or one neither has.
+bool read_text(const Repo& r, const RepoFile& f, uint64_t max, std::string* text, std::string* err);
 // Where r.commit's files are (or will be): <cache>/models--org--name/snapshots/<commit>.
 std::string snapshot_dir(const Repo& r);
 

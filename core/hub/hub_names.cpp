@@ -496,4 +496,45 @@ bool is_drafter(const Repo& r) { return !drafter_kind(r).empty(); }
 
 std::string drafter_kind(const Repo& r) { return drafter_kind_of(r.architectures); }
 
+bool parse_adapter_name(const std::string& s, Name* out) {
+  // The folder between ':' and '@' (a path, which parse_name would refuse), the rest a name without one.
+  const size_t colon = s.find(':', s.find("://") == std::string::npos ? 0 : s.find("://") + 3);
+  if (colon == std::string::npos) return parse_name(s, out);
+  const size_t at = s.find('@', colon);
+  const std::string folder = s.substr(colon + 1, at == std::string::npos ? std::string::npos : at - colon - 1);
+  if (folder.empty() || folder.size() > 400 || !detail::safe_path(folder)) return false;
+  for (size_t start = 0; start <= folder.size();) {
+    const size_t end = std::min(folder.find('/', start), folder.size());
+    if (!detail::valid_word(folder.substr(start, end - start))) return false;
+    start = end + 1;
+  }
+  Name n;
+  if (!parse_name(s.substr(0, colon) + (at == std::string::npos ? "" : s.substr(at)), &n) || !n.quant.empty())
+    return false;
+  n.quant = folder;
+  *out = n;
+  return true;
+}
+
+std::vector<AdapterFolder> adapter_folders(const std::string& repo, const std::vector<RepoFile>& files) {
+  constexpr std::string_view kConfig = "adapter_config.json";
+  std::map<std::string, const RepoFile*> by_path;
+  for (const RepoFile& f : files) by_path[f.path] = &f;
+  std::vector<AdapterFolder> out;
+  for (const RepoFile& f : files) {
+    const std::string_view p = f.path;
+    if (p != kConfig && !(p.size() > kConfig.size() && p.ends_with(kConfig) && p[p.size() - kConfig.size() - 1] == '/'))
+      continue;
+    AdapterFolder a;
+    a.folder = p == kConfig ? "" : std::string(p.substr(0, p.size() - kConfig.size() - 1));
+    a.name = repo + (a.folder.empty() ? "" : ":" + a.folder);
+    a.config = &f;
+    const std::string in = a.folder.empty() ? "" : a.folder + "/";
+    if (const auto w = by_path.find(in + "adapter_model.safetensors"); w != by_path.end()) a.weights = w->second;
+    a.pickle = by_path.count(in + "adapter_model.bin") > 0;
+    out.push_back(std::move(a));
+  }
+  return out;
+}
+
 }  // namespace flyx::hub

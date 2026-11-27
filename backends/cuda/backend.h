@@ -82,6 +82,9 @@ inline void destroy_side(SideStream& s) {
 //   stacks=0              every run of one block type in a stack its own round launch (gemm_blocks_staged_runs)
 //   round_glu=0           a round's SwiGLU in a kernel of its own, not in the gate|up GEMM (block weights, 8 bits)
 //   side_stream=0         a round's narrow GEMMs of a stack after its wide ones, not beside them on a second stream
+//   lora_lanes=1|2|4|8    measurement: an adapter's second product with that many lanes an output (or the most below
+//                         it its rank divides into), not lora_lanes' choice; other bits
+//   lora_glu=0            gate's and up's adapter products in lora_up, not taken by the SwiGLU (one-lane ranks)
 //   attention=split|head  prefill attention in float32 / no KV-head grouping (and no FP8 K/V)
 //   gemm=rows             every GEMM on the CUDA-core row path
 //   pdl=0|1 programmatic dependent launch off / on (default: the GPU's table)
@@ -219,6 +222,7 @@ struct RowBufs {
         *part = nullptr, *attn_state = nullptr, *split_state = nullptr, *feats = nullptr, *cx = nullptr,
         *ckv = nullptr, *mcat = nullptr, *mx = nullptr, *mhn = nullptr;
   float* lora = nullptr;  // the target's adapters' first products (RowNeeds::lora a row; none without adapters)
+  float* lora_part = nullptr;  // their slices' sums (lora_down_rows; RowNeeds::lora_part a row, kLoraEarlyRows rows)
   // Inkling-2 pass-local scratch (null for models without RelAttnBlock / MoeBlock).
   float *res_bank = nullptr, *prelude_cur = nullptr, *prelude_blocks = nullptr;
   float *loop_bank = nullptr, *loop_bank_out = nullptr, *loop_msg = nullptr;
@@ -237,12 +241,16 @@ struct RowBufs {
   Scratch scratch{};  // the GEMM inputs the kernels stage
 };
 
+// RowBufs::lora_part: the slices' sums of lora_down_rows (an adapter's first product) for up to these rows, which it
+// may split over K (more rows: each block every slice, the same bits).
+constexpr int kLoraEarlyRows = 128;
 // Widths of the row buffers (floats per row), from the blocks (runtime/state.cpp).
 struct RowNeeds {
   int proj = 0, act = 0, gdn_o = 0, q = 0;  // projections, activations, GDN output, attention queries
   int attn_state = 0;                       // prefill windowed flash attention softmax state (floats per row)
   int split_state = 0;                      // prefill windowed split attention warp state (floats per row, <= 16 rows)
   int lora = 0;                             // the target's adapters' first products: q|k|v's (3 rank), gate|up's
+  int lora_part = 0;                        // their slices' sums a row, the most of any linear (lora_down_rows)
   int feats = 0, cx = 0, ckv = 0;           // DFlash2/DSpark context: tapped features, fc output, K/V projections
   bool mtp = false;                         // MTP context rows (2 x hidden, hidden, hidden)
   bool glu = false;                         // non-packed MLP weights (prefill gemm_glu_staged)
@@ -279,10 +287,13 @@ struct LoadTimes {
 // own 96 KiB, as do 100 memsets); a memset node kGraphSetBytes; any other kGraphOtherBytes, and the graphs it holds
 // (a conditional node's bodies: DV's canvas pass, regions/layers.cpp; a child graph) each a graph of its own, its nodes
 // priced the same way (a conditional node with a body of 1, 100 and 400 kernels: 192, 256 and 1440 KiB a graph, 96 and
-// 128 KiB more than a chain of 1 and 400); the graph itself kGraphBytes (96 KiB for a graph of one node).
+// 128 KiB more than a chain of 1 and 400); the graph itself kGraphBytes (96 KiB for a graph of one node); and its
+// branches past a node's first (a side stream's forks), the first kGraphForkBytes and each other kGraphForkMoreBytes
+// (chains of 200 and 400 kernels with 1, 10 and 50 forks to a second stream of one kernel each: 102, 113 to 164 and
+// 154 to 256 KiB a graph past its kernels; RTX 5090, driver 615).
 constexpr size_t kGraphParamBytes = 1024, kGraphParamCost = 3;
 constexpr size_t kGraphSetBytes = 1 << 10, kGraphOtherBytes = 16 << 10;
-constexpr size_t kGraphBytes = 128 << 10;
+constexpr size_t kGraphBytes = 128 << 10, kGraphForkBytes = 128 << 10, kGraphForkMoreBytes = 6 << 10;
 // A kernel node's and a device-to-device copy node's are the driver's for the GPU's architecture, three times apart
 // between the two measured (`cuda_bench graphs`, KiB a node in chains of 100, 400 and 1000 kernels; of 100 copies):
 //   sm_120  RTX 5060 Ti and RTX 5070 Ti, driver 610.88, Windows:  3.5, 3.3, 2.7;  5.8 a copy
@@ -302,6 +313,7 @@ constexpr GraphPrices graph_prices(int cc) {  // cc: the device's compute capabi
 // at most (graph_size).
 struct GraphSize {
   size_t kernels = 0, copies = 0, sets = 0, others = 0, params_most = 0, bytes = 0;
+  size_t forks = 0;           // branches past a node's first (a side stream's: regions' SideStream)
   size_t params_unknown = 0;  // kernels whose parameters the driver did not say (priced at kGraphParamBytes)
   size_t bodies = 0;          // graphs its nodes hold (a conditional node's bodies), each priced as a graph
   size_t bodies_unknown = 0;  // conditional nodes whose bodies the driver did not give (priced as the node alone)

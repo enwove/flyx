@@ -95,8 +95,9 @@ void note_graph(flyx_seq* s, const GraphSize& size) {
 void say_graph(const flyx_bmodel* m, const char* what, int rows, int key, const GraphSize& g) {
   if (!m->verbose) return;
   std::fprintf(stderr, "flyx-cuda: %s graph (%d rows, head %d): %zu kernels (parameters %zu bytes at most), %zu "
-                       "copies, %zu memsets, %zu other nodes (%zu graphs in them, %zu not given): %.0f KiB at most\n",
-               what, rows, key, g.kernels, g.params_most, g.copies, g.sets, g.others, g.bodies, g.bodies_unknown,
+                       "copies, %zu memsets, %zu other nodes (%zu graphs in them, %zu not given), %zu forks: %.0f KiB at "
+                       "most\n",
+               what, rows, key, g.kernels, g.params_most, g.copies, g.sets, g.others, g.bodies, g.bodies_unknown, g.forks,
                g.bytes / 1024.0);
 }
 

@@ -21,12 +21,21 @@ void embed_rows(const BatchPass& bp, const EmbedBlock& e) {
 }
 
 void gdn_rows(const BatchPass& bp, const GdnBlock& g, bool fused) {
+  const bool fused_mixer = fused;  // adapters beside the generic producers, the mixer gdn_round's (gdn_layer)
+  if (g.lora) fused = false;
   const RowView& v = bp.v;
   const GdnDims gd = g.gd;
   const int H = g.hidden, R = bp.rows, C = gd.C(), vd = g.v_width();
+  const int ldu = bp.seq[0].s->m->need.lora;
   cudaStream_t st = v.L.st;
-  norm_and_project(v, R, g.norm, g.w_in, g.n_in(), H, fused);
-  if (fused) {
+  if (g.lora) {  // the producer's float32 rows (beside a fused one's staged ones) for the adapters (gdn_layer)
+    norm_project_adapted(v, R, g.norm, g.w_in, g.n_in(), H, fused_mixer, g.lora, 4, ldu);
+    const int out[4] = {C, vd, gd.nv, gd.nv};
+    lora_in_end(v, g.lora, 4, out, v.b.h, H, H, R, ldu, v.L);
+  } else {
+    norm_and_project(v, R, g.norm, g.w_in, g.n_in(), H, fused);
+  }
+  if (fused_mixer) {
     const bool q8 = g.w_out.q8_inputs();
     bool all_fit = true;
     for (const Pass& ps : bp.seq) {
@@ -44,9 +53,12 @@ void gdn_rows(const BatchPass& bp, const GdnBlock& g, bool fused) {
         const float* proj = v.b.proj + size_t(bp.first[i]) * v.ld_proj;
         const int next = ps.p->width == 0 ? kSlotNext : -1;
         gdn_round(proj, v.ld_proj, g.conv_w, sb.win, sb.w_stride, sb.S, sb.s_stride, next, g.A_log, g.dt_bias,
-                  g.gated.w, g.gated.eps, sb.replay, s->P, ps.rows, nullptr, v.L, q8, R, bp.first[i]);
+                  g.gated.w, g.gated.eps, sb.replay, s->P, ps.rows, nullptr, v.L, q8, R, bp.first[i],
+                  g.lora ? v.b.act + size_t(bp.first[i]) * vd : nullptr);
       }
+      if (g.lora) lora_begin(v, g.lora.a_out, g.lora.rank, v.b.act, vd, vd, R, ldu, v.L);
       gemm_presplit(g.w_out, H, vd, v.b.x, H, R, true, v.L);
+      if (g.lora) lora_out_end(v, g.lora, 4, v.b.act, vd, vd, H, R, ldu, v.L);
       return;
     }
   }
@@ -67,6 +79,7 @@ void gdn_rows(const BatchPass& bp, const GdnBlock& g, bool fused) {
               nullptr, direct ? kSkipIfStopped : kSkipNever, st);
   }
   gdn_out_project(v, g, R, fused);
+  if (g.lora) lora_out(v, g.lora, 4, v.b.act, vd, vd, H, R, ldu, v.L);
 }
 
 void attn_rows(const BatchPass& bp, const AttnBlock& a, bool fused) {
@@ -74,10 +87,12 @@ void attn_rows(const BatchPass& bp, const AttnBlock& a, bool fused) {
   const int H = a.hidden, R = bp.rows, nh = a.nh, nkv = a.nkv, hd = a.hd, w = nh * hd;
   const int ldu = bp.seq[0].s->m->need.lora;
   cudaStream_t st = v.L.st;
-  norm_and_project(v, R, a.norm, a.w_in, a.n_in(), H, fused);
-  if (a.lora) {
-    const int out[3] = {w, nkv * hd, nkv * hd};
-    lora_in(v, a.lora, 3, out, fused ? nullptr : v.b.h, H, H, R, ldu, v.L);
+  if (a.lora) {  // the producer's float32 rows, which the adapters read (attn_layer)
+    norm_project_adapted(v, R, a.norm, a.w_in, a.n_in(), H, fused, a.lora, 3, ldu);
+    const int out[3] = {a.q_width(), nkv * hd, nkv * hd};  // q's covers the gate's rows (with one)
+    lora_in_end(v, a.lora, 3, out, v.b.h, H, H, R, ldu, v.L);
+  } else {
+    norm_and_project(v, R, a.norm, a.w_in, a.n_in(), H, fused);
   }
   for (size_t i = 0; i < bp.seq.size(); ++i) {  // rotary, the K/V append and attention: each sequence's own
     const Pass& ps = bp.seq[i];
@@ -102,8 +117,9 @@ void attn_rows(const BatchPass& bp, const AttnBlock& a, bool fused) {
                        kRoundSplits, v.L, ps.strata == kStrataBoth ? s->strata_from : 0);
     }
   }
+  if (a.lora) lora_begin(v, a.lora.a_out, a.lora.rank, v.b.act, w, w, R, ldu, v.L);
   gemm(v.b.act, w, a.w_out, H, w, v.b.x, H, R, true, v.L);
-  if (a.lora) lora_out(v, a.lora, FLYX_LIN_O, v.b.act, w, w, H, R, ldu, v.L);
+  if (a.lora) lora_out_end(v, a.lora, FLYX_LIN_O, v.b.act, w, w, H, R, ldu, v.L);
 }
 
 // The head over all the rows; each sequence's penalties and choice on its rows.  The certified head when every

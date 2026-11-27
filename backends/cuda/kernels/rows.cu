@@ -5,6 +5,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <stdexcept>
+#include <type_traits>
 #include "backends/cuda/kernels/common/device.cuh"
 #include "backends/cuda/kernels/common/launch.h"
 #include "backends/cuda/kernels/kernels.cuh"
@@ -99,19 +100,21 @@ __global__ void __launch_bounds__(512, 2) k_rmsnorm(const TIn* x, int ldx, const
 #pragma unroll
     for (int u = 0; u < kNormCache; ++u) {
       const int i = threadIdx.x + u * 512;
-      if (i < n) put_q8(o, blockIdx.x, i >> 5, rms_value(xv[u], inv, offset, wv[u]));
+      if (i < n) put_q8<false, true>(o, blockIdx.x, i >> 5, rms_value(xv[u], inv, offset, wv[u]));
     }
     for (int i = threadIdx.x + kNormCache * 512; i < n; i += 512)
-      put_q8(o, blockIdx.x, i >> 5, rms_value(in_value(xr + i), inv, offset, w[i]));
+      put_q8<false, true>(o, blockIdx.x, i >> 5, rms_value(in_value(xr + i), inv, offset, w[i]));
     return;
   }
 #pragma unroll
   for (int u = 0; u < kNormCache; ++u) {
     const int i = threadIdx.x + u * 512;
-    if (i < n) put(o, size_t(blockIdx.x) * ldy + i, size_t(blockIdx.x) * n + i, rms_value(xv[u], inv, offset, wv[u]));
+    if (i < n)
+      put<true>(o, size_t(blockIdx.x) * ldy + i, size_t(blockIdx.x) * n + i, rms_value(xv[u], inv, offset, wv[u]));
   }
   for (int i = threadIdx.x + kNormCache * 512; i < n; i += 512)
-    put(o, size_t(blockIdx.x) * ldy + i, size_t(blockIdx.x) * n + i, rms_value(in_value(xr + i), inv, offset, w[i]));
+    put<true>(o, size_t(blockIdx.x) * ldy + i, size_t(blockIdx.x) * n + i,
+              rms_value(in_value(xr + i), inv, offset, w[i]));
 }
 
 // The same rows in 8 bits (n % 32 == 0) for a round's few rows: grid (rows, ceil(n / 512)).  Every block finds the
@@ -136,10 +139,10 @@ __global__ void __launch_bounds__(512) k_rmsnorm_q8(const float* x, int ldx, con
   if (i < n) {
     const float v = rms_value<ALSO == Q8Also::Split>(xi, inv, offset, wi);
     if constexpr (ALSO == Q8Also::Float) o.y[size_t(blockIdx.x) * ldy + i] = v;
-    put_q8<ALSO == Q8Also::Float>(o, blockIdx.x, grp, v);
+    put_q8<ALSO == Q8Also::Float, true>(o, blockIdx.x, grp, v);
     if constexpr (ALSO == Q8Also::Split) {
       const size_t at = size_t(blockIdx.x) * n + i;
-      put(o, at, at, v);
+      put<true>(o, at, at, v);
     }
   }
 }
@@ -155,7 +158,7 @@ __global__ void __launch_bounds__(512) k_rmsnorm_spread(const float* x, int ldx,
   const float wi = i < n ? w[i] : 0.f;
   float xi = 0.f;
   const float inv = rms_inv_spread(xr, n, eps, int(blockIdx.y), i, &xi);
-  if (i < n) put(o, size_t(blockIdx.x) * ldy + i, size_t(blockIdx.x) * n + i, rms_value(xi, inv, offset, wi));
+  if (i < n) put<true>(o, size_t(blockIdx.x) * ldy + i, size_t(blockIdx.x) * n + i, rms_value(xi, inv, offset, wi));
 }
 
 __global__ void k_embed(const int* tokens, const bf16* E, int H, float* x) {
@@ -197,14 +200,56 @@ __global__ void k_build_rows(const DevParams* P, const int* drafts, int fill, in
     tokens[i] = i == 0 ? P->anchor : (fill >= 0 ? fill : drafts[i - 1]);
 }
 
-// grid (rows, pairs / 256): one pair of values per thread.
-__global__ void k_swiglu(const float* gu, int ld, int I, Out o, int ld_out) {
-  pdl_trigger();
-  const int row = blockIdx.x, i = 2 * (blockIdx.y * blockDim.x + threadIdx.x);
-  if (i >= I) return;
+// An adapter's second product for one output, b its row, u the row's (unscaled) u: lora_up's G lanes' sums, each
+// over k = 8 (l + G c) .. + 7 in order, then added as its shuffles add them, the same bits.
+template <int G>
+__device__ __forceinline__ float lora_dot(const float* u, const bf16* b, int rank, float scale) {
+  float p[G];
+  const int chunks = rank / (8 * G);
+#pragma unroll
+  for (int l = 0; l < G; ++l) {
+    p[l] = 0.f;
+    for (int c = 0; c < chunks; ++c) {
+      const int k8 = l + G * c;
+      const uint4 w = reinterpret_cast<const uint4*>(b)[k8];
+      const float4 ua = reinterpret_cast<const float4*>(u + 8 * k8)[0], ub = reinterpret_cast<const float4*>(u + 8 * k8)[1];
+      const uint32_t q[4] = {w.x, w.y, w.z, w.w};
+      const float uv[8] = {ua.x, ua.y, ua.z, ua.w, ub.x, ub.y, ub.z, ub.w};
+#pragma unroll
+      for (int e = 0; e < 4; ++e) {
+        p[l] = __fmaf_rn(__fmul_rn(uv[2 * e], scale), __uint_as_float(q[e] << 16), p[l]);
+        p[l] = __fmaf_rn(__fmul_rn(uv[2 * e + 1], scale), __uint_as_float(q[e] & 0xffff0000u), p[l]);
+      }
+    }
+  }
+#pragma unroll
+  for (int o = G / 2; o > 0; o >>= 1) {
+    float n[G];
+#pragma unroll
+    for (int l = 0; l < G; ++l) n[l] = p[l] + p[l ^ o];
+#pragma unroll
+    for (int l = 0; l < G; ++l) p[l] = n[l];
+  }
+  return p[0];
+}
+
+// One row's pair i, i + 1.  G > 0: the adapters' second products (LoraGlu) added to gate and up first, as lora_up adds
+// them to the rows (y + its sum).
+template <int G>
+__device__ __forceinline__ void swiglu_row(const float* gu, int ld, int I, const Out& o, int ld_out, const LoraGlu& lg,
+                                           int row, int i) {
   const float* r = gu + size_t(row) * ld;
+  auto adapt = [&](float& g, float& u, int at) {
+    if constexpr (G > 0) {
+      const float* ur = lg.u + size_t(row) * lg.ldu;
+      g = g + lora_dot<G>(ur, lg.gate + size_t(at) * lg.rank, lg.rank, lg.scale);
+      u = u + lora_dot<G>(ur + lg.rank, lg.up + size_t(at) * lg.rank, lg.rank, lg.scale);
+    }
+  };
   if (i + 1 >= I) {
-    put(o, size_t(row) * ld_out + i, size_t(row) * I + i, silu(r[i]) * r[I + i]);
+    float g = r[i], u = r[I + i];
+    adapt(g, u, i);
+    put<true>(o, size_t(row) * ld_out + i, size_t(row) * I + i, silu(g) * u);
     return;
   }
   float g0, g1, u0, u1;
@@ -215,10 +260,16 @@ __global__ void k_swiglu(const float* gu, int ld, int I, Out o, int ld_out) {
   } else {
     g0 = r[i], g1 = r[i + 1], u0 = r[I + i], u1 = r[I + i + 1];
   }
+  adapt(g0, u0, i);
+  adapt(g1, u1, i + 1);
   const float a = silu(g0) * u0;
   const float b = silu(g1) * u1;
+  if (o.also && !o.q8) {  // (put_q8_pairs writes its own)
+    o.also[size_t(row) * I + i] = a;
+    o.also[size_t(row) * I + i + 1] = b;
+  }
   if (o.q8) {  // 8-bit rows (I % 64 == 0): a warp holds 64 consecutive values, two groups
-    put_q8_pairs(o, row, i >> 6, a, b);
+    put_q8_pairs<true>(o, row, i >> 6, a, b);
   } else if (o.mid) {  // the three parts of the skinny GEMMs' input, as put() makes them
     uint32_t h, m, l;
     split3(a, b, &h, &m, &l);
@@ -235,6 +286,20 @@ __global__ void k_swiglu(const float* gu, int ld, int I, Out o, int ld_out) {
   }
 }
 
+// grid (ceil(rows / RT), pairs / 256): RT rows a block (an adapter's b rows read once for them, from L1 after), one
+// pair of values a thread a row.
+template <int G = 0, int RT = 1>
+__global__ void k_swiglu(const float* gu, int ld, int I, Out o, int ld_out, int rows, LoraGlu lg = {}) {
+  pdl_trigger();
+  const int i = 2 * (blockIdx.y * blockDim.x + threadIdx.x);
+  if (i >= I) return;
+  for (int t = 0; t < RT; ++t) {
+    const int row = int(blockIdx.x) * RT + t;
+    if (row >= rows) break;
+    swiglu_row<G>(gu, ld, I, o, ld_out, lg, row, i);
+  }
+}
+
 }  // namespace
 
 void rmsnorm(const float* x, int ldx, const float* w, float offset, float eps, float* y, int ldy, int rows, int n,
@@ -247,14 +312,14 @@ void rmsnorm(const float* x, int ldx, const float* w, float offset, float eps, f
 }
 
 void rmsnorm_split(const float* x, int ldx, const float* w, float offset, float eps, int rows, int n,
-                   const Launch& L, bool q8) {
+                   const Launch& L, bool q8, float* also) {
+  Out o = split_out(L, rows, n, q8);
+  o.also = also;
   if (q8 && rows <= 16)
-    k_rmsnorm_q8<Q8Also::None><<<dim3(rows, ceil_div(n, 512)), 512, 0, L.st>>>(x, ldx, w, offset, eps,
-                                                                               split_out(L, rows, n, true), n, n);
+    k_rmsnorm_q8<Q8Also::None><<<dim3(rows, ceil_div(n, 512)), 512, 0, L.st>>>(x, ldx, w, offset, eps, o, n, n);
   else if (rows <= 16)
-    k_rmsnorm_spread<<<dim3(rows, ceil_div(n, 512)), 512, 0, L.st>>>(x, ldx, w, offset, eps,
-                                                                      split_out(L, rows, n, false), n, n);
-  else k_rmsnorm<<<rows, 512, 0, L.st>>>(x, ldx, w, offset, eps, split_out(L, rows, n, q8), n, n);
+    k_rmsnorm_spread<<<dim3(rows, ceil_div(n, 512)), 512, 0, L.st>>>(x, ldx, w, offset, eps, o, n, n);
+  else k_rmsnorm<<<rows, 512, 0, L.st>>>(x, ldx, w, offset, eps, o, n, n);
 }
 
 void rmsnorm_q8_split(const float* x, int ldx, const float* w, float offset, float eps, int rows, int n,
@@ -299,11 +364,34 @@ void build_rows(const DevParams* P, const int* drafts, int fill, int* tokens, in
 }
 
 void swiglu(const float* gu, int ld, int I, float* out, int ld_out, int rows, cudaStream_t st) {
-  k_swiglu<<<dim3(rows, ceil_div(I, 512)), 256, 0, st>>>(gu, ld, I, Out{out, nullptr, nullptr}, ld_out);
+  k_swiglu<0><<<dim3(rows, ceil_div(I, 512)), 256, 0, st>>>(gu, ld, I, Out{out, nullptr, nullptr}, ld_out, rows);
 }
 
-void swiglu_split(const float* gu, int ld, int I, int rows, const Launch& L, bool q8) {
-  k_swiglu<<<dim3(rows, ceil_div(I, 512)), 256, 0, L.st>>>(gu, ld, I, split_out(L, rows, I, q8), I);
+void swiglu_split(const float* gu, int ld, int I, int rows, const Launch& L, bool q8, float* also,
+                  const LoraGlu& lora) {
+  Out o = split_out(L, rows, I, q8);
+  o.also = also;
+  if (!lora.rank) {
+    k_swiglu<0><<<dim3(rows, ceil_div(I, 512)), 256, 0, L.st>>>(gu, ld, I, o, I, rows);
+    return;
+  }
+  if (lora.rank % 8 || lora.ldu % 4 || reinterpret_cast<uintptr_t>(lora.u) % 16)
+    throw std::logic_error("swiglu_split: an adapter's rank no multiple of 8, or u rows not on 16 bytes");
+  // a round's rows a block each; a prefill pass's 16 a block (b's rows reused from L1)
+  constexpr int kTile = 16;
+  const bool tile = rows > 16;
+  const dim3 grid(tile ? ceil_div(rows, kTile) : rows, ceil_div(I, 512));
+  auto go = [&](auto g) {
+    constexpr int G = decltype(g)::value;
+    if (tile) k_swiglu<G, kTile><<<grid, 256, 0, L.st>>>(gu, ld, I, o, I, rows, lora);
+    else k_swiglu<G, 1><<<grid, 256, 0, L.st>>>(gu, ld, I, o, I, rows, lora);
+  };
+  switch (lora_lanes(lora.rank, opts(L).lora_lanes)) {
+    case 8: go(std::integral_constant<int, 8>{}); break;
+    case 4: go(std::integral_constant<int, 4>{}); break;
+    case 2: go(std::integral_constant<int, 2>{}); break;
+    default: go(std::integral_constant<int, 1>{});
+  }
 }
 
 namespace {

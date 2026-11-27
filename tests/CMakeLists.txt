@@ -173,6 +173,7 @@ flyx_add_unit_test(tokenizer_test core/tokenizer/tokenizer_test.cpp)
 flyx_add_unit_test(merge_test core/tokenizer/merge_test.cpp)
 flyx_add_unit_test(flyx_format_test core/modelfile/flyx_test.cpp)
 flyx_add_unit_test(drafter_dir_test core/modelfile/drafter_dir_test.cpp)
+flyx_add_unit_test(peft_dir_test core/modelfile/peft_dir_test.cpp)
 flyx_add_unit_test(hub_test core/hub/hub_test.cpp Threads::Threads)
 flyx_add_unit_test(chat_test core/render/chat_test.cpp)
 flyx_add_unit_test(tags_test models/formats/tags_test.cpp)
@@ -284,6 +285,13 @@ add_test(NAME gguf_qwen2_none COMMAND tokenizer_test ${ASSETS}/qwen2_none.gguf $
 # The tiny models from their GGUF files: the golden outputs, drafting, sampling, reuse.
 add_test(NAME gguf_cpu_ref COMMAND gguf_e2e_test ${ASSETS} cpu_ref)
 flyx_add_golden_test(golden_cpu_ref_qwen3_gguf ARGS cpu_ref qwen3 ${ASSETS}/tiny_qwen3_gguf.gguf FIXTURES gguf_assets)
+# The tiny Qwen3.5 of GGUF (each head's gate rows after its q rows, value heads tiled) with a PEFT LoRA adapter in
+# Hugging Face's layout beside it (--lora), against transformers with it merged.
+flyx_add_golden_test(golden_cpu_ref_qwen35_gguf_lora ARGS cpu_ref qwen35_lora ${ASSETS}/tiny_gguf.gguf
+                     ${ASSETS}/peft_qwen35 FIXTURES gguf_assets)
+# The same GGUF file with a PEFT LoRA adapter beside it (--lora), against transformers with it merged.
+flyx_add_golden_test(golden_cpu_ref_qwen3_gguf_lora ARGS cpu_ref qwen3_lora ${ASSETS}/tiny_qwen3_gguf.gguf
+                     ${ASSETS}/peft_qwen3 FIXTURES gguf_assets)
 set_tests_properties(gguf_reader ggml_blocks gguf_models dflash2_models gguf_qwen2_nfc gguf_qwen2_none gguf_cpu_ref
                      PROPERTIES FIXTURES_REQUIRED gguf_assets)
 
@@ -310,6 +318,9 @@ flyx_add_py_test(remembered_model ${CMAKE_CURRENT_SOURCE_DIR}/apps/flyx-server/r
                  ARGS $<TARGET_FILE:flyx-cli> ${ASSETS}/tiny.flyx FIXTURES assets)
 flyx_add_py_test(server_lan_access ${CMAKE_CURRENT_SOURCE_DIR}/apps/flyx-server/lan_access.py
                  ARGS $<TARGET_FILE:flyx-cli> ${ASSETS}/tiny.flyx FIXTURES assets)
+flyx_add_py_test(lora_load ${CMAKE_CURRENT_SOURCE_DIR}/apps/flyx-server/lora_load.py
+                 ARGS $<TARGET_FILE:flyx-cli> ${ASSETS}/tiny_qwen3_gguf.gguf ${ASSETS}/peft_qwen3 FIXTURES gguf_assets
+                 TIMEOUT 120)
 flyx_add_py_test(queued_request_ttft ${CMAKE_CURRENT_SOURCE_DIR}/apps/flyx-server/queued_request_ttft.py
                  ARGS $<TARGET_FILE:flyx-cli> ${ASSETS}/tiny.flyx FIXTURES assets TIMEOUT 90)
 flyx_add_py_test(streaming_tool_calls ${CMAKE_CURRENT_SOURCE_DIR}/apps/flyx-server/streaming_tool_calls.py
@@ -341,6 +352,7 @@ flyx_add_py_test(hub_concurrent ${CMAKE_CURRENT_SOURCE_DIR}/core/hub/check_concu
                  ARGS $<TARGET_FILE:hub_test> SKIP_RETURN_CODE 77 TIMEOUT 90)
 add_test(NAME drafter_dir COMMAND drafter_dir_test ${ASSETS})
 set_tests_properties(drafter_dir PROPERTIES FIXTURES_REQUIRED gguf_assets)
+add_test(NAME peft_dir COMMAND peft_dir_test)
 
 # Numbers on the command line: all of the text a number, inside what the option takes.
 add_test(NAME flag_numbers COMMAND numbers_test)
@@ -475,6 +487,12 @@ flyx_add_golden_test(golden_cpu_ref ARGS cpu_ref)
 flyx_add_golden_test(golden_cpu_ref_nvfp4 ARGS cpu_ref nvfp4)
 # A second architecture (Qwen3) through models/, against transformers: no backend knows it by name.
 flyx_add_golden_test(golden_cpu_ref_qwen3 ARGS cpu_ref qwen3)
+# The tiny Qwen3 with a LoRA adapter as Hugging Face PEFT saves one (--lora: on some linears of some layers, float32),
+# against transformers with it merged.
+flyx_add_golden_test(golden_cpu_ref_qwen3_lora ARGS cpu_ref qwen3_lora ${ASSETS}/tiny_qwen3.flyx ${ASSETS}/peft_qwen3)
+# The tiny Qwen3.5 (gated attention, gated delta nets, its drafters) with a PEFT LoRA adapter on attention, GDN and
+# MLP linears (--lora), against transformers with it merged; drafting must give the same tokens.
+flyx_add_golden_test(golden_cpu_ref_qwen35_lora ARGS cpu_ref qwen35_lora ${ASSETS}/tiny.flyx ${ASSETS}/peft_qwen35)
 # Llama's attention without q/k norms (MiniCPM5's layers), against transformers.
 flyx_add_golden_test(golden_cpu_ref_llama ARGS cpu_ref llama)
 # The tiny Llama with a V-LoRA of its own (the target's adapters, ABI 43) against transformers with it merged.
@@ -489,7 +507,9 @@ flyx_add_golden_test(golden_cpu_ref_dspine ARGS cpu_ref dspine)
 flyx_add_golden_test(golden_cpu_ref_dspine1 ARGS cpu_ref dspine1)  # a drafter of one layer
 flyx_add_golden_test(golden_cpu_ref_dspine_window ARGS cpu_ref dspine_window)
 # The tiny Qwen3 with a DSpine drafter (taps and context in a second architecture's programs): transformers' tokens.
-flyx_add_golden_test(golden_cpu_ref_qwen3_dspine ARGS cpu_ref qwen3 ${ASSETS}/tiny_qwen3_dspine.flyx dspine)
+flyx_add_golden_test(golden_cpu_ref_qwen3_dspine ARGS cpu_ref qwen3 ${ASSETS}/tiny_qwen3_dspine.flyx - dspine)
+flyx_add_golden_test(golden_cpu_ref_qwen3_dspine_lora ARGS cpu_ref qwen3_lora ${ASSETS}/tiny_qwen3_dspine.flyx
+                     ${ASSETS}/peft_qwen3 dspine)
 
 set_tests_properties(tokenizer tokenizer_minicpm5 chat chat_qwen35 reply_grammars request reply_text
                      scheduler_cpu_ref scheduler_queue scheduler_prewarmed_history scheduler_raw_clients
@@ -519,6 +539,8 @@ if(TARGET flyx-cuda)
   add_test(NAME gguf_cuda_pdl COMMAND gguf_e2e_test ${ASSETS} cuda pdl=1)
   add_test(NAME gguf_cuda_no_pdl COMMAND gguf_e2e_test ${ASSETS} cuda pdl=0)
   flyx_add_golden_test(golden_cuda_qwen3_gguf ARGS cuda qwen3 ${ASSETS}/tiny_qwen3_gguf.gguf FIXTURES gguf_assets)
+  flyx_add_golden_test(golden_cuda_qwen3_gguf_lora ARGS cuda qwen3_lora ${ASSETS}/tiny_qwen3_gguf.gguf
+                       ${ASSETS}/peft_qwen3 FIXTURES gguf_assets)
   # A tiny Qwen3 of GGML block weights (tiny_qwen3_gguf.gguf is float32, read as bf16), held to its own plain
   # decoding (golden_quant.json): tree rounds of more than 16 rows on packed weights, a round's GEMMs and its packed
   # head 16 rows at a time; Q8_0, and Q4_K for the K types' round kernels.
@@ -553,6 +575,18 @@ if(TARGET flyx-cuda)
   flyx_add_golden_test(golden_cuda_no_pdl ARGS cuda ENV FLYX_BACKEND_OPTIONS=pdl=0)
   flyx_add_golden_test(golden_cuda_qwen3 ARGS cuda qwen3 ENV FLYX_BACKEND_OPTIONS=embed=host)
   flyx_add_golden_test(golden_cuda_qwen3_unfused ARGS cuda qwen3 ENV FLYX_BACKEND_OPTIONS=fusion=0)
+  flyx_add_golden_test(golden_cuda_qwen3_lora ARGS cuda qwen3_lora ${ASSETS}/tiny_qwen3.flyx ${ASSETS}/peft_qwen3)
+  flyx_add_golden_test(golden_cuda_qwen35_lora ARGS cuda qwen35_lora ${ASSETS}/tiny.flyx ${ASSETS}/peft_qwen35)
+  flyx_add_golden_test(golden_cuda_qwen35_lora_unfused ARGS cuda qwen35_lora ${ASSETS}/tiny.flyx ${ASSETS}/peft_qwen35
+                       ENV FLYX_BACKEND_OPTIONS=fusion=0)
+  flyx_add_golden_test(golden_cuda_qwen35_gguf_lora ARGS cuda qwen35_lora ${ASSETS}/tiny_gguf.gguf
+                       ${ASSETS}/peft_qwen35 FIXTURES gguf_assets)
+  flyx_add_golden_test(golden_cuda_qwen3_lora_unfused ARGS cuda qwen3_lora ${ASSETS}/tiny_qwen3.flyx
+                       ${ASSETS}/peft_qwen3 ENV FLYX_BACKEND_OPTIONS=fusion=0)
+  # Its adapters' rank (6, padded to 8) one lane an output: the SwiGLU takes gate's and up's products by default, here
+  # lora_up (the same bits).
+  flyx_add_golden_test(golden_cuda_qwen3_lora_no_glu ARGS cuda qwen3_lora ${ASSETS}/tiny_qwen3.flyx
+                       ${ASSETS}/peft_qwen3 ENV FLYX_BACKEND_OPTIONS=lora_glu=0)
   # The tiny Qwen3's head is not its embedding: the table in host memory by default, here on the GPU.
   flyx_add_golden_test(golden_cuda_qwen3_embed_gpu ARGS cuda qwen3 ENV FLYX_BACKEND_OPTIONS=embed=gpu)
   # Llama without q/k norms: the generic regions too, and its 16 query heads on 2 KV heads on tensor cores for every
@@ -580,7 +614,9 @@ if(TARGET flyx-cuda)
   flyx_add_golden_test(golden_cuda_dspine_unfused ARGS cuda dspine ENV FLYX_BACKEND_OPTIONS=fusion=0)
   flyx_add_golden_test(golden_cuda_dspine_window ARGS cuda dspine_window)
   flyx_add_golden_test(golden_cuda_dspine1 ARGS cuda dspine1)  # one layer: its cache binary16 beside fp8 ones
-  flyx_add_golden_test(golden_cuda_qwen3_dspine ARGS cuda qwen3 ${ASSETS}/tiny_qwen3_dspine.flyx dspine)
+  flyx_add_golden_test(golden_cuda_qwen3_dspine ARGS cuda qwen3 ${ASSETS}/tiny_qwen3_dspine.flyx - dspine)
+  flyx_add_golden_test(golden_cuda_qwen3_dspine_lora ARGS cuda qwen3_lora ${ASSETS}/tiny_qwen3_dspine.flyx
+                       ${ASSETS}/peft_qwen3 dspine)
   # decode and verification attention on tensor cores for every row (by default only past rows_attention_from keys)
   flyx_add_golden_test(golden_cuda_rows_mma ARGS cuda nvfp4 ENV FLYX_BACKEND_OPTIONS=rows_attention_from=0)
   flyx_add_golden_test(golden_cuda_qwen3_rows_mma ARGS cuda qwen3 ENV FLYX_BACKEND_OPTIONS=rows_attention_from=0)

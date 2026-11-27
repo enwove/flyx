@@ -2,6 +2,7 @@
 #include "models/model.h"
 
 #include <algorithm>
+#include <cmath>
 #include <stdexcept>
 
 #include "core/interfaces/options.h"
@@ -213,6 +214,47 @@ std::string declared_activations(const ModelFile& file) {
   if (!h.is_object() || !h.contains("quant") || !h.at("quant").is_object()) return "";
   const auto& q = h.at("quant");
   return q.contains("activations") && q.at("activations").is_string() ? q.at("activations").get<std::string>() : "";
+}
+
+bool is_lora_companion(const ModelFile& file, int i) {
+  return file.header().at("companions").at(size_t(i)).value("kind", "") == "lora";
+}
+
+CompanionLora find_lora(const ModelFile& file, const std::set<std::string>& linears, int layers) {
+  CompanionLora l;
+  for (int i = 0; i < file.companions(); ++i) {
+    if (!is_lora_companion(file, i)) continue;
+    if (l) throw std::runtime_error("more than one LoRA adapter (--lora): one is run");
+    const nlohmann::json& d = file.header().at("companions").at(size_t(i)).at("lora");
+    l.companion = i;
+    l.rank = d.at("rank").get<int>();
+    l.scale = d.at("scale").get<float>();
+    l.layers = d.at("layers").get<int>();
+    if (d.value("layout", "") != "hf") throw std::runtime_error("lora: an adapter in a row order other than hf's");
+    if (l.rank < 1 || l.rank > kMaxHeadDim || !std::isfinite(l.scale) || l.scale == 0.f)
+      throw std::runtime_error("lora: rank " + std::to_string(l.rank) + ", scale " + std::to_string(l.scale) +
+                               " (a rank of 1 to " + std::to_string(kMaxHeadDim) + ", a finite scale other than 0)");
+    if (l.layers > layers)
+      throw std::runtime_error("lora: adapters on " + std::to_string(l.layers) + " layers, the model has " +
+                               std::to_string(layers));
+    for (const auto& n : d.at("linears")) {
+      const std::string s = n.get<std::string>();
+      if (!linears.count(s)) throw std::runtime_error("lora: an adapter on " + s + ", a linear this model does not have");
+    }
+  }
+  return l;
+}
+
+flyx_lora Tables::lora(const CompanionLora& l, const std::string& name, int64_t out, int64_t in) {
+  const std::string c = ModelFile::companion_name(l.companion, name);
+  if (!l || !has(c + ".lora_a")) return flyx_lora{-1, -1, 0, l.scale};
+  const flyx_lora a{weight(c + ".lora_a", {l.rank, in}), weight(c + ".lora_b", {out, l.rank}), l.rank, l.scale};
+  for (int w : {a.a, a.b}) {
+    const int dt = weights[size_t(w)].t->dtype;
+    if (dt != FLYX_DT_BF16 && dt != FLYX_DT_F16 && dt != FLYX_DT_F32)
+      throw std::runtime_error(std::string(weights[size_t(w)].t->name) + ": an adapter that is not bf16, f16 or f32");
+  }
+  return a;
 }
 
 int Tables::weight(const std::string& name, std::vector<int64_t> shape, const std::string& ggml_scale_name) {

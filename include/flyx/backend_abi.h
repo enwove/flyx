@@ -30,7 +30,7 @@
 extern "C" {
 #endif
 
-#define FLYX_BACKEND_ABI_VERSION 50u
+#define FLYX_BACKEND_ABI_VERSION 51u
 #define FLYX_BACKEND_ENTRY "flyx_backend_get_api"
 /* How a backend library exports its entry. */
 #if defined(_WIN32)
@@ -39,7 +39,7 @@ extern "C" {
 #define FLYX_BACKEND_EXPORT __attribute__((visibility("default")))
 #endif
 #define FLYX_MAX_ROWS 16       /* rows in one round: the anchor plus up to 15 drafts */
-#define FLYX_DSPINE_MAX_TOPK 16 /* the head's candidates DSpine's walk scores a row, at most (ABI 50) */
+#define FLYX_DSPINE_MAX_TOPK 16 /* the head's candidates DSpine's walk scores a row, at most (ABI 51) */
 /* Rows of a round whose drafts are given (a lookup round, ABI 36), where the backend lowers such plans: a copy of
  * the context verified up to 63 drafts at once.  A round result holds this many tokens. */
 #define FLYX_MAX_WIDE_ROWS 64
@@ -219,7 +219,8 @@ typedef struct {
 } flyx_vnorm;
 
 /* A low-rank adapter on a linear y = W x (ABI 42): y = W x + scale b (a x), a [rank, in], b [out, rank], both bf16
- * (ABI 43: the scale; DV's canvas adapters have none, scale 1).  rank 0: none, as a block built zeroed has. */
+ * (ABI 43: the scale; DV's canvas adapters have none, scale 1); a target's own may also be f16 or f32 (ABI 50: a PEFT
+ * adapter given beside the model), which the backends run as bf16.  rank 0: none, as a block built zeroed has. */
 typedef struct {
   int32_t a, b, rank;
   float scale;
@@ -231,6 +232,12 @@ typedef enum {
   FLYX_LIN_GATE = 4, FLYX_LIN_UP = 5, FLYX_LIN_DOWN = 6,
   FLYX_LINS = 7
 } flyx_linear;
+
+/* A gated delta net's linears, in the order its array of adapters lists them (ABI 50). */
+typedef enum {
+  FLYX_GDN_LIN_QKV = 0, FLYX_GDN_LIN_Z = 1, FLYX_GDN_LIN_B = 2, FLYX_GDN_LIN_A = 3, FLYX_GDN_LIN_OUT = 4,
+  FLYX_GDN_LINS = 5
+} flyx_gdn_linear;
 
 typedef enum {
   FLYX_STATE_KV = 1,     /* `layers` K/V caches of n_kv x head_dim per position */
@@ -305,8 +312,8 @@ typedef enum {
   FLYX_BLOCK_MOE = 16,         /* ABI 45: sparse MoE with SiTU/SwiGLU + optional shortconv & attn-res/loop */
   FLYX_BLOCK_DSPARK = 17,      /* ABI 45: DSpark parallel block drafter with Markov RNN head */
   FLYX_BLOCK_DSPARK_LAYER = 18, /* ABI 45: one layer of DSpark */
-  FLYX_BLOCK_DSPINE = 19,       /* ABI 50: DSpine, a block drafter whose rows pass a code bridge's message on */
-  FLYX_BLOCK_DSPINE_LAYER = 20  /* ABI 50: a DSpine layer: a Qwen3 layer, then its bridge's read and write */
+  FLYX_BLOCK_DSPINE = 19,       /* ABI 51: DSpine, a block drafter whose rows pass a code bridge's message on */
+  FLYX_BLOCK_DSPINE_LAYER = 20  /* ABI 51: a DSpine layer: a Qwen3 layer, then its bridge's read and write */
 } flyx_block_kind;
 
 /* Token rows -> residual rows: x = table[token], optionally followed by RMSNorm (has_norm != 0, ABI 45). */
@@ -334,12 +341,16 @@ typedef struct {
   int32_t q, k, v, o;
   int32_t kv;                          /* state: its K/V cache (layers 1) */
   /* ABI 43: the block's own adapters on q, k, v and o (flyx_linear order), in every pass that runs it (a V-LoRA,
-   * python/convert --lora), all four or none, one rank; none with an output gate. */
+   * python/convert --lora, or a PEFT adapter: --lora), one rank and scale on the linears that have one (ABI 50: rank 0
+   * on the others, none there).  With an output gate (ABI 50) q's covers the gate's rows too, its b's rows in lora_gate's
+   * layout, which may be another than the weight's (a PEFT adapter's are Hugging Face's, FLYX_GATE_PER_HEAD): the
+   * backend reads them as it reads the weight's. */
   flyx_lora lora[4];
   /* ABI 44: 3D Multimodal RoPE (Qwen3.5/3.8). mrope_section[0..2] = (T, H, W) frequency pair counts summing to
    * rot_dim / 2 (all 0 = standard 1D RoPE). mrope_interleaved: 1 = interleaved T,H,W; 0 = contiguous chunks. */
   int32_t mrope_section[3];
   int32_t mrope_interleaved;
+  int32_t lora_gate;                   /* ABI 50: flyx_gate_layout of lora[FLYX_LIN_Q]'s b rows (gate only) */
 } flyx_attn_block;
 
 /* Gated delta net, as ops/ops.h: from h = norm(x), mixed = qkv(h) through
@@ -356,6 +367,12 @@ typedef struct {
   int32_t state;                       /* its GDN state */
   int32_t head_order;                  /* flyx_gdn_head_order, the state's too */
   int32_t decay;                       /* flyx_gdn_decay */
+  /* ABI 50: the block's own adapters on qkv, z, b, a and out (flyx_gdn_linear order), as an attention block's (one
+   * rank and scale on those that have one), their per-value-head rows (qkv's value rows, z's, b's, a's) and out's a's
+   * columns in lora_head_order, which may be another than the weights' (a PEFT adapter's are Hugging Face's,
+   * FLYX_GDN_HEADS_GROUPED): the backend reads them as it reads the weights. */
+  flyx_lora lora[FLYX_GDN_LINS];
+  int32_t lora_head_order;             /* flyx_gdn_head_order */
 } flyx_gdn_block;
 
 /* x += down(silu(gate(h)) * up(h)), h = norm(x). */
@@ -363,7 +380,7 @@ typedef struct {
   int32_t hidden, inter;
   flyx_norm norm;
   int32_t gate, up, down;
-  flyx_lora lora[3];                   /* ABI 43: on gate, up and down, as an attention block's (all or none) */
+  flyx_lora lora[3];                   /* ABI 43: on gate, up and down, as an attention block's */
 } flyx_mlp_block;
 
 /* logits = w(norm(x)), optional softcapping (cap * tanh(logit / cap) when softcap > 0, ABI 45),
@@ -406,10 +423,8 @@ typedef enum {
  * ABI 49: convolutions optional (conv_taps 0: attn_conv_* and mlp_conv_* are
  * -1), the block's first drafting row draft_from (1: rows 1.., 0: the anchor's
  * too, predicting the token after it: up to `block` drafts), sel_hid optional
- * (-1: the selector's score with a unit gate).  ABI 50: float_weights, what
- * the model asks its projections in under draft_weights=auto beside a target
- * of float weights (a flyx_draft_weights: AUTO the backend's own, Q8 or
- * NVFP4). */
+ * (-1: the selector's score with a unit gate), and q8_weights (1: the model
+ * asks its projections in Q8_0 beside a target of float weights). */
 typedef struct {
   int32_t hidden, n_heads, n_kv, head_dim, inter;
   int32_t block, mask_token, n_taps, conv_taps, conv_group, sel_rank, sel_topk;
@@ -423,7 +438,7 @@ typedef struct {
   float softcap;                       /* ABI 46: selector logit softcap (0 = none) */
   int32_t softcap_mode;                /* ABI 46: flyx_dflash2_softcap_mode */
   int32_t draft_from;                  /* ABI 49: the block's first row that drafts: 1, or 0 (the anchor's) */
-  int32_t float_weights;               /* ABI 50: flyx_draft_weights beside a float target (AUTO, Q8, NVFP4) */
+  int32_t q8_weights;                  /* ABI 49: 1: its projections Q8_0 beside a target of float weights */
 } flyx_dflash2_block;
 
 /* A DFlash2 layer: attention (q, k, v, o; q/k norms; rotary on all dims) and
@@ -436,7 +451,7 @@ typedef struct {
   int32_t attn_conv_proj, attn_conv_base, mlp_conv_proj, mlp_conv_base;
 } flyx_dflash2_layer_block;
 
-/* DSpine block drafter (ABI 50; python/reference/flyx_ref/dspine.py): `block` rows (the anchor, then mask_token)
+/* DSpine block drafter (ABI 51; python/reference/flyx_ref/dspine.py): `block` rows (the anchor, then mask_token)
  * through its layers (DSPINE_LAYER blocks), each a Qwen3 layer whose attention sees the context K/V and the block's
  * rows up to its own (causal; with a window, only the positions less than `window` before its own), then the code
  * bridge's write.  With x_r row r's residual after the layer, rms_r = sqrt(mean(x_r^2)):
@@ -723,8 +738,8 @@ typedef struct {
     flyx_moe_block moe;                /* ABI 45 */
     flyx_dspark_block dspark;          /* ABI 45 */
     flyx_dspark_layer_block dspark_layer; /* ABI 45 */
-    flyx_dspine_block dspine;             /* ABI 50 */
-    flyx_dspine_layer_block dspine_layer; /* ABI 50 */
+    flyx_dspine_block dspine;             /* ABI 51 */
+    flyx_dspine_layer_block dspine_layer; /* ABI 51 */
   };
 } flyx_block;
 

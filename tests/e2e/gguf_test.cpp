@@ -54,6 +54,7 @@ struct Load {
   std::vector<std::string> drafter_files{};
   std::string options{};  // backend options, after the tested backend's own
   std::string activations{};  // EngineOptions::activations ("": as the file has it)
+  std::string lora_file{};  // EngineOptions::lora_file
   int kv = FLYX_KV_16;  // the golden tokens and drafts are binary16 K/V's
 };
 
@@ -72,6 +73,7 @@ std::unique_ptr<Engine> engine(const std::string& path, const std::string& backe
   options.drafter = how.speculative ? how.drafter : "none";
   options.drafter_files = how.drafter_files;
   options.activations = how.activations;
+  options.lora_file = how.lora_file;
   options.kv = how.kv;
   auto result = std::make_unique<Engine>();
   std::string error;
@@ -978,6 +980,29 @@ void split_shards(const std::string& dir, const std::string& backend) {
         "2-shard quantized split GGUF gives the single quantized GGUF's tokens");
 }
 
+// Packed block weights beside a PEFT LoRA adapter (--lora: peft_quant/, on some of the linears) against the float64
+// backend on the same file and adapter, as packed() holds them alone: the adapters' GEMMs read the float32 rows the
+// block GEMMs round to 8 bits (backends/cuda/regions/layers.cpp attn_layer).  The adapter changes the tokens.
+void packed_lora(const std::string& dir, const std::string& backend) {
+  std::vector<int32_t> prompt;
+  for (int i = 0; i < 80; ++i) prompt.push_back(i + 20);
+  const Load adapted{.lora_file = dir + "/peft_quant"};
+  for (const char* kind : {"Q8_0", "Q4_K", "Q6_K", "IQ4_XS"}) {
+    const std::string path = dir + "/quant_" + kind + ".gguf";
+    const auto want = tokens_of(*engine(path, "cpu_ref", adapted), prompt, 32);
+    check(want != tokens_of(*engine(path, "cpu_ref"), prompt, 32),
+          std::string(kind) + " with a LoRA adapter: the float64 backend's tokens are not the plain model's");
+    for (int chunk : {16, 64}) {
+      Load how = adapted;
+      how.prefill_chunk = chunk;
+      const int agree = forced_agreement(*engine(path, backend, how), prompt, want);
+      check(agree >= 30, std::string(kind) + " with a LoRA adapter: teacher forced, the float64 backend's tokens at " +
+                             std::to_string(agree) + " of 32 places, prefill in passes of up to " +
+                             std::to_string(chunk) + " rows");
+    }
+  }
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -993,6 +1018,7 @@ int main(int argc, char** argv) {
     dflash_file(dir, backend);
     dspine_file(dir, backend);
     if (backend != "cpu_ref") packed(dir, backend);
+    if (backend != "cpu_ref") packed_lora(dir, backend);
     if (backend != "cpu_ref") nvfp4_inputs(dir, backend);
   } catch (const std::exception& e) {
     std::fprintf(stderr, "%s\n", e.what());

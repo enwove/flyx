@@ -76,13 +76,24 @@ void flush_pending_post_conv(const Pass& ps, bool require_in_x = true);
 void dspark_draft(flyx_seq* s, const DSparkBlock& b, int width, const Launch& L, bool fused = false, int start = 0,
                   int total_width = -1);
 void dspark_context(const Pass& ps, const DSparkBlock& b, bool fused = false);
-// A block's own adapters (ABI 43) on the linears that read one input (x null: a fused producer's staged rows; else
-// ldx apart), added to rv.b.proj's columns in turn (out[i] each), and on its last linear, added to rv.b.x; ldu:
-// RowNeeds::lora.
-void lora_in(const RowView& rv, const Adapters& l, int linears, const int* out, const float* x, int ldx, int K, int R,
-             int ldu, const Launch& L);
+// A block's own adapters (ABI 43) on its last linear (x its float32 input rows, ldx apart), added to rv.b.x; ldu:
+// RowNeeds::lora.  lora_begin then lora_in_end does the same for the linears that read one input,
+// added to rv.b.proj's columns in turn (out[i] each).
 void lora_out(const RowView& rv, const Adapters& l, int linear, const float* x, int ldx, int K, int H, int R, int ldu,
               const Launch& L);
+// A block's norm and in-projection with its adapters' first product beside it (lora_begin), the norm's float32 rows
+// (rv.b.h, beside a fused producer's staged ones) theirs.
+void norm_project_adapted(const RowView& rv, int R, const Norm& n, const Lin& w, int N, int H, bool fused,
+                          const Adapters& l, int linears, int ldu);
+// The same in two steps around the linear's own GEMM: lora_begin before it (a round's u = a x, its float32 rows on the
+// launch's side stream beside the GEMM), then lora_in_end / lora_out_end after it (a prefill pass's u; the join, then
+// y += b u); x, ldx and K the same to both.
+void lora_begin(const RowView& rv, const bf16* a, int n, const float* x, int ldx, int K, int R, int ldu,
+                const Launch& L);
+void lora_in_end(const RowView& rv, const Adapters& l, int linears, const int* out, const float* x, int ldx, int K,
+                 int R, int ldu, const Launch& L);
+void lora_out_end(const RowView& rv, const Adapters& l, int linear, const float* x, int ldx, int K, int H, int R,
+                  int ldu, const Launch& L);
 void mlp_layer(const Pass& ps, const MlpBlock& f, bool fused = false);
 void head(const Pass& ps, const HeadBlock& h, bool last_only);  // logits and the token choice
 void draft_context(const Pass& ps, const DFlashBlock& b, bool fused = false);  // DFlash2 context K/V from the target taps

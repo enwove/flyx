@@ -486,6 +486,7 @@ int run(int argc, char** argv) {
   EngineOptions start_from = eo;
   start_from.drafter_files.clear();  // the command line's model's own: a model named on the page names its drafters
   start_from.mmproj_file.clear();    // likewise: a model named on the page names its own vision projector
+  start_from.lora_file.clear();     // and the command line's LoRA adapter is its model's, not another's
   Server srv{&models, cfg, start_from, os::unix_seconds(), {}};
   RequestLog requests(args.request_log);
   srv.requests = &requests;
@@ -498,6 +499,7 @@ int run(int argc, char** argv) {
   if (!model.empty()) {
     EngineOptions init_eo = start_from;
     init_eo.mmproj_file = eo.vision ? eo.mmproj_file : "";
+    init_eo.lora_file = eo.lora_file;  // the command line's adapter is this model's
     std::string init_dh = flyx::interfaces::backend_opt_get(init_eo.backend_options, "draft_head");
     if (init_dh != "full") init_dh.clear();
     std::string init_dw;

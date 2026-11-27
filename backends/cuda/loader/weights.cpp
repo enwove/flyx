@@ -137,7 +137,7 @@ uint16_t float_to_bf16(float f) {
 // * The MTP layer (projections and fc) runs only for drafts and their context.
 // * A block drafter (DFlash2's block, DSpine's) defaults to target-matched
 //   precision when VRAM allows (NVFP4 beside NVFP4, Q8_0 beside GGUF, beside a
-//   float target as the model asks: its float_weights) and drops to NVFP4 when
+//   float target as the model asks) and drops to NVFP4 when
 //   VRAM is tight.
 // Option draft_weights=auto|nvfp4|q8|exact selects the policy.
 void rows_to_bf16(const float* x, int ldx, int rows, int K, bf16* out, cudaStream_t st);

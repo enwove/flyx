@@ -56,6 +56,9 @@ struct EngineOptions {
   // layer (unsloth ships Qwen3.8-27B's so: MTP/mtp-*.gguf), a block drafter's file (python/convert --draft
   // alone).  Empty: none.
   std::vector<std::string> drafter_files;
+  // A LoRA adapter beside the model file, as Hugging Face PEFT saves it (a directory of adapter_config.json and
+  // adapter_model.safetensors: core/modelfile/peft_dir.cpp), run unmerged on every pass.  Empty: none.
+  std::string lora_file;
   // Optional multimodal vision projector companion GGUF (mmproj-*.gguf). Empty: none.
   std::string mmproj_file;
   // Disable loading any vision encoder even if mmproj weights are present (--no-vision).

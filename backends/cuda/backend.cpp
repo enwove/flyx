@@ -256,6 +256,8 @@ const std::vector<OptionSpec>& option_specs() {
          return std::string("moe_dp4a=") + moe_dp4a_name(o.kernels.moe_dp4a);
        }},
       kernel_flag_opt("side_stream", &KernelOptions::side_stream),
+      kernel_int_choice_opt("lora_lanes", &KernelOptions::lora_lanes, {"0", "1", "2", "4", "8"}),
+      kernel_flag_opt("lora_glu", &KernelOptions::lora_glu),
       {"attention",
        [](const std::string& key, const std::string& val, BackendOptions* o, std::string* err) {
          if (!check_choice(key, val, {"auto", "split", "head"}, err)) return false;

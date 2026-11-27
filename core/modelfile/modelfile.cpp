@@ -44,7 +44,9 @@ bool ModelFile::open(const std::string& path, std::string* err) {
 
 bool ModelFile::add(const std::string& path, std::string* err) {
   auto more = std::make_unique<Companion>();
-  if (modelfile::is_drafter_dir(path)) {
+  if (modelfile::is_peft_dir(path)) {  // before is_drafter_dir: some adapter directories carry a config.json too
+    if (!modelfile::read_peft_dir(path, &more->maps, &more->c, err)) return false;
+  } else if (modelfile::is_drafter_dir(path)) {
     if (!modelfile::read_drafter_dir(path, &more->maps, &more->c, err)) return false;
   } else {
     if (!read(&more->maps, path, &more->c, err, /*need_tokenizer=*/false)) return false;

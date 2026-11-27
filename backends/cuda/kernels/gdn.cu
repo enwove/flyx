@@ -678,9 +678,9 @@ __global__ void k_gdn_gated_norm(const float* o, const TZ* z, int ld_z, const fl
       __syncthreads();
       const float inv = rsqrtf(((sw[b][0] + sw[b][2]) + (sw[b][1] + sw[b][3])) / dv + eps);
       if (y.q8) {  // 8-bit rows (dv % 32 == 0): a warp holds 32 consecutive values of the row, one group
-        put_q8(y, r, (h * dv + j) >> 5, v * inv * wj * sz);
+        put_q8<false, true>(y, r, (h * dv + j) >> 5, v * inv * wj * sz);
       } else if (j < dv) {
-        put(y, at, at, v * inv * wj * sz);
+        put<true>(y, at, at, v * inv * wj * sz);
       }
       v = v_nxt;
       zv = z_nxt;
@@ -695,9 +695,9 @@ __global__ void k_gdn_gated_norm(const float* o, const TZ* z, int ld_z, const fl
     const float sz = j < dv ? silu(in_value(z + size_t(r) * ld_z + size_t(h) * dv + j)) : 0.f;
     const float inv = rsqrtf(block_sum(__fmul_rn(v, v)) / dv + eps);
     if (y.q8) {
-      put_q8(y, r, (h * dv + j) >> 5, v * inv * wj * sz);
+      put_q8<false, true>(y, r, (h * dv + j) >> 5, v * inv * wj * sz);
     } else if (j < dv) {
-      put(y, at, at, v * inv * wj * sz);
+      put<true>(y, at, at, v * inv * wj * sz);
     }
   }
 }
@@ -849,12 +849,12 @@ __global__ void __launch_bounds__(128) k_gdn_round(const float* proj, int ld, co
     const float inv = rsqrtf(warp_sum(t) / d.dv + eps);
     if (y.q8) {  // 8-bit rows (dv % 32 == 0, so jn == 32): the warp's 32 values, one group
       const float z = r == warp ? gate_z : proj[size_t(r) * ld + C + h * d.dv + j0 + lane];
-      put_q8(y, r, (h * d.dv + j0) >> 5, so[r][lane] * inv * gate_w * silu(z));
+      put_q8<false, true>(y, r, (h * d.dv + j0) >> 5, so[r][lane] * inv * gate_w * silu(z));
     } else if (lane < jn) {
       const int j = j0 + lane;
       const size_t at = size_t(r) * vd + size_t(h) * d.dv + j;
       const float z = r == warp ? gate_z : proj[size_t(r) * ld + C + h * d.dv + j];
-      put(y, at, at, so[r][lane] * inv * gate_w * silu(z));
+      put<true>(y, at, at, so[r][lane] * inv * gate_w * silu(z));
     }
   }
   cluster.sync();  // the other blocks have read spart
@@ -931,11 +931,12 @@ bool gdn_round_fits(const GdnDims& d, int rows, const float* S, size_t s_stride,
 bool gdn_round(const float* proj, int ld, const float* conv_w, float* win, size_t win_stride, float* S,
                size_t s_stride, int next_sel, const float* A_log, const float* dt_bias, const float* gw, float eps,
                GdnBufs bufs, const DevParams* P, int rows, float* y, const Launch& L, bool q8,
-               int total_rows, int row_offset) {
+               int total_rows, int row_offset, float* also) {
   if (!gdn_round_fits(bufs.d, rows, S, s_stride, L, q8)) return false;
   const cudaStream_t st = L.st;
-  const Out out = y ? Out{y, nullptr, nullptr}
-                    : split_out_slice(L, total_rows > 0 ? total_rows : rows, row_offset, bufs.d.nv * bufs.d.dv, q8);
+  Out out = y ? Out{y, nullptr, nullptr}
+              : split_out_slice(L, total_rows > 0 ? total_rows : rows, row_offset, bufs.d.nv * bufs.d.dv, q8);
+  if (!y) out.also = also;
   auto launch = [&](auto dk) {
     constexpr int DK = decltype(dk)::value;
     if (rows <= kGdnRoundFew)

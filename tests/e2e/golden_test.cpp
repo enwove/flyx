@@ -558,6 +558,9 @@ std::vector<flyx_round_result> tree_rounds(Engine* e, const std::vector<int32_t>
 
 constexpr int kReferenceWidth = -2;
 
+// A PEFT adapter given beside the model (the sixth argument, --lora): every engine of the run loads it.
+std::string g_lora_file;
+
 std::unique_ptr<Engine> make(const std::string& path, const std::string& backend, bool spec,
                              const std::string& drafter = g_block, bool kv_fp8 = false,
                              const std::string& backend_options = "", bool lookup = false, int max_ctx = 512,
@@ -579,6 +582,7 @@ std::unique_ptr<Engine> make(const std::string& path, const std::string& backend
   o.kv = kv_fp8 ? FLYX_KV_FP8 : FLYX_KV_16;
   o.max_ctx = max_ctx;
   o.backend = backend;
+  o.lora_file = g_lora_file;
   o.speculative = spec;
   o.drafter = drafter;
   o.prefill_chunk = prefill_chunk;  // several chunks per prompt
@@ -3185,7 +3189,9 @@ int plain_only(const json& g, const std::string& model, const std::string& backe
     EngineOptions o;
     o.backend = backend;
     o.max_ctx = 512;
-    o.drafter = mine;
+    // The file's drafters by name: one ("dv"), or all of them where it has several ("mtp+dflash2": the tiny Qwen3.5's).
+    o.drafter = mine.find('+') == std::string::npos ? mine : "all";
+    o.lora_file = g_lora_file;
     std::string why;
     Engine named;
     const bool loaded = named.load(model, o, &why);
@@ -3302,7 +3308,12 @@ int plain_only(const json& g, const std::string& model, const std::string& backe
         batch_rounds(plain.get(), {prompt, other, twice}, {round, round, round},
                      "rounds of three sequences, plain decoding");
     }
-    if (k == 1 && backend == "cuda") {  // a second architecture's tree rounds (attention only)
+    // A gated delta net's tree recurrence stages 16 rows: a file with one (the tiny Qwen3.5 beside a LoRA adapter)
+    // lowers no tree past them, which golden.json's checks hold.
+    bool attention_only = true;
+    const flyx_model_desc& desc = plain->model().desc();
+    for (int i = 0; i < desc.n_blocks; ++i) attention_only = attention_only && desc.blocks[i].kind != FLYX_BLOCK_GDN;
+    if (k == 1 && backend == "cuda" && attention_only) {  // a second architecture's tree rounds (attention only)
       SamplingParams greedy, sampled, penalized;
       sampled.temperature = 0.8f;
       sampled.seed = 7;
@@ -3757,7 +3768,8 @@ int device_memory(const std::string& model, const std::string& backend, const st
 int main(int argc, char** argv) {
   const auto args = os::utf8_arguments(argc, argv);
   if (args.size() < 3) {
-    std::fprintf(stderr, "usage: golden_test ASSET_DIR BACKEND [VARIANT [MODEL [REQUIRED_DRAFTER]]]  (FLYX_TEST_DEVICE_MEMORY=1: "
+    std::fprintf(stderr, "usage: golden_test ASSET_DIR BACKEND [VARIANT [MODEL [LORA_DIR|- [REQUIRED_DRAFTER]]]]  "
+                         "(FLYX_TEST_DEVICE_MEMORY=1: "
                          "the device memory checks alone)\n");
     return 2;
   }
@@ -3781,6 +3793,7 @@ int main(int argc, char** argv) {
   }
   const std::string model = args.size() > 4 ? args[4] : dir + "/tiny" + variant + ".flyx";
   g_block = flyx::drafter_source_kind(model);
+  if (args.size() > 5 && args[5] != "-") g_lora_file = args[5];
   if (const char* which = std::getenv("FLYX_TEST_DEVICE_MEMORY")) {
     const auto prompt = g["cases"][0]["prompt"].get<std::vector<int32_t>>();
     const std::string mode = which;
@@ -3796,7 +3809,7 @@ int main(int argc, char** argv) {
     std::printf("%s (%d failures)\n", g_fail ? "FAILED" : "PASSED", g_fail);
     return g_fail ? 1 : 0;
   }
-  if (g.value("plain_only", false)) return plain_only(g, model, backend, args.size() > 5 ? args[5] : "");
+  if (g.value("plain_only", false)) return plain_only(g, model, backend, args.size() > 6 ? args[6] : "");
   auto spec = make(model, backend, true);
   auto plain = make(model, backend, false);
   prefill_only_checks(plain.get(), g["cases"][0]["prompt"].get<std::vector<int32_t>>());

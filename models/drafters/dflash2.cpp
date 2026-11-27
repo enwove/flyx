@@ -326,7 +326,7 @@ int build_dflash2(Tables& T, const DFlash2Spec& spec, const TargetSpec& target) 
   d.sel_pred = T.weight(dn("draft.sel.pred"), {spec.sel_vocab, d.sel_rank});
   d.sel_succ = T.weight(dn("draft.sel.succ"), {spec.sel_vocab, d.sel_rank});
   d.sel_hid = spec.sel_gate ? T.weight(dn("draft.sel.hid"), {d.sel_rank, H}) : -1;  // -1: a unit gate
-  d.float_weights = draft_weights_beside_float(spec.kind);
+  d.q8_weights = draft_weights_beside_float(spec.kind) == FLYX_DRAFT_WEIGHTS_Q8;
   d.kv = draft_kv_state(T, layers, d.n_kv, d.head_dim);
   flyx_block b{};
   b.kind = FLYX_BLOCK_DFLASH2;

@@ -2,9 +2,8 @@
 // The dashboard's model panel: what the server serves, loading another, and the Hub's files.
 //
 //   GET /v1/load          the load's state (ModelHost::status; also telemetry's "load")
-//   POST /v1/load         {"model": PATH or HUB NAME, "drafters": [...], "ctx": N,
-//                         "drafter": "mtp|dflash2|dspark|dspine|dv|all|none", "speculative": BOOL, "kv": "fp8|16",
-//                         "name": ID}
+//   POST /v1/load         {"model": PATH or HUB NAME, "drafters": [...], "lora": DIR or HUB NAME, "ctx": N,
+//                         "drafter": "mtp|dflash2|dspark|dspine|dv|all|none", "speculative": BOOL, "kv": "fp8|16", "name": ID}
 //                         -> 202 and the state; 409 while one loads
 //   DELETE /v1/load       stops a fetch under way (what came stays for the next try)
 //   GET /v1/hub/config    current Hugging Face Hub endpoint, default endpoint, source ("setting", "HF_ENDPOINT",
@@ -27,9 +26,17 @@
 //                         can be shown, 409 while one is open
 //   GET /v1/hub/cached    the models on this machine, as names the panel can load: every snapshot of the Hugging Face
 //                         cache's repositories, and the model files in --models-dir / FLYX_MODELS_DIR; a model's
-//                         verified drafters (known_drafters), a drafter's kind (drafter_kind)
+//                         verified drafters (known_drafters), a drafter's kind (drafter_kind); LoRA adapters
+//                         (kind "lora") among them, named as "lora" takes them
 //   DELETE /v1/hub/cached?name=NAME   deletes a model the cache holds (never a file of those directories), unless it
 //                         is being served or a load is under way: 409
+//   GET /v1/hub/loras?base=ORG/NAME | model=NAME&cursor=C   the LoRA adapters the Hub files as made for a base model
+//                         (its model cards' base_model): for base, or for the model card's base of model (a Hub name
+//                         or a file of the cache; the base the page loads with), the most downloaded first
+//   GET /v1/hub/lora?repo=ORG/NAME[@REV]   a repository's adapters (each folder with an adapter_config.json), their
+//                         rank, scale and linears, and whether --lora takes each (null "why": yes): its config (at
+//                         most 64 KiB) and its safetensors header (two ranged requests) checked as a load checks them,
+//                         read into memory (the cache is left as it was)
 //   POST /v1/unload       the model served goes; the settings file still names it
 //   POST /v1/agents/launch  {"agent": "claude|codex", "dir": PATH} opens a window of PowerShell on the server's
 //                         machine, in folder dir (without it, one the person picks in the desktop's folder dialog),
@@ -43,6 +50,7 @@
 #include <algorithm>
 #include <atomic>
 #include <filesystem>
+#include <future>
 #include <map>
 #include <mutex>
 #include <set>
@@ -54,6 +62,7 @@
 #include "apps/flyx-server/server.h"
 #include "core/interfaces/model.h"
 #include "core/modelfile/modelfile.h"
+#include "core/modelfile/readers.h"
 #include "core/os/env.h"
 #include "core/os/os.h"
 #include "core/os/path.h"
@@ -77,6 +86,11 @@ namespace fs = std::filesystem;
 
 using os::from_path;
 using os::to_path;
+
+bool on_disk(const std::string& path) {
+  std::error_code ec;
+  return fs::exists(to_path(path), ec);
+}
 
 void error(httplib::Response& res, int status, const std::string& message, const char* type) {
   send_json(res, status, {{"error", {{"message", message}, {"type", type}}}});
@@ -145,6 +159,18 @@ std::vector<Listed> listing(const Server& s) {
                                  false));
       return l;
     };
+    // LoRA adapters (PEFT) with their weights here, by the name that fetches them (org/name, org/name:FOLDER).
+    for (const hub::AdapterFolder& a : hub::adapter_folders(c.repo, c.files)) {
+      if (!a.weights || !seen.insert({c.repo, a.config->path}).second) continue;
+      const std::string last = a.folder.substr(a.folder.rfind('/') == std::string::npos ? 0 : a.folder.rfind('/') + 1);
+      std::error_code ec;
+      const auto modified = fs::last_write_time(to_path(disk_of(a.weights->path)), ec);
+      Listed l = entry(a.name, "lora", "", last.empty() ? c.repo.substr(c.repo.find('/') + 1) : last,
+                       from_path((to_path(c.dir) / to_path(a.folder)).make_preferred()), a.weights->size, modified, -1,
+                       "");
+      for (const hub::RepoFile* g : {a.config, a.weights}) l.files.push_back(g->path), l.on_disk.push_back(disk_of(g->path));
+      out.push_back(std::move(l));
+    }
     const auto ggufs = apps::hub_ggufs(r);
     for (const auto& item : ggufs) {
       if (!item.cached || item.cls.kind.empty()) continue;
@@ -267,6 +293,35 @@ bool in_use(const std::string& file, const std::vector<std::string>& used) {
       if (fs::is_directory(p, e2) && !rel.empty() && *rel.begin() != "..") return true;
   }
   return false;
+}
+
+// The repository a model name or a file of the Hub's cache is from ("" for another file).
+std::string repo_of(const std::string& model) {
+  hub::Name n;
+  if (!on_disk(model) && hub::parse_name(model, &n)) return n.repo;
+  for (const fs::path& part : os::to_path(model)) {  // <cache>/models--org--name/snapshots/<commit>/...
+    const std::string p = os::from_path(part);
+    if (p.rfind("models--", 0) != 0) continue;
+    std::string repo = p.substr(8);
+    const size_t dash = repo.find("--");
+    if (dash == std::string::npos) return "";
+    return repo.replace(dash, 2, "/");
+  }
+  return "";
+}
+
+// What adapters for `model` are made for: its repository's model card's first base_model (a GGUF repository's: the
+// model it quantizes), or the repository itself when it names none.  *from: "model card" or "model".
+std::string base_of(const std::string& model, std::string* from) {
+  const std::string repo = repo_of(model);
+  if (repo.empty()) return "";
+  hub::Repo r;
+  std::string err;
+  if (hub::describe(repo, "main", &r, &err) && !r.base_models.empty()) {
+    hub::Name b;
+    if (hub::parse_name(r.base_models.front(), &b)) return *from = "model card", b.repo;
+  }
+  return *from = "model", repo;
 }
 
 ojson repo_json(const hub::Repo& r) {
@@ -415,6 +470,86 @@ void add_manage_routes(httplib::Server& http, Server* s) {
     std::string err;
     if (!hub::describe(name.repo, name.revision, &repo, &err)) return error(r, 404, err, "not_found");
     send_json(r, 200, repo_json(repo));
+  });
+  http.Get("/v1/hub/loras", [s](const httplib::Request& q, httplib::Response& r) {
+    if (!require_manage(*s, q, r, "loading models")) return;
+    std::string base = q.get_param_value("base"), from = "asked";
+    if (base.empty() && q.has_param("model")) base = base_of(q.get_param_value("model"), &from);
+    if (base.empty()) return send_json(r, 200, {{"base", nullptr}, {"from", nullptr}, {"models", ojson::array()},
+                                                {"next_cursor", nullptr}, {"endpoint", hub::endpoint()}});
+    hub::Name b;
+    if (!hub::parse_name(base, &b)) return error(r, 400, "base: a Hugging Face repository, org/name", "invalid_request_error");
+    std::vector<hub::Found> found;
+    std::string next, err;
+    if (!hub::adapters_of(b.repo, query_int(q, "limit", 30, 1, 100), &found, &err, q.get_param_value("cursor"), &next))
+      return error(r, 502, err, "hub_error");
+    std::set<std::string> here;  // repositories with an adapter's weights in the cache
+    for (const hub::Cached& c : hub::cached())
+      for (const hub::RepoFile& f : c.files)
+        if (f.path.size() >= 25 && f.path.compare(f.path.size() - 25, 25, "adapter_model.safetensors") == 0) here.insert(c.repo);
+    ojson models = ojson::array();
+    for (const hub::Found& f : found)
+      models.push_back({{"id", f.id}, {"downloads", f.downloads}, {"likes", f.likes}, {"updated", or_null(f.updated)},
+                        {"gated", f.gated}, {"cached", here.count(f.id) > 0}});
+    send_json(r, 200, {{"base", b.repo}, {"from", from}, {"models", models}, {"next_cursor", or_null(next)},
+                       {"endpoint", hub::endpoint()}});
+  });
+  http.Get("/v1/hub/lora", [s](const httplib::Request& q, httplib::Response& r) {
+    if (!require_manage(*s, q, r, "loading models")) return;
+    hub::Name name;
+    if (!q.has_param("repo") || !hub::parse_name(q.get_param_value("repo"), &name) || !name.quant.empty())
+      return error(r, 400, "repo: a Hugging Face repository, org/name[@REV]", "invalid_request_error");
+    hub::Repo repo;
+    std::string err;
+    if (!hub::describe(name.repo, name.revision, &repo, &err)) return error(r, 404, err, "not_found");
+    // Each adapter (at most 32), read where it is: its config (at most 64 KiB; a few hundred bytes as PEFT writes it)
+    // and its weights' header, into memory alone, kReadsAtOnce adapters at a time (a request's threads and the Hub's
+    // connections bounded).  The Hub's files are anyone's: every string of them is checked before it is shown
+    // (modelfile::peft_config_ok, peft_header_ok).
+    constexpr size_t kReadsAtOnce = 4;
+    std::vector<hub::AdapterFolder> found = hub::adapter_folders(repo.id, repo.files);
+    if (found.size() > 32) found.resize(32);
+    struct Read {
+      modelfile::PeftConfig config;
+      std::string why;
+      std::vector<std::string> linears;
+      int layers = 0;
+    };
+    auto read = [&repo](const hub::AdapterFolder& a) {
+      Read out;
+      std::string text, header;
+      if (!hub::read_text(repo, *a.config, 64u << 10, &text, &out.why) ||
+          !modelfile::peft_config_ok(text, &out.config, &out.why))
+        return out;
+      if (!a.weights) {
+        out.why = a.pickle ? "adapter_model.bin (a pickle) is not read; only safetensors"
+                           : "no adapter_model.safetensors beside its adapter_config.json";
+        return out;
+      }
+      // its tensors as --lora reads them (names, dtypes, rank), from the file's header alone
+      if (hub::safetensors_header(repo, *a.weights, &header, &out.why))
+        modelfile::peft_header_ok(header, out.config.rank, &out.why, &out.linears, &out.layers);
+      return out;
+    };
+    std::vector<Read> got(found.size());
+    for (size_t first = 0; first < found.size(); first += kReadsAtOnce) {
+      std::vector<std::future<Read>> reads;
+      for (size_t i = first; i < std::min(found.size(), first + kReadsAtOnce); ++i)
+        reads.push_back(std::async(std::launch::async, read, std::cref(found[i])));
+      for (size_t i = 0; i < reads.size(); ++i) got[first + i] = reads[i].get();
+    }
+    ojson adapters = ojson::array();
+    for (size_t i = 0; i < found.size(); ++i) {
+      const hub::AdapterFolder& a = found[i];
+      const modelfile::PeftConfig& c = got[i].config;
+      const bool ok = c.rank > 0;
+      adapters.push_back({{"folder", a.folder}, {"name", a.name + (name.revision == "main" ? "" : "@" + name.revision)},
+                          {"rank", ok ? ojson(c.rank) : ojson()}, {"scale", ok ? ojson(c.scale) : ojson()},
+                          {"base", or_null(c.base)}, {"targets", c.targets}, {"linears", got[i].linears},
+                          {"layers", got[i].layers}, {"size", a.weights ? ojson(a.weights->size) : ojson()},
+                          {"why", or_null(got[i].why)}});
+    }
+    send_json(r, 200, {{"repo", repo.id}, {"revision", repo.revision}, {"adapters", adapters}});
   });
   http.Get("/v1/hub/drafter", [s](const httplib::Request& q, httplib::Response& r) {
     if (!require_manage(*s, q, r, "loading models")) return;

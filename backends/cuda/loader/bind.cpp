@@ -5,11 +5,11 @@
 // stacked (q|k|v, gate|up, the GDN in-projection, every DFlash2 layer's
 // context k|v, DV's adapters on one input), norms as float.  Knows block
 // kinds, not models.
+#include "backends/cuda/loader/loader.h"
+
 #include <algorithm>
 #include <cstring>
 #include <optional>
-
-#include "backends/cuda/loader/loader.h"
 
 namespace flyx::cuda {
 namespace {
@@ -84,25 +84,112 @@ int state_of(const std::vector<int>& map, int i, const char* kind) {
   return map[size_t(i)];
 }
 
-// A DV layer's adapters as uploaded, in order: the a's that read one input stacked (q|k|v, gate|up), then each b.
-std::vector<std::vector<int>> dv_adapters(const flyx_dv_layer_block& b) {
-  const flyx_lora* a = b.lora;
-  return {{a[FLYX_LIN_Q].a, a[FLYX_LIN_K].a, a[FLYX_LIN_V].a},
-          {a[FLYX_LIN_O].a},
-          {a[FLYX_LIN_GATE].a, a[FLYX_LIN_UP].a},
-          {a[FLYX_LIN_DOWN].a},
-          {a[FLYX_LIN_Q].b}, {a[FLYX_LIN_K].b}, {a[FLYX_LIN_V].b}, {a[FLYX_LIN_O].b},
-          {a[FLYX_LIN_GATE].b}, {a[FLYX_LIN_UP].b}, {a[FLYX_LIN_DOWN].b}};
+// One part of an adapter piece: weight w uploaded as bf16, or (w < 0) n zeros, for a linear of an adapted block that
+// has no adapter of its own: the block's stacked GEMMs then run it as an adapter whose products are 0.  rows: the
+// stored row each uploaded row is (an adapter whose rows are in another layout than its linear's weight); cols: the
+// same of its columns (out's a beside a GDN whose value heads the adapter orders otherwise).
+struct AdapterPart {
+  int w = -1;
+  size_t n = 0;  // elements
+  WeightLoader::RowOrder rows{}, cols{};
+  size_t width = 0;  // a b's columns as uploaded, past its stored rank's (zeros): 0, as stored
+};
+using AdapterPiece = std::vector<AdapterPart>;
+
+AdapterPiece weights_piece(const WeightLoader& L, const std::vector<int>& ws) {
+  AdapterPiece p;
+  for (int w : ws) p.push_back({w, WeightLoader::numel(L.t(w)), {}, {}});
+  return p;
 }
 
+// A DV layer's adapters as uploaded, in order: the a's that read one input stacked (q|k|v, gate|up), then each b.
+std::vector<AdapterPiece> dv_adapters(const WeightLoader& L, const flyx_dv_layer_block& b) {
+  const flyx_lora* a = b.lora;
+  std::vector<AdapterPiece> pieces;
+  for (const std::vector<int>& ws : std::vector<std::vector<int>>{
+           {a[FLYX_LIN_Q].a, a[FLYX_LIN_K].a, a[FLYX_LIN_V].a},
+           {a[FLYX_LIN_O].a},
+           {a[FLYX_LIN_GATE].a, a[FLYX_LIN_UP].a},
+           {a[FLYX_LIN_DOWN].a},
+           {a[FLYX_LIN_Q].b}, {a[FLYX_LIN_K].b}, {a[FLYX_LIN_V].b}, {a[FLYX_LIN_O].b},
+           {a[FLYX_LIN_GATE].b}, {a[FLYX_LIN_UP].b}, {a[FLYX_LIN_DOWN].b}})
+    pieces.push_back(weights_piece(L, ws));
+  return pieces;
+}
+
+// A block's adapted rank: its linears' with an adapter, one rank and scale (0: none on any), the scale to *scale.
+int block_rank(const flyx_lora* l, int n, float* scale_out = nullptr) {
+  int rank = 0;
+  float scale = 0.f;
+  for (int i = 0; i < n; ++i) {
+    expect(l[i].rank >= 0, "an adapter of a negative rank");
+    if (l[i].rank == 0) continue;  // none on this linear (a block built zeroed has none on any)
+    if (!rank) rank = l[i].rank, scale = l[i].scale;
+    expect(l[i].rank == rank && l[i].scale == scale, "a block's adapters of ranks or scales apart");
+  }
+  if (scale_out && rank) *scale_out = scale;
+  return rank;
+}
+
+// The inputs and outputs of an attention block's q, k, v, o and of an MLP block's gate, up, down.
+void attn_dims(const flyx_attn_block& b, int in[4], int out[4]) {
+  const int q = b.n_heads * b.head_dim, kv = b.n_kv * b.head_dim, qg = b.gate != FLYX_GATE_NONE ? 2 * q : q;
+  const int i[4] = {b.hidden, b.hidden, b.hidden, q}, o[4] = {qg, kv, kv, b.hidden};
+  std::copy(i, i + 4, in);
+  std::copy(o, o + 4, out);
+}
+// A gated delta net's qkv, z, b, a and out.
+void gdn_dims(const flyx_gdn_block& b, int in[5], int out[5]) {
+  const int v = b.nv * b.dv, C = 2 * b.nk * b.dk + v;
+  const int i[5] = {b.hidden, b.hidden, b.hidden, b.hidden, v}, o[5] = {C, v, b.nv, b.nv, b.hidden};
+  std::copy(i, i + 5, in);
+  std::copy(o, o + 5, out);
+}
+void mlp_dims(const flyx_mlp_block& b, int in[3], int out[3]) {
+  const int i[3] = {b.hidden, b.hidden, b.inter}, o[3] = {b.inter, b.inter, b.hidden};
+  std::copy(i, i + 3, in);
+  std::copy(o, o + 3, out);
+}
+
+// Where an adapter's rows are not its linear's weight's (backend_abi.h lora_gate, lora_head_order): per linear, the
+// stored row of each of its b's uploaded rows (empty: the same), and of each of the last linear's a's columns.
+struct AdapterOrder {
+  std::vector<WeightLoader::RowOrder> b_rows;
+  WeightLoader::RowOrder out_cols;
+};
+
+// An adapter's rank as uploaded: its stored rank's up to a multiple of 8 (the second GEMM's K: gemm() takes those),
+// the a's rows past it and the b's columns zeros, so that B(Ax) is the same (r 1, 3 and 4 are on the Hub).
+int padded_rank(int rank) { return (rank + 7) / 8 * 8; }
+
 // A target block's own adapters as uploaded (ABI 43; n linears, the last one's input its own): the a's of the n - 1
-// linears that read the block's input stacked, the last one's a, then each b.  None: nothing.
-std::vector<std::vector<int>> block_adapters(const flyx_lora* l, int n) {
-  if (l[0].rank <= 0) return {};
-  std::vector<std::vector<int>> pieces(2);
-  for (int i = 0; i + 1 < n; ++i) pieces[0].push_back(l[i].a);
-  pieces[1].push_back(l[n - 1].a);
-  for (int i = 0; i < n; ++i) pieces.push_back({l[i].b});
+// linears that read the block's input stacked, the last one's a, then each b, of the padded rank; a linear without an
+// adapter in an adapted block as zeros of its shape (in[i] inputs, out[i] outputs).  None on any linear: nothing.
+std::vector<AdapterPiece> block_adapters(const WeightLoader& L, const flyx_lora* l, int n, const int* in,
+                                         const int* out, const AdapterOrder& order = {}) {
+  const int stored = block_rank(l, n);
+  if (!stored) return {};
+  const size_t rank = size_t(padded_rank(stored)), more = rank - size_t(stored);
+  auto part = [&](int i, bool a) {
+    AdapterPiece p;
+    const int w = a ? l[i].a : l[i].b;
+    if (w < 0) return AdapterPiece{AdapterPart{-1, rank * size_t(a ? in[i] : out[i])}};
+    if (a) {
+      p.push_back(AdapterPart{w, WeightLoader::numel(L.t(w))});
+      if (i == n - 1) p[0].cols = order.out_cols;
+      if (more) p.push_back(AdapterPart{-1, more * size_t(in[i])});
+      return p;
+    }
+    p.push_back(AdapterPart{w, rank * size_t(out[i])});
+    if (size_t(i) < order.b_rows.size()) p[0].rows = order.b_rows[size_t(i)];
+    if (more) p[0].width = rank;
+    return p;
+  };
+  std::vector<AdapterPiece> pieces(2);
+  for (int i = 0; i + 1 < n; ++i)
+    for (const AdapterPart& q : part(i, true)) pieces[0].push_back(q);
+  pieces[1] = part(n - 1, true);
+  for (int i = 0; i < n; ++i) pieces.push_back(part(i, false));
   return pieces;
 }
 
@@ -113,19 +200,40 @@ std::vector<std::vector<int>> block_adapters(const flyx_lora* l, int n) {
 struct AdapterCarve {
   bf16* next = nullptr;
   size_t left = 0;  // elements
-  static size_t piece(const WeightLoader& L, const std::vector<int>& ws) {
+  static size_t piece(const AdapterPiece& parts) {
     size_t n = 0;
-    for (int w : ws) n += WeightLoader::numel(L.t(w));
+    for (const AdapterPart& p : parts) n += p.n;
     return (n + 127) / 128 * 128;
   }
-  bf16* take(WeightLoader& L, const std::vector<int>& ws) {
-    const size_t n = piece(L, ws);
+  bf16* take(WeightLoader& L, const AdapterPiece& parts) {
+    const size_t n = piece(parts);
     expect(n <= left, "adapters: more than their allocation holds");
     bf16* p = next;
     size_t off = 0;
-    for (int w : ws) {
-      L.put_bf16(p + off, w);
-      off += WeightLoader::numel(L.t(w));
+    for (const AdapterPart& part : parts) {
+      if (part.width) {  // a b [out, rank] widened with zero columns on the host (its rows gathered, if ordered)
+        const std::vector<float> f = L.host_f32(part.w);
+        const size_t R = size_t(L.t(part.w)->shape[1]), O = f.size() / R;
+        std::vector<uint16_t> h(O * part.width, 0);
+        for (size_t o = 0; o < O; ++o) {
+          const size_t from = part.rows ? part.rows(o) : o;
+          for (size_t c = 0; c < R; ++c) h[o * part.width + c] = float_to_bf16(f[from * R + c]);
+        }
+        L.upload_staged(p + off, h.data(), h.size() * sizeof(uint16_t));
+      } else if (part.cols) {  // a small [rank, K] matrix: its columns gathered on the host
+        const std::vector<float> f = L.host_f32(part.w);
+        const size_t K = size_t(L.t(part.w)->shape[1]), R = f.size() / K;
+        std::vector<uint16_t> h(f.size());
+        for (size_t r = 0; r < R; ++r)
+          for (size_t c = 0; c < K; ++c) h[r * K + c] = float_to_bf16(f[r * K + part.cols(c)]);
+        L.upload_staged(p + off, h.data(), h.size() * sizeof(uint16_t));
+      } else if (part.w >= 0) {
+        L.put_bf16(p + off, part.w, part.rows);
+      } else {
+        const std::vector<bf16> zeros(part.n);  // bf16's 0 is all zero bits
+        L.upload_staged(p + off, zeros.data(), part.n * sizeof(bf16));
+      }
+      off += part.n;
     }
     next += n;
     left -= n;
@@ -133,26 +241,27 @@ struct AdapterCarve {
   }
 };
 
-// A target block's own adapters (ABI 43): on all of its n linears or none, one rank and scale, bf16, each of its
-// linear's shape (in[i] inputs, out[i] outputs); carved from `carve`.
-Adapters block_lora(WeightLoader& L, const flyx_lora* l, int n, const int* in, const int* out, AdapterCarve& carve) {
+// A target block's own adapters (ABI 43): one rank and scale on the linears that have one, zeros on the others; each
+// of its linear's shape (in[i] inputs, out[i] outputs), stored bf16, f16 or f32 (uploaded as bf16); carved from
+// `carve`.
+Adapters block_lora(WeightLoader& L, const flyx_lora* l, int n, const int* in, const int* out, AdapterCarve& carve,
+                    const AdapterOrder& order = {}) {
   Adapters a;
-  if (l[0].rank <= 0) {
-    for (int i = 1; i < n; ++i) expect(l[i].rank <= 0, "adapters on some of a block's linears (all or none)");
-    return a;
-  }
-  a.rank = l[0].rank;
-  a.scale = l[0].scale;
+  const int stored = block_rank(l, n, &a.scale);
+  if (!stored) return a;
+  a.rank = padded_rank(stored);
   expect(std::isfinite(a.scale), "an adapter's scale is not finite");
-  expect(a.rank % 8 == 0, "an adapter's rank that is not a multiple of 8 (its second GEMM's K: gemm() takes those)");
   for (int i = 0; i < n; ++i) {
-    expect(l[i].rank == a.rank && l[i].scale == a.scale, "a block's adapters of ranks or scales apart");
+    if (l[i].rank <= 0) continue;
     const flyx_tensor_view *ta = L.t(l[i].a), *tb = L.t(l[i].b);
-    expect(ta->dtype == FLYX_DT_BF16 && tb->dtype == FLYX_DT_BF16 && ta->ndim == 2 && tb->ndim == 2 &&
-               ta->shape[0] == a.rank && ta->shape[1] == in[i] && tb->shape[0] == out[i] && tb->shape[1] == a.rank,
-           std::string(ta->name) + ": an adapter that is not bf16 [rank, in] and [out, rank] of its linear");
+    auto floats = [](const flyx_tensor_view* t) {
+      return t->dtype == FLYX_DT_BF16 || t->dtype == FLYX_DT_F16 || t->dtype == FLYX_DT_F32;
+    };
+    expect(floats(ta) && floats(tb) && ta->ndim == 2 && tb->ndim == 2 && ta->shape[0] == stored &&
+               ta->shape[1] == in[i] && tb->shape[0] == out[i] && tb->shape[1] == stored,
+           std::string(ta->name) + ": an adapter that is not bf16, f16 or f32 [rank, in] and [out, rank] of its linear");
   }
-  const auto pieces = block_adapters(l, n);
+  const auto pieces = block_adapters(L, l, n, in, out, order);
   a.a_in = carve.take(L, pieces[0]);
   a.a_out = carve.take(L, pieces[1]);
   for (int i = 0; i < n; ++i) a.b[i] = carve.take(L, pieces[size_t(2 + i)]);
@@ -176,12 +285,16 @@ AttnBlock attention(WeightLoader& L, const flyx_attn_block& b, const StateMap& s
   a.gate = b.gate != FLYX_GATE_NONE;
   a.norm = norm(L, b.norm);
   // The kernels read every head's q, then every head's gate: a file that keeps
-  // a head's gate rows after its q rows is uploaded in that order.
-  WeightLoader::RowOrder q_rows;
-  if (b.gate == FLYX_GATE_PER_HEAD)
-    q_rows = [q = size_t(b.n_heads) * b.head_dim, hd = size_t(b.head_dim)](size_t r) {
-      return (r % q / hd * 2 + r / q) * hd + r % hd;
-    };
+  // a head's gate rows after its q rows is uploaded in that order (and so is an adapter's q, in its own layout).
+  auto gate_rows = [&](int layout) {
+    WeightLoader::RowOrder rows;
+    if (layout == FLYX_GATE_PER_HEAD)
+      rows = [q = size_t(b.n_heads) * b.head_dim, hd = size_t(b.head_dim)](size_t r) {
+        return (r % q / hd * 2 + r / q) * hd + r % hd;
+      };
+    return rows;
+  };
+  const WeightLoader::RowOrder q_rows = gate_rows(b.gate);
   int rows = 0;
   a.w_in = L.lin_stack_quant({b.q, b.k, b.v}, dq, &rows, {q_rows});
   expect(rows == a.n_in(), "attention q|k|v rows do not match its dimensions");
@@ -189,17 +302,38 @@ AttnBlock attention(WeightLoader& L, const flyx_attn_block& b, const StateMap& s
   a.q_norm = head_norm(L, b.q_norm);
   a.k_norm = head_norm(L, b.k_norm);
   a.kv = state_of(sm.kv, b.kv, "K/V");
-  const int q = b.n_heads * b.head_dim, kv = b.n_kv * b.head_dim;
-  const int in[4] = {b.hidden, b.hidden, b.hidden, q}, out[4] = {q, kv, kv, b.hidden};
-  a.lora = block_lora(L, b.lora, 4, in, out, carve);
+  int in[4], out[4];
+  attn_dims(b, in, out);
+  expect(!a.gate || b.lora[FLYX_LIN_Q].rank <= 0 || b.lora_gate == FLYX_GATE_AFTER_Q ||
+             b.lora_gate == FLYX_GATE_PER_HEAD,
+         "an adapter on a gated attention's q whose gate rows' layout the block does not say");
+  AdapterOrder order;
+  if (a.gate) order.b_rows = {gate_rows(b.lora_gate)};
+  a.lora = block_lora(L, b.lora, 4, in, out, carve, order);
   // An adapter's GEMM reads its input as the linear's bf16 or NVFP4 GEMM does (three bf16 parts, or prefill's bf16
-  // rows); the block kernels stage theirs in 8 bits or binary16 pairs.  Its q adapter covers q's rows, not a gate's.
-  expect(!a.lora || (!a.gate && !a.w_in.packed() && !a.w_out.packed()),
-         "adapters on attention with an output gate or on GGML block weights");
+  // rows); beside GGML block weights, whose kernels stage theirs in 8 bits or binary16 pairs, the generic producers'
+  // float32 rows (regions/layers.cpp attn_layer).  Its q adapter covers the gate's rows too, uploaded as the weight's.
   return a;
 }
 
-GdnBlock gdn(WeightLoader& L, const flyx_gdn_block& b, const StateMap& sm) {
+// A GDN adapter's rows (and out's a's columns) where its value heads are in another order than the weights'
+// (lora_head_order, head_order): per value head of the weights' order, the adapter's.
+AdapterOrder gdn_adapter_order(const flyx_gdn_block& b) {
+  AdapterOrder o;
+  if (b.lora_head_order == b.head_order) return o;
+  const size_t nk = size_t(b.nk), rep = size_t(b.nv / b.nk), dv = size_t(b.dv), keys = 2 * nk * size_t(b.dk);
+  const bool tiled = b.head_order == FLYX_GDN_HEADS_TILED;
+  auto head = [=](size_t v) {  // the weights' value head v -> the adapter's: key head k's i-th value head
+    const size_t k = tiled ? v % nk : v / rep, i = tiled ? v / nk : v % rep;
+    return tiled ? k * rep + i : i * nk + k;
+  };
+  auto rows = [=](size_t r) { return head(r / dv) * dv + r % dv; };  // a value head's dv rows
+  o.b_rows = {[=](size_t r) { return r < keys ? r : keys + rows(r - keys); }, rows, head, head};
+  o.out_cols = rows;
+  return o;
+}
+
+GdnBlock gdn(WeightLoader& L, const flyx_gdn_block& b, const StateMap& sm, AdapterCarve& carve) {
   GdnBlock g;
   g.hidden = b.hidden;
   g.gd = {b.nk, b.nv, b.dk, b.dv, b.conv, b.head_order == FLYX_GDN_HEADS_TILED};
@@ -224,6 +358,11 @@ GdnBlock gdn(WeightLoader& L, const flyx_gdn_block& b, const StateMap& sm) {
   g.state = state_of(sm.gdn, b.state, "GDN");
   const GdnDims& sd = L.model()->states.gdn[size_t(g.state)];
   expect(sd.C() == g.gd.C() && sd.dk == g.gd.dk && sd.tiled == g.gd.tiled, "GDN block and its state differ in shape");
+  expect(b.lora_head_order == FLYX_GDN_HEADS_GROUPED || b.lora_head_order == FLYX_GDN_HEADS_TILED,
+         "GDN adapters in an unknown head order");
+  int in[5], out[5];
+  gdn_dims(b, in, out);
+  g.lora = block_lora(L, b.lora, 5, in, out, carve, gdn_adapter_order(b));
   return g;
 }
 
@@ -236,9 +375,9 @@ MlpBlock mlp(WeightLoader& L, const flyx_mlp_block& b, AdapterCarve& carve, Draf
   f.w_gu = L.lin_stack_quant({b.gate, b.up}, dq, &rows);
   expect(rows == 2 * f.inter, "MLP gate|up rows do not match its dimensions");
   f.w_down = L.lin_quant(b.down, dq);
-  const int in[3] = {b.hidden, b.hidden, b.inter}, out[3] = {b.inter, b.inter, b.hidden};
+  int in[3], out[3];
+  mlp_dims(b, in, out);
   f.lora = block_lora(L, b.lora, 3, in, out, carve);
-  expect(!f.lora || (!f.w_gu.packed() && !f.w_down.packed()), "adapters on GGML block weights");
   return f;
 }
 
@@ -299,9 +438,6 @@ DFlashBlock dflash(WeightLoader& L, const flyx_model_desc& d, const flyx_dflash2
   f.sel_succ = L.mat(b.sel_succ);
   expect(b.draft_from == 0 || b.draft_from == 1, "a block drafter's first drafting row is the anchor's or the next");
   f.draft_from = b.draft_from;
-  expect(b.float_weights == FLYX_DRAFT_WEIGHTS_AUTO || b.float_weights == FLYX_DRAFT_WEIGHTS_Q8 ||
-             b.float_weights == FLYX_DRAFT_WEIGHTS_NVFP4,
-         "a block drafter's weights beside a float target: the backend's own, Q8_0 or NVFP4");
   if (b.sel_hid >= 0) f.sel_hid = L.lin_quant(b.sel_hid, dq);
   else f.unit_hid = L.put(std::vector<float>(size_t(FLYX_MAX_ROWS) * b.sel_rank, 1.f));  // a unit gate
   // Context K/V projections of every layer in one GEMM, their k norms side by side.
@@ -456,7 +592,7 @@ DvLayer dv_layer(WeightLoader& L, const flyx_model_desc& d, const flyx_dv_layer_
   l.norm = norm(L, b.norm);
   l.post_norm = norm(L, b.post_norm);
   Lin* to[] = {&l.a_qkv, &l.a_o, &l.a_gu, &l.a_down, &l.b_q, &l.b_k, &l.b_v, &l.b_o, &l.b_gate, &l.b_up, &l.b_down};
-  const auto pieces = dv_adapters(b);
+  const auto pieces = dv_adapters(L, b);
   for (size_t i = 0; i < pieces.size(); ++i) *to[i] = Lin{carve.take(L, pieces[i])};
   return l;
 }
@@ -919,7 +1055,7 @@ DraftQuants resolve_draft_quant(const flyx_model_desc& d, interfaces::DraftWeigh
     };
     for (int i = 0; i < d.n_blocks; ++i) {
       const flyx_block& b = d.blocks[i];
-      if (b.kind == FLYX_BLOCK_DFLASH2) q.dflash = beside_float(b.dflash2.float_weights);
+      if (b.kind == FLYX_BLOCK_DFLASH2 && b.dflash2.q8_weights) q.dflash = DraftQuant::kQ8;
       if (b.kind == FLYX_BLOCK_DSPINE) q.dspine = beside_float(b.dspine.float_weights);
     }
   }
@@ -1007,11 +1143,13 @@ void bind(flyx_bmodel* m, const flyx_model_desc& d, LoadTimes* times) {
   AdapterCarve carve;
   for (int i = 0; i < d.n_blocks; ++i) {
     const flyx_block& b = d.blocks[i];
-    std::vector<std::vector<int>> pieces;
-    if (b.kind == FLYX_BLOCK_DV_LAYER) pieces = dv_adapters(b.dv_layer);
-    if (b.kind == FLYX_BLOCK_ATTN) pieces = block_adapters(b.attn.lora, 4);
-    if (b.kind == FLYX_BLOCK_MLP) pieces = block_adapters(b.mlp.lora, 3);
-    for (const auto& ws : pieces) carve.left += AdapterCarve::piece(L, ws);
+    std::vector<AdapterPiece> pieces;
+    int in[5], out[5];
+    if (b.kind == FLYX_BLOCK_DV_LAYER) pieces = dv_adapters(L, b.dv_layer);
+    if (b.kind == FLYX_BLOCK_ATTN) attn_dims(b.attn, in, out), pieces = block_adapters(L, b.attn.lora, 4, in, out);
+    if (b.kind == FLYX_BLOCK_MLP) mlp_dims(b.mlp, in, out), pieces = block_adapters(L, b.mlp.lora, 3, in, out);
+    if (b.kind == FLYX_BLOCK_GDN) gdn_dims(b.gdn, in, out), pieces = block_adapters(L, b.gdn.lora, 5, in, out);
+    for (const auto& p : pieces) carve.left += AdapterCarve::piece(p);
   }
   if (carve.left) carve.next = m->alloc<bf16>(carve.left);
 
@@ -1058,7 +1196,7 @@ void bind(flyx_bmodel* m, const flyx_model_desc& d, LoadTimes* times) {
         break;
       }
       case FLYX_BLOCK_ATTN: put_block(m, i, attention(L, b.attn, sm, carve)); break;
-      case FLYX_BLOCK_GDN: put_block(m, i, gdn(L, b.gdn, sm)); break;
+      case FLYX_BLOCK_GDN: put_block(m, i, gdn(L, b.gdn, sm, carve)); break;
       case FLYX_BLOCK_MLP: put_block(m, i, mlp(L, b.mlp, carve)); break;
       case FLYX_BLOCK_REL_ATTN: put_block(m, i, rel_attn(L, b.rel_attn, sm)); break;
       case FLYX_BLOCK_MOE: put_block(m, i, moe(L, b.moe, sm)); break;
@@ -1102,7 +1240,7 @@ void bind(flyx_bmodel* m, const flyx_model_desc& d, LoadTimes* times) {
         t.head = ref(i, b.mtp.head, FLYX_BLOCK_HEAD, "head");
         t.attn = ref(i, b.mtp.attn, FLYX_BLOCK_ATTN, "attention");
         t.mlp = ref(i, b.mtp.mlp, FLYX_BLOCK_MLP, "MLP");
-        expect(!d.blocks[t.attn].attn.lora[0].rank && !d.blocks[t.mlp].mlp.lora[0].rank,
+        expect(!block_rank(d.blocks[t.attn].attn.lora, 4) && !block_rank(d.blocks[t.mlp].mlp.lora, 3),
                "an MTP layer with adapters (its draft steps run its blocks without them)");
         t.norm_emb = norm(L, b.mtp.norm_emb);
         t.norm_hidden = norm(L, b.mtp.norm_hidden);
