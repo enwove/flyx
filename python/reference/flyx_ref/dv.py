@@ -564,14 +564,15 @@ class Dv:
         return (torch.full((T,), self.dv.mask_token, dtype=torch.long), torch.full((T,), -1, dtype=torch.long),
                 torch.ones(T, dtype=torch.long))
 
-    def generate(self, prompt, max_new=512, eos=(), forced=None, oracle=None, commits=None):
+    def generate(self, prompt, max_new=512, eos=(), forced=None, oracle=None, commits=None, rounds=None):
         """DV decoding as bifill-dv evalgen.py mode DV runs it.  forced: the tokens to check the drafts against
         (teacher forcing; the first is the prefill's), instead of the target's own choices.  commits (with forced):
         the drafts forward k commits, commits[k], instead of the ones it accepts, while the list lasts: every forward
         then starts where another run's did (its anchor, its canvas slid by that run's counts), so that its own a_k
         compares with that run's round for round.  oracle(pos, drafts, parents, depths) -> drafts, or (drafts,
         parents, depths): tests replace drafts, or the whole tree (the CUDA backend's test chain, golden_test's DV
-        rounds), before a round.
+        rounds), before a round.  rounds: stop after that many forwards (a run's first forwards are the same whatever
+        comes after them).
         Returns {ids (stopped at the first eos or at max_new), accepted (a_k a forward: the drafts it accepted),
         committed (the drafts it committed: accepted's but where commits says otherwise), need and flyx_rounds (of
         the committed counts), rounds: per forward {pos, anchor, drafts, parents, accepted}}."""
@@ -591,9 +592,9 @@ class Dv:
 
         canvas = fresh_canvas(dv.slots, dv.topk, self.cfg.hidden, dv.mask_token, self.dtype)
         drafts, parents, depths = self.star()
-        out, accepted, committed, rounds = [], [], [], []
+        out, accepted, committed, run = [], [], [], []
         limit = min(max_new, len(forced)) if forced is not None else max_new
-        while True:
+        while rounds is None or len(run) < rounds:
             if oracle is not None:
                 got = oracle(cache.n, drafts.clone(), parents, depths)
                 if isinstance(got, tuple):
@@ -602,8 +603,8 @@ class Dv:
                     drafts = torch.as_tensor(got, dtype=torch.long)
             pos = cache.n
             path, choice, stats, hid = self.round(cache, anchor, drafts, parents, depths, canvas, choose)
-            rounds.append({"pos": pos, "anchor": anchor, "drafts": [int(t) for t in drafts],
-                           "parents": [int(t) for t in parents], "accepted": len(path)})
+            run.append({"pos": pos, "anchor": anchor, "drafts": [int(t) for t in drafts],
+                        "parents": [int(t) for t in parents], "accepted": len(path)})
             n = commits[len(accepted)] if commits is not None and len(accepted) < len(commits) else len(path)
             accepted.append(len(path))
             committed.append(n)
@@ -631,7 +632,7 @@ class Dv:
             drafts, parents, depths = self.tree(anchor, canvas)
         return {"ids": out, "accepted": accepted, "committed": committed,
                 "need": rounds_needed(committed, len(out)), "flyx_rounds": flyx_rounds(committed, len(out)),
-                "rounds": rounds}
+                "rounds": run}
 
 
 # ---- weights ------------------------------------------------------------------------------------------------------

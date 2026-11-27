@@ -143,7 +143,7 @@ the order of K, and adds the lanes' sums by a fixed tree (xor 1, 2, 4, 8,
 and `cpu_ref` in every pass) rounds the same way. Because a group is scaled
 by its largest value, one float32 step upstream (the float32 norm against the
 float64 one) can move a whole group's integers; where the reference's two
-best tokens nearly tie, the backend may pick the other one (`gguf_cuda`
+best tokens nearly tie, the backend may pick the other one (`gguf_cuda_*`
 compares the tiny models' replies teacher forced for that reason). With
 option `blocks=bf16` the weights are instead decoded at load and rounded to
 bf16 like any float32 matrix, which is outside this contract: on the tiny

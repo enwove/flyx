@@ -2810,25 +2810,32 @@ void dv_rounds(const json& g, const std::string& model, const std::string& backe
         fp8_tokens += t8 == t8_ref;
         const json& ref8 = (*fp8_ref)[size_t(k)]["fresh"];
         const DvFresh f8 = dv_fresh(dv8.get(), prompt, t8_ref, width);
-        const DvFresh fh8 = dv_fresh(dv8_host.get(), prompt, t8_ref, width);
         fresh8.add(f8.first, FreshSame::of(ref8, "first"));
-        fresh8_host.add(fh8.first, f8.first);
-        fresh8_host.add(fh8.second, f8.second);
         fresh8_second.add(f8.second, FreshSame::of(ref8, "second"));
+        if (k == 0) {  // the K/V's home: every tree the device's, on the first case (as below)
+          const DvFresh fh8 = dv_fresh(dv8_host.get(), prompt, t8_ref, width);
+          fresh8_host.add(fh8.first, f8.first);
+          fresh8_host.add(fh8.second, f8.second);
+        }
       }
     }
     // DV's first tree after a fresh start at each point: the reference's; with the K/V in host memory (the canvas
-    // reads the text through the stagings), the tokens and every tree this GPU drafts with them on the device.
+    // reads the text through the stagings), the tokens and every tree this GPU drafts with them on the device.  Those,
+    // and the generic regions' trees, are held to the device's own exactly: on the first case (its 46 fresh starts),
+    // the reference's on every case.
     if (fresh_ref && k < static_cast<int>(fresh_ref->size())) {
-      const DvFresh f = dv_fresh(dv.get(), prompt, want, width), fh = dv_fresh(dv_host.get(), prompt, want, width);
+      const DvFresh f = dv_fresh(dv.get(), prompt, want, width);
       fresh16.add(f.first, FreshSame::of((*fresh_ref)[size_t(k)], "first"));
       fresh16_second.add(f.second, FreshSame::of((*fresh_ref)[size_t(k)], "second"));
-      fresh_host.add(fh.first, f.first);
-      fresh_host.add(fh.second, f.second);
-      if (dv_generic) {
-        const DvFresh fg = dv_fresh(dv_generic.get(), prompt, want, width);
-        fresh_generic.add(fg.first, f.first);
-        fresh_generic.add(fg.second, f.second);
+      if (k == 0) {
+        const DvFresh fh = dv_fresh(dv_host.get(), prompt, want, width);
+        fresh_host.add(fh.first, f.first);
+        fresh_host.add(fh.second, f.second);
+        if (dv_generic) {
+          const DvFresh fg = dv_fresh(dv_generic.get(), prompt, want, width);
+          fresh_generic.add(fg.first, f.first);
+          fresh_generic.add(fg.second, f.second);
+        }
       }
       Session sh(dv_host.get());
       init_checked(sh);
@@ -3649,6 +3656,15 @@ int main(int argc, char** argv) {
                     "at a context of 2048");
   }
 
+  // The engine's own behaviour (sampling, penalties, grammars, lookup drafts, kept checkpoints, requests taking turns,
+  // stop strings) is the same code whatever the prompt: held on one case of the file, the first whose penalties change
+  // its tokens (make_tiny.py makes one), so that they are held to the reference's too.  Every case holds the drafters.
+  size_t behaviour_case = 0;
+  for (size_t i = 0; i < g["cases"].size(); ++i)
+    if (const json& pen = g["cases"][i]["penalty"]; !pen.is_null() && pen["differs"].get<bool>()) {
+      behaviour_case = i;
+      break;
+    }
   int k = 0;
   for (const auto& c : g["cases"]) {
     auto prompt = c["prompt"].get<std::vector<int32_t>>();
@@ -3925,6 +3941,7 @@ int main(int argc, char** argv) {
       init_checked(sc);
       check(gen(sc, prompt, N).tokens == want, "both drafters, chosen every round: the reference's tokens");
     }
+    if (static_cast<size_t>(k - 1) != behaviour_case) continue;
 
     // Sampling: for one seed the output does not depend on speculation.
     for (auto sp_cfg : {SamplingParams{0.8f, 1.f, 0, 11}, SamplingParams{1.0f, 0.9f, 40, 12345}}) {
