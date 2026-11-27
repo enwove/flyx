@@ -120,7 +120,7 @@ set_source_files_properties(${FLYX_CUDA_TABLE_SOURCES} runtime/state.cpp
 
 # Host code only: built by the C++ compiler, kernels come from the static library.
 set(FLYX_CUDA_HOST_SOURCES
-  loader/bind.cpp loader/weights.cpp
+  loader/bind.cpp loader/weights.cpp runtime/layer_ring.cpp runtime/cold_experts.cpp runtime/cold_dot.cpp
   runtime/state.cpp runtime/runner.cpp runtime/graphs.cpp runtime/sleep.cpp runtime/device_stats.cpp runtime/tiers.cpp
   runtime/vision_disk.cpp
   regions/batch.cpp regions/layers.cpp regions/linear.cpp regions/plan.cpp)

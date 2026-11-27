@@ -2,122 +2,13 @@
 // Weights onto the device, and the NVFP4 and Q8_0 copies drafting reads.
 #include "backends/cuda/loader/loader.h"
 
-#include <condition_variable>
+#include "backends/cuda/runtime/row_pool.h"
+#include "backends/cuda/runtime/cold_experts.h"
 #include <exception>
 
 #include "backends/cuda/loader/exact_bf16.h"
 
 namespace flyx::cuda {
-
-// Persistent worker pool scoped to a single model load so WeightLoader::parallel_rows avoids spawning and joining
-// thousands of OS threads across tensors while leaving zero background threads alive after bind() returns.
-class RowPool {
- public:
-  static size_t default_threads() {
-    static const size_t n = std::max<size_t>(1, std::min<size_t>(16, std::thread::hardware_concurrency()));
-    return n;
-  }
-
-  explicit RowPool(size_t max_threads) : max_threads_(std::max<size_t>(1, max_threads)) {
-    workers_.reserve(max_threads_ - 1);
-    try {
-      for (size_t idx = 1; idx < max_threads_; ++idx) workers_.emplace_back([this, idx] { worker_loop(idx); });
-    } catch (...) {
-      shutdown();
-      throw;
-    }
-  }
-
-  ~RowPool() { shutdown(); }
-  RowPool(const RowPool&) = delete;
-  RowPool& operator=(const RowPool&) = delete;
-
-  void run(size_t n, const std::function<void(size_t, size_t)>& fn) {
-    const size_t parts = std::min(max_threads_, n);
-    if (parts <= 1) {
-      if (n) fn(0, n);
-      return;
-    }
-    {
-      std::lock_guard<std::mutex> lock(mu_);
-      n_ = n;
-      parts_ = parts;
-      fn_ = &fn;
-      error_ = nullptr;
-      active_ = parts - 1;
-      ++gen_;
-    }
-    wake_cv_.notify_all();
-    std::exception_ptr caller_err;
-    try {
-      fn(0, n / parts);
-    } catch (...) {
-      caller_err = std::current_exception();
-    }
-    std::exception_ptr err;
-    {
-      std::unique_lock<std::mutex> lock(mu_);
-      done_cv_.wait(lock, [&] { return active_ == 0; });
-      err = caller_err ? caller_err : error_;
-      error_ = nullptr;
-      fn_ = nullptr;
-    }
-    if (err) std::rethrow_exception(err);
-  }
-
- private:
-  void worker_loop(size_t idx) {
-    uint64_t seen = 0;
-    for (;;) {
-      size_t a = 0, b = 0;
-      const std::function<void(size_t, size_t)>* fn = nullptr;
-      {
-        std::unique_lock<std::mutex> lock(mu_);
-        wake_cv_.wait(lock, [&] { return stop_ || gen_ != seen; });
-        if (stop_) return;
-        seen = gen_;
-        if (idx >= parts_) continue;
-        a = n_ * idx / parts_;
-        b = n_ * (idx + 1) / parts_;
-        fn = fn_;
-      }
-      std::exception_ptr err;
-      try {
-        (*fn)(a, b);
-      } catch (...) {
-        err = std::current_exception();
-      }
-      {
-        std::lock_guard<std::mutex> lock(mu_);
-        if (err && !error_) error_ = err;
-        if (--active_ == 0) done_cv_.notify_one();
-      }
-    }
-  }
-
-  void shutdown() noexcept {
-    {
-      std::lock_guard<std::mutex> lock(mu_);
-      stop_ = true;
-    }
-    wake_cv_.notify_all();
-    for (auto& th : workers_)
-      if (th.joinable()) th.join();
-  }
-
-  size_t max_threads_ = 1;
-  std::mutex mu_;
-  std::condition_variable wake_cv_;
-  std::condition_variable done_cv_;
-  uint64_t gen_ = 0;
-  size_t active_ = 0;
-  size_t n_ = 0;
-  size_t parts_ = 0;
-  const std::function<void(size_t, size_t)>* fn_ = nullptr;
-  std::exception_ptr error_;
-  bool stop_ = false;
-  std::vector<std::thread> workers_;
-};
 
 uint16_t float_to_bf16(float f) {
   uint32_t u;
@@ -510,6 +401,14 @@ void WeightLoader::parallel_rows(size_t n, const std::function<void(size_t, size
   pool_->run(n, fn);
 }
 
+void WeightLoader::finish_stream_block() {
+  if (staging_) CK(cudaStreamSynchronize(staging_->st));
+  // The next block gets private planes. Their immutable copies in host RAM may use the same device slot.
+  lins_.clear();
+  mats_.clear();
+  packs_.clear();
+}
+
 void WeightLoader::finish() {
   pool_.reset();  // join workers while the last async staging copies finish on staging_->st
   if (staging_) {
@@ -770,15 +669,26 @@ Lin WeightLoader::lin_stack(const std::vector<int>& ws, int* rows_out, const std
   return L;
 }
 
-ExpertMat WeightLoader::expert_mat(int w) {
-  if (auto it = experts_.find(w); it != experts_.end()) return it->second;
+ExpertMat WeightLoader::expert_mat(int w, std::shared_ptr<const ColdMatrix>& cold) {
+  if (auto it = experts_.find(w); it != experts_.end()) {
+    if (auto c = cold_experts_.find(w); c != cold_experts_.end()) cold = c->second;
+    return it->second;
+  }
   const auto* v = t(w);
-  const auto layout = expert_layout(weights_[w], m_->opt.packed_blocks);
-  const size_t E = size_t(v->shape[0]), N = size_t(v->shape[1]), K = size_t(v->shape[2]);
+  auto layout = expert_layout(weights_[w], m_->opt.packed_blocks);
+  const size_t all = size_t(v->shape[0]);
+  const size_t E = std::min(all, size_t(m_->opt.gpu_experts)), N = size_t(v->shape[1]), K = size_t(v->shape[2]);
+  if (E < all) {
+    cold = cold_experts_[w] = std::make_shared<ColdMatrix>(weights_[w], int(E), layout);
+    m_->host_bytes += cold->bytes();
+    layout.rows = E * N;
+    if (layout.expert_scales) layout.expert_scales = E;
+  }
   const size_t total_rows = layout.rows;
   ExpertMat em{};
   em.n_experts = int(E);
   em.N = int(N);
+  if (!E) return experts_[w] = em;
 
   // Optional per-expert F32 scale tensor (present on GGML NVFP4 and on requantized MoE experts in Unsloth GGUFs).
   auto upload_expert_scales = [&]() -> float* {
@@ -788,7 +698,7 @@ ExpertMat WeightLoader::expert_mat(int w) {
     std::vector<float> rs_host(E, 1.f);
     if (s2) {
       const size_t sn = numel(s2);
-      if (sn == E)
+      if (sn == all)
         for (size_t i = 0; i < E; ++i) rs_host[i] = static_cast<float>(flyx::ops::load(s2, i));
       else if (sn == 1)
         std::fill(rs_host.begin(), rs_host.end(), static_cast<float>(flyx::ops::load(s2, 0)));

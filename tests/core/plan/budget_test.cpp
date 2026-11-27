@@ -102,6 +102,10 @@ void check_shortfall_replay(flyx_backend_api api, plan::KvTiers tiers, const pla
 
 int main() {
   flyx::test::print_passes = true;
+  for (int room : {-1, 0, 5, 9, 10}) {
+    const int cap = plan::fit_residency(9, [=](int n) { return n <= room; });
+    check(cap == std::min(room, 9), "expert placement keeps the largest fitting prefix");
+  }
   const flyx_backend_api api = fake();
   // The budget: 16 GiB less the reserve (16 GiB / 40) = 15.6 GiB; 5.1 GiB after weights and workspace, so a context
   // of up to (5.1 GiB - 1 GiB) / 64 KiB = 65,536 tokens' worth less a little.

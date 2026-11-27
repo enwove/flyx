@@ -377,7 +377,8 @@ void expert_estimates() {
     flyx_bmodel m;
     m.opt.packed_blocks = c.packed;
     WeightLoader loader(&m, d);
-    loader.expert_mat(0);
+    std::shared_ptr<const ColdMatrix> cold;
+    loader.expert_mat(0, cold);
     loader.finish();
     require(m.bytes == expected, "actual expert upload matches estimate");
   }

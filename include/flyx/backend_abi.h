@@ -30,7 +30,7 @@
 extern "C" {
 #endif
 
-#define FLYX_BACKEND_ABI_VERSION 55u
+#define FLYX_BACKEND_ABI_VERSION 56u
 #define FLYX_BACKEND_ENTRY "flyx_backend_get_api"
 /* How a backend library exports its entry. */
 #if defined(_WIN32)
@@ -1015,6 +1015,9 @@ typedef struct {
   /* ABI 48: use this target-only position as AUTO's default switch on every layout. An explicit backend
    * switch still wins. A zero-initialized direct caller retains layout-dependent AUTO. */
   int32_t lock_auto_from, auto_from;
+  /* ABI 56: an elastic placement chosen from estimate_load. Zero keeps the backend option/default.
+   * A nonzero value is one plus the number of experts per layer or dense layers retained on device. */
+  uint32_t gpu_experts_plus_one, gpu_layers_plus_one;
 } flyx_open_options;
 
 /* Pre-flight device memory estimate before open() allocates (ABI 48).
@@ -1027,6 +1030,10 @@ typedef struct {
   uint64_t comfort_margin_bytes;  /* headroom above weights + min_runtime to keep full auto drafter precision */
   uint64_t target_kv_bytes_per_position; /* resident exact target K/V, including scales, before placement (ABI 48) */
   int32_t vision_device;                 /* resolved flyx_vision_device for this estimate (ABI 48) */
+  /* ABI 56: supported placement axes and additional host storage required for the requested split.
+   * Zero for both counts means that this backend/model cannot offload weights. */
+  int32_t experts_per_layer, dense_layers;
+  uint64_t offload_host_bytes;
 } flyx_load_estimate;
 
 /* Device memory as the backend sees it (0 = unknown, e.g. a CPU backend). */

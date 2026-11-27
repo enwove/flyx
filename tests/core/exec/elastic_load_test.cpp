@@ -41,6 +41,8 @@ int g_auto_switch = -1;
 bool g_non_vram_error = false;
 bool g_generic_rc_with_vram_text = false;
 int g_open_calls = 0;
+bool g_expert_caps = false, g_layer_caps = false;
+uint32_t g_used_experts = 0, g_used_layers = 0;
 std::vector<int32_t> g_seen_dw;
 std::string g_active_dw;
 std::string g_opaque_options;
@@ -101,6 +103,14 @@ int hook_estimate_load(const flyx_model_desc* desc, const flyx_open_options* opt
   }
   if (has_mtp) draft_b += g_mtp_bytes;
   out->weights_bytes = g_target_bytes + draft_b;
+  if (g_expert_caps || g_layer_caps) {
+    const uint32_t requested = g_expert_caps ? opts->gpu_experts_plus_one : opts->gpu_layers_plus_one;
+    const int kept = requested ? int(requested - 1) : 8;
+    out->experts_per_layer = g_expert_caps ? 8 : 0;
+    out->dense_layers = g_layer_caps ? 8 : 0;
+    out->weights_bytes = g_target_bytes + uint64_t(kept) * (64ull << 20);
+    out->offload_host_bytes = uint64_t(8 - kept) * (64ull << 20);
+  }
   out->target_kv_bytes_per_position = g_kv_row_bytes;
   out->draft_weights_bytes = draft_b;
   out->draft_compact_savings = savings;
@@ -114,6 +124,8 @@ const char* hook_draft_weights(flyx_bmodel*) { return g_active_dw.c_str(); }
 int hook_open(const flyx_model_desc* desc, const flyx_open_options* opts, flyx_bmodel** out) {
   ++g_open_calls;
   g_prefill_rows = 0;
+  g_used_experts = opts->gpu_experts_plus_one;
+  g_used_layers = opts->gpu_layers_plus_one;
   g_file_bytes = 0;
   for (int i = 0; i < desc->n_weights; ++i)
     if (auto* t = desc->weights[i].t) g_file_bytes += t->nbytes;
@@ -248,6 +260,7 @@ void reset_hooks() {
   g_non_vram_error = false;
   g_generic_rc_with_vram_text = false;
   g_open_calls = 0;
+  g_expert_caps = g_layer_caps = false;
   g_target_options.clear();
   g_kv_row_bytes = 0;
   g_refusal = Refusal::none;
@@ -333,6 +346,29 @@ int main(int argc, char** argv) {
     if (!plain.load(model, eo, &err)) { check(false, err); return 1; }
     ref_tokens = tokens(plain);
     check(ref_tokens.size() == 12, "plain reference generated 12 tokens");
+  }
+
+  for (bool experts : {false, true}) {
+    reset_hooks();
+    g_expert_caps = experts;
+    g_layer_caps = !experts;
+    g_total_vram = 12ull << 30;
+    g_free_vram = g_target_bytes + (512ull << 20) + 3 * (64ull << 20) +
+                  plan::device_reserve(g_total_vram, os::gpu_memory_paged());
+    EngineOptions eo;
+    eo.backend = "test-host-kv";
+    eo.max_ctx = 128;
+    eo.speculative = false;
+    eo.drafter = "none";
+    Engine fitted;
+    if (!fitted.load(model, eo, &err)) { check(false, err); return 1; }
+    check((experts ? g_used_experts : g_used_layers) == 4 && g_open_calls == 1,
+          "preflight chooses three resident units at the exact device byte threshold");
+    if (experts) eo.gpu_experts = 2;
+    else eo.gpu_layers = 2;
+    Engine explicit_cap;
+    if (!explicit_cap.load(model, eo, &err)) { check(false, err); return 1; }
+    check((experts ? g_used_experts : g_used_layers) == 3, "explicit residency cap reaches backend open");
   }
 
   // Exactly 32 decimal GB after the plain target. Adding any drafter crosses the old precision threshold.
@@ -612,7 +648,7 @@ int main(int argc, char** argv) {
           "elastic_load=false refuses OOM immediately without retrying or degrading");
   }
 
-  // 7. Non-OOM error never triggers elastic retries (even if the message mentions VRAM — ABI 48 checks FLYX_ERR_OOM).
+  // 7. Non-OOM error never triggers elastic retries (even if the message mentions VRAM â€” ABI 48 checks FLYX_ERR_OOM).
   {
     reset_hooks();
     g_total_vram = 24ull << 30;

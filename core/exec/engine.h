@@ -110,6 +110,8 @@ struct EngineOptions {
   // all free VRAM / available RAM on a dedicated machine or headless VM).
   int64_t vram_reserve = -1;
   int64_t ram_reserve = -1;
+  int gpu_experts = -1;  // resident routed experts per layer (-1: elastic placement)
+  int gpu_layers = -1;   // resident target layers (-1: elastic placement)
   // Drafts verified per round: -1 = chosen each round by the speculation
   // controller from the measured cost of each width and the acceptance seen
   // so far; >= 0 pins the width (tests, benchmarks; the drafter is still

@@ -3261,6 +3261,18 @@ void dv_rounds(const json& g, const std::string& model, const std::string& backe
 int plain_only(const json& g, const std::string& model, const std::string& backend, const std::string& required) {
   auto plain = make(model, backend, false);
   auto plain8 = make(model, backend, false, "", true);
+  if (backend == "cuda") {
+    const auto prompt = g["cases"][0]["prompt"].get<std::vector<int32_t>>();
+    Session resident(plain.get());
+    init_checked(resident);
+    const auto expected = gen(resident, prompt, 12).tokens;
+    for (const char* cap : {"gpu_layers=0", "gpu_layers=1"}) {
+      auto streamed = make(model, backend, false, "none", false, cap);
+      Session session(streamed.get());
+      init_checked(session);
+      check(gen(session, prompt, 12).tokens == expected, std::string(cap) + " preserves greedy tokens");
+    }
+  }
   prefill_only_checks(plain.get(), g["cases"][0]["prompt"].get<std::vector<int32_t>>());
   refused_session(plain.get(), g["cases"][0]["prompt"].get<std::vector<int32_t>>());
   // Prompt passes of up to 64 rows, as a real prompt takes them (the engines above pass 16 rows at a time, which run

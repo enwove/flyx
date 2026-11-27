@@ -863,7 +863,7 @@ void test_fused_rounds(const std::filesystem::path& path, const std::string& mod
                        const std::vector<int32_t>& prompt) {
   std::vector<int32_t> want;
   std::vector<float> generic_logits;
-  for (const std::string fusion : {"fusion=0", "fusion=1"}) {
+  for (const std::string fusion : {"fusion=0", "fusion=1", "fusion=1,gpu_experts=2", "fusion=1,gpu_experts=0"}) {
     const std::string opts = "head_cert=0,blocks=packed," + fusion;
     auto e = load_engine(path.string(), "cuda", {.speculative = true, .lookup = true, .backend_opts = opts});
     if (e->lookup_widths().empty() || e->lookup_widths().front() != 3 || e->widths().front() != 0)
@@ -908,7 +908,13 @@ void test_fused_rounds(const std::filesystem::path& path, const std::string& mod
     matches = matches && r.n_tokens == 1 && r.tokens[0] == want[2] &&
               std::memcmp(logits.data() + vocab, logits.data() + 5 * vocab, vocab * sizeof(float)) == 0;
     if (fusion == "fusion=0") generic_logits = logits;
-    check(matches && std::memcmp(logits.data(), generic_logits.data(), logits.size() * sizeof(float)) == 0,
+    const bool offloaded = fusion.find("gpu_experts") != std::string::npos;
+    bool agreement = logits.size() == generic_logits.size();
+    for (size_t i = 0; agreement && i < logits.size(); ++i) {
+      const double tolerance = 3e-4 * (1.0 + std::abs(generic_logits[i]));
+      agreement = offloaded ? std::abs(logits[i] - generic_logits[i]) <= tolerance : logits[i] == generic_logits[i];
+    }
+    check(matches && agreement,
           model + ": a four-row round, the round after it and the one after a rewind give the generic layers' "
                   "logits (" + fusion + ")");
   }
@@ -1428,6 +1434,11 @@ int main(int argc, char** argv) {
       check(std::string(cu_dspark->drafter()) == "dspark", "cuda loaded DSpark companion drafter");
 
       const auto cu_greedy = fresh_gen(*cu_plain, prompt, 24, false);
+      for (const auto* cap : {"gpu_experts=2", "gpu_experts=0", "gpu_experts=2,fusion=0"}) {
+        auto hybrid = load_engine(bf16_gguf.string(), "cuda", {.prefill_chunk = 32, .backend_opts = cap});
+        check(same_tokens(fresh_gen(*hybrid, prompt, 24, false), cu_greedy),
+              std::string("hybrid routed experts match resident greedy tokens: ") + cap);
+      }
       const auto cu_sampled = fresh_gen(*cu_plain, prompt, 24, true);
       check(same_tokens(cu_greedy, ref_greedy), "cuda plain greedy == float64 cpu_ref");
       check(same_tokens(cu_sampled, ref_sampled), "cuda plain sampled+penalties == float64 cpu_ref");

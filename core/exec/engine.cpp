@@ -52,7 +52,7 @@ int32_t to_abi_draft_weights(interfaces::DraftWeightsMode m) {
 }
 
 // Require meaningful VRAM savings (>= 128 MiB and >= 10% of drafter weights) before elastic loading steps
-// draft_weights down to NVFP4 — avoids spurious downgrades on already-4-bit GGUF drafters like Q4_K_M.
+// draft_weights down to NVFP4 â€” avoids spurious downgrades on already-4-bit GGUF drafters like Q4_K_M.
 bool meaningful_draft_savings(const flyx_load_estimate& est) {
   constexpr uint64_t kMinSavingsBytes = 128ull << 20;
   return est.draft_compact_savings >= kMinSavingsBytes &&
@@ -747,8 +747,11 @@ bool Engine::load(const std::string& path, const EngineOptions& opt, std::string
   };
 
   int auto_from = opt_.kv_gpu >= 0 && opt_.kv_ram != 0 ? opt_.kv_gpu : INT32_MAX;
+  int resident_experts = opt_.gpu_experts, resident_layers = opt_.gpu_layers;
   auto make_open_options = [&]() {
     flyx_open_options oo{};
+    oo.gpu_experts_plus_one = uint32_t(resident_experts) + 1u;
+    oo.gpu_layers_plus_one = uint32_t(resident_layers) + 1u;
     oo.max_ctx = opt_.max_ctx;
     oo.verbose = opt_.verbose;
     oo.lock_auto_from = tiers.method == FLYX_KV_AUTO;
@@ -932,6 +935,46 @@ bool Engine::load(const std::string& path, const EngineOptions& opt, std::string
     return true;
   };
 
+  // Query the backend for physical sizes. A host-memory limit is checked after choosing the largest
+  // feasible GPU partition, which also minimizes the amount we need to keep in RAM.
+  auto fit_weights = [&](const flyx_load_estimate& current, uint64_t free, uint64_t total, bool retry) {
+    const auto ram = os::system_memory();
+    uint64_t host_room = ram.available;
+    const uint64_t keep = opt_.ram_reserve >= 0 ? uint64_t(opt_.ram_reserve) : plan::host_keep(ram.total);
+    host_room -= std::min(host_room, keep);
+    host_room -= std::min(host_room, opt_.host_reserved);
+    uint64_t room = free - std::min(free, device_reserve(total));
+    auto fit_axis = [&](const char* key, int count, int& resident, uint32_t flyx_open_options::*field) {
+      if (count <= 0 || !interfaces::backend_opt_get(clean_backend_opts, key).empty()) return false;
+      const int before = resident < 0 ? count : resident;
+      if (before == 0) return false;
+      // A real allocation refused the previous placement. Leave progressively more space even if
+      // the estimate thinks it fits, and bound the number of complete reuploads.
+      const int upper = retry ? before / 2 : before - 1;
+      flyx_load_estimate trial{};
+      auto estimate = [&](int cap) {
+        auto options = make_open_options();
+        options.*field = cap + 1;
+        trial = {};
+        return api_->estimate_load(&model_->desc(), &options, free, total, &trial) == 0 &&
+               trial.weights_bytes < current.weights_bytes && trial.min_runtime_bytes <= room &&
+               trial.weights_bytes <= room - trial.min_runtime_bytes;
+      };
+      const int cap = plan::fit_residency(upper, estimate);
+      if (cap < 0 || !estimate(cap) || (ram.total && trial.offload_host_bytes > host_room)) return false;
+      resident = cap;
+      const std::string detail = field == &flyx_open_options::gpu_experts_plus_one
+          ? " experts per layer on GPU, remaining experts on CPU"
+          : " target layers resident on GPU, remaining linear weights streamed from RAM";
+      upsert_adj(key, "all", std::to_string(cap), std::to_string(cap) + detail);
+      return true;
+    };
+    return (opt_.gpu_experts < 0 && fit_axis("gpu_experts", current.experts_per_layer, resident_experts,
+                                             &flyx_open_options::gpu_experts_plus_one)) ||
+           (opt_.gpu_layers < 0 && fit_axis("gpu_layers", current.dense_layers, resident_layers,
+                                            &flyx_open_options::gpu_layers_plus_one));
+  };
+
   // Pre-flight backend-reported VRAM check (avoids wasting seconds uploading weights that cannot fit).
   if (opt_.elastic_load && api_->estimate_load) {
     uint64_t free_vram = 0, total_vram = 0;
@@ -941,14 +984,16 @@ bool Engine::load(const std::string& path, const EngineOptions& opt, std::string
       for (;;) {
         flyx_load_estimate est{};
         if (!query_estimate(free_vram, total_vram, &est)) break;
-        const uint64_t hard_need = est.weights_bytes + reserve + est.min_runtime_bytes;
-        const uint64_t comfort_need = hard_need + est.comfort_margin_bytes;
-        if (hard_need > free_vram) {
-          if (!step_down(/*comfort_only=*/false, &est, free_vram, total_vram)) break;
+        uint64_t room = free_vram - std::min(reserve, free_vram);
+        if (est.min_runtime_bytes > room || est.weights_bytes > room - est.min_runtime_bytes) {
+          if (!step_down(/*comfort_only=*/false, &est, free_vram, total_vram) &&
+              !fit_weights(est, free_vram, total_vram, false))
+            break;
           continue;
         }
+        room -= est.min_runtime_bytes + est.weights_bytes;
         if (req_dw == interfaces::DraftWeightsMode::kAuto && cur_dw == interfaces::DraftWeightsMode::kAuto &&
-            meaningful_draft_savings(est) && comfort_need > free_vram) {
+            meaningful_draft_savings(est) && est.comfort_margin_bytes > room) {
           if (step_down(/*comfort_only=*/true, &est, free_vram, total_vram)) continue;
         }
         break;
@@ -1020,7 +1065,8 @@ bool Engine::load(const std::string& path, const EngineOptions& opt, std::string
     query_vram(&free_vram, &total_vram);
     flyx_load_estimate est{};
     const bool have_est = query_estimate(free_vram, total_vram, &est);
-    if (!step_down(/*comfort_only=*/false, have_est ? &est : nullptr, free_vram, total_vram) && !(opened && smaller_prefill())) {
+    if (!step_down(/*comfort_only=*/false, have_est ? &est : nullptr, free_vram, total_vram) &&
+        !(opened && smaller_prefill()) && !(have_est && total_vram && fit_weights(est, free_vram, total_vram, true))) {
       *err = attempt_err;
       if (kept_for_drafter)
         *err += " Beside --drafter " + opt_.drafter + ", prefill passes stay " + std::to_string(prefill_chunk_) +

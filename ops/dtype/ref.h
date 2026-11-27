@@ -136,10 +136,11 @@ inline double round_kv16(double v) {
 // is lost of a value within 2^-32 of the largest; smaller ones round to the
 // binary16 subnormals.  A row of zeros, or one with an infinity, keeps the
 // scale 1.
-inline void round_a16h(double* row, int K) {
+template <typename T>
+inline void round_a16h(T* row, int K) {
   double m = 0;
   for (int k = 0; k < K; ++k) {
-    row[k] = round_bf16(row[k]);
+    row[k] = T(round_bf16(row[k]));
     if (std::fabs(row[k]) > m) m = std::fabs(row[k]);
   }
   double scale = 1;
@@ -148,7 +149,7 @@ inline void round_a16h(double* row, int K) {
     std::frexp(m, &e);  // m in [2^(e-1), 2^e)
     scale = std::ldexp(1.0, std::max(e - 1, -111) - 15);
   }
-  for (int k = 0; k < K; ++k) row[k] = round_f16(row[k] / scale) * scale;
+  for (int k = 0; k < K; ++k) row[k] = T(round_f16(row[k] / scale) * scale);
 }
 
 // The nearest e2m1 code of x (ties to the even code): magnitudes 0, .5, 1, 1.5, 2, 3, 4, 6, bit 3 the sign.

@@ -4,12 +4,16 @@
 #pragma once
 
 #include <cstdint>
+#include <functional>
 #include <string>
 
 #include "core/resources/ledger.h"
 #include "flyx/backend_abi.h"
 
 namespace flyx::plan {
+
+// Largest per-layer expert cap whose backend footprint fits. A negative result means no placement fits.
+int fit_residency(int maximum, const std::function<bool(int)>& fits);
 
 // What holds the GPU besides the model's weights and workspace, as the budget found it: other programs with the
 // driver, and the process's own runtime (its CUDA context, its kernels' modules; a second model's memory, did the

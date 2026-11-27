@@ -30,6 +30,7 @@ Start here when deploying, integrating, or modifying `flyx`. Each document below
 - [docs/building.md](docs/building.md): Toolchain requirements, CMake presets (`dev`, `debug`, `cpu`, `dev-windows`, `cpu-windows`, `release-linux`, `release-windows`), CMake options, and Linux/Windows release packaging.
 - [docs/testing.md](docs/testing.md): Test dependencies, `ctest` suite map, CUPTI tracing, and coding-agent integration checks.
 - [docs/design/architecture.md](docs/design/architecture.md): Repository directory map, request lifecycle, scheduler/prefix-cache orchestration, KV tiering & StrataFlux 2-bit mechanics, speculative decoding invariants, and Model -> Program -> Region -> Op execution model.
+- [docs/design/weight-offload.md](docs/design/weight-offload.md): CUDA expert placement, CPU expert execution and dense layer streaming.
 - [docs/design/numerics.md](docs/design/numerics.md): Machine-verified (`tools/check_numerics.py`) per-kernel precision contract, bitwise equivalence classes, and comparison against `llama.cpp`.
 - [docs/design/gguf.md](docs/design/gguf.md): GGUF container reader, metadata keys, model layout flags, and packed GGML block execution.
 - [docs/design/tree-verification.md](docs/design/tree-verification.md): Bitwise-exact speculative tree verification on hybrid attention + GDN models, DFlash2 dynamic trees, and tree rounds of up to 64 rows on attention-only models.

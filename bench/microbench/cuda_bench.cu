@@ -2243,6 +2243,38 @@ __global__ void k_sum_words(const uint32_t* p, size_t n, unsigned long long* out
   atomicAdd(out, s);
 }
 
+// Transfer ceiling for the layer ring. Allocate and touch pinned memory before the timed interval.
+void bench_h2d() {
+  cudaStream_t stream;
+  cudaEvent_t begin, end;
+  CK(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking));
+  CK(cudaEventCreate(&begin));
+  CK(cudaEventCreate(&end));
+  constexpr size_t capacity = size_t(256) << 20;
+  uint8_t *host, *device;
+  CK(cudaMallocHost(&host, capacity));
+  CK(cudaMalloc(&device, capacity));
+  std::memset(host, 0x5a, capacity);
+  for (size_t bytes : {size_t(4) << 20, size_t(32) << 20, capacity}) {
+    const int repetitions = int(4 * capacity / bytes);
+    CK(cudaMemcpyAsync(device, host, bytes, cudaMemcpyHostToDevice, stream));
+    CK(cudaEventRecord(begin, stream));
+    for (int i = 0; i < repetitions; ++i)
+      CK(cudaMemcpyAsync(device, host, bytes, cudaMemcpyHostToDevice, stream));
+    CK(cudaEventRecord(end, stream));
+    CK(cudaEventSynchronize(end));
+    float ms;
+    CK(cudaEventElapsedTime(&ms, begin, end));
+    std::printf("pinned H2D %zu MiB x %d: %.3f GB/s (%.2f ms)\n", bytes >> 20, repetitions,
+                bytes * double(repetitions) / (ms * 1e6), ms);
+  }
+  CK(cudaFree(device));
+  CK(cudaFreeHost(host));
+  CK(cudaEventDestroy(begin));
+  CK(cudaEventDestroy(end));
+  CK(cudaStreamDestroy(stream));
+}
+
 void bench_host_read() {
   unsigned long long* out = nullptr;
   CK(cudaMalloc(&out, 8));
@@ -2440,6 +2472,10 @@ int main(int argc, char** argv) {
     // Kernels launch as the engine launches them on this GPU; FLYX_BENCH_PDL=0|1 says otherwise.
     g_bench_opts.pdl = gemm_tuning_pdl(g_bench_opts.tuning);
     if (const char* e = std::getenv("FLYX_BENCH_PDL")) g_bench_opts.pdl = std::string(e) == "1";
+  }
+  if (what == "h2d") {
+    bench_h2d();
+    return 0;
   }
   if (what == "moe") {  // uses its own routing and staging scratch
     bench_moe();

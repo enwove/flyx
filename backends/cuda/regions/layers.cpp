@@ -3,6 +3,8 @@
 // region; fused=true is the override regions/plan.cpp may pick.
 #include <bit>
 
+#include "backends/cuda/runtime/cold_experts.h"
+
 #include "backends/cuda/regions/layers.h"
 
 namespace flyx::cuda {
@@ -1179,7 +1181,7 @@ void rel_attn_layer(const Pass& ps, const RelAttnBlock& a, bool fused) {
     const bf16* rb = f.router.round.b16 ? f.router.round.b16 : (f.router.round.f32 ? nullptr : f.router.w);
     if ((!rb && !f.router.round.f32) || f.n_experts < 1 || f.n_experts > 256 ||
         f.top_k < 1 || f.top_k > std::min(f.n_experts, kMoeRouteMaxTopK) ||
-        !f.gate_up.q || !f.gate_up.s || !f.down.q || !f.down.s || f.gate_up.packed() || f.down.packed() ||
+        f.cold_gu || !f.gate_up.q || !f.gate_up.s || !f.down.q || !f.down.s || f.gate_up.packed() || f.down.packed() ||
         (mix && !f.res_query)) return;
     const SideStream& es = s->expert_side;
     CK(cudaEventRecord(es.fork, st));
@@ -1653,7 +1655,10 @@ void moe_layer(const Pass& ps, const MoeBlock& f, bool fused) {
       round_q8 && moe_round_bf16_down(f.down, R, K, I, msc, L) ? reinterpret_cast<bf16*>(rv.b.moe_act) : nullptr;
   // The grouping of the rows by expert that the gate|up GEMM leaves in the scratch, which the down GEMM takes over.
   int grouped = 0;
-  if (fused) {
+  if (f.cold_gu) {
+    float* dst = f.post_conv ? rv.b.post_raw : (ps.res && ps.res->x_cur ? ps.res->x_cur : rv.b.x);
+    hybrid_experts(ps, f, msc, dst, !f.post_conv, fused);
+  } else if (fused) {
     grouped = moe_gate_up(rv.b.h, H, f.gate_up, rv.b.moe_idx, R, K, I, H, f.situ_beta, f.situ_linear_beta, true,
                           rv.b.moe_act, I, msc, L, round_q8, act_bf16);
   } else {
@@ -1662,7 +1667,7 @@ void moe_layer(const Pass& ps, const MoeBlock& f, bool fused) {
     situ_rows(rv.b.moe_gu, 2 * I, I, f.situ_beta, f.situ_linear_beta, rv.b.moe_act, I, R * K, st);
   }
   if (f.post_conv) {
-    moe_down(rv.b.moe_act, I, f.down, rv.b.moe_idx, rv.b.moe_w, R, K, H, I, rv.b.post_raw, H, false, msc, L, act_bf16,
+    if (!f.cold_gu) moe_down(rv.b.moe_act, I, f.down, rv.b.moe_idx, rv.b.moe_w, R, K, H, I, rv.b.post_raw, H, false, msc, L, act_bf16,
              grouped);
     if (fused && ps.round && R <= FLYX_MAX_ROWS && ps.res && rv.b.post_out && H <= 5120) {
       ps.res->pending = PendingPostConv{rv.b.post_raw, f.post_conv, f.sconv, f.sconv_offset, f.conv, false};
@@ -1677,7 +1682,7 @@ void moe_layer(const Pass& ps, const MoeBlock& f, bool fused) {
     float* x_cur = (ps.res && ps.res->x_cur) ? ps.res->x_cur : rv.b.x;
     shortconv_pass(rv.b.post_raw, H, f.post_conv, nullptr, sc.win, sc.w_stride, kSlotCur, next_sel, skip, rep,
                    rep_stride, kSlotCur, f.sconv_offset, sc.channels, H, f.conv, 0, s->P, R, x_cur, H, st, true);
-  } else {
+  } else if (!f.cold_gu) {
     float* x_cur = (ps.res && ps.res->x_cur) ? ps.res->x_cur : rv.b.x;
     moe_down(rv.b.moe_act, I, f.down, rv.b.moe_idx, rv.b.moe_w, R, K, H, I, x_cur, H, true, msc, L, act_bf16,
              grouped);

@@ -3,6 +3,7 @@
 // implementation of each node (the generic one or a fused override that fits);
 // lower() resolves a program into a plan, forward() executes its nodes on a sequence (a prefill pass or a round).
 #include "backends/cuda/regions/layers.h"
+#include "backends/cuda/runtime/layer_ring.h"
 
 #include <algorithm>
 #include <climits>
@@ -383,7 +384,20 @@ void forward_nodes(const Pass& ps, size_t begin, size_t end, int copy_prefix) {
                      std::holds_alternative<RelAttnBlock>(*ps.p->block[i + 1]))
                         ? &std::get<RelAttnBlock>(*ps.p->block[i + 1])
                         : nullptr;
-    ps.p->impl[i]->fn(cur, nd, blk);
+    LayerRing* ring = s->m->layer_ring.get();
+    if (ring && nd.kind == FLYX_NODE_RUN && ring->images[size_t(nd.block)].host) {
+      std::lock_guard lock(ring->mutex);
+      ring->begin(nd.block, ps.v.L.st);
+      try {
+        ps.p->impl[i]->fn(cur, nd, blk);
+      } catch (...) {
+        cudaStreamSynchronize(ps.v.L.st);
+        throw;
+      }
+      ring->end(nd.block, ps.v.L.st);
+    } else {
+      ps.p->impl[i]->fn(cur, nd, blk);
+    }
     if (prof) CK(cudaEventRecord(s->prof_ev[i - begin + 1], s->st));
   }
   if (res_state.expert_work) CK(cudaStreamWaitEvent(ps.v.L.st, s->expert_side.join, 0));

@@ -1965,6 +1965,9 @@ int moe_gate_up(const float* x, int ldx, const ExpertMat& W, const int* eidx, in
 // act_bf16 (with moe_round_bf16_down): its input [rows*top_k, K] in bf16 already, read in place of act.
 // grouped: moe_gate_up's return for these eidx and rows, sc untouched since; its work tiles are taken where they are
 // the ones this GEMM would group (0: group them here).
+// Reduce unweighted GPU and CPU slots in the router's original order.
+void moe_sum_slots(const float* slots, const float* weights, int rows, int top_k, int hidden, float* out,
+                   bool accumulate, cudaStream_t st);
 void moe_down(const float* act, int ld_act, const ExpertMat& W, const int* eidx, const float* ew, int rows, int top_k,
               int H, int K, float* out, int ld_out, bool accumulate, const MoeScratch* sc, const Launch& L,
               const bf16* act_bf16 = nullptr, int grouped = 0);

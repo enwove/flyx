@@ -11,6 +11,7 @@
 //   committing the accepted rows and rolling back inside the last rounds are
 //   both folds of a saved state, never a recompute of the prompt.
 #include "backends/cuda/backend.h"
+#include "backends/cuda/runtime/cold_experts.h"
 #include "backends/cuda/regions/layers.h"
 #include "core/interfaces/memory_policy.h"
 
@@ -224,6 +225,20 @@ OptionSpec kernel_int_choice_opt(const char* name, int KernelOptions::*ptr, std:
 
 const std::vector<OptionSpec>& option_specs() {
   static const std::vector<OptionSpec> specs = {
+      {"gpu_layers",
+       [](const std::string& key, const std::string& val, BackendOptions* o, std::string* err) {
+         return parse_whole_val(key, val, &o->gpu_layers, err);
+       },
+       [](const BackendOptions& o, const BackendOptions& def) -> std::string {
+         return o.gpu_layers == def.gpu_layers ? "" : "gpu_layers=" + std::to_string(o.gpu_layers);
+       }},
+      {"gpu_experts",
+       [](const std::string& key, const std::string& val, BackendOptions* o, std::string* err) {
+         return parse_whole_val(key, val, &o->gpu_experts, err);
+       },
+       [](const BackendOptions& o, const BackendOptions& def) -> std::string {
+         return o.gpu_experts == def.gpu_experts ? "" : "gpu_experts=" + std::to_string(o.gpu_experts);
+       }},
       flag_opt("profile", &BackendOptions::profile),
       flag_opt("graphs", &BackendOptions::graphs),
       flag_opt("dv_conditional", &BackendOptions::dv_conditional),
@@ -683,6 +698,7 @@ int open_model(const flyx_model_desc* desc, const flyx_open_options* opts, flyx_
         m->opt.draft_weights = interfaces::DraftWeightsMode::kAuto;
     }
     if (!resolve_options(opts ? opts->options : nullptr, &m->opt, &err)) return fail("options: " + err);
+    apply_weight_caps(opts, &m->opt);
     if (!nvfp4_inputs(*desc, &m->opt.kernels.prefill_fp4, &err)) return fail(err);
     if (m->opt.embed == 0) {
       // embed=auto: host memory frees the table's GPU memory for a few kilobytes of reads a token; where 32 GB stay
@@ -751,6 +767,7 @@ int open_model(const flyx_model_desc* desc, const flyx_open_options* opts, flyx_
     CK(cudaFree(nullptr));  // the context, here rather than in the first upload
     t[1] = load_clock();
     bind(m.get(), *desc, &load_times);
+    init_cold_experts(m.get());
     t[2] = load_clock();
     if (m->verbose)  // the bf16 residual (residual16): a stack of W4A4 residual adds and no adapters
       std::fprintf(stderr, "flyx-cuda: prefill passes of more than 16 rows keep the residual in %s\n",
@@ -797,7 +814,7 @@ int open_model(const flyx_model_desc* desc, const flyx_open_options* opts, flyx_
                               std::min(FLYX_MAX_WIDE_ROWS, block<DvBlock>(m.get(), m->dv_block).tree_width + 1));
     // The buffers rounds need, before the copies of the head kept only for speed: those take what room is left
     // (device_malloc) and go without where none is.
-    alloc_batch(m.get());  // rounds of several sequences
+    if (!m->cold && !m->layer_ring) alloc_batch(m.get());  // rounds of several sequences
     CK(cudaEventCreateWithFlags(&m->prefill_ev, cudaEventDisableTiming));
     t[4] = load_clock();
     make_head_fp8(m.get());
@@ -844,7 +861,9 @@ int open_model(const flyx_model_desc* desc, const flyx_open_options* opts, flyx_
     if (m->vision_dev_bytes) std::fprintf(stderr, " (vision %.2f GB)", m->vision_dev_bytes / 1e9);
     if (m->host_bytes) {
       std::fprintf(stderr, ", %.2f GB in host memory", m->host_bytes / 1e9);
-      if (m->vision_host_bytes && m->host_bytes > m->vision_host_bytes)
+      if (m->layer_ring) std::fprintf(stderr, " (includes streamed layers)");
+      else if (m->cold) std::fprintf(stderr, " (includes cold experts, GPU cap %d per layer)", m->opt.gpu_experts);
+      else if (m->vision_host_bytes && m->host_bytes > m->vision_host_bytes)
         std::fprintf(stderr, " (embedding + vision %.2f GB)", m->vision_host_bytes / 1e9);
       else if (m->vision_host_bytes)
         std::fprintf(stderr, " (vision)");

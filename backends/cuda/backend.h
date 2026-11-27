@@ -154,6 +154,8 @@ struct BackendOptions {
   // asks, eagle4_tree_steps(): 2 width / 3)
   int eagle4_beam = 4, eagle4_steps = 0;
   bool draft_kv16 = false;       // draft_kv=16: the MTP layer's cache in binary16 beside the target's FP8
+  int gpu_layers = INT_MAX;  // dense layers retained before the streamed suffix
+  int gpu_experts = INT_MAX;  // resident expert IDs [0, gpu_experts) at each MoE layer
   bool packed_blocks = true;     // blocks=bf16 clears it
   int embed = 0;                 // embed=auto (0: host memory unless the GPU has room, open_model), host (1), gpu (2)
   int vision = FLYX_VISION_DEV_DISK;         // vision=disk (0: temp file, 0 VRAM/RAM), host (1), gpu (2), auto (3)
@@ -169,6 +171,17 @@ struct BackendOptions {
   PageableKvMode pageable_kv = PageableKvMode::automatic;
   int pinned_host_mb = -1;  // override pinned host budget in MiB (-1: query DXGI NON_LOCAL on Windows, unlimited else)
 };
+// The core's placement trial is authoritative over a backend default.
+inline void apply_weight_caps(const flyx_open_options* options, BackendOptions* out) {
+  if (!options) return;
+  auto set = [](uint32_t value, int* cap) {
+    if (value > uint32_t(INT_MAX) + 1u) throw std::runtime_error("GPU residency cap exceeds INT_MAX");
+    if (value) *cap = int(value - 1);
+  };
+  set(options->gpu_experts_plus_one, &out->gpu_experts);
+  set(options->gpu_layers_plus_one, &out->gpu_layers);
+}
+
 bool parse_options(const char* text, BackendOptions* o, std::string* err);
 // The environment as apply_env_aliases reads it (null: std::getenv; tests pass their own).
 using EnvLookup = const char* (*)(const char* name);
@@ -489,7 +502,11 @@ uint64_t device_reserve_floor();
 
 }  // namespace flyx::cuda
 
+namespace flyx::cuda { struct ColdWorkspace; struct LayerRing; }
+
 struct flyx_bmodel {
+  std::shared_ptr<flyx::cuda::ColdWorkspace> cold;
+  std::shared_ptr<flyx::cuda::LayerRing> layer_ring;
   std::vector<void*> allocs;
   size_t bytes = 0;
   std::vector<void*> host_allocs;  // pinned host memory (host_alloc / host_pinned)
@@ -556,6 +573,7 @@ struct flyx_bmodel {
       std::fprintf(stderr, "flyx-cuda: %ld rounds of several sequences (%.2f sequences, %.1f rows each), %ld graphs "
                    "captured\n", batch->launched, double(batch->sequences) / batch->launched,
                    double(batch->rows) / batch->launched, batch->captured);
+    layer_ring.reset();  // finish copies before freeing their host and device buffers
     batch.reset();  // its graphs and stream before the memory they use
     if (prefill_ev) cudaEventDestroy(prefill_ev);
     if (prefill_embeds) cudaFree(prefill_embeds);
