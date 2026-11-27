@@ -579,8 +579,13 @@ int main(int argc, char** argv) {
           "a title matching both resident conversations equally uses the idle slot while the main one runs");
   }
   // Long enough that two requests sent one after the other run at once (they overlap in time, below): 40 tokens were
-  // 10 ms on cpu_ref, less than the test's thread may wait between the two sends on a loaded machine.
-  const int N = 200;
+  // 10 ms on cpu_ref, less than the test's thread may wait between the two sends on a loaded machine.  200 were 16 to
+  // 19 ms on CUDA (RTX 5070 Ti, the two batched), which a loaded machine outlasted too (scheduler_cuda in the gpu
+  // preset at -j 8; with every core busy a reader thread read one request's whole text after the other had ended):
+  // 1500 there, 62 to 65 ms alone.
+  const int N = eo.backend == "cpu_ref" ? 200 : 1500;
+  // A reply a conversation's history is made of: short enough that kLong more tokens still fit the context.
+  const int kReply = 200;
   const std::string a = "alpha beta gamma delta " + words("one two three", 4);
   const std::string b = "The quick brown fox " + words("jumps over", 6);
   std::printf("prompts of %d and %d tokens, context %d\n", sched.count_text_tokens(a), sched.count_text_tokens(b),
@@ -623,7 +628,7 @@ int main(int argc, char** argv) {
   // history (a and its reply) in different ways; `third` is new and takes the
   // free session.  They end in the order third, more, other.
   {
-    auto warm = send(sched, raw(sched, "a", a, N));  // a session whose history is a and its reply
+    auto warm = send(sched, raw(sched, "a", a, kReply));  // a session whose history is a and its reply
     warm->wait();
     const std::string history = a + warm->text;
     auto more = send(sched, raw(sched, "more", history + words(" and then some more of the same", 4), kLong));
@@ -694,7 +699,7 @@ int main(int argc, char** argv) {
   }
   // A queued job that is cancelled says so and never runs.
   {
-    auto warm = send(sched, raw(sched, "b", b, N));
+    auto warm = send(sched, raw(sched, "b", b, kReply));
     warm->wait();
     const std::string history = b + warm->text;
     auto busy = send(sched, raw(sched, "busy", history + words(" on and on it goes", 5), kLong));
