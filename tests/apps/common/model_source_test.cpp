@@ -224,12 +224,42 @@ int main() {
       const fs::path expected = to_path(home) / "models";
       check(to_path(flyx::apps::expand_user_path("~/models")) == expected,
             "expand_user_path(\"~/models\") expands tilde");
+#if defined(_WIN32)
       check(to_path(flyx::apps::expand_user_path("~//models")) == expected &&
                 to_path(flyx::apps::expand_user_path("~\\\\models")) == expected,
             "expand_user_path strips repeated slashes after ~ instead of escaping home");
+#else
+      check(to_path(flyx::apps::expand_user_path("~//models")) == expected,
+            "expand_user_path strips repeated slashes after ~ instead of escaping home");
+      check(flyx::apps::expand_user_path("~\\models") == "~\\models",
+            "expand_user_path preserves literal backslash after ~ on POSIX");
+#endif
       check(flyx::apps::expand_user_path("/abs/models") == "/abs/models",
             "expand_user_path leaves non-tilde paths untouched");
     }
+#if !defined(_WIN32)
+    // POSIX path preservation: backslashes are literal filename characters, and symlink/.. follows the real parent.
+    {
+      const fs::path plain_dir = tmp / "posix_dir";
+      const fs::path slash_dir = tmp / "posix_dir\\";
+      const fs::path target_sub = tmp / "real_parent" / "child";
+      const fs::path link_path = tmp / "link_to_child";
+      fs::create_directories(plain_dir);
+      fs::create_directories(slash_dir);
+      fs::create_directories(target_sub);
+      std::error_code sym_ec;
+      fs::create_directory_symlink(target_sub, link_path, sym_ec);
+      check(flyx::apps::canonical_model_dir(from_path(plain_dir)) !=
+                flyx::apps::canonical_model_dir(from_path(slash_dir)),
+            "canonical_model_dir keeps /dir and /dir\\ distinct on POSIX");
+      if (!sym_ec) {
+        const std::string via_link_parent = flyx::apps::canonical_model_dir(from_path(link_path) + "/..");
+        const std::string real_parent = flyx::apps::canonical_model_dir(from_path(tmp / "real_parent"));
+        check(via_link_parent == real_parent,
+              "canonical_model_dir resolves symlink/.. to real parent rather than lexical parent: " + via_link_parent);
+      }
+    }
+#endif
     const fs::path scan_root = tmp / "scan_root";
     const fs::path nested = scan_root / "Author" / "Model" / "Nested-Q4_K_M.gguf";
     const fs::path unsupported = scan_root / "Other" / "Unsupported-Q4.gguf";
@@ -280,6 +310,61 @@ int main() {
       check(saw_linked, "scan_model_dirs follows directory symlinks and survives symlink cycles");
       check(saw_hidden_real, "excluded hidden symlink does not prevent scanning its real target directory");
       check(saw_deep_real, "deep symlink visit does not prevent shallower scan of its real target directory");
+    }
+
+    // Security regression: scan_model_dirs with allow_path + ScanFs must NEVER call any target-following filesystem
+    // operation (is_directory, weakly_canonical, is_regular_file, file_size, last_write_time, classify_gguf) on a
+    // blocked symlink/reparse root or child entry.
+    {
+      std::vector<std::string> touched_blocked;
+      auto record_if_blocked = [&](const fs::path& p, const char* op) {
+        const std::string s = from_path(p);
+        if (s.find("to_unc") != std::string::npos || s.find("blocked_root") != std::string::npos)
+          touched_blocked.push_back(std::string(op) + ":" + s);
+      };
+      flyx::apps::ScanFs fake_fs;
+      fake_fs.is_directory = [&](const fs::path& p, std::error_code&) {
+        record_if_blocked(p, "is_directory");
+        const std::string s = from_path(p);
+        return s == "/safe" || s == "/safe/sub";
+      };
+      fake_fs.weakly_canonical = [&](const fs::path& p, std::error_code&) {
+        record_if_blocked(p, "weakly_canonical");
+        return p;
+      };
+      fake_fs.list_dir = [&](const fs::path& p, std::error_code&) -> std::vector<fs::path> {
+        record_if_blocked(p, "list_dir");
+        const std::string s = from_path(p);
+        if (s == "/safe") return {fs::path("/safe/to_unc_dir"), fs::path("/safe/to_unc_file.gguf"), fs::path("/safe/sub")};
+        if (s == "/safe/sub") return {fs::path("/safe/sub/good-Q4_K_M.gguf")};
+        return {};
+      };
+      fake_fs.is_regular_file = [&](const fs::path& p, std::error_code&) {
+        record_if_blocked(p, "is_regular_file");
+        return from_path(p) == "/safe/sub/good-Q4_K_M.gguf";
+      };
+      fake_fs.file_size = [&](const fs::path& p, std::error_code&) -> uint64_t {
+        record_if_blocked(p, "file_size");
+        return 1024;
+      };
+      fake_fs.last_write_time = [&](const fs::path& p, std::error_code&) -> fs::file_time_type {
+        record_if_blocked(p, "last_write_time");
+        return fs::file_time_type::clock::now();
+      };
+      fake_fs.classify_gguf = [&](const std::string& p, const std::string&, uint64_t,
+                                  fs::file_time_type) -> flyx::apps::GgufClassification {
+        record_if_blocked(to_path(p), "classify_gguf");
+        return {"gguf", "", "", -1};
+      };
+      auto allow = [](std::string_view p) {
+        return p.find("to_unc") == std::string_view::npos && p.find("blocked_root") == std::string_view::npos;
+      };
+      const auto gated = flyx::apps::scan_model_dirs({"/blocked_root", "/safe"}, 4, allow, &fake_fs);
+      check(touched_blocked.empty(),
+            "scan_model_dirs never invokes target-following fs ops on blocked roots/children (touched=" +
+                std::to_string(touched_blocked.size()) + ")");
+      check(gated.size() == 1 && gated[0].file == "good-Q4_K_M.gguf",
+            "scan_model_dirs still discovers allowed siblings when blocked links are skipped");
     }
   }
   set_env("HF_HUB_OFFLINE", "");

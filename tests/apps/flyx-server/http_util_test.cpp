@@ -183,8 +183,45 @@ void test_forwarded_and_management_policy() {
     check(!has_access(s, proxied, Access::kManage), "proxied request without key is denied");
     proxied.set_header("Authorization", "Bearer topsecret");
     check(has_access(s, proxied, Access::kManage), "proxied request with valid API key has kManage");
+    check(has_access(s, proxied, Access::kDashboardRead), "proxied request with valid API key has kDashboardRead");
     check(has_access(s, proxied, Access::kLocalOrKeyed), "proxied request with valid API key has kLocalOrKeyed");
     check(!has_access(s, proxied, Access::kLocalOnly), "proxied request even with API key is denied kLocalOnly");
+  }
+
+  // Access::kDashboardRead: allowed on direct loopback and direct LAN with trusted Host (even when remote_manage=false),
+  // but blocks untrusted Host (DNS rebinding), cross-site browser requests, and forwarded requests when keyless.
+  {
+    Server s{};
+    s.listener.lan = true;
+    s.listener.port = 8080;
+    s.listener.accepted_hosts = {"192.168.1.50", "workstation"};
+    s.lan_manage.saved.store(false);
+
+    auto loop_ok = make_req("127.0.0.1", "127.0.0.1", 8080, "127.0.0.1:8080");
+    check(has_access(s, loop_ok, Access::kDashboardRead), "direct loopback has kDashboardRead");
+
+    auto loop_rebind = make_req("127.0.0.1", "127.0.0.1", 8080, "evil.example:8080");
+    check(!has_access(s, loop_rebind, Access::kDashboardRead), "loopback DNS rebinding denied kDashboardRead");
+
+    auto lan_ok = make_req("192.168.1.99", "192.168.1.50", 8080, "192.168.1.50:8080");
+    check(has_access(s, lan_ok, Access::kDashboardRead),
+          "direct LAN with trusted Host has kDashboardRead even when remote_manage=false");
+    check(!has_access(s, lan_ok, Access::kManage),
+          "direct LAN with trusted Host still lacks kManage when remote_manage=false");
+
+    auto lan_rebind = make_req("192.168.1.99", "192.168.1.50", 8080, "evil.example:8080");
+    check(!has_access(s, lan_rebind, Access::kDashboardRead),
+          "direct LAN with untrusted Host denied kDashboardRead");
+
+    auto lan_xsite = make_req("192.168.1.99", "192.168.1.50", 8080, "192.168.1.50:8080");
+    lan_xsite.set_header("Sec-Fetch-Site", "cross-site");
+    check(!has_access(s, lan_xsite, Access::kDashboardRead),
+          "cross-site LAN request denied kDashboardRead");
+
+    auto lan_fwd = make_req("192.168.1.99", "192.168.1.50", 8080, "192.168.1.50:8080");
+    lan_fwd.set_header("X-Forwarded-For", "198.51.100.7");
+    check(!has_access(s, lan_fwd, Access::kDashboardRead),
+          "forwarded keyless LAN request denied kDashboardRead");
   }
 }
 
@@ -230,11 +267,15 @@ void test_remote_unc_and_device_paths() {
   // Windows mapped network drive (DRIVE_REMOTE) and reparse points pointing to UNC / remote drives (tested via probe).
   PathSafetyProbe probe;
   probe.is_remote_drive = [](char drive) { return drive == 'Z' || drive == 'z' || drive == 'Y' || drive == 'y'; };
-  probe.reparse_target = [](std::string_view p) -> std::optional<std::string> {
-    if (p == R"(C:\links\to_unc)" || p == "C:/links/to_unc") return R"(\\attacker\share)";
-    if (p == R"(C:\links\to_mapped)") return R"(Y:\models)";
-    if (p == R"(C:\links\to_local)") return R"(D:\local\models)";
-    return std::nullopt;
+  probe.reparse_info = [](std::string_view p) -> ReparseResult {
+    if (p == R"(C:\links\to_unc)" || p == "C:/links/to_unc") return {ReparseState::kTarget, R"(\\attacker\share)"};
+    if (p == R"(C:\links\to_mapped)") return {ReparseState::kTarget, R"(Y:\models)"};
+    if (p == R"(C:\links\to_local)") return {ReparseState::kTarget, R"(D:\local\models)"};
+    if (p == R"(D:\local\models\sub_unc)") return {ReparseState::kTarget, R"(\\evil\share)"};
+    if (p == R"(C:\links\sub\rel_to_unc)") return {ReparseState::kTarget, R"(..\to_unc)"};
+    if (p == R"(C:\links\sub\rel_to_local)") return {ReparseState::kTarget, R"(..\to_local)"};
+    if (p == R"(C:\links\unknown_rp)") return {ReparseState::kUnknownOrError, ""};
+    return {ReparseState::kNone, ""};
   };
   check(!remote_path_allowed(s, lan, R"(Y:\secret\a.gguf)", true, &probe),
         "remote LAN blocks unconfigured mapped network drive (DRIVE_REMOTE)");
@@ -250,6 +291,21 @@ void test_remote_unc_and_device_paths() {
         "remote LAN blocks local path traversing reparse point targeting mapped remote drive");
   check(remote_path_allowed(s, lan, R"(C:\links\to_local\a.gguf)", true, &probe),
         "remote LAN allows local reparse point targeting local drive");
+  check(!remote_path_allowed(s, lan, R"(C:\links\to_local\sub_unc\m.gguf)", true, &probe),
+        "remote LAN fails closed when remaining tail after local symlink traverses a nested UNC junction");
+  check(!remote_path_allowed(s, lan, R"(C:\links\sub\rel_to_unc\m.gguf)", true, &probe),
+        "remote LAN resolves relative reparse target against link parent and blocks UNC target");
+  check(remote_path_allowed(s, lan, R"(C:\links\sub\rel_to_local\m.gguf)", true, &probe),
+        "remote LAN resolves relative reparse target against link parent and allows local target");
+  check(!remote_path_allowed(s, lan, R"(C:\links\unknown_rp\m.gguf)", true, &probe),
+        "remote LAN fails closed on unknown or unreadable reparse point");
+
+  // Paths deeper than 64 components fail closed instead of silently trusting uninspected tail components.
+  std::string deep = R"(C:)";
+  for (int i = 0; i < 66; ++i) deep += R"(\d)";
+  deep += R"(\m.gguf)";
+  check(!remote_path_allowed(s, lan, deep, true, &probe),
+        "remote LAN fails closed on paths exceeding 64 components");
 
   // Regular local paths and Hub names are unaffected.
   for (const char* ok_path : {"", "org/model-GGUF:Q4_K_M", "/mnt/local/a.gguf", R"(C:\models\a.gguf)"}) {

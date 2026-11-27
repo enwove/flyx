@@ -109,17 +109,19 @@ ListenConfig make_listen_config(const std::string& bound_host, int port, std::st
 }
 
 void add_network_routes(httplib::Server& http, Server* s, bool host_from_cli) {
-  auto status = [s, host_from_cli](const ModelHost::NetworkSettingsSnapshot& snap) -> ojson {
+  auto status = [s, host_from_cli](bool lan_access) -> ojson {
     const bool api_key_set = !s->cfg.api_key.empty();
     const bool serving_lan = s->listener.lan;
-    const bool remote_manage = s->lan_manage.from_cli || (!api_key_set && snap.remote_manage);
-    const bool remote_manage_effective = serving_lan && !api_key_set && remote_manage;
-    return {{"lan_access", snap.lan_access},
+    // remote_manage and remote_manage_effective reflect the running process's live enforcement state, not an
+    // out-of-process serve.json edit that has not been loaded into s->lan_manage.
+    const bool remote_manage = s->lan_manage.requested(api_key_set);
+    const bool remote_manage_effective = s->lan_manage.effective(s->listener, api_key_set);
+    return {{"lan_access", lan_access},
             {"listen_host", s->listener.host},
             {"port", s->listener.port},
             {"host_from_cli", host_from_cli},
             {"serving_lan", serving_lan},
-            {"restart_required", !host_from_cli && serving_lan != snap.lan_access},
+            {"restart_required", !host_from_cli && serving_lan != lan_access},
             {"remote_manage", remote_manage},
             {"remote_manage_effective", remote_manage_effective},
             {"no_auth_from_cli", s->lan_manage.from_cli},
@@ -128,7 +130,7 @@ void add_network_routes(httplib::Server& http, Server* s, bool host_from_cli) {
   };
   http.Get("/v1/settings/network", [s, status](const httplib::Request& req, httplib::Response& res) {
     if (!require_access(*s, req, res, Access::kManage, "network settings")) return;
-    send_json(res, 200, status(ModelHost::read_network_settings()));
+    send_json(res, 200, status(ModelHost::read_network_settings().lan_access));
   });
   http.Post("/v1/settings/network", [s, status, host_from_cli](const httplib::Request& req, httplib::Response& res) {
     if (!require_access(*s, req, res, Access::kManage, "network settings")) return;
@@ -158,7 +160,7 @@ void add_network_routes(httplib::Server& http, Server* s, bool host_from_cli) {
             lan_opt, remote_opt,
             [s](bool enabled) { s->lan_manage.saved.store(enabled, std::memory_order_release); }, &snap, &err))
       return send_openai_error(res, 500, err, "server_error");
-    send_json(res, 200, status(snap));
+    send_json(res, 200, status(snap.lan_access));
   });
 }
 

@@ -311,30 +311,69 @@ bool gated_field(const nlohmann::json& o) {
   return it != o.end() && (it->is_string() || (it->is_boolean() && it->get<bool>()));
 }
 
-int parse_retry_after_sec(std::string_view raw) {
-  size_t s = 0;
-  while (s < raw.size() && (raw[s] == ' ' || raw[s] == '\t')) ++s;
-  size_t e = raw.size();
-  while (e > s && (raw[e - 1] == ' ' || raw[e - 1] == '\t' || raw[e - 1] == '\r' || raw[e - 1] == '\n')) --e;
-  if (s >= e) return 0;
-  int64_t val = 0;
-  const char* p = raw.data() + s;
-  const char* end = raw.data() + e;
-  for (const char* q = p; q < end; ++q) {
-    if (*q < '0' || *q > '9') return 0;
-    if (val > 86400) {
-      val = 86400;
-      break;
-    }
-    val = val * 10 + (*q - '0');
-  }
-  return val > 0 ? int(std::min<int64_t>(val, 86400)) : 0;
+bool is_digits(std::string_view s) {
+  if (s.empty()) return false;
+  for (char c : s)
+    if (c < '0' || c > '9') return false;
+  return true;
 }
 
-bool set_outcome(HubOutcome* outcome, HubError err, int retry_after_sec = 0) {
+bool valid_hms(std::string_view s) {
+  if (s.size() != 8 || s[2] != ':' || s[5] != ':') return false;
+  if (!is_digits(s.substr(0, 2)) || !is_digits(s.substr(3, 2)) || !is_digits(s.substr(6, 2))) return false;
+  const int hh = (s[0] - '0') * 10 + (s[1] - '0');
+  const int mm = (s[3] - '0') * 10 + (s[4] - '0');
+  const int ss = (s[6] - '0') * 10 + (s[7] - '0');
+  return hh <= 23 && mm <= 59 && ss <= 60;
+}
+
+bool valid_day3(std::string_view s) {
+  return s == "Mon" || s == "Tue" || s == "Wed" || s == "Thu" || s == "Fri" || s == "Sat" || s == "Sun";
+}
+
+bool valid_day_long(std::string_view s) {
+  return s == "Monday" || s == "Tuesday" || s == "Wednesday" || s == "Thursday" || s == "Friday" ||
+         s == "Saturday" || s == "Sunday";
+}
+
+bool valid_month(std::string_view s) {
+  return s == "Jan" || s == "Feb" || s == "Mar" || s == "Apr" || s == "May" || s == "Jun" ||
+         s == "Jul" || s == "Aug" || s == "Sep" || s == "Oct" || s == "Nov" || s == "Dec";
+}
+
+bool valid_http_date(std::string_view s) {
+  // IMF-fixdate: "Sun, 06 Nov 1994 08:49:37 GMT" (29 chars)
+  if (s.size() == 29 && valid_day3(s.substr(0, 3)) && s.substr(3, 2) == ", " && is_digits(s.substr(5, 2)) &&
+      s[7] == ' ' && valid_month(s.substr(8, 3)) && s[11] == ' ' && is_digits(s.substr(12, 4)) && s[16] == ' ' &&
+      valid_hms(s.substr(17, 8)) && s.substr(25, 4) == " GMT") {
+    const int d = (s[5] - '0') * 10 + (s[6] - '0');
+    return d >= 1 && d <= 31;
+  }
+  // Obsolete asctime-date: "Sun Nov  6 08:49:37 1994" (24 chars)
+  if (s.size() == 24 && valid_day3(s.substr(0, 3)) && s[3] == ' ' && valid_month(s.substr(4, 3)) && s[7] == ' ' &&
+      (s[8] == ' ' || (s[8] >= '0' && s[8] <= '9')) && (s[9] >= '0' && s[9] <= '9') && s[10] == ' ' &&
+      valid_hms(s.substr(11, 8)) && s[19] == ' ' && is_digits(s.substr(20, 4))) {
+    const int d = (s[8] == ' ' ? 0 : (s[8] - '0') * 10) + (s[9] - '0');
+    return d >= 1 && d <= 31;
+  }
+  // Obsolete rfc850-date: "Sunday, 06-Nov-94 08:49:37 GMT"
+  const size_t comma = s.find(", ");
+  if (comma != std::string_view::npos && valid_day_long(s.substr(0, comma))) {
+    const std::string_view rest = s.substr(comma + 2);
+    if (rest.size() == 22 && is_digits(rest.substr(0, 2)) && rest[2] == '-' && valid_month(rest.substr(3, 3)) &&
+        rest[6] == '-' && is_digits(rest.substr(7, 2)) && rest[9] == ' ' && valid_hms(rest.substr(10, 8)) &&
+        rest.substr(18, 4) == " GMT") {
+      const int d = (rest[0] - '0') * 10 + (rest[1] - '0');
+      return d >= 1 && d <= 31;
+    }
+  }
+  return false;
+}
+
+bool set_outcome(HubOutcome* outcome, HubError err, std::string retry_after = {}) {
   if (outcome) {
     outcome->error = err;
-    outcome->retry_after_sec = err == HubError::kRateLimited ? retry_after_sec : 0;
+    outcome->retry_after = err == HubError::kRateLimited ? std::move(retry_after) : std::string();
   }
   return false;
 }
@@ -347,6 +386,20 @@ HubError error_for_status(int status) {
 }
 
 }  // namespace
+
+std::string sanitize_retry_after(std::string_view raw) {
+  size_t s = 0;
+  while (s < raw.size() && (raw[s] == ' ' || raw[s] == '\t')) ++s;
+  size_t e = raw.size();
+  while (e > s && (raw[e - 1] == ' ' || raw[e - 1] == '\t' || raw[e - 1] == '\r' || raw[e - 1] == '\n')) --e;
+  if (s >= e) return "";
+  const std::string_view v = raw.substr(s, e - s);
+  for (unsigned char c : v)
+    if (c < 0x20 || c >= 0x7f) return "";
+  if (is_digits(v) && v.size() <= 20) return std::string(v);
+  if (valid_http_date(v)) return std::string(v);
+  return "";
+}
 
 std::string base_relation(const std::string& repo) {
   if (offline()) return "";
@@ -465,7 +518,7 @@ bool describe(const std::string& repo, const std::string& revision, Repo* out, s
   }
   *err = repo + ": " + (offline() ? std::string("not in the cache (") + cache_dir() + ") and HF_HUB_OFFLINE is set"
                                   : "cannot reach the Hub (" + net + ") and not in the cache (" + cache_dir() + ")");
-  if (last_status == 429) return set_outcome(outcome, HubError::kRateLimited, parse_retry_after_sec(retry_after));
+  if (last_status == 429) return set_outcome(outcome, HubError::kRateLimited, sanitize_retry_after(retry_after));
   return set_outcome(outcome, HubError::kUnreachable);
 }
 
@@ -541,7 +594,7 @@ bool search(const std::string& query, const std::string& sort, int limit, std::v
   }
   if (status != 200) {
     *err = "the Hub answered " + std::to_string(status);
-    return set_outcome(outcome, error_for_status(status), parse_retry_after_sec(retry_after));
+    return set_outcome(outcome, error_for_status(status), sanitize_retry_after(retry_after));
   }
   const auto j = nlohmann::json::parse(body, nullptr, false);
   if (!j.is_array()) {
@@ -663,7 +716,7 @@ bool adapters_of(const std::string& base, int limit, std::vector<Found>* out, st
   }
   if (status != 200) {
     *err = "the Hub answered " + std::to_string(status);
-    return set_outcome(outcome, error_for_status(status), parse_retry_after_sec(retry_after));
+    return set_outcome(outcome, error_for_status(status), sanitize_retry_after(retry_after));
   }
   const auto j = nlohmann::json::parse(body, nullptr, false);
   if (!j.is_array()) {

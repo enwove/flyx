@@ -852,12 +852,27 @@ void fetching(const fs::path& tmp) {
           "describe classifies 403 as kUnauthorized");
     out = {};
     check(!flyx::hub::describe("acme/throttled", "main", &out_repo, &err, &out) &&
-              out.error == flyx::hub::HubError::kRateLimited && out.retry_after_sec == 42,
-          "describe classifies 429 as kRateLimited and preserves Retry-After: " + std::to_string(out.retry_after_sec));
+              out.error == flyx::hub::HubError::kRateLimited && out.retry_after == "42",
+          "describe classifies 429 as kRateLimited and preserves Retry-After: " + out.retry_after);
     out = {};
     check(!flyx::hub::describe("acme/tiny-GGUF", "../../bad", &out_repo, &err, &out) &&
               out.error == flyx::hub::HubError::kInvalidName,
           "describe classifies invalid revision as kInvalidName");
+    // RFC 9110 Retry-After sanitizer: delay-seconds (0, >86400) and HTTP-date preserved; injection/garbage dropped.
+    check(flyx::hub::sanitize_retry_after("0") == "0", "sanitize_retry_after preserves 0");
+    check(flyx::hub::sanitize_retry_after("  172800 ") == "172800",
+          "sanitize_retry_after preserves delay-seconds > 86400 without truncation");
+    check(flyx::hub::sanitize_retry_after("Wed, 21 Oct 2015 07:28:00 GMT") == "Wed, 21 Oct 2015 07:28:00 GMT",
+          "sanitize_retry_after preserves IMF-fixdate");
+    check(flyx::hub::sanitize_retry_after("Sunday, 06-Nov-94 08:49:37 GMT") == "Sunday, 06-Nov-94 08:49:37 GMT",
+          "sanitize_retry_after preserves obsolete rfc850-date");
+    check(flyx::hub::sanitize_retry_after("Sun Nov  6 08:49:37 1994") == "Sun Nov  6 08:49:37 1994",
+          "sanitize_retry_after preserves asctime-date");
+    check(flyx::hub::sanitize_retry_after("-5").empty() &&
+              flyx::hub::sanitize_retry_after("42\r\nX-Evil: 1").empty() &&
+              flyx::hub::sanitize_retry_after("not-a-date").empty() &&
+              flyx::hub::sanitize_retry_after("999999999999999999999").empty(),
+          "sanitize_retry_after drops negative, CRLF-injected, malformed, and oversized values");
   }
 }
 

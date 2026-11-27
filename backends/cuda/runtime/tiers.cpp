@@ -90,6 +90,31 @@ const Vmm& vmm() {
       return;
     }
     v.gran = std::max(gd, gh);
+    // Probe one granularity of VMM end-to-end (reserve -> create -> map -> set_access -> release) so drivers
+    // that advertise VIRTUAL_MEMORY_MANAGEMENT_SUPPORTED yet return CUDA_ERROR_NOT_SUPPORTED on VMM calls
+    // report the fallback reserve floor before planning accepts a tighter memory budget.
+    CUdeviceptr probe_va = 0;
+    CUmemGenericAllocationHandle probe_h = 0;
+    bool probe_mapped = false;
+    CUresult pr = v.reserve(&probe_va, v.gran, v.gran, 0, 0);
+    if (pr == CUDA_SUCCESS) pr = v.create(&probe_h, v.gran, &dev, 0);
+    if (pr == CUDA_SUCCESS) {
+      pr = v.map(probe_va, v.gran, 0, probe_h, 0);
+      probe_mapped = (pr == CUDA_SUCCESS);
+    }
+    if (pr == CUDA_SUCCESS) {
+      CUmemAccessDesc access{};
+      access.location = {CU_MEM_LOCATION_TYPE_DEVICE, v.device};
+      access.flags = CU_MEM_ACCESS_FLAGS_PROT_READWRITE;
+      pr = v.set_access(probe_va, v.gran, &access, 1);
+    }
+    if (probe_mapped) v.unmap(probe_va, v.gran);
+    if (probe_va) v.address_free(probe_va, v.gran);
+    if (probe_h) v.release(probe_h);
+    if (pr == CUDA_ERROR_NOT_SUPPORTED) {
+      v.missing = "the driver does not support virtual memory management operations";
+      return;
+    }
   });
   return v;
 }

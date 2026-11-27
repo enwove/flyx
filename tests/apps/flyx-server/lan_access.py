@@ -100,9 +100,13 @@ def main(exe, asset, root):
     def keyed(origin):
         assert Client(origin, None).get(NETWORK)[0] == 403
         assert Client(origin, None).post(NETWORK, {"lan_access": True})[0] == 403
+        assert Client(origin, None).get_raw("/v1/telemetry")[0] == 401
+        assert Client(origin, None).get_raw("/v1/load")[0] == 401
         cl = Client(origin, "lan-test-key")
         assert cl.get(NETWORK)[1]["lan_access"] is False
         assert cl.get(NETWORK)[1]["api_key_set"] is True
+        assert cl.get_raw("/v1/telemetry", {"Host": "evil.example:9999", "X-Forwarded-For": "198.51.100.7"})[0] == 200
+        assert cl.get_raw("/v1/load", {"Host": "evil.example:9999", "X-Forwarded-For": "198.51.100.7"})[0] == 200
         assert cl.post(NETWORK, {"remote_manage": True})[0] == 409
         assert cl.post(NETWORK, {"lan_access": True})[1]["restart_required"] is True
 
@@ -135,34 +139,53 @@ def main(exe, asset, root):
         status, net = cl.get(NETWORK)
         assert status == 200 and net["remote_manage"] is True and net["serving_lan"] is True, net
         assert net["remote_manage_effective"] is True, net
-        # Forwarded headers remain denied even on 0.0.0.0 with remote_manage=true.
+        # Forwarded headers remain denied even on 0.0.0.0 with remote_manage=true (including dashboard read routes).
         for extra in (fwd, {"X-Forwarded-Custom": "1"}, {"CF-Connecting-IP": "198.51.100.1"}):
             assert cl.get_raw("/v1/logs", extra)[0] == 403, extra
             assert cl.get_raw("/v1/requests", extra)[0] == 403, extra
             assert cl.get_raw("/v1/hub/cached", extra)[0] == 403, extra
+            assert cl.get_raw("/v1/telemetry", extra)[0] == 403, extra
+            assert cl.get_raw("/v1/load", extra)[0] == 403, extra
         for url in net["api_urls"][:1]:
             lan_cl = Client(url, None)
             assert lan_cl.get_raw("/v1/logs")[0] == 200
             assert lan_cl.get_raw("/v1/requests")[0] == 200
             assert lan_cl.get_raw("/v1/hub/cached")[0] == 200
+            assert lan_cl.get_raw("/v1/telemetry")[0] == 200
+            assert lan_cl.get_raw("/v1/load")[0] == 200
             # Non-browser LAN inference clients behind Docker port mapping or custom DNS Host are NOT blocked!
             assert lan_cl.get_raw("/v1/models", {"Host": "docker.custom.host:19000"})[0] == 200
             # Keyless LAN clients may never mutate the Hub mirror endpoint.
             assert lan_cl.post("/v1/hub/config", {"endpoint": "https://hf-mirror.com"})[0] == 403
-            # DNS-rebinding Host header is rejected on management even with matching same-origin headers.
+            # DNS-rebinding Host header is rejected on management AND dashboard read routes even with same-origin headers.
             rebind_host = f"evil.example:{lan_cl.port}"
-            assert lan_cl.get_raw("/v1/logs", {
+            rebind_hdrs = {
                 "Host": rebind_host,
                 "Origin": f"http://{rebind_host}",
                 "Sec-Fetch-Site": "same-origin",
-            })[0] == 403
+            }
+            assert lan_cl.get_raw("/v1/logs", rebind_hdrs)[0] == 403
+            assert lan_cl.get_raw("/v1/telemetry", rebind_hdrs)[0] == 403
+            assert lan_cl.get_raw("/v1/load", rebind_hdrs)[0] == 403
             # On Windows, remote UNC/SMB path probing is rejected with 403 before touching the filesystem/network;
             # on POSIX, backslashes are ordinary path characters so the nonexistent path returns 404.
             expected_unc_status = 403 if os.name == "nt" else 404
             assert lan_cl.get_raw("/v1/hub/dir?path=%5C%5Cattacker%5Cshare")[0] == expected_unc_status
-            # Disabling remote_manage takes effect immediately on the LAN client.
+            # Disabling remote_manage takes effect immediately on the LAN client, while direct trusted-Host
+            # dashboard reads (/v1/telemetry, GET /v1/load) stay readable (and untrusted Host stays blocked).
             st_off, net_off = cl.post(NETWORK, {"remote_manage": False})
             assert st_off == 200 and net_off["remote_manage_effective"] is False, net_off
+            assert lan_cl.get_raw("/v1/logs")[0] == 403
+            assert lan_cl.get_raw("/v1/telemetry")[0] == 200
+            assert lan_cl.get_raw("/v1/load")[0] == 200
+            assert lan_cl.get_raw("/v1/telemetry", rebind_hdrs)[0] == 403
+            assert lan_cl.get_raw("/v1/load", rebind_hdrs)[0] == 403
+            # Editing serve.json out-of-process must NOT cause GET /v1/settings/network to lie about live enforcement.
+            disk_saved = json.loads(settings.read_bytes())
+            disk_saved["remote_manage"] = True
+            settings.write_text(json.dumps(disk_saved), encoding="utf-8")
+            live_net = cl.get(NETWORK)[1]
+            assert live_net["remote_manage"] is False and live_net["remote_manage_effective"] is False, live_net
             assert lan_cl.get_raw("/v1/logs")[0] == 403
             st_on, net_on = cl.post(NETWORK, {"remote_manage": True})
             assert st_on == 200 and net_on["remote_manage_effective"] is True, net_on

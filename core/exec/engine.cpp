@@ -11,7 +11,6 @@
 #include <thread>
 
 #include "core/exec/generation.h"
-#include "core/interfaces/memory_policy.h"
 #include "core/interfaces/options.h"
 #include "core/os/env.h"
 #include "core/os/log.h"
@@ -420,7 +419,7 @@ bool Engine::lower_and_time(std::string* err) {
       flyx_memory_info mi{};
       const bool has_others =
           api_->memory && api_->memory(bm_, &mi) == 0 && mi.total > 0 && plan::closable(plan::held_of(mi));
-      *err += ". " + interfaces::oom_fix_advice(has_others, model_->drafters() > 0);
+      *err += ". " + plan::oom_fix_advice(has_others, model_->drafters() > 0);
       return false;
     }
   }
@@ -473,6 +472,15 @@ bool Engine::plan_memory(plan::KvTiers* tiers, int session_limit, int* asked_ctx
   // The model file's pages the load read are cached, not used: on Windows they count as available only once the
   // process lets go of them, and the host memory K/V may take is measured next.
   os::release_working_set();
+  auto current_floor = [&]() -> uint64_t {
+    uint64_t f = device_.reserve_floor;
+    if (api_ && api_->memory && bm_) {
+      flyx_memory_info mi{};
+      if (api_->memory(bm_, &mi) == 0) f = std::max(f, mi.reserve_floor);
+    }
+    return f;
+  };
+  device_.reserve_floor = current_floor();
   tiers->gpu = opt_.kv_gpu;
   tiers->ram = opt_.kv_ram;
   tiers->copy_gpu = opt_.kv_copy_gpu;
@@ -486,23 +494,70 @@ bool Engine::plan_memory(plan::KvTiers* tiers, int session_limit, int* asked_ctx
   // Not even one session fits (in any layout account() takes, its K/V in host memory or its context shrunk
   // included): one step of what the backend keeps for speed, and the budget again.  Only when nothing is left to give
   // is it an error.
-  while (!plan::account(api_, bm_, model_->drafters() > 0, 2 * bf16 > all, &opt_.max_ctx, min_ctx, *tiers, &ledger_,
-                        &budget_, err, opt_.ctx_max)) {
-    const std::string why = *err;
-    if (!give_back()) {
-      *err = why;
-      if (given_back_) *err += " (" + gb(given_back_) + " the backend kept for speed already given back)";
-      return false;
+  for (;;) {
+    while (!plan::account(api_, bm_, model_->drafters() > 0, 2 * bf16 > all, &opt_.max_ctx, min_ctx, *tiers, &ledger_,
+                          &budget_, err, opt_.ctx_max)) {
+      const std::string why = *err;
+      if (!give_back()) {
+        *err = why;
+        if (given_back_) *err += " (" + gb(given_back_) + " the backend kept for speed already given back)";
+        return false;
+      }
+      if (!lower_and_time(err)) {
+        budget_.oom = plans_.oom;
+        return false;
+      }
+      const uint64_t f = current_floor();
+      if (f > tiers->min_vram_reserve) device_.reserve_floor = tiers->min_vram_reserve = f;
     }
-    if (!lower_and_time(err)) {
-      budget_.oom = plans_.oom;
-      return false;
-    }
+    if (session_limit > 1) plan::fit_second_session(api_, bm_, *tiers, ledger_, &budget_);
+    const uint64_t f = current_floor();
+    if (f <= tiers->min_vram_reserve) break;
+    // Backend's reserve floor grew lazily (e.g., CUDA VMM fell back to paged allocation); replan with the new floor.
+    device_.reserve_floor = tiers->min_vram_reserve = f;
   }
   if (given_back_)
     log::info("flyx: %s of GPU memory the backend kept only for speed given back so that a session fits (the same "
               "output, a little slower; -v says what)", gb(given_back_).c_str());
-  if (session_limit > 1) plan::fit_second_session(api_, bm_, *tiers, ledger_, &budget_);
+  planned_tiers_ = *tiers;
+  planned_session_limit_ = session_limit;
+  planned_reserve_floor_ = tiers->min_vram_reserve;
+  return true;
+}
+
+bool Engine::replan_for_floor_increase(std::string* err) {
+  std::lock_guard<std::mutex> lock(replan_mu_);
+  if (!api_ || !api_->memory || !bm_ || !model_) return false;
+  flyx_memory_info mi{};
+  if (api_->memory(bm_, &mi) != 0 || mi.reserve_floor <= planned_reserve_floor_) return false;
+  // Replanning updates engine-wide opt_.max_ctx and budget_; only safe while no sessions hold active leases.
+  const uint64_t fixed = budget_.weights.bytes() + budget_.workspace.bytes();
+  if (ledger_.used() > fixed || host_sessions_.load() > 0) return false;
+  device_.reserve_floor = std::max(device_.reserve_floor, mi.reserve_floor);
+  plan::KvTiers tiers = planned_tiers_;
+  tiers.min_vram_reserve = device_.reserve_floor;
+  double bf16 = 0, all = 0;
+  for (int i = 0; i < model_->desc().n_weights; ++i) {
+    const flyx_tensor_view* t = model_->desc().weights[i].t;
+    if (!t || t->ndim != 2) continue;
+    const double n = double(t->shape[0]) * double(t->shape[1]);
+    all += n;
+    if (t->dtype == FLYX_DT_BF16) bf16 += n;
+  }
+  const int min_ctx = opt_.ctx_max ? 1024 : opt_.ctx_given ? 0 : kMinFittedCtx;
+  int ctx = opt_.max_ctx;
+  std::string plan_err;
+  if (!plan::account(api_, bm_, model_->drafters() > 0, 2 * bf16 > all, &ctx, min_ctx, tiers, &ledger_, &budget_,
+                     &plan_err, opt_.ctx_max)) {
+    if (err) *err = plan_err;
+    return false;
+  }
+  opt_.max_ctx = ctx;
+  if (planned_session_limit_ > 1) plan::fit_second_session(api_, bm_, tiers, ledger_, &budget_);
+  planned_tiers_ = tiers;
+  planned_reserve_floor_ = tiers.min_vram_reserve;
+  log::info("flyx: backend reserve floor rose to %s; replanned context to %d tokens",
+            gb(planned_reserve_floor_).c_str(), opt_.max_ctx);
   return true;
 }
 

@@ -49,6 +49,12 @@ Refusal g_refusal = Refusal::none;
 // Refusal::size past this many rows of a prefill pass lowered since the open (0: the first open's sessions).
 int g_size_max_rows = 0, g_prefill_rows = 0;
 int g_align = 0;  // the backend's prefill alignment, if given
+bool g_custom_memory = false;
+uint64_t g_mem_weights = 0;
+uint64_t g_mem_workspace = 0;
+uint64_t g_seq_per_ctx_bytes = 0;
+uint64_t g_oom_raise_floor = 0;
+int g_seq_new_calls = 0;
 
 
 bool has_block(const flyx_model_desc* desc, int kind) {
@@ -176,6 +182,36 @@ int hook_size(flyx_bmodel* m, const flyx_seq_layout* layout, flyx_seq_size* out)
     return FLYX_ERR_OOM;
   }
   const int rc = g_backend->seq_size(m, layout, out);
+  if (rc) {
+    g_err = g_backend->last_error();
+  } else if (g_seq_per_ctx_bytes > 0) {
+    const int dev_pos = std::min(layout->max_ctx, layout->device_positions);
+    out->device = uint64_t(std::max(dev_pos, 0)) * g_seq_per_ctx_bytes + (64ull << 20);
+    out->host = uint64_t(std::max(layout->max_ctx - std::max(dev_pos, 0), 0)) * g_seq_per_ctx_bytes;
+  }
+  return rc;
+}
+
+int hook_memory(flyx_bmodel* m, flyx_memory_info* out) {
+  if (!g_custom_memory) return g_backend->memory(m, out);
+  *out = {};
+  out->total = g_total_vram;
+  out->free = g_free_vram;
+  out->weights = g_mem_weights;
+  out->workspace = g_mem_workspace;
+  out->reserve_floor = g_reserve_floor;
+  return 0;
+}
+
+int hook_seq_new_in(flyx_bmodel* m, const flyx_seq_layout* layout, flyx_seq** out) {
+  ++g_seq_new_calls;
+  if (g_oom_raise_floor > 0) {
+    g_reserve_floor = g_oom_raise_floor;
+    g_oom_raise_floor = 0;
+    g_err = "simulated late VMM fallback OOM";
+    return FLYX_ERR_OOM;
+  }
+  const int rc = g_backend->seq_new_in(m, layout, out);
   if (rc) g_err = g_backend->last_error();
   return rc;
 }
@@ -187,6 +223,12 @@ const char* hook_last_error() { return g_err.c_str(); }
 void reset_hooks() {
   g_err.clear();
   g_size_max_rows = g_prefill_rows = g_align = 0;
+  g_custom_memory = false;
+  g_mem_weights = 0;
+  g_mem_workspace = 0;
+  g_seq_per_ctx_bytes = 0;
+  g_oom_raise_floor = 0;
+  g_seq_new_calls = 0;
   g_total_vram = 0;
   g_free_vram = 0;
   g_reserve_floor = 0;
@@ -265,7 +307,9 @@ int main(int argc, char** argv) {
   delegated.device_stats = hook_device_stats;
   delegated.open = hook_open;
   delegated.lower = hook_lower;
+  delegated.memory = hook_memory;
   delegated.seq_size = hook_size;
+  delegated.seq_new_in = hook_seq_new_in;
   delegated.prefill_align = hook_align;
   delegated.last_error = hook_last_error;
   delegated.estimate_load = hook_estimate_load;
@@ -770,6 +814,36 @@ int main(int argc, char** argv) {
     check(e_step.load(model, eo_pf, &err), "high vram_reserve steps down in elastic pre-flight: " + err);
     check(g_open_calls == 1 && g_seen_dw.back() == FLYX_DRAFT_WEIGHTS_NVFP4 && !e_step.load_adjustments().empty(),
           "high vram_reserve triggers pre-flight auto -> nvfp4 step-down");
+  }
+
+  // 12. Late reserve_floor increase (e.g., backend VMM fallback on first session allocation): Session::init catches
+  // FLYX_ERR_OOM, triggers Engine::replan_for_floor_increase to adopt the raised floor and shrink context, and retries
+  // seq_new_in cleanly with identical greedy output.
+  {
+    reset_hooks();
+    g_custom_memory = true;
+    g_total_vram = 4ull << 30;
+    g_mem_weights = 2ull << 30;
+    g_mem_workspace = 0;
+    g_free_vram = 1536ull << 20;      // have = 3.5 GiB; with 256 MiB floor -> 1280 MiB session room
+    g_reserve_floor = 256ull << 20;
+    g_seq_per_ctx_bytes = 128ull << 10;  // 8192 ctx -> 1088 MiB (fits 1280), 4096 ctx -> 576 MiB (fits 768)
+    EngineOptions eo;
+    eo.backend = "test-host-kv";
+    eo.max_ctx = 8192;
+    eo.drafter = "none";
+    eo.kv_ram = 0;
+    eo.vram_reserve = 0;
+    Engine e;
+    check(e.load(model, eo, &err), "initial load with low reserve_floor succeeds: " + err);
+    check(e.options().max_ctx == 8192 && e.budget().device_reserve == (256ull << 20),
+          "initial plan keeps 8192 ctx at 256 MiB floor");
+    g_oom_raise_floor = 768ull << 20;
+    const std::vector<int32_t> out = tokens(e);
+    check(out == ref_tokens, "late reserve_floor replan succeeds and reproduces plain greedy tokens");
+    check(g_seq_new_calls == 2 && e.budget().device_reserve == (768ull << 20) && e.options().max_ctx < 8192,
+          "Session::init retried seq_new_in after replan_for_floor_increase raised reserve to 768 MiB and shrank ctx (" +
+              std::to_string(e.options().max_ctx) + ")");
   }
 
   return flyx::test::finish("elastic_load_test");

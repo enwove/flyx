@@ -28,10 +28,31 @@ bool Session::init(std::string* err) {
     lease_.release();
     return refused("not enough host memory for another session's K/V (--kv-ram)");
   }
-  if (e_->api()->seq_new_in(e_->bmodel(), &e_->kv_layout(), &seq_) != 0) {  // where its K/V go
+  if (const int rc = e_->api()->seq_new_in(e_->bmodel(), &e_->kv_layout(), &seq_); rc != 0) {  // where its K/V go
+    const std::string seq_err = e_->api()->last_error();
     e_->release_host_kv();
     lease_.release();
-    return refused(std::string("seq_new: ") + e_->api()->last_error());
+    if (rc == FLYX_ERR_OOM) {
+      std::string replan_err;
+      if (e_->replan_for_floor_increase(&replan_err)) {
+        lease_ = e_->ledger().reserve("session", std::to_string(next_id++), e_->session_bytes(), &why);
+        if (!lease_) return refused("not enough GPU memory for another session: " + why);
+        if (!e_->reserve_host_kv()) {
+          lease_.release();
+          return refused("not enough host memory for another session's K/V (--kv-ram)");
+        }
+        if (e_->api()->seq_new_in(e_->bmodel(), &e_->kv_layout(), &seq_) == 0) {
+          init_error_.clear();
+          return true;
+        }
+        const std::string retry_err = e_->api()->last_error();
+        e_->release_host_kv();
+        lease_.release();
+        return refused("seq_new: " + retry_err);
+      }
+      if (!replan_err.empty()) return refused(replan_err);
+    }
+    return refused("seq_new: " + seq_err);
   }
   init_error_.clear();
   return true;

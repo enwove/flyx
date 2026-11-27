@@ -64,8 +64,11 @@ enum class HubError {
 
 struct HubOutcome {
   HubError error = HubError::kNone;
-  int retry_after_sec = 0;  // parsed Retry-After delta-seconds when rate-limited (0 if absent/non-numeric)
+  std::string retry_after;  // validated RFC 9110 Retry-After value (delay-seconds or HTTP-date; empty if absent/invalid)
 };
+
+// Validates an RFC 9110 Retry-After header value (non-negative delay-seconds or HTTP-date); returns "" if invalid.
+std::string sanitize_retry_after(std::string_view raw);
 
 // A repository's files at a revision, from the Hub; from the cache when offline, or when the Hub cannot be reached
 // or no longer shows the repository and the cache has the revision.

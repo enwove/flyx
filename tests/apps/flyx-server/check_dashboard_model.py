@@ -124,11 +124,15 @@ def repository(repo_spec, helper_cached=False):
                 "info": {"downloads": 50, "likes": 2, "updated": "2026-11-24T02:15:52.000Z", "license": "mit",
                          "pipeline": None, "gated": False, "architecture": None, "context": None, "parameters": None}}
     runs = repo == REPO
-    quants = [("IQ3_XXS", 11.8, True), ("Q4_K_M", 17.6, True), ("Q5_K_M", 19.4, False), ("Q6_K", 22.3, False), ("BF16", 54.7, False)]
+    old_rev = runs and rev == "oldrev123"
+    quants = ([("Q2_K", 9.8, True), ("Q4_K_M", 17.6, True)] if old_rev
+              else [("IQ3_XXS", 11.8, True), ("Q4_K_M", 17.6, True), ("Q5_K_M", 19.4, False), ("Q6_K", 22.3, False), ("BF16", 54.7, False)])
+    drafters = ([{"repo": "acme/OldRev-DFlash2", "kind": "dflash2", "base": "acme/Tiny-27B", "exact": True,
+                  "relation": None, "tok_s": None}] if old_rev
+                else [{"repo": "acme/Tiny-27B-DFlash2", "kind": "dflash2", "base": "acme/Tiny-27B", "exact": False,
+                       "relation": "quantized", "tok_s": None}] if runs else [])
     return {"repo": repo, "revision": rev or "main", "from_cache": False, "drafter": None, "base_models": ["acme/Tiny-27B"], "runs": runs,
-            "known_drafters": [{"repo": "acme/Tiny-27B-DFlash2", "kind": "dflash2", "base": "acme/Tiny-27B", "exact": False,
-                                "relation": "quantized", "tok_s": None}]
-            if runs else [], "build_architectures": ["qwen35", "qwen3"],
+            "known_drafters": drafters, "build_architectures": ["qwen35", "qwen3"],
             "mtp": {"path": "MTP/mtp.gguf", "size": int(0.6 * GB), "cached": True} if runs else None,
             "mmproj": {"path": "mmproj-BF16.gguf", "size": int(0.9 * GB), "cached": True} if runs else None,
             "companions": [
@@ -616,22 +620,33 @@ def check_hub(page, server, want):
     expect(page.locator("#hf-prev")).to_be_disabled()
     expect(page.locator("#hf-page")).to_have_text("Page 1")
     expect(page.locator("#hf-next")).to_be_enabled()
-    # Pagination advances to Page 2 and returns to Page 1 cleanly.
+    # Select a quantization first, then verify pagination reconciles detail & clears stale #mf-load target.
+    expect(page.locator("#hf-name")).to_have_text("Tiny-27B-GGUF")
+    page.locator('#mf-files .mrow[data-name$=":Q5_K_M"]').click()
+    expect(page.locator("#mf-load")).to_be_enabled()
     page.locator("#hf-next").click()
     expect(page.locator("#hf-page")).to_have_text("Page 2")
     expect(page.locator("#hf-list .prow")).to_have_count(1)
     expect(page.locator('#hf-list .prow[data-repo="acme/Page2-Model-GGUF"]')).to_have_count(1)
+    expect(page.locator("#hf-name")).to_have_text("Page2-Model-GGUF")
+    expect(page.locator("#mf-load")).to_be_disabled()
     expect(page.locator("#hf-prev")).to_be_enabled()
     expect(page.locator("#hf-next")).to_be_disabled()
     page.locator("#hf-prev").click()
     expect(page.locator("#hf-page")).to_have_text("Page 1")
     expect(page.locator("#hf-list .prow")).to_have_count(3)
-    # Architecture filter pills narrow the list and reset back to All.
+    expect(page.locator("#hf-name")).to_have_text("Tiny-27B-GGUF")
+    # Architecture filter pills narrow the list, reconcile detail & clear stale #mf-load target, and reset back to All.
+    page.locator('#mf-files .mrow[data-name$=":Q5_K_M"]').click()
+    expect(page.locator("#mf-load")).to_be_enabled()
     page.locator('#hf-archs button[data-arch="inkling2_loop"]').click()
     expect(page.locator("#hf-list .prow")).to_have_count(1)
     expect(page.locator('#hf-list .prow[data-repo="acme/Inkling-2-Mini-GGUF"]')).to_have_count(1)
+    expect(page.locator("#hf-name")).to_have_text("Inkling-2-Mini-GGUF")
+    expect(page.locator("#mf-load")).to_be_disabled()
     page.locator('#hf-archs button[data-arch=""]').click()
     expect(page.locator("#hf-list .prow")).to_have_count(3)
+    page.locator('#hf-list .prow[data-repo="acme/Tiny-27B-GGUF"]').click()
     expect(page.locator("#hf-name")).to_have_text("Tiny-27B-GGUF")  # the first repository found is shown
     expect(page.locator("#hf-detail .dchips")).to_contain_text("+ Vision")
     expect(page.locator("#hf-detail .dchips")).to_contain_text("+ MTP")
@@ -1346,17 +1361,20 @@ def check_lora(open_page, want):
 
 
 def check_local_posix(open_page, want):
-    """POSIX Local tab: case-sensitive folders (/Models vs /models), root '/', and --models-dir == cacheDir merging."""
+    """POSIX Local tab: case-sensitive folders (/Models vs /models), literal backslashes, root '/', --models-dir == cacheDir merging, and revision-pinned Hub jumps."""
     posix_cache = "/home/user/.cache/huggingface/hub"
     posix_catalog = {
         "cache": posix_cache,
         "cache_from": "default",
         "win_paths": False,
-        "dirs": [posix_cache, "/Models", "/models", "/"],
+        "dirs": [posix_cache, "/Models", "/models", "/models\\", "/"],
         "models": [
             {"name": REPO + ":Q4_K_M", "kind": "gguf", "source": "hub", "repo": REPO, "quant": "Q4_K_M",
              "file": "Tiny-27B-Q4_K_M.gguf", "path": posix_cache + "/models--acme--Tiny-27B-GGUF/snapshots/abc/Tiny-27B-Q4_K_M.gguf",
              "size": int(17.6 * GB), "modified": 1.7e9, "revision": "abc", "current": True, "mtp": None, "mmproj": None},
+            {"name": REPO + ":Q4_K_M@oldrev123", "kind": "gguf", "source": "hub", "repo": REPO, "quant": "Q4_K_M",
+             "file": "Tiny-27B-Q4_K_M.gguf", "path": posix_cache + "/models--acme--Tiny-27B-GGUF/snapshots/oldrev123/Tiny-27B-Q4_K_M.gguf",
+             "size": int(17.6 * GB), "modified": 1.6e9, "revision": "oldrev123", "current": False, "mtp": None, "mmproj": None},
             {"name": posix_cache + "/loose.gguf", "kind": "gguf", "source": "dir", "repo": None, "quant": "Q8_0",
              "file": "loose.gguf", "path": posix_cache + "/loose.gguf", "root": posix_cache,
              "size": int(2.1 * GB), "modified": 1.7e9, "revision": None, "current": True, "mtp": None},
@@ -1366,6 +1384,9 @@ def check_local_posix(open_page, want):
             {"name": "/models/lower-7B.gguf", "kind": "gguf", "source": "dir", "repo": None, "quant": "Q4_K_M",
              "file": "lower-7B.gguf", "path": "/models/lower-7B.gguf", "root": "/models",
              "size": int(4.2 * GB), "modified": 1.7e9, "revision": None, "current": True, "mtp": None},
+            {"name": "/models\\/a\\b.gguf", "kind": "gguf", "source": "dir", "repo": None, "quant": "Q4_K_M",
+             "file": "a\\b.gguf", "path": "/models\\/a\\b.gguf", "root": "/models\\",
+             "size": int(4.3 * GB), "modified": 1.7e9, "revision": None, "current": True, "mtp": None},
             {"name": "/root-model.gguf", "kind": "gguf", "source": "dir", "repo": None, "quant": "Q4_K_M",
              "file": "root-model.gguf", "path": "/root-model.gguf", "root": "/",
              "size": int(3.0 * GB), "modified": 1.7e9, "revision": None, "current": True, "mtp": None},
@@ -1373,32 +1394,48 @@ def check_local_posix(open_page, want):
     }
     posix_folders = {
         posix_cache: {"path": posix_cache, "parent": "/home/user/.cache/huggingface", "kind": "dir", "dirs": [],
-                      "models": [posix_catalog["models"][1]]},
+                      "models": [posix_catalog["models"][2]]},
         "/Models": {"path": "/Models", "parent": "/", "kind": "dir", "dirs": [],
-                    "models": [posix_catalog["models"][2]]},
-        "/models": {"path": "/models", "parent": "/", "kind": "dir", "dirs": [],
                     "models": [posix_catalog["models"][3]]},
+        "/models": {"path": "/models", "parent": "/", "kind": "dir", "dirs": [],
+                    "models": [posix_catalog["models"][4]]},
+        "/models\\": {"path": "/models\\", "parent": "/", "kind": "dir", "dirs": [],
+                      "models": [posix_catalog["models"][5]]},
         "/": {"path": "/", "parent": None, "kind": "dir", "dirs": [],
-              "models": [posix_catalog["models"][4]]},
+              "models": [posix_catalog["models"][6]]},
     }
     served = dict(want, model="/models/lower-7B.gguf")
-    page, _ = open_page(telemetry(served), catalog=posix_catalog, folders=posix_folders)
+    page, srv = open_page(telemetry(served), catalog=posix_catalog, folders=posix_folders)
     view(page, "library")
     page.locator('#src-seg [data-src="local"]').click()
-    # All 4 POSIX folders stay distinct: cache (merged Hub + --models-dir), /Models, /models, and root '/'.
+    # All 5 POSIX folders stay distinct: cache, /Models, /models, /models\ (literal backslash), and root '/'.
     folders = page.locator("#lc-list .prow.folder")
-    expect(folders).to_have_count(4)
+    expect(folders).to_have_count(5)
     expect(page.locator('#lc-list .prow.folder[data-place="dir:' + posix_cache + '"]')).to_have_count(1)
     expect(page.locator('#lc-list .prow.folder[data-place="dir:/Models"]')).to_have_count(1)
-    expect(page.locator('#lc-list .prow.folder[data-place="dir:/models"]')).to_have_count(1)
+    expect(page.locator('#lc-list .prow.folder[data-place="dir:/models"] .pn')).to_contain_text("models")
+    bs_folder = page.locator(r'#lc-list .prow.folder[data-place="dir:/models\\"]')
+    expect(bs_folder).to_have_count(1)
+    expect(bs_folder.locator(".pn")).to_have_text("models\\")
     expect(page.locator('#lc-list .prow.folder[data-place="dir:/"]')).to_have_count(1)
-    # Every model is visible (both Hub cache entry and loose local file inside cacheDir, plus /Models, /models, and /).
-    expect(page.locator("#lc-list .prow.model")).to_have_count(5)
+    # Every model is visible, including /models\/a\b.gguf and both Hub cache revisions.
+    expect(page.locator("#lc-list .prow.model")).to_have_count(7)
     expect(page.locator('#lc-list .prow.model[data-model="' + REPO + ':Q4_K_M"]')).to_have_count(1)
+    expect(page.locator('#lc-list .prow.model[data-model="' + REPO + ':Q4_K_M@oldrev123"]')).to_have_count(1)
     expect(page.locator('#lc-list .prow.model[data-model="' + posix_cache + '/loose.gguf"]')).to_have_count(1)
     expect(page.locator('#lc-list .prow.model[data-model="/Models/Upper-7B.gguf"]')).to_have_count(1)
     expect(page.locator('#lc-list .prow.model[data-model="/models/lower-7B.gguf"]')).to_have_count(1)
+    bs_model = page.locator(r'#lc-list .prow.model[data-model="/models\\/a\\b.gguf"]')
+    expect(bs_model).to_have_count(1)
+    expect(bs_model.locator(".pn-t")).to_have_text("a\\b.gguf")
     expect(page.locator('#lc-list .prow.model[data-model="/root-model.gguf"]')).to_have_count(1)
+    # Clicking /models\ folder and pressing #mf-up navigates to '/' without stripping the literal backslash.
+    bs_folder.click()
+    expect(page.locator("#mf-path")).to_have_value("/models\\")
+    expect(page.locator("#mf-cached")).to_contain_text("a\\b.gguf")
+    page.locator("#mf-up").click()
+    expect(page.locator("#mf-path")).to_have_value("/")
+    expect(page.locator("#mf-cached")).to_contain_text("root-model.gguf")
     # Clicking the root-level model shows folder '/' cleanly without mangling it to empty string.
     page.locator('#lc-list .prow.model[data-model="/root-model.gguf"]').click()
     expect(page.locator("#lc-path")).to_contain_text("/root-model.gguf")
@@ -1406,6 +1443,21 @@ def check_local_posix(open_page, want):
     page.locator('#lc-list .prow.folder[data-place="dir:' + posix_cache + '"]').click()
     expect(page.locator("#mf-cached")).to_contain_text("Tiny-27B-GGUF")
     expect(page.locator("#mf-cached")).to_contain_text("loose.gguf")
+    # Clicking "All its quantizations" on an older cached revision preserves @oldrev123 and uses its distinct
+    # quantizations and verified drafters instead of main's.
+    page.locator('#lc-list .prow.model[data-model="' + REPO + ':Q4_K_M@oldrev123"]').click()
+    page.locator("#lc-quants").click()
+    expect(page.locator('#src-seg [data-src="hub"]')).to_have_attribute("aria-selected", "true")
+    expect(page.locator('#mf-files .mrow[data-name="' + REPO + ':Q2_K@oldrev123"]')).to_have_count(1)
+    expect(page.locator("#hf-drafters")).to_contain_text("acme/OldRev-DFlash2")
+    expect(page.locator("#hf-drafters")).not_to_contain_text("acme/Tiny-27B-DFlash2")
+    assert srv.files_asked[-1] == REPO + "@oldrev123", srv.files_asked
+    # Selecting the pinned-revision quantization populates verifiedOf keyed by repo@revision in Settings -> Speculation.
+    page.locator('#mf-files .mrow[data-name="' + REPO + ':Q2_K@oldrev123"]').click()
+    view(page, "current")
+    page.locator('#lset-tabs [data-stab="spec"]').click()
+    page.locator("#sd-made").click()
+    expect(page.locator('[data-verified="acme/OldRev-DFlash2"]')).to_have_count(1)
     page.close()
 
 

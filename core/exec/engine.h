@@ -268,6 +268,9 @@ class Engine {
   // Charge a session's host K/V before the backend starts allocating it.
   bool reserve_host_kv();
   void release_host_kv() { if (budget_.session_host_bytes) --host_sessions_; }
+  // Replan memory budget if the backend's reserve_floor increased lazily (e.g., late CUDA VMM fallback)
+  // while no sessions are active. Returns true if replanned successfully.
+  bool replan_for_floor_increase(std::string* err);
   std::string memory_report() const;
 
  private:
@@ -312,9 +315,13 @@ class Engine {
   std::vector<int32_t> eos_;
   Grammar grammar_;
   std::mutex grammar_mu_;
+  std::mutex replan_mu_;
   mutable vision::VisionCache vision_cache_;
   ResourceLedger ledger_;
   plan::Budget budget_;                     // leases from ledger_
+  plan::KvTiers planned_tiers_{};
+  int planned_session_limit_ = 1;
+  uint64_t planned_reserve_floor_ = 0;
   int wanted_ctx_ = 0;                      // the context before the budget fitted it
   std::atomic<uint64_t> host_sessions_{0};  // includes allocations in progress
 };

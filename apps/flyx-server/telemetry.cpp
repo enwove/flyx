@@ -224,6 +224,7 @@ ojson snapshot_json(const Server& s, int recent) {
 void add_telemetry_routes(httplib::Server& http, Server* s) {
   http.Get("/v1/telemetry", [s](const httplib::Request& q, httplib::Response& r) {
     if (!require_auth(*s, q, r)) return;
+    if (!require_access(*s, q, r, Access::kDashboardRead, "reading server telemetry")) return;
     const int recent = query_int(q, "recent", 20, 0, 100);
     r.set_header("Cache-Control", "no-store");
     send_json(r, 200, snapshot_json(*s, recent));

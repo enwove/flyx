@@ -107,6 +107,8 @@ std::string held_note(const GpuHeld& h);
 // Whether closing other programs is worth naming: they hold a quarter of a gigabyte or more, a gigabyte where the
 // process's own runtime (a few hundred megabytes) cannot be told from them.
 bool closable(const GpuHeld& h);
+// Actionable suffix appended to VRAM OOM diagnostics.
+std::string oom_fix_advice(bool has_others, bool has_drafter);
 // Why the context is no longer (b.ctx_limit) and what would give more, for the load's log; "" when nothing cut it.
 std::string ctx_limit_note(const Budget& b);
 

@@ -5,6 +5,7 @@
 #include <cctype>
 #include <chrono>
 #include <cstdio>
+#include <deque>
 #include <filesystem>
 #include <fstream>
 #include <iterator>
@@ -213,15 +214,20 @@ std::vector<std::string> models_dirs_from_env() {
 
 std::string expand_user_path(const std::string& path) {
   if (path.empty() || path[0] != '~') return path;
-  if (path.size() > 1 && path[1] != '/' && path[1] != '\\') return path;
+#if defined(_WIN32)
+  auto is_sep = [](char c) { return c == '/' || c == '\\'; };
+#else
+  auto is_sep = [](char c) { return c == '/'; };
+#endif
+  if (path.size() > 1 && !is_sep(path[1])) return path;
   const std::string home = os::home_dir();
   if (home.empty()) return path;
   size_t pos = 1;
-  while (pos < path.size() && (path[pos] == '/' || path[pos] == '\\')) ++pos;
+  while (pos < path.size() && is_sep(path[pos])) ++pos;
   if (pos >= path.size()) return home;
   const fs::path suffix = to_path(path.substr(pos));
   if (suffix.is_absolute() || suffix.has_root_name()) return path;
-  return from_path((to_path(home) / suffix).lexically_normal());
+  return from_path(to_path(home) / suffix);
 }
 
 std::string canonical_model_dir(std::string_view raw) {
@@ -230,17 +236,59 @@ std::string canonical_model_dir(std::string_view raw) {
   std::error_code ec;
   fs::path p = fs::absolute(to_path(expanded), ec);
   if (ec) p = to_path(expanded);
-  p = p.lexically_normal();
   std::string s = from_path(p);
-  while (s.size() > 1 && (s.back() == '/' || s.back() == '\\')) {
+#if defined(_WIN32)
+  std::replace(s.begin(), s.end(), '/', '\\');
+  while (s.size() > 1 && s.back() == '\\') {
     if (s.size() == 3 && s[1] == ':') break;
+    if (s.size() == 2 && s[0] == '\\') break;
     s.pop_back();
   }
+#else
+  // On POSIX, '\' is a legal filename character and ".." must not be lexically collapsed across symlinks.
+  std::string norm;
+  norm.reserve(s.size());
+  for (char c : s) {
+    if (c == '/' && !norm.empty() && norm.back() == '/') continue;
+    norm.push_back(c);
+  }
+  while (norm.size() > 1 && norm.back() == '/') norm.pop_back();
+  s = std::move(norm);
+#endif
   return s;
 }
 
-std::vector<LocalModel> scan_model_dirs(const std::vector<std::string>& dirs, int deepest) {
+std::vector<LocalModel> scan_model_dirs(const std::vector<std::string>& dirs, int deepest,
+                                        const PathAllowFn& allow_path, const ScanFs* fs_ops) {
   constexpr int kMostEntries = 200000;     // a directory named by mistake (a whole disk) ends the scan early
+  auto do_is_dir = [&](const fs::path& p, std::error_code& ec) {
+    return fs_ops && fs_ops->is_directory ? fs_ops->is_directory(p, ec) : fs::is_directory(p, ec);
+  };
+  auto do_is_file = [&](const fs::path& p, std::error_code& ec) {
+    return fs_ops && fs_ops->is_regular_file ? fs_ops->is_regular_file(p, ec) : fs::is_regular_file(p, ec);
+  };
+  auto do_file_size = [&](const fs::path& p, std::error_code& ec) -> uint64_t {
+    return fs_ops && fs_ops->file_size ? fs_ops->file_size(p, ec) : uint64_t(fs::file_size(p, ec));
+  };
+  auto do_mtime = [&](const fs::path& p, std::error_code& ec) {
+    return fs_ops && fs_ops->last_write_time ? fs_ops->last_write_time(p, ec) : fs::last_write_time(p, ec);
+  };
+  auto do_canon = [&](const fs::path& p, std::error_code& ec) {
+    return fs_ops && fs_ops->weakly_canonical ? fs_ops->weakly_canonical(p, ec) : fs::weakly_canonical(p, ec);
+  };
+  auto do_list_dir = [&](const fs::path& p, std::error_code& ec) -> std::vector<fs::path> {
+    if (fs_ops && fs_ops->list_dir) return fs_ops->list_dir(p, ec);
+    std::vector<fs::path> children;
+    for (fs::directory_iterator it(p, fs::directory_options::skip_permission_denied, ec), end;
+         !ec && it != end; it.increment(ec)) {
+      children.push_back(it->path());
+    }
+    return children;
+  };
+  auto do_classify = [&](const std::string& p, const std::string& rel, uint64_t sz, fs::file_time_type mt) {
+    return fs_ops && fs_ops->classify_gguf ? fs_ops->classify_gguf(p, rel, sz, mt) : classify_gguf(p, rel, sz, mt);
+  };
+
   std::vector<LocalModel> out;
   std::set<fs::path> seen;  // a file reached from two of the directories (one inside the other) once
   struct LocalShard {
@@ -253,94 +301,105 @@ std::vector<LocalModel> scan_model_dirs(const std::vector<std::string>& dirs, in
     std::map<int, LocalShard> parts;
   };
   std::map<std::pair<std::string, int>, SplitAcc> splits;
-  const auto opts = fs::directory_options::skip_permission_denied | fs::directory_options::follow_directory_symlink;
   for (const std::string& dir : dirs) {
-    const std::string root_str = canonical_model_dir(dir);
+    const std::string root_str = fs_ops ? dir : canonical_model_dir(dir);
     if (root_str.empty()) continue;
+    if (allow_path && !allow_path(root_str)) continue;
     std::error_code ec;
     const fs::path root = to_path(root_str);
-    if (!fs::is_directory(root, ec)) continue;
+    if (!do_is_dir(root, ec)) continue;
     std::map<fs::path, int> visited_depth;
-    const fs::path root_canon = fs::weakly_canonical(root, ec);
+    const fs::path root_canon = do_canon(root, ec);
     if (!ec) visited_depth[root_canon] = -1;
     ec.clear();
     int entries = 0;
-    for (fs::recursive_directory_iterator it(root, opts, ec), end;
-         !ec && it != end && ++entries < kMostEntries; it.increment(ec)) {
-      const std::string name = from_path(it->path().filename());
-      std::error_code e2;
-      if (it->is_directory(e2)) {
-        if (e2 || name.empty() || name[0] == '.' || name[0] == '$' ||
-            name == "node_modules" || name == "System Volume Information" || it.depth() + 1 >= deepest) {
-          it.disable_recursion_pending();
+    // Breadth-first non-recursive walk so every entry is authorized via allow_path BEFORE any target-following
+    // stat, canonicalization, open, or descent, and shallower paths are visited before deeper symlink aliases.
+    std::deque<std::pair<fs::path, int>> queue;
+    queue.emplace_back(root, 0);
+    while (!queue.empty() && entries < kMostEntries) {
+      auto [cur_dir, cur_depth] = std::move(queue.front());
+      queue.pop_front();
+      std::error_code list_ec;
+      const std::vector<fs::path> children = do_list_dir(cur_dir, list_ec);
+      if (list_ec) continue;
+      for (const fs::path& child : children) {
+        if (++entries >= kMostEntries) break;
+        const std::string child_str = from_path(child);
+        if (allow_path && !allow_path(child_str)) continue;
+        const std::string name = from_path(child.filename());
+        std::error_code e2;
+        if (do_is_dir(child, e2)) {
+          if (e2 || name.empty() || name[0] == '.' || name[0] == '$' ||
+              name == "node_modules" || name == "System Volume Information" || cur_depth + 1 >= deepest) {
+            continue;
+          }
+          const fs::path dcanon = do_canon(child, e2);
+          if (e2) continue;
+          auto [vit, inserted] = visited_depth.emplace(dcanon, cur_depth);
+          if (!inserted && vit->second <= cur_depth) continue;
+          vit->second = cur_depth;
+          queue.emplace_back(child, cur_depth + 1);
           continue;
         }
-        const fs::path dcanon = fs::weakly_canonical(it->path(), e2);
-        if (e2) {
-          it.disable_recursion_pending();
+        const std::string low = lower(name);
+        const bool gguf = low.ends_with(".gguf"), flyx = low.ends_with(".flyx");
+        if (name == "adapter_config.json") {  // a LoRA adapter as PEFT saves it: listed by its folder
+          const fs::path adir = child.parent_path(), weights = adir / "adapter_model.safetensors";
+          if (allow_path && !allow_path(from_path(weights))) continue;
+          const fs::path canon = do_canon(adir, e2);
+          if (e2 || !do_is_file(weights, e2) || !seen.insert(canon).second) continue;
+          LocalModel m;
+          m.path = from_path(adir);
+          m.root = root_str;
+          m.file = from_path(adir.filename());
+          m.kind = "lora";
+          m.size = do_file_size(weights, e2);
+          if (e2) continue;
+          std::error_code e3;
+          const auto mt = do_mtime(weights, e3);
+          m.modified = e3 ? fs::file_time_type::min() : mt;
+          out.push_back(std::move(m));
           continue;
         }
-        auto [vit, inserted] = visited_depth.emplace(dcanon, it.depth());
-        if (!inserted && vit->second <= it.depth())
-          it.disable_recursion_pending();
-        else
-          vit->second = it.depth();
-        continue;
-      }
-      const std::string low = lower(name);
-      const bool gguf = low.ends_with(".gguf"), flyx = low.ends_with(".flyx");
-      if (name == "adapter_config.json") {  // a LoRA adapter as PEFT saves it: listed by its folder
-        const fs::path dir = it->path().parent_path(), weights = dir / "adapter_model.safetensors";
-        const fs::path canon = fs::weakly_canonical(dir, e2);
-        if (e2 || !fs::is_regular_file(weights, e2) || !seen.insert(canon).second) continue;
-        LocalModel m;
-        m.path = from_path(dir);
-        m.root = root_str;
-        m.file = from_path(dir.filename());
-        m.kind = "lora";
-        m.size = uint64_t(fs::file_size(weights, e2));
+        if (!gguf && !flyx) continue;
+        std::string rel = from_path(child.lexically_relative(root));
+#if defined(_WIN32)
+        std::replace(rel.begin(), rel.end(), '\\', '/');
+#endif
+        if (gguf && low.find("imatrix") != std::string::npos) continue;
+        const fs::path canon = do_canon(child, e2);
+        if (e2 || !do_is_file(child, e2) || e2 || !seen.insert(canon).second) continue;
+        const uint64_t sz = do_file_size(child, e2);
         if (e2) continue;
         std::error_code e3;
-        const auto mt = fs::last_write_time(weights, e3);
-        m.modified = e3 ? fs::file_time_type::min() : mt;
+        const auto mt = do_mtime(child, e3);
+        const fs::file_time_type modified = e3 ? fs::file_time_type::min() : mt;
+        hub::SplitGguf sp;
+        if (gguf && hub::parse_split_gguf_name(child_str, &sp)) {
+          auto& acc = splits[{sp.prefix, sp.count}];
+          acc.count = sp.count;
+          acc.parts[sp.part] = {child_str, root_str, name, rel, sz, modified};
+          continue;
+        }
+        LocalModel m;
+        m.path = child_str;
+        m.root = root_str;
+        m.file = name;
+        if (gguf) {
+          const GgufClassification cls = do_classify(m.path, rel, sz, modified);
+          if (cls.kind.empty()) continue;
+          m.kind = cls.kind;
+          m.drafter_kind = cls.drafter_kind;
+          m.mtp_layers = cls.mtp_layers;
+        } else {
+          m.kind = "flyx";
+        }
+        m.quant = hub::quant_in_name(name);
+        m.size = sz;
+        m.modified = modified;
         out.push_back(std::move(m));
-        continue;
       }
-      if (!gguf && !flyx) continue;
-      std::string rel = from_path(it->path().lexically_relative(root));
-      std::replace(rel.begin(), rel.end(), '\\', '/');
-      if (gguf && low.find("imatrix") != std::string::npos) continue;
-      const fs::path canon = fs::weakly_canonical(it->path(), e2);
-      if (e2 || !it->is_regular_file(e2) || e2 || !seen.insert(canon).second) continue;
-      const auto sz = it->file_size(e2);
-      if (e2) continue;
-      std::error_code e3;
-      const auto mt = it->last_write_time(e3);
-      const fs::file_time_type modified = e3 ? fs::file_time_type::min() : mt;
-      hub::SplitGguf sp;
-      if (gguf && hub::parse_split_gguf_name(from_path(it->path()), &sp)) {
-        auto& acc = splits[{sp.prefix, sp.count}];
-        acc.count = sp.count;
-        acc.parts[sp.part] = {from_path(it->path()), root_str, name, rel, uint64_t(sz), modified};
-        continue;
-      }
-      LocalModel m;
-      m.path = from_path(it->path());
-      m.root = root_str;
-      m.file = name;
-      if (gguf) {
-        const GgufClassification cls = classify_gguf(m.path, rel, uint64_t(sz), modified);
-        if (cls.kind.empty()) continue;
-        m.kind = cls.kind;
-        m.drafter_kind = cls.drafter_kind;
-        m.mtp_layers = cls.mtp_layers;
-      } else {
-        m.kind = "flyx";
-      }
-      m.quant = hub::quant_in_name(name);
-      m.size = uint64_t(sz);
-      m.modified = modified;
-      out.push_back(std::move(m));
     }
   }
   for (const auto& [_, acc] : splits) {
@@ -359,7 +418,7 @@ std::vector<LocalModel> scan_model_dirs(const std::vector<std::string>& dirs, in
     }
     if (!complete) continue;
     const LocalShard& first = acc.parts.begin()->second;
-    const GgufClassification cls = classify_gguf(first.path, first.rel, first.size, first.modified);
+    const GgufClassification cls = do_classify(first.path, first.rel, first.size, first.modified);
     if (cls.kind.empty()) continue;
     LocalModel m;
     m.path = first.path;

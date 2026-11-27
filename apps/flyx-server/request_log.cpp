@@ -1,6 +1,6 @@
 // Copyright 2026 The flyx Authors. SPDX-License-Identifier: Apache-2.0
-// The request log and GET /v1/requests?limit=N (default and at most 50, newest first): for this
-// machine, or with --api-key for the key's holder (may_manage), as the model panel: it shows other people's prompts.
+// The request log and GET /v1/requests?limit=N (default and at most 50, newest first): gated by Access::kManage,
+// as the model panel: it shows other people's prompts.
 #include "apps/flyx-server/request_log.h"
 
 #include <algorithm>

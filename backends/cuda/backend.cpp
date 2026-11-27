@@ -778,7 +778,8 @@ int open_model(const flyx_model_desc* desc, const flyx_open_options* opts, flyx_
     const bool runtime_known = process > 0 && process >= m->bytes;
     const size_t own = runtime_known ? process : m->bytes;
     const size_t others = mem_ok && total > free && total - free > own ? total - free - own : 0;
-    const bool has_others = interfaces::closable_others(others, runtime_known);
+    const bool has_others =
+        others >= (runtime_known ? interfaces::kClosableOthersKnownBytes : interfaces::kClosableOthersUnknownBytes);
     // From the description: a drafter's layers may come before its block, and run out of memory before it is bound.
     bool drafter = false;
     for (int i = 0; i < desc->n_blocks; ++i)
@@ -791,7 +792,13 @@ int open_model(const flyx_model_desc* desc, const flyx_open_options* opts, flyx_
                     others / 1e9, total / 1e9);
     else if (mem_ok)
       std::snprintf(head, sizeof(head), "Not enough VRAM while loading weights (%.2f GB GPU).", total / 1e9);
-    return fail_oom(std::string(head) + " " + interfaces::oom_fix_advice(has_others, drafter));
+    const std::string advice =
+        has_others
+            ? std::string("Close other apps") + (drafter ? ", disable speculative decoding" : "") +
+                  ", or use a smaller quantization."
+            : (drafter ? "Disable speculative decoding or use a smaller quantization."
+                       : "Use a smaller quantization.");
+    return fail_oom(std::string(head) + " " + advice);
   } catch (const std::exception& e) {
     return fail(std::string("uploading weights: ") + e.what());
   }

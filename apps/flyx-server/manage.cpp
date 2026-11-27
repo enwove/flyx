@@ -47,7 +47,8 @@
 //                         only: 403 from another, 409 with no model served or a dialog open, 501 where no window can
 //                         be opened (not Windows, SSH, a service)
 //
-// All but GET /v1/load change the machine's state or reach the Hub for it: may_manage().
+// GET /v1/load is gated by Access::kDashboardRead; all other routes change machine state or reach the Hub
+// and require Access::kManage (or Access::kLocalOnly for desktop dialogs / shell launch / closing apps).
 #include <algorithm>
 #include <atomic>
 #include <filesystem>
@@ -103,7 +104,7 @@ void hub_error(httplib::Response& res, const hub::HubOutcome& out, const std::st
     case hub::HubError::kNotFound: return error(res, 404, err, "not_found");
     case hub::HubError::kUnauthorized: return error(res, 403, err, "permission_error");
     case hub::HubError::kRateLimited:
-      if (out.retry_after_sec > 0) res.set_header("Retry-After", std::to_string(out.retry_after_sec));
+      if (!out.retry_after.empty()) res.set_header("Retry-After", out.retry_after);
       return error(res, 429, err, "rate_limit_error");
     case hub::HubError::kUnreachable:
     case hub::HubError::kBadAnswer:
@@ -143,7 +144,7 @@ Listed dir_entry(const apps::LocalModel& m) {
 
 // What GET /v1/hub/cached lists: the cache's snapshots, refs/main's first, a file under one path once (refs/main's
 // copy, else the newest snapshot's); then the model directories' files.
-std::vector<Listed> listing(const Server& s) {
+std::vector<Listed> listing(const Server& s, const httplib::Request* req = nullptr) {
   const std::vector<hub::Cached> snapshots = hub::cached();
   std::set<std::string> repos_with_mtp;  // the repository's MTP layer is in the cache, in any snapshot
   std::set<std::pair<std::string, std::string>> snaps_with_mmproj;  // (repo, commit) holding a vision projector
@@ -234,7 +235,9 @@ std::vector<Listed> listing(const Server& s) {
     if (l.vision && snaps_with_mmproj.count({l.repo, l.commit})) l.json["mmproj"] = "in-repo";
     if (snaps_with_dflash2.count({l.repo, l.commit})) l.json["dflash2"] = "in-repo";
   }
-  for (const apps::LocalModel& m : apps::scan_model_dirs(s.models_dirs)) out.push_back(dir_entry(m));
+  apps::PathAllowFn allow;
+  if (req) allow = [&](std::string_view p) { return remote_path_allowed(s, *req, p); };
+  for (const apps::LocalModel& m : apps::scan_model_dirs(s.models_dirs, 6, allow)) out.push_back(dir_entry(m));
   return out;
 }
 
@@ -243,13 +246,12 @@ bool dir_json(const Server& s, const httplib::Request& req, const std::string& a
   constexpr int kLevels = 3;          // a model is listed from its folder, or from one or two folders above it
   constexpr size_t kMostFolders = 2000;
   ojson dirs = ojson::array(), models = ojson::array();
-  const bool local = from_this_machine(req);
+  const apps::PathAllowFn allow = [&](std::string_view path) { return remote_path_allowed(s, req, path); };
   std::error_code ec;
   if (asked.empty()) {
     std::set<fs::path> seen;
     auto start = [&](const std::string& dir) {
-      if (dir.empty()) return;
-      if (!local && !remote_path_allowed(s, req, dir)) return;
+      if (dir.empty() || !allow(dir)) return;
       std::error_code e2;
       const fs::path p = fs::weakly_canonical(to_path(apps::expand_user_path(dir)), e2);
       if (!e2 && fs::is_directory(p, e2) && seen.insert(p).second)
@@ -270,7 +272,8 @@ bool dir_json(const Server& s, const httplib::Request& req, const std::string& a
   const fs::path base = is_dir ? p : p.parent_path();
   if (!is_dir) {
     // The file alone: the scan of its folder knows whether it is a model's (and a split model's parts as one).
-    for (const apps::LocalModel& m : apps::scan_model_dirs({from_path(base)}, 1)) {
+    // Pre-authorize every sibling before inspection so remote callers cannot trigger SMB lookups via sibling links.
+    for (const apps::LocalModel& m : apps::scan_model_dirs({from_path(base)}, 1, allow)) {
       std::error_code e2;
       if (fs::equivalent(to_path(m.path), p, e2)) models.push_back(dir_entry(m).json);
     }
@@ -284,7 +287,7 @@ bool dir_json(const Server& s, const httplib::Request& req, const std::string& a
     const std::string name = from_path(it->path().filename());
     if (name.empty() || name[0] == '.' || name[0] == '$') continue;
     const std::string child = from_path(it->path());
-    if (!local && !remote_path_allowed(s, req, child)) continue;
+    if (!allow(child)) continue;
     std::error_code e2;
     if (!it->is_directory(e2)) continue;
     subs.push_back(it->path());
@@ -292,10 +295,8 @@ bool dir_json(const Server& s, const httplib::Request& req, const std::string& a
   }
   std::sort(subs.begin(), subs.end());
   for (const fs::path& sub : subs) dirs.push_back({{"name", from_path(sub.filename())}, {"path", from_path(sub)}});
-  for (const apps::LocalModel& m : apps::scan_model_dirs({from_path(p)}, kLevels)) {
-    if (!local && !remote_path_allowed(s, req, m.path)) continue;
+  for (const apps::LocalModel& m : apps::scan_model_dirs({from_path(p)}, kLevels, allow))
     models.push_back(dir_entry(m).json);
-  }
   const fs::path up = p.parent_path();
   *out = {{"path", from_path(p)}, {"parent", up.empty() || up == p ? ojson(nullptr) : ojson(from_path(up))},
           {"kind", "dir"}, {"dirs", dirs}, {"models", models}};
@@ -339,9 +340,12 @@ std::string repo_of(const std::string& model) {
 std::string base_of(const std::string& model, std::string* from) {
   const std::string repo = repo_of(model);
   if (repo.empty()) return "";
+  std::string rev = "main";
+  hub::Name n;
+  if (!on_disk(model) && hub::parse_name(model, &n) && !n.revision.empty()) rev = n.revision;
   hub::Repo r;
   std::string err;
-  if (hub::describe(repo, "main", &r, &err) && !r.base_models.empty()) {
+  if (hub::describe(repo, rev, &r, &err) && !r.base_models.empty()) {
     hub::Name b;
     if (hub::parse_name(r.base_models.front(), &b)) return *from = "model card", b.repo;
   }
@@ -438,6 +442,7 @@ ojson repo_json(const hub::Repo& r) {
 void add_manage_routes(httplib::Server& http, Server* s) {
   http.Get("/v1/load", [s](const httplib::Request& q, httplib::Response& r) {
     if (!require_auth(*s, q, r)) return;
+    if (!require_access(*s, q, r, Access::kDashboardRead, "reading load status")) return;
     send_json(r, 200, s->host->status());
   });
   http.Post("/v1/load", [s](const httplib::Request& q, httplib::Response& r) {
@@ -763,7 +768,7 @@ void add_manage_routes(httplib::Server& http, Server* s) {
   http.Get("/v1/hub/cached", [s](const httplib::Request& q, httplib::Response& r) {
     if (!require_access(*s, q, r, Access::kManage, "loading models")) return;
     ojson models = ojson::array();
-    for (Listed& l : listing(*s)) models.push_back(std::move(l.json));
+    for (Listed& l : listing(*s, &q)) models.push_back(std::move(l.json));
     ojson dirs = ojson::array();
     for (const std::string& d : s->models_dirs) dirs.push_back(d);
     const auto cache = hub::resolve_cache_dir();
@@ -778,7 +783,7 @@ void add_manage_routes(httplib::Server& http, Server* s) {
     if (!require_access(*s, q, r, Access::kManage, "loading models")) return;
     const std::string name = q.get_param_value("name");
     if (name.empty()) return error(r, 400, "name: a model as GET /v1/hub/cached lists it", "invalid_request_error");
-    std::vector<Listed> all = listing(*s);
+    std::vector<Listed> all = listing(*s, &q);
     const auto it = std::find_if(all.begin(), all.end(), [&](const Listed& l) { return l.json["name"] == name; });
     if (it == all.end()) return error(r, 400, name + " is not among the cache's models", "invalid_request_error");
     if (it->json["source"] == "dir")

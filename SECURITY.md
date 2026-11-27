@@ -23,13 +23,15 @@ What flyx assumes, so you can judge what is in scope:
   or a reverse proxy that strips forwarding headers cannot be distinguished from a direct client by HTTP headers alone:
   always set `--api-key` when exposing `flyx serve` through a proxy or tunnel.
 - Without a key, a request a browser sends from another site is refused (`Sec-Fetch-Site` and `Origin` are checked; on
-  loopback listeners `Host` must also be a loopback address to stop DNS rebinding, and on keyless LAN management routes
-  `Host` must match the socket's local address/port, a known listener address, or the configured `--host` / system
-  hostname; non-browser LAN inference clients behind Docker port mappings or custom hostnames remain unaffected). Only
-  a link to the dashboard page itself may be followed from elsewhere. A page may call the inference API from a browser
-  when its origin is this machine's (`localhost`, any port: the default) or one `--cors` names; `--cors '*'` without a
-  key lets any page a browser opens use the model (Chrome and Edge still ask the user before a public page may reach a
-  loopback address). The model panel, the request log, the logs and the telemetry are never another origin's.
+  loopback listeners `Host` must also be a loopback address to stop DNS rebinding, and on keyless LAN management and
+  dashboard-read routes (`GET /v1/telemetry`, `GET /v1/load`, `/v1/hub/*`, `/v1/requests`, `/v1/logs`,
+  `/v1/settings/network`, `POST /v1/load`, `POST /v1/unload`) `Host` must match the socket's local address/port, a known
+  listener address, or the configured `--host` / system hostname and forwarded requests are rejected; non-browser LAN
+  inference clients behind Docker port mappings or custom hostnames remain unaffected). Only a link to the dashboard
+  page itself may be followed from elsewhere. A page may call the inference API from a browser when its origin is this
+  machine's (`localhost`, any port: the default) or one `--cors` names; `--cors '*'` without a key lets any page a
+  browser opens use the model (Chrome and Edge still ask the user before a public page may reach a loopback address).
+  The model panel, the request log, the logs and the telemetry are never another origin's.
 - A request is held to 64 MiB, 64 levels of JSON nesting and an 8 KiB target before a handler sees it
   (`server_hardening` tests these).
 - A model file is data, never code: the `.flyx` and GGUF readers check the offsets and sizes a header gives

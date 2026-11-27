@@ -9,6 +9,7 @@
 #include <cmath>
 #include <cstdio>
 #include <cstring>
+#include <filesystem>
 #include <mutex>
 #include <random>
 
@@ -263,8 +264,6 @@ bool inference_path(const std::string& path) {
   return path == "/health";
 }
 
-std::string lower(std::string_view s) { return ascii_lower(s); }
-
 // Says once, per origin and for the first few, what lets its pages in: the page itself sees only that its request
 // failed, and whoever runs the server reads this.
 void log_refused_origin(const std::string& origin) {
@@ -286,7 +285,7 @@ std::string ascii_lower(std::string_view s) {
 }
 
 std::string cors_origin_of(std::string_view value) {
-  std::string o = lower(value);
+  std::string o = ascii_lower(value);
   if (o == "null") return o;
   if (!o.empty() && o.back() == '/') o.pop_back();
   const size_t sep = o.find("://");
@@ -302,7 +301,8 @@ bool cors_allowed(const Server& s, const httplib::Request& req) {
   const std::string origin = req.get_header_value("Origin");
   if (origin.empty() || !inference_path(req.path)) return false;
   if (s.cfg.cors_any) return true;
-  if (std::find(s.cfg.cors_origins.begin(), s.cfg.cors_origins.end(), lower(origin)) != s.cfg.cors_origins.end()) return true;
+  if (std::find(s.cfg.cors_origins.begin(), s.cfg.cors_origins.end(), ascii_lower(origin)) != s.cfg.cors_origins.end())
+    return true;
   return s.cfg.cors_loopback && is_loopback_host(origin_authority(origin));
 }
 
@@ -322,7 +322,8 @@ bool admit_browser_request(const Server& s, const httplib::Request& req, httplib
       const std::string o = origin.substr(0, 200);
       why = "pages of " + o + " may not call this server from a browser: start flyx serve with --cors " + o +
             " (--cors '*' lets any page)";
-      if (cors_origin_of(o) == lower(o)) log_refused_origin(lower(o));
+      const std::string low_o = ascii_lower(o);
+      if (cors_origin_of(o) == low_o) log_refused_origin(low_o);
     } else if (!origin.empty()) {
       why = "the model panel, the request log, the logs and the telemetry are not open to pages of another origin";
     }
@@ -429,7 +430,7 @@ bool normalize_unc_components(std::string_view raw, std::vector<std::string>* ou
   while (i < raw.size()) {
     size_t j = i;
     while (j < raw.size() && !is_sep(raw[j])) ++j;
-    const std::string seg = lower(raw.substr(i, j - i));
+    const std::string seg = ascii_lower(raw.substr(i, j - i));
     if (out->empty() && (seg == "?" || seg == ".")) return false;  // \\?\ or \\.\ device namespace
     if (seg == ".") {
       if (out->size() < 2) return false;
@@ -461,7 +462,7 @@ bool normalize_drive_components(std::string_view raw, char* drive_out, std::vect
   while (i < raw.size()) {
     size_t j = i;
     while (j < raw.size() && !is_sep(raw[j])) ++j;
-    const std::string seg = lower(raw.substr(i, j - i));
+    const std::string seg = ascii_lower(raw.substr(i, j - i));
     if (seg == "..") {
       if (out->empty()) return false;
       out->pop_back();
@@ -509,15 +510,21 @@ bool probe_is_remote_drive(char letter, const PathSafetyProbe* probe) {
 #endif
 }
 
-std::optional<std::string> probe_reparse_target(std::string_view path, const PathSafetyProbe* probe) {
-  if (probe && probe->reparse_target) return probe->reparse_target(path);
+ReparseResult probe_reparse_info(std::string_view path, const PathSafetyProbe* probe) {
+  if (probe && probe->reparse_info) return probe->reparse_info(path);
 #if defined(_WIN32)
   const std::wstring wpath = os::to_path(std::string(path)).wstring();
   const DWORD attrs = GetFileAttributesW(wpath.c_str());
-  if (attrs == INVALID_FILE_ATTRIBUTES || (attrs & FILE_ATTRIBUTE_REPARSE_POINT) == 0) return std::nullopt;
+  if (attrs == INVALID_FILE_ATTRIBUTES) {
+    const DWORD err = GetLastError();
+    if (err == ERROR_FILE_NOT_FOUND || err == ERROR_PATH_NOT_FOUND || err == ERROR_INVALID_NAME)
+      return {ReparseState::kNone, {}};
+    return {ReparseState::kUnknownOrError, {}};
+  }
+  if ((attrs & FILE_ATTRIBUTE_REPARSE_POINT) == 0) return {ReparseState::kNone, {}};
   HANDLE h = CreateFileW(wpath.c_str(), 0, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr,
                          OPEN_EXISTING, FILE_FLAG_OPEN_REPARSE_POINT | FILE_FLAG_BACKUP_SEMANTICS, nullptr);
-  if (h == INVALID_HANDLE_VALUE) return std::nullopt;
+  if (h == INVALID_HANDLE_VALUE) return {ReparseState::kUnknownOrError, {}};
   struct ReparseDataBuf {
     ULONG ReparseTag;
     USHORT ReparseDataLength;
@@ -545,7 +552,8 @@ std::optional<std::string> probe_reparse_target(std::string_view path, const Pat
   const BOOL ok = DeviceIoControl(h, FSCTL_GET_REPARSE_POINT, nullptr, 0, buf.data(), DWORD(buf.size()), &returned,
                                   nullptr);
   CloseHandle(h);
-  if (!ok || returned < offsetof(ReparseDataBuf, SymbolicLinkReparseBuffer)) return std::nullopt;
+  if (!ok || returned < offsetof(ReparseDataBuf, SymbolicLinkReparseBuffer))
+    return {ReparseState::kUnknownOrError, {}};
   const auto* rdb = reinterpret_cast<const ReparseDataBuf*>(buf.data());
   const WCHAR* base_ptr = nullptr;
   USHORT sub_off = 0, sub_len = 0;
@@ -561,21 +569,22 @@ std::optional<std::string> probe_reparse_target(std::string_view path, const Pat
     sub_len = rdb->MountPointReparseBuffer.SubstituteNameLength;
     header_bytes = offsetof(ReparseDataBuf, MountPointReparseBuffer.PathBuffer);
   } else {
-    return std::nullopt;
+    return {ReparseState::kUnknownOrError, {}};
   }
-  if (header_bytes + size_t(sub_off) + size_t(sub_len) > size_t(returned) || sub_len == 0) return std::nullopt;
+  if (header_bytes + size_t(sub_off) + size_t(sub_len) > size_t(returned) || sub_len == 0)
+    return {ReparseState::kUnknownOrError, {}};
   const auto* bytes = reinterpret_cast<const unsigned char*>(base_ptr) + sub_off;
   const int wchars = int(sub_len / sizeof(WCHAR));
   const int utf8_len = WideCharToMultiByte(CP_UTF8, 0, reinterpret_cast<const WCHAR*>(bytes), wchars, nullptr, 0,
                                            nullptr, nullptr);
-  if (utf8_len <= 0) return std::nullopt;
+  if (utf8_len <= 0) return {ReparseState::kUnknownOrError, {}};
   std::string out(size_t(utf8_len), '\0');
   WideCharToMultiByte(CP_UTF8, 0, reinterpret_cast<const WCHAR*>(bytes), wchars, out.data(), utf8_len, nullptr,
                       nullptr);
-  return out;
+  return {ReparseState::kTarget, std::move(out)};
 #else
   (void)path;
-  return std::nullopt;
+  return {ReparseState::kNone, {}};
 #endif
 }
 
@@ -599,6 +608,57 @@ bool normalize_reparse_target(std::string_view raw, std::string* out) {
   return true;
 }
 
+// Resolve a normalized Windows reparse target against the link's parent directory when the target is relative.
+bool resolve_windows_reparse_target(std::string_view link_prefix, std::string_view norm, std::string* resolved) {
+  if (norm.empty()) return false;
+  if (is_unc_or_device_path(norm, /*windows_paths=*/true) || has_drive_letter(norm)) {
+    *resolved = std::string(norm);
+    return true;
+  }
+  if (!has_drive_letter(link_prefix)) return false;
+  const std::string drive(link_prefix.substr(0, 2));
+  std::vector<std::string> comps;
+  if (!is_sep(norm[0])) {
+    size_t i = 2;
+    while (i < link_prefix.size() && is_sep(link_prefix[i])) ++i;
+    while (i < link_prefix.size()) {
+      size_t j = i;
+      while (j < link_prefix.size() && !is_sep(link_prefix[j])) ++j;
+      const std::string_view seg = link_prefix.substr(i, j - i);
+      if (seg == "..") {
+        if (comps.empty()) return false;
+        comps.pop_back();
+      } else if (!seg.empty() && seg != ".") {
+        comps.emplace_back(seg);
+      }
+      i = j;
+      while (i < link_prefix.size() && is_sep(link_prefix[i])) ++i;
+    }
+    if (!comps.empty()) comps.pop_back();  // parent directory of the link itself
+  }
+  size_t i = 0;
+  while (i < norm.size() && is_sep(norm[i])) ++i;
+  while (i < norm.size()) {
+    size_t j = i;
+    while (j < norm.size() && !is_sep(norm[j])) ++j;
+    const std::string_view seg = norm.substr(i, j - i);
+    if (seg == "..") {
+      if (comps.empty()) return false;
+      comps.pop_back();
+    } else if (!seg.empty() && seg != ".") {
+      comps.emplace_back(seg);
+    }
+    i = j;
+    while (i < norm.size() && is_sep(norm[i])) ++i;
+  }
+  *resolved = drive + "\\";
+  for (size_t k = 0; k < comps.size(); ++k) {
+    if (k > 0) resolved->push_back('\\');
+    resolved->append(comps[k]);
+  }
+  return true;
+}
+
 bool windows_path_safe(const Server& s, std::string_view raw, const PathSafetyProbe* probe, int depth = 0) {
   if (depth > 4) return false;
   if (is_unc_or_device_path(raw, /*windows_paths=*/true)) return under_configured_models_dir(s, raw);
@@ -607,14 +667,25 @@ bool windows_path_safe(const Server& s, std::string_view raw, const PathSafetyPr
   size_t pos = has_drive_letter(raw) ? 2 : 0;
   while (pos < raw.size() && is_sep(raw[pos])) ++pos;
   int steps = 0;
-  while (pos < raw.size() && ++steps <= 64) {
+  while (pos < raw.size()) {
+    if (++steps > 64) return false;  // fail closed on deeply nested paths rather than skipping remaining components
     size_t next = pos;
     while (next < raw.size() && !is_sep(raw[next])) ++next;
     const std::string_view prefix = raw.substr(0, next);
-    if (const auto target = probe_reparse_target(prefix, probe)) {
-      std::string norm;
-      if (!normalize_reparse_target(*target, &norm)) return false;
-      if (!windows_path_safe(s, norm, probe, depth + 1)) return false;
+    const ReparseResult rp = probe_reparse_info(prefix, probe);
+    if (rp.state == ReparseState::kUnknownOrError) return false;
+    if (rp.state == ReparseState::kTarget) {
+      std::string norm, resolved;
+      if (!normalize_reparse_target(rp.target, &norm)) return false;
+      if (!resolve_windows_reparse_target(prefix, norm, &resolved)) return false;
+      std::string full = resolved;
+      std::string_view tail = raw.substr(next);
+      while (!tail.empty() && is_sep(tail.front())) tail.remove_prefix(1);
+      if (!tail.empty()) {
+        if (!full.empty() && !is_sep(full.back())) full.push_back('\\');
+        full.append(tail);
+      }
+      if (!windows_path_safe(s, full, probe, depth + 1)) return false;
     }
     pos = next;
     while (pos < raw.size() && is_sep(raw[pos])) ++pos;
@@ -631,7 +702,14 @@ bool is_unc_or_device_path(std::string_view path, bool windows_paths) {
 bool remote_path_allowed(const Server& s, const httplib::Request& req, std::string_view path, bool windows_paths,
                          const PathSafetyProbe* probe) {
   if (path.empty() || from_this_machine(req) || !windows_paths) return true;
-  const std::string expanded = path[0] == '~' ? apps::expand_user_path(std::string(path)) : std::string(path);
+  std::string expanded = path[0] == '~' ? apps::expand_user_path(std::string(path)) : std::string(path);
+  if (!probe && !expanded.empty() && !has_drive_letter(expanded) &&
+      !is_unc_or_device_path(expanded, /*windows_paths=*/true)) {
+    std::error_code ec;
+    const auto abs = std::filesystem::absolute(os::to_path(expanded), ec);
+    if (ec) return false;
+    expanded = os::from_path(abs);
+  }
   return windows_path_safe(s, expanded, probe);
 }
 
@@ -658,7 +736,7 @@ bool browser_request_safe(const Server& s, const httplib::Request& req) {
   const std::string host = req.get_header_value("Host");
   // Enforce loopback Host for loopback peers (stops DNS rebinding against 127.0.0.1). Non-loopback LAN inference
   // clients may arrive via custom DNS, Tailscale MagicDNS, Docker port-mapping, or HTTP/1.0; keyless LAN management
-  // endpoints additionally enforce is_allowed_lan_host() inside has_access().
+  // and private dashboard read endpoints additionally enforce is_allowed_lan_host() inside has_access().
   if (local && !host.empty() && !is_loopback_host(host)) return false;
   const std::string origin = req.get_header_value("Origin");
   if (!origin.empty() && !cors) {
@@ -709,7 +787,9 @@ bool has_access(const Server& s, const httplib::Request& req, Access level) {
   if (forwarded(req) || !browser_request_safe(s, req)) return false;
   if (is_loopback_ip(req.remote_addr)) return true;
   if (level == Access::kLocalOrKeyed) return false;
-  return s.lan_manage.effective(s.listener, false) && is_allowed_lan_host(s, req, req.get_header_value("Host"));
+  if (!is_allowed_lan_host(s, req, req.get_header_value("Host"))) return false;
+  if (level == Access::kDashboardRead) return true;
+  return s.lan_manage.effective(s.listener, false);
 }
 
 bool from_this_machine(const httplib::Request& req) { return is_loopback_ip(req.remote_addr) && !forwarded(req); }
@@ -726,6 +806,9 @@ bool require_access(const Server& s, const httplib::Request& req, httplib::Respo
   if (has_access(s, req, level)) return true;
   std::string msg;
   switch (level) {
+    case Access::kDashboardRead:
+      msg = std::string(what) + " requires a trusted host or --api-key";
+      break;
     case Access::kManage:
       msg = std::string(what) + " is for this machine (use --api-key KEY, or --no-auth on a trusted LAN)";
       break;

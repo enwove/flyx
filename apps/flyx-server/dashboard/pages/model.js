@@ -74,10 +74,10 @@ function hubViewReducer(state, action) {
   }
 }
 
-function describe(m) {
+function describe(m, winPaths = null) {
   const repo = m.repo || (m.source === "dir" ? null : repoOf(m.name));
   const quant = m.quant || (m.source !== "dir" ? quantOf(m.name) : null);
-  return { repo, quant, file: m.file || (m.path ? baseName(m.path) : m.source === "dir" ? baseName(m.name) : null) };
+  return { repo, quant, file: m.file || (m.path ? baseName(m.path, winPaths) : m.source === "dir" ? baseName(m.name, winPaths) : null) };
 }
 
 // Drafters the server found or was given, from the status (or, from an older server, its notes).
@@ -107,10 +107,13 @@ function FitTag({ size }) {
   const room = freeForModel();
   if (!room || !size) return html`<span class="tag2">?</span>`;
   // Untied embeddings (~4% on 27B) stay in host RAM; ~0.85 GB covers workspace and one minimal session beyond reserve.
-  const budget = m && m.ledger_budget ? m.ledger_budget : Math.max(0, room - deviceReserve(d && d.mem_total ? d.mem_total : room, m));
+  const res = deviceReserve(d && d.mem_total ? d.mem_total : room, m);
+  const budget = m && m.ledger_budget ? m.ledger_budget : Math.max(0, room - res);
   const fits = size * 0.96 + 0.85e9 < budget;
-  const title = "Estimate: " + gb(size) + " GB of weights + 1.5 GB against " + gib(room) + " GiB the GPU can give a model " +
-                "(its memory, less other programs'). Long contexts need more; the engine's bill shows once it loads.";
+  const budgetTxt = budget ? gib(budget) : "0.0";
+  const resTxt = res ? gib(res) : "0.0";
+  const title = "Estimate: " + gb(size) + " GB of weights + 0.85 GB workspace/session against " + budgetTxt +
+                " GiB available VRAM budget (after " + resTxt + " GiB reserve). Long contexts need more; the engine's bill shows once it loads.";
   return html`<span class=${"tag2 " + (fits ? "ok" : "bad")} title=${t(title)}>${t(fits ? "fits" : "too big")}</span>`;
 }
 
@@ -354,13 +357,17 @@ function savedFolders() {
   catch (e) { return []; }
 }
 const isWinPath = (p) => /^[a-zA-Z]:(?:[\\/]|$)|^\\\\|\\/.test(String(p || ""));
-const trimTrailingSep = (p) => p === "/" ? "/" : /^[a-zA-Z]:[\\/]+$/.test(p) ? p.slice(0, 3) : p.replace(/[\\/]+$/, "");
-const folderOf = (m) => {
+const trimTrailingSep = (p, winPaths = null) => {
+  const s = String(p || "");
+  if (winPaths === false) return /^\/+$/.test(s) ? "/" : s.replace(/\/+$/, "");
+  return s === "/" ? "/" : /^[a-zA-Z]:[\\/]+$/.test(s) ? s.slice(0, 3) : s.replace(/[\\/]+$/, "");
+};
+const folderOf = (m, winPaths = null) => {
   const raw = String(m.path || m.name || "");
-  const i = Math.max(raw.lastIndexOf("/"), raw.lastIndexOf("\\"));
+  const i = winPaths === false ? raw.lastIndexOf("/") : Math.max(raw.lastIndexOf("/"), raw.lastIndexOf("\\"));
   if (i < 0) return "";
   if (i === 0) return "/";
-  if (i === 2 && /^[a-zA-Z]:/.test(raw)) return raw.slice(0, 3);
+  if (winPaths !== false && i === 2 && /^[a-zA-Z]:/.test(raw)) return raw.slice(0, 3);
   return raw.slice(0, i);
 };
 const normPath = (p, winPaths = null) => {
@@ -468,7 +475,7 @@ export function ModelPage({ active, libraryAsked, currentAsked }) {
   const [shell, setShell] = useState(defaultShell);
   const [msg, setMsg] = useState("");
   const filled = useRef(false), sawState = useRef(""), sawLoaded = useRef("");
-  const searchSeq = useRef(0), repoSeq = useRef(0), dirSeq = useRef(0), placed = useRef(false), hubPickedOnce = useRef(false);
+  const searchSeq = useRef(0), repoSeq = useRef(0), dirSeq = useRef(0), placed = useRef(false), hubPickedOnce = useRef(false), pinnedHubRepo = useRef("");
   const lastAttempt = useRef(null);
   const set = (k) => (e) => setF(Object.assign({}, f, { [k]: e.target.type === "checkbox" ? e.target.checked : e.target.value }));
   const setTab = (k) => { setTabState(k); saved.set("models_tab", k); setMsg(""); };
@@ -574,6 +581,7 @@ export function ModelPage({ active, libraryAsked, currentAsked }) {
     if (nextPage < 0) return;
     const cur = nextPage === 0 ? "" : cursors[nextPage];
     if (nextPage > 0 && !cur) return;
+    pinnedHubRepo.current = "";
     const listEl = document.getElementById("hf-list");
     if (listEl) listEl.scrollTop = 0;
     search(q, sort, arch, nextPage, cur);
@@ -598,6 +606,7 @@ export function ModelPage({ active, libraryAsked, currentAsked }) {
   function named(text) {
     const v = text.trim();
     if (!hubName(v, hubEndpoint)) return false;
+    pinnedHubRepo.current = "";
     const clean = stripHubPrefix(v, hubEndpoint);
     showRepo(repoOf(v, hubEndpoint), quantOf(clean.split("@")[0]) || "", revOf(v, hubEndpoint));
     return true;
@@ -611,13 +620,14 @@ export function ModelPage({ active, libraryAsked, currentAsked }) {
     }, found || foundMsg ? 350 : 0);
     return () => clearTimeout(h);
   }, [active, view, tab, q, sort, arch]);
-  // The repository shown: the served model's or first found on initial load, and the top match when a search or arch filter updates.
+  // The repository shown: the served model's or first found on initial load, and the top match whenever the displayed list no longer contains the selected repo.
   useEffect(() => {
     if (view !== "library" || tab !== "hub" || !found) return;
     const qText = (found.query || "").trim();
     const direct = qText && hubName(qText, hubEndpoint) ? repoOf(qText, hubEndpoint) : "";
+    const pinned = pinnedHubRepo.current && pinnedHubRepo.current === hubView.sel;
     if (!found.models.length) {
-      if (!direct || direct !== hubView.sel) clearHubDetail();
+      if ((!direct || direct !== hubView.sel) && !pinned) clearHubDetail();
       return;
     }
     const served = !qText && !arch && loadedWant && isHub(loadedWant.model) ? repoNameOf(loadedWant.model) : "";
@@ -632,7 +642,8 @@ export function ModelPage({ active, libraryAsked, currentAsked }) {
     }
     if (found.models.some((m) => m.id === hubView.sel)) return;
     if (direct && direct === hubView.sel) return;
-    if (qText) showRepo(found.models[0].id, "", "");
+    if (pinned) return;
+    showRepo(found.models[0].id, "", "");
   }, [found, tab, view]);
 
   // ---- this machine ----
@@ -885,7 +896,7 @@ export function ModelPage({ active, libraryAsked, currentAsked }) {
     const servedLocal = !cmdRepo && loadedWant && cmdModel === loadedWant.model;
     const entry = !cmdRepo && !servedLocal
       ? [...(catalog ? catalog.models : []), ...(dir ? dir.models : [])].find((m) => m.name === cmdModel) : null;
-    const verified = cmdRepo ? verifiedOf[cmdRepo] || []
+    const verified = cmdRepo ? verifiedOf[cmdRepoKey] || []
       : servedLocal ? L.suggested || []
       : (entry && entry.known_drafters) || [];
     const ownVerified = custom && verified.some((k) => k.repo === own);
@@ -909,11 +920,11 @@ export function ModelPage({ active, libraryAsked, currentAsked }) {
     const activeDrafters = model.loaded && !busy ? draftersOf(L).slice() : [];
     if (model.loaded && !busy && activeDraft && /mtp/.test(activeDraft) && !activeDrafters.some((d) => d.kind === "mtp"))
       activeDrafters.unshift({ kind: "mtp", from: "model file" });
-    const specSum = !f.spec ? t("off") : f.draftSource === "custom" && own ? baseName(own) : f.draftSource === "saved" ? t("last loaded") :
+    const specSum = !f.spec ? t("off") : f.draftSource === "custom" && own ? baseName(own, winPaths) : f.draftSource === "saved" ? t("last loaded") :
                     specLoaded ? t("default") : t("none");
     const visSum = !f.vision ? t("off") : visLoaded ? t(normVisionDev(f.vision_device)) + " · " + normVisionQuant(f.vision_quant) :
-                   visCustom && mmOwn ? baseName(mmOwn) : t("none");
-    const loraName = (p) => baseName(String(p).replace(/[\\/]+$/, ""));
+                   visCustom && mmOwn ? baseName(mmOwn, winPaths) : t("none");
+    const loraName = (p) => baseName(trimTrailingSep(p, winPaths), winPaths);
     const loraOwn = (f.lora || "").trim(), loraLoaded = !!(loadedWant && loadedWant.lora);
     const adapters = catalog ? catalog.models.filter((m) => m.kind === "lora") : [];
     const adapterOf = (m) => m.source === "hub" ? m.name : m.path || m.name;
@@ -967,7 +978,7 @@ export function ModelPage({ active, libraryAsked, currentAsked }) {
               <input type="number" id="mf-kvram" min="0" step="1" placeholder=${t("auto")} value=${f.kvram} onInput=${set("kvram")}/><//>
             <${Field} k="kv_gpu" label="KV on the GPU" was=${was("kv_gpu")} hint="Tokens, at most.">
               <input type="number" id="mf-kvgpu" min="0" step="1024" placeholder=${t("as many as fit")} value=${f.kvgpu} onInput=${set("kvgpu")}/><//>
-            <${Field} k="vram_reserve" label="VRAM reserve" was=${was("vram_reserve")} hint="GB left free on the GPU (0: use all VRAM; empty: auto).">
+            <${Field} k="vram_reserve" label="VRAM reserve" was=${was("vram_reserve")} hint="GB left free on the GPU (0: minimum allowed by the backend/OS; empty: auto).">
               <input type="number" id="mf-vramres" min="0" step="0.25" placeholder=${t("auto")} value=${f.vramres} onInput=${set("vramres")}/><//>
             <${Field} k="ram_reserve" label="RAM reserve" was=${was("ram_reserve")} hint="GB kept free in host RAM (0: use all RAM; empty: auto).">
               <input type="number" id="mf-ramres" min="0" step="0.5" placeholder=${t("auto")} value=${f.ramres} onInput=${set("ramres")}/><//>
@@ -1332,9 +1343,9 @@ export function ModelPage({ active, libraryAsked, currentAsked }) {
     return html`
       ${found && found.family && archs.length > 1 ? html`
         <div class="hub-archs pills" id="hf-archs" role="group">
-          <button type="button" data-arch="" aria-pressed=${String(arch === "")} onClick=${() => setArch("")}>${t("All")}</button>
+          <button type="button" data-arch="" aria-pressed=${String(arch === "")} onClick=${() => { pinnedHubRepo.current = ""; setArch(""); }}>${t("All")}</button>
           ${archs.map((a) => html`
-            <button type="button" key=${a} data-arch=${a} aria-pressed=${String(arch === a)} onClick=${() => setArch(a)}>${a}</button>`)}
+            <button type="button" key=${a} data-arch=${a} aria-pressed=${String(arch === a)} onClick=${() => { pinnedHubRepo.current = ""; setArch(a); }}>${a}</button>`)}
         </div>` : null}
       ${foundMsg ? html`
         <div class="hub-status">
@@ -1346,7 +1357,7 @@ export function ModelPage({ active, libraryAsked, currentAsked }) {
         </div>` : null}
       ${found && !list.length && !foundMsg ? html`<div class="empty pad">${t("Nothing matches.")}</div>` : null}
       ${list.length ? html`<div class="hub-items">${list.map((m) => html`
-        <button key=${m.id} class=${"prow" + (m.id === hubView.sel ? " sel" : "")} data-repo=${m.id} onClick=${() => showRepo(m.id, "", "")}>
+        <button key=${m.id} class=${"prow" + (m.id === hubView.sel ? " sel" : "")} data-repo=${m.id} onClick=${() => { pinnedHubRepo.current = ""; showRepo(m.id, "", ""); }}>
           <span class="pn">${m.id.split("/")[1]}</span>
           <span class="pm"><${Icon} name="heart"/>${compact(m.likes)}<${Icon} name="dl"/>${compact(m.downloads)}</span>
           <span class="ps">${m.id.split("/")[0]}${m.architecture ? html` <span class=${"tag2" + (m.runs === false ? " bad" : m.drafter ? " ok" : "")}>${m.architecture}</span>` : m.drafter ? html` <span class="tag2 ok">${t("drafter")}</span>` : null}${m.cached ? html` <span class="tag2 info">${t("downloaded")}</span>` : null}${m.gated ? html` <span class="tag2">${t("gated")}</span>` : null}</span>
@@ -1466,7 +1477,7 @@ export function ModelPage({ active, libraryAsked, currentAsked }) {
       if (!repos.has(key)) repos.set(key, []);
       repos.get(key).push(m);
     } else {
-      const root = m.root || rootOf(folderOf(m));
+      const root = m.root || rootOf(folderOf(m, winPaths));
       const nk = nPath(root);
       if (!known.has(nk)) { known.set(nk, []); knownRoots.set(nk, root); }
       known.get(nk).push(m);
@@ -1477,7 +1488,9 @@ export function ModelPage({ active, libraryAsked, currentAsked }) {
   // models, those of the model served and the one remembered, those added here.
   const cacheDir = catalog ? catalog.cache : "", atCache = !!cacheDir && !!loc && eqPath(loc, cacheDir);
   const places = cacheDir ? [cacheDir] : [];
-  const wanted = [loadedWant, L.remembered].filter((w) => w && w.model && !isHub(w.model) && /[\\/]/.test(w.model)).map((w) => rootOf(folderOf({ name: w.model })));
+  const wanted = [loadedWant, L.remembered]
+    .filter((w) => w && w.model && !isHub(w.model) && (winPaths === false ? w.model.includes("/") : /[\\/]/.test(w.model)))
+    .map((w) => rootOf(folderOf({ name: w.model }, winPaths)));
   for (const x of [...configDirs, ...knownRoots.values(), ...wanted, ...folders]) if (!places.some((k) => eqPath(k, x))) places.push(x);
   const sum = (list) => list.reduce((n, m) => n + (m.size || 0), 0);
   const ql = localQ.trim().toLowerCase(), hit = (text) => !ql || text.toLowerCase().includes(ql);
@@ -1505,8 +1518,8 @@ export function ModelPage({ active, libraryAsked, currentAsked }) {
   const kindCls = (m) => m.kind === "mmproj" ? "k-mmproj" : m.kind === "drafter" ? "k-drafter" : m.kind === "lora" ? "k-lora" : "k-model";
   // A model as the list names it: a repository's by its name and quantization, a file by its own name.
   const titleOf = (m) => {
-    const d = describe(m);
-    return m.source === "hub" && d.repo ? d.repo.split("/")[1] + (d.quant ? " \u00b7 " + d.quant : "") : d.file || baseName(m.name);
+    const d = describe(m, winPaths);
+    return m.source === "hub" && d.repo ? d.repo.split("/")[1] + (d.quant ? " \u00b7 " + d.quant : "") : d.file || baseName(m.name, winPaths);
   };
   const pickModel = (m) => { setPicked(m.name); setTarget(standalone(m) ? m.name : ""); setMsg(""); };
   function localList() {
@@ -1521,11 +1534,11 @@ export function ModelPage({ active, libraryAsked, currentAsked }) {
         const list = all.filter((m) => hit(titleOf(m) + " " + m.name)).sort((x, y) => titleOf(x).localeCompare(titleOf(y)));
         const mine = !eqPath(p, cacheDir) && !configDirs.some((d) => eqPath(d, p)) && folders.some((x) => eqPath(x, p));
         const open = () => { setPicked(""); openPath(p); };
-        const pTrim = trimTrailingSep(p);
+        const pTrim = trimTrailingSep(p, winPaths);
         return html`
           <div class=${"prow act folder" + (!picked && eqPath(loc, p) ? " sel" : "")} role="button" tabindex="0" data-place=${"dir:" + p}
                onClick=${open} onKeyDown=${onEnter(open)}>
-            <span class="pn path"><${Icon} name="folder"/>${baseName(pTrim) || p}</span>
+            <span class="pn path"><${Icon} name="folder"/>${baseName(pTrim, winPaths) || p}</span>
             <span class="pm">${all.length ? sized(sum(all)) : ""}</span>
             <span class="ps path">${p}</span>
             <span class="pt">${all.length ? t(all.length + (all.length === 1 ? " file" : " files")) : ""}</span>
@@ -1534,7 +1547,7 @@ export function ModelPage({ active, libraryAsked, currentAsked }) {
                    : html`<span class="del"></span>`}
           </div>
           ${list.map((m) => {
-            const d = describe(m), hubModel = m.source === "hub", mf = folderOf(m);
+            const d = describe(m, winPaths), hubModel = m.source === "hub", mf = folderOf(m, winPaths);
             const under = hubModel ? (d.repo || "").split("/")[0] : relUnder(mf, p, winPaths);
             const go = () => pickModel(m);
             return html`
@@ -1552,9 +1565,14 @@ export function ModelPage({ active, libraryAsked, currentAsked }) {
       <button class="prow add" id="mf-add" disabled=${picking} onClick=${addFolder}>
         <span class="pn path"><${Icon} name="plus"/>${t(picking ? "Choose the folder in the window that opened\u2026" : "Add a folder\u2026")}</span></button>`;
   }
+  const openHubRepo = (repo, rev = "") => {
+    pinnedHubRepo.current = repo;
+    setTab("hub");
+    showRepo(repo, "", rev);
+  };
   // One model of the list: what it is, where its file is, and the box that loads it.
   function modelDetail(m) {
-    const d = describe(m), hubModel = m.source === "hub", drafter = m.kind === "drafter", mmproj = m.kind === "mmproj", lora = m.kind === "lora";
+    const d = describe(m, winPaths), hubModel = m.source === "hub", drafter = m.kind === "drafter", mmproj = m.kind === "mmproj", lora = m.kind === "lora";
     const isDrafterFile = drafter && /\.(gguf|flyx)$/i.test(m.path || m.file || "");
     const chips = [[drafter && m.drafter_kind ? drafterLabel(m.drafter_kind) : t(kindOfModel(m)), drafter ? "ok" : mmproj ? "info" : ""]];
     if (d.quant) chips.push([d.quant, ""]);
@@ -1574,12 +1592,13 @@ export function ModelPage({ active, libraryAsked, currentAsked }) {
       ? { title: m.path || m.name, sub: "A LoRA adapter is not loaded on its own.", label: "Use with the model",
           disabled: !model.id || busy, onClick: () => loraWith(m.source === "hub" ? m.name : m.path || m.name) }
       : null;
+    const pinnedRev = m.current === false && m.revision ? m.revision : "";
     return html`
       <div class="hub-scroll" id="lc-detail">
         <div class="dh">
           <div class="dh-icon"><${Icon} name=${iconOfModel(m)}/></div>
-          <div class="dh-t"><h3 id="lc-name">${titleOf(m)}</h3><span>${hubModel ? (d.repo || "").split("/")[0] : folderOf(m)}</span></div>
-          ${hubModel && d.repo && (standalone(m) || (drafter && d.quant)) ? html`<button class="btn ghost sm" id="lc-quants" onClick=${() => { setTab("hub"); showRepo(d.repo, "", ""); }}>${t("All its quantizations")}</button>` : ""}
+          <div class="dh-t"><h3 id="lc-name">${titleOf(m)}</h3><span>${hubModel ? (d.repo || "").split("/")[0] : folderOf(m, winPaths)}</span></div>
+          ${hubModel && d.repo && (standalone(m) || (drafter && d.quant)) ? html`<button class="btn ghost sm" id="lc-quants" onClick=${() => openHubRepo(d.repo, pinnedRev)}>${t("All its quantizations")}</button>` : ""}
           ${hubModel ? html`<button class="btn ghost sm" id="lc-delete" onClick=${() => removeCached(m)}><${Icon} name="trash"/>${t("Delete")}</button>` : ""}
         </div>
         <div class="dchips">${chips.map(([text, tone]) => html`<span class=${"tag2 " + tone}>${text}</span>`)}${standalone(m) ? html`<${FitTag} size=${m.size}/>` : ""}</div>
@@ -1602,7 +1621,7 @@ export function ModelPage({ active, libraryAsked, currentAsked }) {
     const go = () => openPath(pathText.trim());
     const locNorm = nPath(loc);
     const above = atCache
-      ? (locNorm === "/" || /^[a-z]:\/$/i.test(locNorm) ? null : folderOf({ path: trimTrailingSep(loc) }) || null)
+      ? (locNorm === "/" || (winPaths !== false && /^[a-z]:\/$/i.test(locNorm)) ? null : folderOf({ path: trimTrailingSep(loc, winPaths) }, winPaths) || null)
       : j ? j.parent : null;
     const bar = html`
       <div class="pathbar">
@@ -1623,11 +1642,13 @@ export function ModelPage({ active, libraryAsked, currentAsked }) {
         const list = all.slice().sort((x, y) => (x.size || 0) - (y.size || 0));
         const mine = list.filter(standalone).map(localRow);
         const drafters = list.filter((m) => m.kind === "drafter");
+        const sharedOldRev = list.length && list.every((m) => m.current === false) && list[0].revision &&
+                             list.every((m) => m.revision === list[0].revision) ? list[0].revision : "";
         rows.push(...mine);
         return html`
           <div class="rgroup" data-repo=${name}>
             <div class="rgroup-h"><b>${name}</b><span>${sized(sum(list))}</span><span class="grow"></span>
-              ${mine.length || drafters.some((d) => !!d.quant) ? html`<button class="btn ghost sm" onClick=${() => { setTab("hub"); showRepo(name, "", ""); }}>${t("All its quantizations")}</button>` : ""}
+              ${mine.length || drafters.some((d) => !!d.quant) ? html`<button class="btn ghost sm" onClick=${() => openHubRepo(name, sharedOldRev)}>${t("All its quantizations")}</button>` : ""}
               <button class="iconbtn del" title=${t("Delete from the Hugging Face cache")} aria-label=${t("Delete")}
                       onClick=${() => removeRepo(name, all)}><${Icon} name="trash"/></button></div>
             ${mine.length ? html`<div class="mrows" role="listbox">${rowsView(mine)}</div>` : ""}
@@ -1653,16 +1674,17 @@ export function ModelPage({ active, libraryAsked, currentAsked }) {
         ${loadBox(rows, rows.length ? "" : "Nothing here to load.")}`;
     }
     // Any other folder: the folders in it, the model files in it and under it.
+    const stripLeadSep = (s) => winPaths === false ? s.replace(/^\/+/, "") : s.replace(/^[\\/]+/, "");
     const allModels = j ? j.models.filter(standalone) : [];
     const rows = allModels.map((m) => {
-      const r = localRow(m), rel = j.kind === "dir" && m.path.length > j.path.length ? m.path.slice(j.path.length).replace(/^[\\/]+/, "") : m.file;
+      const r = localRow(m), rel = j.kind === "dir" && m.path.length > j.path.length ? stripLeadSep(m.path.slice(j.path.length)) : m.file;
       return Object.assign(r, { sub: r.title === rel ? "" : rel });
     }).filter((r) => hit(r.title + " " + r.sub));
     const folderMmproj = j ? j.models.filter((m) => m.kind === "mmproj" && hit(m.file + " " + (m.path || ""))) : [];
     const folderDrafters = j ? j.models.filter((m) => m.kind === "drafter" && hit(m.file + " " + (m.path || ""))) : [];
     const singleMmproj = j && j.kind === "file" && folderMmproj.length === 1 ? folderMmproj[0] : null;
     const singleDrafter = j && j.kind === "file" && folderDrafters.length === 1 ? folderDrafters[0] : null;
-    const relOf = (m) => j && j.kind === "dir" && m.path.length > j.path.length ? m.path.slice(j.path.length).replace(/^[\\/]+/, "") : m.file;
+    const relOf = (m) => j && j.kind === "dir" && m.path.length > j.path.length ? stripLeadSep(m.path.slice(j.path.length)) : m.file;
     const localComps = [
       ...folderDrafters.map((m) => ({
         key: m.path || m.name, spec: m.path || m.name, file: m.file, path: relOf(m),
@@ -1722,18 +1744,21 @@ export function ModelPage({ active, libraryAsked, currentAsked }) {
   useEffect(() => { if (loraKey) findLoras(loraBase, cmdModel); }, [loraKey]);
   // The drafters verified for the model the settings are for, when it is a Hub repository's: offered beside the default.
   const cmdRepo = cmdModel && isHub(cmdModel) ? repoNameOf(cmdModel) : "";
+  const cmdRev = cmdRepo ? revOf(cmdModel, hubEndpoint) : "";
+  const cmdRepoKey = cmdRepo ? repoSpec(cmdRepo, cmdRev) : "";
   useEffect(() => {
-    if (!cmdRepo || verifiedOf[cmdRepo]) return;
-    if (hubView.detail && hubView.detail.repo === cmdRepo) {
-      setVerifiedOf((v) => Object.assign({}, v, { [cmdRepo]: hubView.detail.j.known_drafters || [] }));
+    if (!cmdRepoKey || verifiedOf[cmdRepoKey]) return;
+    const wantRev = cmdRev && cmdRev !== "main" ? cmdRev : "";
+    if (hubView.detail && hubView.detail.repo === cmdRepo && (hubView.detail.rev || "") === wantRev) {
+      setVerifiedOf((v) => Object.assign({}, v, { [cmdRepoKey]: hubView.detail.j.known_drafters || [] }));
       return;
     }
     let live = true;
-    ask("/v1/hub/files?repo=" + encodeURIComponent(cmdRepo), "list a repository").then((a) => {
-      if (live && !a.error) setVerifiedOf((v) => Object.assign({}, v, { [cmdRepo]: a.j.known_drafters || [] }));
+    ask("/v1/hub/files?repo=" + encodeURIComponent(cmdRepoKey), "list a repository").then((a) => {
+      if (live && !a.error) setVerifiedOf((v) => Object.assign({}, v, { [cmdRepoKey]: a.j.known_drafters || [] }));
     });
     return () => { live = false; };
-  }, [cmdRepo, hubView.detail]);
+  }, [cmdRepoKey, hubView.detail]);
   const again = L.remembered ? { model: L.remembered.model, load: () => loadModel(L.remembered.model, L.remembered) } : null;
   const retryWant = L.target
     ? (lastAttempt.current && lastAttempt.current.model === L.target ? lastAttempt.current
@@ -1765,11 +1790,11 @@ export function ModelPage({ active, libraryAsked, currentAsked }) {
           </div>
           <label class="search"><${Icon} name="search"/>
             ${hubTab ? html`<input type="text" id="hf-q" placeholder=${t("Search Hugging Face, or give a repository: org/name")} spellcheck="false" autocomplete="off"
-                                   value=${q} onInput=${(e) => setQ(e.target.value)}
-                                   onKeyDown=${(e) => { if (e.key === "Enter") { e.preventDefault(); if (!named(q)) search(q, sort, arch, 0, ""); } }}/>`
+                                   value=${q} onInput=${(e) => { pinnedHubRepo.current = ""; setQ(e.target.value); }}
+                                   onKeyDown=${(e) => { if (e.key === "Enter") { e.preventDefault(); pinnedHubRepo.current = ""; if (!named(q)) search(q, sort, arch, 0, ""); } }}/>`
                      : html`<input type="text" id="mf-q" placeholder=${t("Filter by name or quantization")} spellcheck="false" autocomplete="off"
                                    value=${localQ} onInput=${(e) => setLocalQ(e.target.value)}/>`}</label>
-          ${hubTab ? html`<select id="hf-sort" aria-label=${t("Order")} value=${sort} onChange=${(e) => setSort(e.target.value)}>
+          ${hubTab ? html`<select id="hf-sort" aria-label=${t("Order")} value=${sort} onChange=${(e) => { pinnedHubRepo.current = ""; setSort(e.target.value); }}>
             ${SORTS.map(([k, name]) => html`<option value=${k}>${t(name)}</option>`)}</select>` : null}
           ${hubTab ? html`<button type="button" class=${"btn epbtn" + (isCustomEndpoint ? " on" : "")} id="hf-ep-toggle"
                     aria-expanded=${String(epOpen)} title=${t("Hugging Face mirror or endpoint") + ": " + hubEndpoint}

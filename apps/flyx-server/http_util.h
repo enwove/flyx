@@ -39,9 +39,11 @@ bool sse_data(httplib::DataSink& sink, const ojson& payload);
 bool sse_event(httplib::DataSink& sink, std::string_view event, const ojson& payload);
 
 enum class Access {
-  kManage,        // API key, direct loopback, or keyless LAN when lan_manage is effective and Host matches listener
-  kLocalOrKeyed,  // API key or direct loopback (never keyless LAN; e.g. Hub mirror mutation)
-  kLocalOnly,     // Direct loopback only (desktop dialogs, shell launch, closing local apps)
+  kDashboardRead,  // Private dashboard metadata (/v1/telemetry, GET /v1/load): API key, direct loopback, or keyless
+                   // LAN with a trusted listener Host (never forwarded)
+  kManage,         // API key, direct loopback, or keyless LAN when lan_manage is effective and Host matches listener
+  kLocalOrKeyed,   // API key or direct loopback (never keyless LAN; e.g. Hub mirror mutation)
+  kLocalOnly,      // Direct loopback only (desktop dialogs, shell launch, closing local apps)
 };
 
 #if defined(_WIN32)
@@ -50,10 +52,22 @@ inline constexpr bool kDefaultWindowsPaths = true;
 inline constexpr bool kDefaultWindowsPaths = false;
 #endif
 
+// Result of probing whether a Windows path component is a reparse point (symlink/junction).
+enum class ReparseState {
+  kNone,            // Not a reparse point (ordinary file/directory or does not exist).
+  kTarget,          // Symlink or mount point with decoded substitute target in `target`.
+  kUnknownOrError,  // Reparse point inspection failed or encountered an unsupported/malformed tag (fail closed).
+};
+
+struct ReparseResult {
+  ReparseState state = ReparseState::kNone;
+  std::string target;
+};
+
 // Injectable filesystem probe for testing Windows mapped-drive and reparse-point checks without touching SMB.
 struct PathSafetyProbe {
   std::function<bool(char drive_letter)> is_remote_drive;
-  std::function<std::optional<std::string>(std::string_view path)> reparse_target;
+  std::function<ReparseResult(std::string_view path)> reparse_info;
 };
 
 std::string ascii_lower(std::string_view s);

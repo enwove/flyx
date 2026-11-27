@@ -475,7 +475,6 @@ void* device_alias(size_t bytes, DevicePieces* out);
 // device_room keeps below memory made of them: kPiecesFloor for pieces of kPieceBytes at most, kPagedFloor where the
 // granularity is larger or there is no VMM (one allocation instead).
 bool vmm_supported();
-size_t vmm_granularity();
 size_t pieces_floor();
 // Minimum VRAM reserve floor the backend requires for its device allocations (Windows WDDM: pieces_floor(); 0 elsewhere).
 uint64_t device_reserve_floor();

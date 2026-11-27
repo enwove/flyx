@@ -7,6 +7,7 @@
 #include <atomic>
 #include <cstdint>
 #include <filesystem>
+#include <functional>
 #include <optional>
 #include <string>
 #include <string_view>
@@ -170,13 +171,27 @@ struct LocalModel {
   int mtp_layers = -1;       // cached <arch>.nextn_predict_layers for kind == "gguf"
   std::filesystem::file_time_type modified = std::filesystem::file_time_type::min();
 };
-// Expands a leading "~" ("~", "~/...", "~\...") to the user's home directory; other paths stay unchanged.
+// Expands a leading "~" ("~", "~/...", and "~\..." on Windows) to the user's home directory; other paths stay unchanged.
 std::string expand_user_path(const std::string& path);
 // Canonicalizes a configured --models-dir / FLYX_MODELS_DIR root (expands "~", resolves absolute, normalizes
-// separators, strips trailing separators except filesystem roots).
+// native separators, strips trailing native separators except filesystem roots without collapsing ".." across symlinks).
 std::string canonical_model_dir(std::string_view raw);
+// Authorization predicate evaluated BEFORE any target-following inspection or recursion (returns true if allowed).
+using PathAllowFn = std::function<bool(std::string_view)>;
+// Injectable filesystem operations for deterministic tests verifying scan_model_dirs checks allow_path first.
+struct ScanFs {
+  std::function<bool(const std::filesystem::path&, std::error_code&)> is_directory;
+  std::function<bool(const std::filesystem::path&, std::error_code&)> is_regular_file;
+  std::function<uint64_t(const std::filesystem::path&, std::error_code&)> file_size;
+  std::function<std::filesystem::file_time_type(const std::filesystem::path&, std::error_code&)> last_write_time;
+  std::function<std::filesystem::path(const std::filesystem::path&, std::error_code&)> weakly_canonical;
+  std::function<std::vector<std::filesystem::path>(const std::filesystem::path&, std::error_code&)> list_dir;
+  std::function<GgufClassification(const std::string&, const std::string&, uint64_t,
+                                   std::filesystem::file_time_type)> classify_gguf;
+};
 // `deepest`: how many directories down a file may be (1: only in the directory named).
-std::vector<LocalModel> scan_model_dirs(const std::vector<std::string>& dirs, int deepest = 6);
+std::vector<LocalModel> scan_model_dirs(const std::vector<std::string>& dirs, int deepest = 6,
+                                        const PathAllowFn& allow_path = {}, const ScanFs* fs_ops = nullptr);
 // FLYX_MODELS_DIR's directories: separated by ';' on Windows, ':' elsewhere (as PATH is).
 std::vector<std::string> models_dirs_from_env();
 // Unix seconds for the model listing; last_write_time's error value is reported as 0.

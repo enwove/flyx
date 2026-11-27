@@ -432,7 +432,17 @@ std::string held_note(const GpuHeld& h) {
          (h.runtime ? ", flyx's own runtime " + gb(h.runtime) : "");
 }
 
-bool closable(const GpuHeld& h) { return interfaces::closable_others(h.others, h.runtime_known); }
+bool closable(const GpuHeld& h) {
+  return h.others >= (h.runtime_known ? interfaces::kClosableOthersKnownBytes : interfaces::kClosableOthersUnknownBytes);
+}
+
+std::string oom_fix_advice(bool has_others, bool has_drafter) {
+  if (has_others) {
+    return std::string("Close other apps") + (has_drafter ? ", disable speculative decoding" : "") +
+           ", or use a smaller quantization.";
+  }
+  return has_drafter ? "Disable speculative decoding or use a smaller quantization." : "Use a smaller quantization.";
+}
 
 std::string ctx_limit_note(const Budget& b) {
   if (b.ctx_limit == CtxLimit::kHost)

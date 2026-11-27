@@ -48,8 +48,18 @@ struct ListenConfig {
 struct LanManage {
   bool from_cli = false;
   std::atomic<bool> saved{false};
-  bool requested(bool api_key_set) const { return from_cli || (!api_key_set && saved.load(std::memory_order_acquire)); }
-  bool effective(const ListenConfig& l, bool api_key_set) const { return l.lan && !api_key_set && requested(api_key_set); }
+  static bool requested_for(bool from_cli_v, bool saved_v, bool api_key_set) {
+    return from_cli_v || (!api_key_set && saved_v);
+  }
+  static bool effective_for(bool from_cli_v, bool saved_v, const ListenConfig& l, bool api_key_set) {
+    return l.lan && !api_key_set && requested_for(from_cli_v, saved_v, api_key_set);
+  }
+  bool requested(bool api_key_set) const {
+    return requested_for(from_cli, saved.load(std::memory_order_acquire), api_key_set);
+  }
+  bool effective(const ListenConfig& l, bool api_key_set) const {
+    return effective_for(from_cli, saved.load(std::memory_order_acquire), l, api_key_set);
+  }
 };
 
 struct Server {

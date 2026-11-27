@@ -192,7 +192,7 @@ export function Integration({ active }) {
               <tr><td><code>ctx</code></td>${Td(String.raw`context per session, or <code>"max"</code>; left out (auto): the model's own, or the longest the GPU and host memory hold`)}</tr>
               <tr><td><code>drafter</code>, <code>speculative</code></td>${Td(String.raw`<code>mtp</code> | <code>dflash2</code> | <code>dflash</code> | <code>dspark</code> | <code>dspine</code> | <code>all</code> | <code>none</code>; <code>false</code> for plain decoding`)}</tr>
               <tr><td><code>kv</code>, <code>kv_ram</code>, <code>kv_gpu</code></td>${Td(String.raw`as <code>--kv</code>, <code>--kv-ram</code> (GB or <code>"auto"</code>), <code>--kv-gpu</code>`)}</tr>
-              <tr><td><code>vram_reserve</code>, <code>ram_reserve</code></td>${Td(String.raw`as <code>--vram-reserve</code>, <code>--ram-reserve</code> (GB to leave free, <code>0</code> for all, or <code>"auto"</code>)`)}</tr>
+              <tr><td><code>vram_reserve</code>, <code>ram_reserve</code></td>${Td(String.raw`as <code>--vram-reserve</code>, <code>--ram-reserve</code> (GB to leave free, <code>0</code> for minimum/all, or <code>"auto"</code>)`)}</tr>
               <tr><td><code>name</code></td>${Td(String.raw`the model id the API reports`)}</tr>
               <tr><td><code>lora</code></td>${Td(String.raw`a LoRA adapter beside the model, as <code>--lora</code>: a PEFT folder or a Hub name (<code>org/name</code>, <code>org/name:FOLDER</code>); <code>null</code> for none`)}</tr>
             </tbody></table>
@@ -330,7 +330,7 @@ export function Integration({ active }) {
           <tr><td><code>--kv fp8|16</code></td>${Td(String.raw`the K/V cache: fp8 holds twice the context; 16 is llama.cpp's binary16 (the default where 32 GB of GPU memory are left after the weights and on Llama models, else fp8)`)}</tr>
           <tr><td><code>--kv-ram GB|auto</code></td>${Td(String.raw`host memory for the K/V past the GPU's part (auto; 0: the context shrinks to fit the GPU)`)}</tr>
           <tr><td><code>--kv-gpu N</code></td>${Td(String.raw`at most N tokens' K/V on the GPU, the rest in host memory`)}</tr>
-          <tr><td><code>--vram-reserve GB|auto</code></td>${Td(String.raw`GPU memory kept free outside FLYX (auto; 0: use all available VRAM)`)}</tr>
+          <tr><td><code>--vram-reserve GB|auto</code></td>${Td(String.raw`GPU memory kept free outside FLYX (auto; 0: minimum allowed by the backend/OS)`)}</tr>
           <tr><td><code>--ram-reserve GB|auto</code></td>${Td(String.raw`host RAM kept free outside KV (auto; 0: use all available RAM)`)}</tr>
           <tr><td><code>--kv-method M</code></td>${Td(String.raw`<code>auto</code> = <code>auto:2</code> (default), <code>exact</code>, <code>strata</code> = <code>strata:2</code>. <code>auto:3</code> uses a 3-bit scan after the switch.`)}</tr>
           <tr><td><code>--drafter D</code></td><td><code>mtp</code> | <code>dflash2</code> | <code>dflash</code> | <code>dspark</code> | <code>dspine</code> | <code>dv</code> | <code>all</code> | <code>none</code></td></tr>

@@ -402,12 +402,17 @@ bool ModelHost::lan_access() { return read_network_settings().lan_access; }
 
 bool ModelHost::remote_manage() { return read_network_settings().remote_manage; }
 
-ModelHost::NetworkSettingsSnapshot ModelHost::read_network_settings() {
-  std::lock_guard<std::mutex> lock(settings_mutex());
-  const ojson root = read_settings_locked();
+namespace {
+ModelHost::NetworkSettingsSnapshot snapshot_of(const ojson& root) {
   if (!root.is_object()) return {};
   return {root.contains("lan_access") && root["lan_access"] == true,
           root.contains("remote_manage") && root["remote_manage"] == true};
+}
+}  // namespace
+
+ModelHost::NetworkSettingsSnapshot ModelHost::read_network_settings() {
+  std::lock_guard<std::mutex> lock(settings_mutex());
+  return snapshot_of(read_settings_locked());
 }
 
 bool ModelHost::save_network_settings(std::optional<bool> lan_access, std::optional<bool> remote_manage,
@@ -424,10 +429,7 @@ bool ModelHost::save_network_settings(std::optional<bool> lan_access, std::optio
   if (remote_manage.has_value()) root["remote_manage"] = *remote_manage;
   if (!write_settings_locked(root, err)) return false;
   if (remote_manage.has_value() && on_remote_manage_committed) on_remote_manage_committed(*remote_manage);
-  if (out_snapshot) {
-    out_snapshot->lan_access = root.contains("lan_access") && root["lan_access"] == true;
-    out_snapshot->remote_manage = root.contains("remote_manage") && root["remote_manage"] == true;
-  }
+  if (out_snapshot) *out_snapshot = snapshot_of(root);
   return true;
 }
 

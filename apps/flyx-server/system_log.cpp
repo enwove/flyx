@@ -1,6 +1,6 @@
 // Copyright 2026 The flyx Authors. SPDX-License-Identifier: Apache-2.0
-// The system log and GET /v1/logs?after=SEQ&limit=N (default 500, at most 2000, oldest first): for
-// this machine, or with --api-key for the key's holder (may_manage), as the request log: it names files and requests.
+// The system log and GET /v1/logs?after=SEQ&limit=N (default 500, at most 2000, oldest first): gated by
+// Access::kManage, as the request log: it names files and requests.
 #include "apps/flyx-server/system_log.h"
 
 #include <algorithm>
