@@ -1863,6 +1863,24 @@ void test_inkling2_moe() {
         }
       moe_sum_slots(ds, dw, rows, top_k, hidden, out, accumulate, 0);
       expect("moe_sum_slots vs float64", down(out, rows * hidden), expected, 4e-7);
+      std::vector<int> route(rows * top_k);
+      Vec resident = slots, cold = slots;
+      for (int pair = 0; pair < rows * top_k; ++pair) {
+        route[pair] = pair % 3;
+        auto& unused = route[pair] < 2 ? cold : resident;
+        std::fill_n(unused.data() + pair * hidden, hidden, -100.);
+      }
+      auto* dr = dev<int>(route.size());
+      CK(cudaMemcpy(dr, route.data(), route.size() * sizeof(int), cudaMemcpyHostToDevice));
+      auto* hot = up(resident);
+      auto* host_values = up(cold);
+      auto* merged = up(residual);
+      moe_sum_mapped(hot, host_values, dr, 2, dw, rows, top_k, hidden, merged, accumulate, 0);
+      expect_bits("mixed CPU and GPU slot reduction", down(merged, rows * hidden), down(out, rows * hidden));
+      cudaFree(merged);
+      cudaFree(host_values);
+      cudaFree(hot);
+      cudaFree(dr);
       cudaFree(out);
     }
     cudaFree(dw);

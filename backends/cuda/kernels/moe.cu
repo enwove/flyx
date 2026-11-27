@@ -9,6 +9,7 @@
 //     both k_moe_blocks_q8_dp4a and INT8 Tensor Core k_moe_blocks_q8_mma.
 //   * BF16: fixed kMoeKT=1024 per-lane FMA + balanced xor tree across decode and compacted grouped tasks.
 #include <algorithm>
+#include <cuda/atomic>
 #include <cfloat>
 #include <cmath>
 #include <cstdio>
@@ -1351,37 +1352,44 @@ void situ_rows(const float* gu, int ld_gu, int I, float beta, float linear_beta,
 __global__ void k_moe_place_ids(int* ids, int pairs, int experts, const int* slots, uint32_t* counts, int* invalid,
                                 ResidentRoutes resident) {
   const int i = blockIdx.x * blockDim.x + threadIdx.x;
-  // One decode row fits the mapped handoff. Event completion makes these writes visible to the host.
+  // All producers of a ticketed packet belong to one CTA.
   for (size_t j = size_t(i); j < size_t(resident.width); j += size_t(blockDim.x) * gridDim.x)
     resident.host_input[j] = resident.input[j];
-  if (i < pairs) {
-    const int id = ids[i];
+  for (size_t slot = i; slot < size_t(pairs); slot += size_t(blockDim.x)*gridDim.x) {
+    const int id = ids[slot];
     if (unsigned(id) >= unsigned(experts)) {
       // A streamed pass still writes this pair via slot zero. Decode checks the sentinel during its handoff.
       if (invalid) atomicExch(invalid, 1);
-      ids[i] = invalid ? 0 : -1;
-      if (resident.ids) resident.ids[i] = 0;
-      if (resident.host_ids) resident.host_ids[i] = -1;
-      return;
-    }
-    if (counts) {
-      unsigned old = atomicAdd(counts + id, 0u);
-      while (old != UINT_MAX) {
-        const unsigned prior = atomicCAS(counts + id, old, old + 1);
-        if (prior == old) break;
-        old = prior;
+      ids[slot] = invalid ? 0 : -1;
+      if (resident.ids) resident.ids[slot] = 0;
+      if (resident.host_ids) resident.host_ids[slot] = -1;
+    } else {
+      if (counts) {
+        unsigned old = atomicAdd(counts + id, 0u);
+        while (old != UINT_MAX) {
+          const unsigned prior = atomicCAS(counts + id, old, old + 1);
+          if (prior == old) break;
+          old = prior;
+        }
       }
+      const int physical = slots ? slots[id] : id;
+      ids[slot] = physical;
+      if (resident.host_ids) resident.host_ids[slot] = physical;
+      if (resident.ids) resident.ids[slot] = unsigned(physical) < unsigned(resident.experts) ? physical : 0;
     }
-    const int physical = slots ? slots[id] : id;
-    ids[i] = physical;
-    if (resident.host_ids) resident.host_ids[i] = physical;
-    if (resident.ids) resident.ids[i] = unsigned(physical) < unsigned(resident.experts) ? physical : 0;
+  }
+  // Each producer participates before the one system-scope release. One CTA owns a ticketed packet.
+  if (resident.ticket) {
+    __syncthreads();
+    if (threadIdx.x == 0)
+      ::cuda::atomic_ref<uint32_t, ::cuda::thread_scope_system>(*resident.ticket)
+          .store(resident.generation, ::cuda::memory_order_release);
   }
 }
 
 void moe_place_ids(int* ids, int pairs, int experts, const int* slots, uint32_t* counts, int* invalid, cudaStream_t st,
                    ResidentRoutes resident) {
-  k_moe_place_ids<<<ceil_div(pairs, 128), 128, 0, st>>>(ids, pairs, experts, slots, counts, invalid, resident);
+  k_moe_place_ids<<<resident.ticket ? 1 : ceil_div(pairs, 128), 128, 0, st>>>(ids, pairs, experts, slots, counts, invalid, resident);
 }
 
 __global__ void k_moe_resident_ids(const int* ids, int* safe, int pairs, int hot) {
@@ -1391,6 +1399,34 @@ __global__ void k_moe_resident_ids(const int* ids, int* safe, int pairs, int hot
 
 void moe_resident_ids(const int* ids, int* safe, int pairs, int hot, cudaStream_t st) {
   k_moe_resident_ids<<<ceil_div(pairs, 128), 128, 0, st>>>(ids, safe, pairs, hot);
+}
+
+// Cold output is published by the host before launch. Each slot retains its original FMA position.
+__global__ void k_moe_sum_mapped(const float* slots, const float* cold, const int* ids, int resident,
+                                 const float* weights, int top_k, int hidden, float* out, bool accumulate) {
+  const int n = blockIdx.x * blockDim.x + threadIdx.x;
+  if (n >= hidden) return;
+  const size_t row = blockIdx.y;
+  float total = 0.f;
+  for (int k = 0; k < top_k; ++k) {
+    const size_t pair = row * top_k + k;
+    const float* source = ids[pair] >= resident ? cold : slots;
+    total = __fmaf_rn(weights[pair], source[pair * hidden + n], total);
+  }
+  float& result = out[row * hidden + n];
+  result = accumulate ? result + total : total;
+}
+
+void moe_sum_mapped(const float* slots, const float* cold, const int* ids, int resident, const float* weights,
+                    int rows, int top_k, int hidden, float* out, bool accumulate, cudaStream_t st) {
+  for (int at = 0; at < rows;) {
+    const int count = std::min(rows-at, kMaxGridY);
+    const size_t first = size_t(at)*top_k;
+    k_moe_sum_mapped<<<dim3(ceil_div(hidden, 256), count), 256, 0, st>>>(
+        slots + first*hidden, cold + first*hidden, ids + first, resident, weights + first, top_k, hidden,
+        out + size_t(at)*hidden, accumulate);
+    at += count;
+  }
 }
 
 void moe_sum_slots(const float* slots, const float* weights, int rows, int top_k, int hidden, float* out,

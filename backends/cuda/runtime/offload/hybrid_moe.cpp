@@ -95,13 +95,15 @@ void hybrid_experts(const Pass& ps, const MoeBlock& f, const MoeScratch* sc, flo
         !ps.round && ws.staging.stream() && sc && sc->chunk_rows >= 3 && ps.rows >= std::max(2, min_rows);
     auto placement = ws.placements.find(f.cold_gu.get());
     const bool mapped_chunk = placement != ws.placements.end() && !stage && ps.rows <= ColdShape::chunk;
-    const bool direct = mapped_chunk && ps.rows == 1 && ws.mapped_ids && ws.mapped_input;
+    const bool direct = mapped_chunk && ws.mapped_ids && ws.mapped_input && ps.rows * K <= 128;
+    const bool ticketed = direct && ws.mapped_ticket;
+    const auto generation = ticketed ? ++ws.next_ticket : 0;
     if (placement != ws.placements.end() || stage) {
       auto* map = placement == ws.placements.end() ? nullptr : &placement->second;
       moe_place_ids(b.moe_idx, ps.rows * K, f.n_experts, map ? map->slots : nullptr,
                     map && !ps.round ? map->counts : nullptr, stage ? ps.s->route_error : nullptr, L.st,
                     {mapped_chunk ? ws.resident_ids : nullptr, f.gate_up.n_experts, direct ? ws.mapped_ids : nullptr,
-                     b.h, ws.mapped_input, direct ? H : 0});
+                     b.h, ws.mapped_input, direct ? ps.rows * H : 0, ticketed ? ws.mapped_ticket : nullptr, generation});
       if (map && !ps.round) ws.pending_counts = true;
     }
     if (stage) {
@@ -119,7 +121,8 @@ void hybrid_experts(const Pass& ps, const MoeBlock& f, const MoeScratch* sc, flo
       auto* ids = b.moe_idx + size_t(base) * K;
       float* input = b.h + size_t(base) * H;
       auto start = ws.stats.verbose || t ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
-      HostHandoff handoff(L.st, ws.handoff, ids, ws.ids, size_t(rows) * K, input, ws.input, size_t(rows) * H, direct);
+      HostHandoff handoff(L.st, ws.handoff, ids, ws.ids, size_t(rows) * K, input, ws.input, size_t(rows) * H, direct,
+                          ticketed ? ws.ticket : nullptr, generation);
       if (t) CK(cudaEventRecord(ws.timer[0], L.st));
       if (f.gate_up.n_experts) {
         if (!mapped_chunk) moe_resident_ids(ids, ws.resident_ids, rows * K, f.gate_up.n_experts, L.st);
@@ -208,7 +211,7 @@ void hybrid_experts(const Pass& ps, const MoeBlock& f, const MoeScratch* sc, flo
           if (t) t->cpu += dt * 1e6;
         }
         if (t) CK(cudaEventRecord(ws.timer[2], L.st));
-        for (size_t i = 0; i < ws.cold.size();) {
+        for (size_t i = 0; !ws.mapped_output && i < ws.cold.size();) {
           int slot = ws.cold[i++];
           size_t count = 1;
           while (i < ws.cold.size() && size_t(ws.cold[i]) == slot + count) {
@@ -221,7 +224,11 @@ void hybrid_experts(const Pass& ps, const MoeBlock& f, const MoeScratch* sc, flo
         }
       }
       if (t) CK(cudaEventRecord(ws.timer[3], L.st));
-      moe_sum_slots(ws.gpu_slots, b.moe_w + size_t(base) * K, rows, K, H, out + size_t(base) * H, accumulate, L.st);
+      if (ws.mapped_output && !ws.cold.empty())
+        moe_sum_mapped(ws.gpu_slots, ws.mapped_output, ids, f.cold_gu->first, b.moe_w + size_t(base) * K, rows, K, H,
+                       out + size_t(base) * H, accumulate, L.st);
+      else
+        moe_sum_slots(ws.gpu_slots, b.moe_w + size_t(base) * K, rows, K, H, out + size_t(base) * H, accumulate, L.st);
       if (t) {
         CK(cudaEventRecord(ws.timer[4], L.st));
         CK(cudaEventSynchronize(ws.timer[4]));

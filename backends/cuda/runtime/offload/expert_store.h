@@ -36,8 +36,9 @@ struct ColdShape {
   }
   size_t quant_bytes() const { return size_mul((inputs + 31) / 32 + (activations + 31) / 32, sizeof(ColdQ8)); }
   size_t pinned_bytes() const {
-    return size_add(size_mul(size_add(inputs, outputs), sizeof(float)),
-                    size_add(size_mul(pairs, sizeof(int)), size_mul(2, bank_bytes)));
+    return size_add(pairs ? sizeof(uint32_t) : 0,
+                    size_add(size_mul(size_add(inputs, outputs), sizeof(float)),
+                             size_add(size_mul(pairs, sizeof(int)), size_mul(2, bank_bytes))));
   }
   size_t pageable_bytes() const {
     return size_add(quant_bytes(), size_add(size_mul(activations, sizeof(float)), size_mul(pairs, sizeof(int))));

@@ -1981,7 +1981,11 @@ struct ResidentRoutes {
   const float* input = nullptr;
   float* host_input = nullptr;
   int width = 0;
+  uint32_t* ticket = nullptr;
+  uint32_t generation = 0;
 };
+void moe_sum_mapped(const float* slots, const float* cold, const int* ids, int resident, const float* weights,
+                    int rows, int top_k, int hidden, float* out, bool accumulate, cudaStream_t st);
 void moe_place_ids(int* ids, int pairs, int experts, const int* slots, uint32_t* counts, int* invalid, cudaStream_t st,
                    ResidentRoutes resident = {});
 void moe_resident_ids(const int* ids, int* safe, int pairs, int hot, cudaStream_t st);

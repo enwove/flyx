@@ -28,7 +28,9 @@ struct ColdWorkspace {
   bool pending_counts = false, failed = false;
   std::mutex mutex;
   int *ids = nullptr, *resident_ids = nullptr, *mapped_ids = nullptr;
-  float* mapped_input = nullptr;
+  float *mapped_input = nullptr, *mapped_output = nullptr;
+  uint32_t *ticket = nullptr, *mapped_ticket = nullptr;
+  uint32_t next_ticket = 0;
   float *input = nullptr, *cpu_slots = nullptr, *gpu_slots = nullptr, *ones = nullptr;
   std::vector<float> act;
   std::vector<ColdQ8> gu_q8, down_q8;

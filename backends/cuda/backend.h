@@ -160,6 +160,7 @@ struct BackendOptions {
   int gpu_layers = INT_MAX;  // dense layers retained before the streamed suffix
   bool expert_adapt = true, expert_global = false, expert_integer = true;
   int expert_simd = 512;  // upper bound on vector width for cold CPU dots
+  bool expert_ticket = true, expert_mapped_output = true;
   bool keep_expert_archive = true;
   int expert_prefill_min = -1;  // minimum prompt rows for streamed GPU experts, zero uses the CPU path
   int expert_threads = 0;  // maximum CPU workers including the submitting thread, zero uses the default

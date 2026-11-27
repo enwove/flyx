@@ -240,6 +240,8 @@ const std::vector<OptionSpec>& option_specs() {
       whole_opt("expert_prefill_min", &BackendOptions::expert_prefill_min),
       whole_opt("expert_threads", &BackendOptions::expert_threads),
       whole_opt("expert_simd", &BackendOptions::expert_simd),
+      flag_opt("expert_ticket", &BackendOptions::expert_ticket),
+      flag_opt("expert_mapped_output", &BackendOptions::expert_mapped_output),
       flag_opt("expert_integer", &BackendOptions::expert_integer),
       flag_opt("expert_adapt", &BackendOptions::expert_adapt),
       flag_opt("expert_global", &BackendOptions::expert_global),
