@@ -91,6 +91,49 @@ void check(CUresult r, const char* what) {
 
 size_t round_up(size_t n, size_t g) { return (n + g - 1) / g * g; }
 
+// The bytes of a piece (kPieceBytes, a multiple of the granularity) and the pieces of `bytes` (a multiple of the
+// granularity): what create_pieces makes and map_pieces / unmap_pieces walk, the last piece the rest.
+size_t piece_of(const Vmm& v) { return std::max(v.gran, kPieceBytes / v.gran * v.gran); }
+
+// A driver call on device memory in pieces: its refusal for want of memory is OutOfDeviceMemory, as device_malloc's;
+// another error a std::runtime_error naming `what`.
+void piece_check(CUresult r, const char* what, size_t bytes) {
+  if (r == CUDA_SUCCESS) return;
+  if (r == CUDA_ERROR_OUT_OF_MEMORY)
+    throw OutOfDeviceMemory("out of GPU memory: " + std::to_string(bytes >> 20) + " MiB asked in pieces of " +
+                            std::to_string(kPieceBytes >> 20) + " MiB, the driver refused one");
+  throw std::runtime_error(std::string(what) + " failed (" + std::to_string(int(r)) + ")");
+}
+
+// Device memory of `bytes` (a multiple of the granularity) in pieces, each piece's handle pushed onto *handles as it
+// is made, so the caller releases what was made when a later one fails.
+void create_pieces(const Vmm& v, size_t bytes, std::vector<unsigned long long>* handles, const char* what) {
+  CUmemAllocationProp dp{};
+  dp.type = CU_MEM_ALLOCATION_TYPE_PINNED;
+  dp.location = {CU_MEM_LOCATION_TYPE_DEVICE, v.device};
+  const size_t piece = piece_of(v);
+  handles->reserve(handles->size() + (bytes + piece - 1) / piece);
+  for (size_t o = 0; o < bytes; o += piece) {
+    CUmemGenericAllocationHandle h = 0;
+    piece_check(v.create(&h, std::min(piece, bytes - o), &dp, 0), what, bytes);
+    handles->push_back(h);
+  }
+}
+
+void map_pieces(const Vmm& v, CUdeviceptr at, size_t bytes, const std::vector<unsigned long long>& handles,
+                const char* what) {
+  const size_t piece = piece_of(v);
+  for (size_t i = 0, o = 0; o < bytes; ++i, o += piece)
+    piece_check(v.map(at + o, std::min(piece, bytes - o), 0, CUmemGenericAllocationHandle(handles[i]), 0), what,
+                bytes);
+}
+
+// A range's mappings of map_pieces, each as it was made (cuMemUnmap takes whole mappings); one not made is let go.
+void unmap_pieces(const Vmm& v, CUdeviceptr at, size_t bytes) {
+  const size_t piece = piece_of(v);
+  for (size_t o = 0; o < bytes; o += piece) v.unmap(at + o, std::min(piece, bytes - o));
+}
+
 }  // namespace
 
 namespace flyx::cuda {
@@ -98,6 +141,74 @@ namespace flyx::cuda {
 size_t vmm_granularity() {
   const Vmm& v = vmm();
   return v.missing.empty() && v.gran > 0 ? v.gran : (2ull << 20);
+}
+
+void DevicePieces::release() {
+  if (!va && handles.empty()) return;
+  const Vmm& v = vmm();
+  if (va) {
+    if (alias) {
+      for (size_t o = 0; o < bytes; o += v.gran) v.unmap(CUdeviceptr(va) + o, v.gran);
+    } else {
+      unmap_pieces(v, CUdeviceptr(va), bytes);
+    }
+    v.address_free(CUdeviceptr(va), bytes);
+  }
+  for (unsigned long long h : handles) v.release(CUmemGenericAllocationHandle(h));
+  handles.clear();
+  va = 0;
+  bytes = 0;
+  alias = false;
+}
+
+namespace {
+
+// The address range of `bytes` (rounded up to the granularity) for *out, mapped by map(va) and readable and
+// writable by the device; null where the driver maps no memory.  *out is released on any error.
+template <class Map>
+void* map_range(size_t bytes, DevicePieces* out, Map&& map) {
+  const Vmm& v = vmm();
+  out->release();
+  if (!v.missing.empty() || bytes == 0) return nullptr;
+  const size_t total = round_up(bytes, v.gran);
+  try {
+    CUdeviceptr va = 0;
+    piece_check(v.reserve(&va, total, v.gran, 0, 0), "reserving device addresses", total);
+    out->va = va;
+    out->bytes = total;
+    map(v, va, total);
+    CUmemAccessDesc access{};
+    access.location = {CU_MEM_LOCATION_TYPE_DEVICE, v.device};
+    access.flags = CU_MEM_ACCESS_FLAGS_PROT_READWRITE;
+    piece_check(v.set_access(va, total, &access, 1), "granting the device access", total);
+  } catch (...) {
+    out->release();
+    throw;
+  }
+  return reinterpret_cast<void*>(out->va);
+}
+
+}  // namespace
+
+void* device_pieces(size_t bytes, DevicePieces* out) {
+  if (!vmm().missing.empty() || bytes == 0) return nullptr;
+  device_room(round_up(bytes, vmm().gran), kPiecesFloor);
+  return map_range(bytes, out, [&](const Vmm& v, CUdeviceptr va, size_t total) {
+    create_pieces(v, total, &out->handles, "allocating device memory in pieces");
+    map_pieces(v, va, total, out->handles, "mapping device memory in pieces");
+  });
+}
+
+void* device_alias(size_t bytes, DevicePieces* out) {
+  if (!vmm().missing.empty() || bytes == 0) return nullptr;
+  device_room(vmm().gran, kPiecesFloor);
+  return map_range(bytes, out, [&](const Vmm& v, CUdeviceptr va, size_t total) {
+    out->alias = true;
+    create_pieces(v, v.gran, &out->handles, "allocating device memory to alias");
+    for (size_t o = 0; o < total; o += v.gran)
+      piece_check(v.map(va + o, v.gran, 0, CUmemGenericAllocationHandle(out->handles[0]), 0),
+                  "mapping aliased device memory", total);
+  });
 }
 
 VmmSlab::~VmmSlab() {
@@ -284,13 +395,13 @@ flyx_seq::Tiered flyx_seq::tiered_alloc(size_t positions, size_t row, int role, 
       check(v.reserve(&va, va_sz, v.gran, 0, 0), "reserving addresses for a pageable ring");
       m.va = va;
       m.va_bytes = va_sz;
-      CUmemGenericAllocationHandle hd = 0, hr = 0;
-      check(v.create(&hd, dev, &dp, 0), "allocating device memory");
-      m.handles[0] = hd;
-      check(v.map(va, dev, 0, hd, 0), "mapping device memory");
-      check(v.map(vw, dev, 0, hd, 0), "mapping a view's device memory");
+      device_room(dev + ring_vmm, kPiecesFloor);
+      create_pieces(v, dev, &m.dev_handles, "allocating device memory");
+      map_pieces(v, va, dev, m.dev_handles, "mapping device memory");
+      map_pieces(v, vw, dev, m.dev_handles, "mapping a view's device memory");
+      CUmemGenericAllocationHandle hr = 0;
       check(v.create(&hr, ring_vmm, &dp, 0), "allocating device tail ring");
-      m.handles[1] = hr;
+      m.rest = hr;
       check(v.map(va + dev, ring_vmm, 0, hr, 0), "mapping device tail ring");
       check(v.set_access(va, va_sz, &access, 1), "granting the device access");
       CK(cudaMemsetAsync(reinterpret_cast<void*>(va), 0, dev + ring_vmm_bytes, st));
@@ -327,15 +438,15 @@ flyx_seq::Tiered flyx_seq::tiered_alloc(size_t positions, size_t row, int role, 
   m.va = va;
   check(v.reserve(&vw, total, v.gran, 0, 0), "reserving addresses for a view");
   m.view = vw;
-  CUmemGenericAllocationHandle hd = 0, hh = 0;
+  CUmemGenericAllocationHandle hh = 0;
   if (dev) {
-    check(v.create(&hd, dev, &dp, 0), "allocating device memory");
-    m.handles[0] = hd;
-    check(v.map(va, dev, 0, hd, 0), "mapping device memory");
-    check(v.map(vw, dev, 0, hd, 0), "mapping a view's device memory");
+    device_room(dev, kPiecesFloor);
+    create_pieces(v, dev, &m.dev_handles, "allocating device memory");
+    map_pieces(v, va, dev, m.dev_handles, "mapping device memory");
+    map_pieces(v, vw, dev, m.dev_handles, "mapping a view's device memory");
   }
   check(v.create(&hh, host, &hp, 0), "allocating host memory");
-  m.handles[1] = hh;
+  m.rest = hh;
   check(v.map(va + dev, host, 0, hh, 0), "mapping host memory");
   check(v.set_access(va, total, &access, 1), "granting the device access");
   // the view's staging, and its access, once the pool is there (pool_finish)
@@ -395,6 +506,7 @@ void flyx_seq::pool_finish() {
   access.location = {CU_MEM_LOCATION_TYPE_DEVICE, v.device};
   access.flags = CU_MEM_ACCESS_FLAGS_PROT_READWRITE;
   // The pool in pieces of the granularity: owned_pieces first, then shared prefill pieces at the tail.
+  device_room(owned_pool_bytes, kPiecesFloor);
   const size_t owned_pieces = owned_pool_bytes / v.gran;
   const size_t shared_pieces = prefill_shared / v.gran;
   pool_pieces.reserve(owned_pieces);
@@ -922,19 +1034,20 @@ void flyx_seq::release_mapped() {
     const Vmm& v = vmm();
     for (const Mapped& m : mapped) {
       if (m.va) {
-        if (m.dev) v.unmap(CUdeviceptr(m.va), m.dev);
+        if (m.dev) unmap_pieces(v, CUdeviceptr(m.va), m.dev);
         if (m.va_bytes > m.dev) v.unmap(CUdeviceptr(m.va) + m.dev, m.va_bytes - m.dev);
         v.address_free(CUdeviceptr(m.va), m.va_bytes);
       }
       if (m.view) {
-        if (m.dev) v.unmap(CUdeviceptr(m.view), m.dev);
+        if (m.dev) unmap_pieces(v, CUdeviceptr(m.view), m.dev);
         for (size_t o = m.dev; o < m.dev + m.stage; o += v.gran) v.unmap(CUdeviceptr(m.view) + o, v.gran);
         v.address_free(CUdeviceptr(m.view), m.bytes);
       }
     }
-    for (const Mapped& m : mapped)
-      for (auto h : m.handles)
-        if (h) v.release(CUmemGenericAllocationHandle(h));
+    for (const Mapped& m : mapped) {
+      for (auto h : m.dev_handles) v.release(CUmemGenericAllocationHandle(h));
+      if (m.rest) v.release(CUmemGenericAllocationHandle(m.rest));
+    }
     if (pool_va) {
       for (size_t o = 0; o < pool_bytes; o += v.gran) v.unmap(CUdeviceptr(pool_va) + o, v.gran);
       v.address_free(CUdeviceptr(pool_va), pool_bytes);

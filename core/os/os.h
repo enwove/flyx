@@ -113,8 +113,11 @@ SystemMemory system_memory();
 // The seconds the machine's processors have been busy since it started, all of them added up (a second of 16 busy
 // processors is 16): two readings give its load between them.  0 where the system does not say.
 double system_cpu_seconds();
-// Whether the GPU's memory is Windows' to page (its video memory manager, natively and under WSL2): an allocation
-// past what it lets a process keep is moved to host memory and read over the bus, never refused.
+// Whether the GPU's memory is Windows' to page out of the backend's sight (its video memory manager under WSL2): an
+// allocation past what it lets a process keep is moved to host memory and read over the bus, never refused, and the
+// driver there tells neither Windows' free memory nor a process's share.  Natively Windows pages it too, but the CUDA
+// backend reads NVML's free memory there and refuses an allocation that would leave less than Windows keeps free for
+// one of its size (backends/cuda: device_room), so the budget keeps its usual reserve.
 bool gpu_memory_paged();
 // Gives back the pages the process holds without needing them locked: on Windows its working set, so that the file
 // pages a load read count as available again (they stay cached; page-locked memory stays); elsewhere nothing (the

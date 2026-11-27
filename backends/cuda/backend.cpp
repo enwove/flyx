@@ -41,29 +41,30 @@ void test_device_room(size_t bytes);
 cudaError_t test_cuda_malloc(void** ptr, size_t bytes);
 #endif
 
-void device_room(size_t bytes) {
+void device_room(size_t bytes, size_t floor) {
 #ifdef FLYX_TEST_DEVICE_ALLOC
   test_device_room(bytes);
 #endif
 #if defined(_WIN32)
   // Windows' driver places an allocation past what its video memory manager keeps free in host memory instead of
-  // refusing it: refused here first, against NVML's free memory (gpu_memory) less kPagedFloor.
+  // refusing it: refused here first, against NVML's free memory (gpu_memory) less the floor for allocations that size.
   size_t free = 0, total = 0;
   if (!gpu_memory(&free, &total)) CK(cudaMemGetInfo(&free, &total));
-  if (bytes + kPagedFloor > free) {
+  if (bytes + floor > free) {
     char m[240];
     std::snprintf(m, sizeof(m), "out of GPU memory: %s asked, %.0f MiB free, of which flyx keeps %.0f MiB (past "
-                  "250 to 700 MiB free Windows puts allocations in host memory)", asked(bytes).c_str(),
-                  free / 1048576.0, kPagedFloor / 1048576.0);
+                  "70 to 630 MiB free, by the allocation's size, Windows puts allocations in host memory)",
+                  asked(bytes).c_str(), free / 1048576.0, floor / 1048576.0);
     throw OutOfDeviceMemory(m);
   }
 #else
   (void)bytes;
+  (void)floor;
 #endif
 }
 
 void* device_malloc(size_t bytes) {
-  device_room(bytes);
+  device_room(bytes, kPagedFloor);
   char m[240];
   // The driver refuses elsewhere; on Windows it may too (another program between device_room and the allocation).
   void* p = nullptr;
@@ -767,9 +768,13 @@ int open_model(const flyx_model_desc* desc, const flyx_open_options* opts, flyx_
     t[5] = load_clock();
   } catch (const OutOfDeviceMemory&) {
     // Not the free memory at the start: on Windows that leaves out what other programs hold until the GPU runs short.
+    // Past the free memory, what this process holds (the weights so far and its CUDA runtime) where the system says,
+    // else the weights so far: the rest is other programs'.
     size_t free = 0, total = 0;
     const bool mem_ok = gpu_memory(&free, &total) && total > 0;
-    const size_t others = mem_ok && total > free + m->bytes ? total - free - m->bytes : 0;
+    const size_t process = gpu_process_memory();
+    const size_t own = process >= m->bytes ? process : m->bytes;
+    const size_t others = mem_ok && total > free + own ? total - free - own : 0;
     const bool has_others = others >= (256ull << 20);
     // From the description: a drafter's layers may come before its block, and run out of memory before it is bound.
     bool drafter = false;

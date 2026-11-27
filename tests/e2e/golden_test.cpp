@@ -3741,6 +3741,57 @@ void graph_dv_rounds(const std::string& model, const std::string& backend, const
             kib(counted) + " they are counted at past them");
 }
 
+// What seq_size counts for round plans no session ran yet: a greedy round of each captured on a sequence of its own
+// whose device arena is one piece of memory under all its addresses (the backend's counting sequence), against each
+// plan's first graph on a session of the same layout that runs it.  Two engines alike, the same rounds lowered on each
+// past the load's (plain decoding and each of the drafter's widths, chains): on one seq_size counts them, on the other
+// a session of 64 tokens runs them first.  Every plan then counted the same way on both, seq_size gives the same.
+void graph_count_capture(const std::string& model, const std::string& backend, const std::vector<int32_t>& prompt,
+                         bool spec) {
+  auto a = make(model, backend, spec), b = make(model, backend, spec);
+  if (!b->api()->graph_stats) return;
+  struct Lowered {
+    Engine* e;
+    std::vector<flyx_plan*> plans;
+    ~Lowered() {
+      for (flyx_plan* p : plans) e->api()->plan_free(p);
+    }
+  } on_a{a.get(), {}}, on_b{b.get(), {}};
+  std::vector<std::pair<int, int>> rounds = {{0, -1}};  // (width, drafter)
+  for (size_t i = 0; i < a->widths().size(); ++i)
+    if (a->widths()[i] > 0 && a->round_drafters()[i] >= 0 && !a->round_trees()[i])
+      rounds.emplace_back(a->widths()[i], a->round_drafters()[i]);
+  for (const auto& [w, d] : rounds)
+    for (Lowered* on : {&on_a, &on_b}) {
+      auto program = on->e->model().round_program(w, d, false);
+      const flyx_program rp{FLYX_PHASE_ROUND, w, w + 1, static_cast<int32_t>(program.size()), program.data()};
+      flyx_plan* p = nullptr;
+      if (on->e->api()->lower(on->e->bmodel(), &rp, &p) == 0) on->plans.push_back(p);
+    }
+  const auto* api = b->api();
+  const flyx_seq_layout layout{64, INT32_MAX, FLYX_KV_READ_ALL, 0, 0};
+  flyx_seq* s = nullptr;
+  bool ran = on_a.plans.size() == rounds.size() && on_b.plans.size() == rounds.size() &&
+             api->seq_new_in(b->bmodel(), &layout, &s) == 0;
+  flyx_gen_params g{};
+  g.limit = 0;
+  flyx_round_result r{};
+  const int n = std::min<int>(8, int(prompt.size()));
+  ran = ran && api->prefill(b->prefill_plan(), s, prompt.data(), n, &g) == 0 && api->read(s, &r) == 0;
+  for (flyx_plan* p : on_b.plans) ran = ran && api->launch(p, s, &g) == 0 && api->read(s, &r) == 0;
+  flyx_graph_stats st{};
+  ran = ran && api->graph_stats(s, &st) == 0;
+  if (s) api->seq_free(s);
+  flyx_seq_size counted{}, run{};
+  const bool sized = a->api()->seq_size(a->bmodel(), &layout, &counted) == 0 &&
+                     api->seq_size(b->bmodel(), &layout, &run) == 0;
+  check(ran && st.captured == rounds.size() && sized && counted.device == run.device,
+        "round graphs counted on the counting sequence as on a session that runs them (" +
+            std::to_string(rounds.size()) + " plans lowered past the load's, " + std::to_string(st.captured) +
+            " graphs captured on the session): " + std::to_string(counted.device) + " and " +
+            std::to_string(run.device) + " bytes a session of 64 tokens");
+}
+
 }  // namespace
 
 // Sessions and engines give their device memory back: the device's free memory before and after 20 sessions, and
@@ -3778,6 +3829,8 @@ int device_memory(const std::string& model, const std::string& backend, const st
   graph_memory(model, backend, prompt, "all", 0);
   graph_after_batch(model, backend, prompt);
   graph_switching(model, backend, prompt);
+  graph_count_capture(model, backend, prompt, false);
+  graph_count_capture(model, backend, prompt, true);
   if (g_block == "dspine") {
     flyx_memory_info with{}, without{};
     flyx_load_estimate estimate{};

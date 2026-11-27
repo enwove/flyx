@@ -189,5 +189,6 @@ struct MoeBenchBuffers {
 // cuda_bench tune [FAMILIES] [FILE...] (tune.cu): this GPU's tuning table.
 int tune(int argc, char** argv);
 void bench_graphs(int argc, char** argv);  // graphs.cu
+int bench_paging(int argc, char** argv);   // paging.cu
 
 }  // namespace flyx::bench

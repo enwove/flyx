@@ -247,7 +247,7 @@ int main() {
       check(!ok && !err.empty(), "refuse a load that cannot cover the reserve, weights or workspace");
     }
   }
-  {  // where Windows pages GPU memory, reserve is max(base, 832 MiB) rather than base + 512 MiB
+  {  // where Windows pages GPU memory out of the backend's sight (WSL2), reserve is max(base, 832 MiB), not base + 512
     ResourceLedger ledger;
     plan::Budget b;
     std::string err;
@@ -257,7 +257,7 @@ int main() {
     const bool ok = plan::account(&api, nullptr, false, false, &ctx, 4096, paged, &ledger, &b, &err);
     const uint64_t paged_left = 16 * kGiB - 832 * kMiB - 10 * kGiB - kGiB / 2;
     const int want = int((paged_left - kGiB) / (64 * 1024)) / 1024 * 1024;
-    check(ok && ctx == want, "GPU memory Windows pages: 832 MiB reserve floor (" + std::to_string(ctx) + ", want " +
+    check(ok && ctx == want, "GPU memory Windows pages unseen (WSL2): 832 MiB reserve floor (" + std::to_string(ctx) + ", want " +
                                  std::to_string(want) + ")");
     check_shortfall_replay(api, paged, b, 262144, 4096);
   }

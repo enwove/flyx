@@ -294,7 +294,7 @@ ProcessUsage process_usage() {
   return u;
 }
 
-bool gpu_memory_paged() { return true; }
+bool gpu_memory_paged() { return false; }  // the CUDA backend keeps Windows' floors itself (os.h)
 
 SystemMemory system_memory() {
   SystemMemory m;

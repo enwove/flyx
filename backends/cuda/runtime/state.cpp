@@ -374,8 +374,9 @@ int ensure_prefill_rows(flyx_bmodel* m, int rows) {
       return reinterpret_cast<void*>(uintptr_t(256) + off);
     });
     // Never in host memory (device_room, device_malloc): a pass reads them a layer at a time.  Where the copies of the
-    // head kept for speed left no room, lowering fails and the engine has the backend give those back (trim).
-    device_room(total);
+    // head kept for speed left no room, lowering fails and the engine has the backend give those back (trim).  In
+    // pieces of the granularity (prefill_vmm_alloc) the floor of pieces; device_malloc, without them, keeps its own.
+    device_room(total, kPiecesFloor);
     size_t actual = 0;
     void* base = prefill_vmm_alloc(m, total, &actual);
     if (!base) {
@@ -451,7 +452,9 @@ uint64_t query_pinned_budget(const flyx_bmodel* m) {
   return host_pinned_budget();
 }
 
-int seq_new_in(flyx_bmodel* m, const flyx_seq_layout* layout, flyx_seq** out) {
+namespace {
+
+int new_seq(flyx_bmodel* m, const flyx_seq_layout* layout, bool capture_only, flyx_seq** out) {
   // Sample the WDDM pinned budget once so dry-run sizing and real allocation choose the identical hybrid split.
   const uint64_t pinned_budget = query_pinned_budget(m);
   // Dry-run first to measure the exact arena sizes so the real build performs one device and one host allocation
@@ -472,6 +475,7 @@ int seq_new_in(flyx_bmodel* m, const flyx_seq_layout* layout, flyx_seq** out) {
 
   auto s = std::make_unique<flyx_seq>();
   if (!take_method(m, layout, s.get())) return fail("seq_new: a K/V layout this backend does not read");
+  s->capture_only = capture_only;
   s->pinned_budget = pinned_budget;
   s->device_positions = std::max(0, layout->device_positions);
   s->copy_host = std::max(0, layout->copy_host);
@@ -488,9 +492,20 @@ int seq_new_in(flyx_bmodel* m, const flyx_seq_layout* layout, flyx_seq** out) {
   return 0;
 }
 
+}  // namespace
+
+int seq_new_in(flyx_bmodel* m, const flyx_seq_layout* layout, flyx_seq** out) {
+  return new_seq(m, layout, false, out);
+}
+
 int seq_new(flyx_bmodel* m, int32_t max_ctx, flyx_seq** out) {
   const flyx_seq_layout all{max_ctx, INT32_MAX, FLYX_KV_READ_ALL, 0, 0};
   return seq_new_in(m, &all, out);
+}
+
+int seq_new_capture(flyx_bmodel* m, int32_t max_ctx, flyx_seq** out) {
+  const flyx_seq_layout all{max_ctx, INT32_MAX, FLYX_KV_READ_ALL, 0, 0};
+  return new_seq(m, &all, true, out);
 }
 
 int seq_size(flyx_bmodel* m, const flyx_seq_layout* layout, flyx_seq_size* out) {
@@ -1330,10 +1345,16 @@ void build_seq(flyx_bmodel* m, int32_t max_ctx, flyx_seq* s) {
     CK(cudaEventCreateWithFlags(&s->idle_ev, cudaEventDisableTiming));
     CK(cudaEventCreateWithFlags(&s->ready_ev, cudaEventDisableTiming));
     if (s->arena_dev_bytes > 0) {
-      s->allocs.reserve(s->allocs.size() + 1);
-      void* p = device_malloc(s->arena_dev_bytes);
-      s->allocs.push_back(p);
-      CK(cudaMemsetAsync(p, 0, s->arena_dev_bytes, s->st));
+      // In pieces where the driver maps memory (Windows places them as allocations that small: kPiecesFloor); a
+      // sequence only captured, never run, over one piece; else one allocation.
+      void* p = s->capture_only ? device_alias(s->arena_dev_bytes, &s->arena_pieces)
+                                : device_pieces(s->arena_dev_bytes, &s->arena_pieces);
+      if (!p) {
+        s->allocs.reserve(s->allocs.size() + 1);
+        p = device_malloc(s->arena_dev_bytes);
+        s->allocs.push_back(p);
+      }
+      if (!s->capture_only) CK(cudaMemsetAsync(p, 0, s->arena_dev_bytes, s->st));
       s->dev_arena = static_cast<unsigned char*>(p);
       s->dev_arena_cap = s->arena_dev_bytes;
     }
