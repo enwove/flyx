@@ -16,6 +16,7 @@ ColdMatrix::ColdMatrix(const flyx_weight& w, int hot, const ExpertLayout& layout
       q8(layout.format == ExpertLayout::ggml_blocks && w.activations == FLYX_ACT_Q8),
       a16h(layout.format == ExpertLayout::ggml_blocks && !q8),
       nvfp4(layout.format == ExpertLayout::nvfp4) {
+  if (q8) quant_dot = cold_q8_kernel(dtype);
   const size_t count = size_t(w.t->shape[0] - hot), nrows = size_mul(count, size_t(rows));
   if (w.scale2) {
     if (!w.scale2->data) throw std::runtime_error("missing cold expert scales");
@@ -108,9 +109,11 @@ void ColdMatrix::prepare(float* x, bool vector_nvfp4) const {
   }
 }
 
-float ColdMatrix::product(int expert, int row, const float* x) const {
+float ColdMatrix::product(int expert, int row, const float* x, const ColdQ8* quant) const {
   size_t e = size_t(expert - first);
-  return cold_dot(dtype, data.data() + (e * rows + row) * stride, x, cols) * (scales.empty() ? 1.f : scales[e]);
+  const uint8_t* weights = data.data() + (e * rows + row) * stride;
+  const float dot = quant_dot ? quant_dot(weights, quant, cols) : cold_dot(dtype, weights, x, cols);
+  return dot * (scales.empty() ? 1.f : scales[e]);
 }
 
 struct ExpertTimes {
@@ -132,6 +135,7 @@ struct ColdWorkspace {
   int *ids, *resident_ids;
   float *input, *cpu_slots, *gpu_slots, *ones;
   std::vector<float> act;
+  std::vector<ColdQ8> gu_q8, down_q8;
   std::vector<int> cold;
   cudaEvent_t ready = nullptr;
   bool verbose = false;
@@ -218,6 +222,9 @@ void init_cold_experts(flyx_bmodel* m) {
   std::vector<float> ones(shape.pairs, 1.f);
   CK(cudaMemcpy(w->ones, ones.data(), shape.pairs * sizeof(float), cudaMemcpyHostToDevice));
   w->act.resize(shape.activations);
+  w->gu_q8.resize((shape.inputs + 31) / 32);
+  w->down_q8.resize((shape.activations + 31) / 32);
+  m->host_bytes += shape.quant_bytes();
   w->cold.reserve(shape.pairs);
   m->host_bytes += shape.activations * sizeof(float) + shape.pairs * sizeof(int);
   CK(cudaEventCreateWithFlags(&w->ready, cudaEventDisableTiming));
@@ -376,24 +383,35 @@ void hybrid_experts(const Pass& ps, const MoeBlock& f, const MoeScratch* sc, flo
         int last_row = -1;
         for (int slot : ws.cold) {
           const int row = slot / K;
-          if (row != last_row) f.cold_gu->prepare(ws.input + size_t(row) * H, vec);
+          if (row != last_row) {
+            if (f.cold_gu->quant_dot)
+              prepare_cold_q8(ws.input + size_t(row) * H, ws.gu_q8.data() + size_t(row) * (H / 32), H);
+            else
+              f.cold_gu->prepare(ws.input + size_t(row) * H, vec);
+          }
           last_row = row;
         }
         ws.pool.run(ws.cold.size() * I, [&](size_t a, size_t end) {
           for (size_t i = a; i < end; ++i) {
             int slot = ws.cold[i / I], j = int(i % I), e = ws.ids[slot];
             const float* x = ws.input + size_t(slot / K) * H;
-            float g = f.cold_gu->product(e, j, x), u = f.cold_gu->product(e, I + j, x);
+            const ColdQ8* quant = ws.gu_q8.data() + size_t(slot / K) * (H / 32);
+            float g = f.cold_gu->product(e, j, x, quant), u = f.cold_gu->product(e, I + j, x, quant);
             ws.act[size_t(slot) * I + j] =
                 float(f.situ_beta > 0 ? ops::situ(g, u, f.situ_beta, f.situ_linear_beta) : ops::silu(g) * u);
           }
         });
-        for (int slot : ws.cold) f.cold_down->prepare(ws.act.data() + size_t(slot) * I, vec);
+        for (int slot : ws.cold) {
+          float* x = ws.act.data() + size_t(slot) * I;
+          if (f.cold_down->quant_dot) prepare_cold_q8(x, ws.down_q8.data() + size_t(slot) * (I / 32), I);
+          else f.cold_down->prepare(x, vec);
+        }
         ws.pool.run(ws.cold.size() * H, [&](size_t a, size_t end) {
           for (size_t i = a; i < end; ++i) {
             int slot = ws.cold[i / H], j = int(i % H);
             ws.cpu_slots[size_t(slot) * H + j] =
-                f.cold_down->product(ws.ids[slot], j, ws.act.data() + size_t(slot) * I);
+                f.cold_down->product(ws.ids[slot], j, ws.act.data() + size_t(slot) * I,
+                                     ws.down_q8.data() + size_t(slot) * (I / 32));
           }
         });
         if (ws.verbose || t) {

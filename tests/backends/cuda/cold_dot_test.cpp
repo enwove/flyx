@@ -44,6 +44,19 @@ int main() {
       expected += term;
       norm += std::fabs(term);
     }
+    std::vector<cuda::ColdQ8> quant(cols / 32);
+    cuda::prepare_cold_q8(x.data(), quant.data(), cols);
+    double expected_q8 = 0, norm_q8 = 0;
+    for (int k = 0; k < cols; ++k) {
+      const auto& group = quant[k / 32];
+      const double term = ops::load(&view, k) * (double(group.d) * group.q[k % 32]);
+      expected_q8 += term;
+      norm_q8 += std::fabs(term);
+    }
+    for (int isa : {256, 512})
+      if (auto dot = cuda::cold_q8_kernel(dtype, isa))
+        test::check(std::fabs(dot(data.data(), quant.data(), cols) - expected_q8) <= 2e-6 * norm_q8,
+                    "integer cold dot vs float64 for dtype " + std::to_string(dtype) + " ISA " + std::to_string(isa));
     for (auto fn : {cuda::cold_dot_scalar, cuda::cold_dot}) {
       test::check(std::fabs(fn(dtype, data.data(), x.data(), cols) - expected) <= 2e-6 * norm,
                   "compressed CPU GEMV vs float64 for dtype " + std::to_string(dtype));
