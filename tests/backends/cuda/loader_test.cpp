@@ -2,6 +2,8 @@
 // Link the production binder and runtime with a backend.cpp whose device allocator can refuse a small request (or
 // fail its room check otherwise).
 #include <algorithm>
+#include <array>
+#include <numeric>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -437,13 +439,27 @@ void expert_estimates() {
                       std::isfinite(row[65]) && row[65] < 0.f,
                   "prepared nonfinite Q8 groups and elements");
         }
-        const auto raw = shared->data, packed = shared->archive;
-        const auto gains = shared->scales;
-        std::vector<uint8_t> bounce(shared->bank.bytes(1));
-        shared->exchange(0, 1, e, bounce.data());
-        shared->exchange(0, 1, e, bounce.data());
-        require(raw == shared->data && packed == shared->archive && gains == shared->scales,
-                "exchanging the same expert twice restores every byte");
+        for (const auto& matrix : {f.cold_gu, f.cold_down}) {
+          const auto raw = matrix->data, packed = matrix->archive;
+          const auto gains = matrix->scales;
+          const auto& bank = matrix->bank;
+          auto resident = [&] {
+            std::vector<uint8_t> image(bank.bytes(1));
+            auto copy = [&](const void* plane, size_t bytes, size_t offset) {
+              if (bytes) CK(cudaMemcpy(image.data() + offset, plane, bytes, cudaMemcpyDeviceToHost));
+            };
+            copy(matrix->resident.payload, bank.payload, 0);
+            copy(matrix->resident.scale, bank.scale, bank.scale_offset(1));
+            copy(matrix->resident.gains, bank.gains, bank.gain_offset(1));
+            return image;
+          };
+          const auto gpu = resident();
+          std::vector<uint8_t> bounce(bank.bytes(1));
+          matrix->exchange(0, 1, e, bounce.data());
+          matrix->exchange(0, 1, e, bounce.data());
+          require(raw == matrix->data && packed == matrix->archive && gains == matrix->scales && gpu == resident(),
+                  "exchanging the same expert twice restores the CPU rows, archive and device planes");
+        }
         auto& ws = *m.offload->experts();
         auto& place = ws.placements.at(shared.get());
         m.offload->on_session_open(&m);
@@ -470,6 +486,38 @@ void expert_estimates() {
         m.offload->on_session_close(&m);
       }
     }
+  }
+}
+
+void staging_rollover() {
+  constexpr int passes = 5, width = 64;
+  for (bool bounce : {false, true}) {
+    flyx_bmodel m;
+    StagingRing<2> ring;
+    ring.allocate(&m, {width, width}, bounce);
+    std::array<CudaStream, 2> readers;
+    for (auto& stream : readers) stream.create();
+    auto* output = m.alloc<uint8_t>(passes * width);
+    std::vector<uint8_t> expected(passes * width);
+    std::iota(expected.begin(), expected.end(), uint8_t(0));
+    const uint8_t* source = expected.data();
+    if (!bounce) {
+      auto* pinned = m.host_pinned<uint8_t>(expected.size());
+      std::copy(expected.begin(), expected.end(), pinned);
+      source = pinned;
+    }
+    for (int pass = 0; pass < passes; ++pass) {
+      auto& stream = readers[(pass / 2) % 2];
+      const size_t offset = size_t(pass) * width;
+      StagingRing<2>::Lease lease(ring, pass % 2, source + offset, width, stream);
+      lease.wait();
+      CK(cudaMemcpyAsync(output + offset, lease.device(), width, cudaMemcpyDeviceToDevice, stream));
+      lease.release();
+    }
+    for (auto& stream : readers) CK(cudaStreamSynchronize(stream));
+    std::vector<uint8_t> actual(expected.size());
+    CK(cudaMemcpy(actual.data(), output, actual.size(), cudaMemcpyDeviceToHost));
+    require(actual == expected, "two staging slots preserve five images across independent sequence streams");
   }
 }
 
@@ -707,6 +755,7 @@ int main() {
     companion_estimates();
     expert_estimates();
     layer_estimates();
+    staging_rollover();
     residual_query_extent();
     drafter_dimensions();
     staging_width();

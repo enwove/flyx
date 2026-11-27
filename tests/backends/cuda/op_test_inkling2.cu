@@ -2109,6 +2109,22 @@ void test_inkling2_moe() {
       m.n_experts = count;
       return m;
     };
+    {
+      auto gu = slice_bank(w_gu, E - 1, 1, H);
+      auto dn = slice_bank(w_dn, E - 1, 1, I);
+      int* zero_ids = dev<int>(2 * top_k);
+      auto* untouched = up(Vec(size_t(2) * top_k * std::max(I, H), -17.));
+      auto scratch = msc;
+      scratch.down_buf = untouched;
+      moe_bank_gate_up(d_x, H, gu, zero_ids, 2, top_k, I, H, beta, lb, true, untouched, I, &scratch, TL, false, nullptr,
+                       {E - 1, 1});
+      moe_bank_down(d_act_fused, I, dn, zero_ids, d_ew, 2, top_k, H, I, d_y_direct, H, false, &scratch, TL, nullptr, 0,
+                    {{E - 1, 1}, true});
+      expect_bits("zero-hit bank leaves slots untouched " + label, down(untouched, size_t(2) * top_k * std::max(I, H)),
+                  Vec(size_t(2) * top_k * std::max(I, H), -17.));
+      cudaFree(untouched);
+      cudaFree(zero_ids);
+    }
     for (int base = 0; base < R;) {
       const int rows = std::min(8, R - base);
       const size_t pair = size_t(base) * top_k;
