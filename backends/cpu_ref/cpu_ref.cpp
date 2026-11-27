@@ -1061,7 +1061,23 @@ void mtp_draft(RefSeq* s, const flyx_mtp_block& B, int width) {
     for (int c = 0; c < H; ++c) x[c] += y[c];
     norm(M, B.norm, x.data(), H, h.data());
     linear(h.data(), 1, H, M->w(head.w), V, logits.data());
-    int d = argmax(logits.data(), V);
+    // The head's best kMtpCands, the draft as ops::draft_choice takes it: the reply's penalties (its counts and this
+    // round's drafts before it), the sampling and the noise at its position, as the CUDA backend's mtp_choose.
+    // Its candidates: no padding row, at most the vocabulary.
+    const int Vc = head.vocab_out > 0 ? head.vocab_out : V, k = std::min(flyx::ops::kMtpCands, Vc);
+    int32_t cand[flyx::ops::kMtpCands], count[flyx::ops::kMtpCands];
+    double val[flyx::ops::kMtpCands];
+    float fval[flyx::ops::kMtpCands];
+    topk(logits.data(), Vc, k, cand, val);
+    const bool pen = penalized(s->gen);
+    for (int c = 0; c < k; ++c) {
+      fval[c] = float(val[c]);
+      count[c] = pen && !s->counts.empty() ? s->counts[size_t(cand[c])] : 0;
+      for (int j = 0; pen && j < i; ++j) count[c] += s->drafts[size_t(j)] == cand[c];
+    }
+    const flyx_gen_params& g = s->gen;
+    int d = flyx::ops::draft_choice(cand, fval, pen ? count : nullptr, k, Vc, g.temperature, g.top_p, g.top_k,
+                                    g.presence_penalty, g.frequency_penalty, g.seed, p + 1 + i);
     if (forced_drafts(s)) d = forced_draft(s, p + 1 + i);
     s->drafts[i] = d;
     tok = d;

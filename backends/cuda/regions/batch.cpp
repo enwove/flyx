@@ -133,6 +133,7 @@ void mtp_draft_rows(const BatchPass& bp, const MtpBlock& b, const std::vector<si
   const flyx_bmodel* m = bp.seq[members[0]].s->m;
   const auto& E = block<EmbedBlock>(m, b.embed);
   const auto& head = block<HeadBlock>(m, b.head);
+  const int K = std::min(ops::kMtpCands, head.vocab);  // the head's best a draft step chooses from
   const auto& a = block<AttnBlock>(m, b.attn);
   const auto& f = block<MlpBlock>(m, b.mlp);
   const int H = a.hidden, q_w = a.nh * a.hd;
@@ -177,13 +178,15 @@ void mtp_draft_rows(const BatchPass& bp, const MtpBlock& b, const std::vector<si
     if (A >= 2) {
       // Read the 1-bit or full draft head once across all A active sequences while keeping rough scores bit-identical
       // to 1-row solo mtp_draft() (exact_1row = true).
-      draft_head_pick(head, v.b.h, A, 1, v.b.choice, nullptr, pick_scratch(bp.seq[active[0]].s, v.logits), L, true);
+      draft_head_pick(head, v.b.h, A, K, v.b.mcand, v.b.mval, pick_scratch(bp.seq[active[0]].s, v.logits), L, true);
       for (int j = 0; j < A; ++j) {
         const Pass& ps = bp.seq[active[size_t(j)]];
         flyx_seq* s = ps.s;
         if (i + 1 < ps.p->nodes[0].arg0)
           CK(cudaMemcpyAsync(s->mg, v.b.h + size_t(j) * H, size_t(H) * sizeof(float), cudaMemcpyDeviceToDevice, st));
-        copy_ints(v.b.choice + j, s->mtok + i + 1, 1, st);
+        // each sequence's own sampling and position
+        mtp_choose(s->P, s->G, s->reply.count, v.b.mcand + size_t(j) * K, v.b.mval + size_t(j) * K, K, head.vocab, i,
+                   s->mtok, st);
         mtp_oracle(s->P, s->oracle, i, s->mtok, st);
       }
     } else {
@@ -191,7 +194,8 @@ void mtp_draft_rows(const BatchPass& bp, const MtpBlock& b, const std::vector<si
       flyx_seq* s = ps.s;
       if (i + 1 < ps.p->nodes[0].arg0)
         CK(cudaMemcpyAsync(s->mg, v.b.h, size_t(H) * sizeof(float), cudaMemcpyDeviceToDevice, st));
-      draft_head_pick(head, v.b.h, 1, 1, s->mtok + i + 1, nullptr, s, L);
+      draft_head_pick(head, v.b.h, 1, K, s->mcand, s->mval, s, L);
+      mtp_choose(s->P, s->G, s->reply.count, s->mcand, s->mval, K, head.vocab, i, s->mtok, st);
       mtp_oracle(s->P, s->oracle, i, s->mtok, st);
     }
   }

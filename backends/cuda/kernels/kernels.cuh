@@ -1429,6 +1429,11 @@ void hring_put(const DevParams* P, int pos_sel, bool skip_if_noop, const float* 
                int H, cudaStream_t st);
 // Test hook: mtok[step + 1] = oracle[P->position + 1 + step] when P->oracle_len > 0.
 void mtp_oracle(const DevParams* P, const int* oracle, int step, int* mtok, cudaStream_t st);
+// Draft step `step`'s token, mtok[step + 1], from the head's k best (k <= min(ops::kMtpCands, vocab); cand, val: best
+// first): ops::draft_choice with the reply's penalties (reply_count and the drafts before it), G's sampling and the
+// noise at the draft's position P->position + 1 + step; a candidate outside [0, vocab) is read as none.
+void mtp_choose(const DevParams* P, const DevGen* G, const int* reply_count, const int* cand, const float* val, int k,
+                int vocab, int step, int* mtok, cudaStream_t st);
 // A round's given drafts: drafts[i] = oracle[P->position + 1 + i] (0 past P->oracle_len), i < width.
 // dst = *P with its position add further on: a wide round's rows a..a+15 run as the round's rows 0..15 of a pass
 // at P->position + a (attention_strata takes up to FLYX_MAX_ROWS rows).

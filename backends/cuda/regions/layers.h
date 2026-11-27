@@ -6,6 +6,7 @@
 #pragma once
 
 #include "backends/cuda/backend.h"
+#include "ops/sampling/sampling.h"
 
 namespace flyx::cuda {
 

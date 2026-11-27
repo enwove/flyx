@@ -304,7 +304,11 @@ void mtp_draft(flyx_seq* s, const MtpBlock& b, int width, const Launch& L, bool 
     else gemm(own.act, nh * hd, a.w_out, H, nh * hd, own.mx, H, 1, true, L);
     mlp_body(own.mx, f, 1, own.h, own.proj, s->ld_proj, own.act, s->ld_act, L, fused);
     rmsnorm(own.mx, H, b.norm.w, b.norm.offset, b.norm.eps, s->mg, H, 1, H, st);
-    draft_head_pick(head, s->mg, 1, 1, s->mtok + i + 1, nullptr, s, L, s->draft_prob + i, s->draft_margin + i);
+    // the head's best kMtpCands (at most its vocabulary), then the draft: the best, or sampling the one coupled to the
+    // target's noise
+    const int K = std::min(ops::kMtpCands, head.vocab);
+    draft_head_pick(head, s->mg, 1, K, s->mcand, s->mval, s, L, s->draft_prob + i, s->draft_margin + i);
+    mtp_choose(s->P, s->G, s->reply.count, s->mcand, s->mval, K, head.vocab, i, s->mtok, st);
     mtp_oracle(s->P, s->oracle, i, s->mtok, st);
   }
   copy_ints(s->mtok + 1 + start, s->drafts + start, width - start, st);

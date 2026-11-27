@@ -706,6 +706,148 @@ void test_select() {
       }
     }
   }
+  {  // MTP's draft at step 2 from row 0's 16 candidates (ops::draft_choice): greedy, with penalties on the reply's
+     // counts and the round's drafts before it, and sampled through the target's filters and noise at its position
+    int* mtok = dev<int>(8);
+    std::vector<int> counts(size_t(V), 0), host_mtok = {1234, want_idx[3], want_idx[0], 0};
+    counts[size_t(want_idx[0])] = 2;  // the best candidate already twice in the reply
+    counts[size_t(want_idx[1])] = 1;
+    int* dcount = dev<int>(size_t(V));
+    CK(cudaMemcpy(dcount, counts.data(), counts.size() * sizeof(int), cudaMemcpyHostToDevice));
+    struct Case {
+      float temp, top_p;
+      int top_k;
+      float presence, frequency;
+    };
+    bool same = true;
+    for (const Case& c : {Case{0.f, 1.f, 0, 0.f, 0.f}, Case{0.f, 1.f, 0, 1.5f, 0.25f}, Case{0.7f, 0.8f, 20, 1.5f, 0.f},
+                          Case{1.3f, 1.f, 0, 0.f, 0.f}, Case{0.7f, 0.5f, 3, 0.f, 0.f}}) {
+      const uint64_t seed = 99;
+      DevGen g{};
+      g.temperature = c.temp, g.top_p = c.top_p, g.top_k = c.top_k, g.seed = seed;
+      g.presence = c.presence, g.frequency = c.frequency;
+      DevGen* dg = dev<DevGen>(1);
+      CK(cudaMemcpy(dg, &g, sizeof(g), cudaMemcpyHostToDevice));
+      CK(cudaMemcpy(mtok, host_mtok.data(), 4 * sizeof(int), cudaMemcpyHostToDevice));
+      mtp_choose(P, dg, dcount, ti, tv, k, V, 2, mtok, 0);
+      std::vector<int32_t> cand(want_idx.begin(), want_idx.begin() + k);
+      std::vector<float> val(k);
+      std::vector<int> cnt(k);
+      for (int x = 0; x < k; ++x) {
+        val[size_t(x)] = float(want_val[size_t(x)]);
+        const int t = cand[size_t(x)];  // the reply's count, and the drafts of steps 0 and 1 before it
+        cnt[size_t(x)] = counts[size_t(t)] + (host_mtok[1] == t) + (host_mtok[2] == t);
+      }
+      const bool pen = c.presence != 0.f || c.frequency != 0.f;
+      const int want_t = ops::draft_choice(cand.data(), val.data(), pen ? cnt.data() : nullptr, k, V, c.temp,
+                                           c.top_p, c.top_k, c.presence, c.frequency, seed, 10 + 1 + 2);
+      same = same && down_i(mtok, 4)[3] == want_t;
+    }
+    std::printf("  %-4s MTP draft from its candidates: greedy, penalties, the target's filters and noise\n",
+                same ? "ok" : "FAIL");
+    g_fail += !same;
+  }
+  {  // MTP's draft against a float64 oracle of the target's rule over the candidates, written apart from
+     // ops::draft_choice: small vocabularies, slots outside the vocabulary (unfilled: INT32_MAX) or of NaN logit, ties
+     // at top_k's and top_p's cut and at the best logit, penalties; the kernel and the host function, 40 seeds each.
+    struct Case {
+      const char* what;
+      int vocab;
+      std::vector<int32_t> cand;
+      std::vector<float> logit;
+      std::vector<int> count;  // empty: no penalties
+      float temp, top_p;
+      int top_k;
+      float presence, frequency;
+    };
+    const float nan = std::numeric_limits<float>::quiet_NaN();
+    const std::vector<Case> cases = {
+        {"a vocabulary of 5", 5, {3, 1, 4, 0, 2}, {2.f, 1.5f, 1.f, 0.5f, 0.f}, {}, 1.f, 1.f, 0, 0.f, 0.f},
+        {"unfilled and out-of-vocabulary slots", 6, {2, 5, INT32_MAX, -1, 7, 0}, {1.f, 0.9f, 3.f, 3.f, 3.f, 0.2f}, {},
+         0.8f, 1.f, 0, 0.f, 0.f},
+        {"a NaN logit", 6, {1, 2, 3}, {nan, 0.5f, 0.4f}, {}, 1.f, 1.f, 0, 0.f, 0.f},
+        {"no usable candidate", 4, {INT32_MAX, -1, 9}, {1.f, 1.f, 1.f}, {}, 1.f, 1.f, 0, 0.f, 0.f},
+        {"ties at top_k's cut", 50, {10, 11, 12, 13, 14}, {3.f, 2.f, 2.f, 2.f, 1.f}, {}, 1.f, 1.f, 2, 0.f, 0.f},
+        {"ties at top_p's cut", 50, {20, 21, 22, 23}, {1.f, 1.f, 1.f, 0.f}, {}, 1.f, 0.3f, 0, 0.f, 0.f},
+        {"greedy, a tie at the best", 50, {31, 30, 32}, {2.f, 2.f, 1.f}, {}, 0.f, 1.f, 0, 0.f, 0.f},
+        {"penalties", 50, {40, 41, 42, 43}, {2.f, 1.8f, 1.f, 0.9f}, {3, 0, 1, 0}, 0.7f, 0.9f, 0, 0.4f, 0.3f},
+        {"greedy with penalties", 50, {40, 41, 42}, {2.f, 1.8f, 1.f}, {2, 0, 0}, 0.f, 1.f, 0, 0.5f, 0.f},
+    };
+    // the oracle: float64, every candidate kept or not by value (no running order)
+    auto oracle = [](const Case& c, uint64_t seed, int64_t pos) -> int32_t {
+      std::vector<std::pair<int32_t, double>> u;  // usable: (token, penalized logit)
+      for (size_t i = 0; i < c.cand.size(); ++i) {
+        if (c.cand[i] < 0 || c.cand[i] >= c.vocab || std::isnan(c.logit[i])) continue;
+        const int n = c.count.empty() ? 0 : c.count[i];
+        u.push_back({c.cand[i], double(c.logit[i]) - (c.presence * (n > 0) + c.frequency * n)});
+      }
+      if (u.empty()) return 0;
+      auto better = [](const std::pair<int32_t, double>& a, const std::pair<int32_t, double>& b) {
+        return a.second > b.second || (a.second == b.second && a.first < b.first);
+      };
+      if (!(c.temp > 0.f)) return std::min_element(u.begin(), u.end(), better)->first;
+      double top = -INFINITY;
+      for (auto& [t, l] : u) top = std::max(top, l);
+      std::vector<std::pair<int32_t, double>> z;  // (token, z) with z above the cut
+      for (auto& [t, l] : u)
+        if ((l - top) / c.temp > ops::kSampleZMin) z.push_back({t, (l - top) / c.temp});
+      if (c.top_k > 0 && c.top_k < int(z.size())) {
+        std::vector<double> v;
+        for (auto& [t, x] : z) v.push_back(x);
+        std::sort(v.rbegin(), v.rend());
+        const double cut = v[size_t(c.top_k - 1)];
+        z.erase(std::remove_if(z.begin(), z.end(), [&](auto& e) { return e.second < cut; }), z.end());
+      }
+      if (c.top_p < 1.f) {
+        double mass = 0;
+        for (auto& [t, x] : z) mass += std::exp(x);
+        double cut = -INFINITY;  // the largest value whose candidates at or above it hold top_p of the mass
+        for (auto& [t, x] : z) {
+          double m = 0;
+          for (auto& [t2, x2] : z) m += x2 >= x ? std::exp(x2) : 0;
+          if (m >= c.top_p * mass) cut = std::max(cut, x);
+        }
+        z.erase(std::remove_if(z.begin(), z.end(), [&](auto& e) { return e.second < cut; }), z.end());
+      }
+      int32_t best = INT32_MAX;
+      double bs = -INFINITY;
+      for (auto& [t, x] : z) {
+        const double g = x - std::log(-std::log(double(ops::sample_uniform(seed, pos, t))));
+        if (g > bs || (g == bs && t < best)) bs = g, best = t;
+      }
+      return best;
+    };
+    int* mtok = dev<int>(2);
+    int* dcount = dev<int>(64);
+    int* dcand = dev<int>(ops::kMtpCands);
+    float* dval = dev<float>(ops::kMtpCands);
+    DevGen* dg = dev<DevGen>(1);
+    for (const Case& c : cases) {
+      const int k = int(c.cand.size());
+      std::vector<int> counts(64, 0);
+      for (int i = 0; i < k; ++i)
+        if (!c.count.empty() && c.cand[size_t(i)] >= 0 && c.cand[size_t(i)] < c.vocab)
+          counts[size_t(c.cand[size_t(i)])] = c.count[size_t(i)];
+      CK(cudaMemcpy(dcount, counts.data(), counts.size() * sizeof(int), cudaMemcpyHostToDevice));
+      CK(cudaMemcpy(dcand, c.cand.data(), size_t(k) * sizeof(int), cudaMemcpyHostToDevice));
+      CK(cudaMemcpy(dval, c.logit.data(), size_t(k) * sizeof(float), cudaMemcpyHostToDevice));
+      bool same = true;
+      for (uint64_t seed = 1; seed <= 40; ++seed) {
+        DevGen g{};
+        g.temperature = c.temp, g.top_p = c.top_p, g.top_k = c.top_k, g.seed = seed;
+        g.presence = c.presence, g.frequency = c.frequency;
+        CK(cudaMemcpy(dg, &g, sizeof(g), cudaMemcpyHostToDevice));
+        mtp_choose(P, dg, dcount, dcand, dval, k, c.vocab, 0, mtok, 0);
+        const int64_t pos = 10 + 1;  // P->position + 1 + step 0
+        const int32_t want = oracle(c, seed, pos);
+        const int32_t host = ops::draft_choice(c.cand.data(), c.logit.data(), c.count.empty() ? nullptr : c.count.data(),
+                                               k, c.vocab, c.temp, c.top_p, c.top_k, c.presence, c.frequency, seed, pos);
+        same = same && down_i(mtok, 2)[1] == want && host == want;
+      }
+      std::printf("  %-4s MTP draft against the float64 oracle: %s\n", same ? "ok" : "FAIL", c.what);
+      g_fail += !same;
+    }
+  }
   // The candidates as a tree (ops/draft/ref.h): drafts, parents, and the TreeRows the round reads; its trunk is the
   // walk's chain.  A tree wider than the positions (it must branch), one that fills a whole round, and one of 5 over
   // 2 positions.
