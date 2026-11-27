@@ -968,7 +968,9 @@ bool Engine::load(const std::string& path, const EngineOptions& opt, std::string
       const std::string detail = field == &flyx_open_options::gpu_experts_plus_one
           ? " experts per layer on GPU, remaining experts on CPU"
           : " target layers resident on GPU, remaining linear weights streamed from RAM";
-      upsert_adj(key, "all", std::to_string(cap), std::to_string(cap) + detail);
+      // The retry log describes the last adjustment, even if a previous attempt already set this cap.
+      erase_adj(key);
+      load_adjustments_.push_back({key, "all", std::to_string(cap), std::to_string(cap) + detail});
       return true;
     };
     return (opt_.gpu_experts < 0 && fit_axis("gpu_experts", current.experts_per_layer, resident_experts,

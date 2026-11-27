@@ -391,6 +391,7 @@ int main(int argc, char** argv) {
     g_free_vram = g_target_bytes + (512ull << 20) + 7 * (64ull << 20) +
                   plan::device_reserve(g_total_vram, os::gpu_memory_paged());
     EngineOptions eo;
+    eo.prefill_chunk = 128;  // Isolate the weight retry from the automatic prefill-size fallback.
     eo.backend = "test-host-kv";
     eo.max_ctx = 128;
     eo.speculative = false;
