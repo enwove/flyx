@@ -425,6 +425,7 @@ export default {
   rules: [
     [/^Speculative drafter \((.+)\) skipped due to tight VRAM; running with prompt lookup$/, "显存不足，已跳过草稿模型（$1），当前使用 Prompt Lookup"],
     [/^Speculative drafter \((.+)\) skipped due to tight VRAM; running plain decoding$/, "显存不足，已跳过草稿模型（$1），当前以普通解码运行"],
+    [/^Prefill passes of (\d+) rows instead of (\d+) \(a slower prompt\)$/, "预填充每次处理 $1 行（原为 $2 行），提示词处理变慢"],
     [/^Failed to load (.+); reverted to (.+)$/, "加载 $1 失败，已切回 $2"],
     [/^Failed to load (.+)$/, "加载 $1 失败"],
     [/^Requests will fail until a model is loaded\. Reload (.+) or choose another model\.$/, "加载模型之前，所有请求都会失败。请重新加载 $1，或选择其他模型。"],
@@ -474,6 +475,8 @@ export default {
     [/^Not enough VRAM: ([\d.]+) \/ ([\d.]+) GB used by other apps\.$/, "显存不足：其他程序占用 $1 / $2 GB。"],
     [/^Not enough VRAM: ([\d.]+) GB GPU, ([\d.]+) GB short\.$/, "显存不足：显卡总显存 $1 GB，还差 $2 GB。"],
     [/^Not enough VRAM: ([\d.]+) GB short\.$/, "显存不足：还差 $1 GB。"],
+    [/^Not enough VRAM for a session beside the weights \((.+)\)\.$/, "显存不足，加载权重后无法再开启一个会话（$1）。"],
+    [/^Beside --drafter (\S+), prefill passes stay (\d+) rows: shorter ones could make its tokens differ from plain decoding's\.$/, "指定 --drafter $1 时，预填充保持每次 $2 行：更短的预填充可能使其输出与普通解码不同。"],
     [/^Not enough VRAM for (\d+)-token context \(needs ([\d.]+) GB, ([\d.]+) GB free after weights\)\.$/, "显存不足，无法开启 $1 token 上下文（需要 $2 GB，加载权重后仅剩 $3 GB）。"],
     [/^Not enough VRAM while loading weights: ([\d.]+) \/ ([\d.]+) GB used by other apps\.$/, "加载权重时显存不足：其他程序占用 $1 / $2 GB。"],
     [/^Not enough VRAM while loading weights \(([\d.]+) GB GPU\)\.$/, "加载权重时显存不足（显卡总显存 $1 GB）。"],

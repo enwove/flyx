@@ -443,7 +443,13 @@ bool account(const flyx_backend_api* api, flyx_bmodel* bm, bool has_drafter, boo
   uint64_t reserve = 0;
   if (!init_device_budget(api, bm, tiers, has_drafter, mostly_bf16, ledger, out, &mi, &reserve, err)) return false;
   uint64_t sb = 0;
-  if (!device_bytes(api, bm, max_ctx, tiers, &sb, err, &out->oom)) return false;
+  if (!device_bytes(api, bm, max_ctx, tiers, &sb, err, &out->oom)) {
+    // Not even a session's fixed state fits beside the weights (a round's graphs are sized on one): what makes room.
+    if (out->oom)
+      *err = "Not enough VRAM for a session beside the weights (" + *err + "). " +
+             vram_fix(out->held, 0, has_drafter, mostly_bf16);
+    return false;
+  }
   out->session_bytes = sb;
 
   const TierPlacer placer{api, bm, tiers, ledger->budget() ? ledger->available() : UINT64_MAX, out};

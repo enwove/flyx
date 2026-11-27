@@ -45,6 +45,9 @@ uint64_t g_file_bytes = 0, g_kv_row_bytes = 0;
 std::vector<std::pair<int, int>> g_target_options;
 enum class Refusal { none, lower, size };
 Refusal g_refusal = Refusal::none;
+// Refusal::size past this many rows of a prefill pass lowered since the open (0: the first open's sessions).
+int g_size_max_rows = 0, g_prefill_rows = 0;
+int g_align = 0;  // the backend's prefill alignment, if given
 
 
 bool has_block(const flyx_model_desc* desc, int kind) {
@@ -99,6 +102,7 @@ const char* hook_draft_weights(flyx_bmodel*) { return g_active_dw.c_str(); }
 
 int hook_open(const flyx_model_desc* desc, const flyx_open_options* opts, flyx_bmodel** out) {
   ++g_open_calls;
+  g_prefill_rows = 0;
   g_file_bytes = 0;
   for (int i = 0; i < desc->n_weights; ++i)
     if (auto* t = desc->weights[i].t) g_file_bytes += t->nbytes;
@@ -154,6 +158,7 @@ int hook_open(const flyx_model_desc* desc, const flyx_open_options* opts, flyx_b
 }
 
 int hook_lower(flyx_bmodel* m, const flyx_program* p, flyx_plan** out) {
+  if (p->phase == FLYX_PHASE_PREFILL) g_prefill_rows = std::max(g_prefill_rows, int(p->max_rows));
   if (g_refusal == Refusal::lower && g_open_calls == 1) {
     g_err = "prefill allocation refused";
     return FLYX_ERR_OOM;
@@ -164,7 +169,7 @@ int hook_lower(flyx_bmodel* m, const flyx_program* p, flyx_plan** out) {
 }
 
 int hook_size(flyx_bmodel* m, const flyx_seq_layout* layout, flyx_seq_size* out) {
-  if (g_refusal == Refusal::size && g_open_calls == 1) {
+  if (g_refusal == Refusal::size && (g_size_max_rows > 0 ? g_prefill_rows > g_size_max_rows : g_open_calls == 1)) {
     g_err = "round graph scratch allocation refused";
     return FLYX_ERR_OOM;
   }
@@ -173,10 +178,13 @@ int hook_size(flyx_bmodel* m, const flyx_seq_layout* layout, flyx_seq_size* out)
   return rc;
 }
 
+int32_t hook_align(flyx_bmodel* m) { return g_align > 0 ? g_align : g_backend->prefill_align(m); }
+
 const char* hook_last_error() { return g_err.c_str(); }
 
 void reset_hooks() {
   g_err.clear();
+  g_size_max_rows = g_prefill_rows = g_align = 0;
   g_total_vram = 0;
   g_free_vram = 0;
   g_target_bytes = 8ull << 30;
@@ -249,6 +257,7 @@ int main(int argc, char** argv) {
   delegated.open = hook_open;
   delegated.lower = hook_lower;
   delegated.seq_size = hook_size;
+  delegated.prefill_align = hook_align;
   delegated.last_error = hook_last_error;
   delegated.estimate_load = hook_estimate_load;
   delegated.draft_weights = hook_draft_weights;
@@ -597,6 +606,77 @@ int main(int argc, char** argv) {
     check(g_open_calls == 1 && g_seen_dw.back() == FLYX_DRAFT_WEIGHTS_NVFP4 && e2.draft_weights() == "nvfp4" &&
               e2.load_adjustments().size() == 1 && e2.load_adjustments()[0].kind == "draft_weights",
           "large (>=128 MiB & >=10%) NVFP4 savings triggers pre-flight auto -> nvfp4 in 1 open call");
+  }
+
+  // 10. Nothing left to drop (no drafter) and a session that does not fit while prefill passes are longer than 256
+  // rows (its buffers are sized by them, and a round's graphs on such a session): the load halves the passes until
+  // it fits.  A prompt longer than two passes, its last pass over 16 rows, gives one pass's tokens (numerics.md: K).
+  // A prefill size the caller gave is kept, and so is a pass no shorter for halving (an alignment of 512 rows).
+  {
+    const int prompt = 2 * kElasticMinPrefill + 88;
+    reset_hooks();
+    EngineOptions eo;
+    eo.backend = "test-host-kv";
+    eo.max_ctx = 1024;
+    eo.drafter = "none";
+    Engine plain;
+    check(plain.load(model, eo, &err) && plain.prefill_chunk() >= prompt,
+          "the reference: the prompt in one prefill pass (" + std::to_string(plain.prefill_chunk()) + " rows) " + err);
+    const std::vector<int32_t> want = tokens(plain, prompt);
+    reset_hooks();
+    g_total_vram = 24ull << 30;
+    g_free_vram = 20ull << 30;
+    g_refusal = Refusal::size;
+    g_size_max_rows = kElasticMinPrefill;
+    Engine e;
+    err.clear();
+    const bool loaded = e.load(model, eo, &err);
+    check(loaded, "a session that does not fit retries with shorter prefill passes: " + err);
+    const auto& adj = e.load_adjustments();
+    check(g_open_calls >= 2 && adj.size() == 1 && adj[0].kind == "prefill_chunk" &&
+              adj[0].from == std::to_string(plain.prefill_chunk()) && e.prefill_chunk() == kElasticMinPrefill,
+          "one adjustment: prefill passes halved to " + std::to_string(e.prefill_chunk()) + " rows, " +
+              std::to_string(g_open_calls) + " opens");
+    check(want.size() == 12 && tokens(e, prompt) == want,
+          "a prompt of " + std::to_string(prompt) + " rows in passes of 256: one pass's greedy tokens");
+    reset_hooks();
+    g_total_vram = 24ull << 30;
+    g_free_vram = 20ull << 30;
+    g_refusal = Refusal::size;
+    g_size_max_rows = kElasticMinPrefill;
+    g_align = 512;
+    Engine a;
+    err.clear();
+    const bool aligned = a.load(model, eo, &err);
+    check(!aligned && g_open_calls == 2,
+          "an alignment of 512 rows: passes of 512, then no retry that would not shorten them (" +
+              std::to_string(g_open_calls) + " opens): " + err);
+    reset_hooks();
+    g_total_vram = 24ull << 30;
+    g_free_vram = 20ull << 30;
+    g_refusal = Refusal::size;
+    g_size_max_rows = kElasticMinPrefill;
+    eo.prefill_chunk = 1024;
+    Engine f;
+    err.clear();
+    const bool given = f.load(model, eo, &err);
+    check(!given && g_open_calls == 1, "a prefill size the caller gave is kept: " + err);
+    // Beside a drafter the caller named, the passes keep their size (plain decoding, fitting with longer ones,
+    // could give a prompt other tokens): the load fails and says so.
+    reset_hooks();
+    g_total_vram = 24ull << 30;
+    g_free_vram = 20ull << 30;
+    g_refusal = Refusal::size;
+    g_size_max_rows = kElasticMinPrefill;
+    eo.prefill_chunk = 0;
+    eo.drafter = "mtp";
+    Engine named;
+    err.clear();
+    const bool kept = named.load(model, eo, &err);
+    bool halved = false;
+    for (const auto& a : named.load_adjustments()) halved = halved || a.kind == "prefill_chunk";
+    check(!kept && !halved && err.find("Beside --drafter mtp, prefill passes stay") != std::string::npos,
+          "--drafter mtp: no shorter prefill passes, the load refused with the reason: " + err);
   }
 
   return flyx::test::finish("elastic_load_test");

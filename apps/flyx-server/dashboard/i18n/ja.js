@@ -681,6 +681,7 @@ export default {
   rules: [
     [/^Speculative drafter \((.+)\) skipped due to tight VRAM; running with prompt lookup$/, "VRAM 不足のためドラフトモデル（$1）を省略し、プロンプト検索で実行しています"],
     [/^Speculative drafter \((.+)\) skipped due to tight VRAM; running plain decoding$/, "VRAM 不足のためドラフトモデル（$1）を省略し、通常デコードで実行しています"],
+    [/^Prefill passes of (\d+) rows instead of (\d+) \(a slower prompt\)$/, "プリフィルを $2 行ではなく $1 行ずつ処理（プロンプトの処理が遅くなります）"],
     [/^Failed to load (.+); reverted to (.+)$/, "$1 の読み込みに失敗しました。$2 に戻しました"],
     [/^Failed to load (.+)$/, "$1 の読み込みに失敗しました"],
     [/^Requests will fail until a model is loaded\. Reload (.+) or choose another model\.$/, "モデルを読み込むまで、リクエストはすべて失敗します。$1 を再読み込みするか、別のモデルを選んでください。"],
@@ -749,6 +750,8 @@ export default {
     [/^Not enough VRAM: ([\d.]+) \/ ([\d.]+) GB used by other apps\.$/, "VRAM 不足：他のアプリが $1 / $2 GB 使用中です。"],
     [/^Not enough VRAM: ([\d.]+) GB GPU, ([\d.]+) GB short\.$/, "VRAM 不足：$1 GB GPU で $2 GB 不足しています。"],
     [/^Not enough VRAM: ([\d.]+) GB short\.$/, "VRAM 不足：$1 GB 不足しています。"],
+    [/^Not enough VRAM for a session beside the weights \((.+)\)\.$/, "VRAM 不足：重みの読み込み後にセッションを 1 つも開けません（$1）。"],
+    [/^Beside --drafter (\S+), prefill passes stay (\d+) rows: shorter ones could make its tokens differ from plain decoding's\.$/, "--drafter $1 を指定しているため、プリフィルは $2 行ずつのままです。短くすると通常のデコードと出力が変わる可能性があります。"],
     [/^Not enough VRAM for (\d+)-token context \(needs ([\d.]+) GB, ([\d.]+) GB free after weights\)\.$/, "$1 token コンテキストに対して VRAM が不足しています（必要 $2 GB、重み読み込み後の空き $3 GB）。"],
     [/^Not enough VRAM while loading weights: ([\d.]+) \/ ([\d.]+) GB used by other apps\.$/, "重みの読み込み中に VRAM が不足しました：他のアプリが $1 / $2 GB 使用中です。"],
     [/^Not enough VRAM while loading weights \(([\d.]+) GB GPU\)\.$/, "重みの読み込み中に VRAM が不足しました（$1 GB GPU）。"],

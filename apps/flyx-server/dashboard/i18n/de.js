@@ -682,6 +682,7 @@ export default {
   rules: [
     [/^Speculative drafter \((.+)\) skipped due to tight VRAM; running with prompt lookup$/, "Spekulativer Drafter ($1) wegen knappem VRAM übersprungen; läuft mit Prompt-Lookup"],
     [/^Speculative drafter \((.+)\) skipped due to tight VRAM; running plain decoding$/, "Spekulativer Drafter ($1) wegen knappem VRAM übersprungen; normale Dekodierung aktiv"],
+    [/^Prefill passes of (\d+) rows instead of (\d+) \(a slower prompt\)$/, "Prefill in Durchgängen von $1 statt $2 Zeilen (langsamerer Prompt)"],
     [/^Failed to load (.+); reverted to (.+)$/, "$1 konnte nicht geladen werden; zurück zu $2"],
     [/^Failed to load (.+)$/, "$1 konnte nicht geladen werden"],
     [/^Requests will fail until a model is loaded\. Reload (.+) or choose another model\.$/, "Anfragen schlagen fehl, bis ein Modell geladen ist. Lade $1 neu oder wähle ein anderes Modell."],
@@ -750,6 +751,8 @@ export default {
     [/^Not enough VRAM: ([\d.]+) \/ ([\d.]+) GB used by other apps\.$/, "Nicht genug VRAM: $1 / $2 GB von anderen Programmen belegt."],
     [/^Not enough VRAM: ([\d.]+) GB GPU, ([\d.]+) GB short\.$/, "Nicht genug VRAM: $1 GB GPU, es fehlen $2 GB."],
     [/^Not enough VRAM: ([\d.]+) GB short\.$/, "Nicht genug VRAM: es fehlen $1 GB."],
+    [/^Not enough VRAM for a session beside the weights \((.+)\)\.$/, "Nicht genug VRAM für eine Sitzung neben den Gewichten ($1)."],
+    [/^Beside --drafter (\S+), prefill passes stay (\d+) rows: shorter ones could make its tokens differ from plain decoding's\.$/, "Neben --drafter $1 bleiben Prefill-Durchgänge bei $2 Zeilen: kürzere könnten seine Tokens von denen der normalen Dekodierung abweichen lassen."],
     [/^Not enough VRAM for (\d+)-token context \(needs ([\d.]+) GB, ([\d.]+) GB free after weights\)\.$/, "Nicht genug VRAM für $1-Token-Kontext (benötigt $2 GB, $3 GB nach Gewichten frei)."],
     [/^Not enough VRAM while loading weights: ([\d.]+) \/ ([\d.]+) GB used by other apps\.$/, "Nicht genug VRAM beim Laden der Gewichte: $1 / $2 GB von anderen Programmen belegt."],
     [/^Not enough VRAM while loading weights \(([\d.]+) GB GPU\)\.$/, "Nicht genug VRAM beim Laden der Gewichte ($1 GB GPU)."],

@@ -681,6 +681,7 @@ export default {
   rules: [
     [/^Speculative drafter \((.+)\) skipped due to tight VRAM; running with prompt lookup$/, "VRAM 부족으로 추측 초안 모델($1)을 생략하고 프롬프트 조회로 실행 중입니다"],
     [/^Speculative drafter \((.+)\) skipped due to tight VRAM; running plain decoding$/, "VRAM 부족으로 추측 초안 모델($1)을 생략하고 일반 디코딩으로 실행 중입니다"],
+    [/^Prefill passes of (\d+) rows instead of (\d+) \(a slower prompt\)$/, "프리필을 $2행 대신 $1행씩 처리(프롬프트 처리가 느려짐)"],
     [/^Failed to load (.+); reverted to (.+)$/, "$1 로드 실패, $2(으)로 되돌림"],
     [/^Failed to load (.+)$/, "$1 로드 실패"],
     [/^Requests will fail until a model is loaded\. Reload (.+) or choose another model\.$/, "모델을 로드하기 전까지 모든 요청이 실패합니다. $1을(를) 다시 로드하거나 다른 모델을 선택하세요."],
@@ -749,6 +750,8 @@ export default {
     [/^Not enough VRAM: ([\d.]+) \/ ([\d.]+) GB used by other apps\.$/, "VRAM 부족: 다른 앱이 $1 / $2 GB 사용 중입니다."],
     [/^Not enough VRAM: ([\d.]+) GB GPU, ([\d.]+) GB short\.$/, "VRAM 부족: $1 GB GPU에서 $2 GB가 부족합니다."],
     [/^Not enough VRAM: ([\d.]+) GB short\.$/, "VRAM 부족: $1 GB가 부족합니다."],
+    [/^Not enough VRAM for a session beside the weights \((.+)\)\.$/, "VRAM 부족: 가중치를 불러온 뒤 세션을 하나도 열 수 없습니다($1)."],
+    [/^Beside --drafter (\S+), prefill passes stay (\d+) rows: shorter ones could make its tokens differ from plain decoding's\.$/, "--drafter $1 지정 시 프리필은 $2행씩 유지됩니다. 더 짧게 하면 일반 디코딩과 출력이 달라질 수 있습니다."],
     [/^Not enough VRAM for (\d+)-token context \(needs ([\d.]+) GB, ([\d.]+) GB free after weights\)\.$/, "$1 token 컨텍스트를 위한 VRAM이 부족합니다(필요 $2 GB, 가중치 로드 후 여유 $3 GB)."],
     [/^Not enough VRAM while loading weights: ([\d.]+) \/ ([\d.]+) GB used by other apps\.$/, "가중치 로드 중 VRAM 부족: 다른 앱이 $1 / $2 GB 사용 중입니다."],
     [/^Not enough VRAM while loading weights \(([\d.]+) GB GPU\)\.$/, "가중치 로드 중 VRAM 부족($1 GB GPU)."],
