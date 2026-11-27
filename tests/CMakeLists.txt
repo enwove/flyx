@@ -45,17 +45,55 @@
 # quick preset runs anyway), dv (DV's, not in production: tests/dv.cmake's, registered with FLYX_TEST_DV alone), server
 # (starts flyx serve).  The registering functions below label what they know; flyx_finish_test_labels() (each
 # directory's end) gives a test without a tier one (tiny with a fixture, else unit), adds quick (unit and tiny tests
-# that need neither the GPU nor DV, and the smoke ones), and refuses the configure where a test breaks these rules.
+# that need neither the GPU nor DV, and the smoke ones), unsets the shell's settings the test presets clear, and
+# refuses the configure where a test breaks these rules.
 # The labels it cannot infer are at this file's end.
 # Labels are only ever appended (set_property(TEST ... APPEND PROPERTY LABELS ...)): one set elsewhere stays.
 
-# After a directory's last test: the tier where none was given, quick, the GPU tests' slot and preflight, the rules.
+# The variables the test presets clear: test-base's environment in CMakePresets.json (the engine's and server's
+# settings of core/os/env.h, PYTHONOPTIMIZE), read from there so that a run without a preset clears the same ones.
+function(flyx_test_cleared_env out)
+  set(file ${CMAKE_SOURCE_DIR}/CMakePresets.json)
+  set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS ${file})
+  file(READ ${file} presets)
+  string(JSON n LENGTH "${presets}" testPresets)
+  math(EXPR last "${n} - 1")
+  foreach(i RANGE ${last})
+    string(JSON name GET "${presets}" testPresets ${i} name)
+    if(name STREQUAL "test-base")
+      string(JSON n LENGTH "${presets}" testPresets ${i} environment)
+      math(EXPR last "${n} - 1")
+      set(names "")
+      foreach(j RANGE ${last})
+        string(JSON var MEMBER "${presets}" testPresets ${i} environment ${j})
+        list(APPEND names ${var})
+      endforeach()
+      set(${out} ${names} PARENT_SCOPE)
+      return()
+    endif()
+  endforeach()
+  message(FATAL_ERROR "${file}: no test preset test-base (the environment the tests run without)")
+endfunction()
+
+# After a directory's last test: the tier where none was given, quick, the GPU tests' slot and preflight, the shell's
+# settings unset, the rules.
 function(flyx_finish_test_labels)
   set(tier_labels unit tiny golden tools)
   set(aspect_labels gpu gpu_serial smoke dv server)
+  flyx_test_cleared_env(cleared_env)
   get_property(tests DIRECTORY PROPERTY TESTS)
   set(errors "")
   foreach(t IN LISTS tests)
+    # A plain ctest as a preset's: the shell's FLYX_BACKEND_DIR, FLYX_BACKEND_OPTIONS, ... unset, but for what the
+    # test sets itself (its ENVIRONMENT is applied before ENVIRONMENT_MODIFICATION, which would unset that too).
+    get_test_property(${t} ENVIRONMENT own_env)
+    set(unset "")
+    foreach(var IN LISTS cleared_env)
+      if(NOT own_env MATCHES "(^|;)${var}=")
+        list(APPEND unset "${var}=unset:")
+      endif()
+    endforeach()
+    set_property(TEST ${t} APPEND PROPERTY ENVIRONMENT_MODIFICATION ${unset})
     get_test_property(${t} LABELS labels)
     if(NOT labels)
       set(labels "")
@@ -410,8 +448,13 @@ flyx_add_py_test(lora_convert ${CMAKE_SOURCE_DIR}/tests/python/convert/check_dv_
                       --hf ${ASSETS}/hf_llama
                  FIXTURES assets)
 # The bf16 prefill residual's decision on each backend (-v): taken by an all-W4A4 stack, never with adapters.
+# --fp4-kernels: the build has the FP4 tensor cores' kernels (sm_120a), so a device of compute capability 12.0 must
+# compute NVFP4 inputs, not refuse them.
 if(TARGET flyx-cuda)
   set(FLYX_RESIDUAL_BACKENDS cpu_ref cuda)
+  if(TARGET flyx_cuda_sm120a)
+    list(PREPEND FLYX_RESIDUAL_BACKENDS --fp4-kernels)
+  endif()
 else()
   set(FLYX_RESIDUAL_BACKENDS cpu_ref)
 endif()
@@ -666,7 +709,7 @@ endif()
 
 # Labels flyx_finish_test_labels cannot infer (the registering functions give golden, gpu_serial, server and tools;
 # the CUDA block gpu).  smoke: the golden and GPU tests quick runs too.  quick takes as long as its longest tests,
-# cuda_ops and golden_cuda_pdl (about 35 s each alone on an RTX 5070 Ti): the others a few seconds each, so that
+# cuda_ops (about 35 s on an RTX 5070 Ti) and golden_cuda_pdl (24 to 30 s): the others a few seconds each, so that
 # they run beside those two (the gguf_cuda runs, as long as them or longer, would set quick's time instead).  The
 # second architecture against transformers (gate 3, from its .flyx and its GGUF file), and on the GPU every kernel
 # against float64 (gate 1), the tiny Qwen3.5 (MTP, DFlash2, sampling: gates 3 and 4), Qwen3 against transformers
