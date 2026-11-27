@@ -745,6 +745,13 @@ void test_inkling2_shortconv() {
 }
 
 namespace {
+// The spacing of binary16 values at x (2^-24 below 2^-14, its subnormals').
+double f16_spacing(double x) {
+  int e = 0;
+  std::frexp(x, &e);  // |x| in [2^(e-1), 2^e)
+  return x == 0 ? 0x1p-24 : std::ldexp(1.0, std::max(e - 1, -14) - 10);
+}
+
 // A single visible key with zero logits and gate gives V/4 exactly. Binary16 cache values can therefore
 // exercise Q8 rounding ties without moving across a tie because the float64 attention accumulated differently.
 void test_inkling2_rel_q8() {
@@ -899,8 +906,9 @@ void test_inkling2_rel_attn() {
     Vec k_new(K_all.begin() + ptrdiff_t(c.ctx) * kv_dim, K_all.end());
     Vec v_new(V_all.begin() + ptrdiff_t(c.ctx) * kv_dim, V_all.end());
 
-    // Reference prep + attend_rel + gate.
+    // Reference prep (the new rows' K/V also before the cache's rounding: k_exact, v_exact).
     Vec q_ref(size_t(c.rows) * q_dim), r_ref(size_t(c.rows) * c.nh * c.d_rel);
+    Vec k_exact(size_t(c.rows) * kv_dim), v_exact(size_t(c.rows) * kv_dim);
     for (int r = 0; r < c.rows; ++r) {
       const int pos = c.ctx + r;
       const double tau = is_swa ? 1.0 : ops::log_pos_scale(pos, log_floor, log_alpha);
@@ -916,6 +924,8 @@ void test_inkling2_rel_attn() {
         Vec ko(c.hd), vo(c.hd);
         ops::l2_clip(&k_new[(size_t(r) * c.nkv + kh) * c.hd], nullptr, c.hd, qk_clip, ko.data());
         ops::rmsnorm(&v_new[(size_t(r) * c.nkv + kh) * c.hd], nullptr, c.hd, v_eps, 0.0, vo.data());
+        std::copy(ko.begin(), ko.end(), &k_exact[(size_t(r) * c.nkv + kh) * c.hd]);
+        std::copy(vo.begin(), vo.end(), &v_exact[(size_t(r) * c.nkv + kh) * c.hd]);
         if (c.fp8) {
           round_fp8_e4m3_vec(ko);
           round_fp8_e4m3_vec(vo);
@@ -927,17 +937,6 @@ void test_inkling2_rel_attn() {
         std::copy(vo.begin(), vo.end(), &V_all[(size_t(pos) * c.nkv + kh) * c.hd]);
       }
     }
-    Vec want_o(size_t(c.rows) * q_dim, 0.0);
-    const double scale = 1.0 / std::sqrt(double(c.hd));
-    for (int r = 0; r < c.rows; ++r) {
-      for (int hh = 0; hh < c.nh; ++hh) {
-        ops::attend_rel(&q_ref[(size_t(r) * c.nh + hh) * c.hd], &r_ref[(size_t(r) * c.nh + hh) * c.d_rel], K_all.data(),
-                        V_all.data(), rel_bias.data(), sink[size_t(r) * c.nh + hh], c.ctx + r, c.window, c.nkv, c.hd,
-                        c.d_rel, c.rel_extent, hh / (c.nh / c.nkv), scale, &want_o[(size_t(r) * c.nh + hh) * c.hd]);
-      }
-    }
-    for (size_t i = 0; i < want_o.size(); ++i) want_o[i] *= ops::sigmoid(gate[i]);
-
     // CUDA prep + attention.
     DevParams* P = params(c.ctx, 0);
     float* d_qin = up(q_in);
@@ -958,6 +957,56 @@ void test_inkling2_rel_attn() {
     rel_attn_prep(d_qin, q_dim, d_kin, kv_dim, d_vin, kv_dim, d_rin, c.nh * c.d_rel, d_qcw, d_rcw, qk_clip, rel_clip,
                   v_eps, log_floor, log_alpha, c.nh, c.nkv, c.hd, c.d_rel, c.rows, P, kPosPosition, is_swa, d_qout,
                   d_rout, kv, 0);
+    // The attention's reference reads what the kernels read (gate 1: the same rounding first): with a binary16 cache,
+    // the q and r the prep wrote and the new rows' K/V as the cache holds them.  The prep rounds its float32 values
+    // to binary16 and the float64 reference its own, so where a value sits at a tie between two binary16 neighbours
+    // the two land on either side of it (up to 4 of a case's 1024 to 37888 new K/V, 100 over the 104 binary16 cases
+    // of the default seed and FLYX_OPS_SEED 0 to 11), and the attention's reference moved by up to 1.2e-4 with them.
+    // So the prep is held to float64 here on its own: q and r within float32's rounding, each binary16 K/V the
+    // nearest to its float64 value, or the other side of a tie that value is within float32's error of (kTieSlack of
+    // the value).  An FP8 cache's scales are each head's own maximum, which the two compute apart as well: its
+    // reference stays the float64 prep's, under FP8's tolerance.
+    Vec q_att = q_ref, r_att = r_ref, K_att = K_all, V_att = V_all;
+    if (!c.fp8) {
+      q_att = down(d_qout, size_t(c.rows) * q_dim);
+      r_att = down(d_rout, size_t(c.rows) * c.nh * c.d_rel);
+      std::vector<uint16_t> hk(size_t(kv_slots) * kv_dim), hv(hk.size());
+      CK(cudaMemcpy(hk.data(), d_k, hk.size() * 2, cudaMemcpyDeviceToHost));
+      CK(cudaMemcpy(hv.data(), d_v, hv.size() * 2, cudaMemcpyDeviceToHost));
+      constexpr double kTieSlack = 0x1p-20;  // relative: a few float32 roundings of the norm and its product
+      int ties = 0, wrong = 0;
+      double worst = 0.0;  // the furthest past half a binary16 spacing, relative to the value
+      for (int r = 0; r < c.rows; ++r) {
+        const size_t pos = size_t(c.ctx + r), slot = c.ring > 0 ? pos % size_t(c.ring) : pos;
+        for (int i = 0; i < kv_dim; ++i)
+          for (bool v : {false, true}) {
+            const double exact = (v ? v_exact : k_exact)[size_t(r) * kv_dim + i];
+            const double got = from_f16((v ? hv : hk)[slot * kv_dim + i]);
+            (v ? V_att : K_att)[pos * kv_dim + i] = got;
+            const double past = std::fabs(got - exact) - 0.5 * f16_spacing(exact);
+            if (past <= 0) continue;
+            worst = std::max(worst, past / std::fabs(exact));
+            ++(past <= kTieSlack * std::fabs(exact) ? ties : wrong);
+          }
+      }
+      const double q_err = relative_error(q_att, q_ref), r_err = relative_error(r_att, r_ref);
+      const bool ok = wrong == 0 && q_err <= 1e-6 && r_err <= 1e-6;
+      std::printf("  %-4s rel_attn_prep vs float64 (%s): q %.1e, r %.1e; binary16 K/V: %d at ties, %d past them "
+                  "(worst %.1e past half a spacing)\n",
+                  ok ? "ok" : "FAIL", c.name, q_err, r_err, ties, wrong, worst);
+      g_fail += !ok;
+    }
+    Vec want_o(size_t(c.rows) * q_dim, 0.0);
+    const double scale = 1.0 / std::sqrt(double(c.hd));
+    for (int r = 0; r < c.rows; ++r) {
+      for (int hh = 0; hh < c.nh; ++hh) {
+        ops::attend_rel(&q_att[(size_t(r) * c.nh + hh) * c.hd], &r_att[(size_t(r) * c.nh + hh) * c.d_rel], K_att.data(),
+                        V_att.data(), rel_bias.data(), sink[size_t(r) * c.nh + hh], c.ctx + r, c.window, c.nkv, c.hd,
+                        c.d_rel, c.rel_extent, hh / (c.nh / c.nkv), scale, &want_o[(size_t(r) * c.nh + hh) * c.hd]);
+      }
+    }
+    for (size_t i = 0; i < want_o.size(); ++i) want_o[i] *= ops::sigmoid(gate[i]);
+
     rel_attention(d_qout, d_rout, kv, d_rb, d_sink, c.nh, d_gate, q_dim, c.nh, c.nkv, c.hd, c.d_rel, c.rel_extent,
                   c.window, c.rows, P, d_out, q_dim, d_part, splits, TL);
     Vec got_o = down(d_out, size_t(c.rows) * q_dim);
@@ -1139,7 +1188,7 @@ void test_inkling2_rel_attn() {
         const int pos = first_pos + rr;
         const size_t q_at = size_t(rr * c.nh + h);
         Vec ref(c.hd);
-        ops::attend_rel(q_ref.data() + q_at * c.hd, r_ref.data() + q_at * c.d_rel, K_all.data(), V_all.data(),
+        ops::attend_rel(q_att.data() + q_at * c.hd, r_att.data() + q_at * c.d_rel, K_att.data(), V_att.data(),
                         rel_bias.data(), sink[q_at], pos, c.window, c.nkv, c.hd, c.d_rel, c.rel_extent,
                         h / (c.nh / c.nkv), scale, ref.data());
         for (int d = 0; d < c.hd; ++d) ref[d] *= ops::sigmoid(gate[q_at * c.hd + d]);
