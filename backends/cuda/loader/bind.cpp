@@ -774,7 +774,7 @@ MoeBlock moe(WeightLoader& L, const flyx_moe_block& b, const StateMap& sm, const
   f.gate_up = L.expert_mat(b.gate_up, plan.hot[b.gate_up], plan.direct, f.cold_gu);
   f.down = L.expert_mat(b.down, plan.hot[b.down], plan.direct, f.cold_down);
   if (plan.direct && plan.hot[b.gate_up] < b.n_experts)
-    L.model()->offload->mapped_experts().attach(L.model(), f, b.gate_up, b.down);
+    L.model()->offload->mapped_experts().attach(L.model(), f, b.gate_up, b.down, plan.hot[b.gate_up]);
   if (b.post_conv >= 0) f.post_conv = L.vec(b.post_conv);
   if (b.res_query >= 0) f.res_query = L.vec(b.res_query);
   f.loop_rank = b.loop_rank;

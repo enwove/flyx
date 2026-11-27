@@ -29,7 +29,7 @@ struct MappedExpertPair {
 class ExpertAddressSpace {
 public:
   void* allocate(flyx_bmodel* model, int weight, size_t bytes, size_t experts, size_t hot);
-  void attach(flyx_bmodel* model, MoeBlock& block, int gate, int down);
+  void attach(flyx_bmodel* model, MoeBlock& block, int gate, int down, int resident);
   size_t gather_bytes(int pairs) const;
   void note_rows(int rows);
   int planned_rows() const { return max_rows_.load(std::memory_order_relaxed); }

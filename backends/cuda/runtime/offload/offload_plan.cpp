@@ -102,7 +102,7 @@ static OffloadPlan make_plan(const flyx_model_desc& d, const BackendOptions& o) 
     }
     for (int w : {f.gate_up, f.down}) {
       if (plan.direct && o.keep_expert_archive && plan.hot[w] < f.n_experts &&
-          int64_t(f.n_experts - o.gpu_experts) * f.top_k >= f.n_experts) {
+          int64_t(f.n_experts - plan.hot[w]) * f.top_k >= f.n_experts) {
         const auto projection = expert_layout(weight(w), o.packed_blocks);
         auto& slot = plan.prefill_slots[w == f.down];
         slot = std::max(slot, size_add(checkpoint_align(projection.payload_bytes()), projection.scale_bytes()));

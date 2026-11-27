@@ -408,7 +408,7 @@ void companion_estimates() {
 }
 
 void route_budget_and_ticket() {
-  constexpr int experts = 32, layers = 4, h = 32;
+  constexpr int experts = 32, layers = 4, h = 256;
   std::vector<uint16_t> data(experts * 2 * h * h);
   flyx_tensor_view gate{"gate", FLYX_DT_BF16, 3, {experts, 2 * h, h}, data.data(), data.size() * 2};
   flyx_tensor_view down{"down", FLYX_DT_BF16, 3, {experts, h, h}, data.data(), data.size()};
@@ -447,6 +447,13 @@ void route_budget_and_ticket() {
     require(slots == layers * cap && (cap != experts - 1 || full == layers - 1),
             "concentrating rare misses conserves the requested expert count");
   }
+
+  options.expert_direct = true;
+  options.gpu_experts = experts - 2;
+  const auto concentrated = plan_offload(desc, options);
+  if (concentrated.direct)
+    require(concentrated.prefill_slots[0] && concentrated.prefill_slots[1],
+            "stage the concentrated layer when its expected host routes reach one per row");
 
   CudaStream stream;
   CudaEvent fallback;

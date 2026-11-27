@@ -113,7 +113,7 @@ void* ExpertAddressSpace::allocate(flyx_bmodel* model, int weight, size_t bytes,
   return address;
 }
 
-void ExpertAddressSpace::attach(flyx_bmodel* model, MoeBlock& block, int gate, int down) {
+void ExpertAddressSpace::attach(flyx_bmodel* model, MoeBlock& block, int gate, int down, int resident) {
   verbose_ = model->verbose != 0;
   const size_t n = block.n_experts;
   auto [it, added] = histograms_.try_emplace({gate, down}, n);
@@ -145,7 +145,7 @@ void ExpertAddressSpace::attach(flyx_bmodel* model, MoeBlock& block, int gate, i
     mapped.gather = &h.gather;
     block.mapped = &mapped;
     h.top_k = block.top_k;
-    h.gather = int64_t(block.n_experts - model->opt.gpu_experts) * block.top_k >= block.n_experts;
+    h.gather = int64_t(block.n_experts - resident) * block.top_k >= block.n_experts;
     const int configured = model->opt.expert_prefill_min;
     if (model->opt.keep_expert_archive && h.gather)
       mapped.stage_min_rows = std::max(2, configured < 0 ? 1 + (block.n_experts - 1) / block.top_k : configured);
