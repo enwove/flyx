@@ -316,13 +316,16 @@ def main(assets):
                 ("beam 7:20 (padded)", "beam:7:20", False, "W", plains), ("pool 7/3", "pool:7:3:1", False, "W", plains),
                 ("pool 9/2", "pool:9:2", False, "W", plains), ("causal canvas", "beam:7:4:cov", True, "W", plains),
                 ("V-LoRA", "beam:7:4:cov", False, "Wv", vplains), ("V-LoRA pool", "pool:7:3", False, "Wv", vplains)]
-    for name, tree, causal, wk, want_all in variants:
+    # The first variant on every prompt, the others (each a tree, canvas or target of its own; the same code around
+    # them) on the first two.
+    for v, (name, tree, causal, wk, want_all) in enumerate(variants):
         dv = DvConfig(slots=8, mask_token=mask, causal=causal).set_tree(tree)
         model = Dv(cfg, weights[wk], dv, torch.float64)
         same = acc = deep = masks = 0
         tf_same = shape = True
         regrown = [0, 0]
-        for case, (c, want) in enumerate(zip(cases, want_all)):
+        held = cases if v == 0 else cases[:2]
+        for case, (c, want) in enumerate(zip(held, want_all)):
             r = model.generate(c["prompt"], n)
             same += r["ids"] == want
             trees = []
@@ -339,8 +342,9 @@ def main(assets):
             shape &= all(len(rd["drafts"]) == dv.width and all(p < i for i, p in enumerate(rd["parents"]))
                          for rd in r["rounds"] + o["rounds"])
         check(shape, f"{name}: the first round drafts a star of MASKs; every round {dv.width} drafts, parents first")
-        check(same == 2 * len(cases), f"{name}: DV emits the plain tokens ({same}/{2 * len(cases)} runs)")
-        check(acc > 2 * n and deep >= 5, f"{name}: planted paths are accepted ({acc} drafts, up to {deep} a round)")
+        check(same == 2 * len(held), f"{name}: DV emits the plain tokens ({same}/{2 * len(held)} runs)")
+        check(acc > n * len(held) / 2 and deep >= 5,
+              f"{name}: planted paths are accepted ({acc} drafts, up to {deep} a round)")
         check(tf_same, f"{name}: teacher forcing on the plain tokens runs the same rounds")
         check(masks > 0, f"{name}: slots past the canvas draft MASK ({masks})")
         check(regrown[0] == regrown[1] > 0,

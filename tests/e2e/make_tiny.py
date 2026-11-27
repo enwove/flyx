@@ -510,7 +510,9 @@ def make_core(out: str):
 
     prompts = [tok.encode(t).ids for t in ("The quick brown fox", "def add(a, b):\n", "推理引擎需要")]
     prompts.append([5, 17, 33, 9])
-    write_golden(path, os.path.join(out, "golden.json"), prompts, vocab)
+    # The reference's golden files (write_golden) are made at the end, each a process's own job (in_processes):
+    # nothing below reads them.
+    goldens = [(write_golden, (path, os.path.join(out, "golden.json"), prompts, vocab))]
     # The drafter as z-lab publishes DFlash2 drafters, converted alone: what tiny.flyx holds of
     # its drafter.  Then with a sliding window of 8, shorter than the prompts and their 48 tokens: with the target
     # (golden drafts from the reference's window) and alone.
@@ -523,7 +525,7 @@ def make_core(out: str):
     zlab_drafter(ddir, wdir, layers, window=8)
     wpath = os.path.join(out, "tiny_window.flyx")
     convert(tdir, wpath, wdir, log=lambda *_: None)
-    write_golden(wpath, os.path.join(out, "golden_window.json"), prompts, vocab)
+    goldens.append((write_golden, (wpath, os.path.join(out, "golden_window.json"), prompts, vocab)))
     convert_draft(wdir, os.path.join(out, "tiny_draft_window.flyx"), log=lambda *_: None)
     odir = os.path.join(out, "hf_draft_1layer")  # no random draws: what is made after it stays as it was
     one_layer_drafter(wdir, odir)
@@ -544,7 +546,7 @@ def make_core(out: str):
     # the reference reproduces); float32 vs float64 activations can still round
     # differently, moving logits by ~1e-3, so these cases avoid near-ties.
     more = [list(p) for p in MORE]
-    write_golden(qpath, os.path.join(out, "golden_nvfp4.json"), prompts + more, vocab, min_margin=0.05, keep=4)
+    goldens.append((write_golden, (qpath, os.path.join(out, "golden_nvfp4.json"), prompts + more, vocab, 0.05, 4)))
     # A second architecture through models/ (Qwen3): no drafter, golden from transformers.
     q3dir = os.path.join(out, "hf_qwen3")
     make_qwen3(q3dir, tdir, vocab, gen)
@@ -561,7 +563,7 @@ def make_core(out: str):
     make_target(gdir, vocab, gen, gdn_heads=(1, 2), gdn_dims=(128, 128))
     gpath = os.path.join(out, "tiny_gdn128.flyx")
     convert(gdir, gpath, ddir, log=lambda *_: None)
-    write_golden(gpath, os.path.join(out, "golden_gdn128.json"), prompts + more, vocab, min_margin=0.05, keep=4)
+    goldens.append((write_golden, (gpath, os.path.join(out, "golden_gdn128.json"), prompts + more, vocab, 0.05, 4)))
     # NVFP4 linears that take NVFP4 inputs in passes of more than 16 rows (the W4A4 kernels): 128
     # wide, with a value head of 32 and an MLP of 256, so every linear's K is a whole number of the kernels' tiles
     # of 128.  No golden outputs: gguf_e2e_test holds the CUDA backend to the float64 one on this file.
@@ -603,6 +605,7 @@ def make_core(out: str):
             lora_dir=os.path.join(out, "dv_tiny", "export_vlora"))
     with open(os.path.join(out, "golden_llama_nvfp4_lora.json"), "w", encoding="utf-8") as f:
         json.dump({"eos": [2], "plain_only": True, "cases": [{"prompt": p} for p in lprompts]}, f, indent=0)
+    in_processes(goldens)
     print(f"wrote {out}: tiny.flyx, tiny_nvfp4.flyx, golden.json, golden_nvfp4.json ({len(prompts)} prompts), "
           f"tokenizer_cases.json ({len(cases)}), chat_cases.json ({n_chat}), tiny_qwen3.flyx, "
           f"golden_qwen3.json ({n3} prompts), tiny_llama.flyx, golden_llama.json ({nl} prompts), "
@@ -831,7 +834,7 @@ def dv_fresh(model, prompt: list, tokens: list) -> list:
     its drafts and parents."""
     out = []
     for k in range(len(tokens) - 2):
-        rounds = model.generate(prompt + tokens[:k], model.dv.width + 3)["rounds"]
+        rounds = model.generate(prompt + tokens[:k], model.dv.width + 3, rounds=3)["rounds"]
         out.append({w: {"start": r["pos"], "drafts": r["drafts"], "parents": r["parents"]}
                     for w, r in (("first", rounds[1]), ("second", rounds[2]))})
     return out
@@ -848,22 +851,15 @@ def write_dv_rounds(out: str, cases: dict) -> int:
     transformers tokens: tiny_llama_dv_lora.flyx's and tiny_llama_dv31_lora.flyx's with their V-LoRA), the others'
     under "".
 
-    A file's cases are independent of each other and of the other files', and nearly all of this script's time (a
-    fresh start at every point of every case, twice over; the script took the hosted CPU runner 41 minutes with them
-    one after another), so each case is a process's own job (dv_case_rounds), as many at once as there are processors,
-    and their rows are put together in the files' and the cases' order: the bytes one process writes."""
+    A file's cases are independent of each other and of the other files', and nearly all of this group's time (a fresh
+    start at every point of every case, twice over: three forwards each; the script took the hosted CPU runner 41
+    minutes with them one after another, each fresh start then running on to width + 3 tokens), so each case is a
+    process's own job (dv_case_rounds, in_processes), and their rows are put together in the files' and the cases'
+    order: the bytes one process writes."""
     rows = {"chains": list(DV_CHAINS), "every": DV_CHAIN_EVERY, "first": DV_CHAIN_FIRST,
             "file_chains": {k: list(v) for k, v in DV_CHAINS_BY_FILE.items()}, "files": {}, "fresh": {}, "fp8": {}}
     jobs = [(out, name, c) for name in DV_ROUND_FILES for c in cases.get(name, cases[""])]
-    workers = min(len(jobs), os.cpu_count() or 1)
-    if workers > 1:
-        import multiprocessing
-        # spawn everywhere: a fork of a process whose torch has started its threads may wait on them forever
-        with multiprocessing.get_context("spawn").Pool(workers, initializer=torch.set_num_threads,
-                                                      initargs=(1,)) as pool:
-            done = pool.map(dv_case_rounds, jobs, chunksize=1)
-    else:
-        done = [dv_case_rounds(job) for job in jobs]
+    done = in_processes([(dv_case_rounds, (job,)) for job in jobs])
     for name in DV_ROUND_FILES:
         rows["files"][name], rows["fresh"][name], rows["fp8"][name] = [], [], []
     n = 0
@@ -875,6 +871,24 @@ def write_dv_rounds(out: str, cases: dict) -> int:
     with open(os.path.join(out, "golden_llama_dv.json"), "w", encoding="utf-8") as f:
         json.dump(rows, f, indent=0)
     return n
+
+
+def in_processes(calls: list) -> list:
+    """calls: (a function of this script, its arguments), independent of each other: each a process's own job, as many
+    at once as there are processors (one torch thread each), their results in calls' order."""
+    workers = min(len(calls), os.cpu_count() or 1)
+    if workers <= 1:
+        return [call(c) for c in calls]
+    import multiprocessing
+    # spawn everywhere: a fork of a process whose torch has started its threads may wait on them forever
+    with multiprocessing.get_context("spawn").Pool(workers, initializer=torch.set_num_threads, initargs=(1,)) as pool:
+        return pool.map(call, calls, chunksize=1)
+
+
+def call(job: tuple):
+    """job: (a function of this script, its arguments), for a process of in_processes' pool."""
+    fn, args = job
+    return fn(*args)
 
 
 DV_ROUND_FILES = ("tiny_llama_dv.flyx", "tiny_llama_dv_pool.flyx", "tiny_llama_dv32.flyx", "tiny_llama_dv31.flyx",

@@ -496,11 +496,10 @@ if(TARGET flyx-cuda)
   flyx_register_test(elastic_load_cuda elastic_load_test ${ASSETS}/tiny.flyx cuda)
   set_tests_properties(elastic_load_cuda PROPERTIES FIXTURES_REQUIRED assets)
 
-  # Packed block weights against the float64 backend on the same files; the generic regions too.
-  add_test(NAME gguf_cuda COMMAND gguf_e2e_test ${ASSETS} cuda)
+  # Packed block weights against the float64 backend on the same files; the generic regions too.  Programmatic
+  # dependent launch (each kernel starts while the one before finishes) on and off: the same tokens.  Whatever the
+  # GPU's table makes the default is one of the two, so neither these nor the golden tests below run it a third time.
   add_test(NAME gguf_cuda_unfused COMMAND gguf_e2e_test ${ASSETS} cuda fusion=0)
-  # Programmatic dependent launch (each kernel starts while the one before finishes) on and off, whatever the GPU's
-  # table makes the default: the same tokens.
   add_test(NAME gguf_cuda_pdl COMMAND gguf_e2e_test ${ASSETS} cuda pdl=1)
   add_test(NAME gguf_cuda_no_pdl COMMAND gguf_e2e_test ${ASSETS} cuda pdl=0)
   flyx_add_golden_test(golden_cuda_qwen3_gguf ARGS cuda qwen3 ${ASSETS}/tiny_qwen3_gguf.gguf FIXTURES gguf_assets)
@@ -509,8 +508,7 @@ if(TARGET flyx-cuda)
   # head 16 rows at a time; Q8_0, and Q4_K for the K types' round kernels.
   flyx_add_golden_test(golden_cuda_quant_q8_0 ARGS cuda quant ${ASSETS}/quant_Q8_0.gguf FIXTURES gguf_assets)
   flyx_add_golden_test(golden_cuda_quant_q4_k ARGS cuda quant ${ASSETS}/quant_Q4_K.gguf FIXTURES gguf_assets)
-  set_tests_properties(gguf_cuda gguf_cuda_unfused gguf_cuda_pdl gguf_cuda_no_pdl
-                       PROPERTIES FIXTURES_REQUIRED gguf_assets)
+  set_tests_properties(gguf_cuda_unfused gguf_cuda_pdl gguf_cuda_no_pdl PROPERTIES FIXTURES_REQUIRED gguf_assets)
 
   # A family of kernels a file (op_test_*.cu), helpers in op_test.cuh, main() in op_test.cu.
   add_executable(cuda_op_test backends/cuda/op_test.cu backends/cuda/op_test_gemm.cu backends/cuda/op_test_blocks.cu
@@ -528,7 +526,6 @@ if(TARGET flyx-cuda)
   add_test(NAME scheduler_cuda COMMAND scheduler_test ${ASSETS}/tiny.flyx cuda)
   set_tests_properties(scheduler_cuda PROPERTIES FIXTURES_REQUIRED assets)
 
-  flyx_add_golden_test(golden_cuda ARGS cuda)
   flyx_add_golden_test(golden_cuda_nvfp4 ARGS cuda nvfp4)
   # the generic implementation of every region (no fused overrides) must pass as well
   flyx_add_golden_test(golden_cuda_unfused ARGS cuda nvfp4 ENV FLYX_BACKEND_OPTIONS=fusion=0)
@@ -620,7 +617,7 @@ if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
   set_property(TEST quickstart_venv APPEND PROPERTY LABELS tools)   # tools/quickstart.sh's environment
 endif()
 if(TARGET flyx-cuda)
-  set_property(TEST gguf_cuda gguf_cuda_unfused gguf_cuda_pdl gguf_cuda_no_pdl APPEND PROPERTY LABELS golden)
+  set_property(TEST gguf_cuda_unfused gguf_cuda_pdl gguf_cuda_no_pdl APPEND PROPERTY LABELS golden)
   set_property(TEST tree_bench_context APPEND PROPERTY LABELS tools)
   set_property(TEST cuda_ops golden_cuda_pdl golden_cuda_qwen3 golden_cuda_qwen3_unfused golden_cuda_llama
                     golden_cuda_llama_nvfp4 golden_cuda_quant_q4_k inkling2_cuda cuda_loader elastic_load_cuda vision
