@@ -3721,17 +3721,6 @@ void graph_dv_rounds(const std::string& model, const std::string& backend, const
 int device_memory(const std::string& model, const std::string& backend, const std::vector<int32_t>& prompt) {
   auto spec = make(model, backend, true);
   auto plain = make(model, backend, false, "none");
-  if (g_block == "dspine") {
-    flyx_memory_info with{}, without{};
-    flyx_load_estimate estimate{};
-    flyx_open_options opts{};
-    const auto* api = spec->api();
-    const bool measured = api->estimate_load(&spec->model().desc(), &opts, 0, 0, &estimate) == 0 &&
-                          api->memory(spec->bmodel(), &with) == 0 && api->memory(plain->bmodel(), &without) == 0;
-    check(measured && estimate.draft_weights_bytes > 0 && with.weights == without.weights + estimate.draft_weights_bytes,
-          "DSpine weights: " + std::to_string(with.weights - without.weights) + " bytes resident, " +
-              std::to_string(estimate.draft_weights_bytes) + " estimated");
-  }
   auto free_now = [&](Engine* e) {
     flyx_memory_info mi{};
     e->api()->memory(e->bmodel(), &mi);
@@ -3761,6 +3750,21 @@ int device_memory(const std::string& model, const std::string& backend, const st
   graph_memory(model, backend, prompt, "all", 0);
   graph_after_batch(model, backend, prompt);
   graph_switching(model, backend, prompt);
+  if (g_block == "dspine") {
+    flyx_memory_info with{}, without{};
+    flyx_load_estimate estimate{};
+    flyx_open_options opts{};
+    const auto* api = spec->api();
+    // Preflight counts the drafter's own weights. Release optional copies of the target head from both
+    // models after their last round, so only weights required for drafting remain in the difference.
+    api->trim(spec->bmodel(), UINT64_MAX);
+    api->trim(plain->bmodel(), UINT64_MAX);
+    const bool measured = api->estimate_load(&spec->model().desc(), &opts, 0, 0, &estimate) == 0 &&
+                          api->memory(spec->bmodel(), &with) == 0 && api->memory(plain->bmodel(), &without) == 0;
+    check(measured && estimate.draft_weights_bytes > 0 && with.weights == without.weights + estimate.draft_weights_bytes,
+          "DSpine weights: " + std::to_string(with.weights - without.weights) + " bytes resident, " +
+              std::to_string(estimate.draft_weights_bytes) + " estimated");
+  }
   std::printf("%s (%d failures)\n", g_fail ? "FAILED" : "PASSED", g_fail);
   return g_fail ? 1 : 0;
 }
