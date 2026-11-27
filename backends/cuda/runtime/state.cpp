@@ -527,10 +527,9 @@ int seq_size(flyx_bmodel* m, const flyx_seq_layout* layout, flyx_seq_size* out) 
     return fail(e.what());
   }
   *out = {};
-  // The arena maps its last piece of the granularity whole (device_pieces; one cudaMalloc takes its pages so too).
-  const size_t gran = vmm_granularity();
-  const size_t arena_rest = (s.arena_dev_bytes + gran - 1) / gran * gran - s.arena_dev_bytes;
-  out->device = s.dry_bytes + arena_rest + s.page_spill_vram + room;
+  // The arena's bytes as it carves them: the rest of its last piece of the granularity, which its pieces map whole (as
+  // one cudaMalloc takes its pages), is left to the reserve, at most one piece a session.
+  out->device = s.dry_bytes + s.page_spill_vram + room;
 #if defined(_WIN32)
   // Without pieces the arena is one cudaMalloc, which leaves kPagedFloor free (device_malloc), not the floor of pieces
   // the budget's reserve is past (plan/budget.cpp): the session holds the difference.
