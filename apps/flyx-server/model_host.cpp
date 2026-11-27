@@ -374,6 +374,23 @@ bool ModelHost::save_hub_endpoint(const std::string& endpoint, std::string* err)
   return write_settings_locked(root, err);
 }
 
+bool ModelHost::lan_access() {
+  const ojson root = read_settings();
+  return root.is_object() && root.contains("lan_access") && root["lan_access"] == true;
+}
+
+bool ModelHost::save_lan_access(bool enabled, std::string* err) {
+  if (settings_path().empty()) {
+    *err = "no configuration directory available to save LAN access";
+    return false;
+  }
+  std::lock_guard<std::mutex> lock(settings_mutex());
+  ojson root = read_settings_locked();
+  if (!root.is_object()) root = ojson::object();
+  root["lan_access"] = enabled;
+  return write_settings_locked(root, err);
+}
+
 ModelHost::~ModelHost() {
   stop_ = true;
   if (worker_.joinable()) worker_.join();

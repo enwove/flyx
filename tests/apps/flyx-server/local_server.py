@@ -52,7 +52,8 @@ def _without_inherited(env):
     return {k: v for k, v in env.items() if not (_shell_setting(k) and os.environ.get(k) == v)}
 
 
-_LISTENING = re.compile(rb"listening on (http://[^\s,]+)")
+# The dashboard URL is connectable even when the listen address is a wildcard.
+_LISTENING = re.compile(rb"listening on http://[^\s,]+, the dashboard at (http://[^\s/]+)/")
 
 
 def serve(exe, cwd, env, model=(), on_ready=None, *, ctx=128, options=(), expect_name="test model", stderr=False):

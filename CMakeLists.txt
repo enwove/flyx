@@ -253,11 +253,13 @@ set(FLYX_CLI_SOURCES
     apps/flyx-server/openai_responses.cpp apps/flyx-server/anthropic_messages.cpp
     apps/flyx-server/telemetry.cpp apps/flyx-server/model_host.cpp apps/flyx-server/manage.cpp
     apps/flyx-server/request_log.cpp apps/flyx-server/system_log.cpp apps/flyx-server/agent_launch.cpp
-    apps/flyx-server/gpu_apps.cpp
+    apps/flyx-server/gpu_apps.cpp apps/flyx-server/network.cpp
     ${FLYX_DASHBOARD_CPP}
     apps/common/engine_flags.cpp apps/common/numbers.cpp apps/common/model_source.cpp)
+set(FLYX_CLI_LIBRARIES flyx_core Threads::Threads)
 if(WIN32)
   list(APPEND FLYX_CLI_SOURCES apps/flyx-cli/flyx.rc)
+  list(APPEND FLYX_CLI_LIBRARIES iphlpapi)
 endif()
 add_executable(flyx-cli ${FLYX_CLI_SOURCES})
 target_compile_definitions(flyx-cli PRIVATE FLYX_VERSION="${PROJECT_VERSION}"
@@ -265,7 +267,7 @@ target_compile_definitions(flyx-cli PRIVATE FLYX_VERSION="${PROJECT_VERSION}"
                            FLYX_VERSION_MINOR=${PROJECT_VERSION_MINOR}
                            FLYX_VERSION_PATCH=${PROJECT_VERSION_PATCH})
 set_source_files_properties(${FLYX_DASHBOARD_CPP} PROPERTIES SKIP_PRECOMPILE_HEADERS ON)
-target_link_libraries(flyx-cli PRIVATE flyx_core Threads::Threads)
+target_link_libraries(flyx-cli PRIVATE ${FLYX_CLI_LIBRARIES})
 set_target_properties(flyx-cli PROPERTIES OUTPUT_NAME flyx)
 flyx_program(flyx-cli)
 if(NOT WIN32)  # Windows: flyx serve (a link there needs the right to make one)
@@ -322,7 +324,7 @@ if(FLYX_STANDALONE_EXE)
                              FLYX_VERSION_MAJOR=${PROJECT_VERSION_MAJOR}
                              FLYX_VERSION_MINOR=${PROJECT_VERSION_MINOR}
                              FLYX_VERSION_PATCH=${PROJECT_VERSION_PATCH})
-  target_link_libraries(flyx-standalone PRIVATE flyx_core flyx_cpu_ref_static Threads::Threads)
+  target_link_libraries(flyx-standalone PRIVATE ${FLYX_CLI_LIBRARIES} flyx_cpu_ref_static)
   if(TARGET flyx_cuda_static)
     target_compile_definitions(flyx-standalone PRIVATE FLYX_HAVE_BUILTIN_CUDA=1)
     target_link_libraries(flyx-standalone PRIVATE flyx_cuda_static)

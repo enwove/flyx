@@ -183,6 +183,10 @@ canvas.spark { display: block; width: 100%; height: 30px; margin-top: 8px; }
 .pane-h h2 { font-size: 14px; font-weight: 600; }
 .pane-h .aside { margin-left: auto; font-size: 12px; color: var(--muted); }
 .pane-h.next { margin-top: 30px; }
+.network-settings { max-width: 680px; }
+.network-settings .lead, .network-settings .snip { margin-top: 8px; }
+.network-settings .snip pre { padding-right: 76px; overflow-wrap: anywhere; white-space: pre-wrap; }
+.network-settings .switch:has(input:disabled) { color: var(--muted); }
 .empty { color: var(--faint); font-size: 13px; }
 .lead { color: var(--muted); font-size: 13px; margin: 0; }
 .legend { display: inline-flex; gap: 12px; font-size: 12px; color: var(--muted); }

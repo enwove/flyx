@@ -58,11 +58,13 @@ class ModelHost {
   // last error, notes, the served model's drafters and those published for it, and what the settings file remembers.
   ojson status() const;
 
-  // The settings file: the last model loaded, as it was named, and optional Hub endpoint override.
+  // The settings file holds the last model, Hub endpoint and dashboard network preference.
   static std::string settings_path();
   static bool remembered(Want* w, const EngineOptions& base);
   static std::string remembered_hub_endpoint();
   static bool save_hub_endpoint(const std::string& endpoint, std::string* err = nullptr);
+  static bool lan_access();
+  static bool save_lan_access(bool enabled, std::string* err);
 
  private:
   struct BusyGuard {

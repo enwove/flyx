@@ -44,6 +44,7 @@ bool authorized(const Server& s, const httplib::Request& req);
 bool may_manage(const Server& s, const httplib::Request& req);
 // Whether `req` came from this machine itself (the loopback address): its sender sees this machine's desktop.
 bool from_this_machine(const httplib::Request& req);
+bool is_loopback_ip(const std::string& address);
 // Reject browser CSRF and DNS rebinding when no --api-key guards the server.
 bool browser_request_safe(const Server& s, const httplib::Request& req);
 // Whether `req` is a page of another origin calling the inference API with leave to (Config's cors_*): a browser

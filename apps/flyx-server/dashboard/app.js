@@ -14,6 +14,7 @@ import { Requests } from "./pages/requests.js";
 import { Chat } from "./pages/chat.js";
 import { Logs } from "./pages/logs.js";
 import { Integration } from "./pages/integration.js";
+import { NetworkSettings } from "./pages/settings.js";
 import { Hint, markVisited } from "./components/hints.js";
 import { VramModal, isVramError, parseVramNeeded } from "./components/vram_apps.js";
 import { reloadServed, loadWant } from "./lib/actions.js";
@@ -104,7 +105,7 @@ function App() {
     setTimeout(() => redraw((x) => x + 1), 200);  // the charts take the panel's new width once the sidebar has moved
   };
 
-  // The keys: 1 to 6 a page, [ the sidebar.
+  // Number keys select a page, [ toggles the sidebar.
   useEffect(() => {
     const key = (e) => {
       if (e.ctrlKey || e.metaKey || e.altKey || typing(e)) return;
@@ -162,6 +163,7 @@ function App() {
           ${page("chat", html`<${Chat} active=${tab === "chat"} showModel=${showModel}/>`)}
           ${page("logs", html`<${Logs} active=${tab === "logs"}/>`)}
           ${page("integration", html`<${Integration} active=${tab === "integration"}/>`)}
+          ${page("settings", tab === "settings" && html`<${NetworkSettings} key=${JSON.stringify([apiKey(), tm?.server?.started_at, live.offline])}/>`)}
         </div>
       </main>
       <${VramModal} open=${!!memKind} kind=${memKind || "vram"} onClose=${() => setMemKind("")} needBytes=${modalNeed}

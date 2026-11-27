@@ -199,6 +199,8 @@ export function Integration({ active }) {
           </div></details>
         <details class="ep"><summary><span class="method delete">DELETE</span><span class="path">/v1/load</span><span class="what">${t("Stop a fetch")}</span><svg class="i"><use href="#i-chev"/></svg></summary>
           <div class="body"><ul>${Li(String.raw`What came stays in the cache; loading the same name again goes on from there.`)}</ul></div></details>
+        <details class="ep"><summary><span class="method get">GET / POST</span><span class="path">/v1/settings/network</span><span class="what">${t("Serve on local network")}</span><svg class="i"><use href="#i-chev"/></svg></summary>
+          <div class="body"><code>{"lan_access": true}</code><p>${t("Restart flyx to apply changes.")}</p></div></details>
         <details class="ep"><summary><span class="method get">GET</span><span class="path">/v1/hub/config</span><span class="what">${t("Hub mirror setting")}</span><svg class="i"><use href="#i-chev"/></svg></summary>
           <div class="body"><ul>${Li(String.raw`Active Hugging Face endpoint (<code>endpoint</code>), default endpoint, <code>source</code> (<code>setting</code>, <code>HF_ENDPOINT</code>, or <code>default</code>), and <code>offline</code> flag.`)}</ul></div></details>
         <details class="ep"><summary><span class="method post">POST</span><span class="path">/v1/hub/config</span><span class="what">${t("Set the Hub mirror")}</span><svg class="i"><use href="#i-chev"/></svg></summary>
