@@ -455,9 +455,10 @@ struct KvBuf {
   int hot_bits = 0;
   size_t hot_tags = 0;  // slots, all heads
   // Sliding-window caches kept as a ring of `ring` physical slots holding positions via KvRef::slot_of (0: a slot a
-  // position): the MTP layer's (its draft steps attend to its first `sink` positions and its last `window`), a
-  // sliding-window DFlash2 drafter's context (s->dring says what it still holds), and the SWA target layers and
-  // DSpark's (KvSpec::window > 0, or DSpark's Full layer at long contexts: `swa_ring = true`, checkpointed on host).
+  // position): a sliding-window DFlash2 drafter's context (s->dring says what it still holds), and, with `swa_ring`
+  // (copied to host with every checkpoint, rewinds bounded by flyx_seq::rewind_floor), the SWA target layers and
+  // DSpark's (KvSpec::window > 0, or DSpark's Full layer at long contexts) and the MTP layer's at long contexts (its
+  // draft steps attend to its first `sink` positions and its last `window`).
   int ring = 0, sink = 0, window = 0;
   bool swa_ring = false;
   void* ckp_k[FLYX_CHECKPOINTS]{};

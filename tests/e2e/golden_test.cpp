@@ -1265,7 +1265,7 @@ void kv_in_host_memory(const std::string& model, const std::string& backend, con
 
 // The MTP layer's draft steps over its first and last positions, a 400-token prompt, FP8 caches: a
 // window as long as the context gives the drafts of none (its positions gathered in order); its first 16 and last 64
-// positions in a ring of 128 slots give the drafts of the same positions over a slot a position (the ring across its
+// positions in a ring of 192 slots give the drafts of the same positions over a slot a position (the ring across its
 // wraps), and plain decoding's tokens; a snapshot of the ring, loaded, the drafts of the session it was taken from.
 void mtp_window_checks(const std::string& model, const std::string& backend, const std::vector<int32_t>& prompt,
                        const std::vector<int32_t>& want) {
@@ -1298,12 +1298,12 @@ void mtp_window_checks(const std::string& model, const std::string& backend, con
   check(!d_none.empty() && d_all == d_none && t_all == t_none,
         "MTP over a window as long as the context: the drafts of none (" + std::to_string(d_none.size()) + ")");
   check(!d_ring.empty() && d_ring == d_flat && t_ring == t_flat,
-        "MTP over its first 16 and last 64 positions: a ring of 128 slots gives the drafts of a slot a position");
+        "MTP over its first 16 and last 64 positions: a ring of 192 slots gives the drafts of a slot a position");
   check(t_plain.size() == 48 && t_none == t_plain && t_ring == t_plain,
         "MTP over its first 16 and last 64 positions decodes plain decoding's tokens");
   auto ring = make(model, backend, true, "mtp", true, "mtp_window=64,mtp_sink=16,mtp_copy=0", false, 512);
   auto exact = make(model, backend, true, "mtp", true, "mtp_window=0", false, 512);
-  snapshot_through_host(ring.get(), exact.get(), prompt, "snapshot, MTP over a ring of 128 slots", false);
+  snapshot_through_host(ring.get(), exact.get(), prompt, "snapshot, MTP over a ring of 192 slots", false);
   // Over a 2- or 3-bit copy of every position, its last 64 exact from the ring (strata attention, the correction
   // reading the ring's slots): the drafts of the same over a slot a position, plain decoding's tokens.
   for (int bits : {2, 3}) {
@@ -1765,9 +1765,21 @@ void strata_rounds(const std::string& model, const std::string& backend, const s
       check(h_pin->api()->seq_size(h_pin->bmodel(), &lpin, &sz_pin) == 0 &&
                 h_pg->api()->seq_size(h_pg->bmodel(), &lpg, &sz_pg) == 0,
             "hybrid pageable_kv: query pinned and pageable sizes");
-      // Full-pinned needs ~(32 MiB + sz_pin.host); backing off by kv_delta/4 lands cleanly between 1 and 2 pinned layers.
+      // Full-pinned needs ~(32 MiB + host); backing off by kv_delta/4 lands cleanly between 1 and 2 pinned layers.  The
+      // host part the MTP session below needs, whose checkpoints copy the MTP layer's ring too (past 8 of mtp_window's
+      // windows: KvBuf::swa_ring).
       const uint64_t kv_delta = sz_pin.host_mapped > sz_pg.host_mapped ? sz_pin.host_mapped - sz_pg.host_mapped : 0;
-      const int mid_mb = int(((32ull << 20) + sz_pin.host - kv_delta / 4) / (1ull << 20));
+      flyx_seq_size sz_pin_mtp{};
+      {
+        auto h_pin_mtp = make(model, backend, true, "mtp", false, hbase + ",pageable_kv=off", false, hctx,
+                              kReferenceWidth, false, 0, "strata", 0);
+        const flyx_seq_layout l = h_pin_mtp->kv_layout();
+        const bool sized = h_pin_mtp->api()->seq_size(h_pin_mtp->bmodel(), &l, &sz_pin_mtp) == 0;
+        check(sized && sz_pin_mtp.host_mapped == sz_pin.host_mapped && sz_pin_mtp.host >= sz_pin.host,
+              "hybrid pageable_kv: the MTP session's pinned size (" + std::to_string(sz_pin_mtp.host) + " >= " +
+                  std::to_string(sz_pin.host) + " host bytes, the same K/V)");
+      }
+      const int mid_mb = int(((32ull << 20) + sz_pin_mtp.host - kv_delta / 4) / (1ull << 20));
       auto h_mix_plain = make(model, backend, false, "", false,
                               hbase + ",pageable_kv=auto,pinned_host_mb=" + std::to_string(mid_mb), false, hctx,
                               kReferenceWidth, false, 0, "strata", 0);
