@@ -74,8 +74,8 @@ int main() {
       if (auto dot = cuda::cold_q8_kernel(dtype, isa))
         test::check(std::fabs(dot(data.data(), quant.data(), cols) - expected_q8) <= 2e-6 * norm_q8,
                     "integer cold dot vs float64 for dtype " + std::to_string(dtype) + " ISA " + std::to_string(isa));
-    for (auto fn : {cuda::cold_dot_scalar, cuda::cold_dot}) {
-      test::check(std::fabs(fn(dtype, data.data(), x.data(), cols) - expected) <= 2e-6 * norm,
+    for (int isa : {0, 256, 512}) {
+      test::check(std::fabs(cuda::cold_dot_limited(dtype, data.data(), x.data(), cols, isa) - expected) <= 2e-6 * norm,
                   "compressed CPU GEMV vs float64 for dtype " + std::to_string(dtype));
     }
   }

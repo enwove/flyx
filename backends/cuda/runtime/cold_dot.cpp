@@ -360,6 +360,57 @@ FLYX_AVX2 float vector_dot(const uint8_t* row, const float* x, int cols) {
   for (float v : sums) sum += v;
   return sum;
 }
+// Sixteen adjacent FP4 weights share the activation load and fit the register lookup table.
+template <int Type, class B, int Span>
+FLYX_AVX512 float vector_dot_512(const uint8_t* row, const float* x, int cols) {
+  __m512 lookup;
+  if constexpr (Type == FLYX_DT_GGML_IQ4_NL)
+    lookup = _mm512_cvtepi32_ps(_mm512_cvtepi8_epi32(_mm_loadu_si128(reinterpret_cast<const __m128i*>(kvalues_iq4nl))));
+  else
+    lookup = _mm512_setr_ps(0,.5f,1,1.5f,2,3,4,6,0,-.5f,-1,-1.5f,-2,-3,-4,-6);
+  static const auto scales = [] {
+    std::array<float, 256> table{};
+    for (int i = 0; i < 256; ++i) {
+      const int v = i & 127;
+      table[i] = Type == FLYX_DT_GGML_NVFP4
+                     ? (v == 127 ? 0.f : v < 8 ? std::ldexp(float(v), -9) : std::ldexp(float(8 + (v & 7)), (v >> 3) - 10))
+                     : std::ldexp(1.f, i - 127);
+    }
+    return table;
+  }();
+  const float* half = half_scales();
+  __m512 acc = _mm512_setzero_ps();
+  for (int k = 0; k < cols; k += Span) {
+    const B b = block_at<B>(row, size_t(k / Span));
+    for (int j = 0; j < Span; j += 16) {
+      __m512 weights;
+      float scale;
+      if constexpr (Type == FLYX_DT_GGML_Q2_0) {
+        uint32_t bits;
+        std::memcpy(&bits, b.qs + j / 4, 4);
+        const auto codes = _mm512_srlv_epi32(_mm512_set1_epi32(bits),
+            _mm512_setr_epi32(0,2,4,6,8,10,12,14,16,18,20,22,24,26,28,30));
+        weights = _mm512_cvtepi32_ps(_mm512_sub_epi32(_mm512_and_si512(codes, _mm512_set1_epi32(3)), _mm512_set1_epi32(1)));
+        scale = half[b.d];
+      } else {
+        __m512i codes;
+        if constexpr (Type == FLYX_DT_GGML_NVFP4) {
+          const __m128i bytes = _mm_loadl_epi64(reinterpret_cast<const __m128i*>(b.qs + j / 2));
+          codes = _mm512_cvtepu8_epi32(_mm_unpacklo_epi64(bytes, _mm_srli_epi16(bytes, 4)));
+          scale = scales[b.d[j / 16]];
+        } else {
+          codes = _mm512_cvtepu8_epi32(_mm_loadu_si128(reinterpret_cast<const __m128i*>(b.qs)));
+          if (j) codes = _mm512_srli_epi32(codes, 4);
+          if constexpr (Type == FLYX_DT_GGML_MXFP4) scale = scales[b.e];
+          else scale = half[b.d];
+        }
+        weights = _mm512_permutexvar_ps(codes, lookup);
+      }
+      acc = _mm512_fmadd_ps(_mm512_mul_ps(weights, _mm512_set1_ps(scale)), _mm512_loadu_ps(x + k + j), acc);
+    }
+  }
+  return _mm512_reduce_add_ps(acc);
+}
 }  // namespace
 #endif
 
@@ -381,10 +432,19 @@ QuantDot cold_q8_kernel(int dtype, int max_isa) {
   return nullptr;
 }
 
-float cold_dot(int dtype, const uint8_t* row, const float* input, int cols) {
+float cold_dot_limited(int dtype, const uint8_t* row, const float* input, int cols, int max_isa) {
 #ifdef FLYX_AVX2
   static const bool simd = has_avx2();
-  if (simd && cols % 8 == 0) {
+  static const bool wide = has_vnni();
+  if (wide && max_isa >= 512 && cols % 64 == 0) {
+    switch (dtype) {
+      case FLYX_DT_GGML_NVFP4: return vector_dot_512<FLYX_DT_GGML_NVFP4, block_nvfp4, 64>(row, input, cols);
+      case FLYX_DT_GGML_Q2_0: return vector_dot_512<FLYX_DT_GGML_Q2_0, block_q2_0, 64>(row, input, cols);
+      case FLYX_DT_GGML_MXFP4: return vector_dot_512<FLYX_DT_GGML_MXFP4, block_mxfp4, 32>(row, input, cols);
+      case FLYX_DT_GGML_IQ4_NL: return vector_dot_512<FLYX_DT_GGML_IQ4_NL, block_iq4_nl, 32>(row, input, cols);
+    }
+  }
+  if (simd && max_isa >= 256 && cols % 8 == 0) {
     switch (dtype) {
 #define FLYX_DOT(T, B, N) \
   case T:                 \
@@ -411,5 +471,8 @@ float cold_dot(int dtype, const uint8_t* row, const float* input, int cols) {
   }
 #endif
   return cold_dot_scalar(dtype, row, input, cols);
+}
+float cold_dot(int dtype, const uint8_t* row, const float* input, int cols) {
+  return cold_dot_limited(dtype, row, input, cols, 512);
 }
 }  // namespace flyx::cuda

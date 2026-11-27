@@ -75,6 +75,7 @@ struct ColdMatrix {
 };
 
 void pack_expert_nvfp4(const uint8_t* in, size_t blocks, uint8_t* qo, uint8_t* so);
+float cold_dot_limited(int dtype, const uint8_t* row, const float* input, int cols, int max_isa);
 float cold_dot(int dtype, const uint8_t* row, const float* input, int cols);
 float cold_dot_scalar(int dtype, const uint8_t* row, const float* input, int cols);
 void cold_sequence_open(flyx_bmodel* m);
