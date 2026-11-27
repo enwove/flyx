@@ -184,9 +184,10 @@ int device_stats(flyx_device_stats* out);
 // below it once 5 of 8 GB are held, and 0 while 0.65 GB are free (device_stats.cpp).  false: no figure.
 bool gpu_memory(size_t* free, size_t* total);
 // NVML's figures of the device's memory, as gpu_memory reads them on Windows (v2: nvmlDeviceGetMemoryInfo_v2, with
-// what the driver reserves of the device; v1: nvmlDeviceGetMemoryInfo), and what gpu_memory makes of them: *free
-// NVML's free memory, *total (left as cudaMemGetInfo gave it without v2) what programs share, NVML's total less the
-// reserved memory, which is in neither its free nor its used memory and which no program can allocate.
+// what the driver reserves of the device; v1: nvmlDeviceGetMemoryInfo), and what gpu_memory makes of them from
+// cudaMemGetInfo's *free and *total: NVML's free memory, and with v2 the total programs share, NVML's total less the
+// reserved memory, which is in neither the used memory nvidia-smi shows nor the free and which no program can
+// allocate.  Figures that do not add up leave cudaMemGetInfo's.
 struct NvmlFigures {
   bool v1 = false, v2 = false;
   uint64_t total = 0, reserved = 0, free = 0;
@@ -454,7 +455,8 @@ void prefill_vmm_free(flyx_bmodel* m);
 // mapped at every offset, for a sequence that is only captured, never run (graphs.cpp count_round_graphs).
 struct DevicePieces {
   unsigned long long va = 0;
-  size_t bytes = 0;  // the range's, a multiple of the granularity
+  size_t bytes = 0;   // the range's, a multiple of the granularity
+  size_t mapped = 0;  // of it mapped so far (what release unmaps)
   std::vector<unsigned long long> handles;
   bool alias = false;
   DevicePieces() = default;
@@ -463,11 +465,17 @@ struct DevicePieces {
   ~DevicePieces() { release(); }
   void release();  // runtime/tiers.cpp
 };
-// `bytes` of device memory in pieces (not zeroed), *out holding them; null where the driver maps no memory (VMM),
-// for the caller's device_malloc.  Throws OutOfDeviceMemory where they do not fit (device_room, kPiecesFloor) or the
-// driver refuses a piece.  device_alias: the same range over one piece of physical memory.
+// `bytes` of device memory in pieces (not zeroed), *out holding them; null where the driver maps no memory (VMM) or
+// takes none of its operations, for the caller's device_malloc.  Throws OutOfDeviceMemory where they do not fit
+// (device_room, pieces_floor) or the driver refuses a piece.  device_alias: the same range over one piece of physical
+// memory.
 void* device_pieces(size_t bytes, DevicePieces* out);
 void* device_alias(size_t bytes, DevicePieces* out);
+// Whether the device maps memory in pieces (VMM: its capability and the driver's functions), and the floor
+// device_room keeps below memory made of them: kPiecesFloor for pieces of kPieceBytes at most, kPagedFloor where the
+// granularity is larger or there is no VMM (one allocation instead).
+bool vmm_supported();
+size_t pieces_floor();
 
 }  // namespace flyx::cuda
 
@@ -925,7 +933,8 @@ struct flyx_seq {
     unsigned long long va = 0, view = 0;
     size_t dev = 0, bytes = 0, va_bytes = 0, stage = 0;  // stage: the view's bytes past dev, its staging's
     std::vector<unsigned long long> dev_handles;         // the device part in pieces (tiers.cpp), at va and at view
-    unsigned long long rest = 0;                         // the host or ring part's handle
+    std::vector<unsigned long long> ring_handles;        // a pageable cache's device tail ring, in pieces, past it
+    unsigned long long rest = 0;                         // the host part's handle
     int slot = -1;                                       // the staging the view maps past its device part
   };
   // A staging's size. 0: as large as a cache's host part. Else, with strata attention (FLYX_KV_STRATA

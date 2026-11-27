@@ -43,8 +43,8 @@ struct NvmlUtilization {
 struct NvmlMemory {
   unsigned long long total, free, used;
 };
-// nvmlMemory_v2_t (driver 510 on): its used memory is nvidia-smi's, without what the driver reserves of the device
-// for itself (its firmware, the display), which is in neither the used nor the free memory.
+// nvmlMemory_v2_t (driver 510 on), with what the driver reserves of the device for itself (its firmware, the
+// display): in neither the used memory nvidia-smi shows nor the free memory.
 struct NvmlMemory2 {
   unsigned int version;
   unsigned long long total, reserved, free, used;
@@ -260,10 +260,12 @@ uint64_t host_pinned_budget() {
 // MiB of the 5070 Ti's 16,303), which no program holds and none can allocate: counted in, the budget took it for
 // another program's (flyx_memory_info: total = free + what processes hold).
 void memory_of(const NvmlFigures& n, size_t* free, size_t* total) {
-  if (n.v2 && n.total > n.reserved && n.total - n.reserved >= n.free) {
-    *free = size_t(n.free);
-    *total = size_t(n.total - n.reserved);
-  } else if (n.v1 || n.v2) {
+  if (n.v2) {
+    if (n.total > n.reserved && n.total - n.reserved >= n.free) {
+      *free = size_t(n.free);
+      *total = size_t(n.total - n.reserved);
+    }
+  } else if (n.v1 && n.free <= *total) {
     *free = size_t(n.free);
   }
 }

@@ -50,7 +50,7 @@ void device_room(size_t bytes, size_t floor) {
   // refusing it: refused here first, against NVML's free memory (gpu_memory) less the floor for allocations that size.
   size_t free = 0, total = 0;
   if (!gpu_memory(&free, &total)) CK(cudaMemGetInfo(&free, &total));
-  if (bytes + floor > free) {
+  if (free < floor || bytes > free - floor) {
     char m[240];
     std::snprintf(m, sizeof(m), "out of GPU memory: %s asked, %.0f MiB free, of which flyx keeps %.0f MiB (past "
                   "70 to 630 MiB free, by the allocation's size, Windows puts allocations in host memory)",
@@ -774,7 +774,7 @@ int open_model(const flyx_model_desc* desc, const flyx_open_options* opts, flyx_
     const bool mem_ok = gpu_memory(&free, &total) && total > 0;
     const size_t process = gpu_process_memory();
     const size_t own = process >= m->bytes ? process : m->bytes;
-    const size_t others = mem_ok && total > free + own ? total - free - own : 0;
+    const size_t others = mem_ok && total > free && total - free > own ? total - free - own : 0;
     const bool has_others = others >= (256ull << 20);
     // From the description: a drafter's layers may come before its block, and run out of memory before it is bound.
     bool drafter = false;

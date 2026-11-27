@@ -167,9 +167,14 @@ int bench_paging(int argc, char** argv) {
     std::fprintf(stderr, "usage: cuda_bench paging malloc|pieces|one STEP_MIB [PIECE_MIB [FILL_TO_MIB]]\n");
     return 2;
   }
-  const size_t step = size_t(argc > 3 ? std::atoll(argv[3]) : 32) << 20;
-  const size_t piece = size_t(argc > 4 ? std::atoll(argv[4]) : 8) << 20;
+  const long long step_mib = argc > 3 ? std::atoll(argv[3]) : 32, piece_mib = argc > 4 ? std::atoll(argv[4]) : 8;
   const double fill_to = argc > 5 ? std::atof(argv[5]) : 1600;
+  // Sizes the driver maps: whole multiples of 2 MiB, its granularity on every GPU flyx runs on.
+  if (step_mib < 2 || piece_mib < 2 || step_mib % 2 || piece_mib % 2 || fill_to < 0) {
+    std::fprintf(stderr, "cuda_bench paging: STEP and PIECE are whole even numbers of MiB, FILL_TO not negative\n");
+    return 2;
+  }
+  const size_t step = size_t(step_mib) << 20, piece = size_t(piece_mib) << 20;
   CK(cudaFree(nullptr));
   if (!open_counters()) {
     std::fprintf(stderr, "cuda_bench paging: no NVML\n");
@@ -179,6 +184,7 @@ int bench_paging(int argc, char** argv) {
   const auto reserve = driver<decltype(&cuMemAddressReserve)>("cuMemAddressReserve");
   const auto map = driver<decltype(&cuMemMap)>("cuMemMap");
   const auto access = driver<decltype(&cuMemSetAccess)>("cuMemSetAccess");
+  const auto granularity = driver<decltype(&cuMemGetAllocationGranularity)>("cuMemGetAllocationGranularity");
   if (kind != "malloc" && !(create && reserve && map && access)) {
     std::fprintf(stderr, "cuda_bench paging: the driver maps no memory (VMM)\n");
     return 1;
@@ -191,6 +197,12 @@ int bench_paging(int argc, char** argv) {
   CUmemAccessDesc rw{};
   rw.location = {CU_MEM_LOCATION_TYPE_DEVICE, dev};
   rw.flags = CU_MEM_ACCESS_FLAGS_PROT_READWRITE;
+  size_t gran = 0;
+  if (kind != "malloc" && (!granularity || granularity(&gran, &dp, CU_MEM_ALLOC_GRANULARITY_MINIMUM) != CUDA_SUCCESS ||
+                           !gran || step % gran || piece % gran)) {
+    std::fprintf(stderr, "cuda_bench paging: STEP and PIECE must be multiples of the granularity (%zu bytes)\n", gran);
+    return 2;
+  }
   unsigned* out = nullptr;
   CK(cudaMalloc(&out, sizeof(unsigned)));
 
@@ -230,15 +242,21 @@ int bench_paging(int argc, char** argv) {
     } else {
       CUdeviceptr va = 0;
       const size_t pc = kind == "one" ? step : piece;
-      bool ok = reserve(&va, step, 0, 0, 0) == CUDA_SUCCESS;
-      for (size_t o = 0; ok && o < step; o += pc) {
+      CUresult r = reserve(&va, step, 0, 0, 0);
+      for (size_t o = 0; r == CUDA_SUCCESS && o < step; o += pc) {
         CUmemGenericAllocationHandle h = 0;
         const size_t n = std::min(pc, step - o);
-        ok = create(&h, n, &dp, 0) == CUDA_SUCCESS && map(va + o, n, 0, h, 0) == CUDA_SUCCESS;
+        r = create(&h, n, &dp, 0);
+        if (r == CUDA_SUCCESS) r = map(va + o, n, 0, h, 0);
       }
-      if (!ok || access(va, step, &rw, 1) != CUDA_SUCCESS) {
+      if (r == CUDA_SUCCESS) r = access(va, step, &rw, 1);
+      if (r == CUDA_ERROR_OUT_OF_MEMORY) {
         std::printf("cuMemCreate refused\n");
         break;
+      }
+      if (r != CUDA_SUCCESS) {
+        std::fprintf(stderr, "cuda_bench paging: a VMM call failed (%d)\n", int(r));
+        return 1;
       }
       p = reinterpret_cast<void*>(va);
     }

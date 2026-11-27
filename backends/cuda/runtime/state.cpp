@@ -375,8 +375,10 @@ int ensure_prefill_rows(flyx_bmodel* m, int rows) {
     });
     // Never in host memory (device_room, device_malloc): a pass reads them a layer at a time.  Where the copies of the
     // head kept for speed left no room, lowering fails and the engine has the backend give those back (trim).  In
-    // pieces of the granularity (prefill_vmm_alloc) the floor of pieces; device_malloc, without them, keeps its own.
-    device_room(total, kPiecesFloor);
+    // pieces of the granularity (prefill_vmm_alloc, the whole last one) the floor of pieces; without them,
+    // device_malloc's, which it checks again.
+    const size_t gran = vmm_granularity();
+    device_room((total + gran - 1) / gran * gran, pieces_floor());
     size_t actual = 0;
     void* base = prefill_vmm_alloc(m, total, &actual);
     if (!base) {
@@ -525,7 +527,15 @@ int seq_size(flyx_bmodel* m, const flyx_seq_layout* layout, flyx_seq_size* out) 
     return fail(e.what());
   }
   *out = {};
-  out->device = s.dry_bytes + s.page_spill_vram + room;
+  // The arena maps its last piece of the granularity whole (device_pieces; one cudaMalloc takes its pages so too).
+  const size_t gran = vmm_granularity();
+  const size_t arena_rest = (s.arena_dev_bytes + gran - 1) / gran * gran - s.arena_dev_bytes;
+  out->device = s.dry_bytes + arena_rest + s.page_spill_vram + room;
+#if defined(_WIN32)
+  // Without pieces the arena is one cudaMalloc, which leaves kPagedFloor free (device_malloc), not the floor of pieces
+  // the budget's reserve is past (plan/budget.cpp): the session holds the difference.
+  if (!vmm_supported() && s.arena_dev_bytes) out->device += kPagedFloor - kPiecesFloor;
+#endif
   out->host = s.dry_host_bytes + s.page_spill_host;
   out->host_mapped = s.dry_mapped_bytes;
   out->device_positions = std::min(s.device_positions, layout->max_ctx);

@@ -40,6 +40,7 @@ struct Vmm {
   decltype(&cuMemMap) map = nullptr;
   decltype(&cuMemUnmap) unmap = nullptr;
   decltype(&cuMemSetAccess) set_access = nullptr;
+  decltype(&cuDeviceGetAttribute) attribute = nullptr;
   size_t gran = 0;  // the larger of the device's and the host's granularity
   int device = 0;
   std::string missing;
@@ -67,8 +68,16 @@ const Vmm& vmm() {
     get("cuMemMap", &v.map);
     get("cuMemUnmap", &v.unmap);
     get("cuMemSetAccess", &v.set_access);
+    get("cuDeviceGetAttribute", &v.attribute);
     if (!v.missing.empty()) return;
     cudaGetDevice(&v.device);
+    int vmm_device = 0;
+    if (v.attribute(&vmm_device, CU_DEVICE_ATTRIBUTE_VIRTUAL_MEMORY_MANAGEMENT_SUPPORTED, CUdevice(v.device)) !=
+            CUDA_SUCCESS ||
+        !vmm_device) {
+      v.missing = "the device maps no memory (virtual memory management)";
+      return;
+    }
     CUmemAllocationProp dev{}, host{};
     dev.type = host.type = CU_MEM_ALLOCATION_TYPE_PINNED;
     dev.location = {CU_MEM_LOCATION_TYPE_DEVICE, v.device};
@@ -95,13 +104,24 @@ size_t round_up(size_t n, size_t g) { return (n + g - 1) / g * g; }
 // granularity): what create_pieces makes and map_pieces / unmap_pieces walk, the last piece the rest.
 size_t piece_of(const Vmm& v) { return std::max(v.gran, kPieceBytes / v.gran * v.gran); }
 
+// What device_room keeps free for memory in pieces: kPiecesFloor for pieces of kPieceBytes at most, else (a
+// granularity past it) kPagedFloor, as for one allocation.
+size_t floor_of(const Vmm& v) { return piece_of(v) <= kPieceBytes ? kPiecesFloor : kPagedFloor; }
+
+// A VMM operation the driver does not take (CUDA_ERROR_NOT_SUPPORTED): device_pieces and device_alias give up their
+// pieces for one allocation.
+struct VmmUnsupported : std::runtime_error {
+  using std::runtime_error::runtime_error;
+};
+
 // A driver call on device memory in pieces: its refusal for want of memory is OutOfDeviceMemory, as device_malloc's;
-// another error a std::runtime_error naming `what`.
+// an operation it does not take VmmUnsupported; another error a std::runtime_error naming `what`.
 void piece_check(CUresult r, const char* what, size_t bytes) {
   if (r == CUDA_SUCCESS) return;
   if (r == CUDA_ERROR_OUT_OF_MEMORY)
     throw OutOfDeviceMemory("out of GPU memory: " + std::to_string(bytes >> 20) + " MiB asked in pieces of " +
                             std::to_string(kPieceBytes >> 20) + " MiB, the driver refused one");
+  if (r == CUDA_ERROR_NOT_SUPPORTED) throw VmmUnsupported(std::string(what) + ": not supported");
   throw std::runtime_error(std::string(what) + " failed (" + std::to_string(int(r)) + ")");
 }
 
@@ -148,23 +168,31 @@ void DevicePieces::release() {
   const Vmm& v = vmm();
   if (va) {
     if (alias) {
-      for (size_t o = 0; o < bytes; o += v.gran) v.unmap(CUdeviceptr(va) + o, v.gran);
+      for (size_t o = 0; o < mapped; o += v.gran) v.unmap(CUdeviceptr(va) + o, v.gran);
     } else {
-      unmap_pieces(v, CUdeviceptr(va), bytes);
+      unmap_pieces(v, CUdeviceptr(va), mapped);
     }
     v.address_free(CUdeviceptr(va), bytes);
   }
   for (unsigned long long h : handles) v.release(CUmemGenericAllocationHandle(h));
   handles.clear();
   va = 0;
-  bytes = 0;
+  bytes = mapped = 0;
   alias = false;
+}
+
+bool vmm_supported() { return vmm().missing.empty(); }
+
+size_t pieces_floor() {
+  const Vmm& v = vmm();
+  return v.missing.empty() ? floor_of(v) : kPagedFloor;
 }
 
 namespace {
 
 // The address range of `bytes` (rounded up to the granularity) for *out, mapped by map(va) and readable and
-// writable by the device; null where the driver maps no memory.  *out is released on any error.
+// writable by the device; null where the driver maps no memory, or takes none of the operations (VmmUnsupported:
+// the caller makes one allocation instead).  *out is released on any error.
 template <class Map>
 void* map_range(size_t bytes, DevicePieces* out, Map&& map) {
   const Vmm& v = vmm();
@@ -181,6 +209,9 @@ void* map_range(size_t bytes, DevicePieces* out, Map&& map) {
     access.location = {CU_MEM_LOCATION_TYPE_DEVICE, v.device};
     access.flags = CU_MEM_ACCESS_FLAGS_PROT_READWRITE;
     piece_check(v.set_access(va, total, &access, 1), "granting the device access", total);
+  } catch (const VmmUnsupported&) {
+    out->release();
+    return nullptr;
   } catch (...) {
     out->release();
     throw;
@@ -191,22 +222,30 @@ void* map_range(size_t bytes, DevicePieces* out, Map&& map) {
 }  // namespace
 
 void* device_pieces(size_t bytes, DevicePieces* out) {
-  if (!vmm().missing.empty() || bytes == 0) return nullptr;
-  device_room(round_up(bytes, vmm().gran), kPiecesFloor);
+  const Vmm& v = vmm();
+  if (!v.missing.empty() || bytes == 0) return nullptr;
+  device_room(round_up(bytes, v.gran), floor_of(v));
   return map_range(bytes, out, [&](const Vmm& v, CUdeviceptr va, size_t total) {
     create_pieces(v, total, &out->handles, "allocating device memory in pieces");
-    map_pieces(v, va, total, out->handles, "mapping device memory in pieces");
+    const size_t piece = piece_of(v);
+    for (size_t i = 0; out->mapped < total; ++i) {
+      const size_t n = std::min(piece, total - out->mapped);
+      piece_check(v.map(va + out->mapped, n, 0, CUmemGenericAllocationHandle(out->handles[i]), 0),
+                  "mapping device memory in pieces", total);
+      out->mapped += n;
+    }
   });
 }
 
 void* device_alias(size_t bytes, DevicePieces* out) {
-  if (!vmm().missing.empty() || bytes == 0) return nullptr;
-  device_room(vmm().gran, kPiecesFloor);
+  const Vmm& v = vmm();
+  if (!v.missing.empty() || bytes == 0) return nullptr;
+  device_room(v.gran, floor_of(v));
   return map_range(bytes, out, [&](const Vmm& v, CUdeviceptr va, size_t total) {
     out->alias = true;
     create_pieces(v, v.gran, &out->handles, "allocating device memory to alias");
-    for (size_t o = 0; o < total; o += v.gran)
-      piece_check(v.map(va + o, v.gran, 0, CUmemGenericAllocationHandle(out->handles[0]), 0),
+    for (; out->mapped < total; out->mapped += v.gran)
+      piece_check(v.map(va + out->mapped, v.gran, 0, CUmemGenericAllocationHandle(out->handles[0]), 0),
                   "mapping aliased device memory", total);
   });
 }
@@ -395,14 +434,12 @@ flyx_seq::Tiered flyx_seq::tiered_alloc(size_t positions, size_t row, int role, 
       check(v.reserve(&va, va_sz, v.gran, 0, 0), "reserving addresses for a pageable ring");
       m.va = va;
       m.va_bytes = va_sz;
-      device_room(dev + ring_vmm, kPiecesFloor);
+      device_room(dev + ring_vmm, floor_of(v));
       create_pieces(v, dev, &m.dev_handles, "allocating device memory");
       map_pieces(v, va, dev, m.dev_handles, "mapping device memory");
       map_pieces(v, vw, dev, m.dev_handles, "mapping a view's device memory");
-      CUmemGenericAllocationHandle hr = 0;
-      check(v.create(&hr, ring_vmm, &dp, 0), "allocating device tail ring");
-      m.rest = hr;
-      check(v.map(va + dev, ring_vmm, 0, hr, 0), "mapping device tail ring");
+      create_pieces(v, ring_vmm, &m.ring_handles, "allocating device tail ring");
+      map_pieces(v, va + dev, ring_vmm, m.ring_handles, "mapping device tail ring");
       check(v.set_access(va, va_sz, &access, 1), "granting the device access");
       CK(cudaMemsetAsync(reinterpret_cast<void*>(va), 0, dev + ring_vmm_bytes, st));
       t.at = reinterpret_cast<void*>(va);
@@ -440,7 +477,7 @@ flyx_seq::Tiered flyx_seq::tiered_alloc(size_t positions, size_t row, int role, 
   m.view = vw;
   CUmemGenericAllocationHandle hh = 0;
   if (dev) {
-    device_room(dev, kPiecesFloor);
+    device_room(dev, floor_of(v));
     create_pieces(v, dev, &m.dev_handles, "allocating device memory");
     map_pieces(v, va, dev, m.dev_handles, "mapping device memory");
     map_pieces(v, vw, dev, m.dev_handles, "mapping a view's device memory");
@@ -506,7 +543,7 @@ void flyx_seq::pool_finish() {
   access.location = {CU_MEM_LOCATION_TYPE_DEVICE, v.device};
   access.flags = CU_MEM_ACCESS_FLAGS_PROT_READWRITE;
   // The pool in pieces of the granularity: owned_pieces first, then shared prefill pieces at the tail.
-  device_room(owned_pool_bytes, kPiecesFloor);
+  device_room(owned_pool_bytes, v.gran <= kPieceBytes ? kPiecesFloor : kPagedFloor);
   const size_t owned_pieces = owned_pool_bytes / v.gran;
   const size_t shared_pieces = prefill_shared / v.gran;
   pool_pieces.reserve(owned_pieces);
@@ -1035,7 +1072,8 @@ void flyx_seq::release_mapped() {
     for (const Mapped& m : mapped) {
       if (m.va) {
         if (m.dev) unmap_pieces(v, CUdeviceptr(m.va), m.dev);
-        if (m.va_bytes > m.dev) v.unmap(CUdeviceptr(m.va) + m.dev, m.va_bytes - m.dev);
+        if (!m.ring_handles.empty()) unmap_pieces(v, CUdeviceptr(m.va) + m.dev, m.va_bytes - m.dev);
+        else if (m.va_bytes > m.dev) v.unmap(CUdeviceptr(m.va) + m.dev, m.va_bytes - m.dev);
         v.address_free(CUdeviceptr(m.va), m.va_bytes);
       }
       if (m.view) {
@@ -1046,6 +1084,7 @@ void flyx_seq::release_mapped() {
     }
     for (const Mapped& m : mapped) {
       for (auto h : m.dev_handles) v.release(CUmemGenericAllocationHandle(h));
+      for (auto h : m.ring_handles) v.release(CUmemGenericAllocationHandle(h));
       if (m.rest) v.release(CUmemGenericAllocationHandle(m.rest));
     }
     if (pool_va) {

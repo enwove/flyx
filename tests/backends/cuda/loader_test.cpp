@@ -1,6 +1,7 @@
 // Copyright 2026 The flyx Authors. SPDX-License-Identifier: Apache-2.0
 // Link the production binder and runtime with a backend.cpp whose device allocator can refuse a small request (or
 // fail its room check otherwise).
+#include <algorithm>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -55,7 +56,7 @@ void oom_paths() {
 // NVML's figures as gpu_memory makes them the device's free and total memory on Windows: the total less what the
 // driver reserves of the device for itself where nvmlDeviceGetMemoryInfo_v2 tells it, the used memory nvidia-smi
 // shows plus the free memory (RTX 5070 Ti, driver 610.88: 16,303 MiB, 308 reserved).  Without v2, the free memory
-// alone; with figures that do not add up, the total as cudaMemGetInfo gave it.
+// alone; with figures that do not add up, cudaMemGetInfo's.
 void memory_figures() {
   constexpr uint64_t kMiB = 1ull << 20;
   auto made = [](const NvmlFigures& n, size_t* free, size_t* total) {
@@ -74,27 +75,35 @@ void memory_figures() {
   NvmlFigures odd = v2;
   odd.reserved = 16303 * kMiB;
   made(odd, &free, &total);
-  require(free == 10326 * kMiB && total == 16303 * kMiB, "a reserve as large as the device: the total as it was");
+  require(free == 1 && total == 16303 * kMiB, "a reserve as large as the device: cudaMemGetInfo's figures");
+  odd = v2;
+  odd.free = 16000 * kMiB;
+  made(odd, &free, &total);
+  require(free == 1 && total == 16303 * kMiB, "more free than the device less its reserve: cudaMemGetInfo's");
   made(NvmlFigures{}, &free, &total);
   require(free == 1 && total == 16303 * kMiB, "no NVML: cudaMemGetInfo's figures");
 }
 
-// What this process holds of the device: as Windows counts it (DXGI), else cudaMemGetInfo's used memory.
+// What this process holds of the device as Windows counts it (DXGI, the adapter of device 0); 0 where the system
+// does not tell a process's share, and the checks of what the memory took are skipped: the device's free memory is
+// every program's, and the GPU tests run beside each other.
 int64_t held_now() {
   CK(cudaDeviceSynchronize());
-  if (const size_t p = gpu_process_memory()) return int64_t(p);
-  size_t free = 0, total = 0;
-  CK(cudaMemGetInfo(&free, &total));
-  return int64_t(total - free);
+  return int64_t(gpu_process_memory());
 }
 
-// device_pieces: device memory in pieces of kPieceBytes that hold what is written to each, and take what they map;
-// device_alias: a range as long over one piece, where a byte written shows at the same offset in every other piece;
-// both give their memory back when released (a session's arena and the counting sequence's: build_seq).
+// device_pieces: device memory in pieces of kPieceBytes (or of the granularity, where it is larger) that hold what is
+// written to each, and take what they map; device_alias: a range as long over one piece, where a byte written shows at
+// the same offset in every other piece; both give their memory back when released (a session's arena and the counting
+// sequence's: build_seq).
 void pieces_and_alias() {
   constexpr size_t kMiB = 1ull << 20, kBytes = 64 * kMiB + 12345;
-  const size_t gran = vmm_granularity();
+  CK(cudaSetDevice(0));
+  remember_device(0);  // the adapter gpu_process_memory reads
+  const size_t gran = vmm_granularity(), piece = std::max(gran, kPieceBytes / gran * gran);
   const int64_t before = held_now();
+  const bool counted = before > 0;
+  if (!counted) std::printf("  device_pieces, device_alias: no process memory figure, what they take not checked\n");
   {
     DevicePieces pieces;
     unsigned char* p = static_cast<unsigned char*>(device_pieces(kBytes, &pieces));
@@ -102,29 +111,32 @@ void pieces_and_alias() {
       std::printf("  skip device_pieces: the driver maps no memory\n");
       return;
     }
-    require(pieces.bytes >= kBytes && pieces.bytes % gran == 0 && pieces.handles.size() ==
-                (pieces.bytes + kPieceBytes - 1) / kPieceBytes, "device_pieces: the range in pieces");
-    for (size_t i = 0; i < pieces.handles.size(); ++i) CK(cudaMemset(p + i * kPieceBytes, int(i + 1), 16));
+    require(pieces.bytes >= kBytes && pieces.bytes % gran == 0 && pieces.mapped == pieces.bytes &&
+                pieces.handles.size() == (pieces.bytes + piece - 1) / piece,
+            "device_pieces: the range in pieces");
+    for (size_t i = 0; i < pieces.handles.size(); ++i) CK(cudaMemset(p + i * piece, int(i + 1), 16));
     std::vector<unsigned char> got(pieces.handles.size());
-    for (size_t i = 0; i < got.size(); ++i) CK(cudaMemcpy(&got[i], p + i * kPieceBytes, 1, cudaMemcpyDeviceToHost));
+    for (size_t i = 0; i < got.size(); ++i) CK(cudaMemcpy(&got[i], p + i * piece, 1, cudaMemcpyDeviceToHost));
     for (size_t i = 0; i < got.size(); ++i) require(got[i] == (i + 1) % 256, "device_pieces: each piece its own");
     const int64_t took = held_now() - before;
-    require(took >= int64_t(64 * kMiB) && took <= int64_t(pieces.bytes + 4 * kMiB), "device_pieces: what it maps");
+    require(!counted || (took >= int64_t(64 * kMiB) && took <= int64_t(pieces.bytes + 4 * kMiB)),
+            "device_pieces: what it maps");
   }
-  require(held_now() <= before + int64_t(2 * kMiB), "device_pieces: the memory back when released");
+  require(!counted || held_now() <= before + int64_t(2 * kMiB), "device_pieces: the memory back when released");
   {
     DevicePieces alias;
     unsigned char* p = static_cast<unsigned char*>(device_alias(kBytes, &alias));
-    require(p && alias.alias && alias.handles.size() == 1 && alias.bytes >= kBytes, "device_alias: one piece");
+    require(p && alias.alias && alias.handles.size() == 1 && alias.bytes >= kBytes && alias.mapped == alias.bytes,
+            "device_alias: one piece");
     const int64_t took = held_now() - before;
-    require(took <= int64_t(gran + 2 * kMiB), "device_alias: one piece of memory under the range");
+    require(!counted || took <= int64_t(gran + 2 * kMiB), "device_alias: one piece of memory under the range");
     CK(cudaMemset(p + 5, 0x5a, 1));
     unsigned char at[2] = {};
     CK(cudaMemcpy(&at[0], p + gran + 5, 1, cudaMemcpyDeviceToHost));
     CK(cudaMemcpy(&at[1], p + alias.bytes - gran + 5, 1, cudaMemcpyDeviceToHost));
     require(at[0] == 0x5a && at[1] == 0x5a, "device_alias: every piece the same memory");
   }
-  require(held_now() <= before + int64_t(2 * kMiB), "device_alias: the memory back when released");
+  require(!counted || held_now() <= before + int64_t(2 * kMiB), "device_alias: the memory back when released");
 }
 
 void residual_query_extent() {
