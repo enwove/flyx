@@ -1,7 +1,8 @@
 # Copyright 2026 The flyx Authors. SPDX-License-Identifier: Apache-2.0
 """bench/ab/same_runs.py on records made up here: the same run passes, a --limit run against a whole one compares its
 first prompts, a record from before `trace` had its third field compares on the first two; another answer, other
-rounds (unless --answers-only), another prompt's tokens, another command's field or no shared prompt fails.
+rounds (unless --answers-only, which also compares a drafter's record with the plain one's), a failed run, another
+prompt's tokens, another command's field or no shared prompt fails.
 
     python tests/bench/ab/same_runs_test.py
 """
@@ -53,6 +54,20 @@ code, out = run(record(2), record(5))
 check(code == 0 and "2 prompts compared (of 2 and 5)" in out, "a --limit run against a whole one: its first prompts")
 code, out = run(record(3), record(3, three_fields=False))
 check(code == 0, "a trace of two fields against one of three: compared on the two")
+
+plain = record(3)
+plain.update(drafter="", rounds=[])
+for p in plain["prompts"]:
+    p["trace"] = [[1, 0, 0]] * len(p["ids"])
+code, out = run(record(3), plain, "--answers-only")
+check(code == 0 and "answers the same 3 of 3" in out, "--answers-only: a drafter's record against the plain one's")
+code, out = run(record(3), plain)
+check(code == 1 and "the runs differ in drafter" in out, "without --answers-only another drafter fails")
+
+failed = record(1)
+failed["error"] = "prompt 1: out of memory"
+code, out = run(failed, record(3))
+check(code == 1 and "the new run failed: prompt 1: out of memory" in out, "a run that failed fails, whatever matches")
 
 other = record(3)
 other["prompts"][1]["ids"][2] = 99
