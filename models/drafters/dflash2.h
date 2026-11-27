@@ -1,7 +1,9 @@
 // Copyright 2026 The flyx Authors. SPDX-License-Identifier: Apache-2.0
-// Architecture-agnostic DFlash2 speculative drafter parser and block builder, and DeepSpec's DSpark (kind "dspark":
-// the same block drafter without its convolutions, every row of the block a draft, the anchor's too, and a Markov
-// head as the selector without a hidden gate; from a .flyx or an authors' directory).
+// Architecture-agnostic DFlash2 speculative drafter parser and block builder; z-lab's DFlash (kind "dflash": the same
+// block drafter without its convolutions or selector, each row's draft the head's best); and
+// DeepSpec's DSpark (kind "dspark": the same block drafter without its convolutions, every row of the block a draft,
+// the anchor's too, and a Markov head as the selector without a hidden gate).  DFlash and DSpark: from a .flyx or an
+// authors' directory.
 // Supports three sources uniformly:
 //   * embedded in a .flyx target model header ("draft"),
 //   * a standalone .flyx drafter file or Hugging Face safetensors directory ("kind": "drafter"),

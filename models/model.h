@@ -30,9 +30,9 @@ using interfaces::ModelOptions;
 
 // The drafters the architectures here can have.  Only models/ knows them by
 // name: the engine sees drafters by number and the round widths each offers
-// (draft_widths).  DFlash2, DSpark and DSpine (models/drafters/) draft a block at once; DV (models/dv.h) drafts
-// trees, and its canvas follows its own rounds only (Model::restarts).
-enum class Drafter { kNone, kMtp, kDFlash2, kDv, kDSpark, kDSpine };
+// (draft_widths).  DFlash2, DFlash, DSpark and DSpine (models/drafters/) draft a block at once; DV (models/dv.h)
+// drafts trees, and its canvas follows its own rounds only (Model::restarts).
+enum class Drafter { kNone, kMtp, kDFlash2, kDv, kDSpark, kDSpine, kDFlash };
 const char* drafter_name(Drafter d);   // --drafter's word for it ("none" for kNone)
 const char* drafter_title(Drafter d);  // its name in messages ("DFlash2", "DSpark")
 Drafter drafter_named(std::string_view name);  // kNone when no drafter is called so
@@ -56,7 +56,7 @@ std::string declared_activations(const ModelFile& file);
 // The drafters a model has: in its own file, or in drafter files beside it (ModelFile::add).
 struct DrafterSources {
   bool mtp = false, mtp_beside = false;   // the model has an MTP layer; ... from a drafter file
-  // its block drafter (kDFlash2 or kDSpark of DFlash2's block, kDSpine); kNone: none
+  // its block drafter (kDFlash2, kDFlash or kDSpark of DFlash2's block, kDSpine); kNone: none
   Drafter block = Drafter::kNone;
   bool block_beside = false;               // ... from a drafter file
   bool dspark_gguf = false;                // llama.cpp's DSpark GGUF beside it (its own block): kDSpark beside `block`

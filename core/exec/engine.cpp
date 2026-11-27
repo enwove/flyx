@@ -7,6 +7,7 @@
 #include <mutex>
 #include <string>
 #include <string_view>
+#include <utility>
 #include <thread>
 
 #include "core/exec/generation.h"
@@ -768,9 +769,14 @@ bool Engine::load(const std::string& path, const EngineOptions& opt, std::string
   // Steps 3 and 4 only for drafters the load chose (drafter_named: none).
   auto step_down = [&](bool comfort_only, const flyx_load_estimate* est) -> bool {
     const bool has_mtp = model_has_drafter(*model_, "mtp");
-    const bool has_dflash2 = model_has_drafter(*model_, "dflash2");
     const bool has_dspark = model_has_drafter(*model_, "dspark");
     const bool has_dv = model_has_drafter(*model_, "dv");
+    // The block drafter in the registry's block slot (DFlash2's block, DFlash's or DSpine's): the heaviest, its
+    // context cache growing with the context.
+    const char* block_title = nullptr;
+    for (const auto& [name, title] : {std::pair{"dflash2", "DFlash2"}, {"dflash", "DFlash"}, {"dspine", "DSpine"}})
+      if (!block_title && model_has_drafter(*model_, name)) block_title = title;
+    const bool has_block = block_title != nullptr;
 
     if (!comfort_only && orig_has_vision && vdev == interfaces::VisionDeviceMode::kGpu) {
       vdev = interfaces::VisionDeviceMode::kDisk;
@@ -781,9 +787,9 @@ bool Engine::load(const std::string& path, const EngineOptions& opt, std::string
     if (req_dw_valid && cur_dw != interfaces::DraftWeightsMode::kNvfp4 && est && meaningful_draft_savings(*est) &&
         (!comfort_only || req_dw == interfaces::DraftWeightsMode::kAuto)) {
       cur_dw = interfaces::DraftWeightsMode::kNvfp4;
-      const std::string detail = has_dflash2   ? "DFlash2 drafter weights quantized to NVFP4 (4-bit) to save VRAM"
-                                 : has_dspark ? "DSpark drafter weights quantized to NVFP4 (4-bit) to save VRAM"
-                                              : "Drafter weights quantized to NVFP4 (4-bit) to save VRAM";
+      const std::string detail = std::string(has_block ? block_title : has_dspark ? "DSpark" : "Drafter") +
+                                 (has_block || has_dspark ? " drafter" : "") +
+                                 " weights quantized to NVFP4 (4-bit) to save VRAM";
       upsert_adj("draft_weights", interfaces::draft_weights_name(req_dw), "nvfp4", detail);
       return true;
     }
@@ -807,15 +813,12 @@ bool Engine::load(const std::string& path, const EngineOptions& opt, std::string
       upsert_adj("drafter", orig_drafters_str, keep, detail);
       return true;
     };
-    // DSpark beside DFlash2 (--drafter all): DFlash2 goes first, the larger of the two (its weights and its context
-    // cache, which grows with the context where DSpark's stays bounded).
-    if (has_dflash2 && has_dspark &&
-        keep_only("dspark", "DFlash2 drafter skipped due to tight VRAM; running with DSpark"))
-      return true;
-    if (has_dflash2 && keep_only("mtp", has_mtp ? "DFlash2 drafter skipped due to tight VRAM; running with MTP"
-                                                : "DFlash2 drafter skipped due to tight VRAM; falling back to MTP"))
-      return true;
-    if (has_dflash2 || has_mtp || has_dv || has_dspark) {
+    // DSpark beside the block drafter (--drafter all): the block drafter goes first, the larger of the two (its weights
+    // and its context cache, which grows with the context where DSpark's stays bounded).
+    const std::string skipped = std::string(has_block ? block_title : "") + " drafter skipped due to tight VRAM; ";
+    if (has_block && has_dspark && keep_only("dspark", skipped + "running with DSpark")) return true;
+    if (has_block && keep_only("mtp", skipped + (has_mtp ? "running with MTP" : "falling back to MTP"))) return true;
+    if (model_->drafters() > 0) {
       interfaces::ModelOptions mo_none = mo;
       mo_none.drafter = "none";
       std::string none_err;

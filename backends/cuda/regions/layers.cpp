@@ -304,9 +304,9 @@ void draft_block(flyx_seq* s, const DFlashBlock& b, int width, const Launch& L, 
   const int nr = std::min(width, B - off);
   rmsnorm(s->dx + size_t(off) * H, H, b.norm.w, b.norm.offset, b.norm.eps, s->dh, H, nr, H, st);
   draft_head_pick(head, s->dh, nr, b.sel_topk, s->cand, s->unary, s, L, s->draft_prob, s->draft_margin);
-  // no sel_hid: the selector's score with a unit gate
+  // no sel_hid: the selector's score with a unit gate; no selector (rank 0): the head's logits alone
   const float* hid = b.unit_hid ? b.unit_hid : s->hid;
-  if (!b.unit_hid) gemm(s->dh, H, b.sel_hid, b.sel_rank, H, s->hid, b.sel_rank, nr, false, L);
+  if (b.selector() && !b.unit_hid) gemm(s->dh, H, b.sel_hid, b.sel_rank, H, s->hid, b.sel_rank, nr, false, L);
   if (tree)
     selector_tree(s->P, s->cand, s->unary, b.sel_topk, hid, b.sel_rank, b.sel_pred, b.sel_succ, width, nr,
                   s->oracle, s->drafts, s->tree, st, b.softcap, b.softcap_mode, s->G);

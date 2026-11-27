@@ -42,10 +42,10 @@ using json = nlohmann::json;
 
 namespace {
 
-// The block drafter the tiny model holds, as its file says (flyx::drafter_source_kind): DFlash2, or DSpine in place of
-// it; "" for none.
+// The block drafter the tiny model holds, as its file says (flyx::drafter_source_kind): DFlash2, or DFlash or DSpine in
+// its place; "" for none.
 std::string g_block;
-std::string block_label() { return g_block == "dspine" ? "DSpine" : "DFlash2"; }
+std::string block_label() { return g_block == "dspine" ? "DSpine" : g_block == "dflash" ? "DFlash" : "DFlash2"; }
 
 // Session::init, checked.  A session the engine refuses (no room left for it, as on a GPU other programs hold, or
 // seq_new failed) has no sequence: a FAIL naming this file's line and why, and false.  generate refuses such a
@@ -553,6 +553,10 @@ std::vector<flyx_round_result> tree_rounds(Engine* e, const std::vector<int32_t>
 }
 
 constexpr int kReferenceWidth = -2;
+// The block drafter's drafts a round in the reference's rounds (the golden file's "width": its block's rows but the
+// anchor; 15 for a block of 16), which a fixed-width engine drafts too: a DFlash block of 8 drafts 7, not 15 from
+// its block stretched (its rows attend both ways, so the stretched rows change the first seven's drafts).
+int g_reference_width = 15;
 
 // A PEFT adapter given beside the model (the sixth argument, --lora): every engine of the run loads it.
 std::string g_lora_file;
@@ -582,8 +586,9 @@ std::unique_ptr<Engine> make(const std::string& path, const std::string& backend
   o.speculative = spec;
   o.drafter = drafter;
   o.prefill_chunk = prefill_chunk;  // several chunks per prompt
-  // fixed widths, as in the reference rounds (MTP 3, DFlash2 15), unless given (-1: chosen every round)
-  o.width = width != kReferenceWidth ? width : !spec ? 0 : drafter == "mtp" ? 3 : 15;
+  // fixed widths, as in the reference rounds (MTP 3, a block drafter its golden file's width), unless given (-1:
+  // chosen every round)
+  o.width = width != kReferenceWidth ? width : !spec ? 0 : drafter == "mtp" ? 3 : g_reference_width;
   auto e = std::make_unique<Engine>();
   std::string err;
   if (!e->load(path, o, &err)) {
@@ -2114,8 +2119,8 @@ void drafted_trees(const std::string& model, const std::string& backend, const s
   };
   int accepted = 0, oracle_accepted = 0;
   const bool same = turn_rounds(nullptr, &accepted) == want;
-  check(same, "DFlash2 trees taking turns with its chains: the reference's tokens (" + std::to_string(accepted) +
-                  " drafts accepted in tree rounds)");
+  check(same, "DFlash2 trees taking turns with its chains: the reference's tokens (" +
+                  std::to_string(accepted) + " drafts accepted in tree rounds)");
   const bool same_oracle = turn_rounds(&oracle, &oracle_accepted) == want;
   check(same_oracle && oracle_accepted > N / 2,
         "  with oracle drafts: long accepted runs (" + std::to_string(oracle_accepted) + " in tree rounds, " +
@@ -3832,6 +3837,7 @@ int main(int argc, char** argv) {
     return 1;
   }
   const std::string model = args.size() > 4 ? args[4] : dir + "/tiny" + variant + ".flyx";
+  g_reference_width = g.value("width", 15);
   g_block = flyx::drafter_source_kind(model);
   if (args.size() > 5 && args[5] != "-") g_lora_file = args[5];
   if (!memory_checks.empty()) {
@@ -4073,7 +4079,8 @@ int main(int argc, char** argv) {
             "relaxed acceptance, min-p 1e-37: more drafts accepted (MTP " + std::to_string(loose_m) + " against " +
                 std::to_string(exact_m) + ", DFlash2 " + std::to_string(loose_d) + " against " +
                 std::to_string(exact_d) + ")");
-      if (g_block == "dflash2") drafted_trees(model, backend, prompt, want, oracle);  // DSpine drafts chains only
+      // DFlash (one candidate a row) and DSpine draft chains only
+      if (g_block == "dflash2") drafted_trees(model, backend, prompt, want, oracle);
     }
 
     // MTP drafter: same tokens; drafts equal to the reference's; state kept

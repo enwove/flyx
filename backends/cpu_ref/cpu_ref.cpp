@@ -810,7 +810,8 @@ void block_layer(const RefModel* M, const Block& d, const Layer& l, const Vec& d
 void draft_block(RefSeq* s, const flyx_dflash2_block& d, int width) {
   const auto* M = s->m;
   // a chain wider than the block: width + 1 mask rows in one block (the CUDA backend's wide block)
-  // ABI 49: from the anchor's row (draft_from 0) or the next; convolutions and the selector's gate optional.
+  // ABI 49: from the anchor's row (draft_from 0) or the next; convolutions and the selector's gate optional; ABI 52:
+  // the selector optional.
   const int off = d.draft_from;
   const int B = std::min(FLYX_MAX_ROWS, std::max(d.block, width + off));
   const int H = d.hidden, ctx = s->position;
@@ -825,8 +826,9 @@ void draft_block(RefSeq* s, const flyx_dflash2_block& d, int width) {
   const int K = d.sel_topk, Rk = d.sel_rank;
   Vec hn(H), logits(V), hid(Rk), val(K);
   std::vector<int> cand(K);
-  const auto* pred = M->w(d.sel_pred);
-  const auto* succ = M->w(d.sel_succ);
+  // ABI 52: no selector (rank 0): each candidate's score its logit alone
+  const auto* pred = Rk ? M->w(d.sel_pred) : nullptr;
+  const auto* succ = Rk ? M->w(d.sel_succ) : nullptr;
   int prev = s->anchor;
   s->drafts.assign(width, 0);
   for (int st = 0; st < B - off && st < width; ++st) {

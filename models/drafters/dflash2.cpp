@@ -79,7 +79,7 @@ void validate_dflash2_spec(DFlash2Spec* spec, const TargetSpec& target) {
   if (d.hidden != target.hidden) throw std::runtime_error(std::string(what) + " hidden size does not match target");
   const int max_vocab = target.padded_vocab();
   if (d.hidden <= 0 || spec->layers <= 0 || d.n_heads <= 0 || d.n_kv <= 0 || d.head_dim <= 0 || d.head_dim % 2 != 0 ||
-      d.inter <= 0 || d.n_heads % d.n_kv != 0 || d.conv_taps < 0 || d.sel_rank <= 0 || d.sel_rank > kMaxWidth ||
+      d.inter <= 0 || d.n_heads % d.n_kv != 0 || d.conv_taps < 0 || d.sel_rank < 0 || d.sel_rank > kMaxWidth ||
       d.sel_topk <= 0 || d.sel_topk > target.vocab || d.mask_token < 0 || d.mask_token >= max_vocab ||
       !(spec->eps > 0) || !std::isfinite(spec->eps) || !(d.theta > 0) || !std::isfinite(d.theta) ||
       !std::isfinite(d.softcap) || d.softcap < 0.0f ||
@@ -87,9 +87,13 @@ void validate_dflash2_spec(DFlash2Spec* spec, const TargetSpec& target) {
       d.head_dim > kMaxHeadDim || d.conv_taps > kMaxHeadDim || spec->taps.empty() ||
       spec->taps.size() > size_t(INT_MAX) || d.window < 0)
     throw std::runtime_error("invalid DFlash2 drafter config");
+  if (d.sel_rank == 0 && d.conv_taps > 0)  // a block without a selector is DFlash's: plain layers
+    throw std::runtime_error(std::string(what) + " without a selector has no convolutions");
   if (spec->sel_vocab != target.vocab && spec->sel_vocab != max_vocab)
     throw std::runtime_error(mismatch_msg(target));
   d.n_taps = int32_t(spec->taps.size());
+  // No selector (sel_rank 0: the walk takes the head's candidates by their logits) has no hidden gate either.
+  if (d.sel_rank == 0 && spec->sel_gate) throw std::runtime_error(std::string(what) + " gate without a selector");
   if (d.conv_group < 1 || d.hidden % d.conv_group)
     throw std::runtime_error("DFlash2 conv group does not divide hidden");
   const int64_t tg2 = int64_t(2) * d.conv_taps * (d.hidden / d.conv_group);
@@ -340,8 +344,9 @@ int build_dflash2(Tables& T, const DFlash2Spec& spec, const TargetSpec& target) 
   d.fc = T.weight(dn("draft.fc"), {H, int64_t(d.n_taps) * target.hidden});
   d.hidden_norm = T.norm(dn("draft.hidden_norm"), H, 0.0, eps);
   d.norm = T.norm(dn("draft.norm"), H, 0.0, eps);
-  d.sel_pred = T.weight(dn("draft.sel.pred"), {spec.sel_vocab, d.sel_rank});
-  d.sel_succ = T.weight(dn("draft.sel.succ"), {spec.sel_vocab, d.sel_rank});
+  const bool selector = d.sel_rank > 0;  // none: -1, the head's candidates by their logits
+  d.sel_pred = selector ? T.weight(dn("draft.sel.pred"), {spec.sel_vocab, d.sel_rank}) : -1;
+  d.sel_succ = selector ? T.weight(dn("draft.sel.succ"), {spec.sel_vocab, d.sel_rank}) : -1;
   d.sel_hid = spec.sel_gate ? T.weight(dn("draft.sel.hid"), {d.sel_rank, H}) : -1;  // -1: a unit gate
   d.q8_weights = draft_weights_beside_float(spec.kind) == FLYX_DRAFT_WEIGHTS_Q8;
   d.kv = draft_kv_state(T, layers, d.n_kv, d.head_dim);

@@ -19,8 +19,8 @@ namespace flyx::apps {
 
 // A drafter that goes with a model.
 struct DrafterSource {
-  std::string kind;            // "mtp", or a block drafter's ("dflash2", "dspark", "dspine"), as its header or the
-                               // Hub says; "" if unknown
+  std::string kind;            // "mtp", or a block drafter's ("dflash2", "dflash", "dspark", "dspine"), as its
+                               // header or the Hub says; "" if unknown
   std::string from;            // "model file" (its own MTP layer), a Hub name or file of a repository, or a path
   std::optional<uint64_t> size;  // bytes on disk; none where only the Hub could tell (or inside the model's file)
 };
@@ -29,7 +29,7 @@ struct DrafterSource {
 // card's base_model): the list drafters.json in the Hub's Enwove/flyx-drafters keeps (docs/models.md).
 struct KnownDrafter {
   std::string repo;      // its Hub name
-  std::string kind;      // --drafter's word for it ("dflash2", "dspark", "dspine")
+  std::string kind;      // --drafter's word for it ("dflash2", "dflash", "dspark", "dspine")
   std::string base;      // the model it was made (and verified) for
   bool exact = false;    // the model is that one (its own repository); else it names it as a base model: inferred
   std::string relation;  // inferred: how the Hub says the model was made from its base ("quantized", ...), or ""
@@ -75,9 +75,9 @@ bool fetch_lora_in(const hub::Repo& repo, const std::string& spec, const std::st
                    const hub::ProgressFn& progress, const std::atomic<bool>* stop, std::string* path,
                    std::string* err);
 
-// The drafter a file or directory holds, as its own fields say ("mtp", "dflash2", "dspark", "dspine"; "" when they say
-// none): a GGUF's header (general.architecture "dflash", or MTP layers), a drafter directory's config.json, a .flyx
-// file's "draft".  The file is not mapped; no name is read for it.
+// The drafter a file or directory holds, as its own fields say ("mtp", "dflash2", "dflash", "dspark", "dspine"; "" when
+// they say none): a GGUF's header (general.architecture "dflash", or MTP layers), a drafter directory's config.json,
+// a .flyx file's "draft".  The file is not mapped; no name is read for it.
 std::string drafter_kind(const std::string& path);
 // The same of a Hub repository, from what the Hub says (its config's architecture, its GGUFs' architecture).
 std::string drafter_kind(const hub::Repo& r);

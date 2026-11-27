@@ -206,12 +206,15 @@ struct DFlashBlock {
   int layers() const { return n_layers; }
   int ctx_width() const { return layers() * 2 * nkv * hd; }
   bool conv() const { return conv_taps > 0; }
+  bool selector() const { return sel_rank > 0; }  // ABI 52: none, the head's candidates walked by their logits
   // A grouped conv's coefficient columns (its taps a group of channels); 0: no convs.
   int conv_cols() const { return conv() ? conv_taps * (hidden / conv_group) : 0; }
   const char* name() const { return dspine ? "dspine" : "dflash2"; }  // the plan's node names
   // Its chains drafted with other sequences' in one pass (BatchDFlash, batch.cpp): convolutions, rows from 1, a
-  // selector gate, two blocks within a pass's rows; the batch's grouped buffers exist only for such a block.
-  bool groups() const { return conv() && draft_from == 1 && !unit_hid && block > 0 && block * 2 <= FLYX_MAX_ROWS; }
+  // selector with its gate, two blocks within a pass's rows; the batch's grouped buffers exist only for such a block.
+  bool groups() const {
+    return conv() && draft_from == 1 && selector() && !unit_hid && block > 0 && block * 2 <= FLYX_MAX_ROWS;
+  }
 };
 
 // DV (backend_abi.h flyx_dv_block, docs/design/dv.md): `slots` canvas rows run the target's attention and MLP blocks

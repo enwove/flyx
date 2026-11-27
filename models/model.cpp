@@ -42,10 +42,14 @@ struct DrafterInfo {
 // 384 against 362 tok/s.  DSpine's NVFP4 layers beside a BF16 target: Qwen3-8B on the same GPU at 15 drafts, the eight
 // prompt sets of docs/benchmarks.md section 6, a round 2-3% faster than with Q8_0 layers at most 1% fewer tokens a
 // round (its walk re-scores the head's top 16 through its bf16 bridge); DFlash2's lost 9% of their acceptance in NVFP4
-// there.  DSpine drafts its block at most (DrafterReach).
+// there.  DFlash's Q8_0 projections: Qwen3-8B bf16 with z-lab's Qwen3-8B-DFlash-b16, DeepSpec's 9 datasets (512
+// tokens), 356.0 against 340.3 tok/s in bf16 at 5.00 tokens a round both.  DSpine drafts its block at most
+// (DrafterReach).
 constexpr DrafterInfo kDrafters[] = {
     {Drafter::kMtp, interfaces::DrafterMode::kMtp, "MTP", {.sequential = true}},
     {Drafter::kDFlash2, interfaces::DrafterMode::kDFlash2, "DFlash2", {.block = true}},
+    {Drafter::kDFlash, interfaces::DrafterMode::kDFlash, "DFlash",
+     {.block = true, .beside_float = FLYX_DRAFT_WEIGHTS_Q8}},
     {Drafter::kDSpark, interfaces::DrafterMode::kDSpark, "DSpark",
      {.block = true, .trees_by_default = true, .beside_float = FLYX_DRAFT_WEIGHTS_Q8, .refines_by_step = true}},
     {Drafter::kDSpine, interfaces::DrafterMode::kDSpine, "DSpine",

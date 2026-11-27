@@ -145,8 +145,8 @@ std::string quant_in_name(const std::string& file_name);
 // baseModels relation), asked of the Hub; "" when it says none, or offline.
 std::string base_relation(const std::string& repo);
 
-// Whether the repository holds a block drafter (its config's architecture: DFlash2, DeepSpec's DSpark or Tencent's
-// DSpine), not a transformers model; and which ("dflash2", "dspark", "dspine").
+// Whether the repository holds a block drafter (its config's architecture: DFlash2, z-lab's DFlash, DeepSpec's DSpark
+// or Tencent's DSpine), not a transformers model; and which ("dflash2", "dflash", "dspark", "dspine").
 bool is_drafter(const Repo& r);
 std::string drafter_kind(const Repo& r);
 // The files `name` asks for: the GGUF of its quant (or the repository's only one), else a block drafter's

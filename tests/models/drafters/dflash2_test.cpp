@@ -79,8 +79,10 @@ void dflash2_validation(const std::string& dir) {
       add("draft.fc", {H, nt * th});
       add("draft.hidden_norm", {H});
       add("draft.norm", {H});
-      add("draft.sel.pred", {vocab, sr});
-      add("draft.sel.succ", {vocab, sr});
+      if (sr > 0) {  // a selector where the config has a rank of it
+        add("draft.sel.pred", {vocab, sr});
+        add("draft.sel.succ", {vocab, sr});
+      }
       if (d.at("sel_gate").get<bool>()) add("draft.sel.hid", {sr, H});  // else a unit gate
     }
     json hdr = {{"format", "flyx"}, {"version", 1}, {"kind", "drafter"}, {"draft", d}, {"tensors", tensors}};
@@ -170,6 +172,48 @@ void dflash2_validation(const std::string& dir) {
     json d = dspark;
     d["block"] = 16;
     check_refused("dspark block of 16 (a round's rows less the anchor's)", d, true, "block size outside 2..15");
+  }
+  // z-lab's DFlash (kind "dflash"): the same block without convolutions or selector (sel_rank 0, no gate); taken as
+  // such, and a gate without a selector refused, or convolutions without one (the batch groups only a selector's).
+  json dflash = base;
+  dflash["kind"] = "dflash";
+  dflash["conv_taps"] = 0;
+  dflash["conv_group"] = 1;
+  dflash["sel_rank"] = 0;
+  dflash["sel_gate"] = false;
+  {
+    const std::string path = dir + "/dflash.flyx";
+    make_drafter(path, dflash, true);
+    std::string error;
+    bool taken = false;
+    {
+      ModelFile f;
+      interfaces::ModelOptions o;
+      o.drafter = "dflash";
+      const auto m = f.open(dir + "/tiny_gguf.gguf", &error) && f.add(path, &error)
+                         ? interfaces::open_model(f, o, &error)
+                         : nullptr;
+      taken = m && m->drafters() == 1 && std::string(m->drafter_name(0)) == "dflash" && m->block_drafts(0) == 7;
+    }
+    std::remove(path.c_str());
+    check(taken, "dflash beside the tiny Qwen3.5: its block's 7 drafts a round (" + error + ")");
+  }
+  {
+    json d = dflash;
+    d["sel_gate"] = true;
+    check_refused("dflash with a gate but no selector", d, false, "gate without a selector");
+  }
+  {
+    json d = base;
+    d.erase("window");
+    check_refused("dflash2 without a window (every key read, none defaulted)", d, false, "window");
+  }
+  {
+    json d = dflash;
+    d["kind"] = "dflash2";
+    d["conv_taps"] = base["conv_taps"];
+    d["conv_group"] = base["conv_group"];
+    check_refused("convolutions without a selector", d, false, "without a selector has no convolutions");
   }
   {  // HIGH: TG2 and n_taps * hidden int32 overflows on a large-hidden synthetic model
     auto check_synth = [&](const std::string& what, json d) {

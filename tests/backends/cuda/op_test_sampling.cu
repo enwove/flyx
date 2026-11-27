@@ -579,6 +579,14 @@ void test_select() {
   }
   std::printf("  %-4s candidate walk\n", drafts == want ? "ok" : "FAIL");
   g_fail += drafts != want;
+  {  // no selector (rank 0, DFlash's): no selector weights read, each row's draft its best candidate
+    selector_walk(P, ti, tv, k, nullptr, 0, nullptr, nullptr, width, nullptr, dr, 0, 0.f, 0, nullptr);
+    const auto bare = down_i(dr, width);
+    std::vector<int> best;
+    for (int s = 0; s < width; ++s) best.push_back(want_idx[s * k]);
+    std::printf("  %-4s candidate walk without a selector: each row's best\n", bare == best ? "ok" : "FAIL");
+    g_fail += bare != best;
+  }
   // Softcapped selector walk and tree (before_correction = 0 and after_correction = 1; ops/draft/ref.h).
   {
     const float sc = 3.0f;

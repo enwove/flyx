@@ -423,6 +423,27 @@ int main(int argc, char** argv) {
     check(tokens(e) == ref_tokens, "MTP-fallback matches plain greedy tokens");
   }
 
+  // 3b. The same with z-lab's DFlash in the block slot (tiny_dflash.flyx, beside tiny.flyx): the block drafter goes
+  // whatever its kind, and MTP stays.
+  {
+    reset_hooks();
+    g_total_vram = 24ull << 30;
+    g_free_vram = 20ull << 30;
+    g_oom_any_dflash = true;
+    EngineOptions eo;
+    eo.backend = "test-host-kv";
+    eo.max_ctx = 128;
+    eo.drafter = "all";
+    Engine e;
+    const std::string dflash_model = model.substr(0, model.find_last_of("/\\") + 1) + "tiny_dflash.flyx";
+    check(e.load(dflash_model, eo, &err), "OOM on DFlash drops DFlash and keeps MTP: " + err);
+    check(std::string(e.drafter()) == "mtp" && e.load_adjustments().size() == 1 &&
+              e.load_adjustments()[0].kind == "drafter" && e.load_adjustments()[0].from == "mtp+dflash" &&
+              e.load_adjustments()[0].to == "mtp" &&
+              e.load_adjustments()[0].detail.find("DFlash drafter skipped") != std::string::npos,
+          "a single drafter mtp+dflash -> mtp adjustment, naming DFlash");
+  }
+
   // 4. Explicit --drafter dflash2 on a model that also has embedded MTP: a drafter the caller named is never skipped.
   // Its weights may still step down to NVFP4 (the drafter stays); when that does not fit either, the load fails as a
   // load without elastic loading does, and says why.

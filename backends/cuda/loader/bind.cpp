@@ -469,12 +469,17 @@ DFlashBlock dflash(WeightLoader& L, const flyx_model_desc& d, const flyx_dflash2
   f.conv_group = b.conv_group;
   f.sel_rank = b.sel_rank;
   f.sel_topk = b.sel_topk;
-  f.sel_pred = L.mat(b.sel_pred);
-  f.sel_succ = L.mat(b.sel_succ);
+  // ABI 52: without a selector (sel_rank 0) its weights are -1: the walk takes the head's candidates by their logits.
+  expect(b.sel_rank > 0 || (b.sel_pred < 0 && b.sel_succ < 0 && b.sel_hid < 0), "selector weights of no selector");
+  if (b.sel_rank > 0) {
+    f.sel_pred = L.mat(b.sel_pred);
+    f.sel_succ = L.mat(b.sel_succ);
+  }
   expect(b.draft_from == 0 || b.draft_from == 1, "a block drafter's first drafting row is the anchor's or the next");
   f.draft_from = b.draft_from;
   if (b.sel_hid >= 0) f.sel_hid = L.lin_quant(b.sel_hid, dq);
-  else f.unit_hid = L.put(std::vector<float>(size_t(FLYX_MAX_ROWS) * b.sel_rank, 1.f));  // a unit gate
+  else if (b.sel_rank > 0)  // a unit gate
+    f.unit_hid = L.put(std::vector<float>(size_t(FLYX_MAX_ROWS) * b.sel_rank, 1.f));
   return f;
 }
 
