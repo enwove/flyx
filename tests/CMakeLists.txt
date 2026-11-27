@@ -295,6 +295,8 @@ flyx_add_unit_test(generation_test core/exec/generation_test.cpp flyx-test-host-
 add_dependencies(generation_test flyx-cpu_ref)
 flyx_add_unit_test(elastic_load_test core/exec/elastic_load_test.cpp flyx-test-host-kv)
 add_dependencies(elastic_load_test flyx-cpu_ref)
+flyx_add_unit_test(speed_copies_test core/exec/speed_copies_test.cpp flyx-test-host-kv)
+add_dependencies(speed_copies_test flyx-cpu_ref)
 flyx_add_unit_test(plans_test core/plan/plans_test.cpp)
 flyx_add_unit_test(scheduler_test core/exec/scheduler_test.cpp flyx-test-host-kv)
 # A model switch in flyx serve's host: the server's model host and model sources over the tiny model.
@@ -530,6 +532,8 @@ add_test(NAME session_host_budget COMMAND session_budget_test ${ASSETS}/tiny.fly
 flyx_register_test(model_host model_host_test ${ASSETS}/tiny.flyx)
 add_test(NAME generation_edges COMMAND generation_test ${ASSETS}/tiny.flyx)
 flyx_register_test(elastic_load elastic_load_test ${ASSETS}/tiny.flyx)
+# The K/V of the context asked for before the copies the backend keeps only for speed (flyx_memory_info::speed).
+flyx_register_test(speed_copies speed_copies_test ${ASSETS}/tiny.flyx)
 # The C API: a chat request with the file's template, and with the one the load options give.
 add_test(NAME capi COMMAND capi_test ${ASSETS}/tiny.flyx cpu_ref)
 flyx_add_py_test(python_binding ${CMAKE_CURRENT_SOURCE_DIR}/python/flyx/binding_test.py
@@ -578,7 +582,7 @@ flyx_add_golden_test(golden_cpu_ref_qwen3_dflash ARGS cpu_ref qwen3 ${ASSETS}/ti
 set_tests_properties(tokenizer tokenizer_minicpm5 chat chat_qwen35 reply_grammars request reply_text
                      scheduler_cpu_ref scheduler_queue scheduler_prewarmed_history scheduler_raw_clients
                      scheduler_interrupted_prewarm
-                     scheduler_reassigned_prewarm scheduler_repeated_prewarm scheduler_marked_system session_host_budget generation_edges elastic_load capi
+                     scheduler_reassigned_prewarm scheduler_repeated_prewarm scheduler_marked_system session_host_budget generation_edges elastic_load speed_copies capi
                      model_host
                      llama_models PROPERTIES FIXTURES_REQUIRED assets)
 

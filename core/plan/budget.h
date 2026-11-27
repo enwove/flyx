@@ -28,6 +28,7 @@ enum class CtxLimit { kNone, kGpu, kHost };
 struct Budget {
   Lease weights, workspace;
   uint64_t session_bytes = 0;  // one session's device memory at the engine's context
+  uint64_t whole_bytes = 0;    // ... a session of the context asked for with every K/V position on the GPU
   uint64_t sessions_room = 0;  // of the budget after the weights and the workspace: what the sessions share
   uint64_t device_reserve = 0;  // effective device VRAM reserve held back outside the ledger
   GpuHeld held;

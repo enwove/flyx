@@ -595,6 +595,7 @@ int memory(flyx_bmodel* m, flyx_memory_info* out) {
   out->total = tot;
   out->process = gpu_process_memory();
   out->reserve_floor = device_reserve_floor();
+  out->speed = head_speed_bytes(m);
   return 0;
 }
 

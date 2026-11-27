@@ -511,16 +511,32 @@ bool Engine::plan_memory(plan::KvTiers* tiers, int session_limit, int* asked_ctx
   const int min_ctx = opt_.ctx_max ? 1024 : opt_.ctx_given ? 0 : kMinFittedCtx;
   // Not even one session fits (in any layout account() takes, its K/V in host memory or its context shrunk
   // included): one step of what the backend keeps for speed, and the budget again.  Only when nothing is left to give
-  // is it an error.
+  // is it an error.  The K/V of the context asked for comes before the copies only the target's rounds read to run
+  // faster (flyx_memory_info::speed) too: where a session of it fits on the GPU without them, they go, a step at a
+  // time, rather than its positions past what fits beside them to host memory, read over the bus every step.  With
+  // the copies first, a tenth of a GB other programs held or let go of at load decided where the K/V went: Qwen3.5-4B
+  // NVFP4 at 40960 tokens on an RTX 5060 Ti, with 0.1 GB more free, kept its certified head (0.64 GB) and 6144
+  // positions on the GPU and decoded a 35K-token prompt at 41 tok/s, against 82 with the head given back and every
+  // position there (the head alone: 127 against 106 tok/s on short prompts).  An explicit --kv-gpu keeps the copies.
+  const int asked = opt_.max_ctx;
+  auto speed_in_the_way = [&] {
+    flyx_memory_info mi{};
+    return tiers->gpu < 0 && ledger_.budget() > 0 && budget_.whole_bytes > budget_.sessions_room && api_->memory &&
+           api_->memory(bm_, &mi) == 0 && mi.speed > 0 && budget_.whole_bytes - budget_.sessions_room <= mi.speed;
+  };
   for (;;) {
-    while (!plan::account(api_, bm_, model_->drafters() > 0, 2 * bf16 > all, &opt_.max_ctx, min_ctx, *tiers, &ledger_,
-                          &budget_, err, opt_.ctx_max)) {
+    for (;;) {
+      const bool placed = plan::account(api_, bm_, model_->drafters() > 0, 2 * bf16 > all, &opt_.max_ctx, min_ctx,
+                                        *tiers, &ledger_, &budget_, err, opt_.ctx_max);
+      if (placed && !speed_in_the_way()) break;
       const std::string why = *err;
       if (!give_back()) {
+        if (placed) break;
         *err = why;
         if (given_back_) *err += " (" + gb(given_back_) + " the backend kept for speed already given back)";
         return false;
       }
+      opt_.max_ctx = asked;  // account() may have fitted a shorter one
       if (!lower_and_time(err)) {
         budget_.oom = plans_.oom;
         return false;
@@ -531,8 +547,10 @@ bool Engine::plan_memory(plan::KvTiers* tiers, int session_limit, int* asked_ctx
     if (session_limit > 1) plan::fit_second_session(api_, bm_, *tiers, ledger_, &budget_);
     const uint64_t f = current_floor();
     if (f <= tiers->min_vram_reserve) break;
-    // Backend's reserve floor grew lazily (e.g., CUDA VMM fell back to paged allocation); replan with the new floor.
+    // Backend's reserve floor grew lazily (e.g., CUDA VMM fell back to paged allocation); replan with the new floor,
+    // for the context asked for.
     device_.reserve_floor = tiers->min_vram_reserve = f;
+    opt_.max_ctx = asked;
   }
   if (given_back_)
     log::info("flyx: %s of GPU memory the backend kept only for speed given back so that a session fits (the same "

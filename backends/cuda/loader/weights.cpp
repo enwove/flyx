@@ -153,6 +153,18 @@ void release_cert(flyx_bmodel* m, HeadBlock* h) {
   h->w8 = nullptr, h->rs8 = nullptr, h->cert = nullptr;
 }
 
+// What release_cert() gives back.
+size_t cert_bytes(const HeadBlock& h) {
+  return (h.w8 ? size_t(h.vocab) * h.hidden : 0) + (h.rs8 ? size_t(h.vocab) * sizeof(float) : 0) +
+         (h.cert ? size_t(h.vocab) * 2 * sizeof(float) : 0);
+}
+
+// What release_w12() gives back.
+size_t w12_bytes(const W12& w, size_t N, size_t K, size_t E) {
+  return (w.hi ? N * K : 0) + (w.lo ? N * K / 2 : 0) + (w.e0 ? N : 0) + (w.esc_start ? (N + 1) * sizeof(int) : 0) +
+         (w.esc_k ? E * sizeof(uint16_t) : 0) + (w.esc_v ? E * sizeof(uint16_t) : 0);
+}
+
 // Gives back what of a W12 copy was allocated (null fields were not); E: the escape list's length as allocated.
 void release_w12(flyx_bmodel* m, W12* w, size_t N, size_t K, size_t E) {
   if (w->hi) m->release(w->hi, N * K);
@@ -328,6 +340,18 @@ uint64_t trim(flyx_bmodel* m, uint64_t bytes) {
   } catch (const std::exception&) {
     return 0;
   }
+}
+
+// trim()'s first two steps: the head's W12 copies, then the certified head's (the target's rounds alone read them).
+uint64_t head_speed_bytes(const flyx_bmodel* m) {
+  uint64_t n = 0;
+  const auto& ko = m->opt.kernels;
+  for (const Block& b : m->blocks)
+    if (const auto* h = std::get_if<HeadBlock>(&b)) {
+      n += w12_bytes(h->w12, size_t(h->vocab), size_t(h->hidden), size_t(h->w12_escapes));
+      if (ko.head_cert && !ko.head_fp8) n += cert_bytes(*h);
+    }
+  return n;
 }
 
 namespace {

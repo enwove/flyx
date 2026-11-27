@@ -474,7 +474,7 @@ bool account(const flyx_backend_api* api, flyx_bmodel* bm, bool has_drafter, boo
              vram_fix(out->held, 0, has_drafter, mostly_bf16);
     return false;
   }
-  out->session_bytes = sb;
+  out->session_bytes = out->whole_bytes = sb;
 
   const TierPlacer placer{api, bm, tiers, ledger->budget() ? ledger->available() : UINT64_MAX, out};
   const bool tiers_on = tiers.ram != 0 && out->host_budget > 0;
