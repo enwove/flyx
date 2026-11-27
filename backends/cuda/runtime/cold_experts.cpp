@@ -119,7 +119,7 @@ struct ExpertTimes {
 };
 
 struct ColdWorkspace {
-  explicit ColdWorkspace(size_t threads) : pool(threads) {}
+  explicit ColdWorkspace(size_t threads) : pool(threads, true) {}
   struct Slot {
     uint8_t *host = nullptr, *device = nullptr;
     cudaEvent_t uploaded = nullptr, consumed = nullptr;
@@ -129,7 +129,7 @@ struct ColdWorkspace {
   size_t next_slot = 0;
   RowPool pool;
   std::mutex mutex;
-  int* ids;
+  int *ids, *resident_ids;
   float *input, *cpu_slots, *gpu_slots, *ones;
   std::vector<float> act;
   std::vector<int> cold;
@@ -209,6 +209,7 @@ void init_cold_experts(flyx_bmodel* m) {
       CK(cudaEventCreateWithFlags(&slot.consumed, cudaEventDisableTiming));
     }
   }
+  w->resident_ids = m->alloc<int>(shape.pairs);
   w->ids = m->host_pinned<int>(shape.pairs);
   w->input = m->host_pinned<float>(shape.inputs);
   w->cpu_slots = m->host_pinned<float>(shape.outputs);
@@ -322,37 +323,41 @@ void hybrid_experts(const Pass& ps, const MoeBlock& f, const MoeScratch* sc, flo
       CK(cudaMemcpyAsync(ws.ids, ids, rows * K * sizeof(int), cudaMemcpyDeviceToHost, L.st));
       CK(cudaMemcpyAsync(ws.input, input, size_t(rows) * H * sizeof(float), cudaMemcpyDeviceToHost, L.st));
       CK(cudaEventRecord(ws.ready, L.st));
+      // Submit the router copy before queuing the independent GPU projections (WDDM batches stream commands).
+      const auto query = cudaStreamQuery(L.st);
+      if (query != cudaSuccess && query != cudaErrorNotReady) CK(query);
+      if (t) CK(cudaEventRecord(ws.timer[0], L.st));
+      if (f.gate_up.n_experts) {
+        moe_resident_ids(ids, ws.resident_ids, rows * K, f.gate_up.n_experts, L.st);
+        moe_gate_up(input, H, f.gate_up, ws.resident_ids, rows, K, I, H, f.situ_beta, f.situ_linear_beta, fused,
+                    fused ? b.moe_act : b.moe_gu, fused ? I : 2 * I, sc, L);
+        if (!fused) situ_rows(b.moe_gu, 2 * I, I, f.situ_beta, f.situ_linear_beta, b.moe_act, I, rows * K, L.st);
+        // One down projection per pair. The scratch holds chunk_rows * max_top_k pairs and all their input rows.
+        MoeScratch pairs{};
+        if (sc) {
+          pairs = *sc;
+          pairs.chunk_rows *= pairs.max_top_k;
+          pairs.max_top_k = 1;
+        }
+        moe_down(b.moe_act, I, f.down, ws.resident_ids, ws.ones, rows * K, 1, H, I, ws.gpu_slots, H, false,
+                 sc ? &pairs : nullptr, L);
+      }
+      if (t) CK(cudaEventRecord(ws.timer[1], L.st));
+      const auto submitted = cudaStreamQuery(L.st);
+      if (submitted != cudaSuccess && submitted != cudaErrorNotReady) CK(submitted);
       CK(cudaEventSynchronize(ws.ready));
       if (ws.verbose || t) {
         const double dt = std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count();
         ws.route_seconds += dt;
         if (t) t->handoff += dt * 1e6;
       }
-      if (t) CK(cudaEventRecord(ws.timer[0], L.st));
       ws.cold.clear();
-      for (int r = 0; r < rows; ++r) {
-        for (int k = 0; k < K;) {
-          int slot = r * K + k;
-          int e = ws.ids[slot];
-          if (e < 0 || e >= f.n_experts) throw std::runtime_error("invalid MoE router expert ID");
-          if (e >= f.cold_gu->first) {
-            ws.cold.push_back(slot);
-            ++k;
-            continue;
-          }
-          // Adjacent hot slots share the input and a gate/up launch. Each down row writes its unweighted slot.
-          int count = 1;
-          while (k + count < K && ws.ids[slot + count] >= 0 && ws.ids[slot + count] < f.cold_gu->first) ++count;
-          moe_gate_up(input + size_t(r) * H, H, f.gate_up, ids + slot, 1, count, I, H, f.situ_beta, f.situ_linear_beta,
-                      fused, fused ? b.moe_act : b.moe_gu, fused ? I : 2 * I, sc, L);
-          if (!fused) situ_rows(b.moe_gu, 2 * I, I, f.situ_beta, f.situ_linear_beta, b.moe_act, I, count, L.st);
-          moe_down(b.moe_act, I, f.down, ids + slot, ws.ones, count, 1, H, I, ws.gpu_slots + size_t(slot) * H, H, false,
-                   sc, L);
-          k += count;
-        }
+      for (int slot = 0; slot < rows * K; ++slot) {
+        const int e = ws.ids[slot];
+        if (e < 0 || e >= f.n_experts) throw std::runtime_error("invalid MoE router expert ID");
+        if (e >= f.cold_gu->first) ws.cold.push_back(slot);
       }
       if (t) {
-        CK(cudaEventRecord(ws.timer[1], L.st));
         t->pairs += rows * K;
         t->cold += ws.cold.size();
         t->bytes += ws.cold.size() * (f.cold_gu->stride * f.cold_gu->rows + f.cold_down->stride * f.cold_down->rows);

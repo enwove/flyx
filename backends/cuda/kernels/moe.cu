@@ -1339,6 +1339,15 @@ void situ_rows(const float* gu, int ld_gu, int I, float beta, float linear_beta,
   k_situ_rows<<<dim3(ceil_div(I, 256), rows), 256, 0, st>>>(gu, ld_gu, I, beta, linear_beta, out, ld_out);
 }
 
+__global__ void k_moe_resident_ids(const int* ids, int* safe, int pairs, int hot) {
+  const int i = blockIdx.x * blockDim.x + threadIdx.x;
+  if (i < pairs) safe[i] = unsigned(ids[i]) < unsigned(hot) ? ids[i] : 0;
+}
+
+void moe_resident_ids(const int* ids, int* safe, int pairs, int hot, cudaStream_t st) {
+  k_moe_resident_ids<<<ceil_div(pairs, 128), 128, 0, st>>>(ids, safe, pairs, hot);
+}
+
 void moe_sum_slots(const float* slots, const float* weights, int rows, int top_k, int hidden, float* out,
                    bool accumulate, cudaStream_t st) {
   k_moe_weighted_sum<<<dim3(ceil_div(hidden, 256), rows), 256, 0, st>>>(slots, weights, top_k, hidden, out, hidden,

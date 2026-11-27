@@ -2,13 +2,17 @@
 #pragma once
 
 #include <algorithm>
-#include <condition_variable>
+#include <atomic>
 #include <cstdint>
 #include <exception>
 #include <functional>
 #include <mutex>
 #include <thread>
 #include <vector>
+
+#if defined(_M_X64) || defined(__x86_64__)
+#include <immintrin.h>
+#endif
 
 namespace flyx::cuda {
 // One caller submits contiguous, disjoint row ranges and computes the first range itself.
@@ -19,7 +23,8 @@ class RowPool {
     return n;
   }
 
-  explicit RowPool(size_t max_threads) : max_threads_(std::max<size_t>(1, max_threads)) {
+  explicit RowPool(size_t max_threads, bool spin = false)
+      : max_threads_(std::max<size_t>(1, max_threads)), spin_(spin) {
     workers_.reserve(max_threads_ - 1);
     try {
       for (size_t idx = 1; idx < max_threads_; ++idx) workers_.emplace_back([this, idx] { worker_loop(idx); });
@@ -40,84 +45,75 @@ class RowPool {
       if (n) fn(0, n);
       return;
     }
-    {
-      std::lock_guard<std::mutex> lock(mu_);
-      n_ = n;
-      parts_ = parts;
-      fn_ = &fn;
-      error_ = nullptr;
-      active_ = parts - 1;
-      ++gen_;
-    }
-    wake_cv_.notify_all();
-    std::exception_ptr caller_err;
+    n_ = n;
+    parts_ = parts;
+    fn_ = &fn;
+    error_ = nullptr;
+    pending_.store(workers_.size(), std::memory_order_relaxed);
+    generation_.fetch_add(1, std::memory_order_release);
+    generation_.notify_all();
+    std::exception_ptr caller_error;
     try {
       fn(0, n / parts);
     } catch (...) {
-      caller_err = std::current_exception();
+      caller_error = std::current_exception();
     }
-    std::exception_ptr err;
-    {
-      std::unique_lock<std::mutex> lock(mu_);
-      done_cv_.wait(lock, [&] { return active_ == 0; });
-      err = caller_err ? caller_err : error_;
-      error_ = nullptr;
-      fn_ = nullptr;
-    }
-    if (err) std::rethrow_exception(err);
+    for (auto pending = pending_.load(std::memory_order_acquire); pending; pending = pending_.load(std::memory_order_acquire))
+      wait_while(pending_, pending);
+    fn_ = nullptr;
+    if (caller_error) std::rethrow_exception(caller_error);
+    if (error_) std::rethrow_exception(error_);
   }
 
  private:
+  template <class T>
+  void wait_while(const std::atomic<T>& value, T seen) const {
+    if (spin_) {
+      for (int i = 0; i < 512; ++i) {
+        if (value.load(std::memory_order_relaxed) != seen) return;
+#if defined(_M_X64) || defined(__x86_64__)
+        _mm_pause();
+#else
+        std::this_thread::yield();
+#endif
+      }
+    }
+    value.wait(seen, std::memory_order_relaxed);
+  }
+
   void worker_loop(size_t idx) {
     uint64_t seen = 0;
     for (;;) {
-      size_t a = 0, b = 0;
-      const std::function<void(size_t, size_t)>* fn = nullptr;
-      {
-        std::unique_lock<std::mutex> lock(mu_);
-        wake_cv_.wait(lock, [&] { return stop_ || gen_ != seen; });
-        if (stop_) return;
-        seen = gen_;
-        if (idx >= parts_) continue;
-        a = n_ * idx / parts_;
-        b = n_ * (idx + 1) / parts_;
-        fn = fn_;
-      }
-      std::exception_ptr err;
+      wait_while(generation_, seen);
+      seen = generation_.load(std::memory_order_acquire);
+      if (stop_) return;
       try {
-        (*fn)(a, b);
+        if (idx < parts_) (*fn_)(n_ * idx / parts_, n_ * (idx + 1) / parts_);
       } catch (...) {
-        err = std::current_exception();
+        std::lock_guard lock(error_mu_);
+        if (!error_) error_ = std::current_exception();
       }
-      {
-        std::lock_guard<std::mutex> lock(mu_);
-        if (err && !error_) error_ = err;
-        if (--active_ == 0) done_cv_.notify_one();
-      }
+      // Even an empty shard acknowledges the generation before the caller can replace its bounds and function.
+      if (pending_.fetch_sub(1, std::memory_order_acq_rel) == 1) pending_.notify_one();
     }
   }
 
   void shutdown() noexcept {
-    {
-      std::lock_guard<std::mutex> lock(mu_);
-      stop_ = true;
-    }
-    wake_cv_.notify_all();
-    for (auto& th : workers_)
-      if (th.joinable()) th.join();
+    stop_ = true;
+    generation_.fetch_add(1, std::memory_order_release);
+    generation_.notify_all();
+    for (auto& th : workers_) if (th.joinable()) th.join();
   }
 
-  size_t max_threads_ = 1;
-  std::mutex mu_;
-  std::condition_variable wake_cv_;
-  std::condition_variable done_cv_;
-  uint64_t gen_ = 0;
-  size_t active_ = 0;
-  size_t n_ = 0;
-  size_t parts_ = 0;
+  size_t max_threads_;
+  bool spin_;
+  std::atomic<uint64_t> generation_{0};
+  std::atomic<size_t> pending_{0};
+  std::atomic<bool> stop_{false};
+  size_t n_ = 0, parts_ = 0;
   const std::function<void(size_t, size_t)>* fn_ = nullptr;
+  std::mutex error_mu_;
   std::exception_ptr error_;
-  bool stop_ = false;
   std::vector<std::thread> workers_;
 };
 

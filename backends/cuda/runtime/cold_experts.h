@@ -38,7 +38,7 @@ struct ColdShape {
     outputs = std::max(outputs, size_mul(count, size_t(hidden)));
     activations = std::max(activations, size_mul(count, size_t(inter)));
   }
-  size_t device_bytes() const { return size_add(size_mul(size_add(outputs, pairs), sizeof(float)), size_mul(2, bank_bytes)); }
+  size_t device_bytes() const { return size_add(size_mul(size_add(outputs, size_mul(2, pairs)), sizeof(float)), size_mul(2, bank_bytes)); }
   size_t host_bytes() const {
     return size_add(size_mul(size_add(size_add(inputs, outputs), activations), sizeof(float)),
                     size_add(size_mul(2 * sizeof(int), pairs), size_mul(2, bank_bytes)));

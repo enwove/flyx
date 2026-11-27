@@ -3,6 +3,7 @@
 // relative-position-bias attention, sparse MoE) and DSpark drafter kernels against float64 refs.
 #include <cstdlib>
 
+#include "backends/cuda/kernels/moe_bank.h"
 #include "backends/cuda/loader/exact_bf16.h"
 #include "tests/backends/cuda/op_test.cuh"
 
@@ -1783,6 +1784,16 @@ void test_moe_dp4a_variants() {
 }  // namespace
 
 void test_inkling2_moe() {
+  {
+    const std::vector<int> ids = {2, 5, 0, 3, 4, 1};
+    int* d = dev<int>(ids.size());
+    CK(cudaMemcpy(d, ids.data(), ids.size() * sizeof(int), cudaMemcpyHostToDevice));
+    moe_resident_ids(d, d, int(ids.size()), 3, 0);
+    std::vector<int> actual(ids.size());
+    CK(cudaMemcpy(actual.data(), d, ids.size() * sizeof(int), cudaMemcpyDeviceToHost));
+    if (actual != std::vector<int>({2, 0, 0, 0, 0, 1})) throw std::runtime_error("resident MoE slot mapping");
+    cudaFree(d);
+  }
   test_inkling2_moe_norm();
   test_moe_gate_up_rules();
   test_moe_dp4a_variants();
