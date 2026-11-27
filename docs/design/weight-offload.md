@@ -50,15 +50,17 @@ Windows 11 build 26300, driver 610.88, RTX 5070 Ti (16,303 MiB), Ryzen 7 9800X3D
 | Inkling Q2_K_XL resident budget | Plain tok/s | 2,897-token prefill tok/s | Decode expert hit rate |
 | --- | ---: | ---: | ---: |
 | 128/128 | 124.91 | 2,250 | 100% |
-| 127/128 | 122.96 | 2,225 | 99.68% |
-| 120/128 | 107.09 | 2,179 | 96.61% |
-| 96/128 | 98.12 | 1,871 | 94.28% |
-| 74/128 | 78.85 | 1,866 | 87.99% |
-| 69/128 | 75.02 | 1,860 | 86.25% |
-| 64/128 | 70.53 | 1,877 | 83.84% |
-| 32/128 | 43.13 | 1,873 | 54.09% |
+| 127/128 | 122.42 | 2,238 | 99.68% |
+| 120/128 | 105.64 | 2,179 | 96.61% |
+| 96/128 | 98.03 | 1,884 | 94.28% |
+| 74/128 | 79.25 | 1,865 | 87.99% |
+| 69/128 | 73.78 | 1,850 | 86.25% |
+| 64/128 | 70.81 | 1,872 | 83.84% |
+| 32/128 | 43.14 | 1,873 | 54.09% |
 
 Every listed placement matched 96/96 full-resident generated IDs and gave zero mean KL and 100% top-1 on the 64 teacher-forced positions. In the 120/128 ablation, selecting prompt staging by the model-wide average produced 1,271 tok/s on the long prompt. Selecting it by each physical layer's cold fraction produced 2,179 tok/s. For Qwen IQ3_XXS, streaming one of 64 layers measured 62.37 tok/s versus 63.26 fully resident. More extensive streaming increases elapsed time with the transferred byte count. Tokens/s is the reciprocal of that time.
+
+On Q2_K_XL with DSpark Q8_0, using the prefill route scores alone to select verification gathers gave 57.58 tok/s at 69/128 and 54.05 at 64/128 with width 3. Using the recent decode observations gave 63.94 and 61.59 tok/s respectively. At 69/128, width 5 gave 51.79 tok/s and width 7 gave 43.50. Every width matched the 96 plain IDs at its placement. Basalt v0.5.7 reported 102.8?109.1 tok/s with its NVFP4-MX8 pack and spec 8 on this machine.
 
 The CPU fallback microbenchmark rotates through roughly 256 MiB of compressed weights and reports compressed weight bytes divided by elapsed time. Replace `THREADS` with 1, 8, 12 or 16 and `ROWS` with 1, 4 or 8. A physical-core affinity mask provides a separate eight-core control. Use the mapped strategy and `--backend-opt expert_direct=0` on the same prompt file to compare end-to-end execution.
 
