@@ -4,11 +4,15 @@ Flyx has two independent limits on CUDA weight residency. `--gpu-experts N` reta
 
 ## Routed experts
 
-The Inkling-2 model binder emits the routed MoE block. The current Qwen GGUF readers reject MoE metadata, so Qwen3-MoE and Qwen3.5-MoE need model-binding work before they can use this path. The GGUF tensor axes are expert, output row and input column after model binding. The split follows expert ID in each physical tensor. Repeated visits through a loop reuse the same stored matrix. GPU memory holds only the resident prefix. A model-owned pageable buffer holds the suffix in the original block quantization or the BF16 representation selected by the loader. A per-expert scale follows the same split. Expert IDs can later map through a frequency-ranked permutation without changing the router or the row kernels.
+The Inkling-2 binder emits routed MoE blocks. A repeated visit through a loop shares the same physical gate/up and down matrices. Each pair initially keeps logical IDs below the cap on the GPU. The suffix lives in pageable host memory with its per-expert scales. The loader retains the CPU row representation and, when streaming is enabled, a second copy of the cold suffix in the CUDA projection layout. The elastic planner charges both copies to host memory. Its device estimate includes the two staging banks, workspace and route maps. It uses the device reserve already calculated for the platform, including the smaller native Windows reserve introduced in PR #71.
 
-The GPU router computes all scores and top-k choices. For a bounded chunk of up to eight input rows the compute stream copies IDs and normalized input into pinned staging and records an event. The submitting thread waits for that event, queues hot work, and joins the persistent CPU pool to compute cold gate/up and down rows. The GPU keeps router weights. The CPU returns the selected slots in FP32. The existing GPU reduction consumes all slots in router order and applies the residual once. Only activations, IDs and results cross PCIe during inference.
+**Prompt passes.** The compute stream groups routed rows by expert. At or above `expert_prefill_min`, the loader's packed cold banks feed the same grouped GPU projections as the resident matrices. A copy stream uploads the next bank through one of two reusable pinned bounce buffers. An upload event protects the host buffer from premature refill, and a consumption event protects the GPU slot from overwrite. All gate/up rows finish before the down pass reuses shared scratch. The reduction visits slots in their original router order. Small prompt tails and verification rows use the CPU path.
 
-The backend option `expert_threads` bounds the number of CPU workers, including the submitting thread. Each worker owns a disjoint range of output rows. Its reduction order is independent of token count and worker scheduling. A runtime AVX2 and FMA check selects vector dot products for the expert types in the two Inkling checkpoints. Other supported block formats use the scalar reference decoder. CPU activation preparation follows the matrix's Q8, A16H, BF16 or FP32 input contract. GPU and CPU accumulation trees differ, so comparisons across placement use logit error and token agreement. Prefill uses the same arithmetic in chunks. Long prompts revisit more weights, making grouped CPU matrix multiplication or staging active experts to GPU worth measuring.
+**Decode.** The compute stream copies router IDs and normalized activations into pinned buffers and records an event. A stream query flushes the submission on WDDM. The host queues resident projections before waiting for the routing event. The submitting thread and the persistent pool share cold gate/up and down work across disjoint output rows. The workers briefly spin for another job and park when idle. Only cold result ranges return over PCIe. The GPU combines them with its resident results and applies the residual once. CPU and GPU accumulation order can differ. The backend therefore measures cross-placement logits against full residency.
+
+**CPU arithmetic.** Each gate/up pair uses the same prepared input row. Supported IQ formats with Q8 inputs quantize each group of 32 activations once and use integer dot products on AVX2 or AVX-512 VNNI. A16H, BF16 and FP32 inputs retain the activation precision of their projection. AVX-512 also accelerates the Q2_0, NVFP4, MXFP4 and IQ4_NL down projections. Runtime dispatch checks processor and OS vector-state support. The scalar path remains available. The `expert_threads`, `expert_simd` and `expert_integer` options support controlled CPU comparisons.
+
+**Placement.** A GPU histogram counts logical IDs during prefill. When a new session opens after every previous session has closed, the backend halves each physical pair's prior score, adds the observed counts and exchanges up to one eighth of its experts. It favors the current resident on equal scores and uses logical ID to break other ties. A swap moves weights and scales together and reconstructs the evicted expert's CPU representation from the packed data. Placement stays fixed across verification, checkpoint restore and overlapping sessions. Load-time plan calibration can train the first user session. Verbose output gives the hit rate over routed verification slots and the aggregate for each completed group of concurrent sessions. `expert_adapt=0` fixes the initial partition, and `expert_global=1` shares scores across physical layers with the same expert count.
 
 The quant in a GGUF filename describes the bundle. The two local Inkling files use these tensor types for the 24 physical gate/up and down matrices. Each matrix contains 128 experts.
 
@@ -34,3 +38,41 @@ Strata's Inkling hybrid dispatcher uses host-visible doorbells, CPU SIMD kernels
 ## Measurements
 
 `cuda_bench h2d` measures the pinned H2D ceiling with 4, 32 and 256 MiB transfers. Verbose streaming runs report DMA bandwidth during sampled copies, separately for prefill and rounds. Device timestamps exclude the wait for a free slot. For plain decode, multiply the logged streamed bytes per full pass by steady-state passes per second to obtain effective streaming bandwidth. For multirow prefill use the actual number of passes, including the final short pass. Compare on the same prompt, context, GPU, driver, clocks and build. Verbose hybrid runs report the wall time from enqueuing the route copies to observing their event per layer visit, including GPU work ahead of the copies.
+
+### Inkling-2 on RTX 5070 Ti
+
+Measured on native Windows 11 build 26300, GeForce RTX 5070 Ti 16,303 MiB, driver 610.88, Ryzen 7 9800X3D (8 cores, 16 logical processors) and 32 GB DDR5-6000. Both Release builds targeted `120-real`. The baseline was PR #70 rebased onto `ab4a4b2b`, with elapsed-time instrumentation. The optimized build was `e7c724e`. The six questions in `bench/prompts/moe_offload.jsonl` include p512 and the town-record prompt used in the Strata and Basalt comparisons. They tokenize to 511 and 2,897 tokens with this template. The competitor clients counted 2,899.
+
+| Q2_K_XL residency | v1 prefill 511 / 2,897 | v2 prefill 511 / 2,897, chunk 128 | v2 prefill 511 / 2,897, chunk 1,024 | v1 / v2 decode | v2 cache hits |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| 128/128 | 1,694.74 / 1,402.55 | 1,699.09 / 1,399.51 | 2,398.33 / 2,235.46 | 127.45 / 127.39 | 100% resident |
+| 96/128 | 38.94 / 41.44 | 693.50 / 667.66 | 1,794.71 / 1,991.58 | 20.40 / 38.20 | 90.47% |
+| 64/128 | 21.99 / 20.65 | 346.50 / 342.59 | 1,183.52 / 1,624.28 | 13.25 / 27.88 | 74.85% |
+| 32/128 | 11.82 / 14.77 | 232.61 / 233.05 | 878.45 / 1,375.73 | 9.05 / 21.94 | 52.44% |
+
+All throughput values are tokens/s. Decode pools elapsed time and tokens after the first generated token over prompts two through six. Hit rate includes load-time calibration and all six prompts. With 64 resident experts, hits were 73.89% on the first user prompt, 84.85% on p512 and 74.51% on the town-record prompt. Pooling scores across physical layers yielded 57.99% overall, versus 74.85% for per-layer scoring. With 96 experts the corresponding rates were 80.29% and 90.47%.
+
+| Q2_K_XL decode stage, chunk 128 | 64/128 tok/s | 96/128 tok/s |
+| --- | ---: | ---: |
+| GPU-streamed prompt, original CPU decode | 12.40 | 19.17 |
+| Early submission and persistent pool, float AVX2, static placement | 12.16 | 19.55 |
+| Integer SIMD and AVX-512 down, static placement | 20.49 | 28.44 |
+| Cross-layer scores | 22.15 | 30.79 |
+| Per-layer scores | 27.88 | 38.20 |
+
+| Per-layer decode diagnostic, mean µs/visit | Route to host | CPU work | Resident GPU | Cold result H2D | Reduction |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| v1 64/128 | 89.64 | 1,435.26 | 103.78 | 55.41 | 31.59 |
+| v2 64/128 | 102.42 | 390.07 | 83.89 | 44.46 | 26.91 |
+| v1 96/128 | 98.09 | 611.94 | 93.77 | 43.00 | 26.11 |
+| v2 96/128 | 103.70 | 196.42 | 85.54 | 29.02 | 19.92 |
+
+The per-layer run uses the first prompt, 12 generated tokens and `--backend-opt profile=1`. Event timing and a synchronization following the reduction change queue depth. In the regular six-prompt run the wall time from copy submission through observing readiness was 176.89 µs at 64/128 and 187.52 µs at 96/128. Cold CPU work read 16.06 and 13.86 GB/s of compressed rows respectively, including activation preparation and pool handoffs in elapsed time. A secondary-stream CUDA host callback took 382.21 µs to hand work to the CPU in a 64/128 probe and reduced five-prompt decode throughput from 26.9 to 24.6 tok/s. The event path remains in use.
+
+Reproduce a throughput run by substituting the checkpoint path and resident count. Repeat with both chunk sizes. For the ablations use `expert_adapt=0`, `expert_adapt=0,expert_integer=0,expert_simd=256` or `expert_global=1` as a single backend option. For the DSpark comparison replace `--no-spec --width 0` with `--drafter dspark --drafter-file DRAFTER --width 3` or width 7.
+
+```sh
+flyx bench MODEL --backend cuda --kv-method exact --no-lookup --ctx 4096 --prefill-chunk 1024 -v --prompts bench/prompts/moe_offload.jsonl -n 16 --ignore-eos --json result.json --no-spec --width 0 --gpu-experts N
+kld MODEL --text bench/prompts/p512.txt --tokens 64 --start 16 --ctx 1024 --kv-method exact --prefill-chunk 128 --save resident.bin
+kld MODEL --text bench/prompts/p512.txt --tokens 64 --start 16 --ctx 1024 --kv-method exact --prefill-chunk 128 --ref resident.bin --backend-options gpu_experts=N
+```
