@@ -459,7 +459,10 @@ void hybrid_experts(const Pass& ps, const MoeBlock& f, const MoeScratch* sc, flo
       moe_place_ids(b.moe_idx, ps.rows * K, it->second.slots, ps.round ? nullptr : it->second.counts, L.st);
       if (!ps.round) ws.pending_counts = true;
     }
-    if (!ps.round && ws.copy && sc && ps.rows >= std::max(2, ps.s->m->opt.expert_prefill_min)) {
+    // Without a measured crossover, stage when there is at least one routed slot per expert on average.
+    const int configured = ps.s->m->opt.expert_prefill_min;
+    const int min_rows = configured < 0 ? 1 + (f.n_experts - 1) / K : configured;
+    if (!ps.round && ws.copy && sc && ps.rows >= std::max(2, min_rows)) {
       streamed_prefill(ws, ps, f, *sc, out, accumulate, fused);
       CK(cudaEventRecord(ws.ready, L.st));
       return;

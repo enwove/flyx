@@ -13,6 +13,9 @@ sku = "rtx5070ti"
 devices = ["NVIDIA GeForce RTX 5070 Ti"]
 # Programmatic dependent launch verified on Qwen3.8-27B UD-IQ3_XXS (3x interleaved code dynamic: 193.8 -> 198.6 tok/s, +2.5%).
 pdl = true
+# Inkling Q2_K_XL, 64 and 96 of 128 experts, 9800X3D: the CPU led at 8 and 16 rows,
+# staged GPU GEMMs led at 32 and 64 (docs/design/weight-offload.md).
+expert_prefill_rows = 32
 
 # cuda_bench tune strata_placement (309K host-copy decode).
 [[strata_placement]]

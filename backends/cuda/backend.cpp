@@ -747,6 +747,7 @@ int open_model(const flyx_model_desc* desc, const flyx_open_options* opts, flyx_
     } else {
       m->opt.kernels.tuning = gemm_tuning_auto(prop.name, dev_cc, code_cc, &arch_cc);
     }
+    if (m->opt.expert_prefill_min < 0) m->opt.expert_prefill_min = gemm_tuning_expert_prefill(m->opt.kernels.tuning);
     if (!m->opt.pdl_given) m->opt.kernels.pdl = gemm_tuning_pdl(m->opt.kernels.tuning);
     if (m->verbose) {
       const std::string table = gemm_tuning_label(m->opt.kernels.tuning, arch_cc, dev_cc);

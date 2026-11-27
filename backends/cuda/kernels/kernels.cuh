@@ -431,6 +431,7 @@ const char* gemm_tuning_name(int tuning);
 bool gemm_tuning_compiled_for(int tuning, int cc);
 // Whether kernels launch as programmatic dependents on the GPU of this table unless the options say.
 bool gemm_tuning_pdl(int tuning);
+int gemm_tuning_expert_prefill(int tuning);
 // The table a device runs unless the options name one or none (option tuning=table; the engine and cuda_bench alike):
 // the device's own (gemm_tuning_for, by its name, else by its compute capability device_cc), where the loaded code
 // (compute capability code_cc, compiled_arch) has its kernels; else the loaded code's architecture's table, where it

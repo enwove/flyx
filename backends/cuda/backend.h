@@ -157,7 +157,7 @@ struct BackendOptions {
   int gpu_layers = INT_MAX;  // dense layers retained before the streamed suffix
   bool expert_adapt = true, expert_global = false, expert_integer = true;
   int expert_simd = 512;  // upper bound on vector width for cold CPU dots
-  int expert_prefill_min = 16;  // minimum prompt rows for streamed GPU experts, zero uses the CPU path
+  int expert_prefill_min = -1;  // minimum prompt rows for streamed GPU experts, zero uses the CPU path
   int expert_threads = 0;  // maximum CPU workers including the submitting thread, zero uses the default
   int gpu_experts = INT_MAX;  // resident expert IDs [0, gpu_experts) at each MoE layer
   bool packed_blocks = true;     // blocks=bf16 clears it

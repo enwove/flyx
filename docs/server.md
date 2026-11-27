@@ -186,7 +186,7 @@ Passed verbatim to the backend (`backends/cuda/backend.cpp`). Unknown keys or in
 | `expert_integer` | `0` or `1` | 1 | Use integer products for supported IQ weights with Q8 inputs. |
 | `expert_adapt` | `0` or `1` | 1 | Rank experts by decaying prompt route counts and exchange slots between sessions when streamed banks are enabled. |
 | `expert_global` | `0` or `1` | 0 | Pool expert counts across physical layers with the same expert count. |
-| `expert_prefill_min` | nonnegative integer | 16 | Minimum prompt rows for streamed expert banks. Zero uses CPU experts for every prompt size. |
+| `expert_prefill_min` | nonnegative integer | GPU table, otherwise one routed slot per expert | Minimum prompt rows for streamed expert banks. Zero uses CPU experts for every prompt size. |
 | `expert_threads` | nonnegative integer | 0 | Maximum CPU threads for cold experts, including the submitting thread. Zero uses up to 16 logical CPUs. An explicit maximum is bounded by the reported logical CPU count. |
 | `gpu_experts` | nonnegative integer | all | CUDA expert residency limit, also set by `--gpu-experts`. |
 | `gpu_layers` | nonnegative integer | all | CUDA dense-layer residency limit, also set by `--gpu-layers`. |
