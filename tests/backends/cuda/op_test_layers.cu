@@ -160,6 +160,47 @@ void test_rmsnorm() {
   test_rmsnorm_q8_split();
 }
 
+// round_rows_bf16: each value of the rows, in place, ops::round_bf16's (nearest even, ties and signed zeros
+// included); the columns past n untouched.
+void test_round_rows_bf16() {
+  std::printf("round_rows_bf16\n");
+  seed("round_rows_bf16");
+  const int rows = 7, n = 2049, ld = n + 3;
+  Vec x = randv(size_t(rows) * ld, 50.0);
+  for (double& v : x) v = float(v);
+  const double ties[] = {1.0 + 1.0 / 256, 1.0 + 3.0 / 256, -(1.0 + 1.0 / 256), 0.0, -0.0, 3e38, 1e-40};
+  for (size_t i = 0; i < std::size(ties); ++i) x[i] = float(ties[i]);
+  Vec want = x;
+  for (int r = 0; r < rows; ++r)
+    for (int c = 0; c < n; ++c) want[size_t(r) * ld + c] = ops::round_bf16(x[size_t(r) * ld + c]);
+  float* dx = up(x);
+  round_rows_bf16(dx, ld, n, rows, 0);
+  const Vec got = down(dx, x.size());
+  bool same = true;
+  for (size_t i = 0; i < got.size(); ++i) same &= std::memcmp(&got[i], &want[i], sizeof(double)) == 0;
+  std::printf("  %-4s every value ops::round_bf16's, signs and the columns past n kept\n", same ? "ok" : "FAIL");
+  g_fail += !same;
+  // add_rows_bf16: the float32 sum of the bf16 rows and the products, rounded once
+  Vec y = randv(size_t(rows) * ld, 5.0);
+  for (double& v : y) v = float(v);
+  Vec sum = want;
+  for (int r = 0; r < rows; ++r)
+    for (int c = 0; c < n; ++c) {
+      const size_t i = size_t(r) * ld + c;
+      sum[i] = ops::round_bf16(float(want[i]) + float(y[i]));
+    }
+  float* dy = up(y);
+  add_rows_bf16(dx, ld, dy, ld, n, rows, 0);
+  const Vec added = down(dx, x.size());
+  bool add_same = true;
+  for (size_t i = 0; i < added.size(); ++i) add_same &= std::memcmp(&added[i], &sum[i], sizeof(double)) == 0;
+  std::printf("  %-4s add_rows_bf16: each float32 sum rounded once, the columns past n kept\n",
+              add_same ? "ok" : "FAIL");
+  g_fail += !add_same;
+  CK(cudaFree(dx));
+  CK(cudaFree(dy));
+}
+
 // Rule 2 at the kernel level: a fused producer (writing the next GEMM's input
 // already rounded) followed by the GEMM that reads it gives the bits of the
 // generic producer and GEMM, for decode rows (split input) and prefill rows

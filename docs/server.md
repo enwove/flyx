@@ -201,7 +201,7 @@ Passed verbatim to the backend (`backends/cuda/backend.cpp`). Unknown keys or in
 
 | Key | Allowed Values | Default | Effect |
 |---|---|---|---|
-| `attention` | `auto` \| `split` \| `head` | `auto` | Attention kernel selection (`split` = FP32 split prefill instead of FlashAttention; `head` = ungrouped per-head prefill and decode/verify attention, disabling FP8 KV). |
+| `attention` | `auto` \| `split` \| `head` | `auto` | Attention kernel selection (`split` = FP32 split prefill instead of FlashAttention; `head` = ungrouped per-head prefill and decode/verify attention, over binary16 K/V only: `--kv 16`). |
 | `rows_attention` | `mma` \| `cores` | `mma` | Decode/verify attention on tensor cores (`mma`) or FP32 CUDA cores (`cores`). |
 | `rows_attention_from` | `N` (≥ 0) | `8192` | Key count threshold for switching decode attention to tensor cores. |
 | `rows_attention_parts` | `1` \| `2` \| `3` | auto (`1` or `3`) | Binary16 split precision parts for `q` and `p` in tensor-core decode attention (`1` on GQA > 4 & HD ≥ 256, else `3`). |

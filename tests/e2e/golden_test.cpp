@@ -723,8 +723,7 @@ void tree_round_before_strata(const std::string& model, const std::string& backe
                               const std::vector<int32_t>& prompt) {
   const int p = static_cast<int>(prompt.size()), W = FLYX_MAX_WIDE_ROWS - 1, after = 3 * FLYX_MAX_ROWS + 8;
   const int from = p + FLYX_MAX_WIDE_ROWS + 3 * FLYX_MAX_ROWS;
-  // As make() would (plain decoding, binary16 K/V), loaded here: a model whose attention shape has no strata kernels
-  // is refused at load (its session is sized there), which make() would end the test on.
+  // As make() would (plain decoding, binary16 K/V), loaded here.
   EngineOptions o;
   o.kv_gpu = o.kv_copy_gpu = -1;
   o.kv_ram = 0;
@@ -739,10 +738,6 @@ void tree_round_before_strata(const std::string& model, const std::string& backe
   auto e = std::make_unique<Engine>();
   std::string err;
   if (!e->load(model, o, &err)) {
-    if (err.find("not compiled for") != std::string::npos) {  // the model's attention shape has no strata kernels
-      std::printf("  --   a tree round before strata's switch: %s\n", err.c_str());
-      return;
-    }
     check(false, "a tree round before strata's switch: load: " + err);
     return;
   }
@@ -750,6 +745,49 @@ void tree_round_before_strata(const std::string& model, const std::string& backe
     std::printf("  --   a tree round before strata's switch: the file reads every position (it holds DV)\n");
     return;
   }
+  // Auto takes no switch only where strata's kernels do not take the model's attention (the tiny Llama's 8 query
+  // heads a KV head), where an explicit strata is refused; there auto reads every position exactly.
+  flyx_seq_size size{};
+  const bool no_switch =
+      e->api()->seq_size(e->bmodel(), &e->kv_layout(), &size) == 0 && size.strata_from >= o.max_ctx;
+  flyx_seq_layout seven = e->kv_layout();
+  seven.method_arg = 7;
+  check(e->api()->seq_size(e->bmodel(), &seven, &size) != 0, "auto with a copy of 7 bits: refused, switch or not");
+  // What to expect apart from the backend's own say (strata_supported, which auto and an explicit strata both read):
+  // of the models this runs on, only the tiny Llama's attention (MiniCPM5-1B's: 8 query heads a KV head of 128) has
+  // no strata kernels.
+  bool kernels = true;
+  const flyx_model_desc& d = e->model().desc();
+  for (int i = 0; i < d.n_blocks; ++i)
+    if (const flyx_block& b = d.blocks[i];
+        b.kind == FLYX_BLOCK_ATTN && b.attn.head_dim == 128 && b.attn.n_heads == 8 * b.attn.n_kv)
+      kernels = false;
+  check(no_switch != kernels, kernels ? "a model strata has kernels for: auto switches"
+                                     : "the tiny Llama (no strata kernels): auto takes no switch");
+  EngineOptions strata = o;
+  strata.kv_method = "strata";
+  std::string why;
+  const bool strata_loads = std::make_unique<Engine>()->load(model, strata, &why);
+  if (no_switch) {
+    check(!strata_loads && why.find("strata") != std::string::npos,
+          "auto takes no switch to strata: an explicit strata is refused too (" + why + ")");
+    EngineOptions exact = o;
+    exact.kv_method = "exact";
+    auto x = std::make_unique<Engine>();
+    Session a(e.get());
+    if (!x->load(model, exact, &err) || !a.init(&err)) {
+      check(false, "  auto and exact past the switch's place: the engines and sessions (" + err + ")");
+      return;
+    }
+    Session xs(x.get());
+    const int n = from - p + FLYX_MAX_ROWS;
+    const std::vector<int32_t> got = gen(a, prompt, n).tokens, want = xs.init(&err) ? gen(xs, prompt, n).tokens
+                                                                                   : std::vector<int32_t>{};
+    check(got.size() == size_t(n) && got == want,
+          "  past the switch's place, auto gives exact's tokens (" + first_difference(got, want) + ")");
+    return;
+  }
+  check(strata_loads, "auto switches to strata where an explicit strata loads (" + why + ")");
   const GivenTrees chain(e.get(), {W}, false);
   Session ref(e.get()), s(e.get());
   if (!chain.lowered() || !ref.init(&err) || !s.init(&err)) {

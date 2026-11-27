@@ -288,7 +288,8 @@ Grammar& Engine::grammar() {
 bool Engine::build_and_calibrate_plans(double* t_plans, double* t_rounds, std::string* err) {
   // Prefill passes run whole multiples of the backend's alignment (numerics.md: K).
   prefill_align_ = std::max(1, int(api_->prefill_align(bm_)));
-  const int chunk = opt_.prefill_chunk > 0 ? opt_.prefill_chunk : auto_prefill_chunk();
+  int chunk = opt_.prefill_chunk > 0 ? opt_.prefill_chunk : auto_prefill_chunk();
+  if (prefill_cap_ > 0) chunk = std::min(chunk, prefill_cap_);
   prefill_chunk_ = std::max(prefill_align_, chunk / prefill_align_ * prefill_align_);
 
   // Lookup rounds are speculation too: none when the caller asks for plain decoding.
@@ -553,6 +554,7 @@ void Engine::log_memory_plan(int asked_ctx) const {
 bool Engine::load(const std::string& path, const EngineOptions& opt, std::string* err, int session_limit) {
   opt_ = opt;
   load_adjustments_.clear();
+  prefill_cap_ = 0;
   active_draft_weights_.clear();
   apply_environment(&opt_);
   interfaces::VisionDeviceMode vdev = interfaces::VisionDeviceMode::kDisk;
@@ -838,6 +840,31 @@ bool Engine::load(const std::string& path, const EngineOptions& opt, std::string
     return false;
   };
 
+  // Past every other step, prefill passes of fewer rows (an automatic size only), down to kElasticMinPrefill: a
+  // session's buffers are sized by them as the passes' own are, and a round's graphs are sized on such a session.
+  // A prompt goes slower; its rows give a longer pass's bits but in a last pass of 16 rows or fewer, which computes
+  // as a round (numerics.md: K).  So not beside a drafter the caller named: plain decoding, fitting with longer
+  // passes, would give such a prompt other tokens, and a drafter never changes them (AGENTS.md rule 4); that load
+  // fails with the reason, as one that cannot keep the drafter does.
+  bool kept_for_drafter = false;
+  auto smaller_prefill = [&] {
+    if (opt_.prefill_chunk > 0) return false;
+    // The size a pass then takes (a whole multiple of the alignment, as build_and_calibrate_plans makes it): a
+    // retry only for fewer rows.
+    const int cap = std::max(kElasticMinPrefill, prefill_chunk_ / 2);
+    const int next = std::max(prefill_align_, cap / prefill_align_ * prefill_align_);
+    if (next >= prefill_chunk_) return false;
+    if (drafter_named) return kept_for_drafter = true, false;
+    std::string from = std::to_string(prefill_chunk_);
+    for (const LoadAdjustment& a : load_adjustments_)
+      if (a.kind == "prefill_chunk") from = a.from;
+    prefill_cap_ = next;
+    const std::string to = std::to_string(next);
+    upsert_adj("prefill_chunk", from, to,
+               "Prefill passes of " + to + " rows instead of " + from + " (a slower prompt)");
+    return true;
+  };
+
   // Pre-flight backend-reported VRAM check (avoids wasting seconds uploading weights that cannot fit).
   if (opt_.elastic_load && api_->estimate_load) {
     uint64_t free_vram = 0, total_vram = 0;
@@ -872,12 +899,14 @@ bool Engine::load(const std::string& path, const EngineOptions& opt, std::string
     std::string attempt_err;
     bool ok = true;
     bool oom = false;
+    bool opened = false;  // the weights fit: what ran short came after them
     if (const int rc = api_->open(&model_->desc(), &oo, &bm_); rc != 0) {
       attempt_err = std::string("backend open: ") + api_->last_error();
       ok = false;
       oom = rc == FLYX_ERR_OOM;
     }
     t[5] = os::now_ms();
+    opened = ok;
     if (ok) {
       lower_ms_ = timed_ms_ = 0;
       given_back_ = 0;
@@ -907,8 +936,11 @@ bool Engine::load(const std::string& path, const EngineOptions& opt, std::string
     query_vram(&free_vram, &total_vram);
     flyx_load_estimate est{};
     const bool have_est = query_estimate(free_vram, total_vram, &est);
-    if (!step_down(/*comfort_only=*/false, have_est ? &est : nullptr)) {
+    if (!step_down(/*comfort_only=*/false, have_est ? &est : nullptr) && !(opened && smaller_prefill())) {
       *err = attempt_err;
+      if (kept_for_drafter)
+        *err += " Beside --drafter " + opt_.drafter + ", prefill passes stay " + std::to_string(prefill_chunk_) +
+                " rows: shorter ones could make its tokens differ from plain decoding's.";
       return false;
     }
     log::warn("flyx: tight VRAM during load (%s); retrying with: %s", attempt_err.c_str(),

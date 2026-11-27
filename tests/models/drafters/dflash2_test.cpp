@@ -83,7 +83,7 @@ void dflash2_validation(const std::string& dir) {
         add("draft.sel.pred", {vocab, sr});
         add("draft.sel.succ", {vocab, sr});
       }
-      if (d.at("sel_gate").get<bool>()) add("draft.sel.hid", {sr, H});  // else a unit gate
+      if (d.value("sel_gate", true)) add("draft.sel.hid", {sr, H});  // else a unit gate (no key: an older file's gate)
     }
     json hdr = {{"format", "flyx"}, {"version", 1}, {"kind", "drafter"}, {"draft", d}, {"tensors", tensors}};
     std::string data(off, '\0');
@@ -140,6 +140,35 @@ void dflash2_validation(const std::string& dir) {
     d["n_kv"] = 1024;
     d["head_dim"] = 2048;
     check_refused("ctx_width int32 overflow", d, false, "invalid DFlash2");
+  }
+  {  // A DFlash2 file from before draft_from and sel_gate: DFlash2's block (draft_from 1, a gated selector)
+    json d = base;
+    d.erase("draft_from");
+    d.erase("sel_gate");
+    const std::string path = dir + "/old_dflash2.flyx";
+    make_drafter(path, d, true);
+    std::string error;
+    bool taken = false;
+    {
+      ModelFile f;
+      interfaces::ModelOptions o;
+      o.drafter = "dflash2";
+      const auto m = f.open(dir + "/tiny_gguf.gguf", &error) && f.add(path, &error)
+                         ? interfaces::open_model(f, o, &error)
+                         : nullptr;
+      taken = m && m->drafters() == 1 && std::string(m->drafter_name(0)) == "dflash2";
+      const flyx_model_desc* desc = taken ? &m->desc() : nullptr;
+      int blocks = 0;
+      for (int i = 0; desc && i < desc->n_blocks; ++i)
+        if (desc->blocks[i].kind == FLYX_BLOCK_DFLASH2) {
+          ++blocks;
+          taken = taken && desc->blocks[i].dflash2.draft_from == 1 && desc->blocks[i].dflash2.sel_hid >= 0;
+        }
+      taken = taken && blocks == 1;
+    }
+    std::remove(path.c_str());
+    check(taken, "dflash2 file without draft_from and sel_gate: DFlash2's block, drafts from row 1 and a gated "
+                 "selector (" + error + ")");
   }
   // DeepSpec's DSpark (kind "dspark"): the same block without convolutions, every row a draft (draft_from 0), no
   // selector gate (sel_gate false); taken as such, and refused past a round's rows.
@@ -214,6 +243,11 @@ void dflash2_validation(const std::string& dir) {
     d["conv_taps"] = base["conv_taps"];
     d["conv_group"] = base["conv_group"];
     check_refused("convolutions without a selector", d, false, "without a selector has no convolutions");
+  }
+  {  // a DSpark file states draft_from (no older DSpark file was written without it)
+    json d = dspark;
+    d.erase("draft_from");
+    check_refused("dspark without draft_from", d, true, "draft_from");
   }
   {  // HIGH: TG2 and n_taps * hidden int32 overflows on a large-hidden synthetic model
     auto check_synth = [&](const std::string& what, json d) {

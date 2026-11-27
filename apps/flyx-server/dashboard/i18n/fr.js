@@ -682,6 +682,7 @@ export default {
   rules: [
     [/^Speculative drafter \((.+)\) skipped due to tight VRAM; running with prompt lookup$/, "Drafter spéculatif ($1) ignoré faute de VRAM ; exécution avec recherche dans le prompt"],
     [/^Speculative drafter \((.+)\) skipped due to tight VRAM; running plain decoding$/, "Drafter spéculatif ($1) ignoré faute de VRAM ; décodage simple actif"],
+    [/^Prefill passes of (\d+) rows instead of (\d+) \(a slower prompt\)$/, "Préremplissage par passes de $1 lignes au lieu de $2 (prompt plus lent)"],
     [/^Failed to load (.+); reverted to (.+)$/, "Échec du chargement de $1 ; retour à $2"],
     [/^Failed to load (.+)$/, "Échec du chargement de $1"],
     [/^Requests will fail until a model is loaded\. Reload (.+) or choose another model\.$/, "Les requêtes échoueront tant qu'aucun modèle n'est chargé. Rechargez $1 ou choisissez un autre modèle."],
@@ -750,6 +751,8 @@ export default {
     [/^Not enough VRAM: ([\d.]+) \/ ([\d.]+) GB used by other apps\.$/, "VRAM insuffisante : $1 / $2 GB utilisés par d'autres applications."],
     [/^Not enough VRAM: ([\d.]+) GB GPU, ([\d.]+) GB short\.$/, "VRAM insuffisante : GPU $1 GB, il manque $2 GB."],
     [/^Not enough VRAM: ([\d.]+) GB short\.$/, "VRAM insuffisante : il manque $1 GB."],
+    [/^Not enough VRAM for a session beside the weights \((.+)\)\.$/, "Pas assez de VRAM pour une session à côté des poids ($1)."],
+    [/^Beside --drafter (\S+), prefill passes stay (\d+) rows: shorter ones could make its tokens differ from plain decoding's\.$/, "Avec --drafter $1, les passes de préremplissage restent à $2 lignes : des passes plus courtes pourraient rendre ses jetons différents de ceux du décodage simple."],
     [/^Not enough VRAM for (\d+)-token context \(needs ([\d.]+) GB, ([\d.]+) GB free after weights\)\.$/, "VRAM insuffisante pour un contexte de $1 tokens ($2 GB requis, $3 GB libres après les poids)."],
     [/^Not enough VRAM while loading weights: ([\d.]+) \/ ([\d.]+) GB used by other apps\.$/, "VRAM insuffisante lors du chargement des poids : $1 / $2 GB utilisés par d'autres applications."],
     [/^Not enough VRAM while loading weights \(([\d.]+) GB GPU\)\.$/, "VRAM insuffisante lors du chargement des poids (GPU $1 GB)."],

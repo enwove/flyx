@@ -300,6 +300,14 @@ __global__ void k_swiglu(const float* gu, int ld, int I, Out o, int ld_out, int 
   }
 }
 
+__global__ void k_round_rows_bf16(float* x, int ld, int n, const float* y, int ldy) {
+  pdl_trigger();
+  float* r = x + size_t(blockIdx.y) * ld;
+  const float* a = y ? y + size_t(blockIdx.y) * ldy : nullptr;
+  for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < n; i += gridDim.x * blockDim.x)
+    r[i] = __bfloat162float(__float2bfloat16_rn(a ? __fadd_rn(r[i], a[i]) : r[i]));  // the sum not contracted
+}
+
 }  // namespace
 
 void rmsnorm(const float* x, int ldx, const float* w, float offset, float eps, float* y, int ldy, int rows, int n,
@@ -365,6 +373,16 @@ void build_rows(const DevParams* P, const int* drafts, int fill, int* tokens, in
 
 void swiglu(const float* gu, int ld, int I, float* out, int ld_out, int rows, cudaStream_t st) {
   k_swiglu<0><<<dim3(rows, ceil_div(I, 512)), 256, 0, st>>>(gu, ld, I, Out{out, nullptr, nullptr}, ld_out, rows);
+}
+
+void round_rows_bf16(float* x, int ld, int n, int rows, cudaStream_t st) {
+  if (rows > 0 && n > 0)
+    k_round_rows_bf16<<<dim3(std::min(ceil_div(n, 256), 32), rows), 256, 0, st>>>(x, ld, n, nullptr, 0);
+}
+
+void add_rows_bf16(float* x, int ld, const float* y, int ldy, int n, int rows, cudaStream_t st) {
+  if (rows > 0 && n > 0)
+    k_round_rows_bf16<<<dim3(std::min(ceil_div(n, 256), 32), rows), 256, 0, st>>>(x, ld, n, y, ldy);
 }
 
 void swiglu_split(const float* gu, int ld, int I, int rows, const Launch& L, bool q8, float* also,

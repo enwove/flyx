@@ -265,7 +265,8 @@ void reset_state(RefSeq* s) {
   s->stopped = false;
 }
 
-void embed_rows(RefSeq* s, const flyx_embed_block& e, const int32_t* ids, int n, Vec* x) {
+// residual16: a target pass whose residual is bf16 (residual_add), where an injected row is stored so too.
+void embed_rows(RefSeq* s, const flyx_embed_block& e, const int32_t* ids, int n, Vec* x, bool residual16 = false) {
   const auto* E = s->m->w(e.table);
   const int H = e.hidden;
   x->assign(size_t(n) * H, 0.0);
@@ -273,7 +274,8 @@ void embed_rows(RefSeq* s, const flyx_embed_block& e, const int32_t* ids, int n,
     double* row = &(*x)[size_t(r) * H];
     auto ov = s->embed_override.find(r);
     if (ov != s->embed_override.end()) {
-      for (int c = 0; c < H; ++c) row[c] = double(ov->second[c]);
+      for (int c = 0; c < H; ++c)
+        row[c] = residual16 ? flyx::ops::round_bf16(double(ov->second[c])) : double(ov->second[c]);
     } else {
       for (int c = 0; c < H; ++c) row[c] = load(E, size_t(ids[r]) * H + c);
       if (e.has_norm) norm(s->m, e.norm, row, H, row);
@@ -1321,7 +1323,7 @@ void run_nodes(RefPlan* p, RefSeq* s) {
               s->rows = p->width + 1;
               s->start = s->position;
             }
-            embed_rows(s, b->embed, s->tok.data(), s->rows, &s->x);
+            embed_rows(s, b->embed, s->tok.data(), s->rows, &s->x, s->rows > FLYX_MAX_ROWS && M->res16);
             s->feats.assign(size_t(s->rows) * size_t(tap_slots) * size_t(H), 0.0);
             s->choice.assign(s->rows, 0);
             break;

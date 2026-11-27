@@ -55,7 +55,10 @@ bool supported(const flyx_bmodel* m, const Block& blk, std::string* why) {
     if (a->q_norm.w && (a->q_norm.offset != a->k_norm.offset || a->q_norm.eps != a->k_norm.eps))
       return no("the attention prep takes one offset and eps for the q and k norms");
     if (m->states.kv[size_t(a->kv)].fp8 && !kv_fp8_supported(m->opt.kernels, a->nh, a->nkv, a->hd))
-      return no("an FP8 KV cache needs 1, 2 or 4 query heads per KV head");
+      return no(m->opt.kernels.attention == kAttnPerHead
+                    ? "the option attention=head reads binary16 K/V caches only (--kv 16)"
+                    : "an FP8 KV cache needs 1, 2 or 4 query heads per KV head, or 6 or 8 at head dim 128 or 256 "
+                      "(binary16 K/V: --kv 16)");
   } else if (const auto* r = std::get_if<RelAttnBlock>(&blk)) {
     if (!attention_head_dim(r->hd) || r->nkv < 1 || r->nh % r->nkv || r->d_rel < 1 || r->conv < 2 || r->conv > 64)
       return no("rel_attn dimensions outside what the CUDA kernels take (head dim 32, 64, 128 or 256, conv 2..64)");
@@ -417,7 +420,11 @@ void run_node(const Pass& ps, const flyx_node& n, const Block* b) {
           if (ps.n_embeds > 0) embed_scatter(rv.b.x, nullptr, e->hidden, ps.embeds, ps.embed_rows, ps.n_embeds, st);
         } else {
           embed_tokens(*e, rv.b.tokens, rv.b.x, ps.rows, st);
-          if (ps.n_embeds > 0) embed_scatter(rv.b.x, nullptr, e->hidden, ps.embeds, ps.embed_rows, ps.n_embeds, st);
+          if (ps.n_embeds > 0) {
+            embed_scatter(rv.b.x, nullptr, e->hidden, ps.embeds, ps.embed_rows, ps.n_embeds, st);
+            // fusion=0 beside a bf16 residual: the injected rows as the fused path stores them (the table's are bf16)
+            if (residual16_pass(ps)) round_rows_bf16(rv.b.x, e->hidden, e->hidden, ps.rows, st);
+          }
         }
       } else if (const auto* g = std::get_if<GdnBlock>(b)) {
         gdn_layer(ps, *g);

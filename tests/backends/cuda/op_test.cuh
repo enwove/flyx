@@ -262,6 +262,7 @@ void test_gemm_draft_tables();
 void test_gemm_tables_compiled();
 void test_gemm_tuning_auto();
 void test_rmsnorm();
+void test_round_rows_bf16();
 void test_blocks();
 void test_blocks_round_stacks();
 void test_blocks_round_glu();

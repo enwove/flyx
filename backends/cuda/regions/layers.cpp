@@ -73,7 +73,7 @@ void norm_and_project(const RowView& v, int R, const Norm& n, const Lin& w, int 
 
 bool residual16_model(flyx_bmodel* m) {
   if (m->res16 < 0) {  // every block of the stack: the embedding a bf16 table, each residual add a W4A4 GEMM
-    bool ok = m->opt.fusion && m->opt.kernels.prefill_fp4 && gemm_w4a4_supported();
+    bool ok = m->opt.kernels.prefill_fp4 && gemm_w4a4_supported();
     std::vector<bool> drafter_parts(m->blocks.size(), false);  // the MTP layer's blocks add to no residual here
     for (const Block& b : m->blocks)
       if (const auto* t = std::get_if<MtpBlock>(&b)) {
@@ -98,13 +98,15 @@ bool residual16_model(flyx_bmodel* m) {
   return m->res16 == 1;
 }
 
-bool residual16(const Pass& ps) {
+bool residual16_pass(const Pass& ps) {
   if (ps.round || ps.rows <= 16) return false;
   return residual16_model(ps.s->m) && ps.v.L.scratch && ps.v.L.scratch->af32;
 }
 
+bool residual16(const Pass& ps) { return ps.s->m->opt.fusion && residual16_pass(ps); }
+
 void mlp_body(float* x, const MlpBlock& f, int R, float* h, float* proj, int ld_proj, float* act, int ld_act,
-              const Launch& L, bool fused) {
+              const Launch& L, bool fused, bool add16) {
   const int H = f.hidden, I = f.inter;
   const Norm& n = f.norm;
   if (fused) {
@@ -137,10 +139,19 @@ void mlp_body(float* x, const MlpBlock& f, int R, float* h, float* proj, int ld_
   rmsnorm(x, H, n.w, n.offset, n.eps, h, H, R, H, L.st);
   gemm(h, H, f.w_gu, 2 * I, H, proj, ld_proj, R, false, L);
   swiglu(proj, ld_proj, I, act, ld_act, R, L.st);
-  gemm(act, ld_act, f.w_down, H, I, x, H, R, true, L);
+  // The fused gate|up GEMM keeps the SwiGLU rows in bf16 (gemm_glu_staged); a down projection of NVFP4 inputs rounds
+  // them from those rows (gemm_on_glu), whatever the gate|up weights are.
+  if (R > 16 && I % 8 == 0 && !f.w_gu.packed() && !f.w_down.packed() && prefill_rows_bf16(L, f.w_down.q, I))
+    round_rows_bf16(act, ld_act, I, R, L.st);
+  if (add16) {  // h, H wide, is free past the gate|up GEMM
+    gemm(act, ld_act, f.w_down, H, I, h, H, R, false, L);
+    add_rows_bf16(x, H, h, H, H, R, L.st);
+  } else {
+    gemm(act, ld_act, f.w_down, H, I, x, H, R, true, L);
+  }
 }
 
-void gdn_out_project(const RowView& v, const GdnBlock& g, int R, bool fused) {
+void gdn_out_project(const RowView& v, const GdnBlock& g, int R, bool fused, bool add16) {
   const GdnDims gd = g.gd;
   const int H = g.hidden, C = gd.C(), vd = g.v_width();
   const float* z = v.b.proj + C;
@@ -149,7 +160,12 @@ void gdn_out_project(const RowView& v, const GdnBlock& g, int R, bool fused) {
     gemm_presplit(g.w_out, H, vd, v.b.x, H, R, true, v.L);
   } else {
     gdn_gated_norm(v.b.gdn_o, z, v.ld_proj, g.gated.w, g.gated.eps, v.b.act, R, gd, v.L.st);
-    gemm(v.b.act, vd, g.w_out, H, vd, v.b.x, H, R, true, v.L);
+    if (add16) {  // h (H wide; gdn_o in a pass's buffers) is free past the gated norm
+      gemm(v.b.act, vd, g.w_out, H, vd, v.b.h, H, R, false, v.L);
+      add_rows_bf16(v.b.x, H, v.b.h, H, H, R, v.L.st);
+    } else {
+      gemm(v.b.act, vd, g.w_out, H, vd, v.b.x, H, R, true, v.L);
+    }
   }
 }
 
@@ -471,6 +487,8 @@ void gdn_layer(const Pass& ps, const GdnBlock& g, bool fused) {
     lora_in_end(rv, g.lora, 4, out, rv.b.h, H, H, R, s->m->need.lora, L);
   } else {
     norm_and_project(rv, R, g.norm, g.w_in, g.n_in(), H, fused);
+    if (!ps.round && R > 16 && !g.w_in.packed() && prefill_rows_bf16(L, g.w_in.q, H))  // the fused path's bf16 rows
+      round_rows_bf16(rv.b.proj, rv.ld_proj, g.n_in(), R, st);
   }
   const float* b = rv.b.proj + C + vd;
   const float* a = b + gd.nv;
@@ -513,7 +531,7 @@ void gdn_layer(const Pass& ps, const GdnBlock& g, bool fused) {
     if (!gdn_chunk(sb.S, sb.s_stride, kSlotCur, bf, s->P, s->position, rv.b.gdn_o, R, st, snap_sel, snap_row))
       gdn_recur(sb.S, sb.s_stride, kSlotCur, kSlotCur, bf, kSlotCur, s->P, rv.b.gdn_o, R, nullptr, false, st);
   }
-  gdn_out_project(rv, g, R, fused);
+  gdn_out_project(rv, g, R, fused, residual16_pass(ps));
   if (g.lora) lora_out(rv, g.lora, 4, rv.b.act, vd, vd, H, R, s->m->need.lora, L);  // the gated norm's rows
 }
 
@@ -783,6 +801,9 @@ void attn_layer(const Pass& ps, const AttnBlock& a, bool fused) {
       throw std::logic_error("cuda: a bf16 residual's out projection is a W4A4 GEMM");
   } else if (split) {
     gemm_presplit(a.w_out, H, nh * hd, rv.b.x, H, R, true, L);
+  } else if (residual16_pass(ps)) {  // fusion=0: as gemm_staged_bf16 adds it; h (H wide; qbuf in a pass) is free here
+    gemm(rv.b.act, nh * hd, a.w_out, H, nh * hd, rv.b.h, H, R, false, L);
+    add_rows_bf16(rv.b.x, H, rv.b.h, H, H, R, st);
   } else {
     gemm(rv.b.act, nh * hd, a.w_out, H, nh * hd, rv.b.x, H, R, true, L);
   }
@@ -801,7 +822,8 @@ void mlp_layer(const Pass& ps, const MlpBlock& f, bool fused) {
     return;
   }
   if (!f.lora) {
-    mlp_body(rv.b.x, f, ps.rows, rv.b.h, rv.b.proj, rv.ld_proj, rv.b.act, rv.ld_act, rv.L, fused);
+    mlp_body(rv.b.x, f, ps.rows, rv.b.h, rv.b.proj, rv.ld_proj, rv.b.act, rv.ld_act, rv.L, fused,
+             residual16_pass(ps));
     return;
   }
   // The block's own adapters (ABI 43): the gate and up rows take their products before the SwiGLU, so the gate|up GEMM

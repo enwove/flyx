@@ -200,11 +200,15 @@ DFlash2Spec parse_dflash2_json(const ModelFile& file, const json& j, const Targe
       companion >= 0 ? ModelFile::companion_name(companion, "draft.sel.pred") : std::string("draft.sel.pred");
   spec.sel_vocab = resolve_sel_vocab(file, pred_name, target);
   spec.kind = block_drafter_kind(j);
-  const int64_t from = config_int(j, "draft_from", "DFlash2");
+  // A DFlash2 file written before the two keys holds the block the converter still writes for DFlash2: drafts from
+  // the row after the anchor's, a gated selector.  A DSpark file states both.
+  const bool before_keys = spec.kind == Drafter::kDFlash2 && !j.contains("draft_from") && !j.contains("sel_gate");
+  const int64_t from = before_keys ? 1 : config_int(j, "draft_from", "DFlash2");
   if (from != 0 && from != 1) throw std::runtime_error("block drafter draft_from " + std::to_string(from));
   d.draft_from = int32_t(from);
-  if (!j.contains("sel_gate") || !j["sel_gate"].is_boolean()) throw std::runtime_error("block drafter sel_gate missing");
-  spec.sel_gate = j["sel_gate"].get<bool>();
+  if (!before_keys && (!j.contains("sel_gate") || !j["sel_gate"].is_boolean()))
+    throw std::runtime_error("block drafter sel_gate missing");
+  spec.sel_gate = before_keys || j["sel_gate"].get<bool>();
   validate_dflash2_spec(&spec, target);
   return spec;
 }
