@@ -1809,7 +1809,11 @@ void test_inkling2_moe() {
     counts.assign(ids.size(), UINT32_MAX);
     CK(cudaMemcpy(d, invalid_ids.data(), invalid_ids.size() * sizeof(int), cudaMemcpyHostToDevice));
     CK(cudaMemcpy(histogram, counts.data(), counts.size() * sizeof(uint32_t), cudaMemcpyHostToDevice));
-    moe_place_ids(d, int(ids.size()), int(permutation.size()), slots, histogram, invalid, 0);
+    int* resident = dev<int>(ids.size());
+    moe_place_ids(d, int(ids.size()), int(permutation.size()), slots, histogram, invalid, 0, {resident, 3});
+    if (down_i(resident, ids.size()) != std::vector<int>({0, 0, 0, 2, 2, 0}))
+      throw std::runtime_error("bounded resident routes");
+    cudaFree(resident);
     int flag = 0;
     CK(cudaMemcpy(&flag, invalid, sizeof(flag), cudaMemcpyDeviceToHost));
     CK(cudaMemcpy(actual.data(), d, ids.size() * sizeof(int), cudaMemcpyDeviceToHost));
@@ -1897,6 +1901,10 @@ void test_inkling2_moe() {
     float* output = dev<float>(pairs);
     situ_rows(input, 2, 1, 0.f, 0.f, output, 1, pairs, 0);
     expect("streamed pair activation beyond CUDA grid.y", down(output, pairs), Vec(pairs, ops::silu(1.)), 1e-6);
+    float* weights = up(Vec(pairs, 1.));
+    moe_sum_slots(input, weights, pairs, 1, 1, output, false, 0);
+    expect_bits("streamed slot reduction beyond CUDA grid.y", down(output, pairs), Vec(pairs, 1.));
+    cudaFree(weights);
     cudaFree(output);
     cudaFree(input);
   }

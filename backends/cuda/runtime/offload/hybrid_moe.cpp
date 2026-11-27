@@ -74,6 +74,7 @@ void hybrid_experts(const Pass& ps, const MoeBlock& f, const MoeScratch* sc, flo
   const Launch& L = ps.v.L;
   const auto& b = ps.v.b;
   int H = f.hidden, I = f.inter, K = f.top_k;
+  if (ps.rows > INT_MAX / K) throw std::runtime_error("MoE pass exceeds routed pair index range");
   const bool vec = opts(L).moe_vec;
   // A different session can own the previous visit. Order reuse of both DMA buffers and device slots on its event.
   CK(cudaStreamWaitEvent(L.st, ws.ready));
@@ -84,10 +85,12 @@ void hybrid_experts(const Pass& ps, const MoeBlock& f, const MoeScratch* sc, flo
     const bool stage =
         !ps.round && ws.staging.stream() && sc && sc->chunk_rows >= 3 && ps.rows >= std::max(2, min_rows);
     auto placement = ws.placements.find(f.cold_gu.get());
+    const bool mapped_chunk = placement != ws.placements.end() && !stage && ps.rows <= ColdShape::chunk;
     if (placement != ws.placements.end() || stage) {
       auto* map = placement == ws.placements.end() ? nullptr : &placement->second;
       moe_place_ids(b.moe_idx, ps.rows * K, f.n_experts, map ? map->slots : nullptr,
-                    map && !ps.round ? map->counts : nullptr, stage ? ps.s->route_error : nullptr, L.st);
+                    map && !ps.round ? map->counts : nullptr, stage ? ps.s->route_error : nullptr, L.st,
+                    {mapped_chunk ? ws.resident_ids : nullptr, f.gate_up.n_experts});
       if (map && !ps.round) ws.pending_counts = true;
     }
     if (stage) {
@@ -109,7 +112,7 @@ void hybrid_experts(const Pass& ps, const MoeBlock& f, const MoeScratch* sc, flo
       HostHandoff handoff(L.st, ws.ready, ids, ws.ids, size_t(rows) * K, input, ws.input, size_t(rows) * H);
       if (t) CK(cudaEventRecord(ws.timer[0], L.st));
       if (f.gate_up.n_experts) {
-        moe_resident_ids(ids, ws.resident_ids, rows * K, f.gate_up.n_experts, L.st);
+        if (!mapped_chunk) moe_resident_ids(ids, ws.resident_ids, rows * K, f.gate_up.n_experts, L.st);
         moe_gate_up(input, H, f.gate_up, ws.resident_ids, rows, K, I, H, f.situ_beta, f.situ_linear_beta, fused,
                     fused ? b.moe_act : b.moe_gu, fused ? I : 2 * I, sc, L);
         if (!fused) situ_rows(b.moe_gu, 2 * I, I, f.situ_beta, f.situ_linear_beta, b.moe_act, I, rows * K, L.st);
@@ -165,7 +168,7 @@ void hybrid_experts(const Pass& ps, const MoeBlock& f, const MoeScratch* sc, flo
           last_row = row;
         }
         // Group identical weight reads while preserving the router's slot order in the output.
-        std::sort(ws.cold.begin(), ws.cold.end(), [&](int a, int b) { return ws.ids[a] < ws.ids[b]; });
+        if (rows > 1) std::sort(ws.cold.begin(), ws.cold.end(), [&](int a, int b) { return ws.ids[a] < ws.ids[b]; });
         std::array<int, ColdShape::chunk * kMoeRouteMaxTopK + 1> starts;
         int groups = 0;
         for (int i = 0; i < int(ws.cold.size()); ++i)
@@ -196,6 +199,11 @@ void hybrid_experts(const Pass& ps, const MoeBlock& f, const MoeScratch* sc, flo
                           mat.scales.empty() ? 1.f : mat.scales[expert],
                           mat.float_dot,
                           mat.quant_dot};
+                if (!gate && count == 1) {
+                  mat.kernel(w, mat.stride, j, stop, x, ws.cpu_slots + size_t(*x.slots) * width + j, tile);
+                  offset += count;
+                  continue;
+                }
                 mat.kernel(w, mat.stride, j, stop, x, lo, tile);
                 if (gate) mat.kernel(w, mat.stride, I + j, I + stop, x, hi, tile);
                 for (int r = 0; r < count; ++r) {
@@ -223,7 +231,7 @@ void hybrid_experts(const Pass& ps, const MoeBlock& f, const MoeScratch* sc, flo
             f.cold_down->prepare(x, vec);
         }
         project(*f.cold_down, ws.act.data(), ws.down_q8.data(), false);
-        std::sort(ws.cold.begin(), ws.cold.end());
+        if (rows > 1) std::sort(ws.cold.begin(), ws.cold.end());
         if (ws.stats.verbose || t) {
           const double dt = std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count();
           ws.stats.cpu_seconds += dt;

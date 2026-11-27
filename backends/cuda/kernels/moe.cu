@@ -27,6 +27,7 @@ namespace {
 
 constexpr int kMoeWarps = 4;
 constexpr int kMoeKT = 1024;
+constexpr int kMaxGridY = 65535;
 constexpr int kRouteThreads = 128, kRouteTop = kMoeRouteMaxTopK;  // threads a row; the most experts a row takes
 
 __device__ __forceinline__ float situ_val(float g, float u, float beta, float linear_beta) {
@@ -78,7 +79,7 @@ __global__ void __launch_bounds__(kRouteThreads) k_moe_route(const float* logits
       const float p = sigm(lr[e]);
       probs[e] = p;
       const float score = p + (bias ? bias[e] : 0.f);
-      sel[e] = isnan(score) ? -INFINITY : score;
+      sel[e] = fmaxf(score, -INFINITY);  // CUDA fmax maps a NaN score to the lower endpoint.
     }
   } else {
     float mx = -INFINITY;
@@ -96,7 +97,7 @@ __global__ void __launch_bounds__(kRouteThreads) k_moe_route(const float* logits
       const float p = probs[e] * inv_z;
       probs[e] = p;
       const float score = p + (bias ? bias[e] : 0.f);
-      sel[e] = isnan(score) ? -INFINITY : score;
+      sel[e] = fmaxf(score, -INFINITY);  // CUDA fmax maps a NaN score to the lower endpoint.
     }
   }
   __syncthreads();
@@ -108,7 +109,7 @@ __global__ void __launch_bounds__(kRouteThreads) k_moe_route(const float* logits
   for (int e = tid; e < E; e += kRouteThreads) {
     const float v = sel[e];
     int before = 0;
-    for (int j = 0; j < E; ++j) before += (j != e && score_better(sel[j], j, v, e)) ? 1 : 0;
+    for (int j = 0; j < E; ++j) before += score_better(sel[j], j, v, e);
     if (before < top_k) {
       s_top_i[before] = e;
       s_top_w[before] = probs[e];
@@ -1339,16 +1340,16 @@ void moe_route(const float* logits, const float* bias, int rows, int n_experts, 
 void situ_rows(const float* gu, int ld_gu, int I, float beta, float linear_beta, float* out, int ld_out, int rows,
                cudaStream_t st) {
   if (rows <= 0 || I <= 0) return;
-  constexpr int max_grid_y = 65535;
   for (int at = 0; at < rows;) {
-    const int count = std::min(rows - at, max_grid_y);
+    const int count = std::min(rows - at, kMaxGridY);
     k_situ_rows<<<dim3(ceil_div(I, 256), count), 256, 0, st>>>(gu + size_t(at) * ld_gu, ld_gu, I, beta, linear_beta,
                                                                out + size_t(at) * ld_out, ld_out);
     at += count;
   }
 }
 
-__global__ void k_moe_place_ids(int* ids, int pairs, int experts, const int* slots, uint32_t* counts, int* invalid) {
+__global__ void k_moe_place_ids(int* ids, int pairs, int experts, const int* slots, uint32_t* counts, int* invalid,
+                                ResidentRoutes resident) {
   const int i = blockIdx.x * blockDim.x + threadIdx.x;
   if (i < pairs) {
     const int id = ids[i];
@@ -1356,6 +1357,7 @@ __global__ void k_moe_place_ids(int* ids, int pairs, int experts, const int* slo
       // A streamed pass still writes this pair via slot zero. Decode checks the sentinel during its handoff.
       if (invalid) atomicExch(invalid, 1);
       ids[i] = invalid ? 0 : -1;
+      if (resident.ids) resident.ids[i] = 0;
       return;
     }
     if (counts) {
@@ -1366,13 +1368,15 @@ __global__ void k_moe_place_ids(int* ids, int pairs, int experts, const int* slo
         old = prior;
       }
     }
-    if (slots) ids[i] = slots[id];
+    const int physical = slots ? slots[id] : id;
+    ids[i] = physical;
+    if (resident.ids) resident.ids[i] = unsigned(physical) < unsigned(resident.experts) ? physical : 0;
   }
 }
 
-void moe_place_ids(int* ids, int pairs, int experts, const int* slots, uint32_t* counts, int* invalid,
-                   cudaStream_t st) {
-  k_moe_place_ids<<<ceil_div(pairs, 128), 128, 0, st>>>(ids, pairs, experts, slots, counts, invalid);
+void moe_place_ids(int* ids, int pairs, int experts, const int* slots, uint32_t* counts, int* invalid, cudaStream_t st,
+                   ResidentRoutes resident) {
+  k_moe_place_ids<<<ceil_div(pairs, 128), 128, 0, st>>>(ids, pairs, experts, slots, counts, invalid, resident);
 }
 
 __global__ void k_moe_resident_ids(const int* ids, int* safe, int pairs, int hot) {
@@ -1386,8 +1390,13 @@ void moe_resident_ids(const int* ids, int* safe, int pairs, int hot, cudaStream_
 
 void moe_sum_slots(const float* slots, const float* weights, int rows, int top_k, int hidden, float* out,
                    bool accumulate, cudaStream_t st) {
-  k_moe_weighted_sum<<<dim3(ceil_div(hidden, 256), rows), 256, 0, st>>>(slots, weights, top_k, hidden, out, hidden,
-                                                                       int(accumulate));
+  for (int at = 0; at < rows;) {
+    const int count = std::min(rows - at, kMaxGridY);
+    const size_t first = size_t(at) * top_k;
+    k_moe_weighted_sum<<<dim3(ceil_div(hidden, 256), count), 256, 0, st>>>(
+        slots + first * hidden, weights + first, top_k, hidden, out + size_t(at) * hidden, hidden, int(accumulate));
+    at += count;
+  }
 }
 
 bool moe_q8_mins(const ExpertMat& W) {

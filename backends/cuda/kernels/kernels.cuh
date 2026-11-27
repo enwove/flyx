@@ -1974,7 +1974,12 @@ void moe_down(const float* act, int ld_act, const ExpertMat& W, const int* eidx,
               const bf16* act_bf16 = nullptr, int grouped = 0);
 
 // Cold slots use a valid temporary expert until the CPU result replaces them.
-void moe_place_ids(int* ids, int pairs, int experts, const int* slots, uint32_t* counts, int* invalid, cudaStream_t st);
+struct ResidentRoutes {
+  int* ids = nullptr;
+  int experts = 0;
+};
+void moe_place_ids(int* ids, int pairs, int experts, const int* slots, uint32_t* counts, int* invalid, cudaStream_t st,
+                   ResidentRoutes resident = {});
 void moe_resident_ids(const int* ids, int* safe, int pairs, int hot, cudaStream_t st);
 
 // For a bank, group just its routed pairs and leave down rows in sc->down_buf for one final ordered reduction.
