@@ -60,14 +60,17 @@ class RoundChooser {
   // lookup_widths: the widths of rounds whose drafts are given (empty: no such
   // rounds).  trunks, cost_per_token, cost_at: as SpecController::reset (null:
   // no trees; a round's cost whatever the context).  lookup_cost_ms: measured
-  // costs of lookup_widths (optional).  The vectors must outlive the chooser.
+  // costs of lookup_widths (optional).  costs, lookup_costs: what the rounds and
+  // the lookup rounds cost at a context (RoundCosts) in place of the measured
+  // costs (null: those).  The vectors and the models must outlive the chooser.
   // Starts the acceptance history over.
   void configure(const std::vector<int>* widths, const std::vector<int>* drafters, const std::vector<double>* cost_ms,
                  const std::vector<int>* lookup_widths, const std::vector<int>* trunks = nullptr,
                  const std::vector<double>* lookup_cost_ms = nullptr,
                  const std::vector<std::vector<int>>* adaptive_checkpoints = nullptr,
                  const std::vector<double>* cost_per_token = nullptr, int cost_at = 0,
-                 SharedTokens* shared = nullptr);
+                 SharedTokens* shared = nullptr, const RoundCostModel* costs = nullptr,
+                 const RoundCostModel* lookup_costs = nullptr);
   bool configured() const { return widths_ != nullptr; }
 
   // A reply begins (after its prompt's prefill).  lookup: it may take drafts
@@ -144,6 +147,7 @@ class RoundChooser {
   const std::vector<int>* drafters_ = nullptr;
   const std::vector<int>* lookup_widths_ = nullptr;
   const std::vector<double>* lookup_cost_ = nullptr;
+  const RoundCostModel* lookup_costs_ = nullptr;
   double lookup_accept_ = 0.75;  // EMA of accepted / width on lookup rounds
   bool lookup_on_ = false;       // this reply may use lookup rounds
   // The text just written appears earlier: the next round is to be a lookup

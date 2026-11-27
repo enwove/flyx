@@ -137,6 +137,7 @@
         "FLYX_LOOKUP": "",
         "FLYX_DRAFT_TREES": "",
         "FLYX_ADAPTIVE": "",
+        "FLYX_LEARN_COSTS": "",
         "FLYX_API_KEY": "",
         "FLYX_KEY": "",
         "FLYX_MODELS_DIR": "",

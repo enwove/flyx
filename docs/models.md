@@ -48,7 +48,7 @@ flyx serve unsloth/Qwen3.8-27B-GGUF:UD-IQ2_S --drafter-file z-lab/Qwen3.8-27B-DF
 
 ## 3. Speculative Drafters
 
-`flyx` supports seven drafter sources and can run multiple simultaneously; a per-round controller (`RoundChooser`) chooses the drafter and width dynamically from load-time measured costs and live acceptance rates.
+`flyx` supports seven drafter sources and can run multiple simultaneously; a per-round controller (`RoundChooser`) chooses the drafter and width dynamically from each round's cost at the context (timed at load, then learned from the rounds a session reads alone: a long context's K/V read over the bus or through a 2-bit copy makes wide rounds dearer; `FLYX_LEARN_COSTS=0` keeps the load's) and live acceptance rates.
 
 | Drafter | Source | Notes |
 |---|---|---|

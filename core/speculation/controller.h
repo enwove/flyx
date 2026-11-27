@@ -53,11 +53,19 @@ class SharedTokens {
   double credit_ = 0;
 };
 
+// What a round costs at a context (RoundCosts: the load's timings, then the rounds the engine's sessions read).
+class RoundCostModel {
+ public:
+  virtual ~RoundCostModel() = default;
+  virtual double cost(size_t round, int context) const = 0;
+};
+
 // Chooses the next round among plain decoding and every drafter's widths
-// by expected tokens per millisecond (each round's cost
-// measured at load; where a drafter's state follows its own rounds only, at two
-// lengths of context: a round costs its cost at the first plus its cost per
-// token of context past it, so at the context the round runs at):
+// by expected tokens per millisecond at the context the round runs at (each
+// round's cost by a RoundCostModel where reset() is given one: measured at load
+// and learned from the rounds read; else measured at load, and where a
+// drafter's state follows its own rounds only, at two lengths of context: a
+// round costs its cost at the first plus its cost per token of context past it):
 //   * plain decoding or a drafted round, by each drafter's per-position
 //     acceptance as a moving average (with one drafter, the whole choice);
 //   * drafted, the drafter: the one whose best round its drafter estimate
@@ -151,10 +159,11 @@ class SpecController {
   // tokens, cost_per_token[i] ms more for every token of context past it (null: none); trunks (null: no trees):
   // trunks[i] > 0 when round i is a tree whose first trunks[i] drafts are the drafter's chain, < 0 a tree without a
   // trunk.  shared: the engine's sessions' rounds of trees without a trunk and their probe credit (null: the
-  // controller's own).  The vectors must outlive the controller.  Starts the acceptance history over.
+  // controller's own).  costs: what the rounds cost at a context in their place (null: cost_ms and
+  // cost_per_token).  The vectors and the model must outlive the controller.  Starts the acceptance history over.
   void reset(const std::vector<int>* widths, const std::vector<int>* drafters, const std::vector<double>* cost_ms,
              const std::vector<int>* trunks = nullptr, const std::vector<double>* cost_per_token = nullptr,
-             int cost_at = 0, SharedTokens* shared = nullptr);
+             int cost_at = 0, SharedTokens* shared = nullptr, const RoundCostModel* costs = nullptr);
   // The round to launch next at a context of `context` tokens (index into widths), and the controller's account of
   // it (it counts as launched): preview(context), then commit().
   int choose(int context = 0);
@@ -190,8 +199,12 @@ class SpecController {
   double expected_tokens(int drafter, int width, bool drafter_estimate = false) const;
   // Tokens round i is expected to give (a tree: its trunk's and its branches'; a tree without a trunk: its own).
   double round_tokens(size_t round, bool drafter_estimate = false) const;
-  // Round i's cost at a context of `context` tokens.
+  // Round i's cost at a context of `context` tokens: the cost model's (reset's `costs`), else the load's; kLeastMs at
+  // least (the rates divide by it).
+  static constexpr double kLeastMs = 1e-3;
   double cost(size_t round, int context) const;
+  // ... the load's in any case (what the adaptive stoppers' checkpoints are priced at).
+  double load_cost(size_t round, int context) const;
   // Round i is a tree round, with a trunk or without one (such a round runs alone: launch_batch).
   bool is_tree(size_t round) const { return tree(round) || bare(round); }
 
@@ -231,6 +244,7 @@ class SpecController {
   const std::vector<double>* cost_ = nullptr;
   const std::vector<double>* per_token_ = nullptr;
   int cost_at_ = 0;
+  const RoundCostModel* costs_ = nullptr;
   const std::vector<int>* trunks_ = nullptr;
   std::vector<double> bonus_sum_, bonus_n_;  // per round (trees): tokens beyond the trunk, counted
   std::vector<double> tok_guess_;              // per round (trees without a trunk): the guess of its tokens a round

@@ -143,6 +143,8 @@ void apply_environment(EngineOptions* o) {
     }
   if (!o->adaptive_given)
     if (const auto v = os::env_bool(env::kAdaptive)) o->adaptive = *v;
+  if (!o->learn_costs_given)
+    if (const auto v = os::env_bool(env::kLearnCosts)) o->learn_costs = *v;
 }
 
 namespace {
@@ -400,6 +402,22 @@ bool Engine::build_and_calibrate_plans(double* t_plans, double* t_rounds, std::s
   } else {
     spec::warm_rounds(api_, bm_, plans_.prefill, plans_.rounds, prompt);
   }
+  // The costs the controller chooses by from here: these timings, then what the rounds read teach (RoundCosts),
+  // where they choose (one plan and no lookup: nothing timed, nothing to learn).  A drafter's wider chain costs no
+  // less than its next narrower one; so does a lookup round of more drafts (given_widths ascend).
+  costs_chosen_ = plans_.widths.size() > 1 || !plans_.given.empty();
+  std::vector<int> narrower(plans_.widths.size(), -1), lookup_narrower(lookup_ms_.size(), -1);
+  for (size_t i = 0; i < plans_.widths.size(); ++i) {
+    const int d = plans_.drafters[i];
+    if (d < 0 || plans_.drafter_trees[i]) continue;
+    for (size_t j = 0; j < plans_.widths.size(); ++j)
+      if (plans_.drafters[j] == d && !plans_.drafter_trees[j] && plans_.widths[j] < plans_.widths[i] &&
+          (narrower[i] < 0 || plans_.widths[j] > plans_.widths[size_t(narrower[i])]))
+        narrower[i] = int(j);
+  }
+  for (size_t k = 1; k < lookup_narrower.size(); ++k) lookup_narrower[k] = int(k - 1);
+  round_costs_.reset(round_ms_, &round_ms_per_token_, round_ms_at_, &narrower);
+  lookup_costs_.reset(lookup_ms_, nullptr, round_ms_at_, &lookup_narrower);
   *t_rounds = os::now_ms();
   return true;
 }

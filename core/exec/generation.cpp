@@ -19,9 +19,13 @@ Generation::Generation(Session* s, const GenerateRequest& req, TextSink sink)
     : s_(s), e_(s->engine()), api_(s->engine()->api()), req_(req),
       reply_(s->engine()->tokenizer(), req.stop, std::move(sink)) {
   s_->set_in_use(true);
+  e_->generation_began();
 }
 
-Generation::~Generation() { s_->set_in_use(false); }
+Generation::~Generation() {
+  e_->generation_ended();
+  s_->set_in_use(false);
+}
 
 bool Generation::device_ready() const {
   return api_->ready(s_->seq()) != 0;  // an error counts: the call that follows reports it
@@ -402,7 +406,7 @@ bool Generation::finish_prefill() {
   if (!rounds.configured())
     rounds.configure(&e_->widths(), &e_->round_drafters(), &e_->round_ms(), &e_->lookup_widths(), &e_->round_trunks(),
                      &e_->lookup_ms(), &e_->adaptive_checkpoints(), &e_->round_ms_per_token(), e_->round_ms_at(),
-                     e_->round_tokens());
+                     e_->round_tokens(), e_->round_costs(), e_->lookup_costs());
   // The reference for grammar tests masks every round's first token, one round at a time.
   every_ = req_.grammar && req_.grammar_reference;
   const std::vector<size_t>& cycle = e_->options().cycle;
@@ -413,6 +417,7 @@ bool Generation::finish_prefill() {
   const bool adaptive = e_->options().adaptive && !every_ && g_.accept_min_p <= 0.f && g_.accept_typical <= 0.f;
   rounds.begin(e_->options().lookup && !every_ && cycle.empty(), wide, adaptive);
   in_flight_ = 0;
+  read_ms_ = 0;
   launching_ = more;
   if (s_->disk_cache()) next_disk_stage_ = (int64_t(n_) / kAnchorTokens + 1) * kAnchorTokens;
   phase_ = Phase::kRounds;
@@ -450,13 +455,30 @@ bool Generation::launch(const RoundChoice& round, bool masked) {
   flyx_gen_params params{};
   flyx_plan* plan = nullptr;
   prepare_round(round, masked, &params, &plan);
+  const double launching = os::now_ms();  // the launch's own time is the round's (a backend may run it there)
   if (api_->launch(plan, s_->seq(), &params) != 0) {
     fail(std::string("launch: ") + api_->last_error(), true);
     return false;
   }
+  launch_ms_[in_flight_] = alone_ && !batched_ ? launching : kUntimed;
+  launch_at_[in_flight_] = static_cast<int>(s_->tokens().size());
+  launch_idle_[in_flight_] = in_flight_ == 0;
+  launch_epoch_[in_flight_] = e_->generation_epoch();
   launched_[in_flight_++] = round;
   result_.adaptive_rounds += params.stop_policy != nullptr;  // as launched(): the adaptive plan's rounds
   return true;
+}
+
+// The plan whose work a round's result is: its own; an adaptive round's, its drafter's chain of the drafts it drafted
+// before it stopped (-1: none such, or none drafted).
+long Generation::ran_as(const RoundChoice& was, const flyx_round_result& r) const {
+  if (!was.adaptive) return long(was.index);
+  const auto& ws = e_->widths();
+  const auto& ds = e_->round_drafters();
+  const auto& tr = e_->round_trees();
+  for (size_t i = 0; r.n_drafts > 0 && i < ws.size(); ++i)
+    if (ds[i] == was.drafter && ws[i] == r.n_drafts && !tr[i]) return long(i);
+  return -1;
 }
 
 bool Generation::round_ready() const {
@@ -515,11 +537,34 @@ bool Generation::round(bool wait, bool* busy) {
     return true;
   }
 
+  // What the round cost, where the clock tells it (RoundCosts::observe), the device this generation's alone from its
+  // launch on: launched behind the round read last (two in flight), the time since that read, its share of the
+  // reply's time with the host's part; launched with none in flight (a lookup round, and every round while lookup
+  // drafts: one in flight), the time from its launch.  Not the first round read since the rounds began or the device
+  // was shared (read_ms_ 0): what ran before may still have been on the device; nor where another generation of the
+  // engine's began or ended since its launch, or runs now (sessions generating at once through the C API).
+  const double launched_at = launch_ms_[0];
+  const bool behind = read_ms_ > 0 && launched_at < read_ms_;
+  const bool idle = read_ms_ > 0 && launch_idle_[0] && launched_at < kUntimed;
+  const bool timed = alone_ && !batched_ && (behind || idle);
+  const uint64_t epoch_at_launch = launch_epoch_[0];
   flyx_round_result r{};
   if (api_->read(s_->seq(), &r) != 0) return fail(std::string("read: ") + api_->last_error(), true);
+  const double read_at = os::now_ms();
   const RoundChoice was = launched_[0];
+  const int ran_at = launch_at_[0];
   std::copy(launched_ + 1, launched_ + in_flight_, launched_);
+  std::copy(launch_ms_ + 1, launch_ms_ + in_flight_, launch_ms_);
+  std::copy(launch_at_ + 1, launch_at_ + in_flight_, launch_at_);
+  std::copy(launch_idle_ + 1, launch_idle_ + in_flight_, launch_idle_);
+  std::copy(launch_epoch_ + 1, launch_epoch_ + in_flight_, launch_epoch_);
+  const bool unshared = e_->generations() == 1 && e_->generation_epoch() == epoch_at_launch;
   --in_flight_;
+  const long ran = was.lookup ? long(was.index) : ran_as(was, r);
+  if (timed && unshared && r.n_tokens > 0 && ran >= 0)
+    if (RoundCosts* costs = was.lookup ? e_->lookup_costs() : e_->round_costs())
+      costs->observe(size_t(ran), ran_at, read_at - (behind ? read_ms_ : launched_at));
+  read_ms_ = read_at;
   if (r.n_tokens > 0) {
     s_->record(r, was.lookup ? -1 : static_cast<int>(was.index));
     flyx_usage& u = result_.usage;
@@ -536,17 +581,7 @@ bool Generation::round(bool wait, bool* busy) {
         if (result_.drafter_rounds.size() <= size_t(was.drafter)) result_.drafter_rounds.resize(size_t(was.drafter) + 1);
         ++result_.drafter_rounds[size_t(was.drafter)];
       }
-      size_t choice_idx = was.index;
-      if (was.adaptive && r.n_drafts > 0) {
-        const auto& ws = e_->widths();
-        const auto& ds = e_->round_drafters();
-        const auto& tr = e_->round_trees();
-        for (size_t i = 0; i < ws.size(); ++i)
-          if (ds[i] == was.drafter && ws[i] == r.n_drafts && !tr[i]) {
-            choice_idx = i;
-            break;
-          }
-      }
+      const size_t choice_idx = ran >= 0 ? size_t(ran) : was.index;
       if (result_.round_choices.size() <= choice_idx) {
         result_.round_choices.resize(choice_idx + 1);
         result_.round_accepted.resize(choice_idx + 1);

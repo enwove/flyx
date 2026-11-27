@@ -306,6 +306,83 @@ void test_empty_history_text_tokenize(const char* model, const flyx_backend_api*
   check(got == expected, "Session::tokenize() does not prepend empty-text history tokens to a new text prompt");
 }
 
+// The costs the rounds read teach (Engine::round_costs, lookup_costs): text that repeats, so that rounds draft by
+// lookup, one in flight (each launched with none ahead of it, timed from its launch), and MTP's rounds besides.
+void test_round_costs_learned(const char* model, const flyx_backend_api* cpu) {
+  g_cpu = cpu;
+  flyx_test_delegate(cpu);
+  EngineOptions eo;
+  eo.backend = "test-host-kv";
+  eo.max_ctx = 512;
+  eo.speculative = true;
+  eo.drafter = "mtp";
+  eo.lookup = true;
+  Engine engine;
+  std::string err;
+  if (!engine.load(model, eo, &err)) {
+    check(false, "load engine for learned costs: " + err);
+    return;
+  }
+  Session s(&engine);
+  if (!s.init(&err)) {
+    check(false, "session init: " + err);
+    return;
+  }
+  GenerateRequest rq;
+  for (int k = 0; k < 12; ++k) {
+    const auto ids = engine.tokenizer().encode("one two three four five six seven eight ");
+    rq.prompt.insert(rq.prompt.end(), ids.begin(), ids.end());
+  }
+  rq.max_new_tokens = 160;
+  rq.ignore_eos = true;
+  const int at = int(rq.prompt.size()) + rq.max_new_tokens;
+  auto costs_of = [&](const RoundCosts* costs) {
+    std::vector<double> c;
+    for (size_t k = 0; costs && k < costs->size(); ++k) c.push_back(costs->cost(k, at));
+    return c;
+  };
+  const std::vector<double> lookup_before = costs_of(engine.lookup_costs()), before = costs_of(engine.round_costs());
+  GenerateResult res;
+  const int rc = generate(s, rq, [](std::string_view, const int32_t*, int) { return true; }, &res, &err);
+  check(rc == 0 && res.lookup_rounds > 1, "rounds drafted by lookup: " + std::to_string(res.lookup_rounds));
+  auto list = [](const std::vector<double>& v) {
+    std::string t;
+    for (double x : v) t += (t.empty() ? "" : " ") + std::to_string(x);
+    return t;
+  };
+  check(!lookup_before.empty() && costs_of(engine.lookup_costs()) != lookup_before,
+        "a lookup round's cost learned from the rounds read (launched with none in flight): " + list(lookup_before) +
+            " -> " + list(costs_of(engine.lookup_costs())));
+  check(!before.empty() && costs_of(engine.round_costs()) != before, "a round's cost learned from the rounds read");
+
+  // Two sessions of the engine generating at once (as the C API lets threads do, here in turn on one): neither's
+  // rounds are timed, the other's work in its clock.
+  Session a(&engine), b(&engine);
+  if (!a.init(&err) || !b.init(&err)) {
+    check(false, "two sessions: " + err);
+    return;
+  }
+  const std::vector<double> lookup_shared = costs_of(engine.lookup_costs()), shared = costs_of(engine.round_costs());
+  {
+    TextSink none = [](std::string_view, const int32_t*, int) { return true; };
+    Generation ga(&a, rq, none), gb(&b, rq, none);
+    check(engine.generations() == 2, "two generations under way");
+    bool a_done = false, b_done = false;
+    while (!a_done || !b_done) {
+      if (!a_done) a_done = ga.advance(true) == Generation::Progress::kDone;
+      if (!b_done) b_done = gb.advance(true) == Generation::Progress::kDone;
+    }
+    check(!ga.failed() && !gb.failed() && ga.result().usage.new_tokens > 0 &&
+              gb.result().usage.new_tokens == ga.result().usage.new_tokens,
+          "both generate: " + std::to_string(ga.result().usage.new_tokens) + " and " +
+              std::to_string(gb.result().usage.new_tokens) + " tokens" + (ga.failed() ? ", " + ga.error() : "") +
+              (gb.failed() ? ", " + gb.error() : ""));
+  }
+  check(engine.generations() == 0, "none under way after");
+  check(costs_of(engine.round_costs()) == shared && costs_of(engine.lookup_costs()) == lookup_shared,
+        "two generations at once: no round's cost learned");
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -327,5 +404,6 @@ int main(int argc, char** argv) {
   test_grammar_rollback_near_max_ctx(argv[1], cpu);
   test_prepare_failure_resets_session(argv[1], cpu);
   test_empty_history_text_tokenize(argv[1], cpu);
+  test_round_costs_learned(argv[1], cpu);
   return flyx::test::finish("generation_test");
 }
