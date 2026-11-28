@@ -110,6 +110,18 @@ std::string model_drafters_str(const interfaces::Model& m) {
   return out;
 }
 
+std::string nvfp4_adjustment(const interfaces::Model& m) {
+  const char* title = nullptr;
+  int companions = 0;
+  for (int d = 0; d < m.drafters(); ++d) {
+    if (std::string_view(m.drafter_name(d)) == "mtp") continue;
+    ++companions;
+    title = m.drafter_title(d);
+  }
+  const std::string subject = companions == 1 ? std::string(title) + " drafter" : "Drafter";
+  return subject + " weights quantized to NVFP4 (4-bit) to save VRAM";
+}
+
 }  // namespace
 
 Engine::~Engine() {
@@ -832,8 +844,7 @@ bool Engine::load(const std::string& path, const EngineOptions& opt, std::string
     if (req_dw_valid && cur_dw != interfaces::DraftWeightsMode::kNvfp4 && est && meaningful_draft_savings(*est) &&
         (!comfort_only || req_dw == interfaces::DraftWeightsMode::kAuto)) {
       cur_dw = interfaces::DraftWeightsMode::kNvfp4;
-      const std::string detail = orig_drafters_str + " drafter weights quantized to NVFP4 (4-bit) to save VRAM";
-      upsert_adj("draft_weights", interfaces::draft_weights_name(req_dw), "nvfp4", detail);
+      upsert_adj("draft_weights", interfaces::draft_weights_name(req_dw), "nvfp4", nvfp4_adjustment(*model_));
       return true;
     }
     if (comfort_only || drafter_named) return false;
@@ -869,8 +880,7 @@ bool Engine::load(const std::string& path, const EngineOptions& opt, std::string
         erase_adj("draft_weights");
         cur_dw = req_dw;
       } else if (cur_dw == interfaces::DraftWeightsMode::kNvfp4) {
-        upsert_adj("draft_weights", interfaces::draft_weights_name(req_dw), "nvfp4",
-                   "Drafter weights quantized to NVFP4 (4-bit) to save VRAM");
+        upsert_adj("draft_weights", interfaces::draft_weights_name(req_dw), "nvfp4", nvfp4_adjustment(*model_));
       }
       upsert_adj("drafter", orig_drafters_str, opt_.drafter,
                  skipped + " drafter skipped due to tight VRAM; running with " + model_->drafter_title(0));

@@ -504,8 +504,9 @@ int main(int argc, char** argv) {
     check(std::string(e.drafter()) == "mtp+dflash2" && e.draft_weights() == "nvfp4",
           "active config reports mtp+dflash2 with draft_weights=nvfp4");
     check(e.load_adjustments().size() == 1 && e.load_adjustments()[0].kind == "draft_weights" &&
-              e.load_adjustments()[0].to == "nvfp4",
-          "single draft_weights -> nvfp4 adjustment reported");
+              e.load_adjustments()[0].to == "nvfp4" &&
+              e.load_adjustments()[0].detail == "DFlash2 drafter weights quantized to NVFP4 (4-bit) to save VRAM",
+          "single draft_weights -> nvfp4 adjustment reported with its dashboard translation key");
     check(g_open_calls == 2 && g_seen_dw.back() == FLYX_DRAFT_WEIGHTS_NVFP4,
           "second open call passed typed FLYX_DRAFT_WEIGHTS_NVFP4");
     check(tokens(e) == ref_tokens, "nvfp4-degraded mtp+dflash2 matches plain greedy tokens");
