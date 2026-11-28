@@ -125,15 +125,15 @@ std::string nvfp4_adjustment(const interfaces::Model& m) {
 }  // namespace
 
 // The settings measured best for a model file (its header's "recommended": flyx pack --recommended), under every other
-// word: its drafter when neither the caller nor the environment named one, its backend options before theirs (a key
-// they give again is theirs).  Keys of another type are read as absent.
+// word: its drafter when neither the caller nor the environment named one (nor a drafter file to draft with), its
+// backend options before theirs (a key they give again is theirs).  Keys of another type are read as absent.
 void apply_recommended(const nlohmann::json& h, EngineOptions* o) {
   const auto rec = h.is_object() ? h.find("recommended") : h.end();
   if (!h.is_object() || rec == h.end() || !rec->is_object()) return;
   std::string applied;
   const auto drafter = rec->find("drafter");
   interfaces::DrafterMode mode;
-  if (o->speculative && o->drafter.empty() && drafter != rec->end() && drafter->is_string() &&
+  if (o->speculative && o->drafter.empty() && o->drafter_files.empty() && drafter != rec->end() && drafter->is_string() &&
       interfaces::parse_drafter_mode(drafter->get_ref<const std::string&>(), &mode)) {
     o->drafter = drafter->get<std::string>();
     applied += " drafter " + o->drafter;

@@ -128,11 +128,20 @@ bool write_packed(const ModelFile& file, const nlohmann::json& extra, const std:
       at += piece.bytes.size();
     }
     zero_to(data_start + data.end);
-    if (!f.flush()) return *err = path + ": writing " + os::from_path(staged) + " failed", false;
+    f.close();
+    if (!f) {
+      std::error_code ignored;
+      std::filesystem::remove(staged, ignored);  // a disk that filled leaves no half file behind
+      return *err = path + ": writing " + os::from_path(staged) + " failed", false;
+    }
   }
   std::error_code ec;
   std::filesystem::rename(staged, target, ec);
-  if (ec) return *err = path + ": " + ec.message(), false;
+  if (ec) {
+    std::error_code ignored;
+    std::filesystem::remove(staged, ignored);
+    return *err = path + ": " + ec.message(), false;
+  }
   return true;
 }
 

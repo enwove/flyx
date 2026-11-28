@@ -146,7 +146,7 @@ flyx pack unsloth/Qwen3.8-27B-GGUF:UD-IQ3_XXS --drafter-file z-lab/Qwen3.8-27B-D
   --recommended recommended.json -o Qwen3.8-27B-UD-IQ3_XXS.flyx
 ```
 
-`--recommended FILE` puts a JSON object in the header's `"recommended"`: `"drafter"` (a `--drafter` word) is the drafter used when neither `--drafter` nor `FLYX_DRAFTER` names one, and `"backend_options"` go before the environment's and the command line's (a key given again is theirs); other keys (the measurements behind them) are kept for the reader. `flyx pack` opens the model with that drafter before writing, and records the files it packed with their SHA-256 (`"packed"`). The file is `.flyx` format 2 requiring `"gguf"`: a build that does not read packed files refuses it. A file packed from a model already packed, a LoRA adapter (`--lora` stays a run's choice) and a model not read from a GGUF are refused.
+`--recommended FILE` puts a JSON object in the header's `"recommended"`: `"drafter"` (a `--drafter` word) is the drafter used when neither `--drafter`, `FLYX_DRAFTER` nor a `--drafter-file` names one, and `"backend_options"` go before the environment's and the command line's (a key given again is theirs); other keys (the measurements behind them) are kept for the reader. `flyx pack` opens the model with that drafter before writing, and records the files it packed with their SHA-256 (`"packed"`). The file is `.flyx` format 2 requiring `"gguf"`: a build that does not read packed files refuses it. A file packed from a model already packed, a LoRA adapter (`--lora` stays a run's choice) and a model not read from a GGUF are refused.
 
 > **WSL2 note:** Store models on the Linux filesystem (`~/models`), not `/mnt/c`.
 
