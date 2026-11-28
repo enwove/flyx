@@ -130,7 +130,7 @@ docker build -f packaging/Dockerfile.server -t flyx:local .                     
 docker build -f packaging/Dockerfile.server -t flyx:local --build-arg FLYX_CUDA_ARCHS=89-real .    # one GPU: a fifth of the compiles
 docker build -f packaging/Dockerfile.server -t flyx:local --build-arg FLYX_CUDA=OFF .              # the float64 reference backend
 
-docker run --gpus all --init -p 127.0.0.1:8080:8080 -v flyx-data:/data flyx:local                  # dashboard on http://127.0.0.1:8080
+docker run --gpus all --init -p 127.0.0.1:8080:8080 -v flyx-data:/data flyx:local                  # the log prints the URL to open
 docker run --gpus all --init -p 8080:8080 -e FLYX_API_KEY=secret -v flyx-data:/data flyx:local     # published to the network
 ```
 
@@ -149,21 +149,21 @@ curl http://127.0.0.1:8080/health
 
 The compose file publishes `127.0.0.1:8080` and sets `init: true`, so the two `docker run` lines above are what you write by hand to change one of those choices.
 
-`packaging/docker-entrypoint.sh` starts `flyx serve` from the environment, so a container needs no arguments; arguments given to `docker run` replace that line and keep the same binding (a port published by Docker reaches nothing bound to the container's own loopback). It binds `0.0.0.0` always, which is why serving a port others can reach means setting `FLYX_API_KEY`. Two consequences of serving through a published port are worth knowing before the first `403`:
+`packaging/docker-entrypoint.sh` starts `flyx serve` from the environment, so a container needs no arguments; arguments given to `docker run` replace that line and keep the same binding (a port published by Docker reaches nothing bound to the container's own loopback). It binds `0.0.0.0` always and it supplies a key when nothing names one, which is what serving through a published port takes. Two consequences of that serving are worth knowing before the first `403`:
 
 - a request that arrives through the port carries the bridge's gateway address rather than localhost, so the endpoints that fetch and load models answer `loading models is for this machine (use --api-key KEY, or --no-auth on a trusted LAN)` even from the machine itself;
 - a browser names the machine in its `Host` header, and inside a container that name is none of the addresses the server trusts, so the dashboard's own reads are refused and the page reports `GET /v1/telemetry answered HTTP 403` under a `No model loaded` panel.
 
-With a key set, open the page once as `http://<host>:<port>/#key=KEY`: the dashboard takes the key from the address's fragment, remembers it, and sends `Authorization: Bearer` on every call after that. That is the answer under bridge networking; `--no-auth` and the dashboard's remote-management toggle ([server.md](server.md)) are not, because they still check `Host` against the container's own addresses — they are the keyless answer for `network_mode: host`, where the container has the machine's addresses and a LAN page's `Host` matches one of them.
+One key answers both. `FLYX_API_KEY` names it; with nothing set, the entrypoint generates one, keeps it in the volume as `docker-api-key` so a restart keeps the address a browser has bookmarked, and prints what to open — `flyx-server: the dashboard at http://127.0.0.1:8080/#key=…`. Open that address once: the dashboard takes the key from the fragment, remembers it, and sends `Authorization: Bearer` on every call after that. `--no-auth` (in `FLYX_ARGS` or in the container's arguments) declines the generated key, and the dashboard's remote-management toggle ([server.md](server.md)) opens management to the LAN; neither is an answer under bridge networking, because both still check `Host` against the container's own addresses — they are the keyless answer for `network_mode: host`, where the container has the machine's addresses and a LAN page's `Host` matches one of them.
 
 | Variable | Effect |
 |---|---|
-| `FLYX_MODEL` | Served at startup: a Hugging Face name (`org/repo:QUANT`, fetched into the cache) or a file under `/models`. Unset starts unloaded; the dashboard then loads one. |
+| `FLYX_MODEL` | Served at startup: a Hugging Face name (`org/repo:QUANT`, fetched into the cache) or a file under `/models` by its full path. Unset starts unloaded; the dashboard then loads one. |
 | `FLYX_ARGS` | More `flyx serve` flags, split on whitespace, no shell evaluation ([server.md](server.md) lists them). A value with a space in it belongs in the container's arguments instead. |
 | `FLYX_PORT` | The port the server listens on and Compose publishes. Default 8080. |
 | `FLYX_HOST` | The address the server binds *inside* the container. Default `0.0.0.0`, which a port mapping needs; it does not limit what the host publishes. |
 | `FLYX_PUBLISH_ADDR` | Compose only: the host address the port is published on. Default `127.0.0.1`; `0.0.0.0` serves the network. |
-| `FLYX_API_KEY` | Requires `Authorization: Bearer <key>`; see the two consequences above. |
+| `FLYX_API_KEY` | Names the key the API and the dashboard use. Unset (and no `--no-auth`), the entrypoint generates one, keeps it in the volume as `docker-api-key`, and prints the URL with it. |
 | `GPU_DEVICE` | Compose only: the card to serve, its number as `nvidia-smi` shows it, reserved by `device_ids`. Default `0`. |
 | `CUDA_VISIBLE_DEVICES` | With `count: all` (every card visible to the container) this picks the card; with `device_ids` the container sees one card and the variable must name it `0`, so the compose file leaves it alone. |
 | `HF_TOKEN`, `HF_ENDPOINT` | Gated repositories; a mirror's endpoint. |

@@ -15,9 +15,10 @@
 # Hugging Face name opens at run time.  That is why the image is 218 MB (52 MB of binaries) on two architectures where
 # a CUDA server image that links dynamically and ships the toolkit is gigabytes.
 #
-# Running it, the dashboard on http://127.0.0.1:8080.  --init forwards signals to PID 1 during a long model load, and
-# the port is published on loopback: publishing it on the network means a key, because a request that arrives through
-# a published port is not localhost to the server (docs/building.md's Docker section).
+# Running it: the entrypoint prints the address to open, with the key the server runs under — FLYX_API_KEY, or one it
+# generates and keeps in the volume.  A key is what a published port takes: a request that arrives through one is not
+# localhost to the server, and a keyless server refuses the dashboard's own reads (docs/building.md's Docker section).
+# --init forwards signals to PID 1 during a long model load.
 #
 #   docker run --gpus all --init -p 127.0.0.1:8080:8080 -v flyx-data:/data flyx:local
 #   docker run --gpus all --init -p 8080:8080 -e FLYX_API_KEY=secret -v flyx-data:/data flyx:local

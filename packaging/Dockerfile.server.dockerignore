@@ -4,9 +4,10 @@
 # in preference to a root .dockerignore, which is what keeps packaging/package_linux_docker.sh working — that script
 # builds packaging/Dockerfile.linux from the same directory, and its context needs tests/requirements.txt.
 #
-# What the server image never reads. A pattern without a slash matches at every depth, so `**/` is only needed where
-# a name has to be excluded below the context root as well: the model folders users point MODELS_DIR at, the nested
-# .env this file's compose setup keeps its FLYX_API_KEY and HF_TOKEN in.
+# What the server image never reads. Unlike .gitignore, a .dockerignore pattern is anchored at the context root:
+# `.env` excludes ./.env and nothing deeper (measured — a nested .env survives that pattern), so the names below
+# that have to reach into the tree carry `**/`: packaging/.env is where the compose setup keeps FLYX_API_KEY and
+# HF_TOKEN, and Compose's default MODELS_DIR of ./data/models lands inside the context as packaging/data/.
 
 # build trees, packages, logs
 build/

@@ -159,13 +159,13 @@ print(reply["content"])
 
 ```sh
 docker build -f packaging/Dockerfile.server -t flyx:local .
-docker run --gpus all --init -p 127.0.0.1:8080:8080 -v flyx-data:/data flyx:local    # dashboard on http://127.0.0.1:8080
+docker run --gpus all --init -p 127.0.0.1:8080:8080 -v flyx-data:/data flyx:local    # the log prints the URL to open
 docker run --gpus all --init -p 8080:8080 -e FLYX_API_KEY=secret -v flyx-data:/data flyx:local
 
 docker compose -f packaging/docker-compose.yml up -d --build           # the same, with volumes and a health probe
 ```
 
-The image is the release build of this checkout — 218 MB for two GPU architectures (`86-real;89-real`, 12 minutes on a 16-job host), no CUDA toolkit in it. The binary needs no Docker: this is the path for a pinned deployment, a card per container. Publish the port on `127.0.0.1` and reach it through a tunnel, or publish it on the network with a key: through a published port the dashboard needs `FLYX_API_KEY` too, and opens once as `http://<host>:8080/#key=KEY`. [docs/building.md's Docker section](docs/building.md#5-docker).
+The image is the release build of this checkout — 218 MB for two GPU architectures (`86-real;89-real`, 12 minutes on a 16-job host), no CUDA toolkit in it. The binary needs no Docker: this is the path for a pinned deployment, a card per container. The container serves with a key — `FLYX_API_KEY`, or one `docker-entrypoint.sh` generates, keeps in the volume and prints as `http://127.0.0.1:8080/#key=…` — because a request that arrives through a published port is not localhost to the server, and a keyless one there refuses the dashboard's own reads. [docs/building.md's Docker section](docs/building.md#5-docker).
 
 </details>
 
