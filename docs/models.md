@@ -53,7 +53,7 @@ By model:
 | Llama (MiniCPM5-1B) | `.flyx` `BF16` or `NVFP4` | as Qwen3's `.flyx`; binary16 K/V | `exact`, `nvfp4/bf16` |
 | Inkling-2 | GGUF | `q8`; its `F32` matrices as above | `exact` |
 | gpt-oss | GGUF (`MXFP4` experts) | `q8` | `bf16`, `mxfp8`, `mxfp8/q8`, `exact` |
-| Gemma 4 (12B, 31B, 26B-A4B) | GGUF (`BF16`, `Q*`, `MXFP4` experts); `.flyx` `BF16` or `NVFP4` (NVIDIA's: `NVFP4` MLPs, bf16 attention) | GGUF `q8`; `NVFP4` files `nvfp4/bf16` (Blackwell); binary16 K/V; its assistant's linears `NVFP4` beside a float target (`draft_weights`) | `exact`, `nvfp4/bf16`; `bf16`, `mxfp8`, `mxfp8/q8` for `MXFP4` experts |
+| Gemma 4 (12B, 31B, 26B-A4B) | GGUF (`BF16`, `Q*`, `MXFP4` experts, GGML `NVFP4` experts as llama.cpp converts NVIDIA's 26B-A4B); `.flyx` `BF16` or `NVFP4` (NVIDIA's: `NVFP4` MLPs, bf16 attention) | GGUF `q8`; `NVFP4` files `nvfp4/bf16` (Blackwell); binary16 K/V; its assistant's linears `NVFP4` beside a float target (`draft_weights`) | `exact`, `nvfp4/bf16`; `bf16`, `mxfp8`, `mxfp8/q8` for `MXFP4` experts |
 
 ---
 

@@ -120,7 +120,11 @@ class WeightLoader {
   Lin lin_stack(const std::vector<int>& ws, int* rows_out = nullptr, const std::vector<RowOrder>& orders = {});
   // A 3D stacked MoE expert weight [E, N, K] (NVFP4 with optional per-expert scale2, packed GGML blocks, or bf16).
   ExpertMat expert_mat(int w);
-  ExpertMat expert_mat(const std::vector<int>& ws);  // [E, N_i, K] weights stacked expert by expert
+  // [E, N_i, K] weights stacked expert by expert. first_scales: parts with per-expert scales of their own are stacked
+  // under the first's, the caller taking the others' ratios to them elsewhere.
+  ExpertMat expert_mat(const std::vector<int>& ws, bool first_scales = false);
+  // A 3D weight's per-expert scales: [E], 1 where it has none.
+  std::vector<float> expert_scales(int w) const;
   // Drafter linear with zero-spike GPU streaming quantization directly into NVFP4 or Q8_0 when requested.
   Lin lin_quant(int w, DraftQuant q) { return lin_stack_quant({w}, q); }
   Lin lin_stack_quant(const std::vector<int>& ws, DraftQuant q, int* rows_out = nullptr,

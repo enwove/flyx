@@ -15,7 +15,8 @@
 * the tiny Qwen3.5 with its matrices quantized (tiny_q8.gguf: the block types
   of 32 weights, mixed, as its matrices are 64 and 128 wide)
 * a tiny gpt-oss in MXFP4 and Q8_0 and the same in float32, with transformers' tokens for them (tiny_gpt_oss.py)
-* a tiny Gemma 4 in Q8_0 and the same in float32, with transformers' tokens for them (tiny_gemma4.py)
+* a tiny Gemma 4 in Q8_0 and the same in float32, with experts too (in Q8_0, float32 and GGML's NVFP4), with
+  transformers' tokens for them (tiny_gemma4.py)
 * a small tokenizer of Gemma 4's kind (SentencePiece's BPE) with tokenizers' ids (gemma4_tokenizer.py)
 """
 from __future__ import annotations
@@ -595,6 +596,7 @@ def main(out):
     tiny_gemma4.write(out, quant=False, stem="gemma4_f32")
     tiny_gemma4.write(out, stem="gemma4_moe", moe=True)
     tiny_gemma4.write(out, quant=False, stem="gemma4_moe_f32", moe=True)
+    tiny_gemma4.write(out, stem="gemma4_moe_nvfp4", moe=True, nvfp4=nvfp4_blocks)
     gemma4_tokenizer.write(out)
     print("wrote GGUF model, tokenizer and independent quantization fixtures")
 

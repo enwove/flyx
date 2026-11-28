@@ -9,6 +9,7 @@
 #include "ops/rope/ref.h"
 
 #include <algorithm>
+#include <cmath>
 #include <cstring>
 #include <optional>
 
@@ -843,9 +844,24 @@ MoeBlock moe(WeightLoader& L, const flyx_moe_block& b, const StateMap& sm) {
   if (b.router_logit_b >= 0) f.router_logit_b = L.vec(b.router_logit_b);
   expect((b.gate_up >= 0) != (b.gate >= 0) && (b.gate >= 0) == (b.up >= 0),
          "an MoE block names its gate and up fused or apart, one way");
-  f.gate_up = b.gate_up >= 0 ? L.expert_mat(b.gate_up) : L.expert_mat(std::vector<int>{b.gate, b.up});
-  f.down = L.expert_mat(b.down);
   const size_t E = size_t(b.n_experts), I = size_t(b.inter), H = size_t(b.hidden);
+  // Gate and up apart with per-expert scales of their own (GGML's NVFP4 experts): stacked under gate's, each expert's
+  // weight times up's over gate's, as SiLU(gate) up and GELU(gate) up are linear in up.
+  std::vector<float> up_over_gate;
+  if (b.gate_up < 0) {
+    const std::vector<float> sg = L.expert_scales(b.gate), su = L.expert_scales(b.up);
+    if (sg != su) {
+      expect((b.act == FLYX_MOE_SWIGLU || b.act == FLYX_MOE_GELU_TANH) && b.gate_b < 0 && b.up_b < 0,
+             "an MoE block's gate and up with scales apart, under an activation not linear in up");
+      up_over_gate.resize(E);
+      for (size_t e = 0; e < E; ++e) {
+        expect(sg[e] > 0.f && std::isfinite(su[e] / sg[e]), "an MoE block's gate scale is not positive");
+        up_over_gate[e] = su[e] / sg[e];
+      }
+    }
+  }
+  f.gate_up = b.gate_up >= 0 ? L.expert_mat(b.gate_up) : L.expert_mat(std::vector<int>{b.gate, b.up}, true);
+  f.down = L.expert_mat(b.down);
   if (b.gate_b >= 0 || b.up_b >= 0) {  // an expert's gate then up biases, as its fused rows
     expect(b.gate_up < 0, "biases on an MoE block's fused gate|up");
     std::vector<float> gu(E * 2 * I, 0.f);
@@ -904,9 +920,14 @@ MoeBlock moe(WeightLoader& L, const flyx_moe_block& b, const StateMap& sm) {
     CK(cudaMemcpy(f.router_in, w.data(), H * sizeof(float), cudaMemcpyHostToDevice));
     f.router_eps = float(b.router_norm.eps);
   }
-  if (b.has_expert_scale) {
-    expect(L.host_f32(b.expert_scale).size() == E, "an MoE block's expert scales are not [E]");
-    f.expert_scale = L.vec(b.expert_scale);
+  if (b.has_expert_scale || !up_over_gate.empty()) {
+    std::vector<float> s(E, 1.f);
+    if (b.has_expert_scale) {
+      s = L.host_f32(b.expert_scale);
+      expect(s.size() == E, "an MoE block's expert scales are not [E]");
+    }
+    for (size_t e = 0; e < up_over_gate.size(); ++e) s[e] *= up_over_gate[e];
+    f.expert_scale = L.put(s);
   }
   return f;
 }

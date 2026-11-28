@@ -791,7 +791,18 @@ ExpertMat WeightLoader::expert_mat(int w) { return expert_mat(std::vector<int>{w
 
 // Weights [E, N_i, K] of one dtype stacked expert by expert: expert e's rows of the first, then its rows of the
 // next (gpt-oss's gate and up, stored apart, as the fused [E, 2 I, K] the kernels read).
-ExpertMat WeightLoader::expert_mat(const std::vector<int>& ws) {
+std::vector<float> WeightLoader::expert_scales(int w) const {
+  const size_t E = size_t(t(w)->shape[0]);
+  std::vector<float> s(E, 1.f);
+  if (const auto* s2 = weights_[w].scale2) {
+    const size_t n = numel(s2);
+    if (n != E && n != 1) throw std::runtime_error(std::string(t(w)->name) + ": unexpected per-expert scale length");
+    for (size_t e = 0; e < E; ++e) s[e] = static_cast<float>(flyx::ops::load(s2, n == 1 ? 0 : e));
+  }
+  return s;
+}
+
+ExpertMat WeightLoader::expert_mat(const std::vector<int>& ws, bool first_scales) {
   if (auto it = experts_.find(ws); it != experts_.end()) return it->second;
   const int w = ws.front();
   const auto* v = t(w);
@@ -802,7 +813,7 @@ ExpertMat WeightLoader::expert_mat(const std::vector<int>& ws) {
   for (int x : ws) {
     const auto* u = t(x);
     if (u->ndim != 3 || u->dtype != v->dtype || size_t(u->shape[0]) != E || size_t(u->shape[2]) != K ||
-        bool(weights_[x].scale2) != bool(weights_[w].scale2) || (ws.size() > 1 && weights_[x].scale2))
+        bool(weights_[x].scale2) != bool(weights_[w].scale2) || (ws.size() > 1 && weights_[x].scale2 && !first_scales))
       throw std::runtime_error(std::string(u->name) + ": experts stacked with another dtype, shape or scale");
     part_rows.push_back(size_t(u->shape[1]));
     N += part_rows.back();
@@ -823,19 +834,9 @@ ExpertMat WeightLoader::expert_mat(const std::vector<int>& ws) {
 
   // Optional per-expert F32 scale tensor (present on GGML NVFP4 and on requantized MoE experts in Unsloth GGUFs).
   auto upload_expert_scales = [&]() -> float* {
-    const auto* s2 = weights_[w].scale2;
     if (!layout.expert_scales) return nullptr;
     float* rs_dev = m_->alloc<float>(layout.expert_scales);
-    std::vector<float> rs_host(E, 1.f);
-    if (s2) {
-      const size_t sn = numel(s2);
-      if (sn == E)
-        for (size_t i = 0; i < E; ++i) rs_host[i] = static_cast<float>(flyx::ops::load(s2, i));
-      else if (sn == 1)
-        std::fill(rs_host.begin(), rs_host.end(), static_cast<float>(flyx::ops::load(s2, 0)));
-      else
-        throw std::runtime_error(std::string(v->name) + ": unexpected per-expert scale length");
-    }
+    const std::vector<float> rs_host = expert_scales(w);
     CK(cudaMemcpy(rs_dev, rs_host.data(), E * sizeof(float), cudaMemcpyHostToDevice));
     return rs_dev;
   };

@@ -348,13 +348,20 @@ int Gemma4::moe_block(const std::string& p, const Config& c, int shared, const T
   m.norm = T.norm(n(p + "moe.norm"), H, 0.0, c.eps);
   m.router = T.weight(n(p + "moe.router"), {E, H});
   m.router_bias = m.router_logit_b = -1;
+  // An expert tensor in GGML's NVFP4 has its own [E] scales (`.scale` beside `.weight`). Down's is not taken here:
+  // it is expert_scale, as llama.cpp's converter folds the router's per_expert_scale into it.
+  auto experts = [&](const std::string& key, std::vector<int64_t> shape) {
+    const std::string name = n(p + key);
+    const bool ggml = name.size() > 7 && name.compare(name.size() - 7, 7, ".weight") == 0;
+    return T.weight(name, std::move(shape), ggml ? name.substr(0, name.size() - 7) + ".scale" : "");
+  };
   if (T.has(n(p + "moe.gate_up"))) {
-    m.gate_up = T.weight(n(p + "moe.gate_up"), {E, 2 * I, H});
+    m.gate_up = experts("moe.gate_up", {E, 2 * I, H});
     m.gate = m.up = -1;
   } else {
     m.gate_up = -1;
-    m.gate = T.weight(n(p + "moe.gate"), {E, I, H});
-    m.up = T.weight(n(p + "moe.up"), {E, I, H});
+    m.gate = experts("moe.gate", {E, I, H});
+    m.up = experts("moe.up", {E, I, H});
   }
   m.down = T.weight(n(p + "moe.down"), {E, H, I});
   m.gate_b = m.up_b = m.down_b = -1;

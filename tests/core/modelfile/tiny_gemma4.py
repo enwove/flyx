@@ -31,6 +31,10 @@
                          row; the router over the layer's input normed without a weight, times its scale and
                          1 / sqrt(64); every expert's scale; the dense MLP's and the experts' outputs each normed, their
                          sum normed again), in Q8_0, and transformers' tokens for it
+    tiny_gemma4_moe_nvfp4.gguf, golden_gemma4_moe_nvfp4.json
+                         the same with experts of 64 in GGML's NVFP4 as llama.cpp's converter writes NVIDIA's
+                         26B-A4B: gate and up apart, each expert's matrices over a scale of its own (`.scale`, [E]),
+                         the router's per-expert scale folded into down's
     hf_gemma4_nvfp4/, tiny_gemma4_nvfp4.flyx
                          the same with its MLPs' linears in NVFP4 as ModelOpt writes them (its attention left in
                          float, as NVIDIA's Gemma-4-31B-IT-NVFP4 leaves it), and its .flyx
@@ -142,9 +146,10 @@ def write_nvfp4(src: Path, dst: Path):
     save_file({k: t.contiguous() for k, t in out.items()}, str(dst / "model.safetensors"))
 
 
-def write(out: Path, quant: bool = True, stem: str = "gemma4", moe: bool = False):
-    """quant False: every tensor float32 (no input rounding anywhere); moe: experts beside every MLP.  Skipped where
-    the files are there, made from the same inputs (their stamp)."""
+def write(out: Path, quant: bool = True, stem: str = "gemma4", moe: bool = False, nvfp4=None):
+    """quant False: every tensor float32 (no input rounding anywhere); moe: experts beside every MLP; nvfp4: those
+    experts in GGML's NVFP4, through this writer of its blocks (make_gguf.py's nvfp4_blocks).  Skipped where the files
+    are there, made from the same inputs (their stamp)."""
     extras = quant and not moe  # the assistant, the HF directory and its .flyx files: the dense Q8 model's
     stamp = out / f"tiny_{stem}.stamp"
     assistant_dir = out / f"tiny_{stem}_assistant"
@@ -171,7 +176,8 @@ def write(out: Path, quant: bool = True, stem: str = "gemma4", moe: bool = False
         final_logit_softcapping=SOFTCAP, rms_norm_eps=EPS, hidden_size_per_layer_input=0, attention_k_eq_v=True,
         num_kv_shared_layers=0, enable_moe_block=moe, tie_word_embeddings=True, max_position_embeddings=131072,
         pad_token_id=0, eos_token_id=1, bos_token_id=2,
-        **({"num_experts": N_EXPERTS, "top_k_experts": TOP_K, "moe_intermediate_size": MOE_INTER} if moe else {}))
+        **({"num_experts": N_EXPERTS, "top_k_experts": TOP_K,
+            "moe_intermediate_size": MOE_INTER if nvfp4 is None else 64} if moe else {}))
     cfg._attn_implementation = "eager"
     cfg._experts_implementation = "eager"  # each expert's own products (the grouped ones take no float64)
     model = Gemma4ForCausalLM(cfg).eval()
@@ -195,6 +201,18 @@ def write(out: Path, quant: bool = True, stem: str = "gemma4", moe: bool = False
             sd[hf] = torch.from_numpy(np.ascontiguousarray(held))
 
     Q8 = gguf.GGMLQuantizationType.Q8_0 if quant else None
+
+    def put_nvfp4_experts(name, a, fold=1.0):
+        """a [E, N, K] into the file as GGML NVFP4 blocks over a scale an expert (name.scale, times fold), and what
+        they hold, without fold."""
+        E_, K = a.shape[0], a.shape[2]
+        s = (np.abs(a).reshape(E_, -1).max(axis=1) / (6 * 448) * rng.uniform(1.0, 4.0, size=E_)).astype(np.float32)
+        blocks = nvfp4(np.ascontiguousarray((a / s[:, None, None]).reshape(-1, K), np.float32))
+        nv = gguf.GGMLQuantizationType.NVFP4
+        tensors.append((name + ".weight", blocks.reshape(a.shape[0], a.shape[1], -1), nv))
+        tensors.append((name + ".scale", (s * fold).astype(np.float32), None))
+        return (gguf.quants.dequantize(blocks, nv).reshape(a.shape) * s[:, None, None]).astype(np.float32)
+
     # the embedding times sqrt(64) below the layers' normed outputs (their post-norms' weights about 2: the head,
     # tied to the embedding, would otherwise give back the token it read); the final norm's weights spread the
     # head's logits
@@ -224,7 +242,7 @@ def write(out: Path, quant: bool = True, stem: str = "gemma4", moe: bool = False
         put(b + "ffn_down.weight", rnd((H, INTER), 1 / np.sqrt(INTER)), Q8, p + "mlp.down_proj.weight")
         put(b + "post_ffw_norm.weight", 2 + rnd((H,), 0.2), None, p + "post_feedforward_layernorm.weight")
         if moe:  # the experts beside the MLP, and the norms around both (llama.cpp's names)
-            E, MI = N_EXPERTS, MOE_INTER
+            E, MI = N_EXPERTS, MOE_INTER if nvfp4 is None else 64  # NVFP4 blocks: 64 columns
             put(b + "post_ffw_norm_1.weight", 1 + rnd((H,), 0.1), None, p + "post_feedforward_layernorm_1.weight")
             put(b + "pre_ffw_norm_2.weight", 1 + rnd((H,), 0.1), None, p + "pre_feedforward_layernorm_2.weight")
             put(b + "post_ffw_norm_2.weight", 1 + rnd((H,), 0.1), None, p + "post_feedforward_layernorm_2.weight")
@@ -233,10 +251,19 @@ def write(out: Path, quant: bool = True, stem: str = "gemma4", moe: bool = False
             put(b + "ffn_gate_inp.weight", rnd((E, H), 32.0 / np.sqrt(H)), None, p + "router.proj.weight")
             put(b + "ffn_gate_inp.scale", rng.uniform(0.8, 1.2, size=(H,)).astype(np.float32), None,
                 p + "router.scale")
-            put(b + "ffn_down_exps.scale", rng.uniform(0.5, 1.5, size=(E,)).astype(np.float32), None,
-                p + "router.per_expert_scale")
-            put(b + "ffn_gate_up_exps.weight", rnd((E, 2 * MI, H), 1 / np.sqrt(H)), Q8, p + "experts.gate_up_proj")
-            put(b + "ffn_down_exps.weight", rnd((E, H, MI), 1 / np.sqrt(MI)), Q8, p + "experts.down_proj")
+            per_expert = rng.uniform(0.5, 1.5, size=(E,)).astype(np.float32)
+            if nvfp4 is None:
+                put(b + "ffn_down_exps.scale", per_expert, None, p + "router.per_expert_scale")
+                put(b + "ffn_gate_up_exps.weight", rnd((E, 2 * MI, H), 1 / np.sqrt(H)), Q8,
+                    p + "experts.gate_up_proj")
+                put(b + "ffn_down_exps.weight", rnd((E, H, MI), 1 / np.sqrt(MI)), Q8, p + "experts.down_proj")
+            else:
+                gate = put_nvfp4_experts(b + "ffn_gate_exps", rnd((E, MI, H), 1 / np.sqrt(H)))
+                up = put_nvfp4_experts(b + "ffn_up_exps", rnd((E, MI, H), 1 / np.sqrt(H)))
+                down = put_nvfp4_experts(b + "ffn_down_exps", rnd((E, H, MI), 1 / np.sqrt(MI)), per_expert)
+                sd[p + "router.per_expert_scale"] = torch.from_numpy(per_expert)
+                sd[p + "experts.gate_up_proj"] = torch.from_numpy(np.concatenate([gate, up], axis=1))
+                sd[p + "experts.down_proj"] = torch.from_numpy(down)
         put(b + "layer_output_scale.weight", rng.uniform(0.5, 1.5, size=(1,)).astype(np.float32), None,
             p + "layer_scalar")
     sd["lm_head.weight"] = sd["model.embed_tokens.weight"]  # tied: the state's own copy would load over the table
@@ -254,7 +281,7 @@ def write(out: Path, quant: bool = True, stem: str = "gemma4", moe: bool = False
     if moe:
         w.add_uint32(a + "expert_count", N_EXPERTS)
         w.add_uint32(a + "expert_used_count", TOP_K)
-        w.add_uint32(a + "expert_feed_forward_length", MOE_INTER)
+        w.add_uint32(a + "expert_feed_forward_length", MOE_INTER if nvfp4 is None else 64)
     w.add_uint32(a + "attention.head_count", NH)
     w.add_array(a + "attention.head_count_kv", [NKV_SWA if s else NKV_FULL for s in SLIDING])
     w.add_float32(a + "rope.freq_base", THETA)
@@ -318,6 +345,18 @@ def write(out: Path, quant: bool = True, stem: str = "gemma4", moe: bool = False
                 w.data = w.data.to(torch.bfloat16).to(w.dtype)
             mod.register_forward_pre_hook(
                 lambda _m, inp: (inp[0].to(torch.bfloat16).to(inp[0].dtype),) + tuple(inp[1:]))
+    # A float32 file with experts: also its matrices alone in bf16, the router's float32 (CUDA's passes of up to 16
+    # rows, which read float32 inputs as two bf16 halves and route in float32).  The coarse model's router, rounded
+    # too, can move back an expert its matrices' rounding moves.
+    weights_only = None
+    if moe and not quant:
+        weights_only = copy.deepcopy(model)
+        for name, mod in weights_only.named_modules():
+            if isinstance(mod, torch.nn.Linear) and not name.endswith("router.proj"):
+                mod.weight.data = mod.weight.data.to(torch.bfloat16).to(mod.weight.dtype)
+            elif type(mod).__name__ == "Gemma4TextExperts":
+                for w in (mod.gate_up_proj, mod.down_proj):
+                    w.data = w.data.to(torch.bfloat16).to(w.dtype)
 
     def greedy(m, prompt):
         ids, margin = list(prompt), float("inf")
@@ -338,7 +377,8 @@ def write(out: Path, quant: bool = True, stem: str = "gemma4", moe: bool = False
                 break
             prompt = [int(t) for t in rng.integers(0, 256, size=n)]
             tokens, margin = greedy(model, prompt)
-            if margin >= MIN_MARGIN and greedy(coarse, prompt)[0] == tokens:
+            if (margin >= MIN_MARGIN and greedy(coarse, prompt)[0] == tokens and
+                    (weights_only is None or greedy(weights_only, prompt)[0] == tokens)):
                 cases.append({"prompt": prompt, "tokens": tokens, "min_margin": margin})
     assert len(cases) == CASES, f"only {len(cases)} cases with a clear margin"
     if extras:

@@ -480,6 +480,25 @@ void gemma4(const std::string& dir, const std::string& backend) {
       }
     }
   }
+  // Its experts in GGML's NVFP4 as llama.cpp writes NVIDIA's 26B-A4B: gate and up apart, each over scales of its own
+  // (CUDA stacks them under gate's and takes up's ratio to it into the expert's weight).  Transformers' tokens on the
+  // values they hold: on the float64 backend, and teacher forced where the experts take bf16 inputs.
+  {
+    std::ifstream fn(dir + "/golden_gemma4_moe_nvfp4.json");
+    const json gn = json::parse(fn);
+    auto nv = engine(dir + "/tiny_gemma4_moe_nvfp4.gguf", backend, {.activations = "exact"});
+    for (const auto& item : gn.at("cases")) {
+      const auto p = item.at("prompt").get<std::vector<int32_t>>();
+      const auto want = item.at("tokens").get<std::vector<int32_t>>();
+      if (backend == "cpu_ref") {
+        check(same_tokens(tokens_of(*nv, p, int(want.size())), want), "tiny gemma4_moe_nvfp4: transformers' tokens");
+        continue;
+      }
+      const int agree = forced_agreement(*nv, p, want);
+      check(agree + 1 >= int(want.size()), "tiny gemma4_moe_nvfp4: transformers' tokens teacher forced, at " +
+                                           std::to_string(agree) + " of " + std::to_string(want.size()));
+    }
+  }
   // Its assistant beside it (models/gemma4/assistant.h): the first round drafts what transformers' assistant drafts
   // on the same K/V (its drafts of a clear margin), and its rounds give plain decoding's tokens, greedy and seeded.
   const std::string assistant = dir + "/tiny_gemma4_assistant";
@@ -523,10 +542,13 @@ void gemma4(const std::string& dir, const std::string& backend) {
     check(same_tokens(tokens_of(*flyx_exact, p, int(want.size())), want),
           "tiny gemma4 .flyx (python/convert): transformers' tokens");
   }
+  // bf16 inputs: its K of 64 is under the W4A4 kernels' tile of 128 (tiny_w4a4.flyx tests NVFP4 inputs)
   const std::string fp4 = dir + "/tiny_gemma4_nvfp4.flyx";
-  auto fp4_plain = engine(fp4, backend);
-  auto fp4_lookup = engine(fp4, backend, {.speculative = true, .drafter = "none", .lookup = true});
-  auto fp4_mtp = engine(fp4, backend, {.speculative = true, .drafter = "mtp", .drafter_files = {assistant}});
+  auto fp4_plain = engine(fp4, backend, {.activations = "exact"});
+  auto fp4_lookup = engine(fp4, backend, {.speculative = true, .drafter = "none", .activations = "exact",
+                                          .lookup = true});
+  auto fp4_mtp = engine(fp4, backend, {.speculative = true, .drafter = "mtp", .drafter_files = {assistant},
+                                       .activations = "exact"});
   std::unique_ptr<Engine> fp4_ref = backend != "cpu_ref" ? engine(fp4, "cpu_ref") : nullptr;
   for (const auto& item : golden.at("cases")) {
     auto p = item.at("prompt").get<std::vector<int32_t>>();
