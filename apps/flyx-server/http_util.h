@@ -120,10 +120,9 @@ bool read_optional_bool(const ojson& body, const char* key, bool* value, std::st
 bool read_optional_string(const ojson& body, const char* key, std::string* value, std::string* err);
 // OpenAI reasoning effort ("none", "minimal", "low", "medium", "high", "xhigh"):
 // "none" disables thinking, other values enable it, and all reach the template as kwargs["reasoning_effort"].
-bool read_reasoning_effort(const ojson& v, const char* field, ojson* effort, bool* thinking, ojson* kwargs,
-                           std::string* err);
-// Merge body["chat_template_kwargs"] into *kwargs and apply its boolean enable_thinking if present.
-bool read_chat_template_kwargs(const ojson& body, ojson* kwargs, bool* thinking, std::string* err);
+bool read_reasoning_effort(const ojson& v, const char* field, ojson* effort, ChatOptions* options, std::string* err);
+// Request kwargs override structured fields and startup defaults.
+bool read_chat_template_kwargs(const ojson& body, ChatOptions* options, std::string* err);
 // Parse an optional integer token limit (clamping values above INT_MAX without signed overflow).
 // Missing or null leaves *out unchanged; when allow_zero is true, 0 sets *is_zero = true.
 bool read_optional_token_limit(const ojson& body, const char* key, bool allow_zero, bool* is_zero, int* out,

@@ -145,17 +145,17 @@ void handle_chat(Server* s, const httplib::Request& req, httplib::Response& res)
   if (body.contains("tools") && !tools_from_openai(body["tools"], &in.tools, &err)) return send_openai_error(res, 400, err);
   if (!rules_from_openai(body, in.tools, &in.rules, &err)) return send_openai_error(res, 400, err);
   if (in.rules.tools == ReplyRules::kNone) in.tools.clear();  // as if none were offered
-  bool thinking = s->cfg.thinking;
+  in.chat_options = s->cfg.chat_defaults;
   if (const auto it = body.find("reasoning_effort"); it != body.end() && !it->is_null()) {
-    if (!read_reasoning_effort(*it, "reasoning_effort", nullptr, &thinking, &in.chat_options.kwargs, &err))
+    if (!read_reasoning_effort(*it, "reasoning_effort", nullptr, &in.chat_options, &err))
       return send_openai_error(res, 400, err);
   }
-  if (!read_optional_bool(body, "enable_thinking", &thinking, &err)) return send_openai_error(res, 400, err);
-  if (!read_chat_template_kwargs(body, &in.chat_options.kwargs, &thinking, &err))
+  if (!read_optional_bool(body, "enable_thinking", &in.chat_options.enable_thinking, &err) ||
+      !read_chat_template_kwargs(body, &in.chat_options, &err))
     return send_openai_error(res, 400, err);
-  in.chat_options.enable_thinking = thinking;
   if (!read_common(body, &in, &stream, &include_usage, &err)) return send_openai_error(res, 400, err);
-  if (!read_sampling(body, thinking, s->cfg, &in.gen.sampling, &err)) return send_openai_error(res, 400, err);
+  if (!read_sampling(body, in.chat_options.enable_thinking, s->cfg, &in.gen.sampling, &err))
+    return send_openai_error(res, 400, err);
 
   AdmittedJob ad;
   if (!admit_job(s, res, std::move(in), "chat", "chatcmpl-", stream, body, arrival, false, true,

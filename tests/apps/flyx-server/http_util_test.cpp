@@ -20,6 +20,18 @@ namespace {
 
 using namespace flyx::server;
 
+void test_chat_kwargs() {
+  flyx::ChatOptions options;
+  std::string err;
+  options.kwargs = {{"context", {{"initial", 1}}}, {"preserve_thinking", true}};
+  const flyx::ojson body = {{"chat_template_kwargs", {{"enable_thinking", false}, {"context", {{"next", 2}}}}}};
+  check(read_chat_template_kwargs(body, &options, &err) && !options.enable_thinking &&
+            options.kwargs == flyx::ojson{{"context", {{"next", 2}}}, {"preserve_thinking", true}},
+        "request kwargs replace whole values and keep a single thinking switch");
+  check(read_chat_template_kwargs(flyx::ojson::object(), &options, &err) && !options.enable_thinking,
+        "absent request kwargs preserve the resolved switch");
+}
+
 httplib::Request make_req(const std::string& remote_addr, const std::string& local_addr, int local_port,
                           const std::string& host, const std::string& origin = "",
                           const std::string& sec_fetch_site = "") {
@@ -508,6 +520,7 @@ void test_remote_unc_and_device_paths() {
 
 int main() {
   flyx::test::print_passes = true;
+  test_chat_kwargs();
   test_dns_rebinding_and_lan_hosts();
   test_forwarded_and_management_policy();
   test_remote_unc_and_device_paths();

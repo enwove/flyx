@@ -13,7 +13,7 @@ Single reference for the `flyx` CLI, `flyx serve` HTTP endpoints, environment va
 | `chat` | `flyx chat MODEL [opts]` | Interactive multi-turn terminal chat. |
 | `bench` | `flyx bench MODEL [-n N] [--prompts FILE.jsonl] [--json [FILE]] [opts]` | Benchmark decode `tok/s`, tokens/round, and GPU telemetry across 3 fixed prompts, or across a prompt set (`--prompts`). `--json` emits one JSON record on stdout, or into `FILE`. |
 | `tokenize` | `flyx tokenize MODEL "TEXT"` | Print token IDs for `TEXT`. |
-| `template` | `flyx template MODEL MESSAGES.json [--no-think]` | Render a JSON message array through the model's chat template. |
+| `template` | `flyx template MODEL MESSAGES.json [--no-think] [--chat-template-kwargs JSON]` | Render a JSON message array through the model's chat template. |
 | `monitor` | `flyx monitor [URL] [--key KEY] [--interval S] [--once [--for S]]` | Read-only terminal monitor polling `GET /v1/telemetry` (default `http://127.0.0.1:8080`; `http://` URLs only). |
 | `--version` | `flyx --version` | Print `flyx X.Y.Z` (also `server.version` in `GET /v1/telemetry`). `--help` after any command prints its usage on stdout with status 0; an option the command does not know is named in one line, status 2. |
 
@@ -70,6 +70,7 @@ All commands that load a model share the parser in `apps/common/engine_flags.cpp
 | `-p TEXT` / `-f FILE` | `run` | string / path | — | Prompt text or file path. |
 | `--image FILE` | `run` | path (repeatable) | none | Attach one or more local image files (PNG, JPEG, BMP, GIF, TGA) to the prompt (implies `--chat`; requires a loaded vision encoder via `--mmproj` or Hub auto-fetch). |
 | `--chat` | `run` | flag | off | Wrap prompt as a single user message through the chat template. |
+| `--chat-template-kwargs JSON` | `run --chat`, `chat`, `template`, `serve` | JSON object | `{}` | Default variables for the loaded template, e.g. `'{"preserve_thinking":true,"reasoning_effort":"medium"}'`. Use a JSON boolean for `enable_thinking`. The renderer supplies `messages`, `tools`, `add_generation_prompt` and the model's own tokens. |
 | `--no-think` | `run`, `chat`, `template`, `serve` | flag | off | Disable thinking block by default (`enable_thinking=false`; a template that reads a thinking effort instead, Inkling-2's, is given its `reasoning_effort` `none`, and the reply is held to no thinking section); `bench` always runs without it. |
 | `-n N` | `run`, `chat`, `bench` | `≥ 0` | `256` | Maximum new tokens to generate. |
 | `--ignore-eos` | `run` | flag | off | Continue past EOS tokens until `-n` or context limit (`bench` always does). |
@@ -82,6 +83,12 @@ All commands that load a model share the parser in `apps/common/engine_flags.cpp
 ---
 
 ## 3. Server Flags (`flyx serve`)
+
+`--chat-template-kwargs` applies to Chat Completions, Responses, Anthropic Messages, and Anthropic token counts.
+`--no-think` overrides the startup object's `enable_thinking` in either flag order. Explicit request fields
+(such as `reasoning_effort`, `reasoning.effort`, or Anthropic `thinking` and `output_config.effort`) override the
+corresponding defaults. The request's `chat_template_kwargs` object overrides individual keys last. Other defaults
+carry through. Each template determines which variables it reads.
 
 To connect from another device, open **Server settings → Serve on local network** in the dashboard. Close flyx and launch it again, then copy an **Active API address** into the other device's client. Choose the address on the network the devices share. If the PC's firewall prompts, allow access on the intended network.
 

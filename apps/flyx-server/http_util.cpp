@@ -13,6 +13,7 @@
 #include <mutex>
 #include <random>
 
+#include "apps/common/chat_options.h"
 #include "apps/common/model_source.h"
 #include "apps/common/numbers.h"
 #include "apps/flyx-server/server.h"
@@ -87,25 +88,21 @@ bool read_optional_string(const ojson& body, const char* key, std::string* value
   return true;
 }
 
-bool read_reasoning_effort(const ojson& v, const char* field, ojson* effort, bool* thinking, ojson* kwargs,
-                           std::string* err) {
+bool read_reasoning_effort(const ojson& v, const char* field, ojson* effort, ChatOptions* options, std::string* err) {
   if (!v.is_string()) return *err = std::string(field) + " must be a string", false;
   const std::string s = v.get<std::string>();
   if (s != "none" && s != "minimal" && s != "low" && s != "medium" && s != "high" && s != "xhigh" && s != "max")
     return *err = std::string(field) + " must be none, minimal, low, medium, high, xhigh, or max", false;
   if (effort) *effort = s;
-  if (thinking) *thinking = s != "none";
-  if (kwargs) (*kwargs)["reasoning_effort"] = s;
+  options->enable_thinking = s != "none";
+  options->kwargs["reasoning_effort"] = s;
   return true;
 }
 
-bool read_chat_template_kwargs(const ojson& body, ojson* kwargs, bool* thinking, std::string* err) {
+bool read_chat_template_kwargs(const ojson& body, ChatOptions* options, std::string* err) {
   const auto it = body.find("chat_template_kwargs");
   if (it == body.end() || it->is_null()) return true;
-  if (!it->is_object()) return *err = "chat_template_kwargs must be an object", false;
-  for (auto kv = it->begin(); kv != it->end(); ++kv) (*kwargs)[kv.key()] = kv.value();
-  if (kwargs->contains("enable_thinking") && (*kwargs)["enable_thinking"].is_boolean())
-    *thinking = (*kwargs)["enable_thinking"].get<bool>();
+  if (!apps::merge_chat_kwargs(*it, options, err)) return *err = "chat_template_kwargs " + *err, false;
   return true;
 }
 

@@ -6,6 +6,7 @@ import re
 import sys
 import tempfile
 
+from chat_template_kwargs import check_template_kwargs
 from local_server import Client, wait_load
 from remembered_model import serve
 
@@ -82,6 +83,7 @@ def check_compat(url):
     # Validation -> 400 (never 500 or silent ignore / signed overflow)
     for bad in ({"reasoning_effort": "turbo"}, {"reasoning_effort": 123},
                 {"enable_thinking": "false"}, {"chat_template_kwargs": ["bad"]},
+                {"chat_template_kwargs": {"enable_thinking": "false"}},
                 {"n": 4294967297}, {"n": 1.5}, {"n": "1"}, {"n": True},
                 {"max_tokens": "50"}, {"max_tokens": 0}, {"max_tokens": -5}, {"max_tokens": 1.5},
                 {"max_completion_tokens": "5"}, {"response_format": "json_object"},
@@ -225,6 +227,7 @@ def check_queued_anthropic_stream_error(url):
 if __name__ == "__main__":
     exe, asset = (Path(arg).resolve() for arg in sys.argv[1:])
     with tempfile.TemporaryDirectory() as tmp:
+        check_template_kwargs(exe, asset, Path(tmp) / "kwargs")
         env = dict(os.environ, APPDATA=tmp, XDG_CONFIG_HOME=tmp, FLYX_BACKEND_DIR=str(exe.parent))
         template = Path(tmp) / "chat.jinja"
         template.write_text(TEMPLATE, encoding="utf-8")

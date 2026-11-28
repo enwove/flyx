@@ -28,6 +28,11 @@ def flyx(*args):
 markers = [int(token) for token in flyx("tokenize", MODEL, OPENER).stdout.split()]
 check(len(markers) == 2, "the opener is two control tokens of the model", markers)
 
+# This format enforces thinking off with a grammar even without a schema or tools.
+r = flyx("run", MODEL, "--chat", "-p", "hello", "--backend", "cpu_ref", "-n", "2",
+         "--chat-template-kwargs", '{"enable_thinking":false}')
+check(r.returncode == 0 and r.stdout == OPENER, "startup kwargs select the no-thinking reply grammar", (r.stdout, r.stderr))
+
 
 with tempfile.TemporaryDirectory() as tmp:
     prompt_set = os.path.join(tmp, "set.jsonl")
