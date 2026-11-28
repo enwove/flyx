@@ -91,10 +91,14 @@ bool supported(const flyx_bmodel* m, const Block& blk, std::string* why) {
   } else if (const auto* e = std::get_if<Eagle4Block>(&blk)) {
     const AttnBlock& a = e->attn;
     // the pair gather's register cache and the candidate pick's rows (draft_pick_rough)
+    // a chain step's and a tree step's candidates come from the n_cands scored exactly (draft_pick_rough)
+    const int fewest = eagle4_tree_cands(m->opt.eagle4_beam, e->vocab);
     if (!attention_head_dim(a.hd) || a.nkv < 1 || a.nh % a.nkv || e->hidden % 64 || e->hidden != m->hidden ||
-        e->target_hidden != m->hidden || e->n_cands > kDraftCands || e->cand_rank % 8 || e->mlp.inter % 64)
-      return no("EAGLE-4 dimensions outside what the CUDA kernels support (head dim 32, 64, 128 or 256, up to " +
-                std::to_string(kDraftCands) + " candidates, a rank of a multiple of 8)");
+        e->target_hidden != m->hidden || e->n_cands > kDraftCands || e->n_cands < fewest || e->cand_rank % 8 ||
+        e->mlp.inter % 64)
+      return no("EAGLE-4 dimensions outside what the CUDA kernels support (head dim 32, 64, 128 or 256, " +
+                std::to_string(fewest) + " to " + std::to_string(kDraftCands) +
+                " candidates, a rank of a multiple of 8)");
     if (e->in_norm.offset != e->hidden_norm.offset || e->in_norm.eps != e->hidden_norm.eps)
       return no("the EAGLE-4 gather takes one offset and eps for its two norms");
     if (m->states.ring_width != e->hidden) return no("the EAGLE-4 ring keeps one hidden vector per position");
