@@ -90,6 +90,9 @@ All commands that load a model share the parser in `apps/common/engine_flags.cpp
 corresponding defaults. The request's `chat_template_kwargs` object overrides individual keys last. Other defaults
 carry through. Each template determines which variables it reads.
 
+In Windows PowerShell 5.1, escape the double quotes inside the single-quoted argument when launching a native
+executable, for example `--chat-template-kwargs '{\"preserve_thinking\":true,\"reasoning_effort\":\"medium\"}'`.
+
 To connect from another device, open **Server settings → Serve on local network** in the dashboard. Close flyx and launch it again, then copy an **Active API address** into the other device's client. Choose the address on the network the devices share. If the PC's firewall prompts, allow access on the intended network.
 
 The switch saves `lan_access` in `serve.json`. It takes effect on the next launch of `flyx.exe` or `flyx serve`. Turning it off and restarting restores loopback-only access. Until restart, the dashboard shows the current listener and any pending change. An explicit `--host` overrides the preference and locks the switch for that launch. Devices that can reach the port can use inference. Set `FLYX_API_KEY` or pass `--api-key KEY` to require authentication.
