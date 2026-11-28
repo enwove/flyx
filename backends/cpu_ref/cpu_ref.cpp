@@ -362,17 +362,34 @@ void ple_layer(RefSeq* s, const flyx_ple_block& b, bool verify) {
   if (verify) replay.resize(size_t(s->rows) * (W + 1));
   auto table = *s->m->w(b.table);
   auto& store = *s->m->packed.at(b.table);
-  std::vector<uint8_t> packed(size_t(heads) * store.stride());
-  table.data = packed.data(); table.shape[0] = heads; table.nbytes = packed.size();
+  constexpr int tile = 16;
+  const int batch = std::min(tile, s->rows);
+  std::vector<int32_t> indices(size_t(batch) * heads), prior(st.width);
+  std::vector<uint8_t> packed(indices.size() * store.stride());
+  table.shape[0] = heads;
+  table.nbytes = size_t(heads) * store.stride();
   const auto& conv = s->m->vec(b.conv_w);
   Vec z(Z), key(W), query(W), value(H), y(W), u(W);
-  std::vector<int32_t> prior(st.width), indices(heads);
+  const auto* committed = win.data() + size_t(st.conv - 1) * W;
   for (int r = 0; r < s->rows; ++r) {
-    int n = 0;
-    const auto* ids = win.data() + size_t(st.conv - 1) * W;
-    while (n < st.width && ids[n] >= 0) { prior[n] = int32_t(ids[n]); ++n; }
-    ple_indices(s->tok[r], prior.data(), n, b, indices.data());
-    store.gather(indices.data(), heads, packed.data());
+    if (r % tile == 0) {
+      const int count = std::min(tile, s->rows - r);
+      for (int j = 0; j < count; ++j) {
+        int n = 0;
+        for (; n < st.width; ++n) {
+          const int in_tile = j - n - 1;
+          if (in_tile >= 0)
+            prior[n] = s->tok[r + in_tile];
+          else if (committed[-1 - in_tile] >= 0)
+            prior[n] = int32_t(committed[-1 - in_tile]);
+          else
+            break;
+        }
+        ple_indices(s->tok[r + j], prior.data(), n, b, indices.data() + size_t(j) * heads);
+      }
+      store.gather(indices.data(), size_t(count) * heads, packed.data());
+    }
+    table.data = packed.data() + size_t(r % tile) * table.nbytes;
     for (int i = 0; i < Z; ++i) z[i] = load(&table, i);
     lin(s->m, b.key, z.data(), 1, Z, W, key.data(), s->rows);
     lin(s->m, b.value, z.data(), 1, Z, H, value.data(), s->rows);
@@ -1813,7 +1830,8 @@ int open_model(const flyx_model_desc* desc, const flyx_open_options* opts, flyx_
       if (!w.t) throw std::runtime_error("weight " + std::to_string(i) + " has no tensor");
       if (lookup_tables.count(i)) {
         m->packed[i] = std::make_unique<flyx::backends::PackedRows>(*w.t, opts ? opts->ple_placement : FLYX_PLE_AUTO,
-                  opts ? opts->ple_hot_bytes : 0, opts ? opts->ple_host_room : 0);
+                                                                    opts ? opts->ple_hot_bytes : 0,
+                                                                    opts ? opts->ple_host_room : 0);
         m->W.push_back(w.t);  // Decode only the selected rows of the packed table.
         continue;
       }
@@ -2502,11 +2520,13 @@ void verify_given_tree(RefPlan* plan, RefSeq* s) {
     run_nodes(&path, s);
     return true;
   };
-  for (int row = 0; row <= width; ++row) if (run_path(row)) choice[row] = s->choice.back();
+  for (int row = 0; row <= width; ++row)
+    if (run_path(row)) choice[row] = s->choice.back();
   const auto& g = s->gen;
-  int n = accept_tree(width + 1, [&](int r) { return parents[r - 1] + 1; }, draft.data(), choice.data(), false,
-                      [](int,int) { return false; }, [](int,int) { return 0.f; }, g.stop_ids,
-                      std::min<int>(g.n_stop_ids, FLYX_MAX_STOP_IDS), taken.data(), tokens.data(), s->max_ctx - s->position);
+  int n = accept_tree(
+      width + 1, [&](int r) { return parents[r - 1] + 1; }, draft.data(), choice.data(), false,
+      [](int, int) { return false; }, [](int, int) { return 0.f; }, g.stop_ids,
+      std::min<int>(g.n_stop_ids, FLYX_MAX_STOP_IDS), taken.data(), tokens.data(), s->max_ctx - s->position);
   if (!run_path(taken[n])) throw std::runtime_error("given tree: selected node outside context");
   accept(s, n);
   commit(s);

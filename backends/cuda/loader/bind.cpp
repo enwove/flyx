@@ -320,7 +320,8 @@ AttnBlock attention(WeightLoader& L, const flyx_attn_block& b, const StateMap& s
   a.kv = state_of(sm.kv, b.kv, "K/V");
   if (b.has_indexer) {
     expect(b.index_kv_heads == 1 && b.index_heads > 0 && b.group_size > 0 && b.token_budget >= b.group_size &&
-           b.token_budget % b.group_size == 0 && b.index_dim >= a.rot, "sparse attention dimensions");
+               b.token_budget % b.group_size == 0 && b.index_dim >= a.rot,
+           "sparse attention dimensions");
     a.index_state = state_of(sm.index, b.index_state, "indexer");
     a.index_dim = b.index_dim;
     a.index_heads = b.index_heads;
@@ -804,7 +805,7 @@ MoeBlock moe(WeightLoader& L, const flyx_moe_block& b, const StateMap& sm) {
   }
   if (b.has_shared) {
     f.shared_inter = b.shared_inter;
-    f.shared_gu = L.lin_stack({b.shared_gate,b.shared_up});
+    f.shared_gu = L.lin_stack({b.shared_gate, b.shared_up});
     f.shared_down = L.lin(b.shared_down);
     f.shared_router = L.vec(b.shared_router);
   }
@@ -1084,7 +1085,11 @@ TargetQuant target_quant(const flyx_model_desc& d, const std::vector<char>& is_d
       linears({b.gdn.out});
     } else if (b.kind == FLYX_BLOCK_MOE) {
       const auto& e = b.moe;
-      linears({e.gate_up, e.down, e.router});
+      if (e.separate_gate_up)
+        linears({e.gate, e.up, e.down, e.router});
+      else
+        linears({e.gate_up, e.down, e.router});
+      if (e.has_shared) linears({e.shared_gate, e.shared_up, e.shared_down});
       if (e.loop_rank > 0) linears({e.loop_ctrl_down, e.loop_ctrl_gain, e.loop_ctrl_forget});
     } else if (b.kind == FLYX_BLOCK_REL_ATTN) {
       // The binder splits q|gate|rel and loop gain|forget when their formats differ.
@@ -1261,7 +1266,7 @@ void bind(flyx_bmodel* m, const flyx_model_desc& d, LoadTimes* times) {
         p.dtype = t.dtype;
         p.stride = size_t(t.nbytes / t.shape[0]);
         expect(t.dtype == FLYX_DT_F32 || t.dtype == FLYX_DT_BF16 || t.dtype == FLYX_DT_F16 ||
-               t.dtype == FLYX_DT_GGML_Q4_0 || t.dtype == FLYX_DT_GGML_Q5_0 || t.dtype == FLYX_DT_GGML_Q8_0,
+                   t.dtype == FLYX_DT_GGML_Q4_0 || t.dtype == FLYX_DT_GGML_Q5_0 || t.dtype == FLYX_DT_GGML_Q8_0,
                "unsupported packed PLE table dtype");
         auto upload = [&](const uint64_t* src, int count) {
           auto* dst = m->alloc<uint64_t>(count);
@@ -1286,22 +1291,29 @@ void bind(flyx_bmodel* m, const flyx_model_desc& d, LoadTimes* times) {
               std::memcpy(host, t.data, t.nbytes);
               p.table = static_cast<uint8_t*>(mapped);
               m->host_bytes += t.nbytes;
-            } else cudaGetLastError();
+            } else
+              cudaGetLastError();
           }
           if (!p.table) {
             p.store = std::make_shared<backends::PackedRows>(t, m->ple_placement, m->ple_hot_bytes, 0);
             m->host_bytes += p.store->storage_bytes();
           }
         }
-        p.key = L.lin(b.ple.key); p.value = L.lin(b.ple.value);
-        p.nk = norm(L, b.ple.norm_key); p.nq = norm(L, b.ple.norm_query); p.nc = norm(L, b.ple.norm_conv);
+        p.key = L.lin(b.ple.key);
+        p.value = L.lin(b.ple.value);
+        p.nk = norm(L, b.ple.norm_key);
+        p.nq = norm(L, b.ple.norm_query);
+        p.nc = norm(L, b.ple.norm_conv);
         p.conv = L.vec(b.ple.conv_w);
         put_block(m, i, std::move(p));
         break;
       }
       case FLYX_BLOCK_HC: {
         HcBlock hc{};
-        hc.phase = b.hc.phase; hc.hidden = b.hc.hidden; hc.streams = b.hc.streams; hc.rank = b.hc.rank;
+        hc.phase = b.hc.phase;
+        hc.hidden = b.hc.hidden;
+        hc.streams = b.hc.streams;
+        hc.rank = b.hc.rank;
         if (hc.phase == FLYX_HC_MIX || hc.phase == FLYX_HC_COLLAPSE) {
           hc.norm = norm(L, b.hc.norm);
           hc.down = L.lin(b.hc.down);
@@ -1581,10 +1593,11 @@ int resolve_vision_device(const flyx_model_desc& desc, const BackendOptions& opt
 int resolve_ple(const flyx_model_desc& d, const flyx_open_options* opts, uint64_t free_bytes) {
   if (opts && opts->ple_placement) return opts->ple_placement;
   uint64_t bytes = 0, table = 0;
-  for (int i=0; i<d.n_weights; ++i) if (d.weights[i].t) bytes = size_add(bytes, d.weights[i].t->nbytes);
-  for (int i=0; i<d.n_blocks; ++i) if (d.blocks[i].kind == FLYX_BLOCK_PLE)
-    table = size_add(table, d.weights[d.blocks[i].ple.table].t->nbytes);
-  if (free_bytes >= bytes && free_bytes - bytes >= (uint64_t(2)<<30)) return FLYX_PLE_GPU;
+  for (int i = 0; i < d.n_weights; ++i)
+    if (d.weights[i].t) bytes = size_add(bytes, d.weights[i].t->nbytes);
+  for (int i = 0; i < d.n_blocks; ++i)
+    if (d.blocks[i].kind == FLYX_BLOCK_PLE) table = size_add(table, d.weights[d.blocks[i].ple.table].t->nbytes);
+  if (free_bytes >= bytes && free_bytes - bytes >= (uint64_t(2) << 30)) return FLYX_PLE_GPU;
   if (opts && table <= opts->ple_host_room) return FLYX_PLE_HOST;
   return opts && opts->ple_hot_bytes ? FLYX_PLE_HYBRID : FLYX_PLE_DISK;
 }
@@ -1682,7 +1695,8 @@ int estimate_load(const flyx_model_desc* desc, const flyx_open_options* opts, ui
       if (b.moe.separate_gate_up) {
         mark(is_expert, b.moe.gate);
         mark(is_expert, b.moe.up);
-      } else mark(is_expert, b.moe.gate_up);
+      } else
+        mark(is_expert, b.moe.gate_up);
       mark(is_expert, b.moe.down);
     } else if (b.kind == FLYX_BLOCK_DSPARK) {
       // Its block's norms, vectors, Markov head and joint projection stay as stored (dspark(): not quantized).

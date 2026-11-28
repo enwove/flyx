@@ -1,5 +1,7 @@
 // Copyright 2026 The flyx Authors. SPDX-License-Identifier: Apache-2.0
 
+#include <algorithm>
+
 #include "backends/cuda/kernels/common/device.cuh"
 #include "backends/cuda/kernels/kernels.cuh"
 

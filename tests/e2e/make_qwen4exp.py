@@ -13,7 +13,7 @@ from transformers import Qwen4ExpForCausalLM, Qwen4ExpTextConfig
 
 def write_fixture(out, ple):
     torch.manual_seed(31415)
-    H, C, D, I, R = 32, 4, 16, 32, 8
+    H, C, D, I, R = 64, 4, 32, 64, 16
     tokens = sorted(ByteLevel.alphabet()) + ["aa", "<|im_end|>", "<|endoftext|>"]
     eos = len(tokens) - 1
     cfg = Qwen4ExpTextConfig(
@@ -41,7 +41,7 @@ def write_fixture(out, ple):
             rope_type="default",
             rope_theta=10000.0,
             partial_rotary_factor=0.5,
-            mrope_section=[2, 1, 1],
+            mrope_section=[3, 3, 2],
             mrope_interleaved=True,
         ),
         ple_layer_ids=[1] if ple else [],
@@ -65,6 +65,11 @@ def write_fixture(out, ple):
             elif name.endswith("norm.weight") and ".linear_attn." not in name:
                 v.normal_(0.0, 0.13)
             v.copy_(v.bfloat16().float())
+        # ReLU makes exact zero-score ties common for two random query heads. Opposite
+        # heads give distinct absolute scores for the cross-platform Transformers oracle.
+        # The dedicated selection test exercises the engine's chronological tie policy.
+        index_qk = model.model.layers[1].self_attn.indexer.index_qk_proj.weight
+        index_qk[D : 2 * D].copy_(-index_qk[:D])
     stem = "qwen4exp_parent" if ple else "qwen4exp_coder"
     w = gguf.GGUFWriter(out / (stem + ".gguf"), "qwen4exp")
     w.add_string("tokenizer.ggml.model", "gpt2")
@@ -97,7 +102,7 @@ def write_fixture(out, ple):
         "attention.head_count_kv": 1,
         "attention.key_length": D,
         "attention.value_length": D,
-        "rope.dimension_count": 8,
+        "rope.dimension_count": D // 2,
         "attention.indexer.head_count": 2,
         "attention.indexer.key_length": D,
         "attention.indexer.top_k": 8,
@@ -109,7 +114,7 @@ def write_fixture(out, ple):
         integer(k, v)
     w.add_float32("qwen4exp.rope.freq_base", 10000.0)
     array("attention.compress_ratios", [0, 4 if ple else 0])
-    array("rope.dimension_sections", [2, 1, 1, 0])
+    array("rope.dimension_sections", [3, 3, 2, 0])
 
     def tensor(name, v):
         w.add_tensor(name, v.detach().float().contiguous().numpy())

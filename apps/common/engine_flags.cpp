@@ -79,13 +79,9 @@ bool engine_flag(const std::string& a, const std::function<std::string()>& value
       std::fprintf(stderr, "error: %s\n", err.c_str()), std::exit(2);
     eo->kv_method = v;
   } else if (a == "--ple") {
-    const auto v = value();
-    if (v == "auto") eo->ple_placement = FLYX_PLE_AUTO;
-    else if (v == "gpu") eo->ple_placement = FLYX_PLE_GPU;
-    else if (v == "host") eo->ple_placement = FLYX_PLE_HOST;
-    else if (v == "disk") eo->ple_placement = FLYX_PLE_DISK;
-    else if (v == "hybrid") eo->ple_placement = FLYX_PLE_HYBRID;
-    else std::fprintf(stderr, "error: --ple expects auto, gpu, host, disk or hybrid\n"), std::exit(2);
+    std::string error;
+    if (!interfaces::parse_ple_placement(value(), &eo->ple_placement, &error))
+      std::fprintf(stderr, "error: %s\n", error.c_str()), std::exit(2);
   } else if (a == "--ple-hot-mb") {
     eo->ple_hot_bytes = uint64_t(whole_flag("--ple-hot-mb", value(), 0, INT_MAX)) << 20;
   } else if (a == "--backend-opt") {

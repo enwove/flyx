@@ -8,6 +8,8 @@
 #include <string_view>
 #include <utility>
 
+#include "flyx/backend_abi.h"
+
 namespace flyx::interfaces {
 
 enum class DrafterMode { kAuto, kMtp, kDFlash2, kDv, kDSpark, kDSpine, kDFlash, kEagle4, kAll, kNone };
@@ -79,6 +81,21 @@ inline bool parse_kv_method(std::string_view value, KvMethodSpec* out, std::stri
   }
   *out = {strata ? KvMethodKind::kStrata : KvMethodKind::kAuto, bits};
   return true;
+}
+
+inline bool parse_ple_placement(std::string_view value, int* out, std::string* err) {
+  constexpr std::pair<std::string_view, int> modes[] = {{"auto", FLYX_PLE_AUTO},
+                                                        {"gpu", FLYX_PLE_GPU},
+                                                        {"host", FLYX_PLE_HOST},
+                                                        {"disk", FLYX_PLE_DISK},
+                                                        {"hybrid", FLYX_PLE_HYBRID}};
+  for (const auto& [name, mode] : modes)
+    if (value == name) {
+      *out = mode;
+      return true;
+    }
+  if (err) *err = "unknown PLE placement '" + std::string(value) + "' (auto, gpu, host, disk, or hybrid)";
+  return false;
 }
 
 enum class VisionDeviceMode { kDisk, kHost, kGpu, kAuto };

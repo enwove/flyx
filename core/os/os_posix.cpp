@@ -39,7 +39,7 @@ MappedFile::~MappedFile() {
 }
 
 bool MappedFile::open(const std::string& path, std::string* err) {
-  fd_ = ::open(path.c_str(), O_RDONLY);
+  fd_ = ::open(path.c_str(), O_RDONLY | O_CLOEXEC);
   if (fd_ < 0) {
     *err = path + ": " + strerror(errno);
     return false;

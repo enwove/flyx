@@ -684,6 +684,24 @@ bool Engine::load(const std::string& path, const EngineOptions& opt, std::string
     clean_backend_opts = interfaces::backend_opt_strip(clean_backend_opts, key);
   }
 
+  for (const char* key : {"ple", "ple_hot_mb"}) {
+    const auto value = interfaces::backend_opt_get(clean_backend_opts, key);
+    if (value.empty()) continue;
+    if (std::string_view(key) == "ple") {
+      if (!interfaces::parse_ple_placement(value, &opt_.ple_placement, err)) return false;
+    } else {
+      int mib = 0;
+      const char* end = value.data() + value.size();
+      const auto parsed = std::from_chars(value.data(), end, mib);
+      if (parsed.ec != std::errc{} || parsed.ptr != end || mib < 0) {
+        *err = "ple_hot_mb requires a nonnegative integer MiB count";
+        return false;
+      }
+      opt_.ple_hot_bytes = uint64_t(mib) << 20;
+    }
+    clean_backend_opts = interfaces::backend_opt_strip(clean_backend_opts, key);
+  }
+
   interfaces::ModelOptions mo;
   mo.drafter = opt_.drafter;
   mo.speculative = opt_.speculative;

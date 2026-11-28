@@ -25,10 +25,12 @@ RowNeeds row_needs(const flyx_bmodel* m) {
   };
   for (const Block& blk : m->blocks) {
     if (const auto* p = std::get_if<PleBlock>(&blk)) {
-      const int W=p->dims.streams*p->dims.hidden, Z=p->heads()*p->dims.row_width;
-      n.ple_embed=std::max(n.ple_embed,Z); n.ple_input=std::max(n.ple_input,W+1);
-      n.ple_heads=std::max(n.ple_heads,p->heads());
-      n.proj=std::max(n.proj,W); n.act=std::max(n.act,W);
+      const int W = p->dims.streams * p->dims.hidden, Z = p->heads() * p->dims.row_width;
+      n.ple_embed = std::max(n.ple_embed, Z);
+      n.ple_input = std::max(n.ple_input, W + 1);
+      n.ple_heads = std::max(n.ple_heads, p->heads());
+      n.proj = std::max(n.proj, W);
+      n.act = std::max(n.act, W);
       n.q8 |= p->key.q8_inputs() || p->value.q8_inputs();
       ks({Z});
     } else if (const auto* hc = std::get_if<HcBlock>(&blk)) {
@@ -86,8 +88,8 @@ RowNeeds row_needs(const flyx_bmodel* m) {
       if (r->res_push && r->loop_rank == 0) ++pass0_pushes;
       ks({r->hidden, q_dim, 2 * r->hidden, r->loop_rank});
     } else if (const auto* e = std::get_if<MoeBlock>(&blk)) {
-      n.proj = std::max({n.proj, e->n_experts, 2*e->shared_inter});
-      n.act = std::max(n.act,e->shared_inter);
+      n.proj = std::max({n.proj, e->n_experts, 2 * e->shared_inter});
+      n.act = std::max(n.act, e->shared_inter);
       if (e->shared_inter) {
         ks({e->shared_inter});
         n.q8 |= e->shared_gu.q8_inputs() || e->shared_down.q8_inputs();
@@ -176,9 +178,9 @@ void alloc_rows(const flyx_bmodel* m, int R, bool prefill, RowBufs* b, Alloc&& a
   }
   b->x = f(size_t(R) * H);
   if (n.ple_heads) {
-    b->ple_ids = static_cast<int*>(alloc(size_t(R)*n.ple_heads*sizeof(int)));
-    b->ple_embed = f(size_t(R)*n.ple_embed);
-    b->ple_input = f(size_t(R)*n.ple_input);
+    b->ple_ids = static_cast<int*>(alloc(size_t(R) * n.ple_heads * sizeof(int)));
+    b->ple_embed = f(size_t(R) * n.ple_embed);
+    b->ple_input = f(size_t(R) * n.ple_input);
   }
   if (n.index_proj) b->index_proj = f(size_t(R) * n.index_proj);
   if (n.hc_streams) {
@@ -928,16 +930,17 @@ void alloc_state(const flyx_bmodel* m, flyx_seq* s) {
        63) /
       64 * 64;
 
-  for (const auto& blk : m->blocks) if (const auto* p = std::get_if<PleBlock>(&blk); p && p->store) {
-    if (s->ple_stages.empty()) s->ple_stages.resize(m->states.sconv.size());
-    auto& slot = s->ple_stages.at(p->state);
-    const size_t count = size_t(kPleStage)*p->heads();
-    slot.ids = s->host_alloc<int>(count);
-    slot.host = s->host_alloc<uint8_t>(count*p->stride);
-    slot.device = s->alloc<uint8_t>(count*p->stride);
-    for (int n=1;n<=kPleStage;++n)
-      slot.calls[n] = {p->store.get(), slot.ids, slot.host, size_t(n)*p->heads(), &s->ple_failed};
-  }
+  for (const auto& blk : m->blocks)
+    if (const auto* p = std::get_if<PleBlock>(&blk); p && p->store) {
+      if (s->ple_stages.empty()) s->ple_stages.resize(m->states.sconv.size());
+      auto& slot = s->ple_stages.at(p->state);
+      const size_t count = size_t(kPleStage) * p->heads();
+      slot.ids = s->host_alloc<int>(count);
+      slot.host = s->host_alloc<uint8_t>(count * p->stride);
+      slot.device = s->alloc<uint8_t>(count * p->stride);
+      for (int n = 1; n <= kPleStage; ++n)
+        slot.calls[n] = {p->store.get(), slot.ids, slot.host, size_t(n) * p->heads(), &s->ple_failed};
+    }
   for (int width : m->states.index_width) s->index_keys.push_back(s->alloc<float>(size_t(s->cap) * width));
   if (m->need.index_group) {
     s->index_scores = s->alloc<float>(size_t(kIndexTile) * (s->cap / m->need.index_group + 1));

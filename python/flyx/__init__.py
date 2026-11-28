@@ -156,7 +156,7 @@ class Engine:
                  chat_template: str | None = None, drafter_file: str | list[str] | None = None,
                  mmproj_file: str | None = None, vision: bool = True,
                  vision_device: str | None = None, vision_quant: str | None = None,
-                 vision_max_tokens: int = 0):
+                 vision_max_tokens: int = 0, ple: str | None = None, ple_hot_mb: int | None = None):
         """max_ctx: tokens, or "max": the model's own context, or the longest the GPU and host memory hold.
         width: drafts per round (0: chosen each round by the speculation controller).
         activations: None (as the file has it), "exact" (every format's own rounding everywhere) or "nvfp4"
@@ -170,7 +170,17 @@ class Engine:
         vision: False skips loading any vision encoder even if present.
         vision_device: "disk" (default, 0 VRAM / 0 locked RAM), "host", "gpu", or "auto".
         vision_quant: "q8" (default), "exact", or "nvfp4" for float vision linears.
-        vision_max_tokens: per-image merged visual token cap (0 = auto)."""
+        vision_max_tokens: per-image merged visual token cap (0 = auto).
+        ple: placement of packed n-gram rows ("auto", "gpu", "host", "disk" or "hybrid").
+        ple_hot_mb: hybrid cache budget in MiB, including row directory overhead."""
+        if ple is not None:
+            if ple not in {"auto", "gpu", "host", "disk", "hybrid"}:
+                raise ValueError(f"unknown PLE placement {ple!r}")
+            backend_options = ",".join(filter(None, (backend_options, f"ple={ple}")))
+        if ple_hot_mb is not None:
+            if type(ple_hot_mb) is not int or not 0 <= ple_hot_mb <= 2**31 - 1:
+                raise ValueError("ple_hot_mb must be an integer in [0, 2**31 - 1]")
+            backend_options = ",".join(filter(None, (backend_options, f"ple_hot_mb={ple_hot_mb}")))
         if isinstance(drafter_file, (list, tuple)):
             drafter_file = "\n".join(os.path.expanduser(os.fspath(p)) for p in drafter_file)
         elif drafter_file is not None:
