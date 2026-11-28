@@ -298,6 +298,24 @@ void choices() {
         "a lone split GGUF is selected in shard order without naming a quant");
   n.quant = "";
   check(!flyx::hub::select(r, n, &files, &err) && err.find("several") != std::string::npos, "no quantization named: which?");
+  {  // a repository of .flyx files packed from GGUFs (flyx pack), a quantization each, chosen as GGUFs are
+    flyx::hub::Repo tiers;
+    tiers.id = "acme/Qwen3.8-27B-flyx";
+    tiers.files = {file("Qwen3.8-27B-NVFP4.flyx", 17), file("Qwen3.8-27B-UD-IQ3_XXS.flyx", 11),
+                   file("Qwen3.8-27B-IQ4_XS.flyx", 15), file("README.md", 1, "")};
+    auto picked = [&](const std::string& quant) {
+      return flyx::hub::select(tiers, {tiers.id, quant}, &files, &err) && files.size() == 1 ? files[0].path : "";
+    };
+    check(picked("NVFP4") == "Qwen3.8-27B-NVFP4.flyx", ".flyx files: :NVFP4");
+    check(picked("iq4_xs") == "Qwen3.8-27B-IQ4_XS.flyx", ".flyx files: :iq4_xs, any case");
+    check(picked("IQ3_XXS") == "Qwen3.8-27B-UD-IQ3_XXS.flyx", ".flyx files: :IQ3_XXS, the tag a lone UD-IQ3_XXS ends with");
+    check(picked("Qwen3.8-27B-NVFP4.flyx") == "Qwen3.8-27B-NVFP4.flyx", ".flyx files: a file named");
+    check(picked("Q8_0").empty() && err.find("no .flyx file for \"Q8_0\"") != std::string::npos &&
+              err.find(tiers.id + ":IQ4_XS") != std::string::npos,
+          ".flyx files: a quantization not there, the ones there listed (" + err + ")");
+    check(picked("").empty() && err.find("several .flyx files") != std::string::npos,
+          ".flyx files: none named, which? (" + err + ")");
+  }
   check(flyx::hub::mtp_file(r) && flyx::hub::mtp_file(r)->path == "MTP/mtp-Qwen3.8-27B-Q4_0.gguf", "the MTP file");
   check(flyx::hub::mmproj_file(r) && flyx::hub::mmproj_file(r)->path == "mmproj-F16.gguf", "the mmproj file");
   {

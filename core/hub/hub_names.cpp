@@ -436,7 +436,11 @@ bool select(const Repo& r, const Name& name, std::vector<RepoFile>* files, std::
     }
     return s;
   };
-  if (!name.quant.empty()) {
+  // A repository of .flyx files alone (flyx pack's, a quantization each) has its quantizations chosen below.
+  const bool flyx_only = choices.empty() && std::any_of(r.files.begin(), r.files.end(), [](const RepoFile& f) {
+    return detail::lower(f.path).ends_with(".flyx");
+  });
+  if (!name.quant.empty() && !flyx_only) {
     const std::string want = detail::lower(name.quant);
     const GgufChoice* pick = nullptr;
     for (const GgufChoice& c : choices)
@@ -509,10 +513,40 @@ bool select(const Repo& r, const Name& name, std::vector<RepoFile>* files, std::
                   "(DFlash2, DSpark, DSpine, EAGLE-4)",
            false;
   files->clear();
+  // .flyx files, a quantization each (flyx pack's): chosen by the quantization their names carry, as GGUFs are.
+  auto flyx_listing = [&] {
+    std::string s;
+    for (const RepoFile* f : flyx) {
+      const std::string q = quant_in_name(f->path);
+      s += "\n  " + r.id + ":" + (q.empty() ? detail::base_name(f->path) : q) + "  (" + detail::format_gb(f->size) + ")";
+    }
+    return s;
+  };
+  if (!name.quant.empty() && !flyx.empty()) {
+    const std::string want = detail::lower(name.quant);
+    const RepoFile* pick = nullptr;
+    for (const RepoFile* f : flyx)
+      if (detail::lower(quant_in_name(f->path)) == want || detail::lower(f->path) == want ||
+          detail::lower(detail::base_name(f->path)) == want)
+        pick = f;
+    if (!pick)  // a tag the name ends with: "IQ3_XXS" for a lone UD-IQ3_XXS
+      for (const RepoFile* f : flyx) {
+        const std::string q = detail::lower(quant_in_name(f->path));
+        if (q.size() > want.size() && q.ends_with(want) &&
+            kSep.find(q[q.size() - want.size() - 1]) != std::string_view::npos &&
+            (!pick || quant_in_name(f->path).size() < quant_in_name(pick->path).size()))
+          pick = f;
+      }
+    if (!pick) return *err = r.id + " has no .flyx file for \"" + name.quant + "\"; it has:" + flyx_listing(), false;
+    files->push_back(*pick);
+    return true;
+  }
   if (flyx.size() == 1) {
     files->push_back(*flyx[0]);
     return true;
   }
+  if (flyx.size() > 1)
+    return *err = r.id + " holds several .flyx files: name one (" + r.id + ":QUANT):" + flyx_listing(), false;
   return *err = r.id + ": no model flyx reads there (a GGUF file, a drafter's config.json and safetensors, a .flyx file)",
          false;
 }
