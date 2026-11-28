@@ -875,6 +875,28 @@ void test_select() {
         const int32_t host = ops::draft_choice(c.cand.data(), c.logit.data(), c.count.empty() ? nullptr : c.count.data(),
                                                k, c.vocab, c.temp, c.top_p, c.top_k, c.presence, c.frequency, seed, pos);
         same = same && down_i(mtok, 2)[1] == want && host == want;
+        // the coupled scores (EAGLE-4's sampled trees): the draft the best, the kept candidates' probabilities
+        // summing to 1, the others -inf; greedy and with no candidate kept, none
+        float cs[ops::kMtpCands];
+        const bool scored = ops::draft_coupled_scores(c.cand.data(), c.logit.data(),
+                                                      c.count.empty() ? nullptr : c.count.data(), k, c.vocab, c.temp,
+                                                      c.top_p, c.top_k, c.presence, c.frequency, seed, pos, 2.f,
+                                                      cs);
+        bool usable = false;
+        for (int i = 0; i < k; ++i)
+          usable = usable || (c.cand[size_t(i)] >= 0 && c.cand[size_t(i)] < c.vocab && !std::isnan(c.logit[size_t(i)]));
+        if (!(c.temp > 0.f) || !usable) {
+          same = same && !scored;
+          continue;
+        }
+        int best = -1;
+        double mass = 0;
+        for (int i = 0; i < k; ++i) {
+          if (cs[i] == -INFINITY) continue;
+          mass += std::exp(double(cs[i]));
+          if (best < 0 || cs[i] > cs[best] || (cs[i] == cs[best] && c.cand[size_t(i)] < c.cand[size_t(best)])) best = i;
+        }
+        same = same && scored && best >= 0 && c.cand[size_t(best)] == want && std::fabs(mass - 1.0) < 1e-5;
       }
       std::printf("  %-4s MTP draft against the float64 oracle: %s\n", same ? "ok" : "FAIL", c.what);
       g_fail += !same;
