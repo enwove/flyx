@@ -99,7 +99,7 @@ FOUND_PAGE2 = {"query": "", "family": True, "architectures": ["qwen35", "qwen3",
 DRAFTER_KINDS = {"./another.gguf": "mtp", "./new-mtp.gguf": "mtp", "./drafts/Speedy": "dspark"}
 
 
-def repository(repo_spec, helper_cached=False):
+def repository(repo_spec, helper_cached=False, mtp_read=True):
     """GET /v1/hub/files: REPO as this build runs it, a dflash GGUF drafter repo, a safetensors drafter repo, or unsupported."""
     repo, _, rev = repo_spec.partition("@")
     rev_sfx = f"@{rev}" if rev and rev != "main" else ""
@@ -145,7 +145,8 @@ def repository(repo_spec, helper_cached=False):
             "mmproj": {"path": "mmproj-BF16.gguf", "size": int(0.9 * GB), "cached": True} if runs else None,
             "companions": [
                 {"name": repo + ":mtp.gguf" + rev_sfx, "path": "MTP/mtp.gguf", "file": "mtp.gguf", "kind": "mtp",
-                 "drafter_kind": "mtp", "size": int(0.6 * GB), "cached": True, "disk": None, "default": True},
+                 "drafter_kind": "mtp" if mtp_read else "", "size": int(0.6 * GB), "cached": True, "disk": None,
+                 "default": True},
                 {"name": repo + ":mmproj-BF16.gguf" + rev_sfx, "path": "mmproj-BF16.gguf", "file": "mmproj-BF16.gguf", "kind": "mmproj",
                  "size": int(0.9 * GB), "cached": True, "disk": None, "default": True},
                 {"name": repo + ":mmproj-F16.gguf" + rev_sfx, "path": "mmproj-F16.gguf", "file": "mmproj-F16.gguf", "kind": "mmproj",
@@ -305,7 +306,7 @@ class Server:
             if self.files_fail:
                 status, msg = self.files_fail
                 return route.fulfill(status=status, json={"error": {"message": msg}})
-            res = repository(query["repo"][0], getattr(self, "helper_cached", False))
+            res = repository(query["repo"][0], getattr(self, "helper_cached", False), getattr(self, "mtp_read", True))
             res["endpoint"] = self.hub_endpoint
             return route.fulfill(json=res)
         if "/v1/hub/dir" in url:
@@ -758,6 +759,27 @@ def check_hub(page, server, want):
     body = server.posted[-1]  # another model, with the settings of the one served
     assert (body["model"], body["ctx"], body["kv"], body["kv_gpu"], body["drafters"], body["mmproj"]) == (
         REPO + ":Q5_K_M", want["ctx"], want["kv"], want["kv_gpu"], [], None), body
+    # The MTP file's header not read (drafter_kind empty): its badge still MTP, the list's kind, and a model loaded
+    # with it is told no drafter mode, the loader reading the file.
+    server.mtp_read = False
+    page.reload()  # the repository's files asked for again, not the page's copy
+    page.locator("#mv-tabs").wait_for()
+    view(page, "library")
+    page.locator("#hf-q").fill("")
+    page.locator("#hf-q").fill(REPO)
+    expect(page.locator("#hf-name")).to_have_text("Tiny-27B-GGUF")
+    unread = page.locator('#hf-companions .mrow[data-comp$=":mtp.gguf"]')
+    expect(unread).to_have_attribute("data-kind", "mtp")
+    expect(unread).to_contain_text("MTP")
+    q5 = page.locator('#mf-files .mrow[data-name$=":Q5_K_M"]')
+    if q5.get_attribute("aria-selected") != "true":
+        q5.click()
+    unread.click()
+    expect(page.locator("#mf-load")).to_have_text("Switch to this model")
+    confirm(page, "#mf-load", "Switch")
+    body = server.posted[-1]
+    assert (body["model"], body["drafter"], body["drafters"]) == (REPO + ":Q5_K_M", "", [REPO + ":mtp.gguf"]), body
+    server.mtp_read = True
     # Hub mirror endpoint selector: validate bad URL, apply mirror, update links, and reset back to default.
     view(page, "library")
     expect(page.locator("#hf-ep-toggle")).to_contain_text("huggingface.co")
@@ -805,7 +827,9 @@ def check_hub(page, server, want):
         page.locator("#hf-q").fill("acme/Model-DFlash2-GGUF")
         expect(page.locator("#hf-name")).to_have_text("Model-DFlash2-GGUF")
         expect(page.locator("#hf-drafter-repo")).to_be_visible()
-        page.locator(f'#hf-companions .mrow[data-comp$=":helper.gguf"][data-kind="{mode}"]').click()
+        helper = page.locator('#hf-companions .mrow[data-comp$=":helper.gguf"]')
+        expect(helper).to_have_attribute("data-kind", mode or "drafter")  # the list's kind; the mode apart
+        helper.click()
         expect(page.locator("#mf-load")).to_have_text("Draft with it")
         page.locator("#mf-load").click()
         expect(page.locator("#sd-file")).to_have_value("acme/Model-DFlash2-GGUF:helper.gguf")
@@ -818,7 +842,10 @@ def check_hub(page, server, want):
     page.locator("#hf-q").fill("")
     page.locator("#hf-q").fill("acme/Model-DFlash2-GGUF")
     expect(page.locator("#hf-name")).to_have_text("Model-DFlash2-GGUF")
-    page.locator('#hf-companions .mrow[data-comp$=":dspark-Misnamed-Q8_0.gguf"]').click()
+    misnamed = page.locator('#hf-companions .mrow[data-comp$=":dspark-Misnamed-Q8_0.gguf"]')
+    expect(misnamed).to_have_attribute("data-kind", "dspark")  # the list says DSpark, by its name
+    expect(misnamed).to_contain_text("DSpark")
+    misnamed.click()
     page.locator("#mf-load").click()
     expect(page.locator("#sd-file")).to_have_value("acme/Model-DFlash2-GGUF:dspark-Misnamed-Q8_0.gguf")
     expect(page.locator("#mf-cmd")).not_to_contain_text("--drafter dspark")
@@ -1254,11 +1281,12 @@ def check_fit(open_page, remembered):
     # A model served, loaded by the repository's name alone: the others against its budget (the engine's, other
     # programs and the reserve out); its own row (the file GET /v1/load says it serves) by the engine's own bill, as
     # the one served.  11.9 GB of the 12 GB budget used: the ledger takes no more than its budget.
-    served = dict(remembered, model=REPO)
+    served = dict(remembered, model=REPO, lora="acme/Tiny-27B-coder-lora", name="tiny-api",
+                  mmproj=REPO + ":mmproj-BF16.gguf", drafter="mtp", drafters=[REPO + ":mtp.gguf"])
     tm = telemetry(served)
     tm["load"]["loaded_file"] = CACHE + "\\Tiny-27B-Q4_K_M.gguf"
     tm["memory"] = {"sessions": [], "ledger_budget": 12 * GB, "ledger_used": int(11.9 * GB), "device_reserve": 2**29}
-    page, _ = open_page(tm)
+    page, server = open_page(tm)
     view(page, "library")
     page.locator('#hf-list .prow[data-repo="%s"]' % REPO).click()
     expect(fit(page, "IQ3_XXS")).to_have_text("file fits")  # 11.8 GB of 12
@@ -1266,6 +1294,20 @@ def check_fit(open_page, remembered):
     expect(fit(page, "Q4_K_M")).to_have_text("fits")  # 17.6 GB on disk, served in 11.9 GB
     title_has(page, "Q4_K_M", "11.1", "11.2 GiB")
     expect(page.locator('#mf-files .mrow[data-name$=":Q4_K_M"] .tag2.live')).to_have_count(1)  # "serving"
+    # Its row chosen: the model served, nothing to switch to; a setting changed, a reload of the load as it was asked
+    # (by the repository's name), its LoRA, projector, drafter and API name kept.
+    page.locator('#mf-files .mrow[data-name$=":Q4_K_M"]').click()
+    expect(page.locator("#mf-load")).to_have_text("Loaded")
+    expect(page.locator("#mf-load")).to_be_disabled()
+    expect(page.locator("#mf-chosen-s")).to_contain_text("This is the model being served.")
+    view(page, "current")
+    page.locator("#mf-ctx").fill("4096")
+    view(page, "library")
+    expect(page.locator("#mf-load")).to_have_text("Reload with these settings")
+    confirm(page, "#mf-load", "Reload")
+    body = server.posted[-1]
+    assert (body["model"], body["ctx"], body["lora"], body["name"], body["mmproj"], body["drafter"], body["drafters"]) == (
+        REPO, 4096, served["lora"], "tiny-api", served["mmproj"], "mtp", served["drafters"]), body
     page.close()
 
 

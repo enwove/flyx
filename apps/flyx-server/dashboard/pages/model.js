@@ -1254,7 +1254,7 @@ export function ModelPage({ active, libraryAsked, currentAsked }) {
     if (hasMain) {
       const overrides = (selDraft || selMm) ? {
         drafter: selDraft ? selDraft.spec : null,
-        drafterKind: selDraft?.kind,
+        drafterKind: selDraft?.mode,  // what a load is told: never the display kind (a name's guess)
         mmproj: selMm ? selMm.spec : null,
         drafterSize: selDraft ? (selDraft.size || 0) : 0,
         drafterCached: selDraft ? !!selDraft.cached : true,
@@ -1316,8 +1316,11 @@ export function ModelPage({ active, libraryAsked, currentAsked }) {
           <button class="btn primary" id="mf-load" disabled=${!!action.disabled} onClick=${action.onClick}>${t(action.label)}</button>
         </div>`;
     }
-    const row = rows.find((r) => r.name === target && !r.off), name = row ? row.name : "";
-    const same = !!loadedWant && name === loadedWant.model, m = entryOf(name);
+    // The row of the file served, by whatever name it was loaded ("org/model" served, its "org/model:QUANT" row): the
+    // load as it was asked, so the action is a reload of it with its settings (LoRA, projector, drafter, API name).
+    const row = rows.find((r) => r.name === target && !r.off);
+    const name = !row ? "" : isServed(row.name, row.disk) ? loadedWant.model : row.name;
+    const same = !!loadedWant && name === loadedWant.model, m = entryOf(name) || (row && entryOf(row.name));
     const eff = settingsFor(name, overrides), effNow = shown(loadBody(name, eff, Boolean(loadedWant)));
     const effChanged = before ? diffShown(before, effNow) : [];
     let label = "Load model", disabled = !name || busy || !!note;
@@ -1409,9 +1412,9 @@ export function ModelPage({ active, libraryAsked, currentAsked }) {
                              kind: "mmproj", size: j.mmproj.size, cached: !!j.mmproj.cached, disk: null, default: true }] : []),
     ];
     const comps = rawComps.map((c) => ({ ...c, key: c.name, spec: c.disk || c.name,
-      kind: c.kind === "mmproj" ? c.kind : (c.drafter_kind ?? c.kind),
-      // The mode a load is told: the kind its cached header says (drafter_kind), never a guess from its name (kind),
-      // which leaves it to the loader.
+      // kind: what the list shows (the server's, from a cached header else the file's name); mode: what a load is
+      // told, the cached header's kind alone (drafter_kind), "" leaving it to the loader.
+      kind: c.kind === "mmproj" ? c.kind : (c.kind || c.drafter_kind || ""),
       mode: c.kind === "mmproj" ? "" : (c.drafter_kind || "") }));
     const hubDraft = hubView.draft, hubMmproj = hubView.mmproj;
     const setHubDraft = (v) => dispatchHub({ type: "draft", value: v });
@@ -1549,7 +1552,6 @@ export function ModelPage({ active, libraryAsked, currentAsked }) {
     if (!catalog) return html`<div class="empty pad">${t("Looking...")}</div>`;
     const act = (go) => (e) => { e.stopPropagation(); go(); };
     const onEnter = (go) => (e) => { if (e.key === "Enter" && e.target === e.currentTarget) go(); };
-    const serving = loadedWant ? loadedWant.model : null;
     return html`
       ${places.map((p) => {
         const all = modelsOf(p), state = listings[p] || {};
@@ -1576,7 +1578,7 @@ export function ModelPage({ active, libraryAsked, currentAsked }) {
               <div class=${"prow act model" + (picked === m.name ? " sel" : "")} role="button" tabindex="0" data-model=${m.name} onClick=${go} onKeyDown=${onEnter(go)}>
                 <span class="pn item"><${Icon} name=${iconOfModel(m)} cls=${kindCls(m)}/><span class="pn-t">${titleOf(m)}</span></span>
                 <span class="pm">${m.size ? sized(m.size) : ""}</span>
-                <span class="ps">${under}${serving && m.name === serving ? html` <span class="tag2 live">${t("serving")}</span>` : ""}</span>
+                <span class="ps">${under}${isServed(m.name, m.path) ? html` <span class="tag2 live">${t("serving")}</span>` : ""}</span>
                 <span class="pt">${t(kindOfModel(m))}</span>
                 ${hubModel ? html`<button class="iconbtn del" title=${t("Delete from the Hugging Face cache")} aria-label=${t("Delete")}
                                           onClick=${act(() => removeCached(m))}><${Icon} name="trash"/></button>` : html`<span class="del"></span>`}
@@ -1604,7 +1606,7 @@ export function ModelPage({ active, libraryAsked, currentAsked }) {
     if (m.mmproj === "in-repo") chips.push([t("+ Vision"), "ok"]);
     if (m.parts > 1) chips.push([t(m.parts + " parts"), ""]);
     if (m.current === false) chips.push([t("older revision"), "info"]);
-    if (loadedWant && m.name === loadedWant.model) chips.push([t("serving"), "live"]);
+    if (isServed(m.name, m.path)) chips.push([t("serving"), "live"]);
     const action = mmproj
       ? { title: m.path || m.name, sub: "A vision projector is not loaded on its own.", label: "Use as projector",
           disabled: !model.id || busy, onClick: () => projectWith(m.path || m.name) }
@@ -1709,13 +1711,14 @@ export function ModelPage({ active, libraryAsked, currentAsked }) {
     const singleDrafter = j && j.kind === "file" && folderDrafters.length === 1 ? folderDrafters[0] : null;
     const relOf = (m) => j && j.kind === "dir" && m.path.length > j.path.length ? stripLeadSep(m.path.slice(j.path.length)) : m.file;
     const localComps = [
+      // A file on this machine: its kind read from its header (GET /v1/hub/dir), the mode a load is told too.
       ...folderDrafters.map((m) => ({
         key: m.path || m.name, spec: m.path || m.name, file: m.file, path: relOf(m),
-        kind: m.drafter_kind || "", size: m.size, cached: true, default: false,
+        kind: m.drafter_kind || "", mode: m.drafter_kind || "", size: m.size, cached: true, default: false,
       })),
       ...folderMmproj.map((m) => ({
         key: m.path || m.name, spec: m.path || m.name, file: m.file, path: relOf(m),
-        kind: "mmproj", size: m.size, cached: true, default: false,
+        kind: "mmproj", mode: "", size: m.size, cached: true, default: false,
       })),
     ];
     const selLocalDraft = localComps.find((c) => c.kind !== "mmproj" && c.key === localDraft) || null;
