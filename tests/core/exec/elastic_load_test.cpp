@@ -6,6 +6,7 @@
 #include <algorithm>
 #include <cstdio>
 #include <cstring>
+#include <filesystem>
 #include <memory>
 #include <string>
 #include <string_view>
@@ -35,6 +36,8 @@ bool g_oom_non_nvfp4_dflash = false;
 bool g_oom_any_dflash = false;
 bool g_oom_any_drafter = false;
 bool g_oom_always = false;
+bool g_oom_eagle4 = false;
+int g_auto_switch = -1;
 bool g_non_vram_error = false;
 bool g_generic_rc_with_vram_text = false;
 int g_open_calls = 0;
@@ -128,7 +131,7 @@ int hook_open(const flyx_model_desc* desc, const flyx_open_options* opts, flyx_b
     g_err = "Not enough VRAM (simulated non-OOM status -1)";
     return -1;
   }
-  if (g_oom_always) {
+  if (g_oom_always || (g_oom_eagle4 && has_block(desc, FLYX_BLOCK_EAGLE4))) {
     g_err = "Not enough VRAM while loading weights (16.00 GB GPU). Use a smaller quantization.";
     return FLYX_ERR_OOM;
   }
@@ -189,6 +192,7 @@ int hook_size(flyx_bmodel* m, const flyx_seq_layout* layout, flyx_seq_size* out)
     out->device = uint64_t(std::max(dev_pos, 0)) * g_seq_per_ctx_bytes + (64ull << 20);
     out->host = uint64_t(std::max(layout->max_ctx - std::max(dev_pos, 0), 0)) * g_seq_per_ctx_bytes;
   }
+  if (!rc && g_auto_switch >= 0 && layout->method == FLYX_KV_AUTO) out->strata_from = g_auto_switch;
   return rc;
 }
 
@@ -239,7 +243,8 @@ void reset_hooks() {
   g_oom_non_nvfp4_dflash = false;
   g_oom_any_dflash = false;
   g_oom_any_drafter = false;
-  g_oom_always = false;
+  g_oom_always = g_oom_eagle4 = false;
+  g_auto_switch = -1;
   g_non_vram_error = false;
   g_generic_rc_with_vram_text = false;
   g_open_calls = 0;
@@ -403,13 +408,13 @@ int main(int argc, char** argv) {
     blocks[0].mlp.down = 1;
     blocks[1].kind = FLYX_BLOCK_DFLASH2;
     auto& df = blocks[1].dflash2;
+    df.draft_from = 1;
+    df.sel_rank = 16;
     df.fc = 2;
     df.hidden_norm.w = df.norm.w = df.sel_hid = df.sel_pred = df.sel_succ = -1;
     flyx_model_desc d{};
     d.n_weights = 3;
     d.weights = ws;
-    df.draft_from = 1;
-    df.sel_rank = 16;
     d.n_blocks = 2;
     d.blocks = blocks;
     flyx_open_options opts{};
@@ -421,6 +426,45 @@ int main(int argc, char** argv) {
     std::swap(blocks[0].mlp.up, blocks[0].mlp.down);
     check(draft_bytes() == 3 * 512, "AUTO sees the BF16 resident format of the mixed gate/up stack");
     return flyx::test::finish("elastic_load_test");
+  }
+
+  const auto assets = std::filesystem::path(model).parent_path();
+  for (const char* file : {"tiny_eagle4.flyx", "tiny_dspark.flyx"}) {
+    reset_hooks();
+    g_oom_eagle4 = g_oom_any_dflash = true;
+    g_dflash_savings = 0;
+    EngineOptions eo;
+    eo.backend = "test-host-kv";
+    eo.max_ctx = 128;
+    eo.drafter = "all";
+    Engine e;
+    if (!e.load((assets / file).string(), eo, &err)) { check(false, err); return 1; }
+    check(std::string(e.drafter()) == "mtp" && !e.options().draft_trees && e.kv_layout().method == FLYX_KV_AUTO &&
+              g_open_calls == 2 && tokens(e) == ref_tokens, std::string(file) + " OOM keeps MTP and target AUTO");
+  }
+  for (int switch_at : {16, 128}) {
+    std::vector<int32_t> greedy, sampled;
+    for (int mode = 0; mode < 3; ++mode) {
+      reset_hooks();
+      g_auto_switch = switch_at;
+      EngineOptions eo;
+      eo.backend = "test-host-kv";
+      eo.max_ctx = 128;
+      eo.drafter = mode == 2 ? "dspark" : "none";
+      if (mode) eo.drafter_files = {(assets / "tiny_dspark_qwen3.flyx").string()};
+      Engine e;
+      if (!e.load((assets / "tiny_qwen3.flyx").string(), eo, &err)) { check(false, err); return 1; }
+      const bool trees = mode == 2 && switch_at >= eo.max_ctx;
+      check(e.options().draft_trees == trees && e.kv_layout().method == (trees ? FLYX_KV_READ_ALL : FLYX_KV_AUTO) &&
+                g_target_options.back().second >= 0, "DSpark trees respect the target-only switch");
+      if (!mode) {
+        greedy = tokens(e, 20);
+        sampled = tokens(e, 20, true);
+      } else {
+        check(greedy.size() == 12 && sampled.size() == 12 && tokens(e, 20) == greedy && tokens(e, 20, true) == sampled,
+              "disabled and active DSpark preserve greedy and fixed-seed tokens");
+      }
+    }
   }
 
   // 1. Roomy VRAM: both MTP and DFlash2 load with zero adjustments and backend-reported draft_weights.

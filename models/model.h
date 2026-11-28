@@ -165,6 +165,8 @@ class Model : public interfaces::Model {
   const flyx_model_desc& desc() const override { return desc_; }
   int drafters() const override { return int(drafters_.size()); }
   const char* drafter_name(int d) const override { return models::drafter_name(drafters_[size_t(d)].kind); }
+  const char* drafter_title(int d) const override { return models::drafter_title(drafters_[size_t(d)].kind); }
+  std::vector<std::string> drafter_fallbacks() const override;
   const char* drafter() const override { return drafter_names_.c_str(); }
   std::vector<int> draft_widths(int d) const override;
   std::vector<int> adaptive_checkpoints(int d) const override;
@@ -204,7 +206,7 @@ class Model : public interfaces::Model {
   std::shared_ptr<const interfaces::VisionAdapter> vision_adapter_;
   std::vector<flyx_node> vision_nodes_;
   bool kv_fp8_by_default_ = true;         // FP8 where a real model of the family showed no visible drop
-  bool file_drafts_trees_ = false;        // the file holds DV or a block drafter drafting trees by default (DSpark)
+  bool file_drafts_trees_ = false;        // the target file holds DV
   bool draft_trees_by_default_ = false;   // its tapped drafter drafts trees by default (drafts_trees_by_default)
   bool verify_scales_with_width_ = false; // sparse-MoE targets whose verify cost climbs steeply with verify width
 

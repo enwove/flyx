@@ -158,6 +158,20 @@ bool Model::widest_trees(int d) const { return drafter_traits(drafters_.at(size_
 
 bool Model::restarts(int d) const { return drafter_traits(drafters_.at(size_t(d)).kind).tree_only; }
 
+std::vector<std::string> Model::drafter_fallbacks() const {
+  std::vector<std::string> modes;
+  bool tapped = false;
+  for (const auto& d : drafters_) {
+    if (tables_.blocks[size_t(d.block)].kind == FLYX_BLOCK_DSPARK) {
+      if (drafters_.size() > 1) modes.emplace_back(models::drafter_name(d.kind));
+    } else if (is_tapped_drafter(d.kind)) {
+      tapped = true;
+    }
+  }
+  if (tapped || drafters_.size() > 1) modes.emplace_back(models::drafter_name(Drafter::kMtp));
+  return modes;
+}
+
 void Model::add_drafter(Drafter kind, int block, DrafterReach reach) {
   drafters_.push_back({kind, block, reach.max_drafts, reach.stretch});
   drafter_names_.clear();
