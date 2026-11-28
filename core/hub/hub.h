@@ -217,7 +217,7 @@ struct Cached {
   std::vector<RepoFile> files;  // sizes only
   std::vector<std::string> architectures;  // its config.json's, when it has one
 };
-// Injectable filesystem operations for deterministic tests verifying hub::cached checks allow_path first.
+// Injectable filesystem operations for deterministic tests verifying cache policy, link handling, and identity errors.
 struct CacheFs {
   std::function<bool(const std::filesystem::path&, std::error_code&)> is_symlink;
   std::function<bool(const std::filesystem::path&, std::error_code&)> is_directory;
@@ -228,6 +228,8 @@ struct CacheFs {
                      std::error_code&)>
       for_each_dir_entry;
   std::function<std::string(const std::filesystem::path&)> read_text;
+  std::function<std::filesystem::path(const std::filesystem::path&, std::error_code&)> weakly_canonical;
+  std::function<bool(const std::filesystem::path&, const std::filesystem::path&, std::error_code&)> equivalent;
   std::string root_override;  // optional cache directory override for deterministic tests
 };
 std::vector<Cached> cached(const PathAllowFn& allow_path = {}, const CacheFs* fs_ops = nullptr);
@@ -236,7 +238,8 @@ std::vector<Cached> cached(const PathAllowFn& allow_path = {}, const CacheFs* fs
 // other entry of the repository's snapshots still refers to, by a link, a hard link or as the blob a copy was made
 // of.  Nothing outside the repository's directory in the cache is touched.  *freed: the bytes given back.
 bool remove_cached(const std::string& repo, const std::string& commit, const std::vector<std::string>& paths,
-                   uint64_t* freed, std::string* err, const PathAllowFn& allow_path = {});
+                   uint64_t* freed, std::string* err, const PathAllowFn& allow_path = {},
+                   const CacheFs* fs_ops = nullptr);
 
 struct ResolvedSetting {
   std::string value, source;

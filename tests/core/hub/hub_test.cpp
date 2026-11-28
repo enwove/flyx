@@ -676,6 +676,34 @@ void cached_allow_path_guard() {
   check(descended_links.empty() && sym_snaps.size() == 1 && sym_snaps[0].files.size() == 1 &&
             sym_snaps[0].files[0].path == "good-Q4_K_M.gguf",
         "hub::cached never descends into directory symlinks while preserving file symlinks to blobs");
+
+  // Linked repo, snapshots, and commit roots are rejected in both hub::cached and detail::from_cache.
+  for (const auto& [label, linked_root] : std::vector<std::pair<std::string, std::string>>{
+           {"repo", repo_ok}, {"snapshots", snaps_ok}, {"commit", snap_ok}}) {
+    std::vector<std::string> enumerated_under;
+    flyx::hub::CacheFs root_link_fs = sym_fs;
+    root_link_fs.is_symlink = [&](const fs::path& p, std::error_code&) {
+      const std::string s = norm(p);
+      return s == linked_root || s == snap_ok + "/good-Q4_K_M.gguf";
+    };
+    root_link_fs.for_each_dir_entry = [&](const fs::path& p, const std::function<bool(const fs::path&)>& visit,
+                                          std::error_code&) {
+      const std::string s = norm(p);
+      if (s == linked_root || s == snap_ok) enumerated_under.push_back(s);
+      std::vector<fs::path> entries;
+      if (s == root) entries = {p / "models--acme--good"};
+      else if (s == snaps_ok) entries = {p / commit_ok};
+      else if (s == snap_ok) entries = {p / "good-Q4_K_M.gguf"};
+      for (const auto& e : entries)
+        if (!visit(e)) break;
+    };
+    const auto listed = flyx::hub::cached({}, &root_link_fs);
+    flyx::hub::Repo resolved;
+    const bool got_main = flyx::hub::detail::from_cache("acme/good", "main", &resolved, {}, &root_link_fs);
+    const bool got_commit = flyx::hub::detail::from_cache("acme/good", commit_ok, &resolved, {}, &root_link_fs);
+    check(listed.empty() && !got_main && !got_commit && enumerated_under.empty(),
+          "linked " + label + " root directory is rejected before enumerating snapshot entries");
+  }
 }
 
 void secondary_cache_policy_and_traversal(const fs::path& tmp) {
@@ -730,6 +758,21 @@ void secondary_cache_policy_and_traversal(const fs::path& tmp) {
     check(!flyx::hub::fetch(r, {f}, &paths, nullptr, nullptr, &err, deny_blob) &&
               err.find("remote path policy") != std::string::npos && paths.empty() && !fs::exists(denied_cache),
           "hub::fetch rejects denied blob path before creating cache dirs: " + err);
+    // Item 1 (PR #74 follow-up): deny ONLY the PartialBlob progress .map path and verify no filesystem I/O occurs.
+    err.clear();
+    bool saw_part_data = false, saw_part_map = false;
+    auto deny_only_map = [&](std::string_view p) {
+      const std::string s = norm(p);
+      if (s.ends_with(".flyx-part")) saw_part_data = true;
+      if (s.ends_with(".flyx-part.map")) {
+        saw_part_map = true;
+        return false;
+      }
+      return true;
+    };
+    check(!flyx::hub::fetch(r, {f}, &paths, nullptr, nullptr, &err, deny_only_map) && saw_part_data && saw_part_map &&
+              err.find("remote path policy") != std::string::npos && paths.empty() && !fs::exists(denied_cache),
+          "hub::fetch rejects denied PartialBlob .map path before any filesystem I/O: " + err);
   }
   // Item 2c: hub::remove_cached retains a shared/unverified blob when allow_path denies another snapshot entry,
   // and refuses to delete a denied target entry.
@@ -759,7 +802,113 @@ void secondary_cache_policy_and_traversal(const fs::path& tmp) {
               !fs::exists(snap_a / "model.gguf") && fs::exists(blob) && fs::exists(snap_b / "model.gguf"),
           "remove_cached safely retains blob when allow_path denies another snapshot during reference scan: " + err);
   }
-  // Item 3 (real filesystem, when OS permits directory symlinks): external directory symlink and ancestor cycle are skipped.
+  // Item 2 (PR #74 follow-up): remove_cached independently rejects linked repo/snapshots/commit/blobs roots (CacheFs).
+  {
+    const fs::path cache = tmp / "rm_linked_root";
+    const fs::path repo = cache / "models--acme--rmroot";
+    const fs::path snaps = repo / "snapshots";
+    const fs::path snap = snaps / commit_a;
+    const fs::path blobs = repo / "blobs";
+    const std::string payload = "do-not-delete-external";
+    const fs::path blob = blobs / sha(payload, true);
+    fs::create_directories(snap);
+    fs::create_directories(blobs);
+    std::ofstream(blob, std::ios::binary) << payload;
+    fs::create_hard_link(blob, snap / "victim.gguf");
+    for (const auto& [label, target] : std::vector<std::pair<std::string, fs::path>>{
+             {"repo", repo}, {"snapshots", snaps}, {"commit", snap}, {"blobs", blobs}}) {
+      flyx::hub::CacheFs linked_fs;
+      linked_fs.root_override = from_path(cache);
+      const std::string linked_norm = norm(from_path(target));
+      linked_fs.is_symlink = [&](const fs::path& p, std::error_code&) { return norm(from_path(p)) == linked_norm; };
+      uint64_t freed = 0;
+      std::string err;
+      check(!flyx::hub::remove_cached("acme/rmroot", commit_a, {"victim.gguf"}, &freed, &err, {}, &linked_fs) &&
+                fs::exists(snap / "victim.gguf") && fs::exists(blob),
+            "remove_cached rejects linked " + label + " root without deleting files: " + err);
+    }
+  }
+  // Item 3 (PR #74 follow-up): remove_cached fails closed (retains blob) on symlink canonicalization or equivalent errors.
+  {
+    const fs::path cache = tmp / "remove_id_err";
+    const std::string payload = "shared-identity-error-bytes";
+    const std::string blob_id = sha(payload, true);
+    // 3a: symlink canonicalization error in another snapshot.
+    {
+      const fs::path repo = cache / "models--acme--iderr-sym";
+      const fs::path blob = repo / "blobs" / blob_id;
+      const fs::path snap_a = repo / "snapshots" / commit_a;
+      const fs::path snap_b = repo / "snapshots" / commit_b;
+      fs::create_directories(blob.parent_path());
+      fs::create_directories(snap_a);
+      fs::create_directories(snap_b);
+      std::ofstream(blob, std::ios::binary) << payload;
+      fs::create_hard_link(blob, snap_a / "model.gguf");
+      std::error_code sym_ec;
+      fs::create_symlink(fs::path("../../blobs") / blob_id, snap_b / "model.gguf", sym_ec);
+      if (sym_ec) fs::create_hard_link(blob, snap_b / "model.gguf");
+      bool canon_err_hit = false;
+      const std::string other_entry = norm(from_path(snap_b / "model.gguf"));
+      flyx::hub::CacheFs canon_err_fs;
+      canon_err_fs.root_override = from_path(cache);
+      canon_err_fs.is_symlink = [&](const fs::path& p, std::error_code& ec) {
+        if (norm(from_path(p)) == other_entry) return true;
+        const auto st = fs::symlink_status(p, ec);
+        if (st.type() == fs::file_type::not_found) {
+          ec.clear();
+          return false;
+        }
+        return !ec && fs::is_symlink(st);
+      };
+      canon_err_fs.weakly_canonical = [&](const fs::path& p, std::error_code& ec) {
+        if (norm(from_path(p)) == other_entry) {
+          canon_err_hit = true;
+          ec = std::make_error_code(std::errc::permission_denied);
+          return fs::path{};
+        }
+        return fs::weakly_canonical(p, ec);
+      };
+      uint64_t freed = 0;
+      std::string err;
+      check(flyx::hub::remove_cached("acme/iderr-sym", commit_a, {"model.gguf"}, &freed, &err, {}, &canon_err_fs) &&
+                canon_err_hit && !fs::exists(snap_a / "model.gguf") && fs::exists(blob) &&
+                read_all(snap_b / "model.gguf") == payload,
+            "remove_cached retains blob when canonicalizing another snapshot symlink errors: " + err);
+    }
+    // 3b: regular-file identity (equivalent) error in another snapshot.
+    {
+      const fs::path repo = cache / "models--acme--iderr-eq";
+      const fs::path blob = repo / "blobs" / blob_id;
+      const fs::path snap_a = repo / "snapshots" / commit_a;
+      const fs::path snap_b = repo / "snapshots" / commit_b;
+      fs::create_directories(blob.parent_path());
+      fs::create_directories(snap_a);
+      fs::create_directories(snap_b);
+      std::ofstream(blob, std::ios::binary) << payload;
+      fs::create_hard_link(blob, snap_a / "model.gguf");
+      fs::create_hard_link(blob, snap_b / "model.gguf");
+      bool eq_err_hit = false;
+      const std::string other_entry = norm(from_path(snap_b / "model.gguf"));
+      flyx::hub::CacheFs eq_err_fs;
+      eq_err_fs.root_override = from_path(cache);
+      eq_err_fs.equivalent = [&](const fs::path& a, const fs::path& b, std::error_code& ec) {
+        if (norm(from_path(a)) == other_entry || norm(from_path(b)) == other_entry) {
+          eq_err_hit = true;
+          ec = std::make_error_code(std::errc::io_error);
+          return false;
+        }
+        return fs::equivalent(a, b, ec);
+      };
+      uint64_t freed = 0;
+      std::string err;
+      check(flyx::hub::remove_cached("acme/iderr-eq", commit_a, {"model.gguf"}, &freed, &err, {}, &eq_err_fs) &&
+                eq_err_hit && !fs::exists(snap_a / "model.gguf") && fs::exists(blob) &&
+                read_all(snap_b / "model.gguf") == payload,
+            "remove_cached retains blob when fs::equivalent errors on another snapshot entry: " + err);
+    }
+  }
+  // Item 3 (real filesystem, when OS permits directory symlinks): external directory symlinks, ancestor cycles,
+  // and linked repo/snapshots/commit roots are rejected in cached/in_cache/remove_cached.
   {
     const fs::path cache = tmp / "real_symlink";
     const fs::path outside = tmp / "outside_dir";
@@ -774,14 +923,41 @@ void secondary_cache_policy_and_traversal(const fs::path& tmp) {
     fs::create_directory_symlink(outside, snap / "ext_link", sec1);
     fs::create_directory_symlink(snap, snap / "cycle_link", sec2);
     if (!sec1 && !sec2) {
+      const fs::path ext_repo = tmp / "ext_repo_target";
+      put(ext_repo, commit_a, "leaked-repo.gguf", "x");
+      fs::create_directories(ext_repo / "refs");
+      std::ofstream(ext_repo / "refs" / "main", std::ios::binary) << commit_a;
+      std::error_code lsec;
+      fs::create_directory_symlink(ext_repo, cache / "models--acme--linked-repo", lsec);
+      const fs::path linked_snaps_repo = cache / "models--acme--linked-snaps";
+      fs::create_directories(linked_snaps_repo / "refs");
+      std::ofstream(linked_snaps_repo / "refs" / "main", std::ios::binary) << commit_a;
+      fs::create_directory_symlink(ext_repo / "snapshots", linked_snaps_repo / "snapshots", lsec);
+      const fs::path linked_commit_repo = cache / "models--acme--linked-commit";
+      fs::create_directories(linked_commit_repo / "snapshots");
+      fs::create_directories(linked_commit_repo / "refs");
+      std::ofstream(linked_commit_repo / "refs" / "main", std::ios::binary) << commit_a;
+      fs::create_directory_symlink(outside, linked_commit_repo / "snapshots" / commit_a, lsec);
+
       set_env("HF_HUB_CACHE", from_path(cache));
       const auto listed = flyx::hub::cached();
-      check(listed.size() == 1 && listed[0].files.size() == 1 && listed[0].files[0].path == "real-Q4_K_M.gguf",
-            "hub::cached skips real directory symlinks and ancestor cycles on disk");
+      check(listed.size() == 1 && listed[0].repo == "acme/sym-GGUF" && listed[0].files.size() == 1 &&
+                listed[0].files[0].path == "real-Q4_K_M.gguf",
+            "hub::cached skips real directory symlinks, ancestor cycles, and linked repo/snapshots/commit roots");
       flyx::hub::Repo r;
       check(flyx::hub::in_cache("acme/sym-GGUF", "main", &r) && r.files.size() == 1 &&
                 r.files[0].path == "real-Q4_K_M.gguf",
             "hub::in_cache skips real directory symlinks and ancestor cycles on disk");
+      check(!flyx::hub::in_cache("acme/linked-repo", "main", &r) &&
+                !flyx::hub::in_cache("acme/linked-snaps", "main", &r) &&
+                !flyx::hub::in_cache("acme/linked-commit", "main", &r) &&
+                !flyx::hub::in_cache("acme/linked-commit", commit_a, &r),
+            "hub::in_cache rejects real linked repo, snapshots, and commit root directories");
+      uint64_t freed = 0;
+      std::string err;
+      check(!flyx::hub::remove_cached("acme/linked-commit", commit_a, {"secret.gguf"}, &freed, &err) &&
+                fs::exists(outside / "secret.gguf"),
+            "hub::remove_cached refuses to delete external file through a real linked commit root: " + err);
     }
   }
   // Item 4: authoritative offline hub::in_cache and hub::describe return complete inventory > 16 dirs deep.

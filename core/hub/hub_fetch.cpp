@@ -780,8 +780,9 @@ bool fetch(const Repo& r, const std::vector<RepoFile>& files, std::vector<std::s
     const std::string id = f.sha256.empty() ? f.blob_id : detail::lower(f.sha256);
     if (!detail::hex_id(id)) return paths->clear(), *err = r.id + ": " + f.path + " has no id on the Hub", false;
     const fs::path blob = blobs / id;
+    const PartialBlob partial(blob, f.size);
     if (!check_allow(blob) || !check_allow(to_path(from_path(blob) + ".flyx-lock")) ||
-        !check_allow(to_path(from_path(blob) + ".flyx-part")))
+        !check_allow(partial.data) || !check_allow(partial.map))
       return false;
     missing.push_back({&f, blob});
   }
