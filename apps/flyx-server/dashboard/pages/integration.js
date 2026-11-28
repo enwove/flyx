@@ -322,6 +322,7 @@ export function Integration({ active }) {
           <tr><td><code>--temperature T</code>, <code>--top-p P</code>, <code>--top-k K</code></td>${Td(String.raw`for requests that do not set them`)}</tr>
           <tr><td><code>--presence-penalty P</code>, <code>--frequency-penalty F</code></td>${Td(String.raw`-2 to 2`)}</tr>
           <tr><td><code>--no-think</code></td>${Td(String.raw`no thinking unless a request asks for it`)}</tr>
+          <tr><td><code>--chat-template-kwargs JSON</code></td>${Td(String.raw`default variables for the chat template (a JSON object such as <code>enable_thinking</code> or <code>reasoning_effort</code>); a request's own come first`)}</tr>
           <tr><td><code>--keep-billing-header</code></td>${Td(String.raw`keep Claude Code's billing line in the system prompt`)}</tr>
         </tbody></table>
         <h3>${t("Engine")}</h3>
@@ -351,7 +352,7 @@ export function Integration({ active }) {
         <h2>${t("Telemetry")}</h2>
         ${Lead(String.raw`<code>GET /v1/telemetry</code>, JSON, <code>schema_version: 1</code>. This page reads it once a second, at no measurable cost to decoding. <code>flyx monitor URL</code> draws the same in a terminal.`)}
         <table><thead><tr><th>${t("Key")}</th><th>${t("Contents")}</th></tr></thead><tbody>
-          <tr><td><code>server</code></td>${Td(String.raw`name, version, pid, started_at, uptime_s, api_key_required, agent_launch, cors`)}</tr>
+          <tr><td><code>server</code></td>${Td(String.raw`name, version, pid, started_at, uptime_s, api_key_required, agent_launch, enable_thinking, cors`)}</tr>
           <tr><td><code>model</code></td>${Td(String.raw`id, loaded, device, backend, drafter, max_width, context, chat_format, max_sessions, memory, load_s`)}</tr>
           <tr><td><code>state</code></td>${Td(String.raw`phase, running, queued. The oldest running request supplies label, session, prompt_tokens, prefilled, reused_tokens, generated, tokens_per_round, rounds, drafted, accepted, decode_tok_s, prefill_tok_s and elapsed_s. Chat completions also supply id.`)}</tr>
           <tr><td><code>rates</code></td>${Td(String.raw`decode_tok_s, tokens_per_round and acceptance (0..1) over the recent window across running requests, plus output_per_second, prefill_per_second (prompt tokens computed), rounds_per_second, drafted_per_second and accepted_per_second over the last 60 seconds`)}</tr>
