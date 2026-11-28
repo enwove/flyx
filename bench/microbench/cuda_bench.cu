@@ -1106,13 +1106,14 @@ void bench_mlp() {
 
 
 // Prefill attention of one long prompt in 1024-row passes (by default Qwen3.5-4B: 16 query heads over 4 KV heads,
-// head dim 256, the 5760-token prefill of the perf records; `cuda_bench flash NH NKV TOKENS CHUNK` another: the 27B
-// 24 4), random queries, keys and values, over a binary16 cache and an FP8 one (e4m3, a scale per position and
-// head: the default); ms per pass and in all.
+// head dim 256, the 5760-token prefill of the perf records; `cuda_bench flash NH NKV TOKENS CHUNK [HD]` another: the
+// 27B 24 4, Gemma 4 26B-A4B's global layers 16 2 200000 4096 512), random queries, keys and values, over a binary16
+// cache and an FP8 one (e4m3, a scale per position and head: the default; not at head dim 512); ms per pass and in all.
 void bench_flash(int argc, char** argv) {
   header();
-  const int nh = argc > 2 ? std::atoi(argv[2]) : 16, nkv = argc > 3 ? std::atoi(argv[3]) : 4, hd = 256;
+  const int nh = argc > 2 ? std::atoi(argv[2]) : 16, nkv = argc > 3 ? std::atoi(argv[3]) : 4;
   const int total = argc > 4 ? std::atoi(argv[4]) : 5760, chunk = argc > 5 ? std::atoi(argv[5]) : 1024;
+  const int hd = argc > 6 ? std::atoi(argv[6]) : 256, caches_n = hd > 256 ? 1 : 2;
   float *q, *out, *gate, *ks, *vs;
   kv16 *K, *V;
   uint8_t *K8, *V8;
@@ -1136,7 +1137,7 @@ void bench_flash(int argc, char** argv) {
   DevParams* P;
   CK(cudaMalloc(&P, sizeof(DevParams)));
   CK(cudaMemset(P, 0, sizeof(DevParams)));
-  const float scale = 1.f / 16.f;
+  const float scale = float(1.0 / std::sqrt(double(hd)));
   const KvRef caches[2] = {KvRef{K, V, nullptr, nullptr}, KvRef{K8, V8, ks, vs}};
   double sum[2] = {0, 0};
   std::printf("prefill attention, %d tokens in %d-row passes: ms per pass (TFLOPS), binary16 | FP8 cache\n", total,
@@ -1145,7 +1146,7 @@ void bench_flash(int argc, char** argv) {
     const int rows = std::min(chunk, total - p0);
     const double pairs = double(rows) * p0 + double(rows) * (rows + 1) / 2;  // causal (query, key) pairs
     std::printf("  rows %5d at %5d:", rows, p0);
-    for (int c = 0; c < 2; ++c) {
+    for (int c = 0; c < caches_n; ++c) {
       const double ms = time_ms([&] {
         attention_flash(q, caches[c], nh, nkv, hd, rows, scale, P, gate, nh * hd, out, nh * hd, BL(0), p0);
       }, 10);
@@ -1155,8 +1156,10 @@ void bench_flash(int argc, char** argv) {
     std::printf("\n");
   }
   const double pairs = double(total) * (total + 1) / 2;
-  std::printf("  all: %.3f ms (%.1f TFLOPS) | %.3f ms (%.1f TFLOPS) a layer\n", sum[0],
-              4.0 * pairs * hd * nh / (sum[0] * 1e9), sum[1], 4.0 * pairs * hd * nh / (sum[1] * 1e9));
+  std::printf("  all:");
+  for (int c = 0; c < caches_n; ++c)
+    std::printf(" %s%.3f ms (%.1f TFLOPS)", c ? "| " : "", sum[c], 4.0 * pairs * hd * nh / (sum[c] * 1e9));
+  std::printf(" a layer\n");
   for (void* p : {(void*)q, (void*)gate, (void*)out, (void*)K, (void*)V, (void*)K8, (void*)V8, (void*)ks, (void*)vs,
                   (void*)P})
     cudaFree(p);

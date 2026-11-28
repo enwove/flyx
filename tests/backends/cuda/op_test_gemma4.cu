@@ -139,16 +139,19 @@ void prep_case(bool global) {
     CK(cudaFree(p));
 }
 
-// A prefill pass at head dim 512 (attention: the split kernel 16 rows at a time): each row's output the bits of that
-// row alone, as decoding it gives.
+// Head dim 512 (Gemma 4's global layers) in a prefill pass: the tensor-core kernel (two warps a row's 16, each half of
+// the head's dims), against float64 on the binary16 cache; a row's result whatever row its pass starts at (key tiles
+// on absolute positions), and over windows of keys (host caches) the one pass's bits.
 void prefill_512_case() {
-  const int nh = 16, nkv = 1, hd = 512, rows = 40, ctx = 90;
+  const int nh = 16, nkv = 2, hd = 512, rows = 70, ctx = 200;
   seed("gemma4_prefill_512", nh, nkv, hd, rows, ctx);
   const int cap = ctx + rows + 16;
-  Vec q = randv(size_t(rows) * nh * hd), Kc = randv(size_t(cap) * nkv * hd), Vc = randv(size_t(cap) * nkv * hd);
+  const float scale = float(1.0 / std::sqrt(double(hd)));  // (expect_windows's)
+  Vec q = randv(size_t(rows) * nh * hd, 0.08 * std::sqrt(double(hd)));
+  Vec Kc = randv(size_t(cap) * nkv * hd), Vc = randv(size_t(cap) * nkv * hd);
   round_f16(Kc);
   round_f16(Vc);
-  float *dq = up(q), *dout = dev<float>(q.size()), *done = dev<float>(q.size());
+  float *dq = up(q), *dout = dev<float>(q.size()), *dsplit = dev<float>(q.size());
   kv16 *dK = up_f16(Kc), *dV = up_f16(Vc);
   DevParams P{};
   P.position = ctx;
@@ -156,13 +159,38 @@ void prefill_512_case() {
   CK(cudaMemcpy(dP, &P, sizeof(P), cudaMemcpyHostToDevice));
   float* part = dev<float>(attention_partial_floats(FLYX_MAX_ROWS, nh, hd, kPrefills));
   const KvRef kv{dK, dV, nullptr, nullptr};
-  attention(dq, kv, nh, nkv, hd, rows, true, 0, 1.f, dP, nullptr, 0, dout, nh * hd, part, kPrefills, TL);
-  for (int r = 0; r < rows; ++r)  // a row at a time, at its own position: what decoding it gives
-    attention(dq + size_t(r) * nh * hd, kv, nh, nkv, hd, 1, true, 0, 1.f, dP, nullptr, 0, done + size_t(r) * nh * hd,
-              nh * hd, part, kPrefills, TL, r);
-  expect("head dim 512, a prefill pass of 40 rows: each row decoding's bits", down(dout, q.size()),
-         down(done, q.size()), 0);
-  for (void* p : {static_cast<void*>(dq), static_cast<void*>(dout), static_cast<void*>(done), static_cast<void*>(dK),
+  attention(dq, kv, nh, nkv, hd, rows, true, 0, scale, dP, nullptr, 0, dout, nh * hd, part, kPrefills, TL);
+  const int cut = 37;  // the same rows in two passes, the second starting at row cut
+  attention(dq, kv, nh, nkv, hd, cut, true, 0, scale, dP, nullptr, 0, dsplit, nh * hd, part, kPrefills, TL);
+  attention(dq + size_t(cut) * nh * hd, kv, nh, nkv, hd, rows - cut, true, 0, scale, dP, nullptr, 0,
+            dsplit + size_t(cut) * nh * hd, nh * hd, part, kPrefills, TL, cut);
+  Vec want(q.size());
+  for (int r = 0; r < rows; ++r)
+    for (int h = 0; h < nh; ++h) {
+      const int kvh = h / (nh / nkv), last = ctx + r;
+      std::vector<double> sc(size_t(last) + 1);
+      double mx = -1e300;
+      for (int k = 0; k <= last; ++k) {
+        double d = 0;
+        for (int c = 0; c < hd; ++c)
+          d += double(float(q[(size_t(r) * nh + h) * hd + c])) * Kc[(size_t(k) * nkv + kvh) * hd + c];
+        sc[size_t(k)] = d *= scale;
+        mx = std::max(mx, d);
+      }
+      double sum = 0;
+      for (double& v : sc) sum += (v = std::exp(v - mx));
+      for (int c = 0; c < hd; ++c) {
+        double o = 0;
+        for (int k = 0; k <= last; ++k) o += sc[size_t(k)] * Vc[(size_t(k) * nkv + kvh) * hd + c];
+        want[(size_t(r) * nh + h) * hd + c] = o / sum;
+      }
+    }
+  const Vec got = down(dout, q.size());
+  expect("head dim 512, a prefill pass of 70 rows on tensor cores", got, want, 2e-3);
+  expect("head dim 512: a row's result whatever row its pass starts at", down(dsplit, q.size()), got, 0);
+  expect_windows<kv16>("head dim 512", dq, dK, dV, nullptr, nullptr, nh, nkv, hd, rows, ctx + rows, dP, nullptr, 0,
+                       got);
+  for (void* p : {static_cast<void*>(dq), static_cast<void*>(dout), static_cast<void*>(dsplit), static_cast<void*>(dK),
                   static_cast<void*>(dV), static_cast<void*>(dP), static_cast<void*>(part)})
     CK(cudaFree(p));
 }

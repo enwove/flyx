@@ -998,9 +998,17 @@ void attention(const float* q, KvRef kv, int nh, int nkv, int hd, int rows, bool
   // Prefill (more causal rows than a round has): tensor cores, unless the options ask for the float32 kernel, a
   // sliding window's too (gpt-oss's even layers: 58 -> 10 us a layer at 145 rows).  A canvas's rows read their keys
   // through its map, which only the float32 kernels have.
+  FlashWindow one;
+  one.sinks = sinks;
+  one.sliding = window;
+  one.ring = window > 0 ? kv.ring : 0;
+  const bool flash = causal && rows > FLYX_MAX_ROWS && !L.round_rows && canvas.s0 < 0 &&
+                     opts(L).attention != kAttnSplit && (window == 0 || kv.sink == 0);
+  if (flash && attention_flash(q, kv, nh, nkv, hd, rows, scale, P, gate, ld_gate, out, ld_out, L, pos_add, one))
+    return;
   if (causal && rows > FLYX_MAX_ROWS && !attention_head_dim(hd)) {
-    // A head dim no tensor-core kernel takes (512): the split kernel a round's rows at a time, each row the bits
-    // decoding it alone gives (its partials then a round's, FLYX_MAX_ROWS rows).
+    // A head dim the grouped kernels do not take (512) where the tensor-core kernel does not either (FP8 caches,
+    // option attention=split): the split kernel a round's rows at a time, each row the bits decoding it alone gives.
     if (!out || tree || canvas.s0 >= 0)
       throw std::logic_error("flyx-cuda: a prefill pass of head dim " + std::to_string(hd) +
                              " writes float32 rows (no staged output, tree or canvas)");
@@ -1012,14 +1020,6 @@ void attention(const float* q, KvRef kv, int nh, int nkv, int hd, int rows, bool
     }
     return;
   }
-  FlashWindow one;
-  one.sinks = sinks;
-  one.sliding = window;
-  one.ring = window > 0 ? kv.ring : 0;
-  if (causal && rows > FLYX_MAX_ROWS && !L.round_rows && canvas.s0 < 0 && opts(L).attention != kAttnSplit &&
-      (window == 0 || kv.sink == 0) &&
-      attention_flash(q, kv, nh, nkv, hd, rows, scale, P, gate, ld_gate, out, ld_out, L, pos_add, one))
-    return;
   attention_split(q, kv, nh, nkv, hd, rows, causal, extra, scale, P, gate, ld_gate, out, ld_out, partial, splits, L,
                   pos_add, window, tree, canvas, SplitWindow{}, sinks);
 }

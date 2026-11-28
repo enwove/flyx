@@ -469,17 +469,24 @@ void launch_rows_mma(const float* q, KvRef kv, int nh, int nkv, int rows, bool c
   const int blocks = ceil_div(rows, rows_per_block);
   const int warps = std::max(FP8 ? kFp8Warps : 1, (rows < rows_per_block ? rows : rows_per_block) * WR);
   // One part where llama.cpp itself rounds q and p to one binary16 (two before), else
-  // three; rows_attention_parts sets it.
+  // three; rows_attention_parts sets it.  Head dim 512 (Gemma 4's global layers): one, always (a lane's output is 128
+  // floats there; three parts of q would not fit its registers beside them).
   const int asked = opts(L).rows_mma_parts;
-  const int parts = asked ? asked : G > 4 && HD >= 256 ? 1 : 3;
+  const int parts = HD > 256 ? 1 : asked ? asked : G > 4 && HD >= 256 ? 1 : 3;
   // q as e4m3 over FP8 caches where asked: on FP8 tensor cores where their sums are float32's
   // (fp8_mma), else the same e4m3 query vector on the binary16 ones.
   const bool asked_q8 = FP8 && opts(L).rows_mma_q8, q8 = asked_q8 && opts(L).fp8_mma;
   auto pick = [&](auto q8_tag) {
     constexpr bool Q8 = decltype(q8_tag)::value;
-    auto kernel = parts == 1   ? k_attention_rows_mma<HD, 1, FP8, Q8>
-                  : parts == 2 ? k_attention_rows_mma<HD, 2, FP8, Q8>
-                               : k_attention_rows_mma<HD, 3, FP8, Q8>;
+    auto kernel = k_attention_rows_mma<HD, 1, FP8, Q8>;
+    if constexpr (rows_mma_smem<HD, FP8, Q8>() > 48 * 1024) {  // head dim 512: past the default dynamic limit
+      static const bool attr = set_dynamic_smem(kernel, rows_mma_smem<HD, FP8, Q8>());
+      (void)attr;
+    }
+    if constexpr (HD <= 256)
+      kernel = parts == 1   ? k_attention_rows_mma<HD, 1, FP8, Q8>
+               : parts == 2 ? k_attention_rows_mma<HD, 2, FP8, Q8>
+                            : k_attention_rows_mma<HD, 3, FP8, Q8>;
     launch_dependent_smem(kernel, dim3(blocks, nkv, splits), dim3(32 * warps), rows_mma_smem<HD, FP8, Q8>(), L, q, kv,
                           nh, nkv, rows, rows_per_block, int(causal), extra, scale, P, partial, pos_add, from, tree,
                           int(asked_q8 && !Q8), sw);
@@ -516,6 +523,11 @@ bool attention_rows_mma(const float* q, KvRef kv, int nh, int nkv, int hd, int r
   case 128: launch_rows_mma<128>(q, kv, nh, nkv, rows, causal, extra, scale, P, partial, splits, L, pos_add, from, tree, sw);
     break;
   case 256: launch_rows_mma<256>(q, kv, nh, nkv, rows, causal, extra, scale, P, partial, splits, L, pos_add, from, tree, sw);
+    break;
+  case 512:  // Gemma 4's global layers: binary16 caches, every row (no float32 grouped kernel takes the short ones)
+    if (kv.fp8()) return false;
+    launch_rows_mma<512, false>(q, kv, nh, nkv, rows, causal, extra, scale, P, partial, splits, L, pos_add, from, tree,
+                                sw);
     break;
   default: return false;
   }

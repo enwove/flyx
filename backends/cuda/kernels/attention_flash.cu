@@ -43,21 +43,23 @@ constexpr size_t flash_smem() { return size_t(64 + 2 * flash_kt<HD>()) * (HD + 8
 
 // A window's softmax state (FlashWindow) of a warp's rows wrow0 + g and + 8 of head h, as the warp
 // holds it: the maximum (the same in the four lanes of a row), each lane's sum, the FP8 value-scale exponent (p[5]),
-// and the lane's output columns 8 n + 2 t (+1).  Exact both ways, so the windows give one pass's bits.
+// and the lane's output columns 8 n + 2 t (+1).  Exact both ways, so the windows give one pass's bits.  A warp with
+// some of a head's `full` columns (k_flash_prefill512's halves): its own from 8 n0 on, the header only if `header`.
 template <int NT, bool StoreVe = false>
 __device__ __forceinline__ void flash_state(bool store, float* state, int nh, int h, int wrow0, int rows, int g, int t,
-                                            float (&o)[NT][4], float (&m)[2], float (&l)[2], int (*ve)[2] = nullptr) {
+                                            float (&o)[NT][4], float (&m)[2], float (&l)[2], int (*ve)[2] = nullptr,
+                                            int n0 = 0, int full = NT * 8, bool header = true) {
 #pragma unroll
   for (int half = 0; half < 2; ++half) {
     const int row = wrow0 + g + 8 * half;
     if (row >= rows) continue;
-    float* p = state + (size_t(row) * nh + h) * kFlashStateFloats(NT * 8);
+    float* p = state + (size_t(row) * nh + h) * kFlashStateFloats(full);
     if (store) {
-      if (t == 0) {
+      if (header && t == 0) {
         p[0] = m[half];
         if constexpr (StoreVe) p[5] = __int_as_float((*ve)[half]);
       }
-      p[1 + t] = l[half];
+      if (header) p[1 + t] = l[half];
     } else {
       m[half] = p[0];
       l[half] = p[1 + t];
@@ -67,7 +69,7 @@ __device__ __forceinline__ void flash_state(bool store, float* state, int nh, in
     for (int n = 0; n < NT; ++n)
 #pragma unroll
       for (int e = 0; e < 2; ++e) {
-        float& x = p[8 + n * 8 + 2 * t + e];
+        float& x = p[8 + (n0 + n) * 8 + 2 * t + e];
         if (store) x = o[n][2 * half + e];
         else o[n][2 * half + e] = x;
       }
@@ -228,6 +230,179 @@ __global__ void __launch_bounds__(128) k_flash_prefill(const float* __restrict__
 #pragma unroll
       for (int e = 0; e < 2; ++e) {
         const int d = n * 8 + 2 * t + e;
+        float v = o[n][2 * half + e] * inv;
+        if (gate) v *= 1.f / (1.f + __expf(-gate[size_t(row) * ld_gate + h * HD + d]));
+        put(out, size_t(row) * ld_out + h * HD + d, size_t(row) * nh * HD + h * HD + d, v);
+      }
+  }
+}
+
+// Head dim 512 (Gemma 4's global layers), binary16 caches, no sliding window.  A row's 512 output floats do not fit
+// one warp's registers beside its queries, so each 16 rows take two warps, one half of the head's dims each: a warp
+// holds its rows' q over its half (A fragments) and its half of the output, scores a tile of 16 keys over its half,
+// adds its partner's partial scores (shared memory; a + b = b + a, so both warps hold the same scores and run the same
+// softmax), and multiplies the probabilities by its half of V.  A block: one query head, 64 rows, 8 warps (warp w: rows
+// 16 (w / 2), half w % 2); key/value tiles double-buffered (cp.async), one barrier a tile for the block and one for
+// each pair.  When no row of a warp gets a larger maximum, o is not rescaled (alpha = 1 exactly: the same bits).
+// Tiles sit on absolute key positions as in k_flash_prefill: a row's result whatever row its pass starts at, and a
+// tile with none of a row's keys leaves its state as it was.
+constexpr int kF512Keys = 16, kF512LD = 512 + 8, kF512XLD = kF512Keys + 8;  // (the scores' rows: no bank conflicts)
+constexpr size_t kF512Tile = size_t(kF512Keys) * kF512LD * sizeof(kv16);
+constexpr size_t kF512Smem = 4 * kF512Tile + size_t(8) * 16 * kF512XLD * sizeof(float);  // K, V twice; the scores
+static_assert(4 * kF512Tile >= size_t(64) * kF512LD * sizeof(kv16), "the queries pass through the tiles' bytes");
+
+__global__ void __launch_bounds__(256, 1) k_flash_prefill512(const float* __restrict__ q, KvRef kv, int nh, int nkv,
+                                                             int rows, float scale, const DevParams* P, int pos_add,
+                                                             const float* __restrict__ gate, int ld_gate, Out out,
+                                                             int ld_out, FlashWindow win) {
+  pdl_trigger();
+  constexpr int HD = 512, HALF = 256, KT = kF512Keys, LD = kF512LD, XLD = kF512XLD, NT = HALF / 8, QS = HALF / 16;
+  extern __shared__ __align__(16) unsigned char sm_raw[];
+  kv16(*Qs)[LD] = reinterpret_cast<kv16(*)[LD]>(sm_raw);  // the queries, then (the same bytes) the tiles
+  kv16(*Ks)[KT][LD] = reinterpret_cast<kv16(*)[KT][LD]>(sm_raw);
+  kv16(*Vs)[KT][LD] = reinterpret_cast<kv16(*)[KT][LD]>(sm_raw + 2 * kF512Tile);
+  float(*xs)[16][XLD] = reinterpret_cast<float(*)[16][XLD]>(sm_raw + 4 * kF512Tile);  // [warp]: its partial scores
+  const int h = blockIdx.x, r0 = blockIdx.y * 64, tid = threadIdx.x, warp = tid >> 5, lane = tid & 31;
+  const int hf = warp & 1, g = lane >> 2, t = lane & 3;
+  const int kvh = h / (nh / nkv);
+  const int base = P->position + pos_add;
+  for (int i = tid; i < 64 * HD / 2; i += 256) {
+    const int r = i / (HD / 2), c = 2 * (i % (HD / 2));
+    float2 v = make_float2(0.f, 0.f);
+    if (r0 + r < rows) v = *reinterpret_cast<const float2*>(q + (size_t(r0 + r) * nh + h) * HD + c);
+    *reinterpret_cast<__half2*>(&Qs[r][c]) = __floats2half2_rn(v.x, v.y);
+  }
+  __syncthreads();
+  const int wrow0 = r0 + (warp >> 1) * 16;  // this warp's first query row
+  uint32_t qa[QS][4];
+#pragma unroll
+  for (int ks = 0; ks < QS; ++ks) ldmatrix_x4(qa[ks], &Qs[wrow0 - r0 + (lane & 15)][hf * HALF + ks * 16 + (lane >> 4) * 8]);
+  __syncthreads();  // the queries' bytes become the tiles'
+  const int last_row = min(rows, r0 + 64) - 1;
+  const int kwin = min(base + last_row + 1, win.k_hi), kfirst = win.k_lo;  // the window's keys the block needs
+  const float sl2 = scale * 1.4426950408889634f;
+  float o[NT][4];
+#pragma unroll
+  for (int n = 0; n < NT; ++n) o[n][0] = o[n][1] = o[n][2] = o[n][3] = 0.f;
+  float m[2] = {-INFINITY, -INFINITY}, l[2] = {0.f, 0.f};
+  if (!win.first) flash_state<NT>(false, win.state, nh, h, wrow0, rows, g, t, o, m, l, nullptr, hf * NT, HD);
+  const kv16* Kc = static_cast<const kv16*>(kv.k);
+  const kv16* Vc = static_cast<const kv16*>(kv.v);
+  auto load = [&](int k0, int buf) {
+    for (int i = tid; i < KT * HD / 8; i += 256) {
+      const int r = i / (HD / 8), c = 8 * (i % (HD / 8)), pos = k0 + r;
+      const bool ok = pos < kwin;
+      const size_t at = (size_t(ok ? (win.ring ? pos % win.ring : pos) : kfirst) * nkv + kvh) * HD + c;
+      cp_async16(&Ks[buf][r][c], Kc + at, ok);
+      cp_async16(&Vs[buf][r][c], Vc + at, ok);
+    }
+    cp_async_commit();
+  };
+  if (kfirst < kwin) load(kfirst, 0);
+  for (int k0 = kfirst, buf = 0; k0 < kwin; k0 += KT, buf ^= 1) {
+    cp_async_wait<0>();
+    __syncthreads();  // tile k0 is in buf; every warp is done with the other buffer and with its partner's scores
+    if (k0 + KT < kwin) load(k0 + KT, buf ^ 1);
+    if (wrow0 >= rows || base + wrow0 + 15 < k0) continue;  // all of the pair's rows precede the tile
+    float s[2][4], s2[2][4];  // even and odd k-steps: two chains of MMAs a key column
+#pragma unroll
+    for (int j = 0; j < 2; ++j)
+#pragma unroll
+      for (int e = 0; e < 4; ++e) s[j][e] = s2[j][e] = 0.f;
+#pragma unroll
+    for (int ks = 0; ks < QS; ks += 2)
+#pragma unroll
+      for (int j = 0; j < 2; ++j) {
+        uint32_t b[4];
+        ldmatrix_x4(b, &Ks[buf][j * 8 + (lane & 7)][hf * HALF + ks * 16 + (lane >> 3) * 8]);
+        mma_f16(s[j], qa[ks], b);
+        mma_f16(s2[j], qa[ks + 1], b + 2);
+      }
+#pragma unroll
+    for (int j = 0; j < 2; ++j)
+#pragma unroll
+      for (int e = 0; e < 4; ++e) s[j][e] += s2[j][e];
+#pragma unroll
+    for (int j = 0; j < 2; ++j)
+#pragma unroll
+      for (int half = 0; half < 2; ++half)
+        *reinterpret_cast<float2*>(&xs[warp][g + 8 * half][j * 8 + 2 * t]) = make_float2(s[j][2 * half], s[j][2 * half + 1]);
+    asm volatile("bar.sync %0, 64;" ::"r"(1 + (warp >> 1)) : "memory");  // the pair's partial scores
+#pragma unroll
+    for (int j = 0; j < 2; ++j)
+#pragma unroll
+      for (int half = 0; half < 2; ++half) {
+        const float2 x = *reinterpret_cast<const float2*>(&xs[warp ^ 1][g + 8 * half][j * 8 + 2 * t]);
+        s[j][2 * half] += x.x;
+        s[j][2 * half + 1] += x.y;
+      }
+    float alpha[2];
+#pragma unroll
+    for (int half = 0; half < 2; ++half) {
+      const int row = wrow0 + g + 8 * half, qpos = base + row;
+      float mx = -INFINITY;
+#pragma unroll
+      for (int j = 0; j < 2; ++j)
+#pragma unroll
+        for (int e = 0; e < 2; ++e) {
+          const int key = k0 + j * 8 + 2 * t + e;
+          float& v = s[j][2 * half + e];
+          v = (row < rows && key <= qpos) ? v * sl2 : -INFINITY;
+          mx = fmaxf(mx, v);
+        }
+      mx = fmaxf(mx, __shfl_xor_sync(0xffffffffu, mx, 1));
+      mx = fmaxf(mx, __shfl_xor_sync(0xffffffffu, mx, 2));
+      const float mnew = fmaxf(m[half], mx);
+      alpha[half] = mnew == -INFINITY ? 1.f : exp2f(m[half] - mnew);
+      m[half] = mnew;
+      l[half] *= alpha[half];
+#pragma unroll
+      for (int j = 0; j < 2; ++j)
+#pragma unroll
+        for (int e = 0; e < 2; ++e) {
+          float& v = s[j][2 * half + e];
+          v = mnew == -INFINITY ? 0.f : exp2f(v - mnew);
+          l[half] += v;
+        }
+    }
+    if (__any_sync(0xffffffffu, alpha[0] != 1.f || alpha[1] != 1.f))
+#pragma unroll
+      for (int n = 0; n < NT; ++n) {
+        o[n][0] *= alpha[0];
+        o[n][1] *= alpha[0];
+        o[n][2] *= alpha[1];
+        o[n][3] *= alpha[1];
+      }
+    const uint32_t a[4] = {pack_f16(s[0][0], s[0][1]), pack_f16(s[0][2], s[0][3]), pack_f16(s[1][0], s[1][1]),
+                           pack_f16(s[1][2], s[1][3])};
+    const uint32_t vrow = static_cast<uint32_t>(__cvta_generic_to_shared(&Vs[buf][lane & 15][hf * HALF + (lane >> 4) * 8]));
+#pragma unroll
+    for (int n = 0; n < NT; n += 2) {
+      uint32_t b[4];
+      ldmatrix_x4_t_s(b, vrow + n * 8 * sizeof(kv16));  // the column tiles n and n + 1
+      mma_f16(o[n], a, b);
+      mma_f16(o[n + 1], a, b + 2);
+    }
+  }
+  if (!win.last) {  // the next window goes on from here (the pair's maximum and sums: half 0's warp writes them)
+    __syncthreads();  // every warp has read them (a window with no tile for the block)
+    flash_state<NT>(true, win.state, nh, h, wrow0, rows, g, t, o, m, l, nullptr, hf * NT, HD, hf == 0);
+    return;
+  }
+#pragma unroll
+  for (int half = 0; half < 2; ++half) {
+    float sum = l[half];
+    sum += __shfl_xor_sync(0xffffffffu, sum, 1);
+    sum += __shfl_xor_sync(0xffffffffu, sum, 2);
+    const int row = wrow0 + g + 8 * half;
+    if (row >= rows) continue;
+    if (win.sinks) sum += exp2f(fminf(win.sinks[h] * 1.4426950408889634f - m[half], 126.f));
+    const float inv = sum > 0.f ? 1.f / sum : 0.f;
+#pragma unroll
+    for (int n = 0; n < NT; ++n)
+#pragma unroll
+      for (int e = 0; e < 2; ++e) {
+        const int d = hf * HALF + n * 8 + 2 * t + e;
         float v = o[n][2 * half + e] * inv;
         if (gate) v *= 1.f / (1.f + __expf(-gate[size_t(row) * ld_gate + h * HD + d]));
         put(out, size_t(row) * ld_out + h * HD + d, size_t(row) * nh * HD + h * HD + d, v);
@@ -744,6 +919,15 @@ bool attention_flash(const float* q, KvRef kv, int nh, int nkv, int hd, int rows
     FLYX_FLASH(64)
     FLYX_FLASH(128)
     FLYX_FLASH(256)
+    case 512: {  // Gemma 4's global layers: binary16 caches, no sliding window
+      if (kv.fp8() || win.sliding) return false;
+      static const bool attr = set_dynamic_smem(k_flash_prefill512, kF512Smem);
+      (void)attr;
+      k_flash_prefill512<<<dim3(nh, ceil_div(rows, 64)), 256, kF512Smem, st>>>(q, kv, nh, nkv, rows, scale, P,
+                                                                                 pos_add, gate, ld_gate, out, ld_out,
+                                                                                 win);
+      return true;
+    }
     default: return false;
   }
 #undef FLYX_FLASH
