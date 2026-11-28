@@ -61,6 +61,19 @@ function App() {
   const [currentAsked, setCurrentAsked] = useState(0);  // and for its card of the model (a load's state, its error)
   const [memKind, setMemKind] = useState("");           // "" | "vram" | "ram": modal showing apps using memory
   const [collapsed, setCollapsedState] = useState(document.documentElement.dataset.side === "collapsed");
+  // A narrow screen's sidebar is a drawer over the page (style.css): open from the top bar's menu button, shut by a
+  // page chosen, a tap beside it, or Escape.
+  const [drawer, setDrawerState] = useState(false);
+  const setDrawer = (open) => {
+    if (open) document.documentElement.dataset.drawer = "open"; else delete document.documentElement.dataset.drawer;
+    setDrawerState(open);
+  };
+  useEffect(() => {
+    if (!drawer) return;
+    const key = (e) => { if (e.key === "Escape") setDrawer(false); };
+    document.addEventListener("keydown", key);
+    return () => document.removeEventListener("keydown", key);
+  }, [drawer]);
 
   useEffect(() => {
     const again = () => redraw((x) => x + 1);
@@ -75,6 +88,7 @@ function App() {
   };
   const go = (to, id = openRequest) => {
     if (!TABS.includes(to)) to = "overview";
+    setDrawer(false);
     setTab(to);
     saved.set("tab", to);
     setAddress(to, id);
@@ -152,8 +166,9 @@ function App() {
   const modalRetryLabel = tm && tm.model && tm.model.id ? "Reload model" : "Retry loading";
   return html`
     <div class="app">
-      <${TopBar} title=${TITLES[tab]} go=${go}/>
+      <${TopBar} title=${TITLES[tab]} go=${go} menuOpen=${drawer} onMenu=${() => setDrawer(!drawer)}/>
       <${Sidebar} tab=${tab} go=${go} collapsed=${collapsed} setCollapsed=${setCollapsed} onOpenMem=${setMemKind}/>
+      <div class="scrim" hidden=${!drawer} onClick=${() => setDrawer(false)}></div>
       <main id="main">
         <div class="page">
           <${Notice} keyChanged=${keyChanged}/>

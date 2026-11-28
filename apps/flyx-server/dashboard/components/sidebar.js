@@ -150,7 +150,7 @@ export function Sidebar({ tab, go, collapsed, setCollapsed, onOpenMem }) {
   const tm = live.last || {};
   const f = figures(tm);
   return html`
-    <aside class="side">
+    <aside class="side" id="side">
       <nav role="tablist" aria-label="pages">
         ${PAGES.map(([id, name, icon], i) => html`
           <button class="navi" role="tab" data-tab=${id} data-tip=${t(name)} title=${t(name) + "  (" + (i + 1) + ")"}

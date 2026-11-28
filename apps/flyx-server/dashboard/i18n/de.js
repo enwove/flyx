@@ -62,7 +62,7 @@ export default {
     "Requests": "Anfragen",
     "Chat": "Chat",
     "Integration": "Integration",
-    "Collapse": "Einklappen",
+    "Collapse": "Einklappen", "Menu": "Menü",
     "Overview  (1)": "Übersicht  (1)",
     "Model  (2)": "Modell  (2)",
     "Requests  (3)": "Anfragen  (3)",

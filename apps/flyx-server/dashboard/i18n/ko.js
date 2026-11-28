@@ -62,7 +62,7 @@ export default {
     "Requests": "요청",
     "Chat": "채팅",
     "Integration": "연동",
-    "Collapse": "접기",
+    "Collapse": "접기", "Menu": "메뉴",
     "Overview  (1)": "개요  (1)",
     "Model  (2)": "모델  (2)",
     "Requests  (3)": "요청  (3)",

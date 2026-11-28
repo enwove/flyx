@@ -106,9 +106,13 @@ function ThemeMenu() {
     </div>`;
 }
 
-export function TopBar({ title, go }) {
+// menuOpen, onMenu: the sidebar as a drawer on a narrow screen (a phone on the LAN), opened by the menu button that
+// only such a screen shows (style.css).
+export function TopBar({ title, go, menuOpen, onMenu }) {
   return html`
     <header class="topbar">
+      <button class="iconbtn menubtn" id="menu" title=${t("Menu")} aria-label=${t("Menu")} aria-controls="side"
+              aria-expanded=${String(!!menuOpen)} onClick=${onMenu}><${Icon} name="menu"/></button>
       <a class="word" href="#overview" aria-label="FLYX" onClick=${(e) => { e.preventDefault(); go("overview"); }}>
         <img src=${"/dashboard/brand/flyx-lockup" + (shownTheme() === "dark" ? "-dark" : "") + ".svg"} alt="" width="102" height="24"/></a>
       <span class="sep">/</span><h1 class="crumb" id="page-title">${t(title)}</h1>

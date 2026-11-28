@@ -53,7 +53,7 @@ export default {
     "Automatic compaction": "自动压缩", "Prompt exceeded the context": "提示词超出上下文窗口", "First turn after compaction": "压缩后的首次请求",
     "Queue time": "排队耗时", "Prefill time": "Prefill 耗时", "Decode time": "Decoding 耗时",
     // frame and sidebar
-    "Overview": "概览", "Model": "模型", "Requests": "请求", "Chat": "对话", "Integration": "集成", "Collapse": "收起",
+    "Overview": "概览", "Model": "模型", "Requests": "请求", "Chat": "对话", "Integration": "集成", "Collapse": "收起", "Menu": "菜单",
     "Overview  (1)": "概览  (1)", "Model  (2)": "模型  (2)", "Requests  (3)": "请求  (3)", "Chat  (4)": "对话  (4)",
     "Expand": "展开", "Live": "实时", "Decode": "Decoding 速度", "Tokens / round": "接受长度", "TTFT": "首 token", "VRAM": "显存", "Context": "上下文",
     "Running / queued": "运行 / 排队", "GPU": "GPU", "now": "当前", "last request": "上一条", "no drafter": "无 drafter",

@@ -62,7 +62,7 @@ export default {
     "Requests": "リクエスト",
     "Chat": "チャット",
     "Integration": "連携",
-    "Collapse": "折りたたむ",
+    "Collapse": "折りたたむ", "Menu": "メニュー",
     "Overview  (1)": "概要  (1)",
     "Model  (2)": "モデル  (2)",
     "Requests  (3)": "リクエスト  (3)",

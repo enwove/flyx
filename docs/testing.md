@@ -216,6 +216,10 @@ python tests/apps/flyx-server/check_dashboard_model.py
 # Light and dark themes: light as it was, dark before the first paint and across a reload, the system's setting
 # followed while nothing is chosen, a browser without storage, the menu in all 7 languages
 python tests/apps/flyx-server/check_dashboard_theme.py
+
+# The frame: at a phone's width no page wider than the screen and the sidebar a drawer (the menu button, a page
+# chosen, a tap beside it, Escape); at both widths the chat, request log and server log within the window
+python tests/apps/flyx-server/check_dashboard_layout.py
 ```
 
 ### Coding Agent Integration Tests
