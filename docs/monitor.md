@@ -14,7 +14,7 @@ Read-only JSON snapshot (`Cache-Control: no-store`). Query parameter: `?recent=N
   "sampled_at": 1763500000.12,
   "server": {
     "name": "flyx-server",
-    "version": "0.2.1",
+    "version": "0.2.2",
     "pid": 12345,
     "started_at": 1763499900.0,
     "uptime_s": 100.12,

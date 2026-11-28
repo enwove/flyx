@@ -32,7 +32,7 @@
   <a href="../../llms.txt">llms.txt</a>
 </p>
 
-**FLYX**는 의존성 제로 로컬 LLM 추론 엔진으로, Windows에서는 약 57 MB 단일 `.exe` 하나에 담깁니다. 빠른 추측 디코딩, 네이티브 롱 컨텍스트, GPU별 자동 튜닝을 제공하며 별도의 설정이 필요하지 않습니다. 지원하는 GGUF 모델을 변환 없이 그대로 실행하고 OpenAI 및 Anthropic 호환 API를 통해 브라우저, 스크립트, 코딩 에이전트에 바로 연결할 수 있습니다.
+**FLYX**는 의존성 제로 로컬 LLM 추론 엔진으로, Windows에서는 약 58 MB 단일 `.exe` 하나에 담깁니다. 빠른 추측 디코딩, 네이티브 롱 컨텍스트, GPU별 자동 튜닝을 제공하며 별도의 설정이 필요하지 않습니다. 지원하는 GGUF 모델을 변환 없이 그대로 실행하고 OpenAI 및 Anthropic 호환 API를 통해 브라우저, 스크립트, 코딩 에이전트에 바로 연결할 수 있습니다.
 
 <p align="center">
   <img src="../media/dashboard-light.png" width="900" alt="실시간 처리량, 롱 컨텍스트 세션, VRAM/RAM 사용량 및 최근 에이전트 요청을 표시하는 FLYX 내장 웹 대시보드">
@@ -44,7 +44,7 @@
 - **최대 6× 빠른 생성** — 추측 디코딩(MTP, DFlash2, DSpark, 프롬프트 룩업)을 내장했습니다. RTX 5090에서 Qwen3.8-27B는 **565.5 tok/s**, Inkling-2-Mini는 **438.9 tok/s**에 이릅니다([성능](#성능)).
 - **소비자용 PC에서 최대 1M 네이티브 컨텍스트** — 16 GB VRAM + 32 GB RAM에서 Inkling-2-Mini를 1M 컨텍스트로 실행합니다.
 - **GPU별 사전 튜닝, 수동 플래그 불필요** — 16종의 NVIDIA GPU에 대한 실측 커널 튜닝 테이블을 내장하고 있으며, 가용 메모리를 기준으로 컨텍스트 길이, K/V 정밀도, GPU/RAM 배치를 자동 결정합니다. 오프로드 레이어 수, 배치 크기, 캐시 타입을 직접 맞출 필요가 없습니다.
-- **설치 불필요, 의존성 제로, 약 57 MB** — CUDA 및 C++ 런타임이 정적으로 링크되어 있어 NVIDIA 드라이버(≥ 580)만 있으면 됩니다. CUDA Toolkit, Python, Docker가 필요 없습니다. Windows에서는 약 57 MB 단일 `.exe`(더블 클릭 실행), Linux에서는 tar.gz 압축 파일로 제공됩니다.
+- **설치 불필요, 의존성 제로, 약 58 MB** — CUDA 및 C++ 런타임이 정적으로 링크되어 있어 NVIDIA 드라이버(≥ 580)만 있으면 됩니다. CUDA Toolkit, Python, Docker가 필요 없습니다. Windows에서는 약 58 MB 단일 `.exe`(더블 클릭 실행), Linux에서는 tar.gz 압축 파일로 제공됩니다.
 - **내장 웹 대시보드 및 터미널 모니터** — 실행 즉시 7개 언어를 지원하는 브라우저 UI가 열리며, 단계별 안내와 함께 Hugging Face 또는 로컬 모델 검색·다운로드, 채팅(텍스트 및 이미지), 현지화된 API 문서 확인, 실시간 처리량·VRAM/RAM 분할·세션·요청·로그 모니터링을 제공합니다([모니터 가이드](../monitor.md)).
 - **원클릭 코딩 에이전트 연동** — 도구 호출과 멀티턴 프롬프트 재사용을 지원하는 OpenAI(Chat Completions, Responses) 및 Anthropic Messages API를 제공합니다. **연동(Integration)** 탭에서 프로젝트 폴더를 선택해 **Claude Code** 또는 **Codex CLI**를 바로 실행할 수 있으며(Windows), **DeepSeek Harness, OpenCode, Pi**용 실행 명령도 원클릭 복사할 수 있습니다.
 - **검증된 정확도** — 모든 GPU 커널을 `float64` 레퍼런스 구현과 대조 테스트합니다. 기본 FP8 K/V는 27B 모델에서 16-bit 대비 **KL 0.0009–0.0016** 이내를 유지하며, 추측 디코딩의 출력은 기본 디코딩과 **토큰 단위로 완전히 동일**합니다([수치 규격](../design/numerics.md)).
@@ -90,7 +90,7 @@ GPU 4종에서 검증한 v0.2.1 디코딩 속도(토큰/초, greedy)입니다. *
 
 [GitHub Releases](https://github.com/enwove/flyx/releases)에서 최신 버전을 다운로드하세요. NVIDIA 드라이버(≥ 580)만 있으면 됩니다:
 
-- **Windows:** `flyx-0.2.1-windows-x86_64-cuda13.exe`를 더블 클릭(또는 PowerShell에서 `.\flyx-0.2.1-windows-x86_64-cuda13.exe serve` 실행)하면 서버가 시작되고 대시보드가 자동으로 열립니다(`8080` 포트가 사용 중이면 다른 빈 포트를 자동 선택).
+- **Windows:** `flyx-0.2.2-windows-x86_64-cuda13.exe`를 더블 클릭(또는 PowerShell에서 `.\flyx-0.2.2-windows-x86_64-cuda13.exe serve` 실행)하면 서버가 시작되고 대시보드가 자동으로 열립니다(`8080` 포트가 사용 중이면 다른 빈 포트를 자동 선택).
 - **Linux / WSL2:** 압축을 풀고 다음을 실행합니다:
 
 ```sh

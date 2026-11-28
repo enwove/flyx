@@ -32,7 +32,7 @@
   <a href="../../llms.txt">llms.txt</a>
 </p>
 
-**FLYX** est un moteur d'inférence LLM local sans dépendance qui tient dans un seul `.exe` Windows de ~57 Mo — décodage spéculatif rapide, contexte long natif, optimisé par GPU, aucune configuration requise. Exécutez les modèles GGUF pris en charge tels quels et servez-les à votre navigateur, vos scripts et vos agents de code via des APIs compatibles OpenAI et Anthropic.
+**FLYX** est un moteur d'inférence LLM local sans dépendance qui tient dans un seul `.exe` Windows de ~58 Mo — décodage spéculatif rapide, contexte long natif, optimisé par GPU, aucune configuration requise. Exécutez les modèles GGUF pris en charge tels quels et servez-les à votre navigateur, vos scripts et vos agents de code via des APIs compatibles OpenAI et Anthropic.
 
 <p align="center">
   <img src="../media/dashboard-light.png" width="900" alt="Tableau de bord web intégré de FLYX affichant le débit en direct, les sessions à contexte long, l'utilisation VRAM et RAM ainsi que les requêtes récentes d'agents">
@@ -44,7 +44,7 @@
 - **Une génération jusqu'à 6× plus rapide** — Décodage spéculatif intégré (MTP, DFlash2, DSpark et recherche dans le prompt) : **565.5 tok/s** avec Qwen3.8-27B et **438.9 tok/s** avec Inkling-2-Mini sur une RTX 5090 ([Performances](#performances)).
 - **Jusqu'à 1M de contexte natif sur un PC grand public** — Exécute Inkling-2-Mini avec 1M de contexte sur 16 Go de VRAM + 32 Go de RAM.
 - **Optimisé par GPU, zéro option manuelle** — Embarque des tables d'optimisation de kernels mesurées pour 16 GPUs NVIDIA et ajuste automatiquement la longueur de contexte, la précision K/V et la répartition GPU/RAM selon la mémoire disponible. Plus besoin de deviner le nombre de couches déchargées, la taille de lot ou le type de cache.
-- **Sans installation, sans dépendance, ~57 Mo** — Les runtimes CUDA et C++ sont liés statiquement ; seul le pilote NVIDIA (≥ 580) est requis. Aucun CUDA Toolkit, Python ou Docker nécessaire. Un seul `.exe` de ~57 Mo sous Windows (double-clic pour lancer), ou une archive tar.gz sous Linux.
+- **Sans installation, sans dépendance, ~58 Mo** — Les runtimes CUDA et C++ sont liés statiquement ; seul le pilote NVIDIA (≥ 580) est requis. Aucun CUDA Toolkit, Python ou Docker nécessaire. Un seul `.exe` de ~58 Mo sous Windows (double-clic pour lancer), ou une archive tar.gz sous Linux.
 - **Tableau de bord web intégré et moniteur terminal** — S'ouvre directement sur une interface web (7 langues) avec des indications guidées pour rechercher/télécharger des modèles Hugging Face ou locaux, discuter (texte et images), lire la documentation API localisée et suivre en direct le débit, la répartition VRAM/RAM, les sessions, les requêtes et les journaux ([guide du moniteur](../monitor.md)).
 - **Intégration en un clic avec les agents de code** — Prend en charge OpenAI (Chat Completions, Responses) et Anthropic Messages avec appels d'outils et réutilisation multi-tours du préfixe. Lancez **Claude Code** ou **Codex CLI** directement dans votre dossier de projet depuis **Intégration** (Windows), ou copiez les commandes prêtes à l'emploi pour **DeepSeek Harness, OpenCode et Pi**.
 - **Précision vérifiée** — Chaque kernel GPU est testé par rapport à une référence `float64` ; le cache K/V FP8 par défaut reste entre **KL 0.0009–0.0016** par rapport au 16-bit sur 27B ; le décodage spéculatif est **strictement identique token par token** au décodage ordinaire ([numérique](../design/numerics.md)).
@@ -90,7 +90,7 @@ Vitesse de décodage de la v0.2.1 en tokens/s, vérifiée sur quatre GPUs (greed
 
 Téléchargez la dernière version sur [GitHub Releases](https://github.com/enwove/flyx/releases) — seul un pilote NVIDIA (≥ 580) est requis :
 
-- **Windows :** Double-cliquez sur `flyx-0.2.1-windows-x86_64-cuda13.exe` (ou exécutez `.\flyx-0.2.1-windows-x86_64-cuda13.exe serve` dans PowerShell). Le serveur démarre et ouvre automatiquement le tableau de bord (en choisissant un autre port libre si `8080` est occupé).
+- **Windows :** Double-cliquez sur `flyx-0.2.2-windows-x86_64-cuda13.exe` (ou exécutez `.\flyx-0.2.2-windows-x86_64-cuda13.exe serve` dans PowerShell). Le serveur démarre et ouvre automatiquement le tableau de bord (en choisissant un autre port libre si `8080` est occupé).
 - **Linux / WSL2 :** Extrayez l'archive et lancez :
 
 ```sh

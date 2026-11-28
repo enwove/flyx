@@ -32,7 +32,7 @@
   <a href="../../llms.txt">llms.txt</a>
 </p>
 
-**FLYX** は依存関係ゼロのローカル LLM 推論エンジンで、Windows では約 57 MB の単一 `.exe` に収まります。高速な投機デコード、ネイティブな長文コンテキスト、GPU ごとの自動チューニングを備え、面倒なセットアップは一切不要です。対応する GGUF モデルをそのまま読み込み、OpenAI / Anthropic 互換 API を通じてブラウザ、スクリプト、コーディングエージェントへ即座に提供できます。
+**FLYX** は依存関係ゼロのローカル LLM 推論エンジンで、Windows では約 58 MB の単一 `.exe` に収まります。高速な投機デコード、ネイティブな長文コンテキスト、GPU ごとの自動チューニングを備え、面倒なセットアップは一切不要です。対応する GGUF モデルをそのまま読み込み、OpenAI / Anthropic 互換 API を通じてブラウザ、スクリプト、コーディングエージェントへ即座に提供できます。
 
 <p align="center">
   <img src="../media/dashboard-light.png" width="900" alt="FLYX 内蔵 Web ダッシュボード：リアルタイムスループット、長文コンテキストセッション、VRAM / RAM 使用量、最近のエージェントリクエストを表示">
@@ -44,7 +44,7 @@
 - **生成を最大 6× 高速化** — 投機デコード（MTP・DFlash2・DSpark・プロンプト検索）を内蔵。RTX 5090 で Qwen3.8-27B は **565.5 tok/s**、Inkling-2-Mini は **438.9 tok/s** に達します（[パフォーマンス](#パフォーマンス)）。
 - **コンシューマー PC で最大 1M のネイティブコンテキスト** — 16 GB VRAM + 32 GB RAM で Inkling-2-Mini を 1M コンテキストで実行できます。
 - **GPU 別チューニング済み・手動フラグ不要** — 16 種類の NVIDIA GPU 向け実測カーネルチューニング表を内蔵し、利用可能なメモリに応じてコンテキスト長・K/V 精度・GPU/RAM 配置を自動決定します。オフロード層数やバッチサイズ、キャッシュ形式を試行錯誤する必要はありません。
-- **インストール不要・依存関係ゼロ・約 57 MB** — CUDA および C++ ランタイムを静的リンク済み。必要なのは NVIDIA ドライバ（≥ 580）のみで、CUDA Toolkit・Python・Docker は不要です。Windows は約 57 MB の単一 `.exe`（ダブルクリックで起動）、Linux は tar.gz アーカイブです。
+- **インストール不要・依存関係ゼロ・約 58 MB** — CUDA および C++ ランタイムを静的リンク済み。必要なのは NVIDIA ドライバ（≥ 580）のみで、CUDA Toolkit・Python・Docker は不要です。Windows は約 58 MB の単一 `.exe`（ダブルクリックで起動）、Linux は tar.gz アーカイブです。
 - **内蔵 Web ダッシュボード＆ターミナルモニター** — 起動すると多言語 Web UI（7 言語対応）が自動で開き、次の操作ガイドとともに Hugging Face / ローカルモデルの検索・ダウンロード、チャット（テキストと画像）、多言語 API ドキュメント閲覧、リアルタイムのスループット・VRAM/RAM 内訳・セッション・リクエスト・ログ監視が行えます（[モニターガイド](../monitor.md)）。
 - **コーディングエージェントへワンクリック連携** — ツール呼び出しとマルチターン接頭辞キャッシュを備えた OpenAI（Chat Completions / Responses）および Anthropic Messages API に対応。**連携（Integration）**画面からプロジェクトフォルダを選んで **Claude Code** や **Codex CLI** を直接起動できるほか（Windows）、**DeepSeek Harness / OpenCode / Pi** 向けの即実行コマンドもコピーできます。
 - **検証済みの数値精度** — すべての GPU カーネルを `float64` リファレンス実装と照合テスト済み。デフォルトの FP8 K/V は 27B モデルで 16-bit 比 **KL 0.0009–0.0016** に収まり、投機デコードの出力は通常デコードと**トークン単位で完全一致**します（[数値仕様](../design/numerics.md)）。
@@ -90,7 +90,7 @@
 
 [GitHub Releases](https://github.com/enwove/flyx/releases) から最新版をダウンロードしてください。必要なのは NVIDIA ドライバ（≥ 580）のみです：
 
-- **Windows：** `flyx-0.2.1-windows-x86_64-cuda13.exe` をダブルクリック（または PowerShell で `.\flyx-0.2.1-windows-x86_64-cuda13.exe serve` を実行）。サーバーが起動し、自動でダッシュボードが開きます（`8080` が使用中の場合は別の空きポートを自動選択）。
+- **Windows：** `flyx-0.2.2-windows-x86_64-cuda13.exe` をダブルクリック（または PowerShell で `.\flyx-0.2.2-windows-x86_64-cuda13.exe serve` を実行）。サーバーが起動し、自動でダッシュボードが開きます（`8080` が使用中の場合は別の空きポートを自動選択）。
 - **Linux / WSL2：** アーカイブを展開して実行：
 
 ```sh

@@ -32,7 +32,7 @@
   <a href="../../llms.txt">llms.txt</a>
 </p>
 
-**FLYX** ist eine lokale LLM-Inferenz-Engine ohne Abhängigkeiten, die in eine einzelne ~57 MB große Windows-`.exe` passt — schnelles spekulatives Dekodieren, nativer Langkontext, pro GPU abgestimmt, ganz ohne Einrichtung. Führen Sie unterstützte GGUF-Modelle direkt aus und stellen Sie sie Ihrem Browser, Skripten und Coding-Agenten über OpenAI- und Anthropic-kompatible APIs bereit.
+**FLYX** ist eine lokale LLM-Inferenz-Engine ohne Abhängigkeiten, die in eine einzelne ~58 MB große Windows-`.exe` passt — schnelles spekulatives Dekodieren, nativer Langkontext, pro GPU abgestimmt, ganz ohne Einrichtung. Führen Sie unterstützte GGUF-Modelle direkt aus und stellen Sie sie Ihrem Browser, Skripten und Coding-Agenten über OpenAI- und Anthropic-kompatible APIs bereit.
 
 <p align="center">
   <img src="../media/dashboard-light.png" width="900" alt="Integriertes FLYX-Web-Dashboard mit Live-Durchsatz, Langkontext-Sitzungen, VRAM- und RAM-Auslastung sowie aktuellen Agenten-Anfragen">
@@ -44,7 +44,7 @@
 - **Bis zu 6× schnellere Generierung** — Integriertes spekulatives Dekodieren (MTP, DFlash2, DSpark und Prompt-Lookup): **565.5 tok/s** mit Qwen3.8-27B und **438.9 tok/s** mit Inkling-2-Mini auf einer RTX 5090 ([Leistung](#leistung)).
 - **Bis zu 1M nativer Kontext auf einem Consumer-PC** — Führt Inkling-2-Mini mit 1M Kontext auf 16 GB VRAM + 32 GB RAM aus.
 - **Pro GPU abgestimmt, keine manuellen Flags** — Liefert gemessene Kernel-Tuning-Tabellen für 16 NVIDIA-GPUs mit und bestimmt Kontextlänge, K/V-Präzision und GPU/RAM-Aufteilung automatisch anhand des verfügbaren Speichers. Kein Rätselraten bei Offload-Schichten, Batch-Größen oder Cache-Typen.
-- **Keine Installation, keine Abhängigkeiten, ~57 MB** — CUDA- und C++-Laufzeiten sind statisch eingebunden; nur der NVIDIA-Treiber (≥ 580) wird benötigt. Kein CUDA Toolkit, Python oder Docker. Eine einzelne ~57 MB große `.exe` unter Windows (Doppelklick genügt) oder ein Tarball unter Linux.
+- **Keine Installation, keine Abhängigkeiten, ~58 MB** — CUDA- und C++-Laufzeiten sind statisch eingebunden; nur der NVIDIA-Treiber (≥ 580) wird benötigt. Kein CUDA Toolkit, Python oder Docker. Eine einzelne ~58 MB große `.exe` unter Windows (Doppelklick genügt) oder ein Tarball unter Linux.
 - **Integriertes Web-Dashboard & Terminal-Monitor** — Startet direkt in einer Browser-Oberfläche (7 Sprachen) mit geführten Hinweisen zum Suchen/Herunterladen von Hugging-Face- oder lokalen Modellen, Chatten (Text & Bilder), lokalisierten API-Dokumenten sowie Live-Überwachung von Durchsatz, VRAM/RAM-Aufteilung, Sitzungen, Anfragen und Protokollen ([Monitor-Leitfaden](../monitor.md)).
 - **Ein-Klick-Integration für Coding-Agenten** — Spricht OpenAI (Chat Completions, Responses) und Anthropic Messages inklusive Tool-Calls und Multi-Turn-Präfix-Wiederverwendung. Starten Sie **Claude Code** oder **Codex CLI** unter **Integration** direkt in Ihrem Projektordner (Windows) oder kopieren Sie sofort ausführbare Befehle für **DeepSeek Harness, OpenCode und Pi**.
 - **Verifizierte Genauigkeit** — Jeder GPU-Kernel wird gegen eine `float64`-Referenz geprüft; standardmäßiges FP8-K/V bleibt auf 27B innerhalb von **KL 0.0009–0.0016** zu 16-Bit; spekulatives Dekodieren liefert **Token-für-Token identische** Ausgaben wie die normale Dekodierung ([Numerik](../design/numerics.md)).
@@ -90,7 +90,7 @@ Dekodiergeschwindigkeit von v0.2.1 in Token/s, auf vier GPUs verifiziert (greedy
 
 Laden Sie das aktuelle Release von [GitHub Releases](https://github.com/enwove/flyx/releases) herunter — es wird lediglich ein NVIDIA-Treiber (≥ 580) benötigt:
 
-- **Windows:** Doppelklicken Sie auf `flyx-0.2.1-windows-x86_64-cuda13.exe` (oder führen Sie `.\flyx-0.2.1-windows-x86_64-cuda13.exe serve` in PowerShell aus). Der Server startet und öffnet das Dashboard automatisch (und wählt einen anderen freien Port, falls `8080` belegt ist).
+- **Windows:** Doppelklicken Sie auf `flyx-0.2.2-windows-x86_64-cuda13.exe` (oder führen Sie `.\flyx-0.2.2-windows-x86_64-cuda13.exe serve` in PowerShell aus). Der Server startet und öffnet das Dashboard automatisch (und wählt einen anderen freien Port, falls `8080` belegt ist).
 - **Linux / WSL2:** Archiv entpacken und starten:
 
 ```sh
