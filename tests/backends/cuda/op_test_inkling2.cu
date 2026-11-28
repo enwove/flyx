@@ -2329,9 +2329,10 @@ void test_inkling2_moe() {
   cudaFree(const_cast<uint8_t*>(nvfp4_down.s));
   cudaFree(const_cast<float*>(nvfp4_down.rs));
 
-  // (d) Multi-span non-power-of-2 K (Inkling-2 dimensions: H = 2304 -> 3 spans tail 8; I = 1152 -> 2 spans tail 4).
-  {
-    const int RM = 19, EM = 4, KM = 2, HM = 2304, IM = 1152;
+  // (d) Multi-span non-power-of-2 K (Inkling-2 dimensions: H = 2304 -> 3 spans tail 8; I = 1152 -> 2 spans tail 4);
+  // 70 rows: 35 an expert, the down projection's tasks of 32 rows (moe_mma_rows), the last of each 3 rows.
+  for (const int RM : {19, 70}) {
+    const int EM = 4, KM = 2, HM = 2304, IM = 1152;
     seed("inkling2_moe_multispan", RM, EM, KM, HM, IM);
     Vec xm = randv(size_t(RM) * HM, 0.5);
     Vec rlm = randv(size_t(RM) * EM, 1.0);
@@ -2391,13 +2392,14 @@ void test_inkling2_moe() {
                   &sm, TL);
       moe_down(d_act_1, IM, wdn, deim + size_t(rr) * KM, dewm + size_t(rr) * KM, 1, KM, HM, IM, d_y_1, HM, false, &sm,
                TL);
-      expect_bits(std::string("moe multispan 2304x1152 R=1==R=19 ") + gbt.name, down(d_y_1, size_t(HM)), yref);
+      const std::string pass = "R=" + std::to_string(RM) + " ";
+      expect_bits("moe multispan 2304x1152 R=1==" + pass + gbt.name, down(d_y_1, size_t(HM)), yref);
       moe_gate_up(dxm + size_t(8) * HM, HM, wgu, deim + size_t(8) * KM, 8, KM, IM, HM, MoeAct{FLYX_MOE_SITU, beta,
                   lb}, true, d_act_8, IM, &sm,
                   TL);
       moe_down(d_act_8, IM, wdn, deim + size_t(8) * KM, dewm + size_t(8) * KM, 8, KM, HM, IM, d_y_8, HM, false, &sm, TL);
       Vec y8 = down(d_y_8, size_t(8) * HM);
-      expect_bits(std::string("moe multispan 2304x1152 R=8==R=19 ") + gbt.name,
+      expect_bits("moe multispan 2304x1152 R=8==" + pass + gbt.name,
                   Vec(y8.begin() + ptrdiff_t(rr - 8) * HM, y8.begin() + ptrdiff_t(rr - 7) * HM), yref);
       cudaFree(const_cast<uint8_t*>(wgu.blk.data));
       cudaFree(const_cast<uint16_t*>(wgu.blk.scales));

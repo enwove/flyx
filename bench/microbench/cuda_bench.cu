@@ -24,6 +24,7 @@
 //   cuda_bench rounds [T]  rounds of 1, 2, 4 and 8 rows in 8 bits on dp4a on those layers: every compiled
 //                          configuration (columns a warp, groups ahead; the numbers behind blocks_round)
 //   cuda_bench moe         Inkling-2-Mini's fused gate|up and weighted down projections, per dp4a variant and rows
+//   cuda_bench moepass     experts in prefill passes of many rows: Gemma 4 26B-A4B's (Q4_K/Q5_1, Q8_0, MXFP4), gpt-oss's
 //   cuda_bench round T LAYER ROWS [KERNEL [CFG]]  one round on one layer, 43 launches (for a profiler)
 //   cuda_bench pass T LAYER ROWS  one prefill pass's GEMM (inputs in 8 bits) on one layer (for a profiler)
 //   cuda_bench stack ROWS K T:N [T:N ...]  a stack of projections of one input, one launch per run of a block type,
@@ -51,6 +52,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <limits>
+#include <random>
 #include <string>
 #include <vector>
 
@@ -287,6 +289,81 @@ void bench_moe() {
   for (int dtype : kMoeDp4aTypes) bench_moe_projection(dtype, false);
   bench_moe_projection(FLYX_DT_GGML_NVFP4, true);
   bench_moe_projection(FLYX_DT_GGML_Q4_K, true);
+}
+
+// Experts in prefill passes (`cuda_bench moepass [gptoss|q8_0|mxfp4] [ROWS...]`, by default 256 1024 4096 rows):
+// Gemma 4 26B-A4B's (128 experts, 8 a row, H 2816, I 704; gate|up in Q4_K and down in Q5_1, the UD-Q4_K_M file's
+// types, or both in Q8_0 or MXFP4, its Q8_0 and MXFP4_MOE files') or gpt-oss-20b's (32 experts, 4 a row, H = I = 2880,
+// MXFP4); the rows' experts random, gate|up with its activation fused; us a call (the rows' 8-bit staging and grouping
+// included) and TOPS.
+void bench_moe_pass(int argc, char** argv) {
+  header();
+  const std::string shape = argc > 2 && !std::isdigit(static_cast<unsigned char>(argv[2][0])) ? argv[2] : "";
+  const bool gptoss = shape == "gptoss";
+  const int H = gptoss ? 2880 : 2816, I = gptoss ? 2880 : 704, E = gptoss ? 32 : 128, top = gptoss ? 4 : 8;
+  const int one = shape == "q8_0" ? FLYX_DT_GGML_Q8_0 : shape == "mxfp4" || gptoss ? FLYX_DT_GGML_MXFP4 : 0;
+  const int gu_type = one ? one : FLYX_DT_GGML_Q4_K, dn_type = one ? one : FLYX_DT_GGML_Q5_1;
+  std::vector<int> list;
+  for (int i = shape.empty() ? 2 : 3; i < argc; ++i) list.push_back(std::atoi(argv[i]));
+  if (list.empty()) list = {256, 1024, 4096};
+  const int max_rows = *std::max_element(list.begin(), list.end()), max_pairs = max_rows * top;
+  MoeBenchBuffers mem;
+  std::vector<BlockMat> gu = block_copies(gu_type, E * 2 * I, H), dn = block_copies(dn_type, E * H, I);
+  float* rs = mem.alloc<float>(E);
+  k_fill_f<<<1, 256>>>(rs, E, 7u, 0.5f, 0.5f);
+  ExpertMat Wgu{}, Wdn{};
+  Wgu.n_experts = Wdn.n_experts = E;
+  Wgu.N = 2 * I;
+  Wdn.N = H;
+  Wgu.rs = Wdn.rs = rs;
+  Wgu.blk = gu.front();
+  Wdn.blk = dn.front();
+  Wgu.blk.q8 = Wdn.blk.q8 = true;
+  MoeScratch sc{};
+  sc.chunk_rows = max_rows;
+  sc.max_experts = E;
+  sc.max_top_k = top;
+  sc.pairs = mem.alloc<int>(max_pairs);
+  sc.tasks = mem.alloc<MoeTask>(max_pairs);
+  sc.n_tasks = mem.alloc<int>(1);
+  sc.stage_elems = std::max(size_t(max_rows) * H, size_t(max_pairs) * I);
+  sc.q8_a = mem.alloc<int8_t>(sc.stage_elems);
+  sc.q8_d = mem.alloc<float>(sc.stage_elems / 32);
+  sc.q8_s = mem.alloc<float>(sc.stage_elems / 16);
+  sc.down_buf = mem.alloc<float>(size_t(max_pairs) * H);
+  float* x = mem.alloc<float>(size_t(max_rows) * H);
+  k_fill_f<<<256, 256>>>(x, size_t(max_rows) * H, 31u, -1.f, 2.f);
+  float* act = mem.alloc<float>(size_t(max_pairs) * I);
+  float* y = mem.alloc<float>(size_t(max_rows) * H);
+  float* ew = mem.alloc<float>(max_pairs);
+  k_fill_f<<<64, 256>>>(ew, max_pairs, 23u, 0.1f, 0.05f);
+  int* eidx = mem.alloc<int>(max_pairs);
+  std::vector<int> routes(max_pairs);
+  std::mt19937 rng(5);
+  for (int r = 0; r < max_rows; ++r) {
+    std::vector<int> e(E);
+    for (int i = 0; i < E; ++i) e[i] = i;
+    for (int k = 0; k < top; ++k) {
+      std::swap(e[k], e[k + rng() % (E - k)]);
+      routes[size_t(r) * top + k] = e[k];
+    }
+  }
+  CK(cudaMemcpy(eidx, routes.data(), routes.size() * sizeof(int), cudaMemcpyHostToDevice));
+  const Launch launch{0, nullptr, &g_bench_opts};
+  std::printf("%s experts (E %d, top %d, H %d, I %d): gate|up %s fused, down %s\n"
+              "   rows   gate|up us  TOPS     down us  TOPS\n", gptoss ? "gpt-oss-20b" : "Gemma 4 26B-A4B", E, top, H, I,
+              block_type_name(gu_type), block_type_name(dn_type));
+  for (int rows : list) {
+    const double pairs = double(rows) * top;
+    const double gu_ms = time_ms([&] {
+      moe_gate_up(x, H, Wgu, eidx, rows, top, I, H, MoeAct{FLYX_MOE_SITU, 6.f, 8.f}, true, act, I, &sc, launch);
+    }, 10);
+    const double dn_ms = time_ms([&] { moe_down(act, I, Wdn, eidx, ew, rows, top, H, I, y, H, false, &sc, launch); }, 10);
+    std::printf("  %5d %11.1f %5.1f %11.1f %5.1f\n", rows, gu_ms * 1e3, 2 * pairs * 2 * I * H / (gu_ms * 1e9),
+                dn_ms * 1e3, 2 * pairs * H * I / (dn_ms * 1e9));
+  }
+  free_copies(gu);
+  free_copies(dn);
 }
 
 // NVFP4 weights: bytes streamed are K/2 + K/16 (+4) per output column.
@@ -2445,6 +2522,10 @@ int main(int argc, char** argv) {
     g_bench_opts.pdl = gemm_tuning_pdl(g_bench_opts.tuning);
     if (const char* e = std::getenv("FLYX_BENCH_PDL")) g_bench_opts.pdl = std::string(e) == "1";
   }
+  if (what == "moepass") {
+    bench_moe_pass(argc, argv);
+    return 0;
+  }
   if (what == "moe") {  // uses its own routing and staging scratch
     bench_moe();
     return 0;
@@ -2490,7 +2571,7 @@ int main(int argc, char** argv) {
   else if (what == "mt") bench_mt(argc, argv);
   else {
     std::printf("usage: cuda_bench gemm|skinny|fp4|fp4cfgs|fp4rows|tune|gdn|decode|tc|attn|flash|strata|mlp|w4a4|w12|pick|dots|blocks|q8runs|rounds|"
-                "round|moe|glu|pass|stack|mma|host_read|stream|graphs|paging|mt\n");
+                "round|moe|moepass|glu|pass|stack|mma|host_read|stream|graphs|paging|mt\n");
     return 2;
   }
   return 0;

@@ -224,7 +224,10 @@ void alloc_rows(const flyx_bmodel* m, int R, bool prefill, RowBufs* b, Alloc&& a
     const size_t gu_or_down = std::max(size_t(2) * size_t(n.moe_inter), size_t(H));
     b->moe_gu = f(size_t(R) * size_t(n.moe_topk) * gu_or_down);
     b->moe_act = f(size_t(R) * size_t(n.moe_topk) * size_t(n.moe_inter));
-    const int chunk = std::min(R, 256);
+    // The whole pass a chunk: each chunk reads every expert it routes to, so a long prompt's pass of thousands of rows
+    // in chunks of 256 read the experts' weights a dozen times over (26B-A4B, a 200K-token prompt on an RTX PRO 6000:
+    // its experts 30 -> 21 s).  The staged rows grow with it (passes of 4096 rows: 46 MB, from 3).
+    const int chunk = R;
     b->moe_sc.pairs = static_cast<int*>(alloc(size_t(chunk) * size_t(n.moe_topk) * sizeof(int)));
     b->moe_sc.tasks = static_cast<MoeTask*>(alloc(size_t(chunk) * size_t(n.moe_topk) * sizeof(MoeTask)));
     b->moe_sc.n_tasks = static_cast<int*>(alloc(sizeof(int)));
