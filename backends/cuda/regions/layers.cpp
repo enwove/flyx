@@ -1559,6 +1559,65 @@ void rel_attn_layer(const Pass& ps, const RelAttnBlock& a, bool fused) {
   }
 }
 
+// A gathered round on a sequence's own stream: only the host-resident experts are copied, on the gather stream, while
+// the device-resident experts' GEMMs run in place (expert banks [0, E) and the copies [E, E + pairs)); one weighted
+// sum in the router's order then takes both banks' slots, the same bits as one GEMM over every copy.
+static bool gathers_beside(const Pass& ps, const MoeBlock& f) {
+  const auto* s = ps.s;
+  const int R = ps.rows, K = f.top_k;
+  return ps.round && R > 1 && R <= ps.v.b.gather_rows && f.mapped && f.mapped->resident && ps.v.b.gather_slot &&
+         s->m->opt.expert_overlap && s->gather_side.st && ps.v.L.st == s->st && R * K <= f.n_experts &&
+         R * K <= kGatherPlanPairs && f.mapped->gather->load(std::memory_order_relaxed);
+}
+
+// The projections take the gather scratch in turn: gate|up's copies cross the bus beside the resident gate|up GEMM,
+// down's once the copied gate|up GEMM is done with the scratch, beside the resident down GEMM.  Every pair can have
+// a copy, as in the gather of every selected expert, so none is read through its mapped pages.
+static void gathered_experts(const Pass& ps, const MoeBlock& f, const MoeScratch* msc, float* down_out, bool fused,
+                             bool round_q8) {
+  const RowView& rv = ps.v;
+  auto* s = ps.s;
+  const int H = f.hidden, I = f.inter, E = f.n_experts, K = f.top_k, R = ps.rows, M = R * K;
+  const cudaStream_t st = rv.L.st;
+  const Launch& L = rv.L;
+  gather_plan(rv.b.moe_idx, M, f.mapped->resident, E, M, rv.b.gather_ids, rv.b.gather_slot, st);
+  GatherPlanes gate_planes, down_planes;
+  const ExpertMat gate_copies = f.mapped->gate.copies(rv.b.gathered, M, &gate_planes);
+  const ExpertMat down_copies = f.mapped->down.copies(rv.b.gathered, M, &down_planes);
+  const SideStream& gs = s->gather_side;
+  auto copy_beside = [&](const GatherPlanes& planes, cudaEvent_t copied) {
+    CK(cudaEventRecord(gs.fork, st));
+    CK(cudaStreamWaitEvent(gs.st, gs.fork, 0));
+    gather_copy(planes, rv.b.moe_idx, rv.b.gather_slot, M, gs.st);
+    CK(cudaEventRecord(copied, gs.st));
+  };
+
+  const int* ids = rv.b.gather_ids;
+  bf16* act_bf16 =
+      round_q8 && moe_round_bf16_down(f.down, R, K, I, msc, L) ? reinterpret_cast<bf16*>(rv.b.moe_act) : nullptr;
+  const BankRange in_place{0, E}, copied{E, M};
+  auto gate_up = [&](const ExpertMat& w, BankRange bank) {
+    if (fused)
+      moe_bank_gate_up(rv.b.h, H, w, ids, R, K, I, H, f.situ_beta, f.situ_linear_beta, true, rv.b.moe_act, I, msc, L,
+                       round_q8, act_bf16, bank);
+    else
+      moe_bank_gate_up(rv.b.h, H, w, ids, R, K, I, H, f.situ_beta, f.situ_linear_beta, false, rv.b.moe_gu, 2 * I,
+                       msc, L, false, nullptr, bank);
+  };
+  copy_beside(gate_planes, s->gather_gate);
+  gate_up(f.gate_up, in_place);
+  CK(cudaStreamWaitEvent(st, s->gather_gate, 0));
+  gate_up(gate_copies, copied);
+  copy_beside(down_planes, gs.join);
+  if (!fused) situ_rows(rv.b.moe_gu, 2 * I, I, f.situ_beta, f.situ_linear_beta, rv.b.moe_act, I, M, st);
+  moe_bank_down(rv.b.moe_act, I, f.down, ids, rv.b.moe_w, R, K, H, I, down_out, H, false, msc, L, act_bf16, 0,
+                {in_place, true});
+  CK(cudaStreamWaitEvent(st, gs.join, 0));
+  moe_bank_down(rv.b.moe_act, I, down_copies, ids, rv.b.moe_w, R, K, H, I, down_out, H, false, msc, L, act_bf16, 0,
+                {copied, true});
+  moe_sum_slots(msc->down_buf, rv.b.moe_w, R, K, H, down_out, !f.post_conv, st);
+}
+
 void moe_layer(const Pass& ps, const MoeBlock& f, bool fused) {
   const RowView& rv = ps.v;
   auto* s = ps.s;
@@ -1660,6 +1719,8 @@ void moe_layer(const Pass& ps, const MoeBlock& f, bool fused) {
     f.mapped->owner->prefill(ps, f, msc, down_out, !f.post_conv, fused);
   } else if (f.cold_gu) {
     hybrid_experts(ps, f, msc, down_out, !f.post_conv, fused);
+  } else if (gathers_beside(ps, f)) {
+    gathered_experts(ps, f, msc, down_out, fused, round_q8);
   } else {
     const bool gather = ps.round && R > 1 && R <= rv.b.gather_rows && f.mapped &&
                         f.mapped->gather->load(std::memory_order_relaxed) && R * K <= E;

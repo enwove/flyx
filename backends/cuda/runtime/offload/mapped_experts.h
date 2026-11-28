@@ -18,10 +18,14 @@ struct MappedExpertPair {
     size_t payload = 0, scales = 0;
     size_t gather_bytes(int pairs) const;
     ExpertMat gather(uint8_t* buffer, const int* ids, int* compact, int pairs, cudaStream_t stream) const;
+    // `count` copies of its experts in `buffer` (gather's layout), and the planes that copy into them.
+    ExpertMat copies(uint8_t* buffer, int count, GatherPlanes* planes) const;
     ExpertMat stage(uint8_t* buffer, cudaStream_t stream) const;
   };
   Projection gate, down;
   const std::atomic<bool>* gather = nullptr;
+  // [n_experts] by physical slot: every page of both projections on the device (ExpertAddressSpace::resident).
+  const uint8_t* resident = nullptr;
   int stage_min_rows = INT_MAX;
   class ExpertAddressSpace* owner = nullptr;
 };
@@ -58,8 +62,10 @@ private:
     size_t desired = 0;
     std::atomic<bool> gather{false};
     int top_k = 0;
+    uint8_t* resident = nullptr;  // resident() by physical slot on the device, for the round gathers
   };
   bool resident(std::pair<int, int> pair, size_t slot) const;
+  void publish_residency(std::pair<int, int> pair, Histogram& h) const;
   void observe();
   void select_gather();
   void promote();

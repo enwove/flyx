@@ -1995,6 +1995,15 @@ struct GatherPlanes {
   int count = 0, blocks = 0;
 };
 void gather_expert_planes(GatherPlanes planes, const int* ids, int* compact, int pairs, cudaStream_t stream);
+// A round's plan for gathering only its host-resident experts (ids: physical experts of `pairs` pairs, at most
+// kGatherPlanPairs).  Pair p keeps its id where resident[id], or once `copies` copies are taken; else its expert's
+// copy is `rank`, the experts' order of first occurrence, and p's id becomes split + rank.  copy_slot[p]: the copy pair
+// p makes (its expert's first pair), -1 none.  One block.
+constexpr int kGatherPlanPairs = 1024;
+void gather_plan(const int* ids, int pairs, const uint8_t* resident, int split, int copies, int* out_ids,
+                 int* copy_slot, cudaStream_t st);
+// Expert ids[p]'s planes to copy copy_slot[p] of the planes' targets, for each p with copy_slot[p] >= 0.
+void gather_copy(GatherPlanes planes, const int* ids, const int* copy_slot, int pairs, cudaStream_t st);
 
 void moe_sum_mapped(const float* slots, const float* cold, const int* ids, int resident, const float* weights,
                     int rows, int top_k, int hidden, float* out, bool accumulate, cudaStream_t st);

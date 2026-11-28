@@ -1877,6 +1877,43 @@ void test_inkling2_moe() {
     cudaFree(routes);
     cudaFree(compact);
   }
+  {
+    // A gathered round's plan: resident experts and those past the copies keep their ids; the others take copies in
+    // order of first occurrence, each copied once by its first pair.  An id outside the bank stays as it is.
+    const std::vector<int> ids{5, 2, 5, 7, 2, 9, 1, 7, -1, 1};
+    const std::vector<uint8_t> resident{0, 0, 1, 0, 0, 0, 0, 0, 0, 1};  // experts 2 and 9
+    const int split = 10, copies = 2, pairs = int(ids.size());
+    const std::vector<int> want_ids{10, 2, 10, 11, 2, 9, 1, 11, -1, 1}, want_slot{0, -1, -1, 1, -1, -1, -1, -1, -1, -1};
+    auto* routes = dev<int>(ids.size());
+    auto* bank = dev<uint8_t>(resident.size());
+    auto* out = dev<int>(ids.size());
+    auto* slot = dev<int>(ids.size());
+    CK(cudaMemcpy(routes, ids.data(), ids.size() * sizeof(int), cudaMemcpyHostToDevice));
+    CK(cudaMemcpy(bank, resident.data(), resident.size(), cudaMemcpyHostToDevice));
+    gather_plan(routes, pairs, bank, split, copies, out, slot, 0);
+    if (down_i(out, ids.size()) != want_ids || down_i(slot, ids.size()) != want_slot)
+      throw std::runtime_error("gather plan ids or copy slots");
+    // The copies: experts 5 and 7 into slots 0 and 1, nothing else written.
+    const size_t stride = 4100;
+    std::vector<uint8_t> source(size_t(split) * stride), want(size_t(copies) * stride);
+    for (size_t k = 0; k < source.size(); ++k) source[k] = uint8_t(7 * k + k / stride);
+    std::copy_n(source.data() + 5 * stride, stride, want.data());
+    std::copy_n(source.data() + 7 * stride, stride, want.data() + stride);
+    auto* input = dev<uint8_t>(source.size());
+    auto* target = dev<uint8_t>(want.size() + 64);
+    CK(cudaMemcpy(input, source.data(), source.size(), cudaMemcpyHostToDevice));
+    CK(cudaMemset(target, 0xee, want.size() + 64));
+    GatherPlanes planes;
+    planes.plane[planes.count++] = {input, target, stride, 3};
+    planes.blocks = 3;
+    gather_copy(planes, routes, slot, pairs, 0);  // the invalid id's pair has no copy slot: its id is never read
+    std::vector<uint8_t> got(want.size() + 64);
+    CK(cudaMemcpy(got.data(), target, got.size(), cudaMemcpyDeviceToHost));
+    if (!std::equal(want.begin(), want.end(), got.begin()) ||
+        std::any_of(got.begin() + ptrdiff_t(want.size()), got.end(), [](uint8_t b) { return b != 0xee; }))
+      throw std::runtime_error("gathered copy bytes or a write past the copies");
+    for (void* q : {(void*)routes, (void*)bank, (void*)out, (void*)slot, (void*)input, (void*)target}) cudaFree(q);
+  }
   test_inkling2_moe_norm();
   test_moe_gate_up_rules();
   test_moe_dp4a_variants();
@@ -2307,6 +2344,89 @@ void test_inkling2_moe() {
     }
     cudaFree(d_act_8);
     cudaFree(d_y_8);
+
+    // A gathered round (gathers_beside): device-resident experts in place, copies of two host-resident ones, a third
+    // in place past the copies, as two expert banks and one weighted sum, against one GEMM a projection.  Same bits.
+    {
+      const int rows = 4, pairs = rows * top_k, copies = 2;
+      // The round's first three experts have host pages: two get copies, the third is read in place.
+      std::vector<uint8_t> resident(E, 1);
+      for (int p = 0, cold = 0; p < pairs && cold < 3; ++p)
+        if (resident[eidx[size_t(p)]]) resident[eidx[size_t(p)]] = 0, ++cold;
+      auto* d_resident = dev<uint8_t>(E);
+      CK(cudaMemcpy(d_resident, resident.data(), E, cudaMemcpyHostToDevice));
+      int* d_ids = dev<int>(pairs);
+      int* d_slot = dev<int>(pairs);
+      gather_plan(d_eidx, pairs, d_resident, E, copies, d_ids, d_slot, TL.st);
+      // The copies of a projection with K inputs, gather's layout: codes, scales, gains, each aligned.
+      auto copies_of = [&](const ExpertMat& w, int K, uint8_t** buffer, GatherPlanes* planes) {
+        ExpertMat c = w;
+        *planes = {};
+        const size_t n = size_t(w.N) * K;
+        size_t strides[3] = {}, at = 0;
+        if (w.packed()) {
+          const BlockLayout l = blocks_layout(w.blk.dtype);
+          strides[0] = n / l.values * l.stride;
+          strides[1] = n / l.values * l.scales * sizeof(uint16_t);
+        } else if (w.q) {
+          strides[0] = n / 2;
+          strides[1] = n / 16;
+        } else {
+          strides[0] = n * sizeof(bf16);
+        }
+        strides[2] = w.rs ? sizeof(float) : 0;
+        *buffer = dev<uint8_t>((strides[0] + strides[1] + strides[2]) * copies + 1024);
+        auto plane = [&](auto& ptr, size_t stride) {
+          if (!ptr || !stride) return;
+          const int blocks = int(std::min<size_t>(128, (stride + 2047) / 2048));
+          planes->plane[planes->count++] = {reinterpret_cast<const uint8_t*>(ptr), *buffer + at, stride, blocks};
+          planes->blocks += blocks;
+          ptr = reinterpret_cast<std::remove_reference_t<decltype(ptr)>>(*buffer + at);
+          at += (stride * copies + 255) / 256 * 256;
+        };
+        plane(c.blk.data, strides[0]);
+        plane(c.q, strides[0]);
+        plane(c.w, strides[0]);
+        plane(c.blk.scales, strides[1]);
+        plane(c.s, strides[1]);
+        plane(c.rs, strides[2]);
+        c.n_experts = copies;
+        if (c.blk.data) c.blk.rows = copies * c.N;
+        return c;
+      };
+      uint8_t *gu_buffer = nullptr, *dn_buffer = nullptr;
+      GatherPlanes gu_planes, dn_planes;
+      const ExpertMat gu_copies = copies_of(w_gu, H, &gu_buffer, &gu_planes);
+      const ExpertMat dn_copies = copies_of(w_dn, I, &dn_buffer, &dn_planes);
+      gather_copy(gu_planes, d_eidx, d_slot, pairs, TL.st);
+      gather_copy(dn_planes, d_eidx, d_slot, pairs, TL.st);
+      float* act_one = dev<float>(size_t(pairs) * I);
+      float* act_banks = dev<float>(size_t(pairs) * I);
+      float* y_one = dev<float>(size_t(rows) * H);
+      float* y_banks = dev<float>(size_t(rows) * H);
+      moe_gate_up(d_x, H, w_gu, d_eidx, rows, top_k, I, H, beta, lb, true, act_one, I, &msc, TL);
+      moe_down(act_one, I, w_dn, d_eidx, d_ew, rows, top_k, H, I, y_one, H, false, &msc, TL);
+      const BankRange in_place{0, E}, copied{E, copies};
+      moe_bank_gate_up(d_x, H, w_gu, d_ids, rows, top_k, I, H, beta, lb, true, act_banks, I, &msc, TL, false,
+                       nullptr, in_place);
+      moe_bank_gate_up(d_x, H, gu_copies, d_ids, rows, top_k, I, H, beta, lb, true, act_banks, I, &msc, TL, false,
+                       nullptr, copied);
+      moe_bank_down(act_banks, I, w_dn, d_ids, d_ew, rows, top_k, H, I, y_banks, H, false, &msc, TL, nullptr, 0,
+                    {in_place, true});
+      moe_bank_down(act_banks, I, dn_copies, d_ids, d_ew, rows, top_k, H, I, y_banks, H, false, &msc, TL, nullptr, 0,
+                    {copied, true});
+      moe_sum_slots(msc.down_buf, d_ew, rows, top_k, H, y_banks, false, TL.st);
+      const std::vector<int> planned = down_i(d_ids, pairs);
+      if (std::none_of(planned.begin(), planned.end(), [&](int id) { return id >= E; }))
+        throw std::runtime_error("gathered round test copies no expert");
+      expect_bits("gathered round gate|up banks == one GEMM " + label, down(act_banks, size_t(pairs) * I),
+                  down(act_one, size_t(pairs) * I));
+      expect_bits("gathered round down banks == one GEMM " + label, down(y_banks, size_t(rows) * H),
+                  down(y_one, size_t(rows) * H));
+      for (void* q : {(void*)d_resident, (void*)d_ids, (void*)d_slot, (void*)gu_buffer, (void*)dn_buffer,
+                      (void*)act_one, (void*)act_banks, (void*)y_one, (void*)y_banks})
+        cudaFree(q);
+    }
 
     // Also verify accumulate=true on moe_down.
     Vec bias_y = randv(size_t(H), 0.5);

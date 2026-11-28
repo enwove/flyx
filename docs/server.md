@@ -185,6 +185,7 @@ Passed verbatim to the backend (`backends/cuda/backend.cpp`). Unknown keys or in
 | `expert_simd` | nonnegative integer | 512 | Maximum cold-dot SIMD width in bits. Zero forces scalar. Values below the next implementation width use the narrower available path. |
 | `expert_integer` | `0` or `1` | 1 | Use integer products for supported IQ weights with Q8 inputs. |
 | `expert_gather` | `0` or `1` | 1 | Gather repeated mapped expert reads in multirow rounds when recent decode routes predict that most verification rows need host weights. |
+| `expert_overlap` | `0` or `1` | 1 | In a gathered round, copy only the experts with host pages, on a second stream, while the device-resident experts' GEMMs run in place. `0` copies every selected expert before the GEMMs. Same results. |
 | `expert_direct` | `0` or `1` | 1 | Run expert kernels over device and pinned host pages when the mapping and host budget allow. Setting 0 selects CPU cold experts. |
 | `expert_ticket` | `0` or `1` | 1 | Publish small CPU route packets through a mapped ticket with a bounded wait and CUDA event fallback. |
 | `expert_mapped_output` | `0` or `1` | 1 | Have the weighted reduction read cold CPU outputs from mapped host memory when available. |

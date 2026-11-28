@@ -241,6 +241,7 @@ const std::vector<OptionSpec>& option_specs() {
       whole_opt("expert_threads", &BackendOptions::expert_threads),
       whole_opt("expert_simd", &BackendOptions::expert_simd),
       flag_opt("expert_gather", &BackendOptions::expert_gather),
+      flag_opt("expert_overlap", &BackendOptions::expert_overlap),
       flag_opt("expert_direct", &BackendOptions::expert_direct),
       flag_opt("expert_ticket", &BackendOptions::expert_ticket),
       flag_opt("expert_mapped_output", &BackendOptions::expert_mapped_output),

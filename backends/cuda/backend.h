@@ -160,6 +160,7 @@ struct BackendOptions {
   int gpu_layers = INT_MAX;  // dense layers retained before the streamed suffix
   bool expert_adapt = true, expert_global = false, expert_integer = true;
   bool expert_gather = true;
+  bool expert_overlap = true;  // gathered rounds copy only host-resident experts, beside the device-resident GEMMs
   bool expert_ticket = true, expert_mapped_output = true, expert_direct = true;
   int expert_simd = 512;  // upper bound on vector width for cold CPU dots
   bool keep_expert_archive = true;
@@ -274,8 +275,9 @@ struct RowBufs {
   float *post_raw = nullptr, *post_out = nullptr;
   int* moe_idx = nullptr;
   int gather_rows = -1;
-  uint8_t* gathered = nullptr;
+  uint8_t* gathered = nullptr;  // gather_bytes(pairs): the selected experts' copies, a projection at a time
   int* gather_ids = nullptr;
+  int* gather_slot = nullptr;   // gather_plan's copy a pair makes
   float* moe_guess = nullptr;  // rounds: the experts' scores moe_prefetch guesses from (n_experts floats), then
                               // the mixed row moe_guess_scores reads (hidden floats)
   // moe_act: the activations in float32, or in bf16 where a fused round's gate|up GEMM writes the down GEMM's input
@@ -735,6 +737,10 @@ struct flyx_seq {
   flyx::cuda::SideStream side{};  // a round's narrow GEMMs of a stack beside its wide ones (Launch::side)
   // A round's expert reads ahead (moe_prefetch): a stream of its own, so they never queue before Launch::side's GEMMs.
   flyx::cuda::SideStream expert_side{};
+  // Gathered rounds: the host-resident experts' copies beside the device-resident experts' GEMMs (gather_gate: the
+  // gate|up copies are in).
+  flyx::cuda::SideStream gather_side{};
+  cudaEvent_t gather_gate = nullptr;
   cudaEvent_t expert_read = nullptr;  // last read of mutable residuals, before the immutable weight prefetch
   std::vector<void*> allocs;
   flyx::cuda::DevicePieces arena_pieces;  // the device arena (dev_arena), where the driver maps memory
@@ -950,6 +956,7 @@ struct flyx_seq {
     if (stage_side.st) cudaStreamSynchronize(stage_side.st);
     if (side.st) cudaStreamSynchronize(side.st);
     if (expert_side.st) cudaStreamSynchronize(expert_side.st);
+    if (gather_side.st) cudaStreamSynchronize(gather_side.st);
     release_prefill_pool();
     if (profile) print_profile();
     for (auto e : prof_ev) cudaEventDestroy(e);
@@ -971,6 +978,8 @@ struct flyx_seq {
     flyx::cuda::destroy_side(side);
     if (expert_read) cudaEventDestroy(expert_read);
     flyx::cuda::destroy_side(expert_side);
+    if (gather_gate) cudaEventDestroy(gather_gate);
+    flyx::cuda::destroy_side(gather_side);
     if (st) cudaStreamDestroy(st);
   }
   // dry: count the bytes the allocations would take, allocate nothing (seq_bytes).

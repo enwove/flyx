@@ -23,6 +23,14 @@ size_t ExpertAddressSpace::gather_bytes(int pairs) const {
 ExpertMat MappedExpertPair::Projection::gather(uint8_t* buffer, const int* ids, int* compact, int pairs,
                                                cudaStream_t st) const {
   GatherPlanes planes;
+  auto staged = copies(buffer, pairs, &planes);
+  gather_expert_planes(planes, ids, compact, pairs, st);
+  return staged;
+}
+
+ExpertMat MappedExpertPair::Projection::copies(uint8_t* buffer, int pairs, GatherPlanes* out) const {
+  GatherPlanes& planes = *out;
+  planes = {};
   auto copy = [&](auto& ptr, size_t stride, size_t offset) {
     if (!ptr || !stride) return;
     const int blocks = int(std::min<size_t>(128, (stride + 2047) / 2048));
@@ -40,7 +48,6 @@ ExpertMat MappedExpertPair::Projection::gather(uint8_t* buffer, const int* ids, 
   copy(staged.s, scale, scale_at);
   copy(staged.blk.scales, scale, scale_at);
   copy(staged.rs, sizeof(float), gains_at);
-  gather_expert_planes(planes, ids, compact, pairs, st);
   staged.n_experts = pairs;
   if (staged.blk.data) staged.blk.rows = pairs * staged.N;
   return staged;
@@ -124,6 +131,7 @@ void ExpertAddressSpace::attach(flyx_bmodel* model, MoeBlock& block, int gate, i
   if (added) {
     h.device = model->alloc<uint32_t>(2 * n);
     h.slots = model->alloc<int>(n);
+    h.resident = model->alloc<uint8_t>(n);
     CK(cudaMemset(h.device, 0, 2 * n * sizeof(uint32_t)));
     CK(cudaMemcpy(h.slots, h.order.slot.data(), n * sizeof(int), cudaMemcpyHostToDevice));
     model->host_bytes += n * (2 * sizeof(uint32_t) + 2 * sizeof(int) + sizeof(uint64_t));
@@ -146,6 +154,7 @@ void ExpertAddressSpace::attach(flyx_bmodel* model, MoeBlock& block, int gate, i
     mapped.down = projection(down, block.down);
     mapped.owner = this;
     mapped.gather = &h.gather;
+    mapped.resident = h.resident;
     block.mapped = &mapped;
     h.top_k = block.top_k;
     h.gather = int64_t(block.n_experts - resident) * block.top_k >= block.n_experts;
@@ -156,6 +165,14 @@ void ExpertAddressSpace::attach(flyx_bmodel* model, MoeBlock& block, int gate, i
 
   block.route_histogram = h.device;
   block.route_slots = h.slots;
+  publish_residency({gate, down}, h);
+}
+
+// A wrong entry costs speed only: a gathered round reads an expert it takes for resident through its mapped pages.
+void ExpertAddressSpace::publish_residency(std::pair<int, int> pair, Histogram& h) const {
+  std::vector<uint8_t> resident(h.order.slot.size());
+  for (size_t slot = 0; slot < resident.size(); ++slot) resident[slot] = this->resident(pair, slot) ? 1 : 0;
+  CK(cudaMemcpy(h.resident, resident.data(), resident.size(), cudaMemcpyHostToDevice));
 }
 
 // plan_lowered serializes writers with the model graph mutex. A sequence freezes its row capacity
@@ -335,6 +352,8 @@ void ExpertAddressSpace::promote() {
     a.plane->hot[a.index] = 0;
     b.plane->hot[b.index] = 1;
   }
+  if (i)
+    for (auto& [pair, h] : histograms_) publish_residency(pair, h);
   select_gather();
   if (verbose_)
     std::fprintf(stderr, "flyx-cuda: redistributed %zu expert pages at quiescence in %.1f ms\n", i,

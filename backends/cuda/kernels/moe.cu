@@ -1440,17 +1440,13 @@ __global__ void k_moe_sum_mapped(const float* slots, const float* cold, const in
   result = accumulate ? result + total : total;
 }
 
-__global__ void k_gather_expert_planes(GatherPlanes planes, const int* ids, int* compact) {
-  const int pair = blockIdx.y, id = ids[pair];
-  int slot = 0;
-  while (ids[slot] != id) ++slot;
-  if (!blockIdx.x && !threadIdx.x) compact[pair] = slot;
-  if (slot != pair) return;
+// This block's share of expert `id`'s planes, to copy `slot` of the planes' targets.
+__device__ __forceinline__ void copy_expert_planes(const GatherPlanes& planes, int id, int slot) {
   int block = blockIdx.x, which = 0;
   while (block >= planes.plane[which].blocks) block -= planes.plane[which++].blocks;
   const auto plane = planes.plane[which];
   const auto* src = plane.source + size_t(id) * plane.stride;
-  auto* dst = plane.target + size_t(pair) * plane.stride;
+  auto* dst = plane.target + size_t(slot) * plane.stride;
   size_t i = size_t(block) * blockDim.x + threadIdx.x;
   const size_t step = size_t(plane.blocks) * blockDim.x;
   if (!(plane.stride % 16)) {
@@ -1460,8 +1456,62 @@ __global__ void k_gather_expert_planes(GatherPlanes planes, const int* ids, int*
   }
 }
 
+__global__ void k_gather_expert_planes(GatherPlanes planes, const int* ids, int* compact) {
+  const int pair = blockIdx.y, id = ids[pair];
+  int slot = 0;
+  while (ids[slot] != id) ++slot;
+  if (!blockIdx.x && !threadIdx.x) compact[pair] = slot;
+  if (slot != pair) return;
+  copy_expert_planes(planes, id, pair);
+}
+
 void gather_expert_planes(GatherPlanes planes, const int* ids, int* compact, int pairs, cudaStream_t st) {
   k_gather_expert_planes<<<dim3(planes.blocks, pairs), 128, 0, st>>>(planes, ids, compact);
+}
+
+// The pairs' ids in shared memory once; each pair finds its expert's first pair there, not through global memory.
+__global__ void __launch_bounds__(256) k_gather_plan(const int* ids, int pairs, const uint8_t* resident, int split,
+                                                     int copies, int* out_ids, int* copy_slot) {
+  __shared__ int s_ids[kGatherPlanPairs], s_rank[kGatherPlanPairs];
+  for (int p = threadIdx.x; p < pairs; p += blockDim.x) s_ids[p] = ids[p];
+  __syncthreads();
+  auto first_of = [&](int p) {
+    int first = 0;
+    while (s_ids[first] != s_ids[p]) ++first;
+    return first;
+  };
+  // An id outside the bank (a router's invalid one) stays as it is, as a resident expert's.
+  for (int p = threadIdx.x; p < pairs; p += blockDim.x)
+    s_rank[p] = first_of(p) == p && unsigned(s_ids[p]) < unsigned(split) && !resident[s_ids[p]];
+  __syncthreads();
+  if (threadIdx.x == 0)
+    for (int p = 0, rank = 0; p < pairs; ++p) {
+      const int takes = s_rank[p];
+      s_rank[p] = takes ? rank : -1;
+      rank += takes;
+    }
+  __syncthreads();
+  for (int p = threadIdx.x; p < pairs; p += blockDim.x) {
+    const int first = first_of(p), rank = s_rank[first];
+    const bool copied = rank >= 0 && rank < copies;
+    out_ids[p] = copied ? split + rank : s_ids[p];
+    copy_slot[p] = copied && first == p ? rank : -1;
+  }
+}
+
+void gather_plan(const int* ids, int pairs, const uint8_t* resident, int split, int copies, int* out_ids,
+                 int* copy_slot, cudaStream_t st) {
+  if (pairs < 1 || pairs > kGatherPlanPairs || !resident) throw std::logic_error("gather_plan: invalid pairs");
+  k_gather_plan<<<1, 256, 0, st>>>(ids, pairs, resident, split, copies, out_ids, copy_slot);
+}
+
+__global__ void k_gather_copy(GatherPlanes planes, const int* ids, const int* copy_slot) {
+  const int pair = blockIdx.y, slot = copy_slot[pair];
+  if (slot >= 0) copy_expert_planes(planes, ids[pair], slot);
+}
+
+void gather_copy(GatherPlanes planes, const int* ids, const int* copy_slot, int pairs, cudaStream_t st) {
+  if (planes.blocks) k_gather_copy<<<dim3(planes.blocks, pairs), 128, 0, st>>>(planes, ids, copy_slot);
 }
 
 void moe_sum_mapped(const float* slots, const float* cold, const int* ids, int resident, const float* weights,

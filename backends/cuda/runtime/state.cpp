@@ -207,6 +207,7 @@ void alloc_rows(const flyx_bmodel* m, int R, bool prefill, RowBufs* b, Alloc&& a
       const int pairs = b->gather_rows * n.moe_topk;
       b->gathered = static_cast<uint8_t*>(alloc(m->offload->mapped_experts().gather_bytes(pairs)));
       b->gather_ids = static_cast<int*>(alloc(size_t(pairs) * sizeof(int)));
+      b->gather_slot = static_cast<int*>(alloc(size_t(pairs) * sizeof(int)));
     }
     if (!prefill) b->moe_guess = f(size_t(n.moe_experts) + size_t(H));  // scores, then a mixed row (R == 1)
     // moe_gu is dead during moe_down (and unused when fused), so down_buf safely aliases it.
@@ -1397,6 +1398,10 @@ void build_seq(flyx_bmodel* m, int32_t max_ctx, flyx_seq* s) {
     if (m->need.moe_experts && sm90_or_newer()) {
       create_side(&s->expert_side);
       CK(cudaEventCreateWithFlags(&s->expert_read, cudaEventDisableTiming));
+    }
+    if (m->offload && m->offload->maps_experts()) {
+      create_side(&s->gather_side);
+      CK(cudaEventCreateWithFlags(&s->gather_gate, cudaEventDisableTiming));
     }
     if (dv) CK(cudaStreamCreateWithFlags(&s->dv.body, cudaStreamNonBlocking));
     s->dv.skip_noop = m->opt.dv_conditional;
