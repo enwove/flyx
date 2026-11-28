@@ -11,7 +11,6 @@
 #include <functional>
 #include <initializer_list>
 #include <optional>
-#include <sstream>
 #include <thread>
 
 #include "apps/common/defaults.h"
@@ -130,10 +129,9 @@ bool read_settings_locked(ojson* root, std::string* err) {
   const std::string keep = " (left as it is: mend or remove it to save settings)";
   if (ec) return *err = path + ": " + ec.message() + keep, false;
   std::ifstream f(p, std::ios::binary);
-  std::ostringstream text;
-  if (f) text << f.rdbuf();
-  if (!f || f.bad()) return *err = path + ": cannot be read" + keep, false;
-  ojson j = ojson::parse(text.str(), nullptr, /*allow_exceptions=*/false);
+  std::string text;
+  if (!f || !read_whole(f, &text)) return *err = path + ": cannot be read" + keep, false;
+  ojson j = ojson::parse(text, nullptr, /*allow_exceptions=*/false);
   if (j.is_discarded()) return *err = path + ": not JSON" + keep, false;
   if (!j.is_object()) return *err = path + ": holds no JSON object" + keep, false;
   *root = std::move(j);
@@ -292,6 +290,16 @@ void save_settings(const ModelHost::Want& w) {
 }
 
 }  // namespace
+
+bool read_whole(std::istream& in, std::string* text) {
+  text->clear();
+  char chunk[1 << 14];
+  while (in) {
+    in.read(chunk, sizeof chunk);
+    text->append(chunk, size_t(in.gcount()));
+  }
+  return in.eof() && !in.bad();
+}
 
 bool want_from_json(const ojson& j, const EngineOptions& base, ModelHost::Want* w, std::string* err) {
   if (!j.is_object() || !j.contains("model") || !j["model"].is_string() || j["model"].get<std::string>().empty())

@@ -5,6 +5,10 @@
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
+#include <ios>
+#include <istream>
+#include <sstream>
+#include <streambuf>
 #include <string>
 #include <vector>
 
@@ -22,6 +26,31 @@ using namespace flyx::server;
 
 // POST /v1/load's "kv_gpu": a cap, "auto" (as many as fit, whatever the server's --kv-gpu: a dashboard field cleared
 // beside a loaded model), or absent / null (the server's own setting).
+// serve.json's bytes as model_host reads them (read_whole): all of them, or none where the read fails part-way, even
+// after a prefix that is whole JSON (so a save does not take that prefix for the file and write over the rest).
+void test_read_whole() {
+  struct FailsAfter : std::streambuf {  // a disk that gives `head`, then an error
+    std::string head;
+    bool given = false;
+    explicit FailsAfter(std::string h) : head(std::move(h)) {}
+    int_type underflow() override {
+      if (given) throw std::ios_base::failure("the volume went away");
+      given = true;
+      setg(head.data(), head.data(), head.data() + head.size());
+      return traits_type::to_int_type(head[0]);
+    }
+  };
+  FailsAfter failing(R"({"lan_access": true})");
+  std::istream broken(&failing);
+  std::string text = "untouched";
+  check(!read_whole(broken, &text), "a read that fails after a whole JSON prefix gives no file");
+  const std::string big = "{\"pad\": \"" + std::string(40000, 'x') + "\"}";  // past one chunk
+  std::istringstream whole(big);
+  check(read_whole(whole, &text) && text == big, "a clean read gives every byte, over several chunks");
+  std::istringstream empty("");
+  check(read_whole(empty, &text) && text.empty(), "an empty file is read as empty");
+}
+
 void test_load_kv_gpu() {
   using ojson = nlohmann::ordered_json;
   flyx::EngineOptions cli;
@@ -552,6 +581,7 @@ void test_remote_unc_and_device_paths() {
 
 int main() {
   flyx::test::print_passes = true;
+  test_read_whole();
   test_load_kv_gpu();
   test_chat_kwargs();
   test_dns_rebinding_and_lan_hosts();

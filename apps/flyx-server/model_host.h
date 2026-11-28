@@ -8,6 +8,7 @@
 
 #include <atomic>
 #include <functional>
+#include <istream>
 #include <memory>
 #include <mutex>
 #include <optional>
@@ -121,6 +122,10 @@ class ModelHost {
   std::atomic<bool> stop_{false};
   std::thread worker_;
 };
+
+// All of `in` into *text, through the stream itself: true only for a clean end (EOF, no error), so a read that fails
+// part-way gives no text to parse, even where what came before it is JSON (serve.json is then left as it is).
+bool read_whole(std::istream& in, std::string* text);
 
 // POST /v1/load's body (and the settings file's "last"): {"model", "drafters", "ctx", "drafter", "speculative", "kv",
 // "name"} over `base`, the command line's engine options.
