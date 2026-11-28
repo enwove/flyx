@@ -60,7 +60,7 @@ Windows 11 build 26300, driver 610.88, RTX 5070 Ti (16,303 MiB), Ryzen 7 9800X3D
 
 Every listed placement matched 96/96 full-resident generated IDs and gave zero mean KL and 100% top-1 on the 64 teacher-forced positions. In the 120/128 ablation, selecting prompt staging by the model-wide average produced 1,271 tok/s on the long prompt. Selecting it by each physical layer's cold fraction produced 2,179 tok/s. For Qwen IQ3_XXS, streaming one of 64 layers measured 62.37 tok/s versus 63.26 fully resident. More extensive streaming increases elapsed time with the transferred byte count. Tokens/s is the reciprocal of that time.
 
-On Q2_K_XL with DSpark Q8_0, using the prefill route scores alone to select verification gathers gave 57.58 tok/s at 69/128 and 54.05 at 64/128 with width 3. Using the recent decode observations gave 63.94 and 61.59 tok/s respectively. At 69/128, width 5 gave 51.79 tok/s and width 7 gave 43.50. Every width matched the 96 plain IDs at its placement. Basalt v0.5.7 reported 102.8?109.1 tok/s with its NVFP4-MX8 pack and spec 8 on this machine.
+On Q2_K_XL with DSpark Q8_0, using the prefill route scores alone to select verification gathers gave 57.58 tok/s at 69/128 and 54.05 at 64/128 with width 3. Using the recent decode observations gave 63.94 and 61.59 tok/s respectively. At 69/128, width 5 gave 51.79 tok/s and width 7 gave 43.50. Every width matched the 96 plain IDs at its placement. Basalt v0.5.7 reported 102.8 to 109.1 tok/s with its NVFP4-MX8 pack and spec 8 on this machine.
 
 The CPU fallback microbenchmark rotates through roughly 256 MiB of compressed weights and reports compressed weight bytes divided by elapsed time. Replace `THREADS` with 1, 8, 12 or 16 and `ROWS` with 1, 4 or 8. The single-row run includes a raw 64-bit read using the same pool, projection-row sharding and expert-sized dispatches. A physical-core affinity mask provides a separate eight-core control. Use the mapped strategy and `--backend-opt expert_direct=0` on the same prompt file to compare end-to-end execution.
 
@@ -68,6 +68,10 @@ The CPU fallback microbenchmark rotates through roughly 256 MiB of compressed we
 cuda_bench cold_dot 2304 2304 THREADS ROWS
 cuda_bench cold_dot 1152 2304 THREADS ROWS
 ```
+
+At 2,304 columns the raw control read 46.07 GB/s with 16 threads. The same pool gave 15.77 GB/s for Q2_K, 6.79 for Q3_K, 16.97 for IQ3_XXS, 13.10 for Q4_K and 16.23 for Q6_K. Eight unrestricted threads reached 23.53 GB/s for IQ3_XXS, compared with 19.65 using one logical processor per physical core. These controls show that the row pool can move considerably more bytes than the unpack-and-dot kernels consume. Logical work also increases with the number of activation rows served from each compressed weight read.
+
+At Q2 64/128 with two 96-ID inputs, fixed chunks of 4, 8, 16 and 32 rows produced 41.70, 46.39, 52.25 and 51.10 prefill tok/s on CPU, and 14.11, 26.81, 52.22 and 96.46 with GPU staging. Six-prompt CPU fallback profiling measured a 92.42 microsecond route handoff with the ticket and mapped output. Recording its fallback event before resident GEMMs cut that interval to 75.66 microseconds but reduced profiled decode from 31.99 to 29.16 tok/s. The regular mapped-GPU implementation avoids the CPU handoff entirely.
 
 ### Inkling-2 on RTX 5070 Ti
 
