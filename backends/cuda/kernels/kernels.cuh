@@ -331,7 +331,7 @@ void gemm_skinny(const float* x, int ldx, const bf16* W, int N, int K, float* y,
 // gemm_fp4() for more than 16 rows.  Explicit entry points for tests and
 // benchmarks: cfg picks one of kTcConfigs compiled configurations (all give
 // the same bits), -1 the GPU's table's (candidates.toml: prefill_tc).
-constexpr int kTcConfigs = 7;  // the prefill_tc configurations
+constexpr int kTcConfigs = 6;  // the prefill_tc configurations
 void gemm_tc(const float* x, int ldx, const bf16* W, int N, int K, float* y, int ldy, int M, bool accumulate,
              const Launch& L, int cfg = -1);
 void gemm_fp4_tc(const float* x, int ldx, const uint8_t* Q, const uint8_t* S, const float* RS, int N, int K, float* y,
@@ -967,9 +967,9 @@ __host__ __device__ inline int tree_slot(const TreeRows* t, int r, int base, int
 // score and K/V slot (-1: a leaf no step continued from; else its K/V and normed output at P->position - 1 + slot);
 // every candidate a step scored is a node, the frontier (front[0 .. fn - 1], one depth, slots f0 ..) the best `beam`
 // of them; the frontier's tokens and the two trees its step runs with (prep for attn_prep, att for attention, by
-// slot); the node on the oracle's path, and the end of the trunk: the drafter's chain (each node's best child), kept in
-// the frontier so that the tree's first drafts are its chain's.
-// kEagleTrunk: the chain a tree's first drafts are (Model::block_drafts of a sequential drafter, 7)
+// slot); the node on the oracle's path, and the end of the trunk: the drafter's chain (each node's child the chain
+// would draft there), kept in the frontier so that a sampled tree's first drafts are its chain's.
+// kEagleTrunk: the chain a sampled tree's first drafts are (Model::block_drafts of a sequential drafter, 7)
 constexpr int kEagleSlots = FLYX_MAX_WIDE_ROWS, kEagleNodes = 512, kEagleBeamMax = 8, kEagleTrunk = FLYX_SEQUENTIAL_TRUNK;
 struct EagleTree {
   int n, f0, fn, oracle_node, trunk_node;
@@ -990,7 +990,8 @@ void eagle_tree_start(EagleTree* t, const DevParams* P, const DevGen* G, const i
 void eagle_tree_grow(EagleTree* t, const DevParams* P, const DevGen* G, const int* reply_count, const int* oracle,
                      const int* cand, const float* val, const float* prob, int kc, int beam, int vocab,
                      const float* gnode, float* hbuf, int H, cudaStream_t st);
-// The round's `width` drafts and their tree (TreeRows) from the nodes, the chain's first `trunk` first.
+// The round's `width` drafts and their tree (TreeRows) from the nodes: sampling the chain's first `trunk` first, greedy
+// best first.
 void eagle_tree_finish(const EagleTree* t, const DevGen* G, int width, int trunk, int* drafts, TreeRows* tree,
                        cudaStream_t st);
 
@@ -1659,7 +1660,7 @@ void gemm_fp4_presplit(const uint8_t* Q, const uint8_t* S, const float* RS, int 
 // bf16 rows a fused producer left in the scratch times W [2 I, K] (gate rows, then up;
 // bf16 W, or NVFP4 Q/S/RS) -> scratch glu [rows][I] = bf16(silu(g) u).  Same bits as the
 // GEMM into float32 followed by swiglu_split; W4A4 under KernelOptions::prefill_fp4 as
-// gemm_fp4_presplit.  cfg: a k_gemm_tc configuration (tests), -1 the default.  Then
+// gemm_fp4_presplit.  cfg: a k_gemm_tc configuration (tests), -1 the GPU's table's (prefill_tc).  Then
 // gemm_on_glu: the next GEMM (the down projection) on those rows, NVFP4 inputs rounded from them where its own
 // weights take them (whatever the gate|up weights are), as gemm_fp4_tc on the rows in float32.
 void gemm_glu_staged(const bf16* W, const uint8_t* Q, const uint8_t* S, const float* RS, int I, int K, int rows,

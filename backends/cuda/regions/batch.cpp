@@ -487,8 +487,9 @@ void draft_context_rows(const BatchPass& bp, const DFlashBlock& b, bool fused) {
 }  // namespace
 
 void run_batch(const BatchPass& bp) {
-  // Drafting: batch sequences drafting on the same MtpBlock (lockstep) or DFlashBlock (grouped up to FLYX_MAX_ROWS)
-  // so drafter weights are shared across sessions; other drafters and given-draft nodes run per sequence.
+  // Drafting: batch sequences drafting on the same MtpBlock or Eagle4Block (lockstep chains) or DFlashBlock (grouped up
+  // to FLYX_MAX_ROWS) so drafter weights are shared across sessions; other drafters and given-draft nodes run per
+  // sequence.
   const MtpBlock* mtp_blk = nullptr;
   const DFlashBlock* dflash_blk = nullptr;
   const Eagle4Block* e4_blk = nullptr;

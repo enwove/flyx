@@ -166,8 +166,9 @@ __global__ void __launch_bounds__(128) k_gemm_rows(const float* __restrict__ x, 
 // streams a row apart, 1.4 TB/s at K = 17408 on an RTX PRO 6000 against 1.2 for
 // contiguous chunks; by pairs, as W12's lanes load a pair's bytes at once and keep
 // them): every configuration
-// (tile, warps, unroll) gives bit-identical results, so a tuning table can
-// pick one per shape and row count freely.
+// (tile, warps, unroll, the blocks a column tile's chunks are shared by) gives
+// bit-identical results, so a tuning table can pick one per shape and row count
+// freely.
 constexpr int kSkinnyChunks = 16;
 
 // The output column of a result column: itself (cols maps it for a gathered GEMM).

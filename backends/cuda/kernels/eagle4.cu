@@ -2,10 +2,11 @@
 // EAGLE-4's draft trees (docs/design/tree-verification.md, "EAGLE-4's trees"): a beam of the best `beam` nodes a step,
 // each node's children its head's best `beam` candidates, scored by the sum of their log-probabilities over the
 // candidates scored exactly (the path's); sampling, by how likely each is the target's choice there, its noise at the
-// position known (draft_coupled_scores), its row's best `beam` by that; every candidate a node, the round verifies the best `width` of them, a parent
-// before its children, the trunk first: from the root each trunk node's child the chain would draft there (mtp_choose:
-// the same candidates, counts and noise), so a tree's first drafts are the chain the controller learns acceptance by
-// position from, sampling too.  Drafts only: the round's verification keeps the output plain decoding's.
+// position known (draft_coupled_scores), its row's best `beam` by that.  Every candidate a node; the round verifies
+// the best `width` of them, a parent before its children: greedy best first throughout, sampling the trunk first (from
+// the root each trunk node's child the chain would draft there, mtp_choose's choice from the same candidates, counts
+// and noise: the coupled chain a sampled round's accepted path follows).  Drafts only: the round's verification keeps
+// the output plain decoding's.
 #include <algorithm>
 #include <cmath>
 #include <stdexcept>
@@ -232,9 +233,7 @@ __global__ void k_eagle_tree_grow(EagleTree* t, const DevParams* P, const DevGen
 // (the coupled chain, which a sampled round's accepted path follows); then the best nodes by score (ties: the lower
 // index; a parent's score is never below its child's, so the nodes taken are a tree), in rows: the trunk (from the
 // root each row's oracle child, else its trunk child, else its first taken child) and the others in node order, so a
-// parent's row is before its child's.  Greedy the trunk is each node's best child, which the scores take first
-// anyway: best first throughout (Qwen3.8-27B, 15 drafts on chat prompts: 4.01 tokens a round against 3.93 with
-// the chain of 7 forced).
+// parent's row is before its child's.  Greedy no trunk is forced (trunk 0): best first throughout.
 __global__ void k_eagle_tree_finish(const EagleTree* t, const DevGen* G, int width, int trunk, int* drafts,
                                     TreeRows* tree) {
   pdl_trigger();

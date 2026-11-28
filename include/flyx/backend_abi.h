@@ -30,7 +30,7 @@
 extern "C" {
 #endif
 
-#define FLYX_BACKEND_ABI_VERSION 55u
+#define FLYX_BACKEND_ABI_VERSION 56u
 #define FLYX_BACKEND_ENTRY "flyx_backend_get_api"
 /* How a backend library exports its entry. */
 #if defined(_WIN32)
@@ -42,7 +42,8 @@ extern "C" {
 #define FLYX_MAX_ROWS 16       /* rows in one round: the anchor plus up to 15 drafts */
 #define FLYX_DSPINE_MAX_TOPK 16 /* the head's candidates DSpine's walk scores a row, at most (ABI 51) */
 /* Rows of a round whose drafts are given (a lookup round, ABI 36), where the backend lowers such plans: a copy of
- * the context verified up to 63 drafts at once.  A round result holds this many tokens. */
+ * the context verified up to 63 drafts at once; and of a round of several sequences there (launch_batch, ABI 56).
+ * A round result holds this many tokens. */
 #define FLYX_MAX_WIDE_ROWS 64
 #define FLYX_MAX_STOP_IDS 8
 #define FLYX_MAX_STOP_BUCKETS 8 /* sorted verify checkpoints in an adaptive round plan */
@@ -1221,10 +1222,13 @@ typedef struct flyx_backend_api {
   int (*snapshot_load)(flyx_seq* s, const flyx_host_pieces* src, uint64_t bytes, int32_t anchor);
   /* One round of several sequences (ABI 21): sequence i runs
    * round plan plans[i] with gens[i], its rows after sequence i - 1's, at most
-   * FLYX_MAX_ROWS rows in all; the plans may differ in their drafter and
-   * width only.  Each sequence gets what launch(plans[i], seqs[i], gens[i])
-   * gives it, read with read(); the weights are read once for all of them.
-   * Returns without waiting. */
+   * FLYX_MAX_ROWS rows a sequence; in all FLYX_MAX_ROWS, or where the backend
+   * lowers rounds of more given drafts, as many rows as the widest of them
+   * (ABI 56; at most FLYX_MAX_WIDE_ROWS).  The plans may differ in their
+   * drafter and width only.  Each sequence gets what launch(plans[i], seqs[i],
+   * gens[i]) gives it, read with read(); the weights are read once for all of
+   * them.  Returns without waiting; a batch it refuses (an error) the engine
+   * launches a round at a time. */
   int (*launch_batch)(flyx_plan* const* plans, flyx_seq* const* seqs, const flyx_gen_params* const* gens,
                       int32_t n);
   /* Host memory the device copies to and from at the bus's speed (ABI 22):

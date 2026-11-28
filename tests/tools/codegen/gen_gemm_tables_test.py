@@ -331,7 +331,8 @@ devices = ["GPU A"]
 format = "bf16"
 n = 5120
 k = 17408
-rules = [{ rows = [1, 8], nt = 4, warps = 16, unroll = 4 }, { rows = [9, 16], nt = 4, warps = 4, unroll = 4, split = 4 }]
+rules = [{ rows = [1, 8], nt = 4, warps = 16, unroll = 4 },
+         { rows = [9, 16], nt = 4, warps = 4, unroll = 4, split = 4 }]
 """
 text, err = generate({"a": SPLIT_SHAPE, "b": INHERITS})
 check(text is not None, "a shape's split rule generates", err)
@@ -429,7 +430,8 @@ refusals = {
         '[rules]\nprefill_tc = [{ format = "bf16", bm = 64, bn = 128, wn = 4, stages = 2 }]\n',
         "with a rule for the rest"),
     "a prefill rule after the rules for the rest": (
-        f'[rules]\nprefill_tc = [{TC_REST}, {{ format = "bf16", rows = [1, 64], bm = 64, bn = 32, wn = 2, stages = 6 }}]\n',
+        f'[rules]\nprefill_tc = [{TC_REST}, '
+        '{ format = "bf16", rows = [1, 64], bm = 64, bn = 32, wn = 2, stages = 6 }]\n',
         "after the rules for the rest"),
     "a prefill rule of no format": (
         f'[rules]\nprefill_tc = [{{ format = "fp8", bm = 64, bn = 32, wn = 2, stages = 6 }}, {TC_REST}]\n',

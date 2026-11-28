@@ -68,11 +68,11 @@ class Model {
   // Drafter d's rounds are always a tree of its drafts: its round programs say so themselves (FLYX_DRAFT_TREE), and
   // no chain of its drafts is a trunk the tree grows from (DV's).
   virtual bool drafts_trees(int) const { return false; }
-  // Drafter d's trees beside its chains are of FLYX_MAX_ROWS - 1 drafts only (EAGLE-4's: its chain of 7 and the
-  // branches beside it), none narrower.
+  // Drafter d's trees beside its chains are of FLYX_MAX_ROWS - 1 drafts only (EAGLE-4's), none narrower.
   virtual bool widest_trees(int) const { return false; }
-  // Drafter d's trees take their drafts best first, with no chain of its drafts kept as a trunk the controller could
-  // learn the chain from (EAGLE-4's greedy trees): rated by the tokens their rounds give, as a tree-only drafter's.
+  // Drafter d's trees are rated by the tokens their rounds give, as a tree-only drafter's, not as a chain and branches
+  // (EAGLE-4's: greedy best first; sampled, the coupled chain first and the rest by how likely each is the target's
+  // choice); its chains' acceptance comes from its chain rounds alone.
   virtual bool trees_best_first(int) const { return false; }
   // The target file requires exact reads even in plain decoding (embedded DV).
   virtual bool file_drafts_trees() const { return false; }

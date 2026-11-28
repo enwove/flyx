@@ -105,7 +105,7 @@ class RoundCostModel {
 // are this GPU's, measured at load.
 //
 // A tree without a trunk (trunks[i] < 0: DV's, whose drafts are all
-// branches) is rated by the tokens its rounds give: what the engine's sessions'
+// branches, and EAGLE-4's, Model::trees_best_first) is rated by the tokens its rounds give: what the engine's sessions'
 // rounds of it gave (SharedTokens: its mean, kept SharedTokens::kKeep a round,
 // a guess counting as kGuessRounds rounds, the tokens a chain of its width gives
 // at the prior acceptance: 4.0 for 15 drafts and for 31), times the session's

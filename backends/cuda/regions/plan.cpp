@@ -672,8 +672,8 @@ int lower(flyx_bmodel* m, const flyx_program* prog, flyx_plan** out) {
       const bool eagle = std::holds_alternative<Eagle4Block>(*b);
       if (!v && !eagle && !(f && !f->dspine && f->sel_topk > 1))
         return fail("lower: only DFlash2's block (of more than one candidate a row), EAGLE-4 and DV draft trees");
-      // EAGLE-4's trees verify its chain of kEagleTrunk and branches beside it: of 15 drafts (narrower ones are its
-      // chain with a branch or none, which its chains price better)
+      // EAGLE-4's trees are of 15 drafts (Model::widest_trees), chosen against its chains of 1..15 by the tokens they
+      // give
       if (eagle && prog->width < FLYX_MAX_ROWS - 1)
         return fail("lower: EAGLE-4 drafts trees of " + std::to_string(FLYX_MAX_ROWS - 1) + " drafts");
       p->tree = p->drafted_tree = p->has_draft = true;

@@ -312,8 +312,8 @@ const std::vector<OptionSpec>& option_specs() {
       bool_choice_opt("draft_head", &BackendOptions::full_draft_head, "full", "pick"),
       {"eagle4_tree",
        [](const std::string& key, const std::string& val, BackendOptions* o, std::string* err) {
-         // STEPS 0 (by the width) or at least the trunk: a shallower tree would cut the chain its trunk is, whose
-         // acceptance the controller counts to its 7th draft (Model::block_drafts)
+         // STEPS 0 (by the width) or at least the trunk: a shallower tree would cut a sampled tree's first drafts, the
+         // coupled chain of kEagleTrunk
          int beam = 0, steps = 0;
          const char *p = val.data(), *end = p + val.size();
          auto r = std::from_chars(p, end, beam);
@@ -769,8 +769,8 @@ int open_model(const flyx_model_desc* desc, const flyx_open_options* opts, flyx_
     // Wide rounds (up to FLYX_MAX_WIDE_ROWS rows, every row the 1..16-row bits: wide lookup rounds, and rounds of
     // several sessions as wide, launch_batch): wide=1, or wide=auto where every projection of the stack is NVFP4 or
     // bf16 (17..64-row GEMMs that read the weights once; GGML blocks take 16-row strips) and 24 GB of the GPU stay free
-    // for the sequences' wider round buffers.  Qwen3.8-27B BF16 with EAGLE-4 on an RTX PRO 6000: 8 sessions 362.4
-    // tok/s with them against 266.9 in batches of 16 rows, one session 121.3 against 121.1.
+    // for the sequences' wider round buffers.  Qwen3.8-27B BF16 with EAGLE-4 on an RTX PRO 6000 Server Edition: 8
+    // sessions 372.4 tok/s with them against 288.7 in batches of 16 rows, one session 128.1 against 126.4.
     if (m->opt.wide != 1) {
       bool once = true;  // every projection read once by a GEMM of 17..64 rows
       auto read_once = [](const Lin& l) { return !l.packed() && (l.q || l.w); };

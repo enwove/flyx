@@ -425,11 +425,6 @@ bm = 64
 bn = 64
 wn = 4
 stages = 4
-[[prefill_tc]]
-bm = 64
-bn = 128
-wn = 4
-stages = 4
 
 # The rules for shapes no table lists, on every GPU whose table (or one it inherits) has no rules of that family.
 [defaults]

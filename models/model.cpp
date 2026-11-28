@@ -22,9 +22,9 @@ struct DrafterTraits {
   bool tapped;            // drafts from the target's taps in the registry's slot without being a block (EAGLE-4)
   bool trees_by_default;  // its trees beside its chains pay on attention-only targets (drafts_trees_by_default)
   bool trees_beside_recurrence;  // ... on a gated delta net's too, whose tree recurrence a tree's rows run
-  bool widest_trees;      // its trees are of FLYX_MAX_ROWS - 1 drafts only (EAGLE-4's: its chain and the branches)
-  // Its trees take their drafts best first (greedy, no trunk of its chain kept): the controller rates them by the
-  // tokens their rounds give, as DV's, and learns its chains' acceptance from its chain rounds alone.
+  bool widest_trees;      // its trees are of FLYX_MAX_ROWS - 1 drafts only (EAGLE-4's)
+  // The controller rates its trees by the tokens their rounds give, as DV's (Model::trees_best_first), and learns its
+  // chains' acceptance from its chain rounds alone.
   bool trees_best_first;
   // A block drafted at once whose drafts a small head then refines one at a time: a step costs little beside the
   // verify row its draft adds, so a round that stops may verify fewer drafts than it has (draft_steps_cheap).  Not a

@@ -158,7 +158,7 @@ struct BackendOptions {
   int embed = 0;                 // embed=auto (0: host memory unless the GPU has room, open_model), host (1), gpu (2)
   int vision = FLYX_VISION_DEV_DISK;         // vision=disk (0: temp file, 0 VRAM/RAM), host (1), gpu (2), auto (3)
   int vision_quant = FLYX_VISION_QUANT_Q8;   // vision_quant=q8 (0), exact (1), nvfp4 (2)
-  int wide = 0;                  // wide=auto (0: wide lookup rounds where the GPU has room, open_model), 0 (1), 1 (2)
+  int wide = 0;                  // wide=auto (0: by the weights and the GPU's room, open_model), 0 (1), 1 (2)
   int strata_copy_slots = 2;
   bool strata_compact = false;  // pack the two shared words into the 24 private words of a hosted 256d 3-bit copy
   // Hybrid WDDM pinned + pageable host K/V overflow for Strata sessions (tiers.cpp / state.cpp):
@@ -407,11 +407,11 @@ struct BatchDFlash {
   int ld_dproj = 0, ld_dact = 0;
 };
 
-// Rounds of several sequences (runtime/runner.cpp launch_batch, regions/batch.cpp): each sequence's
-// rows after the one before it, at most FLYX_MAX_ROWS in all, borrowing the lead sequence's row/logits/cert buffers on
-// the batch stream (every participating sequence is synchronised on ready_ev / done).  Its graphs are kept by the
-// sequences and plans they ran, each in its sequences' rooms for graphs: an equal share of what it takes in each
-// one's graph_held.
+// Rounds of several sequences (runtime/runner.cpp launch_batch, regions/batch.cpp): each sequence's rows after the one
+// before it, at most FLYX_MAX_ROWS a sequence and wide_rows in all (as many sequences), borrowing the lead sequence's
+// row/logits/cert buffers on the batch stream (every participating sequence is synchronised on ready_ev / done).  Its
+// graphs are kept by the sequences and plans they ran, each in its sequences' rooms for graphs: an equal share of what
+// it takes in each one's graph_held.
 struct BatchRounds {
   static constexpr size_t kMaxGraphs = 64;        // LRU cap on cached batch graphs
   static constexpr uint32_t kGraphWarmHits = 8;   // capture only once a batch combo repeats (avoids capture stalls)
@@ -420,7 +420,7 @@ struct BatchRounds {
     cudaGraphExec_t exec = nullptr;
     uint64_t used = 0;   // `launched` at its last launch
     size_t share = 0;    // in each of its sequences' graph_held
-    unsigned long long ran[FLYX_MAX_ROWS]{};  // each sequence's seq_no at its last launch (BatchKey::seqs' order)
+    unsigned long long ran[FLYX_MAX_WIDE_ROWS]{};  // each sequence's seq_no at its last launch (BatchKey::seqs' order)
   };
   cudaStream_t st = nullptr;
   SideStream side{};  // the round's narrow GEMMs of a stack beside its wide ones (Launch::side)
@@ -518,8 +518,8 @@ struct flyx_bmodel {
   int prefill_rows = 0;  // rows of the widest prefill plan lowered: the shared prefill buffers hold them
   int prefill_align = 1;  // gdn_chunk_align() when every GDN block takes the chunked prefill recurrence
   int res16 = -1;         // residual16(): whether the model's prefill passes may keep the residual in bf16 (-1: unknown)
-  // The most rows a round may have: FLYX_MAX_WIDE_ROWS where lookup rounds may be wide (open_model), else
-  // FLYX_MAX_ROWS.  Each sequence's round buffers hold this many rows.
+  // The most rows a round may have, a wide lookup round's or a round of several sequences': FLYX_MAX_WIDE_ROWS where
+  // rounds may be wide (open_model), else FLYX_MAX_ROWS.  Each sequence's round buffers hold this many rows.
   int wide_rows = FLYX_MAX_ROWS;
   flyx::cuda::RowBufs prefill_bufs;  // shared by every session's prefill
   std::vector<void*> prefill_allocs;

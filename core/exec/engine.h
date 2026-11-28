@@ -208,7 +208,8 @@ class Engine {
   // drafter's state follows its own rounds only; 0 otherwise, a round costing the same at any context); round_name(i)
   // says so ("mtp 3", "0", "dflash2 tree 11", "dv tree 31", "dv warm-up": a round of no drafts of a drafter,
   // Model::restarts).  round_trunks()[i]: a tree's trunk, the drafter's chain its first drafts are (its widest chain's
-  // width); 0 for a chain; -1 for a tree without one (a drafter that drafts nothing but trees: SpecController).
+  // width); 0 for a chain; -1 for a tree rated by the tokens its rounds give (a drafter that drafts nothing but trees,
+  // or whose trees are rated so, Model::trees_best_first: SpecController).
   const std::vector<int>& widths() const { return plans_.widths; }
   const std::vector<int>& round_drafters() const { return plans_.drafters; }
   const std::vector<bool>& round_trees() const { return plans_.drafter_trees; }

@@ -685,9 +685,9 @@ void Scheduler::advance_all() {
 }
 
 // Every running generation's next round, jointly scheduled across sessions into batches of at most
-// Engine::batch_rows() rows (core/speculation/batch_schedule.h). In step: they go out when every generation in its round
-// phase has one to launch (one whose rounds in flight are at its limit reads one soon), so they share rounds rather
-// than each keeping its own two in flight at its own times.
+// Engine::batch_rows() rows (core/speculation/batch_schedule.h). In step: they go out when every generation in its
+// round phase has one to launch (one whose rounds in flight are at its limit reads one soon), so they share rounds
+// rather than each keeping its own two in flight at its own times.
 bool Scheduler::launch_rounds() {
   for (auto& r : running_) {
     r->gen->set_batched(true);

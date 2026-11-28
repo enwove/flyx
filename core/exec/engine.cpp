@@ -334,7 +334,7 @@ bool Engine::build_and_calibrate_plans(double* t_plans, double* t_rounds, std::s
   round_ms_at_ = round_ms_again_at_ = 0;
   round_trunks_.assign(plans_.widths.size(), 0);
   // A tree's trunk: the chain one pass of its drafter's block makes (ops/draft/ref.h); a drafter that drafts nothing
-  // but trees has none.
+  // but trees, or whose trees are rated by the tokens they give (Model::trees_best_first), has none.
   for (size_t i = 0; i < plans_.widths.size(); ++i)
     if (plans_.drafter_trees[i]) {
       const int chain = model_->block_drafts(plans_.drafters[i]);

@@ -4,7 +4,7 @@
 // Each running session has a small set of candidate rounds (RoundChooser::candidates):
 // its preferred solo choice plus narrower batchable widths (plain, narrower drafter
 // widths, narrower lookup widths).  A shared batch reads the target's weights once for
-// all of its rows (at most FLYX_MAX_ROWS), and sessions sharing a drafter also share its
+// all of its rows (at most max_rows: plan_batches), and sessions sharing a drafter also share its
 // weight reads in lockstep/grouped batches.  BatchCostModel estimates a batch's cost from
 // the round and lookup timings calibrated at load; plan_batches() compares unconstrained First-Fit Decreasing packing against 1-batch joint width allocation
 // maximizing proportional fairness — the geometric mean of every session's expected
@@ -24,7 +24,7 @@ namespace flyx {
 class BatchCostModel {
  public:
   // Marginal fraction of a session's solo draft cost paid by additional sessions sharing the same drafter
-  // in a batch: lockstep MTP and grouped DFlash2 read drafter weights and the 1-bit draft head once across
+  // in a batch: lockstep MTP and EAGLE-4 and grouped DFlash2 read drafter weights and the draft heads once across
   // concurrent sessions, leaving per-session mixer/attention/table overhead beyond the widest member.
   static constexpr double kSharedDraftShare = 0.15;
   // Fraction of a 1-row pass each session past the first adds to a batch (its own GDN/attention mixers, accept and
@@ -37,7 +37,7 @@ class BatchCostModel {
              const std::vector<int>& lookup_widths, const std::vector<double>& lookup_ms);
   bool ready() const { return !knots_.empty(); }
 
-  // Target-only verification time (ms) for `rows` rows (1..FLYX_MAX_ROWS),
+  // Target-only verification time (ms) for `rows` rows (1..FLYX_MAX_WIDE_ROWS, as wide as the lookup rounds timed),
   // piecewise-linearly interpolated from the calibrated plain and lookup timings.
   double target_ms(int rows) const;
   // Total shared-batch time (ms) for `n_sessions` sharing `rows` rows plus their `draft_ms`:

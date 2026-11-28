@@ -1724,11 +1724,14 @@ int launch_batch(flyx_plan* const* plans, flyx_seq* const* seqs, const flyx_gen_
       return fail("launch_batch: tree, adaptive, and relaxed rounds run alone");
     for (int j = 0; j < i; ++j)
       if (seqs[j] == seqs[i]) return fail("launch_batch: a sequence twice");
+    if (plans[i]->width + 1 > FLYX_MAX_ROWS)
+      return fail("launch_batch: a round of more than FLYX_MAX_ROWS rows runs alone");
     rows += plans[i]->width + 1;
   }
   // Up to the rows a sequence's own buffers hold (m->wide_rows: FLYX_MAX_WIDE_ROWS where wide rounds are on), every
   // row the bits a round of its own gives it (run_batch: the GEMMs of more than FLYX_MAX_ROWS rows as a wide round's)
-  if (rows > m->wide_rows) return fail("launch_batch: more rows than a round holds (" + std::to_string(m->wide_rows) + ")");
+  if (rows > m->wide_rows)
+    return fail("launch_batch: more rows than a round holds (" + std::to_string(m->wide_rows) + ")");
   // Canonicalize sequence order by pointer so equivalent batches share one cached graph regardless of caller order.
   int ord[FLYX_MAX_WIDE_ROWS];
   for (int i = 0; i < n; ++i) ord[i] = i;

@@ -46,7 +46,7 @@ namespace {
 // its place; "" for none.
 std::string g_block;
 std::string block_label() { return g_block == "dspine" ? "DSpine" : g_block == "dflash" ? "DFlash" : "DFlash2"; }
-// EAGLE-4's trunk: the chain a tree of its drafts starts with (Model::block_drafts, kEagleTrunk)
+// EAGLE-4's trunk: the chain a sampled tree of its drafts starts with (Model::block_drafts, kEagleTrunk)
 constexpr int kEagleTrunkDrafts = 7;
 
 // Session::init, checked.  A session the engine refuses (no room left for it, as on a GPU other programs hold, or
@@ -2149,7 +2149,7 @@ void drafted_trees(const std::string& model, const std::string& backend, const s
   std::vector<size_t> turns;
   for (size_t i = 0; i < trees->widths().size(); ++i)
     if (trees->round_trees()[i]) turns.push_back(i);
-  // EAGLE-4's trees are of 15 drafts (its chain of 7 and branches; narrower ones its chains price better)
+  // EAGLE-4's trees are of 15 drafts (Model::widest_trees)
   check(turns.size() == (g_block == "eagle4" ? 1 : plan::draft_tree_widths().size()),
         who + " drafts trees of every size it has");
   for (size_t i = 0; i < trees->widths().size(); ++i)  // and its chains
@@ -2212,7 +2212,7 @@ void drafted_trees(const std::string& model, const std::string& backend, const s
   check(static_cast<int>(a.size()) == N && sampled(trees.get(), true) == a,
         "  sampled (T=0.8): trees taking turns == plain for one seed");
   if (g_block != "eagle4" || backend != "cuda") return;
-  // EAGLE-4's trunk is its chain, sampling and with penalties too (each trunk node's child the chain's draft there:
+  // A sampled EAGLE-4 tree's trunk is its chain, with penalties too (each trunk node's child the chain's draft there:
   // mtp_choose's choice from the same candidates, counts and noise): from each of 8 prompts, the first round of a
   // tree of 15 drafts the chain of 7's drafts first.
   size_t chain = trees->widths().size();
@@ -4174,6 +4174,24 @@ int main(int argc, char** argv) {
                    pick, "rounds of several sequences, plain and each drafter");
       batch_rounds(E, {prompt, other, twice}, {pick.back(), pick.back(), pick.back()},
                    "rounds of three sequences, one plan");
+      if (E->batch_rows() > FLYX_MAX_ROWS) {  // past 16 rows in all (wide rows): three sequences' widest chains, and
+                                              // twenty sequences' plain rounds (more sequences than 16)
+        size_t widest = E->widths().size();
+        for (size_t i = 0; i < E->widths().size(); ++i)
+          if (E->round_drafters()[i] == 0 && !E->round_trees()[i] && E->widths()[i] + 1 <= FLYX_MAX_ROWS &&
+              (widest == E->widths().size() || E->widths()[i] > E->widths()[widest]))
+            widest = i;
+        if (widest < E->widths().size() && 3 * (E->widths()[widest] + 1) > FLYX_MAX_ROWS)
+          batch_rounds(E, {prompt, other, twice}, {widest, widest, widest},
+                       "a round of three sequences of " + std::to_string(3 * (E->widths()[widest] + 1)) + " rows");
+        std::vector<std::vector<int32_t>> many;
+        for (int i = 0; i < 20; ++i) {
+          auto p = prompt;
+          p[0] = (p[0] + 11 * i) % 300;
+          many.push_back(p);
+        }
+        batch_rounds(E, many, std::vector<size_t>(many.size(), pick.front()), "a round of twenty sequences, plain");
+      }
     }
     if (k == 1 && backend == "cuda") {  // tree rounds (the reference backend has none)
       SamplingParams greedy, sampled, penalized;

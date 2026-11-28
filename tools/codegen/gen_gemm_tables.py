@@ -204,7 +204,8 @@ class Compiled:
         for bm, bn, wn, st in self.tc:
             threads = 32 * (bm // 64) * wn
             if (bm not in (64, 128) or bn not in (16, 32, 64, 128) or bn % (16 * wn) or bm * 4 % threads
-                    or bn * 4 < threads or bn * 4 % threads or bn > threads or not 2 <= st <= 8 or st * (bm + bn) * 64 > TC_SMEM):
+                    or bn * 4 < threads or bn * 4 % threads or bn > threads or not 2 <= st <= 8
+                    or st * (bm + bn) * 64 > TC_SMEM):
                 raise SystemExit(f"{where}: prefill_tc takes bm 64 or 128, bn 16..128 with warp tiles of an even "
                                  f"number of 8 columns, threads that share the tile's copies evenly and 2..8 stages "
                                  f"within {TC_SMEM} bytes; got {(bm, bn, wn, st)}")
@@ -528,8 +529,9 @@ def shape_rules(path, t, sid, c: Compiled):
                 if g["k"] % k[0]:
                     raise SystemExit(f"{path}: span {k[0]} does not divide K={g['k']}")
             if cfg < 0:
+                keys = FP4_KEYS if fmt == 1 else BF16_KEYS
                 raise SystemExit(f"{path}: {g['format']} {g['n']}x{g['k']} rows {r['rows']}: configuration "
-                                 f"{ {k: r[k] for k in (FP4_KEYS if fmt == 1 else BF16_KEYS) if k in r} } is not in candidates")
+                                 f"{ {k: r[k] for k in keys if k in r} } is not in candidates")
             rules.append((sid, fmt, g["n"], g["k"], lo, hi, cfg))
         if covered[1:] != [1] * 16:
             raise SystemExit(f"{path}: {g['format']} {g['n']}x{g['k']}: rules must cover rows 1..16 exactly once")
@@ -890,11 +892,13 @@ def emit(c: Compiled, skus, rules, families, archs=(), flash_gqa=(), strata_plac
         out += ([f"    {{{sku}, FLYX_DT_GGML_{t}, {lo}, {hi}, {cfg}}}," for t in types]
                 or [f"    {{{sku}, -1, {lo}, {hi}, {cfg}}},"])
     out.append("};")
-    out.append("// Prefill GEMMs on the bf16 tensor cores: weights' format (-1 both, 0 bf16, 1 nvfp4), passes of lo..hi")
+    out.append("// Prefill GEMMs on the bf16 tensor cores: weights' format (-1 both, 0 bf16, 1 nvfp4), "
+               "passes of lo..hi")
     out.append("// rows, fewer 64 x 128 tiles per SM than tiles_below (0: any); the first rule that matches.")
     out.append("struct PrefillTcRule { int sku, fmt, lo, hi; double tiles_below; int cfg; };")
     out.append("inline constexpr PrefillTcRule kPrefillTc[] = {")
-    out += [f"    {{{sku}, {fmt}, {lo}, {hi}, {below!r}, {cfg}}}," for sku, (fmt, lo, hi, below, cfg) in rows_of("prefill_tc")]
+    out += [f"    {{{sku}, {fmt}, {lo}, {hi}, {below!r}, {cfg}}},"
+            for sku, (fmt, lo, hi, below, cfg) in rows_of("prefill_tc")]
     out.append("};")
     if sku_archs is None:
         sku_archs = [0] * len(skus)
