@@ -118,6 +118,8 @@ def canonical_eagle4_config(sc: dict, target: dict | None) -> dict:
     if types[0] == "sliding_attention":
         _require(sc.get("use_sliding_window") is True and _int(sc.get("sliding_window")) and sc["sliding_window"] > 0,
                  "a sliding layer without its window")
+        _require(sc["sliding_window"] <= MAX_INDEX,
+                 f"sliding_window {sc['sliding_window']} past a 32-bit index (the loader takes 1..{MAX_INDEX})")
         window = sc["sliding_window"]
     else:
         _require(types[0] == "full_attention" and not sc.get("use_sliding_window"), f"layer type {types[0]!r}")

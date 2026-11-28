@@ -603,6 +603,10 @@ def eagle4_config():
           "head_dim 16384, the loader's most: taken")
     check(refused(lambda c: canonical_draft_config(c, None), dict(published, head_dim=16386), "past the loader's bounds"),
           "head_dim 16386: refused")
+    check(canonical_draft_config(dict(published, sliding_window=2147483647), None)["window"] == 2147483647,
+          "a window of 2147483647, the most a 32-bit index takes: taken")
+    check(refused(lambda c: canonical_draft_config(c, None), dict(published, sliding_window=2147483648),
+                  "past a 32-bit index"), "a window of 2147483648: refused")
     wide = (1 << 20) + 2
     check(refused(lambda c: canonical_draft_config(c, None),
                   dict(published, hidden_size=wide, target_hidden_size=wide), "past the loader's bounds"),
