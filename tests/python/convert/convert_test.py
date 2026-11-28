@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import struct
 import sys
 import tempfile
@@ -28,6 +29,7 @@ from check import check, finish  # noqa: E402
 import export_dv  # noqa: E402
 from flyx_convert.convert import (canonical_dense_config, canonical_draft_config,  # noqa: E402
                                   canonical_target_config, convert)
+from flyx_convert import eagle4  # noqa: E402
 from flyx_convert.dv import add_dv, parse_tree, pool_size  # noqa: E402
 from flyx_convert.fileformat import MAGIC, Reader, Writer  # noqa: E402
 from flyx_convert.lora import add_lora  # noqa: E402
@@ -567,6 +569,25 @@ def eagle4_config():
                   "outside the target's layers"), "taps past the target's layers: refused")
     check(refused(lambda c: canonical_draft_config(c, None), dict(published, norm_output=False), "norm_output"),
           "a drafter that carries its unnormalised output on: refused")
+    # What the engine refuses to open (models/drafters/eagle4.cpp) is refused before a tensor is read: more taps than
+    # FLYX_EAGLE4_MAX_TAPS, a rotary base or a norm epsilon not finite and above zero.
+    def taps(n):
+        return dict(published, num_aux_hidden_states=n,
+                    eagle_config=dict(published["eagle_config"], eagle_aux_hidden_state_layer_ids=list(range(n))))
+    with open(os.path.join(HERE, "..", "..", "..", "include", "flyx", "backend_abi.h"), encoding="utf-8") as f:
+        abi = re.search(r"#define FLYX_EAGLE4_MAX_TAPS (\d+)", f.read())
+    check(abi and int(abi.group(1)) == eagle4.MAX_TAPS == 8, "the converter's tap limit is the ABI's")
+    d = canonical_draft_config(taps(8), {"hidden": 5120, "vocab": 248320, "layers": 64})
+    check(d["taps"] == list(range(1, 9)), f"eight taps, the most the engine takes: {d['taps']}")
+    check(refused(lambda c: canonical_draft_config(c, None), taps(9), "9 taps (the engine takes 1..8)"),
+          "nine taps: refused")
+    for theta in (0, 0.0, -1.0, float("inf"), float("nan"), True):
+        check(refused(lambda c: canonical_draft_config(c, None),
+                      dict(published, rope_parameters={"rope_theta": theta, "rope_type": "default"}), "rope_parameters"),
+              f"rope_theta {theta!r}: refused")
+    for eps in (0, -1e-6, float("inf"), float("nan")):
+        check(refused(lambda c: canonical_draft_config(c, None), dict(published, rms_norm_eps=eps), "rms_norm_eps"),
+              f"rms_norm_eps {eps!r}: refused")
 
 
 def main():

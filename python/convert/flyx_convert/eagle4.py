@@ -16,11 +16,14 @@ low-rank candidate head, the target's vocabulary; anything else is refused, neve
 """
 from __future__ import annotations
 
+import math
 import re
 
 from .rules import check_tensors
 
 ARCHITECTURE = "LlamaForCausalLMEagle4"
+# The taps a drafter may have: FLYX_EAGLE4_MAX_TAPS (include/flyx/backend_abi.h), which the engine holds every file to.
+MAX_TAPS = 8
 
 _RULES = [
     (r"fc\.weight", "fc"),
@@ -53,8 +56,8 @@ def _number(x) -> bool:
     return type(x) in (int, float)
 
 
-def is_eagle4_config(sc: dict) -> bool:
-    return ARCHITECTURE in (sc.get("architectures") or [])
+def _positive(x) -> bool:
+    return _number(x) and math.isfinite(x) and x > 0
 
 
 def canonical_eagle4_config(sc: dict, target: dict | None) -> dict:
@@ -76,7 +79,7 @@ def canonical_eagle4_config(sc: dict, target: dict | None) -> dict:
     heads, kv = sc["num_attention_heads"], sc["num_key_value_heads"]
     hd = sc.get("head_dim", H // heads)
     _require(_int(hd) and hd > 0 and hd % 2 == 0 and heads % kv == 0, f"heads {heads}/{kv}, head_dim {hd!r}")
-    _require(_number(sc.get("rms_norm_eps")) and sc["rms_norm_eps"] > 0, "rms_norm_eps")
+    _require(_positive(sc.get("rms_norm_eps")), f"rms_norm_eps {sc.get('rms_norm_eps')!r} (finite, above 0)")
     _require(_int(sc.get("target_hidden_size", H)) and sc.get("target_hidden_size", H) == H,
              "a target width other than its own (its embedding is the target's)")
     _require(_int(sc.get("draft_vocab_size", vocab)) and sc.get("draft_vocab_size", vocab) == vocab,
@@ -88,6 +91,7 @@ def canonical_eagle4_config(sc: dict, target: dict | None) -> dict:
     ids = ec.get("eagle_aux_hidden_state_layer_ids")
     _require(isinstance(ids, list) and ids and all(_int(i) and i >= 0 for i in ids) and ids == sorted(set(ids)),
              f"eagle_aux_hidden_state_layer_ids {ids!r}")
+    _require(len(ids) <= MAX_TAPS, f"{len(ids)} taps (the engine takes 1..{MAX_TAPS})")
     n_aux = sc.get("num_aux_hidden_states", len(ids))
     _require(_int(n_aux) and n_aux == len(ids), "num_aux_hidden_states")
     nt = sc.get("num_target_layers")
@@ -95,9 +99,9 @@ def canonical_eagle4_config(sc: dict, target: dict | None) -> dict:
     if target is not None:
         _require(nt is None or nt == target["layers"], f"made for a model of {nt} layers")
     rp = sc.get("rope_parameters")
-    _require(isinstance(rp, dict) and rp.get("rope_type", "default") == "default" and _number(rp.get("rope_theta"))
+    _require(isinstance(rp, dict) and rp.get("rope_type", "default") == "default" and _positive(rp.get("rope_theta"))
              and sc.get("rope_scaling") is None and set(rp) <= {"rope_type", "rope_theta"},
-             f"rope_parameters {rp!r} (default rotary, its theta)")
+             f"rope_parameters {rp!r} (default rotary, its theta finite and above 0)")
     _require(sc.get("rope_is_neox_style", True) is True, "rotary other than NeoX's halves")
     types = sc.get("layer_types")
     _require(isinstance(types, list) and len(types) == 1, f"layer_types {types!r} (one)")
