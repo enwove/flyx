@@ -147,6 +147,42 @@ std::vector<int32_t> ModelFile::eos_ids() const {
   return out;
 }
 
+std::vector<std::string> packed_drafters(const std::string& path, const PathAllowFn& allow_path) {
+  std::vector<std::string> out;
+  if (allow_path && !allow_path(path)) return out;
+  nlohmann::json h;
+  if (!modelfile::peek_flyx_header(path, &h) || !h.contains("gguf") || !h["gguf"].is_object()) return out;
+  // A GGUF header's MTP layers (<arch>.nextn_predict_layers), 0 when it says none.
+  auto mtp_layers = [](const nlohmann::json& one) {
+    if (!one.contains("arch") || !one["arch"].is_string() || !one.contains("gguf") || !one["gguf"].is_object()) return 0;
+    const auto it = one["gguf"].find(one["arch"].get<std::string>() + ".nextn_predict_layers");
+    return it != one["gguf"].end() && it->is_number_integer() ? it->get<int>() : 0;
+  };
+  if (mtp_layers(h) > 0) out.push_back("mtp");
+  if (!h.contains("bundled") || !h["bundled"].is_array()) return out;
+  for (const auto& b : h["bundled"]) {
+    if (!b.is_object() || b.value("role", "") != "drafter" || !b.contains("header") || !b["header"].is_object()) continue;
+    const auto& bh = b["header"];
+    std::string kind;
+    if (bh.value("arch", "") == "dflash") {  // llama.cpp's: a Markov head is DSpark's
+      const auto& g = bh.contains("gguf") && bh["gguf"].is_object() ? bh["gguf"] : nlohmann::json::object();
+      kind = g.value("dflash.has_markov_context", false) ? "dspark" : "dflash2";
+    } else if (mtp_layers(bh) > 0) {
+      kind = "mtp";
+    } else if (bh.contains("draft") && bh["draft"].is_object()) {
+      kind = bh["draft"].value("kind", "");
+    } else if (b.contains("directory_config") && b["directory_config"].is_object() &&
+               b["directory_config"].contains("architectures") && b["directory_config"]["architectures"].is_array()) {
+      std::vector<std::string> names;
+      for (const auto& a : b["directory_config"]["architectures"])
+        if (a.is_string()) names.push_back(a.get<std::string>());
+      kind = drafter_kind_of(names);
+    }
+    out.push_back(kind);
+  }
+  return out;
+}
+
 ModelOrigin model_origin(const std::string& path, const PathAllowFn& allow_path) {
   ModelOrigin out;
   if (allow_path && !allow_path(path)) return out;

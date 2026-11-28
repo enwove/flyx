@@ -120,6 +120,11 @@ struct ModelOrigin {
 };
 ModelOrigin model_origin(const std::string& path, const PathAllowFn& allow_path = {});
 
+// The drafters a .flyx file packed from a GGUF holds (flyx pack), read from its header alone: "mtp" for the model's
+// own MTP layer, then each bundled drafter's kind ("mtp", "dflash2", "dspark", "dspine", ...; "" when its header does
+// not say).  None for any other file.
+std::vector<std::string> packed_drafters(const std::string& path, const PathAllowFn& allow_path = {});
+
 // The block drafter a config.json's architectures name, by one table (core/modelfile/drafter_dir.cpp): "dflash2",
 // "dflash", "dspark", "dspine"; "" for none.
 std::string drafter_kind_of(const std::vector<std::string>& architectures);

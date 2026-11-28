@@ -119,6 +119,13 @@ int main(int argc, char** argv) {
                 (cpart.empty() ? "" : " (not " + cpart + ")"));
     }
     check(interfaces::open_model(back, {}, &err) != nullptr, what + ": opens as a model: " + err);
+    // What the loader reads of it before opening it: the model's own MTP layer, then each bundled drafter's kind.
+    const auto kinds = packed_drafters(packed);
+    const size_t own_mtp = gguf_peek(dir + "/" + c.model).mtp_layers > 0 ? 1 : 0;
+    bool named = kinds.size() == own_mtp + c.beside.size();
+    std::string listed;
+    for (const auto& k : kinds) named = named && !k.empty(), listed += " " + k;
+    check(named, what + ": its drafters read from its header:" + listed);
     std::filesystem::remove(packed);
   }
 
