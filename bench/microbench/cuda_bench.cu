@@ -35,9 +35,10 @@
 //   cuda_bench graphs [K]  what an instantiated graph takes of the device's memory, by the nodes it holds (graphs.cu)
 //   cuda_bench paging KIND STEP [PIECE [FILL_TO]]  where the driver stops keeping allocations of a size on the GPU
 //                          (Windows pages them to host memory), one cudaMalloc or VMM pieces a step (paging.cu)
-//   cuda_bench mt [ROWS]   bf16 GEMMs of 17..64 rows on MiniCPM5-1B's layers, DV's adapters and head: the prefill
-//                          kernel, the 1..16-row kernel a tile of 16 rows at a time, and every k_gemm_skinny_mt
-//                          configuration (bf16_mt), us and GB/s of weights
+//   cuda_bench mt [ROWS ...] [NxK ...]  bf16 GEMMs of 17..64 rows (by default 17, 32, 48 and 64) on the shapes given
+//                          (by default MiniCPM5-1B's layers, DV's adapters and head): the prefill kernel, the 1..16-row
+//                          kernel a tile of 16 rows at a time, and every k_gemm_skinny_mt configuration (bf16_mt), us
+//                          and GB/s of weights
 //
 // Weights rotate through enough copies to exceed the L2 cache, as in a real
 // forward pass where every weight is read once per round.  Kernels launch as
@@ -2393,14 +2394,21 @@ const Shape kRowsShapes[] = {{"w_in q|k|v", 2560, 1536}, {"w_out", 1536, 2048}, 
 
 void bench_mt(int argc, char** argv) {
   header();
-  std::vector<int> rows_list = {17, 32, 48, 64};
-  if (argc > 2) rows_list = {std::atoi(argv[2])};
+  std::vector<int> rows_list;
+  std::vector<Shape> shapes;
+  for (int i = 2; i < argc; ++i) {
+    int n = 0, k = 0;
+    if (std::sscanf(argv[i], "%dx%d", &n, &k) == 2) shapes.push_back({argv[i], n, k});
+    else if (const int r = std::atoi(argv[i]); r >= 1 && r <= FLYX_MAX_WIDE_ROWS) rows_list.push_back(r);
+  }
+  if (rows_list.empty()) rows_list = {17, 32, 48, 64};
+  if (shapes.empty()) shapes.assign(std::begin(kRowsShapes), std::end(kRowsShapes));
   std::printf("us (GB/s of weights) per GEMM: prefill = gemm_tc, tiles = the 1..16-row kernel 16 rows at a time; "
               "mt c = bf16_mt configuration c (nt, chunks, unroll, parts)\n");
   for (int c = 0; c < kMtConfigCount; ++c)
     std::printf("  mt %2d: nt %d, chunks %2d, unroll %d, parts %d\n", c, kMtConfigs[c].nt, kMtConfigs[c].chunks,
                 kMtConfigs[c].unroll, kMtConfigs[c].parts);
-  for (const auto& s : kRowsShapes) {
+  for (const auto& s : shapes) {
     Weights W(s, true);
     float *x, *y;
     CK(cudaMalloc(&x, size_t(64) * s.K * 4));
