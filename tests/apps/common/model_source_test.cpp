@@ -63,7 +63,13 @@ bool fetched(const std::string& model, const std::vector<std::string>& drafters,
 
 }  // namespace
 
-int main() {
+int main(int argc, char** argv) {
+  if (argc != 2) return 2;
+  const fs::path assets = to_path(argv[1]);
+  auto fixture = [&](const char* file, const fs::path& dst) {
+    fs::create_directories(dst.parent_path());
+    fs::copy_file(assets / file, dst, fs::copy_options::overwrite_existing);
+  };
   flyx::test::print_passes = true;
   // When a DSpark drafter is taken without being named: the default (auto) with no drafter file, dspark, all.
   const std::vector<std::string> none, one = {"dflash2-drafter"};
@@ -85,19 +91,17 @@ int main() {
   const fs::path dir = tmp / "models";
   const fs::path model = dir / "Ink-Tiny-UD-Q4_K_M.gguf", other = dir / "Other-Q4_K_M.gguf";
   const fs::path drafter = dir / "dspark-Ink-Tiny-Q8_0.gguf";
-  write_gguf(model, "inkling2_loop");
+  fixture("tiny_inkling2_bf16.gguf", model);
   write_gguf(other, "inkling2_loop");
-  write_gguf(drafter, "dflash", 1);
+  fixture("dspark-tiny-q8.gguf", drafter);
   write_gguf(dir / "dspark-Ink-Tiny-A.gguf", "dflash", 0);   // a DFlash2 drafter by its header
   write_gguf(dir / "dspark-Ink-TinyX-Q8_0.gguf", "dflash", 1);  // another model's name
   write_gguf(dir / "dspark-Ink-Tiny-B.txt", "dflash", 1);       // not a GGUF by its name
-  const std::string beside = flyx::apps::dspark_beside(from_path(model));
-  check(beside == from_path(drafter), "the DSpark GGUF beside a model on disk: " + beside);
-  check(flyx::apps::dspark_beside(from_path(other)).empty() && flyx::apps::dspark_beside(from_path(drafter)).empty(),
-        "none beside a model no DSpark drafter is named after (nor beside a drafter)");
-
   flyx::apps::Fetched f;
   std::string err;
+  check(fetched(from_path(other), {}, true, &f, &err) && f.drafters.empty() &&
+            fetched(from_path(drafter), {}, true, &f, &err) && f.drafters.empty(),
+        "none beside a model no DSpark drafter is named after (nor beside a drafter)");
   bool ok = fetched(from_path(model), {}, true, &f, &err);
   check(ok && f.drafters == std::vector<std::string>{from_path(drafter)} && f.drafter_sources.size() == 1 &&
             f.drafter_sources[0].kind == "dspark" && f.drafter_sources[0].from == from_path(drafter) &&
@@ -105,6 +109,19 @@ int main() {
         "fetch_model attaches it to the model on disk" + (ok ? "" : ": " + err));
   ok = fetched(from_path(model), {}, false, &f, &err);
   check(ok && f.drafters.empty() && f.drafter_sources.empty(), "not when it is not wanted");
+  auto loads_dspark = [&] {
+    flyx::EngineOptions eo;
+    eo.backend = "cpu_ref";
+    eo.drafter_files = f.drafters;
+    flyx::Engine engine;
+    return engine.load(f.model, eo, &err) && std::string(engine.drafter()) == "dspark";
+  };
+  const auto alternate = dir / "dspark-Ink-Tiny-Q8_0_Alternate.gguf";
+  fixture("dspark-tiny-bf16.gguf", alternate);
+  fixture("dspark_excess_heads.gguf", drafter);  // valid Markov header, incompatible DSpark dimensions
+  ok = fetched(from_path(model), {}, true, &f, &err);
+  check(ok && f.drafters == std::vector<std::string>{from_path(alternate)} && loads_dspark(),
+        "local discovery retries a target-incompatible drafter and loads DSpark: " + err);
   const fs::path named = tmp / "elsewhere" / "dspark-mine.gguf";
   write_gguf(named, "dflash", 1);
   ok = fetched(from_path(model), {from_path(named)}, true, &f, &err);
@@ -121,8 +138,11 @@ int main() {
     fs::create_directories(repo / "refs");
     std::ofstream(repo / "refs" / "main", std::ios::binary) << commit;
     const fs::path snap = repo / "snapshots" / commit;
-    write_gguf(snap / "Ink-Tiny-Q4_K_M.gguf", "inkling2_loop");
-    for (const auto& [file, markov] : dsparks) write_gguf(snap / file, "dflash", markov);
+    fixture("tiny_inkling2_bf16.gguf", snap / "Ink-Tiny-Q4_K_M.gguf");
+    for (const auto& [file, markov] : dsparks) {
+      if (markov == 1) fixture("dspark-tiny-q8.gguf", snap / file);
+      else write_gguf(snap / file, "dflash", markov);
+    }
     return "acme/" + name;
   };
   const std::string repo = cached_repo("Ink-Tiny-GGUF", {{"dspark-Ink-Tiny-Q8_0.gguf", 1}, {"dspark-Ink-Tiny-Z.gguf", 1}});
@@ -139,6 +159,20 @@ int main() {
   bool said = false;
   for (const std::string& n : f.notes) said = said || n.find("is not a DSpark drafter") != std::string::npos;
   check(ok && f.drafters.empty() && said, "a dspark-*.gguf whose header is not a DSpark drafter's is not taken");
+  const std::string fallback = cached_repo("Ink-Fallback-GGUF", {{"dspark-Ink-Tiny-Q8_0_Alternate.gguf", 1}});
+  flyx::hub::Repo fr;
+  check(flyx::hub::in_cache(fallback, "main", &fr), "fallback snapshot exists");
+  const fs::path fd = to_path(flyx::hub::snapshot_dir(fr));
+  fixture("dspark_excess_heads.gguf", fd / "dspark-Ink-Tiny-Q8_0.gguf");
+  std::ofstream(fd / "dspark-Ink-Tiny-Q8_0_A.gguf", std::ios::binary) << "GGUF";
+  ok = fetched(fallback + ":Q4_K_M", {}, true, &f, &err);
+  const auto noted = [&](std::string_view why) {
+    return std::any_of(f.notes.begin(), f.notes.end(), [&](const auto& note) { return note.find(why) != note.npos; });
+  };
+  check(ok && f.drafter_sources.size() == 1 &&
+            f.drafter_sources.front().from == fallback + "/dspark-Ink-Tiny-Q8_0_Alternate.gguf" &&
+            noted("invalid DSpark drafter dimensions") && noted("Q8_0_A.gguf is not a DSpark drafter") && loads_dspark(),
+        "Hub discovery retries an incompatible drafter and a truncated header, then loads DSpark: " + err);
 
   // A remote listing and a cold snapshot. Local blobs stand in for completed transfers to keep this test offline.
   const auto split_repo = cached_repo("Ink-Split-GGUF", {});
@@ -149,7 +183,7 @@ int main() {
   const auto snap = to_path(flyx::hub::snapshot_dir(cold));
   const auto blobs = snap.parent_path().parent_path() / "blobs";
   const std::string id1(40, 'a'), id2(40, 'b');
-  write_gguf(blobs / id1, "dflash", 1);
+  fixture("dspark-tiny-q8.gguf", blobs / id1);
   write_gguf(blobs / id2, "dflash");
   cold.files.push_back({second, fs::file_size(blobs / id2), "", id2});
   cold.files.push_back({first, fs::file_size(blobs / id1), "", id1});
@@ -624,7 +658,8 @@ int main() {
     {
       // 1. dspark_beside skips sibling DSpark files blocked by allow_path.
       auto deny_dspark = [](std::string_view p) { return p.find("dspark-") == std::string_view::npos; };
-      check(flyx::apps::dspark_beside(from_path(model), deny_dspark).empty(),
+      check(flyx::apps::fetch_model(from_path(model), {}, false, {}, nullptr, &f, &err, "", false, true, "", deny_dspark)
+                && f.drafters.empty(),
             "dspark_beside refuses sibling drafter blocked by allow_path");
 
       // 2. Split GGUF shard 2 blocked by allow_path fails ModelFile::open before mapping shard 2.

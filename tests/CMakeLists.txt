@@ -414,7 +414,11 @@ add_test(NAME peft_dir COMMAND peft_dir_test)
 add_test(NAME flag_numbers COMMAND numbers_test)
 # The DSpark drafter published beside a model, taken by default: beside a GGUF on disk, and in its repository (a
 # Hugging Face cache read offline).
-flyx_register_test(model_source model_source_test)
+flyx_register_test(model_source model_source_test ${CMAKE_BINARY_DIR}/inkling2_assets/cpu_ref)
+set_tests_properties(model_source PROPERTIES FIXTURES_REQUIRED inkling2_models)
+flyx_add_py_test(auto_dspark_fetch ${CMAKE_CURRENT_SOURCE_DIR}/apps/common/auto_dspark_fetch.py
+                 ARGS $<TARGET_FILE:flyx-cli> ${CMAKE_BINARY_DIR}/inkling2_assets/cpu_ref FIXTURES inkling2_models
+                 SKIP_RETURN_CODE 77 TIMEOUT 90)
 add_test(NAME known_drafters COMMAND known_drafters_test)
 set_tests_properties(known_drafters PROPERTIES ENVIRONMENT "HF_HUB_OFFLINE=1")  # no network
 add_test(NAME drafter_speeds COMMAND drafter_speeds_test)

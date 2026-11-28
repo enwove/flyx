@@ -17,6 +17,7 @@
 #include <fstream>
 #include <limits>
 #include <map>
+#include <sstream>
 #include <stdexcept>
 #include <string_view>
 
@@ -785,7 +786,7 @@ namespace {
 // A GGUF header read sequentially through a buffer, skipping values not needed (such as tokenizer tables).
 class HeaderReader {
  public:
-  explicit HeaderReader(const std::string& path) : f_(os::to_path(path), std::ios::binary), buf_(size_t(1) << 20) {}
+  explicit HeaderReader(std::istream& input) : f_(input), buf_(size_t(1) << 20) {}
   bool read(void* out, size_t n) {
     char* o = static_cast<char*>(out);
     while (n > 0) {
@@ -818,7 +819,7 @@ class HeaderReader {
     if (f_.eof()) f_.clear();
     return len_ > 0;
   }
-  std::ifstream f_;
+  std::istream& f_;
   std::vector<char> buf_;
   size_t at_ = 0, len_ = 0;
 };
@@ -847,13 +848,9 @@ std::string hub_repo_of_url(const std::string& url) {
              : id;
 }
 
-}  // namespace
-
-GgufPeek gguf_peek(const std::string& path, const PathAllowFn& allow_path) {
+GgufPeek read_gguf_peek(std::istream& input) {
   GgufPeek out;
-  const std::string header = gguf_header_path(path);
-  if (allow_path && !allow_path(header)) return out;
-  modelfile::HeaderReader r(header);
+  modelfile::HeaderReader r(input);
   char magic[4];
   uint32_t version = 0;
   if (!r.read(magic, 4) || std::memcmp(magic, "GGUF", 4) != 0 || !r.get(&version) || version < 1 || version > 3)
@@ -925,6 +922,20 @@ GgufPeek gguf_peek(const std::string& path, const PathAllowFn& allow_path) {
   out.mtp_layers = it == layers.end() || it->second < 0 ? 0 : int(std::min<int64_t>(it->second, 1 << 20));
   out.has_markov_context = arch == "dflash" && has_markov;
   return out;
+}
+
+}  // namespace
+
+GgufPeek gguf_peek(const std::string& path, const PathAllowFn& allow_path) {
+  const std::string header = gguf_header_path(path);
+  if (allow_path && !allow_path(header)) return {};
+  std::ifstream input(os::to_path(header), std::ios::binary);
+  return read_gguf_peek(input);
+}
+
+GgufPeek gguf_peek_prefix(std::string prefix) {
+  std::istringstream input(std::move(prefix));
+  return read_gguf_peek(input);
 }
 
 }  // namespace flyx

@@ -76,6 +76,11 @@ bool ModelFile::add(const std::string& path, std::string* err, const PathAllowFn
   return true;
 }
 
+void ModelFile::remove_last_companion() {
+  c_.header.at("companions").erase(companions_.size() - 1);
+  companions_.pop_back();
+}
+
 const flyx_tensor_view* ModelFile::tensor(const std::string& name) const {
   const Contents* c = &c_;
   std::string_view key = name;

@@ -6,7 +6,9 @@
 #include <cctype>
 #include <cstdio>
 #include <map>
+#include <set>
 #include <string_view>
+#include <tuple>
 
 #include "core/modelfile/modelfile.h"
 
@@ -270,6 +272,27 @@ bool model_gguf_name(const std::string& path) {
   return true;
 }
 
+std::vector<std::string> ranked_dspark_paths(const std::vector<RepoFile>& files) {
+  std::set<std::string> stems;
+  for (const auto& f : files) stems.insert(detail::lower(strip_model_stem(f.path)));
+  std::vector<std::tuple<bool, bool, uint64_t, std::string>> ranked;
+  for (const auto& f : files) {
+    const auto stem = detail::lower(strip_model_stem(f.path));
+    const auto quant = find_quant_in_stem(stem);
+    bool variant = false;
+    for (size_t i = stem.size() - quant.size(); i < stem.size(); ++i)
+      if (kSep.find(stem[i]) != std::string_view::npos && stems.contains(stem.substr(0, i))) {
+        variant = true;
+        break;
+      }
+    ranked.emplace_back(!dspark_gguf_name(f.path), variant, f.size, f.path);
+  }
+  std::sort(ranked.begin(), ranked.end());
+  std::vector<std::string> paths;
+  for (auto& row : ranked) paths.push_back(std::move(std::get<3>(row)));
+  return paths;
+}
+
 bool parse_split_gguf_name(const std::string& path, SplitGguf* out) { return parse_split(path, out); }
 
 bool split_gguf_name(const std::string& file_name) { return parse_split(file_name, nullptr); }
@@ -376,7 +399,10 @@ const RepoFile* mmproj_file(const Repo& r) {
 std::vector<CompanionFile> companion_files(const Repo& r) {
   const RepoFile* def_mtp = mtp_file(r);
   const RepoFile* def_mm = mmproj_file(r);
-  bool dspark_default_set = false;
+  std::vector<RepoFile> drafters;
+  for (const auto& c : gguf_choices(r, /*include_companions=*/true))
+    if (c.complete && dspark_gguf_name(c.file.path)) drafters.push_back({c.file.path, c.total_size, "", ""});
+  const auto ranked = ranked_dspark_paths(drafters);
   std::vector<CompanionFile> out;
   for (const RepoFile& f : r.files) {
     if (mtp_gguf_name(f.path)) {
@@ -384,8 +410,7 @@ std::vector<CompanionFile> companion_files(const Repo& r) {
     } else if (dspark_gguf_name(f.path)) {
       SplitGguf sp;
       if (parse_split(f.path, &sp) && sp.part != 1) continue;
-      out.push_back({f, "dspark", !dspark_default_set});
-      dspark_default_set = true;
+      out.push_back({f, "dspark", !ranked.empty() && f.path == ranked.front()});
     } else if (mmproj_gguf_name(f.path)) {
       out.push_back({f, "mmproj", def_mm && def_mm->path == f.path});
     }

@@ -60,8 +60,7 @@ using PathAllowFn = flyx::PathAllowFn;
 // Fetches what is missing. want_mtp: take the repository's MTP file for a GGUF without the layer.
 // want_vision: take the repository's mmproj GGUF when no explicit mmproj path was given.
 // want_dspark: with no DSpark drafter among `drafters`, take the one published beside the model: its repository's
-// preferred complete DSpark GGUF, or for a model file on disk dspark_beside's; either only where its
-// header says it is a DSpark drafter.
+// first compatible DSpark GGUF in preference order, or one named for a local GGUF in the same directory.
 // lora: an adapter (fetch_lora; empty: none).
 bool fetch_model(const std::string& model, const std::vector<std::string>& drafters, bool want_mtp,
                  const hub::ProgressFn& progress, const std::atomic<bool>* stop, Fetched* out, std::string* err,
@@ -97,12 +96,6 @@ bool wants_mtp(const EngineOptions& eo);
 // Whether `eo` drafts with a DSpark drafter published beside the model, none being named: --drafter dspark or all,
 // or the default (auto) with no drafter file named (`drafters`: the ones named, by the command line or the server).
 bool wants_dspark(const EngineOptions& eo, const std::vector<std::string>& drafters);
-
-// The DSpark drafter beside a model GGUF on disk: in its directory, a dspark-<model's name>[-_.]*.gguf whose header
-// says it is one (general.architecture dflash with dflash.has_markov_context), the model's name being its file's
-// without the quantization ("Inkling-2-Mini" for Inkling-2-Mini-UD-IQ3_XXS.gguf); of several, the first by name.
-// "" for none.
-std::string dspark_beside(const std::string& model_path, const PathAllowFn& allow_path = {});
 
 // The verified drafters this build runs (a kind it does not know left out) for a model: those made for the repository
 // it is (`repo`, "" when unknown), then, inferred, those made for the base models it names (`base_models`), each in the
