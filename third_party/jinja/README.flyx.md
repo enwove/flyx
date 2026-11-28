@@ -19,6 +19,15 @@ nlohmann/json is ours (`third_party/nlohmann`). Differences from upstream:
 
 * `ggml.h` is added: a shim that defines `GGML_ASSERT`, the one thing
   `json.cpp` takes from ggml.
+* `jinja/value.cpp`, `jinja/value.h`: `dictsort` compares strings
+  case-insensitively unless `case_sensitive` is given (Jinja2's default),
+  in a stable sort as Python's `sorted()`; upstream always compared them as
+  they are.  A float printed (`{{ x }}`, `~`) is Python's `repr()` of it
+  (upstream: six decimals, trailing zeros removed).  Gemma 4's template
+  sorts a tool's properties and a call's arguments by `dictsort` and prints
+  numbers bare, so without these a key that begins in capitals or a float
+  of more digits renders differently from transformers.  Marked `flyx:` in
+  the source; candidates to send upstream.
 * `jinja/string.cpp`: `strip()` without a character set (the `trim` filter,
   `.strip()`, `.lstrip()`, `.rstrip()`) removes the whitespace Python's
   `str.isspace()` accepts, Unicode spaces such as U+3000 included; upstream

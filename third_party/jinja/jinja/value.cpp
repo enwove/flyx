@@ -1477,17 +1477,23 @@ const func_builtins & value_object_t::get_builtins() const {
             value val_case    = args.get_kwarg_or_pos("case_sensitive", 1);
             value val_by      = args.get_kwarg_or_pos("by",             2);
             value val_reverse = args.get_kwarg_or_pos("reverse",        3);
-            // FIXME: sorting is currently always case sensitive
-            //const bool case_sensitive = val_case->as_bool(); // undefined == false
+            // flyx: case-insensitive unless asked (Jinja2's default: strings compared lowercased), a stable sort as
+            // Python's sorted() (README.flyx.md)
+            const bool case_sensitive = val_case->as_bool(); // undefined == false
             const bool reverse = val_reverse->as_bool(); // undefined == false
             const bool by_value = is_val<value_string>(val_by) && val_by->as_string().str() == "value" ? true : false;
             auto result = mk_val<value_object>(val_input); // copy
-            std::sort(result->val_obj.begin(), result->val_obj.end(), [&](const auto & a, const auto & b) {
-                if (by_value) {
-                    return value_compare(a.second, b.second, reverse ? value_compare_op::gt : value_compare_op::lt);
-                } else {
-                    return value_compare(a.first, b.first, reverse ? value_compare_op::gt : value_compare_op::lt);
-                }
+            const auto lowered = [](const value & v) -> value {
+                if (!is_val<value_string>(v)) return v;
+                std::string s = v->as_string().str();
+                for (char & c : s) c = char(std::tolower(static_cast<unsigned char>(c)));
+                return mk_val<value_string>(s);
+            };
+            const auto op = reverse ? value_compare_op::gt : value_compare_op::lt;
+            std::stable_sort(result->val_obj.begin(), result->val_obj.end(), [&](const auto & a, const auto & b) {
+                const value & x = by_value ? a.second : a.first;
+                const value & y = by_value ? b.second : b.first;
+                return case_sensitive ? value_compare(x, y, op) : value_compare(lowered(x), lowered(y), op);
             });
             return result;
         }},
@@ -1679,6 +1685,9 @@ void global_from_json(context & ctx, const common_json & json_obj, bool mark_inp
 }
 
 // a float as Python's repr() and str() write it: the shortest digits that read back as the same value
+// flyx: a float as text is Python's repr of it (str() is repr() for floats), as transformers renders
+string value_float_t::as_string() const { return string(float_repr(val_flt)); }
+
 static std::string float_repr(double val) {
     if (!std::isfinite(val)) {
         return std::isnan(val) ? "nan" : val < 0 ? "-inf" : "inf";

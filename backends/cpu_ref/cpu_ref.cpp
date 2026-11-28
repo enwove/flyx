@@ -189,6 +189,16 @@ void prep_head(const RefModel* M, const flyx_attn_block& B, const flyx_norm& n, 
     for (int i = 0; i < B.head_dim; ++i) y[i] *= ms;
     return;
   }
+  if (B.rope.kind == FLYX_ROPE_PROPORTIONAL) {  // the whole head's halves, pairs past rot_dim / 2 not turned
+    if (has_mrope(B) || B.rot_dim > B.head_dim || B.rot_dim % 2) throw std::runtime_error("proportional rotary: 3D or "
+                                                                                          "more dims than the head's");
+    std::vector<double> inv(size_t(B.head_dim / 2));
+    flyx::ops::proportional_inv_freq(B.theta, B.head_dim, B.rot_dim, inv.data());
+    if (w) flyx::ops::rmsnorm(x, w, B.head_dim, n.eps, n.offset, y);
+    else if (y != x) std::copy(x, x + B.head_dim, y);
+    flyx::ops::rope_with(y, pos, inv.data(), B.head_dim);
+    return;
+  }
   if (B.rope.kind != FLYX_ROPE_PLAIN) throw std::runtime_error("unknown rotary scaling");
   if (pos_3d && has_mrope(B)) {
     flyx::ops::prep_head_3d(x, w, B.head_dim, n.eps, n.offset, pos_3d[0], pos_3d[1], pos_3d[2], B.theta, B.rot_dim,
@@ -299,7 +309,8 @@ void embed_rows(RefSeq* s, const flyx_embed_block& e, const int32_t* ids, int n,
       for (int c = 0; c < H; ++c)
         row[c] = residual16 ? flyx::ops::round_bf16(double(ov->second[c])) : double(ov->second[c]);
     } else {
-      for (int c = 0; c < H; ++c) row[c] = load(E, size_t(ids[r]) * H + c);
+      const double scale = e.scale > 0.f ? double(e.scale) : 1.0;
+      for (int c = 0; c < H; ++c) row[c] = load(E, size_t(ids[r]) * H + c) * scale;
       if (e.has_norm) norm(s->m, e.norm, row, H, row);
     }
   }
@@ -395,9 +406,13 @@ void attn_mixer(RefSeq* s, const flyx_attn_block& B) {
   for (int r = 0; r < R; ++r) norm(M, B.norm, &s->x[size_t(r) * H], H, &h[size_t(r) * H]);
   lin(M, B.q, h.data(), R, H, qw, qg.data(), R);
   lin(M, B.k, h.data(), R, H, nkv * hd, k.data(), R);
-  lin(M, B.v, h.data(), R, H, nkv * hd, v.data(), R);
+  if (!B.v_from_k) lin(M, B.v, h.data(), R, H, nkv * hd, v.data(), R);
   lora(M, B.lora[FLYX_LIN_Q], h.data(), R, H, qw, qg.data());  // q's and the gate's rows, the weight's layout (open)
   lora(M, B.lora[FLYX_LIN_K], h.data(), R, H, nkv * hd, k.data());
+  if (B.v_from_k) {  // v is k's projection, before k's norm and rotary (Gemma 4's attention_k_eq_v)
+    if (B.v >= 0 || B.lora[FLYX_LIN_V].rank || B.v_b >= 0) throw std::runtime_error("v from k beside a v weight");
+    v = k;
+  }
   lora(M, B.lora[FLYX_LIN_V], h.data(), R, H, nkv * hd, v.data());
   if (B.q_b >= 0 && B.gate) throw std::runtime_error("q biases on a gated attention block");
   for (auto [bw, y, n] : {std::tuple{B.q_b, &qg, nh * hd}, {B.k_b, &k, nkv * hd}, {B.v_b, &v, nkv * hd}})
@@ -406,6 +421,13 @@ void attn_mixer(RefSeq* s, const flyx_attn_block& B) {
       for (int r = 0; r < R; ++r)
         for (int c = 0; c < n; ++c) (*y)[size_t(r) * n + c] += b[size_t(c)];
     }
+  if (B.v_norm)  // each head's v RMS-normed without a weight, at k_norm's eps
+    for (int r = 0; r < R; ++r)
+      for (int j = 0; j < nkv; ++j) {
+        double* vh = &v[(size_t(r) * nkv + j) * hd];
+        flyx::ops::rmsnorm(vh, nullptr, hd, B.k_norm.eps, 0.0, vh);
+      }
+  const double scale = B.scale > 0.f ? double(B.scale) : 1.0 / std::sqrt(double(hd));
   const double* sinks = B.sinks >= 0 ? M->vec(B.sinks).data() : nullptr;
   Vec& KC = s->K[size_t(B.kv)][0];
   Vec& VC = s->V[size_t(B.kv)][0];
@@ -429,11 +451,11 @@ void attn_mixer(RefSeq* s, const flyx_attn_block& B) {
       prep_head(M, B, B.q_norm, &qg[size_t(r) * qw + q_at(B, hh)], rope_pos, q.data(), p3);
       const int from = B.window > 0 ? std::max(0, pos + 1 - B.window) : 0;  // a sliding window's first position
       if (sinks)
-        attend_range_sink(q.data(), KC.data(), VC.data(), from, pos + 1, nkv, hd, hh / (nh / nkv),
-                          1.0 / std::sqrt(double(hd)), sinks[hh], &o[size_t(hh) * hd]);
+        attend_range_sink(q.data(), KC.data(), VC.data(), from, pos + 1, nkv, hd, hh / (nh / nkv), scale, sinks[hh],
+                          &o[size_t(hh) * hd]);
       else
-        attend_range(q.data(), KC.data(), VC.data(), from, pos + 1, nkv, hd, hh / (nh / nkv),
-                     1.0 / std::sqrt(double(hd)), &o[size_t(hh) * hd]);
+        attend_range(q.data(), KC.data(), VC.data(), from, pos + 1, nkv, hd, hh / (nh / nkv), scale,
+                     &o[size_t(hh) * hd]);
     }
     if (B.gate)
       for (int hh = 0; hh < nh; ++hh) {
@@ -444,11 +466,12 @@ void attn_mixer(RefSeq* s, const flyx_attn_block& B) {
     lora(M, B.lora[FLYX_LIN_O], o.data(), 1, nh * hd, H, y.data());
     if (B.o_b >= 0)
       for (int c = 0; c < H; ++c) y[c] += M->vec(B.o_b)[size_t(c)];
+    if (B.has_post_norm) norm(M, B.post_norm, y.data(), H, y.data());
     for (int c = 0; c < H; ++c) s->x[size_t(r) * H + c] = residual_add(M, R, s->x[size_t(r) * H + c], y[c]);
   }
 }
 
-// x += down(silu(gate(h)) * up(h)), h = norm(x), for R rows of x.
+// x += down(act(gate(h)) * up(h)), h = norm(x), for R rows of x; then x *= out_scale where the block has one.
 void mlp(const RefModel* M, const flyx_mlp_block& B, double* x, int R) {
   const int H = B.hidden, I = B.inter;
   Vec h(H), g(I), u(I), y(H);
@@ -459,13 +482,23 @@ void mlp(const RefModel* M, const flyx_mlp_block& B, double* x, int R) {
     lin(M, B.up, h.data(), 1, H, I, u.data(), R);
     lora(M, B.lora[0], h.data(), 1, H, I, g.data());
     lora(M, B.lora[1], h.data(), 1, H, I, u.data());
-    for (int i = 0; i < I; ++i) g[i] = silu(g[i]) * u[i];
+    if (B.act == FLYX_MLP_GELU_TANH)
+      for (int i = 0; i < I; ++i) g[i] = flyx::ops::gelu_tanh(g[i]) * u[i];
+    else if (B.act == FLYX_MLP_SILU)
+      for (int i = 0; i < I; ++i) g[i] = silu(g[i]) * u[i];
+    else
+      throw std::runtime_error("unknown MLP activation");
     // NVFP4 inputs in a pass: the engine's gate|up GEMM leaves its SwiGLU rows in bf16 (as vLLM's and SGLang's)
     if (R > FLYX_MAX_ROWS && M->a4.count(M->w(B.down)))
       for (int i = 0; i < I; ++i) g[i] = flyx::ops::round_bf16(g[i]);
     lin(M, B.down, g.data(), 1, I, H, y.data(), R);
     lora(M, B.lora[2], g.data(), 1, I, H, y.data());
+    if (B.has_post_norm) norm(M, B.post_norm, y.data(), H, y.data());
     for (int c = 0; c < H; ++c) xr[c] = residual_add(M, R, xr[c], y[c]);
+    if (B.has_out_scale) {
+      const double sc = M->vec(B.out_scale)[0];
+      for (int c = 0; c < H; ++c) xr[c] = residual_add(M, R, xr[c] * sc, 0.0);
+    }
   }
 }
 

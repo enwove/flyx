@@ -86,6 +86,7 @@ struct EmbedBlock {
   BlockMat blk;           // the table as packed GGML blocks (data null: bf16)
   bool has_norm = false;
   Norm norm{};            // optional post-embedding RMSNorm (Inkling-2)
+  float scale = 1.f;      // each row times it (Gemma's sqrt(hidden), ABI 58)
 };
 
 // norm -> q (| output gate) | k | v -> q/k norms, rotary on the first `rot`
@@ -109,8 +110,14 @@ struct AttnBlock {
   int window = 0;
   const double* rope = nullptr;
   float scale = 0.f;
+  // Gemma 4 (ABI 58): v is k's projection (w_in q|k only), v_eps > 0: each head's v RMS-normed without a weight at
+  // that eps before it is cached; post_norm (w null: none): o's output normed before the residual add.
+  bool v_from_k = false;
+  float v_eps = 0.f;
+  Norm post_norm;
   int q_width() const { return (gate ? 2 : 1) * nh * hd; }
-  int n_in() const { return q_width() + 2 * nkv * hd; }
+  int n_in() const { return q_width() + (v_from_k ? 1 : 2) * nkv * hd; }
+  int v_off() const { return q_width() + (v_from_k ? 0 : nkv * hd); }  // v's rows in w_in's output (k's: v_from_k)
   MRoPE mrope(const int32_t* pos_3d = nullptr) const {
     return MRoPE{{mrope_section[0], mrope_section[1], mrope_section[2]}, mrope_interleaved, pos_3d};
   }
@@ -130,12 +137,18 @@ struct GdnBlock {
   int n_in() const { return gd.C() + v_width() + 2 * gd.nv; }
 };
 
-// norm -> gate | up -> silu(gate) * up -> down, added to the residual.
+// norm -> gate | up -> act(gate) * up -> down (-> post_norm), added to the residual (then times out_scale).
 struct MlpBlock {
   int hidden = 0, inter = 0;
   Norm norm;
   Lin w_gu, w_down;
   Adapters lora;               // its own adapters on gate, up and down
+  // Gemma 4 (ABI 58): the activation (flyx_mlp_act), post_norm (w null: none) on down's output before the add, and
+  // out_scale ([1] on the device, null: none) multiplying the residual after it.
+  int act = 0;
+  Norm post_norm;
+  const float* out_scale = nullptr;
+  bool plain() const { return act == 0 && !post_norm.w && !out_scale; }  // SwiGLU added to the residual as it is
 };
 
 // Final norm -> logits -> the token choice per row.

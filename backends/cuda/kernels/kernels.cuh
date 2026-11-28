@@ -264,6 +264,7 @@ Scratch scratch_in(void* mem, size_t bytes, int rows, int k_max, bool q8_parts =
 struct RoundGlu {
   const float* gu;
   int ld, I;
+  int act = 0;  // the gate's activation (flyx_mlp_act: 0 SiLU, 1 GELU's tanh form)
 };
 // A second stream a launch may fork work onto and join back from (a round's narrow GEMMs of a stack beside its wide
 // one, gemm_blocks_staged_runs; a captured round's graph runs them as parallel branches), with its two events.
@@ -283,6 +284,7 @@ struct Launch {
   const KernelOptions* opt = nullptr;
   const RoundGlu* glu = nullptr;
   const SideStream* side = nullptr;
+  int glu_act = 0;  // a gate|up GEMM's epilogue activation (gemm_glu_staged; flyx_mlp_act)
   // A round's rows (a sequence's own buffers): every row the bits of the 1..16-row kernels however many rows there
   // are (a wide lookup round's up to FLYX_MAX_WIDE_ROWS), never the prefill kernels'.
   bool round_rows = false;
@@ -1005,6 +1007,9 @@ __host__ __device__ inline void attn_split_range(int total, int split, int split
 // The head dims every attention kernel takes (split, grouped, flash; binary16 or FP8 caches): 32, 64, 128 and 256.
 // The backend refuses blocks with others at load (regions/plan.cpp).
 bool attention_head_dim(int hd);
+// An attention block's (FLYX_BLOCK_ATTN): attention_head_dim's and 512, which only the per-head split kernel takes
+// (binary16 caches; prefill passes 16 rows at a time, the caches on the device).
+bool attention_split_head_dim(int hd);
 // Whether decode, verification and prefill can read an FP8 cache of this shape.
 bool kv_fp8_supported(const KernelOptions& opt, int nh, int nkv, int hd);
 
@@ -1048,7 +1053,8 @@ void attn_prep(const float* qkv, int ld, int q_off, int k_off, int v_off, const 
                const DevParams* P, int pos_sel, bool skip_if_noop, float* q_out, KvRef kv, cudaStream_t st,
                int pos_add = 0, const TreeRows* tree = nullptr, int strata_base = 0, CanvasKeys canvas = {},
                MRoPE mrope = {}, const double* rope = nullptr,  // rope: the pairs' factors (null: rope_table's)
-               const float* bias = nullptr);  // bias: added to the qkv row as read (at q_off, k_off, v_off: its layout)
+               const float* bias = nullptr,  // bias: added to the qkv row as read (at q_off, k_off, v_off: its layout)
+               float v_eps = 0.f);  // > 0: each head's v RMS-normed without a weight at this eps (Gemma 4)
 // The MTP layer's positions a draft step reads: its first src.sink positions and its last `window`,
 // [max(0, q - window + 1), q] (q = P->position + pos_add), of src (where src.slot_of says), K, V and their scales,
 // copied in order to dst's first rows; *P_out = *P but for the position at which an attention at pos_add reads
@@ -1159,8 +1165,14 @@ void attention_strata(const float* q, KvRef kv, const StrataScratch& scratch, in
 bool strata_supported(int nh, int nkv, int hd, int bits);
 int strata_words(int hd, int bits);  // 32-bit words of codes a position and head (StrataLayout)
 
-// out = silu(a) * b, a and b are column blocks of the same rows.
-void swiglu(const float* gu, int ld, int I, float* out, int ld_out, int rows, cudaStream_t st);
+// out = act(a) * b, a and b are column blocks of the same rows (act: flyx_mlp_act, 0 SiLU, 1 GELU's tanh form).
+void swiglu(const float* gu, int ld, int I, float* out, int ld_out, int rows, cudaStream_t st, int act = 0);
+// x = (x + rmsnorm(y) (offset + w)) * scale (scale null: 1; on the device), n values of each of `rows` rows: a norm
+// after a projection, before the residual add (Gemma's), and its layer scalar.
+void norm_add(float* x, int ldx, const float* y, int ldy, const float* w, float offset, float eps,
+              const float* scale, int rows, int n, cudaStream_t st);
+// x *= s, n values of each of `rows` rows (an embedding's scale).
+void scale_rows(float* x, int ld, int n, float s, int rows, cudaStream_t st);
 // Each of n values of `rows` rows x [rows][ld] rounded to bf16 in place (the generic regions' rows where a fused
 // producer keeps bf16 ones: prefill_rows_bf16, layers.cpp); add_rows_bf16: x + y first, the float32 sum rounded
 // once (a bf16 residual's add, as gemm_staged_bf16's accumulate makes it).
@@ -1602,7 +1614,7 @@ struct LoraGlu {
   float scale = 1.f;
 };
 void swiglu_split(const float* gu, int ld, int I, int rows, const Launch& L, bool q8 = false, float* also = nullptr,
-                  const LoraGlu& lora = {});
+                  const LoraGlu& lora = {}, int act = 0);  // act: flyx_mlp_act (as swiglu)
 void gdn_gated_norm_split(const float* o, const float* z, int ld_z, const float* w, float eps, int rows, GdnDims d,
                           const Launch& L, bool q8 = false);
 void gdn_gated_norm_split(const float* o, const bf16* z, int ld_z, const float* w, float eps, int rows, GdnDims d,
@@ -1690,7 +1702,8 @@ void quantize_rows_nvfp4_bf16(const bf16* x, int ldx, int M, int K, const float*
 // (prefill rows vLLM and SGLang hold in bf16: projections, the residual).
 void gemm_w4a4(const uint8_t* Aq, const uint8_t* As, const float* Ar, const uint8_t* Q, const uint8_t* S,
                const float* RS, int N, int K, float* y, int ldy, int M, bool accumulate, cudaStream_t st,
-               int cfg = -1, bf16* glu = nullptr, float* glu_amax = nullptr, bf16* y16 = nullptr);
+               int cfg = -1, bf16* glu = nullptr, float* glu_amax = nullptr, bf16* y16 = nullptr,
+               int glu_act = 0);  // glu_act: the gate's activation (flyx_mlp_act)
 
 // ---- Device-side intra-round confidence stopping (CUDA conditional graphs) ----
 struct DevStopState {

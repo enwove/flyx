@@ -62,7 +62,7 @@ __device__ __forceinline__ void mma_fp4(float* c, const uint32_t* a, const uint3
 // y[M, N] (=|+=) (A x B^T): A the quantized activations [M][K/2] with block
 // scales As [M][K/16] and row factors Ar [M] (1 / g); B the NVFP4 weights.
 // grid (M / 128, N / 128) walking M first (consecutive blocks share a weight tile).
-// GLU: a gate|up weight, columns as glu_row (device.cuh), glu [M][N / 2] = bf16(silu(g) u) instead of y, and
+// GLU: a gate|up weight, columns as glu_row (device.cuh), glu [M][N / 2] = bf16(act(g) u) instead of y, and
 // glu_amax[r] raised to the largest |value| stored in row r (zeroed by the caller).
 template <int BN, int ST, int KB, bool GLU>
 __global__ void __launch_bounds__(kThreads) k_gemm_w4a4(const uint8_t* __restrict__ Aq, const uint8_t* __restrict__ As,
@@ -70,7 +70,8 @@ __global__ void __launch_bounds__(kThreads) k_gemm_w4a4(const uint8_t* __restric
                                                        const uint8_t* __restrict__ S, const float* __restrict__ RS,
                                                        int N, int K, float* __restrict__ y, int ldy, int M,
                                                        int accumulate, bf16* __restrict__ glu,
-                                                       float* __restrict__ glu_amax, bf16* __restrict__ y16) {
+                                                       float* __restrict__ glu_amax, bf16* __restrict__ y16,
+                                                       int act) {
   constexpr int NI = BN / 4 / 8;  // n tiles per warp
   extern __shared__ __align__(16) unsigned char smem_raw[];
   W4Smem<BN, ST, KB>& sm = *reinterpret_cast<W4Smem<BN, ST, KB>*>(smem_raw);
@@ -167,7 +168,7 @@ __global__ void __launch_bounds__(kThreads) k_gemm_w4a4(const uint8_t* __restric
             const float g0 = acc[mi][ni][2 * h] * RS[j] * Ar[r], g1 = acc[mi][ni][2 * h + 1] * RS[j + 1] * Ar[r];
             const float u0 = acc[mi][ni + 1][2 * h] * RS[I + j] * Ar[r];
             const float u1 = acc[mi][ni + 1][2 * h + 1] * RS[I + j + 1] * Ar[r];
-            const __nv_bfloat162 v = __floats2bfloat162_rn(silu(g0) * u0, silu(g1) * u1);
+            const __nv_bfloat162 v = __floats2bfloat162_rn(glu_act(act, g0) * u0, glu_act(act, g1) * u1);
             *reinterpret_cast<__nv_bfloat162*>(glu + size_t(r) * I + j) = v;
             m = fmaxf(m, fmaxf(fabsf(__low2float(v)), fabsf(__high2float(v))));
           }
@@ -325,6 +326,7 @@ struct Params {
   float* amax;  // GLU: each row's largest |stored value|, raised atomically (zeroed by the caller)
   bf16* y16;    // non-null: the product rounded to bf16 there [M][ldy] instead of y (no accumulation)
   int ldy, M, N, I, K, tok_tiles, accumulate;
+  int act;      // GLU: the gate's activation (flyx_mlp_act)
 };
 
 struct alignas(128) Shared {
@@ -523,7 +525,7 @@ __global__ void __launch_bounds__(kThreads, 1) k_gemm_w4a4_tma(const __grid_cons
             const float g0 = acc[mm][f][2 * h] * sh.rs[jl] * ar, g1 = acc[mm][f][2 * h + 1] * sh.rs[jl + 1] * ar;
             const float u0 = acc[mm][f + kMmaRows / 2][2 * h] * sh.rs[loaded_rows + jl] * ar;
             const float u1 = acc[mm][f + kMmaRows / 2][2 * h + 1] * sh.rs[loaded_rows + jl + 1] * ar;
-            const __nv_bfloat162 v = __floats2bfloat162_rn(silu(g0) * u0, silu(g1) * u1);
+            const __nv_bfloat162 v = __floats2bfloat162_rn(glu_act(p.act, g0) * u0, glu_act(p.act, g1) * u1);
             *reinterpret_cast<__nv_bfloat162*>(p.glu + size_t(r) * p.I + j) = v;
             m = fmaxf(m, fmaxf(fabsf(__low2float(v)), fabsf(__high2float(v))));
           }
@@ -647,7 +649,7 @@ bool prepare() {
 // false: the shapes or pointers do not fit it (the caller takes another configuration)
 bool launch(const uint8_t* Aq, const uint8_t* As, const float* Ar, const uint8_t* Q, const uint8_t* S,
             const float* RS, int N, int K, float* y, int ldy, int M, bool accumulate, cudaStream_t st, bf16* glu,
-            float* glu_amax, bf16* y16) {
+            float* glu_amax, bf16* y16, int act) {
   const auto al16 = [](const void* v) { return (reinterpret_cast<uintptr_t>(v) & 15) == 0; };
   if (M < 1 || K % 256 || !al16(Aq) || !al16(As) || !al16(Q) || !al16(S) || (glu && (N % 2 || (N / 2) % 2)))
     return false;
@@ -665,7 +667,7 @@ bool launch(const uint8_t* Aq, const uint8_t* As, const float* Ar, const uint8_t
   }
   if (!ok) return false;
   p.Ar = Ar, p.RS = RS, p.y = y, p.glu = glu, p.amax = glu_amax, p.y16 = y16, p.ldy = ldy, p.M = M, p.N = N, p.I = glu ? N / 2 : 0, p.K = K;
-  p.tok_tiles = (M + kBT - 1) / kBT, p.accumulate = int(accumulate);
+  p.tok_tiles = (M + kBT - 1) / kBT, p.accumulate = int(accumulate), p.act = act;
   const unsigned blocks = unsigned(((rows + loaded - 1) / loaded) * p.tok_tiles);
   if (glu) k_gemm_w4a4_tma<true><<<blocks, kThreads, kSmem, st>>>(p);
   else k_gemm_w4a4_tma<false><<<blocks, kThreads, kSmem, st>>>(p);
@@ -690,15 +692,15 @@ bool prepare_cfg() {
 template <int BN, int ST, int KB>
 void launch_cfg(const uint8_t* Aq, const uint8_t* As, const float* Ar, const uint8_t* Q, const uint8_t* S,
                 const float* RS, int N, int K, float* y, int ldy, int M, bool accumulate, cudaStream_t st, bf16* glu,
-                float* glu_amax, bf16* y16) {
+                float* glu_amax, bf16* y16, int act) {
   const dim3 grid((M + kBM - 1) / kBM, (N + BN - 1) / BN);
   constexpr size_t smem = sizeof(W4Smem<BN, ST, KB>);
   if (glu)
     k_gemm_w4a4<BN, ST, KB, true><<<grid, kThreads, smem, st>>>(Aq, As, Ar, Q, S, RS, N, K, y, ldy, M, 0, glu,
-                                                               glu_amax, nullptr);
+                                                               glu_amax, nullptr, act);
   else
     k_gemm_w4a4<BN, ST, KB, false><<<grid, kThreads, smem, st>>>(Aq, As, Ar, Q, S, RS, N, K, y, ldy, M,
-                                                                int(accumulate), nullptr, nullptr, y16);
+                                                                int(accumulate), nullptr, nullptr, y16, 0);
 }
 
 bool gemm_w4a4_supported() {
@@ -725,8 +727,9 @@ void quantize_rows_nvfp4_bf16(const bf16* x, int ldx, int M, int K, const float*
 
 void gemm_w4a4(const uint8_t* Aq, const uint8_t* As, const float* Ar, const uint8_t* Q, const uint8_t* S,
                const float* RS, int N, int K, float* y, int ldy, int M, bool accumulate, cudaStream_t st, int cfg,
-               bf16* glu, float* glu_amax, bf16* y16) {
+               bf16* glu, float* glu_amax, bf16* y16, int glu_act) {
   if (y16 && glu) std::abort();  // bf16 rows are a plain product's
+  const int act = glu ? glu_act : 0;
   if (glu && cudaMemsetAsync(glu_amax, 0, size_t(M) * sizeof(float), st) != cudaSuccess) std::abort();
   // 3 is the default where K allows: stages of 256 values of K (half the waits a k step), one block of 72 KB an SM;
   // on the 27B's shapes 600-1010 TFLOPS at 512-4096 rows against 525-750 for 2 (the default before: two blocks an SM
@@ -737,14 +740,15 @@ void gemm_w4a4(const uint8_t* Aq, const uint8_t* As, const float* Ar, const uint
   // 260-450 TFLOPS against 3's 720-900) and on the q|k|v and GDN in-projections (590-680 against 670-760); from 1024
   // rows it is ahead on every layer (1.0 to 1.3 times 3), and on gate|up from 512 (cuda_bench w4a4).
   if (cfg < 0) cfg = K % 256 != 0 ? 2 : M > 512 || glu ? 4 : 3;
-  if (cfg == 4 && tma4::launch(Aq, As, Ar, Q, S, RS, N, K, y, ldy, M, accumulate, st, glu, glu_amax, y16)) return;
+  if (cfg == 4 && tma4::launch(Aq, As, Ar, Q, S, RS, N, K, y, ldy, M, accumulate, st, glu, glu_amax, y16, act))
+    return;
   if (cfg == 4 || (cfg == 3 && K % 256 != 0)) cfg = K % 256 == 0 ? 3 : 2;
-  if (cfg == 1) launch_cfg<256, 3, 64>(Aq, As, Ar, Q, S, RS, N, K, y, ldy, M, accumulate, st, glu, glu_amax, y16);
+  if (cfg == 1) launch_cfg<256, 3, 64>(Aq, As, Ar, Q, S, RS, N, K, y, ldy, M, accumulate, st, glu, glu_amax, y16, act);
   else if (cfg == 2)
-    launch_cfg<128, 2, 64>(Aq, As, Ar, Q, S, RS, N, K, y, ldy, M, accumulate, st, glu, glu_amax, y16);
+    launch_cfg<128, 2, 64>(Aq, As, Ar, Q, S, RS, N, K, y, ldy, M, accumulate, st, glu, glu_amax, y16, act);
   else if (cfg == 3)
-    launch_cfg<128, 2, 128>(Aq, As, Ar, Q, S, RS, N, K, y, ldy, M, accumulate, st, glu, glu_amax, y16);
-  else launch_cfg<128, 4, 64>(Aq, As, Ar, Q, S, RS, N, K, y, ldy, M, accumulate, st, glu, glu_amax, y16);
+    launch_cfg<128, 2, 128>(Aq, As, Ar, Q, S, RS, N, K, y, ldy, M, accumulate, st, glu, glu_amax, y16, act);
+  else launch_cfg<128, 4, 64>(Aq, As, Ar, Q, S, RS, N, K, y, ldy, M, accumulate, st, glu, glu_amax, y16, act);
 }
 
 }  // namespace flyx::cuda

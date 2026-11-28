@@ -450,7 +450,8 @@ size_t kv_row_bytes(const KvSpec& k) { return size_t(k.nkv) * k.hd * (k.fp8 ? 1 
 // stagings on the device (as large as one's host part): a cache alone of its size would save no device memory.  A
 // drafter's stays on the device: its draft steps read it a row at a time.
 bool tiered_cache(const flyx_bmodel* m, const KvSpec& k) {
-  if (k.layers != 1 || k.draft || k.window > 0) return false;
+  // a head dim without tensor-core kernels (512) has no windowed prefill (attn_windows): on the device
+  if (k.layers != 1 || k.draft || k.window > 0 || !attention_head_dim(k.hd)) return false;
   int n = 0;
   for (const KvSpec& o : m->states.kv)
     n += o.layers == 1 && !o.draft && o.window == 0 && kv_row_bytes(o) == kv_row_bytes(k);

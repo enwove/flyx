@@ -51,8 +51,8 @@ std::string node_name(const flyx_node& n, const Block* b) {
 bool supported(const flyx_bmodel* m, const Block& blk, std::string* why) {
   auto no = [&](const std::string& w) { return *why = w, false; };
   if (const auto* a = std::get_if<AttnBlock>(&blk)) {
-    if (!attention_head_dim(a->hd) || a->rot > a->hd || a->rot % 2 || a->nkv < 1 || a->nh % a->nkv)
-      return no("attention dimensions outside what the CUDA kernels take (head dim 32, 64, 128 or 256)");
+    if (!attention_split_head_dim(a->hd) || a->rot > a->hd || a->rot % 2 || a->nkv < 1 || a->nh % a->nkv)
+      return no("attention dimensions outside what the CUDA kernels take (head dim 32, 64, 128, 256 or 512)");
     if (!a->q_norm.w != !a->k_norm.w) return no("the attention prep takes q and k norms both or neither");
     if (a->q_norm.w && (a->q_norm.offset != a->k_norm.offset || a->q_norm.eps != a->k_norm.eps))
       return no("the attention prep takes one offset and eps for the q and k norms");

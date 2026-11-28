@@ -14,15 +14,15 @@ namespace {
 
 ojson any_text(const TagSyntax& s) {
   ojson t = {{"type", "any_text"}};
-  t["excludes"] = s.thinking ? ojson::array({"<think>", "</think>"}) : ojson::array();
+  t["excludes"] = s.thinking ? ojson::array({s.think_open, s.think_close}) : ojson::array();
   return t;
 }
 
 // The thinking block: the rest of one the prompt opened, else an optional whole one.
 ojson thinking(const TagSyntax& s, bool in_reasoning) {
-  ojson block = ojson::array({ojson{{"type", "tag"}, {"begin", in_reasoning ? "" : "<think>"},
-                                    {"content", any_text(s)}, {"end", "</think>"}},
-                              ojson{{"type", "const_string"}, {"value", "\n\n"}}});
+  ojson block = ojson::array({ojson{{"type", "tag"}, {"begin", in_reasoning ? "" : s.think_open},
+                                    {"content", any_text(s)}, {"end", s.think_close}}});
+  if (*s.think_after) block.push_back(ojson{{"type", "const_string"}, {"value", s.think_after}});
   ojson seq = {{"type", "sequence"}, {"elements", block}};
   if (in_reasoning) return seq;
   return {{"type", "optional"}, {"content", seq}};

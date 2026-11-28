@@ -13,6 +13,7 @@
 #include <cctype>
 #include <climits>
 #include <cmath>
+#include <cstdio>
 #include <cstring>
 #include <fstream>
 #include <limits>
@@ -275,11 +276,18 @@ void write_u32(uint8_t* dst, uint32_t v) { std::memcpy(dst, &v, 4); }
 
 // The tokenizer tables core/tokenizer reads (the layout python/convert
 // writes), the stop tokens and the chat template, from GGUF's tokenizer keys.
+// GGUF's tokenizer models read here: gpt2 (byte-level BPE, its tokens in GPT-2's byte alphabet) and gemma4
+// (SentencePiece's BPE: tokens as text with spaces written U+2581, the bytes as tokens <0x00>..<0xFF>; llama.cpp's
+// converter for Gemma 4 writes it, with add_bos_token.  A raw prompt takes transformers' tokens all the same, which
+// begin with no <bos> (the chat template writes it): the model's .flyx and GGUF files give it the same tokens).
 void tokenizer(const json& meta, const RawTokenizer& raw, ModelFile::Contents* out) {
-  if (meta.value("tokenizer.ggml.model", "") != "gpt2") invalid("unsupported GGUF tokenizer model (need gpt2 BPE)");
+  const std::string model = meta.value("tokenizer.ggml.model", "");
+  const bool metaspace = model == "gemma4";
+  if (model != "gpt2" && !metaspace) invalid("unsupported GGUF tokenizer model (need gpt2 or gemma4 BPE)");
   for (const char* key : {"tokenizer.ggml.add_bos_token", "tokenizer.ggml.add_eos_token",
                           "tokenizer.ggml.add_prefix_space", "tokenizer.ggml.clean_spaces"})
-    if (meta.value(key, false)) invalid(std::string("unsupported GGUF tokenizer option ") + key);
+    if (meta.value(key, false) && !(metaspace && std::string_view(key) == "tokenizer.ggml.add_bos_token"))
+      invalid(std::string("unsupported GGUF tokenizer option ") + key);
   if (!raw.seen_tokens || !raw.seen_types || !raw.seen_merges)
     invalid("GGUF tokenizer without tokens, token types or merges");
   if (!raw.has_tokens || raw.tokens.empty() || !raw.has_types || raw.types.size() != raw.tokens.size())
@@ -331,6 +339,8 @@ void tokenizer(const json& meta, const RawTokenizer& raw, ModelFile::Contents* o
     }
   };
   json added = json::array();
+  json byte_ids = json::array();  // gemma4: the token of each byte, <0x00>..<0xFF>
+  std::vector<int> byte_token(256, -1);
 
   auto& vocab_buf = out->owned["tokenizer.vocab"];
   const size_t offsets_bytes = (size_t(n) + 1) * 4;
@@ -346,6 +356,24 @@ void tokenizer(const json& meta, const RawTokenizer& raw, ModelFile::Contents* o
       vocab_buf.insert(vocab_buf.end(), reinterpret_cast<const uint8_t*>(s.data()),
                        reinterpret_cast<const uint8_t*>(s.data() + s.size()));
       added.push_back({{"id", i}, {"content", std::string(s)}, {"special", type != 4}});
+    } else if (metaspace && type == 6) {  // <0xNN>: the byte
+      unsigned v = 0;
+      if (s.size() != 6 || s.substr(0, 3) != "<0x" || s[5] != '>' || std::sscanf(std::string(s.substr(3, 2)).c_str(),
+                                                                                    "%2x", &v) != 1)
+        invalid("GGUF gemma4 byte token is not <0xNN>");
+      if (byte_token[v] >= 0) invalid("GGUF gemma4 byte token twice");
+      byte_token[v] = i;
+      vocab_buf.push_back(uint8_t(v));
+    } else if (metaspace) {  // its text, spaces written U+2581 as SentencePiece writes them
+      for (size_t k = 0; k < s.size();) {
+        if (s.compare(k, 3, "\xE2\x96\x81") == 0) {
+          vocab_buf.push_back(' ');
+          k += 3;
+        } else {
+          if (s[k] == ' ') invalid("GGUF gemma4 token with a space in it");
+          vocab_buf.push_back(uint8_t(s[k++]));
+        }
+      }
     } else {
       append_token_bytes(s, &vocab_buf);
     }
@@ -396,14 +424,22 @@ void tokenizer(const json& meta, const RawTokenizer& raw, ModelFile::Contents* o
   }
   out->blobs["tokenizer.merges"] =
       std::string_view(reinterpret_cast<const char*>(merges_buf.data()), merges_buf.size());
-  const std::string pre = meta.value("tokenizer.ggml.pre", "");
+  const std::string pre = metaspace ? "gemma4" : meta.value("tokenizer.ggml.pre", "");
   const bool is_inkling2 = pre == "inkling2";
   const bool is_gpt4o = pre == "gpt-4o";
   out->header["tokenizer"] = {{"pretokenizer", pre},
-                              {"normalizer", meta.value("tokenizer.ggml.normalizer.nfc", !(is_inkling2 || is_gpt4o)) ? "nfc" : "none"},
+                              {"normalizer", !metaspace && meta.value("tokenizer.ggml.normalizer.nfc",
+                                                                      !(is_inkling2 || is_gpt4o)) ? "nfc" : "none"},
                               {"ignore_merges", meta.value("tokenizer.ggml.ignore_merges", is_inkling2)},
                               {"n_tokens", n},
                               {"n_merges", n_merges}};
+  if (metaspace) {
+    for (int b = 0; b < 256; ++b) {
+      if (byte_token[size_t(b)] < 0) invalid("GGUF gemma4 tokenizer without the token of byte " + std::to_string(b));
+      byte_ids.push_back(byte_token[size_t(b)]);
+    }
+    out->header["tokenizer"]["byte_ids"] = byte_ids;
+  }
   add_blob(out, "tokenizer.added", added.dump());
 
   // Where generation ends: the ids the file names, and ChatML's turn end,
@@ -414,8 +450,12 @@ void tokenizer(const json& meta, const RawTokenizer& raw, ModelFile::Contents* o
   auto stop = [&](int id) {
     if (std::find(eos.begin(), eos.end(), json(id)) == eos.end()) eos.push_back(id);
   };
-  for (std::string_view s : {"<|im_end|>", "<|endoftext|>", "<|return|>", "<|call|>"})
+  // Gemma 4's turn end and the tool response a call stops at (its generation_config's eos ids with <eos>)
+  for (std::string_view s : {"<|im_end|>", "<|endoftext|>", "<|return|>", "<|call|>", "<turn|>", "<|tool_response>"})
     if (const uint32_t id = find_id(s); id != UINT32_MAX) stop(int(id));
+  // Gemma 4's <eos>, which its GGUF files may name a normal token, the eos id another (<turn|>)
+  if (metaspace)
+    if (const uint32_t id = find_id("<eos>"); id != UINT32_MAX) stop(int(id));
   for (const char* kind : {"eos", "eot", "eom", "bos"}) {
     const std::string key = std::string("tokenizer.ggml.") + kind + "_token_id";
     if (!meta.contains(key)) continue;

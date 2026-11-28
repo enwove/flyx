@@ -40,7 +40,10 @@ int main(int argc, char** argv) {
     bool ok = got == want;
     std::string round = tok.decode(got);
     const bool nfc = file.header().at("tokenizer").value("normalizer", "nfc") == "nfc";
-    if (ok && round != (nfc ? Tokenizer::nfc(text) : text)) {
+    std::string want_text = nfc ? Tokenizer::nfc(text) : text;
+    if (file.header().at("tokenizer").value("pretokenizer", "") == "gemma4")  // a U+2581 in the text: a space back
+      for (size_t at; (at = want_text.find("\xE2\x96\x81")) != std::string::npos;) want_text.replace(at, 3, " ");
+    if (ok && round != want_text) {
       // Decoding must give back the normalized text.
       std::printf("decode mismatch for %s\n", nlohmann::json(text).dump().c_str());
       ok = false;

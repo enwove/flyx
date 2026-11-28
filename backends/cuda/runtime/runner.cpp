@@ -3,6 +3,7 @@
 // snapshots in host memory.
 #include "backends/cuda/runtime/checked_size.h"
 #include <algorithm>
+#include <cmath>
 #include <condition_variable>
 #include <cstddef>
 #include <cstring>
@@ -1703,6 +1704,27 @@ RowView slice(const RowView& v, const flyx_bmodel* m, int first) {
 
 }  // namespace
 
+// Whether a model's rounds of several sequences run one at a time (launch_batch): run_batch reads the blocks the
+// plain models have as a round alone does, and none of these (attn_rows: biases, sinks, windows, a rotary table, a
+// scale of its own, Gemma's v and its norms after a projection; head_rows: a softcap; embed_rows: a norm; the
+// mixtures of experts and Inkling-2's attention), so their rounds run as rounds of their own.
+bool batch_alone(flyx_bmodel* m) {
+  if (m->batch_alone < 0) {
+    bool alone = m->need.max_bank > 0 || m->dspark_block >= 0;
+    for (const Block& b : m->blocks) {
+      if (const auto* a = std::get_if<AttnBlock>(&b))
+        alone = alone || a->qkv_b || a->o_b || a->sinks || a->window || a->rope || a->v_from_k || a->v_eps > 0.f ||
+                a->post_norm.w || a->scale != 1.f / std::sqrt(float(a->hd));
+      else if (const auto* f = std::get_if<MlpBlock>(&b)) alone = alone || !f->plain();
+      else if (const auto* h = std::get_if<HeadBlock>(&b)) alone = alone || h->softcap > 0.f;
+      else if (const auto* e = std::get_if<EmbedBlock>(&b)) alone = alone || e->has_norm;
+      else if (std::holds_alternative<MoeBlock>(b) || std::holds_alternative<RelAttnBlock>(b)) alone = true;
+    }
+    m->batch_alone = alone ? 1 : 0;
+  }
+  return m->batch_alone == 1;
+}
+
 int launch_batch(flyx_plan* const* plans, flyx_seq* const* seqs, const flyx_gen_params* const* gens,
                  int32_t n) {
   if (n < 1) return fail("launch_batch: no sequences");
@@ -1710,7 +1732,7 @@ int launch_batch(flyx_plan* const* plans, flyx_seq* const* seqs, const flyx_gen_
     if (!seqs[i]) return no_sequence("launch_batch");
   if (n == 1) return launch(plans[0], seqs[0], gens[0]);
   flyx_bmodel* m = seqs[0]->m;
-  if (m->need.max_bank > 0 || m->dspark_block >= 0) {
+  if (batch_alone(m)) {
     for (int i = 0; i < n; ++i)
       if (const int r = launch(plans[i], seqs[i], gens[i]); r != 0) return r;
     return 0;

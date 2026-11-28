@@ -31,7 +31,7 @@ __global__ void k_attn_prep(const float* qkv, int ld, int q_off, int k_off, int 
                             const float* k_norm, float norm_offset, float eps, double theta, int rot_dim, int nh,
                             int nkv, int hd, const DevParams* P, int pos_sel, int skip_if_noop, float* q_out, KvRef kv,
                             int pos_add, int hpb, const TreeRows* tree, const double* rope, int strata_base,
-                            int canvas_s0, MRoPE mrope = {}, const float* bias = nullptr) {
+                            int canvas_s0, MRoPE mrope = {}, const float* bias = nullptr, float v_eps = 0.f) {
   pdl_trigger();
   extern __shared__ float sh[];
   if (skip_if_noop && P->noop) return;
@@ -93,7 +93,8 @@ __global__ void k_attn_prep(const float* qkv, int ld, int q_off, int k_off, int 
     } else if (slot >= 0) {  // block-uniform, like is_q
       const int cell = kv.slot_of(slot);  // a ring's slot
       const size_t at = (size_t(cell) * nkv + head) * hd + d;
-      const float vv = qkv[size_t(r) * ld + v_off + head * hd + d] + (bias ? bias[v_off + head * hd + d] : 0.f);
+      float vv = qkv[size_t(r) * ld + v_off + head * hd + d] + (bias ? bias[v_off + head * hd + d] : 0.f);
+      if (v_eps > 0.f) vv *= rsqrtf(block_sum(vv * vv) / hd + v_eps);  // v normed without a weight (Gemma 4)
       if (kv.fp8()) {  // e4m3 with the row's scale amax / 448
         float amax[2] = {fabsf(out), fabsf(vv)};
         block_max_n(amax);
@@ -826,7 +827,7 @@ void attn_prep(const float* qkv, int ld, int q_off, int k_off, int v_off, const 
                float norm_offset, float eps, double theta, int rot_dim, int nh, int nkv, int hd, int rows,
                const DevParams* P, int pos_sel, bool skip_if_noop, float* q_out, KvRef kv, cudaStream_t st,
                int pos_add, const TreeRows* tree, int strata_base, CanvasKeys canvas, MRoPE mrope,
-               const double* rope, const float* bias) {
+               const double* rope, const float* bias, float v_eps) {
   const double* factors = rope ? rope : rope_table(theta, rot_dim);
   // Heads per block: enough blocks to fill the GPU (about 512), else fewer rotations.  Every
   // grouping gives the same bits.  A 5760-token prefill: one head per block 11.5 ms of
@@ -855,7 +856,7 @@ void attn_prep(const float* qkv, int ld, int q_off, int k_off, int v_off, const 
   auto run = [&](auto compact_tag, auto mrope_tag) {
     k_attn_prep<decltype(compact_tag)::value, false, decltype(mrope_tag)::value><<<grid, hd, shared, st>>>(
         qkv, ld, q_off, k_off, v_off, q_norm, k_norm, norm_offset, eps, theta, rot_dim, nh, nkv, hd, P, pos_sel,
-        skip_if_noop, q_out, kv, pos_add, hpb, tree, factors, strata_base, -1, mrope, bias);
+        skip_if_noop, q_out, kv, pos_add, hpb, tree, factors, strata_base, -1, mrope, bias, v_eps);
   };
   const bool compact = hd == 256 && kv.bits == 3 && kv.words == 24;
   if (compact && use_mrope) run(std::true_type{}, std::true_type{});
@@ -979,6 +980,9 @@ size_t attention_partial_floats(int rows, int nh, int hd, int splits) {
 // Every attention kernel (split, grouped, flash; binary16 or FP8 caches) has an instance for each of these and no
 // other: a block with another head dim is refused at load (regions/plan.cpp), never run on the wrong strides.
 bool attention_head_dim(int hd) { return hd == 32 || hd == 64 || hd == 128 || hd == 256; }
+// An attention block's head dims: those, and 512 (Gemma 4's global layers) on the per-head kernel alone (binary16
+// caches; a prefill pass 16 rows at a time, attention below).
+bool attention_split_head_dim(int hd) { return attention_head_dim(hd) || hd == 512; }
 
 void attention(const float* q, const kv16* Kc, const kv16* Vc, int nh, int nkv, int hd, int rows, bool causal,
                int extra, float scale, const DevParams* P, const float* gate, int ld_gate, float* out, int ld_out,
@@ -994,6 +998,20 @@ void attention(const float* q, KvRef kv, int nh, int nkv, int hd, int rows, bool
   // Prefill (more causal rows than a round has): tensor cores, unless the options ask for the float32 kernel, a
   // sliding window's too (gpt-oss's even layers: 58 -> 10 us a layer at 145 rows).  A canvas's rows read their keys
   // through its map, which only the float32 kernels have.
+  if (causal && rows > FLYX_MAX_ROWS && !attention_head_dim(hd)) {
+    // A head dim no tensor-core kernel takes (512): the split kernel a round's rows at a time, each row the bits
+    // decoding it alone gives (its partials then a round's, FLYX_MAX_ROWS rows).
+    if (!out || tree || canvas.s0 >= 0)
+      throw std::logic_error("flyx-cuda: a prefill pass of head dim " + std::to_string(hd) +
+                             " writes float32 rows (no staged output, tree or canvas)");
+    for (int r0 = 0; r0 < rows; r0 += FLYX_MAX_ROWS) {
+      const int k = std::min(FLYX_MAX_ROWS, rows - r0);
+      attention_split(q + size_t(r0) * nh * hd, kv, nh, nkv, hd, k, causal, extra, scale, P,
+                      gate ? gate + size_t(r0) * ld_gate : nullptr, ld_gate, out + size_t(r0) * ld_out, ld_out,
+                      partial, splits, L, pos_add + r0, window, nullptr, canvas, SplitWindow{}, sinks);
+    }
+    return;
+  }
   FlashWindow one;
   one.sinks = sinks;
   one.sliding = window;
@@ -1121,7 +1139,8 @@ void attention_split(const float* q, KvRef kv, int nh, int nkv, int hd, int rows
     case 64: per_head(k_attention<64, 1>, k_attention<64, 4>, k_attention<64, 4, true>); break;
     case 128: per_head(k_attention<128, 1>, k_attention<128, 4>, k_attention<128, 4, true>); break;
     case 256: per_head(k_attention<256, 1>, k_attention<256, 4>, k_attention<256, 4, true>); break;
-    default:  // the backend refuses other head dims at load (attention_head_dim)
+    case 512: per_head(k_attention<512, 1>, k_attention<512, 4>, k_attention<512, 4, true>); break;
+    default:  // the backend refuses other head dims at load (attention_split_head_dim)
       throw std::runtime_error("flyx-cuda: attention with head dim " + std::to_string(hd));
     }
   }

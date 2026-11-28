@@ -76,6 +76,12 @@ __device__ inline void block_sum_n(float (&v)[N]) {
 }
 
 __device__ __forceinline__ float silu(float v) { return v / (1.f + __expf(-v)); }
+// GELU's tanh form (Gemma's gelu_pytorch_tanh): 0.5 v (1 + tanh(sqrt(2 / pi) (v + 0.044715 v^3))).
+__device__ __forceinline__ float gelu_tanh(float v) {
+  return 0.5f * v * (1.f + tanhf(0.7978845608028654f * (v + 0.044715f * v * v * v)));
+}
+// An MLP's gate activation (flyx_mlp_act): 0 SiLU, 1 GELU (tanh).
+__device__ __forceinline__ float glu_act(int act, float v) { return act ? gelu_tanh(v) : silu(v); }
 // A row value where rows are float32 or bf16 (a prefill pass's bf16 rows: residual, in-projection).
 __device__ __forceinline__ float in_value(const float* p) { return *p; }
 __device__ __forceinline__ float in_value(const bf16* p) { return __bfloat162float(*p); }

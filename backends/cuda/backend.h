@@ -517,6 +517,7 @@ struct flyx_bmodel {
   int prefill_rows = 0;  // rows of the widest prefill plan lowered: the shared prefill buffers hold them
   int prefill_align = 1;  // gdn_chunk_align() when every GDN block takes the chunked prefill recurrence
   int res16 = -1;         // residual16(): whether the model's prefill passes may keep the residual in bf16 (-1: unknown)
+  int batch_alone = -1;   // batch_alone(): whether its rounds of several sequences run one at a time (-1: unknown)
   // The most rows a round may have: FLYX_MAX_WIDE_ROWS where lookup rounds may be wide (open_model), else
   // FLYX_MAX_ROWS.  Each sequence's round buffers hold this many rows.
   int wide_rows = FLYX_MAX_ROWS;

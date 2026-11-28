@@ -6,6 +6,7 @@
 #include <stdexcept>
 
 #include "core/interfaces/options.h"
+#include "models/gemma4/gemma4.h"
 #include "models/gpt_oss/gpt_oss.h"
 #include "models/inkling2/inkling2.h"
 #include "models/llama/llama.h"
@@ -433,7 +434,7 @@ int Tables::attn_block(const std::string& prefix, const AttnBlockSpec& s, const 
   a.norm = norm(n(prefix + "in_norm"), H, s.norm_offset, s.eps);
   a.q = weight(n(prefix + "attn.q"), {q_rows, H});
   a.k = weight(n(prefix + "attn.k"), {kv, H});
-  a.v = weight(n(prefix + "attn.v"), {kv, H});
+  a.v = s.v_from_k ? -1 : weight(n(prefix + "attn.v"), {kv, H});
   a.o = weight(n(prefix + "attn.o"), {H, q});
   if (s.qk_norm) {
     a.q_norm = norm(n(prefix + "attn.q_norm"), s.head_dim, s.norm_offset, s.eps);
@@ -451,6 +452,11 @@ int Tables::attn_block(const std::string& prefix, const AttnBlockSpec& s, const 
   a.sinks = s.sinks ? weight(n(prefix + "attn.sinks"), {s.n_heads}) : -1;
   a.window = s.window;
   a.rope = s.rope;
+  a.scale = s.scale;
+  a.v_from_k = s.v_from_k ? 1 : 0;
+  a.v_norm = s.v_norm ? 1 : 0;
+  a.has_post_norm = s.post_norm ? 1 : 0;
+  if (s.post_norm) a.post_norm = norm(n(prefix + "attn.post_norm"), H, s.norm_offset, s.eps);
   return block(b);
 }
 
@@ -515,6 +521,7 @@ constexpr ArchEntry kArchitectures[] = {
     {"llama", llama::open, false, false, "lora"},
     {"inkling2_loop", inkling2::open, true, false, nullptr},
     {"gpt-oss", gpt_oss::open, true, false, nullptr},
+    {"gemma4", gemma4::open, true, false, nullptr},
 };
 
 }  // namespace

@@ -42,6 +42,13 @@ inline void yarn_inv_freq(double theta, int rot_dim, double factor, int orig_ctx
   }
 }
 
+// Proportional rotary's factors (FLYX_ROPE_PROPORTIONAL; Gemma 4's global layers, Hugging Face's
+// _compute_proportional_rope_parameters): over the whole head, pair i at theta^(-2i/head_dim) for i < rot_dim / 2 and
+// 0 past it (cos 1, sin 0: not rotated).  inv: head_dim / 2 factors, for rope_with(x, pos, inv, head_dim).
+inline void proportional_inv_freq(double theta, int head_dim, int rot_dim, double* inv) {
+  for (int i = 0; i < head_dim / 2; ++i) inv[i] = 2 * i < rot_dim ? 1.0 / std::pow(theta, (2.0 * i) / head_dim) : 0.0;
+}
+
 // The scale YaRN gives q and k after the rotary (its "attention factor", applied to cos and sin).
 inline double yarn_mscale(double factor) { return factor <= 1.0 ? 1.0 : 0.1 * std::log(factor) + 1.0; }
 

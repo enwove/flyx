@@ -37,6 +37,7 @@ int main(int argc, char** argv) {
     if (std::strcmp(argv[2], "inkling2_rel_attn") == 0) filtered_test = test_rel_attention;
     if (std::strcmp(argv[2], "inkling2_moe") == 0) filtered_test = test_inkling2_moe;
     if (std::strcmp(argv[2], "gpt_oss") == 0) filtered_test = test_gpt_oss;
+    if (std::strcmp(argv[2], "gemma4") == 0) filtered_test = test_gemma4;
   }
   if (argc != 1 && !filtered_test) {
     std::fprintf(stderr,
@@ -106,6 +107,10 @@ int main(int argc, char** argv) {
   test_attention(128, 64, 48, 8, 9, 700, true, 1e6);     // G = 6 at head dim 128, rows not a multiple of two
   test_attention(128, 64, 64, 8, 16, 300, true, 1e6);    // G = 8
   test_attention(256, 64, 32, 4, 3, 300, true, 1e6);     // G = 8 at head dim 256
+  // Head dim 512 (Gemma 4's global layers: 32 query heads on 4 KV heads of 512, 16 on 1) on the per-head kernel
+  test_attention(512, 128, 32, 4, 16, 300, true, 1e6);   // the 31B's verify rows
+  test_attention(512, 128, 32, 4, 1, 3000, true, 1e6);   // the 31B's decode deep in the context
+  test_attention(512, 128, 16, 1, 40, 100, true, 1e6);   // the 12B's prefill rows
   // No q/k norms (Llama) in MiniCPM5-1B's layer: 16 query heads on 2 KV heads of 128, the whole head
   // rotated.  100 rows give a block three heads, which the barrier standing in for the norm's sum keeps apart.
   test_attention(128, 128, 16, 2, 16, 300, true, 5e6, 0, false);   // verify rows
@@ -223,5 +228,6 @@ int main(int argc, char** argv) {
   test_inkling2_moe();
   test_dspark();
   test_gpt_oss();
+  test_gemma4();
   return report_result();
 }

@@ -218,12 +218,13 @@ struct TcSmem {
 // of 64 x 32) is used; WN = 2 (64 x 64) measured the same and needs 166
 // registers instead of 122, which would cost the second block per SM.
 // GLU: W is a gate|up weight and the N = 2 I columns follow glu_row (device.cuh);
-// the epilogue writes glu [M][I] = bf16(silu(g) u) instead of y.
+// the epilogue writes glu [M][I] = bf16(act(g) u) instead of y (act: glu_act, flyx_mlp_act).
 template <bool FP4, int WN, int WM, int ST, bool GLU, int BN>
 __global__ void __launch_bounds__(32 * WM * WN) k_gemm_tc(const bf16* __restrict__ A, int lda, const bf16* __restrict__ W,
                                                     const uint8_t* __restrict__ Q, const uint8_t* __restrict__ S,
                                                     const float* __restrict__ RS, int N, int K, float* __restrict__ y,
-                                                    int ldy, int M, int accumulate, bf16* __restrict__ glu) {
+                                                    int ldy, int M, int accumulate, bf16* __restrict__ glu,
+                                                    int act) {
   pdl_trigger();
   constexpr int BM = 64 * WM, THREADS = 32 * WM * WN, NI = BN / WN / 8;
   constexpr int CPA = BM * 4 / THREADS, CPB = BN * 4 / THREADS;  // 16-byte copies per thread (A, bf16 W)
@@ -380,7 +381,7 @@ __global__ void __launch_bounds__(32 * WM * WN) k_gemm_tc(const bf16* __restrict
             float u0 = acc[mi][ni + 1][2 * h], u1 = acc[mi][ni + 1][2 * h + 1];
             if (FP4) g0 *= RS[j], g1 *= RS[j + 1], u0 *= RS[I + j], u1 *= RS[I + j + 1];
             *reinterpret_cast<__nv_bfloat162*>(glu + size_t(r) * I + j) =
-                __floats2bfloat162_rn(silu(g0) * u0, silu(g1) * u1);
+                __floats2bfloat162_rn(glu_act(act, g0) * u0, glu_act(act, g1) * u1);
           }
         }
   } else {
@@ -426,14 +427,14 @@ void gemm_fp4_mma(const float* x, int ldx, const uint8_t* Q, const uint8_t* S, c
 // a 2560-column weight is 20 such tiles per 64 rows.
 template <bool FP4, int WN, int WM, int ST, bool GLU, int BN>
 void launch_tc_cfg(const bf16* a, const bf16* W, const uint8_t* Q, const uint8_t* S, const float* RS, int N, int K,
-                   float* y, int ldy, int M, bool accumulate, cudaStream_t st, bf16* glu) {
+                   float* y, int ldy, int M, bool accumulate, cudaStream_t st, bf16* glu, int act) {
   constexpr int BM = 64 * WM;
   using Smem = TcSmem<FP4, BM, BN, ST>;
   static const bool attr = set_dynamic_smem(k_gemm_tc<FP4, WN, WM, ST, GLU, BN>, sizeof(Smem), true);
   (void)attr;
   const dim3 grid(ceil_div(M, BM), ceil_div(N, BN));
   k_gemm_tc<FP4, WN, WM, ST, GLU, BN><<<grid, 32 * WM * WN, sizeof(Smem), st>>>(a, K, W, Q, S, RS, N, K, y, ldy, M,
-                                                                                accumulate, glu);
+                                                                                accumulate, glu, act);
 }
 
 // The configuration a prefill GEMM gets, by its 64 x 128 tiles per SM (b):
@@ -455,19 +456,20 @@ int tc_auto_config(int M, int N) {
 // cfg: one of kTcConfigs, -1 = tc_auto_config.
 template <bool FP4, bool GLU>
 void launch_tc_glu(int cfg, const bf16* a, const bf16* W, const uint8_t* Q, const uint8_t* S, const float* RS, int N,
-                   int K, float* y, int ldy, int M, bool accumulate, cudaStream_t st, bf16* glu) {
+                   int K, float* y, int ldy, int M, bool accumulate, cudaStream_t st, bf16* glu, int act = 0) {
   switch (cfg < 0 ? tc_auto_config<FP4>(M, N) : cfg) {
-    case 1: launch_tc_cfg<FP4, 4, 2, 3, GLU, 128>(a, W, Q, S, RS, N, K, y, ldy, M, accumulate, st, glu); break;
-    case 2: launch_tc_cfg<FP4, 4, 1, 2, GLU, 64>(a, W, Q, S, RS, N, K, y, ldy, M, accumulate, st, glu); break;
-    case 3: launch_tc_cfg<FP4, 2, 1, 2, GLU, 32>(a, W, Q, S, RS, N, K, y, ldy, M, accumulate, st, glu); break;
-    default: launch_tc_cfg<FP4, 4, 1, 2, GLU, 128>(a, W, Q, S, RS, N, K, y, ldy, M, accumulate, st, glu); break;
+    case 1: launch_tc_cfg<FP4, 4, 2, 3, GLU, 128>(a, W, Q, S, RS, N, K, y, ldy, M, accumulate, st, glu, act); break;
+    case 2: launch_tc_cfg<FP4, 4, 1, 2, GLU, 64>(a, W, Q, S, RS, N, K, y, ldy, M, accumulate, st, glu, act); break;
+    case 3: launch_tc_cfg<FP4, 2, 1, 2, GLU, 32>(a, W, Q, S, RS, N, K, y, ldy, M, accumulate, st, glu, act); break;
+    default: launch_tc_cfg<FP4, 4, 1, 2, GLU, 128>(a, W, Q, S, RS, N, K, y, ldy, M, accumulate, st, glu, act); break;
   }
 }
 
 template <bool FP4>
 void launch_tc_by(int cfg, const bf16* a, const bf16* W, const uint8_t* Q, const uint8_t* S, const float* RS, int N,
-                  int K, float* y, int ldy, int M, bool accumulate, cudaStream_t st, bf16* glu = nullptr) {
-  if (glu) launch_tc_glu<FP4, true>(cfg, a, W, Q, S, RS, N, K, y, ldy, M, false, st, glu);
+                  int K, float* y, int ldy, int M, bool accumulate, cudaStream_t st, bf16* glu = nullptr,
+                  int act = 0) {
+  if (glu) launch_tc_glu<FP4, true>(cfg, a, W, Q, S, RS, N, K, y, ldy, M, false, st, glu, act);
   else launch_tc_glu<FP4, false>(cfg, a, W, Q, S, RS, N, K, y, ldy, M, accumulate, st, nullptr);
 }
 
@@ -485,7 +487,7 @@ void w4a4_rows(const float* x, int ldx, const uint8_t* Q, const uint8_t* S, cons
   const Scratch& sc = scratch(L);
   quantize_rows_nvfp4(x, ldx, M, K, sc.q4, sc.q4_scale, sc.q4_inv, L.st);
   gemm_w4a4(sc.q4, sc.q4_scale, sc.q4_inv, Q, S, RS, N, K, y, ldy, M, accumulate, L.st, -1, glu ? sc.glu : nullptr,
-            glu ? sc.glu_amax : nullptr);
+            glu ? sc.glu_amax : nullptr, nullptr, glu ? L.glu_act : 0);
 }
 // float32 rows x [M][ldx] as bf16 in abuf, the bf16 tensor cores' input.
 const bf16* to_abuf(const float* x, int ldx, int K, int M, const Launch& L) {
@@ -497,8 +499,9 @@ const bf16* to_abuf(const float* x, int ldx, int K, int M, const Launch& L) {
 // The bf16 tensor cores on bf16 rows a: NVFP4 weights (Q) or bf16 ones (W).
 void tc_rows(int cfg, const bf16* a, const bf16* W, const uint8_t* Q, const uint8_t* S, const float* RS, int N, int K,
              float* y, int ldy, int M, bool accumulate, const Launch& L, bf16* glu = nullptr) {
-  if (Q) launch_tc_by<true>(cfg, a, nullptr, Q, S, RS, N, K, y, ldy, M, accumulate, L.st, glu);
-  else launch_tc_by<false>(cfg, a, W, nullptr, nullptr, nullptr, N, K, y, ldy, M, accumulate, L.st, glu);
+  const int act = glu ? L.glu_act : 0;
+  if (Q) launch_tc_by<true>(cfg, a, nullptr, Q, S, RS, N, K, y, ldy, M, accumulate, L.st, glu, act);
+  else launch_tc_by<false>(cfg, a, W, nullptr, nullptr, nullptr, N, K, y, ldy, M, accumulate, L.st, glu, act);
 }
 }  // namespace
 

@@ -15,6 +15,8 @@
 * the tiny Qwen3.5 with its matrices quantized (tiny_q8.gguf: the block types
   of 32 weights, mixed, as its matrices are 64 and 128 wide)
 * a tiny gpt-oss in MXFP4 and Q8_0 and the same in float32, with transformers' tokens for them (tiny_gpt_oss.py)
+* a tiny Gemma 4 in Q8_0 and the same in float32, with transformers' tokens for them (tiny_gemma4.py)
+* a small tokenizer of Gemma 4's kind (SentencePiece's BPE) with tokenizers' ids (gemma4_tokenizer.py)
 """
 from __future__ import annotations
 
@@ -31,6 +33,8 @@ sys.path.insert(0, str(ROOT / "python" / "convert"))
 from flyx_convert.fileformat import Reader, Writer
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
+import gemma4_tokenizer  # noqa: E402
+import tiny_gemma4  # noqa: E402
 import tiny_gpt_oss  # noqa: E402
 
 QUANTS = ("Q4_0", "Q4_1", "Q5_0", "Q5_1", "Q8_0", "Q2_K", "Q3_K", "Q4_K", "Q5_K", "Q6_K",
@@ -587,6 +591,9 @@ def main(out):
     dflash2_ggufs(out)
     tiny_gpt_oss.write(out)
     tiny_gpt_oss.write(out, quant=False, stem="gpt_oss_f32")
+    tiny_gemma4.write(out)
+    tiny_gemma4.write(out, quant=False, stem="gemma4_f32")
+    gemma4_tokenizer.write(out)
     print("wrote GGUF model, tokenizer and independent quantization fixtures")
 
 

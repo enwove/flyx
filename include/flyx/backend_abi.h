@@ -30,7 +30,7 @@
 extern "C" {
 #endif
 
-#define FLYX_BACKEND_ABI_VERSION 57u
+#define FLYX_BACKEND_ABI_VERSION 58u
 #define FLYX_BACKEND_ENTRY "flyx_backend_get_api"
 /* How a backend library exports its entry. */
 #if defined(_WIN32)
@@ -324,20 +324,25 @@ typedef enum {
   FLYX_BLOCK_EAGLE4 = 21        /* ABI 55: EAGLE-4, a one-layer drafter run a step a draft from target taps */
 } flyx_block_kind;
 
-/* Token rows -> residual rows: x = table[token], optionally followed by RMSNorm (has_norm != 0, ABI 45). */
+/* Token rows -> residual rows: x = table[token] * scale, optionally followed by RMSNorm (has_norm != 0, ABI 45). */
 typedef struct {
   int32_t hidden, vocab;
   int32_t table;                       /* [vocab, hidden] */
   int32_t has_norm;                    /* ABI 45: 1 = apply norm after lookup; 0 = none */
   flyx_norm norm;
+  float scale;                         /* ABI 58: each row times scale (Gemma's sqrt(hidden)); 0 = 1 */
+  int32_t pad0;
 } flyx_embed_block;
 
 /* Rotary scaling of an attention block (ABI 56).  PLAIN: theta^(-2i / rot_dim).  YARN (Peng et al., "YaRN", 2023,
  * as gpt-oss defines it): each pair's frequency between theta's (extrapolated) and theta's / factor (interpolated)
  * by a linear ramp over the dims whose wavelengths fall between orig_ctx / beta_fast and orig_ctx / beta_slow
  * rotations (rounded out to whole dims when truncate), and q and k each scaled by 0.1 ln(factor) + 1 after the
- * rotary; rot_dim is the head's.  ops/rope/ref.h (yarn_inv_freq, yarn_mscale). */
-typedef enum { FLYX_ROPE_PLAIN = 0, FLYX_ROPE_YARN = 1 } flyx_rope_kind;
+ * rotary; rot_dim is the head's.  ops/rope/ref.h (yarn_inv_freq, yarn_mscale).  PROPORTIONAL (ABI 58, Gemma 4's
+ * global layers): the whole head's halves rotated, pair i (dims i and i + head_dim / 2) at theta^(-2i / head_dim)
+ * for i < rot_dim / 2 and not rotated past it: rot_dim dims turn, at the frequencies the whole head would give
+ * them.  ops/rope/ref.h (proportional_inv_freq). */
+typedef enum { FLYX_ROPE_PLAIN = 0, FLYX_ROPE_YARN = 1, FLYX_ROPE_PROPORTIONAL = 2 } flyx_rope_kind;
 typedef struct {
   int32_t kind;                        /* flyx_rope_kind */
   int32_t orig_ctx;                    /* YARN: the context the unscaled frequencies were trained for */
@@ -380,6 +385,14 @@ typedef struct {
   int32_t sinks;
   int32_t window;
   flyx_rope_scaling rope;
+  /* ABI 58 (Gemma 4): scale, q.k's scale (0: 1 / sqrt(head_dim)); v_norm 1: each head's v RMS-normed without a
+   * weight (k_norm's eps) before it is cached; v_from_k 1: v is k's projection (no v weight, v -1), taken before k's
+   * norm and rotary; has_post_norm 1: x += post_norm(o(...)) (Gemma's post-attention norm) instead of x += o(...).
+   * Zero, as a block built zeroed has: none of them. */
+  float scale;
+  int32_t v_norm, v_from_k;
+  int32_t has_post_norm;
+  flyx_norm post_norm;
 } flyx_attn_block;
 
 /* Gated delta net, as ops/ops.h: from h = norm(x), mixed = qkv(h) through
@@ -404,12 +417,23 @@ typedef struct {
   int32_t lora_head_order;             /* flyx_gdn_head_order */
 } flyx_gdn_block;
 
-/* x += down(silu(gate(h)) * up(h)), h = norm(x). */
+/* The activation of an MLP block's gate rows (ABI 58).  SILU: silu(gate) * up.  GELU_TANH: gelu(gate) * up, GELU's
+ * tanh approximation (Gemma's gelu_pytorch_tanh).  ops/activation/ref.h. */
+typedef enum { FLYX_MLP_SILU = 0, FLYX_MLP_GELU_TANH = 1 } flyx_mlp_act;
+
+/* x += down(act(gate(h)) * up(h)), h = norm(x). */
 typedef struct {
   int32_t hidden, inter;
   flyx_norm norm;
   int32_t gate, up, down;
   flyx_lora lora[3];                   /* ABI 43: on gate, up and down, as an attention block's */
+  /* ABI 58 (Gemma 4): act (flyx_mlp_act); has_post_norm 1: x += post_norm(down(...)) instead of x += down(...);
+   * has_out_scale 1: then x *= out_scale ([1], Gemma's layer_scalar: the whole residual, after the add).  Zero, as a
+   * block built zeroed has: SiLU, neither. */
+  int32_t act;
+  int32_t has_post_norm;
+  flyx_norm post_norm;
+  int32_t has_out_scale, out_scale;
 } flyx_mlp_block;
 
 /* logits = w(norm(x)), optional softcapping (cap * tanh(logit / cap) when softcap > 0, ABI 45),

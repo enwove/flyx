@@ -298,10 +298,25 @@ AttnBlock attention(WeightLoader& L, const flyx_attn_block& b, const StateMap& s
     a.rope = tab;
     const double ms = flyx::ops::yarn_mscale(b.rope.factor);
     a.scale = float(ms * ms / std::sqrt(double(b.head_dim)));
+  } else if (b.rope.kind == FLYX_ROPE_PROPORTIONAL) {  // the whole head's pairs, those past rot_dim / 2 at 0 (still)
+    expect(b.rot_dim > 0 && b.rot_dim <= b.head_dim && b.rot_dim % 2 == 0 && b.mrope_section[0] == 0 &&
+               b.mrope_section[1] == 0 && b.mrope_section[2] == 0,
+           "proportional rotary over more dims than the head's, or with 3D sections");
+    std::vector<double> inv(size_t(b.head_dim / 2));
+    flyx::ops::proportional_inv_freq(b.theta, b.head_dim, b.rot_dim, inv.data());
+    double* tab = L.model()->alloc<double>(inv.size());
+    CK(cudaMemcpy(tab, inv.data(), inv.size() * sizeof(double), cudaMemcpyHostToDevice));
+    a.rope = tab;
+    a.rot = b.head_dim;  // attn_prep turns the whole head's pairs, by the table
   } else {
     expect(b.rope.kind == FLYX_ROPE_PLAIN, "unknown rotary scaling");
     rope_register(a.theta, a.rot);  // attn_prep's rotary factors, once
   }
+  if (b.scale > 0.f) a.scale = b.scale;  // Gemma 4's q.k, unscaled (ABI 58)
+  a.v_from_k = b.v_from_k != 0;
+  if (b.v_norm) a.v_eps = float(b.k_norm.eps);
+  expect(!b.v_norm || (b.k_norm.w >= 0 && b.k_norm.eps > 0), "a weightless v norm without k's norm (its eps)");
+  if (b.has_post_norm) a.post_norm = norm(L, b.post_norm);
   a.gate = b.gate != FLYX_GATE_NONE;
   a.norm = norm(L, b.norm);
   // The kernels read every head's q, then every head's gate: a file that keeps
@@ -316,7 +331,10 @@ AttnBlock attention(WeightLoader& L, const flyx_attn_block& b, const StateMap& s
   };
   const WeightLoader::RowOrder q_rows = gate_rows(b.gate);
   int rows = 0;
-  a.w_in = L.lin_stack_quant({b.q, b.k, b.v}, dq, &rows, {q_rows});
+  expect(!a.v_from_k || (b.v < 0 && b.v_b < 0 && b.lora[FLYX_LIN_V].rank <= 0 && b.lora[FLYX_LIN_K].rank <= 0),
+         "v from k's projection beside a v weight, bias or adapter (or an adapter on k)");
+  a.w_in = a.v_from_k ? L.lin_stack_quant({b.q, b.k}, dq, &rows, {q_rows})
+                      : L.lin_stack_quant({b.q, b.k, b.v}, dq, &rows, {q_rows});
   expect(rows == a.n_in(), "attention q|k|v rows do not match its dimensions");
   a.w_out = L.lin_quant(b.o, dq);
   a.q_norm = head_norm(L, b.q_norm);
@@ -417,6 +435,15 @@ MlpBlock mlp(WeightLoader& L, const flyx_mlp_block& b, AdapterCarve& carve, Draf
   f.w_gu = L.lin_stack_quant({b.gate, b.up}, dq, &rows);
   expect(rows == 2 * f.inter, "MLP gate|up rows do not match its dimensions");
   f.w_down = L.lin_quant(b.down, dq);
+  expect(b.act == FLYX_MLP_SILU || b.act == FLYX_MLP_GELU_TANH, "an MLP block's activation is not known");
+  f.act = b.act;
+  if (b.has_post_norm) f.post_norm = norm(L, b.post_norm);
+  if (b.has_out_scale) {
+    expect(L.t(b.out_scale)->ndim >= 1 && L.t(b.out_scale)->shape[0] == 1, "an MLP block's out scale is not [1]");
+    f.out_scale = L.vec(b.out_scale);
+  }
+  expect(f.plain() || (!b.lora[0].rank && !b.lora[1].rank && !b.lora[2].rank),
+         "adapters on an MLP block of another activation, a post-norm or an out scale");
   int in[3], out[3];
   mlp_dims(b, in, out);
   f.lora = block_lora(L, b.lora, 3, in, out, carve);
@@ -1261,6 +1288,8 @@ void bind(flyx_bmodel* m, const flyx_model_desc& d, LoadTimes* times) {
         e.vocab = b.embed.vocab;
         e.has_norm = b.embed.has_norm != 0;
         if (e.has_norm) e.norm = norm(L, b.embed.norm);
+        if (b.embed.scale > 0.f) e.scale = b.embed.scale;
+        expect(e.scale == 1.f || !e.has_norm, "an embedding scaled and normed");
         // Every kernel that reads the table gathers the rows of a pass's tokens, a few kilobytes: a table no head
         // reads stays in host memory and frees its size on the GPU, unless the GPU has room (embed=auto, open_model).
         const bool host = m->opt.embed == 1 && !head_reads(d, b.embed.table);

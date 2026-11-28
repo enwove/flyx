@@ -376,6 +376,56 @@ void gpt_oss(const std::string& dir, const std::string& backend) {
   }
 }
 
+// Gemma 4 (tests/core/modelfile/tiny_gemma4.py): the tiny model as llama.cpp lays it out, its linears and embedding in
+// Q8_0, and the same in float32.  With exact inputs both give transformers' tokens on every golden case: sliding
+// windows of 8 (a ring past them) beside global layers of wider heads whose v is k's projection, proportional rotary
+// on a quarter of those heads, per-head q, k and (weightless) v norms with q.k unscaled, norms after attention and the
+// MLP, GELU (tanh) MLPs, each layer's scalar, the scaled embedding tied to the softcapped head, through prefill passes
+// of up to 16 and 64 rows.  The file with its default 8-bit inputs: prompt lookup's rounds give plain decoding's
+// tokens, greedy and seeded, and on CUDA the unfused kernels the fused ones' and, teacher forced, the float64
+// backend's next token at all but at most four of 24 places.
+void gemma4(const std::string& dir, const std::string& backend) {
+  for (const std::string stem : {"gemma4", "gemma4_f32"}) {
+    std::ifstream f(dir + "/golden_" + stem + ".json");
+    const json golden = json::parse(f);
+    const std::string path = dir + "/tiny_" + stem + ".gguf";
+    auto exact = engine(path, backend, {.activations = "exact"});
+    auto exact_long = engine(path, backend, {.prefill_chunk = 64, .activations = "exact"});
+    for (const auto& item : golden.at("cases")) {
+      const auto p = item.at("prompt").get<std::vector<int32_t>>();
+      const auto want = item.at("tokens").get<std::vector<int32_t>>();
+      check(same_tokens(tokens_of(*exact, p, int(want.size())), want), "tiny " + stem + ": transformers' tokens");
+      check(same_tokens(tokens_of(*exact_long, p, int(want.size())), want),
+            "tiny " + stem + ": transformers' tokens, prefill in passes of up to 64 rows");
+    }
+  }
+  const std::string path = dir + "/tiny_gemma4.gguf";
+  std::ifstream f(dir + "/golden_gemma4.json");
+  const json golden = json::parse(f);
+  auto plain = engine(path, backend), lookup = engine(path, backend, {.speculative = true, .drafter = "none",
+                                                                      .lookup = true});
+  std::unique_ptr<Engine> unfused, ref;
+  if (backend != "cpu_ref") {
+    unfused = engine(path, backend, {.options = "fusion=0"});
+    ref = engine(path, "cpu_ref");
+  }
+  for (const auto& item : golden.at("cases")) {
+    auto p = item.at("prompt").get<std::vector<int32_t>>();
+    const size_t n = p.size();
+    for (size_t i = 0; i < 2 * n; ++i) p.push_back(p[i % n]);  // the prompt three times over: lookup drafts
+    const auto want = tokens_of(*plain, p, 24);
+    check(tokens_of(*lookup, p, 24) == want, "tiny gemma4: prompt lookup's rounds give plain decoding's tokens");
+    check(tokens_of(*lookup, p, 24, true) == tokens_of(*plain, p, 24, true),
+          "tiny gemma4: prompt lookup preserves seeded sampling");
+    if (unfused) {
+      check(tokens_of(*unfused, p, 24) == want, "tiny gemma4: fusion=0 gives the fused kernels' tokens");
+      const int agree = forced_agreement(*plain, p, tokens_of(*ref, p, 24));
+      check(agree >= 20, "tiny gemma4: teacher forced, the float64 backend's tokens at " + std::to_string(agree) +
+                             " of 24 places (8-bit inputs)");
+    }
+  }
+}
+
 // The MTP layer in a file of its own (EngineOptions::drafter_files; unsloth ships the 27B's so): the quantized tiny
 // Qwen3.5 from the two files gives what the one file gives, every round's drafts included; the model without the
 // file has no MTP layer, and a file whose model has one takes no second.
@@ -1196,6 +1246,7 @@ int main(int argc, char** argv) {
     dflash_file(dir, backend);
     dspine_file(dir, backend);
     gpt_oss(dir, backend);
+    gemma4(dir, backend);
     if (backend != "cpu_ref") packed(dir, backend);
     if (backend != "cpu_ref") packed_lora(dir, backend);
     if (backend != "cpu_ref") nvfp4_inputs(dir, backend);

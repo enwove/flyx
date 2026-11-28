@@ -1,10 +1,15 @@
 // Copyright 2026 The flyx Authors. SPDX-License-Identifier: Apache-2.0
-// Byte-level BPE tokenizer for Qwen3.5, Qwen3 (the Qwen2 split) and MiniCPM5.
+// BPE tokenizers: byte-level (Qwen3.5, Qwen3 with the Qwen2 split, MiniCPM5, Inkling-2, gpt-oss) and SentencePiece's
+// (Gemma 4).
 //
 // Pipeline (must match HuggingFace `tokenizers` for these models):
 //   added tokens split out first (leftmost-longest)  ->  optional NFC on the rest  ->
 //   regex pre-tokenizer (hand-written, see pretokenize())  ->  BPE per piece;
 // a raw prompt then gets the post-processor's tokens before it (prefix()).
+// Gemma 4's (pretokenizer "gemma4"): no NFC; each space written U+2581 (SentencePiece's metaspace), the text cut where
+// newlines begin and end (no token mixes a newline with another character, so the pieces merge as the whole would),
+// a piece's symbols its characters by their text, one <0xNN> byte token for each byte of a character the vocabulary
+// lacks (and of a byte no character holds), then the merges by rank.
 // The tables come from the model file (python/convert/tokenizer_export.py).
 //
 // A chat prompt mixes the template's own text with the client's strings.
@@ -71,6 +76,7 @@ class Tokenizer {
   };
   void encode_pieces(const std::vector<std::string_view>& pieces, std::vector<int32_t>* out) const;
   std::vector<int32_t> encode_uncached(std::string_view piece) const;
+  void metaspace_symbols(std::string_view piece, std::vector<int32_t>* sym) const;
   void merge(std::vector<int32_t>* sym) const;
 
   std::vector<std::string> tokens_;
@@ -87,6 +93,7 @@ class Tokenizer {
   std::vector<bool> special_;
   std::vector<int32_t> prefix_;
   bool ignore_merges_ = false;
+  bool metaspace_ = false;  // Gemma 4's: by_bytes_ then maps a token's text, its spaces as U+2581, to its id
   Pretokenizer pretokenizer_ = Pretokenizer::kQwen35;
   bool normalize_nfc_ = true;
   mutable std::shared_mutex cache_mu_;  // encode() may run concurrently across HTTP threads

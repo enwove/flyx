@@ -86,6 +86,10 @@ struct AttnBlockSpec {
   bool sinks = false;  // a learned sink logit per head ("attn.sinks"; gpt-oss)
   int window = 0;      // > 0: each query reads the window positions up to its own (its K/V state a ring of that size)
   flyx_rope_scaling rope{FLYX_ROPE_PLAIN, 0, 1.f, 0.f, 0.f, 0};
+  // Gemma 4 (ABI 58): q.k's scale (0: 1 / sqrt(head_dim)); v is k's projection (no "attn.v"); each head's v normed
+  // without a weight; o's output normed before the residual add ("attn.post_norm").
+  float scale = 0.f;
+  bool v_from_k = false, v_norm = false, post_norm = false;
 };
 
 // A LoRA adapter given beside the model (--lora; core/modelfile/peft_dir.cpp): one rank and scale on the linears its

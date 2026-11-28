@@ -206,12 +206,13 @@ struct RoundColumns {
 
 // A round's SwiGLU in its gate|up GEMM (Launch::glu): the launch's y is column col0 of the gate|up rows gu [rows][ld]
 // (gate 0..I-1, up I..2I-1), all of them (N = 2 I) or the up run's alone (col0 = I; the gate's launch before has
-// written the gate's).  silu(gate) * up goes to o in 8 bits as swiglu_split leaves it: put_q8 gives put_q8_pairs's
+// written the gate's).  act(gate) * up goes to o in 8 bits as swiglu_split leaves it: put_q8 gives put_q8_pairs's
 // bits (the same largest magnitude, integers and sums).
 struct RoundGluArgs {
   const float* gu = nullptr;  // null: no SwiGLU
   int ld = 0, I = 0, col0 = 0;
   Out o{nullptr, nullptr, nullptr, nullptr};
+  int act = 0;  // the gate's activation (flyx_mlp_act)
 };
 
 // The launch's column of a SwiGLU's group g whose j-th column (0..63: 32 of gate, then 32 of up; the up run alone:
@@ -408,7 +409,7 @@ __device__ __forceinline__ void round_glu(const Tables& T, const typename F::Loc
     if (w == k % NW) {
       for (int r = 0; r < rows; ++r) {
         const float gate = both ? s[r * 64 + lane] : __ldcg(glu.gu + size_t(r) * glu.ld + 32 * g + lane);
-        put_q8(glu.o, r, g, silu(gate) * s[r * 64 + 32 + lane]);
+        put_q8(glu.o, r, g, glu_act(glu.act, gate) * s[r * 64 + 32 + lane]);
       }
     }
   }
@@ -1653,6 +1654,7 @@ inline RoundGluArgs round_glu_args(const Launch& L, const BlockMat& W, const flo
   g.ld = u.ld;
   g.I = u.I;
   g.col0 = int(col0);
+  g.act = u.act;
   g.o.q8 = sc.q8_glu;
   g.o.q8_d = sc.q8_glu_scale;
   g.o.q8_sums = sc.q8_glu_sums;

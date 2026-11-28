@@ -16,6 +16,7 @@ namespace flyx::cuda {
 inline void embed_tokens(const EmbedBlock& e, const int* tokens, float* x, int rows, cudaStream_t st) {
   if (e.blk.data) embed_blocks(tokens, e.blk, e.hidden, x, rows, st);
   else embed(tokens, e.table, e.hidden, x, rows, st);
+  scale_rows(x, e.hidden, e.hidden, e.scale, rows, st);  // Gemma's sqrt(hidden); none at 1
 }
 // A prefill pass whose residual rows are bf16 (as vLLM, SGLang and basalt keep them): more than 16 rows, NVFP4
 // inputs in the scratch, and a model whose every residual add is a W4A4 GEMM (layers.cpp).  The fused producers

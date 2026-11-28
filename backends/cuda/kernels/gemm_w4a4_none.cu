@@ -12,7 +12,7 @@ void quantize_rows_nvfp4_bf16(const bf16*, int, int, int, const float*, uint8_t*
   std::abort();
 }
 void gemm_w4a4(const uint8_t*, const uint8_t*, const float*, const uint8_t*, const uint8_t*, const float*, int, int,
-               float*, int, int, bool, cudaStream_t, int, bf16*, float*, bf16*) {
+               float*, int, int, bool, cudaStream_t, int, bf16*, float*, bf16*, int) {
   std::abort();
 }
 
