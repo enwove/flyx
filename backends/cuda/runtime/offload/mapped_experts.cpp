@@ -216,7 +216,7 @@ void ExpertAddressSpace::count_resident(size_t routes) {
   std::lock_guard lock(mutex_);
   full_routes_ += routes;
 }
-// A single live session keeps the device counters until the next base placement observation.
+// Base placement keeps the device counters until its next observation.
 // Record only the increment since the last request; a prefix-only turn can leave both counters intact.
 bool ExpertAddressSpace::record_decode(Histogram& h) {
   bool changed = false;
@@ -461,8 +461,12 @@ void ExpertAddressSpace::request_boundary(bool begin, cudaStream_t stream) {
   try {
     // A request can leave speculative work queued. Raw backend callers can also enqueue from another thread.
     // Hold the submission lock through the fence, the exchanges, and publication of the resident mask.
-    if (sessions_ == 1) {
-      CK(cudaStreamSynchronize(stream));
+    if (sessions_ == 1 || !warm_start_) {
+      if (profile_.empty()) return;
+      // On a cache miss, also retain the base's frozen multi-session placement for this load.
+      // Other idle sessions can still have speculative work queued on their own streams.
+      if (sessions_ == 1) CK(cudaStreamSynchronize(stream));
+      else CK(cudaDeviceSynchronize());
       bool changed = false;
       for (auto& [_, h] : histograms_) {
         const size_t n = h.decode.size();
@@ -471,7 +475,7 @@ void ExpertAddressSpace::request_boundary(bool begin, cudaStream_t stream) {
       }
       if (changed) save_profile();
       if (verbose_)
-        std::fprintf(stderr, "flyx-cuda: single-session expert recording %.1f ms\n",
+        std::fprintf(stderr, "flyx-cuda: expert profile recording %.1f ms\n",
                      std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - started).count());
       return;
     }
