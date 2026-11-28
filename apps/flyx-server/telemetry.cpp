@@ -19,6 +19,7 @@
 // none | fetching | loading | ready | failed, progress, error; model is null while none is served).
 #include <algorithm>
 
+#include "apps/common/chat_options.h"
 #include "apps/common/version.h"
 #include "apps/flyx-server/agent_launch.h"
 #include "apps/flyx-server/server.h"
@@ -28,6 +29,15 @@
 namespace flyx::server {
 
 namespace {
+
+// What a request that names no thinking mode gets, as inference resolves it from the server's defaults
+// (resolve_chat_options: --no-think, --chat-template-kwargs' enable_thinking, a reasoning_effort of "none"); null where
+// the defaults say nothing of either, the chat template's own default then deciding.
+ojson thinking_default(const ojson& defaults) {
+  if (!defaults.is_object() || (!defaults.contains("enable_thinking") && !defaults.contains("reasoning_effort")))
+    return nullptr;
+  return apps::resolve_chat_options(defaults, ojson::object()).enable_thinking;
+}
 
 const char* phase_name(TelemetrySnapshot::Phase p) {
   switch (p) {
@@ -192,12 +202,7 @@ ojson snapshot_json(const Server& s, int recent) {
           {"server", {{"name", "flyx-server"}, {"version", apps::kVersion}, {"pid", os::process_id()}, {"started_at", t.started_at},
                       {"uptime_s", now - t.started_at}, {"api_key_required", !s.cfg.api_key.empty()},
                       {"agent_launch", os::shell_window_supported() ? ojson(launch_agents()) : ojson::array()},
-                      // A request without enable_thinking gets this (--no-think, --chat-template-kwargs); null: none
-                      // set, the chat template's own default.
-                      {"enable_thinking", s.cfg.chat_defaults.contains("enable_thinking") &&
-                                                  s.cfg.chat_defaults["enable_thinking"].is_boolean()
-                                              ? s.cfg.chat_defaults["enable_thinking"]
-                                              : ojson(nullptr)},
+                      {"enable_thinking", thinking_default(s.cfg.chat_defaults)},
                       {"cors", {{"loopback", s.cfg.cors_loopback}, {"any", s.cfg.cors_any}, {"origins", s.cfg.cors_origins}}}}},
           {"model", model},
           {"state", state},

@@ -73,7 +73,8 @@ def check_inkling_effort(exe, model, root):
         for route in ("messages", "messages/count_tokens"):
             post(route, off, thinking={"type": "disabled"})
 
-    for flags, default_count, reenabled, thinking in ((medium, on, on, None), (none, off, native, None),
+    # Telemetry's default as a request without a mode is prompted: on for an effort, off for the effort "none".
+    for flags, default_count, reenabled, thinking in ((medium, on, on, True), (none, off, native, False),
                                                       ([*medium, "--no-think"], off, on, False)):
         serve(exe, root, env, [model], lambda url: check_routes(url, default_count, reenabled, thinking),
               options=["--name", "test model", *flags])

@@ -339,6 +339,12 @@ def check_thinking(page):
     page.reload()
     expect(box).to_be_checked()
     assert "chat_template_kwargs" not in say("Fourth"), bodies[-1]
+    # A server launched with --chat-template-kwargs '{"reasoning_effort":"none"}', whose telemetry says false for it
+    # (chat_template_kwargs.py checks that it does): a fresh page's box unchecked, and still no override sent.
+    server["enable_thinking"] = False
+    page.reload()
+    expect(box).not_to_be_checked()
+    assert "chat_template_kwargs" not in say("Fifth"), bodies[-1]
 
 
 if __name__ == "__main__":
