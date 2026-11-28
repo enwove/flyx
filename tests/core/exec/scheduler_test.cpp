@@ -1007,10 +1007,12 @@ int main(int argc, char** argv) {
       if (first.ok(&err_first)) send(first, raw(first, "before the switch", "one two three", 3))->wait();
     }
     Scheduler second(argv[1], eo_small, so_small, server_telemetry);
-    if (second.ok(&err_second)) send(second, raw(second, "after the switch", "four five six", 3))->wait();
     TelemetrySnapshot t;
     flyx_device_stats device{};
     bool device_ok = false;
+    second.telemetry(&t, &device, &device_ok);
+    check(t.loaded && t.sessions.empty(), "the scheduler before took its sessions with it");
+    if (second.ok(&err_second)) send(second, raw(second, "after the switch", "four five six", 3))->wait();
     second.telemetry(&t, &device, &device_ok);
     check(err_first.empty() && err_second.empty() && t.totals.requests == 2 && t.recent.size() == 2 &&
               t.recent[0].label == "after the switch" && t.recent[1].label == "before the switch",

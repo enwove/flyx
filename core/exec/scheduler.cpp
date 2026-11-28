@@ -301,6 +301,7 @@ Scheduler::~Scheduler() {
   }
   cv_.notify_all();
   if (thread_.joinable()) thread_.join();
+  telemetry_->unloaded();  // its model's sessions and memory go with it; the server's telemetry counts on
 }
 
 void Scheduler::close() {
