@@ -772,11 +772,11 @@ void Scheduler::finish(Running& r) {
                                                           : "stop";
   rec.prompt_tokens = u.prompt_tokens;
   rec.reused_tokens = u.reused_tokens;
-  rec.output_tokens = u.new_tokens + (res.stop_token >= 0 ? 1 : 0);
+  rec.output_tokens = res.output_tokens();
   rec.ttft_ms = r.job->ttft_ms_;
   rec.prefill_ms = u.prefill_ms;
   rec.decode_ms = u.decode_ms;
-  rec.tokens_per_round = u.rounds ? double(u.new_tokens - 1) / u.rounds : 0.0;
+  rec.tokens_per_round = u.rounds ? double(rec.output_tokens - 1) / u.rounds : 0.0;  // the stop token a round chose too
   rec.drafted = u.drafted;
   rec.accepted_drafts = u.accepted_drafts;
   rec.tool_calls = tool_calls;

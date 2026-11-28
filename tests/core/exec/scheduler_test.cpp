@@ -11,6 +11,7 @@
 #include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <future>
@@ -1017,6 +1018,38 @@ int main(int argc, char** argv) {
     check(err_first.empty() && err_second.empty() && t.totals.requests == 2 && t.recent.size() == 2 &&
               t.recent[0].label == "after the switch" && t.recent[1].label == "before the switch",
           "a scheduler on the server's telemetry counts on from the one before it (" + err_first + err_second + ")");
+  }
+
+  // A reply that ends at a stop token, decoded plainly: a token a round, the stop token's round among them (the
+  // request log's and the dashboard's tokens/round; 0.95 for 20 tokens in 20 rounds when it was left out).
+  if (eo.backend == "cpu_ref") {
+    EngineOptions eo_plain = eo;
+    eo_plain.max_ctx = 256;
+    eo_plain.speculative = false;
+    eo_plain.lookup = false;
+    eo_plain.lookup_given = true;
+    Scheduler plain(argv[1], eo_plain, SchedulerOptions{});
+    std::string err_plain;
+    if (!plain.ok(&err_plain)) {
+      check(false, "plain scheduler: " + err_plain);
+    } else {
+      auto probe = send(plain, raw(plain, "probe", "seven eight nine", 6));
+      probe->wait();
+      const std::vector<int32_t> ids = plain.engine()->tokenizer().encode(probe->text);
+      Request stopped = raw(plain, "stopped", "seven eight nine", 6);
+      stopped.gen.ignore_eos = false;
+      if (ids.size() >= 3) stopped.gen.stop_tokens = {ids[2]};
+      send(plain, stopped)->wait();
+      TelemetrySnapshot t;
+      flyx_device_stats device{};
+      bool device_ok = false;
+      plain.telemetry(&t, &device, &device_ok);
+      const RequestRecord* r = t.recent.empty() ? nullptr : &t.recent[0];
+      check(ids.size() >= 3 && r && r->label == "stopped" && r->status == "stop" && r->output_tokens >= 2 &&
+                std::fabs(r->tokens_per_round - 1.0) < 1e-9,
+            "plain decoding to a stop token: 1.00 tokens a round (" +
+                (r ? std::to_string(r->output_tokens) + " tokens, " + std::to_string(r->tokens_per_round) : "none") + ")");
+    }
   }
 
   return flyx::test::finish("scheduler_test");
