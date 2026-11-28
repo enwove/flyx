@@ -128,7 +128,8 @@ void add_network_routes(httplib::Server& http, Server* s, bool host_from_cli) {
             {"remote_manage_effective", remote_manage_effective},
             {"no_auth_from_cli", s->lan_manage.from_cli},
             {"api_key_set", api_key_set},
-            {"api_urls", api_urls(s->listener.host, s->listener.port)}};
+            {"api_urls", api_urls(s->listener.host, s->listener.port)},
+            {"settings_error", snap.error.empty() ? ojson(nullptr) : ojson(snap.error)}};
   };
   http.Get("/v1/settings/network", [s, status, read_live](const httplib::Request& req, httplib::Response& res) {
     if (!require_access(*s, req, res, Access::kManage, "network settings")) return;

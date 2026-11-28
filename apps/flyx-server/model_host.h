@@ -70,6 +70,9 @@ class ModelHost {
     bool lan_access = false;
     bool remote_manage = false;
     bool live_remote_manage = false;
+    // Why serve.json was not read ("" when it was): its lock not had (the file is then not opened), the file
+    // unreadable, not JSON or no object.  The values are then the last this process read or wrote.
+    std::string error;
   };
   static bool lan_access();
   static bool remote_manage();
