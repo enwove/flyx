@@ -484,6 +484,11 @@ std::vector<LocalModel> scan_model_dirs(const std::vector<std::string>& dirs, in
               m.drafter_kind = cls.drafter_kind;
               m.drafter_mode = drafter_mode_of(cls);
               m.mtp_layers = cls.mtp_layers;
+            } else if (holds_drafter_alone(m.path, allow_path)) {
+              // A drafter's .flyx (python/convert --draft alone): listed as the drafter it is, to draft beside the
+              // model served, never as a model to load (ModelFile::open refuses it).
+              m.kind = "drafter";
+              m.drafter_kind = m.drafter_mode = drafter_source_kind(m.path, allow_path);
             } else {
               m.kind = "flyx";
             }

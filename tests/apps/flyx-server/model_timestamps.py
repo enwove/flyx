@@ -8,6 +8,7 @@ import shutil
 import struct
 import sys
 import tempfile
+from urllib.parse import quote
 from urllib.request import Request, urlopen
 import time
 
@@ -22,6 +23,33 @@ def gguf(layers, arch="test", markov=False):
     return (b"GGUF" + struct.pack("<IQQ", 3, 0, 2 + bool(extra))
             + string("general.architecture") + struct.pack("<I", 8) + string(arch)
             + string(arch + ".nextn_predict_layers") + struct.pack("<II", 4, layers) + extra)
+
+
+def check_drafter_alone(url, root, drafter, with_drafter):
+    """A .flyx of a drafter alone is listed as the drafter it is (not a model to switch to), and a load of it is
+    refused while the model served stays served; a model file with its own drafter is a model."""
+    alone, model = root / "mini-draft.flyx", root / "mini-with-draft.flyx"
+    shutil.copyfile(drafter, alone)
+    shutil.copyfile(with_drafter, model)
+    with urlopen(url + "/v1/hub/dir?path=" + quote(str(root)), timeout=5) as response:
+        listed = {Path(m["path"]).name: m for m in json.load(response)["models"]}
+    assert listed["mini-draft.flyx"]["kind"] == "drafter" and listed["mini-draft.flyx"]["drafter_kind"], listed
+    assert listed["mini-with-draft.flyx"]["kind"] == "flyx", listed
+    with urlopen(url + "/v1/load", timeout=5) as response:
+        before = json.load(response)
+    req = Request(url + "/v1/load", data=json.dumps({"model": str(alone)}).encode("utf-8"),
+                  headers={"Content-Type": "application/json"}, method="POST")
+    with urlopen(req, timeout=5) as response:
+        assert response.status == 202
+    deadline, after = time.monotonic() + 30, {}
+    while time.monotonic() < deadline:
+        with urlopen(url + "/v1/load", timeout=5) as response:
+            after = json.load(response)
+        if after.get("state") not in ("fetching", "loading"):
+            break
+        time.sleep(0.05)
+    assert after["state"] == "ready" and after["model"] == before["model"], after
+    assert "holds a drafter alone" in after["error"] and after["error"].count(str(alone)) == 1, after
 
 
 def check_failed_switch(url, root):
@@ -199,7 +227,7 @@ def check_listing(url, file):
 
 
 if __name__ == "__main__":
-    exe, asset = (Path(arg).resolve() for arg in sys.argv[1:])
+    exe, asset, drafter, with_drafter = (Path(arg).resolve() for arg in sys.argv[1:])
     with tempfile.TemporaryDirectory(prefix="flyx-model-times-") as tmp:
         root = Path(tmp)
         model = root / "test model.flyx"
@@ -208,6 +236,7 @@ if __name__ == "__main__":
 
         def checks(url):
             check_listing(url, root / "weights.gguf")
+            check_drafter_alone(url, root, drafter, with_drafter)
             check_failed_switch(url, root)  # last: it leaves the server with no model
 
         serve(exe, root, env, [str(model)], checks)

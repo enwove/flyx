@@ -395,7 +395,8 @@ flyx_add_py_test(client_conversations ${CMAKE_CURRENT_SOURCE_DIR}/apps/flyx-serv
 flyx_add_py_test(codex_threads ${CMAKE_CURRENT_SOURCE_DIR}/apps/flyx-server/codex_threads.py
                  ARGS $<TARGET_FILE:flyx-cli> ${ASSETS}/tiny.flyx FIXTURES assets TIMEOUT 90)
 flyx_add_py_test(model_timestamps ${CMAKE_CURRENT_SOURCE_DIR}/apps/flyx-server/model_timestamps.py
-                 ARGS $<TARGET_FILE:flyx-cli> ${ASSETS}/tiny.flyx FIXTURES assets)
+                 ARGS $<TARGET_FILE:flyx-cli> ${ASSETS}/tiny.flyx ${ASSETS}/tiny_draft.flyx ${ASSETS}/tiny_dflash.flyx
+                 FIXTURES assets)
 
 add_test(NAME chat COMMAND chat_test ${ASSETS}/tiny.flyx ${ASSETS}/chat_cases.json
                                      ${CMAKE_SOURCE_DIR}/tests/core/render/templates)
