@@ -8,7 +8,10 @@
 #include <cstdio>
 #include <filesystem>
 #include <fstream>
+#include <functional>
 #include <initializer_list>
+#include <optional>
+#include <thread>
 
 #include "apps/common/defaults.h"
 #include "apps/common/numbers.h"
@@ -56,6 +59,45 @@ std::mutex& settings_mutex() {
   return mu;
 }
 
+// serve.json held by this process's threads (settings_mutex) and by every other flyx server sharing the file
+// (serve.json.lock, as drafter_speeds.cpp keeps its file), so that one's read-modify-replace never writes back what
+// another has just changed: a LAN setting turned off coming back on, a saved model undone.  Reads take it too: on
+// Windows a replace fails while another process holds the file open.  Waits a few seconds at most.
+class SettingsLock {
+ public:
+  SettingsLock() : guard_(settings_mutex()) {
+    const std::string path = ModelHost::settings_path();
+    if (path.empty()) {  // no file to share
+      held_ = true;
+      return;
+    }
+    std::error_code ec;
+    fs::create_directories(to_path(path).parent_path(), ec);
+    file_.emplace(path + ".lock");
+    for (int i = 0;; ++i) {
+      const os::FileLock::Result r = file_->try_lock(&why_);
+      if (r == os::FileLock::Result::kLocked) {
+        held_ = true;
+        return;
+      }
+      if (r == os::FileLock::Result::kError) return;
+      if (i == 200) {
+        why_ = path + ".lock: held by another flyx server for 5 s";
+        return;
+      }
+      std::this_thread::sleep_for(std::chrono::milliseconds(25));
+    }
+  }
+  bool held() const { return held_; }
+  const std::string& why() const { return why_; }
+
+ private:
+  std::lock_guard<std::mutex> guard_;
+  std::optional<os::FileLock> file_;
+  bool held_ = false;
+  std::string why_;
+};
+
 ojson read_settings_locked() {
   std::ifstream f(to_path(ModelHost::settings_path()), std::ios::binary);
   if (!f) return nullptr;
@@ -67,7 +109,7 @@ ojson read_settings_locked() {
 }
 
 ojson read_settings() {
-  std::lock_guard<std::mutex> lock(settings_mutex());
+  SettingsLock lock;  // not had: the file read as it is, a replace being atomic
   return read_settings_locked();
 }
 
@@ -87,6 +129,23 @@ bool write_settings_locked(const ojson& root, std::string* err) {
     if (err) *err = "could not save settings to " + ModelHost::settings_path();
     return false;
   }
+  return true;
+}
+
+// serve.json's object as it is now, `change` applied and written back under SettingsLock; `committed`, with what
+// was written, before the lock is let go.
+bool update_settings(const std::function<void(ojson&)>& change, std::string* err,
+                     const std::function<void(const ojson&)>& committed = {}) {
+  SettingsLock lock;
+  if (!lock.held()) {
+    if (err) *err = "could not save settings to " + ModelHost::settings_path() + ": " + lock.why();
+    return false;
+  }
+  ojson root = read_settings_locked();
+  if (!root.is_object()) root = ojson::object();
+  change(root);
+  if (!write_settings_locked(root, err)) return false;
+  if (committed) committed(root);
   return true;
 }
 
@@ -177,13 +236,9 @@ void save_settings(const ModelHost::Want& w) {
   for (size_t i = 0; i < w.drafters.size(); ++i) last["drafters"][i] = remember_path(w.drafters[i]);
   if (!w.eo.mmproj_file.empty()) last["mmproj"] = remember_path(w.eo.mmproj_file);
   if (!w.eo.lora_file.empty()) last["lora"] = remember_path(w.eo.lora_file);
-  std::lock_guard<std::mutex> lock(settings_mutex());
-  ojson root = read_settings_locked();
-  if (!root.is_object()) root = ojson::object();
-  root["last"] = std::move(last);
   std::string err;
-  if (!write_settings_locked(root, &err))
-    std::fprintf(stderr, "flyx-server: could not save the last model to %s\n", ModelHost::settings_path().c_str());
+  if (!update_settings([&](ojson& root) { root["last"] = std::move(last); }, &err))
+    std::fprintf(stderr, "flyx-server: could not save the last model: %s\n", err.c_str());
 }
 
 }  // namespace
@@ -390,12 +445,12 @@ std::string ModelHost::remembered_hub_endpoint() {
 }
 
 bool ModelHost::save_hub_endpoint(const std::string& endpoint, std::string* err) {
-  std::lock_guard<std::mutex> lock(settings_mutex());
-  ojson root = read_settings_locked();
-  if (!root.is_object()) root = ojson::object();
-  if (endpoint.empty()) root.erase("hub_endpoint");
-  else root["hub_endpoint"] = endpoint;
-  return write_settings_locked(root, err);
+  return update_settings(
+      [&](ojson& root) {
+        if (endpoint.empty()) root.erase("hub_endpoint");
+        else root["hub_endpoint"] = endpoint;
+      },
+      err);
 }
 
 bool ModelHost::lan_access() { return read_network_settings().lan_access; }
@@ -417,7 +472,7 @@ ModelHost::NetworkSettingsSnapshot snapshot_of(const ojson& root,
 
 ModelHost::NetworkSettingsSnapshot ModelHost::read_network_settings(
     const std::function<bool()>& read_live_remote_manage) {
-  std::lock_guard<std::mutex> lock(settings_mutex());
+  SettingsLock lock;  // not had: the file read as it is, a replace being atomic
   return snapshot_of(read_settings_locked(), read_live_remote_manage);
 }
 
@@ -429,15 +484,16 @@ bool ModelHost::save_network_settings(std::optional<bool> lan_access, std::optio
     *err = "no configuration directory available to save network settings";
     return false;
   }
-  std::lock_guard<std::mutex> lock(settings_mutex());
-  ojson root = read_settings_locked();
-  if (!root.is_object()) root = ojson::object();
-  if (lan_access.has_value()) root["lan_access"] = *lan_access;
-  if (remote_manage.has_value()) root["remote_manage"] = *remote_manage;
-  if (!write_settings_locked(root, err)) return false;
-  if (remote_manage.has_value() && on_remote_manage_committed) on_remote_manage_committed(*remote_manage);
-  if (out_snapshot) *out_snapshot = snapshot_of(root, read_live_remote_manage);
-  return true;
+  return update_settings(
+      [&](ojson& root) {
+        if (lan_access.has_value()) root["lan_access"] = *lan_access;
+        if (remote_manage.has_value()) root["remote_manage"] = *remote_manage;
+      },
+      err,
+      [&](const ojson& root) {
+        if (remote_manage.has_value() && on_remote_manage_committed) on_remote_manage_committed(*remote_manage);
+        if (out_snapshot) *out_snapshot = snapshot_of(root, read_live_remote_manage);
+      });
 }
 
 ModelHost::~ModelHost() {

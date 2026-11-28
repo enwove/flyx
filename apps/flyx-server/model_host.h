@@ -59,7 +59,9 @@ class ModelHost {
   // last error, notes, the served model's drafters and those published for it, and what the settings file remembers.
   ojson status() const;
 
-  // The settings file holds the last model, Hub endpoint and dashboard network preference.
+  // The settings file holds the last model, Hub endpoint and dashboard network preference.  Every read and every
+  // read-modify-replace of it holds this process's settings lock and serve.json.lock beside it, which every flyx
+  // server sharing the file takes: one server's save never writes back another's older settings.
   static std::string settings_path();
   static bool remembered(Want* w, const EngineOptions& base);
   static std::string remembered_hub_endpoint();
@@ -73,7 +75,7 @@ class ModelHost {
   static bool remote_manage();
   static NetworkSettingsSnapshot read_network_settings(
       const std::function<bool()>& read_live_remote_manage = {});
-  // Atomically update lan_access and/or remote_manage in serve.json under settings_mutex(), invoking
+  // Atomically update lan_access and/or remote_manage in serve.json under the settings lock, invoking
   // on_remote_manage_committed before releasing the lock and sampling live_remote_manage under the same lock.
   static bool save_network_settings(std::optional<bool> lan_access, std::optional<bool> remote_manage,
                                     const std::function<void(bool)>& on_remote_manage_committed,

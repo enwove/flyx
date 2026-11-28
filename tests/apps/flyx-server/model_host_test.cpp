@@ -12,11 +12,13 @@
 #include <chrono>
 #include <condition_variable>
 #include <cstdio>
+#include <cstdlib>
 #include <filesystem>
 #include <fstream>
 #include <functional>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <string>
 #include <thread>
 #include <vector>
@@ -97,8 +99,36 @@ bool wait_for(const std::function<bool()>& done, int ms) {
 
 }  // namespace
 
+// One of two servers sharing serve.json (a process of its own, the settings in `dir`): n saves of remote_manage
+// turned on and off ("network") or of a Hub endpoint ("hub"), each read back after it.  The other's
+// read-modify-replace, were it not under the file's lock, would now and then write its older copy over this one's
+// save.  Exit 0: every save made and none lost.
+int settings_writer(const std::string& dir, const std::string& kind, int n) {
+  set_env("APPDATA", dir);
+  set_env("XDG_CONFIG_HOME", dir);
+  int failed = 0, lost = 0;
+  for (int i = 0; i < n; ++i) {
+    std::string err;
+    if (kind == "network") {
+      const bool v = i % 2 == 0;
+      if (!ModelHost::save_network_settings(std::nullopt, v, {}, nullptr, &err))
+        ++failed, std::fprintf(stderr, "%s\n", err.c_str());
+      else if (ModelHost::read_network_settings().remote_manage != v)
+        ++lost;
+    } else {
+      const std::string e = "https://hub-" + std::to_string(i) + ".example";
+      if (!ModelHost::save_hub_endpoint(e, &err)) ++failed, std::fprintf(stderr, "%s\n", err.c_str());
+      else if (ModelHost::remembered_hub_endpoint() != e) ++lost;
+    }
+  }
+  std::printf("%s writer: %d saves, %d failed, %d lost to the other\n", kind.c_str(), n, failed, lost);
+  return failed || lost ? 1 : 0;
+}
+
 int main(int argc, char** argv) {
   flyx::test::print_passes = true;
+  if (argc == 5 && std::string(argv[1]) == "--settings-writer")
+    return settings_writer(argv[2], argv[3], std::atoi(argv[4]));
   if (argc < 2) {
     std::fprintf(stderr, "usage: model_host_test MODEL.flyx\n");
     return 2;
@@ -307,6 +337,33 @@ int main(int argc, char** argv) {
     writer.join();
     reader.join();
     check(!torn.load(), "concurrent save_network_settings / read_network_settings never tear disk vs live_remote_manage");
+  }
+  {
+    // Two servers sharing serve.json, processes of their own: one turns remote_manage on and off, the other saves
+    // Hub endpoints, at once.  Neither save is lost to the other's, and a fresh reader sees both last ones.
+    const std::string self = os::from_path(fs::absolute(os::to_path(argv[0]), ec));
+    const int n = 150;
+    auto writer = [&](const char* kind) {
+      std::string cmd = "\"" + self + "\" --settings-writer \"" + os::from_path(config) + "\" " + kind + " " +
+                        std::to_string(n);
+#if defined(_WIN32)
+      cmd = "\"" + cmd + "\"";  // cmd /c takes the outer quotes off
+#endif
+      std::fflush(stdout);
+      return std::system(cmd.c_str());
+    };
+    int network_rc = -1, hub_rc = -1;
+    std::thread network([&] { network_rc = writer("network"); });
+    std::thread hub([&] { hub_rc = writer("hub"); });
+    network.join();
+    hub.join();
+    check(network_rc == 0 && hub_rc == 0,
+          "two processes' saves of serve.json at once: none lost to the other's (exit " + std::to_string(network_rc) +
+              ", " + std::to_string(hub_rc) + ")");
+    const bool last_remote_manage = (n - 1) % 2 == 0;
+    check(ModelHost::read_network_settings().remote_manage == last_remote_manage &&
+              ModelHost::remembered_hub_endpoint() == "https://hub-" + std::to_string(n - 1) + ".example",
+          "and a fresh reader sees both processes' last saves");
   }
   fs::remove_all(config, ec);
   return flyx::test::finish("model_host_test");
