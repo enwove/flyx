@@ -3,6 +3,7 @@
 // repositories with GGUF files, and all of them with their configs): every page the next of each, the safetensors
 // drafters among the second beside the first's repositories whatever words the query has, each repository once, the
 // pages walked by their cursors to the end of both, a drafter stream the Hub does not answer leaving the GGUF one.
+#include <algorithm>
 #include <map>
 #include <mutex>
 #include <set>
@@ -179,6 +180,23 @@ int main() {
   }
   check(ok && later == std::vector<std::string>{"other/Model-DSpine", "acme/Model-DFlash"},
         "the exact name's repository on no later page, the exclusion in every cursor: " + joined(later));
+  // The exact name typed in another case than the Hub's ID (the Hub resolves either): a first page holding the Hub's
+  // spelling does not add the lookup's again (repo_key), and the exclusion, carried as typed, holds on page two.
+  check(flyx::server::repo_key("ACME/Model-Q8-GGUF") == flyx::server::repo_key("acme/model-q8-gguf") &&
+            flyx::server::repo_key("acme/Model-Q8-GGUF") == "acme/model-q8-gguf",
+        "a repository's key ignores the case of its letters");
+  ok = flyx::server::search_page(hub.fn(), "acme model", "trending", 20, "", &found, &next, &err, nullptr);
+  next = flyx::server::cursor_excluding(next, "ACME/MODEL-Q8-GGUF");
+  ok = ok && flyx::server::search_page(hub.fn(), "acme model", "trending", 20, next, &found, &next, &err, nullptr);
+  check(ok && ids(found) == std::vector<std::string>{"other/Model-DSpine"},
+        "an exact name typed in another case is still on no later page: " + joined(ids(found)));
+  hub.gguf[""].first.push_back(repo("ACME/MODEL-GGUF", "qwen35"));  // the Hub giving one repository twice in two cases
+  ok = flyx::server::search_page(hub.fn(), "acme model", "trending", 20, "", &found, &next, &err, nullptr);
+  const std::vector<std::string> page_one = ids(found);
+  check(ok && std::count(page_one.begin(), page_one.end(), "ACME/MODEL-GGUF") == 0 &&
+            std::count(page_one.begin(), page_one.end(), "acme/Model-GGUF") == 1,
+        "and on one page a repository is once whatever its case: " + joined(page_one));
+  hub.gguf[""].first.pop_back();
   check(flyx::server::cursor_excluding("", "acme/Model-Q8-GGUF").empty() &&
             flyx::server::cursor_excluding("g2", "acme/Model-Q8-GGUF") == "g2",
         "nothing to exclude from where there is no page after, or from the Hub's own cursor");

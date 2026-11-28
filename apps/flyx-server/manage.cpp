@@ -650,7 +650,8 @@ void add_manage_routes(httplib::Server& http, Server* s) {
         // it or not (newly published, or matched by its name alone); shown here, it is on no later page.
         hub::Name exact;
         const auto shown = [&] {
-          return std::any_of(found.begin(), found.end(), [&](const hub::Found& f) { return f.id == exact.repo; });
+          return std::any_of(found.begin(), found.end(),
+                             [&](const hub::Found& f) { return repo_key(f.id) == repo_key(exact.repo); });
         };
         const bool named = hub::parse_name(asked, &exact);
         if (named && !shown()) {

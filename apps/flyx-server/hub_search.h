@@ -16,6 +16,7 @@
 
 #include <functional>
 #include <string>
+#include <string_view>
 #include <vector>
 
 #include "core/hub/hub.h"
@@ -38,6 +39,10 @@ using HubSearchFn = std::function<bool(const std::string& query, const std::stri
 bool search_page(const HubSearchFn& search, const std::string& query, const std::string& sort, int limit,
                  const std::string& cursor, std::vector<hub::Found>* out, std::string* next_cursor, std::string* err,
                  hub::HubOutcome* outcome);
+
+// A repository's identity on the Hub, which resolves an ID in any case of its letters: ASCII lower case.  An exact
+// lookup keeps the spelling typed while a search gives the Hub's own, so pages compare, and leave out, by this.
+std::string repo_key(std::string_view id);
 
 // `next_cursor` (a page's) with the repository `id` left out of every page it resumes: an exact name's repository a
 // first page showed beside the streams' rows.  "" stays "".

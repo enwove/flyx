@@ -62,6 +62,13 @@ std::string cursor_of(const Places& p) {
 
 }  // namespace
 
+std::string repo_key(std::string_view id) {
+  std::string k(id);
+  for (char& c : k)
+    if (c >= 'A' && c <= 'Z') c = char(c - 'A' + 'a');
+  return k;
+}
+
 bool search_page(const HubSearchFn& search, const std::string& query, const std::string& sort, int limit,
                  const std::string& cursor, std::vector<hub::Found>* out, std::string* next_cursor, std::string* err,
                  hub::HubOutcome* outcome) {
@@ -94,13 +101,13 @@ bool search_page(const HubSearchFn& search, const std::string& query, const std:
     if (outcome) *outcome = extra_outcome;
     return false;
   }
-  std::set<std::string> seen;
-  if (!at.excluded.empty()) seen.insert(at.excluded);
+  std::set<std::string> seen;  // repo_key's: one repository however the Hub or a cursor spells it
+  if (!at.excluded.empty()) seen.insert(repo_key(at.excluded));
   for (hub::Found& f : gguf)
-    if (seen.insert(f.id).second) out->push_back(std::move(f));
+    if (seen.insert(repo_key(f.id)).second) out->push_back(std::move(f));
   if (drafters_ok)
     for (hub::Found& f : extra)
-      if (f.is_drafter && f.architecture.empty() && seen.insert(f.id).second) out->push_back(std::move(f));
+      if (f.is_drafter && f.architecture.empty() && seen.insert(repo_key(f.id)).second) out->push_back(std::move(f));
   Places next;
   if (at.gguf && !gguf_next.empty()) next.gguf = gguf_next;
   if (drafters_ok && !extra_next.empty()) next.drafters = extra_next;
