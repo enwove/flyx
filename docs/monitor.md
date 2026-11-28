@@ -147,7 +147,7 @@ Located in `apps/flyx-server/dashboard/`, written as zero-build ES modules using
 | `index.html`, `style.css`, `app.js` | Shell, light/dark themes, keyboard navigation (`1`–`7`, `[`), telemetry poller |
 | `pages/` | `overview.js`, `model.js`, `requests.js`, `chat.js`, `logs.js`, `integration.js`, `settings.js` |
 | `components/` | `topbar.js`, `sidebar.js`, `conversation.js`, `agent_setup.js` |
-| `lib/` | `html.js`, `api.js`, `telemetry.js`, `i18n.js`, `format.js`, `charts.js`, `markdown.js`, `ui.js`, `actions.js`, `chats.js` |
+| `lib/` | `html.js`, `api.js`, `telemetry.js`, `i18n.js`, `theme.js`, `format.js`, `charts.js`, `markdown.js`, `ui.js`, `actions.js`, `chats.js` |
 | `i18n/` | Localization dictionaries: `zh`, `es`, `fr`, `de`, `ja`, `ko` |
 
 When `--api-key` is active, auto-opening the browser passes the key in the URL fragment (`#key=...`) so it never appears in HTTP request lines.
@@ -163,7 +163,7 @@ What the pages do:
 | Server settings | Choose whether to serve on the local network after restart, optionally allow LAN dashboard/management without an API key on trusted networks, and copy the active API address for a client. |
 | Integration | Setup for Claude Code, Codex CLI, DeepSeek Harness, OpenCode and Pi, a text to hand any other agent, SDK snippets, and the API reference. For the agents in `server.agent_launch` (Claude Code and Codex CLI on Windows), with the browser on the server's machine: **Open in PowerShell** asks for the project folder in a dialog (the one used last in this browser, or another chosen in the system's folder dialog) and starts the agent there in a new window (`POST /v1/agents/launch`). |
 
-The sidebar keeps decode speed, prefill speed, tokens per round, TTFT, VRAM, RAM, context, queue, GPU and CPU load in view on every page. Folders added to the library and the chat history are the browser's own (per browser and address).
+The sidebar keeps decode speed, prefill speed, tokens per round, TTFT, VRAM, RAM, context, queue, GPU and CPU load in view on every page. The top bar's theme menu (beside the language) shows the dashboard light, dark, or as the system's setting says (the default, following it as it changes); the choice is applied before the page is first drawn, so a dark page never flashes white. Folders added to the library, the chat history, the language and the theme are the browser's own (per browser and address).
 
 ### Live Dashboard Development (No Rebuild)
 
@@ -176,4 +176,5 @@ Validation tools:
 - Offline Integration guide check (all 7 languages, keyed/open): `python tests/apps/flyx-server/check_dashboard_integration.py` (uses Playwright + PyYAML; pass `--browser msedge` for Edge)
 - Offline Model page check (load settings, shell quoting of the command line, the library): `python tests/apps/flyx-server/check_dashboard_model.py`
 - Offline Chat check (reply streams, the browser-kept history): `python tests/apps/flyx-server/check_dashboard_chat.py`
+- Offline theme check (light unchanged, dark before the first paint and across a reload, the system's setting, no storage, all 7 languages): `python tests/apps/flyx-server/check_dashboard_theme.py`
 - Live endpoint & asset serving check: `python tests/apps/flyx-server/check_server.py --url http://127.0.0.1:8080`

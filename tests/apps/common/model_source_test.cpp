@@ -213,6 +213,91 @@ int main() {
               fs::file_size(lsnap / "adapters" / "small" / "adapter_config.json") == config.size() &&
               fs::file_size(lsnap / "adapters" / "small" / "adapter_model.safetensors") == 64,
           "one within it is fetched with its weights" + (ok ? std::string() : ": " + err));
+    // Expose the cached LoRA snapshot via refs/main so offline fetch_lora can resolve its Hub name.
+    const fs::path lrefs = lsnap.parent_path().parent_path() / "refs";
+    fs::create_directories(lrefs);
+    std::ofstream(lrefs / "main", std::ios::binary) << lora.commit;
+    ok = flyx::apps::fetch_lora("'" + lora.id + ":small'", {}, nullptr, &path, &err);
+    check(ok && to_path(path) == lsnap / "adapters" / "small",
+          "single-quoted Hub LoRA name resolves via fallback" + (ok ? std::string() : ": " + err));
+  }
+
+  // Leading ~ expansion (HOME and USERPROFILE) and outer single-quote fallback (cmd.exe paste).
+  {
+    const std::string saved_home = flyx::os::getenv_str("HOME");
+    const std::string saved_profile = flyx::os::getenv_str("USERPROFILE");
+    const fs::path fake_home = tmp / "home";
+    const fs::path home_model = fake_home / "models" / "Home-Tiny-Q4_K_M.gguf";
+    const fs::path home_lora = fake_home / "adapters" / "tiny-lora";
+    write_gguf(home_model, "inkling2_loop");
+    fs::create_directories(home_lora);
+    std::ofstream(home_lora / "adapter_config.json", std::ios::binary) << R"({"peft_type":"LORA","r":8})";
+
+    set_env("HOME", from_path(fake_home));
+    ok = fetched("~/models/Home-Tiny-Q4_K_M.gguf", {}, false, &f, &err);
+    check(ok && fs::weakly_canonical(to_path(f.model), ec) == fs::weakly_canonical(home_model, ec),
+          "fetch_model expands ~/ via HOME" + (ok ? std::string() : ": " + err));
+#if defined(_WIN32)
+    ok = fetched("~\\models\\Home-Tiny-Q4_K_M.gguf", {}, false, &f, &err);
+    check(ok && fs::weakly_canonical(to_path(f.model), ec) == fs::weakly_canonical(home_model, ec),
+          "fetch_model expands ~\\ via HOME" + (ok ? std::string() : ": " + err));
+#endif
+    std::string lora_path;
+    ok = flyx::apps::fetch_lora("~/adapters/tiny-lora", {}, nullptr, &lora_path, &err);
+    check(ok && fs::weakly_canonical(to_path(lora_path), ec) == fs::weakly_canonical(home_lora, ec),
+          "fetch_lora expands ~/ via HOME" + (ok ? std::string() : ": " + err));
+
+    // When HOME is empty, USERPROFILE is used.
+    set_env("HOME", "");
+    set_env("USERPROFILE", from_path(fake_home));
+    ok = fetched("~/models/Home-Tiny-Q4_K_M.gguf", {}, false, &f, &err);
+    check(ok && fs::weakly_canonical(to_path(f.model), ec) == fs::weakly_canonical(home_model, ec),
+          "fetch_model expands ~/ via USERPROFILE when HOME is unset" + (ok ? std::string() : ": " + err));
+
+    // Outer single-quote fallback for local paths (including ~/) and Hub specs.
+    ok = fetched("'" + from_path(model) + "'", {}, false, &f, &err);
+    check(ok && f.model == from_path(model),
+          "fetch_model strips outer single quotes around a local path" + (ok ? std::string() : ": " + err));
+    ok = fetched("'~/models/Home-Tiny-Q4_K_M.gguf'", {}, false, &f, &err);
+    check(ok && fs::weakly_canonical(to_path(f.model), ec) == fs::weakly_canonical(home_model, ec),
+          "fetch_model strips outer single quotes and expands ~/" + (ok ? std::string() : ": " + err));
+    ok = fetched("'" + repo + ":Q4_K_M'", {}, false, &f, &err);
+    check(ok && fs::path(to_path(f.model)).filename() == "Ink-Tiny-Q4_K_M.gguf",
+          "fetch_model strips outer single quotes around a Hub name" + (ok ? std::string() : ": " + err));
+    ok = flyx::apps::fetch_lora("'" + from_path(home_lora) + "'", {}, nullptr, &lora_path, &err);
+    check(ok && fs::weakly_canonical(to_path(lora_path), ec) == fs::weakly_canonical(home_lora, ec),
+          "fetch_lora strips outer single quotes around a local directory" + (ok ? std::string() : ": " + err));
+    for (const std::string bad : {"''", "'", "'no-such-file'"}) {
+      ok = fetched(bad, {}, false, &f, &err);
+      check(!ok && err.find(bad + ": no such file, and not a Hugging Face name") != std::string::npos,
+            "invalid quoted spec still reports crisp error: " + err);
+    }
+
+    // Remote path policy must be checked on tilde-expanded and single-quote-stripped paths before probing disk.
+    auto deny_expanded_home = [&](std::string_view p) {
+      return p.find(from_path(fake_home)) == std::string_view::npos;
+    };
+    auto deny_unc_after_unquote = [](std::string_view p) {
+      return !p.starts_with("\\\\") && !p.starts_with("//");
+    };
+    ok = flyx::apps::fetch_model("~/models/Home-Tiny-Q4_K_M.gguf", {}, false, {}, nullptr, &f, &err, "", true, true, "",
+                                 deny_expanded_home);
+    check(!ok && err.find("remote path policy") != std::string::npos,
+          "fetch_model checks allow_path on tilde-expanded path before disk access: " + err);
+    ok = flyx::apps::fetch_model("'~/models/Home-Tiny-Q4_K_M.gguf'", {}, false, {}, nullptr, &f, &err, "", true, true,
+                                 "", deny_expanded_home);
+    check(!ok && err.find("remote path policy") != std::string::npos,
+          "fetch_model checks allow_path on single-quoted tilde-expanded path before disk access: " + err);
+    ok = flyx::apps::fetch_model("'\\\\attacker\\share\\model.gguf'", {}, false, {}, nullptr, &f, &err, "", true, true,
+                                 "", deny_unc_after_unquote);
+    check(!ok && err.find("remote path policy") != std::string::npos,
+          "fetch_model checks allow_path on single-quote-stripped UNC path before disk access: " + err);
+    ok = flyx::apps::fetch_lora("'\\\\attacker\\share\\lora'", {}, nullptr, &lora_path, &err, deny_unc_after_unquote);
+    check(!ok && err.find("remote path policy") != std::string::npos,
+          "fetch_lora checks allow_path on single-quote-stripped UNC path before disk access: " + err);
+
+    set_env("HOME", saved_home);
+    set_env("USERPROFILE", saved_profile);
   }
   // expand_user_path and scan_model_dirs: nested non-HF layouts, mixed/unsupported files, tilde, symlinks + cycles.
   {

@@ -12,6 +12,7 @@
 #include <map>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <set>
 #include <tuple>
 
@@ -36,6 +37,51 @@ using os::to_path;
 bool exists_on_disk(const std::string& path) {
   std::error_code ec;
   return fs::exists(to_path(path), ec);
+}
+
+std::string expand_tilde(const std::string& path) {
+  if (path.empty() || path[0] != '~') return path;
+  if (path.size() > 1 && path[1] != '/' && path[1] != '\\') return path;
+  const std::string home = os::home_dir();
+  if (home.empty()) return path;
+  if (path.size() == 1) return home;
+  const bool home_slash = home.back() == '/' || home.back() == '\\';
+  return home_slash ? home + path.substr(2) : home + path.substr(1);
+}
+
+enum class LocalPathResult { kNotFound, kFound, kDenied };
+
+// Matches a local path verbatim first, then with leading "~/" or "~\" expanded.
+// Enforces allow_path BEFORE any filesystem probe on both raw and tilde-expanded candidates.
+LocalPathResult local_path_if_exists(const std::string& spec, const PathAllowFn& allow_path, std::string* resolved,
+                                     std::string* err) {
+  if (allow_path && !allow_path(spec)) {
+    if (err) *err = spec + ": path is not allowed by remote path policy";
+    return LocalPathResult::kDenied;
+  }
+  if (exists_on_disk(spec)) {
+    *resolved = spec;
+    return LocalPathResult::kFound;
+  }
+  const std::string expanded = expand_tilde(spec);
+  if (expanded != spec) {
+    if (allow_path && !allow_path(expanded)) {
+      if (err) *err = expanded + ": path is not allowed by remote path policy";
+      return LocalPathResult::kDenied;
+    }
+    if (exists_on_disk(expanded)) {
+      *resolved = expanded;
+      return LocalPathResult::kFound;
+    }
+  }
+  return LocalPathResult::kNotFound;
+}
+
+// Fallback for Windows cmd.exe pastes of single-quoted shell arguments ('...').
+std::optional<std::string> strip_single_quotes(const std::string& spec) {
+  if (spec.size() >= 2 && spec.front() == '\'' && spec.back() == '\'')
+    return spec.substr(1, spec.size() - 2);
+  return std::nullopt;
 }
 
 std::string lower(std::string s) {
@@ -469,11 +515,21 @@ std::string gigabytes(uint64_t n) {
 // return its directory; a single or split GGUF returns its (first) model file.
 bool one(const std::string& spec, const hub::ProgressFn& progress, const std::atomic<bool>* stop, std::string* path,
          hub::Repo* repo, std::string* err, const PathAllowFn& allow_path = {}) {
-  if (allow_path && !allow_path(spec))
-    return *err = spec + ": path is not allowed by remote path policy", false;
-  if (exists_on_disk(spec)) return *path = spec, true;
+  std::string local;
+  const LocalPathResult r1 = local_path_if_exists(spec, allow_path, &local, err);
+  if (r1 == LocalPathResult::kDenied) return false;
+  if (r1 == LocalPathResult::kFound) return *path = local, true;
   hub::Name name;
-  if (!hub::parse_name(spec, &name))
+  bool parsed = hub::parse_name(spec, &name);
+  if (!parsed) {
+    if (const auto unquoted = strip_single_quotes(spec); unquoted && !unquoted->empty()) {
+      const LocalPathResult r2 = local_path_if_exists(*unquoted, allow_path, &local, err);
+      if (r2 == LocalPathResult::kDenied) return false;
+      if (r2 == LocalPathResult::kFound) return *path = local, true;
+      parsed = hub::parse_name(*unquoted, &name);
+    }
+  }
+  if (!parsed)
     return *err = spec + ": no such file, and not a Hugging Face name (org/name, org/name:QUANT)", false;
   std::vector<hub::RepoFile> files;
   std::vector<std::string> paths;
@@ -700,6 +756,10 @@ bool fetch_model(const std::string& model, const std::vector<std::string>& draft
   const flyx::GgufPeek own = want_mtp ? gguf_header(out->model, allow_path) : flyx::GgufPeek{};
   const int own_mtp = own.valid ? own.mtp_layers : -1;  // -1: not a GGUF, or not asked
   if (own_mtp > 0) out->drafter_sources.push_back({"mtp", "model file", std::nullopt});
+  const auto clean_hub = [](const std::string& s) {
+    const auto u = strip_single_quotes(s);
+    return u && !u->empty() ? *u : s;
+  };
   for (const std::string& d : drafters) {
     hub::Repo drepo;
     std::string path;
@@ -707,7 +767,7 @@ bool fetch_model(const std::string& model, const std::vector<std::string>& draft
     out->drafters.push_back(path);
     out->drafter_sources.push_back(
         {drepo.id.empty() || !hub::is_drafter(drepo) ? drafter_kind(path, allow_path) : hub::drafter_kind(drepo),
-         drepo.id.empty() ? path : d,
+         drepo.id.empty() ? path : clean_hub(d),
          bytes_on_disk(path, allow_path)});
   }
   if (want_vision && !mmproj.empty()) {
@@ -715,7 +775,7 @@ bool fetch_model(const std::string& model, const std::vector<std::string>& draft
     std::string mpath;
     if (!one(mmproj, progress, stop, &mpath, &mrepo, err, allow_path)) return false;
     out->mmproj = mpath;
-    out->mmproj_source = mrepo.id.empty() ? mpath : mmproj;
+    out->mmproj_source = mrepo.id.empty() ? mpath : clean_hub(mmproj);
     out->mmproj_size = bytes_on_disk(mpath, allow_path);
   }
   if (!lora.empty() && !fetch_lora(lora, progress, stop, &out->lora, err, allow_path)) return false;
@@ -793,22 +853,37 @@ bool fetch_model(const std::string& model, const std::vector<std::string>& draft
 
 bool fetch_lora(const std::string& spec, const hub::ProgressFn& progress, const std::atomic<bool>* stop,
                 std::string* path, std::string* err, const PathAllowFn& allow_path) {
-  if (allow_path && !allow_path(spec))
-    return *err = spec + ": path is not allowed by remote path policy", false;
-  if (exists_on_disk(spec)) {  // the directory, or a file of it (its adapter_config.json, adapter_model.safetensors)
+  auto take_local = [&](const std::string& p) {  // the directory, or a file of it (its adapter_config.json, adapter_model.safetensors)
     std::error_code ec;
-    const std::string resolved = fs::is_directory(to_path(spec), ec) ? spec : from_path(to_path(spec).parent_path());
+    const std::string resolved = fs::is_directory(to_path(p), ec) ? p : from_path(to_path(p).parent_path());
     if (allow_path && !allow_path(resolved))
       return *err = resolved + ": path is not allowed by remote path policy", false;
     *path = resolved;
     return true;
-  }
+  };
+  std::string local;
+  const LocalPathResult r1 = local_path_if_exists(spec, allow_path, &local, err);
+  if (r1 == LocalPathResult::kDenied) return false;
+  if (r1 == LocalPathResult::kFound) return take_local(local);
   hub::Name name;
-  if (!hub::parse_adapter_name(spec, &name))
+  std::string active = spec;
+  bool parsed = hub::parse_adapter_name(spec, &name);
+  if (!parsed) {
+    if (const auto unquoted = strip_single_quotes(spec); unquoted && !unquoted->empty()) {
+      const LocalPathResult r2 = local_path_if_exists(*unquoted, allow_path, &local, err);
+      if (r2 == LocalPathResult::kDenied) return false;
+      if (r2 == LocalPathResult::kFound) return take_local(local);
+      if (hub::parse_adapter_name(*unquoted, &name)) {
+        parsed = true;
+        active = *unquoted;
+      }
+    }
+  }
+  if (!parsed)
     return *err = spec + ": no such directory, and not a Hugging Face name (org/name, org/name:FOLDER)", false;
   hub::Repo repo;
   if (!hub::describe(name.repo, name.revision, &repo, err, nullptr, allow_path)) return false;
-  return fetch_lora_in(repo, spec, name.quant, progress, stop, path, err, allow_path);
+  return fetch_lora_in(repo, active, name.quant, progress, stop, path, err, allow_path);
 }
 
 bool fetch_lora_in(const hub::Repo& repo, const std::string& spec, const std::string& folder,

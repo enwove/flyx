@@ -410,7 +410,7 @@ def check_context_limit(open_page, want):
         page.close()
 
 
-def check_commands(page, want):
+def check_commands(page, open_page, want):
     """The command line shown, as each of this system's shells hands it to a program."""
     shells = ("powershell", "pwsh") if os.name == "nt" else ("bash", "zsh")
     with tempfile.TemporaryDirectory() as dirname:
@@ -418,15 +418,38 @@ def check_commands(page, want):
         (tmp / "serve").write_text(
             'import json, sys\nfrom pathlib import Path\n'
             'Path("args.json").write_text(json.dumps(sys.argv[1:]), encoding="utf8")\n', encoding="utf8")
-        for name in ("Qwen ‘local’", 'Local "27B"', "A path ending in a slash\\"):
+        for name in ("Qwen ‘local’", "foo$bar", "foo`bar", 'Local "27B"', "A path ending in a slash\\"):
             page.locator("#mf-name").fill(name)
             expected = [want["model"], "--ctx", "8192", "--kv", "fp8", "--kv-ram", "4", "--kv-gpu", "0", "--name", name, "--port", "18479"]
             assert command(page) == ["flyx", "serve", *expected]
+            page.locator('#mf-settings [data-shell="powershell"]').click()
+            ps_cmd = page.locator("#mf-cmd").inner_text()
+            if name in ("foo$bar", "foo`bar"):
+                assert f"--name '{name}'" in ps_cmd, ps_cmd
+            elif name == "Qwen ‘local’":
+                assert f'--name "{name}"' in ps_cmd, ps_cmd
+            else:
+                assert ps_cmd.startswith("Start-Process flyx "), ps_cmd
             for shell in shells:
                 if shutil.which(shell):
                     page.locator('#mf-settings [data-shell="powershell"]' if os.name == "nt" else '#mf-settings [data-shell="sh"]').click()
                     assert native_args(page.locator("#mf-cmd").inner_text(), shell, tmp) == expected
     page.locator("#mf-reset").click()
+
+    # Smart quoting: safe specs stay unquoted, space-containing Windows paths use double quotes (cmd.exe + PowerShell).
+    for model_spec, want_ps, want_sh in (
+        ("unsloth/Qwen3-GGUF:Q4_K_M", "flyx serve unsloth/Qwen3-GGUF:Q4_K_M", "flyx serve unsloth/Qwen3-GGUF:Q4_K_M"),
+        (r"C:\models\foo.gguf", r"flyx serve C:\models\foo.gguf", r"flyx serve 'C:\models\foo.gguf'"),
+        (r"C:\My Models\foo.gguf", r'flyx serve "C:\My Models\foo.gguf"', r"flyx serve 'C:\My Models\foo.gguf'"),
+    ):
+        p2, _ = open_page(telemetry({"model": model_spec}))
+        p2.locator('#mf-settings [data-shell="powershell"]').click()
+        ps_text = p2.locator("#mf-cmd").inner_text()
+        assert ps_text.startswith(want_ps), ps_text
+        p2.locator('#mf-settings [data-shell="sh"]').click()
+        sh_text = p2.locator("#mf-cmd").inner_text()
+        assert sh_text.startswith(want_sh), sh_text
+        p2.close()
 
 
 def check_drafters(page, server, want):
@@ -657,6 +680,17 @@ def check_hub(page, server, want):
     expect(page.locator('#hf-companions .mrow[data-kind="mtp"] .cmain svg use')).to_have_attribute("href", "#i-bolt")
     expect(page.locator('#hf-companions .mrow[data-kind="mmproj"]').first.locator(".cmain svg use")).to_have_attribute("href", "#i-image")
     expect(page.locator("#mf-load")).to_be_disabled()
+    # Copy name copies org/name by default, or org/name:QUANT when a quantization row is selected.
+    page.evaluate("() => { window.__copied = []; navigator.clipboard.writeText = (s) => { window.__copied.push(s); return Promise.resolve(); }; }")
+    copy_btn = page.locator("#hf-detail .dh button")
+    expect(copy_btn).to_have_attribute("title", REPO)
+    copy_btn.click()
+    assert page.evaluate("() => window.__copied.at(-1)") == REPO
+    page.locator('#mf-files .mrow[data-name$=":Q5_K_M"]').click()
+    expect(copy_btn).to_have_attribute("title", REPO + ":Q5_K_M")
+    copy_btn.click()
+    assert page.evaluate("() => window.__copied.at(-1)") == REPO + ":Q5_K_M"
+    page.locator('#mf-files .mrow[data-name$=":Q5_K_M"]').click()  # restore deselected state
     # Selecting a companion in Hugging Face detail turns the bottom-right CTA into Use as projector / Draft with it.
     page.locator('#hf-companions .mrow[data-comp$=":mmproj-F16.gguf"]').click()
     expect(page.locator("#mf-load")).to_have_text("Use as projector")
@@ -1520,7 +1554,7 @@ def check(browser):
 
     page, server = open_page(telemetry(want))
     check_settings(page, server, want)
-    check_commands(page, want)
+    check_commands(page, open_page, want)
     check_drafters(page, server, want)
     check_vision(page, server, open_page, want)
     page.close()
