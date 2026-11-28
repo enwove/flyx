@@ -551,6 +551,33 @@ int run(int argc, char** argv) {
   // Connections past the workers wait for one, as many again at most: more are closed at once, not left to hang.
   http.new_task_queue = [threads = args.threads] { return new httplib::ThreadPool(threads, threads); };
   http.set_payload_max_length(flyx::apps::kHttpMaxPayloadBytes);
+  static_assert(CPPHTTPLIB_FORM_URL_ENCODED_PAYLOAD_MAX_LENGTH == flyx::apps::kHttpMaxPayloadBytes,
+                "a form-encoded body takes the same limit as any other (CMakeLists.txt)");
+  // What httplib answers itself (no route, a body past the limit, a request it cannot read) in the error body the
+  // API's clients read, as the handlers' own errors are: Anthropic's on its paths, OpenAI's elsewhere.  A response
+  // that already has a body (a handler's error) is left as it is.
+  http.set_error_handler([](const httplib::Request& req, httplib::Response& res) {
+    if (!res.body.empty()) return httplib::Server::HandlerResponse::Unhandled;
+    std::string message;
+    const char* type = "invalid_request_error";
+    switch (res.status) {
+      case 404: message = "no such endpoint: " + req.method + " " + req.path, type = "not_found_error"; break;
+      case 405: message = req.method + " is not allowed on " + req.path; break;
+      case 413:
+        message = "request body larger than " + std::to_string(flyx::apps::kHttpMaxPayloadBytes >> 20) + " MiB";
+        type = "request_too_large";
+        break;
+      case 414: message = "request line too long"; break;
+      case 431: message = "request headers too large"; break;
+      default:
+        message = res.status < 500 ? "malformed HTTP request (a POST needs a Content-Length or a chunked body)"
+                                   : "internal server error";
+        if (res.status >= 500) type = "api_error";
+    }
+    if (req.path.rfind("/v1/messages", 0) == 0) flyx::server::send_anthropic_error(res, res.status, message, type);
+    else flyx::server::send_openai_error(res, res.status, message, type);
+    return httplib::Server::HandlerResponse::Handled;
+  });
   http.set_read_timeout(flyx::apps::kHttpReadTimeoutSec, 0);
   http.set_write_timeout(flyx::apps::kHttpTimeoutSec, 0);
   http.set_pre_routing_handler([&srv](const httplib::Request& req, httplib::Response& res) {

@@ -119,6 +119,12 @@ if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
                       $<$<COMPILE_LANGUAGE:CXX>:-Wno-unused-parameter>)
 endif()
 
+# cpp-httplib takes a body sent as application/x-www-form-urlencoded (curl -d's default) up to 8 KiB unless told
+# otherwise, and answers past it with 413 before any handler runs.  Every body the server takes is JSON, whatever
+# type the client names, so one limit holds for all: apps/common/defaults.h kHttpMaxPayloadBytes (asserted equal in
+# apps/flyx-server/main.cpp).  Every target here that reads httplib.h is built with it.
+add_compile_definitions(CPPHTTPLIB_FORM_URL_ENCODED_PAYLOAD_MAX_LENGTH=67108864)
+
 # ---- third party ------------------------------------------------------------------
 add_library(flyx_utf8proc STATIC third_party/utf8proc/utf8proc.c)
 target_compile_definitions(flyx_utf8proc PUBLIC UTF8PROC_STATIC)

@@ -180,6 +180,38 @@ def check_statuses(url):
     alive(cl, "schemas no grammar is made from")
 
 
+def check_error_bodies(url):
+    """What httplib answers itself (a 404 for no route, as every status it gives) comes with the API's JSON error body,
+    Anthropic's on its paths; a body sent as a form (curl -d's default type) takes the limit a JSON one does, not 8 KiB."""
+    cl, port = Client(url, None), port_of(url)
+    crlf = b"\r\n"
+    host = b"Host: 127.0.0.1:%d" % port + crlf
+    close = b"Connection: close" + crlf
+
+    def error_of(reply):
+        head, _, body = reply.partition(crlf + crlf)
+        assert b"application/json" in head, reply[:300]
+        return json.loads(body)
+
+    for target, status in ((b"GET /v1/nope", 404), (b"GET /v1/chat/completions", 404)):
+        reply, how = exchange(port, target + b" HTTP/1.1" + crlf + host + close + crlf)
+        assert status_of(reply) == status, (target, how, reply[:200])
+        e = error_of(reply)["error"]
+        assert e["message"] and e["type"], (target, e)
+    reply, _ = exchange(port, b"GET /v1/messages/nope HTTP/1.1" + crlf + host + close + crlf)
+    e = error_of(reply)
+    assert status_of(reply) == 404 and e["type"] == "error" and e["error"]["type"] == "not_found_error", e
+    # A request past 8 KiB named as a form: answered as the JSON it is.
+    body = json.dumps({"messages": [{"role": "user", "content": "x " * 6000}], "max_tokens": 2}).encode()
+    head = (b"POST /v1/chat/completions HTTP/1.1" + crlf + host + close +
+            b"Content-Type: application/x-www-form-urlencoded" + crlf + b"Content-Length: %d" % len(body) + crlf + crlf)
+    reply, how = exchange(port, head + body, wait=60)
+    assert status_of(reply) in (200, 400), (how, reply[:300])
+    if status_of(reply) == 400:  # longer than the test's context: refused for that, in words
+        assert "context" in error_of(reply)["error"]["message"], reply[:300]
+    alive(cl, "errors httplib answers")
+
+
 def call(cl, method, path, headers, body=None):
     """One request, its answer's status, headers and body (the pages of a browser are played by their headers)."""
     c = cl._conn()
@@ -299,7 +331,8 @@ def check_cors_flag():
     assert b"--cors '*' without --api-key" in said, said[-400:]
 
 
-CHECKS = [check_depth, check_limits, check_workers_and_port, check_browser, check_statuses, check_cors]
+CHECKS = [check_depth, check_limits, check_workers_and_port, check_browser, check_statuses, check_error_bodies,
+          check_cors]
 
 
 def check_all(url):
