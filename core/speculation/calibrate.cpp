@@ -3,6 +3,7 @@
 
 #include <algorithm>
 #include <cstdio>
+#include <memory>
 
 #include "core/os/log.h"
 #include "core/os/os.h"
@@ -144,6 +145,56 @@ bool costs_plausible(const std::vector<double>& at_short, const std::vector<doub
         at_long[plain] > at_long[i] * (1 + tolerance))
       return false;
   return true;
+}
+
+double time_batch(const flyx_backend_api* api, flyx_bmodel* bm, flyx_plan* prefill, int chunk,
+                  const std::vector<int32_t>& prompt, flyx_plan* round, int n) {
+  if (n < 2 || !api->launch_batch) return 0;
+  std::vector<std::unique_ptr<Scratch>> scratch;
+  std::vector<flyx_seq*> seqs;
+  flyx_gen_params g{};
+  g.limit = 0;
+  for (int i = 0; i < n; ++i) {
+    scratch.push_back(std::make_unique<Scratch>(api, bm, prefill, chunk, prompt));
+    if (!scratch.back()->seq()) return 0;
+    seqs.push_back(scratch.back()->seq());
+  }
+  const std::vector<flyx_plan*> plans(size_t(n), round);
+  const std::vector<const flyx_gen_params*> gens(size_t(n), &g);
+  flyx_round_result r{};
+  // The batches in flight read back: every sequence's round of the oldest.
+  auto read_one = [&] {
+    bool ok = true;
+    for (flyx_seq* s : seqs) ok = api->read(s, &r) == 0 && ok;
+    return ok;
+  };
+  // As time_rounds' rounds: one batch untimed (its graph captured), then three timed, two in flight; twice, the
+  // faster kept.
+  const int warm = 1, timed = 3;
+  double best = 0;
+  for (int rep = 0; rep < 2; ++rep) {
+    for (auto& sc : scratch)
+      if (!sc->start(g)) return 0;
+    double t0 = 0;
+    int in_flight = 0;
+    for (int k = 0; k < warm + timed; ++k) {
+      if (k == warm) {
+        for (; in_flight > 0; --in_flight)
+          if (!read_one()) return 0;
+        t0 = os::now_ms();
+      }
+      if (api->launch_batch(plans.data(), seqs.data(), gens.data(), n) != 0) return 0;
+      if (++in_flight == FLYX_MAX_IN_FLIGHT) {
+        if (!read_one()) return 0;
+        --in_flight;
+      }
+    }
+    for (; in_flight > 0; --in_flight)
+      if (!read_one()) return 0;
+    const double t = (os::now_ms() - t0) / timed;
+    if (rep == 0 || t < best) best = t;
+  }
+  return best;
 }
 
 void warm_rounds(const flyx_backend_api* api, flyx_bmodel* bm, flyx_plan* prefill,

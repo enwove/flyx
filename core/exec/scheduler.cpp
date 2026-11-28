@@ -197,7 +197,7 @@ bool Scheduler::load(std::string* err) {
     engine_ = std::move(e);
   }
   batch_cost_.build(engine_->widths(), engine_->round_drafters(), engine_->round_ms(), engine_->lookup_widths(),
-                    engine_->lookup_ms());
+                    engine_->lookup_ms(), engine_->batch_session_ms());
   if (max_sessions_ < wanted)
     log::info("flyx: %d sessions %s, %d fit in memory (%s of the GPU's each): using %d", wanted,
               opt_.max_sessions > 0 ? "requested" : "by default", max_sessions_, gb(engine_->session_bytes()).c_str(),

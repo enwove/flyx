@@ -251,6 +251,10 @@ class Engine {
     return std::clamp(widest, FLYX_MAX_ROWS, FLYX_MAX_WIDE_ROWS);
   }
   const std::vector<double>& lookup_ms() const { return lookup_ms_; }
+  // What each session past the first adds to a round of several (ms; its own mixers, attention, accept and commit):
+  // plain rounds of a few scratch sessions together, timed at load against one session's round of as many rows; 0
+  // where the engine was loaded for one session.
+  double batch_session_ms() const { return batch_session_ms_; }
   flyx_plan* lookup_plan(size_t i) const { return plans_.given[i]; }
   // Rounds that verify a tree of given drafts (gen.parents), where the backend has them; empty: none.
   const std::vector<int>& tree_widths() const { return plans_.tree_widths; }
@@ -314,6 +318,7 @@ class Engine {
  private:
   bool load_backend(std::string* err);
   bool build_and_calibrate_plans(double* t_plans, double* t_rounds, std::string* err);
+  void time_batches(const std::vector<int32_t>& prompt);
   // The plans lowered and their rounds timed (build_and_calibrate_plans), again after each step of what the backend
   // keeps only to run faster (a second copy of the head: the same output, slower; e.g. an 8 GB card beside a desktop)
   // is given back, where lowering finds no room for the prefill buffers; the time over every pass in lower_ms_ and
@@ -344,6 +349,8 @@ class Engine {
   std::vector<LoadAdjustment> load_adjustments_;  // automatic VRAM adjustments applied during load()
   std::vector<double> round_ms_;            // measured cost of each round plan (core/speculation)
   std::vector<double> lookup_ms_;           // measured cost of each lookup plan (core/speculation)
+  double batch_session_ms_ = 0;             // batch_session_ms()
+  int session_limit_ = 1;                   // load()'s: the sessions the engine may run at once
   std::vector<double> round_ms_per_token_;  // ... more for every token of context past round_ms_at_
   mutable SharedTokens round_tokens_;
   mutable RoundCosts round_costs_, lookup_costs_;  // round_costs(), lookup_costs()

@@ -24,8 +24,9 @@ const RoundCandidate& preferred_of(const std::vector<RoundCandidate>& cands) {
 
 void BatchCostModel::build(const std::vector<int>& widths, const std::vector<int>& drafters,
                            const std::vector<double>& round_ms, const std::vector<int>& lookup_widths,
-                           const std::vector<double>& lookup_ms) {
+                           const std::vector<double>& lookup_ms, double session_ms) {
   knots_.clear();
+  session_ms_ = std::max(0.0, session_ms);
   double plain_ms = 0.0;
   for (size_t i = 0; i < widths.size() && i < drafters.size() && i < round_ms.size(); ++i)
     if (drafters[i] < 0 && widths[i] == 0 && round_ms[i] > 0.0) {
@@ -78,11 +79,14 @@ void BatchCostModel::build(const std::vector<int>& widths, const std::vector<int
 double BatchCostModel::target_ms(int rows) const {
   if (knots_.empty()) return 1.0;
   if (rows <= knots_.front().rows || knots_.size() == 1) return std::max(kMinMs, knots_.front().ms);
+  auto tiles = [](int r) { return (r + FLYX_MAX_ROWS - 1) / FLYX_MAX_ROWS; };
   for (size_t i = 1; i < knots_.size(); ++i) {
     if (rows <= knots_[i].rows) {
       const Knot& a = knots_[i - 1];
       const Knot& b = knots_[i];
-      const double t = static_cast<double>(rows - a.rows) / static_cast<double>(b.rows - a.rows);
+      const bool by_tiles = rows > FLYX_MAX_ROWS && tiles(b.rows) > tiles(a.rows);
+      const double t = by_tiles ? static_cast<double>(tiles(rows) - tiles(a.rows)) / (tiles(b.rows) - tiles(a.rows))
+                                : static_cast<double>(rows - a.rows) / static_cast<double>(b.rows - a.rows);
       return std::max(kMinMs, a.ms + t * (b.ms - a.ms));
     }
   }
@@ -93,10 +97,7 @@ double BatchCostModel::target_ms(int rows) const {
 }
 
 double BatchCostModel::batch_ms(int rows, int n_sessions, double draft_ms) const {
-  // target_ms() includes one session's per-sequence mixers (GDN/attention/commit); each additional
-  // session sharing the batch runs its own (kExtraSessionShare of a 1-row pass).
-  const double extra_sessions =
-      n_sessions > 1 ? kExtraSessionShare * target_ms(1) * static_cast<double>(n_sessions - 1) : 0.0;
+  const double extra_sessions = n_sessions > 1 ? session_ms_ * static_cast<double>(n_sessions - 1) : 0.0;
   return std::max(kMinMs, target_ms(rows) + extra_sessions + draft_ms);
 }
 

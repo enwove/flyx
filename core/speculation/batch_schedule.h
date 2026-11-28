@@ -20,28 +20,29 @@
 
 namespace flyx {
 
-// Calibrated cost of a shared batch: target_ms(total_rows) + extra_sessions + shared_draft_ms(items).
+// Calibrated cost of a shared batch: target_ms(total_rows) + session_ms per session past the first +
+// shared_draft_ms(items).
 class BatchCostModel {
  public:
   // Marginal fraction of a session's solo draft cost paid by additional sessions sharing the same drafter
   // in a batch: lockstep MTP and EAGLE-4 and grouped DFlash2 read drafter weights and the draft heads once across
   // concurrent sessions, leaving per-session mixer/attention/table overhead beyond the widest member.
   static constexpr double kSharedDraftShare = 0.15;
-  // Fraction of a 1-row pass each session past the first adds to a batch (its own GDN/attention mixers, accept and
-  // commit): Qwen3.8-27B BF16 on an RTX PRO 6000, 8 sessions decoding plainly in one batch of 8 rows cost 45.6 ms
-  // against 37.5 for a round of 8 rows of one session (1.16 ms each past the first, 3.2% of the 35.8 ms 1-row pass).
-  static constexpr double kExtraSessionShare = 0.035;
 
-  // Builds the cost model from the engine's calibrated round and lookup timings.
+  // Builds the cost model from the engine's calibrated round and lookup timings and what each session past the first
+  // adds to a round of several (`session_ms`: its own mixers, attention, accept and commit; Engine::batch_session_ms,
+  // timed at load).
   void build(const std::vector<int>& widths, const std::vector<int>& drafters, const std::vector<double>& round_ms,
-             const std::vector<int>& lookup_widths, const std::vector<double>& lookup_ms);
+             const std::vector<int>& lookup_widths, const std::vector<double>& lookup_ms, double session_ms);
   bool ready() const { return !knots_.empty(); }
 
-  // Target-only verification time (ms) for `rows` rows (1..FLYX_MAX_WIDE_ROWS, as wide as the lookup rounds timed),
-  // piecewise-linearly interpolated from the calibrated plain and lookup timings.
+  // Target-only verification time (ms) for `rows` rows (1..FLYX_MAX_WIDE_ROWS, as wide as the lookup rounds timed)
+  // from the calibrated plain and lookup timings: up to FLYX_MAX_ROWS rows interpolated by the rows, past them by the
+  // round's tiles of FLYX_MAX_ROWS rows (such a round runs a tile at a time, each the bits of a round that wide: 17 rows
+  // cost what 32 do).
   double target_ms(int rows) const;
-  // Total shared-batch time (ms) for `n_sessions` sharing `rows` rows plus their `draft_ms`:
-  // includes per-session mixer/state overhead beyond the single session already in target_ms().
+  // Total shared-batch time (ms) for `n_sessions` sharing `rows` rows plus their `draft_ms`: target_ms() holds one
+  // session's own work, each other session adds session_ms.
   double batch_ms(int rows, int n_sessions, double draft_ms) const;
   // Marginal drafting time (ms) of candidate `c` beyond target verification.
   double draft_ms(const RoundCandidate& c) const;
@@ -55,6 +56,7 @@ class BatchCostModel {
     double ms = 1.0;
   };
   std::vector<Knot> knots_;
+  double session_ms_ = 0.0;
 };
 
 struct ScheduledRound {

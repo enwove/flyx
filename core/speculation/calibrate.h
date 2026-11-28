@@ -38,6 +38,12 @@ void time_rounds(const flyx_backend_api* api, flyx_bmodel* bm, flyx_plan* prefil
 bool costs_plausible(const std::vector<double>& at_short, const std::vector<double>& at_long, size_t plain,
                      double tolerance = 0.02);
 
+// Milliseconds per round of `n` sequences running `round` together (launch_batch), each a scratch sequence at the end
+// of `prompt` as time_rounds' is: three batches timed after an untimed one, two in flight, twice, the faster kept.  0
+// where a sequence cannot be made or the backend refuses the batch.
+double time_batch(const flyx_backend_api* api, flyx_bmodel* bm, flyx_plan* prefill, int chunk,
+                  const std::vector<int32_t>& prompt, flyx_plan* round, int n);
+
 // Each of `rounds` once on a scratch sequence that first prefills `prompt`, untimed: a kernel's first launch loads its
 // module (CUDA loads them as first used), which would otherwise wait in a request's first rounds.
 void warm_rounds(const flyx_backend_api* api, flyx_bmodel* bm, flyx_plan* prefill,
