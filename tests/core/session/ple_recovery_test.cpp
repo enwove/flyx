@@ -79,6 +79,43 @@ void budget_boundaries() {
   check(!cuda::ple_fits_gpu(UINT64_MAX, UINT64_MAX, 1, UINT64_MAX, 2), "oversized K/V does not wrap");
 }
 
+bool batch_recovery(Engine& engine, bool cuda_backend, std::string* err) {
+  Session healthy(&engine), faulted(&engine), reference(&engine);
+  for (Session* s : {&healthy, &faulted, &reference})
+    if (!s->init(err)) return false;
+  const int32_t prompt[] = {42, 43, 44};
+  flyx_gen_params gen{};
+  auto* plan = engine.round_plan(0);
+  flyx_round_result result{};
+  for (Session* s : {&healthy, &reference}) {
+    if (backend->prefill(engine.prefill_plan(), s->seq(), prompt, 3, &gen) ||
+        backend->read(s->seq(), &result)) return *err = backend->last_error(), false;
+  }
+  fail_next = true;
+  const bool fault = backend->prefill(engine.prefill_plan(), faulted.seq(), prompt, 3, &gen) != 0;
+  check(fault && !fail_next, "second sequence experienced a real disk fault");
+  flyx_plan* plans[] = {plan, plan};
+  flyx_seq* seqs[] = {healthy.seq(), faulted.seq()};
+  const flyx_gen_params* gens[] = {&gen, &gen};
+  // cpu_ref completes reads synchronously. Exercise the CUDA fallback with the same live CPU
+  // sequences and known failure; on CUDA the host callback owns the actual sticky error.
+  int rc = cuda_backend ? backend->launch_batch(plans, seqs, gens, 2) :
+      cuda::launch_serial_batch(2, [&](int i) { return i == 1 && fault ? -1 : 0; },
+                                [&](int i) { return backend->launch(plans[i], seqs[i], gens[i]); });
+  check(rc != 0, "latched error rejects the two-sequence batch");
+  check(backend->read(healthy.seq(), &result) != 0, "batch rejection queued no round on the healthy sequence");
+  for (int round = 0; round < 6; ++round) {
+    flyx_round_result expected{};
+    for (auto* seq : {healthy.seq(), reference.seq()})
+      if (backend->launch(plan, seq, &gen)) return *err = backend->last_error(), false;
+    if (backend->read(healthy.seq(), &result) || backend->read(reference.seq(), &expected))
+      return *err = backend->last_error(), false;
+    check(result.position == expected.position && result.n_tokens == 1 && result.tokens[0] == expected.tokens[0],
+          "individual retry matches the control sequence");
+  }
+  return true;
+}
+
 bool session_recovery(const char* file, const char* backend_name, std::string* err) {
   EngineOptions options;
   options.backend = backend_name;
@@ -125,7 +162,7 @@ bool session_recovery(const char* file, const char* backend_name, std::string* e
   if (run(session, recovered) || run(fresh, expected)) return false;
   check(session.seq() == original_seq && recovered.size() == 6 && recovered == expected,
         "a subsequent request on the original sequence matches a fresh session");
-  return true;
+  return batch_recovery(engine, std::string(backend_name) == "cuda", err);
 }
 }  // namespace
 

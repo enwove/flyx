@@ -342,7 +342,6 @@ void set_drafts(flyx_seq* s, const flyx_gen_params* g) {
   int len = s->test_oracle_len;
   if (given) {
     const int n = std::min(g->n_drafts, s->m->wide_rows - 1);
-    if (g->drafts_at < 0 || g->drafts_at + n > s->oracle_cap) throw std::runtime_error("drafts outside the context");
     std::memcpy(slot, g->drafts, sizeof(int) * size_t(n));
     CK(cudaMemcpyAsync(s->oracle + g->drafts_at, slot, sizeof(int) * size_t(n), cudaMemcpyHostToDevice, s->st));
     len = g->drafts_at + n;
@@ -388,7 +387,6 @@ void set_tree(flyx_seq* s, const flyx_plan* p, const flyx_gen_params* g) {
   for (int r = 1; r < rows; ++r) {
     const int i = r - 1;  // the row's draft
     const int parent = g->parents && g->drafts && i < g->n_drafts ? g->parents[i] + 1 : r - 1;
-    if (parent < 0 || parent >= r) throw std::runtime_error("tree: a draft's parent must come before it");
     t->depth[r] = t->depth[parent] + 1;
     for (int d = 0; d < t->depth[parent] + 1; ++d) t->path[r][d] = t->path[parent][d];
     t->path[r][t->depth[r]] = static_cast<unsigned char>(r);
@@ -1566,17 +1564,33 @@ GraphSize round_graph_size(flyx_plan* p, flyx_seq* s) {
   }
 }
 
-int launch(flyx_plan* p, flyx_seq* s, const flyx_gen_params* g) {
+static int validate_round(flyx_plan* p, flyx_seq* s, const flyx_gen_params* g) {
   if (!s) return no_sequence("launch");
+  if (!p || !g || p->m != s->m) return fail("launch: missing inputs or plan belongs to another model");
   if (p->phase != FLYX_PHASE_ROUND) return fail("not a round plan");
   const int rows = p->width + 1;
   // A wide round's strata attention goes 16 rows at a time as a chain's rows (shift_params): a tree's rows past 16
   // read every position exactly.
   if (rows > FLYX_MAX_ROWS && p->tree && s->strata_phase(rows) != kStrataNone)
     return fail("a tree round of more than " + std::to_string(FLYX_MAX_ROWS) + " rows reads no strata copy");
-  s->snap_pos = -1;  // rounds write the round slots
+  if (g->drafts && g->n_drafts > 0) {
+    const int n = std::min(g->n_drafts, s->m->wide_rows - 1);
+    if (g->drafts_at < 0 || g->drafts_at > s->oracle_cap - n) return fail("drafts outside the context");
+    if (p->tree && !p->drafted_tree && g->parents)
+      for (int i = 0; i < std::min(g->n_drafts, p->width); ++i)
+        if (g->parents[i] < -1 || g->parents[i] >= i) return fail("tree: a draft's parent must come before it");
+  }
   return guarded([&] {
     check_ple_io(s);
+    return 0;
+  });
+}
+
+// A callback that fails after preflight is observed by ready/read, including when more
+// than one valid round has already been submitted. Do not recheck the latch mid-batch.
+static int submit_round(flyx_plan* p, flyx_seq* s, const flyx_gen_params* g) {
+  s->snap_pos = -1;  // rounds write the round slots
+  return guarded([&] {
     // Hold prefill_mu across submission when sharing the VMM prefill slab so another session cannot evict
     // prefill_owner before this round's work is queued on s->st (lock order: prefill_mu before batch->mu).
     const bool shared = s->uses_shared_prefill();
@@ -1676,6 +1690,11 @@ int launch(flyx_plan* p, flyx_seq* s, const flyx_gen_params* g) {
   });
 }
 
+int launch(flyx_plan* p, flyx_seq* s, const flyx_gen_params* g) {
+  if (const int rc = validate_round(p, s, g)) return rc;
+  return submit_round(p, s, g);
+}
+
 // ---- rounds of several sequences ---------------------------------------------------------------------
 namespace {
 
@@ -1723,24 +1742,24 @@ RowView slice(const RowView& v, const flyx_bmodel* m, int first) {
 int launch_batch(flyx_plan* const* plans, flyx_seq* const* seqs, const flyx_gen_params* const* gens,
                  int32_t n) {
   if (n < 1) return fail("launch_batch: no sequences");
-  for (int i = 0; i < n; ++i)
-    if (!seqs[i]) return no_sequence("launch_batch");
+  if (!plans || !seqs || !gens) return fail("launch_batch: missing inputs");
   if (n == 1) return launch(plans[0], seqs[0], gens[0]);
+  if (!seqs[0]) return no_sequence("launch_batch");
   flyx_bmodel* m = seqs[0]->m;
-  if (m->need.max_bank > 0 || m->need.hc_streams > 0 || m->dspark_block >= 0) {
-    for (int i = 0; i < n; ++i)
-      if (const int r = launch(plans[i], seqs[i], gens[i]); r != 0) return r;
-    return 0;
-  }
+  auto validate = [&](int i) {
+    if (!seqs[i] || seqs[i]->m != m) return fail("launch_batch: sequences of different models");
+    for (int j = 0; j < i; ++j)
+      if (seqs[j] == seqs[i]) return fail("launch_batch: a sequence twice");
+    return validate_round(plans[i], seqs[i], gens[i]);
+  };
+  if (m->need.max_bank > 0 || m->need.hc_streams > 0 || m->dspark_block >= 0)
+    return launch_serial_batch(n, validate, [&](int i) { return submit_round(plans[i], seqs[i], gens[i]); });
   int rows = 0;
   for (int i = 0; i < n; ++i) {
-    if (plans[i]->phase != FLYX_PHASE_ROUND || plans[i]->m != m || seqs[i]->m != m)
-      return fail("launch_batch: round plans of the sequences' model");
+    if (const int rc = validate(i)) return rc;
     if (!same_target(plans[0], plans[i])) return fail("launch_batch: plans that run different target nodes");
     if (plans[i]->tree || plans[i]->adaptive() || relaxed(gens[i]))
       return fail("launch_batch: tree, adaptive, and relaxed rounds run alone");
-    for (int j = 0; j < i; ++j)
-      if (seqs[j] == seqs[i]) return fail("launch_batch: a sequence twice");
     rows += plans[i]->width + 1;
   }
   if (rows > FLYX_MAX_ROWS) return fail("launch_batch: more than FLYX_MAX_ROWS rows");
