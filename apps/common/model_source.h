@@ -86,8 +86,10 @@ bool fetch_lora_in(const hub::Repo& repo, const std::string& spec, const std::st
 // "eagle4"; "" when they say none): a GGUF's header (general.architecture "dflash", or MTP layers), a drafter
 // directory's config.json, a .flyx file's "draft".  The file is not mapped; no name is read for it.
 std::string drafter_kind(const std::string& path, const PathAllowFn& allow_path = {});
-// The same of a Hub repository, from what the Hub says (its config's architecture, its GGUFs' architecture).
-std::string drafter_kind(const hub::Repo& r);
+// The same of what a Hub name selects in `r`: a drafter repository's, as its config says (its architecture); a GGUF's,
+// as its header says once the whole file is in the cache, else "" (never from its name): a GGUF of architecture dflash
+// is a DFlash2 or a DSpark drafter by its own header alone, so the repository's architecture names neither.
+std::string drafter_kind(const hub::Repo& r, const hub::Name& name, const PathAllowFn& allow_path = {});
 
 // Whether `eo` drafts with the MTP layer when the model has one (not --no-spec, not --drafter dflash2 or none).
 bool wants_mtp(const EngineOptions& eo);

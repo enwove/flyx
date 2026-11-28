@@ -556,9 +556,14 @@ std::string drafter_kind(const std::string& path, const PathAllowFn& allow_path)
   return flyx::drafter_source_kind(path, allow_path);
 }
 
-std::string drafter_kind(const hub::Repo& r) {
+std::string drafter_kind(const hub::Repo& r, const hub::Name& name, const PathAllowFn& allow_path) {
   if (hub::is_drafter(r)) return hub::drafter_kind(r);
-  return r.info.gguf_architecture == "dflash" ? "dflash2" : "";
+  std::vector<hub::RepoFile> files;
+  std::string err;
+  if (!hub::select(r, name, &files, &err) || files.empty()) return "";
+  for (const HubGguf& g : hub_ggufs(r, allow_path))
+    if (g.choice.file.path == files.front().path) return g.cached ? drafter_kind(g.disk, allow_path) : "";
+  return "";
 }
 
 bool reads_vision(const std::string& arch) {

@@ -614,7 +614,7 @@ void add_manage_routes(httplib::Server& http, Server* s) {
       hub::HubOutcome out;
       std::string err;
       if (!hub::describe(hn.repo, hn.revision, &repo, &err, &out, allow)) return hub_error(r, out, err);
-      kind = apps::drafter_kind(repo);
+      kind = apps::drafter_kind(repo, hn, allow);
     } else {
       return error(r, 400, "name: a drafter's path or Hugging Face name", "invalid_request_error");
     }

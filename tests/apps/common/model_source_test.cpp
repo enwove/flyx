@@ -179,10 +179,29 @@ int main() {
   auto listing = flyx::apps::hub_ggufs(generic);
   check(listing.size() == 1 && !listing[0].cached && listing[0].cls.kind == "drafter" &&
             listing[0].cls.drafter_kind.empty(), "uncached dflash GGUF is a selectable drafter of unknown type");
+  // What GET /v1/hub/drafter says of a name the dashboard was given: the selected file's own kind, unknown (the
+  // loader's auto) until its header is in the cache, never DFlash2 for the repository's architecture.
+  flyx::hub::Name generic_name;
+  check(flyx::hub::parse_name(generic.id, &generic_name) && flyx::apps::drafter_kind(generic, generic_name).empty(),
+        "a Hub name's uncached dflash GGUF is of unknown kind, not DFlash2 by its repository's architecture");
   write_gguf(to_path(flyx::hub::snapshot_dir(generic)) / "helper.gguf", "dflash", 1);
   listing = flyx::apps::hub_ggufs(generic);
   check(listing.size() == 1 && listing[0].cached && listing[0].cls.drafter_kind == "dspark",
         "cached selection uses the same file's Markov header");
+  check(flyx::apps::drafter_kind(generic, generic_name) == "dspark", "and so does the Hub name's kind once cached");
+  {
+    flyx::hub::Repo plain_dflash = generic;
+    plain_dflash.id = "acme/Generic-DFlash2";
+    flyx::hub::Name n;
+    write_gguf(to_path(flyx::hub::snapshot_dir(plain_dflash)) / "helper.gguf", "dflash", 0);
+    check(flyx::hub::parse_name(plain_dflash.id, &n) && flyx::apps::drafter_kind(plain_dflash, n) == "dflash2",
+          "a cached dflash GGUF without the Markov flag is DFlash2's");
+    flyx::hub::Repo named = generic;
+    named.id = "acme/Named-DSpark";
+    named.files = {{"dspark-Ink-Q8_0.gguf", 0, "", ""}};
+    check(flyx::hub::parse_name(named.id, &n) && flyx::apps::drafter_kind(named, n).empty(),
+          "an uncached dspark-*.gguf is of unknown kind too: no kind from a name");
+  }
   // A LoRA adapter of a repository listed as the Hub lists it (fetch_lora_in), its files' blobs standing in for the
   // transfers as above: a config longer than a load reads (modelfile::kPeftConfigMaxBytes) is refused by its listed
   // size before either file is fetched, the weights' blob there to be taken; one within it comes with its weights.
