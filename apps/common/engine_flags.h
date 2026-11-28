@@ -8,13 +8,13 @@
 #include <optional>
 #include <string>
 
+#include "apps/common/chat_options.h"
 #include "core/exec/engine.h"
 #include "core/exec/generation.h"
-#include "core/interfaces/chat.h"
 
 namespace flyx::apps {
 
-interfaces::ChatOptions chat_template_kwargs_flag(const std::string& value);
+interfaces::ojson chat_template_kwargs_flag(const std::string& value);
 
 // Sampling flag overrides given on the command line (only present fields overwrite a target SamplingParams).
 struct SamplingOverrides {

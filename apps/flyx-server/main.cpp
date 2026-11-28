@@ -249,7 +249,7 @@ ServeArgs parse_args(int argc, char** argv) {
       a.model = f;
     }
   }
-  if (no_think) a.cfg.chat_defaults.enable_thinking = false;
+  if (no_think) a.cfg.chat_defaults["enable_thinking"] = false;
   sampling_overrides.apply(&a.cfg.think_defaults);
   sampling_overrides.apply(&a.cfg.plain_defaults);
   if (a.no_auth && !a.cfg.api_key.empty()) bad_usage("--no-auth cannot be combined with --api-key");

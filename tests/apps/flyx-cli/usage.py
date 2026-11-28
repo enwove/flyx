@@ -43,7 +43,7 @@ for args, says in [(("run", model, "-p", "hello", "--frobnicate"), "unknown opti
     assert err.count("\n") <= 2, (args, err)  # what is wrong, not the usage it would be lost in
 
 for cmd in ("run", "chat", "template", "serve"):
-    for value in ("{", "[]", '"text"', "1", "null", '{"enable_thinking":"false"}'):
+    for value in ("", "{", "{} trailing", "[]", '"text"', "1", "null", '{"enable_thinking":"false"}'):
         rc, out, err = run(cmd, model, "--chat-template-kwargs", value)
         assert rc == 2 and "--chat-template-kwargs" in err and not out, (cmd, value, rc, out, err)
         assert ("JSON object" if "enable_thinking" not in value else "true or false") in err, err

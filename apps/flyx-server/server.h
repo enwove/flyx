@@ -21,7 +21,7 @@
 namespace flyx::server {
 
 struct Config {
-  ChatOptions chat_defaults;
+  ojson chat_defaults = ojson::object();
   // Qwen3.5's recommended settings (its model card): with thinking, the ones
   // for precise coding (no penalty); without, the general ones, which come
   // with a presence penalty of 1.5.

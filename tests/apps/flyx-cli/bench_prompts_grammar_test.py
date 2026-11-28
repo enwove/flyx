@@ -10,12 +10,15 @@ from __future__ import annotations
 
 import json
 import os
+from pathlib import Path
 import subprocess
 import sys
 import tempfile
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", "common"))
 from check import check, finish  # noqa: E402
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "flyx-server"))
+from chat_template_kwargs import check_inkling_effort  # noqa: E402
 
 FLYX, MODEL = sys.argv[1:3]
 OPENER = "<|message_model|><|content_text|>"
@@ -28,13 +31,8 @@ def flyx(*args):
 markers = [int(token) for token in flyx("tokenize", MODEL, OPENER).stdout.split()]
 check(len(markers) == 2, "the opener is two control tokens of the model", markers)
 
-# This format enforces thinking off with a grammar even without a schema or tools.
-r = flyx("run", MODEL, "--chat", "-p", "hello", "--backend", "cpu_ref", "-n", "2",
-         "--chat-template-kwargs", '{"enable_thinking":false}')
-check(r.returncode == 0 and r.stdout == OPENER, "startup kwargs select the no-thinking reply grammar", (r.stdout, r.stderr))
-
-
 with tempfile.TemporaryDirectory() as tmp:
+    check_inkling_effort(Path(FLYX), Path(MODEL), Path(tmp))
     prompt_set = os.path.join(tmp, "set.jsonl")
     with open(prompt_set, "w", encoding="utf8") as f:
         f.write(json.dumps({"question": "hello"}) + "\n")

@@ -100,7 +100,7 @@ bool read_request(Server* s, const ojson& body, Request* in, std::string* err) {
                  "it)\n");
   if (!rules_from_anthropic(body, in->tools, &in->rules, err)) return false;
   if (in->rules.tools == ReplyRules::kNone) in->tools.clear();  // as if none were offered
-  in->chat_options = s->cfg.chat_defaults;
+  ojson request_kwargs = ojson::object();
   if (const auto t_it = body.find("thinking"); t_it != body.end() && !t_it->is_null()) {
     if (!t_it->is_object()) return *err = "thinking must be an object", false;
     std::string t = "enabled";
@@ -108,7 +108,7 @@ bool read_request(Server* s, const ojson& body, Request* in, std::string* err) {
       if (!ty->is_string()) return *err = "thinking.type must be a string", false;
       t = ty->get<std::string>();
     }
-    in->chat_options.enable_thinking = t != "disabled";
+    request_kwargs["enable_thinking"] = t != "disabled";
   }
   if (const auto oc = body.find("output_config"); oc != body.end() && oc->is_object()) {
     if (const auto ef = oc->find("effort"); ef != oc->end() && !ef->is_null()) {
@@ -116,10 +116,10 @@ bool read_request(Server* s, const ojson& body, Request* in, std::string* err) {
       const std::string effort = ef->get<std::string>();
       if (effort != "low" && effort != "medium" && effort != "high" && effort != "max")
         return *err = "output_config.effort must be low, medium, high, or max", false;
-      in->chat_options.kwargs["reasoning_effort"] = effort;
+      request_kwargs["reasoning_effort"] = effort;
     }
   }
-  if (!read_chat_template_kwargs(body, &in->chat_options, err)) return false;
+  if (!read_chat_options(body, s->cfg.chat_defaults, request_kwargs, &in->chat_options, err)) return false;
   if (!read_optional_token_limit(body, "max_tokens", true, &in->gen.prefill_only, &in->gen.max_new_tokens, err))
     return false;
   if (body.contains("stop_sequences") && !read_stop(body["stop_sequences"], &in->gen.stop, err)) return false;

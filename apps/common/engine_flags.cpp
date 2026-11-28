@@ -6,21 +6,20 @@
 #include <cstdio>
 #include <cstdlib>
 
-#include "apps/common/chat_options.h"
 #include "apps/common/defaults.h"
 #include "apps/common/numbers.h"
 #include "core/interfaces/options.h"
 
 namespace flyx::apps {
 
-interfaces::ChatOptions chat_template_kwargs_flag(const std::string& value) {
-  interfaces::ChatOptions options;
+interfaces::ojson chat_template_kwargs_flag(const std::string& value) {
+  auto kwargs = interfaces::parse_json(value);
   std::string err;
-  if (!merge_chat_kwargs(interfaces::parse_json(value), &options, &err)) {
+  if (!valid_chat_kwargs(kwargs, &err)) {
     std::fprintf(stderr, "error: --chat-template-kwargs %s\n", err.c_str());
     std::exit(2);
   }
-  return options;
+  return kwargs;
 }
 
 void SamplingOverrides::apply(SamplingParams* sp) const {

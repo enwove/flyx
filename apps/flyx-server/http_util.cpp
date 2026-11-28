@@ -88,21 +88,24 @@ bool read_optional_string(const ojson& body, const char* key, std::string* value
   return true;
 }
 
-bool read_reasoning_effort(const ojson& v, const char* field, ojson* effort, ChatOptions* options, std::string* err) {
+bool read_reasoning_effort(const ojson& v, const char* field, ojson* effort, ojson* request_kwargs, std::string* err) {
   if (!v.is_string()) return *err = std::string(field) + " must be a string", false;
   const std::string s = v.get<std::string>();
   if (s != "none" && s != "minimal" && s != "low" && s != "medium" && s != "high" && s != "xhigh" && s != "max")
     return *err = std::string(field) + " must be none, minimal, low, medium, high, xhigh, or max", false;
   if (effort) *effort = s;
-  options->enable_thinking = s != "none";
-  options->kwargs["reasoning_effort"] = s;
+  (*request_kwargs)["enable_thinking"] = s != "none";
+  (*request_kwargs)["reasoning_effort"] = s;
   return true;
 }
 
-bool read_chat_template_kwargs(const ojson& body, ChatOptions* options, std::string* err) {
+bool read_chat_options(const ojson& body, const ojson& defaults, ojson& request_kwargs, ChatOptions* out, std::string* err) {
   const auto it = body.find("chat_template_kwargs");
-  if (it == body.end() || it->is_null()) return true;
-  if (!apps::merge_chat_kwargs(*it, options, err)) return *err = "chat_template_kwargs " + *err, false;
+  if (it != body.end() && !it->is_null()) {
+    if (!apps::valid_chat_kwargs(*it, err)) return *err = "chat_template_kwargs " + *err, false;
+    request_kwargs.update(*it);
+  }
+  *out = apps::resolve_chat_options(defaults, request_kwargs);
   return true;
 }
 

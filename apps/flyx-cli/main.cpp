@@ -142,6 +142,7 @@ Args parse(int argc, char** argv) {
   a.command.assign(argv, argv + argc);
   apps::SamplingOverrides sampling_overrides;
   bool no_think = false;
+  ojson chat_defaults = ojson::object();
   for (int i = 3; i < argc; ++i) {
     std::string s = argv[i];
     auto next = [&]() -> std::string {
@@ -160,7 +161,7 @@ Args parse(int argc, char** argv) {
     else if (s == "--chat-template-kwargs") {
       if (a.cmd != "run" && a.cmd != "chat" && a.cmd != "template")
         bad_usage("--chat-template-kwargs applies to run, chat and template");
-      a.chat_options = apps::chat_template_kwargs_flag(next());
+      chat_defaults = apps::chat_template_kwargs_flag(next());
     }
     else if (s == "-n") a.n = apps::whole_flag("-n", next(), 0, INT_MAX), a.n_given = true;
     else if (s == "--ignore-eos") a.ignore_eos = true;
@@ -178,7 +179,8 @@ Args parse(int argc, char** argv) {
     else bad_usage(!s.empty() && s[0] == '-' ? "unknown option " + s : "unexpected argument '" + s + "'");
   }
   sampling_overrides.apply(&a.sampling);
-  if (no_think) a.chat_options.enable_thinking = false;
+  if (no_think) chat_defaults["enable_thinking"] = false;
+  a.chat_options = apps::resolve_chat_options(chat_defaults, ojson::object());
   if (!a.images.empty() && a.cmd != "run") bad_usage("--image is only supported with 'flyx run'");
   return a;
 }
