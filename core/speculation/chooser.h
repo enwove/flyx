@@ -43,7 +43,7 @@ struct RoundChoice {
 
   // A parallel adaptive round pays for its full backbone even when it verifies a shorter chain.
   bool measures_fixed_cost(const interfaces::Model& model) const {
-    return !adaptive || !model.draft_steps_cheap(drafter);
+    return !adaptive || model.drafts_sequentially(drafter);
   }
 };
 

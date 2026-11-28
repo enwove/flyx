@@ -145,6 +145,7 @@ std::vector<int> Model::adaptive_checkpoints(int d) const {
   return cps.size() > 1 ? cps : std::vector<int>{};
 }
 
+bool Model::drafts_sequentially(int d) const { return drafter_traits(drafters_.at(size_t(d)).kind).sequential; }
 bool Model::draft_steps_cheap(int d) const { return drafter_traits(drafters_.at(size_t(d)).kind).refines_by_step; }
 
 int Model::block_drafts(int d) const {

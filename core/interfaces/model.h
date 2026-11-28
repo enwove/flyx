@@ -53,6 +53,8 @@ class Model {
   // Sorted verify checkpoints (subset of draft_widths(d)) for an intra-round
   // adaptive stopping plan on drafter d; empty disables adaptive plans for d.
   virtual std::vector<int> adaptive_checkpoints(int /*d*/) const { return {}; }
+  // A sequential drafter runs one step per draft, so stopping early saves the remaining steps.
+  virtual bool drafts_sequentially(int /*d*/) const { return false; }
   // Whether one more draft of drafter d costs little beside the verify row it adds (a block drafted at once and
   // refined a draft at a time): an adaptive round that stops may then verify fewer drafts than it has
   // (flyx_program::earlier_checkpoints).  Where a draft step is a pass of a layer, what is drafted is verified.
