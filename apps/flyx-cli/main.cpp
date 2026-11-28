@@ -31,6 +31,7 @@
 #include <vector>
 
 #include "apps/common/engine_flags.h"
+#include "apps/common/sampling_defaults.h"
 #include "apps/common/model_source.h"
 #include "apps/common/numbers.h"
 #include "apps/common/version.h"
@@ -70,6 +71,7 @@ struct Args {
   std::vector<std::string> images;   // run --image FILE (repeatable)
   std::vector<std::string> command;  // the command line, for a prompt set's record
   EngineOptions engine;     // the engine's options (apps/common/engine_flags.h)
+  apps::SamplingOverrides sampling_overrides;
   SamplingParams sampling;  // greedy unless --temperature
 };
 
@@ -95,7 +97,8 @@ constexpr int kPromptSetMaxNew = 512;
                "  -n N                 max new tokens (default 256; 0: the model's own limit if its file has one,\n"
                "                       else up to the end of the context)\n"
                "  --ignore-eos         do not stop at end-of-sequence tokens\n"
-               "  --temperature T, --top-p P, --top-k K, --seed S   sampling (default: greedy)\n"
+               "  --sampling-profile NAME  chat thinking preset: thinking (default) or thinking_coding\n"
+               "  --temperature T, --top-p P, --top-k K, --seed S   sampling (run/bench default: greedy, chat: model defaults)\n"
                "  --presence-penalty P, --frequency-penalty F       what a token already in the reply loses\n"
                "                       from its logit, once and per time it was chosen (default 0)\n"
                "  --accept-min-p P, --accept-typical E   relaxed acceptance of drafts (lossy: the output may differ\n"
@@ -141,7 +144,6 @@ Args parse(int argc, char** argv) {
   a.model = argv[2];
   if (asks_help(a.model)) usage(true);
   a.command.assign(argv, argv + argc);
-  apps::SamplingOverrides sampling_overrides;
   bool no_think = false;
   ojson chat_defaults = ojson::object();
   for (int i = 3; i < argc; ++i) {
@@ -166,7 +168,9 @@ Args parse(int argc, char** argv) {
     }
     else if (s == "-n") a.n = apps::whole_flag("-n", next(), 0, INT_MAX), a.n_given = true;
     else if (s == "--ignore-eos") a.ignore_eos = true;
-    else if (apps::sampling_flag(s, next, &sampling_overrides, true)) continue;
+    else if (s == "--sampling-profile" && a.cmd == "chat")
+      a.sampling_overrides.thinking_profile = apps::thinking_profile_flag(next());
+    else if (apps::sampling_flag(s, next, &a.sampling_overrides, true)) continue;
     else if (s == "-v") a.verbose = 1;
     else if (s == "--json") {
       a.json = true;
@@ -179,7 +183,7 @@ Args parse(int argc, char** argv) {
     else if (a.extra.empty() && !s.empty() && s[0] != '-') a.extra = s;
     else bad_usage(!s.empty() && s[0] == '-' ? "unknown option " + s : "unexpected argument '" + s + "'");
   }
-  sampling_overrides.apply(&a.sampling);
+  a.sampling_overrides.apply(&a.sampling);
   if (no_think) chat_defaults["enable_thinking"] = false;
   a.chat_options = apps::resolve_chat_options(chat_defaults, ojson::object());
   if (!a.images.empty() && a.cmd != "run") bad_usage("--image is only supported with 'flyx run'");
@@ -409,6 +413,11 @@ int cmd_run(const Args& a) {
 
 int cmd_chat(const Args& a) {
   auto e = load(a);
+  auto defaults = apps::sampling_defaults(e->model_file().header(), a.sampling_overrides, !a.engine.lora_file.empty());
+  std::fprintf(stderr, "sampling_defaults %s\n", defaults.log_text().c_str());
+  auto mode = a.chat_options.enable_thinking ? apps::SamplingMode::Thinking : apps::SamplingMode::NonThinking;
+  SamplingParams sampling = defaults.get(mode).params();
+  a.sampling_overrides.apply_controls(&sampling);
   Session s(e.get());
   std::string err;
   if (!s.init(&err)) return std::fprintf(stderr, "error: %s\n", err.c_str()), 1;
@@ -423,7 +432,7 @@ int cmd_chat(const Args& a) {
     rq.messages = msgs;
     rq.chat_options = a.chat_options;
     rq.gen.max_new_tokens = a.n;
-    rq.gen.sampling = a.sampling;
+    rq.gen.sampling = sampling;
     PreparedRequest p = prepare(*e, s, rq, true);
     p.gen.on_prefill = prefill_progress();
     // The reply as the next turn's history needs it: thinking apart from the answer.

@@ -22,11 +22,6 @@ namespace flyx::server {
 
 struct Config {
   ojson chat_defaults = ojson::object();
-  // Qwen3.5's recommended settings (its model card): with thinking, the ones
-  // for precise coding (no penalty); without, the general ones, which come
-  // with a presence penalty of 1.5.
-  SamplingParams think_defaults{0.6f, 0.95f, 20, 0, 0.f, 0.f};
-  SamplingParams plain_defaults{0.7f, 0.8f, 20, 0, 1.5f, 0.f};
   std::string api_key;
   // The origins whose pages a browser lets call the inference API (--cors): this machine's own pages unless that is
   // turned off, the origins named, or any.  The model panel, the request log, the logs and the telemetry are never

@@ -246,6 +246,7 @@ int main(int argc, char** argv) {
       hold_next_close = true;
     }
     // A request's hold on the model: once the switch has let go of the host's, the last one.
+    const auto first_defaults = host.served().sampling;
     std::shared_ptr<Scheduler> request = host.served().sched;
     std::atomic<bool> switched{false};
     bool switch_ok = false;
@@ -256,6 +257,7 @@ int main(int argc, char** argv) {
     });
     const bool let_go = wait_for([&] { return request.use_count() == 1; }, 30000);
     check(let_go, "the switch lets go of the host's reference to the old model");
+    check(first_defaults && !host.served().sampling, "old defaults live with the request while the host is empty");
     // The request ends on its own thread, and the old model's close is held up there.
     std::thread request_end([r = std::move(request)]() mutable { r.reset(); });
     bool held = false;
@@ -284,6 +286,8 @@ int main(int argc, char** argv) {
                 events[0] == "close begins" && events[1] == "close ends" && events[2] == "open",
             "the new model loads once the old one's close has returned (" + order + ") " + switch_err);
     }
+    check(host.served().sampling && host.served().sampling != first_defaults,
+          "the new scheduler publishes its own immutable defaults");
     // The new model serves.
     Request rq;
     rq.chat = false;

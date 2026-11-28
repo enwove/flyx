@@ -59,11 +59,12 @@ All commands that load a model share the parser in `apps/common/engine_flags.cpp
 
 | Flag | Commands | Values / Range | Default | Behavior |
 |---|---|---|---|---|
-| `--temperature` | all | `0..100` | `0` (CLI) / model card (`serve`) | Sampling temperature (`0` = greedy). |
-| `--top-p` | all | `0..1` | `0` (CLI) / model card (`serve`) | Nucleus cutoff (`0` or `1` = off). |
-| `--top-k` | all | `≥ 0` | `0` (CLI) / model card (`serve`) | Top-k cutoff (`0` = off). |
-| `--presence-penalty` | all | `-2..2` | `0` (CLI) / model card (`serve`) | One-time logit penalty for tokens already in reply. |
-| `--frequency-penalty` | all | `-2..2` | `0` | Per-occurrence logit penalty for tokens in reply. |
+| `--sampling-profile` | chat/serve | `thinking`, `thinking_coding` | `thinking` | Selects the preset used when thinking is enabled. |
+| `--temperature` | all | `0..100` | `0` (`run`/`bench`) / model (`chat`/`serve`) | Sampling temperature (`0` = greedy). |
+| `--top-p` | all | `0..1` | `1` (`run`/`bench`) / model (`chat`/`serve`) | Nucleus cutoff (`0` or `1` = off). |
+| `--top-k` | all | `≥ 0` | `0` (`run`/`bench`) / model (`chat`/`serve`) | Top-k cutoff (`0` = off). |
+| `--presence-penalty` | all | `-2..2` | `0` (`run`/`bench`) / model (`chat`/`serve`) | One-time logit penalty for tokens already in reply. |
+| `--frequency-penalty` | all | `-2..2` | `0` (`run`/`bench`) / model (`chat`/`serve`) | Per-occurrence logit penalty for tokens in reply. |
 | `--seed` | CLI only | `uint64` | `0` (random) | Seed for position-keyed Gumbel-max sampling. |
 | `--accept-min-p` | CLI only | `0..1` | `0` (off) | Lossy relaxed draft acceptance: accept draft with prob ≥ `P * p_max`. |
 | `--accept-typical` | CLI only | `0..1` | `0` (off) | Lossy relaxed draft acceptance: accept draft with prob ≥ `min(E, sqrt(E) * exp(-H))`. |
@@ -333,7 +334,7 @@ To load Inkling and discover its DSpark companion, post `{"model":"unsloth/Inkli
 | Auth failure | `401` (invalid/missing API key); `403` (remote client accessing local-only management endpoint without API key). |
 | Request superseded (same conversation retry) | Running request cancelled (`cancel_reason: "superseded"`). A legacy `/v1/completions` prompt never supersedes another request, nor is it superseded: raw text carries no conversation, so two clients sending the same or overlapping prompts each get their own reply. Anthropic queued/non-streaming returns `409` (`conflict_error`, `x-should-retry: false`); OpenAI Responses returns `status: "incomplete"` / `response.incomplete`. |
 | Client isolation headers | Claude Code session/subagent headers and Codex `thread-id` headers isolate independent threads even with identical prompt histories. |
-| Default sampling (when request omits params) | Qwen3.5 model card defaults: thinking ON → `temperature=0.6, top_p=0.95, top_k=20, presence_penalty=0`; thinking OFF → `temperature=0.7, top_p=0.8, top_k=20, presence_penalty=1.5`. For tool/code use without thinking, pass `presence_penalty: 0` (or `--presence-penalty 0`). |
+| Default sampling | Each field inherits the CLI override, the model's mode-aware recommendation, verified checkpoint profile, flat file metadata, then a truncated fallback. Explicit request fields take priority. See [Sampling defaults](#sampling-defaults). |
 | Grammar enforcement | Enabled automatically when `tools` or `response_format` / `output_config.format` is set. Compiled once per tool/schema set and cached; checked after each speculative round with rollback on rejected tokens. |
 | Tools or a schema no grammar can be made from | `400` (`invalid_request_error`, the message beginning `reply grammar:`) when the request requires the grammar (`response_format`, `tool_choice` `required` or a named tool); with `tool_choice: auto` the request runs unconstrained and the server logs why. |
 | Browser clients (CORS) | A page of an allowed origin (see `--cors`) may call `/v1/chat/completions`, `/v1/completions`, `/v1/responses`, `/v1/messages`, `/v1/models` and `/health`: its preflight (`OPTIONS`, which carries no key) is answered `204`, Chrome's `Access-Control-Request-Private-Network` included, and answers carry `Access-Control-Allow-Origin` with that origin. A page of any other origin gets `403`, whose message and the server's log name the `--cors` value that would let it in. The model panel, the request log, the logs and the telemetry are never another origin's, whatever `--cors` says. A request without an `Origin` (an SDK, `curl`) is as before. A page of a public site also needs the browser's own leave to reach this machine: Chrome and Edge ask the user before a public page may call a loopback address (Local Network Access), whatever the server answers; a page served from this machine is not asked. |
@@ -341,6 +342,23 @@ To load Inkling and discover its DSpark companion, post `{"model":"unsloth/Inkli
 | Server stopped serving before the request ran | `503` for a request still queued when the model is unloaded or switched, or that waited in the queue past `--queue-timeout`: send it again. |
 
 ---
+
+### Sampling defaults
+
+Interactive `flyx chat` and the HTTP generation routes resolve temperature, top-p, top-k and additive penalties per field. From highest to lowest priority:
+
+1. An explicit request value. HTTP `top_p: 0` requests top-k 1. A null field inherits.
+2. An explicit startup flag such as `--top-k 0`.
+3. The target file's `recommended.sampling` map for the selected mode, then its `default` map. Mode names are `thinking`, `non_thinking` and `thinking_coding`. For precise coding with thinking enabled, HTTP clients can send `"sampling_profile": "thinking_coding"`.
+4. The publisher's per-mode profile for a recognized official checkpoint. The target's repository or its GGUF name and upstream provenance identify the checkpoint. A declared fine-tune, attached adapter or architecture name alone cannot select it.
+5. Explicit `generation.sampling` fields from HF conversion, then GGUF `general.sampling.temp`, `.top_k` and `.top_p`. At this layer `do_sample: false` sets temperature to zero.
+6. Missing fields inherit temperature .6 for thinking or .7 for non-thinking, top-p .95, top-k 20 and zero penalties.
+
+For coding sessions use `flyx serve MODEL --sampling-profile thinking_coding` or `flyx chat MODEL --sampling-profile thinking_coding`. On verified Qwen3.5 this selects .6/.95/20/0 for thinking. Requests with thinking disabled still use the non-thinking row. Numeric startup and request overrides apply to the selected row.
+
+Verified Qwen3.5 general thinking uses temperature 1, top-p .95, top-k 20 and presence 1.5. Non-thinking uses .7/.8/20/1.5. The 0.8B text exception uses 1/1/20/2 with thinking off. With image input, 0.8B uses .7/.8/20/1.5 with thinking off and .6/.95/20/0 with thinking on. Qwen3 uses .6/.95/20/0 with thinking on and .7/.8/20/0 with thinking off. These mode-specific values take priority over a checkpoint's flat generation config. A publisher can customize each row in a `.flyx` recommendation. [Qwen3.5](https://huggingface.co/Qwen/Qwen3.5-27B#best-practices), [Qwen3.5-0.8B](https://huggingface.co/Qwen/Qwen3.5-0.8B#best-practices) and [Qwen3](https://huggingface.co/Qwen/Qwen3-8B#best-practices)
+
+The load log and `GET /v1/telemetry` publish `sampling_defaults`. Each mode lists the effective `value` and `origin` for every field. A server without a selected model returns null. The `warnings` list identifies invalid file settings and active values requested for unsupported samplers such as `min_p` and `penalty_repeat`. The CLI `run` and `bench` commands and zero-initialized C API requests retain greedy decoding.
 
 ## 7. Coding Agent Integrations
 

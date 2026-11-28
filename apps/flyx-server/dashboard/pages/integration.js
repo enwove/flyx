@@ -270,12 +270,14 @@ export function Integration({ active }) {
       <section id="d-sampling">
         <span class="caps">${t("Reference")}</span>
         <h2>${t("Sampling defaults")}</h2>
-        <p>${t("Requests that leave sampling unset get the model card's settings:")}</p>
-        <table><thead><tr><th></th><th class="n">temperature</th><th class="n">top_p</th><th class="n">top_k</th><th class="n">presence</th></tr></thead><tbody>
-          <tr><td>${t("Thinking on")}</td><td class="n">0.6</td><td class="n">0.95</td><td class="n">20</td><td class="n">0</td></tr>
-          <tr><td>${t("Thinking off")}</td><td class="n">0.7</td><td class="n">0.8</td><td class="n">20</td><td class="n">1.5</td></tr>
+        <p><code>GET /v1/telemetry</code> / <code>sampling_defaults</code></p>
+        <table><thead><tr><th></th><th>temperature</th><th>top_p</th><th>top_k</th><th>presence_penalty</th><th>frequency_penalty</th></tr></thead><tbody>
+          ${[["thinking", "Thinking on"], ["non_thinking", "Thinking off"]].map(([mode, label]) => html`<tr>
+            <td>${t(label)}</td>${["temperature", "top_p", "top_k", "presence_penalty", "frequency_penalty"].map(key => {
+              const field = live.last?.sampling_defaults?.[mode]?.[key];
+              return html`<td class="n" title=${field?.origin}>${field ? Number(field.value.toPrecision(7)) : "-"}</td>`;
+            })}</tr>`)}
         </tbody></table>
-        ${Lead(String.raw`<code>--temperature</code>, <code>--top-p</code>, <code>--top-k</code>, <code>--presence-penalty</code> and <code>--frequency-penalty</code> change them for every request. A client that turns thinking off and has the model write tool calls or edit code may want <code>presence_penalty: 0</code>.`)}
       </section>
 
       <section id="d-sessions">

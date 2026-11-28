@@ -135,7 +135,7 @@ class Cursor {
     }
   }
   // A metadata value of GGUF type `type` (0..12; 9 is an array).
-  json value(uint32_t type, int depth = 0) {
+  json value(uint32_t type, bool sampling, int depth = 0) {
     switch (type) {
       case 0: return read<uint8_t>();
       case 1: return read<int8_t>();
@@ -143,9 +143,10 @@ class Cursor {
       case 3: return read<int16_t>();
       case 4: return read<uint32_t>();
       case 5: return read<int32_t>();
-      case 6: return finite(read<float>());
+      case 6: return metadata_number(read<float>(), sampling);
       case 7: {
         const uint8_t b = read<uint8_t>();
+        if (sampling && b > 1) return nullptr;
         if (b > 1) invalid("invalid GGUF boolean");
         return b != 0;
       }
@@ -157,17 +158,22 @@ class Cursor {
         const size_t min_sz = min_elem_bytes(element);
         if (!min_sz || n > remaining() / min_sz) invalid("invalid GGUF array type or length");
         json result = json::array();
-        for (uint64_t i = 0; i < n; ++i) result.push_back(value(element, depth + 1));
+        for (uint64_t i = 0; i < n; ++i) result.push_back(value(element, sampling, depth + 1));
         return result;
       }
       case 10: return read<uint64_t>();
       case 11: return read<int64_t>();
-      case 12: return finite(read<double>());
+      case 12: return metadata_number(read<double>(), sampling);
       default: invalid("unsupported GGUF metadata type " + std::to_string(type));
     }
   }
 
  private:
+  // A malformed optional default is diagnosed by read_model_sampling. Keep strict validation of model metadata.
+  static json metadata_number(double v, bool sampling) {
+    if (sampling && !std::isfinite(v)) return nullptr;
+    return finite(v);
+  }
   static double finite(double v) {
     if (!std::isfinite(v)) invalid("non-finite GGUF metadata number");
     return v;
@@ -559,7 +565,7 @@ ShardHeader parse_shard_header(const uint8_t* data, size_t size, bool allow_zero
     } else {
       const std::string k(key);
       if (h.meta.contains(k)) invalid("empty or duplicate GGUF metadata key");
-      h.meta[k] = r.value(type);
+      h.meta[k] = r.value(type, key.starts_with("general.sampling."));
     }
   }
   h.alignment = h.meta.contains("general.alignment")

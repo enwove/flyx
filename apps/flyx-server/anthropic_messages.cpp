@@ -144,7 +144,7 @@ bool read_request(Server* s, const ojson& body, Request* in, std::string* err) {
   if (!read_optional_token_limit(body, "max_tokens", true, &in->gen.prefill_only, &in->gen.max_new_tokens, err))
     return false;
   if (body.contains("stop_sequences") && !read_stop(body["stop_sequences"], &in->gen.stop, err)) return false;
-  return read_sampling(body, in->chat_options.enable_thinking, s->cfg, &in->gen.sampling, err);
+  return true;
 }
 
 void handle_messages(Server* s, const httplib::Request& req, httplib::Response& res) {
@@ -349,6 +349,9 @@ void add_anthropic_messages_routes(httplib::Server& http, Server* s) {
     Request in;
     std::string err;
     if (!read_request(s, body, &in, &err)) return send_anthropic_error(r, 400, err);
+    apps::SamplingOverrides sampling;
+    apps::SamplingMode mode;
+    if (!read_sampling(body, in.chat_options.enable_thinking, &sampling, &mode, &err)) return send_anthropic_error(r, 400, err);
     ModelHost::Served m;
     if (!serving(s, r, &m, true)) return;
     int n = m.sched->count_tokens(in, &err);

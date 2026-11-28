@@ -770,10 +770,13 @@ bool ModelHost::work(const Want& w, std::string* err) {
     return false;
   }
   const std::string name = !w.name.empty() ? w.name : f.name;
+  auto sampling = std::make_shared<const apps::SamplingDefaults>(
+      apps::sampling_defaults(sched->model_header(), sampling_cli_, !f.lora.empty()));
   log_loaded(*sched, name, load_s);
+  std::fprintf(stderr, "flyx-server: sampling_defaults %s\n", sampling->log_text().c_str());
   {
     std::lock_guard<std::mutex> lock(mu_);
-    served_ = {sched, name}, fetched_ = std::move(f);
+    served_ = {sched, name, std::move(sampling)}, fetched_ = std::move(f);
     state_ = "ready", last_ = w;
     last_.eo.allow_path = {};
   }

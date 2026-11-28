@@ -22,15 +22,20 @@ interfaces::ojson chat_template_kwargs_flag(const std::string& value) {
   return kwargs;
 }
 
+SamplingMode thinking_profile_flag(const std::string& value) {
+  if (value == "thinking") return SamplingMode::Thinking;
+  if (value == "thinking_coding") return SamplingMode::ThinkingCoding;
+  std::fprintf(stderr, "error: --sampling-profile expects thinking or thinking_coding\n");
+  std::exit(2);
+}
+
 void SamplingOverrides::apply(SamplingParams* sp) const {
   if (temperature) sp->temperature = *temperature;
   if (top_p) sp->top_p = *top_p;
   if (top_k) sp->top_k = *top_k;
-  if (seed) sp->seed = *seed;
   if (presence_penalty) sp->presence_penalty = *presence_penalty;
   if (frequency_penalty) sp->frequency_penalty = *frequency_penalty;
-  if (accept_min_p) sp->accept_min_p = *accept_min_p;
-  if (accept_typical) sp->accept_typical = *accept_typical;
+  apply_controls(sp);
 }
 
 bool sampling_flag(const std::string& a, const std::function<std::string()>& value, SamplingOverrides* out,

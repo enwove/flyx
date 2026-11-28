@@ -588,5 +588,13 @@ int main() {
   test_dns_rebinding_and_lan_hosts();
   test_forwarded_and_management_policy();
   test_remote_unc_and_device_paths();
+  {
+    flyx::apps::SamplingOverrides request;
+    flyx::apps::SamplingMode mode;
+    std::string err;
+    check(flyx::server::read_sampling({{"top_p", 0}, {"top_k", 20}, {"seed", 7}}, false, &request, &mode, &err) &&
+          request.top_k == 1 && request.top_p == 1 && request.seed == 7 && !request.temperature,
+          "explicit HTTP top_p zero requests one candidate");
+  }
   return flyx::test::finish("http_util_test");
 }

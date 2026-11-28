@@ -16,6 +16,7 @@
 #include <vector>
 
 #include "apps/common/model_source.h"
+#include "apps/common/sampling_defaults.h"
 #include "core/exec/scheduler.h"
 
 namespace flyx::server {
@@ -25,6 +26,7 @@ class ModelHost {
   struct Served {
     std::shared_ptr<Scheduler> sched;  // nullptr: none
     std::string name;              // the API's model id
+    std::shared_ptr<const apps::SamplingDefaults> sampling;
   };
   struct Want {
     std::string model;                  // as named: a path or a Hub name
@@ -36,7 +38,7 @@ class ModelHost {
     std::string draft_head{}, draft_weights{};
   };
 
-  explicit ModelHost(const SchedulerOptions& so) : so_(so) {}
+  explicit ModelHost(const SchedulerOptions& so, const apps::ChatSamplingOptions& cli = {}) : so_(so), sampling_cli_(cli) {}
   ~ModelHost();
   ModelHost(const ModelHost&) = delete;
   ModelHost& operator=(const ModelHost&) = delete;
@@ -113,6 +115,7 @@ class ModelHost {
   SchedulerOptions so_;
   std::shared_ptr<Telemetry> telemetry_ = std::make_shared<Telemetry>();  // every scheduler's, the server's own
   mutable std::mutex mu_;
+  const apps::ChatSamplingOptions sampling_cli_;
   Served served_;
   apps::Fetched fetched_;  // the served model's files and drafters
   std::string state_ = "none", error_, target_;

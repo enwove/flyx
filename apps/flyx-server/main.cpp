@@ -112,6 +112,7 @@ void pause_owned_console() {
                "  --chat-template-kwargs JSON  default chat template variables for every chat request (JSON object)\n"
                "  --keep-billing-header  keep Claude Code's x-anthropic-billing-header line in the system prompt\n"
                "                       (left out by default: it changes on every request and defeats prompt reuse)\n"
+               "  --sampling-profile NAME  thinking (default) or thinking_coding for thinking requests\n"
                "  --temperature T      default sampling for requests that do not set it\n"
                "  --top-p P / --top-k K\n"
                "  --presence-penalty P  default presence penalty (-2..2); without it Qwen3.5's own: 1.5 for\n"
@@ -194,6 +195,7 @@ struct ServeArgs {
   bool monitor_wanted = true, browser_wanted = true, request_log = true, system_log = true;
   EngineOptions eo;
   SchedulerOptions so;
+  apps::SamplingOverrides sampling;
   Config cfg;
 };
 
@@ -202,7 +204,6 @@ struct ServeArgs {
 ServeArgs parse_args(int argc, char** argv) {
   ServeArgs a;
   a.eo.ctx_max = true;  // default: model's trained context, or the longest GPU and host memory hold
-  apps::SamplingOverrides sampling_overrides;
   bool no_think = false;
   for (int i = 1; i < argc; ++i) {
     const std::string f = argv[i];
@@ -225,7 +226,8 @@ ServeArgs parse_args(int argc, char** argv) {
     else if (f == "--no-think") no_think = true;
     else if (f == "--chat-template-kwargs") a.cfg.chat_defaults = apps::chat_template_kwargs_flag(next());
     else if (f == "--keep-billing-header") a.cfg.keep_billing_header = true;
-    else if (apps::sampling_flag(f, next, &sampling_overrides)) continue;
+    else if (f == "--sampling-profile") a.sampling.thinking_profile = apps::thinking_profile_flag(next());
+    else if (apps::sampling_flag(f, next, &a.sampling)) continue;
     else if (f == "--api-key") a.cfg.api_key = next();
     else if (f == "--no-auth") a.no_auth = true;
     else if (f == "--cors") {
@@ -254,8 +256,6 @@ ServeArgs parse_args(int argc, char** argv) {
     }
   }
   if (no_think) a.cfg.chat_defaults["enable_thinking"] = false;
-  sampling_overrides.apply(&a.cfg.think_defaults);
-  sampling_overrides.apply(&a.cfg.plain_defaults);
   if (a.no_auth && !a.cfg.api_key.empty()) bad_usage("--no-auth cannot be combined with --api-key");
   if (!a.no_auth && a.cfg.api_key.empty()) a.cfg.api_key = apps::api_key_from_env();
   for (const std::string& d : apps::models_dirs_from_env()) a.models_dirs.push_back(d);
@@ -495,7 +495,7 @@ int run(int argc, char** argv) {
         std::fprintf(stderr, "flyx-server: ignoring saved hub_endpoint (%s)\n", ep_err.c_str());
     }
   }
-  ModelHost models(args.so);
+  ModelHost models(args.so, args.sampling);
   EngineOptions start_from = eo;
   start_from.drafter_files.clear();  // the command line's model's own: a model named on the page names its drafters
   start_from.mmproj_file.clear();    // likewise: a model named on the page names its own vision projector

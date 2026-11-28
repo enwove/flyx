@@ -40,6 +40,12 @@ Test-only data (not shipped in releases): Qwen3.5-4B, Qwen3-4B and MiniCPM5-1B c
 
 ## 2. Algorithmic and Architectural References
 
+### Per-model sampling defaults
+
+- llama.cpp reads `general.sampling.*` from GGUF when initializing its sampler. [Model sampler initialization](https://github.com/ggml-org/llama.cpp/blob/3cadf644b73227331a55bd80b0959ca6a13fc775/common/common.cpp#L1079-L1137)
+- vLLM loads Hugging Face generation configuration and supports operator overrides. SGLang's `--sampling-defaults model` uses the checkpoint's sampling parameters. [vLLM engine arguments](https://docs.vllm.ai/en/stable/configuration/engine_args/#--generation-config) · [SGLang sampling parameters](https://github.com/sgl-project/sglang/blob/2800baa29705614c459de217df489b11d13da70b/docs/docs/basic_usage/sampling_params.mdx)
+- LM Studio supports per-model inference defaults and named presets that bundle generation settings. [Per-model defaults](https://lmstudio.ai/docs/app/advanced/per-model) · [Config presets](https://lmstudio.ai/docs/app/presets)
+
 ### Models and Speculative Drafters
 - **Qwen3.5 / Qwen3** (Qwen team): target architectures; float64 reference (`python/reference/flyx_ref/target.py`) verified against HuggingFace `transformers`.
 - **MiniCPM5** (OpenBMB, `openbmb/MiniCPM5-1B`, Apache-2.0): a Llama, the attention without q/k norms; the tiny Llama's golden tokens and `tests/e2e/check_real_model.py` compare with `transformers`' modeling code; its `tokenizer.json` states the pre-tokenizer (numbers in groups of three, then a Qwen2-like split) that `core/tokenizer` writes by hand; its chat template is a test fixture (`tests/core/render/templates/`). `llama.cpp`'s converter is why a Llama GGUF is refused: it reorders a Llama's q and k rows for its interleaved rotary pairs.

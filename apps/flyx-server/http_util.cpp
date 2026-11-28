@@ -12,6 +12,7 @@
 #include <filesystem>
 #include <mutex>
 #include <random>
+#include <type_traits>
 
 #include "apps/common/chat_options.h"
 #include "apps/common/model_source.h"
@@ -136,28 +137,33 @@ bool read_optional_token_limit(const ojson& body, const char* key, bool allow_ze
   return true;
 }
 
-bool read_sampling(const ojson& body, bool thinking, const Config& cfg, SamplingParams* out, std::string* err) {
-  *out = thinking ? cfg.think_defaults : cfg.plain_defaults;
-  auto num = [&](const char* key, double lo, double hi, double* v) {
-    if (!body.contains(key) || body[key].is_null()) return true;
-    if (!body[key].is_number()) {
-      *err = std::string(key) + " must be a number";
-      return false;
-    }
-    *v = body[key].get<double>();
-    if (*v < lo || *v > hi) {
-      *err = std::string(key) + " out of range";
-      return false;
-    }
+bool read_sampling(const ojson& body, bool thinking, apps::SamplingOverrides* out, apps::SamplingMode* mode,
+                   std::string* err) {
+  *mode = thinking ? apps::SamplingMode::Thinking : apps::SamplingMode::NonThinking;
+  if (auto it = body.find("sampling_profile"); it != body.end() && !it->is_null()) {
+    if (*it != "thinking_coding" || !thinking)
+      return *err = "sampling_profile must be thinking_coding with thinking enabled", false;
+    *mode = apps::SamplingMode::ThinkingCoding;
+  }
+  auto num = [&](const char* key, double lo, double hi, auto& field) {
+    auto it = body.find(key);
+    if (it == body.end() || it->is_null()) return true;
+    if (!it->is_number()) return *err = std::string(key) + " must be a number", false;
+    double v = it->get<double>();
+    if (!std::isfinite(v) || v < lo || v > hi) return *err = std::string(key) + " out of range", false;
+    using T = typename std::decay_t<decltype(field)>::value_type;
+    field = static_cast<T>(v);
     return true;
   };
-  double t = out->temperature, p = out->top_p, k = out->top_k;
-  double presence = out->presence_penalty, frequency = out->frequency_penalty;
-  double min_p = out->accept_min_p, typical = out->accept_typical;
-  if (!num("temperature", 0, 100, &t) || !num("top_p", 0, 1, &p) || !num("top_k", -1, 1e9, &k)) return false;
-  if (!num("presence_penalty", -2, 2, &presence) || !num("frequency_penalty", -2, 2, &frequency)) return false;
-  // flyx's own (lossy, off by default): relaxed acceptance of drafts (SamplingParams)
-  if (!num("accept_min_p", 0, 1, &min_p) || !num("accept_typical", 0, 1, &typical)) return false;
+  if (!num("temperature", 0, 100, out->temperature) || !num("top_p", 0, 1, out->top_p) ||
+      !num("top_k", -1, 1e9, out->top_k) || !num("presence_penalty", -2, 2, out->presence_penalty) ||
+      !num("frequency_penalty", -2, 2, out->frequency_penalty) || !num("accept_min_p", 0, 1, out->accept_min_p) ||
+      !num("accept_typical", 0, 1, out->accept_typical)) return false;
+  if (out->top_k && *out->top_k < 0) out->top_k = 0;
+  if (out->top_p && body["top_p"] == 0) {
+    out->top_p = 1.f;
+    out->top_k = 1;
+  }
   if (const auto it = body.find("seed"); it != body.end() && !it->is_null()) {
     if (it->is_number_unsigned()) {
       out->seed = it->get<uint64_t>();
@@ -168,14 +174,6 @@ bool read_sampling(const ojson& body, bool thinking, const Config& cfg, Sampling
       return false;
     }
   }
-  out->presence_penalty = float(presence);
-  out->frequency_penalty = float(frequency);
-  out->accept_min_p = float(min_p);
-  out->accept_typical = float(typical);
-  out->temperature = float(t);
-  const bool zero_top_p = body.contains("top_p") && !body["top_p"].is_null() && p == 0;
-  out->top_p = p > 0 ? float(p) : 1.f;
-  out->top_k = zero_top_p ? 1 : (k > 0 ? int(k) : 0);
   return true;
 }
 
@@ -887,10 +885,27 @@ bool serving(Server* s, httplib::Response& res, ModelHost::Served* out, bool ant
 bool admit_job(Server* s, httplib::Response& res, Request in, const char* api, const char* id_prefix, bool stream,
                const ojson& body, RequestLog::Arrival arrival, bool anthropic, bool set_response_id,
                const std::function<void(httplib::Response&, const JobEvent&)>& on_refused, AdmittedJob* out) {
+  apps::SamplingOverrides request;
+  apps::SamplingMode mode;
+  std::string err;
+  if (!read_sampling(body, in.chat && in.chat_options.enable_thinking, &request, &mode, &err)) {
+    if (anthropic) send_anthropic_error(res, 400, err);
+    else send_openai_error(res, 400, err);
+    return false;
+  }
   if (!serving(s, res, &out->served, anthropic)) return false;
+  const bool images = std::any_of(in.messages.begin(), in.messages.end(), [](const ChatMessage& message) {
+    return std::any_of(message.parts.begin(), message.parts.end(), [](const auto& part) {
+      return part.kind == interfaces::ContentPart::kImage;
+    });
+  });
+  auto resolved = out->served.sampling->get(mode, images);
+  resolved.overlay(request, apps::SamplingOrigin::Request);
+  out->sampling = resolved.params();
+  request.apply_controls(&out->sampling);
+  in.gen.sampling = out->sampling;
   out->id = new_id(id_prefix);
   if (set_response_id) in.response_id = out->id;
-  std::string err;
   int status = 0;
   out->job = out->served.sched->submit(std::move(in), &err, &status, arrival.monotonic_ms);
   if (!out->job) {

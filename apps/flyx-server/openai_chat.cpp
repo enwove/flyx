@@ -157,8 +157,6 @@ void handle_chat(Server* s, const httplib::Request& req, httplib::Response& res)
   if (!read_chat_options(body, s->cfg.chat_defaults, request_kwargs, &in.chat_options, &err))
     return send_openai_error(res, 400, err);
   if (!read_common(body, &in, &stream, &include_usage, &err)) return send_openai_error(res, 400, err);
-  if (!read_sampling(body, in.chat_options.enable_thinking, s->cfg, &in.gen.sampling, &err))
-    return send_openai_error(res, 400, err);
 
   AdmittedJob ad;
   if (!admit_job(s, res, std::move(in), "chat", "chatcmpl-", stream, body, arrival, false, true,
@@ -251,7 +249,6 @@ void handle_completions(Server* s, const httplib::Request& req, httplib::Respons
   in.text = body["prompt"].get<std::string>();
   in.gen.max_new_tokens = 16;  // the legacy Completions default, also used for max_tokens: null
   if (!read_common(body, &in, &stream, &include_usage, &err)) return send_openai_error(res, 400, err);
-  if (!read_sampling(body, false, s->cfg, &in.gen.sampling, &err)) return send_openai_error(res, 400, err);
 
   AdmittedJob ad;
   if (!admit_job(s, res, std::move(in), "completions", "cmpl-", stream, body, arrival, false, false,

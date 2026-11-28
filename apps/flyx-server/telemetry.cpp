@@ -215,6 +215,7 @@ ojson snapshot_json(const Server& s, int recent) {
                       {"enable_thinking", thinking_default(s.cfg.chat_defaults)},
                       {"cors", {{"loopback", s.cfg.cors_loopback}, {"any", s.cfg.cors_any}, {"origins", s.cfg.cors_origins}}}}},
           {"model", model},
+          {"sampling_defaults", served.sampling ? ojson(served.sampling->describe()) : ojson(nullptr)},
           {"state", state},
           {"rates", {{"decode_tok_s", t.decode_tok_s},
                      {"tokens_per_round", known(t.window_tokens_per_round)},

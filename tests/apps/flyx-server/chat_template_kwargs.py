@@ -2,9 +2,14 @@
 """Compare CLI rendering, the actual local prompts and all four HTTP chat routes."""
 import json
 import math
+from pathlib import Path
 import subprocess
+import sys
 
-from local_server import Client, serve, server_env
+from local_server import Client, serve, server_env, wait_load
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[3] / "python" / "convert"))
+from flyx_convert.fileformat import Reader, Writer
 
 MESSAGES = [{"role": "user", "content": "hello"}]
 DEFAULTS = {"enable_thinking": False, "preserve_thinking": True, "reasoning_effort": "medium",
@@ -82,6 +87,18 @@ def check_inkling_effort(exe, model, root):
 
 def check_template_kwargs(exe, model, root):
     root.mkdir()
+    original = model
+    model = root / "recommended.flyx"
+    with Reader(original) as reader:
+        writer = Writer()
+        writer.meta = dict(reader.header, recommended={"sampling": {
+            "thinking": {"temperature": 0.6}, "non_thinking": {"temperature": 0.7},
+            "thinking_coding": {"temperature": 0.25}, "default": {"top_k": 6, "min_p": 0.1}}})
+        for name, rec in reader.header["tensors"].items():
+            writer.add_tensor(name, rec["dtype"], rec["shape"], bytes(reader.raw(rec)))
+        for name in reader.header["blobs"]:
+            writer.add_blob(name, reader.blob(name))
+        writer.write(model)
     env = server_env(root, exe)
     source = root / "chat.jinja"
     source.write_text(TEMPLATE, encoding="utf-8")
@@ -91,12 +108,25 @@ def check_template_kwargs(exe, model, root):
 
     def local(command, *args, stdin=None):
         return subprocess.run([exe, command, model, "--backend", "cpu_ref", *args], input=stdin,
-                              capture_output=True, encoding="utf-8", env=env, check=True, timeout=30)
+                              capture_output=True, encoding="utf-8", errors="replace", env=env, check=True, timeout=30)
 
     def rendered(options, *extra):
         r = local("template", history, "--chat-template", source, *extra, "--chat-template-kwargs", json.dumps(options))
         return json.loads(r.stdout)
 
+    chat_flags = ["--seed", "17", "-n", "8", *flags]
+    inherited = local("chat", *chat_flags, stdin="hello\n\n")
+    explicit = local("chat", *chat_flags, "--temperature", "0.7", "--top-k", "6", stdin="hello\n\n")
+    assert inherited.stdout == explicit.stdout
+    load_log = next(line for line in inherited.stderr.splitlines() if line.startswith("sampling_defaults "))
+    assert json.loads(load_log.split(" ", 1)[1])["non_thinking"]["top_k"] == {"value": 6, "origin": "model_recommended"}
+    for command in ("chat", "serve"):
+        bad = subprocess.run([exe, command, model, "--sampling-profile", "unknown"], env=env,
+                             capture_output=True, encoding="utf-8", timeout=30)
+        assert bad.returncode == 2 and "--sampling-profile expects" in bad.stderr, bad
+    coding = local("chat", *chat_flags, "--sampling-profile", "thinking_coding", stdin="hello\n\n")
+    log = next(line for line in coding.stderr.splitlines() if line.startswith("sampling_defaults "))
+    assert json.loads(log.split(" ", 1)[1])["thinking"]["temperature"]["value"] == 0.25
     base = rendered(DEFAULTS)
     assert base["text"] == "hello generate preserve", base
     on = dict(DEFAULTS, enable_thinking=True, reasoning_effort="high")
@@ -115,6 +145,13 @@ def check_template_kwargs(exe, model, root):
         client = Client(url, None)
         status, tm = client.get("/v1/telemetry")
         assert status == 200 and tm["server"]["enable_thinking"] is False, (status, tm.get("server"))
+        defaults = tm["sampling_defaults"]
+        assert defaults["non_thinking"]["temperature"]["origin"] == "model_recommended"
+        assert defaults["thinking_profile"] == "thinking_coding"
+        assert defaults["thinking"]["temperature"] == {"value": 0.25, "origin": "model_recommended"}
+        assert defaults["thinking"]["top_k"] == {"value": 0, "origin": "cli"}
+        assert defaults["thinking"]["frequency_penalty"] == {"value": 0, "origin": "fallback"}
+        assert defaults["warnings"] == ["recommended.sampling.default.min_p: unsupported, ignored"]
         anthropic = {"thinking": {"type": "enabled"}, "output_config": {"effort": "high"}}
         routes = [
             ("chat/completions", {"messages": MESSAGES, "max_tokens": 1}, {"reasoning_effort": "high"}),
@@ -124,7 +161,7 @@ def check_template_kwargs(exe, model, root):
         ]
         for route, request, structured in routes:
             nested = {"enable_thinking": False, "reasoning_effort": "medium"}
-            for fields, count, temp in (({}, expected, 0.7), (structured, overridden, 0.6),
+            for fields, count, temp in (({}, expected, 0.7), (structured, overridden, 0.25),
                                         (dict(structured, chat_template_kwargs=nested), explicit_off, 0.7)):
                 status, body = client.post("/v1/" + route, dict(model="test model", **request, **fields))
                 assert status == 200, (route, fields, status, body)
@@ -138,4 +175,19 @@ def check_template_kwargs(exe, model, root):
                                                      "chat_template_kwargs": {"enable_thinking": enable}})
             assert got == status, (enable, got, body)
 
-    serve(exe, root, env, [model], check_routes, options=["--name", "test model", *flags])
+        status, body = client.post("/v1/responses", {"input": "hello", "max_output_tokens": 1,
+                                                      "chat_template_kwargs": {"enable_thinking": True},
+                                                      "sampling_profile": "thinking_coding"})
+        assert status == 200 and body["temperature"] == 0.25, body
+        status, body = client.post("/v1/responses", {"input": "hello", "max_output_tokens": 1, "temperature": 0})
+        assert status == 200 and body["temperature"] == 0, body
+        status, body = client.post("/v1/load", {"model": str(original), "name": "second", "ctx": 128})
+        assert status in (200, 202) and wait_load(client, 30)["state"] == "ready", body
+        _, tm = client.get("/v1/telemetry")
+        assert tm["model"]["id"] == "second" and tm["sampling_defaults"]["warnings"] == []
+        field = tm["sampling_defaults"]["thinking"]["temperature"]
+        assert field["origin"] == "fallback" and math.isclose(field["value"], 0.6, rel_tol=1e-6)
+        status, body = client.post("/v1/responses", {"input": "hello", "max_output_tokens": 1})
+        assert status == 200 and math.isclose(body["temperature"], 0.7, rel_tol=1e-6), body
+
+    serve(exe, root, env, [model], check_routes, options=["--name", "test model", "--sampling-profile", "thinking_coding", "--top-k", "0", *flags])

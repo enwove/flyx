@@ -168,6 +168,7 @@ add_library(flyx_core STATIC
   core/hub/hub_fetch.cpp
   core/hub/sha256.cpp
   core/modelfile/modelfile.cpp
+  core/modelfile/sampling.cpp
   core/modelfile/flyx_format.cpp
   core/modelfile/gguf_format.cpp
   core/modelfile/drafter_dir.cpp
@@ -260,7 +261,7 @@ set(FLYX_CLI_SOURCES
     apps/flyx-server/gpu_apps.cpp apps/flyx-server/network.cpp apps/flyx-server/drafter_speeds.cpp
     apps/flyx-server/hub_search.cpp
     ${FLYX_DASHBOARD_CPP}
-    apps/common/engine_flags.cpp apps/common/numbers.cpp apps/common/model_source.cpp)
+    apps/common/sampling_defaults.cpp apps/common/engine_flags.cpp apps/common/numbers.cpp apps/common/model_source.cpp)
 set(FLYX_CLI_LIBRARIES flyx_core Threads::Threads)
 if(WIN32)
   list(APPEND FLYX_CLI_SOURCES apps/flyx-cli/flyx.rc)

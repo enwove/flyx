@@ -146,6 +146,8 @@ class Scheduler {
   int count_tokens(const Request& in, std::string* err);
   // Tokens of a piece of text, e.g. a reply's thinking (any thread).
   int count_text_tokens(const std::string& text) const { return static_cast<int>(tok_.encode(text).size()); }
+  // The immutable target header used for HTTP tokenization, also available while idle-unloaded.
+  const nlohmann::json& model_header() const { return file_.header(); }
   // The chat template's output language ("none" when the file has no usable template).
   const char* chat_format() const { return chat_.format(); }
   // The loaded engine, or nullptr while unloaded.  For start-up reports only:
