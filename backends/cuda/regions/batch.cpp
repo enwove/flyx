@@ -150,10 +150,11 @@ void head_rows(const BatchPass& bp, const HeadBlock& h) {
   }
 }
 
-// Lockstep batched MTP drafting across all sequences drafting on the same MtpBlock: reads MTP's 5 projection
-// matrices once per draft step across active sequences instead of once per sequence per step, while keeping each
-// sequence's attention and 1-row draft head pick identical bit for bit to solo mtp_draft().
-void mtp_draft_rows(const BatchPass& bp, const MtpBlock& b, const std::vector<size_t>& members, bool fused) {
+// Lockstep batched MTP drafting across the sequences drafting on the same MtpBlock, FLYX_MAX_ROWS at a time (a step's
+// draft head pick reads and writes a round's rows of the lead's scratch): reads MTP's 5 projection matrices once per
+// draft step across active sequences instead of once per sequence per step, while keeping each sequence's attention
+// and 1-row draft head pick identical bit for bit to solo mtp_draft().
+void mtp_draft_group(const BatchPass& bp, const MtpBlock& b, const std::vector<size_t>& members, bool fused) {
   const RowView& v = bp.v;
   const flyx_bmodel* m = bp.seq[members[0]].s->m;
   const auto& E = block<EmbedBlock>(m, b.embed);
@@ -227,6 +228,15 @@ void mtp_draft_rows(const BatchPass& bp, const MtpBlock& b, const std::vector<si
   for (size_t idx : members) {
     const Pass& ps = bp.seq[idx];
     copy_ints(ps.s->mtok + 1, ps.s->drafts, ps.p->nodes[0].arg0, st);
+  }
+}
+
+void mtp_draft_rows(const BatchPass& bp, const MtpBlock& b, const std::vector<size_t>& members, bool fused) {
+  std::vector<size_t> group;
+  for (size_t off = 0; off < members.size(); off += size_t(FLYX_MAX_ROWS)) {
+    group.assign(members.begin() + std::ptrdiff_t(off),
+                 members.begin() + std::ptrdiff_t(std::min(members.size(), off + size_t(FLYX_MAX_ROWS))));
+    mtp_draft_group(bp, b, group, fused);
   }
 }
 
