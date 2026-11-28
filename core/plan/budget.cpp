@@ -81,7 +81,7 @@ bool tiered(const flyx_backend_api* api, flyx_bmodel* bm, int ctx, const KvTiers
   auto most = [&](int copy_host, flyx_seq_size* out) {
     const int cap = std::min(ctx, tiers.gpu >= 0 ? tiers.gpu : ctx);
     if (min_device_positions > cap) return false;
-    int lo = (min_device_positions + 1023) / 1024, hi = cap / 1024, best_pos = -1;
+    int lo = min_device_positions / 1024 + (min_device_positions % 1024 != 0), hi = cap / 1024, best_pos = -1;
     while (lo <= hi) {
       const int mid = (lo + hi) / 2;
       flyx_seq_size s{};
@@ -137,6 +137,28 @@ bool tiered(const flyx_backend_api* api, flyx_bmodel* bm, int ctx, const KvTiers
     return fits(layout->device_positions, layout->copy_host, size);
   *size = best_size;
   return true;
+}
+
+// A round before AUTO's switch reads every exact host row. Prefer moving the fewest layer copies that keep
+// that prefix on the device. Check both budgets at the realized boundary: VMM can round a request below it,
+// and the staging and host memory need not change uniformly as heterogeneous layers move.
+void protect_exact_prefix(const flyx_backend_api* api, flyx_bmodel* bm, KvTiers tiers, uint64_t device, uint64_t host,
+                          flyx_seq_layout* layout, flyx_seq_size* size) {
+  const int from = size->strata_from, ctx = layout->max_ctx;
+  if (layout->method != FLYX_KV_AUTO || tiers.copy_gpu >= 0 || from <= size->device_positions || from >= ctx ||
+      (tiers.gpu >= 0 && tiers.gpu < from)) return;
+  for (int moved = layout->copy_host + 1; moved <= size->copies; ++moved) {
+    tiers.copy_gpu = size->copies - moved;
+    flyx_seq_layout candidate{};
+    flyx_seq_size priced{};
+    std::string why;
+    if (tiered(api, bm, ctx, tiers, device, &candidate, &priced, &why, from) &&
+        priced.device_positions >= from && priced.strata_from == from && priced.host <= host) {
+      *layout = candidate;
+      *size = priced;
+      return;
+    }
+  }
 }
 
 // FLYX_KV_AUTO when its copy does not fit beside what stays on the GPU: every position read exactly.
@@ -254,6 +276,7 @@ struct TierPlacer {
     std::string e;
     if (by) *by = CtxLimit::kNone;
     bool placed = tiered(api, bm, ctx, tiers, room, l, s, &e);
+    if (placed) protect_exact_prefix(api, bm, tiers, room, out->host_budget, l, s);
     out->auto_exact = false;
     if (tiers.allow_auto_exact && exact_ok && (!placed || s->host > out->host_budget) && tiers.method == FLYX_KV_AUTO) {
       out->copy_note = !placed ? "it does not fit on the GPU"
@@ -534,7 +557,7 @@ bool account(const flyx_backend_api* api, flyx_bmodel* bm, bool has_drafter, boo
 }
 
 void fit_second_session(const flyx_backend_api* api, flyx_bmodel* bm, const KvTiers& tiers,
-                        const ResourceLedger& ledger, Budget* budget) {
+                        const ResourceLedger& ledger, Budget* budget, bool requested) {
   const uint64_t device = ledger.budget() ? ledger.available() / 2 : UINT64_MAX;
   const uint64_t host = budget->host_budget / 2;
   if (!host || (budget->session_bytes <= device && budget->session_host_bytes <= host)) return;
@@ -559,7 +582,10 @@ void fit_second_session(const flyx_backend_api* api, flyx_bmodel* bm, const KvTi
     if (!original.copies || !tiered(api, bm, ctx, pair, device, &layout, &size, &why, original.device_positions) ||
         size.strata_from != original.strata_from) return;
   }
+  protect_exact_prefix(api, bm, pair, device, host, &layout, &size);
   if (size.host > host) return;
+  if (!requested && original.copies && original.strata_from < ctx &&
+      size.device_positions < std::min(original.device_positions, original.strata_from)) return;
   budget->layout = layout;
   budget->session_bytes = size.device;
   budget->session_host_bytes = size.host;

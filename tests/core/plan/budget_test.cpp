@@ -67,6 +67,92 @@ int seq_size_auto(flyx_bmodel* bm, const flyx_seq_layout* l, flyx_seq_size* out)
 
 const plan::KvTiers kGpuOnly{-1, 0};
 
+// Simulated global FP8 caches and two-bit layer copies at 1M context. Two host copies can be in staging at once.
+// room is what remains after weights, workspace, other programs and the reserve. The switch is fixed at open.
+struct StrataDevice {
+  uint64_t total, room;
+  int from;
+};
+
+void check_strata_placement() {
+  static constexpr int ctx = 1 << 20, layers = 8, gran = 4096, from = 98305;
+  constexpr int aligned = (from + gran - 1) / gran * gran;
+  constexpr uint64_t row = 2 * layers * 8 * (128 + 4), copy = uint64_t(ctx) * 2 * 8 * (32 + 4);
+  auto api = fake();
+  api.memory = [](flyx_bmodel* bm, flyx_memory_info* m) {
+    const auto& d = *reinterpret_cast<StrataDevice*>(bm);
+    *m = {0, 0, d.room + d.total / 40, d.total, 0};
+    return 0;
+  };
+  api.seq_size = [](flyx_bmodel* bm, const flyx_seq_layout* l, flyx_seq_size* s) {
+    const int host = std::min(int(l->copy_host), layers);
+    const int dev = std::min(l->max_ctx, l->device_positions) / gran * gran;
+    s->device = kGiB + row * dev + (layers - host + std::min(host, 2)) * copy;
+    s->host = row * (l->max_ctx - dev) + host * copy;
+    s->device_positions = dev;
+    s->strata_from = reinterpret_cast<StrataDevice*>(bm)->from;
+    s->copies = layers;
+    return 0;
+  };
+  plan::KvTiers tiers{-1, int64_t(64 * kGiB)};
+  tiers.method = FLYX_KV_AUTO;
+  tiers.allow_auto_exact = false;
+  // The first 1 GiB represents the fixed ring, scratch and runtime charges. Each budget requires a different
+  // number of copies moved. The draft's extra half GiB can require one more, at the identical target switch.
+  for (int gib : {16, 24, 32}) {
+    const int resident = gib / 8;
+    for (bool draft : {false, true}) {
+      StrataDevice d{gib * kGiB, kGiB + (resident + 2) * copy + aligned * row - (draft ? kGiB / 2 : 0), from};
+      auto* bm = reinterpret_cast<flyx_bmodel*>(&d);
+      ResourceLedger ledger;
+      plan::Budget b;
+      std::string err;
+      int cap = ctx;
+      check(plan::account(&api, bm, draft, false, &cap, 0, tiers, &ledger, &b, &err) &&
+                b.layout.copy_host == layers - resident + int(draft) && b.layout.device_positions >= from &&
+                b.session_bytes <= d.room && b.session_host_bytes <= b.host_budget,
+            "fewest host copies protect the fixed switch after VMM rounding on " + std::to_string(gib) +
+                " GiB, draft=" + std::to_string(draft) + ": " + err);
+    }
+  }
+  StrataDevice d{32 * kGiB, kGiB + 6 * copy + aligned * row, from};
+  auto* bm = reinterpret_cast<flyx_bmodel*>(&d);
+  ResourceLedger ledger;
+  plan::Budget b;
+  std::string err;
+  int cap = ctx;
+  auto place = [&] { return plan::account(&api, bm, false, false, &cap, 0, tiers, &ledger, &b, &err); };
+  tiers.copy_gpu = layers;
+  check(place() && !b.layout.copy_host && b.layout.device_positions < from, "respect explicit resident copies");
+  const auto original = b.layout;
+  tiers.copy_gpu = -1;
+  tiers.ram = int64_t(b.session_host_bytes);
+  check(place() && b.layout.device_positions == original.device_positions && !b.layout.copy_host,
+        "retain the feasible layout when moving copies exceeds the host budget");
+  tiers.ram = int64_t(64 * kGiB);
+  tiers.gpu = gran;
+  check(place() && b.layout.device_positions == gran && !b.layout.copy_host,
+        "an explicit device cap below the switch cannot be repaired by moving copies");
+  tiers.gpu = -1;
+  d.from = gran;
+  check(place() && !b.layout.copy_host && b.layout.device_positions >= d.from,
+        "honor an earlier backend switch without moving extra copies");
+  d.from = from;
+  d.room *= 2;
+  check(place() && !b.layout.copy_host, "single session holds the exact prefix");
+  plan::fit_second_session(&api, bm, tiers, ledger, &b);
+  check(b.layout.copy_host == 4 && b.layout.device_positions >= from && b.session_bytes <= d.room / 2,
+        "two sessions fit by moving just enough layer copies to protect the exact prefix");
+  d.room = 2 * (kGiB + 2 * copy + aligned / 2 * row);
+  check(place() && b.layout.device_positions >= from, "one session still holds the prefix on the smaller budget");
+  const uint64_t one = b.session_bytes;
+  plan::fit_second_session(&api, bm, tiers, ledger, &b);
+  check(b.session_bytes == one && b.layout.device_positions >= from, "an optional second session cannot create a valley");
+  plan::fit_second_session(&api, bm, tiers, ledger, &b, true);
+  check(b.session_bytes <= d.room / 2 && b.layout.device_positions < from,
+        "explicit concurrency can still trade exact host reads for a second session");
+}
+
 void check_shortfall_replay(flyx_backend_api api, plan::KvTiers tiers, const plan::Budget& before, int wanted,
                             int min_ctx, bool longest = false) {
   if (!before.ctx_need_more) return;
@@ -102,6 +188,7 @@ void check_shortfall_replay(flyx_backend_api api, plan::KvTiers tiers, const pla
 
 int main() {
   flyx::test::print_passes = true;
+  check_strata_placement();
   const flyx_backend_api api = fake();
   // The budget: 16 GiB less the reserve (16 GiB / 40) = 15.6 GiB; 5.1 GiB after weights and workspace, so a context
   // of up to (5.1 GiB - 1 GiB) / 64 KiB = 65,536 tokens' worth less a little.

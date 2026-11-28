@@ -555,7 +555,7 @@ bool Engine::plan_memory(plan::KvTiers* tiers, int session_limit, int* asked_ctx
       const uint64_t f = current_floor();
       if (f > tiers->min_vram_reserve) device_.reserve_floor = tiers->min_vram_reserve = f;
     }
-    if (session_limit > 1) plan::fit_second_session(api_, bm_, *tiers, ledger_, &budget_);
+    if (session_limit != 1) plan::fit_second_session(api_, bm_, *tiers, ledger_, &budget_, session_limit > 1);
     const uint64_t f = current_floor();
     if (f <= tiers->min_vram_reserve) break;
     // Backend's reserve floor grew lazily (e.g., CUDA VMM fell back to paged allocation); replan with the new floor,

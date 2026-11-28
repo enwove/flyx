@@ -183,7 +183,7 @@ bool Scheduler::load(std::string* err) {
   telemetry_.loading();
   auto e = std::make_unique<Engine>();
   const int wanted = opt_.max_sessions > 0 ? opt_.max_sessions : SchedulerOptions::kDefaultSessions;
-  if (!e->load(model_, eo_, err, wanted)) {
+  if (!e->load(model_, eo_, err, opt_.max_sessions)) {
     telemetry_.unloaded();
     return false;
   }

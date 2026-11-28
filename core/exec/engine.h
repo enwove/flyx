@@ -172,6 +172,7 @@ bool probe_device(const EngineOptions& o, std::string* backend, flyx_device_info
 class Engine {
  public:
   ~Engine();
+  // A zero session limit lets the scheduler try a second session while preserving the exact GPU prefix.
   bool load(const std::string& path, const EngineOptions& opt, std::string* err, int session_limit = 1);
 
   const Tokenizer& tokenizer() const { return tok_; }

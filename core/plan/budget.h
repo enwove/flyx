@@ -114,8 +114,9 @@ std::string oom_fix_advice(bool has_others, bool has_drafter);
 std::string ctx_limit_note(const Budget& b);
 
 // Try to fit two sessions at the context and attention precision account() selected for one.
-// The model and workspace are already charged to the ledger. Keep the original layout if both cannot fit.
+// The model and workspace are already charged to the ledger. Only an explicitly requested second session may
+// shorten the device-resident portion of AUTO's exact prefix to make both fit.
 void fit_second_session(const flyx_backend_api* api, flyx_bmodel* bm, const KvTiers& tiers,
-                        const ResourceLedger& ledger, Budget* budget);
+                        const ResourceLedger& ledger, Budget* budget, bool requested = false);
 
 }  // namespace flyx::plan
