@@ -92,7 +92,8 @@ constexpr int kPromptSetMaxNew = 512;
                "  --chat               wrap the prompt as a user message (run)\n"
                "  --no-think           disable the thinking block in chat mode\n"
                "  --chat-template-kwargs JSON  template variables for run --chat, chat and template (JSON object)\n"
-               "  -n N                 max new tokens (default 256)\n"
+               "  -n N                 max new tokens (default 256; 0: the model's own limit if its file has one,\n"
+               "                       else up to the end of the context)\n"
                "  --ignore-eos         do not stop at end-of-sequence tokens\n"
                "  --temperature T, --top-p P, --top-k K, --seed S   sampling (default: greedy)\n"
                "  --presence-penalty P, --frequency-penalty F       what a token already in the reply loses\n"
@@ -182,6 +183,10 @@ Args parse(int argc, char** argv) {
   if (no_think) chat_defaults["enable_thinking"] = false;
   a.chat_options = apps::resolve_chat_options(chat_defaults, ojson::object());
   if (!a.images.empty() && a.cmd != "run") bad_usage("--image is only supported with 'flyx run'");
+  // What the command needs from the command line, said before the model is looked for (a Hub name is fetched).
+  if (a.cmd == "template" && a.extra.empty()) bad_usage("template needs a MESSAGES.json path after the model");
+  if (a.cmd == "run" && a.prompt.empty() && !a.chat && a.images.empty())
+    bad_usage("run needs a prompt: -p TEXT or -f FILE (with --chat, an empty one is a user message)");
   return a;
 }
 

@@ -72,7 +72,7 @@ All commands that load a model share the parser in `apps/common/engine_flags.cpp
 | `--chat` | `run` | flag | off | Wrap prompt as a single user message through the chat template. |
 | `--chat-template-kwargs JSON` | `run --chat`, `chat`, `template`, `serve` | JSON object | `{}` | Default variables for the loaded template, e.g. `'{"preserve_thinking":true,"reasoning_effort":"medium"}'`. Use a JSON boolean for `enable_thinking`. The renderer supplies `messages`, `tools`, `add_generation_prompt` and the model's own tokens. |
 | `--no-think` | `run`, `chat`, `template`, `serve` | flag | off | Disable thinking block by default (`enable_thinking=false`; a template that reads a thinking effort instead, Inkling-2's, is given its `reasoning_effort` `none`, and the reply is held to no thinking section); `bench` always runs without it. |
-| `-n N` | `run`, `chat`, `bench` | `≥ 0` | `256` | Maximum new tokens to generate. |
+| `-n N` | `run`, `chat`, `bench` | `≥ 0` | `256` | Maximum new tokens to generate; `0`: the model's own limit if its file has one (`generation.max_new_tokens`, from `generation_config.json`), else up to the end of the context. |
 | `--ignore-eos` | `run` | flag | off | Continue past EOS tokens until `-n` or context limit (`bench` always does). |
 | `--json [FILE]` | `bench` | flag, or path | off | Emit structured JSON benchmark output on stdout, or into `FILE` when the next argument is not an option. |
 | `--rounds FILE` | `run` | path | — | Write one JSONL record per decode round (`position`, `tokens`, `drafts`, `accepted`, and `prob`/`margin` when the drafter reports per-draft confidence). |
