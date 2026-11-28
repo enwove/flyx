@@ -143,6 +143,8 @@ FLYX_HD int32_t draft_choice(const int32_t* cand, const float* logit, const int*
     z[keep] = inv == INFINITY ? d / T : d * inv;  // as the target scales a logit (scaled_logit)
     if (!(z[keep] > kSampleZMin)) break;
   }
+  // no logit finite to scale from (the best infinite: every difference NaN): the best, as greedy takes it
+  if (keep == 0) return cand[o[0]];
   if (top_k > 0 && top_k < keep) {
     int m = top_k;
     while (m < keep && z[m] >= z[top_k - 1]) ++m;

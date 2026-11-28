@@ -113,7 +113,8 @@ __device__ void grow(EagleTree* t, const DevParams* P, const DevGen* G, const in
       forced = add_node(t, n++, parent, forced_tok, t->score[parent]);
       if (forced_tok == trunk_tok) trunk = forced;
     }
-    if (trunk_tok >= 0 && trunk < 0 && n < kEagleNodes) {  // outside the row's `beam`: its own node, scored as one
+    // outside the row's `beam`: its own node, scored as one (a token of the vocabulary: none from scores all NaN)
+    if (trunk_tok >= 0 && trunk_tok < vocab && trunk < 0 && n < kEagleNodes) {
       float lp = -INFINITY;
       for (int j = beam; j < kc; ++j)
         if (rc[j] == trunk_tok) lp = rv[j] - lse;
@@ -179,16 +180,18 @@ __global__ void k_eagle_tree_grow(EagleTree* t, const DevParams* P, const DevGen
   frontier_rows(t, gnode, hbuf, H);
 }
 
-// The round's tree of `width` drafts: the oracle's path, else the trunk's first `trunk`; then the best nodes by score
-// (ties: the lower index; a parent's score is never below its child's, so the nodes taken are a tree), in rows: the
-// trunk (from the root each row's oracle child, else its trunk child, else its first taken child) and the others in
-// node order, so a parent's row is before its child's.
+// The round's tree of `width` drafts: the oracle's path (its first `width`), else the trunk's first `trunk`; then the
+// best nodes by score (ties: the lower index; a parent's score is never below its child's, so the nodes taken are a
+// tree), in rows: the trunk (from the root each row's oracle child, else its trunk child, else its first taken
+// child) and the others in node order, so a parent's row is before its child's.
 __global__ void k_eagle_tree_finish(const EagleTree* t, int width, int trunk, int* drafts, TreeRows* tree) {
   pdl_trigger();
   if (threadIdx.x != 0) return;
   const int n = t->n;
   bool taken[kEagleNodes] = {}, oracle[kEagleNodes] = {};
-  for (int v = t->oracle_node; v > 0; v = t->parent[v]) oracle[v] = taken[v] = true;
+  // the oracle's path to `width` drafts deep at most (a tree of more steps holds deeper nodes than the round's rows)
+  for (int v = t->oracle_node; v > 0; v = t->parent[v])
+    if (t->depth[v] <= width) oracle[v] = taken[v] = true;
   int count = 0;
   for (int u = 1; u < n; ++u) count += taken[u];
   // without an oracle, the chain's first `trunk` drafts (the trunk the controller learns the chain from)
