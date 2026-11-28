@@ -2,7 +2,7 @@
 
 The binder and the memory estimator use the same offload plan. The model owns the placement, transfer streams and staging slots through `OffloadRuntime`. A sequence owns its round graphs. The elastic fitter accounts separately for resident weights, device workspace, pinned host memory and pageable archives.
 
-`--gpu-layers N` keeps the first N target attention or GDN layers and their MLPs resident. `--gpu-experts N` specifies an average over physical expert layers. Repeated program visits share one weight allocation. An explicit zero is valid for either limit. The elastic fitter searches both axes when one cannot cover the deficit. The public backend ABI carries the limits in version 53.
+`--gpu-layers N` keeps the first N target attention or GDN layers and their MLPs resident. `--gpu-experts N` specifies an average over physical expert layers. Repeated program visits share one weight allocation. An explicit zero is valid for either limit. The elastic fitter searches both axes when one cannot cover the deficit. The public backend ABI carries the limits in version 56.
 
 ## Routed experts
 
