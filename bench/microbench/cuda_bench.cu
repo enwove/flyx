@@ -520,10 +520,19 @@ void bench_gdn_prefill() {
 // the activations (k_to_bf16), which a prefill pass mostly leaves to the
 // producer kernels (gemm_tc_staged): the trace of a real pass shows the GEMM
 // alone (bench/trace).
-void bench_tc() {
+// cuda_bench tc [NxK ...]: the shapes given (default kShapes), 24..2048 rows.
+void bench_tc(int argc, char** argv) {
   header();
   std::printf("prefill GEMM TFLOPS per configuration (bf16 | nvfp4), random weights and activations\n");
-  for (const auto& s : kShapes) {
+  std::vector<Shape> shapes(std::begin(kShapes), std::end(kShapes));
+  if (argc > 2) {
+    shapes.clear();
+    for (int i = 2; i < argc; ++i) {
+      int n = 0, k = 0;
+      if (std::sscanf(argv[i], "%dx%d", &n, &k) == 2) shapes.push_back({argv[i], n, k});
+    }
+  }
+  for (const auto& s : shapes) {
     if (s.N == 248320) continue;
     Weights W(s, true);
     const size_t qb = size_t(s.N) * s.K / 2, sb = size_t(s.N) * s.K / 16;
@@ -538,7 +547,7 @@ void bench_tc() {
     CK(cudaMalloc(&x, size_t(2048) * s.K * 4));
     k_fill_f<<<1024, 256>>>(x, size_t(2048) * s.K, 19u, -2.f, 4.f);
     CK(cudaMalloc(&y, size_t(2048) * s.N * 4));
-    for (int rows : {32, 64, 128, 256, 512, 1024, 2048}) {
+    for (int rows : {24, 32, 48, 64, 96, 128, 256, 512, 1024, 2048}) {
       std::printf("%-14s r%-5d", s.name, rows);
       const double tf = 2.0 * rows * s.N * s.K / 1e12;
       for (int fp4 = 0; fp4 < 2; ++fp4) {
@@ -2461,7 +2470,7 @@ int main(int argc, char** argv) {
   else if (what == "decode") bench_decode();
   else if (what == "fp4cfgs") bench_fp4cfgs(argc, argv);
   else if (what == "fp4rows") bench_fp4rows(argc, argv);
-  else if (what == "tc") bench_tc();
+  else if (what == "tc") bench_tc(argc, argv);
   else if (what == "attn") bench_attn(argc > 2 ? std::atoi(argv[2]) : 16, argc > 3 ? std::atoi(argv[3]) : 32,
                                        argc > 4 ? std::atoi(argv[4]) : 0);
   else if (what == "mlp") bench_mlp();

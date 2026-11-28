@@ -323,8 +323,8 @@ void gemm_skinny(const float* x, int ldx, const bf16* W, int N, int K, float* y,
 // Prefill GEMMs, pipelined tensor cores (bf16 activations); used by gemm() /
 // gemm_fp4() for more than 16 rows.  Explicit entry points for tests and
 // benchmarks: cfg picks one of kTcConfigs compiled configurations (all give
-// the same bits), -1 the default.
-constexpr int kTcConfigs = 4;  // block tiles 64 x 128, 128 x 128, 64 x 64, 64 x 32 (gemm_prefill.cu)
+// the same bits), -1 the GPU's table's (candidates.toml: prefill_tc).
+constexpr int kTcConfigs = 7;  // the prefill_tc configurations
 void gemm_tc(const float* x, int ldx, const bf16* W, int N, int K, float* y, int ldy, int M, bool accumulate,
              const Launch& L, int cfg = -1);
 void gemm_fp4_tc(const float* x, int ldx, const uint8_t* Q, const uint8_t* S, const float* RS, int N, int K, float* y,

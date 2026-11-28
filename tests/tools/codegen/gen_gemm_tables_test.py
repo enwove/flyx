@@ -322,6 +322,30 @@ with tempfile.TemporaryDirectory() as d:
 check(err is not None and "the original tiles" in err, "refused: MoE configurations without the original tiles", err)
 
 MOE_REST = "{ columns = 0, units = 0 }"
+TC_REST = "{ bm = 64, bn = 128, wn = 4, stages = 2 }"
+# A GPU's own prefill rules: by the format and the rows, the defaults' tile counts for NVFP4.
+TC_OWN = f"""
+sku = "a"
+devices = ["GPU A"]
+[rules]
+prefill_tc = [
+  {{ format = "bf16", rows = [1, 128], bm = 64, bn = 32, wn = 2, stages = 6 }},
+  {{ format = "nvfp4", sm_tiles_below = 0.5, bm = 64, bn = 32, wn = 2, stages = 2 }},
+  {TC_REST},
+]
+"""
+text, err = generate({"a": TC_OWN})
+check(text is not None, "a table with prefill rules of its own generates", err)
+if text:
+    tc = [list(map(str.strip, e.strip("{}").split(","))) for e in entries(text, "kPrefillTc")]
+    cfg = {tuple(map(int, m.groups()[1:])): int(m.group(1))
+           for m in re.finditer(r"X\((\d+), (\d+), (\d+), (\d+), (\d+)\)", text)}
+    own = [r for r in tc if r[0] == "0"]
+    check(own == [["0", "0", "1", "128", "0.0", str(cfg[(64, 32, 2, 6)])],
+                  ["0", "1", "1", str(INF), "0.5", str(cfg[(64, 32, 2, 2)])],
+                  ["0", "-1", "1", str(INF), "0.0", str(cfg[(64, 128, 4, 2)])]],
+          "the GPU's prefill rules in order, by format, rows and tiles per SM", own)
+    check(any(r[0] == "-1" for r in tc), "the default prefill rules follow", tc)
 refusals = {
     "a MoE rule for every type in a configuration the other types do not compile": (
         "[rules]\nmoe_gate_up = [{ columns = 2, units = 1 }]\n", "beside the original tiles"),
@@ -372,6 +396,17 @@ refusals = {
     "a family that does not exist": ("[rules]\nblocks_rounds = []\n", "unknown rules"),
     "a configuration that is not compiled": ("[rules]\nblocks = [{ rows = [1, 16], nt = 3, nw = 1, kw = 1 }]\n",
                                              "compiled configuration"),
+    "a prefill configuration that is not compiled": (
+        f"[rules]\nprefill_tc = [{{ bm = 64, bn = 16, wn = 1, stages = 3 }}, {TC_REST}]\n", "compiled configuration"),
+    "prefill rules without a rule for the rest of a format": (
+        '[rules]\nprefill_tc = [{ format = "bf16", bm = 64, bn = 128, wn = 4, stages = 2 }]\n',
+        "with a rule for the rest"),
+    "a prefill rule after the rules for the rest": (
+        f'[rules]\nprefill_tc = [{TC_REST}, {{ format = "bf16", rows = [1, 64], bm = 64, bn = 32, wn = 2, stages = 6 }}]\n',
+        "after the rules for the rest"),
+    "a prefill rule of no format": (
+        f'[rules]\nprefill_tc = [{{ format = "fp8", bm = 64, bn = 32, wn = 2, stages = 6 }}, {TC_REST}]\n',
+        "takes a format"),
     "a K partition per shape broken": ("[rules]\nblocks_q8_runs = [{ runs = 1 }, { n_max = 5120, runs = 2 }]\n",
                                        "rising n_max"),
 }

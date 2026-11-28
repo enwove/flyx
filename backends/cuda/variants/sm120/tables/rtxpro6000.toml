@@ -143,3 +143,18 @@ k = 15360
 rules = [
   { rows = [1, 16], nt = 4, warps = 16, unroll = 4 },  # r1 1408 r4 1398 r8 1380 r16 1238
 ]
+
+[rules]
+# Prefill GEMMs with bf16 weights by the rows, from `cuda_bench tc` on Qwen3.8-27B's and its EAGLE-4 drafter's shapes
+# (34816x5120 5120x17408 16480x5120 14336x5120 5120x6144 15360x10240 5120x5120 32768x5120 5120x16384), TFLOPS
+# against the defaults' tile counts: 24-128 rows 64 x 32 of 6 stages, 23-28 against 11-20 at 24 rows, 99-130
+# against 55-98 at 128; 256 rows 64 x 64 of 4 stages, 155-184 against 100-161 (within 11% of the best
+# configuration on each shape); 512-2048 rows 128 x 128, 217-330 against 174-279.  NVFP4 weights: the defaults'.
+prefill_tc = [
+  { format = "bf16", rows = [1, 160], bm = 64, bn = 32, wn = 2, stages = 6 },
+  { format = "bf16", rows = [161, 384], bm = 64, bn = 64, wn = 4, stages = 4 },
+  { format = "bf16", bm = 128, bn = 128, wn = 4, stages = 3 },
+  { format = "nvfp4", sm_tiles_below = 0.5, bm = 64, bn = 32, wn = 2, stages = 2 },
+  { format = "nvfp4", sm_tiles_below = 6, bm = 64, bn = 64, wn = 4, stages = 2 },
+  { format = "nvfp4", bm = 64, bn = 128, wn = 4, stages = 2 },
+]
