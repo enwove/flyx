@@ -961,6 +961,12 @@ bool Engine::load(const std::string& path, const EngineOptions& opt, std::string
   t[4] = os::now_ms();
 
   int asked_ctx = 0;
+  // Trees a chosen drafter drafts by default beside auto's K/V reads (EAGLE-4's, whose file locks no exact reads as
+  // DV's and DSpark's do): its trees where the target's own switch (Engine::load's auto_from, or the backend's
+  // strata_from) leaves the whole context exact, which reads every position as FLYX_KV_READ_ALL does (the same bits
+  // below the switch); else its chains alone, strata's past the switch.  The switch is the target's either way, so
+  // naming the drafter changes no token (AGENTS.md gate 4).
+  const bool trees_by_switch = opt_.draft_trees && !opt_.draft_trees_given && tiers.method == FLYX_KV_AUTO;
   for (;;) {
     opt_.max_ctx = initial_max_ctx;
     plan::KvTiers attempt_tiers = tiers;
@@ -977,6 +983,17 @@ bool Engine::load(const std::string& path, const EngineOptions& opt, std::string
     }
     t[5] = os::now_ms();
     opened = ok;
+    if (ok && trees_by_switch) {
+      const int ctx = opt_.ctx_max ? (model_->trained_ctx() > 0 ? model_->trained_ctx() : kCtxMaxUnnamed)
+                                   : opt_.max_ctx;
+      const flyx_seq_layout all_on_gpu{ctx, ctx, FLYX_KV_AUTO, attempt_tiers.method_arg, 0};
+      flyx_seq_size size{};
+      opt_.draft_trees = api_->seq_size(bm_, &all_on_gpu, &size) == 0 && size.strata_from >= ctx;
+      if (opt_.draft_trees) attempt_tiers.method = FLYX_KV_READ_ALL;
+      else
+        log::info("flyx: %s drafts chains alone (K/V read through a low-bit copy from %d tokens on, which trees of "
+                  "drafts never read)", model_->drafter(), size.strata_from);
+    }
     if (ok) {
       lower_ms_ = timed_ms_ = 0;
       given_back_ = 0;

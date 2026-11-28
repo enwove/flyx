@@ -46,9 +46,6 @@ namespace {
 // its place; "" for none.
 std::string g_block;
 std::string block_label() { return g_block == "dspine" ? "DSpine" : g_block == "dflash" ? "DFlash" : "DFlash2"; }
-// A file whose drafter drafts trees by default (EAGLE-4's, Model::file_drafts_trees) reads every position: --kv-method
-// auto is exact attention's, never strata's, past any switch.
-bool file_reads_all() { return g_block == "eagle4"; }
 // EAGLE-4's trunk: the chain a tree of its drafts starts with (Model::block_drafts, kEagleTrunk)
 constexpr int kEagleTrunkDrafts = 7;
 
@@ -1654,9 +1651,8 @@ void strata_rounds(const std::string& model, const std::string& backend, const s
       auto strata3 = make(model, backend, false, "", fp8, narrow, false, 512, kReferenceWidth, false, -1, "strata:3");
       auto never = make(model, backend, false, "", fp8, narrow + ",strata_from=100000", false, 512, kReferenceWidth,
                         false, -1, "auto");
-      check(file_reads_all() ? tokens(first.get()) == te && tokens(first3.get()) == te && tokens(never.get()) == te
-                             : tokens(first.get()) == tokens(strata2.get()) &&
-                                   tokens(first3.get()) == tokens(strata3.get()) && tokens(never.get()) == te,
+      check(tokens(first.get()) == tokens(strata2.get()) && tokens(first3.get()) == tokens(strata3.get()) &&
+                tokens(never.get()) == te,
             std::string("auto") + (fp8 ? ", fp8" : ", binary16") +
                 ": switched at the start, strata's tokens (2-bit default and explicit 3-bit); never, exact attention's");
     }
@@ -1852,7 +1848,7 @@ void strata_rounds(const std::string& model, const std::string& backend, const s
         const flyx_seq_layout lp = pinned->kv_layout(), lq = paged->kv_layout();
         const bool ok_sz = pinned->api()->seq_size(pinned->bmodel(), &lp, &sz_pin) == 0 &&
                            paged->api()->seq_size(paged->bmodel(), &lq, &sz_pg) == 0;
-        check(ok_sz && (sz_pg.host_mapped < sz_pin.host_mapped || (file_reads_all() && std::string(method) == "auto")),
+        check(ok_sz && sz_pg.host_mapped < sz_pin.host_mapped,
               std::string("pageable_kv=on, ") + method + (fp8 ? ", fp8" : ", binary16") +
                   ": reduces host_mapped (" + std::to_string(sz_pg.host_mapped) + " < " +
                   std::to_string(sz_pin.host_mapped) + ")");
@@ -2075,10 +2071,7 @@ void strata_rounds(const std::string& model, const std::string& backend, const s
       const flyx_seq_layout lup = u_pin->kv_layout(), lug = u_pg->kv_layout();
       const bool ok_u = u_pin->api()->seq_size(u_pin->bmodel(), &lup, &sz_up) == 0 &&
                         u_pg->api()->seq_size(u_pg->bmodel(), &lug, &sz_ug) == 0;
-      // (a file that reads every position keeps its K/V where auto puts exact attention's: no strata switch to round
-      // to)
-      check(ok_u && (file_reads_all() || (sz_ug.device_positions == 16384 && sz_ug.host_mapped == 0 &&
-                                          sz_ug.host <= sz_up.host + (1ull << 20))),
+      check(ok_u && sz_ug.device_positions == 16384 && sz_ug.host_mapped == 0 && sz_ug.host <= sz_up.host + (1ull << 20),
             "pageable_kv=on unaligned kv_gpu=17000: rounded to 16384 and host size excludes device prefix (" +
                 std::to_string(sz_ug.host) + " vs pinned " + std::to_string(sz_up.host) + ")");
       std::vector<int32_t> p16k(16390);

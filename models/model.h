@@ -199,7 +199,7 @@ class Model : public interfaces::Model {
   std::shared_ptr<const interfaces::VisionAdapter> vision_adapter_;
   std::vector<flyx_node> vision_nodes_;
   bool kv_fp8_by_default_ = true;         // FP8 where a real model of the family showed no visible drop
-  bool file_drafts_trees_ = false;        // the file holds DV or a tapped drafter drafting trees by default
+  bool file_drafts_trees_ = false;        // the file holds DV or a block drafter drafting trees by default (DSpark)
   bool draft_trees_by_default_ = false;   // its tapped drafter drafts trees by default (drafts_trees_by_default)
   bool verify_scales_with_width_ = false; // sparse-MoE targets whose verify cost climbs steeply with verify width
 
