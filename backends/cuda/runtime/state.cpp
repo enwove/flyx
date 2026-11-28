@@ -577,10 +577,8 @@ int seq_size(flyx_bmodel* m, const flyx_seq_layout* layout, flyx_seq_size* out) 
   *out = {};
   // Include the VMM granularity rounding of the device arena so --vram-reserve 0 does not undercount the last piece.
   size_t arena_pad = 0;
-  if (vmm_supported() && s.arena_dev_bytes > 0) {
-    const size_t gran = vmm_granularity();
-    arena_pad = ((s.arena_dev_bytes + gran - 1) / gran) * gran - s.arena_dev_bytes;
-  }
+  if (vmm_supported() && (s.arena_dev_bytes || s.page_spill_vram))
+    arena_pad = arena_padding(s.arena_dev_bytes, s.page_spill_vram, vmm_granularity());
   out->device = s.dry_bytes + arena_pad + s.page_spill_vram + room;
   out->host = s.dry_host_bytes + s.page_spill_host;
   out->host_mapped = s.dry_mapped_bytes;
