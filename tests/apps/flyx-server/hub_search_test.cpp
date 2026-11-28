@@ -39,13 +39,16 @@ struct StandIn {
 
   HubSearchFn fn() {
     return [this](const std::string& q, const std::string&, int n, std::vector<Found>* out, std::string* err,
-                  const std::string& cursor, std::string* next, bool gguf_only, flyx::hub::HubOutcome*) {
+                  const std::string& cursor, std::string* next, bool gguf_only, flyx::hub::HubOutcome* outcome) {
       {
         std::lock_guard<std::mutex> lock(mu);
         asked.push_back(std::string(gguf_only ? "gguf:" : "all:") + cursor);
         limit = n, query = q;
       }
-      if (gguf_only ? gguf_fails : all_fails) return *err = "the Hub answered 429", false;
+      if (gguf_only ? gguf_fails : all_fails) {
+        if (outcome) *outcome = {flyx::hub::HubError::kRateLimited, gguf_only ? "30" : "7"};
+        return *err = std::string("the Hub answered 429 (") + (gguf_only ? "gguf" : "all") + ")", false;
+      }
       const Pages& pages = gguf_only ? gguf : all;
       const auto it = pages.find(cursor);
       if (it == pages.end()) return *err = "no such page: " + cursor, false;
@@ -124,9 +127,61 @@ int main() {
   // The GGUF stream unanswered: the page fails with the Hub's reason.
   hub.gguf_fails = true;
   err.clear();
-  ok = flyx::server::search_page(hub.fn(), "acme model", "trending", 20, "", &found, &next, &err, nullptr);
-  check(!ok && err == "the Hub answered 429", "an unanswered GGUF stream fails the page: " + err);
+  flyx::hub::HubOutcome outcome;
+  ok = flyx::server::search_page(hub.fn(), "acme model", "trending", 20, "", &found, &next, &err, &outcome);
+  check(!ok && err == "the Hub answered 429 (gguf)" && outcome.error == flyx::hub::HubError::kRateLimited &&
+            outcome.retry_after == "30",
+        "an unanswered GGUF stream fails the page with its error: " + err);
   hub.gguf_fails = false;
+
+  // The GGUF stream at its end and the drafter stream unanswered: its error (Retry-After kept), not an empty last
+  // page, so the same cursor can be asked again.
+  const std::string drafters_only = R"({"v":1,"d":"a2"})";
+  hub.all_fails = true;
+  outcome = {};
+  err.clear();
+  ok = flyx::server::search_page(hub.fn(), "acme model", "trending", 20, drafters_only, &found, &next, &err, &outcome);
+  check(!ok && err == "the Hub answered 429 (all)" && outcome.error == flyx::hub::HubError::kRateLimited &&
+            outcome.retry_after == "7" && found.empty() && next.empty(),
+        "the only stream left unanswered fails the page with its error: " + err);
+  hub.all_fails = false;
+  ok = flyx::server::search_page(hub.fn(), "acme model", "trending", 20, drafters_only, &found, &next, &err, nullptr);
+  check(ok && ids(found) == std::vector<std::string>{"other/Model-DSpine"} && next == R"({"d":"a3","v":1})",
+        "and the same cursor asked again goes on: " + next);
+
+  // A cursor of this search's version that is not one fails as a bad request; an object of another shape (an older
+  // server's, the Hub's) is the Hub's own cursor, the GGUF stream's alone.
+  for (const std::string bad : {R"({"v":1})", R"({"v":1,"g":""})", R"({"v":1,"g":5})", R"({"v":2,"g":"g2"})",
+                                R"({"v":1,"g":"g2","page":2})", R"({"v":1,"g":"g2","x":""})"}) {
+    outcome = {};
+    hub.asked.clear();
+    ok = flyx::server::search_page(hub.fn(), "acme model", "trending", 20, bad, &found, &next, &err, &outcome);
+    check(!ok && outcome.error == flyx::hub::HubError::kInvalidName && hub.asked.empty(),
+          "a malformed cursor of this search's is refused, the Hub not asked: " + bad);
+  }
+  hub.gguf[R"({"page":2})"] = {{repo("acme/Legacy-GGUF", "qwen35")}, ""};
+  hub.asked.clear();
+  ok = flyx::server::search_page(hub.fn(), "acme model", "trending", 20, R"({"page":2})", &found, &next, &err, nullptr);
+  check(ok && ids(found) == std::vector<std::string>{"acme/Legacy-GGUF"} &&
+            hub.asked == std::vector<std::string>{R"(gguf:{"page":2})"},
+        "an object that is not this search's cursor goes to the GGUF stream as it is (" + joined(hub.asked) + ")");
+
+  // An exact name's repository a first page showed (manage.cpp's lookup) on no page after it, whichever stream
+  // lists it there, the exclusion carried to the end.
+  ok = flyx::server::search_page(hub.fn(), "acme model", "trending", 20, "", &found, &next, &err, nullptr);
+  next = flyx::server::cursor_excluding(next, "acme/Model-Q8-GGUF");
+  std::vector<std::string> later;
+  for (int i = 0; ok && !next.empty() && i < 10; ++i) {
+    const std::string at = next;
+    ok = flyx::server::search_page(hub.fn(), "acme model", "trending", 20, at, &found, &next, &err, nullptr);
+    for (const std::string& id : ids(found)) later.push_back(id);
+    if (!next.empty() && next.find(R"("x":"acme/Model-Q8-GGUF")") == std::string::npos) ok = false;
+  }
+  check(ok && later == std::vector<std::string>{"other/Model-DSpine", "acme/Model-DFlash"},
+        "the exact name's repository on no later page, the exclusion in every cursor: " + joined(later));
+  check(flyx::server::cursor_excluding("", "acme/Model-Q8-GGUF").empty() &&
+            flyx::server::cursor_excluding("g2", "acme/Model-Q8-GGUF") == "g2",
+        "nothing to exclude from where there is no page after, or from the Hub's own cursor");
 
   // A cursor that is not a page's (the Hub's own, as an older server gave): the GGUF stream from it, alone.
   hub.asked.clear();

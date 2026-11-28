@@ -645,10 +645,13 @@ void add_manage_routes(httplib::Server& http, Server* s) {
         return hub_error(r, out, err);
       if (cursor.empty()) {
         // A query naming a repository (org/name): that one first, looked up directly, whether the Hub's search lists
-        // it or not (newly published, or matched by its name alone).
+        // it or not (newly published, or matched by its name alone); shown here, it is on no later page.
         hub::Name exact;
-        if (hub::parse_name(asked, &exact) &&
-            std::none_of(found.begin(), found.end(), [&](const hub::Found& f) { return f.id == exact.repo; })) {
+        const auto shown = [&] {
+          return std::any_of(found.begin(), found.end(), [&](const hub::Found& f) { return f.id == exact.repo; });
+        };
+        const bool named = hub::parse_name(asked, &exact);
+        if (named && !shown()) {
           hub::Repo repo;
           std::string e2;
           if (hub::describe(exact.repo, exact.revision, &repo, &e2, nullptr, remote_path_policy(*s, q))) {
@@ -664,6 +667,7 @@ void add_manage_routes(httplib::Server& http, Server* s) {
             found.insert(found.begin(), std::move(f));
           }
         }
+        if (named && shown()) next_cursor = cursor_excluding(next_cursor, exact.repo);
       }
     } else {
       // Without a query, browse GGUF repositories of every architecture this build runs (or one chosen via `arch`),
