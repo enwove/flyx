@@ -1642,6 +1642,14 @@ void strata_rounds(const std::string& model, const std::string& backend, const s
       check(tokens(host.get()) == t && tokens(copy_host.get()) == t,
             std::string("auto") + (fp8 ? ", fp8" : ", binary16") +
                 ": the K/V (and the copy) in host memory, DFlash2 across the switch == plain decode");
+      // --kv-gpu below the context and no switch given: the one the target's K/V on the GPU sets (Engine::load's
+      // auto_from), whichever drafter is named; the drafter's chosen rounds (EAGLE-4's chains alone, its trees reading
+      // every position) give plain decoding's tokens there too.
+      auto gpu_plain = make(model, backend, false, "", fp8, narrow, false, 512, kReferenceWidth, false, from, "auto");
+      auto gpu_spec = make(model, backend, true, g_block, fp8, narrow, false, 512, -1, false, from, "auto");
+      check(tokens(gpu_spec.get()) == tokens(gpu_plain.get()),
+            std::string("auto") + (fp8 ? ", fp8" : ", binary16") + ": --kv-gpu " + std::to_string(from) +
+                ", no switch given: " + block_label() + "'s chosen rounds decode == plain decode");
       // The switch at the start: strata's tokens (2-bit default, and explicit 3-bit); past the context: exact's.
       auto first = make(model, backend, false, "", fp8, narrow + ",strata_from=0", false, 512, kReferenceWidth, false,
                         -1, "auto");

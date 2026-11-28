@@ -986,6 +986,9 @@ bool Engine::load(const std::string& path, const EngineOptions& opt, std::string
     if (ok && trees_by_switch) {
       const int ctx = opt_.ctx_max ? (model_->trained_ctx() > 0 ? model_->trained_ctx() : kCtxMaxUnnamed)
                                    : opt_.max_ctx;
+      // The layout's device positions do not move the switch: the open locked it (lock_auto_from) to auto_from, the
+      // target-only K/V on the GPU (or --kv-gpu), unless a backend option's strata_from replaces it; either way it is
+      // the one a session of any placement this attempt gets reads, as with --drafter none.
       const flyx_seq_layout all_on_gpu{ctx, ctx, FLYX_KV_AUTO, attempt_tiers.method_arg, 0};
       flyx_seq_size size{};
       opt_.draft_trees = api_->seq_size(bm_, &all_on_gpu, &size) == 0 && size.strata_from >= ctx;
