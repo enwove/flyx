@@ -774,7 +774,9 @@ MoeBlock moe(WeightLoader& L, const flyx_moe_block& b, const StateMap& sm, const
   f.gate_up = L.expert_mat(b.gate_up, plan.hot[b.gate_up], plan.direct, f.cold_gu);
   f.down = L.expert_mat(b.down, plan.hot[b.down], plan.direct, f.cold_down);
   if (plan.direct && plan.hot[b.gate_up] < b.n_experts)
-    L.model()->offload->mapped_experts().attach(L.model(), f, b.gate_up, b.down, plan.hot[b.gate_up]);
+    L.model()->offload->mapped_experts().attach(L.model(), f, b.gate_up, b.down, plan.hot[b.gate_up],
+                                                {L.t(b.router), b.router_bias >= 0 ? L.t(b.router_bias) : nullptr,
+                                                 L.t(b.gate_up), L.t(b.down)});
   if (b.post_conv >= 0) f.post_conv = L.vec(b.post_conv);
   if (b.res_query >= 0) f.res_query = L.vec(b.res_query);
   f.loop_rank = b.loop_rank;
@@ -1413,6 +1415,7 @@ void bind(flyx_bmodel* m, const flyx_model_desc& d, LoadTimes* times) {
   L.finish();
   if (offload.cold.pairs) m->offload->init_experts(m, offload);
   if (offload.prefill_slots[0]) m->offload->mapped_experts().init_prefill(m, offload.prefill_slots);
+  if (m->offload && m->offload->maps_experts()) m->offload->mapped_experts().load_profile();
   if (times) {
     *times = L.times();
     if (streaming) {

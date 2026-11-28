@@ -123,18 +123,23 @@ void* ExpertAddressSpace::allocate(flyx_bmodel* model, int weight, size_t bytes,
   return address;
 }
 
-void ExpertAddressSpace::attach(flyx_bmodel* model, MoeBlock& block, int gate, int down, int resident) {
+void ExpertAddressSpace::attach(flyx_bmodel* model, MoeBlock& block, int gate, int down, int resident,
+                                const std::array<const flyx_tensor_view*, 4>& views) {
   verbose_ = model->verbose != 0;
   const size_t n = block.n_experts;
   auto [it, added] = histograms_.try_emplace({gate, down}, n);
   auto& h = it->second;
   if (added) {
+    if (model->opt.expert_adapt) profile_ = expert_profile_folder(model->opt.expert_profile);
+    if (!profile_.empty())
+      for (size_t i = 0; i < views.size(); ++i)
+        fingerprint_ = fingerprint_tensor(fingerprint_, views[i], i < 2);
     h.device = model->alloc<uint32_t>(2 * n);
     h.slots = model->alloc<int>(n);
     h.resident = model->alloc<uint8_t>(n);
     CK(cudaMemset(h.device, 0, 2 * n * sizeof(uint32_t)));
     CK(cudaMemcpy(h.slots, h.order.slot.data(), n * sizeof(int), cudaMemcpyHostToDevice));
-    model->host_bytes += n * (2 * sizeof(uint32_t) + 2 * sizeof(int) + sizeof(uint64_t));
+    model->host_bytes += n * (2 * sizeof(uint32_t) + 2 * sizeof(int) + 3 * sizeof(uint64_t));
     if (model->opt.expert_adapt && !scratch_) scratch_ = model->alloc<uint8_t>(vmm_granularity());
   }
   {
@@ -211,7 +216,7 @@ void ExpertAddressSpace::count_resident(size_t routes) {
   std::lock_guard lock(mutex_);
   full_routes_ += routes;
 }
-void ExpertAddressSpace::observe() {
+void ExpertAddressSpace::observe(bool learn) {
   uint64_t visited = full_routes_, resident = full_routes_;
   full_routes_ = 0;
   double sampled_rows = 0, remote_rows = 0;
@@ -223,8 +228,15 @@ void ExpertAddressSpace::observe() {
     uint64_t count = 0, cold = 0;
     for (size_t i = 0; i < n; ++i) {
       const uint32_t decode = h.decode[i];
-      h.order.scores[i] = h.order.scores[i] / 2 + uint64_t(h.order.counts[i]) + decode;
-      pending_ |= h.order.counts[i] != 0 || decode != 0;
+      if (learn) {
+        h.heat[i] = add_routes(h.heat[i], decode);
+        h.unsaved[i] = add_routes(h.unsaved[i], decode);
+        h.order.scores[i] = h.heat[i];
+        pending_ |= decode != 0;
+      } else if (!guided_) {
+        h.order.scores[i] = h.order.scores[i] / 2 + uint64_t(h.order.counts[i]) + decode;
+        pending_ |= h.order.counts[i] != 0 || decode != 0;
+      }
       if (!decode) continue;
       count += decode;
       const bool hot = this->resident(pair, h.order.slot[i]);
@@ -240,6 +252,7 @@ void ExpertAddressSpace::observe() {
       remote_rows += rows * (1 - std::pow(double(count - cold) / count, h.top_k));
     }
   }
+  CK(cudaStreamSynchronize(nullptr));  // the last histogram reset precedes the next nonblocking reader stream
   if (sampled_rows) {
     observed_rows_ = 0.5 * observed_rows_ + sampled_rows;
     observed_remote_rows_ = 0.5 * observed_remote_rows_ + remote_rows;
@@ -252,7 +265,7 @@ void ExpertAddressSpace::observe() {
                  static_cast<unsigned long long>(visited));
 }
 
-void ExpertAddressSpace::rank_experts() {
+void ExpertAddressSpace::rank_experts(bool all) {
   struct Candidate {
     Histogram* layer;
     size_t bytes;
@@ -296,16 +309,16 @@ void ExpertAddressSpace::rank_experts() {
           CK(cudaMemcpyAsync(y, scratch_, n, cudaMemcpyDeviceToDevice));
         }
       }
-    });
+    }, all);
     if (changed)
       CK(cudaMemcpy(h.slots, h.order.slot.data(), h.order.slot.size() * sizeof(int), cudaMemcpyHostToDevice));
   }
   CK(cudaStreamSynchronize(nullptr));
 }
 
-void ExpertAddressSpace::promote() {
+void ExpertAddressSpace::promote(Placement mode) {
   const auto started = std::chrono::steady_clock::now();
-  rank_experts();
+  if (mode != Placement::BetweenRequests) rank_experts(mode == Placement::Load);
   struct Page {
     double frequency;
     size_t order;
@@ -339,34 +352,51 @@ void ExpertAddressSpace::promote() {
   std::sort(device.begin(), device.end(), less);
   std::sort(host.rbegin(), host.rend(), less);
   // Bound adaptation traffic; a tie retains the existing backing.
-  const size_t limit = std::min({device.size(), host.size(), (order + 7) / 8});
+  // Between requests only physical pages move, in pairs. Cap the bytes as well as the
+  // number of remaps (16 MiB on each side for the usual 2 MiB driver granule).
+  size_t budget = order;
+  if (mode == Placement::ColdPrompt) budget = (order + 7) / 8;
+  if (mode == Placement::BetweenRequests) budget = std::min<size_t>(8, (16u << 20) / granule_);
+  const size_t limit = std::min({device.size(), host.size(), budget});
   size_t i = 0;
   for (; i < limit && host[i].frequency > device[i].frequency; ++i) {
     auto &a = device[i], &b = host[i];
     copy_expert_pages(a.plane->memory, a.index, b.plane->memory, b.index, scratch_);
   }
-  CK(cudaStreamSynchronize(nullptr));
+  if (i) CK(cudaStreamSynchronize(nullptr));  // scratch copies complete before either backing is unmapped
   for (size_t j = 0; j < i; ++j) {
     auto &a = device[j], &b = host[j];
     exchange_expert_backing(a.plane->memory, a.index, b.plane->memory, b.index);
     a.plane->hot[a.index] = 0;
     b.plane->hot[b.index] = 1;
   }
-  if (i)
+  if (i) {
     for (auto& [pair, h] : histograms_) publish_residency(pair, h);
-  select_gather();
+    CK(cudaStreamSynchronize(nullptr));
+  }
+  // A cached slot frequency does not describe how many rows of a verification round touch a host page.
+  // Keep the loader's gather choice until this process observes rounds with the new placement.
+  if (mode != Placement::Load) select_gather();
   if (verbose_)
-    std::fprintf(stderr, "flyx-cuda: redistributed %zu expert pages at quiescence in %.1f ms\n", i,
+    std::fprintf(stderr, "flyx-cuda: redistributed %zu expert pages %s in %.1f ms\n", i,
+                 mode == Placement::BetweenRequests ? "between requests" : "at quiescence",
                  std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - started).count());
 }
 
+std::shared_lock<std::shared_mutex> ExpertAddressSpace::reading() {
+  std::shared_lock lock(pages_mu_);
+  if (failed_) throw std::runtime_error("mapped expert placement failed");
+  return lock;
+}
+
 void ExpertAddressSpace::finish_prompt(cudaStream_t stream) {
+  std::unique_lock pages(pages_mu_);
   std::lock_guard lock(mutex_);
-  if (!scratch_ || sessions_ != 1) return;
+  if (!scratch_ || sessions_ != 1 || guided_) return;
   CK(cudaStreamSynchronize(stream));
   try {
     observe();
-    if (pending_) promote();
+    if (pending_) promote(Placement::ColdPrompt);
     pending_ = false;
   } catch (...) {
     failed_ = true;
@@ -375,11 +405,12 @@ void ExpertAddressSpace::finish_prompt(cudaStream_t stream) {
 }
 
 void ExpertAddressSpace::open() {
+  std::unique_lock pages(pages_mu_);
   std::lock_guard lock(mutex_);
   if (failed_) throw std::runtime_error("mapped expert placement failed");
   if (!sessions_ && pending_ && scratch_) {
     try {
-      promote();
+      promote(Placement::ColdPrompt);
     } catch (...) {
       failed_ = true;
       throw;
@@ -390,6 +421,7 @@ void ExpertAddressSpace::open() {
 }
 
 void ExpertAddressSpace::close(const flyx_seq* seq) noexcept {
+  std::unique_lock pages(pages_mu_);
   std::lock_guard lock(mutex_);
   --sessions_;
   try {
@@ -398,6 +430,71 @@ void ExpertAddressSpace::close(const flyx_seq* seq) noexcept {
   } catch (...) {
     failed_ = true;
   }
+}
+
+void ExpertAddressSpace::request_boundary(bool begin) {
+  if (!scratch_) return;
+  std::unique_lock pages(pages_mu_);
+  std::lock_guard lock(mutex_);
+  if (begin) {
+    if (failed_) throw std::runtime_error("mapped expert placement failed");
+    ++requests_;
+    return;
+  }
+  if (--requests_ || failed_) return;
+  const auto started = std::chrono::steady_clock::now();
+  try {
+    // A request can leave speculative work queued. Raw backend callers can also enqueue from another thread.
+    // Hold the submission lock through the fence, the exchanges, and publication of the resident mask.
+    CK(cudaDeviceSynchronize());
+    pending_ = false;
+    observe(true);
+    if (pending_) {
+      promote(Placement::BetweenRequests);
+      guided_ = true;
+      save_profile();
+      if (verbose_)
+        std::fprintf(stderr, "flyx-cuda: between-request expert maintenance %.1f ms\n",
+                     std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - started).count());
+    }
+    pending_ = false;
+  } catch (...) {
+    failed_ = true;
+    throw;
+  }
+}
+
+std::vector<ProfileLayer> ExpertAddressSpace::profile_layers() const {
+  std::vector<ProfileLayer> layers;
+  for (const auto& [weights, h] : histograms_) layers.push_back({weights, h.unsaved});
+  return layers;
+}
+
+void ExpertAddressSpace::save_profile() {
+  if (profile_.empty()) return;
+  auto layers = profile_layers();
+  if (!merge_expert_profile(expert_profile_file(profile_, fingerprint_), fingerprint_, &layers)) return;
+  size_t i = 0;
+  for (auto& [_, h] : histograms_) {
+    h.heat = std::move(layers[i++].scores);
+    std::fill(h.unsaved.begin(), h.unsaved.end(), 0);
+  }
+}
+
+void ExpertAddressSpace::load_profile() {
+  if (profile_.empty()) return;
+  auto layers = profile_layers();
+  if (!load_expert_profile(expert_profile_file(profile_, fingerprint_), fingerprint_, &layers)) return;
+  const bool trained = std::any_of(layers.begin(), layers.end(), [](const auto& layer) {
+    return std::any_of(layer.scores.begin(), layer.scores.end(), [](uint64_t n) { return n != 0; });
+  });
+  if (!trained) return;
+  size_t i = 0;
+  for (auto& [_, h] : histograms_) h.order.scores = h.heat = std::move(layers[i++].scores);
+  guided_ = true;
+  CK(cudaDeviceSynchronize());
+  promote(Placement::Load);
+  if (verbose_) std::fprintf(stderr, "flyx-cuda: loaded local decode expert profile\n");
 }
 
 void ExpertAddressSpace::report(FILE* out) const {

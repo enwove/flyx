@@ -150,9 +150,9 @@ static OffloadPlan make_plan(const flyx_model_desc& d, const BackendOptions& o) 
       const auto& f = d.blocks[i].moe;
       if (plan.hot[f.gate_up] < f.n_experts && pairs.emplace(f.gate_up, f.down).second) {
         const size_t n = f.n_experts;
-        plan.workspace_bytes = size_add(plan.workspace_bytes, n * (2 * sizeof(uint32_t) + sizeof(int)));
+        plan.workspace_bytes = size_add(plan.workspace_bytes, n * (2 * sizeof(uint32_t) + sizeof(int) + sizeof(uint8_t)));
         plan.pageable_bytes =
-            size_add(plan.pageable_bytes, n * (2 * sizeof(uint32_t) + 2 * sizeof(int) + sizeof(uint64_t)));
+            size_add(plan.pageable_bytes, n * (2 * sizeof(uint32_t) + 2 * sizeof(int) + 3 * sizeof(uint64_t)));
       }
     }
   }

@@ -139,6 +139,8 @@ class Generation {
   // generation is destroyed.
   Generation(Session* s, const GenerateRequest& req, TextSink sink);
   ~Generation();
+  Generation(const Generation&) = delete;
+  Generation& operator=(const Generation&) = delete;
 
   enum class Progress { kWorked, kBusy, kDone };
   // The next unit of work.  wait: wait for the device when the unit needs it.
@@ -234,6 +236,7 @@ class Generation {
   Engine* e_;
   const flyx_backend_api* api_;
   const GenerateRequest& req_;
+  bool request_started_ = false;
   ReplyText reply_;
   GenerateResult result_;
   std::string error_;

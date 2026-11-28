@@ -1,4 +1,7 @@
 // Copyright 2026 The flyx Authors. SPDX-License-Identifier: Apache-2.0
+#include <cstdlib>
+#include <filesystem>
+#include <thread>
 #include <limits>
 #include <random>
 #include <stdexcept>
@@ -7,6 +10,7 @@
 
 #include "backends/cuda/runtime/offload/expert_store.h"
 #include "backends/cuda/runtime/offload/expert_order.h"
+#include "backends/cuda/runtime/offload/expert_profile.h"
 #include "ops/dtype/ref.h"
 #include "tests/common/check.h"
 
@@ -27,6 +31,102 @@ int main() {
                 "decayed counts retain a frequent expert for the next epoch");
     test::check(o.update(0, o.scores.data(), exchange) == 0 && o.update(8, o.scores.data(), exchange) == 0,
                 "empty and full resident sets have no swaps");
+  }
+  // The expert profile: its bytes round-trip, and only a whole file of the same fingerprint and layers is read.
+  {
+    const std::vector<cuda::ProfileLayer> written{{{3, 4}, {9, 0, 7}}, {{5, 6}, {1, 2, 3, 4}}};
+    const uint64_t print = 0x1234abcdull;
+    const std::string bytes = cuda::encode_expert_profile(print, written);
+    auto empty = [&] {
+      std::vector<cuda::ProfileLayer> layers = written;
+      for (auto& layer : layers) layer.scores.assign(layer.scores.size(), 0);
+      return layers;
+    };
+    auto layers = empty();
+    test::check(cuda::decode_expert_profile(bytes, print, &layers) && layers[0].scores == written[0].scores &&
+                    layers[1].scores == written[1].scores,
+                "profile round trip");
+    auto refused = [&](const std::string& b, uint64_t p, std::vector<cuda::ProfileLayer> l) {
+      const auto before = l;
+      if (cuda::decode_expert_profile(b, p, &l)) return false;
+      for (size_t i = 0; i < l.size(); ++i)
+        if (l[i].scores != before[i].scores) return false;
+      return true;
+    };
+    test::check(refused(bytes, print + 1, empty()), "another model's profile");
+    test::check(refused(bytes.substr(0, bytes.size() - 1), print, empty()), "a cut profile");
+    test::check(refused(bytes + '\0', print, empty()), "a profile with bytes after it");
+    test::check(refused(bytes.substr(0, 20), print, empty()), "a damaged header");
+    auto old_version = bytes;
+    old_version[8] ^= 1;
+    test::check(refused(old_version, print, empty()), "incompatible profile version");
+    auto other = empty();
+    other[1].weights.second = 7;
+    test::check(refused(bytes, print, other), "a profile of other projections");
+    other = empty();
+    other[0].scores.resize(4);
+    test::check(refused(bytes, print, other), "a profile of another expert count");
+    test::check(refused(bytes, print, {empty()[0]}), "a profile of another layer count");
+
+    const auto folder = std::filesystem::temp_directory_path() /
+                        ("flyx-cold-dot-profile-" + std::to_string(std::random_device{}()));
+    const auto file = cuda::expert_profile_file(folder, print);
+    auto increments = written;
+    test::check(!cuda::load_expert_profile(file, print, &increments), "cache miss");
+    test::check(cuda::merge_expert_profile(file, print, &increments), "create local profile");
+    increments = written;
+    test::check(cuda::merge_expert_profile(file, print, &increments), "merge another engine's counts");
+    layers = empty();
+    test::check(cuda::load_expert_profile(file, print, &layers) && layers[0].scores[0] == 18 &&
+                layers[1].scores[3] == 8, "two writers accumulate routes once each");
+    auto writer = [&] {
+      auto delta = written;
+      return cuda::merge_expert_profile(file, print, &delta);
+    };
+    bool other_ok = false;
+    std::thread another([&] { other_ok = writer(); });
+    const bool own_ok = writer();
+    another.join();
+    test::check(own_ok && other_ok, "concurrent cache merge");
+    test::check(cuda::load_expert_profile(file, print, &layers) && layers[0].scores[0] == 36,
+                "overlapping writers preserve both increments");
+    std::string corrupt = bytes;
+    corrupt[corrupt.size() - 10] ^= 1;
+    test::check(refused(corrupt, print, empty()), "checksum rejects modified scores");
+    test::check(cuda::add_routes(UINT64_MAX - 2, 9) == UINT64_MAX, "route counts saturate");
+    std::error_code ec;
+    std::filesystem::remove_all(folder, ec);
+
+    test::check(cuda::expert_profile_folder("0").empty(), "expert_profile=0 names no folder");
+    test::check(cuda::expert_profile_folder("D:/p/q") == std::filesystem::path("D:/p/q"), "a folder given");
+    const auto cache = cuda::expert_profile_folder("auto");
+#ifdef _WIN32
+    const auto* root = _wgetenv(L"LOCALAPPDATA");
+#else
+    const auto* root = std::getenv("XDG_CACHE_HOME");
+#endif
+    if (root && *root)
+      test::check(cache == std::filesystem::path(root) / "flyx" / "expert_profiles", "user-local cache root");
+    test::check(file.filename() == "v2-000000001234abcd.bin", "cache key includes the format and model");
+
+    // The fingerprint: a router's every byte, a large projection's ends, every tensor's format and shape.
+    std::vector<unsigned char> router(4096, 1), projection(1u << 20, 2);
+    flyx_tensor_view r{"r", FLYX_DT_F32, 2, {32, 32}, router.data(), router.size()};
+    flyx_tensor_view w{"w", FLYX_DT_GGML_Q8_0, 2, {1024, 1024}, projection.data(), projection.size()};
+    auto print_of = [&] {
+      return cuda::fingerprint_tensor(cuda::fingerprint_tensor(cuda::kFingerprintSeed, &r, true), &w, false);
+    };
+    const uint64_t first = print_of();
+    router[2000] = 9;
+    const uint64_t router_changed = print_of();
+    router[2000] = 1;
+    projection[projection.size() / 2] = 9;
+    const uint64_t middle_changed = print_of();
+    projection[projection.size() - 1] = 9;
+    const uint64_t end_changed = print_of();
+    w.dtype = FLYX_DT_GGML_Q4_K;
+    test::check(router_changed != first && middle_changed == first && end_changed != first && print_of() != end_changed,
+                "profile fingerprint: router bytes, projection ends, formats");
   }
   for (bool spin : {false, true}) {
     cuda::RowPool pool(4, spin);

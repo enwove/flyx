@@ -4,6 +4,7 @@
 #include <cstddef>
 #include <cstdio>
 #include <memory>
+#include <shared_mutex>
 #include <cuda_runtime_api.h>
 
 #include "backends/cuda/runtime/offload/offload_stats.h"
@@ -25,6 +26,9 @@ class OffloadRuntime {
   void on_session_close(flyx_bmodel* m, const flyx_seq* sequence = nullptr);
   void maintain(flyx_bmodel* m);
   void finish_prompt(cudaStream_t stream);
+  void request_boundary(bool begin);
+  // Shared while a pass or round is enqueued (ExpertAddressSpace::reading); empty without mapped experts.
+  std::shared_lock<std::shared_mutex> expert_reads();
   void report(FILE* file);
   void count_fully_resident(size_t routes);
   ExpertAddressSpace& mapped_experts();

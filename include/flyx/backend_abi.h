@@ -1286,6 +1286,9 @@ typedef struct flyx_backend_api {
    * policy asked): "nvfp4", "q8" (Q8_0 blocks), "exact" (the file's own precision: bf16, or GGML blocks of another
    * type kept as stored), or "" when no neural drafter is active.  NULL: backend does not report it. */
   const char* (*draft_weights)(flyx_bmodel* m);
+  /* ABI 56: optional request lifetime notification. A successful begin is paired with an end after the
+   * reply, including on cancellation or error. Concurrent requests can use different sequences. */
+  int (*request_boundary)(flyx_seq* s, int32_t begin);
 } flyx_backend_api;
 
 typedef const flyx_backend_api* (*flyx_backend_entry_fn)(void);

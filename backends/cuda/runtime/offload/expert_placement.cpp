@@ -81,6 +81,14 @@ void OffloadRuntime::finish_prompt(cudaStream_t stream) {
   if (mapped_) mapped_->finish_prompt(stream);
 }
 
+void OffloadRuntime::request_boundary(bool begin) {
+  if (mapped_) mapped_->request_boundary(begin);
+}
+
+std::shared_lock<std::shared_mutex> OffloadRuntime::expert_reads() {
+  return mapped_ ? mapped_->reading() : std::shared_lock<std::shared_mutex>();
+}
+
 void OffloadRuntime::on_session_open(flyx_bmodel* m, cudaStream_t stream) {
   if (mapped_) mapped_->open();
   if (!cold_) return;

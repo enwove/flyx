@@ -23,9 +23,9 @@ struct ExpertOrder {
 
   // Swaps are between whole sessions. Prefer the existing resident on ties and use logical ID to break other ties.
   template <class Exchange>
-  size_t update(int hot, const uint64_t* score, Exchange exchange) {
+  size_t update(int hot, const uint64_t* score, Exchange exchange, bool all = false) {
     size_t swaps = 0;
-    for (size_t limit = (id.size() + 7) / 8; swaps < limit; ++swaps) {
+    for (size_t limit = all ? id.size() : (id.size() + 7) / 8; swaps < limit; ++swaps) {
       auto less = [&](int a, int b) { return score[a] != score[b] ? score[a] < score[b] : a > b; };
       auto victim = std::min_element(id.begin(), id.begin() + hot, less);
       auto incoming = std::max_element(id.begin() + hot, id.end(), less);

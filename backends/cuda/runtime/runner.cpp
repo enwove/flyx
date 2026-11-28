@@ -422,7 +422,8 @@ int prefill_ex(flyx_plan* p, flyx_seq* s, const flyx_prefill_input* in, const fl
     if (sample) set_gen(s, sample);
     // Borrow the model's prefill buffers for this pass: after any previous prefill or strata session using the slab.
     auto* m = const_cast<flyx_bmodel*>(s->m);
-    std::lock_guard<std::mutex> lock(m->prefill_mu);
+    auto reads = m->offload ? m->offload->expert_reads() : std::shared_lock<std::shared_mutex>();
+    std::unique_lock<std::mutex> lock(m->prefill_mu);
     save_prefill_owner(m);
     m->prefill_owner = nullptr;
     CK(cudaStreamWaitEvent(s->st, m->prefill_ev, 0));
@@ -519,7 +520,6 @@ int prefill_ex(flyx_plan* p, flyx_seq* s, const flyx_prefill_input* in, const fl
       ++s->seq_no;
       CK(cudaEventRecord(s->ev[s->seq_no % kRing], s->st));
       s->pending.push_back({'P', 0});
-      if (m->offload) m->offload->finish_prompt(s->st);
     }
     s->update_write_hi();
     // A pass moves the position on and not the round: the rounds before it stay rollback sources, their recurrent
@@ -531,6 +531,20 @@ int prefill_ex(flyx_plan* p, flyx_seq* s, const flyx_prefill_input* in, const fl
       if (mt.valid && mt.start + mt.rows < rewind_from) mt.valid = false;
     if (in->n_embeds > 0 || in->pos_3d || in->set_rope_delta) sync_stream(s);
     CK(cudaGetLastError());
+    // The prompt's end may move expert pages, which takes the page lock alone (ExpertAddressSpace::finish_prompt).
+    if (sample_last && m->offload) {
+      lock.unlock();
+      if (reads.owns_lock()) reads.unlock();
+      m->offload->finish_prompt(s->st);
+    }
+    return 0;
+  });
+}
+
+int request_boundary(flyx_seq* s, int32_t begin) {
+  if (!s || !s->m->offload) return 0;
+  return guarded([&] {
+    s->m->offload->request_boundary(begin != 0);
     return 0;
   });
 }
@@ -1572,6 +1586,7 @@ int launch(flyx_plan* p, flyx_seq* s, const flyx_gen_params* g) {
     return fail("a tree round of more than " + std::to_string(FLYX_MAX_ROWS) + " rows reads no strata copy");
   s->snap_pos = -1;  // rounds write the round slots
   return guarded([&] {
+    auto reads = s->m->offload ? s->m->offload->expert_reads() : std::shared_lock<std::shared_mutex>();
     // Hold prefill_mu across submission when sharing the VMM prefill slab so another session cannot evict
     // prefill_owner before this round's work is queued on s->st (lock order: prefill_mu before batch->mu).
     const bool shared = s->uses_shared_prefill();
@@ -1777,11 +1792,13 @@ int launch_batch(flyx_plan* const* plans, flyx_seq* const* seqs, const flyx_gen_
   BatchRounds& B = *m->batch;
   bool any_shared = false;
   for (int i = 0; i < n; ++i) any_shared = any_shared || seqs[ord[i]]->uses_shared_prefill();
-  // Lock order: prefill_mu before B.mu (make_graph_room acquires B.mu while launch() may hold prefill_mu).
-  std::unique_lock<std::mutex> prefill_lock(m->prefill_mu, std::defer_lock);
-  if (any_shared) prefill_lock.lock();
-  std::lock_guard<std::mutex> lock(B.mu);
   return guarded([&] {
+    // Lock order: the expert page lock, then prefill_mu before B.mu (make_graph_room acquires B.mu while launch() may
+    // hold prefill_mu).
+    auto reads = m->offload ? m->offload->expert_reads() : std::shared_lock<std::shared_mutex>();
+    std::unique_lock<std::mutex> prefill_lock(m->prefill_mu, std::defer_lock);
+    if (any_shared) prefill_lock.lock();
+    std::lock_guard<std::mutex> lock(B.mu);
     flyx_seq* lead = seqs[ord[0]];
     BatchPass bp;
     bp.rows = rows;

@@ -24,6 +24,7 @@ Generation::Generation(Session* s, const GenerateRequest& req, TextSink sink)
 }
 
 Generation::~Generation() {
+  if (request_started_) api_->request_boundary(s_->seq(), 0);
   e_->generation_ended();
   s_->set_in_use(false);
 }
@@ -96,6 +97,11 @@ bool Generation::start() {
   const int max_ctx = e_->options().max_ctx;
   std::string why;
   if (!prompt_runs(*e_, prompt, &why)) return fail(why, false);
+
+  if (api_->request_boundary) {
+    if (api_->request_boundary(s_->seq(), 1) != 0) return fail(api_->last_error(), false);
+    request_started_ = true;
+  }
 
   auto finite = [](float v, float fallback = 0.f) { return std::isfinite(v) ? v : fallback; };
   g_ = {};

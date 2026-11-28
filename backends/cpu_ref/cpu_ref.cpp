@@ -2569,6 +2569,7 @@ const flyx_backend_api kApi = {
     prefill_ex,
     nullptr,  // estimate_load: CPU reference has no GPU VRAM budget
     nullptr,  // draft_weights: CPU reference keeps exact float64 weights
+    nullptr,  // request_boundary
 };
 
 }  // namespace

@@ -161,6 +161,8 @@ struct BackendOptions {
   bool expert_adapt = true, expert_global = false, expert_integer = true;
   bool expert_gather = true;
   bool expert_overlap = true;  // gathered rounds copy only host-resident experts, beside the device-resident GEMMs
+  // Local decode route cache: auto, 0 (disabled), or a directory.
+  std::string expert_profile = "auto";
   bool expert_ticket = true, expert_mapped_output = true, expert_direct = true;
   int expert_simd = 512;  // upper bound on vector width for cold CPU dots
   bool keep_expert_archive = true;
@@ -1359,6 +1361,7 @@ RowNeeds row_needs(const flyx_bmodel* m);
 int max_drafts(const Block& drafter);  // most drafts a round of this drafter can verify (0: not a drafter)
 int ensure_prefill_rows(flyx_bmodel* m, int rows);
 void reserve_prefill_inputs(flyx_bmodel* m, size_t embed_rows, size_t position_rows);
+int request_boundary(flyx_seq* s, int32_t begin);
 int seq_new(flyx_bmodel* m, int32_t max_ctx, flyx_seq** out);
 void seq_free(flyx_seq* s);
 int seq_bytes(flyx_bmodel* m, int32_t max_ctx, uint64_t* out);

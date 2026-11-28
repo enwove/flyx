@@ -189,6 +189,7 @@ Passed verbatim to the backend (`backends/cuda/backend.cpp`). Unknown keys or in
 | `expert_direct` | `0` or `1` | 1 | Run expert kernels over device and pinned host pages when the mapping and host budget allow. Setting 0 selects CPU cold experts. |
 | `expert_ticket` | `0` or `1` | 1 | Publish small CPU route packets through a mapped ticket with a bounded wait and CUDA event fallback. |
 | `expert_mapped_output` | `0` or `1` | 1 | Have the weighted reduction read cold CPU outputs from mapped host memory when available. |
+| `expert_profile` | `auto`, `0` or a directory | `auto` | Cache decode routing counts for mapped experts. A warm load uses them for initial placement. The default directory is `flyx/expert_profiles` under `%LOCALAPPDATA%` on Windows or `$XDG_CACHE_HOME` (default `~/.cache`) elsewhere. Set `0` to disable disk reads and writes. |
 | `expert_adapt` | `0` or `1` | 1 | Rank experts by decaying prompt route counts and exchange slots between sessions when streamed banks are enabled. |
 | `expert_global` | `0` or `1` | 0 | Pool expert counts across physical layers with the same expert count. |
 | `expert_prefill_min` | nonnegative integer | GPU table, otherwise one routed slot per expert | Minimum prompt rows for streamed expert banks. Zero uses CPU experts for every prompt size. |

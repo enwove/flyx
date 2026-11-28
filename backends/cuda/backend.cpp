@@ -242,6 +242,15 @@ const std::vector<OptionSpec>& option_specs() {
       whole_opt("expert_simd", &BackendOptions::expert_simd),
       flag_opt("expert_gather", &BackendOptions::expert_gather),
       flag_opt("expert_overlap", &BackendOptions::expert_overlap),
+      {"expert_profile",
+       [](const std::string& key, const std::string& val, BackendOptions* o, std::string* err) {
+         if (val.empty()) return *err = key + " takes auto, 0 or a folder", false;
+         o->expert_profile = val;
+         return true;
+       },
+       [](const BackendOptions& o, const BackendOptions& def) -> std::string {
+         return o.expert_profile != def.expert_profile ? "expert_profile=" + o.expert_profile : "";
+       }},
       flag_opt("expert_direct", &BackendOptions::expert_direct),
       flag_opt("expert_ticket", &BackendOptions::expert_ticket),
       flag_opt("expert_mapped_output", &BackendOptions::expert_mapped_output),
@@ -945,7 +954,7 @@ const flyx_backend_api kApi = {
     prefill, launch, read_result, rewind, checkpoint, restore, set_oracle, last_error, memory, seq_bytes,
     prefill_align, device_stats, ready, set_reply, snapshot_bytes, snapshot_save, snapshot_load, launch_batch,
     pinned_alloc, pinned_free, read_logits, seq_new_in, seq_size, trim, graph_stats, prefill_snapshot,
-    encode_vision, prefill_ex, estimate_load, draft_weights_active,
+    encode_vision, prefill_ex, estimate_load, draft_weights_active, request_boundary,
 };
 
 }  // namespace flyx::cuda

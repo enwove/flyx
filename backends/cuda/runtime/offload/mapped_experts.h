@@ -3,11 +3,13 @@
 
 #include "backends/cuda/backend.h"
 #include "backends/cuda/runtime/offload/expert_order.h"
-
+#include "backends/cuda/runtime/offload/expert_profile.h"
 #include "backends/cuda/runtime/offload/staging_ring.h"
 
+#include <array>
 #include <deque>
 #include <map>
+#include <shared_mutex>
 
 namespace flyx::cuda {
 // Every round sees stable projection addresses. At quiescence, equally sized pages can exchange
@@ -33,7 +35,11 @@ struct MappedExpertPair {
 class ExpertAddressSpace {
 public:
   void* allocate(flyx_bmodel* model, int weight, size_t bytes, size_t experts, size_t hot);
-  void attach(flyx_bmodel* model, MoeBlock& block, int gate, int down, int resident);
+  void attach(flyx_bmodel* model, MoeBlock& block, int gate, int down, int resident,
+              const std::array<const flyx_tensor_view*, 4>& views);
+  void load_profile();
+  void request_boundary(bool begin);
+  std::shared_lock<std::shared_mutex> reading();
   size_t gather_bytes(int pairs) const;
   void note_rows(int rows);
   int planned_rows() const { return max_rows_.load(std::memory_order_relaxed); }
@@ -54,11 +60,12 @@ private:
     std::vector<uint8_t> hot;
   };
   struct Histogram {
-    explicit Histogram(size_t n) : order(n), decode(n) {}
+    explicit Histogram(size_t n) : order(n), decode(n), heat(n), unsaved(n) {}
     ExpertOrder order;
     uint32_t* device = nullptr;
     int* slots = nullptr;
     std::vector<uint32_t> decode;
+    std::vector<uint64_t> heat, unsaved;  // lifetime decode counts and the increments awaiting a cache merge
     size_t desired = 0;
     std::atomic<bool> gather{false};
     int top_k = 0;
@@ -66,10 +73,13 @@ private:
   };
   bool resident(std::pair<int, int> pair, size_t slot) const;
   void publish_residency(std::pair<int, int> pair, Histogram& h) const;
-  void observe();
+  void observe(bool learn = false);
+  std::vector<ProfileLayer> profile_layers() const;
+  void save_profile();
   void select_gather();
-  void promote();
-  void rank_experts();
+  enum class Placement { ColdPrompt, Load, BetweenRequests };
+  void promote(Placement mode);
+  void rank_experts(bool all);
   std::deque<MappedExpertPair> pairs_;
   StagingRing<2> prefill_ring_;
   std::deque<Plane> planes_;
@@ -79,6 +89,11 @@ private:
   uint64_t hits_ = 0, slots_ = 0, full_routes_ = 0;
   bool failed_ = false, pending_ = false, verbose_ = false;
   double observed_rows_ = 0, observed_remote_rows_ = 0;
+  std::filesystem::path profile_;
+  uint64_t fingerprint_ = kFingerprintSeed;
+  size_t requests_ = 0;
+  bool guided_ = false;
+  std::shared_mutex pages_mu_;  // shared across submission, exclusive across sync, remap and map publication
   std::mutex mutex_;
   std::atomic<int> max_rows_{0};
 };
