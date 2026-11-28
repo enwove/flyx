@@ -192,8 +192,11 @@ void print(std::string_view text) {
 
 void report(const Engine& e, const GenerateResult& res) {
   const flyx_usage& u = res.usage;
-  const double tps = apps::decode_rate(u.new_tokens, u.decode_ms);
-  double acc = u.rounds && u.new_tokens > 1 ? double(u.new_tokens - 1) / u.rounds : 0;
+  // The tokens the model chose, its stop token among them (GenerateResult::output_tokens): the first with the prefill,
+  // the others from the rounds, which the rate and the tokens a round count, as the server's request log does.
+  const int out = res.output_tokens();
+  const double tps = apps::decode_rate(out, u.decode_ms);
+  double acc = u.rounds && out > 1 ? double(out - 1) / u.rounds : 0;
   // Which drafter drafted how many rounds, when there are several, and the lookup rounds.
   std::string by;
   if (e.model().drafters() > 1)
@@ -204,7 +207,7 @@ void report(const Engine& e, const GenerateResult& res) {
   std::fprintf(stderr,
                "\n[prompt %d (reused %d) | prefill %.1f ms | %d tokens in %.1f ms = %.1f tok/s | %d rounds, %.2f "
                "tokens/round, %.1f drafts/round%s | finish %d]\n",
-               u.prompt_tokens, u.reused_tokens, u.prefill_ms, u.new_tokens, u.decode_ms, tps, u.rounds, acc,
+               u.prompt_tokens, u.reused_tokens, u.prefill_ms, out, u.decode_ms, tps, u.rounds, acc,
                u.rounds ? double(u.drafted) / u.rounds : 0.0, by.c_str(), u.finish_reason);
 }
 

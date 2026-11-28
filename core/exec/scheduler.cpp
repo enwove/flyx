@@ -755,9 +755,9 @@ void Scheduler::finish(Running& r) {
     log::info("flyx: %s | %s | prompt %d, reused %d (%s%s%s) | prefill %.0f ms | %d tokens, %.1f tok/s, %.2f "
               "tokens/round%s | %s%s%s",
               in.label.c_str(), r.why.c_str(), u.prompt_tokens, u.reused_tokens, res.reuse.c_str(),
-              r.prepared.tokenized.empty() ? "" : "; ", r.prepared.tokenized.c_str(), u.prefill_ms, u.new_tokens,
-              u.decode_ms > 0 && u.new_tokens > 1 ? (u.new_tokens - 1) * 1000.0 / u.decode_ms : 0.0,
-              u.rounds ? double(u.new_tokens - 1) / u.rounds : 0.0, looked_up.c_str(), finish_name(u.finish_reason),
+              r.prepared.tokenized.empty() ? "" : "; ", r.prepared.tokenized.c_str(), u.prefill_ms, res.output_tokens(),
+              u.decode_ms > 0 && res.output_tokens() > 1 ? (res.output_tokens() - 1) * 1000.0 / u.decode_ms : 0.0,
+              u.rounds ? double(res.output_tokens() - 1) / u.rounds : 0.0, looked_up.c_str(), finish_name(u.finish_reason),
               tool_calls ? (", " + std::to_string(tool_calls) + " tool calls").c_str() : "",
               r.prepared.grammar ? (" | grammar " + std::to_string(int(r.prepared.grammar_ms + 0.5)) + " ms" +
                                     (r.prepared.grammar_cached ? " (compiled ahead)" : "") + ", " +

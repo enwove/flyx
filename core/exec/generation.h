@@ -112,6 +112,9 @@ struct GenerateResult {
   flyx_usage usage{};
   std::string stop_string;                // the stop string that ended the generation, if any
   int32_t stop_token = -1;                // the stop token that ended it, if any
+  // The tokens the model chose: the reply's, and the stop token that ended it (a round chose that one too).  The
+  // first comes with the prompt's prefill, every other from a round: decode_rate and tokens a round count those.
+  int output_tokens() const { return usage.new_tokens + (stop_token >= 0 ? 1 : 0); }
   std::string reuse;                      // how the prompt prefix was reused, or why it was not
   std::string parked;                     // checkpoints kept when this request displaced a conversation
   int grammar_fixes = 0;                  // tokens the grammar rejected and that were chosen again
