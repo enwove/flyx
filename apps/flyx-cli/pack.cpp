@@ -17,6 +17,7 @@
 #include "apps/common/model_source.h"
 #include "core/hub/sha256.h"
 #include "core/interfaces/model.h"
+#include "core/interfaces/options.h"
 #include "core/modelfile/readers.h"
 #include "core/os/path.h"
 #include "nlohmann/json.hpp"
@@ -135,8 +136,17 @@ int run(int argc, char** argv) {
     packed_file("projector", fetched.mmproj, fetched.mmproj_source);
   }
   // As the engine opens it: a file the engine would refuse is not written.
-  if (!interfaces::open_model(file, {}, &err)) {
-    std::fprintf(stderr, "error: %s does not open as a model: %s\n", model.c_str(), err.c_str());
+  interfaces::ModelOptions as_loaded;  // with the drafter it recommends, as the engine would load it (apply_recommended)
+  if (extra.contains("recommended") && extra["recommended"].contains("drafter")) {
+    const auto& d = extra["recommended"]["drafter"];
+    interfaces::DrafterMode mode;
+    if (!d.is_string() || !interfaces::parse_drafter_mode(d.get<std::string>(), &mode))
+      bad_usage(recommended_file + ": \"drafter\" is not a drafter (" + interfaces::drafter_mode_words() + ")");
+    as_loaded.drafter = d.get<std::string>();
+  }
+  if (!interfaces::open_model(file, as_loaded, &err)) {
+    std::fprintf(stderr, "error: %s does not open as a model%s: %s\n", model.c_str(),
+                 as_loaded.drafter.empty() ? "" : (" with drafter " + as_loaded.drafter).c_str(), err.c_str());
     return 1;
   }
   extra["packed"] = {{"files", files}};

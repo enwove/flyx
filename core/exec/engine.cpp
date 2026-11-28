@@ -124,6 +124,29 @@ std::string nvfp4_adjustment(const interfaces::Model& m) {
 
 }  // namespace
 
+// The settings measured best for a model file (its header's "recommended": flyx pack --recommended), under every other
+// word: its drafter when neither the caller nor the environment named one, its backend options before theirs (a key
+// they give again is theirs).  Keys of another type are read as absent.
+void apply_recommended(const nlohmann::json& h, EngineOptions* o) {
+  const auto rec = h.is_object() ? h.find("recommended") : h.end();
+  if (!h.is_object() || rec == h.end() || !rec->is_object()) return;
+  std::string applied;
+  const auto drafter = rec->find("drafter");
+  interfaces::DrafterMode mode;
+  if (o->speculative && o->drafter.empty() && drafter != rec->end() && drafter->is_string() &&
+      interfaces::parse_drafter_mode(drafter->get_ref<const std::string&>(), &mode)) {
+    o->drafter = drafter->get<std::string>();
+    applied += " drafter " + o->drafter;
+  }
+  const auto opts = rec->find("backend_options");
+  if (opts != rec->end() && opts->is_string() && !opts->get_ref<const std::string&>().empty()) {
+    const std::string& r = opts->get_ref<const std::string&>();
+    o->backend_options = o->backend_options.empty() ? r : r + "," + o->backend_options;
+    applied += " backend options " + r;
+  }
+  if (!applied.empty()) log::info("flyx: the model file's recommended settings:%s", applied.c_str());
+}
+
 Engine::~Engine() {
   if (api_) {
     plans_.free(api_);
@@ -637,6 +660,7 @@ bool Engine::load(const std::string& path, const EngineOptions& opt, std::string
   // The load's steps, for its report (verbose): file, tokenizer and chat, backend, model, open, plans, rounds, memory.
   double t[7] = {os::now_ms()};
   if (!file_.open(path, err, opt_.allow_path)) return false;
+  apply_recommended(file_.header(), &opt_);
   for (const std::string& f : opt_.drafter_files)
     if (!file_.add(f, err, opt_.allow_path, ModelFile::CompanionRole::Drafter)) return false;
   if (!opt_.lora_file.empty() && !file_.add(opt_.lora_file, err, opt_.allow_path, ModelFile::CompanionRole::Lora))

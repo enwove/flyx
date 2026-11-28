@@ -351,6 +351,31 @@ void one_file(const std::string& dir, const std::string& backend) {
                 std::to_string(drafted) + " drafts)");
     }
   }
+  // The drafter the file recommends (its header's "recommended") is the one it drafts with when none is named (the
+  // tiny model's own MTP layer and the bundled DFlash2 drafter both there), and a drafter named is the one named.
+  ModelFile two_files;
+  std::string err;
+  const std::string recommending = dir + "/one_file_recommended.flyx";
+  check(two_files.open(dir + "/tiny_gguf.gguf", &err) &&
+            two_files.add(dir + "/tiny_draft_q8.gguf", &err, {}, ModelFile::CompanionRole::Drafter) &&
+            modelfile::write_packed(two_files, {{"recommended", {{"drafter", "dflash2"}}}}, recommending, &err),
+        "a packed file recommending DFlash2: " + err);
+  auto drafts_of = [&](Engine& e, const std::vector<int32_t>& p) {
+    std::vector<int32_t> tokens;
+    std::vector<int32_t> all;
+    for (const auto& r : traced(e, p, 40, &tokens)) all.insert(all.end(), r.drafts, r.drafts + r.n_drafts);
+    all.insert(all.end(), tokens.begin(), tokens.end());
+    return all;
+  };
+  const std::string gguf = dir + "/tiny_gguf.gguf", drafter = dir + "/tiny_draft_q8.gguf";
+  auto recommended = engine(recommending, backend, {.speculative = true, .drafter = ""});
+  auto dflash2 = engine(gguf, backend, {.speculative = true, .drafter = "dflash2", .drafter_files = {drafter}});
+  auto named = engine(recommending, backend, {.speculative = true, .drafter = "mtp"});
+  auto mtp = engine(gguf, backend, {.speculative = true, .drafter = "mtp"});
+  const auto p = golden.at("cases")[0].at("prompt").get<std::vector<int32_t>>();
+  check(drafts_of(*recommended, p) == drafts_of(*dflash2, p),
+        "no drafter named: the file's recommended DFlash2, its drafts and tokens");
+  check(drafts_of(*named, p) == drafts_of(*mtp, p), "a drafter named (mtp): the one named, not the file's");
 }
 
 // Prefill tokens [from, to) of t at the sequence's position, in passes of up to `rows` rows that choose no token.
