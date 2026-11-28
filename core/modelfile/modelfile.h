@@ -40,7 +40,9 @@ class ModelFile {
   // companion_name(i, their name); its blobs are not read.  models/<arch>
   // decides what it takes from each, by name: nothing of one stands in for
   // this file's tensors or another companion's.
+  enum class CompanionRole { Any, Drafter, Projector, Lora };
   bool add(const std::string& path, std::string* err, const PathAllowFn& allow_path = {});
+  bool add(const std::string& path, std::string* err, const PathAllowFn& allow_path, CompanionRole role);
   static constexpr const char* kCompanion = "companion/";
   static std::string companion_name(int i, const std::string& name) {
     return kCompanion + std::to_string(i) + "/" + name;
@@ -64,6 +66,7 @@ class ModelFile {
   // What a reader fills (views and blobs point into the mapping, or into `owned`).
   struct Contents {
     nlohmann::json header;
+    nlohmann::json directory_config;  // raw config.json for a mapped directory
     std::string arch;
     std::vector<std::string> names;  // the tensors' names (their views point here)
     std::vector<flyx_tensor_view> tensors;
@@ -72,10 +75,14 @@ class ModelFile {
     std::map<std::string, std::vector<uint8_t>> owned;  // blobs a reader built (GGUF: the tokenizer tables)
   };
 
+  CompanionRole companion_role(int i) const { return companions_.at(size_t(i))->role; }
+  const Contents& companion(int i) const { return companions_.at(size_t(i))->c; }
+
  private:
   std::vector<std::unique_ptr<os::MappedFile>> maps_;  // one file, or a split GGUF's shards
   Contents c_;
   struct Companion {
+    CompanionRole role = CompanionRole::Any;
     std::vector<std::unique_ptr<os::MappedFile>> maps;  // a file, or a drafter directory's shards
     Contents c;
   };

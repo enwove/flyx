@@ -17,7 +17,7 @@
 
 #include "core/modelfile/modelfile.h"
 #include "flyx/backend_abi.h"
-#include "models/drafters/target.h"
+#include "models/drafters/config.h"
 #include "models/model.h"
 
 namespace flyx::models::drafters {
@@ -37,10 +37,6 @@ struct DFlash2Spec {
   int block_drafts() const { return block.block - block.draft_from; }
 };
 
-// The drafter of the target's taps a canonical config ("draft") says it is (its "kind": a block drafter or EAGLE-4),
-// kNone when it is none.
-Drafter block_drafter_kind(const nlohmann::json& draft);
-
 // True if a companion header describes a block drafter of DFlash2's block or DSpine's (a drafter file's "draft"), or
 // a non-Markov arch="dflash" GGUF.
 bool is_block_companion(const nlohmann::json& header);
@@ -51,27 +47,10 @@ bool is_block_companion(const nlohmann::json& header);
 // (parse_dflash2_*, parse_dspark_gguf, parse_dspine_json).
 void check_made_for(const nlohmann::json& header, const TargetSpec& target);
 
-// A drafter config's integer `key`: a whole number in int's range, else "invalid <drafter> drafter config".
-int config_int(const nlohmann::json& j, const char* key, const std::string& drafter);
-
-// A block drafter's Qwen3 layers and context as its canonical config gives them (DFlash2's block, DSpine's), read and
-// checked against the target (`title` names the drafter in refusals): their dimensions, block and mask token, the
-// target layers it taps after, rotary theta and norm epsilon.
-struct Qwen3BlockConfig {
-  int hidden = 0, layers = 0, n_heads = 0, n_kv = 0, head_dim = 0, inter = 0, block = 0, mask_token = 0;
-  double theta = 0.0, eps = 0.0;
-  std::vector<int> taps;  // 1-based (1..target.layers; target.layers: after the final norm)
-};
-Qwen3BlockConfig parse_qwen3_block(const nlohmann::json& j, const TargetSpec& target, const std::string& title);
-
-// Throws unless a block drafter's canonical config ("draft") is of a kind this build reads and was made for this target
-// where it says what it was made for (its width, vocabulary, padded or not, and layer count).
-void check_config_target(const nlohmann::json& draft, const TargetSpec& target);
-
 // Parse and validate a DFlash2 spec from canonical JSON ("draft" section in .flyx or drafter_dir); `file` holds its
 // tensors (the selector's codebooks say whether they have the target's padding rows).
 DFlash2Spec parse_dflash2_json(const ModelFile& file, const nlohmann::json& j, const TargetSpec& target,
-                               int companion);
+                               int companion, const flyx_tensor_view* selector = nullptr);
 
 // Parse and validate a DFlash2 spec from a GGUF companion header with general.architecture == "dflash".
 DFlash2Spec parse_dflash2_gguf(const ModelFile& file, const nlohmann::json& header, const TargetSpec& target,

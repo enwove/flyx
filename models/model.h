@@ -107,7 +107,15 @@ class Tables {
   using NameFn = std::function<std::string(const std::string&)>;
 
   explicit Tables(const ModelFile& file) : file_(&file) {}
-  bool has(const std::string& name) const { return file_->tensor(name) != nullptr; }
+  void add_view(const std::string& name, flyx_tensor_view view) {
+    auto it = views_.emplace(name, view).first;
+    it->second.name = it->first.c_str();
+  }
+  const flyx_tensor_view* tensor(const std::string& name) const {
+    auto it = views_.find(name);
+    return it == views_.end() ? file_->tensor(name) : &it->second;
+  }
+  bool has(const std::string& name) const { return tensor(name) != nullptr; }
   // A weight of this shape (NVFP4: the logical [N, K], with its scales).
   // Asking for the same tensor twice gives the same index.  Throws when the
   // tensor is missing or has another shape.  Optional `ggml_scale_name` binds
@@ -145,6 +153,7 @@ class Tables {
 
  private:
   const ModelFile* file_;
+  std::map<std::string, flyx_tensor_view> views_;  // model-owned names and slices of mapped directory tensors
   std::map<std::string, int> index_;
   bool exact_ = false;
   bool nvfp4_inputs_ = true;  // NVFP4 weights take NVFP4 inputs in passes of more rows

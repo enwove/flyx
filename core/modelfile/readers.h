@@ -70,13 +70,11 @@ bool read_gguf(std::vector<std::unique_ptr<os::MappedFile>>* maps, const std::st
                const PathAllowFn& allow_path = {});
 
 // A block drafter as published (drafter_dir.cpp): a directory with its config.json and *.safetensors,
-// read as python/convert would write it into a drafter file.  The shards stay mapped in `maps`.
+// read with its original tensor names and configuration.  The shards stay mapped in `maps`.
 bool is_drafter_dir(const std::string& path, const PathAllowFn& allow_path = {});
-// Its config.json's block drafter (its architecture, or speculators' type: "dflash2", "dflash", "dspark",
-// "dspine"); "" for none.
+// The drafter kind named by config.json, or an empty string for an unknown architecture.
 std::string drafter_dir_kind(const std::string& dir, const PathAllowFn& allow_path = {});
-// A .flyx file's "draft" section's kind, from its header alone ("dflash2", "dflash", "dspark", "dspine"); "" when it
-// holds none.
+// The drafter kind from a .flyx header, or an empty string when it holds none.
 std::string flyx_draft_kind(const std::string& path);
 // A .flyx file's header alone, read from its first bytes (the file not mapped); false when it is none.
 bool peek_flyx_header(const std::string& path, nlohmann::json* h);

@@ -632,17 +632,11 @@ bool Engine::load(const std::string& path, const EngineOptions& opt, std::string
   double t[7] = {os::now_ms()};
   if (!file_.open(path, err, opt_.allow_path)) return false;
   for (const std::string& f : opt_.drafter_files)
-    if (!file_.add(f, err, opt_.allow_path)) return false;
-  if (!opt_.lora_file.empty()) {
-    const int before = file_.companions();
-    if (!file_.add(opt_.lora_file, err, opt_.allow_path)) return false;
-    if (file_.header()["companions"][size_t(before)].value("kind", "") != "lora")
-      return *err = opt_.lora_file + ": not a LoRA adapter (a directory of adapter_config.json and "
-                                     "adapter_model.safetensors)",
-             false;
-  }
+    if (!file_.add(f, err, opt_.allow_path, ModelFile::CompanionRole::Drafter)) return false;
+  if (!opt_.lora_file.empty() && !file_.add(opt_.lora_file, err, opt_.allow_path, ModelFile::CompanionRole::Lora))
+    return false;
   if (opt_.vision && !opt_.mmproj_file.empty())
-    if (!file_.add(opt_.mmproj_file, err, opt_.allow_path)) return false;
+    if (!file_.add(opt_.mmproj_file, err, opt_.allow_path, ModelFile::CompanionRole::Projector)) return false;
   ReadAhead ahead(file_);  // until the load returns
   t[1] = os::now_ms();
   if (!tok_.load(file_, err)) return false;

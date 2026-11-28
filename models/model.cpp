@@ -230,7 +230,7 @@ std::string declared_activations(const ModelFile& file) {
 }
 
 bool is_lora_companion(const ModelFile& file, int i) {
-  return file.header().at("companions").at(size_t(i)).value("kind", "") == "lora";
+  return file.companion_role(i) == ModelFile::CompanionRole::Lora;
 }
 
 CompanionLora find_lora(const ModelFile& file, const std::set<std::string>& linears, int layers) {
@@ -273,7 +273,7 @@ flyx_lora Tables::lora(const CompanionLora& l, const std::string& name, int64_t 
 int Tables::weight(const std::string& name, std::vector<int64_t> shape, const std::string& ggml_scale_name) {
   auto it = index_.find(name);
   if (it != index_.end()) return it->second;
-  const flyx_tensor_view* t = file_->tensor(name);
+  const flyx_tensor_view* t = tensor(name);
   if (!t) throw std::runtime_error("missing tensor " + name);
   bool same = t->ndim == int32_t(shape.size());
   for (size_t i = 0; same && i < shape.size(); ++i) same = t->shape[i] == shape[i];

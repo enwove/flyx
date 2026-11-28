@@ -504,6 +504,9 @@ void dspine_drafters(const std::string& dir) {
           "write the edited drafter file");
     ModelFile f;
     std::string err;
+    ModelFile plain;
+    const auto disabled = open_beside(&plain, model, tmp.string(), "none", &err);
+    check(disabled && disabled->drafters() == 0, "plain model ignores unsupported canonical DSpine semantics");
     const auto m = open_beside(&f, model, tmp.string(), "dspine", &err);
     check(!m && err.find(c.says) != std::string::npos && err.find("companion file 1: ") != std::string::npos,
           std::string("a DSpine drafter config with ") + c.what + ": refused, the file named (" + err + ")");

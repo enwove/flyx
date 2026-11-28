@@ -49,16 +49,28 @@ bool ModelFile::open(const std::string& path, std::string* err, const PathAllowF
 }
 
 bool ModelFile::add(const std::string& path, std::string* err, const PathAllowFn& allow_path) {
+  return add(path, err, allow_path, CompanionRole::Any);
+}
+
+bool ModelFile::add(const std::string& path, std::string* err, const PathAllowFn& allow_path, CompanionRole role) {
   if (allow_path && !allow_path(path))
     return *err = path + ": path is not allowed by remote path policy", false;
   auto more = std::make_unique<Companion>();
   if (modelfile::is_peft_dir(path, allow_path)) {  // before is_drafter_dir: some adapter directories carry a config.json too
+    if (role == CompanionRole::Drafter || role == CompanionRole::Projector)
+      return *err = path + ": LoRA adapter requires --lora", false;
     if (!modelfile::read_peft_dir(path, &more->maps, &more->c, err, allow_path)) return false;
   } else if (modelfile::is_drafter_dir(path, allow_path)) {
     if (!modelfile::read_drafter_dir(path, &more->maps, &more->c, err, allow_path)) return false;
   } else {
     if (!read(&more->maps, path, &more->c, err, /*need_tokenizer=*/false, allow_path)) return false;
   }
+  const auto kind = more->c.header.find("kind");
+  const bool lora = kind != more->c.header.end() && *kind == "lora";
+  if (role == CompanionRole::Lora && !lora) return *err = path + ": not a LoRA adapter", false;
+  if (lora && (role == CompanionRole::Drafter || role == CompanionRole::Projector))
+    return *err = path + ": LoRA adapter requires --lora", false;
+  more->role = lora ? CompanionRole::Lora : role;
   c_.header["companions"].push_back(more->c.header);
   companions_.push_back(std::move(more));
   return true;

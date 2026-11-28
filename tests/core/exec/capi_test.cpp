@@ -5,6 +5,7 @@
 //
 //   capi_test TINY.flyx BACKEND
 #include <cstdio>
+#include <filesystem>
 #include <string>
 #include <thread>
 #include <vector>
@@ -124,6 +125,19 @@ int main(int argc, char** argv) {
     flyx_cancel(nullptr);
     flyx_session_free(nullptr);
     flyx_unload(nullptr);
+  }
+  const auto adapter = (std::filesystem::path(argv[1]).parent_path() / "peft_qwen35").string();
+  for (bool projector : {false, true}) {
+    flyx_load_options opts{};
+    opts.backend = argv[2];
+    opts.speculative = 0;
+    if (projector) opts.mmproj_file = adapter.c_str();
+    else opts.drafter_file = adapter.c_str();
+    flyx_error error{};
+    auto* engine = flyx_load(argv[1], &opts, &error);
+    check(!engine && std::string(error.message).find("LoRA adapter requires --lora") != std::string::npos,
+          "LoRA supplied as an optional companion is refused even in plain decoding");
+    flyx_unload(engine);
   }
   check_handle_lifetime(argv[1], argv[2]);
   std::string err;
