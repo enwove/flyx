@@ -208,6 +208,9 @@ void split_gguf(const std::string& dir) {
         "split GGUF records shard count");
   check(s1.tensor_names().size() == ref.tensor_names().size() && s2.tensor_names().size() == ref.tensor_names().size(),
         "split GGUF exposes all tensors across shards");
+  std::atomic<bool> stop{false};
+  s1.read_ahead(stop);
+  s1.release_pages();  // All three mappings must still serve the original tensor views below.
   bool exact = true;
   for (const std::string& name : ref.tensor_names()) {
     const auto* a = ref.tensor(name);
@@ -224,8 +227,6 @@ void split_gguf(const std::string& dir) {
   const uint64_t expected_bytes = fs::file_size(os::to_path(shard1)) + fs::file_size(os::to_path(shard2)) +
                                   fs::file_size(os::to_path(shard3));
   check(s1.bytes() == expected_bytes && s2.bytes() == expected_bytes, "split GGUF bytes() sums all shards");
-  std::atomic<bool> stop{false};
-  s1.read_ahead(stop);  // exercises multi-shard read_ahead without crashing
   check(gguf_peek(shard1).valid && gguf_peek(shard1).mtp_layers == gguf_peek(single).mtp_layers &&
             gguf_peek(shard2).valid && gguf_peek(shard2).mtp_layers == gguf_peek(single).mtp_layers,
         "gguf_peek's MTP layers on shard 1 and shard 2");

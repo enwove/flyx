@@ -11,6 +11,7 @@
 //   committing the accepted rows and rolling back inside the last rounds are
 //   both folds of a saved state, never a recompute of the prompt.
 #include "backends/cuda/backend.h"
+#include "backends/cuda/runtime/offload/expert_store.h"
 #include "backends/cuda/regions/layers.h"
 #include "core/interfaces/memory_policy.h"
 
@@ -108,7 +109,7 @@ bool parse_flag_val(const std::string& key, const std::string& val, bool* f, std
 
 bool parse_whole_val(const std::string& key, const std::string& val, int* v, std::string* err) {
   char* end = nullptr;
-  const long n = std::strtol(val.c_str(), &end, 10);
+  const long long n = std::strtoll(val.c_str(), &end, 10);
   if (val.empty() || *end || n < 0 || n > INT_MAX)
     return *err = key + " takes a whole number, not \"" + val + "\"", false;
   *v = int(n);
@@ -222,8 +223,40 @@ OptionSpec kernel_int_choice_opt(const char* name, int KernelOptions::*ptr, std:
   };
 }
 
+OptionSpec whole_opt(const char* name, int BackendOptions::*field) {
+  return {name,
+          [field](const std::string& key, const std::string& value, BackendOptions* options, std::string* error) {
+            return parse_whole_val(key, value, &(options->*field), error);
+          },
+          [name, field](const BackendOptions& options, const BackendOptions& defaults) {
+            return options.*field == defaults.*field ? std::string{} : std::string(name) + "=" + std::to_string(options.*field);
+          }};
+}
+
 const std::vector<OptionSpec>& option_specs() {
   static const std::vector<OptionSpec> specs = {
+      whole_opt("gpu_layers", &BackendOptions::gpu_layers),
+      whole_opt("gpu_experts", &BackendOptions::gpu_experts),
+      whole_opt("expert_prefill_min", &BackendOptions::expert_prefill_min),
+      whole_opt("expert_threads", &BackendOptions::expert_threads),
+      whole_opt("expert_simd", &BackendOptions::expert_simd),
+      flag_opt("expert_gather", &BackendOptions::expert_gather),
+      flag_opt("expert_overlap", &BackendOptions::expert_overlap),
+      {"expert_profile",
+       [](const std::string& key, const std::string& val, BackendOptions* o, std::string* err) {
+         if (val.empty()) return *err = key + " takes auto, 0 or a folder", false;
+         o->expert_profile = val;
+         return true;
+       },
+       [](const BackendOptions& o, const BackendOptions& def) -> std::string {
+         return o.expert_profile != def.expert_profile ? "expert_profile=" + o.expert_profile : "";
+       }},
+      flag_opt("expert_direct", &BackendOptions::expert_direct),
+      flag_opt("expert_ticket", &BackendOptions::expert_ticket),
+      flag_opt("expert_mapped_output", &BackendOptions::expert_mapped_output),
+      flag_opt("expert_integer", &BackendOptions::expert_integer),
+      flag_opt("expert_adapt", &BackendOptions::expert_adapt),
+      flag_opt("expert_global", &BackendOptions::expert_global),
       flag_opt("profile", &BackendOptions::profile),
       flag_opt("graphs", &BackendOptions::graphs),
       flag_opt("dv_conditional", &BackendOptions::dv_conditional),
@@ -407,7 +440,7 @@ const std::vector<OptionSpec>& option_specs() {
          return "";
        }},
       kernel_flag_opt("log_shapes", &KernelOptions::log_shapes),
-      kernel_whole_opt("strata_denom", &KernelOptions::strata_denom),  // 0: no pairs refined (the copy alone)
+      kernel_whole_opt("strata_denom", &KernelOptions::strata_denom), // 0: no pairs refined (the copy alone)
       kernel_whole_opt("strata_least", &KernelOptions::strata_least, 1),
       kernel_whole_opt("strata_recent", &KernelOptions::strata_recent),
       kernel_whole_opt("strata_most", &KernelOptions::strata_most),
@@ -475,6 +508,7 @@ const std::vector<OptionSpec>& option_specs() {
       // Inkling-2's rounds (kEnvAliases: the environment spellings they had before they were options).
       kernel_int_choice_opt("sc_cluster", &KernelOptions::sc_cluster, {"1", "4", "8"}),
       kernel_flag_opt("moe_vec", &KernelOptions::moe_vec),
+      kernel_flag_opt("moe_mmq", &KernelOptions::moe_mmq),
       {"warm",
        [](const std::string& key, const std::string& val, BackendOptions* o, std::string* err) {
          if (!parse_whole_val(key, val, &o->kernels.warm, err)) return false;
@@ -662,29 +696,34 @@ int probe(flyx_device_info* out) {
 }
 
 int open_model(const flyx_model_desc* desc, const flyx_open_options* opts, flyx_bmodel** out) {
-  auto m = std::make_unique<flyx_bmodel>();
-  m->verbose = opts ? opts->verbose : 0;
-  m->kv_fp8 = opts && opts->kv_fp8;
+  if (!out) return fail("missing model output");
+  *out = nullptr;
+  if (!desc || desc->n_weights < 0 || (desc->n_weights && !desc->weights) || desc->n_blocks < 0 ||
+      (desc->n_blocks && !desc->blocks))
+    return fail("invalid model tables");
+  std::unique_ptr<flyx_bmodel> m;
   {
+    BackendOptions resolved;
     cudaDeviceProp prop{};
     cudaGetDeviceProperties(&prop, 0);
     std::string err;
     if (opts) {
-      if (opts->lock_auto_from) m->opt.kernels.strata_from = opts->auto_from;
-      m->opt.vision = opts->vision_device;
-      m->opt.vision_quant = opts->vision_quant;
+      if (opts->lock_auto_from) resolved.kernels.strata_from = opts->auto_from;
+      resolved.vision = opts->vision_device;
+      resolved.vision_quant = opts->vision_quant;
       if (opts->draft_weights == FLYX_DRAFT_WEIGHTS_NVFP4)
-        m->opt.draft_weights = interfaces::DraftWeightsMode::kNvfp4;
+        resolved.draft_weights = interfaces::DraftWeightsMode::kNvfp4;
       else if (opts->draft_weights == FLYX_DRAFT_WEIGHTS_Q8)
-        m->opt.draft_weights = interfaces::DraftWeightsMode::kQ8;
+        resolved.draft_weights = interfaces::DraftWeightsMode::kQ8;
       else if (opts->draft_weights == FLYX_DRAFT_WEIGHTS_EXACT)
-        m->opt.draft_weights = interfaces::DraftWeightsMode::kExact;
+        resolved.draft_weights = interfaces::DraftWeightsMode::kExact;
       else
-        m->opt.draft_weights = interfaces::DraftWeightsMode::kAuto;
+        resolved.draft_weights = interfaces::DraftWeightsMode::kAuto;
     }
-    if (!resolve_options(opts ? opts->options : nullptr, &m->opt, &err)) return fail("options: " + err);
-    if (!nvfp4_inputs(*desc, &m->opt.kernels.prefill_fp4, &err)) return fail(err);
-    if (m->opt.embed == 0) {
+    if (!resolve_options(opts ? opts->options : nullptr, &resolved, &err)) return fail("options: " + err);
+    if (!apply_weight_caps(opts, &resolved)) return fail("GPU residency cap exceeds INT_MAX");
+    if (!nvfp4_inputs(*desc, &resolved.kernels.prefill_fp4, &err)) return fail(err);
+    if (resolved.embed == 0) {
       // embed=auto: host memory frees the table's GPU memory for a few kilobytes of reads a token; where 32 GB stay
       // free after the weights the memory is not missed, and a prefill pass reads its rows faster on the GPU (the
       // 27B's 4096 rows: 2.6 ms over PCIe on the RTX PRO 6000).
@@ -695,15 +734,15 @@ int open_model(const flyx_model_desc* desc, const flyx_open_options* opts, flyx_
       const bool roomy = gpu_memory(&free_b, &total_b) && free_b > weights &&
                          free_b - weights >= size_t(32) * 1000000000;
       cudaGetLastError();
-      m->opt.embed = roomy ? 2 : 1;
+      resolved.embed = roomy ? 2 : 1;
     }
-    if (m->opt.vision == FLYX_VISION_DEV_AUTO) {
+    if (resolved.vision == FLYX_VISION_DEV_AUTO) {
       size_t free_b = 0, total_b = 0;
       if (!gpu_memory(&free_b, &total_b) && cudaMemGetInfo(&free_b, &total_b) != cudaSuccess) {
         cudaGetLastError();
         free_b = 0;
       }
-      m->opt.vision = resolve_vision_device(*desc, m->opt, free_b, nullptr);
+      resolved.vision = resolve_vision_device(*desc, resolved, free_b, nullptr);
     }
     // FP8 tensor cores whose e4m3 sums are float32's: sm_90 and later.  Ada's (sm_89: L4, L40S) sum in fewer bits:
     // attention with q in e4m3 came out about 50 times past the op test's tolerance (relative error up to 1.5e-3
@@ -711,23 +750,29 @@ int open_model(const flyx_model_desc* desc, const flyx_open_options* opts, flyx_
     // vector on the binary16 tensor cores (attention_rows.cu). And the loaded code must have them.
     const int dev_cc = prop.major * 10 + prop.minor;
     const int code_cc = compiled_arch();
-    m->graph_prices = graph_prices(dev_cc);
-    m->opt.kernels.fp8_mma = dev_cc >= 90 && code_cc >= 89;
+    resolved.kernels.fp8_mma = dev_cc >= 90 && code_cc >= 89;
     // The GPU's own table, else its architecture's, unless the options name one or none.
     int arch_cc = 0;
-    if (m->opt.tuning_defaults) {
-      m->opt.kernels.tuning = -1;
-    } else if (!m->opt.tuning_table.empty()) {
-      m->opt.kernels.tuning = gemm_tuning_named(m->opt.tuning_table.c_str());
-      if (m->opt.kernels.tuning < 0)
-        return fail("options: no tuning table named \"" + m->opt.tuning_table + "\" (" + gemm_tuning_names() + ")");
-      if (!gemm_tuning_compiled_for(m->opt.kernels.tuning, code_cc))
-        return fail("options: tuning table \"" + m->opt.tuning_table + "\" is not compiled for loaded sm_" +
+    if (resolved.tuning_defaults) {
+      resolved.kernels.tuning = -1;
+    } else if (!resolved.tuning_table.empty()) {
+      resolved.kernels.tuning = gemm_tuning_named(resolved.tuning_table.c_str());
+      if (resolved.kernels.tuning < 0)
+        return fail("options: no tuning table named \"" + resolved.tuning_table + "\" (" + gemm_tuning_names() + ")");
+      if (!gemm_tuning_compiled_for(resolved.kernels.tuning, code_cc))
+        return fail("options: tuning table \"" + resolved.tuning_table + "\" is not compiled for loaded sm_" +
                     std::to_string(code_cc) + " code in this release build");
     } else {
-      m->opt.kernels.tuning = gemm_tuning_auto(prop.name, dev_cc, code_cc, &arch_cc);
+      resolved.kernels.tuning = gemm_tuning_auto(prop.name, dev_cc, code_cc, &arch_cc);
     }
-    if (!m->opt.pdl_given) m->opt.kernels.pdl = gemm_tuning_pdl(m->opt.kernels.tuning);
+    resolved.keep_expert_archive = resolved.expert_prefill_min != 0;
+    if (resolved.expert_prefill_min < 0)
+      resolved.expert_prefill_min = gemm_tuning_expert_prefill(resolved.kernels.tuning);
+    if (!resolved.pdl_given) resolved.kernels.pdl = gemm_tuning_pdl(resolved.kernels.tuning);
+    m = std::make_unique<flyx_bmodel>(std::move(resolved));
+    m->verbose = opts ? opts->verbose : 0;
+    m->kv_fp8 = opts && opts->kv_fp8;
+    m->graph_prices = graph_prices(dev_cc);
     if (m->verbose) {
       const std::string table = gemm_tuning_label(m->opt.kernels.tuning, arch_cc, dev_cc);
       int q8 = 0, a4 = 0;  // the weights' inputs, as their file says
@@ -797,7 +842,7 @@ int open_model(const flyx_model_desc* desc, const flyx_open_options* opts, flyx_
                               std::min(FLYX_MAX_WIDE_ROWS, block<DvBlock>(m.get(), m->dv_block).tree_width + 1));
     // The buffers rounds need, before the copies of the head kept only for speed: those take what room is left
     // (device_malloc) and go without where none is.
-    alloc_batch(m.get());  // rounds of several sequences
+    if (!m->offload || m->offload->allows_batched_rounds()) alloc_batch(m.get());  // rounds of several sequences
     CK(cudaEventCreateWithFlags(&m->prefill_ev, cudaEventDisableTiming));
     t[4] = load_clock();
     make_head_fp8(m.get());
@@ -844,7 +889,11 @@ int open_model(const flyx_model_desc* desc, const flyx_open_options* opts, flyx_
     if (m->vision_dev_bytes) std::fprintf(stderr, " (vision %.2f GB)", m->vision_dev_bytes / 1e9);
     if (m->host_bytes) {
       std::fprintf(stderr, ", %.2f GB in host memory", m->host_bytes / 1e9);
-      if (m->vision_host_bytes && m->host_bytes > m->vision_host_bytes)
+      if (m->offload && m->offload->layers())
+        std::fprintf(stderr, " (includes streamed layers)");
+      else if (m->offload && (m->offload->experts() || m->offload->maps_experts()))
+        std::fprintf(stderr, " (includes cold experts, GPU expert budget %d per layer on average)", m->opt.gpu_experts);
+      else if (m->vision_host_bytes && m->host_bytes > m->vision_host_bytes)
         std::fprintf(stderr, " (embedding + vision %.2f GB)", m->vision_host_bytes / 1e9);
       else if (m->vision_host_bytes)
         std::fprintf(stderr, " (vision)");
@@ -865,8 +914,18 @@ int open_model(const flyx_model_desc* desc, const flyx_open_options* opts, flyx_
   return 0;
 }
 
-void close_model(flyx_bmodel* m) { delete m; }
-
+void close_model(flyx_bmodel* m) {
+  if (!m) return;
+  const auto& batch = m->batch;
+  if (batch && m->verbose && batch->launched)
+    std::fprintf(stderr,
+                 "flyx-cuda: %ld rounds of several sequences (%.2f sequences, %.1f rows each), %ld graphs "
+                 "captured\n",
+                 batch->launched, double(batch->sequences) / batch->launched, double(batch->rows) / batch->launched,
+                 batch->captured);
+  if (m->offload) m->offload->report(stderr);
+  delete m;
+}
 
 const char* last_error() { return g_error.c_str(); }
 
@@ -895,7 +954,7 @@ const flyx_backend_api kApi = {
     prefill, launch, read_result, rewind, checkpoint, restore, set_oracle, last_error, memory, seq_bytes,
     prefill_align, device_stats, ready, set_reply, snapshot_bytes, snapshot_save, snapshot_load, launch_batch,
     pinned_alloc, pinned_free, read_logits, seq_new_in, seq_size, trim, graph_stats, prefill_snapshot,
-    encode_vision, prefill_ex, estimate_load, draft_weights_active,
+    encode_vision, prefill_ex, estimate_load, draft_weights_active, request_boundary,
 };
 
 }  // namespace flyx::cuda

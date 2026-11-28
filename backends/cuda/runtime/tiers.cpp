@@ -193,7 +193,7 @@ void DevicePieces::release() {
   if (!va && handles.empty()) return;
   const Vmm& v = vmm();
   if (va) {
-    if (alias) {
+    if (granule_mappings) {
       for (size_t o = 0; o < mapped; o += v.gran) v.unmap(CUdeviceptr(va) + o, v.gran);
     } else {
       unmap_pieces(v, CUdeviceptr(va), mapped);
@@ -204,7 +204,7 @@ void DevicePieces::release() {
   handles.clear();
   va = 0;
   bytes = mapped = 0;
-  alias = false;
+  granule_mappings = false;
 }
 
 namespace {
@@ -232,9 +232,11 @@ namespace {
 
 // The address range of `bytes` (rounded up to the granularity) for *out, mapped by map(va) and readable and
 // writable by the device; null where the driver maps no memory, or takes none of the operations (VmmUnsupported:
-// the caller makes one allocation instead).  *out is released on any error.
+// the caller makes one allocation instead).  *out is released on any error.  `device_only`: every page is device
+// memory, so an operation the driver refuses turns pieces off for the process (vmm_supported, pieces_floor); a range
+// with host pages (expert_pages) only loses its own use, and its experts run on the CPU instead.
 template <class Map>
-void* map_range(size_t bytes, DevicePieces* out, Map&& map) {
+void* map_range(size_t bytes, DevicePieces* out, Map&& map, bool device_only = true) {
   const Vmm& v = vmm();
   out->release();
   if (!v.missing.empty() || g_vmm_fallback.load(std::memory_order_relaxed) || bytes == 0) return nullptr;
@@ -250,7 +252,7 @@ void* map_range(size_t bytes, DevicePieces* out, Map&& map) {
     access.flags = CU_MEM_ACCESS_FLAGS_PROT_READWRITE;
     piece_check(v.set_access(va, total, &access, 1), "granting the device access", total);
   } catch (const VmmUnsupported&) {
-    g_vmm_fallback.store(true, std::memory_order_relaxed);
+    if (device_only) g_vmm_fallback.store(true, std::memory_order_relaxed);
     out->release();
     return nullptr;
   } catch (...) {
@@ -278,12 +280,64 @@ void* device_pieces(size_t bytes, DevicePieces* out) {
   });
 }
 
+void copy_expert_pages(const DevicePieces& a, size_t ai, const DevicePieces& b, size_t bi, uint8_t* scratch) {
+  const size_t gran = vmm_granularity();
+  auto* ap = reinterpret_cast<void*>(a.va + ai * gran);
+  auto* bp = reinterpret_cast<void*>(b.va + bi * gran);
+  CK(cudaMemcpyAsync(scratch, ap, gran, cudaMemcpyDeviceToDevice));
+  CK(cudaMemcpyAsync(ap, bp, gran, cudaMemcpyDeviceToDevice));
+  CK(cudaMemcpyAsync(bp, scratch, gran, cudaMemcpyDeviceToDevice));
+}
+
+void exchange_expert_backing(DevicePieces& a, size_t ai, DevicePieces& b, size_t bi) {
+  const Vmm& v = vmm();
+  const auto av = CUdeviceptr(a.va + ai * v.gran), bv = CUdeviceptr(b.va + bi * v.gran);
+  check(v.unmap(av, v.gran), "unmapping resident expert page");
+  check(v.unmap(bv, v.gran), "unmapping host expert page");
+  std::swap(a.handles[ai], b.handles[bi]);
+  check(v.map(av, v.gran, 0, a.handles[ai], 0), "remapping host expert page");
+  check(v.map(bv, v.gran, 0, b.handles[bi], 0), "remapping resident expert page");
+  CUmemAccessDesc access{};
+  access.location = {CU_MEM_LOCATION_TYPE_DEVICE, v.device};
+  access.flags = CU_MEM_ACCESS_FLAGS_PROT_READWRITE;
+  check(v.set_access(av, v.gran, &access, 1), "granting access to host expert page");
+  check(v.set_access(bv, v.gran, &access, 1), "granting access to resident expert page");
+}
+
+void* expert_pages(size_t bytes, size_t resident, DevicePieces* out) {
+  return map_range(bytes, out, [&](const Vmm& v, CUdeviceptr va, size_t total) {
+    out->granule_mappings = true; // each mapping occupies one granule
+    out->handles.reserve(total / v.gran);
+    if (resident) device_room(resident, floor_of(v));
+    for (size_t offset = 0; offset < total; offset += v.gran) {
+      CUmemAllocationProp prop{};
+      prop.type = CU_MEM_ALLOCATION_TYPE_PINNED;
+      prop.location = offset < resident ? CUmemLocation{CU_MEM_LOCATION_TYPE_DEVICE, v.device}
+                                        : CUmemLocation{CU_MEM_LOCATION_TYPE_HOST, 0};
+      CUmemGenericAllocationHandle handle{};
+      piece_check(v.create(&handle, v.gran, &prop, 0), "allocating expert page", v.gran);
+      out->handles.push_back(handle);
+      piece_check(v.map(va + offset, v.gran, 0, handle, 0), "mapping expert page", v.gran);
+      out->mapped += v.gran;
+    }
+  }, /*device_only=*/false);
+}
+
+bool expert_pages_supported() {
+  static const bool supported = [] {
+    if (!vmm_supported()) return false;
+    DevicePieces probe;
+    return expert_pages(vmm_granularity(), 0, &probe) != nullptr;
+  }();
+  return supported;
+}
+
 void* device_alias(size_t bytes, DevicePieces* out) {
   const Vmm& v = vmm();
   if (!vmm_supported() || bytes == 0) return nullptr;
   device_room(v.gran, floor_of(v));
   return map_range(bytes, out, [&](const Vmm& v, CUdeviceptr va, size_t total) {
-    out->alias = true;
+    out->granule_mappings = true;
     create_pieces(v, v.gran, &out->handles, "allocating device memory to alias");
     for (; out->mapped < total; out->mapped += v.gran)
       piece_check(v.map(va + out->mapped, v.gran, 0, CUmemGenericAllocationHandle(out->handles[0]), 0),

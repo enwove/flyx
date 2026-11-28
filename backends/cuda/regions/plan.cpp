@@ -3,6 +3,8 @@
 // implementation of each node (the generic one or a fused override that fits);
 // lower() resolves a program into a plan, forward() executes its nodes on a sequence (a prefill pass or a round).
 #include "backends/cuda/regions/layers.h"
+#include "backends/cuda/runtime/offload/layer_ring.h"
+#include "backends/cuda/runtime/offload/split_round.h"
 
 #include <algorithm>
 #include <climits>
@@ -383,7 +385,20 @@ void forward_nodes(const Pass& ps, size_t begin, size_t end, int copy_prefix) {
                      std::holds_alternative<RelAttnBlock>(*ps.p->block[i + 1]))
                         ? &std::get<RelAttnBlock>(*ps.p->block[i + 1])
                         : nullptr;
-    ps.p->impl[i]->fn(cur, nd, blk);
+    if (s->m->offload && nd.kind == FLYX_NODE_RUN && s->m->offload->wraps_node(size_t(nd.block))) {
+      if (cur.split) {
+        cur.split->begin_layer(cur, nd.block);
+        ps.p->impl[i]->fn(cur, nd, blk);
+        cur.split->end_layer(cur);
+      } else {
+        auto lease = s->m->offload->lease_node(nd.block, ps.round, cur.v.L.st);
+        lease.wait();
+        ps.p->impl[i]->fn(cur, nd, blk);
+        lease.release();
+      }
+    } else {
+      ps.p->impl[i]->fn(cur, nd, blk);
+    }
     if (prof) CK(cudaEventRecord(s->prof_ev[i - begin + 1], s->st));
   }
   if (res_state.expert_work) CK(cudaStreamWaitEvent(ps.v.L.st, s->expert_side.join, 0));
@@ -697,7 +712,7 @@ int lower(flyx_bmodel* m, const flyx_program* prog, flyx_plan** out) {
 #if CUDART_VERSION < 12040
     return fail("lower: adaptive stopping plans need CUDA 12.4+");
 #else
-    if (!m->opt.graphs) return fail("lower: adaptive stopping plans need CUDA graphs");
+    if (!m->allows_graphs()) return fail("lower: adaptive stopping plans need CUDA graphs");
     if (prog->phase != FLYX_PHASE_ROUND || !p->has_draft || p->tree || !prog->checkpoints ||
         prog->n_checkpoints < 2 || prog->n_checkpoints > FLYX_MAX_STOP_BUCKETS || prog->width >= FLYX_MAX_ROWS)
       return fail("lower: invalid adaptive stopping checkpoints");
@@ -742,6 +757,11 @@ int lower(flyx_bmodel* m, const flyx_program* prog, flyx_plan** out) {
   }
   // Its graphs' size, in every session's room (graph_room): a round plan's, but for a tree of given drafts, which the
   // engine lowers and never runs (tests and tree_bench do: a session keeps those in the room the others leave).
+  if (m->offload && (m->offload->experts() || m->offload->maps_experts()) && m->verbose && p->phase == FLYX_PHASE_ROUND)
+    for (size_t i = 0; i < p->nodes.size(); ++i)
+      if (p->nodes[i].kind == FLYX_NODE_RUN && p->block[i])
+        if (const auto* f = std::get_if<MoeBlock>(p->block[i]); f && !f->cold_gu && !f->route_histogram)
+          p->resident_routes += f->top_k;
   if (p->phase == FLYX_PHASE_ROUND && !(p->tree && !p->drafted_tree)) plan_lowered(m, p.get());
   *out = p.release();
   return 0;

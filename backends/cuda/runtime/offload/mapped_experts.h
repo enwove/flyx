@@ -1,0 +1,101 @@
+// Copyright 2026 The flyx Authors. SPDX-License-Identifier: Apache-2.0
+#pragma once
+
+#include "backends/cuda/backend.h"
+#include "backends/cuda/runtime/offload/expert_order.h"
+#include "backends/cuda/runtime/offload/expert_profile.h"
+#include "backends/cuda/runtime/offload/staging_ring.h"
+
+#include <array>
+#include <deque>
+#include <map>
+#include <shared_mutex>
+
+namespace flyx::cuda {
+// Every round sees stable projection addresses. At quiescence, equally sized pages can exchange
+// physical backing across weights without increasing the device budget or changing any value.
+struct MappedExpertPair {
+  struct Projection {
+    ExpertMat mat;
+    size_t payload = 0, scales = 0;
+    size_t gather_bytes(int pairs) const;
+    ExpertMat gather(uint8_t* buffer, const int* ids, int* compact, int pairs, cudaStream_t stream) const;
+    // `count` copies of its experts in `buffer` (gather's layout), and the planes that copy into them.
+    ExpertMat copies(uint8_t* buffer, int count, GatherPlanes* planes) const;
+    ExpertMat stage(uint8_t* buffer, cudaStream_t stream) const;
+  };
+  Projection gate, down;
+  const std::atomic<bool>* gather = nullptr;
+  // [n_experts] by physical slot: every page of both projections on the device (ExpertAddressSpace::resident).
+  const uint8_t* resident = nullptr;
+  int stage_min_rows = INT_MAX;
+  class ExpertAddressSpace* owner = nullptr;
+};
+
+class ExpertAddressSpace {
+public:
+  void* allocate(flyx_bmodel* model, int weight, size_t bytes, size_t experts, size_t hot);
+  void attach(flyx_bmodel* model, MoeBlock& block, int gate, int down, int resident,
+              const std::array<const flyx_tensor_view*, 4>& views);
+  void load_profile();
+  void request_boundary(bool begin, cudaStream_t stream);
+  std::shared_lock<std::shared_mutex> reading();
+  size_t gather_bytes(int pairs) const;
+  void note_rows(int rows);
+  int planned_rows() const { return max_rows_.load(std::memory_order_relaxed); }
+  void init_prefill(flyx_bmodel* model, const std::array<size_t, 2>& slots);
+  void count_resident(size_t routes);
+  void prefill(const Pass& ps, const MoeBlock& block, const MoeScratch* sc, float* out, bool accumulate, bool fused);
+  void open();
+  void finish_prompt(cudaStream_t stream);
+  void close(const flyx_seq* seq) noexcept;
+  void report(FILE* out) const;
+
+private:
+  struct Plane {
+    DevicePieces memory;
+    int weight = 0;
+    size_t stride = 0;
+    uint8_t* data = nullptr;
+    std::vector<uint8_t> hot;
+  };
+  struct Histogram {
+    explicit Histogram(size_t n) : order(n), decode(n), recorded(n), heat(n), unsaved(n) {}
+    ExpertOrder order;
+    uint32_t* device = nullptr;
+    int* slots = nullptr;
+    std::vector<uint32_t> decode, recorded;
+    std::vector<uint64_t> heat, unsaved;  // lifetime decode counts and the increments awaiting a cache merge
+    size_t desired = 0;
+    std::atomic<bool> gather{false};
+    int top_k = 0;
+    uint8_t* resident = nullptr;  // resident() by physical slot on the device, for the round gathers
+  };
+  bool resident(std::pair<int, int> pair, size_t slot) const;
+  void publish_residency(std::pair<int, int> pair, Histogram& h) const;
+  bool record_decode(Histogram& h);
+  void observe(bool between_requests = false);
+  std::vector<ProfileLayer> profile_layers() const;
+  void save_profile();
+  void select_gather();
+  enum class Placement { ColdPrompt, Load, BetweenRequests };
+  void promote(Placement mode);
+  void rank_experts(bool all);
+  std::deque<MappedExpertPair> pairs_;
+  StagingRing<2> prefill_ring_;
+  std::deque<Plane> planes_;
+  std::map<std::pair<int, int>, Histogram> histograms_;
+  uint8_t* scratch_ = nullptr;
+  size_t granule_ = 0, sessions_ = 0;
+  uint64_t hits_ = 0, slots_ = 0, full_routes_ = 0;
+  bool failed_ = false, pending_ = false, verbose_ = false;
+  double observed_rows_ = 0, observed_remote_rows_ = 0;
+  std::filesystem::path profile_;
+  uint64_t fingerprint_ = kFingerprintSeed;
+  size_t requests_ = 0;
+  bool warm_start_ = false, user_started_ = false;
+  std::shared_mutex pages_mu_;  // shared across submission, exclusive across sync, remap and map publication
+  std::mutex mutex_;
+  std::atomic<int> max_rows_{0};
+};
+} // namespace flyx::cuda

@@ -1,8 +1,10 @@
 // Copyright 2026 The flyx Authors. SPDX-License-Identifier: Apache-2.0
 // Sequence state and row buffers, sized from the blocks and the state table.
+#include "backends/cuda/runtime/offload/expert_store.h"
 #include "backends/cuda/runtime/checked_size.h"
 #include "backends/cuda/runtime/window_ring.h"
 #include "backends/cuda/backend.h"
+#include "backends/cuda/runtime/offload/mapped_experts.h"
 #include "flyx/gemm_tables.inc"
 #include "ops/sampling/sampling.h"
 
@@ -201,6 +203,12 @@ void alloc_rows(const flyx_bmodel* m, int R, bool prefill, RowBufs* b, Alloc&& a
   if (n.moe_experts > 0) {
     b->moe_idx = static_cast<int*>(alloc(size_t(R) * n.moe_topk * sizeof(int)));
     b->moe_w = f(size_t(R) * n.moe_topk);
+    if (!prefill && b->gather_rows > 1) {
+      const int pairs = b->gather_rows * n.moe_topk;
+      b->gathered = static_cast<uint8_t*>(alloc(m->offload->mapped_experts().gather_bytes(pairs)));
+      b->gather_ids = static_cast<int*>(alloc(size_t(pairs) * sizeof(int)));
+      b->gather_slot = static_cast<int*>(alloc(size_t(pairs) * sizeof(int)));
+    }
     if (!prefill) b->moe_guess = f(size_t(n.moe_experts) + size_t(H));  // scores, then a mixed row (R == 1)
     // moe_gu is dead during moe_down (and unused when fused), so down_buf safely aliases it.
     const size_t gu_or_down = std::max(size_t(2) * size_t(n.moe_inter), size_t(H));
@@ -313,7 +321,7 @@ void alloc_rows(const flyx_bmodel* m, int R, bool prefill, RowBufs* b, Alloc&& a
 
 template <class Alloc>
 void alloc_cert_scratch(const flyx_bmodel* m, CertScratch* c, Alloc&& alloc) {
-  if (!m->opt.kernels.head_cert || m->opt.kernels.head_fp8) return;
+  if (!m->has_certified_head) return;
   c->norms = static_cast<float*>(alloc(2 * FLYX_MAX_ROWS * sizeof(float)));
   c->key = static_cast<int*>(alloc(FLYX_MAX_ROWS * sizeof(int)));
   c->cols = static_cast<int*>(alloc(size_t(m->vocab) * sizeof(int)));
@@ -495,18 +503,21 @@ bool take_method(const flyx_bmodel* m, const flyx_seq_layout* layout, flyx_seq* 
   return true;
 }
 
-uint64_t query_pinned_budget(const flyx_bmodel* m) {
-  if (m->opt.pageable_kv == PageableKvMode::off) return UINT64_MAX;
-  if (m->opt.pageable_kv == PageableKvMode::on) return 0;
-  if (m->opt.pinned_host_mb >= 0) return uint64_t(m->opt.pinned_host_mb) << 20;
+uint64_t query_pinned_budget(const BackendOptions& options) {
+  if (options.pinned_host_mb >= 0) return uint64_t(options.pinned_host_mb) << 20;
   return host_pinned_budget();
 }
 
 namespace {
+uint64_t kv_pinned_budget(const BackendOptions& options) {
+  if (options.pageable_kv == PageableKvMode::off) return UINT64_MAX;
+  if (options.pageable_kv == PageableKvMode::on) return 0;
+  return query_pinned_budget(options);
+}
 
 int new_seq(flyx_bmodel* m, const flyx_seq_layout* layout, bool capture_only, flyx_seq** out) {
   // Sample the WDDM pinned budget once so dry-run sizing and real allocation choose the identical hybrid split.
-  const uint64_t pinned_budget = query_pinned_budget(m);
+  const uint64_t pinned_budget = kv_pinned_budget(m->opt);
   // Dry-run first to measure the exact arena sizes so the real build performs one device and one host allocation
   // instead of hundreds of per-layer cudaMalloc/cudaHostAlloc calls.
   flyx_seq probe;
@@ -529,10 +540,12 @@ int new_seq(flyx_bmodel* m, const flyx_seq_layout* layout, bool capture_only, fl
   s->pinned_budget = pinned_budget;
   s->device_positions = std::max(0, layout->device_positions);
   s->copy_host = std::max(0, layout->copy_host);
+  s->own.gather_rows = probe.own.gather_rows;
   s->arena_dev_bytes = probe.arena_dev_bytes;
   s->arena_host_bytes = probe.arena_host_bytes;
   try {
     build_seq(m, layout->max_ctx, s.get());
+    if (m->offload && !capture_only) m->offload->on_session_open(m, s->st);
   } catch (const OutOfDeviceMemory& e) {
     return fail_oom(std::string("seq_new: ") + e.what());
   } catch (const std::exception& e) {
@@ -562,7 +575,7 @@ int seq_size(flyx_bmodel* m, const flyx_seq_layout* layout, flyx_seq_size* out) 
   flyx_seq s;
   if (!take_method(m, layout, &s)) return fail("a K/V layout this backend does not read");
   s.dry = true;
-  s.pinned_budget = query_pinned_budget(m);
+  s.pinned_budget = kv_pinned_budget(m->opt);
   s.device_positions = std::max(0, layout->device_positions);
   s.copy_host = std::max(0, layout->copy_host);
   size_t room = 0;  // for its round graphs: the device memory the driver takes for them
@@ -1386,6 +1399,10 @@ void build_seq(flyx_bmodel* m, int32_t max_ctx, flyx_seq* s) {
       create_side(&s->expert_side);
       CK(cudaEventCreateWithFlags(&s->expert_read, cudaEventDisableTiming));
     }
+    if (m->offload && m->offload->maps_experts()) {
+      create_side(&s->gather_side);
+      CK(cudaEventCreateWithFlags(&s->gather_gate, cudaEventDisableTiming));
+    }
     if (dv) CK(cudaStreamCreateWithFlags(&s->dv.body, cudaStreamNonBlocking));
     s->dv.skip_noop = m->opt.dv_conditional;
     for (auto& e : s->ev) CK(cudaEventCreateWithFlags(&e, cudaEventDisableTiming));
@@ -1424,6 +1441,7 @@ void build_seq(flyx_bmodel* m, int32_t max_ctx, flyx_seq* s) {
   if (!s->dry) CK(cudaHostGetDevicePointer(reinterpret_cast<void**>(&s->ring_host_dev), s->ring_host, 0));
   s->tok_host = s->pinned_alloc<int>(size_t(prefill_rows));
   s->P = s->alloc<DevParams>(1);
+  if (m->offload && m->offload->experts()) s->route_error = s->alloc<int>(1);
   s->G = s->alloc<DevGen>(1);
   s->mask_words = (m->vocab + 31) / 32;
   s->mask = s->alloc<uint32_t>(size_t(s->mask_words));
@@ -1436,6 +1454,10 @@ void build_seq(flyx_bmodel* m, int32_t max_ctx, flyx_seq* s) {
   s->ld_proj = n.proj;
   s->ld_act = n.act;
   auto seq_bytes_alloc = [&](size_t bytes) { return static_cast<void*>(s->alloc<unsigned char>(bytes)); };
+  if (s->own.gather_rows < 0)
+    s->own.gather_rows = m->offload && m->offload->maps_experts() && m->opt.expert_gather
+                             ? m->offload->mapped_experts().planned_rows()
+                             : 0;
   alloc_rows(m, R, false, &s->own, seq_bytes_alloc);
   s->drafts = s->alloc<int>(size_t(m->wide_rows));
   if (m->wide_rows > FLYX_MAX_ROWS) s->P_shift = s->alloc<DevParams>(1);
@@ -1563,7 +1585,8 @@ void build_seq(flyx_bmodel* m, int32_t max_ctx, flyx_seq* s) {
 
 void seq_free(flyx_seq* s) {
   // -v: what its rounds ran from (a run's rounds without a graph: the sum of these lines).
-  if (s && s->m && s->m->verbose && s->m->opt.graphs && (s->graph_stats.from_graph || s->graph_stats.without_graph))
+  if (s && s->m && s->m->verbose && s->m->allows_graphs() &&
+      (s->graph_stats.from_graph || s->graph_stats.without_graph))
     std::fprintf(stderr, "flyx-cuda: a session's rounds: %llu from a graph, %llu without; %llu graphs made, %.2f MiB "
                          "held of its room's %.2f\n", (unsigned long long)s->graph_stats.from_graph,
                  (unsigned long long)s->graph_stats.without_graph, (unsigned long long)s->graph_stats.captured,
@@ -1592,6 +1615,8 @@ void seq_free(flyx_seq* s) {
       it = uses ? B.hits.erase(it) : std::next(it);
     }
   }
+  auto* m = s && !s->capture_only ? s->m : nullptr;
+  if (m && m->offload) m->offload->on_session_close(m, s);
   delete s;
 }
 

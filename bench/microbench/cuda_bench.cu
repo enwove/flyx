@@ -47,6 +47,7 @@
 #include <array>
 #include <cctype>
 #include <chrono>
+#include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -286,6 +287,147 @@ void bench_moe() {
   for (int dtype : kMoeDp4aTypes) bench_moe_projection(dtype, false);
   bench_moe_projection(FLYX_DT_GGML_NVFP4, true);
   bench_moe_projection(FLYX_DT_GGML_Q4_K, true);
+}
+
+// Inkling-2-Mini's prefill MoE projections on GGML block experts:
+// cuda_bench moepf [TYPE|all] [ROWS] [gu|down|both] [mmq|mma16] (mma16: option moe_mmq=0, the rounds' bits).
+// A bank of 128 experts, 8 a row, rows routed with a fixed skew (Zipf 0.8 over a shuffled bank, as real routers
+// favour some experts); gate|up K = 2304 with fused SiTU in float32, down K = 1152 into its slots and the weighted
+// sum.  3 warm-up and 10 timed calls, and the FNV-1a hash of the outputs (a kernel change that keeps the bits keeps
+// it).
+void bench_moe_prefill(int argc, char** argv) {
+  constexpr int H = 2304, I = 1152, E = kMoeExperts, top = kMoeTopK;
+  const std::string type = argc > 2 ? argv[2] : "all";
+  const int rows = argc > 3 ? std::atoi(argv[3]) : 1024;
+  const std::string which = argc > 4 ? argv[4] : "both";
+  const std::string kernel = argc > 5 ? argv[5] : "mmq";
+  if (rows < 17 || rows > 4096 || (kernel != "mmq" && kernel != "mma16")) {
+    std::printf("usage: cuda_bench moepf [TYPE|all] [ROWS 17..4096] [gu|down|both] [mmq|mma16]\n");
+    std::exit(2);
+  }
+  struct Case {
+    int dtype;
+    const char* name;
+    bool down;
+  };
+  const Case cases[] = {{FLYX_DT_GGML_IQ2_S, "IQ2_S", false},     {FLYX_DT_GGML_IQ2_XXS, "IQ2_XXS", false},
+                        {FLYX_DT_GGML_IQ1_S, "IQ1_S", false},     {FLYX_DT_GGML_IQ2_XS, "IQ2_XS", false},
+                        {FLYX_DT_GGML_IQ3_XXS, "IQ3_XXS", false}, {FLYX_DT_GGML_Q4_K, "Q4_K", false},
+                        {FLYX_DT_GGML_Q2_0, "Q2_0", true},        {FLYX_DT_GGML_MXFP4, "MXFP4", true},
+                        {FLYX_DT_GGML_IQ4_NL, "IQ4_NL", true},    {FLYX_DT_GGML_Q8_0, "Q8_0", true}};
+  header();
+  std::printf("Inkling-2-Mini prefill experts, E=%d top=%d, %d rows, Zipf 0.8 routes\n"
+              "op      format    rows       us   eff_TOPS  checksum\n", E, top, rows);
+  blocks_init();
+  // Routes: each row takes `top` distinct experts drawn with weights 1 / (rank + 1)^0.8 of a shuffled bank.
+  std::vector<int> routes(size_t(rows) * top);
+  {
+    uint64_t seed = 0x9e3779b97f4a7c15ull;
+    auto next = [&] {
+      seed ^= seed << 13, seed ^= seed >> 7, seed ^= seed << 17;
+      return seed;
+    };
+    std::vector<int> bank(E);
+    std::iota(bank.begin(), bank.end(), 0);
+    for (int i = E - 1; i > 0; --i) std::swap(bank[size_t(i)], bank[size_t(next() % uint64_t(i + 1))]);
+    std::vector<double> cdf(E);
+    double total = 0;
+    for (int i = 0; i < E; ++i) cdf[size_t(i)] = total += 1.0 / std::pow(double(i + 1), 0.8);
+    for (int r = 0; r < rows; ++r)
+      for (int k = 0; k < top; ++k) {
+        int e;
+        do {
+          const double u = double(next() >> 11) * (1.0 / 9007199254740992.0) * total;
+          e = bank[size_t(std::lower_bound(cdf.begin(), cdf.end(), u) - cdf.begin())];
+        } while (std::find(routes.begin() + ptrdiff_t(r) * top, routes.begin() + ptrdiff_t(r) * top + k, e) !=
+                 routes.begin() + ptrdiff_t(r) * top + k);
+        routes[size_t(r) * top + size_t(k)] = e;
+      }
+  }
+  MoeBenchBuffers mem;
+  const size_t pairs = size_t(rows) * top;
+  int* eidx = mem.alloc<int>(pairs);
+  CK(cudaMemcpy(eidx, routes.data(), pairs * sizeof(int), cudaMemcpyHostToDevice));
+  float* ew = mem.alloc<float>(pairs);
+  k_fill_f<<<64, 256>>>(ew, pairs, 23u, 0.05f, 0.1f);
+  float* rs = mem.alloc<float>(E);
+  k_fill_f<<<1, 256>>>(rs, E, 7u, 0.5f, 0.5f);
+  MoeScratch sc{};
+  sc.chunk_rows = rows;
+  sc.max_experts = E;
+  sc.max_top_k = top;
+  sc.pairs = mem.alloc<int>(pairs);
+  sc.tasks = mem.alloc<MoeTask>(pairs + E);
+  sc.n_tasks = mem.alloc<int>(1);
+  sc.stage_elems = pairs * std::max(H, I);
+  sc.q8_a = mem.alloc<int8_t>(sc.stage_elems);
+  sc.q8_d = mem.alloc<float>(sc.stage_elems / 32);
+  sc.q8_s = mem.alloc<float>(sc.stage_elems / 16);
+  sc.down_buf = mem.alloc<float>(pairs * H);
+  float* x = mem.alloc<float>(size_t(rows) * H);
+  k_fill_f<<<256, 256>>>(x, size_t(rows) * H, 31u, -1.f, 2.f);
+  float* act = mem.alloc<float>(pairs * I);
+  k_fill_f<<<256, 256>>>(act, pairs * I, 37u, -1.f, 2.f);
+  float* gu_out = mem.alloc<float>(pairs * I);
+  float* y = mem.alloc<float>(size_t(rows) * H);
+  cudaStream_t st;
+  CK(cudaStreamCreateWithFlags(&st, cudaStreamNonBlocking));
+  KernelOptions options = g_bench_opts;
+  options.moe_mmq = kernel == "mmq";
+  const Launch launch{st, nullptr, &options};
+  auto hash_of = [&](const float* p, size_t n) {
+    std::vector<float> host(n);
+    CK(cudaMemcpy(host.data(), p, n * sizeof(float), cudaMemcpyDeviceToHost));
+    const auto* b = reinterpret_cast<const uint8_t*>(host.data());
+    uint64_t h = 14695981039346656037ull;
+    for (size_t j = 0; j < n * sizeof(float); ++j) h = (h ^ b[j]) * 1099511628211ull;
+    return h;
+  };
+  for (const Case& c : cases) {
+    if (type != "all" && type != c.name) continue;
+    const bool down = c.down;
+    if ((which == "gu" && down) || (which == "down" && !down)) continue;
+    const int N = down ? H : 2 * I, K = down ? I : H;
+    const BlockLayout l = blocks_layout(c.dtype);
+    if (K % l.values) continue;
+    std::vector<BlockMat> packed = block_copies(c.dtype, E * N, K);
+    ExpertMat W{};
+    W.n_experts = E;
+    W.N = N;
+    W.rs = rs;
+    W.blk = packed.front();
+    W.blk.q8 = true;
+    const double macs = double(pairs) * N * K;
+    {
+      auto call = [&] {
+        if (down) moe_down(act, I, W, eidx, ew, rows, top, H, K, y, H, false, &sc, launch);
+        else moe_gate_up(x, H, W, eidx, rows, top, I, K, 6.f, 8.f, true, gu_out, I, &sc, launch);
+      };
+      CK(cudaStreamSynchronize(st));
+      double ms = 0;
+      {
+        for (int i = 0; i < 3; ++i) call();
+        cudaEvent_t a, b;
+        CK(cudaEventCreate(&a));
+        CK(cudaEventCreate(&b));
+        CK(cudaEventRecord(a, st));
+        for (int i = 0; i < 10; ++i) call();
+        CK(cudaEventRecord(b, st));
+        CK(cudaEventSynchronize(b));
+        float t = 0;
+        CK(cudaEventElapsedTime(&t, a, b));
+        ms = t / 10;
+        cudaEventDestroy(a);
+        cudaEventDestroy(b);
+      }
+      const uint64_t h = down ? hash_of(y, size_t(rows) * H) : hash_of(gu_out, pairs * I);
+      std::printf("%-7s %-8s %5d %8.1f %9.2f  %016llx\n", down ? "down" : "gate|up", c.name, rows, ms * 1e3,
+                  2 * macs / (ms * 1e9), static_cast<unsigned long long>(h));
+      std::fflush(stdout);
+    }
+    free_copies(packed);
+  }
+  CK(cudaStreamDestroy(st));
 }
 
 // NVFP4 weights: bytes streamed are K/2 + K/16 (+4) per output column.
@@ -2243,6 +2385,38 @@ __global__ void k_sum_words(const uint32_t* p, size_t n, unsigned long long* out
   atomicAdd(out, s);
 }
 
+// Transfer ceiling for the layer ring. Allocate and touch pinned memory before the timed interval.
+void bench_h2d() {
+  cudaStream_t stream;
+  cudaEvent_t begin, end;
+  CK(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking));
+  CK(cudaEventCreate(&begin));
+  CK(cudaEventCreate(&end));
+  constexpr size_t capacity = size_t(256) << 20;
+  uint8_t *host, *device;
+  CK(cudaMallocHost(&host, capacity));
+  CK(cudaMalloc(&device, capacity));
+  std::memset(host, 0x5a, capacity);
+  for (size_t bytes : {size_t(4) << 20, size_t(32) << 20, capacity}) {
+    const int repetitions = int(4 * capacity / bytes);
+    CK(cudaMemcpyAsync(device, host, bytes, cudaMemcpyHostToDevice, stream));
+    CK(cudaEventRecord(begin, stream));
+    for (int i = 0; i < repetitions; ++i)
+      CK(cudaMemcpyAsync(device, host, bytes, cudaMemcpyHostToDevice, stream));
+    CK(cudaEventRecord(end, stream));
+    CK(cudaEventSynchronize(end));
+    float ms;
+    CK(cudaEventElapsedTime(&ms, begin, end));
+    std::printf("pinned H2D %zu MiB x %d: %.3f GB/s (%.2f ms)\n", bytes >> 20, repetitions,
+                bytes * double(repetitions) / (ms * 1e6), ms);
+  }
+  CK(cudaFree(device));
+  CK(cudaFreeHost(host));
+  CK(cudaEventDestroy(begin));
+  CK(cudaEventDestroy(end));
+  CK(cudaStreamDestroy(stream));
+}
+
 void bench_host_read() {
   unsigned long long* out = nullptr;
   CK(cudaMalloc(&out, 8));
@@ -2420,9 +2594,14 @@ void bench_mt(int argc, char** argv) {
 
 }  // namespace
 
+namespace flyx::bench {
+int cold_dot_bench(int argc, char** argv);
+}
+
 int main(int argc, char** argv) {
   std::string what = argc > 1 ? argv[1] : "gemm";
   // This tuning family uses the recorded decode timings from real model runs.
+  if (what == "cold_dot") return flyx::bench::cold_dot_bench(argc - 2, argv + 2);
   if (what == "tune" && argc > 2 && std::string(argv[2]) == "strata_placement") return tune(argc - 2, argv + 2);
 #if !FLYX_TUNE_CANDIDATES
   if (what == "skinny" || what == "fp4" || what == "fp4cfgs" || what == "fp4rows" || what == "tune" ||
@@ -2441,8 +2620,16 @@ int main(int argc, char** argv) {
     g_bench_opts.pdl = gemm_tuning_pdl(g_bench_opts.tuning);
     if (const char* e = std::getenv("FLYX_BENCH_PDL")) g_bench_opts.pdl = std::string(e) == "1";
   }
+  if (what == "h2d") {
+    bench_h2d();
+    return 0;
+  }
   if (what == "moe") {  // uses its own routing and staging scratch
     bench_moe();
+    return 0;
+  }
+  if (what == "moepf") {  // likewise, prefill row counts
+    bench_moe_prefill(argc, argv);
     return 0;
   }
   if (what == "paging") return bench_paging(argc, argv);  // the device's memory as it is, no scratch beside it
@@ -2485,8 +2672,10 @@ int main(int argc, char** argv) {
   else if (what == "graphs") bench_graphs(argc, argv);
   else if (what == "mt") bench_mt(argc, argv);
   else {
-    std::printf("usage: cuda_bench gemm|skinny|fp4|fp4cfgs|fp4rows|tune|gdn|decode|tc|attn|flash|strata|mlp|w4a4|w12|pick|dots|blocks|q8runs|rounds|"
-                "round|moe|glu|pass|stack|mma|host_read|stream|graphs|paging|mt\n");
+    std::printf("usage: cuda_bench "
+                "gemm|skinny|fp4|fp4cfgs|fp4rows|tune|gdn|decode|tc|attn|flash|strata|mlp|w4a4|w12|pick|dots|blocks|"
+                "q8runs|rounds|"
+                "round|moe|moepf|cold_dot|glu|pass|stack|mma|host_read|stream|graphs|paging|mt\n");
     return 2;
   }
   return 0;

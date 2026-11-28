@@ -30,7 +30,7 @@
 extern "C" {
 #endif
 
-#define FLYX_BACKEND_ABI_VERSION 55u
+#define FLYX_BACKEND_ABI_VERSION 56u
 #define FLYX_BACKEND_ENTRY "flyx_backend_get_api"
 /* How a backend library exports its entry. */
 #if defined(_WIN32)
@@ -141,6 +141,10 @@ static inline int32_t flyx_block_bytes(int32_t dtype) {
     default: return 0;
   }
 }
+
+/* Residency caps use zero for automatic, one for all-cold. */
+FLYX_ABI_INLINE uint32_t flyx_encode_cap(int32_t cap) { return cap < 0 ? 0u : (uint32_t)cap + 1u; }
+FLYX_ABI_INLINE int32_t flyx_decode_cap(uint32_t value) { return value ? (int32_t)(value - 1u) : -1; }
 
 /* A tensor of the model file (host memory, read-only). */
 typedef struct {
@@ -1015,10 +1019,13 @@ typedef struct {
   /* ABI 48: use this target-only position as AUTO's default switch on every layout. An explicit backend
    * switch still wins. A zero-initialized direct caller retains layout-dependent AUTO. */
   int32_t lock_auto_from, auto_from;
+  /* ABI 56: an elastic placement chosen from estimate_load. Zero keeps the backend option/default.
+   * A nonzero value is one plus the number of experts per layer or dense layers retained on device. */
+  uint32_t gpu_experts_plus_one, gpu_layers_plus_one;
 } flyx_open_options;
 
 /* Pre-flight device memory estimate before open() allocates (ABI 48).
- * All figures are in device bytes for the backend's current device and the given model + open options. */
+ * Storage estimates are in bytes for the current device, model and open options. */
 typedef struct {
   uint64_t weights_bytes;         /* total target + active drafter + resident vision weights on device */
   uint64_t draft_weights_bytes;   /* portion of weights_bytes belonging to neural drafter blocks */
@@ -1027,6 +1034,10 @@ typedef struct {
   uint64_t comfort_margin_bytes;  /* headroom above weights + min_runtime to keep full auto drafter precision */
   uint64_t target_kv_bytes_per_position; /* resident exact target K/V, including scales, before placement (ABI 48) */
   int32_t vision_device;                 /* resolved flyx_vision_device for this estimate (ABI 48) */
+  /* ABI 56: supported placement axes and additional host storage required for the requested split.
+   * Zero for both counts means that this backend/model cannot offload weights. */
+  int32_t experts_per_layer, dense_layers;
+  uint64_t offload_pinned_bytes, offload_pageable_bytes;
 } flyx_load_estimate;
 
 /* Device memory as the backend sees it (0 = unknown, e.g. a CPU backend). */
@@ -1275,6 +1286,9 @@ typedef struct flyx_backend_api {
    * policy asked): "nvfp4", "q8" (Q8_0 blocks), "exact" (the file's own precision: bf16, or GGML blocks of another
    * type kept as stored), or "" when no neural drafter is active.  NULL: backend does not report it. */
   const char* (*draft_weights)(flyx_bmodel* m);
+  /* ABI 56: optional request lifetime notification. A successful begin is paired with an end after the
+   * reply, including on cancellation or error. Concurrent requests can use different sequences. */
+  int (*request_boundary)(flyx_seq* s, int32_t begin);
 } flyx_backend_api;
 
 typedef const flyx_backend_api* (*flyx_backend_entry_fn)(void);

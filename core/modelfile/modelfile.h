@@ -67,6 +67,7 @@ class ModelFile {
   // Reads this file and then its companions from disk, front to back a piece at a time (os::MappedFile::read_ahead),
   // until done or `stop`: on a thread of its own while a backend reads the weights.
   void read_ahead(const std::atomic<bool>& stop) const;
+  void release_pages() const;
 
   // What a reader fills (views and blobs point into the mapping, or into `owned`).
   struct Contents {

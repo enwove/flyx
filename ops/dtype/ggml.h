@@ -201,7 +201,9 @@ inline double value(int32_t dtype, const uint8_t* data, size_t i) {
       const int g = j / 16, l = j % 16;
       const uint8_t q = b.qs[8 * g + (l & 7)], x = b.d[g];
       const int e = (x >> 3) & 15, m = x & 7;
-      const double scale = x == 0x7F ? 0.0 : e == 0 ? std::ldexp(double(m), -9) : std::ldexp(double(8 + m), e - 10);
+      const double scale = (x & 0x7F) == 0x7F ? 0.0
+                           : e == 0           ? std::ldexp(double(m), -9)
+                                              : std::ldexp(double(8 + m), e - 10);
       return kvalues_mxfp4[l < 8 ? q & 15 : q >> 4] * scale * 0.5;
     }
     // MXFP4: 32 doubled e2m1 codes with one E8M0 scale, halved (ggml_e8m0_to_fp32_half).

@@ -173,6 +173,8 @@ struct KernelOptions {
                               // later, where the device fits it); 1: one block a row.  Same bits
   bool moe_vec = false;       // NVFP4 experts: float32 inputs and column-at-a-time vector kernels at every width,
                               // instead of bf16 inputs on tensor cores (another arithmetic contract, not a tuning)
+  bool moe_mmq = true;        // GGML block experts in prompt passes of more than 16 rows: 64-row tensor-core tiles, one
+                              // float32 sum a K order (0: 16-row tiles with the rounds' 32-stream bits, where dense)
   int warm = kWarmAll;        // rounds: L2 warming on the expert stream, a mask: the next MoE's router (1), loop
                               // controller (2), residual query and norm (4); the next attention's small weights
                               // (16).  0: none.  Same bits
@@ -431,6 +433,7 @@ const char* gemm_tuning_name(int tuning);
 bool gemm_tuning_compiled_for(int tuning, int cc);
 // Whether kernels launch as programmatic dependents on the GPU of this table unless the options say.
 bool gemm_tuning_pdl(int tuning);
+int gemm_tuning_expert_prefill(int tuning);
 // The table a device runs unless the options name one or none (option tuning=table; the engine and cuda_bench alike):
 // the device's own (gemm_tuning_for, by its name, else by its compute capability device_cc), where the loaded code
 // (compute capability code_cc, compiled_arch) has its kernels; else the loaded code's architecture's table, where it
@@ -1965,9 +1968,65 @@ int moe_gate_up(const float* x, int ldx, const ExpertMat& W, const int* eidx, in
 // act_bf16 (with moe_round_bf16_down): its input [rows*top_k, K] in bf16 already, read in place of act.
 // grouped: moe_gate_up's return for these eidx and rows, sc untouched since; its work tiles are taken where they are
 // the ones this GEMM would group (0: group them here).
+// Reduce unweighted GPU and CPU slots in the router's original order.
+void moe_sum_slots(const float* slots, const float* weights, int rows, int top_k, int hidden, float* out,
+                   bool accumulate, cudaStream_t st);
 void moe_down(const float* act, int ld_act, const ExpertMat& W, const int* eidx, const float* ew, int rows, int top_k,
               int H, int K, float* out, int ld_out, bool accumulate, const MoeScratch* sc, const Launch& L,
               const bf16* act_bf16 = nullptr, int grouped = 0);
+
+// Cold slots use a valid temporary expert until the CPU result replaces them.
+struct ResidentRoutes {
+  int* ids = nullptr;
+  int experts = 0;
+  int* host_ids = nullptr;
+  const float* input = nullptr;
+  float* host_input = nullptr;
+  int width = 0;
+  uint32_t* ticket = nullptr;
+  uint32_t generation = 0;
+};
+struct GatherPlane {
+  const uint8_t* source;
+  uint8_t* target;
+  size_t stride;
+  int blocks;
+};
+struct GatherPlanes {
+  GatherPlane plane[3]{};
+  int count = 0, blocks = 0;
+};
+void gather_expert_planes(GatherPlanes planes, const int* ids, int* compact, int pairs, cudaStream_t stream);
+// A round's plan for gathering only its host-resident experts (ids: physical experts of `pairs` pairs, at most
+// kGatherPlanPairs).  Pair p keeps its id where resident[id], or once `copies` copies are taken; else its expert's
+// copy is `rank`, the experts' order of first occurrence, and p's id becomes split + rank.  copy_slot[p]: the copy pair
+// p makes (its expert's first pair), -1 none.  One block.
+constexpr int kGatherPlanPairs = 1024;
+void gather_plan(const int* ids, int pairs, const uint8_t* resident, int split, int copies, int* out_ids,
+                 int* copy_slot, cudaStream_t st);
+// Expert ids[p]'s planes to copy copy_slot[p] of the planes' targets, for each p with copy_slot[p] >= 0.
+void gather_copy(GatherPlanes planes, const int* ids, const int* copy_slot, int pairs, cudaStream_t st);
+
+void moe_sum_mapped(const float* slots, const float* cold, const int* ids, int resident, const float* weights,
+                    int rows, int top_k, int hidden, float* out, bool accumulate, cudaStream_t st);
+void moe_place_ids(int* ids, int pairs, int experts, const int* slots, uint32_t* counts, int* invalid, cudaStream_t st,
+                   ResidentRoutes resident = {});
+void moe_resident_ids(const int* ids, int* safe, int pairs, int hot, cudaStream_t st);
+
+// For a bank, group just its routed pairs and leave down rows in sc->down_buf for one final ordered reduction.
+struct BankRange {
+  int first = -1, count = 0;
+};
+struct BankDispatch {
+  BankRange range;
+  bool defer_reduce = false;
+};
+int moe_bank_gate_up(const float* x, int ldx, const ExpertMat& W, const int* eidx, int rows, int top_k, int I, int K,
+                     float situ_beta, float situ_linear_beta, bool fuse_act, float* out, int ld_out,
+                     const MoeScratch* sc, const Launch& L, bool q8_ready, bf16* act_bf16, BankRange bank);
+void moe_bank_down(const float* act, int ld_act, const ExpertMat& W, const int* eidx, const float* ew, int rows,
+                   int top_k, int H, int K, float* out, int ld_out, bool accumulate, const MoeScratch* sc,
+                   const Launch& L, const bf16* act_bf16, int grouped, BankDispatch dispatch);
 
 // ---- DSpark drafter kernels (dspark.cu) -----------------------------------------------------
 // Weighted sum of n_taps tapped features [rows, ld_feats] -> RMSNorm -> out [rows, H].

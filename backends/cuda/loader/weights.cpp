@@ -2,129 +2,16 @@
 // Weights onto the device, and the NVFP4 and Q8_0 copies drafting reads.
 #include "backends/cuda/loader/loader.h"
 
-#include <condition_variable>
+#include "backends/cuda/runtime/row_pool.h"
+#include "backends/cuda/runtime/offload/expert_store.h"
+#include "backends/cuda/runtime/offload/mapped_experts.h"
 #include <exception>
 
 #include "backends/cuda/loader/exact_bf16.h"
 
 namespace flyx::cuda {
 
-// Persistent worker pool scoped to a single model load so WeightLoader::parallel_rows avoids spawning and joining
-// thousands of OS threads across tensors while leaving zero background threads alive after bind() returns.
-class RowPool {
- public:
-  static size_t default_threads() {
-    static const size_t n = std::max<size_t>(1, std::min<size_t>(16, std::thread::hardware_concurrency()));
-    return n;
-  }
-
-  explicit RowPool(size_t max_threads) : max_threads_(std::max<size_t>(1, max_threads)) {
-    workers_.reserve(max_threads_ - 1);
-    try {
-      for (size_t idx = 1; idx < max_threads_; ++idx) workers_.emplace_back([this, idx] { worker_loop(idx); });
-    } catch (...) {
-      shutdown();
-      throw;
-    }
-  }
-
-  ~RowPool() { shutdown(); }
-  RowPool(const RowPool&) = delete;
-  RowPool& operator=(const RowPool&) = delete;
-
-  void run(size_t n, const std::function<void(size_t, size_t)>& fn) {
-    const size_t parts = std::min(max_threads_, n);
-    if (parts <= 1) {
-      if (n) fn(0, n);
-      return;
-    }
-    {
-      std::lock_guard<std::mutex> lock(mu_);
-      n_ = n;
-      parts_ = parts;
-      fn_ = &fn;
-      error_ = nullptr;
-      active_ = parts - 1;
-      ++gen_;
-    }
-    wake_cv_.notify_all();
-    std::exception_ptr caller_err;
-    try {
-      fn(0, n / parts);
-    } catch (...) {
-      caller_err = std::current_exception();
-    }
-    std::exception_ptr err;
-    {
-      std::unique_lock<std::mutex> lock(mu_);
-      done_cv_.wait(lock, [&] { return active_ == 0; });
-      err = caller_err ? caller_err : error_;
-      error_ = nullptr;
-      fn_ = nullptr;
-    }
-    if (err) std::rethrow_exception(err);
-  }
-
- private:
-  void worker_loop(size_t idx) {
-    uint64_t seen = 0;
-    for (;;) {
-      size_t a = 0, b = 0;
-      const std::function<void(size_t, size_t)>* fn = nullptr;
-      {
-        std::unique_lock<std::mutex> lock(mu_);
-        wake_cv_.wait(lock, [&] { return stop_ || gen_ != seen; });
-        if (stop_) return;
-        seen = gen_;
-        if (idx >= parts_) continue;
-        a = n_ * idx / parts_;
-        b = n_ * (idx + 1) / parts_;
-        fn = fn_;
-      }
-      std::exception_ptr err;
-      try {
-        (*fn)(a, b);
-      } catch (...) {
-        err = std::current_exception();
-      }
-      {
-        std::lock_guard<std::mutex> lock(mu_);
-        if (err && !error_) error_ = err;
-        if (--active_ == 0) done_cv_.notify_one();
-      }
-    }
-  }
-
-  void shutdown() noexcept {
-    {
-      std::lock_guard<std::mutex> lock(mu_);
-      stop_ = true;
-    }
-    wake_cv_.notify_all();
-    for (auto& th : workers_)
-      if (th.joinable()) th.join();
-  }
-
-  size_t max_threads_ = 1;
-  std::mutex mu_;
-  std::condition_variable wake_cv_;
-  std::condition_variable done_cv_;
-  uint64_t gen_ = 0;
-  size_t active_ = 0;
-  size_t n_ = 0;
-  size_t parts_ = 0;
-  const std::function<void(size_t, size_t)>* fn_ = nullptr;
-  std::exception_ptr error_;
-  bool stop_ = false;
-  std::vector<std::thread> workers_;
-};
-
-uint16_t float_to_bf16(float f) {
-  uint32_t u;
-  std::memcpy(&u, &f, 4);
-  u += 0x7FFF + ((u >> 16) & 1);  // round to nearest even
-  return uint16_t(u >> 16);
-}
+uint16_t float_to_bf16(float f) { return ops::bf16_bits(f); }
 
 // ---- weights -------------------------------------------------------------------------------
 // Drafts never reach the output (the target verifies each one), so the
@@ -212,25 +99,19 @@ void make_head_fp8(flyx_bmodel* m) {
       } catch (const OutOfDeviceMemory& e) {
         if (ko.head_fp8) throw;
         release_cert(m, h);
-        ko.head_cert = false;
         if (m->verbose)
           std::fprintf(stderr, "flyx-cuda: no room for the certified head (%s); the whole head\n", e.what());
-        continue;
+        break;
       }
       quantize_fp8_rows(h->w, h->vocab, h->hidden, h->w8, h->rs8, 0);
       if (h->cert) {
+        m->has_certified_head = true;
         head_cert_coef(h->w, h->w8, h->rs8, h->vocab, h->hidden, h->cert, 0);
         if (m->verbose)
           std::fprintf(stderr, "flyx-cuda: certified head: an e4m3 copy of %.0f MB screens the %d x %d head\n",
                        double(h->vocab) * h->hidden / 1e6, h->vocab, h->hidden);
       }
     }
-  if (ko.head_cert && !ko.head_fp8) {
-    bool any = false;
-    for (const Block& b : m->blocks)
-      if (const auto* h = std::get_if<HeadBlock>(&b); h && h->cert) any = true;
-    ko.head_cert = any;
-  }
   CK(cudaDeviceSynchronize());
 }
 
@@ -305,10 +186,10 @@ uint64_t trim(flyx_bmodel* m, uint64_t bytes) {
     if (w12 && m->verbose)
       std::fprintf(stderr, "flyx-cuda: the W12 head given back (%.2f GB): the bf16 head, the same bits\n", w12 / 1e9);
     if (w12 >= bytes) return w12;
-    auto& ko = m->opt.kernels;
-    if (ko.head_cert && !ko.head_fp8) {
+    if (m->has_certified_head) {
       heads([&](HeadBlock& h) { release_cert(m, &h); });
-      ko.head_cert = false;  // and no session takes head_certify's scratch (rounds of several borrow a session's)
+      m->has_certified_head =
+          false;  // and no session takes head_certify's scratch (rounds of several borrow a session's)
       if (m->verbose)
         std::fprintf(stderr, "flyx-cuda: the certified head given back (%.2f GB): the whole head chooses, the same "
                      "tokens\n", (before - m->bytes - w12) / 1e9);
@@ -463,19 +344,7 @@ void ggml_nvfp4_planes_with(
   dispatch(N, [&](size_t r_begin, size_t r_end) {
     for (size_t r = r_begin; r < r_end; ++r) {
       const uint8_t* in = data + (order ? order(r) : r) * per_row * 36;
-      for (size_t k = 0; k < per_row; ++k, in += 36) {
-        const size_t b = r * per_row + k;  // the block's place in the planes
-        const uint8_t* d = in;
-        const uint8_t* qs = in + 4;
-        for (int g = 0; g < 4; ++g) {
-          if (d[g] == 0xFF)
-            throw std::runtime_error(std::string(v->name) + ": an NVFP4 scale of 0xFF (no e4m3 holds it)");
-          s[4 * b + size_t(g)] = d[g] == 0x7F ? 0 : uint8_t(d[g] & 0x7F);
-          auto code = [&](int l) { return l < 8 ? qs[8 * g + l] & 15 : qs[8 * g + l - 8] >> 4; };
-          for (int i = 0; i < 8; ++i)
-            q[32 * b + 8 * size_t(g) + size_t(i)] = uint8_t(code(2 * i) | code(2 * i + 1) << 4);
-        }
-      }
+      pack_expert_nvfp4(in, per_row, q + r * per_row * 32, s + r * per_row * 4);
     }
   });
 }
@@ -508,6 +377,14 @@ void WeightLoader::parallel_rows(size_t n, const std::function<void(size_t, size
   }
   if (!pool_) pool_ = std::make_unique<RowPool>(threads);
   pool_->run(n, fn);
+}
+
+void WeightLoader::finish_stream_block() {
+  if (staging_) CK(cudaStreamSynchronize(staging_->st));
+  // The next block gets private planes. Their immutable copies in host RAM may use the same device slot.
+  lins_.clear();
+  mats_.clear();
+  packs_.clear();
 }
 
 void WeightLoader::finish() {
@@ -770,25 +647,45 @@ Lin WeightLoader::lin_stack(const std::vector<int>& ws, int* rows_out, const std
   return L;
 }
 
-ExpertMat WeightLoader::expert_mat(int w) {
-  if (auto it = experts_.find(w); it != experts_.end()) return it->second;
+ExpertMat WeightLoader::expert_mat(int w, int hot, bool mapped, std::shared_ptr<ColdMatrix>& cold) {
+  if (auto it = experts_.find(w); it != experts_.end()) {
+    if (auto c = cold_experts_.find(w); c != cold_experts_.end()) cold = c->second;
+    return it->second;
+  }
   const auto* v = t(w);
-  const auto layout = expert_layout(weights_[w], m_->opt.packed_blocks);
-  const size_t E = size_t(v->shape[0]), N = size_t(v->shape[1]), K = size_t(v->shape[2]);
+  auto layout = expert_layout(weights_[w], m_->opt.packed_blocks);
+  const size_t all = size_t(v->shape[0]);
+  const bool direct = size_t(hot) < all && mapped;
+  const size_t E = direct ? all : std::min(all, size_t(hot)), N = size_t(v->shape[1]), K = size_t(v->shape[2]);
+  auto plane = [&]<class T>(size_t count) -> T* {
+    if (!direct) return m_->alloc<T>(count);
+    const size_t bytes = size_mul(count, sizeof(T));
+    return static_cast<T*>(m_->offload->mapped_experts().allocate(m_, w, bytes, all, size_t(hot)));
+  };
+  if (E < all) {
+    auto matrix = std::make_shared<ColdMatrix>(weights_[w], int(E), layout);
+    matrix->resolve(m_->opt.expert_simd, m_->opt.expert_integer);
+    if (m_->opt.keep_expert_archive) matrix->pack_banks(layout, all);
+    cold = cold_experts_[w] = std::move(matrix);
+    m_->host_bytes += cold->bytes();
+    layout.rows = E * N;
+    if (layout.expert_scales) layout.expert_scales = E;
+  }
   const size_t total_rows = layout.rows;
   ExpertMat em{};
   em.n_experts = int(E);
   em.N = int(N);
+  if (!E) return experts_[w] = em;
 
   // Optional per-expert F32 scale tensor (present on GGML NVFP4 and on requantized MoE experts in Unsloth GGUFs).
   auto upload_expert_scales = [&]() -> float* {
     const auto* s2 = weights_[w].scale2;
     if (!layout.expert_scales) return nullptr;
-    float* rs_dev = m_->alloc<float>(layout.expert_scales);
+    float* rs_dev = plane.operator()<float>(layout.expert_scales);
     std::vector<float> rs_host(E, 1.f);
     if (s2) {
       const size_t sn = numel(s2);
-      if (sn == E)
+      if (sn == all)
         for (size_t i = 0; i < E; ++i) rs_host[i] = static_cast<float>(flyx::ops::load(s2, i));
       else if (sn == 1)
         std::fill(rs_host.begin(), rs_host.end(), static_cast<float>(flyx::ops::load(s2, 0)));
@@ -802,8 +699,8 @@ ExpertMat WeightLoader::expert_mat(int w) {
   if (layout.format == ExpertLayout::nvfp4) {
     const size_t per_row = K / 64;
     const size_t q_row = layout.payload_row, s_row = layout.scales_row, file_row = per_row * 36;
-    uint8_t* q_dev = m_->alloc<uint8_t>(layout.payload_bytes());
-    uint8_t* s_dev = m_->alloc<uint8_t>(layout.scale_bytes());
+    uint8_t* q_dev = plane.operator()<uint8_t>(layout.payload_bytes());
+    uint8_t* s_dev = plane.operator()<uint8_t>(layout.scale_bytes());
     const auto* file = static_cast<const uint8_t*>(v->data);
     times_.file_bytes += total_rows * file_row;
     if (!staging_) staging_ = std::make_unique<LoadStaging>();
@@ -823,18 +720,7 @@ ExpertMat WeightLoader::expert_mat(int w) {
           const uint8_t* in = file + (r0 + r) * file_row;
           uint8_t* qo = hq + r * q_row;
           uint8_t* so = hs + r * s_row;
-          for (size_t k = 0; k < per_row; ++k, in += 36) {
-            const uint8_t* d = in;
-            const uint8_t* qs = in + 4;
-            for (int g = 0; g < 4; ++g) {
-              if (d[g] == 0xFF)
-                throw std::runtime_error(std::string(v->name) + ": an NVFP4 scale of 0xFF (no e4m3 holds it)");
-              so[4 * k + size_t(g)] = d[g] == 0x7F ? 0 : uint8_t(d[g] & 0x7F);
-              auto code = [&](int l) { return l < 8 ? qs[8 * g + l] & 15 : qs[8 * g + l - 8] >> 4; };
-              for (int i = 0; i < 8; ++i)
-                qo[32 * k + 8 * size_t(g) + size_t(i)] = uint8_t(code(2 * i) | code(2 * i + 1) << 4);
-            }
-          }
+          pack_expert_nvfp4(in, per_row, qo, so);
         }
       });
       CK(cudaMemcpyAsync(q_dev + r0 * q_row, hq, nr * q_row, cudaMemcpyHostToDevice, S.st));
@@ -845,7 +731,9 @@ ExpertMat WeightLoader::expert_mat(int w) {
     }
     em.q = q_dev;
     em.s = s_dev;
-    em.rs = upload_expert_scales();
+    auto* gains = upload_expert_scales();
+    em.rs = gains;
+    if (cold) cold->resident = {q_dev, s_dev, gains};
     return experts_[w] = em;
   }
 
@@ -855,8 +743,8 @@ ExpertMat WeightLoader::expert_mat(int w) {
     const size_t per_row = K / size_t(l.values);
     const size_t row_bytes = layout.payload_row, row_scales = layout.scales_row / sizeof(uint16_t);
     const size_t file_row = per_row * size_t(l.bytes);
-    uint8_t* data = m_->alloc<uint8_t>(layout.payload_bytes());
-    uint16_t* scales = m_->alloc<uint16_t>(layout.scale_bytes() / sizeof(uint16_t));
+    uint8_t* data = plane.operator()<uint8_t>(layout.payload_bytes());
+    uint16_t* scales = plane.operator()<uint16_t>(layout.scale_bytes() / sizeof(uint16_t));
     const auto* file = static_cast<const uint8_t*>(v->data);
     times_.file_bytes += total_rows * file_row;
     if (!staging_) staging_ = std::make_unique<LoadStaging>();
@@ -883,14 +771,16 @@ ExpertMat WeightLoader::expert_mat(int w) {
       times_.pack_s += load_clock() - t1;
     }
     em.blk = BlockMat{data, scales, v->dtype, int(total_rows), weights_[w].activations == FLYX_ACT_Q8};
-    em.rs = upload_expert_scales();
+    auto* gains = upload_expert_scales();
+    em.rs = gains;
+    if (cold) cold->resident = {data, scales, gains};
     return experts_[w] = em;
   }
 
   // Fallback: BF16 on device (handles BF16, F16, F32, or blocks=bf16).
   if (!numbers(v)) throw std::runtime_error(std::string(v->name) + ": unsupported expert dtype");
   const size_t bytes = layout.payload_bytes();
-  bf16* dst = m_->alloc<bf16>(bytes / sizeof(bf16));
+  bf16* dst = plane.operator()<bf16>(bytes / sizeof(bf16));
   if (v->dtype == FLYX_DT_BF16) {
     upload_staged(dst, v->data, bytes);
   } else {
@@ -923,7 +813,9 @@ ExpertMat WeightLoader::expert_mat(int w) {
     }
   }
   em.w = dst;
-  em.rs = upload_expert_scales();
+  auto* gains = upload_expert_scales();
+  em.rs = gains;
+  if (cold) cold->resident = {dst, nullptr, gains};
   return experts_[w] = em;
 }
 

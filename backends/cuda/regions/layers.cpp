@@ -3,6 +3,9 @@
 // region; fused=true is the override regions/plan.cpp may pick.
 #include <bit>
 
+#include "backends/cuda/runtime/offload/expert_store.h"
+#include "backends/cuda/runtime/offload/mapped_experts.h"
+
 #include "backends/cuda/regions/layers.h"
 
 namespace flyx::cuda {
@@ -1179,7 +1182,7 @@ void rel_attn_layer(const Pass& ps, const RelAttnBlock& a, bool fused) {
     const bf16* rb = f.router.round.b16 ? f.router.round.b16 : (f.router.round.f32 ? nullptr : f.router.w);
     if ((!rb && !f.router.round.f32) || f.n_experts < 1 || f.n_experts > 256 ||
         f.top_k < 1 || f.top_k > std::min(f.n_experts, kMoeRouteMaxTopK) ||
-        !f.gate_up.q || !f.gate_up.s || !f.down.q || !f.down.s || f.gate_up.packed() || f.down.packed() ||
+        f.cold_gu || !f.gate_up.q || !f.gate_up.s || !f.down.q || !f.down.s || f.gate_up.packed() || f.down.packed() ||
         (mix && !f.res_query)) return;
     const SideStream& es = s->expert_side;
     CK(cudaEventRecord(es.fork, st));
@@ -1556,6 +1559,65 @@ void rel_attn_layer(const Pass& ps, const RelAttnBlock& a, bool fused) {
   }
 }
 
+// A gathered round on a sequence's own stream: only the host-resident experts are copied, on the gather stream, while
+// the device-resident experts' GEMMs run in place (expert banks [0, E) and the copies [E, E + pairs)); one weighted
+// sum in the router's order then takes both banks' slots, the same bits as one GEMM over every copy.
+static bool gathers_beside(const Pass& ps, const MoeBlock& f) {
+  const auto* s = ps.s;
+  const int R = ps.rows, K = f.top_k;
+  return ps.round && R > 1 && R <= ps.v.b.gather_rows && f.mapped && f.mapped->resident && ps.v.b.gather_slot &&
+         s->m->opt.expert_overlap && s->gather_side.st && ps.v.L.st == s->st && R * K <= f.n_experts &&
+         R * K <= kGatherPlanPairs && f.mapped->gather->load(std::memory_order_relaxed);
+}
+
+// The projections take the gather scratch in turn: gate|up's copies cross the bus beside the resident gate|up GEMM,
+// down's once the copied gate|up GEMM is done with the scratch, beside the resident down GEMM.  Every pair can have
+// a copy, as in the gather of every selected expert, so none is read through its mapped pages.
+static void gathered_experts(const Pass& ps, const MoeBlock& f, const MoeScratch* msc, float* down_out, bool fused,
+                             bool round_q8) {
+  const RowView& rv = ps.v;
+  auto* s = ps.s;
+  const int H = f.hidden, I = f.inter, E = f.n_experts, K = f.top_k, R = ps.rows, M = R * K;
+  const cudaStream_t st = rv.L.st;
+  const Launch& L = rv.L;
+  gather_plan(rv.b.moe_idx, M, f.mapped->resident, E, M, rv.b.gather_ids, rv.b.gather_slot, st);
+  GatherPlanes gate_planes, down_planes;
+  const ExpertMat gate_copies = f.mapped->gate.copies(rv.b.gathered, M, &gate_planes);
+  const ExpertMat down_copies = f.mapped->down.copies(rv.b.gathered, M, &down_planes);
+  const SideStream& gs = s->gather_side;
+  auto copy_beside = [&](const GatherPlanes& planes, cudaEvent_t copied) {
+    CK(cudaEventRecord(gs.fork, st));
+    CK(cudaStreamWaitEvent(gs.st, gs.fork, 0));
+    gather_copy(planes, rv.b.moe_idx, rv.b.gather_slot, M, gs.st);
+    CK(cudaEventRecord(copied, gs.st));
+  };
+
+  const int* ids = rv.b.gather_ids;
+  bf16* act_bf16 =
+      round_q8 && moe_round_bf16_down(f.down, R, K, I, msc, L) ? reinterpret_cast<bf16*>(rv.b.moe_act) : nullptr;
+  const BankRange in_place{0, E}, copied{E, M};
+  auto gate_up = [&](const ExpertMat& w, BankRange bank) {
+    if (fused)
+      moe_bank_gate_up(rv.b.h, H, w, ids, R, K, I, H, f.situ_beta, f.situ_linear_beta, true, rv.b.moe_act, I, msc, L,
+                       round_q8, act_bf16, bank);
+    else
+      moe_bank_gate_up(rv.b.h, H, w, ids, R, K, I, H, f.situ_beta, f.situ_linear_beta, false, rv.b.moe_gu, 2 * I,
+                       msc, L, false, nullptr, bank);
+  };
+  copy_beside(gate_planes, s->gather_gate);
+  gate_up(f.gate_up, in_place);
+  CK(cudaStreamWaitEvent(st, s->gather_gate, 0));
+  gate_up(gate_copies, copied);
+  copy_beside(down_planes, gs.join);
+  if (!fused) situ_rows(rv.b.moe_gu, 2 * I, I, f.situ_beta, f.situ_linear_beta, rv.b.moe_act, I, M, st);
+  moe_bank_down(rv.b.moe_act, I, f.down, ids, rv.b.moe_w, R, K, H, I, down_out, H, false, msc, L, act_bf16, 0,
+                {in_place, true});
+  CK(cudaStreamWaitEvent(st, gs.join, 0));
+  moe_bank_down(rv.b.moe_act, I, down_copies, ids, rv.b.moe_w, R, K, H, I, down_out, H, false, msc, L, act_bf16, 0,
+                {copied, true});
+  moe_sum_slots(msc->down_buf, rv.b.moe_w, R, K, H, down_out, !f.post_conv, st);
+}
+
 void moe_layer(const Pass& ps, const MoeBlock& f, bool fused) {
   const RowView& rv = ps.v;
   auto* s = ps.s;
@@ -1649,21 +1711,43 @@ void moe_layer(const Pass& ps, const MoeBlock& f, bool fused) {
   moe_route(rv.b.proj, f.router_bias, R, E, K, f.gating_sigmoid, f.norm_weights, f.norm_eps, f.route_scale,
             rv.b.moe_idx, rv.b.moe_w, L);
 
-  bf16* act_bf16 =
-      round_q8 && moe_round_bf16_down(f.down, R, K, I, msc, L) ? reinterpret_cast<bf16*>(rv.b.moe_act) : nullptr;
-  // The grouping of the rows by expert that the gate|up GEMM leaves in the scratch, which the down GEMM takes over.
-  int grouped = 0;
-  if (fused) {
-    grouped = moe_gate_up(rv.b.h, H, f.gate_up, rv.b.moe_idx, R, K, I, H, f.situ_beta, f.situ_linear_beta, true,
-                          rv.b.moe_act, I, msc, L, round_q8, act_bf16);
+  if (f.route_histogram)
+    moe_place_ids(rv.b.moe_idx, R * K, E, f.route_slots, f.route_histogram + (ps.round ? E : 0), nullptr, st);
+  float* residual = ps.res && ps.res->x_cur ? ps.res->x_cur : rv.b.x;
+  float* down_out = f.post_conv ? rv.b.post_raw : residual;
+  if (f.mapped && !ps.round && R >= f.mapped->stage_min_rows) {
+    f.mapped->owner->prefill(ps, f, msc, down_out, !f.post_conv, fused);
+  } else if (f.cold_gu) {
+    hybrid_experts(ps, f, msc, down_out, !f.post_conv, fused);
+  } else if (gathers_beside(ps, f)) {
+    gathered_experts(ps, f, msc, down_out, fused, round_q8);
   } else {
-    grouped = moe_gate_up(rv.b.h, H, f.gate_up, rv.b.moe_idx, R, K, I, H, f.situ_beta, f.situ_linear_beta, false,
-                          rv.b.moe_gu, 2 * I, msc, L);
-    situ_rows(rv.b.moe_gu, 2 * I, I, f.situ_beta, f.situ_linear_beta, rv.b.moe_act, I, R * K, st);
+    const bool gather = ps.round && R > 1 && R <= rv.b.gather_rows && f.mapped &&
+                        f.mapped->gather->load(std::memory_order_relaxed) && R * K <= E;
+    ExpertMat staged;
+    auto projection = [&](const ExpertMat& original, bool down) -> const ExpertMat& {
+      if (!gather) return original;
+      const auto& src = down ? f.mapped->down : f.mapped->gate;
+      staged = src.gather(rv.b.gathered, rv.b.moe_idx, rv.b.gather_ids, R * K, st);
+      return staged;
+    };
+    const auto& gate = projection(f.gate_up, false);
+    const int* ids = gather ? rv.b.gather_ids : rv.b.moe_idx;
+    bf16* act_bf16 =
+        round_q8 && moe_round_bf16_down(f.down, R, K, I, msc, L) ? reinterpret_cast<bf16*>(rv.b.moe_act) : nullptr;
+    int grouped = 0;
+    if (fused) {
+      grouped = moe_gate_up(rv.b.h, H, gate, ids, R, K, I, H, f.situ_beta, f.situ_linear_beta, true, rv.b.moe_act, I,
+                            msc, L, round_q8, act_bf16);
+    } else {
+      grouped = moe_gate_up(rv.b.h, H, gate, ids, R, K, I, H, f.situ_beta, f.situ_linear_beta, false, rv.b.moe_gu,
+                            2 * I, msc, L);
+      situ_rows(rv.b.moe_gu, 2 * I, I, f.situ_beta, f.situ_linear_beta, rv.b.moe_act, I, R * K, st);
+    }
+    const auto& down = projection(f.down, true);
+    moe_down(rv.b.moe_act, I, down, ids, rv.b.moe_w, R, K, H, I, down_out, H, !f.post_conv, msc, L, act_bf16, grouped);
   }
   if (f.post_conv) {
-    moe_down(rv.b.moe_act, I, f.down, rv.b.moe_idx, rv.b.moe_w, R, K, H, I, rv.b.post_raw, H, false, msc, L, act_bf16,
-             grouped);
     if (fused && ps.round && R <= FLYX_MAX_ROWS && ps.res && rv.b.post_out && H <= 5120) {
       ps.res->pending = PendingPostConv{rv.b.post_raw, f.post_conv, f.sconv, f.sconv_offset, f.conv, false};
       return;
@@ -1677,10 +1761,6 @@ void moe_layer(const Pass& ps, const MoeBlock& f, bool fused) {
     float* x_cur = (ps.res && ps.res->x_cur) ? ps.res->x_cur : rv.b.x;
     shortconv_pass(rv.b.post_raw, H, f.post_conv, nullptr, sc.win, sc.w_stride, kSlotCur, next_sel, skip, rep,
                    rep_stride, kSlotCur, f.sconv_offset, sc.channels, H, f.conv, 0, s->P, R, x_cur, H, st, true);
-  } else {
-    float* x_cur = (ps.res && ps.res->x_cur) ? ps.res->x_cur : rv.b.x;
-    moe_down(rv.b.moe_act, I, f.down, rv.b.moe_idx, rv.b.moe_w, R, K, H, I, x_cur, H, true, msc, L, act_bf16,
-             grouped);
   }
 }
 

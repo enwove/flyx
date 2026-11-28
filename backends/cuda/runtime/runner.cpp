@@ -14,6 +14,7 @@
 #include "backends/cuda/backend.h"
 #include "backends/cuda/runtime/strata_snapshot.h"
 #include "backends/cuda/runtime/window_ring.h"
+#include "backends/cuda/runtime/offload/split_round.h"
 
 namespace flyx::cuda {
 
@@ -421,7 +422,8 @@ int prefill_ex(flyx_plan* p, flyx_seq* s, const flyx_prefill_input* in, const fl
     if (sample) set_gen(s, sample);
     // Borrow the model's prefill buffers for this pass: after any previous prefill or strata session using the slab.
     auto* m = const_cast<flyx_bmodel*>(s->m);
-    std::lock_guard<std::mutex> lock(m->prefill_mu);
+    auto reads = m->offload ? m->offload->expert_reads() : std::shared_lock<std::shared_mutex>();
+    std::unique_lock<std::mutex> lock(m->prefill_mu);
     save_prefill_owner(m);
     m->prefill_owner = nullptr;
     CK(cudaStreamWaitEvent(s->st, m->prefill_ev, 0));
@@ -487,6 +489,12 @@ int prefill_ex(flyx_plan* p, flyx_seq* s, const flyx_prefill_input* in, const fl
     s->staged(s->position + n);
     ring_wrote(s, s->position, s->position + n);  // its context rows, counted first: a pass that fails wrote some
     forward(ps);
+    if (s->route_error) {
+      int invalid = 0;
+      CK(cudaMemcpyAsync(&invalid, s->route_error, sizeof(invalid), cudaMemcpyDeviceToHost, s->st));
+      sync_stream(s);
+      if (invalid) throw std::runtime_error("invalid MoE router expert ID");
+    }
     s->flush_page_prefill(s->position, n);
     s->snap_pos = s->pass_snap;
     s->pass_snap = -1;
@@ -523,6 +531,20 @@ int prefill_ex(flyx_plan* p, flyx_seq* s, const flyx_prefill_input* in, const fl
       if (mt.valid && mt.start + mt.rows < rewind_from) mt.valid = false;
     if (in->n_embeds > 0 || in->pos_3d || in->set_rope_delta) sync_stream(s);
     CK(cudaGetLastError());
+    // The prompt's end may move expert pages, which takes the page lock alone (ExpertAddressSpace::finish_prompt).
+    if (sample_last && m->offload) {
+      lock.unlock();
+      if (reads.owns_lock()) reads.unlock();
+      m->offload->finish_prompt(s->st);
+    }
+    return 0;
+  });
+}
+
+int request_boundary(flyx_seq* s, int32_t begin) {
+  if (!s || !s->m->offload) return 0;
+  return guarded([&] {
+    s->m->offload->request_boundary(begin != 0, s->st);
     return 0;
   });
 }
@@ -1526,6 +1548,10 @@ bool capture_adaptive_graph(flyx_plan* p, flyx_seq* s, const RoundPass& r, cudaG
 GraphSize round_graph_size(flyx_plan* p, flyx_seq* s) {
   const flyx_gen_params greedy{};
   const RoundPass r = round_pass(p, s, &greedy);
+  if (!s->m->allows_graphs()) {
+    SplitRound split;
+    return split.capture(r.ps, r.prefix) ? split.size() : GraphSize{};
+  }
 #if CUDART_VERSION >= 12040
   if (p->adaptive()) {
     Captured c;
@@ -1560,6 +1586,7 @@ int launch(flyx_plan* p, flyx_seq* s, const flyx_gen_params* g) {
     return fail("a tree round of more than " + std::to_string(FLYX_MAX_ROWS) + " rows reads no strata copy");
   s->snap_pos = -1;  // rounds write the round slots
   return guarded([&] {
+    auto reads = s->m->offload ? s->m->offload->expert_reads() : std::shared_lock<std::shared_mutex>();
     // Hold prefill_mu across submission when sharing the VMM prefill slab so another session cannot evict
     // prefill_owner before this round's work is queued on s->st (lock order: prefill_mu before batch->mu).
     const bool shared = s->uses_shared_prefill();
@@ -1578,7 +1605,7 @@ int launch(flyx_plan* p, flyx_seq* s, const flyx_gen_params* g) {
     // destroyed in flight, what it holds would stay the driver's beside the new one's until they end.
     if (it != s->graph.end() && (prefix < it->second.copy_prefix || prefix - it->second.copy_prefix >= 4096)) {
       if (it->second.used > s->read_no) sync_stream(s);
-      CK(cudaGraphExecDestroy(it->second.exec));
+      if (it->second.exec) CK(cudaGraphExecDestroy(it->second.exec));
       s->graph_held -= it->second.bytes;
       s->graph.erase(it);
       it = s->graph.end();
@@ -1589,7 +1616,26 @@ int launch(flyx_plan* p, flyx_seq* s, const flyx_gen_params* g) {
     };
     // A capture that found no room waits kGraphRecent rounds before the next: the graphs it would take
     // the place of are by then ones the session ran lately, or not.
-    if (it == s->graph.end() && !page_exact && s->graphs && s->seq_no >= s->graph_retry) {
+    if (it == s->graph.end() && s->graphs && s->seq_no >= s->graph_retry && !s->m->allows_graphs() && !page_exact) {
+      auto split = std::make_shared<SplitRound>();
+      if (split->capture(ps, prefix)) {
+        const GraphSize size = split->size();
+        plan_counted(p->m, p, size.bytes);
+        if (!make_graph_room(s, size.bytes)) {
+          s->graph_retry = s->seq_no + kGraphRecent;
+        } else if (split->instantiate()) {
+          it = s->graph.emplace(key, flyx_seq::RoundGraph{nullptr, prefix, size.bytes, 0, std::move(split)}).first;
+          s->graph_held += size.bytes;
+          note_graph(s, size);
+          say_graph(s->m, "split round", ps.rows, key.second, size);
+        } else {
+          s->graphs = false;
+        }
+      } else {
+        s->graphs = false;
+      }
+    }
+    if (it == s->graph.end() && !page_exact && s->graphs && s->m->allows_graphs() && s->seq_no >= s->graph_retry) {
       cudaGraphExec_t exec = nullptr;
       // A driver that refuses DV's conditional canvas pass (dv_context_unless_noop), in the capture or the
       // instantiation, or does not give its body to count (graph_size), gets the round with the pass inline.
@@ -1643,7 +1689,12 @@ int launch(flyx_plan* p, flyx_seq* s, const flyx_gen_params* g) {
       }
     }
     if (it != s->graph.end()) {
-      CK(cudaGraphLaunch(it->second.exec, s->st));
+      if (it->second.split) {
+        it->second.split->launch(ps);
+        copy_ring(s);
+      } else {
+        CK(cudaGraphLaunch(it->second.exec, s->st));
+      }
       it->second.used = s->seq_no + 1;
       ++s->graph_stats.from_graph;
     } else {
@@ -1653,6 +1704,7 @@ int launch(flyx_plan* p, flyx_seq* s, const flyx_gen_params* g) {
     ++s->seq_no;
     CK(cudaEventRecord(s->ev[s->seq_no % kRing], s->st));
     s->pending.push_back({'R', ps.rows});
+    if (p->resident_routes) s->m->offload->count_fully_resident(p->resident_routes * ps.rows);
     s->update_write_hi();
     CK(cudaGetLastError());
     return 0;
@@ -1705,28 +1757,33 @@ RowView slice(const RowView& v, const flyx_bmodel* m, int first) {
 
 int launch_batch(flyx_plan* const* plans, flyx_seq* const* seqs, const flyx_gen_params* const* gens,
                  int32_t n) {
-  if (n < 1) return fail("launch_batch: no sequences");
-  for (int i = 0; i < n; ++i)
+  if (!plans || !seqs || !gens || n < 1 || n > FLYX_MAX_ROWS) return fail("launch_batch: invalid batch");
+  for (int i = 0; i < n; ++i) {
     if (!seqs[i]) return no_sequence("launch_batch");
+    if (!plans[i] || seqs[i]->m != plans[i]->m) return fail("launch_batch: invalid plan");
+  }
   if (n == 1) return launch(plans[0], seqs[0], gens[0]);
   flyx_bmodel* m = seqs[0]->m;
-  if (m->need.max_bank > 0 || m->dspark_block >= 0) {
-    for (int i = 0; i < n; ++i)
-      if (const int r = launch(plans[i], seqs[i], gens[i]); r != 0) return r;
-    return 0;
-  }
+  const bool separate = !m->batch || m->need.max_bank > 0 || m->dspark_block >= 0;
   int rows = 0;
   for (int i = 0; i < n; ++i) {
     if (plans[i]->phase != FLYX_PHASE_ROUND || plans[i]->m != m || seqs[i]->m != m)
       return fail("launch_batch: round plans of the sequences' model");
-    if (!same_target(plans[0], plans[i])) return fail("launch_batch: plans that run different target nodes");
-    if (plans[i]->tree || plans[i]->adaptive() || relaxed(gens[i]))
+    if (!separate && !same_target(plans[0], plans[i]))
+      return fail("launch_batch: plans that run different target nodes");
+    if (!separate && (plans[i]->tree || plans[i]->adaptive() || relaxed(gens[i])))
       return fail("launch_batch: tree, adaptive, and relaxed rounds run alone");
     for (int j = 0; j < i; ++j)
       if (seqs[j] == seqs[i]) return fail("launch_batch: a sequence twice");
     rows += plans[i]->width + 1;
   }
   if (rows > FLYX_MAX_ROWS) return fail("launch_batch: more than FLYX_MAX_ROWS rows");
+  // Offloaded models submit on each sequence's stream so every round uses its host or copy dependencies.
+  if (separate) {
+    for (int i = 0; i < n; ++i)
+      if (const int r = launch(plans[i], seqs[i], gens[i]); r != 0) return r;
+    return 0;
+  }
   // Canonicalize sequence order by pointer so equivalent batches share one cached graph regardless of caller order.
   int ord[FLYX_MAX_ROWS];
   for (int i = 0; i < n; ++i) ord[i] = i;
@@ -1735,11 +1792,13 @@ int launch_batch(flyx_plan* const* plans, flyx_seq* const* seqs, const flyx_gen_
   BatchRounds& B = *m->batch;
   bool any_shared = false;
   for (int i = 0; i < n; ++i) any_shared = any_shared || seqs[ord[i]]->uses_shared_prefill();
-  // Lock order: prefill_mu before B.mu (make_graph_room acquires B.mu while launch() may hold prefill_mu).
-  std::unique_lock<std::mutex> prefill_lock(m->prefill_mu, std::defer_lock);
-  if (any_shared) prefill_lock.lock();
-  std::lock_guard<std::mutex> lock(B.mu);
   return guarded([&] {
+    // Lock order: the expert page lock, then prefill_mu before B.mu (make_graph_room acquires B.mu while launch() may
+    // hold prefill_mu).
+    auto reads = m->offload ? m->offload->expert_reads() : std::shared_lock<std::shared_mutex>();
+    std::unique_lock<std::mutex> prefill_lock(m->prefill_mu, std::defer_lock);
+    if (any_shared) prefill_lock.lock();
+    std::lock_guard<std::mutex> lock(B.mu);
     flyx_seq* lead = seqs[ord[0]];
     BatchPass bp;
     bp.rows = rows;
@@ -1789,7 +1848,7 @@ int launch_batch(flyx_plan* const* plans, flyx_seq* const* seqs, const flyx_gen_
       for (int i = 0; i < n; ++i) copy_ring(seqs[ord[i]], B.st);
     };
     auto it = any_page_exact ? B.graphs.end() : B.graphs.find(key);
-    if (it == B.graphs.end() && !any_page_exact && B.graphs_ok && m->opt.graphs) {
+    if (it == B.graphs.end() && !any_page_exact && B.graphs_ok && m->allows_graphs()) {
       // Only capture once a batch key repeats enough to amortize graph instantiation cost.
       if (B.hits.size() >= BatchRounds::kMaxHitEntries && B.hits.find(key) == B.hits.end()) B.hits.clear();
       const uint32_t seen = ++B.hits[key];
@@ -1856,7 +1915,9 @@ int launch_batch(flyx_plan* const* plans, flyx_seq* const* seqs, const flyx_gen_
       flyx_seq* s = seqs[ord[i]];
       ++s->seq_no;
       CK(cudaEventRecord(s->ev[s->seq_no % kRing], B.st));
-      s->pending.push_back({'R', bp.seq[size_t(i)].rows});
+      const auto& phase = bp.seq[size_t(i)];
+      s->pending.push_back({'R', phase.rows});
+      if (phase.p->resident_routes) m->offload->count_fully_resident(phase.p->resident_routes * phase.rows);
       s->update_write_hi();
       CK(cudaStreamWaitEvent(s->st, B.done, 0));  // what the sequence does next, after this round
     }
@@ -1905,7 +1966,7 @@ int read_result(flyx_seq* s, flyx_round_result* out) {
 int read_logits(flyx_seq* s, int32_t row, float* out) {
   if (!s) return no_sequence("logits");
   if (row < 0 || row >= FLYX_MAX_ROWS) return fail("logits: row out of range");
-  if (s->m->opt.kernels.head_cert && !s->m->opt.kernels.head_fp8)
+  if (s->m->has_certified_head)
     return fail("logits: the certified head scores only the rows it must (backend option head_cert=0)");
   return guarded([&] {
     sync_stream(s);

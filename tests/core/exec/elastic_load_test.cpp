@@ -13,6 +13,7 @@
 #include <vector>
 
 #include "core/exec/engine.h"
+#include "core/plan/residency_fitter.h"
 #include "core/exec/generation.h"
 #include "core/session/session.h"
 #include "tests/common/check.h"
@@ -41,6 +42,10 @@ int g_auto_switch = -1;
 bool g_non_vram_error = false;
 bool g_generic_rc_with_vram_text = false;
 int g_open_calls = 0;
+bool g_expert_caps = false, g_layer_caps = false;
+uint64_t g_session_bytes = 0;
+uint32_t g_used_experts = 0, g_used_layers = 0;
+int g_allocator_experts = -1;
 std::vector<int32_t> g_seen_dw;
 std::string g_active_dw;
 std::string g_opaque_options;
@@ -101,6 +106,14 @@ int hook_estimate_load(const flyx_model_desc* desc, const flyx_open_options* opt
   }
   if (has_mtp) draft_b += g_mtp_bytes;
   out->weights_bytes = g_target_bytes + draft_b;
+  if (g_expert_caps || g_layer_caps) {
+    const uint32_t requested = g_expert_caps ? opts->gpu_experts_plus_one : opts->gpu_layers_plus_one;
+    const int kept = requested ? int(requested - 1) : 8;
+    out->experts_per_layer = g_expert_caps ? 8 : 0;
+    out->dense_layers = g_layer_caps ? 8 : 0;
+    out->weights_bytes = g_target_bytes + uint64_t(kept) * (64ull << 20);
+    out->offload_pageable_bytes = uint64_t(8 - kept) * (64ull << 20);
+  }
   out->target_kv_bytes_per_position = g_kv_row_bytes;
   out->draft_weights_bytes = draft_b;
   out->draft_compact_savings = savings;
@@ -114,6 +127,8 @@ const char* hook_draft_weights(flyx_bmodel*) { return g_active_dw.c_str(); }
 int hook_open(const flyx_model_desc* desc, const flyx_open_options* opts, flyx_bmodel** out) {
   ++g_open_calls;
   g_prefill_rows = 0;
+  g_used_experts = opts->gpu_experts_plus_one;
+  g_used_layers = opts->gpu_layers_plus_one;
   g_file_bytes = 0;
   for (int i = 0; i < desc->n_weights; ++i)
     if (auto* t = desc->weights[i].t) g_file_bytes += t->nbytes;
@@ -131,7 +146,8 @@ int hook_open(const flyx_model_desc* desc, const flyx_open_options* opts, flyx_b
     g_err = "Not enough VRAM (simulated non-OOM status -1)";
     return -1;
   }
-  if (g_oom_always || (g_oom_eagle4 && has_block(desc, FLYX_BLOCK_EAGLE4))) {
+  if (g_oom_always || (g_oom_eagle4 && has_block(desc, FLYX_BLOCK_EAGLE4)) ||
+      (g_allocator_experts >= 0 && (!g_used_experts || int(g_used_experts - 1) > g_allocator_experts))) {
     g_err = "Not enough VRAM while loading weights (16.00 GB GPU). Use a smaller quantization.";
     return FLYX_ERR_OOM;
   }
@@ -192,11 +208,21 @@ int hook_size(flyx_bmodel* m, const flyx_seq_layout* layout, flyx_seq_size* out)
     out->device = uint64_t(std::max(dev_pos, 0)) * g_seq_per_ctx_bytes + (64ull << 20);
     out->host = uint64_t(std::max(layout->max_ctx - std::max(dev_pos, 0), 0)) * g_seq_per_ctx_bytes;
   }
+  if (!rc && g_session_bytes) out->device = g_session_bytes;
   if (!rc && g_auto_switch >= 0 && layout->method == FLYX_KV_AUTO) out->strata_from = g_auto_switch;
   return rc;
 }
 
 int hook_memory(flyx_bmodel* m, flyx_memory_info* out) {
+  if (g_session_bytes) {
+    const unsigned kept = g_used_experts ? g_used_experts - 1 : 8;
+    *out = {};
+    out->total = g_total_vram;
+    out->weights = g_target_bytes + uint64_t(kept) * (64ull << 20);
+    out->workspace = 512ull << 20;
+    out->free = g_free_vram - out->weights - out->workspace;
+    return 0;
+  }
   if (!g_custom_memory) return g_backend->memory(m, out);
   *out = {};
   out->total = g_total_vram;
@@ -248,6 +274,9 @@ void reset_hooks() {
   g_non_vram_error = false;
   g_generic_rc_with_vram_text = false;
   g_open_calls = 0;
+  g_expert_caps = g_layer_caps = false;
+  g_allocator_experts = -1;
+  g_session_bytes = 0;
   g_target_options.clear();
   g_kv_row_bytes = 0;
   g_refusal = Refusal::none;
@@ -333,6 +362,59 @@ int main(int argc, char** argv) {
     if (!plain.load(model, eo, &err)) { check(false, err); return 1; }
     ref_tokens = tokens(plain);
     check(ref_tokens.size() == 12, "plain reference generated 12 tokens");
+  }
+
+  for (bool experts : {false, true}) {
+    reset_hooks();
+    g_expert_caps = experts;
+    g_layer_caps = !experts;
+    g_total_vram = 12ull << 30;
+    g_free_vram = g_target_bytes + (512ull << 20) + 3 * (64ull << 20) +
+                  plan::device_reserve(g_total_vram, os::gpu_memory_paged());
+    EngineOptions eo;
+    eo.backend = "test-host-kv";
+    eo.max_ctx = 128;
+    eo.speculative = false;
+    eo.drafter = "none";
+    Engine fitted;
+    if (!fitted.load(model, eo, &err)) { check(false, err); return 1; }
+    check((experts ? g_used_experts : g_used_layers) == 4 && g_open_calls == 1,
+          "preflight chooses three resident units at the exact device byte threshold");
+    if (experts) eo.gpu_experts = 2;
+    else eo.gpu_layers = 2;
+    Engine explicit_cap;
+    if (!explicit_cap.load(model, eo, &err)) { check(false, err); return 1; }
+    check((experts ? g_used_experts : g_used_layers) == 3, "explicit residency cap reaches backend open");
+    eo.gpu_experts = eo.gpu_layers = -1;
+    eo.backend_options = experts ? "gpu_experts=1" : "gpu_layers=1";
+    Engine legacy_cap;
+    if (!legacy_cap.load(model, eo, &err)) {
+      check(false, err);
+      return 1;
+    }
+    check((experts ? g_used_experts : g_used_layers) == 2 && g_opaque_options.empty(),
+          "legacy cap reaches the backend through the typed ABI field");
+  }
+
+  for (bool allocator_refusal : {false, true}) {
+    reset_hooks();
+    g_expert_caps = true;
+    g_session_bytes = allocator_refusal ? 0 : 48ull << 20;
+    g_allocator_experts = allocator_refusal ? 6 : -1;
+    g_total_vram = 12ull << 30;
+    g_free_vram = g_target_bytes + (512ull << 20) + 7 * (64ull << 20) +
+                  plan::device_reserve(g_total_vram, os::gpu_memory_paged());
+    EngineOptions eo;
+    eo.prefill_chunk = 128;  // Isolate the weight retry from the automatic prefill-size fallback.
+    eo.backend = "test-host-kv";
+    eo.max_ctx = 128;
+    eo.speculative = false;
+    eo.drafter = "none";
+    Engine fitted;
+    if (!fitted.load(model, eo, &err)) { check(false, err); return 1; }
+    check(g_used_experts == 7 && g_open_calls == 2,
+          allocator_refusal ? "an allocator refusal at seven experts retries at six" :
+                              "after measuring a 48 MiB shortfall the retry releases one 64 MiB expert and retains six");
   }
 
   // Exactly 32 decimal GB after the plain target. Adding any drafter crosses the old precision threshold.
@@ -923,5 +1005,30 @@ int main(int argc, char** argv) {
     check(tokens(e_high) == ref_tokens, "upfront floor-fitted engine reproduces plain greedy tokens");
   }
 
+  {
+    using Fitter = plan::ResidencyFitter;
+    check(Fitter::host_room(16ull << 30, 0, 0) == UINT64_MAX, "unreported available host RAM leaves the cap open");
+    // --ram-reserve takes host_keep()'s place (32 GiB: 2 GiB) in the room offloaded weights may take.
+    check(Fitter::host_room(32ull << 30, 10ull << 30, 1ull << 30) == (7ull << 30) &&
+              Fitter::host_room(32ull << 30, 10ull << 30, 1ull << 30, 0) == (9ull << 30) &&
+              Fitter::host_room(32ull << 30, 10ull << 30, 0, int64_t(4ull << 30)) == (6ull << 30),
+          "ram_reserve replaces host_keep in the offload host room");
+    for (bool pages_reclaimed : {false, true}) {
+      Fitter fitter;
+      int releases = 0;
+      auto result = fitter.fit_weights(
+          {4, 4}, {4, 4}, false,
+          [](Fitter::Caps c) -> std::optional<flyx_load_estimate> {
+            if (c != Fitter::Caps{2, 3}) return std::nullopt;
+            flyx_load_estimate e{};
+            e.offload_pinned_bytes = 4;
+            e.offload_pageable_bytes = 8;
+            return e;
+          },
+          [&] { return releases && pages_reclaimed ? 12u : 11u; }, [&] { ++releases; });
+      check(releases == 1 && bool(result) == pages_reclaimed,
+            "joint estimate retries host room once after page release");
+    }
+  }
   return flyx::test::finish("elastic_load_test");
 }

@@ -78,6 +78,10 @@ bool engine_flag(const std::string& a, const std::function<std::string()>& value
     if (!interfaces::parse_kv_method(v, &spec, &err))
       std::fprintf(stderr, "error: %s\n", err.c_str()), std::exit(2);
     eo->kv_method = v;
+  } else if (a == "--gpu-experts" || a == "--gpu-layers") {
+    const auto cap = whole_flag(a.c_str(), value(), 0, INT_MAX);
+    if (a == "--gpu-experts") eo->gpu_experts = int(cap);
+    else eo->gpu_layers = int(cap);
   } else if (a == "--backend-opt") {
     eo->backend_options += (eo->backend_options.empty() ? "" : ",") + value();
   } else if (a == "--backend") {
@@ -181,6 +185,8 @@ std::string engine_flags_help(int ctx) {
          "  --backend B          cuda | cpu_ref (default: the build's cuda, cpu_ref in a build without it; a CUDA\n"
          "                       backend that cannot run here is an error, never cpu_ref in its place); cuda runs on\n"
          "                       the first GPU CUDA lists: CUDA_VISIBLE_DEVICES=N in the environment makes that GPU N\n"
+         "  --gpu-layers N       keep N dense layers on GPU and stream later layers through VRAM\n"
+         "  --gpu-experts N      keep up to N routed experts per layer on GPU (default: fit to VRAM)\n"
          "  --backend-opt K=V    a backend option (repeatable; also FLYX_BACKEND_OPTIONS=K=V,...)\n"
          "  --no-spec            plain decoding, ignore the drafter\n"
          "  --no-lookup          no rounds drafted from the text itself where it repeats\n"

@@ -28,12 +28,15 @@
 #include <string>
 #include <thread>
 #include <unordered_map>
+#include <utility>
 #include <vector>
 
 #include "backends/cuda/blocks.h"
 #include "backends/cuda/errors.h"
 #include "backends/cuda/kernels/kernels.cuh"
 #include "backends/cuda/runtime/draft_ring.h"
+#include "backends/cuda/runtime/checked_size.h"
+#include "backends/cuda/runtime/offload/offload_runtime.h"
 #include "backends/cuda/runtime/vision_disk.h"
 #include "core/interfaces/options.h"
 #include "flyx/backend_abi.h"
@@ -154,6 +157,18 @@ struct BackendOptions {
   // asks, eagle4_tree_steps(): 2 width / 3)
   int eagle4_beam = 4, eagle4_steps = 0;
   bool draft_kv16 = false;       // draft_kv=16: the MTP layer's cache in binary16 beside the target's FP8
+  int gpu_layers = INT_MAX;  // dense layers retained before the streamed suffix
+  bool expert_adapt = true, expert_global = false, expert_integer = true;
+  bool expert_gather = true;
+  bool expert_overlap = true;  // gathered rounds copy only host-resident experts, beside the device-resident GEMMs
+  // Local decode route cache: auto, 0 (disabled), or a directory.
+  std::string expert_profile = "auto";
+  bool expert_ticket = true, expert_mapped_output = true, expert_direct = true;
+  int expert_simd = 512;  // upper bound on vector width for cold CPU dots
+  bool keep_expert_archive = true;
+  int expert_prefill_min = -1;  // minimum prompt rows for streamed GPU experts, zero uses the CPU path
+  int expert_threads = 0;  // maximum CPU workers including the submitting thread, zero uses the default
+  int gpu_experts = INT_MAX;  // resident expert IDs [0, gpu_experts) at each MoE layer
   bool packed_blocks = true;     // blocks=bf16 clears it
   int embed = 0;                 // embed=auto (0: host memory unless the GPU has room, open_model), host (1), gpu (2)
   int vision = FLYX_VISION_DEV_DISK;         // vision=disk (0: temp file, 0 VRAM/RAM), host (1), gpu (2), auto (3)
@@ -169,6 +184,16 @@ struct BackendOptions {
   PageableKvMode pageable_kv = PageableKvMode::automatic;
   int pinned_host_mb = -1;  // override pinned host budget in MiB (-1: query DXGI NON_LOCAL on Windows, unlimited else)
 };
+// The core's placement trial is authoritative over a backend default.
+inline bool apply_weight_caps(const flyx_open_options* options, BackendOptions* out) {
+  if (!options) return true;
+  const uint32_t maximum = uint32_t(INT_MAX) + 1;
+  if (options->gpu_experts_plus_one > maximum || options->gpu_layers_plus_one > maximum) return false;
+  if (options->gpu_experts_plus_one) out->gpu_experts = flyx_decode_cap(options->gpu_experts_plus_one);
+  if (options->gpu_layers_plus_one) out->gpu_layers = flyx_decode_cap(options->gpu_layers_plus_one);
+  return true;
+}
+
 bool parse_options(const char* text, BackendOptions* o, std::string* err);
 // The environment as apply_env_aliases reads it (null: std::getenv; tests pass their own).
 using EnvLookup = const char* (*)(const char* name);
@@ -251,6 +276,10 @@ struct RowBufs {
   float *rel_q = nullptr, *rel_btab = nullptr, *sink = nullptr, *kv_conv = nullptr, *kv_dyn = nullptr;
   float *post_raw = nullptr, *post_out = nullptr;
   int* moe_idx = nullptr;
+  int gather_rows = -1;
+  uint8_t* gathered = nullptr;  // gather_bytes(pairs): the selected experts' copies, a projection at a time
+  int* gather_ids = nullptr;
+  int* gather_slot = nullptr;   // gather_plan's copy a pair makes
   float* moe_guess = nullptr;  // rounds: the experts' scores moe_prefetch guesses from (n_experts floats), then
                               // the mixed row moe_guess_scores reads (hidden floats)
   // moe_act: the activations in float32, or in bf16 where a fused round's gate|up GEMM writes the down GEMM's input
@@ -466,7 +495,7 @@ struct DevicePieces {
   size_t bytes = 0;   // the range's, a multiple of the granularity
   size_t mapped = 0;  // of it mapped so far (what release unmaps)
   std::vector<unsigned long long> handles;
-  bool alias = false;
+  bool granule_mappings = false;
   DevicePieces() = default;
   DevicePieces(const DevicePieces&) = delete;
   DevicePieces& operator=(const DevicePieces&) = delete;
@@ -479,21 +508,37 @@ struct DevicePieces {
 // memory.
 void* device_pieces(size_t bytes, DevicePieces* out);
 void* device_alias(size_t bytes, DevicePieces* out);
+void* expert_pages(size_t total, size_t resident, DevicePieces* out);
+void copy_expert_pages(const DevicePieces& a, size_t ai, const DevicePieces& b, size_t bi, uint8_t* scratch);
+void exchange_expert_backing(DevicePieces& a, size_t ai, DevicePieces& b, size_t bi);
 // Whether the device maps memory in pieces (VMM: its capability and the driver's functions), and the floor
 // device_room keeps below memory made of them: kPiecesFloor for pieces of kPieceBytes at most, kPagedFloor where the
 // granularity is larger or there is no VMM (one allocation instead).
 bool vmm_supported();
+bool expert_pages_supported();
 size_t pieces_floor();
 // Minimum VRAM reserve floor the backend requires for its device allocations (Windows WDDM: pieces_floor(); 0 elsewhere).
 uint64_t device_reserve_floor();
 
 }  // namespace flyx::cuda
 
-struct flyx_bmodel {
-  std::vector<void*> allocs;
-  size_t bytes = 0;
-  std::vector<void*> host_allocs;  // pinned host memory (host_alloc / host_pinned)
-  size_t host_bytes = 0;
+namespace flyx::cuda { struct ColdWorkspace; struct LayerRing; }
+
+// Device and pinned allocations outlive all model-owned DMA streams and graph handles.
+struct ModelAllocations {
+  std::unordered_map<void*, size_t> allocs;
+  std::vector<void*> host_allocs;
+  size_t bytes = 0, host_bytes = 0, pinned_bytes = 0;
+  ~ModelAllocations() {
+    for (const auto& entry : allocs) cudaFree(entry.first);
+    for (void* p : host_allocs) cudaFreeHost(p);
+  }
+};
+
+struct flyx_bmodel : ModelAllocations {
+  explicit flyx_bmodel(flyx::cuda::BackendOptions options = {}) : opt(std::move(options)) {}
+  std::unique_ptr<flyx::cuda::OffloadRuntime> offload;
+  bool allows_graphs() const { return opt.graphs && (!offload || offload->allows_graphs()); }
   size_t vision_dev_bytes = 0, vision_host_bytes = 0, vision_disk_bytes = 0;
   flyx::cuda::VisionDiskStore vision_disk;  // auto-deleted temp file when vision=disk (0 VRAM, 0 locked host RAM)
   // Tiny 2-slot pinned host ring (<= 16 MiB total) allocated lazily on first disk encode_vision() under prefill_mu.
@@ -542,7 +587,8 @@ struct flyx_bmodel {
   // threads take them one pass after the other.
   std::mutex prefill_mu;                // lock order: prefill_mu before batch->mu
   bool kv_fp8 = false;   // the target's K/V caches in e4m3 (open option)
-  flyx::cuda::BackendOptions opt;    // open()'s options; opt.kernels is what every launch for this model consults
+  bool has_certified_head = false;       // an optional head copy survived bind and trim
+  const flyx::cuda::BackendOptions opt;  // open()'s options; opt.kernels is what every launch for this model consults
   std::string active_draft_weights;  // effective drafter precision ("nvfp4", "q8", "exact", or "" when none)
   std::unique_ptr<flyx::cuda::BatchRounds> batch;  // rounds of several sequences
   // Round graphs: every round plan lowered (plan_free forgets it) and its graph's size, counted when a
@@ -552,10 +598,6 @@ struct flyx_bmodel {
   std::map<const flyx_plan*, flyx::cuda::PlanGraph> round_graphs;
 
   ~flyx_bmodel() {
-    if (batch && verbose && batch->launched)
-      std::fprintf(stderr, "flyx-cuda: %ld rounds of several sequences (%.2f sequences, %.1f rows each), %ld graphs "
-                   "captured\n", batch->launched, double(batch->sequences) / batch->launched,
-                   double(batch->rows) / batch->launched, batch->captured);
     batch.reset();  // its graphs and stream before the memory they use
     if (prefill_ev) cudaEventDestroy(prefill_ev);
     if (prefill_embeds) cudaFree(prefill_embeds);
@@ -563,15 +605,20 @@ struct flyx_bmodel {
     if (prefill_pos3d) cudaFree(prefill_pos3d);
     flyx::cuda::prefill_vmm_free(this);
     for (void* p : prefill_allocs) cudaFree(p);
-    for (void* p : allocs) cudaFree(p);
-    for (void* p : host_allocs) cudaFreeHost(p);
     if (vision_disk_stage) cudaFreeHost(vision_disk_stage);
   }
   template <class T>
   T* alloc(size_t n) {
-    void* p = flyx::cuda::device_malloc(n * sizeof(T));
-    allocs.push_back(p);
-    bytes += n * sizeof(T);
+    const size_t amount = flyx::cuda::size_mul(n, sizeof(T));
+    const size_t total = flyx::cuda::size_add(bytes, amount);
+    void* p = flyx::cuda::device_malloc(amount);
+    try {
+      allocs.emplace(p, amount);
+    } catch (...) {
+      cudaFree(p);
+      throw;
+    }
+    bytes = total;
     return static_cast<T*>(p);
   }
   // Host memory the kernels read in place over the bus (pinned, mapped), for a table the kernels only gather rows
@@ -579,10 +626,14 @@ struct flyx_bmodel {
   // under WSL, which reads no faster here); uploads to it go through cudaMemcpyDefault.
   template <class T>
   T* host_alloc(size_t n) {
+    const size_t amount = flyx::cuda::size_mul(n, sizeof(T));
+    const size_t total = flyx::cuda::size_add(host_bytes, amount);
+    host_allocs.reserve(host_allocs.size() + 1);
     void* p = nullptr;
-    CK(cudaHostAlloc(&p, n * sizeof(T), cudaHostAllocMapped));
+    CK(cudaHostAlloc(&p, amount, cudaHostAllocMapped));
     host_allocs.push_back(p);
-    host_bytes += n * sizeof(T);
+    host_bytes = total;
+    pinned_bytes += amount;
     void* d = nullptr;
     CK(cudaHostGetDevicePointer(&d, p, 0));
     return static_cast<T*>(d);
@@ -590,26 +641,36 @@ struct flyx_bmodel {
   // Page-locked host memory for async H2D DMA streaming (e.g. offloaded vision weights): raw host pointer,
   // 0 bytes of GPU VRAM, freed with host_allocs on model close.
   template <class T>
-  T* host_pinned(size_t n) {
+  T* host_pinned(size_t n, T** device_alias = nullptr) {
     if (n == 0) return nullptr;
+    const size_t amount = flyx::cuda::size_mul(n, sizeof(T));
+    const size_t total = flyx::cuda::size_add(host_bytes, amount);
+    host_allocs.reserve(host_allocs.size() + 1);
     void* p = nullptr;
-    CK(cudaHostAlloc(&p, n * sizeof(T), cudaHostAllocDefault));
+    CK(cudaHostAlloc(&p, amount, device_alias ? cudaHostAllocMapped : cudaHostAllocDefault));
     host_allocs.push_back(p);
-    host_bytes += n * sizeof(T);
+    host_bytes = total;
+    pinned_bytes += amount;
+    if (device_alias) {
+      void* mapped = nullptr;
+      CK(cudaHostGetDevicePointer(&mapped, p, 0));
+      *device_alias = static_cast<T*>(mapped);
+    }
     return static_cast<T*>(p);
   }
   // Gives back an allocation of n bytes made by alloc().
   void release(void* p, size_t n) {
-    auto it = std::find(allocs.begin(), allocs.end(), p);
-    if (it == allocs.end()) return;
-    allocs.erase(it);
-    bytes -= n;
+    auto it = allocs.find(p);
+    if (it == allocs.end() || it->second != n) throw std::logic_error("invalid model allocation release");
     CK(cudaFree(p));
+    bytes -= n;
+    allocs.erase(it);
   }
 };
 
 namespace flyx::cuda {
 struct Pass;
+class SplitRound;
 
 // ---- regions: the generic implementation of every node, and overrides --------------------
 // lower() resolves each node to the most specific implementation that fits
@@ -638,6 +699,7 @@ struct flyx_plan {
   // session's TreeRows, the accepted path compacted after the accept; tree_kv: the K/V caches its attention layers
   // write (flyx_seq::kv indices).  drafted: the drafter writes the TreeRows in the round, the launch does not.
   bool tree = false, drafted_tree = false, has_draft = false;
+  size_t resident_routes = 0; // per row, in fully resident MoE visits of a hybrid round
   std::vector<int> tree_kv;
   std::vector<int> checkpoints;  // sorted verify checkpoints for adaptive conditional round graph (empty: fixed width)
   bool earlier_checkpoints = false;  // flyx_program's: a stop may verify a checkpoint before the one it drafted to
@@ -670,12 +732,17 @@ constexpr int kPrefillSplits = 8;
 }  // namespace flyx::cuda
 
 struct flyx_seq {
+  int* route_error = nullptr;  // sticky invalid-ID flag for a streamed prefill
   flyx_bmodel* m;
   int max_ctx = 0, cap = 0, rows_cap = 0;
   cudaStream_t st = nullptr;
   flyx::cuda::SideStream side{};  // a round's narrow GEMMs of a stack beside its wide ones (Launch::side)
   // A round's expert reads ahead (moe_prefetch): a stream of its own, so they never queue before Launch::side's GEMMs.
   flyx::cuda::SideStream expert_side{};
+  // Gathered rounds: the host-resident experts' copies beside the device-resident experts' GEMMs (gather_gate: the
+  // gate|up copies are in).
+  flyx::cuda::SideStream gather_side{};
+  cudaEvent_t gather_gate = nullptr;
   cudaEvent_t expert_read = nullptr;  // last read of mutable residuals, before the immutable weight prefetch
   std::vector<void*> allocs;
   flyx::cuda::DevicePieces arena_pieces;  // the device arena (dev_arena), where the driver maps memory
@@ -864,6 +931,7 @@ struct flyx_seq {
     int copy_prefix;              // positions transferred by fixed-size H2D nodes captured in this graph
     size_t bytes = 0;             // what it takes at most (graph_size), in graph_held
     unsigned long long used = 0;  // its last launch's seq_no
+    std::shared_ptr<flyx::cuda::SplitRound> split;
   };
   std::map<std::pair<const flyx_plan*, int>, RoundGraph> graph;
   // Its graphs' bytes and its shares of batch graphs, within its room.  Atomic: a batch graph dropped
@@ -890,10 +958,13 @@ struct flyx_seq {
     if (stage_side.st) cudaStreamSynchronize(stage_side.st);
     if (side.st) cudaStreamSynchronize(side.st);
     if (expert_side.st) cudaStreamSynchronize(expert_side.st);
+    if (gather_side.st) cudaStreamSynchronize(gather_side.st);
     release_prefill_pool();
     if (profile) print_profile();
     for (auto e : prof_ev) cudaEventDestroy(e);
-    for (auto& g : graph) cudaGraphExecDestroy(g.second.exec);
+    for (auto& g : graph)
+      if (g.second.exec) cudaGraphExecDestroy(g.second.exec);
+    graph.clear();  // release split executions before freeing the buffers they reference
     for (auto& e : ev)
       if (e) cudaEventDestroy(e);
     if (idle_ev) cudaEventDestroy(idle_ev);
@@ -909,6 +980,8 @@ struct flyx_seq {
     flyx::cuda::destroy_side(side);
     if (expert_read) cudaEventDestroy(expert_read);
     flyx::cuda::destroy_side(expert_side);
+    if (gather_gate) cudaEventDestroy(gather_gate);
+    flyx::cuda::destroy_side(gather_side);
     if (st) cudaStreamDestroy(st);
   }
   // dry: count the bytes the allocations would take, allocate nothing (seq_bytes).
@@ -1094,19 +1167,20 @@ struct flyx_seq {
   // ring_publish); not counted in dry_host_bytes; freed with host_allocs.
   template <class T>
   T* pinned_alloc(size_t n) {
-    const size_t bytes = n * sizeof(T);
-    const size_t aligned = (bytes + 255) / 256 * 256;
+    const size_t bytes = flyx::cuda::size_mul(n, sizeof(T));
+    const size_t aligned = flyx::cuda::checkpoint_align(bytes);
     if (dry) {
-      arena_host_bytes += aligned;
+      arena_host_bytes = flyx::cuda::size_add(arena_host_bytes, aligned);
       return reinterpret_cast<T*>(uintptr_t(256));
     }
     if (bytes == 0) return nullptr;
-    if (host_arena && host_arena_off + aligned <= host_arena_cap) {
+    if (host_arena && aligned <= host_arena_cap - host_arena_off) {
       unsigned char* p = host_arena + host_arena_off;
       host_arena_off += aligned;
       return reinterpret_cast<T*>(p);  // zeroed once with the arena
     }
     void* p = nullptr;
+    host_allocs.reserve(host_allocs.size() + 1);
     CK(cudaHostAlloc(&p, bytes, cudaHostAllocMapped));
     host_allocs.push_back(p);
     return static_cast<T*>(p);
@@ -1115,20 +1189,21 @@ struct flyx_seq {
   // reads in a round (the checkpoints). Not in dry_bytes (the device's budget).
   template <class T>
   T* host_alloc(size_t n) {
-    const size_t bytes = n * sizeof(T);
-    const size_t aligned = (bytes + 255) / 256 * 256;
+    const size_t bytes = flyx::cuda::size_mul(n, sizeof(T));
+    const size_t aligned = flyx::cuda::checkpoint_align(bytes);
     if (dry) {
-      dry_host_bytes += aligned;
-      arena_host_bytes += aligned;
+      dry_host_bytes = flyx::cuda::size_add(dry_host_bytes, aligned);
+      arena_host_bytes = flyx::cuda::size_add(arena_host_bytes, aligned);
       return reinterpret_cast<T*>(uintptr_t(256));
     }
     if (bytes == 0) return nullptr;
-    if (host_arena && host_arena_off + aligned <= host_arena_cap) {
+    if (host_arena && aligned <= host_arena_cap - host_arena_off) {
       unsigned char* p = host_arena + host_arena_off;
       host_arena_off += aligned;
       return reinterpret_cast<T*>(p);  // zeroed once with the arena
     }
     void* p = nullptr;
+    host_allocs.reserve(host_allocs.size() + 1);
     CK(cudaHostAlloc(&p, bytes, cudaHostAllocDefault));
     std::memset(p, 0, bytes);
     host_allocs.push_back(p);
@@ -1136,23 +1211,24 @@ struct flyx_seq {
   }
   template <class T>
   T* alloc(size_t n) {
-    const size_t bytes = n * sizeof(T);
-    const size_t aligned = (bytes + 255) / 256 * 256;
+    const size_t bytes = flyx::cuda::size_mul(n, sizeof(T));
+    const size_t aligned = flyx::cuda::checkpoint_align(bytes);
     if (dry) {
-      dry_bytes += aligned;
-      arena_dev_bytes += aligned;
+      dry_bytes = flyx::cuda::size_add(dry_bytes, aligned);
+      arena_dev_bytes = flyx::cuda::size_add(arena_dev_bytes, aligned);
       return reinterpret_cast<T*>(uintptr_t(256));
     }
     if (bytes == 0) return nullptr;
-    if (dev_arena && dev_arena_off + aligned <= dev_arena_cap) {
+    if (dev_arena && aligned <= dev_arena_cap - dev_arena_off) {
       unsigned char* p = dev_arena + dev_arena_off;
       dev_arena_off += aligned;
       return reinterpret_cast<T*>(p);  // zeroed once with the arena on st
     }
     void* p = nullptr;
+    allocs.reserve(allocs.size() + 1);
     CK(cudaMalloc(&p, bytes));
-    CK(cudaMemsetAsync(p, 0, bytes, st));  // through the session's stream (runner.cpp: set_params)
     allocs.push_back(p);
+    CK(cudaMemsetAsync(p, 0, bytes, st));  // through the session's stream (runner.cpp: set_params)
     return static_cast<T*>(p);
   }
 };
@@ -1221,6 +1297,7 @@ struct Pass {
   ResState* res = nullptr;  // pass-local AttnRes / loop bank counters (stack-owned by forward_nodes)
   const MoeBlock* next_moe = nullptr;       // the MoE right after this node (forward_nodes): its L2 warm-up
   const RelAttnBlock* next_attn = nullptr;  // the attention right after this node: its L2 warm-up
+  SplitRound* split = nullptr;  // records host boundaries during split capture
   int width() const { return accept_width >= 0 ? accept_width : p->width; }
   bool reads_copy(const KvBuf& kb) const { return round && kb.kq && strata != kStrataNone; }
   bool reads_cache(const KvBuf& kb) const { return !reads_copy(kb) || strata == kStrataBoth; }
@@ -1284,6 +1361,7 @@ RowNeeds row_needs(const flyx_bmodel* m);
 int max_drafts(const Block& drafter);  // most drafts a round of this drafter can verify (0: not a drafter)
 int ensure_prefill_rows(flyx_bmodel* m, int rows);
 void reserve_prefill_inputs(flyx_bmodel* m, size_t embed_rows, size_t position_rows);
+int request_boundary(flyx_seq* s, int32_t begin);
 int seq_new(flyx_bmodel* m, int32_t max_ctx, flyx_seq** out);
 void seq_free(flyx_seq* s);
 int seq_bytes(flyx_bmodel* m, int32_t max_ctx, uint64_t* out);

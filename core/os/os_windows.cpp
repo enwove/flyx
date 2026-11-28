@@ -106,6 +106,11 @@ bool MappedFile::open(const std::string& path, std::string* err) {
   return true;
 }
 
+void MappedFile::release_pages() const {
+  // For an unlocked mapping VirtualUnlock trims its pages from this process's working set (ERROR_NOT_LOCKED).
+  if (data_ && size_) VirtualUnlock(const_cast<uint8_t*>(data_), size_);
+}
+
 void MappedFile::read_ahead(size_t offset, size_t len) const {
   if (!data_ || offset >= size_) return;
   WIN32_MEMORY_RANGE_ENTRY range{const_cast<uint8_t*>(data_) + offset, std::min(len, size_ - offset)};

@@ -188,7 +188,10 @@ bool gemm_tuning_compiled_for(int tuning, int cc) {
 #endif
 }
 
-bool gemm_tuning_pdl(int tuning) { return tuning >= 0 && tables::kSkus[tuning].pdl; }
+int gemm_tuning_expert_prefill(int tuning) {
+  return tuning >= 0 && tuning < tables::kSkuCount ? tables::kExpertPrefillRows[tuning] : -1;
+}
+bool gemm_tuning_pdl(int tuning) { return tuning >= 0 && tuning < tables::kSkuCount && tables::kSkus[tuning].pdl; }
 
 int gemm_tuning_auto(const char* device_name, int device_cc, int code_cc, int* arch_cc,
                      bool (*compiled)(int tuning, int cc)) {

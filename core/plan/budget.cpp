@@ -525,6 +525,8 @@ bool account(const flyx_backend_api* api, flyx_bmodel* bm, bool has_drafter, boo
       return true;
     }
     out->oom = true;
+    out->ctx_need_more =
+        tiers_on ? placer.need_more_for(max_ctx, CtxLimit::kGpu, tiers.allow_auto_exact) : sb - placer.room;
     *err = format_oom_error(placer, mi, reserve, max_ctx, has_drafter, mostly_bf16, tiers_on);
     if (tiers.method == FLYX_KV_AUTO && !tiers.allow_auto_exact)
       *err += " The requested context must keep the target model's AUTO attention switch.";

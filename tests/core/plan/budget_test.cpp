@@ -10,6 +10,7 @@
 #include <string>
 
 #include "core/plan/budget.h"
+#include "core/plan/residency_fitter.h"
 #include "tests/common/check.h"
 
 using namespace flyx;
@@ -102,6 +103,18 @@ void check_shortfall_replay(flyx_backend_api api, plan::KvTiers tiers, const pla
 
 int main() {
   flyx::test::print_passes = true;
+  {
+    plan::ResidencyFitter fitter;
+    using Caps = plan::ResidencyFitter::Caps;
+    auto chosen = fitter.fit({8, 8}, {8, 8}, false, [](Caps c) { return c[0] == 5 && c[1] == 3; });
+    check(chosen && *chosen == Caps{5, 3}, "joint fit across non-monotonic cap costs");
+    Caps current{8, 0};
+    for (int expected : {7, 5, 1, 0}) {
+      chosen = fitter.fit(current, {8, 0}, true, [](Caps) { return true; });
+      check(chosen && (*chosen)[0] == expected, "allocator backoff doubles on repeated refusals");
+      current = *chosen;
+    }
+  }
   const flyx_backend_api api = fake();
   // The budget: 16 GiB less the reserve (16 GiB / 40) = 15.6 GiB; 5.1 GiB after weights and workspace, so a context
   // of up to (5.1 GiB - 1 GiB) / 64 KiB = 65,536 tokens' worth less a little.

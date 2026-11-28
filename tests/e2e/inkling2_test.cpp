@@ -856,14 +856,19 @@ std::vector<int32_t> fresh_gen(Engine& e, const std::vector<int32_t>& prompt, in
   return run_gen(s, prompt, n, sampled);
 }
 
-// Gate 2 on every row of a round: a fused round's producers, each writing what the next GEMM reads, against the
-// generic layers.  All of a four-row round's logits, with its last draft rejected, then the next round's, and the
-// round after a rewind into the accepted ones.
-void test_fused_rounds(const std::filesystem::path& path, const std::string& model,
-                       const std::vector<int32_t>& prompt) {
+// Gate 2 on every row of a round: a fused round's producers, each writing what
+// the next GEMM reads, against the generic layers.  All of a four-row round's
+// logits, with its last draft rejected, then the next round's, and the round
+// after a rewind into the accepted ones.
+void test_fused_rounds(const std::filesystem::path& path, const std::string& model, const std::vector<int32_t>& prompt,
+                       double kl_limit) {
   std::vector<int32_t> want;
-  std::vector<float> generic_logits;
-  for (const std::string fusion : {"fusion=0", "fusion=1"}) {
+  std::vector<float> resident_logits, generic_logits;
+  for (const std::string fusion :
+       {"fusion=0", "fusion=1", "fusion=0,gpu_experts=2", "fusion=1,gpu_experts=2", "fusion=0,gpu_experts=0",
+        "fusion=1,gpu_experts=0", "fusion=0,gpu_experts=2,expert_prefill_min=2",
+        "fusion=1,gpu_experts=2,expert_prefill_min=2", "fusion=0,gpu_experts=0,expert_prefill_min=2",
+        "fusion=1,gpu_experts=0,expert_prefill_min=2"}) {
     const std::string opts = "head_cert=0,blocks=packed," + fusion;
     auto e = load_engine(path.string(), "cuda", {.speculative = true, .lookup = true, .backend_opts = opts});
     if (e->lookup_widths().empty() || e->lookup_widths().front() != 3 || e->widths().front() != 0)
@@ -893,7 +898,8 @@ void test_fused_rounds(const std::filesystem::path& path, const std::string& mod
       }
     };
 
-    // Force rejection of only the last draft, then read the history folded from the three accepted inputs.
+    // Force rejection of only the last draft, then read the history folded from
+    // the three accepted inputs.
     const int32_t drafts[] = {want[1], want[2], (want[3] + 1) % vocab};
     flyx_gen_params given = plain;
     given.drafts = drafts;
@@ -907,10 +913,37 @@ void test_fused_rounds(const std::filesystem::path& path, const std::string& mod
     round(e->round_plan(0), plain, 1);
     matches = matches && r.n_tokens == 1 && r.tokens[0] == want[2] &&
               std::memcmp(logits.data() + vocab, logits.data() + 5 * vocab, vocab * sizeof(float)) == 0;
-    if (fusion == "fusion=0") generic_logits = logits;
-    check(matches && std::memcmp(logits.data(), generic_logits.data(), logits.size() * sizeof(float)) == 0,
-          model + ": a four-row round, the round after it and the one after a rewind give the generic layers' "
-                  "logits (" + fusion + ")");
+    if (resident_logits.empty()) resident_logits = logits;
+    if (fusion.compare(0, 8, "fusion=0") == 0) generic_logits = logits;
+    check(matches && logits == generic_logits, model +
+                                                   ": greedy tokens, rewind and all six rows of fused logits match "
+                                                   "generic at this placement (" +
+                                                   fusion + ")");
+
+    // A one-ulp change in an expert sum can cross a quantization boundary in a
+    // later layer. Compare every token probability across placements, including
+    // the rejected row, and require each top-1.
+    double worst_kl = 0;
+    bool same_top1 = true;
+    for (size_t row = 0; row < logits.size(); row += vocab) {
+      const float* a = resident_logits.data() + row;
+      const float* b = logits.data() + row;
+      const auto ia = std::max_element(a, a + vocab) - a;
+      const auto ib = std::max_element(b, b + vocab) - b;
+      same_top1 &= ia == ib;
+      double za = 0, zb = 0, delta = 0;
+      for (int i = 0; i < vocab; ++i) {
+        const double x = double(a[i]) - a[ia], y = double(b[i]) - b[ib];
+        const double p = std::exp(x);
+        za += p;
+        zb += std::exp(y);
+        delta += p * (x - y);
+      }
+      const double kl = delta / za + std::log(zb / za);
+      worst_kl = std::isfinite(kl) ? std::max(worst_kl, kl) : INFINITY;
+    }
+    check(same_top1 && worst_kl <= kl_limit,
+          model + ": every row matches resident top-1, maximum KL " + std::to_string(worst_kl) + " (" + fusion + ")");
   }
 }
 
@@ -1348,14 +1381,16 @@ int main(int argc, char** argv) {
 
     if (backend == "cuda") {
       // The attention's producers on the mixed weights; the MoE's on experts whose gate|up GEMM reads 8-bit rows
-      // and whose down GEMM is NVFP4.
-      test_fused_rounds(mixed_gguf, "mixed weights", prompt);
+      // and whose down GEMM is NVFP4.  Experts on the CPU add in an order of their own (0.000175 with every expert
+      // there); beside device experts in the prompt passes' kernel (moe_mmq) 0.000211, so the bound has room.
+      test_fused_rounds(bf16_gguf, "BF16 trunk", prompt, 1e-6);
+      test_fused_rounds(mixed_gguf, "mixed weights", prompt, 3e-4);
       {
         TinySpec experts = spec;
         experts.packed_gate_nvfp4_down = true;
         const auto path = dir / "tiny_inkling2_mixed_experts.gguf";
         write_tiny_inkling2(path, experts, true, 2002);
-        test_fused_rounds(path, "mixed experts", prompt);
+        test_fused_rounds(path, "mixed experts", prompt, 3e-4);
       }
       {
         auto held = [&](RoundMatrixCase round_case, const char* filename) {
@@ -1428,6 +1463,45 @@ int main(int argc, char** argv) {
       check(std::string(cu_dspark->drafter()) == "dspark", "cuda loaded DSpark companion drafter");
 
       const auto cu_greedy = fresh_gen(*cu_plain, prompt, 24, false);
+      for (const auto* cap :
+           {"gpu_experts=2", "gpu_experts=0", "gpu_experts=2,fusion=0", "gpu_experts=0,expert_prefill_min=2"}) {
+        auto hybrid = load_engine(bf16_gguf.string(), "cuda", {.prefill_chunk = 32, .backend_opts = cap});
+        check(same_tokens(fresh_gen(*hybrid, prompt, 24, false), cu_greedy),
+              std::string("hybrid routed experts match resident greedy tokens: ") + cap);
+      }
+      {
+        auto e = load_engine(bf16_gguf.string(), "cuda",
+                             {.prefill_chunk = 32, .backend_opts = "gpu_experts=2,expert_prefill_min=2"});
+        std::string error;
+        {
+          Session a(e.get()), b(e.get());
+          if (!a.init(&error) || !b.init(&error)) throw std::runtime_error(error);
+          GenerateRequest request;
+          request.prompt = prompt;
+          request.max_new_tokens = 24;
+          request.ignore_eos = true;
+          std::vector<int32_t> result[2];
+          auto collect = [&](int index) {
+            return [&, index](std::string_view, const int32_t* ids, int count) {
+              result[index].insert(result[index].end(), ids, ids + count);
+              return true;
+            };
+          };
+          Generation first(&a, request, collect(0)), second(&b, request, collect(1));
+          while (!first.done() || !second.done()) {
+            if (!first.done()) first.advance(true);
+            if (!second.done()) second.advance(true);
+          }
+          check(result[0] == cu_greedy && result[1] == cu_greedy, "interleaved hybrid sessions match resident tokens");
+          for (auto* session : {&a, &b}) {
+            flyx_graph_stats stats{};
+            check(e->api()->graph_stats(session->seq(), &stats) == 0 && stats.from_graph > 0 &&
+                      stats.held > 0 && stats.held <= stats.room,
+                  "hybrid rounds replay split graphs within each session's reservation");
+          }
+        }
+        check(same_tokens(fresh_gen(*e, prompt, 24), cu_greedy), "fresh session after promotion");
+      }
       const auto cu_sampled = fresh_gen(*cu_plain, prompt, 24, true);
       check(same_tokens(cu_greedy, ref_greedy), "cuda plain greedy == float64 cpu_ref");
       check(same_tokens(cu_sampled, ref_sampled), "cuda plain sampled+penalties == float64 cpu_ref");

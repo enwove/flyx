@@ -8,6 +8,8 @@
 // read only these.  supported() (regions/plan.cpp) says which blocks the kernels take.
 #pragma once
 
+#include <memory>
+
 #include <algorithm>
 #include <cstdint>
 #include <string>
@@ -400,7 +402,13 @@ struct RelAttnBlock {
 };
 
 // Inkling-2 sparse MoE block with AttnRes, optional cross-pass loop control, SiTU activation, and post ShortConv.
+struct ColdMatrix;
+struct MappedExpertPair;
 struct MoeBlock {
+  const MappedExpertPair* mapped = nullptr;
+  std::shared_ptr<ColdMatrix> cold_gu, cold_down;
+  uint32_t* route_histogram = nullptr;
+  const int* route_slots = nullptr;
   int hidden = 0, inter = 0, n_experts = 0, top_k = 0, conv = 0;
   bool gating_sigmoid = true, norm_weights = true;
   float route_scale = 1.f, norm_eps = 1e-20f, situ_beta = 0.f, situ_linear_beta = 0.f;

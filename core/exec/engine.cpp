@@ -3,6 +3,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <charconv>
 #include <limits>
 #include <mutex>
 #include <string>
@@ -16,6 +17,7 @@
 #include "core/os/log.h"
 #include "core/os/os.h"
 #include "core/os/path.h"
+#include "core/plan/residency_fitter.h"
 #include "core/speculation/calibrate.h"
 
 namespace flyx {
@@ -81,13 +83,16 @@ class ReadAhead {
   explicit ReadAhead(const ModelFile& file) : available_(os::system_memory().available) {
     if (available_ && file.bytes() < available_) thread_ = std::thread([this, &file] { file.read_ahead(stop_); });
   }
-  ~ReadAhead() {
-    stop_ = true;
-    if (thread_.joinable()) thread_.join();
+  ~ReadAhead() { stop(); }
+  void stop() {
+    if (thread_.joinable()) {
+      stop_ = true;
+      thread_.join();
+    }
   }
   // For the load's report.
   std::string what() const {
-    return thread_.joinable() ? "read ahead" : "not read ahead: " + gb(available_) + " of memory available";
+    return (thread_.joinable() || stop_) ? "read ahead" : "not read ahead: " + gb(available_) + " of memory available";
   }
 
  private:
@@ -747,8 +752,22 @@ bool Engine::load(const std::string& path, const EngineOptions& opt, std::string
   };
 
   int auto_from = opt_.kv_gpu >= 0 && opt_.kv_ram != 0 ? opt_.kv_gpu : INT32_MAX;
+  int resident_experts = opt_.gpu_experts, resident_layers = opt_.gpu_layers;
+  for (auto [key, cap] : {std::pair{"gpu_experts", &resident_experts}, {"gpu_layers", &resident_layers}}) {
+    const auto value = interfaces::backend_opt_get(clean_backend_opts, key);
+    if (value.empty()) continue;
+    int parsed = 0;
+    const auto result = std::from_chars(value.data(), value.data() + value.size(), parsed);
+    if (result.ec != std::errc{} || result.ptr != value.data() + value.size() || parsed < 0)
+      return *err = std::string("invalid GPU residency cap: ") + key, false;
+    if (*cap < 0) *cap = parsed;
+    clean_backend_opts = interfaces::backend_opt_strip(clean_backend_opts, key);
+  }
+  const bool fit_experts = resident_experts < 0, fit_layers = resident_layers < 0;
   auto make_open_options = [&]() {
     flyx_open_options oo{};
+    oo.gpu_experts_plus_one = flyx_encode_cap(resident_experts);
+    oo.gpu_layers_plus_one = flyx_encode_cap(resident_layers);
     oo.max_ctx = opt_.max_ctx;
     oo.verbose = opt_.verbose;
     oo.lock_auto_from = tiers.method == FLYX_KV_AUTO;
@@ -932,6 +951,51 @@ bool Engine::load(const std::string& path, const EngineOptions& opt, std::string
     return true;
   };
 
+  // Query the backend for physical sizes. A host-memory limit is checked after choosing the largest
+  // feasible GPU partition, which also minimizes the amount we need to keep in RAM.
+  plan::ResidencyFitter fitter;
+  auto fit_weights = [&](const flyx_load_estimate& current, uint64_t free, uint64_t total, bool retry,
+                         uint64_t shortfall) {
+    auto host_room = [&] {
+      const auto ram = os::system_memory();
+      return plan::ResidencyFitter::host_room(ram.total, ram.available, opt_.host_reserved, opt_.ram_reserve);
+    };
+    const uint64_t room = free - std::min(free, device_reserve(total));
+    using Caps = plan::ResidencyFitter::Caps;
+    const Caps limits{fit_experts ? current.experts_per_layer : 0, fit_layers ? current.dense_layers : 0};
+    const Caps before{resident_experts < 0 ? current.experts_per_layer : resident_experts,
+                      resident_layers < 0 ? current.dense_layers : resident_layers};
+    auto probe = [&](Caps trial) -> std::optional<flyx_load_estimate> {
+      auto opts = make_open_options();
+      if (trial[0] != before[0]) opts.gpu_experts_plus_one = flyx_encode_cap(trial[0]);
+      if (trial[1] != before[1]) opts.gpu_layers_plus_one = flyx_encode_cap(trial[1]);
+      flyx_load_estimate est{};
+      if (api_->estimate_load(&model_->desc(), &opts, free, total, &est) != 0 ||
+          est.weights_bytes >= current.weights_bytes || current.weights_bytes - est.weights_bytes < shortfall ||
+          est.min_runtime_bytes > room || est.weights_bytes > room - est.min_runtime_bytes)
+        return std::nullopt;
+      return est;
+    };
+    auto cap = fitter.fit_weights(before, limits, retry && !shortfall, probe, host_room, [&] {
+      ahead.stop();
+      file_.release_pages();
+    });
+    if (!cap) return false;
+    if ((*cap)[0] != before[0]) {
+      resident_experts = (*cap)[0];
+      const auto n = std::to_string(resident_experts);
+      upsert_adj("gpu_experts", "all", n,
+                 n + " resident experts per layer on average, remaining weights in host memory");
+    }
+    if ((*cap)[1] != before[1]) {
+      resident_layers = (*cap)[1];
+      const auto n = std::to_string(resident_layers);
+      upsert_adj("gpu_layers", "all", n,
+                 n + " target layers resident on GPU, remaining linear weights streamed from RAM");
+    }
+    return true;
+  };
+
   // Pre-flight backend-reported VRAM check (avoids wasting seconds uploading weights that cannot fit).
   if (opt_.elastic_load && api_->estimate_load) {
     uint64_t free_vram = 0, total_vram = 0;
@@ -941,14 +1005,16 @@ bool Engine::load(const std::string& path, const EngineOptions& opt, std::string
       for (;;) {
         flyx_load_estimate est{};
         if (!query_estimate(free_vram, total_vram, &est)) break;
-        const uint64_t hard_need = est.weights_bytes + reserve + est.min_runtime_bytes;
-        const uint64_t comfort_need = hard_need + est.comfort_margin_bytes;
-        if (hard_need > free_vram) {
-          if (!step_down(/*comfort_only=*/false, &est, free_vram, total_vram)) break;
+        uint64_t room = free_vram - std::min(reserve, free_vram);
+        if (est.min_runtime_bytes > room || est.weights_bytes > room - est.min_runtime_bytes) {
+          if (!step_down(/*comfort_only=*/false, &est, free_vram, total_vram) &&
+              !fit_weights(est, free_vram, total_vram, false, 0))
+            break;
           continue;
         }
+        room -= est.min_runtime_bytes + est.weights_bytes;
         if (req_dw == interfaces::DraftWeightsMode::kAuto && cur_dw == interfaces::DraftWeightsMode::kAuto &&
-            meaningful_draft_savings(est) && comfort_need > free_vram) {
+            meaningful_draft_savings(est) && est.comfort_margin_bytes > room) {
           if (step_down(/*comfort_only=*/true, &est, free_vram, total_vram)) continue;
         }
         break;
@@ -1007,6 +1073,7 @@ bool Engine::load(const std::string& path, const EngineOptions& opt, std::string
       *err = attempt_err;
       return false;
     }
+    const uint64_t shortfall = budget_.ctx_need_more;
     // Tear down partial GPU allocations before stepping down a tier and retrying.
     plans_.free(api_);
     if (bm_) {
@@ -1020,7 +1087,9 @@ bool Engine::load(const std::string& path, const EngineOptions& opt, std::string
     query_vram(&free_vram, &total_vram);
     flyx_load_estimate est{};
     const bool have_est = query_estimate(free_vram, total_vram, &est);
-    if (!step_down(/*comfort_only=*/false, have_est ? &est : nullptr, free_vram, total_vram) && !(opened && smaller_prefill())) {
+    if (!step_down(/*comfort_only=*/false, have_est ? &est : nullptr, free_vram, total_vram) &&
+        !(opened && smaller_prefill()) &&
+        !(have_est && total_vram && fit_weights(est, free_vram, total_vram, true, shortfall))) {
       *err = attempt_err;
       if (kept_for_drafter)
         *err += " Beside --drafter " + opt_.drafter + ", prefill passes stay " + std::to_string(prefill_chunk_) +
