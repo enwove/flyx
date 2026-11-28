@@ -109,6 +109,7 @@ void pause_owned_console() {
                "                       half the free space)\n"
                "  --no-batch           requests running at once take turns, a round each, instead of sharing rounds\n"
                "  --no-think           requests that do not say otherwise get no thinking block\n"
+               "  --chat-template-kwargs JSON  default chat template variables for every chat request (JSON object)\n"
                "  --keep-billing-header  keep Claude Code's x-anthropic-billing-header line in the system prompt\n"
                "                       (left out by default: it changes on every request and defeats prompt reuse)\n"
                "  --temperature T      default sampling for requests that do not set it\n"
@@ -199,6 +200,7 @@ ServeArgs parse_args(int argc, char** argv) {
   ServeArgs a;
   a.eo.ctx_max = true;  // default: model's trained context, or the longest GPU and host memory hold
   apps::SamplingOverrides sampling_overrides;
+  bool no_think = false;
   for (int i = 1; i < argc; ++i) {
     const std::string f = argv[i];
     auto next = [&]() -> std::string {
@@ -217,7 +219,8 @@ ServeArgs parse_args(int argc, char** argv) {
     else if (f == "--host-cache") a.so.host_cache_bytes = uint64_t(apps::number_flag("--host-cache", next(), 0, 1e9) * 1e9);
     else if (f == "--kv-disk") kv_disk(next(), &a.so);
     else if (f == "--no-batch") a.so.batch_rounds = false;
-    else if (f == "--no-think") a.cfg.thinking = false;
+    else if (f == "--no-think") no_think = true;
+    else if (f == "--chat-template-kwargs") a.cfg.chat_defaults = apps::chat_template_kwargs_flag(next());
     else if (f == "--keep-billing-header") a.cfg.keep_billing_header = true;
     else if (apps::sampling_flag(f, next, &sampling_overrides)) continue;
     else if (f == "--api-key") a.cfg.api_key = next();
@@ -246,6 +249,7 @@ ServeArgs parse_args(int argc, char** argv) {
       a.model = f;
     }
   }
+  if (no_think) a.cfg.chat_defaults["enable_thinking"] = false;
   sampling_overrides.apply(&a.cfg.think_defaults);
   sampling_overrides.apply(&a.cfg.plain_defaults);
   if (a.no_auth && !a.cfg.api_key.empty()) bad_usage("--no-auth cannot be combined with --api-key");

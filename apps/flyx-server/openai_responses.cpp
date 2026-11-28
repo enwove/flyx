@@ -300,22 +300,22 @@ void handle_responses(Server* s, ResponseStore* store, const httplib::Request& r
   if (in.rules.tools == ReplyRules::kNone) in.tools.clear();  // as if none were offered
 
   // Thinking: reasoning.effort "none" turns it off; chat_template_kwargs as in chat completions.
-  bool thinking = s->cfg.thinking;
+  ojson request_kwargs = ojson::object();
   ojson effort = nullptr;
   if (const auto r_it = body.find("reasoning"); r_it != body.end() && !r_it->is_null()) {
     if (!r_it->is_object()) return send_openai_error(res, 400, "reasoning must be an object");
     if (const auto e_it = r_it->find("effort"); e_it != r_it->end() && !e_it->is_null()) {
-      if (!read_reasoning_effort(*e_it, "reasoning.effort", &effort, &thinking, &in.chat_options.kwargs, &err))
+      if (!read_reasoning_effort(*e_it, "reasoning.effort", &effort, &request_kwargs, &err))
         return send_openai_error(res, 400, err);
     }
   }
-  if (!read_chat_template_kwargs(body, &in.chat_options.kwargs, &thinking, &err))
+  if (!read_chat_options(body, s->cfg.chat_defaults, request_kwargs, &in.chat_options, &err))
     return send_openai_error(res, 400, err);
-  in.chat_options.enable_thinking = thinking;
   if (!read_optional_token_limit(body, "max_output_tokens", false, nullptr, &in.gen.max_new_tokens, &err))
     return send_openai_error(res, 400, err);
   if (body.contains("stop") && !read_stop(body["stop"], &in.gen.stop, &err)) return send_openai_error(res, 400, err);
-  if (!read_sampling(body, thinking, s->cfg, &in.gen.sampling, &err)) return send_openai_error(res, 400, err);
+  if (!read_sampling(body, in.chat_options.enable_thinking, s->cfg, &in.gen.sampling, &err))
+    return send_openai_error(res, 400, err);
 
   const float temperature = in.gen.sampling.temperature;
   const float top_p = in.gen.sampling.top_p;

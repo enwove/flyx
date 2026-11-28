@@ -13,7 +13,7 @@ Single reference for the `flyx` CLI, `flyx serve` HTTP endpoints, environment va
 | `chat` | `flyx chat MODEL [opts]` | Interactive multi-turn terminal chat. |
 | `bench` | `flyx bench MODEL [-n N] [--prompts FILE.jsonl] [--json [FILE]] [opts]` | Benchmark decode `tok/s`, tokens/round, and GPU telemetry across 3 fixed prompts, or across a prompt set (`--prompts`). `--json` emits one JSON record on stdout, or into `FILE`. |
 | `tokenize` | `flyx tokenize MODEL "TEXT"` | Print token IDs for `TEXT`. |
-| `template` | `flyx template MODEL MESSAGES.json [--no-think]` | Render a JSON message array through the model's chat template. |
+| `template` | `flyx template MODEL MESSAGES.json [--no-think] [--chat-template-kwargs JSON]` | Render a JSON message array through the model's chat template. |
 | `monitor` | `flyx monitor [URL] [--key KEY] [--interval S] [--once [--for S]]` | Read-only terminal monitor polling `GET /v1/telemetry` (default `http://127.0.0.1:8080`; `http://` URLs only). |
 | `--version` | `flyx --version` | Print `flyx X.Y.Z` (also `server.version` in `GET /v1/telemetry`). `--help` after any command prints its usage on stdout with status 0; an option the command does not know is named in one line, status 2. |
 
@@ -70,6 +70,7 @@ All commands that load a model share the parser in `apps/common/engine_flags.cpp
 | `-p TEXT` / `-f FILE` | `run` | string / path | — | Prompt text or file path. |
 | `--image FILE` | `run` | path (repeatable) | none | Attach one or more local image files (PNG, JPEG, BMP, GIF, TGA) to the prompt (implies `--chat`; requires a loaded vision encoder via `--mmproj` or Hub auto-fetch). |
 | `--chat` | `run` | flag | off | Wrap prompt as a single user message through the chat template. |
+| `--chat-template-kwargs JSON` | `run --chat`, `chat`, `template`, `serve` | JSON object | `{}` | Default variables for the loaded template, e.g. `'{"preserve_thinking":true,"reasoning_effort":"medium"}'`. Use a JSON boolean for `enable_thinking`. The renderer supplies `messages`, `tools`, `add_generation_prompt` and the model's own tokens. |
 | `--no-think` | `run`, `chat`, `template`, `serve` | flag | off | Disable thinking block by default (`enable_thinking=false`; a template that reads a thinking effort instead, Inkling-2's, is given its `reasoning_effort` `none`, and the reply is held to no thinking section); `bench` always runs without it. |
 | `-n N` | `run`, `chat`, `bench` | `≥ 0` | `256` | Maximum new tokens to generate. |
 | `--ignore-eos` | `run` | flag | off | Continue past EOS tokens until `-n` or context limit (`bench` always does). |
@@ -82,6 +83,17 @@ All commands that load a model share the parser in `apps/common/engine_flags.cpp
 ---
 
 ## 3. Server Flags (`flyx serve`)
+
+`--chat-template-kwargs` applies to Chat Completions, Responses, Anthropic Messages, and Anthropic token counts.
+`--no-think` overrides the startup object's `enable_thinking` in either flag order. Explicit request fields
+(such as `reasoning_effort`, `reasoning.effort`, or Anthropic `thinking` and `output_config.effort`) override the
+corresponding defaults. The request's `chat_template_kwargs` object overrides individual keys last. Other defaults
+carry through. A startup `reasoning_effort` of `"none"` disables thinking unless overridden. When the resolved
+mode conflicts with the startup effort, the template uses its own effort for that mode. An effort set by the
+request is preserved. Each template determines which variables it reads.
+
+In Windows PowerShell 5.1, escape the double quotes inside the single-quoted argument when launching a native
+executable, for example `--chat-template-kwargs '{\"preserve_thinking\":true,\"reasoning_effort\":\"medium\"}'`.
 
 To connect from another device, open **Server settings → Serve on local network** in the dashboard. Close flyx and launch it again, then copy an **Active API address** into the other device's client. Choose the address on the network the devices share. If the PC's firewall prompts, allow access on the intended network.
 
@@ -259,7 +271,7 @@ Base URLs: OpenAI clients use `http://127.0.0.1:8080/v1`; Anthropic clients use 
 
 | Method & Path | API Family | Supported Request Fields & Output Contract |
 |---|---|---|
-| `POST /v1/chat/completions` | OpenAI Chat | `messages` (text or array of `text` and base64 `image_url` data URI parts), `tools` (`strict: false` allows arbitrary JSON object args), `tool_choice` (`auto`, `required`, `none`, `{"type":"function","function":{"name":...}}`), `parallel_tool_calls`, `response_format` (`json_object`, `json_schema`), `stream`, `stream_options.include_usage`, `max_tokens` / `max_completion_tokens`, `temperature`, `top_p`, `top_k`, `seed`, `presence_penalty`, `frequency_penalty`, `accept_min_p`, `accept_typical`, `stop`, `chat_template_kwargs` (passed directly to Jinja, e.g., `enable_thinking`, `reasoning_effort`). Returns `reasoning_content`, `tool_calls`, and `usage.prompt_tokens_details.cached_tokens`. |
+| `POST /v1/chat/completions` | OpenAI Chat | `messages` (text or array of `text` and base64 `image_url` data URI parts), `tools` (`strict: false` allows arbitrary JSON object args), `tool_choice` (`auto`, `required`, `none`, `{"type":"function","function":{"name":...}}`), `parallel_tool_calls`, `response_format` (`json_object`, `json_schema`), `stream`, `stream_options.include_usage`, `max_tokens` / `max_completion_tokens`, `temperature`, `top_p`, `top_k`, `seed`, `presence_penalty`, `frequency_penalty`, `accept_min_p`, `accept_typical`, `stop`, `reasoning_effort`, `enable_thinking`, `chat_template_kwargs`. Template kwargs override the corresponding request fields. Template rendering, reply grammar, and sampling defaults share the resolved boolean `enable_thinking`. Returns `reasoning_content`, `tool_calls`, and `usage.prompt_tokens_details.cached_tokens`. |
 | `POST /v1/responses` | OpenAI Responses | `input` (string or items: messages with `input_text` / base64 `input_image`, `reasoning`, `function_call`, `function_call_output`), `instructions` (current request only; developer messages in `input` persist), `previous_response_id`, `store`, function `tools` (top-level or `namespace`), `tool_choice`, `parallel_tool_calls`, `text.format` (`json_object`, `json_schema`), `reasoning.effort` (`none` disables thinking), `max_output_tokens`, `temperature`, `top_p`, `top_k`, `seed`, `stream` (`response.created` … `response.completed` / `response.incomplete`), `include: ["reasoning.encrypted_content"]`. Thinking returned as `reasoning` items (`reasoning_text`). Rejects built-in/custom tool types, `background`, `conversation`, `prompt` with HTTP 400. |
 | `GET`, `DELETE /v1/responses/{id}` | OpenAI Responses | Fetch or delete a stored response. Serialized JSON store cap is `256 MiB` (FIFO eviction; responses exceeding cap are returned unstored). |
 | `GET /v1/responses/{id}/input_items` | OpenAI Responses | Paginated input items: `order=asc\|desc` (default `desc`), `limit=1..100` (default `20`), `after=LAST_ID`. |

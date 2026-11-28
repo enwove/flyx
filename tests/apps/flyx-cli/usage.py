@@ -42,6 +42,12 @@ for args, says in [(("run", model, "-p", "hello", "--frobnicate"), "unknown opti
     assert rc == 2 and says in err and not out, (args, rc, out[:80], err[:300])
     assert err.count("\n") <= 2, (args, err)  # what is wrong, not the usage it would be lost in
 
+for cmd in ("run", "chat", "template", "serve"):
+    for value in ("", "{", "{} trailing", "[]", '"text"', "1", "null", '{"enable_thinking":"false"}'):
+        rc, out, err = run(cmd, model, "--chat-template-kwargs", value)
+        assert rc == 2 and "--chat-template-kwargs" in err and not out, (cmd, value, rc, out, err)
+        assert ("JSON object" if "enable_thinking" not in value else "true or false") in err, err
+
 # The monitor reads plain HTTP: an https URL is told so (the client's library throws on one).
 rc, out, err = run("monitor", "https://127.0.0.1:9", "--once")
 assert rc == 1 and "only http:// URLs" in err, (rc, out, err)

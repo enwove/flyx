@@ -20,6 +20,27 @@ namespace {
 
 using namespace flyx::server;
 
+void test_chat_kwargs() {
+  flyx::ChatOptions options;
+  std::string err;
+  const flyx::ojson defaults = {{"context", {{"initial", 1}}}, {"preserve_thinking", true}, {"reasoning_effort", "medium"}};
+  flyx::ojson request = flyx::ojson::object();
+  const flyx::ojson body = {{"chat_template_kwargs", {{"enable_thinking", false}, {"context", {{"next", 2}}}}}};
+  check(read_chat_options(body, defaults, request, &options, &err) && !options.enable_thinking &&
+            options.kwargs == flyx::ojson{{"context", {{"next", 2}}}, {"preserve_thinking", true}},
+        "request kwargs replace whole values and thinking off drops the inherited effort");
+  const flyx::ojson empty = flyx::ojson::object(), none = {{"reasoning_effort", "none"}};
+  request = {{"enable_thinking", false}, {"reasoning_effort", "medium"}};
+  check(read_chat_options(empty, defaults, request, &options, &err) && !options.enable_thinking &&
+            options.kwargs["reasoning_effort"] == "medium", "an explicit request effort survives thinking off");
+  request = empty;
+  check(read_chat_options(empty, none, request, &options, &err) && !options.enable_thinking &&
+            options.kwargs["reasoning_effort"] == "none", "startup effort none selects thinking off");
+  request = {{"enable_thinking", true}};
+  check(read_chat_options(empty, none, request, &options, &err) && options.enable_thinking &&
+            !options.kwargs.contains("reasoning_effort"), "a request enabling thinking drops the inherited none");
+}
+
 httplib::Request make_req(const std::string& remote_addr, const std::string& local_addr, int local_port,
                           const std::string& host, const std::string& origin = "",
                           const std::string& sec_fetch_site = "") {
@@ -508,6 +529,7 @@ void test_remote_unc_and_device_paths() {
 
 int main() {
   flyx::test::print_passes = true;
+  test_chat_kwargs();
   test_dns_rebinding_and_lan_hosts();
   test_forwarded_and_management_policy();
   test_remote_unc_and_device_paths();

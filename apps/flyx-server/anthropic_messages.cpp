@@ -100,7 +100,7 @@ bool read_request(Server* s, const ojson& body, Request* in, std::string* err) {
                  "it)\n");
   if (!rules_from_anthropic(body, in->tools, &in->rules, err)) return false;
   if (in->rules.tools == ReplyRules::kNone) in->tools.clear();  // as if none were offered
-  bool thinking = s->cfg.thinking;
+  ojson request_kwargs = ojson::object();
   if (const auto t_it = body.find("thinking"); t_it != body.end() && !t_it->is_null()) {
     if (!t_it->is_object()) return *err = "thinking must be an object", false;
     std::string t = "enabled";
@@ -108,7 +108,7 @@ bool read_request(Server* s, const ojson& body, Request* in, std::string* err) {
       if (!ty->is_string()) return *err = "thinking.type must be a string", false;
       t = ty->get<std::string>();
     }
-    thinking = t != "disabled";
+    request_kwargs["enable_thinking"] = t != "disabled";
   }
   if (const auto oc = body.find("output_config"); oc != body.end() && oc->is_object()) {
     if (const auto ef = oc->find("effort"); ef != oc->end() && !ef->is_null()) {
@@ -116,14 +116,14 @@ bool read_request(Server* s, const ojson& body, Request* in, std::string* err) {
       const std::string effort = ef->get<std::string>();
       if (effort != "low" && effort != "medium" && effort != "high" && effort != "max")
         return *err = "output_config.effort must be low, medium, high, or max", false;
-      in->chat_options.kwargs["reasoning_effort"] = effort;
+      request_kwargs["reasoning_effort"] = effort;
     }
   }
-  in->chat_options.enable_thinking = thinking;
+  if (!read_chat_options(body, s->cfg.chat_defaults, request_kwargs, &in->chat_options, err)) return false;
   if (!read_optional_token_limit(body, "max_tokens", true, &in->gen.prefill_only, &in->gen.max_new_tokens, err))
     return false;
   if (body.contains("stop_sequences") && !read_stop(body["stop_sequences"], &in->gen.stop, err)) return false;
-  return read_sampling(body, thinking, s->cfg, &in->gen.sampling, err);
+  return read_sampling(body, in->chat_options.enable_thinking, s->cfg, &in->gen.sampling, err);
 }
 
 void handle_messages(Server* s, const httplib::Request& req, httplib::Response& res) {
@@ -147,9 +147,12 @@ void handle_messages(Server* s, const httplib::Request& req, httplib::Response& 
     return send_anthropic_error(res, 400, "output_config.format cannot be combined with an assistant message prefill");
   if (in.gen.prefill_only) {
     const auto thinking = body.find("thinking");
-    if (stream ||
-        (thinking != body.end() && thinking->is_object() && thinking->contains("type") && (*thinking)["type"] == "enabled") ||
-        in.rules.json || in.rules.tools == ReplyRules::kRequired || in.rules.tools == ReplyRules::kForced)
+    const auto kwargs = body.find("chat_template_kwargs");
+    const bool explicit_thinking = (thinking != body.end() && thinking->is_object() &&
+                                    thinking->value("type", ojson()) == "enabled") ||
+                                   (kwargs != body.end() && kwargs->contains("enable_thinking"));
+    if (stream || (explicit_thinking && in.chat_options.enable_thinking) || in.rules.json ||
+        in.rules.tools == ReplyRules::kRequired || in.rules.tools == ReplyRules::kForced)
       return send_anthropic_error(
           res, 400, "max_tokens: 0 cannot be combined with streaming, enabled thinking, an output format, or a required tool");
   }

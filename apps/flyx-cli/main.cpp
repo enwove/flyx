@@ -60,7 +60,8 @@ namespace {
 
 struct Args {
   std::string cmd, model, prompt, extra, rounds;
-  bool chat = false, think = true, ignore_eos = false, json = false;
+  bool chat = false, ignore_eos = false, json = false;
+  ChatOptions chat_options;
   int n = 256, verbose = 0;
   bool n_given = false;     // -n was on the command line (a prompt set's default is its own)
   std::string json_file;    // --json FILE: the record goes there, not to stdout
@@ -90,6 +91,7 @@ constexpr int kPromptSetMaxNew = 512;
                "  --image FILE         attach an image file to the prompt (run, repeatable; implies --chat)\n"
                "  --chat               wrap the prompt as a user message (run)\n"
                "  --no-think           disable the thinking block in chat mode\n"
+               "  --chat-template-kwargs JSON  template variables for run --chat, chat and template (JSON object)\n"
                "  -n N                 max new tokens (default 256)\n"
                "  --ignore-eos         do not stop at end-of-sequence tokens\n"
                "  --temperature T, --top-p P, --top-k K, --seed S   sampling (default: greedy)\n"
@@ -139,6 +141,8 @@ Args parse(int argc, char** argv) {
   if (asks_help(a.model)) usage(true);
   a.command.assign(argv, argv + argc);
   apps::SamplingOverrides sampling_overrides;
+  bool no_think = false;
+  ojson chat_defaults = ojson::object();
   for (int i = 3; i < argc; ++i) {
     std::string s = argv[i];
     auto next = [&]() -> std::string {
@@ -153,7 +157,12 @@ Args parse(int argc, char** argv) {
         std::fprintf(stderr, "error: cannot read %s\n", path.c_str()), std::exit(2);
     } else if (s == "--chat") a.chat = true;
     else if (s == "--image") a.images.push_back(next());
-    else if (s == "--no-think") a.think = false;
+    else if (s == "--no-think") no_think = true;
+    else if (s == "--chat-template-kwargs") {
+      if (a.cmd != "run" && a.cmd != "chat" && a.cmd != "template")
+        bad_usage("--chat-template-kwargs applies to run, chat and template");
+      chat_defaults = apps::chat_template_kwargs_flag(next());
+    }
     else if (s == "-n") a.n = apps::whole_flag("-n", next(), 0, INT_MAX), a.n_given = true;
     else if (s == "--ignore-eos") a.ignore_eos = true;
     else if (apps::sampling_flag(s, next, &sampling_overrides, true)) continue;
@@ -170,6 +179,8 @@ Args parse(int argc, char** argv) {
     else bad_usage(!s.empty() && s[0] == '-' ? "unknown option " + s : "unexpected argument '" + s + "'");
   }
   sampling_overrides.apply(&a.sampling);
+  if (no_think) chat_defaults["enable_thinking"] = false;
+  a.chat_options = apps::resolve_chat_options(chat_defaults, ojson::object());
   if (!a.images.empty() && a.cmd != "run") bad_usage("--image is only supported with 'flyx run'");
   return a;
 }
@@ -350,7 +361,7 @@ int cmd_run(const Args& a) {
   } else {
     rq.text = a.prompt;
   }
-  rq.chat_options.enable_thinking = a.think;
+  rq.chat_options = a.chat_options;
   rq.gen.max_new_tokens = a.n;
   rq.gen.ignore_eos = a.ignore_eos;
   rq.gen.sampling = a.sampling;
@@ -402,7 +413,7 @@ int cmd_chat(const Args& a) {
     msgs.push_back(msg("user", line));
     Request rq;
     rq.messages = msgs;
-    rq.chat_options.enable_thinking = a.think;
+    rq.chat_options = a.chat_options;
     rq.gen.max_new_tokens = a.n;
     rq.gen.sampling = a.sampling;
     PreparedRequest p = prepare(*e, s, rq, true);
@@ -843,10 +854,8 @@ int cmd_template(const Args& a) {
   if (!messages_from_openai(jm, &msgs, &err)) return std::fprintf(stderr, "error: %s\n", err.c_str()), 1;
   if (j.is_object() && j.contains("tools") && !tools_from_openai(j["tools"], &tools, &err))
     return std::fprintf(stderr, "error: %s\n", err.c_str()), 1;
-  ChatOptions co;
-  co.enable_thinking = a.think;
   RenderedChat rc;
-  if (!chat.render(msgs, tools, co, &rc, &err)) return std::fprintf(stderr, "error: %s\n", err.c_str()), 1;
+  if (!chat.render(msgs, tools, a.chat_options, &rc, &err)) return std::fprintf(stderr, "error: %s\n", err.c_str()), 1;
   auto ids = tok.encode(rc.text, &rc.literal);
   nlohmann::json out = {{"text", rc.text},
                         {"ids", ids},

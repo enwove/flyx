@@ -12,6 +12,16 @@
 
 namespace flyx::apps {
 
+interfaces::ojson chat_template_kwargs_flag(const std::string& value) {
+  auto kwargs = interfaces::parse_json(value);
+  std::string err;
+  if (!valid_chat_kwargs(kwargs, &err)) {
+    std::fprintf(stderr, "error: --chat-template-kwargs %s\n", err.c_str());
+    std::exit(2);
+  }
+  return kwargs;
+}
+
 void SamplingOverrides::apply(SamplingParams* sp) const {
   if (temperature) sp->temperature = *temperature;
   if (top_p) sp->top_p = *top_p;
