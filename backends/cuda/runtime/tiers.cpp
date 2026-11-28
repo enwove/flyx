@@ -232,9 +232,11 @@ namespace {
 
 // The address range of `bytes` (rounded up to the granularity) for *out, mapped by map(va) and readable and
 // writable by the device; null where the driver maps no memory, or takes none of the operations (VmmUnsupported:
-// the caller makes one allocation instead).  *out is released on any error.
+// the caller makes one allocation instead).  *out is released on any error.  `device_only`: every page is device
+// memory, so an operation the driver refuses turns pieces off for the process (vmm_supported, pieces_floor); a range
+// with host pages (expert_pages) only loses its own use, and its experts run on the CPU instead.
 template <class Map>
-void* map_range(size_t bytes, DevicePieces* out, Map&& map) {
+void* map_range(size_t bytes, DevicePieces* out, Map&& map, bool device_only = true) {
   const Vmm& v = vmm();
   out->release();
   if (!v.missing.empty() || g_vmm_fallback.load(std::memory_order_relaxed) || bytes == 0) return nullptr;
@@ -250,7 +252,7 @@ void* map_range(size_t bytes, DevicePieces* out, Map&& map) {
     access.flags = CU_MEM_ACCESS_FLAGS_PROT_READWRITE;
     piece_check(v.set_access(va, total, &access, 1), "granting the device access", total);
   } catch (const VmmUnsupported&) {
-    g_vmm_fallback.store(true, std::memory_order_relaxed);
+    if (device_only) g_vmm_fallback.store(true, std::memory_order_relaxed);
     out->release();
     return nullptr;
   } catch (...) {
@@ -318,7 +320,7 @@ void* expert_pages(size_t bytes, size_t resident, DevicePieces* out) {
       piece_check(v.map(va + offset, v.gran, 0, handle, 0), "mapping expert page", v.gran);
       out->mapped += v.gran;
     }
-  });
+  }, /*device_only=*/false);
 }
 
 bool expert_pages_supported() {
