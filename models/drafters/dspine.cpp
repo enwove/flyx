@@ -80,7 +80,6 @@ int build_dspine(Tables& T, const DSpineSpec& spec, const TargetSpec& t) {
   b.prev = T.weight(dn("draft.bridge.prev"), {R, C});
   b.gate_bias = T.weight(dn("draft.bridge.gate_bias"), {R});
   b.kv = draft_kv_state(T, spec.layers, b.n_kv, b.head_dim);
-  b.float_weights = draft_weights_beside_float(Drafter::kDSpine);
   flyx_block blk{};
   blk.kind = FLYX_BLOCK_DSPINE;
   blk.dspine = b;

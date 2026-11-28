@@ -38,6 +38,7 @@ extern "C" {
 #else
 #define FLYX_BACKEND_EXPORT __attribute__((visibility("default")))
 #endif
+#define FLYX_SEQUENTIAL_TRUNK 7 /* trained chain used as the trunk of a sequential drafter tree */
 #define FLYX_MAX_ROWS 16       /* rows in one round: the anchor plus up to 15 drafts */
 #define FLYX_DSPINE_MAX_TOPK 16 /* the head's candidates DSpine's walk scores a row, at most (ABI 51) */
 /* Rows of a round whose drafts are given (a lookup round, ABI 36), where the backend lowers such plans: a copy of

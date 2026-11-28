@@ -408,6 +408,8 @@ int main(int argc, char** argv) {
     flyx_model_desc d{};
     d.n_weights = 3;
     d.weights = ws;
+    df.draft_from = 1;
+    df.sel_rank = 16;
     d.n_blocks = 2;
     d.blocks = blocks;
     flyx_open_options opts{};

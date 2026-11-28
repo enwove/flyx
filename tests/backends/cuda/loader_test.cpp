@@ -308,7 +308,6 @@ void companion_estimates() {
   blocks[0].mlp.gate = blocks[0].mlp.up = blocks[0].mlp.down = 1;
   blocks[1].kind = FLYX_BLOCK_DSPINE;
   auto& spine = blocks[1].dspine;
-  spine.float_weights = FLYX_DRAFT_WEIGHTS_NVFP4;
   spine.fc = 2;
   spine.hidden = 64;
   spine.rank = 16;
@@ -333,6 +332,19 @@ void companion_estimates() {
   require(estimate_load(&desc, &opts, 0, 0, &est) == 0 && est.draft_weights_bytes == 2 * nvfp4 + copies &&
               est.draft_compact_savings == 0,
           "explicit NVFP4 applies to both companions");
+
+  blocks[0] = {};
+  blocks[0].kind = FLYX_BLOCK_EAGLE4;
+  auto& eagle = blocks[0].eagle4;
+  eagle.head = 1;
+  eagle.cand_down = 2;
+  eagle.cand_up = 3;
+  desc.n_blocks = 1;
+  for (auto mode : {FLYX_DRAFT_WEIGHTS_AUTO, FLYX_DRAFT_WEIGHTS_NVFP4}) {
+    opts.draft_weights = mode;
+    require(estimate_load(&desc, &opts, 0, 0, &est) == 0 && est.draft_weights_bytes == 3 * bf16 &&
+                est.draft_compact_savings == 0, "EAGLE-4 heads stay BF16 in both load estimates");
+  }
 }
 
 void expert_estimates() {

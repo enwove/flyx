@@ -111,7 +111,6 @@ int build_eagle4(Tables& T, const Eagle4Spec& spec, const TargetSpec& t) {
   ring.draft = 1;
   ring.width = H;
   b.ring = T.state(ring);
-  b.float_weights = draft_weights_beside_float(Drafter::kEagle4);
   flyx_block blk{};
   blk.kind = FLYX_BLOCK_EAGLE4;
   blk.eagle4 = b;

@@ -44,10 +44,6 @@ bool is_tapped_drafter(Drafter d);
 // A drafter whose trees beside its chains pay on attention-only targets (DSpark's, EAGLE-4's), and on a target of
 // gated delta nets too where `recurrent` (EAGLE-4's): drafted by default there.
 bool drafts_trees_by_default(Drafter d, bool recurrent);
-// What a block drafter's projections are under draft_weights=auto beside a target of float weights:
-// AUTO (the backend's own: as its file has them), Q8_0 or NVFP4, as measured to pay.
-flyx_draft_weights draft_weights_beside_float(Drafter d);
-
 // What a drafter drafts a round, as its blocks say: the most as trained, and whether its block stretches past them up
 // to a round's rows (DFlash2's block: one shared mask token every row) or drafts its block at most.
 struct DrafterReach {
