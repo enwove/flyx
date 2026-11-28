@@ -4,7 +4,7 @@
 # (q|k|v, attention out, mlp gate|up, mlp down), and, below, its Q8_0 pass rules from gpt-oss-20b; every other shape
 # and family the RTX 5090's.
 # 2026-11-25, RTX PRO 6000 Blackwell Server Edition 96 GB, 600 W, driver 620.70.06, CUDA 13.4.
-# Verified on Qwen3-8B (BF16) with DSpine at 15 drafts (docs/benchmarks.md section 6, the same answers): GSM8K 617.6 to
+# Verified on Qwen3-8B (BF16) with DSpine at 15 drafts (docs/benchmarks.md section 3, the same answers): GSM8K 617.6 to
 # 642.6 tok/s, HumanEval 490.8 to 505.0 against the RTX 5090's table.
 sku = "rtxpro6000"
 devices = ["NVIDIA RTX PRO 6000 Blackwell Server Edition"]
