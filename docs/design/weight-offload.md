@@ -47,6 +47,20 @@ Strata's Inkling hybrid dispatcher uses host-visible doorbells, CPU SIMD kernels
 
 `cuda_bench h2d` measures the pinned H2D ceiling with 4, 32 and 256 MiB transfers. Verbose streaming runs report DMA bandwidth during sampled copies, separately for prefill and rounds. Device timestamps exclude the wait for a free slot. For plain decode, multiply the logged streamed bytes per full pass by steady-state passes per second to obtain effective streaming bandwidth. For multirow prefill use the actual number of passes, including the final short pass. Compare on the same prompt, context, GPU, driver, clocks and build. Verbose hybrid runs report the wall time from enqueuing the route copies to observing their event per layer visit, including GPU work ahead of the copies.
 
+### Local decode profiles on RTX 5070 Ti
+
+Three of the six prompts decoded more slowly with a warm profile. The table shows the baseline and warm resident hit rates on `bench/prompts/moe_offload.jsonl`, with 256 output tokens per prompt and DSpark width 3. The local profile learned from 17 other prompts. These three requests routed more often to experts left on host by that profile. The base placement had already adapted to preceding prompts in the suite. The between-request policy moves at most eight page pairs per turn, so it cannot recover all of those experts before the next request.
+
+| Prompt in suite order | 71/128 hit, base to warm | Decode change | 74/128 hit, base to warm | Decode change |
+| --- | ---: | ---: | ---: | ---: |
+| Python ISO 8601 date parser (2nd) | 70.77% to 68.48% | -3.5% | 71.86% to 70.59% | -3.3% |
+| Word sequence (5th) | 91.08% to 85.78% | -3.1% | 92.11% to 86.28% | -3.3% |
+| Town records (6th) | 82.41% to 81.94% | -2.7% | 85.35% to 82.92% | -3.0% |
+
+The full Inkling-2-Mini-UD-Q2_K_XL suite improved from 113.59 to 122.84 decode tok/s at 71/128 and from 116.81 to 126.19 at 74/128 (driver 610.88, exact KV, context 4096, chunk 1024, greedy and lookup disabled). The CPU-cache explanation and the sea poem contributed the largest gains.
+
+A separate production HTTP sweep sent a 16-token Hello followed by the six prompts at 256 output tokens each. The France question received a long-form instruction so it reached the same output length. With a single GPU session reused across requests, aggregate engine decode fell from 118.06 to 111.18 tok/s at 71/128 and from 121.41 to 114.36 at 74/128. Baseline prompt-end placement continued on this single-session path and retained higher hit rates. With the default session limit, the server kept seven sessions open. The base froze placement once multiple sessions were live, and warm placement improved aggregate decode from 90.27 to 105.69 tok/s and from 91.87 to 109.20 tok/s respectively.
+
 ### Split graphs and mapped experts on RTX 5070 Ti
 
 Windows 11 build 26300, driver 610.88, RTX 5070 Ti (16,303 MiB), Ryzen 7 9800X3D (8C/16T), 32 GB DDR5-6000. The six prompts, exact K/V, 4,096-token context and reproduction command below match the v2 comparison. Prefill uses 1,024-token chunks. Decode pools prompts two through six, excluding the first generated token. Each timing process starts with idle GPU utilization. The complete placement, DSpark width, accuracy and CPU fallback tables are in [PR #70](https://github.com/enwove/flyx/pull/70).
