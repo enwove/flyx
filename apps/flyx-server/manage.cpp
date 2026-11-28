@@ -375,7 +375,7 @@ ojson repo_json(const hub::Repo& r, const apps::PathAllowFn& allow = {}) {
     if (item.cls.kind == "gguf") {
       ggufs.push_back({{"name", r.id + ":" + item.selector + rev_suffix}, {"quant", c.quant}, {"size", c.total_size},
                        {"split", c.split}, {"parts", int(c.parts.size())}, {"complete", c.complete},
-                       {"cached", item.cached}});
+                       {"cached", item.cached}, {"disk", item.cached ? ojson(item.disk) : ojson(nullptr)}});
       continue;
     }
     if (!c.complete) continue;

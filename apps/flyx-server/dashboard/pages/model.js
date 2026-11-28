@@ -95,26 +95,32 @@ function draftersOf(L) {
 // its budget (memory.ledger_budget: other programs and the reserve already out, flyx's own model going when it
 // switches), else the device's free memory less the planner's reserve (memory.device_reserve).  null when the server
 // does not say; the page computes no reserve of its own.
+// A figure the server sent (not null, absent or NaN); a measure without one of its parts is unknown, not 0.
+const known = (v) => typeof v === "number" && isFinite(v);
+// GiB of a figure that is known, 0 too ("0.0", where gib() shows "-" for none).
+const gibOf = (b) => (b / 1073741824).toFixed(b >= 1e11 ? 0 : 1);
 function modelBudget() {
   const d = live.last && live.last.device, m = live.last && live.last.memory;
-  if (m && m.ledger_budget) return { budget: m.ledger_budget, reserve: m.device_reserve };
-  if (!d || !d.mem_total || !m || typeof m.device_reserve !== "number") return null;
-  return { budget: Math.max(0, d.mem_total - (d.mem_used || 0) - m.device_reserve), reserve: m.device_reserve };
+  if (m && known(m.ledger_budget) && m.ledger_budget > 0)  // 0: a backend that keeps no ledger (cpu_ref)
+    return { budget: m.ledger_budget, reserve: known(m.device_reserve) ? m.device_reserve : null };
+  if (!d || !m || !known(d.mem_total) || d.mem_total <= 0 || !known(d.mem_used) || !known(m.device_reserve)) return null;
+  return { budget: Math.max(0, d.mem_total - d.mem_used - m.device_reserve), reserve: m.device_reserve };
 }
 // Whether a model fits the GPU.  The one served: by the engine's own bill.  Any other: only its file is known here
 // (no layout, context, drafter or projector), so the tag says it compares the file's size with the budget, nothing
-// more; the engine sizes the rest as it loads and says what it gave up.
+// more; the engine sizes the rest as it loads and says what it gave up.  The titles are sentences the languages'
+// rules know (i18n/*.js), their figures in them.
 function FitTag({ size, serving }) {
   const m = live.last && live.last.memory;
-  if (serving && m && m.ledger_budget && m.ledger_used)
-    return html`<span class="tag2 ok" title=${t("Loaded: " + gib(m.ledger_used) + " of " + gib(m.ledger_budget) + " GiB")}>${t("fits")}</span>`;
+  if (serving && m && known(m.ledger_budget) && m.ledger_budget > 0 && known(m.ledger_used) && m.ledger_used > 0)
+    return html`<span class="tag2 ok" title=${t("Loaded: " + gibOf(m.ledger_used) + " of " + gibOf(m.ledger_budget) + " GiB")}>${t("fits")}</span>`;
   const room = modelBudget();
-  if (!room || !size) return html`<span class="tag2" title=${t("The server has not said how much GPU memory a model may take.")}>?</span>`;
+  if (!room || !known(size) || size <= 0) return html`<span class="tag2" title=${t("The server has not said how much GPU memory a model may take.")}>?</span>`;
   const fits = size <= room.budget;
-  const title = "The file alone: " + gb(size) + " GB against " + gib(room.budget) + " GiB of GPU memory for a model" +
-                (typeof room.reserve === "number" ? " (after a " + gib(room.reserve) + " GiB reserve)" : "") +
+  const title = "The file alone: " + gb(size) + " GB against " + gibOf(room.budget) + " GiB of GPU memory for a model" +
+                (room.reserve !== null ? " (after a " + gibOf(room.reserve) + " GiB reserve)" : "") +
                 ". Its context, drafter and projector need more, its embedding can stay in host memory; the engine sizes them as it loads.";
-  return html`<span class=${"tag2 " + (fits ? "ok" : "bad")} title=${title}>${t(fits ? "file fits" : "file too big")}</span>`;
+  return html`<span class=${"tag2 " + (fits ? "ok" : "bad")} title=${t(title)}>${t(fits ? "file fits" : "file too big")}</span>`;
 }
 
 const kDrafterLabels = { mtp: "MTP", dflash2: "DFlash2", dflash: "DFlash", dspark: "DSpark", dspine: "DSpine", eagle4: "EAGLE-4", dv: "DV" };
@@ -739,6 +745,10 @@ export function ModelPage({ active, libraryAsked, currentAsked }) {
   }, [live.last]);
 
   const entryOf = (name) => catalog && catalog.models.find((m) => m.name === name);
+  // Whether a row (or a library entry) is the model served: its name as the load named it, or its file the one served
+  // (GET /v1/load's loaded_file), so "org/model" served is its "org/model:QUANT" row, "./m.gguf" its absolute one.
+  const isServed = (name, disk) => !!loadedWant &&
+    (name === loadedWant.model || (!!disk && typeof L.loaded_file === "string" && eqPath(disk, L.loaded_file)));
   async function removeCached(m) {
     const d = describe(m, winPaths);
     const ok = await confirmBox("Delete " + (d.quant || d.file || m.name) + "?",
@@ -1187,19 +1197,19 @@ export function ModelPage({ active, libraryAsked, currentAsked }) {
   // ---- the rows of what can be loaded, and the box that loads the one chosen ----
   // rows: {name, title, sub, tags: [[text, tone]], size, off (cannot be chosen), del (a cached model, to delete)}
   function rowsView(rows) {
-    const serving = loadedWant ? loadedWant.model : null, remembered = L.remembered ? L.remembered.model : null;
+    const remembered = L.remembered ? L.remembered.model : null;
     return rows.map((r) => html`
       <div class=${"mrow" + (r.name === target ? " sel" : "") + (r.off ? " off" : "")} data-name=${r.name} role="option" aria-selected=${String(r.name === target)}
            onClick=${r.off ? undefined : () => { setTarget(r.name === target ? "" : r.name); setMsg(""); }}>
         <span class="radio"></span>
         <div><div class="q">${r.title}</div>${r.sub ? html`<div class="fn">${r.sub}</div>` : ""}</div>
         <div class="tags">
-          ${serving && r.name === serving ? html`<span class="tag2 live">${t("serving")}</span>`
+          ${isServed(r.name, r.disk) ? html`<span class="tag2 live">${t("serving")}</span>`
             : remembered && r.name === remembered ? html`<span class="tag2">${t("last loaded")}</span>` : ""}
           ${r.tags.map(([text, tone]) => html`<span class=${"tag2 " + (tone || "")}>${t(text)}</span>`)}
         </div>
         <div class="sz">${r.size ? sized(r.size) : "-"}</div>
-        <div class="fit">${r.off ? "" : html`<${FitTag} size=${r.size} serving=${Boolean(serving && r.name === serving)}/>`}</div>
+        <div class="fit">${r.off ? "" : html`<${FitTag} size=${r.size} serving=${isServed(r.name, r.disk)}/>`}</div>
         ${r.del ? html`<button class="iconbtn del" title=${t("Delete from the Hugging Face cache")} aria-label=${t("Delete")}
                                onClick=${(e) => { e.stopPropagation(); removeCached(r.del); }}><${Icon} name="trash"/></button>` : html`<span></span>`}
       </div>`);
@@ -1289,7 +1299,7 @@ export function ModelPage({ active, libraryAsked, currentAsked }) {
     if (m.current === false) tags.push(["older revision", "info"]);
     if (m.parts > 1) tags.push([m.parts + " parts"]);
     return { name: m.name, title: d.quant || d.file || m.name, sub: d.quant ? (d.file || m.name) : "", tags, size: m.size,
-             del: m.source === "hub" ? m : null };
+             disk: m.path || null, del: m.source === "hub" ? m : null };
   };
   // `rows`: the ones shown, so a choice made elsewhere is not loaded from here.  `note`: what stands in the way.
   // `action` (optional): replaces loading with a companion action (e.g., attaching an mmproj or drafter).
@@ -1389,7 +1399,8 @@ export function ModelPage({ active, libraryAsked, currentAsked }) {
       if (!whole(g)) tags.push(["split, incomplete"]);
       if (g.cached) tags.push(["downloaded", "info"]);
       const m = entryOf(g.name);
-      return { name: g.name, title: g.quant, sub: "", tags, size: g.size, off: !whole(g), del: m && m.source === "hub" ? m : null };
+      return { name: g.name, title: g.quant, sub: "", tags, size: g.size, off: !whole(g), disk: (m && m.path) || g.disk || null,
+               del: m && m.source === "hub" ? m : null };
     }) : [];
     const rawComps = j && Array.isArray(j.companions) ? j.companions : [
       ...(j && j.mtp ? [{ name: repoSel + ":" + baseName(j.mtp.path) + revSuffix, path: j.mtp.path, file: baseName(j.mtp.path),
@@ -1613,7 +1624,7 @@ export function ModelPage({ active, libraryAsked, currentAsked }) {
           ${hubModel && d.repo && (standalone(m) || (drafter && d.quant)) ? html`<button class="btn ghost sm" id="lc-quants" onClick=${() => openHubRepo(d.repo, pinnedRev)}>${t("All its quantizations")}</button>` : ""}
           ${hubModel ? html`<button class="btn ghost sm" id="lc-delete" onClick=${() => removeCached(m)}><${Icon} name="trash"/>${t("Delete")}</button>` : ""}
         </div>
-        <div class="dchips">${chips.map(([text, tone]) => html`<span class=${"tag2 " + tone}>${text}</span>`)}${standalone(m) ? html`<${FitTag} size=${m.size} serving=${Boolean(loadedWant && m.name === loadedWant.model)}/>` : ""}</div>
+        <div class="dchips">${chips.map(([text, tone]) => html`<span class=${"tag2 " + tone}>${text}</span>`)}${standalone(m) ? html`<${FitTag} size=${m.size} serving=${isServed(m.name, m.path)}/>` : ""}</div>
         <dl class="stats small">
           <div><dt>${t("Size")}</dt><dd>${m.size ? sized(m.size) : "-"}</dd></div>
           ${m.modified ? html`<div><dt>${t("Modified")}</dt><dd>${t(ago(m.modified))}</dd></div>` : ""}

@@ -153,7 +153,8 @@ def repository(repo_spec, helper_cached=False):
             ] if runs else [],
             "info": {"downloads": 7383193, "likes": 6300, "updated": "2026-11-12T02:15:52.000Z", "license": "apache-2.0", "pipeline": None,
                      "gated": False, "architecture": "qwen35" if runs else "gemma4", "context": 262144, "parameters": 27320697856},
-            "ggufs": [{"name": repo + ":" + q + rev_sfx, "quant": q, "size": int(s * GB), "split": False, "parts": 1, "complete": True, "cached": c and runs}
+            "ggufs": [{"name": repo + ":" + q + rev_sfx, "quant": q, "size": int(s * GB), "split": False, "parts": 1, "complete": True, "cached": c and runs,
+                       "disk": CACHE + "\\" + repo.split("/")[1].replace("-GGUF", "") + "-" + q + ".gguf" if c and runs else None}
                       for q, s, c in quants]}
 
 
@@ -1205,38 +1206,66 @@ def check_nothing_served(page, server, remembered):
 def check_fit(open_page, remembered):
     """The fit tags: a file's size against the GPU memory a model may take as the server's planner counts it
     (telemetry's memory.device_reserve, or the loaded model's ledger_budget), said to be the file's alone; never a
-    model's assumed overheads, and "?" where the server does not say."""
+    model's assumed overheads, and "?" where the server does not say (a measure without one of its parts too).  The
+    model served, by whatever name it was loaded, by the engine's own bill.  The titles in the page's language."""
     def fit(page, quant):
         return page.locator('#mf-files .mrow[data-name$=":%s"] .fit .tag2' % quant)
+
+    def title_has(page, quant, *figures):  # the figures in the title, in any language's sentence
+        title = fit(page, quant).get_attribute("title")
+        assert all(f in title for f in figures), (quant, figures, title)
 
     tm = telemetry(None, remembered)
     tm["device"] = {"name": "GPU", "mem_total": 16 * 2**30, "mem_used": 2**30}
     tm["memory"] = {"sessions": [], "device_reserve": 2**29}  # 14.5 GiB (15.57 GB) for a model
     page, _ = open_page(tm)
     expect(fit(page, "IQ3_XXS")).to_have_text("file fits")  # 11.8 GB
-    expect(fit(page, "IQ3_XXS")).to_have_attribute("title", re.compile(r"The file alone: 11\.8 GB against 14\.5 GiB .*0\.5 GiB reserve"))
+    title_has(page, "IQ3_XXS", "11.8 GB", "14.5 GiB", "0.5 GiB")
     expect(fit(page, "Q4_K_M")).to_have_text("file too big")  # 17.6 GB
+    page.close()
+    # The same in another language: its words for the tag, and the title's figures in its own sentence.
+    page, _ = open_page(tm, locale="zh-CN")
+    expect(fit(page, "IQ3_XXS")).to_have_text("文件放得下")
+    expect(fit(page, "Q4_K_M")).to_have_text("文件放不下")
+    title_has(page, "IQ3_XXS", "仅按文件计", "11.8 GB", "14.5 GiB", "0.5 GiB")
     page.close()
     tm["device"]["mem_used"] = 6 * 2**30  # other programs took 5 GiB more: 9.5 GiB left
     page, _ = open_page(tm)
     expect(fit(page, "IQ3_XXS")).to_have_text("file too big")
     page.close()
+    # A reserve of 0, and a file exactly the size of what is left: fits, the reserve shown as 0.0, not as unknown.
+    tm["device"] = {"name": "GPU", "mem_total": int(11.8 * GB) + 2**30, "mem_used": 2**30}
+    tm["memory"] = {"sessions": [], "device_reserve": 0}
+    page, _ = open_page(tm)
+    expect(fit(page, "IQ3_XXS")).to_have_text("file fits")
+    title_has(page, "IQ3_XXS", "11.8 GB", "11.0 GiB", "0.0 GiB")
+    page.close()
+    for unknown in ({"mem_total": 16 * 2**30}, {"mem_total": 16 * 2**30, "mem_used": None}):  # no used bytes: not 0
+        tm["device"] = dict(unknown, name="GPU")
+        tm["memory"] = {"sessions": [], "device_reserve": 2**29}
+        page, _ = open_page(tm)
+        expect(fit(page, "IQ3_XXS")).to_have_text("?")
+        page.close()
+    tm["device"] = {"name": "GPU", "mem_total": 16 * 2**30, "mem_used": 2**30}
     tm["memory"] = {"sessions": []}  # a server that does not say its reserve: no guess at one
     page, _ = open_page(tm)
     expect(fit(page, "IQ3_XXS")).to_have_text("?")
     page.close()
-    # A model served: the others against its budget (the engine's, other programs and the reserve out); the one served
-    # by the engine's own bill.
-    served = dict(remembered, model=REPO + ":Q4_K_M")
+    # A model served, loaded by the repository's name alone: the others against its budget (the engine's, other
+    # programs and the reserve out); its own row (the file GET /v1/load says it serves) by the engine's own bill, as
+    # the one served.  11.9 GB of the 12 GB budget used: the ledger takes no more than its budget.
+    served = dict(remembered, model=REPO)
     tm = telemetry(served)
-    tm["memory"] = {"sessions": [], "ledger_budget": 12 * GB, "ledger_used": int(17.9 * GB), "device_reserve": 2**29}
+    tm["load"]["loaded_file"] = CACHE + "\\Tiny-27B-Q4_K_M.gguf"
+    tm["memory"] = {"sessions": [], "ledger_budget": 12 * GB, "ledger_used": int(11.9 * GB), "device_reserve": 2**29}
     page, _ = open_page(tm)
     view(page, "library")
     page.locator('#hf-list .prow[data-repo="%s"]' % REPO).click()
     expect(fit(page, "IQ3_XXS")).to_have_text("file fits")  # 11.8 GB of 12
     expect(fit(page, "Q5_K_M")).to_have_text("file too big")
-    expect(fit(page, "Q4_K_M")).to_have_text("fits")
-    expect(fit(page, "Q4_K_M")).to_have_attribute("title", re.compile(r"^Loaded: "))
+    expect(fit(page, "Q4_K_M")).to_have_text("fits")  # 17.6 GB on disk, served in 11.9 GB
+    title_has(page, "Q4_K_M", "11.1", "11.2 GiB")
+    expect(page.locator('#mf-files .mrow[data-name$=":Q4_K_M"] .tag2.live')).to_have_count(1)  # "serving"
     page.close()
 
 
@@ -1605,8 +1634,8 @@ def check(browser):
     want = {"model": "./models/Local [27B] & O'Brien.gguf", "ctx": 8192, "kv": "fp8", "kv_gpu": 0, "kv_ram": 4}
     errors = []
 
-    def open_page(tm, **dialog):
-        page = browser.new_page(locale="en-US")
+    def open_page(tm, locale="en-US", **dialog):
+        page = browser.new_page(locale=locale)
         page.on("pageerror", lambda error: errors.append(str(error)))
         server = Server(page, tm, **dialog)
         page.goto(ORIGIN + "/dashboard/#model")

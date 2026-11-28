@@ -787,6 +787,13 @@ ojson ModelHost::status() const {
     j["progress"] = {{"file", progress_.file}, {"done", progress_.done}, {"total", progress_.total},
                      {"bytes_per_s", progress_.bytes_per_s}, {"checking", progress_.checking}};
   if (served_.sched) j["loaded"] = want_json(last_);
+  // The file served, absolute: what a library row of it is, whatever name or path the load was given ("loaded" keeps
+  // that, for a reload).
+  if (served_.sched && !fetched_.model.empty()) {
+    std::error_code ec;
+    const fs::path file = fs::absolute(to_path(fetched_.model), ec).lexically_normal();
+    j["loaded_file"] = ec ? ojson(nullptr) : ojson(os::from_path(file));
+  }
   j["remembered"] = s.is_object() && s.contains("last") ? s["last"] : ojson(nullptr);
   return j;
 }
