@@ -6,6 +6,7 @@
 #include <cstdint>
 #include <functional>
 #include <memory>
+#include <mutex>
 #include <string>
 #include <vector>
 
@@ -72,6 +73,16 @@ struct Server {
   // The probed device's used bytes, refreshed by /v1/device/* (idle VRAM bars update after closing apps) from a
   // reading of that device alone (GpuAppSnapshot::device_unique); -1: none (0 is a reading).
   std::atomic<int64_t> probe_mem_used{-1};
+  // The GPU's live figures while no model is served (telemetry's device): the backend probe_device opened, kept
+  // loaded for the process.  The start-up probe's where it ran (no model named), else probed the first time no model
+  // is served (a model named at start, unloaded since).  Under mu: any telemetry request may be the first.
+  struct IdleDevice {
+    std::mutex mu;
+    bool tried = false;
+    const flyx_backend_api* api = nullptr;
+    std::string name;
+  };
+  mutable IdleDevice idle_device;
   RequestLog* requests = nullptr;  // the last finished requests, for GET /v1/requests
   SystemLog* logs = nullptr;       // the last lines on standard error, for GET /v1/logs
   std::vector<std::string> models_dirs{};  // canonicalized --models-dir + FLYX_MODELS_DIR roots

@@ -251,7 +251,8 @@ bool open_backend(const EngineOptions& opt, std::unique_ptr<os::DynLib>* out_lib
   return false;
 }
 
-bool probe_device(const EngineOptions& o, std::string* backend, flyx_device_info* info, std::string* err) {
+bool probe_device(const EngineOptions& o, std::string* backend, flyx_device_info* info, std::string* err,
+                  const flyx_backend_api** api_out) {
   static std::mutex mu;
   static std::unique_ptr<os::DynLib> kept;  // never unloaded: a CUDA runtime is not to be loaded twice
   std::lock_guard<std::mutex> lock(mu);
@@ -262,6 +263,7 @@ bool probe_device(const EngineOptions& o, std::string* backend, flyx_device_info
   if (!open_backend(opt, &lib, &api, info, err)) return false;
   *backend = api->name;
   if (!kept) kept = std::move(lib);
+  if (api_out) *api_out = api;
   return true;
 }
 

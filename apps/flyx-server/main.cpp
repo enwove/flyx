@@ -542,7 +542,14 @@ int run(int argc, char** argv) {
   if (model.empty()) {  // probe GPU up front so fit tags work while loading or if a remembered load fails
     std::string backend;
     flyx_device_info info{};
-    if (probe_device(start_from, &backend, &info, &err)) {
+    const flyx_backend_api* api = nullptr;
+    const bool probed = probe_device(start_from, &backend, &info, &err, &api);
+    {
+      std::lock_guard<std::mutex> lock(srv.idle_device.mu);  // the GPU's live figures while no model is served
+      srv.idle_device.tried = true;
+      if (probed) srv.idle_device.api = api, srv.idle_device.name = info.name;
+    }
+    if (probed) {
       srv.device_probe = {{"name", info.name}, {"mem_total", info.mem_total ? ojson(info.mem_total) : ojson(nullptr)},
                           {"mem_used", info.mem_total ? ojson(info.mem_total - info.mem_free) : ojson(nullptr)},
                           {"backend", backend}};

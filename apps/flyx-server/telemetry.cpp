@@ -80,6 +80,19 @@ ojson snapshot_json(const Server& s, int recent) {
     s.host->telemetry(&t);  // what the models before counted
     t.loaded = false;
     t.phase = TelemetrySnapshot::kUnloaded;
+    // The GPU's live figures all the same, from the backend the probe opened (Server::idle_device): probed here the
+    // first time no model is served if the start, naming a model, did not.
+    std::lock_guard<std::mutex> lock(s.idle_device.mu);
+    if (!s.idle_device.tried) {
+      s.idle_device.tried = true;
+      std::string backend, err;
+      flyx_device_info info{};
+      const flyx_backend_api* api = nullptr;
+      if (probe_device(s.base, &backend, &info, &err, &api)) s.idle_device.api = api, s.idle_device.name = info.name;
+    }
+    const flyx_backend_api* api = s.idle_device.api;
+    device_ok = api && api->device_stats && api->device_stats(&d) == 0;
+    if (device_ok) t.model.device = s.idle_device.name;
   }
   t.started_at = s.started_at;  // the server's, not the served model's
   const double now = os::unix_seconds();

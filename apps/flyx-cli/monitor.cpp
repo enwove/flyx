@@ -414,7 +414,8 @@ struct TermStyle {
                                            " tok/s"),
                      spark(ttft, cw, 0, kCool)});
     if (dev.is_object()) {
-      const std::string name = str(model, "device");
+      // The device's own name: the server gives its figures with no model loaded too.
+      const std::string name = !str(dev, "name").empty() ? str(dev, "name") : str(model, "device");
       const std::string short_name = name.rfind("NVIDIA GeForce ", 0) == 0 ? name.substr(15) : name;
       const std::string limits = str(dev, "clock_limits");
       tiles.push_back({"GPU load", paint(kBold, num(get(dev, "util")) + " %"),
@@ -423,8 +424,9 @@ struct TermStyle {
                        spark(vec(h.util), cw, 100, kAccent)});
       const double used = get(dev, "mem_used"), total = get(dev, "mem_total");
       tiles.push_back({"VRAM", paint(kBold, gib(used) + " / " + gib(total) + " GiB"),
-                       paint(kDim, "engine " + gib(get(t["memory"], "ledger_used")) + " of " +
-                                       gib(get(t["memory"], "ledger_budget")) + " GiB"),
+                       paint(kDim, loaded ? "engine " + gib(get(t["memory"], "ledger_used")) + " of " +
+                                                gib(get(t["memory"], "ledger_budget")) + " GiB"
+                                          : "model not loaded"),
                        bar(total > 0 ? used / total : 0, cw, kAccent)});
       const double temp = get(dev, "temp_c");
       const char* hot = temp >= 83 ? kHot : temp >= 70 ? kWarm : kAccent;
