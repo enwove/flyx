@@ -36,6 +36,7 @@ struct ModelOptions {
 class Model {
  public:
   virtual ~Model() = default;
+  virtual const char* load_note() const { return nullptr; }
   virtual const flyx_model_desc& desc() const = 0;
   // The drafters the model holds, numbered 0.. drafters - 1.
   virtual int drafters() const = 0;
@@ -106,6 +107,8 @@ class Model {
 
 // The model in a file, by its architecture, with the drafters asked for.
 // Null with *err set if the file cannot be read as a model this build knows.
+// Packed table that the loader can leave on disk, available before tokenizer and backend setup.
+const flyx_tensor_view* ple_table(const ModelFile& file);
 std::unique_ptr<Model> open_model(const ModelFile& file, const ModelOptions& o, std::string* err);
 // The architectures open_model knows, as model files name theirs, whose GGUF files it reads (a Llama: .flyx only):
 // for saying before a file is fetched whether this build runs it.

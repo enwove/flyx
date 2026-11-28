@@ -787,7 +787,7 @@ int launch_nvfp4_gu(const float* x, int ldx, const ExpertMat& W, const int* eidx
                     float situ_beta, float situ_linear_beta, bool fuse_act, float* out, int ld_out,
                     const MoeScratch* sc, const Launch& L) {
   cudaStream_t st = L.st;
-  const int N_work = fuse_act ? I : 2 * I;
+  const int N_work = fuse_act ? I : W.N;
   const bool has_sc = sc && sc->tasks && sc->n_tasks && sc->pairs && W.n_experts <= sc->max_experts &&
                       top_k <= sc->max_top_k;
   const bool vec = opts(L).moe_vec;
@@ -965,7 +965,7 @@ __global__ void __launch_bounds__(32 * kMoeWarps)
   __shared__ float sm[1][kMoeKT];
   const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
   const int col = blockIdx.x * kMoeWarps + warp;
-  const int N_work = FUSE_ACT ? I : 2 * I;
+  const int N_work = FUSE_ACT ? I : N_exp;
   const int k_slot = blockIdx.y, r = blockIdx.z;
   const int e = eidx[r * top_k + k_slot];
   const float rs = RS ? RS[e] : 1.f;
@@ -1350,7 +1350,7 @@ int moe_gate_up(const float* x, int ldx, const ExpertMat& W, const int* eidx, in
                 float situ_beta, float situ_linear_beta, bool fuse_act, float* out, int ld_out, const MoeScratch* sc,
                 const Launch& L, bool q8_ready, bf16* act_bf16) {
   cudaStream_t st = L.st;
-  const int N_work = fuse_act ? I : 2 * I;
+  const int N_work = fuse_act ? I : W.N;
   if ((q8_ready || act_bf16) && !moe_round_q8(W, rows, top_k, K, sc))
     throw std::runtime_error("moe_gate_up: pre-staged input and BF16 output require a staged Q8 round");
   if (act_bf16 && (!fuse_act || ld_out != I))

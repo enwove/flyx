@@ -39,7 +39,7 @@ MappedFile::~MappedFile() {
 }
 
 bool MappedFile::open(const std::string& path, std::string* err) {
-  fd_ = ::open(path.c_str(), O_RDONLY);
+  fd_ = ::open(path.c_str(), O_RDONLY | O_CLOEXEC);
   if (fd_ < 0) {
     *err = path + ": " + strerror(errno);
     return false;
@@ -107,15 +107,25 @@ bool RandomAccessFile::write_at(uint64_t offset, const void* data, size_t n, std
   return true;
 }
 
-bool RandomAccessFile::read_at(uint64_t offset, void* data, size_t n, std::string* err) const {
+static bool read_exact(int handle, uint64_t offset, void* data, size_t n, std::string* err) {
   auto* p = static_cast<char*>(data);
   while (n > 0) {
-    const ssize_t r = pread(int(handle_), p, n, off_t(offset));
+    const ssize_t r = pread(handle, p, n, off_t(offset));
     if (r < 0 && errno == EINTR) continue;
-    if (r <= 0) return *err = path_ + (r == 0 ? ": shorter than expected" : ": " + std::string(strerror(errno))), false;
+    if (r <= 0) return *err = (r == 0 ? "shorter than expected" : std::string(strerror(errno))), false;
     p += r, offset += uint64_t(r), n -= size_t(r);
   }
   return true;
+}
+bool RandomAccessFile::read_at(uint64_t offset, void* data, size_t n, std::string* err) const {
+  if (read_exact(int(handle_), offset, data, n, err)) return true;
+  *err = path_ + ": " + *err;
+  return false;
+}
+
+bool MappedFile::read_at(uint64_t offset, void* data, size_t n) const {
+  std::string err;
+  return offset <= size_ && n <= size_ - offset && read_exact(fd_, offset, data, n, &err);
 }
 
 FileLock::~FileLock() {

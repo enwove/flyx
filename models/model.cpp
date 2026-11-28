@@ -9,6 +9,7 @@
 #include "models/inkling2/inkling2.h"
 #include "models/llama/llama.h"
 #include "models/qwen35/qwen35.h"
+#include "models/qwen4exp/qwen4exp.h"
 
 namespace flyx::models {
 
@@ -486,10 +487,12 @@ struct ArchEntry {
   bool gguf;    // its GGUF files read too (a Llama's are not: llama.cpp's converter permutes its q and k rows)
   bool vision;  // its build opens a vision projector (--mmproj)
   const char* reads;  // a part a file may require (format 2's "requires") that the model reads, or null
+  const char* ple_table = nullptr;
 };
 
 constexpr ArchEntry kArchitectures[] = {
     {"qwen35", qwen35::open, true, true, nullptr},
+    {"qwen4exp", qwen4exp::open, true, false, nullptr, qwen4exp::kPleTable},
     {"qwen3", llama::open, true, false, "lora"},  // Llama's layer with q/k norms; their own adapters (a V-LoRA)
     {"llama", llama::open, false, false, "lora"},
     {"inkling2_loop", inkling2::open, true, false, nullptr},
@@ -548,6 +551,12 @@ std::vector<std::string> vision_architectures() {
 }  // namespace flyx::models
 
 namespace flyx::interfaces {
+
+const flyx_tensor_view* ple_table(const ModelFile& file) {
+  for (const auto& entry : models::kArchitectures)
+    if (entry.ple_table && file.arch() == entry.name) return file.tensor(entry.ple_table);
+  return nullptr;
+}
 
 std::unique_ptr<Model> open_model(const ModelFile& file, const ModelOptions& o, std::string* err) {
   return models::open(file, o, err);

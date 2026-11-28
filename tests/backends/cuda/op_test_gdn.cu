@@ -1,8 +1,205 @@
 // Copyright 2026 The flyx Authors. SPDX-License-Identifier: Apache-2.0
 // Kernel tests: gated delta nets: the round kernel, the chunked prefill recurrence, the grouped conv.
 #include "tests/backends/cuda/op_test.cuh"
+#include "ops/ple/ref.h"
+#include "ops/qsa/ref.h"
 
 namespace flyx::optest {
+
+template <class T>
+static T* upload_values(const T* values, size_t n) {
+  T* result = dev<T>(n);
+  CK(cudaMemcpy(result, values, n * sizeof(T), cudaMemcpyHostToDevice));
+  return result;
+}
+
+void test_sparse_index() {
+  constexpr int R = 13, D = 32, G = 4, Q = 2;
+  seed("sparse index", R, D);
+  Vec packed = randv(R * (Q + 1) * D), q(R * D, 0), values = randv(R * D), expected(R * D);
+  round_f16(values);
+  auto* ones = up(Vec(D, 1));
+  SparseIndex ix{D, Q, G, 2, 0, 10000.0, {}, ones, ones, 1e-6f, 0.f};
+  KvRef kv{};
+  kv.k = up_f16(q);
+  kv.v = up_f16(values);
+  float *out = dev<float>(R * D), *raw = dev<float>(R * (D + 3));
+  auto* p = params(0);
+  indexed_attention(ix, up(packed), raw, dev<float>(kIndexTile * 5), 5, dev<int>(kIndexTile * 2), up(q), kv, 1, 1, D,
+                    nullptr, 0, out, R, p, nullptr, 0);
+  for (int r = 0; r < R; ++r) {
+    const int groups = (r + 1) / G;
+    Vec nq(Q * D), pooled(D), scores(groups), weights(D, 1);
+    for (int h = 0; h < Q; ++h)
+      ops::rmsnorm(&packed[(r * (Q + 1) + h) * D], weights.data(), D, 1e-6, 0, nq.data() + h * D);
+    for (int g = 0; g < groups; ++g) {
+      std::fill(pooled.begin(), pooled.end(), 0);
+      for (int j = 0; j < G; ++j)
+        for (int d = 0; d < D; ++d) pooled[d] += packed[((g * G + j) * (Q + 1) + Q) * D + d] / G;
+      ops::rmsnorm(pooled.data(), weights.data(), D, 1e-6, 0, pooled.data());
+      scores[g] = ops::qsa_score(nq.data(), pooled.data(), Q, D);
+    }
+    const auto pos = ops::qsa_positions(scores, r + 1, G, 2 * G);
+    for (int t : pos)
+      for (int d = 0; d < D; ++d) expected[r * D + d] += values[t * D + d] / pos.size();
+  }
+  expect("sparse selected values", down(out, R * D), expected, 2e-6);
+  TreeRows tree{};
+  tree.n = 4;
+  tree.n_taken = 2;
+  tree.taken[1] = 2;
+  tree.taken[2] = 3;
+  const auto before = down(raw, R * (D + 3));
+  compact_index(raw, D + 3, p, upload_values(&tree, 1), 0);
+  const auto after = down(raw, R * (D + 3));
+  for (int r = 0; r < 3; ++r)
+    for (int d = 0; d < D; ++d)
+      if (before[tree.taken[r] * (D + 3) + d] != after[r * (D + 3) + d]) {
+        ++g_fail;
+        return;
+      }
+}
+
+void test_ple() {
+  constexpr int R = 13, H = 32, C = 2, W = H * C, S = W + 1, N = 3;
+  uint64_t m[]{3, 5, 7}, of[]{0, 23}, mod[]{23, 29};
+  const int ids[R] = {42, 43, 44, 2, 1, 6, 15, 13, 9, 4, 7, 8, 42};
+  seed("PLE", R, H, C);
+  flyx_ple_block b{};
+  b.hidden = H;
+  b.streams = C;
+  b.ngram = N;
+  b.heads_per_order = 1;
+  b.row_width = H;
+  b.eos = 9;
+  b.taps = 4;
+  b.dilation = 3;
+  b.multipliers = upload_values(m, N);
+  b.moduli = upload_values(mod, 2);
+  b.offsets = upload_values(of, 2);
+  PleWindow w{dev<float>(FLYX_ROUND_SLOTS * 9 * S), dev<float>(kGdnReplaySlots * R * S), 9 * S, R * S};
+  auto* tokens = upload_values(ids, R);
+  auto* keys = dev<int>(R * 2);
+  auto* p = params(0);
+  ple_hash(b, w, tokens, keys, R, p, nullptr, 0);
+  int hits[R * 2];
+  CK(cudaMemcpy(hits, keys, sizeof hits, cudaMemcpyDeviceToHost));
+  b.multipliers = m;
+  b.moduli = mod;
+  b.offsets = of;
+  Vec embed = randv(52 * H), gather(R * 2 * H);
+  for (int r = 0; r < R; ++r) {
+    int prior[2] = {r ? ids[r - 1] : 9, r > 1 ? ids[r - 2] : 9}, want[2];
+    ops::ple_indices(ids[r], prior, std::min(r, 2), b, want);
+    for (int j = 0; j < 2; ++j) {
+      if (want[j] != hits[2 * r + j]) ++g_fail;
+      std::copy_n(embed.data() + want[j] * H, H, gather.data() + (2 * r + j) * H);
+    }
+  }
+  auto* emb = dev<float>(gather.size());
+  ple_decode(reinterpret_cast<uint8_t*>(up(embed)), H * sizeof(float), FLYX_DT_F32, H, keys, R * 2, emb, 0);
+  expect("packed PLE gather", down(emb, gather.size()), gather, 1e-7);
+  for (const int dtype : {FLYX_DT_BF16, FLYX_DT_F16, FLYX_DT_GGML_Q8_0,
+                          FLYX_DT_GGML_Q5_0, FLYX_DT_GGML_Q4_0}) {
+    const int block = flyx_block_bytes(dtype), stride = block ? block : 2 * H;
+    std::vector<uint8_t> payload(52 * stride), staged(2 * R * stride);
+    for (int i = 0; i < 52; ++i) {
+      uint8_t *row = payload.data() + i * stride;
+      for (int j = 0; j < stride; ++j)
+        row[j] = uint8_t(17 * i + 31 * j);
+      for (int j = 0; j < (block ? 1 : H); ++j)
+        row[2 * j + 1] = uint8_t(0x38 + (j + i) % 8);
+    }
+    flyx_tensor_view source{};
+    source.dtype = dtype;
+    source.data = payload.data();
+    for (int i = 0; i < 2 * R; ++i) {
+      std::copy_n(payload.data() + hits[i] * stride, stride,
+                  staged.data() + i * stride);
+      for (int j = 0; j < H; ++j)
+        gather[i * H + j] = ops::load(&source, hits[i] * H + j);
+    }
+    ple_decode(upload_values(payload.data(), payload.size()), stride, dtype, H,
+               keys, 2 * R, emb, 0);
+    const auto resident = down(emb, gather.size());
+    ple_decode(upload_values(staged.data(), staged.size()), stride, dtype, H,
+               nullptr, 2 * R, emb, 0);
+    if (resident != down(emb, gather.size()) || resident != gather)
+      ++g_fail;
+  }
+  Vec k = randv(R * W), q = randv(R * W), v = randv(R * H), branch(R * W), u = randv(R * S), cw = randv(W * 4),
+      wide(R * W);
+  auto* y = dev<float>(R * W);
+  ple_gates(up(k), up(q), up(v), H, C, R, y, 0);
+  for (int r = 0; r < R; ++r)
+    for (int c = 0; c < C; ++c) {
+      const int at = (r * C + c) * H;
+      const double gate = ops::ple_gate(k.data() + at, q.data() + at, H);
+      for (int j = 0; j < H; ++j) branch[at + j] = v[r * H + j] * gate;
+    }
+  expect("PLE gate", down(y, branch.size()), branch, 2e-6);
+  auto* output = dev<float>(wide.size());
+  ple_convolve(b, w, up(cw), y, up(u), output, tokens, R, p, nullptr, true, -1, -1, -1, 0);
+  for (int r = 0; r < R; ++r)
+    for (int d = 0; d < W; ++d) {
+      double a = 0;
+      for (int j = 0; j < 4; ++j)
+        if (r >= 9 - 3 * j) a += cw[4 * d + j] * u[(r - 9 + 3 * j) * S + d];
+      wide[r * W + d] = branch[r * W + d] + ops::silu(a);
+    }
+  expect("PLE convolution", down(output, wide.size()), wide, 3e-6);
+  TreeRows tree{};
+  tree.n = 4;
+  tree.n_taken = 2;
+  tree.taken[1] = 2;
+  tree.taken[2] = 3;
+  ple_compact(w, S, p, upload_values(&tree, 1), 0);
+  const auto compacted = down(w.replay, 3 * S);
+  for (int r = 0; r < 3; ++r)
+    for (int d = 0; d < W; ++d)
+      if (float(u[tree.taken[r] * S + d]) != compacted[r * S + d]) {
+        ++g_fail;
+        return;
+      }
+}
+
+void test_hc() {
+  constexpr int R = 3, C = 4, H = 32;
+  seed("hyper connection", R, C, H);
+  Vec x = randv(R * H), u = randv(R * C * H), a = randv(R * C * H), j = randv(R * C), router = randv(H);
+  auto* dx = up(x);
+  auto* dw = dev<float>(u.size());
+  auto* du = up(u);
+  auto* da = up(a);
+  auto* dj = up(j);
+  Vec wide(u.size()), mixed(x.size(), 0);
+  for (int r = 0; r < R; ++r)
+    for (int c = 0; c < C; ++c)
+      for (int i = 0; i < H; ++i) {
+        const size_t k = (r * C + c) * H + i;
+        wide[k] = x[r * H + i];
+        mixed[r * H + i] += u[k] * ops::sigmoid(a[k]) / C;
+      }
+  hc_rows(FLYX_HC_EXPAND, dx, dw, nullptr, nullptr, nullptr, R, C, H, 0);
+  expect("expand", down(dw, wide.size()), wide, 1e-7);
+  hc_rows(FLYX_HC_MIX, dx, dw, du, dj, da, R, C, H, 0);
+  expect("mix", down(dx, x.size()), mixed, 1e-6);
+  hc_rows(FLYX_HC_SCATTER, dx, dw, nullptr, dj, nullptr, R, C, H, 0);
+  for (int r = 0; r < R; ++r)
+    for (int c = 0; c < C; ++c)
+      for (int i = 0; i < H; ++i) wide[(r * C + c) * H + i] += 2 * ops::sigmoid(j[r * C + c] / C) * mixed[r * H + i];
+  expect("scatter", down(dw, wide.size()), wide, 1e-6);
+  hc_down_silu(du, u.size(), C, 0);
+  for (auto& v : u) v = ops::silu(v / C);
+  expect("scaled SiLU", down(du, u.size()), u, 1e-6);
+  shared_expert_add(dx, up(x), up(router), da, R, H, 0);
+  for (int r = 0; r < R; ++r) {
+    double v = 0;
+    for (int i = 0; i < H; ++i) v += x[r * H + i] * router[i];
+    for (int i = 0; i < H; ++i) mixed[r * H + i] += ops::sigmoid(v) * a[r * H + i];
+  }
+  expect("shared expert gate", down(dx, mixed.size()), mixed, 1e-6);
+}
 
 void test_gdn(const GdnDims d, const int rows, const double tol) {
   std::printf("gated delta net (dk %d, dv %d, %d rows)\n", d.dk, d.dv, rows);
@@ -34,7 +231,10 @@ void test_gdn(const GdnDims d, const int rows, const double tol) {
       ops::gdn_row(&S[size_t(h) * d.dv * d.dk], &conv[kh * d.dk], &conv[kd + kh * d.dk], &conv[2 * kd + h * d.dv], beta, g,
                    d.dk, d.dv, o.data());
       ops::rmsnorm(o.data(), gw.data(), d.dv, 1e-6, 0.0, on.data());
-      for (int j = 0; j < d.dv; ++j) y[size_t(r) * vd + h * d.dv + j] = on[j] * ops::silu(proj[size_t(r) * ld + C + h * d.dv + j]);
+      for (int j = 0; j < d.dv; ++j) {
+        const double z = proj[size_t(r) * ld + C + h * d.dv + j];
+        y[size_t(r) * vd + h * d.dv + j] = on[j] * (d.sigmoid_output ? ops::sigmoid(z) : ops::silu(z));
+      }
     }
   }
   // device: slot 1 holds the start state; rounds read it (round = 1).

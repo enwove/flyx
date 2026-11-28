@@ -684,6 +684,22 @@ int open_model(const flyx_model_desc* desc, const flyx_open_options* opts, flyx_
     }
     if (!resolve_options(opts ? opts->options : nullptr, &m->opt, &err)) return fail("options: " + err);
     if (!nvfp4_inputs(*desc, &m->opt.kernels.prefill_fp4, &err)) return fail(err);
+    for (int i = 0; i < desc->n_blocks; ++i)
+      if (desc->blocks[i].kind == FLYX_BLOCK_PLE) {
+        m->ple_placement = opts ? opts->ple_placement : FLYX_PLE_AUTO;
+        if (m->ple_placement == FLYX_PLE_AUTO) {
+          size_t free_b = 0, total_b = 0;
+          if (!gpu_memory(&free_b, &total_b) && cudaMemGetInfo(&free_b, &total_b) != cudaSuccess) {
+            cudaGetLastError();
+            free_b = total_b = 0;
+          }
+          flyx_load_estimate estimate{};
+          if (estimate_load(desc, opts, free_b, total_b, &estimate)) return -1;
+          m->ple_placement = estimate.ple_placement;
+        }
+        m->ple_hot_bytes = opts ? opts->ple_hot_bytes : 0;
+        break;
+      }
     if (m->opt.embed == 0) {
       // embed=auto: host memory frees the table's GPU memory for a few kilobytes of reads a token; where 32 GB stay
       // free after the weights the memory is not missed, and a prefill pass reads its rows faster on the GPU (the

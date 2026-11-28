@@ -90,6 +90,8 @@ inline int eagle4_tree_cands(int beam, int vocab) { return std::max(beam, std::m
 void gdn_layer(const Pass& ps, const GdnBlock& g, bool fused = false);
 void attn_layer(const Pass& ps, const AttnBlock& a, bool fused = false);
 void rel_attn_layer(const Pass& ps, const RelAttnBlock& a, bool fused = false);
+void ple_layer(const Pass& ps, const PleBlock& b);
+void hc_layer(const Pass& ps, const HcBlock& hc);
 void moe_layer(const Pass& ps, const MoeBlock& f, bool fused = false);
 void flush_pending_post_conv(const Pass& ps, bool require_in_x = true);
 void dspark_draft(flyx_seq* s, const DSparkBlock& b, int width, const Launch& L, bool fused = false, int start = 0,

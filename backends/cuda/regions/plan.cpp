@@ -206,7 +206,7 @@ const Block* block_of(const flyx_bmodel* m, const flyx_node& n, std::string* err
              std::holds_alternative<HeadBlock>(*b) || std::holds_alternative<VisionStemBlock>(*b) ||
              std::holds_alternative<VitAttnBlock>(*b) || std::holds_alternative<VitMlpBlock>(*b) ||
              std::holds_alternative<VisionMergeBlock>(*b) || std::holds_alternative<RelAttnBlock>(*b) ||
-             std::holds_alternative<MoeBlock>(*b);
+             std::holds_alternative<MoeBlock>(*b) || std::holds_alternative<HcBlock>(*b) || std::holds_alternative<PleBlock>(*b);
       break;
     case FLYX_NODE_TAP: {
       if (const auto* d = std::get_if<DFlashBlock>(b)) fits = n.arg0 >= 0 && n.arg0 < d->n_taps;
@@ -459,6 +459,10 @@ void run_node(const Pass& ps, const flyx_node& n, const Block* b) {
             if (residual16_pass(ps)) round_rows_bf16(rv.b.x, e->hidden, e->hidden, ps.rows, st);
           }
         }
+      } else if (const auto* hc = std::get_if<HcBlock>(b)) {
+        hc_layer(ps, *hc);
+      } else if (const auto* p = std::get_if<PleBlock>(b)) {
+        ple_layer(ps, *p);
       } else if (const auto* g = std::get_if<GdnBlock>(b)) {
         gdn_layer(ps, *g);
       } else if (const auto* a = std::get_if<AttnBlock>(b)) {

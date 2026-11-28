@@ -74,6 +74,7 @@ std::string last_error(DWORD code = GetLastError()) {
 
 MappedFile::~MappedFile() {
   if (data_) UnmapViewOfFile(data_);
+  if (handle_ != -1) CloseHandle(reinterpret_cast<HANDLE>(handle_));
 }
 
 bool MappedFile::open(const std::string& path, std::string* err) {
@@ -90,7 +91,7 @@ bool MappedFile::open(const std::string& path, std::string* err) {
     return false;
   }
   HANDLE m = CreateFileMappingW(f, nullptr, PAGE_READONLY, 0, 0, nullptr);
-  CloseHandle(f);  // the mapping holds the file
+  handle_ = reinterpret_cast<intptr_t>(f);  // also serves positioned reads of packed rows
   if (!m) {
     *err = path + ": CreateFileMapping failed: " + last_error();
     return false;
@@ -159,20 +160,30 @@ bool RandomAccessFile::write_at(uint64_t offset, const void* data, size_t n, std
   return true;
 }
 
-bool RandomAccessFile::read_at(uint64_t offset, void* data, size_t n, std::string* err) const {
+static bool read_exact(HANDLE handle, uint64_t offset, void* data, size_t n, std::string* err) {
   auto* p = static_cast<char*>(data);
   while (n > 0) {
     OVERLAPPED at{};
     at.Offset = DWORD(offset), at.OffsetHigh = DWORD(offset >> 32);
     DWORD r = 0;
     const DWORD want = DWORD(std::min<size_t>(n, 1u << 30));
-    if (!ReadFile(reinterpret_cast<HANDLE>(handle_), p, want, &r, &at))
-      return *err = path_ + ": " + last_error(), false;
+    if (!ReadFile(handle, p, want, &r, &at))
+      return *err = last_error(), false;
     if (r == 0)
-      return *err = path_ + ": shorter than expected", false;
+      return *err = "shorter than expected", false;
     p += r, offset += r, n -= r;
   }
   return true;
+}
+bool RandomAccessFile::read_at(uint64_t offset, void* data, size_t n, std::string* err) const {
+  if (read_exact(reinterpret_cast<HANDLE>(handle_), offset, data, n, err)) return true;
+  *err = path_ + ": " + *err;
+  return false;
+}
+
+bool MappedFile::read_at(uint64_t offset, void* data, size_t n) const {
+  std::string err;
+  return offset <= size_ && n <= size_ - offset && read_exact(reinterpret_cast<HANDLE>(handle_), offset, data, n, &err);
 }
 
 FileLock::~FileLock() {

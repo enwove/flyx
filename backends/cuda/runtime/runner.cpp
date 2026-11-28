@@ -12,6 +12,7 @@
 
 #include "backends/common/snapshot_format.h"
 #include "backends/cuda/backend.h"
+#include "backends/cuda/runtime/ple_io.h"
 #include "backends/cuda/runtime/strata_snapshot.h"
 #include "backends/cuda/runtime/window_ring.h"
 
@@ -285,6 +286,8 @@ void reset_state(flyx_seq* s, int anchor) {
   s->ring_hi = 0;  // the rings are written again from position 0, in order
   s->dring.reset();
   set_params(s, 0, anchor, 0);
+  s->want_snap = -1;
+  s->ple_failed.store(false, std::memory_order_release);
 }
 
 namespace {
@@ -339,7 +342,6 @@ void set_drafts(flyx_seq* s, const flyx_gen_params* g) {
   int len = s->test_oracle_len;
   if (given) {
     const int n = std::min(g->n_drafts, s->m->wide_rows - 1);
-    if (g->drafts_at < 0 || g->drafts_at + n > s->oracle_cap) throw std::runtime_error("drafts outside the context");
     std::memcpy(slot, g->drafts, sizeof(int) * size_t(n));
     CK(cudaMemcpyAsync(s->oracle + g->drafts_at, slot, sizeof(int) * size_t(n), cudaMemcpyHostToDevice, s->st));
     len = g->drafts_at + n;
@@ -385,7 +387,6 @@ void set_tree(flyx_seq* s, const flyx_plan* p, const flyx_gen_params* g) {
   for (int r = 1; r < rows; ++r) {
     const int i = r - 1;  // the row's draft
     const int parent = g->parents && g->drafts && i < g->n_drafts ? g->parents[i] + 1 : r - 1;
-    if (parent < 0 || parent >= r) throw std::runtime_error("tree: a draft's parent must come before it");
     t->depth[r] = t->depth[parent] + 1;
     for (int d = 0; d < t->depth[parent] + 1; ++d) t->path[r][d] = t->path[parent][d];
     t->path[r][t->depth[r]] = static_cast<unsigned char>(r);
@@ -401,9 +402,18 @@ bool certified(const flyx_seq* s, const flyx_gen_params* g) {
   return s->cert.cols && g->temperature <= 0.f && !g->mask && !penalized(g) && !relaxed(g);  // relaxed: every score
 }
 
-void check_idle(flyx_seq* s) {
+void check_ple_io(flyx_seq* s) {
+  if (drain_failed_ple(s, sync_stream)) throw std::runtime_error("PLE packed row read failed");
+}
+
+void check_idle(flyx_seq* s, bool recover = false) {
+  if (recover && !s->pending.empty() && !s->ple_stages.empty())
+    sync_stream(s);  // the callback may not have reported its failure yet
+  if (recover) drain_failed_ple(s, sync_stream);
+  else check_ple_io(s);
   if (!s->pending.empty()) throw std::runtime_error("rounds still in flight");
   sync_stream(s);
+  if (!recover) check_ple_io(s);
 }
 
 int prefill_ex(flyx_plan* p, flyx_seq* s, const flyx_prefill_input* in, const flyx_gen_params* sample) {
@@ -521,7 +531,11 @@ int prefill_ex(flyx_plan* p, flyx_seq* s, const flyx_prefill_input* in, const fl
     const int rewind_from = s->rewind_floor();
     for (auto& mt : s->meta)
       if (mt.valid && mt.start + mt.rows < rewind_from) mt.valid = false;
-    if (in->n_embeds > 0 || in->pos_3d || in->set_rope_delta) sync_stream(s);
+    if (in->n_embeds > 0 || in->pos_3d || in->set_rope_delta || !s->ple_stages.empty()) sync_stream(s);
+    if (s->ple_failed.load(std::memory_order_acquire)) {
+      s->position -= n;  // restore may still use a checkpoint ending before this pass
+      check_ple_io(s);
+    }
     CK(cudaGetLastError());
     return 0;
   });
@@ -1550,14 +1564,31 @@ GraphSize round_graph_size(flyx_plan* p, flyx_seq* s) {
   }
 }
 
-int launch(flyx_plan* p, flyx_seq* s, const flyx_gen_params* g) {
+static int validate_round(flyx_plan* p, flyx_seq* s, const flyx_gen_params* g) {
   if (!s) return no_sequence("launch");
+  if (!p || !g || p->m != s->m) return fail("launch: missing inputs or plan belongs to another model");
   if (p->phase != FLYX_PHASE_ROUND) return fail("not a round plan");
   const int rows = p->width + 1;
   // A wide round's strata attention goes 16 rows at a time as a chain's rows (shift_params): a tree's rows past 16
   // read every position exactly.
   if (rows > FLYX_MAX_ROWS && p->tree && s->strata_phase(rows) != kStrataNone)
     return fail("a tree round of more than " + std::to_string(FLYX_MAX_ROWS) + " rows reads no strata copy");
+  if (g->drafts && g->n_drafts > 0) {
+    const int n = std::min(g->n_drafts, s->m->wide_rows - 1);
+    if (g->drafts_at < 0 || g->drafts_at > s->oracle_cap - n) return fail("drafts outside the context");
+    if (p->tree && !p->drafted_tree && g->parents)
+      for (int i = 0; i < std::min(g->n_drafts, p->width); ++i)
+        if (g->parents[i] < -1 || g->parents[i] >= i) return fail("tree: a draft's parent must come before it");
+  }
+  return guarded([&] {
+    check_ple_io(s);
+    return 0;
+  });
+}
+
+// A callback that fails after preflight is observed by ready/read, including when more
+// than one valid round has already been submitted. Do not recheck the latch mid-batch.
+static int submit_round(flyx_plan* p, flyx_seq* s, const flyx_gen_params* g) {
   s->snap_pos = -1;  // rounds write the round slots
   return guarded([&] {
     // Hold prefill_mu across submission when sharing the VMM prefill slab so another session cannot evict
@@ -1659,6 +1690,11 @@ int launch(flyx_plan* p, flyx_seq* s, const flyx_gen_params* g) {
   });
 }
 
+int launch(flyx_plan* p, flyx_seq* s, const flyx_gen_params* g) {
+  if (const int rc = validate_round(p, s, g)) return rc;
+  return submit_round(p, s, g);
+}
+
 // ---- rounds of several sequences ---------------------------------------------------------------------
 namespace {
 
@@ -1706,24 +1742,24 @@ RowView slice(const RowView& v, const flyx_bmodel* m, int first) {
 int launch_batch(flyx_plan* const* plans, flyx_seq* const* seqs, const flyx_gen_params* const* gens,
                  int32_t n) {
   if (n < 1) return fail("launch_batch: no sequences");
-  for (int i = 0; i < n; ++i)
-    if (!seqs[i]) return no_sequence("launch_batch");
+  if (!plans || !seqs || !gens) return fail("launch_batch: missing inputs");
   if (n == 1) return launch(plans[0], seqs[0], gens[0]);
+  if (!seqs[0]) return no_sequence("launch_batch");
   flyx_bmodel* m = seqs[0]->m;
-  if (m->need.max_bank > 0 || m->dspark_block >= 0) {
-    for (int i = 0; i < n; ++i)
-      if (const int r = launch(plans[i], seqs[i], gens[i]); r != 0) return r;
-    return 0;
-  }
+  auto validate = [&](int i) {
+    if (!seqs[i] || seqs[i]->m != m) return fail("launch_batch: sequences of different models");
+    for (int j = 0; j < i; ++j)
+      if (seqs[j] == seqs[i]) return fail("launch_batch: a sequence twice");
+    return validate_round(plans[i], seqs[i], gens[i]);
+  };
+  if (m->need.max_bank > 0 || m->need.hc_streams > 0 || m->dspark_block >= 0)
+    return launch_serial_batch(n, validate, [&](int i) { return submit_round(plans[i], seqs[i], gens[i]); });
   int rows = 0;
   for (int i = 0; i < n; ++i) {
-    if (plans[i]->phase != FLYX_PHASE_ROUND || plans[i]->m != m || seqs[i]->m != m)
-      return fail("launch_batch: round plans of the sequences' model");
+    if (const int rc = validate(i)) return rc;
     if (!same_target(plans[0], plans[i])) return fail("launch_batch: plans that run different target nodes");
     if (plans[i]->tree || plans[i]->adaptive() || relaxed(gens[i]))
       return fail("launch_batch: tree, adaptive, and relaxed rounds run alone");
-    for (int j = 0; j < i; ++j)
-      if (seqs[j] == seqs[i]) return fail("launch_batch: a sequence twice");
     rows += plans[i]->width + 1;
   }
   if (rows > FLYX_MAX_ROWS) return fail("launch_batch: more than FLYX_MAX_ROWS rows");
@@ -1867,8 +1903,9 @@ int launch_batch(flyx_plan* const* plans, flyx_seq* const* seqs, const flyx_gen_
 
 int read_result(flyx_seq* s, flyx_round_result* out) {
   if (!s) return no_sequence("read");
-  if (s->pending.empty()) return fail("no round in flight");
   return guarded([&] {
+    check_ple_io(s);
+    if (s->pending.empty()) return fail("no round in flight");
     const unsigned long long seq = s->read_no + 1;
     if (s->pending.front().kind == 'R')
       wait_round(s, s->ev[seq % kRing]);
@@ -1876,6 +1913,7 @@ int read_result(flyx_seq* s, flyx_round_result* out) {
       CK(cudaEventSynchronize(s->ev[seq % kRing]));
     else
       poll_event(s->ev[seq % kRing], 0);
+    check_ple_io(s);
     *out = s->ring_host[seq % kRing];
     if (out->seq_no != seq) return fail("ring entry out of order (" + std::to_string(out->seq_no) + ")");
     s->read_no = seq;
@@ -1909,6 +1947,7 @@ int read_logits(flyx_seq* s, int32_t row, float* out) {
     return fail("logits: the certified head scores only the rows it must (backend option head_cert=0)");
   return guarded([&] {
     sync_stream(s);
+    check_ple_io(s);
     CK(cudaMemcpy(out, s->logits + size_t(row) * s->m->vocab, sizeof(float) * size_t(s->m->vocab),
                   cudaMemcpyDeviceToHost));
     return 0;
@@ -1926,6 +1965,7 @@ int ready(flyx_seq* s) {
       CK(cudaEventRecord(s->idle_ev, s->st));
       r = cudaEventQuery(s->idle_ev);
     }
+    check_ple_io(s);
     if (r == cudaErrorNotReady) return 0;
     CK(r);
     return 1;
@@ -1962,7 +2002,12 @@ int set_reply(flyx_seq* s, const int32_t* tokens, int32_t n) {
 int rewind(flyx_seq* s, int32_t pos, int32_t anchor) {
   if (!s) return no_sequence("rewind");
   return guarded([&] {
-    check_idle(s);
+    check_idle(s, true);
+    if (s->ple_failed.load(std::memory_order_acquire)) {
+      for (auto& ck : s->ckp) ck.valid = false;
+      reset_state(s, anchor);
+      return int(pos == 0);
+    }
     if (pos > s->position) return fail("cannot rewind forward");
     if (pos == 0) {
       reset_state(s, anchor);  // a failed snapshot load may have written state before advancing the position
@@ -2056,7 +2101,12 @@ int restore(flyx_seq* s, int32_t c, int32_t anchor) {
   // The checkpoint keeps no drafter window of its own: what the ring held of it, a later position overwrote.
   if (!s->dring.kept(c)) return fail("restore: the drafter's window of that checkpoint is no longer in its ring");
   return guarded([&] {
-    check_idle(s);
+    check_idle(s, true);
+    const bool failed = s->ple_failed.load(std::memory_order_acquire);
+    // Older exact K/V positions survive failed appends. An unread round can wrap a drafter window
+    // before its overwrite reaches host bookkeeping, so that layout requires a full snapshot or reset.
+    if (failed && (s->dring.slots() || s->ckp[c].pos > s->position))
+      return fail("PLE recovery requires a full snapshot or rewind to zero");
     copy_checkpoint_state(s, c, flyx_round_slot(s->round), s->ckp[c].pos, false);
     for (auto& mt : s->meta) mt = {};
     s->rope_delta = s->ckp[c].rope_delta;
@@ -2067,6 +2117,11 @@ int restore(flyx_seq* s, int32_t c, int32_t anchor) {
     set_params(s, s->ckp[c].pos, anchor, s->round);
     s->dring.restored(c);
     s->reload_page_ring(s->position);
+    if (failed) {
+      for (auto& ck : s->ckp)
+        if (ck.pos > s->position) ck.valid = false;
+      s->ple_failed.store(false, std::memory_order_release);
+    }
     return s->position;
   });
 }
@@ -2119,12 +2174,14 @@ uint64_t layout_hash(const flyx_seq* s) {
       mix(uint64_t(sc.channels));
     }
   }
+  for (int w : m->states.index_width) mix((uint64_t(w) << 32) | 0x515341);
   mix(uint64_t(m->states.ring_width));
   return h;
 }
 
 uint64_t snapshot_size(const flyx_seq* s, int begin, int pos) {
   uint64_t n = sizeof(SnapshotHeader);
+  for (int w : s->m->states.index_width) n += uint64_t(pos - begin) * w * sizeof(float);
   for (size_t i = 0; i < s->m->states.kv.size(); ++i) {
     const KvSpec& k = s->m->states.kv[i];
     const KvBuf& b = s->kv[i];
@@ -2151,6 +2208,10 @@ void snapshot_parts(flyx_seq* s, int c, int begin, int pos, HostCursor& host, bo
                          len, cudaMemcpyDefault, s->st));
     });
   };
+  for (size_t i = 0; i < s->index_keys.size(); ++i) {
+    const size_t w = s->m->states.index_width[i];
+    copy(s->index_keys[i] + size_t(begin) * w, size_t(pos - begin) * w * sizeof(float));
+  }
   bool host_synced = false;
   for (size_t i = 0; i < s->kv.size(); ++i) {
     const KvSpec& k = s->m->states.kv[i];
@@ -2301,7 +2362,7 @@ int snapshot_load(flyx_seq* s, const flyx_host_pieces* src, uint64_t bytes, int3
           [&](int begin, int pos) { return snapshot_size(s, begin, pos); }, &h, &err))
     return fail(err);
   return guarded([&] {
-    check_idle(s);
+    check_idle(s, h.begin == 0);
     HostCursor host{src, sizeof h};
     s->copy_home(false);  // the copy loaded to its host home, every position changed
     s->dring.replacing();  // a ring's every slot
@@ -2315,6 +2376,9 @@ int snapshot_load(flyx_seq* s, const flyx_host_pieces* src, uint64_t bytes, int3
     set_params(s, h.pos, anchor, s->round);
     s->dring.loaded(h.pos);
     sync_stream(s);  // the bytes are the caller's
+    if (s->ple_failed.exchange(false)) {
+      for (auto& ck : s->ckp) ck.valid = false;
+    }
     return s->position;
   });
 }

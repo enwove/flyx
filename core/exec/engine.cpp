@@ -78,10 +78,14 @@ bool set_kv_method(const EngineOptions& opt, plan::KvTiers* tiers, std::string* 
 // in the memory available, so that reading ahead does not push out what the upload has yet to read.
 class ReadAhead {
  public:
-  explicit ReadAhead(const ModelFile& file) : available_(os::system_memory().available) {
-    if (available_ && file.bytes() < available_) thread_ = std::thread([this, &file] { file.read_ahead(stop_); });
+  void start(const ModelFile& file) {
+    if (!thread_.joinable() && available_ && file.bytes() < available_) {
+      stop_ = false;
+      thread_ = std::thread([this, &file] { file.read_ahead(stop_); });
+    }
   }
-  ~ReadAhead() {
+  ~ReadAhead() { stop(); }
+  void stop() {
     stop_ = true;
     if (thread_.joinable()) thread_.join();
   }
@@ -91,7 +95,7 @@ class ReadAhead {
   }
 
  private:
-  const uint64_t available_;
+  const uint64_t available_ = os::system_memory().available;
   std::atomic<bool> stop_{false};
   std::thread thread_;
 };
@@ -643,7 +647,9 @@ bool Engine::load(const std::string& path, const EngineOptions& opt, std::string
     return false;
   if (opt_.vision && !opt_.mmproj_file.empty())
     if (!file_.add(opt_.mmproj_file, err, opt_.allow_path, ModelFile::CompanionRole::Projector)) return false;
-  ReadAhead ahead(file_);  // until the load returns
+  const auto* ple = interfaces::ple_table(file_);
+  ReadAhead ahead;
+  if (!ple) ahead.start(file_);
   t[1] = os::now_ms();
   if (!tok_.load(file_, err)) return false;
   // Chat: a file without a usable template still runs raw prompts; a template
@@ -683,6 +689,24 @@ bool Engine::load(const std::string& path, const EngineOptions& opt, std::string
     clean_backend_opts = interfaces::backend_opt_strip(clean_backend_opts, key);
   }
 
+  for (const char* key : {"ple", "ple_hot_mb"}) {
+    const auto value = interfaces::backend_opt_get(clean_backend_opts, key);
+    if (value.empty()) continue;
+    if (std::string_view(key) == "ple") {
+      if (!interfaces::parse_ple_placement(value, &opt_.ple_placement, err)) return false;
+    } else {
+      int mib = 0;
+      const char* end = value.data() + value.size();
+      const auto parsed = std::from_chars(value.data(), end, mib);
+      if (parsed.ec != std::errc{} || parsed.ptr != end || mib < 0) {
+        *err = "ple_hot_mb requires a nonnegative integer MiB count";
+        return false;
+      }
+      opt_.ple_hot_bytes = uint64_t(mib) << 20;
+    }
+    clean_backend_opts = interfaces::backend_opt_strip(clean_backend_opts, key);
+  }
+
   interfaces::ModelOptions mo;
   mo.drafter = opt_.drafter;
   mo.speculative = opt_.speculative;
@@ -691,6 +715,7 @@ bool Engine::load(const std::string& path, const EngineOptions& opt, std::string
   mo.fp4_inputs = device_.fp4_inputs != 0;
   model_ = interfaces::open_model(file_, mo, err);
   if (!model_) return false;
+  if (const char* note = model_->load_note()) log::info("flyx: %s", note);
   const bool requested_trees = opt_.draft_trees;
   if (opt_.vision && !opt_.mmproj_file.empty() && !model_->vision())
     return *err = "--mmproj " + opt_.mmproj_file + ": file is not a supported vision projector (mmproj)", false;
@@ -746,11 +771,19 @@ bool Engine::load(const std::string& path, const EngineOptions& opt, std::string
     }
   };
 
+  int ple_placement = opt_.ple_placement;
   int auto_from = opt_.kv_gpu >= 0 && opt_.kv_ram != 0 ? opt_.kv_gpu : INT32_MAX;
   auto make_open_options = [&]() {
     flyx_open_options oo{};
-    oo.max_ctx = opt_.max_ctx;
+    oo.max_ctx = ple && opt_.ctx_max
+                     ? (model_->trained_ctx() > 0 ? model_->trained_ctx() : kCtxMaxUnnamed)
+                     : opt_.max_ctx;
     oo.verbose = opt_.verbose;
+    oo.ple_placement = ple_placement;
+    oo.ple_hot_bytes = opt_.ple_hot_bytes;
+    const auto mem = os::system_memory();
+    const auto keep = opt_.ram_reserve < 0 ? plan::host_keep(mem.total) : uint64_t(opt_.ram_reserve);
+    oo.ple_host_room = mem.available > keep ? mem.available - keep : 0;
     oo.lock_auto_from = tiers.method == FLYX_KV_AUTO;
     oo.auto_from = auto_from;
     oo.kv_fp8 = opt_.kv == FLYX_KV_FP8 ? 1 : 0;
@@ -964,7 +997,19 @@ bool Engine::load(const std::string& path, const EngineOptions& opt, std::string
     const bool trees_by_switch = opt_.draft_trees && !opt_.draft_trees_given && tiers.method == FLYX_KV_AUTO;
     opt_.max_ctx = initial_max_ctx;
     plan::KvTiers attempt_tiers = tiers;
-    const flyx_open_options oo = make_open_options();
+    auto oo = make_open_options();
+    if (ple) {
+      if (oo.ple_placement == FLYX_PLE_AUTO) {
+        flyx_load_estimate est{};
+        uint64_t free = 0, total = 0;
+        query_vram(&free, &total);
+        if (api_->estimate_load && api_->estimate_load(&model_->desc(), &oo, free, total, &est) != 0)
+          return *err = std::string("PLE placement: ") + api_->last_error(), false;
+        oo.ple_placement = est.ple_placement ? est.ple_placement :
+            interfaces::host_ple_placement(ple->nbytes, ple->read_at != nullptr, oo.ple_host_room, oo.ple_hot_bytes);
+      }
+      if (oo.ple_placement == FLYX_PLE_GPU || oo.ple_placement == FLYX_PLE_HOST) ahead.start(file_);
+    }
 
     std::string attempt_err;
     bool ok = true;
@@ -1016,6 +1061,12 @@ bool Engine::load(const std::string& path, const EngineOptions& opt, std::string
     budget_ = plan::Budget{};
     ledger_.set_budget(0);
 
+    if (ple && ple_placement == FLYX_PLE_AUTO && oo.ple_placement == FLYX_PLE_GPU) {
+      ahead.stop();
+      ple_placement = interfaces::host_ple_placement(ple->nbytes, ple->read_at != nullptr, oo.ple_host_room, oo.ple_hot_bytes);
+      upsert_adj("ple", "gpu", "off-device", "moved PLE table off device after a VRAM allocation failure");
+      continue;
+    }
     uint64_t free_vram = 0, total_vram = 0;
     query_vram(&free_vram, &total_vram);
     flyx_load_estimate est{};

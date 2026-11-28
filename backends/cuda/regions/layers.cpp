@@ -164,7 +164,7 @@ void gdn_out_project(const RowView& v, const GdnBlock& g, int R, bool fused, boo
       gemm(v.b.act, vd, g.w_out, H, vd, v.b.h, H, R, false, v.L);
       add_rows_bf16(v.b.x, H, v.b.h, H, H, R, v.L.st);
     } else {
-      gemm(v.b.act, vd, g.w_out, H, vd, v.b.x, H, R, true, v.L);
+      gemm(v.b.act, vd, g.w_out, H, vd, v.b.x, H, R, !g.body_only, v.L);
     }
   }
 }
@@ -172,7 +172,8 @@ void gdn_out_project(const RowView& v, const GdnBlock& g, int R, bool fused, boo
 void head_logits(const HeadBlock& h, const RowView& v, int r0, int n, bool cert, const CertScratch& cs,
                  const KernelOptions& ko, bool x16) {
   const int H = h.hidden, V = h.vocab;
-  if (x16) rmsnorm(x16_of(v) + size_t(r0) * H, H, h.norm.w, h.norm.offset, h.norm.eps, v.b.h, H, n, H, v.L.st);
+  if (!h.norm.w) CK(cudaMemcpyAsync(v.b.h, v.b.x + size_t(r0) * H, size_t(n) * H * sizeof(float), cudaMemcpyDeviceToDevice, v.L.st));
+  else if (x16) rmsnorm(x16_of(v) + size_t(r0) * H, H, h.norm.w, h.norm.offset, h.norm.eps, v.b.h, H, n, H, v.L.st);
   else rmsnorm(v.b.x + size_t(r0) * H, H, h.norm.w, h.norm.offset, h.norm.eps, v.b.h, H, n, H, v.L.st);
   if (h.w8 && n <= 16 && ko.head_fp8) {  // option head_fp8: the copy's scores
     gemm_fp8_skinny(v.b.h, H, h.w8, h.rs8, V, H, v.logits, V, n, false, v.L);
@@ -596,6 +597,7 @@ void gdn_layer(const Pass& ps, const GdnBlock& g, bool fused) {
   // norm_project_adapted) and the gated norm's output (gdn_round writes them beside its staged ones in a round, else
   // the generic producer); their products go to the in-projection's rows before the convolution and the gates read
   // them, then to the residual after the out projection.
+  if (g.body_only || g.gd.sigmoid_output) fused = false;
   const bool fused_mixer = fused;
   if (g.lora) fused = false;  // outside gdn_round: the generic producers
   const RowView& rv = ps.v;
@@ -609,7 +611,9 @@ void gdn_layer(const Pass& ps, const GdnBlock& g, bool fused) {
   // convolution, the gates and the gated norm; the proj buffer holds them (half its bytes).
   const bool x16 = residual16(ps);
   if (x16 && !fused) throw std::logic_error("cuda: a bf16 residual's pass runs the fused producers");
-  if (!ps.round && fused && R > 16 && !g.w_in.packed() && g.w_in.q) {
+  if (g.body_only) {
+    gemm(rv.b.x, H, g.w_in, g.n_in(), H, rv.b.proj, rv.ld_proj, R, false, L);
+  } else if (!ps.round && fused && R > 16 && !g.w_in.packed() && g.w_in.q) {
     if (x16) rmsnorm_split(x16_of(rv), H, g.norm.w, g.norm.offset, g.norm.eps, R, H, L, g.w_in.q8_inputs());
     else rmsnorm_split(rv.b.x, H, g.norm.w, g.norm.offset, g.norm.eps, R, H, L, g.w_in.q8_inputs());
     bf16* p16 = reinterpret_cast<bf16*>(rv.b.proj);
@@ -849,7 +853,9 @@ void attn_layer(const Pass& ps, const AttnBlock& a, bool fused) {
   // float32 rows, not the staged ones): the fused producer writes them beside its staged ones (rv.b.h), the attention
   // its output in float32 (rv.b.act), which the out projection's GEMM stages.
   const int ldu = s->m->need.lora;
-  if (x16) {
+  if (a.body_only) {
+    gemm(rv.b.x, H, a.w_in, a.n_in(), H, rv.b.proj, rv.ld_proj, R, false, L);
+  } else if (x16) {
     if (!fused) throw std::logic_error("cuda: a bf16 residual's pass runs the fused producers");
     rmsnorm_split(x16_of(rv), H, a.norm.w, a.norm.offset, a.norm.eps, R, H, L, a.w_in.q8_inputs());
     gemm_presplit(a.w_in, a.n_in(), H, rv.b.proj, rv.ld_proj, R, false, L);
@@ -904,6 +910,26 @@ void attn_layer(const Pass& ps, const AttnBlock& a, bool fused) {
       CK(cudaMemcpyAsync(kb.vqs + goff, stg_vqs, grid_cnt * sizeof(__half2), cudaMemcpyDefault, st));
     }
   }
+  if (a.index_state >= 0) {
+    const int width = (a.index_heads + 1) * a.index_dim;
+    gemm(rv.b.x, H, a.index_in, width, H, rv.b.index_proj, width, R, false, L);
+    SparseIndex ix{a.index_dim,
+                   a.index_heads,
+                   a.group,
+                   a.budget / a.group,
+                   a.rot,
+                   a.theta,
+                   a.mrope(ps.pos_3d),
+                   a.index_q_norm.w,
+                   a.index_k_norm.w,
+                   a.index_q_norm.eps,
+                   a.index_q_norm.offset};
+    indexed_attention(ix, rv.b.index_proj, s->index_keys.at(a.index_state), s->index_scores,
+                      s->cap / s->m->need.index_group + 1, s->index_selected, rv.b.qbuf, kv, nh, nkv, hd,
+                      a.gate ? rv.b.proj + nh * hd : nullptr, rv.ld_proj, rv.b.act, R, s->P, tree, st);
+    gemm(rv.b.act, nh * hd, a.w_out, H, nh * hd, rv.b.x, H, R, !a.body_only, L);
+    return;
+  }
   // The attention writes the out projection's input itself, but not in 8 bits: for such weights it stays float32.
   const bool split = fused && !a.w_out.q8_inputs() && !a.lora;
   if (ps.reads_cache(kb)) {
@@ -949,12 +975,12 @@ void attn_layer(const Pass& ps, const AttnBlock& a, bool fused) {
     if (!split || !gemm_staged_bf16(a.w_out.q, a.w_out.s, a.w_out.rs, H, nh * hd, x16_of(rv), H, R, L, true))
       throw std::logic_error("cuda: a bf16 residual's out projection is a W4A4 GEMM");
   } else if (split) {
-    gemm_presplit(a.w_out, H, nh * hd, rv.b.x, H, R, true, L);
+    gemm_presplit(a.w_out, H, nh * hd, rv.b.x, H, R, !a.body_only, L);
   } else if (residual16_pass(ps)) {  // fusion=0: as gemm_staged_bf16 adds it; h (H wide; qbuf in a pass) is free here
     gemm(rv.b.act, nh * hd, a.w_out, H, nh * hd, rv.b.h, H, R, false, L);
     add_rows_bf16(rv.b.x, H, rv.b.h, H, H, R, st);
   } else {
-    gemm(rv.b.act, nh * hd, a.w_out, H, nh * hd, rv.b.x, H, R, true, L);
+    gemm(rv.b.act, nh * hd, a.w_out, H, nh * hd, rv.b.x, H, R, !a.body_only, L);
   }
   if (a.lora) lora_out_end(rv, a.lora, FLYX_LIN_O, rv.b.act, nh * hd, nh * hd, H, R, ldu, L);
 }
@@ -1556,6 +1582,73 @@ void rel_attn_layer(const Pass& ps, const RelAttnBlock& a, bool fused) {
   }
 }
 
+static void CUDART_CB gather_ple_rows(void* data) noexcept {
+  auto& call = *static_cast<flyx_seq::PleCall*>(data);
+  try {
+    call.store->gather(call.ids, call.count, call.packed);
+  } catch (...) {
+    call.failed->store(true, std::memory_order_release);
+  }
+}
+
+void ple_layer(const Pass& ps, const PleBlock& b) {
+  auto* s = ps.s;
+  const auto& rv = ps.v;
+  const auto& buf = rv.b;
+  const auto& sc = s->sconv.at(b.state);
+  const PleWindow window{sc.win, sc.replay, sc.w_stride, sc.r_stride};
+  const int R = ps.rows, H = b.dims.hidden, C = b.dims.streams, W = C * H, heads = b.heads(), D = b.dims.row_width,
+            Z = heads * D;
+  const auto* tree = tree_of(ps);
+  cudaStream_t st = rv.L.st;
+  ple_hash(b.dims, window, buf.tokens, buf.ple_ids, R, s->P, tree, st);
+  if (b.table)
+    ple_decode(b.table, b.stride, b.dtype, D, buf.ple_ids, R * heads, buf.ple_embed, st);
+  else {
+    auto& stage = s->ple_stages.at(b.state);
+    for (int r = 0; r < R; r += kPleStage) {
+      const int rows = std::min(kPleStage, R - r), n = rows * heads;
+      CK(cudaMemcpyAsync(stage.ids, buf.ple_ids + size_t(r) * heads, n * sizeof(int), cudaMemcpyDeviceToHost, st));
+      CK(cudaLaunchHostFunc(st, gather_ple_rows, &stage.calls[rows]));
+      CK(cudaMemcpyAsync(stage.device, stage.host, size_t(n) * b.stride, cudaMemcpyHostToDevice, st));
+      ple_decode(stage.device, b.stride, b.dtype, D, nullptr, n, buf.ple_embed + size_t(r) * Z, st);
+    }
+  }
+  gemm(buf.ple_embed, Z, b.key, W, Z, buf.proj, W, R, false, rv.L);
+  gemm(buf.ple_embed, Z, b.value, H, Z, buf.h, H, R, false, rv.L);
+  for (int c = 0; c < C; ++c) {
+    const int j = c * H;
+    rmsnorm(buf.proj + j, W, b.nk.w + j, b.nk.offset, b.nk.eps, buf.act + j, W, R, H, st);
+    rmsnorm(buf.hc_wide + j, W, b.nq.w + j, b.nq.offset, b.nq.eps, buf.hc_norm + j, W, R, H, st);
+  }
+  ple_gates(buf.act, buf.hc_norm, buf.h, H, C, R, buf.proj, st);
+  for (int c = 0; c < C; ++c) {
+    const int j = c * H;
+    rmsnorm(buf.proj + j, W, b.nc.w + j, b.nc.offset, b.nc.eps, buf.ple_input + j, W + 1, R, H, st);
+  }
+  const int snap = !ps.round && s->pass_snap >= 0 ? kSlotExplicit + s->snap_slot : -1;
+  const int next = !ps.round ? kSlotCur : ps.width() == 0 ? kSlotNext : -1;
+  ple_convolve(b.dims, window, b.conv, buf.proj, buf.ple_input, buf.hc_wide, buf.tokens, R, s->P, tree, ps.round, next,
+               snap, s->pass_snap - s->position, st);
+}
+
+void hc_layer(const Pass& ps, const HcBlock& hc) {
+  const auto& v = ps.v;
+  const auto& b = v.b;
+  const int R = ps.rows, H = hc.hidden, C = hc.streams, W = C * H;
+  if (hc.phase == FLYX_HC_EXPAND || hc.phase == FLYX_HC_SCATTER) {
+    hc_rows(hc.phase, b.x, b.hc_wide, nullptr, b.hc_inject, nullptr, R, C, H, v.L.st);
+    return;
+  }
+  for (int c = 0; c < C; ++c)
+    rmsnorm(b.hc_wide + c * H, W, hc.norm.w + c * H, hc.norm.offset, hc.norm.eps, b.hc_norm + c * H, W, R, H, v.L.st);
+  gemm(b.hc_norm, W, hc.down, hc.rank, W, b.act, hc.rank, R, false, v.L);
+  hc_down_silu(b.act, int64_t(R) * hc.rank, C, v.L.st);
+  gemm(b.act, hc.rank, hc.up, W, hc.rank, b.proj, W, R, false, v.L);
+  if (hc.phase == FLYX_HC_MIX) gemm(b.hc_norm, W, hc.inject, C, W, b.hc_inject, C, R, false, v.L);
+  hc_rows(hc.phase, b.x, b.hc_wide, b.hc_norm, b.hc_inject, b.proj, R, C, H, v.L.st);
+}
+
 void moe_layer(const Pass& ps, const MoeBlock& f, bool fused) {
   const RowView& rv = ps.v;
   auto* s = ps.s;
@@ -1567,7 +1660,7 @@ void moe_layer(const Pass& ps, const MoeBlock& f, bool fused) {
   // a launch between them: the norm the gate|up GEMM's 8-bit rows beside the router's float32 ones, and that GEMM
   // the down GEMM's bf16 rows (in moe_act: the scratch's own bf16 rows lie over the 8-bit ones it is reading).
   const MoeScratch* msc = rv.b.moe_sc.pairs ? &rv.b.moe_sc : nullptr;
-  const bool round_q8 = fused && ps.round && moe_round_q8(f.gate_up, R, K, H, msc);
+  const bool round_q8 = !f.body_only && !f.separate_gate_up && fused && ps.round && moe_round_q8(f.gate_up, R, K, H, msc);
   bool norm_done = false;
   const float* cur = rv.b.x;
 
@@ -1639,7 +1732,9 @@ void moe_layer(const Pass& ps, const MoeBlock& f, bool fused) {
     }
   }
 
-  if (!norm_done) {
+  if (f.body_only) {
+    CK(cudaMemcpyAsync(rv.b.h, cur, size_t(R) * H * sizeof(float), cudaMemcpyDeviceToDevice, st));
+  } else if (!norm_done) {
     if (round_q8)
       rmsnorm_moe_q8(cur, H, f.norm.w, f.norm.offset, f.norm.eps, rv.b.h, H, R, H, *msc, moe_q8_mins(f.gate_up), st);
     else
@@ -1653,7 +1748,14 @@ void moe_layer(const Pass& ps, const MoeBlock& f, bool fused) {
       round_q8 && moe_round_bf16_down(f.down, R, K, I, msc, L) ? reinterpret_cast<bf16*>(rv.b.moe_act) : nullptr;
   // The grouping of the rows by expert that the gate|up GEMM leaves in the scratch, which the down GEMM takes over.
   int grouped = 0;
-  if (fused) {
+  if (f.separate_gate_up) {
+    // Each unfused projection writes I rows of its own dtype into one half of [R, K, 2I].
+    moe_gate_up(rv.b.h, H, f.gate_up, rv.b.moe_idx, R, K, I, H, 0, 0, false,
+                rv.b.moe_gu, 2 * I, msc, L);
+    grouped = moe_gate_up(rv.b.h, H, f.up, rv.b.moe_idx, R, K, I, H, 0, 0,
+                          false, rv.b.moe_gu + I, 2 * I, msc, L);
+    swiglu(rv.b.moe_gu, 2 * I, I, rv.b.moe_act, I, R * K, st);
+  } else if (fused) {
     grouped = moe_gate_up(rv.b.h, H, f.gate_up, rv.b.moe_idx, R, K, I, H, f.situ_beta, f.situ_linear_beta, true,
                           rv.b.moe_act, I, msc, L, round_q8, act_bf16);
   } else {
@@ -1679,8 +1781,15 @@ void moe_layer(const Pass& ps, const MoeBlock& f, bool fused) {
                    rep_stride, kSlotCur, f.sconv_offset, sc.channels, H, f.conv, 0, s->P, R, x_cur, H, st, true);
   } else {
     float* x_cur = (ps.res && ps.res->x_cur) ? ps.res->x_cur : rv.b.x;
-    moe_down(rv.b.moe_act, I, f.down, rv.b.moe_idx, rv.b.moe_w, R, K, H, I, x_cur, H, true, msc, L, act_bf16,
+    moe_down(rv.b.moe_act, I, f.down, rv.b.moe_idx, rv.b.moe_w, R, K, H, I, x_cur, H, !f.body_only, msc, L, act_bf16,
              grouped);
+  }
+  if (f.shared_inter) {
+    const int I_shared = f.shared_inter;
+    gemm(rv.b.h, H, f.shared_gu, 2 * I_shared, H, rv.b.proj, 2 * I_shared, R, false, L);
+    swiglu(rv.b.proj, 2 * I_shared, I_shared, rv.b.act, I_shared, R, st);
+    gemm(rv.b.act, I_shared, f.shared_down, H, I_shared, rv.b.post_raw, H, R, false, L);
+    shared_expert_add(rv.b.x, rv.b.h, f.shared_router, rv.b.post_raw, R, H, st);
   }
 }
 
@@ -2036,6 +2145,13 @@ void compact_path(const Pass& ps) {
   auto* s = ps.s;
   const auto* m = s->m;
   cudaStream_t st = rv.L.st;
+  for (const auto& blk : m->blocks)
+    if (const auto* p = std::get_if<PleBlock>(&blk)) {
+      const auto& sc = s->sconv.at(p->state);
+      ple_compact({sc.win, sc.replay, sc.w_stride, sc.r_stride}, sc.channels, s->P, s->tree, st);
+    }
+  for (size_t i = 0; i < s->index_keys.size(); ++i)
+    compact_index(s->index_keys[i], m->states.index_width[i], s->P, s->tree, st);
   compact_kv(s->tree_kv, s->n_tree_kv, s->tree_kv_bytes, s->P, s->tree, st);
   if (s->gdn_layers) {
     gdn_compact(s->gdn_layers, int(s->gdn.size()), s->gdn[0].replay, s->P, s->tree, st);

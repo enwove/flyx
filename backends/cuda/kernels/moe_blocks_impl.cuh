@@ -645,7 +645,7 @@ __global__ void __launch_bounds__(128)
 
   const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
   const int col = int(blockIdx.x) * 4 + warp;
-  const int N_work = FUSE_ACT ? I : 2 * I;
+  const int N_work = FUSE_ACT ? I : N_exp;
   const int k_slot = blockIdx.y, r = blockIdx.z;
   const int e = eidx[r * top_k + k_slot];
   const float rs = RS ? RS[e] : 1.f;
@@ -890,7 +890,7 @@ void moe_blocks_gu(const float* x, int ldx, const ExpertMat& W, const int* eidx,
                    float situ_beta, float situ_linear_beta, bool fuse_act, float* out, int ld_out,
                    const MoeScratch* sc, int max_tiles, bool use_mma, int dp4a, cudaStream_t st, bf16* act_bf16) {
   const Tables T = block_tables();
-  const int N_work = fuse_act ? I : 2 * I;
+  const int N_work = fuse_act ? I : W.N;
   const bool has_q8 = W.blk.q8 && sc && sc->q8_a && sc->stage_elems >= size_t(rows) * size_t(K);
   // Only the dp4a kernels that apply the activation write it in bf16: a round's, which moe_round_q8 promises.
   if (act_bf16 && !(fuse_act && has_q8 && !use_mma && (rows == 1 || (sc->tasks && max_tiles > 0))))

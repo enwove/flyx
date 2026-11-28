@@ -25,8 +25,11 @@
 #include <vector>
 
 #include "backends/common/snapshot_format.h"
+#include "backends/common/packed_rows.h"
 #include "flyx/backend_abi.h"
 #include "ops/ops.h"
+#include "ops/ple/ref.h"
+#include "ops/qsa/ref.h"
 
 namespace {
 
@@ -46,6 +49,7 @@ struct RefModel {
   // Per weight; every floating-point one (bf16, f16, f32, NVFP4, GGML blocks) decoded to float64 at open, so the
   // ops read doubles instead of decoding each element again in every call.
   std::vector<const flyx_tensor_view*> W;
+  std::unordered_map<int, std::unique_ptr<flyx::backends::PackedRows>> packed;
   std::vector<std::unique_ptr<std::vector<double>>> owned;
   std::vector<std::unique_ptr<flyx_tensor_view>> owned_views;
   std::unordered_set<const flyx_tensor_view*> a16;   // inputs rounded to bf16 (NVFP4 weights)
@@ -139,6 +143,10 @@ void lora(const RefModel* M, const flyx_lora& l, const double* x, int rows, int 
 }
 
 void norm(const RefModel* M, const flyx_norm& n, const double* x, int len, double* y) {
+  if (n.w < 0) {
+    if (x != y) std::copy_n(x, len, y);
+    return;
+  }
   flyx::ops::rmsnorm(x, M->vec(n.w).data(), len, n.eps, n.offset, y);
 }
 
@@ -179,6 +187,7 @@ void prep_head(const RefModel* M, const flyx_attn_block& B, const flyx_norm& n, 
 struct RefPlan {
   RefModel* m;
   int phase, width, max_rows;
+  bool given_tree = false;
   std::vector<flyx_node> nodes;
 };
 
@@ -228,6 +237,7 @@ struct RefSeq {
   std::unordered_map<int, const float*> embed_override;
   const int32_t* pos_3d = nullptr;
   Vec x, feats;
+  Vec streams, inject;  // Hyper-connection residuals [rows, streams, hidden] and per-stream injection gains.
   // Pass-local depth-residual and looped-pass scratch (ABI 45).
   std::vector<Vec> res_bank, prelude_blocks, loop_bank;
   Vec prelude_cur, loop_bank_out, loop_msg;
@@ -252,6 +262,10 @@ void reset_state(RefSeq* s) {
         const auto& g = states[i];
         sl.S[i].assign(size_t(g.nv) * g.dv * g.dk, 0.0);
         sl.conv[i].assign(size_t(g.conv - 1) * cdim_of(g), 0.0);
+      } else if (states[i].kind == FLYX_STATE_PLE) {
+        const auto& st = states[i];
+        sl.sc[i].assign(size_t(st.conv - 1) * st.channels, 0.0);
+        sl.sc[i].insert(sl.sc[i].end(), st.width, -1.0);
       } else if (states[i].kind == FLYX_STATE_SHORTCONV) {
         const auto& sc = states[i];
         sl.sc[i].assign(size_t(sc.conv - 1) * size_t(sc.channels), 0.0);
@@ -285,6 +299,120 @@ void embed_rows(RefSeq* s, const flyx_embed_block& e, const int32_t* ids, int n,
 
 // ---- target layers ----------------------------------------------------------
 
+void group_norm(const RefModel* m, const flyx_norm& norm, const double* x, int streams, int hidden, double* out) {
+  const auto& gamma = m->vec(norm.w);
+  for (int c = 0; c < streams; ++c) {
+    const size_t offset = size_t(c) * hidden;
+    rmsnorm(x + offset, gamma.data() + offset, hidden, norm.eps, norm.offset, out + offset);
+  }
+}
+
+void hyper_connection(RefSeq* s, const flyx_hc_block& b) {
+  const int rows = s->rows, H = b.hidden, C = b.streams, W = H * C;
+  if (b.phase == FLYX_HC_EXPAND) {
+    s->streams.resize(size_t(rows) * W);
+    for (int r = 0; r < rows; ++r)
+      for (int c = 0; c < C; ++c)
+        std::copy_n(s->x.data() + size_t(r) * H, H, s->streams.data() + (size_t(r) * C + c) * H);
+    return;
+  }
+  if (b.phase == FLYX_HC_SCATTER) {
+    for (int r = 0; r < rows; ++r)
+      for (int c = 0; c < C; ++c)
+        for (int i = 0; i < H; ++i)
+          s->streams[(size_t(r) * C + c) * H + i] += s->inject[size_t(r) * C + c] * s->x[size_t(r) * H + i];
+    return;
+  }
+  Vec u(W), down(b.rank), gain(W);
+  if (b.phase == FLYX_HC_MIX) s->inject.resize(size_t(rows) * C);
+  for (int r = 0; r < rows; ++r) {
+    group_norm(s->m, b.norm, s->streams.data() + size_t(r) * W, C, H, u.data());
+    lin(s->m, b.down, u.data(), 1, W, b.rank, down.data(), rows);
+    for (double& v : down) v = silu(v / C);
+    lin(s->m, b.up, down.data(), 1, b.rank, W, gain.data(), rows);
+    auto* out = s->x.data() + size_t(r) * H;
+    std::fill_n(out, H, 0.0);
+    for (int c = 0; c < C; ++c)
+      for (int i = 0; i < H; ++i) out[i] += sigmoid(gain[c * H + i]) * u[c * H + i];
+    for (int i = 0; i < H; ++i) out[i] /= C;
+    if (b.phase == FLYX_HC_MIX) {
+      auto* j = s->inject.data() + size_t(r) * C;
+      lin(s->m, b.inject, u.data(), 1, W, C, j, rows);
+      for (int c = 0; c < C; ++c) j[c] = 2 * sigmoid(j[c] / C);
+    }
+  }
+}
+
+// Oldest normalized activation first, followed by the newest token ID first. The unused ID tail starts at -1.
+void ple_push(Vec& state, const flyx_state& st, const double* activation, int32_t id) {
+  const size_t conv = size_t(st.conv - 1) * st.channels;
+  conv_push(state.data(), activation, st.channels, st.conv);
+  auto* ids = state.data() + conv;
+  std::copy_backward(ids, ids + st.width - 1, ids + st.width);
+  ids[0] = id;
+}
+
+void ple_layer(RefSeq* s, const flyx_ple_block& b, bool verify) {
+  const int H = b.hidden, C = b.streams, W = C * H, heads = (b.ngram - 1) * b.heads_per_order;
+  const int Z = heads * b.row_width;
+  const auto& st = s->m->states[b.state];
+  auto& slot = s->slot[cur_slot(s)];
+  auto win = slot.sc[b.state];
+  auto& replay = slot.sc_in[b.state];
+  if (verify) replay.resize(size_t(s->rows) * (W + 1));
+  auto table = *s->m->w(b.table);
+  auto& store = *s->m->packed.at(b.table);
+  constexpr int tile = 16;
+  const int batch = std::min(tile, s->rows);
+  std::vector<int32_t> indices(size_t(batch) * heads), prior(st.width);
+  std::vector<uint8_t> packed(indices.size() * store.stride());
+  table.shape[0] = heads;
+  table.nbytes = size_t(heads) * store.stride();
+  const auto& conv = s->m->vec(b.conv_w);
+  Vec z(Z), key(W), query(W), value(H), y(W), u(W);
+  const auto* committed = win.data() + size_t(st.conv - 1) * W;
+  for (int r = 0; r < s->rows; ++r) {
+    if (r % tile == 0) {
+      const int count = std::min(tile, s->rows - r);
+      for (int j = 0; j < count; ++j) {
+        int n = 0;
+        for (; n < st.width; ++n) {
+          const int in_tile = j - n - 1;
+          if (in_tile >= 0)
+            prior[n] = s->tok[r + in_tile];
+          else if (committed[-1 - in_tile] >= 0)
+            prior[n] = int32_t(committed[-1 - in_tile]);
+          else
+            break;
+        }
+        ple_indices(s->tok[r + j], prior.data(), n, b, indices.data() + size_t(j) * heads);
+      }
+      store.gather(indices.data(), size_t(count) * heads, packed.data());
+    }
+    table.data = packed.data() + size_t(r % tile) * table.nbytes;
+    for (int i = 0; i < Z; ++i) z[i] = load(&table, i);
+    lin(s->m, b.key, z.data(), 1, Z, W, key.data(), s->rows);
+    lin(s->m, b.value, z.data(), 1, Z, H, value.data(), s->rows);
+    auto* wide = s->streams.data() + size_t(r) * W;
+    group_norm(s->m, b.norm_key, key.data(), C, H, key.data());
+    group_norm(s->m, b.norm_query, wide, C, H, query.data());
+    for (int c = 0; c < C; ++c) {
+      const double scale = ple_gate(key.data() + c * H, query.data() + c * H, H);
+      for (int i = 0; i < H; ++i) y[c * H + i] = scale * value[i];
+    }
+    group_norm(s->m, b.norm_conv, y.data(), C, H, u.data());
+    for (int i = 0; i < W; ++i)
+      wide[i] += y[i] + ple_shortconv(win.data(), u.data(), conv.data(), i, W, b.taps, b.dilation);
+    if (verify) {
+      auto* row = replay.data() + size_t(r) * (W + 1);
+      std::copy(u.begin(), u.end(), row);
+      row[W] = s->tok[r];
+    }
+    ple_push(win, st, u.data(), s->tok[r]);
+  }
+  if (!verify) slot.sc[b.state] = std::move(win);
+}
+
 void gdn_mixer(RefSeq* s, const flyx_gdn_block& B, bool verify) {
   const auto* M = s->m;
   const int L = B.state;
@@ -305,7 +433,8 @@ void gdn_mixer(RefSeq* s, const flyx_gdn_block& B, bool verify) {
   Vec h(H), mixed(cdim), conv(cdim), z(nv * dv), b(nv), a(nv), o(nv * dv), y(H);
   for (int r = 0; r < s->rows; ++r) {
     double* xr = &s->x[size_t(r) * H];
-    norm(M, B.norm, xr, H, h.data());
+    if (B.body_only) std::copy_n(xr, H, h.data());
+    else norm(M, B.norm, xr, H, h.data());
     lin(M, B.qkv, h.data(), 1, H, cdim, mixed.data(), s->rows);
     lin(M, B.z, h.data(), 1, H, nv * dv, z.data(), s->rows);
     lin(M, B.b, h.data(), 1, H, nv, b.data(), s->rows);
@@ -346,12 +475,15 @@ void gdn_mixer(RefSeq* s, const flyx_gdn_block& B, bool verify) {
       }
       Vec tmp(static_cast<size_t>(dv));
       norm(M, B.out_norm, &o[size_t(vh) * dv], dv, tmp.data());
-      for (int j = 0; j < dv; ++j) o[size_t(vh) * dv + j] = tmp[j] * silu(z[size_t(vh) * dv + j]);
+      for (int j = 0; j < dv; ++j) {
+        const size_t i = size_t(vh) * dv + j;
+        o[i] = tmp[j] * (B.out_gate_act ? sigmoid(z[i]) : silu(z[i]));
+      }
     }
     if (verify) std::copy(mixed.begin(), mixed.end(), &sl.mixed[L][size_t(r) * cdim]);
     lin(M, B.out, o.data(), 1, nv * dv, H, y.data(), s->rows);
     lora(M, B.lora[FLYX_GDN_LIN_OUT], o.data(), 1, nv * dv, H, y.data());
-    for (int c = 0; c < H; ++c) xr[c] = residual_add(M, s->rows, xr[c], y[c]);
+    for (int c = 0; c < H; ++c) xr[c] = B.body_only ? y[c] : residual_add(M, s->rows, xr[c], y[c]);
   }
   if (!verify) {
     sl.S[L] = std::move(S);
@@ -365,12 +497,45 @@ int gate_at(const flyx_attn_block& B, int hh) {
   return (B.gate == FLYX_GATE_PER_HEAD ? 2 * hh + 1 : B.n_heads + hh) * B.head_dim;
 }
 
+// Retain raw keys and their RoPE coordinates. Pool before normalization and rotate at each group's first token.
+std::vector<int> index_positions(RefSeq* s, const flyx_attn_block& b, const double* x, int pos, const int32_t* coords) {
+  const int D = b.index_dim, Q = b.index_heads, G = b.group_size;
+  auto& keys = s->K[b.index_state][0];
+  auto raw = [&](int i) { return keys.data() + size_t(i) * (D + 3); };
+  double* current = raw(pos);
+  lin(s->m, b.index_k, x, 1, b.hidden, D, current, s->rows);
+  for (int i = 0; i < 3; ++i) current[D + i] = coords ? coords[i] : pos + s->rope_delta;
+  const int groups = (pos + 1) / G;
+  if (groups <= b.token_budget / G) return {};
+  auto rotary = b;
+  rotary.head_dim = D;
+  Vec queries(size_t(Q) * D), pooled(D), scores(groups);
+  auto prep = [&](const flyx_norm& norm, double* head, const double* xyz) {
+    const int32_t p[] = {int32_t(xyz[0]), int32_t(xyz[1]), int32_t(xyz[2])};
+    Vec tmp(D);
+    prep_head(s->m, rotary, norm, head, p[0], tmp.data(), p);
+    std::copy(tmp.begin(), tmp.end(), head);
+  };
+  lin(s->m, b.index_q, x, 1, b.hidden, Q * D, queries.data(), s->rows);
+  for (int h = 0; h < Q; ++h) prep(b.index_q_norm, queries.data() + size_t(h) * D, current + D);
+  for (int g = 0; g < groups; ++g) {
+    std::fill(pooled.begin(), pooled.end(), 0.0);
+    for (int j = 0; j < G; ++j)
+      for (int i = 0; i < D; ++i) pooled[i] += raw(g * G + j)[i];
+    for (auto& v : pooled) v /= G;
+    prep(b.index_k_norm, pooled.data(), raw(g * G) + D);
+    scores[g] = qsa_score(queries.data(), pooled.data(), Q, D);
+  }
+  return qsa_positions(scores, pos + 1, G, b.token_budget);
+}
+
 void attn_mixer(RefSeq* s, const flyx_attn_block& B) {
   const auto* M = s->m;
   const int H = B.hidden, nh = B.n_heads, nkv = B.n_kv, hd = B.head_dim, R = s->rows;
   const int qw = (B.gate ? 2 : 1) * nh * hd;  // the q projection's rows: q, and the gate's with an output gate
   Vec h(size_t(R) * H), qg(size_t(R) * qw), k(size_t(R) * nkv * hd), v(size_t(R) * nkv * hd);
-  for (int r = 0; r < R; ++r) norm(M, B.norm, &s->x[size_t(r) * H], H, &h[size_t(r) * H]);
+  if (B.body_only) h = s->x;
+  else for (int r = 0; r < R; ++r) norm(M, B.norm, &s->x[size_t(r) * H], H, &h[size_t(r) * H]);
   lin(M, B.q, h.data(), R, H, qw, qg.data(), R);
   lin(M, B.k, h.data(), R, H, nkv * hd, k.data(), R);
   lin(M, B.v, h.data(), R, H, nkv * hd, v.data(), R);
@@ -395,9 +560,22 @@ void attn_mixer(RefSeq* s, const flyx_attn_block& B) {
     int pos = s->start + r;
     const int32_t* p3 = s->pos_3d ? s->pos_3d + size_t(r) * 3 : nullptr;
     const int rope_pos = pos + (has_mrope(B) ? s->rope_delta : 0);
+    Vec selected_k, selected_v;
+    const auto selected = B.has_indexer ? index_positions(s, B, h.data() + size_t(r) * H, pos, p3) : std::vector<int>{};
+    if (!selected.empty()) {
+      const int width = nkv * hd;
+      selected_k.reserve(selected.size() * width);
+      selected_v.reserve(selected.size() * width);
+      for (int i : selected) {
+        auto at = size_t(i) * width;
+        selected_k.insert(selected_k.end(), KC.data() + at, KC.data() + at + width);
+        selected_v.insert(selected_v.end(), VC.data() + at, VC.data() + at + width);
+      }
+    }
     for (int hh = 0; hh < nh; ++hh) {
       prep_head(M, B, B.q_norm, &qg[size_t(r) * qw + q_at(B, hh)], rope_pos, q.data(), p3);
-      attend(q.data(), KC.data(), VC.data(), pos + 1, nkv, hd, hh / (nh / nkv), 1.0 / std::sqrt(double(hd)),
+      attend(q.data(), selected.empty() ? KC.data() : selected_k.data(), selected.empty() ? VC.data() : selected_v.data(),
+             selected.empty() ? pos + 1 : int(selected.size()), nkv, hd, hh / (nh / nkv), 1.0 / std::sqrt(double(hd)),
              &o[size_t(hh) * hd]);
     }
     if (B.gate)
@@ -407,7 +585,10 @@ void attn_mixer(RefSeq* s, const flyx_attn_block& B) {
       }
     lin(M, B.o, o.data(), 1, nh * hd, H, y.data(), R);
     lora(M, B.lora[FLYX_LIN_O], o.data(), 1, nh * hd, H, y.data());
-    for (int c = 0; c < H; ++c) s->x[size_t(r) * H + c] = residual_add(M, R, s->x[size_t(r) * H + c], y[c]);
+    for (int c = 0; c < H; ++c) {
+      auto& dst = s->x[size_t(r) * H + c];
+      dst = B.body_only ? y[c] : residual_add(M, R, dst, y[c]);
+    }
   }
 }
 
@@ -607,7 +788,8 @@ void moe_ffn(RefSeq* s, const flyx_moe_block& B, bool verify) {
     cur = std::move(out_c);
   }
   Vec h(size_t(R) * size_t(H));
-  for (int r = 0; r < R; ++r)
+  if (B.body_only) h = cur;
+  else for (int r = 0; r < R; ++r)
     norm(M, B.norm, cur.data() + size_t(r) * size_t(H), H, h.data() + size_t(r) * size_t(H));
   Vec r_logits(size_t(R) * size_t(E));
   lin(M, B.router, h.data(), R, H, E, r_logits.data(), R);
@@ -623,13 +805,28 @@ void moe_ffn(RefSeq* s, const flyx_moe_block& B, bool verify) {
     double* dst = &moe_raw[size_t(r) * size_t(H)];
     const double* hr = &h[size_t(r) * size_t(H)];
     for (int k = 0; k < K; ++k) {
-      lin_expert(M, B.gate_up, eidx[size_t(k)], hr, H, 2 * I, gu.data(), R);
+      if (B.separate_gate_up) {
+        lin_expert(M, B.gate, eidx[k], hr, H, I, gu.data(), R);
+        lin_expert(M, B.up, eidx[k], hr, H, I, gu.data() + I, R);
+      } else {
+        lin_expert(M, B.gate_up, eidx[k], hr, H, 2 * I, gu.data(), R);
+      }
       for (int i = 0; i < I; ++i)
         act[size_t(i)] = B.situ_beta > 0.f ? situ(gu[size_t(i)], gu[size_t(I + i)], B.situ_beta, B.situ_linear_beta)
                                            : silu(gu[size_t(i)]) * gu[size_t(I + i)];
       lin_expert(M, B.down, eidx[size_t(k)], act.data(), I, H, down_out.data(), R);
       const double w = ew[size_t(k)];
       for (int c = 0; c < H; ++c) dst[c] += w * down_out[size_t(c)];
+    }
+    if (B.has_shared) {
+      Vec gate(B.shared_inter), up(B.shared_inter);
+      lin(M, B.shared_gate, hr, 1, H, B.shared_inter, gate.data(), R);
+      lin(M, B.shared_up, hr, 1, H, B.shared_inter, up.data(), R);
+      for (int i = 0; i < B.shared_inter; ++i) gate[i] = silu(gate[i]) * up[i];
+      lin(M, B.shared_down, gate.data(), 1, B.shared_inter, H, down_out.data(), R);
+      const auto& router = M->vec(B.shared_router);
+      const double weight = sigmoid(std::inner_product(router.begin(), router.end(), hr, 0.0));
+      for (int c = 0; c < H; ++c) dst[c] += weight * down_out[c];
     }
   }
   Vec moe_out;
@@ -639,7 +836,8 @@ void moe_ffn(RefSeq* s, const flyx_moe_block& B, bool verify) {
   } else {
     moe_out = std::move(moe_raw);
   }
-  for (size_t i = 0; i < s->x.size(); ++i) s->x[i] = ffn_inp[i] + moe_out[i];
+  if (B.body_only) s->x = std::move(moe_out);
+  else for (size_t i = 0; i < s->x.size(); ++i) s->x[i] = ffn_inp[i] + moe_out[i];
 }
 
 bool penalized(const flyx_gen_params& g) { return g.presence_penalty != 0.f || g.frequency_penalty != 0.f; }
@@ -1374,6 +1572,13 @@ void fold_into(RefSeq* s, int from, int to, int rows) {
       }
       b.S[L] = std::move(S);
       b.conv[L] = std::move(win);
+    } else if (st.kind == FLYX_STATE_PLE) {
+      Vec win = a.sc[L];
+      for (int r = 0; r < rows; ++r) {
+        const auto* input = a.sc_in[L].data() + size_t(r) * (st.channels + 1);
+        ple_push(win, st, input, int32_t(input[st.channels]));
+      }
+      b.sc[L] = std::move(win);
     } else if (st.kind == FLYX_STATE_SHORTCONV) {
       Vec win = a.sc[L];
       for (int r = 0; r < rows; ++r)
@@ -1458,6 +1663,8 @@ void run_nodes(RefPlan* p, RefSeq* s) {
             s->feats.assign(size_t(s->rows) * size_t(tap_slots) * size_t(H), 0.0);
             s->choice.assign(s->rows, 0);
             break;
+          case FLYX_BLOCK_HC: hyper_connection(s, b->hc); break;
+          case FLYX_BLOCK_PLE: ple_layer(s, b->ple, p->phase == FLYX_PHASE_ROUND); break;
           case FLYX_BLOCK_GDN: gdn_mixer(s, b->gdn, p->phase == FLYX_PHASE_ROUND); break;
           case FLYX_BLOCK_ATTN: attn_mixer(s, b->attn); break;
           case FLYX_BLOCK_MLP: mlp(M, b->mlp, s->x.data(), s->rows); break;
@@ -1615,9 +1822,19 @@ int open_model(const flyx_model_desc* desc, const flyx_open_options* opts, flyx_
         }
       }
     }
+    std::unordered_set<int> lookup_tables;
+    for (const auto& b : m->blocks)
+      if (b.kind == FLYX_BLOCK_PLE) lookup_tables.insert(b.ple.table);
     for (int i = 0; i < desc->n_weights; ++i) {
       const flyx_weight& w = desc->weights[i];
       if (!w.t) throw std::runtime_error("weight " + std::to_string(i) + " has no tensor");
+      if (lookup_tables.count(i)) {
+        m->packed[i] = std::make_unique<flyx::backends::PackedRows>(*w.t, opts ? opts->ple_placement : FLYX_PLE_AUTO,
+                                                                    opts ? opts->ple_hot_bytes : 0,
+                                                                    opts ? opts->ple_host_room : 0);
+        m->W.push_back(w.t);  // Decode only the selected rows of the packed table.
+        continue;
+      }
       const int dt = w.t->dtype;
       // GGML's NVFP4 is a block type in the file and an NVFP4 weight in what it takes.
       const bool ggml_fp4 = dt == FLYX_DT_GGML_NVFP4;
@@ -1695,7 +1912,7 @@ int open_model(const flyx_model_desc* desc, const flyx_open_options* opts, flyx_
       const flyx_block& b = desc->blocks[i];
       const int k = b.kind;
       // DV's blocks (ABI 42) are taken and never run: such a model decodes here as without DV (lower).
-      if (k < FLYX_BLOCK_EMBED || k > FLYX_BLOCK_EAGLE4)
+      if (k < FLYX_BLOCK_EMBED || k > FLYX_BLOCK_PLE)
         throw std::runtime_error("block kind " + std::to_string(k) + ": not implemented by cpu_ref");
       if (k == FLYX_BLOCK_VISION_STEM && b.vision_stem.cls_token >= 0)
         throw std::runtime_error("vision_stem: cls_token is not yet implemented by cpu_ref");
@@ -1826,7 +2043,7 @@ int open_model(const flyx_model_desc* desc, const flyx_open_options* opts, flyx_
                      m->res16 ? "bf16" : "float32");
     }
     for (const auto& st : m->states) {
-      if (st.kind < FLYX_STATE_KV || st.kind > FLYX_STATE_SHORTCONV)  // DV's canvas: never kept (no DV rounds here)
+      if (st.kind < FLYX_STATE_KV || st.kind > FLYX_STATE_PLE)  // DV's canvas: never kept (no DV rounds here)
         throw std::runtime_error("state kind " + std::to_string(st.kind) + ": not implemented by cpu_ref");
       if (st.kind == FLYX_STATE_RING) m->ring_width = st.width;
     }
@@ -1863,6 +2080,7 @@ int lower(flyx_bmodel* bm, const flyx_program* prog, flyx_plan** out) {
     *out = reinterpret_cast<flyx_plan*>(p.release());
     return 0;
   }
+  bool given_tree = false;
   int most = 0;  // drafts the round may verify: up to a full round of given ones, else what its drafter proposes
   for (int i = 0; i < prog->n_nodes; ++i) {
     const flyx_node& n = prog->nodes[i];
@@ -1878,7 +2096,8 @@ int lower(flyx_bmodel* bm, const flyx_program* prog, flyx_plan** out) {
         (n.kind == FLYX_NODE_DRAFT || prog->phase == FLYX_PHASE_ROUND))
       return fail("DV's rounds (its tree and its canvas pass): not in this backend");
     if (n.kind == FLYX_NODE_GIVEN) most = FLYX_MAX_ROWS - 1;
-    if ((n.kind == FLYX_NODE_GIVEN || n.kind == FLYX_NODE_DRAFT) && n.arg1 != 0)
+    if (n.kind == FLYX_NODE_GIVEN && n.arg1 == FLYX_GIVEN_TREE) given_tree = true;
+    if (n.kind == FLYX_NODE_DRAFT && n.arg1 != 0)
       return fail("tree rounds: not in this backend");
     if (n.kind == FLYX_NODE_DRAFT) {
       const flyx_block& b = m->block(n.block);
@@ -1891,6 +2110,17 @@ int lower(flyx_bmodel* bm, const flyx_program* prog, flyx_plan** out) {
   }
   if (prog->width > most) return fail("round width exceeds what the drafter can propose");
   auto p = std::make_unique<RefPlan>();
+  if (given_tree) {
+    // The serial path oracle is currently validated for the hyper-connected trunk only.
+    if (std::none_of(m->blocks.begin(), m->blocks.end(), [](const auto& b) { return b.kind == FLYX_BLOCK_HC; }))
+      return fail("tree rounds: not in this backend");
+    for (int i = 0; i < prog->n_nodes; ++i) {
+      const int k = prog->nodes[i].kind;
+      if (k != FLYX_NODE_RUN && k != FLYX_NODE_ACCEPT && k != FLYX_NODE_COMMIT && k != FLYX_NODE_GIVEN)
+        return fail("cpu_ref: given-tree verification with persistent drafter context is unsupported");
+    }
+  }
+  p->given_tree = given_tree;
   p->m = m;
   p->phase = prog->phase;
   p->width = prog->width;
@@ -1912,6 +2142,7 @@ int seq_new(flyx_bmodel* bm, int32_t max_ctx, flyx_seq** out) {
     s->V.assign(m->states.size(), {});
     for (size_t i = 0; i < m->states.size(); ++i) {
       const auto& st = m->states[i];
+      if (st.kind == FLYX_STATE_INDEXER) s->K[i].assign(1, Vec(size_t(max_ctx) * (st.head_dim + 3)));
       if (st.kind == FLYX_STATE_KV) {
         s->K[i].assign(size_t(st.layers), Vec(size_t(max_ctx) * st.n_kv * st.head_dim, 0.0));
         s->V[i].assign(size_t(st.layers), Vec(size_t(max_ctx) * st.n_kv * st.head_dim, 0.0));
@@ -2266,6 +2497,45 @@ int encode_vision(flyx_plan* bp, const flyx_vision_input* in, float* out_embeds,
   }
 }
 
+// Serial oracle for tree verification. Each root-to-node path uses the same committed recurrent slot and
+// prefix K/V. Replaying the winner last leaves precisely its K/V and fold inputs available for commit/rewind.
+void verify_given_tree(RefPlan* plan, RefSeq* s) {
+  const int width = plan->width;
+  std::vector<int32_t> parents(width), draft(width), choice(width + 1), tokens(width + 1);
+  std::vector<int> taken(width + 1);
+  for (int i = 0; i < width; ++i) {
+    parents[i] = s->gen.parents && i < s->gen.n_drafts ? s->gen.parents[i] : i - 1;
+    if (parents[i] < -1 || parents[i] >= i) throw std::runtime_error("given tree: invalid parent");
+    draft[i] = forced_draft(s, s->position + i + 1);
+    if (draft[i] < 0 || draft[i] >= s->m->vocab) throw std::runtime_error("given tree: token outside vocabulary");
+  }
+  RefPlan path = *plan;
+  std::erase_if(path.nodes, [](const flyx_node& n) { return n.kind != FLYX_NODE_RUN; });
+  auto run_path = [&](int row) {
+    s->drafts.clear();
+    for (int i = row - 1; i >= 0; i = parents[i]) s->drafts.push_back(draft[i]);
+    std::reverse(s->drafts.begin(), s->drafts.end());
+    path.width = int(s->drafts.size());
+    if (s->position + path.width >= s->max_ctx) return false;
+    run_nodes(&path, s);
+    return true;
+  };
+  for (int row = 0; row <= width; ++row)
+    if (run_path(row)) choice[row] = s->choice.back();
+  const auto& g = s->gen;
+  int n = accept_tree(
+      width + 1, [&](int r) { return parents[r - 1] + 1; }, draft.data(), choice.data(), false,
+      [](int, int) { return false; }, [](int, int) { return 0.f; }, g.stop_ids,
+      std::min<int>(g.n_stop_ids, FLYX_MAX_STOP_IDS), taken.data(), tokens.data(), s->max_ctx - s->position);
+  if (!run_path(taken[n])) throw std::runtime_error("given tree: selected node outside context");
+  accept(s, n);
+  commit(s);
+  auto& result = s->ring.back();
+  result.n_drafts = width;
+  std::copy(draft.begin(), draft.end(), result.drafts);
+  std::copy(parents.begin(), parents.end(), result.parents);
+}
+
 int launch(flyx_plan* bp, flyx_seq* bs, const flyx_gen_params* g) {
   RefPlan* p = as_p(bp);
   RefSeq* s = as_s(bs);
@@ -2280,7 +2550,8 @@ int launch(flyx_plan* bp, flyx_seq* bs, const flyx_gen_params* g) {
       return 0;
     }
     s->drafts.assign(p->width, 0);
-    run_nodes(p, s);
+    if (p->given_tree) verify_given_tree(p, s);
+    else run_nodes(p, s);
   } catch (const std::exception& e) {
     return fail(e.what());
   }
@@ -2440,6 +2711,7 @@ uint64_t layout_hash(const RefModel* m) {
 
 size_t recurrent_doubles(const flyx_state& st) {
   if (st.kind == FLYX_STATE_GDN) return size_t(st.nv) * st.dv * st.dk + size_t(st.conv - 1) * cdim_of(st);
+  if (st.kind == FLYX_STATE_PLE) return size_t(st.conv - 1) * st.channels + st.width;
   if (st.kind == FLYX_STATE_SHORTCONV) return size_t(st.conv - 1) * size_t(st.channels);
   return 0;
 }
@@ -2448,6 +2720,7 @@ uint64_t snapshot_size(const RefSeq* s, int begin, int pos) {
   size_t n = size_t(s->m->ring_width);
   for (const auto& st : s->m->states) {
     if (st.kind == FLYX_STATE_KV) n += 2 * size_t(st.layers) * size_t(pos - begin) * st.n_kv * st.head_dim;
+    if (st.kind == FLYX_STATE_INDEXER) n += size_t(pos - begin) * (st.head_dim + 3);
     n += recurrent_doubles(st);
   }
   return sizeof(SnapshotHeader) + n * sizeof(double);
@@ -2475,7 +2748,10 @@ int snapshot_save(flyx_seq* bs, int32_t c, int32_t begin, const flyx_host_pieces
   auto put = [&](const double* v, size_t n) { out.put(v, n * sizeof(double)); };
   const auto& states = s->m->states;
   for (size_t i = 0; i < states.size(); ++i)
-    if (states[i].kind == FLYX_STATE_KV)
+    if (states[i].kind == FLYX_STATE_INDEXER) {
+      const size_t width = size_t(states[i].head_dim) + 3;
+      put(s->K[i][0].data() + begin * width, (ck.pos - begin) * width);
+    } else if (states[i].kind == FLYX_STATE_KV)
       for (int l = 0; l < states[i].layers; ++l) {
         const size_t width = size_t(states[i].n_kv) * states[i].head_dim;
         put(s->K[i][size_t(l)].data() + begin * width, (ck.pos - begin) * width);
@@ -2485,7 +2761,7 @@ int snapshot_save(flyx_seq* bs, int32_t c, int32_t begin, const flyx_host_pieces
     if (states[i].kind == FLYX_STATE_GDN) {
       put(ck.S[i].data(), ck.S[i].size());
       put(ck.conv[i].data(), ck.conv[i].size());
-    } else if (states[i].kind == FLYX_STATE_SHORTCONV) {
+    } else if (states[i].kind == FLYX_STATE_SHORTCONV || states[i].kind == FLYX_STATE_PLE) {
       put(ck.sc[i].data(), ck.sc[i].size());
     }
   }
@@ -2506,7 +2782,10 @@ int snapshot_load(flyx_seq* bs, const flyx_host_pieces* src, uint64_t bytes, int
   auto get = [&](double* v, size_t n) { in.get(v, n * sizeof(double)); };
   const auto& states = s->m->states;
   for (size_t i = 0; i < states.size(); ++i)
-    if (states[i].kind == FLYX_STATE_KV)
+    if (states[i].kind == FLYX_STATE_INDEXER) {
+      const size_t width = size_t(states[i].head_dim) + 3;
+      get(s->K[i][0].data() + h.begin * width, (h.pos - h.begin) * width);
+    } else if (states[i].kind == FLYX_STATE_KV)
       for (int l = 0; l < states[i].layers; ++l) {
         const size_t width = size_t(states[i].n_kv) * states[i].head_dim;
         get(s->K[i][size_t(l)].data() + h.begin * width, (h.pos - h.begin) * width);
@@ -2521,7 +2800,7 @@ int snapshot_load(flyx_seq* bs, const flyx_host_pieces* src, uint64_t bytes, int
       sl.conv[i].resize(n - sl.S[i].size());
       get(sl.S[i].data(), sl.S[i].size());
       get(sl.conv[i].data(), sl.conv[i].size());
-    } else if (states[i].kind == FLYX_STATE_SHORTCONV) {
+    } else if (states[i].kind == FLYX_STATE_SHORTCONV || states[i].kind == FLYX_STATE_PLE) {
       sl.sc[i].resize(recurrent_doubles(states[i]));
       get(sl.sc[i].data(), sl.sc[i].size());
     }

@@ -1023,6 +1023,32 @@ struct MRoPE {
   __host__ __device__ bool active() const { return sec[0] > 0 || sec[1] > 0 || sec[2] > 0; }
 };
 
+constexpr int kPleStage = 16;
+struct PleWindow {
+  float *win, *replay;
+  size_t w_stride, r_stride;
+};
+void ple_hash(flyx_ple_block b, PleWindow w, const int* tokens, int* ids, int rows, const DevParams* p, const TreeRows* tree, cudaStream_t st);
+void ple_decode(const uint8_t* table, size_t stride, int dtype, int width, const int* ids, int count, float* out, cudaStream_t st);
+void ple_gates(const float* key, const float* query, const float* value, int h, int streams, int rows, float* y, cudaStream_t st);
+void ple_convolve(flyx_ple_block b, PleWindow w, const float* weights, const float* y, float* u, float* wide,
+                  const int* tokens, int rows, const DevParams* p, const TreeRows* tree, bool round, int next,
+                  int snap, int snap_rows, cudaStream_t st);
+void ple_compact(PleWindow w, int channels, const DevParams* p, const TreeRows* tree, cudaStream_t st);
+
+constexpr int kIndexTile = 8;
+struct SparseIndex {
+  int dim, heads, group, keep, rot;
+  double theta;
+  MRoPE rope;
+  const float *qn, *kn;
+  float eps, offset;
+};
+void indexed_attention(SparseIndex index, float* proj, float* keys, float* scores, int score_stride,
+                       int* selected, const float* q, KvRef kv, int nh, int nkv, int hd, const float* gate,
+                       int gate_stride, float* out, int rows, const DevParams* p, const TreeRows* tree, cudaStream_t st);
+void compact_index(float* rows, int width, const DevParams* p, const TreeRows* tree, cudaStream_t st);
+
 // Attention input prep for one projection output row block:
 //   qkv rows: [q heads (nh*hd) | other (skip) | k (nkv*hd) | v (nkv*hd)] at the given column offsets.
 //   q -> rmsnorm(q_norm) -> rope -> q_out [rows, nh, hd]
@@ -1157,10 +1183,16 @@ void swiglu(const float* gu, int ld, int I, float* out, int ld_out, int rows, cu
 void round_rows_bf16(float* x, int ld, int n, int rows, cudaStream_t st);
 void add_rows_bf16(float* x, int ld, const float* y, int ldy, int n, int rows, cudaStream_t st);
 
+void hc_rows(int phase, float* x, float* wide, const float* norm, const float* inject, const float* gain,
+             int rows, int streams, int hidden, cudaStream_t st);
+void hc_down_silu(float* x, int64_t elements, int streams, cudaStream_t st);
+void shared_expert_add(float* x, const float* input, const float* router, const float* expert, int rows, int hidden, cudaStream_t st);
+
 // ---- gated delta net ------------------------------------------------------------
 struct GdnDims {
   int nk, nv, dk, dv, ck;   // heads, head dims, conv kernel
   int tiled = 0;            // how value heads map to key heads (flyx_gdn_head_order)
+  int sigmoid_output = 0;
   __host__ __device__ int C() const { return 2 * nk * dk + nv * dv; }
   __host__ __device__ int rep() const { return nv / nk; }  // value heads to a key head
   // The key head value head h reads; value head i (0 .. rep() - 1) of key head kh; whether h is a key head's first.
