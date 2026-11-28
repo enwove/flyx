@@ -30,7 +30,7 @@
 extern "C" {
 #endif
 
-#define FLYX_BACKEND_ABI_VERSION 53u
+#define FLYX_BACKEND_ABI_VERSION 54u
 #define FLYX_BACKEND_ENTRY "flyx_backend_get_api"
 /* How a backend library exports its entry. */
 #if defined(_WIN32)
@@ -1000,6 +1000,10 @@ typedef struct {
   uint64_t process;
   /* Minimum free device bytes the backend's allocator keeps free (ABI 53; 0 when unconstrained). */
   uint64_t reserve_floor;
+  /* Of `weights`, what trim() gives back before anything drafts read: copies only the target's own rounds read, to
+   * run faster (ABI 54).  The engine gives them back rather than put K/V of the context it was asked for in host
+   * memory, where without them that context's K/V fits on the device.  0: none. */
+  uint64_t speed;
 } flyx_memory_info;
 
 typedef struct flyx_bmodel flyx_bmodel;

@@ -1231,6 +1231,7 @@ void make_draft_weights(flyx_bmodel* m);
 void make_head_fp8(flyx_bmodel* m);
 void make_head_w12(flyx_bmodel* m);
 uint64_t trim(flyx_bmodel* m, uint64_t bytes);  // the ABI's trim: speed-only copies of the head
+uint64_t head_speed_bytes(const flyx_bmodel* m);  // flyx_memory_info::speed: what trim() gives back first
 
 // regions/linear.cpp (gemm and gemm_presplit above)
 void draft_logits(const HeadBlock& h, const float* x, int ldx, float* y, int rows, const Launch& L);

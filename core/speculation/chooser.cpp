@@ -10,13 +10,15 @@ void RoundChooser::configure(const std::vector<int>* widths, const std::vector<i
                              const std::vector<double>* cost_ms, const std::vector<int>* lookup_widths,
                              const std::vector<int>* trunks, const std::vector<double>* lookup_cost_ms,
                              const std::vector<std::vector<int>>* adaptive_checkpoints,
-                             const std::vector<double>* cost_per_token, int cost_at, SharedTokens* shared) {
+                             const std::vector<double>* cost_per_token, int cost_at, SharedTokens* shared,
+                             const RoundCostModel* costs, const RoundCostModel* lookup_costs) {
   widths_ = widths;
   drafters_ = drafters;
   lookup_widths_ = lookup_widths;
   lookup_cost_ = lookup_cost_ms;
+  lookup_costs_ = lookup_costs;
   lookup_accept_ = 0.75;
-  spec_.reset(widths, drafters, cost_ms, trunks, cost_per_token, cost_at, shared);
+  spec_.reset(widths, drafters, cost_ms, trunks, cost_per_token, cost_at, shared, costs);
   stoppers_.clear();
   if (adaptive_checkpoints && !adaptive_checkpoints->empty()) {
     double plain_ms = 1.0;
@@ -76,7 +78,9 @@ double RoundChooser::lookup_rate(size_t k) const {
 }
 
 double RoundChooser::lookup_cost(size_t k) const {
-  if (lookup_cost_ && k < lookup_cost_->size()) return (*lookup_cost_)[k];
+  if (lookup_costs_ && lookup_cost_ && k < lookup_cost_->size())
+    return std::max(SpecController::kLeastMs, lookup_costs_->cost(k, context_));
+  if (lookup_cost_ && k < lookup_cost_->size()) return std::max(SpecController::kLeastMs, (*lookup_cost_)[k]);
   return 1.0 + 0.02 * (*lookup_widths_)[k];  // before any timing: a row costs little beside the weights
 }
 
@@ -263,12 +267,12 @@ void RoundChooser::result(const RoundChoice& round, bool emitted, int accepted, 
       }
       spec_.observe(obs_index, accepted, trunk_accepted);  // the drafter's acceptance only
       // A fixed round's tokens are credited at its own plan's cost, at the context it ran at (tokens holds its own
-      // already): its width may lie past the stopper's checkpoints.
+      // already): its width may lie past the stopper's checkpoints.  The load's cost, as the checkpoints' are.
       if (!spec_.is_tree(round.index) && round.drafter >= 0 && size_t(round.drafter) < stoppers_.size() &&
           stoppers_[size_t(round.drafter)].ready()) {
         const int ran_at = std::max(0, static_cast<int>(tokens.size()) - (accepted + 1));
         stoppers_[size_t(round.drafter)].observe(eff_w, accepted, draft_prob, draft_margin,
-                                                 round.adaptive ? 0.0 : spec_.cost(round.index, ran_at));
+                                                 round.adaptive ? 0.0 : spec_.load_cost(round.index, ran_at));
       }
     }
     // The runs are a model drafter's chains (DFlash2's block): no tree's, and none of DV, whose canvas follows its

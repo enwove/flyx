@@ -48,7 +48,7 @@ flyx serve unsloth/Qwen3.8-27B-GGUF:UD-IQ2_S --drafter-file z-lab/Qwen3.8-27B-DF
 
 ## 3. Speculative Drafters
 
-`flyx` supports seven drafter sources and can run multiple simultaneously; a per-round controller (`RoundChooser`) chooses the drafter and width dynamically from load-time measured costs and live acceptance rates.
+`flyx` supports seven drafter sources and can run multiple simultaneously; a per-round controller (`RoundChooser`) chooses the drafter and width dynamically from each round's cost at the context (timed at load, then learned from the rounds a session reads alone: a long context's K/V read over the bus or through a 2-bit copy makes wide rounds dearer; `FLYX_LEARN_COSTS=0` keeps the load's) and live acceptance rates.
 
 | Drafter | Source | Notes |
 |---|---|---|
@@ -166,6 +166,6 @@ A target's own adapters (a **V-LoRA**: LoRA beside the target's linears, e.g. bi
 | **24 GB** (RTX 3090 / 4090) | 32–64 GB | `unsloth/Qwen3.8-27B-GGUF:UD-Q4_K_XL` (17.7 GB) or `UD-IQ3_XXS`; `--ctx max` | Fast GPU-resident context + high-speed 2-bit StrataFlux overflow to host RAM |
 | **32 GB** (RTX 5090) | 64+ GB | `unsloth/Qwen3.8-27B-GGUF:UD-Q4_K_XL` + `--drafter-file z-lab/Qwen3.8-27B-DFlash2 --ctx max` | The planner caps the request at the trained 262,144 tokens and the available memory budget |
 
-> **8–10 GB GPUs (e.g., RTX 3080 10 GB, RTX 4060 / 5060 8 GB):** Cannot fit 27B weights alongside session recurrent state; use smaller models such as `Qwen/Qwen3.5-4B` (BF16/NVFP4/GGUF). On tight 8 GB desktop GPUs (where Windows WDDM reserves VRAM for desktop composition), `flyx` queries NVML free memory and automatically trims speed-only auxiliary copies (e.g., duplicate W12/FP8 head copies) when needed to fit prefill workspace and sessions.
+> **8–10 GB GPUs (e.g., RTX 3080 10 GB, RTX 4060 / 5060 8 GB):** Cannot fit 27B weights alongside session recurrent state; use smaller models such as `Qwen/Qwen3.5-4B` (BF16/NVFP4/GGUF). On tight 8 GB desktop GPUs (where Windows WDDM reserves VRAM for desktop composition), `flyx` queries NVML free memory and automatically trims speed-only auxiliary copies (e.g., duplicate W12/FP8 head copies) when needed to fit prefill workspace and sessions, and the head's copies before any of the context's K/V would go to host memory where the whole context then fits on the GPU (an explicit `--kv-gpu` keeps them).
 >
 > **GPU tuning tables:** Pre-tuned dispatch tables ship under `backends/cuda/variants/` for RTX 3060, RTX 3080, RTX 3090, RTX 4060 Ti, RTX 4070 Ti SUPER, RTX 4080 SUPER, RTX 4090, L4, L40S, RTX 5060 Ti, RTX 5070, RTX 5070 Ti, RTX 5080, RTX 5090, A100 PCIe 40 GB, and H100 80GB HBM3 (other GPUs inherit their architecture table or defaults).

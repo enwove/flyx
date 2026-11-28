@@ -143,6 +143,8 @@ void apply_environment(EngineOptions* o) {
     }
   if (!o->adaptive_given)
     if (const auto v = os::env_bool(env::kAdaptive)) o->adaptive = *v;
+  if (!o->learn_costs_given)
+    if (const auto v = os::env_bool(env::kLearnCosts)) o->learn_costs = *v;
 }
 
 namespace {
@@ -400,6 +402,22 @@ bool Engine::build_and_calibrate_plans(double* t_plans, double* t_rounds, std::s
   } else {
     spec::warm_rounds(api_, bm_, plans_.prefill, plans_.rounds, prompt);
   }
+  // The costs the controller chooses by from here: these timings, then what the rounds read teach (RoundCosts),
+  // where they choose (one plan and no lookup: nothing timed, nothing to learn).  A drafter's wider chain costs no
+  // less than its next narrower one; so does a lookup round of more drafts (given_widths ascend).
+  costs_chosen_ = plans_.widths.size() > 1 || !plans_.given.empty();
+  std::vector<int> narrower(plans_.widths.size(), -1), lookup_narrower(lookup_ms_.size(), -1);
+  for (size_t i = 0; i < plans_.widths.size(); ++i) {
+    const int d = plans_.drafters[i];
+    if (d < 0 || plans_.drafter_trees[i]) continue;
+    for (size_t j = 0; j < plans_.widths.size(); ++j)
+      if (plans_.drafters[j] == d && !plans_.drafter_trees[j] && plans_.widths[j] < plans_.widths[i] &&
+          (narrower[i] < 0 || plans_.widths[j] > plans_.widths[size_t(narrower[i])]))
+        narrower[i] = int(j);
+  }
+  for (size_t k = 1; k < lookup_narrower.size(); ++k) lookup_narrower[k] = int(k - 1);
+  round_costs_.reset(round_ms_, &round_ms_per_token_, round_ms_at_, &narrower);
+  lookup_costs_.reset(lookup_ms_, nullptr, round_ms_at_, &lookup_narrower);
   *t_rounds = os::now_ms();
   return true;
 }
@@ -493,16 +511,32 @@ bool Engine::plan_memory(plan::KvTiers* tiers, int session_limit, int* asked_ctx
   const int min_ctx = opt_.ctx_max ? 1024 : opt_.ctx_given ? 0 : kMinFittedCtx;
   // Not even one session fits (in any layout account() takes, its K/V in host memory or its context shrunk
   // included): one step of what the backend keeps for speed, and the budget again.  Only when nothing is left to give
-  // is it an error.
+  // is it an error.  The K/V of the context asked for comes before the copies only the target's rounds read to run
+  // faster (flyx_memory_info::speed) too: where a session of it fits on the GPU without them, they go, a step at a
+  // time, rather than its positions past what fits beside them to host memory, read over the bus every step.  With
+  // the copies first, a tenth of a GB other programs held or let go of at load decided where the K/V went: Qwen3.5-4B
+  // NVFP4 at 40960 tokens on an RTX 5060 Ti, with 0.1 GB more free, kept its certified head (0.64 GB) and 6144
+  // positions on the GPU and decoded a 35K-token prompt at 41 tok/s, against 82 with the head given back and every
+  // position there (the head alone: 127 against 106 tok/s on short prompts).  An explicit --kv-gpu keeps the copies.
+  const int asked = opt_.max_ctx;
+  auto speed_in_the_way = [&] {
+    flyx_memory_info mi{};
+    return tiers->gpu < 0 && ledger_.budget() > 0 && budget_.whole_bytes > budget_.sessions_room && api_->memory &&
+           api_->memory(bm_, &mi) == 0 && mi.speed > 0 && budget_.whole_bytes - budget_.sessions_room <= mi.speed;
+  };
   for (;;) {
-    while (!plan::account(api_, bm_, model_->drafters() > 0, 2 * bf16 > all, &opt_.max_ctx, min_ctx, *tiers, &ledger_,
-                          &budget_, err, opt_.ctx_max)) {
+    for (;;) {
+      const bool placed = plan::account(api_, bm_, model_->drafters() > 0, 2 * bf16 > all, &opt_.max_ctx, min_ctx,
+                                        *tiers, &ledger_, &budget_, err, opt_.ctx_max);
+      if (placed && !speed_in_the_way()) break;
       const std::string why = *err;
       if (!give_back()) {
+        if (placed) break;
         *err = why;
         if (given_back_) *err += " (" + gb(given_back_) + " the backend kept for speed already given back)";
         return false;
       }
+      opt_.max_ctx = asked;  // account() may have fitted a shorter one
       if (!lower_and_time(err)) {
         budget_.oom = plans_.oom;
         return false;
@@ -513,8 +547,10 @@ bool Engine::plan_memory(plan::KvTiers* tiers, int session_limit, int* asked_ctx
     if (session_limit > 1) plan::fit_second_session(api_, bm_, *tiers, ledger_, &budget_);
     const uint64_t f = current_floor();
     if (f <= tiers->min_vram_reserve) break;
-    // Backend's reserve floor grew lazily (e.g., CUDA VMM fell back to paged allocation); replan with the new floor.
+    // Backend's reserve floor grew lazily (e.g., CUDA VMM fell back to paged allocation); replan with the new floor,
+    // for the context asked for.
     device_.reserve_floor = tiers->min_vram_reserve = f;
+    opt_.max_ctx = asked;
   }
   if (given_back_)
     log::info("flyx: %s of GPU memory the backend kept only for speed given back so that a session fits (the same "

@@ -668,11 +668,13 @@ Scheduler::Start Scheduler::start(const std::shared_ptr<Job>& job, std::unique_p
 void Scheduler::advance_all() {
   if (running_.size() == 1) {  // alone: wait for the device, as a request always did
     running_.front()->gen->set_batched(false);
+    running_.front()->gen->set_alone(true);
     running_.front()->gen->advance(true);
     return;
   }
   // Several: the rounds they would launch now go out together, the weights read once for all of them;
   // then each does what the device is ready for, none waited for.
+  for (auto& r : running_) r->gen->set_alone(false);  // the time between its reads is others' rounds' too
   bool worked = opt_.batch_rounds && launch_rounds();
   for (auto& r : running_)
     if (!r->gen->done() && r->gen->advance(false) != Generation::Progress::kBusy) worked = true;
