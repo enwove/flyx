@@ -8,7 +8,8 @@ namespace flyx {
 namespace {
 
 bool read(std::vector<std::unique_ptr<os::MappedFile>>* maps, const std::string& path, ModelFile::Contents* c,
-          std::string* err, bool need_tokenizer, const PathAllowFn& allow_path) {
+          std::string* err, bool need_tokenizer, const PathAllowFn& allow_path,
+          std::vector<modelfile::Bundled>* bundled = nullptr) {
   if (allow_path && !allow_path(path))
     return *err = path + ": path is not allowed by remote path policy", false;
   maps->clear();
@@ -17,7 +18,7 @@ bool read(std::vector<std::unique_ptr<os::MappedFile>>* maps, const std::string&
   if (!first->open(path, err)) return false;
   *c = {};
   if (modelfile::is_flyx(first->data(), first->size()))
-    return modelfile::read_flyx(first->data(), first->size(), path, c, err);
+    return modelfile::read_flyx(first->data(), first->size(), path, c, err, bundled);
   if (modelfile::is_gguf(first->data(), first->size()))
     return modelfile::read_gguf(maps, path, c, err, need_tokenizer, allow_path);
   *err = path + ": not a model file this build reads (.flyx or .gguf)";
@@ -35,16 +36,26 @@ std::string drafter_source_kind(const std::string& path, const PathAllowFn& allo
 bool ModelFile::open(const std::string& path, std::string* err, const PathAllowFn& allow_path) {
   companions_.clear();
   maps_.clear();
+  bundled_ = 0;
   if (allow_path && !allow_path(path))
     return *err = path + ": path is not allowed by remote path policy", false;
   if (modelfile::is_drafter_dir(path, allow_path))
     return *err = path + " holds a drafter alone, not a model: give it beside the model (--drafter-file)", false;
-  if (!read(&maps_, path, &c_, err, /*need_tokenizer=*/true, allow_path)) return false;
+  std::vector<modelfile::Bundled> bundled;
+  if (!read(&maps_, path, &c_, err, /*need_tokenizer=*/true, allow_path, &bundled)) return false;
   // The header is the file's word: a key of another type than expected is read as absent, never thrown on.
   const auto kind = c_.header.find("kind");
   if (kind != c_.header.end() && kind->is_string() && kind->get_ref<const std::string&>() == "drafter")
     return *err = path + " holds a drafter alone, not a model: give it beside the model (--drafter-file)", false;
   if (c_.header.is_object()) c_.header.erase("companions");  // add() lists them; what a file put there is not one
+  for (auto& b : bundled) {  // in this file's mapping: the companions own no mapping of their own
+    auto more = std::make_unique<Companion>();
+    more->role = b.role;
+    more->c = std::move(b.c);
+    c_.header["companions"].push_back(more->c.header);
+    companions_.push_back(std::move(more));
+  }
+  bundled_ = int(companions_.size());
   return true;
 }
 
@@ -132,6 +143,42 @@ std::vector<int32_t> ModelFile::eos_ids() const {
       for (const auto& id : g["eos_ids"])
         if (id.is_number_integer()) out.push_back(id.get<int32_t>());
     }
+  }
+  return out;
+}
+
+std::vector<std::string> packed_drafters(const std::string& path, const PathAllowFn& allow_path) {
+  std::vector<std::string> out;
+  if (allow_path && !allow_path(path)) return out;
+  nlohmann::json h;
+  if (!modelfile::peek_flyx_header(path, &h) || !h.contains("gguf") || !h["gguf"].is_object()) return out;
+  // A GGUF header's MTP layers (<arch>.nextn_predict_layers), 0 when it says none.
+  auto mtp_layers = [](const nlohmann::json& one) {
+    if (!one.contains("arch") || !one["arch"].is_string() || !one.contains("gguf") || !one["gguf"].is_object()) return 0;
+    const auto it = one["gguf"].find(one["arch"].get<std::string>() + ".nextn_predict_layers");
+    return it != one["gguf"].end() && it->is_number_integer() ? it->get<int>() : 0;
+  };
+  if (mtp_layers(h) > 0) out.push_back("mtp");
+  if (!h.contains("bundled") || !h["bundled"].is_array()) return out;
+  for (const auto& b : h["bundled"]) {
+    if (!b.is_object() || b.value("role", "") != "drafter" || !b.contains("header") || !b["header"].is_object()) continue;
+    const auto& bh = b["header"];
+    std::string kind;
+    if (bh.value("arch", "") == "dflash") {  // llama.cpp's: a Markov head is DSpark's
+      const auto& g = bh.contains("gguf") && bh["gguf"].is_object() ? bh["gguf"] : nlohmann::json::object();
+      kind = g.value("dflash.has_markov_context", false) ? "dspark" : "dflash2";
+    } else if (mtp_layers(bh) > 0) {
+      kind = "mtp";
+    } else if (bh.contains("draft") && bh["draft"].is_object()) {
+      kind = bh["draft"].value("kind", "");
+    } else if (b.contains("directory_config") && b["directory_config"].is_object() &&
+               b["directory_config"].contains("architectures") && b["directory_config"]["architectures"].is_array()) {
+      std::vector<std::string> names;
+      for (const auto& a : b["directory_config"]["architectures"])
+        if (a.is_string()) names.push_back(a.get<std::string>());
+      kind = drafter_kind_of(names);
+    }
+    out.push_back(kind);
   }
   return out;
 }

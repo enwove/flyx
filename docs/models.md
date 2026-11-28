@@ -10,6 +10,7 @@ Reference for supported model architectures (Qwen3.5 / Qwen3.8, Qwen3, Inkling-2
 |---|---|---|---|
 | **GGUF** (native, zero conversion) | `qwen35` (Qwen3.5 / Qwen3.8 hybrid GDN + gated attention, plus multimodal vision via `--mmproj` `qwen3vl_merger` `mmproj-*.gguf`), `qwen3` (dense), `inkling2_loop` (Inkling-2 looped ShortConv + RelAttn + sparse MoE) | `F32`, `F16`, `BF16`, `Q2_0`, `Q4_0`, `Q4_1`, `Q5_0`, `Q5_1`, `Q8_0`, `Q2_K`–`Q6_K`, `IQ1_S`, `IQ1_M`, `IQ2_XXS`, `IQ2_XS`, `IQ2_S`, `IQ3_XXS`, `IQ3_S`, `IQ4_NL`, `IQ4_XS`, mixed quants, `MXFP4`, GGML `NVFP4`; a split file (`-00001-of-0000N.gguf`) with all its parts in one folder | Inkling-2 vision towers (`mmproj`), scaled RoPE, Llama GGUFs |
 | **`.flyx`** (via `python/convert`) | Qwen3.5 / Qwen3.8, Qwen3, Llama (e.g. MiniCPM5-1B) | `BF16`, NVIDIA ModelOpt `NVFP4` | Vision / MoE; a Llama GGUF |
+| **`.flyx` packed from a GGUF** (via `flyx pack`, [section 4](#packing-a-gguf-with-its-drafters)) | Every GGUF architecture above | Every GGUF type above, byte for byte, with the model's drafters bundled | What its GGUF is refused for |
 
 Inkling-2-Mini stores 24 layers. Running its 12-layer core three times gives 48 effective layer applications. It combines sliding-window and global relative attention, ShortConv and AttnRes with 128 experts, routing each token to eight. Its trained window is 1,048,576 tokens. The usable window depends on available VRAM and host RAM.
 
@@ -19,7 +20,7 @@ Key execution properties:
 - **Vision encoder offload and quantization:** Vision weights (`mmproj-*.gguf`, BF16/F16/F32 or pre-quantized GGML blocks) default to `--vision-device disk` + `--vision-quant q8`: floating-point vision linears are quantized on the fly to `Q8_0` (~46% smaller; 0.50 GB on Qwen3.8-27B, KL 0.00125 / 98.75% top-1 vs BF16 over 800 multimodal positions; pre-quantized `mmproj` files stay packed) and written to an auto-deleted temp file flushed clean to OS Standby/Page Cache (**0 bytes resident VRAM, 0 bytes locked host RAM at KV-budget time** — zero impact on `--kv-ram auto` context capacity). During `encode_vision`, weights stream through a 3-stage pipeline (lazy read-only OS page-cache map → 16 MiB lazy pinned host ring → double-buffered GPU staging) with **bit-identical outputs** to GPU-resident execution (~54–64 ms warm ViT on RTX 5070 Ti). Override with `--vision-device host|gpu|auto` (`host`: pinned host RAM; `auto`: GPU when >= 8 GB free after weights, else `disk`) and `--vision-quant exact|nvfp4` (`exact`: file precision; `nvfp4`: ~70% smaller, opt-in).
 - **GGUF format details:** See [docs/design/gguf.md](design/gguf.md).
 - **Llama (MiniCPM5-1B):** Qwen3's layers without the per-head q/k RMSNorms (`LlamaForCausalLM`), from `.flyx` only (llama.cpp's converter reorders a Llama's q and k rows, so a Llama GGUF is refused). MiniCPM5-1B's pre-tokenizer cuts numbers into groups of three before the Qwen2 split, and its `<s>` goes before every raw prompt as its tokenizer puts it; its chat template renders as transformers renders it (tool calls are not read back yet, so a request with tools is refused). Its K/V cache is binary16 by default: FP8 moved its next-token distributions visibly (KL 0.0064, top-1 97.2%, perplexity +1.4% against binary16), so a Llama keeps binary16 unless `--kv fp8`; Qwen3.5 and Qwen3 keep FP8.
-- **`.flyx` format 2:** a file whose header requires a part a reader must not ignore (`"requires": ["lora"]`, the V-LoRA below) is written as format 2, so builds that read only format 1 refuse it instead of decoding the plain model; every other file stays format 1.
+- **`.flyx` format 2:** a file whose header requires a part a reader must not ignore (`"requires": ["lora"]`, the V-LoRA below) is written as format 2, so builds that read only format 1 refuse it instead of decoding the plain model; every other file stays format 1. A file packed from a GGUF (`flyx pack`) requires `"gguf"`: format 2 as well.
 - **LoRA adapters (PEFT, `--lora DIR|org/name[:FOLDER]`):** an adapter as Hugging Face PEFT saves it (`adapter_config.json`, `adapter_model.safetensors`) runs unmerged beside the model's linears on every pass, its products summed in float32: attention q/k/v/o, MLP gate/up/down and the gated delta net's five in-projections and output (Qwen3, Qwen3.5 / Qwen3.8, Llama; `.flyx` and GGUF, GGML block weights included), any rank, scale alpha / r or alpha / sqrt(r) (rsLoRA). F32 and F16 tensors are rounded to bf16 at load (KL against their float32 products in [numerics](design/numerics.md#against-llamacpp)). Refused with the reason, never run in part: DoRA, ranks or alphas per module, `modules_to_save`, a bias, an activated LoRA (`alora_invocation_tokens`), retrained token embeddings, PiSSA / OLoRA / CorDA / LoftQ initializations not converted on saving (they assume a base those initializations changed), the head's, an embedding's or a vision tower's adapters, layers past the model's, tensors in F8, integers or a pickle (`adapter_model.bin`). The dashboard's LoRA tab lists the ones Hugging Face files for the model's base (`GET /v1/hub/loras`, `GET /v1/hub/lora`: [server](server.md)).
 
 ---
@@ -36,7 +37,7 @@ flyx serve unsloth/Qwen3.8-27B-GGUF:UD-IQ2_S --drafter-file z-lab/Qwen3.8-27B-DF
 
 | Rule | Behavior |
 |---|---|
-| `org/repo:QUANT` | Selects the GGUF carrying `QUANT` (falls back to `UD-<QUANT>` when unique). Passing `org/repo` without `:QUANT` lists available GGUFs and sizes. |
+| `org/repo:QUANT` | Selects the GGUF carrying `QUANT` (falls back to `UD-<QUANT>` when unique). Passing `org/repo` without `:QUANT` lists available GGUFs and sizes. A repository of `.flyx` files and no GGUF model (`flyx pack`'s, one quantization a file) is chosen from the same way. |
 | `org/repo:QUANT@REV` | Pins a branch or commit hash (also used to address older cached snapshots). |
 | Auto MTP sidecar | If a GGUF lacks an embedded MTP layer and the repo contains `MTP/*.gguf` (e.g., `unsloth/Qwen3.8-27B-GGUF`), `flyx` fetches and attaches it automatically. |
 | Auto DSpark sidecar | FLYX tries complete DSpark GGUFs in the model's Hub repository, or matching `dspark-<model name>*.gguf` files beside a local GGUF. It prefers the base quantization when several files share it, then the smaller download. For example, `dspark-Inkling-2-Mini-Q8_0.gguf` precedes `dspark-Inkling-2-Mini-Q8_0_Old.gguf`. It attaches the first candidate whose Markov header and model dimensions pass validation. Use `--drafter none` for no neural drafter. The modes `mtp` and `dflash2` also suppress DSpark, as does `--no-spec`. In auto mode, naming a drafter suppresses implicit DSpark. With `dspark` or `all`, a named drafter of another kind still allows discovery. |
@@ -76,9 +77,9 @@ Control flags:
 
 Windowed DFlash2 layers keep FP16 context keys and values in a ring even beside an FP8 target. Use `--backend-opt dflash_ring=0` for the flat control. DSpark has independent per-layer rings. CUDA's `held_precision()` classifies the bound drafter linears by their actual storage. The dashboard and telemetry report the resulting precision even when packed companion weights already came from disk in Q8_0.
 
-## 4. Converting Hugging Face Checkpoints to `.flyx`
+## 4. Making `.flyx` Files
 
-GGUF files run directly without conversion. Convert HF Safetensors (BF16 or ModelOpt NVFP4) or standalone DFlash2 / DFlash / DSpark / DSpine checkpoints to `.flyx` using `python/convert`:
+GGUF files run directly without conversion. A GGUF can be packed with its drafters into one `.flyx` file ([below](#packing-a-gguf-with-its-drafters)). Convert HF Safetensors (BF16 or ModelOpt NVFP4) or standalone DFlash2 / DFlash / DSpark / DSpine checkpoints to `.flyx` using `python/convert`:
 
 ```sh
 # Target + DFlash2 combined into one .flyx (BF16 or ModelOpt NVFP4)
@@ -134,6 +135,18 @@ PYTHONPATH=python/convert python -m flyx_convert --model ~/models/MiniCPM5-1B \
 ```
 
 A target's own adapters (a **V-LoRA**: LoRA beside the target's linears, e.g. bifill-dv's rank-64 `lora_g_b2h`) run unmerged on every pass, their sums in float32 on the kernels of the linears they sit beside (a bf16 merge loses about 70% of the delta). `export_dv.py --vlora` exports them with or without a DV; `flyx_convert --lora EXPORT` writes a V-LoRA alone. A file with adapters is `.flyx` format 2. Adapters on GGML block weights, on an attention with an output gate, or on an MTP layer are refused. Which checkpoints make which DV file, and what DV is held to: [DV](design/dv.md).
+
+### Packing a GGUF with its drafters
+
+`flyx pack` writes a GGUF model, the drafters the engine would take beside it and the settings measured best for it into one `.flyx` file, so that the file runs at its best with nothing beside it and no flag. It reads the GGUF with the engine's own reader and writes what it read: the GGML blocks byte for byte under their GGUF names, the GGUF's metadata, tokenizer and chat template, and each drafter (or a projector, when named) as a bundled file attached on open in place of a sidecar. Reading the packed file gives the engine what reading the GGUF and its drafters gave it (`flyx_pack` and `gguf_cpu_ref` hold the two to each other, byte for byte and round for round).
+
+```sh
+# The model, its repository's MTP layer and DSpark drafter (unless --no-auto-drafters), and drafters named
+flyx pack unsloth/Qwen3.8-27B-GGUF:UD-IQ3_XXS --drafter-file z-lab/Qwen3.8-27B-DFlash2 \
+  --recommended recommended.json -o Qwen3.8-27B-UD-IQ3_XXS.flyx
+```
+
+`--recommended FILE` puts a JSON object in the header's `"recommended"`: `"drafter"` (a `--drafter` word) is the drafter used when neither `--drafter`, `FLYX_DRAFTER` nor a `--drafter-file` names one, and `"backend_options"` go before the environment's and the command line's (a key given again is theirs); other keys (the measurements behind them) are kept for the reader. `flyx pack` opens the model with that drafter before writing, and records the files it packed with their SHA-256 (`"packed"`). The file is `.flyx` format 2 requiring `"gguf"`: a build that does not read packed files refuses it. A file packed from a model already packed, a LoRA adapter (`--lora` stays a run's choice) and a model not read from a GGUF are refused.
 
 > **WSL2 note:** Store models on the Linux filesystem (`~/models`), not `/mnt/c`.
 

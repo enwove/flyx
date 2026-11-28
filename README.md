@@ -161,7 +161,7 @@ print(reply["content"])
 | Architectures | Qwen3.5 / Qwen3.8 (`qwen35`), Qwen3 (`qwen3`), Inkling-2-Mini (`inkling2_loop`, sparse MoE), Llama (MiniCPM5-1B) | Llama from `.flyx` only |
 | Speculative drafters | MTP, DFlash2, DSpark, prompt lookup | MTP and DSpark attach automatically; DFlash2 is a companion file (`--drafter-file`, or **Draft with it** in the dashboard); DSpark pairs with Inkling-2-Mini |
 | Vision | Image input with an `mmproj` projector, fetched automatically from the model's Hub repo | Qwen3.5 / Qwen3.8 today; Inkling-2-Mini is text-only |
-| Model formats | GGUF (`F32`, `F16`, `BF16`, `Q2_0`, `Q4_0–Q8_0`, `Q2_K–Q6_K`, `IQ1–IQ4`, `MXFP4`, GGML `NVFP4`); `.flyx` (BF16, NVFP4; format 2 with the target's own LoRA adapters, V-LoRA, run unmerged; a DV drafter, drafting only when named: `--drafter dv`, [design](docs/design/dv.md)) | Keep all split GGUF parts in the same folder. |
+| Model formats | GGUF (`F32`, `F16`, `BF16`, `Q2_0`, `Q4_0–Q8_0`, `Q2_K–Q6_K`, `IQ1–IQ4`, `MXFP4`, GGML `NVFP4`); `.flyx` (BF16, NVFP4; format 2 with the target's own LoRA adapters, V-LoRA, run unmerged; a DV drafter, drafting only when named: `--drafter dv`, [design](docs/design/dv.md); a GGUF packed with its drafters and recommended settings by `flyx pack`, [models](docs/models.md#packing-a-gguf-with-its-drafters)) | Keep all split GGUF parts in the same folder. |
 | GPUs | RTX 30 / 40 / 50 series, L4, L40S, A100, H100 (`sm_80`–`sm_120`; `sm_100` in Linux release) | Single GPU per process (`CUDA_VISIBLE_DEVICES`); driver ≥ 580 |
 | Platforms | Windows (native MSVC), Linux, WSL2 | Single-file `.exe` / ZIP / wheel on Windows; tarball / `manylinux` wheel on Linux |
 

@@ -169,6 +169,7 @@ add_library(flyx_core STATIC
   core/hub/sha256.cpp
   core/modelfile/modelfile.cpp
   core/modelfile/flyx_format.cpp
+  core/modelfile/flyx_pack.cpp
   core/modelfile/gguf_format.cpp
   core/modelfile/drafter_dir.cpp
   core/modelfile/peft_dir.cpp
@@ -251,7 +252,7 @@ add_custom_command(OUTPUT ${FLYX_DASHBOARD_CPP}
                            ${CMAKE_SOURCE_DIR}/cmake/embed_files.cmake
                    COMMENT "Building the dashboard in" VERBATIM)
 set(FLYX_CLI_SOURCES
-    apps/flyx-cli/main.cpp apps/flyx-cli/monitor.cpp
+    apps/flyx-cli/main.cpp apps/flyx-cli/monitor.cpp apps/flyx-cli/pack.cpp
     apps/flyx-server/main.cpp apps/flyx-server/http_util.cpp apps/flyx-server/openai_chat.cpp
     apps/flyx-server/openai_responses.cpp apps/flyx-server/anthropic_messages.cpp
     apps/flyx-server/telemetry.cpp apps/flyx-server/model_host.cpp apps/flyx-server/manage.cpp

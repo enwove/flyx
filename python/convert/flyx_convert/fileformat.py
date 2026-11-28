@@ -25,6 +25,13 @@ parts of the file a reader must not ignore, by name (``lora``: the target's
 own adapters, which a reader that dropped would decode another model with).
 A file with none of them is format 1, which every reader reads; a reader of
 format 1 only refuses format 2.
+
+A file packed from a GGUF (``flyx pack``, core/modelfile/flyx_pack.cpp) requires
+``gguf``: its header is the C++ GGUF reader's (``gguf``, ``source.format``
+``gguf``), its tensors GGML blocks (dtype ``ggml_<type>``) under their GGUF
+names, its drafters ``bundled`` files ({role, header, tensors}) whose tensors
+are in the same data section, and ``recommended`` the settings measured best
+for it.  This module neither writes nor reads such files.
 """
 from __future__ import annotations
 

@@ -79,6 +79,10 @@ class ModelFile {
 
   CompanionRole companion_role(int i) const { return companions_.at(size_t(i))->role; }
   const Contents& companion(int i) const { return companions_.at(size_t(i))->c; }
+  // What the reader read of this file (flyx pack writes it out again).
+  const Contents& contents() const { return c_; }
+  // The companions the file itself holds (a .flyx file packed from a GGUF, its "bundled" files): the first ones.
+  int bundled() const { return bundled_; }
 
  private:
   std::vector<std::unique_ptr<os::MappedFile>> maps_;  // one file, or a split GGUF's shards
@@ -89,6 +93,7 @@ class ModelFile {
     Contents c;
   };
   std::vector<std::unique_ptr<Companion>> companions_;
+  int bundled_ = 0;
 };
 
 // Lightweight header metadata peeked from a GGUF file without mapping the whole file.
@@ -114,6 +119,11 @@ struct ModelOrigin {
   std::vector<std::string> base_models;
 };
 ModelOrigin model_origin(const std::string& path, const PathAllowFn& allow_path = {});
+
+// The drafters a .flyx file packed from a GGUF holds (flyx pack), read from its header alone: "mtp" for the model's
+// own MTP layer, then each bundled drafter's kind ("mtp", "dflash2", "dspark", "dspine", ...; "" when its header does
+// not say).  None for any other file.
+std::vector<std::string> packed_drafters(const std::string& path, const PathAllowFn& allow_path = {});
 
 // The block drafter a config.json's architectures name, by one table (core/modelfile/drafter_dir.cpp): "dflash2",
 // "dflash", "dspark", "dspine"; "" for none.

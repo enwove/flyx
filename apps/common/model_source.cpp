@@ -841,6 +841,9 @@ bool fetch_model(const std::string& model, const std::vector<std::string>& draft
   const flyx::GgufPeek own = want_mtp ? gguf_header(out->model, allow_path) : flyx::GgufPeek{};
   const int own_mtp = own.valid ? own.mtp_layers : -1;  // -1: not a GGUF, or not asked
   if (own_mtp > 0) out->drafter_sources.push_back({"mtp", "model file", std::nullopt});
+  // A file packed with its drafters (flyx pack): they are the model's; none is looked for beside it in their place.
+  for (const std::string& kind : flyx::packed_drafters(out->model, allow_path))
+    out->drafter_sources.push_back({kind, "model file", std::nullopt});
   const auto clean_hub = [](const std::string& s) {
     const auto u = strip_single_quotes(s);
     return u && !u->empty() ? *u : s;

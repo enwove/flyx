@@ -9,6 +9,7 @@
 //   flyx template MODEL MESSAGES.json [--no-think]               render the chat template
 //   flyx serve    MODEL [--port 8080] [options]                  OpenAI / Anthropic HTTP API (apps/flyx-server/)
 //   flyx monitor  [URL]                                          live panel of a running server
+//   flyx pack     MODEL -o FILE.flyx [options]                   a GGUF and its drafters in one file (pack.cpp)
 //
 // Called by the name flyx-server (the release package's link to it), it is `flyx serve`.
 //
@@ -35,6 +36,7 @@
 #include "apps/common/numbers.h"
 #include "apps/common/version.h"
 #include "apps/flyx-cli/monitor.h"
+#include "apps/flyx-cli/pack.h"
 #include "core/exec/engine.h"
 #include "core/exec/request.h"
 #include "core/exec/telemetry.h"
@@ -86,6 +88,8 @@ constexpr int kPromptSetMaxNew = 512;
                "  MODEL                a .gguf or .flyx file, or a Hugging Face name (org/name:QUANT), fetched into\n"
                "                       the Hugging Face cache\n"
                "       flyx monitor [URL] [--key KEY] [--interval S] [--once]   (a running server)\n"
+               "       flyx pack MODEL -o FILE.flyx [options]   (a GGUF and its drafters in one file; flyx pack --help)\n"
+               "       flyx pack MODEL -o FILE.flyx [options]   (a GGUF and its drafters in one file; flyx pack --help)\n"
                "  -p TEXT              prompt (run)\n"
                "  -f FILE              the prompt from a file (run; a long one: a command line holds 128 KB at most)\n"
                "  --image FILE         attach an image file to the prompt (run, repeatable; implies --chat)\n"
@@ -915,6 +919,8 @@ int run_command(int argc, char** argv) {
   if (argc == 1 && flyx::os::owns_console()) return flyx::server::run(argc, argv);
   if (argc >= 2 && std::strcmp(argv[1], "serve") == 0) return flyx::server::run(argc - 1, argv + 1);
   if (argc >= 2 && std::strcmp(argv[1], "monitor") == 0) return flyx::monitor::run(argc, argv);
+  if (argc >= 2 && std::strcmp(argv[1], "pack") == 0) return flyx::pack::run(argc, argv);
+  if (argc >= 2 && std::strcmp(argv[1], "pack") == 0) return flyx::pack::run(argc, argv);
   Args a = parse(argc, argv);
   {  // a Hugging Face name: its files fetched; the drafters only for the commands that draft
     std::string err;

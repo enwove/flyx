@@ -160,6 +160,10 @@ struct EngineOptions {
 // FLYX_CHAT_NATIVE=0 turns chat_native off, FLYX_LOOKUP=0 lookup, FLYX_DRAFT_TREES=1 / 0 turns draft_trees on / off.
 // The only place the engine reads the environment.
 void apply_environment(EngineOptions* o);
+// The settings a model file's header recommends ("recommended": flyx pack --recommended), applied by load() after
+// apply_environment: "drafter" when o->drafter is still empty and o names no drafter file (and o->speculative),
+// "backend_options" before o's own.
+void apply_recommended(const nlohmann::json& header, EngineOptions* o);
 
 // The backend library `o` asks for (else the first of cuda, cpu_ref that loads) and the device it found.  *lib must
 // stay loaded while *api is used.
