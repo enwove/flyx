@@ -3,6 +3,7 @@
 // 1. Grammar rollback near max_ctx must not launch a speculative round past flyx_room(at, max_ctx).
 // 2. Failed Session::prepare() (rewind error) must reset device and host session state cleanly.
 // 3. Session::tokenize() must not match an empty history_text_ against every subsequent prompt.
+#include <algorithm>
 #include <cstdio>
 #include <cstring>
 #include <filesystem>
@@ -456,6 +457,49 @@ void test_default_max_new_tokens(const char* model, const flyx_backend_api* cpu)
     check(got > 7 && got <= 96, "no limit anywhere: up to the context's end (" + std::to_string(got) + " tokens)");
 }
 
+// A thinking budget (GenerateRequest::thinking_budget): the reply thinks that many tokens and then writes the closing
+// marker, with a drafter as without one (the budget is held as a grammar is: a speculative round gives plain
+// decoding's tokens).  The markers here are ordinary words, so the model writes them only when made to.
+void test_thinking_budget(const char* model, const flyx_backend_api* cpu) {
+  g_cpu = cpu;
+  flyx_test_delegate(cpu);
+  auto run = [&](bool speculative, std::vector<int32_t>* out, std::vector<int32_t>* close) {
+    EngineOptions eo;
+    eo.backend = "test-host-kv";
+    eo.max_ctx = 160;
+    eo.speculative = speculative;
+    if (speculative) eo.drafter = "mtp";
+    Engine engine;
+    std::string err;
+    if (!engine.load(model, eo, &err)) return check(false, "load engine for the thinking budget: " + err), false;
+    Session s(&engine);
+    if (!s.init(&err)) return check(false, "session init: " + err), false;
+    GenerateRequest rq;
+    for (int k = 0; k < 3; ++k) {
+      const auto ids = engine.tokenizer().encode("one two three four five six seven eight ");
+      rq.prompt.insert(rq.prompt.end(), ids.begin(), ids.end());
+    }
+    rq.max_new_tokens = 24;
+    rq.ignore_eos = true;
+    rq.thinking_budget = 9;
+    rq.thinking_open = engine.tokenizer().encode(" open");
+    rq.thinking_close = *close = engine.tokenizer().encode(" lighthouse harbor");
+    rq.thinking_inside = true;
+    GenerateResult res;
+    if (generate(s, rq, [](std::string_view, const int32_t*, int) { return true; }, &res, &err) != 0)
+      return check(false, "generate: " + err), false;
+    *out = std::vector<int32_t>(s.tokens().end() - res.usage.new_tokens, s.tokens().end());
+    return true;
+  };
+  std::vector<int32_t> plain, spec, close;
+  if (!run(false, &plain, &close) || !run(true, &spec, &close)) return;
+  const bool at_budget = plain.size() >= 9 + close.size() &&
+                         std::equal(close.begin(), close.end(), plain.begin() + 9);
+  check(at_budget, "the closing marker written right after the 9 tokens of the budget");
+  check(spec == plain, "a drafter's reply under a thinking budget is plain decoding's (" +
+                           std::to_string(spec.size()) + " and " + std::to_string(plain.size()) + " tokens)");
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -479,5 +523,6 @@ int main(int argc, char** argv) {
   test_empty_history_text_tokenize(argv[1], cpu);
   test_round_costs_learned(argv[1], cpu);
   test_default_max_new_tokens(argv[1], cpu);
+  test_thinking_budget(argv[1], cpu);
   return flyx::test::finish("generation_test");
 }

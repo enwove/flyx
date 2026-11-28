@@ -334,6 +334,19 @@ bool prepare_request(Engine& e, const Session& s, const Request& rq, const Rende
     }
   }
   gen.grammar = out->grammar.get();
+  // A thinking budget: the format's markers as the model's tokenizer writes them, special tokens read (Inkling-2's
+  // are control tokens), so that what is counted and written is the model's own, never a number fixed here.
+  std::string open, close;
+  if (rq.thinking_budget >= 0 && e.chat().thinking_markers(&open, &close)) {
+    auto tokens = [&](const std::string& text) {
+      const std::vector<TextSpan> all = {{0, text.size()}};
+      return e.tokenizer().encode(text, &all);
+    };
+    gen.thinking_budget = rq.thinking_budget;
+    gen.thinking_open = tokens(open);
+    gen.thinking_close = tokens(close);
+    gen.thinking_inside = rc.in_reasoning;
+  }
   if (rq.split_output)
     out->parser = e.chat().parser(rc, rq.rules.tools == ReplyRules::kNone ? nullptr : &rq.tools);
   return true;

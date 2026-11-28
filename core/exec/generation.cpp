@@ -6,6 +6,7 @@
 #include <random>
 
 #include "core/grammar/grammar.h"
+#include "core/os/log.h"
 #include "core/os/os.h"
 #include "core/vision/media_span.h"
 
@@ -122,12 +123,15 @@ bool Generation::start() {
   const int limit = req_.max_new_tokens > 0 ? req_.max_new_tokens : e_->default_max_new_tokens();
   max_new_ = limit > 0 ? limit : max_ctx;
   g_.limit = static_cast<int32_t>(std::min<long long>(static_cast<long long>(n_) + max_new_ - 1, max_ctx));
-  // A grammar: the first token is chosen under its mask (nothing to undo
-  // before it); later tokens are checked after each round.
-  if (!req_.prefill_only && req_.grammar) {
+  thinking_ = ThinkingBudget(req_.thinking_open, req_.thinking_close, req_.thinking_budget, req_.thinking_inside);
+  // A grammar or a spent thinking budget: the first token is chosen under the mask (nothing to undo before it);
+  // later tokens are checked after each round.
+  if (!req_.prefill_only && constrained()) {
     mask_.resize(size_t((e_->model().desc().vocab + 31) / 32));
-    req_.grammar->allowed(mask_.data());
-    g_.mask = mask_.data();
+    if (req_.grammar || thinking_.forced() >= 0) {
+      fill_mask();
+      g_.mask = mask_.data();
+    }
   }
 
   // Park and restore in one scheduler step. Time the incoming prefill from its own preparation.
@@ -320,10 +324,31 @@ bool Generation::prefill() {
   return true;
 }
 
+void Generation::fill_mask() {
+  const size_t words = mask_.size();
+  if (req_.grammar) req_.grammar->allowed(mask_.data());
+  else std::fill(mask_.begin(), mask_.end(), ~0u);
+  const int32_t f = thinking_.forced();
+  if (f < 0 || size_t(f) / 32 >= words) return;
+  const uint32_t bit = 1u << (f % 32);
+  const bool allowed = (mask_[size_t(f) / 32] & bit) != 0;
+  if (!allowed) {
+    // The grammar takes no end of the thinking here: the budget cannot end it, and holding to it would leave no
+    // token to choose.  The reply goes on unbudgeted.
+    log::info("flyx: the reply's grammar does not let its thinking end here: its thinking budget is not kept");
+    thinking_ = ThinkingBudget();
+    return;
+  }
+  std::fill(mask_.begin(), mask_.end(), 0u);
+  mask_[size_t(f) / 32] = bit;
+}
+
 int Generation::rejected(const flyx_round_result& r) {
-  if (!req_.grammar || finish_ || grammar_over_) return -1;
+  if (finish_ || !constrained()) return -1;
   for (int i = 0; i < r.n_tokens; ++i) {
-    if (!req_.grammar->accept(r.tokens[i])) return i;
+    if (!thinking_.allows(r.tokens[i])) return i;
+    if (req_.grammar && !req_.grammar->accept(r.tokens[i])) return i;
+    thinking_.take(r.tokens[i]);
     // A stop token the request goes on past (ignore_eos: a measurement's fixed number of tokens) is where the reply
     // the grammar holds ends.  What follows is no reply's, so nothing holds it; the matcher, which has ended, is not
     // asked again (it takes no token after a stop token, and has no mask to give).
@@ -393,7 +418,7 @@ bool Generation::finish_prefill() {
   flyx_round_result r{};
   if (api_->read(s_->seq(), &r) != 0) return fail(std::string("read: ") + api_->last_error(), true);
   s_->record(r, -2);
-  if (rejected(r) >= 0) return fail("the first token does not fit the reply's grammar", true);
+  if (rejected(r) >= 0) return fail("the first token does not fit the reply's grammar or thinking budget", true);
   result_.usage.prefill_ms = os::now_ms() - started_ms_;
   // The first token goes out before the checkpoint: nothing is in flight until the rounds below, so the checkpoint
   // takes the same state after it, and its copies (and a slot's first use: pinning its host memory, ~30 ms on the
@@ -428,10 +453,11 @@ bool Generation::finish_prefill() {
 
 void Generation::prepare_round(const RoundChoice& round, bool masked, flyx_gen_params* params, flyx_plan** plan) {
   *params = g_;
-  // No mask once the reply the grammar holds has ended (rejected()): its matcher has none to give.
-  masked = masked && !grammar_over_;
+  // A token the thinking budget forces is chosen under the mask from the start, not chosen again after.  No mask once
+  // the reply the grammar holds has ended (rejected()): its matcher has none to give.
+  masked = (masked || thinking_.forced() >= 0) && constrained();
   if (masked) {
-    req_.grammar->allowed(mask_.data());
+    fill_mask();
     params->mask = mask_.data();
   }
   if (round.lookup) {

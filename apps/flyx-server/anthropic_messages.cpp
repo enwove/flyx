@@ -4,7 +4,9 @@
 // Thinking comes back as "thinking" blocks (with an empty signature), tool
 // calls as "tool_use" blocks; usage reports reused prompt tokens as
 // cache_read_input_tokens.
+#include <algorithm>
 #include <atomic>
+#include <climits>
 #include <cstdio>
 #include <initializer_list>
 
@@ -109,14 +111,28 @@ bool read_request(Server* s, const ojson& body, Request* in, std::string* err) {
       t = ty->get<std::string>();
     }
     request_kwargs["enable_thinking"] = t != "disabled";
+    // The most tokens the reply thinks: its thinking is closed when they are spent (core/exec/thinking_budget.h).
+    if (const auto b = t_it->find("budget_tokens"); t != "disabled" && b != t_it->end() && !b->is_null()) {
+      if (!b->is_number_integer() || b->get<int64_t>() < 1)
+        return *err = "thinking.budget_tokens must be a positive integer", false;
+      in->thinking_budget = int(std::min<int64_t>(b->get<int64_t>(), INT_MAX));
+    }
+  } else if (!s->cfg.chat_defaults.contains("enable_thinking") && !s->cfg.chat_defaults.contains("reasoning_effort")) {
+    // No thinking asked for: none, as Anthropic's API gives (a client that wants it says so; Claude Code sends
+    // {"type": "adaptive"} with every request), unless the server's own defaults (--no-think, --chat-template-kwargs)
+    // say what a request that names nothing gets.
+    request_kwargs["enable_thinking"] = false;
   }
+  const bool thinking_off = request_kwargs.value("enable_thinking", true) == false;
   if (const auto oc = body.find("output_config"); oc != body.end() && oc->is_object()) {
     if (const auto ef = oc->find("effort"); ef != oc->end() && !ef->is_null()) {
       if (!ef->is_string()) return *err = "output_config.effort must be a string", false;
       const std::string effort = ef->get<std::string>();
       if (effort != "low" && effort != "medium" && effort != "high" && effort != "max")
         return *err = "output_config.effort must be low, medium, high, or max", false;
-      request_kwargs["reasoning_effort"] = effort;
+      // The effort of the thinking: none to give it with thinking off (a template that reads an effort, Inkling-2's,
+      // would take it for thinking on).
+      if (!thinking_off) request_kwargs["reasoning_effort"] = effort;
     }
   }
   if (!read_chat_options(body, s->cfg.chat_defaults, request_kwargs, &in->chat_options, err)) return false;

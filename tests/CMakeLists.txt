@@ -226,6 +226,7 @@ flyx_add_unit_test(reply_text_test core/exec/reply_text_test.cpp)
 flyx_add_unit_test(chooser_test core/speculation/chooser_test.cpp)
 flyx_add_unit_test(calibrate_test core/speculation/calibrate_test.cpp)
 flyx_add_unit_test(round_costs_test core/speculation/round_costs_test.cpp)
+flyx_add_unit_test(thinking_budget_test core/exec/thinking_budget_test.cpp)
 flyx_add_unit_test(budget_test core/plan/budget_test.cpp)
 flyx_add_unit_test(golden_test e2e/golden_test.cpp)
 flyx_add_unit_test(gguf_test core/modelfile/gguf_test.cpp)
@@ -451,6 +452,8 @@ add_test(NAME round_chooser COMMAND chooser_test)
 add_test(NAME round_costs_plausible COMMAND calibrate_test)
 # Round costs learned from the rounds read, and the controller choosing by them at the context (no model).
 add_test(NAME round_costs_learned COMMAND round_costs_test)
+# A reply's thinking counted, and closed by the format's marker once the budget is spent (no model).
+add_test(NAME thinking_budget COMMAND thinking_budget_test)
 # The memory budget: a context the caller did not ask for shrinks to what fits (no model, no GPU).
 add_test(NAME memory_budget COMMAND budget_test)
 # The round plans: a drafter whose state follows its own rounds (DV) beside plain decoding's and lookup's (pinned:

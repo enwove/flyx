@@ -95,6 +95,12 @@ class Chat : public interfaces::Chat {
     return inkling2_ ? inkling2_reply_tokens() : std::vector<std::string>();
   }
 
+  bool thinking_markers(std::string* open, std::string* close) const override {
+    if (inkling2_) return *open = "<|content_thinking|>", *close = "<|end_message|>", true;
+    if (!syntax_.thinking) return false;
+    return *open = "<think>", *close = "</think>", true;
+  }
+
   // Inkling-2's template has no enable_thinking: it writes a thinking effort, 0.9 unless told (reasoning_effort),
   // and "none" is its word for no thinking.
   ojson option_variables(const interfaces::ChatOptions& opt) const override {

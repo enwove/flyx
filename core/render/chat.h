@@ -69,6 +69,8 @@ class ChatTemplate {
   std::string reply_grammar(const std::vector<ojson>& tools, const ReplyRules& rules, const RenderedChat& r) const;
   // The special tokens replies are written with (interfaces::Chat::reply_tokens); none without a template.
   std::vector<std::string> reply_tokens() const;
+  // The text that opens and closes a reply's thinking section (interfaces::Chat::thinking_markers); false for none.
+  bool thinking_markers(std::string* open, std::string* close) const;
 
  private:
   struct Impl;
