@@ -154,6 +154,20 @@ print(reply["content"])
 
 </details>
 
+<details>
+<summary><b>Run it in a container (optional)</b></summary>
+
+```sh
+docker build -f packaging/Dockerfile.server -t flyx:local .
+docker run --gpus all -p 8080:8080 -v flyx-data:/data flyx:local       # dashboard on http://127.0.0.1:8080
+
+docker compose -f packaging/docker-compose.yml up -d --build           # the same, with volumes and a health probe
+```
+
+The image is the release build of this checkout — 218 MB for two GPU architectures (`86-real;89-real`, 12 minutes on a 16-job host), no CUDA toolkit in it. The binary needs no Docker: this is the path for a pinned deployment, a card per container. [docs/building.md's Docker section](docs/building.md#5-docker).
+
+</details>
+
 ## Supported Models & Hardware
 
 | Dimension | Supported | Notes |

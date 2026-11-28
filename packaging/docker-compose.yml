@@ -1,0 +1,83 @@
+# Copyright 2026 The flyx Authors. SPDX-License-Identifier: Apache-2.0
+#
+# One flyx server in a container: the release build of this checkout on one GPU, with the model cache in named
+# volumes so a rebuilt image finds the weights it already downloaded (docs/building.md's Docker section).
+#
+#   docker compose -f packaging/docker-compose.yml up -d --build      # dashboard and API on http://127.0.0.1:8080
+#   docker compose -f packaging/docker-compose.yml logs -f flyx       # a model of tens of GB loads for minutes
+#   curl http://127.0.0.1:8080/health
+#
+# Settings come from the environment; packaging/.env.example lists them (cp packaging/.env.example packaging/.env).
+# Compose reads the .env next to the file it is given, and a variable set on the command line wins over both.
+#
+# The build context is the repository root (the image needs the sources), which is why `context: ..` below: the
+# file lives in packaging/.
+#
+# Serving a port other machines can reach means serving inference to them: set FLYX_API_KEY.  A request that
+# arrives through a published port carries the bridge's gateway address rather than localhost, and its Host header
+# names your machine, which inside a container is none of the server's own addresses - so the endpoints that fetch
+# and load models, and the dashboard's own reads, answer 401/403 until the key is set.  With a key, open the page
+# once as http://<host>:<port>/#key=KEY: the dashboard takes the key from the address fragment and remembers it.
+
+name: flyx
+
+services:
+  flyx:
+    build:
+      context: ..
+      dockerfile: packaging/Dockerfile.server
+      args:
+        # The release baseline.  FLYX_CUDA_ARCHS for one GPU (80, 86, 89, 90, 100, 120) is a fifth of the compiles.
+        CUDA_IMAGE: ${CUDA_IMAGE:-nvidia/cuda:13.0.2-devel-ubuntu22.04@sha256:1c517d4fb96528c8999e14e6e6b16d7e2ff9ae8d194fd788d60fdc88e693e982}
+        FLYX_CUDA_ARCHS: ${FLYX_CUDA_ARCHS:-80-real;89-real;90-real;100-real;120-real;120-virtual}
+        FLYX_JOBS: ${FLYX_JOBS:-0}
+    image: flyx:${FLYX_IMAGE_TAG:-local}
+    restart: unless-stopped
+    ports:
+      - "${FLYX_PORT:-8080}:${FLYX_PORT:-8080}"
+    environment:
+      # The card to serve: nvidia-smi's number.  CUDA_DEVICE_ORDER pins that numbering, because CUDA's own orders
+      # cards by speed and moves the number when a second card is added.  The CUDA backend serves one device per
+      # process, so one card per container; every card's VRAM must hold the model, its K/V and its graphs.
+      CUDA_DEVICE_ORDER: PCI_BUS_ID
+      CUDA_VISIBLE_DEVICES: ${CUDA_VISIBLE_DEVICES:-0}
+      FLYX_MODEL: ${FLYX_MODEL:-}
+      FLYX_ARGS: ${FLYX_ARGS:-}
+      FLYX_PORT: ${FLYX_PORT:-8080}
+      FLYX_API_KEY: ${FLYX_API_KEY:-}
+      FLYX_MODELS_DIR: /models
+      HF_HOME: /data/hf
+      HF_TOKEN: ${HF_TOKEN:-}
+      HF_ENDPOINT: ${HF_ENDPOINT:-}
+    volumes:
+      # /data is the image's user (uid 1000) home: the Hugging Face cache and serve.json live here.
+      - flyx-data:/data
+      - flyx-models:/models
+      # Your own folders of .gguf files, as they are, instead of the volume:
+      # - ${MODELS_DIR:-./data/models}:/models:ro
+    # Pinned host memory, which is what --kv-ram (a long context's K/V in host RAM) allocates through.  Without it
+    # the server runs, and the long-context window it planned on pinned RAM silently costs less room.
+    ulimits:
+      memlock:
+        soft: -1
+        hard: -1
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+    healthcheck:
+      # $$ keeps the port in the container's own shell.  ${FLYX_PORT} here would be read from the host's
+      # environment, where it is unset, and probe the server on 8080 whatever port it was told to serve on.
+      test: ["CMD-SHELL", "curl -fsS \"http://127.0.0.1:$$FLYX_PORT/health\" > /dev/null"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      # A model of tens of GB fetches and loads before /health says ready.
+      start_period: 900s
+
+volumes:
+  flyx-data:
+  flyx-models:

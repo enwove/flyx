@@ -1,0 +1,80 @@
+# Copyright 2026 The flyx Authors. SPDX-License-Identifier: Apache-2.0
+#
+# The engine and its HTTP server in one image (docs/building.md's Docker section):
+#
+#   docker build -f packaging/Dockerfile.server -t flyx:local .                     # every GPU architecture of a release
+#   docker build -f packaging/Dockerfile.server -t flyx:local \
+#     --build-arg FLYX_CUDA_ARCHS=89-real .                                          # one GPU: fewer compiles, smaller image
+#   docker build -f packaging/Dockerfile.server -t flyx:local \
+#     --build-arg FLYX_CUDA=OFF .                                                    # the float64 reference backend only
+#
+# The builder is the pinned Ubuntu 22.04 CUDA 13 image the release tarballs are built against (glibc 2.35), so the
+# result runs on any x86-64 host with glibc 2.35 or newer.  CUDA and the C++ runtimes link statically: the runtime
+# stage carries no CUDA toolkit, only what the NVIDIA Container Toolkit mounts in from the host driver plus the
+# system's libcurl, which fetching a model by Hugging Face name opens at run time.  That is why the image is
+# 218 MB (52 MB of binaries) where a CUDA server image that links dynamically and ships the toolkit is gigabytes.
+#
+# Running it, the dashboard on http://127.0.0.1:8080:
+#
+#   docker run --gpus all -p 8080:8080 -v flyx-data:/data flyx:local
+#
+# packaging/docker-compose.yml wires the same up with the volumes, the GPU reservation and the environment.
+
+ARG CUDA_IMAGE=nvidia/cuda:13.0.2-devel-ubuntu22.04@sha256:1c517d4fb96528c8999e14e6e6b16d7e2ff9ae8d194fd788d60fdc88e693e982
+FROM ${CUDA_IMAGE} AS build
+
+# Jammy's CMake (3.22) predates the presets and its Python (3.10) the tuning-table generator, so both come from a
+# 3.12 environment, as in packaging/Dockerfile.linux.  binutils is for the packaged ELF checks, libcurl4 the hub test.
+RUN apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+      binutils build-essential ca-certificates libcurl4 ninja-build \
+    && rm -rf /var/lib/apt/lists/*
+COPY --from=ghcr.io/astral-sh/uv:0.13.10 /uv /usr/local/bin/uv
+ENV UV_PYTHON_INSTALL_DIR=/opt/python
+RUN uv venv --seed --python 3.12.12 /opt/flyx-venv
+ENV PATH="/opt/flyx-venv/bin:${PATH}"
+RUN python -m pip install --no-cache-dir cmake==4.1.3
+
+# FLYX_CUDA_ARCHS takes the release package's whole list; one GPU's architecture (80, 86, 89, 90, 100, 120) is a
+# fifth of the nvcc compiles.  FLYX_JOBS limits them where memory is short (0: every core).
+ARG FLYX_CUDA=ON
+ARG FLYX_CUDA_ARCHS=80-real;89-real;90-real;100-real;120-real;120-virtual
+ARG FLYX_JOBS=0
+WORKDIR /src
+COPY . .
+# CMakePresets.json's release-linux without its tests: static runtimes, the release architectures, compressed
+# fatbins, tuning candidates pruned to what the GPU tables actually select.
+RUN cmake -S . -B /flyx-build -G Ninja \
+      -DCMAKE_BUILD_TYPE=Release \
+      -DFLYX_TESTS=OFF -DFLYX_TEST_DV=OFF \
+      -DFLYX_CUDA="${FLYX_CUDA}" \
+      -DFLYX_STATIC_RUNTIME=ON -DFLYX_CUDA_LINEINFO=OFF -DFLYX_CUDA_COMPRESS=size \
+      -DFLYX_TUNE_CANDIDATES=OFF -DFLYX_CUDA_ARCHS="${FLYX_CUDA_ARCHS}" \
+    && cmake --build /flyx-build -j "$([ "${FLYX_JOBS}" -gt 0 ] && echo "${FLYX_JOBS}" || nproc)" \
+    && cmake --install /flyx-build --prefix /opt/flyx --strip
+
+FROM ubuntu:22.04 AS runtime
+# libcurl4 for fetching models by name, curl for the health check of /health, ca-certificates for HTTPS to the Hub.
+RUN apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+      ca-certificates curl libcurl4 \
+    && rm -rf /var/lib/apt/lists/*
+
+# A non-root user whose home is the volume holding the Hugging Face cache and serve.json.
+RUN useradd --uid 1000 --create-home --home-dir /data --shell /usr/sbin/nologin flyx
+COPY --from=build /opt/flyx /opt/flyx
+COPY packaging/docker-entrypoint.sh /usr/local/bin/docker-entrypoint.sh
+ENV PATH="/opt/flyx/bin:${PATH}" \
+    HOME=/data \
+    FLYX_HOST=0.0.0.0 \
+    FLYX_PORT=8080 \
+    HF_HOME=/data/hf
+LABEL org.opencontainers.image.title="flyx" \
+      org.opencontainers.image.description="Local LLM inference engine: OpenAI- and Anthropic-compatible server with a web dashboard" \
+      org.opencontainers.image.licenses="Apache-2.0"
+
+WORKDIR /data
+EXPOSE 8080
+USER flyx
+# A model of tens of GB fetches and loads for minutes before /health says ready: the probe starts late on purpose.
+HEALTHCHECK --interval=30s --timeout=5s --start-period=600s --retries=3 \
+  CMD curl -fsS "http://127.0.0.1:${FLYX_PORT:-8080}/health" > /dev/null
+ENTRYPOINT ["/usr/local/bin/docker-entrypoint.sh"]
