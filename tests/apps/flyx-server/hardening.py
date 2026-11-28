@@ -182,7 +182,7 @@ def check_statuses(url):
 
 def check_error_bodies(url):
     """What httplib answers itself (a 404 for no route, as every status it gives) comes with the API's JSON error body,
-    Anthropic's on its paths; a body sent as a form (curl -d's default type) takes the limit a JSON one does, not 8 KiB."""
+    Anthropic's on its paths; a body sent as a form (curl -d's default type) past 8 KiB is told to come as JSON."""
     cl, port = Client(url, None), port_of(url)
     crlf = b"\r\n"
     host = b"Host: 127.0.0.1:%d" % port + crlf
@@ -201,14 +201,14 @@ def check_error_bodies(url):
     reply, _ = exchange(port, b"GET /v1/messages/nope HTTP/1.1" + crlf + host + close + crlf)
     e = error_of(reply)
     assert status_of(reply) == 404 and e["type"] == "error" and e["error"]["type"] == "not_found_error", e
-    # A request past 8 KiB named as a form: answered as the JSON it is.
+    # A request past 8 KiB named as a form (curl -d's type): httplib parses a form's fields before any handler, so it
+    # keeps its 8 KiB, refused in words that say what to send.
     body = json.dumps({"messages": [{"role": "user", "content": "x " * 6000}], "max_tokens": 2}).encode()
     head = (b"POST /v1/chat/completions HTTP/1.1" + crlf + host + close +
             b"Content-Type: application/x-www-form-urlencoded" + crlf + b"Content-Length: %d" % len(body) + crlf + crlf)
     reply, how = exchange(port, head + body, wait=60)
-    assert status_of(reply) in (200, 400), (how, reply[:300])
-    if status_of(reply) == 400:  # longer than the test's context: refused for that, in words
-        assert "context" in error_of(reply)["error"]["message"], reply[:300]
+    assert status_of(reply) == 413, (how, reply[:300])
+    assert "Content-Type: application/json" in error_of(reply)["error"]["message"], reply[:300]
     alive(cl, "errors httplib answers")
 
 
