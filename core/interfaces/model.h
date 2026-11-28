@@ -63,6 +63,9 @@ class Model {
   // Drafter d's rounds are always a tree of its drafts: its round programs say so themselves (FLYX_DRAFT_TREE), and
   // no chain of its drafts is a trunk the tree grows from (DV's).
   virtual bool drafts_trees(int) const { return false; }
+  // Drafter d's trees beside its chains are of FLYX_MAX_ROWS - 1 drafts only (EAGLE-4's: its chain of 7 and the
+  // branches beside it), none narrower.
+  virtual bool widest_trees(int) const { return false; }
   // The file holds a drafter whose rounds are trees (DV's always, DSpark's by default), whether or not it was asked
   // for: the engine's default K/V method then reads every position with it or without, so that naming it changes no
   // token (AGENTS.md gate 4).

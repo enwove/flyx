@@ -167,6 +167,7 @@ class Model : public interfaces::Model {
   int block_drafts(int d) const override;
   int trained_ctx() const override { return trained_ctx_; }
   bool drafts_trees(int d) const override;
+  bool widest_trees(int d) const override;
   bool file_drafts_trees() const override { return file_drafts_trees_; }
   bool draft_trees_by_default() const override { return draft_trees_by_default_; }
   bool restarts(int d) const override;
