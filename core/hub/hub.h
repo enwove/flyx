@@ -146,6 +146,9 @@ bool mmproj_gguf_name(const std::string& path);
 bool mtp_gguf_name(const std::string& path);
 // Whether a GGUF at `path` ('/' between directories) is a DSpark drafter file by name/directory.
 bool dspark_gguf_name(const std::string& path);
+// Rank complete candidates (file.size is the total for split files). Prefer conventional names and an unqualified
+// quantization over its suffixed variants, keeping the smaller download first within each group.
+std::vector<std::string> ranked_dspark_paths(const std::vector<RepoFile>& files);
 // A companion GGUF in a repository (vision projector or drafter) listed alongside its main models.
 struct CompanionFile {
   RepoFile file;
@@ -201,6 +204,8 @@ bool fetch(const Repo& r, const std::vector<RepoFile>& files, std::vector<std::s
 // header, at most 16 MiB); from the cache when the file is there.  false, with *err, when neither has it.
 bool safetensors_header(const Repo& r, const RepoFile& f, std::string* header, std::string* err,
                         const PathAllowFn& allow_path = {});
+// Best-effort bounded metadata prefix of an uncached GGUF. Empty when offline or the range is unavailable.
+std::string gguf_prefix(const Repo& r, const RepoFile& f, const PathAllowFn& allow_path = {});
 // A small file's text at r.commit, from the cache when it is there, else from the Hub into memory alone (the cache is
 // left as it was).  false, with *err, for a file of more than `max` bytes or one neither has.
 bool read_text(const Repo& r, const RepoFile& f, uint64_t max, std::string* text, std::string* err,

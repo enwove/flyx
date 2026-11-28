@@ -178,8 +178,9 @@ GgufClassification classify_gguf(const std::string& path, const std::string& rel
   return gguf_identity(gguf_peek_cached(path, size, modified, allow_path), name);
 }
 
-std::vector<HubGguf> hub_ggufs(const hub::Repo& repo, const PathAllowFn& allow_path) {
-  const fs::path root = to_path(hub::snapshot_dir(repo));
+namespace {
+
+std::vector<HubGguf> ggufs_at(const hub::Repo& repo, const fs::path& root, const PathAllowFn& allow_path) {
   auto choices = hub::gguf_choices(repo, /*include_companions=*/true);
   std::map<std::string, int> labels;
   for (const auto& g : choices)
@@ -217,7 +218,31 @@ std::vector<HubGguf> hub_ggufs(const hub::Repo& repo, const PathAllowFn& allow_p
   return out;
 }
 
+std::vector<const HubGguf*> ranked_dspark(const std::vector<HubGguf>& ggufs) {
+  std::map<std::string, const HubGguf*> by_path;
+  std::vector<hub::RepoFile> files;
+  for (const auto& item : ggufs) {
+    if (!item.choice.complete || item.cls.drafter_kind != "dspark") continue;
+    const auto& path = item.choice.file.path;
+    by_path.emplace(path, &item);
+    files.push_back({path, item.choice.total_size, "", ""});
+  }
+  std::vector<const HubGguf*> ranked;
+  for (const auto& path : hub::ranked_dspark_paths(files)) ranked.push_back(by_path.at(path));
+  return ranked;
+}
+
+}  // namespace
+
+std::vector<HubGguf> hub_ggufs(const hub::Repo& repo, const PathAllowFn& allow_path) {
+  return ggufs_at(repo, to_path(hub::snapshot_dir(repo)), allow_path);
+}
+
 const HubGguf* preferred_companion(const std::vector<HubGguf>& ggufs, const std::string& kind) {
+  if (kind == "dspark") {
+    const auto ranked = ranked_dspark(ggufs);
+    return ranked.empty() ? nullptr : ranked.front();
+  }
   hub::Repo candidates;
   const HubGguf* first = nullptr;
   for (const auto& item : ggufs) {
@@ -225,16 +250,12 @@ const HubGguf* preferred_companion(const std::vector<HubGguf>& ggufs, const std:
     if (!first) first = &item;
     candidates.files.push_back(item.choice.file);
   }
-  // Preserve the Hub's preferred precision, MTP directory and default DSpark drafter when conventionally named
-  // candidates exist.
+  // Preserve the Hub's preferred precision and MTP directory when conventionally named candidates exist.
   std::string preferred;
   if (kind == "mmproj") {
     if (const hub::RepoFile* f = hub::mmproj_file(candidates)) preferred = f->path;
   } else if (kind == "mtp") {
     if (const hub::RepoFile* f = hub::mtp_file(candidates)) preferred = f->path;
-  } else if (kind == "dspark") {
-    for (const hub::CompanionFile& c : hub::companion_files(candidates))
-      if (c.kind == "dspark" && c.is_default) preferred = c.file.path;
   }
   if (!preferred.empty())
     for (const auto& item : ggufs)
@@ -690,12 +711,6 @@ bool wants_dspark(const EngineOptions& eo, const std::vector<std::string>& draft
 
 namespace {
 
-bool is_dspark_file(const std::string& path, const PathAllowFn& allow_path = {}) {
-  if (allow_path && !allow_path(path)) return false;
-  const flyx::GgufPeek h = flyx::gguf_peek(path, allow_path);
-  return h.valid && h.arch == "dflash" && h.has_markov_context;
-}
-
 // The verified drafters for a model (a Hub repository's, and a path's) that it was not given: made for the repository it
 // is, or inferred, for the base models it names (its model card's, its file's).
 void suggest_drafters(const hub::Repo& repo, const std::vector<std::string>& drafters, Fetched* out,
@@ -726,13 +741,11 @@ void suggest_drafters(const hub::Repo& repo, const std::vector<std::string>& dra
   }
 }
 
-}  // namespace
-
-std::string dspark_beside(const std::string& model_path, const PathAllowFn& allow_path) {
-  if (allow_path && !allow_path(model_path)) return "";
+std::vector<HubGguf> dspark_beside(const std::string& model_path, const PathAllowFn& allow_path) {
+  if (allow_path && !allow_path(model_path)) return {};
   std::error_code ec;
   const fs::path p = to_path(model_path);
-  if (lower(from_path(p.extension())) != ".gguf" || !fs::is_regular_file(p, ec)) return "";
+  if (lower(from_path(p.extension())) != ".gguf" || !fs::is_regular_file(p, ec)) return {};
   // The model's name without its quantization: what a drafter made for it is named after.
   std::string name = model_name_of(model_path);
   const std::string quant = hub::quant_in_name(from_path(p.filename()));
@@ -740,11 +753,11 @@ std::string dspark_beside(const std::string& model_path, const PathAllowFn& allo
     name.resize(name.size() - quant.size());
     while (!name.empty() && (name.back() == '-' || name.back() == '_' || name.back() == '.')) name.pop_back();
   }
-  if (name.empty()) return "";
+  if (name.empty()) return {};
   const std::string want = "dspark-" + lower(name);
-  std::vector<std::string> found;
+  hub::Repo siblings;
   const fs::path dir = p.has_parent_path() ? p.parent_path() : fs::path(".");
-  if (allow_path && !allow_path(from_path(dir))) return "";
+  if (allow_path && !allow_path(from_path(dir))) return {};
   for (fs::directory_iterator it(dir, ec), end; !ec && it != end; it.increment(ec)) {
     const std::string low = lower(from_path(it->path().filename()));
     if (!low.ends_with(".gguf") || !low.starts_with(want) || low.size() <= want.size()) continue;
@@ -752,12 +765,70 @@ std::string dspark_beside(const std::string& model_path, const PathAllowFn& allo
     const std::string cand = from_path(it->path());
     if (allow_path && !allow_path(cand)) continue;
     std::error_code e2;
-    if (!it->is_regular_file(e2) || e2 || !is_dspark_file(cand, allow_path)) continue;
-    found.push_back(cand);
+    if (!it->is_regular_file(e2) || e2) continue;
+    const auto size = it->file_size(e2);
+    if (!e2) siblings.files.push_back({from_path(it->path().filename()), size, "", ""});
   }
-  std::sort(found.begin(), found.end());
-  return found.empty() ? "" : found.front();
+  return ggufs_at(siblings, dir, allow_path);
 }
+
+bool attach_dspark(const hub::Repo& repo, const std::vector<HubGguf>& ggufs, const hub::ProgressFn& progress,
+                   const std::atomic<bool>* stop, Fetched* out, std::string* err, const PathAllowFn& allow_path) {
+  const bool local = repo.id.empty();
+  const auto ranked = ranked_dspark(ggufs);
+  std::optional<ModelFile> target;
+  for (const auto* ds : ranked) {
+    const auto& choice = ds->choice;
+    const std::string source = local ? ds->disk : repo.id + "/" + choice.file.path;
+    std::string path = ds->disk;
+    if (stop && stop->load()) return *err = "stopped", false;
+    if (!local) {
+      if (!ds->cached && ranked.size() > 1) {
+        const auto peek = gguf_peek_prefix(hub::gguf_prefix(repo, choice.file, allow_path));
+        if (peek.valid && !peek.has_markov_context) {
+          out->notes.push_back(source + " is not a DSpark drafter: skipping the download");
+          continue;
+        }
+      }
+      std::vector<std::string> paths;
+      if (!hub::fetch(repo, choice.parts, &paths, progress, stop, err, allow_path)) return false;
+      path = paths.front();
+    }
+    const auto header = gguf_header(path, allow_path);
+    if (!header.valid || !header.has_markov_context) {
+      out->notes.push_back(source + " is not a DSpark drafter: skipping it");
+      continue;
+    }
+    // Build the same device-independent model description the engine uses. A Markov flag alone cannot establish
+    // that the tap indices, vocabulary and tensor dimensions are compatible with this target.
+    if (!target) {
+      target.emplace();
+      if (!target->open(out->model, err, allow_path)) return false;
+    }
+    std::string why;
+    if (target->add(path, &why, allow_path, ModelFile::CompanionRole::Drafter)) {
+      if (interfaces::open_model(*target, {.drafter = "dspark", .vision = false}, &why)) {
+        out->drafters.push_back(path);
+        out->drafter_sources.push_back({"dspark", source, choice.total_size});
+        out->notes.push_back("the DSpark drafter from " + source);
+        return true;
+      }
+      target->remove_last_companion();
+    }
+    out->notes.push_back("skipping " + source + ": " + why);
+  }
+  if (ranked.empty()) {
+    for (const auto& item : ggufs)
+      if (item.cached && hub::dspark_gguf_name(item.choice.file.path) && !item.cls.arch.empty()) {
+        const std::string source = local ? item.disk : repo.id + "/" + item.choice.file.path;
+        out->notes.push_back(source + " is not a DSpark drafter: not drafting with it");
+        break;
+      }
+  }
+  return true;
+}
+
+}  // namespace
 
 bool fetch_model(const std::string& model, const std::vector<std::string>& drafters, bool want_mtp,
                  const hub::ProgressFn& progress, const std::atomic<bool>* stop, Fetched* out, std::string* err,
@@ -802,21 +873,14 @@ bool fetch_model(const std::string& model, const std::vector<std::string>& draft
   }
   bool has_dspark = false;  // named: none other is taken
   for (const auto& ds : out->drafter_sources) has_dspark = has_dspark || ds.kind == "dspark";
-  if (repo.id.empty()) {  // a path: only a DSpark drafter beside it to know of
-    if (want_dspark && !has_dspark)
-      if (const std::string d = dspark_beside(out->model, allow_path); !d.empty()) {
-        out->drafters.push_back(d);
-        out->drafter_sources.push_back({"dspark", d, bytes_on_disk(d, allow_path)});
-        out->notes.push_back("the DSpark drafter beside the model: " + d);
-      }
-    suggest_drafters(repo, drafters, out, allow_path);
-    return true;
-  }
-  const bool need_mmproj = want_vision && out->mmproj.empty();
-  const bool need_mtp = want_mtp && own_mtp == 0 &&
+  const bool local = repo.id.empty();
+  const bool need_mmproj = !local && want_vision && out->mmproj.empty();
+  const bool need_mtp = !local && want_mtp && own_mtp == 0 &&
       std::none_of(out->drafter_sources.begin(), out->drafter_sources.end(), [](const auto& ds) { return ds.kind == "mtp"; });
   const bool need_dspark = want_dspark && !has_dspark;
-  const auto ggufs = need_mmproj || need_mtp || need_dspark ? hub_ggufs(repo, allow_path) : std::vector<HubGguf>{};
+  std::vector<HubGguf> ggufs;
+  if (need_mmproj || need_mtp || need_dspark)
+    ggufs = local ? dspark_beside(out->model, allow_path) : hub_ggufs(repo, allow_path);
   auto check_paths = [&](const std::vector<std::string>& paths) -> bool {
     if (!allow_path) return true;
     for (const std::string& p : paths)
@@ -847,27 +911,7 @@ bool fetch_model(const std::string& model, const std::vector<std::string>& draft
     out->drafter_sources.push_back({"mtp", repo.id + "/" + mtp->choice.file.path, mtp->choice.total_size});
     out->notes.push_back("the MTP layer from " + repo.id + "/" + mtp->choice.file.path + " (the model's file has none)");
   }
-  if (need_dspark) {
-    if (const auto* ds = preferred_companion(ggufs, "dspark")) {
-      const auto& choice = ds->choice;
-      std::vector<std::string> paths;
-      if (!hub::fetch(repo, choice.parts, &paths, progress, stop, err, allow_path) || !check_paths(paths)) return false;
-      const std::string source = repo.id + "/" + choice.file.path;
-      if (is_dspark_file(paths.front(), allow_path)) {
-        out->drafters.push_back(paths.front());
-        out->drafter_sources.push_back({"dspark", source, choice.total_size});
-        out->notes.push_back("the DSpark drafter from " + source);
-      } else {
-        out->notes.push_back(source + " is not a DSpark drafter: not drafting with it");
-      }
-    } else {
-      for (const auto& item : ggufs)
-        if (item.cached && hub::dspark_gguf_name(item.choice.file.path) && !item.cls.arch.empty()) {
-          out->notes.push_back(repo.id + "/" + item.choice.file.path + " is not a DSpark drafter: not drafting with it");
-          break;
-        }
-    }
-  }
+  if (need_dspark && !attach_dspark(repo, ggufs, progress, stop, out, err, allow_path)) return false;
   suggest_drafters(repo, drafters, out, allow_path);
   return true;
 }

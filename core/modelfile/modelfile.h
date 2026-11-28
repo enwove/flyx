@@ -43,6 +43,8 @@ class ModelFile {
   enum class CompanionRole { Any, Drafter, Projector, Lora };
   bool add(const std::string& path, std::string* err, const PathAllowFn& allow_path = {});
   bool add(const std::string& path, std::string* err, const PathAllowFn& allow_path, CompanionRole role);
+  // Undo a successful add after testing a candidate, once no model refers to that companion's views.
+  void remove_last_companion();
   static constexpr const char* kCompanion = "companion/";
   static std::string companion_name(int i, const std::string& name) {
     return kCompanion + std::to_string(i) + "/" + name;
@@ -101,6 +103,8 @@ struct GgufPeek {
 };
 std::string gguf_header_path(const std::string& path);  // shard 1 for a split GGUF
 GgufPeek gguf_peek(const std::string& path, const PathAllowFn& allow_path = {});
+// A bounded prefix supplied by a Hub range request. An incomplete metadata table leaves valid false.
+GgufPeek gguf_peek_prefix(std::string prefix);
 // Where a model file says it comes from, read from its header alone: the Hub repository it is (a .flyx file's
 // "source": "repo", as flyx_convert --repo writes it; a GGUF never says which repository holds it) and the
 // repositories it names as its bases (a GGUF's GgufPeek::base_models, general.source.repo_url included; a .flyx file's

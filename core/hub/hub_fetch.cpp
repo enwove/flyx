@@ -657,6 +657,21 @@ bool read_text(const Repo& r, const RepoFile& f, uint64_t max, std::string* text
   return true;
 }
 
+std::string gguf_prefix(const Repo& r, const RepoFile& f, const PathAllowFn& allow_path) {
+  if (r.from_cache || offline() || !f.size) return {};
+  fs::path local;
+  os::HttpGet g;
+  std::string prefix, ignored;
+  if (!file_of(r, f, &local, &g, &ignored) || (allow_path && !allow_path(from_path(local)))) return {};
+  const size_t bytes = size_t(std::min<uint64_t>(f.size, 64 << 10));
+  g.ranged = true;
+  g.last = bytes - 1;
+  int status = 0;
+  if (!os::http_get_text(g, &prefix, &status, &ignored, bytes) || prefix.size() != bytes ||
+      (status != 206 && !(status == 200 && bytes == f.size))) return {};
+  return prefix;
+}
+
 bool safetensors_header(const Repo& r, const RepoFile& f, std::string* header, std::string* err,
                         const PathAllowFn& allow_path) {
   fs::path local;

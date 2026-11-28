@@ -388,8 +388,7 @@ void cache_snapshots(const fs::path& tmp) {
             !flyx::hub::model_gguf_name("a/mtp/x.gguf") && !flyx::hub::model_gguf_name("mtp-x.gguf") &&
             !flyx::hub::model_gguf_name("mmproj-F16.gguf") && flyx::hub::split_gguf_name("x-00001-of-00002.gguf"),
         "model GGUFs by name: no MTP layers, projectors; split parts told");
-  // A DSpark drafter's GGUF by its name or directory: no model, and a companion of the models beside it, the first
-  // one the default.
+  // DSpark files are companions of the models beside them. The default is independent of the listing order.
   check(flyx::hub::dspark_gguf_name("dspark-Inkling-2-Mini-Q8_0.gguf") && flyx::hub::dspark_gguf_name("DSpark/x.gguf") &&
             flyx::hub::dspark_gguf_name("a/dspark/x-BF16.gguf") && !flyx::hub::dspark_gguf_name("dspark-imatrix.gguf") &&
             !flyx::hub::dspark_gguf_name("Inkling-2-Mini-Q4_K_M.gguf") && !flyx::hub::dspark_gguf_name("dspark-x.bin") &&
@@ -399,11 +398,15 @@ void cache_snapshots(const fs::path& tmp) {
   {
     flyx::hub::Repo ir;
     ir.id = "acme/Inkling-GGUF";
-    ir.files = {file("Inkling-Q4_K_M.gguf", 9), file("dspark-Inkling-Q8_0.gguf", 2), file("dspark-Inkling-BF16.gguf", 3)};
-    const auto comps = flyx::hub::companion_files(ir);
-    check(comps.size() == 2 && comps[0].kind == "dspark" && comps[0].is_default && comps[1].kind == "dspark" &&
-              !comps[1].is_default && flyx::hub::gguf_choices(ir).size() == 1,
-          "companion_files lists a repository's DSpark drafters, one the default; they are no quantizations of it");
+    ir.files = {file("Inkling-Q4_K_M.gguf", 9), file("dspark-Inkling-Q8_0_Old.gguf", 402278560),
+                file("dspark/dspark-Inkling-BF16.gguf", 647792800), file("dspark-Inkling-Q8_0.gguf", 503889952)};
+    for (int order = 0; order < 2; ++order) {
+      const auto comps = flyx::hub::companion_files(ir);
+      check(comps.size() == 3 && comps[0].file.path == "dspark-Inkling-Q8_0.gguf" && comps[0].is_default &&
+                !comps[1].is_default && !comps[2].is_default && flyx::hub::gguf_choices(ir).size() == 1,
+            "the canonical DSpark quantization precedes its smaller suffixed variant in either listing order");
+      std::reverse(ir.files.begin(), ir.files.end());
+    }
     std::vector<flyx::hub::RepoFile> picked;
     std::string why;
     check(flyx::hub::select(ir, {ir.id, "dspark-Inkling-Q8_0.gguf"}, &picked, &why) && picked.size() == 1 &&
