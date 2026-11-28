@@ -4049,6 +4049,9 @@ int main(int argc, char** argv) {
   auto plain8 = make(model, backend, false, g_block, true);
   auto spec8 = make(model, backend, true, g_block, true);
   auto mtp8 = make(model, backend, true, "mtp", true);
+  // Target layers past the first streamed through VRAM (gpu_layers=1) beside this drafter: no reference rounds, but
+  // its drafting must still give plain decoding's tokens, its oracle runs too (the drafter's own weights stay put).
+  auto streamed = backend == "cuda" ? make(model, backend, true, g_block, false, "gpu_layers=1") : nullptr;
   std::printf("backend %s, drafts per round %d\n", spec->backend_name().c_str(), spec->width());
   // Without a drafter whose state follows its own rounds only, the rounds are timed once at load at the prompt's
   // context, a round costing the same at any context: no second timing however long the context
@@ -4092,6 +4095,15 @@ int main(int argc, char** argv) {
       const auto t8 = gen(a8, prompt, N).tokens;
       check(gen(b8, prompt, N).tokens == t8 && gen(c8, prompt, N).tokens == t8,
             "fp8 kv cache: " + block_label() + " and MTP decode == plain decode");
+    }
+    if (streamed) {
+      Session st(streamed.get()), sto(streamed.get());
+      init_checked(st);
+      init_checked(sto);
+      const auto oracle = c["oracle"].get<std::vector<int32_t>>();
+      streamed->api()->set_oracle(sto.seq(), oracle.data(), static_cast<int32_t>(oracle.size()));
+      check(gen(st, prompt, N).tokens == want && gen(sto, prompt, N).tokens == want,
+            g_block + " beside streamed layers (gpu_layers=1), oracle drafts too: the reference's tokens");
     }
 
     Session ss(spec.get());
