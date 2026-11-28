@@ -3,6 +3,7 @@
 // 1. Grammar rollback near max_ctx must not launch a speculative round past flyx_room(at, max_ctx).
 // 2. Failed Session::prepare() (rewind error) must reset device and host session state cleanly.
 // 3. Session::tokenize() must not match an empty history_text_ against every subsequent prompt.
+#include <algorithm>
 #include <cstdio>
 #include <cstring>
 #include <filesystem>
@@ -423,6 +424,110 @@ void test_round_costs_learned(const char* model, const flyx_backend_api* cpu) {
         "two generations at once: no round's cost learned");
 }
 
+// A request naming no limit (max_new_tokens 0): the engine's default (EngineOptions::max_new_tokens, serve's
+// --max-tokens), else the end of the context; one that names a limit keeps it.
+void test_default_max_new_tokens(const char* model, const flyx_backend_api* cpu) {
+  g_cpu = cpu;
+  flyx_test_delegate(cpu);
+  auto run = [&](int engine_default, int asked, int* got) {
+    EngineOptions eo;
+    eo.backend = "test-host-kv";
+    eo.max_ctx = 96;
+    eo.speculative = false;
+    eo.max_new_tokens = engine_default;
+    Engine engine;
+    std::string err;
+    if (!engine.load(model, eo, &err)) return check(false, "load engine for the default reply limit: " + err), false;
+    Session s(&engine);
+    if (!s.init(&err)) return check(false, "session init: " + err), false;
+    GenerateRequest rq;
+    rq.prompt = engine.tokenizer().encode("one two three");
+    rq.max_new_tokens = asked;
+    rq.ignore_eos = true;
+    GenerateResult res;
+    if (generate(s, rq, [](std::string_view, const int32_t*, int) { return true; }, &res, &err) != 0)
+      return check(false, "generate: " + err), false;
+    *got = res.usage.new_tokens;
+    return true;
+  };
+  int got = 0;
+  if (run(7, 0, &got)) check(got == 7, "no limit asked: the engine's default, 7 tokens (" + std::to_string(got) + ")");
+  if (run(7, 3, &got)) check(got == 3, "a limit asked: its own, 3 tokens (" + std::to_string(got) + ")");
+  if (run(0, 0, &got))
+    check(got > 7 && got <= 96, "no limit anywhere: up to the context's end (" + std::to_string(got) + " tokens)");
+}
+
+// A thinking budget (GenerateRequest::thinking_budget): the reply thinks that many tokens and then writes the closing
+// marker, with a drafter as without one (the budget is held as a grammar is: a speculative round gives plain
+// decoding's tokens).  The markers here are ordinary words, so the model writes them only when made to.
+void test_thinking_budget(const char* model, const flyx_backend_api* cpu) {
+  g_cpu = cpu;
+  flyx_test_delegate(cpu);
+  constexpr int kBudget = 9, kReply = 40;
+  // A reply from `prompt`: under the budget (budget >= 0) or none; its tokens.
+  auto run = [&](bool speculative, const std::vector<int32_t>* prompt, int budget, int max_new,
+                 std::vector<int32_t>* out, std::vector<int32_t>* base, std::vector<int32_t>* close) {
+    EngineOptions eo;
+    eo.backend = "test-host-kv";
+    eo.max_ctx = 160;
+    eo.speculative = speculative;
+    if (speculative) eo.drafter = "mtp";
+    Engine engine;
+    std::string err;
+    if (!engine.load(model, eo, &err)) return check(false, "load engine for the thinking budget: " + err), false;
+    Session s(&engine);
+    if (!s.init(&err)) return check(false, "session init: " + err), false;
+    GenerateRequest rq;
+    if (prompt) {
+      rq.prompt = *prompt;
+    } else {
+      for (int k = 0; k < 3; ++k) {
+        const auto ids = engine.tokenizer().encode("one two three four five six seven eight ");
+        rq.prompt.insert(rq.prompt.end(), ids.begin(), ids.end());
+      }
+    }
+    if (base) *base = rq.prompt;
+    rq.max_new_tokens = max_new;
+    rq.ignore_eos = true;
+    rq.thinking_budget = budget;
+    rq.thinking_open = engine.tokenizer().encode(" open");
+    rq.thinking_close = engine.tokenizer().encode(" lighthouse harbor");
+    if (close) *close = rq.thinking_close;
+    rq.thinking_inside = true;
+    GenerateResult res;
+    if (generate(s, rq, [](std::string_view, const int32_t*, int) { return true; }, &res, &err) != 0)
+      return check(false, "generate: " + err), false;
+    // The reply: the tokens after the prompt (a drafter's session may hold a round's past the reply's end).
+    const auto from = s.tokens().begin() + long(rq.prompt.size());
+    *out = std::vector<int32_t>(from, from + res.usage.new_tokens);
+    return true;
+  };
+  std::vector<int32_t> plain, spec, base, close;
+  if (!run(false, nullptr, kBudget, kReply, &plain, &base, &close) ||
+      !run(true, nullptr, kBudget, kReply, &spec, nullptr, nullptr))
+    return;
+  const size_t marked = kBudget + close.size();
+  const bool at_budget = plain.size() > marked && std::equal(close.begin(), close.end(), plain.begin() + kBudget);
+  check(at_budget, "the closing marker written right after the " + std::to_string(kBudget) + " tokens of the budget");
+  size_t differ = 0;
+  while (differ < spec.size() && differ < plain.size() && spec[differ] == plain[differ]) ++differ;
+  std::string around;
+  for (size_t k = differ > 2 ? differ - 2 : 0; k < std::min(plain.size(), differ + 3); ++k)
+    around += " " + std::to_string(plain[k]) + "/" + (k < spec.size() ? std::to_string(spec[k]) : "-");
+  check(spec == plain, "a drafter's reply under a thinking budget is plain decoding's (" +
+                           std::to_string(spec.size()) + " and " + std::to_string(plain.size()) +
+                           " tokens; first difference at " + std::to_string(differ) + ", plain/drafted:" + around + ")");
+  if (!at_budget) return;
+  // After the marker the reply goes on as the model would from it: what follows the prompt, the thought and the
+  // marker with no budget (two rounds in flight must not write a second marker, nor drop a token).
+  std::vector<int32_t> head = base, after;
+  head.insert(head.end(), plain.begin(), plain.begin() + long(marked));
+  if (!run(false, &head, -1, kReply - int(marked), &after, nullptr, nullptr)) return;
+  const std::vector<int32_t> tail(plain.begin() + long(marked), plain.end());
+  check(tail == after, "after the marker, the model's own continuation (" + std::to_string(tail.size()) +
+                           " tokens against " + std::to_string(after.size()) + ")");
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -445,5 +550,7 @@ int main(int argc, char** argv) {
   test_prepare_failure_resets_session(argv[1], cpu);
   test_empty_history_text_tokenize(argv[1], cpu);
   test_round_costs_learned(argv[1], cpu);
+  test_default_max_new_tokens(argv[1], cpu);
+  test_thinking_budget(argv[1], cpu);
   return flyx::test::finish("generation_test");
 }

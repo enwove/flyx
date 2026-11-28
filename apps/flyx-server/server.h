@@ -114,30 +114,51 @@ bool wait_stream(httplib::DataSink& sink, const std::string& ping, Poll poll) {
 // `ping` every 5 s it waits (so proxies keep the connection), and is false once the client has gone; write is
 // true when the stream is whole, false when the client went away.  A client gone, here or as the connection
 // drops, cancels the job.  The stream holds the scheduler (`sched`) until it ends: a job reaches back into it.
-// Every event next() gives is shown to `rec` (null: the request log is off), logged once the stream ends.
+// Every event of the job is shown to `rec` (null: the request log is off), logged once the job has ended, so that
+// a request whose client went away is logged with what it cost: its usage and timing come with the terminal event,
+// which a cancelled job sends within a round (collect_events waits for it so too).
 template <class Write>
 void stream_events(httplib::Response& res, const std::shared_ptr<Job>& job, std::shared_ptr<Scheduler> sched,
                    std::shared_ptr<Recording> rec, std::string ping, Write write) {
   res.set_header("Cache-Control", "no-cache");
+  // Whether the job's terminal event was read, and the request logged: by the provider, or by the releaser where
+  // the connection dropped before the provider ran.
+  struct Ending {
+    bool ended = false, logged = false;
+  };
+  auto ending = std::make_shared<Ending>();
+  auto see = [rec, ending](const JobEvent& ev) {
+    if (rec) rec->see(ev);
+    ending->ended = ending->ended || ev.kind == JobEvent::kDone || ev.kind == JobEvent::kError;
+  };
+  // The client is gone: the job cancelled, its events read to the terminal one, the request logged.
+  auto abandon = [job, rec, ending, see] {
+    job->cancel();
+    for (JobEvent ev; !ending->ended;)
+      if (job->next(&ev, 1000)) see(ev);
+    if (rec && !ending->logged) rec->finish();
+    ending->logged = true;
+  };
   res.set_chunked_content_provider(
       "text/event-stream",
-      [job, sched, rec, ping = std::move(ping), write = std::move(write)](size_t, httplib::DataSink& sink) mutable {
+      [job, sched, rec, ending, see, abandon, ping = std::move(ping), write = std::move(write)](
+          size_t, httplib::DataSink& sink) mutable {
         auto next = [&](JobEvent* ev) {
           if (!wait_stream(sink, ping, [&](int ms) { return job->next(ev, ms); })) return false;
-          if (rec) rec->see(*ev);
+          see(*ev);
           return true;
         };
-        const bool whole = write(sink, next);
-        if (rec) rec->finish();
-        if (!whole) {
-          job->cancel();
+        if (!write(sink, next)) {
+          abandon();
           return false;
         }
+        if (rec) rec->finish();
+        ending->logged = true;
         sink.done();
         return true;
       },
-      [job, sched](bool success) {
-        if (!success) job->cancel();
+      [sched, ending, abandon](bool success) {
+        if (!success && !ending->logged) abandon();
       });
 }
 

@@ -59,6 +59,9 @@ class ModelFile {
   // Empty view if the blob does not exist.
   std::string_view blob(const std::string& name) const;
   std::vector<int32_t> eos_ids() const;
+  // The most tokens a reply takes where the request names no limit, as the model's maker set it (Hugging Face's
+  // generation_config.json max_new_tokens, kept by the converter); 0 where the file names none.
+  int max_new_tokens() const;
   // The bytes of this file and its companions.
   uint64_t bytes() const;
   // Reads this file and then its companions from disk, front to back a piece at a time (os::MappedFile::read_ahead),
@@ -122,5 +125,10 @@ std::string drafter_kind_of(const std::vector<std::string>& architectures);
 // mapping it: "dflash2", "dflash", "dspark", "dspine"; "" when it holds none (a GGUF drafter's kind is its
 // header's: gguf_peek).
 std::string drafter_source_kind(const std::string& path, const PathAllowFn& allow_path = {});
+// Whether a path holds a drafter alone, no model: a drafter's directory, or a .flyx file whose header says "kind":
+// "drafter" (python/convert --draft alone).  What ModelFile::open refuses to open as a model, read without mapping it:
+// a model list shows such a file as the drafter it is, and a server asked to load it refuses before giving up the
+// model it serves.  (A model file with its own drafter beside it is a model.)
+bool holds_drafter_alone(const std::string& path, const PathAllowFn& allow_path = {});
 
 }  // namespace flyx

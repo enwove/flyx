@@ -186,6 +186,7 @@ add_library(flyx_core STATIC
   core/exec/generation.cpp
   core/exec/request.cpp
   core/exec/reply_text.cpp
+  core/exec/thinking_budget.cpp
   core/exec/scheduler.cpp
   core/exec/telemetry.cpp
   core/resources/ledger.cpp

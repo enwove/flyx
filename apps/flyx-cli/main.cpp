@@ -92,7 +92,8 @@ constexpr int kPromptSetMaxNew = 512;
                "  --chat               wrap the prompt as a user message (run)\n"
                "  --no-think           disable the thinking block in chat mode\n"
                "  --chat-template-kwargs JSON  template variables for run --chat, chat and template (JSON object)\n"
-               "  -n N                 max new tokens (default 256)\n"
+               "  -n N                 max new tokens (default 256; 0: the model's own limit if its file has one,\n"
+               "                       else up to the end of the context)\n"
                "  --ignore-eos         do not stop at end-of-sequence tokens\n"
                "  --temperature T, --top-p P, --top-k K, --seed S   sampling (default: greedy)\n"
                "  --presence-penalty P, --frequency-penalty F       what a token already in the reply loses\n"
@@ -182,6 +183,10 @@ Args parse(int argc, char** argv) {
   if (no_think) chat_defaults["enable_thinking"] = false;
   a.chat_options = apps::resolve_chat_options(chat_defaults, ojson::object());
   if (!a.images.empty() && a.cmd != "run") bad_usage("--image is only supported with 'flyx run'");
+  // What the command needs from the command line, said before the model is looked for (a Hub name is fetched).
+  if (a.cmd == "template" && a.extra.empty()) bad_usage("template needs a MESSAGES.json path after the model");
+  if (a.cmd == "run" && a.prompt.empty() && !a.chat && a.images.empty())
+    bad_usage("run needs a prompt: -p TEXT or -f FILE (with --chat, an empty one is a user message)");
   return a;
 }
 
@@ -192,8 +197,11 @@ void print(std::string_view text) {
 
 void report(const Engine& e, const GenerateResult& res) {
   const flyx_usage& u = res.usage;
-  const double tps = apps::decode_rate(u.new_tokens, u.decode_ms);
-  double acc = u.rounds && u.new_tokens > 1 ? double(u.new_tokens - 1) / u.rounds : 0;
+  // The tokens the model chose, its stop token among them (GenerateResult::output_tokens): the first with the prefill,
+  // the others from the rounds, which the rate and the tokens a round count, as the server's request log does.
+  const int out = res.output_tokens();
+  const double tps = apps::decode_rate(out, u.decode_ms);
+  double acc = u.rounds && out > 1 ? double(out - 1) / u.rounds : 0;
   // Which drafter drafted how many rounds, when there are several, and the lookup rounds.
   std::string by;
   if (e.model().drafters() > 1)
@@ -204,7 +212,7 @@ void report(const Engine& e, const GenerateResult& res) {
   std::fprintf(stderr,
                "\n[prompt %d (reused %d) | prefill %.1f ms | %d tokens in %.1f ms = %.1f tok/s | %d rounds, %.2f "
                "tokens/round, %.1f drafts/round%s | finish %d]\n",
-               u.prompt_tokens, u.reused_tokens, u.prefill_ms, u.new_tokens, u.decode_ms, tps, u.rounds, acc,
+               u.prompt_tokens, u.reused_tokens, u.prefill_ms, out, u.decode_ms, tps, u.rounds, acc,
                u.rounds ? double(u.drafted) / u.rounds : 0.0, by.c_str(), u.finish_reason);
 }
 

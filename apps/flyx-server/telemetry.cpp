@@ -22,6 +22,7 @@
 #include "apps/common/chat_options.h"
 #include "apps/common/version.h"
 #include "apps/flyx-server/agent_launch.h"
+#include "apps/flyx-server/gpu_apps.h"
 #include "apps/flyx-server/server.h"
 #include "core/os/os.h"
 #include "core/plan/budget.h"
@@ -77,10 +78,18 @@ ojson snapshot_json(const Server& s, int recent) {
   if (served.sched) {
     served.sched->telemetry(&t, &d, &device_ok);
   } else {  // no model: none named yet, or one being fetched or loaded (the "load" object says which)
+    s.host->telemetry(&t);  // what the models before counted
     t.loaded = false;
     t.phase = TelemetrySnapshot::kUnloaded;
-    t.started_at = s.started_at;
+    // The GPU's live figures all the same, from NVML alone (nvml_device_stats): no backend call, which would make a
+    // CUDA context and hold GPU memory a server without a model has given back.  The device the start-up probe
+    // found, else the one the models before ran on.
+    const std::string hint = s.device_probe.is_object() ? s.device_probe.value("name", t.model.device) : t.model.device;
+    std::string name;
+    device_ok = nvml_device_stats(hint, &d, &name);
+    if (device_ok) t.model.device = name;
   }
+  t.started_at = s.started_at;  // the server's, not the served model's
   const double now = os::unix_seconds();
   const auto& m = t.model;
 
@@ -102,6 +111,7 @@ ojson snapshot_json(const Server& s, int recent) {
     model["max_sessions"] = m.max_sessions;
     model["memory"] = m.memory;
     model["load_s"] = m.load_s;
+    model["loaded_at"] = t.loaded_at;  // the figures of "the last request" are of requests since
     ojson deg = ojson::array();
     for (const LoadAdjustment& a : m.load_adjustments)
       deg.push_back({{"kind", a.kind}, {"from", a.from}, {"to", a.to}, {"detail", a.detail}});

@@ -17,6 +17,7 @@
 #include "apps/common/numbers.h"
 #include "apps/flyx-server/drafter_speeds.h"
 #include "core/interfaces/options.h"
+#include "core/modelfile/modelfile.h"
 #include "core/os/env.h"
 #include "core/os/os.h"
 #include "core/os/path.h"
@@ -28,6 +29,12 @@ namespace {
 namespace fs = std::filesystem;
 
 using os::to_path;
+
+// An error about a model, with the model named once: a reason from the model file already names it (ModelFile::open's
+// "<path> holds ..."), one from elsewhere is given it.
+std::string naming(const std::string& model, const std::string& why) {
+  return why.find(model) != std::string::npos ? why : model + ": " + why;
+}
 
 ojson want_json(const ModelHost::Want& w) {
   return {{"model", w.model},
@@ -667,15 +674,15 @@ std::shared_ptr<Scheduler> ModelHost::open(const std::string& model, const apps:
   std::shared_ptr<Scheduler> sched;
   try {
     // A deleter that says when it is gone, for retire() to wait on before the next model loads.
-    sched = std::shared_ptr<Scheduler>(new Scheduler(f.model, eo, so), SignalTeardown{std::make_shared<Teardown>()});
+    sched = std::shared_ptr<Scheduler>(new Scheduler(f.model, eo, so, telemetry_), SignalTeardown{std::make_shared<Teardown>()});
   } catch (const std::exception& e) {
     // A model file no check foresaw: a load that failed with its reason, not the end of the server.
     *err = e.what();
-    std::fprintf(stderr, "flyx-server: %s: %s\n", f.model.c_str(), err->c_str());
+    std::fprintf(stderr, "flyx-server: %s\n", naming(f.model, *err).c_str());
     return nullptr;
   }
   if (!sched->ok(err)) {
-    std::fprintf(stderr, "flyx-server: %s: %s\n", f.model.c_str(), err->c_str());
+    std::fprintf(stderr, "flyx-server: %s\n", naming(f.model, *err).c_str());
     return nullptr;
   }
   if (so.on_finished && sched->engine()) {  // the Hub drafters among those the engine drafts with ("mtp+dspark")
@@ -733,6 +740,15 @@ bool ModelHost::work(const Want& w, std::string* err) {
     return false;
   }
   for (const std::string& n : f.notes) std::fprintf(stderr, "flyx-server: %s\n", n.c_str());
+  // A file no load can take, refused while the model served is still served: a drafter alone (ModelFile::open would
+  // refuse it only after the model served had been given up, leaving none).
+  if (holds_drafter_alone(f.model, w.eo.allow_path)) {
+    *err = f.model + " holds a drafter alone, not a model: draft with it beside a model (--drafter-file)";
+    std::fprintf(stderr, "flyx-server: %s\n", err->c_str());
+    std::lock_guard<std::mutex> lock(mu_);
+    error_ = *err, state_ = served_.sched ? "ready" : "failed";
+    return false;
+  }
   // Unload the model served now so its GPU memory is free before the new one loads.
   std::shared_ptr<Scheduler> old;
   {
@@ -749,7 +765,7 @@ bool ModelHost::work(const Want& w, std::string* err) {
   if (!sched) {
     std::fprintf(stderr, "flyx-server: %s did not load: none served\n", w.model.c_str());
     std::lock_guard<std::mutex> lock(mu_);
-    *err = error_ = switching ? (w.model + ": " + why) : why;
+    *err = error_ = switching ? naming(w.model, why) : why;
     state_ = "failed";
     return false;
   }

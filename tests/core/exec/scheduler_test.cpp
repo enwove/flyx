@@ -11,6 +11,7 @@
 #include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <future>
@@ -990,6 +991,64 @@ int main(int argc, char** argv) {
       const bool stayed_loaded = sched_idle.is_loaded();
       check(unloaded && !r->done && !r->error.empty() && reloaded && stayed_loaded,
             "idle reload refreshes last_active_ even when the triggering request fails in start()");
+    }
+  }
+
+  // A server's telemetry outlives the models it serves one after another: a scheduler that follows another on it
+  // counts on from that one's requests (the dashboard's totals and recent requests across a model switch).
+  if (eo.backend == "cpu_ref") {
+    auto server_telemetry = std::make_shared<Telemetry>();
+    EngineOptions eo_small = eo;
+    eo_small.max_ctx = 128;
+    SchedulerOptions so_small;
+    so_small.max_sessions = 1;
+    std::string err_first, err_second;
+    {
+      Scheduler first(argv[1], eo_small, so_small, server_telemetry);
+      if (first.ok(&err_first)) send(first, raw(first, "before the switch", "one two three", 3))->wait();
+    }
+    Scheduler second(argv[1], eo_small, so_small, server_telemetry);
+    TelemetrySnapshot t;
+    flyx_device_stats device{};
+    bool device_ok = false;
+    second.telemetry(&t, &device, &device_ok);
+    check(t.loaded && t.sessions.empty(), "the scheduler before took its sessions with it");
+    if (second.ok(&err_second)) send(second, raw(second, "after the switch", "four five six", 3))->wait();
+    second.telemetry(&t, &device, &device_ok);
+    check(err_first.empty() && err_second.empty() && t.totals.requests == 2 && t.recent.size() == 2 &&
+              t.recent[0].label == "after the switch" && t.recent[1].label == "before the switch",
+          "a scheduler on the server's telemetry counts on from the one before it (" + err_first + err_second + ")");
+  }
+
+  // A reply that ends at a stop token, decoded plainly: a token a round, the stop token's round among them (the
+  // request log's and the dashboard's tokens/round; 0.95 for 20 tokens in 20 rounds when it was left out).
+  if (eo.backend == "cpu_ref") {
+    EngineOptions eo_plain = eo;
+    eo_plain.max_ctx = 256;
+    eo_plain.speculative = false;
+    eo_plain.lookup = false;
+    eo_plain.lookup_given = true;
+    Scheduler plain(argv[1], eo_plain, SchedulerOptions{});
+    std::string err_plain;
+    if (!plain.ok(&err_plain)) {
+      check(false, "plain scheduler: " + err_plain);
+    } else {
+      auto probe = send(plain, raw(plain, "probe", "seven eight nine", 6));
+      probe->wait();
+      const std::vector<int32_t> ids = plain.engine()->tokenizer().encode(probe->text);
+      Request stopped = raw(plain, "stopped", "seven eight nine", 6);
+      stopped.gen.ignore_eos = false;
+      if (ids.size() >= 3) stopped.gen.stop_tokens = {ids[2]};
+      send(plain, stopped)->wait();
+      TelemetrySnapshot t;
+      flyx_device_stats device{};
+      bool device_ok = false;
+      plain.telemetry(&t, &device, &device_ok);
+      const RequestRecord* r = t.recent.empty() ? nullptr : &t.recent[0];
+      check(ids.size() >= 3 && r && r->label == "stopped" && r->status == "stop" && r->output_tokens >= 2 &&
+                std::fabs(r->tokens_per_round - 1.0) < 1e-9,
+            "plain decoding to a stop token: 1.00 tokens a round (" +
+                (r ? std::to_string(r->output_tokens) + " tokens, " + std::to_string(r->tokens_per_round) : "none") + ")");
     }
   }
 

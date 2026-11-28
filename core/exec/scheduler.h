@@ -131,8 +131,10 @@ struct SchedulerOptions {
 
 class Scheduler {
  public:
-  // Loads the model (check ok()); unloads and reloads it per keep_alive_ms.
-  Scheduler(const std::string& model, const EngineOptions& eo, const SchedulerOptions& o);
+  // Loads the model (check ok()); unloads and reloads it per keep_alive_ms.  It counts in `telemetry`: a server's,
+  // which outlives the models it serves one after another (their totals and recent requests add up), or its own.
+  Scheduler(const std::string& model, const EngineOptions& eo, const SchedulerOptions& o,
+            std::shared_ptr<Telemetry> telemetry = std::make_shared<Telemetry>());
   ~Scheduler();
   bool ok(std::string* err) const;
 
@@ -207,7 +209,7 @@ class Scheduler {
   std::atomic<bool> has_vision_{false};
   BatchCostModel batch_cost_;
   mutable std::shared_mutex engine_mu_;
-  Telemetry telemetry_;
+  std::shared_ptr<Telemetry> telemetry_;
   double load_s_ = 0;   // the last load took
   std::atomic<int> ctx_{0};  // the loaded engine's context (eo_'s, or the longest that fit)
   // Before prefix_cache_: the snapshots outlive the prefix cache and the engine (a reload of the same model reads

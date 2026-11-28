@@ -8,7 +8,7 @@ import { Meter, MemBar, StatusBadge, Icon } from "../lib/ui.js";
 import { Chart } from "../lib/charts.js";
 import { pendingConnect } from "../components/hints.js";
 import { openRequest } from "../lib/actions.js";
-import { live, phaseOf, phaseNames, phaseTone, ttftSeconds, speeds, cacheHit, acceptance, memoryOf } from "../lib/telemetry.js";
+import { live, phaseOf, phaseNames, phaseTone, ttftSeconds, speeds, cacheHit, acceptance, memoryOf, servedRecent } from "../lib/telemetry.js";
 
 // What runs now: a sentence of parts (bold where it names a figure), what sits on the right, how far along it is.
 function now(tm, phase) {
@@ -124,7 +124,7 @@ export function Overview({ active, go, explore, showModel, onOpenMem }) {
         <div class="pane-h"><h2>${t("Throughput")}</h2><span class="legend"><span style="--c: var(--chart)">${t("decode, left axis")}</span>
           <span style="--c: var(--chart-2)">${t("prefill, right axis")}</span></span>
           <span class="aside">${t("last 2 minutes")}</span></div>
-        <div class="fig">${speedFigures(tm, phase, recent).map((f) => html`<b>${fmt(f.v, f.d)}</b><span>${t(f.what)}</span>`)}</div>
+        <div class="fig">${speedFigures(tm, phase, servedRecent(tm)).map((f) => html`<b>${fmt(f.v, f.d)}</b><span>${t(f.what)}</span>`)}</div>
         ${active ? html`<${Chart} samples=${perSecond}
                          series=${[{ key: "out", color: "--chart", fill: true }, { key: "pre", color: "--chart-2", axis: "right" }]}
                          opts=${{ span: 120, minTop: 10, right: { minTop: 100 } }}
@@ -135,7 +135,7 @@ export function Overview({ active, go, explore, showModel, onOpenMem }) {
         <div class="pane-h"><h2>${t("Speculative decoding")}</h2>
           <span class="aside">${draftSummary ? t(draftSummary) :
                                 model.loaded ? t("no drafter") : ""}</span></div>
-        <div class="fig pair">${drafting(tm, phase, recent).map((f) => html`
+        <div class="fig pair">${drafting(tm, phase, servedRecent(tm)).map((f) => html`
           <div><b>${figure(f.v, f.d, f.unit)}</b><span>${t(f.what)}</span></div>`)}</div>
         <div class="legend"><span style="--c: var(--chart)">${t("tokens a round, left axis")}</span>
           <span style="--c: var(--chart-2)">${t("drafts accepted, right axis")}</span></div>

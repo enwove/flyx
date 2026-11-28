@@ -33,6 +33,7 @@
 
 #include "core/exec/engine.h"
 #include "core/exec/reply_text.h"
+#include "core/exec/thinking_budget.h"
 #include "core/session/session.h"
 #include "core/speculation/chooser.h"
 #include "flyx/backend_abi.h"
@@ -79,6 +80,12 @@ struct GenerateRequest {
   // without a drafter this is constrained decoding by its definition, which
   // the checked path must reproduce exactly.
   bool grammar_reference = false;
+  // The most tokens the reply thinks (Anthropic's thinking.budget_tokens; -1: no limit): its thinking sections, the
+  // format's markers as tokens (thinking_open, thinking_close: prepare_request), are closed once it is spent
+  // (core/exec/thinking_budget.h); thinking_inside: the prompt leaves a section open.
+  int thinking_budget = -1;
+  std::vector<int32_t> thinking_open, thinking_close;
+  bool thinking_inside = false;
   // A prompt position whose checkpoint is kept through later requests (-1:
   // none): the end of the latest user message.  A new question makes the
   // template drop the thinking of the turns since that message, so the next
@@ -105,6 +112,9 @@ struct GenerateResult {
   flyx_usage usage{};
   std::string stop_string;                // the stop string that ended the generation, if any
   int32_t stop_token = -1;                // the stop token that ended it, if any
+  // The tokens the model chose: the reply's, and the stop token that ended it (a round chose that one too).  The
+  // first comes with the prompt's prefill, every other from a round: decode_rate and tokens a round count those.
+  int output_tokens() const { return usage.new_tokens + (stop_token >= 0 ? 1 : 0); }
   std::string reuse;                      // how the prompt prefix was reused, or why it was not
   std::string parked;                     // checkpoints kept when this request displaced a conversation
   int grammar_fixes = 0;                  // tokens the grammar rejected and that were chosen again
@@ -207,11 +217,16 @@ class Generation {
   bool penalized() const { return g_.presence_penalty != 0.f || g_.frequency_penalty != 0.f; }
   void prepare_round(const RoundChoice& round, bool masked, flyx_gen_params* params, flyx_plan** plan);
   bool launch(const RoundChoice& round, bool masked);
-  // The index of the first token of `r` the grammar rejects, or -1; the tokens before it advance the grammar.
+  // The index of the first token of `r` the grammar or the thinking budget rejects, or -1; the tokens before it
+  // advance both.
   int rejected(const flyx_round_result& r);
+  // Whether a token is constrained: a grammar, or a thinking budget (fill_mask then gives the tokens allowed).
+  bool constrained() const { return (req_.grammar || thinking_.active()) && !grammar_over_; }
+  // mask_: the tokens the grammar allows, and of them only the one the thinking budget forces when it forces one.
+  void fill_mask();
   // Counts and shows a result's tokens up to a stop; false when the reply has ended.
   bool deliver(const flyx_round_result& r);
-  // Token `bad` of `r` does not fit the grammar: show what came before it,
+  // Token `bad` of `r` does not fit the grammar or the thinking budget: show what came before it,
   // undo the rest and choose it again under the mask.
   bool choose_again(const flyx_round_result& r, int bad);
 
@@ -226,7 +241,8 @@ class Generation {
   Phase phase_ = Phase::kStart;
 
   flyx_gen_params g_{};
-  std::vector<uint32_t> mask_;     // the grammar's allowed tokens, for a launch that needs them
+  std::vector<uint32_t> mask_;     // the tokens the grammar and the thinking budget allow, for a launch that needs them
+  ThinkingBudget thinking_;        // GenerateRequest::thinking_budget
   int n_ = 0;                      // prompt tokens
   int max_new_ = 0;
   double started_ms_ = 0, decoding_ms_ = 0;
@@ -246,7 +262,8 @@ class Generation {
   int finish_ = 0;                 // flyx_finish_reason once the reply has ended
   // rounds
   bool every_ = false;             // GenerateRequest::grammar_reference
-  bool grammar_over_ = false;      // the grammar took a stop token the request goes on past (ignore_eos)
+  bool grammar_over_ = false;      // the reply took a stop token the request goes on past (ignore_eos): nothing
+                                   // after it is checked, by the grammar or the thinking budget
   bool launching_ = false;
   int64_t next_disk_stage_ = 0;    // next accepted position at which to stage generated KV (0: no disk tier)
   bool stage_due_ = false;         // drain outstanding rounds before reading their state

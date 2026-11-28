@@ -226,6 +226,7 @@ flyx_add_unit_test(reply_text_test core/exec/reply_text_test.cpp)
 flyx_add_unit_test(chooser_test core/speculation/chooser_test.cpp)
 flyx_add_unit_test(calibrate_test core/speculation/calibrate_test.cpp)
 flyx_add_unit_test(round_costs_test core/speculation/round_costs_test.cpp)
+flyx_add_unit_test(thinking_budget_test core/exec/thinking_budget_test.cpp)
 flyx_add_unit_test(budget_test core/plan/budget_test.cpp)
 flyx_add_unit_test(golden_test e2e/golden_test.cpp)
 flyx_add_unit_test(gguf_test core/modelfile/gguf_test.cpp)
@@ -387,12 +388,15 @@ flyx_add_py_test(server_hardening ${CMAKE_CURRENT_SOURCE_DIR}/apps/flyx-server/h
                  ARGS $<TARGET_FILE:flyx-cli> ${ASSETS}/tiny.flyx FIXTURES assets TIMEOUT 120)
 flyx_add_py_test(queued_request_log ${CMAKE_CURRENT_SOURCE_DIR}/apps/flyx-server/queued_request_log.py
                  ARGS $<TARGET_FILE:flyx-cli> ${ASSETS}/tiny.flyx FIXTURES assets TIMEOUT 90)
+flyx_add_py_test(stream_cancel_log ${CMAKE_CURRENT_SOURCE_DIR}/apps/flyx-server/stream_cancel_log.py
+                 ARGS $<TARGET_FILE:flyx-cli> ${ASSETS}/tiny.flyx FIXTURES assets TIMEOUT 90)
 flyx_add_py_test(client_conversations ${CMAKE_CURRENT_SOURCE_DIR}/apps/flyx-server/client_conversations.py
                  ARGS $<TARGET_FILE:flyx-cli> ${ASSETS}/tiny.flyx FIXTURES assets TIMEOUT 90)
 flyx_add_py_test(codex_threads ${CMAKE_CURRENT_SOURCE_DIR}/apps/flyx-server/codex_threads.py
                  ARGS $<TARGET_FILE:flyx-cli> ${ASSETS}/tiny.flyx FIXTURES assets TIMEOUT 90)
 flyx_add_py_test(model_timestamps ${CMAKE_CURRENT_SOURCE_DIR}/apps/flyx-server/model_timestamps.py
-                 ARGS $<TARGET_FILE:flyx-cli> ${ASSETS}/tiny.flyx FIXTURES assets)
+                 ARGS $<TARGET_FILE:flyx-cli> ${ASSETS}/tiny.flyx ${ASSETS}/tiny_draft.flyx ${ASSETS}/tiny_dflash.flyx
+                 FIXTURES assets)
 
 add_test(NAME chat COMMAND chat_test ${ASSETS}/tiny.flyx ${ASSETS}/chat_cases.json
                                      ${CMAKE_SOURCE_DIR}/tests/core/render/templates)
@@ -449,6 +453,8 @@ add_test(NAME round_chooser COMMAND chooser_test)
 add_test(NAME round_costs_plausible COMMAND calibrate_test)
 # Round costs learned from the rounds read, and the controller choosing by them at the context (no model).
 add_test(NAME round_costs_learned COMMAND round_costs_test)
+# A reply's thinking counted, and closed by the format's marker once the budget is spent (no model).
+add_test(NAME thinking_budget COMMAND thinking_budget_test)
 # The memory budget: a context the caller did not ask for shrinks to what fits (no model, no GPU).
 add_test(NAME memory_budget COMMAND budget_test)
 # The round plans: a drafter whose state follows its own rounds (DV) beside plain decoding's and lookup's (pinned:

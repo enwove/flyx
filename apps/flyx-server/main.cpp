@@ -123,6 +123,9 @@ void pause_owned_console() {
                "  --cors ORIGIN        let the pages of ORIGIN call the API from a browser (repeatable): https://host[:port],\n"
                "                       an extension's origin, null (a page opened from a file); '*': any page; none: not\n"
                "                       even this machine's own pages (localhost), which may by default\n"
+               "  --max-tokens N       the most tokens a reply takes when its request names no limit (default 0: the\n"
+               "                       model's own generation limit if its file has one, else up to the end of the\n"
+               "                       context, as other servers do)\n"
                "  --queue N            requests allowed to wait (default 16)\n"
                "  --queue-timeout S    longest wait in the queue (default 600)\n"
                "  --idle-unload S      free sessions after S idle seconds (default 0 = never)\n"
@@ -232,6 +235,7 @@ ServeArgs parse_args(int argc, char** argv) {
       else if (const std::string o = cors_origin_of(v); !o.empty()) a.cfg.cors_origins.push_back(o);
       else bad_usage("--cors " + v + ": an origin (https://host[:port], chrome-extension://ID, null), '*' or none");
     }
+    else if (f == "--max-tokens") a.eo.max_new_tokens = apps::whole_flag("--max-tokens", next(), 0, INT_MAX);
     else if (f == "--queue") a.so.queue_limit = apps::whole_flag("--queue", next(), 1, INT_MAX);
     else if (f == "--queue-timeout") a.so.queue_timeout_ms = apps::whole_flag("--queue-timeout", next(), 1, INT_MAX / 1000) * 1000;
     else if (f == "--idle-unload") a.so.idle_unload_ms = apps::whole_flag("--idle-unload", next(), 0, INT_MAX / 1000) * 1000;
@@ -551,6 +555,37 @@ int run(int argc, char** argv) {
   // Connections past the workers wait for one, as many again at most: more are closed at once, not left to hang.
   http.new_task_queue = [threads = args.threads] { return new httplib::ThreadPool(threads, threads); };
   http.set_payload_max_length(flyx::apps::kHttpMaxPayloadBytes);
+  // What httplib answers itself (no route, a body past the limit, a request it cannot read) in the error body the
+  // API's clients read, as the handlers' own errors are: Anthropic's on its paths, OpenAI's elsewhere.  A response
+  // that already has a body (a handler's error) is left as it is.
+  http.set_error_handler([](const httplib::Request& req, httplib::Response& res) {
+    if (!res.body.empty()) return httplib::Server::HandlerResponse::Unhandled;
+    std::string message;
+    const char* type = "invalid_request_error";
+    switch (res.status) {
+      case 404: message = "no such endpoint: " + req.method + " " + req.path, type = "not_found_error"; break;
+      case 405: message = req.method + " is not allowed on " + req.path; break;
+      case 413:
+        // httplib parses a body named a form into fields before any handler (or the API key's check) runs, so such a
+        // body keeps its 8 KiB limit (CPPHTTPLIB_FORM_URL_ENCODED_PAYLOAD_MAX_LENGTH); curl -d names one so.
+        message = req.get_header_value("Content-Type").rfind("application/x-www-form-urlencoded", 0) == 0
+                      ? "a body sent as application/x-www-form-urlencoded is read up to " +
+                            std::to_string(CPPHTTPLIB_FORM_URL_ENCODED_PAYLOAD_MAX_LENGTH >> 10) +
+                            " KiB: send JSON with Content-Type: application/json"
+                      : "request body larger than " + std::to_string(flyx::apps::kHttpMaxPayloadBytes >> 20) + " MiB";
+        type = "request_too_large";
+        break;
+      case 414: message = "request line too long"; break;
+      case 431: message = "request headers too large"; break;
+      default:
+        message = res.status < 500 ? "malformed HTTP request (a POST needs a Content-Length or a chunked body)"
+                                   : "internal server error";
+        if (res.status >= 500) type = "api_error";
+    }
+    if (req.path.rfind("/v1/messages", 0) == 0) flyx::server::send_anthropic_error(res, res.status, message, type);
+    else flyx::server::send_openai_error(res, res.status, message, type);
+    return httplib::Server::HandlerResponse::Handled;
+  });
   http.set_read_timeout(flyx::apps::kHttpReadTimeoutSec, 0);
   http.set_write_timeout(flyx::apps::kHttpTimeoutSec, 0);
   http.set_pre_routing_handler([&srv](const httplib::Request& req, httplib::Response& res) {

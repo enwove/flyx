@@ -128,6 +128,16 @@ def check_compat(url):
         "thinking": {"type": "enabled"}, "output_config": {"effort": "max"},
     })
     assert st == 200 and st2 == 200 and c_max["input_tokens"] > c_low["input_tokens"], (st, c_low, st2, c_max)
+    # No "thinking": none, as Anthropic's API gives (the template's think markers left out); "adaptive" (Claude
+    # Code's) thinks.
+    counted = {}
+    for name, extra in (("absent", {}), ("disabled", {"thinking": {"type": "disabled"}}),
+                        ("adaptive", {"thinking": {"type": "adaptive"}})):
+        st, c = cl.post("/v1/messages/count_tokens", {"model": MODEL_NAME, "messages": [{"role": "user", "content": "hi"}],
+                                                      **extra})
+        assert st == 200, (name, st, c)
+        counted[name] = c["input_tokens"]
+    assert counted["absent"] == counted["disabled"] < counted["adaptive"], counted
 
     for bad in ({"thinking": "enabled"}, {"thinking": {"type": 123}},
                 {"output_config": {"effort": "turbo"}}, {"output_config": {"effort": 42}},
@@ -151,9 +161,15 @@ def check_compat(url):
         want = '"drafter": mtp, dflash2, dflash, dspark, dspine, eagle4, dv, all or none'
         assert st == 400 and err["error"]["message"] == want, (bad, st, err)
 
-    # 6. Unloaded model -> GET /v1/models/:id returns 404
+    # 6. Unloaded model -> GET /v1/models/:id returns 404; the telemetry keeps what the server counted (the totals,
+    # the recent requests, the server's start), as the request log does.
+    st, before = cl.get("/v1/telemetry?recent=100")
+    assert st == 200 and before["totals"]["requests"] > 0, (st, before.get("totals"))
     st, _ = cl.post("/v1/unload", {})
     assert st == 200, st
+    st, after = cl.get("/v1/telemetry?recent=100")
+    assert st == 200 and after["model"]["loaded"] is False and after["totals"] == before["totals"], after.get("totals")
+    assert after["recent"] == before["recent"] and after["server"]["started_at"] == before["server"]["started_at"]
     st, err = cl.get(f"/v1/models/{MODEL_NAME}")
     assert st == 404 and err["error"]["code"] == "model_not_found", (st, err)
 
@@ -224,6 +240,48 @@ def check_queued_anthropic_stream_error(url):
     )
 
 
+# A template whose replies think in <think> blocks: a thinking budget ends the block and the answer follows.
+THINK_TEMPLATE = (
+    "{% for m in messages %}<|im_start|>{{ m.role }}\n{{ m.content }}<|im_end|>\n{% endfor %}"
+    "{% if add_generation_prompt %}<|im_start|>assistant\n"
+    "{% if enable_thinking %}<think>\n{% else %}<think>\n\n</think>\n\n{% endif %}{% endif %}"
+)
+
+
+def check_no_think_effort(url):
+    """A server started with --no-think: a Messages request naming no thinking but an effort thinks not, and the
+    effort is not given the template (Inkling-2's would take one for thinking on)."""
+    cl = Client(url, None)
+    counted = {}
+    for name, extra in (("plain", {}), ("effort", {"output_config": {"effort": "high"}})):
+        st, c = cl.post("/v1/messages/count_tokens", {"model": MODEL_NAME, "messages": [{"role": "user", "content": "hi"}],
+                                                      **extra})
+        assert st == 200, (name, st, c)
+        counted[name] = c["input_tokens"]
+    assert counted["effort"] == counted["plain"], counted
+
+
+def check_thinking_budget(url):
+    cl = Client(url, None)
+    body = {"model": MODEL_NAME, "messages": [{"role": "user", "content": "Count to ten."}], "max_tokens": 48,
+            "temperature": 0}
+
+    def blocks(extra):
+        st, r = cl.post("/v1/messages", {**body, **extra})
+        assert st == 200, (extra, st, r)
+        return {b["type"]: b for b in r["content"]}, r["usage"]["output_tokens"]
+
+    unbounded, _ = blocks({"thinking": {"type": "enabled"}})
+    budgeted, out = blocks({"thinking": {"type": "enabled", "budget_tokens": 6}})
+    # The tiny model never closes its thinking itself: all 48 tokens think without a budget.  With one, the block
+    # ends and the answer is written in what is left.
+    assert "thinking" in unbounded and "text" not in unbounded, unbounded
+    assert "thinking" in budgeted and budgeted["text"]["text"], budgeted
+    assert len(budgeted["thinking"]["thinking"]) < len(unbounded["thinking"]["thinking"]), (budgeted, unbounded)
+    st, r = cl.post("/v1/messages", {**body, "thinking": {"type": "enabled", "budget_tokens": 0}})
+    assert st == 400 and "budget_tokens" in r["error"]["message"], (st, r)
+
+
 if __name__ == "__main__":
     exe, asset = (Path(arg).resolve() for arg in sys.argv[1:])
     with tempfile.TemporaryDirectory() as tmp:
@@ -240,4 +298,11 @@ if __name__ == "__main__":
         serve(exe, tmp, env, [asset], check_queued_anthropic_stream_error, ctx=16384,
               options=["--name", MODEL_NAME, "--sessions", "1", "--no-spec", "--chat-template", template],
               expect_name=MODEL_NAME)
+        serve(exe, tmp, env, [asset], check_no_think_effort, ctx=4096,
+              options=["--name", MODEL_NAME, "--no-spec", "--no-think", "--chat-template", template],
+              expect_name=MODEL_NAME)
+        think = Path(tmp) / "think.jinja"
+        think.write_text(THINK_TEMPLATE, encoding="utf-8")
+        serve(exe, tmp, env, [asset], check_thinking_budget, ctx=4096,
+              options=["--name", MODEL_NAME, "--no-spec", "--chat-template", think], expect_name=MODEL_NAME)
     print("api_compat: ok")

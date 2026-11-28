@@ -14,6 +14,12 @@ export function prefillRate(r) {
 export const cacheHit = (r) => r.prompt_tokens > 0 ? Math.min(1, (r.reused_tokens || 0) / r.prompt_tokens) * 100 : null;
 // Of the drafts rounds verified, the share accepted, in percent; null where none were drafted.
 export const acceptance = (accepted, drafted) => drafted > 0 ? Math.min(1, (accepted || 0) / drafted) * 100 : null;
+// The recent requests the served model ran (those since it loaded), newest first: what "the last request"'s figures
+// are of, beside the served model's drafter; the request tables list them all.
+export const servedRecent = (tm) => {
+  const at = tm.model && tm.model.loaded_at, recent = tm.recent || [];
+  return at ? recent.filter((r) => r.finished_at >= at) : recent;
+};
 // Decode and prefill throughput figures: of now, of the running request, or of the last finished request.
 export function speeds(tm, phase, recent) {
   const state = tm.state || {}, rates = tm.rates || {}, last = recent[0] || {};

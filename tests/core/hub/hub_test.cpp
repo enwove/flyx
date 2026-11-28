@@ -1169,8 +1169,8 @@ void fetching(const fs::path& tmp) {
     auto hit = [&](const flyx::hub::Progress& p) { ++reports; last = p; };
     check(flyx::hub::fetch(next, {shared}, &linked_paths, hit, nullptr, &err) && reports == 1 &&
               last.file == shared.path && last.total == shared.size && last.done == last.total &&
-              !last.checking && last.bytes_per_s == 0 && hub.storage == before,
-          "an existing snapshot reports completion once without a transfer");
+              !last.checking && !last.fetched && last.bytes_per_s == 0 && hub.storage == before,
+          "an existing snapshot reports completion once without a transfer, nothing fetched");
     fs::remove(to_path(flyx::hub::snapshot_dir(next)) / shared.path);
     fs::remove(to_path(flyx::hub::snapshot_dir(next)));
   }
@@ -1208,9 +1208,14 @@ void fetching(const fs::path& tmp) {
     check(!flyx::hub::fetch(request, {model}, &paths, nullptr, &stop, &err) && err == "stopped" &&
               hub.storage == before && !fs::exists(resume), "a cancelled fetch makes no requests or cache files");
     stop = false;
-    auto cancel_check = [&](const flyx::hub::Progress& p) { if (p.checking) stop = true; };
+    bool said_fetched = true;  // every report of a fetch that fetches says so
+    auto cancel_check = [&](const flyx::hub::Progress& p) {
+      said_fetched = said_fetched && p.fetched;
+      if (p.checking) stop = true;
+    };
     check(!flyx::hub::fetch(request, {model}, &paths, cancel_check, &stop, &err) && err == "stopped",
           "a cancellation during verification preserves the completed pieces");
+    check(said_fetched, "  its progress says a file is being fetched");
     stop = false;
     before = hub.storage;
     check(flyx::hub::fetch(request, {model}, &paths, nullptr, &stop, &err) && hub.storage == before &&

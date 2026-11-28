@@ -43,6 +43,8 @@ class ModelHost {
 
   // What requests go to now.  Any thread; a request keeps what it got while it runs.
   Served served() const;
+  // What the server counted, across the models it served (the one served now, if any, adds to it).
+  void telemetry(TelemetrySnapshot* out) const { telemetry_->snapshot(out); }
   // Loads `w` on a thread of its own; false (*err) while another load is under way.
   bool start(const Want& w, std::string* err);
   // Loads `w` here (flyx serve MODEL, before it listens).
@@ -109,6 +111,7 @@ class ModelHost {
                                   double* load_s, std::string* err) const;
 
   SchedulerOptions so_;
+  std::shared_ptr<Telemetry> telemetry_ = std::make_shared<Telemetry>();  // every scheduler's, the server's own
   mutable std::mutex mu_;
   Served served_;
   apps::Fetched fetched_;  // the served model's files and drafters

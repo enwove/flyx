@@ -101,6 +101,10 @@ std::string grouped(long long v) {
 }
 
 std::string gib(double bytes) { return num(bytes / 1073741824.0, bytes >= 1e11 ? 0 : 1); }
+// A few MiB to many GiB, in the unit that says it ("0.0 GiB" said nothing of a server's 40 MiB).
+std::string mem_text(double bytes) {
+  return bytes < 1073741824.0 ? num(bytes / 1048576.0, 0) + " MiB" : gib(bytes) + " GiB";
+}
 
 std::string seconds(double s) {
   if (s < 10) return num(s, 2) + " s";
@@ -381,7 +385,14 @@ struct TermStyle {
     if (rates.contains("output_per_second") && rates["output_per_second"].is_array())
       for (const auto& v : rates["output_per_second"])
         if (v.is_number()) per_second.push_back(v.get<double>());
-    const json last = recent.empty() ? json::object() : recent[0];
+    // The last request the served model ran (since it loaded): the "last reply" figures beside its drafter.
+    json last = json::object();
+    const double loaded_at = get(model, "loaded_at");
+    for (const auto& r : recent)
+      if (get(r, "finished_at") >= loaded_at) {
+        last = r;
+        break;
+      }
     std::vector<double> tpr, ttft;
     for (auto it = recent.rbegin(); it != recent.rend(); ++it) {
       tpr.push_back(get(*it, "tokens_per_round"));
@@ -407,14 +418,15 @@ struct TermStyle {
     const double prefill_ms = get(last, "prefill_ms");
     const double first = get(last, "ttft_ms", -1);
     tiles.push_back({"Time to first token", paint(kBold, first < 0 ? "-" : num(first / 1000, 2) + " s"),
-                     paint(kDim, recent.empty()
+                     paint(kDim, last.empty()
                                      ? ""
                                      : grouped(static_cast<long long>(fresh)) + " new · " +
                                            (prefill_ms > 0 ? grouped(static_cast<long long>(fresh * 1000 / prefill_ms)) : "-") +
                                            " tok/s"),
                      spark(ttft, cw, 0, kCool)});
     if (dev.is_object()) {
-      const std::string name = str(model, "device");
+      // The device's own name: the server gives its figures with no model loaded too.
+      const std::string name = !str(dev, "name").empty() ? str(dev, "name") : str(model, "device");
       const std::string short_name = name.rfind("NVIDIA GeForce ", 0) == 0 ? name.substr(15) : name;
       const std::string limits = str(dev, "clock_limits");
       tiles.push_back({"GPU load", paint(kBold, num(get(dev, "util")) + " %"),
@@ -423,8 +435,9 @@ struct TermStyle {
                        spark(vec(h.util), cw, 100, kAccent)});
       const double used = get(dev, "mem_used"), total = get(dev, "mem_total");
       tiles.push_back({"VRAM", paint(kBold, gib(used) + " / " + gib(total) + " GiB"),
-                       paint(kDim, "engine " + gib(get(t["memory"], "ledger_used")) + " of " +
-                                       gib(get(t["memory"], "ledger_budget")) + " GiB"),
+                       paint(kDim, loaded ? "engine " + gib(get(t["memory"], "ledger_used")) + " of " +
+                                                gib(get(t["memory"], "ledger_budget")) + " GiB"
+                                          : "model not loaded"),
                        bar(total > 0 ? used / total : 0, cw, kAccent)});
       const double temp = get(dev, "temp_c");
       const char* hot = temp >= 83 ? kHot : temp >= 70 ? kWarm : kAccent;
@@ -440,7 +453,9 @@ struct TermStyle {
         tiles.push_back({title, paint(kDim, "-"), paint(kDim, loaded ? "no device figures" : "model not loaded"), ""});
     }
     tiles.push_back({"CPU", paint(kBold, cpu_pct < 0 ? "-" : num(cpu_pct, 1) + " %"),
-                     paint(kDim, "of a core · RSS " + gib(get(t["process"], "rss")) + " GiB"),
+                     // flyx's memory as the dashboard counts it: resident, and the page-locked memory the GPU reads
+                     // (process.ram), not the working set alone.
+                     paint(kDim, "of a core · RAM " + mem_text(get(t["process"], "ram", get(t["process"], "rss")))),
                      spark(vec(h.cpu), cw, 0, kCool)});
     for (size_t i = 0; i < tiles.size(); i += size_t(per_row))
       draw_tiles({tiles.begin() + long(i), tiles.begin() + long(std::min(tiles.size(), i + size_t(per_row)))}, tw, out);

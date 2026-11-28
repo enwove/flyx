@@ -1,6 +1,8 @@
 // Copyright 2026 The flyx Authors. SPDX-License-Identifier: Apache-2.0
 #include "core/modelfile/modelfile.h"
 
+#include <cstdint>
+
 #include "core/modelfile/readers.h"
 
 namespace flyx {
@@ -32,18 +34,27 @@ std::string drafter_source_kind(const std::string& path, const PathAllowFn& allo
                                                      : modelfile::flyx_draft_kind(path);
 }
 
+bool holds_drafter_alone(const std::string& path, const PathAllowFn& allow_path) {
+  if (allow_path && !allow_path(path)) return false;
+  if (modelfile::is_drafter_dir(path, allow_path)) return true;
+  // The header is the file's word: a key of another type than expected is read as absent, never thrown on.
+  nlohmann::json h;
+  if (modelfile::peek_flyx_header(path, &h)) {
+    const auto kind = h.find("kind");
+    return kind != h.end() && kind->is_string() && kind->get_ref<const std::string&>() == "drafter";
+  }
+  const GgufPeek g = gguf_peek(path, allow_path);
+  return g.valid && g.arch == "dflash";  // a block drafter's GGUF (DFlash2, DSpark), as file_type refuses it
+}
+
 bool ModelFile::open(const std::string& path, std::string* err, const PathAllowFn& allow_path) {
   companions_.clear();
   maps_.clear();
   if (allow_path && !allow_path(path))
     return *err = path + ": path is not allowed by remote path policy", false;
-  if (modelfile::is_drafter_dir(path, allow_path))
+  if (holds_drafter_alone(path, allow_path))
     return *err = path + " holds a drafter alone, not a model: give it beside the model (--drafter-file)", false;
   if (!read(&maps_, path, &c_, err, /*need_tokenizer=*/true, allow_path)) return false;
-  // The header is the file's word: a key of another type than expected is read as absent, never thrown on.
-  const auto kind = c_.header.find("kind");
-  if (kind != c_.header.end() && kind->is_string() && kind->get_ref<const std::string&>() == "drafter")
-    return *err = path + " holds a drafter alone, not a model: give it beside the model (--drafter-file)", false;
   if (c_.header.is_object()) c_.header.erase("companions");  // add() lists them; what a file put there is not one
   return true;
 }
@@ -134,6 +145,15 @@ std::vector<int32_t> ModelFile::eos_ids() const {
     }
   }
   return out;
+}
+
+int ModelFile::max_new_tokens() const {
+  if (!c_.header.is_object() || !c_.header.contains("generation") || !c_.header["generation"].is_object()) return 0;
+  const auto& g = c_.header["generation"];
+  const auto it = g.find("max_new_tokens");
+  if (it == g.end() || !it->is_number_integer()) return 0;
+  const int64_t n = it->get<int64_t>();
+  return n > 0 && n <= INT32_MAX ? static_cast<int>(n) : 0;
 }
 
 ModelOrigin model_origin(const std::string& path, const PathAllowFn& allow_path) {

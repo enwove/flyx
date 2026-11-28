@@ -43,6 +43,7 @@ struct Request {
   std::vector<ChatCachePoint> cache_points;
   ReplyRules rules;                  // chat: tool_choice, parallel calls, a JSON answer (core/grammar)
   bool split_output = true;          // chat: thinking and tool calls as their own events
+  int thinking_budget = -1;          // chat: the most tokens the reply thinks (-1: no limit; GenerateRequest's)
   std::string text;                  // raw text prompt (chat == false)
   std::vector<int32_t> tokens;       // or the prompt as tokens (chat == false, no text)
   GenerateRequest gen;               // limits, sampling, stops (prepare_request fills in the rest)

@@ -1555,6 +1555,27 @@ def check_lora(open_page, want):
         FOLDERS[FOLDER]["models"].remove(adapter)
 
 
+
+def check_hub_refusal_language(open_page, want):
+    """What the Hub refused, in the page's language: the repository by its name, the advice in that language's words
+    (core/hub/hub_fetch.cpp's messages for 401/403 and for 404)."""
+    page, server = open_page(telemetry(dict(want, model="models/local.gguf")), locale="zh-CN")
+    view(page, "library")
+    refusals = (
+        ("acme/Gated", 403, ": not on the Hub, or gated or private: check the name; for a gated model accept its terms "
+                            "on huggingface.co, then set HF_TOKEN or run `hf auth login`", "需申请"),
+        ("acme/Missing", 404, ": not on the Hub (a typo, or a private repository: set HF_TOKEN)", "可能拼错了"))
+    for repo, status, tail, words in refusals:
+        server.files_fail = (status, repo + tail)
+        page.locator("#hf-q").fill(repo)
+        page.keyboard.press("Enter")
+        banner = page.locator("#mf-hubmsg.banner.bad")
+        expect(banner).to_contain_text(repo + "：Hugging Face 上没有这个仓库")
+        expect(banner).to_contain_text(words)
+        expect(banner).not_to_contain_text("not on the Hub")
+    server.files_fail = None
+    page.close()
+
 def check_local_posix(open_page, want):
     """POSIX Local tab: case-sensitive folders (/Models vs /models), literal backslashes, root '/', --models-dir == cacheDir merging, and revision-pinned Hub jumps."""
     posix_cache = "/home/user/.cache/huggingface/hub"
@@ -1727,6 +1748,7 @@ def check(browser):
     check_switch_companions(open_page, want)
     check_lora(open_page, want)
     check_local_posix(open_page, want)
+    check_hub_refusal_language(open_page, want)
     plain = dict(want, model="models/local.gguf")
     page, server = open_page(telemetry(plain))
     check_hub(page, server, plain)

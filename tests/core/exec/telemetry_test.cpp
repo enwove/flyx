@@ -24,9 +24,11 @@ int main() {
   ModelInfo m;
   m.device = "test device";
   m.max_ctx = 1024;
+  const double before_load = os::unix_seconds();
   t.loaded(m, 123);
   t.memory(456, 789, {{2, 300}, {1, 40}});
   t.snapshot(&s);
+  check(s.loaded_at >= before_load && s.loaded_at <= os::unix_seconds(), "loaded: when, for the last request's figures");
   check(s.phase == TelemetrySnapshot::kIdle && s.loaded && s.model.device == "test device" && s.ledger_used == 456 &&
             s.host_mapped == 789 &&
             s.sessions.size() == 2 && s.sessions[0].id == 2 && s.sessions[0].tokens == 300 && s.running == 0,
@@ -178,7 +180,7 @@ int main() {
   t.unloaded();
   t.snapshot(&s);
   check(s.phase == TelemetrySnapshot::kUnloaded && !s.loaded && s.sessions.empty() && s.host_mapped == 0 &&
-            s.totals.requests == 3,
+            s.totals.requests == 3 && s.loaded_at == 0,
         "unloaded: no sessions, totals kept");
 
   return flyx::test::finish("telemetry_test");

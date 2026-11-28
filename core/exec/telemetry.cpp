@@ -47,6 +47,7 @@ void Telemetry::loading() {
 void Telemetry::loaded(const ModelInfo& m, uint64_t ledger_used) {
   std::lock_guard<std::mutex> lock(mu_);
   s_.loaded = true;
+  s_.loaded_at = os::unix_seconds();
   s_.model = m;
   s_.ledger_used = ledger_used;
   if (s_.phase == TelemetrySnapshot::kUnloaded || s_.phase == TelemetrySnapshot::kLoading)
@@ -56,6 +57,7 @@ void Telemetry::loaded(const ModelInfo& m, uint64_t ledger_used) {
 void Telemetry::unloaded() {
   std::lock_guard<std::mutex> lock(mu_);
   s_.loaded = false;
+  s_.loaded_at = 0;
   s_.phase = TelemetrySnapshot::kUnloaded;
   s_.ledger_used = 0;
   s_.host_mapped = 0;

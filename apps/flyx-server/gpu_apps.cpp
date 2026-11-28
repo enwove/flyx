@@ -1454,4 +1454,101 @@ GpuCloseResult close_ram_app(const std::string& id, bool force) {
 
 #endif
 
+
+// ---- the GPU's live figures from NVML alone (no model loaded) -------------------------------------------------------
+
+namespace {
+
+struct NvmlRates {
+  unsigned int gpu, memory;
+};
+
+// What a device's figures take from NVML (backends/cuda/runtime/device_stats.cpp reads the same while a model is
+// loaded), loaded once: nvml.dll from System32, libnvidia-ml.so.1.  No CUDA call: nothing makes a context.
+struct NvmlStatsApi {
+  int (*init)() = nullptr;
+  int (*count)(unsigned int*) = nullptr;
+  int (*by_index)(unsigned int, NvmlDevice**) = nullptr;
+  int (*name)(NvmlDevice*, char*, unsigned int) = nullptr;
+  int (*memory)(NvmlDevice*, NvmlMemory*) = nullptr;
+  int (*rates)(NvmlDevice*, NvmlRates*) = nullptr;
+  int (*temperature)(NvmlDevice*, int, unsigned int*) = nullptr;
+  int (*power)(NvmlDevice*, unsigned int*) = nullptr;
+  int (*power_limit)(NvmlDevice*, unsigned int*) = nullptr;
+  int (*clock)(NvmlDevice*, int, unsigned int*) = nullptr;
+  int (*pcie_gen)(NvmlDevice*, unsigned int*) = nullptr;
+  int (*pcie_width)(NvmlDevice*, unsigned int*) = nullptr;
+  int (*fan)(NvmlDevice*, unsigned int*) = nullptr;
+  bool ok = false;
+};
+
+const NvmlStatsApi& nvml_stats_api() {
+  static const NvmlStatsApi api = [] {
+    NvmlStatsApi a;
+#if defined(_WIN32)
+    HMODULE lib = LoadLibraryExA("nvml.dll", nullptr, LOAD_LIBRARY_SEARCH_SYSTEM32);
+    auto sym = [&](const char* name) { return lib ? reinterpret_cast<void*>(GetProcAddress(lib, name)) : nullptr; };
+#else
+    void* lib = dlopen("libnvidia-ml.so.1", RTLD_NOW | RTLD_LOCAL);
+    auto sym = [&](const char* name) { return lib ? dlsym(lib, name) : nullptr; };
+#endif
+    if (!lib) return a;
+    a.init = reinterpret_cast<decltype(a.init)>(sym("nvmlInit_v2"));
+    a.count = reinterpret_cast<decltype(a.count)>(sym("nvmlDeviceGetCount_v2"));
+    a.by_index = reinterpret_cast<decltype(a.by_index)>(sym("nvmlDeviceGetHandleByIndex_v2"));
+    a.name = reinterpret_cast<decltype(a.name)>(sym("nvmlDeviceGetName"));
+    a.memory = reinterpret_cast<decltype(a.memory)>(sym("nvmlDeviceGetMemoryInfo"));
+    a.rates = reinterpret_cast<decltype(a.rates)>(sym("nvmlDeviceGetUtilizationRates"));
+    a.temperature = reinterpret_cast<decltype(a.temperature)>(sym("nvmlDeviceGetTemperature"));
+    a.power = reinterpret_cast<decltype(a.power)>(sym("nvmlDeviceGetPowerUsage"));
+    a.power_limit = reinterpret_cast<decltype(a.power_limit)>(sym("nvmlDeviceGetEnforcedPowerLimit"));
+    a.clock = reinterpret_cast<decltype(a.clock)>(sym("nvmlDeviceGetClockInfo"));
+    a.pcie_gen = reinterpret_cast<decltype(a.pcie_gen)>(sym("nvmlDeviceGetCurrPcieLinkGeneration"));
+    a.pcie_width = reinterpret_cast<decltype(a.pcie_width)>(sym("nvmlDeviceGetCurrPcieLinkWidth"));
+    a.fan = reinterpret_cast<decltype(a.fan)>(sym("nvmlDeviceGetFanSpeed"));
+    a.ok = a.init && a.count && a.by_index && a.name && a.init() == 0;
+    return a;
+  }();
+  return api;
+}
+
+}  // namespace
+
+bool nvml_device_stats(const std::string& device_hint, flyx_device_stats* out, std::string* name) {
+  *out = {};
+  out->util = out->mem_util = out->temp_c = out->sm_clock_mhz = out->pcie_gen = out->pcie_width = out->fan =
+      out->mem_clock_mhz = -1;
+  out->power_w = out->power_limit_w = -1;
+  const NvmlStatsApi& nv = nvml_stats_api();
+  if (!nv.ok) return false;
+  unsigned int n = 0;
+  if (nv.count(&n) != 0 || n == 0) return false;
+  std::vector<NvmlDevice*> handles(n, nullptr);
+  std::vector<DeviceSeen> seen(n);
+  for (unsigned int i = 0; i < n; ++i) {
+    char buf[128] = {};
+    seen[i].handle = nv.by_index(i, &handles[i]) == 0 && handles[i];
+    if (seen[i].handle && nv.name(handles[i], buf, sizeof(buf)) == 0) seen[i].name = buf;
+  }
+  const DeviceMatch match = match_device(seen, device_hint);
+  if (match.index < 0) return false;
+  NvmlDevice* dev = handles[size_t(match.index)];
+  if (name) *name = seen[size_t(match.index)].name.value_or("");
+  constexpr int kTemperatureGpu = 0, kClockSm = 1, kClockMem = 2;  // NVML_TEMPERATURE_GPU, NVML_CLOCK_SM, _MEM
+  unsigned int v = 0;
+  NvmlRates r{};
+  if (nv.rates && nv.rates(dev, &r) == 0) out->util = int(r.gpu), out->mem_util = int(r.memory);
+  NvmlMemory m{};
+  if (nv.memory && nv.memory(dev, &m) == 0) out->mem_used = m.used, out->mem_total = m.total;
+  if (nv.temperature && nv.temperature(dev, kTemperatureGpu, &v) == 0) out->temp_c = int(v);
+  if (nv.power && nv.power(dev, &v) == 0) out->power_w = v / 1000.0;
+  if (nv.power_limit && nv.power_limit(dev, &v) == 0) out->power_limit_w = v / 1000.0;
+  if (nv.clock && nv.clock(dev, kClockSm, &v) == 0) out->sm_clock_mhz = int(v);
+  if (nv.clock && nv.clock(dev, kClockMem, &v) == 0) out->mem_clock_mhz = int(v);
+  if (nv.pcie_gen && nv.pcie_gen(dev, &v) == 0) out->pcie_gen = int(v);
+  if (nv.pcie_width && nv.pcie_width(dev, &v) == 0) out->pcie_width = int(v);
+  if (nv.fan && nv.fan(dev, &v) == 0) out->fan = int(v);
+  return true;
+}
+
 }  // namespace flyx::server

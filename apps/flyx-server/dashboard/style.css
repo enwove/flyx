@@ -144,6 +144,20 @@ h1.crumb { color: var(--text); font-weight: 600; }
 main { overflow-y: auto; background: var(--surface); border-top: 1px solid var(--border); border-left: 1px solid var(--border);
        border-top-left-radius: var(--r-lg); min-width: 0; position: relative; }
 .page { padding: 0 0 48px; }
+/* The pages that are one panel the height of the window (the chat, the request log, the server log): the page a
+   column the height of the frame, its notices above at their own heights, the panel the rest; not a fixed guess at
+   that height, which a notice above it (a model ready, a load failed; taller on a narrow screen) pushed past it. */
+.page:has(> #tab-chat:not([hidden]), > #tab-requests:not([hidden]), > #tab-logs:not([hidden])) {
+  display: flex; flex-direction: column; height: 100%; box-sizing: border-box; padding-bottom: 28px; }
+.page:has(> #tab-chat:not([hidden]), > #tab-requests:not([hidden]), > #tab-logs:not([hidden])) > :not(section) { flex: none; }
+.page > #tab-chat:not([hidden]), .page > #tab-requests:not([hidden]), .page > #tab-logs:not([hidden]) {
+  flex: 1; min-height: 0; display: flex; flex-direction: column; }
+
+/* A narrow screen (a phone on the LAN): the page takes the whole width, the sidebar a drawer over it, opened by the
+   top bar's menu button and shut by a page chosen, a tap on the scrim beside it, or Escape (app.js).  The drawer
+   holds the whole sidebar, whether or not a wide screen collapsed it to its rail. */
+.menubtn { display: none; }
+.scrim { position: fixed; inset: 48px 0 0 0; z-index: 39; background: rgba(0, 0, 0, 0.32); }
 
 /* ---- the live figures: a group of the sidebar, or a card floating over the page ------------------------------- */
 .live { font-size: 13px; }
@@ -640,7 +654,7 @@ hr.div { border: 0; border-top: 1px solid var(--border); margin: 20px 0 16px; }
 .snip .btn { position: absolute; top: 7px; right: 7px; }
 
 /* chat */
-.chat { display: grid; grid-template-rows: minmax(0, 1fr) auto; height: calc(100vh - 49px); }
+.chat { display: grid; grid-template-rows: minmax(0, 1fr) auto; grid-template-columns: minmax(0, 1fr); flex: 1; min-height: 0; }
 .msgs { overflow-y: auto; padding: 32px 28px 16px; }
 /* The history, from the button at the page's top right: the conversations kept in this browser, the newest first. */
 .chat { position: relative; }
@@ -819,7 +833,7 @@ hr.div { border: 0; border-top: 1px solid var(--border); margin: 20px 0 16px; }
 
 
 /* ---- the system log: what the server writes to standard error, as it comes --------------------------------------- */
-#tab-logs .syslog { display: flex; flex-direction: column; padding: 0 !important; overflow: hidden; height: calc(100vh - 49px - 8px - 28px); }
+#tab-logs .syslog { display: flex; flex-direction: column; padding: 0 !important; overflow: hidden; flex: 1; min-height: 0; }
 #tab-logs .lbar .aside { margin-left: auto; }
 #tab-logs .lbar .switch { font-size: 12.5px; color: var(--muted); white-space: nowrap; }
 .logbody { flex: 1; min-height: 0; overflow: auto; }
@@ -844,7 +858,7 @@ hr.div { border: 0; border-top: 1px solid var(--border); margin: 20px 0 16px; }
 .logempty { padding: 24px 18px; color: var(--muted); font-family: var(--sans); font-size: 13px; }
 
 /* ---- the request log: a list, and a reader beside it ------------------------------------------------------------- */
-#tab-requests .logs { display: grid; grid-template-columns: minmax(0, 1fr); gap: 18px; height: calc(100vh - 49px - 8px - 28px); }
+#tab-requests .logs { display: grid; grid-template-columns: minmax(0, 1fr); gap: 18px; flex: 1; min-height: 0; }
 #tab-requests .logs.open { grid-template-columns: minmax(320px, 0.82fr) minmax(0, 1.5fr); }
 #tab-requests .logs.open.wide { grid-template-columns: minmax(0, 1fr); }
 #tab-requests .logs.open.wide .list { display: none; }
@@ -952,7 +966,7 @@ td.txt1.muted { color: var(--muted); }
 [data-style="studio"] .sec { border: 0; gap: 18px; margin-bottom: 18px; }
 [data-style="studio"] .pane { padding: 20px var(--px) 22px; }
 [data-style="studio"] .pane-h h2 { font-size: 15px; }
-[data-style="studio"] .chat { background: var(--surface); border-radius: var(--r-lg); height: calc(100vh - 49px - 8px - 28px); }
+[data-style="studio"] .chat { background: var(--surface); border-radius: var(--r-lg); }
 [data-style="studio"] #tab-integration { background: var(--surface); border-radius: var(--r-lg); padding: 36px 40px; }
 [data-style="studio"] .serving .name { font-size: 17px; }
 
@@ -1048,3 +1062,48 @@ td.txt1.muted { color: var(--muted); }
 .lora-ad .sd-what { overflow-wrap: anywhere; }
 .lora-ad.no .sd-what { color: var(--danger); }
 .lora-ad.sel b { color: var(--accent); }
+
+/* A narrow screen (a phone on the LAN), last: it overrides the wide layout's rules above. */
+@media (max-width: 760px) {
+  .app { grid-template-columns: minmax(0, 1fr); }
+  .topbar { padding: 0 8px; }
+  .menubtn { display: inline-flex; margin-right: 6px; }
+  .topbar .sep, .topbar .crumb { display: none; }
+  main { border-left: 0; border-top-left-radius: 0; }
+  .side { position: fixed; z-index: 40; top: 48px; bottom: 0; left: 0; width: min(280px, 86vw); background: var(--frame);
+          border-right: 1px solid var(--border); box-shadow: var(--shadow); transform: translateX(-100%); visibility: hidden;
+          transition: transform 0.18s ease, visibility 0s linear 0.18s; }
+  :root[data-drawer="open"] .side { transform: none; visibility: visible; transition: transform 0.18s ease; }
+  [data-side="collapsed"] .side .grow { display: block; }
+  [data-side="collapsed"] .rail { display: none; }
+  [data-side="collapsed"] .navi { width: 100%; padding: 0 9px; justify-content: flex-start; }
+  [data-side="collapsed"] .navi .t { display: inline; }
+  [data-side="collapsed"] .navi:hover::after { content: none; }
+  .side .foot { display: none; }  /* collapsing to the rail is a wide screen's */
+  /* The request log: the narrow list a reader beside it leaves (no wide-only columns), its bar wrapping; a request
+     opened takes the page, as "Fill the page" does. */
+  .logs .wide-only { display: none; }
+  .lbar { flex-wrap: wrap; height: auto; min-height: 52px; padding: 8px 12px; row-gap: 6px; }
+  .search { max-width: none; }
+  #tab-requests .logs.open { grid-template-columns: minmax(0, 1fr); }
+  #tab-requests .logs.open .list { display: none; }
+  .rbar .ttl { flex: 1; }
+  .rbar .facts { order: 1; flex-basis: 100%; flex-wrap: wrap; row-gap: 2px; margin-left: 0; padding: 0 6px 2px; }
+  /* The chat: its margins a phone's. */
+  .msgs { padding: 18px 14px 12px; }
+  .composer { padding: 8px 10px 10px; }
+  .chatopts { flex-wrap: wrap; row-gap: 4px; }
+  .chatstat { margin-left: 0; flex-wrap: wrap; row-gap: 2px; white-space: normal; }
+  /* The API docs' tables: wider than a phone, scrolled across in their own box. */
+  #tab-integration table { display: block; max-width: 100%; overflow-x: auto; }
+  /* The model served: its actions under its name, which breaks where it must (a Hub path is one long word). */
+  .srv > .srv-acts { grid-column: 1 / -1; grid-row: auto; display: flex; flex-wrap: wrap; gap: 8px; }
+  .srv-name, .srv-src { overflow-wrap: anywhere; }
+  /* Headings with a legend and a note beside them, and the state line's note with its button: wrapped, not run
+     over one another. */
+  .pane-h { flex-wrap: wrap; row-gap: 4px; }
+  .pane-h h2 { white-space: nowrap; }
+  .legend { flex-wrap: wrap; row-gap: 2px; }
+  .now .side-t { white-space: normal; display: flex; flex-wrap: wrap; align-items: center; gap: 8px; }
+}
+@media (max-width: 760px) and (prefers-reduced-motion: reduce) { .side, :root[data-drawer="open"] .side { transition: none; } }

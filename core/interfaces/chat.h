@@ -186,6 +186,10 @@ class Chat {
   // allows that text, and never a delimiter.  Any other special token a grammar never takes; the model's stop tokens
   // end a reply and are not named here.  None where the markers are ordinary tokens (<think>, <tool_call>).
   virtual std::vector<std::string> reply_tokens() const { return {}; }
+  // The text that opens a thinking section in a reply and the text that closes it (<think> and </think>; Inkling-2's
+  // <|content_thinking|> and <|end_message|>): what a thinking budget counts between and writes to end thinking.
+  // false for a format whose replies have no thinking sections.
+  virtual bool thinking_markers(std::string* open, std::string* close) const { return false; }
   // Template variables that say what the engine's own options say, for a template that has other names for them:
   // one with a thinking effort and no enable_thinking is given the effort of thinking switched off.  The request's
   // own variables (ChatOptions::kwargs) come before these.

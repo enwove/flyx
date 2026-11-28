@@ -171,6 +171,12 @@ def guides(panel, keyed):
         prose.update(guide_prose(panel))
         snippets = panel.locator("#agent-guide pre").all_text_contents()
         assert snippets and all(KEY not in value for value in snippets)
+        for para in panel.locator("#agent-guide p").all():
+            # A path in the prose is set off from the sentence after it (htm drops the space a line break makes).
+            text = para.inner_text()
+            for code in para.locator("code").all_inner_texts():
+                rest = text[text.index(code) + len(code):].removeprefix(".")
+                assert not rest or not rest[0].isalnum(), f"{agent}: no space after {code}: {text!r}"
         if agent == "claude":
             modes = panel.locator("#claude-permission")
             assert modes.input_value() == "bypassPermissions"
