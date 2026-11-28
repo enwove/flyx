@@ -59,12 +59,34 @@ constexpr bool moe_dp4a_kernel_active(int cc) {
 
 // The rows of a task of the prompt passes' tensor-core kernel (k_moe_blocks_q8_mmq).
 constexpr int kMoeMmqRows = 64;
+// The block types it is compiled for: the experts of the GGUFs it is measured on (Inkling-2-Mini UD-Q2_K_XL and
+// UD-IQ3_XXS: IQ1_S, IQ2_XXS, IQ2_XS, IQ2_S, IQ3_XXS gate|up, MXFP4, Q2_0, IQ4_NL down) and Q2_K, Q4_K; every type costs
+// some 70 KB of the release EXE (sm_80/89/120).  The others' prompt passes keep the 16-row kernel, which has the
+// rounds' bits; numerics class K holds either way.
+constexpr bool moe_mmq_type(int dtype) {
+  switch (dtype) {
+    case FLYX_DT_GGML_IQ1_S:
+    case FLYX_DT_GGML_IQ2_XXS:
+    case FLYX_DT_GGML_IQ2_XS:
+    case FLYX_DT_GGML_IQ2_S:
+    case FLYX_DT_GGML_IQ3_XXS:
+    case FLYX_DT_GGML_IQ4_NL:
+    case FLYX_DT_GGML_MXFP4:
+    case FLYX_DT_GGML_Q2_0:
+    case FLYX_DT_GGML_Q2_K:
+    case FLYX_DT_GGML_Q4_K:
+      return true;
+    default:
+      return false;
+  }
+}
 
 // dp4a: the moe_dp4a configuration of the dp4a kernel, one compiled for the type (moe_dp4a_cfg_compiled).  mma: the
 // rows of a tensor-core task (moe.cu's moe_mma_rows): 64 the prompt passes' kernel, 16 the one with the rounds' bits,
 // 0 the dp4a kernel.
 struct MoeBlockOps {
   bool mins;  // F::kFlatRun != 0 (requires q8_s half-group sums during staging)
+  bool mmq;   // moe_mmq_type: the prompt kernel is compiled for the type
   void (*gu)(const float* x, int ldx, const ExpertMat& W, const int* eidx, int rows, int top_k, int I, int K,
              float situ_beta, float situ_linear_beta, bool fuse_act, float* out, int ld_out, const MoeScratch* sc,
              int max_tiles, int mma, int dp4a, cudaStream_t st, bf16* act_bf16);

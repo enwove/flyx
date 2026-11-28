@@ -1186,7 +1186,10 @@ void moe_blocks_gu(const float* x, int ldx, const ExpertMat& W, const int* eidx,
     throw std::runtime_error("moe_gate_up: bf16 activations asked of a kernel that writes float32");
   if (has_q8 && (rows == 1 || (sc->tasks && max_tiles > 0))) {
     if (rows > 1 && mma == kMmqRows) {
-      launch_mmq_q8<F, false>(W, I, K, top_k, situ_beta, situ_linear_beta, out, ld_out, sc, max_tiles, fuse_act, st);
+      if constexpr (moe_mmq_type(F::kDtype))
+        launch_mmq_q8<F, false>(W, I, K, top_k, situ_beta, situ_linear_beta, out, ld_out, sc, max_tiles, fuse_act, st);
+      else
+        throw std::runtime_error("moe_gate_up: no prompt kernel for this block type");
     } else if (rows > 1 && mma) {
       if (fuse_act)
         launch_mma_q8<F, true, false>(W, I, K, top_k, situ_beta, situ_linear_beta, out, ld_out, sc, max_tiles, st);
@@ -1240,7 +1243,10 @@ bool moe_blocks_down(const float* act, int ld_act, const ExpertMat& W, const int
       W.blk.q8 && sc && sc->q8_a && sc->down_buf && sc->stage_elems >= size_t(rows) * size_t(top_k) * size_t(K);
   if (has_q8 && (rows == 1 || (sc->tasks && max_tiles > 0))) {
     if (rows > 1 && mma == kMmqRows) {
-      launch_mmq_q8<F, true>(W, H, K, top_k, 0.f, 0.f, sc->down_buf, H, sc, max_tiles, false, st);
+      if constexpr (moe_mmq_type(F::kDtype))
+        launch_mmq_q8<F, true>(W, H, K, top_k, 0.f, 0.f, sc->down_buf, H, sc, max_tiles, false, st);
+      else
+        throw std::runtime_error("moe_down: no prompt kernel for this block type");
     } else if (rows > 1 && mma) {
       launch_mma_q8<F, false, true>(W, H, K, top_k, 0.f, 0.f, sc->down_buf, H, sc, max_tiles, st);
     } else {
@@ -1268,7 +1274,7 @@ bool moe_blocks_down(const float* act, int ld_act, const ExpertMat& W, const int
 
 template <class F>
 const MoeBlockOps* moe_block_ops_one() {
-  static const MoeBlockOps ops{F::kFlatRun != 0, &moe_blocks_gu<F>, &moe_blocks_down<F>};
+  static const MoeBlockOps ops{F::kFlatRun != 0, moe_mmq_type(F::kDtype), &moe_blocks_gu<F>, &moe_blocks_down<F>};
   return &ops;
 }
 

@@ -2152,8 +2152,9 @@ void test_inkling2_moe() {
     expect("moe_gate_up " + label, got_act_f, want_act, std::max(tol, 1.5e-4));
     expect_bits("moe_gate_up fused==unfused " + label, got_act_f, got_act_u);
 
-    // GGML block experts in 8-bit inputs: a pass of more than 16 rows takes the 64-row kernel (option moe_mmq), whose
-    // sums are not the rounds' (numerics.md).  Its rows against float64 (above, and the down GEMM here), the same
+    // GGML block experts in 8-bit inputs: a pass of more than 16 rows takes the 64-row kernel (option moe_mmq; the
+    // types moe_mmq_type lists, the others the 16-row kernel, which the checks below hold too), whose sums are not
+    // the rounds' (numerics.md).  Its rows against float64 (above, and the down GEMM here), the same
     // rows as passes of 17 and 20 rows, and the pass again: the same bits.  Then the rest with moe_mmq=0, whose 16-row
     // kernel keeps the rounds' bits.
     const KernelOptions* entry_opts = TL.opt;

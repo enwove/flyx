@@ -1097,13 +1097,14 @@ __global__ void __launch_bounds__(32 * kMoeWarps)
   }
 }
 
-// The rows of a tensor-core task for a pass of rc rows and M pairs.  Every pass of more than FLYX_MAX_ROWS rows takes
-// the prompt kernel's 64-row tasks whatever its density, so a row's sums do not depend on the pass (numerics class K);
+// The rows of a tensor-core task for a pass of rc rows and M pairs.  Every pass of more than FLYX_MAX_ROWS rows on a
+// block type the prompt kernel is compiled for (mmq: moe_mmq_type) takes its 64-row tasks whatever its density, so a
+// row's sums do not depend on the pass (numerics class K);
 // with option moe_mmq=0 a dense one (2 or more rows an expert on average) takes the 16-row kernel with the rounds'
 // bits, as before.  Rounds and the passes of 16 rows or fewer stay on the low-register dp4a kernels (4-row tasks).
-int moe_mma_rows(const KernelOptions& o, int rc, int M, int n_experts) {
+int moe_mma_rows(const KernelOptions& o, int rc, int M, int n_experts, bool mmq) {
   if (rc <= FLYX_MAX_ROWS) return 0;
-  if (o.moe_mmq) return kMoeMmqRows;
+  if (o.moe_mmq && mmq) return kMoeMmqRows;
   return M >= 2 * n_experts ? 16 : 0;
 }
 
@@ -1598,7 +1599,7 @@ int moe_bank_gate_up(const float* x, int ldx, const ExpertMat& W, const int* eid
       const bool can_q8 = W.blk.q8 && sc && sc->q8_a && sc->stage_elems >= size_t(rc) * size_t(K);
       if (can_q8 && !q8_ready) moe_stage_q8(xc, ldx, K, rc, *sc, ops->mins, st);
       const int M = rc * top_k;
-      const int mma = can_q8 && has_sc ? moe_mma_rows(opts(L), rc, M, W.n_experts) : 0;
+      const int mma = can_q8 && has_sc ? moe_mma_rows(opts(L), rc, M, W.n_experts, ops->mmq) : 0;
       int mt = 0;
       if (rc > 1 && has_sc) {
         const int bm = mma ? mma : 4;
@@ -1679,7 +1680,7 @@ void moe_bank_down(const float* act, int ld_act, const ExpertMat& W, const int* 
       const int M = rc * top_k;
       const bool can_q8 = W.blk.q8 && sc && sc->q8_a && sc->down_buf && sc->stage_elems >= size_t(M) * size_t(K);
       if (can_q8) moe_stage_q8(ac, ld_act, K, M, *sc, ops->mins, st);
-      const int mma = can_q8 && has_sc ? moe_mma_rows(opts(L), rc, M, W.n_experts) : 0;
+      const int mma = can_q8 && has_sc ? moe_mma_rows(opts(L), rc, M, W.n_experts, ops->mmq) : 0;
       int mt = 0;
       if (rc > 1 && has_sc) {
         const int bm = mma ? mma : 4;
