@@ -360,7 +360,9 @@ def check_settings(page, server, want):
         if value != "0":
             expect(page.locator('[data-k="kv_gpu"] .was')).to_contain_text("0")
         confirm(page, "#mf-reload", "Reload")
-        assert server.posted[-1]["kv_gpu"] == (int(value) if value else None) and server.posted[-1]["model"] == want["model"], server.posted[-1]
+        # Cleared beside a loaded model: "auto", as many as fit whatever the server's --kv-gpu (null would keep that
+        # cap while the command line above, without --kv-gpu, sizes it automatically).
+        assert server.posted[-1]["kv_gpu"] == (int(value) if value else "auto") and server.posted[-1]["model"] == want["model"], server.posted[-1]
     page.locator("#mf-vramres").fill("0")
     page.locator("#mf-ramres").fill("0")
     expect(cmd).to_contain_text("--vram-reserve 0")

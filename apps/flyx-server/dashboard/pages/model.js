@@ -284,6 +284,8 @@ function loadBody(chosen, f, hasLoaded = false) {
   const ctx = ctxText === "max" ? "max" : ctxTokens > 0 ? ctxTokens : null;  // "max": the model's own, or the longest that fits
   const kvRam = parseFloat(f.kvram), kvGpu = parseInt(f.kvgpu, 10), name = f.name.trim(), lora = f.lora.trim();
   const vramRes = parseFloat(f.vramres), ramRes = parseFloat(f.ramres);
+  // A blank field beside a loaded model was cleared: "auto", whatever the server's flag was (null would keep it, a
+  // command line from it would not); before any model, null leaves the server's own --kv-gpu and reserves.
   const blankReserve = hasLoaded ? "auto" : null;
   const own = f.draftSource === "custom" && f.spec ? f.drafter.trim() : "";
   const adv = { width: f.width ? parseInt(f.width, 10) : null, draft_trees: f.trees === "on" ? true : f.trees === "off" ? false : null, lookup: f.lookup,
@@ -299,7 +301,7 @@ function loadBody(chosen, f, hasLoaded = false) {
                 vision_max_tokens: Number.isFinite(vmax) && vmax > 0 ? vmax : null };
   // kv "auto": the engine's default, not the server's --kv (null would keep that)
   return Object.assign({ model: chosen, ctx, kv: f.kv || "auto", kv_ram: kvRam >= 0 ? kvRam : "auto",
-                         kv_gpu: kvGpu >= 0 ? kvGpu : null,
+                         kv_gpu: kvGpu >= 0 ? kvGpu : blankReserve,
                          vram_reserve: vramRes >= 0 ? vramRes : blankReserve, ram_reserve: ramRes >= 0 ? ramRes : blankReserve,
                          name: name || null, lora: lora || null, speculative: f.spec },
                        draft, adv, vis);
@@ -318,7 +320,7 @@ function commandOf(b, shell) {
   if (b.ctx) parts.push("--ctx " + b.ctx);
   if (b.kv !== "auto") parts.push("--kv " + b.kv);
   if (b.kv_ram !== "auto") parts.push("--kv-ram " + b.kv_ram);
-  if (b.kv_gpu !== null) parts.push("--kv-gpu " + b.kv_gpu);
+  if (typeof b.kv_gpu === "number") parts.push("--kv-gpu " + b.kv_gpu);
   if (b.vram_reserve !== undefined && b.vram_reserve !== null && b.vram_reserve !== "auto") parts.push("--vram-reserve " + b.vram_reserve);
   if (b.ram_reserve !== undefined && b.ram_reserve !== null && b.ram_reserve !== "auto") parts.push("--ram-reserve " + b.ram_reserve);
   if (!b.speculative) parts.push("--no-spec");

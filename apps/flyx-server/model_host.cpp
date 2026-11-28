@@ -37,7 +37,7 @@ ojson want_json(const ModelHost::Want& w) {
           {"speculative", w.eo.speculative},
           {"kv", w.eo.kv == FLYX_KV_FP8 ? ojson("fp8") : w.eo.kv == FLYX_KV_16 ? ojson("16") : ojson(nullptr)},
           {"kv_ram", w.eo.kv_ram < 0 ? ojson("auto") : ojson(double(w.eo.kv_ram) / 1e9)},
-          {"kv_gpu", w.eo.kv_gpu < 0 ? ojson(nullptr) : ojson(w.eo.kv_gpu)},
+          {"kv_gpu", w.eo.kv_gpu < 0 ? ojson("auto") : ojson(w.eo.kv_gpu)},
           {"vram_reserve", w.eo.vram_reserve < 0 ? ojson("auto") : ojson(double(w.eo.vram_reserve) / 1e9)},
           {"ram_reserve", w.eo.ram_reserve < 0 ? ojson("auto") : ojson(double(w.eo.ram_reserve) / 1e9)},
           {"width", w.eo.width < 0 ? ojson(nullptr) : ojson(w.eo.width)},
@@ -307,10 +307,14 @@ bool want_from_json(const ojson& j, const EngineOptions& base, ModelHost::Want* 
   };
   // Host memory for the K/V past the GPU's part: GB, or "auto"; absent: the server's own setting.
   if (!parse_gb_field("kv_ram", "GB of host memory", &out.eo.kv_ram)) return false;
+  // The K/V positions on the GPU at most: a whole number, or "auto" (as many as fit, whatever the server's --kv-gpu);
+  // absent or null: the server's own setting.
   if (j.contains("kv_gpu") && !j["kv_gpu"].is_null()) {
-    if (!j["kv_gpu"].is_number_integer() || j["kv_gpu"].get<int64_t>() < 0 || j["kv_gpu"].get<int64_t>() > INT32_MAX)
-      return *err = "\"kv_gpu\": positions, a whole number", false;
-    out.eo.kv_gpu = j["kv_gpu"].get<int>();
+    const bool automatic = j["kv_gpu"].is_string() && j["kv_gpu"].get<std::string>() == "auto";
+    if (!automatic && (!j["kv_gpu"].is_number_integer() || j["kv_gpu"].get<int64_t>() < 0 ||
+                       j["kv_gpu"].get<int64_t>() > INT32_MAX))
+      return *err = "\"kv_gpu\": positions, a whole number, or \"auto\"", false;
+    out.eo.kv_gpu = automatic ? -1 : j["kv_gpu"].get<int>();
   }
   if (!parse_gb_field("vram_reserve", "GB to keep free", &out.eo.vram_reserve)) return false;
   if (!parse_gb_field("ram_reserve", "GB to keep free", &out.eo.ram_reserve)) return false;

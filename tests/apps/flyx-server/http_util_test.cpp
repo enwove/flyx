@@ -20,6 +20,29 @@ namespace {
 
 using namespace flyx::server;
 
+// POST /v1/load's "kv_gpu": a cap, "auto" (as many as fit, whatever the server's --kv-gpu: a dashboard field cleared
+// beside a loaded model), or absent / null (the server's own setting).
+void test_load_kv_gpu() {
+  using ojson = nlohmann::ordered_json;
+  flyx::EngineOptions cli;
+  cli.kv_gpu = 4096;  // flyx serve --kv-gpu 4096
+  auto kv_gpu = [&](const ojson& j, std::string* err) {
+    ModelHost::Want w;
+    return want_from_json(j, cli, &w, err) ? w.eo.kv_gpu : -2;
+  };
+  std::string err;
+  check(kv_gpu({{"model", "m"}}, &err) == 4096 && kv_gpu({{"model", "m"}, {"kv_gpu", nullptr}}, &err) == 4096,
+        "kv_gpu absent or null: the server's --kv-gpu");
+  check(kv_gpu({{"model", "m"}, {"kv_gpu", "auto"}}, &err) == -1, "kv_gpu \"auto\": as many as fit, past --kv-gpu");
+  check(kv_gpu({{"model", "m"}, {"kv_gpu", 1024}}, &err) == 1024 && kv_gpu({{"model", "m"}, {"kv_gpu", 0}}, &err) == 0,
+        "kv_gpu a whole number: that cap");
+  for (const ojson& bad : {ojson(-1), ojson(1.5), ojson("max"), ojson(true)}) {
+    err.clear();
+    const int got = kv_gpu({{"model", "m"}, {"kv_gpu", bad}}, &err);
+    check(got == -2 && err.find("\"kv_gpu\"") != std::string::npos, "kv_gpu " + bad.dump() + " refused: " + err);
+  }
+}
+
 void test_chat_kwargs() {
   flyx::ChatOptions options;
   std::string err;
@@ -529,6 +552,7 @@ void test_remote_unc_and_device_paths() {
 
 int main() {
   flyx::test::print_passes = true;
+  test_load_kv_gpu();
   test_chat_kwargs();
   test_dns_rebinding_and_lan_hosts();
   test_forwarded_and_management_policy();
