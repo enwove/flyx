@@ -1381,15 +1381,16 @@ int main(int argc, char** argv) {
 
     if (backend == "cuda") {
       // The attention's producers on the mixed weights; the MoE's on experts whose gate|up GEMM reads 8-bit rows
-      // and whose down GEMM is NVFP4.
+      // and whose down GEMM is NVFP4.  Experts on the CPU add in an order of their own (0.000175 with every expert
+      // there); beside device experts in the prompt passes' kernel (moe_mmq) 0.000211, so the bound has room.
       test_fused_rounds(bf16_gguf, "BF16 trunk", prompt, 1e-6);
-      test_fused_rounds(mixed_gguf, "mixed weights", prompt, 2e-4);
+      test_fused_rounds(mixed_gguf, "mixed weights", prompt, 3e-4);
       {
         TinySpec experts = spec;
         experts.packed_gate_nvfp4_down = true;
         const auto path = dir / "tiny_inkling2_mixed_experts.gguf";
         write_tiny_inkling2(path, experts, true, 2002);
-        test_fused_rounds(path, "mixed experts", prompt, 2e-4);
+        test_fused_rounds(path, "mixed experts", prompt, 3e-4);
       }
       {
         auto held = [&](RoundMatrixCase round_case, const char* filename) {

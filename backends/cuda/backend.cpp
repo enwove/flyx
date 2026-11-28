@@ -499,6 +499,7 @@ const std::vector<OptionSpec>& option_specs() {
       // Inkling-2's rounds (kEnvAliases: the environment spellings they had before they were options).
       kernel_int_choice_opt("sc_cluster", &KernelOptions::sc_cluster, {"1", "4", "8"}),
       kernel_flag_opt("moe_vec", &KernelOptions::moe_vec),
+      kernel_flag_opt("moe_mmq", &KernelOptions::moe_mmq),
       {"warm",
        [](const std::string& key, const std::string& val, BackendOptions* o, std::string* err) {
          if (!parse_whole_val(key, val, &o->kernels.warm, err)) return false;

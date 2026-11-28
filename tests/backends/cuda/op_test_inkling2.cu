@@ -2152,6 +2152,94 @@ void test_inkling2_moe() {
     expect("moe_gate_up " + label, got_act_f, want_act, std::max(tol, 1.5e-4));
     expect_bits("moe_gate_up fused==unfused " + label, got_act_f, got_act_u);
 
+    // GGML block experts in 8-bit inputs: a pass of more than 16 rows takes the 64-row kernel (option moe_mmq), whose
+    // sums are not the rounds' (numerics.md).  Its rows against float64 (above, and the down GEMM here), the same
+    // rows as passes of 17 and 20 rows, and the pass again: the same bits.  Then the rest with moe_mmq=0, whose 16-row
+    // kernel keeps the rounds' bits.
+    const KernelOptions* entry_opts = TL.opt;
+    KernelOptions legacy_opts = opts(TL);
+    if (round_q8 && w_gu.packed()) {
+      float* d_want_in = up(want_act);
+      float* act_split = dev<float>(size_t(R) * top_k * I);
+      float* y_full = dev<float>(size_t(R) * H);
+      float* y_split = dev<float>(size_t(R) * H);
+      moe_down(d_want_in, I, w_dn, d_eidx, d_ew, R, top_k, H, I, y_full, H, false, &msc, TL);
+      expect("moe_mmq down " + label, down(y_full, size_t(R) * H), want_out, tol);
+      moe_down(d_act_fused, I, w_dn, d_eidx, d_ew, R, top_k, H, I, y_full, H, false, &msc, TL);
+      for (const auto& [r0, n] : {std::pair{0, 17}, std::pair{17, R - 17}}) {
+        const size_t pair = size_t(r0) * top_k;
+        moe_gate_up(d_x + size_t(r0) * H, H, w_gu, d_eidx + pair, n, top_k, I, H, beta, lb, true,
+                    act_split + pair * I, I, &msc, TL);
+        moe_down(d_act_fused + pair * I, I, w_dn, d_eidx + pair, d_ew + pair, n, top_k, H, I, y_split + size_t(r0) * H,
+                 H, false, &msc, TL);
+      }
+      expect_bits("moe_mmq gate|up 17 + 20 rows == 37 " + label, down(act_split, size_t(R) * top_k * I), got_act_f);
+      expect_bits("moe_mmq down 17 + 20 rows == 37 " + label, down(y_split, size_t(R) * H), down(y_full, size_t(R) * H));
+      moe_gate_up(d_x, H, w_gu, d_eidx, R, top_k, I, H, beta, lb, true, act_split, I, &msc, TL);
+      expect_bits("moe_mmq gate|up again " + label, down(act_split, size_t(R) * top_k * I), got_act_f);
+      // The 37 rows over and over in one pass of 300 (some 75 rows an expert: several 16-row slices and tasks): each
+      // row has its bits of the 37-row pass.
+      {
+        constexpr int RR = 300;
+        Vec xs(size_t(RR) * H), ws(size_t(RR) * top_k);
+        std::vector<int> ids(size_t(RR) * top_k);
+        for (int r = 0; r < RR; ++r) {
+          std::copy_n(x.data() + size_t(r % R) * H, H, xs.data() + size_t(r) * H);
+          std::copy_n(eidx.data() + size_t(r % R) * top_k, top_k, ids.data() + size_t(r) * top_k);
+          std::copy_n(ew.data() + size_t(r % R) * top_k, top_k, ws.data() + size_t(r) * top_k);
+        }
+        float* d_xs = up(xs);
+        float* d_ws = up(ws);
+        int* d_ids = dev<int>(ids.size());
+        CK(cudaMemcpy(d_ids, ids.data(), ids.size() * sizeof(int), cudaMemcpyHostToDevice));
+        MoeScratch big = msc;
+        big.pairs = dev<int>(size_t(RR) * top_k);
+        big.tasks = dev<MoeTask>(size_t(RR) * top_k);
+        big.down_buf = dev<float>(size_t(RR) * top_k * H);
+        big.stage_elems = std::max(size_t(RR) * H, size_t(RR) * top_k * I);
+        const size_t a_b = (big.stage_elems + 255) / 256 * 256;
+        const size_t d_b = (((big.stage_elems + 31) / 32) * sizeof(float) + 255) / 256 * 256;
+        const size_t s_b = (((big.stage_elems + 15) / 16) * sizeof(float) + 255) / 256 * 256;
+        auto* stage = dev<uint8_t>(a_b + d_b + s_b);
+        big.q8_a = reinterpret_cast<int8_t*>(stage);
+        big.q8_d = reinterpret_cast<float*>(stage + a_b);
+        big.q8_s = reinterpret_cast<float*>(stage + a_b + d_b);
+        big.bf16_a = nullptr;
+        big.chunk_rows = RR;
+        float* acts = dev<float>(size_t(RR) * top_k * I);
+        float* ys = dev<float>(size_t(RR) * H);
+        moe_gate_up(d_xs, H, w_gu, d_ids, RR, top_k, I, H, beta, lb, true, acts, I, &big, TL);
+        moe_down(acts, I, w_dn, d_ids, d_ws, RR, top_k, H, I, ys, H, false, &big, TL);
+        const Vec got_acts = down(acts, size_t(RR) * top_k * I), got_ys = down(ys, size_t(RR) * H);
+        const Vec y37 = down(y_full, size_t(R) * H);
+        bool same = true;
+        for (int r = 0; r < RR && same; ++r) {
+          const int s = r % R;
+          same = std::memcmp(got_acts.data() + size_t(r) * top_k * I, got_act_f.data() + size_t(s) * top_k * I,
+                             size_t(top_k) * I * sizeof(double)) == 0 &&
+                 std::memcmp(got_ys.data() + size_t(r) * H, y37.data() + size_t(s) * H, size_t(H) * sizeof(double)) == 0;
+        }
+        std::printf("  %-4s moe_mmq 300 rows of the 37 == their 37-row pass %s\n", same ? "ok" : "FAIL", label.c_str());
+        if (!same) ++g_fail;
+        for (void* q : {(void*)d_xs, (void*)d_ws, (void*)d_ids, (void*)big.pairs, (void*)big.tasks,
+                        (void*)big.down_buf, (void*)stage, (void*)acts, (void*)ys})
+          cudaFree(q);
+      }
+      for (void* q : {(void*)d_want_in, (void*)act_split, (void*)y_full, (void*)y_split}) cudaFree(q);
+
+      legacy_opts.moe_mmq = false;
+      TL.opt = &legacy_opts;
+      moe_gate_up(d_x, H, w_gu, d_eidx, R, top_k, I, H, beta, lb, true, d_act_fused, I, &msc, TL);
+      moe_gate_up(d_x, H, w_gu, d_eidx, R, top_k, I, H, beta, lb, false, d_gu_raw, 2 * I, &msc, TL);
+      situ_rows(d_gu_raw, 2 * I, I, beta, lb, d_act_unfused, I, R * top_k, 0);
+      got_gu = down(d_gu_raw, size_t(R) * top_k * 2 * I);
+      got_act_f = down(d_act_fused, size_t(R) * top_k * I);
+      got_act_u = down(d_act_unfused, size_t(R) * top_k * I);
+      expect("moe_gate_up raw moe_mmq=0 " + label, got_gu, want_gu, tol);
+      expect("moe_gate_up moe_mmq=0 " + label, got_act_f, want_act, std::max(tol, 1.5e-4));
+      expect_bits("moe_gate_up fused==unfused moe_mmq=0 " + label, got_act_f, got_act_u);
+    }
+
     if (round_q8 && w_gu.packed()) {
       Vec expert_scales(E);
       for (int e = 0; e < E; ++e) expert_scales[e] = 0.5 + e / 16.0;
@@ -2458,6 +2546,7 @@ void test_inkling2_moe() {
     Vec want_acc(static_cast<size_t>(H));
     for (int c = 0; c < H; ++c) want_acc[c] = bias_y[c] + got_y1[c];
     expect("moe_down accumulate " + label, got_acc, want_acc, 1e-6);
+    TL.opt = entry_opts;
 
     cudaFree(d_act_fused);
     cudaFree(d_gu_raw);
@@ -2654,8 +2743,30 @@ void test_inkling2_moe() {
       wdn.N = HM;
       wdn.blk = up_blocks(FLYX_DT_GGML_IQ4_NL, draw, EM * HM);
       wdn.blk.q8 = true;
+      // A pass of 19 rows takes the prompt kernel (moe_mmq; K = 1152 ends in half a span): within tolerance of the
+      // 16-row kernel with the rounds' bits (moe_mmq=0) and the same bits twice; the rounds are held to the latter.
+      Vec ymq;
+      for (int again = 0; again < 2; ++again) {
+        moe_gate_up(dxm, HM, wgu, deim, RM, KM, IM, HM, beta, lb, true, d_act_m, IM, &sm, TL);
+        moe_down(d_act_m, IM, wdn, deim, dewm, RM, KM, HM, IM, d_y_m, HM, false, &sm, TL);
+        if (again)
+          expect_bits(std::string("moe multispan moe_mmq again ") + gbt.name, down(d_y_m, size_t(RM) * HM), ymq);
+        else
+          ymq = down(d_y_m, size_t(RM) * HM);
+      }
+      const KernelOptions* entry_opts = TL.opt;
+      KernelOptions legacy_opts = opts(TL);
+      legacy_opts.moe_mmq = false;
+      const Vec act_mmq = down(d_act_m, size_t(RM) * KM * IM);
+      TL.opt = &legacy_opts;
       moe_gate_up(dxm, HM, wgu, deim, RM, KM, IM, HM, beta, lb, true, d_act_m, IM, &sm, TL);
+      // The activations, not the down GEMM's sums, which cancel: a sequential sum over K's 72 groups and the 32
+      // streams' tree differ by a few float32 steps on each (measured against float64: 2.1e-5 and 7.1e-6 of the
+      // largest activation on IQ3_XXS, 2.8e-5 and 1.3e-5 on Q4_K).
+      expect(std::string("moe multispan 2304x1152 gate|up moe_mmq vs moe_mmq=0 ") + gbt.name, act_mmq,
+             down(d_act_m, size_t(RM) * KM * IM), 1e-4);
       moe_down(d_act_m, IM, wdn, deim, dewm, RM, KM, HM, IM, d_y_m, HM, false, &sm, TL);
+      TL.opt = entry_opts;
       Vec ym = down(d_y_m, size_t(RM) * HM);
       const int rr = 11;
       Vec yref(ym.begin() + ptrdiff_t(rr) * HM, ym.begin() + ptrdiff_t(rr + 1) * HM);
@@ -2749,9 +2860,20 @@ void test_inkling2_moe() {
         wdn.w = up_bf16(dn);
       }
       const char* name = packed ? "Q8_0" : "bf16";
+      // The pass of 70 rows on GGML blocks: the prompt kernel (moe_mmq) within tolerance of the 16-row kernel with the
+      // rounds' bits (moe_mmq=0), which the rows alone are held to.
+      const int mmq_grouped = moe_gate_up(dxg, HG, wgu, deig, RG, KG, IG, HG, beta, lb, true, d_act_g, IG, &sg, TL);
+      moe_down(d_act_g, IG, wdn, deig, dewg, RG, KG, HG, IG, d_y_g, HG, false, &sg, TL, nullptr, mmq_grouped);
+      const Vec yg_mmq = down(d_y_g, size_t(RG) * HG);
+      const KernelOptions* entry_opts = TL.opt;
+      KernelOptions legacy_opts = opts(TL);
+      legacy_opts.moe_mmq = false;
+      TL.opt = &legacy_opts;
       const int grouped = moe_gate_up(dxg, HG, wgu, deig, RG, KG, IG, HG, beta, lb, true, d_act_g, IG, &sg, TL);
       moe_down(d_act_g, IG, wdn, deig, dewg, RG, KG, HG, IG, d_y_g, HG, false, &sg, TL, nullptr, grouped);
+      TL.opt = entry_opts;
       const Vec yg = down(d_y_g, size_t(RG) * HG);
+      expect(std::string("moe grouping of 300 experts moe_mmq vs moe_mmq=0 ") + name, yg_mmq, yg, 5e-5);
       bool same = true;
       for (int rr : {0, 1, 33, 68, 69}) {
         moe_gate_up(dxg + size_t(rr) * HG, HG, wgu, deig + size_t(rr) * KG, 1, KG, IG, HG, beta, lb, true, d_act_1, IG,

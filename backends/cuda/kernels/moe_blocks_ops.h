@@ -57,14 +57,19 @@ constexpr bool moe_dp4a_kernel_active(int cc) {
   }
 }
 
-// dp4a: the moe_dp4a configuration of the dp4a kernel, one compiled for the type (moe_dp4a_cfg_compiled).
+// The rows of a task of the prompt passes' tensor-core kernel (k_moe_blocks_q8_mmq).
+constexpr int kMoeMmqRows = 64;
+
+// dp4a: the moe_dp4a configuration of the dp4a kernel, one compiled for the type (moe_dp4a_cfg_compiled).  mma: the
+// rows of a tensor-core task (moe.cu's moe_mma_rows): 64 the prompt passes' kernel, 16 the one with the rounds' bits,
+// 0 the dp4a kernel.
 struct MoeBlockOps {
   bool mins;  // F::kFlatRun != 0 (requires q8_s half-group sums during staging)
   void (*gu)(const float* x, int ldx, const ExpertMat& W, const int* eidx, int rows, int top_k, int I, int K,
              float situ_beta, float situ_linear_beta, bool fuse_act, float* out, int ld_out, const MoeScratch* sc,
-             int max_tiles, bool use_mma, int dp4a, cudaStream_t st, bf16* act_bf16);
+             int max_tiles, int mma, int dp4a, cudaStream_t st, bf16* act_bf16);
   bool (*down)(const float* act, int ld_act, const ExpertMat& W, const int* eidx, const float* ew, int rows, int top_k,
-               int H, int K, float* out, int ld_out, bool accumulate, const MoeScratch* sc, int max_tiles, bool use_mma,
+               int H, int K, float* out, int ld_out, bool accumulate, const MoeScratch* sc, int max_tiles, int mma,
                int dp4a, cudaStream_t st);
 };
 

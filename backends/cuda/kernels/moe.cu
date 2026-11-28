@@ -1097,8 +1097,15 @@ __global__ void __launch_bounds__(32 * kMoeWarps)
   }
 }
 
-// Use INT8 MMA (BM=16) only when average rows per expert is at least 2 (prefill); rounds stay on low-reg dp4a (BM=4).
-constexpr bool moe_use_mma(int rc, int M, int n_experts) { return rc > FLYX_MAX_ROWS && M >= 2 * n_experts; }
+// The rows of a tensor-core task for a pass of rc rows and M pairs.  Every pass of more than FLYX_MAX_ROWS rows takes
+// the prompt kernel's 64-row tasks whatever its density, so a row's sums do not depend on the pass (numerics class K);
+// with option moe_mmq=0 a dense one (2 or more rows an expert on average) takes the 16-row kernel with the rounds'
+// bits, as before.  Rounds and the passes of 16 rows or fewer stay on the low-register dp4a kernels (4-row tasks).
+int moe_mma_rows(const KernelOptions& o, int rc, int M, int n_experts) {
+  if (rc <= FLYX_MAX_ROWS) return 0;
+  if (o.moe_mmq) return kMoeMmqRows;
+  return M >= 2 * n_experts ? 16 : 0;
+}
 
 bool moe_round_scratch(const ExpertMat& W, int rows, int top_k, const MoeScratch* sc) {
   return rows > 0 && rows <= FLYX_MAX_ROWS && sc && rows <= sc->chunk_rows && W.n_experts <= sc->max_experts &&
@@ -1591,15 +1598,15 @@ int moe_bank_gate_up(const float* x, int ldx, const ExpertMat& W, const int* eid
       const bool can_q8 = W.blk.q8 && sc && sc->q8_a && sc->stage_elems >= size_t(rc) * size_t(K);
       if (can_q8 && !q8_ready) moe_stage_q8(xc, ldx, K, rc, *sc, ops->mins, st);
       const int M = rc * top_k;
-      const bool use_mma = can_q8 && has_sc && moe_use_mma(rc, M, W.n_experts);
+      const int mma = can_q8 && has_sc ? moe_mma_rows(opts(L), rc, M, W.n_experts) : 0;
       int mt = 0;
       if (rc > 1 && has_sc) {
-        const int bm = use_mma ? 16 : 4;
+        const int bm = mma ? mma : 4;
         mt = max_work_tiles(M, W.n_experts, bm);
         group_tasks(ec, M, W.n_experts, bm, sc, st, first);
         grouped = rc == rows ? bm : 0;
       }
-      ops->gu(xc, ldx, W, ec, rc, top_k, I, K, situ_beta, situ_linear_beta, fuse_act, oc, ld_out, sc, mt, use_mma,
+      ops->gu(xc, ldx, W, ec, rc, top_k, I, K, situ_beta, situ_linear_beta, fuse_act, oc, ld_out, sc, mt, mma,
               moe_dp4a_cfg(opts(L), W.blk.dtype, rc, fuse_act), st, act_bf16);
     }
     return grouped;
@@ -1672,15 +1679,15 @@ void moe_bank_down(const float* act, int ld_act, const ExpertMat& W, const int* 
       const int M = rc * top_k;
       const bool can_q8 = W.blk.q8 && sc && sc->q8_a && sc->down_buf && sc->stage_elems >= size_t(M) * size_t(K);
       if (can_q8) moe_stage_q8(ac, ld_act, K, M, *sc, ops->mins, st);
-      const bool use_mma = can_q8 && has_sc && moe_use_mma(rc, M, W.n_experts);
+      const int mma = can_q8 && has_sc ? moe_mma_rows(opts(L), rc, M, W.n_experts) : 0;
       int mt = 0;
       if (rc > 1 && has_sc) {
-        const int bm = use_mma ? 16 : 4;
+        const int bm = mma ? mma : 4;
         mt = max_work_tiles(M, W.n_experts, bm);
         if (rc != rows || !tiles_serve(grouped, bm, rc)) group_tasks(ec, M, W.n_experts, bm, sc, st, first);
       }
       const bool wrote_buf = ops->down(ac, ld_act, W, ec, ewc, rc, top_k, H, K, oc, ld_out, accumulate, sc, mt,
-                                       use_mma, moe_dp4a_cfg(opts(L), W.blk.dtype, rc, false), st);
+                                       mma, moe_dp4a_cfg(opts(L), W.blk.dtype, rc, false), st);
       if (wrote_buf && !dispatch.defer_reduce)
         k_moe_weighted_sum<<<dim3(ceil_div(H, 256), rc), 256, 0, st>>>(sc->down_buf, ewc, top_k, H, oc, ld_out,
                                                                        int(accumulate));

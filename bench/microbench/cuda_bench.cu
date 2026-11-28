@@ -289,7 +289,8 @@ void bench_moe() {
   bench_moe_projection(FLYX_DT_GGML_Q4_K, true);
 }
 
-// Inkling-2-Mini's prefill MoE projections on GGML block experts: cuda_bench moepf [TYPE|all] [ROWS] [gu|down|both].
+// Inkling-2-Mini's prefill MoE projections on GGML block experts:
+// cuda_bench moepf [TYPE|all] [ROWS] [gu|down|both] [mmq|mma16] (mma16: option moe_mmq=0, the rounds' bits).
 // A bank of 128 experts, 8 a row, rows routed with a fixed skew (Zipf 0.8 over a shuffled bank, as real routers
 // favour some experts); gate|up K = 2304 with fused SiTU in float32, down K = 1152 into its slots and the weighted
 // sum.  3 warm-up and 10 timed calls, and the FNV-1a hash of the outputs (a kernel change that keeps the bits keeps
@@ -299,8 +300,9 @@ void bench_moe_prefill(int argc, char** argv) {
   const std::string type = argc > 2 ? argv[2] : "all";
   const int rows = argc > 3 ? std::atoi(argv[3]) : 1024;
   const std::string which = argc > 4 ? argv[4] : "both";
-  if (rows < 17 || rows > 4096) {
-    std::printf("usage: cuda_bench moepf [TYPE|all] [ROWS 17..4096] [gu|down|both]\n");
+  const std::string kernel = argc > 5 ? argv[5] : "mmq";
+  if (rows < 17 || rows > 4096 || (kernel != "mmq" && kernel != "mma16")) {
+    std::printf("usage: cuda_bench moepf [TYPE|all] [ROWS 17..4096] [gu|down|both] [mmq|mma16]\n");
     std::exit(2);
   }
   struct Case {
@@ -371,6 +373,7 @@ void bench_moe_prefill(int argc, char** argv) {
   cudaStream_t st;
   CK(cudaStreamCreateWithFlags(&st, cudaStreamNonBlocking));
   KernelOptions options = g_bench_opts;
+  options.moe_mmq = kernel == "mmq";
   const Launch launch{st, nullptr, &options};
   auto hash_of = [&](const float* p, size_t n) {
     std::vector<float> host(n);

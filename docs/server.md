@@ -216,6 +216,7 @@ Passed verbatim to the backend (`backends/cuda/backend.cpp`). Unknown keys or in
 |---|---|---|---|
 | `gemm` | `auto` \| `rows` | `auto` | Force CUDA-core row GEMMs (`rows`, debugging). |
 | `blocks` | `packed` \| `bf16` | `packed` | `bf16` dequantizes GGUF block weights to bf16 at load (higher VRAM, outside packed contract). |
+| `moe_mmq` | `0` \| `1` | `1` | GGUF block experts in prompt passes of more than 16 rows: 64-row tensor-core tiles with one float32 sum an output (`1`), within tolerance of the rounds; `0`: the 16-row kernel with the rounds' bits, 2 to 4 times slower ([Numerics](design/numerics.md)). |
 | `embed` | `auto` \| `host` \| `gpu` | `auto` | Untied embedding table in host RAM (`host`, read over PCIe) or on the GPU (`gpu`); `auto`: `gpu` where 32 GB of GPU memory remain after the weights, else `host`. |
 | `vision` | `disk` \| `host` \| `gpu` \| `auto` | `disk` | Vision encoder weight placement (`disk`: auto-deleted flushed temp file, 0 VRAM & 0 locked host RAM, 3-stage streamed via OS page cache + 16 MiB lazy pinned ring; `host`: pinned host RAM, 0 VRAM; `gpu`: GPU resident; `auto`: `gpu` when >= 8 GB free after weights, else `disk`). |
 | `vision_quant` | `q8` \| `exact` \| `nvfp4` | `q8` | On-the-fly quantization of floating-point vision linears (`q8`: Q8_0, `exact`: file precision, `nvfp4`: NVFP4; pre-quantized GGML blocks stay packed). |

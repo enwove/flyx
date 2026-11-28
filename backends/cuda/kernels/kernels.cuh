@@ -173,6 +173,8 @@ struct KernelOptions {
                               // later, where the device fits it); 1: one block a row.  Same bits
   bool moe_vec = false;       // NVFP4 experts: float32 inputs and column-at-a-time vector kernels at every width,
                               // instead of bf16 inputs on tensor cores (another arithmetic contract, not a tuning)
+  bool moe_mmq = true;        // GGML block experts in prompt passes of more than 16 rows: 64-row tensor-core tiles, one
+                              // float32 sum a K order (0: 16-row tiles with the rounds' 32-stream bits, where dense)
   int warm = kWarmAll;        // rounds: L2 warming on the expert stream, a mask: the next MoE's router (1), loop
                               // controller (2), residual query and norm (4); the next attention's small weights
                               // (16).  0: none.  Same bits

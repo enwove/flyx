@@ -852,6 +852,278 @@ void launch_mma_q8(const ExpertMat& W, int I_or_H, int K, int top_k, float situ_
       sc->n_tasks, sc->pairs, top_k, situ_beta, situ_linear_beta, out, ld_out);
 }
 
+// ---- Prompt passes of more than 16 rows: 64-row tiles (moe_mmq) -------------------------------------------------
+// A task's up to 64 rows of one expert against 8 columns a warp (gate|up: their 8 up columns too, one launch whether
+// it writes SiTU or both raw columns: `fuse`).  Each warp runs
+// the whole K of its columns: a group's weights, decoded once into the MMA's B fragment, meet every 16-row slice of
+// the task, and every output adds its groups in ascending K order into one float32 sum (the 8-bit inputs' own
+// rounding, staged by moe_stage_q8 as for every q8 kernel).  A sum depends on its row, the shape and the K order only,
+// not on the task's other rows, the pass's length or where it starts (numerics classes R and K); it is not the
+// rounds' 32-stream sum, so prompt passes and rounds agree within tolerance.
+constexpr int kMmqRows = kMoeMmqRows, kMmqSlices = kMmqRows / 16, kMmqWarps = 8, kMmqUnits = 8;
+constexpr int kMmqSpanRow = 32 * kMmqUnits + 32;  // 288 bytes: a row step of 8 banks, conflict-free 8-byte A loads
+
+template <class F>
+struct MoeMmqSmem {
+  static constexpr bool MINS = F::kFlatRun != 0;
+  alignas(16) int8_t rows[2][kMmqRows][kMmqSpanRow];
+  float d[2][kMmqRows][kMmqUnits + 1];
+  alignas(8) float sums[MINS ? 2 : 1][MINS ? kMmqRows : 1][2 * kMmqUnits + 2];
+  int pids[kMmqRows];
+  int rids[kMmqRows];
+  typename F::Local local;
+};
+
+template <class F, bool IS_DOWN>
+__global__ void __launch_bounds__(32 * kMmqWarps)
+    k_moe_blocks_q8_mmq(Tables T, const int8_t* __restrict__ q8_a, const float* __restrict__ q8_d,
+                        const float* __restrict__ q8_s, const uint8_t* __restrict__ W,
+                        const uint16_t* __restrict__ D, const float* __restrict__ RS, int N_exp, int I_or_H, int K,
+                        const MoeTask* __restrict__ tasks, const int* __restrict__ n_tasks,
+                        const int* __restrict__ pairs, int top_k, float situ_beta, float situ_linear_beta,
+                        float* __restrict__ out, int ld_out, int fuse) {
+  pdl_trigger();
+  using S = MoeMmqSmem<F>;
+  static constexpr int GROUPS = F::kValues / 32, BPS = kMmqUnits / GROUPS, SUB = F::kSub;
+  static_assert(kMmqUnits % GROUPS == 0, "a span holds whole blocks");
+  static constexpr int THREADS = 32 * kMmqWarps, NP = IS_DOWN ? 1 : 2;
+  static constexpr bool MINS = S::MINS;
+
+  const int task = int(blockIdx.y);
+  if (task >= *n_tasks) return;
+  const MoeTask tk = tasks[task];
+  const int e = tk.expert, nb = tk.nb;
+
+  extern __shared__ __align__(16) unsigned char smem_raw[];
+  auto& sm = *reinterpret_cast<S*>(smem_raw);
+  const int tid = threadIdx.x;
+  if (tid < nb) {
+    const int pid = pairs[tk.p0 + tid];
+    sm.pids[tid] = pid;
+    sm.rids[tid] = IS_DOWN ? pid : (pid / top_k);
+  }
+  F::tables(T, sm.local);
+  __syncthreads();
+
+  const int lane = tid & 31, warp = tid >> 5;
+  const int g = lane >> 2, t4 = lane & 3;
+  const int units = K >> 5, spans = (units + kMmqUnits - 1) / kMmqUnits, blocks = K / F::kValues;
+  const int N_work = IS_DOWN ? N_exp : I_or_H;
+  const int n0 = (int(blockIdx.x) * kMmqWarps + warp) * 8;
+  const bool live = n0 < N_work;
+  const int slices = (nb + 15) >> 4, staged = 16 * slices;
+  const float rs = RS ? RS[e] : 1.f;
+
+  const uint8_t* wn[NP];
+  const uint16_t* dn[NP];
+#pragma unroll
+  for (int p = 0; p < NP; ++p) {
+    const size_t r = size_t(e) * N_exp + min(n0 + g + (p ? I_or_H : 0), N_exp - 1);
+    wn[p] = W + r * blocks * F::kStride;
+    dn[p] = D + r * blocks * F::kScales;
+  }
+
+  auto stage = [&](int j, int buf) {
+    const int n_s = min(kMmqUnits, units - kMmqUnits * j);
+    const int chunks = 2 * n_s;
+    for (int i = tid; i < staged * chunks; i += THREADS) {
+      const int r = i / chunks, c = i - r * chunks;
+      const bool ok = r < nb;
+      const size_t src = ok ? (size_t(sm.rids[r]) * K + size_t(j) * (32 * kMmqUnits) + 16 * c) : 0;
+      cp_async16(&sm.rows[buf][r][16 * c], q8_a + src, ok);
+    }
+    for (int i = tid; i < staged * n_s; i += THREADS) {
+      const int r = i / n_s, c = i - r * n_s;
+      const bool ok = r < nb;
+      const size_t src = ok ? (size_t(sm.rids[r]) * units + kMmqUnits * j + c) : 0;
+      cp_async4(&sm.d[buf][r][c], q8_d + src, ok);
+    }
+    if constexpr (MINS) {
+      for (int i = tid; i < staged * chunks; i += THREADS) {
+        const int r = i / chunks, c = i - r * chunks;
+        const bool ok = r < nb;
+        const size_t src = ok ? ((size_t(sm.rids[r]) * units + kMmqUnits * j) * 2 + c) : 0;
+        cp_async4(&sm.sums[buf][r][c], q8_s + src, ok);
+      }
+    }
+    cp_async_commit();
+  };
+
+  float acc[NP][kMmqSlices][4];
+#pragma unroll
+  for (int p = 0; p < NP; ++p)
+#pragma unroll
+    for (int s = 0; s < kMmqSlices; ++s)
+#pragma unroll
+      for (int e4 = 0; e4 < 4; ++e4) acc[p][s][e4] = 0.f;
+
+  // A projection's first block of span j, loaded a span ahead, as k_moe_blocks_q8_mma's.
+  struct Ahead {
+    typename F::Raw raw;
+    float s0 = 0.f, s1 = 0.f;
+  };
+  Ahead ahead[NP];
+  auto load_ahead = [&](int j) {
+    const int blk = kMmqUnits * j / GROUPS;
+    if (j >= spans || blk >= blocks) return;
+#pragma unroll
+    for (int p = 0; p < NP; ++p) {
+      ahead[p].raw = block_load<F>(wn[p], dn[p], size_t(blk), t4);
+      ahead[p].s0 = scale_of<F>(dn[p], size_t(blk) * F::kScales);
+      ahead[p].s1 = F::kScales > 1 ? scale_of<F>(dn[p], size_t(blk) * F::kScales + 1) : 0.f;
+    }
+  };
+  auto compute = [&](int j, int buf) {
+    const int base_blk = kMmqUnits * j / GROUPS;
+    typename F::Raw cur[NP];
+    float s0[NP], s1[NP];
+#pragma unroll
+    for (int p = 0; p < NP; ++p) {
+      cur[p] = ahead[p].raw;
+      s0[p] = ahead[p].s0;
+      s1[p] = ahead[p].s1;
+    }
+    load_ahead(j + 1);
+#pragma unroll
+    for (int bi = 0; bi < BPS; ++bi) {
+      const int b_idx = base_blk + bi;
+      if (b_idx >= blocks) break;
+      typename F::Lane ln[NP];
+      float sc0[NP], sc1[NP];
+#pragma unroll
+      for (int p = 0; p < NP; ++p) {
+        ln[p] = F::share(cur[p], t4, lane);
+        sc0[p] = s0[p];
+        sc1[p] = s1[p];
+      }
+      if constexpr (BPS > 1) {
+        if (bi + 1 < BPS && b_idx + 1 < blocks) {
+#pragma unroll
+          for (int p = 0; p < NP; ++p) {
+            cur[p] = block_load<F>(wn[p], dn[p], size_t(b_idx + 1), t4);
+            s0[p] = scale_of<F>(dn[p], size_t(b_idx + 1) * F::kScales);
+            s1[p] = F::kScales > 1 ? scale_of<F>(dn[p], size_t(b_idx + 1) * F::kScales + 1) : 0.f;
+          }
+        }
+      }
+#pragma unroll
+      for (int G = 0; G < GROUPS; ++G) {
+        const int ul = bi * GROUPS + G;
+        uint32_t w[NP][2];
+        float fc[NP][2][2], mc[NP][2][2];
+#pragma unroll
+        for (int p = 0; p < NP; ++p) {
+          float f, m;
+          F::codes(T, sm.local, ln[p], G, w[p]);
+          F::factors(ln[p], G, sc0[p], sc1[p], &f, &m);
+#pragma unroll
+          for (int h = 0; h < 32 / SUB; ++h) {
+            const int o = SUB == 16 ? 2 * h : 0;
+            fc[p][0][h] = __shfl_sync(0xffffffffu, f, 8 * t4 + o);
+            fc[p][1][h] = __shfl_sync(0xffffffffu, f, 8 * t4 + 4 + o);
+            if constexpr (MINS) {
+              mc[p][0][h] = __shfl_sync(0xffffffffu, m, 8 * t4 + o);
+              mc[p][1][h] = __shfl_sync(0xffffffffu, m, 8 * t4 + 4 + o);
+            }
+          }
+        }
+#pragma unroll
+        for (int sl = 0; sl < kMmqSlices; ++sl) {
+          if (sl >= slices) break;
+          const int r0 = 16 * sl + g;
+          const uint2 x0 = *reinterpret_cast<const uint2*>(&sm.rows[buf][r0][32 * ul + 8 * t4]);
+          const uint2 x8 = *reinterpret_cast<const uint2*>(&sm.rows[buf][r0 + 8][32 * ul + 8 * t4]);
+          const float dr[2] = {sm.d[buf][r0][ul], sm.d[buf][r0 + 8][ul]};
+          float2 sr[2] = {make_float2(0.f, 0.f), make_float2(0.f, 0.f)};
+          if constexpr (MINS) {
+            sr[0] = *reinterpret_cast<const float2*>(&sm.sums[buf][r0][2 * ul]);
+            sr[1] = *reinterpret_cast<const float2*>(&sm.sums[buf][r0 + 8][2 * ul]);
+          }
+          const uint32_t a[4] = {x0.x, x8.x, x0.y, x8.y};
+#pragma unroll
+          for (int p = 0; p < NP; ++p) {
+            int c0[4], c1[4];
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 860
+            constexpr bool from_zero = SUB == 32;
+#else
+            constexpr bool from_zero = false;
+#endif
+            if constexpr (from_zero) {
+              mma_s8_k32_zero(c0, a, w[p]);
+            } else {
+              c0[0] = c0[1] = c0[2] = c0[3] = kMagicBits;
+              if constexpr (SUB == 32) {
+                mma_s8_k32(c0, a, w[p]);
+              } else {
+                c1[0] = c1[1] = c1[2] = c1[3] = kMagicBits;
+                const uint32_t lo[2] = {t4 < 2 ? w[p][0] : 0u, t4 < 2 ? w[p][1] : 0u};
+                const uint32_t hi[2] = {t4 < 2 ? 0u : w[p][0], t4 < 2 ? 0u : w[p][1]};
+                mma_s8_k32(c0, a, lo);
+                mma_s8_k32(c1, a, hi);
+              }
+            }
+#pragma unroll
+            for (int e4 = 0; e4 < 4; ++e4) {
+              const int h = e4 >> 1, c = e4 & 1;
+              float& v = acc[p][sl][e4];
+              const float s0f = from_zero ? __int2float_rn(c0[e4]) : (__int_as_float(c0[e4]) - kMagic);
+              v = fmaf(s0f, dr[h] * fc[p][c][0], v);
+              if constexpr (MINS) v = fmaf(SUB == 16 ? sr[h].x : (sr[h].x + sr[h].y), mc[p][c][0], v);
+              if constexpr (SUB == 16) {
+                v = fmaf(__int_as_float(c1[e4]) - kMagic, dr[h] * fc[p][c][1], v);
+                if constexpr (MINS) v = fmaf(sr[h].y, mc[p][c][1], v);
+              }
+            }
+          }
+        }
+      }
+    }
+  };
+
+  if (live) load_ahead(0);
+  stage(0, 0);
+  for (int j = 0; j < spans; ++j) {
+    cp_async_wait<0>();
+    __syncthreads();
+    if (j + 1 < spans) stage(j + 1, (j + 1) & 1);
+    if (live) compute(j, j & 1);
+  }
+  if (!live) return;
+#pragma unroll
+  for (int sl = 0; sl < kMmqSlices; ++sl) {
+    if (sl >= slices) break;
+#pragma unroll
+    for (int e4 = 0; e4 < 4; ++e4) {
+      const int r = 16 * sl + g + 8 * (e4 >> 1), col = n0 + 2 * t4 + (e4 & 1);
+      if (r >= nb || col >= N_work) continue;
+      float* o = out + size_t(sm.pids[r]) * ld_out;
+      const float v = acc[0][sl][e4] * rs;
+      if constexpr (IS_DOWN) {
+        o[col] = v;
+      } else if (fuse) {
+        o[col] = moe_situ(v, acc[NP - 1][sl][e4] * rs, situ_beta, situ_linear_beta);
+      } else {
+        o[col] = v;
+        o[col + I_or_H] = acc[NP - 1][sl][e4] * rs;
+      }
+    }
+  }
+}
+
+// fuse (gate|up): SiTU of the pair into `out`, else the raw gate and up columns (I_or_H apart).
+template <class F, bool IS_DOWN>
+void launch_mmq_q8(const ExpertMat& W, int I_or_H, int K, int top_k, float situ_beta, float situ_linear_beta,
+                   float* out, int ld_out, const MoeScratch* sc, int max_tiles, bool fuse, cudaStream_t st) {
+  constexpr size_t smem = sizeof(MoeMmqSmem<F>);
+  static const bool ready = set_dynamic_smem(k_moe_blocks_q8_mmq<F, IS_DOWN>, smem);
+  (void)ready;
+  const int N_work = IS_DOWN ? W.N : I_or_H;
+  const dim3 grid(ceil_div(N_work, 8 * kMmqWarps), max_tiles);
+  k_moe_blocks_q8_mmq<F, IS_DOWN><<<grid, 32 * kMmqWarps, smem, st>>>(
+      block_tables(), sc->q8_a, sc->q8_d, sc->q8_s, W.blk.data, W.blk.scales, W.rs, W.N, I_or_H, K, sc->tasks,
+      sc->n_tasks, sc->pairs, top_k, situ_beta, situ_linear_beta, out, ld_out, int(fuse));
+}
+
 // A moe_dp4a configuration's tile: C output columns a warp (gate/up pairs fused), U units a lane has in flight; 0 and
 // 0, the original tiles: one pair a warp fused, two columns otherwise, the original prefetch depth and grouped loop.
 template <int CFG, int C, int U>
@@ -905,15 +1177,17 @@ void launch_dp4a_q8(int cfg, const Tables& T, const ExpertMat& W, int I_or_H, in
 template <class F>
 void moe_blocks_gu(const float* x, int ldx, const ExpertMat& W, const int* eidx, int rows, int top_k, int I, int K,
                    float situ_beta, float situ_linear_beta, bool fuse_act, float* out, int ld_out,
-                   const MoeScratch* sc, int max_tiles, bool use_mma, int dp4a, cudaStream_t st, bf16* act_bf16) {
+                   const MoeScratch* sc, int max_tiles, int mma, int dp4a, cudaStream_t st, bf16* act_bf16) {
   const Tables T = block_tables();
   const int N_work = fuse_act ? I : 2 * I;
   const bool has_q8 = W.blk.q8 && sc && sc->q8_a && sc->stage_elems >= size_t(rows) * size_t(K);
   // Only the dp4a kernels that apply the activation write it in bf16: a round's, which moe_round_q8 promises.
-  if (act_bf16 && !(fuse_act && has_q8 && !use_mma && (rows == 1 || (sc->tasks && max_tiles > 0))))
+  if (act_bf16 && !(fuse_act && has_q8 && !mma && (rows == 1 || (sc->tasks && max_tiles > 0))))
     throw std::runtime_error("moe_gate_up: bf16 activations asked of a kernel that writes float32");
   if (has_q8 && (rows == 1 || (sc->tasks && max_tiles > 0))) {
-    if (rows > 1 && use_mma) {
+    if (rows > 1 && mma == kMmqRows) {
+      launch_mmq_q8<F, false>(W, I, K, top_k, situ_beta, situ_linear_beta, out, ld_out, sc, max_tiles, fuse_act, st);
+    } else if (rows > 1 && mma) {
       if (fuse_act)
         launch_mma_q8<F, true, false>(W, I, K, top_k, situ_beta, situ_linear_beta, out, ld_out, sc, max_tiles, st);
       else
@@ -960,12 +1234,14 @@ void moe_blocks_gu(const float* x, int ldx, const ExpertMat& W, const int* eidx,
 template <class F>
 bool moe_blocks_down(const float* act, int ld_act, const ExpertMat& W, const int* eidx, const float* ew, int rows,
                      int top_k, int H, int K, float* out, int ld_out, bool accumulate, const MoeScratch* sc,
-                     int max_tiles, bool use_mma, int dp4a, cudaStream_t st) {
+                     int max_tiles, int mma, int dp4a, cudaStream_t st) {
   const Tables T = block_tables();
   const bool has_q8 =
       W.blk.q8 && sc && sc->q8_a && sc->down_buf && sc->stage_elems >= size_t(rows) * size_t(top_k) * size_t(K);
   if (has_q8 && (rows == 1 || (sc->tasks && max_tiles > 0))) {
-    if (rows > 1 && use_mma) {
+    if (rows > 1 && mma == kMmqRows) {
+      launch_mmq_q8<F, true>(W, H, K, top_k, 0.f, 0.f, sc->down_buf, H, sc, max_tiles, false, st);
+    } else if (rows > 1 && mma) {
       launch_mma_q8<F, false, true>(W, H, K, top_k, 0.f, 0.f, sc->down_buf, H, sc, max_tiles, st);
     } else {
       launch_dp4a_q8<F, false, true>(dp4a, T, W, H, K, eidx, rows, top_k, 0.f, 0.f, sc->down_buf, H, sc, max_tiles,
