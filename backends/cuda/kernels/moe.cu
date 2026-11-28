@@ -1360,16 +1360,16 @@ __device__ __forceinline__ void saturating_add(uint32_t* count, uint32_t n) {
   }
 }
 
-// A block counts its pairs' experts in shared memory and adds each expert's count once: a prompt pass's thousands of
-// pairs on a few hot experts no longer retry compare-and-swap on the same global words (0.22 ms a layer visit of
-// 1,024 rows on Inkling-2, 5070 Ti).  The counts are the same.
-constexpr int kPlaceThreads = 256, kPlacePairs = 2048, kPlaceSharedExperts = 4096;
+// A prompt pass's block counts its pairs' experts in shared memory and adds each expert's count once: its thousands
+// of pairs on a few hot experts no longer retry compare-and-swap on the same global words (0.22 ms a layer visit of
+// 1,024 rows on Inkling-2, 5070 Ti).  A round's few pairs (more than kPlaceSharedPerExpert an expert on average: not)
+// keep the direct increments, without the block's clearing and barriers.  The counts are the same either way.
+constexpr int kPlaceThreads = 256, kPlacePairs = 2048, kPlaceSharedExperts = 4096, kPlaceSharedPerExpert = 4;
 __global__ void __launch_bounds__(kPlaceThreads)
     k_moe_place_ids(int* ids, int pairs, int experts, const int* slots, uint32_t* counts, int* invalid,
-                    ResidentRoutes resident) {
+                    ResidentRoutes resident, bool local) {
   extern __shared__ uint32_t s_counts[];
   const int i = blockIdx.x * blockDim.x + threadIdx.x;
-  const bool local = counts && experts <= kPlaceSharedExperts;
   if (local) {
     for (int e = threadIdx.x; e < experts; e += blockDim.x) s_counts[e] = 0;
     __syncthreads();
@@ -1411,8 +1411,9 @@ __global__ void __launch_bounds__(kPlaceThreads)
 void moe_place_ids(int* ids, int pairs, int experts, const int* slots, uint32_t* counts, int* invalid, cudaStream_t st,
                    ResidentRoutes resident) {
   const int blocks = resident.ticket ? 1 : std::max(1, ceil_div(pairs, kPlacePairs));
-  const size_t smem = counts && experts <= kPlaceSharedExperts ? size_t(experts) * sizeof(uint32_t) : 0;
-  k_moe_place_ids<<<blocks, kPlaceThreads, smem, st>>>(ids, pairs, experts, slots, counts, invalid, resident);
+  const bool local = counts && experts <= kPlaceSharedExperts && pairs > kPlaceSharedPerExpert * experts;
+  const size_t smem = local ? size_t(experts) * sizeof(uint32_t) : 0;
+  k_moe_place_ids<<<blocks, kPlaceThreads, smem, st>>>(ids, pairs, experts, slots, counts, invalid, resident, local);
 }
 
 __global__ void k_moe_resident_ids(const int* ids, int* safe, int pairs, int hot) {

@@ -1834,6 +1834,27 @@ void test_inkling2_moe() {
     CK(cudaMemcpy(counts.data(), histogram, counts.size() * sizeof(uint32_t), cudaMemcpyDeviceToHost));
     if (!flag || actual != std::vector<int>({0, 0, 3, 2, 2, 4}) || counts != std::vector<uint32_t>(6, UINT32_MAX))
       throw std::runtime_error("invalid expert ID or histogram saturation");
+    {
+      // A prompt pass's many pairs (shared-memory counts over several blocks): the same counts, saturating where a
+      // count starts near UINT_MAX, and the same permuted IDs.
+      const int many = 5000;
+      std::vector<int> routes(many), want_ids(many);
+      std::vector<uint32_t> start{0, 7, UINT32_MAX - 3, 0, UINT32_MAX, 1}, want = start;
+      for (int p = 0; p < many; ++p) {
+        routes[size_t(p)] = (p * 7 + p / 11) % 6;
+        want_ids[size_t(p)] = permutation[size_t(routes[size_t(p)])];
+        uint32_t& w = want[size_t(routes[size_t(p)])];
+        if (w != UINT32_MAX) ++w;
+      }
+      int* pass = dev<int>(many);
+      CK(cudaMemcpy(pass, routes.data(), routes.size() * sizeof(int), cudaMemcpyHostToDevice));
+      CK(cudaMemcpy(histogram, start.data(), start.size() * sizeof(uint32_t), cudaMemcpyHostToDevice));
+      moe_place_ids(pass, many, int(permutation.size()), slots, histogram, nullptr, 0);
+      std::vector<uint32_t> got(start.size());
+      CK(cudaMemcpy(got.data(), histogram, got.size() * sizeof(uint32_t), cudaMemcpyDeviceToHost));
+      if (got != want || down_i(pass, many) != want_ids) throw std::runtime_error("prompt pass expert histogram");
+      cudaFree(pass);
+    }
     cudaFree(invalid);
     cudaFree(slots);
     cudaFree(histogram);
