@@ -174,7 +174,8 @@ export default {
     "Choose a model first.": "请先选择一个模型。", "The repository has several files: pick one.": "这个仓库有多个文件，请选一个。",
     "Started: progress shows above.": "已开始，进度显示在上方。", "The server does not answer.": "服务器没有响应。",
     "serving": "服务中", "last loaded": "上次加载", "MTP inside": "自带 MTP", "+ MTP file": "+ MTP 文件", "older revision": "旧版本",
-    "fits": "放得下", "too big": "放不下", "Drafters": "Drafters", "folder": "文件夹", "Nothing matches.": "没有匹配的结果。",
+    "The server has not said how much GPU memory a model may take.": "服务器尚未给出模型可用的显存。",
+    "fits": "放得下", "file fits": "文件放得下", "file too big": "文件放不下", "Drafters": "Drafters", "folder": "文件夹", "Nothing matches.": "没有匹配的结果。",
     "Nothing downloaded yet. Fetch a model from Hugging Face, or give a path.": "还没有下载任何模型。从 Hugging Face 下载一个，或者填写路径。",
     "Add to settings": "加入设置",
     // model page: the status bar, the places models come from, the box that loads

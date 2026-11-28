@@ -91,34 +91,30 @@ function draftersOf(L) {
   return out;
 }
 
-// The memory a new model may use: the GPU's, less what other programs hold (flyx's own model goes when it switches).
-let gpuTotal = Number(saved.get("gpu_total")) || 0;
-function deviceReserve(total, m) {
-  if (m && typeof m.device_reserve === "number" && m.device_reserve >= 0) return m.device_reserve;
-  return Math.max(384 * 1048576, total / 40);
-}
-function freeForModel() {
+// The GPU memory a model may take, as the server's planner counts it (telemetry, docs/monitor.md): with a model loaded
+// its budget (memory.ledger_budget: other programs and the reserve already out, flyx's own model going when it
+// switches), else the device's free memory less the planner's reserve (memory.device_reserve).  null when the server
+// does not say; the page computes no reserve of its own.
+function modelBudget() {
   const d = live.last && live.last.device, m = live.last && live.last.memory;
-  if (!d || !d.mem_total) return gpuTotal || 0;
-  // When a model is loaded, ledger_budget is the engine's real VRAM ceiling (already excluding other programs and the
-  // device reserve, without miscounting flyx's own CUDA context / driver pool as other programs).
-  if (m && m.ledger_budget) return Math.min(d.mem_total, m.ledger_budget + deviceReserve(d.mem_total, m));
-  return Math.max(0, d.mem_total - (d.mem_used || 0));
+  if (m && m.ledger_budget) return { budget: m.ledger_budget, reserve: m.device_reserve };
+  if (!d || !d.mem_total || !m || typeof m.device_reserve !== "number") return null;
+  return { budget: Math.max(0, d.mem_total - (d.mem_used || 0) - m.device_reserve), reserve: m.device_reserve };
 }
-function FitTag({ size }) {
-  const d = live.last && live.last.device, m = live.last && live.last.memory;
-  const room = freeForModel();
-  if (!room || !size) return html`<span class="tag2">?</span>`;
-  // Untied embeddings (~4% on 27B) stay in host RAM; ~0.85 GB covers workspace and one minimal session beyond reserve.
-  const res = deviceReserve(d && d.mem_total ? d.mem_total : room, m);
-  const budget = m && m.ledger_budget ? m.ledger_budget : Math.max(0, room - res);
-  const estWeights = size * 0.96;
-  const fits = estWeights + 0.85e9 < budget;
-  const budgetTxt = budget ? gib(budget) : "0.0";
-  const resTxt = res ? gib(res) : "0.0";
-  const title = "Estimate: " + gb(estWeights) + " GB of weights + 0.85 GB workspace/session against " + budgetTxt +
-                " GiB available VRAM budget (after " + resTxt + " GiB reserve). Long contexts need more; the engine's bill shows once it loads.";
-  return html`<span class=${"tag2 " + (fits ? "ok" : "bad")} title=${t(title)}>${t(fits ? "fits" : "too big")}</span>`;
+// Whether a model fits the GPU.  The one served: by the engine's own bill.  Any other: only its file is known here
+// (no layout, context, drafter or projector), so the tag says it compares the file's size with the budget, nothing
+// more; the engine sizes the rest as it loads and says what it gave up.
+function FitTag({ size, serving }) {
+  const m = live.last && live.last.memory;
+  if (serving && m && m.ledger_budget && m.ledger_used)
+    return html`<span class="tag2 ok" title=${t("Loaded: " + gib(m.ledger_used) + " of " + gib(m.ledger_budget) + " GiB")}>${t("fits")}</span>`;
+  const room = modelBudget();
+  if (!room || !size) return html`<span class="tag2" title=${t("The server has not said how much GPU memory a model may take.")}>?</span>`;
+  const fits = size <= room.budget;
+  const title = "The file alone: " + gb(size) + " GB against " + gib(room.budget) + " GiB of GPU memory for a model" +
+                (typeof room.reserve === "number" ? " (after a " + gib(room.reserve) + " GiB reserve)" : "") +
+                ". Its context, drafter and projector need more, its embedding can stay in host memory; the engine sizes them as it loads.";
+  return html`<span class=${"tag2 " + (fits ? "ok" : "bad")} title=${title}>${t(fits ? "file fits" : "file too big")}</span>`;
 }
 
 const kDrafterLabels = { mtp: "MTP", dflash2: "DFlash2", dflash: "DFlash", dspark: "DSpark", dspine: "DSpine", eagle4: "EAGLE-4", dv: "DV" };
@@ -727,10 +723,6 @@ export function ModelPage({ active, libraryAsked, currentAsked }) {
 
   useEffect(() => { if (active) refreshCached(); }, [active]);
   useEffect(() => {
-    if (tm.device && tm.device.mem_total && tm.device.mem_total !== gpuTotal) {
-      gpuTotal = tm.device.mem_total;
-      saved.set("gpu_total", String(gpuTotal));
-    }
     // Decided on the first answer this draw was made from: `model` is that draw's, and telemetry may have come since.
     if (!viewed.current && "model" in tm) {
       viewed.current = true;
@@ -1207,7 +1199,7 @@ export function ModelPage({ active, libraryAsked, currentAsked }) {
           ${r.tags.map(([text, tone]) => html`<span class=${"tag2 " + (tone || "")}>${t(text)}</span>`)}
         </div>
         <div class="sz">${r.size ? sized(r.size) : "-"}</div>
-        <div class="fit">${r.off ? "" : html`<${FitTag} size=${r.size}/>`}</div>
+        <div class="fit">${r.off ? "" : html`<${FitTag} size=${r.size} serving=${Boolean(serving && r.name === serving)}/>`}</div>
         ${r.del ? html`<button class="iconbtn del" title=${t("Delete from the Hugging Face cache")} aria-label=${t("Delete")}
                                onClick=${(e) => { e.stopPropagation(); removeCached(r.del); }}><${Icon} name="trash"/></button>` : html`<span></span>`}
       </div>`);
@@ -1618,7 +1610,7 @@ export function ModelPage({ active, libraryAsked, currentAsked }) {
           ${hubModel && d.repo && (standalone(m) || (drafter && d.quant)) ? html`<button class="btn ghost sm" id="lc-quants" onClick=${() => openHubRepo(d.repo, pinnedRev)}>${t("All its quantizations")}</button>` : ""}
           ${hubModel ? html`<button class="btn ghost sm" id="lc-delete" onClick=${() => removeCached(m)}><${Icon} name="trash"/>${t("Delete")}</button>` : ""}
         </div>
-        <div class="dchips">${chips.map(([text, tone]) => html`<span class=${"tag2 " + tone}>${text}</span>`)}${standalone(m) ? html`<${FitTag} size=${m.size}/>` : ""}</div>
+        <div class="dchips">${chips.map(([text, tone]) => html`<span class=${"tag2 " + tone}>${text}</span>`)}${standalone(m) ? html`<${FitTag} size=${m.size} serving=${Boolean(loadedWant && m.name === loadedWant.model)}/>` : ""}</div>
         <dl class="stats small">
           <div><dt>${t("Size")}</dt><dd>${m.size ? sized(m.size) : "-"}</dd></div>
           ${m.modified ? html`<div><dt>${t("Modified")}</dt><dd>${t(ago(m.modified))}</dd></div>` : ""}
