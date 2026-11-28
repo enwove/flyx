@@ -95,8 +95,9 @@ class HarmonyParser final : public interfaces::OutputParser {
       if (mode_ == kHeader) {
         const size_t m = buf_.find(kMessage);
         if (m == std::string::npos) {
-          if (final) {  // never a message: a reply not in harmony, as text (its control tokens left out)
-            std::string text = header_ + buf_;
+          if (final) {  // never a message: a reply not in harmony, as text (its control tokens left out); after
+                        // one, a header the reply was cut short in, left out
+            std::string text = messages_ > 0 ? std::string() : header_ + buf_;
             for (std::string_view t : {kStart, kChannel, kConstrain, kEnd, kReturn, kCall})
               for (size_t at; (at = text.find(t)) != std::string::npos;) text.erase(at, t.size());
             push(ev, OutputEvent::kContent, text);
@@ -107,6 +108,7 @@ class HarmonyParser final : public interfaces::OutputParser {
         }
         header_.append(buf_, 0, m);
         buf_.erase(0, m + kMessage.size());
+        ++messages_;
         const std::string channel = word_after(header_, kChannel), to = word_after(header_, "to=");
         if (to.rfind(kFunctions, 0) == 0 && tools_ && !tools_->empty()) {
           mode_ = kTool;
@@ -139,6 +141,7 @@ class HarmonyParser final : public interfaces::OutputParser {
   std::string buf_, header_, call_, tool_;
   Mode mode_ = kHeader;  // the generation prompt ends "<|start|>assistant": the reply's first message's header
   int n_calls_ = 0;
+  int messages_ = 0;  // headers read
 };
 
 }  // namespace

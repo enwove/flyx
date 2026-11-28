@@ -597,6 +597,52 @@ void test_inkling2_loop_control() {
   test_compact_loop_control();
 }
 
+// linear_f32_pass (prefill passes of a matrix of 64 outputs or fewer) against ops::linear: gpt-oss-20b's router, a
+// sink's shape, sizes off its 8-element chunks; a row the same bits in passes of any length and start (numerics.md K:
+// either side of 384 rows, where the pass once changed kernels, and of its 2-, 8- and 32-row blocks), the matrix in 16
+// or 32 bits, accumulation.
+void test_linear_f32_pass() {
+  std::printf("linear_f32_pass\n");
+  struct Shape {
+    int N, K, R;
+  };
+  for (const Shape sh : {Shape{32, 2880, 5000}, Shape{24, 2304, 700}, Shape{37, 101, 300}, Shape{4, 64, 40}}) {
+    const int N = sh.N, K = sh.K, R = sh.R;
+    seed("linear_f32_pass", N, K, R);
+    const std::string at = " " + std::to_string(N) + "x" + std::to_string(K);
+    const auto x = randf(size_t(R) * K, 1.0);
+    const Vec x32(x.begin(), x.end());
+    ExactTestMatrix w(N, K, 0.2);
+    Vec want(size_t(R) * N);
+    ops::linear(x32.data(), R, K, &w.view, N, want.data());
+    float* dx = up_f(x);
+    float* all = dev<float>(want.size());
+    float* part = dev<float>(want.size());
+    linear_f32_pass(dx, K, {w.full}, N, K, all, N, R, false, 0);
+    expect("linear_f32_pass" + at + " rows " + std::to_string(R), down(all, want.size()), want, 2e-5);
+    linear_f32_pass(dx, K, {nullptr, w.compact}, N, K, part, N, R, false, 0);
+    expect_device_bits("linear_f32_pass" + at + ", the matrix in 16 bits: the same bits", part, all, want.size());
+    for (int from : {0, 7, 300}) {
+      for (int rows : {17, 383, 385, 513, 4097}) {
+        if (from + rows > R) continue;
+        linear_f32_pass(dx + size_t(from) * K, K, {w.full}, N, K, part, N, rows, false, 0);
+        expect_device_bits("linear_f32_pass" + at + ": rows " + std::to_string(from) + ".." +
+                               std::to_string(from + rows) + " as a pass of their own",
+                           part, all + size_t(from) * N, size_t(rows) * N);
+      }
+    }
+    CK(cudaMemcpy(part, all, want.size() * sizeof(float), cudaMemcpyDeviceToDevice));
+    linear_f32_pass(dx, K, {w.full}, N, K, part, N, R, true, 0);  // y = y + y
+    const Vec once = down(all, want.size()), twice = down(part, want.size());
+    Vec want2(once.size());
+    for (size_t i = 0; i < once.size(); ++i) want2[i] = double(float(once[i]) + float(once[i]));
+    expect_bits("linear_f32_pass accumulate" + at, twice, want2);
+    cudaFree(dx);
+    cudaFree(all);
+    cudaFree(part);
+  }
+}
+
 // linear_f32 against ops::linear on a float32 matrix: a router's and a sink's shapes of the real model, sizes that
 // fill no warp, accumulation, and a row alone against the same row among others.
 void test_inkling2_linear_f32() {

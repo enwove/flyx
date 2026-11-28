@@ -1382,9 +1382,11 @@ int moe_gate_up(const float* x, int ldx, const ExpertMat& W, const int* eidx, in
     throw std::runtime_error("moe_gate_up: pre-staged input and BF16 output require a staged Q8 round");
   if (act_bf16 && (!fuse_act || ld_out != I))
     throw std::runtime_error("moe_gate_up: BF16 output requires contiguous fused activations");
-  // MXFP4 experts with MXFP8 inputs (every pass, or passes of more than FLYX_MAX_ROWS rows): sm_120a's block-scaled
-  // tensor cores
-  if (W.packed() && (W.blk.mxfp8 || (W.blk.mxfp8_q8 && rows > FLYX_MAX_ROWS))) {
+  // A prefill pass of more than FLYX_MAX_ROWS rows; a round of any width (Launch::round_rows: a wide lookup round's
+  // 17..64 rows too) takes a round's kernels and inputs, every row a 1..16-row round's bits
+  const bool pass = rows > FLYX_MAX_ROWS && !L.round_rows;
+  // MXFP4 experts with MXFP8 inputs (every pass, or prefill passes alone): sm_120a's block-scaled tensor cores
+  if (W.packed() && (W.blk.mxfp8 || (W.blk.mxfp8_q8 && pass))) {
     if (W.blk.dtype != FLYX_DT_GGML_MXFP4 || !sc || !sc->tasks || !sc->pairs || !sc->q8_a || !sc->q8_d ||
         W.n_experts > sc->max_experts || top_k > sc->max_top_k)
       throw std::runtime_error("moe_gate_up: MXFP8 inputs on MXFP4 experts with the MoE scratch alone");
@@ -1392,16 +1394,21 @@ int moe_gate_up(const float* x, int ldx, const ExpertMat& W, const int* eidx, in
     int grouped = 0;
     for (int r0 = 0; r0 < rows; r0 += chunk) {
       const int rc = std::min(chunk, rows - r0), M = rc * top_k;
-      if (sc->stage_elems < size_t(rc) * size_t(K)) throw std::runtime_error("moe_gate_up: MXFP8 rows past the scratch");
+      if (sc->stage_elems < size_t(rc) * size_t(K))
+        throw std::runtime_error("moe_gate_up: MXFP8 rows past the scratch");
       auto* xa = reinterpret_cast<uint8_t*>(sc->q8_a);
       auto* xs = reinterpret_cast<uint8_t*>(sc->q8_d);
       launch_dependent(k_moe_stage_mxfp8, dim3(rc), dim3(256), L, x + size_t(r0) * ldx, ldx, K, xa, xs);
       const int* ec = eidx + size_t(r0) * top_k;
-      const int bm = moe_mxfp4_bm(M, W.n_experts);
+      // a prefill pass the pass kernels (one sum an output in K's order, any tile), a round the K-split ones
+      const int bm = pass ? moe_mxfp4_mxfp8_pass_rows(M, W.n_experts) : moe_mxfp4_bm(M, W.n_experts);
       group_tasks(ec, M, W.n_experts, bm, sc, st);
       grouped = rc == rows ? bm : 0;
-      moe_mxfp4_mxfp8_mma(fuse_act, false, bm, xa, xs, W, N_work, I, K, *sc, max_work_tiles(M, W.n_experts, bm), top_k,
-                    mact, out + size_t(r0) * top_k * ld_out, ld_out, L);
+      float* oc = out + size_t(r0) * top_k * ld_out;
+      const int mt = max_work_tiles(M, W.n_experts, bm);
+      if (pass)
+        moe_mxfp4_mxfp8_pass(fuse_act, false, bm, xa, xs, W, N_work, I, K, *sc, mt, top_k, mact, oc, ld_out, L);
+      else moe_mxfp4_mxfp8_mma(fuse_act, false, bm, xa, xs, W, N_work, I, K, *sc, mt, top_k, mact, oc, ld_out, L);
     }
     return grouped;
   }
@@ -1414,12 +1421,16 @@ int moe_gate_up(const float* x, int ldx, const ExpertMat& W, const int* eidx, in
     for (int r0 = 0; r0 < rows; r0 += chunk) {
       const int rc = std::min(chunk, rows - r0), M = rc * top_k;
       if (sc->stage_elems < size_t(rc) * size_t(K)) throw std::runtime_error("moe_gate_up: bf16 rows past the scratch");
-      const int bm = moe_mxfp4_bm(M, W.n_experts);
+      // a prefill pass the pass kernels (one sum an output in K's order, any tile), a round the K-split ones
+      const int bm = pass ? moe_mxfp4_bf16_pass_rows(M, W.n_experts) : moe_mxfp4_bm(M, W.n_experts);
       moe_mxfp4_bf16_stage(x + size_t(r0) * ldx, ldx, K, rc, sc->bf16_a, L);
       group_tasks(eidx + size_t(r0) * top_k, M, W.n_experts, bm, sc, st);
       grouped = rc == rows ? bm : 0;
-      moe_mxfp4_bf16_mma(fuse_act, false, bm, sc->bf16_a, W, N_work, I, K, *sc, max_work_tiles(M, W.n_experts, bm),
-                         top_k, mact, out + size_t(r0) * top_k * ld_out, ld_out, L);
+      float* oc = out + size_t(r0) * top_k * ld_out;
+      const int mt = max_work_tiles(M, W.n_experts, bm);
+      if (pass)
+        moe_mxfp4_bf16_pass(fuse_act, false, bm, sc->bf16_a, W, N_work, I, K, *sc, mt, top_k, mact, oc, ld_out, L);
+      else moe_mxfp4_bf16_mma(fuse_act, false, bm, sc->bf16_a, W, N_work, I, K, *sc, mt, top_k, mact, oc, ld_out, L);
     }
     return grouped;
   }
@@ -1499,7 +1510,8 @@ void moe_down(const float* act, int ld_act, const ExpertMat& W, const int* eidx,
   cudaStream_t st = L.st;
   if (act_bf16 && !moe_round_bf16_down(W, rows, top_k, K, sc, L))
     throw std::runtime_error("moe_down: pre-staged BF16 input requires an NVFP4 round");
-  if (W.packed() && (W.blk.mxfp8 || (W.blk.mxfp8_q8 && rows > FLYX_MAX_ROWS))) {  // MXFP8 inputs (moe_gate_up)
+  const bool pass = rows > FLYX_MAX_ROWS && !L.round_rows;  // as moe_gate_up
+  if (W.packed() && (W.blk.mxfp8 || (W.blk.mxfp8_q8 && pass))) {  // MXFP8 inputs (moe_gate_up)
     const bool has_down = sc && sc->down_buf && sc->tasks && sc->pairs && sc->q8_a && sc->q8_d &&
                           W.n_experts <= sc->max_experts && top_k <= sc->max_top_k;
     if (W.blk.dtype != FLYX_DT_GGML_MXFP4 || !has_down)
@@ -1512,10 +1524,11 @@ void moe_down(const float* act, int ld_act, const ExpertMat& W, const int* eidx,
       auto* xa = reinterpret_cast<uint8_t*>(sc->q8_a);
       auto* xs = reinterpret_cast<uint8_t*>(sc->q8_d);
       launch_dependent(k_moe_stage_mxfp8, dim3(M), dim3(256), L, act + size_t(r0) * top_k * ld_act, ld_act, K, xa, xs);
-      const int bm = moe_mxfp4_bm(M, W.n_experts);
+      const int bm = pass ? moe_mxfp4_mxfp8_pass_rows(M, W.n_experts) : moe_mxfp4_bm(M, W.n_experts);
       if (rc != rows || !tiles_serve(grouped, bm, rc)) group_tasks(ec, M, W.n_experts, bm, sc, st);
-      moe_mxfp4_mxfp8_mma(false, true, bm, xa, xs, W, H, H, K, *sc, max_work_tiles(M, W.n_experts, bm), top_k, MoeAct{},
-                    sc->down_buf, H, L);
+      const int mt = max_work_tiles(M, W.n_experts, bm);
+      if (pass) moe_mxfp4_mxfp8_pass(false, true, bm, xa, xs, W, H, H, K, *sc, mt, top_k, MoeAct{}, sc->down_buf, H, L);
+      else moe_mxfp4_mxfp8_mma(false, true, bm, xa, xs, W, H, H, K, *sc, mt, top_k, MoeAct{}, sc->down_buf, H, L);
       k_moe_weighted_sum<<<dim3(ceil_div(H, 256), rc), 256, 0, st>>>(sc->down_buf, ew + size_t(r0) * top_k, top_k, H,
                                                                      out + size_t(r0) * ld_out, ld_out,
                                                                      int(accumulate), ec, bias);
@@ -1532,11 +1545,13 @@ void moe_down(const float* act, int ld_act, const ExpertMat& W, const int* eidx,
       const int rc = std::min(chunk, rows - r0), M = rc * top_k;
       if (sc->stage_elems < size_t(M) * size_t(K)) throw std::runtime_error("moe_down: bf16 rows past the scratch");
       const int* ec = eidx + size_t(r0) * top_k;
-      const int bm = moe_mxfp4_bm(M, W.n_experts);
+      const int bm = pass ? moe_mxfp4_bf16_pass_rows(M, W.n_experts) : moe_mxfp4_bm(M, W.n_experts);
       moe_mxfp4_bf16_stage(act + size_t(r0) * top_k * ld_act, ld_act, K, M, sc->bf16_a, L);
       if (rc != rows || !tiles_serve(grouped, bm, rc)) group_tasks(ec, M, W.n_experts, bm, sc, st);
-      moe_mxfp4_bf16_mma(false, true, bm, sc->bf16_a, W, H, H, K, *sc, max_work_tiles(M, W.n_experts, bm), top_k,
-                     MoeAct{}, sc->down_buf, H, L);
+      const int mt = max_work_tiles(M, W.n_experts, bm);
+      if (pass)
+        moe_mxfp4_bf16_pass(false, true, bm, sc->bf16_a, W, H, H, K, *sc, mt, top_k, MoeAct{}, sc->down_buf, H, L);
+      else moe_mxfp4_bf16_mma(false, true, bm, sc->bf16_a, W, H, H, K, *sc, mt, top_k, MoeAct{}, sc->down_buf, H, L);
       k_moe_weighted_sum<<<dim3(ceil_div(H, 256), rc), 256, 0, st>>>(sc->down_buf, ew + size_t(r0) * top_k, top_k, H,
                                                                      out + size_t(r0) * ld_out, ld_out,
                                                                      int(accumulate), ec, bias);

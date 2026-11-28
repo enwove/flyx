@@ -1798,6 +1798,10 @@ void loop_control(const LoopGate* g, int n, int rows, int H, int rank, float* sc
 // row has the same bits whatever rows run with it.
 void linear_f32(const float* x, int ldx, RoundWeight W, int N, int K, float* y, int ldy, int rows, bool accumulate,
                 cudaStream_t st);
+// A prefill pass's float32 linear (N <= 64 outputs: routers, sinks, dynamic taps): ops::linear on W as linear_f32
+// reads it, a row's bits the same in a pass of any length (numerics.md K), not linear_f32's.
+void linear_f32_pass(const float* x, int ldx, RoundWeight W, int N, int K, float* y, int ldy, int rows, bool accumulate,
+                     cudaStream_t st);
 
 // Causal depthwise short convolution with residual scaling and optional per-head dynamic taps (ops/shortconv/ref.h).
 // win: [FLYX_ROUND_SLOTS][conv - 1][ch_total]; replay (rounds): [kGdnReplaySlots][replay_rows][ch_total].
@@ -1990,8 +1994,14 @@ int moe_gate_up(const float* x, int ldx, const ExpertMat& W, const int* eidx, in
 // [rows][K/32]): is_down the down projection (to sc's down_buf), else gate | up, fuse_act its activation.
 bool moe_mxfp4_mxfp8_supported();
 void moe_mxfp4_mxfp8_mma(bool fuse_act, bool is_down, int bm, const uint8_t* xa, const uint8_t* xs, const ExpertMat& W,
-                   int N_work, int I_or_H, int K, const MoeScratch& sc, int max_tiles, int top_k, MoeAct mact,
-                   float* out, int ld_out, const Launch& L);
+                         int N_work, int I_or_H, int K, const MoeScratch& sc, int max_tiles, int top_k, MoeAct mact,
+                         float* out, int ld_out, const Launch& L);
+// The same products for a prefill pass (more than FLYX_MAX_ROWS rows): one float32 sum an output in K's order, every
+// tile shape the same bits (within float32 sums of the rounds' kernel above); the rows a task by the rows an expert
+// has (moe_mxfp4_mxfp8_pass_rows), the tasks grouped so.
+void moe_mxfp4_mxfp8_pass(bool fuse_act, bool is_down, int tok, const uint8_t* xa, const uint8_t* xs,
+                          const ExpertMat& W, int N_work, int I_or_H, int K, const MoeScratch& sc, int max_tiles,
+                          int top_k, MoeAct mact, float* out, int ld_out, const Launch& L);
 // MXFP4 experts with bf16 inputs (FLYX_ACT_BF16) on the bf16 tensor cores (moe_mxfp4_bf16.cu): float32 rows staged as
 // bf16 with each 32-value block's values in the pairs (c, c + 16) (K a multiple of 32); the rows a task of the MXFP4
 // expert GEMMs (these and moe_mxfp4_mxfp8_mma) for `pairs` (row, expert) pairs over n_experts (16 or 32: the same
@@ -2002,6 +2012,16 @@ int moe_mxfp4_bm(int pairs, int n_experts);
 void moe_mxfp4_bf16_mma(bool fuse_act, bool is_down, int bm, const bf16* xa, const ExpertMat& W, int N_work, int I_or_H,
                     int K, const MoeScratch& sc, int max_tiles, int top_k, MoeAct mact, float* out, int ld_out,
                     const Launch& L);
+// The same products for a prefill pass (more than FLYX_MAX_ROWS rows): one float32 sum an output in K's order, every
+// tile shape the same bits (within float32 sums of the rounds' kernel above); the rows a task by the rows an expert
+// has (moe_mxfp4_bf16_pass_rows), the tasks grouped so.
+void moe_mxfp4_bf16_pass(bool fuse_act, bool is_down, int tok, const bf16* xa, const ExpertMat& W, int N_work,
+                         int I_or_H, int K, const MoeScratch& sc, int max_tiles, int top_k, MoeAct mact, float* out,
+                         int ld_out, const Launch& L);
+// The rows a task of the MXFP4 pass kernels for `pairs` (row, expert) pairs over n_experts, by the rows an expert has
+// on average: moe_mxfp4_bf16_pass's (32, 64 or 128) and moe_mxfp4_mxfp8_pass's (16, 64 or 128).
+int moe_mxfp4_bf16_pass_rows(int pairs, int n_experts);
+int moe_mxfp4_mxfp8_pass_rows(int pairs, int n_experts);
 // Weighted down-projection: out[r, n] (=|+=) sum_{k=0..top_k-1} ew[r, k] * (down_{eidx[r, k]}(act[r * top_k + k])[n]
 // + bias[eidx[r, k], n]) (bias [E, H], null: none).
 // act_bf16 (with moe_round_bf16_down): its input [rows*top_k, K] in bf16 already, read in place of act.

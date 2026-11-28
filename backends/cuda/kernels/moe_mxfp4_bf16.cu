@@ -238,6 +238,207 @@ void launch(const bf16* xa, const ExpertMat& W, int N_work, int I_or_H, int K, c
                         sc.n_tasks, sc.pairs, top_k, mact, out, ld_out);
 }
 
+// ---- Prefill passes (more than FLYX_MAX_ROWS rows): swap-AB tiles ----------------------------------------------
+// A the experts' weight rows (their codes times the stored scale, exact in bf16), B the task's rows (bf16, staged in
+// the blocks' pairs (c, c + 16)), C[weight row][row]: one float32 sum an output, MMA after MMA in K's order, so every
+// tile shape gives the same bits (numerics.md K) and the shape follows the rows an expert has
+// (moe_mxfp4_bf16_pass_rows).  Rounds take the K-split kernels above.  A block: 16 MT WMW weight rows (fused gate|up:
+// an m16 tile 8 columns' gate rows then their up rows) x 8 NT WT rows of one expert; warps WMW x WT, a warp MT m16 x NT
+// n8 tiles; spans of SU units staged a span ahead (cp.async), NS stages.
+template <int WROWS, int TOK, int NS, int SU>
+struct PassSmem {
+  struct Stage {
+    alignas(16) bf16 x[TOK][SU * 32 + 32];       // rows: 16 banks apart (a quarter warp's 16-byte reads)
+    alignas(16) uint8_t w[WROWS][SU * 16 + 16];  // codes: 4 banks apart
+    alignas(16) uint16_t ws[WROWS][SU + 2];      // a weight row's span of scales (bf16 bits)
+  };
+  Stage st[NS];
+  int pids[TOK];
+  int rids[TOK];
+};
+
+template <bool FUSE_ACT, bool IS_DOWN, int MT, int NT, int WMW, int WT, int NS, int SU>
+__global__ void __launch_bounds__(32 * WMW * WT)
+    k_moe_mxfp4_bf16_pass(const bf16* xa, const uint8_t* __restrict__ W, const uint16_t* __restrict__ D,
+                          const float* __restrict__ RS, int N_exp, int I_or_H, int K, const MoeTask* tasks,
+                          const int* n_tasks, const int* pairs, int top_k, MoeAct mact, float* __restrict__ out,
+                          int ld_out) {
+  constexpr int WROWS = 16 * MT * WMW, TOK = 8 * NT * WT, NTH = 32 * WMW * WT;
+  constexpr int COLS = FUSE_ACT ? WROWS / 2 : WROWS;
+  using S_t = PassSmem<WROWS, TOK, NS, SU>;
+  pdl_trigger();
+  pdl_wait();  // the staged rows and the tasks: the kernels before
+  const int tid_y = int(blockIdx.y);
+  if (tid_y >= *n_tasks) return;
+  const MoeTask tk = tasks[tid_y];
+  const int e = tk.expert, nb = tk.nb;
+  extern __shared__ __align__(16) unsigned char smem_raw[];
+  auto& sm = *reinterpret_cast<S_t*>(smem_raw);
+  const int tid = threadIdx.x;
+  const int units = K >> 5, spans = (units + SU - 1) / SU;
+  if (tid < nb) {
+    const int pid = pairs[tk.p0 + tid];
+    sm.pids[tid] = pid;
+    sm.rids[tid] = IS_DOWN ? pid : (pid / top_k);
+  }
+  __syncthreads();
+  const int lane = tid & 31, warp = tid >> 5, ww = warp / WT, wt = warp % WT;
+  const int g = lane >> 2, t4 = lane & 3;
+  const int N_work = FUSE_ACT ? I_or_H : N_exp;
+  const int c0 = int(blockIdx.x) * COLS;
+  const float rs = RS ? RS[e] : 1.f;
+  const int rows_st = min(TOK, (nb + 7) & ~7);
+  auto wrow = [&](int s) {
+    if constexpr (FUSE_ACT) {
+      const int col = min(c0 + 8 * (s >> 4) + (s & 7), N_work - 1);
+      return (s & 8) ? I_or_H + col : col;
+    } else {
+      return min(c0 + s, N_exp - 1);
+    }
+  };
+  auto stage = [&](int j) {
+    if (j >= spans) {
+      cp_async_commit();
+      return;
+    }
+    auto& S = sm.st[j % NS];
+    const int n_s = min(SU, units - SU * j);
+    for (int i = tid; i < rows_st * (SU * 4); i += NTH) {  // 16 bytes (8 bf16) a thread
+      const int r = i / (SU * 4), c = i % (SU * 4);
+      const bool ok = r < nb && c < 4 * n_s;
+      const size_t src = ok ? (size_t(sm.rids[r]) * K + size_t(j) * (SU * 32) + 8 * c) : 0;
+      cp_async16(&S.x[r][8 * c], xa + src, ok);
+    }
+    for (int i = tid; i < WROWS * SU; i += NTH) {  // a unit's 16 bytes a thread
+      const int s = i / SU, u = i % SU;
+      const size_t r = size_t(e) * N_exp + wrow(s);
+      const bool ok = u < n_s;
+      cp_async16(&S.w[s][16 * u], W + (r * size_t(units) + size_t(SU) * j + (ok ? u : 0)) * 16, ok);
+    }
+    if ((units & 1) == 0) {  // their scales two at a time (4 bytes, aligned where a row's units are even)
+      for (int i = tid; i < WROWS * (SU / 2); i += NTH) {
+        const int s = i / (SU / 2), u = 2 * (i % (SU / 2));
+        const size_t r = size_t(e) * N_exp + wrow(s);
+        const bool ok = u < n_s;
+        cp_async4(&S.ws[s][u], D + r * size_t(units) + size_t(SU) * j + (ok ? u : 0), ok);
+      }
+    } else {
+      for (int i = tid; i < WROWS * n_s; i += NTH) {
+        const int s = i / n_s, u = i - s * n_s;
+        S.ws[s][u] = D[(size_t(e) * N_exp + wrow(s)) * size_t(units) + size_t(SU) * j + u];
+      }
+    }
+    cp_async_commit();
+  };
+  float acc[MT][NT][4];
+#pragma unroll
+  for (int mt = 0; mt < MT; ++mt)
+#pragma unroll
+    for (int nt = 0; nt < NT; ++nt) acc[mt][nt][0] = acc[mt][nt][1] = acc[mt][nt][2] = acc[mt][nt][3] = 0.f;
+  auto mul = [&](int j) {
+    const auto& S = sm.st[j % NS];
+    const int n_s = min(SU, units - SU * j);
+#pragma unroll
+    for (int ul = 0; ul < SU; ++ul) {
+      if (ul >= n_s) break;
+      // weight rows 16 t + g and + 8: bytes 4 t4 .. 4 t4 + 3 of the block, pairs (4 t4 + i, 4 t4 + 16 + i) times the
+      // scale; rows 8 t + g: their 16 bytes at 8 t4, the same pairs
+      uint32_t a[MT][2][4], b[NT][4];
+#pragma unroll
+      for (int mt = 0; mt < MT; ++mt) {
+        const int ra = 16 * (MT * ww + mt) + g, rb = ra + 8;
+        const uint32_t qa = *reinterpret_cast<const uint32_t*>(&S.w[ra][16 * ul + 4 * t4]);
+        const uint32_t qb = *reinterpret_cast<const uint32_t*>(&S.w[rb][16 * ul + 4 * t4]);
+        const uint32_t sa = __byte_perm(uint32_t(S.ws[ra][ul]), 0u, 0x1010);
+        const uint32_t sb = __byte_perm(uint32_t(S.ws[rb][ul]), 0u, 0x1010);
+        uint32_t pa[4], pb[4];
+        mxfp4x8_to_bf16(qa, pa);
+        mxfp4x8_to_bf16(qb, pb);
+#pragma unroll
+        for (int i = 0; i < 4; ++i) {
+          pa[i] = bf16x2_mul(pa[i], *reinterpret_cast<const __nv_bfloat162*>(&sa));
+          pb[i] = bf16x2_mul(pb[i], *reinterpret_cast<const __nv_bfloat162*>(&sb));
+        }
+        // the unit's two MMAs: pairs 0, 1 then 2, 3 (A: rows g, g + 8 at k-slots 2 t4 and 2 t4 + 8)
+        a[mt][0][0] = pa[0], a[mt][0][1] = pb[0], a[mt][0][2] = pa[1], a[mt][0][3] = pb[1];
+        a[mt][1][0] = pa[2], a[mt][1][1] = pb[2], a[mt][1][2] = pa[3], a[mt][1][3] = pb[3];
+      }
+#pragma unroll
+      for (int nt = 0; nt < NT; ++nt) {
+        const int tr = 8 * (NT * wt + nt) + g;
+        const uint4 x = *reinterpret_cast<const uint4*>(&S.x[tr][32 * ul + 8 * t4]);
+        b[nt][0] = x.x, b[nt][1] = x.y, b[nt][2] = x.z, b[nt][3] = x.w;
+      }
+#pragma unroll
+      for (int nt = 0; nt < NT; ++nt) {
+        if (8 * (NT * wt + nt) >= nb) break;
+#pragma unroll
+        for (int mt = 0; mt < MT; ++mt) {
+          const uint32_t b0[2] = {b[nt][0], b[nt][1]}, b1[2] = {b[nt][2], b[nt][3]};
+          mma_bf16(acc[mt][nt], a[mt][0], b0);
+          mma_bf16(acc[mt][nt], a[mt][1], b1);
+        }
+      }
+    }
+  };
+#pragma unroll
+  for (int p = 0; p < NS - 1; ++p) stage(p);
+  for (int j = 0; j < spans; ++j) {
+    cp_async_wait<NS - 2>();
+    __syncthreads();
+    stage(j + NS - 1);
+    mul(j);
+  }
+#pragma unroll
+  for (int mt = 0; mt < MT; ++mt)
+#pragma unroll
+    for (int nt = 0; nt < NT; ++nt)
+#pragma unroll
+      for (int k = 0; k < 4; ++k) {
+        const int tr = 8 * (NT * wt + nt) + 2 * t4 + (k & 1);
+        if (tr >= nb) continue;
+        if constexpr (FUSE_ACT) {
+          if (k >= 2) continue;  // the up row's sum: k + 2
+          const int col = c0 + 8 * (MT * ww + mt) + g;
+          if (col >= N_work) continue;
+          out[size_t(sm.pids[tr]) * ld_out + col] =
+              moe_act_val(mact, acc[mt][nt][k] * rs, acc[mt][nt][k + 2] * rs, e, col, I_or_H);
+        } else {
+          const int col = c0 + 16 * (MT * ww + mt) + g + 8 * (k >> 1);
+          if (col >= N_work) continue;
+          out[size_t(sm.pids[tr]) * ld_out + col] = acc[mt][nt][k] * rs;
+        }
+      }
+}
+
+// The three shapes, by the rows an expert has: 16 rows a task, 128 weight rows (8 warps, spans of 8); 64, 128 (8 warps
+// 4 x 2, spans of 4); 128, 128 (16 warps 4 x 4, spans of 2, 3 stages).
+template <bool FUSE_ACT, bool IS_DOWN, int MT, int NT, int WMW, int WT, int NS, int SU>
+void launch_pass_cfg(const bf16* xa, const ExpertMat& W, int N_work, int I_or_H, int K, const MoeScratch& sc,
+                     int max_tiles, int top_k, MoeAct mact, float* out, int ld_out, const Launch& L) {
+  constexpr int WROWS = 16 * MT * WMW, TOK = 8 * NT * WT, COLS = FUSE_ACT ? WROWS / 2 : WROWS;
+  using S_t = PassSmem<WROWS, TOK, NS, SU>;
+  auto* kernel = k_moe_mxfp4_bf16_pass<FUSE_ACT, IS_DOWN, MT, NT, WMW, WT, NS, SU>;
+  static const bool ready = set_dynamic_smem(kernel, sizeof(S_t));
+  if (!ready) throw std::runtime_error("moe_mxfp4_bf16_pass: the device refused its shared memory");
+  launch_dependent_smem(kernel, dim3(ceil_div(N_work, COLS), max_tiles), dim3(32 * WMW * WT), sizeof(S_t), L, xa,
+                        W.blk.data, W.blk.scales, W.rs, W.N, I_or_H, K, sc.tasks, sc.n_tasks, sc.pairs, top_k, mact,
+                        out, ld_out);
+}
+
+template <bool FUSE_ACT, bool IS_DOWN, int TOK>
+void launch_pass(const bf16* xa, const ExpertMat& W, int N_work, int I_or_H, int K, const MoeScratch& sc,
+                 int max_tiles, int top_k, MoeAct mact, float* out, int ld_out, const Launch& L) {
+  // 128 rows: a warp's 16 weight rows dequantized once for 8 n8 tiles (gpt-oss-20b's experts at 512 rows an expert,
+  // gate|up and down: 3,629 us against 4,119 with 32 weight rows x 4 n8 tiles a warp)
+  constexpr int MT = TOK == 64 ? 2 : 1, NT = TOK == 128 ? 8 : 4;
+  constexpr int WMW = TOK == 64 ? 4 : 8, WT = TOK == 32 ? 1 : 2;
+  constexpr int NS = TOK == 128 ? 3 : 2, SU = TOK == 32 ? 8 : TOK == 64 ? 4 : 2;
+  static_assert(8 * NT * WT == TOK);
+  launch_pass_cfg<FUSE_ACT, IS_DOWN, MT, NT, WMW, WT, NS, SU>(xa, W, N_work, I_or_H, K, sc, max_tiles, top_k, mact, out,
+                                                             ld_out, L);
+}
+
 }  // namespace
 
 void moe_mxfp4_bf16_stage(const float* x, int ldx, int K, int rows, bf16* out, const Launch& L) {
@@ -246,6 +447,18 @@ void moe_mxfp4_bf16_stage(const float* x, int ldx, int K, int rows, bf16* out, c
 }
 
 int moe_mxfp4_bm(int pairs, int n_experts) { return pairs > 14 * n_experts ? 32 : 16; }
+
+// The pass kernels' rows a task by the rows an expert averages (RTX PRO 6000, gpt-oss-20b's experts, gate|up and down
+// in us: bf16 at 18 rows an expert 377 with 32-row tasks against 537 with 64; at 64 rows 774 with 64 against 899 with
+// 128; at 128 rows 1,135 with 128 against 1,284 with 64.  MXFP8 at 18 rows 346 with 16 against 372 with 64; at 32
+// rows 399 with 64 against 442 with 16; at 128 rows 764 with 128 against 916 with 64).  Either kernel gives every
+// shape the same bits.
+int moe_mxfp4_bf16_pass_rows(int pairs, int n_experts) {
+  return pairs <= 40 * n_experts ? 32 : pairs <= 96 * n_experts ? 64 : 128;
+}
+int moe_mxfp4_mxfp8_pass_rows(int pairs, int n_experts) {
+  return pairs <= 24 * n_experts ? 16 : pairs <= 96 * n_experts ? 64 : 128;
+}
 
 void moe_mxfp4_bf16_mma(bool fuse_act, bool is_down, int bm, const bf16* xa, const ExpertMat& W, int N_work, int I_or_H,
                     int K, const MoeScratch& sc, int max_tiles, int top_k, MoeAct mact, float* out, int ld_out,
@@ -259,6 +472,23 @@ void moe_mxfp4_bf16_mma(bool fuse_act, bool is_down, int bm, const bf16* xa, con
   };
   if (bm == 32) go(std::integral_constant<int, 32>{});
   else go(std::integral_constant<int, 16>{});
+}
+
+void moe_mxfp4_bf16_pass(bool fuse_act, bool is_down, int tok, const bf16* xa, const ExpertMat& W, int N_work,
+                         int I_or_H, int K, const MoeScratch& sc, int max_tiles, int top_k, MoeAct mact, float* out,
+                         int ld_out, const Launch& L) {
+  if (tok != 32 && tok != 64 && tok != 128)
+    throw std::runtime_error("moe_mxfp4_bf16_pass: tasks of 32, 64 or 128 rows");
+  auto go = [&](auto tc) {
+    constexpr int T = decltype(tc)::value;
+    if (is_down) launch_pass<false, true, T>(xa, W, N_work, I_or_H, K, sc, max_tiles, top_k, mact, out, ld_out, L);
+    else if (fuse_act)
+      launch_pass<true, false, T>(xa, W, N_work, I_or_H, K, sc, max_tiles, top_k, mact, out, ld_out, L);
+    else launch_pass<false, false, T>(xa, W, N_work, I_or_H, K, sc, max_tiles, top_k, mact, out, ld_out, L);
+  };
+  if (tok == 128) go(std::integral_constant<int, 128>{});
+  else if (tok == 64) go(std::integral_constant<int, 64>{});
+  else go(std::integral_constant<int, 32>{});
 }
 
 }  // namespace flyx::cuda

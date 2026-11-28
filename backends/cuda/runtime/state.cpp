@@ -15,6 +15,7 @@ RowNeeds row_needs(const flyx_bmodel* m) {
   int k = 0;  // largest GEMM K
   int pass0_pushes = 0;
   bool has_rel_attn = false;
+  bool mxfp4_moe = false, other_moe = false;  // sparse MoEs with MXFP4 experts, and with others
   auto ks = [&](std::initializer_list<int> l) { k = std::max(k, std::max(l)); };
   // lora_down_rows' slice sums a row: the stacked a's (`linears` of them on the block's input, K `in`), the last's (K
   // `last_in`)
@@ -71,6 +72,7 @@ RowNeeds row_needs(const flyx_bmodel* m) {
       n.moe_experts = std::max(n.moe_experts, e->n_experts);
       n.moe_topk = std::max(n.moe_topk, e->top_k);
       n.moe_inter = std::max(n.moe_inter, e->inter);
+      (e->down.packed() && e->down.blk.dtype == FLYX_DT_GGML_MXFP4 ? mxfp4_moe : other_moe) = true;
       n.max_loop_rank = std::max(n.max_loop_rank, e->loop_rank);
       ks({e->hidden, e->inter, 2 * e->hidden, e->loop_rank});
     } else if (const auto* h = std::get_if<HeadBlock>(&blk)) {
@@ -122,6 +124,7 @@ RowNeeds row_needs(const flyx_bmodel* m) {
   }
   if (has_rel_attn) n.max_bank = std::max(pass0_pushes + 2, 4);
   n.k_max = (k + 63) / 64 * 64;
+  n.moe_mxfp4 = mxfp4_moe && !other_moe;
   return n;
 }
 
@@ -206,7 +209,11 @@ void alloc_rows(const flyx_bmodel* m, int R, bool prefill, RowBufs* b, Alloc&& a
     const size_t gu_or_down = std::max(size_t(2) * size_t(n.moe_inter), size_t(H));
     b->moe_gu = f(size_t(R) * size_t(n.moe_topk) * gu_or_down);
     b->moe_act = f(size_t(R) * size_t(n.moe_topk) * size_t(n.moe_inter));
-    const int chunk = std::min(R, 256);
+    // The rows a chunk of the expert GEMMs takes: 256 (the scratch's size bounded), a pass's rows at once where every
+    // expert is MXFP4 (gpt-oss), whose kernels give a row the same bits at any rows an expert gets
+    // (moe_mxfp4_mxfp8_pass, moe_mxfp4_bf16_mma, moe_blocks_q8): each expert's weights read once a pass, not once
+    // every 256 rows (gpt-oss-20b, 16K tokens in passes of 4,096 on an RTX PRO 6000: MoE 561 -> MS ms).
+    const int chunk = n.moe_mxfp4 ? R : std::min(R, 256);
     b->moe_sc.pairs = static_cast<int*>(alloc(size_t(chunk) * size_t(n.moe_topk) * sizeof(int)));
     b->moe_sc.tasks = static_cast<MoeTask*>(alloc(size_t(chunk) * size_t(n.moe_topk) * sizeof(MoeTask)));
     b->moe_sc.n_tasks = static_cast<int*>(alloc(sizeof(int)));
@@ -457,11 +464,14 @@ bool tiered_cache(const flyx_bmodel* m, const KvSpec& k) {
   return n >= 2;
 }
 
-// Whether strata attention's kernels take every attention block that reads a cache in tiers, at `bits` bits.
+// Whether strata attention's kernels take every attention block that reads a cache in tiers, at `bits` bits (none
+// with sinks or YaRN's rotary: the low-bit copy's kernels have neither).
 bool strata_takes(const flyx_bmodel* m, int bits) {
   for (const Block& blk : m->blocks) {
     if (const auto* a = std::get_if<AttnBlock>(&blk)) {
-      if (tiered_cache(m, m->states.kv[size_t(a->kv)]) && !strata_supported(a->nh, a->nkv, a->hd, bits)) return false;
+      if (tiered_cache(m, m->states.kv[size_t(a->kv)]) &&
+          (a->sinks || a->rope || !strata_supported(a->nh, a->nkv, a->hd, bits)))
+        return false;
     } else if (const auto* r = std::get_if<RelAttnBlock>(&blk)) {
       if (tiered_cache(m, m->states.kv[size_t(r->kv)]) && !strata_supported(r->nh, r->nkv, r->hd, bits)) return false;
     }

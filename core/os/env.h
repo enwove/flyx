@@ -23,6 +23,7 @@ inline constexpr const char* kLookup = "FLYX_LOOKUP";
 inline constexpr const char* kDraftTrees = "FLYX_DRAFT_TREES";
 inline constexpr const char* kAdaptive = "FLYX_ADAPTIVE";
 inline constexpr const char* kLearnCosts = "FLYX_LEARN_COSTS";
+inline constexpr const char* kWarmPrefill = "FLYX_WARM_PREFILL";
 
 // Server & CLI
 inline constexpr const char* kApiKey = "FLYX_API_KEY";

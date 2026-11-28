@@ -216,6 +216,7 @@ int main(int argc, char** argv) {
   test_inkling2_loop_ctrl();
   test_inkling2_loop_control();
   test_inkling2_linear_f32();
+  test_linear_f32_pass();
   test_inkling2_shortconv();
   test_inkling2_sublayer_fusion();
   test_rel_attention();

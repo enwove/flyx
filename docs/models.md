@@ -35,7 +35,7 @@ Key execution properties:
 | `NVFP4` MoE experts (3D) | bf16 | — |
 | `MXFP4` MoE experts (gpt-oss) | `q8` (llama.cpp's) | `bf16` (vLLM's, Marlin); `mxfp8`: e4m3 with a power-of-two scale per 32 (SGLang's, FlashInfer CUTLASS; sm_120); `mxfp8/q8` |
 
-Where prefill and decode take the same inputs, a row gets the same bits in a pass of any length and in a round, so speculation never changes the output; with `nvfp4/bf16` and `mxfp8/q8` that holds among rounds and among prefill passes, not between the two.
+A row gets the same bits in a round of any width (so speculation never changes the output) and in a prefill pass of any length (so a reused prompt prefix continues as a fresh prefill does); prefill and rounds agree within float32 sums, or within their inputs' rounding where they differ (`nvfp4/bf16`, `mxfp8/q8`).
 
 Beside the linears:
 

@@ -99,8 +99,10 @@ __global__ void __launch_bounds__(128) k_flash_prefill(const float* __restrict__
   const int last_row = min(rows, r0 + 64) - 1;
   const int kend = base + last_row + 1;       // keys this block needs: [0, kend)
   const int kwin = min(kend, win.k_hi);       // of them, the window's: [win.k_lo, kwin)
-  // a sliding window: the block's first row's first key on (later rows start later)
-  const int kfirst = win.sliding ? max(win.k_lo, base + r0 + 1 - win.sliding) : win.k_lo;
+  // a sliding window: from the tile of KT keys (counted from position 0) that holds the block's first row's first key,
+  // so a row's tiles are the same whichever pass holds it (numerics.md K): its keys past the window masked, a tile of
+  // them leaving the softmax's state as it is (the keys before the window, in the ring or not, are written: finite)
+  const int kfirst = win.sliding ? max(win.k_lo, max(0, base + r0 + 1 - win.sliding) / KT * KT) : win.k_lo;
   const float sl2 = scale * 1.4426950408889634f;
   float o[NT][4];
 #pragma unroll
@@ -221,6 +223,205 @@ __global__ void __launch_bounds__(128) k_flash_prefill(const float* __restrict__
     const int row = wrow0 + g + 8 * half;
     if (row >= rows) continue;
     // a sink joins the denominator, in the scores' log2 units (exp2 of its excess over the row's maximum)
+    if (win.sinks) sum += exp2f(fminf(win.sinks[h] * 1.4426950408889634f - m[half], 126.f));
+    const float inv = sum > 0.f ? 1.f / sum : 0.f;
+#pragma unroll
+    for (int n = 0; n < NT; ++n)
+#pragma unroll
+      for (int e = 0; e < 2; ++e) {
+        const int d = n * 8 + 2 * t + e;
+        float v = o[n][2 * half + e] * inv;
+        if (gate) v *= 1.f / (1.f + __expf(-gate[size_t(row) * ld_gate + h * HD + d]));
+        put(out, size_t(row) * ld_out + h * HD + d, size_t(row) * nh * HD + h * HD + d, v);
+      }
+  }
+}
+
+// Prefill attention for head dim 64 on binary16 caches (gpt-oss's 64 heads of 64 over 8 KV heads), k_flash_prefill's
+// tiles of 64 keys on absolute positions, scheduled for long passes: a block 128 query rows of one head (8 warps of 16,
+// each key and value tile read from L2 once for all of them), the tiles double-buffered (the next loads while this one
+// is used), q times scale * log2(e) in registers (the scores in log2 units: no product a score), a key tile's two B
+// fragments in one ldmatrix (and a value tile's), the blocks with the most keys first, a tile no key of which a warp's
+// rows mask (below the diagonal, inside the window) taken without the mask's tests, exponents on the SFU alone
+// (ex2.approx.ftz), and o not rescaled where no row of the warp gets a larger maximum (alpha 1 exactly).  A row's tiles
+// and their order depend only on its position, so its bits do not depend on its pass (numerics.md K); it takes every
+// pass of these heads.  RTX PRO 6000, gpt-oss-20b's full layer, 4,096 rows after 12,288 keys: k_flash_prefill 4.70 ms,
+// this 3.10 (after 61,440: 20.0 -> 13.0 ms; from position 0: 788 -> 488 us).  256 rows a block: 3.71 ms (16 warps
+// waiting at each tile's barrier).
+// 2^x on the SFU alone (results below 2^-126 flushed to zero: a probability that small adds nothing to a sum of at
+// least one)
+__device__ __forceinline__ float ex2_ftz(float x) {
+  float y;
+  asm("ex2.approx.ftz.f32 %0, %1;" : "=f"(y) : "f"(x));
+  return y;
+}
+constexpr int kFlashPipeRows = 128;  // a block's query rows: 8 warps of 16, all reading every tile
+constexpr size_t flash_pipe_smem() { return size_t(4) * 64 * (64 + 8) * sizeof(kv16); }  // K, V x 2 buffers
+
+__global__ void __launch_bounds__(2 * kFlashPipeRows)
+    k_flash_prefill_pipe(const float* __restrict__ q, KvRef kv, int nh, int nkv, int rows, float scale,
+                         const DevParams* P, int pos_add, const float* __restrict__ gate, int ld_gate, Out out,
+                         int ld_out, FlashWindow win) {
+  pdl_trigger();
+  constexpr int HD = 64, KT = 64, LD = HD + 8, NT = HD / 8, ST = KT / 8, KQ = HD / 16;
+  extern __shared__ __align__(16) unsigned char sm_raw[];
+  kv16(*Kb)[KT][LD] = reinterpret_cast<kv16(*)[KT][LD]>(sm_raw);  // [2][KT][LD]: tiles double-buffered
+  kv16(*Vb)[KT][LD] = reinterpret_cast<kv16(*)[KT][LD]>(sm_raw + size_t(2) * KT * LD * sizeof(kv16));
+  const int h = blockIdx.x, tid = threadIdx.x, warp = tid >> 5, lane = tid & 31;
+  const int r0 = (int(gridDim.y) - 1 - int(blockIdx.y)) * kFlashPipeRows;  // the most keys first
+  const int g = lane >> 2, t = lane & 3;
+  const int kvh = h / (nh / nkv);
+  const int base = P->position + pos_add;
+  const float sl2 = scale * 1.4426950408889634f;  // q times it: the scores in log2 units
+  kv16(*Qs)[LD] = reinterpret_cast<kv16(*)[LD]>(sm_raw);  // q's rows, in binary16, before the tiles
+  for (int i = tid; i < kFlashPipeRows * HD / 2; i += 2 * kFlashPipeRows) {
+    const int r = i / (HD / 2), c = 2 * (i % (HD / 2));
+    float2 v = make_float2(0.f, 0.f);
+    if (r0 + r < rows) v = *reinterpret_cast<const float2*>(q + (size_t(r0 + r) * nh + h) * HD + c);
+    *reinterpret_cast<__half2*>(&Qs[r][c]) = __floats2half2_rn(v.x * sl2, v.y * sl2);
+  }
+  __syncthreads();
+  uint32_t qa[KQ][4];
+#pragma unroll
+  for (int kq = 0; kq < KQ; ++kq) ldmatrix_x4(qa[kq], &Qs[warp * 16 + (lane & 15)][16 * kq + (lane >> 4) * 8]);
+  const int wrow0 = r0 + warp * 16;  // this warp's first query row
+  const int last_row = min(rows, r0 + kFlashPipeRows) - 1;
+  const int kend = base + last_row + 1;
+  const int kwin = min(kend, win.k_hi);
+  const int kfirst = win.sliding ? max(win.k_lo, max(0, base + r0 + 1 - win.sliding) / KT * KT) : win.k_lo;
+  float o[NT][4];
+#pragma unroll
+  for (int n = 0; n < NT; ++n) o[n][0] = o[n][1] = o[n][2] = o[n][3] = 0.f;
+  float m[2] = {-INFINITY, -INFINITY}, l[2] = {0.f, 0.f};
+  if (!win.first) flash_state<NT>(false, win.state, nh, h, wrow0, rows, g, t, o, m, l);
+  const kv16* Kc = static_cast<const kv16*>(kv.k);
+  const kv16* Vc = static_cast<const kv16*>(kv.v);
+  auto load = [&](int buf, int k0) {
+    for (int i = tid; i < KT * HD / 8; i += 2 * kFlashPipeRows) {
+      const int r = i / (HD / 8), c = 8 * (i % (HD / 8)), pos = k0 + r;
+      const bool ok = pos < kwin;
+      const int slot = ok ? (win.ring ? pos % win.ring : pos) : kfirst;
+      const size_t at = (size_t(slot) * nkv + kvh) * HD + c;
+      cp_async16(&Kb[buf][r][c], Kc + at, ok);
+      cp_async16(&Vb[buf][r][c], Vc + at, ok);
+    }
+    cp_async_commit();
+  };
+  __syncthreads();  // q read: the buffers are the tiles' from here
+  if (kfirst < kwin) load(0, kfirst);
+  int buf = 0;
+  for (int k0 = kfirst; k0 < kwin; k0 += KT, buf ^= 1) {
+    if (k0 + KT < kwin) {  // the next tile loads while this one is used
+      load(buf ^ 1, k0 + KT);
+      cp_async_wait<1>();
+    } else {
+      cp_async_wait<0>();
+    }
+    __syncthreads();
+    kv16(*Ks)[LD] = Kb[buf];
+    kv16(*Vs)[LD] = Vb[buf];
+    // this warp's rows all precede the tile, or are all past it: only the barrier below
+    const bool skip = (wrow0 >= rows || base + wrow0 + 15 < k0) ||
+                      (win.sliding && k0 + KT <= base + wrow0 + 1 - win.sliding);
+    if (!skip) {
+      // no key of the tile masked for the warp's rows
+      const bool full = wrow0 + 15 < rows && k0 + KT - 1 <= base + wrow0 &&
+                        (!win.sliding || k0 > base + wrow0 + 15 - win.sliding);
+      float s[ST][4];
+#pragma unroll
+      for (int j = 0; j < ST; ++j) s[j][0] = s[j][1] = s[j][2] = s[j][3] = 0.f;
+#pragma unroll
+      for (int kq = 0; kq < KQ; ++kq)
+#pragma unroll
+        for (int j = 0; j < ST; j += 2) {  // keys j * 8 .. + 15: two B fragments
+          uint32_t b[4];
+          ldmatrix_x4(b, &Ks[j * 8 + (lane & 7) + ((lane >> 4) & 1) * 8][16 * kq + ((lane >> 3) & 1) * 8]);
+          mma_f16(s[j], qa[kq], b);
+          mma_f16(s[j + 1], qa[kq], b + 2);
+        }
+#pragma unroll
+      for (int half = 0; half < 2; ++half) {
+        const int row = wrow0 + g + 8 * half, qpos = base + row;
+        float mx = -INFINITY;
+        if (full) {  // the mask's tests all pass
+#pragma unroll
+          for (int j = 0; j < ST; ++j)
+#pragma unroll
+            for (int e = 0; e < 2; ++e) {
+              float& v = s[j][2 * half + e];
+              mx = fmaxf(mx, v);
+            }
+        } else {
+#pragma unroll
+          for (int j = 0; j < ST; ++j)
+#pragma unroll
+            for (int e = 0; e < 2; ++e) {
+              const int key = k0 + j * 8 + 2 * t + e;
+              float& v = s[j][2 * half + e];
+              v = (row < rows && key <= qpos && (!win.sliding || key > qpos - win.sliding)) ? v : -INFINITY;
+              mx = fmaxf(mx, v);
+            }
+        }
+        mx = fmaxf(mx, __shfl_xor_sync(0xffffffffu, mx, 1));
+        mx = fmaxf(mx, __shfl_xor_sync(0xffffffffu, mx, 2));
+        const float mnew = fmaxf(m[half], mx);
+        const float alpha = mnew == -INFINITY ? 1.f : ex2_ftz(m[half] - mnew);
+        m[half] = mnew;
+        l[half] *= alpha;
+        if (!__all_sync(0xffffffffu, alpha == 1.f)) {  // times 1: the same bits
+#pragma unroll
+          for (int n = 0; n < NT; ++n) {
+            o[n][2 * half] *= alpha;
+            o[n][2 * half + 1] *= alpha;
+          }
+        }
+        if (full) {  // mnew finite
+#pragma unroll
+          for (int j = 0; j < ST; ++j)
+#pragma unroll
+            for (int e = 0; e < 2; ++e) {
+              float& v = s[j][2 * half + e];
+              v = ex2_ftz(v - mnew);
+              l[half] += v;
+            }
+        } else {
+#pragma unroll
+          for (int j = 0; j < ST; ++j)
+#pragma unroll
+            for (int e = 0; e < 2; ++e) {
+              float& v = s[j][2 * half + e];
+              v = mnew == -INFINITY ? 0.f : ex2_ftz(v - mnew);
+              l[half] += v;
+            }
+        }
+      }
+#pragma unroll
+      for (int kk = 0; kk < KT; kk += 16) {
+        const int j = kk / 8;
+        const uint32_t a[4] = {pack_f16(s[j][0], s[j][1]), pack_f16(s[j][2], s[j][3]),
+                               pack_f16(s[j + 1][0], s[j + 1][1]), pack_f16(s[j + 1][2], s[j + 1][3])};
+#pragma unroll
+        for (int n = 0; n < NT; n += 2) {  // dims n * 8 .. + 15: two B fragments
+          uint32_t b[4];
+          ldmatrix_x4_t(b, &Vs[kk + (lane & 15)][(n + (lane >> 4)) * 8]);
+          mma_f16(o[n], a, b);
+          mma_f16(o[n + 1], a, b + 2);
+        }
+      }
+    }
+    __syncthreads();  // this buffer is read: the tile after next loads into it
+  }
+  if (!win.last) {  // the next window goes on from here
+    flash_state<NT>(true, win.state, nh, h, wrow0, rows, g, t, o, m, l);
+    return;
+  }
+#pragma unroll
+  for (int half = 0; half < 2; ++half) {
+    float sum = l[half];
+    sum += __shfl_xor_sync(0xffffffffu, sum, 1);
+    sum += __shfl_xor_sync(0xffffffffu, sum, 2);
+    const int row = wrow0 + g + 8 * half;
+    if (row >= rows) continue;
     if (win.sinks) sum += exp2f(fminf(win.sinks[h] * 1.4426950408889634f - m[half], 126.f));
     const float inv = sum > 0.f ? 1.f / sum : 0.f;
 #pragma unroll
@@ -631,6 +832,13 @@ void launch_flash(const float* q, KvRef kv, int nh, int nkv, int rows, float sca
                   const float* gate, int ld_gate, Out out, int ld_out, cudaStream_t st, const FlashWindow& win) {
   static const bool attr = set_dynamic_smem(k_flash_prefill<HD, FP8>, flash_smem<HD>());
   (void)attr;
+  if constexpr (HD == 64 && !FP8) {  // gpt-oss's heads: k_flash_prefill's bits, scheduled for long passes
+    static const bool pipe_attr = set_dynamic_smem(k_flash_prefill_pipe, flash_pipe_smem());
+    (void)pipe_attr;
+    k_flash_prefill_pipe<<<dim3(nh, ceil_div(rows, kFlashPipeRows)), 2 * kFlashPipeRows, flash_pipe_smem(), st>>>(
+        q, kv, nh, nkv, rows, scale, P, pos_add, gate, ld_gate, out, ld_out, win);
+    return;
+  }
   if constexpr (HD == 256 || HD == 128) {
     if (win.sliding) {  // the grouped kernels take no sliding window
       k_flash_prefill<HD, FP8><<<dim3(nh, ceil_div(rows, 64)), 128, flash_smem<HD>(), st>>>(

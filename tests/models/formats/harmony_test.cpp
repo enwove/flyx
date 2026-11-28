@@ -78,6 +78,8 @@ int main() {
                      {"", "{\"location\": \"x\"}", {}}, nullptr);
   same_at_every_step("a reply cut short inside final", "<|channel|>final<|message|>Partial ans",
                      {"", "Partial ans", {}});
+  same_at_every_step("a reply cut short inside the next message's header: the header left out",
+                     "<|channel|>final<|message|>Answer.<|end|><|start|>assistant<|channel|>fin", {"", "Answer.", {}});
   same_at_every_step("text that is no harmony", "just words <|end|>", {"", "just words ", {}});
   check(is_harmony_template("{{- '<|start|>' + role + '<|channel|>final<|message|>' + content + '<|end|>' }}"),
         "a template with harmony's control tokens is harmony's");

@@ -746,6 +746,78 @@ __global__ void __launch_bounds__(kLoopLinearBlock)
   }
 }
 
+// A prefill pass's float32 linear of few outputs (linear_f32_pass): a lane an output, 32 a block, the block's 8 warps
+// over K's 8-element chunks (warp p: chunks p, p + 8, ..., 8 FMAs a chunk in K's order), the warps' sums then added in
+// order; TR rows a block read each weight once.  An output's sums are the same whatever TR, the block and the pass's
+// rows: a row has the same bits in a pass of any length.  VEC: K % 8 == 0 and the rows and weights 16-byte aligned
+// (the same order, wider loads).
+constexpr int kPassLinearWarps = 8;
+__device__ __forceinline__ void load_w8_at(const float* w, int k, int K, bool vec, float (&out)[8]) {
+  if (vec) {
+    load_w8(w, k >> 3, out);
+  } else {
+#pragma unroll
+    for (int i = 0; i < 8; ++i) out[i] = k + i < K ? __ldg(w + k + i) : 0.f;
+  }
+}
+__device__ __forceinline__ void load_w8_at(const bf16* w, int k, int K, bool vec, float (&out)[8]) {
+  if (vec) {
+    load_w8(w, k >> 3, out);
+  } else {
+#pragma unroll
+    for (int i = 0; i < 8; ++i) out[i] = k + i < K ? in_value(w + k + i) : 0.f;
+  }
+}
+template <int TR, bool VEC, typename Weight>
+__global__ void __launch_bounds__(32 * kPassLinearWarps)
+    k_linear_f32_pass(const float* x, int ldx, const Weight* __restrict__ W, int N, int K, float* y, int ldy, int rows,
+                      int accumulate) {
+  pdl_trigger();
+  __shared__ float parts[kPassLinearWarps][TR][32];
+  const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
+  const int n = int(blockIdx.x) * 32 + lane, r0 = int(blockIdx.y) * TR;
+  const Weight* w = W + size_t(min(n, N - 1)) * K;
+  float acc[TR];
+#pragma unroll
+  for (int j = 0; j < TR; ++j) acc[j] = 0.f;
+  const int chunks = (K + 7) >> 3;
+#pragma unroll 2
+  for (int c = warp; c < chunks; c += kPassLinearWarps) {
+    const int k = 8 * c;
+    float wv[8];
+    load_w8_at(w, k, K, VEC, wv);
+#pragma unroll
+    for (int j = 0; j < TR; ++j) {
+      const float* xr = x + size_t(min(r0 + j, rows - 1)) * ldx + k;
+      float xv[8];
+      if constexpr (VEC) {
+        const float4 a = *reinterpret_cast<const float4*>(xr), b = *reinterpret_cast<const float4*>(xr + 4);
+        xv[0] = a.x, xv[1] = a.y, xv[2] = a.z, xv[3] = a.w, xv[4] = b.x, xv[5] = b.y, xv[6] = b.z, xv[7] = b.w;
+      } else {
+#pragma unroll
+        for (int i = 0; i < 8; ++i) xv[i] = k + i < K ? xr[i] : 0.f;
+      }
+      float a = acc[j];
+#pragma unroll
+      for (int i = 0; i < 8; ++i)
+        if (VEC || k + i < K) a = __fmaf_rn(wv[i], xv[i], a);
+      acc[j] = a;
+    }
+  }
+#pragma unroll
+  for (int j = 0; j < TR; ++j) parts[warp][j][lane] = acc[j];
+  __syncthreads();
+  for (int i = threadIdx.x; i < TR * 32; i += 32 * kPassLinearWarps) {
+    const int j = i >> 5, col = int(blockIdx.x) * 32 + (i & 31);
+    if (r0 + j >= rows || col >= N) continue;
+    float v = parts[0][j][i & 31];
+#pragma unroll
+    for (int p = 1; p < kPassLinearWarps; ++p) v += parts[p][j][i & 31];
+    float* out = y + size_t(r0 + j) * ldy + col;
+    *out = accumulate ? *out + v : v;
+  }
+}
+
 // ---- shortconv_pass & shortconv_fold ------------------------------------------------------
 constexpr int kMaxShortConv = 64;
 
@@ -2612,6 +2684,32 @@ void linear_f32(const float* x, int ldx, RoundWeight W, int N, int K, float* y, 
     };
     if (split) run(std::integral_constant<int, kLoopLinearBlock / 32>{});
     else run(std::integral_constant<int, 1>{});
+  };
+  if (W.b16) launch(W.b16);
+  else launch(W.f32);
+}
+
+void linear_f32_pass(const float* x, int ldx, RoundWeight W, int N, int K, float* y, int ldy, int rows, bool accumulate,
+                     cudaStream_t st) {
+  if (rows <= 0 || N <= 0) return;
+  const int acc = accumulate ? 1 : 0;
+  auto launch = [&](const auto* w) {
+    const bool vec = (K & 7) == 0 && (ldx & 3) == 0 && (reinterpret_cast<uintptr_t>(w) & 15u) == 0 &&
+                     (reinterpret_cast<uintptr_t>(x) & 15u) == 0;
+    auto run = [&](auto tr, auto v) {
+      constexpr int TR = decltype(tr)::value;
+      const dim3 grid(ceil_div(N, 32), ceil_div(rows, TR));
+      k_linear_f32_pass<TR, decltype(v)::value><<<grid, 32 * kPassLinearWarps, 0, st>>>(x, ldx, w, N, K, y, ldy, rows,
+                                                                                        acc);
+    };
+    // rows a block: enough blocks for the GPU at short passes, the weights read fewer times at long ones
+    auto pick = [&](auto v) {
+      if (rows <= 512) run(std::integral_constant<int, 2>{}, v);
+      else if (rows <= 4096) run(std::integral_constant<int, 8>{}, v);
+      else run(std::integral_constant<int, 32>{}, v);
+    };
+    if (vec) pick(std::true_type{});
+    else pick(std::false_type{});
   };
   if (W.b16) launch(W.b16);
   else launch(W.f32);

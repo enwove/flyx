@@ -11,5 +11,9 @@ void moe_mxfp4_mxfp8_mma(bool, bool, int, const uint8_t*, const uint8_t*, const 
                          const MoeScratch&, int, int, MoeAct, float*, int, const Launch&) {
   std::abort();
 }
+void moe_mxfp4_mxfp8_pass(bool, bool, int, const uint8_t*, const uint8_t*, const ExpertMat&, int, int, int,
+                          const MoeScratch&, int, int, MoeAct, float*, int, const Launch&) {
+  std::abort();
+}
 
 }  // namespace flyx::cuda

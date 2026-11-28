@@ -278,6 +278,7 @@ struct RowNeeds {
   int max_bank = 0, max_loop_rank = 0;      // Inkling-2 AttnRes bank depth & loop gate rank
   int rel_q = 0, max_rel_nh = 0, max_rel_extent = 0, sink = 0, kv_dim = 0, kv_dyn = 0;
   int moe_experts = 0, moe_topk = 0, moe_inter = 0;
+  bool moe_mxfp4 = false;  // every sparse MoE's experts MXFP4 (gpt-oss): a pass's rows through the experts at once
   bool dspark = false;
 };
 
@@ -1278,6 +1279,10 @@ struct BatchPass {
   bool cert = false;       // every sequence chooses with the certified head
 };
 void run_batch(const BatchPass& bp);
+// Whether run_batch computes a plan's target nodes: embeddings, gated delta nets, attention without gpt-oss's biases,
+// sinks, window or YaRN, MLPs and the head (a sparse MoE, gpt-oss's attention: each sequence's round alone).  Checked
+// before anything of the batch is queued.
+bool batch_takes(const flyx_plan* p);
 
 // runtime/state.cpp
 RowNeeds row_needs(const flyx_bmodel* m);

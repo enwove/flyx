@@ -110,7 +110,8 @@ double residual_add(const RefModel* M, int rows, double x, double y) {
 // as binary16 over a row's scale, or 8-bit inputs in every pass when the weight says so; NVFP4 weights NVFP4
 // inputs when the weight says so and the engine's GEMM takes more than FLYX_MAX_ROWS rows at once.  This
 // reference computes some layers a row at a time: `rows` are the rows of this call, `gemm_rows` those the engine's
-// GEMM takes together (the pass's, for a layer it runs over the whole pass).
+// GEMM takes together (the pass's, for a layer it runs over the whole pass).  This backend lowers no wide rounds (a
+// round has at most FLYX_MAX_ROWS rows): more rows than that are a prefill pass's.
 void lin(const RefModel* M, int wi, const double* x, int rows, int K, int N, double* y, int gemm_rows) {
   const flyx_tensor_view* w = M->w(wi);
   if (M->q8.count(w)) flyx::ops::linear_a8(x, rows, K, w, N, y);

@@ -140,24 +140,61 @@ void moe_case(int E, int top_k, int H, int I, int R, In in) {
   // MXFP8: the down GEMM's inputs rounded from the float32 activations here, from float64 ones there: a value at an
   // e4m3 tie of one is 2^-4 of itself off in the other
   expect("gpt-oss experts' output " + tag, down(d_y, want_y.size()), want_y, pass_in == In::mxfp8 ? 1e-4 : 5e-5);
-  // the grouped MMA kernel's rows: the bits of each row alone (R = 1); not with MXFP8 in passes alone (8 bits alone)
-  if (R > FLYX_MAX_ROWS && in != In::mxfp8_q8) {
-    float* d_act1 = dev<float>(size_t(top_k) * I);
-    float* d_y1 = dev<float>(size_t(H));
-    Vec act1(want_act.size()), y1(want_y.size());
-    for (int r = 0; r < R; ++r) {
-      const int g1 = moe_gate_up(d_x + size_t(r) * H, H, w_gu, d_eidx + size_t(r) * top_k, 1, top_k, I, H, act, true,
+  // The rows' bits: a round's (16 rows or fewer) each row's alone, in every mode.  A pass's (more rows): bf16 and MXFP8
+  // inputs take the pass kernels (one sum an output in K's order, every tile shape), so a pass's rows are those of a
+  // pass of its first 17 rows (tiles of another shape where the rows an expert has differ); 8-bit inputs each row's
+  // alone.
+  const bool pass_kernels = R > FLYX_MAX_ROWS && (in == In::bf16 || in == In::mxfp8 || in == In::mxfp8_q8);
+  const int R2 = pass_kernels ? FLYX_MAX_ROWS + 1 : 1;  // rows a call of the comparison
+  if (R > 1) {
+    float* d_act1 = dev<float>(size_t(R2) * top_k * I);
+    float* d_y1 = dev<float>(size_t(R2) * H);
+    const int n = pass_kernels ? R2 : R;
+    Vec act1(size_t(n) * top_k * I), y1(size_t(n) * H);
+    for (int r = 0; r < n; r += R2) {
+      const int g1 = moe_gate_up(d_x + size_t(r) * H, H, w_gu, d_eidx + size_t(r) * top_k, R2, top_k, I, H, act, true,
                                  d_act1, I, &msc, TL);
-      moe_down(d_act1, I, w_dn, d_eidx + size_t(r) * top_k, d_ew + size_t(r) * top_k, 1, top_k, H, I, d_y1, H, false,
+      moe_down(d_act1, I, w_dn, d_eidx + size_t(r) * top_k, d_ew + size_t(r) * top_k, R2, top_k, H, I, d_y1, H, false,
                &msc, TL, nullptr, g1, d_dnb);
-      const Vec a1 = down(d_act1, size_t(top_k) * I), o1 = down(d_y1, size_t(H));
+      const Vec a1 = down(d_act1, size_t(R2) * top_k * I), o1 = down(d_y1, size_t(R2) * H);
       std::copy(a1.begin(), a1.end(), act1.begin() + ptrdiff_t(r) * top_k * I);
       std::copy(o1.begin(), o1.end(), y1.begin() + ptrdiff_t(r) * H);
     }
-    expect("gpt-oss experts' activation in one pass, as each row alone " + tag, fused, act1, 0.0);
-    expect("gpt-oss experts' output in one pass, as each row alone " + tag, down(d_y, want_y.size()), y1, 0.0);
+    const Vec y = down(d_y, want_y.size());
+    const Vec fused_n(fused.begin(), fused.begin() + ptrdiff_t(act1.size()));
+    const Vec y_n(y.begin(), y.begin() + ptrdiff_t(y1.size()));
+    const std::string what = pass_kernels             ? "as a pass of its first 17 rows "
+                             : R > FLYX_MAX_ROWS      ? "in one pass, as each row alone "
+                                                      : "in a round, as each row alone ";
+    expect("gpt-oss experts' activation " + what + tag, fused_n, act1, 0.0);
+    expect("gpt-oss experts' output " + what + tag, y_n, y1, 0.0);
     CK(cudaFree(d_act1));
     CK(cudaFree(d_y1));
+  }
+  // A wide round (Launch::round_rows, 17..64 rows: lookup's `wide` rounds) takes a round's kernels and inputs: its
+  // rows are each row's alone (R = 1), MXFP8 inputs or not.
+  if (R > FLYX_MAX_ROWS && R <= FLYX_MAX_WIDE_ROWS) {
+    Launch wide = TL;
+    wide.round_rows = true;
+    float* d_wa = dev<float>(size_t(R) * top_k * I);
+    float* d_wy = dev<float>(size_t(R) * H);
+    float* d_a1 = dev<float>(size_t(top_k) * I);
+    float* d_y1 = dev<float>(size_t(H));
+    const int gw = moe_gate_up(d_x, H, w_gu, d_eidx, R, top_k, I, H, act, true, d_wa, I, &msc, wide);
+    moe_down(d_wa, I, w_dn, d_eidx, d_ew, R, top_k, H, I, d_wy, H, false, &msc, wide, nullptr, gw, d_dnb);
+    Vec act1(size_t(R) * top_k * I), y1(size_t(R) * H);
+    for (int r = 0; r < R; ++r) {
+      const int g1 = moe_gate_up(d_x + size_t(r) * H, H, w_gu, d_eidx + size_t(r) * top_k, 1, top_k, I, H, act, true,
+                                 d_a1, I, &msc, wide);
+      moe_down(d_a1, I, w_dn, d_eidx + size_t(r) * top_k, d_ew + size_t(r) * top_k, 1, top_k, H, I, d_y1, H, false,
+               &msc, wide, nullptr, g1, d_dnb);
+      const Vec a1 = down(d_a1, size_t(top_k) * I), o1 = down(d_y1, size_t(H));
+      std::copy(a1.begin(), a1.end(), act1.begin() + ptrdiff_t(r) * top_k * I);
+      std::copy(o1.begin(), o1.end(), y1.begin() + ptrdiff_t(r) * H);
+    }
+    expect("gpt-oss experts' activation in a wide round, as each row alone " + tag, down(d_wa, act1.size()), act1, 0.0);
+    expect("gpt-oss experts' output in a wide round, as each row alone " + tag, down(d_wy, y1.size()), y1, 0.0);
+    for (float* q : {d_wa, d_wy, d_a1, d_y1}) CK(cudaFree(q));
   }
   for (void* p : {static_cast<void*>(d_x), static_cast<void*>(d_gub), static_cast<void*>(d_dnb),
                   static_cast<void*>(d_ew), static_cast<void*>(d_eidx), static_cast<void*>(d_gu),
@@ -167,8 +204,10 @@ void moe_case(int E, int top_k, int H, int I, int R, In in) {
 
 // One head's attention as the engine runs a round's rows: the rows at positions base .. base + R - 1 over a cache
 // of keys [0, base + R) (window 0) or a ring of `ring` slots holding the last positions (window > 0), with sinks.
-void attention_case(int nh, int nkv, int hd, int base, int R, int window, int ring, bool sinks, int splits) {
-  seed("gpt_oss_attention", nh, nkv, hd, base, R, window, ring, int(sinks), splits);
+// split > 0: the same rows as two passes, rows [0, split) then the rest, give the same bits (numerics.md K).
+void attention_case(int nh, int nkv, int hd, int base, int R, int window, int ring, bool sinks, int splits,
+                    int split = 0) {
+  seed("gpt_oss_attention", nh, nkv, hd, base, R, window, ring, int(sinks), splits, split);
   const int T = base + R;
   const Vec q = randv(size_t(R) * nh * hd, 1.0);
   Vec K = randv(size_t(T) * nkv * hd, 1.0), V = randv(size_t(T) * nkv * hd, 1.0);
@@ -217,7 +256,24 @@ void attention_case(int nh, int nkv, int hd, int base, int R, int window, int ri
                           (window ? " window " + std::to_string(window) + " ring " + std::to_string(ring) : "") +
                           (sinks ? " sinks" : "");
   // The kernels round q and the probabilities through binary16 on the tensor-core paths: their tolerance.
-  expect("attention " + tag, down(d_out, want.size()), want, R > FLYX_MAX_ROWS ? 4e-3 : 2e-4);
+  const Vec whole = down(d_out, want.size());
+  expect("attention " + tag, whole, want, R > FLYX_MAX_ROWS ? 4e-3 : 2e-4);
+  if (split > 0) {
+    float* d_two = dev<float>(want.size());
+    DevParams P2{};
+    P2.position = base + split;
+    DevParams* dP2 = dev<DevParams>(1);
+    CK(cudaMemcpy(dP2, &P2, sizeof(P2), cudaMemcpyHostToDevice));
+    attention(dq, kv, nh, nkv, hd, split, true, 0, float(scale), dP, nullptr, 0, d_two, nh * hd, d_part, splits, TL, 0,
+              window, nullptr, CanvasKeys{}, ds);
+    attention(dq + size_t(split) * nh * hd, kv, nh, nkv, hd, R - split, true, 0, float(scale), dP2, nullptr, 0,
+              d_two + size_t(split) * nh * hd, nh * hd, d_part, splits, TL, 0, window, nullptr, CanvasKeys{}, ds);
+    expect("attention " + tag + " as passes of " + std::to_string(split) + " and " + std::to_string(R - split) +
+               " rows: the same bits",
+           down(d_two, want.size()), whole, 0.0);
+    CK(cudaFree(d_two));
+    CK(cudaFree(dP2));
+  }
   for (void* p : {static_cast<void*>(dk), static_cast<void*>(dv), static_cast<void*>(dq), static_cast<void*>(d_out),
                   static_cast<void*>(d_part), static_cast<void*>(dP)})
     CK(cudaFree(p));
@@ -320,6 +376,7 @@ void test_gpt_oss() {
     for (auto [H, I] : {std::pair{64, 96}, {64, 160}, {256, 192}}) {
       for (int R : {1, 5, 37}) moe_case(4, 2, H, I, R, in);
     }
+    moe_case(4, 2, 64, 96, 300, in);  // more than 128 rows an expert: the pass kernels' widest tiles
     for (int R : {1, 3, 40}) moe_case(32, 4, 2880, 2880, R, in);  // gpt-oss-20b's experts
   }
   // Rounds and prefills, with and without sinks, the grouped kernel's 8 heads of 64 a KV head, and a sliding window of
@@ -333,6 +390,10 @@ void test_gpt_oss() {
     // prefill passes the window bites in (k_flash_prefill's sliding window), and whose keys wrap the ring
     attention_case(64, 8, 64, 100, 96, 32, 160, sinks, kPrefills);
     attention_case(64, 8, 64, 300, 40, 128, 128 + 64, sinks, kPrefills);
+    // split at positions off the key tiles: a row's tiles don't depend on where its pass starts
+    attention_case(64, 8, 64, 100, 96, 32, 160, sinks, kPrefills, 37);
+    attention_case(64, 8, 64, 300, 96, 128, 128 + 96, sinks, kPrefills, 41);
+    attention_case(64, 8, 64, 200, 96, 0, 0, sinks, kPrefills, 29);
   }
   yarn_case();
   route_case();

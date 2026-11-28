@@ -190,6 +190,8 @@ void apply_environment(EngineOptions* o) {
     if (const auto v = os::env_bool(env::kAdaptive)) o->adaptive = *v;
   if (!o->learn_costs_given)
     if (const auto v = os::env_bool(env::kLearnCosts)) o->learn_costs = *v;
+  if (!o->warm_prefill_given)
+    if (const auto v = os::env_bool(env::kWarmPrefill)) o->warm_prefill = *v;
 }
 
 namespace {
@@ -337,6 +339,17 @@ Grammar& Engine::grammar() {
   return grammar_;
 }
 
+// Prose, not a count: after "1, 2, 3, 4, 5, 6," the drafts are digits and commas, and a sparse-MoE target routes a
+// round of those few tokens to few experts, so its wide rounds timed cheap (Inkling-2-Mini: 2 -> 3 drafts +0.7 ms
+// timed, +1.5 ms on chat prompts).  A tokenizer that makes more than 64 tokens of it keeps its end.
+std::vector<int32_t> Engine::timing_prompt() const {
+  std::vector<int32_t> prompt = tok_.encode("The quick brown fox jumps over the lazy dog. In the beginning was the word, and "
+                                            "the word was with the engine, and the engine was fast. When the evening "
+                                            "came, the travellers");
+  if (prompt.size() > 64) prompt.erase(prompt.begin(), prompt.end() - 64);
+  return prompt;
+}
+
 bool Engine::build_and_calibrate_plans(double* t_plans, double* t_rounds, std::string* err) {
   // Prefill passes run whole multiples of the backend's alignment (numerics.md: K).
   prefill_align_ = std::max(1, int(api_->prefill_align(bm_)));
@@ -382,14 +395,9 @@ bool Engine::build_and_calibrate_plans(double* t_plans, double* t_rounds, std::s
                              : std::min(plans_.widths[i], chain > 0 ? chain : plans_.widths[i]);
     }
   *t_plans = os::now_ms();
-  // The rounds are timed where this prompt ends, on the drafts that follow it.  Prose, not a count: after "1, 2, 3, 4,
-  // 5, 6," the drafts are digits and commas, and a sparse-MoE target routes a round of those few tokens to few experts,
-  // so its wide rounds timed cheap (Inkling-2-Mini: 2 -> 3 drafts +0.7 ms timed, +1.5 ms on chat prompts).  A tokenizer
-  // that makes more than 64 tokens of it keeps its end, and the longer context below ends with it too.
-  std::vector<int32_t> prompt = tok_.encode("The quick brown fox jumps over the lazy dog. In the beginning was the word, and "
-                                            "the word was with the engine, and the engine was fast. When the evening "
-                                            "came, the travellers");
-  if (prompt.size() > 64) prompt.erase(prompt.begin(), prompt.end() - 64);
+  // The rounds are timed where timing_prompt() ends, on the drafts that follow it; the longer context below ends
+  // with it too.
+  const std::vector<int32_t> prompt = timing_prompt();
   std::vector<std::string> labels, given_labels;
   for (size_t i = 0; i < plans_.widths.size(); ++i) labels.push_back(round_name(i));
   for (int k : plans_.given_widths) given_labels.push_back(std::to_string(k));
@@ -451,19 +459,6 @@ bool Engine::build_and_calibrate_plans(double* t_plans, double* t_rounds, std::s
     }
   } else {
     spec::warm_rounds(api_, bm_, plans_.prefill, plans_.rounds, prompt);
-  }
-  // Prefill passes past the rounds' rows (these prefilled the prompt's 64), where the device loads kernels on their
-  // first launch (a GPU): 256 rows, then twice as many up to the longest pass, the kernels' configurations changing
-  // with the rows (gpt-oss-20b: its router's bf16 GEMM past 384).
-  if (device_.sm_major > 0) {
-    std::vector<int> lengths;
-    for (int n = 256; n < 2 * prefill_chunk_; n *= 2) {
-      const int len = std::min(n, prefill_chunk_) / prefill_align_ * prefill_align_;
-      if (len > 64 && (lengths.empty() || len > lengths.back())) lengths.push_back(len);
-    }
-    if (const std::string why = spec::warm_prefill(api_, bm_, plans_.prefill, lengths, prompt);
-        !why.empty() && opt_.verbose)
-      log::info("flyx: prefill warm-up stopped at %s", why.c_str());
   }
   // The costs the controller chooses by from here: these timings, then what the rounds read teach (RoundCosts),
   // where they choose (one plan and no lookup: nothing timed, nothing to learn).  A drafter's wider chain costs no
@@ -1078,6 +1073,22 @@ bool Engine::load(const std::string& path, const EngineOptions& opt, std::string
               load_adjustments_.back().detail.c_str());
   }
 
+  // Prefill passes past the rounds' rows (these prefilled the timing prompt's 64), where the device loads kernels on
+  // their first launch (a GPU), once the load has succeeded: 256 rows, then twice as many up to the longest pass, the
+  // kernels' configurations changing with the rows (gpt-oss-20b: its experts' tiles by the rows an expert gets).
+  const double warm_t0 = os::now_ms();
+  if (device_.sm_major > 0 && opt_.warm_prefill) {
+    std::vector<int> lengths;
+    for (int n = 256; n < 2 * prefill_chunk_; n *= 2) {
+      const int len = std::min(n, prefill_chunk_) / prefill_align_ * prefill_align_;
+      if (len > 64 && (lengths.empty() || len > lengths.back())) lengths.push_back(len);
+    }
+    if (const std::string why = spec::warm_prefill(api_, bm_, plans_.prefill, lengths, timing_prompt());
+        !why.empty() && opt_.verbose)
+      log::info("flyx: prefill warm-up stopped at %s", why.c_str());
+  }
+  const double warm_ms = os::now_ms() - warm_t0;
+
   // Record effective active drafter weight precision directly from the backend (ABI 48).
   if (drafter_ != "none" && api_->draft_weights) {
     if (const char* dw = api_->draft_weights(bm_); dw && *dw) active_draft_weights_ = dw;
@@ -1096,10 +1107,11 @@ bool Engine::load(const std::string& path, const EngineOptions& opt, std::string
   t[6] = os::now_ms();
   if (opt_.verbose)
     log::info("flyx: load %.2f s: file %.2f s (%s), tokenizer and chat template %.2f s, backend library "
-              "%.2f s, model %.2f s, backend open %.2f s, plans %.2f s, rounds timed %.2f s, memory %.2f s",
+              "%.2f s, model %.2f s, backend open %.2f s, plans %.2f s, rounds timed %.2f s, prefill warm-up %.2f s, "
+              "memory %.2f s",
               (t[6] - t[0]) / 1000, (t[1] - t[0]) / 1000, ahead.what().c_str(), (t[2] - t[1]) / 1000,
               (t[3] - t[2]) / 1000, (t[4] - t[3]) / 1000, (t[5] - t[4]) / 1000, lower_ms_ / 1000, timed_ms_ / 1000,
-              std::max(0.0, t[6] - t[5] - lower_ms_ - timed_ms_) / 1000);
+              warm_ms / 1000, std::max(0.0, t[6] - t[5] - lower_ms_ - timed_ms_ - warm_ms) / 1000);
   return true;
 }
 
