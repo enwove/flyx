@@ -14,6 +14,7 @@
 #pragma once
 
 #include <cstdint>
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -77,6 +78,14 @@ GpuAppSnapshot list_ram_apps();
 GpuCloseResult close_ram_app(const std::string& id, bool force);
 
 // Pure helpers exposed for unit testing.
+// Which of the GPUs NVML lists (`names` by index; nullopt where its handle or name was not read) a hint names: the
+// first it names, else the first read (-1: none read); `unique`: readings of it are surely the hinted device's, the
+// one GPU there is or the only one the hint names with every GPU's name read (one not read could be its twin).
+struct DeviceMatch {
+  int index = -1;
+  bool unique = false;
+};
+DeviceMatch match_device(const std::vector<std::optional<std::string>>& names, const std::string& hint);
 bool is_system_gpu_process(const std::string& proc_name, const std::string& exe_path);
 std::string clean_gpu_app_name(const std::string& proc_name, const std::string& product_name,
                                const std::string& file_desc);

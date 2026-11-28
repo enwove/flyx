@@ -5,7 +5,9 @@
 
 #include <cstdio>
 #include <cstdlib>
+#include <optional>
 #include <string>
+#include <vector>
 
 namespace {
 
@@ -88,7 +90,29 @@ void test_live_listing_safety() {
 
 }  // namespace
 
+// Which NVML device a hint names, and whether its readings are surely that device's: never where a GPU's handle or
+// name was not read (it could be the hinted one's twin), nor where two of that name are listed.
+void test_device_match() {
+  using flyx::server::match_device;
+  using Names = std::vector<std::optional<std::string>>;
+  const auto one = match_device(Names{"NVIDIA GeForce RTX 4090", "NVIDIA GeForce RTX 3090"}, "RTX 4090");
+  CHECK(one.index == 0 && one.unique);
+  const auto twins = match_device(Names{"NVIDIA GeForce RTX 4090", "NVIDIA GeForce RTX 4090"}, "RTX 4090");
+  CHECK(twins.index == 0 && !twins.unique);
+  const auto unread = match_device(Names{std::nullopt, "NVIDIA GeForce RTX 4090"}, "RTX 4090");
+  CHECK(unread.index == 1 && !unread.unique);  // the device not read could be the other 4090
+  const auto unread_after = match_device(Names{"NVIDIA GeForce RTX 4090", std::nullopt}, "RTX 4090");
+  CHECK(unread_after.index == 0 && !unread_after.unique);
+  const auto alone = match_device(Names{"NVIDIA GeForce RTX 5070 Ti"}, "");
+  CHECK(alone.index == 0 && alone.unique);  // the one GPU there is
+  const auto none_named = match_device(Names{"NVIDIA A100", "NVIDIA H100"}, "RTX 4090");
+  CHECK(none_named.index == 0 && !none_named.unique);  // the first read, not known to be the hinted device
+  const auto nothing = match_device(Names{std::nullopt}, "RTX 4090");
+  CHECK(nothing.index == -1 && !nothing.unique);
+}
+
 int main() {
+  test_device_match();
   test_system_classification();
   test_clean_app_names();
   test_group_ids();

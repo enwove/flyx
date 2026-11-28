@@ -104,6 +104,26 @@ struct NvmlProcessInfoV1 {
 
 }  // namespace
 
+DeviceMatch match_device(const std::vector<std::optional<std::string>>& names, const std::string& hint) {
+  DeviceMatch m;
+  int first = -1, named = -1, matches = 0;
+  bool all_read = true;
+  for (int i = 0; i < int(names.size()); ++i) {
+    if (!names[i]) {
+      all_read = false;
+      continue;
+    }
+    if (first < 0) first = i;
+    if (!hint.empty() && contains_ci(*names[i], hint)) {
+      if (named < 0) named = i;
+      ++matches;
+    }
+  }
+  m.index = named >= 0 ? named : first;
+  m.unique = m.index >= 0 && all_read && (names.size() == 1 || (named >= 0 && matches == 1));
+  return m;
+}
+
 bool is_system_gpu_process(const std::string& proc_name, const std::string& exe_path) {
   const std::string base = to_lower_ascii(strip_exe_suffix(proc_name));
   static const std::unordered_set<std::string> kSystemNames = {
@@ -282,22 +302,16 @@ bool query_nvml_memory(const std::string& device_name, uint64_t* total, uint64_t
   if (!nv.ok) return false;
   unsigned int n = 0;
   if (nv.count(&n) != 0 || n == 0) return false;
-  NvmlDevice* picked = nullptr;
-  NvmlDevice* first = nullptr;
-  int matches = 0;
+  std::vector<NvmlDevice*> handles(n, nullptr);
+  std::vector<std::optional<std::string>> names(n);
   for (unsigned int i = 0; i < n; ++i) {
-    NvmlDevice* d = nullptr;
-    if (nv.by_index(i, &d) != 0 || !d) continue;
-    if (!first) first = d;
     char buf[128] = {};
-    if (nv.name(d, buf, sizeof(buf)) == 0 && !device_name.empty() && contains_ci(buf, device_name)) {
-      if (!picked) picked = d;
-      ++matches;
-    }
+    if (nv.by_index(i, &handles[i]) == 0 && handles[i] && nv.name(handles[i], buf, sizeof(buf)) == 0) names[i] = buf;
   }
-  *unique = matches == 1 || (n == 1 && first);
-  if (!picked) picked = first;
-  if (!picked) return false;
+  const DeviceMatch match = match_device(names, device_name);
+  if (match.index < 0) return false;
+  NvmlDevice* picked = handles[size_t(match.index)];
+  *unique = match.unique;
   NvmlMemory mem{};
   if (nv.memory(picked, &mem) != 0 || mem.total == 0) return false;
   *total = uint64_t(mem.total);
@@ -1223,26 +1237,17 @@ LinuxScan scan_linux_gpu_apps(const std::string& device_hint) {
   unsigned int n = 0;
   if (nv.count(&n) != 0 || n == 0) return out;
 
-  NvmlDevice* dev = nullptr;
-  std::string dev_name;
-  bool named = false;
-  int matches = 0;
+  std::vector<NvmlDevice*> handles(n, nullptr);
+  std::vector<std::optional<std::string>> names(n);
   for (unsigned int i = 0; i < n; ++i) {
-    NvmlDevice* d = nullptr;
-    if (nv.by_index(i, &d) != 0 || !d) continue;
     char buf[128] = {};
-    nv.name(d, buf, sizeof(buf));
-    if (!device_hint.empty() && contains_ci(buf, device_hint)) {
-      if (!named) dev = d, dev_name = buf, named = true;
-      ++matches;
-    }
-    if (!dev) {
-      dev = d;
-      dev_name = buf;
-    }
+    if (nv.by_index(i, &handles[i]) == 0 && handles[i] && nv.name(handles[i], buf, sizeof(buf)) == 0) names[i] = buf;
   }
-  if (!dev) return out;
-  out.snap.device_unique = matches == 1 || n == 1;
+  const DeviceMatch match = match_device(names, device_hint);
+  if (match.index < 0) return out;
+  NvmlDevice* dev = handles[size_t(match.index)];
+  const std::string dev_name = *names[size_t(match.index)];
+  out.snap.device_unique = match.unique;
 
   NvmlMemory mem{};
   if (nv.memory(dev, &mem) != 0 || mem.total == 0) return out;
