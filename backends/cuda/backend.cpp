@@ -770,7 +770,7 @@ int open_model(const flyx_model_desc* desc, const flyx_open_options* opts, flyx_
     // several sessions as wide, launch_batch): wide=1, or wide=auto where every projection of the stack is NVFP4 or
     // bf16 (17..64-row GEMMs that read the weights once; GGML blocks take 16-row strips) and 24 GB of the GPU stay free
     // for the sequences' wider round buffers.  Qwen3.8-27B BF16 with EAGLE-4 on an RTX PRO 6000 Server Edition: 8
-    // sessions 372.4 tok/s with them against 288.7 in batches of 16 rows, one session 128.1 against 126.4.
+    // sessions 443.6 tok/s with them against 290.2 in batches of 16 rows, one session 128.2 against 126.2.
     if (m->opt.wide != 1) {
       bool once = true;  // every projection read once by a GEMM of 17..64 rows
       auto read_once = [](const Lin& l) { return !l.packed() && (l.q || l.w); };
