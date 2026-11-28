@@ -30,6 +30,7 @@
 #include "flyx/backend_abi.h"
 #include "models/vision/preprocess.h"
 #include "ops/dtype/ref.h"
+#include "tests/common/gpu.h"
 
 namespace {
 
@@ -1095,9 +1096,13 @@ BackendRun run_backend_vlm(const char* name, const TinyVlm& vlm, const std::vect
 
   // 4. Intra-pass snapshot with snap_rope_delta != pass-end rope_delta, plus FLYX_PREFILL_SNAP_NONE.
   //    Active when the backend uses chunked prefill alignment (align > 1, e.g. hybrid GDN+Attn on CUDA).
-  if (vlm.has_gdn && std::string(name) == "cuda")
-    CHECK(api->prefill_align && api->prefill_align(bm) > 1 && (64 % api->prefill_align(bm)) == 0,
-          "hybrid GDN model on CUDA must have chunked prefill_align dividing 64");
+  if (vlm.has_gdn && std::string(name) == "cuda") {
+    const int32_t align = api->prefill_align ? api->prefill_align(bm) : 0;
+    if (flyx::test::gdn_chunked_device(api))
+      CHECK(align > 1 && 64 % align == 0, "hybrid GDN model on a chunked-GDN GPU must have prefill_align dividing 64");
+    else
+      CHECK(align == 1, "hybrid GDN model on a float32-recurrence GPU (datacenter parts) must have prefill_align 1");
+  }
   if (api->prefill_snapshot && api->prefill_align && api->prefill_align(bm) > 1) {
     // Extend prompt (64 tokens, rope_delta=-2) with a 2nd image at rows 66..69 (total 72 tokens, pass-end rope_delta=-4).
     std::vector<int32_t> prompt2 = prompt;

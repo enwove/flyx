@@ -171,27 +171,34 @@ flyx_backend_entry_fn find_builtin_backend(const std::string& name) {
 bool open_backend(const EngineOptions& opt, std::unique_ptr<os::DynLib>* out_lib, const flyx_backend_api** out_api,
                   flyx_device_info* out_info, std::string* err) {
   std::string dir = opt.backend_dir.empty() ? os::executable_dir() : opt.backend_dir;
+  // The backend asked for; else the build's own: cuda where it ships one, cpu_ref (the float64 reference) where it
+  // has none.  A cuda backend that is there but cannot run on this machine (no GPU, a GPU before sm_80, a driver too
+  // old) is an error, not the reference in its place: a real model on cpu_ref takes minutes a token.
   std::vector<std::string> names;
   std::string want = opt.backend;
   if (!want.empty()) names = {want};
   else names = {"cuda", "cpu_ref"};
   std::string tried;
+  auto unusable = [&](const std::string& n) {
+    *err = "the " + n + " backend is not usable here:" + tried +
+           "\n(--backend cpu_ref runs the float64 reference instead: for checking, far too slow for a real model)";
+    return false;
+  };
   for (const auto& n : names) {
     if (opt.backend_dir.empty()) {
       if (auto entry = find_builtin_backend(n)) {
         const flyx_backend_api* api = entry();
         if (!api || api->abi_version != FLYX_BACKEND_ABI_VERSION || api->struct_size < sizeof(flyx_backend_api)) {
           tried += "\n  built-in " + n + ": incompatible backend ABI";
+          if (want.empty() && n == names.front()) return unusable(n);
           continue;
         }
         flyx_device_info info{};
         if (api->probe(&info) != 0) {
           tried += "\n  built-in " + n + ": " + api->last_error();
+          if (want.empty() && n == names.front()) return unusable(n);
           continue;
         }
-        if (n != names.front())
-          log::warn("flyx: the %s backend is not usable here, so %s runs:%s", names.front().c_str(), n.c_str(),
-                    tried.c_str());
         *out_lib = nullptr;
         *out_api = api;
         *out_info = info;
@@ -224,17 +231,15 @@ bool open_backend(const EngineOptions& opt, std::unique_ptr<os::DynLib>* out_lib
         failures += "\n  " + path + ": " + api->last_error();
         continue;
       }
-      // A backend passed over is said without -v: on Windows, Smart App Control once refused an unsigned
-      // libflyx-cuda.dll and a real model ran on the float64 reference, a minute a 6000-token prefill, unexplained.
-      if (n != names.front())
-        log::warn("flyx: the %s backend is not usable here, so %s runs:%s", names.front().c_str(), n.c_str(),
-                  tried.c_str());
       *out_lib = std::move(lib);
       *out_api = api;
       *out_info = info;
       return true;
     }
     tried += failures.empty() ? "\n  " + file + " not found in backend paths relative to " + dir : failures;
+    // The build's cuda backend is there and does not run here (on Windows, Smart App Control once refused an
+    // unsigned libflyx-cuda.dll, and a real model then ran on the reference, a minute a 6000-token prefill).
+    if (want.empty() && n == names.front() && !failures.empty()) return unusable(n);
   }
   *err = "no usable backend" + tried;
   return false;

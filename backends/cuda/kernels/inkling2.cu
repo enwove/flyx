@@ -1389,6 +1389,7 @@ __global__ void k_rel_attn_prep(const float* __restrict__ q_in, int ldq, const f
       kv.vqs[size_t(sslot) * nkv + kh] = gridv;
     }
   }
+  if (kv.host_writes) host_writes_done();  // as k_attn_prep
 }
 
 // ---- rel_bias_table -----------------------------------------------------------------------

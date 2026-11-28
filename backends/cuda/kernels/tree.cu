@@ -29,6 +29,7 @@ __global__ void k_compact_kv(const KvRows* table, const DevParams* P, const Tree
       c.where.vscales(to)[size_t(to) * c.nkv + i] = c.where.vscales(from)[size_t(from) * c.nkv + i];
     }
   }
+  if (c.where.host_writes) host_writes_done();  // rows past the device part: host memory the next kernel reads
 }
 
 // grid ceil(words / 256); block 256.

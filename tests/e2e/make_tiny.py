@@ -1266,10 +1266,35 @@ def write_dv_rounds(out: str, cases: dict) -> int:
     return n
 
 
+def usable_cpus() -> int:
+    """The processors this process may run on: its affinity, at most its cgroup's CPU quota (cgroup v2 cpu.max, v1
+    cpu.cfs_quota_us).  A container sees the host's processors (os.cpu_count, the affinity too) but runs on its quota:
+    a RunPod pod of an RTX 5090 saw 224 of a quota of 23.8, and a pool of 224 processes made the assets in over an hour
+    instead of minutes."""
+    n = len(os.sched_getaffinity(0)) if hasattr(os, "sched_getaffinity") else (os.cpu_count() or 1)
+    quota = None  # (quota, period) in microseconds; a quota of "max" or -1: none
+    try:
+        with open("/sys/fs/cgroup/cpu.max", encoding="ascii") as f:
+            q, period = f.read().split()[:2]
+        quota = (-1 if q == "max" else int(q), int(period))
+    except (OSError, ValueError):
+        try:
+            with open("/sys/fs/cgroup/cpu/cpu.cfs_quota_us", encoding="ascii") as f:
+                q = int(f.read())
+            with open("/sys/fs/cgroup/cpu/cpu.cfs_period_us", encoding="ascii") as f:
+                quota = (q, int(f.read()))
+        except (OSError, ValueError):
+            pass
+    if quota is not None and quota[0] > 0 and quota[1] > 0:
+        n = min(n, max(1, quota[0] // quota[1]))
+    return max(1, n)
+
+
 def in_processes(calls: list) -> list:
     """calls: (a function of this script, its arguments), independent of each other: each a process's own job, as many
-    at once as there are processors (one torch thread each), their results in calls' order."""
-    workers = min(len(calls), os.cpu_count() or 1)
+    at once as there are processors to run them (usable_cpus; one torch thread each), their results in calls'
+    order."""
+    workers = min(len(calls), usable_cpus())
     if workers <= 1:
         return [call(c) for c in calls]
     import multiprocessing
@@ -1495,4 +1520,7 @@ def write_golden(path, out_json, prompts, vocab, min_margin=0.0, keep=None):
 
 
 if __name__ == "__main__":
+    # torch's own threads too: as many as the host's processors by default, which a container's quota then throttles
+    # (an RTX 5090 pod: 120 threads on a quota of 12, the assets not made in 35 minutes)
+    torch.set_num_threads(usable_cpus())
     main(ARG_OUT, ARG_GROUPS)

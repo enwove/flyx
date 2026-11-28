@@ -604,6 +604,13 @@ int probe(flyx_device_info* out) {
                 (need == 13000 ? " (driver 580 or newer)" : " or newer"));
   int n = 0;
   cudaError_t e = cudaGetDeviceCount(&n);
+  // A CUDA forward-compatibility driver (a container's libcuda newer than the kernel driver: the version above is its)
+  // runs on data-center GPUs only: an RTX 4080 SUPER with kernel driver 570 under a CUDA 13 image said only "forward
+  // compatibility was attempted on non supported HW".
+  if (e == cudaErrorCompatNotSupportedOnDevice)
+    return fail("the NVIDIA kernel driver is older than CUDA " + std::to_string(need / 1000) + " needs" +
+                (need == 13000 ? " (580 or newer)" : "") +
+                ", and the CUDA forward-compatibility driver in use runs on data-center GPUs only: update the driver");
   if (e != cudaSuccess || n == 0) return fail(std::string("no CUDA device: ") + cudaGetErrorString(e));
   cudaDeviceProp prop{};
   if (cudaGetDeviceProperties(&prop, 0) != cudaSuccess) return fail("cannot query device 0");

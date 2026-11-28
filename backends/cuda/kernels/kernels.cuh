@@ -802,6 +802,9 @@ struct KvRef {
   int ring_pad = 0;
   // A block drafter's binary16 cache: values past it saturate at +-65504 (kv16_of); the target's keep the rounding.
   bool saturate = false;
+  // A pass's writes go to host memory too (K/V past the device part, a copy in host memory): the writer fences them
+  // (host_writes_done) before it ends.
+  bool host_writes = false;
   __host__ __device__ bool fp8() const { return ks != nullptr; }
   __host__ __device__ float* kscales(int pos) const { return pos < scale_split ? ks : ks_far; }
   __host__ __device__ float* vscales(int pos) const { return pos < scale_split ? vs : vs_far; }
