@@ -34,6 +34,9 @@ std::vector<uint64_t> integers(const GgufMeta& m, const char* name, size_t count
 class Decoder final : public Model {
  public:
   explicit Decoder(const ModelFile& file) : Model(file), meta_(file) {}
+  const char* load_note() const override {
+    return dense_only_ ? "qwen4exp GGUF attention.compress_ratios are all zero. Using full dense attention (sparse QSA disabled)." : nullptr;
+  }
   void build(const ModelFile& file, const ModelOptions& options);
   std::vector<flyx_node> prefill_program() const override {
     auto p = trunk_;
@@ -61,6 +64,7 @@ class Decoder final : public Model {
   void ple(const std::string& prefix);
   GgufMeta meta_;
   int h_ = 0, streams_ = 0, rank_ = 0, wide_ = 0, vocab_ = 0, head_ = -1;
+  bool dense_only_ = false;
   double eps_ = 0;
   std::vector<uint64_t> multipliers_, offsets_, moduli_;
   std::vector<flyx_node> trunk_;
@@ -243,7 +247,7 @@ void Decoder::ple(const std::string& prefix) {
   multipliers_ = integers(meta_, "ple.layer_multipliers", p.ngram);
   offsets_ = integers(meta_, "ple.head_offsets", heads);
   moduli_ = integers(meta_, "ple.head_vocab_sizes", heads);
-  const auto* table = tables_.tensor("per_layer_token_embd.weight");
+  const auto* table = tables_.tensor(kPleTable);
   require(table && table->ndim == 2 && table->shape[0] > 0 && table->shape[0] <= INT_MAX, "invalid PLE table");
   for (uint64_t m : multipliers_)
     require((m & 1) && m <= uint64_t(INT64_MAX) / uint64_t(vocab_), "invalid PLE multiplier");
@@ -256,7 +260,7 @@ void Decoder::ple(const std::string& prefix) {
   p.multipliers = multipliers_.data();
   p.offsets = offsets_.data();
   p.moduli = moduli_.data();
-  p.table = tables_.weight("per_layer_token_embd.weight", {table->shape[0], p.row_width});
+  p.table = tables_.weight(kPleTable, {table->shape[0], p.row_width});
   p.key = tables_.weight(prefix + "ple_key.weight", {wide_, embed});
   p.value = tables_.weight(prefix + "ple_value.weight", {h_, embed});
   p.norm_key = tables_.norm(prefix + "ple_norm_key.weight", wide_, 0, eps_);
@@ -294,13 +298,14 @@ void Decoder::build(const ModelFile& file, const ModelOptions& options) {
   const int n = m.count("block_count"), interval = m.count("full_attention_interval");
   require(n <= kMaxLayers, "too many decoder layers");
   const auto ratios = integers(m, "attention.compress_ratios", n);
+  dense_only_ = std::all_of(ratios.begin(), ratios.end(), [](uint64_t r) { return r == 0; });
   int ple_layer = -1;
   if (m.has("ple.layers") && !m.at("ple.layers").empty()) {
     const auto layers = integers(m, "ple.layers", 1);
     require(layers[0] < uint64_t(n) && (layers[0] + 1) % interval != 0, "invalid PLE layer");
     ple_layer = int(layers[0]);
   }
-  require((ple_layer >= 0) == tables_.has("per_layer_token_embd.weight"), "incomplete PLE table metadata");
+  require((ple_layer >= 0) == tables_.has(kPleTable), "incomplete PLE table metadata");
   flyx_block emb{};
   emb.kind = FLYX_BLOCK_EMBED;
   emb.embed = {h_, vocab_, tables_.weight("token_embd.weight", {vocab_, h_})};

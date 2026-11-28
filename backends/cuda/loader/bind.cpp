@@ -6,6 +6,7 @@
 // context k|v, DV's adapters on one input), norms as float.  Knows block
 // kinds, not models.
 #include "backends/cuda/loader/loader.h"
+#include "backends/cuda/loader/ple_budget.h"
 
 #include <algorithm>
 #include <cstring>
@@ -1589,18 +1590,6 @@ int resolve_vision_device(const flyx_model_desc& desc, const BackendOptions& opt
   return placement;
 }
 
-int resolve_ple(const flyx_model_desc& d, const flyx_open_options* opts, uint64_t free_bytes) {
-  if (opts && opts->ple_placement) return opts->ple_placement;
-  uint64_t bytes = 0, table = 0;
-  for (int i = 0; i < d.n_weights; ++i)
-    if (d.weights[i].t) bytes = size_add(bytes, d.weights[i].t->nbytes);
-  for (int i = 0; i < d.n_blocks; ++i)
-    if (d.blocks[i].kind == FLYX_BLOCK_PLE) table = size_add(table, d.weights[d.blocks[i].ple.table].t->nbytes);
-  if (free_bytes >= bytes && free_bytes - bytes >= (uint64_t(2) << 30)) return FLYX_PLE_GPU;
-  if (opts && table <= opts->ple_host_room) return FLYX_PLE_HOST;
-  return opts && opts->ple_hot_bytes ? FLYX_PLE_HYBRID : FLYX_PLE_DISK;
-}
-
 int estimate_load(const flyx_model_desc* desc, const flyx_open_options* opts, uint64_t free_vram,
                   uint64_t total_vram, flyx_load_estimate* out) try {
   if (!desc || !out) return -1;
@@ -1667,7 +1656,8 @@ int estimate_load(const flyx_model_desc* desc, const flyx_open_options* opts, ui
   out->vision_device = resolve_vision_device(*desc, bo, free_vram, &vision_gpu_bytes, &is_vis);
 
   std::vector<char> is_expert(size_t(nw), 0);
-  uint64_t dv_extra = 0, block_extra = 0, ple_bytes = 0;
+  uint64_t dv_extra = 0, block_extra = 0, ple_bytes = 0, ple_tables = 0;
+  bool file_backed = true;
   std::vector<int> dflash_ctx_ws;  // stacked second copy of each DFlash2 or DSpine layer's k|v (f.ctx)
   for (int i = 0; i < desc->n_blocks; ++i) {
     const flyx_block& b = desc->blocks[i];
@@ -1675,7 +1665,9 @@ int estimate_load(const flyx_model_desc* desc, const flyx_open_options* opts, ui
       if (bo.embed == 1 && !head_reads(*desc, b.embed.table)) mark(is_host_embed, b.embed.table);
     } else if (b.kind == FLYX_BLOCK_PLE) {
       mark(is_host_embed, b.ple.table);
-      if (resolve_ple(*desc, opts, free_vram) == FLYX_PLE_GPU) ple_bytes += desc->weights[b.ple.table].t->nbytes;
+      const auto& table = *desc->weights[b.ple.table].t;
+      ple_tables = size_add(ple_tables, table.nbytes);
+      file_backed = file_backed && table.read_at;
       ple_bytes += sizeof(uint64_t) * (b.ple.ngram + 2ull * (b.ple.ngram - 1) * b.ple.heads_per_order);
     } else if (b.kind == FLYX_BLOCK_MTP) {
       mark_norm(is_drafter, b.mtp.norm_emb), mark_norm(is_drafter, b.mtp.norm_hidden), mark_norm(is_drafter, b.mtp.norm);
@@ -1834,7 +1826,19 @@ int estimate_load(const flyx_model_desc* desc, const flyx_open_options* opts, ui
   out->draft_compact_savings = cur_draft_bytes > nvfp4_draft_bytes ? cur_draft_bytes - nvfp4_draft_bytes : 0;
   out->weights_bytes = target_bytes + vision_gpu_bytes + out->draft_weights_bytes;
   // Minimum non-weight device headroom: CUDA context + kernel modules + workspace + minimal KV/graphs.
-  out->min_runtime_bytes = std::clamp<uint64_t>(out->weights_bytes / 20, 384ull << 20, 1ull << 30);
+  if (ple_tables) {
+    const uint64_t resident = size_add(out->weights_bytes, ple_tables);
+    out->ple_placement = opts ? opts->ple_placement : FLYX_PLE_AUTO;
+    if (out->ple_placement == FLYX_PLE_AUTO) {
+      const int ctx = std::max<int>(FLYX_MAX_ROWS, opts ? opts->max_ctx : 0);
+      out->ple_placement = ple_fits_gpu(free_vram, total_vram, resident, out->target_kv_bytes_per_position, ctx)
+                               ? FLYX_PLE_GPU
+                               : interfaces::host_ple_placement(ple_tables, file_backed, opts ? opts->ple_host_room : 0,
+                                                                opts ? opts->ple_hot_bytes : 0);
+    }
+    if (out->ple_placement == FLYX_PLE_GPU) out->weights_bytes = resident;
+  }
+  out->min_runtime_bytes = min_runtime(out->weights_bytes);
   // Extra headroom above hard_need to keep drafter weights at full auto precision (vs compacting to NVFP4).
   out->comfort_margin_bytes =
       total_vram > 0 ? std::clamp<uint64_t>(total_vram / 8, 1ull << 30, 2560ull << 20) : (1536ull << 20);

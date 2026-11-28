@@ -83,6 +83,11 @@ inline bool parse_kv_method(std::string_view value, KvMethodSpec* out, std::stri
   return true;
 }
 
+inline int host_ple_placement(uint64_t bytes, bool file_backed, uint64_t room, uint64_t hot_bytes) {
+  if (!file_backed || bytes <= room) return FLYX_PLE_HOST;
+  return hot_bytes ? FLYX_PLE_HYBRID : FLYX_PLE_DISK;
+}
+
 inline bool parse_ple_placement(std::string_view value, int* out, std::string* err) {
   constexpr std::pair<std::string_view, int> modes[] = {{"auto", FLYX_PLE_AUTO},
                                                         {"gpu", FLYX_PLE_GPU},

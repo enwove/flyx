@@ -1256,7 +1256,6 @@ struct Pass {
 // loader/bind.cpp: blocks and the state table from the description's tables; uploads the weights.
 void bind(flyx_bmodel* m, const flyx_model_desc& d, LoadTimes* times = nullptr);
 // Resolve placement from the representation the loader uploads. Optionally report resident bytes and vision weights.
-int resolve_ple(const flyx_model_desc& desc, const flyx_open_options* opts, uint64_t free_bytes);
 int resolve_vision_device(const flyx_model_desc& desc, const BackendOptions& opt, uint64_t free_vram,
                           uint64_t* resident_bytes, std::vector<char>* vision_weights = nullptr);
 // Pre-flight device memory estimate (ABI 48: flyx_backend_api::estimate_load).

@@ -12,6 +12,7 @@
 #include <stdexcept>
 #include <vector>
 
+#include "core/interfaces/options.h"
 #include "flyx/backend_abi.h"
 
 namespace flyx::backends {
@@ -25,9 +26,7 @@ class PackedRows {
       throw std::runtime_error("PLE: invalid packed table");
     stride_ = size_t(table.nbytes / table.shape[0]);
     if (placement == FLYX_PLE_AUTO)
-      placement = table.nbytes <= host_room || !table.read_at ? FLYX_PLE_HOST
-                  : hot_bytes                                 ? FLYX_PLE_HYBRID
-                                                              : FLYX_PLE_DISK;
+      placement = interfaces::host_ple_placement(table.nbytes, table.read_at != nullptr, host_room, hot_bytes);
     if (placement == FLYX_PLE_GPU || placement == FLYX_PLE_HOST) {
       if (!table.data) throw std::runtime_error("PLE: resident table has no source");
       const auto* src = static_cast<const uint8_t*>(table.data);

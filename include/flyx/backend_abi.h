@@ -152,7 +152,7 @@ typedef struct {
   uint64_t nbytes;
   /* Optional borrowed shard handle, valid as long as data. read_at returns zero only after reading all bytes. */
   const void* file;
-  uint64_t file_offset;
+  uint64_t file_offset;          /* base GGUF tensor offset in this shard, unadjusted for sliced views */
   int (*read_at)(const void* file, uint64_t offset, void* dst, size_t bytes);
 } flyx_tensor_view;
 
@@ -1070,6 +1070,7 @@ typedef struct {
   uint64_t comfort_margin_bytes;  /* headroom above weights + min_runtime to keep full auto drafter precision */
   uint64_t target_kv_bytes_per_position; /* resident exact target K/V, including scales, before placement (ABI 48) */
   int32_t vision_device;                 /* resolved flyx_vision_device for this estimate (ABI 48) */
+  int32_t ple_placement;                 /* resolved table placement, AUTO when no PLE table (ABI 56) */
 } flyx_load_estimate;
 
 /* Device memory as the backend sees it (0 = unknown, e.g. a CPU backend). */

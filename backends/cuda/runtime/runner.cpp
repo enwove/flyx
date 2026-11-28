@@ -12,6 +12,7 @@
 
 #include "backends/common/snapshot_format.h"
 #include "backends/cuda/backend.h"
+#include "backends/cuda/runtime/ple_io.h"
 #include "backends/cuda/runtime/strata_snapshot.h"
 #include "backends/cuda/runtime/window_ring.h"
 
@@ -285,6 +286,8 @@ void reset_state(flyx_seq* s, int anchor) {
   s->ring_hi = 0;  // the rings are written again from position 0, in order
   s->dring.reset();
   set_params(s, 0, anchor, 0);
+  s->want_snap = -1;
+  s->ple_failed.store(false, std::memory_order_release);
 }
 
 namespace {
@@ -401,9 +404,18 @@ bool certified(const flyx_seq* s, const flyx_gen_params* g) {
   return s->cert.cols && g->temperature <= 0.f && !g->mask && !penalized(g) && !relaxed(g);  // relaxed: every score
 }
 
-void check_idle(flyx_seq* s) {
+void check_ple_io(flyx_seq* s) {
+  if (drain_failed_ple(s, sync_stream)) throw std::runtime_error("PLE packed row read failed");
+}
+
+void check_idle(flyx_seq* s, bool recover = false) {
+  if (recover && !s->pending.empty() && !s->ple_stages.empty())
+    sync_stream(s);  // the callback may not have reported its failure yet
+  if (recover) drain_failed_ple(s, sync_stream);
+  else check_ple_io(s);
   if (!s->pending.empty()) throw std::runtime_error("rounds still in flight");
   sync_stream(s);
+  if (!recover) check_ple_io(s);
 }
 
 int prefill_ex(flyx_plan* p, flyx_seq* s, const flyx_prefill_input* in, const flyx_gen_params* sample) {
@@ -522,7 +534,10 @@ int prefill_ex(flyx_plan* p, flyx_seq* s, const flyx_prefill_input* in, const fl
     for (auto& mt : s->meta)
       if (mt.valid && mt.start + mt.rows < rewind_from) mt.valid = false;
     if (in->n_embeds > 0 || in->pos_3d || in->set_rope_delta || !s->ple_stages.empty()) sync_stream(s);
-    if (s->ple_failed.load(std::memory_order_acquire)) return fail("PLE packed row read failed");
+    if (s->ple_failed.load(std::memory_order_acquire)) {
+      s->position -= n;  // restore may still use a checkpoint ending before this pass
+      check_ple_io(s);
+    }
     CK(cudaGetLastError());
     return 0;
   });
@@ -1561,6 +1576,7 @@ int launch(flyx_plan* p, flyx_seq* s, const flyx_gen_params* g) {
     return fail("a tree round of more than " + std::to_string(FLYX_MAX_ROWS) + " rows reads no strata copy");
   s->snap_pos = -1;  // rounds write the round slots
   return guarded([&] {
+    check_ple_io(s);
     // Hold prefill_mu across submission when sharing the VMM prefill slab so another session cannot evict
     // prefill_owner before this round's work is queued on s->st (lock order: prefill_mu before batch->mu).
     const bool shared = s->uses_shared_prefill();
@@ -1868,8 +1884,9 @@ int launch_batch(flyx_plan* const* plans, flyx_seq* const* seqs, const flyx_gen_
 
 int read_result(flyx_seq* s, flyx_round_result* out) {
   if (!s) return no_sequence("read");
-  if (s->pending.empty()) return fail("no round in flight");
   return guarded([&] {
+    check_ple_io(s);
+    if (s->pending.empty()) return fail("no round in flight");
     const unsigned long long seq = s->read_no + 1;
     if (s->pending.front().kind == 'R')
       wait_round(s, s->ev[seq % kRing]);
@@ -1877,7 +1894,7 @@ int read_result(flyx_seq* s, flyx_round_result* out) {
       CK(cudaEventSynchronize(s->ev[seq % kRing]));
     else
       poll_event(s->ev[seq % kRing], 0);
-    if (s->ple_failed.load(std::memory_order_acquire)) return fail("PLE packed row read failed");
+    check_ple_io(s);
     *out = s->ring_host[seq % kRing];
     if (out->seq_no != seq) return fail("ring entry out of order (" + std::to_string(out->seq_no) + ")");
     s->read_no = seq;
@@ -1911,8 +1928,7 @@ int read_logits(flyx_seq* s, int32_t row, float* out) {
     return fail("logits: the certified head scores only the rows it must (backend option head_cert=0)");
   return guarded([&] {
     sync_stream(s);
-    if (s->ple_failed.load(std::memory_order_acquire))
-      return fail("PLE packed row read failed");
+    check_ple_io(s);
     CK(cudaMemcpy(out, s->logits + size_t(row) * s->m->vocab, sizeof(float) * size_t(s->m->vocab),
                   cudaMemcpyDeviceToHost));
     return 0;
@@ -1930,10 +1946,9 @@ int ready(flyx_seq* s) {
       CK(cudaEventRecord(s->idle_ev, s->st));
       r = cudaEventQuery(s->idle_ev);
     }
+    check_ple_io(s);
     if (r == cudaErrorNotReady) return 0;
     CK(r);
-    if (s->ple_failed.load(std::memory_order_acquire))
-      return fail("PLE packed row read failed");
     return 1;
   });
 }
@@ -1968,7 +1983,12 @@ int set_reply(flyx_seq* s, const int32_t* tokens, int32_t n) {
 int rewind(flyx_seq* s, int32_t pos, int32_t anchor) {
   if (!s) return no_sequence("rewind");
   return guarded([&] {
-    check_idle(s);
+    check_idle(s, true);
+    if (s->ple_failed.load(std::memory_order_acquire)) {
+      for (auto& ck : s->ckp) ck.valid = false;
+      reset_state(s, anchor);
+      return int(pos == 0);
+    }
     if (pos > s->position) return fail("cannot rewind forward");
     if (pos == 0) {
       reset_state(s, anchor);  // a failed snapshot load may have written state before advancing the position
@@ -2062,7 +2082,12 @@ int restore(flyx_seq* s, int32_t c, int32_t anchor) {
   // The checkpoint keeps no drafter window of its own: what the ring held of it, a later position overwrote.
   if (!s->dring.kept(c)) return fail("restore: the drafter's window of that checkpoint is no longer in its ring");
   return guarded([&] {
-    check_idle(s);
+    check_idle(s, true);
+    const bool failed = s->ple_failed.load(std::memory_order_acquire);
+    // Older exact K/V positions survive failed appends. An unread round can wrap a drafter window
+    // before its overwrite reaches host bookkeeping, so that layout requires a full snapshot or reset.
+    if (failed && (s->dring.slots() || s->ckp[c].pos > s->position))
+      return fail("PLE recovery requires a full snapshot or rewind to zero");
     copy_checkpoint_state(s, c, flyx_round_slot(s->round), s->ckp[c].pos, false);
     for (auto& mt : s->meta) mt = {};
     s->rope_delta = s->ckp[c].rope_delta;
@@ -2073,6 +2098,11 @@ int restore(flyx_seq* s, int32_t c, int32_t anchor) {
     set_params(s, s->ckp[c].pos, anchor, s->round);
     s->dring.restored(c);
     s->reload_page_ring(s->position);
+    if (failed) {
+      for (auto& ck : s->ckp)
+        if (ck.pos > s->position) ck.valid = false;
+      s->ple_failed.store(false, std::memory_order_release);
+    }
     return s->position;
   });
 }
@@ -2313,7 +2343,7 @@ int snapshot_load(flyx_seq* s, const flyx_host_pieces* src, uint64_t bytes, int3
           [&](int begin, int pos) { return snapshot_size(s, begin, pos); }, &h, &err))
     return fail(err);
   return guarded([&] {
-    check_idle(s);
+    check_idle(s, h.begin == 0);
     HostCursor host{src, sizeof h};
     s->copy_home(false);  // the copy loaded to its host home, every position changed
     s->dring.replacing();  // a ring's every slot
@@ -2327,6 +2357,9 @@ int snapshot_load(flyx_seq* s, const flyx_host_pieces* src, uint64_t bytes, int3
     set_params(s, h.pos, anchor, s->round);
     s->dring.loaded(h.pos);
     sync_stream(s);  // the bytes are the caller's
+    if (s->ple_failed.exchange(false)) {
+      for (auto& ck : s->ckp) ck.valid = false;
+    }
     return s->position;
   });
 }
