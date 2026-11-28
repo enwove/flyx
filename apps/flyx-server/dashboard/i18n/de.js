@@ -823,6 +823,8 @@ export default {
     [/^(.+) is a drafter \(([\d.]+) GB\), not a model: give it as the custom drafter under Speculative decoding\.$/, "$1 ist ein Drafter ($2 GB), kein Modell: unter Spekulatives Dekodieren als eigenen Drafter angeben."],
     [/^No GGUF files in (.+)\.$/, "Keine GGUF-Dateien in $1."],
     [/^Asking Hugging Face about (.+) \.\.\.$/, "Frage Hugging Face nach $1 ..."],
+    [/^(.+?): not on the Hub, or gated or private: check the name; for a gated model accept its terms on huggingface\.co, then set HF_TOKEN or run `hf auth login`$/, "$1: nicht auf dem Hub, oder zugangsbeschränkt oder privat: prüfe den Namen; für ein zugangsbeschränktes Modell akzeptiere seine Bedingungen auf huggingface.co und setze dann HF_TOKEN oder führe `hf auth login` aus"],
+    [/^(.+?): not on the Hub \(a typo, or a private repository: set HF_TOKEN\)$/, "$1: nicht auf dem Hub (ein Tippfehler, oder ein privates Repository: setze HF_TOKEN)"],
     [/^Unloading failed: HTTP (\d+)$/, "Entladen fehlgeschlagen: HTTP $1"],
     [/^This repository includes a vision projector in (.+) \(([\d.]+) GB\): it loads automatically unless vision is turned off\.$/, "Dieses Repository enthält einen Vision-Projektor in $1 ($2 GB): Er wird automatisch geladen, sofern Vision nicht ausgeschaltet ist."],
     [/^(.+) is a vision projector \(([\d.]+) GB\), not a standalone model: attach it to a compatible VLM\.$/, "$1 ist ein Vision-Projektor ($2 GB), kein eigenständiges Modell: Bitte mit einem kompatiblen VLM verwenden."],

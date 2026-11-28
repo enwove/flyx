@@ -822,6 +822,8 @@ export default {
     [/^(.+) is a drafter \(([\d.]+) GB\), not a model: give it as the custom drafter under Speculative decoding\.$/, "$1은(는) 모델이 아니라 drafter($2 GB)입니다. 추측 디코딩에서 사용자 지정 drafter로 지정하세요."],
     [/^No GGUF files in (.+)\.$/, "$1에 GGUF 파일이 없습니다."],
     [/^Asking Hugging Face about (.+) \.\.\.$/, "Hugging Face에 $1 조회 중…"],
+    [/^(.+?): not on the Hub, or gated or private: check the name; for a gated model accept its terms on huggingface\.co, then set HF_TOKEN or run `hf auth login`$/, "$1: Hub에 없거나, 승인 필요 또는 비공개 저장소입니다. 이름을 확인하세요. 승인 필요 모델은 huggingface.co에서 약관에 동의한 뒤 HF_TOKEN을 설정하거나 `hf auth login`을 실행하세요"],
+    [/^(.+?): not on the Hub \(a typo, or a private repository: set HF_TOKEN\)$/, "$1: Hub에 없습니다(오타이거나 비공개 저장소입니다. 비공개라면 HF_TOKEN을 설정하세요)"],
     [/^Unloading failed: HTTP (\d+)$/, "언로드 실패: HTTP $1"],
     [/^This repository includes a vision projector in (.+) \(([\d.]+) GB\): it loads automatically unless vision is turned off\.$/, "이 저장소에는 비전 프로젝터 $1($2 GB)가 포함되어 있으며, 비전을 끄지 않으면 자동으로 로드됩니다."],
     [/^(.+) is a vision projector \(([\d.]+) GB\), not a standalone model: attach it to a compatible VLM\.$/, "$1은(는) 단독 모델이 아닌 비전 프로젝터($2 GB)입니다. 호환되는 VLM에 연결해 사용하세요."],

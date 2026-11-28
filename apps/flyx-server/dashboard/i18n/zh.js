@@ -552,6 +552,8 @@ export default {
     [/^(.+) is a drafter \(([\d.]+) GB\), not a model: give it as the custom drafter under Speculative decoding\.$/, "$1 是一个 drafter（$2 GB），不是模型：请在「投机解码」里把它填为自定义 drafter。"],
     [/^No GGUF files in (.+)\.$/, "$1 里没有 GGUF 文件。"],
     [/^Asking Hugging Face about (.+) \.\.\.$/, "正在向 Hugging Face 查询 $1 …"],
+    [/^(.+?): not on the Hub, or gated or private: check the name; for a gated model accept its terms on huggingface\.co, then set HF_TOKEN or run `hf auth login`$/, "$1：Hugging Face 上没有这个仓库，或者它需申请、是私有的：请检查名称；需申请的模型请先在 huggingface.co 上同意其条款，再设置 HF_TOKEN 或运行 `hf auth login`"],
+    [/^(.+?): not on the Hub \(a typo, or a private repository: set HF_TOKEN\)$/, "$1：Hugging Face 上没有这个仓库（可能拼错了，或是私有仓库：请设置 HF_TOKEN）"],
     [/^Unloading failed: HTTP (\d+)$/, "卸载模型失败：HTTP $1"],
     [/^This repository includes a vision projector in (.+) \(([\d.]+) GB\): it loads automatically unless vision is turned off\.$/, "这个仓库包含视觉投影器 $1（$2 GB）：除非关闭视觉，否则会自动加载。"],
     [/^(.+) is a vision projector \(([\d.]+) GB\), not a standalone model: attach it to a compatible VLM\.$/, "$1 是视觉投影器（$2 GB），不是独立模型：请搭配兼容的多模态模型使用。"],
