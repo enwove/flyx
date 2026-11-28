@@ -4,10 +4,19 @@
 #include "tests/backends/cuda/op_test.cuh"
 #include "backends/cuda/blocks.h"
 #include "backends/cuda/runtime/strata_snapshot.h"
+#include "core/interfaces/memory_policy.h"
 
 namespace flyx::optest {
 
 namespace {
+static_assert([] {
+  for (int hd : {32, 64, 128, 256})
+    for (int bits : {2, 3, 4})
+      if (StrataLayout(hd, bits).words() * sizeof(uint32_t) + sizeof(__half2) >
+          interfaces::strata_copy_head_bound(hd, bits)) return false;
+  return true;
+}(), "the planner must cover the streamed codes and grid of every Strata head");
+
 // Decode and verification attention against the reference: the float32 sums over the keys; with q and p as one
 // binary16 (the tensor-core kernel's default where llama.cpp rounds them so) prefill attention's.
 double rows_tolerance(bool mma, int parts, int nh, int nkv, int hd, int ctx) {

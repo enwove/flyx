@@ -98,7 +98,7 @@ struct EngineOptions {
   int64_t kv_ram = -1;
   std::string kv_method = "auto";
   // With the K/V in host memory, the layers whose low-bit copy stays on the GPU at most; the others' copy is in host
-  // memory too, each read through a staging a round fills a layer ahead. -1: as many as fit.
+  // memory too, each read through a staging a round fills a layer ahead. -1: automatic placement.
   int kv_copy_gpu = -1;
   // Host memory the process takes besides, which kv_ram's auto leaves aside.  (The server's store of parked
   // conversations, is not: it takes what the sessions' K/V leave, Scheduler.)
@@ -172,6 +172,7 @@ bool probe_device(const EngineOptions& o, std::string* backend, flyx_device_info
 class Engine {
  public:
   ~Engine();
+  // A zero session limit lets the scheduler try a second session while preserving the exact GPU prefix.
   bool load(const std::string& path, const EngineOptions& opt, std::string* err, int session_limit = 1);
 
   const Tokenizer& tokenizer() const { return tok_; }

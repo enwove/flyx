@@ -9,6 +9,19 @@
 
 namespace flyx::plan {
 
+double copy_to_exact_ratio(const flyx_model_desc& model, bool fp8, int bits) {
+  const flyx_state* shape = nullptr;
+  for (int i = 0; i < model.n_states; ++i) {
+    const auto& k = model.states[i];
+    if (k.kind != FLYX_STATE_KV || k.draft || k.window || k.layers != 1) continue;
+    if (shape && (shape->head_dim != k.head_dim || shape->n_kv != k.n_kv)) return 0;
+    shape = &k;
+  }
+  if (!shape || shape->n_kv <= 0 || shape->head_dim <= 0 || shape->head_dim % 32 || bits < 2 || bits > 4) return 0;
+  const double hd = shape->head_dim;
+  return interfaces::strata_copy_head_bound(shape->head_dim, bits) / (fp8 ? hd + 4 : 2 * hd);
+}
+
 uint64_t host_keep(uint64_t total_ram) { return std::max<uint64_t>(2ull << 30, total_ram / 16); }
 
 uint64_t device_reserve(uint64_t total_vram, bool gpu_paged) {
@@ -81,7 +94,7 @@ bool tiered(const flyx_backend_api* api, flyx_bmodel* bm, int ctx, const KvTiers
   auto most = [&](int copy_host, flyx_seq_size* out) {
     const int cap = std::min(ctx, tiers.gpu >= 0 ? tiers.gpu : ctx);
     if (min_device_positions > cap) return false;
-    int lo = (min_device_positions + 1023) / 1024, hi = cap / 1024, best_pos = -1;
+    int lo = min_device_positions / 1024 + (min_device_positions % 1024 != 0), hi = cap / 1024, best_pos = -1;
     while (lo <= hi) {
       const int mid = (lo + hi) / 2;
       flyx_seq_size s{};
@@ -137,6 +150,35 @@ bool tiered(const flyx_backend_api* api, flyx_bmodel* bm, int ctx, const KvTiers
     return fits(layout->device_positions, layout->copy_host, size);
   *size = best_size;
   return true;
+}
+
+// A round before AUTO's switch reads every exact host row. Prefer moving the fewest layer copies that keep
+// that prefix on the device. Check both budgets at the realized boundary: VMM can round a request below it,
+// and the staging and host memory need not change uniformly as heterogeneous layers move.
+int protect_exact_prefix(const flyx_backend_api* api, flyx_bmodel* bm, KvTiers tiers, uint64_t device, uint64_t host,
+                         flyx_seq_layout* layout, flyx_seq_size* size) {
+  const int from = size->strata_from, ctx = layout->max_ctx;
+  if (layout->method != FLYX_KV_AUTO || tiers.copy_gpu >= 0 || from <= size->device_positions || from >= ctx ||
+      (tiers.gpu >= 0 && tiers.gpu < from) || tiers.copy_to_exact <= 0) return 0;
+  // Compare peak payload per round, in units of one layer's exact row. Charge the extra copies through the
+  // full requested context (rounded up to a planner step to cover a partial tile), against the old host suffix.
+  const double copied = ((int64_t(ctx) + 1023) / 1024 * 1024) * tiers.copy_to_exact;
+  const double saved = double(from - size->device_positions) * size->copies;
+  for (int moved = layout->copy_host + 1; moved <= size->copies; ++moved) {
+    const int extra = moved - layout->copy_host;
+    if (extra * copied > saved) break;
+    tiers.copy_gpu = size->copies - moved;
+    flyx_seq_layout candidate{};
+    flyx_seq_size priced{};
+    std::string why;
+    if (tiered(api, bm, ctx, tiers, device, &candidate, &priced, &why, from) &&
+        priced.device_positions >= from && priced.strata_from == from && priced.host <= host) {
+      *layout = candidate;
+      *size = priced;
+      return extra;
+    }
+  }
+  return 0;
 }
 
 // FLYX_KV_AUTO when its copy does not fit beside what stays on the GPU: every position read exactly.
@@ -250,10 +292,12 @@ struct TierPlacer {
 
   // *by, where given: which memory did not hold it, when it is not placed.
   bool place(int ctx, flyx_seq_layout* l, flyx_seq_size* s, std::string* note, bool exact_ok = true,
-             CtxLimit* by = nullptr) const {
+             CtxLimit* by = nullptr, int* prefix_copies = nullptr) const {
     std::string e;
     if (by) *by = CtxLimit::kNone;
     bool placed = tiered(api, bm, ctx, tiers, room, l, s, &e);
+    const int moved = placed ? protect_exact_prefix(api, bm, tiers, room, out->host_budget, l, s) : 0;
+    if (prefix_copies) *prefix_copies = moved;
     out->auto_exact = false;
     if (tiers.allow_auto_exact && exact_ok && (!placed || s->host > out->host_budget) && tiers.method == FLYX_KV_AUTO) {
       out->copy_note = !placed ? "it does not fit on the GPU"
@@ -339,7 +383,8 @@ struct TierPlacer {
   // The longest context below max_ctx, a multiple of 1024, that the GPU and host memory hold together (0: none): a
   // binary search, then the next 16 steps one by one (placing is not monotone everywhere: past auto's switch a copy
   // appears).  Placed again at the end, so *out's notes are that context's.
-  int longest_placed(int max_ctx, flyx_seq_layout* l, flyx_seq_size* s, bool exact_ok = true) const {
+  int longest_placed(int max_ctx, flyx_seq_layout* l, flyx_seq_size* s, bool exact_ok = true,
+                     int* prefix_copies = nullptr) const {
     int lo = 1, hi = (max_ctx - 1) / 1024, best = 0;
     std::string note;
     while (lo <= hi) {
@@ -349,7 +394,7 @@ struct TierPlacer {
     }
     for (int k = best + 1; k <= std::min(best + 16, (max_ctx - 1) / 1024); ++k)
       if (place(k * 1024, l, s, &note, exact_ok)) best = k;
-    return best > 0 && place(best * 1024, l, s, &note, exact_ok) ? best * 1024 : 0;
+    return best > 0 && place(best * 1024, l, s, &note, exact_ok, nullptr, prefix_copies) ? best * 1024 : 0;
   }
 };
 
@@ -486,7 +531,7 @@ bool account(const flyx_backend_api* api, flyx_bmodel* bm, bool has_drafter, boo
       out->tier_note = "--kv-ram 0";
     } else if (out->host_budget == 0) {
       out->tier_note = "no host memory to spare for it (--kv-ram GB gives some)";
-    } else if (placer.place(max_ctx, &l, &s, &out->tier_note, !longest)) {
+    } else if (placer.place(max_ctx, &l, &s, &out->tier_note, !longest, nullptr, &out->prefix_copies)) {
       out->layout = l;
       out->session_bytes = s.device;
       out->session_host_bytes = s.host;
@@ -497,10 +542,11 @@ bool account(const flyx_backend_api* api, flyx_bmodel* bm, bool has_drafter, boo
       // GPU's part would have each step read all of it over the bus: a deep conversation at the bus's speed); only
       // when the copy fits nowhere, every position exact.
       bool exact_ok = false;
-      int ctx = placer.longest_placed(max_ctx, &l, &s, exact_ok);
+      int ctx = placer.longest_placed(max_ctx, &l, &s, exact_ok, &out->prefix_copies);
       if (ctx == 0 && tiers.allow_auto_exact) {
         exact_ok = true;
-        ctx = placer.place(max_ctx, &l, &s, &out->tier_note) ? max_ctx : placer.longest_placed(max_ctx, &l, &s);
+        ctx = placer.place(max_ctx, &l, &s, &out->tier_note, exact_ok, nullptr, &out->prefix_copies)
+                  ? max_ctx : placer.longest_placed(max_ctx, &l, &s, exact_ok, &out->prefix_copies);
       }
       if (ctx > 0) {
         *fitted_ctx = ctx;
@@ -534,7 +580,7 @@ bool account(const flyx_backend_api* api, flyx_bmodel* bm, bool has_drafter, boo
 }
 
 void fit_second_session(const flyx_backend_api* api, flyx_bmodel* bm, const KvTiers& tiers,
-                        const ResourceLedger& ledger, Budget* budget) {
+                        const ResourceLedger& ledger, Budget* budget, bool requested) {
   const uint64_t device = ledger.budget() ? ledger.available() / 2 : UINT64_MAX;
   const uint64_t host = budget->host_budget / 2;
   if (!host || (budget->session_bytes <= device && budget->session_host_bytes <= host)) return;
@@ -559,7 +605,15 @@ void fit_second_session(const flyx_backend_api* api, flyx_bmodel* bm, const KvTi
     if (!original.copies || !tiered(api, bm, ctx, pair, device, &layout, &size, &why, original.device_positions) ||
         size.strata_from != original.strata_from) return;
   }
+  const int moved = protect_exact_prefix(api, bm, pair, device, host, &layout, &size);
   if (size.host > host) return;
+  if (!requested && original.copies && original.strata_from < ctx &&
+      size.device_positions < std::min(original.device_positions, original.strata_from)) {
+    budget->declined_pair_host_rows = original.strata_from - size.device_positions;
+    return;
+  }
+  budget->prefix_copies = moved;
+  budget->declined_pair_host_rows = 0;
   budget->layout = layout;
   budget->session_bytes = size.device;
   budget->session_host_bytes = size.host;

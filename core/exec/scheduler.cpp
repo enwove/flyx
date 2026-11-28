@@ -183,7 +183,7 @@ bool Scheduler::load(std::string* err) {
   telemetry_.loading();
   auto e = std::make_unique<Engine>();
   const int wanted = opt_.max_sessions > 0 ? opt_.max_sessions : SchedulerOptions::kDefaultSessions;
-  if (!e->load(model_, eo_, err, wanted)) {
+  if (!e->load(model_, eo_, err, opt_.max_sessions)) {
     telemetry_.unloaded();
     return false;
   }
@@ -197,7 +197,10 @@ bool Scheduler::load(std::string* err) {
   }
   batch_cost_.build(engine_->widths(), engine_->round_drafters(), engine_->round_ms(), engine_->lookup_widths(),
                     engine_->lookup_ms());
-  if (max_sessions_ < wanted)
+  if (const int rows = engine_->budget().declined_pair_host_rows)
+    log::info("flyx: using one session: two fit, but would read up to %d exact K/V rows from host memory per round "
+              "before the switch; --sessions 2 allows that trade", rows);
+  else if (max_sessions_ < wanted)
     log::info("flyx: %d sessions %s, %d fit in memory (%s of the GPU's each): using %d", wanted,
               opt_.max_sessions > 0 ? "requested" : "by default", max_sessions_, gb(engine_->session_bytes()).c_str(),
               max_sessions_);
