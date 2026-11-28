@@ -4,6 +4,7 @@
 #include <cstdio>
 #include <filesystem>
 #include <fstream>
+#include <future>
 #include <numeric>
 #include <vector>
 
@@ -67,6 +68,35 @@ void run(const std::filesystem::path& path, int dt) {
       check(!src.reads.empty(), "bounded CLOCK evicts old rows");
     }
   }
+  // Independent requests share the table and can replace rows in the same cache
+  // set concurrently.
+  auto concurrent = table;
+  concurrent.file = &src.mapping;
+  concurrent.read_at = [](const void *ctx, uint64_t at, void *dest,
+                          size_t size) {
+    return static_cast<const flyx::os::MappedFile *>(ctx)->read_at(at, dest,
+                                                                   size)
+               ? 0
+               : -1;
+  };
+  flyx::backends::PackedRows shared(concurrent, FLYX_PLE_HYBRID,
+                                    8 * stride + 256, 0);
+  std::vector<std::future<bool>> readers;
+  for (int request = 0; request < 4; ++request) {
+    readers.push_back(std::async(std::launch::async, [&, request] {
+      std::vector<uint8_t> row(stride);
+      for (int i = 0; i < 128; ++i) {
+        const int32_t id = (request + 7 * i) % rows;
+        shared.gather(&id, 1, row.data());
+        if (std::memcmp(row.data(), content.data() + offset + id * stride,
+                        stride))
+          return false;
+      }
+      return true;
+    }));
+  }
+  for (auto &reader : readers)
+    check(reader.get(), "concurrent cache eviction preserves row bytes");
   table.shape[0] = INT32_MAX;
   table.nbytes = uint64_t(INT32_MAX) * stride;
   flyx::backends::PackedRows sparse(table, FLYX_PLE_DISK, 0, 0);
@@ -88,12 +118,43 @@ void run(const std::filesystem::path& path, int dt) {
   }
   check(failed, "I/O failure propagates");
 }
+void sparse_file(const std::filesystem::path &path) {
+  constexpr int rows = 1 << 19;
+  constexpr int stride = 64;
+  {
+    std::ofstream f(path, std::ios::binary);
+    f.exceptions(std::ios::badbit | std::ios::failbit);
+    f.seekp(uint64_t(rows) * stride - 1);
+    f.put('Q');
+  }
+  Source source;
+  std::string error;
+  if (!source.mapping.open(path.string(), &error))
+    throw std::runtime_error(error);
+  flyx_tensor_view table{};
+  table.file = &source;
+  table.read_at = Source::read;
+  table.ndim = 2;
+  table.shape[0] = rows;
+  table.shape[1] = 32;
+  table.dtype = FLYX_DT_BF16;
+  table.nbytes = uint64_t(rows) * stride;
+  flyx::backends::PackedRows disk(table, FLYX_PLE_AUTO, 0, 0);
+  std::array<uint8_t, stride> bytes{};
+  int32_t last = rows - 1;
+  disk.gather(&last, 1, bytes.data());
+  check(bytes.back() == 'Q' && disk.storage_bytes() == 0 &&
+            source.reads.size() == 1,
+        "auto with zero hot budget reads one distant row without resident "
+        "table storage");
+}
 }  // namespace
 
 int main() {
   const auto file =
       std::filesystem::temp_directory_path() / ("flyx-ple-rows-" + std::to_string(flyx::os::process_id()));
   for (int dt : {FLYX_DT_BF16, FLYX_DT_GGML_Q8_0, FLYX_DT_GGML_Q5_0, FLYX_DT_GGML_Q4_0}) run(file, dt);
+  sparse_file(file);
   std::filesystem::remove(file);
   return flyx::test::finish("packed_rows");
 }

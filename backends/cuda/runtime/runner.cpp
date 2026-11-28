@@ -1911,6 +1911,8 @@ int read_logits(flyx_seq* s, int32_t row, float* out) {
     return fail("logits: the certified head scores only the rows it must (backend option head_cert=0)");
   return guarded([&] {
     sync_stream(s);
+    if (s->ple_failed.load(std::memory_order_acquire))
+      return fail("PLE packed row read failed");
     CK(cudaMemcpy(out, s->logits + size_t(row) * s->m->vocab, sizeof(float) * size_t(s->m->vocab),
                   cudaMemcpyDeviceToHost));
     return 0;
@@ -1930,6 +1932,8 @@ int ready(flyx_seq* s) {
     }
     if (r == cudaErrorNotReady) return 0;
     CK(r);
+    if (s->ple_failed.load(std::memory_order_acquire))
+      return fail("PLE packed row read failed");
     return 1;
   });
 }

@@ -99,6 +99,34 @@ void test_ple() {
   auto* emb = dev<float>(gather.size());
   ple_decode(reinterpret_cast<uint8_t*>(up(embed)), H * sizeof(float), FLYX_DT_F32, H, keys, R * 2, emb, 0);
   expect("packed PLE gather", down(emb, gather.size()), gather, 1e-7);
+  for (const int dtype : {FLYX_DT_BF16, FLYX_DT_F16, FLYX_DT_GGML_Q8_0,
+                          FLYX_DT_GGML_Q5_0, FLYX_DT_GGML_Q4_0}) {
+    const int block = flyx_block_bytes(dtype), stride = block ? block : 2 * H;
+    std::vector<uint8_t> payload(52 * stride), staged(2 * R * stride);
+    for (int i = 0; i < 52; ++i) {
+      uint8_t *row = payload.data() + i * stride;
+      for (int j = 0; j < stride; ++j)
+        row[j] = uint8_t(17 * i + 31 * j);
+      for (int j = 0; j < (block ? 1 : H); ++j)
+        row[2 * j + 1] = uint8_t(0x38 + (j + i) % 8);
+    }
+    flyx_tensor_view source{};
+    source.dtype = dtype;
+    source.data = payload.data();
+    for (int i = 0; i < 2 * R; ++i) {
+      std::copy_n(payload.data() + hits[i] * stride, stride,
+                  staged.data() + i * stride);
+      for (int j = 0; j < H; ++j)
+        gather[i * H + j] = ops::load(&source, hits[i] * H + j);
+    }
+    ple_decode(upload_values(payload.data(), payload.size()), stride, dtype, H,
+               keys, 2 * R, emb, 0);
+    const auto resident = down(emb, gather.size());
+    ple_decode(upload_values(staged.data(), staged.size()), stride, dtype, H,
+               nullptr, 2 * R, emb, 0);
+    if (resident != down(emb, gather.size()) || resident != gather)
+      ++g_fail;
+  }
   Vec k = randv(R * W), q = randv(R * W), v = randv(R * H), branch(R * W), u = randv(R * S), cw = randv(W * 4),
       wide(R * W);
   auto* y = dev<float>(R * W);

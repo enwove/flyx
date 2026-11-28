@@ -183,7 +183,7 @@ void Decoder::moe(const std::string& p) {
   b.kind = FLYX_BLOCK_MOE;
   auto& f = b.moe;
   f.hidden = h_;
-  f.body_only = f.has_shared = f.norm_weights = 1;
+  f.body_only = f.norm_weights = 1;
   f.norm.w = f.router_bias = f.res_query = f.post_conv = f.sconv = -1;
   f.route_scale = 1;
   f.n_experts = meta_.count("expert_count");
@@ -192,6 +192,9 @@ void Decoder::moe(const std::string& p) {
   require(f.top_k <= f.n_experts, "invalid routed expert count");
   f.router = tables_.weight(p + "ffn_gate_inp.weight", {f.n_experts, h_});
   f.separate_gate_up = !tables_.has(p + "ffn_gate_up_exps.weight");
+  require(f.separate_gate_up || (!tables_.has(p + "ffn_gate_exps.weight") &&
+                                 !tables_.has(p + "ffn_up_exps.weight")),
+          "ambiguous routed gate/up weights");
   if (f.separate_gate_up) {
     f.gate = tables_.weight(p + "ffn_gate_exps.weight", {f.n_experts, f.inter, h_});
     f.up = tables_.weight(p + "ffn_up_exps.weight", {f.n_experts, f.inter, h_});
@@ -200,11 +203,25 @@ void Decoder::moe(const std::string& p) {
     f.gate_up = tables_.weight(p + "ffn_gate_up_exps.weight", {f.n_experts, product(2, f.inter), h_});
   }
   f.down = tables_.weight(p + "ffn_down_exps.weight", {f.n_experts, h_, f.inter});
-  f.shared_inter = meta_.count("expert_shared_feed_forward_length");
-  f.shared_gate = tables_.weight(p + "ffn_gate_shexp.weight", {f.shared_inter, h_});
-  f.shared_up = tables_.weight(p + "ffn_up_shexp.weight", {f.shared_inter, h_});
-  f.shared_down = tables_.weight(p + "ffn_down_shexp.weight", {h_, f.shared_inter});
-  f.shared_router = tables_.weight(p + "ffn_gate_inp_shexp.weight", {h_});
+  f.shared_inter = meta_.has("expert_shared_feed_forward_length")
+                       ? meta_.count("expert_shared_feed_forward_length", 0)
+                       : 0;
+  if (f.shared_inter) {
+    f.has_shared = 1;
+    f.shared_gate =
+        tables_.weight(p + "ffn_gate_shexp.weight", {f.shared_inter, h_});
+    f.shared_up =
+        tables_.weight(p + "ffn_up_shexp.weight", {f.shared_inter, h_});
+    f.shared_down =
+        tables_.weight(p + "ffn_down_shexp.weight", {h_, f.shared_inter});
+    f.shared_router = tables_.weight(p + "ffn_gate_inp_shexp.weight", {h_});
+  } else {
+    for (const char *name :
+         {"ffn_gate_shexp.weight", "ffn_up_shexp.weight",
+          "ffn_down_shexp.weight", "ffn_gate_inp_shexp.weight"})
+      require(!tables_.has(p + name),
+              "shared weights require a shared intermediate dimension");
+  }
   run(b);
 }
 

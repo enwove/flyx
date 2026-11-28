@@ -797,7 +797,6 @@ MoeBlock moe(WeightLoader& L, const flyx_moe_block& b, const StateMap& sm) {
   if (b.router_bias >= 0) f.router_bias = L.vec(b.router_bias);
   f.separate_gate_up = b.separate_gate_up != 0;
   if (f.separate_gate_up) {
-    expect(f.inter % 2 == 0, "separate gate and up matrices require an even intermediate dimension");
     f.gate_up = L.expert_mat(b.gate);
     f.up = L.expert_mat(b.up);
   } else {

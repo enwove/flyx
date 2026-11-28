@@ -11,11 +11,16 @@ from tokenizers.pre_tokenizers import ByteLevel
 from transformers import Qwen4ExpForCausalLM, Qwen4ExpTextConfig
 
 
-def write_fixture(out, ple):
+sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "python" / "reference"))
+from flyx_ref.qwen4exp import logits as reference_logits, q8_inputs
+
+
+def write_fixture(out, ple, mixed=False):
     torch.manual_seed(31415)
     H, C, D, I, R = 64, 4, 32, 64, 16
     tokens = sorted(ByteLevel.alphabet()) + ["aa", "<|im_end|>", "<|endoftext|>"]
     eos = len(tokens) - 1
+    nk, nv = 2, 4
     cfg = Qwen4ExpTextConfig(
         vocab_size=len(tokens),
         hidden_size=H,
@@ -28,8 +33,8 @@ def write_fixture(out, ple):
         num_key_value_heads=1,
         linear_key_head_dim=D,
         linear_value_head_dim=D,
-        linear_num_key_heads=1,
-        linear_num_value_heads=2,
+        linear_num_key_heads=nk,
+        linear_num_value_heads=nv,
         num_experts=4,
         num_experts_per_tok=2,
         moe_intermediate_size=I,
@@ -70,8 +75,9 @@ def write_fixture(out, ple):
         # The dedicated selection test exercises the engine's chronological tie policy.
         index_qk = model.model.layers[1].self_attn.indexer.index_qk_proj.weight
         index_qk[D : 2 * D].copy_(-index_qk[:D])
-    stem = "qwen4exp_parent" if ple else "qwen4exp_coder"
+    stem = "qwen4exp_mixed" if mixed else "qwen4exp_parent" if ple else "qwen4exp_coder"
     w = gguf.GGUFWriter(out / (stem + ".gguf"), "qwen4exp")
+    w.add_quantization_version(2)
     w.add_string("tokenizer.ggml.model", "gpt2")
     w.add_string("tokenizer.ggml.pre", "qwen35")
     w.add_array("tokenizer.ggml.tokens", tokens)
@@ -93,10 +99,10 @@ def write_fixture(out, ple):
         "full_attention_interval": 2,
         "hyper_connection.count": C,
         "hyper_connection.low_rank": R,
-        "ssm.group_count": 1,
-        "ssm.time_step_rank": 2,
+        "ssm.group_count": nk,
+        "ssm.time_step_rank": nv,
         "ssm.state_size": D,
-        "ssm.inner_size": 2 * D,
+        "ssm.inner_size": nv * D,
         "ssm.conv_kernel": 4,
         "attention.head_count": 2,
         "attention.head_count_kv": 1,
@@ -119,6 +125,12 @@ def write_fixture(out, ple):
     def tensor(name, v):
         w.add_tensor(name, v.detach().float().contiguous().numpy())
 
+    def quantized(name, value, dtype):
+        raw = gguf.quants.quantize(value.detach().contiguous().numpy(), dtype)
+        w.add_tensor(name, raw, raw_dtype=dtype)
+        with torch.no_grad():
+            value.copy_(torch.from_numpy(gguf.quants.dequantize(raw, dtype)))
+
     def hc(prefix, block):
         tensor(prefix + "norm.weight", 1 + block.hc_norm.weight)
         tensor(prefix + "down.weight", block.input_mix_weight_down.weight)
@@ -136,24 +148,35 @@ def write_fixture(out, ple):
         f = layer.mlp
         tensor(p + "ffn_gate_inp.weight", f.gate.weight)
         gate, up = f.experts.gate_up_proj.chunk(2, dim=1)
-        tensor(p + "ffn_gate_exps.weight", gate)
-        tensor(p + "ffn_up_exps.weight", up)
+        if mixed and i == 0:
+            quantized(p + "ffn_gate_exps.weight", gate, gguf.GGMLQuantizationType.Q8_0)
+            quantized(p + "ffn_up_exps.weight", up, gguf.GGMLQuantizationType.Q4_0)
+        elif not ple and i == 1:
+            tensor(p + "ffn_gate_up_exps.weight", f.experts.gate_up_proj)
+        else:
+            tensor(p + "ffn_gate_exps.weight", gate)
+            tensor(p + "ffn_up_exps.weight", up)
         tensor(p + "ffn_down_exps.weight", f.experts.down_proj)
         for key in ("gate", "up", "down"):
             tensor(p + "ffn_" + key + "_shexp.weight", getattr(f.shared_expert, key + "_proj").weight)
         tensor(p + "ffn_gate_inp_shexp.weight", f.shared_expert_gate.weight.flatten())
         if i == 0:
             g = layer.linear_attn
+            # GGUF tiles value heads across key heads, while Transformers groups them by key.
+            heads = torch.arange(nv).reshape(nk, nv // nk).T.flatten()
+            features = (heads[:, None] * D + torch.arange(D)).flatten()
+            qk = torch.arange(2 * nk * D)
+            channels = torch.cat((qk, qk.numel() + features))
             for k, v in {
-                "attn_qkv.weight": g.in_proj_qkv.weight,
-                "attn_gate.weight": g.in_proj_z.weight,
-                "ssm_beta.weight": g.in_proj_b.weight,
-                "ssm_alpha.weight": g.in_proj_a.weight,
-                "ssm_out.weight": g.out_proj.weight,
-                "ssm_conv1d.weight": g.conv1d.weight[:, 0],
-                "ssm_a": -g.A_log.exp(),
+                "attn_qkv.weight": g.in_proj_qkv.weight[channels],
+                "attn_gate.weight": g.in_proj_z.weight[features],
+                "ssm_beta.weight": g.in_proj_b.weight[heads],
+                "ssm_alpha.weight": g.in_proj_a.weight[heads],
+                "ssm_out.weight": g.out_proj.weight[:, features],
+                "ssm_conv1d.weight": g.conv1d.weight[channels, 0],
+                "ssm_a": -g.A_log[heads].exp(),
                 "ssm_norm.weight": g.norm.weight,
-                "ssm_dt.bias": g.dt_bias,
+                "ssm_dt.bias": g.dt_bias[heads],
             }.items():
                 tensor(p + k, v)
         else:
@@ -190,9 +213,17 @@ def write_fixture(out, ple):
     w.write_tensors_to_file()
     w.close()
     prompt = [42, 43, 44, 2, 57, 8, 11, 32, 7, 13, 39, 81, 49, 0, 28, 34, 12, eos, 42]
+    if mixed:
+        # Both packed projections take q8 inputs. The router and shared expert still see x.
+        model.model.layers[0].mlp.experts.register_forward_pre_hook(
+            lambda _, args: (q8_inputs(args[0]), *args[1:])
+        )
     with torch.inference_mode():
         logits = model(torch.tensor([prompt]), use_cache=False).logits[0]
-    (out / (stem + ".json")).write_text(json.dumps({"prompt": prompt, "logits": logits.tolist()}), encoding="utf-8")
+    reference = reference_logits(model, prompt, (0,) if mixed else ())
+    torch.testing.assert_close(reference, logits.double(), atol=2e-4, rtol=0)
+    golden = {"prompt": prompt, "logits": logits.tolist(), "reference64": reference.tolist()}
+    (out / (stem + ".json")).write_text(json.dumps(golden), encoding="utf-8")
 
 
 if __name__ == "__main__":
@@ -201,3 +232,4 @@ if __name__ == "__main__":
     target.mkdir(parents=True, exist_ok=True)
     for parent in (False, True):
         write_fixture(target, parent)
+    write_fixture(target, True, mixed=True)

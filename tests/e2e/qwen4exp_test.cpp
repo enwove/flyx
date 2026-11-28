@@ -95,11 +95,15 @@ void fixture(const std::string& stem, bool parent, const std::string& backend) {
   const auto golden = nlohmann::json::parse(std::ifstream(stem + ".json"));
   const auto prompt = golden.at("prompt").get<std::vector<int32_t>>();
   const auto wanted = golden.at("logits").get<std::vector<std::vector<float>>>();
+  const auto precise =
+      golden.at("reference64").get<std::vector<std::vector<double>>>();
   std::vector<float> baseline;
   for (int tier : {FLYX_PLE_GPU, FLYX_PLE_HOST, FLYX_PLE_DISK, FLYX_PLE_HYBRID}) {
     if (!parent && tier != FLYX_PLE_GPU) continue;
     EngineOptions opt;
     opt.backend = backend;
+    if (backend == "cuda")
+      opt.backend_options = "head_cert=0";
     opt.prefill_chunk = 32;
     opt.max_ctx = 128;
     opt.ple_placement = tier;
@@ -111,7 +115,7 @@ void fixture(const std::string& stem, bool parent, const std::string& backend) {
     check_rounds(engine, prompt, true);
     const auto* api = engine.api();
     std::vector<float> trace;
-    double maximum = 0;
+    double maximum = 0, max_double_error = 0;
     for (int chunk : {1, 5, 32}) {
       Session s(&engine);
       require(s.init(&err), err);
@@ -122,9 +126,18 @@ void fixture(const std::string& stem, bool parent, const std::string& backend) {
         flyx_round_result result{};
         require(api->read(s.seq(), &result) == 0, api->last_error());
         std::vector<float> logits(wanted.back().size());
-        require(api->logits(s.seq(), n - 1, logits.data()) == 0, api->last_error());
+        // CUDA projects only the final prefill row and places its logits in
+        // slot zero.
+        require(api->logits(s.seq(), backend == "cuda" ? 0 : n - 1,
+                            logits.data()) == 0,
+                api->last_error());
         const auto& ref = wanted[i + n - 1];
-        for (size_t j = 0; j < logits.size(); ++j) maximum = std::max(maximum, std::abs(double(logits[j]) - ref[j]));
+        for (size_t j = 0; j < logits.size(); ++j) {
+          maximum = std::max(maximum, std::abs(double(logits[j]) - ref[j]));
+          max_double_error =
+              std::max(max_double_error,
+                       std::abs(double(logits[j]) - precise[i + n - 1][j]));
+        }
         if (chunk == 1)
           trace.insert(trace.end(), logits.begin(), logits.end());
         else if (backend == "cpu_ref")
@@ -133,6 +146,11 @@ void fixture(const std::string& stem, bool parent, const std::string& backend) {
       }
     }
     std::printf("%s tier %d max absolute logits error %.8g\n", stem.c_str(), tier, maximum);
+    if (backend == "cpu_ref") {
+      std::printf("  float64 logits max absolute error %.8g\n",
+                  max_double_error);
+      check(max_double_error < 5e-6, "float64 reference logits");
+    }
     // CUDA stores attention K/V in binary16 and wide prefill GEMMs round their inputs.
     check(maximum < (backend == "cpu_ref" ? 0.0002 : 0.04), "eager Transformers logits");
     if (baseline.empty())
@@ -148,6 +166,7 @@ int main(int argc, char** argv) {
   try {
     fixture(std::string(argv[1]) + "/qwen4exp_coder", false, backend);
     fixture(std::string(argv[1]) + "/qwen4exp_parent", true, backend);
+    fixture(std::string(argv[1]) + "/qwen4exp_mixed", true, backend);
   } catch (const std::exception& ex) {
     std::fprintf(stderr, "%s\n", ex.what());
     return 1;

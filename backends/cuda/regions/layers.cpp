@@ -1750,8 +1750,10 @@ void moe_layer(const Pass& ps, const MoeBlock& f, bool fused) {
   int grouped = 0;
   if (f.separate_gate_up) {
     // Each unfused projection writes I rows of its own dtype into one half of [R, K, 2I].
-    moe_gate_up(rv.b.h, H, f.gate_up, rv.b.moe_idx, R, K, I / 2, H, 0, 0, false, rv.b.moe_gu, 2 * I, msc, L);
-    grouped = moe_gate_up(rv.b.h, H, f.up, rv.b.moe_idx, R, K, I / 2, H, 0, 0, false, rv.b.moe_gu + I, 2 * I, msc, L);
+    moe_gate_up(rv.b.h, H, f.gate_up, rv.b.moe_idx, R, K, I, H, 0, 0, false,
+                rv.b.moe_gu, 2 * I, msc, L);
+    grouped = moe_gate_up(rv.b.h, H, f.up, rv.b.moe_idx, R, K, I, H, 0, 0,
+                          false, rv.b.moe_gu + I, 2 * I, msc, L);
     swiglu(rv.b.moe_gu, 2 * I, I, rv.b.moe_act, I, R * K, st);
   } else if (fused) {
     grouped = moe_gate_up(rv.b.h, H, f.gate_up, rv.b.moe_idx, R, K, I, H, f.situ_beta, f.situ_linear_beta, true,
