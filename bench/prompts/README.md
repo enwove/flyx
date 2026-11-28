@@ -8,6 +8,7 @@ Fixed prefill prompt fixtures for reproducible `flyx` benchmarks and A/B runs.
 | `long.txt` | 26,549 | 6,000 | `fd80b763ee1f42a62976a274b3c68fdc` | Random common English words (~6,000 rows) |
 | `prompt_6k.txt` | 20,889 | 5,760 | `a2715ef912616413e720d5ad6d59bb5f` | Technical architecture prose fixture |
 | `make_coding_prompt.py` | script | `1K–256K` | — | Deterministic long-context coding & NIAH prompt generator built from tracked repo sources |
+| `make_long_chat_prompts.py` | script | `200K` | — | Four long chat prompts with needles, as a prompt set, from the sources at a commit and a novel |
 
 Long chat prompts for DV's measurements after long prompts (`flyx run MODEL -f FILE --chat --no-think`, the file one
 user message): `Summarize this document in a few paragraphs.`, a blank line, then an earlier draft of one of flyx's
@@ -42,6 +43,15 @@ the recipe), byte for byte, each checked against its MD5:
 `python -I bench/prompts/dv_sets.py gsm8k_test.jsonl OUT` writes `fs4.jsonl` and `fs10.jsonl` (GSM8K as a 4- and
 10-shot multi-turn chat), `gsm30.jsonl` (the first 30 questions), `chat_then_gsm.jsonl` (`chat_short.jsonl`, then those
 30) and `gsm_long.jsonl` (the 30 with the summarize prompts after every tenth).
+
+`make_long_chat_prompts.py` writes four chat prompts of up to `--tokens` tokens each (200,000 by default) as a prompt
+set, from flyx's sources at a commit (`--rev`, read with `git archive`) and Project Gutenberg's #2600 (War and Peace,
+sha256 `e4bcf9042609b62c7de72a6f1b311f54c412943a9d641b7efcf79a464b5f31c8`), with needles at fixed depths and a task
+after each (a parser to write, the backend's files to explain, a Python file to repeat with docstrings, the novel to
+summarize), counted with the target's Hugging Face tokenizer and chat template. [Benchmarks](../../docs/benchmarks.md)
+section 7's set: `python -I bench/prompts/make_long_chat_prompts.py --rev 86360f0 --book 2600-0.txt --hf
+Qwen3.8-27B -o long200k.jsonl` (`transformers` 5.24.0, `tokenizers` 0.23.3), MD5
+`9bae93700eb1cec1a8629333ab30ed9a`.
 
 ## Usage
 

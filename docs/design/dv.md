@@ -172,12 +172,13 @@ DV still drafts only when named: after long prompts a new engine's first reply m
 ## Rows: the File's Width, and 15
 
 DV drafts trees of its file's width T, min(T, `FLYX_MAX_WIDE_ROWS` - 1): 31 in MiniCPM5-1B's files. Rounds of 1 + 31
-rows run on the rows wide lookup rounds have (ABI 36, `FLYX_MAX_WIDE_ROWS` = 64 rows and round results; chains,
-batching and `flyx_room` keep 16; see [tree verification](tree-verification.md)): on CUDA a model that holds DV has
-the rows of its widest round under `wide=auto`, 64 with `wide=1`, and 16 with `wide=0`, where its rounds of more
-drafts are refused and said. The kernels draft up to 63 drafts over up to 63 depths (`dv_tree_takes`). DV offers two
-widths where its file's is wider than 15: `draft_widths` = {15, min(T, 63)}, each rated by the tokens its own rounds
-give. `--width N` pins the widest at most N.
+rows run on the rows wide lookup rounds have (ABI 36, `FLYX_MAX_WIDE_ROWS` = 64 rows and round results; a chain's round
+and `flyx_room` keep 16, and a round of several sessions holds as many rows in all, each session's at most 16; see [tree
+verification](tree-verification.md)): on CUDA a model that holds DV has under `wide=auto` the wide rows where every
+projection is NVFP4 or bf16 and 24 GB stay free, else the rows of its widest round; 64 with `wide=1`, and 16 with
+`wide=0`, where its rounds of more drafts are refused and said. The kernels draft up to 63 drafts over up to 63 depths
+(`dv_tree_takes`). DV offers two widths where its file's is wider than 15: `draft_widths` = {15, min(T, 63)}, each rated
+by the tokens its own rounds give. `--width N` pins the widest at most N.
 
 Such rounds keep every verify row's one-row bits (AGENTS.md gate 4): a round of more than 16 rows runs as a wide lookup
 round does, its GEMMs on the 1..16-row kernels' arithmetic for every 16-row tile (`k_gemm_skinny_mt` for bf16 weights,

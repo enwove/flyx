@@ -47,6 +47,14 @@ unroll = 4
 nt = 1
 warps = 16
 unroll = 16
+# A column tile's chunks shared by 4 blocks of 4 warps (k_gemm_skinny_split), the last to finish adding them in
+# order: the same bits.  For a long K over few columns: Qwen3.8-27B's mlp down (5120 x 17408) at 16 rows 1346 GB/s
+# against 1206 in one block a tile on an RTX PRO 6000 (160 tiles of 32 columns for 188 SMs; cuda_bench skinny).
+[[bf16_skinny]]
+nt = 4
+warps = 4
+unroll = 4
+split = 4
 
 # 17..64 rows: tile, chunks (a warp each), loop unroll, input parts (3: the 1..16-row bits, in 16 chunks; 1: a
 # drafting pass's, in the chunks K gives it, 8 or 16: gen_gemm_tables.py draft_chunks)
@@ -382,6 +390,42 @@ units = 1
 columns = 4
 units = 2
 
+# Prefill GEMMs on the bf16 tensor cores (k_gemm_tc, more than 16 rows): block tile rows (bm, 64 a warp) and
+# columns (bn), warps along the columns (wn), pipeline stages.  Every one gives the same bits: each output is the
+# same sum in the same order.  64 x 128 of 2 stages takes 24 KB of shared memory (NVFP4 less), four blocks an SM;
+# 64 x 64 and 64 x 32 suit a pass whose 64 x 128 tiles leave SMs idle; deeper pipelines one of few rows, whose
+# blocks each stream their weight columns over K with little compute between the loads.
+[[prefill_tc]]
+bm = 64
+bn = 128
+wn = 4
+stages = 2
+[[prefill_tc]]
+bm = 128
+bn = 128
+wn = 4
+stages = 3
+[[prefill_tc]]
+bm = 64
+bn = 64
+wn = 4
+stages = 2
+[[prefill_tc]]
+bm = 64
+bn = 32
+wn = 2
+stages = 2
+[[prefill_tc]]
+bm = 64
+bn = 32
+wn = 2
+stages = 6
+[[prefill_tc]]
+bm = 64
+bn = 64
+wn = 4
+stages = 4
+
 # The rules for shapes no table lists, on every GPU whose table (or one it inherits) has no rules of that family.
 [defaults]
 # bf16: three input planes; 5..8 rows read them for every 8 columns of an nt = 1 tile (RTX 5090:
@@ -526,4 +570,14 @@ blocks = [
 # by `cuda_bench tune moe_gate_up` belong under variants/<arch>/tables/<sku>.toml.
 moe_gate_up = [
   { columns = 0, units = 0 },
+]
+# Prefill GEMMs, by the 64 x 128 tiles per SM: 64 x 32 below 0.5, 64 x 64 below 6 (NVFP4) or 2.5 (bf16 weights),
+# else 64 x 128.  From cuda_bench tc on the RTX 5070 Ti (Qwen3.5-4B shapes, 32-2048 rows): within 5% of the best of
+# the first four configurations on every shape and row count, and on 2560-column weights up to 1.7x the 64 x 128 tile
+# at 32-64 rows.
+prefill_tc = [
+  { sm_tiles_below = 0.5, bm = 64, bn = 32, wn = 2, stages = 2 },
+  { format = "nvfp4", sm_tiles_below = 6, bm = 64, bn = 64, wn = 4, stages = 2 },
+  { format = "bf16", sm_tiles_below = 2.5, bm = 64, bn = 64, wn = 4, stages = 2 },
+  { bm = 64, bn = 128, wn = 4, stages = 2 },
 ]

@@ -109,6 +109,57 @@ FLYX_HD float coupled_draft_score(float s, float T, uint64_t seed, int64_t pos, 
 // How many of its best logits a sequential drafter (MTP) drafts from (fewer with a smaller vocabulary).
 constexpr int kMtpCands = 16;
 
+// The candidates a sequential drafter drafts from (draft_choice, draft_coupled_scores): of its k <= kMtpCands best
+// logits, those that are candidates (in [0, vocab), logit not NaN), less their penalties (count: null, none), in o
+// (their indices into cand, larger logit first, then lower token); returns their number n.  T > 0: z[i] = o[i]'s logit
+// less the best over T for the first *keep of them, the ones the target's rule keeps (z > kSampleZMin, top_k, top_p;
+// 0: no logit finite to scale from).
+FLYX_HD int draft_kept(const int32_t* cand, const float* logit, const int* count, int k, int vocab, float T,
+                       float top_p, int top_k, float presence, float frequency, int* o, float* z, int* keep) {
+  float l[kMtpCands];
+  int n = 0;
+  *keep = 0;
+  for (int c = 0; c < k && c < kMtpCands; ++c) {
+    if (cand[c] < 0 || cand[c] >= vocab || logit[c] != logit[c]) continue;
+    l[c] = logit[c] - (count ? penalty(presence, frequency, count[c]) : 0.f);
+    int at = n++;
+    while (at > 0 && (l[c] > l[o[at - 1]] || (l[c] == l[o[at - 1]] && cand[c] < cand[o[at - 1]]))) {
+      o[at] = o[at - 1];
+      --at;
+    }
+    o[at] = c;
+  }
+  if (n == 0 || !(T > 0.f)) return n;
+  const float top = l[o[0]], inv = 1.f / T;
+  int kept = 0;
+  for (; kept < n; ++kept) {
+    const float d = l[o[kept]] - top;
+    z[kept] = inv == INFINITY ? d / T : d * inv;  // as the target scales a logit (scaled_logit)
+    if (!(z[kept] > kSampleZMin)) break;
+  }
+  if (kept > 0 && top_k > 0 && top_k < kept) {
+    int m = top_k;
+    while (m < kept && z[m] >= z[top_k - 1]) ++m;
+    kept = m;
+  }
+  if (kept > 0 && top_p < 1.f) {
+    float mass = 0.f;
+    for (int c = 0; c < kept; ++c) mass += expf(z[c]);
+    float acc = 0.f;
+    for (int c = 0; c < kept; ++c) {
+      acc += expf(z[c]);
+      if (acc >= top_p * mass) {
+        int m = c + 1;
+        while (m < kept && z[m] == z[c]) ++m;
+        kept = m;
+        break;
+      }
+    }
+  }
+  *keep = kept;
+  return n;
+}
+
 // A sequential drafter's draft from its k <= kMtpCands best logits (cand, logit: best first; count: each candidate's
 // count in the reply as the row verifying the draft counts it, or null), by the target's rule (sample_rows) applied to
 // the candidates alone: their penalties, then greedy the largest logit (the lower token on a tie); sampling, z = the
@@ -120,50 +171,12 @@ constexpr int kMtpCands = 16;
 // proposes: the round verifies it).
 FLYX_HD int32_t draft_choice(const int32_t* cand, const float* logit, const int* count, int k, int vocab, float T,
                              float top_p, int top_k, float presence, float frequency, uint64_t seed, int64_t pos) {
-  float l[kMtpCands];
-  int o[kMtpCands];  // the usable candidates, larger logit first, then lower token
-  int n = 0;
-  for (int c = 0; c < k && c < kMtpCands; ++c) {
-    if (cand[c] < 0 || cand[c] >= vocab || logit[c] != logit[c]) continue;
-    l[c] = logit[c] - (count ? penalty(presence, frequency, count[c]) : 0.f);
-    int at = n++;
-    while (at > 0 && (l[c] > l[o[at - 1]] || (l[c] == l[o[at - 1]] && cand[c] < cand[o[at - 1]]))) {
-      o[at] = o[at - 1];
-      --at;
-    }
-    o[at] = c;
-  }
-  if (n == 0) return 0;
-  if (!(T > 0.f)) return cand[o[0]];
-  const float top = l[o[0]], inv = 1.f / T;
+  int o[kMtpCands], keep;
   float z[kMtpCands];
-  int keep = 0;
-  for (; keep < n; ++keep) {
-    const float d = l[o[keep]] - top;
-    z[keep] = inv == INFINITY ? d / T : d * inv;  // as the target scales a logit (scaled_logit)
-    if (!(z[keep] > kSampleZMin)) break;
-  }
-  // no logit finite to scale from (the best infinite: every difference NaN): the best, as greedy takes it
-  if (keep == 0) return cand[o[0]];
-  if (top_k > 0 && top_k < keep) {
-    int m = top_k;
-    while (m < keep && z[m] >= z[top_k - 1]) ++m;
-    keep = m;
-  }
-  if (top_p < 1.f) {
-    float mass = 0.f;
-    for (int c = 0; c < keep; ++c) mass += expf(z[c]);
-    float acc = 0.f;
-    for (int c = 0; c < keep; ++c) {
-      acc += expf(z[c]);
-      if (acc >= top_p * mass) {
-        int m = c + 1;
-        while (m < keep && z[m] == z[c]) ++m;
-        keep = m;
-        break;
-      }
-    }
-  }
+  const int n = draft_kept(cand, logit, count, k, vocab, T, top_p, top_k, presence, frequency, o, z, &keep);
+  if (n == 0) return 0;
+  // greedy, or no logit finite to scale from (the best infinite: every difference NaN): the best, as greedy takes it
+  if (!(T > 0.f) || keep == 0) return cand[o[0]];
   float best = -INFINITY;
   int32_t bi = INT32_MAX;
   for (int c = 0; c < keep; ++c) {
@@ -172,6 +185,32 @@ FLYX_HD int32_t draft_choice(const int32_t* cand, const float* logit, const int*
     if (g > best || (g == best && v < bi)) best = g, bi = v;
   }
   return bi;
+}
+
+// Sampling (T > 0), how likely each of the k <= kMtpCands candidates draft_choice takes from is the target's choice at
+// pos, the target's noise there known: score[c] for cand[c] the log-softmax, over the kept candidates, of z plus the
+// noise over tau (draft_choice's argmax the largest), -inf for the others.  The target's z differ from the drafter's:
+// tau > 1 spreads the probability of the drafter's draft after the noise over the candidates nearest it, the
+// target's likeliest alternatives whatever their order before it.  Returns false (scores unset) greedy or with no
+// candidate kept.
+FLYX_HD bool draft_coupled_scores(const int32_t* cand, const float* logit, const int* count, int k, int vocab,
+                                  float T, float top_p, int top_k, float presence, float frequency, uint64_t seed,
+                                  int64_t pos, float tau, float* score) {
+  int o[kMtpCands], keep;
+  float z[kMtpCands];
+  const int n = draft_kept(cand, logit, count, k, vocab, T, top_p, top_k, presence, frequency, o, z, &keep);
+  if (n == 0 || !(T > 0.f) || keep == 0) return false;
+  for (int c = 0; c < k && c < kMtpCands; ++c) score[c] = -INFINITY;
+  float best = -INFINITY;
+  for (int c = 0; c < keep; ++c) {
+    score[o[c]] = (z[c] - logf(-logf(sample_uniform(seed, pos, cand[o[c]])))) / tau;
+    best = fmaxf(best, score[o[c]]);
+  }
+  float sum = 0.f;
+  for (int c = 0; c < keep; ++c) sum += expf(score[o[c]] - best);
+  const float lse = best + logf(sum);
+  for (int c = 0; c < keep; ++c) score[o[c]] -= lse;
+  return true;
 }
 
 // Reflect negative encodings around the key of zero so equal values, including both zeros, share a key.

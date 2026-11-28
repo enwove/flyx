@@ -3,6 +3,7 @@
 // and device memory account).  Sessions are core/session/session.h.
 #pragma once
 
+#include <algorithm>
 #include <cstdint>
 #include <atomic>
 #include <memory>
@@ -207,7 +208,8 @@ class Engine {
   // drafter's state follows its own rounds only; 0 otherwise, a round costing the same at any context); round_name(i)
   // says so ("mtp 3", "0", "dflash2 tree 11", "dv tree 31", "dv warm-up": a round of no drafts of a drafter,
   // Model::restarts).  round_trunks()[i]: a tree's trunk, the drafter's chain its first drafts are (its widest chain's
-  // width); 0 for a chain; -1 for a tree without one (a drafter that drafts nothing but trees: SpecController).
+  // width); 0 for a chain; -1 for a tree rated by the tokens its rounds give (a drafter that drafts nothing but trees,
+  // or whose trees are rated so, Model::trees_best_first: SpecController).
   const std::vector<int>& widths() const { return plans_.widths; }
   const std::vector<int>& round_drafters() const { return plans_.drafters; }
   const std::vector<bool>& round_trees() const { return plans_.drafter_trees; }
@@ -241,7 +243,18 @@ class Engine {
   flyx_plan* round_plan(size_t i) const { return plans_.rounds[i]; }
   // Rounds whose drafts the engine gives (EngineOptions::lookup): no drafter runs.
   const std::vector<int>& lookup_widths() const { return plans_.given_widths; }
+  // The rows a round of several sessions may hold: FLYX_MAX_ROWS, or where the backend lowered wide rounds of given
+  // drafts (plans' wide_given_widths: its rounds of up to FLYX_MAX_WIDE_ROWS rows, every row its 1..16-row bits) as
+  // many as the widest of them.
+  int batch_rows() const {
+    const int widest = plans_.given_widths.empty() ? 0 : plans_.given_widths.back() + 1;
+    return std::clamp(widest, FLYX_MAX_ROWS, FLYX_MAX_WIDE_ROWS);
+  }
   const std::vector<double>& lookup_ms() const { return lookup_ms_; }
+  // What each session past the first adds to a round of several (ms; its own mixers, attention, accept and commit):
+  // plain rounds of a few scratch sessions together, timed at load against one session's round of as many rows; 0
+  // where the engine was loaded for one session.
+  double batch_session_ms() const { return batch_session_ms_; }
   flyx_plan* lookup_plan(size_t i) const { return plans_.given[i]; }
   // Rounds that verify a tree of given drafts (gen.parents), where the backend has them; empty: none.
   const std::vector<int>& tree_widths() const { return plans_.tree_widths; }
@@ -305,6 +318,7 @@ class Engine {
  private:
   bool load_backend(std::string* err);
   bool build_and_calibrate_plans(double* t_plans, double* t_rounds, std::string* err);
+  void time_batches(const std::vector<int32_t>& prompt);
   // The plans lowered and their rounds timed (build_and_calibrate_plans), again after each step of what the backend
   // keeps only to run faster (a second copy of the head: the same output, slower; e.g. an 8 GB card beside a desktop)
   // is given back, where lowering finds no room for the prefill buffers; the time over every pass in lower_ms_ and
@@ -335,6 +349,8 @@ class Engine {
   std::vector<LoadAdjustment> load_adjustments_;  // automatic VRAM adjustments applied during load()
   std::vector<double> round_ms_;            // measured cost of each round plan (core/speculation)
   std::vector<double> lookup_ms_;           // measured cost of each lookup plan (core/speculation)
+  double batch_session_ms_ = 0;             // batch_session_ms()
+  int session_limit_ = 1;                   // load()'s: the sessions the engine may run at once
   std::vector<double> round_ms_per_token_;  // ... more for every token of context past round_ms_at_
   mutable SharedTokens round_tokens_;
   mutable RoundCosts round_costs_, lookup_costs_;  // round_costs(), lookup_costs()

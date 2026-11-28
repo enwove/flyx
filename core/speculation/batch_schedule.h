@@ -4,7 +4,7 @@
 // Each running session has a small set of candidate rounds (RoundChooser::candidates):
 // its preferred solo choice plus narrower batchable widths (plain, narrower drafter
 // widths, narrower lookup widths).  A shared batch reads the target's weights once for
-// all of its rows (at most FLYX_MAX_ROWS), and sessions sharing a drafter also share its
+// all of its rows (at most max_rows: plan_batches), and sessions sharing a drafter also share its
 // weight reads in lockstep/grouped batches.  BatchCostModel estimates a batch's cost from
 // the round and lookup timings calibrated at load; plan_batches() compares unconstrained First-Fit Decreasing packing against 1-batch joint width allocation
 // maximizing proportional fairness — the geometric mean of every session's expected
@@ -20,24 +20,29 @@
 
 namespace flyx {
 
-// Calibrated cost of a shared batch: target_ms(total_rows) + extra_sessions + shared_draft_ms(items).
+// Calibrated cost of a shared batch: target_ms(total_rows) + session_ms per session past the first +
+// shared_draft_ms(items).
 class BatchCostModel {
  public:
   // Marginal fraction of a session's solo draft cost paid by additional sessions sharing the same drafter
-  // in a batch: lockstep MTP and grouped DFlash2 read drafter weights and the 1-bit draft head once across
+  // in a batch: lockstep MTP and EAGLE-4 and grouped DFlash2 read drafter weights and the draft heads once across
   // concurrent sessions, leaving per-session mixer/attention/table overhead beyond the widest member.
   static constexpr double kSharedDraftShare = 0.15;
 
-  // Builds the cost model from the engine's calibrated round and lookup timings.
+  // Builds the cost model from the engine's calibrated round and lookup timings and what each session past the first
+  // adds to a round of several (`session_ms`: its own mixers, attention, accept and commit; Engine::batch_session_ms,
+  // timed at load).
   void build(const std::vector<int>& widths, const std::vector<int>& drafters, const std::vector<double>& round_ms,
-             const std::vector<int>& lookup_widths, const std::vector<double>& lookup_ms);
+             const std::vector<int>& lookup_widths, const std::vector<double>& lookup_ms, double session_ms);
   bool ready() const { return !knots_.empty(); }
 
-  // Target-only verification time (ms) for `rows` rows (1..FLYX_MAX_ROWS),
-  // piecewise-linearly interpolated from the calibrated plain and lookup timings.
+  // Target-only verification time (ms) for `rows` rows (1..FLYX_MAX_WIDE_ROWS, as wide as the lookup rounds timed)
+  // from the calibrated plain and lookup timings: up to FLYX_MAX_ROWS rows interpolated by the rows, past them by the
+  // round's tiles of FLYX_MAX_ROWS rows (such a round runs a tile at a time, each the bits of a round that wide: 17 rows
+  // cost what 32 do).
   double target_ms(int rows) const;
-  // Total shared-batch time (ms) for `n_sessions` sharing `rows` rows plus their `draft_ms`:
-  // includes per-session mixer/state overhead beyond the single session already in target_ms().
+  // Total shared-batch time (ms) for `n_sessions` sharing `rows` rows plus their `draft_ms`: target_ms() holds one
+  // session's own work, each other session adds session_ms.
   double batch_ms(int rows, int n_sessions, double draft_ms) const;
   // Marginal drafting time (ms) of candidate `c` beyond target verification.
   double draft_ms(const RoundCandidate& c) const;
@@ -51,6 +56,7 @@ class BatchCostModel {
     double ms = 1.0;
   };
   std::vector<Knot> knots_;
+  double session_ms_ = 0.0;
 };
 
 struct ScheduledRound {
@@ -63,10 +69,11 @@ struct ScheduledBatch {
 };
 
 // Assigns each session in `sessions` one of its candidates and groups them into
-// batches of at most FLYX_MAX_ROWS total rows.  Non-batchable sessions (tree rounds,
-// relaxed acceptance) are isolated into solo batches so they never prevent other
-// sessions from sharing a batch.
+// batches of at most `max_rows` total rows (FLYX_MAX_ROWS, or up to FLYX_MAX_WIDE_ROWS where the backend runs rounds
+// that wide: Engine::batch_rows).  Non-batchable sessions (tree rounds, relaxed acceptance) are isolated into solo
+// batches so they never prevent other sessions from sharing a batch.
 std::vector<ScheduledBatch> plan_batches(const BatchCostModel& cost,
-                                         const std::vector<std::vector<RoundCandidate>>& sessions);
+                                         const std::vector<std::vector<RoundCandidate>>& sessions,
+                                         int max_rows = FLYX_MAX_ROWS);
 
 }  // namespace flyx

@@ -22,7 +22,10 @@ struct DrafterTraits {
   bool tapped;            // drafts from the target's taps in the registry's slot without being a block (EAGLE-4)
   bool trees_by_default;  // its trees beside its chains pay on attention-only targets (drafts_trees_by_default)
   bool trees_beside_recurrence;  // ... on a gated delta net's too, whose tree recurrence a tree's rows run
-  bool widest_trees;      // its trees are of FLYX_MAX_ROWS - 1 drafts only (EAGLE-4's: its chain and the branches)
+  bool widest_trees;      // its trees are of FLYX_MAX_ROWS - 1 drafts only (EAGLE-4's)
+  // The controller rates its trees by the tokens their rounds give, as DV's (Model::trees_best_first), and learns its
+  // chains' acceptance from its chain rounds alone.
+  bool trees_best_first;
   // A block drafted at once whose drafts a small head then refines one at a time: a step costs little beside the
   // verify row its draft adds, so a round that stops may verify fewer drafts than it has (draft_steps_cheap).  Not a
   // sequential drafter's, whose step is a pass of a layer: with earlier checkpoints allowed Qwen3.8-27B's MTP rounds
@@ -53,7 +56,8 @@ constexpr DrafterInfo kDrafters[] = {
       .tapped = true,
       .trees_by_default = true,
       .trees_beside_recurrence = true,
-      .widest_trees = true}},
+      .widest_trees = true,
+      .trees_best_first = true}},
     {Drafter::kDv, interfaces::DrafterMode::kDv, "DV", {.tree_only = true}},
 };
 
@@ -156,6 +160,10 @@ int Model::block_drafts(int d) const {
 bool Model::drafts_trees(int d) const { return drafter_traits(drafters_.at(size_t(d)).kind).tree_only; }
 
 bool Model::widest_trees(int d) const { return drafter_traits(drafters_.at(size_t(d)).kind).widest_trees; }
+
+bool Model::trees_best_first(int d) const {
+  return drafter_traits(drafters_.at(size_t(d)).kind).trees_best_first;
+}
 
 bool Model::restarts(int d) const { return drafter_traits(drafters_.at(size_t(d)).kind).tree_only; }
 

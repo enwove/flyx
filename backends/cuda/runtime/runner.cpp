@@ -678,7 +678,7 @@ int encode_vision(flyx_plan* p, const flyx_vision_input* in, float* out_embeds, 
       cu_host = {0, N};
     }
 
-    const size_t sc_bytes = scratch_bytes(N, max_k, need_q8, need_a4, false, need_a4);
+    const size_t sc_bytes = scratch_bytes(N, max_k, need_q8, need_a4, false, need_a4, m->need.split_columns);
     const size_t base_bytes =
         align256(x_floats * sizeof(float)) + align256(h_floats * sizeof(float)) +
         align256(b1_floats * sizeof(float)) + align256(b2_floats * sizeof(float)) +
@@ -846,7 +846,7 @@ int encode_vision(flyx_plan* p, const flyx_vision_input* in, float* out_embeds, 
     int32_t* d_gw = d_gh + N;
     int32_t* d_cu = d_gw + N;
     void* sc_mem = take(sc_bytes);
-    Scratch sc = scratch_carve(sc_mem, sc_bytes, N, max_k, need_q8, need_a4, false, need_a4);
+    Scratch sc = scratch_carve(sc_mem, sc_bytes, N, max_k, need_q8, need_a4, false, need_a4, m->need.split_columns);
     if (sc.round_count) CK(cudaMemsetAsync(sc.round_count, 0, sc.round_count_cap * sizeof(int), sg.st));
     if (need_q8) {
       if (sc.q8_count) CK(cudaMemsetAsync(sc.q8_count, 0, kQ8Tiles * sizeof(int), sg.st));
@@ -1724,11 +1724,16 @@ int launch_batch(flyx_plan* const* plans, flyx_seq* const* seqs, const flyx_gen_
       return fail("launch_batch: tree, adaptive, and relaxed rounds run alone");
     for (int j = 0; j < i; ++j)
       if (seqs[j] == seqs[i]) return fail("launch_batch: a sequence twice");
+    if (plans[i]->width + 1 > FLYX_MAX_ROWS)
+      return fail("launch_batch: a round of more than FLYX_MAX_ROWS rows runs alone");
     rows += plans[i]->width + 1;
   }
-  if (rows > FLYX_MAX_ROWS) return fail("launch_batch: more than FLYX_MAX_ROWS rows");
+  // Up to the rows a sequence's own buffers hold (m->wide_rows: FLYX_MAX_WIDE_ROWS where wide rounds are on), every
+  // row the bits a round of its own gives it (run_batch: the GEMMs of more than FLYX_MAX_ROWS rows as a wide round's)
+  if (rows > m->wide_rows)
+    return fail("launch_batch: more rows than a round holds (" + std::to_string(m->wide_rows) + ")");
   // Canonicalize sequence order by pointer so equivalent batches share one cached graph regardless of caller order.
-  int ord[FLYX_MAX_ROWS];
+  int ord[FLYX_MAX_WIDE_ROWS];
   for (int i = 0; i < n; ++i) ord[i] = i;
   std::sort(ord, ord + n, [&](int a, int b) { return uintptr_t(seqs[a]) < uintptr_t(seqs[b]); });
 
@@ -1751,6 +1756,7 @@ int launch_batch(flyx_plan* const* plans, flyx_seq* const* seqs, const flyx_gen_
     bp.v.ld_feats = m->need.feats;
     bp.v.ld_ckv = m->need.ckv;
     bp.v.L = Launch{B.st, &lead->own.scratch, &m->opt.kernels, nullptr, &B.side};
+    bp.v.L.round_rows = true;  // a round's rows (more than FLYX_MAX_ROWS: a wide round's GEMMs, the 1..16-row bits)
     BatchKey key;
     key.n = n;
     bool prefill_claimed = false;

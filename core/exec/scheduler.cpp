@@ -197,7 +197,7 @@ bool Scheduler::load(std::string* err) {
     engine_ = std::move(e);
   }
   batch_cost_.build(engine_->widths(), engine_->round_drafters(), engine_->round_ms(), engine_->lookup_widths(),
-                    engine_->lookup_ms());
+                    engine_->lookup_ms(), engine_->batch_session_ms());
   if (max_sessions_ < wanted)
     log::info("flyx: %d sessions %s, %d fit in memory (%s of the GPU's each): using %d", wanted,
               opt_.max_sessions > 0 ? "requested" : "by default", max_sessions_, gb(engine_->session_bytes()).c_str(),
@@ -684,10 +684,10 @@ void Scheduler::advance_all() {
   if (!worked) os::sleep_us(100);  // on Windows a high-resolution timer, not the OS scheduler's 1 to 16 ms tick
 }
 
-// Every running generation's next round, jointly scheduled across sessions into batches of at most FLYX_MAX_ROWS
-// rows (core/speculation/batch_schedule.h). In step: they go out when every generation in its round
-// phase has one to launch (one whose rounds in flight are at its limit reads one soon), so they share rounds rather
-// than each keeping its own two in flight at its own times.
+// Every running generation's next round, jointly scheduled across sessions into batches of at most
+// Engine::batch_rows() rows (core/speculation/batch_schedule.h). In step: they go out when every generation in its
+// round phase has one to launch (one whose rounds in flight are at its limit reads one soon), so they share rounds
+// rather than each keeping its own two in flight at its own times.
 bool Scheduler::launch_rounds() {
   for (auto& r : running_) {
     r->gen->set_batched(true);
@@ -706,7 +706,7 @@ bool Scheduler::launch_rounds() {
   }
   if (idx == 0) return false;
   batch_cands_.resize(idx);
-  const auto batches = plan_batches(batch_cost_, batch_cands_);
+  const auto batches = plan_batches(batch_cost_, batch_cands_, engine_->batch_rows());
   const auto* api = engine_->api();
   for (const auto& b : batches) {
     const size_t n = b.items.size();

@@ -35,9 +35,10 @@
 //   cuda_bench graphs [K]  what an instantiated graph takes of the device's memory, by the nodes it holds (graphs.cu)
 //   cuda_bench paging KIND STEP [PIECE [FILL_TO]]  where the driver stops keeping allocations of a size on the GPU
 //                          (Windows pages them to host memory), one cudaMalloc or VMM pieces a step (paging.cu)
-//   cuda_bench mt [ROWS]   bf16 GEMMs of 17..64 rows on MiniCPM5-1B's layers, DV's adapters and head: the prefill
-//                          kernel, the 1..16-row kernel a tile of 16 rows at a time, and every k_gemm_skinny_mt
-//                          configuration (bf16_mt), us and GB/s of weights
+//   cuda_bench mt [ROWS ...] [NxK ...]  bf16 GEMMs of 17..64 rows (by default 17, 32, 48 and 64) on the shapes given
+//                          (by default MiniCPM5-1B's layers, DV's adapters and head): the prefill kernel, the 1..16-row
+//                          kernel a tile of 16 rows at a time, and every k_gemm_skinny_mt configuration (bf16_mt), us
+//                          and GB/s of weights
 //
 // Weights rotate through enough copies to exceed the L2 cache, as in a real
 // forward pass where every weight is read once per round.  Kernels launch as
@@ -165,6 +166,10 @@ void bench_skinny() {
     for (int rows : {1, 4, 8, 16}) {
       std::printf("%-14s r%-4d", s.name, rows);
       for (int c = 0; c < kSkinnyConfigs; ++c) {
+        if (!bench_skinny_cfg_fits(c, s.N, false)) {
+          std::printf("  %6s", "-");
+          continue;
+        }
         double ms = time_ms([&] { gemm_skinny_cfg(c, x, s.K, W.next(), s.N, s.K, y, s.N, rows, false, BL(0)); }, 20);
         std::printf("  %6.0f", gb / (ms / 1e3));
       }
@@ -520,10 +525,19 @@ void bench_gdn_prefill() {
 // the activations (k_to_bf16), which a prefill pass mostly leaves to the
 // producer kernels (gemm_tc_staged): the trace of a real pass shows the GEMM
 // alone (bench/trace).
-void bench_tc() {
+// cuda_bench tc [NxK ...]: the shapes given (default kShapes), 24..2048 rows.
+void bench_tc(int argc, char** argv) {
   header();
   std::printf("prefill GEMM TFLOPS per configuration (bf16 | nvfp4), random weights and activations\n");
-  for (const auto& s : kShapes) {
+  std::vector<Shape> shapes(std::begin(kShapes), std::end(kShapes));
+  if (argc > 2) {
+    shapes.clear();
+    for (int i = 2; i < argc; ++i) {
+      int n = 0, k = 0;
+      if (std::sscanf(argv[i], "%dx%d", &n, &k) == 2) shapes.push_back({argv[i], n, k});
+    }
+  }
+  for (const auto& s : shapes) {
     if (s.N == 248320) continue;
     Weights W(s, true);
     const size_t qb = size_t(s.N) * s.K / 2, sb = size_t(s.N) * s.K / 16;
@@ -538,7 +552,7 @@ void bench_tc() {
     CK(cudaMalloc(&x, size_t(2048) * s.K * 4));
     k_fill_f<<<1024, 256>>>(x, size_t(2048) * s.K, 19u, -2.f, 4.f);
     CK(cudaMalloc(&y, size_t(2048) * s.N * 4));
-    for (int rows : {32, 64, 128, 256, 512, 1024, 2048}) {
+    for (int rows : {24, 32, 48, 64, 96, 128, 256, 512, 1024, 2048}) {
       std::printf("%-14s r%-5d", s.name, rows);
       const double tf = 2.0 * rows * s.N * s.K / 1e12;
       for (int fp4 = 0; fp4 < 2; ++fp4) {
@@ -1370,6 +1384,7 @@ void bench_w12() {
               esc, bad);
   for (int cfg = 0; cfg < kSkinnyConfigs; ++cfg) {
     const auto& b = kBf16Configs[cfg];
+    if (!bench_skinny_cfg_fits(cfg, N, true)) continue;
     std::printf("cfg%d nt%d w%2d u%2d", cfg, b.nt, b.warps, b.unroll);
     for (int rows : {1, 4, 8, 16}) {
       const double a = time_ms([&] { gemm_skinny_cfg(cfg, x, K, w, N, K, y, N, rows, false, BL(0)); }, 20);
@@ -2379,14 +2394,21 @@ const Shape kRowsShapes[] = {{"w_in q|k|v", 2560, 1536}, {"w_out", 1536, 2048}, 
 
 void bench_mt(int argc, char** argv) {
   header();
-  std::vector<int> rows_list = {17, 32, 48, 64};
-  if (argc > 2) rows_list = {std::atoi(argv[2])};
+  std::vector<int> rows_list;
+  std::vector<Shape> shapes;
+  for (int i = 2; i < argc; ++i) {
+    int n = 0, k = 0;
+    if (std::sscanf(argv[i], "%dx%d", &n, &k) == 2) shapes.push_back({argv[i], n, k});
+    else if (const int r = std::atoi(argv[i]); r >= 1 && r <= FLYX_MAX_WIDE_ROWS) rows_list.push_back(r);
+  }
+  if (rows_list.empty()) rows_list = {17, 32, 48, 64};
+  if (shapes.empty()) shapes.assign(std::begin(kRowsShapes), std::end(kRowsShapes));
   std::printf("us (GB/s of weights) per GEMM: prefill = gemm_tc, tiles = the 1..16-row kernel 16 rows at a time; "
               "mt c = bf16_mt configuration c (nt, chunks, unroll, parts)\n");
   for (int c = 0; c < kMtConfigCount; ++c)
     std::printf("  mt %2d: nt %d, chunks %2d, unroll %d, parts %d\n", c, kMtConfigs[c].nt, kMtConfigs[c].chunks,
                 kMtConfigs[c].unroll, kMtConfigs[c].parts);
-  for (const auto& s : kRowsShapes) {
+  for (const auto& s : shapes) {
     Weights W(s, true);
     float *x, *y;
     CK(cudaMalloc(&x, size_t(64) * s.K * 4));
@@ -2448,10 +2470,10 @@ int main(int argc, char** argv) {
   if (what == "paging") return bench_paging(argc, argv);  // the device's memory as it is, no scratch beside it
   {
     void* mem = nullptr;
-    // K up to the 27B's MLP down projection (17408).
-    const size_t bytes = scratch_bytes(2048, 17408);
+    // K up to the 27B's MLP down projection (17408); split GEMMs of up to kBenchSplitColumns columns.
+    const size_t bytes = scratch_bytes(2048, 17408, true, false, true, true, kBenchSplitColumns);
     CK(cudaMalloc(&mem, bytes));
-    g_bench_scratch = scratch_in(mem, bytes, 2048, 17408);
+    g_bench_scratch = scratch_in(mem, bytes, 2048, 17408, true, false, kBenchSplitColumns);
   }
   if (what == "gemm") bench_gemm();
   else if (what == "skinny") bench_skinny();
@@ -2461,7 +2483,7 @@ int main(int argc, char** argv) {
   else if (what == "decode") bench_decode();
   else if (what == "fp4cfgs") bench_fp4cfgs(argc, argv);
   else if (what == "fp4rows") bench_fp4rows(argc, argv);
-  else if (what == "tc") bench_tc();
+  else if (what == "tc") bench_tc(argc, argv);
   else if (what == "attn") bench_attn(argc > 2 ? std::atoi(argv[2]) : 16, argc > 3 ? std::atoi(argv[3]) : 32,
                                        argc > 4 ? std::atoi(argv[4]) : 0);
   else if (what == "mlp") bench_mlp();

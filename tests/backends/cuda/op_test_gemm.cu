@@ -70,9 +70,15 @@ void test_gemm() {
       same &= a == b;
     }
     for (int cfg = 0; cfg < kSkinnyConfigs; ++cfg) {  // every compiled tuning configuration gives the same bits
-      if (!gemm_skinny_cfg_compiled(cfg, 1, false)) continue;
-      gemm_skinny_cfg(cfg, dx, K, dw, N, K, d1, N, 1, false, TL);
-      same &= down(d1, N) == down(d16, N);
+      if (gemm_skinny_cfg_compiled(cfg, 1, false)) {
+        gemm_skinny_cfg(cfg, dx, K, dw, N, K, d1, N, 1, false, TL);
+        same &= down(d1, N) == down(d16, N);
+      }
+      if (gemm_skinny_cfg_compiled(cfg, 16, false)) {  // 16 rows (a split configuration's last block adds them)
+        float* d16c = dev<float>(size_t(16) * N);
+        gemm_skinny_cfg(cfg, dx, K, dw, N, K, d16c, N, 16, false, TL);
+        same &= down(d16c, size_t(16) * N) == down(d16, size_t(16) * N);
+      }
     }
     std::printf("  %-4s skinny: a row's result does not depend on the row count or the configuration\n",
                 same ? "ok" : "FAIL");

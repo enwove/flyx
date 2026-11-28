@@ -16,6 +16,7 @@
 #include "core/os/log.h"
 #include "core/os/os.h"
 #include "core/os/path.h"
+#include "core/speculation/batch_schedule.h"
 #include "core/speculation/calibrate.h"
 
 namespace flyx {
@@ -334,11 +335,11 @@ bool Engine::build_and_calibrate_plans(double* t_plans, double* t_rounds, std::s
   round_ms_at_ = round_ms_again_at_ = 0;
   round_trunks_.assign(plans_.widths.size(), 0);
   // A tree's trunk: the chain one pass of its drafter's block makes (ops/draft/ref.h); a drafter that drafts nothing
-  // but trees has none.
+  // but trees, or whose trees are rated by the tokens they give (Model::trees_best_first), has none.
   for (size_t i = 0; i < plans_.widths.size(); ++i)
     if (plans_.drafter_trees[i]) {
       const int chain = model_->block_drafts(plans_.drafters[i]);
-      round_trunks_[i] = model_->drafts_trees(plans_.drafters[i])
+      round_trunks_[i] = model_->drafts_trees(plans_.drafters[i]) || model_->trees_best_first(plans_.drafters[i])
                              ? -1
                              : std::min(plans_.widths[i], chain > 0 ? chain : plans_.widths[i]);
     }
@@ -429,8 +430,32 @@ bool Engine::build_and_calibrate_plans(double* t_plans, double* t_rounds, std::s
   for (size_t k = 1; k < lookup_narrower.size(); ++k) lookup_narrower[k] = int(k - 1);
   round_costs_.reset(round_ms_, &round_ms_per_token_, round_ms_at_, &narrower);
   lookup_costs_.reset(lookup_ms_, nullptr, round_ms_at_, &lookup_narrower);
+  time_batches(prompt);
   *t_rounds = os::now_ms();
   return true;
+}
+
+// batch_session_ms(): plain rounds of up to four scratch sessions together against one session's round of as many
+// rows (BatchCostModel::target_ms from the rounds just timed), what each session past the first adds.
+void Engine::time_batches(const std::vector<int32_t>& prompt) {
+  batch_session_ms_ = 0;
+  const int n = std::min(session_limit_, 4);
+  size_t plain = plans_.widths.size();
+  for (size_t i = 0; i < plans_.widths.size(); ++i)
+    if (plans_.widths[i] == 0 && plans_.drafters[i] < 0) plain = i;
+  if (n < 2 || plain == plans_.widths.size()) return;
+  const double together =
+      spec::time_batch(api_, bm_, plans_.prefill, prefill_chunk_, prompt, plans_.rounds[plain], n);
+  if (together <= 0) {
+    if (opt_.verbose) log::warn("flyx: timing a round of %d sessions failed: %s", n, api_->last_error());
+    return;
+  }
+  BatchCostModel alone;
+  alone.build(plans_.widths, plans_.drafters, round_ms_, plans_.given_widths, lookup_ms_, 0);
+  batch_session_ms_ = std::max(0.0, (together - alone.target_ms(n)) / (n - 1));
+  if (opt_.verbose)
+    log::info("flyx: a round of %d sessions %.2f ms, of one session's %d rows %.2f: %.2f ms a session past the first",
+              n, together, n, alone.target_ms(n), batch_session_ms_);
 }
 
 bool Engine::lower_and_time(std::string* err) {
@@ -621,6 +646,7 @@ void Engine::log_memory_plan(int asked_ctx) const {
 
 bool Engine::load(const std::string& path, const EngineOptions& opt, std::string* err, int session_limit) {
   opt_ = opt;
+  session_limit_ = std::max(1, session_limit);
   load_adjustments_.clear();
   prefill_cap_ = 0;
   active_draft_weights_.clear();

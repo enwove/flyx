@@ -245,7 +245,10 @@ void test_gemm_w12(int N, int K) {
   if (!ok) ++g_fail;
   for (int cfg = 0; cfg < kSkinnyConfigs; ++cfg)
     for (int rows : {1, 3, 9, 16}) {
-      if (!gemm_skinny_cfg_compiled(cfg, rows, false) || !gemm_skinny_cfg_compiled(cfg, rows, true)) continue;
+      // a split configuration serves bf16 weights alone (W12's rules never name one)
+      if (kBf16Configs[cfg].split > 1 || !gemm_skinny_cfg_compiled(cfg, rows, false) ||
+          !gemm_skinny_cfg_compiled(cfg, rows, true))
+        continue;
       const Vec x = randv(size_t(rows) * K);
       float *dx = up(x), *dy = dev<float>(size_t(rows) * N), *dz = dev<float>(size_t(rows) * N);
       gemm_skinny_cfg(cfg, dx, K, dw, N, K, dy, N, rows, false, TL);

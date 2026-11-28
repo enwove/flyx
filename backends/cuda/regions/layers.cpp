@@ -499,7 +499,7 @@ void eagle4_draft_tree(flyx_seq* s, const Eagle4Block& b, int width, const Launc
     eagle_tree_grow(s->etree, s->P, s->G, s->reply.count, s->oracle, s->ecand, s->eval, s->eprob, kc, beam, V,
                     s->egnode, s->ehbuf, H, st);
   }
-  eagle_tree_finish(s->etree, width, kEagleTrunk, s->drafts, s->tree, st);
+  eagle_tree_finish(s->etree, s->G, width, kEagleTrunk, s->drafts, s->tree, st);
 }
 
 // After a pass: each row's h = fc([fc_norm_i(tap_i)]) into the ring, and the K/V of the positions base-1 ..

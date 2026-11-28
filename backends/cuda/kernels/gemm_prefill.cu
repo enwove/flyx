@@ -8,6 +8,7 @@
 #include "backends/cuda/kernels/common/launch.h"
 #include "backends/cuda/kernels/kernels.cuh"
 #include "backends/cuda/kernels/gemm_internal.h"
+#include "flyx/gemm_tables.inc"
 
 namespace flyx::cuda {
 namespace {
@@ -416,14 +417,9 @@ void gemm_fp4_mma(const float* x, int ldx, const uint8_t* Q, const uint8_t* S, c
   k_gemm_mma_fp4<<<grid, 128, 0, st>>>(x, ldx, Q, S, RS, N, K, y, ldy, rows, accumulate);
 }
 
-// Prefill GEMM configurations (block tile rows x columns, pipeline stages);
-// all give the same bits.  0: 64 x 128, 2 stages, 24 KB of shared memory
-// (NVFP4 less), four blocks per SM.  1: 128 x 128, 3 stages, two blocks.  On
-// the RTX 5070 Ti (cuda_bench tc, Qwen3.5-4B shapes, 512-2048 rows) 0 is
-// 2-24% faster than 1 with bf16 weights; with NVFP4 up to 15% faster on the
-// narrow shapes and within 6% on the wide ones.  2: 64 x 64 and 3: 64 x 32
-// (two warps along N), for a short pass whose 64 x 128 tiles leave SMs idle:
-// a 2560-column weight is 20 such tiles per 64 rows.
+// Prefill GEMM configurations: backends/cuda/variants/candidates.toml (prefill_tc, FLYX_PREFILL_TC); all give the
+// same bits.
+static_assert(FLYX_PREFILL_TC_COUNT == kTcConfigs, "kernels.cuh: kTcConfigs, the prefill_tc configurations");
 template <bool FP4, int WN, int WM, int ST, bool GLU, int BN>
 void launch_tc_cfg(const bf16* a, const bf16* W, const uint8_t* Q, const uint8_t* S, const float* RS, int N, int K,
                    float* y, int ldy, int M, bool accumulate, cudaStream_t st, bf16* glu) {
@@ -436,31 +432,31 @@ void launch_tc_cfg(const bf16* a, const bf16* W, const uint8_t* Q, const uint8_t
                                                                                 accumulate, glu);
 }
 
-// The configuration a prefill GEMM gets, by its 64 x 128 tiles per SM (b):
-// 64 x 32 below b = 0.5, 64 x 64 below 6 (NVFP4) or 2.5 (bf16 weights), else
-// 64 x 128.  From cuda_bench tc on the RTX 5070 Ti (Qwen3.5-4B shapes, 32-2048
-// rows): within 5% of the
-// best configuration on every shape and row count, and on 2560-column
-// weights up to 1.7x the 64 x 128 tile at 32-64 rows.
-template <bool FP4>
-int tc_auto_config(int M, int N) {
-  const int64_t sms = device_sm_count();
-  const int64_t tiles = int64_t(ceil_div(M, 64)) * ceil_div(N, 128);
-  if (2 * tiles < sms) return 3;
-  if (FP4 ? tiles < 6 * sms : 2 * tiles < 5 * sms) return 2;
-  return 0;
+// The configuration a prefill GEMM gets: the first prefill_tc rule of the GPU's table (or the one it inherits,
+// else the defaults) for the weights' format, M rows and the GEMM's 64 x 128 tiles per SM.
+static int tc_config(int tuning, bool fp4, int M, int N) {
+  const int s = tables::rules_sku(tuning, tables::kFamilyPrefillTc);
+  const double tiles = double(ceil_div(M, 64)) * ceil_div(N, 128), sms = double(device_sm_count());
+  for (const auto& r : tables::kPrefillTc)
+    if (r.sku == s && (r.fmt < 0 || r.fmt == int(fp4)) && M >= r.lo && M <= r.hi &&
+        (r.tiles_below <= 0 || tiles < r.tiles_below * sms))
+      return r.cfg;
+  std::abort();  // the generator checks that each format ends at a rule for the rest
 }
 
 // glu non-null: the gate|up GEMM with SwiGLU in its epilogue (N = 2 I columns, glu [M][I]).
-// cfg: one of kTcConfigs, -1 = tc_auto_config.
+// cfg: one of kTcConfigs.
 template <bool FP4, bool GLU>
 void launch_tc_glu(int cfg, const bf16* a, const bf16* W, const uint8_t* Q, const uint8_t* S, const float* RS, int N,
                    int K, float* y, int ldy, int M, bool accumulate, cudaStream_t st, bf16* glu) {
-  switch (cfg < 0 ? tc_auto_config<FP4>(M, N) : cfg) {
-    case 1: launch_tc_cfg<FP4, 4, 2, 3, GLU, 128>(a, W, Q, S, RS, N, K, y, ldy, M, accumulate, st, glu); break;
-    case 2: launch_tc_cfg<FP4, 4, 1, 2, GLU, 64>(a, W, Q, S, RS, N, K, y, ldy, M, accumulate, st, glu); break;
-    case 3: launch_tc_cfg<FP4, 2, 1, 2, GLU, 32>(a, W, Q, S, RS, N, K, y, ldy, M, accumulate, st, glu); break;
-    default: launch_tc_cfg<FP4, 4, 1, 2, GLU, 128>(a, W, Q, S, RS, N, K, y, ldy, M, accumulate, st, glu); break;
+  switch (cfg) {
+#define FLYX_TC_CASE(i, bm, bn, wn, stages)                                                                         \
+  case i:                                                                                                          \
+    launch_tc_cfg<FP4, wn, bm / 64, stages, GLU, bn>(a, W, Q, S, RS, N, K, y, ldy, M, accumulate, st, glu);         \
+    break;
+    FLYX_PREFILL_TC(FLYX_TC_CASE)
+#undef FLYX_TC_CASE
+    default: std::abort();
   }
 }
 
@@ -497,6 +493,7 @@ const bf16* to_abuf(const float* x, int ldx, int K, int M, const Launch& L) {
 // The bf16 tensor cores on bf16 rows a: NVFP4 weights (Q) or bf16 ones (W).
 void tc_rows(int cfg, const bf16* a, const bf16* W, const uint8_t* Q, const uint8_t* S, const float* RS, int N, int K,
              float* y, int ldy, int M, bool accumulate, const Launch& L, bf16* glu = nullptr) {
+  if (cfg < 0) cfg = tc_config(opts(L).tuning, Q != nullptr, M, N);
   if (Q) launch_tc_by<true>(cfg, a, nullptr, Q, S, RS, N, K, y, ldy, M, accumulate, L.st, glu);
   else launch_tc_by<false>(cfg, a, W, nullptr, nullptr, nullptr, N, K, y, ldy, M, accumulate, L.st, glu);
 }

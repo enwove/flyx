@@ -115,8 +115,9 @@ void RoundChooser::candidates(const std::vector<int32_t>& tokens, int in_flight,
     }
     return;
   }
-  // A round that runs alone: a tree's (launch_batch), or one of more rows than a round of several sessions holds.  (A
-  // drafter's warm-up is no tree: it may go out with other sessions' rounds, its canvas pass a sequence at a time.)
+  // A round that runs alone: a tree's (launch_batch), or one of more than FLYX_MAX_ROWS rows (a session's share of a
+  // batch holds at most that).  (A drafter's warm-up is no tree: it may go out with other sessions' rounds, its canvas
+  // pass a sequence at a time.)
   auto alone = [&](size_t i) {
     return ((*widths_)[i] > 0 && spec_.is_tree(i)) || (*widths_)[i] + 1 > FLYX_MAX_ROWS;
   };

@@ -312,8 +312,8 @@ const std::vector<OptionSpec>& option_specs() {
       bool_choice_opt("draft_head", &BackendOptions::full_draft_head, "full", "pick"),
       {"eagle4_tree",
        [](const std::string& key, const std::string& val, BackendOptions* o, std::string* err) {
-         // STEPS 0 (by the width) or at least the trunk: a shallower tree would cut the chain its trunk is, whose
-         // acceptance the controller counts to its 7th draft (Model::block_drafts)
+         // STEPS 0 (by the width) or at least the trunk: a shallower tree would cut a sampled tree's first drafts, the
+         // coupled chain of kEagleTrunk
          int beam = 0, steps = 0;
          const char *p = val.data(), *end = p + val.size();
          auto r = std::from_chars(p, end, beam);
@@ -766,11 +766,14 @@ int open_model(const flyx_model_desc* desc, const flyx_open_options* opts, flyx_
     bool chunked = !m->states.gdn.empty();
     for (const GdnDims& gd : m->states.gdn) chunked = chunked && gdn_chunk_takes(gd);
     m->prefill_align = chunked ? gdn_chunk_align() : 1;
-    // Wide lookup rounds (up to FLYX_MAX_WIDE_ROWS rows, every row the 1..16-row bits): wide=1, or wide=auto where
-    // every projection of the stack is NVFP4 (17..64-row GEMMs that read the weights once) and 24 GB of the GPU stay
-    // free for the sequences' wider round buffers.
+    // Wide rounds (up to FLYX_MAX_WIDE_ROWS rows, every row the 1..16-row bits: wide lookup rounds, and rounds of
+    // several sessions as wide, launch_batch): wide=1, or wide=auto where every projection of the stack is NVFP4 or
+    // bf16 (17..64-row GEMMs that read the weights once; GGML blocks take 16-row strips) and 24 GB of the GPU stay free
+    // for the sequences' wider round buffers.  Qwen3.8-27B BF16 with EAGLE-4 on an RTX PRO 6000 Server Edition: 8
+    // sessions 443.6 tok/s with them against 290.2 in batches of 16 rows, one session 128.2 against 126.2.
     if (m->opt.wide != 1) {
-      bool nvfp4 = true;
+      bool once = true;  // every projection read once by a GEMM of 17..64 rows
+      auto read_once = [](const Lin& l) { return !l.packed() && (l.q || l.w); };
       std::vector<bool> mtp_parts(m->blocks.size(), false);  // the MTP layer's blocks run no wide round
       for (const Block& b : m->blocks)
         if (const auto* t = std::get_if<MtpBlock>(&b)) {
@@ -780,14 +783,14 @@ int open_model(const flyx_model_desc* desc, const flyx_open_options* opts, flyx_
       for (size_t i = 0; i < m->blocks.size(); ++i) {
         if (mtp_parts[i]) continue;
         const Block& b = m->blocks[i];
-        if (const auto* g = std::get_if<GdnBlock>(&b)) nvfp4 = nvfp4 && g->w_in.q && g->w_out.q;
-        else if (const auto* a = std::get_if<AttnBlock>(&b)) nvfp4 = nvfp4 && a->w_in.q && a->w_out.q;
-        else if (const auto* f = std::get_if<MlpBlock>(&b)) nvfp4 = nvfp4 && f->w_gu.q && f->w_down.q;
-        else if (std::holds_alternative<RelAttnBlock>(b) || std::holds_alternative<MoeBlock>(b)) nvfp4 = false;
+        if (const auto* g = std::get_if<GdnBlock>(&b)) once = once && read_once(g->w_in) && read_once(g->w_out);
+        else if (const auto* a = std::get_if<AttnBlock>(&b)) once = once && read_once(a->w_in) && read_once(a->w_out);
+        else if (const auto* f = std::get_if<MlpBlock>(&b)) once = once && read_once(f->w_gu) && read_once(f->w_down);
+        else if (std::holds_alternative<RelAttnBlock>(b) || std::holds_alternative<MoeBlock>(b)) once = false;
       }
       size_t free_b = 0, total_b = 0;
       const bool roomy = gpu_memory(&free_b, &total_b) && free_b >= size_t(24) * 1000000000;
-      if (m->opt.wide == 2 || (nvfp4 && roomy)) m->wide_rows = FLYX_MAX_WIDE_ROWS;
+      if (m->opt.wide == 2 || (once && roomy)) m->wide_rows = FLYX_MAX_WIDE_ROWS;
     }
     // A model that holds DV drafts its file's tree every round (docs/design/dv.md): where wide=auto gives no wide
     // rows, it has those of DV's widest round (its tree's drafts and the anchor); wide=0 keeps 16, and DV's rounds of

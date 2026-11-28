@@ -222,6 +222,11 @@ struct Scratch {
   size_t round_parts_cap = 0;
   int* round_count = nullptr;
   size_t round_count_cap = 0;
+  // A 1..16-row bf16 GEMM whose column tiles' chunks are shared by several blocks (k_gemm_skinny_split): the chunks'
+  // sums [tile][16][...] of up to skinny_columns columns, and a counter per tile, zero between launches.
+  float* skinny_parts = nullptr;
+  unsigned* skinny_count = nullptr;
+  int skinny_columns = 0;
   // The same for a launch on a launch's side stream (side_scratch; kSideColumns a launch): two split launches at once
   // take sums and counters of their own.
   float* side_parts = nullptr;
@@ -251,14 +256,16 @@ struct Scratch {
 // bytes, and its buffers carved from `bytes` of memory at a 256-byte boundary
 // (one layout does both; memory too small is a bug and aborts).  q8_parts:
 // room for the runs of K of prefill GEMMs in 8 bits side by side (else they
-// take them in turn).  scratch_carve() does no device work; scratch_in()
+// take them in turn).  split_columns: room for the chunks' sums of split 1..16-row bf16 GEMMs of that many columns
+// (the GPU's table's, gemm_split_columns).  scratch_carve() does no device work; scratch_in()
 // also sets the tiles' counters to zero, which memory that starts zeroed
 // already has.
 size_t scratch_bytes(int rows, int k_max, bool q8_parts = true, bool f32_rows = false, bool need_glu = true,
-                     bool need_q4 = true);
+                     bool need_q4 = true, int split_columns = 0);
 Scratch scratch_carve(void* mem, size_t bytes, int rows, int k_max, bool q8_parts = true, bool f32_rows = false,
-                      bool need_glu = true, bool need_q4 = true);
-Scratch scratch_in(void* mem, size_t bytes, int rows, int k_max, bool q8_parts = true, bool f32_rows = false);
+                      bool need_glu = true, bool need_q4 = true, int split_columns = 0);
+Scratch scratch_in(void* mem, size_t bytes, int rows, int k_max, bool q8_parts = true, bool f32_rows = false,
+                   int split_columns = 0);
 // A round's gate|up rows gu [rows][ld] (gate columns 0..I-1, up I..2I-1): the GEMM that writes them also leaves
 // silu(gate) * up in 8 bits in its scratch (Scratch::q8_glu), the bits swiglu_split(..., q8) gives.
 struct RoundGlu {
@@ -323,8 +330,8 @@ void gemm_skinny(const float* x, int ldx, const bf16* W, int N, int K, float* y,
 // Prefill GEMMs, pipelined tensor cores (bf16 activations); used by gemm() /
 // gemm_fp4() for more than 16 rows.  Explicit entry points for tests and
 // benchmarks: cfg picks one of kTcConfigs compiled configurations (all give
-// the same bits), -1 the default.
-constexpr int kTcConfigs = 4;  // block tiles 64 x 128, 128 x 128, 64 x 64, 64 x 32 (gemm_prefill.cu)
+// the same bits), -1 the GPU's table's (candidates.toml: prefill_tc).
+constexpr int kTcConfigs = 6;  // the prefill_tc configurations
 void gemm_tc(const float* x, int ldx, const bf16* W, int N, int K, float* y, int ldy, int M, bool accumulate,
              const Launch& L, int cfg = -1);
 void gemm_fp4_tc(const float* x, int ldx, const uint8_t* Q, const uint8_t* S, const float* RS, int N, int K, float* y,
@@ -335,7 +342,7 @@ void gemm_fp4_tc(const float* x, int ldx, const uint8_t* Q, const uint8_t* S, co
 void gemm_skinny_cfg(int cfg, const float* x, int ldx, const bf16* W, int N, int K, float* y, int ldy, int rows,
                      bool accumulate, const Launch& L);
 struct Bf16Config {
-  int nt, warps, unroll;
+  int nt, warps, unroll, split;  // split > 1: bf16 weights of at most Scratch::skinny_columns columns
 };
 extern const Bf16Config kBf16Configs[];
 extern const int kSkinnyConfigs;
@@ -431,6 +438,9 @@ const char* gemm_tuning_name(int tuning);
 bool gemm_tuning_compiled_for(int tuning, int cc);
 // Whether kernels launch as programmatic dependents on the GPU of this table unless the options say.
 bool gemm_tuning_pdl(int tuning);
+// The most columns of a shape the table (and those it inherits) runs in a split 1..16-row configuration: the
+// columns a scratch holds the chunks' sums of (scratch_bytes); 0: none, and with no table.
+int gemm_split_columns(int tuning);
 // The table a device runs unless the options name one or none (option tuning=table; the engine and cuda_bench alike):
 // the device's own (gemm_tuning_for, by its name, else by its compute capability device_cc), where the loaded code
 // (compute capability code_cc, compiled_arch) has its kernels; else the loaded code's architecture's table, where it
@@ -957,9 +967,9 @@ __host__ __device__ inline int tree_slot(const TreeRows* t, int r, int base, int
 // score and K/V slot (-1: a leaf no step continued from; else its K/V and normed output at P->position - 1 + slot);
 // every candidate a step scored is a node, the frontier (front[0 .. fn - 1], one depth, slots f0 ..) the best `beam`
 // of them; the frontier's tokens and the two trees its step runs with (prep for attn_prep, att for attention, by
-// slot); the node on the oracle's path, and the end of the trunk: the drafter's chain (each node's best child), kept in
-// the frontier so that the tree's first drafts are its chain's.
-// kEagleTrunk: the chain a tree's first drafts are (Model::block_drafts of a sequential drafter, 7)
+// slot); the node on the oracle's path, and the end of the trunk: the drafter's chain (each node's child the chain
+// would draft there), kept in the frontier so that a sampled tree's first drafts are its chain's.
+// kEagleTrunk: the chain a sampled tree's first drafts are (Model::block_drafts of a sequential drafter, 7)
 constexpr int kEagleSlots = FLYX_MAX_WIDE_ROWS, kEagleNodes = 512, kEagleBeamMax = 8, kEagleTrunk = FLYX_SEQUENTIAL_TRUNK;
 struct EagleTree {
   int n, f0, fn, oracle_node, trunk_node;
@@ -980,8 +990,10 @@ void eagle_tree_start(EagleTree* t, const DevParams* P, const DevGen* G, const i
 void eagle_tree_grow(EagleTree* t, const DevParams* P, const DevGen* G, const int* reply_count, const int* oracle,
                      const int* cand, const float* val, const float* prob, int kc, int beam, int vocab,
                      const float* gnode, float* hbuf, int H, cudaStream_t st);
-// The round's `width` drafts and their tree (TreeRows) from the nodes, the chain's first `trunk` first.
-void eagle_tree_finish(const EagleTree* t, int width, int trunk, int* drafts, TreeRows* tree, cudaStream_t st);
+// The round's `width` drafts and their tree (TreeRows) from the nodes: sampling the chain's first `trunk` first, greedy
+// best first.
+void eagle_tree_finish(const EagleTree* t, const DevGen* G, int width, int trunk, int* drafts, TreeRows* tree,
+                       cudaStream_t st);
 
 // The keys [ks, ke) that split `split` of `splits` gives a row attending to `total` keys: as many splits as its
 // keys fill, kAttnMinSplitKeys or more each, starting on 32-key boundaries.  It depends on the row's own position
@@ -1648,7 +1660,7 @@ void gemm_fp4_presplit(const uint8_t* Q, const uint8_t* S, const float* RS, int 
 // bf16 rows a fused producer left in the scratch times W [2 I, K] (gate rows, then up;
 // bf16 W, or NVFP4 Q/S/RS) -> scratch glu [rows][I] = bf16(silu(g) u).  Same bits as the
 // GEMM into float32 followed by swiglu_split; W4A4 under KernelOptions::prefill_fp4 as
-// gemm_fp4_presplit.  cfg: a k_gemm_tc configuration (tests), -1 the default.  Then
+// gemm_fp4_presplit.  cfg: a k_gemm_tc configuration (tests), -1 the GPU's table's (prefill_tc).  Then
 // gemm_on_glu: the next GEMM (the down projection) on those rows, NVFP4 inputs rounded from them where its own
 // weights take them (whatever the gate|up weights are), as gemm_fp4_tc on the rows in float32.
 void gemm_glu_staged(const bf16* W, const uint8_t* Q, const uint8_t* S, const float* RS, int I, int K, int rows,

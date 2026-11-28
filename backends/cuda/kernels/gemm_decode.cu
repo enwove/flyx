@@ -18,7 +18,7 @@
 namespace flyx::cuda {
 namespace {
 
-template <int NT, bool R16, int WARPS, int UNROLL, bool W12_MODE>
+template <int NT, bool R16, int WARPS, int UNROLL, bool W12_MODE, int SPLIT = 1>
 __host__ __device__ constexpr bool bf16_skinny_active(int cc) {
 #if FLYX_TUNE_CANDIDATES
   (void)cc;
@@ -27,8 +27,8 @@ __host__ __device__ constexpr bool bf16_skinny_active(int cc) {
   const int b = tables::arch_bucket(cc);
   const unsigned mask = W12_MODE ? tables::kReachW12Skinny[b][R16 ? 1 : 0] : tables::kReachBf16Skinny[b][R16 ? 1 : 0];
   bool hit = false;
-#define X(i, nt, w, u) \
-  if ((mask & (1u << i)) && nt == NT && w == WARPS && u == UNROLL) hit = true;
+#define X(i, nt, w, u, sp) \
+  if ((mask & (1u << i)) && nt == NT && w == WARPS && u == UNROLL && sp == SPLIT) hit = true;
   FLYX_BF16_SKINNY(X)
 #undef X
   return hit;
@@ -163,10 +163,12 @@ __global__ void __launch_bounds__(128) k_gemm_rows(const float* __restrict__ x, 
 // chunks added in order, whatever the number of warps; chunk c is every
 // kSkinnyChunks-th pair of 32-value spans from pair c (interleaved: a block's
 // warps stream neighbouring spans of its rows, which DRAM serves faster than 16
-// streams a row apart; 1.2 -> 1.4 TB/s at K = 17408 on an RTX PRO 6000; by pairs,
-// as W12's lanes load a pair's bytes at once and keep them): every configuration
-// (tile, warps, unroll) gives bit-identical results, so a tuning table can
-// pick one per shape and row count freely.
+// streams a row apart, 1.4 TB/s at K = 17408 on an RTX PRO 6000 against 1.2 for
+// contiguous chunks; by pairs, as W12's lanes load a pair's bytes at once and keep
+// them): every configuration
+// (tile, warps, unroll, the blocks a column tile's chunks are shared by) gives
+// bit-identical results, so a tuning table can pick one per shape and row count
+// freely.
 constexpr int kSkinnyChunks = 16;
 
 // The output column of a result column: itself (cols maps it for a gathered GEMM).
@@ -281,6 +283,101 @@ __global__ void __launch_bounds__(32 * WARPS) k_gemm_skinny(Parts x, int ldk, co
   skinny_body<NT, R16, WARPS, UNROLL>(x, ldk, N, K, y, ldy, rows, accumulate, [&](int i, int k) {
     return wv[i] ? ldg_stream(wp[i] + k) : make_uint4(0, 0, 0, 0);
   }, blockIdx.x * 8 * NT);
+#if defined(__CUDA_ARCH__) && !FLYX_TUNE_CANDIDATES
+  }
+#endif
+}
+
+// k_gemm_skinny with its chunks shared by SPLIT blocks a column tile (grid.y): each block's WARPS warps sum chunks
+// s * 16 / SPLIT .. of their spans as k_gemm_skinny's warps do and store them (part: [tile][chunk][NT][32][4]); the
+// tile's last block to finish (ticket) adds the 16 in order, as k_gemm_skinny does, and resets the ticket: the same
+// bits from more, smaller blocks, for a GEMM of few column tiles.
+template <int NT, bool R16, int WARPS, int UNROLL, int SPLIT>
+__global__ void __launch_bounds__(32 * WARPS) k_gemm_skinny_split(Parts x, int ldk, const bf16* __restrict__ W, int N,
+                                                                  int K, float* __restrict__ y, int ldy, int rows,
+                                                                  int accumulate, float* __restrict__ part,
+                                                                  unsigned* __restrict__ ticket) {
+#if defined(__CUDA_ARCH__) && !FLYX_TUNE_CANDIDATES
+  if constexpr (!bf16_skinny_active<NT, R16, WARPS, UNROLL, false, SPLIT>(__CUDA_ARCH__ / 10)) {
+    __trap();
+  } else {
+#endif
+  static_assert(kSkinnyChunks % (SPLIT * WARPS) == 0, "the blocks' warps share the chunks evenly");
+  constexpr int CPB = kSkinnyChunks / SPLIT, CPW = CPB / WARPS;
+  pdl_trigger();
+  const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31, g = lane >> 2, t = lane & 3;
+  const int tile = blockIdx.x, n_base = tile * 8 * NT;
+  const bf16* wp[NT];
+  bool wv[NT];
+#pragma unroll
+  for (int i = 0; i < NT; ++i) {
+    const int n = n_base + i * 8 + g;
+    wv[i] = n < N;
+    wp[i] = W + size_t(wv[i] ? n : 0) * K + 8 * t;
+  }
+  const int spans = K >> 5;
+  const bool ra = g < rows, rb = R16 && g + 8 < rows;
+  const size_t oa = size_t(g) * ldk + 8 * t, ob = size_t(g + 8) * ldk + 8 * t;
+  float* tp = part + size_t(tile) * kSkinnyChunks * NT * 128;
+  pdl_wait();
+#pragma unroll 1
+  for (int c = 0; c < CPW; ++c) {
+    const int chunk = blockIdx.y * CPB + warp * CPW + c;
+    float acc[NT][4];
+#pragma unroll
+    for (int i = 0; i < NT; ++i) acc[i][0] = acc[i][1] = acc[i][2] = acc[i][3] = 0.f;
+#pragma unroll UNROLL
+    for (int s = 2 * chunk; s < spans; s += (s & 1) ? 2 * kSkinnyChunks - 1 : 1) {
+      const int k = s << 5;
+      uint4 w[NT];
+#pragma unroll
+      for (int i = 0; i < NT; ++i) w[i] = wv[i] ? ldg_stream(wp[i] + k) : make_uint4(0, 0, 0, 0);
+      const uint4 z = make_uint4(0, 0, 0, 0);
+      const uint4 ah = ra ? *reinterpret_cast<const uint4*>(x.hi + oa + k) : z;
+      const uint4 am = ra ? *reinterpret_cast<const uint4*>(x.mid + oa + k) : z;
+      const uint4 al = ra ? *reinterpret_cast<const uint4*>(x.lo + oa + k) : z;
+      const uint4 bh = rb ? *reinterpret_cast<const uint4*>(x.hi + ob + k) : z;
+      const uint4 bm = rb ? *reinterpret_cast<const uint4*>(x.mid + ob + k) : z;
+      const uint4 bl = rb ? *reinterpret_cast<const uint4*>(x.lo + ob + k) : z;
+#pragma unroll
+      for (int j = 0; j < 2; ++j) {
+        uint32_t hi[4], mid[4], lo[4];
+        part_frags(ah, bh, j, hi);
+        part_frags(am, bm, j, mid);
+        part_frags(al, bl, j, lo);
+#pragma unroll
+        for (int i = 0; i < NT; ++i) {
+          const uint32_t bf[2] = {j == 0 ? w[i].x : w[i].z, j == 0 ? w[i].y : w[i].w};
+          mma_bf16(acc[i], lo, bf);
+          mma_bf16(acc[i], mid, bf);
+          mma_bf16(acc[i], hi, bf);
+        }
+      }
+    }
+#pragma unroll
+    for (int i = 0; i < NT; ++i)
+      *reinterpret_cast<float4*>(tp + (size_t(chunk) * NT + i) * 128 + lane * 4) =
+          make_float4(acc[i][0], acc[i][1], acc[i][2], acc[i][3]);
+  }
+  __threadfence();
+  __syncthreads();
+  __shared__ bool last;
+  if (threadIdx.x == 0) last = atomicAdd(ticket + tile, 1u) == SPLIT - 1;
+  __syncthreads();
+  if (!last) return;
+  __threadfence();
+  for (int idx = threadIdx.x; idx < NT * 32 * 4; idx += blockDim.x) {
+    const int i = idx / 128, l = (idx / 4) & 31, e = idx & 3;
+    float v = 0.f;
+#pragma unroll
+    for (int c = 0; c < kSkinnyChunks; ++c) v += __ldcg(tp + (size_t(c) * NT + i) * 128 + l * 4 + e);
+    const int r = (l >> 2) + (e >> 1) * 8, col = n_base + i * 8 + 2 * (l & 3) + (e & 1);
+    if (r < rows && col < N) {
+      float* dst = y + size_t(r) * ldy + col;
+      *dst = accumulate ? *dst + v : v;
+    }
+  }
+  if (threadIdx.x == 0) ticket[tile] = 0;
 #if defined(__CUDA_ARCH__) && !FLYX_TUNE_CANDIDATES
   }
 #endif
@@ -1146,10 +1243,27 @@ const bf16* rows_hi(const Launch& L, const float* x, int ldx, int rows, int K) {
 }
 }  // namespace
 
-template <int NT, int WARPS, int UNROLL>
+template <int NT, int WARPS, int UNROLL, int SPLIT>
 void launch_skinny(const float* x, int ldx, const bf16* W, int N, int K, float* y, int ldy, int rows, bool accumulate,
                    const Launch& L) {
   const Parts p = x ? split_rows(L, x, ldx, rows, K) : presplit(L);  // x == nullptr: a producer split it
+  if constexpr (SPLIT > 1) {
+    const Scratch& sc = scratch(L);
+    check_fits(size_t(N), size_t(sc.skinny_columns), "a split 1..16-row GEMM's columns");
+    const dim3 grid(ceil_div(N, 8 * NT), SPLIT);
+    if (rows <= 8) {
+      if constexpr (bf16_skinny_active<NT, false, WARPS, UNROLL, false, SPLIT>(0))
+        launch_dependent(k_gemm_skinny_split<NT, false, WARPS, UNROLL, SPLIT>, grid, dim3(32 * WARPS), L, p, K, W, N,
+                         K, y, ldy, rows, int(accumulate), sc.skinny_parts, sc.skinny_count);
+      else std::abort();
+    } else {
+      if constexpr (bf16_skinny_active<NT, true, WARPS, UNROLL, false, SPLIT>(0))
+        launch_dependent(k_gemm_skinny_split<NT, true, WARPS, UNROLL, SPLIT>, grid, dim3(32 * WARPS), L, p, K, W, N,
+                         K, y, ldy, rows, int(accumulate), sc.skinny_parts, sc.skinny_count);
+      else std::abort();
+    }
+    return;
+  }
   const dim3 grid(ceil_div(N, 8 * NT));
   if (rows <= 8) {
     if constexpr (bf16_skinny_active<NT, false, WARPS, UNROLL, false>(0))
@@ -1167,8 +1281,8 @@ void launch_skinny(const float* x, int ldx, const bf16* W, int N, int K, float* 
 void gemm_skinny_cfg(int cfg, const float* x, int ldx, const bf16* W, int N, int K, float* y, int ldy, int rows,
                      bool accumulate, const Launch& L) {
   switch (cfg) {
-#define X(i, nt, w, u) \
-  case i: launch_skinny<nt, w, u>(x, ldx, W, N, K, y, ldy, rows, accumulate, L); break;
+#define X(i, nt, w, u, sp) \
+  case i: launch_skinny<nt, w, u, sp>(x, ldx, W, N, K, y, ldy, rows, accumulate, L); break;
     FLYX_BF16_SKINNY(X)
 #undef X
     default: std::abort();
@@ -1271,8 +1385,11 @@ void launch_skinny_w12(const float* x, int ldx, const W12& W, int N, int K, floa
 void gemm_w12_skinny_cfg(int cfg, const float* x, int ldx, const W12& W, int N, int K, float* y, int ldy, int rows,
                          bool accumulate, const Launch& L) {
   switch (cfg) {
-#define X(i, nt, w, u) \
-  case i: launch_skinny_w12<nt, w, u>(x, ldx, W, N, K, y, ldy, rows, accumulate, L); break;
+#define X(i, nt, w, u, sp)                                                         \
+  case i:                                                                          \
+    if (sp != 1) std::abort(); /* split: bf16 weights alone (gen_gemm_tables.py) */ \
+    launch_skinny_w12<nt, w, u>(x, ldx, W, N, K, y, ldy, rows, accumulate, L);     \
+    break;
     FLYX_BF16_SKINNY(X)
 #undef X
     default: std::abort();
@@ -1319,7 +1436,7 @@ int w12_finish(const bf16* W, int N, int K, W12* w, cudaStream_t st) {
 }
 
 const Bf16Config kBf16Configs[] = {
-#define X(i, nt, w, u) {nt, w, u},
+#define X(i, nt, w, u, sp) {nt, w, u, sp},
     FLYX_BF16_SKINNY(X)
 #undef X
 };

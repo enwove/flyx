@@ -1,8 +1,15 @@
 # Copyright 2026 The flyx Authors. SPDX-License-Identifier: Apache-2.0
 # Tuning table for NVIDIA RTX PRO 6000 Blackwell Server Edition, written by `cuda_bench tune gemm 6144x4096 4096x4096
 # 24576x4096 4096x12288` (GB/s of weights streamed in brackets): Qwen3-8B's bf16 GEMMs as the engine runs them
-# (q|k|v, attention out, mlp gate|up, mlp down), every other shape and family the RTX 5090's.
+# (q|k|v, attention out, mlp gate|up, mlp down), every other shape and family the RTX 5090's but the prefill GEMMs'
+# (its own prefill_tc rules, below).
 # 2026-11-25, RTX PRO 6000 Blackwell Server Edition 96 GB, 600 W, driver 620.70.06, CUDA 13.4.
+# Qwen3.8-27B's bf16 GEMMs and its EAGLE-4 drafter's (the Workstation Edition table's shapes), written by
+# `cuda_bench tune gemm 34816x5120 5120x17408 16480x5120 14336x5120 5120x6144 15360x10240 5120x5120 32768x5120
+# 5120x16384 5120x15360` on a Modal RTX PRO 6000 Blackwell Server Edition (driver 620.70.06), 2026-11-28; their
+# 9..16-row rules over K of 15360 and more the split configuration (`cuda_bench skinny`, the same GPU), and the 27B's
+# GEMMs of 17..64 rows (bf16_rows: rounds of several sessions and wide lookup rounds) from `cuda_bench mt 34816x5120
+# 5120x17408 16480x5120 14336x5120 5120x6144` on the same GPU.
 # Verified on Qwen3-8B (BF16) with DSpine at 15 drafts (docs/benchmarks.md section 6, the same answers): GSM8K 617.6 to
 # 642.6 tok/s, HumanEval 490.8 to 505.0 against the RTX 5090's table.
 sku = "rtxpro6000"
@@ -47,4 +54,154 @@ rules = [
   { rows = [2, 4], nt = 2, warps = 16, unroll = 8 },  # r4 1023
   { rows = [5, 8], nt = 1, warps = 16, unroll = 16 },  # r8 1040
   { rows = [9, 16], nt = 4, warps = 16, unroll = 4 },  # r16 1008
+]
+
+[[gemm]]  # qwen3.8-27b / its eagle4 drafter, bf16 34816x5120
+format = "bf16"
+n = 34816
+k = 5120
+rules = [
+  { rows = [1, 1], nt = 1, warps = 16, unroll = 16 },  # r1 1516
+  { rows = [2, 4], nt = 1, warps = 16, unroll = 8 },  # r4 1479
+  { rows = [5, 16], nt = 4, warps = 16, unroll = 4 },  # r8 1423 r16 1402
+]
+
+[[gemm]]  # qwen3.8-27b / its eagle4 drafter, bf16 5120x17408
+format = "bf16"
+n = 5120
+k = 17408
+rules = [
+  { rows = [1, 8], nt = 4, warps = 16, unroll = 4 },  # r1 1407 r4 1396 r8 1376
+  { rows = [9, 16], nt = 4, warps = 4, unroll = 4, split = 4 },  # r16 1346 (one block a tile: 1206)
+]
+
+[[gemm]]  # qwen3.8-27b / its eagle4 drafter, bf16 16480x5120
+format = "bf16"
+n = 16480
+k = 5120
+rules = [
+  { rows = [1, 1], nt = 1, warps = 16, unroll = 8 },  # r1 1489
+  { rows = [2, 4], nt = 1, warps = 16, unroll = 4 },  # r4 1452
+  { rows = [5, 16], nt = 4, warps = 16, unroll = 4 },  # r8 1384 r16 1348
+]
+
+[[gemm]]  # qwen3.8-27b / its eagle4 drafter, bf16 14336x5120
+format = "bf16"
+n = 14336
+k = 5120
+rules = [
+  { rows = [1, 1], nt = 1, warps = 16, unroll = 16 },  # r1 1464
+  { rows = [2, 4], nt = 1, warps = 16, unroll = 4 },  # r4 1432
+  { rows = [5, 8], nt = 2, warps = 16, unroll = 4 },  # r8 1326
+  { rows = [9, 16], nt = 4, warps = 16, unroll = 4 },  # r16 1326
+]
+
+[[gemm]]  # qwen3.8-27b / its eagle4 drafter, bf16 5120x6144
+format = "bf16"
+n = 5120
+k = 6144
+rules = [
+  { rows = [1, 1], nt = 1, warps = 8, unroll = 8 },  # r1 1368
+  { rows = [2, 4], nt = 2, warps = 8, unroll = 8 },  # r4 1283
+  { rows = [5, 16], nt = 4, warps = 16, unroll = 4 },  # r8 1272 r16 1251
+]
+
+[[gemm]]  # qwen3.8-27b / its eagle4 drafter, bf16 15360x10240
+format = "bf16"
+n = 15360
+k = 10240
+rules = [
+  { rows = [1, 4], nt = 1, warps = 16, unroll = 4 },  # r1 1493 r4 1412
+  { rows = [5, 16], nt = 4, warps = 16, unroll = 4 },  # r8 1381 r16 1306
+]
+
+[[gemm]]  # qwen3.8-27b / its eagle4 drafter, bf16 5120x5120
+format = "bf16"
+n = 5120
+k = 5120
+rules = [
+  { rows = [1, 1], nt = 1, warps = 8, unroll = 8 },  # r1 1365
+  { rows = [2, 16], nt = 4, warps = 16, unroll = 4 },  # r4 1290 r8 1277 r16 1258
+]
+
+[[gemm]]  # qwen3.8-27b / its eagle4 drafter, bf16 32768x5120
+format = "bf16"
+n = 32768
+k = 5120
+rules = [
+  { rows = [1, 4], nt = 1, warps = 16, unroll = 4 },  # r1 1511 r4 1474
+  { rows = [5, 16], nt = 4, warps = 16, unroll = 4 },  # r8 1409 r16 1406
+]
+
+[[gemm]]  # qwen3.8-27b / its eagle4 drafter, bf16 5120x16384
+format = "bf16"
+n = 5120
+k = 16384
+rules = [
+  { rows = [1, 8], nt = 4, warps = 16, unroll = 4 },  # r1 1477 r4 1467 r8 1449
+  { rows = [9, 16], nt = 4, warps = 4, unroll = 4, split = 4 },  # r16 1370 (one block a tile: 1244)
+]
+
+[[gemm]]  # qwen3.8-27b / its eagle4 drafter, bf16 5120x15360
+format = "bf16"
+n = 5120
+k = 15360
+rules = [
+  { rows = [1, 8], nt = 4, warps = 16, unroll = 4 },  # r1 1408 r4 1398 r8 1380
+  { rows = [9, 16], nt = 4, warps = 4, unroll = 4, split = 4 },  # r16 1337 (one block a tile: 1233)
+]
+
+[[gemm]]  # qwen3.8-27b gate|up, 17..64 rows (in brackets below: the inherited RTX 5090 rules' GB/s)
+format = "bf16_rows"
+n = 34816
+k = 5120
+rules = [
+  { rows = [17, 64], nt = 4, chunks = 16, unroll = 2, parts = 3 },  # r32 1319 r48 1257 r64 1009 (1138 876 696)
+]
+
+[[gemm]]  # qwen3.8-27b mlp down, 17..64 rows
+format = "bf16_rows"
+n = 5120
+k = 17408
+rules = [
+  { rows = [17, 64], nt = 4, chunks = 16, unroll = 2, parts = 3 },  # r32 1166 r48 1071 r64 969 (1140 828 663)
+]
+
+[[gemm]]  # qwen3.8-27b GDN in, 17..64 rows
+format = "bf16_rows"
+n = 16480
+k = 5120
+rules = [
+  { rows = [17, 64], nt = 4, chunks = 16, unroll = 2, parts = 3 },  # r32 1275 r48 1194 r64 919 (1043 785 613)
+]
+
+[[gemm]]  # qwen3.8-27b attention q|k|v|gate, 17..64 rows
+format = "bf16_rows"
+n = 14336
+k = 5120
+rules = [
+  { rows = [17, 64], nt = 4, chunks = 16, unroll = 2, parts = 3 },  # r32 1196 r48 1069 r64 830 (1086 803 611)
+]
+
+[[gemm]]  # qwen3.8-27b GDN and attention out, 17..64 rows
+format = "bf16_rows"
+n = 5120
+k = 6144
+rules = [
+  { rows = [17, 64], nt = 4, chunks = 16, unroll = 2, parts = 3 },  # r32 1205 r48 1108 r64 906 (1027 749 601)
+]
+
+[rules]
+# Prefill GEMMs with bf16 weights by the rows, from `cuda_bench tc` on Qwen3.8-27B's and its EAGLE-4 drafter's shapes
+# (34816x5120 5120x17408 16480x5120 14336x5120 5120x6144 15360x10240 5120x5120 32768x5120 5120x16384), TFLOPS
+# against the defaults' tile counts: 24-128 rows 64 x 32 of 6 stages, 23-28 against 11-20 at 24 rows, 99-130
+# against 55-98 at 128; 256 rows 64 x 64 of 4 stages, 155-184 against 100-161 (within 11% of the best
+# configuration on each shape); 512-2048 rows 128 x 128, 217-330 against 174-279.  NVFP4 weights: the defaults'.
+prefill_tc = [
+  { format = "bf16", rows = [1, 160], bm = 64, bn = 32, wn = 2, stages = 6 },
+  { format = "bf16", rows = [161, 384], bm = 64, bn = 64, wn = 4, stages = 4 },
+  { format = "bf16", bm = 128, bn = 128, wn = 4, stages = 3 },
+  { format = "nvfp4", sm_tiles_below = 0.5, bm = 64, bn = 32, wn = 2, stages = 2 },
+  { format = "nvfp4", sm_tiles_below = 6, bm = 64, bn = 64, wn = 4, stages = 2 },
+  { format = "nvfp4", bm = 64, bn = 128, wn = 4, stages = 2 },
 ]

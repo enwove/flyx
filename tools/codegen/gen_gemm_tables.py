@@ -67,6 +67,11 @@ block type, the round's rows and the layer's columns, which may name one of the
 three tensor-core kernels instead (``tensor_cores``); every one gives the same
 bits too.
 
+Prefill GEMMs on the bf16 tensor cores (``prefill_tc``: block tile rows and
+columns, warps along the columns, pipeline stages) have rules by the weights'
+format, the pass's rows and the GEMM's 64 x 128 tiles per SM; every one gives
+the same bits.
+
 MoE layers' packed expert GEMMs on dp4a (``moe_dp4a``: output columns a warp,
 units a lane has in flight; 0 and 0, the original tiles) have rules for their
 fused gate|up GEMM (``moe_gate_up``) by block type and the pass's rows; the
@@ -85,11 +90,21 @@ import re
 import sys
 import tomllib
 
-BF16_KEYS = ("nt", "warps", "unroll")
+BF16_KEYS = ("nt", "warps", "unroll", "split")
+# split: the blocks a column tile's chunks are shared by (k_gemm_skinny_split; 1, the one block of k_gemm_skinny), for
+# bf16 weights by their shape's own rules (the scratch holds the chunks' sums of the widest, Sku::split_columns).
+
+
+def bf16_key(d: dict) -> tuple:
+    """A 1..16-row bf16 configuration: (tile, warps, unroll, blocks a tile's chunks are shared by)."""
+    return key({"split": 1, **d}, BF16_KEYS)
 MT_KEYS = ("nt", "chunks", "unroll", "parts")
 FP4_KEYS = ("span", "chunks", "nt", "warps", "unroll")
 BLOCKS_KEYS = ("nt", "nw", "kw")
 Q8_KEYS = ("bn", "qk", "bm")
+# Prefill GEMMs on the bf16 tensor cores (k_gemm_tc): block tile rows and columns, warps along the columns, stages.
+TC_KEYS = ("bm", "bn", "wn", "stages")
+TC_SMEM = 99 * 1024  # an SM's dynamic shared memory for one block (sm_86 and up: 99 KB)
 ROUND_KEYS = ("rows", "columns", "ahead", "warps", "staged", "parts")
 ROUND_DEFAULTS = {"warps": 8, "staged": 0, "parts": 1}  # a block of 8 warps; the rows read from global memory
 # The types k_round_blocks_warps takes (gemm_blocks_round_impl.cuh: WarpsType).
@@ -107,7 +122,8 @@ GGML_TYPES = ("Q4_0", "Q4_1", "Q5_0", "Q5_1", "Q8_0", "Q2_K", "Q3_K", "Q4_K", "Q
 # The families of rules: bit i of a sku's `families` is FAMILIES[i]; the keys each takes in [defaults] or [rules].
 FAMILIES = {"bf16": ("bf16",), "nvfp4": ("nvfp4_k128", "nvfp4_k64"), "blocks": ("blocks",),
             "blocks_q8": ("blocks_q8",), "blocks_q8_runs": ("blocks_q8_runs",), "blocks_round": ("blocks_round",),
-            "bf16_rows": ("bf16_rows",), "bf16_draft": ("bf16_draft",), "moe_gate_up": ("moe_gate_up",)}
+            "bf16_rows": ("bf16_rows",), "bf16_draft": ("bf16_draft",), "moe_gate_up": ("moe_gate_up",),
+            "prefill_tc": ("prefill_tc",)}
 # MoE layers' packed expert dp4a GEMMs (moe_dp4a): output columns a warp, units a lane has in flight.
 MOE_KEYS = ("columns", "units")
 MOE_ORIGINAL = (0, 0)  # the original tiles, which every block type compiles
@@ -139,15 +155,17 @@ class Compiled:
     """The configurations candidates.toml compiles, checked."""
 
     def __init__(self, cand: dict, where: str):
-        self.bf16 = [key(c, BF16_KEYS) for c in cand["bf16_skinny"]]
+        self.bf16 = [bf16_key(c) for c in cand["bf16_skinny"]]
         self.fp4 = [key(c, FP4_KEYS) for c in cand["nvfp4_skinny"]]
         for c in self.fp4:
             span, chunks, nt, warps, _ = c
             if span not in (64, 128) or chunks % warps:
                 raise SystemExit(f"{where}: bad nvfp4 configuration {c}")
         for c in self.bf16:
-            if 16 % c[1]:
-                raise SystemExit(f"{where}: bf16 warps must divide 16: {c}")
+            if c[3] not in (1, 2, 4, 8, 16) or 16 % (c[1] * c[3]):
+                raise SystemExit(f"{where}: bf16 warps times split must divide 16 (split 1, 2, 4, 8 or 16): {c}")
+        if len(set(self.bf16)) != len(self.bf16):
+            raise SystemExit(f"{where}: a bf16_skinny configuration listed twice")
         self.mt = [key(c, MT_KEYS) for c in cand["bf16_mt"]]
         for nt, chunks, unroll, parts in self.mt:
             if (nt not in (1, 2, 4) or parts not in (1, 3) or unroll < 1 or (parts == 3 and chunks != 16)
@@ -182,6 +200,17 @@ class Compiled:
                 or any(m != MOE_ORIGINAL and (m[0] not in (1, 2, 4) or m[1] not in (1, 2)) for m in self.moe)):
             raise SystemExit(f"{where}: moe_dp4a takes the original tiles (columns 0, units 0) and columns 1, 2 or 4 "
                              f"with units 1 or 2, each configuration once; got {self.moe}")
+        self.tc = [key(c, TC_KEYS) for c in cand["prefill_tc"]]
+        for bm, bn, wn, st in self.tc:
+            threads = 32 * (bm // 64) * wn
+            if (bm not in (64, 128) or bn not in (16, 32, 64, 128) or bn % (16 * wn) or bm * 4 % threads
+                    or bn * 4 < threads or bn * 4 % threads or bn > threads or not 2 <= st <= 8
+                    or st * (bm + bn) * 64 > TC_SMEM):
+                raise SystemExit(f"{where}: prefill_tc takes bm 64 or 128, bn 16..128 with warp tiles of an even "
+                                 f"number of 8 columns, threads that share the tile's copies evenly and 2..8 stages "
+                                 f"within {TC_SMEM} bytes; got {(bm, bn, wn, st)}")
+        if len(set(self.tc)) != len(self.tc) or not self.tc:
+            raise SystemExit(f"{where}: prefill_tc lists each configuration once")
         for fam, items in (("bf16", self.bf16), ("fp4", self.fp4), ("blocks", self.blocks),
                            ("blocks_q8", self.q8), ("rounds", self.rounds), ("moe_dp4a", self.moe)):
             if len(items) >= 32:
@@ -193,9 +222,10 @@ def bf16_rules(rules, where, c: Compiled):
     out, covered = [], [0] * 17
     for r in rules:
         lo, hi = r["rows"]
-        k = key(r, BF16_KEYS)
-        if not 1 <= lo <= hi <= 16 or k not in c.bf16:
-            raise SystemExit(f"{where}: a bf16 rule takes rows within 1..16 and a compiled configuration: {r}")
+        k = bf16_key(r)
+        if not 1 <= lo <= hi <= 16 or k not in c.bf16 or k[3] != 1:
+            raise SystemExit(f"{where}: a bf16 rule takes rows within 1..16 and a compiled configuration of split 1 "
+                             f"(a split one serves its shapes' own rules): {r}")
         for i in range(lo, hi + 1):
             covered[i] += 1
         out.append((lo, hi, c.bf16.index(k)))
@@ -409,6 +439,31 @@ def moe_rules(rules, where, c: Compiled):
     return out
 
 
+def tc_rules(rules, where, c: Compiled):
+    """Prefill GEMMs: the first rule that matches the weights' format (bf16 or nvfp4; none: both), the pass's rows
+    and the GEMM's 64 x 128 tiles per SM (below sm_tiles_below; none: any).  Each format ends at a rule for the
+    rest.  (fmt: -1 both, 0 bf16, 1 nvfp4; lo, hi, tiles_below, cfg)."""
+    out, ends = [], set()
+    for r in rules:
+        fmt = {None: -1, "bf16": 0, "nvfp4": 1}.get(r.get("format"), -2)
+        lo, hi = r.get("rows", [1, INF])
+        below = float(r.get("sm_tiles_below", 0))
+        k = key(r, TC_KEYS) if set(TC_KEYS) <= set(r) else None
+        if (fmt == -2 or not 1 <= lo <= hi or ("sm_tiles_below" in r and below <= 0) or k not in c.tc
+                or set(r) - {"format", "rows", "sm_tiles_below", *TC_KEYS}):
+            raise SystemExit(f"{where}: a prefill_tc rule takes a format (bf16 or nvfp4), rows from 1, "
+                             f"sm_tiles_below > 0 and a compiled configuration: {r}")
+        fmts = {0, 1} if fmt < 0 else {fmt}
+        if fmts <= ends:
+            raise SystemExit(f"{where}: a prefill_tc rule after the rules for the rest of its formats: {r}")
+        if (lo, hi) == (1, INF) and "sm_tiles_below" not in r:
+            ends |= fmts
+        out.append((fmt, lo, hi, below, c.tc.index(k)))
+    if ends != {0, 1}:
+        raise SystemExit(f"{where}: the prefill_tc rules end, for bf16 and for nvfp4, with a rule for the rest")
+    return out
+
+
 def family_rules(d: dict, where: str, c: Compiled, every: bool, default_rounds=None) -> dict:
     """The families of rules in `d` (candidates.toml's [defaults]: every one; a table's [rules]: any), checked."""
     known = {k for keys in FAMILIES.values() for k in keys}
@@ -435,6 +490,8 @@ def family_rules(d: dict, where: str, c: Compiled, every: bool, default_rounds=N
             out[family] = mt_rules(d[family], where, c, family)
         elif family == "moe_gate_up":
             out[family] = moe_rules(d["moe_gate_up"], where, c)
+        elif family == "prefill_tc":
+            out[family] = tc_rules(d["prefill_tc"], where, c)
         else:
             out[family] = round_rules(d["blocks_round"], where, c, default_rounds)
     return out
@@ -460,7 +517,11 @@ def shape_rules(path, t, sid, c: Compiled):
             for i in range(lo, hi + 1):
                 covered[i] += 1
             if fmt != 1:
-                cfg = c.bf16.index(key(r, BF16_KEYS)) if key(r, BF16_KEYS) in c.bf16 else -1
+                k = bf16_key(r)
+                cfg = c.bf16.index(k) if k in c.bf16 else -1
+                if cfg >= 0 and k[3] > 1 and fmt != 0:
+                    raise SystemExit(f"{path}: {g['format']} {g['n']}x{g['k']}: a split configuration serves bf16 "
+                                     f"weights")
             else:
                 k = key(r, FP4_KEYS)
                 cfg = c.fp4.index(k) if k in c.fp4 else -1
@@ -468,8 +529,9 @@ def shape_rules(path, t, sid, c: Compiled):
                 if g["k"] % k[0]:
                     raise SystemExit(f"{path}: span {k[0]} does not divide K={g['k']}")
             if cfg < 0:
+                keys = FP4_KEYS if fmt == 1 else BF16_KEYS
                 raise SystemExit(f"{path}: {g['format']} {g['n']}x{g['k']} rows {r['rows']}: configuration "
-                                 f"{ {k: r[k] for k in (FP4_KEYS if fmt == 1 else BF16_KEYS)} } is not in candidates")
+                                 f"{ {k: r[k] for k in keys if k in r} } is not in candidates")
             rules.append((sid, fmt, g["n"], g["k"], lo, hi, cfg))
         if covered[1:] != [1] * 16:
             raise SystemExit(f"{path}: {g['format']} {g['n']}x{g['k']}: rules must cover rows 1..16 exactly once")
@@ -691,13 +753,14 @@ def emit(c: Compiled, skus, rules, families, archs=(), flash_gqa=(), strata_plac
         out.append("")
         out.append(f"#define {macro}_COUNT {len(items)}")
 
-    emit_xmacro("FLYX_BF16_SKINNY", "X(index, nt, warps, unroll)", c.bf16)
+    emit_xmacro("FLYX_BF16_SKINNY", "X(index, nt, warps, unroll, split)", c.bf16)
     emit_xmacro("FLYX_BF16_MT", "X(index, nt, chunks, unroll, parts)", c.mt)
     emit_xmacro("FLYX_FP4_SKINNY", "X(index, span, chunks, nt, warps, unroll)", c.fp4)
     emit_xmacro("FLYX_BLOCKS_SKINNY", "X(index, nt, nw, kw)", c.blocks)
     emit_xmacro("FLYX_BLOCKS_Q8", "X(index, bn, qk, bm)", c.q8)
     emit_xmacro("FLYX_BLOCKS_ROUND", "X(index, rows, columns, ahead, warps, staged, parts)", c.rounds)
     emit_xmacro("FLYX_MOE_DP4A", "X(index, columns, units): 0 and 0, the original tiles", c.moe)
+    emit_xmacro("FLYX_PREFILL_TC", "X(index, bm, bn, wn, stages)", c.tc)
     out.append("")
     out.append("namespace flyx::cuda::tables {")
     out.append("// The families of rules a table may have beside its shapes (bit i: the i-th), as the defaults have them.")
@@ -705,17 +768,29 @@ def emit(c: Compiled, skus, rules, families, archs=(), flash_gqa=(), strata_plac
     out += [f"  kFamily{''.join(w.capitalize() for w in f.split('_'))} = {1 << i}u," for i, f in enumerate(FAMILIES)]
     out.append("};")
     out.append("// pdl: kernels launch as programmatic dependents on this GPU unless the options say otherwise")
+    out.append("// split_columns: the most columns of a shape this table's rules (or those it inherits) run in a split")
+    out.append("// configuration, whose chunks' sums the scratch holds; 0: none.")
     out.append("struct Sku { const char* name; const char* const* devices; int n_devices; int parent; unsigned families; "
-               "bool pdl; };")
+               "bool pdl; int split_columns; };")
     for i, (n, devs, _, _) in enumerate(skus):
         lst = ", ".join('"' + x.replace('"', '\\"') + '"' for x in devs) or "nullptr"
         out.append(f"inline const char* const kDevices{i}[] = {{{lst}}};")
     has = {sku: sum(1 << i for i, f in enumerate(FAMILIES) if f in fam) for sku, fam in families}
+    split_own = [0] * len(skus)
+    for sku, fmt, n, _, _, _, cfg in rules:
+        if fmt == 0 and c.bf16[cfg][3] > 1:
+            split_own[sku] = max(split_own[sku], n)
+
+    def split_columns(i):
+        cols = 0
+        while i >= 0:
+            cols, i = max(cols, split_own[i]), skus[i][2]
+        return cols
     out.append("inline const Sku kSkus[] = {")
-    out += [f'    {{"{n}", kDevices{i}, {len(devs)}, {p}, {has.get(i, 0)}u, {"true" if pdl else "false"}}},'
-            for i, (n, devs, p, pdl) in enumerate(skus)]
+    out += [f'    {{"{n}", kDevices{i}, {len(devs)}, {p}, {has.get(i, 0)}u, {"true" if pdl else "false"}, '
+            f'{split_columns(i)}}},' for i, (n, devs, p, pdl) in enumerate(skus)]
     if not skus:
-        out.append('    {"none", nullptr, 0, -1, 0u, false},')
+        out.append('    {"none", nullptr, 0, -1, 0u, false, 0},')
     out.append("};")
     out.append(f"inline constexpr int kSkuCount = {len(skus)};")
     out.append("// The table of a GPU that has none of its own, by its compute capability (major * 10 + minor).")
@@ -816,6 +891,14 @@ def emit(c: Compiled, skus, rules, families, archs=(), flash_gqa=(), strata_plac
     for sku, (types, lo, hi, cfg) in rows_of("moe_gate_up"):
         out += ([f"    {{{sku}, FLYX_DT_GGML_{t}, {lo}, {hi}, {cfg}}}," for t in types]
                 or [f"    {{{sku}, -1, {lo}, {hi}, {cfg}}},"])
+    out.append("};")
+    out.append("// Prefill GEMMs on the bf16 tensor cores: weights' format (-1 both, 0 bf16, 1 nvfp4), "
+               "passes of lo..hi")
+    out.append("// rows, fewer 64 x 128 tiles per SM than tiles_below (0: any); the first rule that matches.")
+    out.append("struct PrefillTcRule { int sku, fmt, lo, hi; double tiles_below; int cfg; };")
+    out.append("inline constexpr PrefillTcRule kPrefillTc[] = {")
+    out += [f"    {{{sku}, {fmt}, {lo}, {hi}, {below!r}, {cfg}}},"
+            for sku, (fmt, lo, hi, below, cfg) in rows_of("prefill_tc")]
     out.append("};")
     if sku_archs is None:
         sku_archs = [0] * len(skus)

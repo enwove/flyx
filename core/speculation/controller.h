@@ -91,15 +91,12 @@ class RoundCostModel {
 // trunk is the chain) its branches add (B + sum_k) / (1 + n_k), the tokens its
 // rounds of that k gave beyond their trunk's, so its tokens are the sum over k
 // of P(the trunk accepts k) (1 + k + that): branches matter most where the trunk
-// fails early, which one mean beside the chain's tokens leaves out (EAGLE-4's
-// trees of 15 on chat prompts: where its chain's first drafts failed, the
-// anchor's four children still gave a token most of the time, and one mean had
-// chains of 3 chosen there over trees that paid more).  B, the tree's prior:
+// fails early, which one mean beside the chain's tokens leaves out.  B, the tree's prior:
 // (prior + sum) / (1 + n) over all its rounds, the prior what the engine's
 // sessions' rounds of it added (SharedTokens, kBonusPrior counting as
 // kGuessRounds rounds: a reply starts from what the replies before it learned;
 // kBonusPrior is what DFlash2's first two branches add on Qwen3.8-27B, 0.3 to
-// 0.46, EAGLE-4's add about a token).  The sums and counts are kept kBonusKeep
+// 0.46).  The sums and counts are kept kBonusKeep
 // a tree round (the gain is a few tenths of a token and noisy: some 30 rounds),
 // and a tree its drafter has not drafted for kTreeProbe of its rounds drafts
 // the next one (the one idle longest), so what its branches add stays known
@@ -108,7 +105,7 @@ class RoundCostModel {
 // are this GPU's, measured at load.
 //
 // A tree without a trunk (trunks[i] < 0: DV's, whose drafts are all
-// branches) is rated by the tokens its rounds give: what the engine's sessions'
+// branches, and EAGLE-4's, Model::trees_best_first) is rated by the tokens its rounds give: what the engine's sessions'
 // rounds of it gave (SharedTokens: its mean, kept SharedTokens::kKeep a round,
 // a guess counting as kGuessRounds rounds, the tokens a chain of its width gives
 // at the prior acceptance: 4.0 for 15 drafts and for 31), times the session's

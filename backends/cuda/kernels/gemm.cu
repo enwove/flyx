@@ -190,6 +190,8 @@ bool gemm_tuning_compiled_for(int tuning, int cc) {
 
 bool gemm_tuning_pdl(int tuning) { return tuning >= 0 && tables::kSkus[tuning].pdl; }
 
+int gemm_split_columns(int tuning) { return tuning >= 0 ? tables::kSkus[tuning].split_columns : 0; }
+
 int gemm_tuning_auto(const char* device_name, int device_cc, int code_cc, int* arch_cc,
                      bool (*compiled)(int tuning, int cc)) {
   if (!compiled) compiled = gemm_tuning_compiled_for;

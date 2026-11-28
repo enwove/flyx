@@ -24,8 +24,9 @@ const RoundCandidate& preferred_of(const std::vector<RoundCandidate>& cands) {
 
 void BatchCostModel::build(const std::vector<int>& widths, const std::vector<int>& drafters,
                            const std::vector<double>& round_ms, const std::vector<int>& lookup_widths,
-                           const std::vector<double>& lookup_ms) {
+                           const std::vector<double>& lookup_ms, double session_ms) {
   knots_.clear();
+  session_ms_ = std::max(0.0, session_ms);
   double plain_ms = 0.0;
   for (size_t i = 0; i < widths.size() && i < drafters.size() && i < round_ms.size(); ++i)
     if (drafters[i] < 0 && widths[i] == 0 && round_ms[i] > 0.0) {
@@ -78,11 +79,14 @@ void BatchCostModel::build(const std::vector<int>& widths, const std::vector<int
 double BatchCostModel::target_ms(int rows) const {
   if (knots_.empty()) return 1.0;
   if (rows <= knots_.front().rows || knots_.size() == 1) return std::max(kMinMs, knots_.front().ms);
+  auto tiles = [](int r) { return (r + FLYX_MAX_ROWS - 1) / FLYX_MAX_ROWS; };
   for (size_t i = 1; i < knots_.size(); ++i) {
     if (rows <= knots_[i].rows) {
       const Knot& a = knots_[i - 1];
       const Knot& b = knots_[i];
-      const double t = static_cast<double>(rows - a.rows) / static_cast<double>(b.rows - a.rows);
+      const bool by_tiles = rows > FLYX_MAX_ROWS && tiles(b.rows) > tiles(a.rows);
+      const double t = by_tiles ? static_cast<double>(tiles(rows) - tiles(a.rows)) / (tiles(b.rows) - tiles(a.rows))
+                                : static_cast<double>(rows - a.rows) / static_cast<double>(b.rows - a.rows);
       return std::max(kMinMs, a.ms + t * (b.ms - a.ms));
     }
   }
@@ -93,9 +97,7 @@ double BatchCostModel::target_ms(int rows) const {
 }
 
 double BatchCostModel::batch_ms(int rows, int n_sessions, double draft_ms) const {
-  // target_ms() includes one session's per-sequence mixers (GDN/attention/commit); each additional
-  // session sharing the batch runs its own mixers (~10% of a 1-row pass).
-  const double extra_sessions = n_sessions > 1 ? 0.10 * target_ms(1) * static_cast<double>(n_sessions - 1) : 0.0;
+  const double extra_sessions = n_sessions > 1 ? session_ms_ * static_cast<double>(n_sessions - 1) : 0.0;
   return std::max(kMinMs, target_ms(rows) + extra_sessions + draft_ms);
 }
 
@@ -139,7 +141,8 @@ double BatchCostModel::shared_draft_ms(const std::vector<const RoundCandidate*>&
 }
 
 std::vector<ScheduledBatch> plan_batches(const BatchCostModel& cost,
-                                         const std::vector<std::vector<RoundCandidate>>& sessions) {
+                                         const std::vector<std::vector<RoundCandidate>>& sessions, int max_rows) {
+  max_rows = std::clamp(max_rows, 1, FLYX_MAX_WIDE_ROWS);
   std::vector<ScheduledBatch> result;
   std::vector<size_t> batchable;
   batchable.reserve(sessions.size());
@@ -166,7 +169,7 @@ std::vector<ScheduledBatch> plan_batches(const BatchCostModel& cost,
     return result;
   }
 
-  // ---- Plan A: each session's preferred solo choice, FFD-packed into <= FLYX_MAX_ROWS bins ----
+  // ---- Plan A: each session's preferred solo choice, FFD-packed into <= max_rows bins ----
   // Objective: proportional fairness, log U = (1/m) sum log(E_i) - log(T_total), i.e. geometric mean
   // of every session's expected tokens per millisecond.  Equals E/T for solo and identical sessions,
   // and trims low-marginal-return tail drafts without starving lower-acceptance sessions.
@@ -201,7 +204,7 @@ std::vector<ScheduledBatch> plan_batches(const BatchCostModel& cost,
   for (const FfdItem& item : ffd) {
     size_t placed = bins.size();
     for (size_t b = 0; b < bins.size(); ++b) {
-      if (bins[b].rows + item.rows <= FLYX_MAX_ROWS) {
+      if (bins[b].rows + item.rows <= max_rows) {
         placed = b;
         break;
       }
@@ -221,12 +224,12 @@ std::vector<ScheduledBatch> plan_batches(const BatchCostModel& cost,
   // Under shared_draft_ms, each drafter d pays (1 - alpha) * max_d + alpha * sum_d.  Enumerating the
   // small set of distinct max_d caps turns the remaining objective into an exact separable additive DP
   //   sum_i ((1/m) log(E_i) - alpha * draft_i / T_ref) - (target_ms(R) + (1 - alpha) * cap) / T_ref
-  // over total rows R in 1..FLYX_MAX_ROWS; every reachable R is scored on the exact non-linear log U.
+  // over total rows R in 1..max_rows; every reachable R is scored on the exact non-linear log U.
   bool have_b = false;
   double score_b = -std::numeric_limits<double>::infinity();
   std::vector<size_t> best_pick_b(m, 0);
 
-  if (m <= static_cast<size_t>(FLYX_MAX_ROWS)) {
+  if (m <= static_cast<size_t>(max_rows)) {
     // Collect active drafters and their distinct candidate draft_ms values (including 0.0).
     struct DrafterCaps {
       int drafter = -1;
@@ -275,8 +278,8 @@ std::vector<ScheduledBatch> plan_batches(const BatchCostModel& cost,
     }
 
     constexpr double kNegInf = -std::numeric_limits<double>::infinity();
-    std::vector<std::array<double, FLYX_MAX_ROWS + 1>> dp(m + 1);
-    std::vector<std::array<int, FLYX_MAX_ROWS + 1>> pick(m + 1);
+    std::vector<std::vector<double>> dp(m + 1, std::vector<double>(size_t(max_rows) + 1));
+    std::vector<std::vector<int>> pick(m + 1, std::vector<int>(size_t(max_rows) + 1));
     std::vector<size_t> cur_pick(m, 0);
     std::vector<const RoundCandidate*> picked_ptrs(m, nullptr);
 
@@ -284,7 +287,7 @@ std::vector<ScheduledBatch> plan_batches(const BatchCostModel& cost,
       auto allowed = [&](const RoundCandidate& c) {
         if (!c.batchable) return false;
         const int rc = c.choice.width + 1;
-        if (rc <= 0 || rc > FLYX_MAX_ROWS) return false;
+        if (rc <= 0 || rc > max_rows) return false;
         if (c.choice.drafter < 0) return true;
         const double g = cost.draft_ms(c);
         if (g <= 0.0) return true;
@@ -300,7 +303,7 @@ std::vector<ScheduledBatch> plan_batches(const BatchCostModel& cost,
       for (size_t i = 0; i < m; ++i) {
         const auto& cands = sessions[batchable[i]];
         size_t best_k = cands.size();
-        int min_r = FLYX_MAX_ROWS + 1;
+        int min_r = max_rows + 1;
         for (size_t k = 0; k < cands.size(); ++k) {
           if (!allowed(cands[k])) continue;
           const int r = cands[k].choice.width + 1;
@@ -318,7 +321,7 @@ std::vector<ScheduledBatch> plan_batches(const BatchCostModel& cost,
         picked_ptrs[i] = &cands[best_k];
         init_log_e += std::log(std::max(1.0, cands[best_k].expected_tokens));
       }
-      if (!feasible || min_rows_sum > FLYX_MAX_ROWS) continue;
+      if (!feasible || min_rows_sum > max_rows) continue;
 
       double t_ref = cost.batch_ms(min_rows_sum, static_cast<int>(m), cost.shared_draft_ms(picked_ptrs));
       const double init_u = inv_m * init_log_e - std::log(t_ref);
@@ -331,8 +334,8 @@ std::vector<ScheduledBatch> plan_batches(const BatchCostModel& cost,
       for (int iter = 0; iter < 6; ++iter) {
         const double inv_t = 1.0 / t_ref;
         for (size_t i = 0; i <= m; ++i) {
-          dp[i].fill(kNegInf);
-          pick[i].fill(-1);
+          std::fill(dp[i].begin(), dp[i].end(), kNegInf);
+          std::fill(pick[i].begin(), pick[i].end(), -1);
         }
         dp[0][0] = 0.0;
         for (size_t i = 0; i < m; ++i) {
@@ -344,7 +347,7 @@ std::vector<ScheduledBatch> plan_batches(const BatchCostModel& cost,
             const double val =
                 inv_m * std::log(std::max(1.0, c.expected_tokens)) -
                 inv_t * (BatchCostModel::kSharedDraftShare * cost.draft_ms(c));
-            for (int r = 0; r + rc <= FLYX_MAX_ROWS; ++r) {
+            for (int r = 0; r + rc <= max_rows; ++r) {
               if (dp[i][size_t(r)] == kNegInf) continue;
               const double cand_val = dp[i][size_t(r)] + val;
               if (cand_val > dp[i + 1][size_t(r + rc)]) {
@@ -357,7 +360,7 @@ std::vector<ScheduledBatch> plan_batches(const BatchCostModel& cost,
 
         double iter_best = kNegInf;
         double iter_t = t_ref;
-        for (int R = min_rows_sum; R <= FLYX_MAX_ROWS; ++R) {
+        for (int R = min_rows_sum; R <= max_rows; ++R) {
           if (dp[m][size_t(R)] == kNegInf) continue;
           int r = R;
           double sum_log_e = 0.0;

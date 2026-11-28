@@ -58,8 +58,8 @@ int main(int argc, char** argv) {
   }
   {  // scratch for every GEMM input the tests stage (prefill rows up to 1024, K up to 16384)
     const int rows = filtered_test ? 16 : 1024, width = filtered_test ? 5120 : 16384;
-    const size_t bytes = scratch_bytes(rows, width, !filtered_test);
-    static Scratch sc = scratch_in(dev<unsigned char>(bytes), bytes, rows, width, !filtered_test);
+    const size_t bytes = scratch_bytes(rows, width, !filtered_test, false, true, true, width);
+    static Scratch sc = scratch_in(dev<unsigned char>(bytes), bytes, rows, width, !filtered_test, false, width);
     TL.scratch = &sc;
   }
   cudaDeviceProp p{};

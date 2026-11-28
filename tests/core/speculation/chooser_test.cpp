@@ -544,7 +544,7 @@ int main() {
     const std::vector<int> lookup_w = {3, 7, 15};
     const std::vector<double> lookup_ms = {16.5, 24.5, 36.5};
     BatchCostModel cost;
-    cost.build(widths, drafters, round_ms, lookup_w, lookup_ms);
+    cost.build(widths, drafters, round_ms, lookup_w, lookup_ms, 0.5);
     check(cost.target_ms(1) == 14.0 && cost.target_ms(4) == 16.5 && cost.target_ms(8) == 24.5 &&
               cost.target_ms(16) == 36.5,
           "BatchCostModel reproduces calibrated plain and lookup knots");
@@ -642,6 +642,38 @@ int main() {
     for (const auto& item : lb[0].items) lk_rows += item.choice.width + 1;
     check(lb.size() == 1 && lb[0].items.size() == 3 && lk_rows <= FLYX_MAX_ROWS,
           "multi-width lookup narrows to share one batch with drafted sessions (" + std::to_string(lk_rows) + " rows)");
+
+    // Batches of more rows (max_rows past FLYX_MAX_ROWS: the backend's wide rounds, Engine::batch_rows): priced by
+    // lookup knots that wide, 8 sessions share one batch of more than 16 rows, none of a session's rounds past 16 rows,
+    // and 20 sessions decoding plainly share one batch (more sessions than FLYX_MAX_ROWS).
+    BatchCostModel wide_cost;
+    wide_cost.build(widths, drafters, round_ms, {3, 7, 15, 31, 47, 63}, {16.5, 24.5, 36.5, 52.0, 66.0, 80.0}, 0.5);
+    check(wide_cost.target_ms(32) == 52.0 && wide_cost.target_ms(64) == 80.0, "BatchCostModel knots past 16 rows");
+    // Past 16 rows by the round's tiles of 16: 17 rows cost what 32 do, 33 what 48 do; up to 16 by the rows.
+    check(wide_cost.target_ms(17) == 52.0 && wide_cost.target_ms(33) == 66.0 && wide_cost.target_ms(49) == 80.0 &&
+              wide_cost.target_ms(12) == 30.5,
+          "BatchCostModel past 16 rows by tiles of 16 rows, below by the rows");
+    BatchCostModel sparse;  // knots at 16 and 64 rows only: 20 rows are two of four tiles
+    sparse.build(widths, drafters, round_ms, {3, 7, 15, 63}, {16.5, 24.5, 36.5, 80.0}, 0.5);
+    check(std::abs(sparse.target_ms(20) - (36.5 + (80.0 - 36.5) / 3)) < 1e-9, "BatchCostModel tiles between sparse knots");
+    check(wide_cost.batch_ms(8, 8, 0.0) == wide_cost.target_ms(8) + 7 * 0.5,
+          "a batch's sessions past the first each add the session cost timed at load");
+    std::vector<std::vector<RoundCandidate>> s8;
+    for (double p : {0.9, 0.85, 0.8, 0.8, 0.75, 0.7, 0.65, 0.6}) s8.push_back(make_session(p));
+    const auto wb = plan_batches(wide_cost, s8, FLYX_MAX_WIDE_ROWS);
+    int wide_rows = 0, widest_session = 0;
+    for (const auto& item : wb.empty() ? std::vector<ScheduledRound>{} : wb[0].items) {
+      wide_rows += item.choice.width + 1;
+      widest_session = std::max(widest_session, item.choice.width + 1);
+    }
+    check(wb.size() == 1 && wb[0].items.size() == 8 && wide_rows > FLYX_MAX_ROWS && wide_rows <= FLYX_MAX_WIDE_ROWS &&
+              widest_session <= FLYX_MAX_ROWS,
+          "8 sessions share one batch of " + std::to_string(wide_rows) + " rows (max_rows " +
+              std::to_string(FLYX_MAX_WIDE_ROWS) + ")");
+    std::vector<std::vector<RoundCandidate>> plain20(20, std::vector<RoundCandidate>{
+                                                             {{false, 0, 0, -1}, 1.0, round_ms[0], true, true}});
+    const auto pb = plan_batches(wide_cost, plain20, FLYX_MAX_WIDE_ROWS);
+    check(pb.size() == 1 && pb[0].items.size() == 20, "20 plain sessions share one batch of 20 rows");
   }
 
   // LookupDrafter flat hash table: latest match wins, periodic repeat, cut() invalidates stale entries, growth/rehash.
