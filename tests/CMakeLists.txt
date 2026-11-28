@@ -387,6 +387,8 @@ flyx_add_py_test(server_hardening ${CMAKE_CURRENT_SOURCE_DIR}/apps/flyx-server/h
                  ARGS $<TARGET_FILE:flyx-cli> ${ASSETS}/tiny.flyx FIXTURES assets TIMEOUT 120)
 flyx_add_py_test(queued_request_log ${CMAKE_CURRENT_SOURCE_DIR}/apps/flyx-server/queued_request_log.py
                  ARGS $<TARGET_FILE:flyx-cli> ${ASSETS}/tiny.flyx FIXTURES assets TIMEOUT 90)
+flyx_add_py_test(stream_cancel_log ${CMAKE_CURRENT_SOURCE_DIR}/apps/flyx-server/stream_cancel_log.py
+                 ARGS $<TARGET_FILE:flyx-cli> ${ASSETS}/tiny.flyx FIXTURES assets TIMEOUT 90)
 flyx_add_py_test(client_conversations ${CMAKE_CURRENT_SOURCE_DIR}/apps/flyx-server/client_conversations.py
                  ARGS $<TARGET_FILE:flyx-cli> ${ASSETS}/tiny.flyx FIXTURES assets TIMEOUT 90)
 flyx_add_py_test(codex_threads ${CMAKE_CURRENT_SOURCE_DIR}/apps/flyx-server/codex_threads.py
