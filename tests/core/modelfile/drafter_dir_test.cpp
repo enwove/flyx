@@ -99,19 +99,24 @@ int main(int argc, char** argv) {
     fs::remove_all(tmp, ec);
     fs::copy(fs::path(dir) / "hf_draft", tmp, fs::copy_options::recursive, ec);
     check(!ec, "copy hf_draft fixture: " + ec.message());
+    int vocab = 0;
     {
       std::ifstream in(tmp / "config.json");
       auto cfg = nlohmann::json::parse(in);
       cfg["draft_vocab_size"] = nullptr;
+      vocab = cfg["transformer_layer_config"].at("vocab_size").get<int>();
+      cfg["transformer_layer_config"].erase("rope_parameters");
       cfg["transformer_layer_config"]["rope_theta"] = nullptr;
       std::ofstream out(tmp / "config.json", std::ios::binary | std::ios::trunc);
       out << cfg.dump();
     }
     {
       flyx::ModelFile f;
-      std::string err;
-      check(f.open(model, &err) && f.add(tmp.string(), &err),
-            "drafter config.json with explicit null draft_vocab_size and rope_theta loads: " + err);
+      if (with(model, tmp.string(), &f)) {
+        const auto draft = flyx::models::drafters::directory_draft(f.companion(0));
+        check(draft.config.at("target").at("vocab") == vocab && draft.config.at("rope_theta") == 10000.0,
+              "explicit null draft_vocab_size and rope_theta select the layer vocabulary and default theta");
+      }
     }
     {
       std::ofstream out(tmp / "config.json", std::ios::binary | std::ios::trunc);

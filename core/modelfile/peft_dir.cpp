@@ -105,10 +105,11 @@ json lora_config(const json& c) {
   // PEFT's default lora_alpha is 8.
   if (c.contains("lora_alpha") && !c["lora_alpha"].is_number())
     throw std::runtime_error("lora_alpha must be a number");
-  if (c.contains("use_rslora") && !c["use_rslora"].is_boolean())
-    throw std::runtime_error("use_rslora must be a boolean");
+  const json use_rslora = c.value("use_rslora", json());
+  if (!use_rslora.is_null() && !use_rslora.is_boolean())
+    throw std::runtime_error("use_rslora must be a boolean or null");
   const double alpha = c.value("lora_alpha", 8.0);
-  const bool rslora = c.value("use_rslora", false);
+  const bool rslora = use_rslora == true;
   const double scale = rslora ? alpha / std::sqrt(double(r)) : alpha / double(r);
   if (!std::isfinite(float(scale)) || float(scale) == 0)
     throw std::runtime_error("lora_alpha must give a finite nonzero float scale");
