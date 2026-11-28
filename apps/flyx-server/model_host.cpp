@@ -128,9 +128,8 @@ bool read_settings_locked(ojson* root, std::string* err) {
   if (st.type() == fs::file_type::not_found) return true;
   const std::string keep = " (left as it is: mend or remove it to save settings)";
   if (ec) return *err = path + ": " + ec.message() + keep, false;
-  std::ifstream f(p, std::ios::binary);
   std::string text;
-  if (!f || !read_whole(f, &text)) return *err = path + ": cannot be read" + keep, false;
+  if (!read_whole_file(path, &text)) return *err = path + ": cannot be read" + keep, false;
   ojson j = ojson::parse(text, nullptr, /*allow_exceptions=*/false);
   if (j.is_discarded()) return *err = path + ": not JSON" + keep, false;
   if (!j.is_object()) return *err = path + ": holds no JSON object" + keep, false;
@@ -291,14 +290,29 @@ void save_settings(const ModelHost::Want& w) {
 
 }  // namespace
 
-bool read_whole(std::istream& in, std::string* text) {
+bool read_chunks(const ChunkSource& src, std::string* text) {
   text->clear();
   char chunk[1 << 14];
-  while (in) {
-    in.read(chunk, sizeof chunk);
-    text->append(chunk, size_t(in.gcount()));
+  for (;;) {
+    const size_t got = src.read(chunk, sizeof chunk);
+    text->append(chunk, got);
+    if (got < sizeof chunk) break;  // the end, or an error: which, the stream's own state says
   }
-  return in.eof() && !in.bad();
+  return !src.error() && src.at_end();
+}
+
+bool read_whole_file(const std::string& path, std::string* text) {
+#if defined(_WIN32)
+  std::FILE* f = _wfopen(to_path(path).c_str(), L"rb");
+#else
+  std::FILE* f = std::fopen(path.c_str(), "rb");
+#endif
+  if (!f) return false;
+  const bool whole = read_chunks({[f](char* b, size_t n) { return std::fread(b, 1, n, f); },
+                                  [f] { return std::ferror(f) != 0; }, [f] { return std::feof(f) != 0; }},
+                                 text);
+  std::fclose(f);
+  return whole;
 }
 
 bool want_from_json(const ojson& j, const EngineOptions& base, ModelHost::Want* w, std::string* err) {

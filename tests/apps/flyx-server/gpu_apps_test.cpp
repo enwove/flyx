@@ -90,25 +90,44 @@ void test_live_listing_safety() {
 
 }  // namespace
 
-// Which NVML device a hint names, and whether its readings are surely that device's: never where a GPU's handle or
-// name was not read (it could be the hinted one's twin), nor where two of that name are listed.
+// Which GPU a hint names, and whether its readings are surely that device's: never where a GPU could not be opened
+// or its name not read (it could be the hinted one's twin), nor where two of that name are listed.  A GPU opened but
+// not named is still the one whose memory and processes are listed; only uniqueness needs its name.
 void test_device_match() {
+  using flyx::server::DeviceSeen;
   using flyx::server::match_device;
-  using Names = std::vector<std::optional<std::string>>;
-  const auto one = match_device(Names{"NVIDIA GeForce RTX 4090", "NVIDIA GeForce RTX 3090"}, "RTX 4090");
+  using flyx::server::readings_unique;
+  using Seen = std::vector<DeviceSeen>;
+  const DeviceSeen r4090{true, "NVIDIA GeForce RTX 4090"}, r3090{true, "NVIDIA GeForce RTX 3090"};
+  const DeviceSeen unnamed{true, std::nullopt}, unopened{};
+  const auto one = match_device(Seen{r4090, r3090}, "RTX 4090");
   CHECK(one.index == 0 && one.unique);
-  const auto twins = match_device(Names{"NVIDIA GeForce RTX 4090", "NVIDIA GeForce RTX 4090"}, "RTX 4090");
+  const auto twins = match_device(Seen{r4090, r4090}, "RTX 4090");
   CHECK(twins.index == 0 && !twins.unique);
-  const auto unread = match_device(Names{std::nullopt, "NVIDIA GeForce RTX 4090"}, "RTX 4090");
-  CHECK(unread.index == 1 && !unread.unique);  // the device not read could be the other 4090
-  const auto unread_after = match_device(Names{"NVIDIA GeForce RTX 4090", std::nullopt}, "RTX 4090");
-  CHECK(unread_after.index == 0 && !unread_after.unique);
-  const auto alone = match_device(Names{"NVIDIA GeForce RTX 5070 Ti"}, "");
+  const auto name_failed = match_device(Seen{unnamed, r4090}, "RTX 4090");
+  CHECK(name_failed.index == 1 && !name_failed.unique);  // the unnamed one could be the other 4090
+  const auto handle_failed = match_device(Seen{unopened, r4090}, "RTX 4090");
+  CHECK(handle_failed.index == 1 && !handle_failed.unique);
+  const auto after = match_device(Seen{r4090, unnamed}, "RTX 4090");
+  CHECK(after.index == 0 && !after.unique);
+  // One GPU whose name could not be read: still listed (its memory, its processes), not taken as the probed one.
+  const auto lone_unnamed = match_device(Seen{unnamed}, "RTX 4090");
+  CHECK(lone_unnamed.index == 0 && !lone_unnamed.unique);
+  const auto lone_unopened = match_device(Seen{unopened}, "RTX 4090");
+  CHECK(lone_unopened.index == -1 && !lone_unopened.unique);
+  const auto alone = match_device(Seen{{true, "NVIDIA GeForce RTX 5070 Ti"}}, "");
   CHECK(alone.index == 0 && alone.unique);  // the one GPU there is
-  const auto none_named = match_device(Names{"NVIDIA A100", "NVIDIA H100"}, "RTX 4090");
-  CHECK(none_named.index == 0 && !none_named.unique);  // the first read, not known to be the hinted device
-  const auto nothing = match_device(Names{std::nullopt}, "RTX 4090");
-  CHECK(nothing.index == -1 && !nothing.unique);
+  const auto none_named = match_device(Seen{{true, "NVIDIA A100"}, {true, "NVIDIA H100"}}, "RTX 4090");
+  CHECK(none_named.index == 0 && !none_named.unique);  // the first named, not known to be the hinted device
+  // DXGI's descriptions: the hint may hold the name; an adapter whose description could not be read, or that DXGI
+  // would not give, leaves the match not unique.
+  CHECK(match_device(Seen{{true, "RTX 4090"}}, "NVIDIA GeForce RTX 4090", /*either_way=*/true).unique);
+  CHECK(match_device(Seen{{true, "RTX 4090"}}, "NVIDIA GeForce RTX 4090").index == 0);  // named, not matched one way
+  CHECK(!match_device(Seen{unnamed, {true, "NVIDIA GeForce RTX 4090"}}, "NVIDIA GeForce RTX 4090", true).unique);
+  CHECK(!match_device(Seen{unopened, {true, "NVIDIA GeForce RTX 4090"}}, "NVIDIA GeForce RTX 4090", true).unique);
+  // Windows: DXGI's verdict alone where NVML is unavailable, else both.
+  CHECK(readings_unique(true, std::nullopt) && !readings_unique(false, std::nullopt));
+  CHECK(readings_unique(true, true) && !readings_unique(true, false) && !readings_unique(false, true));
 }
 
 int main() {

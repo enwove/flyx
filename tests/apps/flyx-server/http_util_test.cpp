@@ -5,10 +5,7 @@
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
-#include <ios>
-#include <istream>
-#include <sstream>
-#include <streambuf>
+#include <memory>
 #include <string>
 #include <vector>
 
@@ -26,29 +23,33 @@ using namespace flyx::server;
 
 // POST /v1/load's "kv_gpu": a cap, "auto" (as many as fit, whatever the server's --kv-gpu: a dashboard field cleared
 // beside a loaded model), or absent / null (the server's own setting).
-// serve.json's bytes as model_host reads them (read_whole): all of them, or none where the read fails part-way, even
-// after a prefix that is whole JSON (so a save does not take that prefix for the file and write over the rest).
+// serve.json's bytes as model_host reads them (read_chunks, read_whole_file): all of them, or none where a read fails,
+// even a short read that brought a prefix that is whole JSON (so a save does not take it for the file and write over
+// the rest).  The stand-in gives `bytes` then stops, its error and end flags as a FILE*'s ferror and feof would say.
 void test_read_whole() {
-  struct FailsAfter : std::streambuf {  // a disk that gives `head`, then an error
-    std::string head;
-    bool given = false;
-    explicit FailsAfter(std::string h) : head(std::move(h)) {}
-    int_type underflow() override {
-      if (given) throw std::ios_base::failure("the volume went away");
-      given = true;
-      setg(head.data(), head.data(), head.data() + head.size());
-      return traits_type::to_int_type(head[0]);
-    }
+  const auto source = [](std::string bytes, bool error, bool end) {
+    auto at = std::make_shared<size_t>(0);
+    return ChunkSource{[bytes, at](char* buf, size_t n) {
+                         const size_t got = std::min(n, bytes.size() - *at);
+                         std::copy_n(bytes.data() + *at, got, buf);
+                         *at += got;
+                         return got;
+                       },
+                       [error] { return error; }, [end] { return end; }};
   };
-  FailsAfter failing(R"({"lan_access": true})");
-  std::istream broken(&failing);
-  std::string text = "untouched";
-  check(!read_whole(broken, &text), "a read that fails after a whole JSON prefix gives no file");
-  const std::string big = "{\"pad\": \"" + std::string(40000, 'x') + "\"}";  // past one chunk
-  std::istringstream whole(big);
-  check(read_whole(whole, &text) && text == big, "a clean read gives every byte, over several chunks");
-  std::istringstream empty("");
-  check(read_whole(empty, &text) && text.empty(), "an empty file is read as empty");
+  std::string text;
+  check(!read_chunks(source(R"({"lan_access": true})", /*error=*/true, /*end=*/false), &text),
+        "a short read with an I/O error after a whole JSON prefix gives no file");
+  check(!read_chunks(source(R"({"lan_access": true})", true, true), &text),
+        "nor where the stream says both its end and an error");
+  const std::string big = "{\"pad\": \"" + std::string(40000, 'x') + "\"}";  // past two chunks
+  check(read_chunks(source(big, false, true), &text) && text == big, "a clean read gives every byte, over several chunks");
+  check(read_chunks(source("", false, true), &text) && text.empty(), "an empty file is read as empty");
+  const std::filesystem::path file = std::filesystem::temp_directory_path() / "flyx-read-whole-test.json";
+  { std::ofstream(file, std::ios::binary) << big; }
+  check(read_whole_file(flyx::os::from_path(file), &text) && text == big, "a file on disk read whole through fread");
+  std::filesystem::remove(file);
+  check(!read_whole_file(flyx::os::from_path(file), &text), "a file not there cannot be read");
 }
 
 void test_load_kv_gpu() {
