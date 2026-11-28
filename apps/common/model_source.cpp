@@ -876,15 +876,21 @@ bool fetch_lora(const std::string& spec, const hub::ProgressFn& progress, const 
       const fs::path file = to_path(p);
       const fs::path dir = file.has_parent_path() ? file.parent_path() : fs::path(".");
       // The file itself is one of the two, by the file system's identity (ADAPTER_CONFIG.JSON on a volume that
-      // ignores case), not by the spelling typed.
+      // ignores case), not by the spelling typed.  Each of the two is a path of its own the policy decides on before
+      // it is looked at: comparing identities follows its links and reparse points.
+      bool denied = false;
       const auto is = [&](const char* name) {
+        const fs::path sibling = dir / name;
+        if (allow_path && !allow_path(from_path(sibling))) return denied = true, false;
         std::error_code e;
-        return fs::equivalent(file, dir / name, e);
+        return fs::equivalent(file, sibling, e);
       };
-      if (!is("adapter_config.json") && !is("adapter_model.safetensors"))
+      if (!is("adapter_config.json") && !is("adapter_model.safetensors")) {
+        if (denied) return *err = p + ": path is not allowed by remote path policy", false;
         return *err = p + ": not a LoRA adapter (its directory, of adapter_config.json and adapter_model.safetensors, "
                           "or one of those two files)",
                false;
+      }
       resolved = file.has_parent_path() ? from_path(dir) : std::string(".");
     }
     if (allow_path && !allow_path(resolved))

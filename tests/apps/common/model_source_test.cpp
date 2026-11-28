@@ -2,12 +2,14 @@
 // apps/common/model_source: the DSpark drafter published beside a model, taken by default (wants_dspark): the one a
 // GGUF on disk has beside it (dspark_beside: its name, then its header), and the default dspark-*.gguf of the model's
 // repository, here a Hugging Face cache read offline.  Neither replaces a drafter that was named.
+#include <algorithm>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
 #include <string>
+#include <string_view>
 #include <vector>
 
 #include "apps/common/model_source.h"
@@ -223,6 +225,20 @@ int main() {
     check(flyx::apps::drafter_kind(mixed, gguf_named) == "dspark", "cached: its own header's DSpark");
     check(flyx::apps::drafter_kind(mixed, whole) == "dflash2",
           "the repository named alone selects its config and safetensors: the config's DFlash2");
+    // A cached mtp-*.gguf whose header is an ordinary model's, no MTP layers in it: listed as MTP by its name, but
+    // neither GET /v1/hub/files' drafter_kind nor GET /v1/hub/drafter tells a load it is one.
+    flyx::hub::Repo mtp_named = generic;
+    mtp_named.id = "acme/Mtp-Named";
+    mtp_named.files = {{"mtp-Tiny-Q8_0.gguf", 0, "", ""}};
+    write_gguf(to_path(flyx::hub::snapshot_dir(mtp_named)) / "mtp-Tiny-Q8_0.gguf", "qwen35");
+    const auto mtp_listing = flyx::apps::hub_ggufs(mtp_named);
+    flyx::hub::Name mtp_name;
+    check(mtp_listing.size() == 1 && mtp_listing[0].cached && mtp_listing[0].cls.drafter_kind == "mtp" &&
+              mtp_listing[0].header_drafter_kind().empty(),
+          "a cached mtp-*.gguf with no MTP layers: MTP by its name in the list, no mode for a load");
+    check(flyx::hub::parse_name(mtp_named.id + ":mtp-Tiny-Q8_0.gguf", &mtp_name) &&
+              flyx::apps::drafter_kind(mtp_named, mtp_name).empty(),
+          "and the Hub name's kind the same: none");
   }
   // A LoRA adapter of a repository listed as the Hub lists it (fetch_lora_in), its files' blobs standing in for the
   // transfers as above: a config longer than a load reads (modelfile::kPeftConfigMaxBytes) is refused by its listed
@@ -307,6 +323,24 @@ int main() {
       ok = flyx::apps::fetch_lora(from_path(adir / file), {}, nullptr, &p, &err);
       check(ok && to_path(p) == adir, "and a path to it, its directory: " + (ok ? p : err));
     }
+#endif
+    // The remote path policy on the sibling compared with the file named (its identity is looked at through its
+    // links): the policy is asked of it first, and a sibling it denies is not compared.
+    const std::string config_sibling = from_path(adir / "adapter_config.json");
+    std::vector<std::string> asked;
+    const auto deny_config = [&](std::string_view q) {
+      asked.emplace_back(q);
+      return q != config_sibling;
+    };
+    p.clear();
+    ok = flyx::apps::fetch_lora(from_path(adir / "adapter_model.safetensors"), {}, nullptr, &p, &err, deny_config);
+    check(ok && to_path(p) == adir && std::find(asked.begin(), asked.end(), config_sibling) != asked.end(),
+          "the policy is asked of each sibling before it is compared (its weights file named: taken)");
+#if defined(_WIN32)
+    // A spelling of the config that is not the sibling's own: the sibling, denied, is not compared, so not taken.
+    ok = flyx::apps::fetch_lora(from_path(adir / "ADAPTER_CONFIG.JSON"), {}, nullptr, &p, &err, deny_config);
+    check(!ok && err.find("remote path policy") != std::string::npos,
+          "a denied sibling is not looked at through the name typed: " + err);
 #endif
     fs::current_path(cwd);
   }
