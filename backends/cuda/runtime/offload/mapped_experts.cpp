@@ -3,6 +3,7 @@
 
 #include "backends/cuda/regions/layers.h"
 
+#include <chrono>
 #include <cmath>
 
 namespace flyx::cuda {
@@ -286,6 +287,7 @@ void ExpertAddressSpace::rank_experts() {
 }
 
 void ExpertAddressSpace::promote() {
+  const auto started = std::chrono::steady_clock::now();
   rank_experts();
   struct Page {
     double frequency;
@@ -334,7 +336,9 @@ void ExpertAddressSpace::promote() {
     b.plane->hot[b.index] = 1;
   }
   select_gather();
-  if (verbose_) std::fprintf(stderr, "flyx-cuda: redistributed %zu expert pages at quiescence\n", i);
+  if (verbose_)
+    std::fprintf(stderr, "flyx-cuda: redistributed %zu expert pages at quiescence in %.1f ms\n", i,
+                 std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - started).count());
 }
 
 void ExpertAddressSpace::finish_prompt(cudaStream_t stream) {
