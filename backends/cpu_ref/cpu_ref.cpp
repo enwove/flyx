@@ -1265,7 +1265,8 @@ void eagle4_draft(RefSeq* s, const flyx_eagle4_block& B, int width) {
     for (int c = 0; c < H; ++c) r[c] += y[c];
     norm(M, B.norm, r.data(), H, h.data());
     // The candidate head: its low-rank scores over the vocabulary, their best C (the lower id on ties), each scored
-    // exactly by the head; the draft as ops::draft_choice takes it over them, as MTP's over the head's best.
+    // exactly by the head; the draft as ops::draft_choice takes it over the best kMtpCands of those (the higher
+    // score, the lower id on ties), as MTP's over the head's best and as the CUDA backend's.
     lin(M, B.cand_down, h.data(), 1, H, R, z.data(), 1);
     lin(M, B.cand_up, z.data(), 1, R, V, score.data(), 1);
     std::vector<int32_t> cand(C), count(C);
@@ -1277,11 +1278,23 @@ void eagle4_draft(RefSeq* s, const flyx_eagle4_block& B, int width) {
       double l = 0;
       for (int k = 0; k < H; ++k) l += load(head, size_t(cand[c]) * H + k) * h[k];
       fval[c] = float(l);
-      count[c] = pen && !s->counts.empty() ? s->counts[size_t(cand[c])] : 0;
-      for (int j = 0; pen && j < i; ++j) count[c] += s->drafts[size_t(j)] == cand[c];
+    }
+    std::vector<int> order(size_t(C), 0);
+    for (int c = 0; c < C; ++c) order[size_t(c)] = c;
+    const int Kc = std::min(flyx::ops::kMtpCands, C);
+    std::partial_sort(order.begin(), order.begin() + Kc, order.end(), [&](int a, int b) {
+      return fval[size_t(a)] != fval[size_t(b)] ? fval[size_t(a)] > fval[size_t(b)] : cand[size_t(a)] < cand[size_t(b)];
+    });
+    std::vector<int32_t> kcand(size_t(Kc), 0);
+    std::vector<float> kval(size_t(Kc), 0.f);
+    for (int c = 0; c < Kc; ++c) {
+      kcand[size_t(c)] = cand[size_t(order[size_t(c)])];
+      kval[size_t(c)] = fval[size_t(order[size_t(c)])];
+      count[size_t(c)] = pen && !s->counts.empty() ? s->counts[size_t(kcand[size_t(c)])] : 0;
+      for (int j = 0; pen && j < i; ++j) count[size_t(c)] += s->drafts[size_t(j)] == kcand[size_t(c)];
     }
     const flyx_gen_params& gp = s->gen;
-    int d = flyx::ops::draft_choice(cand.data(), fval.data(), pen ? count.data() : nullptr, C, V, gp.temperature,
+    int d = flyx::ops::draft_choice(kcand.data(), kval.data(), pen ? count.data() : nullptr, Kc, V, gp.temperature,
                                     gp.top_p, gp.top_k, gp.presence_penalty, gp.frequency_penalty, gp.seed, p + 1 + i);
     if (forced_drafts(s)) d = forced_draft(s, p + 1 + i);
     s->drafts[i] = d;
@@ -1684,6 +1697,12 @@ int open_model(const flyx_model_desc* desc, const flyx_open_options* opts, flyx_
         throw std::runtime_error("block kind " + std::to_string(k) + ": not implemented by cpu_ref");
       if (k == FLYX_BLOCK_VISION_STEM && b.vision_stem.cls_token >= 0)
         throw std::runtime_error("vision_stem: cls_token is not yet implemented by cpu_ref");
+      // its fc_norm per tap, its taps the target's width (as the CUDA backend's bind checks)
+      if (k == FLYX_BLOCK_EAGLE4 && (b.eagle4.n_taps < 1 || b.eagle4.n_taps > FLYX_EAGLE4_MAX_TAPS ||
+                                     b.eagle4.target_hidden != b.eagle4.hidden))
+        throw std::runtime_error("eagle4: " + std::to_string(b.eagle4.n_taps) + " taps of width " +
+                                 std::to_string(b.eagle4.target_hidden) + " (1.." +
+                                 std::to_string(FLYX_EAGLE4_MAX_TAPS) + " of its own width)");
       if (k == FLYX_BLOCK_DFLASH2 || k == FLYX_BLOCK_DSPINE || k == FLYX_BLOCK_EAGLE4) {
         if (m->dflash >= 0) throw std::runtime_error("more than one drafter of the target's taps");
         m->dflash = i;

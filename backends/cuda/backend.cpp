@@ -312,12 +312,21 @@ const std::vector<OptionSpec>& option_specs() {
       bool_choice_opt("draft_head", &BackendOptions::full_draft_head, "full", "pick"),
       {"eagle4_tree",
        [](const std::string& key, const std::string& val, BackendOptions* o, std::string* err) {
+         // STEPS 0 (by the width) or at least the trunk: a shallower tree would cut the chain its trunk is, whose
+         // acceptance the controller counts to its 7th draft (Model::block_drafts)
          int beam = 0, steps = 0;
-         char tail = 0;
-         if (std::sscanf(val.c_str(), "%dx%d%c", &beam, &steps, &tail) != 2 || beam < 1 ||
-             beam > flyx::cuda::kEagleBeamMax || steps < 0 || 1 + beam * steps > flyx::cuda::kEagleSlots) {
+         const char *p = val.data(), *end = p + val.size();
+         auto r = std::from_chars(p, end, beam);
+         bool ok = r.ec == std::errc() && r.ptr < end && *r.ptr == 'x';
+         if (ok) {
+           r = std::from_chars(r.ptr + 1, end, steps);
+           ok = r.ec == std::errc() && r.ptr == end;
+         }
+         if (!ok || beam < 1 || beam > flyx::cuda::kEagleBeamMax || (steps != 0 && steps < flyx::cuda::kEagleTrunk) ||
+             int64_t(steps) * beam + 1 > flyx::cuda::kEagleSlots) {
            *err = "bad value \"" + val + "\" for " + key + " (BEAMxSTEPS: BEAM 1.." +
-                  std::to_string(flyx::cuda::kEagleBeamMax) + ", 1 + BEAM * STEPS <= " +
+                  std::to_string(flyx::cuda::kEagleBeamMax) + ", STEPS 0 or " +
+                  std::to_string(flyx::cuda::kEagleTrunk) + " or more, 1 + BEAM * STEPS <= " +
                   std::to_string(flyx::cuda::kEagleSlots) + ")";
            return false;
          }

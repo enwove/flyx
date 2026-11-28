@@ -117,7 +117,8 @@ def canonical_eagle4_config(sc: dict, target: dict | None) -> dict:
     if target is not None:
         _require(vocab == target["vocab"], "its vocabulary differs from the target's")
         _require(H == target["hidden"], "its width differs from the target's")
-        _require(all(1 <= t <= target["layers"] for t in taps), f"taps {taps} outside the target's layers")
+        # the residual after a layer before the last (the engine's taps: models/drafters/eagle4.cpp)
+        _require(all(1 <= t < target["layers"] for t in taps), f"taps {taps} outside the target's layers")
     return {
         "kind": "eagle4", "hidden": H, "layers": 1, "n_heads": heads, "n_kv": kv, "head_dim": hd,
         "inter": sc["intermediate_size"], "eps": float(sc["rms_norm_eps"]), "rope_theta": float(rp["rope_theta"]),

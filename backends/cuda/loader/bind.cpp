@@ -1332,6 +1332,9 @@ void bind(flyx_bmodel* m, const flyx_model_desc& d, LoadTimes* times) {
       default: throw std::runtime_error("unexpected draft block kind " + std::to_string(b.kind));
     }
   }
+  // EAGLE-4 keeps its state where MTP keeps its own (the sequence's ring, its draft tokens and candidates): never both
+  // (models/model.cpp leaves an MTP layer out beside EAGLE-4)
+  expect(m->eagle4_block < 0 || m->mtp_block < 0, "an EAGLE-4 drafter beside an MTP layer");
   // The precision the drafts run at, as their linears hold it (not the policy asked: a packed file can stay as it is):
   // a block drafter's when there is one (DFlash2's before DSpark's), else MTP's.
   const std::string mtp_held = held_precision(drafter_lins(m, m->mtp_block));
