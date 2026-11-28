@@ -161,9 +161,10 @@ __global__ void __launch_bounds__(128) k_gemm_rows(const float* __restrict__ x, 
 //
 // K is cut into kSkinnyChunks fixed chunks, each summed on its own and the
 // chunks added in order, whatever the number of warps; chunk c is every
-// kSkinnyChunks-th span from span c (interleaved: a block's warps stream
-// neighbouring spans of its rows, which DRAM serves faster than 16 streams a
-// row apart; 1.2 -> 1.4 TB/s at K = 17408 on an RTX PRO 6000): every configuration
+// kSkinnyChunks-th pair of 32-value spans from pair c (interleaved: a block's
+// warps stream neighbouring spans of its rows, which DRAM serves faster than 16
+// streams a row apart; 1.2 -> 1.4 TB/s at K = 17408 on an RTX PRO 6000; by pairs,
+// as W12's lanes load a pair's bytes at once and keep them): every configuration
 // (tile, warps, unroll) gives bit-identical results, so a tuning table can
 // pick one per shape and row count freely.
 constexpr int kSkinnyChunks = 16;
@@ -209,7 +210,8 @@ __device__ __forceinline__ void skinny_body(Parts x, int ldk, int N, int K, floa
 #pragma unroll
     for (int i = 0; i < NT; ++i) acc[i][0] = acc[i][1] = acc[i][2] = acc[i][3] = 0.f;
 #pragma unroll UNROLL
-    for (int s = chunk; s < spans; s += kSkinnyChunks) {  // the chunk's spans: every 16th, interleaved
+    // the chunk's spans: every 16th pair of them, interleaved (a pair is the 64 values W12's lanes load at once)
+    for (int s = 2 * chunk; s < spans; s += (s & 1) ? 2 * kSkinnyChunks - 1 : 1) {
       const int k = s << 5;
       uint4 w[NT];
 #pragma unroll
@@ -537,7 +539,7 @@ __global__ void __launch_bounds__(32 * WARPS) k_gemm_skinny_w12(Parts x, int ldk
   }
   skinny_body<NT, R16, WARPS, UNROLL>(x, ldk, N, K, y, ldy, rows, accumulate, [&](int i, int k) {
     const int pair = k >> 6;
-    if (pair != pc) {  // uniform: the first span of a pair, or a chunk starting at an odd span
+    if (pair != pc) {  // uniform: the first span of a pair (a chunk's spans come in pairs)
 #pragma unroll
       for (int j = 0; j < NT; ++j) {
         hc[j] = wv[j] ? ldg_stream(hp[j] + 64 * size_t(pair)) : make_uint4(0, 0, 0, 0);
@@ -928,7 +930,8 @@ __global__ void __launch_bounds__(32 * WARPS) k_gemm_skinny_fp8(Parts x, int ldk
 #pragma unroll
     for (int i = 0; i < NT; ++i) acc[i][0] = acc[i][1] = acc[i][2] = acc[i][3] = 0.f;
 #pragma unroll UNROLL
-    for (int s = chunk; s < spans; s += kSkinnyChunks) {  // the chunk's spans: every 16th, interleaved
+    // the chunk's spans: every 16th pair of them, interleaved (a pair is the 64 values W12's lanes load at once)
+    for (int s = 2 * chunk; s < spans; s += (s & 1) ? 2 * kSkinnyChunks - 1 : 1) {
       const int k = s << 5;
       uint32_t w[NT][4];
 #pragma unroll
