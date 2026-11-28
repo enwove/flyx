@@ -1282,8 +1282,10 @@ void eagle4_draft(RefSeq* s, const flyx_eagle4_block& B, int width) {
     std::vector<int> order(size_t(C), 0);
     for (int c = 0; c < C; ++c) order[size_t(c)] = c;
     const int Kc = std::min(flyx::ops::kMtpCands, C);
+    // a NaN score below every other (draft_choice skips it), so the order stays a strict weak one
+    auto key = [&](int c) { return fval[size_t(c)] != fval[size_t(c)] ? -INFINITY : fval[size_t(c)]; };
     std::partial_sort(order.begin(), order.begin() + Kc, order.end(), [&](int a, int b) {
-      return fval[size_t(a)] != fval[size_t(b)] ? fval[size_t(a)] > fval[size_t(b)] : cand[size_t(a)] < cand[size_t(b)];
+      return key(a) != key(b) ? key(a) > key(b) : cand[size_t(a)] < cand[size_t(b)];
     });
     std::vector<int32_t> kcand(size_t(Kc), 0);
     std::vector<float> kval(size_t(Kc), 0.f);
@@ -1697,9 +1699,9 @@ int open_model(const flyx_model_desc* desc, const flyx_open_options* opts, flyx_
         throw std::runtime_error("block kind " + std::to_string(k) + ": not implemented by cpu_ref");
       if (k == FLYX_BLOCK_VISION_STEM && b.vision_stem.cls_token >= 0)
         throw std::runtime_error("vision_stem: cls_token is not yet implemented by cpu_ref");
-      // its fc_norm per tap, its taps the target's width (as the CUDA backend's bind checks)
+      // its fc_norm per tap, its taps and its own width the target's (as the CUDA backend's bind checks)
       if (k == FLYX_BLOCK_EAGLE4 && (b.eagle4.n_taps < 1 || b.eagle4.n_taps > FLYX_EAGLE4_MAX_TAPS ||
-                                     b.eagle4.target_hidden != b.eagle4.hidden))
+                                     b.eagle4.target_hidden != desc->hidden || b.eagle4.hidden != desc->hidden))
         throw std::runtime_error("eagle4: " + std::to_string(b.eagle4.n_taps) + " taps of width " +
                                  std::to_string(b.eagle4.target_hidden) + " (1.." +
                                  std::to_string(FLYX_EAGLE4_MAX_TAPS) + " of its own width)");
