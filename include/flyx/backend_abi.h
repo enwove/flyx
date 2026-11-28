@@ -1059,11 +1059,11 @@ typedef struct flyx_seq flyx_seq;
  * from the K/V cache (after StrataFlux); prefill passes read the cache. method_arg: the copy's bits,
  * 2 to 4 (0: 2). */
 #define FLYX_KV_STRATA 1
-/* Exact where it costs nothing, the copy where exact would be slower (ABI 29): a round's row at a
- * position below the switch reads every position, as FLYX_KV_READ_ALL; at the switch or past it, as FLYX_KV_STRATA.
- * The backend picks the switch: where its exact attention, reading the positions past the device's part over the
- * bus, would get slower than the copy's; a session whose every position is below it keeps no copy.  The switch is a
- * position, never a time, so drafts do not change the output.  method_arg: the copy's bits (0: 2). */
+/* A round's row below the switch reads every position as FLYX_KV_READ_ALL, and a row at or past it as
+ * FLYX_KV_STRATA (ABI 29). With lock_auto_from the engine fixes the target's switch across physical layouts,
+ * subject to an explicit backend override. The planner may move layer copies to host memory to keep that exact
+ * prefix on the device. Direct callers without a lock use the backend's default. A wholly exact session keeps
+ * no copy. method_arg: the copy's bits (0: 2). */
 #define FLYX_KV_AUTO 2
 /* copy_host (ABI 30): of the low-bit copies of the caches in host memory (FLYX_KV_STRATA, FLYX_KV_AUTO),
  * how many are in host memory too, each read through a device staging that a round fills while the layers before
