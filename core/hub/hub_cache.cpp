@@ -39,8 +39,22 @@ std::string token() {
   return t;
 }
 
+bool is_symlink_or_junction(const fs::path& p, std::error_code& ec) {
+  const fs::file_status st = fs::symlink_status(p, ec);
+  if (ec) return false;
+  if (fs::is_symlink(st)) return true;
+  // Windows NTFS directory junctions report file_type::junction rather than symlink or directory.
+  if (st.type() != fs::file_type::directory && st.type() != fs::file_type::regular &&
+      st.type() != fs::file_type::not_found) {
+    std::error_code e2;
+    return fs::is_directory(p, e2) && !e2;
+  }
+  return false;
+}
+
 CacheFs resolve_cache_fs(const CacheFs* fs_ops) {
   CacheFs ops;
+  ops.is_symlink = [](const fs::path& p, std::error_code& ec) { return is_symlink_or_junction(p, ec); };
   ops.is_directory = [](const fs::path& p, std::error_code& ec) { return fs::is_directory(p, ec); };
   ops.is_regular_file = [](const fs::path& p, std::error_code& ec) { return fs::is_regular_file(p, ec); };
   ops.file_size = [](const fs::path& p, std::error_code& ec) { return uint64_t(fs::file_size(p, ec)); };
@@ -54,6 +68,8 @@ CacheFs resolve_cache_fs(const CacheFs* fs_ops) {
   };
   ops.read_text = [](const fs::path& p) { return detail::read_text(p); };
   if (!fs_ops) return ops;
+  ops.is_symlink = fs_ops->is_symlink ? fs_ops->is_symlink
+                                      : [](const fs::path&, std::error_code&) { return false; };
   if (fs_ops->is_directory) ops.is_directory = fs_ops->is_directory;
   if (fs_ops->is_regular_file) ops.is_regular_file = fs_ops->is_regular_file;
   if (fs_ops->file_size) ops.file_size = fs_ops->file_size;
@@ -64,32 +80,37 @@ CacheFs resolve_cache_fs(const CacheFs* fs_ops) {
   return ops;
 }
 
-// The files of a snapshot on disk (links followed), sizes only. Every child is authorized via allow_path
-// BEFORE any target-following stat, size lookup, or directory descent.
-std::vector<RepoFile> snapshot_files(const fs::path& snap, const PathAllowFn& allow_path, const CacheFs& ops) {
+// The files of a snapshot on disk (file links followed, directory symlinks/junctions never descended into), sizes only.
+// Every child is authorized via allow_path BEFORE any target-following stat, size lookup, or directory descent.
+// `bounded` caps depth/entries for interactive hub::cached() listings; authoritative single-snapshot resolution passes
+// bounded=false so deep valid snapshots are never silently truncated.
+std::vector<RepoFile> snapshot_files(const fs::path& snap, const PathAllowFn& allow_path, const CacheFs& ops,
+                                     bool bounded) {
   constexpr int kMaxDepth = 16;
   constexpr int kMaxEntries = 50000;
   std::vector<RepoFile> files;
   std::deque<std::pair<fs::path, int>> queue;
   queue.emplace_back(snap, 0);
   int seen = 0;
-  while (!queue.empty() && seen < kMaxEntries) {
+  while (!queue.empty() && (!bounded || seen < kMaxEntries)) {
     auto [cur, depth] = std::move(queue.front());
     queue.pop_front();
     std::error_code ec;
     ops.for_each_dir_entry(
         cur,
         [&](const fs::path& child) {
-          if (++seen > kMaxEntries) return false;
+          if (bounded && ++seen > kMaxEntries) return false;
           const std::string child_str = from_path(child);
           if (allow_path && !allow_path(child_str)) return true;
           std::error_code e2;
-          if (ops.is_directory(child, e2)) {
-            if (!e2 && depth + 1 < kMaxDepth) queue.emplace_back(child, depth + 1);
+          const bool link = ops.is_symlink(child, e2);
+          if (e2) return true;
+          if (!link && ops.is_directory(child, e2)) {
+            if (!e2 && (!bounded || depth + 1 < kMaxDepth)) queue.emplace_back(child, depth + 1);
             return true;
           }
           e2.clear();
-          if (!ops.is_regular_file(child, e2) || e2) return true;  // follows the link; a broken one is no file
+          if (!ops.is_regular_file(child, e2) || e2) return true;  // follows file links; skips directory links & broken links
           RepoFile f;
           f.path = from_path(child.lexically_relative(snap));  // fs::relative would follow the link to the blob
           std::replace(f.path.begin(), f.path.end(), '\\', '/');
@@ -172,18 +193,38 @@ bool has_size(const fs::path& path, uint64_t size) {
   return fs::is_regular_file(path, ec) && fs::file_size(path, ec) == size && !ec;
 }
 
-bool from_cache(const std::string& repo, const std::string& revision, Repo* out) {
+bool from_cache(const std::string& repo, const std::string& revision, Repo* out, const PathAllowFn& allow_path,
+                const CacheFs* fs_ops) {
   if (!valid_repo(repo) || !valid_word(revision)) return false;
-  const fs::path dir = repo_dir(repo);
+  const CacheFs ops = resolve_cache_fs(fs_ops);
+  const std::string root_str = ops.root_override.empty() ? cache_dir() : ops.root_override;
+  if (root_str.empty() || (allow_path && !allow_path(root_str))) return false;
+  const size_t slash = repo.find('/');
+  const fs::path dir = to_path(root_str) / to_path("models--" + repo.substr(0, slash) + "--" + repo.substr(slash + 1));
+  if (allow_path && !allow_path(from_path(dir))) return false;
+  const fs::path snaps = dir / "snapshots";
+  if (allow_path && !allow_path(from_path(snaps))) return false;
   std::error_code ec;
-  std::string commit = is_commit(revision) && fs::exists(dir / "snapshots" / revision, ec)
-                           ? revision
-                           : read_text(dir / "refs" / to_path(revision));
-  if (!is_commit(commit) || !fs::is_directory(dir / "snapshots" / commit, ec)) return false;
+  std::string commit;
+  if (is_commit(revision)) {
+    const fs::path direct = snaps / to_path(revision);
+    if (!allow_path || allow_path(from_path(direct))) {
+      if (ops.is_directory(direct, ec) && !ec) commit = revision;
+    }
+  }
+  if (commit.empty()) {
+    const fs::path ref = dir / "refs" / to_path(revision);
+    if (allow_path && !allow_path(from_path(ref))) return false;
+    commit = ops.read_text(ref);
+  }
+  if (!is_commit(commit)) return false;
+  const fs::path snap = snaps / to_path(commit);
+  if (allow_path && !allow_path(from_path(snap))) return false;
+  ec.clear();
+  if (!ops.is_directory(snap, ec) || ec) return false;
   out->commit = commit;
-  const CacheFs ops = resolve_cache_fs(nullptr);
-  out->files = snapshot_files(dir / "snapshots" / commit, {}, ops);
-  out->architectures = architectures_of(dir / "snapshots" / commit, {}, ops);
+  out->files = snapshot_files(snap, allow_path, ops, /*bounded=*/false);
+  out->architectures = architectures_of(snap, allow_path, ops);
   out->from_cache = true;
   return true;
 }
@@ -322,10 +363,10 @@ bool offline() { return os::env_bool(env::kHfHubOffline).value_or(false); }
 
 std::string snapshot_dir(const Repo& r) { return from_path(detail::repo_dir(r.id) / "snapshots" / r.commit); }
 
-bool in_cache(const std::string& repo, const std::string& revision, Repo* out) {
+bool in_cache(const std::string& repo, const std::string& revision, Repo* out, const PathAllowFn& allow_path) {
   Repo r;
   r.id = repo, r.revision = revision.empty() ? "main" : revision;
-  if (!detail::from_cache(repo, r.revision, &r)) return false;
+  if (!detail::from_cache(repo, r.revision, &r, allow_path)) return false;
   *out = std::move(r);
   return true;
 }
@@ -377,7 +418,7 @@ std::vector<Cached> cached(const PathAllowFn& allow_path, const CacheFs* fs_ops)
           Cached c;
           c.repo = repo, c.commit = s.commit, c.current = s.commit == main;
           c.dir = from_path(snap_dir);
-          c.files = snapshot_files(snap_dir, allow_path, ops);
+          c.files = snapshot_files(snap_dir, allow_path, ops, /*bounded=*/true);
           c.architectures = architectures_of(snap_dir, allow_path, ops);
           if (!c.files.empty()) out.push_back(std::move(c));
         }
@@ -389,14 +430,23 @@ std::vector<Cached> cached(const PathAllowFn& allow_path, const CacheFs* fs_ops)
 }
 
 bool remove_cached(const std::string& repo, const std::string& commit, const std::vector<std::string>& paths,
-                   uint64_t* freed, std::string* err) {
+                   uint64_t* freed, std::string* err, const PathAllowFn& allow_path) {
   *freed = 0;
   if (!detail::valid_repo(repo) || !detail::is_commit(commit))
     return *err = "not a cached snapshot: " + repo + "@" + commit, false;
+  auto check_allow = [&](const fs::path& p) -> bool {
+    if (!allow_path || allow_path(from_path(p))) return true;
+    *err = from_path(p) + ": path is not allowed by remote path policy";
+    return false;
+  };
   const fs::path dir = detail::repo_dir(repo), snaps = dir / "snapshots", snap = snaps / commit, blobs = dir / "blobs";
+  if (!check_allow(to_path(cache_dir())) || !check_allow(dir) || !check_allow(snaps) || !check_allow(snap) ||
+      !check_allow(blobs))
+    return false;
   std::error_code ec;
   // A file's last name going frees its bytes; a link, or one name of a file that has others, frees none.
   auto remove_one = [&](const fs::path& p) {
+    if (!check_allow(p)) return false;
     std::error_code e;
     const bool link = fs::is_symlink(fs::symlink_status(p, e));
     const uint64_t bytes = link ? 0 : fs::file_size(p, e);
@@ -406,21 +456,50 @@ bool remove_cached(const std::string& repo, const std::string& commit, const std
     return true;
   };
   // Whether an entry of any of the repository's snapshots still reads `blob`: a link to it, or a hard link.
+  // Never descends into directory symlinks/junctions; if allow_path denies any snapshot path or enumeration fails,
+  // conservatively treats the blob as still referenced so it is safely retained.
   auto referenced = [&](const fs::path& blob) {
+    if (allow_path && (!allow_path(from_path(snaps)) || !allow_path(from_path(blob)))) return true;
     std::error_code e;
     const fs::path target = fs::weakly_canonical(blob, e);
-    for (fs::recursive_directory_iterator it(snaps, e), end; !e && it != end; it.increment(e)) {
+    if (e) return true;
+    std::deque<fs::path> queue;
+    queue.push_back(snaps);
+    while (!queue.empty()) {
+      const fs::path cur = std::move(queue.front());
+      queue.pop_front();
+      if (allow_path && !allow_path(from_path(cur))) return true;
       std::error_code e2;
-      const fs::file_status st = it->symlink_status(e2);
-      if (fs::is_symlink(st) ? fs::weakly_canonical(it->path(), e2) == target
-                             : fs::is_regular_file(st) && fs::equivalent(it->path(), blob, e2))
-        return true;
+      fs::directory_iterator it(cur, e2), end;
+      if (e2) return true;
+      for (; !e2 && it != end; it.increment(e2)) {
+        const fs::path child = it->path();
+        if (allow_path && !allow_path(from_path(child))) return true;
+        std::error_code e3;
+        const fs::file_status st = fs::symlink_status(child, e3);
+        if (e3) return true;
+        const bool link_or_junc = is_symlink_or_junction(child, e3);
+        if (e3) return true;
+        if (!link_or_junc && fs::is_directory(st)) {
+          queue.push_back(child);
+          continue;
+        }
+        if (fs::is_symlink(st)) {
+          const fs::path resolved = fs::weakly_canonical(child, e3);
+          if (!e3 && resolved == target) return true;
+        } else if (fs::is_regular_file(st)) {
+          if (fs::equivalent(child, blob, e3) && !e3) return true;
+        }
+      }
+      if (e2) return true;
     }
     return false;
   };
   for (const std::string& path : paths) {
     if (!detail::safe_path(path)) return *err = "not a repository's file: " + path, false;
     const fs::path entry = snap / to_path(path);
+    for (fs::path p = entry; !p.empty() && p != snap; p = p.parent_path())
+      if (!check_allow(p)) return false;
     const fs::file_status st = fs::symlink_status(entry, ec);
     if (ec || !fs::exists(st) || fs::is_directory(st))
       return *err = repo + "@" + commit + ": " + path + " is not in the cache", false;
@@ -436,12 +515,13 @@ bool remove_cached(const std::string& repo, const std::string& commit, const std
       const std::string id = from_path(blob.filename());
       std::error_code st_ec;
       if (ec || bec || blob == blobs_canon || blob.parent_path() != blobs_canon || !inside(blob, blobs) ||
-          !fs::is_regular_file(fs::symlink_status(blob, st_ec)) || st_ec || (id.size() != 40 && id.size() != 64) ||
-          !detail::hex_id(id))
-        blob.clear();  // only delete an existing hashed regular blob directly inside blobs/
+          (allow_path && !allow_path(from_path(blob))) || !fs::is_regular_file(fs::symlink_status(blob, st_ec)) ||
+          st_ec || (id.size() != 40 && id.size() != 64) || !detail::hex_id(id))
+        blob.clear();  // only delete an existing allowed hashed regular blob directly inside blobs/
     } else {
       const bool hard = fs::hard_link_count(entry, ec) > 1;
       for (fs::directory_iterator b(blobs, ec), bend; !ec && b != bend && blob.empty(); b.increment(ec)) {
+        if (allow_path && !allow_path(from_path(b->path()))) continue;
         std::error_code e2;
         const std::string id = from_path(b->path().filename());
         if ((id.size() != 40 && id.size() != 64) || !detail::hex_id(id) ||
@@ -454,8 +534,10 @@ bool remove_cached(const std::string& repo, const std::string& commit, const std
     ec.clear();
     if (!remove_one(entry)) return false;
     if (!blob.empty() && !referenced(blob) && !remove_one(blob)) return false;
-    for (fs::path d = entry.parent_path(); d != snap && inside(d, snap); d = d.parent_path())
+    for (fs::path d = entry.parent_path(); d != snap && inside(d, snap); d = d.parent_path()) {
+      if (allow_path && !allow_path(from_path(d))) break;
       if (!fs::is_empty(d, ec) || ec || !fs::remove(d, ec)) break;  // the directories it leaves empty
+    }
   }
   return true;
 }

@@ -72,12 +72,15 @@ struct HubOutcome {
 // Validates an RFC 9110 Retry-After header value (non-negative delay-seconds or HTTP-date); returns "" if invalid.
 std::string sanitize_retry_after(std::string_view raw);
 
+// Authorization predicate evaluated BEFORE any target-following stat, open, or descent (true if allowed).
+using PathAllowFn = std::function<bool(std::string_view)>;
+
 // A repository's files at a revision, from the Hub; from the cache when offline, or when the Hub cannot be reached
 // or no longer shows the repository and the cache has the revision.
 bool describe(const std::string& repo, const std::string& revision, Repo* out, std::string* err,
-              HubOutcome* outcome = nullptr);
+              HubOutcome* outcome = nullptr, const PathAllowFn& allow_path = {});
 // The cache's snapshot of a revision (a branch its refs/ names, or a commit), without the Hub.
-bool in_cache(const std::string& repo, const std::string& revision, Repo* out);
+bool in_cache(const std::string& repo, const std::string& revision, Repo* out, const PathAllowFn& allow_path = {});
 
 // A repository as the Hub lists it in a search.
 struct Found {
@@ -192,13 +195,16 @@ using ProgressFn = std::function<void(const Progress&)>;
 // The files on disk, in the cache's snapshot of r.commit, fetched when missing (all of them: `paths` in the same
 // order).  `stop`, when set, ends a fetch early; what came stays for the next try.  progress: about four times a second.
 bool fetch(const Repo& r, const std::vector<RepoFile>& files, std::vector<std::string>* paths,
-           const ProgressFn& progress, const std::atomic<bool>* stop, std::string* err);
+           const ProgressFn& progress, const std::atomic<bool>* stop, std::string* err,
+           const PathAllowFn& allow_path = {});
 // A safetensors file's header (its JSON) at r.commit without the file: two ranged requests (its length, then the
 // header, at most 16 MiB); from the cache when the file is there.  false, with *err, when neither has it.
-bool safetensors_header(const Repo& r, const RepoFile& f, std::string* header, std::string* err);
+bool safetensors_header(const Repo& r, const RepoFile& f, std::string* header, std::string* err,
+                        const PathAllowFn& allow_path = {});
 // A small file's text at r.commit, from the cache when it is there, else from the Hub into memory alone (the cache is
 // left as it was).  false, with *err, for a file of more than `max` bytes or one neither has.
-bool read_text(const Repo& r, const RepoFile& f, uint64_t max, std::string* text, std::string* err);
+bool read_text(const Repo& r, const RepoFile& f, uint64_t max, std::string* text, std::string* err,
+               const PathAllowFn& allow_path = {});
 // Where r.commit's files are (or will be): <cache>/models--org--name/snapshots/<commit>.
 std::string snapshot_dir(const Repo& r);
 
@@ -211,10 +217,9 @@ struct Cached {
   std::vector<RepoFile> files;  // sizes only
   std::vector<std::string> architectures;  // its config.json's, when it has one
 };
-// Authorization predicate evaluated BEFORE any target-following stat, open, or descent (true if allowed).
-using PathAllowFn = std::function<bool(std::string_view)>;
 // Injectable filesystem operations for deterministic tests verifying hub::cached checks allow_path first.
 struct CacheFs {
+  std::function<bool(const std::filesystem::path&, std::error_code&)> is_symlink;
   std::function<bool(const std::filesystem::path&, std::error_code&)> is_directory;
   std::function<bool(const std::filesystem::path&, std::error_code&)> is_regular_file;
   std::function<uint64_t(const std::filesystem::path&, std::error_code&)> file_size;
@@ -231,7 +236,7 @@ std::vector<Cached> cached(const PathAllowFn& allow_path = {}, const CacheFs* fs
 // other entry of the repository's snapshots still refers to, by a link, a hard link or as the blob a copy was made
 // of.  Nothing outside the repository's directory in the cache is touched.  *freed: the bytes given back.
 bool remove_cached(const std::string& repo, const std::string& commit, const std::vector<std::string>& paths,
-                   uint64_t* freed, std::string* err);
+                   uint64_t* freed, std::string* err, const PathAllowFn& allow_path = {});
 
 struct ResolvedSetting {
   std::string value, source;

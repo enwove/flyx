@@ -1473,6 +1473,24 @@ def check_local_posix(open_page, want):
     page.locator('#lset-tabs [data-stab="spec"]').click()
     page.locator("#sd-made").click()
     expect(page.locator('[data-verified="acme/OldRev-DFlash2"]')).to_have_count(1)
+    # Item 5: when /v1/hub/search fails (502) in the background after jumping from Local -> "All its quantizations"
+    # on a cached older revision, the pinned revision detail, its quantizations, and its Load target remain usable.
+    srv.hub_fail = True
+    view(page, "library")
+    page.locator('#src-seg [data-src="local"]').click()
+    page.locator('#lc-list .prow.model[data-model="' + REPO + ':Q4_K_M@oldrev123"]').click()
+    page.locator("#lc-quants").click()
+    expect(page.locator('#src-seg [data-src="hub"]')).to_have_attribute("aria-selected", "true")
+    expect(page.locator("#hf-msg")).to_contain_text("cannot reach the Hub")
+    page.wait_for_timeout(600)  # past the 350ms search debounce while /v1/hub/search fails with 502
+    expect(page.locator("#hf-name")).to_have_text("Tiny-27B-GGUF")
+    expect(page.locator('#mf-files .mrow[data-name="' + REPO + ':Q2_K@oldrev123"]')).to_have_count(1)
+    page.locator('#mf-files .mrow[data-name="' + REPO + ':Q2_K@oldrev123"]').click()
+    expect(page.locator("#mf-load")).to_be_enabled()
+    # Explicitly typing a new query unpins the cached revision so a failed search clears stale detail.
+    page.locator("#hf-q").fill("nonexistent")
+    page.wait_for_timeout(600)
+    expect(page.locator("#hf-name")).to_have_count(0)
     page.close()
 
     # POSIX served model and LoRA with literal backslashes: Serving card LoRA label stays "a\b" and initial Local

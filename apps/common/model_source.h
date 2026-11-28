@@ -106,7 +106,7 @@ std::string dspark_beside(const std::string& model_path, const PathAllowFn& allo
 // once a process), and an inferred drafter's relation is how the Hub says `repo` was made from its base; else the list
 // is the Hugging Face cache's copy, read without the network, and no relation is known.
 std::vector<KnownDrafter> known_drafters(const std::string& repo, const std::vector<std::string>& base_models,
-                                         bool hub);
+                                         bool hub, const PathAllowFn& allow_path = {});
 // The same from drafters.json's text, with `relation` for the inferred ones: none when the text is not version 1 of the
 // list throughout (an entry that is no {base, repo, kind} of strings, a kind of auto, all or none, a repository twice).
 std::vector<KnownDrafter> known_drafters_in(const std::string& list, const std::string& repo,

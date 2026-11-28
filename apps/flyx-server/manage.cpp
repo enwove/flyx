@@ -134,7 +134,7 @@ Listed dir_entry(const apps::LocalModel& m, const apps::PathAllowFn& allow = {})
   if (m.kind == "gguf" || m.kind == "flyx") {  // what its file says it is and comes from
     const flyx::ModelOrigin o = gguf ? flyx::ModelOrigin{"", apps::gguf_header(m.path, allow).base_models}
                                      : flyx::model_origin(m.path, allow);
-    l.json["known_drafters"] = known_drafters_json(m.path, apps::known_drafters(o.repo, o.base_models, false));
+    l.json["known_drafters"] = known_drafters_json(m.path, apps::known_drafters(o.repo, o.base_models, false, allow));
   }
   if (m.kind == "drafter" && !m.drafter_kind.empty()) l.json["drafter_kind"] = m.drafter_kind;
   if (m.parts > 1) l.json["parts"] = m.parts;
@@ -173,7 +173,7 @@ std::vector<Listed> listing(const Server& s, const httplib::Request* req = nullp
             name + suffix,
             apps::known_drafters(c.repo, kind == "gguf" ? apps::gguf_header(disk, allow).base_models
                                                         : flyx::model_origin(disk, allow).base_models,
-                                 false));
+                                 false, allow));
       return l;
     };
     // LoRA adapters (PEFT) with their weights here, by the name that fetches them (org/name, org/name:FOLDER).
@@ -336,7 +336,7 @@ std::string repo_of(const std::string& model) {
 
 // What adapters for `model` are made for: its repository's model card's first base_model (a GGUF repository's: the
 // model it quantizes), or the repository itself when it names none.  *from: "model card" or "model".
-std::string base_of(const std::string& model, std::string* from) {
+std::string base_of(const std::string& model, std::string* from, const apps::PathAllowFn& allow = {}) {
   const std::string repo = repo_of(model);
   if (repo.empty()) return "";
   std::string rev = "main";
@@ -344,7 +344,7 @@ std::string base_of(const std::string& model, std::string* from) {
   if (!on_disk(model) && hub::parse_name(model, &n) && !n.revision.empty()) rev = n.revision;
   hub::Repo r;
   std::string err;
-  if (hub::describe(repo, rev, &r, &err) && !r.base_models.empty()) {
+  if (hub::describe(repo, rev, &r, &err, nullptr, allow) && !r.base_models.empty()) {
     hub::Name b;
     if (hub::parse_name(r.base_models.front(), &b)) return *from = "model card", b.repo;
   }
@@ -429,7 +429,7 @@ ojson repo_json(const hub::Repo& r, const apps::PathAllowFn& allow = {}) {
                           : ojson(nullptr)},
           {"drafter_repo", dflash_gguf_repo},
           {"architectures", r.architectures},
-          {"known_drafters", known_drafters_json(r.id, apps::known_drafters(r.id, r.base_models, true))},
+          {"known_drafters", known_drafters_json(r.id, apps::known_drafters(r.id, r.base_models, true, allow))},
           {"info", r.from_cache ? ojson(nullptr) : info},
           {"runs", runs},
           {"build_architectures", known},
@@ -503,19 +503,21 @@ void add_manage_routes(httplib::Server& http, Server* s) {
     hub::Name name;
     if (!q.has_param("repo") || !hub::parse_name(q.get_param_value("repo"), &name))
       return error(r, 400, "repo: a Hugging Face repository, org/name", "invalid_request_error");
+    const auto allow = remote_path_policy(*s, q);
     hub::Repo repo;
     hub::HubOutcome out;
     std::string err;
-    if (!hub::describe(name.repo, name.revision, &repo, &err, &out)) return hub_error(r, out, err);
-    send_json(r, 200, repo_json(repo, remote_path_policy(*s, q)));
+    if (!hub::describe(name.repo, name.revision, &repo, &err, &out, allow)) return hub_error(r, out, err);
+    send_json(r, 200, repo_json(repo, allow));
   });
   http.Get("/v1/hub/loras", [s](const httplib::Request& q, httplib::Response& r) {
     if (!require_access(*s, q, r, Access::kManage, "loading models")) return;
+    const auto allow = remote_path_policy(*s, q);
     std::string base = q.get_param_value("base"), from = "asked";
     if (base.empty() && q.has_param("model")) {
       const std::string model = q.get_param_value("model");
       if (!require_local_path(*s, q, r, model)) return;
-      base = base_of(model, &from);
+      base = base_of(model, &from, allow);
     }
     if (base.empty()) return send_json(r, 200, {{"base", nullptr}, {"from", nullptr}, {"models", ojson::array()},
                                                 {"next_cursor", nullptr}, {"endpoint", hub::endpoint()}});
@@ -528,7 +530,7 @@ void add_manage_routes(httplib::Server& http, Server* s) {
                           &out))
       return hub_error(r, out, err);
     std::set<std::string> here;  // repositories with an adapter's weights in the cache
-    for (const hub::Cached& c : hub::cached(remote_path_policy(*s, q)))
+    for (const hub::Cached& c : hub::cached(allow))
       for (const hub::RepoFile& f : c.files)
         if (f.path.size() >= 25 && f.path.compare(f.path.size() - 25, 25, "adapter_model.safetensors") == 0) here.insert(c.repo);
     ojson models = ojson::array();
@@ -543,10 +545,11 @@ void add_manage_routes(httplib::Server& http, Server* s) {
     hub::Name name;
     if (!q.has_param("repo") || !hub::parse_name(q.get_param_value("repo"), &name) || !name.quant.empty())
       return error(r, 400, "repo: a Hugging Face repository, org/name[@REV]", "invalid_request_error");
+    const auto allow = remote_path_policy(*s, q);
     hub::Repo repo;
     hub::HubOutcome out;
     std::string err;
-    if (!hub::describe(name.repo, name.revision, &repo, &err, &out)) return hub_error(r, out, err);
+    if (!hub::describe(name.repo, name.revision, &repo, &err, &out, allow)) return hub_error(r, out, err);
     // Each adapter (at most 32), read where it is: its config (at most 64 KiB; a few hundred bytes as PEFT writes it)
     // and its weights' header, into memory alone, kReadsAtOnce adapters at a time (a request's threads and the Hub's
     // connections bounded).  The Hub's files are anyone's: every string of them is checked before it is shown
@@ -560,10 +563,10 @@ void add_manage_routes(httplib::Server& http, Server* s) {
       std::vector<std::string> linears;
       int layers = 0;
     };
-    auto read = [&repo](const hub::AdapterFolder& a) {
+    auto read = [&repo, &allow](const hub::AdapterFolder& a) {
       Read out;
       std::string text, header;
-      if (!hub::read_text(repo, *a.config, 64u << 10, &text, &out.why) ||
+      if (!hub::read_text(repo, *a.config, 64u << 10, &text, &out.why, allow) ||
           !modelfile::peft_config_ok(text, &out.config, &out.why))
         return out;
       if (!a.weights) {
@@ -572,7 +575,7 @@ void add_manage_routes(httplib::Server& http, Server* s) {
         return out;
       }
       // its tensors as --lora reads them (names, dtypes, rank), from the file's header alone
-      if (hub::safetensors_header(repo, *a.weights, &header, &out.why))
+      if (hub::safetensors_header(repo, *a.weights, &header, &out.why, allow))
         modelfile::peft_header_ok(header, out.config.rank, &out.why, &out.linears, &out.layers);
       return out;
     };
@@ -600,16 +603,17 @@ void add_manage_routes(httplib::Server& http, Server* s) {
     if (!require_access(*s, q, r, Access::kManage, "loading models")) return;
     const std::string name = q.get_param_value("name");
     if (!require_local_path(*s, q, r, name)) return;
+    const auto allow = remote_path_policy(*s, q);
     std::error_code ec;
     hub::Name hn;
     std::string kind;
     if (!name.empty() && fs::exists(to_path(name), ec)) {
-      kind = apps::drafter_kind(name, remote_path_policy(*s, q));
+      kind = apps::drafter_kind(name, allow);
     } else if (hub::parse_name(name, &hn)) {
       hub::Repo repo;
       hub::HubOutcome out;
       std::string err;
-      if (!hub::describe(hn.repo, hn.revision, &repo, &err, &out)) return hub_error(r, out, err);
+      if (!hub::describe(hn.repo, hn.revision, &repo, &err, &out, allow)) return hub_error(r, out, err);
       kind = apps::drafter_kind(repo);
     } else {
       return error(r, 400, "name: a drafter's path or Hugging Face name", "invalid_request_error");
@@ -654,7 +658,7 @@ void add_manage_routes(httplib::Server& http, Server* s) {
         if (hub::parse_name(asked, &exact) && seen_ids.insert(exact.repo).second) {
           hub::Repo repo;
           std::string e2;
-          if (hub::describe(exact.repo, exact.revision, &repo, &e2)) {
+          if (hub::describe(exact.repo, exact.revision, &repo, &e2, nullptr, remote_path_policy(*s, q))) {
             hub::Found f;
             f.id = repo.id;
             f.downloads = repo.info.downloads;
@@ -795,8 +799,9 @@ void add_manage_routes(httplib::Server& http, Server* s) {
     for (const Listed& l : all)
       if (l.json["source"] == "hub" && l.repo == it->repo && l.commit == it->commit) ++models_in_snap;
     std::vector<std::pair<std::string, std::string>> orphan_mmproj;  // (repo-relative path, disk path)
+    const auto allow = remote_path_policy(*s, q);
     if (models_in_snap == 1) {
-      for (const hub::Cached& c : hub::cached(remote_path_policy(*s, q))) {
+      for (const hub::Cached& c : hub::cached(allow)) {
         if (c.repo != it->repo || c.commit != it->commit) continue;
         for (const hub::RepoFile& f : c.files) {
           if (hub::mmproj_gguf_name(f.path)) {
@@ -816,7 +821,7 @@ void add_manage_routes(httplib::Server& http, Server* s) {
             std::vector<std::string> to_remove = it->files;
             for (const auto& [rel, disk] : orphan_mmproj)
               if (!in_use(disk, used)) to_remove.push_back(rel);
-            ok = hub::remove_cached(it->repo, it->commit, to_remove, &freed, &err);
+            ok = hub::remove_cached(it->repo, it->commit, to_remove, &freed, &err, allow);
           }
         },
         &err);

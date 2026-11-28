@@ -477,8 +477,8 @@ bool one(const std::string& spec, const hub::ProgressFn& progress, const std::at
     return *err = spec + ": no such file, and not a Hugging Face name (org/name, org/name:QUANT)", false;
   std::vector<hub::RepoFile> files;
   std::vector<std::string> paths;
-  if (!hub::describe(name.repo, name.revision, repo, err) || !hub::select(*repo, name, &files, err) ||
-      !hub::fetch(*repo, files, &paths, progress, stop, err))
+  if (!hub::describe(name.repo, name.revision, repo, err, nullptr, allow_path) || !hub::select(*repo, name, &files, err) ||
+      !hub::fetch(*repo, files, &paths, progress, stop, err, allow_path))
     return false;
   // A drafter's config and safetensors: its directory; else the (first) model file.
   const std::string resolved = files[0].path == "config.json" ? hub::snapshot_dir(*repo) : paths[0];
@@ -529,7 +529,7 @@ constexpr const char* kDraftersFile = "drafters.json";
 // drafters.json: the copy in the Hugging Face cache, read without the network; and, `ask_hub` (a call that talks to the
 // Hub anyway), the Hub's main once a process (asked again after 10 minutes when it could not be had), no lock held
 // while it is asked.  "" when neither has it.
-std::string hub_drafters(bool ask_hub) {
+std::string hub_drafters(bool ask_hub, const PathAllowFn& allow_path = {}) {
   static std::mutex mu;
   static std::string fetched;  // the Hub's, once had
   static std::chrono::steady_clock::time_point tried;
@@ -543,15 +543,18 @@ std::string hub_drafters(bool ask_hub) {
   }
   hub::Repo r;
   std::string err, path;
-  if (ask_hub ? hub::describe(kDraftersRepo, "main", &r, &err) : hub::in_cache(kDraftersRepo, "main", &r))
+  if (ask_hub ? hub::describe(kDraftersRepo, "main", &r, &err, nullptr, allow_path)
+              : hub::in_cache(kDraftersRepo, "main", &r, allow_path))
     for (const hub::RepoFile& f : r.files) {
       std::vector<std::string> paths;
       if (f.path != kDraftersFile || f.size > (1u << 20)) continue;
-      if (ask_hub ? hub::fetch(r, {f}, &paths, {}, nullptr, &err) : (paths.push_back(hub::snapshot_dir(r) + "/" + f.path), true))
+      if (ask_hub ? hub::fetch(r, {f}, &paths, {}, nullptr, &err, allow_path)
+                  : (paths.push_back(hub::snapshot_dir(r) + "/" + f.path), true))
         path = paths[0];
     }
+  if (path.empty() || (allow_path && !allow_path(path))) return "";
   std::ifstream in(to_path(path), std::ios::binary);
-  std::string got = path.empty() ? "" : std::string((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+  std::string got = std::string((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
   if (!nlohmann::json::accept(got)) return "";
   if (ask_hub) {
     std::lock_guard<std::mutex> lock(mu);
@@ -590,9 +593,9 @@ std::vector<KnownDrafter> known_drafters_in(const std::string& list, const std::
 }
 
 std::vector<KnownDrafter> known_drafters(const std::string& repo, const std::vector<std::string>& base_models,
-                                         bool hub) {
+                                         bool hub, const PathAllowFn& allow_path) {
   if (repo.empty() && base_models.empty()) return {};
-  const std::string list = hub_drafters(hub);
+  const std::string list = hub_drafters(hub, allow_path);
   std::vector<KnownDrafter> known = known_drafters_in(list, repo, base_models, "");
   if (hub && std::any_of(known.begin(), known.end(), [](const KnownDrafter& k) { return !k.exact; }))
     known = known_drafters_in(list, repo, base_models, hub::base_relation(repo));
@@ -632,7 +635,7 @@ void suggest_drafters(const hub::Repo& repo, const std::vector<std::string>& dra
   bases.insert(bases.end(), origin.base_models.begin(), origin.base_models.end());
   // A Hub model's load talks to the Hub anyway; a path's reads the cache's copy alone.
   const bool hub_model = !repo.id.empty();
-  for (const KnownDrafter& known : known_drafters(hub_model ? repo.id : origin.repo, bases, hub_model)) {
+  for (const KnownDrafter& known : known_drafters(hub_model ? repo.id : origin.repo, bases, hub_model, allow_path)) {
     const auto named = [&](const std::string& d) { return d.rfind(known.repo, 0) == 0; };
     if (std::any_of(drafters.begin(), drafters.end(), named)) continue;
     out->notes.push_back("a " + known.kind + " drafter verified for " +
@@ -645,7 +648,7 @@ void suggest_drafters(const hub::Repo& repo, const std::vector<std::string>& dra
     hub::Repo cached;
     std::vector<hub::RepoFile> files;
     std::string ignored;
-    if (hub::in_cache(known.repo, "main", &cached) && hub::select(cached, {known.repo}, &files, &ignored)) {
+    if (hub::in_cache(known.repo, "main", &cached, allow_path) && hub::select(cached, {known.repo}, &files, &ignored)) {
       k.size = 0;
       for (const hub::RepoFile& f : files) *k.size += f.size;
     }
@@ -745,7 +748,8 @@ bool fetch_model(const std::string& model, const std::vector<std::string>& draft
                          ? preferred_companion(ggufs, "mmproj") : nullptr;
     if (mm) {
       std::vector<std::string> paths;
-      if (!hub::fetch(repo, mm->choice.parts, &paths, progress, stop, err) || !check_paths(paths)) return false;
+      if (!hub::fetch(repo, mm->choice.parts, &paths, progress, stop, err, allow_path) || !check_paths(paths))
+        return false;
       out->mmproj = paths[0];
       out->mmproj_source = repo.id + "/" + mm->choice.file.path;
       out->mmproj_size = mm->choice.total_size;
@@ -756,7 +760,8 @@ bool fetch_model(const std::string& model, const std::vector<std::string>& draft
   const auto* mtp = need_mtp ? preferred_companion(ggufs, "mtp") : nullptr;
   if (mtp) {
     std::vector<std::string> paths;
-    if (!hub::fetch(repo, mtp->choice.parts, &paths, progress, stop, err) || !check_paths(paths)) return false;
+    if (!hub::fetch(repo, mtp->choice.parts, &paths, progress, stop, err, allow_path) || !check_paths(paths))
+      return false;
     out->drafters.push_back(paths[0]);
     out->drafter_sources.push_back({"mtp", repo.id + "/" + mtp->choice.file.path, mtp->choice.total_size});
     out->notes.push_back("the MTP layer from " + repo.id + "/" + mtp->choice.file.path + " (the model's file has none)");
@@ -765,7 +770,7 @@ bool fetch_model(const std::string& model, const std::vector<std::string>& draft
     if (const auto* ds = preferred_companion(ggufs, "dspark")) {
       const auto& choice = ds->choice;
       std::vector<std::string> paths;
-      if (!hub::fetch(repo, choice.parts, &paths, progress, stop, err) || !check_paths(paths)) return false;
+      if (!hub::fetch(repo, choice.parts, &paths, progress, stop, err, allow_path) || !check_paths(paths)) return false;
       const std::string source = repo.id + "/" + choice.file.path;
       if (is_dspark_file(paths.front(), allow_path)) {
         out->drafters.push_back(paths.front());
@@ -802,7 +807,7 @@ bool fetch_lora(const std::string& spec, const hub::ProgressFn& progress, const 
   if (!hub::parse_adapter_name(spec, &name))
     return *err = spec + ": no such directory, and not a Hugging Face name (org/name, org/name:FOLDER)", false;
   hub::Repo repo;
-  if (!hub::describe(name.repo, name.revision, &repo, err)) return false;
+  if (!hub::describe(name.repo, name.revision, &repo, err, nullptr, allow_path)) return false;
   return fetch_lora_in(repo, spec, name.quant, progress, stop, path, err, allow_path);
 }
 
@@ -845,7 +850,7 @@ bool fetch_lora_in(const hub::Repo& repo, const std::string& spec, const std::st
            false;
   const std::vector<hub::RepoFile> files = {*found->config, *found->weights};
   std::vector<std::string> paths;
-  if (!hub::fetch(repo, files, &paths, progress, stop, err)) return false;
+  if (!hub::fetch(repo, files, &paths, progress, stop, err, allow_path)) return false;
   const std::string dir = from_path(to_path(paths[0]).parent_path());
   if (allow_path) {
     if (!allow_path(dir)) return *err = dir + ": path is not allowed by remote path policy", false;

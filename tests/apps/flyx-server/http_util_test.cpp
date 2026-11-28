@@ -2,13 +2,17 @@
 // Unit tests for flyx-server HTTP security guards: DNS rebinding Host validation, proxy forwarding isolation,
 // keyless LAN management scoping, local-or-keyed restriction (POST /v1/hub/config), and Windows UNC/device path guards.
 #include <algorithm>
+#include <cstdlib>
 #include <filesystem>
+#include <fstream>
 #include <string>
 #include <vector>
 
+#include "apps/common/model_source.h"
 #include "apps/flyx-server/http_util.h"
 #include "apps/flyx-server/server.h"
 #include "core/hub/hub.h"
+#include "core/os/os.h"
 #include "core/os/path.h"
 #include "tests/common/check.h"
 
@@ -409,6 +413,95 @@ void test_remote_unc_and_device_paths() {
         "hub::cached + remote_path_policy never performs target-following ops on UNC symlink entry");
   check(cached.size() == 1 && cached[0].files.size() == 1 && cached[0].files[0].path == "ok.gguf",
         "hub::cached + remote_path_policy keeps local relative blob symlink while skipping UNC symlink");
+
+  // Production-path integration: combine real remote_path_policy with apps::known_drafters, hub::describe offline
+  // fallback, hub::fetch, and hub::remove_cached on a temporary cache tree (cross-platform via PathSafetyProbe).
+  auto set_env = [](const char* name, const std::string& val) {
+#if defined(_WIN32)
+    _putenv_s(name, val.c_str());
+#else
+    setenv(name, val.c_str(), 1);
+#endif
+  };
+  namespace fs = std::filesystem;
+  const fs::path tmp_root =
+      fs::temp_directory_path() / ("flyx-http-util-hub-policy-" + std::to_string(flyx::os::process_id()));
+  std::error_code tec;
+  fs::remove_all(tmp_root, tec);
+  const std::string c_id = "1111111111111111111111111111111111111111";
+  const fs::path drafters_snap = tmp_root / "models--Enwove--flyx-drafters" / "snapshots" / c_id;
+  fs::create_directories(drafters_snap);
+  fs::create_directories(tmp_root / "models--Enwove--flyx-drafters" / "refs");
+  std::ofstream(tmp_root / "models--Enwove--flyx-drafters" / "refs" / "main", std::ios::binary) << c_id;
+  std::ofstream(drafters_snap / "drafters.json", std::ios::binary)
+      << R"({"version":1,"drafters":[{"base":"acme/BaseModel","repo":"acme/BaseModel-DFlash2","kind":"dflash2"}]})";
+  const fs::path repo_dir_fs = tmp_root / "models--acme--demo-GGUF";
+  const fs::path demo_snap = repo_dir_fs / "snapshots" / c_id;
+  fs::create_directories(demo_snap);
+  fs::create_directories(repo_dir_fs / "refs");
+  fs::create_directories(repo_dir_fs / "blobs");
+  std::ofstream(repo_dir_fs / "refs" / "main", std::ios::binary) << c_id;
+  std::ofstream(demo_snap / "ok-Q4_K_M.gguf", std::ios::binary) << "ok";
+  std::ofstream(demo_snap / "unc-evil-Q8_0.gguf", std::ios::binary) << "evil";
+
+  set_env("HF_HUB_CACHE", flyx::os::from_path(tmp_root));
+  set_env("HF_HUB_OFFLINE", "1");
+
+  PathSafetyProbe cache_probe;
+  cache_probe.is_remote_drive = [](char) { return false; };
+  cache_probe.reparse_info = [](std::string_view p) -> ReparseResult {
+    std::string sp(p);
+    std::replace(sp.begin(), sp.end(), '\\', '/');
+    if (sp.find("drafters.json") != std::string::npos || sp.find("unc-evil") != std::string::npos ||
+        sp.find("models--acme--fetch-unc") != std::string::npos)
+      return {ReparseState::kTarget, R"(\\attacker\share\escape.bin)"};
+    return {ReparseState::kNone, {}};
+  };
+  Server policy_srv{};
+  const auto remote_req = make_req("192.168.1.50", "192.168.1.10", 8080, "192.168.1.10:8080");
+  const auto prod_policy = remote_path_policy(policy_srv, remote_req, /*windows_paths=*/true, &cache_probe);
+  check(static_cast<bool>(prod_policy), "remote_path_policy returns active policy for remote peer");
+
+  // 1) Verified drafter lookup respects remote_path_policy (blocked when drafters.json redirects to UNC; allowed otherwise).
+  const auto blocked_drafters = flyx::apps::known_drafters("acme/BaseModel", {}, false, prod_policy);
+  check(blocked_drafters.empty(),
+        "apps::known_drafters blocks UNC-redirected cached drafters.json under remote_path_policy");
+  const auto allowed_drafters = flyx::apps::known_drafters("acme/BaseModel", {}, false, {});
+  check(allowed_drafters.size() == 1 && allowed_drafters[0].repo == "acme/BaseModel-DFlash2",
+        "apps::known_drafters reads valid cached drafters.json when allowed");
+
+  // 2) hub::describe offline fallback filters out UNC-redirected entry via remote_path_policy.
+  flyx::hub::Repo desc;
+  std::string hub_err;
+  check(flyx::hub::describe("acme/demo-GGUF", "main", &desc, &hub_err, nullptr, prod_policy) && desc.from_cache &&
+            desc.files.size() == 1 && desc.files[0].path == "ok-Q4_K_M.gguf",
+        "hub::describe offline fallback + remote_path_policy skips UNC-redirected file: " + hub_err);
+
+  // 3) hub::fetch rejects UNC-redirected repo cache path before creating any directory.
+  flyx::hub::Repo unc_fetch_repo;
+  unc_fetch_repo.id = "acme/fetch-unc";
+  unc_fetch_repo.commit = c_id;
+  unc_fetch_repo.revision = "main";
+  flyx::hub::RepoFile rf;
+  rf.path = "m-Q4_K_M.gguf";
+  rf.size = 8;
+  rf.sha256 = std::string(64, 'a');
+  std::vector<std::string> out_paths;
+  hub_err.clear();
+  check(!flyx::hub::fetch(unc_fetch_repo, {rf}, &out_paths, nullptr, nullptr, &hub_err, prod_policy) &&
+            hub_err.find("remote path policy") != std::string::npos &&
+            !fs::exists(tmp_root / "models--acme--fetch-unc"),
+        "hub::fetch + remote_path_policy rejects UNC-redirected cache dir before creating dirs: " + hub_err);
+
+  // 4) hub::remove_cached refuses to remove UNC-redirected entry under remote_path_policy.
+  uint64_t freed = 0;
+  hub_err.clear();
+  check(!flyx::hub::remove_cached("acme/demo-GGUF", c_id, {"unc-evil-Q8_0.gguf"}, &freed, &hub_err, prod_policy) &&
+            hub_err.find("remote path policy") != std::string::npos && fs::exists(demo_snap / "unc-evil-Q8_0.gguf"),
+        "hub::remove_cached + remote_path_policy refuses UNC-redirected entry: " + hub_err);
+
+  set_env("HF_HUB_OFFLINE", "");
+  fs::remove_all(tmp_root, tec);
 }
 
 }  // namespace

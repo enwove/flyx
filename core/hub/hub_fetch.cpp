@@ -415,7 +415,8 @@ std::string base_relation(const std::string& repo) {
   return str_field(j["baseModels"], "relation");
 }
 
-bool describe(const std::string& repo, const std::string& revision, Repo* out, std::string* err, HubOutcome* outcome) {
+bool describe(const std::string& repo, const std::string& revision, Repo* out, std::string* err, HubOutcome* outcome,
+              const PathAllowFn& allow_path) {
   if (outcome) *outcome = {};
   if (!detail::valid_repo(repo)) {
     *err = "not a Hub repository name: " + repo;
@@ -440,7 +441,7 @@ bool describe(const std::string& repo, const std::string& revision, Repo* out, s
       last_status = status;
       // A repository the Hub no longer shows this machine (gone, made private, a token expired) is still served
       // from the cache when it has the revision.
-      if ((status == 401 || status == 403 || status == 404) && detail::from_cache(repo, r.revision, &r)) {
+      if ((status == 401 || status == 403 || status == 404) && detail::from_cache(repo, r.revision, &r, allow_path)) {
         *out = std::move(r);
         return true;
       }
@@ -512,7 +513,7 @@ bool describe(const std::string& repo, const std::string& revision, Repo* out, s
       net = "the Hub answered " + std::to_string(status);
     }
   }
-  if (detail::from_cache(repo, r.revision, &r)) {
+  if (detail::from_cache(repo, r.revision, &r, allow_path)) {
     *out = std::move(r);
     return true;
   }
@@ -634,11 +635,14 @@ bool file_of(const Repo& r, const RepoFile& f, fs::path* local, os::HttpGet* g, 
 }
 }  // namespace
 
-bool read_text(const Repo& r, const RepoFile& f, uint64_t max, std::string* text, std::string* err) {
+bool read_text(const Repo& r, const RepoFile& f, uint64_t max, std::string* text, std::string* err,
+               const PathAllowFn& allow_path) {
   fs::path local;
   os::HttpGet g;
   if (!file_of(r, f, &local, &g, err)) return false;
   if (f.size > max) return *err = f.path + ": " + std::to_string(f.size) + " bytes, more than " + std::to_string(max), false;
+  if (allow_path && !allow_path(from_path(local)))
+    return *err = from_path(local) + ": path is not allowed by remote path policy", false;
   if (detail::has_size(local, f.size)) {
     std::ifstream in(local, std::ios::binary);
     text->assign(size_t(f.size), '\0');
@@ -653,10 +657,13 @@ bool read_text(const Repo& r, const RepoFile& f, uint64_t max, std::string* text
   return true;
 }
 
-bool safetensors_header(const Repo& r, const RepoFile& f, std::string* header, std::string* err) {
+bool safetensors_header(const Repo& r, const RepoFile& f, std::string* header, std::string* err,
+                        const PathAllowFn& allow_path) {
   fs::path local;
   os::HttpGet file;
   if (!file_of(r, f, &local, &file, err)) return false;
+  if (allow_path && !allow_path(from_path(local)))
+    return *err = from_path(local) + ": path is not allowed by remote path policy", false;
   constexpr uint64_t kMax = modelfile::kSafetensorsHeaderMaxBytes;  // what a load of the file reads
   if (detail::has_size(local, f.size)) {
     std::ifstream in(local, std::ios::binary);
@@ -732,20 +739,35 @@ bool adapters_of(const std::string& base, int limit, std::vector<Found>* out, st
 }
 
 bool fetch(const Repo& r, const std::vector<RepoFile>& files, std::vector<std::string>* paths, const ProgressFn& progress,
-           const std::atomic<bool>* stop, std::string* err) {
+           const std::atomic<bool>* stop, std::string* err, const PathAllowFn& allow_path) {
   paths->clear();
   if (!detail::valid_repo(r.id)) return *err = "not a Hub repository name: " + r.id, false;
   if (!detail::is_commit(r.commit)) return *err = r.id + ": invalid Hub commit: " + r.commit, false;
   if (!r.revision.empty() && !detail::valid_word(r.revision))
     return *err = "not a Hub revision name: " + r.revision, false;
   if (stop && stop->load()) return *err = "stopped", false;
-  const fs::path snap = to_path(snapshot_dir(r)), blobs = detail::repo_dir(r.id) / "blobs";
+  auto check_allow = [&](const fs::path& p) -> bool {
+    if (!allow_path || allow_path(from_path(p))) return true;
+    paths->clear();
+    *err = from_path(p) + ": path is not allowed by remote path policy";
+    return false;
+  };
+  const fs::path repo_root = detail::repo_dir(r.id), snap = to_path(snapshot_dir(r)), blobs = repo_root / "blobs";
+  if (!check_allow(to_path(cache_dir())) || !check_allow(repo_root) || !check_allow(repo_root / "snapshots") ||
+      !check_allow(snap) || !check_allow(blobs))
+    return false;
+  if (!r.revision.empty() && r.revision != r.commit) {
+    const fs::path refs = repo_root / "refs";
+    if (!check_allow(refs) || !check_allow(refs / to_path(r.revision))) return false;
+  }
   Meter meter;
   meter.fn = progress;
   std::vector<Missing> missing;
   for (const RepoFile& f : files) {
-    if (!detail::safe_path(f.path)) return *err = r.id + ": unsafe file path: " + f.path, false;
+    if (!detail::safe_path(f.path)) return paths->clear(), *err = r.id + ": unsafe file path: " + f.path, false;
     const fs::path dst = snap / to_path(f.path);
+    for (fs::path p = dst; !p.empty() && p != snap; p = p.parent_path())
+      if (!check_allow(p)) return false;
     paths->push_back(from_path(dst));
     meter.total += f.size;
     if (detail::has_size(dst, f.size)) {
@@ -753,16 +775,20 @@ bool fetch(const Repo& r, const std::vector<RepoFile>& files, std::vector<std::s
       meter.file = f.path;
       continue;
     }
-    if (r.from_cache) return *err = r.id + ": " + f.path + " is not in the cache, and the Hub is not reached", false;
+    if (r.from_cache)
+      return paths->clear(), *err = r.id + ": " + f.path + " is not in the cache, and the Hub is not reached", false;
     const std::string id = f.sha256.empty() ? f.blob_id : detail::lower(f.sha256);
-    if (!detail::hex_id(id)) return *err = r.id + ": " + f.path + " has no id on the Hub", false;
+    if (!detail::hex_id(id)) return paths->clear(), *err = r.id + ": " + f.path + " has no id on the Hub", false;
     const fs::path blob = blobs / id;
+    if (!check_allow(blob) || !check_allow(to_path(from_path(blob) + ".flyx-lock")) ||
+        !check_allow(to_path(from_path(blob) + ".flyx-part")))
+      return false;
     missing.push_back({&f, blob});
   }
   if (!missing.empty()) {
     std::error_code ec;
     fs::create_directories(blobs, ec);
-    if (ec) return *err = from_path(blobs) + ": " + ec.message(), false;
+    if (ec) return paths->clear(), *err = from_path(blobs) + ": " + ec.message(), false;
   }
   bool checked_space = false;
   for (const auto& [f, blob] : missing) {

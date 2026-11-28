@@ -13,6 +13,7 @@
 #include <condition_variable>
 #include <cstdio>
 #include <filesystem>
+#include <fstream>
 #include <functional>
 #include <memory>
 #include <mutex>
@@ -219,6 +220,49 @@ int main(int argc, char** argv) {
     check(!host.run(blocked, &policy_err) && policy_err.find("remote path policy") != std::string::npos &&
               opens == opens_now,
           "ModelHost::run rejects model path blocked by eo.allow_path before backend open: " + policy_err);
+
+    // Item 1: Scheduler::Scheduler's own tokenizer ModelFile::open must forward eo.allow_path when opening
+    // split GGUF sibling shards, failing with remote path policy before touching the denied shard or backend.
+    const fs::path split1 = config / "policy_split-00001-of-00002.gguf";
+    const fs::path split2 = config / "policy_split-00002-of-00002.gguf";
+    {
+      auto write_u16 = [](std::ofstream& f, uint16_t v) { f.write(reinterpret_cast<const char*>(&v), 2); };
+      auto write_u32 = [](std::ofstream& f, uint32_t v) { f.write(reinterpret_cast<const char*>(&v), 4); };
+      auto write_u64 = [](std::ofstream& f, uint64_t v) { f.write(reinterpret_cast<const char*>(&v), 8); };
+      auto write_str = [&](std::ofstream& f, const std::string& s) {
+        write_u64(f, s.size());
+        f.write(s.data(), std::streamsize(s.size()));
+      };
+      std::ofstream f(split1, std::ios::binary | std::ios::trunc);
+      f.write("GGUF", 4);
+      write_u32(f, 3);  // version
+      write_u64(f, 0);  // n_tensors
+      write_u64(f, 2);  // n_kv
+      write_str(f, "split.no");
+      write_u32(f, 2);  // GGUF_TYPE_UINT16
+      write_u16(f, 0);
+      write_str(f, "split.count");
+      write_u32(f, 2);  // GGUF_TYPE_UINT16
+      write_u16(f, 2);
+    }
+    bool saw_shard2_check = false;
+    ModelHost::Want split_want;
+    split_want.model = os::from_path(split1);
+    split_want.eo = eo;
+    split_want.eo.allow_path = [&](std::string_view p) {
+      if (p.find("00002-of-00002") != std::string_view::npos) {
+        saw_shard2_check = true;
+        return false;
+      }
+      return true;
+    };
+    policy_err.clear();
+    const int opens_before_split = opens;
+    check(!host.run(split_want, &policy_err) && saw_shard2_check &&
+              policy_err.find("remote path policy") != std::string::npos && opens == opens_before_split &&
+              !fs::exists(split2),
+          "ModelHost::run -> Scheduler::Scheduler rejects denied split GGUF sibling shard via eo.allow_path: " +
+              policy_err);
   }
   {
     // Single-lock NetworkSettingsSnapshot coherence: save_network_settings commits on_remote_manage_committed and

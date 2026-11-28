@@ -422,7 +422,13 @@ export function ModelPage({ active, libraryAsked, currentAsked }) {
   const [cursors, setCursors] = useState([""]);
   const [found, setFound] = useState(null);
   const [foundMsg, setFoundMsg] = useState("");
-  const [hubView, dispatchHub] = useReducer(hubViewReducer, EMPTY_HUB_VIEW);
+  const [hubView, rawDispatchHub] = useReducer(hubViewReducer, EMPTY_HUB_VIEW);
+  const hubViewRef = useRef(hubView);
+  hubViewRef.current = hubView;
+  const dispatchHub = (action) => {
+    hubViewRef.current = hubViewReducer(hubViewRef.current, action);
+    rawDispatchHub(action);
+  };
   const [hubCfg, setHubCfg] = useState(null);  // GET /v1/hub/config: {endpoint, default_endpoint, source, offline}
   const [epOpen, setEpOpen] = useState(false);
   const [epText, setEpText] = useState("");
@@ -569,7 +575,9 @@ export function ModelPage({ active, libraryAsked, currentAsked }) {
     if (a.error) {
       setFound(null);
       setFoundMsg(a.error);
-      if (!hubName(text, hubEndpoint)) clearHubDetail();
+      const cur = hubViewRef.current;
+      const pinned = !!(cur && cur.pinned && cur.pinned === cur.sel);
+      if (!hubName(text, hubEndpoint) && !pinned) clearHubDetail();
       return;
     }
     setFound(a.j);
