@@ -298,6 +298,55 @@ def check_vision_upload(page):
     assert not errors, errors
 
 
+def check_thinking(page):
+    """The Thinking box shows the server's default (--no-think, --chat-template-kwargs: telemetry's
+    server.enable_thinking) and a request leaves enable_thinking to the server until the viewer picks a mode."""
+    bodies = []
+    server = {"name": "flyx-server", "enable_thinking": False}
+
+    def api(route):
+        if route.request.method == "POST" and "/chat/completions" in route.request.url:
+            bodies.append(route.request.post_data_json)
+            events = [{"id": "chatcmpl-1", "choices": [{"delta": {"content": "ok"}}]},
+                      {"id": "chatcmpl-1", "choices": [], "usage": {"completion_tokens": 1}}]
+            route.fulfill(content_type="text/event-stream",
+                          body="".join("data: " + json.dumps(e) + "\n\n" for e in events) + "data: [DONE]\n\n")
+        else:
+            route.fulfill(json={"schema_version": 1, "server": server, "model": {"id": "tiny", "context": 4096},
+                                "load": {"state": "ready"}, "state": {"phase": "idle"}, "memory": {"sessions": []},
+                                "rates": {}, "recent": [], "totals": {}}
+                          if "/telemetry" in route.request.url else {})
+
+    def say(text):
+        page.locator("#prompt").fill(text)
+        page.keyboard.press("Enter")
+        expect(page.locator("#msgs .md").last).to_have_text("ok")
+        expect(page.locator("#send")).to_be_enabled()
+        return bodies[-1]
+
+    page.route("**/dashboard/**", lambda route: serve(route, ROOT / "apps/flyx-server/dashboard"))
+    page.route("**/v1/**", api)
+    page.goto("http://[::1]:18479/dashboard/#chat")
+    box = page.locator("#think")
+    expect(box).not_to_be_checked()  # a server started with --no-think
+    assert "chat_template_kwargs" not in say("First"), bodies[-1]
+    box.check()
+    assert say("Second")["chat_template_kwargs"] == {"enable_thinking": True}, bodies[-1]
+    box.uncheck()
+    assert say("Third")["chat_template_kwargs"] == {"enable_thinking": False}, bodies[-1]
+    # A server with no default of its own: the box checked (the template thinks), still nothing sent until picked.
+    server["enable_thinking"] = None
+    page.reload()
+    expect(box).to_be_checked()
+    assert "chat_template_kwargs" not in say("Fourth"), bodies[-1]
+    # A server launched with --chat-template-kwargs '{"reasoning_effort":"none"}', whose telemetry says false for it
+    # (chat_template_kwargs.py checks that it does): a fresh page's box unchecked, and still no override sent.
+    server["enable_thinking"] = False
+    page.reload()
+    expect(box).not_to_be_checked()
+    assert "chat_template_kwargs" not in say("Fifth"), bodies[-1]
+
+
 if __name__ == "__main__":
     cli = argparse.ArgumentParser(description=__doc__)
     cli.add_argument("--browser", choices=("chromium", "msedge"), default="chromium")
@@ -308,6 +357,8 @@ if __name__ == "__main__":
             check(browser.new_page(locale="en-US"))
             check_history(browser.new_page(locale="en-US"))
             check_vision_upload(browser.new_page(locale="en-US"))
+            check_thinking(browser.new_page(locale="en-US"))
         finally:
             browser.close()
-    print("Chat matched completion IDs, handled partial, failed and complete reply streams, kept its history, and attached images.")
+    print("Chat matched completion IDs, handled partial, failed and complete reply streams, kept its history, attached "
+          "images, and left thinking to the server until asked.")

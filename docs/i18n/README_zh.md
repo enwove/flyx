@@ -32,7 +32,7 @@
   <a href="../../llms.txt">llms.txt</a>
 </p>
 
-**FLYX** 是一款零依赖的本地大模型引擎，Windows 单文件 `.exe` 仅约 57 MB：极速投机解码、原生长上下文、逐卡自动调优，免安装、免配置。直接加载受支持的 GGUF 模型，无需转换格式，通过 OpenAI 与 Anthropic 双协议 API 开箱接入浏览器、脚本与主流 Coding Agent。
+**FLYX** 是一款零依赖的本地大模型引擎，Windows 单文件 `.exe` 仅约 58 MB：极速投机解码、原生长上下文、逐卡自动调优，免安装、免配置。直接加载受支持的 GGUF 模型，无需转换格式，通过 OpenAI 与 Anthropic 双协议 API 开箱接入浏览器、脚本与主流 Coding Agent。
 
 <p align="center">
   <img src="../media/dashboard-zh-light.png" width="900" alt="FLYX 内置 Web 控制台：实时吞吐曲线、长上下文会话、显存/内存占比与近期 Agent 请求记录">
@@ -44,7 +44,7 @@
 - **最高 6× 生成加速** — 内置投机解码（MTP、DFlash2、DSpark 与提示查找）：在 RTX 5090 上，Qwen3.8-27B 达 **565.5 tok/s**，Inkling-2-Mini 达 **438.9 tok/s**（[实测性能](#实测性能)）。
 - **消费级 PC 上最高 1M 原生上下文** — 16 GB 显存 + 32 GB 内存即可运行 Inkling-2-Mini 的 1M 上下文。
 - **逐卡调优，告别反复试超参** — 内置 16 款主流 NVIDIA 显卡的实测 kernel 调优表，启动时根据可用显存与内存自动配置上下文长度、KV 精度与显存/内存配比，不再手动折腾卸载层数、batch 和缓存类型。
-- **免安装、免依赖、约 57 MB** — CUDA 与 C++ 运行库全部静态内置，只需 NVIDIA 驱动（≥ 580），不装 CUDA Toolkit、Python 或 Docker。Windows 是单个约 57 MB 的 `.exe`（双击即运行），Linux 为压缩包。
+- **免安装、免依赖、约 58 MB** — CUDA 与 C++ 运行库全部静态内置，只需 NVIDIA 驱动（≥ 580），不装 CUDA Toolkit、Python 或 Docker。Windows 是单个约 58 MB 的 `.exe`（双击即运行），Linux 为压缩包。
 - **自带图形面板 & 终端监控** — 启动自动打开多语言 Web 控制台（中/英/日/韩/德/法/西 7 种语言），带实时状态引导与完整本地化 API 文档；可直接检索加载 Hugging Face 或本地模型、发起对话（文字与图片），并实时查看速度、显存/内存分布、会话上下文、请求详情与日志（[面板说明](../monitor.md)）。
 - **一键接入多个 Coding Agent** — 同时兼容 OpenAI（Chat Completions / Responses）与 Anthropic Messages 协议，支持工具调用与多轮前缀缓存；在面板 **Integration** 页即可**一键选目录拉起 Claude Code 或 Codex CLI**（Windows），或复制命令接入 **DeepSeek Harness、OpenCode、Pi**。
 - **精度可验证，绝不暗中掉点** — 全算子对标 `float64` 参考实现回归测试；默认 FP8 KV 在 27B 上相对 16-bit 的 KL 仅 **0.0009–0.0016**；投机解码与普通解码**逐 token 完全一致**（[精度与数值契约](../design/numerics.md)）。
@@ -90,7 +90,7 @@ v0.2.1 解码速度（tok/s，贪心解码），四卡实测。**普通解码**�
 
 从 [GitHub Releases](https://github.com/enwove/flyx/releases) 下载对应平台包，只需 NVIDIA 驱动（≥ 580）：
 
-- **Windows**：下载单个 `flyx-0.2.1-windows-x86_64-cuda13.exe`，**双击即启动服务并打开浏览器面板**（若 8080 端口被占会自动顺延空闲端口）；也可在 PowerShell 中运行 `.\flyx-0.2.1-windows-x86_64-cuda13.exe serve`。
+- **Windows**：下载单个 `flyx-0.2.2-windows-x86_64-cuda13.exe`，**双击即启动服务并打开浏览器面板**（若 8080 端口被占会自动顺延空闲端口）；也可在 PowerShell 中运行 `.\flyx-0.2.2-windows-x86_64-cuda13.exe serve`。
 - **Linux / WSL2**：解压发布包后运行：
 
 ```sh

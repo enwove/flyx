@@ -1,6 +1,6 @@
 # Copyright 2026 The flyx Authors. SPDX-License-Identifier: Apache-2.0
 cmake_minimum_required(VERSION 3.24)
-project(flyx VERSION 0.2.1 LANGUAGES C CXX)
+project(flyx VERSION 0.2.2 LANGUAGES C CXX)
 
 option(FLYX_CUDA "Build the CUDA backend (needs CUDA 13)" ON)
 option(FLYX_TESTS "Build tests" ON)
@@ -257,6 +257,7 @@ set(FLYX_CLI_SOURCES
     apps/flyx-server/telemetry.cpp apps/flyx-server/model_host.cpp apps/flyx-server/manage.cpp
     apps/flyx-server/request_log.cpp apps/flyx-server/system_log.cpp apps/flyx-server/agent_launch.cpp
     apps/flyx-server/gpu_apps.cpp apps/flyx-server/network.cpp apps/flyx-server/drafter_speeds.cpp
+    apps/flyx-server/hub_search.cpp
     ${FLYX_DASHBOARD_CPP}
     apps/common/engine_flags.cpp apps/common/numbers.cpp apps/common/model_source.cpp)
 set(FLYX_CLI_LIBRARIES flyx_core Threads::Threads)

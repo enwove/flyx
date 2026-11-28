@@ -347,6 +347,8 @@ def main():
             reference = reference_prose(panel)
             if lang == "en":
                 english[("reference", keyed)] = reference
+                # flyx serve's chat defaults beside --no-think (docs/server.md)
+                assert panel.locator("#d-flags code", has_text="--chat-template-kwargs JSON").count() == 1
             else:
                 assert len(reference) == len(english[("reference", keyed)]), lang
                 for (text, words), (en_text, en_words) in zip(reference, english[("reference", keyed)]):

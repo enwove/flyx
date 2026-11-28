@@ -68,9 +68,11 @@ bool fetch_model(const std::string& model, const std::vector<std::string>& draft
                  const std::string& mmproj = "", bool want_vision = true, bool want_dspark = false,
                  const std::string& lora = "", const PathAllowFn& allow_path = {});
 
-// A LoRA adapter as Hugging Face PEFT saves it: a directory as it is, else a Hub repository's adapter_config.json
-// and adapter_model.safetensors fetched into the cache, "org/name" at its top, "org/name:FOLDER" in a folder of it
-// (a repository of several: the folder's path or its last part), "@REV" for a revision.  `path`: the directory.
+// A LoRA adapter as Hugging Face PEFT saves it: a directory as it is (or one of its two files, for their directory:
+// "." for a bare file name; any other file is refused), else a Hub repository's adapter_config.json and
+// adapter_model.safetensors fetched into the cache, "org/name" at its top, "org/name:FOLDER" in a folder of it (a
+// repository of several: the folder's path or its last part), "@REV" for a revision.  `path`: the directory, never
+// empty on success.
 bool fetch_lora(const std::string& spec, const hub::ProgressFn& progress, const std::atomic<bool>* stop,
                 std::string* path, std::string* err, const PathAllowFn& allow_path = {});
 // fetch_lora's part after the repository is described: the adapter `folder` names in `repo` (spec's FOLDER; spec
@@ -84,8 +86,10 @@ bool fetch_lora_in(const hub::Repo& repo, const std::string& spec, const std::st
 // "eagle4"; "" when they say none): a GGUF's header (general.architecture "dflash", or MTP layers), a drafter
 // directory's config.json, a .flyx file's "draft".  The file is not mapped; no name is read for it.
 std::string drafter_kind(const std::string& path, const PathAllowFn& allow_path = {});
-// The same of a Hub repository, from what the Hub says (its config's architecture, its GGUFs' architecture).
-std::string drafter_kind(const hub::Repo& r);
+// The same of what a Hub name selects in `r`: a drafter repository's, as its config says (its architecture); a GGUF's,
+// as its header says once the whole file is in the cache, else "" (never from its name): a GGUF of architecture dflash
+// is a DFlash2 or a DSpark drafter by its own header alone, so the repository's architecture names neither.
+std::string drafter_kind(const hub::Repo& r, const hub::Name& name, const PathAllowFn& allow_path = {});
 
 // Whether `eo` drafts with the MTP layer when the model has one (not --no-spec, not --drafter dflash2 or none).
 bool wants_mtp(const EngineOptions& eo);
@@ -137,6 +141,10 @@ struct GgufClassification {
   std::string arch;          // general.architecture, "" if the header is unreadable
   int mtp_layers = -1;       // <arch>.nextn_predict_layers when valid, -1 if unreadable/invalid
 };
+// The drafter mode a GGUF's header proves, the one a load may be told: architecture dflash's (dspark or dflash2, by
+// its Markov flag), "mtp" for MTP layers, "" otherwise (unread, or a kind only the file's name gives: an mtp-*.gguf of
+// an ordinary model with no MTP layers is "mtp" in drafter_kind, none here), as drafter_kind(path) reads it.
+std::string drafter_mode_of(const GgufClassification& c);
 GgufClassification classify_gguf(const std::string& path, const std::string& rel_name = "", uint64_t size = 0,
                                  std::filesystem::file_time_type modified = std::filesystem::file_time_type::min(),
                                  const PathAllowFn& allow_path = {});
@@ -148,6 +156,10 @@ struct HubGguf {
   std::string disk, selector;
   bool cached = false;
   std::filesystem::file_time_type modified = std::filesystem::file_time_type::min();
+  // The drafter kind the file's own header says (a whole file in the cache, its header read), "" while it is not or
+  // where the header names none: what a load may be told, as drafter_kind(path) reads it, where cls.drafter_kind can
+  // be a guess from the file's name (mtp-*.gguf of an ordinary model with no MTP layers is "mtp" there, none here).
+  std::string header_drafter_kind() const { return cached ? drafter_mode_of(cls) : ""; }
 };
 std::vector<HubGguf> hub_ggufs(const hub::Repo& repo, const PathAllowFn& allow_path = {});
 // The companion of `kind` ("mmproj", "mtp", "dflash2" or "dspark") a repository offers first: the Hub's preferred
@@ -168,7 +180,8 @@ struct LocalModel {
   std::string root;          // canonical scan root that found this entry
   std::string file;          // its name
   std::string kind;          // "gguf", "flyx", "drafter", "mmproj", or "lora" (a PEFT adapter: path its folder)
-  std::string drafter_kind;  // "dflash2", "dspark" or "mtp" when kind == "drafter", else ""
+  std::string drafter_kind;  // "dflash2", "dspark" or "mtp" when kind == "drafter", else "" (the list's: maybe a name's)
+  std::string drafter_mode;  // the mode its header proves (drafter_mode_of): what a load may be told
   std::string quant;         // from the name, "" when it names none
   uint64_t size = 0;
   int parts = 0;             // > 1 for a complete split GGUF (path points to shard 1, size is the sum)

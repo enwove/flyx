@@ -2,15 +2,19 @@
 # A release's Windows packages on a machine without a GPU (.github/workflows/release-smoke.yml runs this on a hosted
 # runner):
 #
-#   pwsh tools/ci/release_smoke_windows.ps1 -Exe EXE -Zip ZIP -Wheel WHEEL -Model tiny.flyx -Results results.tsv
+#   pwsh tools/ci/release_smoke_windows.ps1 -Exe EXE -Zip ZIP -Wheel WHEEL -Model tiny.flyx -Results results.tsv `
+#     -Tag v0.2.2
 #
 # EXE is the single-file executable, ZIP the package (bin\flyx.exe, lib\flyx.dll and the backends, python\), WHEEL the
-# Windows wheel, MODEL the tiny test model (tools/ci/tiny_model.py).  Every check runs whatever the one before it
-# gave, for the executable and for the package's flyx.exe alike:
+# Windows wheel, MODEL the tiny test model (tools/ci/tiny_model.py), TAG the release's tag.  The three files' names
+# say the tag's version; then every check runs whatever the one before it gave, for the executable and for the
+# package's flyx.exe alike:
 #   - the DLLs it imports are Windows' own (no Visual C++ runtime, no CUDA DLL, no driver DLL: dumpbin /dependents);
-#   - flyx --version and flyx --help;
+#   - flyx --version says the tag's version; flyx --help;
 #   - a run on the CUDA backend is refused with a reason, not a crash (no driver here);
-#   - the CLI falls back to the float64 backend and gives a first token of the tiny model (timed);
+#   - a run on the default backend: from 0.2.2 on it is refused too, naming --backend cpu_ref (a CUDA package never
+#     falls back to the float64 reference on its own); before 0.2.2 it fell back and gave a token;
+#   - --backend cpu_ref gives a first token of the tiny model (timed);
 #   - its server answers a completion (packaging/smoke_model.py; the package's Python binding too);
 # then the wheel installed by pip into a new virtual environment generates (packaging/smoke_binding.py).
 # RESULTS gets a line a check: check<TAB>ok|FAIL|expected|skipped<TAB>detail.  Exits 1 when a check failed.
@@ -19,15 +23,21 @@ param(
   [Parameter(Mandatory)] [string] $Zip,
   [Parameter(Mandatory)] [string] $Wheel,
   [Parameter(Mandatory)] [string] $Model,
-  [Parameter(Mandatory)] [string] $Results
+  [Parameter(Mandatory)] [string] $Results,
+  [Parameter(Mandatory)] [string] $Tag
 )
 $ErrorActionPreference = 'Stop'
 $Here = (Resolve-Path (Join-Path $PSScriptRoot '..\..')).Path
 $Exe, $Zip, $Wheel, $Model = ($Exe, $Zip, $Wheel, $Model) | ForEach-Object { (Resolve-Path $_).Path }
-$Work = Join-Path ([IO.Path]::GetTempPath()) ("flyx-smoke-" + [guid]::NewGuid())
-New-Item -ItemType Directory -Force $Work | Out-Null
+# The tag first: one that names no version stops the script before anything is made.
+$Version = $Tag -replace '^v', ''
+$parsed = $null
+if (-not [version]::TryParse($Version, [ref]$parsed)) { throw "the tag '$Tag' names no version (v0.2.2)" }
+# From 0.2.2 on a CUDA package whose CUDA backend cannot run says so instead of falling back to cpu_ref.
+$RefusesCudaByDefault = $parsed -ge [version]'0.2.2'
 Set-Content -Path $Results -Value $null -Encoding utf8NoBOM
 $script:failed = $false
+$Work = Join-Path ([IO.Path]::GetTempPath()) ("flyx-smoke-" + [guid]::NewGuid())
 
 function Write-Result([string] $Check, [string] $Status, [string] $Detail) {
   $line = ($Detail -replace '\s+', ' ').Trim()
@@ -81,7 +91,10 @@ function Test-Cli([string] $Name, [string] $Flyx, [string[]] $SmokeArgs) {
 
   $r = Invoke-Program $Flyx @('--version')
   $starts = $r.Code -eq 0
-  Write-Result "$Name`: flyx --version" ($starts ? 'ok' : 'FAIL') "exit $($r.Code): $($r.Out)$($r.Err)"
+  $says = $r.Out.Trim()
+  if (-not $starts) { Write-Result "$Name`: flyx --version" 'FAIL' "exit $($r.Code): $($r.Out)$($r.Err)" }
+  elseif ($says -ne "flyx $Version") { Write-Result "$Name`: flyx --version" 'FAIL' "says '$says', the tag $Tag" }
+  else { Write-Result "$Name`: flyx --version" 'ok' $says }
   $r = Invoke-Program $Flyx @('--help')
   Write-Result "$Name`: flyx --help" ($r.Code -eq 0 ? 'ok' : 'FAIL') "exit $($r.Code): $((($r.Out + $r.Err) -split "`n")[0])"
 
@@ -93,14 +106,31 @@ function Test-Cli([string] $Name, [string] $Flyx, [string[]] $SmokeArgs) {
   elseif (($r.Out + $r.Err) -notmatch 'no usable backend') { Write-Result "$Name`: no GPU, --backend cuda" 'FAIL' $said }
   else { Write-Result "$Name`: no GPU, --backend cuda" 'expected' $said }
 
-  # The default backend list (cuda, then cpu_ref): it says it falls back, then generates.  Timed from the process's
-  # start to its exit after one token: loading the model, the prompt, the token.
+  # The default backend (cuda, the backend a CUDA package ships): from 0.2.2 on, one that cannot run here is refused
+  # with the reason and the way to the float64 reference, and the CLI never falls back to it on its own (a real model
+  # would run a minute a prompt there).  Before 0.2.2 the CLI fell back to it and generated.
   $r = Invoke-Program $Flyx @('run', $Model, '-p', 'hello', '-n', '1', '--ctx', '128')
-  if (-not $starts) { Write-Result "$Name`: first token (default backend)" 'FAIL' 'flyx does not start here' }
+  $said = "exit $($r.Code): $($r.Out)$($r.Err)"
+  if (-not $starts) { Write-Result "$Name`: no GPU, default backend" 'FAIL' 'flyx does not start here' }
+  elseif (Test-Crashed $r) { Write-Result "$Name`: no GPU, default backend" 'FAIL' "crashed, $said" }
+  elseif (-not $RefusesCudaByDefault) {
+    Write-Result "$Name`: no GPU, default backend" ($r.Code -eq 0 ? 'ok' : 'FAIL') "fell back to cpu_ref (before 0.2.2), $said"
+  }
+  elseif ($r.Code -eq 0) { Write-Result "$Name`: no GPU, default backend" 'FAIL' "generated without a GPU, $said" }
+  elseif (-not ($r.Err.Contains('cuda backend is not usable here') -and $r.Err.Contains('--backend cpu_ref'))) {
+    Write-Result "$Name`: no GPU, default backend" 'FAIL' $said
+  } else { Write-Result "$Name`: no GPU, default backend" 'expected' $said }
+
+  # The float64 backend named: a first token of the tiny model, timed from the process's start to its exit after one
+  # token (loading the model, the prompt, the token).
+  $r = Invoke-Program $Flyx @('run', $Model, '-p', 'hello', '-n', '1', '--ctx', '128', '--backend', 'cpu_ref')
+  if (-not $starts) { Write-Result "$Name`: first token (--backend cpu_ref)" 'FAIL' 'flyx does not start here' }
   elseif ((Test-Crashed $r) -or $r.Code -ne 0) {
-    Write-Result "$Name`: first token (default backend)" 'FAIL' "exit $($r.Code): $($r.Err)"
+    Write-Result "$Name`: first token (--backend cpu_ref)" 'FAIL' "exit $($r.Code): $($r.Err)"
+  } elseif (-not $r.Err.Contains('| 1 tokens in ')) {  # its closing statistics: one token made
+    Write-Result "$Name`: first token (--backend cpu_ref)" 'FAIL' "no token; stderr: $($r.Err)"
   } else {
-    Write-Result "$Name`: first token (default backend)" 'ok' "$($r.Ms) ms, text '$($r.Out.Trim())'; stderr: $($r.Err)"
+    Write-Result "$Name`: first token (--backend cpu_ref)" 'ok' "$($r.Ms) ms, text '$($r.Out.Trim())'; stderr: $($r.Err)"
   }
 
   $out = & python (Join-Path $Here 'packaging\smoke_model.py') $Flyx $Model --backend cpu_ref @SmokeArgs 2>&1 | Out-String
@@ -111,31 +141,40 @@ function Test-Cli([string] $Name, [string] $Flyx, [string[]] $SmokeArgs) {
   }
 }
 
-Test-Cli 'exe' $Exe @('--no-binding')
-
-$unpacked = Join-Path $Work 'zip'
+# The working directory (the zip unpacked, the venv) lives inside this try alone: removed however the checks end.
+New-Item -ItemType Directory -Force $Work | Out-Null
 try {
-  Expand-Archive -Path $Zip -DestinationPath $unpacked
-  $flyx = Get-ChildItem $unpacked -Recurse -Filter flyx.exe | Select-Object -First 1 -ExpandProperty FullName
-  if (-not $flyx) { throw 'no flyx.exe in it' }
-  Write-Result 'zip: unpack' 'ok' "Expand-Archive: $($flyx.Substring($unpacked.Length + 1))"
-  Test-Cli 'zip' $flyx @()
-} catch {
-  Write-Result 'zip: unpack' 'FAIL' "$_"
-}
+  $names = ($Exe, $Zip, $Wheel | ForEach-Object { Split-Path -Leaf $_ }) -join ', '
+  if (@($Exe, $Zip, $Wheel | Where-Object { -not (Split-Path -Leaf $_).StartsWith("flyx-$Version-") }).Count) {
+    Write-Result 'package names' 'FAIL' "$names, the tag $Tag"
+  } else { Write-Result 'package names' 'ok' $names }
 
-$venv = Join-Path $Work 'venv'
-& python -m venv $venv
-$py = Join-Path $venv 'Scripts\python.exe'
-$out = & $py -m pip install --disable-pip-version-check -q $Wheel 2>&1 | Out-String
-if ($LASTEXITCODE -ne 0) {
-  Write-Result 'wheel: pip install' 'FAIL' (($out -split "`n" | Where-Object { $_ -match 'error' } | Select-Object -Last 2) -join ' ')
-} else {
-  Write-Result 'wheel: pip install' 'ok' "$(& $py -m pip --version) installed $(Split-Path -Leaf $Wheel)"
-  $site = & $py -c "import sysconfig; print(sysconfig.get_paths()['platlib'])"
-  $out = & $py -I (Join-Path $Here 'packaging\smoke_binding.py') $site $Model 2>&1 | Out-String
-  Write-Result 'wheel: generate' ($LASTEXITCODE -eq 0 ? 'ok' : 'FAIL') $out
-}
+  Test-Cli 'exe' $Exe @('--no-binding')
 
-Remove-Item -Recurse -Force $Work -ErrorAction SilentlyContinue
+  $unpacked = Join-Path $Work 'zip'
+  try {
+    Expand-Archive -Path $Zip -DestinationPath $unpacked
+    $flyx = Get-ChildItem $unpacked -Recurse -Filter flyx.exe | Select-Object -First 1 -ExpandProperty FullName
+    if (-not $flyx) { throw 'no flyx.exe in it' }
+    Write-Result 'zip: unpack' 'ok' "Expand-Archive: $($flyx.Substring($unpacked.Length + 1))"
+    Test-Cli 'zip' $flyx @()
+  } catch {
+    Write-Result 'zip: unpack' 'FAIL' "$_"
+  }
+
+  $venv = Join-Path $Work 'venv'
+  & python -m venv $venv
+  $py = Join-Path $venv 'Scripts\python.exe'
+  $out = & $py -m pip install --disable-pip-version-check -q $Wheel 2>&1 | Out-String
+  if ($LASTEXITCODE -ne 0) {
+    Write-Result 'wheel: pip install' 'FAIL' (($out -split "`n" | Where-Object { $_ -match 'error' } | Select-Object -Last 2) -join ' ')
+  } else {
+    Write-Result 'wheel: pip install' 'ok' "$(& $py -m pip --version) installed $(Split-Path -Leaf $Wheel)"
+    $site = & $py -c "import sysconfig; print(sysconfig.get_paths()['platlib'])"
+    $out = & $py -I (Join-Path $Here 'packaging\smoke_binding.py') $site $Model 2>&1 | Out-String
+    Write-Result 'wheel: generate' ($LASTEXITCODE -eq 0 ? 'ok' : 'FAIL') $out
+  }
+} finally {
+  Remove-Item -Recurse -Force $Work -ErrorAction SilentlyContinue
+}
 exit ($script:failed ? 1 : 0)

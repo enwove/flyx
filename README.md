@@ -32,7 +32,7 @@
   <a href="llms.txt">llms.txt</a>
 </p>
 
-**FLYX** is a zero-dependency local LLM engine that fits in a single ~57 MB Windows `.exe` — fast speculative decoding, native long context, tuned per GPU, no setup required. Run supported GGUF models as they are and serve them to your browser, scripts, and coding agents over OpenAI- and Anthropic-compatible APIs.
+**FLYX** is a zero-dependency local LLM engine that fits in a single ~58 MB Windows `.exe` — fast speculative decoding, native long context, tuned per GPU, no setup required. Run supported GGUF models as they are and serve them to your browser, scripts, and coding agents over OpenAI- and Anthropic-compatible APIs.
 
 <p align="center">
   <img src="docs/media/dashboard-light.png" width="900" alt="FLYX built-in web dashboard showing live throughput, long-context sessions, VRAM and RAM usage, and recent agent requests">
@@ -44,7 +44,7 @@
 - **Up to 6× faster generation** — Built-in speculative decoding (MTP, DFlash2, DSpark, and prompt lookup): **565.5 tok/s** on Qwen3.8-27B and **438.9 tok/s** on Inkling-2-Mini on an RTX 5090 ([Performance](#performance)).
 - **Up to 1M native context on a consumer PC** — Runs Inkling-2-Mini at 1M context on 16 GB VRAM + 32 GB RAM.
 - **Tuned per GPU, zero manual flags** — Ships measured kernel tuning tables for 16 NVIDIA GPUs and automatically sizes context length, K/V precision, and GPU/RAM placement from available memory. No guessing offload counts, batch sizes, or cache types.
-- **No install, no dependencies, ~57 MB** — CUDA and C++ runtimes are linked in; only the NVIDIA driver (≥ 580) is required. No CUDA Toolkit, Python, or Docker. Single ~57 MB `.exe` on Windows (double-click to run), or a tarball on Linux.
+- **No install, no dependencies, ~58 MB** — CUDA and C++ runtimes are linked in; only the NVIDIA driver (≥ 580) is required. No CUDA Toolkit, Python, or Docker. Single ~58 MB `.exe` on Windows (double-click to run), or a tarball on Linux.
 - **Built-in web dashboard & terminal monitor** — Starts straight into a browser UI (7 languages) with guided next-step hints to search/download Hugging Face or local models, chat (text & images), read localized API docs, and watch live throughput, VRAM/RAM split, sessions, requests, and logs ([monitor guide](docs/monitor.md)).
 - **One-click coding agent integration** — Speaks OpenAI (Chat Completions, Responses) and Anthropic Messages with tool calls and multi-turn prompt reuse. Launch **Claude Code** or **Codex CLI** straight into your project folder from **Integration** (Windows), or copy ready-to-run commands for **DeepSeek Harness, OpenCode, and Pi**.
 - **Verified accuracy** — Every GPU kernel is tested against a `float64` reference; default FP8 K/V stays within **KL 0.0009–0.0016** of 16-bit on 27B; speculative decoding is **token-for-token identical** to plain decoding ([numerics](docs/design/numerics.md)).
@@ -90,7 +90,7 @@ v0.2.1 decode speed in tokens/s, verified on four GPUs (greedy). **Plain** is de
 
 Grab the latest release from [GitHub Releases](https://github.com/enwove/flyx/releases) — requires only an NVIDIA driver (≥ 580):
 
-- **Windows:** Double-click `flyx-0.2.1-windows-x86_64-cuda13.exe` (or run `.\flyx-0.2.1-windows-x86_64-cuda13.exe serve` in PowerShell). The server starts and opens the dashboard automatically (picking another free port if `8080` is busy).
+- **Windows:** Double-click `flyx-0.2.2-windows-x86_64-cuda13.exe` (or run `.\flyx-0.2.2-windows-x86_64-cuda13.exe serve` in PowerShell). The server starts and opens the dashboard automatically (picking another free port if `8080` is busy).
 - **Linux / WSL2:** Extract the tarball and run:
 
 ```sh

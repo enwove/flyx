@@ -64,7 +64,16 @@ def dir_model(folder, file, size, kind="gguf", quant=None):
             "path": folder + "\\" + file, "size": size, "modified": 1.7e9, "revision": None, "current": True, "mtp": None}
 
 
-LOCAL_DRAFTER = dict(dir_model(FOLDER, "helper.gguf", int(0.3 * GB), kind="drafter"), drafter_kind="dflash2")
+LOCAL_DRAFTER = dict(dir_model(FOLDER, "helper.gguf", int(0.3 * GB), kind="drafter"), drafter_kind="dflash2",
+                     drafter_mode="dflash2")
+# An mtp-*.gguf of an ordinary model, no MTP layers in its header: listed as MTP by its name, no mode for a load; in a
+# folder of this machine and in the Hugging Face cache.
+LOCAL_MTP_NAMED = dict(dir_model(FOLDER, "mtp-Plain-Q8_0.gguf", int(0.2 * GB), kind="drafter"), drafter_kind="mtp",
+                       drafter_mode="")
+CACHED_MTP_NAMED = {"name": REPO + ":mtp-Plain-Q8_0.gguf", "kind": "drafter", "drafter_kind": "mtp", "drafter_mode": "",
+                    "source": "hub", "repo": REPO, "quant": None, "file": "mtp-Plain-Q8_0.gguf",
+                    "path": CACHE + "\\mtp-Plain-Q8_0.gguf", "size": int(0.2 * GB), "modified": 1.7e9,
+                    "revision": "abc123", "current": True, "mtp": None, "mmproj": None}
 CATALOG = {"cache": CACHE, "cache_from": "default", "dirs": [FOLDER], "models": [
     hub_model(REPO, "Q4_K_M", int(17.6 * GB), "in-file", mmproj="in-repo"),
     hub_model(REPO, "IQ3_XXS", int(11.8 * GB), "in-repo", mmproj="in-repo"),
@@ -72,14 +81,20 @@ CATALOG = {"cache": CACHE, "cache_from": "default", "dirs": [FOLDER], "models": 
     dir_model(FOLDER, "tiny-bf16.flyx", int(0.4 * GB), "flyx"),
     dir_model(FOLDER, "Other-12B-Q5_K_M.gguf", int(8.9 * GB), quant="Q5_K_M"),
     LOCAL_DRAFTER,
+    LOCAL_MTP_NAMED,
+    CACHED_MTP_NAMED,
     dir_model(FOLDER, "mmproj-BF16.gguf", int(0.9 * GB), kind="mmproj"),
-    {"name": "acme/Tiny-27B-DFlash2", "kind": "drafter", "drafter_kind": "dflash2", "source": "hub", "repo": "acme/Tiny-27B-DFlash2", "size": int(1.9 * GB)},
-    {"name": "acme/Model-DFlash2-GGUF:BF16", "kind": "drafter", "drafter_kind": "dflash2", "source": "hub",
+    {"name": "acme/Tiny-27B-DFlash2", "kind": "drafter", "drafter_kind": "dflash2", "drafter_mode": "dflash2", "source": "hub",
+     "repo": "acme/Tiny-27B-DFlash2", "size": int(1.9 * GB)},
+    {"name": "acme/Model-DFlash2-GGUF:BF16", "kind": "drafter", "drafter_kind": "dflash2", "drafter_mode": "dflash2", "source": "hub",
      "repo": "acme/Model-DFlash2-GGUF", "quant": "BF16", "file": "Model-DFlash2-Draft-BF16.gguf",
      "path": CACHE + "\\Model-DFlash2-Draft-BF16.gguf", "size": int(1.0 * GB), "modified": 1.7e9,
      "revision": "def456", "current": True, "mtp": None, "mmproj": None}]}
+# A next page's cursor as the server makes one for a query's two streams (apps/flyx-server/hub_search.cpp), characters
+# a URL must escape in it: the page hands it back as it came.
+PAGE2_CURSOR = '{"gguf":"eyJ+/=&x","drafters":"a2"}'
 FOUND = {"query": "", "family": True, "architectures": ["qwen35", "qwen3", "inkling2_loop"], "arch": None,
-         "endpoint": "https://huggingface.co", "next_cursor": "page2-tok", "models": [
+         "endpoint": "https://huggingface.co", "next_cursor": PAGE2_CURSOR, "models": [
     {"id": REPO, "downloads": 7383193, "likes": 6300, "updated": "2026-11-12T02:15:52.000Z", "created": None, "pipeline": None,
      "gated": False, "cached": True, "architecture": "qwen35", "runs": True},
     {"id": "acme/Inkling-2-Mini-GGUF", "downloads": 1900000, "likes": 1200, "updated": "2026-11-20T02:15:52.000Z", "created": None,
@@ -96,7 +111,7 @@ FOUND_PAGE2 = {"query": "", "family": True, "architectures": ["qwen35", "qwen3",
 DRAFTER_KINDS = {"./another.gguf": "mtp", "./new-mtp.gguf": "mtp", "./drafts/Speedy": "dspark"}
 
 
-def repository(repo_spec, helper_cached=False):
+def repository(repo_spec, helper_cached=False, mtp_read=True):
     """GET /v1/hub/files: REPO as this build runs it, a dflash GGUF drafter repo, a safetensors drafter repo, or unsupported."""
     repo, _, rev = repo_spec.partition("@")
     rev_sfx = f"@{rev}" if rev and rev != "main" else ""
@@ -107,7 +122,12 @@ def repository(repo_spec, helper_cached=False):
                 "companions": [{"name": repo + ":helper.gguf" + rev_sfx, "path": "helper.gguf",
                                 "file": "helper.gguf", "kind": "dspark" if helper_cached else "drafter",
                                 "drafter_kind": "dspark" if helper_cached else "",
-                                "size": int(0.5 * GB), "cached": helper_cached, "disk": None, "default": True}],
+                                "size": int(0.5 * GB), "cached": helper_cached, "disk": None, "default": True},
+                               # Named as DSpark's, its header not read (not in the cache): listed by its name, its
+                               # mode left to the loader (drafter_kind empty).
+                               {"name": repo + ":dspark-Misnamed-Q8_0.gguf" + rev_sfx, "path": "dspark-Misnamed-Q8_0.gguf",
+                                "file": "dspark-Misnamed-Q8_0.gguf", "kind": "dspark", "drafter_kind": "",
+                                "size": int(0.4 * GB), "cached": False, "disk": None, "default": False}],
                 "info": {"downloads": 12, "likes": 1, "updated": "2026-11-24T02:15:52.000Z", "license": "apache-2.0",
                          "pipeline": "text-generation", "gated": False, "architecture": "dflash",
                          "context": 1048576, "parameters": 495000000}}
@@ -137,7 +157,8 @@ def repository(repo_spec, helper_cached=False):
             "mmproj": {"path": "mmproj-BF16.gguf", "size": int(0.9 * GB), "cached": True} if runs else None,
             "companions": [
                 {"name": repo + ":mtp.gguf" + rev_sfx, "path": "MTP/mtp.gguf", "file": "mtp.gguf", "kind": "mtp",
-                 "size": int(0.6 * GB), "cached": True, "disk": None, "default": True},
+                 "drafter_kind": "mtp" if mtp_read else "", "size": int(0.6 * GB), "cached": True, "disk": None,
+                 "default": True},
                 {"name": repo + ":mmproj-BF16.gguf" + rev_sfx, "path": "mmproj-BF16.gguf", "file": "mmproj-BF16.gguf", "kind": "mmproj",
                  "size": int(0.9 * GB), "cached": True, "disk": None, "default": True},
                 {"name": repo + ":mmproj-F16.gguf" + rev_sfx, "path": "mmproj-F16.gguf", "file": "mmproj-F16.gguf", "kind": "mmproj",
@@ -145,7 +166,8 @@ def repository(repo_spec, helper_cached=False):
             ] if runs else [],
             "info": {"downloads": 7383193, "likes": 6300, "updated": "2026-11-12T02:15:52.000Z", "license": "apache-2.0", "pipeline": None,
                      "gated": False, "architecture": "qwen35" if runs else "gemma4", "context": 262144, "parameters": 27320697856},
-            "ggufs": [{"name": repo + ":" + q + rev_sfx, "quant": q, "size": int(s * GB), "split": False, "parts": 1, "complete": True, "cached": c and runs}
+            "ggufs": [{"name": repo + ":" + q + rev_sfx, "quant": q, "size": int(s * GB), "split": False, "parts": 1, "complete": True, "cached": c and runs,
+                       "disk": CACHE + "\\" + repo.split("/")[1].replace("-GGUF", "") + "-" + q + ".gguf" if c and runs else None}
                       for q, s, c in quants]}
 
 
@@ -272,7 +294,7 @@ class Server:
             cursor = query.get("cursor", [""])[0]
             arch = query.get("arch", [""])[0]
             q_text = query.get("q", [""])[0]
-            if cursor == "page2-tok":
+            if cursor == PAGE2_CURSOR:
                 res = copy.deepcopy(FOUND_PAGE2)
                 res["endpoint"] = self.hub_endpoint
                 return route.fulfill(json=res)
@@ -296,7 +318,7 @@ class Server:
             if self.files_fail:
                 status, msg = self.files_fail
                 return route.fulfill(status=status, json={"error": {"message": msg}})
-            res = repository(query["repo"][0], getattr(self, "helper_cached", False))
+            res = repository(query["repo"][0], getattr(self, "helper_cached", False), getattr(self, "mtp_read", True))
             res["endpoint"] = self.hub_endpoint
             return route.fulfill(json=res)
         if "/v1/hub/dir" in url:
@@ -360,7 +382,9 @@ def check_settings(page, server, want):
         if value != "0":
             expect(page.locator('[data-k="kv_gpu"] .was')).to_contain_text("0")
         confirm(page, "#mf-reload", "Reload")
-        assert server.posted[-1]["kv_gpu"] == (int(value) if value else None) and server.posted[-1]["model"] == want["model"], server.posted[-1]
+        # Cleared beside a loaded model: "auto", as many as fit whatever the server's --kv-gpu (null would keep that
+        # cap while the command line above, without --kv-gpu, sizes it automatically).
+        assert server.posted[-1]["kv_gpu"] == (int(value) if value else "auto") and server.posted[-1]["model"] == want["model"], server.posted[-1]
     page.locator("#mf-vramres").fill("0")
     page.locator("#mf-ramres").fill("0")
     expect(cmd).to_contain_text("--vram-reserve 0")
@@ -747,6 +771,27 @@ def check_hub(page, server, want):
     body = server.posted[-1]  # another model, with the settings of the one served
     assert (body["model"], body["ctx"], body["kv"], body["kv_gpu"], body["drafters"], body["mmproj"]) == (
         REPO + ":Q5_K_M", want["ctx"], want["kv"], want["kv_gpu"], [], None), body
+    # The MTP file's header not read (drafter_kind empty): its badge still MTP, the list's kind, and a model loaded
+    # with it is told no drafter mode, the loader reading the file.
+    server.mtp_read = False
+    page.reload()  # the repository's files asked for again, not the page's copy
+    page.locator("#mv-tabs").wait_for()
+    view(page, "library")
+    page.locator("#hf-q").fill("")
+    page.locator("#hf-q").fill(REPO)
+    expect(page.locator("#hf-name")).to_have_text("Tiny-27B-GGUF")
+    unread = page.locator('#hf-companions .mrow[data-comp$=":mtp.gguf"]')
+    expect(unread).to_have_attribute("data-kind", "mtp")
+    expect(unread).to_contain_text("MTP")
+    q5 = page.locator('#mf-files .mrow[data-name$=":Q5_K_M"]')
+    if q5.get_attribute("aria-selected") != "true":
+        q5.click()
+    unread.click()
+    expect(page.locator("#mf-load")).to_have_text("Switch to this model")
+    confirm(page, "#mf-load", "Switch")
+    body = server.posted[-1]
+    assert (body["model"], body["drafter"], body["drafters"]) == (REPO + ":Q5_K_M", "", [REPO + ":mtp.gguf"]), body
+    server.mtp_read = True
     # Hub mirror endpoint selector: validate bad URL, apply mirror, update links, and reset back to default.
     view(page, "library")
     expect(page.locator("#hf-ep-toggle")).to_contain_text("huggingface.co")
@@ -794,7 +839,9 @@ def check_hub(page, server, want):
         page.locator("#hf-q").fill("acme/Model-DFlash2-GGUF")
         expect(page.locator("#hf-name")).to_have_text("Model-DFlash2-GGUF")
         expect(page.locator("#hf-drafter-repo")).to_be_visible()
-        page.locator(f'#hf-companions .mrow[data-kind="{mode}"]').click()
+        helper = page.locator('#hf-companions .mrow[data-comp$=":helper.gguf"]')
+        expect(helper).to_have_attribute("data-kind", mode or "drafter")  # the list's kind; the mode apart
+        helper.click()
         expect(page.locator("#mf-load")).to_have_text("Draft with it")
         page.locator("#mf-load").click()
         expect(page.locator("#sd-file")).to_have_value("acme/Model-DFlash2-GGUF:helper.gguf")
@@ -802,6 +849,22 @@ def check_hub(page, server, want):
         body = server.posted[-1]
         assert (body["drafter"], body["drafters"]) == (mode, ["acme/Model-DFlash2-GGUF:helper.gguf"]), body
         page.locator("#mf-reset").click()
+    # A companion named as DSpark's whose header is not read: drafted with in auto (no --drafter dspark from its name).
+    view(page, "library")
+    page.locator("#hf-q").fill("")
+    page.locator("#hf-q").fill("acme/Model-DFlash2-GGUF")
+    expect(page.locator("#hf-name")).to_have_text("Model-DFlash2-GGUF")
+    misnamed = page.locator('#hf-companions .mrow[data-comp$=":dspark-Misnamed-Q8_0.gguf"]')
+    expect(misnamed).to_have_attribute("data-kind", "dspark")  # the list says DSpark, by its name
+    expect(misnamed).to_contain_text("DSpark")
+    misnamed.click()
+    page.locator("#mf-load").click()
+    expect(page.locator("#sd-file")).to_have_value("acme/Model-DFlash2-GGUF:dspark-Misnamed-Q8_0.gguf")
+    expect(page.locator("#mf-cmd")).not_to_contain_text("--drafter dspark")
+    confirm(page, "#mf-reload", "Reload")
+    body = server.posted[-1]
+    assert (body["drafter"], body["drafters"]) == ("", ["acme/Model-DFlash2-GGUF:dspark-Misnamed-Q8_0.gguf"]), body
+    page.locator("#mf-reset").click()
     # Typing a safetensors DFlash2 repo org/name auto-opens it without Enter and offers Draft with it.
     view(page, "library")
     page.locator("#hf-q").fill("acme/Model-DFlash2")
@@ -927,7 +990,7 @@ def check_local(page, server):
     expect(folders).to_have_count(3)  # where Hugging Face downloads to, the model directory, the served model's folder
     expect(folders.nth(0).locator(".ps")).to_have_text(CACHE)
     expect(folders.nth(1).locator(".ps")).to_have_text(FOLDER)
-    expect(models).to_have_count(9)  # #4 added a cached Hub GGUF drafter, #31 a local one
+    expect(models).to_have_count(11)  # #4 added a cached Hub GGUF drafter, #31 a local one, #84 an mtp-*.gguf in each
     one = page.locator('#lc-list .prow.model[data-model="' + REPO + ':IQ3_XXS"]')
     expect(one.locator(".pn")).to_have_text("Tiny-27B-GGUF · IQ3_XXS")
     expect(one.locator(".pm")).to_have_text("11.8 GB")
@@ -968,6 +1031,20 @@ def check_local(page, server):
     expect(page.locator("#lc-quants")).to_be_visible()
     expect(page.locator("#mf-load")).to_have_text("Draft with it")
     expect(page.locator("#mf-load")).to_be_enabled()
+    # The mtp-*.gguf of an ordinary model, in the cache and in this machine's folder: an MTP chip by its name, and drafted
+    # with in auto (its drafter_mode empty), never --drafter mtp.
+    for name, spec in ((CACHED_MTP_NAMED["name"], CACHED_MTP_NAMED["path"]), (LOCAL_MTP_NAMED["name"], LOCAL_MTP_NAMED["path"])):
+        page.locator('#lc-list .prow.model[data-model="%s"]' % selector(name)).click()
+        expect(page.locator("#lc-detail .dchips")).to_contain_text("MTP")
+        expect(page.locator("#mf-load")).to_have_text("Draft with it")
+        page.locator("#mf-load").click()
+        expect(page.locator("#sd-file")).to_have_value(spec)
+        expect(page.locator("#mf-cmd")).not_to_contain_text("--drafter mtp")
+        confirm(page, "#mf-reload", "Reload")
+        body = server.posted[-1]
+        assert (body["drafter"], body["drafters"]) == ("", [spec]), body
+        page.locator("#mf-reset").click()
+        view(page, "library")
     page.locator('#lc-list .prow.model[data-model$="mmproj-BF16.gguf"]').click()
     expect(page.locator("#lc-detail")).to_contain_text("vision projector")
     expect(page.locator("#lc-detail .banner button")).to_have_count(0)
@@ -990,7 +1067,7 @@ def check_local(page, server):
     page.locator("#mf-reset").click()
     view(page, "library")
     folders.nth(1).click()
-    expect(page.locator("#lc-companions .mrow")).to_have_count(2)
+    expect(page.locator("#lc-companions .mrow")).to_have_count(3)
     page.locator('#lc-companions .mrow[data-comp$="helper.gguf"]').click()
     page.locator('#mf-cached .mrow[data-name$="Other-12B-Q5_K_M.gguf"]').click()
     page.locator('#lc-companions .mrow[data-comp$="mmproj-BF16.gguf"]').click()
@@ -1027,12 +1104,13 @@ def check_local(page, server):
     expect(page.locator(".modal")).to_have_count(0)
     folders.nth(0).click()
     page.locator('.rgroup[data-repo="' + REPO + '"] .rgroup-h .del').click()
-    expect(page.locator(".modal")).to_contain_text("2 files")
+    expect(page.locator(".modal")).to_contain_text("3 files")  # its two quantizations and the mtp-*.gguf
     page.locator(".modal").get_by_role("button", name="Delete").click()
     expect(page.locator(".modal")).to_have_count(0)
     page.wait_for_function("() => true")
     page.wait_for_timeout(600)  # its files go one after another
-    assert server.deleted == ["acme/Tiny-4B-GGUF:Q8_0", REPO + ":Q4_K_M", REPO + ":IQ3_XXS"], server.deleted
+    assert sorted(server.deleted) == sorted(["acme/Tiny-4B-GGUF:Q8_0", REPO + ":Q4_K_M", REPO + ":IQ3_XXS",
+                                             CACHED_MTP_NAMED["name"]]), server.deleted
     # Where no dialog can be shown, the folders are browsed in the page.
     server.dialog = (501, {"error": {"message": "no desktop to show a folder dialog on: no display"}})
     page.locator("#mf-add").click()
@@ -1177,6 +1255,87 @@ def check_nothing_served(page, server, remembered):
     page.locator("#act-explore").click()
     expect(page.locator("#tab-model")).to_be_visible()
     expect(page.locator("#mv-library")).to_be_visible()
+
+
+def check_fit(open_page, remembered):
+    """The fit tags: a file's size against the GPU memory a model may take as the server's planner counts it
+    (telemetry's memory.device_reserve, or the loaded model's ledger_budget), said to be the file's alone; never a
+    model's assumed overheads, and "?" where the server does not say (a measure without one of its parts too).  The
+    model served, by whatever name it was loaded, by the engine's own bill.  The titles in the page's language."""
+    def fit(page, quant):
+        return page.locator('#mf-files .mrow[data-name$=":%s"] .fit .tag2' % quant)
+
+    def title_has(page, quant, *figures):  # the figures in the title, in any language's sentence
+        title = fit(page, quant).get_attribute("title")
+        assert all(f in title for f in figures), (quant, figures, title)
+
+    tm = telemetry(None, remembered)
+    tm["device"] = {"name": "GPU", "mem_total": 16 * 2**30, "mem_used": 2**30}
+    tm["memory"] = {"sessions": [], "device_reserve": 2**29}  # 14.5 GiB (15.57 GB) for a model
+    page, _ = open_page(tm)
+    expect(fit(page, "IQ3_XXS")).to_have_text("file fits")  # 11.8 GB
+    title_has(page, "IQ3_XXS", "11.8 GB", "14.5 GiB", "0.5 GiB")
+    expect(fit(page, "Q4_K_M")).to_have_text("file too big")  # 17.6 GB
+    page.close()
+    # The same in another language: its words for the tag, and the title's figures in its own sentence.
+    page, _ = open_page(tm, locale="zh-CN")
+    expect(fit(page, "IQ3_XXS")).to_have_text("文件放得下")
+    expect(fit(page, "Q4_K_M")).to_have_text("文件放不下")
+    title_has(page, "IQ3_XXS", "仅按文件计", "11.8 GB", "14.5 GiB", "0.5 GiB")
+    page.close()
+    tm["device"]["mem_used"] = 6 * 2**30  # other programs took 5 GiB more: 9.5 GiB left
+    page, _ = open_page(tm)
+    expect(fit(page, "IQ3_XXS")).to_have_text("file too big")
+    page.close()
+    # A reserve of 0, and a file exactly the size of what is left: fits, the reserve shown as 0.0, not as unknown.
+    tm["device"] = {"name": "GPU", "mem_total": int(11.8 * GB) + 2**30, "mem_used": 2**30}
+    tm["memory"] = {"sessions": [], "device_reserve": 0}
+    page, _ = open_page(tm)
+    expect(fit(page, "IQ3_XXS")).to_have_text("file fits")
+    title_has(page, "IQ3_XXS", "11.8 GB", "11.0 GiB", "0.0 GiB")
+    page.close()
+    for unknown in ({"mem_total": 16 * 2**30}, {"mem_total": 16 * 2**30, "mem_used": None}):  # no used bytes: not 0
+        tm["device"] = dict(unknown, name="GPU")
+        tm["memory"] = {"sessions": [], "device_reserve": 2**29}
+        page, _ = open_page(tm)
+        expect(fit(page, "IQ3_XXS")).to_have_text("?")
+        page.close()
+    tm["device"] = {"name": "GPU", "mem_total": 16 * 2**30, "mem_used": 2**30}
+    tm["memory"] = {"sessions": []}  # a server that does not say its reserve: no guess at one
+    page, _ = open_page(tm)
+    expect(fit(page, "IQ3_XXS")).to_have_text("?")
+    page.close()
+    # A model served, loaded by the repository's name alone: the others against its budget (the engine's, other
+    # programs and the reserve out); its own row (the file GET /v1/load says it serves) by the engine's own bill, as
+    # the one served.  11.9 GB of the 12 GB budget used: the ledger takes no more than its budget.
+    served = dict(remembered, model=REPO, lora="acme/Tiny-27B-coder-lora", name="tiny-api",
+                  mmproj=REPO + ":mmproj-BF16.gguf", drafter="mtp", drafters=[REPO + ":mtp.gguf"])
+    tm = telemetry(served)
+    tm["load"]["loaded_file"] = CACHE + "\\Tiny-27B-Q4_K_M.gguf"
+    tm["memory"] = {"sessions": [], "ledger_budget": 12 * GB, "ledger_used": int(11.9 * GB), "device_reserve": 2**29}
+    page, server = open_page(tm)
+    view(page, "library")
+    page.locator('#hf-list .prow[data-repo="%s"]' % REPO).click()
+    expect(fit(page, "IQ3_XXS")).to_have_text("file fits")  # 11.8 GB of 12
+    expect(fit(page, "Q5_K_M")).to_have_text("file too big")
+    expect(fit(page, "Q4_K_M")).to_have_text("fits")  # 17.6 GB on disk, served in 11.9 GB
+    title_has(page, "Q4_K_M", "11.1", "11.2 GiB")
+    expect(page.locator('#mf-files .mrow[data-name$=":Q4_K_M"] .tag2.live')).to_have_count(1)  # "serving"
+    # Its row chosen: the model served, nothing to switch to; a setting changed, a reload of the load as it was asked
+    # (by the repository's name), its LoRA, projector, drafter and API name kept.
+    page.locator('#mf-files .mrow[data-name$=":Q4_K_M"]').click()
+    expect(page.locator("#mf-load")).to_have_text("Loaded")
+    expect(page.locator("#mf-load")).to_be_disabled()
+    expect(page.locator("#mf-chosen-s")).to_contain_text("This is the model being served.")
+    view(page, "current")
+    page.locator("#mf-ctx").fill("4096")
+    view(page, "library")
+    expect(page.locator("#mf-load")).to_have_text("Reload with these settings")
+    confirm(page, "#mf-load", "Reload")
+    body = server.posted[-1]
+    assert (body["model"], body["ctx"], body["lora"], body["name"], body["mmproj"], body["drafter"], body["drafters"]) == (
+        REPO, 4096, served["lora"], "tiny-api", served["mmproj"], "mtp", served["drafters"]), body
+    page.close()
 
 
 def check_vram_apps(open_page, want):
@@ -1536,6 +1695,10 @@ def check_local_posix(open_page, want):
     view(page2, "library")
     page2.locator('#src-seg [data-src="local"]').click()
     expect(page2.locator("#lc-list .prow.folder")).to_have_count(5)
+    for _ in range(50):  # the folder's listing is asked for after the list is drawn
+        if srv2.dir_asked:
+            break
+        page2.wait_for_timeout(100)
     assert "/models" in srv2.dir_asked and "/models/a" not in srv2.dir_asked, srv2.dir_asked
     page2.close()
 
@@ -1544,8 +1707,8 @@ def check(browser):
     want = {"model": "./models/Local [27B] & O'Brien.gguf", "ctx": 8192, "kv": "fp8", "kv_gpu": 0, "kv_ram": 4}
     errors = []
 
-    def open_page(tm, **dialog):
-        page = browser.new_page(locale="en-US")
+    def open_page(tm, locale="en-US", **dialog):
+        page = browser.new_page(locale=locale)
         page.on("pageerror", lambda error: errors.append(str(error)))
         server = Server(page, tm, **dialog)
         page.goto(ORIGIN + "/dashboard/#model")
@@ -1575,6 +1738,7 @@ def check(browser):
     page, server = open_page(telemetry(None, remembered))
     check_nothing_served(page, server, remembered)
     page.close()
+    check_fit(open_page, remembered)
     assert not errors, errors
 
 

@@ -15,6 +15,7 @@ Checks:
 """
 from __future__ import annotations
 
+import json
 import os
 from pathlib import Path
 import re
@@ -247,6 +248,19 @@ def main(root: str) -> int:
             bad.append(f"{_CUDA_BACKEND}: kEnvAliases gives `{env}` to `{option}`, which is no backend option")
         if env in env_rows and f"`{option}`" not in env_rows[env]:
             bad.append(f"docs/server.md: the `{env}` row must name the backend option it sets, `{option}`")
+
+    # Every FLYX_* setting the table lists is cleared for the tests (test preset test-base, which tests/CMakeLists.txt
+    # also applies to a plain ctest): a shell's FLYX_WARM=0 or FLYX_LIB would otherwise reach every test run in it.
+    try:
+        presets = json.loads(_read(os.path.join(root, "CMakePresets.json")))
+        base = next(p for p in presets.get("testPresets", []) if p.get("name") == "test-base")
+        cleared = {k for k, v in base.get("environment", {}).items() if v == ""}
+    except (ValueError, StopIteration) as e:
+        bad.append(f"CMakePresets.json: no test preset test-base to read ({e!r})")
+        cleared = None
+    if cleared is not None:
+        for var in sorted(v for v in env_rows if v.startswith("FLYX_") and v not in cleared):
+            bad.append(f'CMakePresets.json: test preset test-base must clear `{var}` (docs/server.md lists it): "{var}": ""')
 
     for b in bad:
         print("FAIL", b)

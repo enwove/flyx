@@ -8,7 +8,10 @@
 #include <cstdio>
 #include <filesystem>
 #include <fstream>
+#include <functional>
 #include <initializer_list>
+#include <optional>
+#include <thread>
 
 #include "apps/common/defaults.h"
 #include "apps/common/numbers.h"
@@ -34,7 +37,7 @@ ojson want_json(const ModelHost::Want& w) {
           {"speculative", w.eo.speculative},
           {"kv", w.eo.kv == FLYX_KV_FP8 ? ojson("fp8") : w.eo.kv == FLYX_KV_16 ? ojson("16") : ojson(nullptr)},
           {"kv_ram", w.eo.kv_ram < 0 ? ojson("auto") : ojson(double(w.eo.kv_ram) / 1e9)},
-          {"kv_gpu", w.eo.kv_gpu < 0 ? ojson(nullptr) : ojson(w.eo.kv_gpu)},
+          {"kv_gpu", w.eo.kv_gpu < 0 ? ojson("auto") : ojson(w.eo.kv_gpu)},
           {"vram_reserve", w.eo.vram_reserve < 0 ? ojson("auto") : ojson(double(w.eo.vram_reserve) / 1e9)},
           {"ram_reserve", w.eo.ram_reserve < 0 ? ojson("auto") : ojson(double(w.eo.ram_reserve) / 1e9)},
           {"width", w.eo.width < 0 ? ojson(nullptr) : ojson(w.eo.width)},
@@ -56,19 +59,99 @@ std::mutex& settings_mutex() {
   return mu;
 }
 
-ojson read_settings_locked() {
-  std::ifstream f(to_path(ModelHost::settings_path()), std::ios::binary);
-  if (!f) return nullptr;
-  try {
-    return ojson::parse(f);
-  } catch (const std::exception&) {
-    return nullptr;
+// serve.json held by this process's threads (settings_mutex) and by every other flyx server sharing the file
+// (serve.json.lock, as drafter_speeds.cpp keeps its file), so that one's read-modify-replace never writes back what
+// another has just changed: a LAN setting turned off coming back on, a saved model undone.  Reads take it too, and
+// open the file only when they have it: on Windows a replace fails while another process holds the file open.  A
+// writer waits 5 s for it at most, a reader (telemetry's, a second) 1 s: it has the settings last read to fall back on.
+class SettingsLock {
+ public:
+  explicit SettingsLock(int wait_ms) : guard_(settings_mutex()) {
+    const std::string path = ModelHost::settings_path();
+    if (path.empty()) {  // no file to share
+      held_ = true;
+      return;
+    }
+    std::error_code ec;
+    fs::create_directories(to_path(path).parent_path(), ec);
+    file_.emplace(path + ".lock");
+    for (int waited = 0;; waited += 25) {
+      const os::FileLock::Result r = file_->try_lock(&why_);
+      if (r == os::FileLock::Result::kLocked) {
+        held_ = true;
+        return;
+      }
+      if (r == os::FileLock::Result::kError) return;
+      if (waited >= wait_ms) {
+        why_ = path + ".lock: held by another flyx server for " + std::to_string(wait_ms / 1000) + " s";
+        return;
+      }
+      std::this_thread::sleep_for(std::chrono::milliseconds(25));
+    }
   }
+  bool held() const { return held_; }
+  const std::string& why() const { return why_; }
+
+ private:
+  std::lock_guard<std::mutex> guard_;
+  std::optional<os::FileLock> file_;
+  bool held_ = false;
+  std::string why_;
+};
+constexpr int kSettingsWriteWaitMs = 5000, kSettingsReadWaitMs = 1000;
+
+// The settings as this process last read or wrote them (under settings_mutex): what a reader is given while
+// serve.json cannot be read.
+ojson& last_known_settings() {
+  static ojson root = ojson::object();
+  return root;
 }
 
-ojson read_settings() {
-  std::lock_guard<std::mutex> lock(settings_mutex());
-  return read_settings_locked();
+// Why the settings could not be read, on standard error once a reason (telemetry reads them every second).
+void say_settings_problem(const std::string& why) {
+  static std::string said;
+  if (why == said) return;
+  std::fprintf(stderr, "flyx-server: %s\n", why.c_str());
+  said = why;
+}
+
+// serve.json's object, under SettingsLock: an empty one while there is no file.  false, with *err, for a file that
+// is there but cannot be read, is not JSON, or holds no object: a save then leaves its bytes as they are (the last
+// model, the network settings in it are not thrown away for an empty object).
+bool read_settings_locked(ojson* root, std::string* err) {
+  *root = ojson::object();
+  const std::string path = ModelHost::settings_path();
+  if (path.empty()) return true;
+  const fs::path p = to_path(path);
+  std::error_code ec;
+  const fs::file_status st = fs::status(p, ec);
+  if (st.type() == fs::file_type::not_found) return true;
+  const std::string keep = " (left as it is: mend or remove it to save settings)";
+  if (ec) return *err = path + ": " + ec.message() + keep, false;
+  std::string text;
+  if (!read_whole_file(path, &text)) return *err = path + ": cannot be read" + keep, false;
+  ojson j = ojson::parse(text, nullptr, /*allow_exceptions=*/false);
+  if (j.is_discarded()) return *err = path + ": not JSON" + keep, false;
+  if (!j.is_object()) return *err = path + ": holds no JSON object" + keep, false;
+  *root = std::move(j);
+  return true;
+}
+
+// The settings for a reader holding `lock`: the file's, else the ones this process last read or wrote, *why saying
+// why not (the lock not had: the file is then not opened; the file unreadable).
+ojson read_settings_with(const SettingsLock& lock, std::string* why) {
+  std::string err;
+  ojson root;
+  if (!lock.held()) err = "could not read settings from " + ModelHost::settings_path() + ": " + lock.why();
+  else if (read_settings_locked(&root, &err)) return last_known_settings() = std::move(root);
+  say_settings_problem(err);
+  if (why) *why = err;
+  return last_known_settings();
+}
+
+ojson read_settings(std::string* why = nullptr) {
+  SettingsLock lock(kSettingsReadWaitMs);
+  return read_settings_with(lock, why);
 }
 
 bool write_settings_locked(const ojson& root, std::string* err) {
@@ -83,10 +166,33 @@ bool write_settings_locked(const ojson& root, std::string* err) {
   f.close();
   if (f) fs::rename(tmp, p, ec);
   if (!f || ec) {
+    const std::string cause = ec ? ": " + ec.message() : "";
     fs::remove(tmp, ec);
-    if (err) *err = "could not save settings to " + ModelHost::settings_path();
+    if (err) *err = "could not save settings to " + ModelHost::settings_path() + cause;
     return false;
   }
+  return true;
+}
+
+// serve.json's object as it is now, `change` applied and written back under SettingsLock; `committed`, with what
+// was written, before the lock is let go.  Nothing is written where the file cannot be read as an object.
+bool update_settings(const std::function<void(ojson&)>& change, std::string* err,
+                     const std::function<void(const ojson&)>& committed = {}) {
+  SettingsLock lock(kSettingsWriteWaitMs);
+  if (!lock.held()) {
+    if (err) *err = "could not save settings to " + ModelHost::settings_path() + ": " + lock.why();
+    return false;
+  }
+  ojson root;
+  std::string why;
+  if (!read_settings_locked(&root, &why)) {
+    if (err) *err = "could not save settings: " + why;
+    return false;
+  }
+  change(root);
+  if (!write_settings_locked(root, err)) return false;
+  last_known_settings() = root;
+  if (committed) committed(root);
   return true;
 }
 
@@ -177,16 +283,37 @@ void save_settings(const ModelHost::Want& w) {
   for (size_t i = 0; i < w.drafters.size(); ++i) last["drafters"][i] = remember_path(w.drafters[i]);
   if (!w.eo.mmproj_file.empty()) last["mmproj"] = remember_path(w.eo.mmproj_file);
   if (!w.eo.lora_file.empty()) last["lora"] = remember_path(w.eo.lora_file);
-  std::lock_guard<std::mutex> lock(settings_mutex());
-  ojson root = read_settings_locked();
-  if (!root.is_object()) root = ojson::object();
-  root["last"] = std::move(last);
   std::string err;
-  if (!write_settings_locked(root, &err))
-    std::fprintf(stderr, "flyx-server: could not save the last model to %s\n", ModelHost::settings_path().c_str());
+  if (!update_settings([&](ojson& root) { root["last"] = std::move(last); }, &err))
+    std::fprintf(stderr, "flyx-server: could not save the last model: %s\n", err.c_str());
 }
 
 }  // namespace
+
+bool read_chunks(const ChunkSource& src, std::string* text) {
+  text->clear();
+  char chunk[1 << 14];
+  for (;;) {
+    const size_t got = src.read(chunk, sizeof chunk);
+    text->append(chunk, got);
+    if (got < sizeof chunk) break;  // the end, or an error: which, the stream's own state says
+  }
+  return !src.error() && src.at_end();
+}
+
+bool read_whole_file(const std::string& path, std::string* text) {
+#if defined(_WIN32)
+  std::FILE* f = _wfopen(to_path(path).c_str(), L"rb");
+#else
+  std::FILE* f = std::fopen(path.c_str(), "rb");
+#endif
+  if (!f) return false;
+  const bool whole = read_chunks({[f](char* b, size_t n) { return std::fread(b, 1, n, f); },
+                                  [f] { return std::ferror(f) != 0; }, [f] { return std::feof(f) != 0; }},
+                                 text);
+  std::fclose(f);
+  return whole;
+}
 
 bool want_from_json(const ojson& j, const EngineOptions& base, ModelHost::Want* w, std::string* err) {
   if (!j.is_object() || !j.contains("model") || !j["model"].is_string() || j["model"].get<std::string>().empty())
@@ -252,10 +379,14 @@ bool want_from_json(const ojson& j, const EngineOptions& base, ModelHost::Want* 
   };
   // Host memory for the K/V past the GPU's part: GB, or "auto"; absent: the server's own setting.
   if (!parse_gb_field("kv_ram", "GB of host memory", &out.eo.kv_ram)) return false;
+  // The K/V positions on the GPU at most: a whole number, or "auto" (as many as fit, whatever the server's --kv-gpu);
+  // absent or null: the server's own setting.
   if (j.contains("kv_gpu") && !j["kv_gpu"].is_null()) {
-    if (!j["kv_gpu"].is_number_integer() || j["kv_gpu"].get<int64_t>() < 0 || j["kv_gpu"].get<int64_t>() > INT32_MAX)
-      return *err = "\"kv_gpu\": positions, a whole number", false;
-    out.eo.kv_gpu = j["kv_gpu"].get<int>();
+    const bool automatic = j["kv_gpu"].is_string() && j["kv_gpu"].get<std::string>() == "auto";
+    if (!automatic && (!j["kv_gpu"].is_number_integer() || j["kv_gpu"].get<int64_t>() < 0 ||
+                       j["kv_gpu"].get<int64_t>() > INT32_MAX))
+      return *err = "\"kv_gpu\": positions, a whole number, or \"auto\"", false;
+    out.eo.kv_gpu = automatic ? -1 : j["kv_gpu"].get<int>();
   }
   if (!parse_gb_field("vram_reserve", "GB to keep free", &out.eo.vram_reserve)) return false;
   if (!parse_gb_field("ram_reserve", "GB to keep free", &out.eo.ram_reserve)) return false;
@@ -390,12 +521,12 @@ std::string ModelHost::remembered_hub_endpoint() {
 }
 
 bool ModelHost::save_hub_endpoint(const std::string& endpoint, std::string* err) {
-  std::lock_guard<std::mutex> lock(settings_mutex());
-  ojson root = read_settings_locked();
-  if (!root.is_object()) root = ojson::object();
-  if (endpoint.empty()) root.erase("hub_endpoint");
-  else root["hub_endpoint"] = endpoint;
-  return write_settings_locked(root, err);
+  return update_settings(
+      [&](ojson& root) {
+        if (endpoint.empty()) root.erase("hub_endpoint");
+        else root["hub_endpoint"] = endpoint;
+      },
+      err);
 }
 
 bool ModelHost::lan_access() { return read_network_settings().lan_access; }
@@ -417,8 +548,12 @@ ModelHost::NetworkSettingsSnapshot snapshot_of(const ojson& root,
 
 ModelHost::NetworkSettingsSnapshot ModelHost::read_network_settings(
     const std::function<bool()>& read_live_remote_manage) {
-  std::lock_guard<std::mutex> lock(settings_mutex());
-  return snapshot_of(read_settings_locked(), read_live_remote_manage);
+  SettingsLock lock(kSettingsReadWaitMs);
+  std::string why;
+  const ojson root = read_settings_with(lock, &why);
+  NetworkSettingsSnapshot snap = snapshot_of(root, read_live_remote_manage);
+  snap.error = why;
+  return snap;
 }
 
 bool ModelHost::save_network_settings(std::optional<bool> lan_access, std::optional<bool> remote_manage,
@@ -429,15 +564,16 @@ bool ModelHost::save_network_settings(std::optional<bool> lan_access, std::optio
     *err = "no configuration directory available to save network settings";
     return false;
   }
-  std::lock_guard<std::mutex> lock(settings_mutex());
-  ojson root = read_settings_locked();
-  if (!root.is_object()) root = ojson::object();
-  if (lan_access.has_value()) root["lan_access"] = *lan_access;
-  if (remote_manage.has_value()) root["remote_manage"] = *remote_manage;
-  if (!write_settings_locked(root, err)) return false;
-  if (remote_manage.has_value() && on_remote_manage_committed) on_remote_manage_committed(*remote_manage);
-  if (out_snapshot) *out_snapshot = snapshot_of(root, read_live_remote_manage);
-  return true;
+  return update_settings(
+      [&](ojson& root) {
+        if (lan_access.has_value()) root["lan_access"] = *lan_access;
+        if (remote_manage.has_value()) root["remote_manage"] = *remote_manage;
+      },
+      err,
+      [&](const ojson& root) {
+        if (remote_manage.has_value() && on_remote_manage_committed) on_remote_manage_committed(*remote_manage);
+        if (out_snapshot) *out_snapshot = snapshot_of(root, read_live_remote_manage);
+      });
 }
 
 ModelHost::~ModelHost() {
@@ -673,6 +809,13 @@ ojson ModelHost::status() const {
     j["progress"] = {{"file", progress_.file}, {"done", progress_.done}, {"total", progress_.total},
                      {"bytes_per_s", progress_.bytes_per_s}, {"checking", progress_.checking}};
   if (served_.sched) j["loaded"] = want_json(last_);
+  // The file served, absolute: what a library row of it is, whatever name or path the load was given ("loaded" keeps
+  // that, for a reload).
+  if (served_.sched && !fetched_.model.empty()) {
+    std::error_code ec;
+    const fs::path file = fs::absolute(to_path(fetched_.model), ec).lexically_normal();
+    j["loaded_file"] = ec ? ojson(nullptr) : ojson(os::from_path(file));
+  }
   j["remembered"] = s.is_object() && s.contains("last") ? s["last"] : ojson(nullptr);
   return j;
 }

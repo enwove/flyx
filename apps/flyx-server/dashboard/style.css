@@ -1,10 +1,13 @@
 /* Copyright 2026 The flyx Authors. SPDX-License-Identifier: Apache-2.0 */
 /* The dashboard's look: Enwove's tokens, the frame, each page's parts. */
-/* Enwove's semantic tokens: "Paper" (light). */
+/* Enwove's semantic tokens: "Paper" (light).  A state's fills and edges (badges, hints, banners, tags) are its colour
+   mixed with transparent (--danger, --info, --accent; amber's lighter --warning-tone), so the dark theme's take its
+   own colours. */
 :root {
   --frame: #f7f4ec; --surface: #fbf9f4; --surface-2: #efeadc; --text: #12352a; --muted: #4d5b54; --faint: #7f8a83;
   --border: #ddd6c3; --primary: #12352a; --on-primary: #f3efe3; --primary-soft: #e1f0e6; --accent: #26704f;
   --success: #22663f; --warning: #8a5a10; --danger: #a8322b; --info: #2a78d6;
+  --warning-tone: #e6b45c; --warning-line: rgba(176, 122, 30, 0.30);
   --chart: #26704f; --chart-fill: rgba(38, 112, 79, 0.10); --chart-2: #eb6834;
   --mem-own: var(--chart); --mem-other: #7f8a83;
   --ring: rgba(18, 53, 42, 0.35); --shadow: 0 1px 2px rgba(18, 53, 42, 0.06), 0 8px 24px rgba(18, 53, 42, 0.12);
@@ -24,6 +27,7 @@
   --frame: #0e0f12; --surface: #17191d; --surface-2: #212328; --text: #e6e8eb; --muted: #a4a9b1; --faint: #878c95;
   --border: #2c2f36; --primary: #e6e8eb; --on-primary: #111214; --primary-soft: #272a30; --accent: #5cc795;
   --success: #5cc795; --warning: #e5ac52; --danger: #f2766d; --info: #6aa7f5;
+  --warning-tone: var(--warning); --warning-line: color-mix(in srgb, var(--warning) 32%, transparent);
   --chart: #5cc795; --chart-fill: rgba(92, 199, 149, 0.14); --chart-2: #f08a5d; --mem-other: #6e737c;
   --ring: rgba(92, 199, 149, 0.55); --shadow: 0 1px 2px rgba(0, 0, 0, 0.5), 0 8px 24px rgba(0, 0, 0, 0.5);
   --panel-shadow: 0 0 0 1px rgba(255, 255, 255, 0.04);
@@ -65,9 +69,9 @@ h1.crumb { color: var(--text); font-weight: 600; }
          white-space: nowrap; background: var(--surface-2); color: var(--muted); }
 .badge .dot { width: 6px; height: 6px; border-radius: 50%; background: currentColor; }
 .badge.ok { background: var(--primary-soft); color: var(--success); }
-.badge.warn { background: rgba(230, 180, 92, 0.16); color: var(--warning); }
-.badge.bad { background: rgba(168, 50, 43, 0.10); color: var(--danger); }
-.badge.info { background: rgba(42, 120, 214, 0.10); color: var(--info); }
+.badge.warn { background: color-mix(in srgb, var(--warning-tone) 16%, transparent); color: var(--warning); }
+.badge.bad { background: color-mix(in srgb, var(--danger) 10%, transparent); color: var(--danger); }
+.badge.info { background: color-mix(in srgb, var(--info) 10%, transparent); color: var(--info); }
 /* The model being served, the top bar's one emphasis: its name, and its state beside it. */
 .mchip { display: inline-flex; align-items: center; gap: 8px; height: 32px; padding: 0 4px 0 10px; border: 1px solid var(--border);
          border-radius: var(--r-md); background: var(--surface); color: var(--text); min-width: 0; max-width: 520px; }
@@ -189,7 +193,7 @@ canvas.spark { display: block; width: 100%; height: 30px; margin-top: 8px; }
 
 /* ---- the page: one surface, sections parted by hairlines ----------------------------------------------------- */
 .notice { display: none; margin: 16px 28px 0; padding: 10px 14px; border-radius: var(--r-md); border: 1px solid var(--warning);
-          background: rgba(230, 180, 92, 0.08); font-size: 13px; }
+          background: color-mix(in srgb, var(--warning-tone) 8%, transparent); font-size: 13px; }
 .notice.show { display: flex; gap: 10px; align-items: center; flex-wrap: wrap; }
 .notice input { flex: 1; min-width: 200px; }
 .sec { display: grid; grid-template-columns: minmax(0, 1fr); border-bottom: 1px solid var(--border); }
@@ -317,8 +321,8 @@ textarea:focus, input:focus, select:focus { outline: none; border-color: var(--a
             background: var(--frame); color: var(--faint); }
 .srv-lamp svg.i { width: 22px; height: 22px; }
 .srv-lamp.ok { background: var(--primary-soft); color: var(--accent); }
-.srv-lamp.warn { background: rgba(230, 180, 92, 0.16); color: var(--warning); }
-.srv-lamp.bad { background: rgba(168, 50, 43, 0.10); color: var(--danger); }
+.srv-lamp.warn { background: color-mix(in srgb, var(--warning-tone) 16%, transparent); color: var(--warning); }
+.srv-lamp.bad { background: color-mix(in srgb, var(--danger) 10%, transparent); color: var(--danger); }
 .srv-what .badge { margin-bottom: 4px; }
 .srv-name { font-size: 20px; font-weight: 700; letter-spacing: -0.01em; overflow-wrap: anywhere; line-height: 1.3; }
 /* Nothing served: the card is the whole view, its two ways on in the middle. */
@@ -373,8 +377,8 @@ textarea:focus, input:focus, select:focus { outline: none; border-color: var(--a
 .srv-dr .dr .f { font-family: var(--mono); font-size: 12px; color: var(--muted); overflow-wrap: anywhere; }
 .banner { grid-column: 1 / -1; display: flex; gap: 10px; align-items: flex-start; padding: 10px 14px; border-radius: var(--r-lg); font-size: 13px; line-height: 1.5; }
 .banner.hint { background: var(--primary-soft); }
-.banner.warn { background: rgba(230, 180, 92, 0.16); }
-.banner.bad { background: rgba(168, 50, 43, 0.08); color: var(--danger); }
+.banner.warn { background: color-mix(in srgb, var(--warning-tone) 16%, transparent); }
+.banner.bad { background: color-mix(in srgb, var(--danger) 8%, transparent); color: var(--danger); }
 .banner .grow2 { flex: 1; min-width: 0; overflow-wrap: anywhere; }
 .banner .btn { flex: none; }
 .banner code { background: var(--banner-code); }
@@ -411,7 +415,7 @@ textarea:focus, input:focus, select:focus { outline: none; border-color: var(--a
 .vapps-tip { margin-top: 8px; padding-top: 8px; border-top: 1px solid var(--border); font-size: 12px; line-height: 1.45; color: var(--muted); }
 .srv .bar { height: 5px; margin-top: 10px; }
 .srv .prog { font-family: var(--mono); font-size: 12px; color: var(--muted); }
-.btn.danger:hover { color: var(--danger); border-color: var(--danger); background: rgba(168, 50, 43, 0.06); }
+.btn.danger:hover { color: var(--danger); border-color: var(--danger); background: color-mix(in srgb, var(--danger) 6%, transparent); }
 
 /* Where models come from: places in a list (the Hub's repositories; this machine's, and its folders), the place chosen
    beside it with what it holds to load.  As tall as the window leaves under the tabs; each side scrolls by itself. */
@@ -461,7 +465,7 @@ div.prow { cursor: pointer; }
 .prow.act .del { grid-column: 3; grid-row: 1 / span 2; align-self: center; width: 28px; height: 28px; }
 .prow.act button.del { opacity: 0; }
 .prow.act:hover button.del, .prow.act button.del:focus-visible { opacity: 1; }
-.prow.act button.del:hover { color: var(--danger); background: rgba(168, 50, 43, 0.08); }
+.prow.act button.del:hover { color: var(--danger); background: color-mix(in srgb, var(--danger) 8%, transparent); }
 /* A folder, and under it the models in it. */
 .prow.folder { margin-top: 6px; }
 .prow.folder:first-child { margin-top: 0; }
@@ -498,7 +502,7 @@ div.prow { cursor: pointer; }
 .dchips .tag2 { font-size: 12px; padding: 2px 9px; }
 .hub-scroll > .stats.small { margin-bottom: 4px; }
 .hub-scroll > .snip pre { white-space: pre-wrap; overflow-wrap: anywhere; padding-right: 72px; }
-.tag2.warn { background: rgba(230, 180, 92, 0.16); color: var(--warning); }
+.tag2.warn { background: color-mix(in srgb, var(--warning-tone) 16%, transparent); color: var(--warning); }
 .dsec { display: flex; align-items: baseline; gap: 8px; margin: 20px 0 8px; font-size: 13px; font-weight: 600; }
 .dsec span { font-size: 12px; font-weight: 400; color: var(--muted); }
 .dnote { margin-top: 10px; font-size: 12.5px; }
@@ -510,7 +514,7 @@ div.prow { cursor: pointer; }
 .rgroup-h b { font-family: var(--mono); font-size: 13px; overflow-wrap: anywhere; }
 .rgroup-h span { font-family: var(--mono); font-size: 12px; color: var(--muted); white-space: nowrap; }
 .rgroup-h .grow { flex: 1; }
-.rgroup-h .del:hover { color: var(--danger); background: rgba(168, 50, 43, 0.08); }
+.rgroup-h .del:hover { color: var(--danger); background: color-mix(in srgb, var(--danger) 8%, transparent); }
 .rgroup .banner { margin-top: 8px; }
 .pathbar input { flex: 1; min-width: 0; }
 .fchips { display: flex; flex-wrap: wrap; gap: 6px; }
@@ -546,7 +550,7 @@ div.prow { cursor: pointer; }
 .mrow .sz { font-family: var(--mono); font-size: 12.5px; color: var(--muted); text-align: right; }
 .mrow .del { width: 28px; height: 28px; opacity: 0; }
 .mrow:hover .del, .mrow .del:focus-visible { opacity: 1; }
-.mrow .del:hover { color: var(--danger); background: rgba(168, 50, 43, 0.08); }
+.mrow .del:hover { color: var(--danger); background: color-mix(in srgb, var(--danger) 8%, transparent); }
 /* The one box that loads: the file chosen, what loading it takes, the button. */
 .loadbox { flex: none; display: flex; align-items: center; gap: 14px; padding: 12px var(--px) 14px 24px; border-top: 1px solid var(--border);
            background: color-mix(in srgb, var(--frame) 50%, var(--surface)); }
@@ -559,8 +563,8 @@ div.prow { cursor: pointer; }
 .tag2 { font-size: 11px; padding: 1px 6px; border-radius: var(--r-xs); background: var(--surface-2); color: var(--muted); white-space: nowrap; }
 .tag2.ok { background: var(--primary-soft); color: var(--success); }
 .tag2.live { background: var(--primary); color: var(--on-primary); }
-.tag2.bad { background: rgba(168, 50, 43, 0.10); color: var(--danger); }
-.tag2.info { background: rgba(42, 120, 214, 0.10); color: var(--info); }
+.tag2.bad { background: color-mix(in srgb, var(--danger) 10%, transparent); color: var(--danger); }
+.tag2.info { background: color-mix(in srgb, var(--info) 10%, transparent); color: var(--info); }
 .chip { display: inline-block; font-family: var(--mono); font-size: 12px; padding: 2px 10px; border-radius: var(--r-sm); background: var(--frame);
         cursor: pointer; margin: 10px 6px 0 0; color: var(--muted); }
 .chip:hover { color: var(--accent); }
@@ -656,7 +660,7 @@ hr.div { border: 0; border-top: 1px solid var(--border); margin: 20px 0 16px; }
 .hist-row .hm { grid-column: 1; font-size: 11.5px; color: var(--faint); }
 .hist-row .del { grid-column: 2; grid-row: 1 / span 2; width: 28px; height: 28px; opacity: 0; }
 .hist-row:hover .del, .hist-row .del:focus-visible { opacity: 1; }
-.hist-row .del:hover { color: var(--danger); background: rgba(168, 50, 43, 0.08); }
+.hist-row .del:hover { color: var(--danger); background: color-mix(in srgb, var(--danger) 8%, transparent); }
 .hist-f { padding: 8px 14px 10px; border-top: 1px solid var(--border); text-align: right; }
 .msgs > .cv { gap: 24px; }
 .composer { padding: 10px 28px 14px; }
@@ -748,9 +752,9 @@ hr.div { border: 0; border-top: 1px solid var(--border); margin: 20px 0 16px; }
 .agent-guide .snip pre { padding-right: 72px; }
 .method { font-family: var(--mono); font-size: 10.5px; font-weight: 700; border-radius: var(--r-xs); padding: 1px 0; width: 54px; text-align: center;
           display: inline-block; margin-right: 10px; }
-.method.get { color: var(--info); background: rgba(42, 120, 214, 0.10); }
+.method.get { color: var(--info); background: color-mix(in srgb, var(--info) 10%, transparent); }
 .method.post { color: var(--success); background: var(--primary-soft); }
-.method.delete { color: var(--danger); background: rgba(168, 50, 43, 0.10); }
+.method.delete { color: var(--danger); background: color-mix(in srgb, var(--danger) 10%, transparent); }
 .eps { border: 1px solid var(--border); border-radius: var(--r-md); overflow: hidden; margin: 8px 0; }
 .ep + .ep { border-top: 1px solid var(--border); }
 .ep summary { padding: 9px 14px; display: flex; align-items: center; list-style: none; }
@@ -830,12 +834,12 @@ hr.div { border: 0; border-top: 1px solid var(--border); margin: 20px 0 16px; }
 .ltable td.msg { font-family: var(--mono); font-size: 12px; line-height: 1.55; color: var(--text); white-space: pre-wrap; overflow-wrap: anywhere; }
 .ltable td.msg .sep { color: var(--faint); }
 .ltable tr.logline:hover td { background: color-mix(in srgb, var(--surface-2) 55%, transparent); }
-.ltable tr.logline.error td { background: rgba(168, 50, 43, 0.04); }
+.ltable tr.logline.error td { background: color-mix(in srgb, var(--danger) 4%, transparent); }
 .ltable tr.logline.error td.msg { color: var(--danger); }
 .ltable tr.logline.hide { display: none; }
 .lvb { display: inline-block; font-size: 11px; line-height: 16px; padding: 0 6px; border-radius: var(--r-xs); font-weight: 600; }
-.lvb.error { background: rgba(168, 50, 43, 0.10); color: var(--danger); }
-.lvb.warn { background: rgba(230, 180, 92, 0.18); color: var(--warning); }
+.lvb.error { background: color-mix(in srgb, var(--danger) 10%, transparent); color: var(--danger); }
+.lvb.warn { background: color-mix(in srgb, var(--warning-tone) 18%, transparent); color: var(--warning); }
 .lvb.info { background: var(--surface-2); color: var(--faint); font-weight: 500; }
 .logempty { padding: 24px 18px; color: var(--muted); font-family: var(--sans); font-size: 13px; }
 
@@ -1013,9 +1017,9 @@ td.txt1.muted { color: var(--muted); }
 /* ---- the hint over every page (components/hints.js) ----------------------------------------------------------- */
 .hint { display: flex; align-items: center; gap: 12px 14px; flex-wrap: wrap; margin: 8px 0 18px; padding: 12px 14px 12px 18px;
         border: 1px solid var(--tone-line); border-radius: var(--r-lg); background: var(--tone-bg); font-size: 13px; }
-.hint.ok { --tone: var(--success); --tone-bg: var(--primary-soft); --tone-line: rgba(38, 112, 79, 0.28); }
-.hint.warn { --tone: var(--warning); --tone-bg: rgba(230, 180, 92, 0.10); --tone-line: rgba(176, 122, 30, 0.30); }
-.hint.bad { --tone: var(--danger); --tone-bg: rgba(168, 50, 43, 0.05); --tone-line: rgba(168, 50, 43, 0.26); }
+.hint.ok { --tone: var(--success); --tone-bg: var(--primary-soft); --tone-line: color-mix(in srgb, var(--accent) 28%, transparent); }
+.hint.warn { --tone: var(--warning); --tone-bg: color-mix(in srgb, var(--warning-tone) 10%, transparent); --tone-line: var(--warning-line); }
+.hint.bad { --tone: var(--danger); --tone-bg: color-mix(in srgb, var(--danger) 5%, transparent); --tone-line: color-mix(in srgb, var(--danger) 26%, transparent); }
 .hint-text { display: flex; flex-direction: column; gap: 1px; flex: 1; min-width: 240px; }
 .hint-text b { font-weight: 600; color: var(--text); }
 .hint.bad .hint-text b { color: var(--danger); }

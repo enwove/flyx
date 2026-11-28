@@ -11,8 +11,9 @@
 //                         "default"), and offline flag
 //   POST /v1/hub/config   {"endpoint": URL or ""} sets or resets the Hub endpoint (persisted to serve.json)
 //   GET /v1/hub/search?q=TEXT&sort=trending|downloads|likes|updated|created&limit=N&cursor=C&arch=A   the Hub's
-//                         repositories with GGUF files; without q, filtered to the architectures this build runs
-//                         (optionally narrowed to arch=A), paginated via next_cursor
+//                         repositories with GGUF files and, beside them, the safetensors drafters the Hub's metadata
+//                         names (hub_search.h); without q, filtered to the architectures this build runs (optionally
+//                         narrowed to arch=A); paginated via next_cursor
 //   GET /v1/hub/files?repo=ORG/NAME   a repository's models: its GGUFs by quantization with their sizes (and which
 //                         are in the cache already), its MTP file, the drafters verified for it, what the Hub
 //                         says of it (downloads, license, its GGUFs' architecture) and whether this build runs that
@@ -60,6 +61,7 @@
 
 #include "apps/flyx-server/agent_launch.h"
 #include "apps/flyx-server/drafter_speeds.h"
+#include "apps/flyx-server/hub_search.h"
 #include "apps/flyx-server/gpu_apps.h"
 #include "apps/flyx-server/server.h"
 #include "core/interfaces/model.h"
@@ -137,6 +139,7 @@ Listed dir_entry(const apps::LocalModel& m, const apps::PathAllowFn& allow = {})
     l.json["known_drafters"] = known_drafters_json(m.path, apps::known_drafters(o.repo, o.base_models, false, allow));
   }
   if (m.kind == "drafter" && !m.drafter_kind.empty()) l.json["drafter_kind"] = m.drafter_kind;
+  if (m.kind == "drafter") l.json["drafter_mode"] = m.drafter_mode;  // what a load is told: its header's alone
   if (m.parts > 1) l.json["parts"] = m.parts;
   l.on_disk = {m.path};
   return l;
@@ -160,7 +163,7 @@ std::vector<Listed> listing(const Server& s, const httplib::Request* req = nullp
     auto disk_of = [&](const std::string& path) { return from_path((to_path(c.dir) / to_path(path)).make_preferred()); };
     auto entry = [&](const std::string& name, const std::string& kind, const std::string& quant,
                      const std::string& file, const std::string& disk, uint64_t size, fs::file_time_type modified,
-                     int mtp_count, const std::string& drafter_kind) {
+                     int mtp_count, const std::string& drafter_kind, const std::string& drafter_mode = "") {
       Listed l;
       l.repo = c.repo, l.commit = c.commit;
       l.json = {{"name", name + suffix}, {"kind", kind}, {"source", "hub"}, {"repo", c.repo}, {"quant", or_null(quant)},
@@ -168,6 +171,7 @@ std::vector<Listed> listing(const Server& s, const httplib::Request* req = nullp
                 {"revision", c.commit}, {"current", c.current}, {"mtp", kind == "gguf" && mtp_count > 0 ? ojson("in-file") : ojson(nullptr)},
                 {"mmproj", nullptr}, {"dflash2", nullptr}};
       if (kind == "drafter" && !drafter_kind.empty()) l.json["drafter_kind"] = drafter_kind;
+      if (kind == "drafter") l.json["drafter_mode"] = drafter_mode;  // what a load is told: header or config alone
       if (kind == "gguf" || kind == "flyx")  // what its file says it comes from
         l.json["known_drafters"] = known_drafters_json(
             name + suffix,
@@ -198,7 +202,8 @@ std::vector<Listed> listing(const Server& s, const httplib::Request* req = nullp
       if (cls.drafter_kind == "mtp") repos_with_mtp.insert(c.repo);
       if (!seen.insert({c.repo, g.file.path}).second) continue;
       Listed l = entry(c.repo + ":" + item.selector, cls.kind, g.quant, g.file.path.substr(g.file.path.rfind('/') + 1),
-                       item.disk, g.total_size, item.modified, cls.mtp_layers, cls.drafter_kind);
+                       item.disk, g.total_size, item.modified, cls.mtp_layers, cls.drafter_kind,
+                       item.header_drafter_kind());
       l.vision = apps::reads_vision(cls.arch);
       if (g.split) l.json["parts"] = int(g.parts.size());
       for (const hub::RepoFile& p : g.parts) l.files.push_back(p.path), l.on_disk.push_back(disk_of(p.path));
@@ -219,8 +224,8 @@ std::vector<Listed> listing(const Server& s, const httplib::Request* req = nullp
       const std::string disk = from_path(to_path(c.dir).make_preferred());
       const auto modified = fs::last_write_time(to_path(disk), ec);
       // its config's kind ("dflash2", "dflash", "dspark", "dspine", "eagle4")
-      l = entry(c.repo, "drafter", "", c.repo.substr(c.repo.find('/') + 1), disk, size, modified, -1,
-                flyx::drafter_source_kind(c.dir, allow));
+      const std::string kind = flyx::drafter_source_kind(c.dir, allow);
+      l = entry(c.repo, "drafter", "", c.repo.substr(c.repo.find('/') + 1), disk, size, modified, -1, kind, kind);
     } else {
       const std::string base = files[0].path.substr(files[0].path.rfind('/') + 1);
       const std::string disk = disk_of(files[0].path);
@@ -373,7 +378,7 @@ ojson repo_json(const hub::Repo& r, const apps::PathAllowFn& allow = {}) {
     if (item.cls.kind == "gguf") {
       ggufs.push_back({{"name", r.id + ":" + item.selector + rev_suffix}, {"quant", c.quant}, {"size", c.total_size},
                        {"split", c.split}, {"parts", int(c.parts.size())}, {"complete", c.complete},
-                       {"cached", item.cached}});
+                       {"cached", item.cached}, {"disk", item.cached ? ojson(item.disk) : ojson(nullptr)}});
       continue;
     }
     if (!c.complete) continue;
@@ -386,7 +391,9 @@ ojson repo_json(const hub::Repo& r, const apps::PathAllowFn& allow = {}) {
     const auto base = path.substr(path.rfind('/') + 1);
     companions.push_back({{"name", r.id + ":" + base + rev_suffix}, {"path", path}, {"file", base},
                           {"kind", item.cls.drafter_kind.empty() ? item.cls.kind : item.cls.drafter_kind},
-                          {"drafter_kind", item.cls.drafter_kind},
+                          // The kind a load may be told: as the cached file's header says it, else none (the
+                          // loader reads it); "kind" above may come from the file's name, for the list alone.
+                          {"drafter_kind", item.header_drafter_kind()},
                           {"size", c.total_size}, {"cached", item.cached}, {"disk", item.cached ? ojson(item.disk) : ojson(nullptr)},
                           {"default", is_default}});
     if (&item == preferred_mtp || &item == preferred_mm)
@@ -614,7 +621,7 @@ void add_manage_routes(httplib::Server& http, Server* s) {
       hub::HubOutcome out;
       std::string err;
       if (!hub::describe(hn.repo, hn.revision, &repo, &err, &out, allow)) return hub_error(r, out, err);
-      kind = apps::drafter_kind(repo);
+      kind = apps::drafter_kind(repo, hn, allow);
     } else {
       return error(r, 400, "name: a drafter's path or Hugging Face name", "invalid_request_error");
     }
@@ -632,30 +639,25 @@ void add_manage_routes(httplib::Server& http, Server* s) {
     hub::HubOutcome out;
     std::string next_cursor, err;
     if (!asked.empty()) {
-      if (!hub::search(asked, sort, limit, &found, &err, cursor, &next_cursor, /*gguf_only=*/true, &out))
+      // The GGUF repositories the query matches and the safetensors drafters beside them, as the Hub's metadata says
+      // they are, paged together (hub_search.h).
+      const HubSearchFn hub_search = [](const std::string& query, const std::string& by, int n,
+                                        std::vector<hub::Found>* list, std::string* why, const std::string& from,
+                                        std::string* next, bool gguf_only, hub::HubOutcome* outcome) {
+        return hub::search(query, by, n, list, why, from, next, gguf_only, outcome);
+      };
+      if (!search_page(hub_search, asked, sort, limit, cursor, &found, &next_cursor, &err, &out))
         return hub_error(r, out, err);
       if (cursor.empty()) {
-        std::set<std::string> seen_ids;
-        for (const auto& f : found) seen_ids.insert(f.id);
-        const std::string low = ascii_lower(asked);
-        const bool drafter_query = low.find("dflash") != std::string::npos || low.find("dspark") != std::string::npos ||
-                                   low.find("dspine") != std::string::npos || low.find("eagle") != std::string::npos ||
-                                   low.find("drafter") != std::string::npos || low.find("mtp") != std::string::npos;
-        // Include block drafters' safetensors repos (which filter=gguf omits) when searching drafters or when no GGUF
-        // matches.
-        if (found.empty() || drafter_query) {
-          std::vector<hub::Found> extra;
-          std::string e2;
-          if (hub::search(asked, sort, limit, &extra, &e2, "", nullptr, /*gguf_only=*/false)) {
-            for (auto& x : extra) {
-              if (x.is_drafter && seen_ids.insert(x.id).second) found.push_back(std::move(x));
-            }
-          }
-        }
-        // If the query names an exact repository (org/name), look it up directly so safetensors drafters or newly
-        // published repos are always found even when Hub search omits them.
+        // A query naming a repository (org/name): that one first, looked up directly, whether the Hub's search lists
+        // it or not (newly published, or matched by its name alone); shown here, it is on no later page.
         hub::Name exact;
-        if (hub::parse_name(asked, &exact) && seen_ids.insert(exact.repo).second) {
+        const auto shown = [&] {
+          return std::any_of(found.begin(), found.end(),
+                             [&](const hub::Found& f) { return repo_key(f.id) == repo_key(exact.repo); });
+        };
+        const bool named = hub::parse_name(asked, &exact);
+        if (named && !shown()) {
           hub::Repo repo;
           std::string e2;
           if (hub::describe(exact.repo, exact.revision, &repo, &e2, nullptr, remote_path_policy(*s, q))) {
@@ -671,6 +673,7 @@ void add_manage_routes(httplib::Server& http, Server* s) {
             found.insert(found.begin(), std::move(f));
           }
         }
+        if (named && shown()) next_cursor = cursor_excluding(next_cursor, exact.repo);
       }
     } else {
       // Without a query, browse GGUF repositories of every architecture this build runs (or one chosen via `arch`),
@@ -929,7 +932,9 @@ void add_manage_routes(httplib::Server& http, Server* s) {
     r.set_header("Cache-Control", "no-store");
     const bool ram = kind == "ram";
     const GpuAppSnapshot snap = ram ? list_ram_apps() : list_gpu_apps(device_hint());
-    if (!ram && snap.mem_total > 0) s->probe_mem_used.store(snap.mem_used, std::memory_order_relaxed);
+    // Only a reading of the device itself (not of one of several of its name) refreshes the probe's.
+    if (!ram && snap.mem_total > 0 && snap.device_unique)
+      s->probe_mem_used.store(int64_t(snap.mem_used), std::memory_order_relaxed);
     send_json(r, 200, gpu_snapshot_json(snap, ram ? "ram" : "vram", from_this_machine(q)));
   });
   http.Post("/v1/device/close", [s, device_hint, gpu_snapshot_json](const httplib::Request& q, httplib::Response& r) {
@@ -952,7 +957,8 @@ void add_manage_routes(httplib::Server& http, Server* s) {
     const bool ram = kind == "ram";
     const GpuCloseResult res =
         ram ? close_ram_app(body["id"].get<std::string>(), force) : close_gpu_app(device_hint(), body["id"].get<std::string>(), force);
-    if (!ram && res.snapshot.mem_total > 0) s->probe_mem_used.store(res.snapshot.mem_used, std::memory_order_relaxed);
+    if (!ram && res.snapshot.mem_total > 0 && res.snapshot.device_unique)
+      s->probe_mem_used.store(int64_t(res.snapshot.mem_used), std::memory_order_relaxed);
     if (res.status == CloseStatus::kUnsupported)
       return error(r, 501, "closing applications is not supported on this system", "not_supported");
     if (res.status == CloseStatus::kNotFound)

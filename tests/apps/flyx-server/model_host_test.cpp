@@ -12,11 +12,14 @@
 #include <chrono>
 #include <condition_variable>
 #include <cstdio>
+#include <cstdlib>
 #include <filesystem>
 #include <fstream>
 #include <functional>
+#include <iterator>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <string>
 #include <thread>
 #include <vector>
@@ -27,6 +30,16 @@
 #include "core/os/path.h"
 #include "tests/common/check.h"
 
+#if defined(_WIN32)
+#define WIN32_LEAN_AND_MEAN
+#include <windows.h>
+#else
+#include <errno.h>
+#include <spawn.h>
+#include <sys/wait.h>
+extern char** environ;
+#endif
+
 using namespace flyx;
 using flyx::server::ModelHost;
 
@@ -34,12 +47,67 @@ extern "C" void flyx_test_delegate(const flyx_backend_api*);
 
 namespace {
 
-void set_env(const char* name, const std::string& value) {
+void set_env(const char* name, const std::string& value) {  // UTF-8 on Windows too (config_dir reads it wide)
 #if defined(_WIN32)
-  _putenv_s(name, value.c_str());
+  _wputenv_s(os::to_path(name).c_str(), os::to_path(value).c_str());
 #else
   setenv(name, value.c_str(), 1);
 #endif
+}
+
+// The exit code of `exe` run with `args`, no shell between (a path's spaces, $ and % reach it as they are, and on
+// Windows its other letters too, the arguments going over as UTF-16); -1 when it could not be started.
+int run_process(const std::string& exe, const std::vector<std::string>& args) {
+  std::fflush(stdout);
+#if defined(_WIN32)
+  // As CommandLineToArgvW reads them back: each argument quoted, the backslashes before a quote and before the
+  // closing one doubled.
+  auto quote = [](const std::wstring& a) {
+    std::wstring q = L"\"";
+    size_t slashes = 0;
+    for (wchar_t c : a) {
+      if (c == L'\\') {
+        ++slashes;
+        continue;
+      }
+      q.append(c == L'"' ? slashes * 2 + 1 : slashes, L'\\');
+      slashes = 0;
+      q += c;
+    }
+    q.append(slashes * 2, L'\\');
+    return q + L"\"";
+  };
+  const std::wstring program = os::to_path(exe).wstring();
+  std::wstring line = quote(program);
+  for (const std::string& a : args) line += L" " + quote(os::to_path(a).wstring());
+  STARTUPINFOW si{};
+  si.cb = sizeof si;
+  PROCESS_INFORMATION pi{};
+  if (!CreateProcessW(program.c_str(), line.data(), nullptr, nullptr, FALSE, 0, nullptr, nullptr, &si, &pi)) return -1;
+  WaitForSingleObject(pi.hProcess, INFINITE);
+  DWORD code = 1;
+  GetExitCodeProcess(pi.hProcess, &code);
+  CloseHandle(pi.hThread);
+  CloseHandle(pi.hProcess);
+  return int(code);
+#else
+  std::vector<std::string> all = {exe};
+  all.insert(all.end(), args.begin(), args.end());
+  std::vector<char*> argv;
+  for (std::string& a : all) argv.push_back(a.data());
+  argv.push_back(nullptr);
+  pid_t pid = 0;
+  if (posix_spawn(&pid, exe.c_str(), nullptr, nullptr, argv.data(), environ) != 0) return -1;
+  int status = 0;
+  while (waitpid(pid, &status, 0) < 0)
+    if (errno != EINTR) return -1;
+  return WIFEXITED(status) ? WEXITSTATUS(status) : -1;
+#endif
+}
+
+std::string file_text(const std::filesystem::path& p) {
+  std::ifstream f(p, std::ios::binary);
+  return std::string(std::istreambuf_iterator<char>(f), std::istreambuf_iterator<char>());
 }
 
 // The backend's models, as the delegating backend sees them.
@@ -97,8 +165,37 @@ bool wait_for(const std::function<bool()>& done, int ms) {
 
 }  // namespace
 
+// One of two servers sharing serve.json (a process of its own, the settings in `dir`): n saves of remote_manage
+// turned on and off ("network") or of a Hub endpoint ("hub"), each read back after it.  The other's
+// read-modify-replace, were it not under the file's lock, would now and then write its older copy over this one's
+// save.  Exit 0: every save made and none lost.
+int settings_writer(const std::string& dir, const std::string& kind, int n) {
+  set_env("APPDATA", dir);
+  set_env("XDG_CONFIG_HOME", dir);
+  int failed = 0, lost = 0;
+  for (int i = 0; i < n; ++i) {
+    std::string err;
+    if (kind == "network") {
+      const bool v = i % 2 == 0;
+      if (!ModelHost::save_network_settings(std::nullopt, v, {}, nullptr, &err))
+        ++failed, std::fprintf(stderr, "%s\n", err.c_str());
+      else if (ModelHost::read_network_settings().remote_manage != v)
+        ++lost;
+    } else {
+      const std::string e = "https://hub-" + std::to_string(i) + ".example";
+      if (!ModelHost::save_hub_endpoint(e, &err)) ++failed, std::fprintf(stderr, "%s\n", err.c_str());
+      else if (ModelHost::remembered_hub_endpoint() != e) ++lost;
+    }
+  }
+  std::printf("%s writer: %d saves, %d failed, %d lost to the other\n", kind.c_str(), n, failed, lost);
+  return failed || lost ? 1 : 0;
+}
+
 int main(int argc, char** argv) {
   flyx::test::print_passes = true;
+  const std::vector<std::string> args = os::utf8_arguments(argc, argv);  // Windows: from UTF-16, not the code page
+  if (args.size() == 5 && args[1] == "--settings-writer")
+    return settings_writer(args[2], args[3], std::atoi(args[4].c_str()));
   if (argc < 2) {
     std::fprintf(stderr, "usage: model_host_test MODEL.flyx\n");
     return 2;
@@ -307,6 +404,91 @@ int main(int argc, char** argv) {
     writer.join();
     reader.join();
     check(!torn.load(), "concurrent save_network_settings / read_network_settings never tear disk vs live_remote_manage");
+  }
+  {
+    // Two servers sharing serve.json, processes of their own started with no shell between, their settings in a
+    // directory whose name has spaces, $ and % and a letter outside ASCII: one turns remote_manage on and off, the
+    // other saves Hub endpoints, at once.  Neither save is lost to the other's, and a fresh reader sees both last ones.
+    const std::string self = os::from_path(fs::absolute(os::to_path(args[0]), ec));
+    const fs::path shared = config / fs::path(u8"two servers $HOME %PATH% ü");
+    fs::create_directories(shared, ec);
+    const std::string shared_dir = os::from_path(shared);
+    const int n = 150;
+    auto writer = [&](const char* kind) {
+      return run_process(self, {"--settings-writer", shared_dir, kind, std::to_string(n)});
+    };
+    int network_rc = -1, hub_rc = -1;
+    std::thread network([&] { network_rc = writer("network"); });
+    std::thread hub([&] { hub_rc = writer("hub"); });
+    network.join();
+    hub.join();
+    check(network_rc == 0 && hub_rc == 0,
+          "two processes' saves of serve.json at once: none lost to the other's (exit " + std::to_string(network_rc) +
+              ", " + std::to_string(hub_rc) + ")");
+    set_env("APPDATA", shared_dir);
+    set_env("XDG_CONFIG_HOME", shared_dir);
+    const bool last_remote_manage = (n - 1) % 2 == 0;
+    check(fs::exists(shared / "flyx" / "serve.json") &&
+              ModelHost::read_network_settings().remote_manage == last_remote_manage &&
+              ModelHost::remembered_hub_endpoint() == "https://hub-" + std::to_string(n - 1) + ".example",
+          "and a fresh reader sees both processes' last saves, in the directory named as it is");
+    set_env("APPDATA", os::from_path(config));
+    set_env("XDG_CONFIG_HOME", os::from_path(config));
+  }
+  {
+    // serve.json there but no object of settings (cut short, not JSON, another root, empty): a save leaves its bytes
+    // as they are and says why, rather than writing the one setting it changes over the last model and the network
+    // settings; a reader gets the settings this process last had, and says why too.
+    std::string err;
+    check(ModelHost::save_network_settings(false, true, {}, nullptr, &err), "known settings saved: " + err);
+    const fs::path file = os::to_path(ModelHost::settings_path());
+    for (const std::string bytes : {std::string(R"({"last": {"model": "a.gguf")"), std::string("[1, 2]"),
+                                    std::string("not json"), std::string()}) {
+      { std::ofstream(file, std::ios::binary | std::ios::trunc) << bytes; }
+      err.clear();
+      const bool saved = ModelHost::save_hub_endpoint("https://mirror.example", &err);
+      check(!saved && file_text(file) == bytes && err.find("left as it is") != std::string::npos,
+            "a save over serve.json of " + std::to_string(bytes.size()) + " bytes that are no settings leaves them: " +
+                err);
+      const ModelHost::NetworkSettingsSnapshot snap = ModelHost::read_network_settings();
+      check(!snap.lan_access && snap.remote_manage && !snap.error.empty(),
+            "and a reader gets the settings last had, saying why: " + snap.error);
+    }
+    fs::remove(file, ec);
+    check(ModelHost::save_hub_endpoint("https://mirror.example", &err) && ModelHost::read_network_settings().error.empty(),
+          "no file at all: a save starts one");
+  }
+  {
+    // Another server holding the lock: a save waits for it and gives up, the file untouched; a reader opens no file
+    // (a file written behind this process's back is not read), giving the settings last had, saying why.
+    std::string err;
+    check(ModelHost::save_network_settings(false, true, {}, nullptr, &err), "known settings saved: " + err);
+    const fs::path file = os::to_path(ModelHost::settings_path());
+    const std::string behind = R"({"lan_access": true, "remote_manage": false})";
+    { std::ofstream(file, std::ios::binary | std::ios::trunc) << behind; }
+    {
+      os::FileLock other(ModelHost::settings_path() + ".lock");
+      std::string why;
+      check(other.try_lock(&why) == os::FileLock::Result::kLocked, "another server's lock taken: " + why);
+      const bool saved = ModelHost::save_hub_endpoint("https://held.example", &err);
+      check(!saved && err.find("held by another flyx server") != std::string::npos && file_text(file) == behind,
+            "a save under another server's lock gives up, the file untouched: " + err);
+      const ModelHost::NetworkSettingsSnapshot snap = ModelHost::read_network_settings();
+      check(!snap.lan_access && snap.remote_manage && snap.error.find("held by another flyx server") != std::string::npos,
+            "a reader without the lock opens no file: the settings last had, and why: " + snap.error);
+    }
+    const ModelHost::NetworkSettingsSnapshot snap = ModelHost::read_network_settings();
+    check(snap.lan_access && !snap.remote_manage && snap.error.empty(), "the lock let go: the file read again");
+    // The lock file not to be had at all (a directory in its place): the same, at once.
+    const fs::path lock = os::to_path(ModelHost::settings_path() + ".lock");
+    fs::remove(lock, ec);
+    fs::create_directory(lock, ec);
+    err.clear();
+    const bool saved = ModelHost::save_hub_endpoint("https://nolock.example", &err);
+    const ModelHost::NetworkSettingsSnapshot none = ModelHost::read_network_settings();
+    check(!saved && !err.empty() && file_text(file) == behind && !none.error.empty(),
+          "a lock file that cannot be opened: no save, no read of the file, both saying why: " + err);
+    fs::remove(lock, ec);
   }
   fs::remove_all(config, ec);
   return flyx::test::finish("model_host_test");

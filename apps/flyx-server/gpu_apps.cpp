@@ -104,6 +104,31 @@ struct NvmlProcessInfoV1 {
 
 }  // namespace
 
+DeviceMatch match_device(const std::vector<DeviceSeen>& devices, const std::string& hint, bool either_way) {
+  DeviceMatch m;
+  int opened = -1, first_named = -1, matched = -1, matches = 0;
+  bool complete = true;  // every GPU opened and named
+  for (int i = 0; i < int(devices.size()); ++i) {
+    const DeviceSeen& d = devices[i];
+    if (!d.handle || !d.name) complete = false;
+    if (!d.handle) continue;
+    if (opened < 0) opened = i;
+    if (!d.name) continue;
+    if (first_named < 0) first_named = i;
+    if (!hint.empty() && (contains_ci(*d.name, hint) || (either_way && contains_ci(hint, *d.name)))) {
+      if (matched < 0) matched = i;
+      ++matches;
+    }
+  }
+  m.index = matched >= 0 ? matched : first_named >= 0 ? first_named : opened;
+  m.unique = m.index >= 0 && complete && (devices.size() == 1 || (matched >= 0 && matches == 1));
+  return m;
+}
+
+bool readings_unique(bool adapter_unique, std::optional<bool> nvml_unique) {
+  return adapter_unique && nvml_unique.value_or(true);
+}
+
 bool is_system_gpu_process(const std::string& proc_name, const std::string& exe_path) {
   const std::string base = to_lower_ascii(strip_exe_suffix(proc_name));
   static const std::unordered_set<std::string> kSystemNames = {
@@ -275,23 +300,24 @@ const NvmlWinApi& nvml_win_api() {
   return api;
 }
 
-bool query_nvml_memory(const std::string& device_name, uint64_t* total, uint64_t* used, uint64_t* free_b) {
+bool query_nvml_memory(const std::string& device_name, uint64_t* total, uint64_t* used, uint64_t* free_b,
+                       bool* unique) {
+  *unique = false;
   const auto& nv = nvml_win_api();
   if (!nv.ok) return false;
   unsigned int n = 0;
   if (nv.count(&n) != 0 || n == 0) return false;
-  NvmlDevice* picked = nullptr;
+  std::vector<NvmlDevice*> handles(n, nullptr);
+  std::vector<DeviceSeen> seen(n);
   for (unsigned int i = 0; i < n; ++i) {
-    NvmlDevice* d = nullptr;
-    if (nv.by_index(i, &d) != 0 || !d) continue;
     char buf[128] = {};
-    if (nv.name(d, buf, sizeof(buf)) == 0 && !device_name.empty() && contains_ci(buf, device_name)) {
-      picked = d;
-      break;
-    }
-    if (!picked) picked = d;
+    seen[i].handle = nv.by_index(i, &handles[i]) == 0 && handles[i];
+    if (seen[i].handle && nv.name(handles[i], buf, sizeof(buf)) == 0) seen[i].name = buf;
   }
-  if (!picked) return false;
+  const DeviceMatch match = match_device(seen, device_name);
+  if (match.index < 0) return false;
+  NvmlDevice* picked = handles[size_t(match.index)];
+  *unique = match.unique;
   NvmlMemory mem{};
   if (nv.memory(picked, &mem) != 0 || mem.total == 0) return false;
   *total = uint64_t(mem.total);
@@ -302,6 +328,7 @@ bool query_nvml_memory(const std::string& device_name, uint64_t* total, uint64_t
 
 struct AdapterChoice {
   bool found = false;
+  bool unique = false;  // the only adapter the hint names (the only one, without a hint)
   LUID luid{};
   std::string name;
   uint64_t dedicated_total = 0;
@@ -326,13 +353,26 @@ AdapterChoice find_target_adapter(const std::string& device_hint) {
     uint64_t mem = 0;
   };
   std::vector<Cand> cands;
+  // The hardware adapters as uniqueness sees them: one whose description could not be read, or one DXGI would not
+  // give, could be the hinted adapter's twin.
+  std::vector<DeviceSeen> seen;
   IDXGIAdapter1* a = nullptr;
-  for (UINT i = 0; factory->EnumAdapters1(i, &a) != DXGI_ERROR_NOT_FOUND; ++i) {
+  for (UINT i = 0; i < 64; ++i) {
+    const HRESULT hr = factory->EnumAdapters1(i, &a);
+    if (hr == DXGI_ERROR_NOT_FOUND) break;
+    if (FAILED(hr) || !a) {
+      seen.push_back({});
+      continue;
+    }
     DXGI_ADAPTER_DESC1 d{};
-    if (SUCCEEDED(a->GetDesc1(&d)) && !(d.Flags & DXGI_ADAPTER_FLAG_SOFTWARE)) {
+    if (FAILED(a->GetDesc1(&d))) {
+      seen.push_back({true, std::nullopt});
+    } else if (!(d.Flags & DXGI_ADAPTER_FLAG_SOFTWARE)) {
       cands.push_back({d.AdapterLuid, utf8_from_wide(d.Description), d.VendorId, uint64_t(d.DedicatedVideoMemory)});
+      seen.push_back({true, cands.back().name});
     }
     a->Release();
+    a = nullptr;
   }
   factory->Release();
   if (cands.empty()) return out;
@@ -346,6 +386,7 @@ AdapterChoice find_target_adapter(const std::string& device_hint) {
       }
     }
   }
+  out.unique = match_device(seen, device_hint, /*either_way=*/true).unique;
   if (best < 0) {
     // Prefer discrete NVIDIA GPU with largest dedicated VRAM.
     uint64_t best_mem = 0;
@@ -643,11 +684,14 @@ LiveScan scan_windows_gpu_apps(const std::string& device_hint) {
   out.snap.supported = true;
 
   uint64_t nv_total = 0, nv_used = 0, nv_free = 0;
-  if (query_nvml_memory(ad.name, &nv_total, &nv_used, &nv_free)) {
+  bool nv_unique = false;
+  if (query_nvml_memory(ad.name, &nv_total, &nv_used, &nv_free, &nv_unique)) {
     out.snap.mem_total = nv_total;
     out.snap.mem_used = nv_used;
     out.snap.mem_free = nv_free;
+    out.snap.device_unique = readings_unique(ad.unique, nv_unique);
   } else {
+    out.snap.device_unique = readings_unique(ad.unique, std::nullopt);
     out.snap.mem_used = ad_dedicated;
     out.snap.mem_free = out.snap.mem_total > ad_dedicated ? out.snap.mem_total - ad_dedicated : 0;
   }
@@ -1212,24 +1256,20 @@ LinuxScan scan_linux_gpu_apps(const std::string& device_hint) {
   unsigned int n = 0;
   if (nv.count(&n) != 0 || n == 0) return out;
 
-  NvmlDevice* dev = nullptr;
-  std::string dev_name;
+  std::vector<NvmlDevice*> handles(n, nullptr);
+  std::vector<DeviceSeen> seen(n);
   for (unsigned int i = 0; i < n; ++i) {
-    NvmlDevice* d = nullptr;
-    if (nv.by_index(i, &d) != 0 || !d) continue;
     char buf[128] = {};
-    nv.name(d, buf, sizeof(buf));
-    if (!device_hint.empty() && contains_ci(buf, device_hint)) {
-      dev = d;
-      dev_name = buf;
-      break;
-    }
-    if (!dev) {
-      dev = d;
-      dev_name = buf;
-    }
+    seen[i].handle = nv.by_index(i, &handles[i]) == 0 && handles[i];
+    if (seen[i].handle && nv.name(handles[i], buf, sizeof(buf)) == 0) seen[i].name = buf;
   }
-  if (!dev) return out;
+  // A device opened but not named still lists its memory and processes; its readings are not taken as the probed
+  // device's (device_unique) without its name.
+  const DeviceMatch match = match_device(seen, device_hint);
+  if (match.index < 0) return out;
+  NvmlDevice* dev = handles[size_t(match.index)];
+  const std::string dev_name = seen[size_t(match.index)].name.value_or("");
+  out.snap.device_unique = match.unique;
 
   NvmlMemory mem{};
   if (nv.memory(dev, &mem) != 0 || mem.total == 0) return out;

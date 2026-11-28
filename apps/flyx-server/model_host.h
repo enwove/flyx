@@ -59,7 +59,9 @@ class ModelHost {
   // last error, notes, the served model's drafters and those published for it, and what the settings file remembers.
   ojson status() const;
 
-  // The settings file holds the last model, Hub endpoint and dashboard network preference.
+  // The settings file holds the last model, Hub endpoint and dashboard network preference.  Every read and every
+  // read-modify-replace of it holds this process's settings lock and serve.json.lock beside it, which every flyx
+  // server sharing the file takes: one server's save never writes back another's older settings.
   static std::string settings_path();
   static bool remembered(Want* w, const EngineOptions& base);
   static std::string remembered_hub_endpoint();
@@ -68,12 +70,15 @@ class ModelHost {
     bool lan_access = false;
     bool remote_manage = false;
     bool live_remote_manage = false;
+    // Why serve.json was not read ("" when it was): its lock not had (the file is then not opened), the file
+    // unreadable, not JSON or no object.  The values are then the last this process read or wrote.
+    std::string error;
   };
   static bool lan_access();
   static bool remote_manage();
   static NetworkSettingsSnapshot read_network_settings(
       const std::function<bool()>& read_live_remote_manage = {});
-  // Atomically update lan_access and/or remote_manage in serve.json under settings_mutex(), invoking
+  // Atomically update lan_access and/or remote_manage in serve.json under the settings lock, invoking
   // on_remote_manage_committed before releasing the lock and sampling live_remote_manage under the same lock.
   static bool save_network_settings(std::optional<bool> lan_access, std::optional<bool> remote_manage,
                                     const std::function<void(bool)>& on_remote_manage_committed,
@@ -116,6 +121,19 @@ class ModelHost {
   std::atomic<bool> stop_{false};
   std::thread worker_;
 };
+
+// A C stream's reads (fread, ferror and feof of a FILE*, or a test's stand-in), for read_chunks.
+struct ChunkSource {
+  std::function<size_t(char* buf, size_t n)> read;
+  std::function<bool()> error, at_end;
+};
+// All of `src` into *text: true only where its reads stopped at the end with no error.  The error is the stream's
+// own (ferror), apart from the end: a short read that comes with an I/O error, even of bytes that are whole JSON, gives
+// no text (an MSVC stream would report it as the end of the file), so serve.json is then left as it is.
+bool read_chunks(const ChunkSource& src, std::string* text);
+// The whole file at `path` (a UTF-8 path: _wfopen on Windows, fopen elsewhere), through read_chunks; false where it
+// cannot be opened or read to its end.
+bool read_whole_file(const std::string& path, std::string* text);
 
 // POST /v1/load's body (and the settings file's "last"): {"model", "drafters", "ctx", "drafter", "speculative", "kv",
 // "name"} over `base`, the command line's engine options.

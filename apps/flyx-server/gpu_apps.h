@@ -14,6 +14,7 @@
 #pragma once
 
 #include <cstdint>
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -40,6 +41,10 @@ struct GpuAppSnapshot {
   uint64_t others_bytes = 0;  // mem_used minus own_bytes (clamped)
   uint64_t system_bytes = 0;  // local VRAM held by OS desktop/compositor processes (read-only summary)
   std::string idle_igpu;      // optional name of an idle integrated GPU if present
+  // The device the readings are of is the one the hint names and no other could be: the only GPU of its name (the
+  // only one, without a hint).  Identical GPUs are told apart by no name, and the backend reports no PCI or UUID
+  // identity (flyx_device_info), so readings of one of several are not taken for the device a model is on.
+  bool device_unique = false;
   std::vector<GpuApp> apps;   // non-self, non-system apps sorted by bytes descending
 };
 
@@ -73,6 +78,23 @@ GpuAppSnapshot list_ram_apps();
 GpuCloseResult close_ram_app(const std::string& id, bool force);
 
 // Pure helpers exposed for unit testing.
+// A GPU as an enumeration (NVML's, DXGI's) saw it: whether it could be opened, and its name where that was read.
+struct DeviceSeen {
+  bool handle = false;
+  std::optional<std::string> name;
+};
+// Which of the GPUs listed a hint names (`either_way`: the hint may hold the name too, as DXGI's descriptions): the
+// first it names, else the first named, else the first opened, for its memory and processes (-1: none opened).
+// `unique`: readings of it are surely the hinted device's, which takes every GPU opened and named (one not could be
+// its twin) and then the one GPU there is or the only one the hint names.
+struct DeviceMatch {
+  int index = -1;
+  bool unique = false;
+};
+DeviceMatch match_device(const std::vector<DeviceSeen>& devices, const std::string& hint, bool either_way = false);
+// Windows: the readings of the adapter DXGI chose are the hinted device's where its enumeration says so and NVML's
+// (when NVML answered: `nvml_unique`) agrees; NVML unavailable, DXGI's alone.
+bool readings_unique(bool adapter_unique, std::optional<bool> nvml_unique);
 bool is_system_gpu_process(const std::string& proc_name, const std::string& exe_path);
 std::string clean_gpu_app_name(const std::string& proc_name, const std::string& product_name,
                                const std::string& file_desc);

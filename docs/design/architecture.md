@@ -9,7 +9,7 @@ System architecture, repository layout, execution pipeline, memory hierarchy, an
 Directory boundaries are architecture boundaries enforced by `tools/check_layering.py` (ctest `layering`). Dependencies point strictly inward: `core/` depends only on itself and `include/`; `ops/` only on `core/interfaces/` and `include/`; `models/` on `core/interfaces/` and `core/modelfile/`; `backends/` on `core/interfaces/`, `ops/`, and `include/`; `apps/` wire layers together.
 
 ```text
-include/flyx/         Public C API (flyx.h, version 3) and engine <-> backend ABI (backend_abi.h, version 53)
+include/flyx/         Public C API (flyx.h, version 3) and engine <-> backend ABI (backend_abi.h, version 55)
 core/                 Plain C++20 engine, zero CUDA headers
   interfaces/         Shared headers: model.h (open_model), chat.h (open_chat), options.h, vision.h
   modelfile/          Format-agnostic mmap container: .flyx (flyx_format.cpp) & GGUF container (gguf_format.cpp)

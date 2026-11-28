@@ -91,34 +91,36 @@ function draftersOf(L) {
   return out;
 }
 
-// The memory a new model may use: the GPU's, less what other programs hold (flyx's own model goes when it switches).
-let gpuTotal = Number(saved.get("gpu_total")) || 0;
-function deviceReserve(total, m) {
-  if (m && typeof m.device_reserve === "number" && m.device_reserve >= 0) return m.device_reserve;
-  return Math.max(384 * 1048576, total / 40);
-}
-function freeForModel() {
+// The GPU memory a model may take, as the server's planner counts it (telemetry, docs/monitor.md): with a model loaded
+// its budget (memory.ledger_budget: other programs and the reserve already out, flyx's own model going when it
+// switches), else the device's free memory less the planner's reserve (memory.device_reserve).  null when the server
+// does not say; the page computes no reserve of its own.
+// A figure the server sent (not null, absent or NaN); a measure without one of its parts is unknown, not 0.
+const known = (v) => typeof v === "number" && isFinite(v);
+// GiB of a figure that is known, 0 too ("0.0", where gib() shows "-" for none).
+const gibOf = (b) => (b / 1073741824).toFixed(b >= 1e11 ? 0 : 1);
+function modelBudget() {
   const d = live.last && live.last.device, m = live.last && live.last.memory;
-  if (!d || !d.mem_total) return gpuTotal || 0;
-  // When a model is loaded, ledger_budget is the engine's real VRAM ceiling (already excluding other programs and the
-  // device reserve, without miscounting flyx's own CUDA context / driver pool as other programs).
-  if (m && m.ledger_budget) return Math.min(d.mem_total, m.ledger_budget + deviceReserve(d.mem_total, m));
-  return Math.max(0, d.mem_total - (d.mem_used || 0));
+  if (m && known(m.ledger_budget) && m.ledger_budget > 0)  // 0: a backend that keeps no ledger (cpu_ref)
+    return { budget: m.ledger_budget, reserve: known(m.device_reserve) ? m.device_reserve : null };
+  if (!d || !m || !known(d.mem_total) || d.mem_total <= 0 || !known(d.mem_used) || !known(m.device_reserve)) return null;
+  return { budget: Math.max(0, d.mem_total - d.mem_used - m.device_reserve), reserve: m.device_reserve };
 }
-function FitTag({ size }) {
-  const d = live.last && live.last.device, m = live.last && live.last.memory;
-  const room = freeForModel();
-  if (!room || !size) return html`<span class="tag2">?</span>`;
-  // Untied embeddings (~4% on 27B) stay in host RAM; ~0.85 GB covers workspace and one minimal session beyond reserve.
-  const res = deviceReserve(d && d.mem_total ? d.mem_total : room, m);
-  const budget = m && m.ledger_budget ? m.ledger_budget : Math.max(0, room - res);
-  const estWeights = size * 0.96;
-  const fits = estWeights + 0.85e9 < budget;
-  const budgetTxt = budget ? gib(budget) : "0.0";
-  const resTxt = res ? gib(res) : "0.0";
-  const title = "Estimate: " + gb(estWeights) + " GB of weights + 0.85 GB workspace/session against " + budgetTxt +
-                " GiB available VRAM budget (after " + resTxt + " GiB reserve). Long contexts need more; the engine's bill shows once it loads.";
-  return html`<span class=${"tag2 " + (fits ? "ok" : "bad")} title=${t(title)}>${t(fits ? "fits" : "too big")}</span>`;
+// Whether a model fits the GPU.  The one served: by the engine's own bill.  Any other: only its file is known here
+// (no layout, context, drafter or projector), so the tag says it compares the file's size with the budget, nothing
+// more; the engine sizes the rest as it loads and says what it gave up.  The titles are sentences the languages'
+// rules know (i18n/*.js), their figures in them.
+function FitTag({ size, serving }) {
+  const m = live.last && live.last.memory;
+  if (serving && m && known(m.ledger_budget) && m.ledger_budget > 0 && known(m.ledger_used) && m.ledger_used > 0)
+    return html`<span class="tag2 ok" title=${t("Loaded: " + gibOf(m.ledger_used) + " of " + gibOf(m.ledger_budget) + " GiB")}>${t("fits")}</span>`;
+  const room = modelBudget();
+  if (!room || !known(size) || size <= 0) return html`<span class="tag2" title=${t("The server has not said how much GPU memory a model may take.")}>?</span>`;
+  const fits = size <= room.budget;
+  const title = "The file alone: " + gb(size) + " GB against " + gibOf(room.budget) + " GiB of GPU memory for a model" +
+                (room.reserve !== null ? " (after a " + gibOf(room.reserve) + " GiB reserve)" : "") +
+                ". Its context, drafter and projector need more, its embedding can stay in host memory; the engine sizes them as it loads.";
+  return html`<span class=${"tag2 " + (fits ? "ok" : "bad")} title=${t(title)}>${t(fits ? "file fits" : "file too big")}</span>`;
 }
 
 const kDrafterLabels = { mtp: "MTP", dflash2: "DFlash2", dflash: "DFlash", dspark: "DSpark", dspine: "DSpine", eagle4: "EAGLE-4", dv: "DV" };
@@ -284,6 +286,8 @@ function loadBody(chosen, f, hasLoaded = false) {
   const ctx = ctxText === "max" ? "max" : ctxTokens > 0 ? ctxTokens : null;  // "max": the model's own, or the longest that fits
   const kvRam = parseFloat(f.kvram), kvGpu = parseInt(f.kvgpu, 10), name = f.name.trim(), lora = f.lora.trim();
   const vramRes = parseFloat(f.vramres), ramRes = parseFloat(f.ramres);
+  // A blank field beside a loaded model was cleared: "auto", whatever the server's flag was (null would keep it, a
+  // command line from it would not); before any model, null leaves the server's own --kv-gpu and reserves.
   const blankReserve = hasLoaded ? "auto" : null;
   const own = f.draftSource === "custom" && f.spec ? f.drafter.trim() : "";
   const adv = { width: f.width ? parseInt(f.width, 10) : null, draft_trees: f.trees === "on" ? true : f.trees === "off" ? false : null, lookup: f.lookup,
@@ -299,7 +303,7 @@ function loadBody(chosen, f, hasLoaded = false) {
                 vision_max_tokens: Number.isFinite(vmax) && vmax > 0 ? vmax : null };
   // kv "auto": the engine's default, not the server's --kv (null would keep that)
   return Object.assign({ model: chosen, ctx, kv: f.kv || "auto", kv_ram: kvRam >= 0 ? kvRam : "auto",
-                         kv_gpu: kvGpu >= 0 ? kvGpu : null,
+                         kv_gpu: kvGpu >= 0 ? kvGpu : blankReserve,
                          vram_reserve: vramRes >= 0 ? vramRes : blankReserve, ram_reserve: ramRes >= 0 ? ramRes : blankReserve,
                          name: name || null, lora: lora || null, speculative: f.spec },
                        draft, adv, vis);
@@ -318,7 +322,7 @@ function commandOf(b, shell) {
   if (b.ctx) parts.push("--ctx " + b.ctx);
   if (b.kv !== "auto") parts.push("--kv " + b.kv);
   if (b.kv_ram !== "auto") parts.push("--kv-ram " + b.kv_ram);
-  if (b.kv_gpu !== null) parts.push("--kv-gpu " + b.kv_gpu);
+  if (typeof b.kv_gpu === "number") parts.push("--kv-gpu " + b.kv_gpu);
   if (b.vram_reserve !== undefined && b.vram_reserve !== null && b.vram_reserve !== "auto") parts.push("--vram-reserve " + b.vram_reserve);
   if (b.ram_reserve !== undefined && b.ram_reserve !== null && b.ram_reserve !== "auto") parts.push("--ram-reserve " + b.ram_reserve);
   if (!b.speculative) parts.push("--no-spec");
@@ -725,10 +729,6 @@ export function ModelPage({ active, libraryAsked, currentAsked }) {
 
   useEffect(() => { if (active) refreshCached(); }, [active]);
   useEffect(() => {
-    if (tm.device && tm.device.mem_total && tm.device.mem_total !== gpuTotal) {
-      gpuTotal = tm.device.mem_total;
-      saved.set("gpu_total", String(gpuTotal));
-    }
     // Decided on the first answer this draw was made from: `model` is that draw's, and telemetry may have come since.
     if (!viewed.current && "model" in tm) {
       viewed.current = true;
@@ -745,6 +745,10 @@ export function ModelPage({ active, libraryAsked, currentAsked }) {
   }, [live.last]);
 
   const entryOf = (name) => catalog && catalog.models.find((m) => m.name === name);
+  // Whether a row (or a library entry) is the model served: its name as the load named it, or its file the one served
+  // (GET /v1/load's loaded_file), so "org/model" served is its "org/model:QUANT" row, "./m.gguf" its absolute one.
+  const isServed = (name, disk) => !!loadedWant &&
+    (name === loadedWant.model || (!!disk && typeof L.loaded_file === "string" && eqPath(disk, L.loaded_file)));
   async function removeCached(m) {
     const d = describe(m, winPaths);
     const ok = await confirmBox("Delete " + (d.quant || d.file || m.name) + "?",
@@ -878,7 +882,7 @@ export function ModelPage({ active, libraryAsked, currentAsked }) {
   };
   const applyCompanions = (draft, mmprojSpec) => {
     setF((current) => Object.assign({}, current,
-      pickedDrafter(draft.spec, draft.kind),
+      pickedDrafter(draft.spec, draft.mode),
       mmprojSpec ? { vision: true, visionSource: "custom", mmproj: mmprojSpec, mmprojPicked: true } : {}));
     setView("current");
     setStab("spec");
@@ -1193,19 +1197,19 @@ export function ModelPage({ active, libraryAsked, currentAsked }) {
   // ---- the rows of what can be loaded, and the box that loads the one chosen ----
   // rows: {name, title, sub, tags: [[text, tone]], size, off (cannot be chosen), del (a cached model, to delete)}
   function rowsView(rows) {
-    const serving = loadedWant ? loadedWant.model : null, remembered = L.remembered ? L.remembered.model : null;
+    const remembered = L.remembered ? L.remembered.model : null;
     return rows.map((r) => html`
       <div class=${"mrow" + (r.name === target ? " sel" : "") + (r.off ? " off" : "")} data-name=${r.name} role="option" aria-selected=${String(r.name === target)}
            onClick=${r.off ? undefined : () => { setTarget(r.name === target ? "" : r.name); setMsg(""); }}>
         <span class="radio"></span>
         <div><div class="q">${r.title}</div>${r.sub ? html`<div class="fn">${r.sub}</div>` : ""}</div>
         <div class="tags">
-          ${serving && r.name === serving ? html`<span class="tag2 live">${t("serving")}</span>`
+          ${isServed(r.name, r.disk) ? html`<span class="tag2 live">${t("serving")}</span>`
             : remembered && r.name === remembered ? html`<span class="tag2">${t("last loaded")}</span>` : ""}
           ${r.tags.map(([text, tone]) => html`<span class=${"tag2 " + (tone || "")}>${t(text)}</span>`)}
         </div>
         <div class="sz">${r.size ? sized(r.size) : "-"}</div>
-        <div class="fit">${r.off ? "" : html`<${FitTag} size=${r.size}/>`}</div>
+        <div class="fit">${r.off ? "" : html`<${FitTag} size=${r.size} serving=${isServed(r.name, r.disk)}/>`}</div>
         ${r.del ? html`<button class="iconbtn del" title=${t("Delete from the Hugging Face cache")} aria-label=${t("Delete")}
                                onClick=${(e) => { e.stopPropagation(); removeCached(r.del); }}><${Icon} name="trash"/></button>` : html`<span></span>`}
       </div>`);
@@ -1250,7 +1254,7 @@ export function ModelPage({ active, libraryAsked, currentAsked }) {
     if (hasMain) {
       const overrides = (selDraft || selMm) ? {
         drafter: selDraft ? selDraft.spec : null,
-        drafterKind: selDraft?.kind,
+        drafterKind: selDraft?.mode,  // what a load is told: never the display kind (a name's guess)
         mmproj: selMm ? selMm.spec : null,
         drafterSize: selDraft ? (selDraft.size || 0) : 0,
         drafterCached: selDraft ? !!selDraft.cached : true,
@@ -1281,7 +1285,7 @@ export function ModelPage({ active, libraryAsked, currentAsked }) {
     }
     return {
       action: { title: selDraft.file, sub, label: "Draft with it", disabled: !model.id || busy,
-                onClick: () => { draftWith(selDraft.spec, selDraft.kind); clearPicked(); } },
+                onClick: () => { draftWith(selDraft.spec, selDraft.mode); clearPicked(); } },
       overrides: null,
     };
   }
@@ -1295,7 +1299,7 @@ export function ModelPage({ active, libraryAsked, currentAsked }) {
     if (m.current === false) tags.push(["older revision", "info"]);
     if (m.parts > 1) tags.push([m.parts + " parts"]);
     return { name: m.name, title: d.quant || d.file || m.name, sub: d.quant ? (d.file || m.name) : "", tags, size: m.size,
-             del: m.source === "hub" ? m : null };
+             disk: m.path || null, del: m.source === "hub" ? m : null };
   };
   // `rows`: the ones shown, so a choice made elsewhere is not loaded from here.  `note`: what stands in the way.
   // `action` (optional): replaces loading with a companion action (e.g., attaching an mmproj or drafter).
@@ -1312,8 +1316,11 @@ export function ModelPage({ active, libraryAsked, currentAsked }) {
           <button class="btn primary" id="mf-load" disabled=${!!action.disabled} onClick=${action.onClick}>${t(action.label)}</button>
         </div>`;
     }
-    const row = rows.find((r) => r.name === target && !r.off), name = row ? row.name : "";
-    const same = !!loadedWant && name === loadedWant.model, m = entryOf(name);
+    // The row of the file served, by whatever name it was loaded ("org/model" served, its "org/model:QUANT" row): the
+    // load as it was asked, so the action is a reload of it with its settings (LoRA, projector, drafter, API name).
+    const row = rows.find((r) => r.name === target && !r.off);
+    const name = !row ? "" : isServed(row.name, row.disk) ? loadedWant.model : row.name;
+    const same = !!loadedWant && name === loadedWant.model, m = entryOf(name) || (row && entryOf(row.name));
     const eff = settingsFor(name, overrides), effNow = shown(loadBody(name, eff, Boolean(loadedWant)));
     const effChanged = before ? diffShown(before, effNow) : [];
     let label = "Load model", disabled = !name || busy || !!note;
@@ -1395,7 +1402,8 @@ export function ModelPage({ active, libraryAsked, currentAsked }) {
       if (!whole(g)) tags.push(["split, incomplete"]);
       if (g.cached) tags.push(["downloaded", "info"]);
       const m = entryOf(g.name);
-      return { name: g.name, title: g.quant, sub: "", tags, size: g.size, off: !whole(g), del: m && m.source === "hub" ? m : null };
+      return { name: g.name, title: g.quant, sub: "", tags, size: g.size, off: !whole(g), disk: (m && m.path) || g.disk || null,
+               del: m && m.source === "hub" ? m : null };
     }) : [];
     const rawComps = j && Array.isArray(j.companions) ? j.companions : [
       ...(j && j.mtp ? [{ name: repoSel + ":" + baseName(j.mtp.path) + revSuffix, path: j.mtp.path, file: baseName(j.mtp.path),
@@ -1404,7 +1412,10 @@ export function ModelPage({ active, libraryAsked, currentAsked }) {
                              kind: "mmproj", size: j.mmproj.size, cached: !!j.mmproj.cached, disk: null, default: true }] : []),
     ];
     const comps = rawComps.map((c) => ({ ...c, key: c.name, spec: c.disk || c.name,
-      kind: c.kind === "mmproj" ? c.kind : (c.drafter_kind ?? c.kind) }));
+      // kind: what the list shows (the server's, from a cached header else the file's name); mode: what a load is
+      // told, the cached header's kind alone (drafter_kind), "" leaving it to the loader.
+      kind: c.kind === "mmproj" ? c.kind : (c.kind || c.drafter_kind || ""),
+      mode: c.kind === "mmproj" ? "" : (c.drafter_kind || "") }));
     const hubDraft = hubView.draft, hubMmproj = hubView.mmproj;
     const setHubDraft = (v) => dispatchHub({ type: "draft", value: v });
     const setHubMmproj = (v) => dispatchHub({ type: "mmproj", value: v });
@@ -1541,7 +1552,6 @@ export function ModelPage({ active, libraryAsked, currentAsked }) {
     if (!catalog) return html`<div class="empty pad">${t("Looking...")}</div>`;
     const act = (go) => (e) => { e.stopPropagation(); go(); };
     const onEnter = (go) => (e) => { if (e.key === "Enter" && e.target === e.currentTarget) go(); };
-    const serving = loadedWant ? loadedWant.model : null;
     return html`
       ${places.map((p) => {
         const all = modelsOf(p), state = listings[p] || {};
@@ -1568,7 +1578,7 @@ export function ModelPage({ active, libraryAsked, currentAsked }) {
               <div class=${"prow act model" + (picked === m.name ? " sel" : "")} role="button" tabindex="0" data-model=${m.name} onClick=${go} onKeyDown=${onEnter(go)}>
                 <span class="pn item"><${Icon} name=${iconOfModel(m)} cls=${kindCls(m)}/><span class="pn-t">${titleOf(m)}</span></span>
                 <span class="pm">${m.size ? sized(m.size) : ""}</span>
-                <span class="ps">${under}${serving && m.name === serving ? html` <span class="tag2 live">${t("serving")}</span>` : ""}</span>
+                <span class="ps">${under}${isServed(m.name, m.path) ? html` <span class="tag2 live">${t("serving")}</span>` : ""}</span>
                 <span class="pt">${t(kindOfModel(m))}</span>
                 ${hubModel ? html`<button class="iconbtn del" title=${t("Delete from the Hugging Face cache")} aria-label=${t("Delete")}
                                           onClick=${act(() => removeCached(m))}><${Icon} name="trash"/></button>` : html`<span class="del"></span>`}
@@ -1596,13 +1606,13 @@ export function ModelPage({ active, libraryAsked, currentAsked }) {
     if (m.mmproj === "in-repo") chips.push([t("+ Vision"), "ok"]);
     if (m.parts > 1) chips.push([t(m.parts + " parts"), ""]);
     if (m.current === false) chips.push([t("older revision"), "info"]);
-    if (loadedWant && m.name === loadedWant.model) chips.push([t("serving"), "live"]);
+    if (isServed(m.name, m.path)) chips.push([t("serving"), "live"]);
     const action = mmproj
       ? { title: m.path || m.name, sub: "A vision projector is not loaded on its own.", label: "Use as projector",
           disabled: !model.id || busy, onClick: () => projectWith(m.path || m.name) }
       : drafter
       ? { title: m.name, sub: "A drafter is not loaded on its own.", label: "Draft with it",
-          disabled: !model.id || busy, onClick: () => draftWith(m.path || m.name, m.drafter_kind) }
+          disabled: !model.id || busy, onClick: () => draftWith(m.path || m.name, m.drafter_mode || "") }
       : lora
       ? { title: m.path || m.name, sub: "A LoRA adapter is not loaded on its own.", label: "Use with the model",
           disabled: !model.id || busy, onClick: () => loraWith(m.source === "hub" ? m.name : m.path || m.name) }
@@ -1616,7 +1626,7 @@ export function ModelPage({ active, libraryAsked, currentAsked }) {
           ${hubModel && d.repo && (standalone(m) || (drafter && d.quant)) ? html`<button class="btn ghost sm" id="lc-quants" onClick=${() => openHubRepo(d.repo, pinnedRev)}>${t("All its quantizations")}</button>` : ""}
           ${hubModel ? html`<button class="btn ghost sm" id="lc-delete" onClick=${() => removeCached(m)}><${Icon} name="trash"/>${t("Delete")}</button>` : ""}
         </div>
-        <div class="dchips">${chips.map(([text, tone]) => html`<span class=${"tag2 " + tone}>${text}</span>`)}${standalone(m) ? html`<${FitTag} size=${m.size}/>` : ""}</div>
+        <div class="dchips">${chips.map(([text, tone]) => html`<span class=${"tag2 " + tone}>${text}</span>`)}${standalone(m) ? html`<${FitTag} size=${m.size} serving=${isServed(m.name, m.path)}/>` : ""}</div>
         <dl class="stats small">
           <div><dt>${t("Size")}</dt><dd>${m.size ? sized(m.size) : "-"}</dd></div>
           ${m.modified ? html`<div><dt>${t("Modified")}</dt><dd>${t(ago(m.modified))}</dd></div>` : ""}
@@ -1668,7 +1678,7 @@ export function ModelPage({ active, libraryAsked, currentAsked }) {
                       onClick=${() => removeRepo(name, all)}><${Icon} name="trash"/></button></div>
             ${mine.length ? html`<div class="mrows" role="listbox">${rowsView(mine)}</div>` : ""}
             ${drafters.map((dr) => html`<div class="banner hint"><div class="grow2">${t(dr.name + " is a drafter (" + gb(dr.size) + " GB), not a model: it drafts for one, and is not loaded on its own.")}</div>
-              ${model.id ? html`<button class="btn sm" onClick=${() => draftWith(dr.path || dr.name, dr.drafter_kind)}>${t("Draft with it")}</button>` : ""}</div>`)}
+              ${model.id ? html`<button class="btn sm" onClick=${() => draftWith(dr.path || dr.name, dr.drafter_mode || "")}>${t("Draft with it")}</button>` : ""}</div>`)}
           </div>`;
       });
       const extraAll = extraDirModels(cacheDir);
@@ -1701,13 +1711,15 @@ export function ModelPage({ active, libraryAsked, currentAsked }) {
     const singleDrafter = j && j.kind === "file" && folderDrafters.length === 1 ? folderDrafters[0] : null;
     const relOf = (m) => j && j.kind === "dir" && m.path.length > j.path.length ? stripLeadSep(m.path.slice(j.path.length)) : m.file;
     const localComps = [
+      // A file on this machine: its kind for the list (drafter_kind: maybe its name's), the mode its header proves for a
+      // load (drafter_mode, GET /v1/hub/dir and /v1/hub/cached).
       ...folderDrafters.map((m) => ({
         key: m.path || m.name, spec: m.path || m.name, file: m.file, path: relOf(m),
-        kind: m.drafter_kind || "", size: m.size, cached: true, default: false,
+        kind: m.drafter_kind || "", mode: m.drafter_mode || "", size: m.size, cached: true, default: false,
       })),
       ...folderMmproj.map((m) => ({
         key: m.path || m.name, spec: m.path || m.name, file: m.file, path: relOf(m),
-        kind: "mmproj", size: m.size, cached: true, default: false,
+        kind: "mmproj", mode: "", size: m.size, cached: true, default: false,
       })),
     ];
     const selLocalDraft = localComps.find((c) => c.kind !== "mmproj" && c.key === localDraft) || null;
@@ -1718,7 +1730,7 @@ export function ModelPage({ active, libraryAsked, currentAsked }) {
           overrides: null }
       : singleDrafter
       ? { action: { title: singleDrafter.path || singleDrafter.name, sub: "A drafter is not loaded on its own.",
-                    label: "Draft with it", disabled: !model.id || busy, onClick: () => draftWith(singleDrafter.path || singleDrafter.name, singleDrafter.drafter_kind) },
+                    label: "Draft with it", disabled: !model.id || busy, onClick: () => draftWith(singleDrafter.path || singleDrafter.name, singleDrafter.drafter_mode || "") },
           overrides: null }
       : companionBarState(rows, selLocalDraft, selLocalMm, () => { setLocalDraft(""); setLocalMmproj(""); });
     const loadNote = start ? "Open a folder to see its model files." : "";

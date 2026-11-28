@@ -163,6 +163,12 @@ GgufClassification gguf_identity(const flyx::GgufPeek& peek, const std::string& 
 
 }  // namespace
 
+std::string drafter_mode_of(const GgufClassification& c) {
+  if (c.arch.empty()) return "";
+  if (c.arch == "dflash") return c.drafter_kind;  // dspark or dflash2, by the header's Markov flag
+  return c.mtp_layers > 0 ? "mtp" : "";
+}
+
 GgufClassification classify_gguf(const std::string& path, const std::string& rel_name, uint64_t size,
                                  fs::file_time_type modified, const PathAllowFn& allow_path) {
   std::string name = rel_name.empty() ? path : rel_name;
@@ -455,6 +461,7 @@ std::vector<LocalModel> scan_model_dirs(const std::vector<std::string>& dirs, in
               if (cls.kind.empty()) return more;
               m.kind = cls.kind;
               m.drafter_kind = cls.drafter_kind;
+              m.drafter_mode = drafter_mode_of(cls);
               m.mtp_layers = cls.mtp_layers;
             } else {
               m.kind = "flyx";
@@ -492,6 +499,7 @@ std::vector<LocalModel> scan_model_dirs(const std::vector<std::string>& dirs, in
     m.file = first.file;
     m.kind = cls.kind;
     m.drafter_kind = cls.drafter_kind;
+    m.drafter_mode = drafter_mode_of(cls);
     m.mtp_layers = cls.mtp_layers;
     m.quant = hub::quant_in_name(first.file);
     m.size = total;
@@ -556,9 +564,15 @@ std::string drafter_kind(const std::string& path, const PathAllowFn& allow_path)
   return flyx::drafter_source_kind(path, allow_path);
 }
 
-std::string drafter_kind(const hub::Repo& r) {
-  if (hub::is_drafter(r)) return hub::drafter_kind(r);
-  return r.info.gguf_architecture == "dflash" ? "dflash2" : "";
+std::string drafter_kind(const hub::Repo& r, const hub::Name& name, const PathAllowFn& allow_path) {
+  // The file the name selects first: a repository can hold a drafter's config and GGUF drafters of other kinds.
+  std::vector<hub::RepoFile> files;
+  std::string err;
+  if (!hub::select(r, name, &files, &err) || files.empty()) return "";
+  if (files.front().path == "config.json") return hub::drafter_kind(r);  // the drafter's directory: its config
+  for (const HubGguf& g : hub_ggufs(r, allow_path))
+    if (g.choice.file.path == files.front().path) return g.cached ? drafter_kind(g.disk, allow_path) : "";
+  return "";
 }
 
 bool reads_vision(const std::string& arch) {
@@ -763,10 +777,13 @@ bool fetch_model(const std::string& model, const std::vector<std::string>& draft
   for (const std::string& d : drafters) {
     hub::Repo drepo;
     std::string path;
+    std::error_code dir_ec;
     if (!one(d, progress, stop, &path, &drepo, err, allow_path)) return false;
     out->drafters.push_back(path);
     out->drafter_sources.push_back(
-        {drepo.id.empty() || !hub::is_drafter(drepo) ? drafter_kind(path, allow_path) : hub::drafter_kind(drepo),
+        {drepo.id.empty() || !hub::is_drafter(drepo) || !fs::is_directory(to_path(path), dir_ec)
+             ? drafter_kind(path, allow_path)  // a file: its own header, whatever else the repository holds
+             : hub::drafter_kind(drepo),
          drepo.id.empty() ? path : clean_hub(d),
          bytes_on_disk(path, allow_path)});
   }
@@ -778,7 +795,11 @@ bool fetch_model(const std::string& model, const std::vector<std::string>& draft
     out->mmproj_source = mrepo.id.empty() ? mpath : clean_hub(mmproj);
     out->mmproj_size = bytes_on_disk(mpath, allow_path);
   }
-  if (!lora.empty() && !fetch_lora(lora, progress, stop, &out->lora, err, allow_path)) return false;
+  if (!lora.empty()) {
+    if (!fetch_lora(lora, progress, stop, &out->lora, err, allow_path)) return false;
+    // An empty path loads no adapter: never the base model answering for the adapter asked for.
+    if (out->lora.empty()) return *err = lora + ": names no LoRA adapter's directory", false;
+  }
   bool has_dspark = false;  // named: none other is taken
   for (const auto& ds : out->drafter_sources) has_dspark = has_dspark || ds.kind == "dspark";
   if (repo.id.empty()) {  // a path: only a DSpark drafter beside it to know of
@@ -853,9 +874,33 @@ bool fetch_model(const std::string& model, const std::vector<std::string>& draft
 
 bool fetch_lora(const std::string& spec, const hub::ProgressFn& progress, const std::atomic<bool>* stop,
                 std::string* path, std::string* err, const PathAllowFn& allow_path) {
-  auto take_local = [&](const std::string& p) {  // the directory, or a file of it (its adapter_config.json, adapter_model.safetensors)
+  // The directory, or one of the two files PEFT saves in it (adapter_config.json, adapter_model.safetensors): their
+  // directory, the current one for a bare file name.  Never empty: an empty path asks for no adapter, and the base
+  // model would answer in the adapter's name.
+  auto take_local = [&](const std::string& p) {
     std::error_code ec;
-    const std::string resolved = fs::is_directory(to_path(p), ec) ? p : from_path(to_path(p).parent_path());
+    std::string resolved = p;
+    if (!fs::is_directory(to_path(p), ec)) {
+      const fs::path file = to_path(p);
+      const fs::path dir = file.has_parent_path() ? file.parent_path() : fs::path(".");
+      // The file itself is one of the two, by the file system's identity (ADAPTER_CONFIG.JSON on a volume that
+      // ignores case), not by the spelling typed.  Each of the two is a path of its own the policy decides on before
+      // it is looked at: comparing identities follows its links and reparse points.
+      bool denied = false;
+      const auto is = [&](const char* name) {
+        const fs::path sibling = dir / name;
+        if (allow_path && !allow_path(from_path(sibling))) return denied = true, false;
+        std::error_code e;
+        return fs::equivalent(file, sibling, e);
+      };
+      if (!is("adapter_config.json") && !is("adapter_model.safetensors")) {
+        if (denied) return *err = p + ": path is not allowed by remote path policy", false;
+        return *err = p + ": not a LoRA adapter (its directory, of adapter_config.json and adapter_model.safetensors, "
+                          "or one of those two files)",
+               false;
+      }
+      resolved = file.has_parent_path() ? from_path(dir) : std::string(".");
+    }
     if (allow_path && !allow_path(resolved))
       return *err = resolved + ": path is not allowed by remote path policy", false;
     *path = resolved;

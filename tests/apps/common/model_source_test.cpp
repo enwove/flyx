@@ -2,12 +2,14 @@
 // apps/common/model_source: the DSpark drafter published beside a model, taken by default (wants_dspark): the one a
 // GGUF on disk has beside it (dspark_beside: its name, then its header), and the default dspark-*.gguf of the model's
 // repository, here a Hugging Face cache read offline.  Neither replaces a drafter that was named.
+#include <algorithm>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
 #include <string>
+#include <string_view>
 #include <vector>
 
 #include "apps/common/model_source.h"
@@ -179,10 +181,81 @@ int main() {
   auto listing = flyx::apps::hub_ggufs(generic);
   check(listing.size() == 1 && !listing[0].cached && listing[0].cls.kind == "drafter" &&
             listing[0].cls.drafter_kind.empty(), "uncached dflash GGUF is a selectable drafter of unknown type");
+  // What GET /v1/hub/drafter says of a name the dashboard was given: the selected file's own kind, unknown (the
+  // loader's auto) until its header is in the cache, never DFlash2 for the repository's architecture.
+  flyx::hub::Name generic_name;
+  check(flyx::hub::parse_name(generic.id, &generic_name) && flyx::apps::drafter_kind(generic, generic_name).empty(),
+        "a Hub name's uncached dflash GGUF is of unknown kind, not DFlash2 by its repository's architecture");
   write_gguf(to_path(flyx::hub::snapshot_dir(generic)) / "helper.gguf", "dflash", 1);
   listing = flyx::apps::hub_ggufs(generic);
   check(listing.size() == 1 && listing[0].cached && listing[0].cls.drafter_kind == "dspark",
         "cached selection uses the same file's Markov header");
+  check(flyx::apps::drafter_kind(generic, generic_name) == "dspark", "and so does the Hub name's kind once cached");
+  {
+    flyx::hub::Repo plain_dflash = generic;
+    plain_dflash.id = "acme/Generic-DFlash2";
+    flyx::hub::Name n;
+    write_gguf(to_path(flyx::hub::snapshot_dir(plain_dflash)) / "helper.gguf", "dflash", 0);
+    check(flyx::hub::parse_name(plain_dflash.id, &n) && flyx::apps::drafter_kind(plain_dflash, n) == "dflash2",
+          "a cached dflash GGUF without the Markov flag is DFlash2's");
+    flyx::hub::Repo named = generic;
+    named.id = "acme/Named-DSpark";
+    named.files = {{"dspark-Ink-Q8_0.gguf", 0, "", ""}};
+    check(flyx::hub::parse_name(named.id, &n) && flyx::apps::drafter_kind(named, n).empty(),
+          "an uncached dspark-*.gguf is of unknown kind too: no kind from a name");
+    // What a picked companion may tell a load (GET /v1/hub/files' drafter_kind): the cached header's kind alone; the
+    // list's kind of an uncached file can be its name's guess.
+    const auto named_listing = flyx::apps::hub_ggufs(named);
+    check(named_listing.size() == 1 && named_listing[0].cls.drafter_kind == "dspark" &&
+              named_listing[0].header_drafter_kind().empty(),
+          "a misleadingly named uncached companion: listed as its name says, its mode left to the loader");
+    check(listing.size() == 1 && listing[0].header_drafter_kind() == "dspark",
+          "a cached one: the mode its header says");
+    // A repository with a drafter's config (DFlash2) and a GGUF of another kind beside it, the GGUF named: the
+    // selected file's own header (Markov: DSpark), not the repository's config.
+    flyx::hub::Repo mixed = generic;
+    mixed.id = "acme/Mixed-Drafters";
+    mixed.architectures = {"DFlash2DraftModel"};
+    mixed.files = {{"config.json", 0, "", ""}, {"model.safetensors", 0, "", ""}, {"dspark-Mixed-Q8_0.gguf", 0, "", ""}};
+    flyx::hub::Name whole, gguf_named;
+    check(flyx::hub::parse_name(mixed.id, &whole) && flyx::hub::parse_name(mixed.id + ":dspark-Mixed-Q8_0.gguf", &gguf_named),
+          "the mixed repository's names parse");
+    check(flyx::apps::drafter_kind(mixed, gguf_named).empty(), "its uncached GGUF named: unknown, not its config's DFlash2");
+    write_gguf(to_path(flyx::hub::snapshot_dir(mixed)) / "dspark-Mixed-Q8_0.gguf", "dflash", 1);
+    check(flyx::apps::drafter_kind(mixed, gguf_named) == "dspark", "cached: its own header's DSpark");
+    check(flyx::apps::drafter_kind(mixed, whole) == "dflash2",
+          "the repository named alone selects its config and safetensors: the config's DFlash2");
+    // A cached mtp-*.gguf whose header is an ordinary model's, no MTP layers in it: listed as MTP by its name, but
+    // neither GET /v1/hub/files' drafter_kind nor GET /v1/hub/drafter tells a load it is one.
+    flyx::hub::Repo mtp_named = generic;
+    mtp_named.id = "acme/Mtp-Named";
+    mtp_named.files = {{"mtp-Tiny-Q8_0.gguf", 0, "", ""}};
+    write_gguf(to_path(flyx::hub::snapshot_dir(mtp_named)) / "mtp-Tiny-Q8_0.gguf", "qwen35");
+    const auto mtp_listing = flyx::apps::hub_ggufs(mtp_named);
+    flyx::hub::Name mtp_name;
+    check(mtp_listing.size() == 1 && mtp_listing[0].cached && mtp_listing[0].cls.drafter_kind == "mtp" &&
+              mtp_listing[0].header_drafter_kind().empty(),
+          "a cached mtp-*.gguf with no MTP layers: MTP by its name in the list, no mode for a load");
+    check(flyx::hub::parse_name(mtp_named.id + ":mtp-Tiny-Q8_0.gguf", &mtp_name) &&
+              flyx::apps::drafter_kind(mtp_named, mtp_name).empty(),
+          "and the Hub name's kind the same: none");
+    // The same file in a folder of this machine (GET /v1/hub/dir, the --models-dir part of /v1/hub/cached): listed as
+    // MTP by its name, its drafter_mode, what a load is told, none; a header that proves its kind gives the mode.
+    const fs::path folder = tmp / "plain-mtp";
+    write_gguf(folder / "mtp-Plain-Q8_0.gguf", "qwen35");
+    write_gguf(folder / "dspark-Plain-Q8_0.gguf", "dflash", 1);
+    const auto here = flyx::apps::scan_model_dirs({from_path(folder)}, 1);
+    const auto at = [&](const char* file) {
+      for (const auto& m : here)
+        if (m.file == file) return m;
+      return flyx::apps::LocalModel{};
+    };
+    check(at("mtp-Plain-Q8_0.gguf").kind == "drafter" && at("mtp-Plain-Q8_0.gguf").drafter_kind == "mtp" &&
+              at("mtp-Plain-Q8_0.gguf").drafter_mode.empty(),
+          "a local mtp-*.gguf with no MTP layers: MTP in the list, no mode for a load");
+    check(at("dspark-Plain-Q8_0.gguf").drafter_kind == "dspark" && at("dspark-Plain-Q8_0.gguf").drafter_mode == "dspark",
+          "a local DSpark GGUF whose header says so: that mode");
+  }
   // A LoRA adapter of a repository listed as the Hub lists it (fetch_lora_in), its files' blobs standing in for the
   // transfers as above: a config longer than a load reads (modelfile::kPeftConfigMaxBytes) is refused by its listed
   // size before either file is fetched, the weights' blob there to be taken; one within it comes with its weights.
@@ -220,6 +293,72 @@ int main() {
     ok = flyx::apps::fetch_lora("'" + lora.id + ":small'", {}, nullptr, &path, &err);
     check(ok && to_path(path) == lsnap / "adapters" / "small",
           "single-quoted Hub LoRA name resolves via fallback" + (ok ? std::string() : ": " + err));
+  }
+
+  // A local adapter named by one of the two files PEFT saves: their directory, the current one for a bare file name
+  // (never an empty path, which would load no adapter and let the base model answer in its name); any other file is
+  // refused, and fetch_model never turns an adapter asked for into none.
+  {
+    const fs::path adir = tmp / "bare-lora";
+    fs::create_directories(adir);
+    std::ofstream(adir / "adapter_config.json", std::ios::binary) << R"({"peft_type":"LORA","r":8})";
+    std::ofstream(adir / "adapter_model.safetensors", std::ios::binary) << std::string(64, 'w');
+    std::ofstream(adir / "notes.txt", std::ios::binary) << "not an adapter";
+    const fs::path cwd = fs::current_path();
+    fs::current_path(adir);
+    std::string p;
+    for (const std::string file : {"adapter_model.safetensors", "adapter_config.json"}) {
+      p.clear();
+      ok = flyx::apps::fetch_lora(file, {}, nullptr, &p, &err);
+      check(ok && !p.empty() && fs::equivalent(to_path(p), adir, ec),
+            "a bare " + file + " is its directory, the current one: " + (ok ? p : err));
+      p.clear();
+      ok = flyx::apps::fetch_lora(from_path(adir / file), {}, nullptr, &p, &err);
+      check(ok && to_path(p) == adir, "a path to " + file + " is its directory: " + (ok ? p : err));
+    }
+    for (const std::string file : {std::string("notes.txt"), from_path(adir / "notes.txt")}) {
+      p = "untouched";
+      ok = flyx::apps::fetch_lora(file, {}, nullptr, &p, &err);
+      check(!ok && p == "untouched" && err.find("not a LoRA adapter") != std::string::npos,
+            "another file is refused, not its directory taken: " + err);
+    }
+    ok = flyx::apps::fetch_model(from_path(model), {}, false, {}, nullptr, &f, &err, "", false, false,
+                                 "adapter_model.safetensors");
+    check(ok && !f.lora.empty() && fs::equivalent(to_path(f.lora), adir, ec),
+          "fetch_model keeps the adapter a bare file name asks for: " + (ok ? f.lora : err));
+    ok = flyx::apps::fetch_model(from_path(model), {}, false, {}, nullptr, &f, &err, "", false, false, "notes.txt");
+    check(!ok && err.find("not a LoRA adapter") != std::string::npos,
+          "and refuses a load whose adapter is no adapter: " + err);
+#if defined(_WIN32)
+    // A volume that ignores case: the two files spelled otherwise are the same files, so their directory.
+    for (const std::string file : {"ADAPTER_CONFIG.JSON", "Adapter_Model.SafeTensors"}) {
+      p.clear();
+      ok = flyx::apps::fetch_lora(file, {}, nullptr, &p, &err);
+      check(ok && p == ".", "a bare " + file + " is the current directory on Windows: " + (ok ? p : err));
+      p.clear();
+      ok = flyx::apps::fetch_lora(from_path(adir / file), {}, nullptr, &p, &err);
+      check(ok && to_path(p) == adir, "and a path to it, its directory: " + (ok ? p : err));
+    }
+#endif
+    // The remote path policy on the sibling compared with the file named (its identity is looked at through its
+    // links): the policy is asked of it first, and a sibling it denies is not compared.
+    const std::string config_sibling = from_path(adir / "adapter_config.json");
+    std::vector<std::string> asked;
+    const auto deny_config = [&](std::string_view q) {
+      asked.emplace_back(q);
+      return q != config_sibling;
+    };
+    p.clear();
+    ok = flyx::apps::fetch_lora(from_path(adir / "adapter_model.safetensors"), {}, nullptr, &p, &err, deny_config);
+    check(ok && to_path(p) == adir && std::find(asked.begin(), asked.end(), config_sibling) != asked.end(),
+          "the policy is asked of each sibling before it is compared (its weights file named: taken)");
+#if defined(_WIN32)
+    // A spelling of the config that is not the sibling's own: the sibling, denied, is not compared, so not taken.
+    ok = flyx::apps::fetch_lora(from_path(adir / "ADAPTER_CONFIG.JSON"), {}, nullptr, &p, &err, deny_config);
+    check(!ok && err.find("remote path policy") != std::string::npos,
+          "a denied sibling is not looked at through the name typed: " + err);
+#endif
+    fs::current_path(cwd);
   }
 
   // Leading ~ expansion (HOME and USERPROFILE) and outer single-quote fallback (cmd.exe paste).

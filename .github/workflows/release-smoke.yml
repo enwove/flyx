@@ -3,8 +3,9 @@ name: Release smoke
 
 # A published release's assets as a user downloads them, on machines without a GPU (tools/ci/README.md):
 # every asset against SHA256SUMS.txt; the Linux tarball and wheel on clean containers of the distributions people run
-# (the libraries and the GLIBC version they need, the CLI, the no-GPU fallback, a first token of the tiny model, the
-# server, pip install); the Windows executable, zip and wheel on a Windows runner.  A release published by a workflow
+# (the libraries and the GLIBC version they need, the version they say against the tag, the CLI, the CUDA backend
+# refused without a GPU, a first token of the tiny model on cpu_ref, the server, pip install); the Windows executable,
+# zip and wheel on a Windows runner.  A release published by a workflow
 # with GITHUB_TOKEN starts no workflow: run this one by hand then (Actions, Release smoke, the tag).
 on:
   release:
@@ -12,7 +13,7 @@ on:
   workflow_dispatch:
     inputs:
       tag:
-        description: "the release's tag (v0.2.1)"
+        description: "the release's tag (v0.2.2)"
         required: true
 
 permissions:
@@ -86,7 +87,13 @@ jobs:
           cd rel
           sha256sum -c --ignore-missing SHA256SUMS.txt | tee checked.txt
           test "$(grep -c ': OK$' checked.txt)" -eq 2
-          mkdir pkg && tar -C pkg -xzf ./*.tar.gz
+          # The tarball as published says the tag's version (the script checks the directory in it and the wheel).
+          tarballs=(./*.tar.gz)
+          if [[ ${#tarballs[@]} -ne 1 || $(basename "${tarballs[0]}") != "flyx-${TAG#v}-linux-x86_64-"*.tar.gz ]]; then
+            echo "::error::the Linux tarball ${tarballs[*]} is not flyx-${TAG#v}-linux-x86_64-*.tar.gz (tag $TAG)"
+            exit 1
+          fi
+          mkdir pkg && tar -C pkg -xzf "${tarballs[0]}"
       - uses: actions/download-artifact@v4
         with:
           name: tiny-model
@@ -96,7 +103,7 @@ jobs:
       - name: Smoke test in ${{ matrix.image }}
         run: |
           docker run --rm -v "$PWD:/w" -w /w "${{ matrix.image }}" \
-            bash tools/ci/release_smoke.sh rel/pkg/flyx-* rel/*.whl tiny/tiny.flyx "${{ matrix.name }}.tsv"
+            bash tools/ci/release_smoke.sh rel/pkg/flyx-* rel/*.whl tiny/tiny.flyx "${{ matrix.name }}.tsv" "$TAG"
       - name: Summary
         if: ${{ !cancelled() && hashFiles(format('{0}.tsv', matrix.name)) != '' }}
         run: python3 tools/ci/release_smoke_report.py "${{ matrix.name }}.tsv" >> "$GITHUB_STEP_SUMMARY"
@@ -134,7 +141,7 @@ jobs:
       - name: Smoke test
         run: |
           pwsh tools/ci/release_smoke_windows.ps1 -Exe (Resolve-Path rel/*.exe) -Zip (Resolve-Path rel/*.zip) `
-            -Wheel (Resolve-Path rel/*.whl) -Model tiny/tiny.flyx -Results windows.tsv
+            -Wheel (Resolve-Path rel/*.whl) -Model tiny/tiny.flyx -Results windows.tsv -Tag $env:TAG
       - name: Summary
         if: ${{ !cancelled() && hashFiles('windows.tsv') != '' }}
         run: python tools/ci/release_smoke_report.py windows.tsv >> $env:GITHUB_STEP_SUMMARY

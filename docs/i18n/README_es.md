@@ -32,7 +32,7 @@
   <a href="../../llms.txt">llms.txt</a>
 </p>
 
-**FLYX** es un motor de inferencia local de LLM sin dependencias que cabe en un único `.exe` de ~57 MB para Windows: decodificación especulativa rápida, contexto largo nativo, optimizado por GPU y sin configuración. Ejecuta los modelos GGUF compatibles tal como están y sírvelos a tu navegador, scripts y agentes de programación mediante APIs compatibles con OpenAI y Anthropic.
+**FLYX** es un motor de inferencia local de LLM sin dependencias que cabe en un único `.exe` de ~58 MB para Windows: decodificación especulativa rápida, contexto largo nativo, optimizado por GPU y sin configuración. Ejecuta los modelos GGUF compatibles tal como están y sírvelos a tu navegador, scripts y agentes de programación mediante APIs compatibles con OpenAI y Anthropic.
 
 <p align="center">
   <img src="../media/dashboard-light.png" width="900" alt="Panel web integrado de FLYX mostrando rendimiento en tiempo real, sesiones de contexto largo, uso de VRAM y RAM, y solicitudes recientes de agentes">
@@ -44,7 +44,7 @@
 - **Generación hasta 6× más rápida** — Decodificación especulativa integrada (MTP, DFlash2, DSpark y búsqueda en el prompt): **565.5 tok/s** con Qwen3.8-27B y **438.9 tok/s** con Inkling-2-Mini en una RTX 5090 ([Rendimiento](#rendimiento)).
 - **Hasta 1M de contexto nativo en un PC de consumo** — Ejecuta Inkling-2-Mini con 1M de contexto en 16 GB de VRAM + 32 GB de RAM.
 - **Ajustado por GPU, cero flags manuales** — Incluye tablas de ajuste de kernels medidas para 16 GPUs NVIDIA y calcula automáticamente la longitud de contexto, la precisión K/V y la distribución entre GPU y RAM según la memoria disponible. Sin adivinar capas de descarga, tamaños de lote ni tipos de caché.
-- **Sin instalación, sin dependencias, ~57 MB** — Los runtimes de CUDA y C++ están enlazados estáticamente; solo se requiere el controlador NVIDIA (≥ 580). Sin CUDA Toolkit, Python ni Docker. Un único `.exe` de ~57 MB en Windows (doble clic para ejecutar) o un archivo tar.gz en Linux.
+- **Sin instalación, sin dependencias, ~58 MB** — Los runtimes de CUDA y C++ están enlazados estáticamente; solo se requiere el controlador NVIDIA (≥ 580). Sin CUDA Toolkit, Python ni Docker. Un único `.exe` de ~58 MB en Windows (doble clic para ejecutar) o un archivo tar.gz en Linux.
 - **Panel web integrado y monitor de terminal** — Se abre directamente en una interfaz web (7 idiomas) con sugerencias guiadas para buscar y descargar modelos de Hugging Face o locales, chatear (texto e imágenes), consultar documentación de API localizada y supervisar en tiempo real el rendimiento, el uso de VRAM/RAM, sesiones, solicitudes y registros ([guía del monitor](../monitor.md)).
 - **Integración en un clic con agentes de programación** — Compatible con OpenAI (Chat Completions, Responses) y Anthropic Messages con llamadas a herramientas y reutilización de prefijos en múltiples turnos. Lanza **Claude Code** o **Codex CLI** directamente en tu carpeta de proyecto desde **Integración** (Windows), o copia comandos listos para ejecutar para **DeepSeek Harness, OpenCode y Pi**.
 - **Precisión verificada** — Cada kernel GPU se verifica frente a una referencia en `float64`; el formato FP8 K/V predeterminado se mantiene en **KL 0.0009–0.0016** respecto a 16-bit en 27B; la decodificación especulativa es **idéntica token a token** a la decodificación normal ([numérica](../design/numerics.md)).
@@ -90,7 +90,7 @@ Velocidad de decodificación de v0.2.1 en tokens/s, verificada en cuatro GPUs (g
 
 Descarga la última versión desde [GitHub Releases](https://github.com/enwove/flyx/releases) — solo necesitas un controlador NVIDIA (≥ 580):
 
-- **Windows:** Haz doble clic en `flyx-0.2.1-windows-x86_64-cuda13.exe` (o ejecuta `.\flyx-0.2.1-windows-x86_64-cuda13.exe serve` en PowerShell). El servidor arranca y abre el panel web automáticamente (eligiendo otro puerto libre si `8080` está ocupado).
+- **Windows:** Haz doble clic en `flyx-0.2.2-windows-x86_64-cuda13.exe` (o ejecuta `.\flyx-0.2.2-windows-x86_64-cuda13.exe serve` en PowerShell). El servidor arranca y abre el panel web automáticamente (eligiendo otro puerto libre si `8080` está ocupado).
 - **Linux / WSL2:** Extrae el archivo y ejecuta:
 
 ```sh

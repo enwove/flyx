@@ -543,7 +543,7 @@ int run(int argc, char** argv) {
                           {"mem_used", info.mem_total ? ojson(info.mem_total - info.mem_free) : ojson(nullptr)},
                           {"backend", backend}};
       srv.device_reserve_floor = info.reserve_floor;
-      if (info.mem_total) srv.probe_mem_used.store(info.mem_total - info.mem_free, std::memory_order_relaxed);
+      if (info.mem_total) srv.probe_mem_used.store(int64_t(info.mem_total - info.mem_free), std::memory_order_relaxed);
       if (!remembered)
         std::fprintf(stderr, "flyx-server: %s (%s), %.1f GB free\n", info.name, backend.c_str(), info.mem_free / 1e9);
     }
