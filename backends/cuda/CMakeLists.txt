@@ -49,7 +49,7 @@ set(FLYX_CUDA_KERNEL_SOURCES
     kernels/gemm_blocks.cu kernels/gemm_blocks_round.cu kernels/gemm_blocks_tables.cu
     kernels/attention.cu kernels/attention_flash.cu kernels/attention_rows.cu kernels/tree.cu
     kernels/gdn_chunk.cu kernels/rows.cu kernels/sampling.cu kernels/draft.cu kernels/draft_head.cu kernels/eagle4.cu
-    kernels/dv.cu kernels/head_cert.cu kernels/stop_decide.cu kernels/vision.cu kernels/inkling2.cu kernels/hyper_connection.cu
+    kernels/dv.cu kernels/head_cert.cu kernels/stop_decide.cu kernels/vision.cu kernels/inkling2.cu kernels/hyper_connection.cu kernels/indexed_attention.cu kernels/ple.cu
     kernels/moe.cu kernels/dspark.cu kernels/dspine.cu)
 
 # The device code's flags: line tables unless left out, the fatbinary's compression (top-level CMakeLists.txt).

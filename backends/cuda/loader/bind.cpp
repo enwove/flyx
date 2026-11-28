@@ -24,7 +24,7 @@ void expect(bool ok, const std::string& what) {
 
 // The state indices of the description -> this backend's tables.
 struct StateMap {
-  std::vector<int> kv, gdn, sconv;  // per description state: index in StateTable::kv / ::gdn / ::sconv, else -1
+  std::vector<int> kv, gdn, sconv, index;  // per description state: index in StateTable::kv / ::gdn / ::sconv, else -1
   std::vector<bool> ring, canvas;
 };
 
@@ -45,6 +45,7 @@ StateMap bind_states(flyx_bmodel* m, const flyx_model_desc& d) {
   for (int i = 0; i < d.n_states; ++i) {
     const flyx_state& s = d.states[i];
     sm.kv.push_back(-1);
+    sm.index.push_back(-1);
     sm.gdn.push_back(-1);
     sm.sconv.push_back(-1);
     sm.ring.push_back(false);
@@ -59,9 +60,19 @@ StateMap bind_states(flyx_bmodel* m, const flyx_model_desc& d) {
                                 m->kv_fp8 && s.layers == 1 && !(s.draft && m->opt.draft_kv16) && !dflash_kv[size_t(i)],
                                 s.draft != 0, s.window});
         break;
+      case FLYX_STATE_INDEXER:
+        expect(s.head_dim > 0 && s.head_dim <= 256, "indexer key width");
+        sm.index.back() = int(m->states.index_width.size());
+        m->states.index_width.push_back(s.head_dim + 3);
+        break;
       case FLYX_STATE_GDN:
         sm.gdn.back() = int(m->states.gdn.size());
         m->states.gdn.push_back({s.nk, s.nv, s.dk, s.dv, s.conv, s.head_order == FLYX_GDN_HEADS_TILED});
+        break;
+      case FLYX_STATE_PLE:
+        expect(s.conv >= 2 && s.conv <= 64 && s.width < s.conv && s.channels < INT_MAX, "PLE history dimensions");
+        sm.sconv.back() = int(m->states.sconv.size());
+        m->states.sconv.push_back({s.conv, s.channels + 1});
         break;
       case FLYX_STATE_SHORTCONV:
         sm.sconv.back() = int(m->states.sconv.size());
@@ -307,6 +318,18 @@ AttnBlock attention(WeightLoader& L, const flyx_attn_block& b, const StateMap& s
   a.q_norm = head_norm(L, b.q_norm);
   a.k_norm = head_norm(L, b.k_norm);
   a.kv = state_of(sm.kv, b.kv, "K/V");
+  if (b.has_indexer) {
+    expect(b.index_kv_heads == 1 && b.index_heads > 0 && b.group_size > 0 && b.token_budget >= b.group_size &&
+           b.token_budget % b.group_size == 0 && b.index_dim >= a.rot, "sparse attention dimensions");
+    a.index_state = state_of(sm.index, b.index_state, "indexer");
+    a.index_dim = b.index_dim;
+    a.index_heads = b.index_heads;
+    a.group = b.group_size;
+    a.budget = b.token_budget;
+    a.index_q_norm = norm(L, b.index_q_norm);
+    a.index_k_norm = norm(L, b.index_k_norm);
+    a.index_in = L.lin_stack_quant({b.index_q, b.index_k}, dq, &rows);
+  }
   int in[4], out[4];
   attn_dims(b, in, out);
   expect(!a.gate || b.lora[FLYX_LIN_Q].rank <= 0 || b.lora_gate == FLYX_GATE_AFTER_Q ||
@@ -1230,6 +1253,52 @@ void bind(flyx_bmodel* m, const flyx_model_desc& d, LoadTimes* times) {
         put_block(m, i, std::move(e));
         break;
       }
+      case FLYX_BLOCK_PLE: {
+        PleBlock p;
+        p.dims = b.ple;
+        p.state = state_of(sm.sconv, b.ple.state, "PLE");
+        const auto& t = *L.t(b.ple.table);
+        p.dtype = t.dtype;
+        p.stride = size_t(t.nbytes / t.shape[0]);
+        expect(t.dtype == FLYX_DT_F32 || t.dtype == FLYX_DT_BF16 || t.dtype == FLYX_DT_F16 ||
+               t.dtype == FLYX_DT_GGML_Q4_0 || t.dtype == FLYX_DT_GGML_Q5_0 || t.dtype == FLYX_DT_GGML_Q8_0,
+               "unsupported packed PLE table dtype");
+        auto upload = [&](const uint64_t* src, int count) {
+          auto* dst = m->alloc<uint64_t>(count);
+          L.upload_staged(dst, src, size_t(count) * sizeof(uint64_t));
+          return dst;
+        };
+        p.dims.multipliers = upload(b.ple.multipliers, b.ple.ngram);
+        p.dims.moduli = upload(b.ple.moduli, p.heads());
+        p.dims.offsets = upload(b.ple.offsets, p.heads());
+        if (m->ple_placement == FLYX_PLE_GPU) {
+          auto* data = m->alloc<uint8_t>(t.nbytes);
+          L.upload_staged(data, t.data, t.nbytes);
+          p.table = data;
+        } else {
+          const uint64_t limit = host_pinned_budget();
+          if (m->ple_placement == FLYX_PLE_HOST && m->host_bytes < limit && t.nbytes <= limit - m->host_bytes) {
+            void* host = nullptr;
+            if (cudaHostAlloc(&host, t.nbytes, cudaHostAllocMapped) == cudaSuccess) {
+              m->host_allocs.push_back(host);
+              void* mapped = nullptr;
+              CK(cudaHostGetDevicePointer(&mapped, host, 0));
+              std::memcpy(host, t.data, t.nbytes);
+              p.table = static_cast<uint8_t*>(mapped);
+              m->host_bytes += t.nbytes;
+            } else cudaGetLastError();
+          }
+          if (!p.table) {
+            p.store = std::make_shared<backends::PackedRows>(t, m->ple_placement, m->ple_hot_bytes, 0);
+            m->host_bytes += p.store->storage_bytes();
+          }
+        }
+        p.key = L.lin(b.ple.key); p.value = L.lin(b.ple.value);
+        p.nk = norm(L, b.ple.norm_key); p.nq = norm(L, b.ple.norm_query); p.nc = norm(L, b.ple.norm_conv);
+        p.conv = L.vec(b.ple.conv_w);
+        put_block(m, i, std::move(p));
+        break;
+      }
       case FLYX_BLOCK_HC: {
         HcBlock hc{};
         hc.phase = b.hc.phase; hc.hidden = b.hc.hidden; hc.streams = b.hc.streams; hc.rank = b.hc.rank;
@@ -1257,7 +1326,12 @@ void bind(flyx_bmodel* m, const flyx_model_desc& d, LoadTimes* times) {
         put_block(m, i, std::move(h));
         break;
       }
-      case FLYX_BLOCK_ATTN: put_block(m, i, attention(L, b.attn, sm, carve)); break;
+      case FLYX_BLOCK_ATTN: {
+        auto a = attention(L, b.attn, sm, carve);
+        m->states.kv.at(a.kv).sparse = a.index_state >= 0;
+        put_block(m, i, std::move(a));
+        break;
+      }
       case FLYX_BLOCK_GDN: put_block(m, i, gdn(L, b.gdn, sm, carve)); break;
       case FLYX_BLOCK_MLP: put_block(m, i, mlp(L, b.mlp, carve)); break;
       case FLYX_BLOCK_REL_ATTN: put_block(m, i, rel_attn(L, b.rel_attn, sm)); break;
@@ -1504,6 +1578,17 @@ int resolve_vision_device(const flyx_model_desc& desc, const BackendOptions& opt
   return placement;
 }
 
+int resolve_ple(const flyx_model_desc& d, const flyx_open_options* opts, uint64_t free_bytes) {
+  if (opts && opts->ple_placement) return opts->ple_placement;
+  uint64_t bytes = 0, table = 0;
+  for (int i=0; i<d.n_weights; ++i) if (d.weights[i].t) bytes = size_add(bytes, d.weights[i].t->nbytes);
+  for (int i=0; i<d.n_blocks; ++i) if (d.blocks[i].kind == FLYX_BLOCK_PLE)
+    table = size_add(table, d.weights[d.blocks[i].ple.table].t->nbytes);
+  if (free_bytes >= bytes && free_bytes - bytes >= (uint64_t(2)<<30)) return FLYX_PLE_GPU;
+  if (opts && table <= opts->ple_host_room) return FLYX_PLE_HOST;
+  return opts && opts->ple_hot_bytes ? FLYX_PLE_HYBRID : FLYX_PLE_DISK;
+}
+
 int estimate_load(const flyx_model_desc* desc, const flyx_open_options* opts, uint64_t free_vram,
                   uint64_t total_vram, flyx_load_estimate* out) try {
   if (!desc || !out) return -1;
@@ -1570,12 +1655,16 @@ int estimate_load(const flyx_model_desc* desc, const flyx_open_options* opts, ui
   out->vision_device = resolve_vision_device(*desc, bo, free_vram, &vision_gpu_bytes, &is_vis);
 
   std::vector<char> is_expert(size_t(nw), 0);
-  uint64_t dv_extra = 0, block_extra = 0;
+  uint64_t dv_extra = 0, block_extra = 0, ple_bytes = 0;
   std::vector<int> dflash_ctx_ws;  // stacked second copy of each DFlash2 or DSpine layer's k|v (f.ctx)
   for (int i = 0; i < desc->n_blocks; ++i) {
     const flyx_block& b = desc->blocks[i];
     if (b.kind == FLYX_BLOCK_EMBED) {
       if (bo.embed == 1 && !head_reads(*desc, b.embed.table)) mark(is_host_embed, b.embed.table);
+    } else if (b.kind == FLYX_BLOCK_PLE) {
+      mark(is_host_embed, b.ple.table);
+      if (resolve_ple(*desc, opts, free_vram) == FLYX_PLE_GPU) ple_bytes += desc->weights[b.ple.table].t->nbytes;
+      ple_bytes += sizeof(uint64_t) * (b.ple.ngram + 2ull * (b.ple.ngram - 1) * b.ple.heads_per_order);
     } else if (b.kind == FLYX_BLOCK_MTP) {
       mark_norm(is_drafter, b.mtp.norm_emb), mark_norm(is_drafter, b.mtp.norm_hidden), mark_norm(is_drafter, b.mtp.norm);
       mark_linear(b.mtp.fc, q.mtp);
@@ -1721,11 +1810,13 @@ int estimate_load(const flyx_model_desc* desc, const flyx_open_options* opts, ui
   }
   for (int i = 0; i < desc->n_states; ++i) {
     const flyx_state& state = desc->states[i];
+    if (state.kind == FLYX_STATE_INDEXER) out->target_kv_bytes_per_position += uint64_t(state.head_dim+3) * sizeof(float);
     if (state.kind != FLYX_STATE_KV || state.draft) continue;
     const bool fp8 = opts && opts->kv_fp8 && state.layers == 1;
     const uint64_t head_bytes = fp8 ? state.head_dim + sizeof(float) : state.head_dim * sizeof(uint16_t);
     out->target_kv_bytes_per_position += 2ull * state.layers * state.n_kv * head_bytes;
   }
+  target_bytes = size_add(target_bytes, ple_bytes);
   out->draft_weights_bytes = cur_draft_bytes + dv_bytes + block_extra;
   out->draft_compact_savings = cur_draft_bytes > nvfp4_draft_bytes ? cur_draft_bytes - nvfp4_draft_bytes : 0;
   out->weights_bytes = target_bytes + vision_gpu_bytes + out->draft_weights_bytes;

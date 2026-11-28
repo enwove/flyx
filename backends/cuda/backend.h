@@ -243,6 +243,9 @@ struct RowBufs {
   float* lora = nullptr;  // the target's adapters' first products (RowNeeds::lora a row; none without adapters)
   float* lora_part = nullptr;  // their slices' sums (lora_down_rows; RowNeeds::lora_part a row, kLoraEarlyRows rows)
   // Inkling-2 pass-local scratch (null for models without RelAttnBlock / MoeBlock).
+  float *ple_embed = nullptr, *ple_input = nullptr;
+  int* ple_ids = nullptr;
+  float* index_proj = nullptr;
   float *hc_wide = nullptr, *hc_norm = nullptr, *hc_inject = nullptr;
   float *res_bank = nullptr, *prelude_cur = nullptr, *prelude_blocks = nullptr;
   float *loop_bank = nullptr, *loop_bank_out = nullptr, *loop_msg = nullptr;
@@ -276,7 +279,8 @@ struct RowNeeds {
   bool glu = false;                         // non-packed MLP weights (prefill gemm_glu_staged)
   int k_max = 0;                            // largest GEMM K: the scratch staging GEMM inputs is sized by it
   bool q8 = false;  // weights with inputs in 8 bits: a prefill scratch holds their GEMMs' runs of K side by side
-  int hc_streams = 0;
+  int ple_embed = 0, ple_input = 0, ple_heads = 0;
+  int hc_streams = 0, index_proj = 0, index_group = 0, index_keep = 0;
   int max_bank = 0, max_loop_rank = 0;      // Inkling-2 AttnRes bank depth & loop gate rank
   int rel_q = 0, max_rel_nh = 0, max_rel_extent = 0, sink = 0, kv_dim = 0, kv_dyn = 0;
   int moe_experts = 0, moe_topk = 0, moe_inter = 0;
@@ -492,6 +496,8 @@ uint64_t device_reserve_floor();
 }  // namespace flyx::cuda
 
 struct flyx_bmodel {
+  int ple_placement = FLYX_PLE_AUTO;
+  uint64_t ple_hot_bytes = 0;
   std::vector<void*> allocs;
   size_t bytes = 0;
   std::vector<void*> host_allocs;  // pinned host memory (host_alloc / host_pinned)
@@ -672,6 +678,20 @@ constexpr int kPrefillSplits = 8;
 }  // namespace flyx::cuda
 
 struct flyx_seq {
+  struct PleCall {
+    flyx::backends::PackedRows* store;
+    const int* ids;
+    uint8_t* packed;
+    size_t count;
+    std::atomic<bool>* failed;
+  };
+  struct PleStage {
+    int* ids = nullptr;
+    uint8_t *host = nullptr, *device = nullptr;
+    PleCall calls[flyx::cuda::kPleStage + 1]{};
+  };
+  std::vector<PleStage> ple_stages;
+  std::atomic<bool> ple_failed{false};
   flyx_bmodel* m;
   int max_ctx = 0, cap = 0, rows_cap = 0;
   cudaStream_t st = nullptr;
@@ -702,6 +722,9 @@ struct flyx_seq {
   std::vector<flyx::cuda::KvBuf> kv;
   std::vector<flyx::cuda::GdnBuf> gdn;
   std::vector<flyx::cuda::ShortConvBuf> sconv;
+  std::vector<float*> index_keys;
+  float* index_scores = nullptr;
+  int* index_selected = nullptr;
   // Every gated delta net's state, window and replay buffers on the device, for a round's commit in two launches
   // (gdn_fold_layers); null where the layers are not alike or their states not 16-byte aligned.
   flyx::cuda::GdnLayer* gdn_layers = nullptr;
@@ -1233,6 +1256,7 @@ struct Pass {
 // loader/bind.cpp: blocks and the state table from the description's tables; uploads the weights.
 void bind(flyx_bmodel* m, const flyx_model_desc& d, LoadTimes* times = nullptr);
 // Resolve placement from the representation the loader uploads. Optionally report resident bytes and vision weights.
+int resolve_ple(const flyx_model_desc& desc, const flyx_open_options* opts, uint64_t free_bytes);
 int resolve_vision_device(const flyx_model_desc& desc, const BackendOptions& opt, uint64_t free_vram,
                           uint64_t* resident_bytes, std::vector<char>* vision_weights = nullptr);
 // Pre-flight device memory estimate (ABI 48: flyx_backend_api::estimate_load).

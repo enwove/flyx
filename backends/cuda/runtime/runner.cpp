@@ -521,7 +521,8 @@ int prefill_ex(flyx_plan* p, flyx_seq* s, const flyx_prefill_input* in, const fl
     const int rewind_from = s->rewind_floor();
     for (auto& mt : s->meta)
       if (mt.valid && mt.start + mt.rows < rewind_from) mt.valid = false;
-    if (in->n_embeds > 0 || in->pos_3d || in->set_rope_delta) sync_stream(s);
+    if (in->n_embeds > 0 || in->pos_3d || in->set_rope_delta || !s->ple_stages.empty()) sync_stream(s);
+    if (s->ple_failed.load(std::memory_order_acquire)) return fail("PLE packed row read failed");
     CK(cudaGetLastError());
     return 0;
   });
@@ -1876,6 +1877,7 @@ int read_result(flyx_seq* s, flyx_round_result* out) {
       CK(cudaEventSynchronize(s->ev[seq % kRing]));
     else
       poll_event(s->ev[seq % kRing], 0);
+    if (s->ple_failed.load(std::memory_order_acquire)) return fail("PLE packed row read failed");
     *out = s->ring_host[seq % kRing];
     if (out->seq_no != seq) return fail("ring entry out of order (" + std::to_string(out->seq_no) + ")");
     s->read_no = seq;
@@ -2119,12 +2121,14 @@ uint64_t layout_hash(const flyx_seq* s) {
       mix(uint64_t(sc.channels));
     }
   }
+  for (int w : m->states.index_width) mix((uint64_t(w) << 32) | 0x515341);
   mix(uint64_t(m->states.ring_width));
   return h;
 }
 
 uint64_t snapshot_size(const flyx_seq* s, int begin, int pos) {
   uint64_t n = sizeof(SnapshotHeader);
+  for (int w : s->m->states.index_width) n += uint64_t(pos - begin) * w * sizeof(float);
   for (size_t i = 0; i < s->m->states.kv.size(); ++i) {
     const KvSpec& k = s->m->states.kv[i];
     const KvBuf& b = s->kv[i];
@@ -2151,6 +2155,10 @@ void snapshot_parts(flyx_seq* s, int c, int begin, int pos, HostCursor& host, bo
                          len, cudaMemcpyDefault, s->st));
     });
   };
+  for (size_t i = 0; i < s->index_keys.size(); ++i) {
+    const size_t w = s->m->states.index_width[i];
+    copy(s->index_keys[i] + size_t(begin) * w, size_t(pos - begin) * w * sizeof(float));
+  }
   bool host_synced = false;
   for (size_t i = 0; i < s->kv.size(); ++i) {
     const KvSpec& k = s->m->states.kv[i];

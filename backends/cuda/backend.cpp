@@ -684,6 +684,13 @@ int open_model(const flyx_model_desc* desc, const flyx_open_options* opts, flyx_
     }
     if (!resolve_options(opts ? opts->options : nullptr, &m->opt, &err)) return fail("options: " + err);
     if (!nvfp4_inputs(*desc, &m->opt.kernels.prefill_fp4, &err)) return fail(err);
+    for (int i = 0; i < desc->n_blocks; ++i) if (desc->blocks[i].kind == FLYX_BLOCK_PLE) {
+      size_t free_b = 0, total_b = 0;
+      gpu_memory(&free_b, &total_b);
+      m->ple_placement = resolve_ple(*desc, opts, free_b);
+      m->ple_hot_bytes = opts ? opts->ple_hot_bytes : 0;
+      break;
+    }
     if (m->opt.embed == 0) {
       // embed=auto: host memory frees the table's GPU memory for a few kilobytes of reads a token; where 32 GB stay
       // free after the weights the memory is not missed, and a prefill pass reads its rows faster on the GPU (the
