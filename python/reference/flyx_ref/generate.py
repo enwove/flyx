@@ -1,5 +1,5 @@
 # Copyright 2026 The flyx Authors. SPDX-License-Identifier: Apache-2.0
-"""Greedy generation loops: plain, and verified with a DFlash2 block draft.
+"""Greedy generation loops: plain, and verified with a DFlash2 block draft, MTP's or EAGLE-4's drafts.
 
 Both must emit exactly the same tokens; the speculative loop also records
 the per-round drafts and acceptance so engine rounds can be compared one by
@@ -48,7 +48,11 @@ def _margin(row):
 
 
 def greedy_spec(target: Target, draft: Draft, prompt, max_new, stop_ids=(), width=None, oracle=None):
-    """width: drafts verified per round (<= draft.block_drafts). oracle(pos)->token|None overrides drafts (tests)."""
+    """width: drafts verified per round (<= draft.block_drafts). oracle(pos)->token|None overrides drafts (tests).
+    A sequential drafter (EAGLE-4) drafts its rounds step by step (greedy_spec_eagle4)."""
+    if getattr(draft, "sequential", False):
+        return greedy_spec_eagle4(target, draft, prompt, max_new, width=width or draft.block_drafts,
+                                  stop_ids=stop_ids, oracle=oracle)
     c = draft.cfg
     K = width or draft.block_drafts
     st = target.new_state()
@@ -115,6 +119,38 @@ def greedy_spec_mtp(target: Target, mtp, prompt, max_new, width=3, stop_ids=(), 
         _, _, hn = target.forward(rows[: n + 1], st)
         mtp.context(ms, hn[:n], rows[1: n + 1], p)
         pending = hn[n]
+        rounds.append({"pos": p, "anchor": anchor, "drafts": drafts, "choice": choice, "n": n})
+        for t in choice[: n + 1]:
+            out.append(t)
+            if t in stop_ids or len(out) >= max_new:
+                break
+    return out[:max_new], rounds
+
+
+def greedy_spec_eagle4(target: Target, draft, prompt, max_new, width=7, stop_ids=(), oracle=None):
+    """Greedy decoding verified with an EAGLE-4 drafter's drafts (flyx_ref/eagle4.py): its context from the target's
+    taps of every row the target keeps (the prompt's, then each round's accepted rows), its first step from the hidden
+    of the row before the anchor.  oracle(pos, token) -> token replaces each draft as it is made (and feeds the
+    replacement to the next step), as the engine's test hook does."""
+    taps = draft.cfg.taps
+    st = target.new_state()
+    ds = draft.new_state()
+    logits, tapped, _ = target.forward(prompt, st, taps=taps)
+    draft.context(ds, _feats(tapped, taps), list(prompt))
+    out = [int(torch.argmax(logits[-1]))]
+    rounds = []
+    while len(out) < max_new and out[-1] not in stop_ids:
+        anchor, p = out[-1], st.pos
+        drafts = draft.draft(ds, anchor, width, oracle)
+        rows = [anchor] + drafts
+        trial = st.clone()
+        logits, _, _ = target.forward(rows, trial)
+        choice = [int(x) for x in torch.argmax(logits, dim=-1)]
+        n = 0
+        while n < width and drafts[n] == choice[n] and choice[n] not in stop_ids:
+            n += 1
+        _, tapped, _ = target.forward(rows[: n + 1], st, taps=taps)
+        draft.context(ds, _feats(tapped, taps), rows[: n + 1])
         rounds.append({"pos": p, "anchor": anchor, "drafts": drafts, "choice": choice, "n": n})
         for t in choice[: n + 1]:
             out.append(t)

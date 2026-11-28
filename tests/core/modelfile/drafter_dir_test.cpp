@@ -63,6 +63,8 @@ int main(int argc, char** argv) {
   same(dir, model, "hf_dspine", "tiny_draft_dspine.flyx");   // DSpine, its stacked bridge tensors cut per layer
   same(dir, model, "hf_dspine1", "tiny_draft_dspine1.flyx");  // one layer: no early reads ([0, code, hidden])
   same(dir, model, "hf_dflash", "tiny_draft_dflash.flyx");    // DFlash: DFlash2's layers, no convolutions or selector
+  same(dir, model, "hf_eagle4", "tiny_draft_eagle4.flyx");    // EAGLE-4: its layer, tap norms and candidate head
+  same(dir, model, "hf_eagle4_window", "tiny_draft_eagle4_window.flyx");  // a sliding window
   {
     flyx::ModelFile f;
     std::string err;

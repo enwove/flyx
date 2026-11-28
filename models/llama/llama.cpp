@@ -177,14 +177,17 @@ bool Llama::build(const ModelFile& file, const ModelOptions& o, std::string* err
     return *err = "companion file " + std::to_string(i + 1) + ": holds no drafter a " + family + " model takes", false;
   }
 
-  // Attention-only layers: a tree's wider verify costs about a chain's, so a block drafter whose trees pay (DSpark's)
-  // drafts them by default, and the file then reads every position as DV's does.
-  draft_trees_by_default_ = drafts_trees_by_default(drafters_reg_.sources().block);
-  file_drafts_trees_ = has_dv || draft_trees_by_default_;
-
   std::vector<Drafter> drafters;
   if (!choose_drafters(o, drafters_reg_.sources(), &drafters, err)) return false;
   drafters_reg_.validate_selected(file, drafters, target);
+  // Attention-only layers: a tree's wider verify costs about a chain's, so a drafter whose trees pay (DSpark's,
+  // EAGLE-4's) drafts them by default (where it is chosen).  A block drafter's (DSpark's) file then reads every
+  // position as DV's does, whichever drafters are chosen; EAGLE-4's trees stay where --kv-method auto's switch leaves
+  // the context exact (Engine::load).
+  const Drafter block = drafters_reg_.sources().block;
+  file_drafts_trees_ = has_dv || (is_block_drafter(block) && drafts_trees_by_default(block, false));
+  draft_trees_by_default_ = std::any_of(drafters.begin(), drafters.end(),
+                                        [](Drafter d) { return drafts_trees_by_default(d, false); });
   if (!tables_.set_activations(o.activations, declared_activations(file), o.fp4_inputs, err)) return false;
 
   const int H = c.hidden, layers = c.layers, V = c.vocab, I = c.inter;

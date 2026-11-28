@@ -347,6 +347,7 @@ set_tests_properties(gguf_reader ggml_blocks gguf_models dflash2_models gguf_qwe
                      PROPERTIES FIXTURES_REQUIRED gguf_assets)
 
 flyx_add_py_test(dspine_reference ${CMAKE_SOURCE_DIR}/tests/python/reference/dspine_test.py ARGS ${ASSETS} FIXTURES assets)
+flyx_add_py_test(eagle4_reference ${CMAKE_SOURCE_DIR}/tests/python/reference/eagle4_test.py ARGS ${ASSETS} FIXTURES assets)
 flyx_add_py_test(draft_reference ${CMAKE_SOURCE_DIR}/tests/python/reference/draft_test.py ARGS ${ASSETS} FIXTURES assets)
 flyx_add_py_test(reference_vs_transformers ${CMAKE_SOURCE_DIR}/tests/python/reference/check_vs_hf.py
                  ARGS ${ASSETS}/hf_target ${ASSETS}/tiny.flyx FIXTURES assets)
@@ -570,6 +571,10 @@ flyx_add_golden_test(golden_cpu_ref_dspine1 ARGS cpu_ref dspine1)  # a drafter o
 flyx_add_golden_test(golden_cpu_ref_dspine_window ARGS cpu_ref dspine_window)
 flyx_add_golden_test(golden_cpu_ref_dspine_nvfp4 ARGS cpu_ref dspine_nvfp4)  # beside the NVFP4 copy
 flyx_add_golden_test(golden_cpu_ref_dspine8 ARGS cpu_ref dspine8)  # a block of 8
+flyx_add_golden_test(golden_cpu_ref_eagle4 ARGS cpu_ref eagle4)
+flyx_add_golden_test(golden_cpu_ref_eagle4_window ARGS cpu_ref eagle4_window)  # a window of 24
+flyx_add_golden_test(golden_cpu_ref_eagle4_nvfp4 ARGS cpu_ref eagle4_nvfp4)  # beside the NVFP4 copy
+flyx_add_golden_test(golden_cpu_ref_qwen3_eagle4 ARGS cpu_ref qwen3 ${ASSETS}/tiny_qwen3_eagle4.flyx - eagle4)
 # The tiny Qwen3 with a DSpine drafter (taps and context in a second architecture's programs): transformers' tokens.
 flyx_add_golden_test(golden_cpu_ref_qwen3_dspine ARGS cpu_ref qwen3 ${ASSETS}/tiny_qwen3_dspine.flyx - dspine)
 flyx_add_golden_test(golden_cpu_ref_qwen3_dspine_lora ARGS cpu_ref qwen3_lora ${ASSETS}/tiny_qwen3_dspine.flyx
@@ -684,6 +689,11 @@ if(TARGET flyx-cuda)
   flyx_add_golden_test(golden_cuda_dspine_window ARGS cuda dspine_window)
   flyx_add_golden_test(golden_cuda_dspine_nvfp4 ARGS cuda dspine_nvfp4)  # its layers' copies beside NVFP4 weights
   flyx_add_golden_test(golden_cuda_dspine8 ARGS cuda dspine8)  # a block of 8
+  flyx_add_golden_test(golden_cuda_eagle4 ARGS cuda eagle4)
+  flyx_add_golden_test(golden_cuda_eagle4_unfused ARGS cuda eagle4 ENV FLYX_BACKEND_OPTIONS=fusion=0)
+  flyx_add_golden_test(golden_cuda_eagle4_window ARGS cuda eagle4_window)
+  flyx_add_golden_test(golden_cuda_eagle4_nvfp4 ARGS cuda eagle4_nvfp4)
+  flyx_add_golden_test(golden_cuda_qwen3_eagle4 ARGS cuda qwen3 ${ASSETS}/tiny_qwen3_eagle4.flyx - eagle4)
   flyx_add_golden_test(golden_cuda_dspine1 ARGS cuda dspine1)  # one layer: its cache binary16 beside fp8 ones
   flyx_add_golden_test(golden_cuda_qwen3_dspine ARGS cuda qwen3 ${ASSETS}/tiny_qwen3_dspine.flyx - dspine)
   flyx_add_golden_test(golden_cuda_qwen3_dspine_lora ARGS cuda qwen3_lora ${ASSETS}/tiny_qwen3_dspine.flyx

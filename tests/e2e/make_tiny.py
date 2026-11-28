@@ -45,6 +45,12 @@ drafter's drafts from transformers' own hidden states (write_hf_drafts).
 tiny_dflash.flyx, golden_dflash.json, tiny_draft_dflash.flyx (hf_dflash/) and tiny_qwen3_dflash.flyx with a DFlash
 drafter (z-lab's DFlashDraftModel, DFlash2's block without convolutions or selector) in place of DFlash2's;
 tiny_dflash8.flyx and golden_dflash8.json one of a block of 8 (hf_dflash8/).
+tiny_eagle4.flyx, golden_eagle4.json and tiny_draft_eagle4.flyx (hf_eagle4/) with an EAGLE-4 drafter (EAGLE-Corp's
+LlamaForCausalLMEagle4) in place of DFlash2's, its rounds of 7 drafts; tiny_eagle4_window.flyx,
+golden_eagle4_window.json and tiny_draft_eagle4_window.flyx (hf_eagle4_window/) one with a sliding window of 24;
+tiny_eagle4_nvfp4.flyx and golden_eagle4_nvfp4.json the drafter
+beside the NVFP4 copy; tiny_qwen3_eagle4.flyx the tiny Qwen3 with one of its own, its tokens golden_qwen3.json's,
+golden_qwen3_eagle4.json its rounds from transformers' own hidden states (write_hf_drafts).
 
 Two groups, each with its outputs (OUTPUTS), digest and stamp: dv (DV's: dv_cases.json, the tiny Llama's DV files,
 golden_llama_dv.json, the DV files beside a V-LoRA and golden_llama_dv_lora.json; FLYX_TEST_DV's tests/dv.cmake makes
@@ -83,7 +89,10 @@ OUTPUTS = {
              "peft_qwen3/adapter_config.json", "peft_qwen3/adapter_model.safetensors", "golden_qwen3_lora.json",
              "peft_qwen35/adapter_config.json", "peft_qwen35/adapter_model.safetensors", "golden_qwen35_lora.json",
              "tiny_dflash.flyx", "golden_dflash.json", "tiny_draft_dflash.flyx", "tiny_qwen3_dflash.flyx",
-             "tiny_dflash8.flyx", "golden_dflash8.json"),
+             "tiny_dflash8.flyx", "golden_dflash8.json", "tiny_eagle4.flyx", "golden_eagle4.json",
+             "tiny_draft_eagle4.flyx", "tiny_eagle4_window.flyx", "golden_eagle4_window.json",
+             "tiny_draft_eagle4_window.flyx", "tiny_eagle4_nvfp4.flyx", "golden_eagle4_nvfp4.json",
+             "tiny_qwen3_eagle4.flyx", "golden_qwen3_eagle4.json"),
     "dv": ("dv_cases.json", "tiny_llama_dv.flyx", "tiny_llama_dv_pool.flyx", "tiny_llama_dv32.flyx",
            "tiny_llama_dv31.flyx", "tiny_llama_dv31_pool.flyx", "tiny_llama_dv31_wide.flyx",
            "tiny_llama_dv31_wide_pool.flyx", "golden_llama_dv.json", "tiny_llama_dv_lora.flyx",
@@ -654,6 +663,56 @@ def make_dflash(out_dir: str, vocab: int, mask_id: int, target_layers: int, gen,
     json.dump(cfg, open(os.path.join(out_dir, "config.json"), "w", encoding="utf-8"), indent=1)
 
 
+def make_eagle4(out_dir: str, vocab: int, target_layers: int, gen, H=64, heads=4, kv=2, hd=32, inter=128,
+                taps=(2, 4, 7), rank=8, cands=16, window=0):
+    """A random EAGLE-4 drafter as EAGLE-Corp publishes them (LlamaForCausalLMEagle4: one layer over the normalised
+    embedding and hidden side by side, per-tap fc norms, the low-rank candidate head beside its own head; its
+    embed_tokens a copy the engine does not read).  Its own generator, so the assets made before it stay what they
+    were."""
+    from safetensors.torch import save_file
+    os.makedirs(out_dir, exist_ok=True)
+    r = lambda *s, scale=1.0: (torch.randn(*s, generator=gen) * scale)  # noqa: E731
+    n = len(taps)
+    layer = "layers.0."
+    W = {"fc.weight": r(H, n * H, scale=1 / math.sqrt(n * H)),
+         "norm.weight": 1 + 0.2 * r(H), "embed_tokens.weight": r(vocab, H),
+         # a head of mostly rank `rank` (a trained head's best is mostly among its rank-r head's candidates: 98% of
+         # the 27B's), with a full-rank rest that the candidates sometimes miss
+         "lm_head.weight": r(vocab, rank, scale=2 * rank ** -0.5) @ r(rank, H, scale=H ** -0.5) * 2
+                           + r(vocab, H, scale=2 * H ** -0.5),
+         "efficient_lm_head_down_proj.weight": r(rank, H, scale=H ** -0.5),
+         "efficient_lm_head.weight": r(vocab, rank, scale=rank ** -0.5),
+         **{f"fc_norm.{i}.weight": 1 + 0.2 * r(H) for i in range(n)},
+         layer + "input_layernorm.weight": 1 + 0.2 * r(H), layer + "hidden_norm.weight": 1 + 0.2 * r(H),
+         layer + "post_attention_layernorm.weight": 1 + 0.2 * r(H),
+         layer + "self_attn.q_proj.weight": r(heads * hd, 2 * H, scale=(2 * H) ** -0.5),
+         layer + "self_attn.k_proj.weight": r(kv * hd, 2 * H, scale=(2 * H) ** -0.5),
+         layer + "self_attn.v_proj.weight": r(kv * hd, 2 * H, scale=(2 * H) ** -0.5),
+         layer + "self_attn.o_proj.weight": r(H, heads * hd, scale=(heads * hd) ** -0.5),
+         layer + "mlp.gate_proj.weight": r(inter, H, scale=H ** -0.5),
+         layer + "mlp.up_proj.weight": r(inter, H, scale=H ** -0.5),
+         layer + "mlp.down_proj.weight": r(H, inter, scale=inter ** -0.5)}
+    # the candidate head: the head's best rank-r part (its SVD's), and noise
+    u, sv, vt = torch.linalg.svd(W["lm_head.weight"], full_matrices=False)
+    W["efficient_lm_head_down_proj.weight"] = vt[:rank] * sv[:rank, None] ** 0.5 + \
+        0.1 * W["efficient_lm_head_down_proj.weight"]
+    W["efficient_lm_head.weight"] = u[:, :rank] * sv[None, :rank] ** 0.5 + 0.1 * W["efficient_lm_head.weight"]
+    save_file({k: v.to(torch.bfloat16).contiguous() for k, v in W.items()}, os.path.join(out_dir, "model.safetensors"))
+    cfg = {"architectures": ["LlamaForCausalLMEagle4"], "model_type": "llama", "attention_bias": False,
+           "attention_dropout": 0.0, "mlp_bias": False, "hidden_act": "silu", "hidden_size": H,
+           "target_hidden_size": H, "intermediate_size": inter, "num_hidden_layers": 1, "num_attention_heads": heads,
+           "num_key_value_heads": kv, "head_dim": hd, "rms_norm_eps": 1e-6, "vocab_size": vocab,
+           "draft_vocab_size": vocab, "tie_word_embeddings": False, "pretraining_tp": 1, "dtype": "bfloat16",
+           "max_position_embeddings": 4096, "bos_token_id": 0, "eos_token_id": 2, "pad_token_id": 0,
+           "eagle_config": {"eagle_aux_hidden_state_layer_ids": [t - 1 for t in taps], "use_aux_hidden_state": True},
+           "num_aux_hidden_states": n, "fc_norm": True, "norm_output": True,
+           "efficient_lm_head_config": {"num_candidates": cands, "rank": rank, "type": "low_rank"},
+           "rope_parameters": {"rope_theta": 10000000.0, "rope_type": "default"},
+           "layer_types": ["sliding_attention" if window else "full_attention"],
+           "use_sliding_window": bool(window), "sliding_window": window or None, "use_cache": True}
+    json.dump(cfg, open(os.path.join(out_dir, "config.json"), "w", encoding="utf-8"), indent=1)
+
+
 def zlab_drafter(src: str, dst: str, target_layers: int, window: int = 0, block: int = 0):
     """The drafter in src (speculators' layout) as z-lab publishes DFlash2 drafters: the same tensors, its settings
     in dflash_config, target_layer_ids the layers whose outputs it reads (speculators' indices - 1), with a
@@ -883,6 +942,32 @@ def make_core(out: str):
     make_dflash(f8dir, vocab, mask, layers, torch.Generator().manual_seed(8766), block=8)
     convert(tdir, f8path, f8dir, log=lambda *_: None)
     write_golden(f8path, os.path.join(out, "golden_dflash8.json"), prompts + more, vocab, keep=4)
+    # The tiny Qwen3.5 with an EAGLE-4 drafter in place of DFlash2's (its MTP layer kept), with a sliding window of 24
+    # (shorter than the prompts and their 48 tokens), as a drafter file, beside the NVFP4 copy; the tiny Qwen3 with
+    # one of its own (taps after its layers 1, 2 and 3 of 4), its rounds from transformers' own hidden states.  Its
+    # own generator: the files above stay what they were.
+    egen = torch.Generator().manual_seed(5150)
+    edir, epath = os.path.join(out, "hf_eagle4"), os.path.join(out, "tiny_eagle4.flyx")
+    make_eagle4(edir, vocab, layers, egen)
+    convert(tdir, epath, edir, log=lambda *_: None)
+    goldens.append((write_golden, (epath, os.path.join(out, "golden_eagle4.json"), prompts + more, vocab, 0.0, 4)))
+    convert_draft(edir, os.path.join(out, "tiny_draft_eagle4.flyx"), log=lambda *_: None)
+    same_drafter(epath, os.path.join(out, "tiny_draft_eagle4.flyx"))
+    ewdir, ewpath = os.path.join(out, "hf_eagle4_window"), os.path.join(out, "tiny_eagle4_window.flyx")
+    make_eagle4(ewdir, vocab, layers, egen, window=24)
+    convert(tdir, ewpath, ewdir, log=lambda *_: None)
+    goldens.append((write_golden, (ewpath, os.path.join(out, "golden_eagle4_window.json"), prompts + more, vocab, 0.0,
+                                   4)))
+    convert_draft(ewdir, os.path.join(out, "tiny_draft_eagle4_window.flyx"), log=lambda *_: None)
+    enpath = os.path.join(out, "tiny_eagle4_nvfp4.flyx")
+    convert(qdir, enpath, edir, log=lambda *_: None, activations="bf16")  # as tiny_nvfp4.flyx: bf16 inputs
+    goldens.append((write_golden, (enpath, os.path.join(out, "golden_eagle4_nvfp4.json"), prompts + more, vocab, 0.05,
+                                   4)))
+    q3e = os.path.join(out, "hf_qwen3_eagle4")
+    make_eagle4(q3e, vocab, 4, egen, taps=(1, 2, 3))
+    convert(q3dir, os.path.join(out, "tiny_qwen3_eagle4.flyx"), q3e, log=lambda *_: None)
+    write_hf_drafts(q3dir, os.path.join(out, "tiny_qwen3_eagle4.flyx"), os.path.join(out, "golden_qwen3.json"),
+                    os.path.join(out, "golden_qwen3_eagle4.json"))
     # The tiny Llama's linears in NVFP4 (ModelOpt's layout, bf16 inputs): rounds of more than 16 rows on its NVFP4
     # GEMMs (gemm_fp4_rows).  The reference has no Llama of NVFP4 weights: golden_llama_nvfp4.json gives the prompts
     # alone, and golden_test holds the file to its own plain decoding.  No random numbers: the files above stay.
@@ -916,7 +1001,9 @@ def make_core(out: str):
           f"tiny_qwen3_dspine.flyx, tiny_dspine1.flyx, golden_dspine1.json, tiny_draft_dspine1.flyx, "
           f"tiny_dspine_nvfp4.flyx, golden_dspine_nvfp4.json, tiny_dspine8.flyx, golden_dspine8.json, "
           f"golden_qwen3_dspine.json, tiny_dflash.flyx, golden_dflash.json, tiny_draft_dflash.flyx, "
-          f"tiny_qwen3_dflash.flyx, tiny_dflash8.flyx, golden_dflash8.json")
+          f"tiny_qwen3_dflash.flyx, tiny_dflash8.flyx, golden_dflash8.json, tiny_eagle4.flyx, golden_eagle4.json, "
+          f"tiny_draft_eagle4.flyx, tiny_eagle4_window.flyx, golden_eagle4_window.json, tiny_draft_eagle4_window.flyx, "
+          f"tiny_eagle4_nvfp4.flyx, golden_eagle4_nvfp4.json, tiny_qwen3_eagle4.flyx, golden_qwen3_eagle4.json")
 
 
 def make_dv(out: str):
@@ -1483,7 +1570,8 @@ def write_golden(path, out_json, prompts, vocab, min_margin=0.0, keep=None):
     target, draft, mtp, header, _ = load(path, with_mtp=True)
     golden = {"eos": header["generation"]["eos_ids"], "cases": []}
     if draft is not None:
-        golden["width"] = draft.block_drafts  # the block drafter's drafts a round below (its block's rows but the anchor)
+        # the block drafter's drafts a round below (its block's rows but the anchor; EAGLE-4's: 7 a round)
+        golden["width"] = draft.block_drafts
     for pr in prompts:
         if keep is not None and len(golden["cases"]) >= keep:
             break

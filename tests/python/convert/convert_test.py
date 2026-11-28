@@ -541,9 +541,38 @@ def draft_taps():
                   "final_logit_softcapping"), "a soft cap below zero is refused")
 
 
+def eagle4_config():
+    """EAGLE-Corp/Qwen3.8-27B-EAGLE4's config.json as published (core/modelfile/drafter_dir.cpp reads it the same way):
+    its taps the outputs of target layers 3, 31 and 59, a window of 4096, 128 candidates of a rank-128 head."""
+    print("an EAGLE-4 drafter's config")
+    published = {
+        "architectures": ["LlamaForCausalLMEagle4"], "attention_bias": False, "attention_dropout": 0.0,
+        "bos_token_id": 248044, "draft_vocab_size": 248320, "dtype": "bfloat16",
+        "eagle_config": {"eagle_aux_hidden_state_layer_ids": [3, 31, 59], "use_aux_hidden_state": True},
+        "efficient_lm_head_config": {"num_candidates": 128, "rank": 128, "type": "low_rank"},
+        "eos_token_id": 248044, "fc_norm": True, "head_dim": 128, "hidden_act": "silu", "hidden_size": 5120,
+        "initializer_range": 0.02, "intermediate_size": 16384, "layer_types": ["sliding_attention"],
+        "max_position_embeddings": 262144, "mlp_bias": False, "model_type": "llama", "norm_output": True,
+        "num_attention_heads": 40, "num_aux_hidden_states": 3, "num_hidden_layers": 1, "num_key_value_heads": 40,
+        "pad_token_id": 248044, "pretraining_tp": 1, "rms_norm_eps": 1e-06,
+        "rope_parameters": {"rope_theta": 10000000.0, "rope_type": "default"}, "sliding_window": 4096,
+        "target_hidden_size": 5120, "tie_word_embeddings": False, "transformers_version": "5.8.1",
+        "use_cache": True, "use_sliding_window": True, "vocab_size": 248320, "torch_dtype": "bfloat16"}
+    d = canonical_draft_config(published, {"hidden": 5120, "vocab": 248320, "layers": 64})
+    check(d == {"kind": "eagle4", "hidden": 5120, "layers": 1, "n_heads": 40, "n_kv": 40, "head_dim": 128,
+                "inter": 16384, "eps": 1e-06, "rope_theta": 10000000.0, "window": 4096, "taps": [4, 32, 60],
+                "cand_rank": 128, "n_cands": 128, "target": {"hidden": 5120, "vocab": 248320, "layers": None}},
+          f"the released drafter's canonical config: {d}")
+    check(refused(lambda c: canonical_draft_config(c, {"hidden": 5120, "vocab": 248320, "layers": 32}), published,
+                  "outside the target's layers"), "taps past the target's layers: refused")
+    check(refused(lambda c: canonical_draft_config(c, None), dict(published, norm_output=False), "norm_output"),
+          "a drafter that carries its unnormalised output on: refused")
+
+
 def main():
     rotary()
     draft_taps()
+    eagle4_config()
     with tempfile.TemporaryDirectory() as tmp:
         post_processor(tmp)
     with tempfile.TemporaryDirectory() as tmp:

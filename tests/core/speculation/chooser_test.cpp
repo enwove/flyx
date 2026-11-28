@@ -219,6 +219,59 @@ int main() {
           "branches that add nothing: the chain, each tree once in 64 rounds (rounds by kind: " + counts() + ")");
   }
 
+  // A tree with a trunk priced by where its trunk stops: its trunk (the chain's first 7) accepts nothing or one draft,
+  // in turn, and where it stops the branches add a token (EAGLE-4's chat rounds on Qwen3.8-27B).  The tree of 15 gives
+  // 2.5 tokens a round in 8.0 ms against the chain of 1's 1.5 in 5.6 and plain decoding's 1 in 5.0: the tree drafts.
+  {
+    const std::vector<int> widths = {0, 1, 3, 7, 15}, drafters = {-1, 0, 0, 0, 0}, trunks = {0, 0, 0, 0, 7};
+    const std::vector<double> cost = {5.0, 5.6, 6.3, 8.4, 8.0};
+    RoundChooser c;
+    c.configure(&widths, &drafters, &cost, nullptr, &trunks);
+    c.begin(true);
+    const std::vector<int32_t> text = range(1, 10);
+    int by[5] = {};
+    for (int i = 0; i < 600; ++i) {
+      const RoundChoice r = c.next(text, 0);
+      if (i >= 300) ++by[r.index];
+      const int deep = std::min(i % 2, r.width), tree = trunks[r.index] > 0;
+      c.result(r, true, deep + tree, text, 0, true, tree ? deep : 0);
+    }
+    check(by[4] >= 270, "a trunk that stops at once but branches that add a token: the tree (rounds by kind: " +
+                            std::to_string(by[0]) + " " + std::to_string(by[1]) + " " + std::to_string(by[2]) + " " +
+                            std::to_string(by[3]) + " " + std::to_string(by[4]) + ")");
+  }
+
+  // A reply's estimate of what a tree's branches add starts from the engine's sessions' (SharedTokens), not from
+  // kBonusPrior: after a session whose tree of 15's branches added 3 tokens a round, the next session drafts the tree
+  // from its first rounds (7 + 3 tokens in 10 ms against the chain of 7's 8 in 8.4), where a session of an engine with
+  // no rounds yet prices the branches at kBonusPrior and drafts the chain until its tree's probe.
+  {
+    const std::vector<int> widths = {0, 7, 15}, drafters = {-1, 0, 0}, trunks = {0, 0, 7};
+    const std::vector<double> cost = {5.0, 8.4, 10.0};
+    const std::vector<int32_t> text = range(1, 10);
+    auto session = [&](SharedTokens* engine, int rounds) {
+      RoundChooser c;
+      c.configure(&widths, &drafters, &cost, nullptr, &trunks, nullptr, nullptr, nullptr, 0, engine);
+      c.begin(true);
+      int trees = 0;
+      for (int i = 0; i < rounds; ++i) {
+        const RoundChoice r = c.next(text, 0);
+        const bool tree = trunks[r.index] > 0;
+        trees += tree;
+        c.result(r, true, r.width >= 7 ? 7 + (tree ? 3 : 0) : 0, text, 0, true, tree ? 7 : 0);
+      }
+      return trees;
+    };
+    SharedTokens engine, fresh;  // an engine's, sized to its rounds (Engine::load)
+    engine.resize(widths.size());
+    fresh.resize(widths.size());
+    session(&engine, 300);
+    const int after = session(&engine, 32), first = session(&fresh, 32);
+    check(after >= 28 && first <= 4,
+          "a session's tree starts from the engine's sessions' branches (trees in its first 32 rounds: " +
+              std::to_string(after) + " after a session, " + std::to_string(first) + " in a new engine)");
+  }
+
   // Lookup: the last tokens occurred before, so a round verifies what
   // followed them there, and such a round runs alone.
   std::vector<int32_t> text = passage;

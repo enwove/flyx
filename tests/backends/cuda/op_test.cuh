@@ -285,6 +285,7 @@ void test_head_cert_input_rounding();
 void test_gemm_fp8(int N, int K);
 void test_gemm_w12(int N, int K);
 void test_draft_pick(int V, int K, bool plant, bool pick = true);
+void test_draft_pick_rough(int V, int K);
 void test_draft_pick_blocks();
 void test_quantize_q8_0();
 void test_fused_producers();

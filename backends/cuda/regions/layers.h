@@ -5,6 +5,8 @@
 // result is the generic one bit for bit.
 #pragma once
 
+#include <algorithm>
+
 #include "backends/cuda/backend.h"
 #include "ops/sampling/sampling.h"
 
@@ -74,6 +76,17 @@ void draft_block(flyx_seq* s, const DFlashBlock& b, int width, const Launch& L, 
 void embed_block_rows(const EmbedBlock& E, const int* tok, float* tmp, float* out, int H, int B, cudaStream_t st);
 void mtp_draft(flyx_seq* s, const MtpBlock& b, int width, const Launch& L, bool fused = false, int start = 0);  // MTP: draft steps [start, width)
 void mtp_context(const Pass& ps, const MtpBlock& b, bool fused = false);  // MTP K/V for the rows of a pass
+// EAGLE-4: draft steps [start, width), MTP's timing; its context: the pass's rows' h kept, (h, next token) K/V written
+void eagle4_draft(flyx_seq* s, const Eagle4Block& b, int width, const Launch& L, bool fused = false, int start = 0);
+void eagle4_context(const Pass& ps, const Eagle4Block& b, bool fused = false);
+// EAGLE-4's tree of `width` drafts (FLYX_DRAFT_TREE; kernels/eagle4.cu): `steps` steps of `beam` rows each after the
+// root's (eagle4_tree_steps), the tree in s->tree.
+void eagle4_draft_tree(flyx_seq* s, const Eagle4Block& b, int width, const Launch& L, bool fused = false);
+// The steps a tree of `width` drafts takes at `beam` nodes a step (the option's, else 2 width / 3), within kEagleSlots.
+int eagle4_tree_steps(const flyx_bmodel* m, int width);
+// A tree step's candidates a row: a node's `beam` children, and the chain's draft at a trunk node (mtp_choose's, from
+// min(kMtpCands, vocab)).
+inline int eagle4_tree_cands(int beam, int vocab) { return std::max(beam, std::min(ops::kMtpCands, vocab)); }
 void gdn_layer(const Pass& ps, const GdnBlock& g, bool fused = false);
 void attn_layer(const Pass& ps, const AttnBlock& a, bool fused = false);
 void rel_attn_layer(const Pass& ps, const RelAttnBlock& a, bool fused = false);

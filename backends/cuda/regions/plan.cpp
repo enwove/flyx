@@ -28,11 +28,13 @@ std::string node_name(const flyx_node& n, const Block* b) {
       if (std::holds_alternative<DvBlock>(*b)) return "dv tree";
       if (std::holds_alternative<DSparkBlock>(*b)) return "dspark block";
       if (const auto* d = std::get_if<DFlashBlock>(b)) return std::string(d->name()) + " block";
+      if (std::holds_alternative<Eagle4Block>(*b)) return "eagle4 draft";
       return "mtp draft";
     case FLYX_NODE_CONTEXT:
       if (std::holds_alternative<DvBlock>(*b)) return "dv canvas";
       if (std::holds_alternative<DSparkBlock>(*b)) return "dspark context";
       if (const auto* d = std::get_if<DFlashBlock>(b)) return std::string(d->name()) + " context";
+      if (std::holds_alternative<Eagle4Block>(*b)) return "eagle4 context";
       return "mtp context";
     case FLYX_NODE_ACCEPT: return "accept";
     case FLYX_NODE_COMMIT: return "commit (fold)";
@@ -86,6 +88,21 @@ bool supported(const flyx_bmodel* m, const Block& blk, std::string* why) {
       return no("DSpine dimensions outside what the CUDA kernels support (code and rank multiples of 8, rank up to " +
                 std::to_string(kDSpineMaxRank) + ")");
     if (d->hidden != m->hidden || d->target_hidden != m->hidden) return no("drafter hidden size differs from the target's");
+  } else if (const auto* e = std::get_if<Eagle4Block>(&blk)) {
+    const AttnBlock& a = e->attn;
+    // the pair gather's register cache and the candidate pick's rows (draft_pick_rough)
+    // a chain step's and a tree step's candidates come from the n_cands scored exactly (draft_pick_rough)
+    const int fewest = eagle4_tree_cands(m->opt.eagle4_beam, e->vocab);
+    if (!attention_head_dim(a.hd) || a.nkv < 1 || a.nh % a.nkv || e->hidden % 64 || e->hidden != m->hidden ||
+        e->target_hidden != m->hidden || e->n_cands > kDraftCands || e->n_cands < fewest || e->cand_rank % 8 ||
+        e->mlp.inter % 64)
+      return no("EAGLE-4 dimensions outside what the CUDA kernels support (head dim 32, 64, 128 or 256, " +
+                std::to_string(fewest) + " to " + std::to_string(kDraftCands) +
+                " candidates, a rank of a multiple of 8)");
+    if (e->in_norm.offset != e->hidden_norm.offset || e->in_norm.eps != e->hidden_norm.eps)
+      return no("the EAGLE-4 gather takes one offset and eps for its two norms");
+    if (m->states.ring_width != e->hidden) return no("the EAGLE-4 ring keeps one hidden vector per position");
+    if (m->states.kv[size_t(a.kv)].fp8) return no("the EAGLE-4 cache in binary16 (its window's attention reads it)");
   } else if (const auto* ds = std::get_if<DSparkBlock>(&blk)) {
     if (!attention_head_dim(ds->hd) || ds->block < 2 || ds->block > FLYX_MAX_ROWS || ds->nkv < 1 || ds->nh % ds->nkv ||
         ds->hidden != m->hidden || ds->markov_rank < 1)
@@ -124,9 +141,11 @@ bool kernel_limits(const flyx_model_desc& d, std::string* why) {
   bool rel_attn = false;
   for (int i = 0; i < d.n_blocks; ++i) {
     const flyx_block& b = d.blocks[i];
-    if (b.kind == FLYX_BLOCK_DFLASH2 || b.kind == FLYX_BLOCK_DSPINE || b.kind == FLYX_BLOCK_DSPARK) {
-      const int taps = b.kind == FLYX_BLOCK_DFLASH2 ? b.dflash2.n_taps
+    if (b.kind == FLYX_BLOCK_DFLASH2 || b.kind == FLYX_BLOCK_DSPINE || b.kind == FLYX_BLOCK_DSPARK ||
+        b.kind == FLYX_BLOCK_EAGLE4) {
+      const int taps = b.kind == FLYX_BLOCK_DFLASH2  ? b.dflash2.n_taps
                        : b.kind == FLYX_BLOCK_DSPINE ? b.dspine.n_taps
+                       : b.kind == FLYX_BLOCK_EAGLE4 ? b.eagle4.n_taps
                                                      : b.dspark.n_taps;
       if (d.hidden <= 0 || taps <= 0) return no("invalid drafter feature dimensions");
       const int64_t width = int64_t(taps) * d.hidden;
@@ -177,7 +196,8 @@ const Block* block_of(const flyx_bmodel* m, const flyx_node& n, std::string* err
   }
   const Block* b = &m->blocks[size_t(n.block)];
   const bool drafter = std::holds_alternative<MtpBlock>(*b) || std::holds_alternative<DFlashBlock>(*b) ||
-                       std::holds_alternative<DvBlock>(*b) || std::holds_alternative<DSparkBlock>(*b);
+                       std::holds_alternative<DvBlock>(*b) || std::holds_alternative<DSparkBlock>(*b) ||
+                       std::holds_alternative<Eagle4Block>(*b);
   bool fits = false;
   switch (n.kind) {
     case FLYX_NODE_RUN:
@@ -191,6 +211,7 @@ const Block* block_of(const flyx_bmodel* m, const flyx_node& n, std::string* err
     case FLYX_NODE_TAP: {
       if (const auto* d = std::get_if<DFlashBlock>(b)) fits = n.arg0 >= 0 && n.arg0 < d->n_taps;
       else if (const auto* ds = std::get_if<DSparkBlock>(b)) fits = n.arg0 >= 0 && n.arg0 < ds->n_taps;
+      else if (const auto* e = std::get_if<Eagle4Block>(b)) fits = n.arg0 >= 0 && n.arg0 < e->n_taps && !n.arg1;
       break;
     }
     case FLYX_NODE_DRAFT:
@@ -242,6 +263,10 @@ bool fused_rel_attn(const flyx_bmodel*, const Block& blk) {
   return r && (r->nh * r->hd) % 64 == 0;
 }
 bool fused_moe(const flyx_bmodel*, const Block& blk) { return std::holds_alternative<MoeBlock>(blk); }
+bool fused_eagle4_draft(const flyx_bmodel*, const Block& blk) {
+  const auto* e = std::get_if<Eagle4Block>(&blk);
+  return e && e->hidden % 64 == 0 && e->mlp.inter % 64 == 0;
+}
 bool fused_dspark_draft(const flyx_bmodel*, const Block& blk) {
   const auto* d = std::get_if<DSparkBlock>(&blk);
   return d && d->hidden % 64 == 0 && d->inter % 64 == 0;
@@ -269,6 +294,11 @@ const RegionImpl kOverrides[] = {
     {FLYX_NODE_DRAFT, "fused producers", 1 << 30, fused_dflash_draft,
      [](const Pass& ps, const flyx_node& n, const Block* b) {
        draft_block(ps.s, std::get<DFlashBlock>(*b), n.arg0, ps.v.L, n.arg1 == FLYX_DRAFT_TREE, true);
+     }},
+    {FLYX_NODE_DRAFT, "fused producers", 1 << 30, fused_eagle4_draft,
+     [](const Pass& ps, const flyx_node& n, const Block* b) {
+       if (n.arg1 == FLYX_DRAFT_TREE) eagle4_draft_tree(ps.s, std::get<Eagle4Block>(*b), n.arg0, ps.v.L, true);
+       else eagle4_draft(ps.s, std::get<Eagle4Block>(*b), n.arg0, ps.v.L, true);
      }},
     {FLYX_NODE_DRAFT, "fused producers", 1 << 30, fused_dspark_draft,
      [](const Pass& ps, const flyx_node& n, const Block* b) {
@@ -383,7 +413,8 @@ void forward_target(const Pass& ps, int copy_prefix) {
 bool sequential_draft(const flyx_plan* p) {
   for (size_t i = 0; i < p->nodes.size(); ++i)
     if (p->nodes[i].kind == FLYX_NODE_DRAFT && p->block[i])
-      return std::holds_alternative<MtpBlock>(*p->block[i]) || std::holds_alternative<DSparkBlock>(*p->block[i]);
+      return std::holds_alternative<MtpBlock>(*p->block[i]) || std::holds_alternative<DSparkBlock>(*p->block[i]) ||
+             std::holds_alternative<Eagle4Block>(*p->block[i]);
   return false;
 }
 
@@ -393,6 +424,8 @@ void draft_step_range(const Pass& ps, int start, int end) {
     const bool fused = ps.p->impl[i] != &kGeneric;
     if (const auto* t = std::get_if<MtpBlock>(ps.p->block[i])) {
       mtp_draft(ps.s, *t, end, ps.v.L, fused, start);
+    } else if (const auto* e = std::get_if<Eagle4Block>(ps.p->block[i])) {
+      eagle4_draft(ps.s, *e, end, ps.v.L, fused, start);
     } else if (const auto* d = std::get_if<DFlashBlock>(ps.p->block[i])) {
       draft_block(ps.s, *d, end, ps.v.L, ps.p->nodes[i].arg1 == FLYX_DRAFT_TREE, fused);
     } else if (const auto* ds = std::get_if<DSparkBlock>(ps.p->block[i])) {
@@ -447,6 +480,8 @@ void run_node(const Pass& ps, const flyx_node& n, const Block* b) {
       if (const auto* df = std::get_if<DFlashBlock>(b)) {
         head_idx = df->head;
         feats_off = df->feats_offset;
+      } else if (const auto* e = std::get_if<Eagle4Block>(b)) {
+        feats_off = e->feats_offset;  // residual rows only (block_of: no normed tap)
       } else {
         const auto& ds = std::get<DSparkBlock>(*b);
         head_idx = ds.head;
@@ -470,12 +505,15 @@ void run_node(const Pass& ps, const flyx_node& n, const Block* b) {
     }
     case FLYX_NODE_DRAFT:
       if (const auto* t = std::get_if<MtpBlock>(b)) mtp_draft(s, *t, n.arg0, rv.L);
+      else if (const auto* e = std::get_if<Eagle4Block>(b))
+        n.arg1 == FLYX_DRAFT_TREE ? eagle4_draft_tree(s, *e, n.arg0, rv.L) : eagle4_draft(s, *e, n.arg0, rv.L);
       else if (const auto* v = std::get_if<DvBlock>(b)) dv_draft(s, *v, n.arg0, rv.L);
       else if (const auto* ds = std::get_if<DSparkBlock>(b)) dspark_draft(s, *ds, n.arg0, rv.L);
       else draft_block(s, std::get<DFlashBlock>(*b), n.arg0, rv.L, n.arg1 == FLYX_DRAFT_TREE);
       break;
     case FLYX_NODE_CONTEXT:
       if (const auto* t = std::get_if<MtpBlock>(b)) mtp_context(ps, *t);
+      else if (const auto* e = std::get_if<Eagle4Block>(b)) eagle4_context(ps, *e);
       else if (const auto* v = std::get_if<DvBlock>(b); v && ps.round) dv_context_unless_noop(ps, *v);
       else if (v) forget_canvas(s, st);  // a prefill's: the canvas starts over
       else if (const auto* ds = std::get_if<DSparkBlock>(b)) dspark_context(ps, *ds);
@@ -631,8 +669,13 @@ int lower(flyx_bmodel* m, const flyx_program* prog, flyx_plan** out) {
       // most); MTP drafts one token a step, DSpine and DFlash (one candidate a row) chains.
       const auto* v = std::get_if<DvBlock>(b);
       const auto* f = std::get_if<DFlashBlock>(b);
-      if (!v && !(f && !f->dspine && f->sel_topk > 1))
-        return fail("lower: only DFlash2's block (of more than one candidate a row) and DV draft trees");
+      const bool eagle = std::holds_alternative<Eagle4Block>(*b);
+      if (!v && !eagle && !(f && !f->dspine && f->sel_topk > 1))
+        return fail("lower: only DFlash2's block (of more than one candidate a row), EAGLE-4 and DV draft trees");
+      // EAGLE-4's trees verify its chain of kEagleTrunk and branches beside it: of 15 drafts (narrower ones are its
+      // chain with a branch or none, which its chains price better)
+      if (eagle && prog->width < FLYX_MAX_ROWS - 1)
+        return fail("lower: EAGLE-4 drafts trees of " + std::to_string(FLYX_MAX_ROWS - 1) + " drafts");
       p->tree = p->drafted_tree = p->has_draft = true;
       most = v ? max_drafts(*b) : FLYX_MAX_ROWS - 1;
     } else if (n.kind == FLYX_NODE_DRAFT) {

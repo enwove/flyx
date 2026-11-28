@@ -51,10 +51,11 @@ typedef struct {
   const char* backend_dir;  /* where backend libraries live; NULL = next to the executable */
   int32_t speculative;      /* use the model's drafters (default 1) */
   int32_t verbose;
-  const char* drafter;      /* "mtp" | "dflash2" | "dflash" | "dspark" | "dspine" | "dv" | "all" (chosen every round) |
+  const char* drafter;      /* "mtp" | "dflash2" | "dflash" | "dspark" | "dspine" | "eagle4" | "dv" | "all" (chosen
+                               every round; EAGLE-4 in MTP's place) |
                                "none" | NULL = the drafter files' drafters and the model file's MTP layer, else its
-                               block drafter (DFlash2, DFlash, DSpark or DSpine); its DV drafter only when named
-                               ("dv", "all").  DV (a Llama file converted with python/convert --dv;
+                               block drafter (DFlash2, DFlash, DSpark, DSpine or EAGLE-4); its DV drafter only when
+                               named ("dv", "all").  DV (a Llama file converted with python/convert --dv;
                                docs/design/dv.md) drafts trees, its rounds chosen every round beside plain decoding's
                                and lookup's; with a width, its rounds alone.  Where the backend cannot run its
                                rounds, the model decodes as without it (plain decoding and lookup rounds) and says

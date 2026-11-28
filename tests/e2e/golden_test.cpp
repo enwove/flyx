@@ -46,6 +46,8 @@ namespace {
 // its place; "" for none.
 std::string g_block;
 std::string block_label() { return g_block == "dspine" ? "DSpine" : g_block == "dflash" ? "DFlash" : "DFlash2"; }
+// EAGLE-4's trunk: the chain a tree of its drafts starts with (Model::block_drafts, kEagleTrunk)
+constexpr int kEagleTrunkDrafts = 7;
 
 // Session::init, checked.  A session the engine refuses (no room left for it, as on a GPU other programs hold, or
 // seq_new failed) has no sequence: a FAIL naming this file's line and why, and false.  generate refuses such a
@@ -1640,6 +1642,14 @@ void strata_rounds(const std::string& model, const std::string& backend, const s
       check(tokens(host.get()) == t && tokens(copy_host.get()) == t,
             std::string("auto") + (fp8 ? ", fp8" : ", binary16") +
                 ": the K/V (and the copy) in host memory, DFlash2 across the switch == plain decode");
+      // --kv-gpu below the context and no switch given: the one the target's K/V on the GPU sets (Engine::load's
+      // auto_from), whichever drafter is named; the drafter's chosen rounds (EAGLE-4's chains alone, its trees reading
+      // every position) give plain decoding's tokens there too.
+      auto gpu_plain = make(model, backend, false, "", fp8, narrow, false, 512, kReferenceWidth, false, from, "auto");
+      auto gpu_spec = make(model, backend, true, g_block, fp8, narrow, false, 512, -1, false, from, "auto");
+      check(tokens(gpu_spec.get()) == tokens(gpu_plain.get()),
+            std::string("auto") + (fp8 ? ", fp8" : ", binary16") + ": --kv-gpu " + std::to_string(from) +
+                ", no switch given: " + block_label() + "'s chosen rounds decode == plain decode");
       // The switch at the start: strata's tokens (2-bit default, and explicit 3-bit); past the context: exact's.
       auto first = make(model, backend, false, "", fp8, narrow + ",strata_from=0", false, 512, kReferenceWidth, false,
                         -1, "auto");
@@ -2134,14 +2144,18 @@ void rows_on_tensor_cores(const std::string& model, const std::string& backend, 
 void drafted_trees(const std::string& model, const std::string& backend, const std::vector<int32_t>& prompt,
                    const std::vector<int32_t>& want, const std::vector<int32_t>& oracle) {
   const int N = static_cast<int>(want.size());
+  const std::string who = g_block == "eagle4" ? "EAGLE-4" : "DFlash2";
   auto trees = make(model, backend, true, g_block, false, "", false, 512, -1, true);
   std::vector<size_t> turns;
   for (size_t i = 0; i < trees->widths().size(); ++i)
     if (trees->round_trees()[i]) turns.push_back(i);
-  check(turns.size() == plan::draft_tree_widths().size(), "DFlash2 drafts trees of every size");
+  // EAGLE-4's trees are of 15 drafts (its chain of 7 and branches; narrower ones its chains price better)
+  check(turns.size() == (g_block == "eagle4" ? 1 : plan::draft_tree_widths().size()),
+        who + " drafts trees of every size it has");
   for (size_t i = 0; i < trees->widths().size(); ++i)  // and its chains
     if (!trees->round_trees()[i] && trees->widths()[i] > 0) turns.push_back(i);
   std::string err;
+  int tree_rounds = 0;
   auto turn_rounds = [&](const std::vector<int32_t>* with_oracle, int* tree_accepted) {
     Session s(trees.get());
     init_checked(s);
@@ -2149,20 +2163,24 @@ void drafted_trees(const std::string& model, const std::string& backend, const s
     s.rounds().cycle(turns);
     std::vector<flyx_round_result> trace;
     const auto out = gen(s, prompt, N, &trace).tokens;
-    *tree_accepted = 0;
+    *tree_accepted = tree_rounds = 0;
     for (size_t r = 1; r < trace.size(); ++r)
-      if (trees->round_trees()[turns[(r - 1) % turns.size()]]) *tree_accepted += trace[r].n_accepted;
+      if (trees->round_trees()[turns[(r - 1) % turns.size()]]) *tree_accepted += trace[r].n_accepted, ++tree_rounds;
     if (with_oracle) trees->api()->set_oracle(s.seq(), nullptr, 0);
     return out;
   };
   int accepted = 0, oracle_accepted = 0;
   const bool same = turn_rounds(nullptr, &accepted) == want;
-  check(same, "DFlash2 trees taking turns with its chains: the reference's tokens (" +
+  check(same, who + " trees taking turns with its chains: the reference's tokens (" +
                   std::to_string(accepted) + " drafts accepted in tree rounds)");
   const bool same_oracle = turn_rounds(&oracle, &oracle_accepted) == want;
-  check(same_oracle && oracle_accepted > N / 2,
-        "  with oracle drafts: long accepted runs (" + std::to_string(oracle_accepted) + " in tree rounds, " +
-            std::to_string(N) + " tokens)");
+  // EAGLE-4's trees of 15 are 10 steps deep: the oracle's path whole (but in the last round, which the token limit
+  // cuts)
+  const bool long_runs = g_block == "eagle4" ? tree_rounds > 1 && oracle_accepted >= 10 * (tree_rounds - 1)
+                                             : oracle_accepted > N / 2;
+  check(same_oracle && long_runs,
+        "  with oracle drafts: long accepted runs (" + std::to_string(oracle_accepted) + " in " +
+            std::to_string(tree_rounds) + " tree rounds, " + std::to_string(N) + " tokens)");
   {
     Session s(trees.get());
     init_checked(s);
@@ -2193,6 +2211,32 @@ void drafted_trees(const std::string& model, const std::string& backend, const s
   const auto a = sampled(plain.get(), false);
   check(static_cast<int>(a.size()) == N && sampled(trees.get(), true) == a,
         "  sampled (T=0.8): trees taking turns == plain for one seed");
+  if (g_block != "eagle4" || backend != "cuda") return;
+  // EAGLE-4's trunk is its chain, sampling and with penalties too (each trunk node's child the chain's draft there:
+  // mtp_choose's choice from the same candidates, counts and noise): from each of 8 prompts, the first round of a
+  // tree of 15 drafts the chain of 7's drafts first.
+  size_t chain = trees->widths().size();
+  for (size_t i = 0; i < trees->widths().size(); ++i)
+    if (!trees->round_trees()[i] && trees->widths()[i] == kEagleTrunkDrafts) chain = i;
+  const SamplingParams sp{0.8f, 0.95f, 0, 5, 0.5f, 0.3f};
+  int trunks = 0, prompts = 0;
+  for (int k = 0; k < 8 && chain < trees->widths().size(); ++k, ++prompts) {
+    auto p = prompt;
+    p.insert(p.end(), want.begin(), want.begin() + std::min(N, 2 * k));
+    auto first_drafts = [&](size_t round) {
+      Session s(trees.get());
+      init_checked(s);
+      s.rounds().cycle({round});
+      std::vector<flyx_round_result> trace;
+      gen(s, p, 8, &trace, sp);
+      if (trace.size() < 2 || trace[1].n_drafts < kEagleTrunkDrafts) return std::vector<int32_t>{};
+      return std::vector<int32_t>(trace[1].drafts, trace[1].drafts + kEagleTrunkDrafts);
+    };
+    const auto c = first_drafts(chain), t = first_drafts(turns[0]);
+    trunks += !c.empty() && c == t;
+  }
+  check(prompts == 8 && trunks == prompts, "  sampled with penalties: a tree's first 7 drafts are its chain's (" +
+                                             std::to_string(trunks) + " of " + std::to_string(prompts) + " prompts)");
 }
 
 // DV's rounds launched one at a time on session s from the end of its prompt (its first token decoded): round k
@@ -4198,8 +4242,9 @@ int main(int argc, char** argv) {
             "relaxed acceptance, min-p 1e-37: more drafts accepted (MTP " + std::to_string(loose_m) + " against " +
                 std::to_string(exact_m) + ", DFlash2 " + std::to_string(loose_d) + " against " +
                 std::to_string(exact_d) + ")");
-      // DFlash (one candidate a row) and DSpine draft chains only
-      if (g_block == "dflash2") drafted_trees(model, backend, prompt, want, oracle);
+      // DFlash (one candidate a row) and DSpine draft chains only; EAGLE-4 trees on CUDA (cpu_ref drafts its chains)
+      if (g_block == "dflash2" || (g_block == "eagle4" && backend == "cuda"))
+        drafted_trees(model, backend, prompt, want, oracle);
     }
 
     // MTP drafter: same tokens; drafts equal to the reference's; state kept
@@ -4257,7 +4302,13 @@ int main(int argc, char** argv) {
     // fresh session with that drafter alone drafts from the same point (on the float64 backend exactly; on the GPU
     // the fresh session's prefill passes may round otherwise).  Chosen every round, they give the reference's
     // tokens, greedy, and plain decoding's, sampled.
-    {
+    // EAGLE-4 keeps its h in the ring MTP keeps the target's in: "all" gives it alone (models/model.cpp:
+    // choose_drafters), and the rounds above are its.
+    if (g_block == "eagle4") {
+      bool alone = !both->round_drafters().empty();
+      for (int d : both->round_drafters()) alone = alone && (d < 0 || both->model().drafter_name(d) == g_block);
+      check(alone, "all: EAGLE-4 alone (it and MTP share the ring)");
+    } else {
       std::vector<size_t> turns;  // the MTP layer's round, then DFlash2's
       for (const std::string name : {std::string("mtp"), g_block})
         for (size_t i = 0; i < both->widths().size(); ++i)

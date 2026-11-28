@@ -30,7 +30,7 @@
 extern "C" {
 #endif
 
-#define FLYX_BACKEND_ABI_VERSION 54u
+#define FLYX_BACKEND_ABI_VERSION 55u
 #define FLYX_BACKEND_ENTRY "flyx_backend_get_api"
 /* How a backend library exports its entry. */
 #if defined(_WIN32)
@@ -313,7 +313,8 @@ typedef enum {
   FLYX_BLOCK_DSPARK = 17,      /* ABI 45: DSpark parallel block drafter with Markov RNN head */
   FLYX_BLOCK_DSPARK_LAYER = 18, /* ABI 45: one layer of DSpark */
   FLYX_BLOCK_DSPINE = 19,       /* ABI 51: DSpine, a block drafter whose rows pass a code bridge's message on */
-  FLYX_BLOCK_DSPINE_LAYER = 20  /* ABI 51: a DSpine layer: a Qwen3 layer, then its bridge's read and write */
+  FLYX_BLOCK_DSPINE_LAYER = 20, /* ABI 51: a DSpine layer: a Qwen3 layer, then its bridge's read and write */
+  FLYX_BLOCK_EAGLE4 = 21        /* ABI 55: EAGLE-4, a one-layer drafter run a step a draft from target taps */
 } flyx_block_kind;
 
 /* Token rows -> residual rows: x = table[token], optionally followed by RMSNorm (has_norm != 0, ABI 45). */
@@ -493,6 +494,42 @@ typedef struct {
   int32_t read, write;
   int32_t pad0;
 } flyx_dspine_layer_block;
+
+/* EAGLE-4 drafter (ABI 55; python/reference/flyx_ref/eagle4.py): one decoder layer run a step per draft, as MTP's,
+ * from the target's residual rows at n_taps taps instead of its final-normed hidden.  All norms plain (w, eps).
+ *   context features at position j (the residual rows tapped there): h_j = fc([fc_norm_i(tap_i)]_i)
+ *   a step from (h, the next token t) at position j:
+ *     x = [in_norm(embed[t]) | hidden_norm(h)]                    (2 hidden wide)
+ *     q, k, v = x q^T, x k^T, x v^T; rotary (theta, every dim, halves rotated) at j; k and v into its cache
+ *     r = h + o(attention over its cache: positions j' <= j, and j' > j - window when window > 0)
+ *     r += down(silu(gate(post_norm(r))) * up(post_norm(r)))
+ *     g = norm(r): the step's logits head g, and the next step's h
+ *   the drafts: the n_cands best tokens by cand_up (cand_down g) (its low-rank scores over the vocabulary; the lower
+ *   id on ties), each scored exactly head[t] . g; a draft the best of them (sampling: the target's noise over them).
+ * Drafting from the anchor a at position p, h_{p-1} kept in its ring: step 1 (h_{p-1}, a) at p - 1, step i
+ * (g_{i-1}, d_{i-1}) at p + i - 2.  Its context (after a pass) writes the K/V of the positions base - 1 ..
+ * base + rows - 2 from (h_j, the token at j + 1) and keeps each h_j in the ring.  It reads the target's embedding
+ * (embed); the head is its own.  Only drafting reads it: it never changes the output. */
+#define FLYX_EAGLE4_MAX_TAPS 8
+typedef struct {
+  int32_t hidden, n_heads, n_kv, head_dim, inter;
+  int32_t n_taps, target_hidden;
+  int32_t window;                      /* sliding window of its attention; 0: none */
+  double theta;
+  int32_t embed;                       /* block: the target's embedding */
+  int32_t fc;                          /* [hidden, n_taps * target_hidden] */
+  flyx_norm fc_norm[FLYX_EAGLE4_MAX_TAPS];  /* one a tap, each over target_hidden */
+  flyx_norm in_norm, hidden_norm, post_norm, norm;
+  int32_t q, k, v, o;                  /* q [n_heads head_dim, 2 hidden], k and v [n_kv head_dim, 2 hidden] */
+  int32_t gate, up, down;
+  int32_t vocab;                       /* tokens it drafts: ids 0..vocab-1 (head and cand_up may hold padding rows) */
+  int32_t head;                        /* [rows >= vocab, hidden] */
+  int32_t cand_down, cand_up;          /* [cand_rank, hidden], [rows >= vocab, cand_rank] */
+  int32_t cand_rank, n_cands;
+  int32_t kv;                          /* state: its K/V cache */
+  int32_t ring;                        /* state (width hidden): h per position */
+  int32_t float_weights;               /* flyx_draft_weights beside a float target (AUTO, Q8, NVFP4) */
+} flyx_eagle4_block;
 
 /* The tree DV drafts (flyx_dv_block.tree; ops/draft/ref.h). */
 typedef enum {
@@ -743,6 +780,7 @@ typedef struct {
     flyx_dspark_layer_block dspark_layer; /* ABI 45 */
     flyx_dspine_block dspine;             /* ABI 51 */
     flyx_dspine_layer_block dspine_layer; /* ABI 51 */
+    flyx_eagle4_block eagle4;             /* ABI 55 */
   };
 } flyx_block;
 

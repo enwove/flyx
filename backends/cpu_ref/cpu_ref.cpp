@@ -54,7 +54,7 @@ struct RefModel {
                                                          // 32 values (FLYX_ACT_Q8)
   std::unordered_set<const flyx_tensor_view*> a4;    // NVFP4 weights whose inputs are NVFP4 in those passes
   mutable std::unordered_map<int, Vec> cache;
-  int dflash = -1;  // the block drafter's block (DFlash2's or DSpine's), -1: none
+  int dflash = -1;  // the tapped drafter's block (DFlash2's, DSpine's or EAGLE-4's), -1: none
   int dspark = -1;  // the DSpark drafter block, -1: none
   int dflash_tap_off = 0, dspark_tap_off = 0, total_taps = 0;
   int ring_width = 0;
@@ -1191,6 +1191,135 @@ void mtp_context(RefSeq* s, const flyx_mtp_block& B, int rows) {
   for (int r = 0; r < rows; ++r) std::copy(&hn[size_t(r) * H], &hn[size_t(r) * H] + H, &s->hidden_at[size_t(base + r) * H]);
 }
 
+// ---- EAGLE-4 drafter (python/reference/flyx_ref/eagle4.py) ---------------------
+
+// h = fc([fc_norm_i(tap_i)]_i) of a pass's row r, from the taps the pass wrote; the engine's GEMM takes gemm_rows rows.
+void eagle4_h(RefSeq* s, const flyx_eagle4_block& B, int r, double* h, int gemm_rows) {
+  const auto* M = s->m;
+  const int Ht = B.target_hidden, F = B.n_taps * Ht;
+  const int F_row = M->total_taps * M->hidden, F_off = M->dflash_tap_off * M->hidden;
+  Vec cat(F);
+  for (int i = 0; i < B.n_taps; ++i)
+    norm(M, B.fc_norm[i], &s->feats[size_t(r) * size_t(F_row) + size_t(F_off) + size_t(i) * Ht], Ht,
+         cat.data() + size_t(i) * Ht);
+  lin(M, B.fc, cat.data(), 1, F, B.hidden, h, gemm_rows);
+}
+
+// The layer's input [in_norm(embed[tok]) | hidden_norm(h)] and its k and v at pos into the cache; q (rotated) if given.
+void eagle4_qkv(RefSeq* s, const flyx_eagle4_block& B, const double* h, int tok, int pos, double* q, int gemm_rows,
+                const float* emb_override = nullptr) {
+  const auto* M = s->m;
+  const auto& e = M->block(B.embed).embed;
+  const int H = B.hidden, nh = B.n_heads, nkv = B.n_kv, hd = B.head_dim;
+  Vec emb(H), x(2 * size_t(H)), k(size_t(nkv) * hd), v(size_t(nkv) * hd), qq(size_t(nh) * hd);
+  if (emb_override) {
+    for (int c = 0; c < H; ++c) emb[c] = double(emb_override[c]);
+  } else {
+    const auto* E = M->w(e.table);
+    for (int c = 0; c < H; ++c) emb[c] = load(E, size_t(tok) * H + c);
+  }
+  norm(M, B.in_norm, emb.data(), H, x.data());
+  norm(M, B.hidden_norm, h, H, x.data() + H);
+  lin(M, B.k, x.data(), 1, 2 * H, nkv * hd, k.data(), gemm_rows);
+  lin(M, B.v, x.data(), 1, 2 * H, nkv * hd, v.data(), gemm_rows);
+  Vec& K = s->K[size_t(B.kv)][0];
+  Vec& V = s->V[size_t(B.kv)][0];
+  for (int j = 0; j < nkv; ++j) {
+    rope(&k[size_t(j) * hd], pos, B.theta, hd);
+    std::copy_n(&k[size_t(j) * hd], hd, &K[(size_t(pos) * nkv + j) * hd]);
+    std::copy_n(&v[size_t(j) * hd], hd, &V[(size_t(pos) * nkv + j) * hd]);
+  }
+  if (!q) return;
+  lin(M, B.q, x.data(), 1, 2 * H, nh * hd, q, gemm_rows);
+  for (int hh = 0; hh < nh; ++hh) rope(q + size_t(hh) * hd, pos, B.theta, hd);
+}
+
+// Drafts `width` tokens from the anchor, one step each (MTP's timing, mtp_draft): step i at position p - 1 + i from
+// (h, the token before), h the ring's at p - 1 for the first step and the step before's normed output after it.
+void eagle4_draft(RefSeq* s, const flyx_eagle4_block& B, int width) {
+  const auto* M = s->m;
+  const int H = B.hidden, nh = B.n_heads, nkv = B.n_kv, hd = B.head_dim, I = B.inter, V = B.vocab;
+  const int R = B.cand_rank, C = std::min(B.n_cands, V);
+  const int p = s->position;
+  Vec h(s->hidden_at.begin() + size_t(p - 1) * H, s->hidden_at.begin() + size_t(p) * H);
+  Vec q(size_t(nh) * hd), o(size_t(nh) * hd), y(H), r(H), tn(H), g(I), u(I), z(R), score(V);
+  int tok = s->anchor;
+  s->drafts.assign(width, 0);
+  const auto* head = M->w(B.head);
+  for (int i = 0; i < width; ++i) {
+    const int pos = p - 1 + i;
+    eagle4_qkv(s, B, h.data(), tok, pos, q.data(), 1);
+    const Vec& K = s->K[size_t(B.kv)][0];
+    const Vec& Vv = s->V[size_t(B.kv)][0];
+    const int lo = B.window > 0 ? std::max(0, pos - B.window + 1) : 0;
+    for (int hh = 0; hh < nh; ++hh)
+      attend(&q[size_t(hh) * hd], K.data() + size_t(lo) * nkv * hd, Vv.data() + size_t(lo) * nkv * hd, pos + 1 - lo,
+             nkv, hd, hh / (nh / nkv), 1.0 / std::sqrt(double(hd)), &o[size_t(hh) * hd]);
+    lin(M, B.o, o.data(), 1, nh * hd, H, y.data(), 1);
+    for (int c = 0; c < H; ++c) r[c] = h[c] + y[c];
+    norm(M, B.post_norm, r.data(), H, tn.data());
+    lin(M, B.gate, tn.data(), 1, H, I, g.data(), 1);
+    lin(M, B.up, tn.data(), 1, H, I, u.data(), 1);
+    for (int k = 0; k < I; ++k) g[k] = silu(g[k]) * u[k];
+    lin(M, B.down, g.data(), 1, I, H, y.data(), 1);
+    for (int c = 0; c < H; ++c) r[c] += y[c];
+    norm(M, B.norm, r.data(), H, h.data());
+    // The candidate head: its low-rank scores over the vocabulary, their best C (the lower id on ties), each scored
+    // exactly by the head; the draft as ops::draft_choice takes it over the best kMtpCands of those (the higher
+    // score, the lower id on ties), as MTP's over the head's best and as the CUDA backend's.
+    lin(M, B.cand_down, h.data(), 1, H, R, z.data(), 1);
+    lin(M, B.cand_up, z.data(), 1, R, V, score.data(), 1);
+    std::vector<int32_t> cand(C), count(C);
+    std::vector<double> sval(C);
+    std::vector<float> fval(C);
+    topk(score.data(), V, C, cand.data(), sval.data());
+    const bool pen = penalized(s->gen);
+    for (int c = 0; c < C; ++c) {
+      double l = 0;
+      for (int k = 0; k < H; ++k) l += load(head, size_t(cand[c]) * H + k) * h[k];
+      fval[c] = float(l);
+    }
+    std::vector<int> order(size_t(C), 0);
+    for (int c = 0; c < C; ++c) order[size_t(c)] = c;
+    const int Kc = std::min(flyx::ops::kMtpCands, C);
+    // a NaN score below every other (draft_choice skips it), so the order stays a strict weak one
+    auto key = [&](int c) { return fval[size_t(c)] != fval[size_t(c)] ? -INFINITY : fval[size_t(c)]; };
+    std::partial_sort(order.begin(), order.begin() + Kc, order.end(), [&](int a, int b) {
+      return key(a) != key(b) ? key(a) > key(b) : cand[size_t(a)] < cand[size_t(b)];
+    });
+    std::vector<int32_t> kcand(size_t(Kc), 0);
+    std::vector<float> kval(size_t(Kc), 0.f);
+    for (int c = 0; c < Kc; ++c) {
+      kcand[size_t(c)] = cand[size_t(order[size_t(c)])];
+      kval[size_t(c)] = fval[size_t(order[size_t(c)])];
+      count[size_t(c)] = pen && !s->counts.empty() ? s->counts[size_t(kcand[size_t(c)])] : 0;
+      for (int j = 0; pen && j < i; ++j) count[size_t(c)] += s->drafts[size_t(j)] == kcand[size_t(c)];
+    }
+    const flyx_gen_params& gp = s->gen;
+    int d = flyx::ops::draft_choice(kcand.data(), kval.data(), pen ? count.data() : nullptr, Kc, V, gp.temperature,
+                                    gp.top_p, gp.top_k, gp.presence_penalty, gp.frequency_penalty, gp.seed, p + 1 + i);
+    if (forced_drafts(s)) d = forced_draft(s, p + 1 + i);
+    s->drafts[i] = d;
+    tok = d;
+  }
+}
+
+// After a pass over `rows` rows starting at position base: keep each row's h (fc of its taps) and write the K/V
+// entries base-1 .. base+rows-2 from (h at j, token at j+1), as mtp_context.
+void eagle4_context(RefSeq* s, const flyx_eagle4_block& B, int rows) {
+  const int H = B.hidden, base = s->start;
+  Vec hs(size_t(rows) * H);
+  for (int r = 0; r < rows; ++r) eagle4_h(s, B, r, &hs[size_t(r) * H], rows);
+  for (int r = 0; r < rows; ++r) {
+    const int pos = base - 1 + r;
+    if (pos < 0) continue;
+    const double* h = r == 0 ? &s->hidden_at[size_t(pos) * H] : &hs[size_t(r - 1) * H];
+    auto ov = s->embed_override.find(r);
+    eagle4_qkv(s, B, h, s->tok[r], pos, nullptr, rows, ov != s->embed_override.end() ? ov->second : nullptr);
+  }
+  for (int r = 0; r < rows; ++r) std::copy_n(&hs[size_t(r) * H], H, &s->hidden_at[size_t(base + r) * H]);
+}
+
 // ---- round bookkeeping ----------------------------------------------------------
 
 void accept(RefSeq* s, int width) {
@@ -1294,10 +1423,12 @@ const char* node_label(const flyx_node& n, const flyx_block* b, int phase) {
       }
     case FLYX_NODE_DRAFT:
       if (b->kind == FLYX_BLOCK_MTP) return "draft mtp";
+      if (b->kind == FLYX_BLOCK_EAGLE4) return "draft eagle4";
       return b->kind == FLYX_BLOCK_DSPARK ? "draft dspark" : b->kind == FLYX_BLOCK_DSPINE ? "draft dspine" : "draft dflash2";
     case FLYX_NODE_CONTEXT:
       if (b->kind == FLYX_BLOCK_DV) return "context dv";
       if (b->kind == FLYX_BLOCK_MTP) return "context mtp";
+      if (b->kind == FLYX_BLOCK_EAGLE4) return "context eagle4";
       return b->kind == FLYX_BLOCK_DSPARK   ? "context dspark"
              : b->kind == FLYX_BLOCK_DSPINE ? "context dspine"
                                             : "context dflash2";
@@ -1344,9 +1475,12 @@ void run_nodes(RefPlan* p, RefSeq* s) {
         break;
       case FLYX_NODE_TAP: {
         const int tap_off = b->kind == FLYX_BLOCK_DSPARK ? M->dspark_tap_off : M->dflash_tap_off;
+        // EAGLE-4 taps residual rows only (models/drafters/eagle4.cpp: no tap after the final norm)
         const int head_idx = b->kind == FLYX_BLOCK_DSPARK   ? b->dspark.head
                              : b->kind == FLYX_BLOCK_DSPINE ? b->dspine.head
+                             : b->kind == FLYX_BLOCK_EAGLE4 ? -1
                                                             : b->dflash2.head;
+        if (n.arg1 == FLYX_TAP_NORMED && head_idx < 0) throw std::runtime_error("cpu_ref: a normed tap without a head");
         const int F = M->total_taps * H;
         const int col_off = (tap_off + n.arg0) * H;
         if (n.arg1 == FLYX_TAP_NORMED) {
@@ -1361,6 +1495,7 @@ void run_nodes(RefPlan* p, RefSeq* s) {
       }
       case FLYX_NODE_DRAFT:
         if (b->kind == FLYX_BLOCK_MTP) mtp_draft(s, b->mtp, n.arg0);
+        else if (b->kind == FLYX_BLOCK_EAGLE4) eagle4_draft(s, b->eagle4, n.arg0);
         else if (b->kind == FLYX_BLOCK_DSPARK) dspark_draft(s, b->dspark, n.arg0);
         else if (b->kind == FLYX_BLOCK_DSPINE) dspine_block(s, b->dspine, n.arg0);
         else draft_block(s, b->dflash2, n.arg0);
@@ -1370,6 +1505,7 @@ void run_nodes(RefPlan* p, RefSeq* s) {
         const int rows = p->phase == FLYX_PHASE_PREFILL ? s->rows : s->noop ? 0 : s->last_n + 1;
         if (rows == 0) break;
         if (b->kind == FLYX_BLOCK_MTP) mtp_context(s, b->mtp, rows);
+        else if (b->kind == FLYX_BLOCK_EAGLE4) eagle4_context(s, b->eagle4, rows);
         else if (b->kind == FLYX_BLOCK_DSPARK) dspark_context(s, b->dspark, rows);
         else if (b->kind == FLYX_BLOCK_DSPINE) block_context(s, b->dspine, rows, slayer);
         else block_context(s, b->dflash2, rows, dlayer);
@@ -1559,15 +1695,22 @@ int open_model(const flyx_model_desc* desc, const flyx_open_options* opts, flyx_
       const flyx_block& b = desc->blocks[i];
       const int k = b.kind;
       // DV's blocks (ABI 42) are taken and never run: such a model decodes here as without DV (lower).
-      if (k < FLYX_BLOCK_EMBED || k > FLYX_BLOCK_DSPINE_LAYER)
+      if (k < FLYX_BLOCK_EMBED || k > FLYX_BLOCK_EAGLE4)
         throw std::runtime_error("block kind " + std::to_string(k) + ": not implemented by cpu_ref");
       if (k == FLYX_BLOCK_VISION_STEM && b.vision_stem.cls_token >= 0)
         throw std::runtime_error("vision_stem: cls_token is not yet implemented by cpu_ref");
-      if (k == FLYX_BLOCK_DFLASH2 || k == FLYX_BLOCK_DSPINE) {
-        if (m->dflash >= 0) throw std::runtime_error("more than one block drafter");
+      // its fc_norm per tap, its taps and its own width the target's (as the CUDA backend's bind checks)
+      if (k == FLYX_BLOCK_EAGLE4 && (b.eagle4.n_taps < 1 || b.eagle4.n_taps > FLYX_EAGLE4_MAX_TAPS ||
+                                     b.eagle4.target_hidden != desc->hidden || b.eagle4.hidden != desc->hidden))
+        throw std::runtime_error("eagle4: " + std::to_string(b.eagle4.n_taps) + " taps of width " +
+                                 std::to_string(b.eagle4.target_hidden) + " (1.." +
+                                 std::to_string(FLYX_EAGLE4_MAX_TAPS) + " of its own width)");
+      if (k == FLYX_BLOCK_DFLASH2 || k == FLYX_BLOCK_DSPINE || k == FLYX_BLOCK_EAGLE4) {
+        if (m->dflash >= 0) throw std::runtime_error("more than one drafter of the target's taps");
         m->dflash = i;
         m->dflash_tap_off = m->total_taps;
-        m->total_taps += k == FLYX_BLOCK_DSPINE ? b.dspine.n_taps : b.dflash2.n_taps;
+        m->total_taps += k == FLYX_BLOCK_DSPINE ? b.dspine.n_taps : k == FLYX_BLOCK_EAGLE4 ? b.eagle4.n_taps
+                                                                                            : b.dflash2.n_taps;
       }
       if (k == FLYX_BLOCK_DSPARK) {
         m->dspark = i;
@@ -1742,7 +1885,7 @@ int lower(flyx_bmodel* bm, const flyx_program* prog, flyx_plan** out) {
       most = b.kind == FLYX_BLOCK_DFLASH2  ? std::max(b.dflash2.block, FLYX_MAX_ROWS) - 1
              : b.kind == FLYX_BLOCK_DSPARK ? b.dspark.block - 1
              : b.kind == FLYX_BLOCK_DSPINE ? b.dspine.block - 1  // the rows it was made for: no wider block
-             : b.kind == FLYX_BLOCK_MTP    ? FLYX_MAX_ROWS - 1
+             : b.kind == FLYX_BLOCK_MTP || b.kind == FLYX_BLOCK_EAGLE4 ? FLYX_MAX_ROWS - 1
                                            : 0;
     }
   }

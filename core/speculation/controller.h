@@ -13,9 +13,10 @@
 
 namespace flyx {
 
-// What an engine's sessions' trees without a trunk gave a round, by round (tokens, the counts kept kKeep a round): the
-// means every reply's estimate of them starts from (SpecController::reply, a session's first reply too); and the
-// engine's credit (ms) for probing a drafter whose state follows its own rounds only.  Any thread.
+// What an engine's sessions' trees gave a round, by round (the counts kept kKeep a round): a tree without a trunk its
+// tokens, a tree with one what its branches added past its trunk (a round is of one kind or the other); the means every
+// reply's estimate of them starts from (SpecController::reply, a session's first reply too); and the engine's credit
+// (ms) for probing a drafter whose state follows its own rounds only.  Any thread.
 class SharedTokens {
  public:
   static constexpr double kKeep = 0.998;
@@ -85,15 +86,21 @@ class RoundCostModel {
 //).
 //
 // A drafter's tree (FLYX_DRAFT_TREE) is its chain of `trunk` drafts and
-// branches: its expected tokens are the chain's (the drafter's acceptance by
-// position, which its rounds teach as much as the chain's: the trunk is the
-// chain) plus what the branches add, learned per tree size from the tokens its
-// rounds gave beyond their trunk's: (kBonusPrior + sum) / (1 + n), the prior
-// counting as one round, the sum and count kept kBonusKeep a tree round (the
-// gain is a few tenths of a token and noisy: some 30 rounds).  Before it is
-// seen a tree's branches
-// are taken to add kBonusPrior (what DFlash2's first two branches add on
-// Qwen3.8-27B, 0.3 to 0.46),
+// branches.  Where its trunk stops (k of its drafts accepted, at the chain's
+// acceptance by position, which its rounds teach as much as the chain's: the
+// trunk is the chain) its branches add (B + sum_k) / (1 + n_k), the tokens its
+// rounds of that k gave beyond their trunk's, so its tokens are the sum over k
+// of P(the trunk accepts k) (1 + k + that): branches matter most where the trunk
+// fails early, which one mean beside the chain's tokens leaves out (EAGLE-4's
+// trees of 15 on chat prompts: where its chain's first drafts failed, the
+// anchor's four children still gave a token most of the time, and one mean had
+// chains of 3 chosen there over trees that paid more).  B, the tree's prior:
+// (prior + sum) / (1 + n) over all its rounds, the prior what the engine's
+// sessions' rounds of it added (SharedTokens, kBonusPrior counting as
+// kGuessRounds rounds: a reply starts from what the replies before it learned;
+// kBonusPrior is what DFlash2's first two branches add on Qwen3.8-27B, 0.3 to
+// 0.46, EAGLE-4's add about a token).  The sums and counts are kept kBonusKeep
+// a tree round (the gain is a few tenths of a token and noisy: some 30 rounds),
 // and a tree its drafter has not drafted for kTreeProbe of its rounds drafts
 // the next one (the one idle longest), so what its branches add stays known
 // at a few percent of a round's cost where it loses.  So a tree wins its rounds
@@ -214,6 +221,8 @@ class SpecController {
   using PerPosition = std::array<double, kPositions>;
   static constexpr int kAnyDrafter = -2;
   static constexpr int kAnyWidth = INT_MAX;  // preview(): no limit on a round's drafts
+  // The acceptance of drafter's draft i (its drafts before it accepted): the estimate's or the moving average.
+  double accept_at(int drafter, int i, bool drafter_estimate) const;
   // The round with the most expected tokens per ms among drafter's (kAnyDrafter: every drafter's whose state does
   // not restart; with_plain: and plain decoding's), of max_width drafts at most, a tree only when allow_trees.
   int best_round(int drafter, bool with_plain, bool drafter_estimate, int context, int max_width = kAnyWidth,
@@ -247,6 +256,8 @@ class SpecController {
   const RoundCostModel* costs_ = nullptr;
   const std::vector<int>* trunks_ = nullptr;
   std::vector<double> bonus_sum_, bonus_n_;  // per round (trees): tokens beyond the trunk, counted
+  // per round (trees), by the trunk's accepted drafts k: the tokens beyond them, counted (kBonusKeep a round of that k)
+  std::vector<std::array<double, kPositions + 1>> bonus_at_sum_, bonus_at_n_;
   std::vector<double> tok_guess_;              // per round (trees without a trunk): the guess of its tokens a round
   SharedTokens* shared_ = nullptr;             // the engine's sessions' rounds of them, and the probe credit
   std::unique_ptr<SharedTokens> own_;          // ... when the caller gives none

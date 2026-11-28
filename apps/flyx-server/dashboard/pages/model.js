@@ -121,7 +121,7 @@ function FitTag({ size }) {
   return html`<span class=${"tag2 " + (fits ? "ok" : "bad")} title=${t(title)}>${t(fits ? "fits" : "too big")}</span>`;
 }
 
-const kDrafterLabels = { mtp: "MTP", dflash2: "DFlash2", dflash: "DFlash", dspark: "DSpark", dspine: "DSpine", dv: "DV" };
+const kDrafterLabels = { mtp: "MTP", dflash2: "DFlash2", dflash: "DFlash", dspark: "DSpark", dspine: "DSpine", eagle4: "EAGLE-4", dv: "DV" };
 const drafterLabel = (k) => kDrafterLabels[k] || k;
 
 // What is served and its state, its facts, a fetch's or a load's progress, an error.  With nothing
@@ -225,7 +225,7 @@ function Serving({ tm, again, retry, browse, winPaths = null }) {
 const standalone = (m) => m.kind !== "drafter" && m.kind !== "mmproj" && m.kind !== "lora";
 // The drafter kinds one drafter file can be (--drafter's words for them).  A drafter's kind is the server's word for
 // it (its file's own fields, GET /v1/hub/drafter), never its name's; unknown, the loader reads it.
-const kFileDrafterKinds = ["mtp", "dflash2", "dflash", "dspark", "dspine"];
+const kFileDrafterKinds = ["mtp", "dflash2", "dflash", "dspark", "dspine", "eagle4"];
 const pickedDrafter = (path, kind) => ({
   spec: true, draftSource: "custom", savedDraft: null, drafter: path, drafterKind: kFileDrafterKinds.includes(kind) ? kind : "", draftPicked: true,
 });

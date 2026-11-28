@@ -63,12 +63,16 @@ class Model {
   // Drafter d's rounds are always a tree of its drafts: its round programs say so themselves (FLYX_DRAFT_TREE), and
   // no chain of its drafts is a trunk the tree grows from (DV's).
   virtual bool drafts_trees(int) const { return false; }
+  // Drafter d's trees beside its chains are of FLYX_MAX_ROWS - 1 drafts only (EAGLE-4's: its chain of 7 and the
+  // branches beside it), none narrower.
+  virtual bool widest_trees(int) const { return false; }
   // The file holds a drafter whose rounds are trees (DV's always, DSpark's by default), whether or not it was asked
   // for: the engine's default K/V method then reads every position with it or without, so that naming it changes no
   // token (AGENTS.md gate 4).
   virtual bool file_drafts_trees() const { return false; }
   // Draft trees (FLYX_DRAFT_TREE rounds beside the chains, the chooser taking them where they pay) unless the caller
-  // says otherwise: DSpark's, whose trees verify more tokens a round than its chains on the targets it is made for.
+  // says otherwise: a chosen drafter's whose trees verify more tokens a round than its chains on the targets it is
+  // made for (DSpark's, EAGLE-4's).
   virtual bool draft_trees_by_default() const { return false; }
   // Drafter d keeps a state that follows its own rounds only (DV's canvas): a round of another kind, a prefill, a
   // rewind or a restore leaves it behind, and its next round drafts from a state that starts over (DV's first tree,

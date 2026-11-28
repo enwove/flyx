@@ -51,11 +51,11 @@ struct EngineOptions {
   std::string backend;       // empty = auto
   std::string backend_dir;   // empty = next to the executable
   bool speculative = true;
-  // interfaces::kDrafterModes ("mtp" | "dflash2" | "dflash" | "dspark" | "dspine" | "dv" | "all" | "none") | empty =
-  // the drafter files' drafters and the model file's MTP layer, else its block drafter (models/model.h:
-  // choose_drafters); its DV drafter only when named ("dv", "all").  With several, the drafter is chosen every round;
-  // DV is never beside another drafter, its rounds chosen against plain decoding's and lookup's every round
-  // (docs/design/dv.md).
+  // interfaces::kDrafterModes ("mtp" | "dflash2" | "dflash" | "dspark" | "dspine" | "eagle4" | "dv" | "all" |
+  // "none") | empty = the drafter files' drafters and the model file's MTP layer, else its block drafter
+  // (models/model.h: choose_drafters); its DV drafter only when named ("dv", "all").  With several, the drafter is
+  // chosen every round; DV is never beside another drafter, its rounds chosen against plain decoding's and lookup's
+  // every round (docs/design/dv.md).
   std::string drafter;
   // Files with drafters' weights beside the model file: a GGUF holding only the MTP
   // layer (unsloth ships Qwen3.8-27B's so: MTP/mtp-*.gguf), a block drafter's file (python/convert --draft

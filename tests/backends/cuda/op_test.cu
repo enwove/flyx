@@ -186,6 +186,7 @@ int main(int argc, char** argv) {
   test_draft_pick(20000, 512, true);
   test_draft_pick(200, 256, false);
   test_draft_pick(3000, 5120, false, false);  // K 5120 (the 27B's): the one-row tables past 48 KB of shared memory
+  test_draft_pick_rough(20000, 512);  // EAGLE-4's candidate head
   test_draft_pick_blocks();
   test_quantize_q8_0();
   test_grouped_conv();

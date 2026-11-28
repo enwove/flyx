@@ -645,6 +645,11 @@ void gemm_sign_rough_add(const float* x, int ldx, const SignHead& h, const float
 // candidate vector + bias + softcap, and pick top-k with prob/margin.
 void draft_select_cands(float* rough, int ld, int V, int rows, const Launch& L, int want = kDraftCands,
                         int cap = kDraftCandCap);
+// draft_pick from rough scores already in `rough` (rows x ld, ld >= max(V, kDraftPickFloats)): the `want` best of
+// each row's V (and their ties, up to kDraftCandCap; want <= kDraftCands) scored exactly with the bf16 rows of W
+// [V, K] against x, then their top k (draft_pick_topk).  EAGLE-4's candidate head, its rough scores low-rank.
+void draft_pick_rough(const float* x, int ldx, const bf16* W, int V, int K, int rows, int want, int k, int* idx,
+                      float* val, float* rough, const Launch& L, float* prob = nullptr, float* margin = nullptr);
 void draft_score_bf16(const float* x, int ldx, const bf16* W, const float* bias, int K, int rows, float* rough, int ld,
                       bool accumulate, float softcap, cudaStream_t st, int cap = kDraftCandCap);
 void draft_combine_cands(const float* add, int ld_add, const float* bias, float softcap, int rows, float* rough, int ld,
@@ -947,6 +952,36 @@ __host__ __device__ inline int tree_row(const TreeRows* t, int r, int d) { retur
 __host__ __device__ inline int tree_slot(const TreeRows* t, int r, int base, int j) {
   return tree_on(t) && j >= base ? base + t->path[r][j - base] : j;
 }
+
+// EAGLE-4's draft tree as it grows (kernels/eagle4.cu): node u (0 the round's anchor) its token, parent, depth, path
+// score and K/V slot (-1: a leaf no step continued from; else its K/V and normed output at P->position - 1 + slot);
+// every candidate a step scored is a node, the frontier (front[0 .. fn - 1], one depth, slots f0 ..) the best `beam`
+// of them; the frontier's tokens and the two trees its step runs with (prep for attn_prep, att for attention, by
+// slot); the node on the oracle's path, and the end of the trunk: the drafter's chain (each node's best child), kept in
+// the frontier so that the tree's first drafts are its chain's.
+// kEagleTrunk: the chain a tree's first drafts are (Model::block_drafts of a sequential drafter, 7)
+constexpr int kEagleSlots = FLYX_MAX_WIDE_ROWS, kEagleNodes = 512, kEagleBeamMax = 8, kEagleTrunk = 7;
+struct EagleTree {
+  int n, f0, fn, oracle_node, trunk_node;
+  int tok[kEagleNodes], parent[kEagleNodes], depth[kEagleNodes], slot[kEagleNodes];
+  float score[kEagleNodes];
+  bool on_trunk[kEagleNodes];  // the root and the chain's drafts after it (trunk_node the last)
+  int front[kEagleBeamMax], tokbuf[kEagleBeamMax];
+  TreeRows prep, att;
+};
+// The root's children (its kc best candidates: cand, val, prob as draft_pick_topk gives them; kc at least beam and
+// min(kMtpCands, vocab)), the anchor its root: its `beam` best and the chain's draft (mtp_choose's, by G and the
+// reply's counts); then the frontier's rows: hbuf [fn][H] its parents' normed outputs (gnode [slot][H]).
+void eagle_tree_start(EagleTree* t, const DevParams* P, const DevGen* G, const int* reply_count, const int* oracle,
+                      const int* anchor, const int* cand, const float* val, const float* prob, int kc, int beam,
+                      int vocab, const float* gnode, float* hbuf, int H, cudaStream_t st);
+// A step's children of the frontier (its rows' kc best candidates each, as the root's), the best `beam` and the
+// trunk's the next frontier.
+void eagle_tree_grow(EagleTree* t, const DevParams* P, const DevGen* G, const int* reply_count, const int* oracle,
+                     const int* cand, const float* val, const float* prob, int kc, int beam, int vocab,
+                     const float* gnode, float* hbuf, int H, cudaStream_t st);
+// The round's `width` drafts and their tree (TreeRows) from the nodes, the chain's first `trunk` first.
+void eagle_tree_finish(const EagleTree* t, int width, int trunk, int* drafts, TreeRows* tree, cudaStream_t st);
 
 // The keys [ks, ke) that split `split` of `splits` gives a row attending to `total` keys: as many splits as its
 // keys fill, kAttnMinSplitKeys or more each, starting on 32-key boundaries.  It depends on the row's own position
@@ -1468,6 +1503,9 @@ void mtp_gather(const DevParams* P, int pos_sel, bool skip_if_noop, const float*
 // hring[(base + r) % kHring] = hn[r] for the last kHring of `rows` rows.
 void hring_put(const DevParams* P, int pos_sel, bool skip_if_noop, const float* hn, int ldh, int rows, float* hring,
                int H, cudaStream_t st);
+// out = the hidden row 0 of mtp_gather reads: h0, else hring's at base - 1 (EAGLE-4's residual of a draft step).
+void pair_hidden(const DevParams* P, int pos_sel, const float* h0, const float* hring, int H, float* out,
+                 cudaStream_t st);
 // Test hook: mtok[step + 1] = oracle[P->position + 1 + step] when P->oracle_len > 0.
 void mtp_oracle(const DevParams* P, const int* oracle, int step, int* mtok, cudaStream_t st);
 // Draft step `step`'s token, mtok[step + 1], from the head's k best (k <= min(ops::kMtpCands, vocab); cand, val: best

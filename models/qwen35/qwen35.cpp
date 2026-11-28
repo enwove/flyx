@@ -14,6 +14,7 @@
 //             so in its flags (backend_abi.h); no tensor is rewritten.
 #include "models/qwen35/qwen35.h"
 
+#include <algorithm>
 #include <climits>
 #include <cmath>
 #include <stdexcept>
@@ -525,6 +526,11 @@ bool Qwen35::build(const ModelFile& file, const ModelOptions& o, std::string* er
   std::vector<Drafter> drafters;
   if (!choose_drafters(o, drafters_reg_.sources(), &drafters, err)) return false;
   drafters_reg_.validate_selected(file, drafters, target);
+  // Gated delta nets: a tree's rows run their tree recurrence, so only a drafter whose trees pay there too drafts them
+  // by default (EAGLE-4's, where it is chosen), and under --kv-method auto only where the target's switch leaves the
+  // whole context exact (Engine::load): the file locks no exact reads.
+  draft_trees_by_default_ = std::any_of(drafters.begin(), drafters.end(),
+                                        [](Drafter d) { return drafts_trees_by_default(d, true); });
   if (!tables_.set_activations(o.activations, declared_activations(file), o.fp4_inputs, err)) return false;
   Tables& T = tables_;
   const auto nf = name_fn();

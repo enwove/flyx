@@ -729,4 +729,55 @@ void test_draft_pick(int V, int K, bool plant, bool pick) {
   }
 }
 
+// draft_pick_rough (EAGLE-4's candidate head): rough scores a caller wrote (here the exact logits and noise, as a
+// low-rank head's are), their `want` best scored exactly against the bf16 head, their top k in order with the
+// truncated softmax's p_max over those candidates; against float64 of the same picks.
+void test_draft_pick_rough(int V, int K) {
+  std::printf("draft_pick_rough (%d x %d)\n", V, K);
+  seed("draft_pick_rough", V, K);
+  const int rows = 4, want = 128, k = 4, ld = std::max(V, kDraftPickFloats);
+  Vec w = randv(size_t(V) * K, 0.05), x = randv(size_t(rows) * K), noise = randv(size_t(rows) * V, 0.3);
+  for (double& v : w) v = from_bf16(to_bf16(v));
+  Vec exact(size_t(rows) * V), rough(size_t(rows) * ld, 0.0);
+  for (int r = 0; r < rows; ++r)
+    for (int n = 0; n < V; ++n) {
+      double a = 0;
+      for (int q = 0; q < K; ++q) a += x[size_t(r) * K + q] * w[size_t(n) * K + q];
+      exact[size_t(r) * V + n] = a;
+      rough[size_t(r) * ld + n] = double(float(a + noise[size_t(r) * V + n]));
+    }
+  bf16* dw = up_bf16(w);
+  float *dx = up(x), *drough = up(rough), *dv = dev<float>(size_t(rows) * k), *dp = dev<float>(size_t(rows));
+  int* di = dev<int>(size_t(rows) * k);
+  draft_pick_rough(dx, K, dw, V, K, rows, want, k, di, dv, drough, TL, dp);
+  std::vector<int> gi(size_t(rows) * k);
+  CK(cudaDeviceSynchronize());
+  CK(cudaMemcpy(gi.data(), di, gi.size() * 4, cudaMemcpyDeviceToHost));
+  bool order = true;
+  Vec wantv(size_t(rows) * k), wantp(static_cast<size_t>(rows));
+  for (int r = 0; r < rows; ++r) {
+    std::vector<std::pair<double, int>> by_rough(V);  // the `want` best rough scores (the lower id on ties)
+    for (int n = 0; n < V; ++n) by_rough[size_t(n)] = {-rough[size_t(r) * ld + n], n};
+    std::partial_sort(by_rough.begin(), by_rough.begin() + want, by_rough.end());
+    std::vector<std::pair<double, int>> cand(want);
+    for (int j = 0; j < want; ++j) cand[size_t(j)] = {-exact[size_t(r) * V + by_rough[size_t(j)].second],
+                                                      by_rough[size_t(j)].second};
+    std::sort(cand.begin(), cand.end());
+    double z = 0;
+    for (const auto& [na, n] : cand) z += std::exp(-na - (-cand[0].first));
+    wantp[size_t(r)] = 1.0 / z;
+    for (int j = 0; j < k; ++j) {
+      order = order && gi[size_t(r) * k + j] == cand[size_t(j)].second;
+      wantv[size_t(r) * k + j] = -cand[size_t(j)].first;
+    }
+  }
+  std::printf("  %-4s %-48s\n", order ? "ok" : "FAIL", "the exact top 4 of the 128 best rough, in order");
+  g_fail += !order;
+  expect("their exact logits", down(dv, size_t(rows) * k), wantv, 1e-5);
+  expect("truncated softmax p_max over the candidates", down(dp, size_t(rows)), wantp, 1e-5);
+  for (float* p : {dx, drough, dv, dp}) CK(cudaFree(p));
+  CK(cudaFree(di));
+  CK(cudaFree(dw));
+}
+
 }  // namespace flyx::optest

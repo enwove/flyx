@@ -39,7 +39,7 @@ void DrafterRegistry::scan(const ModelFile& file, const TargetSpec& target, cons
     sources_.block = block_drafter_kind(hdr["draft"]);
     if (sources_.block == Drafter::kNone)
       throw std::runtime_error("the file's drafter (\"draft\": kind '" + hdr["draft"].value("kind", "") +
-                               "') is no block drafter this build runs");
+                               "') is no drafter of the target's taps this build runs");
   }
 
   for (int i = 0; i < file.companions(); ++i) {
@@ -60,7 +60,9 @@ void DrafterRegistry::scan(const ModelFile& file, const TargetSpec& target, cons
       sources_.dspark_gguf = true;
       dspark_companion_ = i;
     } else if (is_block_companion(h)) {
-      if (sources_.block != Drafter::kNone) throw std::runtime_error(what + "the model has a block drafter already");
+      if (sources_.block != Drafter::kNone)
+        throw std::runtime_error(what + "the model has a block drafter already (DFlash2's, DFlash's, DSpine's or "
+                                        "EAGLE-4's: one drafter of its taps)");
       try {
         check_made_for(h, target);
       } catch (const std::exception& e) {
@@ -115,13 +117,23 @@ const DSpineSpec& DrafterRegistry::ensure_dspine_spec(const ModelFile& file, con
   }));
 }
 
+const Eagle4Spec& DrafterRegistry::ensure_eagle4_spec(const ModelFile& file, const TargetSpec& target) {
+  if (eagle4_spec_) return *eagle4_spec_;
+  const int i = block_companion_;
+  if (i < 0) return eagle4_spec_.emplace(parse_eagle4_json(file.header().at("draft"), target, -1));
+  return eagle4_spec_.emplace(in_companion(i, [&] {
+    return parse_eagle4_json(file.header().at("companions").at(size_t(i)).at("draft"), target, i);
+  }));
+}
+
 void DrafterRegistry::validate_selected(const ModelFile& file, const std::vector<Drafter>& selected,
                                         const TargetSpec& target) {
   int64_t stride = 0;
   for (Drafter kind : selected) {
-    if (!is_block_drafter(kind)) continue;
+    if (!is_tapped_drafter(kind)) continue;
     const int taps = kind == Drafter::kDSpark && sources_.dspark_gguf ? ensure_dspark_spec(file, target).block.n_taps
                      : kind == Drafter::kDSpine                     ? ensure_dspine_spec(file, target).block.n_taps
+                     : kind == Drafter::kEagle4                     ? ensure_eagle4_spec(file, target).block.n_taps
                                                                      : ensure_dflash2_spec(file, target).block.n_taps;
     stride += int64_t(taps) * target.hidden;
     if (stride > INT_MAX) throw std::runtime_error("combined drafter feature stride exceeds int32");
@@ -158,7 +170,7 @@ int DrafterRegistry::attach(Drafter kind, const ModelFile& file, Tables& T, cons
     *reach = {FLYX_MAX_ROWS - 1, false};
     return blk;
   }
-  if (!is_block_drafter(kind)) throw std::runtime_error("unsupported drafter kind in DrafterRegistry::attach");
+  if (!is_tapped_drafter(kind)) throw std::runtime_error("unsupported drafter kind in DrafterRegistry::attach");
   auto record = [&](BlockTaps& attached, int block, const std::vector<int>& taps, DrafterReach r) {
     attached = {block, taps};
     context_blocks_.push_back(block);
@@ -168,6 +180,10 @@ int DrafterRegistry::attach(Drafter kind, const ModelFile& file, Tables& T, cons
   if (kind == Drafter::kDSpark && sources_.dspark_gguf) {  // its own block, per-row mask embeddings: its block at most
     const DSparkSpec& spec = ensure_dspark_spec(file, target);
     return record(dspark_, build_dspark(T, file, spec, target), spec.taps, {spec.block.block - 1, false});
+  }
+  if (kind == Drafter::kEagle4) {  // a step a draft: a round's rows, as MTP's
+    const Eagle4Spec& spec = ensure_eagle4_spec(file, target);
+    return record(block_, build_eagle4(T, spec, target), spec.taps, {FLYX_MAX_ROWS - 1, false});
   }
   if (kind == Drafter::kDSpine) {  // causal, its block at most
     const DSpineSpec& spec = ensure_dspine_spec(file, target);
