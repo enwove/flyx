@@ -405,8 +405,8 @@ void attn_mixer(RefSeq* s, const flyx_attn_block& B) {
   Vec h(size_t(R) * H), qg(size_t(R) * qw), k(size_t(R) * nkv * hd), v(size_t(R) * nkv * hd);
   for (int r = 0; r < R; ++r) norm(M, B.norm, &s->x[size_t(r) * H], H, &h[size_t(r) * H]);
   lin(M, B.q, h.data(), R, H, qw, qg.data(), R);
-  lin(M, B.k, h.data(), R, H, nkv * hd, k.data(), R);
-  if (!B.v_from_k) lin(M, B.v, h.data(), R, H, nkv * hd, v.data(), R);
+  if (!B.kv_shared) lin(M, B.k, h.data(), R, H, nkv * hd, k.data(), R);
+  if (!B.kv_shared && !B.v_from_k) lin(M, B.v, h.data(), R, H, nkv * hd, v.data(), R);
   lora(M, B.lora[FLYX_LIN_Q], h.data(), R, H, qw, qg.data());  // q's and the gate's rows, the weight's layout (open)
   lora(M, B.lora[FLYX_LIN_K], h.data(), R, H, nkv * hd, k.data());
   if (B.v_from_k) {  // v is k's projection, before k's norm and rotary (Gemma 4's attention_k_eq_v)
@@ -432,7 +432,7 @@ void attn_mixer(RefSeq* s, const flyx_attn_block& B) {
   Vec& KC = s->K[size_t(B.kv)][0];
   Vec& VC = s->V[size_t(B.kv)][0];
   Vec tmp(hd);
-  for (int r = 0; r < R; ++r) {
+  for (int r = 0; r < R && !B.kv_shared; ++r) {  // another block's K/V: that one writes it
     int pos = s->start + r;
     const int32_t* p3 = s->pos_3d ? s->pos_3d + size_t(r) * 3 : nullptr;
     const int rope_pos = pos + (has_mrope(B) ? s->rope_delta : 0);
@@ -1413,6 +1413,126 @@ void eagle4_context(RefSeq* s, const flyx_eagle4_block& B, int rows) {
   for (int r = 0; r < rows; ++r) std::copy_n(&hs[size_t(r) * H], H, &s->hidden_at[size_t(base + r) * H]);
 }
 
+// ---- Gemma 4's assistant (flyx_gemma4_mtp_block) -------------------------------
+
+// One of its layers' attention on its row x, the query at position p: q only, over the target's K/V before p (a
+// sliding layer's from p - window + 1); x += post_norm(o(...)).
+void gemma4_mtp_attention(RefSeq* s, const flyx_attn_block& B, double* x, int p) {
+  const auto* M = s->m;
+  const int H = B.hidden, nh = B.n_heads, nkv = B.n_kv, hd = B.head_dim;
+  Vec h(H), qa(size_t(nh) * hd), q(hd), o(size_t(nh) * hd), y(H);
+  norm(M, B.norm, x, H, h.data());
+  lin(M, B.q, h.data(), 1, H, nh * hd, qa.data(), 1);
+  const double scale = B.scale > 0.f ? double(B.scale) : 1.0 / std::sqrt(double(hd));
+  const Vec& KC = s->K[size_t(B.kv)][0];
+  const Vec& VC = s->V[size_t(B.kv)][0];
+  const int from = B.window > 0 ? std::max(0, p + 1 - B.window) : 0;
+  for (int hh = 0; hh < nh; ++hh) {
+    prep_head(M, B, B.q_norm, &qa[size_t(hh) * hd], p, q.data(), nullptr);
+    attend_range(q.data(), KC.data(), VC.data(), from, p, nkv, hd, hh / (nh / nkv), scale, &o[size_t(hh) * hd]);
+  }
+  lin(M, B.o, o.data(), 1, nh * hd, H, y.data(), 1);
+  if (B.has_post_norm) norm(M, B.post_norm, y.data(), H, y.data());
+  for (int c = 0; c < H; ++c) x[c] += y[c];
+}
+
+// Element i of an integer tensor (its token order: int32 or int64).
+int32_t token_at(const flyx_tensor_view* t, size_t i) {
+  const auto* p = static_cast<const uint8_t*>(t->data);
+  if (t->dtype == FLYX_DT_I32) {
+    int32_t v;
+    std::memcpy(&v, p + 4 * i, 4);
+    return v;
+  }
+  if (t->dtype != FLYX_DT_I64) throw std::runtime_error("gemma4_mtp: its token order is not int32 or int64");
+  int64_t v;
+  std::memcpy(&v, p + 8 * i, 8);
+  return int32_t(v);
+}
+
+// Drafts `width` tokens from the anchor at position p, a step each (backend_abi.h): step 1 from the target's
+// final-normed hidden at p - 1, step i from the step before's h' and draft.
+void gemma4_mtp_draft(RefSeq* s, const flyx_gemma4_mtp_block& B, int width) {
+  const auto* M = s->m;
+  const auto& e = M->block(B.embed).embed;
+  const auto& head = M->block(B.head).head;
+  const int H = B.hidden, Ht = B.target_hidden, V = B.vocab, p = s->position;
+  const auto* E = M->w(e.table);
+  const double escale = e.scale > 0.f ? double(e.scale) : 1.0;
+  Vec h(s->hidden_at.begin() + size_t(p - 1) * Ht, s->hidden_at.begin() + size_t(p) * Ht);
+  Vec cat(2 * size_t(Ht)), x(H), g(H);
+  const int per = B.centroids >= 0 ? V / B.n_centroids : 0;
+  const int C = B.centroids >= 0 ? B.top_k * per : V;  // the tokens scored
+  const size_t n_clusters = B.centroids >= 0 ? size_t(B.top_k) : 0;
+  Vec cscore(B.centroids >= 0 ? size_t(B.n_centroids) : 0), score(static_cast<size_t>(C)), cval(n_clusters);
+  std::vector<int32_t> ids(static_cast<size_t>(C)), clusters(n_clusters);
+  int tok = s->anchor;
+  s->drafts.assign(width, 0);
+  for (int i = 0; i < width; ++i) {
+    for (int c = 0; c < Ht; ++c) cat[size_t(c)] = load(E, size_t(tok) * Ht + c) * escale;
+    std::copy(h.begin(), h.end(), cat.begin() + Ht);
+    lin(M, B.pre_proj, cat.data(), 1, 2 * Ht, H, x.data(), 1);
+    for (int l = 0; l < B.layers; ++l) {
+      gemma4_mtp_attention(s, M->block(B.first_layer + 2 * l).attn, x.data(), p);
+      mlp(M, M->block(B.first_layer + 2 * l + 1).mlp, x.data(), 1);
+    }
+    norm(M, head.norm, x.data(), H, g.data());
+    lin(M, B.post_proj, g.data(), 1, H, Ht, h.data(), 1);
+    // its candidates: every token, or the tokens of its top_k clusters (the higher score, the lower index on ties),
+    // each scored exactly by the head
+    if (B.centroids >= 0) {
+      linear(g.data(), 1, H, M->w(B.centroids), B.n_centroids, cscore.data());
+      topk(cscore.data(), B.n_centroids, B.top_k, clusters.data(), cval.data());
+      const auto* order = M->w(B.token_order);
+      for (int c = 0; c < B.top_k; ++c)
+        for (int j = 0; j < per; ++j)
+          ids[size_t(c) * per + j] = token_at(order, size_t(clusters[size_t(c)]) * per + j);
+    } else {
+      for (int t = 0; t < V; ++t) ids[size_t(t)] = t;
+    }
+    const auto* W = M->w(head.w);
+    for (int c = 0; c < C; ++c) {
+      double l = 0;
+      for (int k = 0; k < H; ++k) l += load(W, size_t(ids[size_t(c)]) * H + k) * g[size_t(k)];
+      score[size_t(c)] = l;
+    }
+    // the draft as ops::draft_choice takes it over the best kMtpCands (the higher score, the lower id on ties), as
+    // MTP's and as the CUDA backend's
+    const int k = std::min(flyx::ops::kMtpCands, C);
+    std::vector<int> order(static_cast<size_t>(C));
+    for (int c = 0; c < C; ++c) order[size_t(c)] = c;
+    auto key = [&](int c) { return score[size_t(c)] != score[size_t(c)] ? -INFINITY : score[size_t(c)]; };
+    std::partial_sort(order.begin(), order.begin() + k, order.end(), [&](int a, int b) {
+      return key(a) != key(b) ? key(a) > key(b) : ids[size_t(a)] < ids[size_t(b)];
+    });
+    int32_t cand[flyx::ops::kMtpCands], count[flyx::ops::kMtpCands];
+    float fval[flyx::ops::kMtpCands];
+    const bool pen = penalized(s->gen);
+    for (int c = 0; c < k; ++c) {
+      cand[c] = ids[size_t(order[size_t(c)])];
+      fval[c] = float(score[size_t(order[size_t(c)])]);
+      count[c] = pen && !s->counts.empty() ? s->counts[size_t(cand[c])] : 0;
+      for (int j = 0; pen && j < i; ++j) count[c] += s->drafts[size_t(j)] == cand[c];
+    }
+    const flyx_gen_params& gp = s->gen;
+    int d = flyx::ops::draft_choice(cand, fval, pen ? count : nullptr, k, V, gp.temperature, gp.top_p, gp.top_k,
+                                    gp.presence_penalty, gp.frequency_penalty, gp.seed, p + 1 + i);
+    if (forced_drafts(s)) d = forced_draft(s, p + 1 + i);
+    s->drafts[i] = d;
+    tok = d;
+  }
+}
+
+// After a pass over `rows` rows from position base: each row's final-normed hidden into the ring (the assistant's
+// layers read the target's own K/V, which the pass wrote).
+void gemma4_mtp_context(RefSeq* s, const flyx_gemma4_mtp_block& B, int rows) {
+  const auto* M = s->m;
+  const auto& head = M->block(B.target_head).head;
+  const int Ht = B.target_hidden;
+  for (int r = 0; r < rows; ++r)
+    norm(M, head.norm, &s->x[size_t(r) * Ht], Ht, &s->hidden_at[size_t(s->start + r) * Ht]);
+}
+
 // ---- round bookkeeping ----------------------------------------------------------
 
 void accept(RefSeq* s, int width) {
@@ -1517,11 +1637,13 @@ const char* node_label(const flyx_node& n, const flyx_block* b, int phase) {
     case FLYX_NODE_DRAFT:
       if (b->kind == FLYX_BLOCK_MTP) return "draft mtp";
       if (b->kind == FLYX_BLOCK_EAGLE4) return "draft eagle4";
+      if (b->kind == FLYX_BLOCK_GEMMA4_MTP) return "draft gemma4_mtp";
       return b->kind == FLYX_BLOCK_DSPARK ? "draft dspark" : b->kind == FLYX_BLOCK_DSPINE ? "draft dspine" : "draft dflash2";
     case FLYX_NODE_CONTEXT:
       if (b->kind == FLYX_BLOCK_DV) return "context dv";
       if (b->kind == FLYX_BLOCK_MTP) return "context mtp";
       if (b->kind == FLYX_BLOCK_EAGLE4) return "context eagle4";
+      if (b->kind == FLYX_BLOCK_GEMMA4_MTP) return "context gemma4_mtp";
       return b->kind == FLYX_BLOCK_DSPARK   ? "context dspark"
              : b->kind == FLYX_BLOCK_DSPINE ? "context dspine"
                                             : "context dflash2";
@@ -1589,6 +1711,7 @@ void run_nodes(RefPlan* p, RefSeq* s) {
       case FLYX_NODE_DRAFT:
         if (b->kind == FLYX_BLOCK_MTP) mtp_draft(s, b->mtp, n.arg0);
         else if (b->kind == FLYX_BLOCK_EAGLE4) eagle4_draft(s, b->eagle4, n.arg0);
+        else if (b->kind == FLYX_BLOCK_GEMMA4_MTP) gemma4_mtp_draft(s, b->gemma4_mtp, n.arg0);
         else if (b->kind == FLYX_BLOCK_DSPARK) dspark_draft(s, b->dspark, n.arg0);
         else if (b->kind == FLYX_BLOCK_DSPINE) dspine_block(s, b->dspine, n.arg0);
         else draft_block(s, b->dflash2, n.arg0);
@@ -1599,6 +1722,7 @@ void run_nodes(RefPlan* p, RefSeq* s) {
         if (rows == 0) break;
         if (b->kind == FLYX_BLOCK_MTP) mtp_context(s, b->mtp, rows);
         else if (b->kind == FLYX_BLOCK_EAGLE4) eagle4_context(s, b->eagle4, rows);
+        else if (b->kind == FLYX_BLOCK_GEMMA4_MTP) gemma4_mtp_context(s, b->gemma4_mtp, rows);
         else if (b->kind == FLYX_BLOCK_DSPARK) dspark_context(s, b->dspark, rows);
         else if (b->kind == FLYX_BLOCK_DSPINE) block_context(s, b->dspine, rows, slayer);
         else block_context(s, b->dflash2, rows, dlayer);
@@ -1793,8 +1917,17 @@ int open_model(const flyx_model_desc* desc, const flyx_open_options* opts, flyx_
       const flyx_block& b = desc->blocks[i];
       const int k = b.kind;
       // DV's blocks (ABI 42) are taken and never run: such a model decodes here as without DV (lower).
-      if (k < FLYX_BLOCK_EMBED || k > FLYX_BLOCK_EAGLE4)
+      if (k < FLYX_BLOCK_EMBED || k > FLYX_BLOCK_GEMMA4_MTP)
         throw std::runtime_error("block kind " + std::to_string(k) + ": not implemented by cpu_ref");
+      if (k == FLYX_BLOCK_ATTN && b.attn.kv_shared && (b.attn.k >= 0 || b.attn.v >= 0 || b.attn.v_from_k))
+        throw std::runtime_error("an attention block reading another's K/V with a k or v projection of its own");
+      if (k == FLYX_BLOCK_GEMMA4_MTP) {
+        const auto& g = b.gemma4_mtp;
+        if (g.target_hidden != desc->hidden || g.layers < 1 ||
+            (g.centroids >= 0 && (g.n_centroids < 1 || g.vocab % g.n_centroids || g.top_k < 1 ||
+                                  g.top_k > g.n_centroids || g.token_order < 0)))
+          throw std::runtime_error("gemma4_mtp: its target's width, at least one layer, whole clusters");
+      }
       if (k == FLYX_BLOCK_VISION_STEM && b.vision_stem.cls_token >= 0)
         throw std::runtime_error("vision_stem: cls_token is not yet implemented by cpu_ref");
       // its fc_norm per tap, its taps and its own width the target's (as the CUDA backend's bind checks)
@@ -1983,7 +2116,8 @@ int lower(flyx_bmodel* bm, const flyx_program* prog, flyx_plan** out) {
       most = b.kind == FLYX_BLOCK_DFLASH2  ? std::max(b.dflash2.block, FLYX_MAX_ROWS) - 1
              : b.kind == FLYX_BLOCK_DSPARK ? b.dspark.block - 1
              : b.kind == FLYX_BLOCK_DSPINE ? b.dspine.block - 1  // the rows it was made for: no wider block
-             : b.kind == FLYX_BLOCK_MTP || b.kind == FLYX_BLOCK_EAGLE4 ? FLYX_MAX_ROWS - 1
+             : b.kind == FLYX_BLOCK_MTP || b.kind == FLYX_BLOCK_EAGLE4 || b.kind == FLYX_BLOCK_GEMMA4_MTP
+                 ? FLYX_MAX_ROWS - 1
                                            : 0;
     }
   }

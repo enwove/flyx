@@ -431,18 +431,21 @@ int Tables::attn_block(const std::string& prefix, const AttnBlockSpec& s, const 
   a.rot_dim = s.rot_dim;
   a.gate = s.gate;
   a.theta = s.theta;
+  const bool shared = s.kv_from >= 0;
+  if (shared && (s.v_from_k || s.v_norm || s.bias))
+    throw std::logic_error("an attention block reading another's K/V with a k or v of its own");
   a.norm = norm(n(prefix + "in_norm"), H, s.norm_offset, s.eps);
   a.q = weight(n(prefix + "attn.q"), {q_rows, H});
-  a.k = weight(n(prefix + "attn.k"), {kv, H});
-  a.v = s.v_from_k ? -1 : weight(n(prefix + "attn.v"), {kv, H});
+  a.k = shared ? -1 : weight(n(prefix + "attn.k"), {kv, H});
+  a.v = shared || s.v_from_k ? -1 : weight(n(prefix + "attn.v"), {kv, H});
   a.o = weight(n(prefix + "attn.o"), {H, q});
+  a.q_norm = a.k_norm = flyx_norm{-1, 0, 0.0, 0.0};  // none: the heads go to the rotary as projected (backend_abi.h)
   if (s.qk_norm) {
     a.q_norm = norm(n(prefix + "attn.q_norm"), s.head_dim, s.norm_offset, s.eps);
-    a.k_norm = norm(n(prefix + "attn.k_norm"), s.head_dim, s.norm_offset, s.eps);
-  } else {
-    a.q_norm = a.k_norm = flyx_norm{-1, 0, 0.0, 0.0};  // the heads go to the rotary as projected (backend_abi.h)
+    if (!shared) a.k_norm = norm(n(prefix + "attn.k_norm"), s.head_dim, s.norm_offset, s.eps);
   }
-  a.kv = state(st);
+  a.kv = shared ? s.kv_from : state(st);
+  a.kv_shared = shared ? 1 : 0;
   for (int i = 0; i < 3; ++i) a.mrope_section[i] = s.mrope_section[i];
   a.mrope_interleaved = s.mrope_interleaved ? 1 : 0;
   a.q_b = s.bias ? weight(n(prefix + "attn.q.bias"), {q}) : -1;

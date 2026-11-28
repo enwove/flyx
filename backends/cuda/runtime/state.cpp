@@ -80,6 +80,11 @@ RowNeeds row_needs(const flyx_bmodel* m) {
       n.mtp = true;
       if (t->fc.q8_inputs()) n.q8 = true;
       ks({2 * m->hidden});
+    } else if (const auto* g = std::get_if<Gemma4MtpBlock>(&blk)) {
+      n.mtp = true;  // MTP's row buffers: its step's input (mcat, 2 target_hidden), its residual (mx), the ring's (mhn)
+      for (const Lin* l : {&g->pre_proj, &g->post_proj})
+        if (l->q8_inputs()) n.q8 = true;
+      ks({2 * g->target_hidden, g->hidden});
     } else if (const auto* e = std::get_if<Eagle4Block>(&blk)) {
       // MTP's row buffers (mcat, mx, mhn), its taps; its context's q|k|v of a prefill pass go to act (mcat and mhn
       // are in proj's slot there: eagle4_context)
@@ -131,8 +136,10 @@ int max_drafts(const Block& drafter) {
     return d->dspine ? d->block - 1 : std::max(d->block, FLYX_MAX_ROWS) - 1;
   if (const auto* ds = std::get_if<DSparkBlock>(&drafter)) return ds->block - 1;
   if (const auto* v = std::get_if<DvBlock>(&drafter)) return v->tree_width;
-  return std::holds_alternative<MtpBlock>(drafter) || std::holds_alternative<Eagle4Block>(drafter) ? FLYX_MAX_ROWS - 1
-                                                                                                  : 0;
+  return std::holds_alternative<MtpBlock>(drafter) || std::holds_alternative<Eagle4Block>(drafter) ||
+                 std::holds_alternative<Gemma4MtpBlock>(drafter)
+             ? FLYX_MAX_ROWS - 1
+             : 0;
 }
 
 // Row buffers for R rows; `prefill`: the prefill set (attention partials for
@@ -1441,7 +1448,8 @@ void build_seq(flyx_bmodel* m, int32_t max_ctx, flyx_seq* s) {
   s->drafts = s->alloc<int>(size_t(m->wide_rows));
   if (m->wide_rows > FLYX_MAX_ROWS) s->P_shift = s->alloc<DevParams>(1);
   const int head_rows = std::max({FLYX_MAX_ROWS, d ? d->block : 1, ds ? ds->block : 1});
-  const int logit_cols = std::max(V, (d || ds || m->mtp_block >= 0 || m->eagle4_block >= 0) ? kDraftPickFloats : 0);
+  const int logit_cols = std::max(
+      V, (d || ds || m->mtp_block >= 0 || m->eagle4_block >= 0 || m->gemma4_mtp_block >= 0) ? kDraftPickFloats : 0);
   const int chunks = (V + 4095) / 4096;
   s->argv = s->alloc<float>(size_t(head_rows) * chunks);
   s->argi = s->alloc<int>(size_t(head_rows) * chunks);
@@ -1543,7 +1551,7 @@ void build_seq(flyx_bmodel* m, int32_t max_ctx, flyx_seq* s) {
     s->eval = s->alloc<float>(cands);
     s->eprob = s->alloc<float>(size_t(kEagleBeamMax));
   }
-  if (m->mtp_block >= 0 || m->eagle4_block >= 0) {
+  if (m->mtp_block >= 0 || m->eagle4_block >= 0 || m->gemma4_mtp_block >= 0) {
     s->mg = s->alloc<float>(H);
     s->mtok = s->alloc<int>(FLYX_MAX_ROWS + 1);
     s->mcand = s->alloc<int>(ops::kMtpCands);

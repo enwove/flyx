@@ -424,6 +424,29 @@ void gemma4(const std::string& dir, const std::string& backend) {
                              " of 24 places (8-bit inputs)");
     }
   }
+  // Its assistant beside it (models/gemma4/assistant.h): the first round drafts what transformers' assistant drafts
+  // on the same K/V (its drafts of a clear margin), and its rounds give plain decoding's tokens, greedy and seeded.
+  const std::string assistant = dir + "/tiny_gemma4_assistant";
+  auto mtp = engine(path, backend, {.speculative = true, .drafter = "mtp", .drafter_files = {assistant}});
+  auto mtp_exact = engine(path, backend, {.speculative = true, .drafter = "mtp", .drafter_files = {assistant},
+                                          .options = "draft_weights=exact", .activations = "exact"});
+  size_t compared = 0;
+  for (const auto& item : golden.at("cases")) {
+    const auto p = item.at("prompt").get<std::vector<int32_t>>();
+    const auto drafts = item.at("drafts").get<std::vector<int32_t>>();
+    const auto want = tokens_of(*plain, p, 24);
+    std::vector<int32_t> got;
+    check(tokens_of(*mtp, p, 24) == want, "tiny gemma4: its assistant's rounds give plain decoding's tokens");
+    check(tokens_of(*mtp, p, 24, true) == tokens_of(*plain, p, 24, true),
+          "tiny gemma4: its assistant's rounds preserve seeded sampling");
+    const auto trace = traced(*mtp_exact, p, 24, &got);  // its inputs as transformers' float64 model reads them
+    const flyx_round_result* first = trace.size() > 1 ? &trace[1] : nullptr;
+    const size_t n = first ? std::min(size_t(first->n_drafts), drafts.size()) : 0;
+    check(first && first->n_drafts > 0 && std::equal(drafts.begin(), drafts.begin() + std::ptrdiff_t(n), first->drafts),
+          "tiny gemma4: its assistant's first drafts are transformers'");
+    compared += n;
+  }
+  check(compared >= 10, "tiny gemma4: " + std::to_string(compared) + " of its assistant's drafts compared");
 }
 
 // The MTP layer in a file of its own (EngineOptions::drafter_files; unsloth ships the 27B's so): the quantized tiny

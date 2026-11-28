@@ -79,6 +79,11 @@ void mtp_draft(flyx_seq* s, const MtpBlock& b, int width, const Launch& L, bool 
 void mtp_context(const Pass& ps, const MtpBlock& b, bool fused = false);  // MTP K/V for the rows of a pass
 // EAGLE-4: draft steps [start, width), MTP's timing; its context: the pass's rows' h kept, (h, next token) K/V written
 void eagle4_draft(flyx_seq* s, const Eagle4Block& b, int width, const Launch& L, bool fused = false, int start = 0);
+// Gemma 4's assistant (flyx_gemma4_mtp_block): drafts start .. width - 1, a step each at the anchor's position; its
+// context: the pass's rows' final-normed hidden into the ring.
+void gemma4_mtp_draft(flyx_seq* s, const Gemma4MtpBlock& b, int width, const Launch& L, bool fused = false,
+                      int start = 0);
+void gemma4_mtp_context(const Pass& ps, const Gemma4MtpBlock& b);
 void eagle4_context(const Pass& ps, const Eagle4Block& b, bool fused = false);
 // EAGLE-4's tree of `width` drafts (FLYX_DRAFT_TREE; kernels/eagle4.cu): `steps` steps of `beam` rows each after the
 // root's (eagle4_tree_steps), the tree in s->tree.

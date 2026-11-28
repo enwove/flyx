@@ -333,8 +333,13 @@ AttnBlock attention(WeightLoader& L, const flyx_attn_block& b, const StateMap& s
   int rows = 0;
   expect(!a.v_from_k || (b.v < 0 && b.v_b < 0 && b.lora[FLYX_LIN_V].rank <= 0 && b.lora[FLYX_LIN_K].rank <= 0),
          "v from k's projection beside a v weight, bias or adapter (or an adapter on k)");
-  a.w_in = a.v_from_k ? L.lin_stack_quant({b.q, b.k}, dq, &rows, {q_rows})
-                      : L.lin_stack_quant({b.q, b.k, b.v}, dq, &rows, {q_rows});
+  a.kv_shared = b.kv_shared != 0;
+  expect(!a.kv_shared || (b.k < 0 && b.v < 0 && b.k_norm.w < 0 && !b.v_norm && !a.v_from_k && b.q_b < 0 &&
+                          !a.gate && b.sinks < 0 && block_rank(b.lora, 4) == 0),
+         "an attention block reading another's K/V with a k or v (or biases, a gate, sinks, adapters) of its own");
+  a.w_in = a.kv_shared ? L.lin_stack_quant({b.q}, dq, &rows, {q_rows})
+           : a.v_from_k ? L.lin_stack_quant({b.q, b.k}, dq, &rows, {q_rows})
+                        : L.lin_stack_quant({b.q, b.k, b.v}, dq, &rows, {q_rows});
   expect(rows == a.n_in(), "attention q|k|v rows do not match its dimensions");
   a.w_out = L.lin_quant(b.o, dq);
   a.q_norm = head_norm(L, b.q_norm);
@@ -1199,6 +1204,13 @@ std::vector<const Lin*> drafter_lins(const flyx_bmodel* m, int block) {
     }
   } else if (const auto* e = std::get_if<Eagle4Block>(&m->blocks[size_t(block)])) {
     out = {&e->fc, &e->attn.w_in, &e->attn.w_out, &e->mlp.w_gu, &e->mlp.w_down};
+  } else if (const auto* g = std::get_if<Gemma4MtpBlock>(&m->blocks[size_t(block)])) {
+    out = {&g->pre_proj, &g->post_proj};
+    for (int j = 0; j < g->layers; ++j) {
+      const auto& a = std::get<AttnBlock>(m->blocks[size_t(g->first_layer + 2 * j)]);
+      const auto& f = std::get<MlpBlock>(m->blocks[size_t(g->first_layer + 2 * j + 1)]);
+      for (const Lin* x : {&a.w_in, &a.w_out, &f.w_gu, &f.w_down}) out.push_back(x);
+    }
   } else if (const auto* d = std::get_if<DSparkBlock>(&m->blocks[size_t(block)])) {
     for (int j = 0; j < d->layers(); ++j) {
       const auto& l = std::get<DSparkLayer>(m->blocks[size_t(d->first_layer + j)]);
@@ -1258,6 +1270,15 @@ void bind(flyx_bmodel* m, const flyx_model_desc& d, LoadTimes* times) {
       is_dspark[size_t(i)] = 1;
     } else if (b.kind == FLYX_BLOCK_EAGLE4) {
       is_dflash[size_t(i)] = 1;  // bound beside the block drafters, after the target
+    } else if (b.kind == FLYX_BLOCK_GEMMA4_MTP) {  // its layers beside MTP's; its head with the target's (Pass 1)
+      is_mtp[size_t(i)] = 1;
+      const auto& g = b.gemma4_mtp;
+      expect(g.layers >= 1 && g.first_layer >= 0 && g.first_layer + 2 * g.layers <= d.n_blocks,
+             "Gemma 4's assistant names layers past the blocks");
+      for (int j = 0; j < g.layers; ++j) {
+        is_mtp[size_t(ref(i, g.first_layer + 2 * j, FLYX_BLOCK_ATTN, "attention"))] = 1;
+        is_mtp[size_t(ref(i, g.first_layer + 2 * j + 1, FLYX_BLOCK_MLP, "MLP"))] = 1;
+      }
     }
   }
   std::vector<char> is_draft(size_t(d.n_blocks), 0);
@@ -1423,6 +1444,35 @@ void bind(flyx_bmodel* m, const flyx_model_desc& d, LoadTimes* times) {
         put_block(m, i, eagle4(L, d, b.eagle4, sm, q.eagle4));
         break;
       }
+      case FLYX_BLOCK_GEMMA4_MTP: {
+        const auto& g = b.gemma4_mtp;
+        Gemma4MtpBlock t;
+        t.hidden = g.hidden;
+        t.target_hidden = g.target_hidden;
+        t.vocab = g.vocab;
+        t.embed = ref(i, g.embed, FLYX_BLOCK_EMBED, "embedding");
+        t.head = ref(i, g.head, FLYX_BLOCK_HEAD, "head");
+        t.target_head = ref(i, g.target_head, FLYX_BLOCK_HEAD, "head");
+        t.first_layer = g.first_layer;
+        t.layers = g.layers;
+        expect(g.centroids < 0, "Gemma 4's assistant with a clustered head (not in this backend yet)");
+        expect(g.target_hidden == d.hidden && d.blocks[t.head].head.hidden == g.hidden &&
+                   d.blocks[t.head].head.vocab == g.vocab,
+               "Gemma 4's assistant: its widths are not its head's and its target's");
+        for (int j = 0; j < g.layers; ++j) {
+          const flyx_attn_block& a = d.blocks[g.first_layer + 2 * j].attn;
+          expect(a.kv_shared && a.hidden == g.hidden && d.blocks[g.first_layer + 2 * j + 1].mlp.hidden == g.hidden,
+                 "Gemma 4's assistant: a layer of another width, or one with K/V of its own");
+        }
+        t.pre_proj = L.lin_quant(g.pre_proj, q.mtp);
+        t.post_proj = L.lin_quant(g.post_proj, q.mtp);
+        expect(g.ring >= 0 && g.ring < d.n_states && sm.ring[size_t(g.ring)], "Gemma 4's assistant names no ring");
+        expect(m->mtp_block < 0 && m->eagle4_block < 0 && m->gemma4_mtp_block < 0,
+               "Gemma 4's assistant beside another drafter of its kind (MTP's, EAGLE-4's)");
+        m->gemma4_mtp_block = i;
+        put_block(m, i, std::move(t));
+        break;
+      }
       default: throw std::runtime_error("unexpected draft block kind " + std::to_string(b.kind));
     }
   }
@@ -1435,12 +1485,15 @@ void bind(flyx_bmodel* m, const flyx_model_desc& d, LoadTimes* times) {
   const std::string dflash_held = held_precision(drafter_lins(m, m->dflash_block));
   const std::string dspark_held = held_precision(drafter_lins(m, m->dspark_block));
   const std::string eagle4_held = held_precision(drafter_lins(m, m->eagle4_block));
-  if (m->eagle4_block >= 0) m->active_draft_weights = eagle4_held;
+  const std::string gemma4_held = held_precision(drafter_lins(m, m->gemma4_mtp_block));
+  if (m->gemma4_mtp_block >= 0) m->active_draft_weights = gemma4_held;
+  else if (m->eagle4_block >= 0) m->active_draft_weights = eagle4_held;
   else if (m->dflash_block >= 0) m->active_draft_weights = dflash_held;
   else if (m->dspark_block >= 0) m->active_draft_weights = dspark_held;
   else if (m->mtp_block >= 0) m->active_draft_weights = mtp_held;
   else if (m->dv_block >= 0) m->active_draft_weights = "exact";
-  if (m->verbose && (m->mtp_block >= 0 || m->dflash_block >= 0 || m->dspark_block >= 0 || m->eagle4_block >= 0)) {
+  if (m->verbose && (m->mtp_block >= 0 || m->dflash_block >= 0 || m->dspark_block >= 0 || m->eagle4_block >= 0 ||
+                     m->gemma4_mtp_block >= 0)) {
     std::string what;
     auto say = [&](const char* name, const std::string& held) {
       what += (what.empty() ? "" : ", ") + std::string(name) + "=" + held;
@@ -1449,6 +1502,7 @@ void bind(flyx_bmodel* m, const flyx_model_desc& d, LoadTimes* times) {
     if (m->dflash_block >= 0) say(block<DFlashBlock>(m, m->dflash_block).name(), dflash_held);
     if (m->dspark_block >= 0) say("dspark", dspark_held);
     if (m->eagle4_block >= 0) say("eagle4", eagle4_held);
+    if (m->gemma4_mtp_block >= 0) say("gemma4 assistant", gemma4_held);
     std::fprintf(stderr, "flyx-cuda: drafter weights %s (%.2f GB on GPU)\n", what.c_str(),
                  double(m->bytes - pre_draft_bytes) / 1e9);
   }

@@ -12,7 +12,13 @@
                          decoded back into it), greedy: each case's tokens and the smallest margin between the best
                          two logits along them; the cases kept have one of at least MIN_MARGIN and the same tokens
                          with every linear's weights and input rounded to bf16 (an engine's rounding then moves no
-                         token)
+                         token); and each case's first drafts from its assistant (below), transformers' own
+    tiny_gemma4_assistant/
+                         its assistant (Gemma4AssistantForCausalLM: config.json, model.safetensors in bf16, as Google
+                         ships them): a sliding and a global layer of 32 reading the tiny model's K/V (its last
+                         sliding layer's and its last global one's), MLPs of 48, its own head; "drafts" in
+                         golden_gemma4.json are what it drafts after each prompt, up to the first whose best two
+                         logits are less than MIN_DRAFT_MARGIN apart
 
 Its vocabulary: the 256 bytes as GPT-2 writes them, a few special tokens, reserved ones up to 512 (the model, not
 Gemma's tokenizer, is what these files test).
@@ -35,6 +41,7 @@ NKV_SWA, HD_SWA, NKV_FULL, HD_FULL, ROTARY = 2, 32, 1, 64, 0.25
 THETA, THETA_SWA, EPS, SOFTCAP = 1000000.0, 10000.0, 1e-6, 30.0
 SPECIALS = ["<pad>", "<eos>", "<bos>", "<unk>", "<turn|>"]
 MIN_MARGIN, NEW_TOKENS, CASES = 0.15, 12, 8
+A_H, A_INTER, A_LAYERS, DRAFTS, MIN_DRAFT_MARGIN = 32, 48, [True, False], 7, 0.25  # the assistant
 QK_LO, QK_HI = 0.6, 0.8  # q and k norm weights (see put below)
 
 
@@ -72,8 +79,9 @@ def write(out: Path, quant: bool = True, stem: str = "gemma4"):
     """quant False: every tensor float32 (no input rounding anywhere).  Skipped where the files are there, made from
     the same inputs (their stamp)."""
     stamp = out / f"tiny_{stem}.stamp"
+    assistant_dir = out / f"tiny_{stem}_assistant"
     if stamp.exists() and stamp.read_text() == inputs_digest() and (out / f"tiny_{stem}.gguf").exists() and \
-            (out / f"golden_{stem}.json").exists():
+            (out / f"golden_{stem}.json").exists() and (not quant or (assistant_dir / "model.safetensors").exists()):
         return
     import torch
     from transformers import Gemma4ForCausalLM, Gemma4TextConfig
@@ -229,6 +237,8 @@ def write(out: Path, quant: bool = True, stem: str = "gemma4"):
             if margin >= MIN_MARGIN and greedy(coarse, prompt)[0] == tokens:
                 cases.append({"prompt": prompt, "tokens": tokens, "min_margin": margin})
     assert len(cases) == CASES, f"only {len(cases)} cases with a clear margin"
+    if quant:
+        write_assistant(assistant_dir, model, cases, rng)
     (out / f"golden_{stem}.json").write_text(json.dumps({"eos": eos, "cases": cases}), encoding="utf-8")
     stamp.write_text(inputs_digest())
 
@@ -237,3 +247,88 @@ if __name__ == "__main__":
     import sys
     write(Path(sys.argv[1]))
     write(Path(sys.argv[1]), quant=False, stem="gemma4_f32")
+
+
+def write_assistant(out: Path, target, cases, rng):
+    """The tiny model's assistant into out, and each case's drafts from it (case["drafts"]): its steps at the position
+    after the prompt, each reading the target's K/V before it (a sliding layer's from WINDOW - 1 back), as flyx's
+    drafts read them (backend_abi.h flyx_gemma4_mtp_block)."""
+    import torch
+    from safetensors.torch import save_file
+    from transformers import Gemma4AssistantConfig, Gemma4AssistantForCausalLM, Gemma4TextConfig
+
+    tcfg = Gemma4TextConfig(
+        vocab_size=VOCAB, hidden_size=A_H, intermediate_size=A_INTER, num_hidden_layers=len(A_LAYERS),
+        num_attention_heads=NH, num_key_value_heads=NKV_SWA, head_dim=HD_SWA, global_head_dim=HD_FULL,
+        num_global_key_value_heads=NKV_FULL, sliding_window=WINDOW,
+        layer_types=["sliding_attention" if s else "full_attention" for s in A_LAYERS],
+        rope_parameters={"sliding_attention": {"rope_type": "default", "rope_theta": THETA_SWA},
+                         "full_attention": {"rope_type": "proportional", "partial_rotary_factor": ROTARY,
+                                            "rope_theta": THETA}},
+        final_logit_softcapping=None, rms_norm_eps=EPS, hidden_size_per_layer_input=0, vocab_size_per_layer_input=0,
+        attention_k_eq_v=True,
+        num_kv_shared_layers=len(A_LAYERS), enable_moe_block=False, tie_word_embeddings=True,
+        max_position_embeddings=131072, pad_token_id=0, eos_token_id=1, bos_token_id=2)
+    cfg = Gemma4AssistantConfig(text_config=tcfg, backbone_hidden_size=H, use_ordered_embeddings=False)
+    cfg.architectures = ["Gemma4AssistantForCausalLM"]
+    cfg._attn_implementation = "eager"
+    cfg.text_config._attn_implementation = "eager"
+    model = Gemma4AssistantForCausalLM(cfg).eval()
+
+    def rnd(shape, std):
+        return torch.from_numpy(rng.normal(0.0, std, size=shape).astype(np.float32))
+
+    sd = {}
+    shapes = {k: tuple(v.shape) for k, v in model.state_dict().items() if k != "lm_head.weight"}
+    for k, shape in shapes.items():
+        if k.endswith("layer_scalar"):
+            v = torch.from_numpy(rng.uniform(0.5, 1.5, size=shape).astype(np.float32))
+        elif k.endswith("q_norm.weight"):
+            v = torch.from_numpy(rng.uniform(QK_LO, QK_HI, size=shape).astype(np.float32))
+        elif k.endswith("post_attention_layernorm.weight") or k.endswith("post_feedforward_layernorm.weight"):
+            v = 2 + rnd(shape, 0.2)
+        elif k == "model.norm.weight":
+            v = 3 + rnd(shape, 0.3)
+        elif k.endswith("norm.weight"):
+            v = 1 + rnd(shape, 0.1)
+        elif k == "model.embed_tokens.weight":
+            v = rnd(shape, 0.25)
+        else:  # a linear [out, in]
+            v = rnd(shape, 1 / np.sqrt(shape[1]))
+        sd[k] = v.to(torch.bfloat16)  # as the checkpoints hold them
+    out.mkdir(parents=True, exist_ok=True)
+    save_file(sd, str(out / "model.safetensors"), metadata={"format": "pt"})
+    cfg.to_json_file(str(out / "config.json"), use_diff=False)  # every field, as the checkpoints list them
+    full = {k: v.double() for k, v in sd.items()}
+    full["lm_head.weight"] = full["model.embed_tokens.weight"]
+    model.load_state_dict(full)
+    model = model.double()
+
+    with torch.no_grad():
+        for case in cases:
+            prompt = case["prompt"]
+            ids = torch.tensor([prompt])
+            base = target.model(input_ids=ids, return_shared_kv_states=True, use_cache=False)
+            kv = base.shared_kv_states
+            h = base.last_hidden_state[:, -1:]  # the target's final-normed hidden at the prompt's last position
+            tok = int(torch.argmax(target(input_ids=ids, use_cache=False).logits[0, -1]))  # the anchor
+            p = len(prompt)
+            keys = torch.arange(p)
+            full_mask = torch.zeros(1, 1, 1, p, dtype=torch.float64)
+            swa_mask = torch.where(keys >= p - WINDOW + 1, 0.0, float("-inf")).to(torch.float64).view(1, 1, 1, p)
+            drafts = []
+            for _ in range(DRAFTS):
+                e = target.model.embed_tokens(torch.tensor([[tok]]))
+                x = model.pre_projection(torch.cat([e, h], dim=-1))
+                o = model.model(inputs_embeds=x, position_ids=torch.tensor([[p]]), shared_kv_states=kv,
+                                attention_mask={"full_attention": full_mask, "sliding_attention": swa_mask},
+                                use_cache=False)
+                g = o.last_hidden_state
+                logits = model.lm_head(g)[0, -1]
+                top = torch.topk(logits, 2).values
+                if float(top[0] - top[1]) < MIN_DRAFT_MARGIN:
+                    break
+                tok = int(torch.argmax(logits))
+                drafts.append(tok)
+                h = model.post_projection(g)
+            case["drafts"] = drafts

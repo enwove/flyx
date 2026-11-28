@@ -422,9 +422,14 @@ bool make_sign_head_for(flyx_bmodel* m, const bf16* w, const BlockMat* wb, int N
 // left here are the head copies drafts pick candidates from, for every drafter that reads the target's head (MTP,
 // DFlash2, DSpark).
 void make_draft_weights(flyx_bmodel* m) {
-  if (m->opt.draft_weights == interfaces::DraftWeightsMode::kExact ||
-      (m->mtp_block < 0 && m->dflash_block < 0 && m->dspark_block < 0))
-    return;
+  if (m->opt.draft_weights == interfaces::DraftWeightsMode::kExact) return;
+  // Gemma 4's assistant picks its drafts from a head of its own: its 1-bit copy (a table of bf16 rows)
+  if (m->gemma4_mtp_block >= 0) {
+    auto& h = block<HeadBlock>(m, block<Gemma4MtpBlock>(m, m->gemma4_mtp_block).head);
+    if (!m->opt.full_draft_head && h.w && h.hidden % 128 == 0 && h.vocab >= kDraftPickFloats && h.hidden <= 4096)
+      make_sign_head_for(m, h.w, nullptr, h.vocab, h.hidden, &h.coarse, "assistant head");
+  }
+  if (m->mtp_block < 0 && m->dflash_block < 0 && m->dspark_block < 0) return;
 
   auto& h = block<HeadBlock>(m, m->head_block);
   const bool want_sign =

@@ -113,10 +113,11 @@ struct AttnBlock {
   // Gemma 4 (ABI 58): v is k's projection (w_in q|k only), v_eps > 0: each head's v RMS-normed without a weight at
   // that eps before it is cached; post_norm (w null: none): o's output normed before the residual add.
   bool v_from_k = false;
+  bool kv_shared = false;      // its K/V another block's, which writes it: w_in is q's alone (ABI 58)
   float v_eps = 0.f;
   Norm post_norm;
   int q_width() const { return (gate ? 2 : 1) * nh * hd; }
-  int n_in() const { return q_width() + (v_from_k ? 1 : 2) * nkv * hd; }
+  int n_in() const { return q_width() + (kv_shared ? 0 : v_from_k ? 1 : 2) * nkv * hd; }
   int v_off() const { return q_width() + (v_from_k ? 0 : nkv * hd); }  // v's rows in w_in's output (k's: v_from_k)
   MRoPE mrope(const int32_t* pos_3d = nullptr) const {
     return MRoPE{{mrope_section[0], mrope_section[1], mrope_section[2]}, mrope_interleaved, pos_3d};
@@ -192,6 +193,17 @@ struct Eagle4Block {
   Norm fc_norm[FLYX_EAGLE4_MAX_TAPS], in_norm, hidden_norm, norm;
   Lin fc, cand_down, cand_up;                      // [hidden, n_taps target_hidden], [rank, hidden], [rows, rank]
   const bf16* head = nullptr;                      // [rows, hidden], bf16
+};
+
+// Gemma 4's assistant (flyx_gemma4_mtp_block; regions/layers.cpp gemma4_mtp_draft): its layers (blocks first_layer
+// + 2 i: an AttnBlock reading the target's K/V, kv_shared; + 2 i + 1: an MlpBlock) a step a draft at the anchor's
+// position, from [embed(t) | h] through pre_proj; its own head (a HeadBlock of its width), whose norm's output
+// post_proj takes to the next step's h.  Its ring (MTP's) keeps the target's final-normed hidden.
+struct Gemma4MtpBlock {
+  int hidden = 0, target_hidden = 0, vocab = 0;
+  int embed = -1, head = -1, target_head = -1;  // blocks: the target's embedding, its own head, the target's head
+  int first_layer = -1, layers = 0;
+  Lin pre_proj, post_proj;                      // [hidden, 2 target_hidden], [target_hidden, hidden]
 };
 
 // DFlash2: a block of `block` rows (the anchor, then mask tokens) through its
@@ -474,7 +486,7 @@ struct DSparkBlock {
 
 using Block = std::variant<EmbedBlock, AttnBlock, GdnBlock, MlpBlock, HeadBlock, MtpBlock, DFlashBlock, DFlashLayer,
                            DvBlock, DvLayer, VisionStemBlock, VitAttnBlock, VitMlpBlock, VisionMergeBlock,
-                           RelAttnBlock, MoeBlock, DSparkBlock, DSparkLayer, Eagle4Block>;
+                           RelAttnBlock, MoeBlock, DSparkBlock, DSparkLayer, Eagle4Block, Gemma4MtpBlock>;
 
 // ---- a sequence's state, as the table declares it -------------------------------------------
 struct KvBuf {

@@ -517,6 +517,69 @@ void eagle4_draft_tree(flyx_seq* s, const Eagle4Block& b, int width, const Launc
   eagle_tree_finish(s->etree, width, kEagleTrunk, s->drafts, s->tree, st);
 }
 
+// Gemma 4's assistant: draft step i from [embed(t) * scale | h] at the anchor's position P->position, its layers'
+// queries there reading the target's K/V before it (a sliding layer's from P->position - window + 1: the attention
+// at P->position - 1 over window - 1 keys), none written; h the ring's at P->position - 1 for the first step, the step
+// before's post_proj output (s->mg) after it.  The draft as MTP's: its head's best kMtpCands, then mtp_choose.
+void gemma4_mtp_draft(flyx_seq* s, const Gemma4MtpBlock& b, int width, const Launch& L, bool fused, int start) {
+  const auto* m = s->m;
+  const auto& E = block<EmbedBlock>(m, b.embed);
+  const auto& head = block<HeadBlock>(m, b.head);
+  const RowBufs& own = s->own;
+  const int H = b.hidden, Ht = b.target_hidden;
+  cudaStream_t st = L.st;
+  if (start == 0) build_rows(s->P, nullptr, 0, s->mtok, 1, st);  // mtok[0] = anchor
+  for (int i = start; i < width; ++i) {
+    if (E.blk.data) embed_blocks(s->mtok + i, E.blk, Ht, own.mcat, 1, st);
+    else embed(s->mtok + i, E.table, Ht, own.mcat, 1, st);
+    if (E.scale != 1.f) scale_rows(own.mcat, 2 * Ht, Ht, E.scale, 1, st);
+    pair_hidden(s->P, kPosPosition, i == 0 ? nullptr : s->mg, s->ring, Ht, own.mcat + Ht, st);
+    gemm(own.mcat, 2 * Ht, b.pre_proj, H, 2 * Ht, own.mx, H, 1, false, L);
+    for (int j = 0; j < b.layers; ++j) {
+      const auto& a = block<AttnBlock>(m, b.first_layer + 2 * j);
+      const auto& f = block<MlpBlock>(m, b.first_layer + 2 * j + 1);
+      const KvBuf& kb = s->kv[size_t(a.kv)];
+      const int nh = a.nh, hd = a.hd;
+      norm_project(own.mx, own.h, own.proj, s->ld_proj, 1, a.norm, a.w_in, a.n_in(), H, L, fused);
+      attn_prep(own.proj, s->ld_proj, 0, a.q_width(), a.q_width(), a.q_norm.w, nullptr, a.q_norm.offset,
+                a.q_norm.eps, a.theta, a.rot, nh, 0, hd, 1, s->P, kPosPosition, false, own.qbuf, KvRef{}, st, 0,
+                nullptr, 0, CanvasKeys{}, MRoPE{}, a.rope);
+      s->stage_before(kb, -1, 1, st);
+      attention(own.qbuf, kb.staged(), nh, a.nkv, hd, 1, true, 0, a.scale, s->P, nullptr, 0, own.act, nh * hd,
+                own.part, kRoundSplits, L, -1, a.window > 0 ? a.window - 1 : 0);
+      gemm(own.act, nh * hd, a.w_out, H, nh * hd, own.h, H, 1, false, L);
+      norm_add(own.mx, H, own.h, H, a.post_norm.w, a.post_norm.offset, a.post_norm.eps, nullptr, 1, H, st);
+      mlp_body(own.mx, f, 1, own.h, own.proj, s->ld_proj, own.act, s->ld_act, L, fused);
+    }
+    rmsnorm(own.mx, H, head.norm.w, head.norm.offset, head.norm.eps, own.h, H, 1, H, st);
+    gemm(own.h, H, b.post_proj, Ht, H, s->mg, Ht, 1, false, L);  // the next step's h
+    const int K = std::min(ops::kMtpCands, head.vocab);
+    draft_head_pick(head, own.h, 1, K, s->mcand, s->mval, s, L, s->draft_prob + i, s->draft_margin + i);
+    mtp_choose(s->P, s->G, s->reply.count, s->mcand, s->mval, K, head.vocab, i, s->mtok, st);
+    mtp_oracle(s->P, s->oracle, i, s->mtok, st);
+  }
+  copy_ints(s->mtok + 1 + start, s->drafts + start, width - start, st);
+}
+
+// After a pass: each row's final-normed hidden (the target's head's norm) into the ring.
+void gemma4_mtp_context(const Pass& ps, const Gemma4MtpBlock& b) {
+  const RowView& rv = ps.v;
+  auto* s = ps.s;
+  const auto& head = block<HeadBlock>(s->m, b.target_head);
+  const int H = b.target_hidden, R = ps.rows;
+  const int sel = ps.round ? kPosStart : kPosPosition;
+  cudaStream_t st = rv.L.st;
+  if (residual16(ps)) rmsnorm(x16_of(rv), H, head.norm.w, head.norm.offset, head.norm.eps, rv.b.mhn, H, R, H, st);
+  else rmsnorm(rv.b.x, H, head.norm.w, head.norm.offset, head.norm.eps, rv.b.mhn, H, R, H, st);
+  if (!ps.round && s->pass_snap > 0 && s->ring_snap) {  // as mtp_context: h[pass_snap - 1] before hring_put
+    const int snap_row = s->pass_snap - s->position;
+    const float* src = snap_row == 0 ? s->ring + size_t((s->pass_snap - 1) % kHring) * size_t(H)
+                                     : rv.b.mhn + size_t(snap_row - 1) * size_t(H);
+    CK(cudaMemcpyAsync(s->ring_snap, src, size_t(H) * sizeof(float), cudaMemcpyDeviceToDevice, st));
+  }
+  hring_put(s->P, sel, ps.round, rv.b.mhn, H, R, s->ring, H, st);
+}
+
 // After a pass: each row's h = fc([fc_norm_i(tap_i)]) into the ring, and the K/V of the positions base-1 ..
 // base+rows-2 from (h at j, token at j+1), as mtp_context.  In a round the entries past the accepted rows hold
 // rejected rows; they are rewritten (by the next draft steps or context pass) before anything attends to them.

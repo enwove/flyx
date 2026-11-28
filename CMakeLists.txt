@@ -209,7 +209,7 @@ add_library(flyx_models OBJECT models/model.cpp models/dv.cpp
             models/drafters/eagle4.cpp
             models/drafters/registry.cpp models/llama/llama.cpp models/qwen35/qwen35.cpp models/inkling2/inkling2.cpp
             models/gpt_oss/gpt_oss.cpp
-            models/gemma4/gemma4.cpp
+            models/gemma4/gemma4.cpp models/gemma4/assistant.cpp
             models/vision/preprocess.cpp
             models/formats/formats.cpp models/formats/pytext.cpp models/formats/calls.cpp
             models/formats/tags.cpp models/formats/grammar.cpp models/formats/qwen35.cpp models/formats/inkling2.cpp

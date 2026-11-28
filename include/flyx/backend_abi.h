@@ -321,7 +321,8 @@ typedef enum {
   FLYX_BLOCK_DSPARK_LAYER = 18, /* ABI 45: one layer of DSpark */
   FLYX_BLOCK_DSPINE = 19,       /* ABI 51: DSpine, a block drafter whose rows pass a code bridge's message on */
   FLYX_BLOCK_DSPINE_LAYER = 20, /* ABI 51: a DSpine layer: a Qwen3 layer, then its bridge's read and write */
-  FLYX_BLOCK_EAGLE4 = 21        /* ABI 55: EAGLE-4, a one-layer drafter run a step a draft from target taps */
+  FLYX_BLOCK_EAGLE4 = 21,       /* ABI 55: EAGLE-4, a one-layer drafter run a step a draft from target taps */
+  FLYX_BLOCK_GEMMA4_MTP = 22    /* ABI 58: Gemma 4's assistant, layers that read the target's K/V, a step a draft */
 } flyx_block_kind;
 
 /* Token rows -> residual rows: x = table[token] * scale, optionally followed by RMSNorm (has_norm != 0, ABI 45). */
@@ -387,12 +388,16 @@ typedef struct {
   flyx_rope_scaling rope;
   /* ABI 58 (Gemma 4): scale, q.k's scale (0: 1 / sqrt(head_dim)); v_norm 1: each head's v RMS-normed without a
    * weight (k_norm's eps) before it is cached; v_from_k 1: v is k's projection (no v weight, v -1), taken before k's
-   * norm and rotary; has_post_norm 1: x += post_norm(o(...)) (Gemma's post-attention norm) instead of x += o(...).
-   * Zero, as a block built zeroed has: none of them. */
+   * norm and rotary; has_post_norm 1: x += post_norm(o(...)) (Gemma's post-attention norm) instead of x += o(...);
+   * kv_shared 1: no k or v projection (k and v -1, k_norm none): its K/V state (kv) is another block's, which writes
+   * it, this one only reading it (Gemma 4's layers that share an earlier one's cache, its assistant's layers).  Zero,
+   * as a block built zeroed has: none of them. */
   float scale;
   int32_t v_norm, v_from_k;
   int32_t has_post_norm;
   flyx_norm post_norm;
+  int32_t kv_shared;
+  int32_t pad1;
 } flyx_attn_block;
 
 /* Gated delta net, as ops/ops.h: from h = norm(x), mixed = qkv(h) through
@@ -582,6 +587,29 @@ typedef struct {
   int32_t ring;                        /* state (width hidden): h per position */
   int32_t float_weights;               /* beside a float target: AUTO lets the backend choose, or request Q8 / NVFP4 */
 } flyx_eagle4_block;
+
+/* Gemma 4's assistant (multi-token prediction, ABI 58; transformers' Gemma4AssistantForCausalLM): `layers` Gemma 4
+ * layers of its own width (FLYX_BLOCK_ATTN, kv_shared: q only, reading the K/V of the target's last layer of its kind,
+ * sliding or global; FLYX_BLOCK_MLP), run a step a draft from (h, the token t), at the anchor's position p every
+ * step: each step reads the target's K/V before p (a sliding layer's from p - window + 1), and writes none.
+ *   x = pre_proj [embed(t) | h]         (embed: the target's table and scale; h target_hidden wide)
+ *   the layers; g = head.norm(x); h' = post_proj g: the next step's h
+ *   the draft: the best of head.w[t] . g over every token (centroids -1), or over the tokens of the top_k clusters
+ *   by centroids g (token_order: each cluster's vocab / n_centroids tokens in turn)
+ * Step 1 takes the target's final-normed hidden at p - 1 (its ring) and the anchor; step i the step before's h' and
+ * draft.  Its context keeps the target's final-normed hidden a position.  Only drafting reads it. */
+typedef struct {
+  int32_t hidden, target_hidden, vocab;
+  int32_t embed;                       /* block: the target's embedding (its table and scale) */
+  int32_t pre_proj, post_proj;         /* [hidden, 2 target_hidden], [target_hidden, hidden] */
+  int32_t first_layer, layers;         /* blocks first_layer + 2 i (attention) and + 2 i + 1 (MLP) for i < layers */
+  int32_t head;                        /* block: FLYX_BLOCK_HEAD, hidden wide, its own norm and table */
+  int32_t target_head;                 /* block: the target's head, whose norm its ring's rows take */
+  int32_t centroids, token_order;      /* [n_centroids, hidden], an integer [vocab]; -1: every token scored */
+  int32_t n_centroids, top_k;
+  int32_t ring;                        /* state (width target_hidden): the target's final-normed hidden a position */
+  int32_t float_weights;               /* beside a float target: AUTO lets the backend choose, or Q8 / NVFP4 */
+} flyx_gemma4_mtp_block;
 
 /* The tree DV drafts (flyx_dv_block.tree; ops/draft/ref.h). */
 typedef enum {
@@ -848,6 +876,7 @@ typedef struct {
     flyx_dspine_block dspine;             /* ABI 51 */
     flyx_dspine_layer_block dspine_layer; /* ABI 51 */
     flyx_eagle4_block eagle4;             /* ABI 55 */
+    flyx_gemma4_mtp_block gemma4_mtp;     /* ABI 58 */
   };
 } flyx_block;
 

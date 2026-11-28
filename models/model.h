@@ -90,6 +90,9 @@ struct AttnBlockSpec {
   // without a weight; o's output normed before the residual add ("attn.post_norm").
   float scale = 0.f;
   bool v_from_k = false, v_norm = false, post_norm = false;
+  // >= 0: the K/V state the block reads, another block's, which writes it: no k or v projection, no k norm (Gemma 4's
+  // assistant's layers, its E models' later layers)
+  int kv_from = -1;
 };
 
 // A LoRA adapter given beside the model (--lora; core/modelfile/peft_dir.cpp): one rank and scale on the linears its

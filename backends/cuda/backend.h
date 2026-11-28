@@ -510,6 +510,7 @@ struct flyx_bmodel {
   int mtp_block = -1, dflash_block = -1;  // the drafters (at most one of each), -1: none
   int dv_block = -1, dspark_block = -1;   // DV and DSpark drafters, -1: none
   int eagle4_block = -1;                  // the EAGLE-4 drafter (it drafts a step a draft, as MTP), -1: none
+  int gemma4_mtp_block = -1;              // Gemma 4's assistant (a step a draft, as MTP), -1: none
   int head_block = -1;                    // the head they read
   std::unordered_map<int, float*> vec_weights;  // 1D device vectors referenced by FLYX_NODE_RES_MIX (weight index -> GPU)
   flyx::cuda::RowNeeds need;

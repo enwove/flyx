@@ -5,7 +5,8 @@
 // wider heads, fewer K/V heads, k's projection for v (attention_k_eq_v) and proportional rotary (theta 1M, a quarter
 // of the head turned at the whole head's frequencies).  q and k RMS-normed per head with weights, v without, q.k
 // unscaled; GELU (tanh) MLPs; the embedding times sqrt(hidden), tied to the head, whose logits are softcapped.
-// One drafter: prompt lookup (the engine's).
+// Its drafters: its assistant beside it (models/gemma4/assistant.h, --drafter mtp), and prompt lookup (the
+// engine's).
 #pragma once
 
 #include <memory>

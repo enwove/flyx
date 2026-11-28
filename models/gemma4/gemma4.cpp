@@ -16,6 +16,8 @@
 #include <stdexcept>
 #include <vector>
 
+#include "models/drafters/registry.h"
+#include "models/gemma4/assistant.h"
 #include "models/gguf.h"
 
 namespace flyx::models::gemma4 {
@@ -206,16 +208,37 @@ class Gemma4 final : public Model {
 
   int embed_ = -1, head_ = -1;
   std::vector<int> layers_;  // per layer: attention block, MLP block
+  drafters::DrafterRegistry drafters_reg_;
 };
 
 bool Gemma4::build(const ModelFile& file, const ModelOptions& o, std::string* err) {
   const Config c = read_config(file);
-  if (file.header().contains("companions") && !file.header().at("companions").empty())
-    return *err = "a Gemma 4 model takes no file beside it yet (no drafter or projector of its own)", false;
   trained_ctx_ = c.trained_ctx;
   kv_fp8_by_default_ = false;  // binary16 K/V until a real model's measures say FP8 costs nothing
+  drafters::TargetSpec target{};
+  target.arch = file.arch();
+  target.hidden = c.hidden;
+  target.vocab = c.vocab;
+  target.layers = int(c.layers.size());
+  target.gguf = c.gguf;
+  // Its assistant is its MTP drafter: a block of its own, built (below) once the layers whose K/V it reads are.
+  AssistantTarget at;
+  drafters::MtpHooks hooks{};
+  hooks.claims = [&c](const nlohmann::json& h) { return is_assistant(h, c.hidden, c.vocab); };
+  hooks.build = [this, &file, &at](int companion) { return build_assistant(tables_, file, companion, at); };
+  std::vector<int> unclaimed;
+  drafters_reg_.scan(file, target, &hooks, /*has_dv=*/false, &unclaimed);
+  if (!unclaimed.empty())
+    return *err = "companion file " + std::to_string(unclaimed.front() + 1) +
+                  ": holds no drafter a Gemma 4 model takes (its assistant, or none)",
+           false;
   std::vector<Drafter> drafters;
-  if (!choose_drafters(o, DrafterSources{}, &drafters, err)) return false;
+  if (!choose_drafters(o, drafters_reg_.sources(), &drafters, err)) return false;
+  for (Drafter d : drafters)
+    if (d != Drafter::kMtp)
+      return *err = std::string("a Gemma 4 model drafts with its assistant (mtp) or prompt lookup, not ") +
+                    models::drafter_name(d),
+             false;
   if (!tables_.set_activations(o.activations, declared_activations(file), o.fp4_inputs, err)) return false;
 
   Tables& T = tables_;
@@ -245,6 +268,22 @@ bool Gemma4::build(const ModelFile& file, const ModelOptions& o, std::string* er
     f.has_out_scale = 1;
     f.out_scale = T.weight(n(p + "layer_scalar"), {1});
     layers_.push_back(mlp);
+    const flyx_attn_block& ab = T.blocks[size_t(layers_[layers_.size() - 2])].attn;
+    (l.sliding ? at.kv_sliding : at.kv_full) = ab.kv;  // its last layer of each kind's, by the end
+    (l.sliding ? at.n_kv_sliding : at.n_kv_full) = l.n_kv;
+    (l.sliding ? at.hd_sliding : at.hd_full) = l.head_dim;
+  }
+  at.hidden = H;
+  at.vocab = c.vocab;
+  at.embed = embed_;
+  at.head = head_;
+  at.window = c.window;
+  target.embed = embed_;
+  target.head = head_;
+  for (Drafter kind : drafters) {
+    DrafterReach reach;
+    const int blk = drafters_reg_.attach(kind, file, T, target, &hooks, &reach);
+    add_drafter(kind, blk, reach);
   }
   finish(H, c.vocab);
   return true;
@@ -258,22 +297,23 @@ std::vector<flyx_node> Gemma4::prefill_program() const {
   std::vector<flyx_node> p;
   p.push_back({FLYX_NODE_RUN, embed_, 0, 0});
   add_layers(&p);
+  drafters_reg_.emit_contexts(&p);
   p.push_back({FLYX_NODE_RUN, head_, 1, 0});
   return p;
 }
 
-// Plain decoding (width 0) or a round of given drafts (prompt lookup).
-std::vector<flyx_node> Gemma4::round_program(int width, int /*d*/, bool given) const {
+// Plain decoding (width 0), a round of given drafts (prompt lookup) or of its assistant's.
+std::vector<flyx_node> Gemma4::round_program(int width, int d, bool given) const {
   std::vector<flyx_node> p;
-  if (width > 0) {
-    if (!given) throw std::logic_error("Gemma 4 holds no drafter of its own yet");
-    p.push_back({FLYX_NODE_GIVEN, -1, width, 0});
-  }
+  if (width > 0)
+    p.push_back(given ? flyx_node{FLYX_NODE_GIVEN, -1, width, 0}
+                      : flyx_node{FLYX_NODE_DRAFT, drafters_.at(size_t(d)).block, width, 0});
   p.push_back({FLYX_NODE_RUN, embed_, 0, 0});
   add_layers(&p);
   p.push_back({FLYX_NODE_RUN, head_, 0, 0});
   p.push_back({FLYX_NODE_ACCEPT, -1, width, 0});
   p.push_back({FLYX_NODE_COMMIT, -1, 0, 0});
+  drafters_reg_.emit_contexts(&p);
   return p;
 }
 
