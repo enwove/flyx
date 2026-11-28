@@ -720,7 +720,7 @@ struct flyx_seq {
   float* mval = nullptr;
   float* ez = nullptr;                 // EAGLE-4: cand_down g, its candidate head's low-rank code (kEagleBeamMax rows)
   // EAGLE-4's draft trees: the tree, every frontier node's normed output by K/V slot [kEagleSlots][hidden], a step's
-  // rows' hidden inputs [kEagleBeamMax][hidden], and their candidates (kEagleBeamMax each) and best's probability
+  // rows' hidden inputs [kEagleBeamMax][hidden], and their candidates (eagle4_tree_cands each) and best's probability
   flyx::cuda::EagleTree* etree = nullptr;
   float *egnode = nullptr, *ehbuf = nullptr, *eval = nullptr, *eprob = nullptr;
   int* ecand = nullptr;

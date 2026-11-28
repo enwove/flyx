@@ -2,13 +2,16 @@
 // EAGLE-4's draft trees (docs/design/tree-verification.md, "EAGLE-4's trees"): a beam of the best `beam` nodes a step,
 // each node's children its head's best `beam` candidates, scored by the sum of their log-probabilities over the
 // candidates scored exactly (the path's); every candidate a node, the round verifies the best `width` of them, a parent
-// before its children, the path from the root through each node's best child first (the tree's trunk: the chain
-// the controller learns acceptance by position from).  Drafts only: the round's verification keeps the output plain
-// decoding's.
+// before its children, the trunk first: from the root each trunk node's child the chain would draft there (mtp_choose:
+// the same candidates, counts and noise), so a tree's first drafts are the chain the controller learns acceptance by
+// position from, sampling too.  Drafts only: the round's verification keeps the output plain decoding's.
+#include <algorithm>
 #include <cmath>
+#include <stdexcept>
 #include "backends/cuda/kernels/common/device.cuh"
 #include "backends/cuda/kernels/common/launch.h"
 #include "backends/cuda/kernels/kernels.cuh"
+#include "ops/sampling/sampling.h"
 
 namespace flyx::cuda {
 namespace {
@@ -49,43 +52,75 @@ __device__ void frontier_rows(EagleTree* t, const float* gnode, float* hbuf, int
   }
 }
 
-// Every frontier row's `beam` candidates (cand, val: row k's at k * beam) as nodes, scored by path; the best `beam`
-// of them by score (ties: the lower index, the earlier row and candidate) the next frontier, at slots from `slot0`.
-// With an oracle, its token at the depth below the node on its path is a node (added where not a candidate) and the
-// first of the frontier.
-__device__ void grow(EagleTree* t, const DevParams* P, const int* oracle, const int* cand, const float* val,
-                     const float* prob, int rows, int beam, int slot0) {
+// A node: token `tok` below `parent`, of score `score`.
+__device__ __forceinline__ int add_node(EagleTree* t, int n, int parent, int tok, float score) {
+  t->tok[n] = tok;
+  t->parent[n] = parent;
+  t->depth[n] = t->depth[parent] + 1;
+  t->score[n] = score;
+  t->slot[n] = -1;
+  t->on_trunk[n] = false;
+  return n;
+}
+
+// The draft the chain makes after the trunk node `parent` (k_mtp_choose's): from the row's kt best candidates, each
+// counted as its verifying row counts it (the reply's count and the trunk's drafts above it), at the target's noise of
+// the draft's position.
+__device__ int trunk_choice(const EagleTree* t, const DevParams* P, const DevGen* G, const int* reply_count,
+                            const int* cand, const float* val, int kt, int vocab, int parent) {
+  int count[ops::kMtpCands];
+  const bool pen = G->presence != 0.f || G->frequency != 0.f;
+  for (int c = 0; pen && c < kt; ++c) {
+    if (cand[c] < 0 || cand[c] >= vocab) continue;
+    count[c] = reply_count[cand[c]];
+    for (int u = parent; u > 0; u = t->parent[u]) count[c] += t->tok[u] == cand[c];
+  }
+  return ops::draft_choice(cand, val, pen ? count : nullptr, kt, vocab, G->temperature, G->top_p, G->top_k,
+                           G->presence, G->frequency, G->seed, int64_t(P->position) + 1 + t->depth[parent]);
+}
+
+// Every frontier row's `beam` best candidates (cand, val: row k's kc at k * kc) as nodes, scored by path; the best
+// `beam` of them by score (ties: the lower index, the earlier row and candidate) the next frontier, at slots from
+// `slot0`.  The trunk node's row adds the chain's draft (trunk_choice, from its min(kMtpCands, vocab) best; added
+// where not one of its `beam`), the next trunk node; with an oracle, its token at the depth below the node on its
+// path is a node (added where not a candidate).  The oracle's node first of the frontier, then the trunk's.
+__device__ void grow(EagleTree* t, const DevParams* P, const DevGen* G, const int* reply_count, const int* oracle,
+                     const int* cand, const float* val, const float* prob, int rows, int kc, int beam, int vocab,
+                     int slot0) {
   if (threadIdx.x != 0) return;
-  const int n0 = t->n;
+  const int n0 = t->n, kt = min(ops::kMtpCands, vocab);
   int n = n0;
   int forced = -1, trunk = -1;
   const int on = t->oracle_node;
   const int forced_tok = on >= 0 ? oracle_at(P, oracle, P->position + t->depth[on] + 1) : -1;
   for (int k = 0; k < rows; ++k) {
     const int parent = t->front[k];
-    const float lse = row_lse(val[k * beam], prob[k]);
+    const int* rc = cand + size_t(k) * kc;
+    const float* rv = val + size_t(k) * kc;
+    const float lse = row_lse(rv[0], prob[k]);
+    // a repeated row (fewer candidates than rows) adds nothing new
+    const int trunk_tok =
+        parent == t->trunk_node && trunk < 0 ? trunk_choice(t, P, G, reply_count, rc, rv, kt, vocab, parent) : -1;
     bool has_forced = false;
     for (int j = 0; j < beam && n < kEagleNodes; ++j) {
-      const int c = cand[k * beam + j];
-      if (c < 0) continue;
-      t->tok[n] = c;
-      t->parent[n] = parent;
-      t->depth[n] = t->depth[parent] + 1;
-      t->score[n] = t->score[parent] + (val[k * beam + j] - lse);
-      t->slot[n] = -1;
-      if (parent == on && c == forced_tok) forced = n, has_forced = true;
-      if (parent == t->trunk_node && trunk < 0) trunk = n;  // the best candidate: the chain's draft
+      if (rc[j] < 0) continue;
+      add_node(t, n, parent, rc[j], t->score[parent] + (rv[j] - lse));
+      if (parent == on && rc[j] == forced_tok) forced = n, has_forced = true;
+      if (rc[j] == trunk_tok) trunk = n;
       ++n;
     }
     if (parent == on && forced_tok >= 0 && !has_forced && n < kEagleNodes) {  // not a candidate: its own node
-      t->tok[n] = forced_tok;
-      t->parent[n] = parent;
-      t->depth[n] = t->depth[parent] + 1;
-      t->score[n] = t->score[parent];
-      t->slot[n] = -1;
-      forced = n++;
+      forced = add_node(t, n++, parent, forced_tok, t->score[parent]);
+      if (forced_tok == trunk_tok) trunk = forced;
+    }
+    if (trunk_tok >= 0 && trunk < 0 && n < kEagleNodes) {  // outside the row's `beam`: its own node, scored as one
+      float lp = -INFINITY;
+      for (int j = beam; j < kc; ++j)
+        if (rc[j] == trunk_tok) lp = rv[j] - lse;
+      trunk = add_node(t, n++, parent, trunk_tok, t->score[parent] + lp);
     }
   }
+  if (trunk >= 0) t->on_trunk[trunk] = true;
   t->oracle_node = forced;
   t->trunk_node = trunk;
   int fn = 0;
@@ -107,9 +142,10 @@ __device__ void grow(EagleTree* t, const DevParams* P, const int* oracle, const 
   t->n = n;
 }
 
-__global__ void k_eagle_tree_start(EagleTree* t, const DevParams* P, const int* oracle, const int* anchor,
-                                   const int* cand, const float* val, const float* prob, int beam, const float* gnode,
-                                   float* hbuf, int H) {
+__global__ void k_eagle_tree_start(EagleTree* t, const DevParams* P, const DevGen* G, const int* reply_count,
+                                   const int* oracle, const int* anchor, const int* cand, const float* val,
+                                   const float* prob, int kc, int beam, int vocab, const float* gnode, float* hbuf,
+                                   int H) {
   pdl_trigger();
   if (threadIdx.x == 0) {
     t->n = 1;
@@ -118,6 +154,7 @@ __global__ void k_eagle_tree_start(EagleTree* t, const DevParams* P, const int* 
     t->depth[0] = 0;
     t->score[0] = 0.f;
     t->slot[0] = 0;
+    t->on_trunk[0] = true;
     t->front[0] = 0;
     t->f0 = 0;
     t->fn = 1;
@@ -125,26 +162,27 @@ __global__ void k_eagle_tree_start(EagleTree* t, const DevParams* P, const int* 
     t->trunk_node = 0;
   }
   __syncthreads();
-  grow(t, P, oracle, cand, val, prob, 1, beam, 1);
+  grow(t, P, G, reply_count, oracle, cand, val, prob, 1, kc, beam, vocab, 1);
   __syncthreads();
   frontier_rows(t, gnode, hbuf, H);
 }
 
-__global__ void k_eagle_tree_grow(EagleTree* t, const DevParams* P, const int* oracle, const int* cand,
-                                  const float* val, const float* prob, int beam, const float* gnode, float* hbuf,
-                                  int H) {
+__global__ void k_eagle_tree_grow(EagleTree* t, const DevParams* P, const DevGen* G, const int* reply_count,
+                                  const int* oracle, const int* cand, const float* val, const float* prob, int kc,
+                                  int beam, int vocab, const float* gnode, float* hbuf, int H) {
   pdl_trigger();
   __shared__ int slot0;
   if (threadIdx.x == 0) slot0 = t->f0 + t->fn;
   __syncthreads();
-  grow(t, P, oracle, cand, val, prob, t->fn, beam, slot0);
+  grow(t, P, G, reply_count, oracle, cand, val, prob, t->fn, kc, beam, vocab, slot0);
   __syncthreads();
   frontier_rows(t, gnode, hbuf, H);
 }
 
-// The round's tree of `width` drafts: the oracle's path, then the best nodes by score (ties: the lower index; a
-// parent's score is never below its child's, so the nodes taken are a tree), in rows: the trunk (from the root each
-// row's best taken child, the oracle's first) and the others in node order, so a parent's row is before its child's.
+// The round's tree of `width` drafts: the oracle's path, else the trunk's first `trunk`; then the best nodes by score
+// (ties: the lower index; a parent's score is never below its child's, so the nodes taken are a tree), in rows: the
+// trunk (from the root each row's oracle child, else its trunk child, else its first taken child) and the others in
+// node order, so a parent's row is before its child's.
 __global__ void k_eagle_tree_finish(const EagleTree* t, int width, int trunk, int* drafts, TreeRows* tree) {
   pdl_trigger();
   if (threadIdx.x != 0) return;
@@ -154,17 +192,9 @@ __global__ void k_eagle_tree_finish(const EagleTree* t, int width, int trunk, in
   int count = 0;
   for (int u = 1; u < n; ++u) count += taken[u];
   // without an oracle, the chain's first `trunk` drafts (the trunk the controller learns the chain from)
-  if (count == 0) {
-    for (int u = 0; count < min(width, trunk);) {
-      int next = -1;
-      for (int v = u + 1; v < n && next < 0; ++v)
-        if (t->parent[v] == u) next = v;  // a node's first child: its best candidate
-      if (next < 0) break;
-      taken[next] = true;
-      ++count;
-      u = next;
-    }
-  }
+  if (count == 0)
+    for (int u = 1; u < n && count < min(width, trunk); ++u)
+      if (t->on_trunk[u]) taken[u] = true, ++count;
   while (count < width) {
     int best = -1;
     for (int u = 1; u < n; ++u)
@@ -178,12 +208,12 @@ __global__ void k_eagle_tree_finish(const EagleTree* t, int width, int trunk, in
   for (int u = 0; u < n; ++u) row_of[u] = -1;
   row_of[0] = 0;
   int rows = 1;
-  for (int u = 0;;) {  // the trunk: each row's oracle child, else its first taken child (the chain's)
-    int next = -1;
-    for (int v = u + 1; v < n; ++v)
-      if (taken[v] && t->parent[v] == u &&
-          (next < 0 || (oracle[v] && !oracle[next])))
-        next = v;
+  for (int u = 0;;) {  // the trunk: each row's oracle child, else its trunk child, else its first taken child
+    int next = -1, rank = -1;
+    for (int v = u + 1; v < n; ++v) {
+      const int r = oracle[v] ? 2 : t->on_trunk[v] ? 1 : 0;
+      if (taken[v] && t->parent[v] == u && r > rank) next = v, rank = r;
+    }
     if (next < 0) break;
     row_of[next] = rows++;
     u = next;
@@ -206,15 +236,22 @@ __global__ void k_eagle_tree_finish(const EagleTree* t, int width, int trunk, in
 
 }  // namespace
 
-void eagle_tree_start(EagleTree* t, const DevParams* P, const int* oracle, const int* anchor, const int* cand,
-                      const float* val, const float* prob, int beam, const float* gnode, float* hbuf, int H,
-                      cudaStream_t st) {
-  k_eagle_tree_start<<<1, 256, 0, st>>>(t, P, oracle, anchor, cand, val, prob, beam, gnode, hbuf, H);
+void eagle_tree_start(EagleTree* t, const DevParams* P, const DevGen* G, const int* reply_count, const int* oracle,
+                      const int* anchor, const int* cand, const float* val, const float* prob, int kc, int beam,
+                      int vocab, const float* gnode, float* hbuf, int H, cudaStream_t st) {
+  if (beam < 1 || beam > kEagleBeamMax || kc < std::max(beam, std::min(ops::kMtpCands, vocab)))
+    throw std::runtime_error("eagle_tree_start: candidates out of range");
+  k_eagle_tree_start<<<1, 256, 0, st>>>(t, P, G, reply_count, oracle, anchor, cand, val, prob, kc, beam, vocab, gnode,
+                                        hbuf, H);
 }
 
-void eagle_tree_grow(EagleTree* t, const DevParams* P, const int* oracle, const int* cand, const float* val,
-                     const float* prob, int beam, const float* gnode, float* hbuf, int H, cudaStream_t st) {
-  k_eagle_tree_grow<<<1, 256, 0, st>>>(t, P, oracle, cand, val, prob, beam, gnode, hbuf, H);
+void eagle_tree_grow(EagleTree* t, const DevParams* P, const DevGen* G, const int* reply_count, const int* oracle,
+                     const int* cand, const float* val, const float* prob, int kc, int beam, int vocab,
+                     const float* gnode, float* hbuf, int H, cudaStream_t st) {
+  if (beam < 1 || beam > kEagleBeamMax || kc < std::max(beam, std::min(ops::kMtpCands, vocab)))
+    throw std::runtime_error("eagle_tree_grow: candidates out of range");
+  k_eagle_tree_grow<<<1, 256, 0, st>>>(t, P, G, reply_count, oracle, cand, val, prob, kc, beam, vocab, gnode, hbuf,
+                                       H);
 }
 
 void eagle_tree_finish(const EagleTree* t, int width, int trunk, int* drafts, TreeRows* tree, cudaStream_t st) {

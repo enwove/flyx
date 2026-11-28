@@ -49,6 +49,8 @@ std::string block_label() { return g_block == "dspine" ? "DSpine" : g_block == "
 // A file whose drafter drafts trees by default (EAGLE-4's, Model::file_drafts_trees) reads every position: --kv-method
 // auto is exact attention's, never strata's, past any switch.
 bool file_reads_all() { return g_block == "eagle4"; }
+// EAGLE-4's trunk: the chain a tree of its drafts starts with (Model::block_drafts, kEagleTrunk)
+constexpr int kEagleTrunkDrafts = 7;
 
 // Session::init, checked.  A session the engine refuses (no room left for it, as on a GPU other programs hold, or
 // seq_new failed) has no sequence: a FAIL naming this file's line and why, and false.  generate refuses such a
@@ -2208,6 +2210,32 @@ void drafted_trees(const std::string& model, const std::string& backend, const s
   const auto a = sampled(plain.get(), false);
   check(static_cast<int>(a.size()) == N && sampled(trees.get(), true) == a,
         "  sampled (T=0.8): trees taking turns == plain for one seed");
+  if (g_block != "eagle4" || backend != "cuda") return;
+  // EAGLE-4's trunk is its chain, sampling and with penalties too (each trunk node's child the chain's draft there:
+  // mtp_choose's choice from the same candidates, counts and noise): from each of 8 prompts, the first round of a
+  // tree of 15 drafts the chain of 7's drafts first.
+  size_t chain = trees->widths().size();
+  for (size_t i = 0; i < trees->widths().size(); ++i)
+    if (!trees->round_trees()[i] && trees->widths()[i] == kEagleTrunkDrafts) chain = i;
+  const SamplingParams sp{0.8f, 0.95f, 0, 5, 0.5f, 0.3f};
+  int trunks = 0, prompts = 0;
+  for (int k = 0; k < 8 && chain < trees->widths().size(); ++k, ++prompts) {
+    auto p = prompt;
+    p.insert(p.end(), want.begin(), want.begin() + std::min(N, 2 * k));
+    auto first_drafts = [&](size_t round) {
+      Session s(trees.get());
+      init_checked(s);
+      s.rounds().cycle({round});
+      std::vector<flyx_round_result> trace;
+      gen(s, p, 8, &trace, sp);
+      if (trace.size() < 2 || trace[1].n_drafts < kEagleTrunkDrafts) return std::vector<int32_t>{};
+      return std::vector<int32_t>(trace[1].drafts, trace[1].drafts + kEagleTrunkDrafts);
+    };
+    const auto c = first_drafts(chain), t = first_drafts(turns[0]);
+    trunks += !c.empty() && c == t;
+  }
+  check(prompts == 8 && trunks == prompts, "  sampled with penalties: a tree's first 7 drafts are its chain's (" +
+                                             std::to_string(trunks) + " of " + std::to_string(prompts) + " prompts)");
 }
 
 // DV's rounds launched one at a time on session s from the end of its prompt (its first token decoded): round k

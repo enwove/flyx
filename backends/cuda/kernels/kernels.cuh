@@ -962,17 +962,21 @@ struct EagleTree {
   int n, f0, fn, oracle_node, trunk_node;
   int tok[kEagleNodes], parent[kEagleNodes], depth[kEagleNodes], slot[kEagleNodes];
   float score[kEagleNodes];
+  bool on_trunk[kEagleNodes];  // the root and the chain's drafts after it (trunk_node the last)
   int front[kEagleBeamMax], tokbuf[kEagleBeamMax];
   TreeRows prep, att;
 };
-// The root's children (its `beam` best candidates: cand, val, prob as draft_pick_topk gives them), the anchor its
-// root; then the frontier's rows: hbuf [fn][H] its parents' normed outputs (gnode [slot][H]).
-void eagle_tree_start(EagleTree* t, const DevParams* P, const int* oracle, const int* anchor, const int* cand,
-                      const float* val, const float* prob, int beam, const float* gnode, float* hbuf, int H,
-                      cudaStream_t st);
-// A step's children of the frontier (its rows' `beam` best candidates each), the best `beam` the next frontier.
-void eagle_tree_grow(EagleTree* t, const DevParams* P, const int* oracle, const int* cand, const float* val,
-                     const float* prob, int beam, const float* gnode, float* hbuf, int H, cudaStream_t st);
+// The root's children (its kc best candidates: cand, val, prob as draft_pick_topk gives them; kc at least beam and
+// min(kMtpCands, vocab)), the anchor its root: its `beam` best and the chain's draft (mtp_choose's, by G and the
+// reply's counts); then the frontier's rows: hbuf [fn][H] its parents' normed outputs (gnode [slot][H]).
+void eagle_tree_start(EagleTree* t, const DevParams* P, const DevGen* G, const int* reply_count, const int* oracle,
+                      const int* anchor, const int* cand, const float* val, const float* prob, int kc, int beam,
+                      int vocab, const float* gnode, float* hbuf, int H, cudaStream_t st);
+// A step's children of the frontier (its rows' kc best candidates each, as the root's), the best `beam` and the
+// trunk's the next frontier.
+void eagle_tree_grow(EagleTree* t, const DevParams* P, const DevGen* G, const int* reply_count, const int* oracle,
+                     const int* cand, const float* val, const float* prob, int kc, int beam, int vocab,
+                     const float* gnode, float* hbuf, int H, cudaStream_t st);
 // The round's `width` drafts and their tree (TreeRows) from the nodes, the chain's first `trunk` first.
 void eagle_tree_finish(const EagleTree* t, int width, int trunk, int* drafts, TreeRows* tree, cudaStream_t st);
 

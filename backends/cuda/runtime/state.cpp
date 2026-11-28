@@ -1538,8 +1538,9 @@ void build_seq(flyx_bmodel* m, int32_t max_ctx, flyx_seq* s) {
     s->etree = s->alloc<EagleTree>(1);
     s->egnode = s->alloc<float>(size_t(kEagleSlots) * H);
     s->ehbuf = s->alloc<float>(size_t(kEagleBeamMax) * H);
-    s->ecand = s->alloc<int>(size_t(kEagleBeamMax) * kEagleBeamMax);
-    s->eval = s->alloc<float>(size_t(kEagleBeamMax) * kEagleBeamMax);
+    const size_t cands = size_t(kEagleBeamMax) * std::max(kEagleBeamMax, ops::kMtpCands);  // eagle4_tree_cands
+    s->ecand = s->alloc<int>(cands);
+    s->eval = s->alloc<float>(cands);
     s->eprob = s->alloc<float>(size_t(kEagleBeamMax));
   }
   if (m->mtp_block >= 0 || m->eagle4_block >= 0) {

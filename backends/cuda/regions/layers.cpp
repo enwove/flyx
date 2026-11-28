@@ -453,7 +453,7 @@ int eagle4_tree_steps(const flyx_bmodel* m, int width) {
 // chain's), their normed outputs to g [rows][H], their `beam` best candidates to cand / val, the best's probability to
 // prob.
 static void eagle4_tree_step(flyx_seq* s, const Eagle4Block& b, const int* tok, const float* h, int rows, int f0,
-                             const TreeRows* prep, const TreeRows* att, float* g, int beam, const Launch& L,
+                             const TreeRows* prep, const TreeRows* att, float* g, int kc, const Launch& L,
                              bool fused) {
   const auto* m = s->m;
   const auto& E = block<EmbedBlock>(m, b.embed);
@@ -478,23 +478,26 @@ static void eagle4_tree_step(flyx_seq* s, const Eagle4Block& b, const int* tok, 
   rmsnorm(own.mx, H, b.norm.w, b.norm.offset, b.norm.eps, g, H, rows, H, st);
   gemm(g, H, b.cand_down, b.cand_rank, H, s->ez, b.cand_rank, rows, false, L);
   gemm(s->ez, b.cand_rank, b.cand_up, V, b.cand_rank, s->logits, ld, rows, false, L);
-  draft_pick_rough(g, H, b.head, V, H, rows, b.n_cands, beam, s->ecand, s->eval, s->logits, L, s->eprob);
+  draft_pick_rough(g, H, b.head, V, H, rows, b.n_cands, kc, s->ecand, s->eval, s->logits, L, s->eprob);
 }
 
 void eagle4_draft_tree(flyx_seq* s, const Eagle4Block& b, int width, const Launch& L, bool fused) {
   const auto* m = s->m;
-  const int H = b.hidden, beam = m->opt.eagle4_beam, steps = eagle4_tree_steps(m, width);
+  const int H = b.hidden, V = b.vocab, beam = m->opt.eagle4_beam, steps = eagle4_tree_steps(m, width);
+  const int kc = eagle4_tree_cands(beam, V);  // a node's beam children, and its chain's candidates where a trunk's
   cudaStream_t st = L.st;
   build_rows(s->P, nullptr, 0, s->mtok, 1, st);  // mtok[0] = anchor
   // the root: (the ring's h at P->position - 1, the anchor) at P->position - 1, its K/V at that slot (node 0's)
   pair_hidden(s->P, kPosPosition, nullptr, s->ring, H, s->ehbuf, st);
-  eagle4_tree_step(s, b, s->mtok, s->ehbuf, 1, 0, nullptr, nullptr, s->egnode, beam, L, fused);
-  eagle_tree_start(s->etree, s->P, s->oracle, s->mtok, s->ecand, s->eval, s->eprob, beam, s->egnode, s->ehbuf, H, st);
+  eagle4_tree_step(s, b, s->mtok, s->ehbuf, 1, 0, nullptr, nullptr, s->egnode, kc, L, fused);
+  eagle_tree_start(s->etree, s->P, s->G, s->reply.count, s->oracle, s->mtok, s->ecand, s->eval, s->eprob, kc, beam, V,
+                   s->egnode, s->ehbuf, H, st);
   for (int d = 1; d < steps; ++d) {  // the frontier: nodes 1 + beam (d - 1) .. at depth d
     const int f0 = 1 + beam * (d - 1);
     eagle4_tree_step(s, b, s->etree->tokbuf, s->ehbuf, beam, f0, &s->etree->prep, &s->etree->att,
-                     s->egnode + size_t(f0) * H, beam, L, fused);
-    eagle_tree_grow(s->etree, s->P, s->oracle, s->ecand, s->eval, s->eprob, beam, s->egnode, s->ehbuf, H, st);
+                     s->egnode + size_t(f0) * H, kc, L, fused);
+    eagle_tree_grow(s->etree, s->P, s->G, s->reply.count, s->oracle, s->ecand, s->eval, s->eprob, kc, beam, V,
+                    s->egnode, s->ehbuf, H, st);
   }
   eagle_tree_finish(s->etree, width, kEagleTrunk, s->drafts, s->tree, st);
 }
