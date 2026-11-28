@@ -5,7 +5,8 @@
 # 2026-11-25, RTX PRO 6000 Blackwell Server Edition 96 GB, 600 W, driver 620.70.06, CUDA 13.4.
 # Qwen3.8-27B's bf16 GEMMs and its EAGLE-4 drafter's (the Workstation Edition table's shapes), written by
 # `cuda_bench tune gemm 34816x5120 5120x17408 16480x5120 14336x5120 5120x6144 15360x10240 5120x5120 32768x5120
-# 5120x16384 5120x15360` on a Modal RTX PRO 6000 Blackwell Server Edition (driver 620.70.06), 2026-11-28.
+# 5120x16384 5120x15360` on a Modal RTX PRO 6000 Blackwell Server Edition (driver 620.70.06), 2026-11-28; their
+# 9..16-row rules over K of 15360 and more the split configuration (`cuda_bench skinny`, the same GPU).
 # Verified on Qwen3-8B (BF16) with DSpine at 15 drafts (docs/benchmarks.md section 6, the same answers): GSM8K 617.6 to
 # 642.6 tok/s, HumanEval 490.8 to 505.0 against the RTX 5090's table.
 sku = "rtxpro6000"
@@ -67,7 +68,8 @@ format = "bf16"
 n = 5120
 k = 17408
 rules = [
-  { rows = [1, 16], nt = 4, warps = 16, unroll = 4 },  # r1 1407 r4 1396 r8 1376 r16 1215
+  { rows = [1, 8], nt = 4, warps = 16, unroll = 4 },  # r1 1407 r4 1396 r8 1376
+  { rows = [9, 16], nt = 4, warps = 4, unroll = 4, split = 4 },  # r16 1346 (one block a tile: 1206)
 ]
 
 [[gemm]]  # qwen3.8-27b / its eagle4 drafter, bf16 16480x5120
@@ -133,7 +135,8 @@ format = "bf16"
 n = 5120
 k = 16384
 rules = [
-  { rows = [1, 16], nt = 4, warps = 16, unroll = 4 },  # r1 1477 r4 1467 r8 1449 r16 1275
+  { rows = [1, 8], nt = 4, warps = 16, unroll = 4 },  # r1 1477 r4 1467 r8 1449
+  { rows = [9, 16], nt = 4, warps = 4, unroll = 4, split = 4 },  # r16 1370 (one block a tile: 1244)
 ]
 
 [[gemm]]  # qwen3.8-27b / its eagle4 drafter, bf16 5120x15360
@@ -141,7 +144,8 @@ format = "bf16"
 n = 5120
 k = 15360
 rules = [
-  { rows = [1, 16], nt = 4, warps = 16, unroll = 4 },  # r1 1408 r4 1398 r8 1380 r16 1238
+  { rows = [1, 8], nt = 4, warps = 16, unroll = 4 },  # r1 1408 r4 1398 r8 1380
+  { rows = [9, 16], nt = 4, warps = 4, unroll = 4, split = 4 },  # r16 1337 (one block a tile: 1233)
 ]
 
 [rules]

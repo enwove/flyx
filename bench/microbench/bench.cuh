@@ -69,6 +69,13 @@ static __global__ void k_fill_bf16(bf16* p, size_t n, uint32_t seed, float lo, f
 extern Scratch g_bench_scratch;
 extern KernelOptions g_bench_opts;
 inline Launch BL(cudaStream_t st) { return Launch{st, &g_bench_scratch, &g_bench_opts}; }
+// The columns of the split 1..16-row GEMMs the benchmarks' scratch holds the chunks' sums of.
+constexpr int kBenchSplitColumns = 65536;
+// Whether 1..16-row bf16 configuration cfg runs a GEMM of N columns here: a split one bf16 weights (not W12) of at
+// most the scratch's columns.
+inline bool bench_skinny_cfg_fits(int cfg, int N, bool w12) {
+  return kBf16Configs[cfg].split == 1 || (!w12 && N <= g_bench_scratch.skinny_columns);
+}
 
 // ms a call of f: three calls first, then the mean of `reps`.
 template <class F>

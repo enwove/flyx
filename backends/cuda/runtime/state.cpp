@@ -122,6 +122,7 @@ RowNeeds row_needs(const flyx_bmodel* m) {
   }
   if (has_rel_attn) n.max_bank = std::max(pass0_pushes + 2, 4);
   n.k_max = (k + 63) / 64 * 64;
+  n.split_columns = gemm_split_columns(m->opt.kernels.tuning);
   return n;
 }
 
@@ -307,8 +308,9 @@ void alloc_rows(const flyx_bmodel* m, int R, bool prefill, RowBufs* b, Alloc&& a
   // A prefill set's rows in float32 too when NVFP4 weights take NVFP4 inputs.
   const bool f32_rows = prefill && m->opt.kernels.prefill_fp4;
   const bool need_glu = prefill && n.glu;
-  const size_t scratch_size = scratch_bytes(R, n.k_max, n.q8, f32_rows, need_glu, f32_rows);
-  b->scratch = scratch_carve(alloc(scratch_size), scratch_size, R, n.k_max, n.q8, f32_rows, need_glu, f32_rows);
+  const size_t scratch_size = scratch_bytes(R, n.k_max, n.q8, f32_rows, need_glu, f32_rows, n.split_columns);
+  b->scratch = scratch_carve(alloc(scratch_size), scratch_size, R, n.k_max, n.q8, f32_rows, need_glu, f32_rows,
+                             n.split_columns);
 }
 
 template <class Alloc>
@@ -1355,8 +1357,9 @@ void alloc_dv(const flyx_bmodel* m, const DvBlock& v, flyx_seq* s) {
   d.part = s->alloc<float>(attention_partial_floats(v.slots, nh, hd, d.splits));
   // The GEMM inputs of `slots` rows (prefill's kernels past 16 rows); K up to the adapters' rank too.
   const int k_max = std::max(n.k_max, (rank + 63) / 64 * 64);
-  const size_t bytes = scratch_bytes(v.slots, k_max, n.q8, false);
-  d.scratch = scratch_carve(s->alloc<unsigned char>(bytes), bytes, v.slots, k_max, n.q8, false);
+  const size_t bytes = scratch_bytes(v.slots, k_max, n.q8, false, true, true, n.split_columns);
+  d.scratch = scratch_carve(s->alloc<unsigned char>(bytes), bytes, v.slots, k_max, n.q8, false, true, true,
+                            n.split_columns);
 }
 
 void build_seq(flyx_bmodel* m, int32_t max_ctx, flyx_seq* s) {

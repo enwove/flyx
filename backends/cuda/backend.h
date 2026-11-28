@@ -274,6 +274,7 @@ struct RowNeeds {
   bool mtp = false;                         // MTP context rows (2 x hidden, hidden, hidden)
   bool glu = false;                         // non-packed MLP weights (prefill gemm_glu_staged)
   int k_max = 0;                            // largest GEMM K: the scratch staging GEMM inputs is sized by it
+  int split_columns = 0;                    // the table's split 1..16-row GEMMs' columns (gemm_split_columns)
   bool q8 = false;  // weights with inputs in 8 bits: a prefill scratch holds their GEMMs' runs of K side by side
   int max_bank = 0, max_loop_rank = 0;      // Inkling-2 AttnRes bank depth & loop gate rank
   int rel_q = 0, max_rel_nh = 0, max_rel_extent = 0, sink = 0, kv_dim = 0, kv_dyn = 0;

@@ -47,6 +47,14 @@ unroll = 4
 nt = 1
 warps = 16
 unroll = 16
+# A column tile's chunks shared by 4 blocks of 4 warps (k_gemm_skinny_split), the last to finish adding them in
+# order: the same bits.  For a long K over few columns: Qwen3.8-27B's mlp down (5120 x 17408) at 16 rows 1346 GB/s
+# against 1206 in one block a tile on an RTX PRO 6000 (160 tiles of 32 columns for 188 SMs; cuda_bench skinny).
+[[bf16_skinny]]
+nt = 4
+warps = 4
+unroll = 4
+split = 4
 
 # 17..64 rows: tile, chunks (a warp each), loop unroll, input parts (3: the 1..16-row bits, in 16 chunks; 1: a
 # drafting pass's, in the chunks K gives it, 8 or 16: gen_gemm_tables.py draft_chunks)

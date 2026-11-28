@@ -52,8 +52,13 @@ struct Carve {
 // exclusive per launch (1..16-row round staging vs >16-row 8-bit block GEMMs vs >16-row bf16/NVFP4/non-Q8 GEMMs) and
 // share one union base.
 uintptr_t lay_out(uintptr_t base, int rows, int k_max, bool q8_parts, bool f32_rows, bool need_glu, bool need_q4,
-                  Scratch* s) {
+                  int split_columns, Scratch* s) {
   Carve c{base};
+  if (split_columns > 0) {  // a tile of 8 NT <= 32 columns: 16 chunks x 16 rows x 8 NT sums; a counter per tile
+    s->skinny_columns = split_columns;
+    s->skinny_parts = c.take<float>(size_t(256) * (split_columns + 32), 256);
+    s->skinny_count = c.take<unsigned>(size_t(split_columns) / 8 + 1, 16);
+  }
   // Dedicated zeroed tile counters and per-row scales (tiny, shared across paths).
   s->row_scale = c.take<float>(size_t(std::max(rows, 16) + 3) / 4 * 4, 16);
   // Shared by split Q8 round GEMMs (k_round_blocks_split) and fused relative-attention round combine (k_rel_round_gqa).
@@ -130,16 +135,17 @@ uintptr_t lay_out(uintptr_t base, int rows, int k_max, bool q8_parts, bool f32_r
 }
 }  // namespace
 
-size_t scratch_bytes(int rows, int k_max, bool q8_parts, bool f32_rows, bool need_glu, bool need_q4) {
+size_t scratch_bytes(int rows, int k_max, bool q8_parts, bool f32_rows, bool need_glu, bool need_q4,
+                     int split_columns) {
   Scratch s;
-  return lay_out(0, rows, k_max, q8_parts, f32_rows, need_glu, need_q4, &s);
+  return lay_out(0, rows, k_max, q8_parts, f32_rows, need_glu, need_q4, split_columns, &s);
 }
 
 Scratch scratch_carve(void* mem, size_t bytes, int rows, int k_max, bool q8_parts, bool f32_rows, bool need_glu,
-                      bool need_q4) {
+                      bool need_q4, int split_columns) {
   Scratch s;
   const uintptr_t base = reinterpret_cast<uintptr_t>(mem);
-  const uintptr_t end = lay_out(base, rows, k_max, q8_parts, f32_rows, need_glu, need_q4, &s);
+  const uintptr_t end = lay_out(base, rows, k_max, q8_parts, f32_rows, need_glu, need_q4, split_columns, &s);
   if (base % kScratchAlign || end - base > bytes) {  // a sizing bug in the caller, not a condition to recover from
     std::fprintf(stderr, "flyx-cuda: scratch for %d rows of %d needs %zu bytes from a %zu-byte boundary, has %zu\n",
                  rows, k_max, size_t(end - base), size_t(kScratchAlign), bytes);
@@ -148,14 +154,16 @@ Scratch scratch_carve(void* mem, size_t bytes, int rows, int k_max, bool q8_part
   return s;
 }
 
-Scratch scratch_in(void* mem, size_t bytes, int rows, int k_max, bool q8_parts, bool f32_rows) {
-  Scratch s = scratch_carve(mem, bytes, rows, k_max, q8_parts, f32_rows);
+Scratch scratch_in(void* mem, size_t bytes, int rows, int k_max, bool q8_parts, bool f32_rows, int split_columns) {
+  Scratch s = scratch_carve(mem, bytes, rows, k_max, q8_parts, f32_rows, true, true, split_columns);
   // The tiles' counters start at zero; every GEMM leaves them so.  Waited for: callers launch on streams that do
   // not wait for the default one.
   if ((s.q8_count && cudaMemset(s.q8_count, 0, kQ8Tiles * sizeof(int)) != cudaSuccess) ||
       (s.round_count && cudaMemset(s.round_count, 0, s.round_count_cap * sizeof(int)) != cudaSuccess) ||
       (s.side_count && cudaMemset(s.side_count, 0, s.side_count_cap * sizeof(int)) != cudaSuccess) ||
-      ((s.q8_count || s.round_count) && cudaDeviceSynchronize() != cudaSuccess)) {
+      (s.skinny_count &&
+       cudaMemset(s.skinny_count, 0, (size_t(s.skinny_columns) / 8 + 1) * sizeof(unsigned)) != cudaSuccess) ||
+      ((s.q8_count || s.round_count || s.skinny_count) && cudaDeviceSynchronize() != cudaSuccess)) {
     std::fprintf(stderr, "flyx-cuda: scratch_in: %s\n", cudaGetErrorString(cudaGetLastError()));
     std::abort();
   }
@@ -176,6 +184,9 @@ Scratch side_scratch(const Scratch& s) {
   g.round_parts_cap = s.side_parts_cap;
   g.round_count = s.side_count;
   g.round_count_cap = s.side_count_cap;
+  g.skinny_parts = nullptr;  // the side stream's GEMMs take 8-bit inputs (layers.cpp: side_kv)
+  g.skinny_count = nullptr;
+  g.skinny_columns = 0;
   return g;
 }
 

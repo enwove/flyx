@@ -90,7 +90,14 @@ import re
 import sys
 import tomllib
 
-BF16_KEYS = ("nt", "warps", "unroll")
+BF16_KEYS = ("nt", "warps", "unroll", "split")
+# split: the blocks a column tile's chunks are shared by (k_gemm_skinny_split; 1, the one block of k_gemm_skinny), for
+# bf16 weights by their shape's own rules (the scratch holds the chunks' sums of the widest, Sku::split_columns).
+
+
+def bf16_key(d: dict) -> tuple:
+    """A 1..16-row bf16 configuration: (tile, warps, unroll, blocks a tile's chunks are shared by)."""
+    return key({"split": 1, **d}, BF16_KEYS)
 MT_KEYS = ("nt", "chunks", "unroll", "parts")
 FP4_KEYS = ("span", "chunks", "nt", "warps", "unroll")
 BLOCKS_KEYS = ("nt", "nw", "kw")
@@ -148,15 +155,17 @@ class Compiled:
     """The configurations candidates.toml compiles, checked."""
 
     def __init__(self, cand: dict, where: str):
-        self.bf16 = [key(c, BF16_KEYS) for c in cand["bf16_skinny"]]
+        self.bf16 = [bf16_key(c) for c in cand["bf16_skinny"]]
         self.fp4 = [key(c, FP4_KEYS) for c in cand["nvfp4_skinny"]]
         for c in self.fp4:
             span, chunks, nt, warps, _ = c
             if span not in (64, 128) or chunks % warps:
                 raise SystemExit(f"{where}: bad nvfp4 configuration {c}")
         for c in self.bf16:
-            if 16 % c[1]:
-                raise SystemExit(f"{where}: bf16 warps must divide 16: {c}")
+            if c[3] not in (1, 2, 4, 8, 16) or 16 % (c[1] * c[3]):
+                raise SystemExit(f"{where}: bf16 warps times split must divide 16 (split 1, 2, 4, 8 or 16): {c}")
+        if len(set(self.bf16)) != len(self.bf16):
+            raise SystemExit(f"{where}: a bf16_skinny configuration listed twice")
         self.mt = [key(c, MT_KEYS) for c in cand["bf16_mt"]]
         for nt, chunks, unroll, parts in self.mt:
             if (nt not in (1, 2, 4) or parts not in (1, 3) or unroll < 1 or (parts == 3 and chunks != 16)
@@ -212,9 +221,10 @@ def bf16_rules(rules, where, c: Compiled):
     out, covered = [], [0] * 17
     for r in rules:
         lo, hi = r["rows"]
-        k = key(r, BF16_KEYS)
-        if not 1 <= lo <= hi <= 16 or k not in c.bf16:
-            raise SystemExit(f"{where}: a bf16 rule takes rows within 1..16 and a compiled configuration: {r}")
+        k = bf16_key(r)
+        if not 1 <= lo <= hi <= 16 or k not in c.bf16 or k[3] != 1:
+            raise SystemExit(f"{where}: a bf16 rule takes rows within 1..16 and a compiled configuration of split 1 "
+                             f"(a split one serves its shapes' own rules): {r}")
         for i in range(lo, hi + 1):
             covered[i] += 1
         out.append((lo, hi, c.bf16.index(k)))
@@ -506,7 +516,11 @@ def shape_rules(path, t, sid, c: Compiled):
             for i in range(lo, hi + 1):
                 covered[i] += 1
             if fmt != 1:
-                cfg = c.bf16.index(key(r, BF16_KEYS)) if key(r, BF16_KEYS) in c.bf16 else -1
+                k = bf16_key(r)
+                cfg = c.bf16.index(k) if k in c.bf16 else -1
+                if cfg >= 0 and k[3] > 1 and fmt != 0:
+                    raise SystemExit(f"{path}: {g['format']} {g['n']}x{g['k']}: a split configuration serves bf16 "
+                                     f"weights")
             else:
                 k = key(r, FP4_KEYS)
                 cfg = c.fp4.index(k) if k in c.fp4 else -1
@@ -515,7 +529,7 @@ def shape_rules(path, t, sid, c: Compiled):
                     raise SystemExit(f"{path}: span {k[0]} does not divide K={g['k']}")
             if cfg < 0:
                 raise SystemExit(f"{path}: {g['format']} {g['n']}x{g['k']} rows {r['rows']}: configuration "
-                                 f"{ {k: r[k] for k in (FP4_KEYS if fmt == 1 else BF16_KEYS)} } is not in candidates")
+                                 f"{ {k: r[k] for k in (FP4_KEYS if fmt == 1 else BF16_KEYS) if k in r} } is not in candidates")
             rules.append((sid, fmt, g["n"], g["k"], lo, hi, cfg))
         if covered[1:] != [1] * 16:
             raise SystemExit(f"{path}: {g['format']} {g['n']}x{g['k']}: rules must cover rows 1..16 exactly once")
@@ -737,7 +751,7 @@ def emit(c: Compiled, skus, rules, families, archs=(), flash_gqa=(), strata_plac
         out.append("")
         out.append(f"#define {macro}_COUNT {len(items)}")
 
-    emit_xmacro("FLYX_BF16_SKINNY", "X(index, nt, warps, unroll)", c.bf16)
+    emit_xmacro("FLYX_BF16_SKINNY", "X(index, nt, warps, unroll, split)", c.bf16)
     emit_xmacro("FLYX_BF16_MT", "X(index, nt, chunks, unroll, parts)", c.mt)
     emit_xmacro("FLYX_FP4_SKINNY", "X(index, span, chunks, nt, warps, unroll)", c.fp4)
     emit_xmacro("FLYX_BLOCKS_SKINNY", "X(index, nt, nw, kw)", c.blocks)
@@ -752,17 +766,29 @@ def emit(c: Compiled, skus, rules, families, archs=(), flash_gqa=(), strata_plac
     out += [f"  kFamily{''.join(w.capitalize() for w in f.split('_'))} = {1 << i}u," for i, f in enumerate(FAMILIES)]
     out.append("};")
     out.append("// pdl: kernels launch as programmatic dependents on this GPU unless the options say otherwise")
+    out.append("// split_columns: the most columns of a shape this table's rules (or those it inherits) run in a split")
+    out.append("// configuration, whose chunks' sums the scratch holds; 0: none.")
     out.append("struct Sku { const char* name; const char* const* devices; int n_devices; int parent; unsigned families; "
-               "bool pdl; };")
+               "bool pdl; int split_columns; };")
     for i, (n, devs, _, _) in enumerate(skus):
         lst = ", ".join('"' + x.replace('"', '\\"') + '"' for x in devs) or "nullptr"
         out.append(f"inline const char* const kDevices{i}[] = {{{lst}}};")
     has = {sku: sum(1 << i for i, f in enumerate(FAMILIES) if f in fam) for sku, fam in families}
+    split_own = [0] * len(skus)
+    for sku, fmt, n, _, _, _, cfg in rules:
+        if fmt == 0 and c.bf16[cfg][3] > 1:
+            split_own[sku] = max(split_own[sku], n)
+
+    def split_columns(i):
+        cols = 0
+        while i >= 0:
+            cols, i = max(cols, split_own[i]), skus[i][2]
+        return cols
     out.append("inline const Sku kSkus[] = {")
-    out += [f'    {{"{n}", kDevices{i}, {len(devs)}, {p}, {has.get(i, 0)}u, {"true" if pdl else "false"}}},'
-            for i, (n, devs, p, pdl) in enumerate(skus)]
+    out += [f'    {{"{n}", kDevices{i}, {len(devs)}, {p}, {has.get(i, 0)}u, {"true" if pdl else "false"}, '
+            f'{split_columns(i)}}},' for i, (n, devs, p, pdl) in enumerate(skus)]
     if not skus:
-        out.append('    {"none", nullptr, 0, -1, 0u, false},')
+        out.append('    {"none", nullptr, 0, -1, 0u, false, 0},')
     out.append("};")
     out.append(f"inline constexpr int kSkuCount = {len(skus)};")
     out.append("// The table of a GPU that has none of its own, by its compute capability (major * 10 + minor).")

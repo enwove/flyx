@@ -678,7 +678,7 @@ int encode_vision(flyx_plan* p, const flyx_vision_input* in, float* out_embeds, 
       cu_host = {0, N};
     }
 
-    const size_t sc_bytes = scratch_bytes(N, max_k, need_q8, need_a4, false, need_a4);
+    const size_t sc_bytes = scratch_bytes(N, max_k, need_q8, need_a4, false, need_a4, m->need.split_columns);
     const size_t base_bytes =
         align256(x_floats * sizeof(float)) + align256(h_floats * sizeof(float)) +
         align256(b1_floats * sizeof(float)) + align256(b2_floats * sizeof(float)) +
@@ -846,7 +846,7 @@ int encode_vision(flyx_plan* p, const flyx_vision_input* in, float* out_embeds, 
     int32_t* d_gw = d_gh + N;
     int32_t* d_cu = d_gw + N;
     void* sc_mem = take(sc_bytes);
-    Scratch sc = scratch_carve(sc_mem, sc_bytes, N, max_k, need_q8, need_a4, false, need_a4);
+    Scratch sc = scratch_carve(sc_mem, sc_bytes, N, max_k, need_q8, need_a4, false, need_a4, m->need.split_columns);
     if (sc.round_count) CK(cudaMemsetAsync(sc.round_count, 0, sc.round_count_cap * sizeof(int), sg.st));
     if (need_q8) {
       if (sc.q8_count) CK(cudaMemsetAsync(sc.q8_count, 0, kQ8Tiles * sizeof(int), sg.st));

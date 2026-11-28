@@ -687,7 +687,7 @@ std::vector<std::vector<std::array<double, 4>>> tune_gemm_shapes(const std::vect
     std::vector<std::array<double, 4>> ms(nc);
     size_t it = 0;
     for (int c = 0; c < nc; ++c) {
-      if (fp4 && s.K % kFp4Configs[c].span) {
+      if ((fp4 && s.K % kFp4Configs[c].span) || (!fp4 && !bench_skinny_cfg_fits(c, s.N, s.fmt == 2))) {
         ms[c].fill(1e30);
         continue;
       }
@@ -740,7 +740,9 @@ std::vector<std::vector<std::array<double, 4>>> tune_gemm_shapes(const std::vect
       const int nt = fp4 ? kFp4Configs[c].nt : kBf16Configs[c].nt;
       const int w = fp4 ? kFp4Configs[c].warps : kBf16Configs[c].warps;
       const int u = fp4 ? kFp4Configs[c].unroll : kBf16Configs[c].unroll;
-      std::printf("nt = %d, warps = %d, unroll = %d },  #", nt, w, u);
+      std::printf("nt = %d, warps = %d, unroll = %d", nt, w, u);
+      if (!fp4 && kBf16Configs[c].split > 1) std::printf(", split = %d", kBf16Configs[c].split);
+      std::printf(" },  #");
       for (int k = b; k <= e; ++k) std::printf(" r%d %.0f", kBands[k][2], bytes / 1e9 / (ms[c][k] / 1e3));
       std::printf("\n");
       b = e + 1;
@@ -783,8 +785,8 @@ void print_gemm_rules(const std::vector<std::vector<std::array<double, 4>>>& ms)
   int pick[4];
   for (int b = 0; b < 4; ++b) {
     pick[b] = 0;
-    for (int c = 1; c < kSkinnyConfigs; ++c)
-      if (slowdown(0, c, b, false) < slowdown(0, pick[b], b, false)) pick[b] = c;
+    for (int c = 1; c < kSkinnyConfigs; ++c)  // a split configuration serves its shapes' own rules alone
+      if (kBf16Configs[c].split == 1 && slowdown(0, c, b, false) < slowdown(0, pick[b], b, false)) pick[b] = c;
   }
   for (int b = 0; b < 4;) {
     int e = b;

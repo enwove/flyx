@@ -165,6 +165,10 @@ void bench_skinny() {
     for (int rows : {1, 4, 8, 16}) {
       std::printf("%-14s r%-4d", s.name, rows);
       for (int c = 0; c < kSkinnyConfigs; ++c) {
+        if (!bench_skinny_cfg_fits(c, s.N, false)) {
+          std::printf("  %6s", "-");
+          continue;
+        }
         double ms = time_ms([&] { gemm_skinny_cfg(c, x, s.K, W.next(), s.N, s.K, y, s.N, rows, false, BL(0)); }, 20);
         std::printf("  %6.0f", gb / (ms / 1e3));
       }
@@ -1379,6 +1383,7 @@ void bench_w12() {
               esc, bad);
   for (int cfg = 0; cfg < kSkinnyConfigs; ++cfg) {
     const auto& b = kBf16Configs[cfg];
+    if (!bench_skinny_cfg_fits(cfg, N, true)) continue;
     std::printf("cfg%d nt%d w%2d u%2d", cfg, b.nt, b.warps, b.unroll);
     for (int rows : {1, 4, 8, 16}) {
       const double a = time_ms([&] { gemm_skinny_cfg(cfg, x, K, w, N, K, y, N, rows, false, BL(0)); }, 20);
@@ -2457,10 +2462,10 @@ int main(int argc, char** argv) {
   if (what == "paging") return bench_paging(argc, argv);  // the device's memory as it is, no scratch beside it
   {
     void* mem = nullptr;
-    // K up to the 27B's MLP down projection (17408).
-    const size_t bytes = scratch_bytes(2048, 17408);
+    // K up to the 27B's MLP down projection (17408); split GEMMs of up to kBenchSplitColumns columns.
+    const size_t bytes = scratch_bytes(2048, 17408, true, false, true, true, kBenchSplitColumns);
     CK(cudaMalloc(&mem, bytes));
-    g_bench_scratch = scratch_in(mem, bytes, 2048, 17408);
+    g_bench_scratch = scratch_in(mem, bytes, 2048, 17408, true, false, kBenchSplitColumns);
   }
   if (what == "gemm") bench_gemm();
   else if (what == "skinny") bench_skinny();

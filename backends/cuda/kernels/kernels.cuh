@@ -222,6 +222,11 @@ struct Scratch {
   size_t round_parts_cap = 0;
   int* round_count = nullptr;
   size_t round_count_cap = 0;
+  // A 1..16-row bf16 GEMM whose column tiles' chunks are shared by several blocks (k_gemm_skinny_split): the chunks'
+  // sums [tile][16][...] of up to skinny_columns columns, and a counter per tile, zero between launches.
+  float* skinny_parts = nullptr;
+  unsigned* skinny_count = nullptr;
+  int skinny_columns = 0;
   // The same for a launch on a launch's side stream (side_scratch; kSideColumns a launch): two split launches at once
   // take sums and counters of their own.
   float* side_parts = nullptr;
@@ -251,14 +256,16 @@ struct Scratch {
 // bytes, and its buffers carved from `bytes` of memory at a 256-byte boundary
 // (one layout does both; memory too small is a bug and aborts).  q8_parts:
 // room for the runs of K of prefill GEMMs in 8 bits side by side (else they
-// take them in turn).  scratch_carve() does no device work; scratch_in()
+// take them in turn).  split_columns: room for the chunks' sums of split 1..16-row bf16 GEMMs of that many columns
+// (the GPU's table's, gemm_split_columns).  scratch_carve() does no device work; scratch_in()
 // also sets the tiles' counters to zero, which memory that starts zeroed
 // already has.
 size_t scratch_bytes(int rows, int k_max, bool q8_parts = true, bool f32_rows = false, bool need_glu = true,
-                     bool need_q4 = true);
+                     bool need_q4 = true, int split_columns = 0);
 Scratch scratch_carve(void* mem, size_t bytes, int rows, int k_max, bool q8_parts = true, bool f32_rows = false,
-                      bool need_glu = true, bool need_q4 = true);
-Scratch scratch_in(void* mem, size_t bytes, int rows, int k_max, bool q8_parts = true, bool f32_rows = false);
+                      bool need_glu = true, bool need_q4 = true, int split_columns = 0);
+Scratch scratch_in(void* mem, size_t bytes, int rows, int k_max, bool q8_parts = true, bool f32_rows = false,
+                   int split_columns = 0);
 // A round's gate|up rows gu [rows][ld] (gate columns 0..I-1, up I..2I-1): the GEMM that writes them also leaves
 // silu(gate) * up in 8 bits in its scratch (Scratch::q8_glu), the bits swiglu_split(..., q8) gives.
 struct RoundGlu {
@@ -335,7 +342,7 @@ void gemm_fp4_tc(const float* x, int ldx, const uint8_t* Q, const uint8_t* S, co
 void gemm_skinny_cfg(int cfg, const float* x, int ldx, const bf16* W, int N, int K, float* y, int ldy, int rows,
                      bool accumulate, const Launch& L);
 struct Bf16Config {
-  int nt, warps, unroll;
+  int nt, warps, unroll, split;  // split > 1: bf16 weights of at most Scratch::skinny_columns columns
 };
 extern const Bf16Config kBf16Configs[];
 extern const int kSkinnyConfigs;
@@ -431,6 +438,9 @@ const char* gemm_tuning_name(int tuning);
 bool gemm_tuning_compiled_for(int tuning, int cc);
 // Whether kernels launch as programmatic dependents on the GPU of this table unless the options say.
 bool gemm_tuning_pdl(int tuning);
+// The most columns of a shape the table (and those it inherits) runs in a split 1..16-row configuration: the
+// columns a scratch holds the chunks' sums of (scratch_bytes); 0: none, and with no table.
+int gemm_split_columns(int tuning);
 // The table a device runs unless the options name one or none (option tuning=table; the engine and cuda_bench alike):
 // the device's own (gemm_tuning_for, by its name, else by its compute capability device_cc), where the loaded code
 // (compute capability code_cc, compiled_arch) has its kernels; else the loaded code's architecture's table, where it

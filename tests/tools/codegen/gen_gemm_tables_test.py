@@ -71,9 +71,9 @@ check(text is not None, "a table with rules of its own generates", err)
 if text:
     skus = entries(text, "kSkus")
     round_bit, runs_bit = 1 << list(gen.FAMILIES).index("blocks_round"), 1 << list(gen.FAMILIES).index("blocks_q8_runs")
-    check(skus[0] == f'{{"a", kDevices0, 1, -1, {round_bit | runs_bit}u, false}}',
+    check(skus[0] == f'{{"a", kDevices0, 1, -1, {round_bit | runs_bit}u, false, 0}}',
           "the GPU's table says which families it has", skus[0])
-    check(skus[1] == '{"b", kDevices1, 1, 0, 0u, false}',
+    check(skus[1] == '{"b", kDevices1, 1, 0, 0u, false, 0}',
           "the GPU that inherits has none of its own and names its parent", skus[1])
     rounds = entries(text, "kBlocksRound")
     own = [r for r in rounds if r.startswith("{0,")]
@@ -159,7 +159,7 @@ text, err = generate({"a": 'sku = "a"\npdl = true\n', "b": 'sku = "b"\ninherit =
                       "c": 'sku = "c"\ninherit = "a"\npdl = false\n', "d": 'sku = "d"\n'})
 check(text is not None, "tables that say pdl generate", err)
 if text:
-    pdl = [s.rsplit(", ", 1)[1].rstrip("}") for s in entries(text, "kSkus")]
+    pdl = [s.rsplit(", ", 2)[1] for s in entries(text, "kSkus")]
     check(pdl == ["true", "true", "false", "false"],
           "pdl: the table's own, the inherited one, an inheriting table's own, none", pdl)
 
@@ -272,7 +272,7 @@ if text and base:
                   f"{{0, FLYX_DT_GGML_IQ2_S, 1, {INF}, {moe[(1, 2)]}}}", f"{{0, -1, 1, {INF}, {original}}}"],
           "the GPU's MoE rules: its type's in order, then the original tiles for every type", own)
     moe_bit = 1 << list(gen.FAMILIES).index("moe_gate_up")
-    check(entries(text, "kSkus")[0] == f'{{"a", kDevices0, 0, -1, {moe_bit}u, false}}',
+    check(entries(text, "kSkus")[0] == f'{{"a", kDevices0, 0, -1, {moe_bit}u, false, 0}}',
           "the GPU's table says it has the family", entries(text, "kSkus")[0])
     check(entries(base, "kMoeGateUp")[-1] == f"{{-1, -1, 1, {INF}, {original}}}",
           "the defaults end with the original tiles for every type", entries(base, "kMoeGateUp")[-1])
@@ -322,6 +322,25 @@ with tempfile.TemporaryDirectory() as d:
 check(err is not None and "the original tiles" in err, "refused: MoE configurations without the original tiles", err)
 
 MOE_REST = "{ columns = 0, units = 0 }"
+# A split configuration in a shape's own rules: the scratch holds the chunks' sums of its columns, for the GPU and the
+# one that inherits its table.
+SPLIT_SHAPE = """
+sku = "a"
+devices = ["GPU A"]
+[[gemm]]
+format = "bf16"
+n = 5120
+k = 17408
+rules = [{ rows = [1, 8], nt = 4, warps = 16, unroll = 4 }, { rows = [9, 16], nt = 4, warps = 4, unroll = 4, split = 4 }]
+"""
+text, err = generate({"a": SPLIT_SHAPE, "b": INHERITS})
+check(text is not None, "a shape's split rule generates", err)
+if text:
+    cols = [e.rsplit(", ", 1)[1].rstrip("}") for e in entries(text, "kSkus")]
+    check(cols == ["5120", "5120"], "the split columns: the table's widest split shape, inherited too", cols)
+    base, _ = generate({})
+    check(base is not None and entries(base, "kSkus") == ['{"none", nullptr, 0, -1, 0u, false, 0}'],
+          "no table: no split columns", base and entries(base, "kSkus"))
 TC_REST = "{ bm = 64, bn = 128, wn = 4, stages = 2 }"
 # A GPU's own prefill rules: by the format and the rows, the defaults' tile counts for NVFP4.
 TC_OWN = f"""
@@ -396,6 +415,14 @@ refusals = {
     "a family that does not exist": ("[rules]\nblocks_rounds = []\n", "unknown rules"),
     "a configuration that is not compiled": ("[rules]\nblocks = [{ rows = [1, 16], nt = 3, nw = 1, kw = 1 }]\n",
                                              "compiled configuration"),
+    "a split configuration for shapes no table lists": (
+        "[rules]\nbf16 = [{ rows = [1, 16], nt = 4, warps = 4, unroll = 4, split = 4 }]\n", "of split 1"),
+    "a split configuration for W12 weights": (
+        '[[gemm]]\nformat = "w12"\nn = 5120\nk = 17408\nrules = [{ rows = [1, 16], nt = 4, warps = 4, unroll = 4, '
+        'split = 4 }]\n', "serves bf16 weights"),
+    "a split configuration that is not compiled": (
+        '[[gemm]]\nformat = "bf16"\nn = 5120\nk = 17408\nrules = [{ rows = [1, 16], nt = 4, warps = 4, unroll = 4, '
+        'split = 2 }]\n', "is not in candidates"),
     "a prefill configuration that is not compiled": (
         f"[rules]\nprefill_tc = [{{ bm = 64, bn = 16, wn = 1, stages = 3 }}, {TC_REST}]\n", "compiled configuration"),
     "prefill rules without a rule for the rest of a format": (
