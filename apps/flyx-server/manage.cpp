@@ -928,7 +928,9 @@ void add_manage_routes(httplib::Server& http, Server* s) {
     r.set_header("Cache-Control", "no-store");
     const bool ram = kind == "ram";
     const GpuAppSnapshot snap = ram ? list_ram_apps() : list_gpu_apps(device_hint());
-    if (!ram && snap.mem_total > 0) s->probe_mem_used.store(snap.mem_used, std::memory_order_relaxed);
+    // Only a reading of the device itself (not of one of several of its name) refreshes the probe's.
+    if (!ram && snap.mem_total > 0 && snap.device_unique)
+      s->probe_mem_used.store(int64_t(snap.mem_used), std::memory_order_relaxed);
     send_json(r, 200, gpu_snapshot_json(snap, ram ? "ram" : "vram", from_this_machine(q)));
   });
   http.Post("/v1/device/close", [s, device_hint, gpu_snapshot_json](const httplib::Request& q, httplib::Response& r) {
@@ -951,7 +953,8 @@ void add_manage_routes(httplib::Server& http, Server* s) {
     const bool ram = kind == "ram";
     const GpuCloseResult res =
         ram ? close_ram_app(body["id"].get<std::string>(), force) : close_gpu_app(device_hint(), body["id"].get<std::string>(), force);
-    if (!ram && res.snapshot.mem_total > 0) s->probe_mem_used.store(res.snapshot.mem_used, std::memory_order_relaxed);
+    if (!ram && res.snapshot.mem_total > 0 && res.snapshot.device_unique)
+      s->probe_mem_used.store(int64_t(res.snapshot.mem_used), std::memory_order_relaxed);
     if (res.status == CloseStatus::kUnsupported)
       return error(r, 501, "closing applications is not supported on this system", "not_supported");
     if (res.status == CloseStatus::kNotFound)

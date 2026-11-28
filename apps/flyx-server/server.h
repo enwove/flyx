@@ -69,7 +69,9 @@ struct Server {
   double started_at = 0;  // unix seconds
   ojson device_probe;     // the GPU found at start when no model was named (telemetry's device until one loads)
   uint64_t device_reserve_floor = 0;  // backend-reported reserve floor from start-up probe (for idle telemetry)
-  std::atomic<uint64_t> probe_mem_used{0};  // refreshed by /v1/device/* so idle VRAM bars update after closing apps
+  // The probed device's used bytes, refreshed by /v1/device/* (idle VRAM bars update after closing apps) from a
+  // reading of that device alone (GpuAppSnapshot::device_unique); -1: none (0 is a reading).
+  std::atomic<int64_t> probe_mem_used{-1};
   RequestLog* requests = nullptr;  // the last finished requests, for GET /v1/requests
   SystemLog* logs = nullptr;       // the last lines on standard error, for GET /v1/logs
   std::vector<std::string> models_dirs{};  // canonicalized --models-dir + FLYX_MODELS_DIR roots

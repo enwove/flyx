@@ -275,22 +275,28 @@ const NvmlWinApi& nvml_win_api() {
   return api;
 }
 
-bool query_nvml_memory(const std::string& device_name, uint64_t* total, uint64_t* used, uint64_t* free_b) {
+bool query_nvml_memory(const std::string& device_name, uint64_t* total, uint64_t* used, uint64_t* free_b,
+                       bool* unique) {
+  *unique = false;
   const auto& nv = nvml_win_api();
   if (!nv.ok) return false;
   unsigned int n = 0;
   if (nv.count(&n) != 0 || n == 0) return false;
   NvmlDevice* picked = nullptr;
+  NvmlDevice* first = nullptr;
+  int matches = 0;
   for (unsigned int i = 0; i < n; ++i) {
     NvmlDevice* d = nullptr;
     if (nv.by_index(i, &d) != 0 || !d) continue;
+    if (!first) first = d;
     char buf[128] = {};
     if (nv.name(d, buf, sizeof(buf)) == 0 && !device_name.empty() && contains_ci(buf, device_name)) {
-      picked = d;
-      break;
+      if (!picked) picked = d;
+      ++matches;
     }
-    if (!picked) picked = d;
   }
+  *unique = matches == 1 || (n == 1 && first);
+  if (!picked) picked = first;
   if (!picked) return false;
   NvmlMemory mem{};
   if (nv.memory(picked, &mem) != 0 || mem.total == 0) return false;
@@ -302,6 +308,7 @@ bool query_nvml_memory(const std::string& device_name, uint64_t* total, uint64_t
 
 struct AdapterChoice {
   bool found = false;
+  bool unique = false;  // the only adapter the hint names (the only one, without a hint)
   LUID luid{};
   std::string name;
   uint64_t dedicated_total = 0;
@@ -337,15 +344,16 @@ AdapterChoice find_target_adapter(const std::string& device_hint) {
   factory->Release();
   if (cands.empty()) return out;
 
-  int best = -1;
+  int best = -1, named = 0;
   if (!device_hint.empty()) {
     for (int i = 0; i < int(cands.size()); ++i) {
       if (contains_ci(cands[i].name, device_hint) || contains_ci(device_hint, cands[i].name)) {
-        best = i;
-        break;
+        if (best < 0) best = i;
+        ++named;
       }
     }
   }
+  out.unique = named == 1 || cands.size() == 1;
   if (best < 0) {
     // Prefer discrete NVIDIA GPU with largest dedicated VRAM.
     uint64_t best_mem = 0;
@@ -643,11 +651,14 @@ LiveScan scan_windows_gpu_apps(const std::string& device_hint) {
   out.snap.supported = true;
 
   uint64_t nv_total = 0, nv_used = 0, nv_free = 0;
-  if (query_nvml_memory(ad.name, &nv_total, &nv_used, &nv_free)) {
+  bool nv_unique = false;
+  if (query_nvml_memory(ad.name, &nv_total, &nv_used, &nv_free, &nv_unique)) {
     out.snap.mem_total = nv_total;
     out.snap.mem_used = nv_used;
     out.snap.mem_free = nv_free;
+    out.snap.device_unique = ad.unique && nv_unique;
   } else {
+    out.snap.device_unique = ad.unique;
     out.snap.mem_used = ad_dedicated;
     out.snap.mem_free = out.snap.mem_total > ad_dedicated ? out.snap.mem_total - ad_dedicated : 0;
   }
@@ -1214,15 +1225,16 @@ LinuxScan scan_linux_gpu_apps(const std::string& device_hint) {
 
   NvmlDevice* dev = nullptr;
   std::string dev_name;
+  bool named = false;
+  int matches = 0;
   for (unsigned int i = 0; i < n; ++i) {
     NvmlDevice* d = nullptr;
     if (nv.by_index(i, &d) != 0 || !d) continue;
     char buf[128] = {};
     nv.name(d, buf, sizeof(buf));
     if (!device_hint.empty() && contains_ci(buf, device_hint)) {
-      dev = d;
-      dev_name = buf;
-      break;
+      if (!named) dev = d, dev_name = buf, named = true;
+      ++matches;
     }
     if (!dev) {
       dev = d;
@@ -1230,6 +1242,7 @@ LinuxScan scan_linux_gpu_apps(const std::string& device_hint) {
     }
   }
   if (!dev) return out;
+  out.snap.device_unique = matches == 1 || n == 1;
 
   NvmlMemory mem{};
   if (nv.memory(dev, &mem) != 0 || mem.total == 0) return out;

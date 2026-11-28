@@ -40,6 +40,10 @@ struct GpuAppSnapshot {
   uint64_t others_bytes = 0;  // mem_used minus own_bytes (clamped)
   uint64_t system_bytes = 0;  // local VRAM held by OS desktop/compositor processes (read-only summary)
   std::string idle_igpu;      // optional name of an idle integrated GPU if present
+  // The device the readings are of is the one the hint names and no other could be: the only GPU of its name (the
+  // only one, without a hint).  Identical GPUs are told apart by no name, and the backend reports no PCI or UUID
+  // identity (flyx_device_info), so readings of one of several are not taken for the device a model is on.
+  bool device_unique = false;
   std::vector<GpuApp> apps;   // non-self, non-system apps sorted by bytes descending
 };
 
