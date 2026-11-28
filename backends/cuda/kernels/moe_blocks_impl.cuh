@@ -354,12 +354,26 @@ __global__ void __launch_bounds__(32 * kMoeMmaTileWarps * CT)
   };
   zero_acc();
 
-  auto compute_half = [&](int j, int buf, const uint8_t* wn, const uint16_t* dn) {
+  // A warp's first block of span j, loaded a span ahead: its global load is in flight while the span before computes
+  // (and while the block waits at the span's barrier), not after.
+  struct Ahead {
+    typename F::Raw raw;
+    float s0 = 0.f, s1 = 0.f;
+  };
+  auto load_ahead = [&](Ahead& a, int j, const uint8_t* wn, const uint16_t* dn) {
+    const int base_blk = (32 * j + 8 * wi) / GROUPS;
+    if (j >= spans || base_blk >= blocks) return;
+    a.raw = block_load<F>(wn, dn, size_t(base_blk), t4);
+    a.s0 = scale_of<F>(dn, size_t(base_blk) * F::kScales);
+    a.s1 = F::kScales > 1 ? scale_of<F>(dn, size_t(base_blk) * F::kScales + 1) : 0.f;
+  };
+  auto compute_half = [&](int j, int buf, const uint8_t* wn, const uint16_t* dn, Ahead& ahead) {
     const int base_blk = (32 * j + 8 * wi) / GROUPS;
     if (base_blk >= blocks) return;
-    typename F::Raw cur = block_load<F>(wn, dn, size_t(base_blk), t4);
-    float s0_cur = scale_of<F>(dn, size_t(base_blk) * F::kScales);
-    float s1_cur = F::kScales > 1 ? scale_of<F>(dn, size_t(base_blk) * F::kScales + 1) : 0.f;
+    typename F::Raw cur = ahead.raw;
+    float s0_cur = ahead.s0;
+    float s1_cur = ahead.s1;
+    load_ahead(ahead, j + 1, wn, dn);
 #pragma unroll
     for (int bi = 0; bi < BPW; ++bi) {
       const int b_idx = base_blk + bi;
@@ -436,12 +450,14 @@ __global__ void __launch_bounds__(32 * kMoeMmaTileWarps * CT)
     }
   };
 
+  Ahead ahead;
+  if (n0 < N_work) load_ahead(ahead, 0, wn0, dn0);
   stage(0, 0);
   for (int j = 0; j < spans; ++j) {
     cp_async_wait<0>();
     __syncthreads();
     if (j + 1 < spans) stage(j + 1, (j + 1) & 1);
-    if (n0 < N_work) compute_half(j, j & 1, wn0, dn0);
+    if (n0 < N_work) compute_half(j, j & 1, wn0, dn0, ahead);
   }
 
   // Exact same 32-stream balanced binary tree as k_moe_blocks_q8_dp4a.
@@ -465,15 +481,16 @@ __global__ void __launch_bounds__(32 * kMoeMmaTileWarps * CT)
     const size_t r1_idx = size_t(e) * N_exp + min(n0 + g + I_or_H, N_exp - 1);
     const uint8_t* wn1 = W + r1_idx * blocks * F::kStride;
     const uint16_t* dn1 = D + r1_idx * blocks * F::kScales;
+    if (n0 < N_work) load_ahead(ahead, 0, wn1, dn1);
     if (spans == 1) {
-      if (n0 < N_work) compute_half(0, 0, wn1, dn1);
+      if (n0 < N_work) compute_half(0, 0, wn1, dn1, ahead);
     } else {
       stage(0, 0);
       for (int j = 0; j < spans; ++j) {
         cp_async_wait<0>();
         __syncthreads();
         if (j + 1 < spans) stage(j + 1, (j + 1) & 1);
-        if (n0 < N_work) compute_half(j, j & 1, wn1, dn1);
+        if (n0 < N_work) compute_half(j, j & 1, wn1, dn1, ahead);
       }
     }
 #pragma unroll
