@@ -4174,30 +4174,40 @@ int main(int argc, char** argv) {
                    pick, "rounds of several sequences, plain and each drafter");
       batch_rounds(E, {prompt, other, twice}, {pick.back(), pick.back(), pick.back()},
                    "rounds of three sequences, one plan");
-      // Past 16 rows in all (wide rows): three sequences' widest chains, and twenty sequences' plain rounds and MTP
-      // chains (more sequences than 16).
-      if (E->batch_rows() > FLYX_MAX_ROWS) {
-        size_t widest = E->widths().size();
-        for (size_t i = 0; i < E->widths().size(); ++i)
-          if (E->round_drafters()[i] == 0 && !E->round_trees()[i] && E->widths()[i] + 1 <= FLYX_MAX_ROWS &&
-              (widest == E->widths().size() || E->widths()[i] > E->widths()[widest]))
-            widest = i;
-        if (widest < E->widths().size() && 3 * (E->widths()[widest] + 1) > FLYX_MAX_ROWS)
-          batch_rounds(E, {prompt, other, twice}, {widest, widest, widest},
-                       "a round of three sequences of " + std::to_string(3 * (E->widths()[widest] + 1)) + " rows");
-        std::vector<std::vector<int32_t>> many;
-        for (int i = 0; i < 20; ++i) {
-          auto p = prompt;
-          p[0] = (p[0] + 11 * i) % 300;
-          many.push_back(p);
-        }
-        batch_rounds(E, many, std::vector<size_t>(many.size(), pick.front()), "a round of twenty sequences, plain");
-        size_t mtp1 = E->widths().size();  // MTP's lockstep chains, drafted FLYX_MAX_ROWS sequences at a time
-        for (size_t i = 0; i < E->widths().size(); ++i)
-          if (E->round_name(i) == "mtp 1") mtp1 = i;
-        if (mtp1 < E->widths().size())
-          batch_rounds(E, many, std::vector<size_t>(many.size(), mtp1), "a round of twenty sequences, MTP chains of 1");
+    }
+    if (k == 1 && backend == "cuda") {
+      // Past 16 rows in all (wide rows, lookup's wide rounds lowered beside them: Engine::batch_rows): three sequences'
+      // widest chains, and twenty sequences' plain rounds and MTP chains (more sequences than 16).
+      auto wide = make(model, backend, true, "all", false, "wide=1", true, 512, -1);
+      Engine* W = wide.get();
+      check(W->batch_rows() > FLYX_MAX_ROWS, "wide=1 beside lookup: rounds of several sequences of " +
+                                                 std::to_string(W->batch_rows()) + " rows");
+      size_t plain_round = W->widths().size(), widest = W->widths().size(), mtp1 = W->widths().size();
+      for (size_t i = 0; i < W->widths().size(); ++i) {
+        if (W->widths()[i] == 0 && W->round_drafters()[i] < 0) plain_round = i;
+        if (W->round_drafters()[i] == 0 && !W->round_trees()[i] && W->widths()[i] + 1 <= FLYX_MAX_ROWS &&
+            (widest == W->widths().size() || W->widths()[i] > W->widths()[widest]))
+          widest = i;
+        if (W->round_name(i) == "mtp 1") mtp1 = i;
       }
+      auto other = prompt;
+      other[0] = (other[0] + 7) % 300;
+      auto twice = prompt;
+      twice.insert(twice.end(), prompt.begin(), prompt.end());
+      if (widest < W->widths().size() && 3 * (W->widths()[widest] + 1) > FLYX_MAX_ROWS)
+        batch_rounds(W, {prompt, other, twice}, {widest, widest, widest},
+                     "a round of three sequences of " + std::to_string(3 * (W->widths()[widest] + 1)) + " rows");
+      std::vector<std::vector<int32_t>> many;
+      for (int i = 0; i < 20; ++i) {
+        auto p = prompt;
+        p[0] = (p[0] + 11 * i) % 300;
+        many.push_back(p);
+      }
+      check(plain_round < W->widths().size(), "wide=1 beside lookup: a plain round");
+      if (plain_round < W->widths().size())
+        batch_rounds(W, many, std::vector<size_t>(many.size(), plain_round), "a round of twenty sequences, plain");
+      if (mtp1 < W->widths().size())
+        batch_rounds(W, many, std::vector<size_t>(many.size(), mtp1), "a round of twenty sequences, MTP chains of 1");
     }
     if (k == 1 && backend == "cuda") {  // tree rounds (the reference backend has none)
       SamplingParams greedy, sampled, penalized;

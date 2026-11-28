@@ -62,6 +62,29 @@ void gdn_rows(const BatchPass& bp, const GdnBlock& g, bool fused) {
       return;
     }
   }
+  // Past FLYX_MAX_ROWS rows (the generic producers): each sequence's mixer gdn_round's into the float32 rows the output
+  // GEMM reads, where every sequence's rows fit it (the bits of the convolution, recurrence and gated norm: numerics.md
+  // F), one kernel a sequence for three and the shared gated norm.
+  if (!fused && !g.lora) {
+    bool all_fit = true;
+    for (const Pass& ps : bp.seq) {
+      const GdnBuf& sb = ps.s->gdn[size_t(g.state)];
+      all_fit = all_fit && gdn_round_fits(gd, ps.rows, sb.S, sb.s_stride, v.L);
+    }
+    if (all_fit) {
+      for (size_t i = 0; i < bp.seq.size(); ++i) {
+        const Pass& ps = bp.seq[i];
+        flyx_seq* s = ps.s;
+        GdnBuf& sb = s->gdn[size_t(g.state)];
+        const float* proj = v.b.proj + size_t(bp.first[i]) * v.ld_proj;
+        const int next = ps.p->width == 0 ? kSlotNext : -1;
+        gdn_round(proj, v.ld_proj, g.conv_w, sb.win, sb.w_stride, sb.S, sb.s_stride, next, g.A_log, g.dt_bias,
+                  g.gated.w, g.gated.eps, sb.replay, s->P, ps.rows, v.b.act + size_t(bp.first[i]) * vd, v.L);
+      }
+      gemm(v.b.act, vd, g.w_out, H, vd, v.b.x, H, R, true, v.L);
+      return;
+    }
+  }
   for (size_t i = 0; i < bp.seq.size(); ++i) {  // each sequence's convolution and recurrence, as in a round of its own
     const Pass& ps = bp.seq[i];
     flyx_seq* s = ps.s;
@@ -479,6 +502,40 @@ void mtp_context_rows(const BatchPass& bp, const MtpBlock& b, bool fused) {
   }
 }
 
+// Batched EAGLE-4 context update after a round: its taps' norms, b.fc and its layer's q|k|v over all bp.rows rows (each
+// row the bits solo eagle4_context() gives it), each sequence's gather, ring and K/V on its own rows.
+void eagle4_context_rows(const BatchPass& bp, const Eagle4Block& b) {
+  const RowView& v = bp.v;
+  const flyx_bmodel* m = bp.seq[0].s->m;
+  const auto& E = block<EmbedBlock>(m, b.embed);
+  const AttnBlock& a = b.attn;
+  const int H = b.hidden, Ht = b.target_hidden, R = bp.rows, nh = a.nh, nkv = a.nkv, hd = a.hd, n_in = a.n_in();
+  cudaStream_t st = v.L.st;
+  const Launch& L = v.L;
+  float* taps = v.b.feats + b.feats_offset;
+  for (int t = 0; t < b.n_taps; ++t)
+    rmsnorm(taps + size_t(t) * Ht, v.ld_feats, b.fc_norm[t].w, b.fc_norm[t].offset, b.fc_norm[t].eps,
+            taps + size_t(t) * Ht, v.ld_feats, R, Ht, st);
+  gemm(taps, v.ld_feats, b.fc, H, b.n_taps * Ht, v.b.mhn, H, R, false, L);
+  if (E.blk.data) embed_blocks(v.b.tokens, E.blk, H, v.b.h, R, st);
+  const bf16* table = E.blk.data ? nullptr : E.table;
+  for (const Pass& ps : bp.seq) {
+    const RowView& rv = ps.v;
+    mtp_gather(ps.s->P, kPosStart, true, nullptr, ps.s->ring, rv.b.mhn, H, rv.b.tokens, table, rv.b.h, b.in_norm.w,
+               b.hidden_norm.w, b.in_norm.offset, b.in_norm.eps, H, ps.rows, rv.b.mcat, st);
+    hring_put(ps.s->P, kPosStart, true, rv.b.mhn, H, ps.rows, ps.s->ring, H, st);
+  }
+  // q|k|v into act, a row ld_act apart: each sequence's slice of it (row_needs gives act the layer's n_in at least)
+  gemm(v.b.mcat, 2 * H, a.w_in, n_in, 2 * H, v.b.act, v.ld_act, R, false, L);
+  for (const Pass& ps : bp.seq) {
+    const RowView& rv = ps.v;
+    const KvBuf& kv = ps.s->kv[size_t(a.kv)];
+    attn_prep(rv.b.act, v.ld_act, 0, a.q_width(), a.q_width() + nkv * hd, nullptr, nullptr, 0.f, 0.f, a.theta, a.rot,
+              nh, nkv, hd, ps.rows, ps.s->P, kPosStart, true, rv.b.qbuf, kv.ref(), st, -1, nullptr, 0, CanvasKeys{},
+              a.mrope());
+  }
+}
+
 // Batched DFlash2 context update: shares b.fc and b.ctx across all bp.rows rows (same bits as solo draft_context()).
 void draft_context_rows(const BatchPass& bp, const DFlashBlock& b, bool fused) {
   const RowView& v = bp.v;
@@ -618,11 +675,12 @@ void run_batch(const BatchPass& bp) {
       }
       continue;
     }
-    // Share drafter context GEMMs across all batch rows; DV's canvas pass (a warm-up's: its trees run alone),
-    // DSpark's per-layer K/V + Markov context update and EAGLE-4's context run a sequence at a time below.
+    // Share drafter context GEMMs across all batch rows; DV's canvas pass (a warm-up's: its trees run alone) and
+    // DSpark's per-layer K/V + Markov context update run a sequence at a time below.
     if (n.kind == FLYX_NODE_CONTEXT && !std::holds_alternative<DvBlock>(*b) &&
-        !std::holds_alternative<DSparkBlock>(*b) && !std::holds_alternative<Eagle4Block>(*b)) {
+        !std::holds_alternative<DSparkBlock>(*b)) {
       if (const auto* t = std::get_if<MtpBlock>(b)) mtp_context_rows(bp, *t, fused);
+      else if (const auto* e = std::get_if<Eagle4Block>(b)) eagle4_context_rows(bp, *e);
       else draft_context_rows(bp, std::get<DFlashBlock>(*b), fused);
       continue;
     }
