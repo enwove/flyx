@@ -60,7 +60,7 @@
 
 ## Performance
 
-v0.2.1 decode speed in tokens/s, verified on four GPUs (greedy). **Plain** is decoding with no drafter; the two **Speculative** columns turn the drafter on for chat and for code prompts, with the speedup over plain in parentheses.
+Decode speed in tokens/s, verified on four GPUs (greedy). **Plain** is decoding with no drafter; the two **Speculative** columns turn the drafter on for chat and for code prompts, with the speedup over plain in parentheses.
 
 **Qwen3.8-27B + DFlash2** — chat / mixed: 3 prompts × 128 tokens; code: 1 prompt × 128 tokens.
 
@@ -82,7 +82,7 @@ v0.2.1 decode speed in tokens/s, verified on four GPUs (greedy). **Plain** is de
 
 <sub>**×** is the speedup over plain decoding on the same prompts, from unrounded rates; **Plain** shows the chat / mixed run. Speculative output matched plain decoding token for token in every run that recorded token IDs (all but the Windows Qwen mixed run). Linux, except the RTX 5070 Ti on native Windows 11.</sub>
 
-<sub>**Also measured:** Qwen3.8-27B's built-in **MTP** drafter (no extra file) reaches **286.6 / 158.0 / 121.7 / 167.2 tok/s** on the mixed prompts (5090 / 4090 / 3090 / 5070 Ti). **RTX 5090 `NVFP4`:** W4A4 prefill at **15,496 tok/s**; **203.8 tok/s** with MTP at 128K context (plain: 73.4); **164.5 tok/s** at 256K with **100%** needle retrieval (v0.2.0 run). Hardware, drivers, and exact commands: [docs/benchmarks.md](docs/benchmarks.md#v021-four-gpu-verified-benchmarks).</sub>
+<sub>**Also measured:** Qwen3.8-27B's built-in **MTP** drafter (no extra file) reaches **286.6 / 158.0 / 121.7 / 167.2 tok/s** on the mixed prompts (5090 / 4090 / 3090 / 5070 Ti). **RTX 5090 `NVFP4`:** W4A4 prefill at **15,496 tok/s**; **203.8 tok/s** with MTP at 128K context (plain: 73.4); **164.5 tok/s** at 256K with **100%** needle retrieval. Hardware, drivers, and exact commands: [docs/benchmarks.md](docs/benchmarks.md#decode-and-prefill-on-four-gpus).</sub>
 
 ## Quick Start
 
@@ -158,7 +158,7 @@ print(reply["content"])
 
 | Dimension | Supported | Notes |
 |---|---|---|
-| Architectures | Qwen3.5 / Qwen3.8 (`qwen35`), Qwen3 (`qwen3`), Inkling-2-Mini (`inkling2_loop`, sparse MoE), Llama (MiniCPM5-1B) | Llama from `.flyx` only |
+| Architectures | Qwen3.5 / Qwen3.8 (`qwen35`), Qwen3 (`qwen3`), Inkling-2-Mini (`inkling2_loop`, sparse MoE), gpt-oss-20b / 120b (`gpt-oss`, sparse MoE, GGUF), Llama (MiniCPM5-1B) | Llama from `.flyx` only |
 | Speculative drafters | MTP, DFlash2, DSpark, prompt lookup | MTP and DSpark attach automatically; DFlash2 is a companion file (`--drafter-file`, or **Draft with it** in the dashboard); DSpark pairs with Inkling-2-Mini |
 | Vision | Image input with an `mmproj` projector, fetched automatically from the model's Hub repo | Qwen3.5 / Qwen3.8 today; Inkling-2-Mini is text-only |
 | Model formats | GGUF (`F32`, `F16`, `BF16`, `Q2_0`, `Q4_0–Q8_0`, `Q2_K–Q6_K`, `IQ1–IQ4`, `MXFP4`, GGML `NVFP4`); `.flyx` (BF16, NVFP4; format 2 with the target's own LoRA adapters, V-LoRA, run unmerged; a DV drafter, drafting only when named: `--drafter dv`, [design](docs/design/dv.md)) | Keep all split GGUF parts in the same folder. |

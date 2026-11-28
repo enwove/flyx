@@ -322,6 +322,7 @@ void test_inkling2_attn_res();
 void test_inkling2_loop_ctrl();
 void test_inkling2_loop_control();
 void test_inkling2_linear_f32();
+void test_linear_f32_pass();
 void test_inkling2_shortconv();
 void test_inkling2_sublayer_fusion();
 void test_inkling2_rel_prep_kv_sc();
@@ -329,5 +330,6 @@ void test_inkling2_rel_attn();
 void test_inkling2_rel_strata();
 void test_inkling2_moe();
 void test_dspark();
+void test_gpt_oss();
 
 }  // namespace flyx::optest

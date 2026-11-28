@@ -60,7 +60,7 @@
 
 ## Leistung
 
-Dekodiergeschwindigkeit von v0.2.1 in Token/s, auf vier GPUs verifiziert (greedy). **Normal** ist die Dekodierung ohne Drafter; die beiden Spalten **Spekulativ** schalten den Drafter für Chat- und für Code-Prompts ein, mit der Beschleunigung gegenüber Normal in Klammern.
+Dekodiergeschwindigkeit in Token/s, auf vier GPUs verifiziert (greedy). **Normal** ist die Dekodierung ohne Drafter; die beiden Spalten **Spekulativ** schalten den Drafter für Chat- und für Code-Prompts ein, mit der Beschleunigung gegenüber Normal in Klammern.
 
 **Qwen3.8-27B + DFlash2** — Chat / gemischt: 3 Prompts × 128 Tokens; Code: 1 Prompt × 128 Tokens.
 
@@ -82,7 +82,7 @@ Dekodiergeschwindigkeit von v0.2.1 in Token/s, auf vier GPUs verifiziert (greedy
 
 <sub>**×** ist die Beschleunigung gegenüber der normalen Dekodierung mit denselben Prompts, berechnet aus ungerundeten Raten; **Normal** zeigt den Chat- / gemischten Lauf. Die spekulative Ausgabe stimmte in jedem Lauf, der Token-IDs aufzeichnete, Token für Token mit der normalen Dekodierung überein (alle außer dem gemischten Qwen-Lauf unter Windows). Linux, außer der RTX 5070 Ti unter nativem Windows 11.</sub>
 
-<sub>**Außerdem gemessen:** Der in Qwen3.8-27B integrierte **MTP**-Drafter (keine zusätzliche Datei) erreicht **286.6 / 158.0 / 121.7 / 167.2 tok/s** mit den gemischten Prompts (5090 / 4090 / 3090 / 5070 Ti). **RTX 5090 `NVFP4`:** W4A4-Prefill mit **15 496 tok/s**; **203.8 tok/s** mit MTP bei 128K Kontext (normal: 73.4); **164.5 tok/s** bei 256K mit **100 %** Abruf (v0.2.0-Lauf). Hardware, Treiber und genaue Befehle: [docs/benchmarks.md](../benchmarks.md#v021-four-gpu-verified-benchmarks).</sub>
+<sub>**Außerdem gemessen:** Der in Qwen3.8-27B integrierte **MTP**-Drafter (keine zusätzliche Datei) erreicht **286.6 / 158.0 / 121.7 / 167.2 tok/s** mit den gemischten Prompts (5090 / 4090 / 3090 / 5070 Ti). **RTX 5090 `NVFP4`:** W4A4-Prefill mit **15 496 tok/s**; **203.8 tok/s** mit MTP bei 128K Kontext (normal: 73.4); **164.5 tok/s** bei 256K mit **100 %** Abruf. Hardware, Treiber und genaue Befehle: [docs/benchmarks.md](../benchmarks.md#decode-and-prefill-on-four-gpus).</sub>
 
 ## Schnellstart
 
@@ -158,7 +158,7 @@ print(reply["content"])
 
 | Bereich | Unterstützt | Hinweise |
 |---|---|---|
-| Architekturen | Qwen3.5 / Qwen3.8 (`qwen35`), Qwen3 (`qwen3`), Inkling-2-Mini (`inkling2_loop`, Sparse MoE), Llama (MiniCPM5-1B) | Llama nur aus `.flyx` |
+| Architekturen | Qwen3.5 / Qwen3.8 (`qwen35`), Qwen3 (`qwen3`), Inkling-2-Mini (`inkling2_loop`, Sparse MoE), gpt-oss-20b / 120b (`gpt-oss`, Sparse MoE, GGUF), Llama (MiniCPM5-1B) | Llama nur aus `.flyx` |
 | Spekulative Drafter | MTP, DFlash2, DSpark, Prompt-Lookup | MTP und DSpark werden automatisch angehängt; DFlash2 ist eine Begleitdatei (`--drafter-file` oder **Draft with it** im Dashboard); DSpark gehört zu Inkling-2-Mini |
 | Vision | Bildeingabe mit einem `mmproj`-Projektor, automatisch aus dem Hub-Repository des Modells geladen | Derzeit Qwen3.5 / Qwen3.8; Inkling-2-Mini ist nur Text |
 | Modellformate | GGUF (`F32`, `F16`, `BF16`, `Q4_0–Q8_0`, `Q2_K–Q6_K`, `IQ1–IQ4`, `MXFP4`, `Q2_0`, GGML NVFP4); `.flyx` (BF16, NVFP4; Format 2 mit eigenen LoRA-Adaptern des Zielmodells, V-LoRA, ungemergt ausgeführt; DV-Drafter nur bei expliziter Angabe `--drafter dv`, [Design](../design/dv.md)) | Alle Teile eines geteilten GGUF müssen im selben Ordner liegen. |

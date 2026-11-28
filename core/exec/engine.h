@@ -148,6 +148,11 @@ struct EngineOptions {
   // timings throughout.  FLYX_LEARN_COSTS=0 turns it off.  The output is the same either way.
   bool learn_costs = true;
   bool learn_costs_given = false;
+  // On a GPU, once the load succeeds: prefill passes of 256 rows, then twice as many up to the longest, untimed, so a
+  // prompt's first pass of a length waits for no kernel's module.  FLYX_WARM_PREFILL=0 turns it off.  The output is
+  // the same either way.
+  bool warm_prefill = true;
+  bool warm_prefill_given = false;
   // Automatically step down VRAM-heavy optional features on tight GPUs (vision gpu->disk, draft_weights->nvfp4,
   // drop DFlash2 keeping MTP, drop drafters keeping prompt lookup). Never changes target output tokens.
   // Benchmarks set this to false so measurements never silently alter configuration.
@@ -305,6 +310,8 @@ class Engine {
  private:
   bool load_backend(std::string* err);
   bool build_and_calibrate_plans(double* t_plans, double* t_rounds, std::string* err);
+  // The prompt the load's rounds and prefill warm-up run on: up to 64 tokens of prose.
+  std::vector<int32_t> timing_prompt() const;
   // The plans lowered and their rounds timed (build_and_calibrate_plans), again after each step of what the backend
   // keeps only to run faster (a second copy of the head: the same output, slower; e.g. an 8 GB card beside a desktop)
   // is given back, where lowering finds no room for the prefill buffers; the time over every pass in lower_ms_ and

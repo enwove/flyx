@@ -6,6 +6,7 @@
 #include <stdexcept>
 
 #include "core/interfaces/options.h"
+#include "models/gpt_oss/gpt_oss.h"
 #include "models/inkling2/inkling2.h"
 #include "models/llama/llama.h"
 #include "models/qwen35/qwen35.h"
@@ -305,8 +306,13 @@ int Tables::weight(const std::string& name, std::vector<int64_t> shape, const st
   // ones), bf16 in rounds (finer than its 8 bits).
   const bool fp4 = t->dtype == FLYX_DT_NVFP4 || t->dtype == FLYX_DT_GGML_NVFP4;
   if (flyx_block_values(t->dtype) && !fp4 && !exact_) w.activations = FLYX_ACT_Q8;
+  // Asked for, MXFP4 weights (gpt-oss's experts) take bf16 inputs in prefill and rounds, as vLLM gives them, or MXFP8
+  // ones, as SGLang does, or MXFP8 in prefill and 8 bits in rounds.
+  if (t->dtype == FLYX_DT_GGML_MXFP4 && mxfp4_inputs_ == "bf16") w.activations = FLYX_ACT_BF16;
+  if (t->dtype == FLYX_DT_GGML_MXFP4 && mxfp4_inputs_ == "mxfp8") w.activations = FLYX_ACT_MXFP8;
+  if (t->dtype == FLYX_DT_GGML_MXFP4 && mxfp4_inputs_ == "mxfp8/q8") w.activations = FLYX_ACT_MXFP8_Q8;
   // 3D NVFP4 expert tensors keep bf16 activations (finer than FP4 and row-independent across sparse MoE dispatches).
-  if (fp4 && t->ndim == 2 && !exact_ && nvfp4_inputs_) w.activations = FLYX_ACT_NVFP4;
+  if (fp4 && t->ndim == 2 && !exact_ && nvfp4_inputs_) w.activations = FLYX_ACT_NVFP4_BF16;
   if (t->dtype == FLYX_DT_NVFP4) {
     w.scale = file_->tensor(name + ".scale");
     w.scale2 = file_->tensor(name + ".scale2");
@@ -331,11 +337,18 @@ int Tables::weight(const std::string& name, std::vector<int64_t> shape, const st
 
 bool Tables::set_activations(const std::string& how, const std::string& declared, bool fp4_inputs,
                               std::string* err) {
-  if (!how.empty() && how != "exact" && how != "nvfp4")
-    return *err = "activations: '" + how + "' (exact, nvfp4, or as the file has it)", false;
+  // PREFILL[/DECODE]: the inputs of prefill passes, then of rounds (the same where left out)
+  const size_t slash = how.find('/');
+  const std::string pre = how.substr(0, slash), dec = slash == std::string::npos ? pre : how.substr(slash + 1);
+  const std::string mode = pre == dec ? pre : pre + "/" + dec;
+  if (mode != "" && mode != "exact" && mode != "q8" && mode != "bf16" && mode != "mxfp8" && mode != "mxfp8/q8" &&
+      mode != "nvfp4/bf16")
+    return *err = "activations: '" + how + "' (PREFILL[/DECODE]: q8, bf16, mxfp8, mxfp8/q8, nvfp4/bf16 or exact)",
+           false;
   if (!declared.empty() && declared != "bf16" && declared != "nvfp4")
     return *err = "the file's activations: '" + declared + "' (bf16 or nvfp4)", false;
-  exact_ = how == "exact";
+  exact_ = mode == "exact";
+  mxfp4_inputs_ = mode == "bf16" || mode == "mxfp8" || mode == "mxfp8/q8" ? mode : "";
   // A GGUF file may name tensors whose inputs are not to be rounded to 4 bits (llama.cpp's
   // general.tensor_extra.prec_a4, false for them; by default NVFP4 weights take FP4 inputs on Blackwell). The
   // backend rounds one model's NVFP4 inputs one way, so then none are: finer than llama.cpp for the others. A file
@@ -365,7 +378,7 @@ bool Tables::set_activations(const std::string& how, const std::string& declared
   // weights is what it is without the word, as with "exact" on a bf16 model: a server that switches models keeps it.
   // Otherwise a GPU without FP4 tensor cores gives NVFP4 weights bf16 inputs: finer than the 8 bits llama.cpp gives
   // them there.
-  nvfp4_inputs_ = how == "nvfp4" || (declared != "bf16" && fp4_inputs && !flagged && !other_k);
+  nvfp4_inputs_ = mode == "nvfp4/bf16" || (declared != "bf16" && fp4_inputs && !flagged && !other_k);
   return true;
 }
 
@@ -406,6 +419,7 @@ int Tables::attn_block(const std::string& prefix, const AttnBlockSpec& s, const 
   st.layers = 1;
   st.n_kv = s.n_kv;
   st.head_dim = s.head_dim;
+  st.window = s.window;
   flyx_block b{};
   b.kind = FLYX_BLOCK_ATTN;
   auto& a = b.attn;
@@ -430,6 +444,13 @@ int Tables::attn_block(const std::string& prefix, const AttnBlockSpec& s, const 
   a.kv = state(st);
   for (int i = 0; i < 3; ++i) a.mrope_section[i] = s.mrope_section[i];
   a.mrope_interleaved = s.mrope_interleaved ? 1 : 0;
+  a.q_b = s.bias ? weight(n(prefix + "attn.q.bias"), {q}) : -1;
+  a.k_b = s.bias ? weight(n(prefix + "attn.k.bias"), {kv}) : -1;
+  a.v_b = s.bias ? weight(n(prefix + "attn.v.bias"), {kv}) : -1;
+  a.o_b = s.bias ? weight(n(prefix + "attn.o.bias"), {H}) : -1;
+  a.sinks = s.sinks ? weight(n(prefix + "attn.sinks"), {s.n_heads}) : -1;
+  a.window = s.window;
+  a.rope = s.rope;
   return block(b);
 }
 
@@ -493,6 +514,7 @@ constexpr ArchEntry kArchitectures[] = {
     {"qwen3", llama::open, true, false, "lora"},  // Llama's layer with q/k norms; their own adapters (a V-LoRA)
     {"llama", llama::open, false, false, "lora"},
     {"inkling2_loop", inkling2::open, true, false, nullptr},
+    {"gpt-oss", gpt_oss::open, true, false, nullptr},
 };
 
 }  // namespace

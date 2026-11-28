@@ -60,7 +60,7 @@
 
 ## 实测性能
 
-v0.2.1 解码速度（tok/s，贪心解码），四卡实测。**普通解码**不使用草稿器；两列**投机解码**分别在对话与代码提示上开启草稿器，括号内为相对普通解码的加速比。
+解码速度（tok/s，贪心解码），四卡实测。**普通解码**不使用草稿器；两列**投机解码**分别在对话与代码提示上开启草稿器，括号内为相对普通解码的加速比。
 
 **Qwen3.8-27B + DFlash2** — 对话 / 混合：3 条提示 × 128 token；代码：1 条提示 × 128 token。
 
@@ -82,7 +82,7 @@ v0.2.1 解码速度（tok/s，贪心解码），四卡实测。**普通解码**�
 
 <sub>**×** 为同一组提示上相对普通解码的加速比，按未取整的速度计算；**普通解码**一列取自对话 / 混合测试。凡记录了 token ID 的测试，投机解码的输出均与普通解码逐 token 一致（仅 Windows 上的 Qwen 混合测试未记录 ID）。除 RTX 5070 Ti 为原生 Windows 11 外，其余均为 Linux。</sub>
 
-<sub>**其他实测：** Qwen3.8-27B 内置的 **MTP** 草稿器（无需额外文件）在混合提示上达 **286.6 / 158.0 / 121.7 / 167.2 tok/s**（5090 / 4090 / 3090 / 5070 Ti）。**RTX 5090 `NVFP4`：** W4A4 预填充 **15,496 tok/s**；128K 上下文下 MTP 解码 **203.8 tok/s**（普通解码：73.4）；256K 下 **164.5 tok/s**，大海捞针召回 **100%**（v0.2.0 实测）。硬件、驱动与完整命令见 [docs/benchmarks.md](../benchmarks.md#v021-four-gpu-verified-benchmarks)。</sub>
+<sub>**其他实测：** Qwen3.8-27B 内置的 **MTP** 草稿器（无需额外文件）在混合提示上达 **286.6 / 158.0 / 121.7 / 167.2 tok/s**（5090 / 4090 / 3090 / 5070 Ti）。**RTX 5090 `NVFP4`：** W4A4 预填充 **15,496 tok/s**；128K 上下文下 MTP 解码 **203.8 tok/s**（普通解码：73.4）；256K 下 **164.5 tok/s**，大海捞针召回 **100%**。硬件、驱动与完整命令见 [docs/benchmarks.md](../benchmarks.md#decode-and-prefill-on-four-gpus)。</sub>
 
 ## 快速开始
 
@@ -158,7 +158,7 @@ print(reply["content"])
 
 | 维度 | 支持范围 | 说明 |
 |---|---|---|
-| 模型架构 | Qwen3.5 / Qwen3.8（`qwen35`）、Qwen3（`qwen3`）、Inkling-2-Mini（`inkling2_loop`，稀疏 MoE）、Llama（MiniCPM5-1B） | Llama 仅支持 `.flyx` |
+| 模型架构 | Qwen3.5 / Qwen3.8（`qwen35`）、Qwen3（`qwen3`）、Inkling-2-Mini（`inkling2_loop`，稀疏 MoE）、gpt-oss-20b / 120b（`gpt-oss`，稀疏 MoE，GGUF）、Llama（MiniCPM5-1B） | Llama 仅支持 `.flyx` |
 | 投机草稿器 | MTP、DFlash2、DSpark、提示查找 | MTP 与 DSpark 自动挂载；DFlash2 为配套文件（`--drafter-file`，或控制台中的 **Draft with it**）；DSpark 配合 Inkling-2-Mini 使用 |
 | 视觉 | 配合 `mmproj` 投影器输入图像，投影器自动从模型所在的 Hub 仓库下载 | 目前支持 Qwen3.5 / Qwen3.8；Inkling-2-Mini 仅支持文本 |
 | 模型格式 | GGUF（`F32`、`F16`、`BF16`、`Q4_0–Q8_0`、`Q2_K–Q6_K`、`IQ1–IQ4`、`MXFP4`, `Q2_0`, GGML NVFP4）；`.flyx`（BF16、NVFP4；格式 2 可带目标模型自带的 LoRA 适配器（V-LoRA，不合并运行）；DV 草稿器，仅在指定时起草：`--drafter dv`，[设计](../design/dv.md)） | 分片 GGUF 的所有文件须放在同一目录。 |

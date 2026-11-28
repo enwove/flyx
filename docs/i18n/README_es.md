@@ -60,7 +60,7 @@
 
 ## Rendimiento
 
-Velocidad de decodificación de v0.2.1 en tokens/s, verificada en cuatro GPUs (greedy). **Normal** es la decodificación sin drafter; las dos columnas **Especulativa** activan el drafter en prompts de chat y de código, con la aceleración frente a la normal entre paréntesis.
+Velocidad de decodificación en tokens/s, verificada en cuatro GPUs (greedy). **Normal** es la decodificación sin drafter; las dos columnas **Especulativa** activan el drafter en prompts de chat y de código, con la aceleración frente a la normal entre paréntesis.
 
 **Qwen3.8-27B + DFlash2** — chat / mixto: 3 prompts × 128 tokens; código: 1 prompt × 128 tokens.
 
@@ -82,7 +82,7 @@ Velocidad de decodificación de v0.2.1 en tokens/s, verificada en cuatro GPUs (g
 
 <sub>**×** es la aceleración frente a la decodificación normal con los mismos prompts, calculada con las tasas sin redondear; **Normal** muestra la ejecución de chat / mixto. La salida especulativa coincidió token a token con la decodificación normal en todas las ejecuciones que registraron los IDs de tokens (todas salvo la ejecución mixta de Qwen en Windows). Linux, excepto la RTX 5070 Ti en Windows 11 nativo.</sub>
 
-<sub>**También medido:** el drafter **MTP** integrado en Qwen3.8-27B (sin archivo adicional) alcanza **286.6 / 158.0 / 121.7 / 167.2 tok/s** en los prompts mixtos (5090 / 4090 / 3090 / 5070 Ti). **RTX 5090 `NVFP4`:** prefill W4A4 a **15 496 tok/s**; **203.8 tok/s** con MTP a 128K de contexto (normal: 73.4); **164.5 tok/s** a 256K con **100 %** de recuperación (ejecución de v0.2.0). Hardware, controladores y comandos exactos: [docs/benchmarks.md](../benchmarks.md#v021-four-gpu-verified-benchmarks).</sub>
+<sub>**También medido:** el drafter **MTP** integrado en Qwen3.8-27B (sin archivo adicional) alcanza **286.6 / 158.0 / 121.7 / 167.2 tok/s** en los prompts mixtos (5090 / 4090 / 3090 / 5070 Ti). **RTX 5090 `NVFP4`:** prefill W4A4 a **15 496 tok/s**; **203.8 tok/s** con MTP a 128K de contexto (normal: 73.4); **164.5 tok/s** a 256K con **100 %** de recuperación. Hardware, controladores y comandos exactos: [docs/benchmarks.md](../benchmarks.md#decode-and-prefill-on-four-gpus).</sub>
 
 ## Inicio rápido
 
@@ -158,7 +158,7 @@ print(reply["content"])
 
 | Dimensión | Compatible | Notas |
 |---|---|---|
-| Arquitecturas | Qwen3.5 / Qwen3.8 (`qwen35`), Qwen3 (`qwen3`), Inkling-2-Mini (`inkling2_loop`, MoE disperso), Llama (MiniCPM5-1B) | Llama solo desde `.flyx` |
+| Arquitecturas | Qwen3.5 / Qwen3.8 (`qwen35`), Qwen3 (`qwen3`), Inkling-2-Mini (`inkling2_loop`, MoE disperso), gpt-oss-20b / 120b (`gpt-oss`, MoE disperso, GGUF), Llama (MiniCPM5-1B) | Llama solo desde `.flyx` |
 | Drafters especulativos | MTP, DFlash2, DSpark, búsqueda en el prompt | MTP y DSpark se acoplan automáticamente; DFlash2 es un archivo complementario (`--drafter-file`, o **Draft with it** en el panel); DSpark acompaña a Inkling-2-Mini |
 | Visión | Entrada de imágenes con un proyector `mmproj`, descargado automáticamente del repositorio del modelo en el Hub | Hoy Qwen3.5 / Qwen3.8; Inkling-2-Mini es solo texto |
 | Formatos de modelo | GGUF (`F32`, `F16`, `BF16`, `Q4_0–Q8_0`, `Q2_K–Q6_K`, `IQ1–IQ4`, `MXFP4`, `Q2_0`, GGML NVFP4); `.flyx` (BF16, NVFP4; formato 2 con adaptadores LoRA propios del objetivo, V-LoRA, sin fusionar; drafter DV solo al indicarlo explícitamente con `--drafter dv`, [diseño](../design/dv.md)) | Guarda todas las partes de un GGUF dividido en la misma carpeta. |

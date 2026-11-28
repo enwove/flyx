@@ -257,6 +257,52 @@ void special_spelling_across_modes(Engine& e) {
 
 }  // namespace
 
+// A reply format with no grammar (harmony's, gpt-oss's: replies unconstrained): a request that needs one (a tool
+// call required or forced, a JSON answer) is the request's fault, refused, where optional tools go unconstrained.
+void no_grammar_format(const std::string& model) {
+  EngineOptions o;
+  o.backend = "cpu_ref";
+  o.max_ctx = 512;
+  o.speculative = false;
+  o.chat_template =
+      "{% for m in messages %}<|start|>{{ m.role }}<|message|>{{ m.content }}<|end|>{% endfor %}"
+      "<|start|>assistant<|channel|>final<|message|>";
+  Engine e;
+  std::string err;
+  if (!e.load(model, o, &err)) return (void)check(false, "load " + model + " with a harmony template: " + err);
+  Session s(&e);
+  check(s.init(&err), "a session " + err);
+  Request rq;
+  rq.messages = {msg("user", "What is the weather in Paris?")};
+  rq.tools = {ojson::parse(kWeather)};
+  rq.gen.max_new_tokens = 4;
+  auto refused = [&](const Request& r, const std::string& what) {
+    RenderedChat rc;
+    PreparedRequest p;
+    std::string why;
+    const bool ok = ready(e, s, r, &rc, &p, &why);
+    check(!ok && p.invalid && !why.empty(), "a harmony reply, " + what + ": refused, the request's fault (" + why + ")");
+  };
+  Request required = rq;
+  required.rules.tools = ReplyRules::kRequired;
+  refused(required, "a tool call required");
+  Request forced = rq;
+  forced.rules.tools = ReplyRules::kForced;
+  forced.rules.forced = "get_weather";
+  refused(forced, "a tool call forced");
+  Request json = rq;
+  json.tools.clear();
+  json.rules.json = true;
+  json.rules.schema = ojson{{"type", "object"}};
+  refused(json, "a JSON answer");
+  Request optional = rq;
+  optional.rules.tools = ReplyRules::kAuto;
+  RenderedChat rc;
+  PreparedRequest p;
+  check(ready(e, s, optional, &rc, &p, &err) && !p.grammar && p.parser,
+        "a harmony reply, optional tools: unconstrained, read by its parser " + err);
+}
+
 int main(int argc, char** argv) {
   flyx::test::print_passes = true;
   if (argc < 3) {
@@ -427,6 +473,7 @@ int main(int argc, char** argv) {
   check(!ready(e, s, empty, &rc, &p, &err) && err == "empty prompt", "no prompt at all is refused");
   check(tok.prefix().empty(), "a tokenizer without a post-processor's tokens: no prefix (raw text as it is, above)");
   if (argc > 3) raw_prompt_after_prefix(argv[3]);
+  no_grammar_format(argv[1]);
   special_spelling_across_modes(e);
 
   // Rewriting an early block invalidates its suffix, but we can resume from the natural prefill pass

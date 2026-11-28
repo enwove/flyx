@@ -108,7 +108,7 @@ inline const BlockType kBlockTypes[] = {{FLYX_DT_GGML_IQ2_XXS, "IQ2_XXS"}, {FLYX
                                         {FLYX_DT_GGML_Q5_K, "Q5_K"},       {FLYX_DT_GGML_Q6_K, "Q6_K"},
                                         {FLYX_DT_GGML_Q4_0, "Q4_0"},       {FLYX_DT_GGML_IQ4_NL, "IQ4_NL"},
                                         {FLYX_DT_GGML_Q4_1, "Q4_1"},       {FLYX_DT_GGML_Q5_0, "Q5_0"},
-                                        {FLYX_DT_GGML_Q5_1, "Q5_1"}};
+                                        {FLYX_DT_GGML_Q5_1, "Q5_1"},       {FLYX_DT_GGML_MXFP4, "MXFP4"}};
 inline const char* block_type_name(int dtype) {
   for (const BlockType& t : kBlockTypes)
     if (t.dtype == dtype) return t.name;

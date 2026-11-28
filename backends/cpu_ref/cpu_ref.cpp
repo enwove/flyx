@@ -21,6 +21,7 @@
 #include <string>
 #include <unordered_map>
 #include <unordered_set>
+#include <tuple>
 #include <utility>
 #include <vector>
 
@@ -53,6 +54,8 @@ struct RefModel {
   std::unordered_set<const flyx_tensor_view*> q8;    // ... or, in every pass, as 8-bit integers with a scale per
                                                          // 32 values (FLYX_ACT_Q8)
   std::unordered_set<const flyx_tensor_view*> a4;    // NVFP4 weights whose inputs are NVFP4 in those passes
+  std::unordered_set<const flyx_tensor_view*> amxfp8;  // MXFP4 weights whose inputs are MXFP8 (FLYX_ACT_MXFP8)
+  std::unordered_set<const flyx_tensor_view*> amxfp8_q8;  // ... MXFP8 in passes of more rows, 8 bits in rounds
   mutable std::unordered_map<int, Vec> cache;
   int dflash = -1;  // the tapped drafter's block (DFlash2's, DSpine's or EAGLE-4's), -1: none
   int dspark = -1;  // the DSpark drafter block, -1: none
@@ -107,10 +110,14 @@ double residual_add(const RefModel* M, int rows, double x, double y) {
 // as binary16 over a row's scale, or 8-bit inputs in every pass when the weight says so; NVFP4 weights NVFP4
 // inputs when the weight says so and the engine's GEMM takes more than FLYX_MAX_ROWS rows at once.  This
 // reference computes some layers a row at a time: `rows` are the rows of this call, `gemm_rows` those the engine's
-// GEMM takes together (the pass's, for a layer it runs over the whole pass).
+// GEMM takes together (the pass's, for a layer it runs over the whole pass).  This backend lowers no wide rounds (a
+// round has at most FLYX_MAX_ROWS rows): more rows than that are a prefill pass's.
 void lin(const RefModel* M, int wi, const double* x, int rows, int K, int N, double* y, int gemm_rows) {
   const flyx_tensor_view* w = M->w(wi);
   if (M->q8.count(w)) flyx::ops::linear_a8(x, rows, K, w, N, y);
+  else if (M->amxfp8.count(w)) flyx::ops::linear_amxfp8(x, rows, K, w, N, y);
+  else if (M->amxfp8_q8.count(w) && gemm_rows > FLYX_MAX_ROWS) flyx::ops::linear_amxfp8(x, rows, K, w, N, y);
+  else if (M->amxfp8_q8.count(w)) flyx::ops::linear_a8(x, rows, K, w, N, y);
   else if (gemm_rows > FLYX_MAX_ROWS && M->a4.count(w)) flyx::ops::linear_a4(x, rows, K, w, N, y);
   else if (M->a16h.count(w)) flyx::ops::linear_a16h(x, rows, K, w, N, y);
   else if (M->a16.count(w)) flyx::ops::linear_a16(x, rows, K, w, N, y);
@@ -127,6 +134,9 @@ void lin_expert(const RefModel* M, int wi, int e, const double* x, int K, int N,
   slice.data = static_cast<const double*>(w->data) + size_t(e) * size_t(N) * size_t(K);
   slice.nbytes = uint64_t(N) * uint64_t(K) * sizeof(double);
   if (M->q8.count(w)) flyx::ops::linear_a8(x, 1, K, &slice, N, y);
+  else if (M->amxfp8.count(w)) flyx::ops::linear_amxfp8(x, 1, K, &slice, N, y);
+  else if (M->amxfp8_q8.count(w) && gemm_rows > FLYX_MAX_ROWS) flyx::ops::linear_amxfp8(x, 1, K, &slice, N, y);
+  else if (M->amxfp8_q8.count(w)) flyx::ops::linear_a8(x, 1, K, &slice, N, y);
   else if (gemm_rows > FLYX_MAX_ROWS && M->a4.count(w)) flyx::ops::linear_a4(x, 1, K, &slice, N, y);
   else if (M->a16h.count(w)) flyx::ops::linear_a16h(x, 1, K, &slice, N, y);
   else if (M->a16.count(w)) flyx::ops::linear_a16(x, 1, K, &slice, N, y);
@@ -168,6 +178,19 @@ bool has_mrope(const flyx_attn_block& B) {
 void prep_head(const RefModel* M, const flyx_attn_block& B, const flyx_norm& n, const double* x, int pos,
                double* y, const int32_t* pos_3d = nullptr) {
   const double* w = n.w < 0 ? nullptr : M->vec(n.w).data();
+  if (B.rope.kind == FLYX_ROPE_YARN) {  // YaRN's factors, then q and k each scaled by its mscale (ops/rope/ref.h)
+    if (B.rot_dim != B.head_dim || has_mrope(B)) throw std::runtime_error("YaRN rotary on part of a head or 3D");
+    std::vector<double> inv(size_t(B.rot_dim / 2));
+    flyx::ops::yarn_inv_freq(B.theta, B.rot_dim, B.rope.factor, B.rope.orig_ctx, B.rope.beta_fast, B.rope.beta_slow,
+                             B.rope.truncate != 0, inv.data());
+    if (w) flyx::ops::rmsnorm(x, w, B.head_dim, n.eps, n.offset, y);
+    else if (y != x) std::copy(x, x + B.head_dim, y);
+    flyx::ops::rope_with(y, pos, inv.data(), B.rot_dim);
+    const double ms = flyx::ops::yarn_mscale(B.rope.factor);
+    for (int i = 0; i < B.head_dim; ++i) y[i] *= ms;
+    return;
+  }
+  if (B.rope.kind != FLYX_ROPE_PLAIN) throw std::runtime_error("unknown rotary scaling");
   if (pos_3d && has_mrope(B)) {
     flyx::ops::prep_head_3d(x, w, B.head_dim, n.eps, n.offset, pos_3d[0], pos_3d[1], pos_3d[2], B.theta, B.rot_dim,
                             B.mrope_section, B.mrope_interleaved != 0, y);
@@ -377,6 +400,14 @@ void attn_mixer(RefSeq* s, const flyx_attn_block& B) {
   lora(M, B.lora[FLYX_LIN_Q], h.data(), R, H, qw, qg.data());  // q's and the gate's rows, the weight's layout (open)
   lora(M, B.lora[FLYX_LIN_K], h.data(), R, H, nkv * hd, k.data());
   lora(M, B.lora[FLYX_LIN_V], h.data(), R, H, nkv * hd, v.data());
+  if (B.q_b >= 0 && B.gate) throw std::runtime_error("q biases on a gated attention block");
+  for (auto [bw, y, n] : {std::tuple{B.q_b, &qg, nh * hd}, {B.k_b, &k, nkv * hd}, {B.v_b, &v, nkv * hd}})
+    if (bw >= 0) {
+      const Vec& b = M->vec(bw);
+      for (int r = 0; r < R; ++r)
+        for (int c = 0; c < n; ++c) (*y)[size_t(r) * n + c] += b[size_t(c)];
+    }
+  const double* sinks = B.sinks >= 0 ? M->vec(B.sinks).data() : nullptr;
   Vec& KC = s->K[size_t(B.kv)][0];
   Vec& VC = s->V[size_t(B.kv)][0];
   Vec tmp(hd);
@@ -397,8 +428,13 @@ void attn_mixer(RefSeq* s, const flyx_attn_block& B) {
     const int rope_pos = pos + (has_mrope(B) ? s->rope_delta : 0);
     for (int hh = 0; hh < nh; ++hh) {
       prep_head(M, B, B.q_norm, &qg[size_t(r) * qw + q_at(B, hh)], rope_pos, q.data(), p3);
-      attend(q.data(), KC.data(), VC.data(), pos + 1, nkv, hd, hh / (nh / nkv), 1.0 / std::sqrt(double(hd)),
-             &o[size_t(hh) * hd]);
+      const int from = B.window > 0 ? std::max(0, pos + 1 - B.window) : 0;  // a sliding window's first position
+      if (sinks)
+        attend_range_sink(q.data(), KC.data(), VC.data(), from, pos + 1, nkv, hd, hh / (nh / nkv),
+                          1.0 / std::sqrt(double(hd)), sinks[hh], &o[size_t(hh) * hd]);
+      else
+        attend_range(q.data(), KC.data(), VC.data(), from, pos + 1, nkv, hd, hh / (nh / nkv),
+                     1.0 / std::sqrt(double(hd)), &o[size_t(hh) * hd]);
     }
     if (B.gate)
       for (int hh = 0; hh < nh; ++hh) {
@@ -407,6 +443,8 @@ void attn_mixer(RefSeq* s, const flyx_attn_block& B) {
       }
     lin(M, B.o, o.data(), 1, nh * hd, H, y.data(), R);
     lora(M, B.lora[FLYX_LIN_O], o.data(), 1, nh * hd, H, y.data());
+    if (B.o_b >= 0)
+      for (int c = 0; c < H; ++c) y[c] += M->vec(B.o_b)[size_t(c)];
     for (int c = 0; c < H; ++c) s->x[size_t(r) * H + c] = residual_add(M, R, s->x[size_t(r) * H + c], y[c]);
   }
 }
@@ -611,7 +649,16 @@ void moe_ffn(RefSeq* s, const flyx_moe_block& B, bool verify) {
     norm(M, B.norm, cur.data() + size_t(r) * size_t(H), H, h.data() + size_t(r) * size_t(H));
   Vec r_logits(size_t(R) * size_t(E));
   lin(M, B.router, h.data(), R, H, E, r_logits.data(), R);
+  if (B.router_logit_b >= 0)
+    for (int r = 0; r < R; ++r)
+      for (int e = 0; e < E; ++e) r_logits[size_t(r) * size_t(E) + size_t(e)] += M->vec(B.router_logit_b)[size_t(e)];
   const double* r_bias = B.router_bias >= 0 ? M->vec(B.router_bias).data() : nullptr;
+  if ((B.gate_up >= 0) == (B.gate >= 0) || (B.gate >= 0) != (B.up >= 0))
+    throw std::runtime_error("an MoE block names its gate and up fused or apart, one way");
+  if (B.act == FLYX_MOE_SITU ? !(B.situ_beta > 0.f) : B.act != FLYX_MOE_SWIGLU && B.act != FLYX_MOE_SWIGLU_OAI)
+    throw std::runtime_error("an MoE block's activation out of range");
+  // an expert's bias row (b [E, n]), none where the block names none
+  auto bias = [&](int bw, int e, int n) { return bw >= 0 ? M->vec(bw).data() + size_t(e) * size_t(n) : nullptr; };
 
   Vec moe_raw(size_t(R) * size_t(H), 0.0);
   Vec gu(static_cast<size_t>(2 * I)), act(static_cast<size_t>(I)), down_out(static_cast<size_t>(H));
@@ -623,11 +670,25 @@ void moe_ffn(RefSeq* s, const flyx_moe_block& B, bool verify) {
     double* dst = &moe_raw[size_t(r) * size_t(H)];
     const double* hr = &h[size_t(r) * size_t(H)];
     for (int k = 0; k < K; ++k) {
-      lin_expert(M, B.gate_up, eidx[size_t(k)], hr, H, 2 * I, gu.data(), R);
-      for (int i = 0; i < I; ++i)
-        act[size_t(i)] = B.situ_beta > 0.f ? situ(gu[size_t(i)], gu[size_t(I + i)], B.situ_beta, B.situ_linear_beta)
-                                           : silu(gu[size_t(i)]) * gu[size_t(I + i)];
-      lin_expert(M, B.down, eidx[size_t(k)], act.data(), I, H, down_out.data(), R);
+      const int e = eidx[size_t(k)];
+      if (B.gate_up >= 0) {
+        lin_expert(M, B.gate_up, e, hr, H, 2 * I, gu.data(), R);
+      } else {
+        lin_expert(M, B.gate, e, hr, H, I, gu.data(), R);
+        lin_expert(M, B.up, e, hr, H, I, gu.data() + I, R);
+      }
+      for (auto [b, off] : {std::pair{bias(B.gate_b, e, I), 0}, {bias(B.up_b, e, I), I}})
+        if (b)
+          for (int i = 0; i < I; ++i) gu[size_t(off + i)] += b[i];
+      for (int i = 0; i < I; ++i) {
+        const double g = gu[size_t(i)], u = gu[size_t(I + i)];
+        act[size_t(i)] = B.act == FLYX_MOE_SITU ? situ(g, u, B.situ_beta, B.situ_linear_beta)
+                         : B.act == FLYX_MOE_SWIGLU_OAI ? swiglu_oai(g, u, B.act_alpha, B.act_limit)
+                                                        : silu(g) * u;
+      }
+      lin_expert(M, B.down, e, act.data(), I, H, down_out.data(), R);
+      if (const double* b = bias(B.down_b, e, H))
+        for (int c = 0; c < H; ++c) down_out[size_t(c)] += b[c];
       const double w = ew[size_t(k)];
       for (int c = 0; c < H; ++c) dst[c] += w * down_out[size_t(c)];
     }
@@ -1684,10 +1745,15 @@ int open_model(const flyx_model_desc* desc, const flyx_open_options* opts, flyx_
       v->data = data->data();
       v->nbytes = data->size() * sizeof(double);
       m->W.push_back(v.get());
-      if (blocks) m->a16h.insert(v.get());
-      if (nvfp4 || q_fp4) m->a16.insert(v.get());
+      const bool bf16_in = blocks && w.activations == FLYX_ACT_BF16;  // MXFP4 weights asked for bf16 inputs
+      const bool mxfp8_in = blocks && w.activations == FLYX_ACT_MXFP8;  // ... or MXFP8 ones
+      const bool mxfp8_q8_in = blocks && w.activations == FLYX_ACT_MXFP8_Q8;  // ... in prefill, 8 bits in rounds
+      if (blocks && !bf16_in && !mxfp8_in && !mxfp8_q8_in) m->a16h.insert(v.get());
+      if (nvfp4 || q_fp4 || bf16_in) m->a16.insert(v.get());
+      if (mxfp8_in) m->amxfp8.insert(v.get());
+      if (mxfp8_q8_in) m->amxfp8_q8.insert(v.get());
       if ((blocks && w.activations == FLYX_ACT_Q8) || q_q8) m->q8.insert(v.get());
-      if (nvfp4 && w.activations == FLYX_ACT_NVFP4) m->a4.insert(v.get());
+      if (nvfp4 && w.activations == FLYX_ACT_NVFP4_BF16) m->a4.insert(v.get());
       m->owned.push_back(std::move(data));
       m->owned_views.push_back(std::move(v));
     }

@@ -8,19 +8,51 @@ Reference for supported model architectures (Qwen3.5 / Qwen3.8, Qwen3, Inkling-2
 
 | Format | Supported Architectures | Supported Weight Types | Refused / Unsupported |
 |---|---|---|---|
-| **GGUF** (native, zero conversion) | `qwen35` (Qwen3.5 / Qwen3.8 hybrid GDN + gated attention, plus multimodal vision via `--mmproj` `qwen3vl_merger` `mmproj-*.gguf`), `qwen3` (dense), `inkling2_loop` (Inkling-2 looped ShortConv + RelAttn + sparse MoE) | `F32`, `F16`, `BF16`, `Q2_0`, `Q4_0`, `Q4_1`, `Q5_0`, `Q5_1`, `Q8_0`, `Q2_K`–`Q6_K`, `IQ1_S`, `IQ1_M`, `IQ2_XXS`, `IQ2_XS`, `IQ2_S`, `IQ3_XXS`, `IQ3_S`, `IQ4_NL`, `IQ4_XS`, mixed quants, `MXFP4`, GGML `NVFP4`; a split file (`-00001-of-0000N.gguf`) with all its parts in one folder | Inkling-2 vision towers (`mmproj`), scaled RoPE, Llama GGUFs |
+| **GGUF** (native, zero conversion) | `qwen35` (Qwen3.5 / Qwen3.8 hybrid GDN + gated attention, plus multimodal vision via `--mmproj` `qwen3vl_merger` `mmproj-*.gguf`), `qwen3` (dense), `inkling2_loop` (Inkling-2 looped ShortConv + RelAttn + sparse MoE), `gpt-oss` (gpt-oss-20b / 120b: attention with biases, a learned sink a head, sliding windows of 128 on every other layer and YaRN rotary; sparse MoE with MXFP4 experts, their biases and gpt-oss's clamped SwiGLU; harmony replies: the analysis channel as thinking, messages to `functions.NAME` as tool calls) | `F32`, `F16`, `BF16`, `Q2_0`, `Q4_0`, `Q4_1`, `Q5_0`, `Q5_1`, `Q8_0`, `Q2_K`–`Q6_K`, `IQ1_S`, `IQ1_M`, `IQ2_XXS`, `IQ2_XS`, `IQ2_S`, `IQ3_XXS`, `IQ3_S`, `IQ4_NL`, `IQ4_XS`, mixed quants, `MXFP4`, GGML `NVFP4`; a split file (`-00001-of-0000N.gguf`) with all its parts in one folder | Inkling-2 vision towers (`mmproj`), scaled RoPE (but gpt-oss's YaRN), Llama GGUFs; a gpt-oss .flyx |
 | **`.flyx`** (via `python/convert`) | Qwen3.5 / Qwen3.8, Qwen3, Llama (e.g. MiniCPM5-1B) | `BF16`, NVIDIA ModelOpt `NVFP4` | Vision / MoE; a Llama GGUF |
 
 Inkling-2-Mini stores 24 layers. Running its 12-layer core three times gives 48 effective layer applications. It combines sliding-window and global relative attention, ShortConv and AttnRes with 128 experts, routing each token to eight. Its trained window is 1,048,576 tokens. The usable window depends on available VRAM and host RAM.
 
 Key execution properties:
-- **Packed GGUF blocks:** GGML block weights remain packed on GPU, decoded in registers, and multiplied by 8-bit quantized activations (matching `llama.cpp` precision; `--activations exact` forces exact activations).
+- **Packed GGUF blocks:** GGML block weights remain packed on GPU and are decoded in registers (their inputs: [Precision](#precision)).
 - **Host-resident untied embeddings:** When output head and token embedding are untied (e.g., Qwen3.8-27B's 0.42 GB embedding), the embedding stays in host RAM where under 32 GB of GPU memory are left after the weights, its rows fetched over PCIe at negligible cost; above that it goes to the GPU (`--backend-opt embed=host` or `embed=gpu` chooses).
 - **Vision encoder offload and quantization:** Vision weights (`mmproj-*.gguf`, BF16/F16/F32 or pre-quantized GGML blocks) default to `--vision-device disk` + `--vision-quant q8`: floating-point vision linears are quantized on the fly to `Q8_0` (~46% smaller; 0.50 GB on Qwen3.8-27B, KL 0.00125 / 98.75% top-1 vs BF16 over 800 multimodal positions; pre-quantized `mmproj` files stay packed) and written to an auto-deleted temp file flushed clean to OS Standby/Page Cache (**0 bytes resident VRAM, 0 bytes locked host RAM at KV-budget time** — zero impact on `--kv-ram auto` context capacity). During `encode_vision`, weights stream through a 3-stage pipeline (lazy read-only OS page-cache map → 16 MiB lazy pinned host ring → double-buffered GPU staging) with **bit-identical outputs** to GPU-resident execution (~54–64 ms warm ViT on RTX 5070 Ti). Override with `--vision-device host|gpu|auto` (`host`: pinned host RAM; `auto`: GPU when >= 8 GB free after weights, else `disk`) and `--vision-quant exact|nvfp4` (`exact`: file precision; `nvfp4`: ~70% smaller, opt-in).
 - **GGUF format details:** See [docs/design/gguf.md](design/gguf.md).
 - **Llama (MiniCPM5-1B):** Qwen3's layers without the per-head q/k RMSNorms (`LlamaForCausalLM`), from `.flyx` only (llama.cpp's converter reorders a Llama's q and k rows, so a Llama GGUF is refused). MiniCPM5-1B's pre-tokenizer cuts numbers into groups of three before the Qwen2 split, and its `<s>` goes before every raw prompt as its tokenizer puts it; its chat template renders as transformers renders it (tool calls are not read back yet, so a request with tools is refused). Its K/V cache is binary16 by default: FP8 moved its next-token distributions visibly (KL 0.0064, top-1 97.2%, perplexity +1.4% against binary16), so a Llama keeps binary16 unless `--kv fp8`; Qwen3.5 and Qwen3 keep FP8.
 - **`.flyx` format 2:** a file whose header requires a part a reader must not ignore (`"requires": ["lora"]`, the V-LoRA below) is written as format 2, so builds that read only format 1 refuse it instead of decoding the plain model; every other file stays format 1.
 - **LoRA adapters (PEFT, `--lora DIR|org/name[:FOLDER]`):** an adapter as Hugging Face PEFT saves it (`adapter_config.json`, `adapter_model.safetensors`) runs unmerged beside the model's linears on every pass, its products summed in float32: attention q/k/v/o, MLP gate/up/down and the gated delta net's five in-projections and output (Qwen3, Qwen3.5 / Qwen3.8, Llama; `.flyx` and GGUF, GGML block weights included), any rank, scale alpha / r or alpha / sqrt(r) (rsLoRA). F32 and F16 tensors are rounded to bf16 at load (KL against their float32 products in [numerics](design/numerics.md#against-llamacpp)). Refused with the reason, never run in part: DoRA, ranks or alphas per module, `modules_to_save`, a bias, an activated LoRA (`alora_invocation_tokens`), retrained token embeddings, PiSSA / OLoRA / CorDA / LoftQ initializations not converted on saving (they assume a base those initializations changed), the head's, an embedding's or a vision tower's adapters, layers past the model's, tensors in F8, integers or a pickle (`adapter_model.bin`). The dashboard's LoRA tab lists the ones Hugging Face files for the model's base (`GET /v1/hub/loras`, `GET /v1/hub/lora`: [server](server.md)).
+
+### Precision
+
+`--activations PREFILL[/DECODE]` (or `FLYX_ACTIVATIONS`) names the inputs a weight multiplies in prefill passes (more than 16 rows), then in decoding rounds (1 to 16 rows: plain decoding and verifying drafts); `/DECODE` left out means the same as prefill. Unset, each weight takes what its file says. [Numerics](design/numerics.md#against-llamacpp) holds each choice against llama.cpp's.
+
+| Weights | Unset | `--activations` |
+|---|---|---|
+| `BF16`, `F16` | prefill bf16 (tensor cores); decode three bf16 parts (24 bits: exact products, float32 sums) | — |
+| `F32` matrices (Inkling-2's routers and loop controllers, for one) | float32; bf16 on tensor cores in prefill passes of more than 384 rows or more than 64 outputs | — |
+| GGML blocks (GGUF `Q*`, `IQ*`, `MXFP4`) | `q8`: 8 bits with a scale per 32 (llama.cpp's `q8_1`) | `exact`: binary16 over a row's power-of-two scale |
+| `NVFP4` matrices (ModelOpt `.flyx`, GGML `NVFP4`) | `nvfp4/bf16` on GPUs with FP4 tensor cores unless the file declares bf16; else bf16 | `nvfp4/bf16` whatever the file declares; `exact`: bf16 |
+| `NVFP4` MoE experts (3D) | bf16 | — |
+| `MXFP4` MoE experts (gpt-oss) | `q8` (llama.cpp's) | `bf16` (vLLM's, Marlin); `mxfp8`: e4m3 with a power-of-two scale per 32 (SGLang's, FlashInfer CUTLASS; sm_120); `mxfp8/q8` |
+
+A row gets the same bits in a round of any width (so speculation never changes the output) and in a prefill pass of any length (so a reused prompt prefix continues as a fresh prefill does); prefill and rounds agree within float32 sums, or within their inputs' rounding where they differ (`nvfp4/bf16`, `mxfp8/q8`).
+
+Beside the linears:
+
+- **K/V cache** (`--kv`): FP8 (e4m3, a float32 scale per position and head) where under 32 GB of GPU memory remain after the weights, binary16 above that and on Llama models.
+- **Residual stream:** float32; bf16 in prefill passes of stacks whose every residual add is a W4A4 GEMM.
+- **GDN recurrence:** chunked prefill with bf16 products on sm_86, 89, 120 and 121; float32 elsewhere and in rounds.
+- **LoRA adapters:** bf16 weights, float32 inputs and sums.
+- **Vision encoder** (`--vision-quant`): `q8` (`Q8_0` weights, 8-bit inputs) by default on floating-point `mmproj` files; `exact` keeps the file's type; `nvfp4`.
+
+By model:
+
+| Model | Files | Unset | `--activations` |
+|---|---|---|---|
+| Qwen3.5 / Qwen3.8, Qwen3 | GGUF; `.flyx` `BF16` or `NVFP4` | GGUF `q8`; `NVFP4` files `nvfp4/bf16` (Blackwell) | `exact`, `nvfp4/bf16` |
+| Llama (MiniCPM5-1B) | `.flyx` `BF16` or `NVFP4` | as Qwen3's `.flyx`; binary16 K/V | `exact`, `nvfp4/bf16` |
+| Inkling-2 | GGUF | `q8`; its `F32` matrices as above | `exact` |
+| gpt-oss | GGUF (`MXFP4` experts) | `q8` | `bf16`, `mxfp8`, `mxfp8/q8`, `exact` |
 
 ---
 

@@ -8,6 +8,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <stdexcept>
+#include <type_traits>
 
 #include <cooperative_groups.h>
 
@@ -670,16 +671,21 @@ __global__ void __launch_bounds__(kLoopApplyBlock)
   }
 }
 
-// A warp: one output for NR rows; vectorized 8-element chunks when K % 8 == 0 and aligned (identical order for bf16/f32).
-template <int NR, typename Weight>
+// S warps: one output for NR rows, warp p of them taking K's 8-element chunks p, p + S, ... (a lane every 32 S-th, in
+// order), then the S warps' trees in order (S = 1: a warp an output); vectorized 8-element chunks when K % 8 == 0 and
+// aligned (identical order for bf16/f32).
+template <int NR, int S, typename Weight>
 __global__ void __launch_bounds__(kLoopLinearBlock)
     k_linear_f32(const float* x, int ldx, const Weight* __restrict__ W, int N, int K, float* y, int ldy, int rows,
                  int accumulate) {
   pdl_trigger();
-  const int lane = threadIdx.x & 31, n = blockIdx.x * (kLoopLinearBlock / 32) + (threadIdx.x >> 5);
+  constexpr int kWarps = kLoopLinearBlock / 32;
+  const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5, part = warp % S;
+  const int n = blockIdx.x * (kWarps / S) + warp / S;
   const int r0 = blockIdx.y * NR;
-  if (n >= N) return;
-  const Weight* w = W + size_t(n) * K;
+  if constexpr (S == 1)
+    if (n >= N) return;
+  const Weight* w = W + size_t(min(n, N - 1)) * K;
   const float* xr[NR];
   float acc[NR];
 #pragma unroll
@@ -690,37 +696,125 @@ __global__ void __launch_bounds__(kLoopLinearBlock)
   const bool vec8 =
       (K & 7) == 0 && (ldx & 3) == 0 && (reinterpret_cast<uintptr_t>(W) & 15u) == 0 &&
       (reinterpret_cast<uintptr_t>(x) & 15u) == 0;
-  if (vec8) {
-    const int K8 = K >> 3;
-    for (int k = lane; k < K8; k += 32) {
-      float wv[8];
-      load_w8(w, k, wv);
+  if (n < N) {
+    if (vec8) {
+      const int K8 = K >> 3;
+      for (int k = part * 32 + lane; k < K8; k += 32 * S) {
+        float wv[8];
+        load_w8(w, k, wv);
 #pragma unroll
-      for (int j = 0; j < NR; ++j) {
-        const float4 x0 = reinterpret_cast<const float4*>(xr[j])[2 * k];
-        const float4 x1 = reinterpret_cast<const float4*>(xr[j])[2 * k + 1];
-        float a = acc[j];
-        a = __fmaf_rn(wv[0], x0.x, a); a = __fmaf_rn(wv[1], x0.y, a);
-        a = __fmaf_rn(wv[2], x0.z, a); a = __fmaf_rn(wv[3], x0.w, a);
-        a = __fmaf_rn(wv[4], x1.x, a); a = __fmaf_rn(wv[5], x1.y, a);
-        a = __fmaf_rn(wv[6], x1.z, a); a = __fmaf_rn(wv[7], x1.w, a);
-        acc[j] = a;
+        for (int j = 0; j < NR; ++j) {
+          const float4 x0 = reinterpret_cast<const float4*>(xr[j])[2 * k];
+          const float4 x1 = reinterpret_cast<const float4*>(xr[j])[2 * k + 1];
+          float a = acc[j];
+          a = __fmaf_rn(wv[0], x0.x, a); a = __fmaf_rn(wv[1], x0.y, a);
+          a = __fmaf_rn(wv[2], x0.z, a); a = __fmaf_rn(wv[3], x0.w, a);
+          a = __fmaf_rn(wv[4], x1.x, a); a = __fmaf_rn(wv[5], x1.y, a);
+          a = __fmaf_rn(wv[6], x1.z, a); a = __fmaf_rn(wv[7], x1.w, a);
+          acc[j] = a;
+        }
+      }
+    } else {
+      for (int k = part * 32 + lane; k < K; k += 32 * S) {
+        const float wk = in_value(w + k);
+#pragma unroll
+        for (int j = 0; j < NR; ++j) acc[j] = __fmaf_rn(wk, xr[j][k], acc[j]);
       }
     }
-  } else {
-    for (int k = lane; k < K; k += 32) {
-      const float wk = in_value(w + k);
+  }
+  float v[NR];
 #pragma unroll
-      for (int j = 0; j < NR; ++j) acc[j] = __fmaf_rn(wk, xr[j][k], acc[j]);
-    }
+  for (int j = 0; j < NR; ++j) v[j] = warp_sum(acc[j]);
+  if constexpr (S > 1) {
+    __shared__ float parts[kWarps][NR];
+    if (lane == 0)
+#pragma unroll
+      for (int j = 0; j < NR; ++j) parts[warp][j] = v[j];
+    __syncthreads();
+    if (part != 0 || n >= N) return;
+#pragma unroll
+    for (int j = 0; j < NR; ++j)
+#pragma unroll
+      for (int p = 1; p < S; ++p) v[j] += parts[warp + p][j];
   }
 #pragma unroll
   for (int j = 0; j < NR; ++j) {
-    const float v = warp_sum(acc[j]);
     if (lane == 0 && r0 + j < rows) {
       float* out = y + (size_t(r0) + j) * ldy + n;
-      *out = accumulate ? *out + v : v;
+      *out = accumulate ? *out + v[j] : v[j];
     }
+  }
+}
+
+// A prefill pass's float32 linear of few outputs (linear_f32_pass): a lane an output, 32 a block, the block's 8 warps
+// over K's 8-element chunks (warp p: chunks p, p + 8, ..., 8 FMAs a chunk in K's order), the warps' sums then added in
+// order; TR rows a block read each weight once.  An output's sums are the same whatever TR, the block and the pass's
+// rows: a row has the same bits in a pass of any length.  VEC: K % 8 == 0 and the rows and weights 16-byte aligned
+// (the same order, wider loads).
+constexpr int kPassLinearWarps = 8;
+__device__ __forceinline__ void load_w8_at(const float* w, int k, int K, bool vec, float (&out)[8]) {
+  if (vec) {
+    load_w8(w, k >> 3, out);
+  } else {
+#pragma unroll
+    for (int i = 0; i < 8; ++i) out[i] = k + i < K ? __ldg(w + k + i) : 0.f;
+  }
+}
+__device__ __forceinline__ void load_w8_at(const bf16* w, int k, int K, bool vec, float (&out)[8]) {
+  if (vec) {
+    load_w8(w, k >> 3, out);
+  } else {
+#pragma unroll
+    for (int i = 0; i < 8; ++i) out[i] = k + i < K ? in_value(w + k + i) : 0.f;
+  }
+}
+template <int TR, bool VEC, typename Weight>
+__global__ void __launch_bounds__(32 * kPassLinearWarps)
+    k_linear_f32_pass(const float* x, int ldx, const Weight* __restrict__ W, int N, int K, float* y, int ldy, int rows,
+                      int accumulate) {
+  pdl_trigger();
+  __shared__ float parts[kPassLinearWarps][TR][32];
+  const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
+  const int n = int(blockIdx.x) * 32 + lane, r0 = int(blockIdx.y) * TR;
+  const Weight* w = W + size_t(min(n, N - 1)) * K;
+  float acc[TR];
+#pragma unroll
+  for (int j = 0; j < TR; ++j) acc[j] = 0.f;
+  const int chunks = (K + 7) >> 3;
+#pragma unroll 2
+  for (int c = warp; c < chunks; c += kPassLinearWarps) {
+    const int k = 8 * c;
+    float wv[8];
+    load_w8_at(w, k, K, VEC, wv);
+#pragma unroll
+    for (int j = 0; j < TR; ++j) {
+      const float* xr = x + size_t(min(r0 + j, rows - 1)) * ldx + k;
+      float xv[8];
+      if constexpr (VEC) {
+        const float4 a = *reinterpret_cast<const float4*>(xr), b = *reinterpret_cast<const float4*>(xr + 4);
+        xv[0] = a.x, xv[1] = a.y, xv[2] = a.z, xv[3] = a.w, xv[4] = b.x, xv[5] = b.y, xv[6] = b.z, xv[7] = b.w;
+      } else {
+#pragma unroll
+        for (int i = 0; i < 8; ++i) xv[i] = k + i < K ? xr[i] : 0.f;
+      }
+      float a = acc[j];
+#pragma unroll
+      for (int i = 0; i < 8; ++i)
+        if (VEC || k + i < K) a = __fmaf_rn(wv[i], xv[i], a);
+      acc[j] = a;
+    }
+  }
+#pragma unroll
+  for (int j = 0; j < TR; ++j) parts[warp][j][lane] = acc[j];
+  __syncthreads();
+  for (int i = threadIdx.x; i < TR * 32; i += 32 * kPassLinearWarps) {
+    const int j = i >> 5, col = int(blockIdx.x) * 32 + (i & 31);
+    if (r0 + j >= rows || col >= N) continue;
+    float v = parts[0][j][i & 31];
+#pragma unroll
+    for (int p = 1; p < kPassLinearWarps; ++p) v += parts[p][j][i & 31];
+    float* out = y + size_t(r0 + j) * ldy + col;
+    *out = accumulate ? *out + v : v;
   }
 }
 
@@ -2573,13 +2667,49 @@ void linear_f32(const float* x, int ldx, RoundWeight W, int N, int K, float* y, 
                 cudaStream_t st) {
   if (rows <= 0 || N <= 0) return;
   const int nr = loop_rows(rows), acc = accumulate ? 1 : 0;
-  const dim3 grid(ceil_div(N, kLoopLinearBlock / 32), ceil_div(rows, nr));
+  // Few outputs (a router's): a block's 8 warps on one, else a few blocks would read all of W one warp at a time
+  // (gpt-oss's router, 32 x 2880: 5.2 -> us a round's layer).  N alone decides, so a row's bits are the same in
+  // every row count.
+  const bool split = N <= 128;
+  const dim3 grid(split ? N : ceil_div(N, kLoopLinearBlock / 32), ceil_div(rows, nr));
   auto launch = [&](const auto* w) {
-    switch (nr) {
-      case 1: k_linear_f32<1><<<grid, kLoopLinearBlock, 0, st>>>(x, ldx, w, N, K, y, ldy, rows, acc); break;
-      case 2: k_linear_f32<2><<<grid, kLoopLinearBlock, 0, st>>>(x, ldx, w, N, K, y, ldy, rows, acc); break;
-      default: k_linear_f32<4><<<grid, kLoopLinearBlock, 0, st>>>(x, ldx, w, N, K, y, ldy, rows, acc); break;
-    }
+    auto run = [&](auto S) {
+      switch (nr) {
+        case 1: k_linear_f32<1, S.value><<<grid, kLoopLinearBlock, 0, st>>>(x, ldx, w, N, K, y, ldy, rows, acc); break;
+        case 2: k_linear_f32<2, S.value><<<grid, kLoopLinearBlock, 0, st>>>(x, ldx, w, N, K, y, ldy, rows, acc); break;
+        default:
+          k_linear_f32<4, S.value><<<grid, kLoopLinearBlock, 0, st>>>(x, ldx, w, N, K, y, ldy, rows, acc);
+          break;
+      }
+    };
+    if (split) run(std::integral_constant<int, kLoopLinearBlock / 32>{});
+    else run(std::integral_constant<int, 1>{});
+  };
+  if (W.b16) launch(W.b16);
+  else launch(W.f32);
+}
+
+void linear_f32_pass(const float* x, int ldx, RoundWeight W, int N, int K, float* y, int ldy, int rows, bool accumulate,
+                     cudaStream_t st) {
+  if (rows <= 0 || N <= 0) return;
+  const int acc = accumulate ? 1 : 0;
+  auto launch = [&](const auto* w) {
+    const bool vec = (K & 7) == 0 && (ldx & 3) == 0 && (reinterpret_cast<uintptr_t>(w) & 15u) == 0 &&
+                     (reinterpret_cast<uintptr_t>(x) & 15u) == 0;
+    auto run = [&](auto tr, auto v) {
+      constexpr int TR = decltype(tr)::value;
+      const dim3 grid(ceil_div(N, 32), ceil_div(rows, TR));
+      k_linear_f32_pass<TR, decltype(v)::value><<<grid, 32 * kPassLinearWarps, 0, st>>>(x, ldx, w, N, K, y, ldy, rows,
+                                                                                        acc);
+    };
+    // rows a block: enough blocks for the GPU at short passes, the weights read fewer times at long ones
+    auto pick = [&](auto v) {
+      if (rows <= 512) run(std::integral_constant<int, 2>{}, v);
+      else if (rows <= 4096) run(std::integral_constant<int, 8>{}, v);
+      else run(std::integral_constant<int, 32>{}, v);
+    };
+    if (vec) pick(std::true_type{});
+    else pick(std::false_type{});
   };
   if (W.b16) launch(W.b16);
   else launch(W.f32);

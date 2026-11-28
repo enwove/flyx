@@ -52,6 +52,30 @@ inline void attend_range(const double* q, const double* K, const double* V, int 
   }
 }
 
+// The same with a learned sink (gpt-oss; flyx_attn_block sinks): exp(sink) joins the softmax's denominator, its
+// value read by none.
+inline void attend_range_sink(const double* q, const double* K, const double* V, int k_begin, int k_end, int n_kv,
+                              int hd, int kv_head, double scale, double sink, double* out) {
+  const int n_keys = k_end - k_begin;
+  std::vector<double> s(static_cast<size_t>(n_keys));
+  double mx = sink;
+  for (int j = 0; j < n_keys; ++j) {
+    const double* k = K + (size_t(k_begin + j) * n_kv + kv_head) * hd;
+    double d = 0;
+    for (int i = 0; i < hd; ++i) d += q[i] * k[i];
+    s[size_t(j)] = d * scale;
+    mx = std::max(mx, s[size_t(j)]);
+  }
+  double sum = std::exp(sink - mx);
+  for (int j = 0; j < n_keys; ++j) sum += (s[size_t(j)] = std::exp(s[size_t(j)] - mx));
+  for (int i = 0; i < hd; ++i) out[i] = 0;
+  for (int j = 0; j < n_keys; ++j) {
+    const double* v = V + (size_t(k_begin + j) * n_kv + kv_head) * hd;
+    double p = s[size_t(j)] / sum;
+    for (int i = 0; i < hd; ++i) out[i] += p * v[i];
+  }
+}
+
 // One query head against keys [0, n_keys): K and V are [n_keys, n_kv, hd]; kv head = h / group.
 inline void attend(const double* q, const double* K, const double* V, int n_keys, int n_kv, int hd, int kv_head,
                    double scale, double* out) {

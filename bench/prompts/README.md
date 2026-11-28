@@ -29,7 +29,7 @@ thinking off):
 | `code_short.jsonl` | 1,151 | 8 | `777d118bfb91ceb04cc5a5149731851a` | Short coding requests (a function with tests, JSON, SQL, a class, a shell script: structured text a drafter's long runs show on) |
 | `inkling2_think8.jsonl` | 1,948 | 8 | `fb3614397ed4cc530d4b8f5c53a96cf5` | Eight questions with thinking on, as Inkling-2 token ids (`{"ids": ...}`: its chat template's thinking prompt, rendered) |
 
-`eval_sets.py` writes the prompt sets of [benchmarks](../../docs/benchmarks.md) section 6 (DSpine, DFlash2, MTP)
+`eval_sets.py` writes the prompt sets of [benchmarks](../../docs/benchmarks.md) section 3 (DSpine, DFlash2, MTP)
 from public evaluation sets downloaded with `hf download` (the revisions that section names): the first 30 of GSM8K, MATH-500, HumanEval, MBPP and
 MT-Bench's first turns, as questions (`python -I bench/prompts/eval_sets.py HF_DIR OUT`), and with `--think` the
 first four as token ids with thinking on.

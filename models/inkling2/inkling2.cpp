@@ -244,8 +244,10 @@ Inkling2::LogicalLayer Inkling2::build_logical_layer(int ip, int pass, const Con
   m.norm_weights = 1;
   m.route_scale = float(c.route_scale);
   m.norm_eps = 1e-20f;
+  m.act = FLYX_MOE_SITU;
   m.situ_beta = float(c.situ_beta);
   m.situ_linear_beta = float(c.situ_linear_beta);
+  m.gate = m.up = m.gate_b = m.up_b = m.down_b = m.router_logit_b = -1;
   m.norm = T.norm(blk + "ffn_norm.weight", H, 0.0, c.eps);
   m.router = T.weight(blk + "ffn_gate_inp.weight", {c.n_experts, H});
   m.router_bias = T.has(blk + "exp_probs_b.bias") ? T.weight(blk + "exp_probs_b.bias", {c.n_experts}) : -1;

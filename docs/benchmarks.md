@@ -1,12 +1,29 @@
 # Benchmarks
 
-Reproducible long-context coding, `flyx bench` decode, drafter, and Needle-in-a-Haystack measurements for `flyx` on consumer NVIDIA GPUs with exact hardware, models, and commands.
+Reproducible measurements of `flyx` (decode and prefill, long context and needle recall, speculative drafters, and other engines on the same GPU and prompts) with exact hardware, models, and commands.
+
+Each section is one model, or one family of drafters, on the hardware it was measured on: its setup, the results, notes
+on them, then the commands that reproduce them. Every table names its build, GPU, driver and workload; decoding is
+greedy unless a section says otherwise, rates are tokens a second, and "tokens a round" counts what one
+speculative round accepted. Wherever a section says so, every drafted answer was checked against plain decoding's,
+token for token.
+
+1. [Qwen3.8-27B on consumer GPUs](#1-qwen38-27b-on-consumer-gpus): decode and prefill on four cards, `flyx bench` on six, coding at 262K context, needle recall, DFlash2 ring memory.
+2. [Inkling-2-Mini with DSpark on consumer GPUs](#2-inkling-2-mini-with-dspark-on-consumer-gpus): plain against DSpark decode, prefill, Windows startup.
+3. [Speculative drafters on the RTX PRO 6000](#3-speculative-drafters-on-the-rtx-pro-6000): DSpine, DFlash2, DFlash and MTP on Qwen3.8-27B and Qwen3-8B; EAGLE-4; against Tencent's and SGLang's implementations.
+4. [gpt-oss-20b against llama.cpp, vLLM and SGLang](#4-gpt-oss-20b-against-llamacpp-vllm-and-sglang-rtx-pro-6000): prefill, decode and accuracy for each activation format.
+5. [MiniCPM5-1B with DV](#5-minicpm5-1b-with-dv-rtx-5060-ti-8-gb): DV drafting from private drafter inputs.
+6. [Benchmarking tools in this repo](#6-benchmarking-tools-in-this-repo).
 
 ---
 
-## v0.2.1 four-GPU verified benchmarks
+## 1. Qwen3.8-27B on consumer GPUs
 
-Linux captures used CUDA 13.0.88 on Ubuntu 24.04 with PTX JIT disabled. The hardware table below describes the original `5fa1a32` runs. The RTX 4090 and 3090 Inkling decode results come from a second capture on `078022fc`. Windows measurements used native Windows 11 (WDDM), with Inkling and the dashboard on `5fa1a32`, and Qwen, the 20K ring and cold start on `42e3734` before the Inkling decode changes. The Windows candidate passed 170/170 GPU-suite tests. Its standalone executable contained 115 cubins and zero PTX images and weighed 57,144,832 bytes (57.14 MB), compared with 58,960,384 bytes in v0.2.0. Those four-GPU captures predate the version bump; the RTX 5070 Ti 256K coding rerun below used the tagged `v0.2.1` release binary (`flyx-0.2.1-windows-x86_64-cuda13.exe`, commit `7f0de79`).
+The 27B from the GGUF files a user downloads for each card (the hardware tables name them).
+
+### Decode and prefill on four GPUs
+
+Linux runs used CUDA 13.0.88 on Ubuntu 24.04 with PTX JIT disabled; Windows runs used native Windows 11 (WDDM).
 
 | GPU | Driver | Power limit | Qwen3.8-27B GGUF | GPU weight GB | Effective / rated GB/s | Share |
 |---|---|---:|---|---:|---:|---:|
@@ -17,8 +34,6 @@ Linux captures used CUDA 13.0.88 on Ubuntu 24.04 with PTX JIT disabled. The hard
 
 Effective bandwidth estimates bytes read per token from GPU weight size times plain decode rate. The range was 76.9%–82.4% of rated bandwidth. Verbose Linux runs recorded graph execution for every round, with zero eager fallbacks, including on the 3090 using the compatible sm_80 cubin.
 
-### Qwen3.8-27B
-
 Mixed decode uses the three built-in prompts, 128 tokens each. Linux ran their JSONL equivalents to capture IDs (one warm-up, then the median of three runs). Windows ran the built-in benchmark once per mode. Its mixed record omits token IDs. Linux mixed IDs and all four cards' separate single-code-prompt OFF/ON IDs matched. Each Qwen file includes MTP. DFlash2 used the same Q4_K_M companion on all cards. Rates are tokens/s.
 
 | GPU | Mixed plain | Mixed MTP | Mixed DFlash2 | Mixed all | First code prompt plain / DFlash2 | 5,791-token prefill |
@@ -28,65 +43,11 @@ Mixed decode uses the three built-in prompts, 128 tokens each. Linux ran their J
 | RTX 3090 | 42.8 | 121.7 | 131.2 | 125.0 | 42.8 / 234.1 | 954 |
 | RTX 5070 Ti | 68.8 | 167.2 | 154.4 | 156.1 | 68.8 / 332.8 | — |
 
-On the 6,293-token Inkling prefill workload (same input file, different tokenizer), the 3090, 4090 and 5090 reached 1,829, 3,855 and 5,409 tok/s respectively. These plain prefill timings come from the original candidate.
-
 The 5090 used W4A4 prefill on the NVFP4 target. On the same prompt, explicit `--activations exact` (BF16 inputs) gave 3,602 tok/s on the first pass and 3,598 on the second. At 128,000 input tokens, plain decode reached 73.4 tok/s and MTP reached 203.8 tok/s with identical output text over 256 tokens.
 
-### RTX 5070 Ti 256K coding rerun (v0.2.1 native Windows 11)
+#### Commands for the four-GPU runs
 
-Measured with the official GitHub Release binary `flyx-0.2.1-windows-x86_64-cuda13.exe` (`57,144,832 B` / `57.14 MB`, tag `v0.2.1`, commit `7f0de79`) on an NVIDIA GeForce RTX 5070 Ti (`16,303 MiB` VRAM, `300 W` TDP, driver `610.88`), **native Windows 11 Pro** (`10.0.26300`), and **32 GB system RAM**, running `unsloth/Qwen3.8-27B-GGUF` (`Qwen3.8-27B-UD-IQ3_XXS.gguf`, `10.93 GB`; `10.83 GB` GPU weights + `0.42 GB` host embedding + `0.35 GB` MTP on GPU).
-
-- **Automatic 262K (`--ctx max`) K/V placement (`14.89 GB` WDDM budget):** `16,384` tokens K/V on GPU (`3.71 GB` session VRAM) + `245,760` tokens in host RAM (`9.70 GB` host memory incl. checkpoints); exact K/V reads up to `123,203` tokens (`strata_from=123203`), then 2-bit StrataFlux + exact hot reads *(vs `v0.2.0` WSL2 baseline: `2,048` GPU KV + `260,096` RAM KV, exact up to `34,816`)*.
-- **Decode (`260,051` prompt tokens, 512 new tokens, greedy MTP):** **`113.5 tok/s`** (`512` tokens in `4,501.9 ms`, `106` rounds, `4.82 tok/round`, `6.3 drafts/round`, `lookup 3`) — **1.85× faster (+85%)** than the `v0.2.0` WSL2 baseline (`61.2 tok/s`).
-- **Prefill:** **`787.2 tok/s`** (`330.37 s` / `330,368.9 ms` for `260,051` tokens; vs `v0.2.0` WSL2 `382.49 s` / `679.9 tok/s`).
-- **Needle recall (50% depth at 256K):** **PASS** (verbatim recall: `# Calibration verification passphrase: emerald-falcon-4829`).
-
-| Metric | v0.2.0 WSL2 (`b950329b`) | v0.2.1 Native Win11 (`7f0de79`) | Delta |
-|---|---:|---:|---:|
-| WDDM / GPU KV budget | `13.51 GB` (`2,048` GPU + `260,096` RAM) | `14.89 GB` (`16,384` GPU + `245,760` RAM) | `8×` GPU KV tokens |
-| Exact K/V threshold | `34,816` tokens | `123,203` tokens (`strata_from=123203`) | `3.54×` exact span |
-| 256K prefill (`~260K` tokens) | `382.49 s` (`679.9 tok/s`) | **`330.37 s` (`787.2 tok/s`)** | **`+15.8%`** |
-| 256K decode (512 new, MTP) | `61.2 tok/s` (`3.70 tok/rnd`) | **`113.5 tok/s` (`4.82 tok/rnd`, `6.3 drafts/rnd`)** | **`1.85× (+85%)`** |
-| 256K needle recall (50% depth) | pass | **pass** | — |
-
-Only the 256K coding prompt (with its 50%-depth needle) was rerun on `v0.2.1` native Windows 11; the `1K`/`128K` coding rows and `5/5 + 4/4` NIAH grid in Sections 1 and 3 remain from the `v0.2.0` WSL2 baseline.
-
-```sh
-python bench/prompts/make_coding_prompt.py --flyx ./flyx.exe --model Qwen3.8-27B-UD-IQ3_XXS.gguf --tokens 260000 -o prompt_256k.txt
-./flyx.exe run Qwen3.8-27B-UD-IQ3_XXS.gguf --drafter mtp --ctx max --chat --no-think -n 512 --ignore-eos -v -f prompt_256k.txt
-```
-
-### Inkling-2-Mini and Markov DSpark
-
-The target was `Inkling-2-Mini-UD-IQ3_XXS.gguf`, the companion `dspark-Inkling-2-Mini-Q8_0.gguf`. Each cell shows plain → DSpark decode tok/s on the same GPU, with exact KV reads and lookup disabled. All four GPUs matched prompt IDs, output IDs and output lengths between plain and DSpark for every prompt in the warm-up and three measured runs. The RTX 5090 and 5070 Ti used `5fa1a32`. The 4090 and 3090 used `078022fc`, which rounds the scaled ShortConv result before adding the residual. On each of those two GPUs, the fused and generic paths matched on all eight chat prompts, and all four GPU tests passed (`cuda_ops`, `inkling2_cuda`, `cuda_loader`, `elastic_load_cuda`).
-
-| GPU | chat_short, 8 × 128 | code_short, 8 × 384 |
-|---|---:|---:|
-| RTX 5090 | 225.5 → 259.8 | 228.5 → 438.9 |
-| RTX 4090 | 166.7 → 202.9 | 167.9 → 322.4 |
-| RTX 3090 | 126.2 → 136.5 | 126.9 → 222.0 |
-| RTX 5070 Ti | 150.9 → 169.3 | 153.6 → 276.2 |
-
-The RTX 4090 recheck used a 500 W limit and driver 595.91.07. The RTX 3090 recheck used 350 W and driver 580.178.04. The ranges below cover the three measured runs. Speedups use the unrounded rates. The single-prompt rows used the first `chat_short` prompt (`--limit 1 -n 128`) once per mode.
-
-| GPU | Workload | Plain tok/s (min–max) | DSpark tok/s (min–max) | DSpark tokens/round | Speedup |
-|---|---|---:|---:|---:|---:|
-| RTX 4090 | Chat, 8 × 128 | 166.6–166.7 | 202.7–202.9 | 1.79 | 1.217× |
-| RTX 4090 | Code, 8 × 384 | 167.9–168.0 | 321.6–322.6 | 3.38–3.39 | 1.920× |
-| RTX 4090 | First chat prompt, 1 × 128 | 166.5 | 257.2 | 2.76 | 1.545× |
-| RTX 3090 | Chat, 8 × 128 | 126.1–126.4 | 135.8–139.0 | 1.60–1.67 | 1.082× |
-| RTX 3090 | Code, 8 × 384 | 126.8–127.0 | 220.9–222.7 | 3.48–3.49 | 1.749× |
-| RTX 3090 | First chat prompt, 1 × 128 | 126.1 | 180.1 | 2.82 | 1.429× |
-
-### DFlash2 ring memory and Windows latency
-
-With a 17,993-token prompt and 20,480-token context, single-session memory (decimal GB, flat → ring) fell from 1.87 → 1.51 on the 3090 and 4090, 1.82 → 1.46 on the 5070 Ti (0.36 GB saved), and 1.82 → 1.52 on the 5090. Flat and ring output IDs matched. With 59,976 prompt tokens and a 65,536-token context on the 5090, the same comparison gave 4.24 → 3.02 GB (1.22 GB saved), with identical text and accepted tokens each round.
-
-On the 5070 Ti, three fresh Inkling plain processes with warm OS file cache took 2,381, 2,353 and 2,347 ms from spawn to first visible text (median **2,353 ms**). In a separate live dashboard request the active drafter read **dspark · q8**. The server decoded **237.8 tok/s** (128 tokens, 3.34 tokens/round). Client time to first streamed content was 106 ms.
-
-### Reproduce the captures
-
-Set `Q` to the Qwen file in the hardware table (akopytko's NVFP4 GGUF or Unsloth's UD GGUF), `D` to z-lab's `Qwen3.8-27B-DFlash2-Q4_K_M.gguf`, and `I` and `S` to the two Inkling files above from Unsloth. From the repository root, run the following in Bash. For the Windows mixed timing, omit `--prompts mixed3.jsonl` to use the built-in workload. For repeated measurements, warm up each variant once and alternate their order over three repetitions.
+Set `Q` to the Qwen file in the hardware table (akopytko's NVFP4 GGUF or Unsloth's UD GGUF) and `D` to z-lab's `Qwen3.8-27B-DFlash2-Q4_K_M.gguf`. From the repository root, run the following in Bash. For the Windows mixed timing, omit `--prompts mixed3.jsonl` to use the built-in workload. For repeated measurements, warm up each variant once and alternate their order over three repetitions.
 
 ```bash
 cat > mixed3.jsonl <<'JSONL'
@@ -109,23 +70,136 @@ for mode in plain dflash2; do
   if [[ $mode == dflash2 ]]; then opts=(--drafter dflash2 --drafter-file "$D"); fi
   flyx bench "$Q" "${common[@]}" --prompts bench/prompts/code_short.jsonl --limit 1 --no-lookup "${opts[@]}" -n 128
 done
-for set in chat_short code_short; do
-  n=128
-  if [[ $set == code_short ]]; then n=384; fi
-  for mode in plain dspark; do
-    opts=(--no-spec)
-    if [[ $mode == dspark ]]; then opts=(--drafter dspark --drafter-file "$S"); fi
-    flyx bench "$I" "${common[@]}" --kv-method exact --no-lookup --prompts "bench/prompts/$set.jsonl" --limit 8 -n "$n" "${opts[@]}" --json "$set-$mode.json"
-  done
-done
 runner=(--backend cuda --no-vision --chat --no-think --seed 42 --temperature 0 --ignore-eos)
-for model in "$Q" "$I"; do
-  flyx run "$model" "${runner[@]}" --no-spec --no-lookup --ctx 8192 -f bench/prompts/prompt_6k.txt -n 16
-done
+flyx run "$Q" "${runner[@]}" --no-spec --no-lookup --ctx 8192 -f bench/prompts/prompt_6k.txt -n 16
 flyx run "$Q" "${runner[@]}" --no-spec --ctx 8192 -f bench/prompts/prompt_6k.txt -n 32 --activations exact -v
 python bench/prompts/make_coding_prompt.py --flyx flyx --model "$Q" --tokens 128000 -o long128k.txt
 flyx run "$Q" "${runner[@]}" --ctx 131072 -f long128k.txt --no-spec --no-lookup -n 256 -v
 flyx run "$Q" "${runner[@]}" --ctx 131072 -f long128k.txt --drafter mtp -n 256 -v
+```
+
+### `flyx bench` on six GPUs
+
+On the machines of the [262K coding runs](#coding-at-262k-context) below, across `flyx bench`'s 3 fixed mixed prompts (33..79 tokens, 128 new tokens each, greedy `tok/s`; `--ctx 4096` on 16 GB GPUs):
+
+```sh
+./bin/flyx bench MODEL.gguf --no-spec -n 128 --json
+./bin/flyx bench MODEL.gguf --drafter mtp -n 128 --json
+./bin/flyx bench MODEL.gguf --drafter dflash2 --drafter-file z-lab/Qwen3.8-27B-DFlash2 -n 128 --json
+./bin/flyx bench MODEL.gguf --drafter all     --drafter-file z-lab/Qwen3.8-27B-DFlash2 -n 128 --json
+```
+
+#### RTX 5090 (32 GB, `575 W`, driver `615.71.09`): Drafter Modes (`NVFP4`)
+
+| Model | `flyx` plain | `flyx` + MTP | `flyx` + DFlash2 | `flyx` + both | Best Speedup |
+|---|---:|---:|---:|---:|---:|
+| `NVFP4` (`15.72 GB`) | **94.0** | **282.7** (`4.10 tok/rnd`) | **311.6** (`4.10 tok/rnd`) | **310.3** (`4.28 tok/rnd`) | **3.3x** |
+
+#### All 6 Consumer GPUs: Plain vs Built-In MTP (`flyx bench -n 128`)
+
+| GPU | Model | `flyx` plain (`tok/s`) | `flyx` + MTP (`tok/s`) | Speedup |
+|---|---|---:|---:|---:|
+| **RTX 5090** (32 GB) | `NVFP4` | **94.0** | **282.7** (`4.10 tok/rnd`) | **3.0x** |
+| **RTX 5080** (16 GB) | `UD-IQ3_XXS` | **71.0** | **183.9** (`3.97 tok/rnd`) | **2.6x** |
+| **RTX 5070 Ti** (16 GB, WSL2) | `UD-IQ3_XXS` | **58.6** | **150.4** (`3.93 tok/rnd`) | **2.6x** |
+| **RTX 4090** (24 GB) | `UD-Q4_K_XL` | **49.6** | **154.2** (`4.43 tok/rnd`) | **3.1x** |
+| **RTX 4080** (16 GB) | `UD-IQ3_XXS` | **53.9** | **140.9** (`3.97 tok/rnd`) | **2.6x** |
+| **RTX 3090** (24 GB, 300 W) | `UD-Q4_K_XL` | **41.0** | **108.2** (`4.23 tok/rnd`) | **2.6x** |
+
+Important caveats:
+- **Drafted speed depends on workload predictability.** Code and structured output accept more drafts per round (`5.0–5.9 tok/rnd`) than mixed/prose prompts (`3.9–4.4 tok/rnd`).
+- **Single-user latency focus:** Concurrent requests share decode rounds (`1.12x` aggregate throughput at 2 requests, `1.30x` at 4 requests on 27B 4-bit), but `flyx` is optimized for single-request latency rather than high-concurrency batching.
+
+### Coding at 262K context
+
+Full native context (`--ctx max` = `262,144` tokens), CUDA `13.0`, per-GPU tuning tables, built-in **MTP** speculative decoding (plus `MTP + DFlash2` on RTX 5090 `NVFP4`); the RTX 5070 Ti ran its 256K prompt on native Windows 11 and its 1K and 128K prompts under WSL2:
+
+- **RTX 5090 (Blackwell native FP4):** [`akopytko/Qwen3.8-27B-NVFP4-GGUF`](https://huggingface.co/akopytko/Qwen3.8-27B-NVFP4-GGUF) `Qwen3.8-27B-NVFP4-MTP-N4_0.gguf` (`NVFP4`, `15.72 GB` file, `15.20 GB` GPU weights; 504 GGML NVFP4 tensors executing on native `sm_120a` W4A4 FP4 tensor cores in prefill + built-in MTP).
+- **24 GB GPUs (RTX 4090, RTX 3090):** [`unsloth/Qwen3.8-27B-GGUF`](https://huggingface.co/unsloth/Qwen3.8-27B-GGUF) `UD-Q4_K_XL` (`17.66 GB` file, `17.24 GB` GPU weights).
+- **16 GB GPUs (RTX 5080, RTX 5070 Ti, RTX 4080):** `unsloth/Qwen3.8-27B-GGUF:UD-IQ3_XXS` (`10.93 GB` file).
+
+#### Workload & Reproducible Commands
+
+Each prompt embeds a calibration passphrase at 50% depth inside tracked C++ repository sources (about 1K, 128K and 256K tokens; the results table gives each) and asks the model to recall the passphrase and write a fresh 512-token pure-Python ISO 8601 date/timestamp parser with unit tests (greedy decoding; no repeated Python code in the prompt so prompt-lookup hits stay at 0–3 rounds).
+
+```sh
+# 1. Generate deterministic 1K / 128K / 256K prompts from this repository
+python bench/prompts/make_coding_prompt.py --flyx ./bin/flyx --model MODEL.gguf --tokens 1024   -o prompt_1k.txt
+python bench/prompts/make_coding_prompt.py --flyx ./bin/flyx --model MODEL.gguf --tokens 131072 -o prompt_128k.txt
+python bench/prompts/make_coding_prompt.py --flyx ./bin/flyx --model MODEL.gguf --tokens 260000 -o prompt_256k.txt
+
+# 2. Run greedy coding benchmark at full native 262K context
+./bin/flyx run MODEL.gguf \
+  --drafter mtp --ctx max --chat --no-think -n 512 --ignore-eos -v -f prompt_128k.txt
+```
+
+#### Hardware & Automatic 262K Memory Placement
+
+| GPU | Model | VRAM / TDP / Driver | Automatic 262K (`--ctx max`) K/V placement |
+|---|---|---|---|
+| **RTX 5090** | `NVFP4` (`15.72 GB`) | `32,607 MiB` · `575 W` · driver `615.71.09` | Full `262,144` tokens exact FP8 K/V on GPU (`9.64 GB` VRAM); W4A4 NVFP4 prefill |
+| **RTX 5080** | `UD-IQ3_XXS` (`10.93 GB`) | `16,303 MiB` · `360 W` · driver `610.57.04` | `43,008` tokens on GPU (`4.49 GB`) + `219,136` in RAM (`8.55 GB`); exact to `75,776`, then 2-bit StrataFlux + exact hot reads |
+| **RTX 5070 Ti** (Win11) | `UD-IQ3_XXS` (`10.93 GB`) | `16,303 MiB` · `300 W` · driver `610.88` · 32 GB RAM | `16,384` tokens on GPU (`3.71 GB`, `14.89 GB` WDDM budget) + `245,760` in RAM (`9.70 GB` incl. checkpoints); exact to `123,203` (`strata_from=123203`), then 2-bit StrataFlux + exact hot reads |
+| **RTX 5070 Ti** (WSL2) | `UD-IQ3_XXS` (`10.93 GB`) | `16,303 MiB` · `300 W` · driver `610.88` | `2,048` tokens on GPU (`2.42 GB`, `13.51 GB` WSL2/WDDM budget) + `260,096` in RAM (`10.62 GB`); exact to `34,816`, then 2-bit StrataFlux + exact hot reads |
+| **RTX 4090** | `UD-Q4_K_XL` (`17.66 GB`) | `24,564 MiB` · `450 W` · driver `590.48.01` | `88,064` tokens on GPU + `174,080` in RAM; exact to `120,832`, then 2-bit StrataFlux + exact hot reads |
+| **RTX 4080** | `UD-IQ3_XXS` (`10.93 GB`) | `16,376 MiB` · `340 W` · driver `580.178.04` | `43,008` tokens on GPU (`4.49 GB`) + `219,136` in RAM (`8.55 GB`); exact to `75,776`, then 2-bit StrataFlux + exact hot reads |
+| **RTX 3090** | `UD-Q4_K_XL` (`17.66 GB`) | `24,576 MiB` · `300 W` cap · driver `595.58.03` | `92,160` tokens on GPU (`6.14 GB`) + `169,984` in RAM (`6.94 GB`); exact to `124,928`, then 2-bit StrataFlux + exact hot reads |
+
+#### Coding Results Across RTX 50 / 40 / 30 Series (Greedy, 512 New Tokens)
+
+| GPU | Model & Drafter | Context (prompt tokens) | Prefill | Prefill (`tok/s`) | Decode (`tok/s`) | `tok/rnd` (`drafts/rnd`) | Needle recall |
+|---|---|---|---:|---:|---:|---:|:---:|
+| **RTX 5090** (32 GB) | `NVFP4` + MTP | 1K (`1,022`) | **`0.06 s`** | **`17,090.3`** | **350.2** | `5.27` (`6.8`) | pass |
+| **RTX 5090** (32 GB) | `NVFP4` + MTP | 128K (`131,081`) | **`29.70 s`** | **`4,414.0`** | **228.7** | `5.27` (`7.0`) | pass |
+| **RTX 5090** (32 GB) | `NVFP4` + MTP | 256K (`260,049`) | **`103.09 s`** | **`2,522.5`** | **164.5** | `4.96` (`6.8`) | pass |
+| **RTX 5090** (32 GB) | `NVFP4` + MTP & DFlash2 | 1K (`1,022`) | `0.10 s` | `9,883.9` | **365.0** | `5.06` (`6.7`) | pass |
+| **RTX 5090** (32 GB) | `NVFP4` + MTP & DFlash2 | 128K (`131,081`) | `30.06 s` | `4,361.1` | **273.1** | `5.74` (`7.0`) | pass |
+| **RTX 5080** (16 GB) | `UD-IQ3_XXS` + MTP | 1K (`1,022`) | `0.44 s` | `2,312.7` | **225.9** | `5.06` (`6.2`) | pass |
+| **RTX 5080** (16 GB) | `UD-IQ3_XXS` + MTP | 128K (`131,081`) | `100.64 s` | `1,302.4` | **161.0** | `5.27` (`6.7`) | pass |
+| **RTX 5080** (16 GB) | `UD-IQ3_XXS` + MTP | 256K (`260,049`) | `283.49 s` | `917.3` | **105.8** | `3.84` (`5.6`) | pass |
+| **RTX 5070 Ti** (16 GB, WSL2) | `UD-IQ3_XXS` + MTP | 1K (`1,022`) | `0.63 s` | `1,611.2` | **167.4** | `4.48` (`5.0`) | pass |
+| **RTX 5070 Ti** (16 GB, WSL2) | `UD-IQ3_XXS` + MTP | 128K (`131,081`) | `135.09 s` | `970.3` | **104.6** | `5.21` (`6.5`) | pass |
+| **RTX 5070 Ti** (16 GB, Win11) | `UD-IQ3_XXS` + MTP | 256K (`260,051`) | `330.37 s` | `787.2` | **113.5** | `4.82` (`6.3`) | pass |
+| **RTX 4090** (24 GB) | `UD-Q4_K_XL` + MTP | 1K (`1,022`) | `0.37 s` | `2,763.7` | **193.6** | `5.94` (`9.0`) | pass |
+| **RTX 4090** (24 GB) | `UD-Q4_K_XL` + MTP | 128K (`131,081`) | `85.10 s` | `1,540.4` | **155.9** | `5.94` (`8.3`) | pass |
+| **RTX 4090** (24 GB) | `UD-Q4_K_XL` + MTP | 256K (`260,049`) | `241.20 s` | `1,078.2` | **122.7** | `5.06` (`6.9`) | pass |
+| **RTX 4080** (16 GB) | `UD-IQ3_XXS` + MTP | 1K (`1,022`) | `0.55 s` | `1,864.3` | **172.3** | `5.11` (`6.1`) | pass |
+| **RTX 4080** (16 GB) | `UD-IQ3_XXS` + MTP | 128K (`131,081`) | `127.00 s` | `1,032.2` | **111.0** | `4.29` (`5.9`) | pass |
+| **RTX 4080** (16 GB) | `UD-IQ3_XXS` + MTP | 256K (`260,049`) | `358.46 s` | `725.5` | **99.0** | `4.69` (`6.4`) | pass |
+| **RTX 3090** (24 GB, 300 W) | `UD-Q4_K_XL` + MTP | 1K (`1,022`) | `1.15 s` | `888.1` | **135.8** | `5.49` (`7.6`) | pass |
+| **RTX 3090** (24 GB, 300 W) | `UD-Q4_K_XL` + MTP | 128K (`131,081`) | `254.71 s` | `514.6` | **97.5** | `5.55` (`7.3`) | pass |
+| **RTX 3090** (24 GB, 300 W) | `UD-Q4_K_XL` + MTP | 256K (`260,049`) | `694.67 s` | `374.3` | **68.1** | `4.41` (`6.4`) | pass |
+
+Note: the RTX 5070 Ti's 256K row (`512` tokens in `4,501.9 ms`, `106` rounds, `lookup 3`) ran on native Windows 11 Pro (`10.0.26300`, 32 GB RAM) with `flyx.exe`; it recalled the needle verbatim (`# Calibration verification passphrase: emerald-falcon-4829`).
+
+### Needle-in-a-Haystack recall
+
+To verify that neither default FP8 K/V nor tiered Host-RAM + 2-bit StrataFlux attention degrades long-range retrieval, we verified single-needle recall (`5%`, `25%`, `50%`, `75%`, `95%` depths across `32K–256K` plus `1K / 128K / 256K` 50%-depth recall on every GPU) and 4-needle simultaneous retrieval at `256K` (`ALPHA` / `BETA` / `GAMMA` / `DELTA` embedded at `10%`, `35%`, `65%`, `90%` depth): **51/51 (100%) exact recall across all 6 consumer GPUs, zero failures**. The RTX 5070 Ti's grids ran under WSL2.
+
+```sh
+# Generate and run the 256K 4-needle NIAH prompt
+python bench/prompts/make_coding_prompt.py --flyx ./bin/flyx --model MODEL.gguf --tokens 260000 --multi-needle -o niah_256k.txt
+./bin/flyx run MODEL.gguf --drafter mtp --ctx max --chat --no-think -n 96 -v -f niah_256k.txt
+```
+
+| GPU | Model & K/V Attention Mode | Single-Needle Recall | Multi-Needle at 256K (4 keys) | Total |
+|---|---|---:|---:|---:|
+| **RTX 5090** (32 GB) | `NVFP4` · Full 262K GPU exact FP8 | `3/3` (`1K / 128K / 256K` @ `50%`) | `4/4` | **7/7 (100%)** |
+| **RTX 5080** (16 GB) | `UD-IQ3_XXS` · 43K GPU + 219K RAM, 2-bit StrataFlux > 75K | `5/5` (`256K` @ `5%–95%`) | — | **5/5 (100%)** |
+| **RTX 5070 Ti** (16 GB, WSL2) | `UD-IQ3_XXS` · 2K GPU + 260K RAM, 2-bit StrataFlux > 34K | `5/5` (`256K` @ `5%–95%`) | `4/4` | **9/9 (100%)** |
+| **RTX 4090** (24 GB) | `UD-Q4_K_XL` · 88K GPU + 174K RAM, 2-bit StrataFlux > 120K | `20/20` (`32K–256K` @ `5%–95%`) | `4/4` | **24/24 (100%)** |
+| **RTX 4080** (16 GB) | `UD-IQ3_XXS` · 43K GPU + 219K RAM, 2-bit StrataFlux > 75K | `3/3` (`1K / 128K / 256K` @ `50%`) | — | **3/3 (100%)** |
+| **RTX 3090** (24 GB, 300 W) | `UD-Q4_K_XL` · 92K GPU + 170K RAM, 2-bit StrataFlux > 124K | `3/3` (`1K / 128K / 256K` @ `50%`) | — | **3/3 (100%)** |
+
+### DFlash2 ring memory
+
+With a 17,993-token prompt and 20,480-token context, single-session memory (decimal GB, flat → ring) fell from 1.87 → 1.51 on the 3090 and 4090, 1.82 → 1.46 on the 5070 Ti (0.36 GB saved), and 1.82 → 1.52 on the 5090. Flat and ring output IDs matched. With 59,976 prompt tokens and a 65,536-token context on the 5090, the same comparison gave 4.24 → 3.02 GB (1.22 GB saved), with identical text and accepted tokens each round.
+
+With `Q` and `D` as in the [four-GPU commands](#commands-for-the-four-gpu-runs) above, the 60K comparison:
+
+```bash
+export CUDA_DISABLE_PTX_JIT=1
+runner=(--backend cuda --no-vision --chat --no-think --seed 42 --temperature 0 --ignore-eos)
 python bench/prompts/make_coding_prompt.py --flyx flyx --model "$Q" --tokens 60000 -o long60k.txt
 for ring in 0 1; do
   flyx run "$Q" "${runner[@]}" --ctx 65536 -f long60k.txt --drafter dflash2 --drafter-file "$D" --no-lookup --backend-opt dflash_ring="$ring" -n 256 -v
@@ -149,6 +223,62 @@ for ring in 0 1; do
 done
 ```
 
+---
+
+## 2. Inkling-2-Mini with DSpark on consumer GPUs
+
+On the four GPUs of [section 1's hardware table](#decode-and-prefill-on-four-gpus).
+
+### Decode: plain against Markov DSpark
+
+The target was `Inkling-2-Mini-UD-IQ3_XXS.gguf`, the companion `dspark-Inkling-2-Mini-Q8_0.gguf`. Each cell shows plain → DSpark decode tok/s on the same GPU, with exact KV reads and lookup disabled. All four GPUs matched prompt IDs, output IDs and output lengths between plain and DSpark for every prompt in the warm-up and three measured runs. On the 4090 and 3090 the fused and generic paths matched on all eight chat prompts.
+
+| GPU | chat_short, 8 × 128 | code_short, 8 × 384 |
+|---|---:|---:|
+| RTX 5090 | 225.5 → 259.8 | 228.5 → 438.9 |
+| RTX 4090 | 166.7 → 202.9 | 167.9 → 322.4 |
+| RTX 3090 | 126.2 → 136.5 | 126.9 → 222.0 |
+| RTX 5070 Ti | 150.9 → 169.3 | 153.6 → 276.2 |
+
+The RTX 4090 Inkling runs used a 500 W limit and driver 595.91.07, the RTX 3090 Inkling runs 350 W and driver 580.178.04. The ranges below cover the three measured runs. Speedups use the unrounded rates. The single-prompt rows used the first `chat_short` prompt (`--limit 1 -n 128`) once per mode.
+
+| GPU | Workload | Plain tok/s (min–max) | DSpark tok/s (min–max) | DSpark tokens/round | Speedup |
+|---|---|---:|---:|---:|---:|
+| RTX 4090 | Chat, 8 × 128 | 166.6–166.7 | 202.7–202.9 | 1.79 | 1.217× |
+| RTX 4090 | Code, 8 × 384 | 167.9–168.0 | 321.6–322.6 | 3.38–3.39 | 1.920× |
+| RTX 4090 | First chat prompt, 1 × 128 | 166.5 | 257.2 | 2.76 | 1.545× |
+| RTX 3090 | Chat, 8 × 128 | 126.1–126.4 | 135.8–139.0 | 1.60–1.67 | 1.082× |
+| RTX 3090 | Code, 8 × 384 | 126.8–127.0 | 220.9–222.7 | 3.48–3.49 | 1.749× |
+| RTX 3090 | First chat prompt, 1 × 128 | 126.1 | 180.1 | 2.82 | 1.429× |
+
+### Prefill
+
+On the 6,293-token Inkling prefill workload (same input file, different tokenizer), the 3090, 4090 and 5090 reached 1,829, 3,855 and 5,409 tok/s respectively.
+
+### Windows startup and dashboard latency
+
+On the 5070 Ti, three fresh Inkling plain processes with warm OS file cache took 2,381, 2,353 and 2,347 ms from spawn to first visible text (median **2,353 ms**). In a separate live dashboard request the active drafter read **dspark · q8**. The server decoded **237.8 tok/s** (128 tokens, 3.34 tokens/round). Client time to first streamed content was 106 ms.
+
+### Commands
+
+Set `I` and `S` to the two Inkling files above from Unsloth, and run the following in Bash from the repository root. For repeated measurements, warm up each variant once and alternate their order over three repetitions.
+
+```bash
+export CUDA_DISABLE_PTX_JIT=1
+common=(--backend cuda --no-vision --ctx 4096 --temperature 0 --seed 42 --ignore-eos)
+for set in chat_short code_short; do
+  n=128
+  if [[ $set == code_short ]]; then n=384; fi
+  for mode in plain dspark; do
+    opts=(--no-spec)
+    if [[ $mode == dspark ]]; then opts=(--drafter dspark --drafter-file "$S"); fi
+    flyx bench "$I" "${common[@]}" --kv-method exact --no-lookup --prompts "bench/prompts/$set.jsonl" --limit 8 -n "$n" "${opts[@]}" --json "$set-$mode.json"
+  done
+done
+runner=(--backend cuda --no-vision --chat --no-think --seed 42 --temperature 0 --ignore-eos)
+flyx run "$I" "${runner[@]}" --no-spec --no-lookup --ctx 8192 -f bench/prompts/prompt_6k.txt -n 16
+```
+
 To repeat the Windows startup measurement, time the process through its first visible reply with the OS cache warm. For the live measurement, start the server below and stream a chat completion for `Write a detailed Python ISO 8601 parser with unit tests. Start with code.` with thinking disabled, temperature 0, seed 42 and a 128-token limit.
 
 ```bash
@@ -156,212 +286,16 @@ flyx run "$I" --backend cuda --ctx 4096 --no-spec --no-lookup --chat --no-think 
 flyx serve "$I" --drafter dspark --drafter-file "$S" --no-lookup --ctx 4096 --host 127.0.0.1 --port 18080 --no-browser --no-monitor
 ```
 
-## Historical v0.2.0 results
-
-Sections 1–3 below preserve the original six-card measurements on `b950329b`, including the WSL2 run, alongside the updated `v0.2.1` native Windows 11 RTX 5070 Ti 256K rerun (`7f0de79`, **`113.5 tok/s`**) in Sections 1 and 3. The independent DV study in section 5 uses a different model and workload.
-
-## 1. Qwen3.8-27B Long-Context Coding Benchmark
-
-Except for the `v0.2.1` native Windows 11 RTX 5070 Ti 256K rerun (`flyx-0.2.1-windows-x86_64-cuda13.exe`, tag `v0.2.1`, commit `7f0de79`), all rows below were measured on the same `release-linux` build (`flyx 0.2.0`, commit `b950329b`, CUDA `13.0`, per-GPU tuning tables) at full native context (`--ctx max` = `262,144` tokens) with built-in **MTP** speculative decoding (plus `MTP + DFlash2` on RTX 5090 `NVFP4`):
-
-- **RTX 5090 (Blackwell native FP4):** [`akopytko/Qwen3.8-27B-NVFP4-GGUF`](https://huggingface.co/akopytko/Qwen3.8-27B-NVFP4-GGUF) `Qwen3.8-27B-NVFP4-MTP-N4_0.gguf` (`NVFP4`, `15.72 GB` file, `15.20 GB` GPU weights; 504 GGML NVFP4 tensors executing on native `sm_120a` W4A4 FP4 tensor cores in prefill + built-in MTP).
-- **24 GB GPUs (RTX 4090, RTX 3090):** [`unsloth/Qwen3.8-27B-GGUF`](https://huggingface.co/unsloth/Qwen3.8-27B-GGUF) `UD-Q4_K_XL` (`17.66 GB` file, `17.24 GB` GPU weights).
-- **16 GB GPUs (RTX 5080, RTX 5070 Ti, RTX 4080):** `unsloth/Qwen3.8-27B-GGUF:UD-IQ3_XXS` (`10.93 GB` file; `10.72 GB` GPU weights on `v0.2.0`, `10.83 GB` GPU weights + `0.42 GB` host embedding + `0.35 GB` MTP on GPU on `v0.2.1` Win11).
-
-### Workload & Reproducible Commands
-
-Each prompt embeds a calibration passphrase at 50% depth inside tracked C++ repository sources (`1,022` / `131,081` / `260,049` tokens on `v0.2.0`; `260,051` tokens on the `v0.2.1` rerun) and asks the model to recall the passphrase and write a fresh 512-token pure-Python ISO 8601 date/timestamp parser with unit tests (greedy decoding; no repeated Python code in the prompt so prompt-lookup hits stay at 0–3 rounds).
-
-```sh
-# 1. Generate deterministic 1K / 128K / 256K prompts from this repository
-python bench/prompts/make_coding_prompt.py --flyx ./bin/flyx --model MODEL.gguf --tokens 1024   -o prompt_1k.txt
-python bench/prompts/make_coding_prompt.py --flyx ./bin/flyx --model MODEL.gguf --tokens 131072 -o prompt_128k.txt
-python bench/prompts/make_coding_prompt.py --flyx ./bin/flyx --model MODEL.gguf --tokens 260000 -o prompt_256k.txt
-
-# 2. Run greedy coding benchmark at full native 262K context
-./bin/flyx run MODEL.gguf \
-  --drafter mtp --ctx max --chat --no-think -n 512 --ignore-eos -v -f prompt_128k.txt
-```
-
-### Hardware & Automatic 262K Memory Placement
-
-| GPU | Model | VRAM / TDP / Driver | Automatic 262K (`--ctx max`) K/V placement |
-|---|---|---|---|
-| **RTX 5090** | `NVFP4` (`15.72 GB`) | `32,607 MiB` · `575 W` · driver `615.71.09` | Full `262,144` tokens exact FP8 K/V on GPU (`9.64 GB` VRAM); W4A4 NVFP4 prefill |
-| **RTX 5080** | `UD-IQ3_XXS` (`10.93 GB`) | `16,303 MiB` · `360 W` · driver `610.57.04` | `43,008` tokens on GPU (`4.49 GB`) + `219,136` in RAM (`8.55 GB`); exact to `75,776`, then 2-bit StrataFlux + exact hot reads |
-| **RTX 5070 Ti** (Win11, v0.2.1) | `UD-IQ3_XXS` (`10.93 GB`) | `16,303 MiB` · `300 W` · driver `610.88` · 32 GB RAM | `16,384` tokens on GPU (`3.71 GB`, `14.89 GB` WDDM budget) + `245,760` in RAM (`9.70 GB` incl. checkpoints); exact to `123,203` (`strata_from=123203`), then 2-bit StrataFlux + exact hot reads |
-| **RTX 5070 Ti** (WSL2, v0.2.0) | `UD-IQ3_XXS` (`10.93 GB`) | `16,303 MiB` · `300 W` · driver `610.88` | `2,048` tokens on GPU (`2.42 GB`, `13.51 GB` WSL2/WDDM budget) + `260,096` in RAM (`10.62 GB`); exact to `34,816`, then 2-bit StrataFlux + exact hot reads |
-| **RTX 4090** | `UD-Q4_K_XL` (`17.66 GB`) | `24,564 MiB` · `450 W` · driver `590.48.01` | `88,064` tokens on GPU + `174,080` in RAM; exact to `120,832`, then 2-bit StrataFlux + exact hot reads |
-| **RTX 4080** | `UD-IQ3_XXS` (`10.93 GB`) | `16,376 MiB` · `340 W` · driver `580.178.04` | `43,008` tokens on GPU (`4.49 GB`) + `219,136` in RAM (`8.55 GB`); exact to `75,776`, then 2-bit StrataFlux + exact hot reads |
-| **RTX 3090** | `UD-Q4_K_XL` (`17.66 GB`) | `24,576 MiB` · `300 W` cap · driver `595.58.03` | `92,160` tokens on GPU (`6.14 GB`) + `169,984` in RAM (`6.94 GB`); exact to `124,928`, then 2-bit StrataFlux + exact hot reads |
-
-### Coding Results Across RTX 50 / 40 / 30 Series (Greedy, 512 New Tokens)
-
-| GPU | Model & Drafter | Context (prompt tokens) | Prefill | Prefill (`tok/s`) | Decode (`tok/s`) | `tok/rnd` (`drafts/rnd`) | Needle recall |
-|---|---|---|---:|---:|---:|---:|:---:|
-| **RTX 5090** (32 GB) | `NVFP4` + MTP | 1K (`1,022`) | **`0.06 s`** | **`17,090.3`** | **350.2** | `5.27` (`6.8`) | pass |
-| **RTX 5090** (32 GB) | `NVFP4` + MTP | 128K (`131,081`) | **`29.70 s`** | **`4,414.0`** | **228.7** | `5.27` (`7.0`) | pass |
-| **RTX 5090** (32 GB) | `NVFP4` + MTP | 256K (`260,049`) | **`103.09 s`** | **`2,522.5`** | **164.5** | `4.96` (`6.8`) | pass |
-| **RTX 5090** (32 GB) | `NVFP4` + MTP & DFlash2 | 1K (`1,022`) | `0.10 s` | `9,883.9` | **365.0** | `5.06` (`6.7`) | pass |
-| **RTX 5090** (32 GB) | `NVFP4` + MTP & DFlash2 | 128K (`131,081`) | `30.06 s` | `4,361.1` | **273.1** | `5.74` (`7.0`) | pass |
-| **RTX 5080** (16 GB) | `UD-IQ3_XXS` + MTP | 1K (`1,022`) | `0.44 s` | `2,312.7` | **225.9** | `5.06` (`6.2`) | pass |
-| **RTX 5080** (16 GB) | `UD-IQ3_XXS` + MTP | 128K (`131,081`) | `100.64 s` | `1,302.4` | **161.0** | `5.27` (`6.7`) | pass |
-| **RTX 5080** (16 GB) | `UD-IQ3_XXS` + MTP | 256K (`260,049`) | `283.49 s` | `917.3` | **105.8** | `3.84` (`5.6`) | pass |
-| **RTX 5070 Ti** (16 GB, Win11, v0.2.1) | `UD-IQ3_XXS` + MTP | 256K (`260,051`) | `330.37 s` | `787.2` | **113.5** | `4.82` (`6.3`) | pass |
-| **RTX 5070 Ti** (16 GB, WSL2, v0.2.0) | `UD-IQ3_XXS` + MTP | 1K (`1,022`) | `0.63 s` | `1,611.2` | **167.4** | `4.48` (`5.0`) | pass |
-| **RTX 5070 Ti** (16 GB, WSL2, v0.2.0) | `UD-IQ3_XXS` + MTP | 128K (`131,081`) | `135.09 s` | `970.3` | **104.6** | `5.21` (`6.5`) | pass |
-| **RTX 5070 Ti** (16 GB, WSL2, v0.2.0) | `UD-IQ3_XXS` + MTP | 256K (`260,049`) | `382.49 s` | `679.9` | **61.2** | `3.70` (`5.0`) | pass |
-| **RTX 4090** (24 GB) | `UD-Q4_K_XL` + MTP | 1K (`1,022`) | `0.37 s` | `2,763.7` | **193.6** | `5.94` (`9.0`) | pass |
-| **RTX 4090** (24 GB) | `UD-Q4_K_XL` + MTP | 128K (`131,081`) | `85.10 s` | `1,540.4` | **155.9** | `5.94` (`8.3`) | pass |
-| **RTX 4090** (24 GB) | `UD-Q4_K_XL` + MTP | 256K (`260,049`) | `241.20 s` | `1,078.2` | **122.7** | `5.06` (`6.9`) | pass |
-| **RTX 4080** (16 GB) | `UD-IQ3_XXS` + MTP | 1K (`1,022`) | `0.55 s` | `1,864.3` | **172.3** | `5.11` (`6.1`) | pass |
-| **RTX 4080** (16 GB) | `UD-IQ3_XXS` + MTP | 128K (`131,081`) | `127.00 s` | `1,032.2` | **111.0** | `4.29` (`5.9`) | pass |
-| **RTX 4080** (16 GB) | `UD-IQ3_XXS` + MTP | 256K (`260,049`) | `358.46 s` | `725.5` | **99.0** | `4.69` (`6.4`) | pass |
-| **RTX 3090** (24 GB, 300 W) | `UD-Q4_K_XL` + MTP | 1K (`1,022`) | `1.15 s` | `888.1` | **135.8** | `5.49` (`7.6`) | pass |
-| **RTX 3090** (24 GB, 300 W) | `UD-Q4_K_XL` + MTP | 128K (`131,081`) | `254.71 s` | `514.6` | **97.5** | `5.55` (`7.3`) | pass |
-| **RTX 3090** (24 GB, 300 W) | `UD-Q4_K_XL` + MTP | 256K (`260,049`) | `694.67 s` | `374.3` | **68.1** | `4.41` (`6.4`) | pass |
-
-Note: The `RTX 5070 Ti (16 GB, Win11, v0.2.1)` row (`113.5 tok/s`, `512` tokens in `4,501.9 ms`, `106` rounds, `lookup 3`, `1.85×` vs `v0.2.0` WSL2 `61.2 tok/s`) ran the official `flyx-0.2.1-windows-x86_64-cuda13.exe` binary on native Windows 11 Pro (`10.0.26300`, 32 GB RAM). Only the 256K prompt (with 50%-depth needle recall) was rerun on `v0.2.1` Win11; the `1K` and `128K` RTX 5070 Ti rows above are from the earlier `v0.2.0` WSL2 run (`b950329b`).
-
 ---
 
-## 2. Standard `flyx bench` Across GPUs & Drafters (Qwen3.8-27B)
+## 3. Speculative drafters on the RTX PRO 6000
 
-Measured on the exact same build (`b950329b`) and machines as Section 1 across `flyx bench`'s 3 fixed mixed prompts (33..79 tokens, 128 new tokens each, greedy `tok/s`; `--ctx 4096` on 16 GB GPUs):
+Drafters on one RTX PRO 6000 Blackwell each: every drafted answer checked against plain decoding's, and each drafter
+against its authors' own implementation in SGLang.
 
-```sh
-./bin/flyx bench MODEL.gguf --no-spec -n 128 --json
-./bin/flyx bench MODEL.gguf --drafter mtp -n 128 --json
-./bin/flyx bench MODEL.gguf --drafter dflash2 --drafter-file z-lab/Qwen3.8-27B-DFlash2 -n 128 --json
-./bin/flyx bench MODEL.gguf --drafter all     --drafter-file z-lab/Qwen3.8-27B-DFlash2 -n 128 --json
-```
+### Block drafters on Qwen3.8-27B and Qwen3-8B: DSpine, DFlash2, DFlash, MTP
 
-### RTX 5090 (32 GB, `575 W`, driver `615.71.09`): Drafter Modes (`NVFP4`)
-
-| Model | `flyx` plain | `flyx` + MTP | `flyx` + DFlash2 | `flyx` + both | Best Speedup |
-|---|---:|---:|---:|---:|---:|
-| `NVFP4` (`15.72 GB`) | **94.0** | **282.7** (`4.10 tok/rnd`) | **311.6** (`4.10 tok/rnd`) | **310.3** (`4.28 tok/rnd`) | **3.3x** |
-
-### All 6 Consumer GPUs: Plain vs Built-In MTP (`flyx bench -n 128`)
-
-| GPU | Model | `flyx` plain (`tok/s`) | `flyx` + MTP (`tok/s`) | Speedup |
-|---|---|---:|---:|---:|
-| **RTX 5090** (32 GB) | `NVFP4` | **94.0** | **282.7** (`4.10 tok/rnd`) | **3.0x** |
-| **RTX 5080** (16 GB) | `UD-IQ3_XXS` | **71.0** | **183.9** (`3.97 tok/rnd`) | **2.6x** |
-| **RTX 5070 Ti** (16 GB, WSL2) | `UD-IQ3_XXS` | **58.6** | **150.4** (`3.93 tok/rnd`) | **2.6x** |
-| **RTX 4090** (24 GB) | `UD-Q4_K_XL` | **49.6** | **154.2** (`4.43 tok/rnd`) | **3.1x** |
-| **RTX 4080** (16 GB) | `UD-IQ3_XXS` | **53.9** | **140.9** (`3.97 tok/rnd`) | **2.6x** |
-| **RTX 3090** (24 GB, 300 W) | `UD-Q4_K_XL` | **41.0** | **108.2** (`4.23 tok/rnd`) | **2.6x** |
-
-Important caveats:
-- **Drafted speed depends on workload predictability.** Code and structured output accept more drafts per round (`5.0–5.9 tok/rnd`) than mixed/prose prompts (`3.9–4.4 tok/rnd`).
-- **Single-user latency focus:** Concurrent requests share decode rounds (`1.12x` aggregate throughput at 2 requests, `1.30x` at 4 requests on 27B 4-bit), but `flyx` is optimized for single-request latency rather than high-concurrency batching.
-
----
-
-## 3. Long-Context Attention Fidelity (Needle-in-a-Haystack Suite)
-
-To verify that neither default FP8 K/V nor tiered Host-RAM + 2-bit StrataFlux attention degrades long-range retrieval, we verified single-needle recall (`5%`, `25%`, `50%`, `75%`, `95%` depths across `32K–256K` plus `1K / 128K / 256K` 50%-depth recall on every GPU) and 4-needle simultaneous retrieval at `256K` (`ALPHA` / `BETA` / `GAMMA` / `DELTA` embedded at `10%`, `35%`, `65%`, `90%` depth) on `b950329b`: **51/51 (100%) exact recall across all 6 consumer GPUs, zero failures**. On `v0.2.1` native Windows 11 (`7f0de79`), the RTX 5070 Ti 256K coding rerun also passed its 50%-depth needle recall (`1/1`; the 5-depth and 4-needle grids were not rerun on `v0.2.1` Win11).
-
-```sh
-# Generate and run the 256K 4-needle NIAH prompt
-python bench/prompts/make_coding_prompt.py --flyx ./bin/flyx --model MODEL.gguf --tokens 260000 --multi-needle -o niah_256k.txt
-./bin/flyx run MODEL.gguf --drafter mtp --ctx max --chat --no-think -n 96 -v -f niah_256k.txt
-```
-
-| GPU | Model & K/V Attention Mode | Single-Needle Recall | Multi-Needle at 256K (4 keys) | Total |
-|---|---|---:|---:|---:|
-| **RTX 5090** (32 GB) | `NVFP4` · Full 262K GPU exact FP8 | `3/3` (`1K / 128K / 256K` @ `50%`) | `4/4` (`b950329b`) | **7/7 (100%)** |
-| **RTX 5080** (16 GB) | `UD-IQ3_XXS` · 43K GPU + 219K RAM, 2-bit StrataFlux > 75K | `5/5` (`256K` @ `5%–95%`) | — | **5/5 (100%)** |
-| **RTX 5070 Ti** (16 GB, Win11, v0.2.1) | `UD-IQ3_XXS` · `16,384` GPU + `245,760` RAM, 2-bit StrataFlux > `123,203` | `1/1` (`256K` @ `50%`, `7f0de79`) | — | **1/1 (100%)** |
-| **RTX 5070 Ti** (16 GB, WSL2, v0.2.0) | `UD-IQ3_XXS` · 2K GPU + 260K RAM, 2-bit StrataFlux > 34K | `5/5` (`256K` @ `5%–95%`) | `4/4` (`b950329b`) | **9/9 (100%)** |
-| **RTX 4090** (24 GB) | `UD-Q4_K_XL` · 88K GPU + 174K RAM, 2-bit StrataFlux > 120K | `20/20` (`32K–256K` @ `5%–95%`) | `4/4` (`b950329b`) | **24/24 (100%)** |
-| **RTX 4080** (16 GB) | `UD-IQ3_XXS` · 43K GPU + 219K RAM, 2-bit StrataFlux > 75K | `3/3` (`1K / 128K / 256K` @ `50%`) | — | **3/3 (100%)** |
-| **RTX 3090** (24 GB, 300 W) | `UD-Q4_K_XL` · 92K GPU + 170K RAM, 2-bit StrataFlux > 124K | `3/3` (`1K / 128K / 256K` @ `50%`) | — | **3/3 (100%)** |
-
----
-
-## 4. Benchmarking Tools in This Repo
-
-| Tool | Purpose & Command |
-|---|---|
-| `flyx bench` | End-to-end decode speed + tokens/round + GPU clocks/power/throttling (`flyx bench MODEL -n 128 --json`). |
-| `bench/prompts/make_coding_prompt.py` | Deterministic `1K–256K` long-context coding and 4-needle NIAH prompt generator from tracked repository sources. |
-| `bench/ab/ab.sh` | Interleaved A/B comparison across builds or env vars: `bench/ab/ab.sh decode\|prefill MODEL A B`. |
-| `bench/drafters_27b.sh` + `bench/drafters_table.py` | Multi-workload drafter comparison across `code`, `cache`, `list` and `reason` prompts. |
-| `bench/prompts/` | Fixed prefill prompt fixtures (`p512.txt`, `long.txt`, `prompt_6k.txt`), and the long chat prompts and the prompt sets DV is measured on. |
-| `bench/replay/agent_replay.py` | Multi-turn tool-using OpenAI replay measuring recomputed prompt tokens and TTFT p50/p95. |
-| `cuda_bench` | Kernel microbenchmarks (`gemm`, `skinny`, `fp4`, `decode`, `tc`, `w4a4`, `w12`, `pick`, `gdn`, `attn`, `flash`, `mlp`, `blocks`, `q8runs`, `rounds`, `moe`, `strata`, `mma`, `host_read`, `graphs`) and tuning table generator (`cuda_bench tune [FAMILIES] [FILE.gguf...] [NxK...]`; NxK: a model's bf16 GEMMs alone, for a table that inherits the rest). |
-| `tree_bench` | Speculative tree verification latency and acceptance: `tree_bench MODEL [--ctx-at P] [--widths 1,15,31,63] [--drafted T]` (every width timed from the same context; trees of up to 63 drafts where the backend lowers them). |
-| `flyx bench --prompts` | A prompt set (`{"question"}`, `{"messages"}` or `{"ids"}` a line), every prompt's tokens and rounds in the `--json` record: `flyx bench MODEL --prompts FILE.jsonl [--suffix S] [--limit N] --json OUT.json`; `tests/e2e/check_dv.py` scores and compares such records. |
-| `bench/ab/paired_records.sh`, `bench/ab/summarize_records.py`, `bench/ab/same_runs.py` | Two builds' `flyx bench --prompts` runs in turns (waiting for a quiet GPU), their medians, and whether two runs give the same answers and rounds. |
-| `bench/ab/sglang_bench.py` | A `flyx bench --prompts` record's prompts, token for token, through an SGLang server: its decode tok/s as flyx counts it, its tokens a round, and how many answers are the record's (section 6). |
-| `bench/replay/dv_choice` | DV's per-round choice replayed on recorded rounds (`bench/replay/dv_traces/`), each constant set otherwise: `python -I bench/replay/dv_choice.py table BUILD/bin/dv_choice`. |
-| `bench/trace/dv_round_kernels.py` | Where a DV round's time goes, from an `nsys` trace of DV's rounds with graphs off. |
-| `bench/trace/` | CUPTI kernel timeline analysis (`gaps.py`, `layer_times.py`, `per_matrix.py`, `prefill_kinds.py`). |
-
----
-
-## 5. MiniCPM5-1B with DV (RTX 5060 Ti 8 GB)
-
-Historical study using private drafter inputs. The original capture did not record a release commit.
-
-Hardware: RTX 5060 Ti 8 GB, driver `610.88`, CUDA `13.5`, Windows 11 (native, MSVC), the desktop holding about 3.3 GB of the GPU. Model: `openbmb/MiniCPM5-1B` in BF16, its DV files made from bifill-dv's checkpoints on Hugging Face (`panmz/bifill-dv`, a private repository: without access to it the DV rows below cannot be reproduced; [models](models.md) has the commands, [DV](design/dv.md#the-description-and-the-file-abi-42) the files), binary16 K/V (`--kv 16`). Prompts: GSM8K's first 100 test questions as bifill-dv prompts them (`gsm8k_test.jsonl`, made from the public `openai/gsm8k` as below; the instruction below after each), greedy, at most 512 new tokens. Every DV run generates plain decoding's tokens for all 100 (`tests/e2e/check_dv.py`).
-
-`gsm8k_test.jsonl` is GSM8K's test split, one `{"question", "answer"}` object a line in the dataset's order, as bifill-dv writes it (sha256 `ca6e7c5108b7ab7bc920c707e021b21bd9bdaf725e48a179b781ce4be1e9ad13`, its lines ending in CRLF; with LF line ends the same prompts, sha256 `752adc99f23132275139f1f7be57126b08735a55daf0c56859ee6df70abafbac`):
-
-```python
-import json
-from datasets import load_dataset  # pip install datasets
-with open("gsm8k_test.jsonl", "w", encoding="utf-8", newline="\r\n") as f:
-    for r in load_dataset("openai/gsm8k", "main", split="test"):
-        f.write(json.dumps({"question": r["question"], "answer": r["answer"]}, ensure_ascii=False) + "\n")
-```
-
-| File | Drafter | Decode `tok/s` | Tokens / round |
-|---|---|---:|---:|
-| `minicpm5-1b.flyx` | none (`--no-lookup`) | 226.7 | 1.00 |
-| `minicpm5-1b-dv-res2.flyx` (beam 31:8:cov) | DV, 31 drafts every round (`--width 31`) | 320.1 | 5.02 |
-| `minicpm5-1b-dv-res2.flyx` | DV, rounds chosen per round | **338.7** | 4.30 |
-| `minicpm5-1b-dv-b2h.flyx` (with its V-LoRA) | none (`--drafter none --no-lookup`) | 179.2 | 1.00 |
-| `minicpm5-1b-dv-b2h.flyx` | DV, 31 drafts every round (`--width 31`) | 387.2 | 7.08 |
-| `minicpm5-1b-dv-b2h.flyx` | DV, rounds chosen per round | **426.1** | 6.37 |
-
-Commands:
-
-```sh
-S='\nPlease reason step by step, and put your final answer within \boxed{}.'
-C="--prompts gsm8k_test.jsonl --kv 16 --ctx 2048 --limit 100"
-flyx bench minicpm5-1b.flyx $C --suffix "$S" --no-lookup --json plain.json
-flyx bench minicpm5-1b-dv-res2.flyx $C --suffix "$S" --drafter dv --width 31 --json dv31.json
-flyx bench minicpm5-1b-dv-res2.flyx $C --suffix "$S" --drafter dv --json dv.json
-flyx bench minicpm5-1b-dv-b2h.flyx $C --suffix "$S" --drafter none --no-lookup --json b2h_plain.json
-flyx bench minicpm5-1b-dv-b2h.flyx $C --suffix "$S" --drafter dv --width 31 --json b2h31.json
-flyx bench minicpm5-1b-dv-b2h.flyx $C --suffix "$S" --drafter dv --json b2h.json
-python -I tests/e2e/check_dv.py --drafted dv31.json --plain plain.json --same-target
-python -I tests/e2e/check_dv.py --drafted dv.json --plain plain.json --same-target
-python -I tests/e2e/check_dv.py --drafted b2h31.json --plain b2h_plain.json --same-target
-python -I tests/e2e/check_dv.py --drafted b2h.json --plain b2h_plain.json --same-target
-```
-
-`check_dv.py` passes for each DV run against the plain run of its file's target (`plain.json` for the `-dv-res2`
-file, `b2h_plain.json` for the `-dv-b2h` file): the same generated tokens for every question.
-
-After long prompts (the three `bench/prompts/summarize_*.txt`, 3110 to 5949 tokens; 200 tokens, a new engine each) `minicpm5-1b-dv-res2.flyx`'s DV of 31 drafts every round gives 1.75 to 1.95 tokens a round and decodes at 0.31 to 0.42 times plain decoding; with its rounds chosen per round it runs plain decoding's and lookup rounds there (1.00 to 1.02 tokens a round), at about plain decoding's speed. Every text is plain decoding's. DV drafts only when named.
-
-```sh
-for p in bench/prompts/summarize_*.txt; do
-  flyx run minicpm5-1b.flyx -f $p --chat --no-think -n 200 --kv 16 --ctx 8192 --no-spec --no-lookup
-  flyx run minicpm5-1b-dv-res2.flyx -f $p --chat --no-think -n 200 --kv 16 --ctx 8192 --drafter dv --width 31
-  flyx run minicpm5-1b-dv-res2.flyx -f $p --chat --no-think -n 200 --kv 16 --ctx 8192 --drafter dv
-done
-```
-
----
-
-## 6. Block Drafters on Qwen3.8-27B and Qwen3-8B: DSpine, DFlash2, DFlash, MTP (RTX PRO 6000)
-
-One RTX PRO 6000 Blackwell Server Edition (96 GB, driver `595.112.07`; flyx at #9's two commits, Release,
+One RTX PRO 6000 Blackwell Server Edition (96 GB, driver `595.112.07`; flyx Release,
 `cmake --preset dev -DFLYX_CUDA_ARCHS=120-real` with CUDA 13.0's `nvcc`), greedy, thinking off unless said, up to 1024
 new tokens a prompt, each prompt in a fresh session, every row of both tables from one run of this build:
 
@@ -468,35 +402,23 @@ python -m sglang.launch_server --model-path Qwen3-8B --speculative-algorithm DSP
   --attention-backend flashinfer --speculative-draft-attention-backend triton --page-size 1 \
   --mem-fraction-static 0.65 --context-length 8192 --max-running-requests 8 --cuda-graph-bs-decode 1 2 4 8 \
   --trust-remote-code
-python -I bench/ab/sglang_bench.py plain_gsm8k.json --json sglang_gsm8k.json
+python -I bench/ab/server_bench.py plain_gsm8k.json --api sglang --json sglang_gsm8k.json
 ```
 
-Its column was measured at #6 on another RTX PRO 6000 Blackwell Server Edition (driver `620.70.06`). flyx on that host,
-DSpine at 15 drafts: at #6 (`c97fd62f`) GSM8K 692.1, MATH-500 614.5, HumanEval 555.0, MBPP 531.9, MT-Bench 258.5,
-chat 331.8 tok/s, 1.1-2.2% above this table's at the same tokens a round; the DSpine change rebased onto `main` at
-`527f0ba6` 682.5, 604.2, 545.8, 523.5, 254.4 and 326.2, within 0.5% of this table's (the 1-2% came with `main`). Against the plugin at 15 drafts flyx is 1.4-6.1% faster on every set with this table's
-numbers (8.3% on MT-Bench with widths chosen every round) and 3.6-8.4% with #6's from the plugin's own host, at about
+Its column was measured on another RTX PRO 6000 Blackwell Server Edition (driver `620.70.06`). flyx on that host,
+DSpine at 15 drafts: GSM8K 692.1, MATH-500 614.5, HumanEval 555.0, MBPP 531.9, MT-Bench 258.5, chat 331.8 tok/s,
+1.1-2.2% above this table's at the same tokens a round. Against the plugin at 15 drafts flyx is 1.4-6.1% faster on
+every set with this table's numbers (8.3% on MT-Bench with widths chosen every round) and 3.6-8.4% with those from the
+plugin's own host, at about
 the same tokens a round: its round is shorter. Every flyx answer is plain decoding's; SGLang's speculative answers were
 its own plain decoding's in 8 of the 30 GSM8K prompts (`--same-as` a run of the server without `--speculative-*`).
-What made the difference on this GPU, measured on GSM8K and HumanEval at 15 drafts (617.6 / 490.8 tok/s before):
 
-- **This GPU's table** (`backends/cuda/variants/sm120/tables/rtxpro6000.toml`, `cuda_bench tune gemm` on the four
-  bf16 GEMMs Qwen3-8B runs): the attention out and mlp down projections at 9..16 rows read 1052 and 953 GB/s on the
-  RTX 5090's rules, 1255 and 1008 on their own (+2-4%; bit-identical configurations).
-- **DSpine's layer copies**: beside a BF16 target the drafter was bf16, its five layers 1.9 GB a round, each layer
-  the size of a target layer; Q8_0 copies +6% at the same tokens a round, NVFP4 copies 2-3% more at most 1% fewer.
-  DFlash's go to Q8_0 (GSM8K at 15 drafts: 398.0 -> 431.2 tok/s at the same tokens a round).
-- **The walk's GEMMs** in one launch of up to 240 rows (+0.5%).
+### EAGLE-4 on Qwen3.8-27B BF16 against SGLang's EAGLE-4 (RTX PRO 6000 Workstation)
 
-The trace that found them (`CUDA_INJECTION64_PATH=.../libflyx-trace.so FLYX_TRACE=round.tsv flyx bench ...`, then
-`python -I bench/trace/gaps.py round.tsv`), before them: a round 15.35 ms, its graph busy 15.2 ms of it, the GEMMs 13.3.
-
-## 7. EAGLE-4 on Qwen3.8-27B BF16 against SGLang's EAGLE-4 (RTX PRO 6000 Workstation)
-
-One RTX PRO 6000 Blackwell Workstation Edition (96 GB, 600 W, driver `615.71.09`, a rented instance; flyx at this
-change, `cmake --preset dev` (this GPU's `sm_120`) with CUDA 13.0's `nvcc`, its GEMMs from
+One RTX PRO 6000 Blackwell Workstation Edition (96 GB, 600 W, driver `615.71.09`, a rented instance; flyx built with
+`cmake --preset dev` (this GPU's `sm_120`) with CUDA 13.0's `nvcc`, its GEMMs from
 `variants/sm120/tables/rtxpro6000ws.toml`), greedy, thinking off, up to 256 new tokens a prompt, each prompt in a fresh
-session; the six sets of section 6 (the same md5s; 174 prompts).
+session; the six sets of the block-drafter tables above (the same md5s; 174 prompts).
 
 - **Model**: `Qwen/Qwen3.8-27B` (`37561816`, BF16, its MTP layer kept), converted with
   `EAGLE-Corp/Qwen3.8-27B-EAGLE4` (`f58a5985`, `LlamaForCausalLMEagle4`: one layer over the taps 4, 32 and 60, a
@@ -504,8 +426,8 @@ session; the six sets of section 6 (the same md5s; 174 prompts).
 - **SGLang**: the EAGLE-4 release's SGLang (`0.5.23.dev252+eagle`, its `EAGLE_HARNESS` worker) on the same GPU and
   checkpoints, `--speculative-num-steps 12 --speculative-eagle-topk 4 --speculative-num-draft-tokens 16` (its
   configuration for this drafter), `--disable-overlap-schedule --mem-fraction-static 0.92 --context-length 16384`, fed
-  flyx's own prompt token ids one request at a time (`bench/ab/sglang_bench.py`, which counts decode speed as flyx
-  bench does).
+  flyx's own prompt token ids one request at a time (`bench/ab/server_bench.py --api sglang`, which counts decode
+  speed as flyx bench does).
 
 ```sh
 PYTHONPATH=python/convert python -m flyx_convert --model Qwen3.8-27B --draft Qwen3.8-27B-EAGLE4 -o q38-e4.flyx
@@ -515,7 +437,7 @@ flyx bench q38-e4.flyx --prompts S -n 256 --json R.json --drafter eagle4        
 flyx bench q38-e4.flyx --prompts S -n 256 --json R.json --drafter eagle4 --no-draft-trees
 sglang serve --model-path Qwen3.8-27B --speculative-algorithm EAGLE_HARNESS --speculative-draft-model-path \
   Qwen3.8-27B-EAGLE4 --speculative-num-steps 12 --speculative-eagle-topk 4 --speculative-num-draft-tokens 16 ...
-python -I bench/ab/sglang_bench.py PLAIN.json --json SGL.json [--same-as SGL_PLAIN.json]
+python -I bench/ab/server_bench.py PLAIN.json --api sglang --json SGL.json [--same-as SGL_PLAIN.json]
 ```
 
 Decode `tok/s` (tokens a round). Every flyx answer is its plain decoding's, token for token, in every configuration
@@ -540,3 +462,160 @@ first), chosen every round with its chains of 1 to 15 and lookup rounds by cost 
 nothing to learn the chain's acceptance from. flyx's plain decoding is SGLang's +6% from the bf16 skinny GEMMs' interleaved
 spans (`kernels/gemm_decode.cu`): a block's warps read neighbouring 32-value spans of its rows instead of 16 streams a
 chunk apart, 24.6 -> 30.6 tok/s on this GPU (the 27B's decode GEMMs 1.1-1.35 -> 1.4-1.6 TB/s of 1.65 its copies reach).
+
+---
+
+## 4. gpt-oss-20b against llama.cpp, vLLM and SGLang (RTX PRO 6000)
+
+One RTX PRO 6000 Blackwell Server Edition on Modal (96 GB, driver `620.70.06`); flyx built with
+`cmake --preset dev -DFLYX_CUDA_ARCHS=120-real` and CUDA 13.0; greedy, up to 1024 new tokens a prompt, each prompt alone
+and in a fresh session, section 3's prompt sets, the chat template as flyx renders it (harmony, its default reasoning),
+every engine fed the same token ids. Each flyx mode ran on the same GPU as the engine whose activations it matches,
+right after it (the engine stopped first):
+
+- **llama.cpp** (`2a8bf0f5`, CUDA 12.9; `llama-server -ngl 999 -c 8192 -np 1 -fa on`) and **flyx**:
+  `ggml-org/gpt-oss-20b-GGUF` at `41e8a94d`, `gpt-oss-20b-MXFP4.gguf` (sha256 `27cd6c43...6ae35901`: MXFP4 experts,
+  Q8_0 attention, embedding and head). llama.cpp's experts take 8-bit inputs (`q8_1`), as flyx's `q8`.
+- **vLLM** 0.34.0 (FlashInfer attention; Marlin MXFP4 MoE: bf16 inputs, flyx's `bf16`) and **SGLang** 0.5.23
+  (FlashInfer's CUTLASS MXFP4 MoE: MXFP8 inputs, flyx's `mxfp8`), CUDA 12.9: `openai/gpt-oss-20b` at `6cee5e81` (the
+  same MXFP4 experts, bf16 elsewhere); each the faster of its runs with its prefix cache (the default) and without
+  (`--no-enable-prefix-caching`, `--disable-radix-cache`).
+
+`--activations` (docs/models.md, Precision) names the experts' inputs as PREFILL/DECODE; `mxfp8/q8` has no engine of
+its own (MXFP8 in prefill, llama.cpp's 8 bits in rounds). In brackets, how much faster flyx is than the engine of its
+activations.
+Prefill: flyx's `prefill_ms` (in the process), the others' time to the first streamed token over HTTP (a millisecond or
+two of request handling); the first prompt of GSM8K, every engine's first set, left out. Decode: the tokens after the
+first over the time from the first to the last (`bench/ab/server_bench.py` for the others).
+
+Prefill, ms a prompt:
+
+| | GSM8K | MATH-500 | HumanEval | MBPP | MT-Bench | chat |
+|---|---|---|---|---|---|---|
+| llama.cpp (q8) | 39.3 | 35.8 | 35.6 | 35.8 | 31.6 | 28.5 |
+| flyx `q8` | 17.3 (+127%) | 19.2 (+87%) | 19.4 (+83%) | 17.9 (+100%) | 16.0 (+98%) | 13.8 (+107%) |
+| vLLM (bf16) | 16.7 | 16.9 | 17.5 | 16.8 | 14.7 | 14.3 |
+| flyx `bf16` | 14.3 (+17%) | 15.8 (+7%) | 15.7 (+11%) | 14.8 (+13%) | 13.5 (+9%) | 11.7 (+22%) |
+| SGLang (mxfp8) | 18.0 | 20.2 | 16.4 | 16.4 | 14.7 | 13.9 |
+| flyx `mxfp8` | **13.2** (+36%) | **14.7** (+38%) | 14.3 (+15%) | **13.6** (+20%) | 12.8 (+14%) | 11.6 (+20%) |
+| flyx `mxfp8/q8` | 13.3 | 14.7 | **14.2** | 13.7 | **12.8** | **11.6** |
+
+Decode, tok/s:
+
+| | GSM8K | MATH-500 | HumanEval | MBPP | MT-Bench | chat |
+|---|---|---|---|---|---|---|
+| llama.cpp (q8) | 314.5 | 318.4 | 318.2 | 319.3 | 318.7 | 319.5 |
+| flyx `q8` | 384.0 (+22%) | **386.8** (+21%) | **386.9** (+22%) | **386.7** (+21%) | **386.8** (+21%) | **387.0** (+21%) |
+| vLLM (bf16) | 255.4 | 255.6 | 255.7 | 255.9 | 255.8 | 255.9 |
+| flyx `bf16` | 363.6 (+42%) | 365.2 (+43%) | 365.3 (+43%) | 365.3 (+43%) | 365.4 (+43%) | 365.5 (+43%) |
+| SGLang (mxfp8) | 245.2 | 245.0 | 244.8 | 245.1 | 244.9 | 245.1 |
+| flyx `mxfp8` | 356.0 (+45%) | 357.1 (+46%) | 357.2 (+46%) | 357.1 (+46%) | 357.4 (+46%) | 357.5 (+46%) |
+| flyx `mxfp8/q8` | **385.5** | 386.2 | 386.3 | 386.2 | 386.4 | 386.4 |
+
+Every flyx mode is faster than the engine of its activations on every set: `q8` prefills 83-127% faster than
+llama.cpp and decodes 21-22% faster; `bf16` 7-22% and 42-43% faster than vLLM; `mxfp8` 14-38% and 45-46% faster
+than SGLang. `mxfp8/q8` prefills as fast as `mxfp8` and decodes as fast as `q8`.
+
+Against the exact path's distributions (`bench/quality/kld`, `--activations exact` saved, 2048 positions of
+`bench/prompts/prompt_6k.txt` and `bench/quality/texts/zh.txt` from position 64, teacher forced):
+
+| `--activations` | KL | same top-1 |
+|---|---|---|
+| `q8` (the default) | 0.0086 | 95.9% |
+| `bf16` | 0.0078 | 95.6% |
+| `mxfp8` | 0.0174 | 92.5% |
+| `mxfp8/q8` | 0.0091 | 95.3% |
+
+With prompt lookup (`flyx bench` without `--no-spec`), `q8` decodes 2-13% faster still, every answer plain
+decoding's token for token.
+
+```sh
+# flyx (S: each set of section 3's sets/; A: q8, bf16, mxfp8 or mxfp8/q8)
+flyx bench gpt-oss-20b-MXFP4.gguf --prompts S -n 1024 --no-spec --activations A --json flyx_S.json
+flyx bench gpt-oss-20b-MXFP4.gguf --prompts S -n 1024 --json flyx_lookup_S.json
+# the others, each server up alone on the GPU, the flyx record's prompts token for token
+llama-server -m gpt-oss-20b-MXFP4.gguf -ngl 999 -c 8192 -np 1 -fa on --port 8080
+python -I bench/ab/server_bench.py flyx_S.json --api llamacpp --json llamacpp_S.json
+vllm serve gpt-oss-20b --served-model-name gpt-oss-20b --max-model-len 8192 --gpu-memory-utilization 0.85 \
+  [--no-enable-prefix-caching]
+python -I bench/ab/server_bench.py flyx_S.json --api vllm --model gpt-oss-20b --json vllm_S.json
+python -m sglang.launch_server --model-path gpt-oss-20b --context-length 8192 --mem-fraction-static 0.8 \
+  [--disable-radix-cache]
+python -I bench/ab/server_bench.py flyx_S.json --api sglang --json sglang_S.json
+```
+
+---
+
+## 5. MiniCPM5-1B with DV (RTX 5060 Ti 8 GB)
+
+Hardware: RTX 5060 Ti 8 GB, driver `610.88`, CUDA `13.5`, Windows 11 (native, MSVC), the desktop holding about 3.3 GB of the GPU. Model: `openbmb/MiniCPM5-1B` in BF16, its DV files made from bifill-dv's checkpoints on Hugging Face (`panmz/bifill-dv`, a private repository: without access to it the DV rows below cannot be reproduced; [models](models.md) has the commands, [DV](design/dv.md#the-description-and-the-file-abi-42) the files), binary16 K/V (`--kv 16`). Prompts: GSM8K's first 100 test questions as bifill-dv prompts them (`gsm8k_test.jsonl`, made from the public `openai/gsm8k` as below; the instruction below after each), greedy, at most 512 new tokens. Every DV run generates plain decoding's tokens for all 100 (`tests/e2e/check_dv.py`).
+
+`gsm8k_test.jsonl` is GSM8K's test split, one `{"question", "answer"}` object a line in the dataset's order, as bifill-dv writes it (sha256 `ca6e7c5108b7ab7bc920c707e021b21bd9bdaf725e48a179b781ce4be1e9ad13`, its lines ending in CRLF; with LF line ends the same prompts, sha256 `752adc99f23132275139f1f7be57126b08735a55daf0c56859ee6df70abafbac`):
+
+```python
+import json
+from datasets import load_dataset  # pip install datasets
+with open("gsm8k_test.jsonl", "w", encoding="utf-8", newline="\r\n") as f:
+    for r in load_dataset("openai/gsm8k", "main", split="test"):
+        f.write(json.dumps({"question": r["question"], "answer": r["answer"]}, ensure_ascii=False) + "\n")
+```
+
+| File | Drafter | Decode `tok/s` | Tokens / round |
+|---|---|---:|---:|
+| `minicpm5-1b.flyx` | none (`--no-lookup`) | 226.7 | 1.00 |
+| `minicpm5-1b-dv-res2.flyx` (beam 31:8:cov) | DV, 31 drafts every round (`--width 31`) | 320.1 | 5.02 |
+| `minicpm5-1b-dv-res2.flyx` | DV, rounds chosen per round | **338.7** | 4.30 |
+| `minicpm5-1b-dv-b2h.flyx` (with its V-LoRA) | none (`--drafter none --no-lookup`) | 179.2 | 1.00 |
+| `minicpm5-1b-dv-b2h.flyx` | DV, 31 drafts every round (`--width 31`) | 387.2 | 7.08 |
+| `minicpm5-1b-dv-b2h.flyx` | DV, rounds chosen per round | **426.1** | 6.37 |
+
+Commands:
+
+```sh
+S='\nPlease reason step by step, and put your final answer within \boxed{}.'
+C="--prompts gsm8k_test.jsonl --kv 16 --ctx 2048 --limit 100"
+flyx bench minicpm5-1b.flyx $C --suffix "$S" --no-lookup --json plain.json
+flyx bench minicpm5-1b-dv-res2.flyx $C --suffix "$S" --drafter dv --width 31 --json dv31.json
+flyx bench minicpm5-1b-dv-res2.flyx $C --suffix "$S" --drafter dv --json dv.json
+flyx bench minicpm5-1b-dv-b2h.flyx $C --suffix "$S" --drafter none --no-lookup --json b2h_plain.json
+flyx bench minicpm5-1b-dv-b2h.flyx $C --suffix "$S" --drafter dv --width 31 --json b2h31.json
+flyx bench minicpm5-1b-dv-b2h.flyx $C --suffix "$S" --drafter dv --json b2h.json
+python -I tests/e2e/check_dv.py --drafted dv31.json --plain plain.json --same-target
+python -I tests/e2e/check_dv.py --drafted dv.json --plain plain.json --same-target
+python -I tests/e2e/check_dv.py --drafted b2h31.json --plain b2h_plain.json --same-target
+python -I tests/e2e/check_dv.py --drafted b2h.json --plain b2h_plain.json --same-target
+```
+
+`check_dv.py` passes for each DV run against the plain run of its file's target (`plain.json` for the `-dv-res2`
+file, `b2h_plain.json` for the `-dv-b2h` file): the same generated tokens for every question.
+
+After long prompts (the three `bench/prompts/summarize_*.txt`, 3110 to 5949 tokens; 200 tokens, a new engine each) `minicpm5-1b-dv-res2.flyx`'s DV of 31 drafts every round gives 1.75 to 1.95 tokens a round and decodes at 0.31 to 0.42 times plain decoding; with its rounds chosen per round it runs plain decoding's and lookup rounds there (1.00 to 1.02 tokens a round), at about plain decoding's speed. Every text is plain decoding's. DV drafts only when named.
+
+```sh
+for p in bench/prompts/summarize_*.txt; do
+  flyx run minicpm5-1b.flyx -f $p --chat --no-think -n 200 --kv 16 --ctx 8192 --no-spec --no-lookup
+  flyx run minicpm5-1b-dv-res2.flyx -f $p --chat --no-think -n 200 --kv 16 --ctx 8192 --drafter dv --width 31
+  flyx run minicpm5-1b-dv-res2.flyx -f $p --chat --no-think -n 200 --kv 16 --ctx 8192 --drafter dv
+done
+```
+
+---
+
+## 6. Benchmarking tools in this repo
+
+| Tool | Purpose & Command |
+|---|---|
+| `flyx bench` | End-to-end decode speed + tokens/round + GPU clocks/power/throttling (`flyx bench MODEL -n 128 --json`). |
+| `bench/prompts/make_coding_prompt.py` | Deterministic `1K–256K` long-context coding and 4-needle NIAH prompt generator from tracked repository sources. |
+| `bench/ab/ab.sh` | Interleaved A/B comparison across builds or env vars: `bench/ab/ab.sh decode\|prefill MODEL A B`. |
+| `bench/drafters_27b.sh` + `bench/drafters_table.py` | Multi-workload drafter comparison across `code`, `cache`, `list` and `reason` prompts. |
+| `bench/prompts/` | Fixed prefill prompt fixtures (`p512.txt`, `long.txt`, `prompt_6k.txt`), and the long chat prompts and the prompt sets DV is measured on. |
+| `bench/replay/agent_replay.py` | Multi-turn tool-using OpenAI replay measuring recomputed prompt tokens and TTFT p50/p95. |
+| `cuda_bench` | Kernel microbenchmarks (`gemm`, `skinny`, `fp4`, `decode`, `tc`, `w4a4`, `w12`, `pick`, `gdn`, `attn`, `flash`, `mlp`, `blocks`, `q8runs`, `rounds`, `moe`, `strata`, `mma`, `host_read`, `graphs`) and tuning table generator (`cuda_bench tune [FAMILIES] [FILE.gguf...] [NxK...]`; NxK: a model's bf16 GEMMs alone, for a table that inherits the rest). |
+| `tree_bench` | Speculative tree verification latency and acceptance: `tree_bench MODEL [--ctx-at P] [--widths 1,15,31,63] [--drafted T]` (every width timed from the same context; trees of up to 63 drafts where the backend lowers them). |
+| `flyx bench --prompts` | A prompt set (`{"question"}`, `{"messages"}` or `{"ids"}` a line), every prompt's tokens and rounds in the `--json` record: `flyx bench MODEL --prompts FILE.jsonl [--suffix S] [--limit N] --json OUT.json`; `tests/e2e/check_dv.py` scores and compares such records. |
+| `bench/ab/paired_records.sh`, `bench/ab/summarize_records.py`, `bench/ab/same_runs.py` | Two builds' `flyx bench --prompts` runs in turns (waiting for a quiet GPU), their medians, and whether two runs give the same answers and rounds. |
+| `bench/ab/server_bench.py` | A `flyx bench --prompts` record's prompts, token for token, through an SGLang, vLLM or llama.cpp server: its decode tok/s as flyx counts it, its time to the first token, its tokens a round (SGLang's), and how many answers are the record's (sections 3 and 4). |
+| `bench/replay/dv_choice` | DV's per-round choice replayed on recorded rounds (`bench/replay/dv_traces/`), each constant set otherwise: `python -I bench/replay/dv_choice.py table BUILD/bin/dv_choice`. |
+| `bench/trace/dv_round_kernels.py` | Where a DV round's time goes, from an `nsys` trace of DV's rounds with graphs off. |
+| `bench/trace/` | CUPTI kernel timeline analysis (`gaps.py`, `layer_times.py`, `per_matrix.py`, `prefill_kinds.py`). |

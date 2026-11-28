@@ -66,9 +66,13 @@ typedef struct {
                                the weights or on Llama models, else FP8), FLYX_KV_FP8 (e4m3, a scale per position
                                and head: half the memory) or FLYX_KV_16 (binary16, llama.cpp's) */
   const char* backend_options; /* "key=value,..." for the backend (see its documentation); NULL = none */
-  const char* activations;  /* NULL = as each weight's file has it; "exact" = every format's own rounding everywhere;
-                               "nvfp4" = NVFP4 weights take NVFP4 inputs in prefill passes whatever the file says
-                               (a backend that cannot compute them refuses the model) */
+  const char* activations;  /* PREFILL[/DECODE], the inputs of prefill passes then of rounds (DECODE = PREFILL where
+                               left out); NULL = as each weight's file has it. "q8": GGML blocks in 8 bits (their
+                               default, llama.cpp's); "bf16", "mxfp8", "mxfp8/q8": MXFP4 weights (gpt-oss's experts)
+                               as vLLM, as SGLang, or SGLang's prefill with llama.cpp's rounds; "nvfp4/bf16": NVFP4
+                               weights' NVFP4 prefill whatever the file says; "exact": every format's own rounding
+                               everywhere. Other weights as without the word; a backend that cannot compute a mode
+                               refuses the model (docs/models.md, Precision) */
   const char* chat_template; /* a Jinja chat template's source, used instead of the model file's; NULL = the file's */
   const char* drafter_file; /* drafters in files of their own: a GGUF holding the MTP layer, or a block drafter's file
                                (python/convert --draft alone); several separated by newlines; NULL = none */

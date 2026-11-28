@@ -50,7 +50,7 @@ set(FLYX_CUDA_KERNEL_SOURCES
     kernels/attention.cu kernels/attention_flash.cu kernels/attention_rows.cu kernels/tree.cu
     kernels/gdn_chunk.cu kernels/rows.cu kernels/sampling.cu kernels/draft.cu kernels/draft_head.cu kernels/eagle4.cu
     kernels/dv.cu kernels/head_cert.cu kernels/stop_decide.cu kernels/vision.cu kernels/inkling2.cu
-    kernels/moe.cu kernels/dspark.cu kernels/dspine.cu)
+    kernels/moe.cu kernels/moe_mxfp4_bf16.cu kernels/moe_mxfp4_q8.cu kernels/dspark.cu kernels/dspine.cu)
 
 # The device code's flags: line tables unless left out, the fatbinary's compression (top-level CMakeLists.txt).
 set(FLYX_CUDA_DEVICE_FLAGS "")
@@ -108,11 +108,11 @@ target_link_libraries(flyx_cuda_kernels PUBLIC flyx_cuda_compat_kernels)
 set(flyx_arch_numbers ${FLYX_CUDA_ARCHS})
 list(TRANSFORM flyx_arch_numbers REPLACE "-(real|virtual)$" "")
 if("120" IN_LIST flyx_arch_numbers)
-  add_library(flyx_cuda_sm120a STATIC kernels/gemm_w4a4.cu)
+  add_library(flyx_cuda_sm120a STATIC kernels/gemm_w4a4.cu kernels/moe_mxfp4_mxfp8.cu)
   flyx_configure_cuda_lib(flyx_cuda_sm120a "120a-real")
   target_link_libraries(flyx_cuda_kernels PUBLIC flyx_cuda_sm120a)
 else()
-  target_sources(flyx_cuda_kernels PRIVATE kernels/gemm_w4a4_none.cu)
+  target_sources(flyx_cuda_kernels PRIVATE kernels/gemm_w4a4_none.cu kernels/moe_mxfp4_mxfp8_none.cu)
 endif()
 
 set_source_files_properties(${FLYX_CUDA_TABLE_SOURCES} runtime/state.cpp

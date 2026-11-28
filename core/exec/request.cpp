@@ -318,14 +318,19 @@ bool prepare_request(Engine& e, const Session& s, const Request& rq, const Rende
   // The grammar the reply must match: tool calls in the format's syntax with
   // arguments that fit their schemas, tool_choice, a JSON answer (core/grammar).
   const std::string tag = e.chat().reply_grammar(rq.tools, reply_rules(rq), rc);
+  const bool must = rq.rules.tools == ReplyRules::kRequired || rq.rules.tools == ReplyRules::kForced || rq.rules.json;
+  if (tag.empty() && must) {  // the format has no grammar for it (harmony's replies), or the tools none to call
+    out->invalid = true;
+    return *err = rq.rules.json ? "this model's reply format cannot constrain a JSON answer"
+                                : "this model's reply format cannot constrain a required tool call",
+           false;
+  }
   if (!tag.empty()) {
     const double t0 = os::now_ms();
     std::string why;
     out->grammar = e.grammar().matcher(tag, &why, &out->grammar_cached);
     out->grammar_ms = os::now_ms() - t0;
     if (!out->grammar) {
-      const bool must = rq.rules.tools == ReplyRules::kRequired || rq.rules.tools == ReplyRules::kForced ||
-                        rq.rules.json;
       if (must) {
         out->invalid = e.grammar().ready();  // the compiler is there: what it was given is at fault
         return *err = why, false;

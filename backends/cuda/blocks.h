@@ -101,6 +101,14 @@ struct AttnBlock {
   Lin w_in, w_out;             // w_in: the projections stacked as above
   Adapters lora;               // its own adapters on q, k, v and o (never with a gate)
   int kv = -1;                 // its cache (StateTable::kv)
+  // gpt-oss (ABI 56): q|k|v's biases stacked as w_in's rows ([n_in()]) and o's ([hidden]), null: none; sinks [nh] (a
+  // logit per head in its softmax's denominator), null: none; window (0: every position); its rotary's factors
+  // (YaRN's; null: rope_table's for theta), and the softmax's scale (1 / sqrt(hd), times YaRN's mscale squared: q
+  // and k each scaled by it after the rotary).
+  float *qkv_b = nullptr, *o_b = nullptr, *sinks = nullptr;
+  int window = 0;
+  const double* rope = nullptr;
+  float scale = 0.f;
   int q_width() const { return (gate ? 2 : 1) * nh * hd; }
   int n_in() const { return q_width() + 2 * nkv * hd; }
   MRoPE mrope(const int32_t* pos_3d = nullptr) const {
@@ -292,7 +300,7 @@ struct VisionLin {
   int N = 0, K = 0, K_pad = 0;
   bool on_host = false;
   bool on_disk = false;
-  bool a4 = false;  // pre-quantized NVFP4 weight calibrated for W4A4 prefill activations (FLYX_ACT_NVFP4)
+  bool a4 = false;  // pre-quantized NVFP4 weight calibrated for W4A4 prefill activations (FLYX_ACT_NVFP4_BF16)
   DiskKind disk_kind = kDiskNone;
   uint64_t disk_off = 0;
   size_t disk_bytes = 0;
@@ -399,11 +407,15 @@ struct RelAttnBlock {
   int kv = -1, sconv = -1;
 };
 
-// Inkling-2 sparse MoE block with AttnRes, optional cross-pass loop control, SiTU activation, and post ShortConv.
+// Sparse MoE block (Inkling-2's with AttnRes, optional cross-pass loop control, SiTU activation and post ShortConv;
+// gpt-oss's with biases and its own activation).
 struct MoeBlock {
   int hidden = 0, inter = 0, n_experts = 0, top_k = 0, conv = 0;
   bool gating_sigmoid = true, norm_weights = true;
-  float route_scale = 1.f, norm_eps = 1e-20f, situ_beta = 0.f, situ_linear_beta = 0.f;
+  float route_scale = 1.f, norm_eps = 1e-20f;
+  MoeAct act;  // its bias: an expert's gate then up biases [E, 2 I] (either zeros where the block has none)
+  float* down_b = nullptr;     // [E, H]
+  float* router_logit_b = nullptr;  // [E], added to the router's logits
   Norm norm;
   Lin router;
   float* router_bias = nullptr;

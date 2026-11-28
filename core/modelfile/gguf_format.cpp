@@ -407,14 +407,15 @@ void tokenizer(const json& meta, const RawTokenizer& raw, ModelFile::Contents* o
                               {"n_merges", n_merges}};
   add_blob(out, "tokenizer.added", added.dump());
 
-  // Where generation ends: the ids the file names, and ChatML's turn end and
-  // GPT-2's text end when the vocabulary has them (files often name only
+  // Where generation ends: the ids the file names, and ChatML's turn end,
+  // GPT-2's text end and harmony's reply ends (gpt-oss: <|return|>, and <|call|>
+  // after a tool call) when the vocabulary has them (files often name only
   // one; llama.cpp's loader adds the well-known ones by their text too).
   json eos = json::array();
   auto stop = [&](int id) {
     if (std::find(eos.begin(), eos.end(), json(id)) == eos.end()) eos.push_back(id);
   };
-  for (std::string_view s : {"<|im_end|>", "<|endoftext|>"})
+  for (std::string_view s : {"<|im_end|>", "<|endoftext|>", "<|return|>", "<|call|>"})
     if (const uint32_t id = find_id(s); id != UINT32_MAX) stop(int(id));
   for (const char* kind : {"eos", "eot", "eom", "bos"}) {
     const std::string key = std::string("tokenizer.ggml.") + kind + "_token_id";

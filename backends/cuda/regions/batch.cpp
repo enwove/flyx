@@ -402,6 +402,20 @@ void draft_context_rows(const BatchPass& bp, const DFlashBlock& b, bool fused) {
 
 }  // namespace
 
+bool batch_takes(const flyx_plan* p) {
+  for (size_t k = target_start(p); k < p->nodes.size(); ++k) {
+    if (p->nodes[k].kind != FLYX_NODE_RUN) continue;
+    const Block* b = p->block[k];
+    if (const auto* a = std::get_if<AttnBlock>(b)) {
+      if (a->qkv_b || a->o_b || a->sinks || a->window > 0 || a->rope) return false;
+    } else if (!std::holds_alternative<EmbedBlock>(*b) && !std::holds_alternative<GdnBlock>(*b) &&
+               !std::holds_alternative<MlpBlock>(*b) && !std::holds_alternative<HeadBlock>(*b)) {
+      return false;
+    }
+  }
+  return true;
+}
+
 void run_batch(const BatchPass& bp) {
   // Drafting: batch sequences drafting on the same MtpBlock (lockstep) or DFlashBlock (grouped up to FLYX_MAX_ROWS)
   // so drafter weights are shared across sessions; other drafters and given-draft nodes run per sequence.

@@ -31,7 +31,7 @@ __global__ void k_attn_prep(const float* qkv, int ld, int q_off, int k_off, int 
                             const float* k_norm, float norm_offset, float eps, double theta, int rot_dim, int nh,
                             int nkv, int hd, const DevParams* P, int pos_sel, int skip_if_noop, float* q_out, KvRef kv,
                             int pos_add, int hpb, const TreeRows* tree, const double* rope, int strata_base,
-                            int canvas_s0, MRoPE mrope = {}) {
+                            int canvas_s0, MRoPE mrope = {}, const float* bias = nullptr) {
   pdl_trigger();
   extern __shared__ float sh[];
   if (skip_if_noop && P->noop) return;
@@ -72,7 +72,7 @@ __global__ void k_attn_prep(const float* qkv, int ld, int q_off, int k_off, int 
     const int head = is_q ? hidx : hidx - nh;
     const float* src = qkv + size_t(r) * ld + (is_q ? q_off : k_off) + head * hd;
     const float* norm_w = is_q ? q_norm : k_norm;  // null: no norm (block-uniform, like is_q)
-    float nv = src[d];
+    float nv = src[d] + (bias ? bias[(is_q ? q_off : k_off) + head * hd + d] : 0.f);  // the row's q or k bias
     if (norm_w) {
       const float v = nv, nw = norm_w[d];  // the weight loads with v, not after the sum
       const float inv = rsqrtf(block_sum(v * v) / hd + eps);
@@ -93,7 +93,7 @@ __global__ void k_attn_prep(const float* qkv, int ld, int q_off, int k_off, int 
     } else if (slot >= 0) {  // block-uniform, like is_q
       const int cell = kv.slot_of(slot);  // a ring's slot
       const size_t at = (size_t(cell) * nkv + head) * hd + d;
-      const float vv = qkv[size_t(r) * ld + v_off + head * hd + d];
+      const float vv = qkv[size_t(r) * ld + v_off + head * hd + d] + (bias ? bias[v_off + head * hd + d] : 0.f);
       if (kv.fp8()) {  // e4m3 with the row's scale amax / 448
         float amax[2] = {fabsf(out), fabsf(vv)};
         block_max_n(amax);
@@ -752,7 +752,7 @@ __global__ void __launch_bounds__(128) k_attention_gqa(const float* __restrict__
 template <bool TREE>
 __global__ void k_attention_combine(const float* part, int nh, int hd, int splits, const float* gate, int ld_gate,
                                     Out out, int ld_out, const DevParams* P, int causal, int extra, int pos_add,
-                                    int from, const TreeRows* tree) {
+                                    int from, const TreeRows* tree, const float* sinks) {
   pdl_trigger();
   constexpr int kFastSplits = 128;
   __shared__ float s_m[kFastSplits], s_l[kFastSplits], s_f[kFastSplits];
@@ -760,6 +760,7 @@ __global__ void k_attention_combine(const float* part, int nh, int hd, int split
   const int h = blockIdx.x, r = blockIdx.y, d = threadIdx.x;
   const float* pr = part + (size_t(r) * nh + h) * splits * (hd + 2);
   const float g = gate ? gate[size_t(r) * ld_gate + h * hd + d] : 0.f;  // loads with the partials
+  const float sink = sinks ? sinks[h] : -INFINITY;  // the head's sink: in the denominator, nowhere else
   const int cores = min(splits, kAttnCoresSplits);
   int used = cores;
   if (from >= 0) {
@@ -780,12 +781,13 @@ __global__ void k_attention_combine(const float* part, int nh, int hd, int split
       for (int s = d; s < used; s += 32) M = fmaxf(M, s_m[s]);
 #pragma unroll
       for (int o = 16; o > 0; o >>= 1) M = fmaxf(M, __shfl_xor_sync(0xffffffffu, M, o));
+      M = fmaxf(M, sink);
       if (d == 0) s_M = M;
       if (M != -INFINITY) {
         for (int s = d; s < used; s += 32) s_f[s] = s_m[s] == -INFINITY ? 0.f : __expf(s_m[s] - M);
         __syncwarp();
         if (d == 0) {
-          float ls = 0.f;
+          float ls = sink == -INFINITY ? 0.f : __expf(sink - M);
           for (int s = 0; s < used; ++s)
             if (s_m[s] != -INFINITY) ls += s_l[s] * s_f[s];
           s_L = ls;
@@ -802,8 +804,9 @@ __global__ void k_attention_combine(const float* part, int nh, int hd, int split
       }
     }
   } else {
-    float M = -INFINITY;
+    float M = sink;
     for (int s = 0; s < used; ++s) M = fmaxf(M, pr[s * (hd + 2)]);
+    if (sink != -INFINITY) L = __expf(sink - M);
     if (M != -INFINITY)
       for (int s = 0; s < used; ++s) {
         if (pr[s * (hd + 2)] == -INFINITY) continue;  // an empty split adds zeros: not read
@@ -822,7 +825,9 @@ __global__ void k_attention_combine(const float* part, int nh, int hd, int split
 void attn_prep(const float* qkv, int ld, int q_off, int k_off, int v_off, const float* q_norm, const float* k_norm,
                float norm_offset, float eps, double theta, int rot_dim, int nh, int nkv, int hd, int rows,
                const DevParams* P, int pos_sel, bool skip_if_noop, float* q_out, KvRef kv, cudaStream_t st,
-               int pos_add, const TreeRows* tree, int strata_base, CanvasKeys canvas, MRoPE mrope) {
+               int pos_add, const TreeRows* tree, int strata_base, CanvasKeys canvas, MRoPE mrope,
+               const double* rope, const float* bias) {
+  const double* factors = rope ? rope : rope_table(theta, rot_dim);
   // Heads per block: enough blocks to fill the GPU (about 512), else fewer rotations.  Every
   // grouping gives the same bits.  A 5760-token prefill: one head per block 11.5 ms of
   // attn_prep, all 20 of a row 2.9 ms (bench/trace).
@@ -838,19 +843,19 @@ void attn_prep(const float* qkv, int ld, int q_off, int k_off, int v_off, const 
     if (use_mrope)
       k_attn_prep<false, true, true><<<grid, hd, shared, st>>>(qkv, ld, q_off, k_off, v_off, q_norm, k_norm, norm_offset,
                                                                eps, theta, rot_dim, nh, nkv, hd, P, pos_sel, skip_if_noop,
-                                                               q_out, kv, pos_add, hpb, nullptr, rope_table(theta, rot_dim),
+                                                               q_out, kv, pos_add, hpb, nullptr, factors,
                                                                0, canvas.s0, mrope);
     else
       k_attn_prep<false, true, false><<<grid, hd, shared, st>>>(qkv, ld, q_off, k_off, v_off, q_norm, k_norm, norm_offset,
                                                                 eps, theta, rot_dim, nh, nkv, hd, P, pos_sel, skip_if_noop,
-                                                                q_out, kv, pos_add, hpb, nullptr, rope_table(theta, rot_dim),
+                                                                q_out, kv, pos_add, hpb, nullptr, factors,
                                                                 0, canvas.s0);
     return;
   }
   auto run = [&](auto compact_tag, auto mrope_tag) {
     k_attn_prep<decltype(compact_tag)::value, false, decltype(mrope_tag)::value><<<grid, hd, shared, st>>>(
         qkv, ld, q_off, k_off, v_off, q_norm, k_norm, norm_offset, eps, theta, rot_dim, nh, nkv, hd, P, pos_sel,
-        skip_if_noop, q_out, kv, pos_add, hpb, tree, rope_table(theta, rot_dim), strata_base, -1, mrope);
+        skip_if_noop, q_out, kv, pos_add, hpb, tree, factors, strata_base, -1, mrope, bias);
   };
   const bool compact = hd == 256 && kv.bits == 3 && kv.words == 24;
   if (compact && use_mrope) run(std::true_type{}, std::true_type{});
@@ -984,15 +989,21 @@ void attention(const float* q, const kv16* Kc, const kv16* Vc, int nh, int nkv, 
 
 void attention(const float* q, KvRef kv, int nh, int nkv, int hd, int rows, bool causal, int extra, float scale,
                const DevParams* P, const float* gate, int ld_gate, float* out, int ld_out, float* partial, int splits,
-               const Launch& L, int pos_add, int window, const TreeRows* tree, CanvasKeys canvas) {
-  // Prefill (more causal rows than a round has): tensor cores, unless the options ask for the float32 kernel.  A
-  // canvas's rows read their keys through its map, which only the float32 kernels have.
-  if (window == 0 && causal && rows > FLYX_MAX_ROWS && !L.round_rows && canvas.s0 < 0 &&
-      opts(L).attention != kAttnSplit &&
-      attention_flash(q, kv, nh, nkv, hd, rows, scale, P, gate, ld_gate, out, ld_out, L, pos_add))
+               const Launch& L, int pos_add, int window, const TreeRows* tree, CanvasKeys canvas,
+               const float* sinks) {
+  // Prefill (more causal rows than a round has): tensor cores, unless the options ask for the float32 kernel, a
+  // sliding window's too (gpt-oss's even layers: 58 -> 10 us a layer at 145 rows).  A canvas's rows read their keys
+  // through its map, which only the float32 kernels have.
+  FlashWindow one;
+  one.sinks = sinks;
+  one.sliding = window;
+  one.ring = window > 0 ? kv.ring : 0;
+  if (causal && rows > FLYX_MAX_ROWS && !L.round_rows && canvas.s0 < 0 && opts(L).attention != kAttnSplit &&
+      (window == 0 || kv.sink == 0) &&
+      attention_flash(q, kv, nh, nkv, hd, rows, scale, P, gate, ld_gate, out, ld_out, L, pos_add, one))
     return;
   attention_split(q, kv, nh, nkv, hd, rows, causal, extra, scale, P, gate, ld_gate, out, ld_out, partial, splits, L,
-                  pos_add, window, tree, canvas);
+                  pos_add, window, tree, canvas, SplitWindow{}, sinks);
 }
 
 template <int HD, int G, bool FP8>
@@ -1017,10 +1028,10 @@ void launch_gqa(const float* q, KvRef kv, int nh, int nkv, int rows, bool causal
 
 namespace {
 // The query heads a KV head has that the grouped kernel is compiled for: 1, 2 and 4 at every head dim; 6 (Qwen3.5's
-// 27B: 24 over 4) and 8 (Qwen3's 32B: 64 over 8) at the head dims of real models.
+// 27B: 24 over 4) and 8 (Qwen3's 32B: 64 over 8; gpt-oss: 64 over 8 of 64 dims) at the head dims of real models.
 bool gqa_compiled(int hd, int g) {
   if (g == 1 || g == 2 || g == 4) return attention_head_dim(hd);
-  return (g == 6 || g == 8) && (hd == 128 || hd == 256);
+  return (g == 6 && (hd == 128 || hd == 256)) || (g == 8 && (hd == 64 || hd == 128 || hd == 256));
 }
 }  // namespace
 
@@ -1048,7 +1059,7 @@ bool attention_gqa(const float* q, KvRef kv, int nh, int nkv, int hd, int rows, 
     return true;                                                                                              \
   }
   FLYX_GQA(32, 1) FLYX_GQA(32, 2) FLYX_GQA(32, 4)
-  FLYX_GQA(64, 1) FLYX_GQA(64, 2) FLYX_GQA(64, 4)
+  FLYX_GQA(64, 1) FLYX_GQA(64, 2) FLYX_GQA(64, 4) FLYX_GQA(64, 8)
   FLYX_GQA(128, 1) FLYX_GQA(128, 2) FLYX_GQA(128, 4) FLYX_GQA(128, 6) FLYX_GQA(128, 8)
   FLYX_GQA(256, 1) FLYX_GQA(256, 2) FLYX_GQA(256, 4) FLYX_GQA(256, 6) FLYX_GQA(256, 8)
 #undef FLYX_GQA
@@ -1066,7 +1077,7 @@ void attention_split(const float* q, const kv16* Kc, const kv16* Vc, int nh, int
 void attention_split(const float* q, KvRef kv, int nh, int nkv, int hd, int rows, bool causal, int extra, float scale,
                      const DevParams* P, const float* gate, int ld_gate, float* out, int ld_out, float* partial,
                      int splits, const Launch& L, int pos_add, int window, const TreeRows* tree, CanvasKeys canvas,
-                     const SplitWindow& sw) {
+                     const SplitWindow& sw, const float* sinks) {
   const cudaStream_t st = L.st;
   const bool on_canvas = canvas.s0 >= 0;
   if (on_canvas && (tree || window > 0)) {
@@ -1119,10 +1130,10 @@ void attention_split(const float* q, KvRef kv, int nh, int nkv, int hd, int rows
   const int used_from = from == INT_MAX ? -1 : from;
   if (tree)
     k_attention_combine<true><<<dim3(nh, rows), hd, 0, st>>>(partial, nh, hd, splits, gate, ld_gate, o, ld_out, P,
-                                                             causal, extra, pos_add, used_from, tree);
+                                                             causal, extra, pos_add, used_from, tree, sinks);
   else
     k_attention_combine<false><<<dim3(nh, rows), hd, 0, st>>>(partial, nh, hd, splits, gate, ld_gate, o, ld_out, P,
-                                                              causal, extra, pos_add, used_from, nullptr);
+                                                              causal, extra, pos_add, used_from, nullptr, sinks);
 }
 
 }  // namespace flyx::cuda

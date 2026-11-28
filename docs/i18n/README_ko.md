@@ -60,7 +60,7 @@
 
 ## 성능
 
-GPU 4종에서 검증한 v0.2.1 디코딩 속도(토큰/초, greedy)입니다. **기본**은 드래프터 없이 디코딩한 값이고, 두 **추측** 열은 채팅과 코드 프롬프트에서 드래프터를 켠 값이며 괄호 안은 기본 디코딩 대비 속도 향상 배수입니다.
+GPU 4종에서 검증한 디코딩 속도(토큰/초, greedy)입니다. **기본**은 드래프터 없이 디코딩한 값이고, 두 **추측** 열은 채팅과 코드 프롬프트에서 드래프터를 켠 값이며 괄호 안은 기본 디코딩 대비 속도 향상 배수입니다.
 
 **Qwen3.8-27B + DFlash2** — 채팅 / 혼합: 프롬프트 3개 × 128토큰, 코드: 프롬프트 1개 × 128토큰.
 
@@ -82,7 +82,7 @@ GPU 4종에서 검증한 v0.2.1 디코딩 속도(토큰/초, greedy)입니다. *
 
 <sub>**×**는 같은 프롬프트에서 기본 디코딩 대비 속도 향상 배수이며 반올림 전 속도로 계산했습니다. **기본** 열은 채팅 / 혼합 측정값입니다. 토큰 ID를 기록한 모든 측정에서 추측 디코딩의 출력은 기본 디코딩과 토큰 단위로 일치했습니다(ID를 기록하지 않은 것은 Windows의 Qwen 혼합 측정뿐입니다). RTX 5070 Ti만 네이티브 Windows 11이고 나머지는 Linux입니다.</sub>
 
-<sub>**추가 측정:** Qwen3.8-27B에 내장된 **MTP** 드래프터(추가 파일 불필요)는 혼합 프롬프트에서 **286.6 / 158.0 / 121.7 / 167.2 tok/s**입니다(5090 / 4090 / 3090 / 5070 Ti). **RTX 5090 `NVFP4`:** W4A4 프리필 **15,496 tok/s**, 128K 컨텍스트에서 MTP **203.8 tok/s**(기본: 73.4), 256K에서 **164.5 tok/s**와 롱 컨텍스트 검색 정확도 **100%**(v0.2.0 측정). 하드웨어, 드라이버, 정확한 명령어는 [docs/benchmarks.md](../benchmarks.md#v021-four-gpu-verified-benchmarks)를 참고하세요.</sub>
+<sub>**추가 측정:** Qwen3.8-27B에 내장된 **MTP** 드래프터(추가 파일 불필요)는 혼합 프롬프트에서 **286.6 / 158.0 / 121.7 / 167.2 tok/s**입니다(5090 / 4090 / 3090 / 5070 Ti). **RTX 5090 `NVFP4`:** W4A4 프리필 **15,496 tok/s**, 128K 컨텍스트에서 MTP **203.8 tok/s**(기본: 73.4), 256K에서 **164.5 tok/s**와 롱 컨텍스트 검색 정확도 **100%**. 하드웨어, 드라이버, 정확한 명령어는 [docs/benchmarks.md](../benchmarks.md#decode-and-prefill-on-four-gpus)를 참고하세요.</sub>
 
 ## 빠른 시작
 
@@ -158,7 +158,7 @@ print(reply["content"])
 
 | 항목 | 지원 범위 | 참고 |
 |---|---|---|
-| 아키텍처 | Qwen3.5 / Qwen3.8 (`qwen35`), Qwen3 (`qwen3`), Inkling-2-Mini (`inkling2_loop`, 희소 MoE), Llama (MiniCPM5-1B) | Llama는 `.flyx`만 지원 |
+| 아키텍처 | Qwen3.5 / Qwen3.8 (`qwen35`), Qwen3 (`qwen3`), Inkling-2-Mini (`inkling2_loop`, 희소 MoE), gpt-oss-20b / 120b (`gpt-oss`, 희소 MoE, GGUF), Llama (MiniCPM5-1B) | Llama는 `.flyx`만 지원 |
 | 추측 드래프터 | MTP, DFlash2, DSpark, 프롬프트 룩업 | MTP와 DSpark는 자동으로 연결됩니다. DFlash2는 별도 파일입니다(`--drafter-file` 또는 대시보드의 **Draft with it**). DSpark는 Inkling-2-Mini 전용입니다 |
 | 비전 | `mmproj` 프로젝터를 통한 이미지 입력(모델의 Hub 저장소에서 자동으로 가져옴) | 현재 Qwen3.5 / Qwen3.8 지원. Inkling-2-Mini는 텍스트 전용 |
 | 모델 형식 | GGUF (`F32`, `F16`, `BF16`, `Q4_0–Q8_0`, `Q2_K–Q6_K`, `IQ1–IQ4`, `MXFP4`, `Q2_0`, GGML NVFP4); `.flyx` (BF16, NVFP4; 포맷 2는 타깃 모델의 LoRA 어댑터인 V-LoRA를 병합 없이 실행 가능하며, DV 드래프터는 `--drafter dv` 지정 시에만 사용, [설계](../design/dv.md)) | 분할 GGUF 파일은 모두 같은 폴더에 둡니다. |

@@ -17,12 +17,16 @@
 //   W4A4 kernels, tiny_w4a4.flyx, a Qwen3.5 128 wide): the
 //   float64 backend's tokens, teacher forced, with the same prefill passes
 //   (the rounding depends on a pass's rows); asked for by name
-//   (--activations nvfp4) in a file that says bf16 inputs, the same tokens.
+//   (--activations nvfp4/bf16) in a file that says bf16 inputs, the same tokens.
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
+#include <cstring>
 #include <fstream>
 #include <stdexcept>
+#include <string>
+#include <utility>
+#include <vector>
 
 #include "core/exec/generation.h"
 #include "nlohmann/json.hpp"
@@ -55,6 +59,7 @@ struct Load {
   std::string activations{};  // EngineOptions::activations ("": as the file has it)
   std::string lora_file{};  // EngineOptions::lora_file
   int kv = FLYX_KV_16;  // the golden tokens and drafts are binary16 K/V's
+  bool lookup = false;  // prompt lookup's rounds (speculative, drafter "none")
 };
 
 // The engine; a load that fails throws, or with `failed` says why there.
@@ -66,7 +71,7 @@ std::unique_ptr<Engine> engine(const std::string& path, const std::string& backe
   if (!how.options.empty()) options.backend_options += (options.backend_options.empty() ? "" : ",") + how.options;
   options.max_ctx = how.max_ctx;
   options.prefill_chunk = how.prefill_chunk;
-  options.lookup = false;
+  options.lookup = how.lookup;
   options.width = !how.speculative ? 0 : how.drafter == "mtp" ? 3 : 15;  // the reference's rounds
   options.speculative = how.speculative;
   options.drafter = how.speculative ? how.drafter : "none";
@@ -126,6 +131,58 @@ std::vector<int32_t> tokens_of(Engine& e, const std::vector<int32_t>& prompt, in
   std::string error;
   if (!s.init(&error)) throw std::runtime_error(error);
   return generate_tokens(s, prompt, n, sampling);
+}
+
+// Two sessions of one engine generating at once, their rounds launched together (launch_batch, as the scheduler
+// launches concurrent requests' rounds): each one's tokens, greedy, and how many rounds ran as a pair.
+std::pair<std::vector<int32_t>, std::vector<int32_t>> dual_batched(Engine& e, const std::vector<int32_t>& pa,
+                                                                   const std::vector<int32_t>& pb, int n,
+                                                                   int* paired) {
+  Session sa(&e), sb(&e);
+  std::string err;
+  if (!sa.init(&err) || !sb.init(&err)) throw std::runtime_error("dual session init: " + err);
+  std::vector<int32_t> out_a, out_b;
+  GenerateRequest ra, rb;
+  ra.prompt = pa, rb.prompt = pb;
+  ra.max_new_tokens = rb.max_new_tokens = n;
+  ra.ignore_eos = rb.ignore_eos = true;
+  Generation ga(&sa, ra, [&](std::string_view, const int32_t* ids, int cnt) {
+    out_a.insert(out_a.end(), ids, ids + cnt);
+    return true;
+  });
+  Generation gb(&sb, rb, [&](std::string_view, const int32_t* ids, int cnt) {
+    out_b.insert(out_b.end(), ids, ids + cnt);
+    return true;
+  });
+  ga.set_batched(true);
+  gb.set_batched(true);
+  *paired = 0;
+  while (!ga.done() || !gb.done()) {
+    if (!ga.done()) ga.advance(false);
+    if (!gb.done()) gb.advance(false);
+    std::vector<Generation*> ready;
+    std::vector<Generation::NextRound> nr;
+    for (Generation* g : {&ga, &gb}) {
+      Generation::NextRound r;
+      if (!g->done() && g->next_round(&r)) ready.push_back(g), nr.push_back(r);
+    }
+    if (ready.empty()) {
+      if (!ga.done()) ga.advance(true);
+      if (!gb.done()) gb.advance(true);
+      continue;
+    }
+    std::vector<flyx_plan*> plans(ready.size());
+    std::vector<flyx_seq*> seqs(ready.size());
+    std::vector<const flyx_gen_params*> gens(ready.size());
+    for (size_t i = 0; i < ready.size(); ++i)
+      plans[i] = nr[i].plan, seqs[i] = ready[i]->session()->seq(), gens[i] = &nr[i].g;
+    if (e.api()->launch_batch(plans.data(), seqs.data(), gens.data(), int32_t(ready.size())) != 0)
+      throw std::runtime_error(std::string("launch_batch: ") + e.api()->last_error());
+    for (size_t i = 0; i < ready.size(); ++i) ready[i]->launched(nr[i]);
+    *paired += ready.size() == 2;
+  }
+  if (ga.failed() || gb.failed()) throw std::runtime_error("dual batched generation failed");
+  return {out_a, out_b};
 }
 
 // The same, greedy, with every result the device gave (the prefill's, then a round's each).
@@ -284,6 +341,106 @@ void packed(const std::string& dir, const std::string& backend) {
   }
 }
 
+// gpt-oss (tests/core/modelfile/tiny_gpt_oss.py): the tiny model as llama.cpp lays it out, with its experts in MXFP4
+// and its attention in Q8_0, and the same in float32.  With exact inputs (every linear's input rounded as its format
+// does, binary16 pairs for GGML blocks) both give transformers' tokens on every golden case (cases far from a tie in
+// the next token and in every router's k-th expert): its biases, sinks, sliding windows (8 positions, a ring past
+// them), YaRN rotary, routing and clamped expert activation, through prefill passes of up to 16 and 64 rows.  The file
+// as the real model ships it, with the default 8-bit inputs (a coarser rounding than the golden cases' margins
+// absorb): prompt lookup's rounds give plain decoding's tokens, greedy and seeded, and on CUDA the unfused kernels
+// the fused ones' and, teacher forced, the float64 backend's next token at all but at most four of 24 places.
+void gpt_oss(const std::string& dir, const std::string& backend) {
+  for (const std::string stem : {"gpt_oss", "gpt_oss_f32"}) {
+    std::ifstream f(dir + "/golden_" + stem + ".json");
+    const json golden = json::parse(f);
+    const std::string path = dir + "/tiny_" + stem + ".gguf";
+    auto exact = engine(path, backend, {.activations = "exact"});
+    auto exact_long = engine(path, backend, {.prefill_chunk = 64, .activations = "exact"});
+    for (const auto& item : golden.at("cases")) {
+      const auto p = item.at("prompt").get<std::vector<int32_t>>();
+      const auto want = item.at("tokens").get<std::vector<int32_t>>();
+      check(same_tokens(tokens_of(*exact, p, int(want.size())), want), "tiny " + stem + ": transformers' tokens");
+      check(same_tokens(tokens_of(*exact_long, p, int(want.size())), want),
+            "tiny " + stem + ": transformers' tokens, prefill in passes of up to 64 rows");
+    }
+  }
+  const std::string path = dir + "/tiny_gpt_oss.gguf";
+  std::ifstream f(dir + "/golden_gpt_oss.json");
+  const json golden = json::parse(f);
+  auto plain = engine(path, backend), lookup = engine(path, backend, {.speculative = true, .drafter = "none",
+                                                                      .lookup = true});
+  auto plain_bf16 = engine(path, backend, {.activations = "bf16"});
+  auto lookup_bf16 = engine(path, backend, {.speculative = true, .drafter = "none", .activations = "bf16",
+                                            .lookup = true});
+  // MXFP8 inputs where the backend computes them (CUDA: sm_120's block-scaled tensor cores)
+  std::string no_mxfp8;
+  auto plain_mxfp8 = engine(path, backend, {.activations = "mxfp8"}, &no_mxfp8);
+  auto lookup_mxfp8 = plain_mxfp8 ? engine(path, backend, {.speculative = true, .drafter = "none",
+                                                       .activations = "mxfp8", .lookup = true})
+                              : nullptr;
+  if (!plain_mxfp8) std::printf("  skip MXFP8 inputs on %s: %s\n", backend.c_str(), no_mxfp8.c_str());
+  // MXFP8 in prefill passes, 8 bits in rounds
+  auto plain_mxfp8_q8 = plain_mxfp8 ? engine(path, backend, {.activations = "mxfp8/q8"}) : nullptr;
+  auto lookup_mxfp8_q8 = plain_mxfp8 ? engine(path, backend, {.speculative = true, .drafter = "none",
+                                                        .activations = "mxfp8/q8", .lookup = true})
+                               : nullptr;
+  std::unique_ptr<Engine> unfused, ref, ref_bf16, ref_mxfp8, ref_mxfp8_q8;
+  if (backend != "cpu_ref") {
+    unfused = engine(path, backend, {.options = "fusion=0"});
+    ref = engine(path, "cpu_ref");
+    ref_bf16 = engine(path, "cpu_ref", {.activations = "bf16"});
+    ref_mxfp8 = engine(path, "cpu_ref", {.activations = "mxfp8"});
+    ref_mxfp8_q8 = engine(path, "cpu_ref", {.activations = "mxfp8/q8"});
+  }
+  for (const auto& item : golden.at("cases")) {
+    auto p = item.at("prompt").get<std::vector<int32_t>>();
+    const size_t n = p.size();
+    for (size_t i = 0; i < 2 * n; ++i) p.push_back(p[i % n]);  // the prompt three times over: lookup drafts
+    const auto want = tokens_of(*plain, p, 24);
+    check(tokens_of(*lookup, p, 24) == want, "tiny gpt_oss: prompt lookup's rounds give plain decoding's tokens");
+    check(tokens_of(*lookup, p, 24, true) == tokens_of(*plain, p, 24, true),
+          "tiny gpt_oss: prompt lookup preserves seeded sampling");
+    check(tokens_of(*lookup_bf16, p, 24) == tokens_of(*plain_bf16, p, 24),
+          "tiny gpt_oss, the experts' inputs in bf16: prompt lookup's rounds give plain decoding's tokens");
+    if (plain_mxfp8)
+      check(tokens_of(*lookup_mxfp8, p, 24) == tokens_of(*plain_mxfp8, p, 24),
+            "tiny gpt_oss, the experts' inputs in MXFP8: prompt lookup's rounds give plain decoding's tokens");
+    {  // two requests decoding at once (their rounds launched together: the backend runs each alone, gpt-oss's
+       // blocks being no batch's), each its own tokens, past the window's ring
+      std::vector<int32_t> q(p.rbegin(), p.rend());
+      int paired = 0;
+      const auto [ta, tb] = dual_batched(*plain, p, q, 24, &paired);
+      check(paired > 0 && ta == want && tb == tokens_of(*plain, q, 24),
+            "tiny gpt_oss: two sessions' rounds launched together (" + std::to_string(paired) +
+                " paired) give each session's own tokens");
+    }
+    if (plain_mxfp8_q8)
+      check(tokens_of(*lookup_mxfp8_q8, p, 24) == tokens_of(*plain_mxfp8_q8, p, 24),
+            "tiny gpt_oss, the experts' inputs in MXFP8 in prefill, 8 bits in rounds: prompt lookup's rounds give "
+            "plain decoding's tokens");
+    if (unfused) {
+      check(tokens_of(*unfused, p, 24) == want, "tiny gpt_oss: fusion=0 gives the fused kernels' tokens");
+      const auto ref_tokens = tokens_of(*ref, p, 24);
+      const int agree = forced_agreement(*plain, p, ref_tokens);
+      // these prompts are not the golden cases' (no margin kept): where the reference's two best nearly tie
+      check(agree >= 20, "tiny gpt_oss: teacher forced, the float64 backend's tokens at " + std::to_string(agree) +
+                             " of 24 places (8-bit inputs)");
+      const int agree_bf16 = forced_agreement(*plain_bf16, p, tokens_of(*ref_bf16, p, 24));
+      check(agree_bf16 >= 20, "tiny gpt_oss, the experts' inputs in bf16: teacher forced, the float64 backend's "
+                              "tokens at " + std::to_string(agree_bf16) + " of 24 places");
+      if (plain_mxfp8) {
+        const int agree_mxfp8 = forced_agreement(*plain_mxfp8, p, tokens_of(*ref_mxfp8, p, 24));
+        check(agree_mxfp8 >= 20, "tiny gpt_oss, the experts' inputs in MXFP8: teacher forced, the float64 backend's "
+                               "tokens at " + std::to_string(agree_mxfp8) + " of 24 places");
+        const int agree_mxfp8_q8 = forced_agreement(*plain_mxfp8_q8, p, tokens_of(*ref_mxfp8_q8, p, 24));
+        check(agree_mxfp8_q8 >= 20, "tiny gpt_oss, the experts' inputs in MXFP8 in prefill, 8 bits in rounds: teacher "
+                                "forced, the float64 backend's tokens at " + std::to_string(agree_mxfp8_q8) +
+                                " of 24 places");
+      }
+    }
+  }
+}
+
 // The MTP layer in a file of its own (EngineOptions::drafter_files; unsloth ships the 27B's so): the quantized tiny
 // Qwen3.5 from the two files gives what the one file gives, every round's drafts included; the model without the
 // file has no MTP layer, and a file whose model has one takes no second.
@@ -342,6 +499,48 @@ bool decode_from(Engine& e, Session& s, int32_t first, size_t n, std::vector<int
   }
   if (last) *last = rr;
   return true;
+}
+
+// gpt-oss and numerics.md K: a prompt's last row gets the same logits, bit for bit, whichever passes of more than 16
+// rows prefilled it (prefill_align 1: starting anywhere): one pass of 700 rows, 300 then 400 (the router's float32
+// linear in passes on either side of 384 rows), 37 then 663 (the sliding window's key tiles off its pass's start), in
+// each mode of the experts' inputs.
+void gpt_oss_passes(const std::string& dir, const std::string& backend) {
+  std::vector<int32_t> prompt(700);
+  for (size_t i = 0; i < prompt.size(); ++i) prompt[i] = int32_t(32 + (i * 37 + i / 7) % 200);  // byte tokens
+  for (const std::string act : {"", "bf16", "mxfp8", "mxfp8/q8"}) {
+    std::string why;
+    auto e = engine(dir + "/tiny_gpt_oss.gguf", backend, {.prefill_chunk = 1024, .max_ctx = 1024, .activations = act},
+                    &why);
+    if (!e) {
+      std::printf("  skip tiny gpt_oss passes, activations %s: %s\n", act.c_str(), why.c_str());
+      continue;
+    }
+    const auto* api = e->api();
+    const size_t vocab = size_t(e->model().desc().vocab);
+    auto last_logits = [&](size_t split) {
+      Session s(e.get());
+      std::string err;
+      flyx_gen_params g{};
+      g.top_p = 1.f;
+      flyx_round_result rr{};
+      std::vector<float> z(vocab);
+      const bool ok = s.init(&err) && (split == 0 || prefill_span(*e, s, prompt, 0, split, split)) &&
+                      api->prefill(e->prefill_plan(), s.seq(), prompt.data() + split, int32_t(prompt.size() - split),
+                                   &g) == 0 &&
+                      api->read(s.seq(), &rr) == 0 && api->logits(s.seq(), 0, z.data()) == 0;
+      if (!ok) z.clear();
+      return z;
+    };
+    const auto one = last_logits(0);
+    for (size_t split : {size_t(300), size_t(37)}) {
+      const auto two = last_logits(split);
+      check(!one.empty() && two.size() == one.size() && std::memcmp(two.data(), one.data(), one.size() * 4) == 0,
+            "tiny gpt_oss" + (act.empty() ? std::string() : ", activations " + act) + ": prefill as passes of " +
+                std::to_string(split) + " and " + std::to_string(prompt.size() - split) +
+                " rows, the last row's logits are one pass's bits");
+    }
+  }
 }
 
 // Greedy through a session, the prompt checkpointed at `checkpoints`: the tokens, every result the device gave, and
@@ -751,7 +950,8 @@ void dspine_file(const std::string& dir, const std::string& backend) {
                        {.speculative = true, .drafter = "dspine", .drafter_files = {dir + "/" + file},
                         .options = "draft_weights=exact"});
     for (const auto& item : golden.at("cases")) {
-      const auto p = item.at("prompt").get<std::vector<int32_t>>(), want = item.at("tokens").get<std::vector<int32_t>>();
+      const auto p = item.at("prompt").get<std::vector<int32_t>>();
+      const auto want = item.at("tokens").get<std::vector<int32_t>>();
       std::vector<int32_t> got;
       const auto trace = traced(*spec, p, 48, &got);
       int same = 0, total = 0;
@@ -805,7 +1005,8 @@ void dflash_file(const std::string& dir, const std::string& backend) {
                          {.speculative = true, .drafter = "dflash2", .drafter_files = {source}});
     auto mtp = engine(dir + "/tiny_gguf.gguf", backend, {.speculative = true, .drafter_files = {drafter}});
     for (const auto& item : golden.at("cases")) {
-      const auto p = item.at("prompt").get<std::vector<int32_t>>(), want = item.at("tokens").get<std::vector<int32_t>>();
+      const auto p = item.at("prompt").get<std::vector<int32_t>>();
+      const auto want = item.at("tokens").get<std::vector<int32_t>>();
       std::vector<int32_t> got;
       const auto trace = traced(*dflash, p, 48, &got);
       int same = 0, total = 0;
@@ -983,7 +1184,7 @@ void nvfp4_inputs(const std::string& dir, const std::string& backend) {
   const std::string path = dir + "/tiny_w4a4.flyx";
   if (!fp4_inputs_here(path, backend, "NVFP4 inputs").empty()) {  // what this checks needs FP4 tensor cores
     // Asked for by name where the device cannot compute them: refused at open, not bf16 inputs instead.
-    const std::string why = refusal(dir + "/tiny_w4a4_a16.flyx", backend, {.activations = "nvfp4"});
+    const std::string why = refusal(dir + "/tiny_w4a4_a16.flyx", backend, {.activations = "nvfp4/bf16"});
     check(why.find("cannot compute") != std::string::npos,
           "NVFP4 inputs asked for without FP4 tensor cores: refused (" + why + ")");
     return;
@@ -1018,10 +1219,10 @@ void nvfp4_inputs(const std::string& dir, const std::string& backend) {
   }
   auto spec = engine(path, backend, {.speculative = true, .prefill_chunk = 64});
   check(tokens_of(*plain, prompt, 32) == tokens_of(*spec, prompt, 32), "NVFP4 inputs: the MTP drafter changes nothing");
-  // Asked for by name (--activations nvfp4) in a file of the same weights that says bf16 inputs: the tokens of the
-  // file that says NVFP4, greedy and sampled; by default, that file's with --activations exact.
+  // Asked for by name (--activations nvfp4/bf16) in a file of the same weights that says bf16 inputs: the tokens of
+  // the file that says NVFP4, greedy and sampled; by default, that file's with --activations exact.
   const std::string a16 = dir + "/tiny_w4a4_a16.flyx";
-  auto asked = engine(a16, backend, {.prefill_chunk = 64, .activations = "nvfp4"});
+  auto asked = engine(a16, backend, {.prefill_chunk = 64, .activations = "nvfp4/bf16"});
   auto as_said = engine(a16, backend, {.prefill_chunk = 64});
   auto exact = engine(path, backend, {.prefill_chunk = 64, .activations = "exact"});
   for (bool sampling : {false, true}) {
@@ -1033,13 +1234,17 @@ void nvfp4_inputs(const std::string& dir, const std::string& backend) {
   }
   // Asked for where this backend cannot compute them, refused: 64-wide NVFP4 weights (the W4A4 kernels' tile of K is
   // 128). A model without NVFP4 weights gives what it gives without the word.
-  const std::string why = refusal(dir + "/tiny_nvfp4.flyx", backend, {.activations = "nvfp4"});
+  const std::string why = refusal(dir + "/tiny_nvfp4.flyx", backend, {.activations = "nvfp4/bf16"});
   check(why.find("a multiple of 128") != std::string::npos,
         "NVFP4 inputs asked for with K = 64: refused (" + why + ")");
   const std::vector<int32_t> short_prompt(prompt.begin(), prompt.begin() + 40);
-  check(tokens_of(*engine(dir + "/tiny.flyx", backend, {.prefill_chunk = 64, .activations = "nvfp4"}), short_prompt,
-                  16) == tokens_of(*engine(dir + "/tiny.flyx", backend, {.prefill_chunk = 64}), short_prompt, 16),
+  auto no_nvfp4 = engine(dir + "/tiny.flyx", backend, {.prefill_chunk = 64, .activations = "nvfp4/bf16"});
+  check(tokens_of(*no_nvfp4, short_prompt, 16) ==
+            tokens_of(*engine(dir + "/tiny.flyx", backend, {.prefill_chunk = 64}), short_prompt, 16),
         "NVFP4 inputs asked for without NVFP4 weights: the tokens without the word");
+  // PREFILL/DECODE: NVFP4 rounds are no mode of its (refused, naming the modes)
+  const std::string bare = refusal(path, backend, {.activations = "nvfp4"});
+  check(bare.find("nvfp4/bf16") != std::string::npos, "--activations nvfp4 (NVFP4 rounds too): refused (" + bare + ")");
 }
 void split_shards(const std::string& dir, const std::string& backend) {
   auto single = engine(dir + "/tiny_gguf.gguf", backend);
@@ -1097,6 +1302,8 @@ int main(int argc, char** argv) {
     split_mtp(dir, backend);
     dflash_file(dir, backend);
     dspine_file(dir, backend);
+    gpt_oss(dir, backend);
+    gpt_oss_passes(dir, backend);
     if (backend != "cpu_ref") packed(dir, backend);
     if (backend != "cpu_ref") packed_lora(dir, backend);
     if (backend != "cpu_ref") nvfp4_inputs(dir, backend);

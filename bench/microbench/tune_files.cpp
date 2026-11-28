@@ -26,18 +26,33 @@ bool file_matrices(const std::string& path, std::vector<FileMatrix>* out, std::s
 bool file_experts(const std::string& path, std::vector<FileExperts>* out, std::string* err) {
   ModelFile file;
   if (!file.open(path, err)) return false;
-  const std::string suffix = "ffn_gate_up_exps.weight", key = file.arch() + ".expert_used_count";
+  const std::string fused = "ffn_gate_up_exps.weight", gate = "ffn_gate_exps.weight", up = "ffn_up_exps.weight";
+  const std::string key = file.arch() + ".expert_used_count";
+  auto ends = [](const std::string& s, const std::string& suffix) {
+    return s.size() >= suffix.size() && s.compare(s.size() - suffix.size(), suffix.size(), suffix) == 0;
+  };
   for (const std::string& name : file.tensor_names()) {
     const flyx_tensor_view* t = file.tensor(name);
-    if (!t || t->ndim != 3 || name.size() < suffix.size() ||
-        name.compare(name.size() - suffix.size(), suffix.size(), suffix) != 0)
+    if (!t || t->ndim != 3) continue;
+    // gate and up apart (gpt-oss's): the pair as the engine stacks them, an expert's gate rows then its up rows
+    int rows_per = 1;
+    if (ends(name, gate)) {
+      const flyx_tensor_view* u = file.tensor(name.substr(0, name.size() - gate.size()) + up);
+      if (!u || u->dtype != t->dtype || u->ndim != 3 || u->shape[0] != t->shape[0] || u->shape[1] != t->shape[1] ||
+          u->shape[2] != t->shape[2]) {
+        *err = name + " without an up matrix of its shape";
+        return false;
+      }
+      rows_per = 2;
+    } else if (!ends(name, fused)) {
       continue;
+    }
     const nlohmann::json& h = file.header();
     if (!h.contains("gguf") || !h.at("gguf").contains(key) || !h.at("gguf").at(key).is_number_integer()) {
       *err = "expert matrices without " + key;
       return false;
     }
-    const int n_experts = int(t->shape[0]), N = int(t->shape[1]), K = int(t->shape[2]);
+    const int n_experts = int(t->shape[0]), N = rows_per * int(t->shape[1]), K = int(t->shape[2]);
     const int top_k = h.at("gguf").at(key).get<int>();
     const int blk = flyx_block_values(t->dtype);
     if (n_experts <= 0 || top_k <= 0 || top_k > n_experts || N <= 0 || (N & 1) != 0 || K <= 0 ||
