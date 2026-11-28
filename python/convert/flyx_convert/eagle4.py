@@ -24,6 +24,9 @@ from .rules import check_tensors
 ARCHITECTURE = "LlamaForCausalLMEagle4"
 # The taps a drafter may have: FLYX_EAGLE4_MAX_TAPS (include/flyx/backend_abi.h), which the engine holds every file to.
 MAX_TAPS = 8
+# The loader's bounds on a drafter's dimensions (models/model.h kMaxWidth, kMaxHeads, kMaxHeadDim; the products a
+# 32-bit index takes: models/drafters/eagle4.cpp): a config past them converts to a file that cannot be opened.
+MAX_WIDTH, MAX_HEADS, MAX_HEAD_DIM, MAX_INDEX = 1 << 20, 1 << 12, 1 << 14, (1 << 31) - 1
 
 _RULES = [
     (r"fc\.weight", "fc"),
@@ -57,7 +60,10 @@ def _number(x) -> bool:
 
 
 def _positive(x) -> bool:
-    return _number(x) and math.isfinite(x) and x > 0
+    try:
+        return _number(x) and math.isfinite(x) and x > 0
+    except OverflowError:  # an integer past any float: no theta or epsilon the engine takes
+        return False
 
 
 def canonical_eagle4_config(sc: dict, target: dict | None) -> dict:
@@ -79,6 +85,10 @@ def canonical_eagle4_config(sc: dict, target: dict | None) -> dict:
     heads, kv = sc["num_attention_heads"], sc["num_key_value_heads"]
     hd = sc.get("head_dim", H // heads)
     _require(_int(hd) and hd > 0 and hd % 2 == 0 and heads % kv == 0, f"heads {heads}/{kv}, head_dim {hd!r}")
+    _require(H <= MAX_WIDTH and sc["intermediate_size"] <= MAX_WIDTH and heads <= MAX_HEADS and hd <= MAX_HEAD_DIM and
+             (heads + 2 * kv) * hd <= MAX_INDEX,
+             f"hidden {H}, intermediate {sc['intermediate_size']}, heads {heads}/{kv}, head_dim {hd} past the loader's "
+             f"bounds (width {MAX_WIDTH}, heads {MAX_HEADS}, head_dim {MAX_HEAD_DIM})")
     _require(_positive(sc.get("rms_norm_eps")), f"rms_norm_eps {sc.get('rms_norm_eps')!r} (finite, above 0)")
     _require(_int(sc.get("target_hidden_size", H)) and sc.get("target_hidden_size", H) == H,
              "a target width other than its own (its embedding is the target's)")
@@ -118,6 +128,10 @@ def canonical_eagle4_config(sc: dict, target: dict | None) -> dict:
              0 < head["rank"] <= H and 0 < head["num_candidates"] <= vocab,
              f"efficient_lm_head_config {head!r} (low_rank, its rank and candidates)")
     taps = [i + 1 for i in ids]
+    _require(len(taps) * H <= MAX_INDEX, f"{len(taps)} taps of width {H}: fc's input past a 32-bit index")
+    # The residual after a layer before the target's last: against the declared model where no target is given.
+    _require(target is not None or nt is None or all(1 <= t < nt for t in taps),
+             f"taps {taps} outside the {nt} layers of the model it says it was made for")
     if target is not None:
         _require(vocab == target["vocab"], "its vocabulary differs from the target's")
         _require(H == target["hidden"], "its width differs from the target's")

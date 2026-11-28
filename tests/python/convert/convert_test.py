@@ -585,9 +585,28 @@ def eagle4_config():
         check(refused(lambda c: canonical_draft_config(c, None),
                       dict(published, rope_parameters={"rope_theta": theta, "rope_type": "default"}), "rope_parameters"),
               f"rope_theta {theta!r}: refused")
-    for eps in (0, -1e-6, float("inf"), float("nan")):
+    for eps in (0, -1e-6, float("inf"), float("nan"), 10**400):
         check(refused(lambda c: canonical_draft_config(c, None), dict(published, rms_norm_eps=eps), "rms_norm_eps"),
-              f"rms_norm_eps {eps!r}: refused")
+              f"rms_norm_eps {str(eps)[:12]}: refused")
+    check(refused(lambda c: canonical_draft_config(c, None),
+                  dict(published, rope_parameters={"rope_theta": 10**400, "rope_type": "default"}), "rope_parameters"),
+          "a rotary base past any float: refused as the field, not an OverflowError")
+    # With no target given, the taps against the layers its config says it was made for (strictly before the last).
+    def made_for(layers, ids):
+        return dict(published, num_target_layers=layers, num_aux_hidden_states=len(ids),
+                    eagle_config=dict(published["eagle_config"], eagle_aux_hidden_state_layer_ids=ids))
+    check(refused(lambda c: canonical_draft_config(c, None), made_for(4, [3]), "outside the 4 layers"),
+          "a tap after the last of the 4 layers it says it was made for: refused")
+    check(canonical_draft_config(made_for(4, [2]), None)["taps"] == [3], "a tap after its third layer of 4: taken")
+    # The loader's dimension bounds (models/model.h), before a tensor is read.
+    check(canonical_draft_config(dict(published, head_dim=16384), None)["head_dim"] == 16384,
+          "head_dim 16384, the loader's most: taken")
+    check(refused(lambda c: canonical_draft_config(c, None), dict(published, head_dim=16386), "past the loader's bounds"),
+          "head_dim 16386: refused")
+    wide = (1 << 20) + 2
+    check(refused(lambda c: canonical_draft_config(c, None),
+                  dict(published, hidden_size=wide, target_hidden_size=wide), "past the loader's bounds"),
+          "a width past the loader's 1 << 20: refused")
 
 
 def main():
