@@ -1784,10 +1784,84 @@ void test_moe_dp4a_variants() {
 
 }  // namespace
 
+// BF16 experts whose rows do not all start on 16 bytes and whose widths end inside a load (K of 100 and 52): the
+// one-value loads sum as the 16-byte ones do; against float64, and each row alone as in a grouped pass, bit for bit.
+void test_moe_bf16_unaligned() {
+  const int R = 5, E = 4, top_k = 2, H = 100, I = 52;
+  seed("moe_bf16_unaligned", R, E, top_k, H, I);
+  Vec gu = randv(size_t(E) * 2 * I * H, 0.1), dn = randv(size_t(E) * H * I, 0.1), x = randv(size_t(R) * H, 1.0);
+  round_bf16(gu);
+  round_bf16(dn);
+  std::vector<int> eidx(size_t(R) * top_k);
+  Vec ew(size_t(R) * top_k);
+  for (int r = 0; r < R; ++r)
+    for (int k = 0; k < top_k; ++k) {
+      eidx[size_t(r) * top_k + k] = (r + 3 * k) % E;
+      ew[size_t(r) * top_k + k] = 0.25 + 0.5 * k;
+    }
+  ExpertMat w_gu{}, w_dn{};
+  w_gu.n_experts = w_dn.n_experts = E;
+  w_gu.N = 2 * I;
+  w_gu.w = up_bf16(gu);
+  w_dn.N = H;
+  w_dn.w = up_bf16(dn);
+  float* d_x = up(x);
+  int* d_eidx = dev<int>(eidx.size());
+  CK(cudaMemcpy(d_eidx, eidx.data(), eidx.size() * 4, cudaMemcpyHostToDevice));
+  float* d_ew = up(ew);
+  MoeScratch msc{};
+  msc.pairs = dev<int>(size_t(R) * top_k);
+  msc.tasks = dev<MoeTask>(size_t(R) * top_k);
+  msc.n_tasks = dev<int>(1);
+  msc.down_buf = dev<float>(size_t(R) * top_k * H);
+  msc.chunk_rows = R;
+  msc.max_experts = E;
+  msc.max_top_k = top_k;
+  const MoeAct act{FLYX_MOE_SWIGLU, 0.f, 0.f, nullptr};
+
+  Vec want_act(size_t(R) * top_k * I), want_y(size_t(R) * H, 0.0);
+  for (int r = 0; r < R; ++r)
+    for (int k = 0; k < top_k; ++k) {
+      const int slot = r * top_k + k, e = eidx[size_t(slot)];
+      Vec g(size_t(2) * I), d(static_cast<size_t>(H));
+      ops::linear_expert_f64(x.data() + size_t(r) * H, H, gu.data(), e, 2 * I, g.data());
+      for (int i = 0; i < I; ++i) want_act[size_t(slot) * I + i] = g[i] / (1.0 + std::exp(-g[i])) * g[I + i];
+      ops::linear_expert_f64(want_act.data() + size_t(slot) * I, I, dn.data(), e, H, d.data());
+      for (int c = 0; c < H; ++c) want_y[size_t(r) * H + c] += ew[size_t(slot)] * d[c];
+    }
+
+  float* d_act = dev<float>(size_t(R) * top_k * I);
+  float* d_y = dev<float>(size_t(R) * H);
+  const int grouped = moe_gate_up(d_x, H, w_gu, d_eidx, R, top_k, I, H, act, true, d_act, I, &msc, TL);
+  const Vec act_grouped = down(d_act, size_t(R) * top_k * I);
+  moe_down(d_act, I, w_dn, d_eidx, d_ew, R, top_k, H, I, d_y, H, false, &msc, TL, nullptr, grouped);
+  const Vec y_grouped = down(d_y, size_t(R) * H);
+  expect("moe_gate_up bf16 unaligned", act_grouped, want_act, 3e-5);
+  expect("moe_down bf16 unaligned", y_grouped, want_y, 3e-5);
+  for (int r = 0; r < R; ++r) {
+    moe_gate_up(d_x + size_t(r) * H, H, w_gu, d_eidx + size_t(r) * top_k, 1, top_k, I, H, act, true, d_act, I, &msc,
+                TL);
+    const Vec a1 = down(d_act, size_t(top_k) * I);
+    moe_down(d_act, I, w_dn, d_eidx + size_t(r) * top_k, d_ew + size_t(r) * top_k, 1, top_k, H, I, d_y, H, false,
+             &msc, TL);
+    const std::string row = " row " + std::to_string(r);
+    expect_bits("moe_gate_up bf16 unaligned, R=1 == R=5" + row, a1,
+                Vec(act_grouped.begin() + ptrdiff_t(r) * top_k * I, act_grouped.begin() + ptrdiff_t(r + 1) * top_k * I));
+    expect_bits("moe_down bf16 unaligned, R=1 == R=5" + row, down(d_y, size_t(H)),
+                Vec(y_grouped.begin() + ptrdiff_t(r) * H, y_grouped.begin() + ptrdiff_t(r + 1) * H));
+  }
+  for (void* p : {static_cast<void*>(const_cast<bf16*>(w_gu.w)), static_cast<void*>(const_cast<bf16*>(w_dn.w)),
+                  static_cast<void*>(d_x), static_cast<void*>(d_eidx), static_cast<void*>(d_ew),
+                  static_cast<void*>(msc.pairs), static_cast<void*>(msc.tasks), static_cast<void*>(msc.n_tasks),
+                  static_cast<void*>(msc.down_buf), static_cast<void*>(d_act), static_cast<void*>(d_y)})
+    cudaFree(p);
+}
+
 void test_inkling2_moe() {
   test_inkling2_moe_norm();
   test_moe_gate_up_rules();
   test_moe_dp4a_variants();
+  test_moe_bf16_unaligned();
   std::printf("inkling2 moe (route, situ, gate_up, down)\n");
   // 1. moe_route: sigmoid+bias and softmax.
   for (int sig : {1, 0}) {

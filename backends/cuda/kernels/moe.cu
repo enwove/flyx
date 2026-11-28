@@ -971,14 +971,75 @@ __device__ __forceinline__ void stage_f32_tile(const float* __restrict__ x, int 
   }
 }
 
-template <int BT>
-__device__ __forceinline__ void bf16_row_step(const bf16* __restrict__ w_row, int k0, int kt, int lane, int nb,
-                                              const float sm[BT][kMoeKT], float acc[BT]) {
-  for (int j = lane; j < kt; j += 32) {
-    const float wv = __bfloat162float(w_row[k0 + j]);
+// Columns a warp of the bf16 expert kernels takes: a row alone's one (blocks enough for every SM), a grouped pass's
+// gate|up two (two rows each, gate and up, where fused) and down four, whose rows (an expert's inner width) are short.
+// A column's sums are the same at any width.
+constexpr int kBf16RowCols = 1, kBf16GuCols = 2, kBf16DownCols = 4;
+
+// 8 values of a weight row's tile at j: one 16-byte load where aligned and whole, else one at a time (0 past kt).
+__device__ __forceinline__ void bf16_load8(const bf16* __restrict__ w, int j, int kt, bool aligned, float wv[8]) {
+  if (aligned && j + 8 <= kt) {
+    const uint4 raw = __ldg(reinterpret_cast<const uint4*>(w + j));
+    const __nv_bfloat162* h = reinterpret_cast<const __nv_bfloat162*>(&raw);
 #pragma unroll
-    for (int b = 0; b < BT; ++b)
-      if (b < nb) acc[b] = __fmaf_rn(sm[b][j], wv, acc[b]);
+    for (int q = 0; q < 4; ++q) {
+      const float2 f = __bfloat1622float2(h[q]);
+      wv[2 * q] = f.x;
+      wv[2 * q + 1] = f.y;
+    }
+  } else {
+#pragma unroll
+    for (int q = 0; q < 8; ++q) wv[q] = j + q < kt ? __bfloat162float(w[j + q]) : 0.f;
+  }
+}
+
+// NW weight rows' tiles [k0, k0 + kt) against up to BT staged rows: lane l takes the 8 values at 8 l + 256 i of each,
+// ascending, the NW rows' loads issued together; each (row, staged row) sum is the same whatever NW and BT are and
+// whether a load is one of 16 bytes or eight of one value (a row's bits do not depend on the rows taken with it).
+template <int BT, int NW>
+__device__ __forceinline__ void bf16_rows_step(const bf16* const (&w_rows)[NW], int k0, int kt, int lane, int nb,
+                                               const float sm[BT][kMoeKT], float (&acc)[NW][BT]) {
+  const bf16* w[NW];
+  bool aligned[NW];
+#pragma unroll
+  for (int c = 0; c < NW; ++c) {
+    w[c] = w_rows[c] + k0;
+    aligned[c] = (reinterpret_cast<uintptr_t>(w[c]) & 15) == 0;
+  }
+#pragma unroll 2
+  for (int j = 8 * lane; j < kt; j += 256) {
+    float wv[NW][8];
+#pragma unroll
+    for (int c = 0; c < NW; ++c) bf16_load8(w[c], j, kt, aligned[c], wv[c]);
+    if (j + 8 <= kt) {
+#pragma unroll
+      for (int b = 0; b < BT; ++b) {
+        if (b >= nb) break;
+        const float4 x0 = *reinterpret_cast<const float4*>(&sm[b][j]);
+        const float4 x1 = *reinterpret_cast<const float4*>(&sm[b][j + 4]);
+#pragma unroll
+        for (int c = 0; c < NW; ++c) {
+          float a = acc[c][b];
+          a = __fmaf_rn(x0.x, wv[c][0], a);
+          a = __fmaf_rn(x0.y, wv[c][1], a);
+          a = __fmaf_rn(x0.z, wv[c][2], a);
+          a = __fmaf_rn(x0.w, wv[c][3], a);
+          a = __fmaf_rn(x1.x, wv[c][4], a);
+          a = __fmaf_rn(x1.y, wv[c][5], a);
+          a = __fmaf_rn(x1.z, wv[c][6], a);
+          a = __fmaf_rn(x1.w, wv[c][7], a);
+          acc[c][b] = a;
+        }
+      }
+    } else {
+#pragma unroll
+      for (int b = 0; b < BT; ++b) {
+        if (b >= nb) break;
+#pragma unroll
+        for (int c = 0; c < NW; ++c)
+          for (int q = 0; q < 8 && j + q < kt; ++q) acc[c][b] = __fmaf_rn(sm[b][j + q], wv[c][q], acc[c][b]);
+      }
+    }
   }
 }
 
@@ -986,33 +1047,38 @@ template <bool FUSE_ACT>
 __global__ void __launch_bounds__(32 * kMoeWarps)
     k_moe_bf16_gu_decode(const float* __restrict__ x, int ldx, const bf16* __restrict__ W, const float* __restrict__ RS,
                          int N_exp, int I, int K, const int* __restrict__ eidx, int top_k, MoeAct mact,
-                             float* __restrict__ out, int ld_out) {
+                         float* __restrict__ out, int ld_out) {
   pdl_trigger();
-  __shared__ float sm[1][kMoeKT];
+  constexpr int CW = kBf16RowCols, NW = FUSE_ACT ? 2 * CW : CW;
+  __shared__ __align__(16) float sm[1][kMoeKT];
   const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
-  const int col = blockIdx.x * kMoeWarps + warp;
+  const int col0 = (blockIdx.x * kMoeWarps + warp) * CW;
   const int N_work = FUSE_ACT ? I : 2 * I;
   const int k_slot = blockIdx.y, r = blockIdx.z;
   const int e = eidx[r * top_k + k_slot];
   const float rs = RS ? RS[e] : 1.f;
-  const bf16* w0 = W + (size_t(e) * N_exp + min(col, N_exp - 1)) * K;
-  const bf16* w1 = FUSE_ACT ? (W + (size_t(e) * N_exp + min(col + I, N_exp - 1)) * K) : nullptr;
-  float ag[1] = {0.f}, au[1] = {0.f};
+  const bf16* rows[NW];
+#pragma unroll
+  for (int c = 0; c < CW; ++c) {
+    rows[c] = W + (size_t(e) * N_exp + min(col0 + c, N_exp - 1)) * K;
+    if constexpr (FUSE_ACT) rows[CW + c] = W + (size_t(e) * N_exp + min(col0 + c + I, N_exp - 1)) * K;
+  }
+  float acc[NW][1] = {};
   const int rids[1] = {r};
   for (int k0 = 0; k0 < K; k0 += kMoeKT) {
     const int kt = min(kMoeKT, K - k0);
     stage_f32_tile<1>(x, ldx, rids, 1, k0, kt, sm);
     __syncthreads();
-    if (col < N_work) {
-      bf16_row_step<1>(w0, k0, kt, lane, 1, sm, ag);
-      if constexpr (FUSE_ACT) bf16_row_step<1>(w1, k0, kt, lane, 1, sm, au);
-    }
+    if (col0 < N_work) bf16_rows_step<1, NW>(rows, k0, kt, lane, 1, sm, acc);
     __syncthreads();
   }
-  if (col < N_work) {
-    const float g = warp_tree_sum(ag[0]) * rs;
+#pragma unroll
+  for (int c = 0; c < CW; ++c) {
+    const int col = col0 + c;
+    if (col >= N_work) break;
+    const float g = warp_tree_sum(acc[c][0]) * rs;
     if constexpr (FUSE_ACT) {
-      const float u = warp_tree_sum(au[0]) * rs;
+      const float u = warp_tree_sum(acc[CW + c][0]) * rs;
       if (lane == 0) out[size_t(r * top_k + k_slot) * ld_out + col] = moe_act_val(mact, g, u, e, col, I);
     } else if (lane == 0) {
       out[size_t(r * top_k + k_slot) * ld_out + col] = g;
@@ -1026,33 +1092,42 @@ __global__ void __launch_bounds__(32 * kMoeWarps)
                            const float* __restrict__ ew, int top_k, float* __restrict__ out, int ld_out,
                            int accumulate, const float* __restrict__ bias) {
   pdl_trigger();
-  __shared__ float sm[1][kMoeKT];
+  constexpr int CW = kBf16RowCols;
+  __shared__ __align__(16) float sm[1][kMoeKT];
   const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
-  const int col = blockIdx.x * kMoeWarps + warp;
+  const int col0 = (blockIdx.x * kMoeWarps + warp) * CW;
   const int r = blockIdx.y;
-  float total = 0.f;
+  float total[CW] = {};
   for (int k_slot = 0; k_slot < top_k; ++k_slot) {
     const int e = eidx[r * top_k + k_slot];
     const float rs = RS ? RS[e] : 1.f;
-    const bf16* w0 = W + (size_t(e) * H + min(col, H - 1)) * K;
+    const bf16* rows[CW];
+#pragma unroll
+    for (int c = 0; c < CW; ++c) rows[c] = W + (size_t(e) * H + min(col0 + c, H - 1)) * K;
     const int rids[1] = {r * top_k + k_slot};
-    float acc[1] = {0.f};
+    float acc[CW][1] = {};
     for (int k0 = 0; k0 < K; k0 += kMoeKT) {
       const int kt = min(kMoeKT, K - k0);
       stage_f32_tile<1>(act, ld_act, rids, 1, k0, kt, sm);
       __syncthreads();
-      if (col < H) bf16_row_step<1>(w0, k0, kt, lane, 1, sm, acc);
+      if (col0 < H) bf16_rows_step<1, CW>(rows, k0, kt, lane, 1, sm, acc);
       __syncthreads();
     }
-    if (col < H) {
-      float v = warp_tree_sum(acc[0]) * rs;
+#pragma unroll
+    for (int c = 0; c < CW; ++c) {
+      const int col = col0 + c;
+      if (col >= H) break;
+      float v = warp_tree_sum(acc[c][0]) * rs;
       if (bias) v += bias[size_t(e) * H + col];  // as k_moe_weighted_sum adds it
-      if (lane == 0) total = __fmaf_rn(ew[r * top_k + k_slot], v, total);
+      if (lane == 0) total[c] = __fmaf_rn(ew[r * top_k + k_slot], v, total[c]);
     }
   }
-  if (col < H && lane == 0) {
+#pragma unroll
+  for (int c = 0; c < CW; ++c) {
+    const int col = col0 + c;
+    if (col >= H || lane != 0) break;
     float* dst = out + size_t(r) * ld_out + col;
-    *dst = accumulate ? (*dst + total) : total;
+    *dst = accumulate ? (*dst + total[c]) : total[c];
   }
 }
 
@@ -1062,19 +1137,23 @@ __global__ void __launch_bounds__(32 * kMoeWarps)
                        int N_exp, int I_or_H, int K, const MoeTask* __restrict__ tasks, const int* __restrict__ n_tasks,
                        const int* __restrict__ pairs, int top_k, MoeAct mact,
                        float* __restrict__ out, int ld_out) {
-  constexpr int BT = 8;
+  constexpr int BT = 8, CW = IS_DOWN ? kBf16DownCols : kBf16GuCols, NW = FUSE_ACT ? 2 * CW : CW;
   const int tid_y = int(blockIdx.y);
   if (tid_y >= *n_tasks) return;
   const MoeTask tk = tasks[tid_y];
   const int e = tk.expert, nb = tk.nb;
 
-  __shared__ float sm[BT][kMoeKT];
+  __shared__ __align__(16) float sm[BT][kMoeKT];
   const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
-  const int col = blockIdx.x * kMoeWarps + warp;
+  const int col0 = (blockIdx.x * kMoeWarps + warp) * CW;
   const int N_work = FUSE_ACT ? I_or_H : N_exp;
   const float rs = RS ? RS[e] : 1.f;
-  const bf16* w0 = W + (size_t(e) * N_exp + min(col, N_exp - 1)) * K;
-  const bf16* w1 = FUSE_ACT ? (W + (size_t(e) * N_exp + min(col + I_or_H, N_exp - 1)) * K) : nullptr;
+  const bf16* rows[NW];
+#pragma unroll
+  for (int c = 0; c < CW; ++c) {
+    rows[c] = W + (size_t(e) * N_exp + min(col0 + c, N_exp - 1)) * K;
+    if constexpr (FUSE_ACT) rows[CW + c] = W + (size_t(e) * N_exp + min(col0 + c + I_or_H, N_exp - 1)) * K;
+  }
 
   int rids[BT], pids[BT];
 #pragma unroll
@@ -1082,24 +1161,24 @@ __global__ void __launch_bounds__(32 * kMoeWarps)
     pids[b] = b < nb ? pairs[tk.p0 + b] : 0;
     rids[b] = IS_DOWN ? pids[b] : (pids[b] / top_k);
   }
-  float ag[BT] = {}, au[BT] = {};
+  float acc[NW][BT] = {};
   for (int k0 = 0; k0 < K; k0 += kMoeKT) {
     const int kt = min(kMoeKT, K - k0);
     stage_f32_tile<BT>(x, ldx, rids, nb, k0, kt, sm);
     __syncthreads();
-    if (col < N_work) {
-      bf16_row_step<BT>(w0, k0, kt, lane, nb, sm, ag);
-      if constexpr (FUSE_ACT) bf16_row_step<BT>(w1, k0, kt, lane, nb, sm, au);
-    }
+    if (col0 < N_work) bf16_rows_step<BT, NW>(rows, k0, kt, lane, nb, sm, acc);
     __syncthreads();
   }
-  if (col < N_work) {
+#pragma unroll
+  for (int c = 0; c < CW; ++c) {
+    const int col = col0 + c;
+    if (col >= N_work) break;
 #pragma unroll
     for (int b = 0; b < BT; ++b) {
       if (b >= nb) break;
-      const float g = warp_tree_sum(ag[b]) * rs;
+      const float g = warp_tree_sum(acc[c][b]) * rs;
       if constexpr (FUSE_ACT) {
-        const float u = warp_tree_sum(au[b]) * rs;
+        const float u = warp_tree_sum(acc[CW + c][b]) * rs;
         if (lane == 0) out[size_t(pids[b]) * ld_out + col] = moe_act_val(mact, g, u, e, col, I_or_H);
       } else if (lane == 0) {
         out[size_t(pids[b]) * ld_out + col] = g;
@@ -1465,7 +1544,7 @@ int moe_gate_up(const float* x, int ldx, const ExpertMat& W, const int* eidx, in
   const bool tiled = rows > 1 && sc && sc->tasks && sc->pairs && W.n_experts <= sc->max_experts &&
                      top_k <= sc->max_top_k;
   if (!tiled) {
-    const dim3 grid(ceil_div(N_work, kMoeWarps), top_k, rows);
+    const dim3 grid(ceil_div(N_work, kMoeWarps * kBf16RowCols), top_k, rows);
     if (fuse_act)
       k_moe_bf16_gu_decode<true><<<grid, 32 * kMoeWarps, 0, st>>>(
           x, ldx, W.w, W.rs, W.N, I, K, eidx, top_k, mact, out, ld_out);
@@ -1480,7 +1559,7 @@ int moe_gate_up(const float* x, int ldx, const ExpertMat& W, const int* eidx, in
     const int M = rc * top_k;
     const int mt = max_work_tiles(M, W.n_experts, 8);
     group_tasks(eidx + size_t(r0) * top_k, M, W.n_experts, 8, sc, st);
-    const dim3 grid(ceil_div(N_work, kMoeWarps), mt);
+    const dim3 grid(ceil_div(N_work, kMoeWarps * kBf16GuCols), mt);
     const float* xc = x + size_t(r0) * ldx;
     float* oc = out + size_t(r0) * top_k * ld_out;
     if (fuse_act)
@@ -1590,7 +1669,7 @@ void moe_down(const float* act, int ld_act, const ExpertMat& W, const int* eidx,
   const bool tiled = rows > 1 && sc && sc->tasks && sc->pairs && sc->down_buf && W.n_experts <= sc->max_experts &&
                      top_k <= sc->max_top_k;
   if (!tiled) {
-    k_moe_bf16_down_decode<<<dim3(ceil_div(H, kMoeWarps), rows), 32 * kMoeWarps, 0, st>>>(
+    k_moe_bf16_down_decode<<<dim3(ceil_div(H, kMoeWarps * kBf16RowCols), rows), 32 * kMoeWarps, 0, st>>>(
         act, ld_act, W.w, W.rs, H, K, eidx, ew, top_k, out, ld_out, int(accumulate), bias);
     return;
   }
@@ -1600,7 +1679,7 @@ void moe_down(const float* act, int ld_act, const ExpertMat& W, const int* eidx,
     const int M = rc * top_k;
     const int mt = max_work_tiles(M, W.n_experts, 8);
     if (rc != rows || !tiles_serve(grouped, 8, rc)) group_tasks(eidx + size_t(r0) * top_k, M, W.n_experts, 8, sc, st);
-    const dim3 grid(ceil_div(H, kMoeWarps), mt);
+    const dim3 grid(ceil_div(H, kMoeWarps * kBf16DownCols), mt);
     k_moe_bf16_grouped<false, true><<<grid, 32 * kMoeWarps, 0, st>>>(
         act + size_t(r0) * top_k * ld_act, ld_act, W.w, W.rs, H, H, K, sc->tasks, sc->n_tasks, sc->pairs, top_k,
                      MoeAct{}, sc->down_buf, H);
